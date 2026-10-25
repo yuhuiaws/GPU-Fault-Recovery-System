@@ -943,10 +943,10 @@ class IncidentOrchestrator:
         self,
         parameters: dict[str, Any],
         observation,
+        **scope: bool,
     ) -> dict[str, Any]:
         return self._evidence_operations.quiesce_parameters(
-            parameters,
-            observation,
+            parameters, observation, **scope
         )
 
     _RECOVERY_OPERATION_RANK = RECOVERY_OPERATION_RANK

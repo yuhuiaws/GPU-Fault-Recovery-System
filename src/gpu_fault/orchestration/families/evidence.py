@@ -2,20 +2,42 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from datetime import datetime, timedelta, timezone
 from threading import Lock
 from typing import Any, Callable
 
 from gpu_fault.host_health import NodeHealthFinding
-from gpu_fault.models import WorkflowOperation, WorkflowRequest, WorkflowStatus
+from gpu_fault.models import (
+    WorkflowOperation,
+    WorkflowRequest,
+    WorkflowStatus,
+    WorkflowStepSpec,
+)
 from gpu_fault.orchestration.dag_branching import join_accepts_new_branch
 from gpu_fault.policy import SxidEvent, XidEvent
 from gpu_fault.store import NotFoundError
 from gpu_fault.watcher import AttemptObservation, WorkloadPhase
+from gpu_fault.workload_container_scope import (
+    WORKLOAD_CONTAINER_IDS,
+    container_ids_by_node,
+)
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_ACTIVE_OBSERVATION_MAX_AGE_SECONDS = 120.0
+
+
+def stops_attempt_before(steps: Sequence[WorkflowStepSpec], index: int) -> bool:
+    """Whether the plan stops the attempt (STOP_WORKLOADS) before step ``index``.
+
+    The QUIESCE device sweep may signal what still runs in the attempt's own
+    containers only once the plan has stopped the attempt: what it then finds
+    of them holding the target GPU are survivors, never a job left running.
+    """
+
+    return any(
+        step.operation is WorkflowOperation.STOP_WORKLOADS for step in steps[:index]
+    )
 
 
 class EvidenceOperationService:
@@ -506,13 +528,40 @@ class EvidenceOperationService:
         self,
         parameters: dict[str, Any],
         observation,
+        *,
+        attempt_stopped: bool = False,
     ) -> dict[str, Any]:
+        """The QUIESCE step's workload scope: the attempt's containers per node.
+
+        The device sweep may signal a holder of the target GPU only inside it.
+        A container's explicit ``cgroup_path`` comes from a Pod annotation that
+        nothing sets, so a managed container is named by the runtime id the
+        kubelet reports instead and the Agent finds its cgroup on the node
+        (``gpu_fault.workload_container_scope``). The ids go only into a
+        QUIESCE the plan precedes with the attempt's STOP_WORKLOADS
+        (``attempt_stopped``, :func:`stops_attempt_before`), so the sweep meets
+        a stopped attempt's survivors, never a running job. Frozen into the
+        step, so a resend carries the same body.
+        """
+
+        scope: dict[str, Any] = {}
         paths = self.workload_cgroup_paths_by_node(observation)
-        return (
+        if paths:
+            scope["workload_cgroup_paths_by_node"] = paths
+        nodes = sorted(
             {
-                **parameters,
-                "workload_cgroup_paths_by_node": paths,
+                container.node_id
+                for container in observation.containers
+                if container.node_id and not container.terminated
             }
-            if paths
-            else parameters
         )
+        container_ids = {
+            node: identifiers
+            for node, identifiers in container_ids_by_node(
+                observation.containers, nodes
+            ).items()
+            if identifiers
+        }
+        if container_ids and attempt_stopped:
+            scope[WORKLOAD_CONTAINER_IDS] = container_ids
+        return {**parameters, **scope} if scope else parameters

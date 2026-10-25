@@ -17,6 +17,7 @@ from gpu_fault.models import (
     bounded_reasons,
 )
 from gpu_fault.orchestration.disposition import Disposition, DispositionApplier
+from gpu_fault.orchestration.families.evidence import stops_attempt_before
 from gpu_fault.orchestration.workflow_merge import workflow_is_mutable
 from gpu_fault.orchestration.hung_episode import diagnostic_only_hung, new_hung_episode
 
@@ -300,7 +301,7 @@ class GroupedHealthService:
             WorkflowOperation.RESTART_WORKLOAD,
         }
         scoped = []
-        for step in workflow.official_steps:
+        for index, step in enumerate(workflow.official_steps):
             parameters = step.parameters
             if step.operation is WorkflowOperation.STOP_WORKLOADS:
                 parameters = {
@@ -313,6 +314,9 @@ class GroupedHealthService:
                 parameters = self.callbacks.quiesce_parameters(
                     parameters,
                     context.observation,
+                    attempt_stopped=stops_attempt_before(
+                        workflow.official_steps, index
+                    ),
                 )
             scoped.append(
                 step.model_copy(

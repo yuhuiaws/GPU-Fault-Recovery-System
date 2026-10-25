@@ -32,6 +32,7 @@ from gpu_fault.models import (
 from gpu_fault.orchestration.arbitration import RecoveryArbiter, gpu_shares_unknown
 from gpu_fault.orchestration.dag_branching import DagBrancher
 from gpu_fault.orchestration.disposition import Disposition, DispositionApplier
+from gpu_fault.orchestration.families.evidence import stops_attempt_before
 from gpu_fault.orchestration.reset_window import fixed_scope_step_indexes
 from gpu_fault.orchestration.workflow_builder import WorkflowBuilder
 from gpu_fault.orchestration.workflow_merge import workflow_is_mutable
@@ -446,7 +447,11 @@ class SxidIngestionService:
                 parameters = {**parameters, **restart_parameters}
             elif step.operation is WorkflowOperation.QUIESCE_GPU_SERVICES:
                 parameters = self.callbacks.quiesce_parameters(
-                    parameters, context.observation
+                    parameters,
+                    context.observation,
+                    attempt_stopped=stops_attempt_before(
+                        workflow.official_steps, index
+                    ),
                 )
             steps.append(
                 step.model_copy(
@@ -636,7 +641,7 @@ class SxidIngestionService:
             "sxid": event.sxid,
         }
         scoped_steps = []
-        for step in steps:
+        for index, step in enumerate(steps):
             parameters = step.parameters
             if step.operation is WorkflowOperation.STOP_WORKLOADS:
                 parameters = {
@@ -654,6 +659,7 @@ class SxidIngestionService:
                     step.operation,
                     {**parameters, "gpu_uuids_by_node": gpu_mapping},
                     reset_parameters,
+                    attempt_stopped=stops_attempt_before(steps, index),
                 )
             scoped_steps.append(
                 step.model_copy(
@@ -675,6 +681,8 @@ class SxidIngestionService:
         operation: WorkflowOperation,
         parameters: dict[str, object],
         reset_parameters: dict[str, object],
+        *,
+        attempt_stopped: bool,
     ) -> dict[str, object]:
         if operation is WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE:
             parameters.update(
@@ -698,7 +706,7 @@ class SxidIngestionService:
             }
         if operation is WorkflowOperation.QUIESCE_GPU_SERVICES:
             parameters = self.callbacks.quiesce_parameters(
-                parameters, context.observation
+                parameters, context.observation, attempt_stopped=attempt_stopped
             )
         return parameters
 

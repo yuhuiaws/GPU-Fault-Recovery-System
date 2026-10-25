@@ -191,7 +191,7 @@ def _grouped_service() -> GroupedFaultService:
             merge_disposition=unused,
             prepare_preempting_successor=unused,
             preempt_parallel_job_branch=unused,
-            quiesce_parameters=lambda parameters, observation: parameters,
+            quiesce_parameters=lambda parameters, observation, **_: parameters,
             reopen_if_terminal=unused,
             runtime_effective_action=unused,
             widen_node_action_scope=lambda workflow, scope: workflow,

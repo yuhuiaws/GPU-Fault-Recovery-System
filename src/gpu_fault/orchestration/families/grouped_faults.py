@@ -14,6 +14,7 @@ from gpu_fault.models import (
     resolved_step_indexes,
 )
 from gpu_fault.orchestration.disposition import DispositionApplier
+from gpu_fault.orchestration.families.evidence import stops_attempt_before
 from gpu_fault.orchestration.workflow_merge import workflow_is_mutable
 from gpu_fault.policy import (
     ActionDisposition,
@@ -493,6 +494,9 @@ class GroupedFaultService:
                 parameters = self.callbacks.quiesce_parameters(
                     parameters,
                     context.observation,
+                    attempt_stopped=stops_attempt_before(
+                        workflow.official_steps, index
+                    ),
                 )
             steps.append(
                 step.model_copy(
