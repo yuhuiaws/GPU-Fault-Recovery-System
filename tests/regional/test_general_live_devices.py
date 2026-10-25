@@ -160,18 +160,17 @@ def _probe(rewrites: int, **extra: Any) -> FakeProbe:
     script: dict[str, Any] = {
         "install-source": {"bytes": 1},
         "install-wrapper": {"shim": "/run/gfrs-live/source-x/bin/nvidia-smi"},
+        "build-nvidia-proc-fixture": {
+            "path": "/run/gfrs-live/source-x/fixtures/nvidia-proc",
+            "gpus": [],
+            "omit_gpus": True,
+        },
         "open-window": {
             "after": {"ActiveState": "active"},
             "proof_scope": "live-replay",
             "verification": {
                 "ok": True,
-                "checks": [
-                    {
-                        "kind": "inaccessible",
-                        "dest": "/proc/driver/nvidia/gpus",
-                        "ok": True,
-                    }
-                ],
+                "checks": [{"kind": "tree", "dest": "/proc/driver/nvidia", "ok": True}],
             },
         },
         "audit-read": {"entries": entries, "calls": {"nvidia-smi/0": rewrites}},
@@ -301,9 +300,10 @@ def _failed_docs(
 ) -> list[dict[str, Any]]:
     error = "_gpu_inventory: CollectorError: GPU inventory query failed: Failed to initialize NVML"
     if not discovered:
+        # The unit's copy of /proc/driver/nvidia has no ``gpus``: ENOENT.
         error += (
-            "; /proc/driver/nvidia/gpus could not be read (Permission denied), so the "
-            "bound GPU count is unknown as well"
+            "; /proc/driver/nvidia/gpus could not be read (No such file or "
+            "directory), so the bound GPU count is unknown as well"
         )
     batches = [
         _batch(
@@ -343,19 +343,34 @@ def test_query_failed_is_unknown_with_driver_context_not_zero(tmp_path: Path) ->
     assert result["failed_ticks_served"] == mod.FAILED_TICKS
 
 
-def test_proc_unreadable_hides_the_procfs_and_needs_no_discovered_count(
+def test_proc_unreadable_replays_a_tree_without_gpus_and_needs_no_discovered_count(
     tmp_path: Path,
 ) -> None:
+    """A root unit lists an ``InaccessiblePaths=`` directory as *empty* (0 GPUs
+    bound -- a count), so the unit gets a copy of ``/proc/driver/nvidia`` with
+    no ``gpus`` and its listing fails with ENOENT instead."""
+
     probe = _probe(mod.FAILED_TICKS)
     docs = _failed_docs(mod.INVENTORY_UNAVAILABLE, discovered=False)
     ctx = _ctx("proc_unreadable", docs=docs, tmp_path=tmp_path, probe=probe)
     result = mod.gpu_proc_unreadable(ctx)
     assert result["verdict"] == "PASS", result["errors"]
+    build = next(call for call in probe.calls if call[0] == "build-nvidia-proc-fixture")
+    assert build[1:5] == ("--source", "/proc/driver/nvidia", "--omit-gpus", "--run-id")
     opened = _opened(probe)
-    assert ("--inaccessible", "/proc/driver/nvidia/gpus") == tuple(
-        opened[opened.index("--inaccessible") : opened.index("--inaccessible") + 2]
+    assert probe.calls.index(build) < probe.calls.index(opened), (
+        "the tree is built before the window that binds it opens"
+    )
+    assert ("--tree", "nvidia-proc:/proc/driver/nvidia") == tuple(
+        opened[opened.index("--tree") : opened.index("--tree") + 2]
     ), opened
+    assert "--inaccessible" not in opened, (
+        "no InaccessiblePaths= directory: root would read it as 0 GPUs"
+    )
     assert opened[1:3] == ("--mode", "mixed"), opened
+    assert (Path(ctx.case_dir) / "nvidia-proc-fixture.json").is_file(), (
+        "the built tree is evidence of what the unit was given"
+    )
 
 
 def test_proc_unreadable_fails_when_a_count_was_fabricated(tmp_path: Path) -> None:

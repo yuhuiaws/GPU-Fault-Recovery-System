@@ -21,10 +21,14 @@ the driver's own bound GPUs under ``/proc/driver/nvidia/gpus``
 (``collectors/host/inventory.py`` ``_gpu_inventory`` / ``_discovered_gpu_count``).
 The reviewed wrapper on the unit's PATH drops one *real* UUID from one call
 (``single_sample``), or fails the query like an NVML initialisation failure for
-a few ticks (``query_failed``); ``proc_unreadable`` hides ``/proc/driver/nvidia/
-gpus`` from the unit while that query fails (the two-read-failure case the spec
-marks as the known risk); ``expectation_wrong`` overrides the expected count in
-the unit's environment. The product's own records decide: a ``gpu_inventory_
+a few ticks (``query_failed``); ``proc_unreadable`` gives the unit a copy of
+``/proc/driver/nvidia`` without ``gpus`` while that query fails, so the
+product's listing of the directory fails too (ENOENT -- the two-read-failure
+case the spec marks as the known risk; for a root unit no directory can be made
+*unreadable*: ``InaccessiblePaths=`` leaves an empty directory root lists,
+which is "zero GPUs bound", the very reading this variant must never feed the
+product); ``expectation_wrong`` overrides the expected count in the unit's
+environment. The product's own records decide: a ``gpu_inventory_
 mismatch`` finding is the CRITICAL REBOOT_NODE rule's input (``host_health.py``
 METRIC_RULES), so none of these may ever mint one, plan a hardware step or
 isolate the node; a failed query must leave ``failure_mode`` DRIVER_QUERY_FAILED
@@ -71,6 +75,7 @@ from scripts.e2e.regional.general_live_registry import (
 )
 from scripts.e2e.regional.general_live_source_replay import (
     HOST_SOURCE_REPLAY,
+    NVIDIA_PROC_TREE,
     HostSourceReplay,
     command_plan,
     host_source_replay,
@@ -303,7 +308,7 @@ def _nvidia_smi_window(
     replay: HostSourceReplay,
     rules: list[dict[str, Any]],
     *,
-    inaccessible: tuple[str, ...] = (),
+    trees: tuple[tuple[str, str], ...] = (),
 ) -> dict[str, Any]:
     plan = command_plan(
         "nvidia-smi", rules, not_after_seconds=ctx.spec.max_minutes * 60
@@ -312,7 +317,7 @@ def _nvidia_smi_window(
     ctx.evidence.write("wrapper-install", replay.install_wrapper("nvidia-smi", plan))
     opened = replay.open_window(
         wrappers=["nvidia-smi"],
-        inaccessible=list(inaccessible),
+        trees=list(trees),
         restore_seconds=ctx.spec.max_minutes * 60,
     )
     ctx.evidence.write("source-window-open", opened)
@@ -407,6 +412,15 @@ def _failed_query(ctx: VariantContext, *, proc_unreadable: bool) -> dict[str, An
     _uuids, expected = _node_gpus(ctx)
     replay = host_source_replay(ctx)
     started = utc_now()
+    if proc_unreadable:
+        # The unit reads a copy of the real /proc/driver/nvidia that has no
+        # ``gpus``: ``_discovered_gpu_count``'s listing raises (ENOENT), the
+        # same OSError branch as an unreadable directory, and the version file
+        # stays real. InaccessiblePaths= on ``gpus`` would leave root an empty
+        # directory -- 0 GPUs bound, a count, never "could not be read".
+        ctx.evidence.write(
+            "nvidia-proc-fixture", replay.build_nvidia_proc(omit_gpus=True)
+        )
     _nvidia_smi_window(
         ctx,
         replay,
@@ -420,7 +434,7 @@ def _failed_query(ctx: VariantContext, *, proc_unreadable: bool) -> dict[str, An
                 max_calls=FAILED_TICKS,
             )
         ],
-        inaccessible=("/proc/driver/nvidia/gpus",) if proc_unreadable else (),
+        trees=((NVIDIA_PROC_TREE, "/proc/driver/nvidia"),) if proc_unreadable else (),
     )
     ctx.hold(ctx.host_interval * (FAILED_TICKS + 1) + 30, name="failed-query")
     served = _read_audit(ctx, replay)
@@ -456,8 +470,9 @@ def _failed_query(ctx: VariantContext, *, proc_unreadable: bool) -> dict[str, An
     ]
     if proc_unreadable:
         notes.append(
-            "both reads failed (NVML and /proc/driver/nvidia/gpus): the inventory "
-            "is INVENTORY_UNAVAILABLE with no discovered count -- the spec's known "
+            "both reads failed (NVML, and /proc/driver/nvidia/gpus absent from the "
+            "unit's copy of the tree: ENOENT): the inventory is "
+            "INVENTORY_UNAVAILABLE with no discovered count -- the spec's known "
             "REBOOT_NODE risk must not reproduce"
         )
     return _result_012(
@@ -757,8 +772,10 @@ VARIANTS = [
     _gpu_read_path(
         "proc_unreadable",
         injection=(
-            "the same failing query while /proc/driver/nvidia/gpus is InaccessiblePaths "
-            "inside the host collector unit only (two failed reads)"
+            "the same failing query while the host collector unit reads a copy of "
+            "/proc/driver/nvidia without gpus (its listing fails: ENOENT; two failed "
+            "reads) -- not InaccessiblePaths=, which leaves a root unit an empty "
+            "directory, i.e. 0 GPUs bound"
         ),
         expected=(
             "collection error names the unreadable procfs ('unknown as well'); "
