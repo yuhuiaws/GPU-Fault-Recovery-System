@@ -1477,6 +1477,70 @@ fails the cleanup. The module tests run the real probe in-process over an
 `InMemoryStore` with the three key/value shims the SQL stores have, so the
 advisory-lock path itself is exercised only live.
 
+## GF-GENERAL-LIVE 029 hardware chain under an exhausted budget
+
+029 `hardware_chain_continues` (`scripts/e2e/regional/general_live_attempt_hardware.py`;
+`--approve GPU_RESET --approve KERNEL_SOURCE_REPLAY`, list flag `X`, both lanes)
+is the one GENERAL-LIVE variant that drives a fatal-grade kernel XID live. What
+it proves, and what it does not:
+
+- The fault is a replay. One reviewed `NVRM: Xid (PCI:<bdf>): 46, …` line
+  (`ROBUST_CHANNEL_GPU_TIMEOUT_ERROR`, pinned catalog
+  `src/gpu_fault/data/nvidia-xid-catalog-610.generated.yaml` lines 462-473,
+  `immediateAction: RESET_GPU`, H100 family; the code GF-REGIONAL-DESTR-001
+  proved the reset chain with on this hardware) enters through the kernel
+  collector's kmsg source, so the evidence says `proof_scope: live-replay` and
+  nothing physically failed. The actions are the product's own node actions --
+  cordon, stop of the managed job, quiesce, one reset of one H200, restore,
+  validate, uncordon -- read as SUCCEEDED step receipts. XID 46 alone is
+  exercised: nothing is said about the other RESET_GPU codes (62, 109, 110,
+  119/120, 136, 140, 143, 156, 158), about XID 95's pre-actions or about the
+  XID 154 dynamic recovery actions.
+- The exhausted budget is seeded, not consumed. `ExhaustedRestartBudget`
+  (built on the store-level variants' `SeededRestartBudget`, same `gl29hc-…`
+  test job id and cleanup) reserves `restart_count == budget` through
+  `store.reserve_job_restart` -- the call the executor's claim preflight makes
+  -- and records the product's refusal of one more reservation; the managed
+  training job is then created under that id with `restart_budget` 1. The
+  product cannot tell the seed from a consumed budget, but the spec's
+  "consume the budget through legitimate failures" sentence is proved by
+  `budget_consumed` / 028 `one_restart`, not here.
+- The contrast with GF-REGIONAL-ISO-007 (software XID 11, budget 0, never run
+  live) is asserted explicitly: both end FAILED on `RESTART_BUDGET_EXHAUSTED`
+  with that one FAILED step and no remote restart command; this variant
+  additionally requires RESET_GPU to have executed, every planned repair step
+  SUCCEEDED, the node uncordoned by the product's RESTORE_SCHEDULING and the
+  incident ESCALATED (QUARANTINED, or an ESCALATED incident on a still
+  isolated node, is a FAIL and the node is handed back through the validated
+  restore). It proves nothing about a second physical cluster or ISO-007's
+  cross-cluster independence.
+- The attempt is graded on the completion records: terminal STOPPED with the
+  hardware incident as initiator, decision NO_ACTION, no passive
+  `TrainingAttemptFailureDetected` containment, the ledger still the seeded
+  1/1 (a withheld restart reserves nothing), exactly one
+  `restart-budget-exhausted` notification for the incident -- the one the
+  withheld record names. GPU health is fresh accepted GPU_METRICS after the
+  RESET_GPU receipt with no active finding; a reset that released the idle
+  display stack must report it restored (`display_stack_restored`), and the
+  product's busy-reset retries are recorded (`gpu_reset_busy_attempts`), not
+  judged.
+- Cleanup is LIFO -- the kmsg window (closed as soon as the decision exists;
+  its `systemd-run --on-active` deadman restores the collector if the runner
+  dies), the test job and its prewarm Pods, then the seeded reservations and
+  the emptied test ledger row (a row that is not provably gone raises and
+  fails the variant). The job and the ledger row are cluster/control-plane
+  test objects with no deadman of their own: a run that dies leaves a
+  `gl29hc-…` row that withholds restarts of that test job only, and the next
+  attempt refuses it (`NOT_RUN(FIXTURE_NOT_READY)`) while its cleanup removes
+  it -- the same residue rule as the store-level variants.
+- Live prerequisites: an idle target node (no GPU Pods; the variant creates
+  the job itself), `--site-file`, a maintenance window (the node is cordoned
+  for the duration of the chain, hence flag `X`); HyperPod additionally
+  `NodeRecovery=None`. The module tests run the seed and notification probes
+  in-process over an `InMemoryStore` and the whole variant over scripted
+  product records; the Postgres advisory lock, the kernel collector's reopen
+  of the fixture file and the reset itself are exercised only live.
+
 ## GF-GENERAL-LIVE live acceptance runner (phase 2)
 
 Phase 2 adds the workload- and spare-centred categories through

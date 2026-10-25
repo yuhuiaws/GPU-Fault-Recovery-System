@@ -674,8 +674,8 @@ decision、restart 预算账本），绝不 POST 预制 finding/workflow。运�
 （native：exporter_timeout/sustained_unknown/post_refresh_success）、
 028 进程失败/终态、029 重启预算、031 采集器静默。延后变体留在分母并记
 `NOT_RUN`/`BLOCKED`：需产品侧读取夹具的 live-replay（004 probe_error、
-008 statistics_failed、009 errors_delta、025 的 5 个字段/别名/NaN 变体、
-029 hardware_chain_continues）、
+008 statistics_failed、009 errors_delta、025 的 5 个字段/别名/NaN 变体；
+029 hardware_chain_continues 已由下文的硬件链变体实现）、
 本站能力缺失（008 bond_vf、031 inactive_cluster/notification_failure）、
 需未授批危险分支（028 api_unreachable、029 worker_restart）。
 
@@ -705,6 +705,58 @@ fail-closed（`RESTART_RESERVATION_MISSING`）；对照组：同一步骤补全�
 他人 reservation 的行保留并记为清理失败，非 `gl29` 前缀的 job id 一律拒绝，已有账本行时记
 `NOT_RUN(FIXTURE_NOT_READY)` 并由清理移除本次运行的残留。标志 `P`（仅 lane 锁），无需
 `--approve`；`--fault-node` 仍是预检要求，但变体本身不触碰节点。
+
+029 `hardware_chain_continues`（`general_live_attempt_hardware.py`；注入为 live-replay，动作为产品
+原生节点动作；需 `--approve GPU_RESET --approve KERNEL_SOURCE_REPLAY`，标志 `X`，risk H，两条
+lane）：预算耗尽时只扣住 RESTART_WORKLOAD、既定 STOP/硬件恢复/验证仍有实际回执的实证。步骤：
+（1）`ExhaustedRestartBudget`（复用 store 层变体的 `SeededRestartBudget`：同一 `gl29hc-…` 测试
+job id、同一清理）经产品自身的 `store.reserve_job_restart`（claim 预检所用的同一调用）把该 job 的
+账本预留到 `restart_count == budget`（预算 1），再多预留一次并要求产品拒绝——耗尽由产品 API
+自证，不直接改计数；（2）以同一 job id 启动受管单节点训练任务（真实 CUDA 负载与心跳、
+`restart_budget` 1），等到 Running，使内核 XID 遇到节点上唯一的活动 attempt；（3）经 lane K 的
+kmsg 内核源回放（`inject_kernel_xid` 配本模块的 reset-grade 目录门禁 `require_reset_grade`）
+写入一条审阅过的 `NVRM: Xid (PCI:<bdf>): 46, …` 行，点名最高索引 GPU 的 PCI BDF：XID 46
+`ROBUST_CHANNEL_GPU_TIMEOUT_ERROR`（`src/gpu_fault/data/nvidia-xid-catalog-610.generated.yaml`
+第 462-473 行：`immediateAction: RESET_GPU`、产品族 A100/H100/B100/GB200、无 xid154Linkage；
+引擎直接映射为 RESET_GPU、GPU containment、无 pre-action；GF-REGIONAL-DESTR-001 在本硬件上实证
+复位链所用的同一代码；行格式即 lane K 已实跑的 `xid_message`，不自创载荷）。产品侧全程真实：
+内核采集器解析 → 目录判定 EXECUTABLE RESET_GPU → 按节点唯一活动 attempt 补全 workload →
+编译 FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → STOP_WORKLOADS → QUIESCE_GPU_SERVICES →
+VERIFY_NO_GPU_CLIENTS → RESET_GPU → RESTORE_GPU_SERVICES → VALIDATE_GPU → RESTORE_SCHEDULING →
+RESTART_WORKLOAD；claim 预检发现预算耗尽，只把 RESTART_WORKLOAD 记为
+FAILED(`RESTART_BUDGET_EXHAUSTED`，1/1，附一次通知）并 supersede 该步，其余步骤照常执行，
+工作流以预算原因结束 FAILED、incident ESCALATED（节点已由 RESTORE_SCHEDULING 解除 cordon）。
+决定一出即关闭 kmsg 窗口（窗口内真实 /dev/kmsg 不被读取）。判定只读产品记录：决定为
+KERNEL_LOG、RESET_GPU、目标 GPU、唯一且非重复；STOP_WORKLOADS/RESET_GPU/VALIDATE_GPU 必须
+SUCCEEDED，计划内的 MARK_UNSCHEDULABLE/QUIESCE/VERIFY/RESTORE_GPU_SERVICES/RESTORE_SCHEDULING
+亦须 SUCCEEDED，任何工作流不得出现 RESET_ALL_GPUS_NVSWITCHES/RESTART_NODE/REPLACE_NODE/
+QUARANTINE；RESTART_WORKLOAD 恰有一条 FAILED 记录、原因 `RESTART_BUDGET_EXHAUSTED`、计数 1/1、
+点名通知、索引已 supersede，远端命令中没有 RESTART_WORKLOAD；与 GF-REGIONAL-ISO-007（软件
+XID 11 + 预算 0、整条工作流只因预算 FAILED、从未实跑）的差异显式断言：FAILED 步骤集合恰为
+{RESTART_WORKLOAD} 且 RESET_GPU 确有执行记录；该 XID 只有一个 incident、终态 ESCALATED 且节点无
+cordon/归属注解/taint（QUARANTINED 或仍隔离即 FAIL，并经产品验证式恢复交还节点）；该 incident
+恰有一条 `restart-budget-exhausted` 通知且为扣住记录所点名；attempt 终态 STOPPED（由 incident
+发起的停止）、completion 决定 NO_ACTION、无被动 containment incident、账本仍为播种的 1/1 且
+reservation 未变（扣住的 restart 不预留）；RESET_GPU 回执之后有新的 GPU_METRICS batch 且无活动
+finding；复位若卸载了空闲显示栈必须已装回（RESET_GPU 步骤的 `display_stack_restored`；
+`gpu_reset_busy_attempts` 记入结果）。硬件链被跳过或 RESTART_WORKLOAD 实跑为 FAIL；夹具未收到行
+或行未成为 KERNEL_LOG 事件为 INCONCLUSIVE；XID 非 reset-grade、节点无 PCI BDF、已有账本行等在
+触碰节点前记 NOT_RUN。清理为 LIFO：kmsg 窗口（已提前关闭，自带 `systemd-run --on-active`
+deadman）→ 删除测试任务与预热 Pod → 经产品 API 释放播种的 reservation 并删除清空的测试行（行
+未证明消失即抛错，整项 FAIL）。账本行与任务是控制面/集群侧测试对象：运行器中途死亡只会留下一行
+只扣住该测试 job 的 `gl29hc-…` 账本，下次同 attempt 重跑拒绝（NOT_RUN）并由其清理移除，与 store
+层变体同一残留规则。现场前提：目标节点空闲（无 GPU Pod）、`--site-file`、维护窗口（链路期间
+节点被 cordon，故标志 `X`）；HyperPod 另需 `NodeRecovery=None`。计划/执行形如：
+
+```bash
+run_general_live.py --site-profile <profile> --run-dir <run> \
+  --case GF-GENERAL-LIVE-029 --variant hardware_chain_continues --fault-node <node> \
+  --site-file <site.yaml> --approve GPU_RESET --approve KERNEL_SOURCE_REPLAY --plan
+run_general_live.py --site-profile <profile> --run-dir <run> \
+  --case GF-GENERAL-LIVE-029 --variant hardware_chain_continues --fault-node <node> \
+  --site-file <site.yaml> --approve GPU_RESET --approve KERNEL_SOURCE_REPLAY --execute \
+  --confirm GENERALLIVE029_EXECUTE --maintenance-window-end <UTC>
+```
 
 009 `tcp_only`（native 负例：TCP 重传不是网卡错误，`general_live_tcp.py`）：网卡探针
 建 `gfrs<digest>ns` 测试 netns 与一对 gfrs veth（复用 gfrs-only 建接口与真实网卡守卫，
