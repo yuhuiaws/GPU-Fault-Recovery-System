@@ -83,6 +83,18 @@ PASS_THROUGH_READS = 3
 #: pass-through by itself, and the deadman restores the unit later still.
 TOOL_MARGIN_SECONDS = 300
 DEADMAN_MARGIN_SECONDS = 600
+#: The collector's scrape interval when the node did not report its own: the
+#: product's default (``collectors_cli._dcgm_arguments``).
+INTERVAL_KEY = "GPU_FAULT_METRICS_INTERVAL_SECONDS"
+DEFAULT_INTERVAL_SECONDS = 15
+#: The oracle gate after ``arm``: the plan moves only when the collector
+#: scrapes, so the first replayed reading takes the plan's pass-through reads
+#: plus one more scrape. The gate allows that many scrapes, two slack ones (a
+#: skipped or late scrape) and a fixed grace for the restarted collector's
+#: phase and the probe round trips, polling the journal in between.
+SERVE_SLACK_READS = 2
+SERVE_GRACE_SECONDS = 90
+SERVE_POLL_SECONDS = 10
 
 
 # --------------------------------------------------------------------------- #
@@ -384,6 +396,37 @@ def baseline() -> dict[str, Any]:
     return step(PASS_THROUGH_READS)
 
 
+def leading_passthrough_reads(plan: dict[str, Any]) -> int:
+    """The armed reads a plan spends before its first operation (``baseline``).
+
+    Those reads serve nothing by design; the oracle gate waits past them.
+    """
+
+    count = 0
+    for item in plan.get("steps") or []:
+        if item.get("ops"):
+            break
+        count += int(item.get("reads") or 0)
+    return count
+
+
+def collector_interval(repoint: dict[str, Any], *, default: int) -> int:
+    """The repointed collector's scrape interval, from its real environment.
+
+    The probe's ``repoint-collector`` receipt carries the allow-listed keys of
+    the restarted process's environment; the product reads this one as a
+    float. A receipt without it (an older probe) or a malformed value keeps
+    ``default``.
+    """
+
+    raw = (repoint.get("process_environment") or {}).get(INTERVAL_KEY)
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
 def at_limit_increment(interval: int, rate_per_minute: float = 8.0) -> int:
     """The largest per-read PCIe increment that never exceeds ``rate``.
 
@@ -435,6 +478,8 @@ class DcgmReplay:
     inventory_plan: dict[str, Any] | None = None
     boot_id: str = ""
     unknown_expected_count: bool = False
+    #: The repointed collector's scrape interval; ``deploy`` reads the real one.
+    interval: int = DEFAULT_INTERVAL_SECONDS
     audit_offset: int = 0
     inventory_offset: int = 0
     records: list[dict[str, Any]] = field(default_factory=list)
@@ -503,6 +548,9 @@ class DcgmReplay:
             repoint.append("--unknown-expected-count")
         self.receipts["repoint"] = self.ctx.dcgm(*repoint, timeout=180)
         self.repointed = True
+        self.interval = collector_interval(
+            self.receipts["repoint"], default=self.interval
+        )
         self.ctx.evidence.write("dcgm-replay-deploy", self.receipts)
 
     def arm(self) -> dict[str, Any]:
@@ -587,32 +635,97 @@ class DcgmReplay:
                 f"the inventory replay was not effective: {detail}"
             )
 
-    def served_any(self, key: str) -> bool:
-        """Whether the replay ever served a non-null value for ``<gpu>/<field>``."""
-
-        self.audit()
+    def _served(self, key: str) -> bool:
         return any(
             (record.get("served") or {}).get(key) is not None
             for record in self.records
             if record.get("armed")
         )
 
-    def aborted(self) -> str | None:
-        self.audit()
+    def _aborted(self) -> str | None:
         for record in self.records:
             if record.get("aborted"):
                 return str(record["aborted"])
         return None
 
-    def require_effective(self, *keys: str) -> None:
-        """The oracle gate: the replay really served ``keys`` and never aborted."""
+    def armed_reads(self) -> list[dict[str, Any]]:
+        """The journal's armed collector reads so far (events are not reads)."""
 
-        aborted = self.aborted()
+        return [
+            record
+            for record in self.records
+            if record.get("armed") and record.get("read") is not None
+        ]
+
+    def served_any(self, key: str) -> bool:
+        """Whether the replay ever served a non-null value for ``<gpu>/<field>``."""
+
+        self.audit()
+        return self._served(key)
+
+    def aborted(self) -> str | None:
+        self.audit()
+        return self._aborted()
+
+    def _gate(self, keys: Sequence[str]) -> list[str]:
+        """Read the journal once; raise on an abort, return the unserved keys."""
+
+        self.audit()
+        aborted = self._aborted()
         if aborted:
             raise VariantInconclusive(f"the replay aborted: {aborted}")
-        missing = [key for key in keys if not self.served_any(key)]
+        return [key for key in keys if not self._served(key)]
+
+    def require_effective(self, *keys: str) -> None:
+        """The oracle gate, judged now: the replay served ``keys``, no abort."""
+
+        missing = self._gate(keys)
         if missing:
             raise VariantInconclusive("the replay never served " + ", ".join(missing))
+
+    def serve_timeout_seconds(self) -> int:
+        """How long the first replayed reading of this plan may take."""
+
+        reads = leading_passthrough_reads(self.plan) + 1 + SERVE_SLACK_READS
+        return reads * self.interval + SERVE_GRACE_SECONDS
+
+    def wait_served(self, *keys: str) -> None:
+        """The oracle gate, waited for: poll the journal until the replay has
+        served every key once, the replay aborts, or the deadline passes.
+
+        The plan only moves when the collector scrapes, and its leading
+        pass-through reads serve nothing by design -- a journal judged right
+        after ``arm`` holds nothing else (live 2026-10-25: two baseline reads
+        of a 15-s collector, every 019 variant INCONCLUSIVE "never served").
+        An abort is final and raised at once; a deadline names the reads the
+        journal did hold, so a collector that never scraped the replay reads
+        differently from one that had not reached the step yet.
+        """
+
+        timeout = self.serve_timeout_seconds()
+
+        def served() -> dict[str, Any] | None:
+            missing = self._gate(keys)
+            if missing:
+                return None
+            return {"served": list(keys), "armed_reads": len(self.armed_reads())}
+
+        value = self.ctx.wait_until(
+            served,
+            timeout_seconds=timeout,
+            poll_seconds=SERVE_POLL_SECONDS,
+            name="replay-served",
+        )
+        if value is not None:
+            return
+        reads = self.armed_reads()
+        missing = [key for key in keys if not self._served(key)]
+        seen = f"{len(reads)} armed read{'s' if len(reads) != 1 else ''}"
+        if reads:
+            seen += f", the last at plan step {reads[-1].get('step')}"
+        raise VariantInconclusive(
+            f"the replay never served {', '.join(missing)} within {timeout} s: {seen}"
+        )
 
     def close(self) -> dict[str, Any]:
         """Disarm, restore the collector endpoint, stop the tool, prove it clean.
@@ -667,12 +780,19 @@ def cleanup_message(node: str, leftover: Sequence[str], errors: Sequence[str]) -
 
 
 def arm_and_confirm(replay: DcgmReplay, *served_keys: str) -> None:
-    """Deploy, let a few normal samples through, arm, and gate on the oracle."""
+    """Deploy, arm, and gate on the oracle once the collector reached the step.
+
+    The gate waits (``DcgmReplay.wait_served``): the collector scrapes on its
+    own interval and the plan's pass-through baseline reads serve nothing, so
+    the journal is judged when it can hold a replayed reading, not right
+    after ``arm``. Without keys there is no gate (the variant reads the
+    journal itself).
+    """
 
     replay.deploy()
     replay.arm()
     if served_keys:
-        replay.require_effective(*served_keys)
+        replay.wait_served(*served_keys)
 
 
 def wait_accepted(
@@ -858,6 +978,7 @@ def _all_workflows(state: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 __all__ = [
+    "DEFAULT_INTERVAL_SECONDS",
     "DcgmReplay",
     "GPU_KINDS",
     "ReplayCleanupError",
@@ -874,9 +995,11 @@ __all__ = [
     "at_limit_increment",
     "baseline",
     "cleanup_message",
+    "collector_interval",
     "passthrough_plan",
     "clear",
     "label",
+    "leading_passthrough_reads",
     "over_limit_increment",
     "plan",
     "put",

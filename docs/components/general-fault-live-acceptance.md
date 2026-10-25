@@ -1021,6 +1021,15 @@ run_general_live.py --site-profile <profile> --run-dir <run> \
   单元 fork 即 active，沙箱建立期间 `/proc/<pid>/environ` 仍是 systemd 自身的环境——
   超过等待窗口或读到真实端点才算失败；探针失败行带异常类、消息摘要与 `函数:行` 位点，
   运行器把子命令名前置到 `HostProbeError`。
+- **arm 后的有效性门**（2026-10-25 现场：两台 plain-EKS 节点上 019 的 6 个回放变体全部
+  INCONCLUSIVE "the replay never served"——运行器在 arm 后约 30 s 即判回放日志，而 15 s
+  间隔的采集器只抓了两次，都落在计划开头按设计不改任何读数的 3 次透传基线读里）：
+  `arm_and_confirm` 不立即判定，而是轮询 `audit-read` 直到日志出现第一条真正回放的读数
+  （`served` 含目标 `<GPU>/<字段>`）；上限 =（基线读数 + 1 + 2 次余量）× 采集间隔 + 90 s
+  宽限，间隔取 `repoint-collector` 回执里重指后采集进程真实环境的
+  `GPU_FAULT_METRICS_INTERVAL_SECONDS`（默认 15 s，本站上限即 180 s）。回放 abort 立即判
+  INCONCLUSIVE；超时的 INCONCLUSIVE 写明日志里的 armed 读数与最后所到的计划步骤，
+  以区分"采集器根本没抓回放"与"尚未走到回放步骤"。
 
 需审批与独占节点的变体：019 `pending_supported`/`post_reset` 单卡 service-window
 reset 需 `--approve GPU_RESET`；021 任一 finding 都驱动全 GPU+NVSwitch reset，故

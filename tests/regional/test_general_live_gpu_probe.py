@@ -49,6 +49,7 @@ def test_process_environment_reads_only_allow_listed_keys(
     environ.write_bytes(
         b"GPU_FAULT_DCGM_METRICS_URL=http://127.0.0.1:9412/metrics\x00"
         b"AWS_SECRET_ACCESS_KEY=supersecret\x00"
+        b"GPU_FAULT_METRICS_INTERVAL_SECONDS=15\x00"
         b"PATH=/run/gfrs-live/x/bin:/usr/bin\x00"
     )
 
@@ -62,6 +63,9 @@ def test_process_environment_reads_only_allow_listed_keys(
     monkeypatch.setattr(probe, "Path", lambda value: FakePath(value))
     values = probe.process_environment("123")
     assert values["GPU_FAULT_DCGM_METRICS_URL"].endswith(":9412/metrics"), values
+    assert values["GPU_FAULT_METRICS_INTERVAL_SECONDS"] == "15", (
+        "the runner paces its oracle gate by the collector's real interval"
+    )
     assert "AWS_SECRET_ACCESS_KEY" not in values, "secrets never leave the node"
 
 

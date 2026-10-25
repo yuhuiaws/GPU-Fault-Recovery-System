@@ -119,13 +119,15 @@ ENV_KEYS = (
     "GPU_FAULT_NVLINK_ERROR_DELTA_CRITICAL",
     "GPU_FAULT_EXPECTED_GPU_COUNT",
 )
-#: Process-environment keys the repoint verification may read.
+#: Process-environment keys the repoint verification may read. The scrape
+#: interval is what the runner's oracle gate paces its wait by.
 PROCESS_KEYS = (
     ENDPOINT_ENV,
     "PATH",
     "GPU_FAULT_BOOT_ID_PATH",
     "GPU_FAULT_EXPECTED_GPU_COUNT",
     "GPU_FAULT_NODE_INSTANCE_TYPE",
+    "GPU_FAULT_METRICS_INTERVAL_SECONDS",
 )
 #: The expected-count inputs the unknown-count variant blanks (discovery.py:
 #: ``expected_gpu_count_from_environment``); an unknown instance type answers

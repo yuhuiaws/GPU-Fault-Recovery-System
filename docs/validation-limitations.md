@@ -1727,8 +1727,32 @@ environment of a restarted collector is read only once the process has exec'd
 start -- naming each drop-in, unit, run directory and deadman fire time -- while
 an earlier run's objects are on the node, reclaiming only this fixture's own
 leftovers whose deadman has elapsed, never a pending one and never a foreign
-drop-in or directory. Neither variant has product evidence yet; both are to be
-re-run.
+drop-in or directory.
+
+The second live contact (2026-10-25 11:09-11:29Z, the same release, both
+plain-EKS nodes) got through the repoint and ended every 019 replay variant
+(`corrected_ecc`, `remap_failure`, `volatile_dbe`, `aggregate_dbe`,
+`pending_supported`, `post_reset`) INCONCLUSIVE "the replay never served
+`<GPU>/<field>`" about 30 s after `arm`, with the node clean afterwards. The
+replay journals held exactly two armed reads, both in the plan's three
+pass-through baseline reads (`baseline()`, which serve nothing by design): the
+collector scrapes every 15 s and the first replayed reading comes with its
+fourth armed scrape, but `arm_and_confirm` judged the journal at once. Nothing
+below the runner failed -- the proxy unit, the drop-in, the collector's reads
+of the replay and the close are all in the receipts -- and no product record
+was ever consulted; the variants carry no product evidence either way.
+`arm_and_confirm` now waits for the first replayed reading
+(`DcgmReplay.wait_served`, polled through `audit-read`, bounded by the plan's
+leading pass-through reads plus three scrapes at the repointed collector's own
+`GPU_FAULT_METRICS_INTERVAL_SECONDS` -- read from its process environment in
+the repoint receipt, default 15 s -- plus 90 s; 180 s on this site), ends at
+once on a replay abort, and a deadline names the armed reads the journal did
+hold and the plan step they reached, so "the collector never scraped the
+replay" reads differently from "the step was not reached yet"
+(`tests/regional/test_general_live_gpu_replay_wait.py`, over the live journal
+shape). Every replay-based DCGM category (019-022, 024, 025) goes through the
+same gate; 025's keyless variants keep their own settle hold. All six 019
+variants are to be re-run; they still have no product evidence.
 
 The reset-driving variants need an explicit approval and an exclusive node:
 019 `pending_supported` / `post_reset` need `--approve GPU_RESET` (a
