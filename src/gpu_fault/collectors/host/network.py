@@ -18,7 +18,10 @@ LOGGER = logging.getLogger(__name__)
 
 #: The sysfs counters behind each per-interface delta sample. Read as one unit:
 #: ``_delta`` advances a baseline as it reads it, so a counter that fails to
-#: parse must not have consumed another counter's interval already.
+#: parse must not have consumed another counter's interval already. Each file
+#: keeps its own baseline (``net/<interface>/<metric>/<file>``): a reset is
+#: detected per counter, where ``rx_errors`` falling back to 1 while
+#: ``tx_errors`` climbs would otherwise sum to an unchanged, "clean" total.
 _COUNTER_FILES: dict[str, tuple[str, ...]] = {
     "network_errors_delta": ("rx_errors", "tx_errors"),
     "network_drops_delta": ("rx_dropped", "tx_dropped"),
@@ -201,33 +204,69 @@ class HostNetworkMixin:
                 )
             )
         try:
-            totals = {
-                metric: sum(
-                    read_counter(interface / "statistics" / filename)
-                    for filename in files
-                )
+            counters = {
+                (metric, filename): read_counter(interface / "statistics" / filename)
                 for metric, files in _COUNTER_FILES.items()
+                for filename in files
             }
         except (OSError, ValueError) as exc:
             raise HostObservationError(
                 f"statistics unavailable: {exc}", result
             ) from exc
-        for metric, total in totals.items():
-            change = self._delta(
-                f"net/{name}/{metric}",
-                total,
-                observed_at,
-            )
-            if change and _is_reportable(metric, change[0]):
-                result.append(
-                    self._sample(
-                        metric,
-                        change[0],
-                        "packets",
-                        name,
-                    )
+        # A counter below its baseline is a reset, not "no errors": the delta
+        # ``_delta`` clamps to 0 is a reading (``_ZERO_IS_A_READING``) that
+        # clears an active ``network_errors_delta`` signal, restarts the drops
+        # sustain window and passes VALIDATE_FABRIC, and the next increase
+        # then mints the same fault as a new incident. The metric is unknown
+        # for this tick (a collection error naming the counter), its baseline
+        # re-armed from the new value; the other metric is still a reading.
+        problems: list[str] = []
+        for metric, files in _COUNTER_FILES.items():
+            total = 0.0
+            complete = True
+            for filename in files:
+                value = float(counters[metric, filename])
+                change, reset_from = self._monotonic_delta(
+                    f"net/{name}/{metric}/{filename}", value, observed_at
                 )
+                if reset_from is not None:
+                    problems.append(self._reset_problem(filename, reset_from, value))
+                    complete = False
+                elif change is None:
+                    complete = False
+                else:
+                    total += change[0]
+            if complete and _is_reportable(metric, total):
+                result.append(self._sample(metric, total, "packets", name))
+        if problems:
+            raise HostObservationError("; ".join(problems), result)
         return result
+
+    def _monotonic_delta(
+        self, key: str, value: float, observed_at: datetime
+    ) -> tuple[tuple[float, float] | None, float | None]:
+        """``_delta`` plus the baseline a reset counter fell below.
+
+        ``_delta`` clamps a counter that went backwards to a 0 delta and moves
+        the baseline on. The clamp is right for the rates the other
+        contributors derive; for the error counters here a 0 is a reading
+        (:data:`_ZERO_IS_A_READING`) that would clear a signal nothing
+        measured. Returns the ``_delta`` result and, when the counter read
+        below its baseline, that baseline, so the caller can withhold the
+        delta and name the reset. The baseline is re-armed either way.
+        """
+
+        before = self._previous.get(key)
+        change = self._delta(key, value, observed_at)
+        if before is not None and value < before[0]:
+            return change, before[0]
+        return change, None
+
+    @staticmethod
+    def _reset_problem(counter: str, before: float, value: float) -> str:
+        """The one wording every counter reader uses for a reset tick."""
+
+        return f"{counter} reset ({before:g} -> {value:g}); delta unknown"
 
     def _prune_interface_counters(self, seen: set[str]) -> None:
         """Drop the counter baselines of interfaces this tick did not see.
@@ -332,50 +371,46 @@ class HostNetworkMixin:
                         )
                     )
                 total = 0.0
-                for counter in counter_names:
+                # A counter below its baseline is a reset (GF-GENERAL-LIVE-010
+                # counter_reset), handled as ``_ethtool_counters`` handles its
+                # groups: the counter's own delta and the port's
+                # ``rdma_errors_delta`` -- the delta of the counter sum, which
+                # a reset lowers or, with another counter climbing, leaves
+                # misleadingly unchanged -- are unknown for this tick, named
+                # in a collection error, and measured from the new baseline
+                # on the next one. ``_delta`` clamped the reset to a 0 that
+                # cleared the active signal, passed VALIDATE_FABRIC and let the
+                # continuing increase mint the fault again.
+                resets: list[str] = []
+                readings: list[tuple[str, float]] = []
+                for counter in sorted(counter_names):
                     path = port / "counters" / counter
                     if path.exists():
-                        value = float(path.read_text().strip())
-                        total += value
-                        change = self._delta(
-                            (f"rdma/{device.name}/{port.name}/{counter}"),
-                            value,
-                            observed_at,
-                        )
-                        if change and _is_reportable(
-                            f"rdma_{counter}_delta", change[0]
-                        ):
-                            result.append(
-                                self._sample(
-                                    f"rdma_{counter}_delta",
-                                    change[0],
-                                    "events",
-                                    f"{device.name}/{port.name}",
-                                )
-                            )
-                for counter in hw_counter_names:
+                        readings.append((counter, float(path.read_text().strip())))
+                for counter in sorted(hw_counter_names):
                     path = port / "hw_counters" / counter
                     if path.exists():
                         raw = path.read_text().strip()
                         if raw.isdigit():
-                            value = float(raw)
-                            total += value
-                            change = self._delta(
-                                (f"rdma/{device.name}/{port.name}/{counter}"),
-                                value,
-                                observed_at,
+                            readings.append((counter, float(raw)))
+                for counter, value in readings:
+                    total += value
+                    change, reset_from = self._monotonic_delta(
+                        f"rdma/{device.name}/{port.name}/{counter}",
+                        value,
+                        observed_at,
+                    )
+                    if reset_from is not None:
+                        resets.append(self._reset_problem(counter, reset_from, value))
+                    elif change and _is_reportable(f"rdma_{counter}_delta", change[0]):
+                        result.append(
+                            self._sample(
+                                f"rdma_{counter}_delta",
+                                change[0],
+                                "events",
+                                f"{device.name}/{port.name}",
                             )
-                            if change and _is_reportable(
-                                f"rdma_{counter}_delta", change[0]
-                            ):
-                                result.append(
-                                    self._sample(
-                                        f"rdma_{counter}_delta",
-                                        change[0],
-                                        "events",
-                                        (f"{device.name}/{port.name}"),
-                                    )
-                                )
+                        )
                 try:
                     traffic_samples, traffic, error = port_traffic(
                         port, observed_at, self._previous, self._delta
@@ -391,8 +426,16 @@ class HostNetworkMixin:
                     aggregate_traffic_delta += traffic[0]
                     aggregate_rate += traffic[0] / traffic[1]
                 key = f"rdma/{device.name}/{port.name}"
-                change = self._delta(key, total, observed_at)
-                if change:
+                change, reset_from = self._monotonic_delta(key, total, observed_at)
+                if reset_from is not None and not resets:
+                    # No counter fell below its own baseline, yet the sum did:
+                    # a counter the port no longer exposes. Not zero errors.
+                    resets.append(
+                        self._reset_problem("error counter total", reset_from, total)
+                    )
+                if resets:
+                    errors.append(f"{device.name}/{port.name}: " + "; ".join(resets))
+                elif change:
                     result.append(
                         self._sample(
                             "rdma_errors_delta",
@@ -514,16 +557,14 @@ class HostNetworkMixin:
                 problems.append(f"{name} is not a counter: {raw[:40]!r}")
                 continue
             value = float(raw)
-            key = f"ethtool/{interface}/{name}"
-            before = self._previous.get(key)
-            change = self._delta(key, value, observed_at)
-            if before is not None and value < before[0]:
+            change, reset_from = self._monotonic_delta(
+                f"ethtool/{interface}/{name}", value, observed_at
+            )
+            if reset_from is not None:
                 # ``_delta`` clamps a reset to 0; that zero would clear an
                 # active error signal although nothing was measured.
                 incomplete.add(metric)
-                problems.append(
-                    f"{name} reset ({before[0]:g} -> {value:g}); delta unknown"
-                )
+                problems.append(self._reset_problem(name, reset_from, value))
             elif change is None:
                 # First reading, or no time has passed: a baseline, no delta.
                 incomplete.add(metric)

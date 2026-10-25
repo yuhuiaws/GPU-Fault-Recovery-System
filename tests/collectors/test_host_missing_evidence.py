@@ -19,6 +19,10 @@ import pytest
 from gpu_fault.host_diagnostics import validate_host_metrics
 from gpu_fault.host_health import HostMetricSample, HostTelemetryBatch, NodeHealthPolicy
 from gpu_fault.models import RecoveryAction, Severity
+from gpu_fault.store.shared.health_signals import (
+    finding_health_signal_fingerprint,
+    finding_health_signal_key,
+)
 from scripts.e2e.regional import general_live_bmc as bmc
 from tests._builders import build_store
 from tests.collectors import _cov95_runtime_collect as common
@@ -405,6 +409,200 @@ def test_a_non_numeric_ethtool_counter_is_unknown_not_zero(host_case):
     )
     assert any("cq_err" in error for error in batch.collection_errors), (
         batch.collection_errors
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 010 EFA sysfs counters (the ``_rdma`` reader)
+# --------------------------------------------------------------------------- #
+RDMA_PORT = "rdmap0/1"
+
+
+def efa_sysfs_port(case, **counters: int):
+    """One EFA port whose ``counters/`` files start at the given values."""
+
+    device = case.roots.rdma / "rdmap0"
+    support.write_file(device / "device/uevent", "DRIVER=efa\n")
+    port = device / "ports/1"
+    support.write_file(port / "state", "4: ACTIVE\n")
+    for name, value in counters.items():
+        support.write_file(port / "counters" / name, f"{value}\n")
+    return port
+
+
+def rdma_deltas(batch) -> dict[tuple[str, str | None], float]:
+    return {
+        key: value
+        for key, value in support.values(batch).items()
+        if key[0].startswith("rdma_") and key[0].endswith("_delta")
+    }
+
+
+def incidents(policy, batches, metric: str) -> list[float]:
+    """The values that minted a finding for ``metric`` over a batch sequence.
+
+    Latches every emitted finding the way the ingest's finish half does after
+    the incident commits (P0-38B); without that a still-active signal emits on
+    every sample and one incident is indistinguishable from a re-minted one.
+    """
+
+    minted = []
+    for batch in batches:
+        for finding in policy.evaluate_metrics(batch):
+            if finding.metric_name == metric:
+                minted.append(finding.value)
+            policy.store.mark_health_signal_notified(
+                finding_health_signal_key(finding),
+                notified_at=batch.observed_at,
+                semantic_fingerprint=finding_health_signal_fingerprint(finding),
+            )
+    return minted
+
+
+def test_a_sysfs_rdma_counter_reset_is_unknown_not_a_recovery(host_case):
+    """The ``ethtool`` reader's reset rule, applied to the sysfs reader.
+
+    ``_delta`` clamped a counter below its baseline to 0 and ``_rdma`` shipped
+    it as ``rdma_errors_delta=0``: a reading that cleared the active signal,
+    that VALIDATE_FABRIC accepted as a clean port, and after which the
+    continuing increase minted the same fault as a second incident. A reset
+    is missing evidence: UNKNOWN for that tick, the baseline re-armed, the
+    next increase measured from the new value (GF-GENERAL-LIVE-010
+    counter_reset).
+    """
+
+    port = efa_sysfs_port(host_case, symbol_error=0)
+    collector = host_case.build("_rdma")
+    policy = NodeHealthPolicy(build_store())
+    readings = []
+    for value in (0, 5, 10, 1, 3, 3):
+        (port / "counters/symbol_error").write_text(f"{value}\n")
+        readings.append(collector.collect_once())
+        host_case.clock.sleep(15)
+
+    _, _, ramp, reset, after, quiet = readings
+    assert rdma_deltas(ramp) == {
+        ("rdma_errors_delta", RDMA_PORT): 5,
+        ("rdma_symbol_error_delta", RDMA_PORT): 5,
+    }, ramp.samples
+    assert rdma_deltas(reset) == {}, (
+        f"a reset counter reported a delta: {reset.samples}"
+    )
+    assert any(
+        "_rdma" in error
+        and RDMA_PORT in error
+        and "symbol_error reset (10 -> 1); delta unknown" in error
+        for error in reset.collection_errors
+    ), f"the reset tick must name the reader, the port and the counter: {reset}"
+    assert rdma_deltas(after) == {
+        ("rdma_errors_delta", RDMA_PORT): 2,
+        ("rdma_symbol_error_delta", RDMA_PORT): 2,
+    }, f"the reading after the reset is measured from the new baseline: {after}"
+    assert after.collection_errors == [], after.collection_errors
+    assert rdma_deltas(quiet) == {("rdma_errors_delta", RDMA_PORT): 0}, (
+        f"a quiet tick after the reset is a real zero reading: {quiet.samples}"
+    )
+    assert all(sample.value >= 0 for batch in readings for sample in batch.samples), (
+        "a counter delta went negative"
+    )
+    assert incidents(policy, readings, "rdma_errors_delta") == [5], (
+        "the reset tick cleared the signal and the next increase re-minted it"
+    )
+
+
+def test_a_sysfs_rdma_counter_total_going_backwards_is_unknown(host_case):
+    """A counter the port stopped exposing is not a drop to zero errors.
+
+    The per-port ``rdma_errors_delta`` is the delta of the counter *sum*; a
+    counter file that disappears lowers the sum without any counter reading
+    below its own baseline, and the clamped 0 shipped as a clean port.
+    """
+
+    port = efa_sysfs_port(host_case, symbol_error=4, link_downed=6)
+    collector = host_case.build("_rdma")
+    collector.collect_once()
+    host_case.clock.sleep(15)
+    (port / "counters/link_downed").unlink()
+
+    batch = collector.collect_once()
+
+    assert rdma_deltas(batch) == {}, batch.samples
+    assert any(
+        RDMA_PORT in error and "reset (10 -> 4); delta unknown" in error
+        for error in batch.collection_errors
+    ), batch.collection_errors
+
+
+# --------------------------------------------------------------------------- #
+# 009 netdev statistics counters (the ``_network`` reader)
+# --------------------------------------------------------------------------- #
+def physical_netdev(case, name: str, **counters: int):
+    interface = case.roots.net / name
+    (interface / "device").mkdir(parents=True)
+    support.write_file(interface / "operstate", "up\n")
+    for counter in ("rx_errors", "tx_errors", "rx_dropped", "tx_dropped"):
+        support.write_file(
+            interface / "statistics" / counter, f"{counters.get(counter, 0)}\n"
+        )
+    return interface
+
+
+def netdev_deltas(batch) -> dict[tuple[str, str | None], float]:
+    return {
+        key: value
+        for key, value in support.values(batch).items()
+        if key[0] in {"network_errors_delta", "network_drops_delta"}
+    }
+
+
+def test_a_netdev_statistics_counter_reset_is_unknown_not_a_recovery(host_case):
+    """Same clamp, same consumer: ``network_errors_delta`` is graded at 1,
+    kept as a latest value for VALIDATE_FABRIC and clears on a 0 reading.
+
+    The reset is per counter: the drop counters did not reset, so their delta
+    is still a reading on the reset tick, as is the link state
+    (GF-GENERAL-LIVE-009 counter_reset).
+    """
+
+    interface = physical_netdev(host_case, "eth0", rx_dropped=7)
+    collector = host_case.build("_network")
+    policy = NodeHealthPolicy(build_store())
+    readings = []
+    for value in (0, 5, 10, 1, 3, 3):
+        (interface / "statistics/rx_errors").write_text(f"{value}\n")
+        readings.append(collector.collect_once())
+        host_case.clock.sleep(15)
+
+    _, _, ramp, reset, after, quiet = readings
+    assert netdev_deltas(ramp) == {
+        ("network_errors_delta", "eth0"): 5,
+        ("network_drops_delta", "eth0"): 0,
+    }, ramp.samples
+    assert netdev_deltas(reset) == {("network_drops_delta", "eth0"): 0}, (
+        f"a reset counter reported a delta, or an unrelated one lost its: "
+        f"{reset.samples}"
+    )
+    assert support.values(reset)[("network_link_up", "eth0")] == 1, reset.samples
+    assert any(
+        "_network" in error
+        and "eth0" in error
+        and "rx_errors reset (10 -> 1); delta unknown" in error
+        for error in reset.collection_errors
+    ), f"the reset tick must name the reader, the netdev and the counter: {reset}"
+    assert netdev_deltas(after) == {
+        ("network_errors_delta", "eth0"): 2,
+        ("network_drops_delta", "eth0"): 0,
+    }, f"the reading after the reset is measured from the new baseline: {after}"
+    assert after.collection_errors == [], after.collection_errors
+    assert netdev_deltas(quiet) == {
+        ("network_errors_delta", "eth0"): 0,
+        ("network_drops_delta", "eth0"): 0,
+    }, f"a quiet tick after the reset is a real zero reading: {quiet.samples}"
+    assert all(sample.value >= 0 for batch in readings for sample in batch.samples), (
+        "a counter delta went negative"
+    )
+    assert incidents(policy, readings, "network_errors_delta") == [5], (
+        "the reset tick cleared the signal and the next increase re-minted it"
     )
 
 
