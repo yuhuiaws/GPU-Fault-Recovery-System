@@ -755,6 +755,10 @@ heartbeat use the template identity provided by the release: the template source
 cluster's host DCGM mode into `sha256("<source digest>:dcgm-hostengine:host")` (`regional_release_node_identity`), so a
 release that only changes the node configuration also leaves the nodes PENDING in the fleet and rolls them through the
 Agent waves. The two must not reuse the same self-referencing variable.
+The installer version the reconciler renders the Job and its node identity (`gpu-fault.io/installer-version`) with,
+`GPU_FAULT_VERSION`, comes from the release too: the version of the candidate's bundle file, or for a rollback of the
+previous bundle key the snapshot captured (`pin_installer_version`), never the value exported in the deploy host's
+shell; the same version names the bundle the Job unpacks, and the script refuses one its ConfigMap does not carry.
 previous separately stores the `GPU_FAULT_INSTALLER_TEMPLATE_CONTENT_SHA256` the old Reconciler already trusted,
 and uses it to validate the full bytes of the actual `job.yaml` in the ConfigMap as well as the old dependency image/inventory/read-only mounts;
 the digest must not be recomputed over the mutable live Job and then authorized as the old version. An explicit template override must also provide that

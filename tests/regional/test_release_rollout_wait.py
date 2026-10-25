@@ -292,7 +292,13 @@ def test_reconciler_deploy_uses_progress_aware_wait(
         "wait",
     ], "script, node-scope stamp, then the one progress-aware wait"
     assert environments == [
-        {**rendered_identity, "GPU_FAULT_WAIT_FOR_RECONCILER_ROLLOUT": "false"}
+        {
+            **rendered_identity,
+            # The release names no bundle file: the script's own default
+            # version, never one inherited from the deploy host's shell.
+            "GPU_FAULT_VERSION": "",
+            "GPU_FAULT_WAIT_FOR_RECONCILER_ROLLOUT": "false",
+        }
     ]
     (patch,) = patches
     assert (

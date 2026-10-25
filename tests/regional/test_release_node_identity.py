@@ -203,6 +203,65 @@ def test_status_names_the_identity_each_clusters_agents_report(tmp_path: Path) -
     ), "a host-mode cluster's Agents report the folded identity, not the source"
 
 
+# --- the installer version ----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "version"),
+    [
+        ("gpu-fault-node-installer-0.10.0.tar.gz", "0.10.0"),
+        ("gpu-fault-node-installer-1.2.3rc1+local.tar.gz", "1.2.3rc1+local"),
+        ("gpu-fault-node-installer-.tar.gz", ""),
+        ("gpu-fault-node-installer-0.10.0.tar.gz.bak", ""),
+        ("gpu-fault-node-installer-a#b.tar.gz", ""),
+        ("custom-bundle.tar.gz", ""),
+        (None, ""),
+    ],
+)
+def test_the_installer_version_is_the_bundle_files(name, version) -> None:
+    assert IDENTITY.installer_bundle_version(name) == version
+
+
+def test_the_pinned_version_is_the_rolled_bundles_never_the_shells(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The candidate's bundle file for a forward deploy, the captured key of the
+    previous bundle for a rollback; with neither, the script's own default --
+    never what the deploy host exported."""
+
+    monkeypatch.setenv(IDENTITY.INSTALLER_VERSION_ENV, "9.9.9")
+    release = SimpleNamespace(
+        config=SimpleNamespace(
+            bundle=Path("dist/gpu-fault-node-installer-0.11.0.tar.gz")
+        ),
+        state={
+            "previous": {
+                "clusters": {
+                    "gpu-a": {"bundle_key": "gpu-fault-node-installer-0.10.0.tar.gz"}
+                }
+            }
+        },
+    )
+    target = SimpleNamespace(cluster_id="gpu-a")
+    expected = {
+        NodeDependencyTarget.CANDIDATE: "0.11.0",
+        NodeDependencyTarget.PREVIOUS: "0.10.0",
+    }
+    for kind, version in expected.items():
+        environment = {IDENTITY.INSTALLER_VERSION_ENV: "9.9.9"}
+        IDENTITY.pin_installer_version(environment, release, target, kind)
+        assert environment[IDENTITY.INSTALLER_VERSION_ENV] == version, kind
+
+    release.state = {"previous": {"clusters": {"gpu-a": {"bundle_key": None}}}}
+    release.config = SimpleNamespace(bundle=Path("custom-bundle.tar.gz"))
+    for kind in NodeDependencyTarget:
+        environment = {IDENTITY.INSTALLER_VERSION_ENV: "9.9.9"}
+        IDENTITY.pin_installer_version(environment, release, target, kind)
+        assert environment[IDENTITY.INSTALLER_VERSION_ENV] == "", (
+            "an unnamed version leaves the script's default, not the shell's"
+        )
+
+
 # --- the diff guard ---------------------------------------------------------------
 
 

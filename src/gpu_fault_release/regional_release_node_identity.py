@@ -41,6 +41,19 @@ node-scope change) hands it ``*`` at once, so an installed node whose installer
 identity differs from the release's -- every Agent of a host-mode cluster
 installed before the fold, or a node a refused release left behind -- would be
 re-installed outside every gate. The diff plans the Agent waves for it instead.
+
+``pin_installer_version`` keeps the operator's shell out of the identity. The
+reconciler script renders the installer Job and the reconciler's node identity
+(``gpu-fault.io/installer-version``) with ``GPU_FAULT_VERSION``, falling back
+to a default of its own, and the environment it is handed starts from the
+deploy host's -- so a value exported there named a version the release never
+shipped: the script refuses a bundle ConfigMap without
+``gpu-fault-node-installer-<version>.tar.gz``, and every reconciler deploy of
+the release failed with "installer ConfigMap is missing the candidate bundle".
+The engine now hands it the version of the bundle it actually rolls -- the
+candidate's bundle file, a rollback's captured bundle key -- which is the
+version every node installed from that bundle carries, whatever the operator
+exported.
 """
 
 from __future__ import annotations
@@ -69,18 +82,30 @@ from gpu_fault_release.regional_release_profile_model import (
 )
 
 __all__ = [
+    "INSTALLER_VERSION_ENV",
     "NODE_INSTALLER_IDENTITY_DRIFT_INPUT",
     "candidate_installer_template_identity",
     "identity_dcgm_hostengine",
     "installed_template_matches",
+    "installer_bundle_version",
     "installer_template_identity",
     "node_installer_identity_drift",
+    "pin_installer_version",
     "reconciler_template_identity",
+    "released_installer_version",
 ]
 
 #: The diff input of installed nodes the release's reconciler would re-install.
 NODE_INSTALLER_IDENTITY_DRIFT_INPUT = "node_installer_identity_drift"
 SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+#: The installer version ``deploy-node-installer-reconciler.sh`` renders the Job
+#: and the reconciler's node identity (``installer-version``) with.
+INSTALLER_VERSION_ENV = "GPU_FAULT_VERSION"
+#: ``build-node-installer-bundle.sh``'s bundle file, which the installer Job
+#: unpacks by the same version.
+INSTALLER_BUNDLE_NAME = re.compile(
+    r"gpu-fault-node-installer-(?P<version>[0-9A-Za-z][0-9A-Za-z.+_-]{0,63})\.tar\.gz"
+)
 
 
 def identity_dcgm_hostengine(value: object) -> str:
@@ -154,6 +179,50 @@ def reconciler_template_identity(
     if node_dependency_target is not NodeDependencyTarget.CANDIDATE:
         return template_sha256
     return candidate_installer_template_identity(release, target, template_sha256)
+
+
+def installer_bundle_version(name: object) -> str:
+    """The installer version a node bundle file was built for; empty if none."""
+
+    match = INSTALLER_BUNDLE_NAME.fullmatch(str(name or ""))
+    return match.group("version") if match else ""
+
+
+def released_installer_version(
+    release: Any, target: Any, node_dependency_target: NodeDependencyTarget
+) -> str:
+    """The installer version of the bundle a reconciler deploy hands its nodes.
+
+    The candidate's bundle file; for a rollback, the key of the previous
+    bundle the snapshot captured on ``target``. Empty when neither names a
+    version, which leaves the script's own default.
+    """
+
+    if node_dependency_target is NodeDependencyTarget.CANDIDATE:
+        bundle = getattr(getattr(release, "config", None), "bundle", None)
+        return installer_bundle_version(getattr(bundle, "name", ""))
+    state = getattr(release, "state", None)
+    previous = state.get("previous") if isinstance(state, Mapping) else None
+    clusters = previous.get("clusters") if isinstance(previous, Mapping) else None
+    cluster = clusters.get(target.cluster_id) if isinstance(clusters, Mapping) else None
+    if not isinstance(cluster, Mapping):
+        return ""
+    return installer_bundle_version(cluster.get("bundle_key"))
+
+
+def pin_installer_version(
+    environment: dict[str, str],
+    release: Any,
+    target: Any,
+    node_dependency_target: NodeDependencyTarget,
+) -> None:
+    """Hand the reconciler script the released installer version, never the
+    deploy host's ``GPU_FAULT_VERSION``: the version names the bundle the Job
+    unpacks and is part of the reconciler's node identity."""
+
+    environment[INSTALLER_VERSION_ENV] = released_installer_version(
+        release, target, node_dependency_target
+    )
 
 
 def installed_template_matches(annotations: Mapping[str, Any], expected: str) -> bool:

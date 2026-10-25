@@ -59,7 +59,10 @@ from gpu_fault.node_installer_reconciler import (
 from gpu_fault.node_installer_rendering import INSTALLER_DCGM_HOSTENGINE_ANNOTATION
 from gpu_fault_release import regional_release_fleet_rollout as FLEET
 from gpu_fault_release import regional_release_node_runtime_rollout as RUNTIME
-from gpu_fault_release.regional_release_config import ClusterLocalReleaseError
+from gpu_fault_release.regional_release_config import (
+    ClusterLocalReleaseError,
+    ReleaseError,
+)
 from gpu_fault_release.regional_release_diff import ReleaseComponent
 from gpu_fault_release.regional_release_gpu_rollout import agents_converged
 from gpu_fault_release.regional_release_rollback_target import rollback_target
@@ -84,6 +87,10 @@ AGENT_VERSION = "0.10.0"
 POLICY = "test-policy"
 PROFILE = "candidate-profile"
 INSTALLER_VERSION = "0.10.0"
+#: The bundle the release rolls, and the one key its ConfigMap holds.
+BUNDLE_FILE = f"gpu-fault-node-installer-{INSTALLER_VERSION}.tar.gz"
+#: ``deploy-node-installer-reconciler.sh``'s own ``GPU_FAULT_VERSION`` default.
+SCRIPT_DEFAULT_VERSION = "0.10.0"
 EKS_SELECTOR = "gpu-fault.io/control-plane=site-a"
 ZONE_LABEL = "topology.kubernetes.io/zone"
 #: Two failure domains of two nodes: the auto policy allows four at once, one
@@ -94,6 +101,21 @@ PER_DOMAIN_CAP = 2
 
 class NotFound(Exception):
     status = 404
+
+
+def script_version(environment: dict[str, str]) -> str:
+    """The installer version the reconciler script renders with, and checks the
+    bundle ConfigMap for (``gpu-fault-node-installer-<version>.tar.gz``)."""
+
+    version = environment.get("GPU_FAULT_VERSION") or SCRIPT_DEFAULT_VERSION
+    bundle = environment["GPU_FAULT_INSTALLER_CONFIG_MAP"]
+    if f"gpu-fault-node-installer-{version}.tar.gz" != BUNDLE_FILE:
+        # What the script exits with before it renders or applies anything.
+        raise ReleaseError(
+            f"installer ConfigMap {bundle} is missing the candidate bundle "
+            f"gpu-fault-node-installer-{version}.tar.gz"
+        )
+    return version
 
 
 class KubernetesNodes:
@@ -277,13 +299,14 @@ class Site:
         """Run the reconciler ``environment`` describes until it is idle."""
 
         allowed = environment["GPU_FAULT_INSTALLER_ALLOWED_NODES"]
+        version = script_version(environment)
         reconciler = NodeInstallerReconciler(
             self.nodes,
             self.batch,
             namespace=environment["GPU_FAULT_NAMESPACE"],
             cluster_name=environment["GPU_FAULT_HYPERPOD_CLUSTER"],
             node_selector=environment.get("GPU_FAULT_NODE_SELECTOR") or None,
-            version=INSTALLER_VERSION,
+            version=version,
             config_digest=environment["GPU_FAULT_INSTALLER_CONFIG_DIGEST"],
             artifact_sha256=environment["GPU_FAULT_INSTALLER_ARTIFACT_SHA256"],
             bundle_sha256=environment["GPU_FAULT_INSTALLER_BUNDLE_SHA256"],
@@ -305,6 +328,7 @@ class Site:
                 allowed=allowed,
                 max_unavailable=reconciler.max_unavailable,
                 template=reconciler.template_sha256,
+                version=reconciler.version,
             )
         )
         for _ in range(16):
@@ -414,6 +438,8 @@ def site_release(
     # "auto": the cap the node count allows (four), with the canary and the
     # per-domain budget the policy derives from it.
     release.config.upgrade_max_unavailable = 0
+    # The node bundle this release rolls (``build-node-installer-bundle.sh``).
+    release.config.bundle = Path(BUNDLE_FILE)
     holder = SimpleNamespace(site=None)
 
     def run(arguments: list[str], *, env: dict[str, str] | None = None, **options: Any):
@@ -425,6 +451,7 @@ def site_release(
         assert env is not None, "the reconciler script runs with an environment"
         node_release.environments.append(dict(env))
         if env.get("GPU_FAULT_RECONCILER_PREFLIGHT_ONLY") == "true":
+            script_version(env)
             return json.dumps({"status": "PASSED", "node_count": len(NODES)})
         holder.site.deploy(env)
         return ""
@@ -597,7 +624,7 @@ def test_a_release_without_a_node_change_stays_a_no_op(
 
 
 def test_rolling_back_a_mode_flip_rolls_through_the_rollback_waves(
-    site_release: SimpleNamespace,
+    site_release: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The release that flipped embedded to host rolled its Agents through the
     waves; its rollback restores the previous release's embedded Agents the
@@ -615,6 +642,11 @@ def test_rolling_back_a_mode_flip_rolls_through_the_rollback_waves(
     )
     # The previous release ran the embedded engine from the same source.
     previous["clusters"]["gpu-a"]["dcgm_hostengine"] = "embedded"
+    # The key of the previous bundle, as the snapshot captures it; the version
+    # the restored reconciler renders with comes from it, never from the shell.
+    previous["clusters"]["gpu-a"]["bundle_key"] = BUNDLE_FILE
+    monkeypatch.setenv("GPU_FAULT_VERSION", "9.9.9")
+    before = len(scenario.environments)
     previous["agent_identities"]["gpu-a"].update(
         agent_protocol_version=CURRENT_AGENT_PROTOCOL_VERSION,
         agent_version=AGENT_VERSION,
@@ -646,3 +678,65 @@ def test_rolling_back_a_mode_flip_rolls_through_the_rollback_waves(
         DCGM_HOSTENGINE_ENV in env and env[DCGM_HOSTENGINE_ENV] == "embedded"
         for env in scenario.environments[-len(site.deploys) :]
     ), "the restored reconciler installs the captured mode"
+    assert {env["GPU_FAULT_VERSION"] for env in scenario.environments[before:]} == {
+        INSTALLER_VERSION
+    }, (
+        "the rollback's preflight and reconciler are handed the previous bundle's version"
+    )
+
+
+@pytest.mark.parametrize("cluster", ["hyperpod", "host"])
+def test_an_exported_gpu_fault_version_never_moves_the_node_identity(
+    site_release: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, cluster: str
+) -> None:
+    """``GPU_FAULT_VERSION`` exported in the deploy host's shell names a
+    version the release never shipped. The reconciler script renders the
+    installer Job and its node identity with it, and the environment the engine
+    hands the script starts from the deploy host's: the script then found no
+    bundle of that version and refused every reconciler deploy of the release.
+    The engine pins the version of the bundle it rolls, so the same no-change
+    release is still one: every node keeps its identity and no ``*`` re-installs
+    anything."""
+
+    base = site_release.scenario.target
+    target = base if cluster == "hyperpod" else _eks_target(base, cluster)
+    template, mode = (
+        (TEMPLATE, "embedded")
+        if cluster == "hyperpod"
+        else _installed_identity(site_release, target)
+    )
+    site = _site(site_release, target, template=template, mode=mode)
+    monkeypatch.setenv("GPU_FAULT_VERSION", "9.9.9")
+    before = len(site_release.scenario.environments)
+
+    RUNTIME.preflight_node_runtime(
+        site_release.release,
+        target,
+        phase="upgrade",
+        wheel_cm="candidate-wheel",
+        bundle_cm=site_release.release.bundle_cm,
+        artifact_sha=ARTIFACT,
+        config_digest=CONFIG,
+    )
+    _roll(site_release, target)
+
+    (deployment,) = site.created
+    assert deployment.status is DeploymentStatus.SUCCEEDED, (
+        "every Agent still reports the release identity"
+    )
+    assert site.installs == [], f"Agents were re-installed: {site.installs}"
+    assert [item.allowed for item in site.deploys] == ["", "*"], (
+        "the paused reconciler, then the steady-state one, and nothing between"
+    )
+    assert {item.version for item in site.deploys} == {INSTALLER_VERSION}, (
+        "the reconciler's node identity keeps the released installer version"
+    )
+    handed = site_release.scenario.environments[before:]
+    assert len(handed) == 3, "the preflight, the paused and the steady-state run"
+    assert {env["GPU_FAULT_VERSION"] for env in handed} == {INSTALLER_VERSION}, (
+        "every script run is handed the version of the bundle the release rolls"
+    )
+    assert {
+        item["metadata"]["annotations"][INSTALLER_VERSION_ANNOTATION]
+        for item in site.nodes.items.values()
+    } == {INSTALLER_VERSION}, "no node identity moved"

@@ -21,6 +21,7 @@ from gpu_fault_release.regional_release_dcgm import record_node_dcgm_states
 from gpu_fault_release.regional_release_gpu_rollout import gpu_node_items
 from gpu_fault_release.regional_release_images import NodeDependencyTarget
 from gpu_fault_release.regional_release_node_identity import (
+    pin_installer_version,
     reconciler_template_identity,
 )
 from gpu_fault_release.regional_release_observation import ApiUnavailable
@@ -215,6 +216,9 @@ def run_node_installer_preflight(
         runtime_image=candidate.runtime_image,
         node_installer_image=candidate.node_installer_image,
         node_dependency_target=candidate.node_dependency_target,
+    )
+    pin_installer_version(
+        environment, release, target, candidate.node_dependency_target
     )
     environment.update(
         {

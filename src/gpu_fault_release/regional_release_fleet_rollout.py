@@ -45,6 +45,7 @@ from gpu_fault_release.regional_release_images import NodeDependencyTarget
 from gpu_fault_release.regional_release_interfaces import AgentNodeSet
 from gpu_fault_release.regional_release_narration import narrate_step
 from gpu_fault_release.regional_release_node_identity import (
+    pin_installer_version,
     reconciler_template_identity,
 )
 from gpu_fault_release.regional_release_node_scope import (
@@ -1445,6 +1446,7 @@ def deploy_reconciler(
         node_dependency_target=node_dependency_target,
         node_scope=node_scope,
     )
+    pin_installer_version(environment, release, target, node_dependency_target)
     release._settle_installer_jobs(target)
     environment["GPU_FAULT_WAIT_FOR_RECONCILER_ROLLOUT"] = "false"
     # Product reports are diagnostic, not authorization to skip fresh key
