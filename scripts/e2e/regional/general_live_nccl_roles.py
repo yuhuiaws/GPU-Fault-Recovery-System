@@ -677,12 +677,26 @@ def pyspy_errors(
             for rank in holders
             if any(r == rank for (n, r) in by_node_rank if n == node)
         ]
+        pids = {str(holders[rank].get("pid")) for rank in started}
+        # nvidia-smi names the holder by its executable path; the container
+        # pid the trainer printed is its main thread's innermost namespace id.
         found = [
             row
             for row in rows
             if str(row.get("node_id")) == node
             and row.get("rank") is None
-            and HOLDER_NAME in str(row.get("process_name") or "")
+            and (
+                HOLDER_NAME in str(row.get("process_name") or "")
+                or str(
+                    (
+                        kernel_threads(row)
+                        .get(str(row.get("pid")), {})
+                        .get("namespace_ids")
+                        or [row.get("pid")]
+                    )[-1]
+                )
+                in pids
+            )
         ]
         if len(found) != len(started):
             errors.append(
@@ -1233,7 +1247,8 @@ def attempt_change(ctx: VariantContext) -> dict[str, Any]:
             records if set(nodes) <= warning_nodes(records, job_a.attempt_id) else None
         )
 
-    budget = max(0.0, A_DELETE_BY_SECONDS - (ctx.clock() - started).total_seconds())
+    # At least one poll; the deletion then still falls under the hung threshold.
+    budget = max(20.0, A_DELETE_BY_SECONDS - (ctx.clock() - started).total_seconds())
     records_a = ctx.wait_until(
         warned, timeout_seconds=budget, poll_seconds=20, name="ac-warned"
     )

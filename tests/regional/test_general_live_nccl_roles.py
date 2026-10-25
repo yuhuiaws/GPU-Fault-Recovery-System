@@ -185,6 +185,64 @@ def gpu_uuid(rank: int) -> str:
 # --------------------------------------------------------------------------- #
 # triage rows as the Node Agent emits them
 # --------------------------------------------------------------------------- #
+def pyspy_payload(
+    threads: dict[str, tuple[str, str | None, str, str]],
+    pid: int,
+    rank: int,
+    mode: str,
+    index: int,
+    unstable: bool,
+) -> list[dict[str, Any]]:
+    """What py-spy's JSON lists for sample ``index`` of a rank: every thread
+    with its native id, the blocked rank 0 inside the collective, a held
+    rank's main thread moving between samples, one churn thread per sample in
+    the threads mode."""
+
+    pyspy = []
+    for host, (native, _role, name, kind) in threads.items():
+        if name == "gfrs-watch":
+            frames = [{"name": "watch", "filename": TRAINER, "line": 160}]
+        elif kind == "main" and rank == 0:
+            frames = [
+                {"name": "all_reduce", "filename": TORCH, "line": 2000},
+                {"name": "stall", "filename": TRAINER, "line": 280},
+            ]
+        elif kind == "main":
+            frames = [
+                {
+                    "name": "gpu_busy_until",
+                    "filename": TRAINER,
+                    "line": 170 + (index if unstable else 0),
+                }
+            ]
+        else:
+            frames = [{"name": kind + "_loop", "filename": TRAINER, "line": 400}]
+        pyspy.append(
+            {
+                "pid": pid,
+                "thread_id": 139_000_000 + int(host),
+                "thread_name": name,
+                "os_thread_id": int(native),
+                "active": kind == "spin",
+                "owns_gil": False,
+                "frames": frames,
+            }
+        )
+    if mode == plan.THREADS:
+        pyspy.append(
+            {
+                "pid": pid,
+                "thread_id": 139_900_000 + index,
+                "thread_name": "gfrs-churn-x",
+                "os_thread_id": 300 + index,
+                "active": False,
+                "owns_gil": False,
+                "frames": [{"name": "wait", "filename": TRAINER, "line": 518}],
+            }
+        )
+    return pyspy
+
+
 def rank_row(
     mode: str,
     rank: int,
@@ -277,48 +335,7 @@ def rank_row(
                 "observed_at": (T0 + timedelta(seconds=index)).isoformat(),
             }
         )
-        pyspy = []
-        for host, (native, _role, name, kind) in threads.items():
-            if name == "gfrs-watch":
-                frames = [{"name": "watch", "filename": TRAINER, "line": 160}]
-            elif kind == "main" and rank == 0:
-                frames = [
-                    {"name": "all_reduce", "filename": TORCH, "line": 2000},
-                    {"name": "stall", "filename": TRAINER, "line": 280},
-                ]
-            elif kind == "main":
-                frames = [
-                    {
-                        "name": "gpu_busy_until",
-                        "filename": TRAINER,
-                        "line": 170 + (index if unstable else 0),
-                    }
-                ]
-            else:
-                frames = [{"name": kind + "_loop", "filename": TRAINER, "line": 400}]
-            pyspy.append(
-                {
-                    "pid": pid,
-                    "thread_id": 139_000_000 + int(host),
-                    "thread_name": name,
-                    "os_thread_id": int(native),
-                    "active": kind == "spin",
-                    "owns_gil": False,
-                    "frames": frames,
-                }
-            )
-        if mode == plan.THREADS:
-            pyspy.append(
-                {
-                    "pid": pid,
-                    "thread_id": 139_900_000 + index,
-                    "thread_name": "gfrs-churn-x",
-                    "os_thread_id": 300 + index,
-                    "active": False,
-                    "owns_gil": False,
-                    "frames": [{"name": "wait", "filename": TRAINER, "line": 518}],
-                }
-            )
+        pyspy = pyspy_payload(threads, pid, rank, mode, index, unstable)
         role_map = (
             {tid: role for tid, (role, _n) in decl.roles.items()}
             if decl.declared
@@ -752,7 +769,7 @@ def test_the_product_forms_role_cohorts_the_grader_accepts() -> None:
     assert comparisons[7] == roles.NO_COHORT and comparisons[15] == roles.NO_COHORT
     assert all(
         comparisons[rank] == roles.ROLE_COHORT for rank in range(16) if rank % 8 != 7
-    )
+    ), "every declared rank is compared inside its own cohort"
     assert "4 cohort(s)" in roles.cohort_notes(reports, groups)[0]
 
 
@@ -834,7 +851,9 @@ def test_thread_identity_graders_over_the_namespace_mapping() -> None:
     assert roles.stack_identity_errors(rows, decls) == []
     assert roles.stability_errors(rows, decls, reports) == []
     blocked = view.report_for(reports, rows[0])
-    assert any(t["role"] == "TRAINING" for t in blocked["stack"]["stable_threads"])
+    assert any(t["role"] == "TRAINING" for t in blocked["stack"]["stable_threads"]), (
+        "the blocked rank's training thread is a stable thread"
+    )
     assert all(
         t["role"] != "UNKNOWN" or t["name"] == "gfrs-watch"
         for r in reports
@@ -866,7 +885,9 @@ def test_wchan_grader_over_a_spinner_and_a_sleeper() -> None:
     assert errors and all("wchan '0' for the spinner" in e for e in errors), errors
     rows[4]["process_series"]["windows"][0]["cpu_cores"] = 0.1
     errors = roles.wchan_errors(rows, decls, reports)
-    assert any("0.10 cores with a spinning thread" in e for e in errors)
+    assert any("0.10 cores with a spinning thread" in e for e in errors), (
+        "a window under the spinner floor is named"
+    )
     assert any("cpu_cores 0.1 !=" in e for e in errors), (
         "the normalization is recomputed"
     )
@@ -894,7 +915,7 @@ def test_cpu_grader_over_intervals_and_a_shared_gpu() -> None:
     assert any(
         "0 sharer process(es) sampled, 2 started" in e
         for e in roles.cpu_errors(without, decls, reports, sharers)
-    )
+    ), "an unsampled sharer is named"
 
 
 def test_pyspy_grader_over_the_non_python_holder() -> None:
@@ -924,14 +945,14 @@ def test_pyspy_grader_over_the_non_python_holder() -> None:
     assert any(
         "0 holder process(es) sampled, 1 started" in e
         for e in roles.pyspy_errors(dropped, reports, holders)
-    )
+    ), "an unsampled holder is named"
     rows[0]["stack_series"]["samples"] = [
         {"status": "FAILED", "error": "x", "returncode": 1}
     ] * 3
     assert any(
         "no real py-spy capture" in e
         for e in roles.pyspy_errors(rows, reports, holders)
-    )
+    ), "a Python rank without a real capture is named"
 
 
 # --------------------------------------------------------------------------- #
@@ -960,7 +981,9 @@ def test_each_role_variant_passes_on_a_faithful_triage(
     job = FakeNcclJob.instances[-1]
     assert job.stall_mode == mode and job.stalled and job.released == 1
     assert result["attempt"]["stall_mode"] == mode
-    assert (ctx.evidence.case_dir / "triage-view.json").is_file()
+    assert (ctx.evidence.case_dir / "triage-view.json").is_file(), (
+        "the triage view is evidence"
+    )
     assert (ctx.evidence.case_dir / f"{suffix}-account.json").is_file(), (
         "the trainer's account is evidence"
     )
@@ -991,7 +1014,9 @@ def test_a_missing_decision_or_an_unsampled_rank_is_a_triage_fail(
     )
     assert result["verdict"] == "FAIL"
     assert f"triage: {NODE}: ranks [0] were not sampled" in result["errors"]
-    assert any("no hung_triage_decision" in e for e in result["errors"])
+    assert any("no hung_triage_decision" in e for e in result["errors"]), (
+        "a missing decision is named"
+    )
 
 
 def test_no_hung_incident_at_all_fails_the_chain_not_the_fixture(
@@ -1178,7 +1203,9 @@ def test_attempt_change_warns_on_a_deletes_it_under_the_threshold_and_starts_b_f
         and second.attempt_id == f"{first.name}-a002"
     )
     assert second.name == first.name and not second.stalled
-    assert result["attempt_b"]["attempt_id"].endswith("-a002")
+    assert result["attempt_b"]["attempt_id"].endswith("-a002"), (
+        "B is attempt 2 of the same job"
+    )
     assert set(result["stages"]) == {"a_warned", "no_hung", "fresh_attempt"}
     assert (
         product.calls[0][3] == first.attempt_id

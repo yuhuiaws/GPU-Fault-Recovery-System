@@ -378,7 +378,9 @@ def test_registry_covers_every_011_variant() -> None:
         "pyspy_nonzero",
         "attempt_change",
     }
-    assert all(spec.implemented for spec in roles.VARIANTS)
+    assert all(spec.implemented for spec in roles.VARIANTS), (
+        "every role variant is executable"
+    )
     assert all(
         lane == "hp"
         for spec in [*nc.VARIANTS, *nf.VARIANTS, *pair.VARIANTS]

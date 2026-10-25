@@ -368,7 +368,9 @@ def test_a_pp0_rank_declares_its_group_and_burns_only_while_stalled(
         "gfrs-burn-1",
         "gfrs-burn-2",
     ], "helpers exist from the start, in declaration order"
-    assert all(thread.daemon for thread in scope["threads"])
+    assert all(thread.daemon for thread in scope["threads"]), (
+        "helper threads are daemons"
+    )
     assert {str(thread.native_id) for thread in threads} | {str(MAIN_NATIVE_ID)} == set(
         roles
     )
@@ -395,7 +397,7 @@ def test_a_pp0_rank_declares_its_group_and_burns_only_while_stalled(
     )
     assert fixture.stop.value is True, "finish() stops the helpers with the job"
     assert scope["popens"] == [] and scope["runs"] == []
-    assert runtime.lines("SUCCESS")
+    assert runtime.lines("SUCCESS"), "the job completes"
 
 
 def test_pp1_and_undeclared_ranks_stay_quiet(
@@ -504,7 +506,9 @@ def test_wchan_mode_declares_a_spinner_and_a_sleeper(
     fixture.stop.is_set = lambda: next(flips)
     spinner.target()
     assert runtime.matmuls, "the spinner burns CPU with torch.mm while stalled"
-    assert all(call[0] != "set_device" or call[1] == 4 for call in runtime.calls)
+    assert all(call[0] != "set_device" or call[1] == 4 for call in runtime.calls), (
+        "the spinner touches no other device"
+    )
 
 
 def test_cpu_mode_shares_the_gpu_of_local_ranks_6_and_7_with_an_unranked_child(
