@@ -234,6 +234,25 @@ def test_finding_incidents_takes_a_scripted_document_as_it_is() -> None:
     assert _low_memory(doc), "a scripted document names no read"
 
 
+@pytest.mark.parametrize(
+    "label", ["NODE_HEALTH_GROUP", "NODE_RESOURCE_GROUP", "GPU_FAULT_GROUP"]
+)
+def test_finding_incidents_takes_the_minted_record_under_a_group_label(
+    label: str,
+) -> None:
+    # Live 2026-10-25 008 required_link_down: the veth peer's finding joined
+    # the incident, which the product re-labelled NODE_HEALTH_GROUP; its id and
+    # event id still name the finding that minted it.
+    assert _low_memory({**READ, "incidents": [_minted(event_type=label)]}), label
+
+
+@pytest.mark.parametrize("label", ["XID", "SXID", "XID_BATCH", "NODE", None])
+def test_finding_incidents_refuses_an_incident_no_node_health_finding_minted(
+    label: str | None,
+) -> None:
+    assert not _low_memory({**READ, "incidents": [_minted(event_type=label)]}), label
+
+
 def test_chain_errors_present_and_absent() -> None:
     doc = {
         "incidents": [_incident("cpu_usage_percent")],

@@ -44,6 +44,26 @@ def safe_device(value: str | None) -> str:
 #: never ``-dcgm_field_completeness-``. It is node-level, with no rule.
 UNNAMED_FINDINGS = {"dcgm_field_completeness": ("gpu-", "-dcgm-fields")}
 
+#: The event types an incident minted by a node-health finding carries. The
+#: health family mints ``NODE_HEALTH`` (``families/health.py``), and the
+#: product re-labels that same record -- same ``inc-<event id>``, same minting
+#: ``event_id`` -- when it routes more evidence into it instead of opening a
+#: second incident: a critical QUARANTINE that joins the node's in-flight
+#: isolation makes the incumbent ``NODE_HEALTH_GROUP``
+#: (``families/drain.py`` ``ingest_terminal_node_quarantine``), a device-resource
+#: finding ``NODE_RESOURCE_GROUP`` (``ingest_grouped_node_resource_finding``),
+#: and a finding on a node a managed attempt holds is opened as
+#: ``GPU_FAULT_GROUP`` (``families/grouped_health.py`` ``_candidate``). Live
+#: 2026-10-25 008 ``required_link_down``: the test veth's peer, also declared
+#: required, read ``lowerlayerdown`` in the same tick, its finding joined the
+#: ``-network_link_down-<a>`` incident, which became NODE_HEALTH_GROUP and was
+#: QUARANTINED -- and the runner, taking only NODE_HEALTH, reported "no
+#: network_link_down on <a> finding reached an incident". The event id, not the
+#: label, says which finding minted an incident.
+NODE_HEALTH_EVENT_TYPES = frozenset(
+    {"NODE_HEALTH", "NODE_HEALTH_GROUP", "NODE_RESOURCE_GROUP", "GPU_FAULT_GROUP"}
+)
+
 
 def _moment(value: Any) -> datetime | None:
     try:
@@ -87,7 +107,7 @@ def finding_incidents(
     device: str | None = None,
     rule_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    """NODE_HEALTH incidents minted by ``metric`` (on ``device``) since the read.
+    """Node-health incidents minted by ``metric`` (on ``device``) since the read.
 
     A metric finding's event id is ``<batch>-<metric>-<device|node>`` and a
     sustained finding's adds ``-<rule id lower>`` (``host_health.py``); the
@@ -95,9 +115,12 @@ def finding_incidents(
     (``LOW_MEMORY_AVAILABLE``), never its threshold family (``memory``): the
     runner matched on the family and never saw the LOW_MEMORY_AVAILABLE
     incident the product opened and closed RECOVERED (live 2026-10-25).
-    Incidents of any state count; ``minted_in_read`` keeps out the ones the
-    read did not select for itself. A finding whose event id does not name
-    its metric is matched on its own shape (``UNNAMED_FINDINGS``).
+    Incidents of any state count, under any label the product's grouping gives
+    the minted record (``NODE_HEALTH_EVENT_TYPES``); ``minted_in_read`` keeps
+    out the ones the read did not select for itself. A finding the product
+    folded into an incident another finding minted names no incident of its
+    own here. A finding whose event id does not name its metric is matched on
+    its own shape (``UNNAMED_FINDINGS``).
     """
 
     suffix = f"-{metric}-{safe_device(device)}" if device is not None else f"-{metric}-"
@@ -106,7 +129,7 @@ def finding_incidents(
     )
     result = []
     for incident in activity.get("incidents") or []:
-        if incident.get("event_type") != "NODE_HEALTH":
+        if incident.get("event_type") not in NODE_HEALTH_EVENT_TYPES:
             continue
         if not minted_in_read(activity, incident):
             continue
@@ -467,6 +490,7 @@ def verdict(
 __all__ = [
     "ChainExpectation",
     "HOST_DIAGNOSTIC_FAILURE",
+    "NODE_HEALTH_EVENT_TYPES",
     "TERMINAL_WORKFLOWS",
     "UNNAMED_FINDINGS",
     "breaching",
