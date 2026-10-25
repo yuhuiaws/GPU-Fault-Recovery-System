@@ -31,19 +31,23 @@ between its pair must stay active past the product's rearm window (a stall
 episode closes only after three samples over 120 s, which the host collector
 sends every 30 s for 180 s once traffic is back) or it is INCONCLUSIVE, and the
 second stall must open its own incident and workflow, chained to the first's
-(``hung_episode.py``). The deep triage/forensics variants (per-rank FR
-temporal completion, the second-dump-missing and whole-group cases, py-spy
-failure classification, role and thread/CPU comparison) need a reviewed test
-flight-recorder dump responder and a py-spy fault tool that are not wired this
-phase, and the 128-node/1024-process scale variants need a cluster this site
-does not have: each stays NOT_RUN with its reason, in the denominator.
+(``hung_episode.py``). The flight-recorder forensics variants (per-rank FR
+temporal completion, the second-dump-missing, whole-group, few/ambiguous
+candidate and separate-process-group cases) live in ``general_live_nccl_fr``:
+they stall the same job while the reviewed test dump responder of
+``general_live_fr_replay`` answers the product's dump requests with shaped
+dumps (live-replay). The py-spy failure classification and the role and
+thread/CPU comparison variants need a py-spy fault tool and a role-declaring
+test job that are not wired this phase, and the 128-node/1024-process scale
+variants need a cluster this site does not have: each stays NOT_RUN with its
+reason, in the denominator.
 """
 
 from __future__ import annotations
 
 import math
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -54,6 +58,7 @@ from scripts.e2e.regional.general_live_fixture import (
     VariantInconclusive,
     run_identity,
 )
+from scripts.e2e.regional.general_live_fr_replay import FlightRecorderReplay
 from scripts.e2e.regional.general_live_nccl_job import MIN_ACTIVE_BPS, ManagedNcclJob
 from scripts.e2e.regional.general_live_registry import (
     HARDWARE_OPERATIONS,
@@ -422,7 +427,7 @@ def episode(
     return {**records, "incidents": incidents}
 
 
-def _hung_workflow(records: dict[str, Any]) -> dict[str, Any]:
+def hung_workflow(records: dict[str, Any]) -> dict[str, Any]:
     incident = hung_incident(records) or {}
     return (records.get("workflows") or {}).get(
         str(incident.get("workflow_request_id"))
@@ -432,7 +437,7 @@ def _hung_workflow(records: dict[str, Any]) -> dict[str, Any]:
 def dag_errors(records: dict[str, Any]) -> list[str]:
     if hung_incident(records) is None:
         return ["no EFA hung_suspected finding reached an incident"]
-    ops = operations(_hung_workflow(records))
+    ops = operations(hung_workflow(records))
     errors: list[str] = []
     if ops != list(DIAGNOSTIC_DAG):
         errors.append(
@@ -449,7 +454,7 @@ def execution_errors(records: dict[str, Any]) -> list[str]:
 
     if hung_incident(records) is None:
         return []
-    workflow = _hung_workflow(records)
+    workflow = hung_workflow(records)
     by_index: dict[int, list[dict[str, Any]]] = {}
     for item in workflow.get("step_executions") or []:
         if type(item.get("step_index")) is int:
@@ -631,7 +636,7 @@ def no_suspicion_errors(records: dict[str, Any]) -> list[str]:
     return []
 
 
-def _triage_ranks(
+def triage_ranks(
     records: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], list[str]] | None:
     """Every rank row COLLECT_HUNG_TRIAGE returned, and the results unread.
@@ -639,12 +644,13 @@ def _triage_ranks(
     The executor stores each node's triage result as the summary codec's
     zlib/JSON envelope (``hung_summary_codec.encode_summary``); a document
     without ``encoding`` (an older record) is read as it is. A result that does
-    not decode is named, never read as a node that sampled nothing.
+    not decode is named, never read as a node that sampled nothing. Each row
+    carries the ``node_id`` it was stored under (the rows themselves do not).
     """
 
     executions = [
         item
-        for item in _hung_workflow(records).get("step_executions") or []
+        for item in hung_workflow(records).get("step_executions") or []
         if item.get("operation") == "COLLECT_HUNG_TRIAGE"
     ]
     if not executions:
@@ -662,7 +668,11 @@ def _triage_ranks(
                 )
                 continue
             ranks = document.get("ranks")
-            rows.extend(item for item in ranks or [] if isinstance(item, dict))
+            rows.extend(
+                {"node_id": node, **item}
+                for item in ranks or []
+                if isinstance(item, dict)
+            )
     return rows, unreadable
 
 
@@ -676,7 +686,7 @@ def fr_errors(records: dict[str, Any], *, expect_configured: bool) -> list[str]:
 
     if hung_incident(records) is None:
         return []
-    triage = _triage_ranks(records)
+    triage = triage_ranks(records)
     if triage is None:
         return ["no COLLECT_HUNG_TRIAGE execution to read FR status from"]
     rows, errors = triage
@@ -712,7 +722,7 @@ def _job(
     ctx: VariantContext,
     suffix: str,
     *,
-    flight_recorder: bool = False,
+    flight_recorder: bool | FlightRecorderReplay = False,
     keep_active: bool = True,
     stall_mode: str = "quiet",
 ) -> ManagedNcclJob:
@@ -732,7 +742,7 @@ def _job(
     return job
 
 
-def _nodes(ctx: VariantContext) -> list[str]:
+def attempt_nodes(ctx: VariantContext) -> list[str]:
     return [ctx.settings.node, ctx.settings.peer_node]
 
 
@@ -769,7 +779,7 @@ def _efa_window(
 ) -> dict[str, list[dict[str, Any]]]:
     """Both nodes' probe counter readings, now and every 30 s for ``seconds``."""
 
-    window: dict[str, list[dict[str, Any]]] = {node: [] for node in _nodes(ctx)}
+    window: dict[str, list[dict[str, Any]]] = {node: [] for node in attempt_nodes(ctx)}
 
     def read() -> dict[str, Any]:
         for node, readings in window.items():
@@ -870,7 +880,7 @@ def _records(ctx: VariantContext, job: ManagedNcclJob, since: datetime) -> Any:
     return ctx.regional.cpu_python(
         HUNG_PROBE,
         ctx.settings.regional.cluster_id,
-        ",".join(_nodes(ctx)),
+        ",".join(attempt_nodes(ctx)),
         job.name,
         job.attempt_id,
         since.isoformat(),
@@ -956,15 +966,26 @@ def stalled_chain(
     suffix: str,
     *,
     stall_mode: str = "quiet",
-    flight_recorder: bool = False,
+    flight_recorder: bool | FlightRecorderReplay = False,
     require_both: bool = False,
+    after_hung: Callable[[ManagedNcclJob, dict[str, Any]], None] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, list[str]]]:
+    """Start, prove active, stall, read the settled hung records, release.
+
+    ``(the job's identity, the records, the common chain stages)``.
+    ``after_hung`` runs with the job and the settled records before the stall
+    is released: where a variant reads the job's own account of the product's
+    collection (the flight-recorder replay ledgers) while the stall still holds.
+    """
+
     run_survey(ctx)
     job = _job(ctx, suffix, flight_recorder=flight_recorder, stall_mode=stall_mode)
     _prove_baseline(ctx, name=f"{suffix}-active")
     started, _events = _stall(ctx, job, name=suffix)
-    nodes = _nodes(ctx)
+    nodes = attempt_nodes(ctx)
     records = _hung(ctx, job, started, require_nodes=nodes if require_both else ())
+    if after_hung is not None:
+        after_hung(job, records)
     stages = {
         **episode_stages(records, started, nodes),
         "resumed": _release_and_resume(ctx, job, name=suffix),
@@ -977,7 +998,7 @@ def stalled_chain(
 # --------------------------------------------------------------------------- #
 def active_to_zero(ctx: VariantContext) -> dict[str, Any]:
     identity, _, stages = stalled_chain(ctx, "a2z")
-    return _result(stages, extra={"attempt": identity})
+    return variant_result(stages, extra={"attempt": identity})
 
 
 def always_low(ctx: VariantContext) -> dict[str, Any]:
@@ -994,7 +1015,7 @@ def always_low(ctx: VariantContext) -> dict[str, Any]:
         "no_suspicion": no_suspicion_errors(records),
         "resumed": _release_and_resume(ctx, job, name="low"),
     }
-    return _result(
+    return variant_result(
         stages,
         notes=["always-low is a suspicion signal, never a confirmed hang"],
         extra={"attempt": job.identity()},
@@ -1003,7 +1024,7 @@ def always_low(ctx: VariantContext) -> dict[str, Any]:
 
 def write_progress(ctx: VariantContext) -> dict[str, Any]:
     identity, _, stages = stalled_chain(ctx, "wp", stall_mode="write")
-    return _result(
+    return variant_result(
         stages,
         notes=[
             "held ranks rewrite 4 MiB/s of checkpoint I/O during the stall; host"
@@ -1015,7 +1036,7 @@ def write_progress(ctx: VariantContext) -> dict[str, Any]:
 
 def phase_progress(ctx: VariantContext) -> dict[str, Any]:
     identity, _, stages = stalled_chain(ctx, "pp", stall_mode="phase")
-    return _result(
+    return variant_result(
         stages,
         notes=[
             "held ranks keep advancing the step and switching the phase of their"
@@ -1029,7 +1050,7 @@ def phase_progress(ctx: VariantContext) -> dict[str, Any]:
 def fr_enabled(ctx: VariantContext) -> dict[str, Any]:
     identity, records, stages = stalled_chain(ctx, "fron", flight_recorder=True)
     stages["fr_dumps"] = fr_errors(records, expect_configured=True)
-    return _result(
+    return variant_result(
         stages,
         notes=["FR configured: triage must take two real dumps per PID"],
         extra={"attempt": identity},
@@ -1039,7 +1060,7 @@ def fr_enabled(ctx: VariantContext) -> dict[str, Any]:
 def fr_disabled(ctx: VariantContext) -> dict[str, Any]:
     identity, records, stages = stalled_chain(ctx, "froff")
     stages["fr_dumps"] = fr_errors(records, expect_configured=False)
-    return _result(
+    return variant_result(
         stages,
         notes=[
             "FR off: triage records not_configured and never fabricates a dump; still ESCALATED"
@@ -1050,8 +1071,8 @@ def fr_disabled(ctx: VariantContext) -> dict[str, Any]:
 
 def simultaneous_nodes(ctx: VariantContext) -> dict[str, Any]:
     identity, records, stages = stalled_chain(ctx, "sim", require_both=True)
-    stages["both_nodes"] = both_nodes_errors(records, _nodes(ctx))
-    return _result(
+    stages["both_nodes"] = both_nodes_errors(records, attempt_nodes(ctx))
+    return variant_result(
         stages,
         notes=["two nodes in one stall wave merge into one workflow, not two"],
         extra={"attempt": identity},
@@ -1061,7 +1082,7 @@ def simultaneous_nodes(ctx: VariantContext) -> dict[str, Any]:
 def repeat_after_recovery(ctx: VariantContext) -> dict[str, Any]:
     run_survey(ctx)
     job = _job(ctx, "rar")
-    nodes = _nodes(ctx)
+    nodes = attempt_nodes(ctx)
     _prove_baseline(ctx, name="rar-active")
     first_at, events = _stall(ctx, job, name="rar")
     first = episode(_hung(ctx, job, first_at), first_at)
@@ -1070,7 +1091,7 @@ def repeat_after_recovery(ctx: VariantContext) -> dict[str, Any]:
         # Without a first episode the product handled there is nothing to repeat.
         stages["resumed"] = _release_and_resume(ctx, job, name="rar")
         stages["repeat"] = ["not attempted: the first stall's hung chain failed"]
-        return _result(stages, extra={"attempt": job.identity()})
+        return variant_result(stages, extra={"attempt": job.identity()})
     _prove_recovered(ctx, job, name="rar")
     before = episode(_records(ctx, job, first_at), first_at)
     ctx.evidence.write("hung-before-repeat", before)
@@ -1086,14 +1107,14 @@ def repeat_after_recovery(ctx: VariantContext) -> dict[str, Any]:
         },
         "resumed": _release_and_resume(ctx, job, name="rar2"),
     }
-    return _result(
+    return variant_result(
         stages,
         notes=["a stall after a proven recovery is a new episode, not the old one"],
         extra={"attempt": job.identity(), "rearm_seconds": rearm_seconds(ctx)},
     )
 
 
-def _result(
+def variant_result(
     stages: dict[str, list[str]],
     *,
     notes: list[str] | None = None,
@@ -1110,7 +1131,7 @@ def _result(
     }
 
 
-def _spec(
+def variant_spec(
     variant: str,
     injection: str,
     expected: str,
@@ -1118,11 +1139,12 @@ def _spec(
     *,
     risk: str = "M",
     max_minutes: int = 65,
+    proof: str = NATIVE,
 ) -> VariantSpec:
     return VariantSpec(
         case_id=CASE,
         variant=variant,
-        proof_mode=NATIVE,
+        proof_mode=proof,
         lanes=("hp",),
         risk=risk,
         flags="S",
@@ -1145,10 +1167,6 @@ def _deferred(
     )
 
 
-_FR_FIXTURE = (
-    "FIXTURE_NOT_READY: needs a reviewed test flight-recorder dump responder that "
-    "updates/withholds the second dump on demand, not wired into this runner"
-)
 _SCALE = "SCALE: needs a 128-node/1024-process task; this site has one 4-node HyperPod cluster"
 _ROLE_FIXTURE = (
     "FIXTURE_NOT_READY: needs a mixed-parallelism test job that declares PP/EP roles "
@@ -1157,7 +1175,7 @@ _ROLE_FIXTURE = (
 
 
 VARIANTS = [
-    _spec(
+    variant_spec(
         "active_to_zero",
         "a two-node NCCL job at 1-4 MiB/s of EFA traffic per node, then one rank in"
         " an extra collective so the EFA pair falls to zero",
@@ -1166,7 +1184,7 @@ VARIANTS = [
         " resumes on release",
         active_to_zero,
     ),
-    _spec(
+    variant_spec(
         "always_low",
         "a two-node job that only all-reduces its heartbeat (never 1 MiB/s), then"
         " goes silent for the hung window",
@@ -1176,38 +1194,38 @@ VARIANTS = [
         risk="L",
         max_minutes=40,
     ),
-    _spec(
+    variant_spec(
         "write_progress",
         "stall the collective while the held ranks keep writing checkpoint I/O",
         "host writes do not delay the RDMA idle clock; HUNG_SUSPECTED still fires -> ESCALATED",
         write_progress,
     ),
-    _spec(
+    variant_spec(
         "phase_progress",
         "stall the collective while the held ranks keep advancing a declared"
         " step/phase (rank-progress/v1)",
         "declared progress does not delay the RDMA idle clock; HUNG_SUSPECTED still fires -> ESCALATED",
         phase_progress,
     ),
-    _spec(
+    variant_spec(
         "fr_enabled",
         "the stalled job runs the flight recorder (trace buffer + debug pipe)",
         "triage takes two real FR dumps per PID; chain -> ESCALATED",
         fr_enabled,
     ),
-    _spec(
+    variant_spec(
         "fr_disabled",
         "the stalled job has no FR pipe and a zero trace buffer",
         "triage records not_configured and fabricates no dump; chain -> ESCALATED with process evidence",
         fr_disabled,
     ),
-    _spec(
+    variant_spec(
         "simultaneous_nodes",
         "both nodes of the two-node job lose EFA in one stall wave (needs --node-b)",
         "one merged grouped incident/workflow with both nodes' hung evidence, not two",
         simultaneous_nodes,
     ),
-    _spec(
+    variant_spec(
         "repeat_after_recovery",
         "stall the job, release it once the hung chain settled, keep its own EFA"
         " traffic active past the product's rearm window, then stall it again",
@@ -1241,21 +1259,6 @@ VARIANTS = [
         proof=NATIVE,
     ),
     _deferred(
-        "few_candidates",
-        _FR_FIXTURE,
-        "1-3 trusted candidates get a targeted bundle plus at most one control rank",
-    ),
-    _deferred(
-        "ambiguous_candidates",
-        _FR_FIXTURE,
-        "too many/weak candidates keep the conservative bundle scope",
-    ),
-    _deferred(
-        "different_process_groups",
-        _FR_FIXTURE,
-        "collective progress is never compared across different process groups",
-    ),
-    _deferred(
         "no_step_no_rank",
         _SCALE,
         "128-node task with no step reporter, no FR and no RANK: full process evidence with rank unknown",
@@ -1266,21 +1269,6 @@ VARIANTS = [
         _SCALE,
         "unfinished commands hold the concurrency window; resume does not re-sample completed nodes",
         proof=NATIVE,
-    ),
-    _deferred(
-        "fr_temporal_completion",
-        _FR_FIXTURE,
-        "two new dumps per PID/PG compare enqueued/started/completed watermarks at >= 2 s apart",
-    ),
-    _deferred(
-        "fr_second_missing",
-        _FR_FIXTURE,
-        "a withheld second dump is a forensics gap, never a real stall",
-    ),
-    _deferred(
-        "fr_whole_group",
-        _FR_FIXTURE,
-        "a whole process group pending is reported without inventing a single culprit rank",
     ),
     _deferred(
         "pyspy_nonzero",
@@ -1306,10 +1294,5 @@ VARIANTS = [
         "cpu_interval",
         _ROLE_FIXTURE,
         "CPU cores use delta ticks over actual elapsed, a shared GPU is not claimed as the PID's utilization",
-    ),
-    _deferred(
-        "fr_plus_process",
-        _FR_FIXTURE,
-        "FR completion progress does not silence the independent process I/O-wait evidence",
     ),
 ]

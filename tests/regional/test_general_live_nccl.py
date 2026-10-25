@@ -19,6 +19,7 @@ import pytest
 
 from gpu_fault.hung_summary_codec import encode_summary
 from scripts.e2e.regional import general_live_nccl as nc
+from scripts.e2e.regional import general_live_nccl_fr as nf
 from scripts.e2e.regional.general_live_fixture import VariantInconclusive
 from scripts.e2e.regional.general_live_nccl_job import STALL_MAX_SECONDS
 from scripts.e2e.regional.general_live_registry import build_registry, coverage_rows
@@ -74,13 +75,15 @@ class FakeNcclJob:
     traffic = Traffic()
     alive_value = True
     events: dict[str, list[str]] | None = None
+    #: What ``flight_ledgers`` answers (a replayed recorder's responder ledgers).
+    ledgers: dict[str, Any] | None = None
 
     def __init__(
         self,
         ctx: Any,
         *,
         name: str,
-        flight_recorder: bool = False,
+        flight_recorder: Any = False,
         keep_active: bool = True,
         stall_mode: str = "quiet",
     ) -> None:
@@ -88,6 +91,7 @@ class FakeNcclJob:
         self.name = name
         self.attempt_id = f"{name}-a001"
         self.flight_recorder = flight_recorder
+        self.replay = None if isinstance(flight_recorder, bool) else flight_recorder
         self.keep_active = keep_active
         self.stall_mode = stall_mode
         self.stalled = False
@@ -122,6 +126,9 @@ class FakeNcclJob:
     def alive(self) -> dict[str, Any]:
         return {"alive": self.alive_value}
 
+    def flight_ledgers(self) -> dict[str, Any]:
+        return dict(FakeNcclJob.ledgers or {})
+
     def trainer_events(self) -> dict[str, list[str]]:
         """The trainer's log: every stall so far, each released one resumed."""
 
@@ -155,6 +162,7 @@ def _patch_job(monkeypatch: pytest.MonkeyPatch) -> None:
     FakeNcclJob.traffic = Traffic()
     FakeNcclJob.alive_value = True
     FakeNcclJob.events = None
+    FakeNcclJob.ledgers = None
     monkeypatch.setattr(nc, "ManagedNcclJob", FakeNcclJob)
 
 
@@ -327,8 +335,18 @@ def _window(rates: list[float], *, start: float = 1_000.0) -> list[dict[str, Any
 # --------------------------------------------------------------------------- #
 def test_registry_covers_every_011_variant() -> None:
     rows = coverage_rows()
-    build_registry(nc.VARIANTS, rows=rows, categories=[11])
-    assert {s.variant for s in nc.VARIANTS} == set(rows["GF-GENERAL-LIVE-011"])
+    build_registry([*nc.VARIANTS, *nf.VARIANTS], rows=rows, categories=[11])
+    everything = [*nc.VARIANTS, *nf.VARIANTS]
+    assert {s.variant for s in everything} == set(rows["GF-GENERAL-LIVE-011"])
+    assert {s.variant for s in nf.VARIANTS} == {
+        "few_candidates",
+        "ambiguous_candidates",
+        "different_process_groups",
+        "fr_temporal_completion",
+        "fr_second_missing",
+        "fr_whole_group",
+        "fr_plus_process",
+    }, "the FR module implements exactly the replayed forensics variants"
     implemented = {s.variant for s in nc.VARIANTS if s.implemented}
     assert implemented == {
         "active_to_zero",

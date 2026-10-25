@@ -646,6 +646,7 @@ rules:
       - scripts/e2e/regional/probes/general_live_dcgm_probe.py
       - scripts/e2e/regional/probes/general_live_kernel_source_probe.py
       - scripts/e2e/regional/probes/collector_window_probe.py
+      - scripts/e2e/regional/probes/general_live_fr_responder.py
       - tools/gpu_dcgm_field_replay.py
       - tools/nvidia_smi_inventory_replay.py
       - tests/regional/_general_live_fakes.py
@@ -676,6 +677,10 @@ rules:
       - tests/regional/test_general_live_dm_setup.py
       - tests/regional/test_general_live_memory.py
       - tests/regional/test_general_live_phase2.py
+      - tests/regional/test_general_live_nccl.py
+      - tests/regional/test_general_live_nccl_job.py
+      - tests/regional/test_general_live_nccl_fr.py
+      - tests/regional/test_general_live_fr_responder.py
       - tests/regional/test_general_live_gpu_memory.py
       - tests/regional/test_general_live_gpu_links.py
       - tests/regional/test_general_live_gpu_fabric.py

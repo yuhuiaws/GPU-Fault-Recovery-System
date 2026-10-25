@@ -282,6 +282,7 @@ CATEGORY_MODULES = (
     "scripts.e2e.regional.general_live_shared",
     "scripts.e2e.regional.general_live_devices",
     "scripts.e2e.regional.general_live_nccl",
+    "scripts.e2e.regional.general_live_nccl_fr",
     "scripts.e2e.regional.general_live_progress",
     "scripts.e2e.regional.general_live_spares",
     "scripts.e2e.regional.general_live_kernel",
