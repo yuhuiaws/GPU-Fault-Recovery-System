@@ -98,10 +98,14 @@ def test_pci_missing_is_registered_as_the_reboot_variant() -> None:
 
 def test_013_denominator_is_complete_across_both_modules() -> None:
     expected = set(coverage_rows()["GF-GENERAL-LIVE-013"])
+    # 013 is spread over the inventory module, this module (pci_missing) and
+    # general_live_efa_driver (bind_failure / post_repair_failure): check the registry.
+    from scripts.e2e.regional.general_live_registry import load_registry
+
     registered = {
-        item.variant
-        for item in (*inventory.VARIANTS, *mod.VARIANTS)
-        if item.case_id == "GF-GENERAL-LIVE-013"
+        key.split(".", 1)[1]
+        for key in load_registry()
+        if key.startswith("GF-GENERAL-LIVE-013.")
     }
     assert registered == expected, registered ^ expected
     assert "pci_missing" not in {item.variant for item in inventory.VARIANTS}
