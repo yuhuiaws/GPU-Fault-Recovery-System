@@ -71,6 +71,7 @@ sharer process and ``pyspy`` a non-Python CUDA holder. The ``ROLES``/``SHARER``
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -121,6 +122,32 @@ FLIGHT_RECORDER_ENV = {
     "TORCH_NCCL_DUMP_ON_TIMEOUT": "1",
 }
 FLIGHT_RECORDER_OFF_ENV = {"TORCH_NCCL_TRACE_BUFFER_SIZE": "0"}
+#: Where the trainer's own recorder leaves a dump when nothing pins
+#: ``TORCH_NCCL_DEBUG_INFO_TEMP_FILE`` (the manual's injection does not):
+#: PyTorch <= 2.8 defaulted to ``/tmp/nccl_trace_rank_<rank>``, the only default
+#: the product's reader knows; 2.9.0 (the DLC image) moved it to
+#: ``$HOME/.cache/torch/comm_lib_trace_rank_<rank>`` (``c10d::DebugInfoWriter::
+#: getWriter``, which prefers ``TORCH_FR_DUMP_TEMP_FILE``). The forensics stat
+#: both, and the debug FIFOs, inside each Pod while the stall still holds.
+LEGACY_DUMP_BASE = "/tmp/nccl_trace_rank_"
+TORCH29_DUMP_SUFFIX = "/.cache/torch/comm_lib_trace_rank_"
+FR_FORENSICS_COMMAND = (
+    'echo "HOME|${HOME:-}"; '
+    f'for f in {LEGACY_DUMP_BASE}* "${{HOME:-/tmp}}"{TORCH29_DUMP_SUFFIX}* '
+    f"{FLIGHT_RECORDER_ENV['TORCH_NCCL_DEBUG_INFO_PIPE_FILE']}*; do "
+    '[ -e "$f" ] && stat -c "FILE|%n|%F|%s|%Y" "$f"; done; true'
+)
+#: PyTorch's own account of a dump request and its outcome (c10d log lines in
+#: the rank's stderr), and its deprecation notice for the <= 2.8 variable names.
+FR_LOG_MARKERS = (
+    "preparing to dump debug info",
+    "Dump signal received through pipe",
+    "Flight Recorder debug info",
+    "Flight Recorder trace",
+    "is deprecated; use TORCH_FR",
+)
+FR_LOG_TAIL = 2000
+FR_DUMP_REQUEST_MARKER = FR_LOG_MARKERS[0]
 #: Variables the renderer owns; any copy in the source manifest is replaced.
 MANAGED_ENV = frozenset(
     {
@@ -557,6 +584,100 @@ def _env(
     return [{"name": key, "value": value} for key, value in values.items()]
 
 
+def parse_fr_forensics(listing: str, log_text: str) -> dict[str, Any]:
+    """One Pod's :data:`FR_FORENSICS_COMMAND` listing and log, as a record.
+
+    ``home`` is the container's ``$HOME`` (None when unset: PyTorch then
+    resolves its default against ``/tmp``); ``files`` are the ``stat`` rows
+    (path, type, size, mtime) of whatever exists at the known dump locations
+    and the pipe base; ``log_lines`` are PyTorch's own flight-recorder lines.
+    A row that does not parse is dropped, never guessed.
+    """
+
+    home: str | None = None
+    files: list[dict[str, Any]] = []
+    for line in listing.splitlines():
+        parts = line.strip().split("|")
+        if parts[0] == "HOME" and len(parts) == 2:
+            home = parts[1] or None
+        elif parts[0] == "FILE" and len(parts) == 5:
+            try:
+                files.append(
+                    {
+                        "path": parts[1],
+                        "type": parts[2],
+                        "size": int(parts[3]),
+                        "mtime": int(parts[4]),
+                    }
+                )
+            except ValueError:
+                continue
+    lines = [
+        line
+        for line in log_text.splitlines()
+        if any(marker in line for marker in FR_LOG_MARKERS)
+    ]
+    return {"home": home, "files": files, "log_lines": lines[:200]}
+
+
+def fr_location_errors(forensics: Mapping[str, Mapping[str, Any]]) -> list[str]:
+    """Where the trainer's recorder left its dumps, when the product paired none.
+
+    The product reads ``TORCH_NCCL_DEBUG_INFO_TEMP_FILE`` or, unset, the PyTorch
+    <= 2.8 default :data:`LEGACY_DUMP_BASE`; PyTorch 2.9 moved the default to
+    ``$HOME`` + :data:`TORCH29_DUMP_SUFFIX`. Dumps found only there are a dump
+    the product never looked at; dumps where it reads are a dump it read too
+    early; none anywhere is a trainer that never dumped -- each named with
+    PyTorch's own count of dump requests. A Pod the forensics could not read
+    is named too; nothing read means nothing to attribute.
+    """
+
+    errors: list[str] = []
+    legacy = moved = requests = 0
+    bases: set[str] = set()
+    for pod, report in sorted(forensics.items()):
+        if report.get("error"):
+            errors.append(f"{pod}: FR forensics unavailable: {report['error']}")
+            continue
+        base = f"{report.get('home') or '/tmp'}{TORCH29_DUMP_SUFFIX}"
+        bases.add(base)
+        for entry in report.get("files") or []:
+            path = str(entry.get("path") or "")
+            if entry.get("type") != "regular file":
+                continue
+            if path.startswith(LEGACY_DUMP_BASE):
+                legacy += 1
+            elif path.startswith(base):
+                moved += 1
+        requests += sum(
+            1
+            for line in report.get("log_lines") or []
+            if FR_DUMP_REQUEST_MARKER in line
+        )
+    if not bases:
+        return errors
+    where = ", ".join(f"{base}*" for base in sorted(bases))
+    asked = f"{requests} '{FR_DUMP_REQUEST_MARKER}' line(s)"
+    if legacy:
+        errors.append(
+            f"the trainer's {legacy} FR dump file(s) are under {LEGACY_DUMP_BASE}* where"
+            " the product reads, yet the product read none within its triage budget"
+            f" (compare the dump mtimes with the triage times); {asked}"
+        )
+    elif moved:
+        errors.append(
+            f"the trainer wrote {moved} FR dump file(s) under {where} (the PyTorch >="
+            f" 2.9 default) and 0 under {LEGACY_DUMP_BASE}* (the only default the"
+            f" product reads); {asked}"
+        )
+    else:
+        errors.append(
+            f"the trainer wrote no FR dump file under {LEGACY_DUMP_BASE}* or {where};"
+            f" {asked}"
+        )
+    return errors
+
+
 class ManagedNcclJob:
     """The managed two-node stall job (``ManagedWorkloadFixture`` underneath).
 
@@ -747,6 +868,34 @@ class ManagedNcclJob:
                 if any(marker in line for marker in TRAINER_MARKERS)
             ]
         return events
+
+    def flight_recorder_forensics(self) -> dict[str, Any]:
+        """Where each Pod's trainer left its recorder files, and what it logged.
+
+        Read while the stall still holds, after the product's collection: a
+        ``stat`` of every known dump location and the debug FIFOs plus PyTorch's
+        own flight-recorder log lines (:func:`parse_fr_forensics`). Evidence
+        that attributes a ``dump_missing`` -- a trainer that never dumped, a
+        dump written where the product does not read, a dump read too early --
+        never the verdict itself, so a Pod that cannot be read is recorded with
+        its error, not raised.
+        """
+
+        report: dict[str, Any] = {}
+        for item in self.fixture.pods():
+            pod = str(item["name"])
+            listing = log_text = ""
+            error = None
+            try:
+                listing = self._exec(pod, FR_FORENSICS_COMMAND)
+                log_text = self.ctx.regional.kubectl(
+                    "gpu", "logs", pod, "-c", "pytorch", f"--tail={FR_LOG_TAIL}"
+                )
+            except (OSError, RuntimeError) as exc:
+                listing = log_text = ""
+                error = f"{type(exc).__name__}: {str(exc)[:200]}"
+            report[pod] = {**parse_fr_forensics(listing, log_text), "error": error}
+        return report
 
     def delete(self) -> dict[str, Any]:
         from scripts.e2e.regional.managed_workload_fixture import remove_managed_job

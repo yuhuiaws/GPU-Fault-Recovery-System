@@ -726,3 +726,242 @@ def test_the_job_pauses_the_master_releases_every_pod_and_checks_liveness(
     ], "the stall lines, prefixed or not, and nothing else"
     assert job.identity()["stall_mode"] == "write"
     assert job.identity()["payload_bytes"] == nj.PAYLOAD_BYTES
+
+
+# --------------------------------------------------------------------------- #
+# The trainer's own flight-recorder files (where PyTorch left its dumps)
+# --------------------------------------------------------------------------- #
+FR_LISTING = (
+    "HOME|/root\n"
+    "FILE|/tmp/torch_nccl_debug_pipe_0.pipe|fifo|0|1792940750\n"
+    "FILE|/tmp/torch_nccl_debug_pipe_1.pipe|fifo|0|1792940750\n"
+    "FILE|/root/.cache/torch/comm_lib_trace_rank_0|regular file|48213|1792941153\n"
+    "FILE|/root/.cache/torch/comm_lib_trace_rank_1|regular file|48210|1792941153\n"
+    "a line without the listing's shape\n"
+    "FILE|/root/.cache/torch/comm_lib_trace_rank_2|regular file|not-a-size|1\n"
+)
+FR_DEPRECATION = (
+    "[rank0]:[W1025 15:14:36.364962229 Utils.hpp:137] Warning: Environment variable "
+    "TORCH_NCCL_TRACE_BUFFER_SIZE is deprecated; use TORCH_FR_BUFFER_SIZE instead"
+)
+FR_DUMP_REQUEST = (
+    "[rank0]:[E1025 15:05:53.400000000 ProcessGroupNCCL.cpp:1575] [PG ID 0 PG GUID "
+    "0(default_pg) Rank 0] ProcessGroupNCCL preparing to dump debug info. Include "
+    "stack trace: 1"
+)
+FR_LOG = (
+    "HEARTBEAT rank=0 step=3\n"
+    f"{FR_DEPRECATION}\n"
+    f"{FR_DUMP_REQUEST}\n"
+    "STALL step=106 held=before_extra_all_reduce mode=quiet rank=1\n"
+)
+
+
+def _fr_pod(
+    home: str | None, *dumps: str, fifos: int = 2, requests: int = 0
+) -> dict[str, Any]:
+    files: list[dict[str, Any]] = [
+        {
+            "path": f"/tmp/torch_nccl_debug_pipe_{index}.pipe",
+            "type": "fifo",
+            "size": 0,
+            "mtime": 1,
+        }
+        for index in range(fifos)
+    ]
+    files += [
+        {"path": path, "type": "regular file", "size": 48213, "mtime": 2}
+        for path in dumps
+    ]
+    return {
+        "home": home,
+        "files": files,
+        "log_lines": [FR_DUMP_REQUEST] * requests,
+        "error": None,
+    }
+
+
+def test_parse_fr_forensics_reads_the_stat_lines_and_the_fr_log_lines_only() -> None:
+    report = nj.parse_fr_forensics(FR_LISTING, FR_LOG)
+    assert report["home"] == "/root"
+    assert report["files"] == [
+        {
+            "path": "/tmp/torch_nccl_debug_pipe_0.pipe",
+            "type": "fifo",
+            "size": 0,
+            "mtime": 1792940750,
+        },
+        {
+            "path": "/tmp/torch_nccl_debug_pipe_1.pipe",
+            "type": "fifo",
+            "size": 0,
+            "mtime": 1792940750,
+        },
+        {
+            "path": "/root/.cache/torch/comm_lib_trace_rank_0",
+            "type": "regular file",
+            "size": 48213,
+            "mtime": 1792941153,
+        },
+        {
+            "path": "/root/.cache/torch/comm_lib_trace_rank_1",
+            "type": "regular file",
+            "size": 48210,
+            "mtime": 1792941153,
+        },
+    ], "malformed stat lines are dropped, never guessed"
+    assert report["log_lines"] == [FR_DEPRECATION, FR_DUMP_REQUEST], (
+        "only PyTorch's own flight-recorder lines, not the trainer's"
+    )
+    assert nj.parse_fr_forensics("", "") == {"home": None, "files": [], "log_lines": []}
+    assert nj.parse_fr_forensics("HOME|\n", "")["home"] is None, (
+        "an empty HOME is unset"
+    )
+
+
+def test_the_forensics_command_stats_every_known_dump_location_and_the_pipes() -> None:
+    command = nj.FR_FORENSICS_COMMAND
+    assert f"{nj.LEGACY_DUMP_BASE}*" in command, "the product's pre-2.9 default"
+    assert f'"${{HOME:-/tmp}}"{nj.TORCH29_DUMP_SUFFIX}*' in command, (
+        "PyTorch 2.9's default, resolved inside the container like PyTorch does"
+    )
+    assert f"{nj.FLIGHT_RECORDER_ENV['TORCH_NCCL_DEBUG_INFO_PIPE_FILE']}*" in command
+    assert 'echo "HOME|${HOME:-}"' in command
+    assert "stat -c" in command and command.endswith("; true"), (
+        "a location with no file is not a failed exec"
+    )
+    assert not any(verb in command for verb in ("rm ", "mv ", "touch ", ">", "kill")), (
+        "the forensics only read the container"
+    )
+
+
+class ForensicRegional(KubectlRegional):
+    exec_error: Exception | None = None
+
+    def kubectl(self, plane: str, *arguments: str, **_: Any) -> str:
+        self.commands.append(arguments)
+        if arguments[0] == "logs":
+            return FR_LOG
+        if arguments[0] == "exec":
+            if self.exec_error is not None:
+                raise self.exec_error
+            return FR_LISTING
+        return ""
+
+
+def _managed_job(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, regional: KubectlRegional
+) -> nj.ManagedNcclJob:
+    monkeypatch.setattr(mwf, "ManagedWorkloadFixture", FakeWorkload)
+    monkeypatch.setattr(mwf, "ImagePrewarmFixture", FakePrewarm)
+    spec = next(item for item in nc.VARIANTS if item.variant == "fr_enabled")
+    base = make_settings(spec, node=NODE, peer=PEER)
+    (tmp_path / "site.yaml").write_text("site: test\n")
+    settings = type(base)(**{**base.__dict__, "site_file": tmp_path / "site.yaml"})
+    ctx = make_context(
+        spec, tmp_path=tmp_path, regional=regional, probes={}, settings=settings
+    )
+    FakeWorkload.current = [dict(item) for item in PODS]
+    job = nj.ManagedNcclJob(ctx, name="gl11-fron-a1-deadbeef", flight_recorder=True)
+    job.start()
+    regional.commands.clear()
+    return job
+
+
+def test_flight_recorder_forensics_stats_and_reads_the_log_of_every_pod(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    regional = ForensicRegional()
+    job = _managed_job(monkeypatch, tmp_path, regional)
+    report = job.flight_recorder_forensics()
+    execs = [command for command in regional.commands if command[0] == "exec"]
+    assert [command[1] for command in execs] == ["job-master-0", "job-worker-0"]
+    assert all(
+        command[2:7] == ("-c", "pytorch", "--", "/bin/sh", "-c") for command in execs
+    ), "the listing runs in the trainer container, like the stall and release"
+    assert all(command[-1] == nj.FR_FORENSICS_COMMAND for command in execs), execs
+    logs = [command for command in regional.commands if command[0] == "logs"]
+    assert [command[1] for command in logs] == ["job-master-0", "job-worker-0"]
+    assert all(
+        ("-c", "pytorch", f"--tail={nj.FR_LOG_TAIL}") == command[2:] for command in logs
+    ), "the trainer container's log, deep enough for the dump request lines"
+    assert set(report) == {"job-master-0", "job-worker-0"}
+    master = report["job-master-0"]
+    assert master["home"] == "/root" and master["error"] is None
+    assert [
+        item["path"] for item in master["files"] if item["type"] == "regular file"
+    ] == [
+        "/root/.cache/torch/comm_lib_trace_rank_0",
+        "/root/.cache/torch/comm_lib_trace_rank_1",
+    ]
+    assert master["log_lines"] == [FR_DEPRECATION, FR_DUMP_REQUEST]
+
+
+def test_a_pod_the_forensics_cannot_read_is_recorded_not_raised(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    regional = ForensicRegional()
+    regional.exec_error = RuntimeError("kubectl exec: container not found")
+    job = _managed_job(monkeypatch, tmp_path, regional)
+    report = job.flight_recorder_forensics()
+    assert set(report) == {"job-master-0", "job-worker-0"}
+    for pod in report.values():
+        assert pod["error"] == "RuntimeError: kubectl exec: container not found"
+        assert pod["files"] == [] and pod["home"] is None
+        assert pod["log_lines"] == [], "no half-read Pod: the error names it"
+
+
+def test_fr_location_errors_say_where_the_trainer_left_its_dumps() -> None:
+    moved = {
+        "master": _fr_pod(
+            "/root",
+            "/root/.cache/torch/comm_lib_trace_rank_0",
+            "/root/.cache/torch/comm_lib_trace_rank_1",
+            requests=2,
+        ),
+        "worker": _fr_pod(
+            "/root", "/root/.cache/torch/comm_lib_trace_rank_8", requests=1
+        ),
+    }
+    assert nj.fr_location_errors(moved) == [
+        "the trainer wrote 3 FR dump file(s) under /root/.cache/torch/comm_lib_trace_rank_*"
+        " (the PyTorch >= 2.9 default) and 0 under /tmp/nccl_trace_rank_* (the only"
+        " default the product reads); 3 'preparing to dump debug info' line(s)"
+    ]
+    no_home = {
+        "master": _fr_pod(None, "/tmp/.cache/torch/comm_lib_trace_rank_0", requests=1)
+    }
+    assert nj.fr_location_errors(no_home) == [
+        "the trainer wrote 1 FR dump file(s) under /tmp/.cache/torch/comm_lib_trace_rank_*"
+        " (the PyTorch >= 2.9 default) and 0 under /tmp/nccl_trace_rank_* (the only"
+        " default the product reads); 1 'preparing to dump debug info' line(s)"
+    ], "without HOME, PyTorch resolves its default against /tmp"
+    legacy = {"master": _fr_pod("/root", "/tmp/nccl_trace_rank_0", requests=1)}
+    assert nj.fr_location_errors(legacy) == [
+        "the trainer's 1 FR dump file(s) are under /tmp/nccl_trace_rank_* where the"
+        " product reads, yet the product read none within its triage budget (compare"
+        " the dump mtimes with the triage times); 1 'preparing to dump debug info'"
+        " line(s)"
+    ]
+    nothing = {"master": _fr_pod("/root", requests=2), "worker": _fr_pod("/root")}
+    assert nj.fr_location_errors(nothing) == [
+        "the trainer wrote no FR dump file under /tmp/nccl_trace_rank_* or"
+        " /root/.cache/torch/comm_lib_trace_rank_*; 2 'preparing to dump debug info'"
+        " line(s)"
+    ]
+    unread = {
+        "master": {
+            "home": None,
+            "files": [],
+            "log_lines": [],
+            "error": "RuntimeError: x",
+        },
+        "worker": _fr_pod("/root", "/root/.cache/torch/comm_lib_trace_rank_8"),
+    }
+    assert nj.fr_location_errors(unread) == [
+        "master: FR forensics unavailable: RuntimeError: x",
+        "the trainer wrote 1 FR dump file(s) under /root/.cache/torch/comm_lib_trace_rank_*"
+        " (the PyTorch >= 2.9 default) and 0 under /tmp/nccl_trace_rank_* (the only"
+        " default the product reads); 0 'preparing to dump debug info' line(s)",
+    ]
+    assert nj.fr_location_errors({}) == [], "no Pod read: nothing to attribute"
