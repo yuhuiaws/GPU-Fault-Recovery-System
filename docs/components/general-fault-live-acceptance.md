@@ -138,6 +138,13 @@ incident 常在两次轮询之间就以 `diagnostic inconclusive` 关闭为 `REC
 (Cached+SReclaimable−Shmem)/MemTotal）确认条件：`page_cache_percent` 未在 300 秒
 持续窗口内一直 ≥90% 即 `INCONCLUSIVE`（condition not established），只有条件成立
 而产品没有 finding 才记 `FAIL`。
+`gpu_idle`/`rank_cpu_idle` 断言产品对空闲 attempt 的处置：FREEZE_EVIDENCE 后
+VALIDATE_GPU/VALIDATE_HOST 携带绑定指标的 `host_diagnostic_probe`（≤5%），attempt
+仍空闲时探针必须失败并指出 `host_diagnostic:<指标>`，workflow FAILED，incident 以
+`diagnostic inconclusive` 关闭为 `RECOVERED`（不得 ESCALATED），无
+RUN_DCGM_DIAGNOSTIC/硬件步骤，incident 带 attempt id。验证步骤在更新的证据到达前为
+WAITING，所有判定验证的等待都等到该步骤终态（或 workflow 终态）再判，判定所用的
+incident/workflow 记录存为 `<wait>-chain.json`。
 
 ### GF-GENERAL-LIVE-004
 

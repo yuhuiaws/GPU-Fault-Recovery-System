@@ -1473,6 +1473,45 @@ through the product's own collection-error code. The other diagnostic-only
 waits (001 CPU and load, 002 memory, 004 unusable filesystem, 006 disk I/O,
 009 drops) match event ids the product does mint.
 
+The 10:25Z pass of the same day (release 6a95b90fcd82, plain-EKS nodes) read
+FAIL for the two attempt-bound 003 variants, and both were runner judgments.
+`gpu_idle` reported "VALIDATE_GPU ended WAITING": the first node-activity
+read that showed the incident (the third poll, 10:33:16Z) found the
+validation step WAITING and the chain was judged off that snapshot; the step
+was terminal by the settled wait's second poll, 10:33:47Z. A validation waits
+for evidence newer than itself -- GPU_METRICS and HOST_TELEMETRY collector
+statuses within the 2-minute sample age, a sample of its host diagnostic
+probe observed after the finding, fresh GPU metrics -- and the executor
+records it WAITING until that arrives (`adapters/gpu_validation.py`,
+`host_diagnostics.py`); a step still running is not a verdict.
+`rank_cpu_idle` reported "VALIDATE_HOST ended FAILED: validation failed on
+nodes: ... (host_diagnostic:training_rank_cpu_percent)": the validation's
+host diagnostic probe re-read the metric while the ranks still slept and
+failed naming it -- the product judging the held fault, the same flow as
+`low_available_memory` -- but the variant's expectation did not say the
+validation must fail, so the failure was the error. Both variants now expect
+what the product does with an idle attempt: FREEZE_EVIDENCE then
+VALIDATE_GPU / VALIDATE_HOST carrying a `host_diagnostic_probe` on the metric
+(at most 5 %), the probe failing `host_diagnostic:<metric>` while the attempt
+stays idle, the workflow FAILED and the incident closed RECOVERED "diagnostic
+inconclusive" (never ESCALATED, which would hold the job's restart), no
+RUN_DCGM_DIAGNOSTIC, no hardware step, the attempt id on the incident; the
+tests pin each of those to the product's own code (`diagnostic_probe`,
+`validate_diagnostic_probe`, `failure_incident_state`). Every wait that
+precedes a validation judgment -- 001 load average and checkpoint phase, the
+003 variants, 004 unusable mounts, 006 disk I/O, 009 drops, 025 exporter
+timeout -- now polls until the validation has a terminal execution or the
+workflow is terminal (`chain_judgeable`), within the same detection budget,
+and the judged incidents and workflows are kept in the case directory as
+`<wait>-chain.json`. A validation still WAITING when judged reads "did not
+finish" with what it waited for, whether or not the expectation says it must
+fail (a WAITING step used to satisfy a must-fail expectation). The recorded
+runs replay through the real activity probe: gpu_idle's chain appears WAITING
+on the third read and FAILED on the fifth and the variant passes;
+rank_cpu_idle's appears FAILED on the third and passes; a validation that
+passes while the attempt is idle, or never finishes within the budget, fails
+the variant.
+
 The managed test jobs of 003, 011, 027, 028 and 029 are thin wrappers over
 the image prewarm and the managed workload fixture, and the variant tests
 replace both with fakes, so the live pass was the first to start one: 003

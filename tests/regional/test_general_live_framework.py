@@ -655,3 +655,78 @@ def test_store_read_helpers_pass_through_and_validate() -> None:
         store.node_activity(rec, "c", "n", datetime.now(timezone.utc), metrics=["a,b"])
     with pytest.raises(ValueError):
         store.attempt_records(rec, "c", "job", [])
+
+
+# --------------------------------------------------------------------------- #
+# a validation still running is not a verdict (live 2026-10-25, 003.gpu_idle)
+# --------------------------------------------------------------------------- #
+WAITING_VALIDATION = {
+    "operation": "VALIDATE_GPU",
+    "status": "WAITING",
+    "details": {
+        "pending_nodes": ["node-a"],
+        "node_pending": {
+            "node-a": {
+                "missing_diagnostic_metric": ["host_gpu_utilization_percent"],
+                "device": "GPU-0",
+            }
+        },
+    },
+}
+
+
+def _idle_doc(execs: list[dict], status: str = "RUNNING") -> dict:
+    return {
+        "incidents": [
+            _incident("host_gpu_utilization_percent", rule="LOW_GPU_UTILIZATION")
+        ],
+        "workflows": [
+            _wf(
+                "inc-host_gpu_utilization_percent",
+                ["FREEZE_EVIDENCE", "VALIDATE_GPU"],
+                status=status,
+                execs=execs,
+                probe="host_gpu_utilization_percent",
+            )
+        ],
+    }
+
+
+@pytest.mark.parametrize("must_fail", [False, True])
+def test_chain_errors_names_a_validation_still_waiting(must_fail: bool) -> None:
+    # A WAITING step used to read "ended WAITING: " and, with
+    # validation_must_fail, as no error at all.
+    errors = v.chain_errors(
+        _idle_doc([WAITING_VALIDATION]),
+        v.ChainExpectation(
+            metric="host_gpu_utilization_percent",
+            rule_id="LOW_GPU_UTILIZATION",
+            validation="VALIDATE_GPU",
+            validation_must_fail=must_fail,
+            probe_metric="host_gpu_utilization_percent",
+            incident_states=v.DIAGNOSTIC_ONLY_STATES,
+        ),
+    )
+    assert errors == [
+        "VALIDATE_GPU did not finish: still WAITING "
+        "(node-a: device, missing_diagnostic_metric)"
+    ], errors
+
+
+def test_chain_judgeable_waits_for_a_terminal_validation() -> None:
+    judge = lambda doc: v.chain_judgeable(  # noqa: E731
+        doc,
+        "host_gpu_utilization_percent",
+        rule_id="LOW_GPU_UTILIZATION",
+        validation="VALIDATE_GPU",
+    )
+    assert not judge({"incidents": []}), "no incident yet"
+    assert not judge({**_idle_doc([]), "workflows": []}), "no workflow yet"
+    assert not judge(_idle_doc([WAITING_VALIDATION])), "the step is still running"
+    for status in ("FAILED", "SUCCEEDED"):
+        terminal = _idle_doc([{"operation": "VALIDATE_GPU", "status": status}])
+        assert judge(terminal), f"a {status} validation is a verdict"
+    assert judge(_idle_doc([], status="BLOCKED")), "a terminal workflow is a verdict"
+    assert v.pending_summary({"status": "WAITING", "error": "lease lost"}) == (
+        "lease lost"
+    )

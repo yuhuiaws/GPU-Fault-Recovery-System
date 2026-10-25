@@ -231,6 +231,7 @@ def gpu_idle(ctx: VariantContext) -> dict[str, Any]:
         rule_id=LOW_GPU,
         timeout_seconds=LOW_BUDGET,
         metrics={"host_gpu_utilization_percent"},
+        validation="VALIDATE_GPU",
         name="gpu-idle",
     )
     incidents = finding_incidents(
@@ -245,6 +246,8 @@ def gpu_idle(ctx: VariantContext) -> dict[str, Any]:
                 device=None,
                 operations=("FREEZE_EVIDENCE", "VALIDATE_GPU"),
                 validation="VALIDATE_GPU",
+                validation_must_fail=True,
+                probe_metric="host_gpu_utilization_percent",
                 forbidden=_hardware() | {"RUN_DCGM_DIAGNOSTIC"},
                 single=False,
                 incident_states=DIAGNOSTIC_ONLY_STATES,
@@ -279,6 +282,7 @@ def rank_cpu_idle(ctx: VariantContext) -> dict[str, Any]:
         rule_id=LOW_CPU,
         timeout_seconds=LOW_BUDGET,
         metrics={"training_rank_cpu_percent"},
+        validation="VALIDATE_HOST",
         name="rank-cpu",
     )
     incidents = finding_incidents(
@@ -293,6 +297,8 @@ def rank_cpu_idle(ctx: VariantContext) -> dict[str, Any]:
                 device=None,
                 operations=("FREEZE_EVIDENCE", "VALIDATE_HOST"),
                 validation="VALIDATE_HOST",
+                validation_must_fail=True,
+                probe_metric="training_rank_cpu_percent",
                 single=False,
                 incident_states=DIAGNOSTIC_ONLY_STATES,
             ),
@@ -363,6 +369,7 @@ def low_available_memory(ctx: VariantContext) -> dict[str, Any]:
         rule_id=LOW_MEMORY,
         timeout_seconds=hold,
         metrics={"memory_available_percent", "memory_used_percent"},
+        validation="VALIDATE_HOST",
         name="low-mem",
     )
     oracle.read()
@@ -426,6 +433,7 @@ def high_page_cache(ctx: VariantContext) -> dict[str, Any]:
         rule_id=HIGH_PAGE_CACHE,
         timeout_seconds=hold,
         metrics={"page_cache_percent", "memory_used_percent"},
+        validation="VALIDATE_HOST",
         name="page-cache",
     )
     _page_cache_established(oracle)
@@ -495,6 +503,7 @@ def scratch_full(ctx: VariantContext) -> dict[str, Any]:
         rule_id=HIGH_LOCAL_FS,
         timeout_seconds=LOW_BUDGET,
         metrics={"local_filesystem_used_percent", "filesystem_used_percent"},
+        validation="VALIDATE_HOST",
         name="scratch",
     )
     stages = {
@@ -751,13 +760,17 @@ VARIANTS = [
     _spec(
         "gpu_idle",
         "a 1-node 8-GPU managed job at GPU duty 0 for >= 12 min",
-        "LOW_GPU_UTILIZATION on the job's UUIDs -> VALIDATE_GPU (no DCGM diag, no reset); the attempt id matches",
+        "LOW_GPU_UTILIZATION on the job's UUIDs -> VALIDATE_GPU with a host_diagnostic_probe on "
+        "host_gpu_utilization_percent that fails while the job stays idle (no DCGM diag, no reset); "
+        "the incident closes RECOVERED 'diagnostic inconclusive'; the attempt id matches",
         gpu_idle,
     ),
     _spec(
         "rank_cpu_idle",
         "the same managed job; ranks sleep holding GPU contexts",
-        "LOW_CPU_UTILIZATION bound to the rank PIDs -> VALIDATE_HOST",
+        "LOW_CPU_UTILIZATION bound to the rank PIDs -> VALIDATE_HOST with a host_diagnostic_probe on "
+        "training_rank_cpu_percent that fails while the ranks stay idle; the incident closes "
+        "RECOVERED 'diagnostic inconclusive'; the attempt id matches",
         rank_cpu_idle,
     ),
     _spec(

@@ -35,6 +35,7 @@ from scripts.e2e.regional.general_live_verdicts import (
     DIAGNOSTIC_ONLY_STATES,
     ChainExpectation,
     chain_errors,
+    chain_judgeable,
     finding_incidents,
     hardware_errors,
     operations,
@@ -75,8 +76,11 @@ def _pause_exporter(ctx: VariantContext, seconds: int) -> dict[str, Any]:
 
 
 def _wait_completion_error(
-    ctx: VariantContext, since: Any, *, name: str
+    ctx: VariantContext, since: Any, *, name: str, validation: str | None = None
 ) -> dict[str, Any]:
+    """The field-completeness incident; with ``validation``, its chain
+    judgeable (the step terminal), not the first snapshot showing it."""
+
     last: dict[str, Any] = {}
 
     def accept() -> dict[str, Any] | None:
@@ -84,8 +88,13 @@ def _wait_completion_error(
         last = activity(
             ctx, since, metrics={"collector_observation_valid"}, kinds=("GPU_METRICS",)
         )
-        incidents = finding_incidents(last, "dcgm_field_completeness")
-        return last if incidents else None
+        if validation is not None:
+            ready = chain_judgeable(
+                last, "dcgm_field_completeness", validation=validation
+            )
+        else:
+            ready = bool(finding_incidents(last, "dcgm_field_completeness"))
+        return last if ready else None
 
     value = ctx.wait_until(
         accept, timeout_seconds=DCGM_BUDGET, poll_seconds=ctx.host_interval, name=name
@@ -97,7 +106,9 @@ def exporter_timeout(ctx: VariantContext) -> dict[str, Any]:
     started = utc_now()
     hold = DCGM_BUDGET + 60
     _pause_exporter(ctx, hold + 120)
-    detection = _wait_completion_error(ctx, started, name="dcgm-error")
+    detection = _wait_completion_error(
+        ctx, started, name="dcgm-error", validation="VALIDATE_HOST"
+    )
     incidents = finding_incidents(detection, "dcgm_field_completeness")
     stages = {
         "chain": chain_errors(

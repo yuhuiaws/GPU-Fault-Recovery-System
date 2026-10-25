@@ -179,6 +179,7 @@ def load_average(ctx: VariantContext) -> dict[str, Any]:
         "load1_per_cpu",
         timeout_seconds=hold,
         metrics={"cpu_usage_percent", "load1_per_cpu"},
+        validation="VALIDATE_HOST",
         name="load-detection",
     )
     oracle.read()
@@ -323,6 +324,7 @@ def checkpoint_phase(ctx: VariantContext) -> dict[str, Any]:
         "cpu_usage_percent",
         timeout_seconds=DETECTION_BUDGET,
         metrics={"cpu_usage_percent"},
+        validation="VALIDATE_HOST",
         name="checkpoint-detection",
     )
     _oracle_busy_each_tick(oracle, minimum=SUSTAIN_SECONDS // 5)

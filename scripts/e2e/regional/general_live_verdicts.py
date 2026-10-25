@@ -182,6 +182,68 @@ def final_execution(workflow: dict[str, Any], operation: str) -> dict[str, Any] 
     return items[-1] if items else None
 
 
+def judged_chain(
+    activity: dict[str, Any],
+    metric: str,
+    *,
+    device: str | None = None,
+    rule_id: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any] | None] | None:
+    """The incident and first workflow ``chain_errors`` judges, or None."""
+
+    incidents = finding_incidents(activity, metric, device=device, rule_id=rule_id)
+    if not incidents:
+        return None
+    workflows = workflows_of(activity, str(incidents[0]["incident_id"]))
+    return incidents[0], (workflows[0] if workflows else None)
+
+
+def chain_judgeable(
+    activity: dict[str, Any],
+    metric: str,
+    *,
+    device: str | None = None,
+    rule_id: str | None = None,
+    validation: str,
+) -> bool:
+    """Whether the chain's ``validation`` can be judged from ``activity``.
+
+    A validation step waits for evidence newer than itself -- fresh collector
+    statuses, a fresh sample of its host diagnostic probe, fresh GPU metrics
+    (``adapters/gpu_validation.py``) -- and the executor records it WAITING
+    until that arrives. Live 2026-10-25 003.gpu_idle: the first read that
+    showed the incident had VALIDATE_GPU WAITING; the step finished within
+    the next 30 s, and the verdict had already been read off the snapshot
+    ("VALIDATE_GPU ended WAITING"). Judgeable means the step has a terminal
+    execution (SUCCEEDED or FAILED) or the workflow itself is terminal -- a
+    workflow BLOCKED before its validation is a verdict, not a wait.
+    """
+
+    chain = judged_chain(activity, metric, device=device, rule_id=rule_id)
+    if chain is None or chain[1] is None:
+        return False
+    workflow = chain[1]
+    if str(workflow.get("status")) in TERMINAL_WORKFLOWS:
+        return True
+    execution = final_execution(workflow, validation)
+    return execution is not None and execution.get("status") in {"SUCCEEDED", "FAILED"}
+
+
+def pending_summary(execution: dict[str, Any]) -> str:
+    """What a WAITING validation says it waits for, one line."""
+
+    details = execution.get("details") or {}
+    pending = details.get("node_pending")
+    if isinstance(pending, dict) and pending:
+        return "; ".join(
+            f"{node}: {', '.join(sorted(map(str, reasons)))}"
+            if isinstance(reasons, dict)
+            else f"{node}: {reasons}"
+            for node, reasons in sorted(pending.items())
+        )[:300]
+    return str(execution.get("error") or sorted(details) or "no detail")[:300]
+
+
 def step_parameters(workflow: dict[str, Any], operation: str) -> list[dict[str, Any]]:
     return [
         dict(step.get("parameters") or {})
@@ -326,6 +388,14 @@ def chain_errors(activity: dict[str, Any], expectation: ChainExpectation) -> lis
         execution = final_execution(workflow, expectation.validation)
         if execution is None:
             errors.append(f"{label} workflow never executed {expectation.validation}")
+        elif execution.get("status") not in {"SUCCEEDED", "FAILED"}:
+            # Not a verdict on the product: the step was still running when
+            # judged (``chain_judgeable`` is what the waits should have used),
+            # or it never finished within the wait -- say what it waited for.
+            errors.append(
+                f"{expectation.validation} did not finish: still "
+                f"{execution.get('status')} ({pending_summary(execution)})"
+            )
         elif expectation.validation_must_fail:
             if execution.get("status") == "SUCCEEDED":
                 errors.append(
@@ -495,18 +565,21 @@ __all__ = [
     "UNNAMED_FINDINGS",
     "breaching",
     "chain_errors",
+    "chain_judgeable",
     "detection_seconds",
     "executions",
     "final_execution",
     "finding_incidents",
     "hardware_errors",
     "isolation_operations",
+    "judged_chain",
     "minted_in_read",
     "node_isolated",
     "notification_errors",
     "operations",
     "oracle_values",
     "parse_time",
+    "pending_summary",
     "safe_device",
     "samples",
     "settled",

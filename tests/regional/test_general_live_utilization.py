@@ -10,14 +10,38 @@ from typing import Any
 
 import pytest
 
+from gpu_fault.execution.terminal_state import (
+    failure_incident_state,
+    inconclusive_reason,
+)
+from gpu_fault.health_recovery_contract import recovery_contract
+from gpu_fault.host_diagnostics import (
+    diagnostic_failure_details,
+    diagnostic_probe,
+    validate_diagnostic_probe,
+)
 from gpu_fault.host_health import HostMetricSample, NodeHealthPolicy
-from gpu_fault.models import WorkflowStatus
+from gpu_fault.models import (
+    IncidentState,
+    RecoveryAction,
+    WorkflowOperation,
+    WorkflowStatus,
+    WorkflowStepStatus,
+)
+from gpu_fault.telemetry import TelemetryMetricLatest
 from scripts.e2e.regional import general_live_utilization as util
 from scripts.e2e.regional.general_live_common import STORE_POLL_SECONDS
 from scripts.e2e.regional.general_live_fixture import VariantInconclusive, VariantNotRun
 from scripts.e2e.regional.general_live_store import ACTIVITY_PROBE
 from scripts.e2e.regional.general_live_verdicts import finding_incidents
-from tests._builders import build_store, host_telemetry_batch, workflow_request
+from tests._builders import (
+    build_store,
+    fault_incident,
+    host_telemetry_batch,
+    workflow_request,
+    workflow_step,
+    workflow_step_execution,
+)
 from tests.host_health._support import NOW, observe_running_attempt
 from tests.regional._general_live_fakes import (
     FakeProbe,
@@ -208,20 +232,18 @@ def empty() -> dict[str, Any]:
     }
 
 
+def idle_doc(metric: str, validation: str, attempt: str) -> dict[str, Any]:
+    """An attempt-bound low-utilisation chain as the product leaves it: the
+    validation's host diagnostic probe failed on the still-idle metric."""
+
+    return low_doc(metric, validation, probe=metric, attempt=attempt)
+
+
 def test_gpu_idle_passes(tmp_path: Path) -> None:
     spec = SPECS["gpu_idle"]
     settings = _settings(spec, tmp_path)
-    regional = FakeRegional(
-        cpu_python=store_script(
-            {
-                "activity": low_doc(
-                    "host_gpu_utilization_percent",
-                    "VALIDATE_GPU",
-                    attempt="gl3-idle-1-a001",
-                )
-            }
-        )
-    )
+    doc = idle_doc("host_gpu_utilization_percent", "VALIDATE_GPU", "gl3-idle-1-a001")
+    regional = FakeRegional(cpu_python=store_script({"activity": doc}))
     ctx = make_context(
         spec, tmp_path=tmp_path, regional=regional, probes=probes(), settings=settings
     )
@@ -232,9 +254,7 @@ def test_gpu_idle_passes(tmp_path: Path) -> None:
 def test_gpu_idle_fails_when_dcgm_diagnostic_runs(tmp_path: Path) -> None:
     spec = SPECS["gpu_idle"]
     settings = _settings(spec, tmp_path)
-    doc = low_doc(
-        "host_gpu_utilization_percent", "VALIDATE_GPU", attempt="gl3-idle-1-a001"
-    )
+    doc = idle_doc("host_gpu_utilization_percent", "VALIDATE_GPU", "gl3-idle-1-a001")
     doc["workflows"][0]["official_steps"].insert(
         1, {"operation": "RUN_DCGM_DIAGNOSTIC", "parameters": {}}
     )
@@ -244,22 +264,16 @@ def test_gpu_idle_fails_when_dcgm_diagnostic_runs(tmp_path: Path) -> None:
     )
     result = spec.execute(ctx)
     assert result["verdict"] == "FAIL"
+    assert result["stages"]["chain"] == [
+        "host_gpu_utilization_percent workflow wf-u plans ['RUN_DCGM_DIAGNOSTIC']"
+    ], result["stages"]
 
 
 def test_rank_cpu_idle_passes(tmp_path: Path) -> None:
     spec = SPECS["rank_cpu_idle"]
     settings = _settings(spec, tmp_path)
-    regional = FakeRegional(
-        cpu_python=store_script(
-            {
-                "activity": low_doc(
-                    "training_rank_cpu_percent",
-                    "VALIDATE_HOST",
-                    attempt="gl3-rankcpu-1-a001",
-                )
-            }
-        )
-    )
+    doc = idle_doc("training_rank_cpu_percent", "VALIDATE_HOST", "gl3-rankcpu-1-a001")
+    regional = FakeRegional(cpu_python=store_script({"activity": doc}))
     ctx = make_context(
         spec, tmp_path=tmp_path, regional=regional, probes=probes(), settings=settings
     )
@@ -497,10 +511,10 @@ MINTED_DEVICES = {
 }
 
 
-@pytest.mark.parametrize("metric", sorted(NodeHealthPolicy.SUSTAINED_METRIC_RULES))
-def test_runner_selects_the_sustained_incident_the_product_mints(
-    monkeypatch: pytest.MonkeyPatch, metric: str
-) -> None:
+def mint_sustained_finding(monkeypatch: pytest.MonkeyPatch, metric: str) -> Any:
+    """The finding the product's own policy mints for a sustained ``metric``
+    breach on NODE, held by the running attempt ``job-a``/``attempt-a``."""
+
     for knob in (
         "LOW_UTILIZATION",
         "MEMORY_PRESSURE",
@@ -509,10 +523,10 @@ def test_runner_selects_the_sustained_incident_the_product_mints(
     ):
         monkeypatch.setenv(f"GPU_FAULT_{knob}_DURATION_SECONDS", "15")
     comparison = NodeHealthPolicy.SUSTAINED_METRIC_RULES[metric][1]
-    sample_device, wanted_device = MINTED_DEVICES.get(metric, (None, None))
+    sample_device, _wanted = MINTED_DEVICES.get(metric, (None, None))
     store = build_store()
     # The low-utilisation rules count only on a GPU a running attempt holds.
-    observe_running_attempt(store, NOW)
+    observe_running_attempt(store, NOW, node_ids=(NODE,))
     policy = NodeHealthPolicy(store)
 
     def batch(batch_id: str, seconds: int) -> Any:
@@ -526,6 +540,7 @@ def test_runner_selects_the_sustained_incident_the_product_mints(
             batch_id,
             NOW + timedelta(seconds=seconds),
             [sample],
+            node_id=NODE,
             workload_state="ACTIVE",
             affected_workload_ids=["training/job/job-a"],
         )
@@ -533,7 +548,15 @@ def test_runner_selects_the_sustained_incident_the_product_mints(
     assert not policy.evaluate_metrics(batch("initial", 0)), "one reading is no breach"
     findings = policy.evaluate_metrics(batch("sustained", 15))
     assert len(findings) == 1, findings
-    event_id = findings[0].event_id
+    return findings[0]
+
+
+@pytest.mark.parametrize("metric", sorted(NodeHealthPolicy.SUSTAINED_METRIC_RULES))
+def test_runner_selects_the_sustained_incident_the_product_mints(
+    monkeypatch: pytest.MonkeyPatch, metric: str
+) -> None:
+    _sample_device, wanted_device = MINTED_DEVICES.get(metric, (None, None))
+    event_id = mint_sustained_finding(monkeypatch, metric).event_id
     document = {
         "incidents": [
             {
@@ -703,6 +726,343 @@ def test_low_available_memory_takes_no_incident_it_did_not_cause(
         "no memory_available_percent finding reached an incident"
     ], result["stages"]
     assert replay.reads > FIRST_SEEN_READ, "nothing to take: detection runs out"
+
+
+# --------------------------------------------------------------------------- #
+# gpu_idle / rank_cpu_idle: the attempt-bound diagnostic chain (live 2026-10-25)
+# --------------------------------------------------------------------------- #
+#: metric -> (validation step, the product's sample device, the fake job's attempt)
+IDLE_CHAINS = {
+    "gpu_idle": ("host_gpu_utilization_percent", "VALIDATE_GPU", "gl3-idle-1-a001"),
+    "rank_cpu_idle": (
+        "training_rank_cpu_percent",
+        "VALIDATE_HOST",
+        "gl3-rankcpu-1-a001",
+    ),
+}
+#: Live 2026-10-25 10:25Z (release 6a95b90fcd82): the incident first showed on
+#: the third store read; gpu_idle's VALIDATE_GPU was WAITING on it and
+#: terminal two reads later (the settled wait accepted at 10:33:47Z);
+#: rank_cpu_idle's VALIDATE_HOST had already FAILED on the first sight.
+WAITING_READS = {3, 4}
+FAILED_READ = 5
+
+
+def fresh_sample(finding: Any, value: float, *, seconds: int = 15) -> Any:
+    return TelemetryMetricLatest(
+        cluster_id=finding.cluster_id,
+        node_id=finding.node_id,
+        observed_at=finding.observed_at + timedelta(seconds=seconds),
+        name=finding.metric_name,
+        value=value,
+        unit="percent",
+        device=finding.device,
+        labels={},
+    )
+
+
+def validation_steps(finding: Any, validation: str) -> list[Any]:
+    """FREEZE_EVIDENCE then the validation, parameterised as ``health.py``
+    does: the metric's host diagnostic probe and the recovery contract."""
+
+    parameters: dict[str, Any] = {"host_diagnostic_probe": diagnostic_probe(finding)}
+    contract = recovery_contract(finding)
+    if contract is not None:
+        parameters["health_recovery_contract"] = contract
+    return [
+        workflow_step(WorkflowOperation.FREEZE_EVIDENCE, node_ids=[NODE]),
+        workflow_step(
+            WorkflowOperation[validation], node_ids=[NODE], parameters=parameters
+        ),
+    ]
+
+
+@pytest.mark.parametrize("variant", sorted(IDLE_CHAINS))
+def test_idle_validation_waits_then_fails_on_the_held_metric(
+    monkeypatch: pytest.MonkeyPatch, variant: str
+) -> None:
+    """What the product does with an idle attempt, pinned to its own code.
+
+    The validation step carries a host diagnostic probe on the metric
+    (``health.py``); the probe is pending -- the step WAITS -- until a sample
+    newer than the finding arrives, fails ``host_diagnostic:<metric>`` while
+    the attempt stays idle, and passes only once the metric recovered; a
+    FAILED validation-only workflow closes its incident RECOVERED "diagnostic
+    inconclusive", never ESCALATED (``terminal_state.py``).
+    """
+
+    metric, validation, _attempt = IDLE_CHAINS[variant]
+    finding = mint_sustained_finding(monkeypatch, metric)
+    assert finding.recommended_action is RecoveryAction.RUN_DIAGNOSTICS
+    probe = diagnostic_probe(finding)
+    assert probe is not None and probe["metric"] == metric, probe
+    assert (probe["comparison"], probe["threshold"]) == ("lte", 5.0), probe
+
+    pending, failure = validate_diagnostic_probe(probe, [])
+    assert pending == {"missing_diagnostic_metric": [metric], "device": "GPU-0"}
+    assert failure is None, "no fresh sample: the step waits, it does not judge"
+
+    pending, failure = validate_diagnostic_probe(probe, [fresh_sample(finding, 0.0)])
+    assert (pending, failure) == (None, f"host_diagnostic:{metric}")
+    details = diagnostic_failure_details(probe, {}, {NODE: [failure]})
+    assert details == {"host_diagnostic_failure": True}
+
+    pending, failure = validate_diagnostic_probe(probe, [fresh_sample(finding, 42.0)])
+    assert (pending, failure) == (None, None), "a busy attempt passes the probe"
+
+    workflow = workflow_request(
+        "wf-idle",
+        f"inc-{finding.event_id}",
+        WorkflowStatus.FAILED,
+        official_steps=validation_steps(finding, validation),
+        step_executions=[
+            workflow_step_execution(0, WorkflowOperation.FREEZE_EVIDENCE),
+            workflow_step_execution(
+                1,
+                WorkflowOperation[validation],
+                WorkflowStepStatus.FAILED,
+                error=f"validation failed on nodes: {NODE} (host_diagnostic:{metric})",
+                details={"node_failures": {NODE: [f"host_diagnostic:{metric}"]}},
+            ),
+        ],
+    )
+    assert failure_incident_state(workflow) is IncidentState.RECOVERED
+    error = workflow.step_executions[1].error
+    assert inconclusive_reason(error) == f"diagnostic inconclusive: {error}"
+
+
+class RecordedStore:
+    """The node's records read by read, through the real activity probe.
+
+    ``stages`` maps a store read number to a writer ``(store, since)`` that
+    puts the product's records into their state as of that read.
+    """
+
+    def __init__(self, stages: dict[int, Callable[[Any, datetime], None]]) -> None:
+        self.store = build_store()
+        self.stages = stages
+        self.reads = 0
+
+    def __call__(self, script: str, *arguments: str) -> dict[str, Any]:
+        assert script is ACTIVITY_PROBE, "the variant reads only node activity"
+        self.reads += 1
+        writer = self.stages.get(self.reads)
+        if writer is not None:
+            writer(self.store, datetime.fromisoformat(arguments[2]))
+        return activity_read(self.store, arguments)
+
+
+def idle_chain(
+    finding: Any, validation: str, attempt: str, stage: str
+) -> Callable[[Any, datetime], None]:
+    """Writer of the attempt-bound chain in one of its recorded states.
+
+    ``waiting``: FREEZE_EVIDENCE done, the validation WAITING for a fresh
+    probe sample, workflow RUNNING, incident ACTION_PENDING. ``failed``: the
+    probe failed on the held metric, workflow FAILED, incident RECOVERED
+    "diagnostic inconclusive". ``succeeded``: the validation passed while the
+    attempt was idle (what a product defect would look like).
+    """
+
+    metric = finding.metric_name
+    operation = WorkflowOperation[validation]
+    error = f"validation failed on nodes: {NODE} (host_diagnostic:{metric})"
+
+    def write(store: Any, since: datetime) -> None:
+        created = since + timedelta(seconds=405)
+        now = created + timedelta(seconds=30 if stage == "waiting" else 55)
+        if stage == "waiting":
+            execution = workflow_step_execution(
+                1,
+                operation,
+                WorkflowStepStatus.WAITING,
+                details={
+                    "pending_nodes": [NODE],
+                    "node_pending": {
+                        NODE: {"missing_diagnostic_metric": [metric], "device": "GPU-0"}
+                    },
+                    "failed_nodes_observed": [],
+                    "node_failures_observed": {},
+                },
+                started_at=created,
+                updated_at=now,
+            )
+            status, state, reasons = (
+                WorkflowStatus.RUNNING,
+                IncidentState.ACTION_PENDING,
+                [finding.reason],
+            )
+        elif stage == "failed":
+            execution = workflow_step_execution(
+                1,
+                operation,
+                WorkflowStepStatus.FAILED,
+                error=error,
+                details={
+                    "failed_nodes": [NODE],
+                    "node_failures": {NODE: [f"host_diagnostic:{metric}"]},
+                    "validation": validation,
+                    "host_diagnostic_failure": True,
+                },
+                started_at=created,
+                updated_at=now,
+            )
+            status, state, reasons = (
+                WorkflowStatus.FAILED,
+                IncidentState.RECOVERED,
+                [finding.reason, inconclusive_reason(error)],
+            )
+        else:
+            execution = workflow_step_execution(
+                1, operation, started_at=created, updated_at=now
+            )
+            status, state, reasons = (
+                WorkflowStatus.SUCCEEDED,
+                IncidentState.RECOVERED,
+                [finding.reason],
+            )
+        incident_id = f"inc-{finding.event_id}"
+        store.save_incident_and_workflow(
+            fault_incident(
+                incident_id,
+                finding.event_id,
+                "NODE_HEALTH",
+                CLUSTER,
+                node_ids=[NODE],
+                policy_version="site-host-resource-health",
+                policy_source="SITE_HOST_RESOURCE_HEALTH",
+                job_id=attempt.rsplit("-", 1)[0],
+                attempt_id=attempt,
+                effective_action=RecoveryAction.RUN_DIAGNOSTICS,
+                state=state,
+                workflow_request_id="wf-idle",
+                reasons=reasons,
+                created_at=created,
+                updated_at=now,
+            ),
+            workflow_request(
+                "wf-idle",
+                incident_id,
+                status,
+                official_steps=validation_steps(finding, validation),
+                step_executions=[
+                    workflow_step_execution(
+                        0,
+                        WorkflowOperation.FREEZE_EVIDENCE,
+                        started_at=created,
+                        updated_at=created,
+                    ),
+                    execution,
+                ],
+                created_at=created,
+                updated_at=now,
+            ),
+        )
+
+    return write
+
+
+def idle_run(
+    tmp_path: Path, variant: str, recorded: RecordedStore
+) -> tuple[dict[str, Any], Any]:
+    spec = SPECS[variant]
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=FakeRegional(cluster_id=CLUSTER, cpu_python=recorded),
+        probes=probes(),
+        settings=_settings(spec, tmp_path),
+    )
+    return spec.execute(poll_clock(ctx)), ctx
+
+
+def accepted_flags(ctx: Any, name: str) -> list[bool]:
+    import json
+
+    timeline = json.loads((ctx.case_dir / f"{name}-timeline.json").read_text())
+    return [bool(entry["accepted"]) for entry in timeline["entries"]]
+
+
+def test_gpu_idle_judges_the_validation_once_it_finished(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Live 2026-10-25 003.gpu_idle (ip-10-0-43-5): the third read showed the
+    # incident with VALIDATE_GPU WAITING for a fresh probe sample; the chain
+    # was judged off that snapshot ("VALIDATE_GPU ended WAITING: ") while the
+    # step finished FAILED on the held metric within the next two reads.
+    metric, validation, attempt = IDLE_CHAINS["gpu_idle"]
+    finding = mint_sustained_finding(monkeypatch, metric)
+    recorded = RecordedStore(
+        {
+            **{
+                read: idle_chain(finding, validation, attempt, "waiting")
+                for read in WAITING_READS
+            },
+            FAILED_READ: idle_chain(finding, validation, attempt, "failed"),
+        }
+    )
+    result, ctx = idle_run(tmp_path, "gpu_idle", recorded)
+    assert result["verdict"] == "PASS", result["errors"]
+    assert accepted_flags(ctx, "gpu-idle") == [False] * (FAILED_READ - 1) + [True]
+    import json
+
+    chain = json.loads((ctx.case_dir / "gpu-idle-chain.json").read_text())
+    assert chain["accepted"] and chain["validation"] == "VALIDATE_GPU"
+    assert chain["workflows"][0]["status"] == "FAILED", "the judged records"
+
+
+def test_rank_cpu_idle_takes_the_failed_validation_as_the_held_fault(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Live 2026-10-25 003.rank_cpu_idle (ip-10-0-32-162): VALIDATE_HOST FAILED
+    # "validation failed on nodes: ... (host_diagnostic:training_rank_cpu_
+    # percent)" while the ranks slept -- the product judging the held fault,
+    # which the runner reported as "VALIDATE_HOST ended FAILED".
+    metric, validation, attempt = IDLE_CHAINS["rank_cpu_idle"]
+    finding = mint_sustained_finding(monkeypatch, metric)
+    recorded = RecordedStore(
+        {min(WAITING_READS): idle_chain(finding, validation, attempt, "failed")}
+    )
+    result, ctx = idle_run(tmp_path, "rank_cpu_idle", recorded)
+    assert result["verdict"] == "PASS", result["errors"]
+    assert accepted_flags(ctx, "rank-cpu") == [False, False, True]
+
+
+@pytest.mark.parametrize("variant", sorted(IDLE_CHAINS))
+def test_idle_validation_that_passes_while_idle_fails_the_variant(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, variant: str
+) -> None:
+    metric, validation, attempt = IDLE_CHAINS[variant]
+    finding = mint_sustained_finding(monkeypatch, metric)
+    recorded = RecordedStore(
+        {min(WAITING_READS): idle_chain(finding, validation, attempt, "succeeded")}
+    )
+    result, _ctx = idle_run(tmp_path, variant, recorded)
+    assert result["verdict"] == "FAIL", result
+    # Both the step and the close are wrong then: a pass while idle, and a
+    # RECOVERED that does not say "diagnostic inconclusive".
+    assert result["stages"]["chain"] == [
+        f"{validation} succeeded while the fault was still held",
+        f"{metric} incident is RECOVERED while the fault was held, without the "
+        "'diagnostic inconclusive' reason",
+    ], result["stages"]
+
+
+def test_gpu_idle_validation_that_never_finishes_is_the_products_fail(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    metric, validation, attempt = IDLE_CHAINS["gpu_idle"]
+    finding = mint_sustained_finding(monkeypatch, metric)
+    recorded = RecordedStore(
+        {min(WAITING_READS): idle_chain(finding, validation, attempt, "waiting")}
+    )
+    result, ctx = idle_run(tmp_path, "gpu_idle", recorded)
+    assert result["verdict"] == "FAIL", result
+    assert result["stages"]["chain"] == [
+        "VALIDATE_GPU did not finish: still WAITING "
+        f"({NODE}: device, missing_diagnostic_metric)"
+    ], result["stages"]
+    assert not any(accepted_flags(ctx, "gpu-idle")), "the wait ran out"
 
 
 def _settings(spec: Any, tmp_path: Path, *, approvals: tuple[str, ...] | None = None):

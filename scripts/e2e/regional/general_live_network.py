@@ -52,6 +52,7 @@ from scripts.e2e.regional.general_live_verdicts import (
     DIAGNOSTIC_ONLY_STATES,
     ChainExpectation,
     chain_errors,
+    chain_judgeable,
     finding_incidents,
     hardware_errors,
     node_isolated,
@@ -454,7 +455,7 @@ def sustained_drops(ctx: VariantContext) -> dict[str, Any]:
     oracle = _drops_oracle(ctx, a, b, hold)
     ctx.net("start-drops", "--slot", "a", "--rate", "10", "--seconds", str(hold))
     ctx.cleanup.push("net-drops", lambda: ctx.net("stop-drops"))
-    detection = _wait_drops_finding(ctx, started, (a, b))
+    detection = _wait_drops_finding(ctx, started, (a, b), validation="VALIDATE_FABRIC")
     _assert_drops_moved(oracle, a, b)
     device = _drops_device(detection, (a, b))
     incidents = finding_incidents(detection, "network_drops_delta", device=device)
@@ -643,15 +644,30 @@ def _hardware() -> frozenset[str]:
 
 
 def _wait_drops_finding(
-    ctx: VariantContext, since: Any, interfaces: tuple[str, ...]
+    ctx: VariantContext,
+    since: Any,
+    interfaces: tuple[str, ...],
+    *,
+    validation: str | None = None,
 ) -> dict[str, Any]:
+    """The drops incident on one of ``interfaces``; with ``validation``, its
+    chain judgeable (the step terminal), not the first snapshot showing it."""
+
     last: dict[str, Any] = {}
 
     def accept() -> dict[str, Any] | None:
         nonlocal last
         last = activity(ctx, since, metrics={"network_drops_delta"})
         for interface in interfaces:
-            if finding_incidents(last, "network_drops_delta", device=interface):
+            if validation is not None:
+                ready = chain_judgeable(
+                    last, "network_drops_delta", device=interface, validation=validation
+                )
+            else:
+                ready = bool(
+                    finding_incidents(last, "network_drops_delta", device=interface)
+                )
+            if ready:
                 return last
         return None
 

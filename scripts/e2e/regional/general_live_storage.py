@@ -301,6 +301,7 @@ def _unusable_filesystem_variant(
         device=mount,
         timeout_seconds=QUARANTINE_BUDGET,
         metrics={UNAVAILABLE_METRIC, "filesystem_used_percent"},
+        validation="VALIDATE_HOST",
         name=f"{variant}-detection",
     )
     incidents = finding_incidents(detection, UNAVAILABLE_METRIC, device=mount)
@@ -615,6 +616,7 @@ def _io_metric_variant(
         device=device,
         timeout_seconds=IO_BUDGET,
         metrics={metric},
+        validation="VALIDATE_HOST",
         name=f"{metric}-detection",
     )
     oracle.read()

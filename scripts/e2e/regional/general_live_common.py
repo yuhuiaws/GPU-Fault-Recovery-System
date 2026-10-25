@@ -24,6 +24,7 @@ from scripts.e2e.regional.general_live_fixture import (
 from scripts.e2e.regional.general_live_store import node_activity, signal_key
 from scripts.e2e.regional.general_live_verdicts import (
     TERMINAL_WORKFLOWS,
+    chain_judgeable,
     finding_incidents,
     node_isolated,
     samples,
@@ -253,11 +254,20 @@ def wait_for_incident(
     *,
     device: str | None = None,
     rule_id: str | None = None,
+    validation: str | None = None,
     timeout_seconds: float,
     metrics: Iterable[str] = (),
     name: str = "detection",
 ) -> dict[str, Any]:
-    """Poll the product until ``metric`` minted an incident (or the deadline)."""
+    """Poll the product until ``metric`` minted an incident (or the deadline).
+
+    With ``validation``, until that step of the incident's workflow can be
+    judged as well: a validation waits for evidence newer than itself and is
+    recorded WAITING meanwhile (``chain_judgeable``), so a verdict read off
+    the first snapshot that shows the incident judges a step still running
+    (live 2026-10-25, 003.gpu_idle). The returned document's incidents and
+    workflows are kept in the evidence as ``<name>-chain``.
+    """
 
     wanted = {metric, *metrics}
     last: dict[str, Any] = {}
@@ -265,8 +275,15 @@ def wait_for_incident(
     def accept() -> dict[str, Any] | None:
         nonlocal last
         last = activity(ctx, since, metrics=wanted)
-        found = finding_incidents(last, metric, device=device, rule_id=rule_id)
-        return last if found else None
+        if validation is not None:
+            ready = chain_judgeable(
+                last, metric, device=device, rule_id=rule_id, validation=validation
+            )
+        else:
+            ready = bool(
+                finding_incidents(last, metric, device=device, rule_id=rule_id)
+            )
+        return last if ready else None
 
     value = ctx.wait_until(
         accept,
@@ -274,7 +291,17 @@ def wait_for_incident(
         poll_seconds=STORE_POLL_SECONDS,
         name=name,
     )
-    return value if value is not None else last
+    document = value if value is not None else last
+    ctx.evidence.write(
+        f"{name}-chain",
+        {
+            "accepted": value is not None,
+            "validation": validation,
+            "incidents": document.get("incidents") or [],
+            "workflows": document.get("workflows") or [],
+        },
+    )
+    return document
 
 
 def wait_settled(
