@@ -851,11 +851,32 @@ phase 2 新增经审查的 `live-replay` 类别，统一经产品自身的读取
   `BindReadOnlyPaths` 的允许列表 procfs/sysfs 文件或整棵树、PATH 首位的透传命令包装、
   `InaccessiblePaths`、期望数环境覆盖，或重指 `GPU_FAULT_PCI_DEVICES_ROOT`（详见上文
   “共享主机原始源回放夹具”；phase-1 之外的模式需 `HOST_SOURCE_REPLAY`）。
+- 可复用的**CRI Pod 日志源夹具** `general_live_applog_fixture.py`（主机探针
+  `probes/general_live_applog_probe.py`，受管归属目标 `general_live_applog_job.py`）：
+  节点日志采集器只经 `GPU_FAULT_TRAINING_LOG_PATHS` 读训练日志（本站为空），窗口用
+  `/run` drop-in 追加第二个 `EnvironmentFile` 把该单元指到本次运行的
+  `/var/log/pods/*/<container>/gfrs-live-<digest>.log*`，runtime 启用并重启
+  （`ENABLE_NODE_LOG_COLLECTOR`）。夹具文件建在 kubelet 为运行器自建受管 Pod 创建的
+  真实目录里（仅 `old_pod` 为已不存在的旧 Pod 以其真实 UID 重建目录，清理即删），按 CRI
+  语法 `<RFC3339 ns> <stdout|stderr> <P|F> <message>` 以节点时钟逐条写入，支持改名轮转
+  （`.1`，继续写旧 inode）与采集器重启；Pod UID、容器名、attempt 与
+  `gpu-fault.io/host-pid`（探针从容器 cgroup 读出 init 进程 PID，运行器为自己的 Pod
+  声明）均为真实值，只有日志文本是经审查输入。oracle 只读采集器自身状态文件里本次文件的
+  offset/inode/待拼接 CRI 片段；判定读 attempt observation、投递的 NODE_LOGS 条目
+  （`pod_uid`/`container_name`/CRI 事件时间）、incident 的 attempt 和诊断 bundle 步骤
+  参数（`attribution`/`process_state`/`target_pids_by_node`），不 POST 任何预制记录。
 - 所有回放都带 `systemd-run --on-active` deadman，证据标注 `proof_scope: live-replay`，
   只证明处理链，不证明物理故障。
 
 已实现变体：016 严重内核日志（全部 9 个，含 user_text/old_boot/corrected_mce 的
-反向门禁）、017 应用错误日志（cgroup_oom 诊断与 nccl_error/distributed_error 仅证据）、
+反向门禁）、017 应用错误日志（journal 源的 cgroup_oom 诊断与 nccl_error/distributed_error
+仅证据；CRI Pod 日志归属 `live_pid`（LIVE，目标 PID 即声明的 host PID，bundle 实际抓取）、
+`exited_pid`（EXITED，不编排 bundle/不抓栈）、`old_pod`（产品 RESTART_WORKLOAD 后以旧 Pod UID
+写入，只能归 UNRESOLVED 或旧 attempt）、`cri_partial_rotation`（P 片段跨轮次、改名轮转与
+采集器重启后与 F 拼成一条，事件时间取 P 的时间戳；投递失败回滚由采集器单元测试钉住，不在线
+诱发），均需 `--site-file`；native 的 `missing_flight_recorder` 复用 011 的两节点 NCCL 任务且
+无 flight recorder，需 `--site-file --node-b`，判定独立 RDMA 空闲触发
+`detection_basis: ATTEMPT_SCOPED_RDMA_IDLE` 与 triage 的 `not_configured`）、
 032 `unknown_xid`（判为 SITE_SAFETY）与 `duplicate`、013 `unreadable_state`
 （UNKNOWN 而非零卡），以及 phase-1 文件源 001 `invalid_delta`、008 `statistics_failed`、
 009 `errors_delta`。
@@ -876,8 +897,7 @@ run_general_live.py --site-profile <profile> --run-dir <run> \
 本轮保持 `NOT_RUN` 并留在分母：014 全部（伪造 allocatable/改 Node.status 不算证明，
 原生 plugin 故障需 `DEVICE_PLUGIN_RESTART`）、013 多数（唯一 EKS 节点上的 missing→reboot
 链、保留的原生解绑、不可重指的 `/sys/class/infiniband`）、032 的目录/版本/Profile 权限
-变体（AUTH-015 未配置）、017 的归属变体（需受管 attempt 与 CRI Pod 日志）、004 `probe_error`
-（`statvfs` 错误无法由只读文件 bind 产生）。
+变体（AUTH-015 未配置）、004 `probe_error`（`statvfs` 错误无法由只读文件 bind 产生）。
 
 ### phase 2 范围与前提（DCGM 字段 / GPU 库存回放）
 
