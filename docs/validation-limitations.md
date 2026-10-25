@@ -1430,7 +1430,7 @@ refused EACCES client-side, leaving 0-byte files, the image smoke test's first
 symptom -- `Attr_Expiration_Time` sits in the EXPORT block, which NFS-Ganesha
 4.3 reads it from, and `NFS_KRB5 { Active_krb5 = false; }` silences the
 start-up CRIT; the site image is
-`514385905925.dkr.ecr.us-west-2.amazonaws.com/gfrs-test/nfs-ganesha@sha256:d354efdc8364e4ba17b83c4aa27cdef4001a474fc950b07547e7fcf9d1e14d7f`,
+`<account-id>.dkr.ecr.us-west-2.amazonaws.com/gfrs-test/nfs-ganesha@sha256:d354efdc8364e4ba17b83c4aa27cdef4001a474fc950b07547e7fcf9d1e14d7f`,
 Ubuntu 24.04 with NFS-Ganesha 4.3, `/usr/bin/ganesha.nfsd`,
 `/usr/lib/x86_64-linux-gnu/ganesha/libfsalvfs.so` and dash as `/bin/sh`) and
 mounts it `soft` on the client node in PID 1's mount namespace through

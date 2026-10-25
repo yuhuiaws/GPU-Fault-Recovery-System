@@ -225,7 +225,7 @@ QUARANTINE、MOUNT_MISSING）判定，把共享存储状况变成坏节点结论
 EXPORT 块（NFS-Ganesha 4.3 在 MDCACHE 块报 Unknown parameter），`NFS_KRB5 { Active_krb5 = false; }`
 消去启动 CRIT；`activeDeadlineSeconds` 为集群侧 deadman，按 UID 前提删除，调度到客户端节点之外或由
 `--export-node` 指定）加其 `ganesha.conf` ConfigMap。本站镜像：
-`514385905925.dkr.ecr.us-west-2.amazonaws.com/gfrs-test/nfs-ganesha@sha256:d354efdc8364e4ba17b83c4aa27cdef4001a474fc950b07547e7fcf9d1e14d7f`
+`<account-id>.dkr.ecr.us-west-2.amazonaws.com/gfrs-test/nfs-ganesha@sha256:d354efdc8364e4ba17b83c4aa27cdef4001a474fc950b07547e7fcf9d1e14d7f`
 （Ubuntu 24.04 + NFS-Ganesha 4.3：`/usr/bin/ganesha.nfsd`、`/usr/lib/x86_64-linux-gnu/ganesha/libfsalvfs.so`，
 `/bin/sh` 为 dash，入口脚本按 POSIX sh 书写）。客户端由 `probes/general_live_shared_probe.py` 在
 PID 1 的挂载命名空间以 `vers=4.1,soft,timeo=100,retrans=2,actimeo=2` 挂到
