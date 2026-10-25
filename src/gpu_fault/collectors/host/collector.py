@@ -18,6 +18,10 @@ from gpu_fault.collectors.host.gpu_rank import HostGpuRankMixin
 from gpu_fault.collectors.host.inventory import HostInventoryMixin
 from gpu_fault.collectors.host.network import HostNetworkMixin
 from gpu_fault.collectors.host.observation import HostObservationError
+from gpu_fault.collectors.host.shared_mounts import (
+    SharedMountMemory,
+    read_directory_entry,
+)
 from gpu_fault.collectors.host.system_metrics import (
     BoundedStatvfs,
     HostSystemMetricsMixin,
@@ -125,6 +129,8 @@ class HostTelemetryCollector(
         statvfs: Callable[[str], os.statvfs_result] | None = None,
         statvfs_timeout_seconds: float = 5,
         statvfs_budget_seconds: float = 15,
+        directory_probe: Callable[[str], None] | None = None,
+        shared_filesystem_state_path: str | None = None,
         edge_filter_enabled: bool | None = None,
         health_summary_seconds: int | None = None,
         history_max_points: int | None = None,
@@ -216,6 +222,19 @@ class HostTelemetryCollector(
         self._statvfs_tick: datetime | None = None
         self._statvfs_spent_seconds: float = 0.0
         self._unresponsive_mounts: set[str] = set()
+        # The shared mounts' data-path read, under the same deadline and
+        # budget as statvfs, and the memory of the node-scoped shared mounts
+        # seen so far (``shared_mounts``). No state path keeps the memory in
+        # the process: the factory below supplies the on-disk default.
+        self._directory_probe = (
+            directory_probe if directory_probe is not None else read_directory_entry
+        )
+        self._shared_mount_memory = SharedMountMemory(
+            Path(shared_filesystem_state_path) if shared_filesystem_state_path else None
+        )
+        memory_warning = self._shared_mount_memory.load()
+        if memory_warning is not None:
+            LOGGER.warning("%s", memory_warning)
         #: Samples a contributor produced before it failed (see
         #: :meth:`collect_once`).
         self._partial_samples: list[HostMetricSample] = []
@@ -806,5 +825,11 @@ def build_from_environment(
                 "GPU_FAULT_INVENTORY_MISMATCH_CONSECUTIVE_SAMPLES",
                 "2",
             )
+        ),
+        # Under the unit's ``ReadWritePaths=/var/lib/gpu-fault``; empty
+        # disables the file (the memory then lives in the process only).
+        shared_filesystem_state_path=os.getenv(
+            "GPU_FAULT_HOST_SHARED_FILESYSTEM_STATE_PATH",
+            "/var/lib/gpu-fault/host-collector-shared-filesystems.json",
         ),
     )

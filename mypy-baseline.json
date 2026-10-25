@@ -140,7 +140,6 @@
   "src/gpu_fault/collectors/host/collector.py:arg-type": 1,
   "src/gpu_fault/collectors/host/gpu_rank.py:has-type": 1,
   "src/gpu_fault/collectors/host/network.py:var-annotated": 1,
-  "src/gpu_fault/collectors/host/system_metrics.py:var-annotated": 1,
   "src/gpu_fault/collectors/logs/node.py:var-annotated": 1,
   "src/gpu_fault/completion_controller.py:no-any-return": 1,
   "src/gpu_fault/completion_controller.py:no-untyped-def": 1,

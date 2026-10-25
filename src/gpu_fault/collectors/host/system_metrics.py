@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -10,19 +11,55 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, NamedTuple
+from typing import Any, Callable, NamedTuple, TypeVar
 
-from gpu_fault.collectors.host.mount_table import host_mount, read_mount_table
+from gpu_fault.collectors.host.mount_table import (
+    MountEntry,
+    host_mount,
+    read_mount_table,
+)
 from gpu_fault.collectors.host.observation import HostObservationError
+from gpu_fault.collectors.host.shared_mounts import (
+    SharedMountMemory,
+    SharedMountRecord,
+    node_scoped,
+    shared_mounts,
+)
 from gpu_fault.host_health import (
     HostMetricSample,
 )
 
 LOGGER = logging.getLogger(__name__)
 
-#: Sentinel that retires an abandoned ``statvfs`` worker once its mount
-#: answers, so a mount that recovers does not leave the thread behind.
-_RETIRE = "\0retire"
+_T = TypeVar("_T")
+
+#: One request to a probe worker: the mount and the syscall to make on it.
+#: None retires an abandoned worker once its mount answers, so a mount that
+#: recovers does not leave the thread behind.
+_ProbeRequest = tuple[str, Callable[[str], Any]] | None
+_ProbeResponse = tuple[Any, OSError | None]
+
+
+class ProbeStillRunning(TimeoutError):
+    """A probe of this mount from an earlier tick has not returned yet.
+
+    Carries the syscall that is parked, so the caller can keep reporting the
+    condition under the failure mode that first described it: a directory read
+    that hung must not be relabelled a ``statvfs`` timeout on the next tick
+    merely because ``statvfs`` was the call that found the mount busy.
+    """
+
+    def __init__(self, mount: str, operation: Callable[[str], Any]) -> None:
+        super().__init__(
+            f"{_operation_name(operation)}({mount}) from an earlier tick has not "
+            "returned"
+        )
+        self.operation = operation
+
+
+def _operation_name(operation: Callable[[str], Any]) -> str:
+    return getattr(operation, "__name__", "probe")
+
 
 #: How long a SMART health verdict is reused. ``smartctl -H`` is one fork per
 #: drive with a 20 s timeout -- nine forks and a 180 s worst case on a p5 with
@@ -131,7 +168,7 @@ _SMART_OPEN_FAILED = "open failed"
 
 
 class _InFlightProbe:
-    """A ``statvfs`` call that missed its deadline and is still running.
+    """A mount syscall that missed its deadline and is still running.
 
     The syscall cannot be cancelled, so the worker it captured is abandoned --
     but the *mount* is remembered, across ticks: until this worker answers,
@@ -142,9 +179,11 @@ class _InFlightProbe:
 
     def __init__(
         self,
-        requests: queue.SimpleQueue[str],
-        responses: queue.SimpleQueue[tuple[os.statvfs_result | None, OSError | None]],
+        operation: Callable[[str], Any],
+        requests: queue.SimpleQueue[_ProbeRequest],
+        responses: queue.SimpleQueue[_ProbeResponse],
     ) -> None:
+        self.operation = operation
         self._requests = requests
         self._responses = responses
 
@@ -157,12 +196,12 @@ class _InFlightProbe:
             return False
         # The worker is idle again and nothing else holds its queues: retire it
         # rather than keep a thread per mount that ever hung.
-        self._requests.put(_RETIRE)
+        self._requests.put(None)
         return True
 
 
 class BoundedStatvfs:
-    """``os.statvfs`` a hung mount cannot wedge the caller with.
+    """Mount syscalls a hung mount cannot wedge the caller with.
 
     ``statvfs`` on a hard NFS mount or a Lustre client in MDS recovery blocks
     in uninterruptible sleep, and the collector calls it once per configured
@@ -171,7 +210,10 @@ class BoundedStatvfs:
     including the batch that would have reported it. The syscall cannot be
     cancelled, so it runs on a worker thread and the caller gives up after
     ``timeout_seconds`` with ``TimeoutError`` (an ``OSError``, which the
-    callers already read as "this mount is unavailable").
+    callers already read as "this mount is unavailable"). :meth:`run` makes
+    any other per-mount syscall under the same deadline -- the shared mounts'
+    directory read -- and the parking below is per mount, whichever call hung
+    it: a mount whose read is still parked is not asked for a ``statvfs``.
 
     A worker a hung mount captured is abandoned, and the mount is remembered
     until that worker answers: a dead FSx server that is N hung bind mounts
@@ -197,47 +239,47 @@ class BoundedStatvfs:
         self._statvfs = statvfs
         self._timeout_seconds = timeout_seconds
         self._max_in_flight = max_in_flight
-        self._requests: queue.SimpleQueue[str] | None = None
-        self._responses: (
-            queue.SimpleQueue[tuple[os.statvfs_result | None, OSError | None]] | None
-        ) = None
+        self._requests: queue.SimpleQueue[_ProbeRequest] | None = None
+        self._responses: queue.SimpleQueue[_ProbeResponse] | None = None
         self._in_flight: dict[str, _InFlightProbe] = {}
 
     def __call__(self, mount: str) -> os.statvfs_result:
+        return self.run(mount, self._statvfs)
+
+    def run(self, mount: str, operation: Callable[[str], _T]) -> _T:
+        """``operation(mount)`` on the worker, or ``TimeoutError`` past the deadline."""
+
+        what = _operation_name(operation)
         blocked = self._in_flight.get(mount)
         if blocked is not None:
             if not blocked.has_answered():
-                raise TimeoutError(
-                    f"statvfs({mount}) from an earlier tick has not returned"
-                )
+                raise ProbeStillRunning(mount, blocked.operation)
             del self._in_flight[mount]
         self._retire_answered_probes()
         if len(self._in_flight) >= self._max_in_flight:
             raise TimeoutError(
-                f"{len(self._in_flight)} statvfs calls are already parked in the "
-                f"kernel; not starting one for {mount}"
+                f"{len(self._in_flight)} mount probes are already parked in the "
+                f"kernel; not starting {what} for {mount}"
             )
         if self._requests is None or self._responses is None:
             self._start_worker()
         requests = self._requests
         responses = self._responses
         if requests is None or responses is None:  # pragma: no cover - defensive
-            raise OSError(f"no statvfs worker for {mount}")
-        requests.put(mount)
+            raise OSError(f"no probe worker for {mount}")
+        requests.put((mount, operation))
         try:
-            stat, error = responses.get(timeout=self._timeout_seconds)
+            value, error = responses.get(timeout=self._timeout_seconds)
         except queue.Empty:
-            self._in_flight[mount] = _InFlightProbe(requests, responses)
+            self._in_flight[mount] = _InFlightProbe(operation, requests, responses)
             self._requests = None
             self._responses = None
             raise TimeoutError(
-                f"statvfs({mount}) did not answer within {self._timeout_seconds:g}s"
+                f"{what}({mount}) did not answer within {self._timeout_seconds:g}s"
             ) from None
         if error is not None:
             raise error
-        if stat is None:  # pragma: no cover - defensive
-            raise OSError(f"statvfs({mount}) returned nothing")
-        return stat
+        return value  # type: ignore[no-any-return]
 
     def _retire_answered_probes(self) -> None:
         """Free the slots of mounts whose abandoned syscall has since returned.
@@ -254,30 +296,29 @@ class BoundedStatvfs:
             del self._in_flight[mount]
 
     def _start_worker(self) -> None:
-        requests: queue.SimpleQueue[str] = queue.SimpleQueue()
-        responses: queue.SimpleQueue[
-            tuple[os.statvfs_result | None, OSError | None]
-        ] = queue.SimpleQueue()
+        requests: queue.SimpleQueue[_ProbeRequest] = queue.SimpleQueue()
+        responses: queue.SimpleQueue[_ProbeResponse] = queue.SimpleQueue()
         threading.Thread(
             target=self._serve,
             args=(requests, responses),
-            name="gpu-fault-statvfs",
+            name="gpu-fault-mount-probe",
             daemon=True,
         ).start()
         self._requests = requests
         self._responses = responses
 
+    @staticmethod
     def _serve(
-        self,
-        requests: queue.SimpleQueue[str],
-        responses: queue.SimpleQueue[tuple[os.statvfs_result | None, OSError | None]],
+        requests: queue.SimpleQueue[_ProbeRequest],
+        responses: queue.SimpleQueue[_ProbeResponse],
     ) -> None:
         while True:
-            mount = requests.get()
-            if mount == _RETIRE:
+            request = requests.get()
+            if request is None:
                 return
+            mount, operation = request
             try:
-                responses.put((self._statvfs(mount), None))
+                responses.put((operation(mount), None))
             except OSError as exc:
                 responses.put((None, exc))
             except Exception as exc:  # pragma: no cover - defensive
@@ -292,9 +333,11 @@ class HostSystemMetricsMixin:
     statvfs_timeout_seconds: float
 
     _delta: Callable[..., Any]
+    _directory_probe: Callable[[str], None]
     _previous: Any
     _sample: Callable[..., Any]
-    _statvfs_probe: Callable[[str], os.statvfs_result]
+    _shared_mount_memory: SharedMountMemory
+    _statvfs_probe: BoundedStatvfs
     _statvfs_spent_seconds: float
     _statvfs_tick: datetime | None
     _unresponsive_mounts: set[str]
@@ -310,10 +353,17 @@ class HostSystemMetricsMixin:
     #: warning per tick would flood the journal.
     _filesystem_warnings = _NO_FILESYSTEM_WARNINGS
 
-    def _probe_mount(self, mount: str, observed_at: datetime) -> os.statvfs_result:
-        """``statvfs`` with a deadline, at most once per mount per tick.
+    def _probe_mount(
+        self,
+        mount: str,
+        observed_at: datetime,
+        operation: Callable[[str], Any] | None = None,
+    ) -> Any:
+        """A mount syscall with a deadline, at most once per hung mount per tick.
 
-        A mount that missed its deadline is not asked again in the same tick:
+        ``operation`` is ``statvfs`` by default, or the shared mounts' directory
+        read; both share the deadline, the budget and the parking below. A
+        mount that missed its deadline is not asked again in the same tick:
         the configured filesystem list and ``/proc/self/mountinfo`` overlap on
         an FSx or NFS path, and paying the deadline once per contributor would
         multiply the tick's worst case by the number of contributors that name
@@ -333,27 +383,29 @@ class HostSystemMetricsMixin:
             self._statvfs_spent_seconds = 0.0
             self._unresponsive_mounts.clear()
         if mount in self._unresponsive_mounts:
-            raise TimeoutError(f"{mount} already missed its statvfs deadline this tick")
+            raise TimeoutError(f"{mount} already missed its probe deadline this tick")
         if self._statvfs_spent_seconds >= self.statvfs_budget_seconds:
             self._unresponsive_mounts.add(mount)
             LOGGER.warning(
-                "this tick already spent %gs of its %gs statvfs budget; reporting "
-                "%s as unavailable without probing it",
+                "this tick already spent %gs of its %gs mount probe budget; "
+                "reporting %s as unavailable without probing it",
                 self._statvfs_spent_seconds,
                 self.statvfs_budget_seconds,
                 mount,
             )
-            raise TimeoutError(f"the tick's statvfs budget was spent before {mount}")
+            raise TimeoutError(
+                f"the tick's mount probe budget was spent before {mount}"
+            )
         started = time.monotonic()
         try:
-            return self._statvfs_probe(mount)
-        except TimeoutError:
+            if operation is None:
+                return self._statvfs_probe(mount)
+            return self._statvfs_probe.run(mount, operation)
+        except TimeoutError as error:
             self._unresponsive_mounts.add(mount)
             LOGGER.warning(
-                "statvfs(%s) did not answer within %gs; reporting the mount as "
-                "unavailable",
-                mount,
-                self.statvfs_timeout_seconds,
+                "%s; reporting the mount as unavailable",
+                error,
             )
             raise
         finally:
@@ -482,9 +534,16 @@ class HostSystemMetricsMixin:
                 # ``GPU_FAULT_FILESYSTEMS`` may name an FSx or NFS path, and a
                 # local mount that stops answering is worse news still; either
                 # way the consumer's rule for "this mount is not usable" is
-                # ``shared_filesystem_unavailable``.
+                # ``shared_filesystem_unavailable``. The same failure mode as
+                # ``_shared_filesystems`` gives a hung ``statvfs``, so a mount
+                # both contributors name carries one meaning, not two.
                 result.append(
-                    self._sample("shared_filesystem_unavailable", 1, None, mount)
+                    HostMetricSample(
+                        name="shared_filesystem_unavailable",
+                        value=1.0,
+                        device=mount,
+                        labels={"failure_mode": "PROBE_TIMEOUT"},
+                    )
                 )
                 continue
             except OSError as error:
@@ -635,53 +694,213 @@ class HostSystemMetricsMixin:
         return max(candidates)[1] if candidates else None
 
     def _shared_filesystems(self, observed_at: datetime) -> list[HostMetricSample]:
-        result = []
-        mountinfo = Path("/proc/self/mountinfo")
-        if not mountinfo.exists():
+        """Every NFS/Lustre mount the host has, and every one it used to have.
+
+        Discovery reads the host's (PID 1's) mount table, as ``_filesystems``
+        does for its read-only verdict: the collector's own table is a sandbox
+        view that hides ``ProtectHome=`` paths and never receives a mount made
+        under a non-propagating parent. A shared mount the sandbox hides is
+        warned about once and neither probed nor reported -- the collector's
+        syscalls there would read the sandbox's filesystem, not the export.
+        Without a host table the collector's own table stands, as it always
+        did.
+
+        Each visible mount is probed twice under one deadline and one budget
+        (``_probe_mount``): ``statvfs`` for the capacity reading and the
+        FSSTAT round trip, then one directory-entry read for the data path
+        (``shared_mounts.read_directory_entry``) -- an export whose
+        permissions changed server-side or whose backend is stuck answers
+        FSSTAT and used to read healthy (GF-GENERAL-LIVE-005
+        ``io_only_failure``).
+
+        The node-scoped mounts seen are remembered (``SharedMountMemory``): a
+        remembered mount the table no longer lists is MOUNT_MISSING while its
+        mount point directory is still there, and forgotten once the
+        directory is gone too (``mount_disappears``, and its legitimate
+        counterpart, a teardown). Which mounts are remembered, what clears
+        them and what survives a restart is the memory module's docstring.
+        """
+
+        result: list[HostMetricSample] = []
+        own = read_mount_table(Path("/proc/self/mountinfo"))
+        host_table = self.proc_root / "1" / "mountinfo"
+        host = read_mount_table(host_table)
+        table = host if host is not None else own
+        if table is None:
             return result
-        for line in mountinfo.read_text().splitlines():
-            fields = line.split()
-            if " - " not in line:
-                continue
-            separator = fields.index("-")
-            fs_type = fields[separator + 1]
-            if fs_type not in {"lustre", "nfs", "nfs4"}:
-                continue
-            mount = fields[4].replace("\\040", " ")
-            try:
-                # ``TimeoutError`` is an ``OSError``: a mount that never
-                # answers lands in the same "unavailable" branch as one that
-                # answers ESTALE, which is what the CRITICAL rule wants.
-                stat = self._probe_mount(mount, observed_at)
-                total = stat.f_blocks * stat.f_frsize
-                available = stat.f_bavail * stat.f_frsize
-                result.append(
-                    self._sample(
-                        "shared_filesystem_unavailable",
-                        0,
-                        None,
-                        mount,
-                    )
+        if host is None:
+            self._warn_filesystems_once(
+                "\0shared-host-mount-table",
+                "the host mount table %s cannot be read; shared mounts are "
+                "discovered from the collector's own table",
+                host_table,
+            )
+        present: dict[str, tuple[str, str]] = {}
+        for entry in shared_mounts(table):
+            mount = entry.mount_point
+            if not host_mount(mount, own, host).same_filesystem:
+                self._warn_filesystems_once(
+                    mount,
+                    "shared mount %s (%s) is hidden by the collector's sandbox; it "
+                    "is not reported",
+                    mount,
+                    entry.source,
                 )
-                if total:
-                    result.append(
-                        self._sample(
-                            "shared_filesystem_used_percent",
-                            100 * (total - available) / total,
-                            "percent",
-                            mount,
-                        )
-                    )
-            except OSError:
-                result.append(
-                    self._sample(
-                        "shared_filesystem_unavailable",
-                        1,
-                        None,
-                        mount,
-                    )
-                )
+                continue
+            if node_scoped(entry, table):
+                present[mount] = (entry.source, entry.fs_type)
+            result.extend(self._shared_mount_samples(entry, observed_at))
+        observation = self._shared_mount_memory.observe(present, observed_at)
+        for mount in observation.refused:
+            self._warn_filesystems_once(
+                f"\0shared-memory-full:{mount}",
+                "the shared mount memory is full; a disappearance of %s will not be "
+                "reported",
+                mount,
+            )
+        for record in observation.missing:
+            result.extend(self._missing_shared_mount(record, own, host, observed_at))
+        warning = self._shared_mount_memory.save()
+        if warning is not None:
+            self._warn_filesystems_once("\0shared-memory-save", "%s", warning)
         return result
+
+    def _shared_mount_samples(
+        self, entry: MountEntry, observed_at: datetime
+    ) -> list[HostMetricSample]:
+        """The availability gauge and the capacity reading of one visible mount."""
+
+        mount = entry.mount_point
+        try:
+            stat = self._probe_mount(mount, observed_at)
+        except ProbeStillRunning as error:
+            # The parked call may be last tick's directory read: keep its name.
+            return [
+                self._shared_filesystem_unavailable(
+                    mount,
+                    entry.source,
+                    entry.fs_type,
+                    "IO_TIMEOUT"
+                    if error.operation is self._directory_probe
+                    else "PROBE_TIMEOUT",
+                )
+            ]
+        except TimeoutError:
+            return [
+                self._shared_filesystem_unavailable(
+                    mount, entry.source, entry.fs_type, "PROBE_TIMEOUT"
+                )
+            ]
+        except OSError as error:
+            # ESTALE, EIO, ENOENT ...: a status that cannot be read is
+            # unusable (UNKNOWN), never healthy and never skipped.
+            return [
+                self._shared_filesystem_unavailable(
+                    mount, entry.source, entry.fs_type, "PROBE_FAILED", error
+                )
+            ]
+        result = []
+        total = stat.f_blocks * stat.f_frsize
+        available = stat.f_bavail * stat.f_frsize
+        if total:
+            result.append(
+                self._sample(
+                    "shared_filesystem_used_percent",
+                    100 * (total - available) / total,
+                    "percent",
+                    mount,
+                )
+            )
+        io_failure: str | None = None
+        io_error: OSError | None = None
+        try:
+            self._probe_mount(mount, observed_at, self._directory_probe)
+        except TimeoutError:
+            # No errno and no verdict: the read did not answer within the
+            # deadline. Missing evidence reads unavailable, not healthy.
+            io_failure = "IO_TIMEOUT"
+        except OSError as exc:
+            io_failure, io_error = "IO_ERROR", exc
+        result.insert(
+            0,
+            self._shared_filesystem_unavailable(
+                mount, entry.source, entry.fs_type, io_failure, io_error
+            ),
+        )
+        return result
+
+    def _missing_shared_mount(
+        self,
+        record: SharedMountRecord,
+        own: tuple[MountEntry, ...] | None,
+        host: tuple[MountEntry, ...] | None,
+        observed_at: datetime,
+    ) -> list[HostMetricSample]:
+        """A remembered mount the table no longer lists: gone, or torn down.
+
+        The mount point is read with the bounded directory probe, never a bare
+        ``stat`` (the parent may be a wedged mount). ENOENT on the host's own
+        directory is a teardown -- ``umount`` then ``rmdir`` -- and the mount
+        is forgotten. Anything else, including a read that hangs or an ENOENT
+        the sandbox may have produced, leaves the mount MOUNT_MISSING: the
+        table says it is gone and nothing proved it was meant to be.
+        """
+
+        mount = record.mount_point
+        try:
+            self._probe_mount(mount, observed_at, self._directory_probe)
+        except (FileNotFoundError, NotADirectoryError):
+            if host_mount(mount, own, host).same_directory:
+                self._shared_mount_memory.forget(mount)
+                LOGGER.info(
+                    "shared mount %s (%s) was unmounted and its mount point removed; "
+                    "no longer tracked",
+                    mount,
+                    record.source,
+                )
+                return []
+        except OSError:
+            pass
+        return [
+            self._shared_filesystem_unavailable(
+                mount, record.source, record.fs_type, "MOUNT_MISSING"
+            )
+        ]
+
+    @staticmethod
+    def _shared_filesystem_unavailable(
+        mount: str,
+        source: str,
+        fs_type: str,
+        failure_mode: str | None,
+        error: OSError | None = None,
+    ) -> HostMetricSample:
+        """Availability gauge for one shared mount (GF-GENERAL-LIVE-005).
+
+        Value 0 with no labels for a mount whose ``statvfs`` and directory read
+        both answered; value 1 otherwise, naming the export (``source``,
+        ``fs_type``) and the ``failure_mode``: ``PROBE_TIMEOUT`` (``statvfs``
+        did not answer), ``PROBE_FAILED`` (it raised; ``errno`` named),
+        ``IO_TIMEOUT`` (the directory read did not answer: no verdict, reported
+        unavailable rather than healthy), ``IO_ERROR`` (it raised; ``errno``
+        named) and ``MOUNT_MISSING`` (a remembered mount the host's table no
+        longer lists). The labels are new and optional on the wire; the
+        consumer's rule reads the value.
+        """
+
+        if failure_mode is None:
+            return HostMetricSample(
+                name="shared_filesystem_unavailable", value=0.0, device=mount
+            )
+        labels = {"failure_mode": failure_mode, "source": source, "fs_type": fs_type}
+        if error is not None and error.errno:
+            labels["errno"] = errno.errorcode.get(error.errno, str(error.errno))
+        return HostMetricSample(
+            name="shared_filesystem_unavailable",
+            value=1.0,
+            device=mount,
+            labels=labels,
+        )
 
     def _lustre(self, observed_at: datetime) -> list[HostMetricSample]:
         result = []

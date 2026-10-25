@@ -122,12 +122,12 @@ def wedged_children() -> Iterator[_WedgedChildFactory]:
 
 
 def _statvfs_workers() -> int:
-    """How many bounded-``statvfs`` worker threads exist right now."""
+    """How many bounded mount-probe worker threads exist right now."""
 
     return sum(
         1
         for thread in threading.enumerate()
-        if thread.name.startswith("gpu-fault-statvfs")
+        if thread.name.startswith("gpu-fault-mount-probe")
     )
 
 
@@ -358,6 +358,7 @@ def test_a_hung_shared_mount_does_not_wedge_the_tick(
         now=lambda: NOW,
         statvfs=_blocking_statvfs(released),
         statvfs_timeout_seconds=0.5,
+        directory_probe=lambda mount: None,
     )
 
     try:
@@ -787,6 +788,7 @@ def test_the_tick_gives_up_on_the_remaining_mounts_when_its_budget_is_spent(
         statvfs=statvfs,
         statvfs_timeout_seconds=0.2,
         statvfs_budget_seconds=0.5,
+        directory_probe=lambda mount: None,
     )
 
     try:
@@ -839,6 +841,7 @@ def test_the_tick_does_not_reprobe_a_mount_that_already_timed_out(
         filesystems=["/hung"],
         statvfs=statvfs,
         statvfs_timeout_seconds=0.5,
+        directory_probe=lambda mount: None,
     )
 
     try:

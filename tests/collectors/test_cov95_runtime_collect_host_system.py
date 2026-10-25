@@ -91,6 +91,7 @@ def test_zero_capacity_or_absent_mounts_do_not_create_usage_percent(host_case, s
         "_shared_filesystems" if shared else "_filesystems",
         filesystems=["/zero", "/missing"],
         statvfs=probe,
+        directory_probe=lambda path: None,
     )
     batch = collector.collect_once()
     assert batch.collection_errors == []

@@ -61,6 +61,10 @@ class MountEntry:
     fs_type: str
     mount_options: tuple[str, ...]
     super_options: tuple[str, ...]
+    #: The mount source: a block device for a local filesystem, the export
+    #: (``10.0.0.2:/export``, ``10.0.0.1@tcp:/fsx``) for a shared one. Last so
+    #: that callers constructing entries positionally are unaffected.
+    source: str = ""
 
     @property
     def read_only(self) -> bool:
@@ -115,6 +119,7 @@ def parse_mountinfo(text: str) -> tuple[MountEntry, ...]:
                 fs_type=fields[separator + 1],
                 mount_options=tuple(fields[5].split(",")),
                 super_options=tuple(fields[separator + 3].split(",")),
+                source=_unescape(fields[separator + 2]),
             )
         )
     return tuple(entries)
