@@ -2,8 +2,10 @@
 
 Every required variant of the host/device categories 002/005/007/010/012/015
 must be in the registry -- implemented, or NOT_RUN with a reviewed reason --
-so none silently drops out of the coverage denominator. The one read-only
-observation (007 healthy) is exercised here against scripted product records.
+so none silently drops out of the coverage denominator. The read-only
+observation 007 healthy is exercised here against scripted product records;
+the replay variants of 007 and 015 have their own modules and tests
+(``test_general_live_smart.py``, ``test_general_live_bmc.py``).
 """
 
 from __future__ import annotations
@@ -13,8 +15,8 @@ from typing import Any
 
 import pytest
 
-from scripts.e2e.regional import general_live_devices as devices
 from scripts.e2e.regional import general_live_registry as reg
+from scripts.e2e.regional import general_live_smart as smart
 from tests.regional._general_live_fakes import (
     FakeProbe,
     FakeRegional,
@@ -80,7 +82,7 @@ def test_live_replay_executable_is_now_allowed_but_vendor_lab_is_not() -> None:
         reg.validate_spec(reg.VariantSpec(proof_mode=reg.VENDOR_LAB, **base))
 
 
-def test_only_the_native_and_observation_variants_execute() -> None:
+def test_the_executable_lane_variants_are_the_wired_ones() -> None:
     registry = reg.load_registry()
     implemented = sorted(
         spec.key
@@ -92,7 +94,19 @@ def test_only_the_native_and_observation_variants_execute() -> None:
         "GF-GENERAL-LIVE-002.memory_pressure",
         "GF-GENERAL-LIVE-002.no_swap",
         "GF-GENERAL-LIVE-002.recovery",
+        "GF-GENERAL-LIVE-007.health_failed",
         "GF-GENERAL-LIVE-007.healthy",
+        "GF-GENERAL-LIVE-007.malformed_json",
+        "GF-GENERAL-LIVE-007.query_failed",
+        "GF-GENERAL-LIVE-007.scan_failed",
+        "GF-GENERAL-LIVE-007.tool_missing",
+        "GF-GENERAL-LIVE-007.unsupported_device",
+        "GF-GENERAL-LIVE-015.command_failure",
+        "GF-GENERAL-LIVE-015.critical",
+        "GF-GENERAL-LIVE-015.nonrecoverable",
+        "GF-GENERAL-LIVE-015.unavailable_sensor",
+        "GF-GENERAL-LIVE-015.unsupported_bmc",
+        "GF-GENERAL-LIVE-015.wrong_column",
     ], implemented
 
 
@@ -140,7 +154,7 @@ def _devices_context(
 ):
     spec = next(
         item
-        for item in devices.VARIANTS
+        for item in smart.VARIANTS
         if item.case_id == case_id and item.variant == variant
     )
     regional = FakeRegional(cpu_python=store_script({"activity": document}))
