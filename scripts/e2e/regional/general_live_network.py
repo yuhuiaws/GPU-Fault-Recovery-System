@@ -19,6 +19,7 @@ fixture, the temporary ``tc`` dependency and its oracle) is
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import timedelta
 from typing import Any
 
@@ -36,6 +37,7 @@ from scripts.e2e.regional.general_live_common import (
 from scripts.e2e.regional.general_live_fixture import (
     VariantContext,
     VariantInconclusive,
+    VariantNotRun,
     require_module,
     require_tools,
     utc_now,
@@ -362,17 +364,80 @@ def optional_interface(ctx: VariantContext) -> dict[str, Any]:
     return _result(stages)
 
 
+#: Interface roles of the net probe's ``inventory`` (008 ``empty_required_list``).
+ROLES = ("management", "pod_network", "virtual", "dedicated")
+
+
+def interface_roles(inventory: Mapping[str, Any]) -> dict[str, list[str]]:
+    """Which real netdevs are a dedicated data NIC the required list could name.
+
+    From the probe's read-only ``inventory`` of every netdev but ``lo`` and the
+    run's own test interfaces: ``management`` carries the main table's default
+    route; ``pod_network`` is a device-backed netdev that is the default route
+    of a policy routing table and not of the main table -- the pattern the pod
+    network sets up (the VPC CNI keeps one table per secondary ENI), so it is
+    the CNI's, not an admin's; ``virtual`` has no sysfs ``device`` link
+    (host-side pod veths, bridges, dummies, tunnels); ``dedicated`` is every
+    other device-backed netdev -- an RDMA-capable netdev, a NIC of another
+    driver, an admin-configured secondary interface routed in the main table --
+    the candidates ``GPU_FAULT_REQUIRED_INTERFACES`` exists for. Generic: no
+    site names, only sysfs and routing facts.
+    """
+
+    roles: dict[str, list[str]] = {role: [] for role in ROLES}
+    for name, info in sorted((inventory.get("interfaces") or {}).items()):
+        info = info if isinstance(info, Mapping) else {}
+        if not info.get("has_device"):
+            roles["virtual"].append(name)
+        elif info.get("default_route"):
+            roles["management"].append(name)
+        elif info.get("policy_tables") and not info.get("rdma"):
+            roles["pod_network"].append(name)
+        else:
+            roles["dedicated"].append(name)
+    return roles
+
+
 def empty_required_list(ctx: VariantContext) -> dict[str, Any]:
-    """Observation: the live required-interface list is empty, so a real NIC
-    link-down can never isolate the node (spec FAIL, site configuration)."""
+    """Observation: the live required-interface list is empty.
+
+    A real NIC link-down can then never isolate the node -- the spec's site
+    FAIL -- but only where the node has a dedicated data NIC to declare. A node
+    whose real netdevs are the default-route interface and the pod network's
+    secondary ENIs (everything else a container/virtual interface) has nothing
+    to declare: an empty list is the correct configuration there, and the
+    variant is NOT_RUN(CAPABILITY_ABSENT) rather than a FAIL. The decision is
+    read from the node (``interface_roles`` over the net probe's ``inventory``),
+    never from a site name.
+    """
 
     survey = run_survey(ctx)
     env = survey.get("collector_env") or {}
     configured = str(env.get("GPU_FAULT_REQUIRED_INTERFACES") or "").strip()
+    require_tools(survey, "ip")
+    inventory = ctx.net("inventory")
+    roles = interface_roles(inventory)
+    ctx.evidence.write(
+        "interface-roles",
+        {
+            "configured_required_interfaces": configured,
+            "roles": roles,
+            "inventory": inventory,
+        },
+    )
+    if not configured and not roles["dedicated"]:
+        raise VariantNotRun(
+            "CAPABILITY_ABSENT",
+            "no dedicated data NIC on this node (default route "
+            f"{roles['management']}, pod network {roles['pod_network']}, "
+            f"{len(roles['virtual'])} virtual/container interfaces); an empty "
+            "GPU_FAULT_REQUIRED_INTERFACES is the correct configuration",
+        )
     stages = {
         "required_list": [
             "GPU_FAULT_REQUIRED_INTERFACES is empty, so no real NIC link-down can "
-            "isolate this node (the installer default is empty)"
+            f"isolate this node (the installer default is empty) while it has the "
+            f"dedicated data netdev(s) {roles['dedicated']} to declare"
         ]
         if not configured
         else []
@@ -380,9 +445,11 @@ def empty_required_list(ctx: VariantContext) -> dict[str, Any]:
     return _result(
         stages,
         notes=[
-            "remedy: an admin/installer decision to declare the primary/EFA netdevs"
+            "remedy: an admin/installer decision to declare the dedicated data "
+            f"netdev(s) {roles['dedicated']} (and the primary/EFA netdevs where "
+            "the site has them)"
         ],
-        extra={"configured_required_interfaces": configured},
+        extra={"configured_required_interfaces": configured, "interface_roles": roles},
     )
 
 
@@ -1061,8 +1128,14 @@ VARIANTS = [
     _spec(
         CASE_008,
         "empty_required_list",
-        "read GPU_FAULT_REQUIRED_INTERFACES on the live node",
-        "the list is empty, so a real NIC link-down can never isolate (spec FAIL, site config)",
+        "read GPU_FAULT_REQUIRED_INTERFACES on the live node and the roles of its real "
+        "netdevs (net probe inventory: device links, drivers, RDMA, the main default "
+        "route, pod-network policy tables)",
+        "the list is empty while the node has a dedicated data NIC to declare, so a real "
+        "NIC link-down can never isolate (spec FAIL, site config); a node whose real "
+        "netdevs are only the default-route interface and the pod network's secondary "
+        "ENIs has nothing to declare: NOT_RUN(CAPABILITY_ABSENT), an empty list is the "
+        "correct configuration there",
         empty_required_list,
         risk="L",
         proof=OBSERVATION,

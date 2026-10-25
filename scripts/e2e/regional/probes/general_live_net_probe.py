@@ -1103,6 +1103,91 @@ def show_residue(arguments: argparse.Namespace) -> None:
     emit({"residue": value, "clean": residue_is_clean(value)})
 
 
+# --------------------------------------------------------------------------- #
+# Interface inventory: the real netdevs and their routing roles (008
+# ``empty_required_list`` decides from it whether the node has a dedicated
+# data NIC that GPU_FAULT_REQUIRED_INTERFACES could name). Read-only.
+# --------------------------------------------------------------------------- #
+#: Routing tables that are the kernel's, not a policy table of the pod network.
+KERNEL_ROUTE_TABLES = frozenset({"main", "local", "default", "0", "253", "254", "255"})
+#: Policy tables read at most (the VPC CNI keeps one per secondary ENI).
+ROUTE_TABLES_LIMIT = 64
+
+
+def json_rows(command: list[str]) -> list[dict[str, Any]]:
+    """The objects an ``ip -j`` command printed (nothing on any failure)."""
+
+    completed = run(command, check=False)
+    try:
+        value = json.loads(completed.stdout or "[]")
+    except json.JSONDecodeError:
+        return []
+    return (
+        [item for item in value if isinstance(item, dict)]
+        if isinstance(value, list)
+        else []
+    )
+
+
+def default_route_devices(table: str | None = None) -> list[str]:
+    """The devices of the default route(s) in ``table`` (the main table by default)."""
+
+    command = ["ip", "-j", "route", "show", "default"]
+    if table is not None:
+        command += ["table", table]
+    return sorted({str(item["dev"]) for item in json_rows(command) if item.get("dev")})
+
+
+def policy_tables() -> list[str]:
+    """The routing tables ``ip rule`` sends traffic to, besides the kernel's own."""
+
+    tables: list[str] = []
+    for item in json_rows(["ip", "-j", "rule", "show"]):
+        table = str(item.get("table") or "")
+        if table and table not in KERNEL_ROUTE_TABLES and table not in tables:
+            tables.append(table)
+    return tables[:ROUTE_TABLES_LIMIT]
+
+
+def interface_driver(name: str) -> str | None:
+    link = NET_CLASS / name / "device" / "driver"
+    try:
+        return link.resolve().name if link.exists() else None
+    except OSError:
+        return None
+
+
+def inventory(arguments: argparse.Namespace) -> None:
+    """Every real interface (``lo`` and this run's test interfaces excluded) with
+    its device link, driver, RDMA device, global addresses, whether it carries
+    the main table's default route and which policy tables default through it."""
+
+    run_id = checked_run_id(arguments.run_id)
+    main_default = default_route_devices()
+    policy = {table: default_route_devices(table) for table in policy_tables()}
+    interfaces: dict[str, Any] = {}
+    for name in real_interfaces(run_id):
+        link = interface_link(name)
+        interfaces[name] = {
+            "has_device": bool(link.get("has_device")),
+            "operstate": link.get("operstate"),
+            "driver": interface_driver(name),
+            "rdma": (NET_CLASS / name / "device" / "infiniband").exists(),
+            "addresses": interface_addresses(name, include_link_local=False),
+            "default_route": name in main_default,
+            "policy_tables": sorted(
+                table for table, devices in policy.items() if name in devices
+            ),
+        }
+    emit(
+        {
+            "interfaces": interfaces,
+            "default_route_devices": main_default,
+            "policy_tables": policy,
+        }
+    )
+
+
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser()
     commands = value.add_subparsers(dest="command", required=True)
@@ -1139,6 +1224,7 @@ def parser() -> argparse.ArgumentParser:
     item.add_argument("--rate-kbps", type=int, default=8000)
     command("tcp-reading", tcp_reading)
     command("tcp-stop", tcp_stop)
+    command("inventory", inventory)
     command("residue", show_residue)
     command("cleanup", cleanup).add_argument("--kind", default="all")
     return value

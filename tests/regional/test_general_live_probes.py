@@ -496,6 +496,157 @@ def test_net_management_plane_excludes_link_local_only_interfaces(
     assert sorted(netp.management_plane(run_id)) == ["enp71s0"]
 
 
+def _inventory_runner(
+    addresses: dict[str, list[tuple[str, str]]],
+    *,
+    main_default: str,
+    policy: dict[str, str],
+) -> Any:
+    """``ip -j`` answers: addresses per device, the main default route and the
+    policy rules/tables of a pod network (one table per secondary ENI)."""
+
+    def runner(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if command[:3] == ["ip", "-j", "-o"] and "addr" in command:
+            name = command[-1]
+            return subprocess.CompletedProcess(
+                command, 0, stdout=_addr_show(addresses.get(name, [])), stderr=""
+            )
+        if command[:5] == ["ip", "-j", "route", "show", "default"]:
+            table = command[command.index("table") + 1] if "table" in command else None
+            dev = main_default if table is None else policy.get(table)
+            rows = (
+                [{"dst": "default", "gateway": "10.0.0.1", "dev": dev}] if dev else []
+            )
+            return subprocess.CompletedProcess(
+                command, 0, stdout=json.dumps(rows), stderr=""
+            )
+        if command[:4] == ["ip", "-j", "rule", "show"]:
+            rules = [
+                {"priority": 0, "src": "all", "table": "local"},
+                {"priority": 512, "src": "all", "dst": "10.0.44.7", "table": "main"},
+                *[
+                    {"priority": 1536, "src": "10.0.44.7", "table": table}
+                    for table in policy
+                ],
+                {"priority": 32766, "src": "all", "table": "main"},
+                {"priority": 32767, "src": "all", "table": "default"},
+            ]
+            return subprocess.CompletedProcess(
+                command, 0, stdout=json.dumps(rules), stderr=""
+            )
+        return subprocess.CompletedProcess(command, 0, stdout="[]", stderr="")
+
+    return runner
+
+
+def test_net_inventory_reads_roles_from_sysfs_and_routing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    run_id = "gl8-empty-a1-deadbeef"
+    sysfs = tmp_path / "net"
+    for name, device in (
+        ("ens5", True),
+        ("ens6", True),
+        ("enp72s0", True),
+        ("eni9f0a", False),
+    ):
+        root = sysfs / name
+        root.mkdir(parents=True)
+        if device:
+            (root / "device").mkdir()
+    (sysfs / "enp72s0" / "device" / "infiniband").mkdir()
+    drivers = tmp_path / "drivers"
+    (drivers / "ena").mkdir(parents=True)
+    (drivers / "mlx5_core").mkdir()
+    (sysfs / "ens5" / "device" / "driver").symlink_to(drivers / "ena")
+    (sysfs / "ens6" / "device" / "driver").symlink_to(drivers / "ena")
+    (sysfs / "enp72s0" / "device" / "driver").symlink_to(drivers / "mlx5_core")
+    monkeypatch.setattr(netp, "NET_CLASS", sysfs)
+    monkeypatch.setattr(
+        netp, "real_interfaces", lambda rid: ["eni9f0a", "enp72s0", "ens5", "ens6"]
+    )
+    monkeypatch.setattr(
+        netp,
+        "interface_link",
+        lambda n: {
+            "present": True,
+            "has_device": (sysfs / n / "device").exists(),
+            "operstate": "up",
+        },
+    )
+    monkeypatch.setattr(
+        netp,
+        "run",
+        _inventory_runner(
+            {
+                "ens5": [("global", "10.0.43.5"), ("link", "fe80::5")],
+                "ens6": [("global", "10.0.44.7")],
+                "enp72s0": [("global", "10.1.0.5")],
+                "eni9f0a": [("link", "fe80::a")],
+            },
+            main_default="ens5",
+            policy={"2": "ens6"},
+        ),
+    )
+    emitted: dict[str, Any] = {}
+    monkeypatch.setattr(netp, "emit", lambda value: emitted.update(value))
+    netp.inventory(argparse.Namespace(run_id=run_id))
+    assert emitted["default_route_devices"] == ["ens5"]
+    assert emitted["policy_tables"] == {"2": ["ens6"]}
+    assert emitted["interfaces"]["ens5"] == {
+        "has_device": True,
+        "operstate": "up",
+        "driver": "ena",
+        "rdma": False,
+        "addresses": ["10.0.43.5/24"],
+        "default_route": True,
+        "policy_tables": [],
+    }
+    assert emitted["interfaces"]["ens6"]["policy_tables"] == ["2"]
+    assert emitted["interfaces"]["ens6"]["default_route"] is False
+    assert emitted["interfaces"]["enp72s0"]["rdma"] is True
+    assert emitted["interfaces"]["enp72s0"]["driver"] == "mlx5_core"
+    assert emitted["interfaces"]["eni9f0a"] == {
+        "has_device": False,
+        "operstate": "up",
+        "driver": None,
+        "rdma": False,
+        "addresses": [],
+        "default_route": False,
+        "policy_tables": [],
+    }
+    # The kernel's own tables are never read as a pod network's.
+    assert (
+        "main" not in emitted["policy_tables"]
+        and "local" not in emitted["policy_tables"]
+    )
+
+
+def test_net_inventory_tolerates_an_ip_without_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(netp, "real_interfaces", lambda rid: ["ens5"])
+    monkeypatch.setattr(
+        netp,
+        "interface_link",
+        lambda n: {"present": True, "has_device": True, "operstate": "up"},
+    )
+    monkeypatch.setattr(netp, "interface_driver", lambda n: "ena")
+    monkeypatch.setattr(
+        netp,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 255, stdout="garbage", stderr="x"
+        ),
+    )
+    emitted: dict[str, Any] = {}
+    monkeypatch.setattr(netp, "emit", lambda value: emitted.update(value))
+    netp.inventory(argparse.Namespace(run_id="gl8-empty-a1-deadbeef"))
+    assert emitted["default_route_devices"] == [] and emitted["policy_tables"] == {}
+    assert emitted["interfaces"]["ens5"]["default_route"] is False
+    assert emitted["interfaces"]["ens5"]["addresses"] == []
+
+
 # --------------------------------------------------------------------------- #
 # node probe: EFA traffic oracle (GF-GENERAL-LIVE-011)
 # --------------------------------------------------------------------------- #

@@ -9,6 +9,7 @@ real node-activity read.
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
 from pathlib import Path
 from typing import Any
@@ -21,7 +22,7 @@ from gpu_fault.execution.models import WorkflowStepOutcome
 from gpu_fault.models import WorkflowOperation, WorkflowStatus
 from gpu_fault.store import InMemoryStore
 from scripts.e2e.regional import general_live_network as net
-from scripts.e2e.regional.general_live_fixture import VariantInconclusive
+from scripts.e2e.regional.general_live_fixture import VariantInconclusive, VariantNotRun
 from scripts.e2e.regional.general_live_store import ACTIVITY_PROBE
 from tests._builders import active_workflow_executor, asgi_client, execute_workflow
 from tests.regional._general_live_fakes import (
@@ -62,11 +63,59 @@ def survey(required: str = "") -> dict[str, Any]:
     }
 
 
+def netdev(
+    *,
+    has_device: bool = True,
+    default_route: bool = False,
+    policy_tables: tuple[str, ...] = (),
+    rdma: bool = False,
+    driver: str | None = "ena",
+    addresses: tuple[str, ...] = ("10.0.43.5/24",),
+) -> dict[str, Any]:
+    return {
+        "has_device": has_device,
+        "operstate": "up",
+        "driver": driver if has_device else None,
+        "rdma": rdma,
+        "addresses": list(addresses),
+        "default_route": default_route,
+        "policy_tables": list(policy_tables),
+    }
+
+
+#: A node with a dedicated data NIC beside the management interface: the
+#: spec's site FAIL applies when the required list is empty.
+INVENTORY_WITH_DATA_NIC = {
+    "interfaces": {
+        "enp71s0": netdev(default_route=True),
+        "enp72s0": netdev(driver="mlx5_core", rdma=True, addresses=("10.1.0.5/24",)),
+        "eni9f0a1b2c3d4": netdev(has_device=False, addresses=()),
+    },
+    "default_route_devices": ["enp71s0"],
+    "policy_tables": {},
+}
+#: This site's p5en: the primary ENA (default route), the VPC CNI's secondary
+#: ENIs (one policy table each), host-side pod veths; EFA-only rdmap devices
+#: have no netdev. Nothing to declare.
+INVENTORY_WITHOUT_DATA_NIC = {
+    "interfaces": {
+        "ens5": netdev(default_route=True),
+        "ens6": netdev(policy_tables=("2",), addresses=("10.0.44.7/24",)),
+        "ens7": netdev(policy_tables=("3",), addresses=("10.0.45.9/24",)),
+        "eni9f0a1b2c3d4": netdev(has_device=False, addresses=()),
+        "enib1c2d3e4f5a": netdev(has_device=False, addresses=()),
+    },
+    "default_route_devices": ["ens5"],
+    "policy_tables": {"2": ["ens6"], "3": ["ens7"]},
+}
+
+
 def net_probe(down: str | None = None, **extra: Any) -> FakeProbe:
     operstate = {IFA: "up", IFB: "up", IFC: "up", IFD: "up"}
     if down:
         operstate[down] = "down"
     script = {
+        "inventory": INVENTORY_WITH_DATA_NIC,
         "create-veth": [
             {"a": IFA, "b": IFB, "link_a": {"operstate": "up"}},
             {"a": IFC, "b": IFD, "link_a": {"operstate": "up"}},
@@ -296,15 +345,96 @@ def test_unknown_state_is_collection_error_no_quarantine(tmp_path: Path) -> None
 def test_empty_required_list_is_a_site_fail(tmp_path: Path) -> None:
     spec = SPECS["empty_required_list"]
     regional = FakeRegional(cpu_python=store_script({"activity": {}}))
+    net = net_probe()
     ctx = make_context(
         spec,
         tmp_path=tmp_path,
         regional=regional,
-        probes=probes(node_probe(survey(required="")), net_probe(), window_probe()),
+        probes=probes(node_probe(survey(required="")), net, window_probe()),
     )
     result = spec.execute(ctx)
     assert result["verdict"] == "FAIL"
-    assert spec.proof_mode == "observation"
+    assert spec.proof_mode == "observation" and spec.expected_outcome == "FAIL"
+    assert net.calls == [("inventory", "--run-id", ctx.run_id)]
+    assert result["interface_roles"] == {
+        "management": ["enp71s0"],
+        "pod_network": [],
+        "virtual": ["eni9f0a1b2c3d4"],
+        "dedicated": ["enp72s0"],
+    }
+    assert "enp72s0" in result["stages"]["required_list"][0]
+    assert "enp72s0" in result["notes"][0]
+    assert (ctx.case_dir / "interface-roles.json").is_file(), "the roles are evidence"
+
+
+def test_empty_required_list_is_not_applicable_without_a_dedicated_data_nic(
+    tmp_path: Path,
+) -> None:
+    spec = SPECS["empty_required_list"]
+    regional = FakeRegional(cpu_python=store_script({"activity": {}}))
+    net = net_probe(inventory=INVENTORY_WITHOUT_DATA_NIC)
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=regional,
+        probes=probes(node_probe(survey(required="")), net, window_probe()),
+    )
+    with pytest.raises(VariantNotRun) as raised:
+        spec.execute(ctx)
+    assert raised.value.reason == "CAPABILITY_ABSENT"
+    assert raised.value.detail == (
+        "no dedicated data NIC on this node (default route ['ens5'], pod network "
+        "['ens6', 'ens7'], 2 virtual/container interfaces); an empty "
+        "GPU_FAULT_REQUIRED_INTERFACES is the correct configuration"
+    )
+    roles = json.loads((ctx.case_dir / "interface-roles.json").read_text())["roles"]
+    assert roles["dedicated"] == [] and roles["pod_network"] == ["ens6", "ens7"]
+    assert ctx.cleanup.pending() == [], "an observation changes nothing"
+
+
+def test_empty_required_list_needs_ip_for_the_inventory(tmp_path: Path) -> None:
+    spec = SPECS["empty_required_list"]
+    value = survey(required="")
+    value["tools"]["ip"] = False
+    regional = FakeRegional(cpu_python=store_script({"activity": {}}))
+    net = net_probe()
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=regional,
+        probes=probes(node_probe(value), net, window_probe()),
+    )
+    with pytest.raises(VariantNotRun, match="lacks ip"):
+        spec.execute(ctx)
+    assert net.calls == []
+
+
+@pytest.mark.parametrize(
+    ("info", "role"),
+    [
+        (netdev(default_route=True), "management"),
+        (netdev(default_route=True, policy_tables=("2",)), "management"),
+        (netdev(policy_tables=("2",)), "pod_network"),
+        (netdev(has_device=False, addresses=()), "virtual"),
+        (netdev(has_device=False, policy_tables=("2",)), "virtual"),
+        (netdev(), "dedicated"),
+        (netdev(driver="mlx5_core", rdma=True), "dedicated"),
+        (netdev(rdma=True, policy_tables=("2",)), "dedicated"),
+        (netdev(addresses=()), "dedicated"),
+    ],
+)
+def test_interface_roles_classify_from_device_links_and_routes(
+    info: dict[str, Any], role: str
+) -> None:
+    roles = net.interface_roles({"interfaces": {"x0": info}})
+    assert roles[role] == ["x0"], roles
+    assert sum(len(items) for items in roles.values()) == 1
+    assert net.interface_roles({}) == {
+        "management": [],
+        "pod_network": [],
+        "virtual": [],
+        "dedicated": [],
+    }
 
 
 def test_empty_required_list_passes_if_configured(tmp_path: Path) -> None:
