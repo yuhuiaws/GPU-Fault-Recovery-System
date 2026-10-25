@@ -1215,8 +1215,22 @@ Phase 2 adds the host/device categories 002 memory/swap, 005 shared storage,
 drops out of the denominator, but only the variants that need no raw-source
 replay fixture are executable on this site: 002 `memory_pressure`/`recovery`
 (native host memory pressure in a capped cgroup, behind `HOST_MEMORY_PRESSURE`)
-and `no_swap`, plus 007 `healthy` (a read-only observation that the real SMART
-reading mints no finding). Their module tests under
+and `no_swap`, 002 `cgroup_only` (the negative control: the node probe's
+`memory-start --cgroup-oom-bytes` exhausts a 2 GiB test cgroup -- no swap,
+`OOMPolicy=kill`, refused above 1 % of MemTotal or the host's headroom -- three
+times across the rule's sustain plus one health summary, and `memory-status`
+reads systemd's `Result=oom-kill` on the uncollected unit as the proof the OOM
+stayed inside the cgroup, also behind `HOST_MEMORY_PRESSURE`), plus 007
+`healthy` (a read-only observation that the real SMART reading mints no
+finding). `cgroup_only` proves only that the product does not grade a
+cgroup-local OOM as host pressure (no `memory_used_percent` /
+`memory_available_percent` finding, no STOP, isolation or hardware step while
+the host collector keeps delivering normal samples); it is a transient systemd
+unit, not a kubelet-managed container, so it says nothing about an
+`OOMKilled` Pod status or the completion watcher, and the kernel collector
+ignores the kernel's OOM line (it extracts XID/SXID records only), so the
+RUN_DIAGNOSTICS grading of that line is exercised only where the node log
+collector is enabled. Their module tests under
 `tests/regional/test_general_live_memory.py` and
 `tests/regional/test_general_live_phase2.py` run the verdict logic against
 scripted product records with fakes; they are not proof of a physical fault.
@@ -1241,6 +1255,29 @@ are UNKNOWN, missing counters `efa_ethtool_counters_unsupported`), and an NVML
 failure with an unreadable `/proc/driver/nvidia/gpus` is
 `INVENTORY_UNAVAILABLE` rather than zero GPUs. statvfs-OK-but-I/O-fails shared
 storage remains open.
+
+## GF-GENERAL-LIVE 029 store-level restart-budget variants
+
+029 `concurrent_claim` and `missing_context` run no managed job. The harness
+(`scripts/e2e/regional/general_live_restart_budget.py`) ships a probe into an
+API Pod under the product's interpreter and drives the product's own ledger API
+(`reserve_job_restart`/`release_job_restart`/`get_restart_budget`) and claim
+preflight (`reserve_restart_budgets`, `issue_restart_authorization`) on a test
+job id (`gl29…`) that no training job carries; the incident and workflow the
+preflight is handed exist in memory only and are never saved. What this proves
+is the ledger layer against the live store -- the same-reservation idempotency,
+the over-budget refusal, the exactly-once release and the context check before
+any budget read, serialised by the Postgres advisory lock the product uses --
+and not two real executor replicas racing a claimed workflow through the
+dispatcher, nor a watcher restart (029 `worker_restart` stays `NOT_RUN`
+pending `CONTROL_PLANE_RESTART`). The product offers no way to delete a ledger
+row, so the cleanup releases this run's reservations through the API and then
+removes the emptied test row with the store's `_delete` primitive (the one
+`cleanup_audit_records` uses for the command-protocol audit's `restart_budget`
+rows); a row that still holds a reservation this run did not make is left and
+fails the cleanup. The module tests run the real probe in-process over an
+`InMemoryStore` with the three key/value shims the SQL stores have, so the
+advisory-lock path itself is exercised only live.
 
 ## GF-GENERAL-LIVE live acceptance runner (phase 2)
 

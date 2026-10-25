@@ -81,13 +81,18 @@ HOST_VARIANTS = frozenset(
         "scratch_full",
     )
 )
+#: The 029 variants that drive the store-level restart-budget probe in an API
+#: Pod (general_live_restart_budget), not a managed job.
+STORE_VARIANTS = frozenset(
+    {"GF-GENERAL-LIVE-029.concurrent_claim", "GF-GENERAL-LIVE-029.missing_context"}
+)
 REGISTRY = runner.load_registry()
 MANAGED_JOB_VARIANTS = sorted(
     key
     for key, spec in REGISTRY.items()
     if spec.case_id in MANAGED_JOB_CASES
     and spec.implemented
-    and key not in HOST_VARIANTS
+    and key not in HOST_VARIANTS | STORE_VARIANTS
 )
 #: One variant per case, the live failure first.
 ONE_PER_CASE = (
