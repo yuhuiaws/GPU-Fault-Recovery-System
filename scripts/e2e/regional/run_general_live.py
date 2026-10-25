@@ -81,8 +81,12 @@ def plan_details(
         "target_node": settings.node,
         "peer_node": settings.peer_node or None,
         "approvals_required": list(spec.approvals),
+        "approvals_optional": list(spec.optional_approvals),
         "approvals_given": list(settings.approvals),
-        "approval_meanings": {item: APPROVALS[item] for item in spec.approvals},
+        "approval_meanings": {
+            item: APPROVALS[item]
+            for item in (*spec.approvals, *spec.optional_approvals)
+        },
         "safety": {
             "automatic_stop": "every node mutation arms a systemd-run deadman first",
             "independent_restore": "LIFO cleanup stack; a failed cleanup fails the variant",

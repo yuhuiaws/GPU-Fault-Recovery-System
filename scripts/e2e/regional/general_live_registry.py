@@ -124,6 +124,16 @@ APPROVALS: dict[str, str] = {
         "(catalog RESTART_APP, monitor-only on an idle node) on one test GPU; "
         "the product turns it into a trusted XID event"
     ),
+    # GF-GENERAL-LIVE-009 tcp_only: the AL2023 EKS node image ships no tc.
+    "TEMP_TEST_PACKAGE_INSTALL": (
+        "install, for this run only, a test package the node lacks with dnf: "
+        "iproute-tc when tc is absent, kernel-modules-extra-$(uname -r) (the "
+        "running kernel's module package) when sch_netem cannot be loaded; "
+        "refused unless the previewed dnf transaction installs exactly those "
+        "packages (no kernel, upgrade, downgrade, removal or other dependency); "
+        "cleanup and a deadman dnf-remove exactly the packages this run "
+        "installed and nothing else"
+    ),
 }
 
 #: Workflow operations a diagnostic-only chain must never contain.
@@ -164,6 +174,9 @@ class VariantSpec:
     max_minutes: int
     flags: str = "S"
     approvals: tuple[str, ...] = ()
+    #: Tokens that only unlock an extra branch: without one the variant still
+    #: runs and that branch's prerequisite stays NOT_RUN(CAPABILITY_ABSENT).
+    optional_approvals: tuple[str, ...] = ()
     expected_outcome: str = "PASS"
     product_gap: str = ""
     deferred: str = ""
@@ -201,6 +214,7 @@ class VariantSpec:
             "risk": self.risk,
             "flags": self.flags,
             "approvals": list(self.approvals),
+            "optional_approvals": list(self.optional_approvals),
             "injection": self.injection,
             "expected": self.expected,
             "cleanup": self.cleanup,
@@ -323,9 +337,16 @@ def validate_spec(spec: VariantSpec) -> None:
         raise RegistryError(f"{spec.key}: unknown risk {spec.risk!r}")
     if FLAG_PATTERN.fullmatch(spec.flags) is None:
         raise RegistryError(f"{spec.key}: bad list flags {spec.flags!r}")
-    unknown = [item for item in spec.approvals if item not in APPROVALS]
+    unknown = [
+        item
+        for item in (*spec.approvals, *spec.optional_approvals)
+        if item not in APPROVALS
+    ]
     if unknown:
         raise RegistryError(f"{spec.key}: unknown approvals {unknown}")
+    both = sorted(set(spec.approvals) & set(spec.optional_approvals))
+    if both:
+        raise RegistryError(f"{spec.key}: approvals both required and optional {both}")
     if spec.expected_outcome not in {"PASS", "FAIL"}:
         raise RegistryError(f"{spec.key}: expected outcome must be PASS or FAIL")
     if spec.expected_outcome == "FAIL" and not spec.product_gap:

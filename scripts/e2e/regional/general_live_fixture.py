@@ -54,6 +54,7 @@ STORAGE_PROBE = PROBES / "general_live_storage_probe.py"
 NET_PROBE = PROBES / "general_live_net_probe.py"
 WINDOW_PROBE = PROBES / "collector_window_probe.py"
 DCGM_PROBE = PROBES / "general_live_dcgm_probe.py"
+DEPS_PROBE = PROBES / "general_live_deps_probe.py"
 #: Mount propagation for each probe's ``/host`` hostPath. Only the storage
 #: probe creates a test loop/dm filesystem that the installed host collector
 #: must statvfs and the ``systemd-run`` I/O writer must write to; both run in
@@ -451,7 +452,7 @@ class VariantContext:
     sleep: Callable[[float], None] = time.sleep
 
     def probe(self, name: str, *, node: str | None = None) -> ProbeHandle:
-        """The probe Pod running ``name`` (node, storage, net, window, dcgm)."""
+        """The probe Pod running ``name`` (node, storage, net, window, dcgm, deps)."""
 
         script = {
             "node": NODE_PROBE,
@@ -459,6 +460,7 @@ class VariantContext:
             "net": NET_PROBE,
             "window": WINDOW_PROBE,
             "dcgm": DCGM_PROBE,
+            "deps": DEPS_PROBE,
         }[name]
         target = node or self.settings.node
         handle_key = f"{name}@{target}"
@@ -500,6 +502,13 @@ class VariantContext:
         """The DCGM field / inventory replay controller (``--run-id`` added)."""
 
         return self.probe("dcgm").execute(
+            *arguments, "--run-id", self.run_id, timeout=timeout
+        )
+
+    def deps(self, *arguments: str, timeout: int = 180) -> dict[str, Any]:
+        """The temporary test package probe (``--run-id`` added)."""
+
+        return self.probe("deps").execute(
             *arguments, "--run-id", self.run_id, timeout=timeout
         )
 
