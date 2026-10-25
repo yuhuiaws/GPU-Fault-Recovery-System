@@ -36,6 +36,7 @@ from scripts.e2e.regional.general_live_registry import (
 )
 from scripts.e2e.regional.general_live_store import preflight_state
 from scripts.e2e.regional.host_probe_fixture import (
+    HostProbeError,
     HostProbeFixture,
     HostProbeSettings,
 )
@@ -499,11 +500,20 @@ class VariantContext:
         return self.probe("window").execute(*arguments, timeout=timeout)
 
     def dcgm(self, *arguments: str, timeout: int = 180) -> dict[str, Any]:
-        """The DCGM field / inventory replay controller (``--run-id`` added)."""
+        """The DCGM field / inventory replay controller (``--run-id`` added).
 
-        return self.probe("dcgm").execute(
-            *arguments, "--run-id", self.run_id, timeout=timeout
-        )
+        A failed call is re-raised with the subcommand in front: the host
+        fixture withholds the probe's output, so the subcommand name is the
+        runner's only record of which step raised.
+        """
+
+        try:
+            return self.probe("dcgm").execute(
+                *arguments, "--run-id", self.run_id, timeout=timeout
+            )
+        except HostProbeError as exc:
+            subcommand = arguments[0] if arguments else "?"
+            raise type(exc)(f"dcgm {subcommand}: {exc}") from exc
 
     def deps(self, *arguments: str, timeout: int = 180) -> dict[str, Any]:
         """The temporary test package probe (``--run-id`` added)."""

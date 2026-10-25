@@ -902,6 +902,27 @@ run_general_live.py --site-profile <profile> --run-dir <run> \
 批次前一直保持抬升值再 disarm。判定只读产品自己的记录
 （`general_live_gpu_store`/`general_live_gpu_verdicts`），绝不 POST 预制 finding。
 
+节点状态规则（2026-10-25 现场：019 `corrected_ecc`/`volatile_dbe` 在 `repoint-collector`
+写入 drop-in 并重启采集器后才被判失败，收尾又跳过还原，节点留下 drop-in、代理单元和运行
+目录，只剩 deadman 兜底）：
+
+- **开始前**：探针 `survey` 按运行 digest（`gfrs-live-<digest>`）列出节点上尚存的每个回放
+  对象——drop-in、代理单元、运行目录（含其 `run.json` 记录的 run id）、deadman 定时器及其
+  触发时刻——并单列非本夹具的 drop-in / 目录和仍在回放端口应答的工具。只要有任何残留，
+  变体记 `NOT_RUN(FIXTURE_NOT_READY)` 并逐一点名，不装任何文件。仅当残留是本夹具自己的
+  对象、且其 deadman 已不再待触发（已触发、从未布置或已停止）时，运行器先经探针
+  `cleanup-leftover --digest` 还原再重新 survey；deadman 仍待触发的留给它触发，外来对象
+  一律不碰。
+- **结束时**：`DcgmReplay.close` 只走探针幂等的 `close-run`，与运行器自身记的
+  armed/repointed 标志无关：best-effort disarm 工具 → 删 drop-in 与覆盖文件、重启采集器
+  并核对真实端点 → 停工具、删运行目录 → 全部成功才撤 deadman。任一步失败则保留 deadman，
+  并把探针仍找到的每个对象逐一写入 `ReplayCleanupError`（整项 FAIL 的原因里带名字），
+  `probe_residuals`/`cleanup` 失败项同样写进 "cleanup did not prove the node clean" 之后。
+- **重指验证**：`repoint-collector` 读取采集进程环境前先等它真正 exec——`Type=simple`
+  单元 fork 即 active，沙箱建立期间 `/proc/<pid>/environ` 仍是 systemd 自身的环境——
+  超过等待窗口或读到真实端点才算失败；探针失败行带异常类、消息摘要与 `函数:行` 位点，
+  运行器把子命令名前置到 `HostProbeError`。
+
 需审批与独占节点的变体：019 `pending_supported`/`post_reset` 单卡 service-window
 reset 需 `--approve GPU_RESET`；021 任一 finding 都驱动全 GPU+NVSwitch reset，故
 该类变体需 `--approve GPU_FULL_FABRIC_RESET`（`recovery_failure` 另需

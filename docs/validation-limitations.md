@@ -1612,8 +1612,32 @@ proves the processing chain, never the physical fault, so every verdict is
 (`tests/regional/test_general_live_gpu_*.py`, `tests/test_gpu_dcgm_field_replay.py`,
 `tests/test_nvidia_smi_inventory_replay.py`) run the verdict logic over
 scripted product records with fakes -- they are not proof of a physical
-experiment. No case has live evidence yet; every case stays `manual` /
-`NOT_RUN`.
+experiment.
+
+The fixture's first live contact (2026-10-25, plain EKS, release
+6a95b90fcd82, 019 `corrected_ecc` on ip-10-0-43-5 and `volatile_dbe` on
+ip-10-0-32-162) failed inside the fixture before any product evidence:
+`repoint-collector` had armed the deadman, written the drop-in and restarted
+the collector, then judged the repoint failed because it read
+`/proc/<MainPID>/environ` as soon as the `Type=simple` unit was active -- at
+that moment the process is still systemd's pre-exec child (the sandbox,
+`ProtectSystem=strict` over every mount of a Kubernetes node, is built between
+fork and exec) and carries systemd's environment, not the unit's. The runner's
+cleanup then skipped `restore-collector` (its `repointed` flag is set only when
+the probe call returns), `stop-proxy` rightly refused while the collector read
+the replay, and the drop-in, proxy unit and run directory stayed until the
+deadman fired. Three rules now hold, pinned by
+`tests/regional/test_general_live_gpu_probe_cleanup.py` and
+`test_general_live_gpu_replay_cleanup.py` over a recorded fake systemd: the
+environment of a restarted collector is read only once the process has exec'd
+(bounded settle window); `DcgmReplay.close` runs the probe's idempotent
+`close-run` whatever step raised and names every object the probe still finds
+(the deadman stays armed while anything is left); and the survey refuses to
+start -- naming each drop-in, unit, run directory and deadman fire time -- while
+an earlier run's objects are on the node, reclaiming only this fixture's own
+leftovers whose deadman has elapsed, never a pending one and never a foreign
+drop-in or directory. Neither variant has product evidence yet; both are to be
+re-run.
 
 The reset-driving variants need an explicit approval and an exclusive node:
 019 `pending_supported` / `post_reset` need `--approve GPU_RESET` (a

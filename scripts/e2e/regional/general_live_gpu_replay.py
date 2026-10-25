@@ -23,6 +23,17 @@ survey, and owns the clean end of an injection: a counter finding is only
 recovered by a fresh zero-delta sample, so the replay holds the elevated value
 until the product has accepted one before it disarms.
 
+Two node-state rules bracket every replay. Before anything starts, the survey
+must show no replay object on the node: an earlier run's drop-in, proxy unit,
+run directory or deadman is named in a ``NOT_RUN(FIXTURE_NOT_READY)`` and
+nothing is installed; only this fixture's own leftovers whose deadman has
+already elapsed (or never armed) are reclaimed first, through the probe's
+``cleanup-leftover``, and never a drop-in or directory that is not this
+fixture's. At the end, ``DcgmReplay.close`` runs the probe's ``close-run``
+whatever state the run reached -- a repoint that raised after it wrote its
+drop-in is undone like a finished run -- and names every object the probe
+still finds in the error that fails the variant.
+
 Nothing here decides a verdict and nothing posts a finding or workflow; the
 category modules judge the product's own records (``general_live_gpu_store``)
 with ``general_live_gpu_verdicts``.
@@ -55,6 +66,16 @@ ROOT = Path(__file__).resolve().parents[3]
 FIELD_TOOL = ROOT / "tools" / "gpu_dcgm_field_replay.py"
 INVENTORY_WRAPPER = ROOT / "tools" / "nvidia_smi_inventory_replay.py"
 PORT = 9412
+#: The one unit the probe repoints (named in refusals; the probe owns the rule).
+METRICS_UNIT = "gpu-fault-metrics-collector.service"
+STATE_ROOT = "/run/gfrs-live"
+
+
+class ReplayCleanupError(RuntimeError):
+    """The replay's cleanup left named objects on the node (or could not prove
+    it clean); the message lists each one."""
+
+
 #: Normal samples the product must accept through the pass-through proxy
 #: before a replay is armed (spec step 3: at least three normal samples).
 PASS_THROUGH_READS = 3
@@ -168,8 +189,11 @@ class GpuSurvey:
         return candidates[-1]
 
 
-def require_replayable(survey: GpuSurvey) -> None:
-    """The node can run a replay at all: one collector, a real exporter."""
+def require_replayable(
+    survey: GpuSurvey, *, reclaim: dict[str, dict[str, Any]] | None = None
+) -> None:
+    """The node can run a replay at all: one collector, a real exporter, and
+    nothing of an earlier replay still on it (every leftover is named)."""
 
     if not survey.raw.get("venv_python"):
         raise VariantNotRun("CAPABILITY_ABSENT", "the node has no gpu_fault venv")
@@ -195,20 +219,94 @@ def require_replayable(survey: GpuSurvey) -> None:
             "the real DCGM exporter scrape is not usable: "
             + str(exporter.get("error") or "no GPU"),
         )
-    residue = survey.raw.get("residue") or {}
-    if residue.get("metrics_dropins") or residue.get("units"):
+    leftovers = residue_lines(survey.raw.get("residue") or {})
+    for run_digest, receipt in sorted((reclaim or {}).items()):
+        for error in receipt.get("errors") or []:
+            leftovers.append(f"reclaim of run {run_digest} failed: {error}")
+    if leftovers:
         raise VariantNotRun(
             "FIXTURE_NOT_READY",
-            "a runtime drop-in or replay unit already changes the metrics collector",
+            "replay objects are still on the node; nothing was started: "
+            + "; ".join(leftovers),
         )
 
 
+def residue_lines(residue: dict[str, Any]) -> list[str]:
+    """Every replay object the survey found on the node, named precisely.
+
+    A probe that groups its findings per run digest (``runs``) names each
+    run's objects with its run id and whether its deadman restore is still
+    pending; the flat lists of an older probe are named as they are. Foreign
+    drop-ins and directories -- not this fixture's -- are named as left in
+    place, and so is a tool that still answers on the replay port.
+    """
+
+    lines: list[str] = []
+    runs = residue.get("runs")
+    if isinstance(runs, dict):
+        for run_digest in sorted(runs):
+            state = runs[run_digest] or {}
+            objects = [str(item) for item in state.get("objects") or []]
+            if not objects:
+                continue
+            label = f"earlier run {state.get('run_id') or run_digest}"
+            if state.get("deadman_pending"):
+                label += " (deadman restore pending, left to fire)"
+            lines.append(f"{label}: " + ", ".join(objects))
+    else:
+        lines.extend(f"drop-in {name}" for name in residue.get("metrics_dropins") or [])
+        lines.extend(f"unit {name}" for name in residue.get("units") or [])
+        lines.extend(
+            f"run dir {STATE_ROOT}/{name}" for name in residue.get("run_dirs") or []
+        )
+    lines.extend(
+        f"foreign drop-in {name} on {METRICS_UNIT} (not this fixture's; left in place)"
+        for name in residue.get("foreign_dropins") or []
+    )
+    lines.extend(
+        f"foreign directory {STATE_ROOT}/{name} (not this fixture's; left in place)"
+        for name in residue.get("foreign_run_dirs") or []
+    )
+    if residue.get("port_answers"):
+        lines.append(
+            f"a replay tool still answers on 127.0.0.1:{residue.get('port') or PORT}"
+        )
+    return lines
+
+
+def reclaim_leftovers(
+    ctx: VariantContext, survey: GpuSurvey, arguments: Sequence[str]
+) -> tuple[GpuSurvey, dict[str, dict[str, Any]]]:
+    """Restore this fixture's own expired leftovers, then survey again.
+
+    Only runs the probe marks ``reclaimable`` -- its own objects whose deadman
+    is no longer pending -- are handed to ``cleanup-leftover``; a pending
+    deadman, a foreign drop-in or directory is never touched here and stays
+    for ``require_replayable`` to name.
+    """
+
+    runs = (survey.raw.get("residue") or {}).get("runs") or {}
+    expired = sorted(
+        run_digest
+        for run_digest, state in runs.items()
+        if isinstance(state, dict) and state.get("reclaimable")
+    )
+    if not expired:
+        return survey, {}
+    receipts = {
+        run_digest: ctx.dcgm("cleanup-leftover", "--digest", run_digest, timeout=300)
+        for run_digest in expired
+    }
+    ctx.evidence.write("dcgm-leftover-reclaim", receipts)
+    return GpuSurvey(ctx.dcgm(*arguments, timeout=300)), receipts
+
+
 def run_gpu_survey(ctx: VariantContext, *, limits: bool = False) -> GpuSurvey:
-    arguments = ["survey", *(["--limits"] if limits else [])]
-    value = ctx.dcgm(*arguments, timeout=300)
-    ctx.evidence.write("gpu-survey", value)
-    survey = GpuSurvey(value)
-    require_replayable(survey)
+    arguments = ["survey", "--port", str(PORT), *(["--limits"] if limits else [])]
+    survey = GpuSurvey(ctx.dcgm(*arguments, timeout=300))
+    survey, reclaimed = reclaim_leftovers(ctx, survey, arguments)
+    ctx.evidence.write("gpu-survey", survey.raw)
+    require_replayable(survey, reclaim=reclaimed)
     return survey
 
 
@@ -517,35 +615,55 @@ class DcgmReplay:
             raise VariantInconclusive("the replay never served " + ", ".join(missing))
 
     def close(self) -> dict[str, Any]:
-        """Disarm, restore the collector endpoint, stop the tool -- in order."""
+        """Disarm, restore the collector endpoint, stop the tool, prove it clean.
+
+        One idempotent probe call (``close-run``) performs every step whatever
+        the run reached -- the runner's own ``armed`` / ``repointed`` flags do
+        not decide what is undone, because a probe call that raised midway
+        (live 2026-10-25: ``repoint-collector`` after it had written the
+        drop-in and restarted the collector) leaves the node changed with the
+        flag unset. The journals are read first (the run directory goes with
+        the stop), and every object the probe still finds is named in the
+        ``ReplayCleanupError`` that fails the variant.
+        """
 
         receipts: dict[str, Any] = {}
-        if self.armed:
-            try:
-                receipts["disarm"] = self.ctx.dcgm(
-                    "disarm", "--port", str(PORT), timeout=60
-                )
-                self.armed = False
-            except Exception as exc:  # noqa: BLE001 - recorded; restore still runs
-                receipts["disarm_error"] = f"{type(exc).__name__}: {exc}"
-        if self.repointed:
-            receipts["restore"] = self.ctx.dcgm("restore-collector", timeout=180)
-            self.repointed = False
-        receipts["stop"] = self.ctx.dcgm("stop-proxy", "--port", str(PORT), timeout=60)
-        self.audit()
+        journals: list[tuple[str, Callable[[], Any]]] = [("audit", self.audit)]
         if self.inventory_wrapper:
-            self.inventory_audit()
+            journals.append(("inventory_audit", self.inventory_audit))
+        for name, read in journals:
+            try:
+                read()
+            except Exception as exc:  # noqa: BLE001 - recorded; the close still runs
+                receipts[f"{name}_error"] = f"{type(exc).__name__}: {exc}"
+        closed = self.ctx.dcgm("close-run", "--port", str(PORT), timeout=300)
+        self.armed = False
+        self.repointed = False
+        receipts["close"] = closed
+        for key in ("disarm", "restore", "stop"):
+            if key in closed:
+                receipts[key] = closed[key]
         self.ctx.evidence.write("dcgm-replay-close", receipts)
-        restore = receipts.get("restore") or {}
-        stop = receipts.get("stop") or {}
-        if restore and restore.get("restored_endpoint") not in {
-            None,
-            restore.get("original_endpoint"),
-        }:
-            raise VariantInconclusive("the collector endpoint was not restored")
-        if stop and not stop.get("run_dir_removed", True):
-            raise VariantInconclusive("the replay run directory was not removed")
+        leftover = [str(item) for item in closed.get("leftover") or []]
+        errors = [str(item) for item in closed.get("errors") or []]
+        if leftover or errors or closed.get("clean") is not True:
+            raise ReplayCleanupError(
+                cleanup_message(self.ctx.settings.node, leftover, errors)
+            )
         return receipts
+
+
+def cleanup_message(node: str, leftover: Sequence[str], errors: Sequence[str]) -> str:
+    """Name what the replay cleanup left on ``node`` and which steps failed."""
+
+    parts = []
+    if leftover:
+        parts.append("left on the node: " + "; ".join(leftover))
+    if errors:
+        parts.append("failed steps: " + "; ".join(errors))
+    if not parts:
+        parts.append("the probe did not prove the run clean")
+    return f"replay cleanup on {node} -- " + " -- ".join(parts)
 
 
 def arm_and_confirm(replay: DcgmReplay, *served_keys: str) -> None:
@@ -742,6 +860,7 @@ def _all_workflows(state: dict[str, Any]) -> list[dict[str, Any]]:
 __all__ = [
     "DcgmReplay",
     "GPU_KINDS",
+    "ReplayCleanupError",
     "activity_now",
     "wait_gpu_incident",
     "gpu_spec",
@@ -754,16 +873,19 @@ __all__ = [
     "arm_and_confirm",
     "at_limit_increment",
     "baseline",
+    "cleanup_message",
     "passthrough_plan",
     "clear",
     "label",
     "over_limit_increment",
     "plan",
     "put",
+    "reclaim_leftovers",
     "recover_counter",
     "replay_boot_id",
     "replay_uuid",
     "require_replayable",
+    "residue_lines",
     "run_gpu_survey",
     "state_now",
     "step",

@@ -74,13 +74,12 @@ def test_corrected_ecc_is_a_clean_diagnostic_chain(tmp_path: Path) -> None:
     out = mem.corrected_ecc(ctx)
     assert out["verdict"] == "PASS", out["errors"]
     assert out["proof_scope"] == "live-replay"
-    # the replay was deployed, armed and closed (restore before stop).
+    # the replay was deployed, armed and closed by the probe's one idempotent
+    # close-run (restore before stop happens inside it), once.
     calls = [c[0] for c in probe.calls]
-    assert (
-        calls.index("arm")
-        < calls.index("restore-collector")
-        < calls.index("stop-proxy")
-    )
+    assert calls.index("arm") < calls.index("close-run")
+    assert calls.count("close-run") == 1
+    assert "restore-collector" not in calls and "stop-proxy" not in calls
 
 
 def test_diagnostic_fails_when_a_reset_is_planned(tmp_path: Path) -> None:

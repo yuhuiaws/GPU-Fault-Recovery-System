@@ -2,7 +2,8 @@
 
 No cluster, no node, no systemd: ``dcgm_probe`` scripts the DCGM replay
 controller's subcommands (survey, install-source, deploy/arm/advance/disarm,
-repoint/restore, audit-read, stop) and records every call; ``gpu_cpu_python``
+repoint/restore, audit-read, stop, close-run, cleanup-leftover) and records
+every call; ``gpu_cpu_python``
 answers the two read-only store probes the categories use -- the GPU telemetry
 state (``general_live_gpu_store.GPU_STATE_PROBE``) and the node activity
 (``general_live_store.ACTIVITY_PROBE``) -- from scripted documents so the
@@ -75,8 +76,18 @@ def survey(
             for i, gpu in enumerate(gpus)
         ],
         "exporter": {"sample_count": len(gpus) * len(fields), "gpus": entries},
-        "residue": {"run_dirs": [], "metrics_dropins": [], "units": []}
+        "residue": {
+            "run_dirs": [],
+            "metrics_dropins": [],
+            "units": [],
+            "runs": {},
+            "foreign_dropins": [],
+            "foreign_run_dirs": [],
+            "port": 9412,
+            "port_answers": False,
+        }
         if residue_clean
+        # An older probe's flat answer: a drop-in that is not ours.
         else {"run_dirs": [], "metrics_dropins": ["x.conf"], "units": []},
         "tools": {"systemd-run": True, "systemctl": True, "nvidia-smi": True},
         "venv_python": True,
@@ -146,6 +157,25 @@ def dcgm_probe(
             "original_endpoint": "http://127.0.0.1:9400/metrics",
         },
         "stop-proxy": {"run_dir_removed": True, "unit_active": False},
+        "close-run": {
+            "clean": True,
+            "leftover": [],
+            "errors": [],
+            "deadman_kept": False,
+            "disarm": {"disarmed": True, "http_status": 200},
+            "restore": {
+                "restored_endpoint": "http://127.0.0.1:9400/metrics",
+                "original_endpoint": "http://127.0.0.1:9400/metrics",
+                "dropin_removed": True,
+            },
+            "stop": {"run_dir_removed": True, "unit_active": False},
+        },
+        "cleanup-leftover": {
+            "reclaimed": True,
+            "clean": True,
+            "leftover": [],
+            "errors": [],
+        },
         "audit-read": audit_read,
     }
     script.update(extra or {})

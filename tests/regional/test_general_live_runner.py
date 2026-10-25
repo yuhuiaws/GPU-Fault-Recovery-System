@@ -630,3 +630,13 @@ def test_teardown_downgrades_on_dirty_cleanup(
     assert any("cleanup did not prove" in e for e in result["errors"]), (
         "any('cleanup did not prove' in e for e in result['errors'])"
     )
+    # The line names what did not prove clean: the failed undo and its error.
+    assert any(
+        e.startswith(
+            "cleanup did not prove the node clean: leftover: RuntimeError: stuck"
+        )
+        for e in result["errors"]
+    ), result["errors"]
+    assert result["cleanup"] == [
+        {"name": "leftover", "ok": False, "error": "RuntimeError: stuck"}
+    ]

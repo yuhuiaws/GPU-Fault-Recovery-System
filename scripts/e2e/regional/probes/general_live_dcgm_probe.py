@@ -13,35 +13,50 @@ changes is bounded and restored two ways, by the runner's cleanup and by a
 ``systemd-run`` deadman that needs neither the runner, the probe Pod nor the
 control plane:
 
+* **survey** -- read-only facts, including every object an earlier run left
+  (``residue``): per run digest the drop-in, proxy unit, run directory and
+  deadman timer (with its fire time and whether it is still pending), plus the
+  drop-ins / directories that are not this fixture's. The runner refuses to
+  start while anything is listed.
 * **install-source** -- the tool, the reviewed plan and, for the inventory
   variants, the reviewed ``nvidia-smi`` pass-through wrapper, handed in base64
-  and checked against a sha256, under ``/run/gfrs-live/<digest>/`` (tmpfs: a
-  reboot clears it). The files run verbatim; nothing here re-types them.
+  and checked against a sha256, under ``/run/gfrs-live/<digest>/`` (tmpfs; a
+  ``run.json`` marker names the owning run). The files run verbatim.
 * **deploy-proxy** -- a transient unit runs the tool ``--serve`` against the
   real exporter on a loopback-only port (``IPAddressDeny=any``,
   ``IPAddressAllow=localhost``, ``RuntimeMaxSec``); it starts pass-through and
-  only replays after ``arm``.
+  only replays after ``arm``; a port a tool still answers on is refused.
 * **repoint-collector** -- the deadman is armed *first*; then a ``/run``
   drop-in adds an ``EnvironmentFile=-/run/gfrs-live/<digest>/collector.env``
-  to the one allow-listed unit (``gpu-fault-metrics-collector.service``). An
-  ``EnvironmentFile`` and not an ``Environment=`` line: ``collector.env``
-  already sets ``GPU_FAULT_DCGM_METRICS_URL`` and systemd lets an environment
-  file override ``Environment=`` (systemd.exec), so only a later environment
-  file wins. The ``-`` prefix makes a vanished override file fall back to the
-  real endpoint. The effective endpoint is read from the running process
-  (``/proc/<MainPID>/environ``), never from ``systemctl show``. The real
-  exporter, ``collector.env`` and every other unit are untouched; the Node
-  Agent is never in the allow-list.
-* **arm / disarm / status / audit-read** -- loopback control of the tool.
-* **collector-restart** -- one ``systemctl restart`` of the same unit (the
-  monitor-restart variant), nothing else.
-* **restore-collector / stop-proxy / cleanup** -- remove the drop-in and the
-  override file, restart the unit on the real endpoint, verify the process,
-  then stop the tool; ``cleanup`` is the deadman's idempotent entry point.
+  to the one allow-listed unit (``gpu-fault-metrics-collector.service``) --
+  an environment file, not ``Environment=``, because a later environment file
+  is what overrides ``collector.env`` (systemd.exec), and ``-`` lets a
+  vanished override fall back to the real endpoint. The effective endpoint is
+  read from the running process (``/proc/<MainPID>/environ``), never from
+  ``systemctl show``, and only once that process has exec'd: a ``Type=simple``
+  unit is active from the fork on, and until the child has built its sandbox
+  and exec'd its environ is still systemd's own (live 2026-10-25: that first
+  read lacked the endpoint and the repoint was judged failed). The Node Agent
+  is never in the allow-list.
+* **arm / disarm / status / audit-read** -- loopback control of the tool;
+  **collector-restart** -- one ``systemctl restart`` of the same unit.
+* **close-run** -- the runner's cleanup: disarm the tool if it answers, remove
+  the drop-in and override, restart the unit on the real endpoint and verify
+  the process, stop the tool, remove the run directory, then disarm the
+  deadman. Every step runs whatever an earlier step did (a repoint that failed
+  after writing its drop-in is undone like a completed run); the answer names
+  what is left and keeps the deadman armed while anything is.
+* **cleanup-leftover** -- the same steps for an earlier run's objects, by
+  digest, only when that run's deadman is no longer pending; a pending one is
+  reported and left to fire.
+* **restore-collector / stop-proxy / cleanup** -- the single steps; ``cleanup``
+  is the deadman's entry point (non-zero on a failed step, so its
+  ``Restart=on-failure`` unit tries again).
 
-Every answer is one JSON object on the last stdout line. Secrets in
-``collector.env`` or the collector's environment never leave the node: only
-allow-listed keys are read.
+Every answer is one JSON object on the last stdout line; only allow-listed
+environment keys are read, so secrets never leave the node. A failure prints
+the exception class, a digest of its message and its ``function:line`` site --
+the message-free trail the host fixture may show the runner.
 """
 
 from __future__ import annotations
@@ -85,6 +100,8 @@ SOURCES = {
     INVENTORY_PLAN: "plan",
 }
 UNIT_PREFIX = "gfrs-live-"
+#: Written into a run directory when it is created: which run owns it.
+RUN_MARKER = "run.json"
 #: Collector settings a plan may depend on; nothing else is ever read out.
 ENV_KEYS = (
     ENDPOINT_ENV,
@@ -115,6 +132,8 @@ PROCESS_KEYS = (
 #: ``None``, never a guessed count.
 UNKNOWN_INSTANCE_TYPE = "gfrs-live-unknown.48xlarge"
 SAFE_RUN_ID = re.compile(r"^[a-z0-9][a-z0-9-]{2,62}$")
+#: A run's on-node objects are named by the 12-hex digest of its run id.
+DIGEST = re.compile(r"^[0-9a-f]{12}$")
 BOOT_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 GPU_UUID = re.compile(r"^GPU-[0-9a-fA-F-]{8,64}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -123,6 +142,16 @@ MIN_RESTORE_SECONDS, MAX_RESTORE_SECONDS = 120, 5400
 MAX_TOOL_SECONDS = 3600
 MAX_SOURCE_BYTES = 512 * 1024
 MAX_AUDIT_LINES = 400
+#: How long a restarted collector may take between systemd's fork (the unit
+#: is "active" from here) and its exec (its environment is the unit's from
+#: here). The sandbox setup in between (``ProtectSystem=strict`` over every
+#: mount of a Kubernetes node) is what makes this a wait, not an instant.
+SETTLE_SECONDS = 45
+#: Unit states in which a deadman is still going to restore, or restoring.
+PENDING_TIMER_STATES = frozenset({"active", "activating", "reloading"})
+PENDING_SERVICE_STATES = frozenset(
+    {"active", "activating", "reloading", "deactivating"}
+)
 
 
 class ProbeError(RuntimeError):
@@ -162,6 +191,12 @@ def checked_run_id(value: str) -> str:
     return value
 
 
+def checked_digest(value: str) -> str:
+    if DIGEST.fullmatch(value) is None:
+        raise ProbeError("unsafe run digest")
+    return value
+
+
 def bounded(value: int, low: int, high: int, label: str) -> int:
     number = int(value)
     if not low <= number <= high:
@@ -173,24 +208,47 @@ def digest(run_id: str) -> str:
     return hashlib.sha256(checked_run_id(run_id).encode()).hexdigest()[:12]
 
 
+# Every on-node object of a run derives from the run id's digest; the digest
+# forms let an earlier run's leftovers be addressed when only their names are
+# known (``cleanup-leftover``).
+def run_dir_of(run_digest: str) -> Path:
+    return STATE_ROOT / checked_digest(run_digest)
+
+
+def proxy_unit_of(run_digest: str) -> str:
+    return f"{UNIT_PREFIX}{checked_digest(run_digest)}-proxy"
+
+
+def deadman_unit_of(run_digest: str) -> str:
+    return f"{UNIT_PREFIX}{checked_digest(run_digest)}-restore"
+
+
+def dropin_of(run_digest: str) -> Path:
+    return DROPIN_DIR / f"{UNIT_PREFIX}{checked_digest(run_digest)}.conf"
+
+
+def override_env_of(run_digest: str) -> Path:
+    return run_dir_of(run_digest) / "collector.env"
+
+
 def run_dir(run_id: str) -> Path:
-    return STATE_ROOT / digest(run_id)
+    return run_dir_of(digest(run_id))
 
 
 def proxy_unit(run_id: str) -> str:
-    return f"{UNIT_PREFIX}{digest(run_id)}-proxy"
+    return proxy_unit_of(digest(run_id))
 
 
 def deadman_unit(run_id: str) -> str:
-    return f"{UNIT_PREFIX}{digest(run_id)}-restore"
+    return deadman_unit_of(digest(run_id))
 
 
 def dropin_path(run_id: str) -> Path:
-    return DROPIN_DIR / f"{UNIT_PREFIX}{digest(run_id)}.conf"
+    return dropin_of(digest(run_id))
 
 
 def override_env_path(run_id: str) -> Path:
-    return run_dir(run_id) / "collector.env"
+    return override_env_of(digest(run_id))
 
 
 def checked_port(value: int) -> int:
@@ -233,6 +291,7 @@ def unit_state(unit: str) -> dict[str, str]:
             "--property=InvocationID",
             "--property=DropInPaths",
             "--property=ExecMainStartTimestamp",
+            "--property=NextElapseUSecRealtime",
         ],
         check=False,
     )
@@ -243,6 +302,10 @@ def unit_state(unit: str) -> dict[str, str]:
             values[key] = value
     values["returncode"] = str(completed.returncode)
     return values
+
+
+def loaded(state: dict[str, str]) -> bool:
+    return state.get("LoadState") == "loaded"
 
 
 def process_environment(pid: str) -> dict[str, str]:
@@ -263,11 +326,20 @@ def process_environment(pid: str) -> dict[str, str]:
     return values
 
 
-def effective_endpoint() -> str | None:
-    """The DCGM URL the running collector process actually uses."""
+def has_execed(pid: str) -> bool:
+    """Whether ``pid`` runs its own program yet, not systemd's pre-exec child.
 
-    state = unit_state(METRICS_UNIT)
-    return process_environment(state.get("MainPID", "")).get(ENDPOINT_ENV)
+    systemd names the forked child ``(<exec basename>)`` until it execs, and
+    its ``exe`` is still systemd's; from the exec on, ``comm`` and ``exe`` are
+    the service's and ``/proc/<pid>/environ`` is the unit's environment.
+    """
+
+    try:
+        comm = Path(f"/proc/{pid}/comm").read_text(encoding="utf-8", errors="replace")
+        exe = os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        return False
+    return not comm.strip().startswith("(") and Path(exe).name != "systemd"
 
 
 def wait_active(unit: str, *, seconds: int = 60) -> dict[str, str]:
@@ -282,6 +354,39 @@ def wait_active(unit: str, *, seconds: int = 60) -> dict[str, str]:
             return state
         time.sleep(1)
     return state
+
+
+def settled_environment(
+    unit: str, *, seconds: int = SETTLE_SECONDS
+) -> tuple[dict[str, str], dict[str, str]]:
+    """The unit's state and its main process's environment once it has exec'd.
+
+    Returns what it last saw when the window closes; callers check for the
+    endpoint key, which every exec'd collector carries from ``collector.env``.
+    """
+
+    deadline = time.monotonic() + seconds
+    state = wait_active(unit, seconds=seconds)
+    while True:
+        pid = state.get("MainPID", "")
+        environment = process_environment(pid)
+        if (
+            state.get("ActiveState") == "active"
+            and pid not in {"", "0"}
+            and (ENDPOINT_ENV in environment or has_execed(pid))
+        ):
+            return state, environment
+        if time.monotonic() >= deadline:
+            return state, environment
+        time.sleep(0.5)
+        state = unit_state(unit)
+
+
+def effective_endpoint(*, seconds: int = 15) -> str | None:
+    """The DCGM URL the running collector process actually uses."""
+
+    _state, environment = settled_environment(METRICS_UNIT, seconds=seconds)
+    return environment.get(ENDPOINT_ENV)
 
 
 # --------------------------------------------------------------------------- #
@@ -309,6 +414,16 @@ def tool_status(port: int) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ProbeError("replay /status did not return an object")
     return value
+
+
+def port_answers(port: int) -> bool:
+    """Whether a replay tool (ours or an earlier run's) answers on ``port``."""
+
+    try:
+        tool_status(port)
+    except (ProbeError, ValueError):
+        return False
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -385,29 +500,146 @@ def exporter_readings(url: str) -> dict[str, Any]:
     }
 
 
-def residue() -> dict[str, Any]:
+def recorded_run_id(run_digest: str) -> str | None:
+    """The run id a leftover directory names for itself, if it checks out."""
+
+    for name in (RUN_MARKER, "repoint.json"):
+        path = run_dir_of(run_digest) / name
+        if not path.is_file():
+            continue
+        try:
+            value = json.loads(path.read_text(encoding="utf-8")).get("run_id")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if (
+            isinstance(value, str)
+            and SAFE_RUN_ID.fullmatch(value)
+            and digest(value) == run_digest
+        ):
+            return value
+    return None
+
+
+def deadman_pending(timer: dict[str, str], service: dict[str, str]) -> bool:
+    """Whether a run's deadman is still going to restore (or is restoring)."""
+
+    return (
+        timer.get("ActiveState") in PENDING_TIMER_STATES
+        or service.get("ActiveState") in PENDING_SERVICE_STATES
+    )
+
+
+def run_state(run_digest: str) -> dict[str, Any]:
+    """Every object one run (by digest) still has on the node, named."""
+
+    run_digest = checked_digest(run_digest)
+    root, dropin = run_dir_of(run_digest), dropin_of(run_digest)
+    proxy_name = f"{proxy_unit_of(run_digest)}.service"
+    timer_name = f"{deadman_unit_of(run_digest)}.timer"
+    service_name = f"{deadman_unit_of(run_digest)}.service"
+    proxy, timer, service = (
+        unit_state(proxy_name),
+        unit_state(timer_name),
+        unit_state(service_name),
+    )
+    run_id = recorded_run_id(run_digest)
+    objects: list[str] = []
+    if dropin.exists():
+        objects.append(f"drop-in {dropin}")
+    if loaded(proxy):
+        objects.append(f"unit {proxy_name} ({proxy.get('ActiveState')})")
+    if root.is_dir():
+        objects.append(f"run dir {root}" + (f" (run {run_id})" if run_id else ""))
+    pending = deadman_pending(timer, service)
+    if loaded(timer):
+        fires = timer.get("NextElapseUSecRealtime") or "n/a"
+        objects.append(
+            f"deadman {timer_name} ({timer.get('ActiveState')}; fires {fires})"
+        )
+    if loaded(service):
+        objects.append(
+            f"deadman {service_name} ({service.get('ActiveState')}/{service.get('SubState')})"
+        )
+    return {
+        "digest": run_digest,
+        "run_id": run_id,
+        "objects": objects,
+        "deadman_pending": pending,
+        "reclaimable": bool(objects) and not pending,
+        "dropin": str(dropin) if dropin.exists() else None,
+        "run_dir": str(root) if root.is_dir() else None,
+        "proxy_unit": {"name": proxy_name, **proxy} if loaded(proxy) else None,
+        "deadman_timer": {"name": timer_name, **timer} if loaded(timer) else None,
+        "deadman_service": {"name": service_name, **service}
+        if loaded(service)
+        else None,
+    }
+
+
+def residue(port: int | None = None) -> dict[str, Any]:
+    """What is on the node from any replay run, ours by digest and foreign.
+
+    The flat lists are kept for older readers; ``runs`` groups this fixture's
+    objects by run digest with the deadman's state, ``foreign_*`` name what
+    this fixture never touches, and ``port_answers`` says whether a tool
+    (an earlier run's) still serves the replay port.
+    """
+
     dropins = (
         sorted(path.name for path in DROPIN_DIR.glob("*.conf"))
         if DROPIN_DIR.is_dir()
         else []
     )
-    units = run(
-        [
-            "systemctl",
-            "list-units",
-            "--all",
-            "--plain",
-            "--no-legend",
-            f"{UNIT_PREFIX}*",
-        ],
-        check=False,
-    ).stdout.split()
-    return {
-        "run_dirs": sorted(path.name for path in STATE_ROOT.glob("*") if path.is_dir())
+    units = sorted(
+        item
+        for item in run(
+            [
+                "systemctl",
+                "list-units",
+                "--all",
+                "--plain",
+                "--no-legend",
+                f"{UNIT_PREFIX}*",
+            ],
+            check=False,
+        ).stdout.split()
+        if item.startswith(UNIT_PREFIX)
+    )
+    run_dirs = (
+        sorted(path.name for path in STATE_ROOT.glob("*") if path.is_dir())
         if STATE_ROOT.is_dir()
-        else [],
+        else []
+    )
+    prefix = re.escape(UNIT_PREFIX)
+    digests: set[str] = set()
+    foreign_dropins: list[str] = []
+    foreign_run_dirs: list[str] = []
+    for name in dropins:
+        match = re.fullmatch(rf"{prefix}([0-9a-f]{{12}})\.conf", name)
+        if match:
+            digests.add(match.group(1))
+        else:
+            foreign_dropins.append(name)
+    for name in units:
+        match = re.fullmatch(
+            rf"{prefix}([0-9a-f]{{12}})-(?:proxy|restore)\.(?:service|timer)", name
+        )
+        if match:
+            digests.add(match.group(1))
+    for name in run_dirs:
+        if DIGEST.fullmatch(name):
+            digests.add(name)
+        else:
+            foreign_run_dirs.append(name)
+    return {
+        "run_dirs": run_dirs,
         "metrics_dropins": dropins,
-        "units": sorted(item for item in units if item.startswith(UNIT_PREFIX)),
+        "units": units,
+        "runs": {item: run_state(item) for item in sorted(digests)},
+        "foreign_dropins": foreign_dropins,
+        "foreign_run_dirs": foreign_run_dirs,
+        "port": port,
+        "port_answers": port_answers(port) if port is not None else None,
     }
 
 
@@ -469,7 +701,7 @@ def survey(arguments: argparse.Namespace) -> None:
             "baseline_endpoint": baseline_endpoint(),
             "gpu_inventory": gpu_inventory(),
             "exporter": exporter_readings(baseline_endpoint()),
-            "residue": residue(),
+            "residue": residue(checked_port(arguments.port)),
             "tools": {
                 name: bool(shutil.which(name))
                 for name in ("systemd-run", "systemctl", "nvidia-smi")
@@ -502,6 +734,16 @@ def install_source(arguments: argparse.Namespace) -> None:
         raise ProbeError("installed source sha256 does not match")
     root = run_dir(run_id)
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    marker = root / RUN_MARKER
+    if not marker.exists():
+        marker.write_text(
+            json.dumps(
+                {"run_id": run_id, "digest": digest(run_id), "created_at": utc_now()},
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        marker.chmod(0o600)
     target = root / name
     if target.exists():
         raise ProbeError(f"{name} is already installed for this run")
@@ -572,6 +814,10 @@ def deploy_proxy(arguments: argparse.Namespace) -> None:
     unit = proxy_unit(run_id)
     run(["systemctl", "stop", f"{unit}.service"], check=False)
     run(["systemctl", "reset-failed", f"{unit}.service"], check=False)
+    if port_answers(port):
+        raise ProbeError(
+            "a replay tool already answers on the port; not starting a second"
+        )
     run(
         [
             "systemd-run",
@@ -663,12 +909,16 @@ def arm_deadman(run_id: str, seconds: int) -> dict[str, str]:
     return state
 
 
-def disarm_deadman(run_id: str) -> None:
-    name = deadman_unit(run_id)
+def disarm_deadman_of(run_digest: str) -> None:
+    name = deadman_unit_of(run_digest)
     run(["systemctl", "stop", f"{name}.timer"], check=False)
     if unit_state(f"{name}.service").get("MainPID") != str(os.getpid()):
         run(["systemctl", "stop", f"{name}.service"], check=False)
     run(["systemctl", "reset-failed", f"{name}.service", f"{name}.timer"], check=False)
+
+
+def disarm_deadman(run_id: str) -> None:
+    disarm_deadman_of(digest(run_id))
 
 
 def override_lines(
@@ -787,10 +1037,13 @@ def repoint_collector(arguments: argparse.Namespace) -> None:
     )
     run(["systemctl", "daemon-reload"])
     run(["systemctl", "restart", METRICS_UNIT], timeout=120)
-    after = wait_active(METRICS_UNIT)
+    after, environment = settled_environment(METRICS_UNIT)
     if after.get("ActiveState") != "active":
         raise ProbeError(f"{METRICS_UNIT} is not active after the repoint")
-    environment = process_environment(after.get("MainPID", ""))
+    if ENDPOINT_ENV not in environment:
+        raise ProbeError(
+            "the restarted collector did not exec within the settle window"
+        )
     wanted = f"http://127.0.0.1:{port}/metrics"
     if environment.get(ENDPOINT_ENV) != wanted:
         raise ProbeError("the running collector did not pick up the replay endpoint")
@@ -902,7 +1155,7 @@ def collector_restart(arguments: argparse.Namespace) -> None:
     run_id = checked_run_id(arguments.run_id)
     before = unit_state(METRICS_UNIT)
     run(["systemctl", "restart", METRICS_UNIT], timeout=120)
-    after = wait_active(METRICS_UNIT)
+    after, environment = settled_environment(METRICS_UNIT)
     if after.get("ActiveState") != "active":
         raise ProbeError(f"{METRICS_UNIT} is not active after the restart")
     emit(
@@ -911,9 +1164,7 @@ def collector_restart(arguments: argparse.Namespace) -> None:
             "before": before,
             "after": after,
             "restarted": before.get("InvocationID") != after.get("InvocationID"),
-            "effective_endpoint": process_environment(after.get("MainPID", "")).get(
-                ENDPOINT_ENV
-            ),
+            "effective_endpoint": environment.get(ENDPOINT_ENV),
         }
     )
 
@@ -921,10 +1172,10 @@ def collector_restart(arguments: argparse.Namespace) -> None:
 # --------------------------------------------------------------------------- #
 # restore / stop / cleanup
 # --------------------------------------------------------------------------- #
-def restore(run_id: str) -> dict[str, Any]:
-    dropin = dropin_path(run_id)
+def restore_of(run_digest: str) -> dict[str, Any]:
+    dropin = dropin_of(run_digest)
     original = baseline_endpoint()
-    repoint = run_dir(run_id) / "repoint.json"
+    repoint = run_dir_of(run_digest) / "repoint.json"
     if repoint.is_file():
         try:
             original = str(json.loads(repoint.read_text())["original_endpoint"])
@@ -932,14 +1183,15 @@ def restore(run_id: str) -> dict[str, Any]:
             pass
     present = dropin.exists()
     dropin.unlink(missing_ok=True)
-    override_env_path(run_id).unlink(missing_ok=True)
+    override_env_of(run_digest).unlink(missing_ok=True)
     if present:
         run(["systemctl", "daemon-reload"])
         run(["systemctl", "restart", METRICS_UNIT], timeout=120)
-    after = wait_active(METRICS_UNIT)
+    after, environment = settled_environment(METRICS_UNIT)
     if after.get("ActiveState") != "active":
         raise ProbeError(f"{METRICS_UNIT} is not active after the restore")
-    environment = process_environment(after.get("MainPID", ""))
+    if present and ENDPOINT_ENV not in environment:
+        raise ProbeError("the restored collector did not exec within the settle window")
     effective = environment.get(ENDPOINT_ENV)
     if effective is not None and effective != original:
         raise ProbeError("the collector endpoint is not the original after the restore")
@@ -959,6 +1211,10 @@ def restore(run_id: str) -> dict[str, Any]:
     }
 
 
+def restore(run_id: str) -> dict[str, Any]:
+    return restore_of(digest(run_id))
+
+
 def restore_collector(arguments: argparse.Namespace) -> None:
     run_id = checked_run_id(arguments.run_id)
     result = restore(run_id)
@@ -966,7 +1222,7 @@ def restore_collector(arguments: argparse.Namespace) -> None:
     emit({"run_id": run_id, **result})
 
 
-def stop(run_id: str, port: int | None) -> dict[str, Any]:
+def stop_of(run_digest: str, port: int | None) -> dict[str, Any]:
     effective = effective_endpoint()
     if (
         effective
@@ -974,10 +1230,10 @@ def stop(run_id: str, port: int | None) -> dict[str, Any]:
         and effective != baseline_endpoint()
     ):
         raise ProbeError("refusing to stop the replay while the collector reads it")
-    unit = proxy_unit(run_id)
+    unit = proxy_unit_of(run_digest)
     run(["systemctl", "stop", f"{unit}.service"], check=False)
     run(["systemctl", "reset-failed", f"{unit}.service"], check=False)
-    root = run_dir(run_id)
+    root = run_dir_of(run_digest)
     audit_present = (root / "replay.jsonl").is_file()
     if root.is_dir():
         shutil.rmtree(root)
@@ -991,31 +1247,155 @@ def stop(run_id: str, port: int | None) -> dict[str, Any]:
     }
 
 
+def stop(run_id: str, port: int | None) -> dict[str, Any]:
+    return stop_of(digest(run_id), port)
+
+
 def stop_proxy(arguments: argparse.Namespace) -> None:
     run_id = checked_run_id(arguments.run_id)
     emit({"run_id": run_id, **stop(run_id, checked_port(arguments.port))})
+
+
+def step_error(step: str, exc: BaseException) -> str:
+    """One failed cleanup step: its name, the class and -- for this probe's
+    own constant sentences -- the message."""
+
+    detail = f": {exc}" if isinstance(exc, ProbeError) else ""
+    return f"{step}: {type(exc).__name__}{detail}"
+
+
+def cleanup_steps(
+    run_digest: str, port: int | None
+) -> tuple[dict[str, Any], list[str]]:
+    """Restore the collector, then stop the tool; every step is attempted."""
+
+    result: dict[str, Any] = {}
+    errors: list[str] = []
+    try:
+        result["restore"] = restore_of(run_digest)
+    except Exception as exc:  # noqa: BLE001 - recorded, the next step still runs
+        errors.append(step_error("restore", exc))
+    try:
+        result["stop"] = stop_of(run_digest, port)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(step_error("stop", exc))
+    return result, errors
+
+
+def disarm_tool(port: int) -> dict[str, Any]:
+    """Best-effort ``POST /disarm`` so the tool passes through before the
+    collector is restarted; no tool on the port is not an error here."""
+
+    try:
+        status, _body = loopback(
+            f"http://127.0.0.1:{checked_port(port)}/disarm", method="POST", timeout=5
+        )
+    except ProbeError:
+        return {"disarmed": False, "detail": "no replay tool answered"}
+    return {"disarmed": status == 200, "http_status": status}
 
 
 def cleanup(arguments: argparse.Namespace) -> None:
     """The deadman's entry point: every step is attempted, in order."""
 
     run_id = checked_run_id(arguments.run_id)
-    result: dict[str, Any] = {"run_id": run_id}
-    errors = []
-    try:
-        result["restore"] = restore(run_id)
-    except Exception as exc:  # noqa: BLE001 - recorded, the next step still runs
-        errors.append(f"restore: {type(exc).__name__}")
-    try:
-        result["stop"] = stop(run_id, None)
-    except Exception as exc:  # noqa: BLE001
-        errors.append(f"stop: {type(exc).__name__}")
-    disarm_deadman(run_id)
-    result["residue"] = residue()
-    result["errors"] = errors
+    run_digest = digest(run_id)
+    result, errors = cleanup_steps(run_digest, None)
+    disarm_deadman_of(run_digest)
+    result.update(run_id=run_id, residue=residue(), errors=errors)
     emit(result)
     if errors:
         raise SystemExit(1)
+
+
+def close_run(arguments: argparse.Namespace) -> None:
+    """The runner's cleanup of this run: every step, then what is left.
+
+    The deadman is disarmed only once nothing failed; while a step failed it
+    stays armed as the independent restore of what the runner could not undo,
+    and is listed among the leftovers with its fire time.
+    """
+
+    run_id = checked_run_id(arguments.run_id)
+    port = checked_port(arguments.port)
+    run_digest = digest(run_id)
+    result: dict[str, Any] = {"run_id": run_id, "digest": run_digest}
+    result["disarm"] = disarm_tool(port)
+    steps, errors = cleanup_steps(run_digest, port)
+    result.update(steps)
+    if errors:
+        result["deadman_kept"] = loaded(
+            unit_state(f"{deadman_unit_of(run_digest)}.timer")
+        )
+    else:
+        disarm_deadman_of(run_digest)
+        result["deadman_kept"] = False
+    state = run_state(run_digest)
+    result.update(
+        errors=errors,
+        leftover=state["objects"],
+        clean=not state["objects"] and not errors,
+        run_state=state,
+    )
+    emit(result)
+
+
+def cleanup_leftover(arguments: argparse.Namespace) -> None:
+    """Reclaim an earlier run's objects by digest, unless its deadman is pending.
+
+    Only this fixture's own objects (the ``gfrs-live-<digest>`` names) are
+    ever addressed; a pending deadman means the run that armed it may still
+    be live or its restore is about to run, so nothing is touched and the
+    answer says so.
+    """
+
+    checked_run_id(arguments.run_id)
+    run_digest = checked_digest(arguments.digest)
+    before = run_state(run_digest)
+    result: dict[str, Any] = {
+        "digest": run_digest,
+        "run_id": before.get("run_id"),
+        "before": before,
+    }
+    if not before["objects"]:
+        emit(
+            {
+                **result,
+                "reclaimed": False,
+                "reason": "nothing of this run is left on the node",
+                "clean": True,
+                "leftover": [],
+                "errors": [],
+            }
+        )
+        return
+    if before["deadman_pending"]:
+        emit(
+            {
+                **result,
+                "reclaimed": False,
+                "reason": "the run's deadman restore is still pending; left to fire",
+                "clean": False,
+                "leftover": before["objects"],
+                "errors": [],
+            }
+        )
+        return
+    steps, errors = cleanup_steps(run_digest, None)
+    if not errors:
+        disarm_deadman_of(run_digest)
+    after = run_state(run_digest)
+    emit(
+        {
+            **result,
+            **steps,
+            "reclaimed": True,
+            "errors": errors,
+            "leftover": after["objects"],
+            "clean": not after["objects"] and not errors,
+            "after": after,
+        }
+    )
 
 
 def parser() -> argparse.ArgumentParser:
@@ -1030,7 +1410,7 @@ def parser() -> argparse.ArgumentParser:
         item.set_defaults(handler=handler)
         return item
 
-    surveyed = command("survey", survey)
+    surveyed = command("survey", survey, port=True)
     surveyed.add_argument("--limits", action="store_true")
     source = command("install-source", install_source)
     source.add_argument("--name", required=True)
@@ -1056,8 +1436,37 @@ def parser() -> argparse.ArgumentParser:
     command("collector-restart", collector_restart)
     command("restore-collector", restore_collector)
     command("stop-proxy", stop_proxy, port=True)
+    command("close-run", close_run, port=True)
+    leftover = command("cleanup-leftover", cleanup_leftover)
+    leftover.add_argument("--digest", required=True)
     command("cleanup", cleanup)
     return value
+
+
+def exception_site(exc: BaseException) -> str | None:
+    """The innermost ``function:line`` of this file on the exception's path."""
+
+    site = None
+    frame = exc.__traceback__
+    while frame is not None:
+        if frame.tb_frame.f_code.co_filename == __file__:
+            site = f"{frame.tb_frame.f_code.co_name}:{frame.tb_lineno}"
+        frame = frame.tb_next
+    return site
+
+
+def error_fields(exc: BaseException, command: str) -> dict[str, Any]:
+    """The failure line: class, message digest and site are what the host
+    fixture may show; the message itself stays on the node."""
+
+    return {
+        "error": f"{type(exc).__name__}: {exc}",
+        "error_kind": "probe",
+        "error_class": type(exc).__name__,
+        "error_code": hashlib.sha256(str(exc).encode()).hexdigest()[:16],
+        "error_site": exception_site(exc),
+        "command": command,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1067,14 +1476,7 @@ def main(argv: list[str] | None = None) -> int:
     except SystemExit:
         raise
     except Exception as exc:  # noqa: BLE001 - reported as the probe's JSON error
-        emit(
-            {
-                "error": f"{type(exc).__name__}: {exc}",
-                "error_kind": "probe",
-                "error_class": type(exc).__name__,
-                "command": arguments.command,
-            }
-        )
+        emit(error_fields(exc, arguments.command))
         return 1
     return 0
 

@@ -217,8 +217,35 @@ def _teardown(ctx: VariantContext, result: dict[str, Any]) -> None:
     )
     if dirty and result["verdict"] in {"PASS", "FAIL"}:
         result["verdict"] = "FAIL"
-        result.setdefault("errors", []).append("cleanup did not prove the node clean")
+        result.setdefault("errors", []).append(
+            unclean_detail(ctx.cleanup.failed, ctx.cleanup.pending(), probe_residuals)
+        )
     ctx.evidence.write("result", result)
+
+
+def unclean_detail(
+    failed: list[dict[str, Any]],
+    pending: list[str],
+    probe_residuals: dict[str, Any],
+) -> str:
+    """The failed-cleanup line, naming what did not prove clean.
+
+    Each failed undo with its error (a replay cleanup names every object it
+    left), each undo never reached, and each probe residual still present.
+    """
+
+    parts = [f"{item['name']}: {item.get('error')}" for item in failed]
+    parts.extend(f"undo not reached: {name}" for name in pending)
+    for handle, residual in probe_residuals.items():
+        if not isinstance(residual, dict):
+            continue
+        parts.extend(
+            f"probe {handle}: {key}={value}"
+            for key, value in residual.items()
+            if value is not False
+        )
+    detail = "cleanup did not prove the node clean"
+    return detail + (": " + "; ".join(parts) if parts else "")
 
 
 def main() -> int:
