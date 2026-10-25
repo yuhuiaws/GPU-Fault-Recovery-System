@@ -100,7 +100,9 @@ from scripts.e2e.regional.general_live_verdicts import (
     workflows_of,
 )
 
-NODE_REBOOT = "NODE_REBOOT"  # approval name the reboot-class variants of other modules import
+NODE_REBOOT = (
+    "NODE_REBOOT"  # approval name the reboot-class variants of other modules import
+)
 CASE_013 = "GF-GENERAL-LIVE-013"
 CASE_014 = "GF-GENERAL-LIVE-014"
 DETECTION_BUDGET = 420
@@ -886,28 +888,9 @@ VARIANTS = [
         ),
         execute=unknown_inventory,
     ),
-    deferred_variant(
-        CASE_013,
-        "bind_failure",
-        proof_mode=LIVE_REPLAY,
-        reason=(
-            "NOT_AUTHORIZED: a bind that fails after an unbind needs the reserved "
-            "EFA_DRIVER_UNBIND native path"
-        ),
-        lanes=("eks",),
-        expected="a failed bind has its own receipt and is handled per the approved branch; no global efa unload",
-    ),
-    deferred_variant(
-        CASE_013,
-        "post_repair_failure",
-        proof_mode=LIVE_REPLAY,
-        reason=(
-            "NOT_AUTHORIZED: a post-action validation failure needs the reserved "
-            "EFA_DRIVER_UNBIND native path plus an injected post-repair failure"
-        ),
-        lanes=("eks",),
-        expected="action succeeds but post-action validation fails -> independent receipt and escalation",
-    ),
+    # 013 bind_failure and post_repair_failure are the reserved native EFA
+    # driver unbind: implemented in general_live_efa_driver.py (EFA_DRIVER_UNBIND
+    # + NODE_REBOOT), not here.
     # --- 014 Kubernetes allocatable under-report --- #
     # The native device-plugin registration faults (gpu_plugin, efa_plugin,
     # one_sample, replacement_uid, validation_failure) are implemented in

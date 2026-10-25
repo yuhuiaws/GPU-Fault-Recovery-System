@@ -334,6 +334,7 @@ CATEGORY_MODULES = (
     "scripts.e2e.regional.general_live_inventory",
     "scripts.e2e.regional.general_live_efa_pci",
     "scripts.e2e.regional.general_live_device_plugin",
+    "scripts.e2e.regional.general_live_efa_driver",
     "scripts.e2e.regional.general_live_gpu_memory",
     "scripts.e2e.regional.general_live_gpu_links",
     "scripts.e2e.regional.general_live_gpu_fabric",
