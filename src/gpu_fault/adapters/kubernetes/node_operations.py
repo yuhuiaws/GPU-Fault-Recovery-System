@@ -215,13 +215,13 @@ class KubernetesNodeOperationsMixin:
         annotations = self._annotations(node)
         operation = annotations.get(keys.operation)
         old_uid = annotations.get(keys.pod_uid, "")
-        started = self._plugin_restart_started(annotations.get(keys.started))
+        started = _plugin_restart_started(annotations.get(keys.started))
         took_over: str | None = None
         if operation and operation != context.idempotency_key:
             owner_incident = annotations.get(keys.incident)
             if (
                 owner_incident != context.incident.incident_id
-                and not self._plugin_restart_is_stale(
+                and not _plugin_restart_is_stale(
                     started, now=now, timeout_seconds=timeout_seconds
                 )
             ):
@@ -342,31 +342,6 @@ class KubernetesNodeOperationsMixin:
         return stale_quiesce_taint_values(
             node, context, lambda owner: self._incident_ownership(owner, context)
         )
-
-    @staticmethod
-    def _plugin_restart_started(raw: str | None) -> datetime | None:
-        if not raw:
-            return None
-        try:
-            return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-        except (TypeError, ValueError):
-            return None
-
-    @staticmethod
-    def _plugin_restart_is_stale(
-        started: datetime | None,
-        *,
-        now: datetime,
-        timeout_seconds: int,
-    ) -> bool:
-        """A foreign restart annotation may be taken over once it is stale.
-
-        Age is the only evidence available: an annotation with no parsable
-        start time cannot be proven stale, so it stays refused (fail closed).
-        """
-        if started is None:
-            return False
-        return (now - started).total_seconds() >= timeout_seconds
 
     def _mark_plugin_restart(
         self,
@@ -960,6 +935,32 @@ def split_plugin_pods(
         "companion_pods": [pod_name(pod) for pod in live if companion_pod(pod)],
     }
     return [pod for pod in live if not companion_pod(pod)], report
+
+
+def _plugin_restart_started(raw: str | None) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _plugin_restart_is_stale(
+    started: datetime | None,
+    *,
+    now: datetime,
+    timeout_seconds: int,
+) -> bool:
+    """A foreign restart annotation may be taken over once it is stale.
+
+    Age is the only evidence available: an annotation with no parsable start
+    time cannot be proven stale, so it stays refused (fail closed).
+    """
+
+    if started is None:
+        return False
+    return (now - started).total_seconds() >= timeout_seconds
 
 
 def deleted_plugin_pod_receipt(
