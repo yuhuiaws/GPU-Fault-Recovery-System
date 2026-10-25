@@ -45,6 +45,7 @@ from gpu_fault_release.regional_release_diff import (
 )
 from gpu_fault_release.regional_release_gpu_rollout import agents_converged
 from gpu_fault_release.regional_release_images import NodeDependencyTarget
+from gpu_fault_release.regional_release_reporting import build_release_status
 from tests.regional.test_regional_release_eks_managed import _hyperpod_cluster
 from tests.regional.test_release_dcgm_hostengine import HOST_ENTRY, _eks, _release
 
@@ -185,6 +186,21 @@ def test_convergence_by_the_recorded_source_accepts_a_host_install() -> None:
     assert not agents_converged(
         [node], target, "a" * 64, template_sha=SOURCE, dcgm_hostengine="embedded"
     ), "a wait that names the mode still holds the node to it"
+
+
+def test_status_names_the_identity_each_clusters_agents_report(tmp_path: Path) -> None:
+    release = _release(
+        tmp_path, _hyperpod_cluster(tmp_path), _eks(tmp_path, **HOST_ENTRY)
+    )
+    hyperpod, eks = release.config.clusters
+    source = release.node_template_sha
+
+    clusters = build_release_status(release)["clusters"]
+
+    assert clusters[hyperpod.cluster_id]["installer_template_sha256"] == source
+    assert clusters[eks.cluster_id]["installer_template_sha256"] == (
+        IDENTITY.installer_template_identity(source, "host")
+    ), "a host-mode cluster's Agents report the folded identity, not the source"
 
 
 # --- the diff guard ---------------------------------------------------------------

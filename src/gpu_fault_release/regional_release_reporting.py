@@ -3,6 +3,9 @@ from __future__ import annotations
 from typing import Any
 
 from gpu_fault_release import regional_deployment_inventory as inventory
+from gpu_fault_release.regional_release_node_identity import (
+    candidate_installer_template_identity,
+)
 from gpu_fault_release.regional_release_profile_model import (
     cluster_runtime_profiles,
 )
@@ -141,5 +144,18 @@ def build_release_status(release: Any) -> dict[str, Any]:
                 inventory.GPU_RECONCILER_DEPLOYMENT,
             ),
             "template": release._deployment_template_name(target),
+            # What this release's reconciler stamps and its Agents report on
+            # the cluster: ``node_template_sha256`` folded with a host DCGM
+            # engine, the source digest everywhere else.
+            "installer_template_sha256": _installer_template_identity(release, target),
         }
     return result
+
+
+def _installer_template_identity(release: Any, target: Any) -> str | None:
+    try:
+        return candidate_installer_template_identity(release, target)
+    except ValueError:
+        # A source digest nothing can fold (a malformed config) is shown as
+        # unknown; the status report itself never fails on it.
+        return None
