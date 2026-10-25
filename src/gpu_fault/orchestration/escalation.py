@@ -29,6 +29,14 @@ from gpu_fault.orchestration.gpu_placement import (
     escalation_gpu_scope,
     scope_validation_steps,
 )
+from gpu_fault.orchestration.validation_evidence import (
+    VALIDATION_OPERATIONS,
+    missing_evidence_reason,
+    requested_escalations,
+    validation_unobserved_failure,
+    withheld_escalation,
+    withheld_escalation_reasons,
+)
 from gpu_fault.store.shared.errors import NotFoundError
 
 RESTART_SAFETY_PARAMETERS = (
@@ -47,13 +55,7 @@ _RESET_OPERATIONS = frozenset(
         WorkflowOperation.RECOVER_DRAIN_P2P,
     }
 )
-_VALIDATION_OPERATIONS = frozenset(
-    {
-        WorkflowOperation.VALIDATE_GPU,
-        WorkflowOperation.VALIDATE_HOST,
-        WorkflowOperation.VALIDATE_FABRIC,
-    }
-)
+_VALIDATION_OPERATIONS = VALIDATION_OPERATIONS
 # The node actions a validation judges: the reset, reboot, replacement,
 # remediation or diagnostic that ran before it. A failed validation escalates
 # the nodes one of these acted on, never a sibling the step merely checked.
@@ -100,6 +102,18 @@ NODE_ACTION_REFUSED_STAGE = "node_action_refused"
 # node. The hand-off plans evidence and the ticket only, like a refusal: the
 # node keeps the chain's cordon and the operator's restore lifts the taint.
 VALIDATION_UNOBSERVED_STAGE = "validation_unobserved"
+# A validation a bound failed before it observed any node failure -- the
+# per-step cap or the workflow deadline, the node's collectors dark or no
+# fresh sample yet -- whose plan asked for an escalation on failure
+# (``failure_escalation_action``). The request is for a validation that looked
+# and found the fault still there; this one could not look, so it is withheld
+# (``validation_evidence.withheld_escalation``) -- live 2026-10-25 (plain EKS,
+# GF-GENERAL-LIVE-013 link_inactive) the EFA diagnostic chain's VALIDATE_FABRIC
+# waited out the 600 s cap with ``missing_or_stale_collectors`` as its only
+# word and the requested REBOOT_NODE rebooted a node nothing had been learned
+# about. Same hand-off as the unobserved stage: evidence and the ticket, the
+# incident reasons naming the missing evidence and the withheld request.
+VALIDATION_EVIDENCE_MISSING_STAGE = "validation_evidence_missing"
 # A failure whose outcome nobody knows. Three producers write it into the step
 # details (``status_source`` never crosses into a step record, so details are
 # the contract): the node-action fold, when the agent's attempt closed
@@ -319,32 +333,6 @@ def escalation_descends_from(
     return False
 
 
-def validation_unobserved_failure(details: Mapping[str, Any] | None) -> bool:
-    """Whether a FAILED validation never observed its node because the
-    product's own quiesce taint kept the exporter off it.
-
-    True only when every node the step was still waiting for is pending with
-    ``quiesce_taint_present`` and no node was observed failing: the step's
-    verdict is "could not look", not "looked and found a fault". Both ladders
-    read this and climb on neither -- a REPLACE_NODE after such a validation
-    replaces a node nothing was learned about.
-    """
-
-    if details is None:
-        return False
-    pending = details.get("node_pending")
-    if not isinstance(pending, Mapping) or not pending:
-        return False
-    if details.get("failed_nodes_observed") or details.get("node_failures_observed"):
-        return False
-    if details.get("failed_nodes") or details.get("node_failures"):
-        return False
-    return all(
-        isinstance(record, Mapping) and record.get("quiesce_taint_present") is True
-        for record in pending.values()
-    )
-
-
 def unknown_outcome_failure(details: Mapping[str, Any] | None) -> bool:
     """Whether a FAILED step's details say its outcome is not actually known.
 
@@ -428,11 +416,10 @@ def _unknown_outcome_failures(
     ]
 
 
-def _unobserved_validation_failures(
+def _latest_failed_validation(
     executions: list[WorkflowStepExecution],
-) -> list[WorkflowStepExecution]:
-    """The record's latest FAILED step, when it is a validation that could not
-    observe its node (``validation_unobserved_failure``); else empty.
+) -> WorkflowStepExecution | None:
+    """The record's latest FAILED step when it is a validation; else ``None``.
 
     The latest failure is the one the ladder stopped on: an earlier FAILED
     reset was answered by the reboot rung that ran after it, and classifying
@@ -449,26 +436,24 @@ def _unobserved_validation_failures(
         key=lambda execution: execution.step_index,
         default=None,
     )
-    if (
-        latest is None
-        or latest.operation not in _VALIDATION_OPERATIONS
-        or not validation_unobserved_failure(latest.details)
-    ):
-        return []
-    return [latest]
+    if latest is None or latest.operation not in _VALIDATION_OPERATIONS:
+        return None
+    return latest
 
 
 def _no_verdict_classification(
-    executions: list[WorkflowStepExecution],
+    workflow: WorkflowRequest,
 ) -> tuple[str, RecoveryAction, WorkflowOperation, list[WorkflowStepExecution]] | None:
     """The operator hand-offs for a record whose failure carries no hardware
     verdict: an unknown outcome (the step may have run, or may still be
-    running -- an operator confirms, no rung is climbed on a guess), or a
+    running -- an operator confirms, no rung is climbed on a guess), a
     validation that could not look at the node because the product's own
     quiesce taint kept the exporter off it (no verdict, no rung, no
-    quarantine -- the operator's restore lifts the taint)."""
+    quarantine -- the operator's restore lifts the taint), or a validation a
+    bound failed before it observed any failure while its plan asked for an
+    escalation (``withheld_escalation``: the request was for a verdict)."""
 
-    unknown_failures = _unknown_outcome_failures(executions)
+    unknown_failures = _unknown_outcome_failures(workflow.step_executions)
     if unknown_failures:
         return (
             MANUAL_CONFIRMATION_STAGE,
@@ -476,15 +461,21 @@ def _no_verdict_classification(
             WorkflowOperation.ESCALATE_SUPPORT,
             unknown_failures,
         )
-    unobserved = _unobserved_validation_failures(executions)
-    if unobserved:
-        return (
-            VALIDATION_UNOBSERVED_STAGE,
-            RecoveryAction.ESCALATE_OPERATOR,
-            WorkflowOperation.ESCALATE_SUPPORT,
-            unobserved,
-        )
-    return None
+    latest = _latest_failed_validation(workflow.step_executions)
+    if latest is None:
+        return None
+    if validation_unobserved_failure(latest.details):
+        stage = VALIDATION_UNOBSERVED_STAGE
+    elif withheld_escalation(workflow, latest) is not None:
+        stage = VALIDATION_EVIDENCE_MISSING_STAGE
+    else:
+        return None
+    return (
+        stage,
+        RecoveryAction.ESCALATE_OPERATOR,
+        WorkflowOperation.ESCALATE_SUPPORT,
+        [latest],
+    )
 
 
 def _refused_containment(
@@ -595,6 +586,7 @@ def _escalation_operations(
         CONTAINMENT_REFUSED_STAGE,
         NODE_ACTION_REFUSED_STAGE,
         VALIDATION_UNOBSERVED_STAGE,
+        VALIDATION_EVIDENCE_MISSING_STAGE,
     ):
         # The adapter refused the isolation (absent node, foreign
         # generation): there is nothing this workflow can isolate, and
@@ -602,7 +594,9 @@ def _escalation_operations(
         # only reproduces the refusal. Evidence and the hand-off remain. The
         # Node Agent's attested refusal takes the same shape: the chain's
         # cordon is on the node, nothing was applied to it, and a quarantine
-        # would isolate a healthy node (live, gpu-eks-cluster).
+        # would isolate a healthy node (live, gpu-eks-cluster). A validation
+        # that could not look learned nothing to isolate on either: the node
+        # keeps whatever cordon its own chain placed.
         operations = [WorkflowOperation.FREEZE_EVIDENCE]
     elif next_action is RecoveryAction.DRAIN:
         operations = [
@@ -796,7 +790,7 @@ class HardwareEscalationService:
         handled, verdict = _pre_action_classification(failed_executions)
         if handled:
             return verdict
-        hand_off = _no_verdict_classification(workflow.step_executions)
+        hand_off = _no_verdict_classification(workflow)
         if hand_off is not None:
             return hand_off
         failed_operation_set = {execution.operation for execution in failed_executions}
@@ -829,23 +823,11 @@ class HardwareEscalationService:
                 )
                 for step in workflow.official_steps[: execution.step_index]
             }
-        requested_escalations = {
-            str(
-                workflow.official_steps[execution.step_index].parameters.get(
-                    "failure_escalation_action"
-                )
-            )
-            for execution in workflow.step_executions
-            if (
-                execution.status is WorkflowStepStatus.FAILED
-                and execution.step_index < len(workflow.official_steps)
-                and workflow.official_steps[execution.step_index].parameters.get(
-                    "failure_escalation_action"
-                )
-            )
-        }
+        # The plan's own requests, less a validation's that observed no
+        # failure (``validation_evidence.requested_escalations``).
+        requested = requested_escalations(workflow)
         if (
-            RecoveryAction.REBOOT_NODE.value in requested_escalations
+            RecoveryAction.REBOOT_NODE.value in requested
             and WorkflowOperation.RESTART_NODE not in recovery_context_operations
         ):
             failed_stage = "efa_recovery"
@@ -1026,8 +1008,10 @@ class HardwareEscalationService:
             failed_nodes.update(selected)
             reported_failures = execution.details.get("node_failures", {})
             # A validation that never observed the node has no failure to
-            # report; its pending reason names what kept it from looking (and
-            # the operator's exit), which is what the hand-off should carry.
+            # report; its pending record names what kept it from looking --
+            # the adapter's reason (and the operator's exit) when it wrote
+            # one, else the missing evidence itself -- which is what the
+            # hand-off should carry (``missing_evidence_reason``).
             pending = execution.details.get("node_pending")
             pending = pending if isinstance(pending, dict) else {}
             for node_id in selected:
@@ -1035,8 +1019,8 @@ class HardwareEscalationService:
                 if not isinstance(reasons, list):
                     reasons = [str(reasons)]
                 if not reasons and isinstance(pending.get(node_id), dict):
-                    reason = pending[node_id].get("reason")
-                    if isinstance(reason, str) and reason:
+                    reason = missing_evidence_reason(pending[node_id])
+                    if reason:
                         reasons = [reason]
                 node_failures.setdefault(node_id, []).extend(
                     str(reason) for reason in reasons
@@ -1297,6 +1281,7 @@ class HardwareEscalationService:
                 f"{failed_stage} remediation failed; "
                 f"failed operation or validation: {failed}; "
                 f"nodes: {node_reason}",
+                *withheld_escalation_reasons(workflow),
                 *list(dict.fromkeys(diagnostic_evidence)),
                 *list(dict.fromkeys(diagnostic_guidance)),
             ],

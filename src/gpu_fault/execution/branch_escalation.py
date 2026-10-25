@@ -41,8 +41,8 @@ from gpu_fault.orchestration.escalation import (
     next_rung,
     node_action_refused_before_acting,
     unknown_outcome_failure,
-    validation_unobserved_failure,
 )
+from gpu_fault.orchestration.validation_evidence import validation_unobserved_failure
 
 if TYPE_CHECKING:
     from gpu_fault.orchestration.dag_branching import DagBrancher

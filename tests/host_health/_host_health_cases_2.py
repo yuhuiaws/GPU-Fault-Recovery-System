@@ -9,6 +9,7 @@ import pytest
 from gpu_fault.adapters.gpu_validation import GpuValidationAdapter
 from gpu_fault.app import ApplicationContext
 from gpu_fault.execution import WorkflowExecutionRequest, WorkflowStepContext
+from gpu_fault.execution.step_bounds import bounded_waiting_outcome
 from gpu_fault.gpu_metrics import GpuMetricSample, GpuMetricSource
 from gpu_fault.host_health import (
     HostMetricSample,
@@ -531,6 +532,72 @@ def test_excess_efa_device_diagnostic_validation_judges_fresh_inventory_without_
     readings.host_row("efa_inventory_active_count", 16, now - timedelta(seconds=1))
     _, cleared = _validate_fabric(context, workflow, readings)
     assert cleared.status is WorkflowStepStatus.SUCCEEDED, cleared
+
+
+def test_inactive_efa_link_diagnostic_validation_with_dark_collectors_goes_to_an_operator() -> (
+    None
+):
+    """GF-GENERAL-LIVE-013 ``link_inactive`` with the node's collectors dark:
+    the diagnostic chain's VALIDATE_FABRIC waits on
+    ``missing_or_stale_collectors``, the 600 s per-step cap fails the wait, and
+    the plan's REBOOT_NODE request is withheld -- the record goes to an
+    operator with the missing evidence named, no RESTART_NODE. Live: the cap's
+    failure rebooted a node nothing had been learned about."""
+
+    context = build_context()
+    workflow = _efa_inventory_diagnostic_chain(context, "LINK_INACTIVE", "15")
+    now = datetime.now(timezone.utc)
+    # Both collectors silent for a quarter of an hour: no reading at all.
+    readings = _FabricReadings(now - timedelta(minutes=15))
+    validated, waiting = _validate_fabric(context, workflow, readings)
+    assert waiting.status is WorkflowStepStatus.WAITING, waiting
+    assert waiting.details["node_pending"]["node-a"] == {
+        "missing_or_stale_collectors": ["GPU_METRICS", "HOST_TELEMETRY"]
+    }, waiting.details
+    assert waiting.details["node_failures_observed"] == {}, waiting.details
+
+    # The real per-step cap fails the wait the step has been in for 603 s.
+    step = validated.official_steps[1]
+    waited = copy_model(
+        validated,
+        step_executions=[
+            *validated.step_executions,
+            workflow_step_execution(
+                1,
+                WorkflowOperation.VALIDATE_FABRIC,
+                WorkflowStepStatus.WAITING,
+                details=waiting.details,
+                started_at=now - timedelta(seconds=603),
+            ),
+        ],
+    )
+    executor = SimpleNamespace(
+        config=SimpleNamespace(
+            step_waiting_limit=lambda operation: 600,
+            step_waiting_warning_limit=lambda operation: 300,
+            node_busy_wait_seconds=240,
+        ),
+        store=None,
+    )
+    capped = bounded_waiting_outcome(executor, waited, step, 1, waiting)
+    assert capped.status is WorkflowStepStatus.FAILED, capped
+    assert capped.details["step_waiting_timeout_seconds"] == 600, capped.details
+
+    escalation = _escalation_after_failed_validation(context, validated, capped)
+    assert escalation is not None, "the operator is told"
+    incident, successor = escalation
+    assert incident.effective_action is RecoveryAction.ESCALATE_OPERATOR
+    assert WorkflowOperation.RESTART_NODE not in {
+        step.operation for step in successor.official_steps
+    }, "no reboot on missing evidence"
+    assert any(
+        "missing_or_stale_collectors: GPU_METRICS, HOST_TELEMETRY" in reason
+        for reason in incident.reasons
+    ), incident.reasons
+    assert any(
+        "REBOOT_NODE withheld" in reason and "600s per-step cap" in reason
+        for reason in incident.reasons
+    ), incident.reasons
 
 
 def test_efa_traffic_anomaly_sends_fixed_email(monkeypatch) -> None:

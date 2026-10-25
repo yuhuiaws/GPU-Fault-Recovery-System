@@ -49,6 +49,7 @@ from ._host_health_cases_2 import (
     test_host_telemetry_endpoint_builds_quarantine_workflow,
     test_inactive_efa_link_diagnoses_then_escalates_to_reboot,
     test_inactive_efa_link_diagnostic_validation_converges_on_fresh_port_state,
+    test_inactive_efa_link_diagnostic_validation_with_dark_collectors_goes_to_an_operator,
     test_kubernetes_efa_allocatable_loss_restarts_device_plugin,
     test_kubernetes_gpu_allocatable_loss_restarts_device_plugin,
     test_node_log_endpoint_classifies_mce_and_nccl,
