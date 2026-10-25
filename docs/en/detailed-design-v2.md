@@ -110,7 +110,10 @@ The schema-v4 business wheels and locked dependencies are pre-installed into the
 (`deploy/image/Dockerfile`: CPU and Executor run the entry points under `/opt/gpu-fault/control-plane` and
 `/opt/gpu-fault/executor` respectively; the container directly execs the uvicorn/entry point of that venv), and business Pods
 do not run `pip install` at startup. The `/artifact` ConfigMap volume stores only xz-compressed wheels
-(`<wheel>.whl.xz`, `src/gpu_fault/admin/artifact_configmaps.py`) for digest verification and recovery: it is
+(`<wheel>.whl.xz`, `src/gpu_fault/admin/artifact_configmaps.py`) for digest verification and recovery; once the xz
+stream itself exceeds the 1 MiB ConfigMap ceiling (the control-plane wheel's xz stream has reached 1,051,472 bytes) it
+becomes a chunked set: the named ConfigMap holds only `artifact.json` (file name, sha256, encoding and the part list), the
+parts live in `<name>-part-<k>`, the parts are created before the manifest and every reader re-hashes them part by part. It is
 part of signed-artifact delivery and audit, not an online dependency installation source, and nothing reads it at runtime; the Node bundle
 is additionally paired with an offline dependency image at a fixed digest. The regional
 orchestrator judges the blast radius by component `module_digest`, so control-plane changes no longer require rolling GPUs or nodes.
@@ -3428,9 +3431,12 @@ rule out that state.
 A rule change = swapping the wheel, and swapping the wheel has six places that must all be changed at once; missing one fails closed:
 
 1. the wheel ConfigMap (**both clusters**; `upload_config_map` runs
-   `kubectl create configmap --from-file=<wheel>.whl.xz=<file>` when the object does not exist, and only reads back and compares the digest when it does,
-   with no `apply`: the ConfigMap ceiling is 1 MiB and the control-plane wheel has outgrown it, so it is stored xz-compressed, and
-   `apply` would also write the whole object into the last-applied annotation and exceed the limit again);
+   `kubectl create configmap --from-file=<wheel>.whl.xz=<file>` when the object does not exist, and when the xz stream is over 1 MiB
+   creates the `<name>-part-<k>` parts first and the named ConfigMap holding only `artifact.json` last; an existing object of either
+   layout is only read back, re-hashed part by part and compared, with no `apply`: the ConfigMap ceiling is 1 MiB, the control-plane
+   wheel's xz stream has outgrown it, and `apply` would also write the whole object into the last-applied annotation and exceed the
+   limit again. The preflight check `artifact_config_maps` derives every artifact's layout from the local files before any object is
+   created; the bundle cannot be split -- the installer Job reads it from its mount -- so over the limit is FAIL and near it is WARN);
 2. the bundle ConfigMap;
 3. the references in the template ConfigMap;
 4. **every Deployment with `replicas>0`** (including the data-plane executor, completion-watcher,

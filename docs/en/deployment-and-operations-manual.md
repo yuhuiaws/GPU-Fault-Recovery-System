@@ -1792,26 +1792,18 @@ PY
 
 WHEEL_SHA256="$(sha256sum "${WHEEL}" | awk '{print $1}')"
 WHEEL_CM="gpu-fault-control-plane-wheel-0100-${WHEEL_SHA256:0:12}"
-# The ConfigMap stores the xz-compressed wheel (key name <wheel>.xz): the ConfigMap limit is 1 MiB,
-# which the control-plane wheel already exceeds; the runtime image ships the installed wheel, and no component installs it from the mount.
-WHEEL_KEY="$(basename "${WHEEL}").xz"
-
-if kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
-  get configmap "${WHEEL_CM}" >/dev/null 2>&1; then
-  CONFIG_MAP_SHA256="$(
-    kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
-      get configmap "${WHEEL_CM}" -o json |
-    jq -er --arg key "${WHEEL_KEY}" '.binaryData[$key]' |
-    base64 -d | xz -d |
-    sha256sum | awk '{print $1}'
-  )"
-  test "${CONFIG_MAP_SHA256}" = "${WHEEL_SHA256}"
-else
-  xz -9 -k -c "${WHEEL}" > "/tmp/${WHEEL_KEY}"
-  kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
-    create configmap "${WHEEL_CM}" --from-file="${WHEEL_KEY}=/tmp/${WHEEL_KEY}"
-  rm -f "/tmp/${WHEEL_KEY}"
-fi
+# The same writer/reader as the release engine (gpu_fault.admin.artifact_configmaps): while the xz
+# stream fits the 1 MiB ConfigMap ceiling it is one object (key name <wheel>.xz); past it, a chunked set
+# (the named ConfigMap holds only artifact.json, the parts live in <name>-part-<k>). An existing object is
+# never rewritten: it is read back, re-hashed part by part and compared with the wheel's own sha256. The
+# runtime image ships the installed wheel, and no component installs it from the mount.
+CONFIG_MAP_SHA256="$(
+  PYTHONPATH=src python3.12 -m gpu_fault.admin.artifact_configmaps \
+    --kubeconfig "${CPU_KUBECONFIG}" --namespace "${NAMESPACE}" \
+    upload --name "${WHEEL_CM}" --artifact "${WHEEL}" --compress --splittable |
+  jq -er '.sha256'
+)"
+test "${CONFIG_MAP_SHA256}" = "${WHEEL_SHA256}"
 
 sed "s/gpu-fault-control-plane-wheel-0100/${WHEEL_CM}/g" \
   deploy/control-plane/regional/aurora-credential-refresh.yaml \
@@ -2565,24 +2557,16 @@ PYTHONPATH=src python3.12 -m gpu_fault.config_cli validate \
 kubectl --kubeconfig "${CPU_KUBECONFIG}" apply \
   -f deploy/control-plane/regional/regional-control-plane-prerequisites.yaml
 
-if kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
-  get configmap "${WHEEL_CONFIG_MAP}" >/dev/null 2>&1; then
-  export CONFIG_MAP_SHA256="$(
-    kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
-      get configmap "${WHEEL_CONFIG_MAP}" -o json |
-    jq -r --arg key "$(basename "${WHEEL}").xz" '.binaryData[$key]' |
-    base64 -d | xz -d |
-    sha256sum | awk '{print $1}'
-  )"
-  test "${CONFIG_MAP_SHA256}" = "${ARTIFACT_SHA256}"
-else
-  # Consistent with gpu-fault-admin: the wheel is stored xz-compressed in the ConfigMap (key name <wheel>.xz).
-  xz -9 -k -c "${WHEEL}" > "/tmp/$(basename "${WHEEL}").xz"
-  kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
-    create configmap "${WHEEL_CONFIG_MAP}" \
-    --from-file="$(basename "${WHEEL}").xz=/tmp/$(basename "${WHEEL}").xz"
-  rm -f "/tmp/$(basename "${WHEEL}").xz"
-fi
+# The same writer/reader as gpu-fault-admin: one object while the xz stream fits 1 MiB (key name
+# <wheel>.xz), a chunked set past it (the named ConfigMap holds only artifact.json, the parts live in
+# <name>-part-<k>); an existing object is read back, re-hashed part by part and compared, never rewritten.
+export CONFIG_MAP_SHA256="$(
+  PYTHONPATH=src python3.12 -m gpu_fault.admin.artifact_configmaps \
+    --kubeconfig "${CPU_KUBECONFIG}" --namespace "${NAMESPACE}" \
+    upload --name "${WHEEL_CONFIG_MAP}" --artifact "${WHEEL}" --compress --splittable |
+  jq -er '.sha256'
+)"
+test "${CONFIG_MAP_SHA256}" = "${ARTIFACT_SHA256}"
 ```
 
 The release metadata values come from the Executor/Node Runtime artefacts, bundle/template, image digests and the final Node Agent configuration
@@ -2849,6 +2833,9 @@ KUBECONFIG_PATH="${CPU_KUBECONFIG}" NAMESPACE="${NAMESPACE}" \
 On the GPU side replace `KUBECONFIG_PATH` with `KUBE_CONTEXT="${GPU_EKS_CONTEXT}"`.
 `deploy/hyperpod/deploy.sh` already calls it automatically after creating the ConfigMap
 (`GPU_FAULT_PRUNE_WHEELS=false` skips it), so that path needs no manual execution.
+The `<name>-part-<k>` parts of a chunked set are kept or reclaimed together with their named
+ConfigMap (workloads mount only the named ConfigMap; a part itself never has a holder); orphan
+parts whose named ConfigMap no longer exists (an interrupted upload) are reclaimed by age the same way.
 
 The script's retention rules -- **deleting one wrong object breaks rollback, so none of the three can be omitted**:
 
@@ -4268,32 +4255,20 @@ export EXECUTOR_COMPATIBILITY_DIGEST="$(
 [[ "${ARTIFACT_SHA256}" =~ ^[0-9a-f]{64}$ ]]
 export WHEEL_CONFIG_MAP="gpu-fault-executor-wheel-0100-${ARTIFACT_SHA256:0:12}"
 
-if kubectl --context "${GPU_EKS_CONTEXT}" -n "${NAMESPACE}" \
-  get configmap "${WHEEL_CONFIG_MAP}" >/dev/null 2>&1; then
-  # When the key name ends in .xz, decompress before verifying (the release engine stores the wheel xz-compressed).
-  EXISTING_WHEEL_KEY="$(
-    kubectl --context "${GPU_EKS_CONTEXT}" -n "${NAMESPACE}" \
-      get configmap "${WHEEL_CONFIG_MAP}" -o json |
-    jq -r '.binaryData | keys[0]'
-  )"
-  EXISTING_WHEEL_SHA="$(
-    kubectl --context "${GPU_EKS_CONTEXT}" -n "${NAMESPACE}" \
-      get configmap "${WHEEL_CONFIG_MAP}" -o json |
-    jq -r --arg key "${EXISTING_WHEEL_KEY}" '.binaryData[$key]' |
-    base64 -d |
-    { if [[ "${EXISTING_WHEEL_KEY}" == *.xz ]]; then xz -d; else cat; fi; } |
-    sha256sum | awk '{print $1}'
-  )"
-  test "${EXISTING_WHEEL_SHA}" = "${ARTIFACT_SHA256}"
-else
-  # Consistent with the release engine: store the xz-compressed wheel under the key <wheel>.whl.xz. This ConfigMap is only
-  # a pin/identity artefact; the Executor runs from the signed image (the image has the executor built in, PATH points at
-  # /opt/gpu-fault/executor/bin) and does not pip install from /artifact inside the Pod.
-  xz -9e -c "${EXECUTOR_WHEEL}" > "/tmp/$(basename "${EXECUTOR_WHEEL}").xz"
-  kubectl --context "${GPU_EKS_CONTEXT}" -n "${NAMESPACE}" \
-    create configmap "${WHEEL_CONFIG_MAP}" \
-    --from-file="$(basename "${EXECUTOR_WHEEL}").xz=/tmp/$(basename "${EXECUTOR_WHEEL}").xz"
-fi
+# The same writer/reader as the release engine: one object under the key <wheel>.whl.xz while the xz
+# stream fits 1 MiB, a chunked set past it (the named ConfigMap holds only artifact.json, the parts live
+# in <name>-part-<k>); an existing object of any layout (the raw-wheel key of older releases included)
+# is read back, re-hashed and compared, never rewritten. This ConfigMap is only a pin/identity
+# artefact; the Executor runs from the signed image (the image has the executor built in, PATH points
+# at /opt/gpu-fault/executor/bin) and does not pip install from /artifact inside the Pod.
+EXISTING_WHEEL_SHA="$(
+  PYTHONPATH=src python3.12 -m gpu_fault.admin.artifact_configmaps \
+    --context "${GPU_EKS_CONTEXT}" --namespace "${NAMESPACE}" \
+    upload --name "${WHEEL_CONFIG_MAP}" --artifact "${EXECUTOR_WHEEL}" \
+    --compress --splittable |
+  jq -er '.sha256'
+)"
+test "${EXISTING_WHEEL_SHA}" = "${ARTIFACT_SHA256}"
 
 # The GPU side also accumulates wheel ConfigMaps (98 measured on 2026-08-01); reclaim after the rollout completes;
 # protect the one just built -- it is not yet referenced by any workload.
@@ -6011,16 +5986,13 @@ export NEW_COMPATIBILITY_DIGEST="$(
 export NEW_CONFIG_MAP="gpu-fault-executor-wheel-0100-${NEW_WHEEL_SHA:0:12}"
 
 # This ConfigMap is only a pin/identity artefact: the runtime image has the executor built in (PATH points at
-# /opt/gpu-fault/executor/bin) and the Pod does not install from /artifact. When creating by hand stay consistent with the release
-# engine: store the xz-compressed wheel under the key <wheel>.whl.xz.
-if ! kubectl --context "${GPU_EKS_CONTEXT}" -n "${NAMESPACE}" \
-  get configmap "${NEW_CONFIG_MAP}" >/dev/null 2>&1; then
-  # The identity artefact matches the releaser, using .whl.xz; the running code still comes from the signature-verified image.
-  xz -9e -c "${NEW_WHEEL}" > "/tmp/$(basename "${NEW_WHEEL}").xz"
-  kubectl --context "${GPU_EKS_CONTEXT}" -n "${NAMESPACE}" \
-    create configmap "${NEW_CONFIG_MAP}" \
-    --from-file="$(basename "${NEW_WHEEL}").xz=/tmp/$(basename "${NEW_WHEEL}").xz"
-fi
+# /opt/gpu-fault/executor/bin) and the Pod does not install from /artifact. When creating by hand use the release
+# engine's own writer: one object under the key <wheel>.whl.xz while the xz stream fits 1 MiB, a chunked set past it
+# (the named ConfigMap holds only artifact.json, the parts live in <name>-part-<k>); an existing set is verified,
+# never rewritten, and the running code still comes from the signature-verified image.
+PYTHONPATH=src python3.12 -m gpu_fault.admin.artifact_configmaps \
+  --context "${GPU_EKS_CONTEXT}" --namespace "${NAMESPACE}" \
+  upload --name "${NEW_CONFIG_MAP}" --artifact "${NEW_WHEEL}" --compress --splittable
 
 # The IRSA role annotation must be replaced together. The manifest holds a placeholder, and **missing the replacement is worse than not writing it**:
 # apply would overwrite the correct eks.amazonaws.com/role-arn on the ServiceAccount with
