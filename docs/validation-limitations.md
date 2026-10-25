@@ -1545,9 +1545,13 @@ it proves, and what it does not:
   (built on the store-level variants' `SeededRestartBudget`, same `gl29hc-…`
   test job id and cleanup) reserves `restart_count == budget` through
   `store.reserve_job_restart` -- the call the executor's claim preflight makes
-  -- and records the product's refusal of one more reservation; the managed
-  training job is then created under that id with `restart_budget` 1. The
-  product cannot tell the seed from a consumed budget, but the spec's
+  -- and records the product's refusal of one more reservation. The managed
+  training job is created first under that id with `restart_budget` 1 (the
+  runner's managed-job contract: its `kubectl create` is the variant's first
+  cluster mutation and no store record is read before it; the ledger cleanup
+  is armed ahead of the job so the LIFO stack releases it last), the seed
+  follows once the job is RUNNING. The product cannot tell the seed from a
+  consumed budget, but the spec's
   "consume the budget through legitimate failures" sentence is proved by
   `budget_consumed` / 028 `one_restart`, not here.
 - The contrast with GF-REGIONAL-ISO-007 (software XID 11, budget 0, never run

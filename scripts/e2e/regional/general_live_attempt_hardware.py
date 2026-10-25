@@ -12,7 +12,13 @@ its index superseded, the repair steps go ahead, and the workflow ends FAILED
 with the incident ESCALATED once RESTORE_SCHEDULING has run
 (``executor._fail_with_reason``).
 
-Mechanism (every piece reused, nothing reinvented):
+Mechanism (every piece reused, nothing reinvented). Run order: the managed
+job is created first -- the runner's managed-job contract
+(``tests/regional/test_general_live_managed_job_start.py``): its ``kubectl
+create`` is the variant's first cluster mutation and no store record is read
+before it -- then the read-only GPU survey, then the ledger seed, then the
+fault; the ledger cleanup is registered before the job so the LIFO stack still
+releases it after the job is gone:
 
 * the budget: ``ExhaustedRestartBudget`` builds on lane SMALL's
   ``SeededRestartBudget`` -- same ``gl29<tag>-<digest>-a<attempt>`` test job id,
@@ -379,9 +385,12 @@ class ExhaustedRestartBudget(SeededRestartBudget):
     (release this run's reservations, remove the emptied row). The seed takes
     ``budget`` reservations under this run's own workflow id -- the same
     ``reserve_job_restart`` the executor's claim preflight calls -- and one
-    more that the product must refuse. The cleanup goes on the LIFO stack
-    before the first write, and raises when the row is not provably gone, so
-    the runner's teardown records a failed undo.
+    more that the product must refuse. ``register`` puts the cleanup on the
+    LIFO stack before the managed job is started (so the ledger is released
+    only after the job is gone); ``exhaust`` registers too, before its one
+    write. The cleanup is a no-op while nothing was seeded -- it reads no
+    store record -- and raises when a seeded row is not provably gone, so the
+    runner's teardown records a failed undo.
     """
 
     def __init__(
@@ -390,6 +399,7 @@ class ExhaustedRestartBudget(SeededRestartBudget):
         super().__init__(ctx, tag=tag, budget=budget)
         if self.budget < 1:
             raise ValueError("an exhausted ledger needs a budget of at least 1")
+        self._cleanup_armed = False
         self._seeded = False
 
     @property
@@ -399,12 +409,22 @@ class ExhaustedRestartBudget(SeededRestartBudget):
             for index in range(self.budget)
         ]
 
+    @property
+    def seeded(self) -> bool:
+        return self._seeded
+
+    def register(self) -> None:
+        """Put the ledger cleanup on the LIFO stack once (before the job)."""
+
+        if not self._cleanup_armed:
+            self.ctx.cleanup.push(self.cleanup_name, self.cleanup)
+            self._cleanup_armed = True
+
     def exhaust(self) -> dict[str, Any]:
         """Seed the ledger to ``budget``/``budget``; NOT_RUN on a preexisting row."""
 
-        if not self._seeded:
-            self.ctx.cleanup.push(self.cleanup_name, self.cleanup)
-            self._seeded = True
+        self.register()
+        self._seeded = True
         value = self.ctx.regional.cpu_python(
             SEED_PROBE,
             "seed",
@@ -425,6 +445,10 @@ class ExhaustedRestartBudget(SeededRestartBudget):
         return value
 
     def cleanup(self) -> dict[str, Any]:
+        if not self._seeded:
+            # Registered ahead of the job, never written: nothing to release,
+            # and no store read in a teardown that may run with no API Pod.
+            return {"mode": "cleanup", "skipped": "nothing seeded", "clean": True}
         value = super().cleanup()
         errors = cleanup_errors(value)
         if errors:
@@ -1098,9 +1122,14 @@ def validated_restore(ctx: VariantContext, incident_id: str) -> list[str]:
 
 def hardware_chain_continues(ctx: VariantContext) -> dict[str, Any]:
     entry = require_reset_grade(HARDWARE_XID)
+    budget = ExhaustedRestartBudget(ctx)
+    # The ledger cleanup is armed before the job (LIFO: released after the job
+    # is gone); the job's create is the first cluster mutation and no store
+    # record is read before it (the runner's managed-job contract).
+    budget.register()
+    job = start_job(ctx, name=budget.job_id, restart_budget=budget.budget)
     survey = run_gpu_survey(ctx)
     gpu, pci_bdf = target_gpu(survey, entry)
-    budget = ExhaustedRestartBudget(ctx)
     seeded = budget.exhaust()
     seed_problems = seed_errors(
         seeded, budget=budget.budget, reservation_ids=budget.seed_reservation_ids
@@ -1109,7 +1138,6 @@ def hardware_chain_continues(ctx: VariantContext) -> dict[str, Any]:
         raise VariantInconclusive(
             "the exhausted ledger was not established: " + "; ".join(seed_problems)
         )
-    job = start_job(ctx, name=budget.job_id, restart_budget=budget.budget)
     since = utc_now()
     injection = inject_kernel_xid(
         ctx,

@@ -780,13 +780,15 @@ fail-closed（`RESTART_RESERVATION_MISSING`）；对照组：同一步骤补全�
 
 029 `hardware_chain_continues`（`general_live_attempt_hardware.py`；注入为 live-replay，动作为产品
 原生节点动作；需 `--approve GPU_RESET --approve KERNEL_SOURCE_REPLAY`，标志 `X`，risk H，两条
-lane）：预算耗尽时只扣住 RESTART_WORKLOAD、既定 STOP/硬件恢复/验证仍有实际回执的实证。步骤：
-（1）`ExhaustedRestartBudget`（复用 store 层变体的 `SeededRestartBudget`：同一 `gl29hc-…` 测试
-job id、同一清理）经产品自身的 `store.reserve_job_restart`（claim 预检所用的同一调用）把该 job 的
-账本预留到 `restart_count == budget`（预算 1），再多预留一次并要求产品拒绝——耗尽由产品 API
-自证，不直接改计数；（2）以同一 job id 启动受管单节点训练任务（真实 CUDA 负载与心跳、
-`restart_budget` 1），等到 Running，使内核 XID 遇到节点上唯一的活动 attempt；（3）经 lane K 的
-kmsg 内核源回放（`inject_kernel_xid` 配本模块的 reset-grade 目录门禁 `require_reset_grade`）
+lane）：预算耗尽时只扣住 RESTART_WORKLOAD、既定 STOP/硬件恢复/验证仍有实际回执的实证。步骤
+（遵守受管任务约定：任务的 `kubectl create` 是变体的第一个集群变更，此前不读任何 store 记录，见
+`tests/regional/test_general_live_managed_job_start.py`）：（1）先登记账本清理（LIFO 中位于任务
+之后释放），以派生的 `gl29hc-…` 测试 job id 启动受管单节点训练任务（真实 CUDA 负载与心跳、
+`restart_budget` 1），等到 Running，使内核 XID 遇到节点上唯一的活动 attempt；（2）只读 GPU
+survey 选定最高索引 GPU 及其 PCI BDF，随后 `ExhaustedRestartBudget`（复用 store 层变体的
+`SeededRestartBudget`：同一测试 job id、同一清理）经产品自身的 `store.reserve_job_restart`
+（claim 预检所用的同一调用）把该 job 的账本预留到 `restart_count == budget`（预算 1），再多预留
+一次并要求产品拒绝——耗尽由产品 API 自证，不直接改计数；（3）经 lane K 的 kmsg 内核源回放（`inject_kernel_xid` 配本模块的 reset-grade 目录门禁 `require_reset_grade`）
 写入一条审阅过的 `NVRM: Xid (PCI:<bdf>): 46, …` 行，点名最高索引 GPU 的 PCI BDF：XID 46
 `ROBUST_CHANNEL_GPU_TIMEOUT_ERROR`（`src/gpu_fault/data/nvidia-xid-catalog-610.generated.yaml`
 第 462-473 行：`immediateAction: RESET_GPU`、产品族 A100/H100/B100/GB200、无 xid154Linkage；
@@ -812,8 +814,8 @@ cordon/归属注解/taint（QUARANTINED 或仍隔离即 FAIL，并经产品验�
 reservation 未变（扣住的 restart 不预留）；RESET_GPU 回执之后有新的 GPU_METRICS batch 且无活动
 finding；复位若卸载了空闲显示栈必须已装回（RESET_GPU 步骤的 `display_stack_restored`；
 `gpu_reset_busy_attempts` 记入结果）。硬件链被跳过或 RESTART_WORKLOAD 实跑为 FAIL；夹具未收到行
-或行未成为 KERNEL_LOG 事件为 INCONCLUSIVE；XID 非 reset-grade、节点无 PCI BDF、已有账本行等在
-触碰节点前记 NOT_RUN。清理为 LIFO：kmsg 窗口（已提前关闭，自带 `systemd-run --on-active`
+或行未成为 KERNEL_LOG 事件为 INCONCLUSIVE；XID 非 reset-grade 在任何变更前记 NOT_RUN，节点无
+PCI BDF、已有账本行等在注入故障前记 NOT_RUN（此时测试任务已启动，由清理栈删除）。清理为 LIFO：kmsg 窗口（已提前关闭，自带 `systemd-run --on-active`
 deadman）→ 删除测试任务与预热 Pod → 经产品 API 释放播种的 reservation 并删除清空的测试行（行
 未证明消失即抛错，整项 FAIL）。账本行与任务是控制面/集群侧测试对象：运行器中途死亡只会留下一行
 只扣住该测试 job 的 `gl29hc-…` 账本，下次同 attempt 重跑拒绝（NOT_RUN）并由其清理移除，与 store

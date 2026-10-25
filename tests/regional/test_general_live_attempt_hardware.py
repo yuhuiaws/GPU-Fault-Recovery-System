@@ -688,9 +688,11 @@ def test_hardware_chain_passes_and_cleans_up_lifo(tmp_path: Path) -> None:
         f"{out['job_id']}-workflow/0/RESTART_WORKLOAD"
     ]
     assert out["kernel_replay"]["mode"] == "kmsg" and out["kernel_replay"]["xid"] == 46
-    # The seed came first, then the job, then the fault; the window closed as
-    # soon as the decision existed, before the chain was read.
-    assert FakeJob.log[:2] == ["seed", "job-start"], FakeJob.log
+    # The job came first (its create is the variant's first cluster mutation,
+    # no store record read before it), then the seed, then the fault; the
+    # window closed as soon as the decision existed, before the chain was read.
+    assert FakeJob.log[:2] == ["job-start", "seed"], FakeJob.log
+    assert scenario.calls[0] == "seed", "no store record is read before the job"
     assert kernel_calls(ctx) == [
         "install-records",
         "open-window",
@@ -1016,8 +1018,17 @@ def test_inconclusive_when_the_seed_did_not_exhaust(tmp_path: Path) -> None:
         VariantInconclusive, match="exhausted ledger was not established"
     ):
         hw.hardware_chain_continues(ctx)
-    assert FakeJob.created == [], "no job was started on an unproven seed"
-    assert ctx.cleanup.pending() == [f"budget-{seeded_job_id(ctx)}"]
+    # The job was already running (it comes first); the ledger cleanup was
+    # armed ahead of it, so the stack releases the seed after the job is gone.
+    job_id = seeded_job_id(ctx)
+    assert FakeJob.created and FakeJob.created[0].started, "the job ran first"
+    assert ctx.cleanup.pending() == [f"budget-{job_id}", f"job-{job_id}"]
+    assert kernel_calls(ctx) == [], "no fault was injected on an unproven seed"
+    results = ctx.cleanup.run()
+    assert [item["name"] for item in results] == [f"job-{job_id}", f"budget-{job_id}"]
+    assert all(item["ok"] for item in results), results
+    with pytest.raises(NotFoundError):
+        scenario.store.get_restart_budget(CLUSTER, job_id)
 
 
 def test_not_run_before_any_mutation_for_a_code_that_is_not_reset_grade(
@@ -1046,10 +1057,17 @@ def test_seed_refuses_a_preexisting_row_as_not_run_and_cleanup_removes_it(
         hw.hardware_chain_continues(ctx)
     assert info.value.reason == "FIXTURE_NOT_READY"
     assert "preexisting ledger" in info.value.detail
-    assert FakeJob.created == [], "no job on a refused seed"
-    assert ctx.cleanup.pending() == [f"budget-{job_id}"], "the residue cleanup is armed"
+    # The job is created before the seed can be refused (the managed-job
+    # contract); the stack deletes it, then removes the residue row.
+    assert FakeJob.created and FakeJob.created[0].started, "the job ran first"
+    assert kernel_calls(ctx) == [], "no fault on a refused seed"
+    assert ctx.cleanup.pending() == [f"budget-{job_id}", f"job-{job_id}"], (
+        "the residue cleanup is armed behind the job's"
+    )
     results = ctx.cleanup.run()
-    assert results[0]["ok"], results
+    assert [item["name"] for item in results] == [f"job-{job_id}", f"budget-{job_id}"]
+    assert all(item["ok"] for item in results), results
+    assert FakeJob.created[0].cleaned, "the job was deleted"
     with pytest.raises(NotFoundError):
         scenario.store.get_restart_budget(CLUSTER, job_id)
 
@@ -1134,9 +1152,21 @@ def test_exhausted_budget_identity_and_guards(tmp_path: Path) -> None:
     assert budget.seed_reservation_ids == [f"{budget.workflow_id}/0/RESTART_WORKLOAD"]
     with pytest.raises(ValueError, match="at least 1"):
         hw.ExhaustedRestartBudget(ctx, budget=0)
+    # Registering twice arms one undo; before any seed the undo is a no-op
+    # that reads no store record (a teardown may run with no API Pod).
+    budget.register()
+    budget.register()
+    assert ctx.cleanup.pending() == [budget.cleanup_name]
+    assert budget.seeded is False, "nothing seeded yet"
+    assert budget.cleanup() == {
+        "mode": "cleanup",
+        "skipped": "nothing seeded",
+        "clean": True,
+    }
     budget.exhaust()
+    assert budget.seeded is True, "the seed was written"
     # A second seed meets its own row: refused by the probe (NOT_RUN), the
-    # cleanup registered once.
+    # cleanup still registered once.
     with pytest.raises(VariantNotRun, match="preexisting ledger"):
         budget.exhaust()
     assert ctx.cleanup.pending().count(budget.cleanup_name) == 1
