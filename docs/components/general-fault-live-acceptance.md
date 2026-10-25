@@ -235,8 +235,9 @@ run_general_live.py --site-profile <profile> --run-dir <run> \
 限时I/O负载只写专用测试文件，不访问裸盘；记录挂载到块设备的映射。分别达到util/
 latency门槛且跨越默认120秒，另测短flush。用同一设备/同一时间区间的原始diskstats
 独立计算读写平均完成时间，并与iostat对照；不得用GFRS自己的值作为唯一oracle。
-现有weighted I/O time口径若与标准await不符必须报差异/FAIL。零完成I/O、回退不产生
-伪速率。停止负载后实际验证原设备恢复，无reset/reboot；保留原数据卷内容。
+产品`disk_io_await_ms`已改为标准await口径（diskstats字段(4+8)/(1+5)，见故障类别总表
+"磁盘 await 口径"），`reference_iostat`预期PASS；若与标准await不符仍必须报差异/FAIL。
+零完成I/O、回退不产生伪速率（跨越计数器回退的区间不产生样本）。停止负载后实际验证原设备恢复，无reset/reboot；保留原数据卷内容。
 
 ### GF-GENERAL-LIVE-007
 
@@ -535,7 +536,7 @@ Agent过期/非活跃集群单独处理，不伪造成同一种静默。恢复�
 ## 已知缺口和执行入口
 
 本轮补规格，不修改生产检测逻辑。特别需要用测试揭示的已知问题包括：GPU两个库存
-读取失败可能被当成零卡、EFA不支持的错误计数可能报零、disk await口径、必需挂载/
+读取失败可能被当成零卡、EFA不支持的错误计数可能报零、disk await口径（已按标准await修正）、必需挂载/
 真实I/O覆盖、SMART scan失败，以及多GPU字段完整性。这些有正反向验收，但不能
 因尚未修复就宣称全部通过。标准Host/journal/非环境DCGM读取夹具、OEM实验条件、
 千卡/万卡资源也仍是执行前提，不由本文件自动提供。

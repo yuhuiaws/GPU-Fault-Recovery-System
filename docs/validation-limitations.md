@@ -956,8 +956,12 @@ capability-absent variants (no SR-IOV VF netdev, no inactive cluster, no safe
 way to fail the live SES channel) and the dangerous branches that need an
 approval not arranged this phase (watcher network isolation, control-plane
 restart). The implemented verdicts record the known product gaps the spec
-expects to FAIL (the weighted-time disk await and the empty required-interface
-list) rather than masking them. Inode exhaustion is no longer one of them: the
+expects to FAIL rather than masking them; since batch 172 only the empty
+required-interface list remains one. The weighted-time disk await does not: the
+host collector reports iostat's `await` (diskstats fields 4+8 over 1+5, with an
+interval spanning a counter restart re-baselined instead of rated), so 006
+`reference_iostat` expects the product's value and the oracle's standard await
+to agree within the tolerance. Inode exhaustion is no longer one of them: the
 product grades `filesystem_inodes_used_percent` like capacity, so 004
 `inode_full` now expects the full MARK_UNSCHEDULABLE/QUARANTINE chain on the
 inode signal and readmits the node through the validated restore, exactly as
