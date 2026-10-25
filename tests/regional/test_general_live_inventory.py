@@ -401,20 +401,32 @@ REBOOT_WORKFLOW = {
 }
 
 
+SURVEY = {
+    "tools": {},
+    "residue": {},
+    "collector_env": {"GPU_FAULT_HOST_INTERVAL_SECONDS": "15"},
+}
+
+
 def _tree_ctx(
     variant: str,
     *,
     docs: list[dict[str, Any]],
     tmp_path: Path,
     probe: FakeProbe | None = None,
+    interval: str = "15",
 ) -> Any:
     spec = SPECS[variant]
     regional = FakeRegional(cpu_python=store_script({"activity": docs}))
+    survey = {**SURVEY, "collector_env": {"GPU_FAULT_HOST_INTERVAL_SECONDS": interval}}
     return make_context(
         spec,
         tmp_path=tmp_path,
         regional=regional,
-        probes={f"source-replay@{NODE}": probe or _tree_probe()},
+        probes={
+            f"source-replay@{NODE}": probe or _tree_probe(),
+            f"node@{NODE}": FakeProbe({"survey": survey}),
+        },
         settings=make_settings(spec, node=NODE),
         window_minutes=90,
     )
@@ -683,6 +695,21 @@ def test_link_inactive_passes_on_a_bounded_exposure_and_a_fresh_verdict(
         probe=_closing_probe(already_closed=False),
     )
     assert mod.link_inactive(ctx)["closed_by"] == "runner"
+    # The exposure follows the node's own collector interval (the survey).
+    probe = _closing_probe()
+    ctx = _tree_ctx(
+        "link_inactive",
+        docs=_link_docs(),
+        tmp_path=tmp_path,
+        probe=probe,
+        interval="30",
+    )
+    result = mod.link_inactive(ctx)
+    opened = next(call for call in probe.calls if call[0] == "open-window")
+    assert opened[opened.index("--restore-seconds") + 1] == "51", (
+        "1.7 x 30 s: after the second tick, before the third"
+    )
+    assert result["exposure_seconds"] == 51
 
 
 def test_link_inactive_fails_on_the_old_deadline_reboot_gap(tmp_path: Path) -> None:

@@ -60,6 +60,7 @@ from typing import Any
 
 from scripts.e2e.regional.general_live_common import (
     activity,
+    run_survey,
     wait_for_incident,
     wait_settled,
 )
@@ -590,6 +591,9 @@ def link_inactive(ctx: VariantContext) -> dict[str, Any]:
     product: its own close afterwards finds the window already closed.
     """
 
+    # The exposure is sized from the node's own collector interval, so the
+    # survey (collector_env) comes first.
+    run_survey(ctx)
     replay = host_source_replay(ctx)
     _baseline, device, port, active = _real_tree(ctx, replay)
     expected = _expected_efa_count(ctx, active)
