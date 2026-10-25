@@ -738,14 +738,43 @@ IPC 命名空间，udev 在主机命名空间里找不到 Pod 的信号量，cre
   `_bmc` 采集错误记 FAIL（永久能力缺口不应是采集错误）；若节点真的有 BMC 应答则 BLOCKED
   （该变体不适用）。`healthy` 仍 `NOT_RUN(CAPABILITY_ABSENT)`。
 
+- 010 EFA/RDMA 计数（模块 `general_live_efa`，复用夹具 `general_live_efa_fixture`，8 个变体
+  全部 `live-replay`，需 `HOST_SOURCE_REPLAY`，eks/hp 两车道）。每个变体先用共享回放器的
+  只读 `inventory` 读取节点真实 RDMA 树——驱动身份、所属 netdev、每端口 `state`/`phys_state`、
+  `counters`/`hw_counters` 文件名与值、真实 `ethtool -S` 计数器名——写入证据，再只替换一个读取：
+  `rdma_error` 把该端口一个真实计数器文件（优先 `hw_counters/rx_drops`）以真实值 bind 进
+  host collector 单元后加 5000，产品记录须出现同端口 `rdma_errors_delta` 与
+  `rdma_<counter>_delta` ≥ 5000（计数器在产品读数里确实增长才算正向）→ WARNING
+  RUN_DIAGNOSTICS → FREEZE_EVIDENCE + VALIDATE_FABRIC 实际执行（失败须点名该指标）、端口仍被
+  观察、无硬件动作/隔离；`link_inactive` bind 端口 `state` 为 `1: DOWN`（phys_state 真实）→
+  `rdma_link_down=1` → VALIDATE_FABRIC 在故障持有期间必须失败并点名该指标，共现的
+  `efa_inventory_mismatch` 只允许 `LINK_INACTIVE`（只诊断不 reboot），关窗后须有新的
+  `rdma_link_down=0` 读数且 incident 收敛；`rnr`/`retry`/`cq_error` 让经审查的 `ethtool`
+  透传包装器对 EFA 设备所属 netdev 的 `-S` 输出先以 0 再以 5000 提供一个带对应 token 的
+  计数器（真实同 token 计数器优先，否则测试名 `gfrs_<token>_err`），
+  `efa_<group>_errors_delta` → WARNING → 只诊断、不推导坏卡；`missing_counter` 先提供后撤回
+  该计数器（真实名用 `delete_counter`，测试名改为透传），产品须记
+  `efa_ethtool_counters_unsupported` `MISSING_COUNTER` 点名该指标且绝不报零 delta；
+  `ethtool_failed` 让 `-S <netdev>` 以 exit 1（I/O error）返回，产品须记 `_efa_network`
+  采集错误（UNKNOWN）、无零 delta、不误判 NO_STATISTICS、无 finding，包装器审计日志证明产品
+  确实发出该查询并得到该失败；`counter_reset` 在同一窗口让 sysfs 计数器与 ethtool 计数器每半个
+  采集周期递增直到各自出 WARNING，再归 1 继续递增：无负 delta、每个读取器只有一个 incident
+  （重置不是新故障）、重置那一拍记 UNKNOWN 而不是会清除信号的 0 读数。`counter_reset`
+  登记为 expected FAIL（product_gap）：`collectors/host/network.py` `_rdma` 把低于基线的
+  计数器夹成 0 delta 并作为 `rdma_errors_delta=0` 读数上报，`_ethtool_counters` 对同一情形
+  记 UNKNOWN。若节点上没有任何 EFA 功能拥有 netdev，夹具树给第一个 EFA 设备附上节点一个真实
+  物理 netdev（`build-infiniband-fixture --netdev`，netdev 本身不改动）以便产品的 ethtool
+  路径有读数可回放，证据记 `netdev_source: fixture`。清理关窗后用只读 `read-source` 核对
+  单元与 PID 1 读到同一真实 sysfs 值且不等于夹具值。`non_efa` 仍为 CAPABILITY_ABSENT。
+
 其余变体按映射文件留在分母并记 `NOT_RUN`，原因精确可查：
 
-- `FIXTURE_NOT_READY`：010/012 以及 002 `read_failure`、005 `stat_timeout`
-  /`io_only_failure` 需要把 `ethtool`/`nvidia-smi` 的输出或
-  `/proc/meminfo`、EFA `hw_counters`/`state`、`/proc/driver/nvidia` 的读取**只在
-  host collector 单元私有环境里**替换的共享原始源回放夹具。该通用回放器现已由
-  协调方集中审查提供（下文“共享主机原始源回放夹具”），各类别车道在其上接线（007/015
-  已接线，见上）；接线前这些变体仍记 `FIXTURE_NOT_READY`。005 `stat_timeout`/`io_only_failure`
+- `FIXTURE_NOT_READY`：012 以及 002 `read_failure`、005 `stat_timeout`
+  /`io_only_failure` 需要把 `nvidia-smi` 的输出或 `/proc/meminfo`、
+  `/proc/driver/nvidia` 的读取**只在 host collector 单元私有环境里**替换的共享原始源
+  回放夹具。该通用回放器现已由协调方集中审查提供（下文“共享主机原始源回放夹具”），
+  各类别车道在其上接线（007/010/015 已接线，见上）；接线前这些变体仍记
+  `FIXTURE_NOT_READY`。005 `stat_timeout`/`io_only_failure`
   不是文件/命令读取，不在其范围内。
 - `CAPABILITY_ABSENT`：005 的共享存储变体（本站无可扰动的独立 NFS/Lustre export）、
   010 `non_efa`（本站只有 EFA RDMA 设备）、015 `healthy`（EC2 无 BMC；`unsupported_bmc`
@@ -875,12 +904,19 @@ POST 预制 finding。类别模块 `general_live_nccl`/`_nccl_fr`/`_progress`/`_
   （两节点组序号 1200/700 互不比较、成员不混、无 culprit）、`fr_plus_process`
   （write 模式停滞 + completion 推进：`HOST_WRITES_OBSERVED` 与进程 I/O 窗口保留在
   决策中，不被 FR 分支覆盖；D 状态等待无法原生制造）。
+  `broken_pair`（`live-replay`，需 `HOST_SOURCE_REPLAY`，模块 `general_live_nccl_pair`）：
+  两节点任务活跃基线证明后，把目标节点一个 EFA 端口的 `hw_counters/tx_bytes` 在 host
+  collector 单元内 bind 成不可解析文本（共享回放器 bind 模式），再停滞任务并持有超过
+  warning 阈值加一个 health summary；期间探针自己的收发对 oracle 读到真实零流量，而产品记录
+  须为 `efa_traffic_observation_valid=0`、“incomplete traffic counter pair” 采集错误、无速率
+  样本、无 ZERO_WARNING/HUNG（无效观察不开始零流量计数，也不是零）；关窗恢复后仍停滞的任务须
+  在恢复后不早于 60 s 出 ZERO_WARNING（计数只从真实读数开始），释放后流量恢复、warning
+  incident 收敛。
   延后留分母：规模类 `large_job`/`no_step_no_rank`/
   `active_window_resume`（`SCALE`，本站无 128 节点任务）、需 py-spy 故障
   工具的 `pyspy_nonzero`、需角色声明测试任务的 `role_mismatch`/`tid_namespace`/
-  `wchan_zero`/`cpu_interval`（均 `FIXTURE_NOT_READY`）、`broken_pair`（需 sysfs 读取
-  夹具）、`attempt_change`（需可控换 attempt）、`unreachable_node`（隔离 Agent 通道
-  未授批，`NOT_AUTHORIZED`）。
+  `wchan_zero`/`cpu_interval`（均 `FIXTURE_NOT_READY`）、`attempt_change`（需可控换
+  attempt）、`unreachable_node`（隔离 Agent 通道未授批，`NOT_AUTHORIZED`）。
 - **027（eks 或 hp 车道）**：产品训练进度 reporter 默认关闭、全局周期 monitor 必须
   保持关闭；仅测试任务 Pod 内以 `gpu-fault-collector training-progress` sidecar 启用
   reporter，读测试应用原子写的进度文件（启用 reporter 的源路径）。训练镜像不含产品，
@@ -957,8 +993,9 @@ phase 2 新增经审查的 `live-replay` 类别，统一经产品自身的读取
 无 flight recorder，需 `--site-file --node-b`，判定独立 RDMA 空闲触发
 `detection_basis: ATTEMPT_SCOPED_RDMA_IDLE` 与 triage 的 `not_configured`）、
 032 `unknown_xid`（判为 SITE_SAFETY）与 `duplicate`、013 `unreadable_state`
-（UNKNOWN 而非零卡），以及 phase-1 文件源 001 `invalid_delta`、008 `statistics_failed`、
-009 `errors_delta`。
+（UNKNOWN 而非零卡），phase-1 文件源 001 `invalid_delta`、008 `statistics_failed`、
+009 `errors_delta`，以及共享回放器上的 010 全部 8 个 EFA/RDMA 计数变体与 011 `broken_pair`
+（见 host/device 与工作负载两节）。
 
 计划/执行守卫键仍为 `<case>.<variant>`，确认串 `GENERALLIVE<NNN>_EXECUTE`。新 `--approve`
 令牌：`KERNEL_SOURCE_REPLAY`（kmsg 源重指，032）、`EFA_DRIVER_UNBIND`、

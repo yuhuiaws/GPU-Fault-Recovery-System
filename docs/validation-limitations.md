@@ -1287,10 +1287,41 @@ never names the critical sensors or their thresholds (spec 015). 015
 002 `no_swap`): FAIL only if an installed `ipmitool` without a BMC makes the
 product report a permanent `_bmc` collection error, BLOCKED if a BMC answers.
 
-The rest stay `NOT_RUN`: `FIXTURE_NOT_READY` for 010/012 and a few 002/005
-variants, which need the targeted command/file reading (`ethtool`/`nvidia-smi`
-output, `/proc/meminfo`, the EFA `hw_counters`/`state` sysfs,
-`/proc/driver/nvidia`) wired onto the same shared replay by their lane, never
+The 010 EFA/RDMA counter variants are wired on the shared host source replay
+(`scripts/e2e/regional/general_live_efa.py` on the reusable
+`general_live_efa_fixture.py`; every one `live-replay` behind
+`HOST_SOURCE_REPLAY`, on both clusters). Each starts from the node's real RDMA
+inventory (the probe's read-only `inventory`: driver identity, owned netdevs,
+port states, every `counters`/`hw_counters` file, the real `ethtool -S` names)
+and replaces exactly one reading inside the host collector unit: a real port
+counter file bound at its real value and stepped (`rdma_error`), the port
+`state` bound to `1: DOWN` (`link_inactive`: VALIDATE_FABRIC must fail on the
+held port, an `efa_inventory_mismatch` co-finding may only be LINK_INACTIVE),
+or the reviewed `ethtool` wrapper serving, withdrawing or failing a group
+counter on the netdev an EFA function owns (`rnr`/`retry`/`cq_error`,
+`missing_counter` -> `efa_ethtool_counters_unsupported` MISSING_COUNTER,
+`ethtool_failed` -> a collection error, never a zero). Where no EFA function
+owns a netdev the fixture tree attaches one of the node's physical netdevs to
+an EFA device (`netdev_source: fixture`) so the product's ethtool path has a
+reading to replay; the netdev itself is untouched. Cleanup closes the window
+and `read-source` proves the unit reads the real sysfs value again.
+`counter_reset` ramps both readers past their WARNING, resets them below the
+baseline and ramps on; it is an expected FAIL: `HostNetworkMixin._rdma` clamps
+a counter that fell below its baseline to a 0 delta and ships
+`rdma_errors_delta=0` as a reading (clearing the signal, re-minting a
+continuing fault), while `_ethtool_counters` marks the same case UNKNOWN. 011
+`broken_pair` (`general_live_nccl_pair.py`, HyperPod lane) uses the same bind
+on one port's `hw_counters/tx_bytes` around a real two-node stall: while broken
+the product must record `efa_traffic_observation_valid=0` with no rate and
+start no zero streak although the probe's own pair oracle reads a real zero;
+once the pair reads again the still-stalled job's ZERO_WARNING must come no
+earlier than the warning threshold after the restore. `non_efa` stays
+CAPABILITY_ABSENT (no IB-only RDMA device on this site).
+
+The rest stay `NOT_RUN`: `FIXTURE_NOT_READY` for 012 and a few 002/005
+variants, which need the targeted command/file reading (`nvidia-smi` output,
+`/proc/meminfo`, `/proc/driver/nvidia`) wired onto the same shared replay by
+their lane, never
 replacing a host binary or a global mount; `CAPABILITY_ABSENT` where the site
 genuinely lacks the capability (no independent NFS/Lustre export, no non-EFA
 RDMA device, no BMC on EC2 for 015 `healthy`, no swap device); and
