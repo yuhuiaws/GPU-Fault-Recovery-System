@@ -1085,6 +1085,71 @@ real device. This recovers the three `set-link down` variants (008
 never call `set-link down` and were already recovered by the digest fix. Only 009
 `tcp_only` remained `INCONCLUSIVE`, for the unrelated netem gap above.
 
+The next live pass (2026-10-25, plain EKS) ran 008 `required_link_down` end to
+end and still read FAIL, "no network_link_down on gfrs0d3ec4a finding reached
+an incident", while the product had done what the variant expects. The first
+host-collector tick after `set-link down` was delivered at once (a new
+`threshold:network_link_down` edge; the rule has no sustain window) and minted
+`inc-<that batch>-network_link_down-gfrs0d3ec4a`; MARK_UNSCHEDULABLE and
+QUARANTINE isolated the node under it, and the runner's validated restore
+later readmitted the node through that incident, found by the node's ownership
+annotation. Both ends of the test veth pair are declared required, and a veth
+end set down leaves its peer `lowerlayerdown` (NO-CARRIER; for a required
+interface the collector reads every operstate but `up` as down), so the same
+tick carried a second CRITICAL QUARANTINE finding, for the peer. The product
+folds a critical quarantine that arrives while the node's isolation workflow is
+in flight into that incumbent (`orchestration/families/drain.py`,
+`ingest_terminal_node_quarantine`): one incident and one isolation, the peer's
+event linked to it, the record re-labelled `NODE_HEALTH_GROUP` with its id and
+minting event id unchanged. The runner's matcher took only `NODE_HEALTH`
+incidents, polled its whole 420 s budget and then waited another 420 s for the
+incident it had not found to settle. `finding_incidents` now takes every label
+the product gives the record a node-health finding minted -- `NODE_HEALTH`,
+`NODE_HEALTH_GROUP`, `NODE_RESOURCE_GROUP`, and `GPU_FAULT_GROUP` for a finding
+on a node a managed attempt holds -- because the event id, not the label, says
+which finding minted an incident. The 008 link variants (`required_link_down`,
+`interface_missing`) also grade the isolation chain on the read in which its
+workflow is terminal (the detection read can catch the incident
+`ACTION_PENDING` seconds before it is `QUARANTINED`), skip that wait when
+nothing was detected, and hand back through the validated restore every
+`network_link_down` incident of either end of the pair.
+
+The same pass ran 008 `interface_missing` on the other plain EKS node and the
+opposite happened: the runner found the incident of the deleted end, and the
+node was QUARANTINED, but the validated restore of the node's owning incident
+ended FAILED. Two product defects and one runner defect met there. The peer's
+finding had not joined the first end's isolation: the node's merge-group link
+still named an isolation an earlier case had merged and ended, the
+terminal-quarantine route compared the new finding against that ended pair
+and opened a second MARK_UNSCHEDULABLE + QUARANTINE beside the in-flight one,
+and that second incident took the node (the contrast with the first node,
+whose link was clean, is exactly that link). Both drain routes (the critical
+quarantine and the device-resource finding) now treat a linked pair whose
+workflow has ended as no link and merge into the live incumbent. The
+restore then failed on the pair's last reading: the runner had closed the
+collector window with the pair still deleted, so the newest readings of both
+ends stayed "missing" (`network_link_down=1`, `network_link_up=0`), inside the
+validation window, and VALIDATE_HOST judged them although the collector no
+longer reported either interface. VALIDATE_HOST and VALIDATE_FABRIC now drop
+a link reading older than the node's newest host batch without a collection
+error -- that batch reads every interface in the collector's scope -- so an
+interface taken out of `GPU_FAULT_REQUIRED_INTERFACES`, or deleted, no longer
+blocks a restore, while one the newest batch reads down still fails it and a
+batch with a collection error still makes the step wait. And the runner now
+restores the original interface configuration before the controlled
+readmission, as the specification asks: `interface_missing` recreates the pair
+while it is still declared required and waits for the product to read both
+ends up again before it closes the window; `required_link_down` and
+`recovery`, which closed the window seconds after `set-link up` and passed
+only because a collector tick happened to fall in between, wait for that
+reading too. The regression tests run the three variants over the real
+product -- a real host collector over a fake `/sys/class/net` whose pair goes
+`down` / `lowerlayerdown` or disappears and comes back, ticking between the
+runner's reads, a real control plane over an in-memory store, the real
+executor on the simulated Runtime Profile and the real node-activity read,
+once on a fresh node and once after an earlier merged isolation -- and fail
+with the live messages before the change.
+
 Once the veth path ran, live pass 3 recorded 009 `tcp_only` as
 `NOT_RUN(CAPABILITY_ABSENT)` "the node lacks tc": the AL2023 NVIDIA EKS AMI
 ships no `iproute-tc` (its survey showed `sch_netem` available but not loaded).

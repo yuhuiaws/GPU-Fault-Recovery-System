@@ -24,6 +24,7 @@ from typing import Any
 from scripts.e2e.regional.general_live_common import (
     Oracle,
     activity,
+    await_metric_recovery,
     close_window,
     open_window,
     restore_incidents,
@@ -91,6 +92,75 @@ def _declare_required(ctx: VariantContext, *names: str) -> None:
     open_window(ctx, *pairs, restore_seconds=QUARANTINE_BUDGET + 600)
 
 
+def _link_incidents(
+    activity_document: dict[str, Any], *devices: str
+) -> list[dict[str, Any]]:
+    """The ``network_link_down`` incidents of the variant's test links.
+
+    A veth's peer goes down with it: ``ip link set a down`` leaves the peer
+    ``lowerlayerdown`` (NO-CARRIER) and ``ip link del a`` removes both ends.
+    Both ends are declared required, so the peer reports ``network_link_down=1``
+    in the same tick and the product folds that second critical finding into
+    the isolation the first one opened (one incident, re-labelled
+    NODE_HEALTH_GROUP; ``general_live_verdicts.NODE_HEALTH_EVENT_TYPES``). A
+    peer finding the product only took in a later tick, after that isolation
+    had ended, mints an incident of its own -- one this variant caused too, so
+    it is handed back through the validated restore as well.
+    """
+
+    found: dict[str, dict[str, Any]] = {}
+    for device in devices:
+        for item in finding_incidents(
+            activity_document, "network_link_down", device=device
+        ):
+            found.setdefault(str(item["incident_id"]), item)
+    return list(found.values())
+
+
+def _settled_isolation(
+    ctx: VariantContext,
+    started: Any,
+    detection: dict[str, Any],
+    devices: tuple[str, ...],
+    *,
+    name: str,
+) -> dict[str, Any]:
+    """The read the isolation chain is graded on.
+
+    The detection poll returns the first read that lists the incident, and
+    the product's isolation workflow (FREEZE_EVIDENCE, MARK_UNSCHEDULABLE,
+    QUARANTINE) ends seconds after it, so that read can still show the
+    incident ACTION_PENDING behind a RUNNING workflow; the incident is
+    QUARANTINED once the workflow is terminal. Without an incident there is
+    nothing to settle and the detection read carries the failure.
+    """
+
+    incidents = _link_incidents(detection, *devices)
+    if not incidents:
+        return detection
+    return wait_settled(
+        ctx,
+        started,
+        [item["incident_id"] for item in incidents],
+        timeout_seconds=QUARANTINE_BUDGET,
+        metrics={"network_link_down", "network_link_up"},
+        name=name,
+    )
+
+
+def _isolation_chain(settled: dict[str, Any], device: str) -> list[str]:
+    return chain_errors(
+        settled,
+        ChainExpectation(
+            metric="network_link_down",
+            device=device,
+            operations=("MARK_UNSCHEDULABLE", "QUARANTINE"),
+            forbidden=_hardware() | {"STOP_WORKLOADS"},
+            incident_states=frozenset({"QUARANTINED"}),
+        ),
+    )
+
+
 def required_link_down(ctx: VariantContext) -> dict[str, Any]:
     created = _veth(ctx)
     a, b = created["a"], created["b"]
@@ -98,6 +168,13 @@ def required_link_down(ctx: VariantContext) -> dict[str, Any]:
     ctx.hold(ctx.host_interval * 3, name="healthy-samples")
     started = utc_now()
     ctx.net("set-link", "--slot", "a", "--state", "down")
+    # network_link_down is an immediate rule (no sustain window) and the down
+    # tick opens a ``threshold:network_link_down`` edge the host collector
+    # delivers at once, so the incident follows within one collector interval
+    # (live 2026-10-25: minted from the first down tick). The edge is per
+    # metric, not per device: with another network_link_down already open on
+    # the node the tick waits for the next health summary (300 s, jitter 0.1),
+    # which QUARANTINE_BUDGET still covers.
     detection = wait_for_incident(
         ctx,
         started,
@@ -107,42 +184,26 @@ def required_link_down(ctx: VariantContext) -> dict[str, Any]:
         metrics={"network_link_down", "network_link_up"},
         name="link-quarantine",
     )
-    reading = ctx.net("reading", "--slot", "a")
+    reading = ctx.net("reading", "--slot", "a", "--slot", "b")
     ctx.evidence.write("link-reading", reading)
-    link = (reading.get("interfaces") or {}).get(a) or {}
+    links = reading.get("interfaces") or {}
+    link = links.get(a) or {}
     if link.get("operstate") == "up":
         raise VariantInconclusive(f"the test link {a} did not go down: {link}")
-    incidents = finding_incidents(detection, "network_link_down", device=a)
-    stages = {
-        "chain": chain_errors(
-            detection,
-            ChainExpectation(
-                metric="network_link_down",
-                device=a,
-                operations=("MARK_UNSCHEDULABLE", "QUARANTINE"),
-                forbidden=_hardware() | {"STOP_WORKLOADS"},
-                incident_states=frozenset({"QUARANTINED"}),
-            ),
-        ),
-    }
-    wait_settled(
-        ctx,
-        started,
-        [item["incident_id"] for item in incidents],
-        timeout_seconds=QUARANTINE_BUDGET,
-        metrics={"network_link_down"},
-        name="link-settled",
-    )
-    # Recovery order: bring the link up, close the window (unit sees all links
-    # up), then validated restore; deleting the interface before that would be
-    # a fresh interface_missing event.
-    ctx.net("set-link", "--slot", "a", "--state", "up")
+    settled = _settled_isolation(ctx, started, detection, (a, b), name="link-settled")
+    stages = {"chain": _isolation_chain(settled, a)}
+    # Recovery order: bring the link up and let the product read it, close the
+    # window, then validated restore; deleting the interface before that would
+    # be a fresh interface_missing event.
+    stages["link_restored"] = _link_up(ctx, a, b)
     close_window(ctx)
     ctx.cleanup.discard("collector-window")
     restore_incidents(
-        ctx, incidents, reason="GF-GENERAL-LIVE-008 required_link_down restore"
+        ctx,
+        _link_incidents(settled, a, b),
+        reason="GF-GENERAL-LIVE-008 required_link_down restore",
     )
-    return _result(stages)
+    return _result(stages, extra={"peer_link": links.get(b)})
 
 
 def interface_missing(ctx: VariantContext) -> dict[str, Any]:
@@ -161,25 +222,79 @@ def interface_missing(ctx: VariantContext) -> dict[str, Any]:
         metrics={"network_link_down"},
         name="missing-quarantine",
     )
-    incidents = finding_incidents(detection, "network_link_down", device=a)
+    settled = _settled_isolation(
+        ctx, started, detection, (a, b), name="missing-settled"
+    )
     stages = {
-        "chain": chain_errors(
-            detection,
-            ChainExpectation(
-                metric="network_link_down",
-                device=a,
-                operations=("MARK_UNSCHEDULABLE", "QUARANTINE"),
-                forbidden=_hardware() | {"STOP_WORKLOADS"},
-                incident_states=frozenset({"QUARANTINED"}),
-            ),
-        ),
+        "chain": _isolation_chain(settled, a),
+        "link_restored": _restore_pair(ctx, a, b),
     }
     close_window(ctx)
     ctx.cleanup.discard("collector-window")
     restore_incidents(
-        ctx, incidents, reason="GF-GENERAL-LIVE-008 interface_missing restore"
+        ctx,
+        _link_incidents(settled, a, b),
+        reason="GF-GENERAL-LIVE-008 interface_missing restore",
     )
     return _result(stages)
+
+
+def _restore_pair(ctx: VariantContext, a: str, b: str) -> list[str]:
+    """Put the deleted pair back while it is still required (``ip link del``
+    removed both ends) and wait until the product has read both up again."""
+
+    since = utc_now()
+    recreated = ctx.net(
+        "create-veth",
+        "--slot",
+        "a",
+        "--peer-slot",
+        "b",
+        "--deadman-seconds",
+        str(ctx.spec.max_minutes * 60 + 600),
+    )
+    ctx.evidence.write("veth-ab-restored", recreated)
+    return _await_pair_up(ctx, since, a, b)
+
+
+def _link_up(ctx: VariantContext, a: str, b: str) -> list[str]:
+    """Bring the downed end back up and wait until the product read both up."""
+
+    since = utc_now()
+    ctx.net("set-link", "--slot", "a", "--state", "up")
+    return _await_pair_up(ctx, since, a, b)
+
+
+def _await_pair_up(ctx: VariantContext, since: Any, a: str, b: str) -> list[str]:
+    """Fresh product evidence that both ends of the pair read up again.
+
+    The validated restore judges the node on the product's newest link
+    readings, and closing the collector window restarts the collector without
+    the pair: a change the collector had not read by then never reaches the
+    product. Live 2026-10-25 (ip-10-0-43-5, interface_missing) the window was
+    closed with the pair still deleted, the newest readings of both ends
+    stayed "missing" (``network_link_down=1``, ``network_link_up=0``) and the
+    restore ended FAILED; ``required_link_down`` and ``recovery`` closed it a
+    few seconds after ``set-link up`` and only passed because a collector tick
+    happened to fall in between. The spec's recovery puts the original
+    interface configuration back before the controlled readmission. The ends
+    coming back clear the ``threshold:network_link_down`` edge, which the
+    collector delivers at once; ``await_metric_recovery`` allows two health
+    summaries.
+    """
+
+    errors: list[str] = []
+    for slot, device in (("a", a), ("b", b)):
+        recovered = await_metric_recovery(
+            ctx,
+            "network_link_down",
+            1.0,
+            device=device,
+            since=since,
+            name=f"link-restored-{slot}",
+        )
+        errors.extend(recovered["errors"])
+    return errors
 
 
 def unknown_state(ctx: VariantContext) -> dict[str, Any]:
@@ -281,8 +396,8 @@ def link_recovery(ctx: VariantContext) -> dict[str, Any]:
         metrics={"network_link_down"},
         name="recovery-detection",
     )
-    incidents = finding_incidents(detection, "network_link_down", device=a)
-    ctx.net("set-link", "--slot", "a", "--state", "up")
+    incidents = _link_incidents(detection, a, b)
+    link_restored = _link_up(ctx, a, b)
     close_window(ctx)
     ctx.cleanup.discard("collector-window")
     restored = restore_incidents(
@@ -290,6 +405,7 @@ def link_recovery(ctx: VariantContext) -> dict[str, Any]:
     )
     operations = [op for item in restored for op in item.get("operations") or []]
     stages = {
+        "link_restored": link_restored,
         "restore": []
         if "VALIDATE_FABRIC" in operations and "RESTORE_SCHEDULING" in operations
         else [

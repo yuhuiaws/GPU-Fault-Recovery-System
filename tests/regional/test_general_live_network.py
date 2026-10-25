@@ -1,17 +1,33 @@
-"""GF-GENERAL-LIVE-008/009 injector/verdict contract over scripted records."""
+"""GF-GENERAL-LIVE-008/009 injector/verdict contract over scripted records.
+
+The 008 link-down chain is also driven over the real product: a real host
+collector over a fake ``/sys/class/net``, a real control plane over an
+in-memory store, the real executor on the simulated Runtime Profile and the
+real node-activity read.
+"""
 
 from __future__ import annotations
 
+import asyncio
+import shutil
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from gpu_fault.app import ApplicationContext
+from gpu_fault.collectors import CollectorContext, HostTelemetryCollector
+from gpu_fault.execution.models import WorkflowStepOutcome
+from gpu_fault.models import WorkflowOperation, WorkflowStatus
+from gpu_fault.store import InMemoryStore
 from scripts.e2e.regional import general_live_network as net
 from scripts.e2e.regional.general_live_fixture import VariantInconclusive
+from scripts.e2e.regional.general_live_store import ACTIVITY_PROBE
+from tests._builders import active_workflow_executor, asgi_client, execute_workflow
 from tests.regional._general_live_fakes import (
     FakeProbe,
     FakeRegional,
+    activity_read,
     host_batch,
     incident,
     make_context,
@@ -102,6 +118,13 @@ def probes(node: FakeProbe, netp: FakeProbe, win: FakeProbe) -> dict[str, FakePr
 
 
 def quarantine_doc(device: str) -> dict[str, Any]:
+    """The isolated link, and the pair read up again once it is put back.
+
+    ``interface_missing`` recreates the deleted pair before it closes the
+    window and waits for fresh ``network_link_down=0`` readings of both ends;
+    the other variants never look at them.
+    """
+
     inc = incident(
         "inc-l",
         "network_link_down",
@@ -118,7 +141,16 @@ def quarantine_doc(device: str) -> dict[str, Any]:
     return {
         "incidents": [inc],
         "workflows": [wf],
-        "batches": [],
+        "batches": [
+            host_batch(
+                f"2026-10-24T00:1{minute}:00+00:00",
+                "network_link_down",
+                0.0,
+                device=end,
+            )
+            for minute in range(2)
+            for end in (IFA, IFB)
+        ],
         "markers": [],
         "commands": [],
         "health_signals": {},
@@ -546,3 +578,419 @@ def test_statistics_failed_flags_a_dropped_link_sample(tmp_path: Path) -> None:
     result = spec.execute(ctx)
     assert result["verdict"] == "FAIL", result
     assert any("link sample" in error for error in result["errors"]), result["errors"]
+
+
+# --------------------------------------------------------------------------- #
+# 008 required_link_down / interface_missing: the veth peer goes down with a
+# (live 2026-10-25, ip-10-0-32-162, release 6a95b90fcd82: "chain: no
+# network_link_down on gfrs0d3ec4a finding reached an incident" while the
+# product had quarantined the node under exactly that incident).
+# --------------------------------------------------------------------------- #
+#: The reason the product appends to the incumbent incident when the peer's
+#: finding joins it (``families/drain.py`` ``ingest_terminal_node_quarantine``).
+PEER_REASON = f"{NODE}: network_link_down: required network interface is down"
+
+
+def grouped_doc(
+    device: str, *, state: str = "QUARANTINED", status: str = "SUCCEEDED"
+) -> dict[str, Any]:
+    """The records once the peer's finding joined ``device``'s incident.
+
+    ``ip link set a down`` leaves the veth peer ``lowerlayerdown`` and ``ip
+    link del a`` removes both ends; both are declared required, so a second
+    critical finding comes in the same tick and the product folds it into the
+    first one's isolation: same ``inc-<event id>``, same minting event id,
+    re-labelled NODE_HEALTH_GROUP.
+    """
+
+    doc = quarantine_doc(device)
+    doc["incidents"] = [
+        {
+            **doc["incidents"][0],
+            "event_type": "NODE_HEALTH_GROUP",
+            "state": state,
+            "reasons": ["required network interface is down", PEER_REASON],
+        }
+    ]
+    doc["workflows"] = [{**doc["workflows"][0], "status": status}]
+    return doc
+
+
+def peer_down_probe() -> FakeProbe:
+    return net_probe(
+        down=IFA,
+        reading={
+            "interfaces": {
+                IFA: {"operstate": "down", "flags": "0x1002"},
+                IFB: {"operstate": "lowerlayerdown", "flags": "0x1003"},
+            }
+        },
+    )
+
+
+def restore_recorder(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    restored: list[list[str]] = []
+
+    def record(ctx, incidents, reason):
+        restored.append([str(item["incident_id"]) for item in incidents])
+        return [
+            {
+                "status": "SUCCEEDED",
+                "operations": ["VALIDATE_FABRIC", "RESTORE_SCHEDULING"],
+            }
+        ]
+
+    monkeypatch.setattr(net, "restore_incidents", record)
+    return restored
+
+
+@pytest.mark.parametrize("variant", ["required_link_down", "interface_missing"])
+def test_link_down_takes_the_incident_its_peer_finding_joined(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variant: str
+) -> None:
+    restored = restore_recorder(monkeypatch)
+    spec = SPECS[variant]
+    regional = FakeRegional(cpu_python=store_script({"activity": grouped_doc(IFA)}))
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=regional,
+        probes=probes(node_probe(survey()), peer_down_probe(), window_probe()),
+    )
+    result = spec.execute(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    assert restored == [["inc-l"]], (
+        f"the isolation incident must be handed back through the validated restore: "
+        f"{restored}"
+    )
+
+
+@pytest.mark.parametrize("variant", ["required_link_down", "interface_missing"])
+def test_link_down_grades_the_chain_once_the_isolation_settled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variant: str
+) -> None:
+    # The detection read is the first to list the incident; the isolation
+    # workflow finishes seconds later, so that read can still show it
+    # ACTION_PENDING behind a RUNNING workflow.
+    restore_patch(monkeypatch)
+    spec = SPECS[variant]
+    running = quarantine_doc(IFA)
+    running["incidents"] = [{**running["incidents"][0], "state": "ACTION_PENDING"}]
+    running["workflows"] = [{**running["workflows"][0], "status": "RUNNING"}]
+    regional = FakeRegional(
+        cpu_python=store_script({"activity": [running, quarantine_doc(IFA)]})
+    )
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=regional,
+        probes=probes(node_probe(survey()), peer_down_probe(), window_probe()),
+    )
+    result = spec.execute(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+
+
+def test_link_down_hands_back_an_incident_the_peer_minted_on_its_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A peer finding the product took in a later tick, once the first
+    # isolation had ended, opens an incident of its own: this variant caused
+    # it too, so it goes back through the validated restore as well.
+    restored = restore_recorder(monkeypatch)
+    spec = SPECS["required_link_down"]
+    doc = quarantine_doc(IFA)
+    peer = incident(
+        "inc-p", "network_link_down", device=IFB, state="QUARANTINED", workflow="wf-p"
+    )
+    doc["incidents"].append(peer)
+    doc["workflows"].append(
+        workflow(
+            "wf-p",
+            "inc-p",
+            ["FREEZE_EVIDENCE", "MARK_UNSCHEDULABLE", "QUARANTINE"],
+            status="SUCCEEDED",
+        )
+    )
+    regional = FakeRegional(cpu_python=store_script({"activity": doc}))
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=regional,
+        probes=probes(node_probe(survey()), peer_down_probe(), window_probe()),
+    )
+    result = spec.execute(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    assert restored == [["inc-l", "inc-p"]], restored
+
+
+class SimulatedRuntime:
+    """Runs every step the simulated Runtime Profile owns, successfully."""
+
+    def __init__(self) -> None:
+        self.operations: list[str] = []
+
+    def supports(self, step: Any) -> bool:
+        return step.execution_owner == "simulated-runtime"
+
+    def execute(self, context: Any) -> WorkflowStepOutcome:
+        self.operations.append(context.step.operation.value)
+        return WorkflowStepOutcome.succeeded(
+            operation_id=f"simulated-{context.idempotency_key}"
+        )
+
+
+#: Another run's test pair, isolated on the node before this one.
+EARLIER_PAIR = ("gfrsbbbbbba", "gfrsbbbbbbb")
+
+
+class LinkDownWorld:
+    """The node's host collector and the control plane, both real.
+
+    The window probe's ``open-window`` (re)starts a real host collector with
+    the pair declared required over a fake ``/sys/class/net``; ``set-link``
+    flips the pair as the kernel does -- the downed end reads ``down``, its
+    peer ``lowerlayerdown`` (NO-CARRIER) -- ``delete-interface`` removes both
+    ends and ``create-veth`` puts them back. The collector sees a change at
+    its next tick, which runs before each of the runner's reads (one collector
+    interval per poll), never inside the probe call: a window closed right
+    after a probe call restarts the collector before it read the change.
+    Every batch the collector delivers is posted to a real
+    ``ApplicationContext`` over an in-memory store, every workflow it plans is
+    run by the real executor, and the runner's reads run the real
+    ``ACTIVITY_PROBE`` there.
+    """
+
+    def __init__(self, root: Path) -> None:
+        self.net = root / "net"
+        self.interface("enp71s0", physical=True)
+        self.collector: HostTelemetryCollector | None = None
+        self.delivered: list[dict[str, Any]] = []
+        self.context = ApplicationContext(store=InMemoryStore())
+        self.runtime = SimulatedRuntime()
+        self.executor = active_workflow_executor(
+            self.context.store,
+            [self.runtime],
+            [
+                WorkflowOperation.FREEZE_EVIDENCE,
+                WorkflowOperation.MARK_UNSCHEDULABLE,
+                WorkflowOperation.QUARANTINE,
+            ],
+        )
+
+    def interface(self, name: str, *, physical: bool = False) -> None:
+        statistics = self.net / name / "statistics"
+        statistics.mkdir(parents=True, exist_ok=True)
+        for counter in ("rx_errors", "tx_errors", "rx_dropped", "tx_dropped"):
+            (statistics / counter).write_text("0\n")
+        if physical:
+            (self.net / name / "device").mkdir(exist_ok=True)
+        self.operstate(name, "up")
+
+    def operstate(self, name: str, state: str) -> None:
+        (self.net / name / "operstate").write_text(f"{state}\n")
+
+    def post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        async def send() -> Any:
+            async with asgi_client(self.context) as client:
+                return await client.post(path, json=payload)
+
+        response = asyncio.run(send())
+        assert response.status_code == 200, response.text
+        self.delivered.append(payload)
+        for item in self.context.store.list_workflows(limit=50, newest_first=True):
+            if item.status is WorkflowStatus.PENDING:
+                execute_workflow(
+                    self.executor,
+                    item.request_id,
+                    expected_fencing_token=item.fencing_token,
+                )
+        return response.json()
+
+    def host_collector(self, required: list[str]) -> HostTelemetryCollector:
+        return HostTelemetryCollector(
+            self,
+            CollectorContext(
+                cluster_id="gpu-eks-cluster", runtime_profile_version="simulated-v1"
+            ),
+            node_id=NODE,
+            net_class_root=str(self.net),
+            required_interfaces=required,
+            edge_filter_enabled=True,
+            health_summary_seconds=300,
+        )
+
+    def open_window(self, _arguments: tuple[str, ...]) -> dict[str, Any]:
+        self.collector = self.host_collector([IFA, IFB])
+        self.collector.collect_once()
+        return {"after": {"ActiveState": "active"}}
+
+    def earlier_isolation(self) -> str:
+        """An earlier run's required pair on this node: isolated, peer merged,
+        ended. From then on the node's merge group names that incident (live:
+        ip-10-0-43-5 had run other cases before 008 interface_missing)."""
+
+        first, peer = EARLIER_PAIR
+        for name in EARLIER_PAIR:
+            self.interface(name)
+        self.collector = self.host_collector(list(EARLIER_PAIR))
+        self.collector.collect_once()
+        self.operstate(first, "down")
+        self.operstate(peer, "lowerlayerdown")
+        self.tick()
+        down = self.delivered[-1]
+        self.operstate(first, "up")
+        self.operstate(peer, "up")
+        self.tick()
+        for name in EARLIER_PAIR:
+            shutil.rmtree(self.net / name)
+        self.collector = None
+        self.delivered.clear()
+        self.runtime.operations.clear()
+        return f"inc-{down['batch_id']}-network_link_down-{first}"
+
+    def tick(self) -> None:
+        assert self.collector is not None, "the window opens before the link moves"
+        self.collector.collect_once()
+
+    def set_link(self, arguments: tuple[str, ...]) -> dict[str, Any]:
+        state = arguments[arguments.index("--state") + 1]
+        self.operstate(IFA, state)
+        self.operstate(IFB, "up" if state == "up" else "lowerlayerdown")
+        return {"name": IFA, "state": state, "link": {"operstate": state}}
+
+    def create_veth(self, _arguments: tuple[str, ...]) -> dict[str, Any]:
+        for name in (IFA, IFB):
+            self.interface(name)
+        return {"a": IFA, "b": IFB, "link_a": {"operstate": "up"}}
+
+    def delete_interface(self, _arguments: tuple[str, ...]) -> dict[str, Any]:
+        for name in (IFA, IFB):
+            shutil.rmtree(self.net / name)
+        return {"deleted": IFA, "present": False}
+
+    def close_window(self, _arguments: tuple[str, ...]) -> dict[str, Any]:
+        # The unit restarts without the pair: nothing reads it any more.
+        self.collector = None
+        return {"after": {"ActiveState": "active"}}
+
+    def pair_readings(self) -> dict[str, float]:
+        """The product's latest ``network_link_down`` of each end of the pair."""
+
+        return {
+            str(item.device): item.value
+            for item in self.context.store.list_telemetry_metrics_latest(
+                "gpu-eks-cluster", NODE
+            )
+            if item.name == "network_link_down" and item.device in (IFA, IFB)
+        }
+
+    def reading(self, _arguments: tuple[str, ...]) -> dict[str, Any]:
+        return {
+            "interfaces": {
+                name: {"operstate": (self.net / name / "operstate").read_text().strip()}
+                if (self.net / name).exists()
+                else {"present": False}
+                for name in (IFA, IFB)
+            }
+        }
+
+    def activity(self, script: str, *arguments: str) -> dict[str, Any]:
+        assert script is ACTIVITY_PROBE, "the variant reads only node activity"
+        if self.collector is not None:
+            self.tick()
+        return activity_read(self.context.store, arguments)
+
+
+@pytest.mark.parametrize("earlier", [False, True], ids=["first", "after-earlier"])
+@pytest.mark.parametrize(
+    "variant", ["required_link_down", "interface_missing", "recovery"]
+)
+def test_link_down_over_the_real_product(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variant: str, earlier: bool
+) -> None:
+    monkeypatch.setattr(HostTelemetryCollector, "CONTRIBUTORS", ("_network",))
+    world = LinkDownWorld(tmp_path)
+    previous = world.earlier_isolation() if earlier else None
+    restored: list[list[str]] = []
+    held: list[dict[str, float]] = []
+
+    def restore(ctx, incidents, reason):
+        restored.append([str(item["incident_id"]) for item in incidents])
+        held.append(world.pair_readings())
+        return [
+            {
+                "status": "SUCCEEDED",
+                "operations": ["VALIDATE_FABRIC", "RESTORE_SCHEDULING"],
+            }
+        ]
+
+    monkeypatch.setattr(net, "restore_incidents", restore)
+    netp = net_probe(
+        **{
+            "create-veth": world.create_veth,
+            "set-link": world.set_link,
+            "delete-interface": world.delete_interface,
+            "reading": world.reading,
+        }
+    )
+    window = FakeProbe(
+        {"open-window": world.open_window, "close-window": world.close_window}
+    )
+    spec = next(
+        item
+        for item in net.VARIANTS
+        if item.case_id == "GF-GENERAL-LIVE-008" and item.variant == variant
+    )
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=FakeRegional(cpu_python=world.activity),
+        probes=probes(node_probe(survey()), netp, window),
+    )
+
+    result = spec.execute(ctx)
+
+    down = next(
+        payload
+        for payload in world.delivered
+        if "threshold:network_link_down" in payload["edge_filter_reasons"]
+    )
+    reported = {
+        sample["device"]: sample["value"]
+        for sample in down["samples"]
+        if sample["name"] == "network_link_down"
+    }
+    assert reported == {IFA: 1.0, IFB: 1.0}, (
+        f"the down tick must carry both required ends of the pair: {reported}"
+    )
+    minted = f"inc-{down['batch_id']}-network_link_down-{IFA}"
+    stored = world.context.store.get_incident(minted)
+    assert stored.event_type == "NODE_HEALTH_GROUP", (
+        f"the peer's finding is folded into the target's incident: {stored}"
+    )
+    assert stored.state.value == "QUARANTINED", stored
+    peer_event = f"{down['batch_id']}-network_link_down-{IFB}"
+    linked = world.context.store.get_incident_by_event(peer_event)
+    assert linked is not None and linked.incident_id == minted, linked
+    assert world.runtime.operations == [
+        "FREEZE_EVIDENCE",
+        "MARK_UNSCHEDULABLE",
+        "QUARANTINE",
+    ], world.runtime.operations
+    assert result["verdict"] == "PASS", result["errors"]
+    assert restored == [[minted]], restored
+    # Live 2026-10-25 interface_missing: the window was closed with the pair
+    # still deleted, so the product's newest reading of both ends was
+    # "missing" and the validated restore ended FAILED on it. The pair is put
+    # back (or brought up) first, and the window is only closed once the
+    # product has read it up: closing it right after the probe call restarts
+    # the collector before its next tick could see the change.
+    assert held == [{IFA: 0.0, IFB: 0.0}], (
+        f"the validated restore must find both ends read up again: {held}"
+    )
+    if previous is not None:
+        # The node's merge group still named the earlier, ended isolation;
+        # the peer's finding joined this run's in-flight one all the same.
+        ended = world.context.store.get_incident(previous)
+        assert ended.event_type == "NODE_HEALTH_GROUP", ended
+        assert ended.state.value == "QUARANTINED", ended

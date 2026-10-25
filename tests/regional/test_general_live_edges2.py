@@ -373,6 +373,18 @@ def test_network_link_recovery(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
                             status="SUCCEEDED",
                         )
                     ],
+                    # Both ends read up again once the link is back up: the
+                    # variant closes the window only after the product has.
+                    "batches": [
+                        host_batch(
+                            f"2026-10-24T00:1{minute}:00+00:00",
+                            "network_link_down",
+                            0.0,
+                            device=device,
+                        )
+                        for minute in range(2)
+                        for device in ("gfrsaaaaaaa", "gfrsaaaaaab")
+                    ],
                 }
             }
         )
