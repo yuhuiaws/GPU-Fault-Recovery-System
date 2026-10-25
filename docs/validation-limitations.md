@@ -986,20 +986,49 @@ product code and leaves the collector unit's own sandbox
 (`ProtectSystem=strict`, `PrivateTmp=true`) untouched. Only the storage probe
 asks for propagation; every read-only probe keeps its Pod-private default.
 
-The 006 disk-I/O variants share this probe and mechanism (a loop + device-mapper
-device mounted under the same digest directory, with a `systemd-run` O_DIRECT
-writer), so the propagation fix is a prerequisite for them too -- the writer now
-reaches the test `dm-N` device instead of the root filesystem, and
-`/proc/diskstats` (which the collector reads globally) carries that device's
-load. It is not sufficient on its own: the live run showed the native dm-I/O
-load path failing independently of mount visibility (`sustained_util` host probe
-`TimeoutExpired`, `sustained_latency` 200 ms dm-delay injector `ProbeError`).
-Making the dm-delay-backed signal reliable needs a real dm/dm-delay device this
-harness cannot exercise, so when `dm_delay` is in play `sustained_util` and
-`sustained_latency` record `NOT_RUN(FIXTURE_NOT_READY)` rather than a blind,
-unverifiable device-mapper fix; the delay-free 006 variants (`short_flush`,
-`zero_completed_io`, `counter_reset`, `recovery`) are recovered by the
-propagation fix alone.
+The 006 disk-I/O variants use the same probe for a loop + device-mapper test
+device (`dm-N`, the name `/proc/diskstats` and the product report) and a
+`systemd-run` O_DIRECT writer, but mount visibility was not their blocker. On
+2026-10-25 every 006 variant still failed on both plain-EKS nodes with `host
+probe failed (exit 1; error TimeoutExpired)` about 290 s into the run, before
+any product evidence and with an empty cleanup stack. The class came from the
+probe's own JSON, so a command inside the probe timed out, not the runner's
+`kubectl exec`: `dmsetup create` in `dm-create`, at the probe's 180 s default
+command timeout. libdevmapper makes every create, resume and remove wait until
+the host's systemd-udevd confirms a notification cookie -- a SysV semaphore that
+`95-dm-notify.rules` completes with `dmsetup udevcomplete $DM_COOKIE` -- and SysV
+IPC objects are per IPC namespace. The probe Pod is hostPID/hostNetwork but has
+its own IPC namespace, so udev's completion in the host namespace never finds
+the Pod's semaphore and the create waits forever; 004's loop file system never
+calls `dmsetup`, which is why it worked. The diagnosis rests on the error class,
+the timing and this mechanism, not on a live trace; the nodes' journals should
+show systemd-udevd's failed `dmsetup udevcomplete` runs at those times. The
+earlier `sustained_latency` `ProbeError` fits a second gap: the variant requires
+`KERNEL_MODULE_LOAD`, but nothing loaded `dm_delay`, so the probe refused the
+delay table. Neither depends on a loaded `dm_delay`, so the previous
+`NOT_RUN(FIXTURE_NOT_READY)` deferral of `sustained_util`/`sustained_latency` is
+withdrawn.
+
+The harness now builds the device in the host's namespaces. `dm-create` arms the
+deadman, records the device and only starts a bounded transient setup unit
+(`RuntimeMaxSec`; `fallocate`, `losetup`, `dmsetup create`, `mkfs.ext4`, `mount`,
+each step recorded before it runs) and returns; the runner polls `dm-status`
+until the record reads `ready`, or `failed` with the step, the error class, a
+digest and the probe site. Every other `dmsetup`, `mount` and `umount` of the
+device joins PID 1's IPC and mount namespaces through `nsenter` (a node whose
+survey lacks `nsenter` or `systemd-run` is `NOT_RUN(CAPABILITY_ABSENT)`). Each 006
+probe call has a wall-clock budget the probe clamps every command to, and the
+runner's `kubectl exec` timeout is that budget plus a 60 s transport margin, so a
+call always answers with its own error first. Every undo is on the LIFO stack
+before the call it undoes; the device undo is the probe's `cleanup --kind dm-io`
+(also the deadman's command), which stops the setup and writer units, removes
+the mapping, detaches only loop devices backed by the run's own file, unloads a
+`dm_delay` the run loaded (`--load-module`, recorded before the load) and fails
+the cleanup unless the residue is empty. `counter_reset` now stops the writer
+before it removes and recreates the mapping (the writer's open files kept the
+mount busy) and restarts it afterwards. A probe failure now reads `error <class>
+<digest> at <function:line>` instead of a bare class. All of this is
+harness-only and has not yet run live.
 
 The native network variants (008 NIC link down, 009 NIC errors/drops) build
 host-local `gfrs<digest><slot>` test interfaces (a `veth` pair, a `dummy`) with

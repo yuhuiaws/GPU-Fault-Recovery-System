@@ -614,6 +614,35 @@ run_general_live.py --site-profile <profile> --run-dir <run> \
   --confirm GENERALLIVE009_EXECUTE --maintenance-window-end <UTC>
 ```
 
+006 磁盘 I/O（native）：存储探针用 loop + device-mapper 测试设备（`dm-N`，即
+`/proc/diskstats` 与产品上报的名字）和 `systemd-run` O_DIRECT 写入单元。2026-10-25
+两台 plain EKS 节点上所有 006 变体仍在产品证据之前失败（`host probe failed (exit 1;
+error TimeoutExpired)`，开始约 290 s，清理栈为空）：错误类来自探针自身 JSON，超时的是
+探针内 `dm-create` 的 `dmsetup create`（探针默认 180 s 命令超时），不是运行器的
+`kubectl exec`。libdevmapper 的 create/resume/remove 会等主机 systemd-udevd 确认一个
+通知 cookie（SysV 信号量，由 `95-dm-notify.rules` 的 `dmsetup udevcomplete $DM_COOKIE`
+完成），而 SysV IPC 按 IPC 命名空间隔离；探针 Pod 是 hostPID/hostNetwork 但有自己的
+IPC 命名空间，udev 在主机命名空间里找不到 Pod 的信号量，create 一直等下去（004 的 loop
+文件系统不调用 `dmsetup`，所以正常）。该诊断依据错误类、时序和这一机制，并非现场跟踪；
+当时节点 journal 应有 systemd-udevd 执行 `dmsetup udevcomplete` 失败的记录。早先
+`sustained_latency` 的 `ProbeError` 符合另一个缺口：变体要求 `KERNEL_MODULE_LOAD`，但
+没有任何步骤加载 `dm_delay`，探针因此拒绝 delay 表。两者都与 `dm_delay` 是否已加载
+无关，故撤销 `sustained_util`/`sustained_latency` 的 `NOT_RUN(FIXTURE_NOT_READY)`。
+
+现在设备完全在主机命名空间中构建：`dm-create` 先布置 deadman、写记录，只启动一个有界
+瞬态 setup 单元（`RuntimeMaxSec`；`fallocate`、`losetup`、`dmsetup create`、
+`mkfs.ext4`、`mount`，每步执行前先记录）即返回；运行器轮询 `dm-status`，直到记录为
+`ready`，或 `failed`（带步骤、错误类、摘要和探针位置）。设备的其他 `dmsetup`、
+`mount`、`umount` 都经 `nsenter` 进入 PID 1 的 IPC 与挂载命名空间（survey 缺 `nsenter`
+或 `systemd-run` 记 `NOT_RUN(CAPABILITY_ABSENT)`）。每个 006 探针调用有墙钟预算，探针把
+每条命令的超时截到剩余预算之内，运行器的 `kubectl exec` 超时为该预算加 60 s 传输余量，
+调用总能先返回带自身错误的 JSON。每个撤销都在对应调用之前压入 LIFO 栈；设备撤销是探针的
+`cleanup --kind dm-io`（也是 deadman 的命令）：停 setup 与写入单元、删除映射、只摘除以
+本次运行自身文件为后端的 loop、卸载本次运行加载的 `dm_delay`（`--load-module`，加载前
+先记录），残留不为空即清理失败。`counter_reset` 先停写入单元再删除并重建映射（写入单元
+打开的文件使挂载处于忙状态），之后重新写入。探针失败现在显示
+`error <类> <摘要> at <函数:行>`，不再只有类名。以上仅改测试夹具，尚未真机运行。
+
 ### phase 2 范围（host/device 扩展）
 
 第二批补充 host/device 类别 002 内存/交换、005 共享存储、007 SMART、
