@@ -35,38 +35,65 @@ from tools import host_command_replay as wrapper
 RUN = "gl007-health-failed-a1-deadbeef"
 MAIN_PID = "4242"
 UNIT = probe.HOST_UNIT
+KERNEL_UNIT = probe.KERNEL_UNIT
+KERNEL_PID = "4343"
 
 
 class FakeHost:
-    """systemctl / systemd-run / nsenter as the probe sees them, without systemd."""
+    """systemctl / systemd-run / nsenter as the probe sees them, without systemd.
+
+    Two units exist: the host collector (``MAIN_PID``) and the kernel collector
+    (``KERNEL_PID``), whose EnvironmentFile hands it a configured driver branch
+    that only an ``UnsetEnvironment=`` line of the window may remove.
+    """
 
     def __init__(self, tmp_path: Path) -> None:
         self.tmp = tmp_path
         self.calls: list[list[str]] = []
         self.timers: set[str] = set()
         self.restarts = 0
+        self.restarted: list[str] = []
         self.dropin_present_at_arm: bool | None = None
         self.unit_active = True
         self.binds: dict[str, str] = {}
         self.inaccessible: set[str] = set()
-        self.environment: dict[str, str] = {}
+        self.units = {UNIT: MAIN_PID, KERNEL_UNIT: KERNEL_PID}
+        self.base_environment: dict[str, dict[str, str]] = {
+            KERNEL_UNIT: {probe.DRIVER_BRANCH_ENV: "580"}
+        }
+        self.environments: dict[str, dict[str, str]] = {
+            unit: dict(self.base_environment.get(unit, {})) for unit in self.units
+        }
+        self.journal: dict[str, str] = {}
+
+    @property
+    def environment(self) -> dict[str, str]:
+        """The host collector's private environment (the phase-1 tests' view)."""
+
+        return self.environments[UNIT]
 
     # -- the drop-in is what systemd would apply on restart ------------------
-    def apply_dropin(self) -> None:
-        self.binds, self.inaccessible, self.environment = {}, set(), {}
-        path = probe.dropin_path(RUN)
-        if not path.is_file():
-            return
-        for line in path.read_text(encoding="utf-8").splitlines():
-            key, _, value = line.partition("=")
-            if key == "BindReadOnlyPaths":
-                source, _, dest = value.partition(":")
-                self.binds[dest] = source
-            elif key == "InaccessiblePaths":
-                self.inaccessible.add(value.lstrip("-"))
-            elif key == "Environment":
-                name, _, setting = value.partition("=")
-                self.environment[name] = setting
+    def apply_dropin(self, unit: str = UNIT) -> None:
+        environment = dict(self.base_environment.get(unit, {}))
+        binds: dict[str, str] = {}
+        inaccessible: set[str] = set()
+        path = probe.dropin_path(RUN, unit)
+        if path.is_file():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                key, _, value = line.partition("=")
+                if key == "BindReadOnlyPaths":
+                    source, _, dest = value.partition(":")
+                    binds[dest] = source
+                elif key == "InaccessiblePaths":
+                    inaccessible.add(value.lstrip("-"))
+                elif key == "Environment":
+                    name, _, setting = value.partition("=")
+                    environment[name] = setting
+                elif key == "UnsetEnvironment":
+                    environment.pop(value, None)
+        self.environments[unit] = environment
+        if unit == UNIT:
+            self.binds, self.inaccessible = binds, inaccessible
 
     def unit_view(self, path: str) -> str | None:
         """The path ``path`` resolves to inside the unit, or None if inaccessible."""
@@ -111,20 +138,27 @@ class FakeHost:
         self.calls.append(list(command))
         if command[0] == "nsenter":
             return self.nsenter(command[2], command[5:])
+        if command[0] == "journalctl":
+            unit = command[command.index("-u") + 1]
+            return subprocess.CompletedProcess(
+                command, 0, self.journal.get(unit, ""), ""
+            )
         if command[0] == "systemd-run":
             unit = next(item for item in command if item.startswith("--unit=")).split(
                 "=", 1
             )[1]
-            self.dropin_present_at_arm = probe.dropin_path(RUN).exists()
+            self.dropin_present_at_arm = any(
+                probe.dropin_path(RUN, item).exists() for item in self.units
+            )
             self.timers.add(f"{unit}.timer")
             return subprocess.CompletedProcess(command, 0, "", "")
         assert command[0] == "systemctl", command
         verb = command[1]
         if verb == "show":
             unit = command[2]
-            if unit == UNIT:
-                state = "active" if self.unit_active else "failed"
-                text = f"LoadState=loaded\nActiveState={state}\nSubState=running\nMainPID={MAIN_PID}\nNRestarts=0\n"
+            if unit in self.units:
+                state = "active" if self.unit_active or unit != UNIT else "failed"
+                text = f"LoadState=loaded\nActiveState={state}\nSubState=running\nMainPID={self.units[unit]}\nNRestarts=0\n"
             elif unit.endswith(".timer"):
                 state = "active" if unit in self.timers else "inactive"
                 text = f"LoadState=loaded\nActiveState={state}\nSubState=waiting\nMainPID=0\nNRestarts=0\n"
@@ -135,17 +169,23 @@ class FakeHost:
             for unit in command[2:]:
                 self.timers.discard(unit)
         if verb == "restart":
-            assert command[2] == UNIT, (
-                f"only the host collector may be restarted: {command}"
+            assert command[2] in self.units, (
+                f"only an allow-listed collector may be restarted: {command}"
             )
             self.restarts += 1
-            self.apply_dropin()
+            self.restarted.append(command[2])
+            self.apply_dropin(command[2])
         return subprocess.CompletedProcess(command, 0, "", "")
 
     def environment_of(self, pid: str, keys: tuple[str, ...]) -> dict[str, str]:
-        if pid != MAIN_PID:
-            return {}
-        return {name: value for name, value in self.environment.items() if name in keys}
+        for unit, unit_pid in self.units.items():
+            if pid == unit_pid:
+                return {
+                    name: value
+                    for name, value in self.environments[unit].items()
+                    if name in keys
+                }
+        return {}
 
 
 @pytest.fixture
@@ -247,7 +287,19 @@ def test_tree_inaccessible_env_and_unit_allow_lists() -> None:
         probe.checked_env_override("GPU_FAULT_CLUSTER_TOKEN=x")
     with pytest.raises(probe.ProbeError, match="Node Agent"):
         probe.checked_unit(probe.NODE_AGENT_UNIT)
-    assert probe.ALLOWED_UNITS == (UNIT,), "one allow-listed unit: the host collector"
+    assert probe.ALLOWED_UNITS == (UNIT, KERNEL_UNIT), (
+        "the host collector, and the kernel collector for its command window"
+    )
+    assert probe.UNIT_WRAPPERS == {KERNEL_UNIT: {"nvidia-smi": ("driver_version",)}}
+    assert probe.checked_unit_wrapper(UNIT, "smartctl") == "smartctl"
+    assert probe.checked_unit_wrapper(KERNEL_UNIT, "nvidia-smi") == "nvidia-smi"
+    with pytest.raises(probe.ProbeError, match="only, not 'smartctl'"):
+        probe.checked_unit_wrapper(KERNEL_UNIT, "smartctl")
+    assert probe.UNSET_ENV_BY_UNIT == {KERNEL_UNIT: ("GPU_FAULT_DRIVER_BRANCH",)}
+    assert probe.dropin_path(RUN) == probe.dropin_path(RUN, UNIT), (
+        "the host collector's drop-in path is unchanged for phase-1 deadmen"
+    )
+    assert probe.dropin_path(RUN, KERNEL_UNIT).parent.name == f"{KERNEL_UNIT}.d"
     assert probe.checked_name("plan-smartctl.json") == "plan-smartctl.json"
     with pytest.raises(probe.ProbeError, match="unsafe fixture name"):
         probe.checked_name("../window.json")

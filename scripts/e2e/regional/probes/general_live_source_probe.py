@@ -29,7 +29,14 @@ combinable in one window:
   installed with its sha256) first on the unit's PATH for ``smartctl``,
   ``ipmitool``, ``ethtool`` or the host collector's ``nvidia-smi`` queries. It
   forwards to the real binary and rewrites only the plan's allow-listed fields;
-  no host binary is replaced. ``py-spy`` is refused (Node Agent only).
+  no host binary is replaced. ``py-spy`` is refused (Node Agent only). With
+  ``--unit gpu-fault-kernel-collector.service`` (the runner's
+  ``KERNEL_COLLECTOR_SOURCE_REPLAY`` approval) the same mode -- and only this
+  mode -- opens on the kernel collector for its ``nvidia-smi`` driver-version
+  discovery query (``UNIT_WRAPPERS``): the unit restarts into the window, its
+  ``CollectorContext`` asks the wrapper for the version, and
+  ``GPU_FAULT_DRIVER_BRANCH`` is unset in that unit's environment so no
+  configured branch stands in (GF-GENERAL-LIVE-032 ``missing_version``).
 * **inaccessible** -- ``InaccessiblePaths=`` for an allow-listed path or tool
   binary inside the unit only (002 read_failure, 007 tool_missing, 012
   proc_unreadable).
@@ -42,12 +49,14 @@ in the unit's mount namespace / process environment and *not* in PID 1's.
 The Node Agent is never touched; no global mount is made and no real
 ``/proc``/sysfs file is written. ``proof_scope`` is always ``live-replay``.
 
-Two read-only commands serve the variants' oracle: ``inventory`` lists the
+Three read-only commands serve the variants' oracle: ``inventory`` lists the
 node's RDMA tree as the product reads it (driver identity, owned netdevs, port
 ``state``/``phys_state``, every ``counters``/``hw_counters`` file with its value,
-the names ``ethtool -S`` prints per netdev), and ``read-source --path`` shows
+the names ``ethtool -S`` prints per netdev), ``read-source --path`` shows
 one allow-listed source file as the unit sees it next to what PID 1 sees, so a
-closed window can prove the real value is read again.
+closed window can prove the real value is read again, and ``journal-read``
+returns the tail of an allow-listed unit's own journal since a moment (what the
+collector itself logged about its discovery).
 """
 
 from __future__ import annotations
@@ -69,9 +78,25 @@ from typing import Any
 STATE_ROOT = Path("/run/gfrs-live")
 DROPIN_ROOT = Path("/run/systemd/system")
 HOST_UNIT = "gpu-fault-host-collector.service"
+KERNEL_UNIT = "gpu-fault-kernel-collector.service"
 NODE_AGENT_UNIT = "gpu-fault-node-agent.service"
-#: The one unit a window may touch. The Node Agent is absent on purpose.
-ALLOWED_UNITS = (HOST_UNIT,)
+#: The units a window may touch. The Node Agent is absent on purpose. The host
+#: collector carries every mode; the kernel collector carries a *command*
+#: window for the queries ``UNIT_WRAPPERS`` lists and nothing else.
+ALLOWED_UNITS = (HOST_UNIT, KERNEL_UNIT)
+UNIT_WRAPPERS: dict[str, dict[str, tuple[str, ...]]] = {
+    KERNEL_UNIT: {"nvidia-smi": ("driver_version",)},
+}
+#: The kernel collector reads a configured driver branch before it asks
+#: ``nvidia-smi`` (``collectors/context.py``; the node installer writes the
+#: variable empty by default). It is unset in that unit's environment for the
+#: window -- ``UnsetEnvironment=`` applies after ``EnvironmentFile=`` -- so the
+#: wrapped query is the only version evidence the unit has.
+DRIVER_BRANCH_ENV = "GPU_FAULT_DRIVER_BRANCH"
+UNSET_ENV_BY_UNIT: dict[str, tuple[str, ...]] = {KERNEL_UNIT: (DRIVER_BRANCH_ENV,)}
+#: ``journal-read`` bounds.
+MAX_JOURNAL_LINES = 400
+MAX_JOURNAL_LINE_CHARS = 400
 PCI_ENV = "GPU_FAULT_PCI_DEVICES_ROOT"
 WRAPPER_NAME = "host_command_replay.py"
 #: The fixture builders, installed through ``install-source`` like the wrapper.
@@ -182,12 +207,8 @@ def state_dir(run_id: str) -> Path:
     return STATE_ROOT / f"source-{digest(run_id)}"
 
 
-def dropin_path(run_id: str) -> Path:
-    return (
-        DROPIN_ROOT
-        / f"{HOST_UNIT}.d"
-        / f"gpu-fault-source-replay-{digest(run_id)}.conf"
-    )
+def dropin_path(run_id: str, unit: str = HOST_UNIT) -> Path:
+    return DROPIN_ROOT / f"{unit}.d" / f"gpu-fault-source-replay-{digest(run_id)}.conf"
 
 
 def deadman_unit(run_id: str) -> str:
@@ -200,6 +221,29 @@ def checked_unit(unit: str) -> str:
     if unit not in ALLOWED_UNITS:
         raise ProbeError(f"{unit!r} is not an allow-listed collector unit")
     return unit
+
+
+def checked_unit_wrapper(unit: str, tool: str) -> str:
+    """``tool`` may be wrapped on ``unit`` (the kernel collector: nvidia-smi only)."""
+
+    restricted = UNIT_WRAPPERS.get(checked_unit(unit))
+    if restricted is not None and tool not in restricted:
+        raise ProbeError(
+            f"{unit} carries a wrapper for {sorted(restricted)} only, not {tool!r}"
+        )
+    return tool
+
+
+def checked_moment(text: str) -> str:
+    """An ISO-8601 moment as ``journalctl --since`` reads it (UTC)."""
+
+    try:
+        moment = datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ProbeError(f"not an ISO-8601 moment: {text!r}") from error
+    if moment.tzinfo is None:
+        raise ProbeError("a journal moment needs a timezone")
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 def checked_bind_dest(dest: str) -> str:
@@ -626,19 +670,24 @@ def load_wrappers(run_id: str) -> dict[str, Any]:
 def install_wrapper(arguments: argparse.Namespace) -> None:
     run_id = safe_id(arguments.run_id)
     tool = arguments.tool
+    unit = checked_unit(arguments.unit)
     module = load_wrapper_module(run_id)
     try:
         module.checked_tool(tool)
-        module.checked_unit(HOST_UNIT)
+        module.checked_unit(unit)
     except ValueError as error:
         raise ProbeError(str(error)) from error
+    checked_unit_wrapper(unit, tool)
     plan_file = fixtures_dir(run_id) / f"plan-{tool}.json"
     if not plan_file.is_file():
         raise ProbeError(f"install plan-{tool}.json before wrapping {tool}")
+    # The installed wrapper validates the plan against its own per-tool and
+    # per-unit allow-lists: the kernel collector takes driver_version rules only.
+    checker = getattr(module, "checked_unit_plan", None)
+    if checker is None:
+        raise ProbeError("the installed wrapper does not know per-unit plans")
     try:
-        plan = module.validate_plan(
-            tool, json.loads(plan_file.read_text(encoding="utf-8"))
-        )
+        plan = checker(unit, tool, json.loads(plan_file.read_text(encoding="utf-8")))
     except ValueError as error:
         raise ProbeError(f"plan-{tool}.json rejected: {error}") from error
     real = shutil.which(tool, path=STANDARD_PATH)
@@ -661,6 +710,7 @@ def install_wrapper(arguments: argparse.Namespace) -> None:
     wrappers[tool] = {
         "real": real,
         "shim": str(shim),
+        "unit": unit,
         "plan_sha256": hashlib.sha256(plan_file.read_bytes()).hexdigest(),
         "rules": len(plan["rules"]),
         "not_after": plan["not_after"],
@@ -776,10 +826,17 @@ def local_view(path: Path) -> dict[str, Any]:
     }
 
 
+def window_unit(state: dict[str, Any]) -> str:
+    """The unit a window's state names (phase-1 states name none: the host)."""
+
+    return str(state.get("unit") or HOST_UNIT)
+
+
 def verify_window(run_id: str, state: dict[str, Any]) -> dict[str, Any]:
-    pid = unit_state(HOST_UNIT).get("MainPID", "0")
+    unit = window_unit(state)
+    pid = unit_state(unit).get("MainPID", "0")
     if not pid.isdigit() or pid == "0":
-        raise ProbeError(f"{HOST_UNIT} has no main process to verify against")
+        raise ProbeError(f"{unit} has no main process to verify against")
     checks: list[dict[str, Any]] = []
     bound = [("bind", item) for item in state.get("binds", [])] + [
         ("tree", item) for item in state.get("trees", [])
@@ -814,8 +871,18 @@ def verify_window(run_id: str, state: dict[str, Any]) -> dict[str, Any]:
                 "ok": not unit["readable"] and host["readable"],
             }
         )
-    keys = ("PATH", PCI_ENV, *ENV_OVERRIDES)
+    unset = [str(item) for item in state.get("unset_env") or []]
+    keys = ("PATH", PCI_ENV, *ENV_OVERRIDES, *unset)
     environment = process_environment(pid, keys)
+    for name in unset:
+        checks.append(
+            {
+                "kind": "unset-env",
+                "dest": name,
+                "unit_has": name in environment,
+                "ok": name not in environment,
+            }
+        )
     for tool, record in state.get("wrappers", {}).items():
         shim = record["shim"]
         in_unit = nsenter(pid, ["/usr/bin/test", "-x", shim]).returncode == 0
@@ -861,6 +928,7 @@ def preflight(arguments: argparse.Namespace) -> None:
         {
             "captured_at": utc_now(),
             "unit": unit_state(HOST_UNIT),
+            "units": {unit: unit_state(unit) for unit in ALLOWED_UNITS},
             "tools": {tool: tool_locations(tool) for tool in WRAPPABLE_TOOLS},
             "nsenter": shutil.which("nsenter", path=STANDARD_PATH) is not None,
             "infiniband_devices": sorted(
@@ -901,12 +969,19 @@ def dropin_lines(
                 raise ProbeError(
                     f"install-wrapper {tool} before opening a command window"
                 )
+            installed_for = str(wrappers[tool].get("unit") or HOST_UNIT)
+            if installed_for != state["unit"]:
+                raise ProbeError(
+                    f"{tool} was installed for {installed_for}, not {state['unit']}"
+                )
             state["wrappers"][tool] = wrappers[tool]
         audit_dir(run_id).mkdir(mode=0o755, parents=True, exist_ok=True)
         lines.append(f"Environment=PATH={bin_dir(run_id)}:{STANDARD_PATH}")
         # The wrapper journals and counts calls here; /run is read-only for the
         # unit under ProtectSystem=strict without this.
         lines.append(f"ReadWritePaths={audit_dir(run_id)}")
+        for name in state.get("unset_env") or []:
+            lines.append(f"UnsetEnvironment={name}")
     for item in arguments.inaccessible:
         for path in checked_inaccessible(item):
             lines.append(f"InaccessiblePaths=-{path}")
@@ -939,28 +1014,52 @@ def checked_mode(arguments: argparse.Namespace) -> str:
     return mode
 
 
+def checked_unit_window(unit: str, arguments: argparse.Namespace, mode: str) -> str:
+    """A window on a unit other than the host collector is a command window only."""
+
+    if unit == HOST_UNIT:
+        return unit
+    if (
+        mode != "command"
+        or arguments.bind
+        or arguments.tree
+        or arguments.inaccessible
+        or arguments.env
+        or arguments.pci_root
+    ):
+        raise ProbeError(
+            f"{unit} carries a command-output window only (--mode command with "
+            "--wrapper); no bind, tree, inaccessible path, count override or PCI root"
+        )
+    for tool in arguments.wrapper:
+        checked_unit_wrapper(unit, tool)
+    return unit
+
+
 def open_window(arguments: argparse.Namespace) -> None:
     run_id = safe_id(arguments.run_id)
     mode = checked_mode(arguments)
+    unit = checked_unit_window(checked_unit(arguments.unit), arguments, mode)
     restore_seconds = checked_restore_seconds(arguments.restore_seconds)
     if load_state(run_id):
         raise ProbeError("a source replay window for this run is already open")
-    dropin = dropin_path(run_id)
+    dropin = dropin_path(run_id, unit)
     if dropin.exists():
         raise ProbeError("an untracked source replay drop-in already exists")
-    before = unit_state(HOST_UNIT)
+    before = unit_state(unit)
     if before.get("ActiveState") != "active":
-        raise ProbeError(f"{HOST_UNIT} is not active at baseline")
+        raise ProbeError(f"{unit} is not active at baseline")
     state: dict[str, Any] = {
         "run_id": run_id,
         "mode": mode,
-        "unit": checked_unit(HOST_UNIT),
+        "unit": unit,
         "dropin": str(dropin),
         "binds": [],
         "trees": [],
         "wrappers": {},
         "inaccessible": [],
         "env": {},
+        "unset_env": list(UNSET_ENV_BY_UNIT.get(unit, ())),
         "pci_root": False,
         "before": before,
         "opened_at": utc_now(),
@@ -975,11 +1074,11 @@ def open_window(arguments: argparse.Namespace) -> None:
     dropin.parent.mkdir(parents=True, exist_ok=True)
     dropin.write_text("\n".join(lines) + "\n", encoding="utf-8")
     run(["systemctl", "daemon-reload"])
-    run(["systemctl", "restart", HOST_UNIT], timeout=120)
-    after = unit_state(HOST_UNIT)
+    run(["systemctl", "restart", unit], timeout=120)
+    after = unit_state(unit)
     if after.get("ActiveState") != "active":
         _close(run_id, state)
-        raise ProbeError(f"{HOST_UNIT} is not active after the window opened; closed")
+        raise ProbeError(f"{unit} is not active after the window opened; closed")
     verification: dict[str, Any] = {"skipped": True}
     if not arguments.skip_verify:
         try:
@@ -1008,10 +1107,17 @@ def apply_value(arguments: argparse.Namespace) -> None:
     """Rewrite a bound fixture value; the unit re-reads the file each poll."""
 
     run_id = safe_id(arguments.run_id)
-    if not load_state(run_id):
+    state = load_state(run_id)
+    if not state:
         raise ProbeError("no source replay window is open for this run")
     set_value(arguments)
-    emit({"run_id": run_id, "unit": unit_state(HOST_UNIT), "value": arguments.value})
+    emit(
+        {
+            "run_id": run_id,
+            "unit": unit_state(window_unit(state)),
+            "value": arguments.value,
+        }
+    )
 
 
 def status(arguments: argparse.Namespace) -> None:
@@ -1037,10 +1143,55 @@ def status(arguments: argparse.Namespace) -> None:
         {
             "run_id": run_id,
             "mode": state["mode"],
-            "unit": unit_state(HOST_UNIT),
+            "unit": unit_state(window_unit(state)),
+            "unit_name": window_unit(state),
             "fixtures": fixtures,
             "wrappers": sorted(state.get("wrappers", {})),
             "audit_lines": audits,
+        }
+    )
+
+
+def journal_read(arguments: argparse.Namespace) -> None:
+    """The tail of one allow-listed unit's journal since a moment (read-only).
+
+    What the collector itself logged about its discovery is the unit's own
+    record of a replayed query (``collectors/context.py`` warns when the
+    version discovery is unavailable; ``collectors/gpu/discovery.py`` logs the
+    branch it found). Lines are bounded in number and length.
+    """
+
+    run_id = safe_id(arguments.run_id)
+    unit = checked_unit(arguments.unit)
+    since = checked_moment(arguments.since)
+    tail = max(1, min(int(arguments.tail), MAX_JOURNAL_LINES))
+    completed = run(
+        [
+            "journalctl",
+            "-u",
+            unit,
+            "--since",
+            since,
+            "-n",
+            str(tail),
+            "--no-pager",
+            "-q",
+            "-o",
+            "cat",
+        ],
+        check=False,
+        timeout=60,
+    )
+    lines = [line[:MAX_JOURNAL_LINE_CHARS] for line in completed.stdout.splitlines()]
+    emit(
+        {
+            "run_id": run_id,
+            "unit": unit,
+            "since": since,
+            "returncode": completed.returncode,
+            "lines": lines,
+            "truncated": len(lines) >= tail,
+            "window_open": bool(load_state(run_id)),
         }
     )
 
@@ -1054,13 +1205,14 @@ def verify(arguments: argparse.Namespace) -> None:
 
 
 def _close(run_id: str, state: dict[str, Any]) -> dict[str, Any]:
-    dropin = Path(state.get("dropin") or dropin_path(run_id))
+    unit = window_unit(state)
+    dropin = Path(state.get("dropin") or dropin_path(run_id, unit))
     dropin.unlink(missing_ok=True)
     run(["systemctl", "daemon-reload"])
-    run(["systemctl", "restart", HOST_UNIT], timeout=120)
-    after = unit_state(HOST_UNIT)
+    run(["systemctl", "restart", unit], timeout=120)
+    after = unit_state(unit)
     if after.get("ActiveState") != "active":
-        raise ProbeError(f"{HOST_UNIT} is not active after the window closed")
+        raise ProbeError(f"{unit} is not active after the window closed")
     disarm_deadman(run_id)
     residue = {
         "dropin": dropin.exists(),
@@ -1070,18 +1222,30 @@ def _close(run_id: str, state: dict[str, Any]) -> dict[str, Any]:
     if state_dir(run_id).is_dir():
         shutil.rmtree(state_dir(run_id))
     residue["state_dir"] = state_dir(run_id).exists()
-    return {"after": after, "residue": residue, "clean": not any(residue.values())}
+    return {
+        "unit": unit,
+        "after": after,
+        "residue": residue,
+        "clean": not any(residue.values()),
+    }
 
 
 def close_window(arguments: argparse.Namespace) -> None:
     run_id = safe_id(arguments.run_id)
     state = load_state(run_id)
     if not state:
-        dropin = dropin_path(run_id)
-        if dropin.exists():
-            # A crash between the drop-in and the state file: still restore.
-            emit({"run_id": run_id, "untracked_dropin": True, **_close(run_id, {})})
-            return
+        for unit in ALLOWED_UNITS:
+            dropin = dropin_path(run_id, unit)
+            if dropin.exists():
+                # A crash between the drop-in and the state file: still restore.
+                emit(
+                    {
+                        "run_id": run_id,
+                        "untracked_dropin": True,
+                        **_close(run_id, {"unit": unit, "dropin": str(dropin)}),
+                    }
+                )
+                return
         if state_dir(run_id).is_dir():
             shutil.rmtree(state_dir(run_id))
         emit({"run_id": run_id, "already_closed": True, "clean": True})
@@ -1096,7 +1260,7 @@ def snapshot(arguments: argparse.Namespace) -> None:
         {
             "run_id": run_id,
             "window_open": bool(state),
-            "dropin": dropin_path(run_id).exists(),
+            "dropin": any(dropin_path(run_id, unit).exists() for unit in ALLOWED_UNITS),
             "state_dir": state_dir(run_id).exists(),
             "deadman": unit_state(f"{deadman_unit(run_id)}.timer").get("ActiveState")
             == "active",
@@ -1151,9 +1315,11 @@ def parser() -> argparse.ArgumentParser:
     add(item, "--set", **many)
     item = command("install-wrapper", install_wrapper)
     item.add_argument("--tool", required=True)
+    item.add_argument("--unit", default=HOST_UNIT)
     add(item, "--allow-missing-real", **switch)
     item = command("open-window", open_window)
     item.add_argument("--mode", choices=WINDOW_MODES, required=True)
+    item.add_argument("--unit", default=HOST_UNIT)
     add(item, "--bind --tree --wrapper --inaccessible --env", **many)
     add(item, "--pci-root --skip-verify", **switch)
     item.add_argument("--restore-seconds", type=int, default=900)
@@ -1163,6 +1329,9 @@ def parser() -> argparse.ArgumentParser:
     item = command("audit-read", audit_read)
     item.add_argument("--tool", required=True)
     item.add_argument("--tail", type=int, default=100)
+    item = command("journal-read", journal_read)
+    add(item, "--unit --since", required=True)
+    item.add_argument("--tail", type=int, default=200)
     for name, handler in (
         ("status", status),
         ("verify", verify),

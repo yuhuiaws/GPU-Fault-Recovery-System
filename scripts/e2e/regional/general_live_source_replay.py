@@ -23,6 +23,17 @@ the PCI-root repoint needs the ``HOST_SOURCE_REPLAY`` approval on the plan;
 ``host_source_replay(ctx)`` carries the variant's approvals in and refuses the
 extended modes without it.
 
+The same controller opens a *command* window on the kernel collector unit
+(``kernel_collector_source_replay(ctx)``, ``unit=KERNEL_UNIT``) under its own
+approval, ``KERNEL_COLLECTOR_SOURCE_REPLAY``: only the ``nvidia-smi``
+``driver_version`` query the unit's ``CollectorContext`` runs at start may be
+answered there (``tools/host_command_replay.py`` ``UNIT_QUERIES``), the probe
+unsets ``GPU_FAULT_DRIVER_BRANCH`` in that unit's environment for the window,
+and every file, tree, inaccessible-path, count-override and PCI-root mode is
+refused for it. ``HOST_SOURCE_REPLAY`` never unlocks the kernel collector and
+``KERNEL_COLLECTOR_SOURCE_REPLAY`` never unlocks the host collector's extended
+modes (GF-GENERAL-LIVE-032 ``missing_version``).
+
 Plans for the command wrapper are built here and validated against the
 wrapper's own per-tool, per-field allow-list before anything is sent::
 
@@ -60,6 +71,15 @@ BUILDERS_MODULE = Path(__file__).with_name("probes") / "general_live_source_buil
 PROOF_SCOPE = "live-replay"
 #: The ``--approve`` token the extended modes need (``general_live_registry.APPROVALS``).
 HOST_SOURCE_REPLAY = "HOST_SOURCE_REPLAY"
+#: The token a command window on the kernel collector unit needs instead.
+KERNEL_COLLECTOR_SOURCE_REPLAY = "KERNEL_COLLECTOR_SOURCE_REPLAY"
+HOST_UNIT = probe.HOST_UNIT
+KERNEL_UNIT = probe.KERNEL_UNIT
+#: The one token that unlocks each allow-listed unit.
+UNIT_TOKENS = {
+    HOST_UNIT: HOST_SOURCE_REPLAY,
+    KERNEL_UNIT: KERNEL_COLLECTOR_SOURCE_REPLAY,
+}
 #: Bind destinations the phase-1 variants used before the token existed.
 LEGACY_BIND_DESTS = ("/proc/stat",)
 #: Fixture tree names the builders produce (``--tree <name>:<dest>``).
@@ -128,9 +148,14 @@ class HostSourceReplay:
         active_deadline_seconds: int = 3600,
         host: Any | None = None,
         approvals: Iterable[str] = (),
+        unit: str = HOST_UNIT,
     ) -> None:
         self.run_id = run_id
         self.approvals = frozenset(approvals)
+        try:
+            self.unit = wrapper.checked_unit(unit)
+        except wrapper.PlanError as error:
+            raise HostSourceReplayError(str(error)) from error
         self._opened = False
         self._wrapper_installed = False
         self._builders_installed = False
@@ -151,13 +176,26 @@ class HostSourceReplay:
 
     # ------------------------------------------------------------------ guards
     @property
+    def token(self) -> str:
+        """The ``--approve`` token this controller's unit needs."""
+
+        return UNIT_TOKENS[self.unit]
+
+    @property
     def approved(self) -> bool:
-        return HOST_SOURCE_REPLAY in self.approvals
+        return self.token in self.approvals
 
     def _require_approval(self, what: str) -> None:
         if not self.approved:
             raise HostSourceReplayError(
-                f"{what} needs the {HOST_SOURCE_REPLAY} approval on the plan"
+                f"{what} needs the {self.token} approval on the plan"
+            )
+
+    def _require_host_unit(self, what: str) -> None:
+        if self.unit != HOST_UNIT:
+            raise HostSourceReplayError(
+                f"{what} is a host collector mode; {self.unit} carries a "
+                "command-output replay only"
             )
 
     def create(self) -> None:
@@ -197,6 +235,7 @@ class HostSourceReplay:
             self._builders_installed = True
 
     def build_pci(self, *, efa_count: int, malformed: bool = False) -> dict[str, Any]:
+        self._require_host_unit("a PCI-root replay")
         self._install_builders()
         arguments = ["build-pci-fixture", "--efa-count", str(int(efa_count))]
         if malformed:
@@ -227,6 +266,7 @@ class HostSourceReplay:
         no netdev is given one so ``ethtool -S`` is run for it).
         """
 
+        self._require_host_unit("an infiniband tree replay")
         self._require_approval("an infiniband tree replay")
         self._install_builders()
         arguments = ["build-infiniband-fixture", "--source", source]
@@ -263,12 +303,29 @@ class HostSourceReplay:
         After ``close`` this is the proof that the real source is read again.
         """
 
+        self._require_host_unit("a source file read-back")
         try:
             probe.checked_source_path(dest)
         except probe.ProbeError as error:
             raise HostSourceReplayError(str(error)) from error
         self.create()
         return self._execute("read-source", "--path", dest, timeout=60)
+
+    def journal(self, *, since: Any, tail: int = 200) -> dict[str, Any]:
+        """The unit's own journal since ``since`` (a datetime): bounded, read-only."""
+
+        self.create()
+        moment = since.isoformat() if hasattr(since, "isoformat") else str(since)
+        return self._execute(
+            "journal-read",
+            "--unit",
+            self.unit,
+            "--since",
+            moment,
+            "--tail",
+            str(int(tail)),
+            timeout=60,
+        )
 
     def build_nvidia_proc(
         self,
@@ -281,6 +338,7 @@ class HostSourceReplay:
     ) -> dict[str, Any]:
         """Copy ``/proc/driver/nvidia`` with reviewed gaps (``--tree nvidia-proc:...``)."""
 
+        self._require_host_unit("a /proc/driver/nvidia tree replay")
         self._require_approval("a /proc/driver/nvidia tree replay")
         self._install_builders()
         arguments = ["build-nvidia-proc-fixture", "--source", source]
@@ -305,6 +363,7 @@ class HostSourceReplay:
         of what the product's ``_memory`` contributor will compute.
         """
 
+        self._require_host_unit("a /proc/meminfo replay")
         self._require_approval("a /proc/meminfo replay")
         unknown = sorted(set(fields_kb) - set(MEMINFO_FIELDS))
         if unknown or not fields_kb:
@@ -325,11 +384,16 @@ class HostSourceReplay:
 
         self._require_approval("a command-output replay")
         try:
-            checked = wrapper.validate_plan(tool, dict(plan))
+            checked = wrapper.checked_unit_plan(self.unit, tool, dict(plan))
         except wrapper.PlanError as error:
             raise HostSourceReplayError(f"{tool} plan rejected: {error}") from error
         content = json.dumps(checked, sort_keys=True).encode("utf-8")
         return self.install(f"plan-{tool}.json", content)
+
+    def _unit_arguments(self) -> list[str]:
+        """``--unit`` for a window off the host collector (the probe's default)."""
+
+        return [] if self.unit == HOST_UNIT else ["--unit", self.unit]
 
     def install_wrapper(
         self, tool: str, plan: Mapping[str, Any], *, allow_missing_real: bool = False
@@ -346,7 +410,7 @@ class HostSourceReplay:
             self.install(probe.WRAPPER_NAME, WRAPPER_TOOL.read_bytes())
             self._wrapper_installed = True
         receipts = {"plan": self.install_plan(tool, plan)}
-        arguments = ["install-wrapper", "--tool", tool]
+        arguments = ["install-wrapper", "--tool", tool, *self._unit_arguments()]
         if allow_missing_real:
             arguments.append("--allow-missing-real")
         receipts["wrapper"] = self._execute(*arguments, timeout=120)
@@ -387,6 +451,10 @@ class HostSourceReplay:
         """
 
         env_pairs = list(env.items()) if isinstance(env, Mapping) else list(env)
+        if binds or trees or inaccessible or env_pairs or pci_root:
+            self._require_host_unit(
+                "a file, tree, inaccessible-path, override or PCI-root window"
+            )
         extended = (
             any(not legacy_bind(dest) for _name, dest in binds)
             or bool(trees)
@@ -440,6 +508,7 @@ class HostSourceReplay:
             mode,
             "--restore-seconds",
             str(int(restore_seconds)),
+            *self._unit_arguments(),
         ]
         for name, dest in binds:
             arguments += ["--bind", f"{name}:{dest}"]
@@ -497,6 +566,7 @@ class HostSourceReplay:
         )
 
     def set_value(self, name: str, value: int | str) -> dict[str, Any]:
+        self._require_host_unit("a fixture value step")
         require_action_time(60)
         return self._execute(
             "set-value", "--name", name, "--value", str(value), timeout=60
@@ -505,6 +575,7 @@ class HostSourceReplay:
     def set_tree_value(self, name: str, path: str, value: int | str) -> dict[str, Any]:
         """Rewrite one file of an open fixture tree (``name`` = tree, ``path`` inside it)."""
 
+        self._require_host_unit("a fixture tree step")
         require_action_time(60)
         return self._execute(
             "set-value",
@@ -552,15 +623,27 @@ class HostSourceReplay:
             "proof_scope": PROOF_SCOPE,
             "physical_fault_injected": False,
             "run_id": self.run_id,
+            "unit": self.unit,
             "approved": self.approved,
             **extra,
         }
 
 
-def host_source_replay(ctx: VariantContext) -> HostSourceReplay:
+#: The probe handle key and cleanup name per unit (tests pre-register fakes
+#: under the key; phase-1 variants keep the host collector's names).
+UNIT_HANDLES = {
+    HOST_UNIT: "source-replay",
+    KERNEL_UNIT: "kernel-collector-replay",
+}
+
+
+def host_source_replay(
+    ctx: VariantContext, *, unit: str = HOST_UNIT
+) -> HostSourceReplay:
     """Build a ``HostSourceReplay`` from a variant context and register cleanup."""
 
-    host = ctx.probes.get(f"source-replay@{ctx.settings.node}")
+    handle = UNIT_HANDLES.get(unit, "source-replay")
+    host = ctx.probes.get(f"{handle}@{ctx.settings.node}")
     replay = HostSourceReplay(
         ctx.regional,
         node=ctx.settings.node,
@@ -571,25 +654,38 @@ def host_source_replay(ctx: VariantContext) -> HostSourceReplay:
         active_deadline_seconds=ctx.spec.max_minutes * 60 + 1200,
         host=host,
         approvals=ctx.settings.approvals,
+        unit=unit,
     )
-    ctx.cleanup.push("source-replay", replay.cleanup)
+    ctx.cleanup.push(handle, replay.cleanup)
     return replay
+
+
+def kernel_collector_source_replay(ctx: VariantContext) -> HostSourceReplay:
+    """The kernel collector's command-only window (``KERNEL_COLLECTOR_SOURCE_REPLAY``)."""
+
+    return host_source_replay(ctx, unit=KERNEL_UNIT)
 
 
 __all__ = [
     "DEFAULT_PLAN_SECONDS",
     "HOST_SOURCE_REPLAY",
+    "HOST_UNIT",
     "INFINIBAND_TREE",
+    "KERNEL_COLLECTOR_SOURCE_REPLAY",
+    "KERNEL_UNIT",
     "MEMINFO_FIELDS",
     "MEMINFO_FIXTURE",
     "NVIDIA_PROC_TREE",
     "PROOF_SCOPE",
     "TOOLS",
     "TREE_DESTS",
+    "UNIT_HANDLES",
+    "UNIT_TOKENS",
     "HostSourceReplay",
     "HostSourceReplayError",
     "command_plan",
     "host_source_replay",
+    "kernel_collector_source_replay",
     "legacy_bind",
     "rule",
 ]

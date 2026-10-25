@@ -35,22 +35,93 @@ def _plan(tool: str, *rules: dict) -> dict:
     return {"tool": tool, "not_after": time.time() + 600, "rules": list(rules)}
 
 
-def test_catalog_names_the_spec_tools_and_the_host_unit_only() -> None:
+def test_catalog_names_the_spec_tools_and_the_collector_units_only() -> None:
     assert set(wrapper.TOOLS) == {"smartctl", "ipmitool", "ethtool", "nvidia-smi"}, (
         "the wrapper catalogue is exactly the spec's command sources"
     )
-    assert wrapper.ALLOWED_UNITS == ("gpu-fault-host-collector.service",), (
-        "only the host collector unit may carry a wrapper"
-    )
+    assert wrapper.ALLOWED_UNITS == (
+        "gpu-fault-host-collector.service",
+        "gpu-fault-kernel-collector.service",
+    ), "the host collector, and the kernel collector for its version query only"
     assert wrapper.NODE_AGENT_UNIT not in wrapper.ALLOWED_UNITS, (
         "the Node Agent is never in the allow-list"
     )
     with pytest.raises(wrapper.PlanError, match="Node Agent"):
         wrapper.checked_unit(wrapper.NODE_AGENT_UNIT)
+    with pytest.raises(wrapper.PlanError, match="may not carry a wrapper"):
+        wrapper.checked_unit("gpu-fault-metrics-collector.service")
     with pytest.raises(wrapper.PlanError, match="never in a replay allow-list"):
         wrapper.checked_tool("py-spy")
     with pytest.raises(wrapper.PlanError, match="not a replayable tool"):
         wrapper.checked_tool("journalctl")
+
+
+def test_kernel_collector_carries_the_driver_version_query_only() -> None:
+    """KERNEL_COLLECTOR_SOURCE_REPLAY: one unit, one tool, one query."""
+
+    assert wrapper.UNIT_QUERIES == {
+        wrapper.KERNEL_UNIT: {"nvidia-smi": frozenset({"driver_version"})}
+    }
+    assert wrapper.unit_queries(wrapper.HOST_UNIT, "nvidia-smi") is None, (
+        "the host collector may carry every catalogued query"
+    )
+    assert wrapper.unit_queries(wrapper.KERNEL_UNIT, "smartctl") == frozenset()
+    version = {
+        "query": "driver_version",
+        "action": "exit",
+        "exit_code": 1,
+        "stderr": "withheld\n",
+    }
+    checked = wrapper.checked_unit_plan(
+        wrapper.KERNEL_UNIT, "nvidia-smi", _plan("nvidia-smi", version)
+    )
+    assert [rule["query"] for rule in checked["rules"]] == ["driver_version"]
+    passthrough = {"query": "driver_version", "action": "passthrough"}
+    wrapper.checked_unit_plan(
+        wrapper.KERNEL_UNIT, "nvidia-smi", _plan("nvidia-smi", passthrough)
+    )
+    with pytest.raises(wrapper.PlanError, match="may rewrite only"):
+        wrapper.checked_unit_plan(
+            wrapper.KERNEL_UNIT,
+            "nvidia-smi",
+            _plan(
+                "nvidia-smi",
+                version,
+                {"query": "utilization", "action": "drop_row", "uuid": UUID_A},
+            ),
+        )
+    with pytest.raises(wrapper.PlanError, match="may rewrite only"):
+        wrapper.checked_unit_plan(
+            wrapper.KERNEL_UNIT,
+            "nvidia-smi",
+            _plan(
+                "nvidia-smi", {"query": "topology", "action": "exit", "exit_code": 2}
+            ),
+        )
+    with pytest.raises(wrapper.PlanError, match="may not carry a smartctl wrapper"):
+        wrapper.checked_unit_plan(
+            wrapper.KERNEL_UNIT,
+            "smartctl",
+            _plan("smartctl", {"query": "scan", "action": "exit", "exit_code": 2}),
+        )
+    with pytest.raises(wrapper.PlanError, match="Node Agent"):
+        wrapper.checked_unit_plan(
+            wrapper.NODE_AGENT_UNIT, "nvidia-smi", _plan("nvidia-smi", version)
+        )
+    # The host collector keeps every reviewed field (the 012 row drop included).
+    host = wrapper.checked_unit_plan(
+        wrapper.HOST_UNIT,
+        "nvidia-smi",
+        _plan(
+            "nvidia-smi",
+            version,
+            {"query": "utilization", "action": "drop_row", "uuid": UUID_A},
+        ),
+    )
+    assert len(host["rules"]) == 2
+    # A malformed plan is still a plan error before the unit is considered.
+    with pytest.raises(wrapper.PlanError, match="exactly the keys"):
+        wrapper.checked_unit_plan(wrapper.KERNEL_UNIT, "nvidia-smi", {"tool": "x"})
 
 
 def test_validate_plan_accepts_each_reviewed_field() -> None:

@@ -9,9 +9,13 @@ probe (``scripts/e2e/regional/probes/general_live_source_probe.py``) installs
 this file and a reviewed plan under ``/run/gfrs-live/<run>/`` with sha256
 checks, writes a shim named after the tool into that run's ``bin/`` and puts
 ``bin/`` first on the PATH of exactly one allow-listed collector unit through a
-``/run`` drop-in that cleanup and a deadman remove. The Node Agent is never in
-the allow-list, and ``py-spy`` -- which only the Node Agent runs, by absolute
-path -- is refused by name.
+``/run`` drop-in that cleanup and a deadman remove. The host collector may
+carry every catalogued query; the kernel collector
+(``gpu-fault-kernel-collector.service``) only its ``nvidia-smi`` driver-version
+discovery query (``UNIT_QUERIES``, the ``KERNEL_COLLECTOR_SOURCE_REPLAY``
+approval of GF-GENERAL-LIVE-032 ``missing_version``). The Node Agent is never
+in the allow-list, and ``py-spy`` -- which only the Node Agent runs, by
+absolute path -- is refused by name.
 
 Every invocation is forwarded to the real binary (the first one on PATH outside
 ``/run/gfrs-live``) unchanged unless the argv is one of the catalogued queries
@@ -47,9 +51,21 @@ TOOL_ENV = "GFRS_LIVE_TOOL"
 DIR_ENV = "GFRS_LIVE_REPLAY_DIR"
 PROOF_SCOPE = "live-replay"
 HOST_UNIT = "gpu-fault-host-collector.service"
+KERNEL_UNIT = "gpu-fault-kernel-collector.service"
 NODE_AGENT_UNIT = "gpu-fault-node-agent.service"
-#: The only unit whose PATH may carry a wrapper. The Node Agent is absent on purpose.
-ALLOWED_UNITS = (HOST_UNIT,)
+#: The units whose PATH may carry a wrapper. The Node Agent is absent on purpose.
+ALLOWED_UNITS = (HOST_UNIT, KERNEL_UNIT)
+#: Per unit, the catalogued queries a wrapper may rewrite there. A unit absent
+#: here (the host collector) may carry every query of every tool. The kernel
+#: collector shells out to ``nvidia-smi`` only to discover its GPU identity and
+#: software versions at unit start (``collectors/context.py``); only the
+#: driver-version query may be answered for it, so the version the
+#: ``CollectorContext`` stamps on every XID event is the one reading replaced
+#: (GF-GENERAL-LIVE-032 ``missing_version``). Its identity query and every
+#: other call pass through to the real binary.
+UNIT_QUERIES: dict[str, dict[str, frozenset[str]]] = {
+    KERNEL_UNIT: {"nvidia-smi": frozenset({"driver_version"})},
+}
 MAX_RULES = 16
 MAX_STDOUT_BYTES = 64 * 1024
 MAX_STDERR_BYTES = 4 * 1024
@@ -248,6 +264,40 @@ def checked_unit(unit: Any) -> str:
     if unit not in ALLOWED_UNITS:
         raise PlanError(f"{unit!r} may not carry a wrapper; allowed: {ALLOWED_UNITS}")
     return str(unit)
+
+
+def unit_queries(unit: Any, tool: str) -> frozenset[str] | None:
+    """The queries of ``tool`` a wrapper on ``unit`` may rewrite; ``None`` = all."""
+
+    restricted = UNIT_QUERIES.get(checked_unit(unit))
+    if restricted is None:
+        return None
+    return restricted.get(tool, frozenset())
+
+
+def checked_unit_plan(unit: Any, tool: str, plan: Any) -> dict[str, Any]:
+    """``validate_plan`` plus the unit's own query allow-list.
+
+    The host collector takes every reviewed plan; the kernel collector only a
+    plan whose rules all name the queries ``UNIT_QUERIES`` lists for it.
+    """
+
+    checked = validate_plan(tool, plan)
+    allowed = unit_queries(unit, tool)
+    if allowed is None:
+        return checked
+    if not allowed:
+        raise PlanError(
+            f"{unit} may not carry a {tool} wrapper; it carries only "
+            f"{sorted(UNIT_QUERIES[str(unit)])}"
+        )
+    outside = sorted({str(rule["query"]) for rule in checked["rules"]} - allowed)
+    if outside:
+        raise PlanError(
+            f"{unit} may rewrite only the {tool} queries {sorted(allowed)}; "
+            f"the plan names {outside}"
+        )
+    return checked
 
 
 def _bounded_int(value: Any, low: int, high: int, label: str) -> int:

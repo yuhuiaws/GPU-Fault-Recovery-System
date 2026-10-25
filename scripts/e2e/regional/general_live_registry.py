@@ -143,6 +143,25 @@ APPROVALS: dict[str, str] = {
         "allow-listed fields; no host binary is replaced, no global mount is "
         "made, the Node Agent is never touched; removed by cleanup and a deadman"
     ),
+    # GF-GENERAL-LIVE-032 missing_version: the version the NVLink5 decoder
+    # gates on is the one the KERNEL collector's own CollectorContext stamps.
+    "KERNEL_COLLECTOR_SOURCE_REPLAY": (
+        "extend the host source replay's command-output mode to "
+        "gpu-fault-kernel-collector.service for its nvidia-smi driver-version "
+        "discovery query only (--query-gpu=driver_version, "
+        "collectors/gpu/discovery.py): the reviewed pass-through wrapper first "
+        "on that unit's PATH answers that one query with a reviewed failure or "
+        "empty output so the restarted collector's CollectorContext discovers "
+        "no driver branch and stamps none on its XID events, "
+        "GPU_FAULT_DRIVER_BRANCH is unset in that unit's environment for the "
+        "window (the installer writes it empty by default) so no configured "
+        "branch stands in, and every other nvidia-smi call (the GPU identity "
+        "query included) passes through to the real binary; no file bind, "
+        "tree, inaccessible path, count override or PCI root on that unit; "
+        "the unit is restarted into the window and restarted back onto the "
+        "real binary by cleanup and a deadman; the host collector and the "
+        "Node Agent are never touched by this token"
+    ),
     # GF-GENERAL-LIVE-009 tcp_only: the AL2023 EKS node image ships no tc.
     "TEMP_TEST_PACKAGE_INSTALL": (
         "install, for this run only, a test package the node lacks with dnf: "

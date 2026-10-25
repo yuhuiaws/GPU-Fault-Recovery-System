@@ -497,6 +497,208 @@ def test_host_source_replay_from_a_variant_context(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# the kernel collector's command window (KERNEL_COLLECTOR_SOURCE_REPLAY, 032)
+# --------------------------------------------------------------------------- #
+KERNEL_TOKEN = helper.KERNEL_COLLECTOR_SOURCE_REPLAY
+VERSION_RULE = helper.rule("driver_version", "exit", exit_code=1, stderr="withheld\n")
+
+
+def _kernel_controller(tmp_path: Path, approvals: tuple[str, ...], **extra: object):
+    fake = FakeProbe(_script(**extra))
+    controller = helper.HostSourceReplay(
+        _Regional(),
+        node=NODE,
+        image="img@sha256:" + "0" * 64,
+        case_id="GF-GENERAL-LIVE-032.missing_version",
+        run_id="gl032-missing-version-a1-deadbeef",
+        case_dir=tmp_path / "case",
+        host=fake,
+        approvals=approvals,
+        unit=helper.KERNEL_UNIT,
+    )
+    return controller, fake
+
+
+def test_registry_carries_the_kernel_collector_token() -> None:
+    meaning = APPROVALS[KERNEL_TOKEN]
+    for phrase in (
+        "gpu-fault-kernel-collector.service",
+        "driver-version discovery query only",
+        "--query-gpu=driver_version",
+        "GPU_FAULT_DRIVER_BRANCH is unset",
+        "no file bind",
+        "deadman",
+        "Node Agent are never touched",
+    ):
+        assert phrase in meaning, f"the token's description names {phrase!r}"
+    assert helper.UNIT_TOKENS == {
+        helper.HOST_UNIT: TOKEN,
+        helper.KERNEL_UNIT: KERNEL_TOKEN,
+    }
+    assert helper.UNIT_HANDLES[helper.KERNEL_UNIT] == "kernel-collector-replay"
+
+
+def test_kernel_collector_window_needs_its_own_token_and_carries_one_query(
+    tmp_path: Path,
+) -> None:
+    refused, fake = _kernel_controller(tmp_path, approvals=(TOKEN,))
+    assert refused.unit == helper.KERNEL_UNIT and refused.token == KERNEL_TOKEN
+    assert refused.approved is False, "HOST_SOURCE_REPLAY never unlocks the kernel unit"
+    plan = helper.command_plan("nvidia-smi", [VERSION_RULE], now=1.0)
+    with pytest.raises(helper.HostSourceReplayError, match=KERNEL_TOKEN):
+        refused.install_wrapper("nvidia-smi", plan)
+    with pytest.raises(helper.HostSourceReplayError, match=KERNEL_TOKEN):
+        refused.open_command(["nvidia-smi"])
+    assert fake.calls == [], "a refused request never reaches the node"
+
+    controller, fake = _kernel_controller(tmp_path, approvals=(KERNEL_TOKEN,))
+    assert controller.approved is True
+    controller.install_wrapper("nvidia-smi", plan)
+    installed = next(call for call in fake.calls if call[0] == "install-wrapper")
+    assert installed[1:] == (
+        "--tool",
+        "nvidia-smi",
+        "--unit",
+        helper.KERNEL_UNIT,
+        "--run-id",
+        controller.run_id,
+    ), installed
+    controller.open_command(["nvidia-smi"], restore_seconds=1800)
+    opened = next(call for call in fake.calls if call[0] == "open-window")
+    assert opened[1:] == (
+        "--mode",
+        "command",
+        "--restore-seconds",
+        "1800",
+        "--unit",
+        helper.KERNEL_UNIT,
+        "--wrapper",
+        "nvidia-smi",
+        "--run-id",
+        controller.run_id,
+    ), opened
+    with pytest.raises(helper.HostSourceReplayError, match="may rewrite only"):
+        controller.install_wrapper(
+            "nvidia-smi",
+            helper.command_plan(
+                "nvidia-smi",
+                [
+                    VERSION_RULE,
+                    helper.rule(
+                        "utilization",
+                        "drop_row",
+                        uuid="GPU-11111111-2222-3333-4444-555555555555",
+                    ),
+                ],
+                now=1.0,
+            ),
+        )
+    with pytest.raises(helper.HostSourceReplayError, match="may not carry a smartctl"):
+        controller.install_wrapper(
+            "smartctl",
+            helper.command_plan(
+                "smartctl", [helper.rule("scan", "exit", exit_code=2)], now=1.0
+            ),
+        )
+    for refusal in (
+        lambda: controller.open_window(binds=[("meminfo", "/proc/meminfo")]),
+        lambda: controller.open_window(
+            wrappers=["nvidia-smi"], env={"GPU_FAULT_EXPECTED_GPU_COUNT": "7"}
+        ),
+        lambda: controller.open_window(
+            wrappers=["nvidia-smi"], inaccessible=["/proc/meminfo"]
+        ),
+        lambda: controller.open_pci_root(),
+        lambda: controller.build_meminfo(SwapTotal=1),
+        lambda: controller.build_nvidia_proc(),
+        lambda: controller.build_infiniband(),
+        lambda: controller.build_pci(efa_count=15),
+        lambda: controller.read_back("/proc/driver/nvidia/version"),
+        lambda: controller.set_value("meminfo", 1),
+    ):
+        with pytest.raises(
+            helper.HostSourceReplayError, match="command-output replay only"
+        ):
+            refusal()
+    from datetime import datetime, timezone
+
+    since = datetime(2026, 10, 25, 8, tzinfo=timezone.utc)
+    controller.journal(since=since, tail=50)
+    journal = next(call for call in fake.calls if call[0] == "journal-read")
+    assert journal[1:] == (
+        "--unit",
+        helper.KERNEL_UNIT,
+        "--since",
+        since.isoformat(),
+        "--tail",
+        "50",
+        "--run-id",
+        controller.run_id,
+    ), journal
+    evidence = controller.evidence(tool="nvidia-smi")
+    assert evidence["unit"] == helper.KERNEL_UNIT and evidence["approved"] is True
+    assert evidence["proof_scope"] == "live-replay"
+
+
+def test_kernel_collector_token_does_not_unlock_the_host_collector(
+    tmp_path: Path,
+) -> None:
+    controller, fake = _controller(tmp_path, approvals=(KERNEL_TOKEN,))
+    assert controller.unit == helper.HOST_UNIT and controller.approved is False
+    with pytest.raises(helper.HostSourceReplayError, match=TOKEN):
+        controller.install_wrapper(
+            "smartctl",
+            helper.command_plan(
+                "smartctl", [helper.rule("scan", "passthrough")], now=1.0
+            ),
+        )
+    with pytest.raises(helper.HostSourceReplayError, match=TOKEN):
+        controller.open_bind([("meminfo", "/proc/meminfo")])
+    assert not any(call[0] in {"install-wrapper", "open-window"} for call in fake.calls)
+    with pytest.raises(helper.HostSourceReplayError, match="Node Agent"):
+        helper.HostSourceReplay(
+            _Regional(),
+            node=NODE,
+            image="img@sha256:" + "0" * 64,
+            case_id="x",
+            run_id="gl032-x-a1-deadbeef",
+            case_dir=tmp_path,
+            host=fake,
+            unit=wrapper.NODE_AGENT_UNIT,
+        )
+
+
+def test_kernel_collector_source_replay_from_a_variant_context(tmp_path: Path) -> None:
+    spec = VariantSpec(
+        case_id="GF-GENERAL-LIVE-032",
+        variant="missing_version",
+        proof_mode=LIVE_REPLAY,
+        lanes=("eks", "hp"),
+        risk="M",
+        injection="driver_version withheld",
+        expected="BLOCKED_MISSING_EVIDENCE",
+        cleanup="window closed",
+        max_minutes=30,
+        approvals=(KERNEL_TOKEN, "KERNEL_SOURCE_REPLAY"),
+        execute=lambda ctx: {},
+    )
+    fake = FakeProbe(_script())
+    settings = make_settings(spec, node=NODE)
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=FakeRegional(),
+        probes={f"kernel-collector-replay@{NODE}": fake},
+        settings=settings,
+    )
+    replay = helper.kernel_collector_source_replay(ctx)
+    assert replay.unit == helper.KERNEL_UNIT and replay.host is fake
+    assert replay.approved is True
+    assert "kernel-collector-replay" in ctx.cleanup.pending()
+    assert "source-replay" not in ctx.cleanup.pending()
+
+
+# --------------------------------------------------------------------------- #
 # read-only inventory / read-back and the netdev tree mutation (010, 011)
 # --------------------------------------------------------------------------- #
 def test_inventory_and_read_back_need_no_token(tmp_path: Path) -> None:
