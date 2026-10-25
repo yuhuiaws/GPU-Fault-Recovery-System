@@ -1519,6 +1519,29 @@ namespace with a training operator and the product's in-place and copy
 restarts; on the old code all of its cases fail, the in-place restart with the
 live cleanup record.
 
+With the names apart, 003 `ambiguous_ownership` then failed on its first job
+(live 2026-10-25, as it already had on 2026-10-24 under the fixed name):
+"managed workload did not become healthy", the PyTorchJob annotated with the
+completion watcher's `inc-attempt-failure-*` incident and its
+`workflow-attempt-stop-*/1/STOP_WORKLOADS`, no Pod. The variant runs two
+4-GPU jobs on one 8-GPU node, and its 4-GPU rendering changed only the GPU
+request: the trainer still ran `torchrun --nproc-per-node=8`, so local ranks
+4-7 had no device, torchrun exited non-zero, the product's passive containment
+stopped the attempt and suspended the job, and the start wait saw no Pod for
+900 s. Each job also kept the manifest's 16 EFA devices, the node's whole
+complement, so the second job could never have been scheduled beside the
+first; and a job that had run would have heartbeated at world size 8 against
+the fixture's expected 4. The 4-GPU rendering now fits the trainer's workers
+and the EFA request to the GPU count (8 EFA for 4 GPUs). The start-wait
+failure also printed `suspend: None` for a PyTorchJob the product had
+suspended, because the snapshot read `spec.suspend`; it reads
+`runPolicy.suspend` for a PyTorchJob now. The fake namespace of
+`tests/regional/test_general_live_managed_job_cleanup.py` schedules Pods
+against the node's GPUs and EFA devices, runs a torchrun only when every
+worker has a GPU, and stops a failed attempt as the completion watcher does;
+the variant runs through `execute_variant` on it, and the old rendering
+reproduces the live failure text.
+
 GF-GENERAL-LIVE-030 (warm spare unhealthy) is the same story on the HyperPod
 lane: its `SpareSession` keeps the spare node *name* in `self.node` and also
 defined a `node()` accessor, so the instance attribute shadowed the method and

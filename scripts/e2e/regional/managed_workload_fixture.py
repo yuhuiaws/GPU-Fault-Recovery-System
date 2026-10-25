@@ -1281,6 +1281,7 @@ class ManagedWorkloadFixture:
     def snapshot(self) -> dict[str, Any]:
         workload = self.workload()
         pods = self.pods()
+        spec = workload.get("spec") or {}
         return {
             "workload": {
                 "kind": workload["kind"],
@@ -1288,7 +1289,11 @@ class ManagedWorkloadFixture:
                 "uid": workload["metadata"]["uid"],
                 "annotations": workload["metadata"].get("annotations", {}),
                 "labels": workload["metadata"].get("labels", {}),
-                "suspend": workload.get("spec", {}).get("suspend"),
+                # A PyTorchJob suspends under runPolicy; the live start-wait
+                # failure read "suspend: None" of a job the product had suspended.
+                "suspend": spec.get(
+                    "suspend", (spec.get("runPolicy") or {}).get("suspend")
+                ),
             },
             "pods": pods,
             "heartbeat_logs": self.heartbeat_logs(pods),

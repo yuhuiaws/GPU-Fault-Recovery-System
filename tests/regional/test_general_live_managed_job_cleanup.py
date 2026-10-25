@@ -33,10 +33,12 @@ from typing import Any
 
 import pytest
 
+from gpu_fault.watcher import failure_containment_ids
 from scripts.e2e.regional import general_live_attempts as attempts
 from scripts.e2e.regional import general_live_nccl_job as nccl_job
 from scripts.e2e.regional import general_live_progress as progress
 from scripts.e2e.regional import general_live_utilization as utilization
+from scripts.e2e.regional import managed_workload_fixture
 from scripts.e2e.regional import run_general_live as runner
 from scripts.e2e.regional.general_live_fixture import (
     Evidence,
@@ -62,7 +64,13 @@ from scripts.e2e.regional.regional_commands import (
     RegionalFixtureError,
 )
 from scripts.e2e.regional.regional_live_fixture import RegionalLiveFixture
+from scripts.e2e.regional.training_topology import (
+    EFA_RESOURCE,
+    GPU_RESOURCE,
+    NPROC_PATTERN,
+)
 from tests.regional.test_general_live_managed_job_start import (
+    CLUSTER,
     EXECUTOR,
     NAMESPACE,
     NODE,
@@ -80,6 +88,9 @@ RESTART = "-r-8856497f"
 RESTART_OPERATION = "workflow-restart/0/RESTART_WORKLOAD"
 JOB_LABEL = "gpu-fault.io/job-id"
 ATTEMPT_LABEL = "gpu-fault.io/attempt-id"
+#: What one p5en-class GPU node allocates (the manifests' resource profile).
+NODE_GPUS = 8
+NODE_EFA = 16
 PLURALS = {
     "pods": "pod",
     "jobs": "job",
@@ -122,6 +133,28 @@ def private_umask() -> Iterator[None]:
         os.umask(previous)
 
 
+def nproc_per_node(container: dict[str, Any]) -> int | None:
+    """The workers ``torchrun`` starts in the container, if it runs torchrun."""
+
+    text = " ".join(
+        str(part)
+        for part in [*(container.get("command") or []), *(container.get("args") or [])]
+    )
+    match = NPROC_PATTERN.search(text)
+    return int(match.group().rsplit("=", 1)[1]) if match else None
+
+
+def requested(pod_spec: dict[str, Any]) -> dict[str, int]:
+    """The GPUs and EFA devices a Pod asks its node for (its containers' limits)."""
+
+    totals = {GPU_RESOURCE: 0, EFA_RESOURCE: 0}
+    for container in pod_spec.get("containers") or []:
+        limits = (container.get("resources") or {}).get("limits") or {}
+        for resource in totals:
+            totals[resource] += int(limits.get(resource, 0) or 0)
+    return totals
+
+
 def gpu_total(job: dict[str, Any]) -> int:
     total = 0
     for replica in job["spec"]["pytorchReplicaSpecs"].values():
@@ -144,6 +177,12 @@ class Cluster:
         self.requests: list[tuple[str, ...]] = []
         self.deletes: list[tuple[str, str, str]] = []
         self.serial = 0
+        #: Scheduler refusals, the product's stops, and the most devices held.
+        self.pending: list[str] = []
+        self.stopped: list[str] = []
+        self.peak = {GPU_RESOURCE: 0, EFA_RESOURCE: 0}
+        #: Every object a delete removed, the garbage collector's included.
+        self.deleted_objects: dict[tuple[str, str], dict[str, Any]] = {}
 
     # -- kubectl -------------------------------------------------------------
     def run(
@@ -243,7 +282,7 @@ class Cluster:
             "resourceVersion": metadata["resourceVersion"],
         }:
             raise RegionalCommandFailed(1, "Precondition failed: UID in precondition")
-        del self.objects[(kind, name)]
+        self.deleted_objects[(kind, name)] = self.objects.pop((kind, name))
         policy = options["propagationPolicy"]
         self.deletes.append((kind, name, policy))
         for key, item in list(self.objects.items()):
@@ -251,7 +290,7 @@ class Cluster:
             if not any(owner.get("uid") == metadata["uid"] for owner in owners):
                 continue
             if policy == "Foreground":
-                del self.objects[key]
+                self.deleted_objects[key] = self.objects.pop(key)
                 continue
             # Orphan: the garbage collector strips the deleted owner.
             kept = [owner for owner in owners if owner.get("uid") != metadata["uid"]]
@@ -263,8 +302,18 @@ class Cluster:
 
     def logs(self, name: str) -> str:
         pod = self.objects[("pod", name)]
+        if (pod.get("status") or {}).get("phase") != "Running":
+            return ""
         owner = pod["metadata"]["ownerReferences"][0]["name"]
-        world = gpu_total(self.objects[("pytorchjob", owner)])
+        # torchrun's world: its workers per node, whatever the GPU request says.
+        workers = [
+            nproc_per_node(item)
+            for item in pod["spec"]["containers"]
+            if nproc_per_node(item) is not None
+        ]
+        world = (
+            workers[0] if workers else gpu_total(self.objects[("pytorchjob", owner)])
+        )
         return (
             f"HEARTBEAT rank=0 step=1 node={pod['spec'].get('nodeName')} "
             f"world_size={world} all_reduce={world * (world + 1) / 2} elapsed=2.0\n"
@@ -306,6 +355,7 @@ class Cluster:
             "controller": True,
             "blockOwnerDeletion": True,
         }
+        failed = False
         for role, replica in job["spec"]["pytorchReplicaSpecs"].items():
             template = replica["template"]
             for index in range(int(replica.get("replicas", 1))):
@@ -314,7 +364,9 @@ class Cluster:
                     "training.kubeflow.org/job-name": name,
                     "training.kubeflow.org/replica-type": role.lower(),
                 }
-                containers = template["spec"]["containers"]
+                pod_spec = copy.deepcopy(template["spec"])
+                status = self.schedule_and_start(pod_spec)
+                failed = failed or status["phase"] == "Failed"
                 self.store(
                     {
                         "apiVersion": "v1",
@@ -330,15 +382,8 @@ class Cluster:
                             ),
                             "ownerReferences": [dict(owner)],
                         },
-                        "spec": copy.deepcopy(template["spec"]),
-                        "status": {
-                            "phase": "Running",
-                            "conditions": [{"type": "Ready", "status": "True"}],
-                            "containerStatuses": [
-                                {"name": item["name"], "ready": True}
-                                for item in containers
-                            ],
-                        },
+                        "spec": pod_spec,
+                        "status": status,
                     }
                 )
                 self.store(
@@ -353,6 +398,130 @@ class Cluster:
                         "spec": {"clusterIP": "None"},
                     }
                 )
+        if failed:
+            self.stop_failed_attempt(job)
+
+    def allocated(self, node: str) -> dict[str, int]:
+        """The devices the node's Running Pods hold."""
+
+        totals = {GPU_RESOURCE: 0, EFA_RESOURCE: 0}
+        for (kind, _name), item in self.objects.items():
+            if kind != "pod" or item["spec"].get("nodeName") != node:
+                continue
+            if (item.get("status") or {}).get("phase") != "Running":
+                continue
+            for resource, count in requested(item["spec"]).items():
+                totals[resource] += count
+        return totals
+
+    def schedule_and_start(self, pod_spec: dict[str, Any]) -> dict[str, Any]:
+        """The scheduler, the device plugins and the kubelet for one Pod.
+
+        A Pod pinned to a node gets its devices only while the node has them
+        free, else it stays Pending (``Insufficient vpc.amazonaws.com/efa``).
+        A started trainer runs only if ``torchrun`` has a GPU for every
+        worker: eight workers on four devices die on
+        ``torch.cuda.set_device`` (invalid device ordinal), torchrun exits
+        non-zero and the Pod is Failed, as the live job was.
+        """
+
+        node = pod_spec.get("nodeName")
+        wanted = requested(pod_spec)
+        held = self.allocated(str(node))
+        capacity = {GPU_RESOURCE: NODE_GPUS, EFA_RESOURCE: NODE_EFA}
+        short = [
+            resource
+            for resource, count in wanted.items()
+            if held[resource] + count > capacity[resource]
+        ]
+        if node not in (NODE, PEER) or short:
+            message = "0/2 nodes are available: " + ", ".join(
+                f"1 Insufficient {resource}" for resource in short
+            )
+            self.pending.append(message)
+            return {
+                "phase": "Pending",
+                "conditions": [
+                    {
+                        "type": "PodScheduled",
+                        "status": "False",
+                        "reason": "Unschedulable",
+                        "message": message,
+                    }
+                ],
+            }
+        self.peak[GPU_RESOURCE] = max(
+            self.peak[GPU_RESOURCE], held[GPU_RESOURCE] + wanted[GPU_RESOURCE]
+        )
+        self.peak[EFA_RESOURCE] = max(
+            self.peak[EFA_RESOURCE], held[EFA_RESOURCE] + wanted[EFA_RESOURCE]
+        )
+        statuses = []
+        for container in pod_spec["containers"]:
+            workers = nproc_per_node(container)
+            gpus = int(
+                (container.get("resources") or {})
+                .get("limits", {})
+                .get(GPU_RESOURCE, 0)
+            )
+            if workers is not None and workers > gpus:
+                statuses.append(
+                    {
+                        "name": container["name"],
+                        "ready": False,
+                        "state": {
+                            "terminated": {
+                                "exitCode": 1,
+                                "reason": "Error",
+                                "message": (
+                                    f"local rank {gpus}: RuntimeError: CUDA error: "
+                                    "invalid device ordinal"
+                                ),
+                            }
+                        },
+                    }
+                )
+            else:
+                statuses.append(
+                    {"name": container["name"], "ready": True, "state": {"running": {}}}
+                )
+        ready = all(item["ready"] for item in statuses)
+        return {
+            "phase": "Running" if ready else "Failed",
+            "conditions": [{"type": "Ready", "status": str(ready)}],
+            "containerStatuses": statuses,
+        }
+
+    def stop_failed_attempt(self, job: dict[str, Any]) -> None:
+        """The completion watcher's passive containment of a FAILED attempt.
+
+        A container that exited non-zero is a FailureDetectedEvent; its
+        containment workflow's STOP_WORKLOADS suspends the job with the
+        annotations the live snapshot showed, and the operator removes the Pod.
+        """
+
+        attempt = job["metadata"]["labels"][ATTEMPT_LABEL]
+        incident, workflow = failure_containment_ids(
+            f"{CLUSTER}/{attempt}/TrainingAttemptFailureDetected"
+        )
+        job["metadata"].setdefault("annotations", {}).update(
+            {
+                "gpu-fault.io/execution-epoch": "1",
+                "gpu-fault.io/fencing-token": "1",
+                "gpu-fault.io/incident-id": incident,
+                "gpu-fault.io/operation-id": f"{workflow}/1/STOP_WORKLOADS",
+                "gpu-fault.io/termination-initiator-incident-id": incident,
+                "gpu-fault.io/workflow-id": workflow,
+                "gpu-fault.io/workflow-step-index": "1",
+            }
+        )
+        job.setdefault("status", {})["conditions"] = [
+            {"type": "Failed", "status": "True"}
+        ]
+        job["spec"].setdefault("runPolicy", {})["suspend"] = True
+        self.stopped.append(job["metadata"]["name"])
+        self.bump(job)
+        self.reconcile(job)
 
     def restart_in_place(self, name: str, *, then_suspend: bool) -> dict[str, Any]:
         """RESTART_WORKLOAD of a job that is not terminal, as the product patches it.
@@ -520,6 +689,7 @@ def test_two_jobs_on_one_node_run_side_by_side_under_their_own_names(
     ctx = variant_context(
         "GF-GENERAL-LIVE-003.ambiguous_ownership", tmp_path, monkeypatch, cluster
     )
+    install_clock(monkeypatch)  # a job that does not come up fails fast, not in 900 s
     jobs = []
     for name in ("gl3-ambA-1", "gl3-ambB-1"):
         job = utilization.ManagedIdleJob(ctx, name=name, gpu_count=4)
@@ -550,6 +720,131 @@ def test_two_jobs_on_one_node_run_side_by_side_under_their_own_names(
             f"service/{job.fixture.name}-master-0",
         }, deleted
         assert item["result"]["prewarm"] == NOTHING_CREATED
+
+
+class Clock:
+    """One virtual clock for the context's holds and the fixture's start waits."""
+
+    def __init__(self) -> None:
+        self.now_at = datetime(2026, 10, 25, 9, 36, 16, tzinfo=timezone.utc)
+        self.elapsed = 1000.0
+
+    def now(self) -> datetime:
+        return self.now_at
+
+    def monotonic(self) -> float:
+        return self.elapsed
+
+    def sleep(self, seconds: float) -> None:
+        self.now_at += timedelta(seconds=seconds)
+        self.elapsed += seconds
+
+
+def no_activity(regional: Any, script: str, *arguments: str, **options: Any) -> Any:
+    """The store read of a node on which the product opened no incident."""
+
+    return {"incidents": [], "workflows": [], "signals": [], "samples": []}
+
+
+def install_clock(monkeypatch: pytest.MonkeyPatch) -> Clock:
+    clock = Clock()
+    monkeypatch.setattr(managed_workload_fixture, "time", clock)
+    monkeypatch.setattr(
+        runner,
+        "VariantContext",
+        lambda **fields: VariantContext(**fields, clock=clock.now, sleep=clock.sleep),
+    )
+    return clock
+
+
+def gpu_only_request(document: dict[str, Any], gpu_count: int) -> None:
+    """``_request_gpus`` as it was: the GPU request alone, the trainer untouched."""
+
+    for replica in (document.get("spec", {}).get("pytorchReplicaSpecs") or {}).values():
+        for container in ((replica.get("template") or {}).get("spec") or {}).get(
+            "containers"
+        ) or []:
+            resources = container.setdefault("resources", {})
+            for bucket in ("requests", "limits"):
+                if GPU_RESOURCE in (resources.get(bucket) or {}):
+                    resources[bucket][GPU_RESOURCE] = str(gpu_count)
+
+
+@pytest.mark.parametrize("fitted", [True, False], ids=["fitted", "eight-workers"])
+def test_ambiguous_ownership_runs_two_four_gpu_jobs_on_one_node(
+    fitted: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The variant through ``execute_variant``: two 4-GPU jobs on one 8-GPU node.
+
+    Live 2026-10-24 and 2026-10-25 the first job never became healthy: its
+    GPU request was four but its trainer still ran ``torchrun
+    --nproc-per-node=8``, so the Pod failed, the completion watcher's passive
+    containment stopped the attempt (STOP_WORKLOADS, the job Suspended) and the
+    start wait saw no Pod for 900 s. Each job also asked for the node's whole
+    16 EFA devices, so the second could never have been scheduled beside the
+    first. ``eight-workers`` keeps the old GPU-only rewrite and reproduces the
+    live failure against the same fake; ``fitted`` is the variant as it is.
+    """
+
+    key = "GF-GENERAL-LIVE-003.ambiguous_ownership"
+    cluster = Cluster()
+    settings, run_dir = configured(tmp_path, monkeypatch, REGISTRY[key])
+    install(monkeypatch, cluster)
+    monkeypatch.setattr(RegionalLiveFixture, "cpu_python", no_activity)
+    clock = install_clock(monkeypatch)
+    if not fitted:
+        monkeypatch.setattr(utilization, "_request_gpus", gpu_only_request)
+
+    result = execute(key, settings, run_dir)
+
+    names = {
+        job: managed_workload_name(SINGLE_NODE, job)
+        for job in ("gl3-ambA-1", "gl3-ambB-1")
+    }
+    if not fitted:
+        assert result["verdict"] == "FAIL", result
+        assert result["error"].startswith(
+            "RegionalFixtureError: managed workload did not become healthy: "
+            f"{{'workload': {{'kind': 'PyTorchJob', 'name': '{names['gl3-ambA-1']}'"
+        ), result["error"]
+        assert "/1/STOP_WORKLOADS" in result["error"], "the product stopped the attempt"
+        assert "'suspend': True}, 'pods': []" in result["error"], result["error"]
+        assert cluster.stopped == [names["gl3-ambA-1"]], cluster.stopped
+        assert clock.elapsed >= 1000.0 + 900, "the whole start wait passed"
+        (cleanup,) = result["cleanup"]
+        assert cleanup["ok"] is True and cluster.kinds() == {"deployment"}, cleanup
+        return
+
+    assert (result["verdict"], result.get("errors")) == ("PASS", []), result
+    assert [item["job_id"] for item in result["jobs"]] == list(names)
+    for job, name in names.items():
+        (pod,) = [item for item in result["jobs"] if item["job_id"] == job][0]["pods"]
+        assert (pod["name"], pod["node"], pod["phase"], pod["ready"]) == (
+            f"{name}-master-0",
+            NODE,
+            "Running",
+            True,
+        ), pod
+    trainers = [
+        (name, container)
+        for (kind, name), item in cluster.deleted_objects.items()
+        if kind == "pod"
+        for container in item["spec"]["containers"]
+    ]
+    assert len(trainers) == 2, trainers
+    for _name, container in trainers:
+        limits = container["resources"]["limits"]
+        assert (
+            nproc_per_node(container),
+            limits[GPU_RESOURCE],
+            limits[EFA_RESOURCE],
+        ) == (4, "4", "8"), container["resources"]
+    assert cluster.pending == [], "both jobs were scheduled beside each other"
+    assert cluster.stopped == [], "no attempt failed"
+    assert cluster.peak == {GPU_RESOURCE: 8, EFA_RESOURCE: 16}, cluster.peak
+    assert cluster.kinds() == {"deployment"}, cluster.objects
+    assert clock.elapsed < 1000.0 + 900, "neither start wait ran out"
+    assert [item["ok"] for item in result["cleanup"]] == [True, True], result["cleanup"]
 
 
 # --------------------------------------------------------------------------- #

@@ -73,6 +73,17 @@ def test_managed_idle_job_renders_idle_and_requested_gpus(
         for container in containers
         if "nvidia.com/gpu" in container["resources"]["requests"]
     ), "all( container['resources']['requests']['nvidia.com/gpu'] == '4' for c"
+    # The trainer and the EFA request follow the GPU count: eight torchrun
+    # workers on four GPUs failed the Pod and the product stopped the attempt
+    # (live 2026-10-24/25), and two 16-EFA jobs never fit one node.
+    assert [
+        (
+            container["command"][-1].count("--nproc-per-node=4"),
+            container["resources"]["limits"]["vpc.amazonaws.com/efa"],
+            container["resources"]["requests"]["vpc.amazonaws.com/efa"],
+        )
+        for container in containers
+    ] == [(1, "8", "8")], containers
     assert job.name == "gl3-amb"
 
 
