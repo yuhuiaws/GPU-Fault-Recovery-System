@@ -272,6 +272,10 @@ GF-ENV-LIVE-001..011（012 始终 NOT_RUN）。默认只计划，不动集群。
 - **逐案确认串** `ENVLIVE<NNN>_EXECUTE`；会 cordon/quarantine 并停训的用例
   （004/007/010/011）另需 `--confirm-isolate ENVLIVE<NNN>_ISOLATE` 与
   `--confirm-stop ENVLIVE<NNN>_STOP`。本链从不重启训练任务。
+- **010 的对照节点**：`--node-b <对照节点>`（站点 profile 的 `node-b` 自动填入）；
+  对照任务需要 `--site-file`。例：
+  `--case GF-ENV-LIVE-010 --node-b "$NODE_B" --execute --confirm ENVLIVE010_EXECUTE
+  --confirm-isolate ENVLIVE010_ISOLATE --confirm-stop ENVLIVE010_STOP`。
 - **设备能力判定**：运行器在只读 preflight 用产品自身的 XML 解析读该节点逐 GPU
   的同刻度限值（`scripts/e2e/regional/env_live_plans.py`），据此判定每个严重温度
   变体 RUN/NOT_RUN，并由真实限值（而非 `tlimit-example.json`）生成回放计划。
@@ -288,12 +292,57 @@ GF-ENV-LIVE-001..011（012 始终 NOT_RUN）。默认只计划，不动集群。
   T.Limit≤0、GPU≥80 C 或显存≥85 C 时工具永久中止并透传真实读数。
 - **判据** 由 `scripts/e2e/regional/env_live_verdicts.py` 依据控制面真实
   incident/workflow/notification/证据记录给出；工具从不输出 LIVE PASS。
+- **两种集群**：运行器不含任何 HyperPod 专有步骤，plain EKS 与 HyperPod 共用。
+  唯一的差别在只读 preflight 读取逐 GPU 限值的方式：exporter 以 DaemonSet 运行的节点
+  （HyperPod）在该节点现有的 `gpu-fault-dcgm-exporter` Pod 内执行 `nvidia-smi -q -x`；
+  host 模式节点（plain EKS：exporter 是 `gpu-fault-dcgm-exporter.service` 容器，
+  DaemonSet 无 Pod）没有可 exec 的 Pod，则由一个瞬态特权 host 探针（与执行阶段相同的
+  `env_replay_proxy.py`，子命令 `preflight`）在节点上用产品解析器读取同一份 XML 与
+  exporter 的 T.Limit 读数，读完即删除并校验无残留；preflight/plan 记录
+  `device_limits_source`（`exporter-pod` / `host-probe`）。两条 EKS lane（eks/eksb）
+  各自作用于本 lane 的节点；004/007/010 隔离节点，取全部锁（X）。
+- **009 间断与来源切换**：计划 `core_tlimit/interruption` = 2 次健康读 → 2 次严重读 →
+  暂停 → 1 次严重读 → ≥3 次健康读。arm 之后立刻由 `env_replay_proxy.py pause-collector`
+  在节点上起一个瞬态等待单元：它以 0.25 秒轮询代理 `/status`，在 collector 恰好消费完
+  第二个严重读（`pause_after_reads`，按代理绝对读数计）的瞬间对
+  `gpu-fault-metrics-collector.service` 执行 `systemctl kill --signal=SIGSTOP`（与
+  `general_live_node_probe.py unit-pause` 相同的暂停方式，但在节点上读同步地触发：
+  由运行器按轮询时机发起的暂停可能晚一个采集周期，让第三个严重样本完成确认并隔离
+  节点，而 009 不带隔离确认串）。暂停前先以 `systemd-run --on-active` 装好恢复
+  deadman（`resume-collector`，暂停时长 + 120 秒）；运行器在暂停满
+  `CONFIRMATION_MAX_GAP_SECONDS + 15` = 75 秒后 `resume-collector`，待计划读完、清除
+  读数被接受且该字段 finding 失效后 `restart-collector`（drop-in 保留，一次
+  `systemctl restart`，核对 endpoint 不变）。等待单元没有起来则该案 INCONCLUSIVE 并
+  立即还原 endpoint（在严重读开始之前）；等待单元超时或暂停落在目标读之后同样记
+  INCONCLUSIVE（此时产品对三个连续严重样本的反应不是本例证据）。判据
+  （`scripts/e2e/regional/env_live_interruption.py`）：暂停前已接受 2 个严重样本
+  （WARNING `confirmation 2/3`），暂停后第一个被接受的严重样本与上一个相隔 >60 秒且
+  其 finding `confirmation_count` 为 1、无 CRITICAL、无隔离/禁止步骤、无
+  RESTORE_SCHEDULING（不越权恢复）；间隔内没有任何被接受的读数，暂停期间已激活的
+  finding 不得在没有读数的情况下消失（缺测不当健康）；清除读数穿过 edge filter；重启
+  后出现带节点 boot id 的 `initial-baseline` 批次，所有读数只有一个 `source`，重启后的
+  批次速率不超过单个 producer（只有一个 producer）。DCGM→nvidia-smi 的来源切换只能经
+  正常安装流程（`GPU_FAULT_METRICS_MODE`）完成，跨 boot 需另行批准的节点维护重启：
+  本运行器都不驱动，记为未覆盖缺口而不是 PASS。
+- **010 作用域与并发**：需要 `--node-b`（站点 profile 的 `node-b`）指定对照节点、
+  `--site-file`（提交对照任务）与至少两张 GPU 的目标节点，缺一则 NOT_RUN 并写明原因。
+  执行前先对对照节点做与目标节点相同的洁净 preflight；再在对照节点上以
+  `gpu-training-submit` 提交节点固定的单节点训练夹具（`env_live_scope.ControlTask`，
+  GPU duty 0，镜像预热），等待其 Running 且心跳正常，记录 Pod UID 与对照节点状态；
+  然后在目标节点的一张 GPU 上 arm 与 004 相同的严重 T.Limit 计划。判据
+  （`env_live_scope.ScopeJudge`，在 004 判据之上）：目标节点其他 GPU 的该字段无
+  finding、其被接受样本不含回放值（原始对照指标未改动）；incident 的 GPU/节点作用域
+  只含目标 GPU/节点；对照节点全程无 cordon、无 `gpu-fault.io/` taint、无归属注解、无新
+  incident/workflow/notification；对照任务 Pod 的 UID 集合不变且始终 Running；同一故障
+  只有一个带隔离步骤的工作流、评审 incident 最多一条 SENT 通知（其余 DUPLICATE）、
+  STOP_WORKLOADS 最多执行一次。目标节点按 preflight 要求没有归属训练任务，因此受影响
+  分布式任务的 STOP 范围未测量，记入证据。清理顺序：还原 endpoint → 停代理 → 删探针 →
+  删除对照任务（`remove_managed_job`）。两节点运行在 plain EKS 上占用两条 EKS lane 的
+  节点（campaign 列表标 X）。
 - **特殊用例**：002 复用 `GF-REGIONAL-COLLECT-002` 的受控功率与 dcgmproftester
-  负载及其 deadman 还原（本运行器对 002 记 BLOCKED 并指向该运行器）；009 需要在
-  两个严重样本后受控暂停采集 >60 秒、重启 collector 与切换来源，本运行器没有这一
-  维护步骤，而不暂停就 arm 其严重 T.Limit 计划只会重复 004 的隔离/停训链且缺少分支
-  确认，因此 009 记 BLOCKED、不 arm；010 需要第二个多 GPU 测试节点与对照任务，
-  未配置则 NOT_RUN；012 为真实物理/厂商实验室故障，始终 NOT_RUN。
+  负载及其 deadman 还原（本运行器对 002 记 BLOCKED 并指向该运行器）；011 只在设备
+  报告绝对 `gpu_shutdown_temperature_c` 时运行（H200 为 NOT_RUN）；012 为真实物理/
+  厂商实验室故障，始终 NOT_RUN。
 
 ### arm 之后的观察与判据
 
@@ -339,6 +388,10 @@ arm 只是实验开始：正常安装的 collector 每个采集周期经代理�
   - 007 非 brake 位：该位被接受且没有任何该字段 finding。
   - 008：有 collection error/UNKNOWN 记录点名该字段；若已接受的批次缺该 GPU 的字段
     却无人报告 UNKNOWN（多 GPU 时按批次字段集合判完整），判 FAIL。
+  - 009：见上节"009 间断与来源切换"；轮询多读一项节点侧暂停状态（`pause-status`），
+    恢复与重启两个维护步骤由判据按记录触发。
+  - 010：004 的全部判据，外加对照 GPU、对照节点、对照任务与并发合并/去重的检查；轮询
+    多读一项对照节点的 Node、活动记录与对照任务 Pod。
   - 001：repoint 后 collector 的 `initial-baseline` 批次带目标 GPU 的必需字段、
     `source_boot_id` 与节点 boot 一致、静态值（功率上限、阈值）与 repoint 前相同、
     代理至少 3 次透传读取、没有新的 GPU 环境 incident；只有 preflight 数据为

@@ -73,8 +73,17 @@ supporting logic coverage, not a LIVE PASS. The runner decides per device which
 severe-temperature variant can run on the real same-scale limits and leaves the
 others NOT_RUN rather than fabricating a scale: on a T.Limit-only p5en H200 the
 absolute-core and absolute-shutdown (GF-ENV-LIVE-011) variants are NOT_RUN,
-GF-ENV-LIVE-002 reuses GF-REGIONAL-COLLECT-002's controlled power path, and
-GF-ENV-LIVE-010 needs a second multi-GPU node and a control task.
+GF-ENV-LIVE-002 reuses GF-REGIONAL-COLLECT-002's controlled power path.
+GF-ENV-LIVE-010 runs only with a control node (`--node-b`), `--site-file` and a
+multi-GPU target node: an independent control task (the node-pinned single-node
+training fixture, idle GPU duty) runs on the control node while one GPU of the
+target node is replayed, and the scope judge grades the control GPUs, the control
+node and the task as untouched and the fault as one merged workflow / one sent
+notification; without those it is NOT_RUN. The target node carries no owned
+distributed job, so the STOP scope of an affected job is reported as not measured.
+The runner carries no HyperPod-specific step: on a host-mode node without an
+exporter Pod (plain EKS) the device limits are read by a transient host probe
+that is deleted again, otherwise by an exec into the node's exporter Pod.
 After arming, the runner polls the proxy status and the product's records within
 a deadline derived from the node's collector interval, the confirmation, cooldown
 and VALIDATE_GPU windows and a scan margin, capped by the proxy's replay window
@@ -82,8 +91,15 @@ and the collector deadman. A replay that was not consumed or whose ingestion no
 accepted record shows is INCONCLUSIVE, never PASS; a reaction the product needs
 longer than that window for is INCONCLUSIVE as well. Non-brake bits and unusable
 fields are no edge-filter delivery edge, so they reach the control plane only when
-a health summary falls inside their short plans. GF-ENV-LIVE-009 is BLOCKED: the
-runner has no controlled collection pause. The preflight admits only a node without
+a health summary falls inside their short plans. GF-ENV-LIVE-009 pauses the metrics
+collector read-synchronously on the node (a waiter unit SIGSTOPs it the moment the
+second severe read is consumed, a deadman resumes it), resumes it past the 60 s
+confirmation gap and restarts it once at a normal temperature; the judge requires
+the post-gap sample to count 1/N again, no reading inside the gap, no finding
+cleared by silence, one producer and a fresh initial-baseline batch. A waiter that
+does not run, times out or pauses late makes the case INCONCLUSIVE. The DCGM to
+nvidia-smi source switch (installation only) and the cross-boot path are not
+driven and are recorded as gaps. The preflight admits only a node without
 business workloads, so task progress and suspension are reported as not measured.
 
 AUTH-016 follows the real administrator rotation contract using controlled I/O.
