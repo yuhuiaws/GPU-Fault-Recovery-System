@@ -53,7 +53,10 @@ def collect_pair(node_factory, tmp_path, monkeypatch, mode="stalled"):
         pipe = root / f"trace{rank}.pipe"
         os.mkfifo(pipe)
         fd = os.open(pipe, os.O_RDONLY | os.O_NONBLOCK)
-        descriptors.append(fd)
+        # A held write end keeps the FIFO out of end-of-file: select() then
+        # only reports request bytes, so the read() below cannot meet the
+        # agent's next open() and fail with EAGAIN (which killed the writer).
+        descriptors += [fd, os.open(pipe, os.O_WRONLY | os.O_NONBLOCK)]
         requests[rank] = 0
 
         def writer(rank=rank, root=root, fd=fd):
@@ -61,11 +64,7 @@ def collect_pair(node_factory, tmp_path, monkeypatch, mode="stalled"):
                 while not stop.is_set():
                     if not select.select([fd], [], [], 0.05)[0]:
                         continue
-                    payload = os.read(fd, 100)
-                    if not payload:
-                        stop.wait(0.005)
-                        continue
-                    requests[rank] += payload.count(b"1\n")
+                    requests[rank] += os.read(fd, 100).count(b"1\n")
                     if mode == "stale-second" and requests[rank] >= 2:
                         continue
                     completed = rank != 0 or mode == "advancing" and requests[rank] >= 2

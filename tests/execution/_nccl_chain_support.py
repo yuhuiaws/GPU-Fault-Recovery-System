@@ -43,6 +43,7 @@ class NodeClock:
     def __init__(self):
         self.value = 0.0
         self.tick = lambda value: None
+        self.settle = lambda: None
 
     def monotonic(self):
         return self.value
@@ -50,6 +51,9 @@ class NodeClock:
     def sleep(self, seconds):
         self.value += seconds
         self.tick(self.value)
+        # An agent sleep is where PyTorch's monitor thread gets to run: every
+        # FIFO request the agent already wrote is answered before it returns.
+        self.settle()
         time.sleep(0.003)
 
 
@@ -78,6 +82,7 @@ class NcclChain(RawHealthRig):
         super().__init__(path, monkeypatch)
         self.node_clock = NodeClock()
         self.actors = [ChainNode(self, index, mode) for index in range(nodes)]
+        self.node_clock.settle = self.settle_fifos
         self.commands, self.outcomes, self.extra_stores = [], [], []
         self.pending_node = None
         self.summary_unreachable = None
@@ -199,6 +204,10 @@ class NcclChain(RawHealthRig):
 
     def node_now(self):
         return self.clock + timedelta(seconds=self.node_clock.value)
+
+    def settle_fifos(self):
+        for actor in self.actors:
+            actor.settle()
 
     def write_counters(self):
         for name, value in (("rx_bytes", self.rx), ("tx_bytes", self.tx)):
@@ -442,8 +451,15 @@ class NcclChain(RawHealthRig):
         return result
 
     def close(self):
+        # Every actor is closed even when one fails: an actor left open keeps
+        # its non-daemon FIFO thread running and the worker cannot exit.
+        failures = []
         for actor in self.actors:
-            actor.close()
+            try:
+                actor.close()
+            except AssertionError as exc:
+                failures.append(f"{actor.name}: {exc}")
         for store in self.extra_stores:
             store.close()
         self.store.close()
+        assert not failures, failures

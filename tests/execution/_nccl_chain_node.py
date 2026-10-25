@@ -1,11 +1,14 @@
 """Owned proc/sysfs/FIFO fixtures; no real GPU, workload or external service."""
 
+import fcntl
 import json
 import os
 import pickle
 import select
+import struct
+import termios
 from subprocess import CompletedProcess
-from threading import Event, Thread
+from threading import Condition, Event, Thread
 
 from gpu_fault.models import WorkflowOperation as Op
 from gpu_fault.node_agent import NodeActionExecutor, NodeActionLedger
@@ -20,6 +23,11 @@ OPERATIONS = {
     Op.COLLECT_HUNG_TRIAGE,
     Op.COLLECT_DIAGNOSTIC_BUNDLE,
 }
+
+
+def pending_bytes(descriptor):
+    """Bytes written to the FIFO that its reader has not consumed yet."""
+    return struct.unpack("i", fcntl.ioctl(descriptor, termios.FIONREAD, bytes(4)))[0]
 
 
 class ChainNode:
@@ -57,7 +65,8 @@ class ChainNode:
         self.requests = 0
         self.worker = None
         self.stop = Event()
-        self.reader = None
+        self.answered = Condition()
+        self.reader = self.holder = None
         self.errors = []
         if mode.startswith("fr-") or mode == "pid-reuse":
             environment += [
@@ -67,6 +76,12 @@ class ChainNode:
             pipe = self.namespace / f"trace{index}.pipe"
             os.mkfifo(pipe)
             self.reader = os.open(pipe, os.O_RDONLY | os.O_NONBLOCK)
+            # Our own write end keeps the FIFO out of its end-of-file state.
+            # Without it, once a request's writer closed, select() reported the
+            # empty FIFO readable (POLLHUP); when the agent's next open() landed
+            # before the following read(), that read raised EAGAIN, the thread
+            # died and every later request on this node went unanswered.
+            self.holder = os.open(pipe, os.O_WRONLY | os.O_NONBLOCK)
             self.worker = Thread(target=self.respond)
             self.worker.start()
         if mode in {"same-role", "different-role", "cooperative", "tid-namespace"}:
@@ -151,57 +166,81 @@ class ChainNode:
     def respond(self):
         try:
             while not self.stop.is_set():
+                # Readable only ever means request bytes (see ``holder``).
                 if not select.select([self.reader], [], [], 0.05)[0]:
                     continue
-                payload = os.read(self.reader, 128)
-                if not payload:
-                    self.stop.wait(0.002)
-                    continue
-                self.requests += payload.count(b"1\n")
-                if self.mode == "fr-second-missing" and self.requests >= 2:
-                    continue
-                done = (
-                    self.index != 0
-                    or self.mode == "fr-advancing"
-                    and self.requests >= 2
-                )
-                if self.mode == "fr-whole-group":
-                    done = False
-                document = {
-                    "pg_config": {"0": {"ranks": list(range(len(self.rig.nodes)))}},
-                    "entries": [
-                        {**item, "process_group": ["0", "dp"]}
-                        for item in [
-                            entry(99, "completed"),
-                            entry(100, "completed" if done else "started"),
-                        ]
-                    ],
-                }
-                if self.mode == "fr-pg-status":
-                    document["version"] = "2.10"
-                    document["pg_status"] = {
-                        "42": {
-                            "last_enqueued_collective": "100",
-                            "last_started_collective": "100",
-                            "last_completed_collective": "100" if done else "99",
-                        }
-                    }
-                    document["entries"] = [
-                        {
-                            **entry(sequence, "completed"),
-                            "pg_id": 42,
-                            "process_group": ["0", "dp"],
-                        }
-                        for sequence in range(1, 81)
-                    ] + [{**document["entries"][-1], "pg_id": 42}]
-                temporary = self.namespace / "pending"
-                if self.mode == "fr-pickle":
-                    temporary.write_bytes(pickle.dumps(document, protocol=2))
-                else:
-                    temporary.write_text(json.dumps(document))
-                temporary.replace(self.namespace / f"dump{self.index}")
+                with self.answered:
+                    self.answer(os.read(self.reader, 128))
+                    self.answered.notify_all()
         except Exception as exc:
             self.errors.append(exc)
+        finally:
+            with self.answered:
+                self.answered.notify_all()
+
+    def answer(self, payload):
+        self.requests += payload.count(b"1\n")
+        if self.mode == "fr-second-missing" and self.requests >= 2:
+            return
+        done = self.index != 0 or self.mode == "fr-advancing" and self.requests >= 2
+        if self.mode == "fr-whole-group":
+            done = False
+        document = {
+            "pg_config": {"0": {"ranks": list(range(len(self.rig.nodes)))}},
+            "entries": [
+                {**item, "process_group": ["0", "dp"]}
+                for item in [
+                    entry(99, "completed"),
+                    entry(100, "completed" if done else "started"),
+                ]
+            ],
+        }
+        if self.mode == "fr-pg-status":
+            document["version"] = "2.10"
+            document["pg_status"] = {
+                "42": {
+                    "last_enqueued_collective": "100",
+                    "last_started_collective": "100",
+                    "last_completed_collective": "100" if done else "99",
+                }
+            }
+            document["entries"] = [
+                {
+                    **entry(sequence, "completed"),
+                    "pg_id": 42,
+                    "process_group": ["0", "dp"],
+                }
+                for sequence in range(1, 81)
+            ] + [{**document["entries"][-1], "pg_id": 42}]
+        temporary = self.namespace / "pending"
+        if self.mode == "fr-pickle":
+            temporary.write_bytes(pickle.dumps(document, protocol=2))
+        else:
+            temporary.write_text(json.dumps(document))
+        temporary.replace(self.namespace / f"dump{self.index}")
+
+    def settle(self, timeout=30.0):
+        """Return once every request already in the FIFO has been answered.
+
+        The agent waits for a dump by sleeping on the rig's node clock, which
+        moves 0.25 s per 3 ms of real time: on a loaded host its whole budget
+        could pass before this thread was scheduled at all.
+        """
+        if self.worker is None:
+            return
+        with self.answered:
+            answered = self.answered.wait_for(
+                lambda: (
+                    self.errors
+                    or not self.worker.is_alive()
+                    or not pending_bytes(self.reader)
+                ),
+                timeout,
+            )
+        if not answered:
+            self.errors.append(
+                AssertionError(f"{self.name}: FIFO request unanswered for {timeout}s")
+            )
 
     def runner(self, argv, **kwargs):
         self.calls.append(argv)
@@ -261,5 +300,6 @@ class ChainNode:
             self.worker.join(timeout=2)
             assert not self.worker.is_alive(), "owned FIFO writer must exit"
             os.close(self.reader)
+            os.close(self.holder)
         self.ledger.close()
         assert not self.errors, self.errors
