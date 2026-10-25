@@ -379,12 +379,17 @@ def observation_window(
 
 @dataclass
 class Snapshot:
-    """The product's records at one poll (``None`` when a read failed)."""
+    """The product's records at one poll (``None`` when a read failed).
+
+    ``extra`` is the judge-specific fifth read a case may bind (the 009 pause
+    state on the node, the 010 control node and task); ``None`` for the others.
+    """
 
     at: datetime
     gpu_state: dict[str, Any] | None
     activity: dict[str, Any] | None
     node: dict[str, Any] | None
+    extra: dict[str, Any] | None = None
 
 
 @dataclass
@@ -411,12 +416,17 @@ class Judge(Protocol):
 
 @dataclass
 class WatchReads:
-    """The four reads one poll makes; the runner binds them to the live fixture."""
+    """The reads one poll makes; the runner binds them to the live fixture.
+
+    ``extra`` is read only when the judge sets ``reads_extra`` (the 009 pause
+    state, the 010 control node and task); it fails like the other reads.
+    """
 
     status: Callable[[], dict[str, Any]]
     gpu_state: Callable[[], dict[str, Any]]
     activity: Callable[[], dict[str, Any]]
     node: Callable[[], dict[str, Any]]
+    extra: Callable[[], dict[str, Any]] | None = None
 
 
 @dataclass
@@ -490,6 +500,11 @@ def watch(
             gpu_state=read(reads.gpu_state, "gpu_state"),
             activity=read(reads.activity, "activity"),
             node=read(reads.node, "node") if judge.reads_node else None,
+            extra=(
+                read(reads.extra, "extra")
+                if reads.extra is not None and getattr(judge, "reads_extra", False)
+                else None
+            ),
         )
         judge.observe(snapshot, progress)
         polls += 1

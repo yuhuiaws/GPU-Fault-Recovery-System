@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 T0 = datetime(2031, 3, 4, 5, 0, 0, tzinfo=timezone.utc)
@@ -66,6 +67,38 @@ class World:
         }
         self.sleeps: list[float] = []
         self.polls = 0
+        # GF-ENV-LIVE-009: the scheduled read-synchronous pause and the restart.
+        self.pause_target: int | None = None
+        self.pause_scheduled_at: datetime | None = None
+        self.paused_at: datetime | None = None
+        self.resumed_at: datetime | None = None
+        self.pause_timed_out = False
+        self.waiter_dead = False
+        self.restart_at: datetime | None = None
+        self.restart_events: list[tuple[float, Callable[[World], None]]] = []
+        self.read_events: list[tuple[int, Callable[[World], None]]] = []
+        # GF-ENV-LIVE-010: the control node and the control task's Pods.
+        self.control_node: dict[str, Any] = {
+            "name": "ip-10-0-32-162",
+            "uid": "uid-2",
+            "boot_id": "boot-2",
+            "ready": "True",
+            "unschedulable": False,
+            "taints": [],
+            "ownership_annotations": {},
+        }
+        self.control_incidents: dict[str, dict[str, Any]] = {}
+        self.control_workflows: dict[str, dict[str, Any]] = {}
+        self.control_pods: list[dict[str, Any]] = [
+            {
+                "name": "envctl-master-0",
+                "uid": "pod-ctl-1",
+                "node": "ip-10-0-32-162",
+                "phase": "Running",
+                "ready": True,
+                "attempt_id": "envctl-a001",
+            }
+        ]
 
     # -- time --------------------------------------------------------------- #
     def clock(self) -> datetime:
@@ -82,6 +115,18 @@ class World:
     def origin(self) -> datetime:
         return self.armed_at or self.repoint_at or self.now
 
+    def at_read(self, reads: int, action: Callable[[World], None]) -> World:
+        """Fire once the collector consumed ``reads`` proxy reads (pause-aware)."""
+
+        self.read_events.append((reads, action))
+        return self
+
+    def at_restart(self, offset: float, action: Callable[[World], None]) -> World:
+        """Fire ``offset`` seconds after the 009 collector restart."""
+
+        self.restart_events.append((offset, action))
+        return self
+
     def _fire(self) -> None:
         if self.repoint_at is None:
             return  # nothing reaches the product before the collector is repointed
@@ -93,18 +138,76 @@ class World:
         for item in due:
             self.events.remove(item)
             item[1](self)
+        reads = self.reads()
+        for item in [item for item in self.read_events if item[0] <= reads]:
+            self.read_events.remove(item)
+            item[1](self)
+        if self.restart_at is not None:
+            for item in [
+                item
+                for item in self.restart_events
+                if self.restart_at + timedelta(seconds=item[0]) <= self.now
+            ]:
+                self.restart_events.remove(item)
+                item[1](self)
 
     def moment(self, offset: float) -> datetime:
         return self.origin() + timedelta(seconds=offset)
 
     # -- proxy -------------------------------------------------------------- #
     def reads(self) -> int:
+        """Collector ticks since the repoint, skipping those inside a pause.
+
+        The 009 waiter stops the unit right after the target read: a tick
+        inside the pause is never taken, and the first tick after the resume
+        is the next grid point, so the accepted-sample gap is the pause plus
+        up to one interval -- what the live collector's sleep does too.
+        """
+
         if self.repoint_at is None:
             return 0
-        value = int((self.now - self.repoint_at).total_seconds() // self.interval)
+        count, k = 0, 1
+        while True:
+            tick = self.repoint_at + timedelta(seconds=k * self.interval)
+            if tick > self.now:
+                break
+            k += 1
+            if (
+                self.paused_at is not None
+                and tick > self.paused_at
+                and (self.resumed_at is None or tick < self.resumed_at)
+            ):
+                continue
+            count += 1
+            if (
+                self.pause_target is not None
+                and self.paused_at is None
+                and not self.pause_timed_out
+                and not self.waiter_dead
+                and count >= self.pause_target
+            ):
+                self.paused_at = tick + timedelta(milliseconds=250)
         if self.reads_frozen_at is not None:
-            value = min(value, self.reads_frozen_at)
-        return value
+            count = min(count, self.reads_frozen_at)
+        return count
+
+    def tick_time(self, reads: int) -> datetime:
+        """When the collector took its ``reads``-th read (pause-aware)."""
+
+        assert self.repoint_at is not None, "no reads before the repoint"
+        count, k = 0, 1
+        while True:
+            tick = self.repoint_at + timedelta(seconds=k * self.interval)
+            k += 1
+            if (
+                self.paused_at is not None
+                and tick > self.paused_at
+                and (self.resumed_at is None or tick < self.resumed_at)
+            ):
+                continue
+            count += 1
+            if count == reads:
+                return tick
 
     def status(self) -> dict[str, Any]:
         return {
@@ -130,6 +233,88 @@ class World:
         self.armed_at = self.now
         self.armed = True
         return {"run_id": "r1", "armed": True, "status": self.status()["status"]}
+
+    # -- 009: pause / resume / restart ------------------------------------- #
+    def pause_collector(self, **options: Any) -> dict[str, Any]:
+        self.pause_target = int(options["after_reads"])
+        self.pause_scheduled_at = self.now
+        return {
+            "run_id": "r1",
+            "target_reads": self.pause_target,
+            "waiter": {"ActiveState": "inactive" if self.waiter_dead else "active"},
+            "status": self.status()["status"],
+        }
+
+    def pause_status(self) -> dict[str, Any]:
+        self._fire()
+        record: dict[str, Any] = {}
+        if self.pause_target is not None:
+            record = {
+                "run_id": "r1",
+                "target_reads": self.pause_target,
+                "scheduled_at": iso(self.pause_scheduled_at or self.now),
+            }
+        if self.paused_at is not None:
+            record.update(
+                paused_at=iso(self.paused_at),
+                reads_at_pause=self.pause_target,
+                missed=False,
+            )
+        if self.resumed_at is not None:
+            record["resumed_at"] = iso(self.resumed_at)
+        if self.pause_timed_out:
+            record["timed_out_at"] = iso(self.now)
+        waiting = self.pause_target is not None and self.paused_at is None
+        return {
+            "run_id": "r1",
+            "pause": record,
+            "stopped": self.paused_at is not None and self.resumed_at is None,
+            "waiter": {
+                "ActiveState": "active"
+                if waiting and not self.pause_timed_out and not self.waiter_dead
+                else "inactive"
+            },
+            "effective_endpoint": self.endpoint,
+        }
+
+    def resume_collector(self) -> dict[str, Any]:
+        self.resumed_at = self.now
+        return {
+            "run_id": "r1",
+            "stopped": False,
+            "pause": {"resumed_at": iso(self.now)},
+        }
+
+    def restart_collector(self) -> dict[str, Any]:
+        self.restart_at = self.now
+        return {
+            "run_id": "r1",
+            "restarted_at": iso(self.now),
+            "effective_endpoint": PROXY,
+        }
+
+    # -- 010: the control node and task ------------------------------------ #
+    def control_node_snapshot(self) -> dict[str, Any]:
+        self._fire()
+        return {**self.control_node, "taints": list(self.control_node["taints"])}
+
+    def control_activity(self) -> dict[str, Any]:
+        self._fire()
+        return {
+            "since": iso(self.now),
+            "incidents": list(self.control_incidents.values()),
+            "workflows": list(self.control_workflows.values()),
+            "notifications": [],
+        }
+
+    def control_task_snapshot(self) -> dict[str, Any]:
+        self._fire()
+        return {
+            "job_id": "envctl",
+            "attempt_id": "envctl-a001",
+            "node": self.control_node["name"],
+            "pods": [dict(item) for item in self.control_pods],
+        }
 
     # -- product records ---------------------------------------------------- #
     def gpu_state(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
@@ -178,6 +363,49 @@ class World:
         return {**self.node, "taints": list(self.node["taints"])}
 
     # -- builders ----------------------------------------------------------- #
+    def record_batch(
+        self,
+        observed_at: datetime,
+        values: dict[str, float],
+        *,
+        reasons: tuple[str, ...] = ("environmental-observation",),
+        errors: tuple[str, ...] = (),
+        gpu: str = GPU,
+        boot: str = BOOT,
+    ) -> None:
+        """A delivered batch now: raw evidence with the samples, and the latest."""
+
+        observed = iso(observed_at)
+        batch_id = f"dcgm-{NODE}-{len(self.batches)}"
+        self.batches.append(
+            {
+                "batch_id": batch_id,
+                "observed_at": observed,
+                "edge_filter_reasons": list(reasons),
+                "collection_errors": list(errors),
+                "sample_count": len(values),
+                "gpus": [gpu],
+                "samples": [
+                    {
+                        "gpu": gpu,
+                        "name": name,
+                        "value": value,
+                        "labels": {"source_boot_id": boot},
+                    }
+                    for name, value in values.items()
+                ],
+            }
+        )
+        for name, value in values.items():
+            self.latest[f"{gpu}:{name}"] = {
+                "gpu": gpu,
+                "name": name,
+                "value": value,
+                "observed_at": observed,
+                "source": "DCGM_EXPORTER",
+                "labels": {"source_boot_id": boot},
+            }
+
     def accept(
         self,
         offset: float,
@@ -188,41 +416,57 @@ class World:
         gpu: str = GPU,
         boot: str = BOOT,
     ) -> World:
-        """A delivered batch: raw evidence with the samples, and the latest."""
+        """A delivered batch at ``offset`` from the arm."""
 
-        def action(world: World) -> None:
-            observed = iso(world.moment(offset))
-            batch_id = f"dcgm-{NODE}-{len(world.batches)}"
-            world.batches.append(
-                {
-                    "batch_id": batch_id,
-                    "observed_at": observed,
-                    "edge_filter_reasons": list(reasons),
-                    "collection_errors": list(errors),
-                    "sample_count": len(values),
-                    "gpus": [gpu],
-                    "samples": [
-                        {
-                            "gpu": gpu,
-                            "name": name,
-                            "value": value,
-                            "labels": {"source_boot_id": boot},
-                        }
-                        for name, value in values.items()
-                    ],
-                }
-            )
-            for name, value in values.items():
-                world.latest[name] = {
-                    "gpu": gpu,
-                    "name": name,
-                    "value": value,
-                    "observed_at": observed,
-                    "source": "DCGM_EXPORTER",
-                    "labels": {"source_boot_id": boot},
-                }
+        return self.at(
+            offset,
+            lambda world: world.record_batch(
+                world.moment(offset),
+                values,
+                reasons=reasons,
+                errors=errors,
+                gpu=gpu,
+                boot=boot,
+            ),
+        )
 
-        return self.at(offset, action)
+    def record_finding(
+        self,
+        observed_at: datetime,
+        finding_id: str,
+        *,
+        name: str,
+        value: float,
+        severity: str,
+        count: int = 0,
+        action: str | None = None,
+        source: str | None = None,
+        policy: str = "SITE_NVIDIA_DEVICE_LIMIT_DERIVED",
+        active: bool = True,
+        gpu: str = GPU,
+        reason: str = "",
+    ) -> None:
+        self.findings[finding_id] = {
+            "finding_id": finding_id,
+            "canonical_name": name,
+            "severity": severity,
+            "value": value,
+            "gpu_uuid": gpu,
+            "observed_at": iso(observed_at),
+            "automatic_action": action
+            or ("DRAIN" if severity == "CRITICAL" else "RUN_DIAGNOSTICS"),
+            "official_action": None,
+            "policy_source": policy,
+            "threshold_source": source,
+            "confirmation_count": count,
+            "workload_state": "IDLE",
+            "affected_workload_ids": [],
+            "reason": reason,
+            "finding_kind": "METRIC",
+            "affected_gpu_uuids": [],
+        }
+        if active:
+            self.active.add(finding_id)
 
     def finding(
         self,
@@ -240,30 +484,23 @@ class World:
         gpu: str = GPU,
         reason: str = "",
     ) -> World:
-        def apply(world: World) -> None:
-            world.findings[finding_id] = {
-                "finding_id": finding_id,
-                "canonical_name": name,
-                "severity": severity,
-                "value": value,
-                "gpu_uuid": gpu,
-                "observed_at": iso(world.moment(offset)),
-                "automatic_action": action
-                or ("DRAIN" if severity == "CRITICAL" else "RUN_DIAGNOSTICS"),
-                "official_action": None,
-                "policy_source": policy,
-                "threshold_source": source,
-                "confirmation_count": count,
-                "workload_state": "IDLE",
-                "affected_workload_ids": [],
-                "reason": reason,
-                "finding_kind": "METRIC",
-                "affected_gpu_uuids": [],
-            }
-            if active:
-                world.active.add(finding_id)
-
-        return self.at(offset, apply)
+        return self.at(
+            offset,
+            lambda world: world.record_finding(
+                world.moment(offset),
+                finding_id,
+                name=name,
+                value=value,
+                severity=severity,
+                count=count,
+                action=action,
+                source=source,
+                policy=policy,
+                active=active,
+                gpu=gpu,
+                reason=reason,
+            ),
+        )
 
     def clear(self, offset: float, *finding_ids: str) -> World:
         return self.at(
@@ -518,3 +755,163 @@ def baseline_values(**overrides: float) -> dict[str, float]:
     }
     values.update(overrides)
     return values
+
+
+COLLECTOR_ENV = {
+    "GPU_FAULT_METRICS_INTERVAL_SECONDS": "15",
+    "GPU_FAULT_DCGM_EDGE_CONFIRMATION_SAMPLES": "3",
+    "GPU_FAULT_DCGM_HEALTH_SUMMARY_SECONDS": "300",
+}
+
+
+class WorldRegionalSettings:
+    cluster_id = "gpu-eks-cluster"
+
+    def environment(self) -> dict[str, str]:
+        return {"GPU_FAULT_CLUSTER_ID": self.cluster_id}
+
+
+class WorldRegional:
+    """Stands in for RegionalLiveFixture over a World."""
+
+    world: World
+
+    def __init__(self, settings: Any) -> None:
+        self.settings = settings
+
+    def evidence_identity(self) -> dict[str, str]:
+        return {"release_id": "rel-1", "cluster_id": "gpu-eks-cluster"}
+
+    def node_snapshot(self, node: str) -> dict[str, Any]:
+        if node == self.world.control_node["name"]:
+            return self.world.control_node_snapshot()
+        return self.world.node_snapshot()
+
+
+class WorldController:
+    """Stands in for EnvReplayController; records the lifecycle order."""
+
+    instances: list[WorldController] = []
+    world: World
+    restored_endpoint: str | None = None
+    after_state = "active"
+
+    def __init__(self, regional: Any, **options: Any) -> None:
+        self.options = options
+        self.calls: list[str] = []
+        WorldController.instances.append(self)
+
+    def create(self) -> None:
+        self.calls.append("create")
+
+    def preflight(self) -> dict[str, Any]:
+        self.calls.append("preflight")
+        return {
+            "metrics_unit": {"ActiveState": "active"},
+            "collector_env": dict(COLLECTOR_ENV),
+        }
+
+    def deploy_proxy(self, plan_path: Any, gpu_uuid: str, **options: Any) -> Any:
+        self.calls.append("deploy_proxy")
+        self.plan = Path(plan_path).read_text()
+        return {"endpoint": PROXY, "status": {"armed": False}}
+
+    def repoint(self, **options: Any) -> dict[str, Any]:
+        self.calls.append("repoint")
+        return self.world.repoint()
+
+    def status(self, **options: Any) -> dict[str, Any]:
+        self.calls.append("status")
+        return self.world.status()
+
+    def arm(self, **options: Any) -> dict[str, Any]:
+        self.calls.append("arm")
+        return self.world.arm()
+
+    def pause_collector(self, **options: Any) -> dict[str, Any]:
+        self.calls.append("pause_collector")
+        return self.world.pause_collector(**options)
+
+    def pause_status(self) -> dict[str, Any]:
+        self.calls.append("pause_status")
+        return self.world.pause_status()
+
+    def resume_collector(self) -> dict[str, Any]:
+        self.calls.append("resume_collector")
+        return self.world.resume_collector()
+
+    def restart_collector(self) -> dict[str, Any]:
+        self.calls.append("restart_collector")
+        return self.world.restart_collector()
+
+    def cleanup(self) -> dict[str, Any]:
+        self.calls.append("cleanup")
+        return {
+            "restore": {
+                "restored_endpoint": self.restored_endpoint,
+                "original_endpoint": "http://127.0.0.1:9400/metrics",
+                "after": {"ActiveState": self.after_state},
+                "dropin_removed": True,
+            },
+            "stop_proxy": {"ok": True},
+            "probe_residuals": {"pod": False, "configmap": False},
+        }
+
+
+class WorldControlTask:
+    """Stands in for env_live_scope.ControlTask over the World's control Pods."""
+
+    instances: list[WorldControlTask] = []
+    world: World
+
+    def __init__(self, regional: Any, **options: Any) -> None:
+        self.options = options
+        self.calls: list[str] = []
+        self.node = options.get("node")
+        WorldControlTask.instances.append(self)
+
+    def start(self, **_options: Any) -> dict[str, Any]:
+        self.calls.append("start")
+        return self.world.control_task_snapshot()
+
+    def snapshot(self) -> dict[str, Any]:
+        self.calls.append("snapshot")
+        return self.world.control_task_snapshot()
+
+    def cleanup(self) -> dict[str, Any]:
+        self.calls.append("cleanup")
+        return {"workload": "removed", "prewarm": {"pods": False}}
+
+
+def install_world(monkeypatch: Any, world: World, *, preflight: Any) -> None:
+    """Bind the runner's live seams to ``world`` (no cluster, fake clock)."""
+
+    from scripts.e2e.regional import env_live_fixture as fixture
+    from scripts.e2e.regional import env_live_scope as scope
+    from scripts.e2e.regional import run_env_live as runner
+
+    WorldController.instances = []
+    WorldControlTask.instances = []
+    monkeypatch.setattr(WorldController, "world", world, raising=False)
+    monkeypatch.setattr(WorldControlTask, "world", world, raising=False)
+    monkeypatch.setattr(WorldRegional, "world", world, raising=False)
+    monkeypatch.setattr(runner, "RegionalLiveFixture", WorldRegional)
+    monkeypatch.setattr(fixture, "EnvReplayController", WorldController)
+    monkeypatch.setattr(scope, "ControlTask", WorldControlTask)
+    monkeypatch.setattr(fixture, "gpu_records", world.gpu_state)
+
+    def node_records(regional: Any, node: str, since: Any) -> dict[str, Any]:
+        if node == world.control_node["name"]:
+            return world.control_activity()
+        return world.activity()
+
+    def node_state(regional: Any, node: str) -> dict[str, Any]:
+        if node == world.control_node["name"]:
+            return world.control_node_snapshot()
+        return world.node_snapshot()
+
+    monkeypatch.setattr(fixture, "node_records", node_records)
+    monkeypatch.setattr(fixture, "node_state", node_state)
+    monkeypatch.setattr(fixture, "utc_now", world.clock)
+    monkeypatch.setattr(runner, "SLEEP", world.sleep)
+    monkeypatch.setattr(runner, "read_only_preflight", lambda s, d: preflight)

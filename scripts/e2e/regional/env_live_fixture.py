@@ -24,7 +24,9 @@ import hashlib
 import json
 import re
 import sys
+import time
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -66,6 +68,8 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
 #: The audited replay tool and the controller probe this fixture ships.
 REPLAY_TOOL = ROOT / "tools" / "gpu_environment_replay.py"
 PROBE_SCRIPT = Path(__file__).with_name("probes") / "env_replay_proxy.py"
+#: The one case that uses the control node (``--node-b``).
+SCOPE_CASE_ID = "GF-ENV-LIVE-010"
 #: The file names the node side writes the plan and the tool under.
 PLAN_FILE = "plan.json"
 TOOL_FILE = "gpu_environment_replay.py"
@@ -101,6 +105,10 @@ class EnvLiveSettings:
     #: them before an isolating / stopping branch runs.
     isolate_confirm: str = ""
     stop_confirm: str = ""
+    #: GF-ENV-LIVE-010's control node (``--node-b``, the site profile's
+    #: ``node-b``): a second GPU node that runs the independent control task
+    #: and must stay untouched while the target node's GPU is replayed.
+    control_node: str = ""
 
     def environment(self) -> dict[str, str]:
         value = {
@@ -111,6 +119,8 @@ class EnvLiveSettings:
         }
         if self.gpu_uuid:
             value["GPU_FAULT_ENV_LIVE_GPU_UUID"] = self.gpu_uuid
+        if self.control_node:
+            value["GPU_FAULT_ENV_LIVE_CONTROL_NODE"] = self.control_node
         return value
 
 
@@ -124,6 +134,11 @@ def add_env_live_arguments(parser: argparse.ArgumentParser, confirmation: str) -
     parser.add_argument("--cluster-id", default="")
     parser.add_argument("--region", default="")
     parser.add_argument("--node", default="")
+    parser.add_argument(
+        "--node-b",
+        default="",
+        help="GF-ENV-LIVE-010's control node (runs the independent control task)",
+    )
     parser.add_argument("--host-probe-image", default="")
     parser.add_argument("--gpu-uuid", default="")
     parser.add_argument("--site-file", default="")
@@ -162,13 +177,18 @@ def configure(arguments: argparse.Namespace, confirmation: str) -> EnvLiveSettin
         else None,
         isolate_confirm=str(getattr(arguments, "confirm_isolate", "") or ""),
         stop_confirm=str(getattr(arguments, "confirm_stop", "") or ""),
+        control_node=str(getattr(arguments, "node_b", "") or ""),
     )
 
 
 # --------------------------------------------------------------------------- #
-# Read-only device-limit read (an exec into the node's existing exporter Pod)
+# Read-only device-limit read: an exec into the node's exporter Pod where the
+# exporter is a DaemonSet (HyperPod); on a host-mode node (plain EKS: the
+# exporter is the gpu-fault-dcgm-exporter.service container, the DaemonSet is
+# inactive) a transient host probe runs the same ``nvidia-smi -q -x`` read
+# through the product parser and is deleted again.
 # --------------------------------------------------------------------------- #
-def _exporter_pod_on_node(regional: RegionalLiveFixture, node: str) -> str:
+def _exporter_pod_on_node(regional: RegionalLiveFixture, node: str) -> str | None:
     value = json.loads(
         regional.kubectl(
             "gpu",
@@ -205,27 +225,39 @@ def _exporter_pod_on_node(regional: RegionalLiveFixture, node: str) -> str:
             for item in value.get("items", [])
             if str(item["metadata"].get("name", "")).startswith(EXPORTER_POD_PREFIX)
         ]
-    if not pods:
-        raise RegionalFixtureError(
-            f"no running {EXPORTER_POD_PREFIX} Pod on {node} to read device limits"
-        )
-    return sorted(pods)[0]
+    return sorted(pods)[0] if pods else None
+
+
+HostLimitRead = Callable[[], dict[str, Any]]
 
 
 def read_device_limits(
-    regional: RegionalLiveFixture, node: str
-) -> list[dict[str, Any]]:
+    regional: RegionalLiveFixture,
+    node: str,
+    *,
+    host_read: HostLimitRead | None = None,
+) -> tuple[list[dict[str, Any]], str]:
     """Per-GPU temperature limits parsed with the product's own XML parser.
 
     Read-only: ``nvidia-smi -q -x`` runs in the node's existing exporter Pod,
     and the XML is parsed by ``query_nvidia_temperature_limits`` through a
     runner that just returns that text, so the scale decision is identical to
-    the collector's.
+    the collector's. Without an exporter Pod on the node (host-mode exporter)
+    ``host_read`` -- the env_replay_proxy probe's ``preflight`` on the node,
+    which runs the same parser -- supplies the limits and the live T.Limit
+    readings. Returns the devices and which source read them.
     """
 
     from gpu_fault.collectors.gpu.discovery import query_nvidia_temperature_limits
 
     pod = _exporter_pod_on_node(regional, node)
+    if pod is None:
+        if host_read is None:
+            raise RegionalFixtureError(
+                f"no running {EXPORTER_POD_PREFIX} Pod on {node} to read device "
+                "limits and no host probe read is configured"
+            )
+        return host_probe_devices(host_read()), "host-probe"
     xml = regional.kubectl(
         "gpu", "exec", pod, "--", "nvidia-smi", "-q", "-x", timeout=90
     )
@@ -255,7 +287,77 @@ def read_device_limits(
     for uuid, reading in _current_tlimit_readings(xml).items():
         if uuid in by_gpu:
             by_gpu[uuid]["limits"].setdefault("gpu_tlimit_c", reading)
-    return [by_gpu[key] for key in sorted(by_gpu)]
+    return [by_gpu[key] for key in sorted(by_gpu)], "exporter-pod"
+
+
+def host_probe_devices(preflight: dict[str, Any]) -> list[dict[str, Any]]:
+    """The device list of the probe's ``preflight`` receipt, in the Pod-read shape.
+
+    ``device_limits`` is the product parser's output on the node (no T.Limit
+    reading); ``current_tlimit_readings`` is the exporter's field 153 per GPU,
+    merged in as ``gpu_tlimit_c`` exactly as the Pod read merges the XML's
+    ``<gpu_temp_tlimit>``.
+    """
+
+    devices: list[dict[str, Any]] = []
+    readings = preflight.get("current_tlimit_readings") or {}
+    for item in preflight.get("device_limits") or []:
+        if not isinstance(item, dict):
+            continue
+        limits = dict(item.get("limits") or {})
+        uuid = item.get("gpu_uuid")
+        if uuid in readings and "gpu_tlimit_c" not in limits:
+            limits["gpu_tlimit_c"] = readings[uuid]
+        devices.append(
+            {
+                "gpu_uuid": uuid,
+                "gpu_index": item.get("gpu_index"),
+                "pci_bdf": item.get("pci_bdf"),
+                "product": item.get("product"),
+                "limits": limits,
+            }
+        )
+    if not devices:
+        raise RegionalFixtureError("the host probe read no GPU device limits")
+    return sorted(devices, key=lambda item: str(item.get("gpu_uuid")))
+
+
+def host_limit_reader(settings: EnvLiveSettings, case_dir: Path) -> HostLimitRead:
+    """A one-shot host probe ``preflight`` on the target node, deleted after use.
+
+    The same privileged probe the execute path runs the proxy from; here it
+    only reads (``nvidia-smi -q -x`` through the product parser, the exporter's
+    T.Limit readings, the unit state) and is removed again, so a ``--plan`` on
+    a host-mode node leaves nothing behind.
+    """
+
+    def read() -> dict[str, Any]:
+        regional = RegionalLiveFixture(settings.regional)
+        host = HostProbeFixture(
+            HostProbeSettings(
+                kubeconfig=regional.settings.gpu_kubeconfig,
+                context=regional.settings.gpu_context,
+                namespace=regional.settings.namespace,
+                node=settings.node,
+                image=settings.host_probe_image,
+                case_id=settings.case_id,
+                run_id=f"{settings.case_id.lower()}-limits-{int(time.time())}",
+                probe_script=PROBE_SCRIPT,
+                state_directory=case_dir / "host-probes",
+                active_deadline_seconds=600,
+            )
+        )
+        try:
+            host.create()
+            return host.execute("preflight", timeout=120)
+        finally:
+            residuals = host.cleanup()
+            if any(residuals.values()):
+                raise RegionalFixtureError(
+                    f"the device-limit host probe left residuals: {residuals}"
+                )
+
+    return read
 
 
 def _current_tlimit_readings(xml: str) -> dict[str, float]:
@@ -347,10 +449,15 @@ def read_only_preflight(settings: EnvLiveSettings, case_dir: Path) -> dict[str, 
     devices: list[dict[str, Any]] = []
     device_plans: dict[str, Any] = {}
     target: dict[str, Any] = {}
+    limits_source: str | None = None
     thresholds = GpuMetricsThresholds.from_environment()
     confirmation_samples = 3
     try:
-        devices = read_device_limits(regional, settings.node)
+        devices, limits_source = read_device_limits(
+            regional,
+            settings.node,
+            host_read=host_limit_reader(settings, case_dir),
+        )
         built = build_device_plans(
             devices, thresholds=thresholds, confirmation_samples=3
         )
@@ -364,6 +471,15 @@ def read_only_preflight(settings: EnvLiveSettings, case_dir: Path) -> dict[str, 
             )
     except RegionalFixtureError as exc:
         errors.append(f"device limit read failed: {exc}")
+    # The site profile supplies ``node-b`` to every case; only the scope case
+    # uses it, so only 010 is held to the control node's cleanliness.
+    control = (
+        control_node_preflight(regional, settings)
+        if settings.control_node and settings.case_id == SCOPE_CASE_ID
+        else None
+    )
+    if control is not None:
+        errors.extend(control["errors"])
 
     result = {
         **identity,
@@ -377,13 +493,55 @@ def read_only_preflight(settings: EnvLiveSettings, case_dir: Path) -> dict[str, 
         "predecessor": predecessor,
         "cpu_blast": regional.cpu_blast_snapshot(),
         "devices": devices,
+        "device_limits_source": limits_source,
         "device_plans": device_plans,
         "target_gpu": target,
+        "control_node": control,
         "confirmation_samples": confirmation_samples,
         "errors": errors,
     }
     write_json_atomic(case_dir / "preflight.json", result)
     return result
+
+
+def control_node_preflight(
+    regional: RegionalLiveFixture, settings: EnvLiveSettings
+) -> dict[str, Any]:
+    """GF-ENV-LIVE-010's control node must be a clean, distinct GPU node.
+
+    It receives the independent control task and nothing else; a node that
+    already carries ownership, a business workload or an inactive Agent could
+    not prove "no change" afterwards.
+    """
+
+    errors: list[str] = []
+    name = settings.control_node
+    if name == settings.node:
+        return {
+            "name": name,
+            "errors": ["the control node (--node-b) equals the target node"],
+        }
+    node = regional.node_snapshot(name)
+    state = regional.store_snapshot(node=name)
+    workloads = regional.business_workloads(name)
+    if node["ready"] != "True":
+        errors.append(f"control node {name} is not Ready")
+    if node.get("unschedulable"):
+        errors.append(f"control node {name} is cordoned")
+    if node["ownership_annotations"]:
+        errors.append(f"control node {name} has pre-existing workflow ownership")
+    if workloads:
+        errors.append(f"control node {name} has a business workload")
+    agent = state.get("agent") or {}
+    if agent.get("lifecycle_state") != "ACTIVE":
+        errors.append(f"control node {name} Node Agent is not ACTIVE")
+    return {
+        "name": name,
+        "node": node,
+        "agent_state": agent.get("lifecycle_state"),
+        "workloads": workloads,
+        "errors": errors,
+    }
 
 
 def device_plan_report(plan: plans.DevicePlan) -> dict[str, Any]:
@@ -431,6 +589,7 @@ class EnvReplayController:
         self.case_dir = case_dir
         self._repointed = False
         self._armed = False
+        self._pause_scheduled = False
         # A caller (the GF-GENERAL-LIVE 024 composites, a test) may hand in the
         # host probe; production builds the node-pinned probe Pod itself.
         self.host = host or HostProbeFixture(
@@ -460,6 +619,8 @@ class EnvReplayController:
             "deploy-proxy",
             "repoint-collector",
             "arm",
+            "pause-collector",
+            "restart-collector",
             "restore-collector",
         }:
             require_action_time(timeout)
@@ -540,11 +701,52 @@ class EnvReplayController:
         self._armed = True
         return receipt
 
+    def pause_collector(
+        self,
+        *,
+        after_reads: int,
+        seconds: int,
+        wait_seconds: int,
+        port: int = 9411,
+    ) -> dict[str, Any]:
+        """Schedule the read-synchronous pause (GF-ENV-LIVE-009) on the node."""
+
+        receipt = self.execute(
+            "pause-collector",
+            "--run-id",
+            self.run_id,
+            "--after-reads",
+            str(int(after_reads)),
+            "--port",
+            str(port),
+            "--seconds",
+            str(int(seconds)),
+            "--wait-seconds",
+            str(int(wait_seconds)),
+            timeout=60,
+        )
+        self._pause_scheduled = True
+        return receipt
+
+    def pause_status(self) -> dict[str, Any]:
+        return self.host.execute("pause-status", "--run-id", self.run_id, timeout=60)
+
+    def resume_collector(self) -> dict[str, Any]:
+        receipt = self.host.execute(
+            "resume-collector", "--run-id", self.run_id, timeout=60
+        )
+        self._pause_scheduled = False
+        return receipt
+
+    def restart_collector(self) -> dict[str, Any]:
+        return self.execute("restart-collector", "--run-id", self.run_id, timeout=120)
+
     def restore(self) -> dict[str, Any]:
         receipt = self.execute(
             "restore-collector", "--run-id", self.run_id, timeout=120
         )
         self._repointed = False
+        self._pause_scheduled = False
         return receipt
 
     def stop_proxy(self, *, port: int = 9411) -> dict[str, Any]:
@@ -560,6 +762,13 @@ class EnvReplayController:
         """
 
         receipts: dict[str, Any] = {}
+        if self._pause_scheduled:
+            # The restore resumes a paused unit itself; an explicit resume first
+            # keeps the receipt even when the restore is refused by the window.
+            try:
+                receipts["resume"] = self.resume_collector()
+            except Exception as exc:  # noqa: BLE001 - recorded; cleanup continues
+                receipts["resume_error"] = f"{type(exc).__name__}: {exc}"
         if self._repointed:
             try:
                 receipts["restore"] = self.restore()

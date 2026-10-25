@@ -32,7 +32,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from gpu_fault.gpu_environment_policy import CONFIRMATION_SAMPLES, HW_POWER_BRAKE_MASK
+from gpu_fault.gpu_environment_policy import (
+    CONFIRMATION_MAX_GAP_SECONDS,
+    CONFIRMATION_SAMPLES,
+    HW_POWER_BRAKE_MASK,
+)
 from gpu_fault.health_recovery_contract import COOLDOWN_SECONDS
 
 from scripts.e2e.regional import env_live_verdicts as verdicts
@@ -55,8 +59,24 @@ FIELD_VARIANTS = {
     "memory_temperature_c": "memory_absolute",
 }
 KINDS = frozenset(
-    {"baseline", "review", "warning", "transient", "duration", "no_finding", "unknown"}
+    {
+        "baseline",
+        "review",
+        "warning",
+        "transient",
+        "duration",
+        "no_finding",
+        "unknown",
+        "interruption",
+    }
 )
+#: GF-ENV-LIVE-009's collection pause: longer than the policy's confirmation
+#: gap (``CONFIRMATION_MAX_GAP_SECONDS``) by one collector tick of margin, so
+#: the first accepted sample after the resume is unmistakably past the gap.
+PAUSE_MARGIN_SECONDS = 15.0
+#: How long the pause deadman waits beyond the planned pause before it resumes
+#: the unit itself (the runner normally resumes first).
+PAUSE_DEADMAN_MARGIN_SECONDS = 120.0
 
 
 def number_or_none(value: Any) -> float | None:
@@ -107,6 +127,12 @@ class Expectation:
     fallback_field: str | None = None
     boot_id: str | None = None
     notes: tuple[str, ...] = ()
+    #: GF-ENV-LIVE-009: the plan read after which the collector is paused and
+    #: for how long (0 = no pause step in this expectation).
+    pause_after_reads: int = 0
+    pause_seconds: float = 0.0
+    #: GF-ENV-LIVE-010: the control node whose task and records must not change.
+    control_node: str | None = None
 
     def evidence(self) -> dict[str, Any]:
         return {
@@ -122,6 +148,9 @@ class Expectation:
             "hold_seconds": self.hold_seconds,
             "require_diagnostic": self.require_diagnostic,
             "require_clear": self.require_clear,
+            "pause_after_reads": self.pause_after_reads,
+            "pause_seconds": self.pause_seconds,
+            "control_node": self.control_node,
             "not_covered_by_this_attempt": list(self.notes),
         }
 
@@ -164,6 +193,129 @@ def _single_field(values: Mapping[str, list[float | None]], case_id: str) -> str
 
 def _served(values: Mapping[str, list[float | None]], name: str) -> list[float]:
     return [value for value in values.get(name) or [] if value is not None]
+
+
+def _interruption_expectation(
+    base: dict[str, Any],
+    values: Mapping[str, list[float | None]],
+    *,
+    plan: Mapping[str, Any],
+    case_id: str,
+    preflight: Mapping[str, Any],
+    gpu: str,
+    cadence: CollectorCadence,
+    replay: Mapping[str, float],
+    hold: float,
+) -> Expectation:
+    """GF-ENV-LIVE-009: the pause, the recount, the clear and the restart."""
+
+    interval = cadence.interval_seconds
+    name = _single_field(values, case_id)
+    pause_after = plan_pause_read(plan)
+    pause_seconds = CONFIRMATION_MAX_GAP_SECONDS + PAUSE_MARGIN_SECONDS
+    return Expectation(
+        **base,
+        kind="interruption",
+        field=name,
+        trigger_values=tuple(sorted(set(_served(values, name)))),
+        names=(name, "gpu_temperature_c"),
+        terms={
+            **replay,
+            # The pause stops the proxy reads for its whole length; the
+            # restart's first scrape waits for the startup spread; its
+            # delivery and one hold after the clear complete the case.
+            "collection_pause": pause_seconds,
+            "collector_restart_first_read": STARTUP_SPREAD_SECONDS + interval,
+            "restart_delivery_margin": PROCESSING_MARGIN_SECONDS,
+            "hold": hold,
+        },
+        hold_seconds=hold,
+        threshold_source=_decision(preflight, gpu, FIELD_VARIANTS.get(name, "")).get(
+            "threshold_source"
+        ),
+        require_clear=True,
+        pause_after_reads=pause_after,
+        pause_seconds=pause_seconds,
+        boot_id=str((preflight.get("node") or {}).get("boot_id") or "") or None,
+        notes=(
+            "the DCGM -> nvidia-smi source switch runs only through the normal "
+            "installation (GPU_FAULT_METRICS_MODE); this attempt does not "
+            "switch the source and records that gap",
+            "cross-boot re-confirmation needs a separately approved node "
+            "maintenance reboot; this attempt does not reboot the node",
+        ),
+    )
+
+
+def _review_expectation(
+    base: dict[str, Any],
+    values: Mapping[str, list[float | None]],
+    *,
+    number: int,
+    plan_name: str,
+    case_id: str,
+    preflight: Mapping[str, Any],
+    gpu: str,
+    interval: float,
+    replay: Mapping[str, float],
+) -> Expectation:
+    """004 / 010 / 011 and the sustained or mixed brake of 007: the review chain."""
+
+    name = _single_field(values, case_id)
+    triggers = _served(values, name)
+    if number == 7:
+        triggers = [value for value in triggers if brake_mask(value)]
+        source: Any = "NVIDIA_HW_POWER_BRAKE"
+    elif number == 11:
+        source = "NVIDIA_DEVICE_LIMIT"
+    else:
+        source = _decision(preflight, gpu, plan_name.split("/", 1)[0]).get(
+            "threshold_source"
+        )
+    notes: tuple[str, ...] = ()
+    if number == 7:
+        notes = (
+            "the transient brake, the 0x04/0x08/0x10/0x100 bits and the "
+            "other mixed masks run as their own attempts",
+        )
+    elif number == 10:
+        notes = (
+            "the target node runs no owned distributed job (the preflight admits "
+            "only a clean node), so the STOP scope of an affected job is not "
+            "measured; the control task runs on the control node",
+        )
+    return Expectation(
+        **base,
+        kind="review",
+        field=name,
+        trigger_values=tuple(sorted(set(triggers))),
+        names=(name, "gpu_temperature_c"),
+        terms={
+            **replay,
+            "cooldown_hold": COOLDOWN_SECONDS + interval,
+            "workflow_dispatch": PROCESSING_MARGIN_SECONDS,
+        },
+        hold_seconds=COOLDOWN_SECONDS + interval,
+        required_samples=1 if number == 11 else CONFIRMATION_SAMPLES,
+        threshold_source=source,
+        power_delivery=number == 7,
+        control_node=(
+            str((preflight.get("control_node") or {}).get("name") or "") or None
+        )
+        if number == 10
+        else None,
+        notes=notes,
+    )
+
+
+def plan_pause_read(plan: Mapping[str, Any]) -> int:
+    """The read after which 009 pauses: the warmup block plus the first severe
+    block (``env_live_plans.pause_read_index``, kept here without the import)."""
+
+    steps = [step for step in plan.get("steps") or [] if isinstance(step, Mapping)]
+    if len(steps) < 3:
+        raise ValueError("an interruption plan needs warmup, severe and clear steps")
+    return int(steps[0].get("reads") or 0) + int(steps[1].get("reads") or 0)
 
 
 def expectation_for(
@@ -222,43 +374,31 @@ def expectation_for(
             hold_seconds=0.0,
             boot_id=str((preflight.get("node") or {}).get("boot_id") or "") or None,
         )
-    if number in {4, 11} or (
+    if number == 9:
+        return _interruption_expectation(
+            base,
+            values,
+            plan=plan,
+            case_id=case_id,
+            preflight=preflight,
+            gpu=gpu,
+            cadence=cadence,
+            replay=replay,
+            hold=hold,
+        )
+    if number in {4, 10, 11} or (
         number == 7 and (plan_name == "sustained" or plan_name.startswith("mixed_"))
     ):
-        name = _single_field(values, case_id)
-        triggers = _served(values, name)
-        if number == 7:
-            triggers = [value for value in triggers if brake_mask(value)]
-            source: Any = "NVIDIA_HW_POWER_BRAKE"
-        elif number == 11:
-            source = "NVIDIA_DEVICE_LIMIT"
-        else:
-            source = _decision(preflight, gpu, plan_name.split("/", 1)[0]).get(
-                "threshold_source"
-            )
-        return Expectation(
-            **base,
-            kind="review",
-            field=name,
-            trigger_values=tuple(sorted(set(triggers))),
-            names=(name, "gpu_temperature_c"),
-            terms={
-                **replay,
-                "cooldown_hold": COOLDOWN_SECONDS + interval,
-                "workflow_dispatch": PROCESSING_MARGIN_SECONDS,
-            },
-            hold_seconds=COOLDOWN_SECONDS + interval,
-            required_samples=1 if number == 11 else CONFIRMATION_SAMPLES,
-            threshold_source=source,
-            power_delivery=number == 7,
-            notes=(
-                (
-                    "the transient brake, the 0x04/0x08/0x10/0x100 bits and the "
-                    "other mixed masks run as their own attempts",
-                )
-                if number == 7
-                else ()
-            ),
+        return _review_expectation(
+            base,
+            values,
+            number=number,
+            plan_name=plan_name,
+            case_id=case_id,
+            preflight=preflight,
+            gpu=gpu,
+            interval=interval,
+            replay=replay,
         )
     if number == 3:
         name = _single_field(values, case_id)
@@ -359,10 +499,13 @@ __all__ = [
     "Expectation",
     "FIELD_VARIANTS",
     "KINDS",
+    "PAUSE_DEADMAN_MARGIN_SECONDS",
+    "PAUSE_MARGIN_SECONDS",
     "TEMPERATURE_WARNING_GRACE_SECONDS",
     "brake_mask",
     "expectation_for",
     "number_or_none",
+    "plan_pause_read",
     "replayed_values",
     "same_value",
 ]

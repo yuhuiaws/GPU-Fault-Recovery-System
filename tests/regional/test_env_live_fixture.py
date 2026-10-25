@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 from pathlib import Path
@@ -129,9 +130,10 @@ H200_XML = """<nvidia_smi_log><gpu><product_name>NVIDIA H200</product_name>
 
 def test_read_device_limits_parses_with_the_product_parser() -> None:
     regional = FakeRegional(device_xml=H200_XML)
-    devices = fixture.read_device_limits(regional, "node-a")
+    devices, source = fixture.read_device_limits(regional, "node-a")
     assert devices and devices[0]["gpu_uuid"] == "GPU-aaaa"
     assert devices[0]["limits"]["gpu_slowdown_tlimit_c"] == -2.0
+    assert source == "exporter-pod"
 
 
 def _settings() -> fixture.EnvLiveSettings:
@@ -356,3 +358,241 @@ def test_controller_accepts_an_injected_created_host(tmp_path: Path) -> None:
     assert controller.host is host
     assert controller.status(port=9411) == {"status": {"armed": False}}
     assert host.calls == [("status", "--run-id", "r1", "--port", "9411")]
+
+
+# --------------------------------------------------------------------------- #
+# Host-mode nodes (plain EKS): no exporter Pod, the host probe reads the limits
+# --------------------------------------------------------------------------- #
+class HostModeRegional(FakeRegional):
+    """A node whose exporter is the host systemd container: no exporter Pod."""
+
+    def kubectl(self, plane: str, *args: str, **kwargs: Any) -> str:
+        if "exec" in args:
+            raise AssertionError("nothing to exec into on a host-mode node")
+        return json.dumps({"items": []})
+
+
+HOST_PREFLIGHT = {
+    "device_limits": [
+        {
+            "gpu_uuid": "GPU-aaaa",
+            "gpu_index": "0",
+            "pci_bdf": "59:00",
+            "product": "NVIDIA H200",
+            "limits": {
+                "gpu_slowdown_tlimit_c": -2.0,
+                "gpu_shutdown_tlimit_c": -8.0,
+                "gpu_max_operating_tlimit_c": 0.0,
+            },
+        }
+    ],
+    "current_tlimit_readings": {"GPU-aaaa": 59.0},
+    "collector_env": {"GPU_FAULT_METRICS_MODE": "dcgm"},
+}
+
+
+def test_read_device_limits_falls_back_to_the_host_probe_without_a_pod() -> None:
+    calls: list[str] = []
+
+    def host_read() -> dict[str, Any]:
+        calls.append("preflight")
+        return dict(HOST_PREFLIGHT)
+
+    devices, source = fixture.read_device_limits(
+        HostModeRegional(device_xml=""), "node-a", host_read=host_read
+    )
+    assert source == "host-probe" and calls == ["preflight"]
+    assert devices[0]["gpu_uuid"] == "GPU-aaaa"
+    # The exporter's T.Limit reading is merged in as the XML read merges it.
+    assert devices[0]["limits"]["gpu_tlimit_c"] == 59.0
+    assert devices[0]["limits"]["gpu_slowdown_tlimit_c"] == -2.0
+    with pytest.raises(RegionalFixtureError, match="no host probe read"):
+        fixture.read_device_limits(HostModeRegional(device_xml=""), "node-a")
+    with pytest.raises(RegionalFixtureError, match="read no GPU device limits"):
+        fixture.host_probe_devices({"device_limits": []})
+
+
+def test_read_device_limits_prefers_the_exporter_pod_when_present() -> None:
+    def host_read() -> dict[str, Any]:
+        raise AssertionError("the Pod read must win where the exporter is a DaemonSet")
+
+    devices, source = fixture.read_device_limits(
+        FakeRegional(device_xml=H200_XML), "node-a", host_read=host_read
+    )
+    assert source == "exporter-pod" and devices[0]["limits"]["gpu_tlimit_c"] == 59.0
+
+
+class RecordingHostProbe:
+    """A host probe that answers ``preflight`` and journals create/cleanup."""
+
+    instances: list["RecordingHostProbe"] = []
+
+    def __init__(self, settings: Any) -> None:
+        self.settings = settings
+        self.calls: list[str] = []
+        RecordingHostProbe.instances.append(self)
+
+    def create(self) -> None:
+        self.calls.append("create")
+
+    def execute(self, *arguments: str, timeout: int = 180) -> dict[str, Any]:
+        self.calls.append(arguments[0])
+        assert arguments == ("preflight",), arguments
+        return dict(HOST_PREFLIGHT)
+
+    def cleanup(self) -> dict[str, bool]:
+        self.calls.append("cleanup")
+        return {"pod": False, "configmap": False}
+
+
+def test_read_only_preflight_on_a_host_mode_node_uses_a_transient_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    RecordingHostProbe.instances = []
+    monkeypatch.setattr(
+        fixture, "RegionalLiveFixture", lambda s: HostModeRegional(device_xml="")
+    )
+    monkeypatch.setattr(fixture, "HostProbeFixture", RecordingHostProbe)
+    monkeypatch.setattr(fixture, "HostProbeSettings", lambda **kwargs: kwargs)
+    result = fixture.read_only_preflight(_settings(), tmp_path)
+    assert result["errors"] == [], result["errors"]
+    assert result["device_limits_source"] == "host-probe"
+    assert result["target_gpu"]["gpu_uuid"] == "GPU-aaaa"
+    assert "core_tlimit" in result["device_plans"]["GPU-aaaa"]["runnable_variants"]
+    probe = RecordingHostProbe.instances[0]
+    assert probe.calls == ["create", "preflight", "cleanup"]
+    assert probe.settings["probe_script"] == fixture.PROBE_SCRIPT
+    assert probe.settings["run_id"].startswith("gf-env-live-004-limits-"), (
+        probe.settings
+    )
+
+
+def test_read_only_preflight_fails_when_the_limit_probe_leaves_residuals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Leaky(RecordingHostProbe):
+        def cleanup(self) -> dict[str, bool]:
+            self.calls.append("cleanup")
+            return {"pod": True, "configmap": False}
+
+    monkeypatch.setattr(
+        fixture, "RegionalLiveFixture", lambda s: HostModeRegional(device_xml="")
+    )
+    monkeypatch.setattr(fixture, "HostProbeFixture", Leaky)
+    monkeypatch.setattr(fixture, "HostProbeSettings", lambda **kwargs: kwargs)
+    result = fixture.read_only_preflight(_settings(), tmp_path)
+    assert any("left residuals" in item for item in result["errors"]), result["errors"]
+
+
+# --------------------------------------------------------------------------- #
+# GF-ENV-LIVE-010: the control node's own preflight
+# --------------------------------------------------------------------------- #
+def _scope_settings(control_node: str) -> fixture.EnvLiveSettings:
+    regional = type("R", (), {"environment": lambda self: {}})()
+    return fixture.EnvLiveSettings(
+        regional=regional,
+        case_id="GF-ENV-LIVE-010",
+        confirmation="ENVLIVE010_EXECUTE",
+        node="node-a",
+        host_probe_image="x@sha256:" + "0" * 64,
+        gpu_uuid="GPU-aaaa",
+        predecessor_path=None,
+        predecessor_id=None,
+        site_file=None,
+        control_node=control_node,
+    )
+
+
+def test_control_node_preflight_requires_a_clean_distinct_node(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clean = fixture.control_node_preflight(
+        FakeRegional(device_xml=H200_XML), _scope_settings("node-b")
+    )
+    assert clean["errors"] == [] and clean["name"] == "node-b"
+    same = fixture.control_node_preflight(
+        FakeRegional(device_xml=H200_XML), _scope_settings("node-a")
+    )
+    assert same["errors"] == ["the control node (--node-b) equals the target node"]
+    dirty = fixture.control_node_preflight(
+        FakeRegional(device_xml=H200_XML, clean=False), _scope_settings("node-b")
+    )
+    text = "\n".join(dirty["errors"])
+    assert "control node node-b" in text
+    assert "workflow ownership" in text and "business workload" in text
+    assert "Node Agent is not ACTIVE" in text
+    # The whole preflight carries the control node's errors and record.
+    monkeypatch.setattr(
+        fixture,
+        "RegionalLiveFixture",
+        lambda s: FakeRegional(device_xml=H200_XML, clean=False),
+    )
+    result = fixture.read_only_preflight(_scope_settings("node-b"), tmp_path)
+    assert result["control_node"]["name"] == "node-b"
+    assert any("control node node-b" in item for item in result["errors"]), result[
+        "errors"
+    ]
+    monkeypatch.setattr(
+        fixture, "RegionalLiveFixture", lambda s: FakeRegional(device_xml=H200_XML)
+    )
+    result = fixture.read_only_preflight(_scope_settings(""), tmp_path)
+    assert result["control_node"] is None
+    # Every other case ignores the profile's node-b, dirty or not.
+    monkeypatch.setattr(
+        fixture,
+        "RegionalLiveFixture",
+        lambda s: FakeRegional(device_xml=H200_XML, clean=False),
+    )
+    other = fixture.read_only_preflight(
+        dataclasses.replace(_scope_settings("node-b"), case_id="GF-ENV-LIVE-004"),
+        tmp_path,
+    )
+    assert other["control_node"] is None
+    assert not any("control node" in item for item in other["errors"]), other["errors"]
+
+
+def test_env_live_arguments_take_the_control_node_from_node_b() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    fixture.add_env_live_arguments(parser, confirmation="X")
+    arguments = parser.parse_args(
+        [
+            "--run-dir",
+            "/tmp/x",
+            "--case",
+            "GF-ENV-LIVE-010",
+            "--node",
+            "node-a",
+            "--node-b",
+            "node-b",
+        ]
+    )
+    assert arguments.node_b == "node-b"
+    assert fixture.EnvLiveSettings.__dataclass_fields__["control_node"].default == ""
+
+
+# --------------------------------------------------------------------------- #
+# The controller's 009 verbs and the resume-before-restore cleanup order
+# --------------------------------------------------------------------------- #
+def test_controller_pause_verbs_and_cleanup_resume_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = _controller(monkeypatch, tmp_path)
+    controller.create()
+    controller.repoint()
+    controller.pause_collector(after_reads=7, seconds=195, wait_seconds=150)
+    controller.pause_status()
+    controller.restart_collector()
+    receipts = controller.cleanup()
+    host = controller.host
+    verbs = [call[0] for call in host.calls]
+    pause = next(call for call in host.calls if call[0] == "pause-collector")
+    assert pause[pause.index("--after-reads") + 1] == "7"
+    assert pause[pause.index("--seconds") + 1] == "195"
+    assert pause[pause.index("--wait-seconds") + 1] == "150"
+    assert "pause-status" in verbs and "restart-collector" in verbs
+    # A scheduled pause is resumed before the endpoint restore, then the proxy stops.
+    assert verbs.index("resume-collector") < verbs.index("restore-collector")
+    assert verbs.index("restore-collector") < verbs.index("stop-proxy")
+    assert "resume" in receipts and "restore" in receipts

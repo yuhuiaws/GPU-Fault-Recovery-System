@@ -501,6 +501,46 @@ def power_limit_throttling_plan(
     return {"steps": steps}
 
 
+def interruption_plan(
+    decision: VariantDecision, *, confirmation_samples: int, warmup_reads: int = 2
+) -> dict[str, Any]:
+    """GF-ENV-LIVE-009: two severe reads, the collection pause, one more, a clear.
+
+    The runner pauses the collector read-synchronously right after the second
+    severe read (``pause_read_index``) for longer than the policy's 60 s
+    confirmation gap, so the third severe read -- the one that would have
+    confirmed -- must be counted ``1/N`` again, never CRITICAL. The final
+    healthy block clears the finding before the collector restart is taken at
+    a normal temperature. ``confirmation_samples - 1`` severe reads go before
+    the pause so the pre-gap count is visibly one short of confirming.
+    """
+
+    field = _temperature_field(decision.variant)
+    severe = _severe_value(decision)
+    before = max(1, confirmation_samples - 1)
+    return {
+        "steps": [
+            _reads(max(1, warmup_reads), {}),
+            _reads(before, {field: severe}),
+            _reads(1, {field: severe}),
+            _reads(max(3, confirmation_samples), {}),
+        ]
+    }
+
+
+def pause_read_index(plan: dict[str, Any]) -> int:
+    """The plan read after which GF-ENV-LIVE-009 pauses: the end of step 2.
+
+    Counted in the proxy's reads since the arm (``reads - start_reads``): the
+    warmup reads plus the first severe block.
+    """
+
+    steps = list(plan.get("steps") or [])
+    if len(steps) < 3:
+        raise EnvLivePlanError("an interruption plan needs warmup, severe and clear")
+    return int(steps[0]["reads"]) + int(steps[1]["reads"])
+
+
 def thermal_duration_plan(
     *, baseline_us: float = 0.0, increments: int = 4, step_us: float = 1_000_000.0
 ) -> dict[str, dict[str, Any]]:

@@ -215,7 +215,7 @@ def test_review_terms_derive_from_the_plan_cadence_and_cooldown() -> None:
     assert transient.trigger_values == (-3.0,) and transient.max_confirmation == 1
     with pytest.raises(ValueError, match="no observation rule"):
         expectations.expectation_for(
-            case_id="GF-ENV-LIVE-010",
+            case_id="GF-ENV-LIVE-002",
             plan_name="x",
             plan={"steps": [{"reads": 1, "values": {}}]},
             preflight=h200_preflight(),
@@ -636,7 +636,10 @@ def test_unusable_field_accepted_without_unknown_fails() -> None:
         25,
         lambda w: w.latest.__setitem__(
             "gpu_temperature_c",
-            {**w.latest["gpu_temperature_c"], "observed_at": w.moment(25).isoformat()},
+            {
+                **w.latest[f"{GPU}:gpu_temperature_c"],
+                "observed_at": w.moment(25).isoformat(),
+            },
         ),
     )
     outcome, _window = _run(world, "GF-ENV-LIVE-008", "omit_reason")

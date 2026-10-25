@@ -1400,6 +1400,11 @@ class ReadOnlyJudge(_Judge):
         return pending
 
 
+#: The intake base the case-specific judges of ``env_live_interruption`` (009)
+#: and ``env_live_scope`` (010) extend.
+BaseJudge = _Judge
+
+
 def judge_for(
     expectation: Expectation,
     *,
@@ -1408,6 +1413,8 @@ def judge_for(
     collector_mode: str = "dcgm",
     node_before: Mapping[str, Any] | None = None,
 ) -> BaselineJudge | ReviewJudge | ReadOnlyJudge:
+    if expectation.kind == "interruption":
+        raise ValueError("GF-ENV-LIVE-009 is judged by env_live_interruption")
     if expectation.kind == "baseline":
         return BaselineJudge(
             expectation,
@@ -1422,6 +1429,7 @@ def judge_for(
 
 
 __all__ = [
+    "BaseJudge",
     "BaselineJudge",
     "NO_TASK",
     "QUARANTINE_TAINT",
