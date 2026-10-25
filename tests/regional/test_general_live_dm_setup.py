@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 
 from scripts.e2e.regional import general_live_storage as storage
+from scripts.e2e.regional import general_live_storage_io as storage_io
 from scripts.e2e.regional.general_live_fixture import VariantInconclusive
 from scripts.e2e.regional.probes import general_live_storage_probe as storage_probe
 from scripts.e2e.regional.regional_commands import RegionalFixtureError
@@ -219,8 +220,8 @@ def test_a_setup_that_never_finishes_is_bounded_by_its_unit(tmp_path: Path) -> N
         ctx.spec.execute(ctx)
     assert "'mkfs'" in str(caught.value), str(caught.value)
     polls = names(store, "dm-status")
-    assert 2 <= len(polls) <= storage.SETUP_WAIT_SECONDS // 7 + 2, len(polls)
-    assert storage.SETUP_WAIT_SECONDS > storage_probe.SETUP_MAX_SECONDS, (
+    assert 2 <= len(polls) <= storage_io.SETUP_WAIT_SECONDS // 7 + 2, len(polls)
+    assert storage_io.SETUP_WAIT_SECONDS > storage_probe.SETUP_MAX_SECONDS, (
         "the unit's RuntimeMaxSec always ends the setup before the runner gives up"
     )
     assert ctx.cleanup.pending() == ["dm"]
@@ -263,7 +264,7 @@ def test_every_006_storage_call_waits_out_the_probe_budget(
         for subcommand, timeout in store.timeouts
         if timeout
         != storage_probe.CALL_BUDGET_SECONDS[subcommand]
-        + storage.TRANSPORT_MARGIN_SECONDS
+        + storage_io.TRANSPORT_MARGIN_SECONDS
     ]
     assert wrong == [], wrong
 

@@ -9,6 +9,7 @@ import pytest
 
 from scripts.e2e.regional import general_live_collectors as col
 from scripts.e2e.regional import general_live_storage as storage
+from scripts.e2e.regional import general_live_storage_io as storage_io
 from scripts.e2e.regional import general_live_utilization as util
 from tests.regional._general_live_fakes import (
     FakeProbe,
@@ -248,9 +249,9 @@ def test_low_available_memory_inconclusive(tmp_path: Path) -> None:
 # storage helpers
 # --------------------------------------------------------------------------- #
 def test_storage_await_divergence_and_dm_delay() -> None:
-    assert storage._await_divergence([], [1.0]) is False
-    assert storage._await_divergence([200.0], [10.0]) is True
-    assert storage._await_divergence([11.0], [10.0]) is False
+    assert storage_io._await_divergence([], [1.0]) is False
+    assert storage_io._await_divergence([200.0], [10.0]) is True
+    assert storage_io._await_divergence([11.0], [10.0]) is False
 
 
 def test_storage_below_threshold_inconclusive(tmp_path: Path) -> None:

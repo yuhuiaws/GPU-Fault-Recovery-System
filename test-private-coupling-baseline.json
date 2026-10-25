@@ -232,7 +232,7 @@
   "tests/regional/test_general_live_edges3.py:col._one_snapshot_per_hour": 2,
   "tests/regional/test_general_live_edges3.py:col._silent_advisory": 2,
   "tests/regional/test_general_live_edges3.py:col._snapshot_only": 2,
-  "tests/regional/test_general_live_edges3.py:storage._await_divergence": 3,
+  "tests/regional/test_general_live_edges3.py:storage_io._await_divergence": 3,
   "tests/regional/test_general_live_edges3.py:util._attribution_errors": 3,
   "tests/regional/test_general_live_edges3.py:util._memory_used_low": 2,
   "tests/regional/test_general_live_efa_probe.py:probe._preconditions": 6,
