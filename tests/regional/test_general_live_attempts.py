@@ -713,6 +713,10 @@ def test_duplicate_event_redelivers_the_same_terminal_and_nothing_changes(
     assert result["replayed_decision"]["duplicate"] is True
     assert result["notifications_before"] == 1
     assert result["stages"]["unchanged"] == []
+    # The baseline is the read right before the redelivery, after the watcher
+    # pass: it asks for both attempts, like the read after it.
+    baseline = calls[calls.index(replays[0]) - 1]
+    assert baseline[0] == "attempt" and baseline[-1] == result["new_attempt"], baseline
     spec = SPECS["duplicate_event"]
     assert "handle_terminal" in spec.injection and "duplicate=true" in spec.expected
     assert spec.proof_mode == "native" and spec.approvals == ()

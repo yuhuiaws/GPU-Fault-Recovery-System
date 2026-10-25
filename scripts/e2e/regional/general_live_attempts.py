@@ -535,11 +535,13 @@ def _settled_first_delivery(
 ) -> tuple[dict[str, Any], dict[str, Any], str]:
     """The first attempt's failure decided, restarted and quiet.
 
-    Returns the product's records, a copy of the original decision and the
-    restart copy's attempt id once the product's RESTART_WORKLOAD execution
-    recorded it and one watcher pass has gone by -- the baseline a redelivery is
-    judged against. No decision or no restart copy is INCONCLUSIVE: there is
-    nothing to redeliver, or the first delivery has not settled.
+    Returns the product's records of both attempts read *after* one watcher
+    pass has gone by since the product's RESTART_WORKLOAD execution recorded the
+    restart copy -- the baseline a redelivery is judged against, so a late
+    record of the first delivery is never taken for the redelivery's -- with a
+    copy of the original decision and the restart copy's attempt id. No
+    decision or no restart copy is INCONCLUSIVE: there is nothing to redeliver,
+    or the first delivery has not settled.
     """
 
     records = _wait_decision(ctx, job, name=name)
@@ -558,7 +560,13 @@ def _settled_first_delivery(
         )
     ctx.evidence.write("restart-attempt", {"old": job.attempt_id, "new": new_attempt})
     ctx.hold(WATCHER_PASS_SECONDS, name="new-attempt-running")
-    return records, original, new_attempt
+    settled = attempt_records(
+        ctx.regional,
+        ctx.settings.regional.cluster_id,
+        job.name,
+        [job.attempt_id, new_attempt],
+    )
+    return settled, original, new_attempt
 
 
 def old_terminal(ctx: VariantContext) -> dict[str, Any]:
