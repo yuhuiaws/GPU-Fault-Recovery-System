@@ -32,6 +32,7 @@ from gpu_fault_release.regional_aurora_credentials import (
 )
 from gpu_fault_release.regional_notifications import check_notification_channel
 from gpu_fault_release.regional_release_artifacts import check_artifact_config_maps
+from gpu_fault_release.regional_check_value import CheckSkipped as CheckSkipped
 from gpu_fault_release.regional_check_value import CheckValue as CheckValue
 from gpu_fault_release.regional_release_aurora_refresh import aurora_refresh_preflight
 from gpu_fault_release.regional_release_namespace import controller_check_value
@@ -43,6 +44,10 @@ from gpu_fault_release.regional_release_diff import (
 from gpu_fault_release.regional_release_preflight import monitoring_repair_preflight
 from gpu_fault_release.regional_release_probes import probe_source
 from gpu_fault_release.regional_release_profile_model import runtime_profile_version_for
+from gpu_fault_release.regional_release_s3_destinations import (
+    check_control_record_archive_bucket,
+    check_diagnostic_evidence_destination,
+)
 from gpu_fault_release.regional_release_runtime_identity import (
     CONTROL_PLANE_PYTHON,
     EXECUTOR_PYTHON,
@@ -65,10 +70,6 @@ REQUIRED_TOOLS = ("aws", "kubectl", "helm", "jq", "openssl", "sha256sum", "pytho
 
 if TYPE_CHECKING:
     from gpu_fault_release.rollout import RegionalRelease
-
-
-class CheckSkipped(RuntimeError):
-    pass
 
 
 def _check(
@@ -961,47 +962,6 @@ def check_aurora_refresh(
     )
 
 
-def check_control_record_archive_bucket(release: Any) -> CheckValue:
-    """The control-record archive target exists in this Region before the
-    workers that will archive into it roll out (control-plane review
-    2026-09-08, F-8 / Agent 10).
-
-    Retention is on: every control-worker reads
-    ``GPU_FAULT_CONTROL_RECORD_ARCHIVE_S3_URI`` (site.yaml ``spec.retention``)
-    and the archiver soft-fails (keeps live rows, counts errors) when the
-    bucket is missing -- a failure once discovered from an alert hours later;
-    this check refuses the release instead. Read-only: ``get-bucket-location``
-    proves the bucket exists and sits in the site Region.
-    """
-
-    retention = getattr(release.config, "retention", None)
-    uri = str(getattr(retention, "archive_s3_uri", "") or "")
-    if not uri:
-        raise CheckSkipped(
-            "control record retention is off (site.yaml spec.retention not declared)"
-        )
-    parts = urlsplit(uri)
-    bucket = parts.netloc
-    prefix = parts.path.strip("/")
-    if parts.scheme != "s3" or not bucket or not prefix:
-        raise ReleaseError(
-            f"control record archive target must be s3://bucket/prefix, got {uri}"
-        )
-    location = _aws_json(
-        release, ["s3api", "get-bucket-location", "--bucket", bucket]
-    ).get("LocationConstraint")
-    region = str(location or "us-east-1")
-    if region != release.config.aws_region:
-        raise ReleaseError(
-            f"control record archive bucket {bucket} is in {region}, "
-            f"expected the site Region {release.config.aws_region}"
-        )
-    return CheckValue(
-        f"control record archive bucket {bucket} exists in {region}",
-        {"bucket": bucket, "prefix": prefix, "region": region},
-    )
-
-
 def check_adot_self_metrics(release: Any) -> CheckValue:
     """AMP holds every ``otelcol_*`` series the alerts read (control-plane
     review 2026-09-08, H2-4); the read lives in ``regional_adot_self_metrics``."""
@@ -1050,6 +1010,10 @@ def build_preflight_report(
         (
             "control_record_archive_bucket",
             lambda: check_control_record_archive_bucket(release),
+        ),
+        (
+            "diagnostic_evidence_destination",
+            lambda: check_diagnostic_evidence_destination(release),
         ),
         ("email_notifications", lambda: check_email_notifications(release)),
         (

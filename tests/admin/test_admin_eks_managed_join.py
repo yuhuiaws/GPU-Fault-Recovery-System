@@ -983,7 +983,8 @@ def test_eks_cluster_joining_a_hyperpod_site_gets_its_own_profile_after_review(
     monkeypatch.setattr(
         cluster_join_profile,
         "compute_agent_config_digest",
-        lambda _runner, *, repository_root, runtime_profile_version: "e" * 64,
+        lambda _runner, *, repository_root, runtime_profile_version, **_kwargs: "e"
+        * 64,
     )
     original_run = scenario.run
 
@@ -1273,7 +1274,7 @@ def test_deploy_restores_a_lost_override_from_the_approved_snapshot(
     monkeypatch.setattr(
         cluster_join_profile,
         "compute_agent_config_digest",
-        lambda _runner, *, repository_root, runtime_profile_version: (
+        lambda _runner, *, repository_root, runtime_profile_version, **_kwargs: (
             runtime_profile_version[:1] * 64
         ),
     )
@@ -1307,7 +1308,8 @@ def test_deploy_keeps_an_existing_override_and_refreshes_its_digest(
     monkeypatch.setattr(
         cluster_join_profile,
         "compute_agent_config_digest",
-        lambda _runner, *, repository_root, runtime_profile_version: "2" * 64,
+        lambda _runner, *, repository_root, runtime_profile_version, **_kwargs: "2"
+        * 64,
     )
     cluster_join_profile.reconcile_cluster_runtime_profiles(
         object(), document, repository_root=repo, state_dir=state_dir

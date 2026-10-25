@@ -31,6 +31,7 @@ from gpu_fault.admin.site import (
     load_site,
     materialized_release_config,
 )
+from gpu_fault.admin.site_s3 import node_agent_environment
 from gpu_fault.digests import SHA256_PATTERN
 from gpu_fault_release.regional_validation_evidence import (
     QUICK_VALIDATION_EVIDENCE_ENV,
@@ -204,10 +205,15 @@ def prepare_site_release(
             "Runtime Profile changed without a matching state approval"
         )
     desired_profile = profile_plan.desired_version
+    # The pin is computed with what the nodes will run with: the site's
+    # node-side declarations (spec.diagnosticS3Uri) enter the Agent digest.
     digest = compute_agent_config_digest(
         digest_runner or CommandRunner(),
         repository_root=rendered.repository_root,
         runtime_profile_version=desired_profile,
+        node_agent_environment=node_agent_environment(
+            rendered.release_config.get("diagnostic_s3_uri")
+        ),
     )
     if not SHA256_PATTERN.fullmatch(digest):
         raise ReleaseDeployError("computed Agent config digest is invalid")

@@ -69,7 +69,8 @@ def _hyperpod_site(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(
         cluster_join_profile,
         "compute_agent_config_digest",
-        lambda _runner, *, repository_root, runtime_profile_version: "e" * 64,
+        lambda _runner, *, repository_root, runtime_profile_version, **_kwargs: "e"
+        * 64,
     )
     monkeypatch.setattr(release_deploy, "_run", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(release_deploy, "_run_json", _run_json)

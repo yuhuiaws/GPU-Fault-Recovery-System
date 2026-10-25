@@ -12,7 +12,7 @@ import json
 from typing import Any
 
 from gpu_fault.admin.bootstrap_common import BootstrapError, CommandRunner
-from gpu_fault.admin.site import S3_URI_PATTERN
+from gpu_fault.admin.site_s3 import S3_URI_PATTERN
 
 ARCHIVE_BUCKET_NOT_FOUND = ("404", "NoSuchBucket", "Not Found")
 ARCHIVE_BUCKET_SETTING_ABSENT = (

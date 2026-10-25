@@ -308,6 +308,10 @@ def platform_task_graph(
                     from gpu_fault.admin.bootstrap_common import (
                         compute_agent_config_digest,
                     )
+                    from gpu_fault.admin.site_s3 import (
+                        node_agent_environment,
+                        site_diagnostic_s3_uri,
+                    )
 
                     verified_release = release()
                     digest = (
@@ -317,6 +321,9 @@ def platform_task_graph(
                             task_runner,
                             repository_root=repository_root,
                             runtime_profile_version=custody_runtime_profile,
+                            node_agent_environment=node_agent_environment(
+                                site_diagnostic_s3_uri(existing_site)
+                            ),
                         )
                     )
                     custody_arguments["custody_context"] = AdminNodeKeyContext(

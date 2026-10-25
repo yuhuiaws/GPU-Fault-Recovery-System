@@ -381,6 +381,7 @@ def test_for_deploy_runs_real_prerequisite_and_independent_bootstrap_gate(
         "_check_nlb_inputs",
         "_check_aurora",
         "check_control_record_archive_bucket",
+        "check_diagnostic_evidence_destination",
         "check_email_notifications",
     ):
         monkeypatch.setattr(

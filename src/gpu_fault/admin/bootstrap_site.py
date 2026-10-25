@@ -581,6 +581,15 @@ def preserve_existing_site_contract(
         raise BootstrapError("existing site spec.autoRollback must be a boolean")
     if isinstance(declared_rollback, bool):
         generated_spec["autoRollback"] = declared_rollback
+    # ``diagnosticS3Uri`` is the operator's declaration of where every node
+    # Agent uploads its diagnostic archives; the generator derives none, and a
+    # regenerated site dropping it would silently send the evidence back to the
+    # nodes' local disks -- and move the Agent config digest with it.
+    declared_destination = existing_spec.get("diagnosticS3Uri")
+    if declared_destination is not None and not isinstance(declared_destination, str):
+        raise BootstrapError("existing site spec.diagnosticS3Uri must be a string")
+    if declared_destination:
+        generated_spec["diagnosticS3Uri"] = declared_destination
     existing_clusters = {
         item.get("clusterId"): item
         for item in existing_spec.get("clusters", [])

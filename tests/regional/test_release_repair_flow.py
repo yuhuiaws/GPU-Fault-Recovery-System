@@ -227,6 +227,7 @@ def preflight_model(monkeypatch: pytest.MonkeyPatch) -> Any:
         "_check_nlb_inputs",
         "_check_aurora",
         "check_control_record_archive_bucket",
+        "check_diagnostic_evidence_destination",
         "check_email_notifications",
     ):
         monkeypatch.setattr(

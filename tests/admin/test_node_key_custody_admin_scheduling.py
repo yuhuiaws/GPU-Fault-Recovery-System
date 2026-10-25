@@ -48,7 +48,7 @@ def test_configured_key_tasks_wait_for_release_and_run_serially_without_blocking
     order = []
     digests = []
 
-    def compute_digest(_runner, *, repository_root, runtime_profile_version):
+    def compute_digest(_runner, *, repository_root, runtime_profile_version, **_kwargs):
         assert repository_root == world.repo
         assert runtime_profile_version == profile_version
         digests.append(runtime_profile_version)

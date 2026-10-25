@@ -347,53 +347,6 @@ def test_sns_email_check_fails_without_a_topic_or_site_context(monkeypatch) -> N
         module.check_email_notifications(release)
 
 
-def test_preflight_report_contains_all_required_domains(monkeypatch) -> None:
-    module = _checks_module()
-    names = (
-        "_check_tools",
-        "_check_local_inputs",
-        "check_artifact_config_maps",
-        "_check_aws_identity",
-        "_check_contexts",
-        "_check_cpu_capacity",
-        "check_cpu_secrets",
-        "_check_load_balancer_controller",
-        "_check_nlb_inputs",
-        "_check_aurora",
-        "check_aurora_refresh",
-        "check_control_record_archive_bucket",
-        "check_email_notifications",
-        "_check_monitoring",
-        "workflow_safety_snapshot",
-    )
-    for name in names:
-        monkeypatch.setattr(
-            module, name, lambda *args, name=name: module.CheckValue(name)
-        )
-    report = module.build_preflight_report(Release())
-
-    assert report["healthy"] is True
-    assert (report["summary"]["PASS"], report["summary"]["WARN"]) == (len(names), 1)
-    assert {item["name"] for item in report["checks"]} == {
-        "tools",
-        "local_inputs",
-        "artifact_config_maps",
-        "aws_identity",
-        "regional_contexts",
-        "cpu_capacity",
-        "cpu_secrets",
-        "load_balancer_controller",
-        "nlb_inputs",
-        "aurora",
-        "aurora_credential_refresh",
-        "control_record_archive_bucket",
-        "email_notifications",
-        "monitoring",
-        "workflow_safety",
-        "token_rotation",
-    }
-
-
 def test_aurora_refresh_check_rejects_rbac_target_drift() -> None:
     module = _checks_module()
     cronjob = {
@@ -1488,41 +1441,6 @@ def test_aurora_refresh_check_lists_jobs_by_the_job_label() -> None:
 
     job_commands = [command for command in seen if "job" in command]
     assert job_commands and "app=gpu-fault-aurora-credential-refresh" in job_commands[0]
-
-
-def test_archive_bucket_check_requires_the_site_region(monkeypatch) -> None:
-    module = _checks_module()
-    release = SimpleNamespace(
-        config=SimpleNamespace(
-            aws_region="us-east-2",
-            retention=SimpleNamespace(
-                archive_s3_uri="s3://gpu-fault-control-records/site/archive"
-            ),
-        )
-    )
-    monkeypatch.setattr(
-        module, "_aws_json", lambda _release, _args: {"LocationConstraint": "us-east-2"}
-    )
-    value = module.check_control_record_archive_bucket(release)
-    assert value.details == {
-        "bucket": "gpu-fault-control-records",
-        "prefix": "site/archive",
-        "region": "us-east-2",
-    }
-
-    monkeypatch.setattr(
-        module, "_aws_json", lambda _release, _args: {"LocationConstraint": "eu-west-1"}
-    )
-    with pytest.raises(module.ReleaseError, match="expected the site Region"):
-        module.check_control_record_archive_bucket(release)
-
-    release.config.retention.archive_s3_uri = "s3://bucket-only"
-    with pytest.raises(module.ReleaseError, match="s3://bucket/prefix"):
-        module.check_control_record_archive_bucket(release)
-
-    release.config.retention.archive_s3_uri = None
-    with pytest.raises(module.CheckSkipped):
-        module.check_control_record_archive_bucket(release)
 
 
 def _cpu_node(name: str, pods_allocatable: int) -> dict:

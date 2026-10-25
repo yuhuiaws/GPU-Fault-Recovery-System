@@ -22,6 +22,7 @@ from gpu_fault.admin.bootstrap_common import (
     tag_map,
 )
 from gpu_fault.admin.release_artifacts import build_signed_release
+from gpu_fault.admin.site_s3 import node_agent_environment, site_diagnostic_s3_uri
 from gpu_fault.admin.execution import current_deadline, deadline_scope, run_command
 from gpu_fault.admin.api_budget import api_phase
 
@@ -317,7 +318,9 @@ class SignedReleaseBuild:
                 api_phase("release"),
                 deadline_scope("signed release build", 7200, parent=parent),
             ):
-                return prepare(request=request, **arguments)
+                return prepare(
+                    request=request, existing_site=existing_site, **arguments
+                )
 
         self._future = self._executor.submit(build)
         self._existing_site = existing_site
@@ -354,6 +357,7 @@ def prepare_signed_release(
     gpu_clusters: tuple[ClusterIdentity, ...],
     site_id: str,
     state: BootstrapState,
+    existing_site: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     repositories = ensure_release_repositories(
         runner,
@@ -370,6 +374,11 @@ def prepare_signed_release(
         runtime_profile="hyperpod-v1",
         staging_only=request.staging_only_release,
         impact_base=request.impact_base,
+        # The existing site's node declarations (spec.diagnosticS3Uri) enter
+        # the Agent digest this release records; a first bootstrap has none.
+        node_agent_environment=node_agent_environment(
+            site_diagnostic_s3_uri(existing_site)
+        ),
     )
     bind_bootstrap_inputs(
         state,

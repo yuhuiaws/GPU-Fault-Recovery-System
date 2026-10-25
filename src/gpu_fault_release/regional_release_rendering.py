@@ -11,6 +11,7 @@ import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.admin.config import AdminConfig
 from gpu_fault.admin.dcgm_exporter_release import DCGM_EXPORTER_IMAGE
+from gpu_fault.admin.site_s3 import DIAGNOSTIC_S3_URI_ENV
 from gpu_fault.cluster_scope import cluster_provider, is_eks_managed, node_selector
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import repository_root
@@ -1055,6 +1056,15 @@ def build_reconciler_environment(
             runtime_profile_version or target_runtime_profile_version(config, target)
         ),
     }
+    # The site's diagnostic evidence destination (spec.diagnosticS3Uri): the
+    # reconciler hands it to the installer Job renderer, which encodes it for
+    # the node installer's ``--diagnostic-s3-uri``; the Agent then uploads
+    # every diagnostic archive there instead of leaving a node-local file://
+    # reference. Declared, it wins over anything the deploy host exported;
+    # undeclared, the environment is rendered as before.
+    diagnostic_s3_uri = getattr(config, "diagnostic_s3_uri", None)
+    if diagnostic_s3_uri:
+        environment[DIAGNOSTIC_S3_URI_ENV] = str(diagnostic_s3_uri)
     previous_template_identity: dict[str, str] = {}
     if node_dependency_target is NodeDependencyTarget.PREVIOUS:
         environment.update(
@@ -1146,6 +1156,9 @@ INSTALLER_PRODUCT_INPUT_ENV = (
     "GPU_FAULT_HYPERPOD_CLUSTER",
     "GPU_FAULT_VERSION",
     "GPU_FAULT_RUNTIME_PROFILE",
+    # The diagnostic evidence destination is rendered into the installer Job
+    # template, so a changed one renders new products.
+    DIAGNOSTIC_S3_URI_ENV,
     "GPU_FAULT_INSTALLER_CONFIG_MAP",
     "GPU_FAULT_INSTALLER_CONFIG_DIGEST",
     "GPU_FAULT_INSTALLER_ARTIFACT_SHA256",

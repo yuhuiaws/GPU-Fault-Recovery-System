@@ -1,9 +1,13 @@
-"""The value one preflight or verify check returns."""
+"""The value one preflight or verify check returns, and how one opts out."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+
+
+class CheckSkipped(RuntimeError):
+    """A check that does not apply to this site (SKIP, or FAIL where required)."""
 
 
 @dataclass(frozen=True)

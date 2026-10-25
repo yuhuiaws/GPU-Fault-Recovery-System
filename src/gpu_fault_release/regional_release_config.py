@@ -12,6 +12,8 @@ import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.admin.config import AdminConfig
 from gpu_fault.admin.site import ADMIN_STATE_DIR_SIDECAR
+from gpu_fault.admin.site_fields import SiteConfigError
+from gpu_fault.admin.site_s3 import parse_diagnostic_s3_uri
 from gpu_fault.failure_domains import FAILURE_DOMAIN_LABELS
 from gpu_fault.cluster_scope import (
     ClusterProvider,
@@ -21,6 +23,14 @@ from gpu_fault.cluster_scope import (
     validate_dcgm_hostengine,
 )
 from gpu_fault_release import containing_repository_root, repository_root
+from gpu_fault_release.regional_release_errors import CheckFailure as CheckFailure
+from gpu_fault_release.regional_release_errors import (
+    ClusterLocalReleaseError as ClusterLocalReleaseError,
+)
+from gpu_fault_release.regional_release_errors import (
+    PartialClusterRolloutError as PartialClusterRolloutError,
+)
+from gpu_fault_release.regional_release_errors import ReleaseError as ReleaseError
 from gpu_fault_release.regional_release_profile_model import (
     RuntimeProfileSpec,
     cluster_runtime_profiles,
@@ -45,39 +55,6 @@ EKS_ARN_PATTERN = re.compile(
     r"^arn:[^:]+:eks:(?P<region>[^:]+):(?P<account>[^:]+):"
     r"cluster/(?P<name>[^/]+)$"
 )
-
-
-class ReleaseError(RuntimeError):
-    pass
-
-
-class ClusterLocalReleaseError(ReleaseError):
-    pass
-
-
-class PartialClusterRolloutError(ReleaseError):
-    pass
-
-
-class CheckFailure(ReleaseError):
-    """A refused check that keeps the evidence it was refused on.
-
-    A plain ``ReleaseError`` is recorded as a summary with no details, which is
-    right for a refusal whose message is the whole finding. A judgement made
-    over a snapshot -- which node, which collector, how stale -- carries the
-    snapshot here, so the FAIL record shows what was seen and not only what was
-    concluded.
-    """
-
-    def __init__(self, message: str, details: Any) -> None:
-        super().__init__(message)
-        self.details = details
-
-    @staticmethod
-    def details_of(error: BaseException) -> Any:
-        """The evidence a failed check carries; ``None`` for every other error."""
-
-        return error.details if isinstance(error, CheckFailure) else None
 
 
 def admin_state_dir_sidecar(config_path: Path) -> Path | None:
@@ -1173,6 +1150,11 @@ class ReleaseConfig:
     # failure-domain ConfigMap render and by the fleet rollout's per-domain cap.
     failure_domain_labels: tuple[str, ...] = FAILURE_DOMAIN_LABELS
     retention: RegionalRetentionConfig = RegionalRetentionConfig()
+    #: ``site.yaml`` ``spec.diagnosticS3Uri``: where every GPU node's Agent
+    #: uploads its diagnostic archives (``GPU_FAULT_DIAGNOSTIC_S3_URI`` on the
+    #: node, rendered through the installer Job template). None keeps the
+    #: archives on the nodes, as every site ran before the setting existed.
+    diagnostic_s3_uri: str | None = None
     installation_id: str | None = None
     retained_database_handoff: Path | None = None
     release_manifest_path: str = ""
@@ -1347,6 +1329,12 @@ class ReleaseConfig:
                     "admin_config.role_sha256 does not match its content"
                 )
         dns = RegionalDnsConfig.from_mapping(dict(value.get("dns") or {}))
+        try:
+            diagnostic_s3_uri = parse_diagnostic_s3_uri(
+                value.get("diagnostic_s3_uri"), "diagnostic_s3_uri"
+            )
+        except SiteConfigError as exc:
+            raise ReleaseError(str(exc)) from None
         if len(digest) != 64 or any(
             character not in "0123456789abcdef" for character in digest
         ):
@@ -1414,6 +1402,7 @@ class ReleaseConfig:
             retention=RegionalRetentionConfig.from_mapping(
                 dict(value.get("retention") or {})
             ),
+            diagnostic_s3_uri=diagnostic_s3_uri,
         )
 
 

@@ -56,6 +56,13 @@ REQUIRE_ROLLBACK_SLOT="${GPU_FAULT_REQUIRE_ROLLBACK_SLOT:-false}"
 REUSE_NODE_SET_SHA256="${GPU_FAULT_INSTALLER_REUSE_NODE_SET_SHA256:-}"
 REUSE_TEMPLATE_CONFIG_MAP="${GPU_FAULT_INSTALLER_REUSE_TEMPLATE_CONFIG_MAP:-}"
 PRODUCTS_FILE="${GPU_FAULT_RECONCILER_PRODUCTS_FILE:-}"
+# The diagnostic evidence destination of every node Agent (site.yaml
+# spec.diagnosticS3Uri, handed over by the release engine). Rendered into the
+# installer Job template as DIAGNOSTIC_S3_URI_B64 and written on the node as
+# GPU_FAULT_DIAGNOSTIC_S3_URI by --diagnostic-s3-uri; empty keeps the archives
+# on the node (file:// references).
+DIAGNOSTIC_S3_URI="${GPU_FAULT_DIAGNOSTIC_S3_URI:-}"
+DIAGNOSTIC_S3_URI="${DIAGNOSTIC_S3_URI%/}"
 
 for command in awk kubectl python3 sed sha256sum; do
     command -v "${command}" >/dev/null || {
@@ -159,6 +166,11 @@ fi
 }
 [[ "${EXECUTOR_WHEEL_FILENAME}" =~ ^[A-Za-z0-9_.-]+\.whl$ ]] || {
     printf 'ERROR: invalid GPU_FAULT_EXECUTOR_WHEEL_FILENAME\n' >&2
+    exit 2
+}
+[[ -z "${DIAGNOSTIC_S3_URI}" ||
+    "${DIAGNOSTIC_S3_URI}" == s3://?* ]] || {
+    printf 'ERROR: GPU_FAULT_DIAGNOSTIC_S3_URI must use s3://\n' >&2
     exit 2
 }
 case "${DCGM_HOSTENGINE}" in
@@ -441,6 +453,7 @@ render_installer_job() {
     GPU_FAULT_NODE_COMPATIBILITY_DIGEST="${NODE_COMPATIBILITY_DIGEST}" \
     GPU_FAULT_DCGM_METRICS_URL="${DCGM_METRICS_URL}" \
     GPU_FAULT_REQUIRE_ROLLBACK_SLOT="${REQUIRE_ROLLBACK_SLOT}" \
+    GPU_FAULT_DIAGNOSTIC_S3_URI="${DIAGNOSTIC_S3_URI}" \
         "${SCRIPT_DIR}/run-hyperpod-installer-job.sh" \
         --node "${node}" --node-inputs "${NODE_INPUTS_FILE}" "$@"
 }

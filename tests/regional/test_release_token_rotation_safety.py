@@ -259,6 +259,7 @@ def test_build_preflight_report_fails_closed_on_an_unfinished_rotation(
         "_check_aurora",
         "check_aurora_refresh",
         "check_control_record_archive_bucket",
+        "check_diagnostic_evidence_destination",
         "check_email_notifications",
         "_check_monitoring",
         "workflow_safety_snapshot",

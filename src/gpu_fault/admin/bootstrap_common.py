@@ -442,8 +442,33 @@ def compute_agent_config_digest(
     *,
     repository_root: Path,
     runtime_profile_version: str,
+    node_agent_environment: Mapping[str, str] | None = None,
 ) -> str:
+    """The Agent config digest the deploy pins for ``runtime_profile_version``.
+
+    ``node_agent_environment`` is what the site declares for every GPU node's
+    Agent (``admin.site.node_agent_environment``: today ``spec.diagnosticS3Uri``
+    as the Agent's diagnostic S3 destination). ``agent_config_payload`` folds
+    those values into the digest, so the pin has to be computed with them -- a pin
+    computed without the destination the nodes are installed with would fail
+    the fleet consistency gate on every node-owned step after the wave.
+    """
+
     installer = repository_root / "deploy/node/install-gpu-fault-collector.sh"
+    site_environment = dict(node_agent_environment or {})
+    for name, value in site_environment.items():
+        if (
+            not isinstance(name, str)
+            or not name.startswith("GPU_FAULT_")
+            or name in NODE_INSTALLER_CONFIG_DIGEST_ENVIRONMENT_KEYS
+            or not isinstance(value, str)
+            or not value
+            or "\n" in value
+            or "\r" in value
+        ):
+            raise BootstrapError(
+                f"node Agent environment setting {name!r} is invalid for the digest"
+            )
     raw_environment = runner.run(
         [
             "bash",
@@ -482,6 +507,7 @@ def compute_agent_config_digest(
         "GPU_FAULT_NODE_ALLOW_SERVICE_QUIESCE": "true",
         "GPU_FAULT_NODE_ALLOW_FABRIC_MANAGER_RESTART": "true",
         "GPU_FAULT_NODE_ALLOW_EFA_DRIVER_REMEDIATION": "true",
+        **site_environment,
         **installer_environment,
     }
     digest = runner.run(

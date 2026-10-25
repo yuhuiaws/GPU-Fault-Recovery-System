@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 from gpu_fault.admin.bootstrap_common import Arn, BootstrapError
-from gpu_fault.admin.site import archive_s3_prefix_arn
+from gpu_fault.admin.site_s3 import archive_s3_prefix_arn
 from gpu_fault.cluster_scope import ClusterProvider
 
 __all__ = ["control_plane_policy_document", "executor_policy_document"]

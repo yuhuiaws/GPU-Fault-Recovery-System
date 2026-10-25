@@ -27,6 +27,7 @@ from gpu_fault.admin.site_fields import SiteConfigError as SiteConfigError
 from gpu_fault.admin.site_fields import mapping as _mapping
 from gpu_fault.admin.site_fields import optional_text as _optional_text
 from gpu_fault.admin.site_fields import required_text as _required_text
+from gpu_fault.admin.site_s3 import archive_s3_prefix_arn, parse_diagnostic_s3_uri
 from gpu_fault.cluster_scope import (
     ClusterProvider,
     cluster_provider,
@@ -168,19 +169,6 @@ def _failure_domain_labels(
 RETENTION_DAYS_ENV = "GPU_FAULT_CONTROL_RECORD_RETENTION_DAYS"
 RETENTION_ARCHIVE_URI_ENV = "GPU_FAULT_CONTROL_RECORD_ARCHIVE_S3_URI"
 RETENTION_INTERVAL_ENV = "GPU_FAULT_CONTROL_RECORD_ARCHIVE_INTERVAL_SECONDS"
-S3_URI_PATTERN = re.compile(
-    r"^s3://(?P<bucket>[a-z0-9][a-z0-9.-]{1,61}[a-z0-9])(?P<prefix>/.*)?$"
-)
-
-
-def archive_s3_prefix_arn(uri: str) -> str:
-    """The object ARN pattern one ``s3://bucket/prefix`` archive URI covers."""
-
-    match = S3_URI_PATTERN.fullmatch(uri.strip())
-    if match is None:
-        raise SiteConfigError("archiveS3Uri must be an s3://bucket[/prefix] URI")
-    prefix = (match.group("prefix") or "").strip("/")
-    return f"arn:aws:s3:::{match.group('bucket')}/{prefix + '/' if prefix else ''}*"
 
 
 def default_control_record_archive_s3_uri(
@@ -1066,6 +1054,8 @@ class SiteSpec:
     clusters: tuple[GpuClusterSiteConfig, ...]
     failure_domain_labels: tuple[str, ...] = FAILURE_DOMAIN_LABELS
     retention: RetentionSiteConfig = RetentionSiteConfig()
+    #: ``spec.diagnosticS3Uri`` (``site_s3``); None keeps evidence on the nodes.
+    diagnostic_s3_uri: str | None = None
 
     @classmethod
     def from_value(cls, value: object) -> SiteSpec:
@@ -1089,6 +1079,7 @@ class SiteSpec:
                 "clusters",
                 "failureDomainLabels",
                 "retention",
+                "diagnosticS3Uri",
             },
         )
         region = _required_text(data.get("awsRegion"), "spec.awsRegion")
@@ -1159,6 +1150,9 @@ class SiteSpec:
                 [cluster_provider(item.provider) for item in clusters],
             ),
             retention=RetentionSiteConfig.from_value(data.get("retention")),
+            diagnostic_s3_uri=parse_diagnostic_s3_uri(
+                data.get("diagnosticS3Uri"), "spec.diagnosticS3Uri"
+            ),
         )
 
 
@@ -1417,6 +1411,10 @@ def load_site(path: Path, *, repository_root: Path | None = None) -> RenderedSit
         "failure_domain_labels": list(site.spec.failure_domain_labels),
         "retention": site.spec.retention.as_release_config(),
     }
+    # Written only when declared: the config bytes feed identity digests, and a
+    # site that keeps node-local evidence renders byte for byte as before.
+    if site.spec.diagnostic_s3_uri:
+        release_config["diagnostic_s3_uri"] = site.spec.diagnostic_s3_uri
     image_values = {
         "GPU_FAULT_RUNTIME_IMAGE": site.spec.images.runtime,
         "GPU_FAULT_EXECUTOR_IMAGE": site.spec.images.executor,

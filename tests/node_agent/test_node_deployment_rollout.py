@@ -544,6 +544,16 @@ def test_production_installer_enables_failsafe_quiesce() -> None:
     assert "--allow-firmware-update" in hyperpod_installer
     assert "--diagnostic-s3-uri" in hyperpod_installer
     assert 'DIAGNOSTIC_S3_URI="${DIAGNOSTIC_S3_URI%/}"' in deploy
+    # The managed path: the release engine puts the site's spec.diagnosticS3Uri
+    # into the reconciler environment, the reconciler hands it to the Job
+    # renderer explicitly (not by inheritance), and the renderer encodes it for
+    # the installer's --diagnostic-s3-uri.
+    reconciler = (ROOT / "deploy/node/deploy-node-installer-reconciler.sh").read_text()
+    assert 'DIAGNOSTIC_S3_URI="${GPU_FAULT_DIAGNOSTIC_S3_URI:-}"' in reconciler
+    assert 'GPU_FAULT_DIAGNOSTIC_S3_URI="${DIAGNOSTIC_S3_URI}"' in reconciler
+    assert "GPU_FAULT_DIAGNOSTIC_S3_URI must use s3://" in reconciler
+    assert 'DIAGNOSTIC_S3_URI="${GPU_FAULT_DIAGNOSTIC_S3_URI:-}"' in hyperpod_installer
+    assert "DIAGNOSTIC_S3_URI_B64" in hyperpod_installer
     assert (
         "Agent artifact/configuration differs from control-plane requirement"
     ) in deploy

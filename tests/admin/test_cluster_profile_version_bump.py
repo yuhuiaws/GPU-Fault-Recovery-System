@@ -85,7 +85,7 @@ def _fake_digest(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         cluster_join_profile,
         "compute_agent_config_digest",
-        lambda _runner, *, repository_root, runtime_profile_version: (
+        lambda _runner, *, repository_root, runtime_profile_version, **_kwargs: (
             runtime_profile_version[:1] * 64
         ),
     )

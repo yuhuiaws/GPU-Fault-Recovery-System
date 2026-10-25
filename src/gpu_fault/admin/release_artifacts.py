@@ -79,6 +79,7 @@ def load_reusable_signed_release(
     staging_only: bool,
     impact_base: str,
     cosign_public_key: Path | None = None,
+    node_agent_environment: Mapping[str, str] | None = None,
 ) -> dict[str, Any] | None:
     manifest = repository_root / "dist/current-release.json"
     attestation = repository_root / "dist/current-attestation.json"
@@ -124,6 +125,7 @@ def load_reusable_signed_release(
         repository_root=repository_root,
         runtime_profile=runtime_profile,
         allow_staging=staging_only,
+        node_agent_environment=node_agent_environment,
     )
     references = []
     for name in ("runtime", "executor", "node_dependencies"):
@@ -542,6 +544,30 @@ def load_verified_ci_candidate_receipt(
     return value
 
 
+def _announced_release_source(*, staging_only: bool, promoted: bool) -> str:
+    """Name the source of this build and say it up front: it decides whether
+    the next four minutes are spent re-running gates that CI already passed."""
+
+    release_source = (
+        "staging_impact"
+        if staging_only
+        else "main_ci_candidate"
+        if promoted
+        else "local_full_gate"
+    )
+    print(
+        f"release-build: release_source={release_source}"
+        + (
+            " (no verified CI candidate for this tree; running the full gates locally)"
+            if release_source == "local_full_gate"
+            else ""
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
+    return release_source
+
+
 def build_signed_release(
     runner: CommandRunner,
     *,
@@ -556,6 +582,7 @@ def build_signed_release(
     cosign_password_file: Path | None = None,
     staging_only: bool = False,
     impact_base: str = "origin/main",
+    node_agent_environment: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     if staging_only and not impact_base.strip():
         raise BootstrapError("staging release requires a non-empty impact base")
@@ -577,6 +604,7 @@ def build_signed_release(
         staging_only=staging_only,
         impact_base=impact_base,
         cosign_public_key=cosign_public_key,
+        node_agent_environment=node_agent_environment,
     )
     if reusable is not None:
         return reusable
@@ -593,24 +621,8 @@ def build_signed_release(
                 runner,
                 repository_root=repository_root,
             )
-    release_source = (
-        "staging_impact"
-        if staging_only
-        else "main_ci_candidate"
-        if promoted_candidate is not None
-        else "local_full_gate"
-    )
-    # Said up front, because it decides whether the next four minutes are spent
-    # re-running gates that CI already passed on main.
-    print(
-        f"release-build: release_source={release_source}"
-        + (
-            " (no verified CI candidate for this tree; running the full gates locally)"
-            if release_source == "local_full_gate"
-            else ""
-        ),
-        file=sys.stderr,
-        flush=True,
+    release_source = _announced_release_source(
+        staging_only=staging_only, promoted=promoted_candidate is not None
     )
     impact_plan_path: Path | None = None
     postgres_required = promoted_candidate is None
@@ -734,6 +746,7 @@ def build_signed_release(
         repository_root=repository_root,
         runtime_profile=runtime_profile,
         allow_staging=staging_only,
+        node_agent_environment=node_agent_environment,
     )
     return {
         **release,
@@ -748,6 +761,7 @@ def load_prebuilt_release(
     repository_root: Path,
     runtime_profile: str,
     allow_staging: bool = False,
+    node_agent_environment: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     manifest = repository_root / "dist/current-release.json"
     if not manifest.is_file():
@@ -791,6 +805,7 @@ def load_prebuilt_release(
             runner,
             repository_root=repository_root,
             runtime_profile_version=runtime_profile,
+            node_agent_environment=node_agent_environment,
         ),
         "staging_only": staging_only,
     }

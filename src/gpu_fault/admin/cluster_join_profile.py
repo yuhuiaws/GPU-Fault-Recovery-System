@@ -71,6 +71,7 @@ from gpu_fault.admin.profile_approval import (
 from gpu_fault.admin.cluster_join_types import JoinClusterRequest
 from gpu_fault.admin.registration_anchor import require_anchor_family
 from gpu_fault.admin.site import RenderedSite
+from gpu_fault.admin.site_s3 import node_agent_environment, site_diagnostic_s3_uri
 from gpu_fault.cluster_scope import (
     PROVIDER_NODE_REBOOT_OWNERS,
     PROVIDER_PROFILE_SOURCES,
@@ -675,6 +676,9 @@ def cluster_profile_document(
         runner,
         repository_root=site.repository_root,
         runtime_profile_version=override.version,
+        node_agent_environment=node_agent_environment(
+            site.release_config.get("diagnostic_s3_uri")
+        ),
     )
     return {
         "source": str(snapshot),
@@ -941,6 +945,9 @@ def reconcile_cluster_runtime_profiles(
     pins = _entry_pins(document, repository_root=repository_root, state_dir=state_dir)
     _approve_planned_versions(pins, document=document, state_dir=state_dir, write=True)
     digests: dict[str, str] = {}
+    # Site-wide node declarations (spec.diagnosticS3Uri) reach every cluster's
+    # Agents, so every per-cluster pin is computed with them too.
+    site_environment = node_agent_environment(site_diagnostic_s3_uri(document))
     for pin in pins:
         current = pin.entry.get("runtimeProfile")
         if pin.version not in digests:
@@ -948,6 +955,7 @@ def reconcile_cluster_runtime_profiles(
                 runner,
                 repository_root=repository_root,
                 runtime_profile_version=pin.version,
+                node_agent_environment=site_environment,
             )
         pin.entry["runtimeProfile"] = {
             "source": str(pin.snapshot),
