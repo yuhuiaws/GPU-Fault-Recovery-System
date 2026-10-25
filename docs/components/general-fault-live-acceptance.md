@@ -182,6 +182,14 @@ FAIL）。只读以宿主 `/proc/1/mountinfo`
 确认collector有界返回且其他指标仍上报，VALIDATE_HOST不能用另一个挂载的健康代替。
 两个任务节点访问同一export时记录共同故障域，不把每节点都误作坏硬件。
 当前若未检测实际I/O或挂载消失，记录FAIL。还原export/连接后验证新采样、真实I/O和任务进度。
+产品行为（批次176）：共享挂载从宿主挂载表 `/proc/1/mountinfo` 发现（沙箱遮住的不上报）；每个挂载在
+statvfs 之外再做一次有界、只读的目录项读取（不写、不 fsync），statvfs 正常而读取失败报
+`shared_filesystem_unavailable=1`、`failure_mode=IO_ERROR` 并带 `errno`/`source`，读取超时报 `IO_TIMEOUT`
+（缺证据，不读作健康）；statvfs 超时/报错为 `PROBE_TIMEOUT`/`PROBE_FAILED`。曾见过的节点级共享挂载（不含
+kubelet Pod 卷、容器运行时目录和 autofs 子项）从表中消失而挂载点目录仍在，报 `MOUNT_MISSING`，记忆保存在
+`/var/lib/gpu-fault/host-collector-shared-filesystems.json` 并跨 collector 重启；重新挂载清零，挂载点目录被
+删除视为退役而遗忘。`mount_disappears`/`io_only_failure` 按这些信号验证，此前登记的产品缺口已修复。
+
 `shared_failure_domain` 的产品形态（批次177，此前因每节点各成一条 NODE_HEALTH incident、无共同记录而记
 FAIL）：两节点仍各自产出诊断链（FREEZE_EVIDENCE → VALIDATE_HOST，`RUN_DIAGNOSTICS`，不 cordon/taint、
 不停任务）；≥2 个节点在 600 s 内报同一 export 不可用时，控制面另记一条集群级

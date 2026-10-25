@@ -3335,6 +3335,37 @@ The bottleneck where accepted stalled at 11k-13k in the load test is in this lay
   once. A path the sandbox hides (`/home`, `/root` and `/run/user` under `ProtectHome=`, or a mount the host has but
   the sandbox never received) is neither probed nor reported, and ENOENT inside a `PrivateTmp=` private directory is
   not `MOUNT_MISSING`. Configured paths are matched against the mount points as written; symlinks are not resolved.
+- Shared storage (`_shared_filesystems`): the `nfs`/`nfs4`/`lustre` mounts are discovered from the host mount table
+  `/proc/1/mountinfo` (the collector's own table when it cannot be read, warned once); a mount the sandbox hides is
+  warned about once and neither probed nor reported. Each visible mount is probed twice under one deadline
+  (`statvfs_timeout_seconds`, 5 s by default) and one tick budget (15 s): `statvfs` produces
+  `shared_filesystem_used_percent`, then `open(O_DIRECTORY)` plus one directory-entry read is the data-path probe
+  (read-only: no file created, written or synced; one entry of one page; the NFS directory attribute cache,
+  `acdirmax` 60 s by default, is the detection latency of a failure that leaves FSSTAT working).
+  `shared_filesystem_unavailable` is 0 when usable and 1 with `failure_mode`, `source` (the export) and `fs_type`
+  otherwise: `PROBE_TIMEOUT` (`statvfs` did not answer, or the tick budget was spent), `PROBE_FAILED` (`statvfs`
+  raised; `errno` named), `IO_ERROR` (`statvfs` answered but the directory read raised; `errno` named, e.g.
+  EACCES/EIO/ESTALE), `IO_TIMEOUT` (the directory read did not answer: no verdict, reported unavailable as missing
+  evidence rather than healthy, and kept `IO_TIMEOUT` on later ticks while the parked read still holds the mount,
+  never relabelled `PROBE_TIMEOUT`) and `MOUNT_MISSING` (below). The rule is unchanged: ≥1 is CRITICAL
+  `RUN_DIAGNOSTICS`, VALIDATE_HOST re-reads the value and holds the node while it is 1; the labels are new and
+  optional, and unlabelled samples from older collectors grade as before.
+- Shared mount memory (`collectors/host/shared_mounts.py`): only node-scoped mounts are remembered -- not the
+  workload mounts under `/var/lib/kubelet/pods`, `/var/lib/kubelet/plugins` and the container runtime directories
+  (they come and go with the job, and the control plane follows the Pod lifecycle), and not automounter children
+  whose parent mount is `autofs` (idle expiry, back on access); all of them are sampled while present. A
+  remembered mount gone from the host table has its mount point read with the same bounded directory probe: the
+  directory still there (a forced or lazy umount, fstab not restoring it after a reboot -- the job then writes into
+  the local disk under that path) is `MOUNT_MISSING` every tick until the mount is back at the same mount point;
+  the directory gone too (umount then rmdir, a teardown) forgets the mount with an info log. The memory never
+  expires with time; it holds at most 64 mounts, and a new mount past the cap is not remembered, warned once. It
+  is persisted at `GPU_FAULT_HOST_SHARED_FILESYSTEM_STATE_PATH` (default
+  `/var/lib/gpu-fault/host-collector-shared-filesystems.json`, inside the unit's `ReadWritePaths`; empty keeps it
+  in the process only), rewritten atomically only when it changes, and survives collector restarts (the watchdog
+  restarting a tick a hung mount wedged is exactly when it is needed) and node reboots; a reimaged node loses it
+  with the rest of `/var/lib/gpu-fault`, and a corrupt or unreadable file starts the memory empty with one
+  warning. An operator clears `MOUNT_MISSING` by remounting, by removing the mount point directory, or by deleting
+  the state file and restarting the collector.
 
 The control plane uses `HealthSignalState` in the Aurora/SQLite/in-memory Store to keep
 `active_since/notified`. A finding is created only when the abnormality persists for the configured duration; a persistent abnormality notifies only once,

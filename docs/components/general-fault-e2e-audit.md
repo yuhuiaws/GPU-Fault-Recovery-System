@@ -136,9 +136,12 @@ GPU/rank CPU ≤5% 持续 300 秒、可用内存 ≤5% 持续 60 秒、page cach
 共享存储。用独立 NFS/Lustre 测试挂载分别制造 statvfs 超时、98% 容量和正常响应，
 验证采集有界且其他指标仍送达，随后实际执行目标挂载的 VALIDATE_HOST。
 另一正常挂载不能覆盖故障挂载；缺失新样本应等待，不得确认恢复。
-增加“statvfs 正常但读写/fsync 失败”变体作为整改验收，不伪称当前能检出。
+增加“statvfs 正常但读写/fsync 失败”与“挂载消失”变体作为整改验收：产品自批次176起对每个共享挂载在
+statvfs 之外做一次有界只读目录项读取（`IO_ERROR` 带 errno、超时 `IO_TIMEOUT` 按缺证据记不可用），并记住
+节点级共享挂载、消失后报 `MOUNT_MISSING`（记忆跨 collector 重启）；真机证明仍待独立测试 export。
 恢复服务器/挂载，读写探针和相关任务进度均通过后结束。
-整改缺口：真实有界 I/O 探针。共享存储故障域聚合已由控制面实现（批次177：≥2 节点在 600 s 内报同一
+整改缺口：均已由产品关闭——真实有界 I/O 探针与消失挂载记忆由采集器实现（批次176：statvfs 之外的有界只读目录项读取、
+节点级共享挂载消失的跨重启记忆，样本带 `source`/`fstype` 标签供聚合）；共享存储故障域聚合已由控制面实现（批次177：≥2 节点在 600 s 内报同一
 export 不可用时另记一条集群级 `SHARED_STORAGE_FAILURE_DOMAIN` incident 并只发一封通知，节点链不变；
 依赖采集器样本标签 `source`/`server`+`export` 给出 export 标识，见
 [真机验收 GF-GENERAL-LIVE-005](general-fault-live-acceptance.md#gf-general-live-005)），真机执行仍待证明。

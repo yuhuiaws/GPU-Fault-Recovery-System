@@ -1414,14 +1414,24 @@ QUARANTINE/MOUNT_MISSING rules). A hang is `SIGSTOP` on the ganesha child
 handles. `stat_timeout`, `capacity_full`, `healthy_other_mount` and `recovery`
 expect PASS (diagnostic-only chain on `shared_filesystem_unavailable` /
 `shared_filesystem_used_percent`, other host metrics still delivered, the
-healthy second mount never stands in, fresh I/O after the resume); three are
-registered as expected FAILs that name their product gap and flip to PASS once
-the product records what the spec asks: `mount_disappears` (the collector
-rediscovers shared mounts every tick and keeps no memory of one that vanished),
-`io_only_failure` (statvfs-only probing; a server-side `chmod 000` denies every
-read while statvfs answers) and `shared_failure_domain` (two nodes on one hung
-export mint two unrelated node incidents; nothing names the common failure
-domain). All need `KERNEL_MODULE_LOAD` (a missing `nfsv4` is loaded and
+healthy second mount never stands in, fresh I/O after the resume).
+`mount_disappears` and `io_only_failure` were registered as expected FAILs
+naming their product gaps; batch 176 closes both in the product and they now
+expect PASS: each NFS/Lustre mount of the host's table gets one bounded,
+read-only directory-entry read after its `statvfs` (`IO_ERROR` with the errno
+for the server-side `chmod 000`, or `IO_TIMEOUT` as missing evidence --
+unavailable, never healthy), and a node-scoped shared mount the table no
+longer lists is `MOUNT_MISSING` from a memory kept in
+`/var/lib/gpu-fault/host-collector-shared-filesystems.json` across collector
+restarts, until it is remounted or its mount point directory is removed (a
+teardown -- which is why the fixture's `nfs-umount` keeps the directory for
+the injection and its cleanup removes it). Pod volumes and autofs children
+are sampled while present but never remembered. `shared_failure_domain`
+stays the registered expected FAIL (two nodes on one hung export mint two
+unrelated node incidents; nothing names the common failure domain) until a
+control-plane correlation lands; the unavailable and used-percent samples
+now name the export in their `source` label for it. All need
+`KERNEL_MODULE_LOAD` (a missing `nfsv4` is loaded and
 unloaded), `shared_failure_domain` holds both EKS lane locks (`X`) and needs
 `--node-b`. Live prerequisites: an immutable-digest server image shipping
 `ganesha.nfsd` and `/bin/sh` (`--export-image` /
