@@ -34,6 +34,7 @@ from typing import Any
 import pytest
 
 from gpu_fault.watcher import failure_containment_ids
+from scripts.e2e.regional import general_live_applog_job as applog_job
 from scripts.e2e.regional import general_live_attempts as attempts
 from scripts.e2e.regional import general_live_nccl_job as nccl_job
 from scripts.e2e.regional import general_live_progress as progress
@@ -107,18 +108,23 @@ WRAPPERS = {
     "GF-GENERAL-LIVE-028": lambda ctx, name: attempts.ManagedFailJob(
         ctx, name=name, mode="exit:1"
     ),
+    "GF-GENERAL-LIVE-017": lambda ctx, name: applog_job.ManagedApplogJob(
+        ctx, name=name, mode="hold"
+    ),
 }
 BASES = {
     "GF-GENERAL-LIVE-003": SINGLE_NODE,
     "GF-GENERAL-LIVE-011": TWO_NODE,
     "GF-GENERAL-LIVE-027": SINGLE_NODE,
     "GF-GENERAL-LIVE-028": SINGLE_NODE,
+    "GF-GENERAL-LIVE-017": SINGLE_NODE,
 }
 CASE_VARIANTS = {
     "GF-GENERAL-LIVE-003": "GF-GENERAL-LIVE-003.gpu_idle",
     "GF-GENERAL-LIVE-011": "GF-GENERAL-LIVE-011.active_to_zero",
     "GF-GENERAL-LIVE-027": "GF-GENERAL-LIVE-027.nan",
     "GF-GENERAL-LIVE-028": "GF-GENERAL-LIVE-028.nonzero_exit",
+    "GF-GENERAL-LIVE-017": "GF-GENERAL-LIVE-017.exited_pid",
 }
 
 

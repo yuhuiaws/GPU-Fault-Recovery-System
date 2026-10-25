@@ -70,7 +70,15 @@ MANAGED_JOB_CASES = (
     "GF-GENERAL-LIVE-027",  # general_live_progress: ManagedProgressJob
     "GF-GENERAL-LIVE-028",  # general_live_attempts: ManagedFailJob
     "GF-GENERAL-LIVE-029",  # general_live_attempts: ManagedFailJob
+    "GF-GENERAL-LIVE-017",  # general_live_applogs / _applog_job: ManagedApplogJob
 )
+#: The 017 variants that replay the journal source, not a managed job's CRI log.
+JOURNAL_VARIANTS = frozenset(
+    f"GF-GENERAL-LIVE-017.{variant}"
+    for variant in ("cgroup_oom", "nccl_error", "distributed_error")
+)
+#: Variants outside 011 that run the two-node NCCL job (``--node-b``).
+TWO_NODE_VARIANTS = frozenset({"GF-GENERAL-LIVE-017.missing_flight_recorder"})
 #: The 003 variants that drive the host and storage probes, not a managed job.
 HOST_VARIANTS = frozenset(
     f"GF-GENERAL-LIVE-003.{variant}"
@@ -93,6 +101,7 @@ MANAGED_JOB_VARIANTS = sorted(
     if spec.case_id in MANAGED_JOB_CASES
     and spec.implemented
     and key not in HOST_VARIANTS | STORE_VARIANTS
+    and key not in JOURNAL_VARIANTS
 )
 #: One variant per case, the live failure first.
 ONE_PER_CASE = (
@@ -101,6 +110,7 @@ ONE_PER_CASE = (
     "GF-GENERAL-LIVE-027.nan",
     "GF-GENERAL-LIVE-028.nonzero_exit",
     "GF-GENERAL-LIVE-029.budget_consumed",
+    "GF-GENERAL-LIVE-017.live_pid",
 )
 MUTATING_VERBS = frozenset(
     {
@@ -281,8 +291,8 @@ def configured(
         "host_probe_image": "public.ecr.aws/gfrs/probe@sha256:" + "1" * 64,
         "site_file": str(site),
     }
-    if spec.case_id == "GF-GENERAL-LIVE-011":
-        arguments["node_b"] = PEER  # the HyperPod lane's second node
+    if spec.case_id == "GF-GENERAL-LIVE-011" or spec.key in TWO_NODE_VARIANTS:
+        arguments["node_b"] = PEER  # the lane's second node
     profile = tmp_path / "site-profile.json"
     profile.write_text(
         json.dumps({"arguments": arguments, "environment": {}}), encoding="utf-8"
@@ -301,6 +311,10 @@ def configured(
         "--confirm",
         spec.confirmation,
     ]
+    for token in spec.approvals:
+        # A variant's required tokens (017's CRI window runtime-enables the
+        # node log collector); without them the run is NOT_RUN before any job.
+        argv += ["--approve", token]
     runner.install_site_profile(argv)
     parser = argparse.ArgumentParser()
     runner.add_arguments(parser)
@@ -429,7 +443,7 @@ def test_every_managed_job_reaches_its_first_mutation_pinned_to_the_target_node(
     # longer holds every later job's name (live 2026-10-25).
     base = (
         "gpu-fault-two-node-replace"
-        if spec.case_id == "GF-GENERAL-LIVE-011"
+        if spec.case_id == "GF-GENERAL-LIVE-011" or spec.key in TWO_NODE_VARIANTS
         else "gpu-fault-single-node-warm-spare"
     )
     assert metadata["name"] == managed_workload_name(base, job_id), metadata["name"]
