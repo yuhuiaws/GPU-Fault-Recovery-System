@@ -839,3 +839,72 @@ def test_dm_destroy_and_fs_destroy_prune_the_runs_directories(host: FakeDmHost) 
     assert backing.is_dir() and (mount_root / "fs").is_dir()
     assert storep.main(call("fs-destroy", "--name", "fs")) == 0, host.emitted[-1]
     assert not backing.exists() and not mount_root.exists()
+
+
+def test_retarget_data_with_delay_ms_swaps_the_delay_table(host: FakeDmHost) -> None:
+    """``dm-retarget --target data --delay-ms 0`` takes the injected latency
+    out of the mounted device in place: same mapping, dm-N, mount and files.
+
+    The 006 ``sustained_latency`` recovery proof needs it: the product emits
+    no await sample without completed I/O, and with the 200 ms table still
+    loaded any I/O would read above the threshold (live 2026-10-25 14:47Z).
+    """
+
+    assert storep.main(create("--load-module", delay=200)) == 0, host.emitted[-1]
+    assert storep.main(call("dm-setup", "--name", "io")) == 0, host.emitted[-1]
+    assert host.tables[DM] == "0 4194304 delay /dev/loop0 0 200", host.tables
+    before = device()["device"]
+    host.calls.clear()
+    assert (
+        storep.main(
+            call("dm-retarget", "--name", "io", "--target", "data", "--delay-ms", "0")
+        )
+        == 0
+    ), host.emitted[-1]
+    answer = host.emitted[-1]
+    assert answer["delay_ms"] == 0 and answer["target"] == "data", answer
+    assert host.tables[DM] == "0 4194304 linear /dev/loop0 0", host.tables
+    assert device()["delay_ms"] == 0 and device()["device"] == before, device()
+    assert host.mounts, "the mount stays"
+    steps = [call[len(NS) :][:2] for call in host.device_calls()]
+    assert steps == [
+        ["dmsetup", "suspend"],
+        ["dmsetup", "reload"],
+        ["dmsetup", "resume"],
+    ], steps
+    # Back to a delay table needs the module; without it the swap is refused.
+    shutil.rmtree(host.sys_module / storep.DELAY_MODULE)
+    assert (
+        storep.main(
+            call("dm-retarget", "--name", "io", "--target", "data", "--delay-ms", "50")
+        )
+        == 1
+    )
+    assert host.emitted[-1]["error"] == "ProbeError", host.emitted[-1]
+    assert host.tables[DM] == "0 4194304 linear /dev/loop0 0", host.tables
+
+
+def test_io_start_paces_the_writer(host: FakeDmHost) -> None:
+    built(host)
+    assert (
+        storep.main(
+            call(
+                "io-start",
+                "--name",
+                "io",
+                "--threads",
+                "1",
+                "--seconds",
+                "120",
+                "--direct",
+                "--pace-ms",
+                "100",
+            )
+        )
+        == 0
+    ), host.emitted[-1]
+    answer = host.emitted[-1]
+    assert answer["pace_ms"] == 100 and answer["threads"] == 1, answer
+    writer = host.started[WRITER_UNIT]
+    assert writer[-1] == "0.1", writer[-8:]  # the pace in seconds, after the span
+    assert "if pace:" in writer[-7] or "pace" in writer[-7], "the writer honours it"

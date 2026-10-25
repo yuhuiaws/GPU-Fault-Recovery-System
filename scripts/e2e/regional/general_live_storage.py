@@ -687,7 +687,12 @@ def _device_name(created: dict[str, Any]) -> str:
 
 
 def _run_io(
-    ctx: VariantContext, seconds: int, *, direct: bool = True, threads: int = 16
+    ctx: VariantContext,
+    seconds: int,
+    *,
+    direct: bool = True,
+    threads: int = 16,
+    pace_ms: int = 0,
 ) -> dict[str, Any]:
     arguments = [
         "io-start",
@@ -700,6 +705,8 @@ def _run_io(
     ]
     if direct:
         arguments.append("--direct")
+    if pace_ms:
+        arguments += ["--pace-ms", str(pace_ms)]
     # Registered before the start: a writer whose answer is lost is stopped too.
     ctx.cleanup.push("io", lambda: _device_call(ctx, "io-stop", "--name", TEST_DM))
     return _device_call(ctx, *arguments)
@@ -759,7 +766,10 @@ def _io_metric_variant(
         "hardware": hardware_errors(detection),
     }
     _stop_io(ctx)
+    load = _recovery_load(ctx, metric, delay_ms)
     recovered = _await_io_recovery(ctx, metric, device, threshold)
+    if load:
+        _stop_io(ctx)
     stages["recovery"] = recovered["errors"]
     wait_settled(
         ctx,
@@ -769,7 +779,47 @@ def _io_metric_variant(
         metrics={metric},
         name=f"{metric}-settled",
     )
-    return _result(stages, extra={"device": device, "recovery": recovered})
+    return _result(
+        stages,
+        extra={"device": device, "recovery": recovered, "recovery_load": load},
+    )
+
+
+#: The recovery writer's pace: ten 64 KiB O_DIRECT writes a second keep
+#: completed requests in every collector interval at well under 1 % util.
+RECOVERY_LOAD_PACE_MS = 100
+RECOVERY_LOAD_MARGIN_SECONDS = 60
+
+
+def _recovery_load(ctx: VariantContext, metric: str, delay_ms: int) -> dict[str, Any]:
+    """What the await recovery proof needs on the device, started before the
+    wait: the injected delay out of the data table, and completed I/O.
+
+    ``disk_io_await_ms`` exists only for intervals with completed requests
+    (the zero-completed-I/O rule), so an idle device never yields the fresh
+    below-threshold sample that clears the signal -- live 2026-10-25 14:47Z
+    (ip-10-0-43-5, R13e) the 690 s wait saw none, the oracle read no
+    completion after ``io-stop`` -- and with the 200 ms table still loaded
+    any I/O reads above the threshold. The table goes back to linear in
+    place (same dm-N, mount and files) and a paced single O_DIRECT writer
+    keeps completed requests flowing for the length of the wait; the caller
+    stops it afterwards. Util needs neither: field 10 over elapsed time reads
+    0 % on an idle device.
+    """
+
+    if metric != "disk_io_await_ms":
+        return {}
+    removed = None
+    if delay_ms:
+        removed = _device_call(
+            ctx, "dm-retarget", "--name", TEST_DM, "--target", "data", "--delay-ms", "0"
+        )
+        ctx.evidence.write("dm-delay-removed", removed)
+    seconds = (
+        ctx.host_summary * 2 + ctx.host_interval * 6 + RECOVERY_LOAD_MARGIN_SECONDS
+    )
+    writer = _run_io(ctx, seconds, threads=1, pace_ms=RECOVERY_LOAD_PACE_MS)
+    return {"delay_removed": removed, "writer": writer}
 
 
 def sustained_util(ctx: VariantContext) -> dict[str, Any]:

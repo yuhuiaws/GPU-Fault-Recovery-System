@@ -919,3 +919,136 @@ def test_reference_iostat_is_inconclusive_under_the_tolerance_floor(
     assert "tolerance floor" in str(caught.value), str(caught.value)
     arguments = _dm_create_arguments(store)
     assert arguments[arguments.index("--delay-ms") + 1] == "0", arguments
+
+
+def _latency_run(tmp_path: Path, store: FakeProbe) -> dict[str, Any]:
+    spec = SPECS["sustained_latency"]
+    node = node_probe(survey(dm_delay=True))
+    node.script["oracle-read"] = {
+        "records": [
+            {"diskstats": {"dm-7": {"standard_await_ms": 210.0}}} for _ in range(80)
+        ],
+        "next_offset": 80,
+        "total": 80,
+    }
+    inc = incident(
+        "inc-io",
+        "disk_io_await_ms",
+        device="dm-7",
+        state="ACTION_PENDING",
+        workflow="wf-io",
+    )
+    wf = workflow(
+        "wf-io",
+        "inc-io",
+        ["FREEZE_EVIDENCE", "VALIDATE_HOST"],
+        status="FAILED",
+        probe_metric="disk_io_await_ms",
+        executions=[
+            {
+                "operation": "VALIDATE_HOST",
+                "status": "FAILED",
+                "details": {"host_diagnostic_failure": True},
+            }
+        ],
+    )
+    doc = {
+        "incidents": [inc],
+        "workflows": [wf],
+        "batches": [
+            host_batch(
+                "2026-10-24T00:02:00+00:00", "disk_io_await_ms", 210.0, device="dm-7"
+            )
+        ]
+        + [
+            host_batch(
+                f"2026-10-24T00:2{i}:00+00:00", "disk_io_await_ms", 0.4, device="dm-7"
+            )
+            for i in range(3)
+        ],
+        "markers": [],
+        "commands": [],
+        "health_signals": {},
+        "notifications": [],
+    }
+    regional = FakeRegional(cpu_python=store_script({"activity": doc}))
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=regional,
+        probes=probes(node, store, window_probe()),
+    )
+    return spec.execute(ctx)
+
+
+def test_sustained_latency_removes_the_delay_and_proves_recovery_on_paced_io(
+    tmp_path: Path,
+) -> None:
+    """Live 2026-10-25 14:47Z (ip-10-0-43-5, R13e): after ``io-stop`` the
+    dm-delay device saw no completed I/O for the whole 690 s recovery wait,
+    so the product -- by its zero-completed-I/O rule -- emitted no await
+    sample and the signal could never clear; with the 200 ms table still
+    loaded any I/O would have read above the 100 ms threshold anyway. The
+    recovery proof now takes the delay out of the data table and keeps a
+    paced single writer on the same dm-N while the product samples it."""
+
+    store = storage_probe()
+    result = _latency_run(tmp_path, store)
+    assert result["verdict"] == "PASS", result["errors"]
+    names = [call[0] for call in store.calls]
+    first_stop = names.index("io-stop")
+    assert names[first_stop:] == ["io-stop", "dm-retarget", "io-start", "io-stop"], (
+        names
+    )
+    retarget = store.calls[first_stop + 1]
+    assert retarget[retarget.index("--target") + 1] == "data", retarget
+    assert retarget[retarget.index("--delay-ms") + 1] == "0", retarget
+    writer = store.calls[first_stop + 2]
+    assert writer[writer.index("--threads") + 1] == "1", writer
+    assert writer[writer.index("--pace-ms") + 1] == "100", writer
+    assert "--direct" in writer, writer
+    assert int(writer[writer.index("--seconds") + 1]) >= 690 + 60, writer
+    assert result["recovery_load"]["delay_removed"]["target"] == "data", result
+    assert result["recovery"]["fresh_samples"], result["recovery"]
+
+
+def test_sustained_util_recovery_needs_no_verification_load(tmp_path: Path) -> None:
+    """Util falls to 0 % without I/O (field 10 over elapsed time), so the util
+    variant keeps the idle recovery wait: no table swap, no second writer."""
+
+    spec = SPECS["sustained_util"]
+    store = storage_probe()
+    node = node_probe(survey(dm_delay=False))
+    node.script["oracle-read"] = {
+        "records": [
+            {"diskstats": {"dm-7": {"util_percent": 100.0}}} for _ in range(80)
+        ],
+        "next_offset": 80,
+        "total": 80,
+    }
+    doc = {
+        "incidents": [incident("inc-io", "disk_io_util_percent", device="dm-7")],
+        "workflows": [],
+        "batches": [
+            host_batch(
+                f"2026-10-24T00:2{i}:00+00:00",
+                "disk_io_util_percent",
+                2.0,
+                device="dm-7",
+            )
+            for i in range(3)
+        ],
+        "markers": [],
+        "commands": [],
+        "health_signals": {},
+        "notifications": [],
+    }
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=FakeRegional(cpu_python=store_script({"activity": doc})),
+        probes=probes(node, store, window_probe()),
+    )
+    spec.execute(ctx)
+    names = [call[0] for call in store.calls]
+    assert "dm-retarget" not in names and names.count("io-start") == 1, names

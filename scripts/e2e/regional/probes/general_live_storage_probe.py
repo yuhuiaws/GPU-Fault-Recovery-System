@@ -505,13 +505,8 @@ def run_directories(run_id: str) -> list[Path]:
 
 def prune_run_directories(run_id: str) -> list[str]:
     """Remove the run's directories once it holds no test file system or
-    device and they are empty; one with content stays and ``residue`` names it.
-
-    Every destroy and ``cleanup`` ends here. Before, only ``cleanup --kind
-    all`` -- which no caller used -- pruned them: on 2026-10-25 each finished
-    006 run left one empty backing directory and one empty mount root behind
-    on both EKS nodes.
-    """
+    device and they are empty (every destroy and ``cleanup`` end here); one
+    with content stays and ``residue`` names it."""
 
     state = load_state(run_id)
     if state["devices"] or state["filesystems"]:
@@ -1081,7 +1076,9 @@ def dm_retarget(arguments: argparse.Namespace) -> None:
     ``statvfs`` fails EIO until ``--target data`` puts the data table back.
     When something read the fresh mount first and cached the count, the swap
     is retried from a new mount; ``faulted`` says whether the probe's own
-    reading failed.
+    reading failed. ``--delay-ms`` gives the data table a new delay first --
+    0 takes the injected latency out in place (same dm-N, mount and files),
+    the 006 ``sustained_latency`` recovery proof.
     """
 
     run_id = checked_run_id(arguments.run_id)
@@ -1089,6 +1086,11 @@ def dm_retarget(arguments: argparse.Namespace) -> None:
     entry = ready_device(run_id, name)
     if arguments.target not in {"data", "error"}:
         raise ProbeError("retarget target must be data or error")
+    if arguments.delay_ms is not None:
+        delay = bounded(arguments.delay_ms, 0, 1000, "delay ms")
+        if delay and not module_loaded(DELAY_MODULE):
+            raise ProbeError("dm_delay is not loaded on this node")
+        entry = update_device(run_id, name, delay_ms=delay)
     writer = unit_state(f"{unit_name(run_id, f'io-{name}')}.service")
     if writer.get("ActiveState") in RUNNING_STATES:
         raise ProbeError("the writer still runs; stop it before the retarget")
@@ -1105,6 +1107,7 @@ def dm_retarget(arguments: argparse.Namespace) -> None:
             "name": name,
             "dm": entry["dm"],
             "target": arguments.target,
+            "delay_ms": int(entry["delay_ms"]),
             "attempts": len(readings),
             "statvfs": readings[-1],
             "faulted": error and "error" in readings[-1],
@@ -1214,7 +1217,7 @@ def dm_destroy(arguments: argparse.Namespace) -> None:
 
 IO_WRITER = r"""
 import mmap, os, sys, threading, time
-path, threads, block, seconds, direct, span = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), float(sys.argv[4]), sys.argv[5] == "1", int(sys.argv[6])
+path, threads, block, seconds, direct, span, pace = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), float(sys.argv[4]), sys.argv[5] == "1", int(sys.argv[6]), float(sys.argv[7])
 deadline = time.monotonic() + seconds
 flags = os.O_WRONLY | os.O_CREAT | (getattr(os, "O_DIRECT", 0) if direct else 0)
 def writer(index):
@@ -1228,6 +1231,7 @@ def writer(index):
             offset = (offset + block) % span
             if not direct:
                 os.fsync(fd)
+            if pace: time.sleep(pace)
     finally:
         os.close(fd)
 workers = [threading.Thread(target=writer, args=(item,), daemon=True) for item in range(threads)]
@@ -1248,6 +1252,7 @@ def io_start(arguments: argparse.Namespace) -> None:
     block_kib = bounded(arguments.block_kib, 4, 1024, "block KiB")
     seconds = bounded(arguments.seconds, 10, 1800, "seconds")
     span = bounded(arguments.span_mib, 1, 64, "span MiB") * 1024 * 1024
+    pace_ms = bounded(arguments.pace_ms, 0, 10_000, "pace ms")
     path = str(Path(entry["mountpoint"]) / "gfrs-io")
     unit = start_unit(
         run_id,
@@ -1263,6 +1268,7 @@ def io_start(arguments: argparse.Namespace) -> None:
             str(seconds),
             "1" if arguments.direct else "0",
             str(span),
+            str(pace_ms / 1000),
         ],
         "Nice=19",
     )
@@ -1272,6 +1278,7 @@ def io_start(arguments: argparse.Namespace) -> None:
             "threads": threads,
             "block_kib": block_kib,
             "direct": arguments.direct,
+            "pace_ms": pace_ms,
             "state": unit_state(f"{unit}.service"),
         }
     )
@@ -1429,9 +1436,9 @@ def parser() -> argparse.ArgumentParser:
     item.add_argument("--deadman-seconds", type=int, required=True)
     item.add_argument("--load-module", action="store_true")
     item.add_argument("--fstype", default="ext4", choices=sorted(MKFS))
-    command("dm-retarget", dm_retarget).add_argument(
-        "--target", required=True, choices=("data", "error")
-    )
+    item = command("dm-retarget", dm_retarget)
+    item.add_argument("--target", required=True, choices=("data", "error"))
+    item.add_argument("--delay-ms", type=int, default=None)
     command("dm-suspend", dm_suspend).add_argument("--seconds", type=int, required=True)
     item = command("io-start", io_start)
     item.add_argument("--threads", type=int, default=16)
@@ -1439,6 +1446,7 @@ def parser() -> argparse.ArgumentParser:
     item.add_argument("--seconds", type=int, required=True)
     item.add_argument("--span-mib", type=int, default=16)
     item.add_argument("--direct", action="store_true")
+    item.add_argument("--pace-ms", type=int, default=0)
     return value
 
 
