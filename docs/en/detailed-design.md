@@ -3342,8 +3342,11 @@ The bottleneck where accepted stalled at 11k-13k in the load test is in this lay
   `shared_filesystem_used_percent`, then `open(O_DIRECTORY)` plus one directory-entry read is the data-path probe
   (read-only: no file created, written or synced; one entry of one page; the NFS directory attribute cache,
   `acdirmax` 60 s by default, is the detection latency of a failure that leaves FSSTAT working).
-  `shared_filesystem_unavailable` is 0 when usable and 1 with `failure_mode`, `source` (the export) and `fs_type`
-  otherwise: `PROBE_TIMEOUT` (`statvfs` did not answer, or the tick budget was spent), `PROBE_FAILED` (`statvfs`
+  Every shared sample (`shared_filesystem_unavailable` at 0 and at 1, `shared_filesystem_used_percent`) carries
+  `source` (the mount table's source field, e.g. `10.0.0.2:/export`, `fs-0abc@tcp:/fsname` -- the same on every
+  node that mounts the export, for the control plane's cross-node failure-domain correlation; the mount point is
+  not part of that identity) and `fstype`; `shared_filesystem_unavailable` is 0 when usable and 1 with a
+  `failure_mode` otherwise: `PROBE_TIMEOUT` (`statvfs` did not answer, or the tick budget was spent), `PROBE_FAILED` (`statvfs`
   raised; `errno` named), `IO_ERROR` (`statvfs` answered but the directory read raised; `errno` named, e.g.
   EACCES/EIO/ESTALE), `IO_TIMEOUT` (the directory read did not answer: no verdict, reported unavailable as missing
   evidence rather than healthy, and kept `IO_TIMEOUT` on later ticks while the parked read still holds the mount,
@@ -3357,7 +3360,8 @@ The bottleneck where accepted stalled at 11k-13k in the load test is in this lay
   remembered mount gone from the host table has its mount point read with the same bounded directory probe: the
   directory still there (a forced or lazy umount, fstab not restoring it after a reboot -- the job then writes into
   the local disk under that path) is `MOUNT_MISSING` every tick until the mount is back at the same mount point;
-  the directory gone too (umount then rmdir, a teardown) forgets the mount with an info log. The memory never
+  the directory gone too (umount then rmdir, a teardown) forgets the mount with an info log (no further samples
+  for it; VALIDATE_HOST reads only the latest values inside `max_sample_age`, so a stale 1 ages out). The memory never
   expires with time; it holds at most 64 mounts, and a new mount past the cap is not remembered, warned once. It
   is persisted at `GPU_FAULT_HOST_SHARED_FILESYSTEM_STATE_PATH` (default
   `/var/lib/gpu-fault/host-collector-shared-filesystems.json`, inside the unit's `ReadWritePaths`; empty keeps it

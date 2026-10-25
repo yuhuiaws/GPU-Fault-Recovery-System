@@ -150,11 +150,12 @@ class HostSharedFilesystemsMixin:
         available = stat.f_bavail * stat.f_frsize
         if total:
             result.append(
-                self._sample(
-                    "shared_filesystem_used_percent",
-                    100 * (total - available) / total,
-                    "percent",
-                    mount,
+                HostMetricSample(
+                    name="shared_filesystem_used_percent",
+                    value=100 * (total - available) / total,
+                    unit="percent",
+                    device=mount,
+                    labels=self._export_labels(entry.source, entry.fs_type),
                 )
             )
         io_failure: str | None = None
@@ -214,6 +215,21 @@ class HostSharedFilesystemsMixin:
         ]
 
     @staticmethod
+    def _export_labels(source: str, fs_type: str) -> dict[str, str]:
+        """The export a shared sample is about, for cross-node correlation.
+
+        ``source`` is the mount table's source field (``10.0.0.2:/export``,
+        ``fs-0abc@tcp:/fsname``): the same string on every node that mounts the
+        export, whatever mount point each chose, so a control-plane failure
+        domain can be built from it. ``fstype`` is the mount's filesystem
+        type. The mount point (the sample's ``device``) is deliberately not
+        part of that identity. Both labels are optional on the wire; a sample
+        without them is simply not correlated.
+        """
+
+        return {"source": source, "fstype": fs_type}
+
+    @staticmethod
     def _shared_filesystem_unavailable(
         mount: str,
         source: str,
@@ -223,22 +239,27 @@ class HostSharedFilesystemsMixin:
     ) -> HostMetricSample:
         """Availability gauge for one shared mount (GF-GENERAL-LIVE-005).
 
-        Value 0 with no labels for a mount whose ``statvfs`` and directory read
-        both answered; value 1 otherwise, naming the export (``source``,
-        ``fs_type``) and the ``failure_mode``: ``PROBE_TIMEOUT`` (``statvfs``
-        did not answer), ``PROBE_FAILED`` (it raised; ``errno`` named),
-        ``IO_TIMEOUT`` (the directory read did not answer: no verdict, reported
-        unavailable rather than healthy), ``IO_ERROR`` (it raised; ``errno``
-        named) and ``MOUNT_MISSING`` (a remembered mount the host's table no
-        longer lists). The labels are new and optional on the wire; the
-        consumer's rule reads the value.
+        Every sample names its export (``source``, ``fstype``;
+        :meth:`_export_labels`). Value 0 for a mount whose ``statvfs`` and
+        directory read both answered; value 1 otherwise, adding the
+        ``failure_mode``: ``PROBE_TIMEOUT`` (``statvfs`` did not answer),
+        ``PROBE_FAILED`` (it raised; ``errno`` named), ``IO_TIMEOUT`` (the
+        directory read did not answer: no verdict, reported unavailable rather
+        than healthy), ``IO_ERROR`` (it raised; ``errno`` named) and
+        ``MOUNT_MISSING`` (a remembered mount the host's table no longer
+        lists). The labels are new and optional on the wire; the consumer's
+        rule reads the value.
         """
 
+        labels = HostSharedFilesystemsMixin._export_labels(source, fs_type)
         if failure_mode is None:
             return HostMetricSample(
-                name="shared_filesystem_unavailable", value=0.0, device=mount
+                name="shared_filesystem_unavailable",
+                value=0.0,
+                device=mount,
+                labels=labels,
             )
-        labels = {"failure_mode": failure_mode, "source": source, "fs_type": fs_type}
+        labels["failure_mode"] = failure_mode
         if error is not None and error.errno:
             labels["errno"] = errno.errorcode.get(error.errno, str(error.errno))
         return HostMetricSample(

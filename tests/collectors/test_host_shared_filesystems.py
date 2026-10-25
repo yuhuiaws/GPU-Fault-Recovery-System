@@ -56,6 +56,13 @@ AUTOFS_HOME = "60 28 0:45 / /home rw,relatime shared:60 - autofs systemd-1 rw,fd
 AUTOMOUNTED_HOME = (
     "61 60 0:46 / /home/alice rw,relatime shared:61 - nfs4 10.0.0.2:/home/alice rw"
 )
+#: The export labels every shared sample carries (``source`` identifies the
+#: export across nodes for the control plane's failure-domain correlation;
+#: the mount point is not part of that identity).
+FSX_LABELS = {"source": "10.0.0.1@tcp:/fsx", "fstype": "lustre"}
+SHARED_LABELS = {"source": "10.0.0.2:/shared", "fstype": "nfs4"}
+POD_LABELS = {"source": "10.0.0.2:/data", "fstype": "nfs4"}
+HOME_LABELS = {"source": "10.0.0.2:/home/alice", "fstype": "nfs4"}
 
 
 def write_tables(case, *lines: str, own: tuple[str, ...] | None = None) -> None:
@@ -172,7 +179,9 @@ def test_a_vanished_node_scoped_shared_mount_is_unavailable_until_remounted(host
     collector = build(host_case, probe, "_cpu", "_memory", "_filesystems")
 
     first = collector.collect_once()
-    assert gauges(first) == {"/fsx": (0, {}), "/shared": (0, {})}, gauges(first)
+    assert gauges(first) == {"/fsx": (0, FSX_LABELS), "/shared": (0, SHARED_LABELS)}, (
+        gauges(first)
+    )
     assert support.values(first)[("shared_filesystem_used_percent", "/fsx")] == 50
     assert set(memory_file(host_case)) == {"/fsx", "/shared"}, memory_file(host_case)
 
@@ -180,13 +189,13 @@ def test_a_vanished_node_scoped_shared_mount_is_unavailable_until_remounted(host
     host_case.clock.sleep(15)
     second = collector.collect_once()
     values = support.values(second)
-    assert gauges(second)["/shared"] == (0, {}), gauges(second)
+    assert gauges(second)["/shared"] == (0, SHARED_LABELS), gauges(second)
     assert gauges(second)["/fsx"] == (
         1,
         {
             "failure_mode": "MOUNT_MISSING",
             "source": "10.0.0.1@tcp:/fsx",
-            "fs_type": "lustre",
+            "fstype": "lustre",
         },
     ), gauges(second)
     assert ("shared_filesystem_used_percent", "/fsx") not in values, (
@@ -214,7 +223,10 @@ def test_a_vanished_node_scoped_shared_mount_is_unavailable_until_remounted(host
     write_tables(host_case, ROOT, FSX, SHARED)
     host_case.clock.sleep(15)
     recovered = collector.collect_once()
-    assert gauges(recovered) == {"/fsx": (0, {}), "/shared": (0, {})}, gauges(recovered)
+    assert gauges(recovered) == {
+        "/fsx": (0, FSX_LABELS),
+        "/shared": (0, SHARED_LABELS),
+    }, gauges(recovered)
     assert support.values(recovered)[("shared_filesystem_used_percent", "/fsx")] == 50
     assert memory_file(host_case)["/fsx"]["missing_since"] is None, memory_file(
         host_case
@@ -265,7 +277,7 @@ def test_a_torn_down_shared_mount_is_forgotten(host_case):
     )
     host_case.clock.sleep(15)
     torn_down = collector.collect_once()
-    assert gauges(torn_down) == {"/shared": (0, {})}, gauges(torn_down)
+    assert gauges(torn_down) == {"/shared": (0, SHARED_LABELS)}, gauges(torn_down)
     assert set(memory_file(host_case)) == {"/shared"}, memory_file(host_case)
 
     del probe.failures["/fsx"]
@@ -289,16 +301,16 @@ def test_workload_and_automounter_mounts_are_sampled_but_not_remembered(host_cas
 
     present = collector.collect_once()
     assert gauges(present) == {
-        "/fsx": (0, {}),
-        pod_volume: (0, {}),
-        "/home/alice": (0, {}),
+        "/fsx": (0, FSX_LABELS),
+        pod_volume: (0, POD_LABELS),
+        "/home/alice": (0, HOME_LABELS),
     }, gauges(present)
     assert set(memory_file(host_case)) == {"/fsx"}, memory_file(host_case)
 
     write_tables(host_case, ROOT, FSX, AUTOFS_HOME)
     host_case.clock.sleep(15)
     gone = collector.collect_once()
-    assert gauges(gone) == {"/fsx": (0, {})}, gauges(gone)
+    assert gauges(gone) == {"/fsx": (0, FSX_LABELS)}, gauges(gone)
     assert probe.calls.count(pod_volume) == 1, "a departed Pod volume was probed again"
 
 
@@ -326,8 +338,8 @@ def test_a_shared_mount_the_sandbox_hides_is_neither_reported_nor_remembered(
         first = collector.collect_once()
         host_case.clock.sleep(15)
         second = collector.collect_once()
-    assert gauges(first) == {"/fsx": (0, {})}, gauges(first)
-    assert gauges(second) == {"/fsx": (0, {})}, gauges(second)
+    assert gauges(first) == {"/fsx": (0, FSX_LABELS)}, gauges(first)
+    assert gauges(second) == {"/fsx": (0, FSX_LABELS)}, gauges(second)
     assert "/home" not in probe.calls, probe.calls
     assert set(memory_file(host_case)) == {"/fsx"}, memory_file(host_case)
     hidden_warnings = [
@@ -338,7 +350,7 @@ def test_a_shared_mount_the_sandbox_hides_is_neither_reported_nor_remembered(
     write_tables(host_case, ROOT, FSX, own=(ROOT, FSX, hidden))
     host_case.clock.sleep(15)
     third = collector.collect_once()
-    assert gauges(third) == {"/fsx": (0, {})}, gauges(third)
+    assert gauges(third) == {"/fsx": (0, FSX_LABELS)}, gauges(third)
 
 
 def test_an_unreadable_host_table_falls_back_to_the_collectors_own(host_case):
@@ -349,7 +361,7 @@ def test_an_unreadable_host_table_falls_back_to_the_collectors_own(host_case):
     collector = build(host_case, probe)
 
     first = collector.collect_once()
-    assert gauges(first) == {"/fsx": (0, {})}, gauges(first)
+    assert gauges(first) == {"/fsx": (0, FSX_LABELS)}, gauges(first)
 
     support.write_file(host_case.roots.proc / "self/mountinfo", f"{ROOT}\n")
     host_case.clock.sleep(15)
@@ -365,7 +377,7 @@ def test_a_malformed_memory_file_starts_empty_and_is_rewritten(host_case, caplog
     write_tables(host_case, ROOT, FSX)
     with caplog.at_level(logging.WARNING, logger="gpu_fault.collectors.host"):
         batch = build(host_case, probe).collect_once()
-    assert gauges(batch) == {"/fsx": (0, {})}, gauges(batch)
+    assert gauges(batch) == {"/fsx": (0, FSX_LABELS)}, gauges(batch)
     assert set(memory_file(host_case)) == {"/fsx"}, memory_file(host_case)
     assert any(
         "shared mount memory" in record.getMessage() for record in caplog.records
@@ -394,14 +406,14 @@ def test_a_data_path_failure_behind_a_healthy_statvfs_is_unavailable(host_case):
 
     batch = collector.collect_once()
     values = support.values(batch)
-    assert gauges(batch)["/fsx"] == (0, {}), gauges(batch)
+    assert gauges(batch)["/fsx"] == (0, FSX_LABELS), gauges(batch)
     assert gauges(batch)["/shared"] == (
         1,
         {
             "failure_mode": "IO_ERROR",
             "errno": "EACCES",
             "source": "10.0.0.2:/shared",
-            "fs_type": "nfs4",
+            "fstype": "nfs4",
         },
     ), gauges(batch)
     assert values[("shared_filesystem_used_percent", "/shared")] == 50, (
@@ -419,7 +431,10 @@ def test_a_data_path_failure_behind_a_healthy_statvfs_is_unavailable(host_case):
     del probe.failures["/shared"]
     host_case.clock.sleep(15)
     restored = collector.collect_once()
-    assert gauges(restored) == {"/fsx": (0, {}), "/shared": (0, {})}, gauges(restored)
+    assert gauges(restored) == {
+        "/fsx": (0, FSX_LABELS),
+        "/shared": (0, SHARED_LABELS),
+    }, gauges(restored)
 
 
 def test_a_data_path_read_that_never_answers_is_unknown_not_healthy(host_case):
@@ -446,10 +461,10 @@ def test_a_data_path_read_that_never_answers_is_unknown_not_healthy(host_case):
         probe.released.set()
 
     assert elapsed < 3, f"the tick waited on the hung read: {elapsed:.1f}s"
-    assert gauges(batch)["/fsx"] == (0, {}), gauges(batch)
+    assert gauges(batch)["/fsx"] == (0, FSX_LABELS), gauges(batch)
     assert gauges(batch)["/shared"] == (
         1,
-        {"failure_mode": "IO_TIMEOUT", "source": "10.0.0.2:/shared", "fs_type": "nfs4"},
+        {"failure_mode": "IO_TIMEOUT", "source": "10.0.0.2:/shared", "fstype": "nfs4"},
     ), gauges(batch)
     assert support.values(batch)[("shared_filesystem_used_percent", "/shared")] == 50
     assert gauges(again)["/shared"][1]["failure_mode"] == "IO_TIMEOUT", gauges(again)
@@ -484,7 +499,7 @@ def test_a_failed_statvfs_names_its_errno_and_a_hung_one_its_mode(host_case):
             "failure_mode": "PROBE_FAILED",
             "errno": "ESTALE",
             "source": "10.0.0.2:/shared",
-            "fs_type": "nfs4",
+            "fstype": "nfs4",
         },
     ), gauges(batch)
     assert gauges(batch)["/fsx"] == (
@@ -492,7 +507,7 @@ def test_a_failed_statvfs_names_its_errno_and_a_hung_one_its_mode(host_case):
         {
             "failure_mode": "PROBE_TIMEOUT",
             "source": "10.0.0.1@tcp:/fsx",
-            "fs_type": "lustre",
+            "fstype": "lustre",
         },
     ), gauges(batch)
     assert probe.calls == [], "the data path was read on a mount statvfs failed"
@@ -521,6 +536,53 @@ def test_batches_from_a_collector_without_labels_still_grade():
         RecoveryAction.RUN_DIAGNOSTICS
     ], findings
     assert findings[0].diagnostic_parameters == {}, findings[0]
+
+
+def test_every_shared_sample_names_its_export_for_failure_domain_correlation(host_case):
+    """The control plane correlates nodes on one export by the sample labels.
+
+    ``source`` is the mount table's source field, the same on every node that
+    mounts the export; ``fstype`` rides along. Both the availability gauge --
+    healthy or any failure mode -- and the capacity reading carry them, and
+    the mount point stays out of the labels: nodes may mount one export at
+    different paths.
+    """
+
+    probe = DirectoryProbe()
+    probe.failures["/shared"] = PermissionError(errno.EACCES, "Permission denied")
+    write_tables(host_case, ROOT, FSX, SHARED)
+    collector = build(host_case, probe)
+    batch = collector.collect_once()
+    write_tables(host_case, ROOT, SHARED)
+    host_case.clock.sleep(15)
+    vanished = collector.collect_once()
+
+    shared_samples = [
+        sample
+        for sample in [*batch.samples, *vanished.samples]
+        if sample.name
+        in {"shared_filesystem_unavailable", "shared_filesystem_used_percent"}
+    ]
+    assert len(shared_samples) == 7, [
+        (s.name, s.device, s.value) for s in shared_samples
+    ]
+    expected = {"/fsx": FSX_LABELS, "/shared": SHARED_LABELS}
+    for sample in shared_samples:
+        assert sample.labels["source"] == expected[sample.device]["source"], sample
+        assert sample.labels["fstype"] == expected[sample.device]["fstype"], sample
+        assert sample.device not in sample.labels.values(), (
+            f"the mount point leaked into the correlation identity: {sample}"
+        )
+    modes = {
+        (sample.device, sample.value): sample.labels.get("failure_mode")
+        for sample in shared_samples
+        if sample.name == "shared_filesystem_unavailable"
+    }
+    assert modes == {
+        ("/fsx", 0): None,
+        ("/shared", 1): "IO_ERROR",
+        ("/fsx", 1): "MOUNT_MISSING",
+    }, modes
 
 
 # --------------------------------------------------------------------------- #
@@ -554,7 +616,7 @@ def test_a_memory_file_over_the_cap_keeps_the_oldest_known_mounts(tmp_path):
                 "mounts": {
                     f"/m{index}": {
                         "source": f"s:/m{index}",
-                        "fs_type": "nfs4",
+                        "fstype": "nfs4",
                         "first_seen": f"2026-07-{10 + index:02d}T00:00:00+00:00",
                         "missing_since": None,
                     }
