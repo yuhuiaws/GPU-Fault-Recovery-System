@@ -158,7 +158,17 @@ inode耗尽、只读、必需挂载消失、EIO/EACCES分别验，不能用剩�
 （READ_ONLY/MOUNT_MISSING/PROBE_FAILED）报为不可用并走 VALIDATE_HOST 诊断：不产生
 容量 finding，不 reset/reboot/隔离，不可读状态记为不可用（UNKNOWN）而非健康，挂载
 不可用期间 hold 节点、还原后随信号清零受控接纳（批次163修复，此前按 capacity-only
-缺口记 FAIL；probe_error 仍因缺故障挂载夹具而 live 延后）。只读以宿主 `/proc/1/mountinfo`
+缺口记 FAIL）。`probe_error` 的故障挂载夹具：存储探针的 loop + device-mapper 测试设备改载
+FAT16（`dm-create --fstype vfat`），`dm-retarget --target error` 先重新挂载再把表换成 `dm_mod`
+内建的 `error` 目标——挂载仍在（非 MOUNT_MISSING）、宿主表为 rw（非 READ_ONLY），而每次
+`statvfs` 都返回 EIO（FAT 在挂载后首次 `statfs` 时才从设备读 FAT 计数空簇，ext4 全在内存，
+对 dm-error 无感）→ PROBE_FAILED；`--target data` 还原，探针自身读数是有效性 oracle（未读到
+EIO 即 `INCONCLUSIVE`，缓存命中时从新挂载重试最多 3 次）。交换前先 sync，不向 error 表写入
+（写失败会记 `Buffer I/O error`，节点日志采集器 `log_rules.py` 的存储规则会把它判成
+QUARANTINE），因此节点日志采集器处于 active 时记 `NOT_RUN(FIXTURE_NOT_READY)`；缺 `vfat`
+模块时在 `KERNEL_MODULE_LOAD` 下加载并在清理时卸载，节点需有 `mkfs.vfat`（dosfstools）。
+三个不可用变体另核对 `filesystem_unavailable` 采样的 `failure_mode` 标签（有标签而不符即
+FAIL）。只读以宿主 `/proc/1/mountinfo`
 中承载该路径挂载的 per-mount/超级块 `ro` 为准，不取 collector 沙箱（`ProtectSystem=strict`
 只读绑定）自身的 `ST_RDONLY`；沙箱遮住的路径不上报（批次166）。释放文件/还原挂载后验证再
 受控解隔离。
@@ -172,6 +182,51 @@ inode耗尽、只读、必需挂载消失、EIO/EACCES分别验，不能用剩�
 确认collector有界返回且其他指标仍上报，VALIDATE_HOST不能用另一个挂载的健康代替。
 两个任务节点访问同一export时记录共同故障域，不把每节点都误作坏硬件。
 当前若未检测实际I/O或挂载消失，记录FAIL。还原export/连接后验证新采样、真实I/O和任务进度。
+
+本站实现（`general_live_shared.py`）。产品没有共享存储配置项：host collector 的
+`_shared_filesystems` 每个采样周期从自身 `/proc/self/mountinfo` 按文件系统类型
+（`nfs`/`nfs4`/`lustre`）发现共享挂载并做有界 `statvfs`（每挂载 5 s、每周期 15 s），超时或
+出错报 `shared_filesystem_unavailable`=1（CRITICAL RUN_DIAGNOSTICS），否则报 0 与
+`shared_filesystem_used_percent`（98% WARNING RUN_DIAGNOSTICS）。夹具因此**不**把测试 export
+追加进 `GPU_FAULT_FILESYSTEMS`——那会按本地盘规则（`filesystem_used_percent` 98% →
+QUARANTINE、MOUNT_MISSING）判定，把共享存储状况变成坏节点结论并掩盖 005 要揭示的缺口。
+测试 export 由 `shared_export_fixture.py` 提供：每个 export 一个 Pod
+（`gfrs-export-<digest>-<a|b>`，用户态 NFSv4 服务 NFS-Ganesha / VFS FSAL，导出一个 256 MiB 的
+内存 `emptyDir`——其 `sizeLimit` 即全部容量，`Root_Squash` + 1777 目录，`activeDeadlineSeconds`
+为集群侧 deadman，按 UID 前提删除，调度到客户端节点之外或由 `--export-node` 指定）加其
+`ganesha.conf` ConfigMap。客户端由 `probes/general_live_shared_probe.py` 在 PID 1 的挂载命名空间
+以 `vers=4.1,soft,timeo=100,retrans=2,actimeo=2` 挂到 `/mnt/gfrs-live/<digest>/shared`：
+deadman 与记录先于挂载，`systemd-run --on-active` deadman 级联 `umount`/`-f`/`-l`，有界
+`statvfs`、写/fsync/回读证明与填充读数都经 `nsenter` 在宿主命名空间执行。挂起 = 对 ganesha
+子进程 `SIGSTOP`（内核仍接受 TCP 而无应答，statvfs 超时），`SIGCONT` 以同一组文件句柄恢复、
+无需重挂（内核 nfsd 无法这样挂起，故用用户态服务）。判定只读产品记录：
+`stat_timeout`/`healthy_other_mount`/`recovery`（`shared_filesystem_unavailable`=1 →
+FREEZE_EVIDENCE、VALIDATE_HOST 在该指标上失败、无隔离/硬件步骤；挂起期间其他主机指标仍到达
+（≥2 个 batch 带 `memory_used_percent`），另一挂载保持 0 且不建链；恢复后信号清零、新
+`used_percent` 采样与真实写/fsync/回读）和 `capacity_full`（`shared_filesystem_used_percent`
+≥ 98 → 诊断链，不得 QUARANTINE，释放后低于 98）预期 PASS；`mount_disappears`
+（`_shared_filesystems` 不记忆已发现的挂载，消失即停止采样，从不报不可用）、`io_only_failure`
+（服务端 `chmod 000` export 根：statvfs 正常而 open/read/fsync EACCES，产品只用 statvfs 探测）、
+`shared_failure_domain`（两节点各自成独立 NODE_HEALTH incident，无记录把同一 export 关联为
+共同故障域）按产品缺口注册 `expected_outcome=FAIL`，产品补齐后自动转 PASS。全部变体需
+`--approve KERNEL_MODULE_LOAD`（缺 `nfsv4` 时加载并在清理时卸载）；`shared_failure_domain`
+标志 `X` 并要求 `--node-b`（EKS 的两个 GPU 节点同时作客户端，export 调度到两者之外）。
+站点前提：`--export-image` 或 `GPU_FAULT_GENERAL_LIVE_EXPORT_IMAGE` 指向带 `ganesha.nfsd` 与
+`/bin/sh` 的不可变摘要镜像；节点 AMI 有 `nfs-utils`（`mount.nfs4`）；节点到 Pod IP 的 TCP/2049
+放通（GPU 集群内 VPC CNI 的 Pod 共用节点 ENI 安全组，自引用规则通常已覆盖；CPU 集群需 VPC
+可达与显式规则）；kubelet 对内存 `emptyDir` 执行 `sizeLimit`（首个客户端 `statvfs` 校验容量，
+不符记 `NOT_RUN(FIXTURE_NOT_READY)`）。不起受管训练任务，“任务进度”不在本主机类别范围内。
+计划/执行形如：
+
+```bash
+run_general_live.py --site-profile <profile> --run-dir <run> \
+  --case GF-GENERAL-LIVE-005 --variant stat_timeout --fault-node <node> \
+  --export-image <image@sha256:...> --approve KERNEL_MODULE_LOAD --plan
+run_general_live.py --site-profile <profile> --run-dir <run> \
+  --case GF-GENERAL-LIVE-005 --variant shared_failure_domain --fault-node <node-a> \
+  --node-b <node-b> --export-image <image@sha256:...> --approve KERNEL_MODULE_LOAD \
+  --execute --confirm GENERALLIVE005_EXECUTE --maintenance-window-end <UTC>
+```
 
 ### GF-GENERAL-LIVE-006
 
@@ -509,7 +564,9 @@ SIGSTOP、节点日志采集器的 runtime 启用）、`probes/general_live_stor
 `probes/general_live_net_probe.py`（host-local veth/dummy 测试接口、丢包生成器、
 009 `tcp_only` 的测试 netns+netem TCP 夹具）、`probes/general_live_deps_probe.py`
 （单次运行的临时测试包：仅在缺失时用 dnf 安装经审查的包、加载 `sch_netem`，
-并只撤销本次运行装/载的内容）。采集单元清单的只读扩展复用
+并只撤销本次运行装/载的内容）、`probes/general_live_shared_probe.py`（005 的 NFSv4
+测试挂载：宿主命名空间 soft 挂载、有界 statvfs/I/O/填充读数、级联卸载与 deadman；服务端
+Pod 由 `shared_export_fixture.py` 提供）。采集单元清单的只读扩展复用
 `probes/collector_window_probe.py`（仅对 host collector 追加一个测试挂载到
 `GPU_FAULT_FILESYSTEMS`、或把测试接口追加到 `GPU_FAULT_REQUIRED_INTERFACES`）。
 
@@ -533,7 +590,8 @@ Node Agent ACTIVE、无未关闭 incident/工作流、必需采集通道新鲜�
 未过期的维护窗口。危险分支另需 `--approve` 令牌（绑进 `plan.json`）：
 `HOST_MEMORY_PRESSURE`（主机内存压力，以及 002 `cgroup_only` 的小容量自身 cgroup
 OOM）、`KERNEL_MODULE_LOAD`（加载 dm_delay/
-veth/dummy/sch_netem）、`ENABLE_NODE_LOG_COLLECTOR`（临时启用被禁用的节点日志
+veth/dummy/sch_netem，以及 004 `probe_error` 的 `vfat`、005 的 `nfsv4`；dm-error 目标内建于
+dm_mod，无需加载）、`ENABLE_NODE_LOG_COLLECTOR`（临时启用被禁用的节点日志
 采集器）、`WATCHER_NETWORK_ISOLATION`、`CONTROL_PLANE_RESTART`、
 `DECLARE_WARM_SPARE`（经 admin CLI 声明一台热备并 cordon，清理时释放/解除 cordon）、
 `SPARE_KUBELET_STOP`（停热备上的 kubelet 使其 NotReady，带宿主机自动重启定时器）；
@@ -704,6 +762,10 @@ IPC 命名空间，udev 在主机命名空间里找不到 Pod 的信号量，cre
   `memory_available_percent` finding、无硬件步骤、无 STOP/cordon/隔离、节点仍可调度；若节点
   日志采集器被启用而把 OOM 行判为 finding，只接受 RUN_DIAGNOSTICS 诊断（`log_rules.py`），
   任何 STOP 或隔离为 FAIL。
+- 005 全部七个变体（native）：自带的测试 NFSv4 export 夹具（`shared_export_fixture.py`
+  服务端 Pod + `probes/general_live_shared_probe.py` 客户端挂载），需
+  `KERNEL_MODULE_LOAD`；`mount_disappears`/`io_only_failure`/`shared_failure_domain` 按产品
+  缺口预期 FAIL，详见 GF-GENERAL-LIVE-005 节。
 - 007 `healthy`（observation：只读确认真实 SMART 判定健康且不产生存储 finding，
   作为失败变体的对照基线）。
 - 007 SMART 的回放变体 `health_failed`/`query_failed`/`scan_failed`/`malformed_json`/
@@ -769,14 +831,13 @@ IPC 命名空间，udev 在主机命名空间里找不到 Pod 的信号量，cre
 
 其余变体按映射文件留在分母并记 `NOT_RUN`，原因精确可查：
 
-- `FIXTURE_NOT_READY`：005 `stat_timeout`/`io_only_failure`。007/010/015 的命令/文件回放与
-  002/012 的 `/proc/meminfo`、`nvidia-smi`、`/proc/driver/nvidia` 读取回放都已在协调方集中
-  审查提供的共享原始源回放夹具（下文“共享主机原始源回放夹具”）上接线（见上及下文）。
-  005 `stat_timeout`/`io_only_failure`
-  不是文件/命令读取，不在其范围内。
-- `CAPABILITY_ABSENT`：005 的共享存储变体（本站无可扰动的独立 NFS/Lustre export）、
-  010 `non_efa`（本站只有 EFA RDMA 设备）、015 `healthy`（EC2 无 BMC；`unsupported_bmc`
-  本身就是这条能力记录的只读 observation）。
+- `FIXTURE_NOT_READY`：本节已无此类变体。007/010/015 的命令/文件回放与 002/012 的
+  `/proc/meminfo`、`nvidia-smi`、`/proc/driver/nvidia` 读取回放都已在协调方集中审查提供的
+  共享原始源回放夹具（下文“共享主机原始源回放夹具”）上接线（见上及下文）；005 不走回放：
+  其七个变体都在自带的测试 NFSv4 export 夹具上 native 执行（见 GF-GENERAL-LIVE-005 节；
+  三个按产品缺口预期 FAIL）。
+- `CAPABILITY_ABSENT`：010 `non_efa`（本站只有 EFA RDMA 设备）、015 `healthy`（EC2 无 BMC；
+  `unsupported_bmc` 本身就是这条能力记录的只读 observation）。
 
 已在共享回放器上接线的 002/012 变体（均需 `--approve HOST_SOURCE_REPLAY`，两个集群
 都运行；证据 `proof_scope: live-replay`，判定只读产品自身记录，包装器日志

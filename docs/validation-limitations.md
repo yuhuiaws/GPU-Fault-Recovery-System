@@ -1318,14 +1318,15 @@ once the pair reads again the still-stalled job's ZERO_WARNING must come no
 earlier than the warning threshold after the restore. `non_efa` stays
 CAPABILITY_ABSENT (no IB-only RDMA device on this site).
 
-The rest stay `NOT_RUN`: `FIXTURE_NOT_READY` only for the 005
-`stat_timeout`/`io_only_failure` variants (not a file or command reading; the
-007/010/015 command replays and the 002/012 `/proc/meminfo` / `nvidia-smi` /
-`/proc/driver/nvidia` read replays are all wired on the shared raw-source
-replay described below), never
+The rest stay `NOT_RUN` for a missing capability or vendor lab only; no
+`FIXTURE_NOT_READY` is left in these categories (the 007/010/015 command
+replays and the 002/012 `/proc/meminfo` / `nvidia-smi` / `/proc/driver/nvidia`
+read replays are all wired on the shared raw-source replay described below,
+which replaces a reading only inside the one host-collector unit's private
+environment, and 005 runs natively on the test export fixture), never
 replacing a host binary or a global mount; `CAPABILITY_ABSENT` where the site
-genuinely lacks the capability (no independent NFS/Lustre export, no non-EFA
-RDMA device, no BMC on EC2 for 015 `healthy`); and `VENDOR_LAB_ONLY` for the
+genuinely lacks the capability (no non-EFA RDMA device, no BMC on EC2 for 015
+`healthy`); and `VENDOR_LAB_ONLY` for the
 012 variants that need a real GPU off the bus and an approved provider reboot
 (this lane never unbinds or removes a real GPU). The 012 read paths and the 002
 variants are wired on that replay: `single_sample` (one real UUID dropped from
@@ -1353,7 +1354,53 @@ never zero drives), the EFA `ethtool -S` deltas reported only from real readings
 `counter_reset`, and an NVML failure with an unreadable `/proc/driver/nvidia/gpus`
 being `INVENTORY_UNAVAILABLE` rather than zero GPUs by 012 `proc_unreadable`; an
 unopenable drive and a hung drive query stay software-tested.
-statvfs-OK-but-I/O-fails shared storage remains open.
+
+005 shared storage no longer waits for a site export: `general_live_shared.py`
+brings a disposable test export (`shared_export_fixture.py`: one Pod per export
+running a userspace NFSv4 server, NFS-Ganesha over a 256 MiB memory-backed
+`emptyDir` whose `sizeLimit` is the whole capacity, `activeDeadlineSeconds` as
+the cluster-side deadman, deleted by UID precondition) and mounts it `soft` on
+the client node in PID 1's mount namespace through
+`probes/general_live_shared_probe.py` (record and `systemd-run --on-active`
+deadman before the mount, `umount`/`-f`/`-l` cascade, bounded `statvfs` and
+write/fsync/read-back readings in the host namespace). The product has no
+shared-filesystem setting -- the host collector discovers `nfs`/`nfs4`/`lustre`
+mounts by type from its own mount table -- so the export is deliberately not
+added to `GPU_FAULT_FILESYSTEMS` (that would grade it under the local-disk
+QUARANTINE/MOUNT_MISSING rules). A hang is `SIGSTOP` on the ganesha child
+(TCP still accepted, nothing answered), recovery `SIGCONT` with the same file
+handles. `stat_timeout`, `capacity_full`, `healthy_other_mount` and `recovery`
+expect PASS (diagnostic-only chain on `shared_filesystem_unavailable` /
+`shared_filesystem_used_percent`, other host metrics still delivered, the
+healthy second mount never stands in, fresh I/O after the resume); three are
+registered as expected FAILs that name their product gap and flip to PASS once
+the product records what the spec asks: `mount_disappears` (the collector
+rediscovers shared mounts every tick and keeps no memory of one that vanished),
+`io_only_failure` (statvfs-only probing; a server-side `chmod 000` denies every
+read while statvfs answers) and `shared_failure_domain` (two nodes on one hung
+export mint two unrelated node incidents; nothing names the common failure
+domain). All need `KERNEL_MODULE_LOAD` (a missing `nfsv4` is loaded and
+unloaded), `shared_failure_domain` holds both EKS lane locks (`X`) and needs
+`--node-b`. Live prerequisites: an immutable-digest server image shipping
+`ganesha.nfsd` and `/bin/sh` (`--export-image` /
+`GPU_FAULT_GENERAL_LIVE_EXPORT_IMAGE`), `nfs-utils` on the node AMI, TCP/2049
+from the node to the Pod IP, and a kubelet that honours memory `emptyDir`
+`sizeLimit` (the first client `statvfs` verifies the capacity). These are
+fakes-based module tests until the live run; the fixture proves the processing
+chain on a real NFS mount, not a production file server's failure modes.
+
+004 `probe_error` has its faulting mount: the storage probe's loop +
+device-mapper device carrying FAT16 (`dm-create --fstype vfat`) whose table
+`dm-retarget --target error` swaps to the `error` target built into `dm_mod`
+right after a fresh mount, so the mount stays, reads read-write in the host
+table, and every `statvfs` fails EIO (FAT counts its free clusters from the
+device at the first `statfs` after a mount; ext4 answers from memory and never
+notices dm-error); `--target data` restores it and the probe's own reading is
+the oracle (no EIO is `INCONCLUSIVE`). The swap is made with nothing dirty so
+the error table is never written -- a failed write would log `Buffer I/O
+error`, which the node log collector's storage rule grades QUARANTINE -- and
+the variant refuses to run while that collector is active. It needs
+`mkfs.vfat` on the node and `KERNEL_MODULE_LOAD` for a missing `vfat`.
 
 ## GF-GENERAL-LIVE 029 store-level restart-budget variants
 
