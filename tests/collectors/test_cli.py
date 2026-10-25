@@ -185,10 +185,26 @@ def test_host_defaults(monkeypatch: pytest.MonkeyPatch, node_environment: Path) 
     assert collector.interval_seconds == 15.0
     assert collector.filesystems == ["/", "/var", "/tmp"]
     assert collector.required_interfaces == set()
+    # The installer writes no GPU_FAULT_PCI_DEVICES_ROOT: every production
+    # node reads the real bus, so PCI_DEVICE_MISSING is reachable live.
+    assert collector.pci_devices_root == Path("/sys/bus/pci/devices")
     assert collector.node_instance_type is None
     assert collector.expected_gpu_count is None
     assert collector.expected_efa_device_count is None
     assert collector.inventory_mismatch_consecutive_samples == 2
+
+
+def test_host_empty_pci_devices_root_reads_the_real_bus(
+    monkeypatch: pytest.MonkeyPatch, node_environment: Path
+) -> None:
+    """An empty override is the default, not "no PCI evidence": without the
+    bus a missing EFA function would read as an unbound driver."""
+
+    monkeypatch.setenv("GPU_FAULT_PCI_DEVICES_ROOT", "")
+
+    collector = _run_cli(monkeypatch, HostTelemetryCollector, ["host"])
+
+    assert collector.pci_devices_root == Path("/sys/bus/pci/devices")
 
 
 def test_logs(monkeypatch: pytest.MonkeyPatch, node_environment: Path) -> None:

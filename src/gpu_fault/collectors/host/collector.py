@@ -45,6 +45,13 @@ from gpu_fault.host_health import (
 from gpu_fault.models import WorkloadState
 
 LOGGER = logging.getLogger(__name__)
+#: The real RDMA tree and the real PCI bus. Production names neither: the
+#: installer writes no ``GPU_FAULT_PCI_DEVICES_ROOT``, so the EFA inventory's
+#: PCI evidence (``PCI_DEVICE_MISSING`` against ``DRIVER_UNBOUND``) comes from
+#: this bus on every node. The host collector unit (``ProtectSystem=strict``,
+#: no ``InaccessiblePaths``) leaves ``/sys`` readable.
+DEFAULT_INFINIBAND_ROOT = "/sys/class/infiniband"
+DEFAULT_PCI_DEVICES_ROOT = "/sys/bus/pci/devices"
 #: The per-GPU samples the low CPU/GPU utilisation rules grade; each GPU's own
 #: crossing of the threshold is an edge (``sustained:<metric>:<device>``).
 LOW_UTILIZATION_METRICS = ("host_gpu_utilization_percent", "training_rank_cpu_percent")
@@ -117,7 +124,7 @@ class HostTelemetryCollector(
         interval_seconds: float = 15,
         filesystems: list[str] | None = None,
         required_interfaces: list[str] | None = None,
-        infiniband_root: str = "/sys/class/infiniband",
+        infiniband_root: str = DEFAULT_INFINIBAND_ROOT,
         net_class_root: str = "/sys/class/net",
         proc_root: str = "/proc",
         pci_devices_root: str | None = None,
@@ -152,12 +159,17 @@ class HostTelemetryCollector(
         self.infiniband_root = Path(infiniband_root)
         self.net_class_root = Path(net_class_root)
         self.proc_root = Path(proc_root)
+        # The real RDMA tree reads the real bus. Only a *relocated* RDMA tree
+        # (a test's private sysfs) reads no PCI evidence unless it is given a
+        # matching PCI tree: against the host's own EFA-less bus every one of
+        # its devices would count as a missing function. ``build_from_environment``
+        # always names the root, so production never depends on this fallback.
         self.pci_devices_root = (
             Path(pci_devices_root)
             if pci_devices_root is not None
             else (
-                Path("/sys/bus/pci/devices")
-                if infiniband_root == "/sys/class/infiniband"
+                Path(DEFAULT_PCI_DEVICES_ROOT)
+                if infiniband_root == DEFAULT_INFINIBAND_ROOT
                 else None
             )
         )
@@ -816,7 +828,14 @@ def build_from_environment(
             for item in os.getenv("GPU_FAULT_REQUIRED_INTERFACES", "").split(",")
             if item
         ],
-        pci_devices_root=(os.getenv("GPU_FAULT_PCI_DEVICES_ROOT") or None),
+        # The real bus unless an override names another tree. An empty value
+        # is the default as well: there is no "no PCI evidence" mode on a
+        # production node, where a missing EFA function would then read as an
+        # unbound driver and be answered with bind attempts instead of a
+        # reboot. An unreadable or empty tree is a collection error (UNKNOWN).
+        pci_devices_root=(
+            os.getenv("GPU_FAULT_PCI_DEVICES_ROOT") or DEFAULT_PCI_DEVICES_ROOT
+        ),
         node_instance_type=(os.getenv("GPU_FAULT_NODE_INSTANCE_TYPE") or None),
         expected_gpu_count=(int(expected_gpu_count) if expected_gpu_count else None),
         expected_efa_device_count=(

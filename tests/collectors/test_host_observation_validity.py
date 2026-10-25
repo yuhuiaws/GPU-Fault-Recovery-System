@@ -174,11 +174,21 @@ def test_ambiguous_driver_identity_is_not_silently_excluded(tmp_path):
         is_efa_device(tmp_path)
 
 
-@pytest.mark.parametrize("damage", ["absent-root", "no-ports", "invalid-state"])
+@pytest.mark.parametrize(
+    "damage", ["absent-root", "empty-pci-tree", "no-ports", "invalid-state"]
+)
 def test_inventory_requires_observable_port_state(tmp_path, damage):
     root = tmp_path / "rdma"
     pci = tmp_path / "pci"
     pci.mkdir()
+    if damage == "empty-pci-tree":
+        # A bus lists its bridges at least: an empty tree is a mis-pointed or
+        # hidden PCI root, never a bus with zero EFA functions on it.
+        with pytest.raises(ValueError, match="lists no PCI device"):
+            efa_inventory_counts(root, pci)
+        return
+    support.write_file(pci / "0000:00:00.0/vendor", "0x8086\n")
+    support.write_file(pci / "0000:00:00.0/device", "0x1237\n")
     if damage == "absent-root":
         assert efa_inventory_counts(root, pci) == (0, 0, 0)
         return

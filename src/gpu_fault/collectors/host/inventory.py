@@ -334,7 +334,18 @@ class HostInventoryMixin:
                 raise CollectorError(
                     f"EFA inventory observation unavailable: {exc}"
                 ) from exc
-            if pci_discovered is None:
+            # The driver cannot hold an RDMA device whose PCI function is not
+            # on the bus, so a listing below the bound count is an incomplete
+            # or mis-pointed listing (``GPU_FAULT_PCI_DEVICES_ROOT`` at the
+            # wrong tree, a sandbox hiding part of sysfs), not a lost function.
+            # PCI_DEVICE_MISSING reboots the node, so it needs consistent
+            # evidence; an inconsistent listing is graded like no listing, by
+            # the driver's and the ports' own counts, and stays visible as read.
+            pci_evidence = "LISTED"
+            if pci_discovered is None or pci_discovered < driver_bound:
+                pci_evidence = (
+                    "UNAVAILABLE" if pci_discovered is None else "INCONSISTENT"
+                )
                 failure_mode = (
                     "INVENTORY_UNAVAILABLE"
                     if driver_bound < self.expected_efa_device_count
@@ -365,7 +376,10 @@ class HostInventoryMixin:
                     inventory_details={
                         "driver_bound_count": driver_bound,
                     },
-                    extra_labels={"failure_mode": failure_mode},
+                    extra_labels={
+                        "failure_mode": failure_mode,
+                        "pci_evidence": pci_evidence,
+                    },
                 )
             )
         return samples

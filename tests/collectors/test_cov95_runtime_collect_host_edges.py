@@ -28,7 +28,19 @@ def test_explicit_inventory_counts_override_only_their_own_instance_default(
     assert host_case.commands == []
 
 
-def add_efa(case, index, *, active=True, pci=True, driver=True):
+def add_pci_bus(case):
+    """The bus is never only EFA: a host bridge keeps the listing realistic."""
+
+    support.write_file(case.roots.pci / "0000:00:00.0" / "vendor", "0x8086")
+    support.write_file(case.roots.pci / "0000:00:00.0" / "device", "0x1237")
+
+
+def add_efa(case, index, *, active=True, pci=True, driver=True, rdma=True):
+    if pci:
+        support.write_file(case.roots.pci / str(index) / "vendor", "0x1d0f")
+        support.write_file(case.roots.pci / str(index) / "device", "0xefa0")
+    if not rdma:
+        return None
     device = case.roots.rdma / f"efa{index}"
     if driver:
         target = case.tmp_path / "drivers/efa"
@@ -41,22 +53,32 @@ def add_efa(case, index, *, active=True, pci=True, driver=True):
     port.mkdir(parents=True)
     (port / "state").write_text("4: ACTIVE" if active else "1: DOWN")
     (port / "phys_state").write_text("5: LinkUp" if active else "3: Disabled")
-    if pci:
-        support.write_file(case.roots.pci / str(index) / "vendor", "0x1d0f")
-        support.write_file(case.roots.pci / str(index) / "device", "0xefa0")
     return port
 
 
 @pytest.mark.parametrize(
-    "mode", ["healthy", "inactive", "unbound", "missing-pci", "excess", "unconfigured"]
+    "mode",
+    [
+        "healthy",
+        "inactive",
+        "unbound",
+        "missing-pci",
+        "pci-below-bound",
+        "excess",
+        "unconfigured",
+    ],
 )
 def test_efa_inventory_keeps_failure_modes_distinct(host_case, mode):
+    add_pci_bus(host_case)
+    # A function that left the bus took its RDMA device with it; a bus that
+    # lists fewer functions than the driver has bound is a bad listing.
     add_efa(
         host_case,
         0,
         active=mode != "inactive",
-        pci=mode != "missing-pci",
+        pci=mode not in {"missing-pci", "pci-below-bound"},
         driver=mode != "unbound",
+        rdma=mode != "missing-pci",
     )
     if mode == "excess":
         add_efa(host_case, 1)
@@ -75,12 +97,36 @@ def test_efa_inventory_keeps_failure_modes_distinct(host_case, mode):
         "inactive": "LINK_INACTIVE",
         "unbound": "DRIVER_UNBOUND",
         "missing-pci": "PCI_DEVICE_MISSING",
+        "pci-below-bound": "HEALTHY",
         "excess": "EXCESS_DEVICE",
     }[mode]
-    assert samples["efa_inventory_active_count"].labels["failure_mode"] == expected
-    assert samples["efa_inventory_mismatch"].value == int(
-        mode in {"inactive", "unbound", "excess"}
+    labels = samples["efa_inventory_active_count"].labels
+    assert labels["failure_mode"] == expected
+    assert labels["pci_evidence"] == (
+        "INCONSISTENT" if mode == "pci-below-bound" else "LISTED"
     )
+    assert samples["efa_inventory_mismatch"].value == int(
+        mode in {"inactive", "unbound", "excess", "missing-pci"}
+    )
+    assert batch.collection_errors == []
+
+
+def test_efa_inventory_empty_pci_bus_listing_is_unavailable(host_case):
+    """An empty ``/sys/bus/pci/devices`` is not a bus with no EFA functions on
+    it -- every host lists a bridge at least -- so the tick reports a
+    collection error instead of PCI_DEVICE_MISSING."""
+
+    add_efa(host_case, 0, pci=False)
+    collector = host_case.build(
+        "_efa_inventory",
+        expected_efa_device_count=1,
+        inventory_mismatch_consecutive_samples=1,
+    )
+    batch = collector.collect_once()
+    assert batch.samples == []
+    assert len(batch.collection_errors) == 1, batch.collection_errors
+    assert "EFA inventory observation unavailable" in batch.collection_errors[0]
+    assert "lists no PCI device" in batch.collection_errors[0]
 
 
 def test_unanswerable_driver_query_retains_context_without_claiming_missing_gpus(

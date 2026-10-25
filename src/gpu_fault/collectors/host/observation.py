@@ -52,6 +52,22 @@ def is_efa_device(device: Path) -> bool:
     return drivers[0] == "efa"
 
 
+def efa_pci_function_count(pci_devices_root: Path) -> int:
+    """EFA functions on the bus, counted by PCI vendor/device id, not netdev.
+
+    An unlistable root (missing, a file, hidden by the unit's sandbox) raises
+    the ``OSError``; so does a listing with no device on it at all, as a
+    ``ValueError``: a PCI bus always carries at least its bridges, so an empty
+    tree is a mis-pointed or hidden root, not a bus with no EFA functions.
+    Either is "no reading" to the caller, never zero functions.
+    """
+
+    functions = list(pci_devices_root.iterdir())
+    if not functions:
+        raise ValueError(f"PCI device tree lists no PCI device: {pci_devices_root}")
+    return sum(is_efa_pci_device(function) for function in functions)
+
+
 def efa_inventory_counts(
     infiniband_root: Path, pci_devices_root: Path | None
 ) -> tuple[int | None, int, int]:
@@ -61,7 +77,7 @@ def efa_inventory_counts(
         rdma_devices = []
     devices = [device for device in rdma_devices if is_efa_device(device)]
     pci_count = (
-        sum(is_efa_pci_device(device) for device in pci_devices_root.iterdir())
+        efa_pci_function_count(pci_devices_root)
         if pci_devices_root is not None
         else None
     )

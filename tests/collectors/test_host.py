@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import shutil
+from pathlib import Path
+
+from gpu_fault.collectors.host.collector import DEFAULT_PCI_DEVICES_ROOT
 from gpu_fault.collectors.host.observation import HostObservationError
 
 from ._support import (
@@ -451,6 +455,191 @@ def test_efa_inventory_distinguishes_unbound_driver_from_missing_pci(tmp_path) -
     assert by_name["efa_inventory_active_count"].value == 1
     assert by_name["efa_inventory_mismatch"].value == 1
     assert by_name["efa_inventory_mismatch"].labels["failure_mode"] == "DRIVER_UNBOUND"
+
+
+def _efa_pci_function(pci_root, index: int, device_id: str = "0xefa2") -> None:
+    """One EFA PCI function as ``/sys/bus/pci/devices`` lists it (0x1d0f:0xefa*)."""
+
+    function = pci_root / f"0000:5{index}:00.0"
+    function.mkdir(parents=True)
+    (function / "vendor").write_text("0x1d0f\n")
+    (function / "device").write_text(f"{device_id}\n")
+
+
+def _non_efa_pci_function(pci_root) -> None:
+    """A PCI bus always lists more than EFA: the host bridge, ENA, NVMe, GPUs."""
+
+    function = pci_root / "0000:00:00.0"
+    function.mkdir(parents=True)
+    (function / "vendor").write_text("0x8086\n")
+    (function / "device").write_text("0x1237\n")
+
+
+def _efa_rdma_device(infiniband_root, index: int, *, active: bool = True) -> None:
+    """One driver-bound ``rdmap*`` device with a single port."""
+
+    port = infiniband_root / f"rdmap{index}s0" / "ports" / "1"
+    port.mkdir(parents=True)
+    device = port.parents[1] / "device"
+    device.mkdir()
+    (device / "uevent").write_text("DRIVER=efa\n")
+    (port / "state").write_text("4: ACTIVE\n" if active else "1: DOWN\n")
+    (port / "phys_state").write_text("5: LinkUp\n" if active else "3: Disabled\n")
+
+
+def _efa_inventory_collector(tmp_path, *, expected: int, consecutive: int, **kwargs):
+    return HostTelemetryCollector(
+        RecordingSink(),
+        context(),
+        node_id="worker-1",
+        expected_efa_device_count=expected,
+        inventory_mismatch_consecutive_samples=consecutive,
+        infiniband_root=str(tmp_path / "infiniband"),
+        pci_devices_root=str(tmp_path / "pci"),
+        **kwargs,
+    )
+
+
+def test_efa_inventory_dropped_function_confirms_missing_on_the_second_sample(
+    tmp_path,
+) -> None:
+    """A function that leaves the bus takes its RDMA device with it; the
+    verdict is PCI_DEVICE_MISSING, and only after the configured two samples."""
+
+    pci_root = tmp_path / "pci"
+    infiniband_root = tmp_path / "infiniband"
+    _non_efa_pci_function(pci_root)
+    for index in range(2):
+        _efa_pci_function(pci_root, index)
+        _efa_rdma_device(infiniband_root, index)
+    collector = _efa_inventory_collector(tmp_path, expected=2, consecutive=2)
+
+    healthy = {item.name: item for item in collector._efa_inventory(NOW)}
+    assert healthy["efa_inventory_mismatch"].value == 0
+    assert healthy["efa_inventory_mismatch"].labels["failure_mode"] == "HEALTHY"
+    assert healthy["efa_inventory_mismatch"].labels["pci_evidence"] == "LISTED"
+
+    shutil.rmtree(pci_root / "0000:51:00.0")
+    shutil.rmtree(infiniband_root / "rdmap1s0")
+
+    first = {
+        item.name: item
+        for item in collector._efa_inventory(NOW + timedelta(seconds=15))
+    }
+    assert first["efa_inventory_mismatch"].value == 0, "one sample never confirms"
+    assert first["efa_inventory_mismatch"].labels["failure_mode"] == (
+        "PCI_DEVICE_MISSING"
+    )
+    assert first["efa_inventory_mismatch"].labels["consecutive_mismatch_samples"] == (
+        "1"
+    )
+
+    second = {
+        item.name: item
+        for item in collector._efa_inventory(NOW + timedelta(seconds=30))
+    }
+    assert second["efa_inventory_mismatch"].value == 1
+    assert second["efa_inventory_mismatch"].labels["failure_mode"] == (
+        "PCI_DEVICE_MISSING"
+    )
+    assert second["efa_inventory_mismatch"].labels["pci_evidence"] == "LISTED"
+    assert second["efa_inventory_discovered_count"].value == 1
+    assert second["efa_inventory_driver_bound_count"].value == 1
+    assert second["efa_inventory_missing_count"].value == 1
+
+
+@pytest.mark.parametrize(
+    ("pci_functions", "bound", "active", "failure_mode", "mismatch"),
+    [
+        # Two bound, both ACTIVE, one PCI function listed: the bus cannot
+        # hold fewer functions than the driver has bound, so the listing is
+        # the odd reading out and the node is healthy by its ports.
+        (1, 2, 2, "HEALTHY", 0),
+        # Same listing, one port DOWN: diagnose the link, do not reboot.
+        (1, 2, 1, "LINK_INACTIVE", 1),
+        # No EFA function listed at all while the driver has one bound: the
+        # driver shortfall cannot be classified without PCI evidence.
+        (0, 1, 1, "INVENTORY_UNAVAILABLE", 1),
+    ],
+)
+def test_efa_inventory_pci_listing_below_bound_count_is_not_a_missing_function(
+    tmp_path, pci_functions, bound, active, failure_mode, mismatch
+) -> None:
+    """A PCI listing below the driver's own bound count is an incomplete or
+    mis-pointed listing (``GPU_FAULT_PCI_DEVICES_ROOT`` at the wrong tree),
+    never a lost function: PCI_DEVICE_MISSING would reboot the node."""
+
+    pci_root = tmp_path / "pci"
+    infiniband_root = tmp_path / "infiniband"
+    _non_efa_pci_function(pci_root)
+    for index in range(pci_functions):
+        _efa_pci_function(pci_root, index)
+    for index in range(bound):
+        _efa_rdma_device(infiniband_root, index, active=index < active)
+    collector = _efa_inventory_collector(tmp_path, expected=2, consecutive=1)
+
+    by_name = {item.name: item for item in collector._efa_inventory(NOW)}
+
+    labels = by_name["efa_inventory_mismatch"].labels
+    assert labels["failure_mode"] == failure_mode
+    assert labels["failure_mode"] != "PCI_DEVICE_MISSING"
+    assert labels["pci_evidence"] == "INCONSISTENT"
+    assert by_name["efa_inventory_mismatch"].value == mismatch
+    # The listing stays visible as read, next to the count it contradicts.
+    assert by_name["efa_inventory_discovered_count"].value == pci_functions
+    assert labels["discovered_count"] == str(pci_functions)
+    assert by_name["efa_inventory_driver_bound_count"].value == bound
+
+
+@pytest.mark.parametrize("shape", ["missing", "file", "empty"])
+def test_efa_inventory_unreadable_or_empty_pci_root_is_unavailable(
+    tmp_path, shape
+) -> None:
+    """A PCI root that cannot be listed, or lists no device at all, is no
+    reading: the tick reports a collection error (UNKNOWN), not zero EFA
+    functions, and the mismatch streak starts over."""
+
+    pci_root = tmp_path / "pci"
+    infiniband_root = tmp_path / "infiniband"
+    for index in range(2):
+        _efa_rdma_device(infiniband_root, index)
+    if shape == "file":
+        pci_root.write_text("not a directory\n")
+    elif shape == "empty":
+        pci_root.mkdir()
+    collector = _efa_inventory_collector(tmp_path, expected=2, consecutive=1)
+    collector._inventory_mismatch_counts["efa"] = 1
+
+    with pytest.raises(CollectorError, match="EFA inventory observation unavailable"):
+        collector._efa_inventory(NOW)
+
+    assert collector._inventory_mismatch_counts["efa"] == 0
+    assert collector._partial_samples == []
+
+
+def test_pci_devices_root_defaults_to_the_real_bus_with_the_real_rdma_tree(
+    tmp_path,
+) -> None:
+    """Production never names the roots: the real RDMA tree reads the real PCI
+    bus. A relocated RDMA tree (a test's private sysfs) reads no PCI evidence
+    unless given a matching PCI tree, so the test host's own EFA-less bus is
+    never counted as missing functions."""
+
+    assert DEFAULT_PCI_DEVICES_ROOT == "/sys/bus/pci/devices"
+    production = HostTelemetryCollector(RecordingSink(), context(), node_id="w")
+    assert production.pci_devices_root == Path(DEFAULT_PCI_DEVICES_ROOT)
+    relocated = HostTelemetryCollector(
+        RecordingSink(), context(), node_id="w", infiniband_root=str(tmp_path)
+    )
+    assert relocated.pci_devices_root is None
+    explicit = HostTelemetryCollector(
+        RecordingSink(),
+        context(),
+        node_id="w",
+        infiniband_root=str(tmp_path),
+        pci_devices_root=str(tmp_path / "pci"),
+    )
+    assert explicit.pci_devices_root == tmp_path / "pci"
 
 
 def test_efa_inventory_ignores_non_efa_rdma_devices(tmp_path) -> None:
