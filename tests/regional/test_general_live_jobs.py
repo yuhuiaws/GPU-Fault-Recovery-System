@@ -249,8 +249,8 @@ def test_main_deferred_execute_records_not_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runner = _patch_main(monkeypatch)
-    # invalid_delta is implemented now (lane K); 004 probe_error is still a
-    # deferred live-replay variant, so --execute records NOT_RUN without acting.
+    # invalid_delta and 004 probe_error are implemented now; 008 bond_vf stays
+    # CAPABILITY_ABSENT on this site, so --execute records NOT_RUN without acting.
     kc = tmp_path / "kc"
     kc.write_text("apiVersion: v1\n")
     monkeypatch.setattr(
@@ -260,9 +260,9 @@ def test_main_deferred_execute_records_not_run(
             "--run-dir",
             str(tmp_path / "run"),
             "--case",
-            "GF-GENERAL-LIVE-004",
+            "GF-GENERAL-LIVE-008",
             "--variant",
-            "probe_error",
+            "bond_vf",
             "--cpu-kubeconfig",
             str(kc),
             "--gpu-kubeconfig",
@@ -279,7 +279,7 @@ def test_main_deferred_execute_records_not_run(
             "a@sha256:" + "0" * 64,
             "--execute",
             "--confirm",
-            "GENERALLIVE004_EXECUTE",
+            "GENERALLIVE008_EXECUTE",
             "--maintenance-window-end",
             "2026-11-07T00:00:00Z",
         ],
@@ -289,8 +289,8 @@ def test_main_deferred_execute_records_not_run(
         tmp_path
         / "run"
         / "cases"
-        / "GF-GENERAL-LIVE-004.probe_error"
-        / "GF-GENERAL-LIVE-004.probe_error.json"
+        / "GF-GENERAL-LIVE-008.bond_vf"
+        / "GF-GENERAL-LIVE-008.bond_vf.json"
     )
     assert evidence.is_file(), "evidence.is_file()"
     import json

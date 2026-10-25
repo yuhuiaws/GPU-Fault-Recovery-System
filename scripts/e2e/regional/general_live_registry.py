@@ -63,7 +63,9 @@ APPROVALS: dict[str, str] = {
     ),
     "KERNEL_MODULE_LOAD": (
         "load a kernel module the node does not have loaded (dm_delay, veth, "
-        "dummy, sch_netem); unloaded again in cleanup"
+        "dummy, sch_netem, vfat for the 004 probe_error FAT16 carrier, nfsv4 for "
+        "the 005 test export mount; the dm-error target is built into dm_mod); "
+        "unloaded again in cleanup"
     ),
     "ENABLE_NODE_LOG_COLLECTOR": (
         "runtime-enable (/run only) and start the installed but disabled node "

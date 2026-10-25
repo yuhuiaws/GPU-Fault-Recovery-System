@@ -120,8 +120,19 @@ TOOLS = (
     "nsenter",
     "dnf",
     "rpm",
+    "mkfs.vfat",
+    "mount.nfs4",
 )
-MODULES = ("dm_mod", "dm_delay", "loop", "veth", "dummy", "sch_netem", "nfsv4")
+MODULES = (
+    "dm_mod",
+    "dm_delay",
+    "loop",
+    "veth",
+    "dummy",
+    "sch_netem",
+    "nfsv4",
+    "vfat",
+)
 #: The exporter process a pause may stop: the dcgm-exporter binary of the
 #: product's exporter (DaemonSet Pod or systemd container), never the host
 #: engine.

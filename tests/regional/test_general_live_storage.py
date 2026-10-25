@@ -23,7 +23,7 @@ SPECS = {spec.variant: spec for spec in storage.VARIANTS}
 NODE = "ip-10-0-43-5.us-west-2.compute.internal"
 
 
-def survey(**modules: bool) -> dict[str, Any]:
+def survey(log_collector: str = "inactive", **modules: bool) -> dict[str, Any]:
     return {
         "cpu_count": 8,
         "tools": {
@@ -31,6 +31,7 @@ def survey(**modules: bool) -> dict[str, Any]:
             for name in (
                 "losetup",
                 "mkfs.ext4",
+                "mkfs.vfat",
                 "mount",
                 "fallocate",
                 "dmsetup",
@@ -43,7 +44,9 @@ def survey(**modules: bool) -> dict[str, Any]:
         "modules": {
             "dm_mod": {"loaded": True, "available": True},
             "dm_delay": {"loaded": modules.get("dm_delay", True), "available": True},
+            "vfat": {"loaded": modules.get("vfat", True), "available": True},
         },
+        "units": {storage.LOG_COLLECTOR_UNIT: {"ActiveState": log_collector}},
         "backing": [
             {
                 "root": "/var/lib/gpu-fault-acceptance",
@@ -56,6 +59,20 @@ def survey(**modules: bool) -> dict[str, Any]:
             "GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS": "300",
         },
         "residue": {"units": [], "paused_units": {}, "paused_processes": {}},
+    }
+
+
+def retarget_answer(arguments: tuple[str, ...]) -> dict[str, Any]:
+    """``dm-retarget``: EIO on the error table, a healthy reading on the data one."""
+
+    error = "error" in arguments
+    return {
+        "name": "err",
+        "target": "error" if error else "data",
+        "attempts": 1,
+        "mounted_on_host": True,
+        "faulted": error,
+        "statvfs": {"error": "OSError: 5"} if error else {"used_percent": 1.0},
     }
 
 
@@ -86,6 +103,7 @@ def storage_probe(**overrides: Any) -> FakeProbe:
         "dm-suspend": {"suspended": "gfrs-x-io"},
         "dm-resume": {"resumed": "gfrs-x-io"},
         "dm-recreate": {"device_before": "dm-7", "device_after": "dm-8"},
+        "dm-retarget": retarget_answer,
         "dm-destroy": {"destroyed": True},
         "io-start": {"unit": "gfrs-x-io-io"},
         "io-stop": {"stopped": "gfrs-x-io-io"},
@@ -211,7 +229,8 @@ def test_below_threshold_passes_without_quarantine(tmp_path: Path) -> None:
     assert result["verdict"] == "PASS", result["errors"]
 
 
-def unavailable_activity(mount: str) -> dict[str, Any]:
+def unavailable_activity(mount: str, mode: str | None = None) -> dict[str, Any]:
+    labels = {"failure_mode": mode} if mode else {}
     inc = incident(
         "inc-fs",
         "filesystem_unavailable",
@@ -237,9 +256,22 @@ def unavailable_activity(mount: str) -> dict[str, Any]:
         "incidents": [inc],
         "workflows": [wf],
         "batches": [
-            host_batch(
-                "2026-10-24T00:02:00+00:00", "filesystem_unavailable", 1.0, device=mount
-            )
+            {
+                **host_batch(
+                    "2026-10-24T00:02:00+00:00",
+                    "filesystem_unavailable",
+                    1.0,
+                    device=mount,
+                ),
+                "samples": [
+                    {
+                        "name": "filesystem_unavailable",
+                        "device": mount,
+                        "value": 1.0,
+                        "labels": labels,
+                    }
+                ],
+            }
         ]
         + [
             host_batch(
@@ -628,7 +660,154 @@ def test_dm_io_load_runs_natively_with_or_without_a_loaded_dm_delay(
     )
 
 
-def test_probe_error_is_deferred() -> None:
-    assert SPECS["probe_error"].deferred.startswith("FIXTURE_NOT_READY"), (
-        "SPECS['probe_error'].deferred.startswith('FIXTURE_NOT_READY')"
+# --------------------------------------------------------------------------- #
+# 004 probe_error: the FAT16 dm device and its error-table swap
+# --------------------------------------------------------------------------- #
+ERR_MOUNT = "/mnt"  # the scripted dm-status mountpoint
+
+
+def probe_error_context(
+    tmp_path: Path,
+    *,
+    activity: dict[str, Any] | None,
+    store: FakeProbe | None = None,
+    node: FakeProbe | None = None,
+) -> tuple[Any, Any]:
+    spec = SPECS["probe_error"]
+    regional = FakeRegional(cpu_python=store_script({"activity": activity or {}}))
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=regional,
+        probes=probes(
+            node or node_probe(survey()), store or storage_probe(), window_probe()
+        ),
     )
+    return spec, ctx
+
+
+def test_probe_error_is_a_native_variant_behind_kernel_module_load() -> None:
+    spec = SPECS["probe_error"]
+    assert spec.implemented and not spec.deferred, spec
+    assert spec.approvals == ("KERNEL_MODULE_LOAD",), spec.approvals
+    assert spec.lanes == ("eks", "hp"), spec.lanes
+    assert spec.expected_outcome == "PASS" and not spec.product_gap, spec
+
+
+def test_probe_error_swaps_the_error_table_under_a_declared_vfat_device(
+    tmp_path: Path,
+) -> None:
+    store = storage_probe()
+    win = window_probe()
+    spec, ctx = probe_error_context(
+        tmp_path, activity=unavailable_activity(ERR_MOUNT, "PROBE_FAILED"), store=store
+    )
+    ctx.probes[f"window@{NODE}"] = win  # type: ignore[assignment]
+    result = spec.execute(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    created = next(call for call in store.calls if call[0] == "dm-create")
+    assert ("--fstype", "vfat") == created[
+        created.index("--fstype") : created.index("--fstype") + 2
+    ]
+    assert "--name" in created and created[created.index("--name") + 1] == "err", (
+        created
+    )
+    assert "--load-module" not in created, "vfat is loaded in the survey: no load"
+    retargets = [call for call in store.calls if call[0] == "dm-retarget"]
+    assert [call[call.index("--target") + 1] for call in retargets] == ["error", "data"]
+    opened = next(call for call in win.calls if call[0] == "open-window")
+    assert f"GPU_FAULT_FILESYSTEMS={ERR_MOUNT}" in opened, opened
+    assert "dm-data" not in ctx.cleanup.pending(), ctx.cleanup.pending()
+    assert ctx.cleanup.pending() == ["dm"], ctx.cleanup.pending()
+
+
+def test_probe_error_loads_vfat_under_the_token_when_the_node_lacks_it(
+    tmp_path: Path,
+) -> None:
+    store = storage_probe()
+    spec, ctx = probe_error_context(
+        tmp_path,
+        activity=unavailable_activity(ERR_MOUNT, "PROBE_FAILED"),
+        store=store,
+        node=node_probe(survey(vfat=False)),
+    )
+    assert spec.execute(ctx)["verdict"] == "PASS"
+    created = next(call for call in store.calls if call[0] == "dm-create")
+    assert "--load-module" in created, created
+
+
+def test_probe_error_is_inconclusive_when_statvfs_still_answers(tmp_path: Path) -> None:
+    store = storage_probe(
+        **{
+            "dm-retarget": {
+                "faulted": False,
+                "attempts": 3,
+                "mounted_on_host": True,
+                "statvfs": {"used_percent": 1.0},
+            }
+        }
+    )
+    spec, ctx = probe_error_context(tmp_path, activity={}, store=store)
+    with pytest.raises(VariantInconclusive, match="no EIO"):
+        spec.execute(ctx)
+    # The data-table restore stays registered for the cleanup stack.
+    assert "dm-data" in ctx.cleanup.pending(), ctx.cleanup.pending()
+
+
+def test_probe_error_refuses_an_active_node_log_collector(tmp_path: Path) -> None:
+    spec, ctx = probe_error_context(
+        tmp_path, activity={}, node=node_probe(survey(log_collector="active"))
+    )
+    with pytest.raises(VariantNotRun, match="log collector"):
+        spec.execute(ctx)
+    assert ctx.cleanup.pending() == [], "refused before any mutation"
+
+
+def test_probe_error_needs_mkfs_vfat(tmp_path: Path) -> None:
+    value = survey()
+    value["tools"]["mkfs.vfat"] = False
+    spec, ctx = probe_error_context(tmp_path, activity={}, node=node_probe(value))
+    with pytest.raises(VariantNotRun, match="mkfs.vfat"):
+        spec.execute(ctx)
+
+
+def test_probe_error_fails_when_the_product_never_reports_the_mount(
+    tmp_path: Path,
+) -> None:
+    empty = {
+        "incidents": [],
+        "workflows": [],
+        "batches": [],
+        "markers": [],
+        "commands": [],
+        "health_signals": {},
+        "notifications": [],
+    }
+    spec, ctx = probe_error_context(tmp_path, activity=empty)
+    result = spec.execute(ctx)
+    assert result["verdict"] == "FAIL", result
+    assert any("filesystem_unavailable" in error for error in result["errors"]), result
+
+
+@pytest.mark.parametrize(
+    ("variant", "mode"),
+    [("read_only", "READ_ONLY"), ("required_mount_missing", "MOUNT_MISSING")],
+)
+def test_unusable_filesystem_wrong_failure_mode_label_fails(
+    tmp_path: Path, variant: str, mode: str
+) -> None:
+    spec = SPECS[variant]
+    regional = FakeRegional(cpu_python=store_script({"activity": None}))
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=regional,
+        probes=probes(node_probe(survey()), storage_probe(), window_probe()),
+    )
+    mount = storage._fs_mount(ctx)
+    regional.cpu_python_responder = store_script(
+        {"activity": unavailable_activity(mount, "PROBE_FAILED")}
+    )
+    result = spec.execute(ctx)
+    assert result["verdict"] == "FAIL", result
+    assert any(mode in error for error in result["errors"]), result["errors"]

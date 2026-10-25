@@ -43,7 +43,16 @@ DEADMAN = f"gfrs-{DIGEST}-sdeadman-dm-io"
 #: remove send a uevent carrying the cookie).
 UDEV_SYNCED = frozenset({"create", "resume", "remove"})
 DEVICE_TOOLS = frozenset(
-    {"fallocate", "losetup", "blockdev", "dmsetup", "mkfs.ext4", "mount", "umount"}
+    {
+        "fallocate",
+        "losetup",
+        "blockdev",
+        "dmsetup",
+        "mkfs.ext4",
+        "mkfs.vfat",
+        "mount",
+        "umount",
+    }
 )
 
 
@@ -66,6 +75,7 @@ class FakeDmHost:
         self.timers: set[str] = set()
         self.started: dict[str, list[str]] = {}
         self.mappings: dict[str, int] = {}
+        self.tables: dict[str, str] = {}
         self.loops: dict[str, str] = {}
         self.mounts: dict[str, str] = {}
         self.sys_block = root / "sys-block"
@@ -127,7 +137,7 @@ class FakeDmHost:
         if tool == "fallocate":
             Path(args[-1]).write_bytes(b"")
             return 0, ""
-        if tool == "mkfs.ext4":
+        if tool in {"mkfs.ext4", "mkfs.vfat"}:
             return 0, ""
         if tool == "mount":
             self.mounts[args[-1]] = args[-2]
@@ -177,9 +187,15 @@ class FakeDmHost:
 
     def dmsetup(self, args: list[str]) -> tuple[int, str]:
         verb, name = args[0], args[-1]
+        if verb == "reload":
+            name = args[1]
+            assert args[2] == "--table", args
+            self.tables[name] = args[3]
+            return 0, ""
         if verb == "create":
             name = args[1]
             assert args[2] == "--table", args
+            self.tables[name] = args[3]
             self.minor += 1
             self.mappings[name] = self.minor
             node = self.sys_block / f"dm-{self.minor}" / "dm"
@@ -586,3 +602,182 @@ def test_the_probe_copy_follows_the_current_script(host: FakeDmHost) -> None:
     copy.write_text("# an older probe without dm-setup\n")
     assert storep.probe_copy(RUN_ID) == copy
     assert copy.read_bytes() == Path(storep.__file__).read_bytes()
+
+
+# --------------------------------------------------------------------------- #
+# 004 probe_error: FAT16 carrier and the error-table swap
+# --------------------------------------------------------------------------- #
+def table_statvfs(host: FakeDmHost) -> Any:
+    """A ``statvfs_reading`` that fails EIO while the mapping is on ``error``."""
+
+    def reading(path: str) -> dict[str, Any]:
+        if host.tables.get(DM, "").endswith("error"):
+            return {"path": path, "error": "OSError: 5"}
+        return {"path": path, "used_percent": 1.0, "read_only": False}
+
+    return reading
+
+
+def build_vfat(host: FakeDmHost, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    synced: list[str] = []
+    monkeypatch.setattr(storep, "statvfs_reading", table_statvfs(host))
+    monkeypatch.setattr(storep.os, "sync", lambda: synced.append("sync"))
+    (host.sys_module / storep.VFAT_MODULE).mkdir(exist_ok=True)  # already loaded
+    assert storep.main(create("--fstype", "vfat")) == 0, host.emitted[-1]
+    assert storep.main(call("dm-setup", "--name", "io")) == 0, host.emitted[-1]
+    return synced
+
+
+def test_a_vfat_device_is_formatted_fat16_and_mounted_with_errors_continue(
+    host: FakeDmHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    build_vfat(host, monkeypatch)
+    ready = host.emitted[-1]
+    assert ready["fstype"] == "vfat" and device()["fstype"] == "vfat", ready
+    assert device()["target"] == "data", device()
+    mkfs = next(call for call in host.calls if call[0] == "mkfs.vfat")
+    assert mkfs[1:4] == ["-F", "16", "-n"] and mkfs[4] == "GFRSIO", mkfs
+    mount = next(call for call in host.device_calls() if tool_of(call) == "mount")
+    assert mount[len(NS) :][:5] == [
+        "mount",
+        "-t",
+        "vfat",
+        "-o",
+        "errors=continue,noatime",
+    ], mount
+
+
+def test_retarget_error_remounts_syncs_swaps_and_data_restores(
+    host: FakeDmHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    synced = build_vfat(host, monkeypatch)
+    host.calls.clear()
+    assert storep.main(call("dm-retarget", "--name", "io", "--target", "error")) == 0
+    faulted = host.emitted[-1]
+    assert faulted["faulted"] is True and faulted["attempts"] == 1, faulted
+    assert faulted["statvfs"]["error"] == "OSError: 5" and faulted["mounted_on_host"]
+    assert host.tables[DM] == "0 4194304 error", host.tables
+    assert device()["target"] == "error", device()
+    assert synced == ["sync"], "the fresh mount's dirty boot sector is synced"
+    steps = [
+        call[len(NS) :][:2] if call[: len(NS)] == NS else call[:2]
+        for call in host.device_calls()
+    ]
+    assert steps == [
+        ["umount", device()["mountpoint"]],
+        ["mount", "-t"],
+        ["dmsetup", "suspend"],
+        ["dmsetup", "reload"],
+        ["dmsetup", "resume"],
+    ], steps
+    assert all(call[: len(NS)] == NS for call in host.device_calls()), (
+        "every device command joins the host namespaces"
+    )
+    host.calls.clear()
+    assert storep.main(call("dm-retarget", "--name", "io", "--target", "data")) == 0
+    restored = host.emitted[-1]
+    assert restored["faulted"] is False and "error" not in restored["statvfs"]
+    assert host.tables[DM].startswith("0 4194304 linear"), host.tables
+    assert device()["target"] == "data", device()
+    tools = [tool_of(call) for call in host.device_calls()]
+    assert tools == ["dmsetup", "dmsetup", "dmsetup"], "no remount on the way back"
+
+
+def test_retarget_retries_from_a_fresh_mount_when_the_count_was_cached(
+    host: FakeDmHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    build_vfat(host, monkeypatch)
+    answers = iter([False, True])  # first error-table reading still cached, then EIO
+    base = table_statvfs(host)
+
+    def cached(path: str) -> dict[str, Any]:
+        if host.tables.get(DM, "").endswith("error") and not next(answers):
+            return {"path": path, "used_percent": 1.0}
+        return base(path)
+
+    monkeypatch.setattr(storep, "statvfs_reading", cached)
+    assert storep.main(call("dm-retarget", "--name", "io", "--target", "error")) == 0
+    result = host.emitted[-1]
+    assert result["faulted"] is True and result["attempts"] == 2, result
+    reloads = [
+        call[len(NS) + 4]
+        for call in host.calls
+        if tool_of(call) == "dmsetup" and call[len(NS) + 1] == "reload"
+    ]
+    assert reloads == [
+        "0 4194304 error",
+        "0 4194304 linear /dev/loop0 0",
+        "0 4194304 error",
+    ]
+
+
+def test_retarget_gives_up_after_its_attempts(
+    host: FakeDmHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    build_vfat(host, monkeypatch)
+    monkeypatch.setattr(
+        storep, "statvfs_reading", lambda path: {"path": path, "used_percent": 1.0}
+    )
+    assert storep.main(call("dm-retarget", "--name", "io", "--target", "error")) == 0
+    result = host.emitted[-1]
+    assert result["faulted"] is False
+    assert result["attempts"] == storep.RETARGET_ATTEMPTS, result
+
+
+def test_retarget_refuses_a_running_writer_and_an_unfinished_device(
+    host: FakeDmHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (host.sys_module / storep.VFAT_MODULE).mkdir(exist_ok=True)
+    assert storep.main(create("--fstype", "vfat")) == 0, host.emitted[-1]
+    assert storep.main(call("dm-retarget", "--name", "io", "--target", "error")) == 1
+    assert host.emitted[-1]["error_class"] == "ProbeError", host.emitted[-1]
+    assert storep.main(call("dm-setup", "--name", "io")) == 0, host.emitted[-1]
+    assert storep.main(call("io-start", "--name", "io", "--seconds", "60")) == 0
+    host.calls.clear()
+    assert storep.main(call("dm-retarget", "--name", "io", "--target", "error")) == 1
+    assert host.device_calls() == [], "refused before any unmount or reload"
+
+
+def test_cleanup_of_a_faulted_device_puts_the_data_table_back_first(
+    host: FakeDmHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    build_vfat(host, monkeypatch)
+    assert storep.main(call("dm-retarget", "--name", "io", "--target", "error")) == 0
+    host.calls.clear()
+    assert storep.main(call("cleanup", "--kind", "dm-io")) == 0, host.emitted[-1]
+    assert host.emitted[-1]["clean"] is True, host.emitted[-1]["residue"]
+    verbs = [
+        (tool_of(call), inner[1] if inner[0] == "dmsetup" else "")
+        for call in host.device_calls()
+        for inner in [call[len(NS) :] if call[: len(NS)] == NS else call]
+    ]
+    reload_at = verbs.index(("dmsetup", "reload"))
+    umount_at = verbs.index(("umount", ""))
+    assert reload_at < umount_at, verbs
+    assert (host.mappings, host.loops, host.mounts) == ({}, {}, {})
+
+
+def test_dm_create_loads_vfat_under_the_flag_and_cleanup_unloads_it(
+    host: FakeDmHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(storep, "statvfs_reading", table_statvfs(host))
+    assert not (host.sys_module / storep.VFAT_MODULE).exists(), "vfat starts unloaded"
+    assert storep.main(create("--fstype", "vfat")) == 1
+    assert host.emitted[-1]["error_class"] == "ProbeError", host.emitted[-1]
+    assert host.calls == [], "refused before the deadman or any record"
+    assert storep.main(create("--fstype", "vfat", "--load-module")) == 0, host.emitted[
+        -1
+    ]
+    created = host.emitted[-1]
+    assert created["modules_loaded_by_run"] == [storep.VFAT_MODULE], created
+    assert storep.load_state(RUN_ID)["modules"] == [storep.VFAT_MODULE]
+    assert ["modprobe", storep.VFAT_MODULE] in [call[:2] for call in host.calls]
+    assert (host.sys_module / storep.VFAT_MODULE).is_dir(), "loaded for the run"
+    assert storep.main(call("dm-setup", "--name", "io")) == 0, host.emitted[-1]
+    assert storep.residue(RUN_ID)["modules_loaded_by_run"] == [storep.VFAT_MODULE]
+    assert storep.main(call("cleanup", "--kind", "dm-io")) == 0, host.emitted[-1]
+    result = host.emitted[-1]
+    assert result["clean"] is True, result["residue"]
+    assert {"modules_unloaded": [storep.VFAT_MODULE]} in result["actions"], result
+    assert not (host.sys_module / storep.VFAT_MODULE).exists(), "unloaded again"
+    assert ["modprobe", "-r", storep.VFAT_MODULE] in [call[:3] for call in host.calls]

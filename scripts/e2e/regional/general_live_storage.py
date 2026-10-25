@@ -15,8 +15,16 @@ configured mount that is read-only, gone, or whose ``statvfs`` raises is
 ``filesystem_unavailable`` (READ_ONLY / MOUNT_MISSING / PROBE_FAILED): a
 VALIDATE_HOST diagnostic with no capacity finding and no reset, reboot or
 quarantine (batch 163), the node held while it stays unusable and readmitted
-once the mount is restored; ``probe_error`` stays live-deferred for want of a
-faulting-mount fixture. 006
+once the mount is restored. ``probe_error``'s faulting mount is the storage
+probe's loop + device-mapper device carrying FAT16 (``dm-create --fstype
+vfat``): ``dm-retarget --target error`` swaps its table to the ``error``
+target built into ``dm_mod`` under a fresh mount, so the mount stays, reads
+read-write in the host table, and every ``statvfs`` fails EIO (FAT counts its
+free clusters from the device at the first ``statfs`` after a mount; ext4
+answers from memory). ``--target data`` restores it. The node log collector
+must be inactive (its storage rule grades a ``Buffer I/O error`` line
+QUARANTINE; the swap is made with nothing dirty so no such line is written,
+but an active collector would make the chain ambiguous). 006
 ``disk_io_util_percent``/``disk_io_await_ms`` are WARNING
 RUN_DIAGNOSTICS with a 120 s sustain; the oracle's own ``/proc/diskstats`` read
 computes the standard await to compare with the product's weighted-time one.
@@ -56,7 +64,6 @@ from scripts.e2e.regional.general_live_fixture import (
 from scripts.e2e.regional.general_live_registry import (
     NATIVE,
     VariantSpec,
-    deferred_variant,
 )
 from scripts.e2e.regional.general_live_verdicts import (
     DIAGNOSTIC_ONLY_STATES,
@@ -80,6 +87,10 @@ IO_BUDGET = IO_SUSTAIN + 300 + 90
 SHORT_FLUSH = 45
 TEST_FS = "fs"
 TEST_DM = "io"
+#: The 004 ``probe_error`` faulting device (FAT16 over loop + dm).
+TEST_ERR = "err"
+ERR_SIZE_MIB = 256
+LOG_COLLECTOR_UNIT = "gpu-fault-log-collector.service"
 #: What a 006 storage call may take on top of the probe's own budget for it
 #: (``storage_probe.CALL_BUDGET_SECONDS``): the ``kubectl exec`` round trip,
 #: the chroot and the interpreter start.
@@ -101,6 +112,10 @@ def _fs_mount(ctx: VariantContext) -> str:
 
 def _dm_mount(ctx: VariantContext) -> str:
     return f"/mnt/gfrs-live/{_digest(ctx)}/{TEST_DM}"
+
+
+def _err_mount(ctx: VariantContext) -> str:
+    return f"/mnt/gfrs-live/{_digest(ctx)}/{TEST_ERR}"
 
 
 def _digest(ctx: VariantContext) -> str:
@@ -134,12 +149,12 @@ def _create_fs(
     return created
 
 
-def _declare_fs(ctx: VariantContext) -> None:
+def _declare_fs(ctx: VariantContext, mount: str | None = None) -> None:
     """Add the test mount to GPU_FAULT_FILESYSTEMS through a window drop-in."""
 
     open_window(
         ctx,
-        f"GPU_FAULT_FILESYSTEMS={_fs_mount(ctx)}",
+        f"GPU_FAULT_FILESYSTEMS={mount or _fs_mount(ctx)}",
         restore_seconds=QUARANTINE_BUDGET + 600,
     )
 
@@ -271,6 +286,55 @@ def duplicate(ctx: VariantContext) -> dict[str, Any]:
 
 
 UNAVAILABLE_METRIC = "filesystem_unavailable"
+#: The ``failure_mode`` label the product puts on each unusable reading.
+UNAVAILABLE_MODES = {
+    "read_only": "READ_ONLY",
+    "required_mount_missing": "MOUNT_MISSING",
+    "probe_error": "PROBE_FAILED",
+}
+
+
+def _refuse_active_log_collector(survey: dict[str, Any]) -> None:
+    """``probe_error`` needs the node log collector off.
+
+    Its storage rule (``log_rules.py``) grades ``Buffer I/O error`` /
+    ``blk_update_request ... error`` lines CRITICAL QUARANTINE. The table swap
+    is made with nothing dirty so the error target is never written, but with
+    the collector active any such line would turn the diagnostic-only chain
+    under test into a quarantine the verdict could not attribute.
+    """
+
+    state = (survey.get("units") or {}).get(LOG_COLLECTOR_UNIT) or {}
+    residue = survey.get("residue") or {}
+    if state.get("ActiveState") == "active" or residue.get(
+        "log_collector_enabled_by_run"
+    ):
+        raise VariantNotRun(
+            "FIXTURE_NOT_READY",
+            "the node log collector is active; its storage rule would grade a "
+            "block I/O error line QUARANTINE and mask the probe_error chain",
+        )
+
+
+def _failure_mode_errors(detection: dict[str, Any], mount: str, mode: str) -> list[str]:
+    """The unusable readings carry the variant's ``failure_mode`` label.
+
+    Only readings that carry a label are judged: a product build whose
+    accepted batches keep no labels is noted, not failed.
+    """
+
+    seen = {
+        str(sample["labels"]["failure_mode"])
+        for sample in samples(detection, UNAVAILABLE_METRIC, device=mount)
+        if sample.get("value") == 1
+        and isinstance(sample.get("labels"), dict)
+        and sample["labels"].get("failure_mode")
+    }
+    if seen and mode not in seen:
+        return [
+            f"filesystem_unavailable on {mount} is labelled {sorted(seen)}, not {mode}"
+        ]
+    return []
 
 
 def _unusable_filesystem_variant(
@@ -284,13 +348,21 @@ def _unusable_filesystem_variant(
     quarantine. The node is held while the mount stays unusable, and readmitted
     once the injection is undone and the signal clears to 0 (batch 163 closed
     the capacity-only gap these variants used to record as expected FAILs).
+    ``probe_error`` uses the FAT16 dm device and its ``error`` table swap; the
+    others the loop ext4 file system.
     """
 
     survey = run_survey(ctx)
-    require_tools(survey, "losetup", "mkfs.ext4", "mount", "fallocate")
-    mount = _fs_mount(ctx)
-    _create_fs(ctx)
-    _declare_fs(ctx)
+    if variant == "probe_error":
+        _refuse_active_log_collector(survey)
+        require_tools(survey, "mkfs.vfat")
+        created = _create_dm(ctx, name=TEST_ERR, fstype="vfat", size_mib=ERR_SIZE_MIB)
+        mount = str(created.get("mountpoint") or _err_mount(ctx))
+    else:
+        require_tools(survey, "losetup", "mkfs.ext4", "mount", "fallocate")
+        mount = _fs_mount(ctx)
+        _create_fs(ctx)
+    _declare_fs(ctx, mount)
     started = utc_now()
     injected = _inject_unusable(ctx, variant)
     ctx.evidence.write("injection", injected)
@@ -331,6 +403,9 @@ def _unusable_filesystem_variant(
             ),
         ),
         "hardware": hardware_errors(detection),
+        "failure_mode": _failure_mode_errors(
+            detection, mount, UNAVAILABLE_MODES[variant]
+        ),
     }
     # Undo the injection, then readmit once the availability signal clears.
     _restore_unusable(ctx, variant)
@@ -371,7 +446,22 @@ def _inject_unusable(ctx: VariantContext, variant: str) -> dict[str, Any]:
             raise VariantInconclusive("the mount did not disappear")
         ctx.cleanup.push("fs-mount", lambda: ctx.storage("fs-mount", "--name", TEST_FS))
         return injected
+    if variant == "probe_error":
+        # Registered before the swap: a lost answer still puts the data table
+        # back before the device is destroyed (LIFO).
+        ctx.cleanup.push("dm-data", lambda: _retarget(ctx, "data"))
+        injected = _retarget(ctx, "error")
+        if not injected.get("faulted") or not injected.get("mounted_on_host", True):
+            raise VariantInconclusive(
+                "the error-table swap left the mount's statvfs answering "
+                f"(attempts {injected.get('attempts')}); no EIO to inject"
+            )
+        return injected
     raise VariantInconclusive(f"unknown unusable-filesystem variant {variant!r}")
+
+
+def _retarget(ctx: VariantContext, target: str) -> dict[str, Any]:
+    return _device_call(ctx, "dm-retarget", "--name", TEST_ERR, "--target", target)
 
 
 def _restore_unusable(ctx: VariantContext, variant: str) -> None:
@@ -381,6 +471,11 @@ def _restore_unusable(ctx: VariantContext, variant: str) -> None:
     elif variant == "required_mount_missing":
         ctx.storage("fs-mount", "--name", TEST_FS)
         ctx.cleanup.discard("fs-mount")
+    elif variant == "probe_error":
+        restored = _retarget(ctx, "data")
+        ctx.cleanup.discard("dm-data")
+        if "error" in (restored.get("statvfs") or {}):
+            raise RegionalFixtureError("the data table did not restore the mount")
 
 
 INODE_METRIC = "filesystem_inodes_used_percent"
@@ -462,6 +557,10 @@ def required_mount_missing(ctx: VariantContext) -> dict[str, Any]:
     return _unusable_filesystem_variant(ctx, variant="required_mount_missing")
 
 
+def probe_error(ctx: VariantContext) -> dict[str, Any]:
+    return _unusable_filesystem_variant(ctx, variant="probe_error")
+
+
 # --------------------------------------------------------------------------- #
 # 006 disk I/O
 # --------------------------------------------------------------------------- #
@@ -472,11 +571,11 @@ def _device_call(ctx: VariantContext, subcommand: str, *arguments: str) -> Any:
     return ctx.storage(subcommand, *arguments, timeout=timeout)
 
 
-def _checked_dm_cleanup(ctx: VariantContext) -> dict[str, Any]:
+def _checked_dm_cleanup(ctx: VariantContext, name: str = TEST_DM) -> dict[str, Any]:
     """Destroy the test device with its units, deadmen and a module this run
     loaded; fail the cleanup stack unless the probe proves the node clean."""
 
-    value = _device_call(ctx, "cleanup", "--kind", f"dm-{TEST_DM}")
+    value = _device_call(ctx, "cleanup", "--kind", f"dm-{name}")
     if value.get("clean") is not True:
         raise RegionalFixtureError(
             f"the test device cleanup left residue: {value.get('residue')}"
@@ -485,14 +584,19 @@ def _checked_dm_cleanup(ctx: VariantContext) -> dict[str, Any]:
 
 
 def _create_dm(
-    ctx: VariantContext, *, delay_ms: int = 0, size_mib: int = 2048
+    ctx: VariantContext,
+    *,
+    delay_ms: int = 0,
+    size_mib: int = 2048,
+    name: str = TEST_DM,
+    fstype: str = "ext4",
 ) -> dict[str, Any]:
-    survey = run_survey(ctx)
+    survey = ctx.survey or run_survey(ctx)
     require_tools(
         survey,
         "losetup",
         "dmsetup",
-        "mkfs.ext4",
+        storage_probe.MKFS[fstype][0],
         "mount",
         "blockdev",
         "fallocate",
@@ -503,16 +607,22 @@ def _create_dm(
     load = bool(delay_ms) and require_module(
         survey, storage_probe.DELAY_MODULE, ctx.settings.approvals
     )
+    if fstype == "vfat" and require_module(
+        survey, storage_probe.VFAT_MODULE, ctx.settings.approvals
+    ):
+        load = True
     if load:
         require_tools(survey, "modprobe")
     root = backing_root(survey)
     arguments = [
         "--name",
-        TEST_DM,
+        name,
         "--size-mib",
         str(size_mib),
         "--delay-ms",
         str(delay_ms),
+        "--fstype",
+        fstype,
         "--backing",
         root,
         "--deadman-seconds",
@@ -522,22 +632,22 @@ def _create_dm(
         arguments.append("--load-module")
     # Registered before the create: a failed or half-built device is destroyed
     # by this runner too, not only by the probe's deadman minutes later.
-    ctx.cleanup.push("dm", lambda: _checked_dm_cleanup(ctx))
+    ctx.cleanup.push("dm", lambda: _checked_dm_cleanup(ctx, name))
     started = _device_call(ctx, "dm-create", *arguments)
     ctx.evidence.write("dm-create", started)
-    ready = _await_dm_setup(ctx)
+    ready = _await_dm_setup(ctx, name)
     ctx.evidence.write("dm-ready", ready)
     return ready
 
 
-def _await_dm_setup(ctx: VariantContext) -> dict[str, Any]:
+def _await_dm_setup(ctx: VariantContext, name: str = TEST_DM) -> dict[str, Any]:
     """Poll ``dm-status`` until the setup unit has built the device or failed."""
 
     last: dict[str, Any] = {}
 
     def accept() -> dict[str, Any] | None:
         nonlocal last
-        last = _device_call(ctx, "dm-status", "--name", TEST_DM)
+        last = _device_call(ctx, "dm-status", "--name", name)
         return last if last.get("phase") in {"ready", "failed"} else None
 
     status = ctx.wait_until(
@@ -951,6 +1061,7 @@ def _fs_spec(
     *,
     outcome: str = "PASS",
     gap: str = "",
+    approvals=(),
 ) -> VariantSpec:
     return VariantSpec(
         case_id=CASE_004,
@@ -966,6 +1077,7 @@ def _fs_spec(
         execute=execute,
         expected_outcome=outcome,
         product_gap=gap,
+        approvals=tuple(approvals),
     )
 
 
@@ -1041,22 +1153,18 @@ VARIANTS = [
         "remount",
         required_mount_missing,
     ),
-    deferred_variant(
-        CASE_004,
+    _fs_spec(
         "probe_error",
-        proof_mode="live-replay",
-        reason=(
-            "FIXTURE_NOT_READY: the product reports a statvfs EIO/EACCES as "
-            "filesystem_unavailable (PROBE_FAILED) since batch 163, but injecting a "
-            "real one live needs a faulting test mount (FUSE/dm-error) not built this "
-            "phase; a read-only file bind cannot (statvfs resolves the mount, not the "
-            "bound file)"
-        ),
-        lanes=("eks",),
-        expected=(
-            "a configured mount whose statvfs raises is unusable -> "
-            "filesystem_unavailable (PROBE_FAILED) -> VALIDATE_HOST (batch 163)"
-        ),
+        "a declared FAT16 test mount over loop + dm whose table is swapped to the "
+        "dm_mod error target under a fresh mount: statvfs EIO while mounted rw "
+        "(KERNEL_MODULE_LOAD loads a missing vfat; the node log collector must be off)",
+        "filesystem_unavailable (PROBE_FAILED) -> FREEZE_EVIDENCE, VALIDATE_HOST; "
+        "no capacity finding, no reset/reboot/quarantine (batch 163: an "
+        "unreadable status is unusable, never healthy); readmit once the data "
+        "table is back",
+        "data table back, close the window, destroy the device, unload vfat if loaded here",
+        probe_error,
+        approvals=("KERNEL_MODULE_LOAD",),
     ),
     _fs_spec(
         "duplicate",
