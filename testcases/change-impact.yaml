@@ -574,8 +574,10 @@ rules:
       - scripts/e2e/regional/general_live_gpu_store.py
       - scripts/e2e/regional/general_live_store.py
       - scripts/e2e/regional/probes/env_replay_proxy.py
+      - scripts/e2e/regional/general_live_env_replay.py
       - tools/gpu_environment_replay.py
       - tests/regional/test_env_live_plans.py
+      - tests/regional/test_general_live_env_replay.py
       - tests/regional/test_env_live_verdicts.py
       - tests/regional/test_env_live_runner.py
       - tests/regional/test_env_live_fixture.py
@@ -587,6 +589,7 @@ rules:
       - docs/components/gpu-environment-live-acceptance.md
     pytest:
       - tests/regional/test_env_live_plans.py
+      - tests/regional/test_general_live_env_replay.py
       - tests/regional/test_env_live_verdicts.py
       - tests/regional/test_env_live_runner.py
       - tests/regional/test_env_live_fixture.py
@@ -641,6 +644,7 @@ rules:
       - scripts/e2e/regional/probes/general_live_net_probe.py
       - scripts/e2e/regional/probes/general_live_deps_probe.py
       - scripts/e2e/regional/probes/general_live_dcgm_probe.py
+      - scripts/e2e/regional/probes/general_live_kernel_source_probe.py
       - scripts/e2e/regional/probes/collector_window_probe.py
       - tools/gpu_dcgm_field_replay.py
       - tools/nvidia_smi_inventory_replay.py
@@ -676,6 +680,10 @@ rules:
       - tests/regional/test_general_live_gpu_links.py
       - tests/regional/test_general_live_gpu_fabric.py
       - tests/regional/test_general_live_gpu_composite.py
+      - tests/regional/test_general_live_gpu_environment.py
+      - tests/regional/test_general_live_env_replay.py
+      - tests/regional/test_general_live_kernel_xid.py
+      - tests/regional/test_general_live_kernel_replay.py
       - tests/regional/test_general_live_gpu_fields.py
       - tests/regional/test_general_live_gpu_identity.py
       - tests/regional/test_general_live_gpu_probe.py

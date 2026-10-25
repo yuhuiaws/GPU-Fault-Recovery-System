@@ -907,10 +907,44 @@ reset 需 `--approve GPU_RESET`；021 任一 finding 都驱动全 GPU+NVSwitch r
 该类变体需 `--approve GPU_FULL_FABRIC_RESET`（`recovery_failure` 另需
 `NODE_REBOOT`）并只在 HyperPod 独占节点跑；022 的 XID 联合变体只把 DCGM last-XID
 gauge 回放为 XID 32（`--approve DCGM_XID_GAUGE`）；019 `remap_failure` 的 RMA 现场
-诊断需 `GPU_FIELD_DIAGNOSTIC`。延后：020 `independent_fatal_event`、024
-`independent_xid` 需 K 车道的可信内核 XID/SXid 源，记 `NOT_RUN(FIXTURE_NOT_READY)`；
-024 热/功耗复合复用 GF-ENV-LIVE 环境回放；019 `pending_unsupported`（无旧架构卡）、
+诊断需 `GPU_FIELD_DIAGNOSTIC`。延后：019 `pending_unsupported`（无旧架构卡）、
 `observe_profile`（无 OBSERVE reset Profile）记 `CAPABILITY_ABSENT`。
+
+**复用 K 车道的独立可信内核 XID**（020 `independent_fatal_event`、024
+`independent_xid`，`general_live_kernel_xid.py`，需 `--approve KERNEL_SOURCE_REPLAY`）：
+在 DCGM 回放把 NVLink 计数/弱复合 `CORRECTABLE_MEMORY_DEGRADATION` 保持在目标卡上
+并已形成 incident 之后，经 `general_live_kernel_replay` kmsg 模式投递一条经审查的
+`NVRM: Xid (PCI:<目标卡 BDF>): <code>` 行，走真实 `KernelLogCollector`、NVIDIA_KERNEL
+投递、GPU 身份补全和固定 catalog。只允许 catalog Immediate Action 为 `IGNORE` 的
+**monitor 级**条目（`require_monitor_grade`，执行前校验，catalog 变化则记
+`NOT_RUN(FIXTURE_NOT_READY)`）：020 用 XID 137 `NVLINK_PRIV_ERR`，024 用 XID 92
+`EXCESSIVE_SBE_INTERRUPTS`（与弱复合同属 GPU_MEMORY 类）。引擎把 `IGNORE` 解析为
+`NO_ACTION`/`MONITOR_ONLY`（与 workload 状态无关），协调器不会把非 EXECUTABLE 决策并入
+其它 incident，其 incident 创建即 `RECOVERED`、无 workflow，因此真机不隔离、不 reset。
+判定读产品自己的 `FaultPolicyDecision`：恰一条非 duplicate 决策、disposition
+`MONITOR_ONLY`、official_action 等于 catalog、无 action/safety_action/operator/
+correlated_event/workflow、incident 为自己的且 `RECOVERED`、不是计数/复合 incident、
+GPU 解析到目标卡；复合的 `component_metrics`/`component_finding_ids` 不含 XID；计数链
+仍是单条只读诊断。它证明可信源路径独立、未被吸收；**不**证明致命级（RESET/QUARANTINE）
+处置在并发诊断 workflow 下存活——该分支需 reset 授权，由 kmsg 致命 XID 的危险车道执行。
+
+**复用 GF-ENV-LIVE 环境回放**（024 `thermal_warning`、`power_performance`，
+`general_live_gpu_environment.py` + `general_live_env_replay.py`，无需新令牌）：
+`tools/gpu_environment_replay.py` 的 `ALLOWED_FIELDS` 原样覆盖温度/T.Limit、热/功耗
+violation、clock reason、功耗/限值/利用率，由 `probes/env_replay_proxy.py` 装入并以
+`/run` drop-in 重指 `gpu-fault-metrics-collector.service`（deadman 先布置，透传到 arm）。
+计划来自 `env_live_plans.thermal_stress_plan`（warning 区间核心温度，刻度按设备自身
+`nvidia-smi` 限值决定，与 003/006 相同；thermal violation 从设备真实计数之上递增；
+`0x20` 软件热 reason，绝不 `0x80`）和 `power_limit_throttling_plan`（violation 递增、
+功耗钉在真实限值的 ratio 与限值之间、高利用率；不服务任何 clock reason，否则产品按
+设计把它当温度 finding 排除出功耗复合）。arm 前校验目标卡真实 T.Limit 高于 10 C 且无
+热/brake reason。判定：`THERMAL_STRESS`/`POWER_LIMIT_THROTTLING` 保持 WARNING
+`RUN_DIAGNOSTICS`（finding 的 severity/automatic_action 与 incident 的 effective_action
+三处一致），workflow 只有 FREEZE_EVIDENCE/VALIDATE，不隔离不 reset；去重按实际
+workflow：恰一条复合 incident，组件 finding 被抑制进复合（复合形成后不再单独 mint
+组件 incident），复合只由自己的指标组成；代理 `/status` 证明采集器确实消费了全部回放
+读数、工具未因真实不安全读数中止，产品接受过回放的 warning 样本；尾部平直/清零后先还原
+endpoint 再等待无活动 finding 的新批次（不要求硬件累计计数器归零）。
 
 规格明示、注入有效但产品不足的按 `expected_outcome="FAIL"` + `product_gap` 记录，不
 掩盖。首批记为预期 FAIL 的四个产品缺口——025 `one_gpu_missing`（完整性按全批 union

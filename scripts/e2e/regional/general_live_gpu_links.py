@@ -15,17 +15,23 @@ catalog RESTART_APP and monitor-only on an idle node; ``--approve
 DCGM_XID_GAUGE``). ``expired_xid`` is an expected FAIL: the gauge fallback has
 no age check, so a stale gauge keeps re-arming the CRITICAL DRAIN composite.
 
-``independent_fatal_event`` needs a trusted independent kernel XID/SXID; that
-source is lane K's, so it is recorded NOT_RUN(FIXTURE_NOT_READY) here.
+``independent_fatal_event`` delivers a trusted kernel XID beside the held
+NVLink counter fault through lane K's kernel-source replay
+(``general_live_kernel_xid``): XID 137 NVLINK_PRIV_ERR, an NVLink-class entry
+whose catalog action is IGNORE (-> MONITOR_ONLY), so the live run isolates and
+resets nothing while proving the XID keeps its own catalog decision and
+incident and is not absorbed by the counter diagnosis. The fatal-grade dispatch
+(RESET/QUARANTINE) is deliberately not driven here.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from scripts.e2e.regional.general_live_fixture import VariantContext
+from scripts.e2e.regional.general_live_fixture import VariantContext, VariantNotRun
 from scripts.e2e.regional.general_live_gpu_replay import (
     DcgmReplay,
+    activity_now,
     add,
     arm_and_confirm,
     at_limit_increment,
@@ -51,7 +57,14 @@ from scripts.e2e.regional.general_live_gpu_verdicts import (
     metric_incidents,
     read_only_errors,
 )
-from scripts.e2e.regional.general_live_registry import deferred_variant
+from scripts.e2e.regional.general_live_kernel_xid import (
+    independence_errors,
+    inject_kernel_xid,
+    kmsg_pci_bdf,
+    require_monitor_grade,
+    restore_if_isolated,
+    wait_xid_decisions,
+)
 
 CASE_020 = "GF-GENERAL-LIVE-020"
 CASE_022 = "GF-GENERAL-LIVE-022"
@@ -63,6 +76,10 @@ NVLINK = {
 RESET = frozenset(
     {"RESET_GPU", "RESET_ALL_GPUS_NVSWITCHES", "RESTART_NODE", "REPLACE_NODE"}
 )
+#: The reviewed trusted kernel XID beside the NVLink counter fault: an NVLink
+#: class entry whose catalog Immediate Action is IGNORE (-> NO_ACTION).
+INDEPENDENT_XID = 137
+KERNEL_SOURCE_REPLAY = "KERNEL_SOURCE_REPLAY"
 
 
 def _hold(ctx: VariantContext) -> int:
@@ -133,8 +150,6 @@ def multiple_gpus(ctx: VariantContext) -> dict[str, Any]:
     canonical = NVLINK["crc"]
     gpus = survey.gpus_with(canonical)[:2]
     if len(gpus) < 2:
-        from scripts.e2e.regional.general_live_fixture import VariantNotRun
-
         raise VariantNotRun(
             "CAPABILITY_ABSENT", "fewer than two GPUs report NVLink counters"
         )
@@ -257,6 +272,87 @@ def stale_sample(ctx: VariantContext) -> dict[str, Any]:
         stages,
         notes=["an unrefreshed (stale) scrape carries no new information"],
         extra={"gpu_uuid": gpu},
+    )
+
+
+def independent_fatal_event(ctx: VariantContext) -> dict[str, Any]:
+    """A trusted kernel XID beside the NVLink counter fault keeps its own handling.
+
+    The CRC counter is held on one GPU until its read-only diagnosis has an
+    incident; then a reviewed XID 137 (NVLINK_PRIV_ERR, catalog IGNORE) enters
+    through the kernel source naming that GPU's PCI BDF. The product must grade
+    the XID from its own catalog row (MONITOR_ONLY, own RECOVERED incident, no
+    workflow), neither merge it into the counter incident nor drop it, and the
+    counter chain must stay the single read-only diagnostic it was.
+    """
+
+    entry = require_monitor_grade(INDEPENDENT_XID)
+    survey = run_gpu_survey(ctx)
+    canonical = NVLINK["crc"]
+    gpu = survey.target(canonical)
+    pci_bdf = kmsg_pci_bdf(survey.pci_bdf(gpu))
+    if pci_bdf is None:
+        raise VariantNotRun(
+            "CAPABILITY_ABSENT",
+            f"{gpu} reports no PCI BDF; a kernel XID cannot name it",
+        )
+    since = utc_now()
+    repl = DcgmReplay(
+        ctx,
+        plan("nvlink", baseline(), step(40, add(canonical, [gpu]), hold=True)),
+        _hold(ctx),
+    )
+    arm_and_confirm(repl, f"{gpu}/{canonical}")
+    detection = wait_gpu_incident(
+        ctx,
+        since,
+        lambda doc: metric_incidents(doc, canonical, gpu=gpu),
+        metrics=(canonical,),
+        timeout_seconds=survey.health_summary + 240,
+        name="detection",
+    )
+    if not metric_incidents(detection, canonical, gpu=gpu):
+        stages = {"counter": [f"no {canonical} finding on {gpu} reached an incident"]}
+        recover_counter(ctx, repl, since, names=[canonical])
+        return result(stages, extra={"gpu_uuid": gpu})
+    injection = inject_kernel_xid(
+        ctx, xid=INDEPENDENT_XID, pci_bdf=pci_bdf, label="020-independent-event"
+    )
+    decisions = wait_xid_decisions(
+        ctx, injection.started, xid=INDEPENDENT_XID, name="independent-xid"
+    )
+    injection.close()
+    final = activity_now(ctx, since, metrics=(canonical,))
+    counter_incidents = metric_incidents(final, canonical, gpu=gpu)
+    stages = {
+        "counter_chain": _diag_chain(final, canonical, gpu),
+        "counter_read_only": read_only_errors(final, counter_incidents, canonical),
+        "independent": independence_errors(
+            decisions,
+            entry=entry,
+            gpu_uuid=gpu,
+            foreign_incident_ids={
+                str(item.get("incident_id")) for item in counter_incidents
+            },
+        ),
+        "hardware": no_hardware(final),
+    }
+    stages["isolation"] = restore_if_isolated(ctx, decisions)
+    recover_counter(ctx, repl, since, names=[canonical])
+    return result(
+        stages,
+        notes=[
+            f"XID {INDEPENDENT_XID} ({entry.mnemonic}) is monitor grade in catalog "
+            f"{entry.catalog_version}: {entry.immediate_action} -> MONITOR_ONLY; the "
+            "fatal-grade dispatch beside a counter diagnosis is not driven live here",
+        ],
+        extra={
+            "gpu_uuid": gpu,
+            "xid": INDEPENDENT_XID,
+            "pci_bdf": pci_bdf,
+            "decisions": decisions,
+            "kernel_replay": injection.evidence(),
+        },
     )
 
 
@@ -642,15 +738,20 @@ VARIANTS = [
         stale_sample,
         max_minutes=18,
     ),
-    deferred_variant(
+    gpu_spec(
         CASE_020,
         "independent_fatal_event",
-        proof_mode="live-replay",
-        reason="FIXTURE_NOT_READY: needs the kernel-source replay of lane K; an independent fatal "
-        "Xid/SXid must enter through the trusted kernel source and be dispatched by its "
-        "catalog, not absorbed by the NVLink counter diagnosis",
-        lanes=("eks", "hp"),
-        expected="an independent fatal Xid/SXid keeps its own catalog handling, not absorbed by counters",
+        "hold nvlink_crc_flit_error_total on one GPU, then a reviewed trusted kernel "
+        f"XID {INDEPENDENT_XID} (NVLINK_PRIV_ERR, catalog IGNORE) on that GPU through "
+        "the kmsg source",
+        "the XID keeps its own catalog decision (MONITOR_ONLY, own RECOVERED incident, "
+        "no workflow) and is not absorbed by the counter diagnosis, which stays a single "
+        "read-only chain. The fatal-grade dispatch (RESET/QUARANTINE) is deliberately "
+        "not driven live",
+        independent_fatal_event,
+        risk="M",
+        max_minutes=30,
+        approvals=(KERNEL_SOURCE_REPLAY,),
     ),
     gpu_spec(
         CASE_020,

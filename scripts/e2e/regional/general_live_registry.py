@@ -292,6 +292,7 @@ CATEGORY_MODULES = (
     "scripts.e2e.regional.general_live_gpu_links",
     "scripts.e2e.regional.general_live_gpu_fabric",
     "scripts.e2e.regional.general_live_gpu_composite",
+    "scripts.e2e.regional.general_live_gpu_environment",
     "scripts.e2e.regional.general_live_gpu_fields",
     "scripts.e2e.regional.general_live_gpu_identity",
 )

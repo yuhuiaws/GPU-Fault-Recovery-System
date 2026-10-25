@@ -168,6 +168,9 @@ warning 后一次严重；每个变体至少再观察三个有效采集周期。
 再在 warning 区间温度下重复该过程，验证 THERMAL_STRESS 仍只诊断，不高于组件。
 通过条件：实际执行只读验证，没有压测、STOP、reset/reboot；停止增量并恢复
 原因位/温度后能完成诊断。用例不要求硬件累计计数器真正归零。
+warning 区间的重复由 GF-GENERAL-LIVE-024 `thermal_warning` 用同一回放工具与探针执行
+（`env_live_plans.thermal_stress_plan`，见通用故障真机验收 phase 2 DCGM 节），
+功耗复合由 024 `power_performance`（`power_limit_throttling_plan`，不服务 `0x80`）执行。
 
 ### GF-ENV-LIVE-007
 

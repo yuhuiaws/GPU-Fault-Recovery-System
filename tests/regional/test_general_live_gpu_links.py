@@ -228,6 +228,140 @@ def test_counter_reset_passes_with_no_finding(tmp_path: Path) -> None:
     assert out["verdict"] == "PASS", out["errors"]
 
 
-def test_independent_fatal_event_is_deferred_to_lane_k() -> None:
+def _xid_decision(**overrides: Any) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "event_id": "kernel-log-kmsg-boot-900000064-xid-137-cluster-abc",
+        "xid": links.INDEPENDENT_XID,
+        "gpu_uuid": G1,
+        "event_source": "KERNEL_LOG",
+        "decision": True,
+        "disposition": "MONITOR_ONLY",
+        "official_action": "IGNORE",
+        "action": "NO_ACTION",
+        "safety_action": None,
+        "requires_operator": False,
+        "incident_id": "inc-xid-137",
+        "incident_state": "RECOVERED",
+        "workflow_request_id": None,
+        "duplicate": False,
+        "correlated_event_id": None,
+        "reasons": [],
+    }
+    base.update(overrides)
+    return base
+
+
+def _independent_ctx(
+    tmp_path: Path, decisions: list[dict[str, Any]], *, counter_incidents: int = 1
+) -> Any:
+    from scripts.e2e.regional.general_live_kernel_xid import XID_DECISION_PROBE
+    from tests.regional._general_live_fakes import FakeProbe
+
+    canonical = "nvlink_crc_flit_error_total"
+    incidents = [
+        gpu_incident(
+            f"inc-{index}",
+            f"b{index}-{G1}-{canonical}",
+            state="RECOVERED",
+            workflow="wf-1",
+        )
+        for index in range(counter_incidents)
+    ]
+    wf = gpu_workflow(
+        "wf-1",
+        "inc-0",
+        ["FREEZE_EVIDENCE", "VALIDATE_GPU"],
+        status="FAILED",
+        executions=[
+            {
+                "operation": "VALIDATE_GPU",
+                "status": "FAILED",
+                "details": {"host_diagnostic_failure": True},
+            }
+        ],
+    )
+    records = gpu_cpu_python(
+        activity=_activity(incidents, [wf]),
+        gpu_state={"active_findings": [], "batches": [{"observed_at": "t"}]},
+    )
+
+    def cpu(script: str, *arguments: str) -> dict[str, Any]:
+        if script == XID_DECISION_PROBE:
+            return {"decisions": decisions}
+        return records(script, *arguments)
+
+    ctx = _ctx(
+        tmp_path,
+        "independent_fatal_event",
+        probe=dcgm_probe(audit=audit_records({f"{G1}/{canonical}": 1.0})),
+        cpu=cpu,
+        approvals=("KERNEL_SOURCE_REPLAY",),
+    )
+    ctx.probes[f"kernel-replay-kmsg@{ctx.settings.node}"] = FakeProbe(
+        {
+            "install-records": {"records": 1},
+            "open-window": {"after": {"ActiveState": "active"}},
+            "arm": {"armed": True, "lines_written": 6},
+            "status": {"injected": {"mode": "kmsg", "fixture_lines": 6}},
+            "close-window": {"clean": True},
+        }
+    )
+    return ctx
+
+
+def test_independent_fatal_event_keeps_its_catalog_decision_beside_the_counter(
+    tmp_path: Path,
+) -> None:
     spec = SPECS["independent_fatal_event"]
-    assert spec.deferred.startswith("FIXTURE_NOT_READY") and "lane K" in spec.deferred
+    assert spec.approvals == ("KERNEL_SOURCE_REPLAY",) and spec.lanes == ("eks", "hp")
+    ctx = _independent_ctx(tmp_path, [_xid_decision()])
+    out = links.independent_fatal_event(ctx)
+    assert out["verdict"] == "PASS", out["errors"]
+    assert out["xid"] == 137 and out["gpu_uuid"] == G1
+    assert out["pci_bdf"] == "0000:02:00", "the kernel line names the target GPU's BDF"
+    kernel = ctx.probes[f"kernel-replay-kmsg@{ctx.settings.node}"]
+    verbs = [call[0] for call in kernel.calls]
+    assert verbs == ["install-records", "open-window", "arm", "status", "close-window"]
+    dcgm = [call[0] for call in ctx.probes[f"dcgm@{ctx.settings.node}"].calls]
+    assert dcgm.index("restore-collector") < dcgm.index("stop-proxy"), (
+        "the counter is released: endpoint restored, then the field tool stopped"
+    )
+
+
+def test_independent_fatal_event_fails_when_the_counter_absorbs_the_xid(
+    tmp_path: Path,
+) -> None:
+    out = links.independent_fatal_event(
+        _independent_ctx(tmp_path, [_xid_decision(incident_id="inc-0")])
+    )
+    assert out["verdict"] == "FAIL"
+    assert any("absorbed" in error for error in out["errors"]), out["errors"]
+
+
+def test_independent_fatal_event_fails_when_the_xid_earns_an_action(
+    tmp_path: Path,
+) -> None:
+    out = links.independent_fatal_event(
+        _independent_ctx(
+            tmp_path,
+            [
+                _xid_decision(
+                    disposition="EXECUTABLE",
+                    action="RESET_GPU",
+                    incident_state="ACTION_PENDING",
+                )
+            ],
+        )
+    )
+    assert out["verdict"] == "FAIL"
+    assert any("RESET_GPU" in error for error in out["errors"]), out["errors"]
+
+
+def test_independent_fatal_event_fails_when_the_counter_chain_is_perturbed(
+    tmp_path: Path,
+) -> None:
+    out = links.independent_fatal_event(
+        _independent_ctx(tmp_path, [_xid_decision()], counter_incidents=2)
+    )
+    assert out["verdict"] == "FAIL"
+    assert any("expected one" in error for error in out["errors"]), out["errors"]

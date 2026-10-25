@@ -1622,12 +1622,49 @@ NVSwitch reset, so those variants need `--approve GPU_FULL_FABRIC_RESET` (and
 `NODE_REBOOT` for `recovery_failure`) and run only on the HyperPod lane's
 exclusive node. 022's XID-join variants replay the DCGM last-XID gauge only as
 XID 32 (`--approve DCGM_XID_GAUGE`); 019 `remap_failure` needs
-`GPU_FIELD_DIAGNOSTIC`. Variants that need a trusted independent kernel
-XID/SXid source (020 `independent_fatal_event`, 024 `independent_xid`) are
-`NOT_RUN(FIXTURE_NOT_READY)` pending lane K's kernel-source replay; 024's
-thermal/power composite components reuse the GF-ENV-LIVE environment replay;
-019 `pending_unsupported` (no legacy GPU) and `observe_profile` (no OBSERVE
-reset profile) are `CAPABILITY_ABSENT`. The four product gaps these variants
+`GPU_FIELD_DIAGNOSTIC`; 019 `pending_unsupported` (no legacy GPU) and
+`observe_profile` (no OBSERVE reset profile) are `CAPABILITY_ABSENT`.
+
+The two variants that need a trusted independent kernel XID beside a held
+DCGM fault (020 `independent_fatal_event`, 024 `independent_xid`) reuse lane
+K's kmsg-mode kernel-source replay through
+`scripts/e2e/regional/general_live_kernel_xid.py` (`--approve
+KERNEL_SOURCE_REPLAY`). They deliberately replay a *monitor-grade* catalog
+entry -- XID 137 `NVLINK_PRIV_ERR` beside the NVLink counter, XID 92
+`EXCESSIVE_SBE_INTERRUPTS` beside the weak correctable-memory composite; both
+are catalog Immediate Action `IGNORE`, which the engine resolves to
+`NO_ACTION` / `MONITOR_ONLY` whatever the workload state, and the helper
+refuses any other grade before touching the node. What they prove is the
+independence of the trusted-source path under a concurrent diagnosis: the
+XID's own catalog decision, its own `RECOVERED` incident, no workflow, no
+correlation, no merge into the counter/composite incident, no XID component
+inside the composite, the counter chain undisturbed. What they do **not**
+prove is the spec's fatal wording -- that a RESET/QUARANTINE-grade dispatch
+survives the concurrent diagnostic workflow (node-scoped merge, exclusive
+operations). That branch needs the reset approvals and belongs to the
+dangerous kmsg-XID lanes; a PASS here must be read with that limit. The
+kmsg probe now gives every run its own sequence band (`kmsg_sequence`): the
+product dedups the XID event id derived from `kmsg-<boot>-<sequence>`, so a
+second run on the same boot used to be graded a duplicate of the first.
+
+024 `thermal_warning` and `power_performance` reuse the GF-ENV-LIVE
+telemetry replay unchanged (`tools/gpu_environment_replay.py`,
+`probes/env_replay_proxy.py`, `env_live_fixture.EnvReplayController`) through
+`general_live_env_replay.py` and the reviewed plans
+`env_live_plans.thermal_stress_plan` / `power_limit_throttling_plan`; the
+environment tool's `ALLOWED_FIELDS` is not widened. The thermal plan holds a
+warning-band core temperature computed from the device's own limits with a
+rising thermal violation under the `0x20` software reason (never `0x80`); the
+power plan pins the draw just under the real enforced limit at high
+utilization with a rising power violation and serves no clock reason, because
+a thermal or brake reason is a temperature finding the power composite excludes
+by design. Every wait stays inside the proxy's 600 s window and the endpoint is
+restored by the runner, not the deadman. The de-duplication grade reads the
+product's own records (one composite incident, no component incident minted
+after it formed, components only its own metrics, severity WARNING and
+RUN_DIAGNOSTICS on the finding and the incident). A device without a gradable
+core scale, without the power fields or with a real thermal/brake reason at
+preflight is `NOT_RUN`. No case has live evidence yet. The four product gaps these variants
 first recorded as expected FAIL -- the whole-batch (not per-GPU) DCGM
 completeness check (025 `one_gpu_missing`), the PCIe<->XID gauge join with no
 age check (022 `expired_xid`), the UUID-set-only identity comparison (026

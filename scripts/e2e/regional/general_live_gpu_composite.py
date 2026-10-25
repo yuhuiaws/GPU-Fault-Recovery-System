@@ -14,12 +14,15 @@ product's real correlation and de-duplication, not just a rule name:
   MULTI_GPU_NVLINK_FABRIC_FAILURE (diagnostic);
 * ``fresh_components`` -- a composite forms from components activated this batch;
 * ``reused_components`` -- holding the same components does not re-mint it;
-* ``wrong_scope_source`` -- components on different GPUs do not compose.
+* ``wrong_scope_source`` -- components on different GPUs do not compose;
+* ``independent_xid`` -- a trusted kernel XID on the GPU of a weak composite
+  keeps its own catalog decision and incident; the composite never covers it
+  (``general_live_kernel_xid``: XID 92 EXCESSIVE_SBE_INTERRUPTS, catalog
+  IGNORE -> MONITOR_ONLY, beside CORRECTABLE_MEMORY_DEGRADATION).
 
 ``thermal_warning`` / ``power_performance`` reuse the GF-ENV-LIVE environment
 replay (temperature / clock / power are on the environment proxy's allow-list,
-not this lane's DCGM field tool); ``independent_xid`` needs a trusted
-independent fatal XID from lane K. Both are recorded NOT_RUN with their reason.
+not this lane's DCGM field tool) and live in ``general_live_gpu_environment``.
 """
 
 from __future__ import annotations
@@ -29,6 +32,7 @@ from typing import Any
 from scripts.e2e.regional.general_live_fixture import VariantContext, VariantNotRun
 from scripts.e2e.regional.general_live_gpu_replay import (
     DcgmReplay,
+    activity_now,
     add,
     arm_and_confirm,
     baseline,
@@ -39,6 +43,7 @@ from scripts.e2e.regional.general_live_gpu_replay import (
     recover_counter,
     result,
     run_gpu_survey,
+    state_now,
     step,
     utc_now,
     wait_gpu_incident,
@@ -46,15 +51,31 @@ from scripts.e2e.regional.general_live_gpu_replay import (
 from scripts.e2e.regional.general_live_gpu_verdicts import (
     GpuChain,
     chain_errors,
+    composite_component_errors,
+    composite_findings,
     composite_incidents,
     read_only_errors,
 )
-from scripts.e2e.regional.general_live_registry import deferred_variant
+from scripts.e2e.regional.general_live_kernel_xid import (
+    independence_errors,
+    inject_kernel_xid,
+    kmsg_pci_bdf,
+    require_monitor_grade,
+    restore_if_isolated,
+    wait_xid_decisions,
+)
 
 CASE = "GF-GENERAL-LIVE-024"
 RESET = frozenset(
     {"RESET_GPU", "RESET_ALL_GPUS_NVSWITCHES", "RESTART_NODE", "REPLACE_NODE"}
 )
+#: The reviewed trusted kernel XID beside the weak memory composite: catalog
+#: IGNORE (-> NO_ACTION / MONITOR_ONLY), fault class GPU_MEMORY like the
+#: correctable-memory components it must not be folded into.
+INDEPENDENT_XID = 92
+CORRECTABLE_RULE = "CORRECTABLE_MEMORY_DEGRADATION"
+CORRECTABLE_COMPONENTS = ("ecc_sbe_volatile_total", "row_remap_correctable_total")
+KERNEL_SOURCE_REPLAY = "KERNEL_SOURCE_REPLAY"
 
 
 def _hold(ctx: VariantContext) -> int:
@@ -352,6 +373,111 @@ def wrong_scope_source(ctx: VariantContext) -> dict[str, Any]:
     )
 
 
+def independent_xid(ctx: VariantContext) -> dict[str, Any]:
+    """A trusted kernel XID on the GPU of a weak composite is not covered by it.
+
+    The weak composite is the diagnostic CORRECTABLE_MEMORY_DEGRADATION held
+    on one GPU; while it is active, a reviewed XID 92 (EXCESSIVE_SBE_INTERRUPTS,
+    the same GPU_MEMORY class, catalog IGNORE) enters through the kernel source
+    naming that GPU's PCI BDF. The product must grade the XID from its own
+    catalog row (MONITOR_ONLY, own RECOVERED incident, no workflow), never merge
+    it into the composite's incident or list it among the composite's
+    components, and the composite must stay the read-only diagnostic it was.
+    """
+
+    entry = require_monitor_grade(INDEPENDENT_XID)
+    survey = run_gpu_survey(ctx)
+    gpu = survey.target("ecc_sbe_volatile_total")
+    pci_bdf = kmsg_pci_bdf(survey.pci_bdf(gpu))
+    if pci_bdf is None:
+        raise VariantNotRun(
+            "CAPABILITY_ABSENT",
+            f"{gpu} reports no PCI BDF; a kernel XID cannot name it",
+        )
+    since = utc_now()
+    repl = DcgmReplay(
+        ctx,
+        plan(
+            "composite",
+            baseline(),
+            step(
+                40,
+                add("ecc_sbe_volatile_total", [gpu]),
+                add("row_remap_correctable_total", [gpu]),
+                hold=True,
+            ),
+        ),
+        _hold(ctx),
+    )
+    arm_and_confirm(
+        repl, f"{gpu}/ecc_sbe_volatile_total", f"{gpu}/row_remap_correctable_total"
+    )
+    detection = wait_gpu_incident(
+        ctx,
+        since,
+        lambda doc: composite_incidents(doc, CORRECTABLE_RULE),
+        timeout_seconds=survey.health_summary + 300,
+        name="detection",
+    )
+    if not composite_incidents(detection, CORRECTABLE_RULE):
+        # Without the weak composite there is nothing to be covered by; the
+        # counters are released and the variant reports the missing composite.
+        stages = {"composite": [f"no {CORRECTABLE_RULE} composite reached an incident"]}
+        recover_counter(ctx, repl, since, names=list(CORRECTABLE_COMPONENTS))
+        return result(stages, extra={"gpu_uuid": gpu})
+    injection = inject_kernel_xid(
+        ctx, xid=INDEPENDENT_XID, pci_bdf=pci_bdf, label="024-independent-xid"
+    )
+    decisions = wait_xid_decisions(
+        ctx, injection.started, xid=INDEPENDENT_XID, name="independent-xid"
+    )
+    injection.close()
+    final = activity_now(ctx, since, metrics=CORRECTABLE_COMPONENTS)
+    state = state_now(ctx, since, names=CORRECTABLE_COMPONENTS)
+    composites = composite_incidents(final, CORRECTABLE_RULE)
+    stages = {
+        "composite_chain": chain_errors(
+            final,
+            composites,
+            GpuChain(
+                label=CORRECTABLE_RULE,
+                operations=("FREEZE_EVIDENCE",),
+                forbidden=RESET,
+            ),
+        ),
+        "composite_read_only": read_only_errors(final, composites, CORRECTABLE_RULE),
+        "independent": independence_errors(
+            decisions,
+            entry=entry,
+            gpu_uuid=gpu,
+            foreign_incident_ids={str(item.get("incident_id")) for item in composites},
+        ),
+        "not_covered": composite_component_errors(
+            composite_findings(state, CORRECTABLE_RULE, gpu=gpu),
+            rule_id=CORRECTABLE_RULE,
+            allowed_components=CORRECTABLE_COMPONENTS,
+        ),
+        "hardware": no_hardware(final),
+    }
+    stages["isolation"] = restore_if_isolated(ctx, decisions)
+    recover_counter(ctx, repl, since, names=list(CORRECTABLE_COMPONENTS))
+    return result(
+        stages,
+        notes=[
+            f"XID {INDEPENDENT_XID} ({entry.mnemonic}) is monitor grade in catalog "
+            f"{entry.catalog_version}: {entry.immediate_action} -> MONITOR_ONLY; the "
+            "fatal-grade dispatch beside a weak composite is not driven live here",
+        ],
+        extra={
+            "gpu_uuid": gpu,
+            "xid": INDEPENDENT_XID,
+            "pci_bdf": pci_bdf,
+            "decisions": decisions,
+            "kernel_replay": injection.evidence(),
+        },
+    )
+
+
 def _any_incident(doc: dict[str, Any], gpu: str) -> list[dict[str, Any]]:
     from scripts.e2e.regional.general_live_gpu_verdicts import metric_incidents
 
@@ -373,24 +499,6 @@ def _validated_restore(
 
 
 VARIANTS = [
-    deferred_variant(
-        CASE,
-        "thermal_warning",
-        proof_mode="live-replay",
-        reason="FIXTURE_NOT_READY: the THERMAL_STRESS components (temperature + thermal violation / clock "
-        "throttle) are on the environment proxy's allow-list; reuse the GF-ENV-LIVE thermal flow "
-        "(run_env_live.py 006) and check the composite de-duplication there",
-        expected="a thermal warning composite does not escalate to a stronger action",
-    ),
-    deferred_variant(
-        CASE,
-        "power_performance",
-        proof_mode="live-replay",
-        reason="FIXTURE_NOT_READY: the POWER_LIMIT_THROTTLING components (power violation / usage / limit / "
-        "clock throttle) are on the environment proxy's allow-list; reuse the GF-ENV-LIVE power flow "
-        "(run_env_live.py 007)",
-        expected="a power-cap composite stays diagnostic",
-    ),
     gpu_spec(
         CASE,
         "corrected_memory",
@@ -441,12 +549,19 @@ VARIANTS = [
         risk="M",
         max_minutes=22,
     ),
-    deferred_variant(
+    gpu_spec(
         CASE,
         "independent_xid",
-        proof_mode="live-replay",
-        reason="FIXTURE_NOT_READY: needs the kernel-source replay of lane K; an independent fatal XID must "
-        "enter through the trusted kernel source so a weak composite cannot cover it",
-        expected="an independent fatal XID is not covered by a weak composite",
+        "hold CORRECTABLE_MEMORY_DEGRADATION on one GPU, then a reviewed trusted "
+        f"kernel XID {INDEPENDENT_XID} (EXCESSIVE_SBE_INTERRUPTS, catalog IGNORE) on "
+        "that GPU through the kmsg source",
+        "the XID keeps its own catalog decision (MONITOR_ONLY, own RECOVERED incident, "
+        "no workflow) and is neither merged into the weak composite's incident nor "
+        "listed among its components; the composite stays diagnostic. The fatal-grade "
+        "dispatch (RESET/QUARANTINE) is deliberately not driven live",
+        independent_xid,
+        risk="M",
+        max_minutes=30,
+        approvals=(KERNEL_SOURCE_REPLAY,),
     ),
 ]
