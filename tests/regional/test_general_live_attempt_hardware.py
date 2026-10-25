@@ -1165,3 +1165,66 @@ def test_contrast_and_display_helpers_read_the_records() -> None:
     )
     assert hw.result({"a": []})["verdict"] == "PASS"
     assert hw.result({"a": ["x"]})["errors"] == ["a: x"]
+
+
+# --------------------------------------------------------------------------- #
+# the plan path: both approvals, bound on plan and execute alike
+# --------------------------------------------------------------------------- #
+def _preflight_regional(gpu_pods: Sequence[dict[str, Any]] = ()) -> FakeRegional:
+    from tests.regional._general_live_fakes import store_script
+
+    fresh = datetime.now(timezone.utc).isoformat()
+    return FakeRegional(
+        node_metadata={"name": NODE, "labels": {"eks.amazonaws.com/nodegroup": "g"}},
+        gpu_pods=gpu_pods,
+        cpu_python=store_script(
+            {
+                "preflight": {
+                    "agent": {"lifecycle_state": "ACTIVE"},
+                    "open_incidents": [],
+                    "active_workflows": [],
+                    "collector_statuses": [
+                        {
+                            "collector": c,
+                            "last_success_at": fresh,
+                            "last_error_at": None,
+                        }
+                        for c in ("HOST_TELEMETRY", "GPU_INVENTORY", "GPU_METRICS")
+                    ],
+                }
+            }
+        ),
+    )
+
+
+@pytest.mark.parametrize("approvals", [(), ("GPU_RESET",), ("KERNEL_SOURCE_REPLAY",)])
+def test_plan_is_not_authorized_without_both_approvals(
+    approvals: tuple[str, ...],
+) -> None:
+    from scripts.e2e.regional.general_live_fixture import read_only_preflight
+
+    settings = make_settings(SPEC, node=NODE)
+    settings = type(settings)(**{**settings.__dict__, "approvals": approvals})
+    result = read_only_preflight(settings, SPEC, _preflight_regional())
+    assert result["planned_verdict"] == "NOT_RUN(NOT_AUTHORIZED)"
+    assert sorted(result["missing_approvals"]) == sorted(
+        set(SPEC.approvals) - set(approvals)
+    )
+
+
+def test_plan_passes_on_an_idle_node_with_both_approvals() -> None:
+    from scripts.e2e.regional.general_live_fixture import read_only_preflight
+
+    settings = make_settings(SPEC, node=NODE)
+    result = read_only_preflight(settings, SPEC, _preflight_regional())
+    assert result["planned_verdict"] is None, result
+    assert result["errors"] == [], result["errors"]
+    assert result["missing_approvals"] == []
+    # The variant creates its own GPU job: a node already running one is refused.
+    busy = _preflight_regional(
+        gpu_pods=[{"node": NODE, "name": "someone-elses-trainer"}]
+    )
+    result = read_only_preflight(settings, SPEC, busy)
+    assert any("GPU-requesting Pods" in error for error in result["errors"]), result[
+        "errors"
+    ]
