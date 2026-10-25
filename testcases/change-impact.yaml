@@ -668,6 +668,8 @@ rules:
       - tests/regional/test_general_live_edges2.py
       - tests/regional/test_general_live_edges3.py
       - tests/regional/test_general_live_probes.py
+      - tests/regional/test_general_live_dm_fixture.py
+      - tests/regional/test_general_live_dm_setup.py
       - tests/regional/test_general_live_memory.py
       - tests/regional/test_general_live_phase2.py
       - tests/regional/test_general_live_gpu_memory.py

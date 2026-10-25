@@ -20,6 +20,13 @@ faulting-mount fixture. 006
 ``disk_io_util_percent``/``disk_io_await_ms`` are WARNING
 RUN_DIAGNOSTICS with a 120 s sustain; the oracle's own ``/proc/diskstats`` read
 computes the standard await to compare with the product's weighted-time one.
+
+The 006 test device is built by a bounded transient setup unit on the node:
+``dm-create`` only starts it and ``_await_dm_setup`` polls ``dm-status`` on the
+context clock. Every 006 probe call gets the probe's own per-subcommand budget
+plus ``TRANSPORT_MARGIN_SECONDS`` as its ``kubectl exec`` timeout, and every
+undo is on the LIFO stack before the call it undoes (see the storage probe's
+docstring for why a ``dmsetup`` in the probe Pod never returned).
 """
 
 from __future__ import annotations
@@ -62,6 +69,8 @@ from scripts.e2e.regional.general_live_verdicts import (
     sustained,
     verdict,
 )
+from scripts.e2e.regional.probes import general_live_storage_probe as storage_probe
+from scripts.e2e.regional.regional_commands import RegionalFixtureError
 
 CASE_004 = "GF-GENERAL-LIVE-004"
 CASE_006 = "GF-GENERAL-LIVE-006"
@@ -71,21 +80,18 @@ IO_BUDGET = IO_SUSTAIN + 300 + 90
 SHORT_FLUSH = 45
 TEST_FS = "fs"
 TEST_DM = "io"
-#: Why the dm-delay-backed 006 I/O-load signal is NOT_RUN(FIXTURE_NOT_READY).
-#: The Bidirectional host-mount fix (host_probe_fixture) lets the ``systemd-run``
-#: writer reach the test dm device instead of the root fs, but the live run still
-#: showed the native dm-I/O load path failing independently of mount visibility
-#: (sustained_util: host probe TimeoutExpired; sustained_latency: the 200 ms
-#: dm-delay injector raised ProbeError). Making it reliable needs a real
-#: dm/dm-delay device this harness cannot exercise (the unit tests fake the
-#: probe), so the dm-delay-backed signal is deferred rather than blind-fixed.
-DM_IO_LOAD_DEFERRED = (
-    "the native dm-I/O load path live-failed (sustained_util host probe "
-    "TimeoutExpired, sustained_latency dm-delay injector ProbeError); the "
-    "Bidirectional host mount lets the writer reach the dm device, but the "
-    "long-running O_DIRECT writer unit and the dm-delay injector still need a "
-    "real dm/dm-delay device this harness cannot exercise, so the dm-delay-backed "
-    "signal is deferred rather than given a blind, unverifiable fix"
+#: What a 006 storage call may take on top of the probe's own budget for it
+#: (``storage_probe.CALL_BUDGET_SECONDS``): the ``kubectl exec`` round trip,
+#: the chroot and the interpreter start.
+TRANSPORT_MARGIN_SECONDS = 60
+#: How often the runner reads the setup unit's progress, and for how long: the
+#: unit's own ``RuntimeMaxSec`` and one more status call, so the unit has
+#: always ended -- ``ready``, or ``failed`` at a recorded step -- by then.
+SETUP_POLL_SECONDS = 5
+SETUP_WAIT_SECONDS = (
+    storage_probe.SETUP_MAX_SECONDS
+    + storage_probe.CALL_BUDGET_SECONDS["dm-status"]
+    + TRANSPORT_MARGIN_SECONDS
 )
 
 
@@ -458,19 +464,48 @@ def required_mount_missing(ctx: VariantContext) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # 006 disk I/O
 # --------------------------------------------------------------------------- #
+def _device_call(ctx: VariantContext, subcommand: str, *arguments: str) -> Any:
+    """One 006 storage probe call, timed out only after the probe's budget."""
+
+    timeout = storage_probe.CALL_BUDGET_SECONDS[subcommand] + TRANSPORT_MARGIN_SECONDS
+    return ctx.storage(subcommand, *arguments, timeout=timeout)
+
+
+def _checked_dm_cleanup(ctx: VariantContext) -> dict[str, Any]:
+    """Destroy the test device with its units, deadmen and a module this run
+    loaded; fail the cleanup stack unless the probe proves the node clean."""
+
+    value = _device_call(ctx, "cleanup", "--kind", f"dm-{TEST_DM}")
+    if value.get("clean") is not True:
+        raise RegionalFixtureError(
+            f"the test device cleanup left residue: {value.get('residue')}"
+        )
+    return value
+
+
 def _create_dm(
     ctx: VariantContext, *, delay_ms: int = 0, size_mib: int = 2048
 ) -> dict[str, Any]:
     survey = run_survey(ctx)
     require_tools(
-        survey, "losetup", "dmsetup", "mkfs.ext4", "mount", "blockdev", "fallocate"
+        survey,
+        "losetup",
+        "dmsetup",
+        "mkfs.ext4",
+        "mount",
+        "blockdev",
+        "fallocate",
+        "systemd-run",
+        "nsenter",
     )
     require_module(survey, "dm_mod", ctx.settings.approvals)
-    if delay_ms:
-        require_module(survey, "dm_delay", ctx.settings.approvals)
+    load = bool(delay_ms) and require_module(
+        survey, storage_probe.DELAY_MODULE, ctx.settings.approvals
+    )
+    if load:
+        require_tools(survey, "modprobe")
     root = backing_root(survey)
-    created = ctx.storage(
-        "dm-create",
+    arguments = [
         "--name",
         TEST_DM,
         "--size-mib",
@@ -481,11 +516,54 @@ def _create_dm(
         root,
         "--deadman-seconds",
         str(ctx.spec.max_minutes * 60 + 600),
-        timeout=600,
+    ]
+    if load:
+        arguments.append("--load-module")
+    # Registered before the create: a failed or half-built device is destroyed
+    # by this runner too, not only by the probe's deadman minutes later.
+    ctx.cleanup.push("dm", lambda: _checked_dm_cleanup(ctx))
+    started = _device_call(ctx, "dm-create", *arguments)
+    ctx.evidence.write("dm-create", started)
+    ready = _await_dm_setup(ctx)
+    ctx.evidence.write("dm-ready", ready)
+    return ready
+
+
+def _await_dm_setup(ctx: VariantContext) -> dict[str, Any]:
+    """Poll ``dm-status`` until the setup unit has built the device or failed."""
+
+    last: dict[str, Any] = {}
+
+    def accept() -> dict[str, Any] | None:
+        nonlocal last
+        last = _device_call(ctx, "dm-status", "--name", TEST_DM)
+        return last if last.get("phase") in {"ready", "failed"} else None
+
+    status = ctx.wait_until(
+        accept,
+        timeout_seconds=SETUP_WAIT_SECONDS,
+        poll_seconds=SETUP_POLL_SECONDS,
+        name="dm-setup",
     )
-    ctx.cleanup.push("dm", lambda: ctx.storage("dm-destroy", "--name", TEST_DM))
-    ctx.evidence.write("dm-create", created)
-    return created
+    if status is None:
+        raise RegionalFixtureError(
+            f"the test device setup did not finish within {SETUP_WAIT_SECONDS} s "
+            f"(last step {last.get('step')!r})"
+        )
+    if status.get("phase") != "ready":
+        # Fixed tokens only (step, class, digest, site): the message stays on
+        # the node with the rest of the probe's output.
+        trail = " ".join(
+            str(status[key])
+            for key in ("setup_error_class", "setup_error_code")
+            if status.get(key)
+        )
+        site = status.get("setup_error_site")
+        raise RegionalFixtureError(
+            f"the test device setup failed at {status.get('failed_step')!r}: "
+            f"{trail}" + (f" at {site}" if site else "")
+        )
+    return status
 
 
 def _device_name(created: dict[str, Any]) -> str:
@@ -509,9 +587,15 @@ def _run_io(
     ]
     if direct:
         arguments.append("--direct")
-    started = ctx.storage(*arguments)
-    ctx.cleanup.push("io", lambda: ctx.storage("io-stop", "--name", TEST_DM))
-    return started
+    # Registered before the start: a writer whose answer is lost is stopped too.
+    ctx.cleanup.push("io", lambda: _device_call(ctx, "io-stop", "--name", TEST_DM))
+    return _device_call(ctx, *arguments)
+
+
+def _stop_io(ctx: VariantContext) -> dict[str, Any]:
+    stopped = _device_call(ctx, "io-stop", "--name", TEST_DM)
+    ctx.cleanup.discard("io")
+    return stopped
 
 
 def _io_metric_variant(
@@ -560,8 +644,7 @@ def _io_metric_variant(
         ),
         "hardware": hardware_errors(detection),
     }
-    ctx.storage("io-stop", "--name", TEST_DM)
-    ctx.cleanup.discard("io")
+    _stop_io(ctx)
     recovered = _await_io_recovery(ctx, metric, device, threshold)
     stages["recovery"] = recovered["errors"]
     wait_settled(
@@ -576,16 +659,14 @@ def _io_metric_variant(
 
 
 def sustained_util(ctx: VariantContext) -> dict[str, Any]:
-    survey = run_survey(ctx)
-    # The reliable util signal uses a dm-delay device (20 ms keeps util high at
-    # tiny throughput so the backing disk is barely touched). That native
-    # dm-I/O load path live-failed and cannot be exercised here, so when dm_delay
-    # is in play the variant is NOT_RUN(FIXTURE_NOT_READY); without dm_delay the
-    # plain linear device is still attempted (it may read INCONCLUSIVE on fast
-    # NVMe, which is a distinct, honest outcome).
-    if (survey.get("modules") or {}).get("dm_delay", {}).get("loaded"):
-        raise VariantNotRun("FIXTURE_NOT_READY", DM_IO_LOAD_DEFERRED)
-    return _io_metric_variant(ctx, metric="disk_io_util_percent", delay_ms=0)
+    run_survey(ctx)
+    # dm-delay 20 ms keeps util high at tiny throughput so the backing disk is
+    # barely touched; without a loaded dm_delay the plain linear device (this
+    # variant loads no module; it may read INCONCLUSIVE on fast NVMe, a
+    # distinct, honest outcome). The 2026-10-24/25 TimeoutExpired was the
+    # Pod-side dmsetup udev wait (see the storage probe), not the delay target.
+    delay = 20 if _dm_delay_loaded(ctx) else 0
+    return _io_metric_variant(ctx, metric="disk_io_util_percent", delay_ms=delay)
 
 
 def sustained_latency(ctx: VariantContext) -> dict[str, Any]:
@@ -596,10 +677,11 @@ def sustained_latency(ctx: VariantContext) -> dict[str, Any]:
             "CAPABILITY_ABSENT",
             "dm_delay is not loaded; load it with KERNEL_MODULE_LOAD or use the replay",
         )
-    # dm_delay is available, but the 200 ms dm-delay injector live-failed on the
-    # native dm-I/O load path; deferred rather than given a blind, unverifiable
-    # fix (see DM_IO_LOAD_DEFERRED).
-    raise VariantNotRun("FIXTURE_NOT_READY", DM_IO_LOAD_DEFERRED)
+    # A missing dm_delay is loaded for this run (``dm-create --load-module``)
+    # and unloaded by the device cleanup. Before, nothing loaded it and the
+    # probe refused the delay table ("dm_delay is not loaded") -- consistent
+    # with the earlier live "dm-delay injector ProbeError".
+    return _io_metric_variant(ctx, metric="disk_io_await_ms", delay_ms=200)
 
 
 def short_flush(ctx: VariantContext) -> dict[str, Any]:
@@ -608,8 +690,7 @@ def short_flush(ctx: VariantContext) -> dict[str, Any]:
     started = utc_now()
     _run_io(ctx, SHORT_FLUSH)
     ctx.hold(SHORT_FLUSH + 10, name="flush")
-    ctx.storage("io-stop", "--name", TEST_DM)
-    ctx.cleanup.discard("io")
+    _stop_io(ctx)
     observed = _watch_no_finding(
         ctx, started, "disk_io_util_percent", IO_SUSTAIN + 420, device=device
     )
@@ -631,14 +712,17 @@ def zero_completed_io(ctx: VariantContext) -> dict[str, Any]:
     oracle = Oracle(ctx, "disk")
     oracle.start(180, interval=2, diskstats=[device])
     _run_io(ctx, 180)
-    suspended = ctx.storage("dm-suspend", "--name", TEST_DM, "--seconds", "90")
-    ctx.cleanup.push("dm-resume", lambda: ctx.storage("dm-resume", "--name", TEST_DM))
+    # Registered before the suspend: a lost answer still resumes the device
+    # before the writer is stopped (LIFO), as the probe's deadman would.
+    ctx.cleanup.push(
+        "dm-resume", lambda: _device_call(ctx, "dm-resume", "--name", TEST_DM)
+    )
+    suspended = _device_call(ctx, "dm-suspend", "--name", TEST_DM, "--seconds", "90")
     ctx.evidence.write("dm-suspend", suspended)
     ctx.hold(90, name="suspend")
-    ctx.storage("dm-resume", "--name", TEST_DM)
+    _device_call(ctx, "dm-resume", "--name", TEST_DM)
     ctx.cleanup.discard("dm-resume")
-    ctx.storage("io-stop", "--name", TEST_DM)
-    ctx.cleanup.discard("io")
+    _stop_io(ctx)
     oracle.read()
     # No await sample may be emitted with zero completions (Delta ios == 0); the
     # product must not fabricate a rate.
@@ -670,11 +754,15 @@ def counter_reset(ctx: VariantContext) -> dict[str, Any]:
     started = utc_now()
     _run_io(ctx, 60)
     ctx.hold(30, name="pre-reset")
-    recreated = ctx.storage("dm-recreate", "--name", TEST_DM)
+    # The writer's open files keep the test mount busy: stop it, remove and
+    # recreate the mapping (its counters restart), then write again so the
+    # collector's next delta spans the reset.
+    _stop_io(ctx)
+    recreated = _device_call(ctx, "dm-recreate", "--name", TEST_DM)
     ctx.evidence.write("dm-recreate", recreated)
+    _run_io(ctx, 60)
     ctx.hold(30, name="post-reset")
-    ctx.storage("io-stop", "--name", TEST_DM)
-    ctx.cleanup.discard("io")
+    _stop_io(ctx)
     observed = activity(
         ctx, started, metrics={"disk_io_util_percent", "disk_io_await_ms"}
     )
@@ -692,6 +780,7 @@ def counter_reset(ctx: VariantContext) -> dict[str, Any]:
 def reference_iostat(ctx: VariantContext) -> dict[str, Any]:
     """Compare the product's weighted await with the standard await (spec FAIL)."""
 
+    run_survey(ctx)  # whether dm_delay is loaded is the survey's answer
     created = _create_dm(ctx, delay_ms=200 if _dm_delay_loaded(ctx) else 0)
     device = _device_name(created)
     started = utc_now()
@@ -717,8 +806,7 @@ def reference_iostat(ctx: VariantContext) -> dict[str, Any]:
         [record.get("diskstats", {}).get(device, {}) for record in oracle.records],
         lambda record: record.get("standard_await_ms"),
     )
-    ctx.storage("io-stop", "--name", TEST_DM)
-    ctx.cleanup.discard("io")
+    _stop_io(ctx)
     diverged = _await_divergence(product, standard)
     stages = {
         "await_definition": [
@@ -755,8 +843,7 @@ def io_recovery(ctx: VariantContext) -> dict[str, Any]:
         name="io-recovery-detection",
     )
     incidents = finding_incidents(detection, "disk_io_util_percent", device=device)
-    ctx.storage("io-stop", "--name", TEST_DM)
-    ctx.cleanup.discard("io")
+    _stop_io(ctx)
     recovered = _await_io_recovery(ctx, "disk_io_util_percent", device, 98.0)
     wait_settled(
         ctx,
@@ -986,7 +1073,8 @@ VARIANTS = [
     _io_spec(
         "sustained_latency",
         "dm-delay 200 ms with queued writers",
-        "disk_io_await_ms >= 100 -> VALIDATE_HOST; without dm_delay NOT_RUN(CAPABILITY_ABSENT)",
+        "disk_io_await_ms >= 100 -> VALIDATE_HOST; a missing dm_delay is loaded "
+        "for the run (KERNEL_MODULE_LOAD) and unloaded in cleanup",
         sustained_latency,
         max_minutes=20,
         approvals=("KERNEL_MODULE_LOAD",),

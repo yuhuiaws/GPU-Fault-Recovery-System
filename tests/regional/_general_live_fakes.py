@@ -44,17 +44,20 @@ class FakeProbe:
 
     A callable receives the full argument tuple and returns the JSON object the
     probe would print. A list value is consumed one call at a time; the last
-    entry repeats. A missing subcommand returns ``{}``.
+    entry repeats. A missing subcommand returns ``{}``. ``timeouts`` records the
+    ``kubectl exec`` timeout the runner gave each call, by subcommand.
     """
 
     def __init__(self, script: dict[str, Any] | None = None) -> None:
         self.script = script or {}
         self.calls: list[tuple[str, ...]] = []
+        self.timeouts: list[tuple[str, int]] = []
         self.created = True
         self._iterators: dict[str, Any] = {}
 
     def execute(self, *arguments: str, timeout: int = 180) -> dict[str, Any]:
         self.calls.append(arguments)
+        self.timeouts.append((arguments[0], timeout))
         key = arguments[0]
         value = self.script.get(key, {})
         if callable(value):

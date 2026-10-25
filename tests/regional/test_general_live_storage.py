@@ -36,6 +36,8 @@ def survey(**modules: bool) -> dict[str, Any]:
                 "dmsetup",
                 "blockdev",
                 "systemd-run",
+                "nsenter",
+                "modprobe",
             )
         },
         "modules": {
@@ -71,12 +73,16 @@ def storage_probe(**overrides: Any) -> FakeProbe:
         "fs-umount": {"directory_present": False, "statvfs": {"used_percent": None}},
         "fs-mount": {"mounted": "/mnt"},
         "fs-destroy": {"destroyed": True},
-        "dm-create": {
+        # dm-create only starts the setup unit; dm-status reports the device.
+        "dm-create": {"name": "io", "dm": "gfrs-x-io", "phase": "setup"},
+        "dm-status": {
             "name": "io",
+            "phase": "ready",
             "dm": "gfrs-x-io",
             "device": "dm-7",
             "mountpoint": "/mnt",
         },
+        "cleanup": {"clean": True, "residue": {}},
         "dm-suspend": {"suspended": "gfrs-x-io"},
         "dm-resume": {"resumed": "gfrs-x-io"},
         "dm-recreate": {"device_before": "dm-7", "device_after": "dm-8"},
@@ -357,7 +363,7 @@ def test_inode_full_passes_only_on_the_inode_quarantine_and_restores_it(
 
 def test_sustained_util_passes(tmp_path: Path) -> None:
     # Without dm_delay the plain linear device path is attempted and the scripted
-    # util samples carry it through; the dm_delay path is deferred (see below).
+    # util samples carry it through; with dm_delay it runs on a 20 ms delay.
     spec = SPECS["sustained_util"]
     node = node_probe(survey(dm_delay=False))
     node.script["oracle-read"] = {
@@ -575,27 +581,51 @@ def test_sustained_latency_requires_dm_delay(tmp_path: Path) -> None:
     assert caught.value.reason == "CAPABILITY_ABSENT"
 
 
-@pytest.mark.parametrize("variant", ["sustained_util", "sustained_latency"])
-def test_dm_io_load_is_deferred_when_dm_delay_is_present(
-    tmp_path: Path, variant: str
+def _dm_create_arguments(store: FakeProbe) -> tuple[str, ...]:
+    created = [call for call in store.calls if call[0] == "dm-create"]
+    assert len(created) == 1, store.calls
+    return created[0]
+
+
+@pytest.mark.parametrize(
+    ("variant", "loaded", "delay", "load"),
+    [
+        ("sustained_util", True, "20", False),
+        ("sustained_util", False, "0", False),
+        ("sustained_latency", True, "200", False),
+        ("sustained_latency", False, "200", True),
+    ],
+    ids=["util-delay", "util-linear", "latency-loaded", "latency-loads"],
+)
+def test_dm_io_load_runs_natively_with_or_without_a_loaded_dm_delay(
+    tmp_path: Path, variant: str, loaded: bool, delay: str, load: bool
 ) -> None:
-    # The live finding: the dm-delay-backed 006 I/O-load signal failed on the
-    # native path (TimeoutExpired / dm-delay ProbeError). With dm_delay present
-    # both variants record NOT_RUN(FIXTURE_NOT_READY) instead of a blind fix.
+    # The 2026-10-24/25 TimeoutExpired was the probe Pod's dmsetup waiting for a
+    # udev cookie it could never get (see the storage probe), not the delay
+    # target, so neither variant defers on dm_delay any more: util uses a 20 ms
+    # delay when one is loaded, latency a 200 ms one -- loaded for the run
+    # (KERNEL_MODULE_LOAD, the variant's approval) when the node lacks it.
     spec = SPECS[variant]
-    regional = FakeRegional(cpu_python=store_script({"activity": {}}))
+    store = storage_probe()
+    metric = (
+        "disk_io_util_percent" if variant == "sustained_util" else "disk_io_await_ms"
+    )
+    detected = {"incidents": [incident("inc-io", metric, device="dm-7")]}
+    regional = FakeRegional(cpu_python=store_script({"activity": detected}))
     ctx = make_context(
         spec,
         tmp_path=tmp_path,
         regional=regional,
-        probes=probes(
-            node_probe(survey(dm_delay=True)), storage_probe(), window_probe()
-        ),
+        probes=probes(node_probe(survey(dm_delay=loaded)), store, window_probe()),
     )
-    with pytest.raises(VariantNotRun) as caught:
-        spec.execute(ctx)
-    assert caught.value.reason == "FIXTURE_NOT_READY"
-    assert "dm-I/O load path" in caught.value.detail
+    with pytest.raises(VariantInconclusive):
+        spec.execute(ctx)  # no scripted oracle samples: the injection is unproven
+    arguments = _dm_create_arguments(store)
+    assert arguments[arguments.index("--delay-ms") + 1] == delay, arguments
+    assert ("--load-module" in arguments) is load, arguments
+    assert [call[0] for call in store.calls[:2]] == ["dm-create", "dm-status"], (
+        store.calls
+    )
 
 
 def test_probe_error_is_deferred() -> None:

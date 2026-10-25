@@ -19,6 +19,23 @@ Every creation is recorded in ``storage-state.json`` before it happens and is
 preceded by a ``systemd-run --on-active`` deadman that unmounts, detaches and
 deletes it from a copy of this file. No raw disk, real mount, system or log
 disk is ever opened.
+
+The 006 device-mapper device lives entirely in the host's namespaces.
+``dmsetup`` blocks every create, resume and remove until the host's
+systemd-udevd confirms a libdevmapper "cookie" -- a SysV semaphore that
+``95-dm-notify.rules`` completes with ``dmsetup udevcomplete $DM_COOKIE``.
+SysV IPC objects are per IPC namespace (ipc_namespaces(7)) and the probe Pod
+is hostPID/hostNetwork but has its own IPC namespace, so from the Pod that
+confirmation never arrives and ``dmsetup create`` waits until this probe's
+180 s command timeout -- the 2026-10-25 live ``dm-create`` ``TimeoutExpired``
+on both EKS nodes, before any product evidence. Therefore the setup
+(``fallocate``, ``losetup``, ``dmsetup create``, ``mkfs.ext4``, ``mount``)
+runs as a bounded transient unit -- ``dm-create`` returns once the unit is
+started and the runner polls ``dm-status`` -- and every other ``dmsetup``,
+``mount`` and ``umount`` of the device joins PID 1's IPC and mount
+namespaces through ``nsenter`` (``host_command``). Each subcommand also has a
+wall-clock budget (``CALL_BUDGET_SECONDS``) that ``run`` clamps every command
+to, so a call always answers before the runner's ``kubectl exec`` timeout.
 """
 
 from __future__ import annotations
@@ -32,12 +49,76 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 STATE_ROOT = Path("/run/gpu-fault-acceptance/general")
 MOUNT_ROOT = Path("/mnt/gfrs-live")
+#: The host root mount namespace's table (the Pod is hostPID): where the dm
+#: device is mounted, whatever this Pod's own namespace mirrors of it.
+HOST_MOUNTINFO = Path("/proc/1/mountinfo")
+SYS_BLOCK = Path("/sys/block")
+SYS_MODULE = Path("/sys/module")
+#: The only kernel module this probe may load (``--load-module``, the
+#: KERNEL_MODULE_LOAD approval); unloaded again by ``cleanup``.
+DELAY_MODULE = "dm_delay"
+#: Device commands run in PID 1's IPC namespace (udev can complete the
+#: dmsetup cookie there) and mount namespace (the collector and the writer
+#: unit see the mount there).
+HOST_NAMESPACES = ("nsenter", "--target", "1", "--ipc", "--mount", "--")
+#: Per-command timeouts (seconds). systemd method calls (``systemctl show``/
+#: ``reset-failed``, a timer stop, ``systemd-run`` of a transient unit) give
+#: up on their own after sd-bus's 25 s method-call timeout; ``dmsetup``,
+#: ``losetup`` and ``blockdev`` return in well under a second once udev can
+#: confirm the cookie.
+QUICK_SECONDS = 30
+#: ``TimeoutStopSec`` of every unit this probe starts (I/O writer, setup,
+#: deadman): a stop is SIGTERM, then SIGKILL after the same timeout, so a
+#: ``systemctl stop`` of one returns within ``UNIT_STOP_SECONDS``.
+UNIT_TIMEOUT_STOP_SECONDS = 20
+UNIT_STOP_SECONDS = 2 * UNIT_TIMEOUT_STOP_SECONDS + 20
+MOUNT_SECONDS = 60
+UMOUNT_SECONDS = 120
+#: The setup unit's steps and their timeouts. Its ``RuntimeMaxSec`` adds
+#: ``SETUP_RECORD_SECONDS`` so the worker records a failed step before
+#: systemd would kill it.
+SETUP_STEP_SECONDS = {
+    "fallocate": 120,
+    "losetup": QUICK_SECONDS,
+    "blockdev": QUICK_SECONDS,
+    "dmsetup-create": QUICK_SECONDS,
+    "mkfs": 300,
+    "mount": MOUNT_SECONDS,
+}
+SETUP_RECORD_SECONDS = 30
+SETUP_MAX_SECONDS = sum(SETUP_STEP_SECONDS.values()) + SETUP_RECORD_SECONDS
+#: Worst-case wall time of one call (seconds), per subcommand. ``main`` arms
+#: this deadline and ``run`` clamps every command to what is left of it, so a
+#: call ends -- with its JSON error if a command is still running -- inside
+#: the runner's ``kubectl exec`` timeout (this budget plus its transport
+#: margin). A fixed-path call's budget covers the sum of its commands'
+#: timeouts; ``cleanup``/``dm-destroy`` are cut at theirs and the deadman
+#: (``Restart=on-failure``) finishes. Subcommands not listed (the 003/004
+#: file-system calls) keep their per-command timeouts only.
+CALL_BUDGET_SECONDS = {
+    "dm-create": 300,
+    "dm-status": 60,
+    "dm-setup": SETUP_MAX_SECONDS - SETUP_RECORD_SECONDS,
+    "dm-suspend": 180,
+    "dm-resume": 180,
+    "dm-recreate": 300,
+    "dm-destroy": 600,
+    "io-start": 180,
+    "io-stop": 120,
+    "cleanup": 600,
+}
+#: The deadline of the running call (``time.monotonic``), empty when unbudgeted.
+DEADLINE: list[float] = []
+#: Command helpers every step goes through; an error's site is the caller.
+HELPER_FRAMES = frozenset({"run", "clamp", "host_command", "dmsetup"})
+RUNNING_STATES = frozenset({"active", "activating", "deactivating", "reloading"})
 BACKING_ROOTS = (
     Path("/var/lib/gpu-fault-acceptance"),
     Path("/opt/dlami/nvme/gpu-fault-acceptance"),
@@ -60,6 +141,10 @@ class ProbeError(RuntimeError):
     pass
 
 
+class BudgetExhausted(ProbeError):
+    """The call used up its ``CALL_BUDGET_SECONDS`` before a command could run."""
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -68,11 +153,22 @@ def emit(value: dict[str, Any]) -> None:
     print(json.dumps(value, sort_keys=True, separators=(",", ":"), default=str))
 
 
+def clamp(timeout: float) -> float:
+    """``timeout`` cut to what is left of the call's budget."""
+
+    if not DEADLINE:
+        return timeout
+    left = DEADLINE[0] - time.monotonic()
+    if left <= 0:
+        raise BudgetExhausted("the probe call has used up its time budget")
+    return min(float(timeout), left)
+
+
 def run(
     command: list[str],
     *,
     check: bool = True,
-    timeout: int = 180,
+    timeout: float = 180,
     input_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     completed = subprocess.run(
@@ -81,7 +177,7 @@ def run(
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        timeout=timeout,
+        timeout=clamp(timeout),
         check=False,
     )
     if check and completed.returncode:
@@ -90,6 +186,33 @@ def run(
             f"{completed.stderr.strip()[:300]}"
         )
     return completed
+
+
+def tool_present(name: str) -> bool:
+    return shutil.which(name) is not None
+
+
+def host_command(
+    command: list[str], *, check: bool = True, timeout: float = QUICK_SECONDS
+) -> subprocess.CompletedProcess[str]:
+    """``command`` in PID 1's IPC and mount namespaces (the Pod is hostPID).
+
+    libdevmapper's udev cookie is a SysV semaphore, and only a ``dmsetup`` in
+    the host IPC namespace is woken by the host udevd's ``dmsetup
+    udevcomplete``; a mount made there is the one the collector and the writer
+    unit see. From the deadman's or the setup unit's own host context this
+    joins the namespaces it is already in.
+    """
+
+    if not tool_present("nsenter"):
+        raise ProbeError("nsenter is missing: device commands cannot reach the host")
+    return run([*HOST_NAMESPACES, *command], check=check, timeout=timeout)
+
+
+def dmsetup(
+    *arguments: str, check: bool = True, timeout: float = QUICK_SECONDS
+) -> subprocess.CompletedProcess[str]:
+    return host_command(["dmsetup", *arguments], check=check, timeout=timeout)
 
 
 def checked_run_id(value: str) -> str:
@@ -131,7 +254,14 @@ def dm_name(run_id: str, name: str) -> str:
     return f"{UNIT_PREFIX}{run_digest(run_id)}-{checked_name(name)}"
 
 
-EMPTY_STATE: dict[str, Any] = {"units": [], "filesystems": {}, "devices": {}}
+#: ``modules`` are the kernel modules this run loaded (recorded before the
+#: load), which ``cleanup`` unloads again once no device of the run is left.
+EMPTY_STATE: dict[str, Any] = {
+    "units": [],
+    "filesystems": {},
+    "devices": {},
+    "modules": [],
+}
 
 
 def load_state(run_id: str) -> dict[str, Any]:
@@ -157,14 +287,21 @@ def save_state(run_id: str, state: dict[str, Any]) -> None:
 
 
 def probe_copy(run_id: str) -> Path:
-    """A copy of this file the deadman can run after the probe Pod is gone."""
+    """A copy of this file the deadman and the setup unit run (Pod or not).
+
+    Refreshed whenever this file differs, so a rerun of the same run id never
+    starts a unit from an older copy that lacks a subcommand.
+    """
 
     directory = state_dir(run_id)
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     target = directory / "storage-probe.py"
-    if not target.is_file():
-        shutil.copyfile(Path(__file__).resolve(), target)
-        target.chmod(0o700)
+    source = Path(__file__).resolve().read_bytes()
+    if not target.is_file() or target.read_bytes() != source:
+        temporary = target.with_suffix(".tmp")
+        temporary.write_bytes(source)
+        temporary.chmod(0o700)
+        os.replace(temporary, target)
     return target
 
 
@@ -184,6 +321,7 @@ def unit_state(unit: str) -> dict[str, str]:
             "--property=ExecMainStartTimestamp",
         ],
         check=False,
+        timeout=QUICK_SECONDS,
     )
     values: dict[str, str] = {}
     for line in completed.stdout.splitlines():
@@ -199,8 +337,12 @@ def arm_deadman(run_id: str, kind: str, seconds: int) -> str:
 
     bounded(seconds, MIN_DEADMAN_SECONDS, MAX_DEADMAN_SECONDS, "deadman seconds")
     name = unit_name(run_id, f"{DEADMAN_PREFIX}-{kind}")
-    run(["systemctl", "stop", f"{name}.timer"], check=False)
-    run(["systemctl", "reset-failed", f"{name}.service"], check=False)
+    run(["systemctl", "stop", f"{name}.timer"], check=False, timeout=QUICK_SECONDS)
+    run(
+        ["systemctl", "reset-failed", f"{name}.service"],
+        check=False,
+        timeout=QUICK_SECONDS,
+    )
     run(
         [
             "systemd-run",
@@ -210,6 +352,7 @@ def arm_deadman(run_id: str, kind: str, seconds: int) -> str:
             "--property=Restart=on-failure",
             "--property=RestartSec=30s",
             "--property=StartLimitIntervalSec=0",
+            f"--property=TimeoutStopSec={UNIT_TIMEOUT_STOP_SECONDS}",
             sys.executable,
             str(probe_copy(run_id)),
             "cleanup",
@@ -217,7 +360,8 @@ def arm_deadman(run_id: str, kind: str, seconds: int) -> str:
             run_id,
             "--kind",
             kind,
-        ]
+        ],
+        timeout=QUICK_SECONDS,
     )
     if unit_state(f"{name}.timer").get("ActiveState") != "active":
         raise ProbeError(f"deadman {name} is not armed")
@@ -226,12 +370,17 @@ def arm_deadman(run_id: str, kind: str, seconds: int) -> str:
 
 def disarm_deadman(run_id: str, kind: str) -> None:
     name = unit_name(run_id, f"{DEADMAN_PREFIX}-{kind}")
-    run(["systemctl", "stop", f"{name}.timer"], check=False)
+    run(["systemctl", "stop", f"{name}.timer"], check=False, timeout=QUICK_SECONDS)
     if unit_state(f"{name}.service").get("MainPID") != str(os.getpid()):
-        run(["systemctl", "stop", f"{name}.service"], check=False)
+        run(
+            ["systemctl", "stop", f"{name}.service"],
+            check=False,
+            timeout=UNIT_STOP_SECONDS,
+        )
     run(
         ["systemctl", "reset-failed", f"{name}.service", f"{name}.timer"],
         check=False,
+        timeout=QUICK_SECONDS,
     )
 
 
@@ -242,7 +391,11 @@ def start_unit(
     command: list[str],
     *properties: str,
 ) -> str:
-    """A transient unit that stops itself after ``seconds`` (``RuntimeMaxSec``)."""
+    """A transient unit that stops itself after ``seconds`` (``RuntimeMaxSec``).
+
+    It runs in the host's namespaces (PID 1 forks it), whatever namespace the
+    caller is in, and a stop of it is bounded by ``UNIT_TIMEOUT_STOP_SECONDS``.
+    """
 
     bounded(seconds, 10, MAX_SECONDS, "unit seconds")
     name = unit_name(run_id, kind)
@@ -250,25 +403,43 @@ def start_unit(
     if name not in state["units"]:
         state["units"].append(name)
         save_state(run_id, state)
-    run(["systemctl", "stop", f"{name}.service"], check=False)
-    run(["systemctl", "reset-failed", f"{name}.service"], check=False)
+    run(
+        ["systemctl", "stop", f"{name}.service"],
+        check=False,
+        timeout=UNIT_STOP_SECONDS,
+    )
+    run(
+        ["systemctl", "reset-failed", f"{name}.service"],
+        check=False,
+        timeout=QUICK_SECONDS,
+    )
     run(
         [
             "systemd-run",
             f"--unit={name}",
             "--collect",
             f"--property=RuntimeMaxSec={int(seconds)}",
+            f"--property=TimeoutStopSec={UNIT_TIMEOUT_STOP_SECONDS}",
             *[f"--property={item}" for item in properties],
             *command,
-        ]
+        ],
+        timeout=QUICK_SECONDS,
     )
     return name
 
 
 def stop_unit(run_id: str, kind: str) -> dict[str, str]:
     name = unit_name(run_id, kind)
-    run(["systemctl", "stop", f"{name}.service"], check=False, timeout=120)
-    run(["systemctl", "reset-failed", f"{name}.service"], check=False)
+    run(
+        ["systemctl", "stop", f"{name}.service"],
+        check=False,
+        timeout=UNIT_STOP_SECONDS,
+    )
+    run(
+        ["systemctl", "reset-failed", f"{name}.service"],
+        check=False,
+        timeout=QUICK_SECONDS,
+    )
     return unit_state(f"{name}.service")
 
 
@@ -292,9 +463,9 @@ def statvfs_reading(path: str) -> dict[str, Any]:
     }
 
 
-def mounts() -> list[dict[str, str]]:
+def mounts(table: Path = Path("/proc/self/mountinfo")) -> list[dict[str, str]]:
     result = []
-    for line in Path("/proc/self/mountinfo").read_text().splitlines():
+    for line in table.read_text().splitlines():
         fields = line.split()
         try:
             separator = fields.index("-")
@@ -309,6 +480,19 @@ def mounts() -> list[dict[str, str]]:
             }
         )
     return result
+
+
+def host_mounts() -> list[dict[str, str]]:
+    """The host root mount namespace's mounts (this Pod's own table if unreadable)."""
+
+    try:
+        return mounts(HOST_MOUNTINFO)
+    except OSError:
+        return mounts()
+
+
+def mounted_on_host(target: str) -> bool:
+    return any(item["mountpoint"] == target for item in host_mounts())
 
 
 def backing_root(value: str, size_bytes: int) -> Path:
@@ -338,8 +522,8 @@ def run_backing_dir(run_id: str, root: Path) -> Path:
 # --------------------------------------------------------------------------- #
 # Test file systems and test block devices
 # --------------------------------------------------------------------------- #
-def loop_attach(path: Path) -> str:
-    completed = run(["losetup", "--find", "--show", str(path)])
+def loop_attach(path: Path, *, timeout: float = 180) -> str:
+    completed = run(["losetup", "--find", "--show", str(path)], timeout=timeout)
     device = completed.stdout.strip()
     if not re.fullmatch(r"/dev/loop\d+", device):
         raise ProbeError("losetup returned an unexpected device")
@@ -556,13 +740,53 @@ def dm_table(sectors: int, loop: str, delay_ms: int) -> str:
 
 
 def dm_device_name(dm: str) -> str:
-    """``dm-N`` -- the name ``/proc/diskstats`` and the product report."""
+    """``dm-N`` of the mapping ``dm``: the name ``/proc/diskstats`` and the
+    product report, read back from the kernel's own ``/sys/block/dm-N/dm/name``
+    -- so the identity holds whether ``/dev/mapper/<dm>`` is udev's symlink or
+    a plain node."""
 
-    resolved = os.path.realpath(f"/dev/mapper/{dm}")
-    return os.path.basename(resolved)
+    for entry in sorted(SYS_BLOCK.glob("dm-*")):
+        try:
+            named = (entry / "dm" / "name").read_text().strip()
+        except OSError:
+            continue
+        if named == dm:
+            return entry.name
+    raise ProbeError("the test mapping has no dm-N block device")
+
+
+def setup_kind(name: str) -> str:
+    """The setup unit, ``gfrs-<digest>-io-<name>-setup`` (``residue`` lists it)."""
+
+    return f"io-{checked_name(name)}-setup"
+
+
+def module_loaded(name: str) -> bool:
+    return (SYS_MODULE / name).exists()
+
+
+def update_device(run_id: str, name: str, **values: Any) -> dict[str, Any]:
+    """Merge ``values`` into the device record (written before the next step)."""
+
+    state = load_state(run_id)
+    entry = state["devices"].get(name)
+    if entry is None:
+        raise ProbeError("no test device of this name")
+    entry.update(values)
+    save_state(run_id, state)
+    return dict(entry)
 
 
 def dm_create(arguments: argparse.Namespace) -> None:
+    """Record the test device and start its bounded setup unit; return at once.
+
+    The deadman is armed first and the record written before anything is
+    built, so ``cleanup --kind dm-<name>`` undoes whatever the setup reached.
+    ``--load-module`` (KERNEL_MODULE_LOAD) loads a missing ``dm_delay``,
+    recorded before the load so ``cleanup`` unloads it again. The runner polls
+    ``dm-status`` until the record reads ``ready`` or ``failed``.
+    """
+
     run_id = checked_run_id(arguments.run_id)
     name = checked_name(arguments.name)
     size_mib = bounded(arguments.size_mib, MIN_FS_MIB, MAX_FS_MIB, "size MiB")
@@ -573,51 +797,163 @@ def dm_create(arguments: argparse.Namespace) -> None:
         MAX_DEADMAN_SECONDS,
         "deadman seconds",
     )
-    if delay_ms and not Path("/sys/module/dm_delay").exists():
+    load = bool(delay_ms) and not module_loaded(DELAY_MODULE)
+    if load and not arguments.load_module:
         raise ProbeError("dm_delay is not loaded on this node")
+    if not tool_present("nsenter"):
+        raise ProbeError("nsenter is missing: device commands cannot reach the host")
     state = load_state(run_id)
     if name in state["devices"] or name in state["filesystems"]:
         raise ProbeError("a test device of this name already exists")
     root = backing_root(arguments.backing, size_mib * 1024 * 1024)
     deadman = arm_deadman(run_id, f"dm-{name}", seconds)
-    backing = run_backing_dir(run_id, root) / f"{name}.img"
-    target = mountpoint(run_id, name)
     dm = dm_name(run_id, name)
+    unit = unit_name(run_id, setup_kind(name))
     state["devices"][name] = {
-        "backing": str(backing),
-        "mountpoint": str(target),
+        "backing": str(run_backing_dir(run_id, root) / f"{name}.img"),
+        "mountpoint": str(mountpoint(run_id, name)),
         "loop": None,
         "dm": dm,
         "dm_path": f"/dev/mapper/{dm}",
         "delay_ms": delay_ms,
+        "size_mib": size_mib,
         "mounted": False,
+        "phase": "setup",
+        "step": None,
+        "setup_unit": unit,
     }
+    if load and DELAY_MODULE not in state["modules"]:
+        # Recorded before the load: it was not loaded, so loaded later is ours.
+        state["modules"].append(DELAY_MODULE)
     save_state(run_id, state)
-    run(["fallocate", "-l", f"{size_mib}M", str(backing)])
-    loop = loop_attach(backing)
-    state["devices"][name]["loop"] = loop
-    save_state(run_id, state)
-    sectors = int(run(["blockdev", "--getsz", loop]).stdout.strip())
-    run(["dmsetup", "create", dm], input_text=dm_table(sectors, loop, delay_ms) + "\n")
-    state["devices"][name]["sectors"] = sectors
-    save_state(run_id, state)
-    run(
-        ["mkfs.ext4", "-q", "-F", "-m", "0", "-L", f"gfrs-{name}", f"/dev/mapper/{dm}"],
-        timeout=600,
+    if load:
+        run(["modprobe", DELAY_MODULE], check=False, timeout=QUICK_SECONDS)
+        if not module_loaded(DELAY_MODULE):
+            raise ProbeError("dm_delay could not be loaded")
+    command = [sys.executable, str(probe_copy(run_id)), "dm-setup"]
+    start_unit(
+        run_id,
+        setup_kind(name),
+        SETUP_MAX_SECONDS,
+        [*command, "--run-id", run_id, "--name", name],
     )
-    target.mkdir(mode=0o755, parents=True, exist_ok=True)
-    run(["mount", "-t", "ext4", f"/dev/mapper/{dm}", str(target)])
-    state["devices"][name]["mounted"] = True
-    save_state(run_id, state)
     emit(
         {
             "name": name,
             "dm": dm,
-            "device": dm_device_name(dm),
-            "loop": loop,
-            "mountpoint": str(target),
+            "phase": "setup",
+            "setup_unit": unit,
+            "setup_max_seconds": SETUP_MAX_SECONDS,
+            "module_loaded_by_run": load,
             "delay_ms": delay_ms,
             "deadman": deadman,
+            "state": unit_state(f"{unit}.service"),
+        }
+    )
+
+
+def dm_setup(arguments: argparse.Namespace) -> None:
+    """The setup unit's body: back, map, format and mount the recorded device.
+
+    Runs only in the unit ``dm-create`` starts, i.e. in the host's namespaces.
+    Each step is recorded before it runs; a failure records the step, the
+    error class, a digest of its message and its site, and exits non-zero.
+    """
+
+    run_id = checked_run_id(arguments.run_id)
+    name = checked_name(arguments.name)
+    entry = checked_device(run_id, name)
+    if entry.get("phase") != "setup":
+        raise ProbeError("the test device is not waiting for its setup")
+    try:
+        ready = build_device(run_id, name, entry)
+    except Exception as exc:
+        update_device(
+            run_id,
+            name,
+            phase="failed",
+            setup_error_class=type(exc).__name__,
+            setup_error_code=error_code(exc),
+            setup_error_site=exception_site(exc),
+        )
+        raise
+    emit(ready)
+
+
+def build_device(run_id: str, name: str, entry: dict[str, Any]) -> dict[str, Any]:
+    def step(label: str) -> float:
+        update_device(run_id, name, step=label)
+        return SETUP_STEP_SECONDS[label]
+
+    backing = str(entry["backing"])
+    size = f"{int(entry['size_mib'])}M"
+    run(["fallocate", "-l", size, backing], timeout=step("fallocate"))
+    loop = loop_attach(Path(backing), timeout=step("losetup"))
+    update_device(run_id, name, loop=loop)
+    blocks = run(["blockdev", "--getsz", loop], timeout=step("blockdev"))
+    sectors = int(blocks.stdout.strip())
+    update_device(run_id, name, sectors=sectors)
+    table = dm_table(sectors, loop, int(entry["delay_ms"]))
+    dmsetup("create", entry["dm"], "--table", table, timeout=step("dmsetup-create"))
+    device = dm_device_name(entry["dm"])
+    update_device(run_id, name, device=device)
+    label = f"gfrs-{name}"
+    mkfs = ["mkfs.ext4", "-q", "-F", "-m", "0", "-L", label, entry["dm_path"]]
+    run(mkfs, timeout=step("mkfs"))
+    timeout = step("mount")
+    Path(entry["mountpoint"]).mkdir(mode=0o755, parents=True, exist_ok=True)
+    host_command(
+        ["mount", "-t", "ext4", entry["dm_path"], entry["mountpoint"]],
+        timeout=timeout,
+    )
+    update_device(run_id, name, mounted=True, phase="ready", step=None)
+    return {
+        "name": name,
+        "phase": "ready",
+        "device": device,
+        "dm": entry["dm"],
+        "loop": loop,
+        "mountpoint": entry["mountpoint"],
+        "delay_ms": entry["delay_ms"],
+    }
+
+
+def dm_status(arguments: argparse.Namespace) -> None:
+    """Where the device's setup stands: ``setup``, ``ready`` or ``failed``.
+
+    The unit is read before the record: the worker writes its result before
+    it exits, so a record still at ``setup`` behind a unit that no longer runs
+    means the worker died without one (killed at ``RuntimeMaxSec``, or never
+    started) -- ``failed``, at the step it had reached. No ``error`` key: the
+    host fixture would read the answer as a failed call.
+    """
+
+    run_id = checked_run_id(arguments.run_id)
+    name = checked_name(arguments.name)
+    unit = unit_state(f"{unit_name(run_id, setup_kind(name))}.service")
+    entry = checked_device(run_id, name)
+    phase = str(entry.get("phase") or "ready")
+    lost = phase == "setup" and unit.get("ActiveState") not in RUNNING_STATES
+    failed = lost or phase == "failed"
+    emit(
+        {
+            "name": name,
+            "phase": "failed" if lost else phase,
+            "step": entry.get("step"),
+            "failed_step": (entry.get("step") or "start") if failed else None,
+            "setup_error_class": (
+                "SetupUnitEnded" if lost else entry.get("setup_error_class")
+            ),
+            "setup_error_code": entry.get("setup_error_code"),
+            "setup_error_site": entry.get("setup_error_site"),
+            "device": entry.get("device") if phase == "ready" else None,
+            "dm": entry.get("dm"),
+            "loop": entry.get("loop"),
+            "mountpoint": entry.get("mountpoint"),
+            "delay_ms": entry.get("delay_ms"),
+            "setup_unit": {
+                key: unit.get(key) for key in ("LoadState", "ActiveState", "SubState")
+            },
         }
     )
 
@@ -629,19 +965,26 @@ def checked_device(run_id: str, name: str) -> dict[str, Any]:
     return dict(entry)
 
 
+def ready_device(run_id: str, name: str) -> dict[str, Any]:
+    entry = checked_device(run_id, name)
+    if entry.get("phase", "ready") != "ready":
+        raise ProbeError("the test device has not finished its setup")
+    return entry
+
+
 def dm_suspend(arguments: argparse.Namespace) -> None:
     """Suspend the test device; a deadman resumes it after ``seconds``."""
 
     run_id = checked_run_id(arguments.run_id)
-    entry = checked_device(run_id, arguments.name)
+    entry = ready_device(run_id, arguments.name)
     seconds = bounded(arguments.seconds, MIN_DEADMAN_SECONDS, 180, "suspend seconds")
     deadman = arm_deadman(run_id, f"resume-{checked_name(arguments.name)}", seconds)
-    run(["dmsetup", "suspend", "--nolockfs", "--noflush", entry["dm"]], timeout=60)
+    dmsetup("suspend", "--nolockfs", "--noflush", entry["dm"])
     emit(
         {
             "suspended": entry["dm"],
             "deadman": deadman,
-            "info": run(["dmsetup", "info", entry["dm"]], check=False).stdout[-400:],
+            "info": dmsetup("info", entry["dm"], check=False).stdout[-400:],
         }
     )
 
@@ -649,35 +992,59 @@ def dm_suspend(arguments: argparse.Namespace) -> None:
 def dm_resume(arguments: argparse.Namespace) -> None:
     run_id = checked_run_id(arguments.run_id)
     entry = checked_device(run_id, arguments.name)
-    run(["dmsetup", "resume", entry["dm"]], timeout=60)
+    dmsetup("resume", entry["dm"])
     disarm_deadman(run_id, f"resume-{checked_name(arguments.name)}")
     emit({"resumed": entry["dm"]})
 
 
 def dm_recreate(arguments: argparse.Namespace) -> None:
-    """Remove and recreate the mapping under the same name: counters restart."""
+    """Remove and recreate the mapping under the same name: counters restart.
+
+    The writer must be stopped first: its open files keep the mount busy, and
+    an unmount would fail ``EBUSY``.
+    """
 
     run_id = checked_run_id(arguments.run_id)
     name = checked_name(arguments.name)
-    entry = checked_device(run_id, name)
+    entry = ready_device(run_id, name)
+    writer = unit_state(f"{unit_name(run_id, f'io-{name}')}.service")
+    if writer.get("ActiveState") in RUNNING_STATES:
+        raise ProbeError("the writer still runs; stop it before the recreate")
     before = dm_device_name(entry["dm"])
-    if entry.get("mounted"):
-        run(["umount", entry["mountpoint"]], timeout=120)
-    run(["dmsetup", "remove", entry["dm"]], timeout=60)
-    run(
-        ["dmsetup", "create", entry["dm"]],
-        input_text=dm_table(
-            int(entry["sectors"]), entry["loop"], int(entry["delay_ms"])
-        )
-        + "\n",
+    if mounted_on_host(entry["mountpoint"]):
+        host_command(["umount", entry["mountpoint"]], timeout=UMOUNT_SECONDS)
+    dmsetup("remove", entry["dm"])
+    table = dm_table(int(entry["sectors"]), entry["loop"], int(entry["delay_ms"]))
+    dmsetup("create", entry["dm"], "--table", table)
+    host_command(
+        ["mount", "-t", "ext4", entry["dm_path"], entry["mountpoint"]],
+        timeout=MOUNT_SECONDS,
     )
-    run(["mount", "-t", "ext4", entry["dm_path"], entry["mountpoint"]])
-    emit(
-        {
-            "dm": entry["dm"],
-            "device_before": before,
-            "device_after": dm_device_name(entry["dm"]),
-        }
+    after = dm_device_name(entry["dm"])
+    update_device(run_id, name, device=after, mounted=True)
+    emit({"dm": entry["dm"], "device_before": before, "device_after": after})
+
+
+def loop_devices() -> list[dict[str, Any]]:
+    if not tool_present("losetup"):
+        return []
+    listing = run(["losetup", "-J", "-l"], check=False, timeout=QUICK_SECONDS).stdout
+    try:
+        devices = json.loads(listing or "{}").get("loopdevices") or []
+    except json.JSONDecodeError:
+        return []
+    return [item for item in devices if isinstance(item, dict)]
+
+
+def backing_loops(backing: str) -> list[str]:
+    """Loop devices backed by ``backing`` (also once it is deleted): only these
+    are ever detached, never a loop device that a recorded name now points at."""
+
+    names = {backing, f"{backing} (deleted)"}
+    return sorted(
+        str(item.get("name"))
+        for item in loop_devices()
+        if str(item.get("back-file") or "") in names
     )
 
 
@@ -686,35 +1053,67 @@ def destroy_device(run_id: str, name: str) -> dict[str, Any]:
     entry = state["devices"].get(name)
     if entry is None:
         return {"name": name, "absent": True}
-    if shutil.which("dmsetup"):
-        run(["dmsetup", "resume", entry["dm"]], check=False, timeout=60)
+    dm = entry["dm"]
+    if tool_present("dmsetup"):
+        dmsetup("resume", dm, check=False)
     target = entry["mountpoint"]
-    if any(item["mountpoint"] == target for item in mounts()):
-        run(["umount", target], check=False, timeout=120)
-        if any(item["mountpoint"] == target for item in mounts()):
-            run(["umount", "-l", target], timeout=120)
-    if (
-        shutil.which("dmsetup")
-        and run(["dmsetup", "info", entry["dm"]], check=False).returncode == 0
-    ):
-        run(["dmsetup", "remove", "--retry", entry["dm"]], timeout=120)
-    if entry.get("loop"):
-        run(["losetup", "-d", entry["loop"]], check=False)
+    if mounted_on_host(target):
+        host_command(["umount", target], check=False, timeout=UMOUNT_SECONDS)
+        if mounted_on_host(target):
+            host_command(["umount", "-l", target], timeout=UMOUNT_SECONDS)
+    if tool_present("dmsetup") and dmsetup("info", dm, check=False).returncode == 0:
+        dmsetup("remove", "--retry", dm)
+    detached = backing_loops(entry["backing"])
+    for loop in detached:
+        run(["losetup", "-d", loop], check=False, timeout=QUICK_SECONDS)
     Path(entry["backing"]).unlink(missing_ok=True)
     if Path(target).is_dir():
         Path(target).rmdir()
-    del state["devices"][name]
+    state = load_state(run_id)
+    state["devices"].pop(name, None)
     save_state(run_id, state)
-    return {"name": name, "destroyed": True}
+    return {"name": name, "destroyed": True, "detached": detached}
+
+
+def destroy_dm(run_id: str, name: str) -> dict[str, Any]:
+    """Stop the device's setup and writer units, remove it, disarm its deadmen."""
+
+    stop_unit(run_id, setup_kind(name))
+    stop_unit(run_id, f"io-{name}")
+    result = destroy_device(run_id, name)
+    disarm_deadman(run_id, f"resume-{name}")
+    disarm_deadman(run_id, f"dm-{name}")
+    return result
+
+
+def unload_modules(run_id: str) -> list[str]:
+    """Unload each module this run loaded, once no device of the run is left."""
+
+    state = load_state(run_id)
+    if state["devices"] or not state["modules"]:
+        return []
+    unloaded: list[str] = []
+    kept: list[str] = []
+    for name in state["modules"]:
+        root = SYS_MODULE / str(name)
+        if name == DELAY_MODULE and root.exists():
+            try:
+                users = (root / "refcnt").read_text().strip()
+            except OSError:
+                users = "0"
+            if users == "0":
+                run(["modprobe", "-r", name], check=False, timeout=QUICK_SECONDS)
+        (kept if root.exists() else unloaded).append(str(name))
+    state["modules"] = kept
+    save_state(run_id, state)
+    return unloaded
 
 
 def dm_destroy(arguments: argparse.Namespace) -> None:
     run_id = checked_run_id(arguments.run_id)
     name = checked_name(arguments.name)
-    stop_unit(run_id, f"io-{name}")
-    result = destroy_device(run_id, name)
-    disarm_deadman(run_id, f"dm-{name}")
-    disarm_deadman(run_id, f"resume-{name}")
+    result = destroy_dm(run_id, name)
+    result["modules_unloaded"] = unload_modules(run_id)
     emit(result)
 
 
@@ -743,9 +1142,13 @@ for worker in workers: worker.join()
 
 
 def io_start(arguments: argparse.Namespace) -> None:
+    """A bounded O_DIRECT writer unit on the test mount (host namespaces)."""
+
     run_id = checked_run_id(arguments.run_id)
     name = checked_name(arguments.name)
-    entry = checked_device(run_id, name)
+    entry = ready_device(run_id, name)
+    if not mounted_on_host(entry["mountpoint"]):
+        raise ProbeError("the test device is not mounted on the host")
     threads = bounded(arguments.threads, 1, 64, "threads")
     block_kib = bounded(arguments.block_kib, 4, 1024, "block KiB")
     seconds = bounded(arguments.seconds, 10, 1800, "seconds")
@@ -790,29 +1193,23 @@ def residue(run_id: str) -> dict[str, Any]:
     digest = run_digest(run_id)
     own_mounts = [
         item["mountpoint"]
-        for item in mounts()
+        for item in host_mounts()
         if item["mountpoint"].startswith(str(MOUNT_ROOT / digest))
     ]
     dms: list[str] = []
-    if shutil.which("dmsetup"):
-        listing = run(["dmsetup", "ls"], check=False).stdout
+    if tool_present("dmsetup"):
+        # ``ls`` sends no uevent, so it needs no cookie and no host namespace.
+        listing = run(["dmsetup", "ls"], check=False, timeout=QUICK_SECONDS).stdout
         dms = [
             line.split()[0]
             for line in listing.splitlines()
             if line.startswith(f"{UNIT_PREFIX}{digest}-")
         ]
-    loops: list[str] = []
-    if shutil.which("losetup"):
-        listing = run(["losetup", "-J", "-l"], check=False).stdout
-        try:
-            devices = json.loads(listing or "{}").get("loopdevices") or []
-        except json.JSONDecodeError:
-            devices = []
-        loops = [
-            str(item.get("name"))
-            for item in devices
-            if f"gfrs-live-{digest}" in str(item.get("back-file") or "")
-        ]
+    loops = [
+        str(item.get("name"))
+        for item in loop_devices()
+        if f"gfrs-live-{digest}" in str(item.get("back-file") or "")
+    ]
     files = sorted(
         str(path)
         for root in BACKING_ROOTS
@@ -830,15 +1227,18 @@ def residue(run_id: str) -> dict[str, Any]:
                 f"{UNIT_PREFIX}{digest}-io-*",
             ],
             check=False,
+            timeout=QUICK_SECONDS,
         ).stdout.splitlines()
         if line.strip()
     ]
+    modules = [name for name in load_state(run_id)["modules"] if module_loaded(name)]
     return {
         "mounts": own_mounts,
         "device_mapper": dms,
         "loop_devices": loops,
         "backing_files": files,
         "units": units,
+        "modules_loaded_by_run": modules,
     }
 
 
@@ -856,20 +1256,29 @@ def cleanup(arguments: argparse.Namespace) -> None:
         raise ProbeError("unsafe cleanup kind")
     actions: list[dict[str, Any]] = []
     state = load_state(run_id)
-    for name in list(state["devices"]):
+    devices = set(state["devices"])
+    if kind.startswith("dm-"):
+        # A device whose record never landed still has its units and deadman.
+        devices.add(kind[3:])
+    for name in sorted(devices):
         if kind in {"all", f"dm-{name}"}:
-            stop_unit(run_id, f"io-{name}")
-            actions.append({"device": destroy_device(run_id, name)})
-            disarm_deadman(run_id, f"resume-{name}")
-            disarm_deadman(run_id, f"dm-{name}")
-        elif kind == f"resume-{name}" and shutil.which("dmsetup"):
-            run(["dmsetup", "resume", state["devices"][name]["dm"]], check=False)
+            actions.append({"device": destroy_dm(run_id, name)})
+        elif (
+            kind == f"resume-{name}"
+            and name in state["devices"]
+            and tool_present("dmsetup")
+        ):
+            dmsetup("resume", state["devices"][name]["dm"], check=False)
             actions.append({"resumed_device": name})
             disarm_deadman(run_id, kind)
     for name in list(state["filesystems"]):
         if kind in {"all", f"fs-{name}"}:
             actions.append({"filesystem": destroy_filesystem(run_id, name)})
             disarm_deadman(run_id, f"fs-{name}")
+    if kind == "all" or kind.startswith("dm-"):
+        unloaded = unload_modules(run_id)
+        if unloaded:
+            actions.append({"modules_unloaded": unloaded})
     if kind == "all":
         for root in BACKING_ROOTS:
             directory = root / f"gfrs-live-{run_digest(run_id)}"
@@ -921,6 +1330,8 @@ def parser() -> argparse.ArgumentParser:
         ("dm-resume", dm_resume),
         ("dm-recreate", dm_recreate),
         ("dm-destroy", dm_destroy),
+        ("dm-setup", dm_setup),
+        ("dm-status", dm_status),
         ("io-stop", io_stop),
     ):
         command(name, handler).add_argument("--name", required=True)
@@ -939,6 +1350,7 @@ def parser() -> argparse.ArgumentParser:
     item.add_argument("--delay-ms", type=int, default=0)
     item.add_argument("--backing", required=True)
     item.add_argument("--deadman-seconds", type=int, required=True)
+    item.add_argument("--load-module", action="store_true")
     item = command("dm-suspend", dm_suspend)
     item.add_argument("--name", required=True)
     item.add_argument("--seconds", type=int, required=True)
@@ -952,21 +1364,47 @@ def parser() -> argparse.ArgumentParser:
     return value
 
 
+def error_code(exc: BaseException) -> str:
+    return hashlib.sha256(str(exc).encode()).hexdigest()[:16]
+
+
+def exception_site(exc: BaseException) -> str | None:
+    """The innermost ``function:line`` of this file on the exception's path,
+    above the command helpers -- the step that ran the failing command."""
+
+    site = None
+    frame = exc.__traceback__
+    while frame is not None:
+        code = frame.tb_frame.f_code
+        if code.co_filename == __file__ and code.co_name not in HELPER_FRAMES:
+            site = f"{code.co_name}:{frame.tb_lineno}"
+        frame = frame.tb_next
+    return site
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = parser().parse_args(argv)
+    budget = CALL_BUDGET_SECONDS.get(arguments.command)
+    DEADLINE[:] = [time.monotonic() + budget] if budget else []
     try:
         arguments.handler(arguments)
     except Exception as exc:  # noqa: BLE001 - reported as the probe's JSON error
+        # The host fixture withholds this output; the class, a digest of the
+        # message and the site are the message-free trail it may show.
         emit(
             {
                 "error": type(exc).__name__,
                 "error_kind": "probe",
                 "error_class": type(exc).__name__,
+                "error_code": error_code(exc),
+                "error_site": exception_site(exc),
                 "command": arguments.command,
             }
         )
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
+    finally:
+        DEADLINE[:] = []
     return 0
 
 
