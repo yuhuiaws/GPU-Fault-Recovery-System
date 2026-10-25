@@ -36,6 +36,7 @@ def test_identity_accepts_the_actual_control_plane_wheel_and_its_shared_admin_cl
         "gpu_fault.admin.site",
         "gpu_fault.admin.site_cluster_profile",
         "gpu_fault.admin.site_fields",
+        "gpu_fault.admin.site_s3",
     }, (
         "the guard must use the actual reviewed component closure, not an empty admin package"
     )
@@ -56,6 +57,30 @@ def test_identity_accepts_the_actual_control_plane_wheel_and_its_shared_admin_cl
         assert probe.runtime_identity() == report, (
             "the measured guard and standalone probe must agree on actual wheel identity"
         )
+
+
+def test_the_probe_allowlist_mirrors_the_application_shared_admin_modules():
+    """The probe is a standalone payload and spells its allowlist out; the
+    reviewed source of truth is ``coverage.application_shared_files`` of
+    config/ci-unit-gate.json (what the CI gate and the wheel closure agree
+    on). Live 2026-10-25 (R13f staging): admin/site_s3.py entered the
+    control-plane closure through admin/site.py, the config was updated, the
+    probe was not, and the real control-plane wheel was refused as a
+    forbidden surface."""
+
+    from scripts.ci_coverage_config import load_config
+    from scripts.e2e.regional.probes import notify008_identity
+
+    shared = load_config()["coverage"]["application_shared_files"]
+    admin_files = {
+        name.removeprefix("src/gpu_fault/admin/")
+        for name in shared
+        if name.startswith("src/gpu_fault/admin/")
+    }
+    assert notify008_identity.SHARED_ADMIN_FILES == frozenset(admin_files), (
+        "the identity probe's shared admin allowlist drifted from "
+        "config/ci-unit-gate.json application_shared_files"
+    )
 
 
 @pytest.mark.parametrize(

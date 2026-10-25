@@ -13,6 +13,11 @@ from typing import Any
 
 import gpu_fault
 
+#: The admin modules the control-plane wheel legitimately carries: the site
+#: document reader and what it imports (``training_submit_cli`` loads a site).
+#: Mirrors ``coverage.application_shared_files`` of config/ci-unit-gate.json;
+#: this probe is a standalone payload, so the set is spelled out here and
+#: tests/regional/test_cov95_notify008_component.py keeps the two equal.
 SHARED_ADMIN_FILES = frozenset(
     {
         "__init__.py",
@@ -25,6 +30,7 @@ SHARED_ADMIN_FILES = frozenset(
         "site.py",
         "site_cluster_profile.py",
         "site_fields.py",
+        "site_s3.py",
     }
 )
 
