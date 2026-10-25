@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,7 @@ import pytest
 
 from scripts.e2e.regional import general_live_storage as storage
 from scripts.e2e.regional.general_live_common import STORE_POLL_SECONDS
+from scripts.e2e.regional.general_live_deps import DEPS_TIMEOUT, PACKAGE_APPROVAL
 from scripts.e2e.regional.general_live_fixture import VariantInconclusive, VariantNotRun
 from tests.regional._general_live_fakes import (
     FakeProbe,
@@ -17,6 +19,7 @@ from tests.regional._general_live_fakes import (
     host_batch,
     incident,
     make_context,
+    make_settings,
     store_script,
     workflow,
 )
@@ -716,22 +719,51 @@ def test_dm_io_load_runs_natively_with_or_without_a_loaded_dm_delay(
 ERR_MOUNT = "/mnt"  # the scripted dm-status mountpoint
 
 
+DOSFS_NEVRA = "dosfstools-4.2-3.amzn2023.0.2.x86_64"
+WITH_INSTALL = ("KERNEL_MODULE_LOAD", PACKAGE_APPROVAL)
+
+
+def deps_probe(**overrides: Any) -> FakeProbe:
+    """The dependency probe: ``dosfstools`` installed for the run, clean removal."""
+
+    ensure = {
+        "refused": None,
+        "tools": {"mkfs.vfat": True},
+        "modules": {},
+        "installed": [DOSFS_NEVRA],
+        "modules_loaded_by_run": [],
+        "transaction": [{"name": "dosfstools", "section": "Installing"}],
+        "deadman": "gfrs-abcdef-pdeadman",
+    }
+    ensure.update(overrides)
+    return FakeProbe({"ensure": ensure, "cleanup": {"clean": True}})
+
+
 def probe_error_context(
     tmp_path: Path,
     *,
     activity: dict[str, Any] | None,
     store: FakeProbe | None = None,
     node: FakeProbe | None = None,
+    deps: FakeProbe | None = None,
+    approvals: tuple[str, ...] | None = None,
 ) -> tuple[Any, Any]:
     spec = SPECS["probe_error"]
     regional = FakeRegional(cpu_python=store_script({"activity": activity or {}}))
+    settings = make_settings(spec, node=NODE)
+    if approvals is not None:
+        settings = dataclasses.replace(settings, approvals=approvals)
     ctx = make_context(
         spec,
         tmp_path=tmp_path,
         regional=regional,
-        probes=probes(
-            node or node_probe(survey()), store or storage_probe(), window_probe()
-        ),
+        probes={
+            **probes(
+                node or node_probe(survey()), store or storage_probe(), window_probe()
+            ),
+            f"deps@{NODE}": deps or deps_probe(),
+        },
+        settings=settings,
     )
     return spec, ctx
 
@@ -740,6 +772,7 @@ def test_probe_error_is_a_native_variant_behind_kernel_module_load() -> None:
     spec = SPECS["probe_error"]
     assert spec.implemented and not spec.deferred, spec
     assert spec.approvals == ("KERNEL_MODULE_LOAD",), spec.approvals
+    assert spec.optional_approvals == (PACKAGE_APPROVAL,), spec.optional_approvals
     assert spec.lanes == ("eks", "hp"), spec.lanes
     assert spec.expected_outcome == "PASS" and not spec.product_gap, spec
 
@@ -816,9 +849,108 @@ def test_probe_error_refuses_an_active_node_log_collector(tmp_path: Path) -> Non
 def test_probe_error_needs_mkfs_vfat(tmp_path: Path) -> None:
     value = survey()
     value["tools"]["mkfs.vfat"] = False
-    spec, ctx = probe_error_context(tmp_path, activity={}, node=node_probe(value))
-    with pytest.raises(VariantNotRun, match="mkfs.vfat"):
+    deps = deps_probe()
+    store = storage_probe()
+    spec, ctx = probe_error_context(
+        tmp_path, activity={}, node=node_probe(value), store=store, deps=deps
+    )
+    with pytest.raises(VariantNotRun) as raised:
         spec.execute(ctx)
+    assert raised.value.reason == "CAPABILITY_ABSENT"
+    assert raised.value.detail == (
+        "the node lacks mkfs.vfat (TEMP_TEST_PACKAGE_INSTALL installs dosfstools "
+        "for one run)"
+    )
+    assert deps.calls == [] and store.calls == [], "refused before any change"
+    assert ctx.cleanup.pending() == []
+
+
+def test_probe_error_installs_dosfstools_for_the_run_behind_the_token(
+    tmp_path: Path,
+) -> None:
+    value = survey()
+    value["tools"]["mkfs.vfat"] = False
+    deps = deps_probe()
+    store = storage_probe()
+    spec, ctx = probe_error_context(
+        tmp_path,
+        activity=unavailable_activity(ERR_MOUNT, "PROBE_FAILED"),
+        node=node_probe(value),
+        store=store,
+        deps=deps,
+        approvals=WITH_INSTALL,
+    )
+    result = spec.execute(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    assert deps.calls == [
+        (
+            "ensure",
+            "--tool",
+            "mkfs.vfat",
+            "--deadman-seconds",
+            str(spec.max_minutes * 60 + 600 + DEPS_TIMEOUT + 300),
+            "--allow-install",
+            "--run-id",
+            ctx.run_id,
+        )
+    ]
+    created = next(call for call in store.calls if call[0] == "dm-create")
+    assert ("--fstype", "vfat") == created[
+        created.index("--fstype") : created.index("--fstype") + 2
+    ], "the device is built with the tool installed moments before"
+    assert result["dependencies"] == {
+        "changed": True,
+        "installed": [DOSFS_NEVRA],
+        "modules_loaded_by_run": [],
+        "transaction": [{"name": "dosfstools", "section": "Installing"}],
+    }
+    # LIFO: the device goes first, the package last.
+    assert ctx.cleanup.pending() == ["deps", "dm"], ctx.cleanup.pending()
+    assert ctx.cleanup.run() and ctx.cleanup.failed == [], ctx.cleanup.results
+    assert deps.calls[-1] == ("cleanup", "--run-id", ctx.run_id)
+    assert store.calls[-1][:3] == ("cleanup", "--kind", "dm-err"), store.calls[-1]
+
+
+def test_probe_error_with_mkfs_vfat_present_installs_nothing(tmp_path: Path) -> None:
+    deps = deps_probe()
+    spec, ctx = probe_error_context(
+        tmp_path,
+        activity=unavailable_activity(ERR_MOUNT, "PROBE_FAILED"),
+        deps=deps,
+        approvals=WITH_INSTALL,
+    )
+    result = spec.execute(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    assert deps.calls == [] and result["dependencies"]["changed"] is False
+    assert ctx.cleanup.pending() == ["dm"]
+
+
+def test_probe_error_refused_install_is_fixture_not_ready_before_the_device(
+    tmp_path: Path,
+) -> None:
+    value = survey()
+    value["tools"]["mkfs.vfat"] = False
+    refused = {
+        "reason": "FIXTURE_NOT_READY",
+        "detail": "dnf would also upgrading glibc-2.34-52.amzn2023.0.10.x86_64",
+    }
+    store = storage_probe()
+    spec, ctx = probe_error_context(
+        tmp_path,
+        activity={},
+        node=node_probe(value),
+        store=store,
+        deps=deps_probe(refused=refused, installed=[], tools={"mkfs.vfat": False}),
+        approvals=WITH_INSTALL,
+    )
+    with pytest.raises(VariantNotRun) as raised:
+        spec.execute(ctx)
+    assert (raised.value.reason, raised.value.detail) == (
+        "FIXTURE_NOT_READY",
+        refused["detail"],
+    )
+    assert store.calls == [], "no device once the dependency step refused"
+    assert ctx.cleanup.pending() == ["deps"], "a half-finished install is undone"
 
 
 def test_probe_error_fails_when_the_product_never_reports_the_mount(

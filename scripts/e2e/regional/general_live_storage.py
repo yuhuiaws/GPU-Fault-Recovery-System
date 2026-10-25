@@ -24,7 +24,12 @@ free clusters from the device at the first ``statfs`` after a mount; ext4
 answers from memory). ``--target data`` restores it. The node log collector
 must be inactive (its storage rule grades a ``Buffer I/O error`` line
 QUARANTINE; the swap is made with nothing dirty so no such line is written,
-but an active collector would make the chain ambiguous). 006
+but an active collector would make the chain ambiguous). A node without
+``mkfs.vfat`` (the AL2023 EKS GPU AMI) keeps ``probe_error``
+NOT_RUN(CAPABILITY_ABSENT) unless the optional ``TEMP_TEST_PACKAGE_INSTALL`` is
+given; then the shared temporary-package step (``general_live_deps``) installs
+exactly ``dosfstools`` for this run before the device is built and removes it
+as the last LIFO cleanup, after the device is destroyed. 006
 ``disk_io_util_percent``/``disk_io_await_ms`` are WARNING
 RUN_DIAGNOSTICS with a 120 s sustain; the oracle's own ``/proc/diskstats`` read
 computes the standard await (fields 4+8 over 1+5) to compare with the product's,
@@ -53,6 +58,12 @@ from scripts.e2e.regional.general_live_common import (
     run_survey,
     wait_for_incident,
     wait_settled,
+)
+from scripts.e2e.regional.general_live_deps import (
+    PACKAGE_APPROVAL,
+    dependency_summary,
+    deps_deadman_seconds,
+    ensure_dependencies,
 )
 from scripts.e2e.regional.general_live_fixture import (
     VariantContext,
@@ -326,6 +337,26 @@ def _refuse_active_log_collector(survey: dict[str, Any]) -> None:
         )
 
 
+def _ensure_mkfs_vfat(ctx: VariantContext, survey: dict[str, Any]) -> dict[str, Any]:
+    """``mkfs.vfat`` as the node has it, or ``dosfstools`` for this run only.
+
+    The shared temporary-package step: NOT_RUN(CAPABILITY_ABSENT) naming the
+    token without ``TEMP_TEST_PACKAGE_INSTALL``; with it the probe installs
+    exactly ``dosfstools``, the survey then says the node has ``mkfs.vfat`` for
+    ``_create_dm``'s own tool check, and the removal is the last LIFO cleanup,
+    after the test device is destroyed. The package deadman is timed after the
+    device's (``max_minutes * 60 + 600``).
+    """
+
+    return ensure_dependencies(
+        ctx,
+        survey,
+        tools=("mkfs.vfat",),
+        deadman_seconds=deps_deadman_seconds(ctx.spec.max_minutes * 60 + 600),
+        evidence="probe-error-dependencies",
+    )
+
+
 def _failure_mode_errors(detection: dict[str, Any], mount: str, mode: str) -> list[str]:
     """The unusable readings carry the variant's ``failure_mode`` label.
 
@@ -363,9 +394,10 @@ def _unusable_filesystem_variant(
     """
 
     survey = run_survey(ctx)
+    dependencies: dict[str, Any] = {"changed": False, "installed": []}
     if variant == "probe_error":
         _refuse_active_log_collector(survey)
-        require_tools(survey, "mkfs.vfat")
+        dependencies = _ensure_mkfs_vfat(ctx, survey)
         created = _create_dm(ctx, name=TEST_ERR, fstype="vfat", size_mib=ERR_SIZE_MIB)
         mount = str(created.get("mountpoint") or _err_mount(ctx))
     else:
@@ -433,7 +465,14 @@ def _unusable_filesystem_variant(
     )
     close_window(ctx)
     ctx.cleanup.discard("collector-window")
-    return _result(stages, extra={"injection": injected, "recovery": recovered})
+    return _result(
+        stages,
+        extra={
+            "injection": injected,
+            "recovery": recovered,
+            "dependencies": dependency_summary(dependencies),
+        },
+    )
 
 
 def _inject_unusable(ctx: VariantContext, variant: str) -> dict[str, Any]:
@@ -1303,6 +1342,7 @@ def _fs_spec(
     outcome: str = "PASS",
     gap: str = "",
     approvals=(),
+    optional_approvals=(),
 ) -> VariantSpec:
     return VariantSpec(
         case_id=CASE_004,
@@ -1319,6 +1359,7 @@ def _fs_spec(
         expected_outcome=outcome,
         product_gap=gap,
         approvals=tuple(approvals),
+        optional_approvals=tuple(optional_approvals),
     )
 
 
@@ -1400,14 +1441,18 @@ VARIANTS = [
         "probe_error",
         "a declared FAT16 test mount over loop + dm whose table is swapped to the "
         "dm_mod error target under a fresh mount: statvfs EIO while mounted rw "
-        "(KERNEL_MODULE_LOAD loads a missing vfat; the node log collector must be off)",
+        "(KERNEL_MODULE_LOAD loads a missing vfat; the optional "
+        "TEMP_TEST_PACKAGE_INSTALL installs a missing mkfs.vfat as dosfstools for "
+        "the run; the node log collector must be off)",
         "filesystem_unavailable (PROBE_FAILED) -> FREEZE_EVIDENCE, VALIDATE_HOST; "
         "no capacity finding, no reset/reboot/quarantine (batch 163: an "
         "unreadable status is unusable, never healthy); readmit once the data "
         "table is back",
-        "data table back, close the window, destroy the device, unload vfat if loaded here",
+        "data table back, close the window, destroy the device, unload vfat if loaded "
+        "here, remove dosfstools if installed here",
         probe_error,
         approvals=("KERNEL_MODULE_LOAD",),
+        optional_approvals=(PACKAGE_APPROVAL,),
     ),
     _fs_spec(
         "duplicate",

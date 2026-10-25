@@ -157,7 +157,7 @@ def ensure_dependencies(
     arguments += ["--deadman-seconds", str(int(deadman_seconds))]
     if may_install:
         arguments.append("--allow-install")
-    if MODULE_APPROVAL in approvals:
+    if modules and MODULE_APPROVAL in approvals:
         arguments.append("--allow-module-load")
     require_action_time(DEPS_TIMEOUT)
     # Registered before the change: a half-finished install is undone too, and
