@@ -33,6 +33,7 @@ def _hung_triage_agent(
     create_pipe: bool = True,
     rank: int = 4,
     pid: int = 100,
+    environment: dict[str, str] | None = None,
 ):
     """An agent whose only operation is a hung triage of one fake rank.
 
@@ -41,7 +42,8 @@ def _hung_triage_agent(
     ``/proc/<pid>/environ``, and each rank's summary is published at
     ``result.details["ranks"][i]["flight_recorder"]``. The returned path is the
     container's namespace root, so a test can plant dumps where the Agent will
-    look for them.
+    look for them. ``environment`` replaces the two default recorder variables
+    with exactly the variables given (``RANK`` is always written).
     """
 
     proc_root = tmp_path / "proc"
@@ -49,10 +51,19 @@ def _hung_triage_agent(
     namespace_root = proc_dir / "root"
     (namespace_root / "tmp").mkdir(parents=True)
     (proc_dir / "cwd").mkdir()
+    variables = (
+        {
+            "TORCH_NCCL_DEBUG_INFO_PIPE_FILE": pipe_file,
+            "TORCH_NCCL_DEBUG_INFO_TEMP_FILE": temp_file,
+        }
+        if environment is None
+        else environment
+    )
     (proc_dir / "environ").write_bytes(
-        f"RANK={rank}\0"
-        f"TORCH_NCCL_DEBUG_INFO_PIPE_FILE={pipe_file}\0"
-        f"TORCH_NCCL_DEBUG_INFO_TEMP_FILE={temp_file}\0".encode()
+        "".join(
+            f"{key}={value}\0"
+            for key, value in {"RANK": str(rank), **variables}.items()
+        ).encode()
     )
     (proc_dir / "status").write_text("voluntary_ctxt_switches:\t10\n")
     (proc_dir / "wchan").write_text("futex_wait\n")
@@ -247,6 +258,206 @@ def test_flight_recorder_trigger_survives_an_unstattable_pipe(
     assert result.status is NodeActionStatus.SUCCEEDED, result.error
     summary = result.details["ranks"][0]["flight_recorder"]
     assert summary["status"] == "pipe_missing", summary
+
+
+#: A rank that configured the debug pipe and nothing else about the dump file.
+PIPE_ONLY = {"TORCH_NCCL_DEBUG_INFO_PIPE_FILE": "/tmp/nccl_pipe_"}
+
+
+def test_flight_recorder_dump_follows_torch_fr_dump_temp_file_first(
+    tmp_path, monkeypatch
+) -> None:
+    """PyTorch 2.9 reads ``TORCH_FR_DUMP_TEMP_FILE`` before the old name.
+
+    ``DebugInfoWriter::getWriter`` (FlightRecorder.cpp, torch 2.9.0) resolves
+    the dump prefix as ``TORCH_FR_DUMP_TEMP_FILE`` first and the pre-2.9
+    ``TORCH_NCCL_DEBUG_INFO_TEMP_FILE`` second, then writes ``<prefix><rank>``.
+    The Agent read only the old name, so a rank that set the new one dumped
+    where the Agent never looked.
+    """
+
+    agent, namespace_root = _hung_triage_agent(
+        tmp_path,
+        monkeypatch,
+        "fr-dump-temp-file.db",
+        environment={
+            **PIPE_ONLY,
+            "TORCH_FR_DUMP_TEMP_FILE": "/scratch/fr_",
+            "TORCH_NCCL_DEBUG_INFO_TEMP_FILE": "/tmp/legacy_",
+        },
+        sleep=lambda _seconds: dump.write_text(_flight_dump_payload()),
+    )
+    (namespace_root / "scratch").mkdir()
+    dump = namespace_root / "scratch" / "fr_4"
+
+    result = _triage(agent)
+
+    assert result.status is NodeActionStatus.SUCCEEDED, result.error
+    summary = result.details["ranks"][0]["flight_recorder"]
+    assert summary["status"] == "dumped", summary
+    assert summary["dump_file"] == str(dump), summary
+    assert summary["dump_source"] == "TORCH_FR_DUMP_TEMP_FILE", summary
+
+
+@pytest.mark.parametrize(
+    ("home", "cache_root"),
+    [("/root", ("root",)), (None, ("tmp",))],
+    ids=["HOME=/root", "HOME unset falls back to /tmp"],
+)
+def test_flight_recorder_finds_the_torch_2_9_default_dump_under_home_cache(
+    tmp_path, monkeypatch, home, cache_root
+) -> None:
+    """Without a prefix variable torch 2.9 dumps under ``$HOME/.cache/torch``.
+
+    ``comm_lib_trace_rank_<rank>`` in ``<HOME, else /tmp>/.cache/torch`` is the
+    2.9.0 default (the writer creates the directory). Live on HyperPod
+    (pytorch-training 2.9.0, HOME=/root) every rank of GF-GENERAL-LIVE-011
+    fr_enabled dumped there while the Agent waited on ``/tmp/nccl_trace_rank_``
+    and reported ``dump_missing`` for all 16.
+    """
+
+    environment = dict(PIPE_ONLY)
+    if home is not None:
+        environment["HOME"] = home
+    agent, namespace_root = _hung_triage_agent(
+        tmp_path,
+        monkeypatch,
+        "fr-home-cache.db",
+        environment=environment,
+        sleep=lambda _seconds: dump.write_text(_flight_dump_payload()),
+    )
+    cache = namespace_root.joinpath(*cache_root, ".cache", "torch")
+    cache.mkdir(parents=True)
+    dump = cache / "comm_lib_trace_rank_4"
+
+    result = _triage(agent)
+
+    assert result.status is NodeActionStatus.SUCCEEDED, result.error
+    summary = result.details["ranks"][0]["flight_recorder"]
+    assert summary["status"] == "dumped", summary
+    assert summary["dump_file"] == str(dump), summary
+    assert summary["dump_source"] == "torch_home_cache_default", summary
+
+
+def test_flight_recorder_finds_the_legacy_default_dump_without_a_prefix_variable(
+    tmp_path, monkeypatch
+) -> None:
+    """torch 2.8 and older default the dump to ``/tmp/nccl_trace_rank_<rank>``."""
+
+    agent, namespace_root = _hung_triage_agent(
+        tmp_path,
+        monkeypatch,
+        "fr-legacy-default.db",
+        environment={**PIPE_ONLY, "HOME": "/root"},
+        sleep=lambda _seconds: dump.write_text(_flight_dump_payload()),
+    )
+    dump = namespace_root / "tmp" / "nccl_trace_rank_4"
+
+    result = _triage(agent)
+
+    assert result.status is NodeActionStatus.SUCCEEDED, result.error
+    summary = result.details["ranks"][0]["flight_recorder"]
+    assert summary["status"] == "dumped", summary
+    assert summary["dump_file"] == str(dump), summary
+    assert summary["dump_source"] == "legacy_tmp_default", summary
+
+
+def test_flight_recorder_dump_missing_lists_the_candidates_it_checked(
+    tmp_path, monkeypatch
+) -> None:
+    """A missing dump names every path the Agent waited on, newest default first.
+
+    ``dump_missing`` used to carry the pipe and nothing else, so the live
+    record could not say whether the Agent had looked where PyTorch wrote.
+    """
+
+    agent, namespace_root = _hung_triage_agent(
+        tmp_path,
+        monkeypatch,
+        "fr-dump-missing.db",
+        environment={**PIPE_ONLY, "HOME": "/root"},
+        sleep=lambda _seconds: time.sleep(0.05),
+    )
+
+    result = _triage(agent, timeout_seconds=2)
+
+    assert result.status is NodeActionStatus.SUCCEEDED, result.error
+    summary = result.details["ranks"][0]["flight_recorder"]
+    assert summary["status"] == "dump_missing", summary
+    assert summary["dump_prefix_variable"] is None, summary
+    candidates = summary["dump_candidates"]
+    cache_default = str(
+        namespace_root / "root" / ".cache" / "torch" / "comm_lib_trace_rank_4"
+    )
+    legacy_default = str(namespace_root / "tmp" / "nccl_trace_rank_4")
+    assert cache_default in candidates and legacy_default in candidates, candidates
+    assert candidates.index(cache_default) < candidates.index(legacy_default), (
+        candidates
+    )
+
+
+def test_flight_recorder_not_configured_reads_the_trace_buffer_by_either_name(
+    tmp_path, monkeypatch
+) -> None:
+    """``not_configured`` says which buffer variable the rank set, new name included."""
+
+    agent, _ = _hung_triage_agent(
+        tmp_path,
+        monkeypatch,
+        "fr-not-configured.db",
+        environment={"TORCH_FR_BUFFER_SIZE": "20000"},
+        create_pipe=False,
+        sleep=lambda _seconds: None,
+    )
+
+    result = _triage(agent)
+
+    assert result.status is NodeActionStatus.SUCCEEDED, result.error
+    summary = result.details["ranks"][0]["flight_recorder"]
+    assert summary["status"] == "not_configured", summary
+    assert summary["trace_buffer"] == {
+        "variable": "TORCH_FR_BUFFER_SIZE",
+        "value": "20000",
+        "enabled": True,
+        "pipe_enabled": False,
+    }, summary
+
+
+@pytest.mark.parametrize(
+    ("buffer_variable", "hinted"),
+    [("TORCH_FR_BUFFER_SIZE", True), ("TORCH_NCCL_TRACE_BUFFER_SIZE", False)],
+)
+def test_flight_recorder_pipe_missing_explains_a_buffer_enabled_by_the_new_name_only(
+    tmp_path, monkeypatch, buffer_variable, hinted
+) -> None:
+    """torch 2.9.0's DumpPipe opens only when ``TORCH_NCCL_TRACE_BUFFER_SIZE`` > 0.
+
+    ``TORCH_FR_BUFFER_SIZE`` sizes the ring buffer (FlightRecorder.hpp) but the
+    pipe constructor (ProcessGroupNCCL.hpp ``DumpPipe``) still reads the old
+    name alone, so a job that only renamed the buffer knob records traces the
+    Agent can never trigger. The ``pipe_missing`` row says so instead of
+    leaving the operator to diff PyTorch releases.
+    """
+
+    agent, _ = _hung_triage_agent(
+        tmp_path,
+        monkeypatch,
+        "fr-pipe-missing.db",
+        environment={**PIPE_ONLY, buffer_variable: "20000"},
+        create_pipe=False,
+        sleep=lambda _seconds: None,
+    )
+
+    result = _triage(agent)
+
+    assert result.status is NodeActionStatus.SUCCEEDED, result.error
+    summary = result.details["ranks"][0]["flight_recorder"]
+    assert summary["status"] == "pipe_missing", summary
+    assert summary["trace_buffer"]["variable"] == buffer_variable, summary
+    assert summary["trace_buffer"]["pipe_enabled"] is not hinted, summary
+    assert ("TORCH_NCCL_TRACE_BUFFER_SIZE > 0" in summary.get("hint", "")) is hinted, (
+        summary
+    )
 
 
 def test_strace_samples_run_round_parallel_across_processes(tmp_path) -> None:

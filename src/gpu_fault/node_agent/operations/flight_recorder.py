@@ -7,12 +7,172 @@ import os
 import pickle
 import stat
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Callable
 
 from gpu_fault.flight_progress import apply_pg_status, completed, group_progress
 from gpu_fault.node_agent.operations.collection_budget import bounded_read
 from gpu_fault.node_agent.operations.flight_evidence import preserve_dump
+
+# PyTorch's flight recorder knobs, in PyTorch's own precedence. Evidence -- the
+# upstream sources, read line by line at the v2.9.0 tag (the live site's training
+# image is pytorch-training 2.9.0 / CUDA 13.0) and on ``main``:
+#
+# * https://github.com/pytorch/pytorch/blob/v2.9.0/torch/csrc/distributed/c10d/FlightRecorder.cpp
+#   ``DebugInfoWriter::getWriter``: ``auto homeDir = getCvarString({"HOME"},
+#   "/tmp");`` ``auto cacheDirPath = std::filesystem::path(homeDir +
+#   "/.cache/torch");`` ``std::filesystem::create_directories(cacheDirPath);``
+#   ``auto defaultLocation = cacheDirPath / "comm_lib_trace_rank_";``
+#   ``std::string fileNamePrefix = getCvarString({"TORCH_FR_DUMP_TEMP_FILE",
+#   "TORCH_NCCL_DEBUG_INFO_TEMP_FILE"}, defaultLocation.string().c_str());``
+# * https://github.com/pytorch/pytorch/blob/v2.9.0/torch/csrc/distributed/c10d/FlightRecorder.hpp
+#   the ``DebugInfoWriter`` constructor: ``filename_ = c10::str(namePrefix,
+#   rank);`` -- prefix + rank, no extension, no separator -- and
+#   ``FlightRecorder()``: ``max_entries_ = getCvarInt({"TORCH_FR_BUFFER_SIZE",
+#   "TORCH_NCCL_TRACE_BUFFER_SIZE"}, 0);`` ``enabled_ = max_entries_ > 0;``
+# * https://github.com/pytorch/pytorch/blob/v2.9.0/torch/csrc/distributed/c10d/ProcessGroupNCCL.hpp
+#   ``DumpPipe(int rank)``: ``std::string fileStem =
+#   getCvarString({"TORCH_NCCL_DEBUG_INFO_PIPE_FILE"}, "");`` ``if
+#   (fileStem.empty() || getCvarInt({"TORCH_NCCL_TRACE_BUFFER_SIZE"}, 0) <= 0)
+#   { return; }`` ``std::string filename = c10::str(fileStem, rank, ".pipe");``
+#   -- the pipe trigger is gated on the OLD buffer-size name alone.
+# * https://github.com/pytorch/pytorch/blob/main/torch/csrc/distributed/c10d/FlightRecorder.cpp
+#   ``DebugInfoWriter::getWriter`` on main: the cache root is ``XDG_CACHE_HOME``
+#   when set, else ``getCvarString({"HOME"}, "/tmp") + "/.cache"``;
+#   ``cacheDirPath = cacheRoot + "/torch"``; the default file stays
+#   ``comm_lib_trace_rank_`` and both prefix variable names are unchanged.
+#
+# ``getCvarString``/``getCvarInt`` (Utils.hpp) walk the name list in reverse so
+# the first name listed wins when both are set, and a variable set to the empty
+# string still counts as set. Before 2.9 the writer defaulted to
+# ``/tmp/nccl_trace_rank_`` and read ``TORCH_NCCL_DEBUG_INFO_TEMP_FILE`` only.
+PYTORCH_FLIGHT_RECORDER_CPP_REFERENCE = (
+    "https://github.com/pytorch/pytorch/blob/v2.9.0/"
+    "torch/csrc/distributed/c10d/FlightRecorder.cpp"
+)
+PYTORCH_FLIGHT_RECORDER_HPP_REFERENCE = (
+    "https://github.com/pytorch/pytorch/blob/v2.9.0/"
+    "torch/csrc/distributed/c10d/FlightRecorder.hpp"
+)
+PYTORCH_DUMP_PIPE_REFERENCE = (
+    "https://github.com/pytorch/pytorch/blob/v2.9.0/"
+    "torch/csrc/distributed/c10d/ProcessGroupNCCL.hpp"
+)
+PYTORCH_FLIGHT_RECORDER_MAIN_REFERENCE = (
+    "https://github.com/pytorch/pytorch/blob/main/"
+    "torch/csrc/distributed/c10d/FlightRecorder.cpp"
+)
+#: The two upstream lines the operations manuals quote verbatim
+#: (``scripts/check-doc-facts.py`` pins them in both language editions).
+PYTORCH_DUMP_PREFIX_QUOTE = (
+    'getCvarString({"TORCH_FR_DUMP_TEMP_FILE", "TORCH_NCCL_DEBUG_INFO_TEMP_FILE"}, '
+    "defaultLocation.string().c_str())"
+)
+PYTORCH_DUMP_PIPE_QUOTE = (
+    'if (fileStem.empty() || getCvarInt({"TORCH_NCCL_TRACE_BUFFER_SIZE"}, 0) <= 0)'
+)
+#: The official tutorial, and the sentence of it that is stale against the
+#: 2.9.0 code: it still gives the pre-2.9 default for ``TORCH_FR_DUMP_TEMP_FILE``,
+#: its example sets the old ``TORCH_NCCL_DEBUG_INFO_TEMP_FILE`` name, it names
+#: ``TORCH_NCCL_TRACE_BUFFER_SIZE`` and ``TORCH_NCCL_DUMP_ON_TIMEOUT`` only and
+#: does not document the pipe variable. The default list above is NOT to be
+#: "corrected" back to ``/tmp/nccl_trace_rank_`` alone on its strength.
+PYTORCH_FLIGHT_RECORDER_TUTORIAL_REFERENCE = (
+    "https://docs.pytorch.org/tutorials/unstable/flight_recorder_tutorial.html"
+)
+PYTORCH_TUTORIAL_STALE_DEFAULT_QUOTE = "The default value is /tmp/nccl_trace_rank_"
+#: The pipe the Agent writes ``1\n`` into; one name in every PyTorch generation.
+DUMP_PIPE_VARIABLE = "TORCH_NCCL_DEBUG_INFO_PIPE_FILE"
+#: The dump prefix, new name first (2.9+), the pre-2.9 name still honoured.
+DUMP_PREFIX_VARIABLES = ("TORCH_FR_DUMP_TEMP_FILE", "TORCH_NCCL_DEBUG_INFO_TEMP_FILE")
+#: The ring buffer size, new name first (2.9+), the pre-2.9 name still honoured.
+TRACE_BUFFER_VARIABLES = ("TORCH_FR_BUFFER_SIZE", "TORCH_NCCL_TRACE_BUFFER_SIZE")
+#: The only buffer variable the 2.9.0 ``DumpPipe`` constructor reads.
+PIPE_TRACE_BUFFER_VARIABLE = "TORCH_NCCL_TRACE_BUFFER_SIZE"
+#: The default dump file name under the cache directory (2.9+ and main).
+CACHE_DUMP_NAME = "comm_lib_trace_rank_"
+#: The default dump prefix of PyTorch 2.8 and older.
+LEGACY_DUMP_PREFIX = "/tmp/nccl_trace_rank_"
+#: Why a rank whose only buffer variable is the new name has no pipe to trigger.
+PIPE_BUFFER_HINT = (
+    "PyTorch 2.9.0 opens TORCH_NCCL_DEBUG_INFO_PIPE_FILE only when "
+    "TORCH_NCCL_TRACE_BUFFER_SIZE > 0 (ProcessGroupNCCL.hpp DumpPipe); "
+    "TORCH_FR_BUFFER_SIZE alone sizes the ring buffer and creates no pipe: "
+    + PYTORCH_DUMP_PIPE_REFERENCE
+)
+
+
+def flight_dump_prefix(environment: Mapping[str, str]) -> tuple[str, str] | None:
+    """``(variable, prefix)`` PyTorch resolves for the dump, None for its default.
+
+    The first name of :data:`DUMP_PREFIX_VARIABLES` that is set wins, exactly
+    as ``getCvarString`` resolves it; an empty value is still a value.
+    """
+
+    for name in DUMP_PREFIX_VARIABLES:
+        value = environment.get(name)
+        if value is not None:
+            return name, value
+    return None
+
+
+def default_dump_prefixes(environment: Mapping[str, str]) -> list[tuple[str, str]]:
+    """``(source, prefix)`` pairs PyTorch dumps to without a prefix variable.
+
+    Newest generation first: ``$XDG_CACHE_HOME/torch`` (main), the rank's
+    ``$HOME/.cache/torch`` with ``/tmp`` for an unset HOME (2.9.0), then the
+    pre-2.9 ``/tmp/nccl_trace_rank_``. All are tried: the Agent does not know
+    which PyTorch the rank runs, and a stat of an absent path is free.
+    """
+
+    prefixes = []
+    cache_home = environment.get("XDG_CACHE_HOME")
+    if cache_home:
+        prefixes.append(
+            ("torch_xdg_cache_default", f"{cache_home}/torch/{CACHE_DUMP_NAME}")
+        )
+    home = environment.get("HOME", "/tmp")
+    prefixes.append(
+        ("torch_home_cache_default", f"{home}/.cache/torch/{CACHE_DUMP_NAME}")
+    )
+    prefixes.append(("legacy_tmp_default", LEGACY_DUMP_PREFIX))
+    return prefixes
+
+
+def _positive_integer(value: str | None) -> bool | None:
+    """``getCvarInt(..., 0) > 0``: unset is 0, an unparsable value is unknown."""
+
+    if value is None:
+        return False
+    try:
+        return int(value.strip()) > 0
+    except ValueError:
+        return None
+
+
+def trace_buffer_configuration(environment: Mapping[str, str]) -> dict[str, Any]:
+    """How the rank sizes the flight recorder ring buffer, by either name.
+
+    ``enabled`` follows ``FlightRecorder()`` (``TORCH_FR_BUFFER_SIZE``, then
+    ``TORCH_NCCL_TRACE_BUFFER_SIZE``, default 0); ``pipe_enabled`` follows the
+    2.9.0 ``DumpPipe`` (``TORCH_NCCL_TRACE_BUFFER_SIZE`` alone). An environment
+    the Agent could not read answers None throughout: no evidence, not "off".
+    """
+
+    if not environment:
+        return {"variable": None, "value": None, "enabled": None, "pipe_enabled": None}
+    pipe_enabled = _positive_integer(environment.get(PIPE_TRACE_BUFFER_VARIABLE))
+    for name in TRACE_BUFFER_VARIABLES:
+        value = environment.get(name)
+        if value is not None:
+            return {
+                "variable": name,
+                "value": value[:64],
+                "enabled": _positive_integer(value),
+                "pipe_enabled": pipe_enabled,
+            }
+    return {"variable": None, "value": None, "enabled": False, "pipe_enabled": False}
 
 
 class FlightRecorderUnpickler(pickle.Unpickler):
@@ -22,7 +182,7 @@ class FlightRecorderUnpickler(pickle.Unpickler):
     plain dict of builtins, so no global lookup is ever legitimate here.
     Refusing them keeps a compromised training container from getting
     code execution inside the root-owned Agent by planting a crafted
-    dump at ``TORCH_NCCL_DEBUG_INFO_TEMP_FILE``.
+    dump at its ``TORCH_FR_DUMP_TEMP_FILE`` / ``TORCH_NCCL_DEBUG_INFO_TEMP_FILE``.
     """
 
     def find_class(self, module: str, name: str) -> Any:
@@ -114,12 +274,15 @@ class FlightRecorderOperationsMixin:
 
     def _trigger_flight_recorder(self, process: dict[str, Any]) -> dict[str, Any]:
         environment = process.get("_environment") or {}
-        base = environment.get("TORCH_NCCL_DEBUG_INFO_PIPE_FILE")
+        base = environment.get(DUMP_PIPE_VARIABLE)
         rank = process.get("rank")
         pid = process["pid"]
-        result: dict[str, Any] = {"status": "not_configured"}
+        # Which buffer variable the rank set, by either name: the pipe decides
+        # the status, the buffer makes a not_configured / pipe_missing row say
+        # whether the recorder itself was on (``TORCH_FR_BUFFER_SIZE`` counts).
+        trace_buffer = trace_buffer_configuration(environment)
         if not base:
-            return result
+            return {"status": "not_configured", "trace_buffer": trace_buffer}
         raw_candidates = []
         if "{rank}" in base and rank is not None:
             raw_candidates.append(Path(base.format(rank=rank)))
@@ -133,15 +296,20 @@ class FlightRecorderOperationsMixin:
             None,
         )
         if pipe is None:
-            return {
+            missing: dict[str, Any] = {
                 "status": "pipe_missing",
                 "pipe_candidates": [str(path) for path in candidates],
+                "trace_buffer": trace_buffer,
             }
-        dump_candidates = self._flight_dump_candidates(
+            if trace_buffer["enabled"] and not trace_buffer["pipe_enabled"]:
+                missing["hint"] = PIPE_BUFFER_HINT
+            return missing
+        sources = self._flight_dump_candidate_sources(
             environment, rank, pid=pid, pipe=pipe
         )
+        resolved = flight_dump_prefix(environment)
         previous = {}
-        for candidate in dump_candidates:
+        for candidate in sources:
             candidate_stat = self._dump_file_stat(candidate)
             if candidate_stat is not None:
                 previous[str(candidate)] = candidate_stat.st_mtime_ns
@@ -160,14 +328,17 @@ class FlightRecorderOperationsMixin:
         return {
             "status": "triggered",
             "pipe": str(pipe),
-            "dump_candidates": [str(path) for path in dump_candidates],
+            "dump_candidates": [str(path) for path in sources],
+            "dump_sources": {str(path): label for path, label in sources.items()},
+            "dump_prefix_variable": resolved[0] if resolved else None,
             "previous_mtimes": previous,
         }
 
     @staticmethod
     def process_namespace_path_for_root(proc_root: Path, pid: int, path: Path) -> Path:
-        # ``path`` is read from the training container's environment
-        # (TORCH_NCCL_DEBUG_INFO_* variables), so it is attacker-influenced.
+        # ``path`` is read from the training container's environment (the
+        # TORCH_FR_* / TORCH_NCCL_DEBUG_INFO_* variables, HOME, XDG_CACHE_HOME),
+        # so it is attacker-influenced.
         # Map it into the container's mount namespace as the root-owned Agent
         # sees it (``/proc/<pid>/root`` for absolute paths, ``/cwd`` for
         # relative ones) and refuse anything that would escape that base via
@@ -201,52 +372,78 @@ class FlightRecorderOperationsMixin:
                 continue
         return mapped
 
+    def _flight_dump_candidate_sources(
+        self,
+        environment: Mapping[str, str],
+        rank: int | None,
+        *,
+        pid: int,
+        pipe: Path | None = None,
+    ) -> dict[Path, str]:
+        """Every path the dump may appear at, mapped into the rank's namespace.
+
+        Keys are in the order they are checked; each value names the rule that
+        produced the path -- the honoured prefix variable, ``pipe_sibling``, or
+        one of PyTorch's default generations (:func:`default_dump_prefixes`).
+        The prefix is resolved as PyTorch 2.9 resolves it: the new
+        ``TORCH_FR_DUMP_TEMP_FILE`` first, the pre-2.9 name second. Live on
+        HyperPod (pytorch-training 2.9.0, HOME=/root, no prefix variable) every
+        rank dumped to ``/root/.cache/torch/comm_lib_trace_rank_<rank>`` while
+        the Agent waited on ``/tmp/nccl_trace_rank_<rank>`` alone and reported
+        all 16 ranks ``dump_missing``.
+        """
+
+        sources: dict[Path, str] = {}
+
+        def add(label: str, raw: list[Path]) -> None:
+            for path in self._process_namespace_paths(pid, raw):
+                sources.setdefault(path, label)
+
+        resolved = flight_dump_prefix(environment)
+        if resolved is not None:
+            variable, prefix = resolved
+            raw = [Path(prefix)] if prefix else []
+            if rank is not None:
+                raw.extend(
+                    [
+                        Path(f"{prefix}{rank}"),
+                        Path(f"{prefix}{rank}.json"),
+                        Path(f"{prefix}.{rank}"),
+                        Path(f"{prefix}.{rank}.json"),
+                    ]
+                )
+            if prefix:
+                raw.append(Path(f"{prefix}.json"))
+            add(variable, raw)
+        if pipe is not None:
+            for sibling in (
+                pipe.with_suffix(""),
+                pipe.with_suffix(".json"),
+                Path(f"{pipe}.json"),
+            ):
+                sources.setdefault(sibling, "pipe_sibling")
+        if rank is not None:
+            for label, default_prefix in default_dump_prefixes(environment):
+                add(
+                    label,
+                    [
+                        Path(f"{default_prefix}{rank}"),
+                        Path(f"{default_prefix}{rank}.json"),
+                    ],
+                )
+        return sources
+
     def _flight_dump_candidates(
         self,
-        environment: dict[str, str],
+        environment: Mapping[str, str],
         rank: int | None,
         *,
         pid: int,
         pipe: Path | None = None,
     ) -> list[Path]:
-        base = environment.get("TORCH_NCCL_DEBUG_INFO_TEMP_FILE")
-        raw_candidates = [Path(base)] if base else []
-        if base and rank is not None:
-            raw_candidates.extend(
-                [
-                    Path(f"{base}{rank}"),
-                    Path(f"{base}{rank}.json"),
-                    Path(f"{base}.{rank}"),
-                    Path(f"{base}.{rank}.json"),
-                ]
-            )
-        if base:
-            raw_candidates.append(Path(f"{base}.json"))
-        candidates = self._process_namespace_paths(pid, raw_candidates)
-        if pipe is not None:
-            candidates.extend(
-                [
-                    pipe.with_suffix(""),
-                    pipe.with_suffix(".json"),
-                    Path(f"{pipe}.json"),
-                ]
-            )
-        if rank is not None:
-            candidates.extend(
-                [
-                    FlightRecorderOperationsMixin.process_namespace_path_for_root(
-                        self.proc_root,
-                        pid,
-                        Path(f"/tmp/nccl_trace_rank_{rank}"),
-                    ),
-                    FlightRecorderOperationsMixin.process_namespace_path_for_root(
-                        self.proc_root,
-                        pid,
-                        Path(f"/tmp/nccl_trace_rank_{rank}.json"),
-                    ),
-                ]
-            )
-        return list(dict.fromkeys(candidates))
+        return list(
+            self._flight_dump_candidate_sources(environment, rank, pid=pid, pipe=pipe)
+        )
 
     @staticmethod
     def _is_flight_pipe(path: Path) -> bool:
@@ -292,10 +489,17 @@ class FlightRecorderOperationsMixin:
             if info is not None and info.st_mtime_ns > int(previous.get(str(path), -1)):
                 updated.append((path, info))
         if not updated:
-            return {
+            # Name every path that was waited on, so a live ``dump_missing``
+            # says where the Agent looked instead of leaving the operator to
+            # guess whether PyTorch wrote somewhere else.
+            missing: dict[str, Any] = {
                 "status": "dump_missing",
                 "pipe": request.get("pipe"),
+                "dump_candidates": [str(path) for path in files],
             }
+            if "dump_prefix_variable" in request:
+                missing["dump_prefix_variable"] = request["dump_prefix_variable"]
+            return missing
         dump_path, dump_stat = max(
             updated,
             key=lambda item: item[1].st_mtime_ns,
@@ -306,6 +510,9 @@ class FlightRecorderOperationsMixin:
             "dump_file": str(dump_path),
             "dump_size_bytes": dump_stat.st_size,
         }
+        source = (request.get("dump_sources") or {}).get(str(dump_path))
+        if source:
+            summary["dump_source"] = source
         try:
             summary.update(
                 bounded_read(
