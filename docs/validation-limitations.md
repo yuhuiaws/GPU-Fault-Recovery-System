@@ -1453,7 +1453,9 @@ verdict reached after the restore, an inactive reading after it or no
 `rdma_link_down` sample inside the window are INCONCLUSIVE),
 or the reviewed `ethtool` wrapper serving, withdrawing or failing a group
 counter on the netdev an EFA function owns (`rnr`/`retry`/`cq_error`,
-`missing_counter` -> `efa_ethtool_counters_unsupported` MISSING_COUNTER,
+`missing_counter` -> `efa_ethtool_counters_unsupported` MISSING_COUNTER, read
+from the batch the changed marker is delivered in (its `not-supported:*` edge;
+the first live run found the changed marker never left the node),
 `ethtool_failed` -> a collection error, never a zero). Where no EFA function
 owns a netdev the fixture tree attaches one of the node's physical netdevs to
 an EFA device (`netdev_source: fixture`) so the product's ethtool path has a
@@ -1465,8 +1467,12 @@ baseline and ramps on; since batch 173 (one reset rule for the three readers,
 asserts the rule: per reader a collection error naming the reader (`_rdma` /
 `_efa_network`), the port or netdev, the counter that fell and `delta unknown`,
 no reading of that counter's delta or its aggregate (`rdma_errors_delta`,
-`rdma_<counter>_delta`, `efa_<group>_errors_delta`) in that batch, one incident
-per reader, no negative delta and never a clamped 0 after the reset. 009
+`rdma_<counter>_delta`, `efa_<group>_errors_delta`) in that batch, no more
+incidents per reader than the episodes the product's own readings show (a
+runner step slower than the tick ships a legitimate 0 reading that ends an
+episode and the next step opens one; the first live run read those as clamps
+and four incidents per reader as re-minted while the reset tick was UNKNOWN on
+both readers), no negative delta and no reading in the reset tick's batch. 009
 `counter_reset` (the drop interface deleted and recreated) grades the same way
 on `_network` and `network_drops_delta`, and is INCONCLUSIVE when the recreate
 straddled a tick and the baseline was pruned (neither an error nor a reading). 011

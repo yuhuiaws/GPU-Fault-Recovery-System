@@ -504,6 +504,107 @@ def unsupported_markers(
     ]
 
 
+def device_readings(
+    document: Mapping[str, Any], device: str, metrics: Iterable[str]
+) -> list[dict[str, Any]]:
+    """What each batch of the document says about one port's or netdev's counters.
+
+    The evidence a verdict needs when it fails: per batch its delivery
+    reasons, the collection errors naming the device, the NOT_SUPPORTED
+    marker samples (``reason``, ``metrics``) and the deltas of ``metrics``
+    shipped for it. Live 2026-10-25 ``missing_counter`` recorded only
+    accepted/not per poll, which could not tell a marker the product never
+    emitted from one its edge filter never delivered (the product gap found:
+    the changed marker was no edge), and ``counter_reset`` could not show
+    which ticks saw a ramp step and which shipped a 0 reading.
+    """
+
+    wanted = set(metrics)
+    readings = []
+    for batch in document.get("batches") or []:
+        batch_samples = [
+            sample
+            for sample in batch.get("samples") or []
+            if sample.get("device") == device
+        ]
+        readings.append(
+            {
+                "batch_id": batch.get("batch_id"),
+                "observed_at": batch.get("observed_at"),
+                "edge_filter_reasons": list(batch.get("edge_filter_reasons") or []),
+                "collection_errors": [
+                    str(error)
+                    for error in batch.get("collection_errors") or []
+                    if device in str(error)
+                ],
+                "markers": [
+                    dict(sample.get("labels") or {})
+                    for sample in batch_samples
+                    if sample.get("name") == UNSUPPORTED_METRIC
+                ],
+                "deltas": {
+                    str(sample.get("name")): sample.get("value")
+                    for sample in batch_samples
+                    if sample.get("name") in wanted
+                },
+            }
+        )
+    return readings
+
+
+def episodes(
+    document: Mapping[str, Any], metric: str, device: str, *, threshold: float = 1.0
+) -> int:
+    """How many times the product's own readings of ``metric`` crossed ``threshold``.
+
+    A reading at or above the threshold that follows no reading, or one below
+    it, opens an episode; the product mints one WARNING per episode because a
+    below-threshold reading of these metrics is a reading that clears the
+    signal (``_ZERO_IS_A_READING``). The number the reset must not exceed:
+    the clamped 0 of the old ``_rdma`` added a clearing reading the counter
+    never produced, and the next increase a second incident. A runner-driven
+    ramp whose steps are slower than the collector tick (live 2026-10-25: two
+    probe round trips per step, ~45 s against 15 s ticks) also ships 0
+    readings between its steps -- real readings, each ending an episode -- so
+    the incident count is judged against the episodes, never against 1.
+    """
+
+    count = 0
+    active = False
+    for item in samples(dict(document), metric, device=device):
+        value = item.get("value")
+        if not isinstance(value, (int, float)):
+            continue
+        above = value >= threshold
+        if above and not active:
+            count += 1
+        active = above
+    return count
+
+
+def readings_summary(readings: Sequence[Mapping[str, Any]]) -> str:
+    """One line naming what the batches carried, for a failure's text."""
+
+    markers = sorted(
+        {
+            f"{marker.get('reason')}[{marker.get('metrics')}]"
+            for reading in readings
+            for marker in reading.get("markers") or []
+        }
+    )
+    deltas = sorted(
+        {
+            f"{name}={value}"
+            for reading in readings
+            for name, value in (reading.get("deltas") or {}).items()
+        }
+    )
+    return (
+        f"{len(readings)} batch(es); markers: {', '.join(markers) or 'none'}; "
+        f"deltas: {', '.join(deltas) or 'none'}"
+    )
+
+
 def validation_errors(
     document: Mapping[str, Any],
     incident: Mapping[str, Any],
@@ -586,11 +687,14 @@ __all__ = [
     "EfaTarget",
     "collection_errors",
     "counter_target",
+    "device_readings",
     "efa_devices",
+    "episodes",
     "metric_values",
     "negative_readings",
     "netdev_target",
     "pair_target",
+    "readings_summary",
     "real_counter",
     "reset_tick_readings",
     "served_errors",

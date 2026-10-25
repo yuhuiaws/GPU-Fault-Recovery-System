@@ -75,9 +75,12 @@ from scripts.e2e.regional.general_live_efa_fixture import (
     EfaTarget,
     collection_errors,
     counter_target,
+    device_readings,
+    episodes,
     metric_values,
     negative_readings,
     netdev_target,
+    readings_summary,
     real_counter,
     reset_tick_readings,
     served_errors,
@@ -687,7 +690,16 @@ def ethtool_failed(ctx: VariantContext) -> dict[str, Any]:
 
 
 def missing_counter(ctx: VariantContext) -> dict[str, Any]:
-    """A counter the netdev stops exposing -> MISSING_COUNTER marker, never a zero delta."""
+    """A counter the netdev stops exposing -> MISSING_COUNTER marker, never a zero delta.
+
+    The marker is read from the product's batches, so the product must
+    *deliver* the tick on which it changed: its edge filter keys the marker by
+    its content (``collectors/host/network.py`` ``not_supported_edge_reason``)
+    since the live 2026-10-25 run, where the marker named the withdrawn counter
+    on every tick and no batch carrying it ever left the node. What each batch
+    carried for the netdev is written as ``counter-present-readings`` and
+    ``counter-missing-readings`` so a failed run shows what was read.
+    """
 
     run_survey(ctx)
     fixture = EfaSourceFixture(ctx)
@@ -721,6 +733,9 @@ def missing_counter(ctx: VariantContext) -> dict[str, Any]:
         timeout_seconds=ctx.host_interval * 4 + 30,
         name="counter-present",
     )
+    ctx.evidence.write(
+        "counter-present-readings", device_readings(present, interface, [metric])
+    )
     started = utc_now()
     fixture.replan_ethtool(
         [
@@ -739,6 +754,8 @@ def missing_counter(ctx: VariantContext) -> dict[str, Any]:
         timeout_seconds=ctx.host_summary + ctx.host_interval * 4 + 30,
         name="counter-missing",
     )
+    missing_readings = device_readings(observed, interface, [metric])
+    ctx.evidence.write("counter-missing-readings", missing_readings)
     journal = fixture.audit()
     stages = {
         "was_present": []
@@ -750,7 +767,8 @@ def missing_counter(ctx: VariantContext) -> dict[str, Any]:
         "not_supported_marker": []
         if unsupported_markers(observed, interface, metric, "MISSING_COUNTER")
         else [
-            f"no {UNSUPPORTED_METRIC} MISSING_COUNTER marker names {metric} on {interface}"
+            f"no {UNSUPPORTED_METRIC} MISSING_COUNTER marker names {metric} on "
+            f"{interface} since the withdrawal ({readings_summary(missing_readings)})"
         ],
         "no_zero_reading": [
             f"{metric} shipped {value} for {interface} after the counter disappeared"
@@ -790,11 +808,18 @@ def _ramp(
     accept: Callable[[dict[str, Any]], bool],
     timeout_seconds: float,
     name: str,
+    poll: bool = True,
 ) -> dict[str, Any]:
-    """Step both readers every half interval while polling the store.
+    """Step both readers every half interval, polling the store when asked.
 
-    Each collector tick must see at least one step, or a 0 delta would clear
-    the signal for a reason that is not the reset under test.
+    A collector tick that sees no step reads a 0 delta: a reading, which ends
+    the signal's episode for a reason that is not the reset under test (live
+    2026-10-25: every step cost two probe round trips plus a store read, ~45 s
+    against 15 s ticks, so most ticks shipped a 0 and each later step minted
+    its own incident). The step period is therefore measured from the step,
+    the store is read only when the caller can accept something, and every
+    step is written with its time so the verdict can be read against the
+    product's per-batch readings (``reset-readings``).
     """
 
     start = ctx.clock()
@@ -802,7 +827,9 @@ def _ramp(
     last_poll: datetime | None = None
     step_seconds = max(3, ctx.host_interval // 2)
     wanted = set(metrics)
+    steps: list[dict[str, Any]] = []
     while True:
+        stepped_at = ctx.clock()
         values["sysfs"] += RAMP_STEP
         fixture.step(sysfs, values["sysfs"])
         if ethtool is not None:
@@ -818,18 +845,22 @@ def _ramp(
                     )
                 ]
             )
+        steps.append({"at": stepped_at.isoformat(), **values})
         now = ctx.clock()
-        if last_poll is None or (now - last_poll).total_seconds() >= STORE_POLL_SECONDS:
+        if poll and (
+            last_poll is None or (now - last_poll).total_seconds() >= STORE_POLL_SECONDS
+        ):
             last = activity(ctx, since, metrics=wanted)
             last_poll = now
-            ctx.evidence.write(
-                f"{name}-ramp", {"values": dict(values), "at": now.isoformat()}
-            )
-            if accept(last):
-                return last
+        ctx.evidence.write(
+            f"{name}-ramp",
+            {"values": dict(values), "at": now.isoformat(), "steps": steps},
+        )
+        if poll and accept(last):
+            return last
         if (now - start).total_seconds() >= timeout_seconds:
             return last
-        ctx.sleep(step_seconds)
+        ctx.sleep(max(0.0, step_seconds - (ctx.clock() - stepped_at).total_seconds()))
 
 
 def counter_reset(ctx: VariantContext) -> dict[str, Any]:
@@ -839,7 +870,14 @@ def counter_reset(ctx: VariantContext) -> dict[str, Any]:
     and ramp on. The reset tick must read UNKNOWN on both: a ``_rdma`` /
     ``_efa_network`` collection error naming the port or netdev, the counter
     and ``delta unknown``, and no delta of the counter or its aggregate in
-    that batch -- the clamped 0 reading of the old ``_rdma`` is the FAIL.
+    that batch -- the clamped 0 reading of the old ``_rdma`` is the FAIL. A 0
+    reading on any *other* tick is a reading by the product's contract
+    (``_ZERO_IS_A_READING``): a tick the ramp did not reach ends the episode
+    and the next step opens a new one, so the incidents are judged against
+    the episodes the product's own readings show, never against 1 (live
+    2026-10-25: the first run flagged seven such readings and four incidents
+    per reader as "the reset re-minted the fault" while the reset tick itself
+    was UNKNOWN on both readers).
     """
 
     run_survey(ctx)
@@ -919,9 +957,17 @@ def counter_reset(ctx: VariantContext) -> dict[str, Any]:
         accept=lambda _document: False,
         timeout_seconds=ctx.host_interval * 4 + 20,
         name="reset-after",
+        poll=False,
     )
     ctx.hold(ctx.host_interval + 5, name="reset-settle")
     after = activity(ctx, started, metrics=metrics)
+    readings = {
+        "sysfs": device_readings(
+            after, target.port_device, (ERRORS_METRIC, target.counter_metric)
+        ),
+        "ethtool": device_readings(after, ethtool[0], (metric,)) if ethtool else [],
+    }
+    ctx.evidence.write("reset-readings", readings)
     sysfs_incidents = finding_incidents(after, ERRORS_METRIC, device=target.port_device)
     sysfs_needles = (
         "_rdma",
@@ -930,6 +976,11 @@ def counter_reset(ctx: VariantContext) -> dict[str, Any]:
         "reset",
         "delta unknown",
     )
+    gaps = {
+        "sysfs": len(
+            zero_readings(after, ERRORS_METRIC, target.port_device, after=started)
+        )
+    }
     stages: dict[str, list[str]] = {
         "fault_seen": []
         if finding_incidents(before, ERRORS_METRIC, device=target.port_device)
@@ -939,12 +990,9 @@ def counter_reset(ctx: VariantContext) -> dict[str, Any]:
         "no_decrement": negative_readings(
             after, (ERRORS_METRIC, target.counter_metric), target.port_device
         ),
-        "sysfs_single_incident": []
-        if len(sysfs_incidents) <= 1
-        else [
-            f"the reset re-minted the fault: {len(sysfs_incidents)} {ERRORS_METRIC} "
-            f"incidents on {target.port_device}"
-        ],
+        "sysfs_not_reminted": _reminted(
+            sysfs_incidents, after, ERRORS_METRIC, target.port_device
+        ),
         "sysfs_reset_unknown": (
             []
             if collection_errors(after, *sysfs_needles)
@@ -959,56 +1007,14 @@ def counter_reset(ctx: VariantContext) -> dict[str, Any]:
             sysfs_needles,
             (ERRORS_METRIC, target.counter_metric),
             target.port_device,
-        )
-        + [
-            f"{ERRORS_METRIC}=0 shipped for {target.port_device} at the reset "
-            f"(observed {item['observed_at']}): a clamped reset read as a clean port"
-            for item in zero_readings(
-                after, ERRORS_METRIC, target.port_device, after=reset_at
-            )
-        ],
+        ),
         "hardware": hardware_errors(after),
         "not_isolated": _not_isolated(ctx, after),
     }
     if ethtool is not None:
-        interface = ethtool[0]
-        ethtool_incidents = finding_incidents(after, metric, device=interface)
-        stages["ethtool_fault_seen"] = (
-            []
-            if finding_incidents(before, metric, device=interface)
-            else [f"no {metric} finding on {interface}"]
-        )
-        stages["ethtool_single_incident"] = (
-            []
-            if len(ethtool_incidents) <= 1
-            else [
-                f"the reset re-minted the fault: {len(ethtool_incidents)} {metric} incidents"
-            ]
-        )
-        ethtool_needles = (
-            "_efa_network",
-            interface,
-            ethtool[1],
-            "reset",
-            "delta unknown",
-        )
-        stages["ethtool_reset_unknown"] = (
-            (
-                []
-                if collection_errors(after, *ethtool_needles)
-                else [
-                    f"no _efa_network collection error names the {interface} "
-                    f"{ethtool[1]} reset with 'delta unknown'"
-                ]
-            )
-            + reset_tick_readings(after, ethtool_needles, (metric,), interface)
-            + [
-                f"{metric}=0 shipped for {interface} at the reset "
-                f"(observed {item['observed_at']})"
-                for item in zero_readings(after, metric, interface, after=reset_at)
-            ]
-        )
-        stages["no_decrement"] += negative_readings(after, (metric,), interface)
+        gaps["ethtool"] = len(zero_readings(after, metric, ethtool[0], after=started))
+        stages.update(_ethtool_reset_stages(before, after, ethtool, metric))
+        stages["no_decrement"] += negative_readings(after, (metric,), ethtool[0])
     minted_incidents = list(sysfs_incidents)
     if ethtool is not None:
         minted_incidents += finding_incidents(after, metric, device=ethtool[0])
@@ -1025,13 +1031,63 @@ def counter_reset(ctx: VariantContext) -> dict[str, Any]:
             "fault and not a recovery",
             "ethtool half: "
             + (f"{ethtool[1]} on {ethtool[0]}" if ethtool else "skipped"),
+            "ticks the ramp did not reach shipped a 0 reading (an episode's end by the "
+            f"product's contract, not the reset): {gaps}; incidents are judged against "
+            "the episodes the readings show (reset-readings)",
         ],
         extra={
             "target": target.describe(),
             "reset_at": reset_at.isoformat(),
             "values": values,
+            "zero_readings_between_steps": gaps,
         },
     )
+
+
+def _ethtool_reset_stages(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    ethtool: tuple[str, str],
+    metric: str,
+) -> dict[str, list[str]]:
+    """The ethtool reader's half of the ``counter_reset`` verdict."""
+
+    interface, counter = ethtool
+    needles = ("_efa_network", interface, counter, "reset", "delta unknown")
+    return {
+        "ethtool_fault_seen": []
+        if finding_incidents(before, metric, device=interface)
+        else [f"no {metric} finding on {interface}"],
+        "ethtool_not_reminted": _reminted(
+            finding_incidents(after, metric, device=interface), after, metric, interface
+        ),
+        "ethtool_reset_unknown": (
+            []
+            if collection_errors(after, *needles)
+            else [
+                f"no _efa_network collection error names the {interface} "
+                f"{counter} reset with 'delta unknown'"
+            ]
+        )
+        + reset_tick_readings(after, needles, (metric,), interface),
+    }
+
+
+def _reminted(
+    incidents: Sequence[Mapping[str, Any]],
+    document: Mapping[str, Any],
+    metric: str,
+    device: str,
+) -> list[str]:
+    """More incidents than the readings' episodes: a fault minted without a reading."""
+
+    count = episodes(document, metric, device)
+    if len(incidents) <= count:
+        return []
+    return [
+        f"the reset re-minted the fault: {len(incidents)} {metric} incidents on "
+        f"{device} for {count} episode(s) in the product's own readings"
+    ]
 
 
 # --------------------------------------------------------------------------- #

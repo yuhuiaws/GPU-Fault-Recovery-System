@@ -499,6 +499,50 @@ def test_missing_group_is_the_products_not_supported_marker(
     assert fx.real_counter("rnr", ["rnr_nak_err", "gfrs_retry_err"]) == "rnr_nak_err"
 
 
+def test_a_withdrawn_counter_is_delivered_by_the_products_edge_filter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``missing_counter`` reads the marker from delivered batches: the tick on
+    which a served counter disappears must be an edge (live 2026-10-25: it was
+    not, the marker named the counter on every tick and never left the node)."""
+
+    served = "NIC statistics:\n     gfrs_rnr_err: 0\n     queue_0_tx_cnt: 7\n"
+    withdrawn = "NIC statistics:\n     queue_0_tx_cnt: 7\n"
+    collector, sink = _ethtool_collector(
+        tmp_path, monkeypatch, [served, served, withdrawn, withdrawn]
+    )
+    for _ in range(4):
+        collector.collect_once()
+
+    reasons = [payload["edge_filter_reasons"] for _, payload in sink.requests]
+    assert len(reasons) == 2 and reasons[0] == ["baseline"], reasons
+    assert any(reason.startswith("not-supported:") for reason in reasons[1]), (
+        f"the withdrawal tick is not an edge: {reasons}"
+    )
+    delivered = doc(
+        batches=[
+            {
+                **batch(payload["samples"]),
+                "edge_filter_reasons": payload["edge_filter_reasons"],
+            }
+            for _, payload in sink.requests
+        ]
+    )
+    assert fx.unsupported_markers(
+        delivered, IFACE, "efa_rnr_errors_delta", "MISSING_COUNTER"
+    ), (
+        "the runner's matcher reads the withdrawn counter's marker from the delivered batch"
+    )
+    assert fx.metric_values(delivered, "efa_rnr_errors_delta", IFACE) == [], (
+        "the withdrawn counter never ships a zero delta"
+    )
+    readings = fx.device_readings(delivered, IFACE, ["efa_rnr_errors_delta"])
+    named = [set(reading["markers"][0]["metrics"].split(",")) for reading in readings]
+    assert named[1] - named[0] == {"efa_rnr_errors_delta"} and named[0] < named[1], (
+        f"the withdrawn counter is the only change between the markers: {readings}"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # target selection
 # --------------------------------------------------------------------------- #
@@ -657,6 +701,41 @@ def test_readings_and_collection_error_matchers() -> None:
     assert len(fx.collection_errors(document, PORT_DEVICE, "reset")) == 1
     assert fx.collection_errors(document, "ethtool") == []
     assert fx.metric_values(document, fx.ERRORS_METRIC, PORT_DEVICE) == [0.0, 0.0, -3.0]
+
+
+def test_device_readings_record_what_each_batch_carried() -> None:
+    marker = {"reason": "MISSING_COUNTER", "metrics": "efa_rnr_errors_delta"}
+    first = batch(
+        [
+            sample("efa_rnr_errors_delta", 0, IFACE),
+            sample("efa_rnr_errors_delta", 4, "eth9"),
+            sample(fx.UNSUPPORTED_METRIC, 1, "eth9", marker),
+        ],
+        errors=(f"_efa_network: HostObservationError: {IFACE}: boom", "other: x"),
+        observed_at=future(10),
+    )
+    first["edge_filter_reasons"] = ["baseline"]
+    second = batch(
+        [sample(fx.UNSUPPORTED_METRIC, 1, IFACE, marker)], observed_at=future(20)
+    )
+    readings = fx.device_readings(
+        doc(batches=[first, second]), IFACE, ["efa_rnr_errors_delta"]
+    )
+    assert [reading["deltas"] for reading in readings] == [
+        {"efa_rnr_errors_delta": 0},
+        {},
+    ], "only the netdev's own deltas, other netdevs are not its evidence"
+    assert [reading["markers"] for reading in readings] == [[], [marker]], readings
+    assert readings[0]["collection_errors"] == [
+        f"_efa_network: HostObservationError: {IFACE}: boom"
+    ]
+    assert readings[0]["edge_filter_reasons"] == ["baseline"]
+    assert readings[0]["batch_id"] == first["batch_id"]
+    assert fx.readings_summary(readings) == (
+        "2 batch(es); markers: MISSING_COUNTER[efa_rnr_errors_delta]; "
+        "deltas: efa_rnr_errors_delta=0"
+    )
+    assert fx.readings_summary([]) == "0 batch(es); markers: none; deltas: none"
 
 
 # --------------------------------------------------------------------------- #
@@ -1071,6 +1150,19 @@ def test_missing_counter_withdraws_a_real_counter_and_reads_not_supported(
         "set_counter",
         "delete_counter",
     ]
+    case_dir = tmp_path / "cases" / SPECS["missing_counter"].key
+    present = json.loads((case_dir / "counter-present-readings.json").read_text())
+    missing = json.loads((case_dir / "counter-missing-readings.json").read_text())
+    assert [reading["deltas"] for reading in present] == [{"efa_rnr_errors_delta": 0}]
+    assert [reading["markers"] for reading in present] == [[]]
+    assert [reading["markers"] for reading in missing] == [
+        [
+            {
+                "reason": "MISSING_COUNTER",
+                "metrics": "efa_retry_errors_delta,efa_rnr_errors_delta",
+            }
+        ]
+    ], "the evidence names what each batch carried for the netdev"
     result, source = run("missing_counter", tmp_path, records=_missing_docs())
     assert result["verdict"] == "PASS", result["errors"]
     assert [plan["rules"][0]["action"] for plan in plans(source)] == [
@@ -1080,9 +1172,11 @@ def test_missing_counter_withdraws_a_real_counter_and_reads_not_supported(
     result, _source = run(
         "missing_counter", tmp_path, records=_missing_docs(marker=False)
     )
-    assert result["verdict"] == "FAIL" and any(
-        "not_supported_marker" in e for e in result["errors"]
-    )
+    assert result["verdict"] == "FAIL" and result["errors"] == [
+        "not_supported_marker: no efa_ethtool_counters_unsupported MISSING_COUNTER "
+        f"marker names efa_rnr_errors_delta on {IFACE} since the withdrawal "
+        "(1 batch(es); markers: none; deltas: none)"
+    ], "a failure names what the batches since the withdrawal carried"
 
 
 # --------------------------------------------------------------------------- #
@@ -1099,7 +1193,12 @@ ETHTOOL_RESET_ERROR = (
 
 
 def _reset_doc(
-    *, fixed: bool, with_ethtool: bool = True, reset_tick_reading: bool = False
+    *,
+    fixed: bool,
+    with_ethtool: bool = True,
+    reset_tick_reading: bool = False,
+    gapped: bool = False,
+    reminted: bool = False,
 ) -> dict[str, Any]:
     """The product's records of a ramp -> reset -> ramp on both readers.
 
@@ -1109,6 +1208,11 @@ def _reset_doc(
     ``rdma_errors_delta=0`` reading at the reset and the fault minted again.
     ``reset_tick_reading`` puts a port delta into the fixed reset tick batch --
     a delta measured against a stale baseline, which the rule forbids.
+    ``gapped``: the ramp after the reset was slower than the tick (live
+    2026-10-25): a 0 reading between two steps on both readers, each step a
+    new episode and its own incident -- the product's contract, a PASS.
+    ``reminted``: a second incident per reader although the readings show one
+    unbroken episode -- a fault minted without a reading, the FAIL.
     """
 
     inc, wf = diagnostic(fx.ERRORS_METRIC, PORT_DEVICE, tag="r")
@@ -1121,6 +1225,10 @@ def _reset_doc(
         sample(fx.ERRORS_METRIC, 1000, PORT_DEVICE),
         sample("rdma_rx_drops_delta", 1000, PORT_DEVICE),
         sample("efa_rnr_errors_delta", 1000, IFACE),
+    ]
+    zeros = [
+        sample(fx.ERRORS_METRIC, 0, PORT_DEVICE),
+        sample("efa_rnr_errors_delta", 0, IFACE),
     ]
     batches = [batch(list(ramp), observed_at=future(30))]
     if fixed:
@@ -1143,6 +1251,19 @@ def _reset_doc(
             )
         )
     batches.append(batch(list(ramp), observed_at=future(90)))
+    if gapped or reminted:
+        for reader, metric, device in (
+            ("r2", fx.ERRORS_METRIC, PORT_DEVICE),
+            ("e2", "efa_rnr_errors_delta", IFACE),
+        ):
+            if device == IFACE and not with_ethtool:
+                continue
+            more, more_wf = diagnostic(metric, device, tag=reader)
+            incidents.append(more)
+            workflows.append(more_wf)
+        if gapped:
+            batches.append(batch(list(zeros), observed_at=future(105)))
+        batches.append(batch(list(ramp), observed_at=future(120)))
     return doc(incidents=incidents, workflows=workflows, batches=batches)
 
 
@@ -1162,18 +1283,131 @@ def test_counter_reset_passes_on_the_reset_rule_and_fails_on_the_old_clamp(
     assert all((int(value) >= 1 for value in values)), (
         "the ramp never writes a value below 1"
     )
+    case_dir = tmp_path / "cases" / SPECS["counter_reset"].key
+    readings = json.loads((case_dir / "reset-readings.json").read_text())
+    assert [reading["deltas"] for reading in readings["sysfs"]] == [
+        {fx.ERRORS_METRIC: 1000, "rdma_rx_drops_delta": 1000},
+        {},
+        {fx.ERRORS_METRIC: 1000, "rdma_rx_drops_delta": 1000},
+    ], "the evidence shows every batch's port readings"
+    assert readings["sysfs"][1]["collection_errors"] == [SYSFS_RESET_ERROR]
+    assert [reading["deltas"] for reading in readings["ethtool"]] == [
+        {"efa_rnr_errors_delta": 1000},
+        {},
+        {"efa_rnr_errors_delta": 1000},
+    ]
+    after_ramp = json.loads((case_dir / "reset-after-ramp.json").read_text())
+    steps = [step["sysfs"] for step in after_ramp["steps"]]
+    assert steps == sorted(steps) and steps[0] == 1 + fx.RAMP_STEP, (
+        "every step is recorded with its time"
+    )
+    assert result["zero_readings_between_steps"] == {"sysfs": 0, "ethtool": 0}
     # The old sysfs clamp: no _rdma reset error, a 0 reading, the fault re-minted.
     result, _source = run("counter_reset", tmp_path, records=_reset_doc(fixed=False))
     assert result["verdict"] == "FAIL", result
     stages = result["stages"]
-    assert stages["sysfs_reset_unknown"] and stages["sysfs_single_incident"], stages
-    joined = "\n".join(stages["sysfs_reset_unknown"])
-    assert "did not mark the reset UNKNOWN" in joined and "=0 shipped" in joined
+    assert stages["sysfs_reset_unknown"] == [
+        f"no _rdma collection error names the {PORT_DEVICE} rx_drops reset with "
+        "'delta unknown': the sysfs reader did not mark the reset UNKNOWN"
+    ], stages
+    assert stages["sysfs_not_reminted"] == [], (
+        "the clamp's 0 is a reading in the records: the second incident matches a "
+        "second episode, the FAIL is the missing UNKNOWN"
+    )
     assert (
-        stages["ethtool_reset_unknown"] == []
-        and stages["ethtool_single_incident"] == []
+        stages["ethtool_reset_unknown"] == [] and stages["ethtool_not_reminted"] == []
     )
     assert stages["no_decrement"] == [] and stages["fault_seen"] == []
+
+
+def test_counter_reset_judges_incidents_against_the_readings_episodes(
+    tmp_path: Path,
+) -> None:
+    """A ramp slower than the tick ships 0 readings between steps (live
+    2026-10-25: 7 zeros, 4 incidents per reader flagged as "re-minted" while
+    the reset tick was UNKNOWN on both readers): each is a reading that ends
+    the episode by the product's contract, so the incident count is judged
+    against the episodes the readings show, and a 0 after the reset is no
+    clamp unless it sits in the reset tick's batch."""
+
+    result, _source = run(
+        "counter_reset", tmp_path, records=_reset_doc(fixed=True, gapped=True)
+    )
+    assert result["verdict"] == "PASS", result["errors"]
+    assert result["zero_readings_between_steps"] == {"sysfs": 1, "ethtool": 1}
+    assert any("judged against the episodes" in note for note in result["notes"]), (
+        result["notes"]
+    )
+    result, _source = run(
+        "counter_reset", tmp_path, records=_reset_doc(fixed=True, reminted=True)
+    )
+    assert result["verdict"] == "FAIL", result
+    assert result["stages"]["sysfs_not_reminted"] == [
+        f"the reset re-minted the fault: 2 {fx.ERRORS_METRIC} incidents on "
+        f"{PORT_DEVICE} for 1 episode(s) in the product's own readings"
+    ]
+    assert result["stages"]["ethtool_not_reminted"] == [
+        f"the reset re-minted the fault: 2 efa_rnr_errors_delta incidents on {IFACE} "
+        "for 1 episode(s) in the product's own readings"
+    ]
+    assert result["stages"]["sysfs_reset_unknown"] == [], (
+        "the reset tick itself was UNKNOWN: only the re-mint fails"
+    )
+
+
+def test_episodes_count_threshold_crossings_of_the_readings() -> None:
+    def document(*values: float) -> dict[str, Any]:
+        return doc(
+            batches=[
+                batch(
+                    [sample(fx.ERRORS_METRIC, value, PORT_DEVICE)],
+                    observed_at=future(index),
+                )
+                for index, value in enumerate(values)
+            ]
+        )
+
+    assert fx.episodes(document(), fx.ERRORS_METRIC, PORT_DEVICE) == 0
+    assert fx.episodes(document(1000, 2000, 1000), fx.ERRORS_METRIC, PORT_DEVICE) == 1
+    assert (
+        fx.episodes(
+            document(0, 1000, 0, 0, 1000, 1000, 0, 1), fx.ERRORS_METRIC, PORT_DEVICE
+        )
+        == 3
+    )
+    assert fx.episodes(document(0, 0.5, 0), fx.ERRORS_METRIC, PORT_DEVICE) == 0, (
+        "below the WARNING threshold nothing opens"
+    )
+    assert fx.episodes(document(1000), fx.ERRORS_METRIC, "other/1") == 0
+
+
+def test_reset_ramp_after_the_reset_does_not_read_the_store(tmp_path: Path) -> None:
+    """``poll=False``: the after-reset ramp accepts nothing, so each step costs the
+    two probe round trips only; the one read afterwards grades the whole window."""
+
+    reads: list[str] = []
+    document = _reset_doc(fixed=True)
+
+    def records(arguments: tuple[str, ...]) -> dict[str, Any]:
+        reads.append(arguments[2])
+        return dict(document)
+
+    result, _source = run("counter_reset", tmp_path, records=records)
+    assert result["verdict"] == "PASS", result["errors"]
+    before = json.loads(
+        (
+            tmp_path / "cases" / SPECS["counter_reset"].key / "reset-before-ramp.json"
+        ).read_text()
+    )
+    after = json.loads(
+        (
+            tmp_path / "cases" / SPECS["counter_reset"].key / "reset-after-ramp.json"
+        ).read_text()
+    )
+    assert len(before["steps"]) >= 1 and len(after["steps"]) >= 1
+    # one read per before-ramp poll (the first step mints), one after the settle,
+    # the settled wait, and none during the after-reset ramp
+    assert len(reads) <= len(before["steps"]) + 3, reads
 
 
 def test_counter_reset_fails_on_a_delta_shipped_in_the_reset_tick(

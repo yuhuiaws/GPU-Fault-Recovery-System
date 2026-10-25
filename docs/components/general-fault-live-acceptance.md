@@ -1203,12 +1203,21 @@ expected FAIL 变体却 PASS），这种底线之下的读数以及无样本可�
   计数器（真实同 token 计数器优先，否则测试名 `gfrs_<token>_err`），
   `efa_<group>_errors_delta` → WARNING → 只诊断、不推导坏卡；`missing_counter` 先提供后撤回
   该计数器（真实名用 `delete_counter`，测试名改为透传），产品须记
-  `efa_ethtool_counters_unsupported` `MISSING_COUNTER` 点名该指标且绝不报零 delta；
+  `efa_ethtool_counters_unsupported` `MISSING_COUNTER` 点名该指标且绝不报零 delta（首次 live 运行的 FAIL 是
+  产品侧缺口：标记每拍都点名已撤回的计数器，却不是边沿理由，变化后的批次没有投递，而无 finding/采集错误的
+  健康摘要不写 evidence；现在标记按全部内容生成 `not-supported:*` 边沿理由、变化那一拍投递一次，
+  `collectors/host/network.py` `not_supported_edge_reason`；用例把每个批次对该 netdev 的读数写成
+  `counter-present-readings`/`counter-missing-readings`，失败文案列出撤回后各批次携带的标记与 delta）；
   `ethtool_failed` 让 `-S <netdev>` 以 exit 1（I/O error）返回，产品须记 `_efa_network`
   采集错误（UNKNOWN）、无零 delta、不误判 NO_STATISTICS、无 finding，包装器审计日志证明产品
   确实发出该查询并得到该失败；`counter_reset` 在同一窗口让 sysfs 计数器与 ethtool 计数器每半个
-  采集周期递增直到各自出 WARNING，再归 1 继续递增：无负 delta、每个读取器只有一个 incident
-  （重置不是新故障）、重置那一拍记 UNKNOWN 而不是会清除信号的 0 读数。批次 173 后三个计数读取器
+  采集周期递增直到各自出 WARNING，再归 1 继续递增：无负 delta、每个读取器的 incident 数不超过产品自身读数
+  显示的 episode 数（≥1 的读数跟在无读数或 <1 的读数之后开启一个 episode；重置不是新故障）、重置那一拍记
+  UNKNOWN 而不是会清除信号的 0 读数。运行器每步两次探针往返、比 15 s 采集拍慢，未赶上的拍会发出合法的 0
+  读数并结束 episode、下一步再开一个——这是产品契约（`_ZERO_IS_A_READING`）而非重置之过；首次 live 运行把
+  重置后的每个 0 读数判成"夹成 0"、把每个读取器的 4 个 incident 判成重复铸造，而重置拍本身在两个读取器上
+  都是 UNKNOWN，属用例侧缺陷，现只判重置拍批次与 episode 数，证据 `reset-readings` 列出每个批次对端口与
+  netdev 的读数、`reset-*-ramp` 记录每一步的时间，重置后的 ramp 不再逐步读存储。批次 173 后三个计数读取器
   共用一条重置规则（`collectors/host/network.py` `_monotonic_delta`/`_reset_problem`），`counter_reset`
   预期 PASS 并据此判定：每个读取器一条采集错误点名读取器（`_rdma`/`_efa_network`）、端口或 netdev、
   下降的计数器名与 `delta unknown`，且该拍的 batch 里没有该计数器 delta 及其聚合
