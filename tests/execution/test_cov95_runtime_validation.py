@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -132,13 +133,12 @@ def test_fabric_validation_waits_for_required_network_evidence(missing: str) -> 
         )
 
 
-@pytest.mark.parametrize("action", [None, GPU_PLUGIN])
-def test_inventory_requirement_requires_completed_action_and_post_action_sample(
-    action,
-) -> None:
+def test_inventory_requirement_requires_completed_action_and_post_action_sample() -> (
+    None
+):
     h = ValidationHarness(
         GPU,
-        action=action,
+        action=GPU_PLUGIN,
         requirements={
             "node-a": {
                 "active_metric": "gpu_inventory_active_count",
@@ -149,22 +149,126 @@ def test_inventory_requirement_requires_completed_action_and_post_action_sample(
     first = h.execute()
     assert first.status is WorkflowStepStatus.WAITING, first
     pending = first.details["node_pending"]["node-a"]
-    if action is None:
-        assert "missing_inventory_action_completion" in pending, pending
-    else:
-        assert pending["missing_post_action_inventory_metric"] == [
-            "gpu_inventory_active_count"
-        ], pending
-        h.feed.host_metric("node-a", "gpu_inventory_active_count", 7)
-        mismatch = h.execute()
-        assert mismatch.status is WorkflowStepStatus.FAILED, mismatch
-        assert mismatch.details["node_failures"] == {
-            "node-a": ["gpu_inventory_active_count=7,expected=8"]
-        }, mismatch
-        h.feed.host_metric("node-a", "gpu_inventory_active_count", 8)
-        assert h.execute().status is WorkflowStepStatus.SUCCEEDED, (
-            "the expected inventory observed after recovery must clear the guard"
-        )
+    assert pending["missing_post_action_inventory_metric"] == [
+        "gpu_inventory_active_count"
+    ], pending
+    h.feed.host_metric("node-a", "gpu_inventory_active_count", 7)
+    mismatch = h.execute()
+    assert mismatch.status is WorkflowStepStatus.FAILED, mismatch
+    assert mismatch.details["node_failures"] == {
+        "node-a": ["gpu_inventory_active_count=7,expected=8"]
+    }, mismatch
+    assert (
+        mismatch.details["inventory_evidence"]["node-a"]["gpu_inventory_active_count"][
+            "value"
+        ]
+        == 7
+    ), mismatch
+    h.feed.host_metric("node-a", "gpu_inventory_active_count", 8)
+    recovered = h.execute()
+    assert recovered.status is WorkflowStepStatus.SUCCEEDED, (
+        "the expected inventory observed after recovery must clear the guard"
+    )
+    assert (
+        recovered.details["inventory_evidence"]["node-a"]["gpu_inventory_active_count"][
+            "value"
+        ]
+        == 8
+    ), recovered
+
+
+def test_inventory_requirement_waits_for_a_planned_action_that_has_not_completed() -> (
+    None
+):
+    h = ValidationHarness(
+        GPU,
+        action=GPU_PLUGIN,
+        requirements={
+            "node-a": {
+                "active_metric": "gpu_inventory_active_count",
+                "expected_count": 8,
+            }
+        },
+    )
+    # The plugin restart is in the plan ahead of the validation but has no
+    # completed record: the completion it will produce is what the gate waits
+    # for, and a fresh reading taken before it says nothing about the repair.
+    h.context = replace(
+        h.context,
+        workflow=h.context.workflow.model_copy(update={"step_executions": []}),
+    )
+    h.feed.host_metric(
+        "node-a",
+        "gpu_inventory_active_count",
+        8,
+        observed_at=datetime.now(timezone.utc),
+    )
+    first = h.execute()
+    assert first.status is WorkflowStepStatus.WAITING, first
+    assert first.details["node_pending"]["node-a"][
+        "missing_inventory_action_completion"
+    ] == ["REPLACE_NODE", "RESTART_GPU_DEVICE_PLUGIN", "RESTART_NODE"], first
+
+
+@pytest.mark.parametrize(
+    ("operation", "metric", "expected"),
+    [
+        (FABRIC, "efa_inventory_active_count", 16),
+        (GPU, "gpu_inventory_active_count", 8),
+    ],
+)
+def test_diagnostic_inventory_validation_judges_fresh_readings_without_an_action(
+    operation: WorkflowOperation, metric: str, expected: int
+) -> None:
+    """A diagnostic chain (RUN_DIAGNOSTICS: FREEZE_EVIDENCE -> VALIDATE_*) plans
+    no recovery action, so the inventory gate has no completion to wait for; it
+    judges the readings observed after the chain reached the validation. Live
+    (GF-GENERAL-LIVE-013 link_inactive): the step waited for an action nothing
+    would ever produce, failed at the 600 s cap, and the cap's failure rebooted a
+    node whose port had been ACTIVE again for minutes."""
+
+    h = ValidationHarness(
+        operation,
+        requirements={"node-a": {"active_metric": metric, "expected_count": expected}},
+    )
+    first = h.execute()
+    assert first.status is WorkflowStepStatus.WAITING, first
+    pending = first.details["node_pending"]["node-a"]
+    assert "missing_inventory_action_completion" not in pending, pending
+    assert pending["missing_fresh_inventory_metric"] == [metric], pending
+    assert pending["observed_after"] == [h.context.workflow.created_at.isoformat()], (
+        pending
+    )
+    # The detection's own reading predates the chain: not fresh, not judged.
+    h.feed.host_metric(
+        "node-a",
+        metric,
+        expected - 1,
+        observed_at=h.context.workflow.created_at - timedelta(seconds=30),
+    )
+    stale = h.execute()
+    assert stale.status is WorkflowStepStatus.WAITING, stale
+    assert stale.details["node_pending"]["node-a"][
+        "missing_fresh_inventory_metric"
+    ] == [metric], stale
+    h.feed.host_metric(
+        "node-a", metric, expected, observed_at=datetime.now(timezone.utc)
+    )
+    recovered = h.execute()
+    assert recovered.status is WorkflowStepStatus.SUCCEEDED, recovered
+    evidence = recovered.details["inventory_evidence"]["node-a"][metric]
+    assert (evidence["value"], evidence["expected"]) == (expected, expected), recovered
+    assert evidence["observed_at"] > h.context.workflow.created_at.isoformat(), (
+        recovered
+    )
+    h.feed.host_metric(
+        "node-a", metric, expected - 1, observed_at=datetime.now(timezone.utc)
+    )
+    still_short = h.execute()
+    assert still_short.status is WorkflowStepStatus.FAILED, still_short
+    assert still_short.details["node_failures"] == {
+        "node-a": [f"{metric}={expected - 1},expected={expected}"]
+    }, still_short
 
 
 def test_reboot_validation_uses_historical_expected_inventory_but_requires_fresh_actual_count() -> (

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
+from gpu_fault.adapters.gpu_validation import GpuValidationAdapter
 from gpu_fault.app import ApplicationContext
+from gpu_fault.execution import WorkflowExecutionRequest, WorkflowStepContext
+from gpu_fault.gpu_metrics import GpuMetricSample, GpuMetricSource
 from gpu_fault.host_health import (
     HostMetricSample,
     HostTelemetryBatch,
@@ -21,6 +25,7 @@ from gpu_fault.models import (
     WorkflowStepStatus,
 )
 from gpu_fault.store import SqliteStore
+from gpu_fault.telemetry import CollectorKind, CollectorStatus
 from tests._builders import (
     asgi_client,
     build_context,
@@ -302,6 +307,230 @@ def test_inactive_efa_link_diagnoses_then_escalates_to_reboot() -> None:
 
     assert escalation is not None
     assert escalation[0].effective_action is RecoveryAction.REBOOT_NODE
+
+
+class _FabricReadings:
+    """What the validation adapter reads for ``node-a``: collector statuses
+    fresh as of ``observed_at``, the node's latest host rows (one per metric,
+    as the latest-value store keeps them) and the NVLink groups a fabric
+    validation requires of GPU telemetry."""
+
+    def __init__(self, observed_at: datetime) -> None:
+        self.store = self
+        self.observed_at = observed_at
+        self.rows: dict[str, SimpleNamespace] = {}
+        self.host_row("network_link_up", 1, observed_at)
+
+    def host_row(self, name: str, value: float, observed_at: datetime) -> None:
+        self.rows[name] = SimpleNamespace(
+            name=name, value=value, observed_at=observed_at
+        )
+
+    def list_collector_statuses(self, cluster_id: str, node_id: str) -> list:
+        return [
+            CollectorStatus(
+                cluster_id=cluster_id,
+                node_id=node_id,
+                collector=kind,
+                observed_at=self.observed_at,
+                ingested_at=self.observed_at,
+                last_success_at=self.observed_at,
+            )
+            for kind in (CollectorKind.GPU_METRICS, CollectorKind.HOST_TELEMETRY)
+        ]
+
+    def list_telemetry_metrics_latest(self, cluster_id: str, node_id: str) -> list:
+        return list(self.rows.values())
+
+    def latest(self, cluster_id: str, node_id: str) -> list:
+        return [
+            SimpleNamespace(
+                observed_at=self.observed_at,
+                source=GpuMetricSource.DCGM_EXPORTER,
+                sample=GpuMetricSample(
+                    metric_name=name, canonical_name=name, value=0, gpu_uuid="GPU-a"
+                ),
+            )
+            for name in (
+                "gpu_temperature_c",
+                "nvlink_crc_aggregate_error_total",
+                "nvlink_recovery_aggregate_error_total",
+                "nvlink_replay_aggregate_error_total",
+            )
+        ]
+
+    def findings(self, cluster_id: str, node_id: str) -> list:
+        return []
+
+
+def _efa_inventory_diagnostic_chain(
+    context: ApplicationContext, failure_mode: str, observed_count: str
+):
+    """Ingest an ``efa_inventory_mismatch`` finding and return its workflow
+    with FREEZE_EVIDENCE completed, so VALIDATE_FABRIC (step 1) is next."""
+
+    finding = NodeHealthPolicy(context.store).evaluate_metrics(
+        host_telemetry_batch(
+            f"efa-{failure_mode.lower()}",
+            NOW,
+            [
+                HostMetricSample(
+                    name="efa_inventory_mismatch",
+                    value=1,
+                    labels={
+                        "failure_mode": failure_mode,
+                        "expected_count": "16",
+                        "observed_count": observed_count,
+                        "discovered_count": "16",
+                        "driver_bound_count": "16",
+                    },
+                )
+            ],
+            runtime_profile_version="simulated-v1",
+        )
+    )[0]
+    _, workflow = context.orchestrator.ingest_node_health(finding)
+    assert [step.operation for step in workflow.official_steps] == [
+        WorkflowOperation.FREEZE_EVIDENCE,
+        WorkflowOperation.VALIDATE_FABRIC,
+    ], workflow.official_steps
+    now = datetime.now(timezone.utc)
+    return copy_model(
+        workflow,
+        status=WorkflowStatus.RUNNING,
+        created_at=now - timedelta(seconds=60),
+        step_executions=[
+            workflow_step_execution(
+                0,
+                WorkflowOperation.FREEZE_EVIDENCE,
+                started_at=now - timedelta(seconds=40),
+                updated_at=now - timedelta(seconds=30),
+            )
+        ],
+    )
+
+
+def _validate_fabric(context: ApplicationContext, workflow, readings):
+    adapter = GpuValidationAdapter(readings, store=readings)
+    step = copy_model(workflow.official_steps[1], execution_owner=adapter.owner)
+    workflow = copy_model(workflow, official_steps=[workflow.official_steps[0], step])
+    outcome = adapter.execute(
+        WorkflowStepContext(
+            workflow=workflow,
+            incident=context.store.get_incident(workflow.incident_id),
+            step=step,
+            step_index=1,
+            request=WorkflowExecutionRequest(
+                expected_fencing_token=workflow.fencing_token
+            ),
+            idempotency_key="validation/efa-diagnostic",
+        )
+    )
+    return workflow, outcome
+
+
+def _escalation_after_failed_validation(context: ApplicationContext, workflow, outcome):
+    failed = copy_model(
+        workflow,
+        status=WorkflowStatus.FAILED,
+        step_executions=[
+            *workflow.step_executions,
+            workflow_step_execution(
+                1,
+                WorkflowOperation.VALIDATE_FABRIC,
+                WorkflowStepStatus.FAILED,
+                error=outcome.error,
+                details=outcome.details,
+            ),
+        ],
+    )
+    context.store.save_workflow(failed)
+    return context.orchestrator.escalate_failed_hardware_remediation(failed)
+
+
+def test_inactive_efa_link_diagnostic_validation_converges_on_fresh_port_state() -> (
+    None
+):
+    """GF-GENERAL-LIVE-013 ``link_inactive``: diagnose first. The chain plans no
+    recovery action, so its VALIDATE_FABRIC judges the EFA inventory observed
+    after the chain reached it -- SUCCEEDED once a fresh reading shows every
+    port ACTIVE again, no RESTART_NODE; FAILED only on a fresh reading of the
+    still-inactive link, and then the designed REBOOT_NODE escalation applies.
+    Live: the step waited for an action completion no step would produce, hit
+    the 600 s cap, and the cap's failure rebooted a recovered node."""
+
+    context = build_context()
+    workflow = _efa_inventory_diagnostic_chain(context, "LINK_INACTIVE", "15")
+    assert (
+        workflow.official_steps[1].parameters["failure_escalation_action"]
+        == "REBOOT_NODE"
+    ), workflow.official_steps[1].parameters
+    now = datetime.now(timezone.utc)
+    readings = _FabricReadings(now - timedelta(seconds=1))
+    # Only the detection's own reading (before FREEZE_EVIDENCE completed).
+    readings.host_row("efa_inventory_active_count", 15, now - timedelta(seconds=45))
+    _, waiting = _validate_fabric(context, workflow, readings)
+    assert waiting.status is WorkflowStepStatus.WAITING, waiting
+    pending = waiting.details["node_pending"]["node-a"]
+    assert pending["missing_fresh_inventory_metric"] == [
+        "efa_inventory_active_count"
+    ], pending
+    assert "missing_inventory_action_completion" not in pending, pending
+
+    # The port is ACTIVE again on the next host sample: the diagnostic passes.
+    readings.host_row("efa_inventory_active_count", 16, now - timedelta(seconds=1))
+    _, recovered = _validate_fabric(context, workflow, readings)
+    assert recovered.status is WorkflowStepStatus.SUCCEEDED, recovered
+    assert (
+        recovered.details["inventory_evidence"]["node-a"]["efa_inventory_active_count"][
+            "value"
+        ]
+        == 16
+    ), recovered
+    assert WorkflowOperation.RESTART_NODE not in {
+        step.operation for step in workflow.official_steps
+    }, "a diagnostic that passed must not reboot the node"
+
+    # Still inactive on the fresh reading: FAILED on evidence, then the
+    # designed escalation (the product test above) takes it to REBOOT_NODE.
+    readings.host_row("efa_inventory_active_count", 15, now - timedelta(seconds=1))
+    validated, still_inactive = _validate_fabric(context, workflow, readings)
+    assert still_inactive.status is WorkflowStepStatus.FAILED, still_inactive
+    assert still_inactive.details["node_failures"] == {
+        "node-a": ["efa_inventory_active_count=15,expected=16"]
+    }, still_inactive
+    escalation = _escalation_after_failed_validation(context, validated, still_inactive)
+    assert escalation is not None, "a fresh inactive link keeps the reboot rung"
+    assert escalation[0].effective_action is RecoveryAction.REBOOT_NODE
+
+
+def test_excess_efa_device_diagnostic_validation_judges_fresh_inventory_without_reboot() -> (
+    None
+):
+    """GF-GENERAL-LIVE-013 ``excess_device``: the same diagnostic chain; its
+    validation judges the fresh inventory instead of timing out inconclusive,
+    and a confirmed excess never authorizes a reboot."""
+
+    context = build_context()
+    workflow = _efa_inventory_diagnostic_chain(context, "EXCESS_DEVICE", "17")
+    assert "failure_escalation_action" not in workflow.official_steps[1].parameters, (
+        workflow.official_steps[1].parameters
+    )
+    now = datetime.now(timezone.utc)
+    readings = _FabricReadings(now - timedelta(seconds=1))
+    readings.host_row("efa_inventory_active_count", 17, now - timedelta(seconds=1))
+    validated, excess = _validate_fabric(context, workflow, readings)
+    assert excess.status is WorkflowStepStatus.FAILED, excess
+    assert excess.details["node_failures"] == {
+        "node-a": ["efa_inventory_active_count=17,expected=16"]
+    }, excess
+    assert _escalation_after_failed_validation(context, validated, excess) is None, (
+        "an excess device must not authorize a reboot"
+    )
+
+    readings.host_row("efa_inventory_active_count", 16, now - timedelta(seconds=1))
+    _, cleared = _validate_fabric(context, workflow, readings)
+    assert cleared.status is WorkflowStepStatus.SUCCEEDED, cleared
 
 
 def test_efa_traffic_anomaly_sends_fixed_email(monkeypatch) -> None:

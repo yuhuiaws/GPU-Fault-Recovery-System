@@ -149,6 +149,7 @@ class GpuValidationAdapter:
         failures: dict[str, list[str]] = {}
         node_findings: dict[str, list[dict[str, Any]]] = {}
         clamped: dict[str, dict[str, Any]] = {}
+        inventory_evidence: dict[str, dict[str, Any]] = {}
         operation = context.step.operation
         probe = context.step.parameters.get(HOST_DIAGNOSTIC_PROBE)
         raw_inventory_requirements = context.step.parameters.get(
@@ -258,6 +259,7 @@ class GpuValidationAdapter:
                 host_latest,
                 failures,
                 clamped,
+                inventory_evidence,
             )
             if inventory_pending is not None:
                 pending[node_id] = inventory_pending
@@ -330,12 +332,19 @@ class GpuValidationAdapter:
                     **diagnostic_details,
                     **({"node_findings": node_findings} if node_findings else {}),
                     **({"inventory_requirement_clamped": clamped} if clamped else {}),
+                    **(
+                        {"inventory_evidence": inventory_evidence}
+                        if inventory_evidence
+                        else {}
+                    ),
                 },
             )
         cooling = thermal_cooldown(context, self.metrics, now, self._node_gpu_targets)
         if cooling is not None:
             return cooling
-        return validation_success(context, **success_evidence(context, clamped))
+        return validation_success(
+            context, **success_evidence(context, clamped, inventory_evidence)
+        )
 
     def _restore_collectors_dark(
         self,
@@ -447,7 +456,29 @@ class GpuValidationAdapter:
         latest,
         failures,
         clamped=None,
+        evidence=None,
     ):
+        """Judge the node's ACTIVE inventory against the plan's requirement.
+
+        After a recovery action (``recovery_operations``: the driver, plugin,
+        reboot and replacement steps) the reading must postdate the action's
+        completion -- a count cached before the repair proves nothing about it
+        -- and while the plan has such an action ahead of this step that has
+        not completed, the gate waits for its completion. A diagnostic chain
+        (``RUN_DIAGNOSTICS``: FREEZE_EVIDENCE -> VALIDATE_FABRIC for an EFA
+        ``LINK_INACTIVE`` / ``EXCESS_DEVICE`` / unknown failure mode) plans no
+        such action, so there is no completion to wait for: it judges the
+        readings observed after the chain reached this step
+        (``diagnostic_observed_after``) -- SUCCEEDED when they show the
+        expected count, FAILED on a fresh mismatch, when the failure
+        escalation the plan carries applies. Live 2026-10-25
+        (GF-GENERAL-LIVE-013 ``link_inactive``): the step waited for an action
+        completion no step would produce, failed at the 600 s per-step cap,
+        and the cap's failure escalated a node whose port had been ACTIVE
+        again for minutes to RESTART_NODE. The reading each verdict rests on
+        goes into ``evidence`` (``details.inventory_evidence``).
+        """
+
         requirement = requirements.get(node_id)
         if (
             not isinstance(requirement, dict)
@@ -485,7 +516,12 @@ class GpuValidationAdapter:
             and item.status is WorkflowStepStatus.SUCCEEDED
             and item.operation in recovery_operations
         ]
-        if required and not executions:
+        if executions:
+            observed_after = max(item.updated_at for item in executions)
+            pending_key = "missing_post_action_inventory_metric"
+        elif not required:
+            return None
+        elif planned_inventory_recovery(context, recovery_operations):
             return {
                 "missing_inventory_action_completion": [
                     item.value
@@ -495,23 +531,27 @@ class GpuValidationAdapter:
                     )
                 ]
             }
-        observed_after = (
-            max(item.updated_at for item in executions) if executions else None
-        )
+        else:
+            observed_after = diagnostic_observed_after(context)
+            pending_key = "missing_fresh_inventory_metric"
         for metric, expected_count in required.items():
             samples = [
                 item
                 for item in latest
-                if item.name == metric
-                and observed_after is not None
-                and item.observed_at > observed_after
+                if item.name == metric and item.observed_at > observed_after
             ]
             if not samples:
                 return {
-                    "missing_post_action_inventory_metric": [metric],
+                    pending_key: [metric],
                     "observed_after": [observed_after.isoformat()],
                 }
             actual = samples[-1].value
+            if evidence is not None:
+                evidence.setdefault(node_id, {})[metric] = {
+                    "value": actual,
+                    "expected": expected_count,
+                    "observed_at": samples[-1].observed_at.isoformat(),
+                }
             if actual != expected_count:
                 failures.setdefault(node_id, []).append(
                     f"{metric}={actual:g},expected={expected_count}"
@@ -918,15 +958,61 @@ def unknown_task_fabric_details(context: WorkflowStepContext) -> dict[str, Any]:
     return {"task_fabric_unknown_nodes": unknown} if unknown else {}
 
 
-def success_evidence(
-    context: WorkflowStepContext, clamped: dict[str, Any]
-) -> dict[str, Any]:
-    return validation_evidence(
-        context.step.operation,
-        clamped,
-        resolved_unknown_task_fabric(context),
-        context.step.node_ids,
+def planned_inventory_recovery(
+    context: WorkflowStepContext, recovery_operations: set[WorkflowOperation]
+) -> bool:
+    """Whether a step ahead of this validation in the executing plan is one of
+    the actions whose completion the inventory gate waits for.
+
+    Positional, like the completed-execution check it pairs with: the inventory
+    chains are sequential, and a plan with none of these steps before the
+    validation is a diagnostic chain, which no completion will ever reach.
+    """
+
+    workflow = context.workflow
+    steps = (
+        workflow.safety_steps
+        if workflow.executes_safety_steps
+        else workflow.official_steps
     )
+    return any(
+        step.operation in recovery_operations for step in steps[: context.step_index]
+    )
+
+
+def diagnostic_observed_after(context: WorkflowStepContext) -> datetime:
+    """When a diagnostic chain reached this validation: the completion of the
+    last step before it, never earlier than the workflow's creation.
+
+    The same discipline the post-action gate applies to a repair: a reading
+    older than that moment is the detection's own evidence (the collector's
+    confirming samples), not a re-read of the device; the host collector's
+    next batch is.
+    """
+
+    completed = [
+        execution.updated_at
+        for execution in context.workflow.step_executions
+        if execution.step_index < context.step_index
+        and execution.status is WorkflowStepStatus.SUCCEEDED
+    ]
+    return max([context.workflow.created_at, *completed])
+
+
+def success_evidence(
+    context: WorkflowStepContext,
+    clamped: dict[str, Any],
+    inventory: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        **validation_evidence(
+            context.step.operation,
+            clamped,
+            resolved_unknown_task_fabric(context),
+            context.step.node_ids,
+        ),
+        **({"inventory_evidence": inventory} if inventory else {}),
+    }
 
 
 #: How many findings the failure text spells out per node; the rest are counted
