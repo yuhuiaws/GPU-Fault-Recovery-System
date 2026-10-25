@@ -126,6 +126,21 @@ APPROVALS: dict[str, str] = {
         "(catalog RESTART_APP, monitor-only on an idle node) on one test GPU; "
         "the product turns it into a trusted XID event"
     ),
+    # The shared host-collector source replay (general_live_source_replay.py):
+    # phase-2 host/device variants 002/007/010/011/012/013/015/032.
+    "HOST_SOURCE_REPLAY": (
+        "replace one reviewed raw reading inside the host collector unit's "
+        "private environment for a bounded window, through a /run drop-in on "
+        "gpu-fault-host-collector.service only: a procfs/sysfs file or whole "
+        "tree bound read-only into its mount namespace (/proc/meminfo, an EFA "
+        "port's hw_counters/counters/state/phys_state, /sys/class/infiniband, "
+        "/proc/driver/nvidia and its version file), a path or tool binary made "
+        "inaccessible there, an expected GPU/EFA count override, or a reviewed "
+        "pass-through wrapper first on its PATH (smartctl, ipmitool, ethtool, "
+        "the host collector's nvidia-smi queries) that rewrites only the plan's "
+        "allow-listed fields; no host binary is replaced, no global mount is "
+        "made, the Node Agent is never touched; removed by cleanup and a deadman"
+    ),
     # GF-GENERAL-LIVE-009 tcp_only: the AL2023 EKS node image ships no tc.
     "TEMP_TEST_PACKAGE_INSTALL": (
         "install, for this run only, a test package the node lacks with dnf: "
