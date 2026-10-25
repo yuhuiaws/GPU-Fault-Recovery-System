@@ -253,3 +253,230 @@ def test_restore_collector_puts_the_endpoint_back(
     out = _run(["restore-collector", "--run-id", "r1"])
     assert out["code"] == 0
     assert out["json"]["restored_endpoint"] == "http://127.0.0.1:9400/metrics"
+
+
+# --------------------------------------------------------------------------- #
+# GF-ENV-LIVE-009: pause-collector / pause-wait / pause-status / resume / restart
+# --------------------------------------------------------------------------- #
+def _repointed_run(root: Path) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "probe.py").write_text("# probe copy\n")
+    (root / "repoint.json").write_text(
+        json.dumps(
+            {
+                "original_endpoint": "http://127.0.0.1:9400/metrics",
+                "proxy_endpoint": "http://127.0.0.1:9411/metrics",
+            }
+        )
+    )
+
+
+def _recording_run(order: list[list[str]]) -> Any:
+    def fake_run(cmd: list[str], **kw: Any) -> Any:
+        order.append(list(cmd))
+        return _ok()
+
+    return fake_run
+
+
+def test_pause_collector_schedules_a_waiter_unit_before_the_pause_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = probe.run_dir("r1")
+    order: list[list[str]] = []
+    monkeypatch.setattr(probe, "run", _recording_run(order))
+    monkeypatch.setattr(probe, "unit_state", lambda unit: {"ActiveState": "active"})
+    monkeypatch.setattr(probe, "proxy_status", lambda port, **kw: {"reads": 2})
+    # No repoint yet: no probe copy to run the waiter from.
+    out = _run(
+        ["pause-collector", "--run-id", "r1", "--after-reads", "7", "--seconds", "195"]
+    )
+    assert out["code"] == 1 and "repoint the collector" in out["json"]["error"]
+    _repointed_run(root)
+    out = _run(
+        ["pause-collector", "--run-id", "r1", "--after-reads", "7", "--seconds", "195"]
+    )
+    assert out["code"] == 0, out
+    assert out["json"]["target_reads"] == 7 and out["json"]["reads_at_schedule"] == 2
+    assert out["json"]["waiter"]["ActiveState"] == "active"
+    waiter = next(cmd for cmd in order if cmd[0] == "systemd-run")
+    assert "pause-wait" in waiter and waiter[waiter.index("--after-reads") + 1] == "7"
+    assert any(item.startswith("--property=RuntimeMaxSec=") for item in waiter), waiter
+    record = json.loads((root / probe.PAUSE_FILE).read_text())
+    assert record["target_reads"] == 7 and record["pause_seconds"] == 195
+    # A second schedule for the same run is refused.
+    again = _run(
+        ["pause-collector", "--run-id", "r1", "--after-reads", "7", "--seconds", "195"]
+    )
+    assert again["code"] == 1 and "already scheduled" in again["json"]["error"]
+
+
+def test_pause_collector_refuses_a_pause_read_already_consumed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _repointed_run(probe.run_dir("r1"))
+    monkeypatch.setattr(probe, "run", lambda cmd, **kw: _ok())
+    monkeypatch.setattr(probe, "unit_state", lambda unit: {"ActiveState": "active"})
+    monkeypatch.setattr(probe, "proxy_status", lambda port, **kw: {"reads": 7})
+    out = _run(
+        ["pause-collector", "--run-id", "r1", "--after-reads", "7", "--seconds", "195"]
+    )
+    assert out["code"] == 1 and "already consumed" in out["json"]["error"]
+    for bad in ("30", "5000"):
+        out = _run(
+            [
+                "pause-collector",
+                "--run-id",
+                "r1",
+                "--after-reads",
+                "7",
+                "--seconds",
+                bad,
+            ]
+        )
+        assert out["code"] == 1 and "pause seconds" in out["json"]["error"]
+
+
+def test_pause_wait_arms_the_resume_deadman_then_stops_the_unit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = probe.run_dir("r1")
+    _repointed_run(root)
+    probe.write_pause("r1", {"run_id": "r1", "target_reads": 4})
+    order: list[list[str]] = []
+    monkeypatch.setattr(probe, "run", _recording_run(order))
+    monkeypatch.setattr(
+        probe, "unit_state", lambda unit: {"ActiveState": "active", "MainPID": "0"}
+    )
+    reads = iter([2, 3, 4])
+    monkeypatch.setattr(
+        probe, "proxy_status", lambda port, **kw: {"reads": next(reads)}
+    )
+    monkeypatch.setattr(probe.time, "sleep", lambda seconds: None)
+    out = _run(
+        [
+            "pause-wait",
+            "--run-id",
+            "r1",
+            "--after-reads",
+            "4",
+            "--seconds",
+            "195",
+            "--wait-seconds",
+            "60",
+        ]
+    )
+    assert out["code"] == 0, out
+    assert out["json"]["reads_at_pause"] == 4 and out["json"]["missed"] is False
+    deadman = next(i for i, cmd in enumerate(order) if cmd[0] == "systemd-run")
+    stop = next(i for i, cmd in enumerate(order) if "--signal=SIGSTOP" in cmd)
+    assert deadman < stop, "the resume deadman is armed before the SIGSTOP"
+    assert "resume-collector" in order[deadman]
+    assert any(item.startswith("--on-active=195s") for item in order[deadman]), order[
+        deadman
+    ]
+    assert probe.METRICS_UNIT in order[stop]
+    record = json.loads((root / probe.PAUSE_FILE).read_text())
+    assert record["paused_at"] and record["target_reads"] == 4
+
+
+def test_pause_wait_times_out_without_pausing(monkeypatch: pytest.MonkeyPatch) -> None:
+    root = probe.run_dir("r1")
+    _repointed_run(root)
+    probe.write_pause("r1", {"run_id": "r1", "target_reads": 4})
+    order: list[list[str]] = []
+    monkeypatch.setattr(probe, "run", _recording_run(order))
+    monkeypatch.setattr(probe, "proxy_status", lambda port, **kw: {"reads": 1})
+    clock = iter([0.0, 0.0, 0.5, 2.0])
+    monkeypatch.setattr(probe.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(probe.time, "sleep", lambda seconds: None)
+    out = _run(
+        [
+            "pause-wait",
+            "--run-id",
+            "r1",
+            "--after-reads",
+            "4",
+            "--seconds",
+            "195",
+            "--wait-seconds",
+            "1",
+        ]
+    )
+    assert out["code"] == 1 and "did not reach the pause read" in out["json"]["error"]
+    assert not any("--signal=SIGSTOP" in cmd for cmd in order), order
+    record = json.loads((root / probe.PAUSE_FILE).read_text())
+    assert record["timed_out_at"] and record["reads_at_timeout"] == 1
+
+
+def test_pause_status_resume_and_restore_resume_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = probe.run_dir("r1")
+    _repointed_run(root)
+    probe.write_pause(
+        "r1", {"run_id": "r1", "target_reads": 4, "paused_at": "2031-01-01T00:00:00Z"}
+    )
+    order: list[list[str]] = []
+    monkeypatch.setattr(probe, "run", _recording_run(order))
+    monkeypatch.setattr(
+        probe, "unit_state", lambda unit: {"ActiveState": "active", "MainPID": "1"}
+    )
+    monkeypatch.setattr(probe, "unit_is_stopped", lambda unit: True)
+    monkeypatch.setattr(
+        probe, "effective_endpoint", lambda unit: "http://127.0.0.1:9400/metrics"
+    )
+    status = _run(["pause-status", "--run-id", "r1"])
+    assert status["code"] == 0 and status["json"]["stopped"] is True
+    assert status["json"]["pause"]["target_reads"] == 4
+    resumed = _run(["resume-collector", "--run-id", "r1"])
+    assert resumed["code"] == 0 and resumed["json"]["pause"]["resumed_at"]
+    assert any("--signal=SIGCONT" in cmd for cmd in order), order
+    assert any(
+        cmd[:2] == ["systemctl", "stop"] and cmd[2].endswith(".timer") for cmd in order
+    ), order
+    # The restore of a still-paused run resumes before it restarts the unit.
+    order.clear()
+    probe.write_pause(
+        "r1", {"run_id": "r1", "target_reads": 4, "paused_at": "2031-01-01T00:00:00Z"}
+    )
+    monkeypatch.setattr(probe, "dropin_path", lambda run_id: root / "missing.conf")
+    out = _run(["restore-collector", "--run-id", "r1"])
+    assert out["code"] == 0 and out["json"]["resumed_pause"]["pause"]["resumed_at"]
+    cont = next(i for i, cmd in enumerate(order) if "--signal=SIGCONT" in cmd)
+    restart = next(
+        i for i, cmd in enumerate(order) if cmd[:2] == ["systemctl", "restart"]
+    )
+    assert cont < restart
+
+
+def test_restart_collector_needs_the_dropin_and_a_running_unit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = probe.run_dir("r1")
+    _repointed_run(root)
+    dropin = tmp_path / "env-r1.conf"
+    monkeypatch.setattr(probe, "dropin_path", lambda run_id: dropin)
+    monkeypatch.setattr(probe, "run", lambda cmd, **kw: _ok())
+    monkeypatch.setattr(
+        probe, "unit_state", lambda unit: {"ActiveState": "active", "MainPID": "1"}
+    )
+    monkeypatch.setattr(
+        probe, "effective_endpoint", lambda unit: "http://127.0.0.1:9411/metrics"
+    )
+    out = _run(["restart-collector", "--run-id", "r1"])
+    assert out["code"] == 1 and "drop-in" in out["json"]["error"]
+    dropin.write_text("[Service]\n")
+    monkeypatch.setattr(probe, "unit_is_stopped", lambda unit: True)
+    out = _run(["restart-collector", "--run-id", "r1"])
+    assert out["code"] == 1 and "resume the paused collector" in out["json"]["error"]
+    monkeypatch.setattr(probe, "unit_is_stopped", lambda unit: False)
+    out = _run(["restart-collector", "--run-id", "r1"])
+    assert out["code"] == 0
+    assert out["json"]["effective_endpoint"] == "http://127.0.0.1:9411/metrics"
+    assert out["json"]["restarted_at"]
+    # An endpoint that changed across the restart is refused.
+    endpoints = iter(["http://127.0.0.1:9411/metrics", "http://127.0.0.1:9400/metrics"])
+    monkeypatch.setattr(probe, "effective_endpoint", lambda unit: next(endpoints))
+    out = _run(["restart-collector", "--run-id", "r1"])
+    assert out["code"] == 1 and "changed across the restart" in out["json"]["error"]
