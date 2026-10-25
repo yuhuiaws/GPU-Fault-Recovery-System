@@ -66,6 +66,41 @@ from gpu_fault.workflow_quarantine import quiesce_taint_nodes_held
 #: every batch it delivers (``collectors/host/network.py``).
 INTERFACE_LINK_METRICS = frozenset({"network_link_down", "network_link_up"})
 
+#: The actions whose completion the GPU (EFA) inventory gate waits for, and
+#: after which the ACTIVE count must be re-read.
+GPU_INVENTORY_RECOVERY_OPERATIONS = frozenset(
+    {
+        WorkflowOperation.RESTART_NODE,
+        WorkflowOperation.REPLACE_NODE,
+        WorkflowOperation.RESTART_GPU_DEVICE_PLUGIN,
+    }
+)
+EFA_INVENTORY_RECOVERY_OPERATIONS = frozenset(
+    {
+        WorkflowOperation.REMEDIATE_EFA_DRIVER,
+        WorkflowOperation.RESTART_EFA_DEVICE_PLUGIN,
+        WorkflowOperation.RESTART_NODE,
+        WorkflowOperation.REPLACE_NODE,
+    }
+)
+#: The actions after which GPU and host telemetry starts over: a validation
+#: behind one of them reads only samples newer than its completion.
+TELEMETRY_READINESS_OPERATIONS = frozenset(
+    {
+        WorkflowOperation.RESET_GPU,
+        WorkflowOperation.RECOVER_DRAIN_P2P,
+        WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES,
+        WorkflowOperation.RESTART_FABRIC_MANAGER,
+        WorkflowOperation.REMEDIATE_DRIVER,
+        WorkflowOperation.UPDATE_SOFTWARE_FIRMWARE,
+        WorkflowOperation.REMEDIATE_EFA_DRIVER,
+        WorkflowOperation.RESTART_EFA_DEVICE_PLUGIN,
+        WorkflowOperation.RESTART_GPU_DEVICE_PLUGIN,
+        WorkflowOperation.RESTART_NODE,
+        WorkflowOperation.REPLACE_NODE,
+    }
+)
+
 
 def current_interface_readings(
     latest: list[Any], newest_batch_at: datetime | None
@@ -149,7 +184,7 @@ class GpuValidationAdapter:
         failures: dict[str, list[str]] = {}
         node_findings: dict[str, list[dict[str, Any]]] = {}
         clamped: dict[str, dict[str, Any]] = {}
-        inventory_evidence: dict[str, dict[str, Any]] = {}
+        evidence: dict[str, dict[str, Any]] = {}
         operation = context.step.operation
         probe = context.step.parameters.get(HOST_DIAGNOSTIC_PROBE)
         raw_inventory_requirements = context.step.parameters.get(
@@ -160,34 +195,10 @@ class GpuValidationAdapter:
             if isinstance(raw_inventory_requirements, dict)
             else {}
         )
-        gpu_inventory_recovery_operations = {
-            WorkflowOperation.RESTART_NODE,
-            WorkflowOperation.REPLACE_NODE,
-            WorkflowOperation.RESTART_GPU_DEVICE_PLUGIN,
-        }
-        efa_inventory_recovery_operations = {
-            WorkflowOperation.REMEDIATE_EFA_DRIVER,
-            WorkflowOperation.RESTART_EFA_DEVICE_PLUGIN,
-            WorkflowOperation.RESTART_NODE,
-            WorkflowOperation.REPLACE_NODE,
-        }
-        telemetry_readiness_operations = {
-            WorkflowOperation.RESET_GPU,
-            WorkflowOperation.RECOVER_DRAIN_P2P,
-            WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES,
-            WorkflowOperation.RESTART_FABRIC_MANAGER,
-            WorkflowOperation.REMEDIATE_DRIVER,
-            WorkflowOperation.UPDATE_SOFTWARE_FIRMWARE,
-            WorkflowOperation.REMEDIATE_EFA_DRIVER,
-            WorkflowOperation.RESTART_EFA_DEVICE_PLUGIN,
-            WorkflowOperation.RESTART_GPU_DEVICE_PLUGIN,
-            WorkflowOperation.RESTART_NODE,
-            WorkflowOperation.REPLACE_NODE,
-        }
         inventory_recovery_operations = (
-            efa_inventory_recovery_operations
+            EFA_INVENTORY_RECOVERY_OPERATIONS
             if operation is WorkflowOperation.VALIDATE_FABRIC
-            else gpu_inventory_recovery_operations
+            else GPU_INVENTORY_RECOVERY_OPERATIONS
         )
         completed_node_recovery = any(
             execution.step_index < context.step_index
@@ -211,7 +222,7 @@ class GpuValidationAdapter:
                 if (
                     execution.step_index < context.step_index
                     and execution.status is WorkflowStepStatus.SUCCEEDED
-                    and execution.operation in telemetry_readiness_operations
+                    and execution.operation in TELEMETRY_READINESS_OPERATIONS
                 )
             ]
             if readiness_barriers:
@@ -259,7 +270,7 @@ class GpuValidationAdapter:
                 host_latest,
                 failures,
                 clamped,
-                inventory_evidence,
+                evidence,
             )
             if inventory_pending is not None:
                 pending[node_id] = inventory_pending
@@ -331,19 +342,14 @@ class GpuValidationAdapter:
                     "validation": operation.value,
                     **diagnostic_details,
                     **({"node_findings": node_findings} if node_findings else {}),
-                    **({"inventory_requirement_clamped": clamped} if clamped else {}),
-                    **(
-                        {"inventory_evidence": inventory_evidence}
-                        if inventory_evidence
-                        else {}
-                    ),
+                    **inventory_details(clamped, evidence),
                 },
             )
         cooling = thermal_cooldown(context, self.metrics, now, self._node_gpu_targets)
         if cooling is not None:
             return cooling
         return validation_success(
-            context, **success_evidence(context, clamped, inventory_evidence)
+            context, **success_evidence(context, clamped, evidence)
         )
 
     def _restore_collectors_dark(
@@ -458,26 +464,10 @@ class GpuValidationAdapter:
         clamped=None,
         evidence=None,
     ):
-        """Judge the node's ACTIVE inventory against the plan's requirement.
-
-        After a recovery action (``recovery_operations``: the driver, plugin,
-        reboot and replacement steps) the reading must postdate the action's
-        completion -- a count cached before the repair proves nothing about it
-        -- and while the plan has such an action ahead of this step that has
-        not completed, the gate waits for its completion. A diagnostic chain
-        (``RUN_DIAGNOSTICS``: FREEZE_EVIDENCE -> VALIDATE_FABRIC for an EFA
-        ``LINK_INACTIVE`` / ``EXCESS_DEVICE`` / unknown failure mode) plans no
-        such action, so there is no completion to wait for: it judges the
-        readings observed after the chain reached this step
-        (``diagnostic_observed_after``) -- SUCCEEDED when they show the
-        expected count, FAILED on a fresh mismatch, when the failure
-        escalation the plan carries applies. Live 2026-10-25
-        (GF-GENERAL-LIVE-013 ``link_inactive``): the step waited for an action
-        completion no step would produce, failed at the 600 s per-step cap,
-        and the cap's failure escalated a node whose port had been ACTIVE
-        again for minutes to RESTART_NODE. The reading each verdict rests on
-        goes into ``evidence`` (``details.inventory_evidence``).
-        """
+        """Judge the node's ACTIVE inventory against the plan's requirement on
+        a reading from the window ``inventory_observation_window`` opens; the
+        reading each verdict rests on goes into ``evidence``
+        (``details.inventory_evidence``)."""
 
         requirement = requirements.get(node_id)
         if (
@@ -509,19 +499,10 @@ class GpuValidationAdapter:
         required, bounded = self._bound_by_instance_inventory(requirement, required)
         if bounded and clamped is not None:
             clamped[node_id] = bounded
-        executions = [
-            item
-            for item in context.workflow.step_executions
-            if item.step_index < context.step_index
-            and item.status is WorkflowStepStatus.SUCCEEDED
-            and item.operation in recovery_operations
-        ]
-        if executions:
-            observed_after = max(item.updated_at for item in executions)
-            pending_key = "missing_post_action_inventory_metric"
-        elif not required:
+        if not required:
             return None
-        elif planned_inventory_recovery(context, recovery_operations):
+        window = inventory_observation_window(context, recovery_operations)
+        if window is None:
             return {
                 "missing_inventory_action_completion": [
                     item.value
@@ -531,9 +512,7 @@ class GpuValidationAdapter:
                     )
                 ]
             }
-        else:
-            observed_after = diagnostic_observed_after(context)
-            pending_key = "missing_fresh_inventory_metric"
+        observed_after, pending_key = window
         for metric, expected_count in required.items():
             samples = [
                 item
@@ -958,51 +937,75 @@ def unknown_task_fabric_details(context: WorkflowStepContext) -> dict[str, Any]:
     return {"task_fabric_unknown_nodes": unknown} if unknown else {}
 
 
-def planned_inventory_recovery(
-    context: WorkflowStepContext, recovery_operations: set[WorkflowOperation]
-) -> bool:
-    """Whether a step ahead of this validation in the executing plan is one of
-    the actions whose completion the inventory gate waits for.
+def inventory_observation_window(
+    context: WorkflowStepContext,
+    recovery_operations: frozenset[WorkflowOperation],
+) -> tuple[datetime, str] | None:
+    """Since when a reading counts for the inventory gate, with the pending key
+    that names the wait for one; ``None`` while the plan has one of
+    ``recovery_operations`` ahead of this step that has not completed, which
+    the gate waits for.
 
-    Positional, like the completed-execution check it pairs with: the inventory
-    chains are sequential, and a plan with none of these steps before the
-    validation is a diagnostic chain, which no completion will ever reach.
+    After a completed recovery action (the driver, plugin, reboot and
+    replacement steps) the reading must postdate its completion: a count
+    cached before the repair proves nothing about it. A diagnostic chain
+    (``RUN_DIAGNOSTICS``: FREEZE_EVIDENCE -> VALIDATE_FABRIC for an EFA
+    ``LINK_INACTIVE`` / ``EXCESS_DEVICE`` / unknown failure mode) plans no
+    such action, so there is no completion to wait for: the reading must
+    postdate the moment the chain reached this step -- the last completed
+    step's ``updated_at``, never earlier than the workflow's creation -- which
+    excludes the collector's confirming samples and admits its next batch.
+    Live 2026-10-25 (GF-GENERAL-LIVE-013 ``link_inactive``): the gate waited
+    for an action completion no step would produce, failed at the 600 s
+    per-step cap, and the cap's failure escalated a node whose port had been
+    ACTIVE again for minutes to RESTART_NODE. Positional like the rest of the
+    adapter's step arithmetic: the inventory chains are sequential.
     """
 
     workflow = context.workflow
+    completed = [
+        execution
+        for execution in workflow.step_executions
+        if execution.step_index < context.step_index
+        and execution.status is WorkflowStepStatus.SUCCEEDED
+    ]
+    acted: list[datetime] = [
+        item.updated_at for item in completed if item.operation in recovery_operations
+    ]
+    if acted:
+        return max(acted), "missing_post_action_inventory_metric"
     steps = (
         workflow.safety_steps
         if workflow.executes_safety_steps
         else workflow.official_steps
     )
-    return any(
+    if any(
         step.operation in recovery_operations for step in steps[: context.step_index]
-    )
-
-
-def diagnostic_observed_after(context: WorkflowStepContext) -> datetime:
-    """When a diagnostic chain reached this validation: the completion of the
-    last step before it, never earlier than the workflow's creation.
-
-    The same discipline the post-action gate applies to a repair: a reading
-    older than that moment is the detection's own evidence (the collector's
-    confirming samples), not a re-read of the device; the host collector's
-    next batch is.
-    """
-
-    completed = [
-        execution.updated_at
-        for execution in context.workflow.step_executions
-        if execution.step_index < context.step_index
-        and execution.status is WorkflowStepStatus.SUCCEEDED
+    ):
+        return None
+    reached: list[datetime] = [
+        workflow.created_at,
+        *(item.updated_at for item in completed),
     ]
-    return max([context.workflow.created_at, *completed])
+    return max(reached), "missing_fresh_inventory_metric"
+
+
+def inventory_details(
+    clamped: dict[str, Any], evidence: dict[str, Any]
+) -> dict[str, Any]:
+    """The inventory gate's record on a verdict: the configured counts it
+    capped and the readings it judged."""
+
+    return {
+        **({"inventory_requirement_clamped": clamped} if clamped else {}),
+        **({"inventory_evidence": evidence} if evidence else {}),
+    }
 
 
 def success_evidence(
     context: WorkflowStepContext,
     clamped: dict[str, Any],
-    inventory: dict[str, Any] | None = None,
+    evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         **validation_evidence(
@@ -1011,7 +1014,7 @@ def success_evidence(
             resolved_unknown_task_fabric(context),
             context.step.node_ids,
         ),
-        **({"inventory_evidence": inventory} if inventory else {}),
+        **inventory_details({}, evidence or {}),
     }
 
 
