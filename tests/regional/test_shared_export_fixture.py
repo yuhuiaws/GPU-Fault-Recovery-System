@@ -37,6 +37,7 @@ class FakeRegional:
         }
         self.phases: list[dict[str, Any]] = []
         self.exec_output = "State:\tT (stopped)"
+        self.log_output = export.EXPORT_CREATED_LINE + " and tag ((null)) perms (...)\n"
         self.uid = 100
 
     def kubectl(
@@ -64,7 +65,7 @@ class FakeRegional:
         if verb == "exec":
             return self.exec_output
         if verb == "logs":
-            return "ganesha started\n"
+            return self.log_output
         if verb == "delete":
             plural = arguments[2].rsplit("/", 2)[-2]
             kind = {"pods": "pod", "configmaps": "configmap"}[plural]
@@ -373,3 +374,69 @@ def test_the_cpu_plane_is_selectable() -> None:
     regional = FakeRegional()
     server(regional, plane="cpu").create()
     assert {plane for plane, _args, _text in regional.calls} == {"cpu"}
+
+
+# --------------------------------------------------------------------------- #
+# readiness reads the server's own log (live attempt 5: Ready on TCP/2049, yet
+# the client's mount of /a got ENOENT from the server and nothing recorded why)
+# --------------------------------------------------------------------------- #
+def test_ganesha_logs_its_export_decisions_at_info() -> None:
+    config = export.ganesha_config()
+    log_block = config[config.index("LOG {") :]
+    assert "Components {" in log_block and "CONFIG = INFO;" in log_block, log_block
+    assert "EXPORT = INFO;" in log_block, log_block
+    assert "Default_Log_Level = EVENT;" in log_block, log_block
+
+
+def test_wait_ready_requires_the_export_created_line_in_the_server_log() -> None:
+    regional = FakeRegional()
+    fixture = server(regional)
+    fixture.create()
+    regional.phases = [running()] * 50
+    regional.log_output = "ganesha.nfsd Starting: Ganesha Version 4.3\n"
+    with pytest.raises(RegionalFixtureError, match="never reported export /a"):
+        fixture.wait_ready(timeout_seconds=5, poll_seconds=1)
+    log_calls = [args for _plane, args, _text in regional.calls if args[0] == "logs"]
+    assert len(log_calls) >= 2, "the log is re-read while the Pod is Ready"
+    assert all(
+        args[1] == fixture.name and args[2:4] == ("-c", "export") for args in log_calls
+    ), log_calls
+    regional.phases = [running()] * 5
+    regional.log_output = (
+        "export_commit_common :CONFIG :INFO :" + export.EXPORT_CREATED_LINE + "\n"
+        "build_default_root :CONFIG :INFO :Export 0 (/) successfully created\n"
+    )
+    ready = fixture.wait_ready(timeout_seconds=600, poll_seconds=1)
+    assert ready["export_log_verified"] is True and ready["ip"] == "10.0.9.7", ready
+
+
+def test_wait_ready_fails_with_the_servers_own_line_when_the_export_root_failed() -> (
+    None
+):
+    regional = FakeRegional()
+    fixture = server(regional)
+    fixture.create()
+    regional.phases = [running()] * 5
+    failed = (
+        "init_export_root :EXPORT :CRIT :Lookup failed on path, ExportId=1 "
+        "Path=/export/a FSAL_ERROR=(No such file or directory,2)"
+    )
+    regional.log_output = (
+        "export_commit_common :CONFIG :INFO :"
+        + export.EXPORT_CREATED_LINE
+        + "\n"
+        + failed
+        + "\n"
+    )
+    with pytest.raises(
+        RegionalFixtureError, match="never initialised export /a"
+    ) as caught:
+        fixture.wait_ready(timeout_seconds=600, poll_seconds=1)
+    assert "Lookup failed on path, ExportId=1" in str(caught.value), str(caught.value)
+    assert fixture.ready == {}, "a failed export is never reported ready"
+    regional.log_output = (
+        "Config File (/etc/ganesha/ganesha.conf:9): Unknown block (EXPORTS)\n"
+    )
+    regional.phases = [running()] * 5
+    with pytest.raises(RegionalFixtureError, match="Config File"):
+        fixture.wait_ready(timeout_seconds=600, poll_seconds=1)

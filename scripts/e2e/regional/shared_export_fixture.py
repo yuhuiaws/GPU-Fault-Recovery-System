@@ -79,6 +79,20 @@ NFS_PORT = 2049
 EXPORT_PATH = "/export/a"
 PSEUDO_PATH = "/a"
 PID_FILE = "/run/gfrs/ganesha.pid"
+#: What NFS-Ganesha 4.3 logs (COMPONENT_CONFIG at INFO) once the export is in
+#: the pseudo-FS: the readiness oracle beyond "TCP/2049 accepts". Without it a
+#: client's path walk of ``/a`` gets NFS4ERR_NOENT (live attempt 5).
+EXPORT_CREATED_LINE = (
+    f"Export 1 created at pseudo ({PSEUDO_PATH}) with path ({EXPORT_PATH})"
+)
+#: Server log lines that mean the export will never be mountable: the export
+#: root lookup failed (``init_export_root``, CRIT at every level; the export is
+#: then reverted) or the configuration did not parse.
+EXPORT_FAILURE_MARKERS = (
+    "Lookup failed on path, ExportId=1 ",
+    "Config File (",
+    "Could not create export",
+)
 DEFAULT_SIZE_MIB = 256
 MIN_SIZE_MIB = 64
 MAX_SIZE_MIB = 2048
@@ -158,6 +172,10 @@ EXPORT {{
 }}
 LOG {{
     Default_Log_Level = EVENT;
+    Components {{
+        CONFIG = INFO;
+        EXPORT = INFO;
+    }}
 }}
 """
 
@@ -431,10 +449,18 @@ class TestExportServer:
     def wait_ready(
         self, *, timeout_seconds: float, poll_seconds: float = 5.0
     ) -> dict[str, Any]:
-        """Running and Ready: the Pod IP (the mount server), node and UID."""
+        """Running, Ready *and* serving the export: the Pod IP (the mount
+        server), node and UID.
+
+        The readiness probe only proves TCP/2049 accepts; the server's own log
+        must state the export is in the pseudo-FS (``EXPORT_CREATED_LINE``) and
+        carry none of ``EXPORT_FAILURE_MARKERS`` -- otherwise a client's path
+        walk gets NFS4ERR_NOENT and the fixture, not the product, is at fault.
+        """
 
         started = self.clock()
         last: dict[str, Any] | None = None
+        log_tail = ""
         while True:
             last = self.pod()
             status = (last or {}).get("status") or {}
@@ -448,21 +474,45 @@ class TestExportServer:
                 for item in status.get("conditions") or []
             )
             if phase == "Running" and ready and status.get("podIP"):
-                self.ready = {
-                    "ip": str(status["podIP"]),
-                    "node": str((last or {}).get("spec", {}).get("nodeName") or ""),
-                    "uid": str((last or {}).get("metadata", {}).get("uid") or ""),
-                    "export": PSEUDO_PATH,
-                    "ready_at": status.get("startTime"),
-                }
-                self._journal()
-                return dict(self.ready)
+                log_tail = self.logs(200)
+                failed = self._export_failure(log_tail)
+                if failed is not None:
+                    raise RegionalFixtureError(
+                        f"test export {self.name} never initialised export "
+                        f"{PSEUDO_PATH}: {failed}"
+                    )
+                if EXPORT_CREATED_LINE in log_tail:
+                    self.ready = {
+                        "ip": str(status["podIP"]),
+                        "node": str((last or {}).get("spec", {}).get("nodeName") or ""),
+                        "uid": str((last or {}).get("metadata", {}).get("uid") or ""),
+                        "export": PSEUDO_PATH,
+                        "ready_at": status.get("startTime"),
+                        "export_log_verified": True,
+                    }
+                    self._journal()
+                    return dict(self.ready)
             if self.clock() - started >= timeout_seconds:
+                if phase == "Running" and ready:
+                    raise RegionalFixtureError(
+                        f"test export {self.name} is Ready but its log never "
+                        f"reported export {PSEUDO_PATH} created within "
+                        f"{timeout_seconds:.0f} s: {log_tail[-600:]}"
+                    )
                 raise RegionalFixtureError(
                     f"test export {self.name} is not Ready after {timeout_seconds:.0f} s "
                     f"(phase {phase}): {self.logs()[-600:]}"
                 )
             self.sleep(poll_seconds)
+
+    @staticmethod
+    def _export_failure(log_text: str) -> str | None:
+        """The first server log line proving the export cannot be served."""
+
+        for line in log_text.splitlines():
+            if any(marker in line for marker in EXPORT_FAILURE_MARKERS):
+                return line.strip()[-300:]
+        return None
 
     def logs(self, tail: int = 40) -> str:
         try:
@@ -591,6 +641,8 @@ __all__ = [
     "APP_LABEL",
     "DEFAULT_SIZE_MIB",
     "ENTRY_SCRIPT",
+    "EXPORT_CREATED_LINE",
+    "EXPORT_FAILURE_MARKERS",
     "EXPORT_PATH",
     "ExportServerSettings",
     "NFS_PORT",

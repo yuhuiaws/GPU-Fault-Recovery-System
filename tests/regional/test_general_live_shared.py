@@ -14,6 +14,7 @@ product records what the spec asks for.
 from __future__ import annotations
 
 import dataclasses
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ import pytest
 
 from scripts.e2e.regional import general_live_shared as shared
 from scripts.e2e.regional.general_live_fixture import VariantInconclusive, VariantNotRun
+from scripts.e2e.regional.host_probe_fixture import HostProbeError
 from scripts.e2e.regional.regional_commands import RegionalFixtureError
 from tests.regional._general_live_fakes import (
     FakeProbe,
@@ -58,6 +60,10 @@ class FakeExportServer:
     def __init__(self, regional: Any, settings: Any, **_: Any) -> None:
         self.regional = regional
         self.settings = settings
+        self.name = f"gfrs-export-fake-{settings.suffix}"
+        self.log_text = (
+            "export_commit_common :CONFIG :INFO :Export 1 created at pseudo (/a)\n"
+        )
         self.paused = False
         self.mode = "1777"
         self.deleted = False
@@ -103,6 +109,10 @@ class FakeExportServer:
 
     def describe(self) -> dict[str, Any]:
         return {"suffix": self.settings.suffix, "ready": self.ready}
+
+    def logs(self, tail: int = 40) -> str:
+        self.calls.append(f"logs-{tail}")
+        return self.log_text
 
 
 def servers_by_suffix() -> dict[str, FakeExportServer]:
@@ -1078,4 +1088,46 @@ def test_delivery_errors_need_two_batches_with_the_companion_metric() -> None:
     before = {"batches": [batch(-5, sample(shared.COMPANION_METRIC, None, 1.0))] * 2}
     assert shared.delivery_errors(before, since), (
         "batches from before the injection do not count"
+    )
+
+
+def test_a_failed_client_mount_keeps_the_server_log_and_names_the_cause(
+    tmp_path: Path,
+) -> None:
+    """Live attempt 5 ended every variant on "host probe failed ...; output
+    withheld": the export Pod was Ready, the mount got ENOENT from the server,
+    and the Pod was deleted with its log. The module now saves the server log
+    beside the case before the LIFO cleanup deletes the Pod, and the error
+    names the node, the probe's sentence and the evidence file."""
+
+    probe = shared_probe(NODE)
+    failure = HostProbeError(
+        "host probe failed (exit 1; error MountError 0123456789abcdef at "
+        "nfs_mount:560; nfs mount failed: export server answered ENOENT for the "
+        "export path); output withheld"
+    )
+
+    def refuse(_arguments: tuple[str, ...]) -> dict[str, Any]:
+        raise failure
+
+    probe.script["nfs-mount"] = refuse
+    ctx = context(
+        "stat_timeout", tmp_path, activity=None, probes={f"shared@{NODE}": probe}
+    )
+    with pytest.raises(RegionalFixtureError) as caught:
+        SPECS["stat_timeout"].execute(ctx)
+    text = str(caught.value)
+    server = servers_by_suffix()["a"]
+    assert server.name in text and NODE in text and "answered ENOENT" in text, text
+    assert "export-a-log-at-mount-failure" in text, text
+    assert any(call.startswith("logs-") for call in server.calls), server.calls
+    saved = json.loads(
+        (ctx.case_dir / "export-a-log-at-mount-failure.json").read_text()
+    )
+    assert saved["log"] == server.log_text and saved["node"] == NODE, saved
+    assert saved["server"] == server.ready and "answered ENOENT" in saved["error"], (
+        saved
+    )
+    assert ctx.cleanup.pending() == ["export-a", f"mount-shared@{NODE}"], (
+        "the unmount and the delete are still on the stack for the runner"
     )

@@ -78,6 +78,7 @@ from scripts.e2e.regional.general_live_registry import (
     VariantSpec,
 )
 from scripts.e2e.regional.general_live_store import node_activity, signal_key
+from scripts.e2e.regional.host_probe_fixture import HostProbeError
 from scripts.e2e.regional.general_live_verdicts import (
     DIAGNOSTIC_ONLY_STATES,
     ChainExpectation,
@@ -244,7 +245,29 @@ def mount_export(
         f"mount-{name}@{node}",
         lambda: _checked_unmount(ctx, node, name),
     )
-    mounted = ctx.shared(*arguments, node=node, timeout=240)
+    try:
+        mounted = ctx.shared(*arguments, node=node, timeout=240)
+    except HostProbeError as exc:
+        # The export Pod is deleted by the LIFO cleanup right after this; its
+        # log is the only record of why the server refused the mount (live
+        # attempt 5: six variants, "output withheld", log gone with the Pod).
+        suffix = server.settings.suffix
+        evidence = f"export-{suffix}-log-at-mount-failure"
+        ctx.evidence.write(
+            evidence,
+            {
+                "node": node,
+                "mount": name,
+                "server": dict(server.ready),
+                "error": str(exc),
+                "log": server.logs(200),
+            },
+        )
+        raise RegionalFixtureError(
+            f"mounting the test export {server.name} "
+            f"({server.ready.get('ip')}:{server.ready.get('export')}) on {node} "
+            f"failed: {exc}; the export Pod log is saved as {evidence}.json"
+        ) from exc
     ctx.evidence.write(f"mount-{name}-{node}", mounted)
     reading = mounted.get("statvfs") or {}
     total = reading.get("total_bytes")
