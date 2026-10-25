@@ -988,6 +988,20 @@ inaccessible, env, pci_root)`/`open_command`/`open_tree`/`set_value`/`set_tree_v
 `audit`/`verify`/`status`/`close`，计划用 `command_plan(tool, [rule(query, action, **字段)])`
 构造并在发送前按包装器自己的允许列表校验。
 
+**内核采集器的命令窗口（`KERNEL_COLLECTOR_SOURCE_REPLAY`）**：同一回放器以
+`kernel_collector_source_replay(ctx)`（`unit=gpu-fault-kernel-collector.service`）在内核采集器
+单元上只开 **command** 窗口，且只允许一个查询——该单元 CollectorContext 启动时的
+`nvidia-smi --query-gpu=driver_version`（`tools/host_command_replay.py` `UNIT_QUERIES`；包装器、
+探针、控制端三处各自拒绝其它工具/查询）。drop-in 写在该单元自己的 `.d` 目录（PATH 首位 shim、
+审计目录可写，并 `UnsetEnvironment=GPU_FAULT_DRIVER_BRANCH`——`UnsetEnvironment=` 在
+`EnvironmentFile=` 之后生效，安装器默认把该变量写空，窗口内不让已配置的分支顶替被扣留的查询），
+核验除 shim/PATH 外还确认该变量在单元真实环境中不存在；只重启内核采集器，关窗/deadman 把它
+重启回真实二进制，无 state 的残留 drop-in 也按两个单元的路径查找并移除。bind/tree/inaccessible/
+env/pci-root 对该单元一律拒绝；`HOST_SOURCE_REPLAY` 不解锁内核采集器，新令牌也不解锁 host
+collector 的扩展模式；Node Agent 仍永不在允许列表内。只读的 `journal-read --unit --since` 返回
+允许列表内单元自己的 journal 尾部（有界），供变体读采集器对发现过程的记录
+（`software version discovery unavailable` / `discovered NVIDIA driver branch`）。
+
 ### phase 2 范围与前提（工作负载/热备类）
 
 第二批补 011 EFA 流量停滞/NCCL hung、027 训练进度、030 热备不健康；均用受管的
@@ -1191,13 +1205,24 @@ phase 2 新增经审查的 `live-replay` 类别，统一经产品自身的读取
   reset/reboot 步骤；产品按站点安全对该事件做 MARK_UNSCHEDULABLE + QUARANTINE，变体经
   产品的 validated restore 把节点交回。决策通过节点新 incident 的 `event_id` 读
   `get_xid_policy_decision`（SXID 决策同表）。
-- 032 `missing_version` 仍 `FIXTURE_NOT_READY`：解码器门禁（`_workflow_nvlink5` 的
-  `driver_branch is None` → BLOCKED_MISSING_EVIDENCE）读的是 XID 事件上由**内核采集器**
-  自身 CollectorContext（单元启动时的 `nvidia-smi --query-gpu=driver_version`）盖上的
-  版本，而非 host collector 或 `/proc/driver/nvidia/version`；共享回放器只允许
-  `gpu-fault-host-collector.service`，需要协调方审查后把包装器/探针的允许单元扩到
-  `gpu-fault-kernel-collector.service`（仅 `driver_version` 查询），再配合 kmsg 回放一条带
-  IntrInfo/Error Status 的 WORKFLOW_NVLINK5_ERR XID。
+- 032 `missing_version`（`KERNEL_COLLECTOR_SOURCE_REPLAY` + `KERNEL_SOURCE_REPLAY`，两个
+  集群，`S`）：解码器门禁（`_workflow_nvlink5` 的 `driver_branch is None` →
+  BLOCKED_MISSING_EVIDENCE "NVLink5 decode requires driver branch, IntrInfo and Error
+  Status"）读的是 XID 事件上由**内核采集器**自身 CollectorContext（单元启动时的
+  `nvidia-smi --query-gpu=driver_version`）盖上的版本。变体先在内核采集器单元上开命令窗口
+  （包装器以经审查的失败答复 `driver_version` 查询、`GPU_FAULT_DRIVER_BRANCH` 置空），用包装器
+  审计（重启后的采集器确实来问、且被拒）和单元自身 journal（无 `discovered NVIDIA driver
+  branch`）证明版本确已缺失，**然后**才经 kmsg 回放一条真实 B 系列形态的 XID 149 行
+  `NVRM: Xid (PCI:<gpu>): 149, pid=0, name=gfrs-live, NETIR_LINK_EVT Fatal XC0 i0 Link 08
+  (0x004505c6 0x00000000)`（固件两寄存器 payload；V1 解码为 RESET_GPU、V2 无匹配——正因如此
+  窗口无效时绝不注入）。判定只读产品记录：事件带 `intr_info`/`error_status` 而
+  `driver_branch=null`，决策 BLOCKED 且理由点名 driver branch、WORKFLOW_NVLINK5_ERR 被扣留、
+  operator-required、无 reset/reboot；站点安全隔离经 validated restore 交回。窗口未生效
+  （无被拒查询、journal 出现 discovered、或事件上盖了分支）记 INCONCLUSIVE。**本站结论**：
+  `_resolve_xid` 先过目录产品门禁再进工作流解析器，而 XID 144-150 的产品只有 B100/GB200，
+  H200 上任何此类 XID 无论分支如何都是 NOT_APPLICABLE（真实解析器 + 引擎已验证）——版本门禁
+  在本站不可达，变体从 DCGM survey 读到节点 GPU 型号后、在任何变更之前记
+  NOT_RUN(CAPABILITY_ABSENT)；在 Blackwell 节点上照常执行。
 - 013 整树回放（`HOST_SOURCE_REPLAY`，两个集群）：`build-infiniband-fixture` 先复制节点
   真实 `/sys/class/infiniband`（选一个端口 ACTIVE/LinkUp 的真实设备），再施加一个经审查的
   变异并以 `--tree` 绑入 host collector 单元；PCI 根保持真实，`pci_discovered` 不会下降，
@@ -1221,7 +1246,8 @@ phase 2 新增经审查的 `live-replay` 类别，统一经产品自身的读取
   放在车道最后执行。
 
 计划/执行守卫键仍为 `<case>.<variant>`，确认串 `GENERALLIVE<NNN>_EXECUTE`。新 `--approve`
-令牌：`KERNEL_SOURCE_REPLAY`（kmsg 源重指，032）、`EFA_DRIVER_UNBIND`、
+令牌：`KERNEL_SOURCE_REPLAY`（kmsg 源重指，032）、`KERNEL_COLLECTOR_SOURCE_REPLAY`（内核采集器
+单元上仅 `driver_version` 查询的命令窗口，032 `missing_version`）、`EFA_DRIVER_UNBIND`、
 `DEVICE_PLUGIN_RESTART`（013/014 的原生注入，本轮未执行）；016/017 的 journal 模式复用
 `ENABLE_NODE_LOG_COLLECTOR`（节点日志采集器生产默认禁用），008/009 复用
 `KERNEL_MODULE_LOAD`。每个 016/017/032/013 变体单独 plan/execute，与 phase-1 相同：
@@ -1236,8 +1262,9 @@ run_general_live.py --site-profile <profile> --run-dir <run> \
 本轮保持 `NOT_RUN` 并留在分母：014 全部（伪造 allocatable/改 Node.status 不算证明，
 原生 plugin 故障需 `DEVICE_PLUGIN_RESTART`）、013 `pci_missing`/`driver_unbound`/
 `bind_failure`/`post_repair_failure`（唯一 EKS 节点上的 missing→reboot 链、保留的原生
-解绑）、032 的产品/版本/Profile 权限变体（`missing_version` 需内核采集器单元的回放；
-AUTH-015 未配置）、004 `probe_error`（`statvfs` 错误无法由只读文件 bind 产生）。
+解绑）、032 的产品/Profile 权限变体（AUTH-015 未配置）与本站 H200 上的 `missing_version`
+（目录产品门禁先于 NVLink5 解码器，记 CAPABILITY_ABSENT；夹具已就绪，Blackwell 节点可执行）、
+004 `probe_error`（`statvfs` 错误无法由只读文件 bind 产生）。
 
 ### phase 2 范围与前提（DCGM 字段 / GPU 库存回放）
 

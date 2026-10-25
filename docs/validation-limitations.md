@@ -1611,10 +1611,31 @@ that only a completed EFA recovery operation can satisfy, so it never re-reads
 the port, waits out `GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS` (600 s), fails,
 and -- tagged `failure_escalation_action=REBOOT_NODE` for LINK_INACTIVE --
 escalates to RESTART_NODE even though the port is ACTIVE again (the runner
-restores the link the moment the finding exists). 032 `missing_version` stays
-`FIXTURE_NOT_READY`: the NVLink5 decoder gates on the `driver_branch` the
-*kernel collector's* own CollectorContext stamps on the XID event, and the host
-source replay is allow-listed for `gpu-fault-host-collector.service` only.
+restores the link the moment the finding exists). 032 `missing_version` runs on
+the kernel collector's own command window (`--approve
+KERNEL_COLLECTOR_SOURCE_REPLAY` plus `KERNEL_SOURCE_REPLAY`, both lanes): the
+NVLink5 decoder gates on the `driver_branch` the *kernel collector's*
+CollectorContext stamps on the XID event from its `nvidia-smi
+--query-gpu=driver_version` at unit start, so the reviewed wrapper is placed
+first on that one unit's PATH and answers only that query with a failure
+(`GPU_FAULT_DRIVER_BRANCH` is unset in the unit's environment for the window;
+every other `nvidia-smi` call passes through; no file, tree, override or
+PCI-root mode exists for that unit, `HOST_SOURCE_REPLAY` never unlocks it and
+the new token never unlocks the host collector). The runner proves from the
+wrapper journal that the restarted collector asked and was refused and from the
+unit's own journal (`journal-read`) that no branch was discovered, then replays
+the real B-series XID 149 `NETIR_LINK_EVT ... (0x004505c6 0x00000000)` line
+through the kmsg replay and grades the product's records: `intr_info` and
+`error_status` parsed, `driver_branch` null, BLOCKED_MISSING_EVIDENCE naming the
+driver branch, WORKFLOW_NVLINK5_ERR withheld, operator required, no reset or
+reboot, quarantine handed back through the validated restore. A window that did
+not take effect is INCONCLUSIVE and nothing is injected (under the pre-R575 V1
+decode the same line is RESET_GPU). On this site the variant records
+`NOT_RUN(CAPABILITY_ABSENT)` before any mutation: `_resolve_xid` runs the
+Catalog's product gate before the workflow resolver and XID 144-150 apply to the
+B100/GB200 families only, so every such line is NOT_APPLICABLE on an H200
+whatever the branch (verified with the real parser and engine) -- the version
+gate is reachable only on a Blackwell node, where the same code runs for real.
 
 The variants that stay `NOT_RUN` on this single-node site keep their place in the
 denominator with an explicit reason: 014 Kubernetes allocatable (every variant --
