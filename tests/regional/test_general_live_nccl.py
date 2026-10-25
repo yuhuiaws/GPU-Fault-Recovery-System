@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 
+from gpu_fault.hung_summary_codec import encode_summary
 from scripts.e2e.regional import general_live_nccl as nc
 from scripts.e2e.regional.general_live_fixture import VariantInconclusive
 from scripts.e2e.regional.general_live_nccl_job import STALL_MAX_SECONDS
@@ -197,8 +198,13 @@ def hung_records(
     tag: str = "",
     workflow: str = "wf",
     predecessor: str | None = None,
+    encoded: bool = True,
 ) -> dict[str, Any]:
-    """One stall wave's records; ``tag`` keeps a later wave's ids apart."""
+    """One stall wave's records; ``tag`` keeps a later wave's ids apart.
+
+    A triage node result is stored as the executor stores it: the summary
+    codec's zlib/JSON envelope (``encoded=False``: a plain legacy document).
+    """
 
     started = datetime.fromisoformat(since)
     incidents = [
@@ -235,7 +241,9 @@ def hung_records(
         if operation == "COLLECT_HUNG_TRIAGE":
             # Wave 1 samples the reporting node; wave 2 found nothing to add.
             first = index == ops.index("COLLECT_HUNG_TRIAGE")
-            details = {"node_results": {NODE: {"ranks": ranks or []}} if first else {}}
+            result = {"node_id": NODE, "ranks": ranks or []}
+            stored = encode_summary(result) if encoded else result
+            details = {"node_results": {NODE: stored} if first else {}}
         executions.append(
             {
                 "step_index": index,
@@ -516,6 +524,36 @@ def test_fr_errors_read_the_triage_ranks() -> None:
     assert nc.fr_errors(triage(), expect_configured=False) == [
         "COLLECT_HUNG_TRIAGE sampled no rank process"
     ]
+
+
+def test_fr_errors_decode_the_envelope_each_triage_result_is_stored_in() -> None:
+    """The executor keeps every triage node result as a zlib/JSON envelope.
+
+    The oracle read ``ranks`` straight off it, so even a triage that sampled
+    every rank read "sampled no rank process" (GF-GENERAL-LIVE-011.fr_enabled).
+    A plain legacy document is read as it is; an envelope that does not decode
+    is named, never silently empty.
+    """
+
+    paired = {
+        "flight_recorder": {"status": "dumped"},
+        "flight_recorder_series": {"status": "PAIRED"},
+    }
+    for encoded in (True, False):
+        records = hung_records(SINCE, ranks=[paired], encoded=encoded)
+        assert nc.fr_errors(records, expect_configured=True) == [], encoded
+    broken = hung_records(SINCE, ranks=[paired])
+    triage = next(
+        item
+        for item in broken["workflows"]["wf"]["step_executions"]
+        if item["operation"] == "COLLECT_HUNG_TRIAGE"
+    )
+    triage["details"]["node_results"][NODE]["sha256"] = "0" * 64
+    errors = nc.fr_errors(broken, expect_configured=True)
+    assert errors[-1] == "COLLECT_HUNG_TRIAGE sampled no rank process", errors
+    assert errors[0].startswith(
+        f"COLLECT_HUNG_TRIAGE result of {NODE} is unreadable: "
+    ), errors
 
 
 # --------------------------------------------------------------------------- #

@@ -47,6 +47,7 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any
 
+from gpu_fault.hung_summary_codec import decode_summary
 from scripts.e2e.regional.general_live_common import run_survey
 from scripts.e2e.regional.general_live_fixture import (
     VariantContext,
@@ -630,7 +631,17 @@ def no_suspicion_errors(records: dict[str, Any]) -> list[str]:
     return []
 
 
-def _triage_ranks(records: dict[str, Any]) -> list[dict[str, Any]] | None:
+def _triage_ranks(
+    records: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[str]] | None:
+    """Every rank row COLLECT_HUNG_TRIAGE returned, and the results unread.
+
+    The executor stores each node's triage result as the summary codec's
+    zlib/JSON envelope (``hung_summary_codec.encode_summary``); a document
+    without ``encoding`` (an older record) is read as it is. A result that does
+    not decode is named, never read as a node that sampled nothing.
+    """
+
     executions = [
         item
         for item in _hung_workflow(records).get("step_executions") or []
@@ -639,12 +650,20 @@ def _triage_ranks(records: dict[str, Any]) -> list[dict[str, Any]] | None:
     if not executions:
         return None
     rows: list[dict[str, Any]] = []
+    unreadable: list[str] = []
     for execution in executions:
         results = (execution.get("details") or {}).get("node_results") or {}
-        for value in results.values():
-            ranks = value.get("ranks") if isinstance(value, dict) else None
+        for node, value in sorted(results.items()):
+            try:
+                document = decode_summary(value)
+            except ValueError as exc:
+                unreadable.append(
+                    f"COLLECT_HUNG_TRIAGE result of {node} is unreadable: {exc}"
+                )
+                continue
+            ranks = document.get("ranks")
             rows.extend(item for item in ranks or [] if isinstance(item, dict))
-    return rows
+    return rows, unreadable
 
 
 def fr_errors(records: dict[str, Any], *, expect_configured: bool) -> list[str]:
@@ -657,15 +676,15 @@ def fr_errors(records: dict[str, Any], *, expect_configured: bool) -> list[str]:
 
     if hung_incident(records) is None:
         return []
-    rows = _triage_ranks(records)
-    if rows is None:
+    triage = _triage_ranks(records)
+    if triage is None:
         return ["no COLLECT_HUNG_TRIAGE execution to read FR status from"]
+    rows, errors = triage
     if not rows:
-        return ["COLLECT_HUNG_TRIAGE sampled no rank process"]
+        return [*errors, "COLLECT_HUNG_TRIAGE sampled no rank process"]
     statuses = [(row.get("flight_recorder") or {}).get("status") for row in rows]
     series = [(row.get("flight_recorder_series") or {}).get("status") for row in rows]
     if expect_configured:
-        errors = []
         if "not_configured" in statuses:
             errors.append(
                 f"FR was configured but {statuses.count('not_configured')} "
@@ -680,8 +699,10 @@ def fr_errors(records: dict[str, Any], *, expect_configured: bool) -> list[str]:
         return errors
     unexpected = sorted({str(item) for item in statuses if item not in FR_OFF_STATUSES})
     if unexpected or any(series):
-        return [f"FR was not configured yet triage reports {unexpected or series}"]
-    return []
+        errors.append(
+            f"FR was not configured yet triage reports {unexpected or series}"
+        )
+    return errors
 
 
 # --------------------------------------------------------------------------- #
