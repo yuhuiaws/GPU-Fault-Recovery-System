@@ -3382,6 +3382,39 @@ the locks of all its keys in one statement ordered `COLLATE "C"` (byte order: th
 pods' per-key loops), so two batches with overlapping keys cannot deadlock and no key costs its own database round trip
 (`tests/store/test_postgres_advisory_lock_batches.py`).
 
+Device-scoped signals and a device that disappears (batch 160, GF-GENERAL-LIVE-006 live on plain EKS): a signal keyed
+`cluster/node/metric/<device>` (`disk_io_*` per block device, `network_*` per interface, the filesystem rules per mount
+point, SMART per drive) only receives samples while the device is on the node -- the host collector emits `disk_io_*`
+only for block devices present in `/proc/diskstats` with completed I/O -- so when a test dm-delay device had driven
+`disk_io_await_ms/dm-0` to active+notified and was then torn down, no below-threshold sample ever cleared it, the latch
+stayed for two hours, and a new same-named dm-0 that crossed the threshold again minted nothing because
+`_next_health_signal_state` saw `previously_notified` (a silent miss). Two layers now close this; both only ever *clear*
+a signal and never invent a fault, a cleared signal must run its full sustain window again before it notifies, and a
+device that keeps breaching is carried by every delivered batch so neither layer touches it. (1) The collector reports a
+block device that was in `/proc/diskstats` on its previous read and is not now -- or whose counters restarted, which the
+kernel documents as reattachment or reinitialisation, i.e. a new instance under the old name -- with one
+`device_state=GONE` sample per `disk_io_*` metric (value 0, but not a reading: the control plane grades it as a clear and
+keeps it out of the latest metrics, so VALIDATE_HOST never reads a healthy 0 ms for a device that is not there); the
+samples come first in the tick and are repeated every tick until a batch is delivered (the tick a device vanishes is
+usually the `recovered` edge of its own, otherwise the next health summary carries them), and a vanished device's
+counter baseline is forgotten so a same-named successor is rated from its own first read
+(`collectors/host/system_metrics.py`). (2) After the claim of every host batch from the node's own collector
+(`producer=node`) the control plane reads, through `stale_health_signal_states("cluster/node/")` (an exact prefix, not
+a key range: the production database's default collation is not byte order), the node's rows no claim wrote for
+`GPU_FAULT_HEALTH_SIGNAL_DEVICE_AGE_OUT_SUMMARIES` (default 3; `0` off; otherwise at least 2, because one jittered
+summary interval can run 1.5x) times `GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS` (default 300 s: about 15 minutes), and
+writes those that are active, device-scoped (device segment not `node`, metric in the host rule tables, not a
+per-attempt low-utilisation window) and absent from this batch to inactive through the ordinary claim once the window
+has passed on both the control plane's receive clock and the node's clock (the age-out); when only one clock jumped --
+a backlog delivered after an outage moves only the receive clock -- nothing is cleared. The record is the cleared state
+itself (`observed_at/clock_at` at the age-out), one INFO line naming the keys (`aged out N device-scoped health
+signal(s) of cluster/node`) and `device_signal_age_outs_total` on the policy; no field is added to `HealthSignalState`,
+because the previous release could not decode a row with an unknown field after a rollback and the claim path reads
+these rows on every sample. Node-scoped signals (device segment `node`) and attempt windows are never aged out
+(`host_device_signals.py`; `tests/host_health/test_device_signal_age_out.py`,
+`tests/app_services/test_device_signal_age_out_ingest.py`, `tests/collectors/test_host_device_gone.py`,
+`tests/store/test_stale_health_signal_states.py`).
+
 Low CPU/GPU utilization is timed only when the control plane can resolve exactly one real managed attempt for that node (PENDING/RUNNING in the attempt
 observation, and still having non-terminated containers on this node); the collector's
 self-reported `ACTIVE` workload state is only an environment-variable-derived pre-filter and is not sufficient to start the timer; failing to resolve, or

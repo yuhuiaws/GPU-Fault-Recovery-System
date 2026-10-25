@@ -718,6 +718,7 @@ rules:
       # Health-signal state retention (batch 145): the sweep's rules on every
       # backend, its periodic job, and the EFA traffic row per node it keeps.
       - tests/store/test_health_signal_retention.py
+      - tests/store/test_stale_health_signal_states.py
       - tests/app_services/test_health_signal_retention_job.py
       - tests/host_health/test_efa_traffic_node_state.py
       - tests/execution/test_hung_triage_efa_node_row.py
@@ -784,6 +785,11 @@ rules:
       - tests/host_health/test_low_utilization_attempt_window.py
       - tests/host_health/test_low_utilization_owned_gpus.py
       - tests/host_health/test_low_utilization_provider_parity.py
+      # Device-scoped signals whose device stopped reporting: the GONE sample
+      # and the control-plane age-out (batch 160).
+      - src/gpu_fault/host_device_signals.py
+      - tests/host_health/test_device_signal_age_out.py
+      - tests/app_services/test_device_signal_age_out_ingest.py
       - src/gpu_fault/control_record_archive.py
       - src/gpu_fault/efa_traffic_state.py
       - src/gpu_fault/log_rules.py
@@ -811,6 +817,7 @@ rules:
       # host_health.py's own rules: the sustained host-resource windows, the
       # managed-attempt gate and its per-attempt scope (batch 140).
       - tests/host_health
+      - tests/app_services/test_device_signal_age_out_ingest.py
       - tests/fleet/test_dcgm_hostengine_heartbeat.py
       - tests/metrics/test_fabric_manager_state.py
       - tests/execution/test_validation_nvlink_fabric.py
