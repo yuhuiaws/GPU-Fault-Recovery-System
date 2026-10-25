@@ -66,7 +66,11 @@ from scripts.e2e.regional.general_live_fixture import (
     run_identity,
 )
 from scripts.e2e.regional.general_live_fr_replay import FlightRecorderReplay
-from scripts.e2e.regional.general_live_nccl_job import MIN_ACTIVE_BPS, ManagedNcclJob
+from scripts.e2e.regional.general_live_nccl_job import (
+    MIN_ACTIVE_BPS,
+    ManagedNcclJob,
+    fr_location_errors,
+)
 from scripts.e2e.regional.general_live_registry import (
     HARDWARE_OPERATIONS,
     LIVE_REPLAY,
@@ -107,6 +111,26 @@ RECOVERY_MAX_GAP_SECONDS = 60
 #: The recovery threshold without a trusted pre-stall baseline; with one it is a
 #: quarter of that baseline, under the active threshold for this job (< 4x it).
 RECOVERY_FALLBACK_BPS = 1048576
+#: Why ``fr_enabled`` is an expected FAIL on this product: PyTorch 2.9.0 (the
+#: DLC image) writes the flight-recorder dump of a job that pins no dump file to
+#: ``$HOME/.cache/torch/comm_lib_trace_rank_<rank>`` and prefers
+#: ``TORCH_FR_DUMP_TEMP_FILE``; the product's reader knows only the <= 2.8 names.
+FR_DUMP_LOCATION_GAP = (
+    "Node Agent COLLECT_HUNG_TRIAGE flight-recorder reader (src/gpu_fault/node_agent/"
+    "operations/flight_recorder.py::_flight_dump_candidates, lines 204-249): the dump"
+    " prefix comes only from TORCH_NCCL_DEBUG_INFO_TEMP_FILE, else the PyTorch <= 2.8"
+    " default /tmp/nccl_trace_rank_<rank>. PyTorch 2.9.0 (the DLC image; c10d::"
+    "DebugInfoWriter::getWriter in torch/csrc/distributed/c10d/FlightRecorder.cpp)"
+    " prefers TORCH_FR_DUMP_TEMP_FILE and defaults to $HOME/.cache/torch/"
+    "comm_lib_trace_rank_<rank>, so a job injected exactly as docs/部署和运维手册.md"
+    " prescribes (trace buffer, pipe, dump-on-timeout; no TEMP_FILE) dumps where the"
+    " product never looks: every rank ends dump_missing after the half-budget wait and"
+    " no series is PAIRED (the FIFO is found and written; the file is not). Fix: read"
+    " TORCH_FR_DUMP_TEMP_FILE first, add <HOME or /tmp>/.cache/torch/"
+    "comm_lib_trace_rank_<rank> to the dump candidates, and pin the dump file in the"
+    " manual's injection (CN and EN); the variant's <suffix>-fr-forensics.json shows"
+    " where the trainer's dumps are."
+)
 #: The step a trainer line is about (``STALL step=``, ``RESUMED step=``).
 STEP = re.compile(r"\bstep=(\d+)")
 #: Incident states the hung chain does not leave on its own.
@@ -1054,9 +1078,36 @@ def phase_progress(ctx: VariantContext) -> dict[str, Any]:
     )
 
 
+def _fr_forensics(
+    ctx: VariantContext, suffix: str
+) -> tuple[dict[str, Any], Callable[[ManagedNcclJob, dict[str, Any]], None]]:
+    """An ``after_hung`` hook keeping the trainer's own FR files as evidence.
+
+    Read while the stall still holds and the Pods are alive (they are deleted
+    at cleanup): ``<suffix>-fr-forensics.json`` carries, per Pod, the files at
+    every known dump location, the debug FIFOs and PyTorch's own FR log lines.
+    """
+
+    taken: dict[str, Any] = {}
+
+    def hook(job: ManagedNcclJob, _records: dict[str, Any]) -> None:
+        taken.update(job.flight_recorder_forensics())
+        ctx.evidence.write(f"{suffix}-fr-forensics", taken)
+
+    return taken, hook
+
+
 def fr_enabled(ctx: VariantContext) -> dict[str, Any]:
-    identity, records, stages = stalled_chain(ctx, "fron", flight_recorder=True)
-    stages["fr_dumps"] = fr_errors(records, expect_configured=True)
+    forensics, hook = _fr_forensics(ctx, "fron")
+    identity, records, stages = stalled_chain(
+        ctx, "fron", flight_recorder=True, after_hung=hook
+    )
+    errors = fr_errors(records, expect_configured=True)
+    if errors:
+        # A miss is attributed, not just counted: where the trainer's dumps
+        # really are tells the product gap from a trainer that never dumped.
+        errors.extend(fr_location_errors(forensics))
+    stages["fr_dumps"] = errors
     return variant_result(
         stages,
         notes=["FR configured: triage must take two real dumps per PID"],
@@ -1065,7 +1116,8 @@ def fr_enabled(ctx: VariantContext) -> dict[str, Any]:
 
 
 def fr_disabled(ctx: VariantContext) -> dict[str, Any]:
-    identity, records, stages = stalled_chain(ctx, "froff")
+    _forensics, hook = _fr_forensics(ctx, "froff")
+    identity, records, stages = stalled_chain(ctx, "froff", after_hung=hook)
     stages["fr_dumps"] = fr_errors(records, expect_configured=False)
     return variant_result(
         stages,
@@ -1267,6 +1319,8 @@ def variant_spec(
     max_minutes: int = 65,
     proof: str = NATIVE,
     approvals: tuple[str, ...] = (),
+    expected_outcome: str = "PASS",
+    product_gap: str = "",
 ) -> VariantSpec:
     return VariantSpec(
         case_id=CASE,
@@ -1283,6 +1337,8 @@ def variant_spec(
         ),
         max_minutes=max_minutes,
         approvals=approvals,
+        expected_outcome=expected_outcome,
+        product_gap=product_gap,
         execute=execute,
     )
 
@@ -1336,6 +1392,8 @@ VARIANTS = [
         "the stalled job runs the flight recorder (trace buffer + debug pipe)",
         "triage takes two real FR dumps per PID; chain -> ESCALATED",
         fr_enabled,
+        expected_outcome="FAIL",
+        product_gap=FR_DUMP_LOCATION_GAP,
     ),
     variant_spec(
         "fr_disabled",

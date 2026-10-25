@@ -81,6 +81,8 @@ class FakeNcclJob:
     events: dict[str, list[str]] | None = None
     #: What ``flight_ledgers`` answers (a replayed recorder's responder ledgers).
     ledgers: dict[str, Any] | None = None
+    #: What ``flight_recorder_forensics`` answers (the trainer's own FR files).
+    forensics: dict[str, Any] | None = None
 
     def __init__(
         self,
@@ -101,6 +103,9 @@ class FakeNcclJob:
         self.stalled = False
         self.stall_times: list[datetime] = []
         self.released = 0
+        #: ``released`` as of each forensics read: the files must be read while
+        #: the stall still holds, before the Pods move on or go away.
+        self.forensics_reads: list[int] = []
         FakeNcclJob.instances.append(self)
 
     def start(self) -> dict[str, Any]:
@@ -132,6 +137,10 @@ class FakeNcclJob:
 
     def flight_ledgers(self) -> dict[str, Any]:
         return dict(FakeNcclJob.ledgers or {})
+
+    def flight_recorder_forensics(self) -> dict[str, Any]:
+        self.forensics_reads.append(self.released)
+        return dict(FakeNcclJob.forensics or {})
 
     def trainer_events(self) -> dict[str, list[str]]:
         """The trainer's log: every stall so far, each released one resumed."""
@@ -167,6 +176,7 @@ def _patch_job(monkeypatch: pytest.MonkeyPatch) -> None:
     FakeNcclJob.alive_value = True
     FakeNcclJob.events = None
     FakeNcclJob.ledgers = None
+    FakeNcclJob.forensics = None
     monkeypatch.setattr(nc, "ManagedNcclJob", FakeNcclJob)
 
 
@@ -863,6 +873,105 @@ def test_fr_variants_configure_the_job_and_read_the_dumps(tmp_path: Path) -> Non
     assert result["verdict"] == "PASS", result["errors"]
     assert FakeNcclJob.instances[-1].flight_recorder is False
     assert _run("fr_disabled", tmp_path / "dumped", ranks=[paired])["verdict"] == "FAIL"
+
+
+def _torch29_forensics(*pods: str) -> dict[str, Any]:
+    """The trainer's account on PyTorch 2.9: dumps under $HOME/.cache/torch."""
+
+    return {
+        pod: {
+            "home": "/root",
+            "files": [
+                {
+                    "path": f"/tmp/torch_nccl_debug_pipe_{rank}.pipe",
+                    "type": "fifo",
+                    "size": 0,
+                    "mtime": 1,
+                },
+                {
+                    "path": f"/root/.cache/torch/comm_lib_trace_rank_{rank}",
+                    "type": "regular file",
+                    "size": 48213,
+                    "mtime": 2,
+                },
+            ],
+            "log_lines": ["... ProcessGroupNCCL preparing to dump debug info ..."],
+            "error": None,
+        }
+        for rank, pod in enumerate(pods)
+    }
+
+
+def test_fr_enabled_is_an_expected_fail_naming_the_dump_location_gap() -> None:
+    """The product reads the pre-2.9 PyTorch dump location; the DLC image is 2.9.
+
+    A job injected exactly as the manual prescribes (buffer, pipe,
+    dump-on-timeout, no TEMP_FILE) dumps to ``$HOME/.cache/torch/
+    comm_lib_trace_rank_<rank>``, which the product's reader never visits.
+    """
+
+    spec = SPECS["fr_enabled"]
+    assert spec.expected_outcome == "FAIL"
+    for needle in (
+        "flight_recorder.py",
+        "_flight_dump_candidates",
+        "TORCH_NCCL_DEBUG_INFO_TEMP_FILE",
+        "TORCH_FR_DUMP_TEMP_FILE",
+        "/tmp/nccl_trace_rank_",
+        ".cache/torch/comm_lib_trace_rank_",
+        "部署和运维手册",
+        "dump_missing",
+    ):
+        assert needle in spec.product_gap, needle
+    assert SPECS["fr_disabled"].expected_outcome == "PASS"
+    assert SPECS["fr_disabled"].product_gap == ""
+
+
+def test_fr_variants_keep_the_trainers_own_fr_files_as_evidence_and_attribute_a_miss(
+    tmp_path: Path,
+) -> None:
+    missing = {
+        "flight_recorder": {
+            "status": "dump_missing",
+            "pipe": "/proc/3024782/root/tmp/torch_nccl_debug_pipe_0.pipe",
+        }
+    }
+    FakeNcclJob.forensics = _torch29_forensics("master", "worker")
+    ctx, _calls = _ctx(SPECS["fr_enabled"], tmp_path, ranks=[missing])
+    result = SPECS["fr_enabled"].execute(ctx)
+    assert result["verdict"] == "FAIL"
+    assert result["stages"]["fr_dumps"] == [
+        "no sampled rank got two real FR dumps (statuses ['dump_missing'], series ['None'])",
+        "the trainer wrote 2 FR dump file(s) under /root/.cache/torch/comm_lib_trace_rank_*"
+        " (the PyTorch >= 2.9 default) and 0 under /tmp/nccl_trace_rank_* (the only"
+        " default the product reads); 2 'preparing to dump debug info' line(s)",
+    ]
+    job = FakeNcclJob.instances[-1]
+    assert job.forensics_reads == [0], "read once, while the stall still holds"
+    evidence = json.loads((ctx.case_dir / "fron-fr-forensics.json").read_text())
+    assert evidence == FakeNcclJob.forensics
+
+    paired = {
+        "flight_recorder": {"status": "dumped"},
+        "flight_recorder_series": {"status": "PAIRED"},
+    }
+    result = _run("fr_enabled", tmp_path / "paired", ranks=[paired])
+    assert result["verdict"] == "PASS", result["errors"]
+    assert result["stages"]["fr_dumps"] == [], "a paired read needs no attribution"
+
+    FakeNcclJob.forensics = {
+        "master": {"home": "/root", "files": [], "log_lines": [], "error": None}
+    }
+    ctx, _calls = _ctx(
+        SPECS["fr_disabled"],
+        tmp_path / "disabled",
+        ranks=[{"flight_recorder": {"status": "not_configured"}}],
+    )
+    result = SPECS["fr_disabled"].execute(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    assert FakeNcclJob.instances[-1].forensics_reads == [0]
+    evidence = json.loads((ctx.case_dir / "froff-fr-forensics.json").read_text())
+    assert evidence == FakeNcclJob.forensics
 
 
 def test_always_low_passes_on_a_quiet_job_with_no_suspicion(tmp_path: Path) -> None:

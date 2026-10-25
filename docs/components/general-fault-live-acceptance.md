@@ -1219,7 +1219,15 @@ POST 预制 finding。类别模块 `general_live_nccl`/`_nccl_fr`/`_progress`/`_
   在 `/dev/shm` 重写 4 MiB）、`phase_progress`（各 rank 在自己的
   `GPU_FAULT_RANK_PROGRESS_FILE` 写 `rank-progress/v1`，停滞中 step 增长、phase 每 30 秒
   切换）、`fr_enabled`（按运维手册注入 trace buffer/pipe/dump-on-timeout，至少一个 PID
-  两次真实 dump 为 `PAIRED`）、`fr_disabled`（trace buffer 为 0，只能 `not_configured`）、
+  两次真实 dump 为 `PAIRED`；现按产品缺口登记为 `expected_outcome="FAIL"`：DLC 镜像的
+  PyTorch 2.9 把未钉 `TORCH_NCCL_DEBUG_INFO_TEMP_FILE` 时的默认 dump 文件从
+  `/tmp/nccl_trace_rank_<rank>` 移到 `$HOME/.cache/torch/comm_lib_trace_rank_<rank>`
+  并优先读 `TORCH_FR_DUMP_TEMP_FILE`，而产品 `flight_recorder.py` 的读取器只认旧变量名与
+  旧默认位置，手册的注入又不钉 dump 位置，于是 FIFO 找到、写入成功但全部 rank
+  `dump_missing`、无 `PAIRED`；运行器在释放前把两 Pod 内三处候选位置的 `stat` 清单与
+  PyTorch 自己的 FR 日志行写入 `<suffix>-fr-forensics.json`，`fr_dumps` 判定指出 dump
+  实际所在——写在 2.9 默认位置、写在产品读取位置但读取过早、或根本未写）、
+  `fr_disabled`（trace buffer 为 0，只能 `not_configured`；同样留存 forensics 证据）、
   `simultaneous_nodes`（合并 incident 须含两节点各自的 hung 证据）。
   live-replay 实测（`general_live_nccl_fr`，经审查的测试 FR dump 响应器
   `probes/general_live_fr_responder.py`，形状由 `general_live_fr_replay` 渲染）：同一
@@ -1625,4 +1633,7 @@ endpoint 再等待无活动 finding 的新批次（不要求硬件累计计数�
 掩盖。首批记为预期 FAIL 的四个产品缺口——025 `one_gpu_missing`（完整性按全批 union
 计算，漏查单卡）、022 `expired_xid`（PCIe↔XID gauge 回退无时效检查）、026
 `bdf_changed`（身份只比 UUID 集）、026 `stale_boot`（库存基线不比 source_boot_id）
-——已由批次 160 修复，对应变体改为预期 PASS；产品回退时这些变体判 FAIL。
+——已由批次 160 修复，对应变体改为预期 PASS；产品回退时这些变体判 FAIL。当前登记的
+预期 FAIL 缺口：011 `fr_enabled`（产品 FR 读取器不认 PyTorch 2.9 的默认 dump 位置
+`$HOME/.cache/torch/comm_lib_trace_rank_<rank>` 与 `TORCH_FR_DUMP_TEMP_FILE`，手册注入
+亦不钉 dump 文件；见该用例的变体说明），产品修复并经该变体 PASS 后改回预期 PASS。
