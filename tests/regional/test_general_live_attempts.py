@@ -7,9 +7,13 @@ from typing import Any
 
 import pytest
 
+from gpu_fault.store import NotFoundError
 from scripts.e2e.regional import general_live_attempts as att
+from scripts.e2e.regional.general_live_restart_budget import BUDGET_PROBE
 from tests.regional._general_live_fakes import (
     FakeRegional,
+    budget_ledger_store,
+    budget_probe_run,
     make_context,
     make_settings,
     store_script,
@@ -340,9 +344,97 @@ def test_deferred_variants() -> None:
     assert SPECS["hardware_chain_continues"].deferred.startswith("FIXTURE_NOT_READY"), (
         "SPECS['hardware_chain_continues'].deferred.startswith('FIXTURE_NOT_REA"
     )
-    assert SPECS["concurrent_claim"].deferred.startswith("FIXTURE_NOT_READY"), (
-        "SPECS['concurrent_claim'].deferred.startswith('FIXTURE_NOT_READY')"
+
+
+# --------------------------------------------------------------------------- #
+# 029 store-level variants over the product's restart ledger
+# --------------------------------------------------------------------------- #
+def budget_regional(store: Any, mutate=None) -> FakeRegional:
+    def responder(script: str, *arguments: str) -> dict[str, Any]:
+        assert script == BUDGET_PROBE, "store variants ship only the budget probe"
+        document = budget_probe_run(store, arguments)
+        if mutate is not None:
+            mutate(arguments, document)
+        return document
+
+    return FakeRegional(cpu_python=responder)
+
+
+def test_store_variants_are_implemented_lane_locked_and_unapproved() -> None:
+    for variant in ("concurrent_claim", "missing_context"):
+        spec = SPECS[variant]
+        assert spec.implemented, variant
+        assert spec.flags == "P" and spec.lanes == ("eks", "hp"), variant
+        assert spec.approvals == () and spec.risk == "L", variant
+        assert "test" in spec.cleanup and "release" in spec.cleanup, variant
+
+
+@pytest.mark.parametrize("variant", ["concurrent_claim", "missing_context"])
+def test_store_variants_pass_and_clean_up_over_the_product_ledger(
+    tmp_path: Path, variant: str
+) -> None:
+    store = budget_ledger_store()
+    spec = SPECS[variant]
+    ctx = make_context(
+        spec, tmp_path=tmp_path, regional=budget_regional(store), probes={}
     )
-    assert SPECS["missing_context"].deferred.startswith("FIXTURE_NOT_READY"), (
-        "SPECS['missing_context'].deferred.startswith('FIXTURE_NOT_READY')"
+    result = spec.execute(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    assert ctx.cleanup.pending() == [], "the variant cleaned up itself"
+    assert result["cleanup_receipt"]["clean"] is True
+    assert result["job_id"].startswith("gl29"), "result['job_id'].startswith('gl29')"
+    with pytest.raises(NotFoundError):
+        store.get_restart_budget("gpu-eks-cluster", result["job_id"])
+
+
+def test_concurrent_claim_fails_on_a_granted_rival(tmp_path: Path) -> None:
+    def grant_rival(arguments: tuple[str, ...], document: dict[str, Any]) -> None:
+        if arguments[0] == "concurrent":
+            document["phases"]["rival"]["results"][0]["reserved"] = True
+
+    store = budget_ledger_store()
+    spec = SPECS["concurrent_claim"]
+    ctx = make_context(
+        spec, tmp_path=tmp_path, regional=budget_regional(store, grant_rival), probes={}
     )
+    result = spec.execute(ctx)
+    assert result["verdict"] == "FAIL"
+    assert any("past the budget" in error for error in result["errors"]), result[
+        "errors"
+    ]
+    assert result["cleanup_receipt"]["clean"] is True, "cleanup still runs on a FAIL"
+
+
+def test_missing_context_fails_when_the_preflight_admits_the_step(
+    tmp_path: Path,
+) -> None:
+    def admit(arguments: tuple[str, ...], document: dict[str, Any]) -> None:
+        if arguments[0] == "missing-context":
+            document["preflight"] = None
+
+    store = budget_ledger_store()
+    spec = SPECS["missing_context"]
+    ctx = make_context(
+        spec, tmp_path=tmp_path, regional=budget_regional(store, admit), probes={}
+    )
+    result = spec.execute(ctx)
+    assert result["verdict"] == "FAIL"
+    assert any("admitted" in error for error in result["errors"]), result["errors"]
+
+
+def test_store_variants_fail_when_the_ledger_row_remains(tmp_path: Path) -> None:
+    def keep_row(arguments: tuple[str, ...], document: dict[str, Any]) -> None:
+        if arguments[0] == "cleanup":
+            document["clean"] = False
+            document["remaining"] = {"restart_count": 0, "reservation_ids": []}
+
+    store = budget_ledger_store()
+    spec = SPECS["missing_context"]
+    ctx = make_context(
+        spec, tmp_path=tmp_path, regional=budget_regional(store, keep_row), probes={}
+    )
+    result = spec.execute(ctx)
+    assert result["verdict"] == "FAIL"
+    assert any("ledger remains" in error for error in result["errors"]), result[
+        "errors"
+    ]

@@ -10,7 +10,11 @@ containment incident/workflow, the recovery history and the durable restart
 ledger -- never a hand-made terminal. 029 consumes the budget through
 legitimate failures and checks that an exhausted budget withholds only
 RESTART_WORKLOAD while the rest of a chain still runs, and that duplicates and
-missing restart context are refused without a double deduction.
+missing restart context are refused without a double deduction. The two 029
+variants that are about the ledger itself rather than a job -- a concurrent
+claim of one restart and a restart step without its safety context -- run the
+store-level harness of ``general_live_restart_budget`` (the product's own
+reserve/release API and claim preflight on a test job id, in an API Pod).
 """
 
 from __future__ import annotations
@@ -26,6 +30,13 @@ from scripts.e2e.regional.general_live_registry import (
     NATIVE,
     VariantSpec,
     deferred_variant,
+)
+from scripts.e2e.regional.general_live_restart_budget import (
+    CLAIMERS,
+    SeededRestartBudget,
+    cleanup_errors,
+    concurrent_claim_errors,
+    missing_context_errors,
 )
 from scripts.e2e.regional.general_live_store import attempt_records
 from scripts.e2e.regional.general_live_verdicts import operations, verdict
@@ -381,6 +392,58 @@ def single_notification(ctx: VariantContext) -> dict[str, Any]:
     )
 
 
+def concurrent_claim(ctx: VariantContext) -> dict[str, Any]:
+    """Several executors claim one restart at once: one reservation, no false release."""
+
+    budget = SeededRestartBudget(ctx, tag="cc")
+    document = budget.concurrent()
+    stages = {"claims": concurrent_claim_errors(document)}
+    cleaned = budget.cleanup()
+    ctx.cleanup.discard(budget.cleanup_name)
+    stages["cleanup"] = cleanup_errors(cleaned)
+    final = ((document.get("phases") or {}).get("false_release") or {}).get("ledger")
+    return _result(
+        stages,
+        notes=[
+            f"{CLAIMERS} claimers reserved one RESTART_WORKLOAD step at once through the "
+            "product's ledger API; a rival step raced for the last slot; the release was raced",
+            "no training job exists for the test job id; nothing was created or dispatched",
+        ],
+        extra={
+            "job_id": budget.job_id,
+            "reservation_ids": document.get("reservation_ids"),
+            "final_ledger": final,
+            "cleanup_receipt": cleaned,
+        },
+    )
+
+
+def missing_context(ctx: VariantContext) -> dict[str, Any]:
+    """A restart step without its safety context is refused at preflight, fail-closed."""
+
+    budget = SeededRestartBudget(ctx, tag="mc")
+    document = budget.missing_context("source_gpu_count")
+    stages = {"refusal": missing_context_errors(document)}
+    cleaned = budget.cleanup()
+    ctx.cleanup.discard(budget.cleanup_name)
+    stages["cleanup"] = cleanup_errors(cleaned)
+    return _result(
+        stages,
+        notes=[
+            "the claim preflight refuses RESTART_SAFETY_CONTEXT_MISSING before any budget read; "
+            "the adapter gate repeats it and fails closed on a missing reservation",
+            "the same step with its context is reserved and authorized (control)",
+        ],
+        extra={
+            "job_id": budget.job_id,
+            "preflight": document.get("preflight"),
+            "gate": document.get("gate"),
+            "unreserved": document.get("unreserved"),
+            "cleanup_receipt": cleaned,
+        },
+    )
+
+
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
@@ -598,13 +661,29 @@ VARIANTS = [
         "RESTART_WORKLOAD is withheld (BUDGET_EXHAUSTED_REASON); no new training job created",
         restart_withheld,
     ),
-    deferred_variant(
-        CASE_029,
-        "concurrent_claim",
+    VariantSpec(
+        case_id=CASE_029,
+        variant="concurrent_claim",
         proof_mode=NATIVE,
-        reason="FIXTURE_NOT_READY: two executors claiming one restart concurrently needs a seeded concurrent-claim harness (store-level), not the managed-job path",
         lanes=("eks", "hp"),
-        expected="concurrent claims do not double-decrement or falsely release the budget",
+        risk="L",
+        flags="P",
+        injection=(
+            f"{CLAIMERS} claimers reserve the same RESTART_WORKLOAD reservation of a test "
+            "job (budget 1) at once through the product's ledger API in an API Pod; a "
+            "rival step races for the last slot; the release is raced too"
+        ),
+        expected=(
+            "one reservation and restart_count 1 == its ids; every rival refused; the "
+            "release frees it exactly once; releasing an unheld id changes nothing; the "
+            "count never goes negative; no training job is created"
+        ),
+        cleanup=(
+            "release the run's reservations through the product API and remove the "
+            "emptied test ledger row"
+        ),
+        max_minutes=10,
+        execute=concurrent_claim,
     ),
     deferred_variant(
         CASE_029,
@@ -621,13 +700,29 @@ VARIANTS = [
         "the same decision is returned (duplicate=true); no second budget deduction",
         duplicate_event,
     ),
-    deferred_variant(
-        CASE_029,
-        "missing_context",
+    VariantSpec(
+        case_id=CASE_029,
+        variant="missing_context",
         proof_mode=NATIVE,
-        reason="FIXTURE_NOT_READY: a RESTART_WORKLOAD step with missing restart context must be seeded at the store level to exercise the preflight refusal (RESTART_SAFETY_CONTEXT_MISSING)",
         lanes=("eks", "hp"),
-        expected="a restart step with missing context is refused at preflight, fail-closed",
+        risk="L",
+        flags="P",
+        injection=(
+            "hand the product's claim preflight and adapter gate an in-memory "
+            "RESTART_WORKLOAD step of a test job without source_gpu_count, then the "
+            "same step complete (control), in an API Pod"
+        ),
+        expected=(
+            "RESTART_SAFETY_CONTEXT_MISSING naming the parameter, before any ledger "
+            "write; the gate fails closed (RESERVATION_MISSING) without a reservation; "
+            "the complete step is reserved and authorized"
+        ),
+        cleanup=(
+            "release the control reservation through the product API and remove the "
+            "emptied test ledger row"
+        ),
+        max_minutes=10,
+        execute=missing_context,
     ),
     _spec(
         CASE_029,

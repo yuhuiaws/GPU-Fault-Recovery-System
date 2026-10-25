@@ -31,6 +31,7 @@ from scripts.e2e.regional.general_live_fixture import (
     VariantContext,
 )
 from scripts.e2e.regional.general_live_registry import VariantSpec
+from scripts.e2e.regional.general_live_restart_budget import BUDGET_PROBE
 from scripts.e2e.regional.general_live_store import (
     ACTIVITY_PROBE,
     ATTEMPT_PROBE,
@@ -273,6 +274,60 @@ def activity_read(store: Any, arguments: Sequence[str]) -> dict[str, Any]:
     ):
         exec(ACTIVITY_CODE, {"__name__": "__main__"})
     return json.loads(output.getvalue())
+
+
+BUDGET_CODE = compile(BUDGET_PROBE, "<general-live-budget-probe>", "exec")
+
+
+def budget_probe_run(store: Any, arguments: Sequence[str]) -> dict[str, Any]:
+    """Run the real ``BUDGET_PROBE`` in-process over ``store``.
+
+    ``arguments`` are what ``SeededRestartBudget`` passes the probe in the API
+    Pod (mode first); the probe drives the product's restart-ledger API and
+    claim preflight on ``store`` and prints the document a variant receives.
+    """
+
+    from gpu_fault.app import ApplicationContext
+
+    output = io.StringIO()
+    context = types.SimpleNamespace(store=store)
+    with (
+        mock.patch.object(ApplicationContext, "from_environment", lambda: context),
+        mock.patch.object(sys, "argv", ["budget-probe", *arguments]),
+        contextlib.redirect_stdout(output),
+    ):
+        exec(BUDGET_CODE, {"__name__": "__main__"})
+    return json.loads(output.getvalue().splitlines()[-1])
+
+
+def budget_ledger_store() -> Any:
+    """An in-memory store with the key/value primitives the probe's cleanup uses.
+
+    The shared SQL stores expose ``_restart_budget_key``/``_delete``/
+    ``_get_optional`` for every record kind; the in-memory store keeps its
+    restart ledgers in a plain map, so this subclass answers those three for
+    the ``restart_budget`` kind over that map.
+    """
+
+    from gpu_fault.store import InMemoryStore
+
+    class BudgetLedgerStore(InMemoryStore):
+        def _restart_budget_key(self, cluster_id: str, job_id: str) -> tuple[str, str]:
+            return (cluster_id, job_id)
+
+        def _delete(self, kind: str, key: Any) -> None:
+            if kind != "restart_budget":
+                raise NotImplementedError(kind)
+            with self._lock:
+                self._restart_budgets.pop(key, None)
+
+        def _get_optional(self, kind: str, key: Any) -> Any:
+            if kind != "restart_budget":
+                raise NotImplementedError(kind)
+            with self._lock:
+                return self._restart_budgets.get(key)
+
+    return BudgetLedgerStore()
 
 
 def save_diagnostic_incident(
