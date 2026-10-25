@@ -9,16 +9,38 @@ recovery action -- and a repeat of the same event must not isolate twice. The
 verdict reads the product's own ``FaultPolicyDecision`` records; nothing is
 faked and no policy conclusion is posted.
 
+``missing_topology`` rides the same kmsg replay with a reviewed Fabric Manager
+SXID line: the kernel collector forwards an ``SXid (PCI:...): <code>, Fatal``
+summary line (``collectors/logs/kernel.py`` SXID_SUMMARY_PATTERN), the parser
+leaves the link scope UNKNOWN (``nvidia_logs.py`` ``_sxid_scope``), and the
+control plane resolves it only from fresh trusted ``nvswitch_port_topology``
+telemetry or -- when the line names a port on an H100/H200 -- the product
+invariant (``telemetry.py`` NvSwitchPortTopologyService). The host collector's
+topology query runs only where ``GPU_FAULT_NVSWITCH_TOPOLOGY_COMMAND`` is set;
+the node installer's default is empty and no deploy path on this site sets it,
+so the trusted topology is genuinely absent here and nothing is faked: a FATAL
+catalog code whose official action is scope-dependent (``SCOPE_DEPENDENT_RESET``)
+and whose line names no link must resolve BLOCKED_MISSING_EVIDENCE ("requires a
+trusted access/trunk port-scope mapping"), operator-required, with the full
+fabric reset withheld -- the gap kept explicit, as the spec demands. The product
+quarantines the node under site safety for it; the variant hands the node back
+through the product's validated restore.
+
 The variants that need a genuinely unknown *product*, an unconfigured Runtime
-Profile authority, or reviewed inventory/version/topology source fixtures are
-not reachable on this single H200 site and stay NOT_RUN with their reason -- the
-denominator keeps them.
+Profile authority, or the kernel collector's own driver-version evidence are not
+reachable on this single H200 site with the host-collector-only replay and stay
+NOT_RUN with their reason -- the denominator keeps them.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+from scripts.e2e.regional.general_live_common import (
+    activity,
+    restore_incidents,
+    wait_settled,
+)
 from scripts.e2e.regional.general_live_fixture import (
     VariantContext,
     VariantInconclusive,
@@ -40,7 +62,64 @@ KERNEL_SOURCE_REPLAY = "KERNEL_SOURCE_REPLAY"
 #: A code well outside the pinned catalog (which tops out near XID 150). Chosen
 #: so ``policy/engine.py`` ``_resolve_xid`` finds no rule -> SITE_SAFETY.
 UNKNOWN_XID = 987
+#: A pinned-catalog FATAL SXID (``data/nvidia-fabric-manager-sxid-*.yaml``,
+#: SCOPE_DEPENDENT_RESET) that is not Always Fatal: its action depends on the
+#: access/trunk scope, so without trusted topology it is BLOCKED_MISSING_EVIDENCE.
+MISSING_TOPOLOGY_SXID = 11001
+#: The reviewed kmsg line: a Fabric Manager summary line (code, Fatal) from an
+#: NVSwitch, deliberately naming no ``Link N`` so the H200 product invariant
+#: cannot stand in for the missing topology.
+MISSING_TOPOLOGY_LINE = (
+    f"nvidia-nvswitch0: SXid (PCI:0000:05:00.0): {MISSING_TOPOLOGY_SXID}, Fatal, "
+    "acceptance missing-topology replay without a link"
+)
+BLOCKED_MISSING_EVIDENCE = "BLOCKED_MISSING_EVIDENCE"
+TOPOLOGY_REASON = "port-scope mapping"
 DETECTION_BUDGET = 420
+#: The site-safety quarantine workflow of a BLOCKED SXID settles in minutes.
+SETTLE_BUDGET = 600
+
+#: Read the product's own SXID policy decisions for one node since a moment:
+#: every incident the node got since then, joined to the FaultPolicyDecision
+#: saved for its event (``store.save_xid_policy_decision`` keeps SXID decisions
+#: too). Nothing here is a prefabricated conclusion.
+SXID_DECISION_PROBE = r"""
+import json
+import sys
+from datetime import datetime
+
+from gpu_fault.app import ApplicationContext
+from gpu_fault.models import IncidentState
+
+cluster_id, node_id, since_text = sys.argv[1:4]
+since = datetime.fromisoformat(since_text.replace("Z", "+00:00"))
+store = ApplicationContext.from_environment().store
+decisions = []
+for incident in store.list_incidents_by_state(
+    cluster_id, list(IncidentState), node_ids={node_id}
+):
+    if incident.created_at < since:
+        continue
+    decision = store.get_xid_policy_decision(incident.event_id)
+    if decision is None or decision.event_type.value != "SXID":
+        continue
+    decisions.append({
+        "event_id": decision.event_id,
+        "incident_id": incident.incident_id,
+        "incident_state": incident.state.value,
+        "disposition": decision.disposition.value,
+        "official_action": decision.official_action,
+        "investigatory_action": decision.investigatory_action,
+        "action": decision.action.value if decision.action else None,
+        "safety_action": decision.safety_action.value if decision.safety_action else None,
+        "pre_actions": [item.value for item in decision.pre_actions],
+        "requires_operator": decision.requires_operator,
+        "workflow_request_id": decision.workflow_request_id,
+        "duplicate": decision.duplicate,
+        "reasons": list(decision.reasons),
+    })
+print(json.dumps({"decisions": decisions}, sort_keys=True, default=str))
+"""
 
 #: Read the product's own XID policy decisions for one node since a moment. The
 #: engine grades an unknown code SITE_SAFETY with no NVIDIA action; this reads
@@ -184,6 +263,133 @@ def duplicate(ctx: VariantContext) -> dict[str, Any]:
     )
 
 
+# --------------------------------------------------------------------------- #
+# missing_topology: a fatal SXID with no trusted port-scope evidence
+# --------------------------------------------------------------------------- #
+def _sxid_decisions(
+    ctx: VariantContext, since: Any, *, sxid: int
+) -> list[dict[str, Any]]:
+    value = ctx.regional.cpu_python(
+        SXID_DECISION_PROBE,
+        ctx.settings.regional.cluster_id,
+        ctx.settings.node,
+        since.isoformat(),
+        timeout=120,
+    )
+    marker = f"-sxid-{sxid}-"
+    return [
+        item
+        for item in value.get("decisions") or []
+        if marker in str(item.get("event_id") or "")
+    ]
+
+
+def _wait_sxid_decisions(
+    ctx: VariantContext, since: Any, *, sxid: int, name: str
+) -> list[dict[str, Any]]:
+    last: list[dict[str, Any]] = []
+
+    def accept() -> list[dict[str, Any]] | None:
+        nonlocal last
+        last = _sxid_decisions(ctx, since, sxid=sxid)
+        return last or None
+
+    value = ctx.wait_until(
+        accept, timeout_seconds=DETECTION_BUDGET, poll_seconds=15, name=name
+    )
+    return value if value is not None else last
+
+
+def missing_topology_errors(decisions: list[dict[str, Any]]) -> list[str]:
+    if not decisions:
+        return ["the fatal SXID did not reach a FaultPolicyDecision"]
+    errors = []
+    for item in decisions:
+        if item.get("disposition") != BLOCKED_MISSING_EVIDENCE:
+            errors.append(
+                f"SXID {MISSING_TOPOLOGY_SXID} disposition is {item.get('disposition')}, "
+                f"expected {BLOCKED_MISSING_EVIDENCE}"
+            )
+        if not any(
+            TOPOLOGY_REASON in str(reason) for reason in item.get("reasons") or []
+        ):
+            errors.append(
+                "the decision does not name the missing trusted access/trunk "
+                f"port-scope mapping: {item.get('reasons')}"
+            )
+        if not item.get("requires_operator"):
+            errors.append(
+                "a fatal SXID without topology evidence did not require an operator"
+            )
+        if item.get("action") not in (None, "NO_ACTION"):
+            errors.append(
+                f"a fatal SXID without topology evidence earned action {item['action']}"
+            )
+    return errors
+
+
+def missing_topology(ctx: VariantContext) -> dict[str, Any]:
+    """A fatal SXID naming no link, with no trusted topology on the node.
+
+    PASS: the product keeps the gap explicit -- BLOCKED_MISSING_EVIDENCE naming
+    the missing port-scope mapping, operator-required, the full fabric reset
+    withheld -- and plans no reset or reboot. The site-safety quarantine it
+    applies is released through the product's validated restore.
+    """
+
+    started = _drive_kmsg(ctx, MISSING_TOPOLOGY_LINE)
+    decisions = _wait_sxid_decisions(
+        ctx, started, sxid=MISSING_TOPOLOGY_SXID, name="missing-topology"
+    )
+    incident_ids = sorted(
+        {str(item["incident_id"]) for item in decisions if item.get("incident_id")}
+    )
+    observed = (
+        wait_settled(
+            ctx,
+            started,
+            incident_ids,
+            timeout_seconds=SETTLE_BUDGET,
+            name="missing-topology-settled",
+        )
+        if incident_ids
+        else activity(ctx, started, kinds=("NVIDIA_KERNEL",))
+    )
+    stages = {
+        "blocked": missing_topology_errors(decisions),
+        "reset_withheld": [
+            f"the withheld official action is {item.get('official_action')}, "
+            "expected RESET_ALL_GPUS_AND_NVSWITCHES"
+            for item in decisions
+            if item.get("official_action") != "RESET_ALL_GPUS_AND_NVSWITCHES"
+        ],
+        "no_hardware_step": hardware_errors(observed),
+    }
+    restored: list[dict[str, Any]] = []
+    if incident_ids:
+        restored = restore_incidents(
+            ctx,
+            [{"incident_id": item} for item in incident_ids],
+            reason=f"{ctx.spec.key} acceptance restore",
+        )
+    return _result(
+        stages,
+        notes=[
+            "GPU_FAULT_NVSWITCH_TOPOLOGY_COMMAND is unset on this site (installer "
+            "default), so no trusted nvswitch_port_topology exists; the line names no "
+            "link, so the H200 access-only invariant cannot apply either",
+            "the fatal SXID is quarantined under site safety and handed back through "
+            "the validated restore",
+        ],
+        extra={
+            "decisions": decisions,
+            "incidents": incident_ids,
+            "restore": restored,
+            "sxid_line": MISSING_TOPOLOGY_LINE,
+        },
+    )
+
+
 def _result(
     stages: dict[str, list[str]],
     *,
@@ -240,26 +446,49 @@ VARIANTS = [
         lanes=("eks",),
         expected="an unknown product -> BLOCKED_MISSING_EVIDENCE, operator-required, no action",
     ),
-    deferred_variant(
-        CASE,
-        "missing_topology",
+    VariantSpec(
+        case_id=CASE,
+        variant="missing_topology",
         proof_mode=LIVE_REPLAY,
-        reason=(
-            "FIXTURE_NOT_READY: needs a reviewed NVSwitch/NVLink topology source fixture "
-            "the replay helper does not yet install"
-        ),
         lanes=("eks", "hp"),
-        expected="an SXID without topology evidence -> BLOCKED_MISSING_EVIDENCE",
+        risk="M",
+        flags="S",
+        injection=(
+            f"reviewed kmsg line 'nvidia-nvswitch0: SXid (PCI:...): {MISSING_TOPOLOGY_SXID}, "
+            "Fatal, ...' naming no link, on a node with no GPU_FAULT_NVSWITCH_TOPOLOGY_COMMAND "
+            "(no trusted nvswitch_port_topology)"
+        ),
+        expected=(
+            "BLOCKED_MISSING_EVIDENCE 'requires a trusted access/trunk port-scope mapping', "
+            "operator-required, RESET_ALL_GPUS_AND_NVSWITCHES withheld; site-safety "
+            "quarantine only, no reset/reboot; readmitted through the validated restore"
+        ),
+        cleanup=(
+            "restore the kernel collector's /dev/kmsg source; validated restore of the "
+            "quarantine incident; confirm clean"
+        ),
+        max_minutes=30,
+        approvals=(KERNEL_SOURCE_REPLAY,),
+        execute=missing_topology,
     ),
     deferred_variant(
         CASE,
         "missing_version",
         proof_mode=LIVE_REPLAY,
         reason=(
-            "FIXTURE_NOT_READY: the driver version is stamped from the collector context; "
-            "a reviewed missing-version source fixture is not built this phase"
+            "FIXTURE_NOT_READY: the version evidence the decoder gates on "
+            "(policy/engine.py _workflow_nvlink5: event.driver_branch is None -> "
+            "BLOCKED_MISSING_EVIDENCE) is stamped on the XID event from the kernel "
+            "collector's own CollectorContext (collectors/context.py "
+            "discover_gpu_software_versions at unit start, collectors/logs/kernel.py "
+            "payload), not from the host collector or /proc/driver/nvidia/version; the "
+            "HOST_SOURCE_REPLAY wrapper is allow-listed for gpu-fault-host-collector.service "
+            "only, so it needs a reviewed widening of tools/host_command_replay.py "
+            "ALLOWED_UNITS and the source probe to gpu-fault-kernel-collector.service for "
+            "the driver_version query, combined with a kmsg replay of a WORKFLOW_NVLINK5_ERR "
+            "XID carrying IntrInfo/Error Status"
         ),
-        lanes=("eks",),
+        lanes=("eks", "hp"),
         expected="a workflow decoder without its version evidence -> BLOCKED_MISSING_EVIDENCE",
     ),
     deferred_variant(
