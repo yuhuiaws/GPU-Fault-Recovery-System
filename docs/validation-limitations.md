@@ -952,6 +952,16 @@ VALIDATE_HOST diagnostic that holds the node while the mount stays unusable and
 never resets, reboots or quarantines, so 004 `read_only` and
 `required_mount_missing` now expect that chain and readmit the node once the
 mount is restored and the signal clears.
+Batch 163 took the read-only flag from the collector's own `statvfs`, inside the
+unit's `ProtectSystem=strict` sandbox where every mount is a read-only bind: in
+that release every GPU node reported `/` and `/var` READ_ONLY (and the 004 test mount
+would have read READ_ONLY before the injection and after the restore). Batch
+166 takes the verdict from the host's `/proc/1/mountinfo` -- per-mount or
+superblock `ro` on the mount holding the path -- which the 004 `read_only`
+injection (a superblock `remount,ro` from the storage probe's Pod namespace)
+sets and the restore clears; an unreadable host table reports no READ_ONLY,
+and a path the sandbox hides (`ProtectHome=`, a `PrivateTmp=` directory, a
+mount that never reached the collector's namespace) is not reported at all.
 
 The native storage variants (003 `scratch_full`, 004
 `capacity_full`/`duplicate`/`below_threshold`/`inode_full`, and the 006 disk

@@ -3274,6 +3274,17 @@ The bottleneck where accepted stalled at 11k-13k in the load test is in this lay
   table) produces no inode sample. Excluding NFS, Lustre, CIFS, Ceph, EFS and S3FS according to
   `/proc/self/mountinfo`, it then produces
   `local_filesystem_used_percent`.
+- Each configured mount point also reports `filesystem_unavailable`: 0 when usable, 1 with a `failure_mode` when not
+  (`READ_ONLY`; `MOUNT_MISSING` when `statvfs` returns ENOENT; `PROBE_FAILED` for any other `statvfs` error), graded
+  CRITICAL `RUN_DIAGNOSTICS` and re-read by VALIDATE_HOST. Read-only is judged from the mount that holds the path in
+  the host's mount table `/proc/1/mountinfo` (PID 1 lives in the host mount namespace and the root unit can read it):
+  `READ_ONLY` only when that mount's per-mount options or its superblock options say `ro`, never from the collector's
+  own `statvfs` `ST_RDONLY` -- the unit's `ProtectSystem=strict` binds every mount read-only inside its sandbox, so
+  batch 163, which read that flag, reported every node's healthy `/` and `/var` read-only. An unreadable host table
+  reports no `READ_ONLY` (a view that cannot be read is no evidence of a read-only filesystem) and is warned about
+  once. A path the sandbox hides (`/home`, `/root` and `/run/user` under `ProtectHome=`, or a mount the host has but
+  the sandbox never received) is neither probed nor reported, and ENOENT inside a `PrivateTmp=` private directory is
+  not `MOUNT_MISSING`. Configured paths are matched against the mount points as written; symlinks are not resolved.
 
 The control plane uses `HealthSignalState` in the Aurora/SQLite/in-memory Store to keep
 `active_since/notified`. A finding is created only when the abnormality persists for the configured duration; a persistent abnormality notifies only once,

@@ -151,7 +151,9 @@ inode耗尽、只读、必需挂载消失、EIO/EACCES分别验，不能用剩�
 （READ_ONLY/MOUNT_MISSING/PROBE_FAILED）报为不可用并走 VALIDATE_HOST 诊断：不产生
 容量 finding，不 reset/reboot/隔离，不可读状态记为不可用（UNKNOWN）而非健康，挂载
 不可用期间 hold 节点、还原后随信号清零受控接纳（批次163修复，此前按 capacity-only
-缺口记 FAIL；probe_error 仍因缺故障挂载夹具而 live 延后）。释放文件/还原挂载后验证再
+缺口记 FAIL；probe_error 仍因缺故障挂载夹具而 live 延后）。只读以宿主 `/proc/1/mountinfo`
+中承载该路径挂载的 per-mount/超级块 `ro` 为准，不取 collector 沙箱（`ProtectSystem=strict`
+只读绑定）自身的 `ST_RDONLY`；沙箱遮住的路径不上报（批次166）。释放文件/还原挂载后验证再
 受控解隔离。
 
 ### GF-GENERAL-LIVE-005
