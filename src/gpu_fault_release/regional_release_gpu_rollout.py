@@ -29,6 +29,9 @@ from gpu_fault_release.regional_release_diff import (
     build_execution_plan,
 )
 from gpu_fault_release.regional_release_images import NodeDependencyTarget
+from gpu_fault_release.regional_release_node_identity import (
+    installed_template_matches,
+)
 from gpu_fault_release.regional_release_gpu_stage import GpuStageStep, run_gpu_stage
 from gpu_fault_release.regional_release_profile_model import (
     target_agent_config_digest,
@@ -556,7 +559,11 @@ def agents_converged(
     dcgm_hostengine: str | None = None,
 ) -> bool:
     """Every selected node runs an installer of this identity (and, when
-    ``dcgm_hostengine`` is given, an Agent installed for that DCGM mode)."""
+    ``dcgm_hostengine`` is given, an Agent installed for that DCGM mode).
+
+    ``template_sha`` is an installer template identity, or the template source
+    digest a node installed in its recorded mode folds into one
+    (``regional_release_node_identity.installed_template_matches``)."""
 
     selector = node_selector(target)
     nodes = [
@@ -605,10 +612,9 @@ def agents_converged(
             )
             and (
                 template_sha is None
-                or item.get("metadata", {})
-                .get("annotations", {})
-                .get("gpu-fault.io/installer-template-sha256")
-                == template_sha
+                or installed_template_matches(
+                    item.get("metadata", {}).get("annotations") or {}, template_sha
+                )
             )
             and installed_dcgm_hostengine_matches(item, dcgm_hostengine)
         )

@@ -20,6 +20,9 @@ from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseErro
 from gpu_fault_release.regional_release_dcgm import record_node_dcgm_states
 from gpu_fault_release.regional_release_gpu_rollout import gpu_node_items
 from gpu_fault_release.regional_release_images import NodeDependencyTarget
+from gpu_fault_release.regional_release_node_identity import (
+    reconciler_template_identity,
+)
 from gpu_fault_release.regional_release_observation import ApiUnavailable
 from gpu_fault_release.regional_release_rendering import build_reconciler_environment
 
@@ -196,7 +199,14 @@ def run_node_installer_preflight(
         executor_wheel_filename=candidate.executor_wheel_filename,
         node_compatibility_digest=candidate.node_compatibility_digest,
         bundle_sha256=candidate.bundle_sha256,
-        template_sha256=candidate.template_sha256,
+        # The identity the rollout's reconciler installs, so the preflight
+        # renders and proves exactly that template.
+        template_sha256=reconciler_template_identity(
+            release,
+            target,
+            candidate.template_sha256,
+            candidate.node_dependency_target,
+        ),
         template_config_map=candidate.template_config_map,
         template_content_sha256=candidate.template_content_sha256,
         allowed_node_names=candidate.node_names,

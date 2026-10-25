@@ -13,6 +13,10 @@ from gpu_fault_release.regional_release_dcgm import (
     dcgm_hostengines_digest,
     recorded_dcgm_hostengines_digest,
 )
+from gpu_fault_release.regional_release_node_identity import (
+    NODE_INSTALLER_IDENTITY_DRIFT_INPUT,
+    node_installer_identity_drift,
+)
 from gpu_fault_release.regional_release_node_scope import (
     RECORDED_SCOPES_DIGEST_STATE_KEY,
     RECORDED_SCOPES_INPUT,
@@ -185,6 +189,10 @@ def build_execution_plan(diff: ReleaseDiff) -> ReleaseExecutionPlan:
     # Agents whose environment and reconciler identity name it.
     dcgm_modes = bool(changed & {DCGM_HOSTENGINES_INPUT, DCGM_HOSTENGINE_DRIFT_INPUT})
     dcgm = dcgm_modes or bool(changed & {"dcgm", "dcgm_manifests", "dcgm_image"})
+    # Installed nodes the release's reconciler would re-install although no
+    # Agent input changed: re-deploying it hands it ``*`` at once, so those
+    # nodes go through the Agent waves instead.
+    node_identity = NODE_INSTALLER_IDENTITY_DRIFT_INPUT in changed
     executor = node_scope or bool(
         changed
         & {
@@ -215,7 +223,7 @@ def build_execution_plan(diff: ReleaseDiff) -> ReleaseExecutionPlan:
             "clusters",
         }
     )
-    agent = dcgm_modes or bool(
+    agent = (dcgm_modes or node_identity) or bool(
         changed
         & {
             "node_runtime_wheel",
@@ -231,7 +239,7 @@ def build_execution_plan(diff: ReleaseDiff) -> ReleaseExecutionPlan:
             "cluster_runtime_profiles",
         }
     )
-    reconciler = (node_scope or dcgm_modes) or bool(
+    reconciler = (node_scope or dcgm_modes or node_identity) or bool(
         changed
         & {
             "executor_wheel",
@@ -562,4 +570,14 @@ def classify_release(release: RegionalRelease, state: dict[str, Any]) -> Release
         and isinstance(state.get("previous"), dict)
     ):
         changed.add("aurora_refresh_drift")
+    # Asked only when the plan re-deploys the reconciler without the Agent
+    # waves: every other plan leaves the reconciler, or rolls the nodes anyway.
+    plan = build_execution_plan(diff_from_changed(changed))
+    if (
+        state
+        and plan.has(ReleaseComponent.RECONCILER)
+        and not plan.has(ReleaseComponent.AGENT)
+        and node_installer_identity_drift(release)
+    ):
+        changed.add(NODE_INSTALLER_IDENTITY_DRIFT_INPUT)
     return diff_from_changed(changed)

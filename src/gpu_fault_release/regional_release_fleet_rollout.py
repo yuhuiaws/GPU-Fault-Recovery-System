@@ -44,6 +44,9 @@ from gpu_fault_release.regional_release_gpu_rollout import gpu_node_items
 from gpu_fault_release.regional_release_images import NodeDependencyTarget
 from gpu_fault_release.regional_release_interfaces import AgentNodeSet
 from gpu_fault_release.regional_release_narration import narrate_step
+from gpu_fault_release.regional_release_node_identity import (
+    reconciler_template_identity,
+)
 from gpu_fault_release.regional_release_node_scope import (
     recorded_node_scope,
     stamp_reconciler_node_scope,
@@ -1427,7 +1430,11 @@ def deploy_reconciler(
         executor_wheel_filename=executor_wheel_filename,
         node_compatibility_digest=node_compatibility_digest,
         bundle_sha256=bundle_sha256,
-        template_sha256=template_sha256,
+        # The cluster's installer template identity, not the source digest: it
+        # is what the Agents report and the fleet's waves compare.
+        template_sha256=reconciler_template_identity(
+            release, target, template_sha256, node_dependency_target
+        ),
         template_config_map=template_config_map,
         template_content_sha256=template_content_sha256,
         allowed_node_names=allowed_node_names,

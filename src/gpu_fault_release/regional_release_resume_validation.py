@@ -15,6 +15,9 @@ from gpu_fault_release.regional_release_gpu_rollout import (
     agents_converged,
     gpu_node_items,
 )
+from gpu_fault_release.regional_release_node_identity import (
+    candidate_installer_template_identity,
+)
 from gpu_fault_release.regional_release_probes import probe_source
 from gpu_fault_release.regional_release_product_isolation import (
     recorded_product_isolated_nodes,
@@ -233,6 +236,16 @@ def _validate_candidate_components(
     components: frozenset[ReleaseComponent],
     node_names: tuple[str, ...],
 ) -> None:
+    # The cluster's installer template identity: what the candidate's
+    # reconciler, its nodes and its Agents carry (the source digest unless the
+    # cluster runs a host DCGM engine).
+    template = (
+        candidate_installer_template_identity(release, target)
+        if components.intersection(
+            {ReleaseComponent.RECONCILER, ReleaseComponent.AGENT}
+        )
+        else None
+    )
     for component, deployment_name in DEPLOYMENT_COMPONENTS:
         if component in components:
             _require_ready_deployment(
@@ -264,8 +277,7 @@ def _validate_candidate_components(
         }
         if (
             environment.get("GPU_FAULT_INSTALLER_BUNDLE_SHA256") != release.bundle_sha
-            or environment.get("GPU_FAULT_INSTALLER_TEMPLATE_SHA256")
-            != release.node_template_sha
+            or environment.get("GPU_FAULT_INSTALLER_TEMPLATE_SHA256") != template
         ):
             raise ReleaseError(
                 f"{target.cluster_id} resume Reconciler identity drifted"
@@ -292,7 +304,7 @@ def _validate_candidate_components(
         target,
         release.node_wheel_sha,
         bundle_sha=release.bundle_sha,
-        template_sha=release.node_template_sha,
+        template_sha=template,
         config_digest=target_agent_config_digest(release.config, target),
         require_node_uid=True,
         node_names=frozenset(node_names),
@@ -308,7 +320,7 @@ def _validate_candidate_components(
         config_digest=target_agent_config_digest(release.config, target),
         runtime_profile_version=target_runtime_profile_version(release.config, target),
         bundle_sha=release.bundle_sha,
-        template_sha=release.node_template_sha,
+        template_sha=template,
     ):
         raise ReleaseError(
             f"{target.cluster_id} resume candidate Agent heartbeats drifted"
@@ -370,12 +382,13 @@ def _validate_incomplete_agent_state(
     # partial wave's id (``node_subset``). The excluded nodes are still asked
     # about by the probe -- they must be back inside the window to resume.
     included = tuple(name for name in node_names if name not in set(excluded))
+    template = candidate_installer_template_identity(release, target)
     deployment_id = release._fleet_deployment_id(
         target,
         phase="upgrade",
         artifact_sha=release.node_wheel_sha,
         bundle_sha=release.bundle_sha,
-        template_sha=release.node_template_sha,
+        template_sha=template,
         config_digest=target_agent_config_digest(release.config, target),
         runtime_profile_version=target_runtime_profile_version(release.config, target),
         **({"node_subset": included} if excluded else {}),
@@ -407,7 +420,7 @@ def _validate_incomplete_agent_state(
                             or release.node_wheel_sha
                         ),
                         bundle=release.bundle_sha,
-                        template=release.node_template_sha,
+                        template=template,
                         profile=target_runtime_profile_version(release.config, target),
                         config=target_agent_config_digest(release.config, target),
                     ),
@@ -433,7 +446,7 @@ def _validate_incomplete_agent_state(
         or deployment.get("desired_config_digest")
         != target_agent_config_digest(release.config, target)
         or deployment.get("desired_bundle_sha256") != release.bundle_sha
-        or deployment.get("desired_template_sha256") != release.node_template_sha
+        or deployment.get("desired_template_sha256") != template
     ):
         raise ReleaseError(
             f"{target.cluster_id} resume FleetDeployment contract drifted"

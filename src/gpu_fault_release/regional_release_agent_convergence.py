@@ -15,6 +15,9 @@ from gpu_fault_release.regional_release_gpu_rollout import (
     gpu_node_items,
 )
 from gpu_fault_release.regional_release_narration import narrate_step
+from gpu_fault_release.regional_release_node_identity import (
+    candidate_installer_template_identity,
+)
 from gpu_fault_release.regional_release_probes import probe_source
 from gpu_fault_release.regional_release_profile_model import (
     target_agent_config_digest,
@@ -159,11 +162,13 @@ def wait_agents(
                 else None
             )
         )
+        # The cluster's template identity: a host-mode cluster's Agents report
+        # the source digest folded with the mode.
         expected_template = (
             template_sha
             if template_sha is not None
             else (
-                release.node_template_sha
+                candidate_installer_template_identity(release, target)
                 if release.config.release_manifest_schema_version >= 3
                 else None
             )
