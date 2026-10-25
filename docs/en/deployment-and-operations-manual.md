@@ -10519,7 +10519,15 @@ Diagnostic bundles live by default in `/var/lib/gpu-fault/diagnostics`; after co
 `GPU_FAULT_DIAGNOSTIC_S3_URI=s3://<bucket>/<prefix>` (managed site: `spec.diagnosticS3Uri` of `site.yaml`) they are uploaded
 to S3, and the hand-off mail marks each archive with its `s3://` console link or as a `file://` readable only on that node. Check that
 `fault_context.diagnostic_reason` in `manifest.json` is
-`EFA_TRAFFIC_HUNG_SUSPECTED`. Without eligible candidates, the bounded passive bundle need not contain
+`EFA_TRAFFIC_HUNG_SUSPECTED`. The manifest's `fault_context.hung_triage_decision` is the decision's wire form: verdict, candidates,
+coverage, FR branches and `wire_form` (size and SHA-256 of the full decision, the omitted
+`evidence_branches.process_observations.processes`); the per-process, per-thread observations live only in the workflow record (the
+bundle step's parameters, the triage step's execution record). If `fault_context.observation_request_trimmed` lists keys, that Agent's
+observation request exceeded the 256 KiB budget and the listed context parameters were replaced by a stand-in naming `omitted`, the byte
+count and the SHA-256 (the node result carries the same field); the collection itself ran as usual. When a node refuses the bundle, the
+step's `node_failures` reads `ObservationIncomplete: <status>: <exception class: message>` and the node result's details carry
+`failed_component`/`failure_stage`/`worker_started`; a bare `error="ValueError"` without a message comes from an Agent older than this fix.
+Without eligible candidates, the bounded passive bundle need not contain
 process stacks; eligible targeted bundles attach only to verified PIDs. Hung bundles omit strace,
 DCGM diag and bug-report. Per-process `flight_recorder_series` retains two compact summaries and
 explicit timing/gaps; the application may overwrite the same raw dump file on the second request.

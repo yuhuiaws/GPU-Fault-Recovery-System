@@ -410,6 +410,13 @@ PG、D 状态线索和剩余节点，不重复首轮。不再因应用 step 前�
 summary、triage、bundle、Fabric 的节点集合分别记录。
 无可信候选的后置 bundle 单独限制最多 32 节点，不因主动预算增大而扩大。
 每轮主动结果和全任务摘要仍保存在 workflow；后置包的遗漏节点单独列出。
+bundle 命令带到节点的 `hung_triage_decision` 是线上形式（`hung_bundle.wire_decision`）：判定、候选、覆盖率与 FR 分支保留，
+逐进程逐线程观测 `evidence_branches.process_observations.processes` 换成计数，`wire_form` 记全量的字节数与 SHA-256；
+全量判定只在 workflow 记录（bundle step 参数、triage step 执行记录）。节点侧观测请求预算 256 KiB
+（`OBSERVATION_REQUEST_BUDGET_BYTES`），超预算先裁掉仅作上下文的 `hung_triage_decision`（占位写明 `omitted`、字节数、SHA-256，
+manifest/结果的 `observation_request_trimmed` 列键），bundle 照常采集；裁后仍超才拒绝，拒绝带 `error` 消息、
+`failed_component`、`failure_stage`、`worker_started`。真机 `tid_namespace` 曾因 259 KB 全量判定在 5 ms 内整体失败
+（`error="ValueError"`，worker 未启动）。
 hung 包跳过 DCGM diag、bug-report 与 strace；
 FR 文件读取上限 64 MiB，结构遍历有界，环形 pickle 不递归失控。
 20 秒是新版 triage 内部采样预算；生产 Agent 另用隔离只读 worker 约束父进程等待，

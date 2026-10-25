@@ -3695,6 +3695,26 @@ Survey/triage results, adaptive targets and the rewrite of step 4 share one leas
 `dag_revision` increments on rewrite. Only 1-3 temporally supported plausible candidates with complete group membership,
 no unreachable nodes or identity conflicts, and verified process identities permit targeted collection plus at most one control.
 Otherwise the bundle stays on at most 32 triage nodes; all returned survey and active-wave evidence stays in the workflow.
+The `hung_triage_decision` a bundle command carries to a node is its wire form (`execution/hung_bundle.wire_decision`,
+applied by `adapters/node_action/step_execution.py` when the command is built): the verdict, candidate processes, coverage
+and flight-recorder branches stay; `evidence_branches.process_observations.processes` (every sampled process's per-thread
+stacks and wait observations, ~15 KB a process, bounded only at 256 processes) becomes a `processes_omitted` count, and
+`wire_form` records the omitted path with the size and SHA-256 of the full decision. The full decision lives only in the
+workflow record -- the bundle step's `parameters` and the triage step execution's `details.hung_triage_decision` -- which is
+where the acceptance runner and the triage view read it. The node only copies the parameter into the manifest's
+`fault_context` and never reads it.
+On the Node Agent, the isolated read-only worker's observation request budget is 256 KiB
+(`observation_limits.OBSERVATION_REQUEST_BUDGET_BYTES`, shared by supervisor and worker). Over budget,
+`communication_runtime.bounded_request` first replaces the context-only parameters (`CONTEXT_ONLY_PARAMETERS`, today only
+`hung_triage_decision`) with a stand-in naming `omitted=OBSERVATION_REQUEST_BUDGET`, the byte count and the SHA-256; the
+manifest's `fault_context.observation_request_trimmed` and the node result's `observation_request_trimmed` list the trimmed
+keys and the bundle collects as usual; only a request still over budget is refused. Every supervisor-side refusal carries
+`error` (exception class and message, e.g. `ValueError: observation input exceeds budget: <bytes> > 262144 bytes; largest
+parameters: ...`), `failed_component=observation_supervisor`, `failure_stage` (`WORKER_NOT_STARTED`/`WORKER_OUTPUT`) and
+`worker_started`, and `ObservationIncomplete`'s message is `<status>: <error>`, so the step's `node_failures` and the
+hand-off mail state the cause. Live, a two-node `tid_namespace` run's 259 KB full decision pushed the request to 264 KB and
+the bundle failed as a whole within 5 ms with `{"status":"UNAVAILABLE","ranks":[],"error":"ValueError"}` -- neither thread
+namespaces nor thread discovery were involved; the worker never started.
 Hung bundles omit DCGM diag, bug-report and strace.
 EFA/log suspicion goes to operator review; healthy fabric is not application recovery.
 The NCCL pipeline never uses training step/phase, including detection, target selection and completion.
