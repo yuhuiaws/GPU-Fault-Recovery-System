@@ -673,3 +673,65 @@ def test_node_unit_state_includes_the_oom_result(
     assert {"Result", "ExecMainCode", "ExecMainStatus", "ActiveState"} <= set(
         properties[0].removeprefix("--property=").split(",")
     )
+
+
+# --------------------------------------------------------------------------- #
+# node probe: the 002 hold fits the memory unit's cap; failures name their step
+# (live 2026-10-25: memory_pressure asked for 1980 s, the cap was 1800 s)
+# --------------------------------------------------------------------------- #
+def _node_shaped(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    # A p5en.48xlarge as the two live surveys read it: 2 TiB, 3.6 % used, no swap.
+    return _node_probe_runner(monkeypatch, tmp_path, total_gib=2000, available_gib=1928)
+
+
+def test_node_memory_start_accepts_the_002_hold_on_a_2tib_host(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls, emitted = _node_shaped(monkeypatch, tmp_path)
+    _memory_start("--target-used-percent", "96.5", "--seconds", "1980", "--approved")
+    unit = next(call for call in calls if call[0] == "systemd-run")
+    assert "--property=RuntimeMaxSec=1980" in unit
+    assert f"--property=MemoryMax={int(2000 * GIB * 97.5 / 100)}" in unit
+    assert emitted[-1]["deadman"] == "deadman-memory"
+    assert nodep.MAX_SECONDS == 3600, "the memory unit shares the load units' cap"
+    with pytest.raises(nodep.ProbeError, match="outside 60..3600"):
+        _memory_start(
+            "--target-used-percent", "96.5", "--seconds", "3601", "--approved"
+        )
+
+
+def test_node_probe_failure_json_names_the_failing_step(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _, emitted = _node_shaped(monkeypatch, tmp_path)
+    code = nodep.main(
+        [
+            "memory-start",
+            "--run-id",
+            RUN,
+            "--target-used-percent",
+            "96.5",
+            "--seconds",
+            "3601",
+            "--approved",
+        ]
+    )
+    assert code == 1
+    failure = emitted[-1]
+    assert failure["error_kind"] == "probe" and failure["error_class"] == "ProbeError"
+    assert failure["command"] == "memory-start"
+    assert failure["error_site"].startswith("memory_start:"), failure["error_site"]
+    assert len(failure["error_code"]) == 16 and int(failure["error_code"], 16) >= 0
+    assert "3601" not in json.dumps(failure), "the message itself stays on the node"
+
+
+def test_node_exception_site_names_the_step_not_the_helper() -> None:
+    # memory_status validates its run id through the checked_run_id helper: the
+    # site the fixture may show is the step (memory_status), not the helper.
+    arguments = nodep.parser().parse_args(["memory-status", "--run-id", "bad id; rm"])
+    try:
+        arguments.handler(arguments)
+    except nodep.ProbeError as exc:
+        site = nodep.exception_site(exc)
+    assert site is not None and site.startswith("memory_status:"), site
+    assert nodep.exception_site(ValueError("no traceback")) is None

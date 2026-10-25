@@ -60,6 +60,10 @@ from scripts.e2e.regional.general_live_registry import (
     VariantSpec,
     deferred_variant,
 )
+from scripts.e2e.regional.probes.general_live_node_probe import (
+    MAX_SECONDS as PROBE_MAX_SECONDS,
+)
+from scripts.e2e.regional.regional_commands import RegionalFixtureError
 from scripts.e2e.regional.general_live_verdicts import (
     DIAGNOSTIC_ONLY_STATES,
     ChainExpectation,
@@ -106,15 +110,36 @@ def _require_memory_approval(ctx: VariantContext) -> None:
         )
 
 
+def _probe_seconds(hold_seconds: int) -> int:
+    """The unit seconds asked of the node probe, checked against its cap first.
+
+    Live 2026-10-25 (both plain-EKS nodes, three times): memory_pressure asked
+    for a 1980 s hold -- the 14-minute ramp of a 2 TiB host plus detection --
+    and the probe's memory-start, then capped at 1800 s, refused it before any
+    product evidence, with the message withheld by policy. The probe's cap is
+    now its common load-unit cap (``MAX_SECONDS``) and this guard fails the
+    variant with the numbers *before* a probe Pod touches the node.
+    """
+
+    seconds = int(hold_seconds) + 120
+    if seconds > PROBE_MAX_SECONDS:
+        raise RegionalFixtureError(
+            f"a {seconds} s memory hold exceeds the node probe's {PROBE_MAX_SECONDS} s "
+            "unit cap (memory-start); shorten the ramp/detection budgets"
+        )
+    return seconds
+
+
 def _run_memory_load(ctx: VariantContext, hold_seconds: int) -> Oracle:
+    seconds = _probe_seconds(hold_seconds)
     oracle = Oracle(ctx, "mem")
-    oracle.start(hold_seconds + 120, interval=5, meminfo=True)
+    oracle.start(seconds, interval=5, meminfo=True)
     started = ctx.node(
         "memory-start",
         "--target-used-percent",
         str(TARGET_USED_PERCENT),
         "--seconds",
-        str(hold_seconds + 120),
+        str(seconds),
         "--approved",
     )
     ctx.cleanup.push("memory", lambda: ctx.node("memory-stop"))

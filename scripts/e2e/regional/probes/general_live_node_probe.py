@@ -1027,8 +1027,7 @@ while time.monotonic() < deadline:
     time.sleep(1)
 """
 
-#: Exhausts its own cgroup: touches anonymous memory until the kernel's cgroup
-#: OOM killer ends it (same argv as MEMORY_ALLOCATOR; only the seconds count).
+#: Exhausts its own cgroup until the kernel's OOM killer ends it (argv[2]: seconds).
 CGROUP_OOM_ALLOCATOR = r"""
 import mmap, sys, time
 deadline, step, chunks = time.monotonic() + float(sys.argv[2]), 64 << 20, []
@@ -1041,18 +1040,13 @@ while time.monotonic() < deadline:
 
 
 def memory_start(arguments: argparse.Namespace) -> None:
-    """Host memory pressure inside its own capped cgroup (needs approval).
-
-    ``--cgroup-oom-bytes`` caps the cgroup far below the host instead (at most
-    1 % of MemTotal and within the host's headroom under the 95 % rule) and the
-    allocator is OOM-killed inside it; that unit is kept, not collected, so
-    ``memory-status`` can report its ``Result=oom-kill``.
-    """
+    """Host memory pressure, or with ``--cgroup-oom-bytes`` an OOM inside a small
+    test cgroup (its uncollected unit is read by ``memory-status``); approved."""
 
     if not arguments.approved:
         raise ProbeError("host memory pressure requires the runner's approval")
     run_id = checked_run_id(arguments.run_id)
-    seconds = bounded(arguments.seconds, 60, 1800, "seconds")
+    seconds = bounded(arguments.seconds, 60, MAX_SECONDS, "seconds")
     total = meminfo()["MemTotal"]
     oom_bytes = int(arguments.cgroup_oom_bytes or 0)
     target = arguments.target_used_percent
@@ -1465,6 +1459,22 @@ def parser() -> argparse.ArgumentParser:
     return value
 
 
+#: This file's own helpers: the failing *step* is the frame above them.
+HELPER_FRAMES = frozenset({"run", "bounded", "checked_run_id", "checked_name", "emit"})
+
+
+def exception_site(exc: BaseException) -> str | None:
+    """Innermost ``function:line`` of this file above its helpers: the failing step."""
+
+    site, frame = None, exc.__traceback__
+    while frame is not None:
+        code = frame.tb_frame.f_code
+        if code.co_filename == __file__ and code.co_name not in HELPER_FRAMES:
+            site = f"{code.co_name}:{frame.tb_lineno}"
+        frame = frame.tb_next
+    return site
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = parser().parse_args(argv)
     try:
@@ -1475,6 +1485,8 @@ def main(argv: list[str] | None = None) -> int:
                 "error": type(exc).__name__,
                 "error_kind": "probe",
                 "error_class": type(exc).__name__,
+                "error_code": hashlib.sha256(str(exc).encode()).hexdigest()[:16],
+                "error_site": exception_site(exc),
                 "command": arguments.command,
             }
         )

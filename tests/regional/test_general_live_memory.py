@@ -446,3 +446,95 @@ def test_cgroup_only_spec_reuses_the_memory_approval() -> None:
     spec = SPECS["cgroup_only"]
     assert spec.implemented and spec.approvals == ("HOST_MEMORY_PRESSURE",)
     assert spec.lanes == ("eks", "hp") and spec.proof_mode == "native"
+
+
+# --------------------------------------------------------------------------- #
+# the real probe's memory-start behind the fake (live 2026-10-25: the variant
+# asked for a 1980 s hold and the probe's 1800 s cap refused it before any
+# product evidence, three times on two 2 TiB nodes)
+# --------------------------------------------------------------------------- #
+def real_memory_start(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A ``memory-start`` that runs the real probe function over a p5en-shaped host."""
+
+    import subprocess
+
+    from scripts.e2e.regional.probes import general_live_node_probe as nodep
+
+    gib = 1024**3
+    monkeypatch.setattr(nodep, "STATE_ROOT", tmp_path / "node-state")
+    monkeypatch.setattr(
+        nodep,
+        "run",
+        lambda command, **_: subprocess.CompletedProcess(command, 0, "", ""),
+    )
+    monkeypatch.setattr(nodep, "arm_deadman", lambda run_id, kind, seconds, *a: kind)
+    monkeypatch.setattr(
+        nodep,
+        "meminfo",
+        lambda: {"MemTotal": 2000 * gib, "MemAvailable": 1928 * gib, "SwapTotal": 0.0},
+    )
+    emitted: list[dict[str, Any]] = []
+    monkeypatch.setattr(nodep, "emit", emitted.append)
+
+    def start(arguments: tuple[str, ...]) -> dict[str, Any]:
+        parsed = nodep.parser().parse_args(list(arguments))
+        parsed.handler(parsed)  # raises ProbeError exactly as on the node
+        return dict(emitted[-1])
+
+    return start
+
+
+@pytest.mark.parametrize("variant", ["memory_pressure", "recovery", "cgroup_only"])
+def test_memory_variants_ask_the_real_probe_for_an_accepted_hold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variant: str
+) -> None:
+    probe = mem_node_probe() if variant != "cgroup_only" else cgroup_node_probe()
+    probe.script["memory-start"] = real_memory_start(monkeypatch, tmp_path)
+    document = chain_activity() if variant != "cgroup_only" else quiet_activity()
+    regional = FakeRegional(cpu_python=store_script({"activity": document}))
+    ctx = make_context(
+        SPECS[variant],
+        tmp_path=tmp_path,
+        regional=regional,
+        probes={f"node@{NODE}": probe},
+    )
+    result = SPECS[variant].execute(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    starts = [call for call in probe.calls if call[0] == "memory-start"]
+    assert starts, "the variant started the memory unit through the real probe"
+    seconds = [int(call[call.index("--seconds") + 1]) for call in starts]
+    assert all(value <= mem.PROBE_MAX_SECONDS for value in seconds), seconds
+    if variant == "memory_pressure":
+        assert seconds == [1980], "the 14-minute ramp plus detection hold"
+    if variant == "recovery":
+        assert seconds == [1800], "exactly the old cap: recovery never failed live"
+
+
+def test_memory_pressure_fails_fast_when_the_hold_exceeds_the_probe_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.e2e.regional.regional_commands import RegionalFixtureError
+
+    monkeypatch.setattr(mem, "PROBE_MAX_SECONDS", 1800)  # the live cap of 2026-10-25
+    probe = mem_node_probe()
+    regional = FakeRegional(cpu_python=store_script({"activity": chain_activity()}))
+    ctx = make_context(
+        SPECS["memory_pressure"],
+        tmp_path=tmp_path,
+        regional=regional,
+        probes={f"node@{NODE}": probe},
+    )
+    with pytest.raises(
+        RegionalFixtureError, match="1980 s memory hold exceeds .* 1800 s"
+    ):
+        SPECS["memory_pressure"].execute(ctx)
+    assert [call[0] for call in probe.calls] == ["survey"], (
+        "refused before the oracle or the memory unit touched the node"
+    )
+
+
+def test_low_available_memory_hold_fits_the_probe_cap() -> None:
+    from scripts.e2e.regional import general_live_utilization as util
+
+    requested = util.MEMORY_RAMP_BUDGET + (util.MEMORY_DURATION + 300 + 120) + 120
+    assert requested <= mem.PROBE_MAX_SECONDS, requested

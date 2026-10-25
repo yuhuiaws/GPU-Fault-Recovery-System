@@ -1234,6 +1234,14 @@ collector is enabled. Their module tests under
 `tests/regional/test_general_live_memory.py` and
 `tests/regional/test_general_live_phase2.py` run the verdict logic against
 scripted product records with fakes; they are not proof of a physical fault.
+`memory_pressure` has no live evidence yet: on 2026-10-25 it failed three times
+on two plain-EKS nodes before any product record because the runner asked the
+node probe for a 1980 s hold (the 2 TiB host's 14-minute ramp plus detection)
+and the probe's `memory-start` cap was 1800 s; the cap now equals the other
+load units' 3600 s, the runner checks the requested hold against it before a
+probe Pod touches the node, and a probe failure's JSON names its step
+(`error_code`/`error_site`), so the memory tests now also run the real
+`memory_start` over a p5en-shaped fake host to pin the accepted hold.
 
 The rest stay `NOT_RUN`: `FIXTURE_NOT_READY` for 007/010/012/015 and a few
 002/005 variants, which need the targeted command/file reading

@@ -683,6 +683,14 @@ IPC 命名空间，udev 在主机命名空间里找不到 Pod 的信号量，cre
   cgroup 压力和 meminfo oracle，需 `HOST_MEMORY_PRESSURE`；`memory_used_percent`
   ≥95% 持续 120 秒 → VALIDATE_HOST 探针在加载期间失败，无 reset/reboot）；
   `no_swap`（observation：确认 `SwapTotal=0` 时 swap 规则天然不触发）。
+  2026-10-25 两台 plain EKS 节点上 `memory_pressure` 三次在产品证据之前失败
+  （`host probe failed (exit 1; error ProbeError)`，survey 与 oracle 均正常）：运行器按
+  2 TiB 主机 14 分钟 ramp 预算请求 1980 秒的 hold（ramp 1080 + 检测 540 + 余量），而
+  探针 `memory-start` 当时的上限是 1800 秒，`bounded()` 直接拒绝，错误文本按策略不进日志。
+  现在该上限与其他负载单元一致为 3600 秒（deadman 仍为 hold+120 ≤ 5400），运行器在触碰
+  节点之前先按探针上限检查请求的秒数（超出即带数字失败），节点探针的失败 JSON 带
+  `error_code`/`error_site`，夹具证据显示 `error <类> <摘要> at <函数:行>`
+  （如 `memory_start:<行>`）。以上仅改测试夹具，尚未真机复跑。
 - 002 `cgroup_only`（native 负例，复用 `HOST_MEMORY_PRESSURE`）：节点探针
   `memory-start --cgroup-oom-bytes 2147483648` 把分配器放进一个上限 2 GiB（探针拒绝超过
   MemTotal 的 1 % 或超过主机在 95 % 规则下余量的上限）、无 swap、`OOMPolicy=kill` 的测试
