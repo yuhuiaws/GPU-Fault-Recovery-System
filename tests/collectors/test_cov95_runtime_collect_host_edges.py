@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from types import SimpleNamespace
 
 import pytest
@@ -111,22 +112,148 @@ def test_efa_inventory_keeps_failure_modes_distinct(host_case, mode):
     assert batch.collection_errors == []
 
 
-def test_efa_inventory_empty_pci_bus_listing_is_unavailable(host_case):
-    """An empty ``/sys/bus/pci/devices`` is not a bus with no EFA functions on
-    it -- every host lists a bridge at least -- so the tick reports a
-    collection error instead of PCI_DEVICE_MISSING."""
+def efa_samples(batch):
+    return {sample.name: sample for sample in batch.samples}
 
-    add_efa(host_case, 0, pci=False)
+
+def test_efa_inventory_dropped_function_confirms_missing_on_the_second_sample(
+    host_case,
+):
+    """A function that leaves the bus takes its RDMA device with it; the
+    verdict is PCI_DEVICE_MISSING, and only after the configured two samples."""
+
+    add_pci_bus(host_case)
+    add_efa(host_case, 0)
+    add_efa(host_case, 1)
     collector = host_case.build(
         "_efa_inventory",
-        expected_efa_device_count=1,
+        expected_efa_device_count=2,
+        inventory_mismatch_consecutive_samples=2,
+    )
+
+    healthy = efa_samples(collector.collect_once())
+    assert healthy["efa_inventory_mismatch"].value == 0
+    assert healthy["efa_inventory_mismatch"].labels["failure_mode"] == "HEALTHY"
+    assert healthy["efa_inventory_mismatch"].labels["pci_evidence"] == "LISTED"
+
+    shutil.rmtree(host_case.roots.pci / "1")
+    shutil.rmtree(host_case.roots.rdma / "efa1")
+
+    first = efa_samples(collector.collect_once())
+    assert first["efa_inventory_mismatch"].value == 0, "one sample never confirms"
+    labels = first["efa_inventory_mismatch"].labels
+    assert labels["failure_mode"] == "PCI_DEVICE_MISSING"
+    assert labels["consecutive_mismatch_samples"] == "1"
+
+    second = efa_samples(collector.collect_once())
+    assert second["efa_inventory_mismatch"].value == 1
+    labels = second["efa_inventory_mismatch"].labels
+    assert labels["failure_mode"] == "PCI_DEVICE_MISSING"
+    assert labels["pci_evidence"] == "LISTED"
+    assert second["efa_inventory_discovered_count"].value == 1
+    assert second["efa_inventory_driver_bound_count"].value == 1
+    assert second["efa_inventory_missing_count"].value == 1
+
+
+@pytest.mark.parametrize(
+    ("pci_functions", "bound", "active", "failure_mode", "mismatch"),
+    [
+        # Two bound, both ACTIVE, one PCI function listed: the bus cannot
+        # hold fewer functions than the driver has bound, so the listing is
+        # the odd reading out and the node is healthy by its ports.
+        (1, 2, 2, "HEALTHY", 0),
+        # Same listing, one port DOWN: diagnose the link, do not reboot.
+        (1, 2, 1, "LINK_INACTIVE", 1),
+        # No EFA function listed at all while the driver has one bound: the
+        # driver shortfall cannot be classified without PCI evidence.
+        (0, 1, 1, "INVENTORY_UNAVAILABLE", 1),
+    ],
+)
+def test_efa_inventory_pci_listing_below_bound_count_is_not_a_missing_function(
+    host_case, pci_functions, bound, active, failure_mode, mismatch
+):
+    """A PCI listing below the driver's own bound count is an incomplete or
+    mis-pointed listing (``GPU_FAULT_PCI_DEVICES_ROOT`` at the wrong tree),
+    never a lost function: PCI_DEVICE_MISSING would reboot the node."""
+
+    add_pci_bus(host_case)
+    for index in range(bound):
+        add_efa(host_case, index, pci=index < pci_functions, active=index < active)
+    collector = host_case.build(
+        "_efa_inventory",
+        expected_efa_device_count=2,
         inventory_mismatch_consecutive_samples=1,
     )
+
+    samples = efa_samples(collector.collect_once())
+
+    labels = samples["efa_inventory_mismatch"].labels
+    assert labels["failure_mode"] == failure_mode
+    assert labels["pci_evidence"] == "INCONSISTENT"
+    assert samples["efa_inventory_mismatch"].value == mismatch
+    # The listing stays visible as read, next to the count it contradicts.
+    assert samples["efa_inventory_discovered_count"].value == pci_functions
+    assert labels["discovered_count"] == str(pci_functions)
+    assert samples["efa_inventory_driver_bound_count"].value == bound
+
+
+@pytest.mark.parametrize("shape", ["missing", "file", "empty"])
+def test_efa_inventory_unreadable_or_empty_pci_root_is_unavailable(host_case, shape):
+    """A PCI root that cannot be listed, or lists no device at all (every bus
+    carries a bridge at least), is no reading: the tick reports a collection
+    error (UNKNOWN) and not one EFA count, never zero functions."""
+
+    add_efa(host_case, 0, pci=False)
+    if shape != "empty":
+        shutil.rmtree(host_case.roots.pci)
+    if shape == "file":
+        host_case.roots.pci.write_text("not a directory\n")
+    collector = host_case.build(
+        "_efa_inventory",
+        expected_efa_device_count=2,
+        inventory_mismatch_consecutive_samples=1,
+    )
+
     batch = collector.collect_once()
+
     assert batch.samples == []
     assert len(batch.collection_errors) == 1, batch.collection_errors
     assert "EFA inventory observation unavailable" in batch.collection_errors[0]
-    assert "lists no PCI device" in batch.collection_errors[0]
+    if shape == "empty":
+        assert "lists no PCI device" in batch.collection_errors[0]
+
+
+def test_efa_inventory_unreadable_pci_root_restarts_the_confirmation(host_case):
+    """A tick without a reading breaks the streak: the two valid mismatching
+    samples PCI_DEVICE_MISSING needs are counted from the next reading on."""
+
+    add_pci_bus(host_case)
+    add_efa(host_case, 0)
+    collector = host_case.build(
+        "_efa_inventory",
+        expected_efa_device_count=2,
+        inventory_mismatch_consecutive_samples=2,
+    )
+    first = efa_samples(collector.collect_once())
+    assert first["efa_inventory_mismatch"].value == 0
+    assert first["efa_inventory_mismatch"].labels["consecutive_mismatch_samples"] == (
+        "1"
+    )
+
+    bus = host_case.tmp_path / "bus-aside"
+    host_case.roots.pci.rename(bus)
+    unreadable = collector.collect_once()
+    assert unreadable.samples == []
+    assert "EFA inventory observation unavailable" in unreadable.collection_errors[0]
+    bus.rename(host_case.roots.pci)
+
+    restarted = efa_samples(collector.collect_once())
+    assert restarted["efa_inventory_mismatch"].value == 0, "the streak starts over"
+    labels = restarted["efa_inventory_mismatch"].labels
+    assert labels["consecutive_mismatch_samples"] == "1"
+    assert labels["failure_mode"] == "PCI_DEVICE_MISSING"
+    confirmed = efa_samples(collector.collect_once())
+    assert confirmed["efa_inventory_mismatch"].value == 1
 
 
 def test_unanswerable_driver_query_retains_context_without_claiming_missing_gpus(
