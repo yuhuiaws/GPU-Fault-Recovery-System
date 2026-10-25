@@ -1512,8 +1512,8 @@ is the ledger layer against the live store -- the same-reservation idempotency,
 the over-budget refusal, the exactly-once release and the context check before
 any budget read, serialised by the Postgres advisory lock the product uses --
 and not two real executor replicas racing a claimed workflow through the
-dispatcher, nor a watcher restart (029 `worker_restart` stays `NOT_RUN`
-pending `CONTROL_PLANE_RESTART`). The product offers no way to delete a ledger
+dispatcher (a watcher restart mid-claim is 029 `worker_restart`, below). The
+product offers no way to delete a ledger
 row, so the cleanup releases this run's reservations through the API and then
 removes the emptied test row with the store's `_delete` primitive (the one
 `cleanup_audit_records` uses for the command-protocol audit's `restart_budget`
@@ -1585,6 +1585,65 @@ it proves, and what it does not:
   in-process over an `InMemoryStore` and the whole variant over scripted
   product records; the Postgres advisory lock, the kernel collector's reopen
   of the fixture file and the reset itself are exercised only live.
+
+## GF-GENERAL-LIVE watcher isolation and restart (028 api_unreachable, 011 unreachable_node, 029 worker_restart)
+
+Three dangerous native variants cut or replace a product component instead of
+a node resource, each behind its own `--approve` token and each graded on the
+product's records only (`scripts/e2e/regional/general_live_network_isolation.py`,
+`general_live_watcher_restart.py`, node probe
+`probes/general_live_isolation_probe.py`).
+
+028 `api_unreachable` (`WATCHER_NETWORK_ISOLATION`) rejects, on the node that
+runs the one completion-watcher Pod, TCP from that Pod's IP to the control-plane
+endpoint (FORWARD rules, tcp-reset, the run's tag in the comment match) while a
+managed job exits non-zero on the runner's trigger file. The scope is the Pod
+IP: no other Pod, host unit or destination is affected, and the systemd deadman
+(a copy of the probe running `cleanup --strict`) fires within 540 s, under the
+600 s after which the control plane reads the cluster's coverage UNKNOWN. What
+is proven: the watcher's emergency fallback suspends the workload itself
+(annotated `emergency-fallback`, naming the containment incident), nothing
+reaches the control plane while the block holds (the coverage heartbeat stops
+advancing and the attempt has no event/decision -- otherwise INCONCLUSIVE), and
+after the restore every action is recorded once: one containment with one
+successful STOP_WORKLOADS, one decision (PLAN_CREATED: a STOPPED terminal
+initiated by the passive containment is still the failure's terminal and
+restarts once within budget), at most one RESTART_WORKLOAD, a ledger whose
+count equals its reservations, no notification twice, and a coverage heartbeat
+after the restore. Limits: the block holds the resolved IPv4 addresses of the
+endpoint at block time (a CIDR list can be given instead); a DNS change during
+the window is reported by the probe's `status` and would show up as an
+ineffective block (INCONCLUSIVE), never as a product verdict. The REJECT makes
+the watcher fail fast; a silent DROP (hung POSTs until their timeout) is not
+exercised.
+
+011 `unreachable_node` (`NODE_AGENT_NETWORK_ISOLATION`) rejects TCP to the Node
+Agent's listening port on `--node-b` -- the channel the executor pushes node
+actions to -- from before the stall until the hung chain's summary/triage
+executions are recorded, then restores it so the chain's later steps run
+against a reachable node. The Agent's outbound heartbeats, the collectors and
+kubelet are untouched, so the control plane still believes the node is covered
+and has to record the gap itself: the summary/triage details must name the
+node as undetermined/failed/not responding and carry no reading for it, the
+reachable node's evidence must be present, the incident must still end
+ESCALATED and nothing may be cordoned, stopped or reset. The restore proof is
+the probe's own connect to the Agent port plus the Agent's `last_seen_at`
+advancing in the control plane. Not exercised: an Agent that is down (its
+heartbeat lost), a node whose host collector is also unreachable, and the
+10-minute waiting cap a node action would hit if the channel stayed cut.
+
+029 `worker_restart` (`CONTROL_PLANE_RESTART`) deletes the watcher Pod fenced on
+its UID/resourceVersion, with no grace, while the recovery workflow's
+RESTART_WORKLOAD reservation is open (reserved on the ledger, step WAITING on
+the replica); a claim already closed at the first read is INCONCLUSIVE, since
+the replica's start decides the window. The replacement restores its state
+from the product's own ConfigMaps and must not re-decide, re-reserve or re-send:
+the ledger keeps exactly the one reservation of the recovery workflow (not lost,
+not doubled), one RESTART_WORKLOAD succeeds, one STOP_WORKLOADS, one decision,
+exactly one restart attempt is observed, no notification is recorded twice and
+a coverage heartbeat follows from the replacement. The module tests drive the
+sequence over fakes (a phase-driven store, an inventory that flips on the fenced
+delete); the live run is the only proof of the real outbox replay.
 
 ## GF-GENERAL-LIVE live acceptance runner (phase 2)
 

@@ -684,7 +684,12 @@ Node Agent ACTIVE、无未关闭 incident/工作流、必需采集通道新鲜�
 OOM）、`KERNEL_MODULE_LOAD`（加载 dm_delay/
 veth/dummy/sch_netem，以及 004 `probe_error` 的 `vfat`、005 的 `nfsv4`；dm-error 目标内建于
 dm_mod，无需加载）、`ENABLE_NODE_LOG_COLLECTOR`（临时启用被禁用的节点日志
-采集器）、`WATCHER_NETWORK_ISOLATION`、`CONTROL_PLANE_RESTART`、
+采集器）、`WATCHER_NETWORK_ISOLATION`（028 `api_unreachable`：在 completion watcher Pod
+所在节点，仅以该 Pod IP 为源的 FORWARD REJECT 切断其到控制面端点的 TCP，deadman 不超过
+600 s 覆盖期限）、`NODE_AGENT_NETWORK_ISOLATION`（011 `unreachable_node`：在第二节点
+INPUT REJECT 其 Node Agent 监听端口——执行器下发节点动作的通道，心跳/采集器/kubelet 不受
+影响，带 deadman）、`CONTROL_PLANE_RESTART`（029 `worker_restart`：在 restart claim 打开期间
+按 UID/resourceVersion 栅栏删除唯一的 completion watcher Pod，由 Deployment 重建）、
 `DECLARE_WARM_SPARE`（经 admin CLI 声明一台热备并 cordon，清理时释放/解除 cordon）、
 `SPARE_KUBELET_STOP`（停热备上的 kubelet 使其 NotReady，带宿主机自动重启定时器）；
 缺令牌记 `NOT_RUN(NOT_AUTHORIZED)`。可选令牌只解锁一个附加分支、不影响变体本身是否
@@ -742,8 +747,9 @@ decision、restart 预算账本），绝不 POST 预制 finding/workflow。运�
 `NOT_RUN`/`BLOCKED`：需产品侧读取夹具的 live-replay（004 probe_error、
 008 statistics_failed、009 errors_delta、025 的 5 个字段/别名/NaN 变体；
 029 hardware_chain_continues 已由下文的硬件链变体实现）、
-本站能力缺失（008 bond_vf、031 inactive_cluster/notification_failure）、
-需未授批危险分支（028 api_unreachable、029 worker_restart）。
+本站能力缺失（008 bond_vf、031 inactive_cluster/notification_failure）。028
+`api_unreachable` 与 029 `worker_restart` 原为未授批危险分支，现已实现为带令牌的
+native 变体（见下文"watcher 失联与重建"）。
 
 需管理员安排的站点配置：008 `empty_required_list` 是站点 FAIL，修复需把主/EFA
 netdev 写进安装器/管理配置的 `GPU_FAULT_REQUIRED_INTERFACES`（默认空）；
@@ -823,6 +829,41 @@ run_general_live.py --site-profile <profile> --run-dir <run> \
   --site-file <site.yaml> --approve GPU_RESET --approve KERNEL_SOURCE_REPLAY --execute \
   --confirm GENERALLIVE029_EXECUTE --maintenance-window-end <UTC>
 ```
+
+watcher 失联与重建（028 `api_unreachable`、029 `worker_restart`，native，标志 `X`，
+`general_live_network_isolation.py`/`general_live_watcher_restart.py`，节点侧探针
+`probes/general_live_isolation_probe.py`）。`api_unreachable`（`--approve
+WATCHER_NETWORK_ISOLATION`）：先确认恰好一个 Ready 的 `gpu-fault-completion-watcher` Pod
+（非 hostNetwork，有自己的 Pod IP），从 `gpu-fault-regional-connection` 只读
+`control-plane-url` 一个键解析端点；受管任务以 `trigger:1` 模式启动（容器等待运行器创建
+`/tmp/gfrs-live-exit` 后非零退出），等到全部 Pod Running 且 watcher 已向控制面发布该 attempt
+的 RUNNING 观测后，在 watcher 所在节点经探针写入意图记录、布置 `systemd-run --on-active`
+deadman（探针自身副本执行 `cleanup --strict`，失败重试）、再在 FORWARD 链顶部插入
+`-s <Pod IP>/32 -d <解析地址>/32 -p tcp --dport <端口> -m comment --comment gfrs-<digest>-iso-pod-egress
+-j REJECT --reject-with tcp-reset`（其他 Pod、宿主机进程、其他目的地址一律不受影响；deadman
+≤ 540 s，低于控制面 600 s 覆盖期限），随后 `kubectl exec` 触发退出。阻断期内 watcher 的
+紧急保底（`GPU_FAULT_PASSIVE_STOP_FALLBACK_SECONDS`）须自行 suspend 工作负载并写上
+`gpu-fault.io/passive-stop-mode=emergency-fallback` 与 termination-initiator 注解，attempt
+的 Pod 被 operator 删除后终态在 watcher 侧产生并缓冲于 outbox；有效性 oracle：阻断至少 150 s
+后，控制面的 watcher coverage heartbeat `observed_at` 仍早于阻断时刻，且该 attempt 无
+event/decision，否则 `INCONCLUSIVE`（阻断未生效）。恢复后判定只读产品记录：紧急停止注解
+指向该 attempt 的 containment incident；event/decision 各恰好一条且 decision 为
+`PLAN_CREATED`（被动 containment 发起的 STOPPED 终态仍按预算重启一次）；containment
+工作流 STOP_WORKLOADS 恰好成功一次、recovery 工作流至多一个且 RESTART_WORKLOAD 至多成功一次、
+账本 `restart_count ≤ 1` 且等于 reservation 数；该 attempt 各 incident 的通知无重复
+deduplication key；恢复后出现新的 coverage heartbeat（`observed_at` 晚于恢复时刻）。清理删除
+带本次 tag 的全部规则并停 deadman，探针回读链上无残留且 timer 未激活，否则记清理失败。
+`worker_restart`（`--approve CONTROL_PLANE_RESTART`）：受管任务 `exit:1`、预算 1；每 5 s
+读取 attempt 记录直到 claim 打开——账本已有 recovery 工作流的 reservation 且 RESTART_WORKLOAD
+尚无 SUCCEEDED/FAILED 执行（适配器已提交副本、处于 WAITING）；首次读到即已关闭记
+`INCONCLUSIVE`。随后以 `DeleteOptions.preconditions{uid,resourceVersion}`、grace 0 删除唯一的
+watcher Pod，等待 Deployment 重建出新 UID 且 Ready（≤ 600 s，与 startupProbe 一致），再等
+recovery 工作流终结。判定：账本 `restart_count == 1` 且唯一 reservation 属于该 recovery
+工作流（未丢失、未重复扣减）；RESTART_WORKLOAD 恰好成功一次、recovery 工作流恰好一个且
+SUCCEEDED、STOP_WORKLOADS 恰好成功一次、decision 为 `PLAN_CREATED`；watcher 发布的观测中除源
+attempt 外恰好一个重启 attempt；通知无重复；重建后出现新的 coverage heartbeat。两变体都在
+`eks`/`hp` 车道、需 `--fault-node`（跑受管任务的 GPU 节点）与 `--site-file`；清理按重启血缘删
+除受管任务及其副本。
 
 009 `tcp_only`（native 负例：TCP 重传不是网卡错误，`general_live_tcp.py`）：网卡探针
 建 `gfrs<digest>ns` 测试 netns 与一对 gfrs veth（复用 gfrs-only 建接口与真实网卡守卫，
@@ -1237,9 +1278,26 @@ POST 预制 finding。类别模块 `general_live_nccl`/`_nccl_fr`/`_progress`/`_
   阈值之下（最晚 540 秒）删除，同一任务以 `--attempt-id <job>-a002` 回到 attempt B
   并转为活跃；A 不得出 `HUNG_SUSPECTED`，B 不得出任何 warning/hung，各节点 EFA 流量
   状态行须记 B、首次观测在切换之后、`had_active_traffic` 为真、无零流量 streak。
+  `unreachable_node`（native，`--approve NODE_AGENT_NETWORK_ISOLATION`，标志 `X`，eks/hp，
+  `general_live_network_isolation.py` + `probes/general_live_isolation_probe.py`）：Node Agent
+  是节点上的 HTTP 服务（`/v1/node-actions/submit|result`），执行器把节点动作推送到其心跳
+  宣告的端点；基线证明后、停滞前，在 `--node-b` 上写入意图记录、布置 `systemd-run --on-active`
+  deadman（≤ 3600 s，不超过维护窗口），再在 INPUT 链顶部插入 `-p tcp --dport <Agent 端口>
+  -m comment --comment gfrs-<digest>-iso-agent-ingress -j REJECT --reject-with tcp-reset`
+  （端口取自该节点 Agent 记录的 endpoint，探针核对 Agent 单元 active 且其主进程确在该端口监听；
+  探针本机 TCP 连接须被拒才算阻断生效）。Agent 的出向心跳、各采集器与 kubelet 不受影响，所以
+  两节点的 EFA 零流量仍由主机采集器上报、控制面仍认为节点在覆盖之内。等 hung 工作流的
+  COLLECT_HUNG_SUMMARY/TRIAGE 执行记录出现（或工作流终结）后立即恢复通道，让 bundle/
+  VALIDATE_FABRIC/ESCALATE_SUPPORT 面对可达节点运行；再等 incident 稳定。判定只读产品记录：
+  DAG 形状与禁止动作同其他 011 变体；incident 为 ESCALATED；summary/triage 执行的
+  `undetermined_nodes`/`node_failures`/`hung_triage_decision.undetermined_nodes|not_sampled_nodes`
+  或 `survey_coverage.responding_node_count < expected_node_count` 至少一处点名 node-b，
+  且 node-b 不出现在任何 summary/triage 的 `node_results`（否则为伪造读数），可达节点的
+  `node_results` 存在；node-b 未被 cordon/隔离；清理后探针回读 INPUT 链无残留、timer 未激活、
+  Agent 端口再次接受连接，且控制面记录的 Agent `last_seen_at` 晚于恢复时刻；最后释放停滞并
+  证明 EFA 流量恢复。
   延后留分母：规模类 `large_job`/`no_step_no_rank`/
-  `active_window_resume`（`SCALE`，本站无 128 节点任务）、`unreachable_node`（隔离 Agent
-  通道未授批，`NOT_AUTHORIZED`）。
+  `active_window_resume`（`SCALE`，本站无 128 节点任务）。
 - **027（eks 或 hp 车道）**：产品训练进度 reporter 默认关闭、全局周期 monitor 必须
   保持关闭；仅测试任务 Pod 内以 `gpu-fault-collector training-progress` sidecar 启用
   reporter，读测试应用原子写的进度文件（启用 reporter 的源路径）。训练镜像不含产品，
