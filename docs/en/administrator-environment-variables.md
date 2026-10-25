@@ -192,7 +192,7 @@ Nodes enable the four systemd Collectors kernel, Fabric Manager, GPU metrics and
 | `GPU_FAULT_DCGM_EDGE_CONFIRMATION_SAMPLES` | — | `'3'` | Number of consecutive confirmation samples for a candidate anomaly. |
 | `GPU_FAULT_HOST_EDGE_FILTER_ENABLED` | — | `True` | Whether Host telemetry performs baseline/edge compression on the node side. |
 | `GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS` | — | `'300'` | Period of the Host no-change health summary. |
-| `GPU_FAULT_EXPECTED_GPU_COUNT` | Written by the node installer per instance type | `<implicit>` | Expected GPU count of this node; unknown instance types must be configured explicitly, not skipped silently. |
+| `GPU_FAULT_EXPECTED_GPU_COUNT` | Written by the node installer per instance type | `<implicit>` | Expected GPU count of this node; unknown instance types must be configured explicitly, not skipped silently. On a known type, a value that contradicts the type's GPU count while the node lists exactly that count only yields a WARNING gpu_expected_count_contradicted (configuration error) on the control plane -- no lost-GPU verdict, no reboot. |
 | `GPU_FAULT_EXPECTED_EFA_DEVICE_COUNT` | Written by the node installer per instance type | `<implicit>` | Expected EFA device count of this node. |
 | `GPU_FAULT_GPU_INVENTORY_INTERVAL_SECONDS` | — | `'60'` | Independent GPU inventory reporting period. |
 | `GPU_FAULT_GPU_INVENTORY_MAX_AGE_SECONDS` | — | `'180'` | Maximum GPU inventory age the control plane may use for recovery validation. |

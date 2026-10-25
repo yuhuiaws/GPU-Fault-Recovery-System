@@ -325,7 +325,7 @@ categories:
         description: "Host 无变化健康摘要周期。"
       - name: GPU_FAULT_EXPECTED_GPU_COUNT
         production: 节点安装器按实例类型写入
-        description: "该节点期望 GPU 数；未知机型必须显式配置，不能静默跳过。"
+        description: "该节点期望 GPU 数；未知机型必须显式配置，不能静默跳过。已知机型上与实例类型卡数不符、而节点恰列出该卡数时，控制面只报 WARNING gpu_expected_count_contradicted（配置错误），不判掉卡、不 reboot。"
       - name: GPU_FAULT_EXPECTED_EFA_DEVICE_COUNT
         production: 节点安装器按实例类型写入
         description: "该节点期望 EFA device 数。"

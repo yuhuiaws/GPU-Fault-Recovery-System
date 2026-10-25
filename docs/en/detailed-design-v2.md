@@ -1541,7 +1541,11 @@ and `_LABEL_VALUE=true`; history retention of GPU discovery results is
 Unknown devices (reported but absent from the asset view) enter the GPU finding history and can trigger a hardware inventory notification.
 
 **⑪ Exception handling** — expected GPU count does not match the instance type (e.g. a `p5.48xlarge` reports only 7 cards)
-→ record a finding and handle it as missing hardware; HyperPod identity unresolvable → HyperPod-class actions for that node
+→ record a finding and handle it as missing hardware; `GPU_FAULT_EXPECTED_GPU_COUNT` itself contradicts the instance type's
+GPU count while the node lists exactly that count (bound count agreeing) → the control plane re-reads the mismatch against
+the instance-type table before grading and reports a WARNING `gpu_expected_count_contradicted` instead (configuration error:
+evidence + operator-review advisory only, no reboot; GF-GENERAL-LIVE-012 `expectation_wrong`, decision table in the v1
+Detailed Design §2.21.1); HyperPod identity unresolvable → HyperPod-class actions for that node
 fail closed, ordinary Kubernetes actions can still execute.
 
 **⑫ Unit test scope** — expected GPU/EFA count assertions for six instance types; a MIG UUID prefix is not treated as

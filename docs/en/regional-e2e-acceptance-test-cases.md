@@ -14587,6 +14587,14 @@ otherwise a machine with a non-EFA RDMA card mixed in would reach a false "consi
   The runner validates and saves the raw text of these two batches, binds the event IDs, and then
   delivers each once, in the original order, through the real `HttpEventSink` on the node. The control
   plane must persist the identical batches and then execute a real reboot workflow.
+  ⚠ Since the GF-GENERAL-LIVE-012 `expectation_wrong` fix the control plane re-reads the mismatch against
+  the instance-type table before grading: on a type in the table, a `baseline+1` expectation that
+  contradicts the count the node lists (bound count agreeing) only yields a WARNING
+  `gpu_expected_count_contradicted` (FREEZE_EVIDENCE only) and **no longer enters the reboot chain**.
+  This case's stimulus must become a reviewed `nvidia-smi` output replay with one real UUID fewer in the
+  full query (the GF-GENERAL-LIVE-012 `confirmed_missing` processing-chain replay); the changed-expectation
+  path is void as a reboot stimulus. Until the runner is reworked the case is recorded FAIL / not run; that
+  WARNING incident must not stand in for `RESTART_NODE` evidence.
   This is a controlled inventory-policy stimulus, not a real GPU drop-off; a successful isolated sample
   is not by itself a live case pass.
 - Verdict:
@@ -16233,17 +16241,21 @@ hardware**. Available means, from least to most invasive:
 |------|-----------|--------|--------|
 | Write to `/dev/kmsg` | the full kernel-collector chain (verified by `DESTR-010`) | low | complete |
 | Append to the fabric manager log | fabric-manager collector (`COLLECT-005`) | low | complete |
-| Temporarily change the expected value in `collector.env` and restart the collector | the **false-positive direction** of `COLLECT-003/004` | medium | recovers when changed back |
+| Temporarily change the expected value in `collector.env` and restart the collector | the **false-positive direction** of `COLLECT-003`; for `COLLECT-004` on a type in the table it only reaches the WARNING `gpu_expected_count_contradicted`, no longer the reboot chain | medium | recovers when changed back |
 | `nvidia-smi -pm 0` / change clocks | changes in some DCGM metrics | medium | complete |
+| Reviewed `nvidia-smi` output replay: one real UUID fewer in the full query | the lost-GPU verdict chain of `COLLECT-004` / GF-GENERAL-LIVE-012 (processing-chain proof, not a physical loss) | medium | recovers when the window closes |
 | Real GPU drop-off / pulling the EFA | the **false-negative direction** of `COLLECT-004` | **unacceptable** | no |
 
 ⚠ **The "false-negative direction" of `COLLECT-003/004` (really one GPU fewer) has no safe
-means; it can only be approached from the "false-positive direction" by changing the
-expected value**: temporarily set `EXPECTED_GPU_COUNT` to 9 (one more than actual) and the
-collector believes "one GPU is missing", which drives the same verdict code. This
-substitute path **must be documented in the manual as a substitute**, and must not be
-claimed to have verified a real GPU drop-off. After the change, **it must be set back to 8
-and the collector restarted**.
+means.** The former substitute was to set `EXPECTED_GPU_COUNT` to 9 (one more than actual) so the
+collector believed "one GPU is missing". Since the GF-GENERAL-LIVE-012 `expectation_wrong` fix this
+path **no longer reaches a reboot** on a type in the table (p5/p5e/p5en/p6 families): the control
+plane grades it as a configuration contradiction (WARNING `gpu_expected_count_contradicted`,
+evidence only) because the count the node lists agrees with the instance type. The lost-GPU verdict
+chain can only be driven by a reviewed `nvidia-smi` output replay with one real UUID fewer in the
+full query; that too **must be documented in the manual as a substitute**, must not be claimed to
+have verified a real GPU drop-off, and the real, complete inventory must be read back after the
+window closes.
 
 ## 14. E2E: Full closed loop per cluster
 

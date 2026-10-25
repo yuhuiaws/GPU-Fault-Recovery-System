@@ -3754,6 +3754,33 @@ reads. An unreadable directory used to count as 0, and the second such cycle min
 fail to answer and the directory cannot be read, the inventory samples are produced as usual but without
 `gpu_inventory_discovered_count` and the `discovered_count` label, instead of reporting 0.
 
+A configuration error is not a lost GPU (GF-GENERAL-LIVE-012 `expectation_wrong`). The expected count is a
+node-level setting; typed wrong by hand (live: `expected=9` on an 8-GPU p5en) the collector compared only the
+configured value with the listed UUIDs, and the second cycle graded a healthy node as a lost GPU and went to
+`REBOOT_NODE`. The collector now writes the driver-bound count (`discovered_count`, label only when the query
+answered -- no extra sample, the sample set is unchanged) and the instance type's GPU count
+(`instance_type_gpu_count`) into the labels of every GPU inventory sample; the node-side verdict itself is
+unchanged, still configured against listed. On the control plane, `gpu_inventory_verdicts` in
+`src/gpu_fault/host_health.py` re-reads every `gpu_inventory_mismatch` sample against its own instance-type
+table (`gpu_instance_inventory`) before grading, whatever the collector version -- an older collector's
+`node_instance_type`, `expected_count` and `observed_count` labels are enough:
+
+| Configured E vs type count T | Listed O vs T | Bound D vs O | Verdict |
+| --- | --- | --- | --- |
+| E = T | O = T | — | healthy |
+| E = T | O ≠ T | — | `gpu_inventory_mismatch` CRITICAL → `REBOOT_NODE` (unchanged) |
+| E ≠ T | O = T | D = O or not reported | mismatch re-read as 0; `gpu_expected_count_contradicted=1` → WARNING `COLLECT_EVIDENCE` (FREEZE_EVIDENCE only + operator-review advisory whose reason names E, T, O and D) |
+| E ≠ T | O = T | D ≠ O or unparsable | mismatch stays CRITICAL → `REBOOT_NODE`; the contradicted WARNING is raised as well |
+| E ≠ T | O ≠ T | — | mismatch graded against E as before (a real loss still reboots); the contradicted WARNING is raised as well |
+| T unknown (type not in the table) or labels missing/unparsable | — | — | the explicit expectation keeps its meaning; nothing is re-read |
+
+`gpu_expected_count_contradicted` clears with a 0 on every batch where E = T, so correcting the setting and
+restarting the collector closes the episode; one contradiction is told once. When `VALIDATE_GPU` has no
+plan-frozen requirement it validates against the node's latest `gpu_inventory_expected_count`; that row's own
+`node_instance_type` label lets the instance type's physical count cap it too (`inventory_requirement_clamped`
+in the step details), so a configuration error no longer fails every reboot's validation and escalates to
+`REPLACE_NODE`.
+
 #### 2.21.2 Debounce and metrics
 
 The collector maintains in-process consecutive mismatch counters for GPU and EFA separately. A normal sample

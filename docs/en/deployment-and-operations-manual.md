@@ -10629,7 +10629,7 @@ shell before running the installation.
 | Environment variable | Node installer parameter | Default | Meaning |
 | --- | --- | ---: | --- |
 | `GPU_FAULT_NODE_INSTANCE_TYPE` | `--node-instance-type` | Read automatically on HyperPod | Instance type written into metrics and emails |
-| `GPU_FAULT_EXPECTED_GPU_COUNT` | `--expected-gpu-count` | Per the table above | Expected number of visible GPU UUIDs |
+| `GPU_FAULT_EXPECTED_GPU_COUNT` | `--expected-gpu-count` | Per the table above | Expected number of visible GPU UUIDs; on a type in the table, a value that contradicts the table while the node lists exactly the table's count (bound count agreeing) only yields a WARNING `gpu_expected_count_contradicted` (configuration error) on the control plane -- no lost-GPU verdict, no reboot |
 | `GPU_FAULT_EXPECTED_EFA_DEVICE_COUNT` | `--expected-efa-device-count` | Per the table above | Expected number of ACTIVE EFA devices |
 | `GPU_FAULT_INVENTORY_MISMATCH_CONSECUTIVE_SAMPLES` | `--inventory-mismatch-samples` | 2 | How many consecutive abnormal rounds trigger |
 | `GPU_FAULT_HOST_INTERVAL_SECONDS` | `--host-interval` | 15 | Host Collector period (seconds) |
@@ -10966,6 +10966,13 @@ fabricated as 0; the EFA inventory is still collected independently.
    `KubernetesNodeResourceCollector` additionally monitors `vpc.amazonaws.com/efa` and
    `nvidia.com/gpu` allocatable.
 2. The control plane isolates state by cluster, node and metric, generating a CRITICAL finding and incident.
+   Before grading a GPU mismatch it re-reads it against the instance-type table: a mistyped
+   `GPU_FAULT_EXPECTED_GPU_COUNT` while the node lists exactly the type's GPU count (and the
+   `/proc/driver/nvidia/gpus` bound count agrees or was not reported) produces no CRITICAL and no reboot but a
+   WARNING `gpu_expected_count_contradicted` (FREEZE_EVIDENCE only; the operator-review advisory names the
+   configured count, the type's count, the listed count and the bound count); correcting the setting and
+   restarting the collector clears the signal. A node really short of the type's count, a bound count that
+   disagrees with the listing, or a type outside the table is handled by the original rule.
 3. SES sends the email with the fixed `hardware-inventory-mismatch-zh-v1` template. The body contains the instance
    type, expected, ACTIVE, discovered, missing/excess, node, workload and workflow.
 4. A missing EFA PCI executes `RESTART_NODE`; an unbound driver executes
