@@ -117,6 +117,9 @@ TOOLS = (
     "modprobe",
     "lsblk",
     "nvidia-smi",
+    "nsenter",
+    "dnf",
+    "rpm",
 )
 MODULES = ("dm_mod", "dm_delay", "loop", "veth", "dummy", "sch_netem", "nfsv4")
 #: The exporter process a pause may stop: the dcgm-exporter binary of the

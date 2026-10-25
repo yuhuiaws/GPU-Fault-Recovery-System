@@ -332,58 +332,6 @@ def test_sustained_drops_inconclusive_if_counters_flat(tmp_path: Path) -> None:
         spec.execute(ctx)
 
 
-def test_tcp_only_passes_when_counters_stay_zero(tmp_path: Path) -> None:
-    spec = SPECS["tcp_only"]
-    oracle = {
-        "records": [
-            {"tcp_retransmits": 10 * i, "netdev": {IFA: {"tx_errors": 0}}}
-            for i in range(1, 12)
-        ],
-        "next_offset": 11,
-        "total": 11,
-    }
-    empty = {
-        "incidents": [],
-        "workflows": [],
-        "batches": [],
-        "markers": [],
-        "commands": [],
-        "health_signals": {},
-        "notifications": [],
-        "collector_statuses": [],
-    }
-    regional = FakeRegional(cpu_python=store_script({"activity": empty}))
-    ctx = make_context(
-        spec,
-        tmp_path=tmp_path,
-        regional=regional,
-        probes=probes(node_probe(survey(), oracle), net_probe(), window_probe()),
-    )
-    result = spec.execute(ctx)
-    assert result["verdict"] == "PASS", result["errors"]
-
-
-def test_tcp_only_inconclusive_if_nic_counters_move(tmp_path: Path) -> None:
-    spec = SPECS["tcp_only"]
-    oracle = {
-        "records": [
-            {"tcp_retransmits": 10 * i, "netdev": {IFA: {"tx_errors": i}}}
-            for i in range(1, 12)
-        ],
-        "next_offset": 11,
-        "total": 11,
-    }
-    regional = FakeRegional(cpu_python=store_script({"activity": {}}))
-    ctx = make_context(
-        spec,
-        tmp_path=tmp_path,
-        regional=regional,
-        probes=probes(node_probe(survey(), oracle), net_probe(), window_probe()),
-    )
-    with pytest.raises(VariantInconclusive):
-        spec.execute(ctx)
-
-
 def test_wrong_interface_binds_to_b(tmp_path: Path) -> None:
     spec = SPECS["wrong_interface"]
     regional = FakeRegional(cpu_python=store_script({"activity": drops_doc(IFC)}))

@@ -12,7 +12,9 @@ the product's validated restore. 009 ``network_errors_delta`` is WARNING
 (immediate) and ``network_drops_delta`` WARNING (60 s sustain), both
 VALIDATE_FABRIC. The oracle reads the sysfs counters itself; a drop generator
 that never moves the counters, or a ``tc netem`` flow that moves NIC counters,
-is INCONCLUSIVE rather than a native pass.
+is INCONCLUSIVE rather than a native pass. 009 ``tcp_only`` (its netns + netem
+fixture, the temporary ``tc`` dependency and its oracle) is
+``general_live_tcp.py``.
 """
 
 from __future__ import annotations
@@ -44,6 +46,7 @@ from scripts.e2e.regional.general_live_registry import (
     VariantSpec,
 )
 from scripts.e2e.regional.general_live_source_replay import host_source_replay
+from scripts.e2e.regional.general_live_tcp import PACKAGE_APPROVAL, tcp_only
 from scripts.e2e.regional.general_live_verdicts import (
     DIAGNOSTIC_ONLY_STATES,
     ChainExpectation,
@@ -385,49 +388,6 @@ def short_drops(ctx: VariantContext) -> dict[str, Any]:
         "no_finding": chain_errors(
             observed, ChainExpectation(metric="network_drops_delta", present=False)
         )
-    }
-    close_window(ctx)
-    ctx.cleanup.discard("collector-window")
-    return _result(stages)
-
-
-def tcp_only(ctx: VariantContext) -> dict[str, Any]:
-    survey = run_survey(ctx)
-    require_module(survey, "veth", ctx.settings.approvals)
-    require_module(survey, "sch_netem", ctx.settings.approvals)
-    require_tools(survey, "tc", "ip")
-    created = _veth(ctx)
-    a, b = created["a"], created["b"]
-    _declare_required(ctx, a, b)
-    started = utc_now()
-    oracle = Oracle(ctx, "net")
-    oracle.start(180, interval=5, netdev=[a, b], snmp=True)
-    # A TCP flow with netem loss raises RetransSegs but must not move the NIC
-    # error/drop counters; otherwise the experiment is INCONCLUSIVE, not a
-    # native proof that retransmits alone do not trip the hardware rules.
-    ctx.hold(120, name="tcp-flow")
-    oracle.read()
-    retrans = oracle_values(
-        oracle.records, lambda record: record.get("tcp_retransmits")
-    )
-    errors = oracle_values(
-        [record.get("netdev", {}).get(a, {}) for record in oracle.records],
-        lambda record: record.get("tx_errors"),
-    )
-    if not (retrans and max(retrans) > min(retrans)):
-        raise VariantInconclusive(
-            "TCP RetransSegs did not rise; the netem loss was ineffective"
-        )
-    if errors and max(errors) > min(errors):
-        raise VariantInconclusive(
-            "the NIC error counters moved; netem is not a hardware error"
-        )
-    observed = _watch_no_finding(ctx, started, "network_errors_delta", 180)
-    stages = {
-        "no_hardware_finding": chain_errors(
-            observed, ChainExpectation(metric="network_errors_delta", present=False)
-        ),
-        "hardware": hardware_errors(observed),
     }
     close_window(ctx)
     ctx.cleanup.discard("collector-window")
@@ -808,8 +768,10 @@ def _spec(
     outcome="PASS",
     gap="",
     approvals=(),
+    optional_approvals=(),
     proof=NATIVE,
     flags="S",
+    cleanup="restore the link/config; delete the test interfaces after closing the window",
 ) -> VariantSpec:
     return VariantSpec(
         case_id=case,
@@ -820,12 +782,13 @@ def _spec(
         flags=flags,
         injection=injection,
         expected=expected,
-        cleanup="restore the link/config; delete the test interfaces after closing the window",
+        cleanup=cleanup,
         max_minutes=max_minutes,
         execute=execute,
         expected_outcome=outcome,
         product_gap=gap,
         approvals=tuple(approvals),
+        optional_approvals=tuple(optional_approvals),
     )
 
 
@@ -942,12 +905,20 @@ VARIANTS = [
     _spec(
         CASE_009,
         "tcp_only",
-        "a TCP flow with tc netem loss 5 % in a test netns",
-        "RetransSegs rises and the NIC counters stay 0; no finding, no fabric hardware path",
+        "a bounded TCP flow from the host netns to a gfrs test netns over a gfrs "
+        "veth pair, tc netem loss 5 % on the host-side veth egress; tc/sch_netem "
+        "installed or loaded for this run only when missing",
+        "host RetransSegs rises while the test veth and every real interface "
+        "count no errors; the product collects tcp_retransmits_delta but mints no "
+        "finding: no NIC finding, no fabric hardware path, no isolation",
         tcp_only,
         risk="L",
-        max_minutes=12,
+        max_minutes=30,
         approvals=("KERNEL_MODULE_LOAD",),
+        optional_approvals=(PACKAGE_APPROVAL,),
+        cleanup="stop the flow, close the window, delete the qdisc/netns/veth; "
+        "unload sch_netem and dnf-remove the packages only if this run "
+        "loaded/installed them",
     ),
     _spec(
         CASE_009,
