@@ -20,9 +20,11 @@ import pytest
 from gpu_fault.hung_summary_codec import encode_summary
 from scripts.e2e.regional import general_live_nccl as nc
 from scripts.e2e.regional import general_live_nccl_fr as nf
+from scripts.e2e.regional import general_live_nccl_pair as pair
 from scripts.e2e.regional.general_live_fixture import VariantInconclusive
 from scripts.e2e.regional.general_live_nccl_job import STALL_MAX_SECONDS
 from scripts.e2e.regional.general_live_registry import build_registry, coverage_rows
+from scripts.e2e.regional.general_live_store import ACTIVITY_PROBE
 from tests.regional._general_live_fakes import (
     FakeProbe,
     FakeRegional,
@@ -30,7 +32,7 @@ from tests.regional._general_live_fakes import (
     make_settings,
 )
 
-SPECS = {spec.variant: spec for spec in nc.VARIANTS}
+SPECS = {spec.variant: spec for spec in (*nc.VARIANTS, *pair.VARIANTS)}
 NODE = "ip-10-0-43-5.us-west-2.compute.internal"
 PEER = "ip-10-0-43-6.us-west-2.compute.internal"
 CLEAN_SURVEY = {
@@ -335,9 +337,9 @@ def _window(rates: list[float], *, start: float = 1_000.0) -> list[dict[str, Any
 # --------------------------------------------------------------------------- #
 def test_registry_covers_every_011_variant() -> None:
     rows = coverage_rows()
-    build_registry([*nc.VARIANTS, *nf.VARIANTS], rows=rows, categories=[11])
-    everything = [*nc.VARIANTS, *nf.VARIANTS]
-    assert {s.variant for s in everything} == set(rows["GF-GENERAL-LIVE-011"])
+    variants = [*nc.VARIANTS, *nf.VARIANTS, *pair.VARIANTS]
+    build_registry(variants, rows=rows, categories=[11])
+    assert {s.variant for s in variants} == set(rows["GF-GENERAL-LIVE-011"])
     assert {s.variant for s in nf.VARIANTS} == {
         "few_candidates",
         "ambiguous_candidates",
@@ -347,7 +349,10 @@ def test_registry_covers_every_011_variant() -> None:
         "fr_whole_group",
         "fr_plus_process",
     }, "the FR module implements exactly the replayed forensics variants"
-    implemented = {s.variant for s in nc.VARIANTS if s.implemented}
+    assert [s.variant for s in pair.VARIANTS] == ["broken_pair"], (
+        "the pair module carries exactly the broken_pair entry"
+    )
+    implemented = {s.variant for s in [*nc.VARIANTS, *pair.VARIANTS] if s.implemented}
     assert implemented == {
         "active_to_zero",
         "always_low",
@@ -357,8 +362,14 @@ def test_registry_covers_every_011_variant() -> None:
         "fr_disabled",
         "simultaneous_nodes",
         "repeat_after_recovery",
+        "broken_pair",
     }
-    assert all(lane == "hp" for spec in nc.VARIANTS for lane in spec.lanes), (
+    pair_spec = SPECS["broken_pair"]
+    assert pair_spec.proof_mode == "live-replay", "broken_pair replays inside the unit"
+    assert pair_spec.approvals == ("HOST_SOURCE_REPLAY",), (
+        "broken_pair replays the pair inside the host collector under the token"
+    )
+    assert all(lane == "hp" for spec in variants for lane in spec.lanes), (
         "011 runs only on the HyperPod lane"
     )
     # Every deferred variant keeps an explicit NOT_RUN reason in the denominator.
@@ -915,3 +926,246 @@ def test_a_failed_first_episode_fails_without_a_second_stall(tmp_path: Path) -> 
     )
     job = FakeNcclJob.instances[-1]
     assert len(job.stall_times) == 1 and job.released == 1, "released, not repeated"
+
+
+# --------------------------------------------------------------------------- #
+# broken_pair: the pair broken inside the host collector around a real stall
+# --------------------------------------------------------------------------- #
+PAIR_DEV = "rdmap79s0"
+PAIR_DEST = f"/sys/class/infiniband/{PAIR_DEV}/ports/1/hw_counters/tx_bytes"
+PAIR_INVENTORY = {
+    "root": "/sys/class/infiniband",
+    "devices": {
+        PAIR_DEV: {
+            "driver": "efa",
+            "uevent_drivers": ["efa"],
+            "efa": True,
+            "netdevs": [],
+            "ports": {
+                "1": {
+                    "state": "4: ACTIVE",
+                    "phys_state": "5: LinkUp",
+                    "counters": {},
+                    "hw_counters": {
+                        "rx_bytes": "100",
+                        "tx_bytes": "200",
+                        "rx_drops": "0",
+                    },
+                }
+            },
+        }
+    },
+    "physical_netdevs": ["ens5"],
+    "ethtool": {"path": None, "statistics": {}},
+}
+
+
+def _pair_ctx(
+    tmp_path: Path,
+    *,
+    warn_after: float = 90.0,
+    warn_while_broken: bool = False,
+    warn_never: bool = False,
+    invalid: bool = True,
+) -> tuple[Any, FakeProbe, dict[str, Any]]:
+    spec = SPECS["broken_pair"]
+    state: dict[str, Any] = {}
+    ctx_box: dict[str, Any] = {}
+
+    def warning(created: datetime, node: str = NODE) -> dict[str, Any]:
+        return {
+            "incident_id": f"inc-warn-{node}",
+            "event_id": f"host-{node}-77{nc.WARNING_SUFFIX}",
+            "event_type": "NODE_HEALTH",
+            "state": "RECOVERED",
+            "node_ids": [node],
+            "reasons": [
+                "EFA/RDMA traffic remains at zero for an active training attempt"
+            ],
+            "workflow_request_id": "wf-warn",
+            "created_at": created.isoformat(),
+        }
+
+    def respond(script: str, *arguments: str) -> dict[str, Any]:
+        if script == ACTIVITY_PROBE:
+            samples = [
+                {
+                    "name": "efa_traffic_observation_valid",
+                    "device": None,
+                    "value": 0 if invalid else 1,
+                    "labels": {},
+                }
+            ]
+            errors = [
+                f"_rdma: HostObservationError: {PAIR_DEV}/1: incomplete traffic counter pair (invalid counter at {PAIR_DEST})"
+            ]
+            if not invalid:
+                samples.append(
+                    {
+                        "name": "efa_traffic_bytes_per_second",
+                        "device": None,
+                        "value": 0.0,
+                        "labels": {},
+                    }
+                )
+                errors = []
+            return {
+                "incidents": [],
+                "workflows": [],
+                "batches": [
+                    {
+                        "observed_at": "2026-10-24T00:05:00+00:00",
+                        "batch_id": "host-b1",
+                        "edge_filter_reasons": [],
+                        "collection_errors": errors,
+                        "samples": samples,
+                    }
+                ],
+                "markers": [],
+                "commands": [],
+                "health_signals": {},
+                "notifications": [],
+                "collector_statuses": [],
+                "metric_latest": [],
+            }
+        # The peer's pair is real and its zero is graded meanwhile: its own
+        # ZERO_WARNING is never this node's streak.
+        peer = [warning(ctx_box["ctx"].clock(), PEER)]
+        if warn_never:
+            return {"incidents": peer, "workflows": {}}
+        if "closed_at" in state:
+            return {
+                "incidents": [
+                    *peer,
+                    warning(state["closed_at"] + timedelta(seconds=warn_after)),
+                ],
+                "workflows": {},
+            }
+        if warn_while_broken:
+            return {
+                "incidents": [*peer, warning(ctx_box["ctx"].clock())],
+                "workflows": {},
+            }
+        return {"incidents": peer, "workflows": {}}
+
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=FakeRegional(cpu_python=respond),
+        probes={},
+        settings=_settings(spec, tmp_path),
+    )
+    ctx_box["ctx"] = ctx
+    start = datetime(2026, 10, 24, tzinfo=timezone.utc)
+    ticks = itertools.count()
+    ctx.clock = lambda: start + timedelta(seconds=15 * next(ticks))
+    ctx.probes[f"node@{NODE}"] = efa_probe(NODE, survey=True)  # type: ignore[assignment]
+    ctx.probes[f"node@{PEER}"] = efa_probe(PEER)  # type: ignore[assignment]
+
+    def close(_arguments: tuple[str, ...]) -> dict[str, Any]:
+        state["closed_at"] = ctx.clock()
+        return {"clean": True}
+
+    def read_source(arguments: tuple[str, ...]) -> dict[str, Any]:
+        view = {"readable": True, "value": "200", "device": "21"}
+        return {
+            "path": arguments[2],
+            "unit": view,
+            "host": dict(view),
+            "same": True,
+            "window_open": False,
+        }
+
+    source = FakeProbe(
+        {
+            "inventory": PAIR_INVENTORY,
+            "install-source": {"bytes": 7},
+            "open-window": {
+                "after": {"ActiveState": "active"},
+                "proof_scope": "live-replay",
+                "verification": {"ok": True},
+            },
+            "close-window": close,
+            "read-source": read_source,
+        }
+    )
+    ctx.probes[f"source-replay@{NODE}"] = source  # type: ignore[assignment]
+    return ctx, source, state
+
+
+def test_broken_pair_starts_the_streak_only_on_real_readings(tmp_path: Path) -> None:
+    ctx, source, state = _pair_ctx(tmp_path)
+    result = SPECS["broken_pair"].execute(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    assert (
+        result["proof_scope"] == "live-replay"
+        and result["target"]["counter"] == "tx_bytes"
+    )
+    assert ("install-source",) == source.calls[1][:1] and source.calls[1][
+        2
+    ] == "efa-tx-bytes"
+    opened = source.calls[2]
+    assert opened[0] == "open-window" and f"efa-tx-bytes:{PAIR_DEST}" in opened, opened
+    order = [call[0] for call in source.calls]
+    assert order.index("close-window") < order.index("read-source")
+    assert "closed_at" in state
+    job = FakeNcclJob.instances[-1]
+    assert job.stalled and job.released == 1, (
+        "the job was stalled while broken and released after"
+    )
+    assert result["stages"]["settled"] == [] and result["stages"]["resumed"] == []
+    ctx.cleanup.run()
+    assert ctx.cleanup.failed == []
+
+
+def test_broken_pair_fails_on_a_suspicion_while_broken(tmp_path: Path) -> None:
+    ctx, _source, _state = _pair_ctx(tmp_path, warn_while_broken=True)
+    result = SPECS["broken_pair"].execute(ctx)
+    assert result["verdict"] == "FAIL"
+    assert any("no_streak_while_broken" in error for error in result["errors"]), result[
+        "errors"
+    ]
+
+
+def test_broken_pair_fails_when_the_warning_comes_too_early_or_never(
+    tmp_path: Path,
+) -> None:
+    ctx, _source, _state = _pair_ctx(tmp_path, warn_after=20)
+    result = SPECS["broken_pair"].execute(ctx)
+    assert result["verdict"] == "FAIL"
+    assert any(
+        "warning_after_restore" in e and "streak began on the broken pair" in e
+        for e in result["errors"]
+    ), result["errors"]
+    ctx, _source, _state = _pair_ctx(tmp_path, warn_never=True)
+    result = SPECS["broken_pair"].execute(ctx)
+    assert result["verdict"] == "FAIL"
+    assert any("real zero was not graded" in error for error in result["errors"]), (
+        result["errors"]
+    )
+
+
+def test_broken_pair_fails_when_the_product_reads_the_broken_pair_as_a_rate(
+    tmp_path: Path,
+) -> None:
+    ctx, _source, _state = _pair_ctx(tmp_path, invalid=False)
+    result = SPECS["broken_pair"].execute(ctx)
+    assert result["verdict"] == "FAIL"
+    assert any("observation_invalid" in e for e in result["errors"]), result["errors"]
+    assert any("no_rate_from_broken_pair" in e for e in result["errors"]), result[
+        "errors"
+    ]
+
+
+def test_broken_pair_is_inconclusive_when_the_pair_keeps_moving(tmp_path: Path) -> None:
+    ctx, source, _state = _pair_ctx(tmp_path)
+    FakeNcclJob.traffic.stalled = ACTIVE_BPS
+    with pytest.raises(
+        VariantInconclusive, match="zero EFA traffic while the pair was broken"
+    ):
+        SPECS["broken_pair"].execute(ctx)
+    ctx.cleanup.run()
+    assert [call[0] for call in source.calls][-1] == "close-window", (
+        "the LIFO cleanup still closes the window"
+    )
+    assert ctx.cleanup.failed == []

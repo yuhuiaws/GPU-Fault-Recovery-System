@@ -1140,6 +1140,7 @@ def variant_spec(
     risk: str = "M",
     max_minutes: int = 65,
     proof: str = NATIVE,
+    approvals: tuple[str, ...] = (),
 ) -> VariantSpec:
     return VariantSpec(
         case_id=CASE,
@@ -1155,6 +1156,7 @@ def variant_spec(
             "confirm no node was isolated/stopped/reset"
         ),
         max_minutes=max_minutes,
+        approvals=approvals,
         execute=execute,
     )
 
@@ -1234,11 +1236,6 @@ VARIANTS = [
         " follows the first; nothing suppressed, merged or duplicated",
         repeat_after_recovery,
         max_minutes=120,
-    ),
-    _deferred(
-        "broken_pair",
-        "FIXTURE_NOT_READY: a broken RX/TX counter pair needs a sysfs hw_counters read fixture; it must read as an invalid observation, never zero",
-        "an incomplete counter pair is observation-invalid and does not start a zero streak",
     ),
     _deferred(
         "attempt_change",
