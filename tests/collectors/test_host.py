@@ -78,7 +78,10 @@ def test_host_collector_disk_latency_tcp_and_rdma_deltas(
     disk = collector._diskstats(later)
     tcp = collector._tcp(later)
 
-    assert next(item.value for item in disk if item.name == "disk_io_await_ms") == 4
+    # iostat's await: (30 - 20) ms reading + (50 - 40) ms writing over
+    # (15 - 10) + (25 - 20) completed I/Os. The weighted field (100 - 60 over
+    # the same 10 I/Os, 4 ms) is not a latency and is no longer what is shipped.
+    assert next(item.value for item in disk if item.name == "disk_io_await_ms") == 2
     assert tcp[0].name == "tcp_retransmits_delta"
     assert tcp[0].value == 3
 

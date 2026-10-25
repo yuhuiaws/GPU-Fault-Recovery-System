@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from gpu_fault.collectors.host import collector as host_module
+from gpu_fault.collectors.host import system_metrics
 from gpu_fault.collectors.host.system_metrics import BoundedStatvfs
 from gpu_fault.collectors.sinks import CollectorError
 from tests.collectors import _cov95_runtime_collect as common
@@ -117,6 +118,132 @@ def test_absent_mountinfo_and_short_diskstats_are_ignored(host_case):
     assert collector.collect_once().samples == []
     host_case.clock.sleep(1)
     assert collector.collect_once().samples == []
+
+
+def _diskstats_batches(host_case, snapshots, *, seconds=15):
+    """Collect one host batch per ``/proc/diskstats`` snapshot, ``seconds`` apart."""
+
+    collector = host_case.build("_diskstats")
+    batches = []
+    for index, snapshot in enumerate(snapshots):
+        if index:
+            host_case.clock.sleep(seconds)
+        support.write_file(host_case.roots.proc / "diskstats", snapshot)
+        batches.append(collector.collect_once())
+    return batches
+
+
+def test_disk_await_is_iostat_await_not_the_weighted_queue_time(host_case):
+    # Kernel fields behind "major minor name": 1 reads, 2 merged, 3 sectors,
+    # 4 ms reading, 5 writes, 6 merged, 7 sectors, 8 ms writing, 9 in flight,
+    # 10 ms doing I/O, 11 weighted ms, then 12-15 discards and 16-17 flushes on
+    # a 5.5+ kernel (``nvme0n1``) or nothing more on an older one (``sda``).
+    first, second = _diskstats_batches(
+        host_case,
+        [
+            "259 0 nvme0n1 1000 0 0 4000 2000 0 0 8000 3 9000 50000 10 0 0 100 5 20\n"
+            "8 0 sda 10 0 0 20 20 0 0 40 0 50 60\n",
+            "259 0 nvme0n1 1100 0 0 4600 2300 0 0 10000 3 13500 110000 10 0 0 100 5 20\n"
+            "8 0 sda 15 0 0 30 25 0 0 50 0 200 100\n",
+        ],
+    )
+    assert first.samples == []
+    # nvme0n1: (600 + 2000) ms over (100 + 300) completed reads and writes is
+    # iostat's await, 6.5 ms. The weighted field 11 grew by 60000 ms over the
+    # same 400 I/Os -- 150 ms, the quantity the collector used to report, which
+    # is the queue-length integral (iostat's aqu-sz numerator), not a latency.
+    # sda: 20 ms over 10 I/Os, from the 14-column layout.
+    assert support.values(second) == {
+        ("disk_io_util_percent", "nvme0n1"): 30.0,
+        ("disk_io_await_ms", "nvme0n1"): 6.5,
+        ("disk_io_util_percent", "sda"): 1.0,
+        ("disk_io_await_ms", "sda"): 2.0,
+    }
+    assert {sample.unit for sample in second.samples} == {"percent", "milliseconds"}
+
+
+def test_disk_counters_that_restart_are_rebaselined_not_rated(host_case):
+    # A dm mapping recreated under the same name (or a re-attached drive)
+    # restarts every counter at zero. The old history was slow (900 ms per
+    # I/O); the restarted device is fast (10 ms per I/O) but has already
+    # completed more I/Os than the old counter held. Clamping each delta to
+    # zero on its own rated this interval as 0 ms await and 0 % util -- a
+    # healthy-looking reading no request produced. The kernel asks readers to
+    # "detect and handle resets when comparing stat snapshots": the interval
+    # spanning the restart reports nothing and the next one rates the restarted
+    # counters from their new baseline.
+    before, restarted, after = _diskstats_batches(
+        host_case,
+        [
+            "253 0 dm-0 100 0 0 90000 100 0 0 90000 0 60000 180000\n",
+            "253 0 dm-0 300 0 0 3000 300 0 0 3000 0 6000 6000\n",
+            "253 0 dm-0 600 0 0 6000 600 0 0 6000 0 7500 12000\n",
+        ],
+    )
+    assert before.samples == []
+    assert restarted.samples == [], (
+        "the interval spanning a counter restart is not a rate"
+    )
+    assert support.values(after) == {
+        ("disk_io_util_percent", "dm-0"): 10.0,
+        ("disk_io_await_ms", "dm-0"): 10.0,
+    }
+
+
+def test_disk_await_needs_completed_io_while_util_does_not(host_case):
+    # A suspended device with writes outstanding (GF-GENERAL-LIVE-006
+    # zero_completed_io): the busy time keeps growing, nothing completes.
+    # util reads 100 %, and no await is fabricated from a zero denominator.
+    _, suspended = _diskstats_batches(
+        host_case,
+        [
+            "253 0 dm-0 10 0 0 20 20 0 0 40 2 50 60\n",
+            "253 0 dm-0 10 0 0 20 20 0 0 40 2 15050 90060\n",
+        ],
+    )
+    assert support.values(suspended) == {("disk_io_util_percent", "dm-0"): 100.0}
+
+
+def test_the_await_definition_cites_the_kernel_and_sysstat_verbatim():
+    # The metric's definition is vendor-documented policy: the URLs and the
+    # quoted sentences the code and the docs rest on are pinned here.
+    assert system_metrics.KERNEL_IOSTATS_REFERENCE == (
+        "https://docs.kernel.org/admin-guide/iostats.html"
+    )
+    assert system_metrics.KERNEL_IOSTATS_FIELDS == {
+        1: "# of reads completed",
+        4: "# of milliseconds spent reading",
+        5: "# of writes completed",
+        8: "# of milliseconds spent writing",
+        10: "# of milliseconds spent doing I/Os",
+        11: "weighted # of milliseconds spent doing I/Os",
+    }
+    assert system_metrics.KERNEL_IOSTATS_FIELD_11_QUOTE == (
+        "This field is incremented at each I/O start, I/O completion, I/O merge, "
+        "or read of these stats by the number of I/Os in progress (field 9) times "
+        "the number of milliseconds spent doing I/O since the last update of this "
+        "field. This can provide an easy measure of both I/O completion time and "
+        "the backlog that may be accumulating."
+    )
+    assert system_metrics.KERNEL_IOSTATS_RESET_QUOTE == (
+        "All fields are cumulative, monotonic counters, except for field 9, which "
+        "resets to zero as I/Os complete. The remaining fields reset at boot, on "
+        "device reattachment or reinitialization, or when the underlying counter "
+        "overflows. Applications reading these counters should detect and handle "
+        "resets when comparing stat snapshots."
+    )
+    assert system_metrics.SYSSTAT_IOSTAT_REFERENCE == (
+        "https://man7.org/linux/man-pages/man1/iostat.1.html"
+    )
+    assert system_metrics.SYSSTAT_IOSTAT_AWAIT_QUOTE == (
+        "The average time (in milliseconds) for I/O requests issued to the device "
+        "to be served. This includes the time spent by the requests in queue and "
+        "the time spent servicing them."
+    )
+    assert system_metrics.SYSSTAT_IOSTAT_AQU_SZ_QUOTE == (
+        "The average queue length of the requests that were issued to the device. "
+        "Note: In previous versions, this field was known as avgqu-sz."
+    )
 
 
 @pytest.mark.parametrize(

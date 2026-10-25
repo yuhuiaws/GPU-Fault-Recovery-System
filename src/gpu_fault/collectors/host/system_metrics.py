@@ -49,6 +49,67 @@ _NO_SMART_HEALTH = _SmartHealth(None, (), ())
 
 _NO_FILESYSTEM_WARNINGS: frozenset[str] = frozenset()
 
+# ``disk_io_await_ms`` is iostat's ``await``; its definition is vendor-documented
+# policy, so the sources are cited here verbatim and pinned by a test.
+#
+# Linux kernel, ``Documentation/admin-guide/iostats.rst``, section "I/O
+# statistics fields" (mainline text as rendered at docs.kernel.org, read
+# 2026-10-25). In ``/proc/diskstats`` the fields follow the major and minor
+# device numbers and the device name, so kernel field *n* is column ``n + 2``.
+KERNEL_IOSTATS_REFERENCE = "https://docs.kernel.org/admin-guide/iostats.html"
+#: The field headings the arithmetic below rests on, by kernel field number.
+KERNEL_IOSTATS_FIELDS: dict[int, str] = {
+    1: "# of reads completed",
+    4: "# of milliseconds spent reading",
+    5: "# of writes completed",
+    8: "# of milliseconds spent writing",
+    10: "# of milliseconds spent doing I/Os",
+    11: "weighted # of milliseconds spent doing I/Os",
+}
+#: Field 11, the column the collector divided by the completions before batch
+#: 172: an in-flight-count-weighted time (its rate is iostat's ``aqu-sz``), not
+#: a per-request time.
+KERNEL_IOSTATS_FIELD_11_QUOTE = (
+    "This field is incremented at each I/O start, I/O completion, I/O merge, "
+    "or read of these stats by the number of I/Os in progress (field 9) times "
+    "the number of milliseconds spent doing I/O since the last update of this "
+    "field. This can provide an easy measure of both I/O completion time and "
+    "the backlog that may be accumulating."
+)
+KERNEL_IOSTATS_RESET_QUOTE = (
+    "All fields are cumulative, monotonic counters, except for field 9, which "
+    "resets to zero as I/Os complete. The remaining fields reset at boot, on "
+    "device reattachment or reinitialization, or when the underlying counter "
+    "overflows. Applications reading these counters should detect and handle "
+    "resets when comparing stat snapshots."
+)
+# sysstat iostat(1), section "Device Utilization Report" (man7.org rendering of
+# the sysstat Git page dated AUGUST 2026; the sysstat 12.6.1 page carries the
+# same sentences). sysstat's ``iostat.c`` computes each await as the class's
+# request milliseconds over its completions in the interval
+# (``r_await = (rd_ticks - rd_ticks') / (rd_ios - rd_ios')``) and ``aqu-sz`` as
+# field 11's rate (``S_VALUE(rq_ticks', rq_ticks, itv) / 1000``).
+SYSSTAT_IOSTAT_REFERENCE = "https://man7.org/linux/man-pages/man1/iostat.1.html"
+SYSSTAT_IOSTAT_AWAIT_QUOTE = (
+    "The average time (in milliseconds) for I/O requests issued to the device "
+    "to be served. This includes the time spent by the requests in queue and "
+    "the time spent servicing them."
+)
+SYSSTAT_IOSTAT_AQU_SZ_QUOTE = (
+    "The average queue length of the requests that were issued to the device. "
+    "Note: In previous versions, this field was known as avgqu-sz."
+)
+#: The ``/proc/diskstats`` counters the collector rates, by kernel field number
+#: (``KERNEL_IOSTATS_FIELDS``). Field 9 (I/Os in progress) is the one field
+#: that is not monotonic, so it takes no part in the restart check.
+_DISK_COUNTER_FIELDS: dict[str, int] = {
+    "reads": 1,
+    "read_ms": 4,
+    "writes": 5,
+    "write_ms": 8,
+    "io_ms": 10,
+}
+
 
 class _SmartScan(NamedTuple):
     """What ``smartctl --scan-open`` could and could not enumerate.
@@ -662,6 +723,50 @@ class HostSystemMetricsMixin:
         return result
 
     def _diskstats(self, observed_at: datetime) -> list[HostMetricSample]:
+        """``disk_io_util_percent`` and ``disk_io_await_ms`` per block device.
+
+        ``disk_io_await_ms`` is iostat's ``await`` (``SYSSTAT_IOSTAT_REFERENCE``:
+        "The average time (in milliseconds) for I/O requests issued to the
+        device to be served. This includes the time spent by the requests in
+        queue and the time spent servicing them."): the request milliseconds
+        completed in the interval over the requests completed in it, which for
+        reads and writes together is ``/proc/diskstats`` kernel fields (4 + 8)
+        / (1 + 5) -- "# of milliseconds spent reading" plus "# of milliseconds
+        spent writing" over "# of reads completed" plus "# of writes completed"
+        (``KERNEL_IOSTATS_REFERENCE``, section "I/O statistics fields").
+
+        Until batch 172 the numerator was field 11, "weighted # of milliseconds
+        spent doing I/Os": the in-flight count integrated over time
+        (``KERNEL_IOSTATS_FIELD_11_QUOTE``), whose rate is iostat's ``aqu-sz``
+        (``SYSSTAT_IOSTAT_AQU_SZ_QUOTE``), not a per-request time. Under a
+        steady load the two ratios agree (Little's law: queue length = arrival
+        rate x time in system), so the 100 ms rule keeps its meaning; they
+        diverge whenever the backlog changes inside the interval, and 5.0+
+        kernels print field 11 as the summed request time of reads, writes,
+        discards and flushes (``block/genhd.c``, ``diskstats_show``), so an
+        fsync-heavy writer inflated the product's await with flush time that
+        no completed read or write accounts for -- the GF-GENERAL-LIVE-006
+        ``reference_iostat`` divergence.
+
+        Discards (fields 12-15) and flushes (16-17) stay out of the await on
+        purpose: they are what ``d_await``/``f_await`` report, the rule reads
+        the latency a job's reads and writes see, and the 14-column layout of
+        older kernels has no such fields. ``disk_io_util_percent`` keeps field
+        10 ("# of milliseconds spent doing I/Os"), which grows while a request
+        of any class is in flight.
+
+        Counter restarts: the fields "reset at boot, on device reattachment or
+        reinitialization, or when the underlying counter overflows", and
+        "Applications reading these counters should detect and handle resets
+        when comparing stat snapshots" (``KERNEL_IOSTATS_RESET_QUOTE``). A
+        device whose monotonic counters went backwards -- a dm mapping recreated
+        under the same name, a re-attached NVMe -- reports nothing for the
+        interval spanning the restart and is rated from the restarted baseline
+        on the next tick. Clamping each counter's delta to zero on its own, as
+        before, mixed a clamped numerator with a live denominator (or the
+        reverse) into an await of 0 ms, or of hundreds, that no request had.
+        """
+
         result = []
         for line in Path("/proc/diskstats").read_text().splitlines():
             fields = line.split()
@@ -670,37 +775,34 @@ class HostSystemMetricsMixin:
             device = fields[2]
             if device.startswith(("loop", "ram")):
                 continue
-            io_ms = float(fields[12])
-            completed_ios = float(fields[3]) + float(fields[7])
-            weighted_io_ms = float(fields[13])
-            change = self._delta(f"disk/{device}/io_ms", io_ms, observed_at)
-            if change and change[1] > 0:
-                result.append(
-                    self._sample(
-                        "disk_io_util_percent",
-                        min(
-                            100.0,
-                            100 * change[0] / (change[1] * 1000),
-                        ),
-                        "percent",
-                        device,
-                    )
+            restarted = False
+            deltas: dict[str, float] = {}
+            elapsed = 0.0
+            for name, field in _DISK_COUNTER_FIELDS.items():
+                key = f"disk/{device}/{name}"
+                value = float(fields[field + 2])
+                last = self._previous.get(key)
+                if last is not None and value < last[0]:
+                    restarted = True
+                change = self._delta(key, value, observed_at)
+                if change is not None:
+                    deltas[name], elapsed = change
+            if restarted or len(deltas) < len(_DISK_COUNTER_FIELDS) or elapsed <= 0:
+                continue
+            result.append(
+                self._sample(
+                    "disk_io_util_percent",
+                    min(100.0, 100 * deltas["io_ms"] / (elapsed * 1000)),
+                    "percent",
+                    device,
                 )
-            io_change = self._delta(
-                f"disk/{device}/completed_ios",
-                completed_ios,
-                observed_at,
             )
-            weighted_change = self._delta(
-                f"disk/{device}/weighted_io_ms",
-                weighted_io_ms,
-                observed_at,
-            )
-            if io_change and weighted_change and io_change[0] > 0:
+            completed = deltas["reads"] + deltas["writes"]
+            if completed > 0:
                 result.append(
                     self._sample(
                         "disk_io_await_ms",
-                        weighted_change[0] / io_change[0],
+                        (deltas["read_ms"] + deltas["write_ms"]) / completed,
                         "milliseconds",
                         device,
                     )
