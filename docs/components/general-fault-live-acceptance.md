@@ -800,11 +800,20 @@ INPUT REJECT 其 Node Agent 监听端口——执行器下发节点动作的通�
 plan 与 execute 必须给出同一组令牌）：`TEMP_TEST_PACKAGE_INSTALL`（临时测试包，共享步骤
 `general_live_deps.ensure_dependencies` 经 `general_live_deps_probe.py` 的审查允许表：009 `tcp_only`
 节点缺 `tc` 时为本次运行用 dnf 安装 `iproute-tc`，`sch_netem` 无法为运行内核加载时安装
-`kernel-modules-extra-$(uname -r)`；007 六个 SMART 回放变体缺 `smartctl` 时安装 `smartmontools`；
-004 `probe_error` 缺 `mkfs.vfat` 时安装 `dosfstools`。dnf 预演事务必须恰好只安装这些包，不得拉入
-内核、升级、降级、删除或其他依赖，否则 `NOT_RUN(FIXTURE_NOT_READY)`；采集器不为此重启（每个 tick
-重新查找工具）；清理与 deadman 只 dnf 卸载本次运行记录在案安装的包，且在用到该工具的夹具之后
-（LIFO）。不给该令牌时节点缺该工具仍记 `NOT_RUN(CAPABILITY_ABSENT)`，detail 指出令牌与包名。
+`kernel-modules-extra-$(uname -r)`；007 六个 SMART 回放变体缺 `smartctl` 时安装 `smartmontools`
+及其经审查的依赖闭包 `smartmontools-selinux`（探针的 `PACKAGE_CLOSURES`：smartmontools 的 rpm 声明富依赖
+`(smartmontools-selinux if selinux-policy-targeted)`，AL2023 节点装有 selinux-policy-targeted，dnf 必然
+一并拉入；该子包是同一源码构建的 noarch SELinux 策略模块包，脚本只以 200 优先级加载 `smartmon` 策略模块、
+对变化的文件上下文重贴标签，不运行任何进程；只接受预演中的 `Installing dependencies` 行且须与
+smartmontools 同版本）；004 `probe_error` 缺 `mkfs.vfat` 时安装 `dosfstools`。dnf 预演事务必须恰好只安装
+这些包（含声明的闭包），不得拉入内核、升级、降级、删除或闭包之外的任何依赖，否则 `NOT_RUN(FIXTURE_NOT_READY)`
+且 detail 点名多出的包（“dnf would also install the dependencies …”）；采集器不为此重启（每个 tick
+重新查找工具）；清理与 deadman 只 dnf 卸载本次运行记录在案安装的包，按安装顺序倒序逐包卸载（先
+smartmontools 后 smartmontools-selinux，每包单独预演、只许卸载该包；反序会级联卸载依赖者），且在用到
+该工具的夹具之后（LIFO）；安装带来的 `smartd.service`（AL2023 `90-default.preset` 会在安装时 enable 它）
+在安装后立即 disable（若 active 则 stop），残留检查证明两个包都已卸载、该单元既不 active 也不 enabled、
+200 优先级的 `smartmon` 策略模块已卸载。不给该令牌时节点缺该工具仍记 `NOT_RUN(CAPABILITY_ABSENT)`，detail
+指出令牌与包名（含闭包）。
 `ipmitool` 不在允许表内：015 由 shim（`--allow-missing-real`）回答，不需要真实工具；005 的
 `nfs-utils` 也不在（其事务拉入 rpcbind/libtirpc/gssproxy 等依赖，与“只装这一个包”规则冲突，放宽需
 另行审查）。
@@ -1137,12 +1146,15 @@ expected FAIL 变体却 PASS），这种底线之下的读数以及无样本可�
   采集错误、不记健康盘。包装器日志（`audit-read`）是“产品确实问过且规则已生效”的 oracle，
   否则 `INCONCLUSIVE`；每个变体关窗后都要读到真实 `smartctl` 的新鲜判定且无 `_smart` 错误。
   节点缺 `smartctl`（AL2023 EKS GPU AMI）时六个回放变体记 `NOT_RUN(CAPABILITY_ABSENT)` 并提示令牌；
-  给可选令牌 `TEMP_TEST_PACKAGE_INSTALL` 则先由共享临时测试包步骤只安装 `smartmontools`（会拉入其他
-  包的事务被拒为 `NOT_RUN(FIXTURE_NOT_READY)`）。采集器无需重启：`_smart` 每个 tick 都
+  给可选令牌 `TEMP_TEST_PACKAGE_INSTALL` 则先由共享临时测试包步骤只安装 `smartmontools` 及其审查依赖
+  `smartmontools-selinux`（AL2023 的 dnf 必然一并拉入的同构建 SELinux 策略模块包；拉入闭包之外任何包的
+  事务被拒为 `NOT_RUN(FIXTURE_NOT_READY)` 并点名该包）。采集器无需重启：`_smart` 每个 tick 都
   `shutil.which("smartctl")`，主机采集器单元不设自己的 PATH 且 `ProtectSystem=strict` 是实时 `/usr`
   的只读视图，下一个 tick 即扫描并判定各盘；运行器等待最多一个健康汇总加 6 个 tick 读到产品首个
   `smart_health_failed` 读数（`smart_devices(fresh=True)`）作为目标盘，之后开窗/关窗照常重启单元；
-  关窗后作为最后一步 LIFO 清理卸载该包，产品随后恢复上报 `smart_status_unsupported` TOOL_MISSING。
+  关窗后作为最后一步 LIFO 清理按安装倒序卸载这两个包（先 smartmontools 后 smartmontools-selinux），
+  残留检查证明两包已卸、`smartd.service` 既不 enabled 也不 active、策略模块已卸载，产品随后恢复上报
+  `smart_status_unsupported` TOOL_MISSING。
 - 015 BMC 的回放变体 `critical`/`nonrecoverable`/`wrong_column`/`unavailable_sensor`/
   `command_failure`（live-replay，模块 `general_live_bmc`，两条车道，需 `HOST_SOURCE_REPLAY`；
   `install-wrapper --allow-missing-real`：EC2 无 BMC 也无 `ipmitool`，shim 只按计划回答

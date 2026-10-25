@@ -185,15 +185,17 @@ APPROVALS: dict[str, str] = {
     "TEMP_TEST_PACKAGE_INSTALL": (
         "install, for this run only, a test package the node lacks with dnf, "
         "from the reviewed allow-list of general_live_deps_probe.py: iproute-tc "
-        "when tc is absent (009 tcp_only), smartmontools when smartctl is absent "
-        "(the 007 SMART replay variants), dosfstools when mkfs.vfat is absent "
+        "when tc is absent (009 tcp_only), smartmontools with its reviewed "
+        "dependency smartmontools-selinux when smartctl is absent (the 007 "
+        "SMART replay variants), dosfstools when mkfs.vfat is absent "
         "(004 probe_error), kernel-modules-extra-$(uname -r) (the running "
         "kernel's module package) when sch_netem cannot be loaded; refused "
         "unless the previewed dnf transaction installs exactly those packages "
-        "(no kernel, upgrade, downgrade, removal or other dependency); the "
+        "(no kernel, upgrade, downgrade, removal or undeclared dependency); the "
         "collectors are not restarted for it (they look a tool up every tick); "
         "cleanup and a deadman dnf-remove exactly the packages this run "
-        "installed and nothing else"
+        "installed, last installed first, and nothing else, and prove nothing "
+        "they brought (smartd.service, the SELinux module) stays active"
     ),
 }
 

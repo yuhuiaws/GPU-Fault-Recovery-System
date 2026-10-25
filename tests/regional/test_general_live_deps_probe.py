@@ -1,12 +1,15 @@
 """The temporary test package probe (TEMP_TEST_PACKAGE_INSTALL).
 
-A recording fake node stands in for dnf, rpm, modprobe and systemd: the tests
-prove the probe installs only what is missing (009 ``tc`` -> ``iproute-tc``,
-007 ``smartctl`` -> ``smartmontools``, 004 ``mkfs.vfat`` -> ``dosfstools``),
-refuses any dnf transaction that would pull more than the reviewed package for
-the running kernel, records what it installed and loaded before doing it, and
-that its cleanup (also the deadman's command) removes and unloads exactly that
--- never a package or a module the run found on the node.
+A recording fake node stands in for dnf, rpm, modprobe, systemd and semodule:
+the tests prove the probe installs only what is missing (009 ``tc`` ->
+``iproute-tc``, 007 ``smartctl`` -> ``smartmontools`` with its reviewed closure
+``smartmontools-selinux``, 004 ``mkfs.vfat`` -> ``dosfstools``), refuses any dnf
+transaction that would pull more than the reviewed packages for the running
+kernel (naming the unexpected ones), records what it installed, loaded and
+brought (the preset-enabled ``smartd.service``, the ``smartmon`` policy module)
+before doing it, quiets the unit at once, and that its cleanup (also the
+deadman's command) removes and unloads exactly that, last installed first --
+never a package, a module or a policy the run found on the node.
 """
 
 from __future__ import annotations
@@ -27,8 +30,19 @@ TC_ROW = ("iproute-tc", "x86_64", "5.10.0-2.amzn2023.0.5", "amazonlinux")
 TC_NEVRA = "iproute-tc-5.10.0-2.amzn2023.0.5.x86_64"
 KMOD_ROW = ("kernel-modules-extra", "x86_64", "6.1.100-100.100.amzn2023", "amazonlinux")
 KMOD_NEVRA = f"kernel-modules-extra-{KERNEL}"
-SMART_ROW = ("smartmontools", "x86_64", "1:7.3-1.amzn2023.0.2", "amazonlinux")
-SMART_NEVRA = "smartmontools-1:7.3-1.amzn2023.0.2.x86_64"
+#: The AL2023 build the live nodes previewed: smartmontools and, pulled by its
+#: rich dependency ``(smartmontools-selinux if selinux-policy-targeted)``, the
+#: same build's SELinux policy subpackage.
+SMART_ROW = ("smartmontools", "x86_64", "1:7.2-11.amzn2023.0.1", "amazonlinux")
+SMART_NEVRA = "smartmontools-1:7.2-11.amzn2023.0.1.x86_64"
+SELINUX_ROW = (
+    "smartmontools-selinux",
+    "noarch",
+    "1:7.2-11.amzn2023.0.1",
+    "amazonlinux",
+)
+SELINUX_NEVRA = "smartmontools-selinux-1:7.2-11.amzn2023.0.1.noarch"
+SMART_CLOSURE = [SELINUX_NEVRA, SMART_NEVRA]  # install order: the dependency first
 DOSFS_ROW = ("dosfstools", "x86_64", "4.2-3.amzn2023.0.2", "amazonlinux")
 DOSFS_NEVRA = "dosfstools-4.2-3.amzn2023.0.2.x86_64"
 #: Packages the node already has: the probe must never touch them.
@@ -93,11 +107,31 @@ class FakeNode:
         self.loadable = set(loadable)
         #: The package whose install makes the module loadable.
         self.module_files_from = module_files_from
-        self.repo = {row[0]: row for row in (TC_ROW, KMOD_ROW, SMART_ROW, DOSFS_ROW)}
+        self.repo = {
+            row[0]: row for row in (TC_ROW, KMOD_ROW, SMART_ROW, SELINUX_ROW, DOSFS_ROW)
+        }
         self.install_preview: dict[str, list[tuple[str, str, str, str]]] | None = None
         self.remove_preview: dict[str, list[tuple[str, str, str, str]]] | None = None
         self.unmatched: list[str] = []
         self.next_tid = 2000
+        #: Units with a unit file, as ``systemctl show`` reports them.
+        self.units: dict[str, dict[str, bool]] = {}
+        #: ``semodule --list-modules=full`` rows; the base selinux-policy-targeted
+        #: ships a ``smartmon`` module at priority 100 on every AL2023 node.
+        self.selinux_modules: set[str] = {"100 smartmon"}
+        #: Footprint knobs: the install also starts the daemon; the unit cannot
+        #: be disabled; the subpackage's %postun leaves its policy module behind.
+        self.start_units_on_install = False
+        self.undisableable = False
+        self.sticky_selinux = False
+        if self.has("smartmontools"):
+            self.units["smartd.service"] = {
+                "loaded": True,
+                "active": False,
+                "enabled": True,
+            }
+        if self.has("smartmontools-selinux"):
+            self.selinux_modules.add("200 smartmon")
 
     @staticmethod
     def _record(name: str, version: str, release: str, tid: str) -> dict[str, str]:
@@ -107,11 +141,21 @@ class FakeNode:
         (self.sys_module / name).mkdir(exist_ok=True)
         (self.sys_module / name / "refcnt").write_text("0\n")
 
+    def has(self, package: str) -> bool:
+        return any(item["name"] == package for item in self.packages.values())
+
     def tool(self, name: str) -> bool:
         package = deps.TOOL_PACKAGES.get(name)
         if package is not None:
-            return any(item["name"] == package for item in self.packages.values())
-        return name in {"dnf", "rpm", "modprobe", "systemd-run", "systemctl"}
+            return self.has(package)
+        return name in {
+            "dnf",
+            "rpm",
+            "modprobe",
+            "systemd-run",
+            "systemctl",
+            "semodule",
+        }
 
     def _done(
         self, command: list[str], code: int = 0, stdout: str = "", stderr: str = ""
@@ -119,11 +163,37 @@ class FakeNode:
         return subprocess.CompletedProcess(command, code, stdout=stdout, stderr=stderr)
 
     def _rows(self, specs: list[str]) -> dict[str, list[tuple[str, str, str, str]]]:
-        rows = []
+        """dnf's preview for ``specs`` on this node: AL2023 pulls the
+        smartmontools-selinux subpackage with smartmontools unless it is there."""
+
+        rows, dependencies = [], []
         for spec in specs:
             name = "kernel-modules-extra" if spec.startswith("kernel-modules") else spec
             rows.append(self.repo[name])
-        return {"Installing": rows}
+            if name == "smartmontools" and not self.has("smartmontools-selinux"):
+                dependencies.append(SELINUX_ROW)
+        plan = {"Installing": rows}
+        if dependencies:
+            plan["Installing dependencies"] = dependencies
+        return plan
+
+    def _scriptlets(self, name: str, *, installed: bool) -> None:
+        """What the AL2023 rpm scriptlets of the footprint packages do."""
+
+        if name == "smartmontools":
+            if installed:  # %post: systemd-update-helper install-system-units -> preset
+                self.units["smartd.service"] = {
+                    "loaded": True,
+                    "active": self.start_units_on_install,
+                    "enabled": True,
+                }
+            else:  # %preun: remove-system-units -> disable --now; the unit file goes
+                self.units.pop("smartd.service", None)
+        if name == "smartmontools-selinux":
+            if installed:  # %post: semodule -X 200 -i smartmon.pp.bz2
+                self.selinux_modules.add("200 smartmon")
+            elif not self.sticky_selinux:  # %postun: semodule -X 200 -r smartmon
+                self.selinux_modules.discard("200 smartmon")
 
     def dnf_command(self, command: list[str]) -> subprocess.CompletedProcess[str]:
         verb = "install" if "install" in command else "remove"
@@ -159,12 +229,37 @@ class FakeNode:
                     if item == f"{name}-{version}.{arch}":
                         number, release = version.split("-", 1)
                         self.packages[item] = self._record(name, number, release, tid)
+                        self._scriptlets(name, installed=True)
                 if self.module_files_from and item.startswith(self.module_files_from):
                     self.loadable.add("sch_netem")
             return self._done(command, 0, "Complete!\n")
         for item in targets:
-            self.packages.pop(item, None)
+            info = self.packages.pop(item, None)
+            if info is not None:
+                self._scriptlets(info["name"], installed=False)
         return self._done(command, 0, "Complete!\n")
+
+    def systemctl(self, command: list[str]) -> subprocess.CompletedProcess[str]:
+        action, unit = command[1], command[2]
+        if action == "show":
+            if unit in self.units:
+                state = self.units[unit]
+                text = (
+                    "LoadState=loaded\n"
+                    f"ActiveState={'active' if state['active'] else 'inactive'}\n"
+                    f"UnitFileState={'enabled' if state['enabled'] else 'disabled'}\n"
+                    "MainPID=0\n"
+                )
+            elif "pdeadman" in unit:
+                text = "LoadState=loaded\nActiveState=active\nMainPID=0\n"
+            else:
+                text = "LoadState=not-found\nActiveState=inactive\nUnitFileState=\nMainPID=0\n"
+            return self._done(command, 0, text)
+        if action == "stop" and unit in self.units:
+            self.units[unit]["active"] = False
+        if action == "disable" and unit in self.units and not self.undisableable:
+            self.units[unit]["enabled"] = False
+        return self._done(command)
 
     def run(self, command: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
         self.calls.append(list(command))
@@ -195,8 +290,11 @@ class FakeNode:
             return self._done(
                 command, 1, stderr=f"modprobe: FATAL: Module {name} not found"
             )
-        if head == "systemctl" and command[1] == "show":
-            return self._done(command, 0, "ActiveState=active\nMainPID=0\n")
+        if head == "systemctl":
+            return self.systemctl(command)
+        if head == "semodule":
+            rows = "".join(f"{row}   pp\n" for row in sorted(self.selinux_modules))
+            return self._done(command, 0, rows)
         return self._done(command)
 
     def ran(self, *prefix: str) -> list[list[str]]:
@@ -330,14 +428,14 @@ def test_ensure_without_install_approval_keeps_capability_absent(node_factory) -
                     ("libbpf", "x86_64", "2:0.5.0-1.amzn2023", "amazonlinux")
                 ],
             },
-            "installing dependencies libbpf-2:0.5.0-1.amzn2023.x86_64",
+            "install the dependencies libbpf-2:0.5.0-1.amzn2023.x86_64",
         ),
         (
             {
                 "Installing": [TC_ROW],
                 "Upgrading": [("iproute", "x86_64", "6.5.0-1.amzn2023", "amazonlinux")],
             },
-            "upgrading iproute-6.5.0-1.amzn2023.x86_64",
+            "upgrade iproute-6.5.0-1.amzn2023.x86_64",
         ),
         (
             {
@@ -353,9 +451,9 @@ def test_ensure_without_install_approval_keeps_capability_absent(node_factory) -
                 "Installing": [TC_ROW],
                 "Removing": [("bash", "x86_64", "5.2.15-1.amzn2023.0.2", "@System")],
             },
-            "removing bash",
+            "remove bash",
         ),
-        ({"Installing": [TC_ROW, ("x", "y", "z", "w")]}, "installing x-z.y"),
+        ({"Installing": [TC_ROW, ("x", "y", "z", "w")]}, "install x-z.y"),
     ],
 )
 def test_ensure_refuses_a_transaction_beyond_the_package(
@@ -388,7 +486,7 @@ def test_ensure_refuses_an_unreadable_or_obsoleting_plan(node_factory) -> None:
 
     node.dnf_command = obsoleting
     deps.ensure(ensure_args())
-    assert "replacing iproute.x86_64" in emitted[-1]["refused"]["detail"]
+    assert "replace iproute.x86_64" in emitted[-1]["refused"]["detail"]
     assert not node.ran("dnf", "-y"), "not node.ran('dnf', '-y')"
 
 
@@ -430,6 +528,17 @@ def test_install_records_only_its_own_rpm_transaction() -> None:
     ours, problems = deps.installed_by_run(before, extra, [TC_NEVRA])
     assert ours == [TC_NEVRA, "libbpf-1-1.x86_64"]
     assert problems == ["dnf installed more than previewed: libbpf-1-1.x86_64"]
+
+
+def test_install_records_the_closure_in_install_order() -> None:
+    after = {
+        SMART_NEVRA: {"name": "smartmontools", "tid": "7"},
+        SELINUX_NEVRA: {"name": "smartmontools-selinux", "tid": "7"},
+    }
+    ours, problems = deps.installed_by_run({}, after, SMART_CLOSURE)
+    assert (ours, problems) == (SMART_CLOSURE, []), (
+        "the dependency before its package, as rpm installed them -- not sorted"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -503,7 +612,7 @@ def test_cleanup_refuses_a_cascading_removal(node_factory) -> None:
     deps.cleanup(argparse.Namespace(run_id=RUN_ID))
     result = emitted[-1]
     assert result["clean"] is False, result
-    assert "removing dependent packages netplug" in result["report"]["errors"][0]
+    assert "remove the dependent packages netplug" in result["report"]["errors"][0]
     assert not node.ran("dnf", "-y", *deps.DNF_REMOVE_OPTIONS), (
         "a removal that takes more than this run's package never runs"
     )
@@ -550,7 +659,7 @@ def test_ensure_rejects_a_tool_outside_the_allow_list(node_factory) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# the 007 / 004 packages: the same mechanism, one package each
+# the 007 / 004 packages: the same mechanism; 007's package has a reviewed closure
 # --------------------------------------------------------------------------- #
 def test_the_allow_list_names_the_al2023_package_of_each_tool() -> None:
     assert deps.TOOL_PACKAGES == {
@@ -558,45 +667,91 @@ def test_the_allow_list_names_the_al2023_package_of_each_tool() -> None:
         "smartctl": "smartmontools",
         "mkfs.vfat": "dosfstools",
     }
+    assert deps.PACKAGE_CLOSURES == {"smartmontools": ("smartmontools-selinux",)}, (
+        "the one reviewed closure: AL2023's rich dependency "
+        "(smartmontools-selinux if selinux-policy-targeted)"
+    )
+    assert deps.PACKAGE_FOOTPRINT == {
+        "smartmontools": {"units": ("smartd.service",)},
+        "smartmontools-selinux": {"selinux_modules": ("200 smartmon",)},
+    }, "the preset-enabled unit and the priority-200 policy module, never the base one"
     assert "ipmitool" not in deps.TOOL_PACKAGES, (
         "015 serves ipmitool from the wrapper (allow_missing_real); no package"
     )
 
 
 @pytest.mark.parametrize(
-    ("tool", "package", "nevra"),
+    ("tool", "package", "nevras"),
     [
-        ("smartctl", "smartmontools", SMART_NEVRA),
-        ("mkfs.vfat", "dosfstools", DOSFS_NEVRA),
+        ("smartctl", "smartmontools", SMART_CLOSURE),
+        ("mkfs.vfat", "dosfstools", [DOSFS_NEVRA]),
     ],
 )
-def test_ensure_installs_exactly_the_tools_package_and_cleanup_removes_it(
-    node_factory, tool: str, package: str, nevra: str
+def test_ensure_installs_the_tools_package_with_its_closure_and_cleanup_removes_them(
+    node_factory, tool: str, package: str, nevras: list[str]
 ) -> None:
+    """``nevras`` is the install order: a reviewed dependency before its package."""
+
     node, emitted = node_factory()
     deps.ensure(ensure_args(tool=[tool], module=[]))
     result = emitted[-1]
     assert result["refused"] is None, result
-    assert result["installed"] == [nevra]
+    assert result["installed"] == nevras
     assert result["tools"] == {tool: True}
     assert result["modules_loaded_by_run"] == [] and result["modules"] == {}
     preview, install = node.ran("dnf", "--assumeno"), node.ran("dnf", "-y")
     assert preview[0][-2:] == ["install", package], preview
-    assert install[0][-2:] == ["install", nevra], install
+    assert install == [["dnf", "-y", *deps.DNF_INSTALL_OPTIONS, "install", *nevras]]
     assert result["deadman"] == deps.deadman_unit(RUN_ID)
-    assert recorded()["installed"] == [nevra] and recorded()["pending"] == []
+    assert recorded()["installed"] == nevras and recorded()["pending"] == []
     assert node.tool(tool) is True, "the tool is usable after the install"
 
     emitted.clear()
+    node.calls.clear()
     deps.cleanup(argparse.Namespace(run_id=RUN_ID))
     report = emitted[-1]
     assert report["clean"] is True, report
-    assert report["report"]["removed"] == [nevra]
-    remove = node.ran("dnf", "-y", *deps.DNF_REMOVE_OPTIONS, "remove")
-    assert remove == [["dnf", "-y", *deps.DNF_REMOVE_OPTIONS, "remove", nevra]]
+    # Last installed first: the package before its dependency, each through its
+    # own previewed transaction that may remove exactly that one package.
+    assert report["report"]["removed"] == list(reversed(nevras))
+    expected = []
+    for nevra in reversed(nevras):
+        expected.append(
+            ["dnf", "--assumeno", *deps.DNF_REMOVE_OPTIONS, "remove", nevra]
+        )
+        expected.append(["dnf", "-y", *deps.DNF_REMOVE_OPTIONS, "remove", nevra])
+    assert node.ran("dnf") == expected
     assert node.tool(tool) is False, "the package this run installed is gone"
     assert set(node.packages) == set(BASELINE), "the node's own packages stay"
     assert recorded()["installed"] == []
+    assert report["residue"] == {
+        "packages": [],
+        "modules": [],
+        "units": [],
+        "selinux_modules": [],
+    }, "the residue proves every package gone and nothing they brought left"
+
+
+def test_the_live_smartmontools_preview_is_accepted_with_its_closure(
+    node_factory,
+) -> None:
+    """The transaction both AL2023 kernels previewed live: ``Installing``
+    smartmontools, ``Installing dependencies`` smartmontools-selinux, same build."""
+
+    node, emitted = node_factory()
+    node.install_preview = {
+        "Installing": [SMART_ROW],
+        "Installing dependencies": [SELINUX_ROW],
+    }
+    deps.ensure(ensure_args(tool=["smartctl"], module=[]))
+    result = emitted[-1]
+    assert result["refused"] is None, result
+    assert [(row["section"], row["name"]) for row in result["transaction"]] == [
+        ("Installing", "smartmontools"),
+        ("Installing dependencies", "smartmontools-selinux"),
+    ], "the evidence keeps dnf's table as printed"
+    assert result["installed"] == SMART_CLOSURE
+    assert "would also installing" not in json.dumps(emitted), "the old grammar is gone"
 
 
 def test_ensure_without_the_approval_names_the_tools_package(node_factory) -> None:
@@ -605,26 +760,217 @@ def test_ensure_without_the_approval_names_the_tools_package(node_factory) -> No
     refused = emitted[-1]["refused"]
     assert refused["reason"] == "CAPABILITY_ABSENT", refused
     assert refused["detail"] == (
-        "the node lacks smartctl; installing smartmontools needs "
-        "TEMP_TEST_PACKAGE_INSTALL"
+        "the node lacks smartctl; installing smartmontools with its reviewed "
+        "dependency smartmontools-selinux needs TEMP_TEST_PACKAGE_INSTALL"
     )
     assert not node.ran("dnf") and not node.ran("systemd-run")
 
 
-def test_ensure_refuses_a_dependency_pulled_by_the_tools_package(node_factory) -> None:
+@pytest.mark.parametrize("with_closure_row", [True, False])
+def test_ensure_refuses_an_undeclared_dependency_naming_only_that(
+    node_factory, with_closure_row: bool
+) -> None:
+    node, emitted = node_factory()
+    mailx = ("mailx", "x86_64", "12.5-30.amzn2023", "amazonlinux")
+    node.install_preview = {
+        "Installing": [SMART_ROW],
+        "Installing dependencies": [SELINUX_ROW, mailx]
+        if with_closure_row
+        else [mailx],
+    }
+    deps.ensure(ensure_args(tool=["smartctl"], module=[]))
+    refused = emitted[-1]["refused"]
+    assert refused["reason"] == "FIXTURE_NOT_READY", refused
+    assert refused["detail"] == (
+        "dnf would also install the dependencies mailx-12.5-30.amzn2023.x86_64 "
+        "(only smartmontools with its reviewed dependency smartmontools-selinux "
+        "may be installed)"
+    ), "the unexpected package is named; the accepted closure never is"
+    assert not node.ran("dnf", "-y"), "a refused transaction never runs"
+    assert not node.ran("systemd-run"), "nothing changed, so no deadman"
+    assert recorded()["installed"] == [] and recorded()["pending"] == []
+    assert emitted[-1]["transaction"][0]["name"] == "smartmontools"
+
+
+def test_ensure_refuses_a_closure_package_from_another_build(node_factory) -> None:
     node, emitted = node_factory()
     node.install_preview = {
         "Installing": [SMART_ROW],
         "Installing dependencies": [
-            ("mailx", "x86_64", "12.5-30.amzn2023", "amazonlinux")
+            ("smartmontools-selinux", "noarch", "1:7.2-10.amzn2023.0.1", "amazonlinux")
         ],
     }
     deps.ensure(ensure_args(tool=["smartctl"], module=[]))
     refused = emitted[-1]["refused"]
     assert refused["reason"] == "FIXTURE_NOT_READY", refused
-    assert "installing dependencies mailx-12.5-30.amzn2023.x86_64" in refused["detail"]
+    assert refused["detail"] == (
+        "dnf would install smartmontools-selinux-1:7.2-10.amzn2023.0.1.noarch, not "
+        "the build of smartmontools-1:7.2-11.amzn2023.0.1"
+    )
     assert not node.ran("dnf", "-y"), "a refused transaction never runs"
-    assert emitted[-1]["transaction"][0]["name"] == "smartmontools"
+
+
+def test_a_closure_package_the_node_already_has_is_never_touched(node_factory) -> None:
+    node, emitted = node_factory(
+        installed={
+            **BASELINE,
+            SELINUX_NEVRA: ("smartmontools-selinux", "1:7.2", "11.amzn2023.0.1"),
+        }
+    )
+    deps.ensure(ensure_args(tool=["smartctl"], module=[]))
+    result = emitted[-1]
+    assert result["refused"] is None, result
+    assert result["installed"] == [SMART_NEVRA], "dnf pulled nothing: the node had it"
+    assert result["footprint"]["claimed"] == {
+        "units": ["smartd.service"],
+        "selinux_modules": [],
+    }, "the node's own policy module is not this run's"
+    deps.cleanup(argparse.Namespace(run_id=RUN_ID))
+    assert emitted[-1]["clean"] is True, emitted[-1]
+    assert emitted[-1]["report"]["removed"] == [SMART_NEVRA]
+    assert SELINUX_NEVRA in node.packages, "the node's smartmontools-selinux stays"
+    assert "200 smartmon" in node.selinux_modules, "and so does its policy module"
+
+
+# --------------------------------------------------------------------------- #
+# what the closure brings beyond its files: smartd.service, the smartmon policy
+# --------------------------------------------------------------------------- #
+def test_the_install_quiets_the_preset_enabled_smartd_and_claims_the_policy(
+    node_factory,
+) -> None:
+    """AL2023's 90-default.preset enables smartd.service when smartmontools's
+    %post presets it; the fixture needs smartctl, never the daemon."""
+
+    node, emitted = node_factory()
+    deps.ensure(ensure_args(tool=["smartctl"], module=[]))
+    result = emitted[-1]
+    assert result["refused"] is None, result
+    footprint = result["footprint"]
+    assert footprint["before"] == {
+        "units": {
+            "smartd.service": {"loaded": False, "active": False, "enabled": False}
+        },
+        "selinux_modules": {"200 smartmon": False},
+    }
+    assert footprint["after"] == {
+        "units": {
+            "smartd.service": {"loaded": True, "active": False, "enabled": False}
+        },
+        "selinux_modules": {"200 smartmon": True},
+    }, "disabled again right after the install; the policy stays until cleanup"
+    assert footprint["quieted"] == ["smartd.service"]
+    assert footprint["claimed"] == {
+        "units": ["smartd.service"],
+        "selinux_modules": ["200 smartmon"],
+    }
+    assert node.ran("systemctl", "disable") == [
+        ["systemctl", "disable", "smartd.service"]
+    ]
+    assert node.ran("systemctl", "stop", "smartd.service") == [], "inactive: no stop"
+    assert node.units["smartd.service"]["enabled"] is False
+    assert recorded()["units"] == ["smartd.service"]
+    assert recorded()["selinux_modules"] == ["200 smartmon"]
+
+
+def test_a_daemon_the_install_started_is_stopped_at_once(node_factory) -> None:
+    node, emitted = node_factory()
+    node.start_units_on_install = True
+    deps.ensure(ensure_args(tool=["smartctl"], module=[]))
+    result = emitted[-1]
+    assert result["refused"] is None, result
+    assert node.ran("systemctl", "stop", "smartd.service") == [
+        ["systemctl", "stop", "smartd.service"]
+    ]
+    assert result["footprint"]["after"]["units"]["smartd.service"] == {
+        "loaded": True,
+        "active": False,
+        "enabled": False,
+    }
+
+
+def test_a_unit_that_cannot_be_quieted_refuses_the_variant(node_factory) -> None:
+    node, emitted = node_factory()
+    node.undisableable = True
+    deps.ensure(ensure_args(tool=["smartctl"], module=[]))
+    result = emitted[-1]
+    assert result["refused"] == {
+        "reason": "FIXTURE_NOT_READY",
+        "detail": "smartd.service is still enabled after the install",
+    }
+    # The packages are on the node: recorded and under the deadman, so the
+    # registered cleanup removes them.
+    assert recorded()["installed"] == SMART_CLOSURE
+    assert result["deadman"] == deps.deadman_unit(RUN_ID)
+
+
+def test_cleanup_quiets_a_daemon_started_meanwhile_before_the_packages_go(
+    node_factory,
+) -> None:
+    node, emitted = node_factory()
+    deps.ensure(ensure_args(tool=["smartctl"], module=[]))
+    node.units["smartd.service"]["active"] = True  # started during the run
+    node.calls.clear()
+    deps.cleanup(argparse.Namespace(run_id=RUN_ID))
+    result = emitted[-1]
+    assert result["clean"] is True, result
+    assert result["report"]["quieted"] == ["smartd.service"]
+    stop = node.calls.index(["systemctl", "stop", "smartd.service"])
+    removal = next(i for i, call in enumerate(node.calls) if call[:2] == ["dnf", "-y"])
+    assert stop < removal, "the daemon is stopped before its package goes"
+    assert "smartd.service" not in node.units, "the unit file went with the package"
+
+
+def test_cleanup_reports_a_policy_module_the_removal_left_behind(node_factory) -> None:
+    node, emitted = node_factory()
+    deps.ensure(ensure_args(tool=["smartctl"], module=[]))
+    node.sticky_selinux = True
+    node.calls.clear()
+    deps.cleanup(argparse.Namespace(run_id=RUN_ID))
+    result = emitted[-1]
+    assert result["clean"] is False, result
+    assert result["residue"] == {
+        "packages": [],
+        "modules": [],
+        "units": [],
+        "selinux_modules": ["200 smartmon"],
+    }
+    assert result["report"]["removed"] == [SMART_NEVRA, SELINUX_NEVRA], "both went"
+    assert not node.ran(
+        "systemctl", "stop", f"gfrs-{deps.run_digest(RUN_ID)}-pdeadman.timer"
+    ), "an unfinished cleanup leaves the deadman armed"
+
+
+def test_residue_reads_a_record_from_before_the_footprint_keys(node_factory) -> None:
+    node_factory()
+    deps.save_state(
+        RUN_ID, {"run_id": RUN_ID, "installed": [], "pending": [], "modules": []}
+    )
+    assert deps.residue(RUN_ID) == {
+        "packages": [],
+        "modules": [],
+        "units": [],
+        "selinux_modules": [],
+    }
+
+
+@pytest.mark.parametrize(
+    ("section", "phrase"),
+    [
+        ("Installing", "install"),
+        ("Installing dependencies", "install the dependencies"),
+        ("Installing weak dependencies", "install the weak dependencies"),
+        ("Upgrading", "upgrade"),
+        ("Downgrading", "downgrade"),
+        ("Removing", "remove"),
+        ("Removing dependent packages", "remove the dependent packages"),
+        ("Removing unused dependencies", "remove the unused dependencies"),
+        ("Replacing", "replace"),
+        ("Skipping packages with conflicts", "skip the packages with conflicts"),
+        ("Frobnicating", "frobnicating"),
+    ],
+)
+def test_a_refusal_reads_as_what_dnf_would_do(section: str, phrase: str) -> None:
+    assert deps.section_phrase(section) == phrase
 
 
 def test_ensure_touches_nothing_when_the_tool_is_there(node_factory) -> None:

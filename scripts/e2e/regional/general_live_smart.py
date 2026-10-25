@@ -28,8 +28,11 @@ closes its window and proves the real tool answers again before it ends;
 A node without ``smartctl`` (the AL2023 EKS GPU AMI) keeps the six replay
 variants NOT_RUN(CAPABILITY_ABSENT) unless ``TEMP_TEST_PACKAGE_INSTALL`` is
 given; then the shared temporary-package step (``general_live_deps``) installs
-exactly ``smartmontools`` for this run before anything else and removes it as
-the last LIFO cleanup, after the window closed. No collector restart is needed
+exactly ``smartmontools`` and its reviewed dependency ``smartmontools-selinux``
+(the same build's SELinux policy module, which AL2023's
+``selinux-policy-targeted`` makes dnf pull) for this run before anything else
+and removes both as the last LIFO cleanup, ``smartmontools`` first, after the
+window closed. No collector restart is needed
 for the install: ``_smart`` runs ``shutil.which("smartctl")`` on every tick and
 the unit's ``ProtectSystem=strict`` is a read-only view of the live ``/usr``,
 so the next tick scans and grades the drives; the runner then waits up to one
@@ -195,9 +198,11 @@ def ensure_smartctl(ctx: VariantContext, survey: dict[str, Any]) -> dict[str, An
 
     The shared temporary-package step: NOT_RUN(CAPABILITY_ABSENT) naming the
     token without ``TEMP_TEST_PACKAGE_INSTALL``; with it the probe installs
-    exactly ``smartmontools`` (a transaction pulling anything else is refused)
-    and its removal is the last LIFO cleanup, after the window closed. The
-    package deadman is timed after the window's restore deadman.
+    exactly ``smartmontools`` with its reviewed dependency
+    ``smartmontools-selinux`` (a transaction pulling anything beyond that
+    closure is refused, naming it) and their removal, ``smartmontools`` first,
+    is the last LIFO cleanup, after the window closed. The package deadman is
+    timed after the window's restore deadman.
     """
 
     return ensure_dependencies(

@@ -31,7 +31,14 @@ from tests.regional._general_live_fakes import (
 )
 
 NODE = "ip-10-0-43-5.us-west-2.compute.internal"
-SMART_NEVRA = "smartmontools-1:7.3-1.amzn2023.0.2.x86_64"
+SMART_NEVRA = "smartmontools-1:7.2-11.amzn2023.0.1.x86_64"
+SELINUX_NEVRA = "smartmontools-selinux-1:7.2-11.amzn2023.0.1.noarch"
+#: The probe's receipt: the closure in install order, dnf's table as printed.
+SMART_INSTALLED = [SELINUX_NEVRA, SMART_NEVRA]
+SMART_TRANSACTION = [
+    {"name": "smartmontools", "section": "Installing"},
+    {"name": "smartmontools-selinux", "section": "Installing dependencies"},
+]
 SPEC = VariantSpec(
     case_id="GF-GENERAL-LIVE-007",
     variant="health_failed",
@@ -58,9 +65,9 @@ def ensured(**overrides: Any) -> dict[str, Any]:
         "refused": None,
         "tools": {"smartctl": True},
         "modules": {},
-        "installed": [SMART_NEVRA],
+        "installed": SMART_INSTALLED,
         "modules_loaded_by_run": [],
-        "transaction": [{"name": "smartmontools", "section": "Installing"}],
+        "transaction": SMART_TRANSACTION,
         "deadman": "gfrs-abcdef-pdeadman",
     }
     value.update(overrides)
@@ -92,8 +99,8 @@ def test_without_the_token_a_missing_tool_is_capability_absent_with_the_hint(
     assert raised.value.reason == "CAPABILITY_ABSENT"
     assert raised.value.detail == (
         "the node lacks smartctl (TEMP_TEST_PACKAGE_INSTALL installs smartmontools "
-        "for one run)"
-    )
+        "with its reviewed dependency smartmontools-selinux for one run)"
+    ), "the hint names the closure: what the token would put on the node"
     assert deps_probe.calls == [] and ctx.cleanup.pending() == []
     assert value["tools"]["smartctl"] is False, "the survey is not touched"
 
@@ -121,12 +128,12 @@ def test_with_the_token_the_probe_installs_and_the_cleanup_is_registered_first(
         )
     ]
     assert deps_probe.timeouts == [("ensure", deps.DEPS_TIMEOUT)]
-    assert result["changed"] is True and result["installed"] == [SMART_NEVRA]
+    assert result["changed"] is True and result["installed"] == SMART_INSTALLED
     assert deps.dependency_summary(result) == {
         "changed": True,
-        "installed": [SMART_NEVRA],
+        "installed": SMART_INSTALLED,
         "modules_loaded_by_run": [],
-        "transaction": [{"name": "smartmontools", "section": "Installing"}],
+        "transaction": SMART_TRANSACTION,
     }
     assert value["tools"]["smartctl"] is True, "the survey now says the node has it"
     assert (ctx.case_dir / "smart-deps.json").is_file(), "the receipt is evidence"
@@ -154,7 +161,7 @@ def test_a_refused_transaction_is_the_probes_not_run_and_keeps_the_cleanup(
 ) -> None:
     refused = {
         "reason": "FIXTURE_NOT_READY",
-        "detail": "dnf would also installing dependencies mailx-12.5-30.amzn2023.x86_64",
+        "detail": "dnf would also install the dependencies mailx-12.5-30.amzn2023.x86_64",
     }
     deps_probe = FakeProbe({"ensure": ensured(refused=refused, installed=[])})
     ctx = context(tmp_path, deps_probe, approvals=(deps.PACKAGE_APPROVAL,))
@@ -197,6 +204,9 @@ def test_only_the_probes_allow_list_can_be_asked_for(tmp_path: Path) -> None:
         )
     assert deps.TOOL_PACKAGES is probe.TOOL_PACKAGES, (
         "one allow-list: the probe's, shipped to the node"
+    )
+    assert deps.PACKAGE_CLOSURES is probe.PACKAGE_CLOSURES, (
+        "and one set of reviewed closures: the probe's"
     )
 
 

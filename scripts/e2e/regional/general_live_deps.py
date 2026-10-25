@@ -10,16 +10,24 @@ Some variants need a host tool or kernel module the node image does not ship
 
 Whatever the node has is used as found. A missing tool is installed only
 behind ``TEMP_TEST_PACKAGE_INSTALL`` -- exactly the reviewed package of the
-probe's ``TOOL_PACKAGES``, after a ``dnf --assumeno`` preview that must install
-nothing else (no kernel, upgrade, downgrade, removal or other dependency;
-otherwise NOT_RUN(FIXTURE_NOT_READY) with the transaction in the evidence).
-Without the token the variant stays NOT_RUN(CAPABILITY_ABSENT) and its detail
-names the token that would enable the install. A module that is not loaded is
-loaded only behind ``KERNEL_MODULE_LOAD``. The probe arms a deadman and records
-the installed NEVRAs and loaded modules on the node *before* the change; the
-runner registers the probe's ``cleanup`` on the LIFO stack before the call, so
-it runs after every fixture that used the tool is gone and removes exactly what
-this run installed. The product's collectors are never restarted for an
+probe's ``TOOL_PACKAGES`` with its reviewed dependency closure
+(``PACKAGE_CLOSURES``: on AL2023 ``smartmontools`` carries
+``smartmontools-selinux``, the same build's SELinux policy module), after a
+``dnf --assumeno`` preview that must install nothing else (no kernel, upgrade,
+downgrade, removal or undeclared dependency; otherwise
+NOT_RUN(FIXTURE_NOT_READY) naming the unexpected packages, with the
+transaction in the evidence). Without the token the variant stays
+NOT_RUN(CAPABILITY_ABSENT) and its detail names the token that would enable the
+install and what it would install. A module that is not loaded is loaded only
+behind ``KERNEL_MODULE_LOAD``. The probe arms a deadman and records the
+installed NEVRAs (in install order), loaded modules and what the packages
+brought beyond their files on the node *before* the change; the runner
+registers the probe's ``cleanup`` on the LIFO stack before the call, so it runs
+after every fixture that used the tool is gone and removes exactly what this
+run installed, last installed first (the package before its dependency),
+proving the closure gone and nothing it brought (``smartd.service``, the
+``smartmon`` policy module at priority 200) left active, enabled or loaded. The
+product's collectors are never restarted for an
 install: they look a tool up on every tick (``shutil.which`` in
 ``collectors/host/system_metrics.py`` ``_smart`` and ``host/bmc.py`` ``_bmc``),
 and the host collector unit's ``ProtectSystem=strict`` is a read-only view of
@@ -46,9 +54,11 @@ MODULE_APPROVAL = "KERNEL_MODULE_LOAD"
 #: cleanup's (a previewed ``dnf remove``).
 DEPS_TIMEOUT = 900
 DEPS_CLEANUP_TIMEOUT = 600
-#: The reviewed tool -> package and module -> package maps are the probe's:
-#: one allow-list, reviewed once, shipped to the node.
+#: The reviewed tool -> package, package -> dependency closure and module ->
+#: package maps are the probe's: one allow-list, reviewed once, shipped to the
+#: node.
 TOOL_PACKAGES = deps_probe.TOOL_PACKAGES
+PACKAGE_CLOSURES = deps_probe.PACKAGE_CLOSURES
 MODULE_PACKAGES = deps_probe.MODULE_PACKAGES
 #: The receipt fields a variant keeps in its result.
 RECEIPT_KEYS = ("changed", "installed", "modules_loaded_by_run", "transaction")
@@ -128,7 +138,8 @@ def ensure_dependencies(
         name for name in modules if not (modules_state.get(name) or {}).get("loaded")
     ]
     if missing and not may_install:
-        packages = ", ".join(TOOL_PACKAGES[name] for name in missing)
+        # Names the closure too: what the token would put on the node.
+        packages = deps_probe.allowed_label(TOOL_PACKAGES[name] for name in missing)
         raise VariantNotRun(
             "CAPABILITY_ABSENT",
             f"the node lacks {', '.join(missing)} ({PACKAGE_APPROVAL} installs "
@@ -194,6 +205,7 @@ __all__ = [
     "MODULE_APPROVAL",
     "MODULE_PACKAGES",
     "PACKAGE_APPROVAL",
+    "PACKAGE_CLOSURES",
     "RECEIPT_KEYS",
     "TOOL_PACKAGES",
     "checked_cleanup",

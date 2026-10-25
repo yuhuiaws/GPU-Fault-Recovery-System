@@ -1290,10 +1290,13 @@ the running kernel) after a `dnf --assumeno` preview, and loads `sch_netem` only
 if it is not loaded (`KERNEL_MODULE_LOAD`). Its limits are deliberate:
 
 - The previewed transaction must consist of `Installing` rows of exactly those
-  packages. A kernel, an upgrade (for example an `iproute` bump that a newer
-  `iproute-tc` would require), a downgrade, a removal, an obsolete or any other
-  dependency makes the variant `NOT_RUN(FIXTURE_NOT_READY)` with the transaction
-  in `tcp-dependencies.json`; widening the allow-list is a separate review.
+  packages, plus `Installing dependencies` rows of their reviewed closure only
+  (`PACKAGE_CLOSURES`, same build; `iproute-tc` has none). A kernel, an upgrade
+  (for example an `iproute` bump that a newer `iproute-tc` would require), a
+  downgrade, a removal, an obsolete or any dependency outside the closure makes
+  the variant `NOT_RUN(FIXTURE_NOT_READY)` naming the unexpected packages ("dnf
+  would also install the dependencies ..."), with the transaction in
+  `tcp-dependencies.json`; widening the allow-list is a separate review.
 - The module package is only the running kernel's `kernel-modules-extra`
   build; a `kernel6.x` flavour would need `kernel6.x-modules-extra` and is
   reported as "no package ... in the enabled repositories", never guessed.
@@ -1301,9 +1304,10 @@ if it is not loaded (`KERNEL_MODULE_LOAD`). Its limits are deliberate:
   and which module it loads are recorded on the node *before* the change, and
   `cleanup` -- the runner's LIFO step after the fixture is gone, and a deadman
   timed to fire after the fixture's even when the install took its whole
-  budget -- unloads only a module this run loaded once it is idle, and
-  `dnf remove`s exactly the recorded packages after a preview that
-  must remove nothing else (no dependent package, no "unused" dependency). A
+  budget -- unloads only a module this run loaded once it is idle, quiets any
+  unit the packages brought, and `dnf remove`s exactly the recorded packages,
+  last installed first, one previewed transaction each that must remove
+  nothing else (no dependent package, no "unused" dependency). A
   cleanup that cannot finish keeps its deadman armed and fails the variant's
   cleanup. A node reboot before either runs loses the `/run` record and the
   timers; the installed NEVRAs stay in the case evidence for a manual removal.
@@ -1313,10 +1317,24 @@ over the same probe, never a copy per category -- by the six 007 SMART replay
 variants (`smartctl` -> `smartmontools`) and 004 `probe_error` (`mkfs.vfat` ->
 `dosfstools`), the two other tools the AL2023 EKS GPU AMI lacks (pass 5 recorded
 all of them NOT_RUN(CAPABILITY_ABSENT)). Without the optional token the NOT_RUN
-stays and its detail names the token and the package; with it exactly that
-package is installed before the fixture that needs the tool and removed as the
-last LIFO cleanup after that fixture is gone (the package deadman is timed
-after the fixture's). The allow-list is the probe's `TOOL_PACKAGES`. `ipmitool`
+stays and its detail names the token and the package(s); with it exactly that
+package -- with its reviewed closure -- is installed before the fixture that
+needs the tool and removed as the last LIFO cleanup after that fixture is gone
+(the package deadman is timed after the fixture's). The allow-list is the
+probe's `TOOL_PACKAGES` plus the closures of `PACKAGE_CLOSURES`. The one closure
+is `smartmontools` -> `smartmontools-selinux`: the rpm requires
+`(smartmontools-selinux if selinux-policy-targeted)` and AL2023 nodes ship
+`selinux-policy-targeted`, so dnf always adds the subpackage -- the same source
+build's noarch SELinux policy module, whose scriptlets load the `smartmon`
+module at priority 200 (over the base policy's priority-100 `smartmon`) and
+relabel only changed file contexts; nothing runs. It is accepted only as an
+`Installing dependencies` row of the same build as `smartmontools`; a preview
+that lists anything else is refused by name. Removal walks the record
+backwards (`smartmontools`, then `smartmontools-selinux`; the reverse would
+cascade), and the residue proves both packages gone, `smartd.service` -- which
+AL2023's `90-default.preset` enables on install and the probe disables at
+once, the fixture needing `smartctl`, never the daemon -- neither active nor
+enabled, and the priority-200 policy module unloaded. `ipmitool`
 is deliberately not on it: 015 serves it from the wrapper with
 `--allow-missing-real`, so no real tool is needed on this BMC-less site.
 `nfs-utils` for 005 is not either: its transaction pulls rpcbind, libtirpc,
@@ -1383,13 +1401,15 @@ wrapper journal is the oracle that the product asked (otherwise INCONCLUSIVE),
 and every variant closes its window and proves the real tool answers again. On
 a node without `smartctl` the six 007 replay variants are
 NOT_RUN(CAPABILITY_ABSENT) naming `TEMP_TEST_PACKAGE_INSTALL`; with that
-optional token `smartmontools` is installed first (exactly that package), the
+optional token `smartmontools` is installed first (exactly that package and its
+reviewed dependency `smartmontools-selinux`, the same build's SELinux policy
+module that AL2023's `selinux-policy-targeted` makes dnf pull), the
 runner waits up to one health summary plus six ticks for the product's first
 `smart_health_failed` reading -- the host collector finds the tool on its next
 tick, no restart -- and names that drive, the window then restarts the unit on
-open and close as always, and the package is removed as the last LIFO cleanup
-after the window closed, so the product reports `smart_status_unsupported`
-TOOL_MISSING again. A replay proves the processing chain only -- no drive fails and no BMC exists, so
+open and close as always, and the packages are removed as the last LIFO cleanup
+after the window closed, `smartmontools` first, so the product reports
+`smart_status_unsupported` TOOL_MISSING again. A replay proves the processing chain only -- no drive fails and no BMC exists, so
 `proof_scope` is `live-replay`; the OPEN_FAILED drive and a hung `-H` query stay
 software-tested; 015 `unavailable_sensor` uses one `na` row among healthy ones
 (a table of only `na` rows is UNKNOWN in the product -- a `_bmc` collection

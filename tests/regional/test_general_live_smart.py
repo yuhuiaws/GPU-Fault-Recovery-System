@@ -104,6 +104,13 @@ def healthy(*times: str) -> dict[str, Any]:
 
 
 SMART_NEVRA = "smartmontools-1:7.3-1.amzn2023.0.2.x86_64"
+#: The probe's receipt: smartmontools with its reviewed closure, install order.
+SELINUX_NEVRA = "smartmontools-selinux-1:7.3-1.amzn2023.0.2.noarch"
+SMART_INSTALLED = [SELINUX_NEVRA, SMART_NEVRA]
+SMART_TRANSACTION = [
+    {"name": "smartmontools", "section": "Installing"},
+    {"name": "smartmontools-selinux", "section": "Installing dependencies"},
+]
 WITH_INSTALL = (HOST_SOURCE_REPLAY, PACKAGE_APPROVAL)
 
 
@@ -192,9 +199,9 @@ def deps_probe(**overrides: Any) -> FakeProbe:
         "refused": None,
         "tools": {"smartctl": True},
         "modules": {},
-        "installed": [SMART_NEVRA],
+        "installed": SMART_INSTALLED,
         "modules_loaded_by_run": [],
-        "transaction": [{"name": "smartmontools", "section": "Installing"}],
+        "transaction": SMART_TRANSACTION,
         "deadman": "gfrs-abcdef-pdeadman",
     }
     ensure.update(overrides)
@@ -448,7 +455,7 @@ def test_without_the_token_a_node_without_smartctl_names_the_install(
     assert raised.value.reason == "CAPABILITY_ABSENT"
     assert raised.value.detail == (
         "the node lacks smartctl (TEMP_TEST_PACKAGE_INSTALL installs smartmontools "
-        "for one run)"
+        "with its reviewed dependency smartmontools-selinux for one run)"
     )
     assert deps.calls == [] and source.calls == [], "nothing touched the node"
     assert ctx.cleanup.pending() == []
@@ -482,9 +489,9 @@ def test_with_the_token_smartmontools_is_installed_first_and_removed_last(
     ]
     assert result["dependencies"] == {
         "changed": True,
-        "installed": [SMART_NEVRA],
+        "installed": SMART_INSTALLED,
         "modules_loaded_by_run": [],
-        "transaction": [{"name": "smartmontools", "section": "Installing"}],
+        "transaction": SMART_TRANSACTION,
     }
     baseline = json.loads((ctx.case_dir / "smart-baseline.json").read_text())
     assert baseline["fresh_install"] is True and baseline["devices"] == [DEV0, DEV1]
@@ -517,7 +524,7 @@ def test_a_refused_install_is_fixture_not_ready_before_any_window(
 ) -> None:
     refused = {
         "reason": "FIXTURE_NOT_READY",
-        "detail": "dnf would also installing dependencies mailx-12.5-30.amzn2023.x86_64",
+        "detail": "dnf would also install the dependencies mailx-12.5-30.amzn2023.x86_64",
     }
     ctx, source, _node, _deps = build(
         "health_failed",
