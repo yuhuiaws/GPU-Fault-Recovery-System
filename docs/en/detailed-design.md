@@ -3849,6 +3849,19 @@ This gate does not depend on the original event type. For any workflow that cont
 requires fresh ACTIVE counts after the action completes. Even when the reboot was triggered by XID, SXID, DCGM or another
 Host event, a lost card fails the workflow and enters the unified escalator.
 
+A diagnostic chain has no action to wait for. `LINK_INACTIVE`, `EXCESS_DEVICE` and an unknown failure mode take
+`RUN_DIAGNOSTICS` (FREEZE_EVIDENCE → VALIDATE_FABRIC), a plan with no recovery action at all, so that
+`VALIDATE_FABRIC` waits for no completion: it judges the `efa_inventory_active_count` observed after the chain
+reached the validation -- after the previous step completed, never earlier than the workflow was created. Equal to
+the expected count is `SUCCEEDED` and the incident `RECOVERED`; with no such sample yet the step is `WAITING` only
+until the next host sample; only a fresh sample that still disagrees is `FAILED`, and then `LINK_INACTIVE` escalates
+to `REBOOT_NODE` through the `failure_escalation_action` the plan carries while excess/unknown authorizes no reboot
+and goes to an operator. The samples that raised the finding predate that moment and are not diagnostic evidence.
+Both modes record the reading each verdict rests on in the step record's `inventory_evidence` (node → metric →
+`value`/`expected`/`observed_at`). Before this, the validation waited for an action completion no step in the plan
+would produce, failed at the 600 s per-step cap, and the cap's failure escalated a node whose port had long been
+ACTIVE again to `RESTART_NODE` (GF-GENERAL-LIVE-013 `link_inactive`, live).
+
 The Dispatcher's failure escalator then creates a `REPLACE_NODE` workflow whose predecessor has ended:
 
 ```text
