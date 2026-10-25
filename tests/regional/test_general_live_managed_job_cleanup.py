@@ -1168,3 +1168,89 @@ def test_a_controller_another_owner_relabelled_is_never_deleted(
         job.delete()
     assert ("pytorchjob", job.fixture.name) in cluster.objects
     assert cluster.deletes == []
+
+
+# --------------------------------------------------------------------------- #
+# the product contains its own restart copy while, or before, the cleanup runs
+# --------------------------------------------------------------------------- #
+def restart_copy(cluster: Cluster, job: attempts.ManagedFailJob) -> dict[str, Any]:
+    """The product's RESTART_WORKLOAD copy of the job's terminal workload."""
+
+    name = job.fixture.name
+    restart = copy.deepcopy(cluster.objects[("pytorchjob", name)])
+    for key in ("uid", "resourceVersion"):
+        restart["metadata"].pop(key)
+    restart["metadata"]["name"] = f"{name[:52]}{RESTART}"
+    restart["metadata"]["annotations"] = {
+        "gpu-fault.io/operation-id": RESTART_OPERATION,
+        "gpu-fault.io/restart-count": "1",
+    }
+    target = f"{job.attempt_id[:52]}{RESTART}"
+    restart["metadata"]["labels"][ATTEMPT_LABEL] = target
+    for replica in restart["spec"]["pytorchReplicaSpecs"].values():
+        replica["template"]["metadata"]["labels"][ATTEMPT_LABEL] = target
+    stored = cluster.store(restart)
+    cluster.reconcile(stored)
+    return stored
+
+
+def test_the_copys_own_failure_during_the_cleanup_does_not_refuse_the_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live 2026-10-25 11:36Z (eksb, 028.nonzero_exit): the cleanup retained the
+    product's restart copy, deleted the source PyTorchJob, and in between the
+    copy's own attempt failed (``sleep 30; exit 1`` again) and the product's
+    STOP_WORKLOADS suspended and annotated the copy (managedFields 11:36:03Z).
+    The delete of the copy was refused -- "fixture cleanup ownership changed" --
+    and the copy stayed. The product's bookkeeping on its own copy is no
+    change of ownership; the cleanup removes the copy and proves the node clean."""
+
+    cluster = Cluster()
+    job = started_fail_job(tmp_path, monkeypatch, cluster)
+    stored = restart_copy(cluster, job)
+    copy_name = stored["metadata"]["name"]
+    original_delete = cluster.delete
+
+    def delete_then_the_product_contains_the_copy(
+        path: str, options: dict[str, Any]
+    ) -> str:
+        result = original_delete(path, options)
+        if path.endswith(f"/pytorchjobs/{job.fixture.name}"):
+            cluster.stop_failed_attempt(cluster.objects[("pytorchjob", copy_name)])
+        return result
+
+    monkeypatch.setattr(cluster, "delete", delete_then_the_product_contains_the_copy)
+
+    deleted = job.fixture.delete()
+
+    assert f"pytorchjob/{copy_name}" in deleted, deleted
+    assert cluster.stopped == [copy_name], "the product contained the copy mid-cleanup"
+    assert job.fixture.unbound_restart_resources >= {f"pytorchjob/{copy_name}"}
+    assert cluster.kinds() == {"deployment"}, cluster.objects
+    assert job.fixture.ownership is not None
+    assert journal(job.fixture.ownership.path)["completed"] is True
+
+
+def test_a_copy_the_product_already_contained_is_still_its_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same copy a few seconds later: its own attempt failed before the
+    cleanup started, so ``gpu-fault.io/operation-id`` now names the product's
+    STOP_WORKLOADS of the derived attempt, not the RESTART_WORKLOAD that made
+    it. It is still a product restart of this fixture's workload (the owner
+    nonce, the job id, the derived attempt id, a product step key) and goes
+    with the job that made it."""
+
+    cluster = Cluster()
+    job = started_fail_job(tmp_path, monkeypatch, cluster)
+    stored = restart_copy(cluster, job)
+    cluster.stop_failed_attempt(stored)
+    assert stored["metadata"]["annotations"]["gpu-fault.io/operation-id"].endswith(
+        "/STOP_WORKLOADS"
+    ), "the product's containment overwrote the restart's step key"
+    copy_name = stored["metadata"]["name"]
+
+    deleted = job.fixture.delete()
+
+    assert deleted[f"pytorchjob/{copy_name}"] == stored["metadata"]["uid"], deleted
+    assert cluster.kinds() == {"deployment"}, cluster.objects

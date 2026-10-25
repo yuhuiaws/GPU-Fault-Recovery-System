@@ -1845,6 +1845,23 @@ worker has a GPU, and stops a failed attempt as the completion watcher does;
 the variant runs through `execute_variant` on it, and the old rendering
 reproduces the live failure text.
 
+028 `nonzero_exit` failed in its cleanup (live 2026-10-25, pass 4, plain
+EKS): the product restarted the failed job as a copy, the copy's own attempt
+failed 33 s later (it runs the same command), and the product's STOP_WORKLOADS
+suspended and annotated the copy in the second after the cleanup had retained
+it and deleted the source job; the delete of the copy was refused as a change
+of ownership and the copy stayed (the leftover PyTorchJob
+`...-c098a41205-r-893dc810`). The cleanup custody no longer binds the
+product's own bookkeeping on a managed workload -- the `gpu-fault.io/*` step
+annotations, the suspend toggle, the Pod's initiator annotation and the
+attempt-id relabel of an in-place restart -- while the UID, namespace, owner
+nonce, job id, every other label and annotation and the spec still bind it;
+and the lineage rule for an unbound restart copy accepts the STOP_WORKLOADS
+step key the copy's own containment writes over the RESTART_WORKLOAD key,
+since only the product derives a `-r-` attempt id under this fixture's nonce.
+The fake namespace reproduces both refusals on the old code (the containment
+inside the cleanup and before it).
+
 GF-GENERAL-LIVE-030 (warm spare unhealthy) is the same story on the HyperPod
 lane: its `SpareSession` keeps the spare node *name* in `self.node` and also
 defined a `node()` accessor, so the instance attribute shadowed the method and

@@ -132,16 +132,64 @@ def _fingerprint(document: dict[str, Any]) -> str:
     ).hexdigest()
 
 
+#: What the product writes on a managed workload it contains or restarts, and
+#: on that workload's Pods: STOP_WORKLOADS patches ``gpu-fault.io/*`` step
+#: annotations and the suspend in one go (``_apply_workload_mutation``) and
+#: annotates the Pods with the initiator incident (``_mark_terminating_pods``);
+#: RESTART_WORKLOAD relabels a non-terminal workload's attempt id in place.
+#: Live 2026-10-25 (eksb, 028.nonzero_exit) the cleanup retained the product's
+#: restart copy, the copy's own attempt failed seconds later and the product's
+#: containment rewrote it between the snapshot and the delete, which was then
+#: refused as a change of ownership. None of this is: the identity (UID,
+#: namespace, kind, name), the owner nonce, the job id and every other field
+#: still bind the custody.
+PRODUCT_ANNOTATION_PREFIX = "gpu-fault.io/"
+PRODUCT_RELABELLED = ("gpu-fault.io/attempt-id",)
+
+
+def _without_product_bookkeeping(stable: dict[str, Any]) -> dict[str, Any]:
+    metadata = stable["metadata"]
+    annotations = metadata.get("annotations")
+    if isinstance(annotations, dict):
+        kept = {
+            key: value
+            for key, value in annotations.items()
+            if not str(key).startswith(PRODUCT_ANNOTATION_PREFIX)
+        }
+        if kept:
+            metadata["annotations"] = kept
+        else:
+            metadata.pop("annotations")
+    labels = metadata.get("labels")
+    if isinstance(labels, dict):
+        for key in PRODUCT_RELABELLED:
+            labels.pop(key, None)
+    spec = stable.get("spec")
+    if isinstance(spec, dict):
+        spec.pop("suspend", None)
+        run_policy = spec.get("runPolicy")
+        if isinstance(run_policy, dict):
+            run_policy.pop("suspend", None)
+    return stable
+
+
 def _cleanup_fingerprint(document: dict[str, Any]) -> str:
     stable = _stable(document)
     metadata = stable["metadata"]
     metadata.pop("ownerReferences", None)
     metadata.pop("finalizers", None)
-    return _fingerprint(stable)
+    return _fingerprint(_without_product_bookkeeping(stable))
 
 
 def capture_cleanup_custody(document: dict[str, Any]) -> CleanupCustody:
-    """Retain an already-verified object before orphaning its controller."""
+    """Retain an already-verified object before orphaning its controller.
+
+    The snapshot binds everything but the product's own bookkeeping
+    (``_without_product_bookkeeping``): the delete that follows is refused when
+    the UID, the namespace, the owner nonce, the job id, any other label or
+    annotation, or the spec changed -- not when the product suspended or
+    annotated the object it contains.
+    """
     return CleanupCustody(
         uid=_identity(document)[2],
         snapshot_sha256=_cleanup_fingerprint(document),

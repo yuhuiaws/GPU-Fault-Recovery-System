@@ -369,6 +369,14 @@ OWNER_LABEL = "gpu-fault.io/acceptance-owner"
 JOB_LABEL = "gpu-fault.io/job-id"
 ATTEMPT_LABEL = "gpu-fault.io/attempt-id"
 OPERATION_ANNOTATION = "gpu-fault.io/operation-id"
+#: The product step keys a restart copy carries: the RESTART_WORKLOAD that
+#: created it, or -- once the copy's own attempt failed too -- the
+#: STOP_WORKLOADS of its containment, which overwrites the key in the same
+#: patch as the suspend (``_apply_workload_mutation``). Live 2026-10-25 (eksb,
+#: 028.nonzero_exit) the copy failed 33 s after its creation, inside the
+#: source job's cleanup; a cleanup starting a few seconds later finds the
+#: STOP_WORKLOADS key and must still recognise the copy as the product's.
+PRODUCT_COPY_OPERATIONS = ("/RESTART_WORKLOAD", "/STOP_WORKLOADS")
 CONTROLLER_KINDS = frozenset({"Job", "PyTorchJob", "JobSet"})
 
 
@@ -404,7 +412,8 @@ def unbound_restart_root(
     ``adapters/kubernetes/restart_operations.py``); a retired Pod UID never
     comes back. The chain must end at a controller the fixture owns by UID or
     at a restart copy: a new controller of the derived attempt whose
-    ``gpu-fault.io/operation-id`` names the RESTART_WORKLOAD that created it.
+    ``gpu-fault.io/operation-id`` names the RESTART_WORKLOAD that created it or
+    the STOP_WORKLOADS that contained its own attempt (``PRODUCT_COPY_OPERATIONS``).
     Returns the root controller; nothing here makes the resource a replacement
     a case may count, which ``ManagedWorkloadFixture.adopt`` alone decides.
     """
@@ -454,7 +463,7 @@ def unbound_restart_root(
                 cast(str, attempt).startswith(lineage)
                 and isinstance(annotations, dict)
                 and str(annotations.get(OPERATION_ANNOTATION) or "").endswith(
-                    "/RESTART_WORKLOAD"
+                    PRODUCT_COPY_OPERATIONS
                 ),
                 f"{kind}/{name} is not a product restart of this workload",
             )
