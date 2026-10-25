@@ -15,6 +15,23 @@ variants that are about the ledger itself rather than a job -- a concurrent
 claim of one restart and a restart step without its safety context -- run the
 store-level harness of ``general_live_restart_budget`` (the product's own
 reserve/release API and claim preflight on a test job id, in an API Pod).
+
+028 ``old_terminal`` replays an old attempt's terminal against a running new
+one: the job's first attempt fails (``exit_once``), the product restarts it as
+a copy whose Pod reads its own ``gpu-fault.io/attempt-id`` label (the ``-r-``
+id the product derives) and keeps running, and the product's *recorded*
+TerminalEvent of the old attempt is redelivered through
+``CompletionService.handle_terminal`` -- the same entry the
+``/v1/attempts/terminal`` route calls -- by ``TERMINAL_REPLAY_PROBE`` in an
+API Pod. Nothing is hand-made: the event is the product's own row. The replay
+must come back ``duplicate=true`` with the original decision, mint no second
+restart, deduct no second budget and leave the new attempt without a
+terminal, a decision or a containment. ``missing_allocation`` stays
+NOT_RUN(FIXTURE_NOT_READY): on Kubernetes the watcher derives the allocation
+from the Pod's ``spec.nodeName`` of every terminated critical container
+(``completion_pod_parsing`` -> ``watcher._terminal_event``), so a
+watcher-observed terminal always carries one; only a hand-made terminal POST
+could lack it, which the spec and the lane rules forbid.
 """
 
 from __future__ import annotations
@@ -25,6 +42,7 @@ from typing import TYPE_CHECKING, Any
 
 from scripts.e2e.regional.general_live_fixture import (
     VariantContext,
+    VariantInconclusive,
     VariantNotRun,
     run_identity,
 )
@@ -202,11 +220,26 @@ def suspend_workload(fixture: ManagedWorkloadFixture) -> None:
     )
 
 
+#: The Pod's own attempt id, from its ``gpu-fault.io/attempt-id`` label through
+#: the downward API: the product's restart copy relabels the template with the
+#: ``-r-`` id it derives (``adapters/kubernetes/restart_operations.py``), so a
+#: container can tell the first attempt from a restart.
+ATTEMPT_ID_ENV = "GFRS_ATTEMPT_ID"
+ATTEMPT_ID_LABEL = "gpu-fault.io/attempt-id"
 MODE_COMMANDS = {
     "exit": "sleep 30; exit ${CODE:-1}",
     "stop": "trap 'exit 143' TERM; sleep 3600",
     "hang": "trap '' TERM; sleep 3600",
+    # The first attempt exits CODE; the product's restart copy keeps running
+    # until stopped, so a replayed old terminal has a live new attempt to leave
+    # alone (028 old_terminal).
+    "exit_once": (
+        f"case \"${{{ATTEMPT_ID_ENV}:-}}\" in *-r-*) trap 'exit 143' TERM; sleep 3600;; "
+        "*) sleep 30; exit ${CODE:-1};; esac"
+    ),
 }
+#: Modes whose ``:<code>`` suffix is the exit code.
+EXIT_MODES = frozenset({"exit", "exit_once"})
 
 
 def _add_worker_ranks(document: dict[str, Any], ranks: int) -> None:
@@ -243,7 +276,23 @@ def _apply_mode(document: dict[str, Any], mode: str | Mapping[str, str]) -> None
         kind = role_mode.split(":", 1)[0]
         script = MODE_COMMANDS.get(kind, MODE_COMMANDS["exit"])
         code = (
-            role_mode.split(":", 1)[1] if ":" in role_mode and kind == "exit" else "1"
+            role_mode.split(":", 1)[1]
+            if ":" in role_mode and kind in EXIT_MODES
+            else "1"
+        )
+        identity = (
+            [
+                {
+                    "name": ATTEMPT_ID_ENV,
+                    "valueFrom": {
+                        "fieldRef": {
+                            "fieldPath": f"metadata.labels['{ATTEMPT_ID_LABEL}']"
+                        }
+                    },
+                }
+            ]
+            if kind == "exit_once"
+            else []
         )
         for container in ((replica.get("template") or {}).get("spec") or {}).get(
             "containers"
@@ -251,6 +300,7 @@ def _apply_mode(document: dict[str, Any], mode: str | Mapping[str, str]) -> None
             container["command"] = ["/bin/bash", "-c", script]
             container["env"] = [
                 {"name": "CODE", "value": code},
+                *identity,
                 *(container.get("env") or []),
             ]
 
@@ -432,40 +482,189 @@ def controller_stop(ctx: VariantContext) -> dict[str, Any]:
     )
 
 
-def missing_allocation(ctx: VariantContext) -> dict[str, Any]:
-    job = _job(ctx, "gl28ma-" + _suffix(ctx), "exit:1")
-    records = _wait_decision(ctx, job, name="missing-allocation")
-    entry = _attempt(records, job.attempt_id)
-    decision = entry.get("decision") or {}
-    stages = {
-        "blocked": []
-        if "allocation" in str(decision.get("reason") or "").lower()
-        or decision.get("status") == "PLAN_CREATED"
-        else ["a terminal with no allocation did not block the automatic restart"],
+#: Runs in an API Pod under the product's interpreter: redeliver the product's
+#: own recorded TerminalEvent of a test attempt through the completion
+#: service, exactly as the ``/v1/attempts/terminal`` route does for the
+#: watcher. Refuses an attempt outside the test prefix and one with no
+#: recorded terminal (nothing to replay). One JSON object on the last line.
+TERMINAL_REPLAY_PROBE = r"""
+import json
+import sys
+
+from gpu_fault.app import ApplicationContext
+from gpu_fault.store import NotFoundError
+
+
+
+def main(argv):
+    cluster_id, attempt_id = argv[:2]
+    if not attempt_id.startswith("gl28"):
+        raise ValueError(
+            f"refusing to replay a terminal outside the test prefix: {attempt_id}"
+        )
+    context = ApplicationContext.from_environment()
+    store = context.store
+    try:
+        event = store.get_event_by_attempt(cluster_id, attempt_id)
+    except NotFoundError:
+        return {"attempt_id": attempt_id, "refused": "no recorded terminal event"}
+    before = store.get_decision_by_event(event.event_key)
+    decision = context.completion.handle_terminal(event)
+    return {
+        "attempt_id": attempt_id,
+        "event_key": event.event_key,
+        "terminal_status": event.terminal_status.value,
+        "ended_at": event.ended_at.isoformat(),
+        "before": before.model_dump(mode="json") if before is not None else None,
+        "decision": decision.model_dump(mode="json"),
     }
-    return _result(
-        stages,
-        notes=[
-            "a terminal with no allocation snapshot blocks the automatic restart and escalates"
-        ],
+
+
+print(json.dumps(main(sys.argv[1:]), sort_keys=True, default=str))
+"""
+#: The replay probe's test-attempt prefix (every 028 job id starts with it).
+REPLAY_ATTEMPT_PREFIX = "gl28"
+#: One completion-watcher pass, so a restart copy is observed before and after.
+WATCHER_PASS_SECONDS = 60
+
+
+def restart_attempt_of(entry: dict[str, Any]) -> str | None:
+    """The new attempt id the product's RESTART_WORKLOAD recorded, if any."""
+
+    for item in entry.get("recovery") or []:
+        workflow = item.get("workflow") or {}
+        for execution in workflow.get("step_executions") or []:
+            if (
+                execution.get("operation") == "RESTART_WORKLOAD"
+                and execution.get("status") == "SUCCEEDED"
+            ):
+                value = (execution.get("details") or {}).get("restart_attempt_id")
+                if value:
+                    return str(value)
+    return None
+
+
+def _wait_restart_attempt(
+    ctx: VariantContext, job: ManagedFailJob, *, name: str
+) -> tuple[dict[str, Any], str | None]:
+    last: dict[str, Any] = {}
+
+    def accept() -> dict[str, Any] | None:
+        nonlocal last
+        last = _records(ctx, job)
+        return last if restart_attempt_of(_attempt(last, job.attempt_id)) else None
+
+    value = ctx.wait_until(
+        accept, timeout_seconds=ATTEMPT_BUDGET, poll_seconds=20, name=name
     )
+    records = value if value is not None else last
+    return records, restart_attempt_of(_attempt(records, job.attempt_id))
+
+
+def replay_errors(replay: dict[str, Any], original: dict[str, Any]) -> list[str]:
+    """The redelivered terminal came back as the original decision, flagged duplicate."""
+
+    decision = replay.get("decision") or {}
+    errors = []
+    if decision.get("duplicate") is not True:
+        errors.append(
+            "the replayed terminal was decided anew (duplicate is not true): "
+            f"{decision.get('status')} {decision.get('reason')}"
+        )
+    for key in ("status", "recovery_plan_id", "event_key"):
+        if decision.get(key) != original.get(key):
+            errors.append(
+                f"the replayed decision's {key} is {decision.get(key)!r}, the "
+                f"original's {original.get(key)!r}"
+            )
+    return errors
+
+
+def untouched_errors(entry: dict[str, Any], attempt_id: str) -> list[str]:
+    """The new attempt has no terminal, decision or containment of its own."""
+
+    return [
+        f"the new attempt {attempt_id} has a {name} after the replay: "
+        f"{str(entry.get(name))[:160]}"
+        for name in ("event", "decision", "containment_incident")
+        if entry.get(name)
+    ]
 
 
 def old_terminal(ctx: VariantContext) -> dict[str, Any]:
-    job = _job(ctx, "gl28ot-" + _suffix(ctx), "exit:1")
+    """An old attempt's terminal, replayed, controls nothing of the new attempt.
+
+    The first attempt fails (``exit_once``) and is restarted once by the
+    product; the copy's Pod reads a ``-r-`` attempt id and keeps running. The
+    product's recorded terminal of the old attempt is then redelivered through
+    the completion service: the decision must be the original one with
+    ``duplicate=true``, no second RESTART_WORKLOAD, no second budget deduction,
+    and the new attempt must keep running untouched (no terminal, decision or
+    containment of its own).
+    """
+
+    job = _job(ctx, "gl28ot-" + _suffix(ctx), "exit_once:1", restart_budget=1)
     records = _wait_decision(ctx, job, name="old-terminal")
-    entry = _attempt(records, job.attempt_id)
-    decision = entry.get("decision") or {}
+    original = (_attempt(records, job.attempt_id).get("decision") or {}).copy()
+    if not original:
+        raise VariantInconclusive(
+            "the product reached no decision on the first attempt's failure: "
+            "nothing to replay"
+        )
+    records, new_attempt = _wait_restart_attempt(ctx, job, name="old-terminal-restart")
+    if new_attempt is None:
+        raise VariantInconclusive(
+            "the product's RESTART_WORKLOAD recorded no restart_attempt_id: there is "
+            "no new attempt for the replayed terminal to leave alone"
+        )
+    ctx.evidence.write("restart-attempt", {"old": job.attempt_id, "new": new_attempt})
+    ctx.hold(WATCHER_PASS_SECONDS, name="new-attempt-running")
+    replay = ctx.regional.cpu_python(
+        TERMINAL_REPLAY_PROBE,
+        ctx.settings.regional.cluster_id,
+        job.attempt_id,
+        attempts=1,
+        timeout=240,
+    )
+    ctx.evidence.write("terminal-replay", replay)
+    if replay.get("refused"):
+        raise VariantInconclusive(
+            f"the terminal of {job.attempt_id} could not be replayed: {replay['refused']}"
+        )
+    ctx.hold(WATCHER_PASS_SECONDS, name="after-replay")
+    after = attempt_records(
+        ctx.regional,
+        ctx.settings.regional.cluster_id,
+        job.name,
+        [job.attempt_id, new_attempt],
+    )
+    old_entry = _attempt(after, job.attempt_id)
     stages = {
-        "not_recursive": []
-        if decision.get("status") in {"PLAN_CREATED", "NO_ACTION"}
-        else [f"unexpected decision {decision.get('status')}"],
+        "replay_duplicate": replay_errors(replay, original),
+        "single_restart": []
+        if len(_restart_workflows(old_entry)) == 1
+        else [
+            f"{len(_restart_workflows(old_entry))} restart workflows for the old "
+            "attempt after the replay, expected exactly one"
+        ],
+        "budget": _budget_errors(after, consumed=1),
+        "new_attempt_untouched": untouched_errors(
+            _attempt(after, new_attempt), new_attempt
+        ),
     }
     return _result(
         stages,
         notes=[
-            "replaying an old attempt's terminal must not stop or restart a new attempt (decision duplicate)"
+            "the product's own recorded terminal of the old attempt was redelivered "
+            "through CompletionService.handle_terminal (the /v1/attempts/terminal "
+            "route's entry) while the restart copy ran; a redelivery is the original "
+            "decision, duplicate=true, and controls nothing of the new attempt"
         ],
+        extra={
+            "old_attempt": job.attempt_id,
+            "new_attempt": new_attempt,
+            "replayed_decision": replay.get("decision"),
+        },
     )
 
 
@@ -759,20 +958,38 @@ VARIANTS = [
         controller_stop,
         risk="L",
     ),
-    _spec(
+    deferred_variant(
         CASE_028,
         "missing_allocation",
-        "a terminal with no allocation snapshot",
-        "the automatic restart is blocked and escalated",
-        missing_allocation,
+        proof_mode=NATIVE,
+        reason=(
+            "FIXTURE_NOT_READY: a terminal event without an allocation snapshot cannot "
+            "be produced through the completion watcher on Kubernetes -- the watcher "
+            "builds the allocation from spec.nodeName of every terminated critical "
+            "container (completion_pod_parsing.observe_containers -> "
+            "watcher._terminal_event) and a terminated container always has a node; "
+            "only a hand-made TerminalEvent POSTed to /v1/attempts/terminal could lack "
+            "one, which the spec (watcher-observed terminals, no hand-made ones) and the "
+            "lane rules forbid. The product path (service._decide -> "
+            "planner.from_missing_allocation: COLLECT_EVIDENCE + ESCALATE_OPERATOR, "
+            "'allocation snapshot is missing; automatic restart is blocked') stays "
+            "software-tested"
+        ),
+        lanes=("eks", "hp"),
+        expected="a terminal with no allocation snapshot blocks the automatic restart and escalates",
     ),
     _spec(
         CASE_028,
         "old_terminal",
-        "replay an old attempt's terminal event",
-        "it must not stop or restart a new attempt (decision duplicate)",
+        "the job's first attempt exits non-zero (exit_once) and the product restarts it "
+        "once; while the restart copy runs, the product's recorded terminal of the old "
+        "attempt is redelivered through CompletionService.handle_terminal in an API Pod",
+        "the replay is the original decision with duplicate=true; exactly one "
+        "RESTART_WORKLOAD and one budget deduction for the old attempt; the new attempt "
+        "keeps running with no terminal, decision or containment of its own",
         old_terminal,
         risk="L",
+        max_minutes=30,
     ),
     deferred_variant(
         CASE_028,

@@ -103,7 +103,12 @@ def test_managed_idle_job_requires_site_file(
 
 @pytest.mark.parametrize(
     "mode,needle",
-    [("exit:7", "exit ${CODE:-1}"), ("stop", "exit 143"), ("hang", "trap '' TERM")],
+    [
+        ("exit:7", "exit ${CODE:-1}"),
+        ("stop", "exit 143"),
+        ("hang", "trap '' TERM"),
+        ("exit_once:3", "*-r-*)"),
+    ],
 )
 def test_managed_fail_job_applies_mode(
     tmp_path: Path, mode: str, needle: str, monkeypatch: pytest.MonkeyPatch
@@ -113,15 +118,27 @@ def test_managed_fail_job_applies_mode(
     ctx = _ctx(spec, tmp_path)
     job = att.ManagedFailJob(ctx, name="gl28x", mode=mode, restart_budget=1)
     document = yaml.safe_load((ctx.case_dir / "gl28x.source.yaml").read_text())
-    commands = [
-        container["command"][-1]
+    containers = [
+        container
         for replica in document["spec"]["pytorchReplicaSpecs"].values()
         for container in replica["template"]["spec"]["containers"]
     ]
+    commands = [container["command"][-1] for container in containers]
     assert any(needle in command for command in commands), (
         "any(needle in command for command in commands)"
     )
     assert job.attempt_id == "gl28x-a001"
+    env = {item["name"]: item for item in containers[0]["env"]}
+    assert env["CODE"]["value"] == (mode.split(":")[1] if ":" in mode else "1")
+    if mode.startswith("exit_once"):
+        # The Pod reads its own attempt id: the product's restart copy carries
+        # the -r- id on its template label, so only the first attempt exits.
+        assert env[att.ATTEMPT_ID_ENV]["valueFrom"] == {
+            "fieldRef": {"fieldPath": f"metadata.labels['{att.ATTEMPT_ID_LABEL}']"}
+        }
+        assert "sleep 30; exit ${CODE:-1}" in commands[0], commands[0]
+    else:
+        assert att.ATTEMPT_ID_ENV not in env
 
 
 # --------------------------------------------------------------------------- #

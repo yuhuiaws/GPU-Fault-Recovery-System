@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +10,7 @@ import pytest
 
 from gpu_fault.store import NotFoundError
 from scripts.e2e.regional import general_live_attempts as att
+from scripts.e2e.regional.general_live_fixture import VariantInconclusive
 from scripts.e2e.regional.general_live_restart_budget import BUDGET_PROBE
 from tests.regional._general_live_fakes import (
     FakeRegional,
@@ -91,7 +93,14 @@ def attempt_doc(
     restart_reason: str = "",
     incident_state: str = "ACTION_PENDING",
     duplicate: bool = False,
+    restart_attempt_id: str | None = None,
+    restarts: int = 1,
+    extra_attempts: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    """One attempt's records. ``restart_attempt_id`` is what the product's
+    RESTART_WORKLOAD execution recorded; ``restarts`` recovery workflows carry
+    it; ``extra_attempts`` are further attempt entries (a restart copy's)."""
+
     reservations = (
         reservations
         if reservations is not None
@@ -102,39 +111,49 @@ def attempt_doc(
     )
     recovery = []
     if recovery_ops:
+        details: dict[str, Any] = {"reason": restart_reason}
+        if restart_attempt_id:
+            details["restart_attempt_id"] = restart_attempt_id
         executions = (
             [
                 {
                     "operation": "RESTART_WORKLOAD",
                     "status": restart_status,
-                    "details": {"reason": restart_reason},
+                    "details": details,
                 }
             ]
             if "RESTART_WORKLOAD" in recovery_ops
             else []
         )
-        recovery_wf = workflow(
-            "wf-r",
-            "inc-r",
-            list(recovery_ops),
-            status="SUCCEEDED",
-            executions=executions,
-        )
-        recovery = [
-            {
-                "incident": {
-                    "incident_id": "inc-r",
-                    "job_id": attempt_id.rsplit("-", 1)[0],
-                    "state": incident_state,
-                },
-                "workflow": recovery_wf,
-            }
-        ]
+        for index in range(restarts):
+            recovery_wf = workflow(
+                f"wf-r{index}",
+                f"inc-r{index}",
+                list(recovery_ops),
+                status="SUCCEEDED",
+                executions=executions,
+            )
+            recovery.append(
+                {
+                    "incident": {
+                        "incident_id": f"inc-r{index}",
+                        "job_id": attempt_id.rsplit("-", 1)[0],
+                        "state": incident_state,
+                    },
+                    "workflow": recovery_wf,
+                }
+            )
     return {
         "attempts": {
             attempt_id: {
                 "event": {"terminal_status": terminal},
-                "decision": {"status": decision, "duplicate": duplicate, "reason": "r"},
+                "decision": {
+                    "status": decision,
+                    "duplicate": duplicate,
+                    "reason": "r",
+                    "event_key": f"gpu-eks-cluster/{attempt_id}/TrainingAttemptFailureDetected",
+                    "recovery_plan_id": "plan-1",
+                },
                 "containment_incident": {
                     "incident_id": "inc-c",
                     "job_id": attempt_id.rsplit("-", 1)[0],
@@ -142,7 +161,8 @@ def attempt_doc(
                 },
                 "containment_workflows": [containment_wf],
                 "recovery": recovery,
-            }
+            },
+            **(extra_attempts or {}),
         },
         "restart_budget": {
             "restart_count": restart_count,
@@ -322,23 +342,243 @@ def test_user_and_controller_stop(tmp_path: Path) -> None:
     assert result["verdict"] == "FAIL"
 
 
-def test_missing_allocation_and_old_terminal(tmp_path: Path) -> None:
-    assert (
-        _run(
-            "missing_allocation",
-            tmp_path,
-            lambda aid: attempt_doc(aid, decision="PLAN_CREATED"),
-        )["verdict"]
-        == "PASS"
+# --------------------------------------------------------------------------- #
+# 028 old_terminal: the product's recorded terminal, redelivered
+# --------------------------------------------------------------------------- #
+def untouched() -> dict[str, Any]:
+    return {
+        "event": None,
+        "decision": None,
+        "containment_incident": None,
+        "containment_workflows": [],
+        "recovery": [],
+    }
+
+
+def replayed(
+    original: dict[str, Any], *, duplicate: bool = True, plan: str = "plan-1"
+) -> dict[str, Any]:
+    """What TERMINAL_REPLAY_PROBE prints for the old attempt."""
+
+    return {
+        "attempt_id": original["attempt_id"],
+        "event_key": original["event_key"],
+        "terminal_status": "FAILED",
+        "ended_at": "2026-10-25T00:00:00+00:00",
+        "before": original,
+        "decision": {**original, "duplicate": duplicate, "recovery_plan_id": plan},
+    }
+
+
+def _run_old_terminal(
+    tmp_path: Path,
+    *,
+    new_attempt_records: dict[str, Any] | None = None,
+    restarts: int = 1,
+    restart_count: int = 1,
+    restart_attempt: bool = True,
+    duplicate: bool = True,
+    plan: str = "plan-1",
+    refused: bool = False,
+) -> tuple[dict[str, Any], list[tuple[str, ...]]]:
+    spec = SPECS["old_terminal"]
+    calls: list[tuple[str, ...]] = []
+
+    def responder(script: str, *a: str) -> dict[str, Any]:
+        if script == att.TERMINAL_REPLAY_PROBE:
+            calls.append(("replay", *a))
+            if refused:
+                return {"attempt_id": a[1], "refused": "no recorded terminal event"}
+            original = {
+                "cluster_id": a[0],
+                "attempt_id": a[1],
+                "event_key": f"{a[0]}/{a[1]}/TrainingAttemptFailureDetected",
+                "status": "PLAN_CREATED",
+                "reason": "r",
+                "duplicate": False,
+                "matched_marker_ids": [],
+                "recovery_plan_id": "plan-1",
+            }
+            return replayed(original, duplicate=duplicate, plan=plan)
+        calls.append(("attempt", *a))
+        attempt_id = a[2]
+        new_id = f"{attempt_id}-r-deadbeef"
+        return attempt_doc(
+            attempt_id,
+            restart_attempt_id=new_id if restart_attempt else None,
+            restarts=restarts,
+            restart_count=restart_count,
+            reservations=[f"res-{i}" for i in range(restart_count)],
+            extra_attempts={new_id: new_attempt_records or untouched()},
+        )
+
+    regional = FakeRegional(cpu_python=responder)
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=regional,
+        settings=settings(spec, tmp_path),
+        probes={},
     )
-    assert (
-        _run(
-            "old_terminal",
-            tmp_path,
-            lambda aid: attempt_doc(aid, decision="NO_ACTION", recovery_ops=()),
-        )["verdict"]
-        == "PASS"
+    return spec.execute(ctx), calls
+
+
+def test_old_terminal_replays_the_recorded_terminal_against_a_running_copy(
+    tmp_path: Path,
+) -> None:
+    result, calls = _run_old_terminal(tmp_path)
+    assert result["verdict"] == "PASS", result["errors"]
+    (job,) = FakeJob.created
+    assert job.mode == "exit_once:1" and job.restart_budget == 1, job.mode
+    replays = [call for call in calls if call[0] == "replay"]
+    assert replays == [("replay", "gpu-eks-cluster", job.attempt_id)], replays
+    assert result["new_attempt"] == f"{job.attempt_id}-r-deadbeef"
+    assert result["replayed_decision"]["duplicate"] is True
+    # The replay came after the restart copy was known (attempt reads first).
+    assert calls.index(replays[0]) > 1, calls
+    final = calls[-1]
+    assert final[0] == "attempt" and final[-1] == result["new_attempt"], (
+        "the last read asks for both attempts"
     )
+    spec = SPECS["old_terminal"]
+    assert "handle_terminal" in spec.injection and "duplicate=true" in spec.expected
+
+
+@pytest.mark.parametrize(
+    ("overrides", "stage", "needle"),
+    [
+        ({"duplicate": False}, "replay_duplicate", "decided anew"),
+        ({"plan": "plan-2"}, "replay_duplicate", "recovery_plan_id"),
+        ({"restarts": 2}, "single_restart", "2 restart workflows"),
+        ({"restart_count": 2}, "budget", "exceeds"),
+        (
+            {
+                "new_attempt_records": {
+                    **untouched(),
+                    "containment_incident": {"incident_id": "inc-new"},
+                }
+            },
+            "new_attempt_untouched",
+            "containment_incident",
+        ),
+        (
+            {
+                "new_attempt_records": {
+                    **untouched(),
+                    "event": {"terminal_status": "STOPPED"},
+                }
+            },
+            "new_attempt_untouched",
+            "has a event",
+        ),
+    ],
+)
+def test_old_terminal_fails_when_the_replay_controls_anything(
+    tmp_path: Path, overrides: dict[str, Any], stage: str, needle: str
+) -> None:
+    result, _calls = _run_old_terminal(tmp_path, **overrides)
+    assert result["verdict"] == "FAIL", result
+    assert any(needle in error for error in result["stages"][stage]), result["stages"]
+
+
+def test_old_terminal_is_inconclusive_without_a_new_attempt_or_a_recorded_terminal(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(VariantInconclusive, match="no new attempt"):
+        _run_old_terminal(tmp_path, restart_attempt=False)
+    with pytest.raises(VariantInconclusive, match="could not be replayed"):
+        _run_old_terminal(tmp_path, refused=True)
+
+
+def test_missing_allocation_is_deferred_with_the_watcher_reason() -> None:
+    spec = SPECS["missing_allocation"]
+    assert not spec.implemented and spec.deferred.startswith("FIXTURE_NOT_READY: "), (
+        spec.deferred
+    )
+    for needle in ("spec.nodeName", "/v1/attempts/terminal", "from_missing_allocation"):
+        assert needle in spec.deferred, needle
+    assert spec.lanes == ("eks", "hp")
+
+
+REPLAY_CODE = compile(att.TERMINAL_REPLAY_PROBE, "<terminal-replay-probe>", "exec")
+
+
+def _replay_probe_run(context: Any, arguments: list[str]) -> dict[str, Any]:
+    import contextlib
+    import io
+    import sys
+    from unittest import mock
+
+    from gpu_fault.app import ApplicationContext
+
+    output = io.StringIO()
+    with (
+        mock.patch.object(ApplicationContext, "from_environment", lambda: context),
+        mock.patch.object(sys, "argv", ["terminal-replay-probe", *arguments]),
+        contextlib.redirect_stdout(output),
+    ):
+        exec(REPLAY_CODE, {"__name__": "__main__"})
+    return json.loads(output.getvalue().splitlines()[-1])
+
+
+def test_terminal_replay_probe_redelivers_the_stored_event_and_refuses_strangers() -> (
+    None
+):
+    import types
+    from datetime import datetime, timezone
+
+    from gpu_fault.models import (
+        CompletionDecision,
+        DecisionStatus,
+        Environment,
+        TerminalEvent,
+        TerminalStatus,
+    )
+    from gpu_fault.store import InMemoryStore
+
+    store = InMemoryStore()
+    event = TerminalEvent(
+        cluster_id="gpu-eks-cluster",
+        environment=Environment.EKS,
+        job_id="gl28ot-x",
+        attempt_id="gl28ot-x-a001",
+        terminal_status=TerminalStatus.FAILED,
+        ended_at=datetime(2026, 10, 25, tzinfo=timezone.utc),
+        runtime_profile_version="p1",
+    )
+    assert store.save_event_if_absent(event), "the event row is new"
+    original = CompletionDecision(
+        cluster_id=event.cluster_id,
+        attempt_id=event.attempt_id,
+        event_key=event.event_key,
+        status=DecisionStatus.PLAN_CREATED,
+        reason="r",
+        recovery_plan_id="plan-1",
+    )
+    store.save_decision(original)
+    handled: list[TerminalEvent] = []
+
+    class Completion:
+        def handle_terminal(self, item: TerminalEvent) -> CompletionDecision:
+            handled.append(item)
+            return original.model_copy(update={"duplicate": True})
+
+    context = types.SimpleNamespace(store=store, completion=Completion())
+    document = _replay_probe_run(context, ["gpu-eks-cluster", "gl28ot-x-a001"])
+    assert handled == [event], "the product's own recorded event is what is redelivered"
+    assert document["decision"]["duplicate"] is True
+    assert document["before"]["recovery_plan_id"] == "plan-1"
+    assert (
+        document["event_key"] == event.event_key
+        and document["terminal_status"] == "FAILED"
+    )
+    assert _replay_probe_run(context, ["gpu-eks-cluster", "gl28ot-y-a001"]) == {
+        "attempt_id": "gl28ot-y-a001",
+        "refused": "no recorded terminal event",
+    }
+    with pytest.raises(ValueError, match="outside the test prefix"):
+        _replay_probe_run(context, ["gpu-eks-cluster", "train-123-a001"])
+    assert len(handled) == 1, "a refused replay redelivers nothing"
 
 
 def test_restart_withheld_passes(tmp_path: Path) -> None:
