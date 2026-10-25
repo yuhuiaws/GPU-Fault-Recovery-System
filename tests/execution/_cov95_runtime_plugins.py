@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -8,6 +9,7 @@ from kubernetes import client
 
 from gpu_fault.adapters import KubernetesWorkflowAdapter
 from gpu_fault.execution import WorkflowExecutionRequest, WorkflowStepContext
+from gpu_fault.execution.step_bounds import record_attempt
 from gpu_fault.models import WorkflowOperation
 from gpu_fault.store import InMemoryStore
 from tests.execution._cov95_runtime_restart import ApiError
@@ -124,3 +126,13 @@ class PluginHarness:
 
     def execute(self):
         return self.adapter.execute(self.context)
+
+    def record(self, outcome: Any) -> None:
+        """Fold ``outcome`` into the context the way the executor does between
+        two passes (``record_attempt`` replaces this step's record), so the next
+        pass reads its own earlier receipt from ``workflow.step_executions``."""
+
+        workflow = record_attempt(
+            self.context.workflow, self.context.step, self.context.step_index, outcome
+        )
+        self.context = replace(self.context, workflow=workflow)

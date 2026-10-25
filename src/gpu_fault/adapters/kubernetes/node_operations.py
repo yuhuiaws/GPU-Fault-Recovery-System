@@ -36,6 +36,8 @@ from gpu_fault.models import (
     IncidentState,
     WorkflowOperation,
     WorkflowStatus,
+    execution_matches_step,
+    execution_phase,
 )
 from gpu_fault.node_provider import efa_device_plugin_name
 from gpu_fault.orchestration.escalation import (
@@ -248,18 +250,22 @@ class KubernetesNodeOperationsMixin:
             if self._pod_ready(pod) and self._pod_uid(pod) != old_uid
         ]
         if allocatable >= expected and (operation is None or ready_new_pods):
-            if operation == context.idempotency_key:
-                self._clear_plugin_restart(node_id, keys)
             result: dict[str, Any] = {
                 "allocatable": allocatable,
                 "expected": expected,
                 "already_healthy": operation is None,
-                "replacement_pod_uids": [self._pod_uid(pod) for pod in ready_new_pods],
             }
+            if operation == context.idempotency_key:
+                self._clear_plugin_restart(node_id, keys)
+                result.update(deleted_plugin_pod_receipt(context, node_id, old_uid))
+            result["replacement_pod_uids"] = [
+                self._pod_uid(pod) for pod in ready_new_pods
+            ]
             if took_over is not None:
                 result["took_over_incident"] = took_over
             return result, False
         if operation == context.idempotency_key:
+            deleted = deleted_plugin_pod_receipt(context, node_id, old_uid)
             if started is None:
                 started = now
             if (now - started).total_seconds() >= timeout_seconds:
@@ -271,12 +277,14 @@ class KubernetesNodeOperationsMixin:
                         "allocatable": allocatable,
                         "expected": expected,
                         "plugin_pods": [self._pod_name(pod) for pod in pods],
+                        **deleted,
                     },
                 )
             return {
                 "allocatable": allocatable,
                 "expected": expected,
                 "waiting_for_replacement_pod": True,
+                **deleted,
             }, True
         if not pods:
             self._mark_plugin_restart(node_id, keys, context, pod_uid="", now=now)
@@ -952,6 +960,56 @@ def split_plugin_pods(
         "companion_pods": [pod_name(pod) for pod in live if companion_pod(pod)],
     }
     return [pod for pod in live if not companion_pod(pod)], report
+
+
+def deleted_plugin_pod_receipt(
+    context: WorkflowStepContext, node_id: str, pod_uid: str
+) -> dict[str, Any]:
+    """What this step's restart deleted on ``node_id``, for every record after
+    the delete attempt's own.
+
+    The executor replaces a step's record on every pass, so the delete
+    attempt's receipt (``deleted_pod`` / ``deleted_pod_uid``) was gone the
+    moment the restart was confirmed and the SUCCEEDED record named only
+    ``replacement_pod_uids`` (live, GF-GENERAL-LIVE-014: nothing durable said
+    which Pod had been restarted). ``pod_uid`` is the node's own
+    ``…-plugin-restart-pod-uid`` annotation, written beside the delete: the
+    product's authority on what went. Empty when the DaemonSet had no Pod to
+    delete and the restart only waited for one -- then there is nothing to
+    name. The Pod's name lives only in this step's earlier receipt and is
+    carried forward when that receipt names the same UID.
+    """
+
+    if not pod_uid:
+        return {}
+    receipt: dict[str, Any] = {"deleted_pod_uid": pod_uid}
+    prior = prior_node_receipt(context, node_id)
+    if prior.get("deleted_pod_uid") == pod_uid and isinstance(
+        prior.get("deleted_pod"), str
+    ):
+        receipt["deleted_pod"] = prior["deleted_pod"]
+    return receipt
+
+
+def prior_node_receipt(context: WorkflowStepContext, node_id: str) -> dict[str, Any]:
+    """This step's last recorded per-node result for ``node_id``, or ``{}``.
+
+    The step execution record the executor replaces on every attempt, or the
+    synthetic prior record a remote executor hands the adapter back
+    (``cluster_executor/dispatch.py``); a record of another step identity at
+    the same index (``execution_matches_step``) is not this step's.
+    """
+
+    phase = execution_phase(context.workflow)
+    for execution in reversed(context.workflow.step_executions):
+        if not execution_matches_step(
+            execution, context.step_index, context.step.operation, phase
+        ):
+            continue
+        node_results = execution.details.get("node_results")
+        receipt = node_results.get(node_id) if isinstance(node_results, dict) else None
+        return dict(receipt) if isinstance(receipt, dict) else {}
+    return {}
 
 
 def pod_terminating(pod: Any) -> bool:
