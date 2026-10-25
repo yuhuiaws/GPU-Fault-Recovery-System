@@ -64,6 +64,37 @@ _ETHTOOL_GROUPS: dict[str, str] = {
 _ETHTOOL_NO_STATISTICS = ("no stats available", "Operation not supported")
 _ETHTOOL_NO_STATISTICS_EXIT = 94
 
+#: The NOT_SUPPORTED marker ``_ethtool_counters`` ships for the groups a netdev
+#: cannot provide, and the prefix of the edge reason it contributes
+#: (``not-supported:<marker>:<netdev>:<reason>:<metrics>``).
+EFA_ETHTOOL_UNSUPPORTED = "efa_ethtool_counters_unsupported"
+NOT_SUPPORTED_REASON_PREFIX = "not-supported:"
+
+
+def not_supported_edge_reason(sample: HostMetricSample) -> str | None:
+    """The edge reason of a NOT_SUPPORTED marker, ``None`` for any other sample.
+
+    The marker is the state a netdev is in and ships on every tick, so it is
+    no edge of its own (``HostTelemetryCollector._edge_reasons``): a netdev
+    that never had a counter rides the baseline batch and then the health
+    summary. The reason carries the whole marker -- netdev, ``reason`` and the
+    metric list -- so that a counter the netdev *stops* exposing (a new name
+    in ``labels.metrics``), one it starts exposing again or a reason change
+    (``MISSING_COUNTER`` <-> ``NO_STATISTICS``) is a new reason, delivered
+    once, and the old one ends as a ``recovered`` edge. Live
+    GF-GENERAL-LIVE-010 ``missing_counter`` (2026-10-25): the marker named the
+    withdrawn counter on every tick, but no reason delivered the batch and a
+    health summary without findings or collection errors is not kept as
+    evidence, so the product's records never said the counter was gone.
+    """
+
+    if sample.name != EFA_ETHTOOL_UNSUPPORTED:
+        return None
+    return (
+        f"{NOT_SUPPORTED_REASON_PREFIX}{sample.name}:{sample.device or 'node'}:"
+        f"{sample.labels.get('reason', '')}:{sample.labels.get('metrics', '')}"
+    )
+
 
 def _is_reportable(name: str, value: float) -> bool:
     """Whether a delta sample earns its place in the batch.
@@ -482,8 +513,9 @@ class HostNetworkMixin:
         failed or hung ``ethtool``, a reset and an unparseable counter are
         UNKNOWN (a collection error, no delta), and a counter the netdev does
         not have is NOT_SUPPORTED (``efa_ethtool_counters_unsupported``, no
-        collection error: the gap is permanent). One netdev's failure no
-        longer costs the others their readings.
+        collection error: the gap is permanent; one that opens, changes or
+        closes after the first tick is an edge, :func:`not_supported_edge_reason`).
+        One netdev's failure no longer costs the others their readings.
         """
 
         if not shutil.which("ethtool"):
@@ -598,7 +630,7 @@ class HostNetworkMixin:
 
         names = sorted(metrics)
         return HostMetricSample(
-            name="efa_ethtool_counters_unsupported",
+            name=EFA_ETHTOOL_UNSUPPORTED,
             value=len(names),
             unit="counters",
             device=interface,

@@ -54,6 +54,12 @@ training, thermal, spare-health or RMA policies from that review.
   baseline, a reset or an unparseable counter is unknown (collection error), a
   failed or hung `ethtool` is a collection error for that netdev only, and a
   counter the netdev lacks is `efa_ethtool_counters_unsupported` instead of 0.
+  The marker is a state, not an edge of its own; a marker that appears,
+  changes or clears after the first tick is one
+  (`not-supported:<marker>:<netdev>:<reason>:<metrics>`), delivered once, so
+  the records say when a netdev stopped exposing a counter -- the first live
+  `missing_counter` run found the changed marker never delivered, the health
+  summary that carried it not kept as evidence.
 - The sysfs RDMA port counters (`rdma_errors_delta`, `rdma_<counter>_delta`)
   and the netdev `statistics` counters (`network_errors_delta`,
   `network_drops_delta`) follow the same reset rule: a counter below its

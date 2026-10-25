@@ -1109,6 +1109,19 @@ emits `efa_ethtool_counters_unsupported` (`value` is the number of missing group
 delta names, `reason` is `MISSING_COUNTER` or `NO_STATISTICS`) instead of a 0, and records no collection error.
 All of these used to be reported as 0, which VALIDATE_FABRIC accepted as a clean link for counters it never measured.
 
+The marker is the state a netdev is in, not an event, and ships with every tick, so it is no edge of its own: a
+counter the node lacked from the start rides the baseline batch and the health summaries after it. The host
+collector's edge filter derives a reason from the whole marker,
+`not-supported:efa_ethtool_counters_unsupported:<netdev>:<reason>:<metrics>` (`collectors/host/network.py`
+`not_supported_edge_reason`, `collector.py` `_edge_reasons`): a counter that disappears from `ethtool -S` mid-run
+(one more name in `metrics`), one that reappears, or a `reason` moving between `MISSING_COUNTER` and
+`NO_STATISTICS` is a new reason, delivered once on that tick, and the old reason ending is a `recovered` edge; an
+unchanged marker is not delivered. On the first tick the reason is stripped like the low-utilisation ones (a state,
+not an edge) but still becomes active, so only a later change is the edge. Before this, a changed marker had no
+delivery reason at all, and a health summary without findings or collection errors writes no raw evidence
+(`app/ingest/telemetry.py`), so the product's records never said that a counter had gone (the first live run of
+GF-GENERAL-LIVE-010 `missing_counter` failed on exactly that).
+
 The sysfs RDMA error counters (`/sys/class/infiniband/<device>/ports/<port>/{counters,hw_counters}`, summed per port
 into `rdma_errors_delta`, each counter also reported as `rdma_<counter>_delta`) and the netdev `statistics` counters
 (`rx_errors`/`tx_errors` as `network_errors_delta`, `rx_dropped`/`tx_dropped` as `network_drops_delta`) handle a counter

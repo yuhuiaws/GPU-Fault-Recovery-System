@@ -16,7 +16,11 @@ from gpu_fault.collectors.gpu.discovery import expected_accelerator_counts
 from gpu_fault.collectors.host.bmc import IPMI_DEVICE_NODES, HostBmcMixin
 from gpu_fault.collectors.host.gpu_rank import HostGpuRankMixin
 from gpu_fault.collectors.host.inventory import HostInventoryMixin
-from gpu_fault.collectors.host.network import HostNetworkMixin
+from gpu_fault.collectors.host.network import (
+    NOT_SUPPORTED_REASON_PREFIX,
+    HostNetworkMixin,
+    not_supported_edge_reason,
+)
 from gpu_fault.collectors.host.observation import HostObservationError
 from gpu_fault.collectors.host.shared_filesystems import HostSharedFilesystemsMixin
 from gpu_fault.collectors.host.shared_mounts import (
@@ -597,13 +601,17 @@ class HostTelemetryCollector(
         if not self.edge_filter_enabled:
             delivery_reasons.add("filter-disabled")
         elif self._last_delivered_at is None:
-            # Idle GPUs read low from a node's first tick: a state, not an
-            # edge. Left in, every collector start would post evidence-class
-            # traffic instead of a routine (spoolable) baseline.
+            # Idle GPUs read low from a node's first tick, and a netdev lacks
+            # the counters it never had: states, not edges. Left in, every
+            # collector start would post evidence-class traffic instead of a
+            # routine (spoolable) baseline. The reasons still become active,
+            # so a later change is the edge.
             delivery_reasons = {
                 reason
                 for reason in delivery_reasons
-                if not reason.startswith(LOW_UTILIZATION_REASONS)
+                if not reason.startswith(
+                    (*LOW_UTILIZATION_REASONS, NOT_SUPPORTED_REASON_PREFIX)
+                )
             }
             delivery_reasons.add("baseline")
         if self._active_edge_reasons - reasons:
@@ -713,6 +721,15 @@ class HostTelemetryCollector(
         for sample in batch.samples:
             if device_gone(sample):
                 continue  # a clear, not a reading: never an edge of its own
+            # A NOT_SUPPORTED marker is keyed by its whole content: a counter
+            # the netdev stops (or starts) exposing changes the reason and is
+            # delivered once; an unchanged marker is not an edge (live
+            # GF-GENERAL-LIVE-010 missing_counter: the marker that named the
+            # withdrawn counter never left the node).
+            not_supported = not_supported_edge_reason(sample)
+            if not_supported is not None:
+                reasons.add(not_supported)
+                continue
             immediate = NodeHealthPolicy.METRIC_RULES.get(sample.name)
             if immediate is not None and sample.value >= immediate[0]:
                 reason = f"threshold:{sample.name}"

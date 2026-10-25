@@ -307,6 +307,78 @@ def test_a_missing_ethtool_counter_is_not_supported_not_zero(host_case):
     )
 
 
+def _not_supported_reason(*metrics: str) -> str:
+    return (
+        "not-supported:efa_ethtool_counters_unsupported:eth0:MISSING_COUNTER:"
+        + ",".join(sorted(metrics))
+    )
+
+
+def test_a_counter_withdrawn_mid_run_is_a_delivered_edge_never_a_zero(host_case):
+    """The marker naming a counter the netdev *stopped* exposing must be delivered.
+
+    Live GF-GENERAL-LIVE-010 ``missing_counter`` (eks, 2026-10-25): the served
+    ``gfrs_rnr_err`` was withdrawn and ``_ethtool_counters`` did name
+    ``efa_rnr_errors_delta`` MISSING_COUNTER on every following tick, but the
+    edge filter had no reason for a NOT_SUPPORTED marker, so no batch carrying
+    the changed marker was delivered, and a health summary without findings or
+    collection errors is not kept as evidence: the product's records never
+    said the counter was gone. A marker that appears, changes or clears after
+    the first tick is an edge; the one a netdev starts with is a state (the
+    baseline batch carries it, ``baseline`` is its only reason).
+    """
+
+    efa_netdev(host_case, "eth0")
+    host_case.outputs[("ethtool", "-S", "eth0")] = ethtool_stats(gfrs_rnr_err=0)
+    collector = host_case.build(
+        "_efa_network", edge_filter_enabled=True, health_summary_seconds=3600
+    )
+    others = ETHTOOL_METRICS - {"efa_rnr_errors_delta"}
+
+    baseline = collector.collect_once()
+    host_case.clock.sleep(15)
+    served = collector.collect_once()
+    host_case.clock.sleep(15)
+    host_case.outputs[("ethtool", "-S", "eth0")] = ethtool_stats(queue_0_tx_cnt=7)
+    withdrawn = collector.collect_once()
+    host_case.clock.sleep(15)
+    collector.collect_once()
+    host_case.clock.sleep(15)
+    host_case.outputs[("ethtool", "-S", "eth0")] = ethtool_stats(gfrs_rnr_err=0)
+    back = collector.collect_once()
+
+    assert counter_samples(served) == {("efa_rnr_errors_delta", "eth0"): 0.0}, (
+        "a zero delta from a served counter is a reading"
+    )
+    assert unsupported(withdrawn) == {
+        "eth0": {
+            "reason": "MISSING_COUNTER",
+            "metrics": ",".join(sorted(ETHTOOL_METRICS)),
+        }
+    }, withdrawn.samples
+    assert counter_samples(withdrawn) == {}, (
+        f"a withdrawn counter shipped a delta: {withdrawn.samples}"
+    )
+    assert withdrawn.collection_errors == [], withdrawn.collection_errors
+    delivered = [payload for _, payload in host_case.sink.requests]
+    assert [payload["batch_id"] for payload in delivered] == [
+        baseline.batch_id,
+        withdrawn.batch_id,
+        back.batch_id,
+    ], [payload["edge_filter_reasons"] for payload in delivered]
+    assert [payload["edge_filter_reasons"] for payload in delivered] == [
+        ["baseline"],
+        [_not_supported_reason(*ETHTOOL_METRICS), "recovered"],
+        [_not_supported_reason(*others), "recovered"],
+    ]
+    markers = [
+        sample["labels"]["metrics"]
+        for sample in delivered[1]["samples"]
+        if sample["name"] == "efa_ethtool_counters_unsupported"
+    ]
+    assert markers == [",".join(sorted(ETHTOOL_METRICS))], delivered[1]["samples"]
+
+
 @pytest.mark.parametrize(
     "answer",
     [
