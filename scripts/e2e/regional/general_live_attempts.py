@@ -19,7 +19,9 @@ reserve/release API and claim preflight on a test job id, in an API Pod).
 
 from __future__ import annotations
 
-from typing import Any
+import json
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any
 
 from scripts.e2e.regional.general_live_fixture import (
     VariantContext,
@@ -41,6 +43,9 @@ from scripts.e2e.regional.general_live_restart_budget import (
 from scripts.e2e.regional.general_live_store import attempt_records
 from scripts.e2e.regional.general_live_verdicts import operations, verdict
 
+if TYPE_CHECKING:
+    from scripts.e2e.regional.managed_workload_fixture import ManagedWorkloadFixture
+
 CASE_028 = "GF-GENERAL-LIVE-028"
 CASE_029 = "GF-GENERAL-LIVE-029"
 ATTEMPT_BUDGET = 900
@@ -48,14 +53,20 @@ SINGLE_NODE_MANIFEST = "single-node-warm-spare-pytorchjob.yaml"
 
 
 class ManagedFailJob:
-    """A managed single-node job whose critical container can be made to exit,
-    stop, or hang; a thin wrapper over ManagedWorkloadFixture.
+    """A managed single-node job whose critical container(s) can be made to
+    exit, stop, or hang; a thin wrapper over ManagedWorkloadFixture.
 
     ``mode`` is baked into the rendered command: ``exit:<code>`` exits the code
     after a short run, ``stop`` waits for a delete/suspend, ``hang`` ignores the
-    terminal signal so the cleanup window times out. The verdict tests
-    monkeypatch this class; test_general_live_managed_job_start.py runs its
-    start with the real fixtures.
+    terminal signal so the cleanup window times out. One mode applies to every
+    replica; a mapping gives each replica role its own (``{"Master": "exit:1",
+    "Worker": "hang"}``). ``ranks`` 2 adds a Worker replica cloned from the
+    manifest's Master, both pinned to the node, and ``gpu_count`` is then per
+    Pod (two 4-GPU Pods fill one p5en node); the product infers the critical
+    rank count from the replicas (``training_submit_cli._pytorch_templates``).
+    The verdict tests monkeypatch this class;
+    test_general_live_managed_job_start.py runs its start with the real
+    fixtures.
     """
 
     def __init__(
@@ -63,9 +74,10 @@ class ManagedFailJob:
         ctx: VariantContext,
         *,
         name: str,
-        mode: str,
+        mode: str | Mapping[str, str],
         restart_budget: int = 1,
         gpu_count: int = 8,
+        ranks: int = 1,
     ) -> None:
         from pathlib import Path
 
@@ -76,6 +88,7 @@ class ManagedFailJob:
             name_managed_workload,
             render_node_pinned_manifest,
         )
+        from scripts.e2e.regional.training_topology import fit_gpu_count
 
         yaml = __import__("yaml")
         if ctx.settings.site_file is None:
@@ -88,6 +101,8 @@ class ManagedFailJob:
         )
         document = yaml.safe_load(rendered.read_text(encoding="utf-8"))
         name_managed_workload(document, name)
+        _add_worker_ranks(document, ranks)
+        fit_gpu_count(document, gpu_count)
         _apply_mode(document, mode)
         document.setdefault("metadata", {}).setdefault("labels", {}).update(
             {"gpu-fault.io/job-id": name, "gpu-fault.io/attempt-id": f"{name}-a001"}
@@ -111,7 +126,7 @@ class ManagedFailJob:
                 job_id=name,
                 attempt_id=self.attempt_id,
                 restart_budget=restart_budget,
-                expected_pods=1,
+                expected_pods=ranks,
                 expected_gpu_count=gpu_count,
             ),
             state_path=ctx.case_dir / f"{name}.ownership.json",
@@ -123,22 +138,113 @@ class ManagedFailJob:
         self.prewarm.create([self.node])
         return self.fixture.submit()
 
+    def suspend(self) -> None:
+        """The job controller's stop: suspend the workload, as Kueue would."""
+
+        suspend_workload(self.fixture)
+
     def delete(self) -> dict[str, Any]:
         from scripts.e2e.regional.managed_workload_fixture import remove_managed_job
 
         return remove_managed_job(self.fixture, self.prewarm)
 
 
-def _apply_mode(document: dict[str, Any], mode: str) -> None:
-    command = {
-        "exit": "sleep 30; exit ${CODE:-1}",
-        "stop": "trap 'exit 143' TERM; sleep 3600",
-        "hang": "trap '' TERM; sleep 3600",
-    }
-    kind = mode.split(":", 1)[0]
-    script = command.get(kind, "sleep 30; exit 1")
-    code = mode.split(":", 1)[1] if ":" in mode and kind == "exit" else "1"
-    for replica in (document.get("spec", {}).get("pytorchReplicaSpecs") or {}).values():
+def suspend_workload(fixture: ManagedWorkloadFixture) -> None:
+    """Suspend a managed workload fixture's own workload as its job controller would.
+
+    ``spec.runPolicy.suspend`` (PyTorchJob) or ``spec.suspend`` (Job,
+    JobSet): the toggle a scheduler such as Kueue applies, which the
+    training operator answers by deleting the replica Pods. The product
+    reads it as a stop by someone else (completion_observation: a suspend
+    without its own initiator annotation), never as a failure. Fenced on
+    the UID and resourceVersion the fixture just adopted, like
+    ``ManagedWorkloadFixture.annotate_auto_resume``. Lives here, with its only
+    caller (028 ``controller_stop``), rather than on the fixture class.
+    """
+
+    current = fixture.workload()
+    fixture.adopt(current)
+    spec = current.get("spec") or {}
+    if fixture.resource == "pytorchjob":
+        operation: dict[str, Any] = (
+            {"op": "add", "path": "/spec/runPolicy/suspend", "value": True}
+            if isinstance(spec.get("runPolicy"), dict)
+            else {
+                "op": "add",
+                "path": "/spec/runPolicy",
+                "value": {"suspend": True},
+            }
+        )
+    else:
+        operation = {"op": "add", "path": "/spec/suspend", "value": True}
+    fixture.regional.kubectl(
+        "gpu",
+        "patch",
+        fixture.resource,
+        fixture.name,
+        "--type=json",
+        "--patch-file=/dev/stdin",
+        input_text=json.dumps(
+            [
+                {
+                    "op": "test",
+                    "path": "/metadata/uid",
+                    "value": current["metadata"]["uid"],
+                },
+                {
+                    "op": "test",
+                    "path": "/metadata/resourceVersion",
+                    "value": current["metadata"]["resourceVersion"],
+                },
+                operation,
+            ]
+        ),
+    )
+
+
+MODE_COMMANDS = {
+    "exit": "sleep 30; exit ${CODE:-1}",
+    "stop": "trap 'exit 143' TERM; sleep 3600",
+    "hang": "trap '' TERM; sleep 3600",
+}
+
+
+def _add_worker_ranks(document: dict[str, Any], ranks: int) -> None:
+    """Give the single-node manifest ``ranks`` critical ranks: its Master and,
+    for a second rank, a Worker replica cloned from it (same node, image,
+    devices); the product counts the ranks from the replicas."""
+
+    import copy
+
+    if ranks not in (1, 2):
+        raise ValueError(f"a managed fail job runs one or two ranks, not {ranks}")
+    replicas = (document.get("spec") or {}).get("pytorchReplicaSpecs") or {}
+    if list(replicas) != ["Master"]:
+        raise ValueError("the single-node manifest renders one Master replica")
+    if ranks == 2:
+        worker = copy.deepcopy(replicas["Master"])
+        worker["replicas"] = 1
+        replicas["Worker"] = worker
+
+
+def _apply_mode(document: dict[str, Any], mode: str | Mapping[str, str]) -> None:
+    replicas = document.get("spec", {}).get("pytorchReplicaSpecs") or {}
+    modes: Mapping[str, str] = (
+        mode if isinstance(mode, Mapping) else dict.fromkeys(replicas, mode)
+    )
+    unknown = sorted(set(modes) - set(replicas))
+    if unknown:
+        raise ValueError(f"no replica to apply a mode to: {', '.join(unknown)}")
+    missing = sorted(set(replicas) - set(modes))
+    if missing:
+        raise ValueError(f"no mode for replica: {', '.join(missing)}")
+    for role, replica in replicas.items():
+        role_mode = modes[role]
+        kind = role_mode.split(":", 1)[0]
+        script = MODE_COMMANDS.get(kind, MODE_COMMANDS["exit"])
+        code = (
+            role_mode.split(":", 1)[1] if ":" in role_mode and kind == "exit" else "1"
+        )
         for container in ((replica.get("template") or {}).get("spec") or {}).get(
             "containers"
         ) or []:
@@ -150,9 +256,22 @@ def _apply_mode(document: dict[str, Any], mode: str) -> None:
 
 
 def _job(
-    ctx: VariantContext, name: str, mode: str, *, restart_budget: int = 1
+    ctx: VariantContext,
+    name: str,
+    mode: str | Mapping[str, str],
+    *,
+    restart_budget: int = 1,
+    gpu_count: int = 8,
+    ranks: int = 1,
 ) -> ManagedFailJob:
-    job = ManagedFailJob(ctx, name=name, mode=mode, restart_budget=restart_budget)
+    job = ManagedFailJob(
+        ctx,
+        name=name,
+        mode=mode,
+        restart_budget=restart_budget,
+        gpu_count=gpu_count,
+        ranks=ranks,
+    )
     ctx.cleanup.push(f"job-{name}", job.delete)
     job.start()
     return job
@@ -238,7 +357,21 @@ def one_restart(ctx: VariantContext) -> dict[str, Any]:
 
 
 def cleanup_timeout(ctx: VariantContext) -> dict[str, Any]:
-    job = _job(ctx, "gl28ct-" + _suffix(ctx), "hang")
+    # The product's TIMED_OUT (watcher.py) needs a detected failure first --
+    # the cleanup deadline starts at the FailureDetectedEvent -- and a critical
+    # rank still not terminated when it passes: a Master that exits non-zero
+    # and a Worker that ignores the stop, two 4-GPU Pods on the node. One
+    # hanging Pod alone never fails, so the terminal stayed None for the whole
+    # wait (live 2026-10-25, eks). No restart budget: the restart is
+    # nonzero_exit's and one_restart's proof, not this variant's.
+    job = _job(
+        ctx,
+        "gl28ct-" + _suffix(ctx),
+        {"Master": "exit:1", "Worker": "hang"},
+        restart_budget=0,
+        gpu_count=4,
+        ranks=2,
+    )
     records = _wait_decision(ctx, job, name="cleanup-timeout")
     entry = _attempt(records, job.attempt_id)
     event = entry.get("event") or {}
@@ -275,10 +408,20 @@ def user_stop(ctx: VariantContext) -> dict[str, Any]:
 
 def controller_stop(ctx: VariantContext) -> dict[str, Any]:
     job = _job(ctx, "gl28cs-" + _suffix(ctx), "stop")
+    ctx.hold(30, name="running")
+    # The job controller's stop: the workload is suspended as a scheduler
+    # (Kueue) does it; the training operator deletes the replica Pod, whose
+    # container exits 143 on TERM. Without this the job waited untouched for
+    # the whole decision wait (live 2026-10-25, eksb: "produced None").
+    job.suspend()
     records = _wait_decision(ctx, job, name="controller-stop")
     entry = _attempt(records, job.attempt_id)
     decision = entry.get("decision") or {}
+    event = entry.get("event") or {}
     stages = {
+        "stopped": []
+        if event.get("terminal_status") == "STOPPED"
+        else [f"terminal was {event.get('terminal_status')}, expected STOPPED"],
         "no_restart": []
         if decision.get("status") == "NO_ACTION"
         else [f"a controller stop produced {decision.get('status')}"],
@@ -589,7 +732,7 @@ VARIANTS = [
     _spec(
         CASE_028,
         "cleanup_timeout",
-        "a failed attempt whose container ignores the stop past cleanup_timeout",
+        "a two-rank attempt (two 4-GPU Pods on the node) whose Master exits non-zero while its Worker ignores the stop past cleanup_timeout; restart budget 0",
         "the terminal is TIMED_OUT; STOP_WORKLOADS still ran",
         cleanup_timeout,
     ),
@@ -611,8 +754,8 @@ VARIANTS = [
     _spec(
         CASE_028,
         "controller_stop",
-        "a controller-initiated stop of the attempt",
-        "STOPPED -> NO_ACTION",
+        "the job controller suspends the running attempt's workload (spec.runPolicy.suspend, as Kueue would); the operator deletes its Pod",
+        "STOPPED -> NO_ACTION; no restart",
         controller_stop,
         risk="L",
     ),

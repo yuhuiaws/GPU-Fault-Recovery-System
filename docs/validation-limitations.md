@@ -1862,6 +1862,25 @@ since only the product derives a `-r-` attempt id under this fixture's nonce.
 The fake namespace reproduces both refusals on the old code (the containment
 inside the cleanup and before it).
 
+Two more 028 variants failed in the same pass for want of an injection:
+`cleanup_timeout` ran one Pod whose only container ignored TERM and slept,
+`controller_stop` one that waited for a stop nobody sent, and both read the
+product's records for the whole 900-s decision wait ("terminal was None", "a
+controller stop produced None"). The product's TIMED_OUT (`watcher.py`) needs
+a detected failure first -- the cleanup deadline starts at the
+FailureDetectedEvent -- and a critical rank still not terminated when it
+passes, so `cleanup_timeout` now runs two ranks on the node, a Master that
+exits non-zero and a Worker that ignores the stop (two 4-GPU Pods), with no
+restart budget: the restart is `nonzero_exit`'s and `one_restart`'s proof.
+`controller_stop` suspends its own running job the way a job controller such
+as Kueue does (`spec.runPolicy.suspend`, fenced on the UID and resourceVersion
+the fixture adopted); the operator deletes the Pod, the product reads a stop
+by someone else, and the verdict wants the STOPPED terminal and NO_ACTION.
+Neither variant proves what the product does with a stop its own control
+plane initiates; that is the containment path of the node-fault categories.
+The two-rank and suspend injections run through the real wrappers and
+fixtures in the fake namespace.
+
 GF-GENERAL-LIVE-030 (warm spare unhealthy) is the same story on the HyperPod
 lane: its `SpareSession` keeps the spare node *name* in `self.node` and also
 defined a `node()` accessor, so the instance attribute shadowed the method and

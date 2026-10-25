@@ -182,6 +182,7 @@ class Cluster:
         }
         self.requests: list[tuple[str, ...]] = []
         self.deletes: list[tuple[str, str, str]] = []
+        self.patches: list[tuple[tuple[str, ...], str]] = []
         self.serial = 0
         #: Scheduler refusals, the product's stops, and the most devices held.
         self.pending: list[str] = []
@@ -230,6 +231,10 @@ class Cluster:
         elif verb == "delete":
             assert arguments[1] == "--raw" and input_text is not None, arguments
             stdout = self.delete(arguments[2], json.loads(input_text))
+        elif verb == "patch":
+            assert input_text is not None, arguments
+            self.patches.append((arguments, input_text))
+            stdout = self.patch(list(arguments[1:]), json.loads(input_text))
         elif verb == "logs":
             stdout = self.logs(arguments[1])
         elif verb == "wait":
@@ -305,6 +310,31 @@ class Cluster:
                 item["metadata"]["ownerReferences"] = kept
             self.bump(item)
         return ""
+
+    def patch(self, arguments: list[str], operations: list[dict[str, Any]]) -> str:
+        """``kubectl patch <kind> <name> --type=json``: test and add operations."""
+
+        kind, name = arguments[0], arguments[1]
+        assert "--type=json" in arguments, arguments
+        current = self.objects.get((kind, name))
+        if current is None:
+            raise RegionalCommandFailed(1, f'{kind} "{name}" not found')
+        for operation in operations:
+            parts = operation["path"].lstrip("/").split("/")
+            parent: Any = current
+            for part in parts[:-1]:
+                parent = parent[part]
+            if operation["op"] == "test":
+                if parent.get(parts[-1]) != operation["value"]:
+                    raise RegionalCommandFailed(1, "the patch's test operation failed")
+            elif operation["op"] == "add":
+                parent[parts[-1]] = copy.deepcopy(operation["value"])
+            else:
+                raise AssertionError(f"unexpected patch operation: {operation}")
+        self.bump(current)
+        if kind == "pytorchjob":
+            self.reconcile(current)
+        return json.dumps(current)
 
     def logs(self, name: str) -> str:
         pod = self.objects[("pod", name)]
@@ -1253,4 +1283,47 @@ def test_a_copy_the_product_already_contained_is_still_its_restart(
     deleted = job.fixture.delete()
 
     assert deleted[f"pytorchjob/{copy_name}"] == stored["metadata"]["uid"], deleted
+    assert cluster.kinds() == {"deployment"}, cluster.objects
+
+
+# --------------------------------------------------------------------------- #
+# 028.controller_stop suspends its own job as a scheduler would
+# --------------------------------------------------------------------------- #
+def test_a_managed_fail_job_suspends_its_own_workload_and_still_cleans_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``controller_stop`` toggles ``spec.runPolicy.suspend`` on its own
+    PyTorchJob (what a job controller such as Kueue does); the operator removes
+    the replica Pod; the fixture's cleanup still owns the suspended object."""
+
+    cluster = Cluster()
+    ctx = variant_context(
+        "GF-GENERAL-LIVE-028.controller_stop", tmp_path, monkeypatch, cluster
+    )
+    job = attempts.ManagedFailJob(ctx, name="gl28cs-c5afa469-2", mode="stop")
+    job.start()
+    name = job.fixture.name
+    assert ("pod", f"{name}-master-0") in cluster.objects
+
+    job.suspend()
+
+    patched = cluster.objects[("pytorchjob", name)]
+    assert patched["spec"]["runPolicy"]["suspend"] is True, patched["spec"]
+    assert ("pod", f"{name}-master-0") not in cluster.objects, (
+        "the operator removes the Pods of a suspended PyTorchJob"
+    )
+    (patch,) = [
+        json.loads(body)
+        for arguments, body in cluster.patches
+        if arguments[:3] == ("patch", "pytorchjob", name)
+    ]
+    assert [op["op"] for op in patch] == ["test", "test", "add"], patch
+    assert patch[0]["path"] == "/metadata/uid", "the patch is fenced by UID"
+
+    receipt = job.delete()
+
+    assert (
+        receipt["workload"]["deleted"][f"pytorchjob/{name}"]
+        == (patched["metadata"]["uid"])
+    ), receipt
     assert cluster.kinds() == {"deployment"}, cluster.objects

@@ -320,6 +320,48 @@ def render_topology_manifest(
     return destination
 
 
+def fit_gpu_count(document: dict[str, Any], gpu_count: int) -> None:
+    """Fit every replica of a single-node training manifest to ``gpu_count``
+    of the node's GPUs, in place (003's 4-GPU jobs, 028's two-rank job).
+
+    The manifests run ``torchrun --nproc-per-node=8`` on eight GPUs with
+    sixteen EFA devices. Changing only the GPU request left eight workers on
+    four GPUs: ``torch.cuda.set_device`` fails for local ranks 4-7, torchrun
+    exits non-zero, the completion watcher's passive containment stops the
+    attempt (``inc-attempt-failure-*`` / STOP_WORKLOADS suspends the job) and
+    the Pod is gone for the whole start wait (live 2026-10-24 and 2026-10-25,
+    003.ambiguous_ownership: "managed workload did not become healthy", pods
+    []). The worker count follows the GPU count, so the heartbeat's world size
+    is the one the fixture expects, and the EFA request keeps the manifest's
+    devices per GPU, so two 4-GPU Pods fit one node's 16 EFA devices.
+    """
+
+    if not 1 <= gpu_count <= 8:
+        raise ValueError(f"a single-node managed job runs 1-8 GPUs, not {gpu_count}")
+    for replica in (document.get("spec", {}).get("pytorchReplicaSpecs") or {}).values():
+        for container in ((replica.get("template") or {}).get("spec") or {}).get(
+            "containers"
+        ) or []:
+            resources = container.setdefault("resources", {})
+            limits = resources.get("limits") or {}
+            gpus = int(limits.get(GPU_RESOURCE, 0) or 0)
+            efa = int(limits.get(EFA_RESOURCE, 0) or 0)
+            for bucket in ("requests", "limits"):
+                values = resources.get(bucket) or {}
+                if GPU_RESOURCE in values:
+                    values[GPU_RESOURCE] = str(gpu_count)
+                if EFA_RESOURCE in values and gpus > 0:
+                    values[EFA_RESOURCE] = str(max(1, efa * gpu_count // gpus))
+            for key in ("command", "args"):
+                if isinstance(container.get(key), list):
+                    container[key] = [
+                        NPROC_PATTERN.sub(f"--nproc-per-node={gpu_count}", part)
+                        if isinstance(part, str)
+                        else part
+                        for part in container[key]
+                    ]
+
+
 def all_reduce_marker(world_size: int) -> str:
     """The ``all_reduce=`` text every rank prints for ``world_size`` ranks."""
 

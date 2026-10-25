@@ -32,14 +32,18 @@ class FakeJob:
         ctx: Any,
         *,
         name: str,
-        mode: str,
+        mode: Any,
         restart_budget: int = 1,
         gpu_count: int = 8,
+        ranks: int = 1,
     ) -> None:
         self.name = name
         self.attempt_id = f"{name}-a001"
         self.mode = mode
         self.restart_budget = restart_budget
+        self.gpu_count = gpu_count
+        self.ranks = ranks
+        self.suspended = False
 
         class _Fixture:
             def __init__(self, outer: "FakeJob") -> None:
@@ -54,6 +58,9 @@ class FakeJob:
 
     def start(self) -> dict[str, Any]:
         return {}
+
+    def suspend(self) -> None:
+        self.suspended = True
 
     def delete(self) -> None:
         pass
@@ -232,6 +239,63 @@ def test_cleanup_timeout(tmp_path: Path) -> None:
         )["verdict"]
         == "FAIL"
     )
+
+
+def test_cleanup_timeout_injects_a_failed_rank_and_a_rank_that_ignores_the_stop(
+    tmp_path: Path,
+) -> None:
+    """Live 2026-10-25 (eks): the variant ran one Pod whose only container
+    ignored TERM and slept; nothing failed, the product saw a healthy attempt
+    for 900 s and the terminal stayed None. The product's TIMED_OUT needs a
+    detected failure first (watcher.py: the cleanup deadline starts at the
+    FailureDetectedEvent) and a critical rank still not terminated at that
+    deadline: two ranks, one exiting non-zero, one ignoring the stop, on one
+    node (4 GPUs each), with no restart budget -- the restart is not what this
+    variant proves."""
+
+    _run(
+        "cleanup_timeout",
+        tmp_path,
+        lambda aid: attempt_doc(aid, terminal="TIMED_OUT", recovery_ops=()),
+    )
+    (job,) = FakeJob.created
+    assert job.mode == {"Master": "exit:1", "Worker": "hang"}, job.mode
+    assert (job.ranks, job.gpu_count, job.restart_budget) == (2, 4, 0)
+
+
+def test_controller_stop_suspends_the_job_before_reading_the_stop(
+    tmp_path: Path,
+) -> None:
+    """Live 2026-10-25 (eksb): the variant started a job that waited for a stop
+    and never stopped it; 900 s later the decision was None. The injection is
+    the job controller's suspend of the workload (``spec.runPolicy.suspend``,
+    what Kueue does), after which the product must read a STOPPED terminal and
+    answer NO_ACTION."""
+
+    suspended_when_read: list[bool] = []
+
+    def build(aid: str) -> dict[str, Any]:
+        suspended_when_read.append(FakeJob.created[-1].suspended)
+        return attempt_doc(
+            aid, terminal="STOPPED", decision="NO_ACTION", recovery_ops=()
+        )
+
+    result = _run("controller_stop", tmp_path, build)
+    assert result["verdict"] == "PASS", result["errors"]
+    assert suspended_when_read and all(suspended_when_read), (
+        "the stop is read only after the suspend was sent"
+    )
+    assert FakeJob.created[-1].mode == "stop"
+    # A terminal that is not a stop, or a decision that restarts, is a FAIL.
+    for terminal, decision in (("FAILED", "NO_ACTION"), ("STOPPED", "PLAN_CREATED")):
+        result = _run(
+            "controller_stop",
+            tmp_path,
+            lambda aid, t=terminal, d=decision: attempt_doc(
+                aid, terminal=t, decision=d, recovery_ops=()
+            ),
+        )
+        assert result["verdict"] == "FAIL", (terminal, decision, result)
 
 
 def test_user_and_controller_stop(tmp_path: Path) -> None:

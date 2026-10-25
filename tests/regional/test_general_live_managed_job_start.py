@@ -415,9 +415,11 @@ def test_every_managed_job_reaches_its_first_mutation_pinned_to_the_target_node(
         document
     )
     assert (prewarm["started"], prewarm["creations"]) == (True, {})
-    assert sorted(item["spec"]["nodeName"] for item in templates(document)) == sorted(
-        nodes
-    ), document["spec"]
+    # Every template is pinned to a lane node and every lane node is used:
+    # 028.cleanup_timeout runs two ranks on the one node (a set, not a list).
+    assert {item["spec"]["nodeName"] for item in templates(document)} == set(nodes), (
+        document["spec"]
+    )
     assert {
         item["metadata"]["annotations"][TRAINING_CONTAINER_ANNOTATION]
         for item in templates(document)

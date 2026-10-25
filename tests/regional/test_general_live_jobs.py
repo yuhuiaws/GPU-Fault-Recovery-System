@@ -296,3 +296,55 @@ def test_main_deferred_execute_records_not_run(
     import json
 
     assert json.loads(evidence.read_text())["verdict"] == "NOT_RUN"
+
+
+def test_managed_fail_job_renders_two_ranks_with_their_own_modes_on_one_node(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """028.cleanup_timeout: a Master that exits non-zero and a Worker that
+    ignores the stop, both pinned to the node, four GPUs and eight EFA devices
+    each (two such Pods fill one p5en node), expected as two Pods."""
+
+    _patch_workload(monkeypatch)
+    spec = next(s for s in att.VARIANTS if s.variant == "cleanup_timeout")
+    ctx = _ctx(spec, tmp_path)
+    job = att.ManagedFailJob(
+        ctx,
+        name="gl28ct",
+        mode={"Master": "exit:1", "Worker": "hang"},
+        restart_budget=0,
+        gpu_count=4,
+        ranks=2,
+    )
+    document = yaml.safe_load((ctx.case_dir / "gl28ct.source.yaml").read_text())
+    replicas = document["spec"]["pytorchReplicaSpecs"]
+    assert list(replicas) == ["Master", "Worker"]
+    rendered = {}
+    for role, replica in replicas.items():
+        (container,) = replica["template"]["spec"]["containers"]
+        rendered[role] = (
+            replica["replicas"],
+            replica["template"]["spec"]["nodeName"],
+            container["command"][-1],
+            container["resources"]["limits"]["nvidia.com/gpu"],
+            container["resources"]["requests"]["vpc.amazonaws.com/efa"],
+        )
+    assert rendered == {
+        "Master": (1, NODE, "sleep 30; exit ${CODE:-1}", "4", "8"),
+        "Worker": (1, NODE, "trap '' TERM; sleep 3600", "4", "8"),
+    }, rendered
+    assert job.fixture.settings.expected_pods == 2
+    assert job.fixture.settings.expected_gpu_count == 4
+    assert job.fixture.settings.restart_budget == 0
+
+
+def test_managed_fail_job_refuses_a_mode_for_a_replica_it_does_not_render(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_workload(monkeypatch)
+    spec = next(s for s in att.VARIANTS if s.variant == "cleanup_timeout")
+    ctx = _ctx(spec, tmp_path)
+    with pytest.raises(ValueError, match="Worker"):
+        att.ManagedFailJob(
+            ctx, name="gl28x", mode={"Master": "exit:1", "Worker": "hang"}
+        )
