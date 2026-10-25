@@ -889,11 +889,27 @@ def counter_reset(ctx: VariantContext) -> dict[str, Any]:
     )
 
 
+#: Below this standard await the weighted/standard comparison cannot
+#: discriminate: ``_await_divergence`` tolerates 5 ms, so sub-5 ms awaits read
+#: "no divergence" whatever formula the product uses.
+AWAIT_TOLERANCE_FLOOR_MS = 5.0
+
+
 def reference_iostat(ctx: VariantContext) -> dict[str, Any]:
-    """Compare the product's weighted await with the standard await (spec FAIL)."""
+    """Compare the product's weighted await with the standard await (spec FAIL).
+
+    The comparison needs awaits above the 5 ms tolerance floor, so the test
+    device gets the 200 ms dm-delay table -- with a loaded ``dm_delay``, or one
+    loaded for the run under the optional ``KERNEL_MODULE_LOAD``. A plain
+    linear device on NVMe reads sub-millisecond awaits that no formula
+    difference can lift past the floor: 2026-10-25 on ip-10-0-43-5 the
+    product's 0.30-0.44 ms against the oracle's 0.33-0.76 ms read PASS on this
+    expected-FAIL variant, proving nothing; that reading is INCONCLUSIVE now.
+    """
 
     run_survey(ctx)  # whether dm_delay is loaded is the survey's answer
-    created = _create_dm(ctx, delay_ms=200 if _dm_delay_loaded(ctx) else 0)
+    delayed = _dm_delay_loaded(ctx) or "KERNEL_MODULE_LOAD" in ctx.settings.approvals
+    created = _create_dm(ctx, delay_ms=200 if delayed else 0)
     device = _device_name(created)
     started = utc_now()
     oracle = Oracle(ctx, "disk")
@@ -919,6 +935,21 @@ def reference_iostat(ctx: VariantContext) -> dict[str, Any]:
         lambda record: record.get("standard_await_ms"),
     )
     _stop_io(ctx)
+    if not product or not standard:
+        # Nothing to compare is not "no divergence": the oracle or the product
+        # produced no await sample for the device.
+        raise VariantInconclusive(
+            f"no await samples to compare (product {len(product)}, "
+            f"oracle {len(standard)})"
+        )
+    median = _median(standard) or 0.0
+    if median < AWAIT_TOLERANCE_FLOOR_MS:
+        raise VariantInconclusive(
+            f"the standard await stayed under the {AWAIT_TOLERANCE_FLOOR_MS:g} ms "
+            f"tolerance floor (median {median:.2f} ms): the weighted/standard "
+            "comparison cannot discriminate; run with --approve KERNEL_MODULE_LOAD "
+            "so the dm-delay table lifts the awaits"
+        )
     diverged = _await_divergence(product, standard)
     stages = {
         "await_definition": [
@@ -931,6 +962,7 @@ def reference_iostat(ctx: VariantContext) -> dict[str, Any]:
     return _result(
         stages,
         extra={
+            "delay_ms": 200 if delayed else 0,
             "product_await_ms": product[-5:],
             "standard_await_ms": standard[-5:],
             "diverged": diverged,
@@ -988,14 +1020,22 @@ def _dm_delay_loaded(ctx: VariantContext) -> bool:
     return bool((ctx.survey.get("modules") or {}).get("dm_delay", {}).get("loaded"))
 
 
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    import statistics
+
+    return float(statistics.median(values))
+
+
 def _await_divergence(product: list[float], standard: list[float]) -> bool:
     if not product or not standard:
         return False
-    import statistics
-
-    product_median = statistics.median(product)
-    standard_median = statistics.median(standard)
-    return abs(product_median - standard_median) > max(5.0, 0.10 * standard_median)
+    product_median = _median(product) or 0.0
+    standard_median = _median(standard) or 0.0
+    return abs(product_median - standard_median) > max(
+        AWAIT_TOLERANCE_FLOOR_MS, 0.10 * standard_median
+    )
 
 
 def _await_io_recovery(
@@ -1092,6 +1132,7 @@ def _io_spec(
     gap: str = "",
     lanes=("eks", "hp"),
     approvals=(),
+    optional_approvals=(),
 ) -> VariantSpec:
     return VariantSpec(
         case_id=CASE_006,
@@ -1108,6 +1149,7 @@ def _io_spec(
         expected_outcome=outcome,
         product_gap=gap,
         approvals=tuple(approvals),
+        optional_approvals=tuple(optional_approvals),
     )
 
 
@@ -1212,12 +1254,16 @@ VARIANTS = [
     ),
     _io_spec(
         "reference_iostat",
-        "sample /proc/diskstats at 1 s and compute the standard await vs the product's weighted await",
-        "the product uses weighted time / ios; a divergence > 10 % or 5 ms is the spec FAIL",
+        "dm-delay 200 ms (dm_delay loaded, or loaded for the run under the optional "
+        "KERNEL_MODULE_LOAD); sample /proc/diskstats at 1 s and compute the standard "
+        "await vs the product's weighted await",
+        "the product uses weighted time / ios; a divergence > 10 % or 5 ms is the spec "
+        "FAIL; awaits under the 5 ms tolerance floor (no dm-delay) are INCONCLUSIVE",
         reference_iostat,
         max_minutes=20,
         outcome="FAIL",
         gap="disk_io_await_ms uses the weighted in-flight time (field 11) / ios, not the standard await",
+        optional_approvals=("KERNEL_MODULE_LOAD",),
     ),
     _io_spec(
         "recovery",

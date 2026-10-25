@@ -813,3 +813,89 @@ def test_unusable_filesystem_wrong_failure_mode_label_fails(
     result = spec.execute(ctx)
     assert result["verdict"] == "FAIL", result
     assert any(mode in error for error in result["errors"]), result["errors"]
+
+
+@pytest.mark.parametrize(
+    ("loaded", "approved", "delay", "load"),
+    [(True, False, "200", False), (False, True, "200", True)],
+    ids=["delay-loaded", "delay-loaded-for-the-run"],
+)
+def test_reference_iostat_lifts_the_awaits_with_dm_delay(
+    tmp_path: Path, loaded: bool, approved: bool, delay: str, load: bool
+) -> None:
+    """The weighted/standard comparison needs awaits above the 5 ms tolerance
+    floor: dm-delay 200 ms, loaded for the run under the optional
+    KERNEL_MODULE_LOAD when the node lacks it (before, only a dm_delay someone
+    else had loaded counted, and this site never has one)."""
+
+    from tests.regional._general_live_fakes import make_settings
+
+    spec = SPECS["reference_iostat"]
+    assert spec.optional_approvals == ("KERNEL_MODULE_LOAD",), spec.optional_approvals
+    store = storage_probe()
+    settings = make_settings(spec)
+    approvals = ("KERNEL_MODULE_LOAD",) if approved else ()
+    settings = type(settings)(**{**settings.__dict__, "approvals": approvals})
+    regional = FakeRegional(cpu_python=store_script({"activity": {}}))
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=regional,
+        settings=settings,
+        probes=probes(node_probe(survey(dm_delay=loaded)), store, window_probe()),
+    )
+    with pytest.raises(VariantInconclusive):
+        spec.execute(ctx)  # no scripted oracle samples
+    arguments = _dm_create_arguments(store)
+    assert arguments[arguments.index("--delay-ms") + 1] == delay, arguments
+    assert ("--load-module" in arguments) is load, arguments
+
+
+def test_reference_iostat_is_inconclusive_under_the_tolerance_floor(
+    tmp_path: Path,
+) -> None:
+    """No dm_delay and no approval to load it: a linear device on NVMe reads
+    sub-millisecond awaits that no formula difference can lift past the 5 ms
+    floor -- 2026-10-25 on ip-10-0-43-5 the product's 0.30-0.44 ms against the
+    oracle's 0.33-0.76 ms read PASS on an expected-FAIL variant."""
+
+    from tests.regional._general_live_fakes import make_settings
+
+    spec = SPECS["reference_iostat"]
+    store = storage_probe()
+    node = node_probe(survey(dm_delay=False))
+    node.script["oracle-read"] = {
+        "records": [
+            {"diskstats": {"dm-7": {"standard_await_ms": 0.45}}} for _ in range(30)
+        ],
+        "next_offset": 30,
+        "total": 30,
+    }
+    doc = {
+        "incidents": [incident("inc-io", "disk_io_await_ms", device="dm-7")],
+        "workflows": [],
+        "batches": [
+            host_batch(
+                f"2026-10-24T00:0{i}:00+00:00", "disk_io_await_ms", 0.3, device="dm-7"
+            )
+            for i in range(4)
+        ],
+        "markers": [],
+        "commands": [],
+        "health_signals": {},
+        "notifications": [],
+    }
+    settings = make_settings(spec)
+    settings = type(settings)(**{**settings.__dict__, "approvals": ()})
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=FakeRegional(cpu_python=store_script({"activity": doc})),
+        settings=settings,
+        probes=probes(node, store, window_probe()),
+    )
+    with pytest.raises(VariantInconclusive) as caught:
+        spec.execute(ctx)
+    assert "tolerance floor" in str(caught.value), str(caught.value)
+    arguments = _dm_create_arguments(store)
+    assert arguments[arguments.index("--delay-ms") + 1] == "0", arguments
