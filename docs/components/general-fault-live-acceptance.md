@@ -980,7 +980,16 @@ expected FAIL 变体却 PASS），这种底线之下的读数以及无样本可�
   `memory-stop` 复位单元并撤销 deadman。在长于 120 秒持续窗口加一个 health summary 的窗口内
   重复 3 次；meminfo oracle 读到的主机 `memory_used_percent` 须全程低于 95%（越过即
   `INCONCLUSIVE`：主机本身有压力），窗口内产品须至少接收一个主机内存样本（否则
-  `INCONCLUSIVE`：静默通道无法证明判定）。PASS 要求无 `memory_used_percent`/
+  `INCONCLUSIVE`：静默通道无法证明判定）。该样本的见证取产品自己的记录：窗口内 evidence
+  批次里的 `memory_used_percent` 样本，或——因为稳态投递按设计不写 evidence
+  （`app/ingest/telemetry.py` 只在有 finding、有采集错误或投递理由不只 `health-summary`
+  时才 `_capture_evidence`，而本变体构造的恰是一个没有任何沿的安静窗口）——产品从每一批被接收
+  的主机遥测都会 upsert 的 `memory_used_percent` latest 记录，其 `observed_at` 落在本次读取的
+  `since` 之后（值本身不算证据：latest 永远有一条）；`host-` 前缀的 HOST_TELEMETRY collector
+  status（同样每批 upsert）作为旁证与 evidence 子集一并写入 `cgroup-window.json`。2026-10-25
+  两个 lane 的首次真机运行（EKS 第 5 次、HyperPod 第 4 次）都因此判 `INCONCLUSIVE`：窗口
+  约 11.5 分钟内两次 health summary 已被接收（HyperPod 节点的 collector status 从 16:21:25
+  移到 16:31:25，101 个样本），但只按 evidence 读样本的运行器一条也看不到。PASS 要求无 `memory_used_percent`/
   `memory_available_percent` finding、无硬件步骤、无 STOP/cordon/隔离、节点仍可调度；若节点
   日志采集器被启用而把 OOM 行判为 finding，只接受 RUN_DIAGNOSTICS 诊断（`log_rules.py`），
   任何 STOP 或隔离为 FAIL。
