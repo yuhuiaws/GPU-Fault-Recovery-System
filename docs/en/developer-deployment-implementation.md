@@ -751,7 +751,10 @@ A single rollout of a CPU role or a GPU Executor/Watcher/Collector is capped at 
 Job has an active deadline and a host `flock`, and the Reconciler handles only the Fleet's current wave. A deterministic pin,
 protocol or compatibility mismatch must fail before apply and cannot consume the full rollout window.
 The Node Installer ConfigMap name uses the digest of the rendered Job YAML; node annotations and the Agent
-heartbeat use the template source digest provided by the release. The two must not reuse the same self-referencing variable.
+heartbeat use the template identity provided by the release: the template source digest, folded for an `eks-managed`
+cluster's host DCGM mode into `sha256("<source digest>:dcgm-hostengine:host")` (`regional_release_node_identity`), so a
+release that only changes the node configuration also leaves the nodes PENDING in the fleet and rolls them through the
+Agent waves. The two must not reuse the same self-referencing variable.
 previous separately stores the `GPU_FAULT_INSTALLER_TEMPLATE_CONTENT_SHA256` the old Reconciler already trusted,
 and uses it to validate the full bytes of the actual `job.yaml` in the ConfigMap as well as the old dependency image/inventory/read-only mounts;
 the digest must not be recomputed over the mutable live Job and then authorized as the old version. An explicit template override must also provide that

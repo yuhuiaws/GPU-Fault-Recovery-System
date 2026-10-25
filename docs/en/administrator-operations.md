@@ -2263,10 +2263,12 @@ Follow these steps in order and without pausing between them:
    so labelling before the hostengine runs is refused and the exporter is left untouched; conversely, enabling
    `nvidia-dcgm` (even `enable` without a start) and deploying without the label is refused by the embedded-mode conflict
    check (see the table below). Once the preflight passes the exporter is re-rendered (dialling `127.0.0.1:5555`,
-   annotation `gpu-fault.io/dcgm-hostengine: host`), the cluster's Agents are re-installed in waves (Agent environment
-   `GPU_FAULT_DCGM_HOSTENGINE=host`, node annotation `gpu-fault.io/installer-dcgm-hostengine=host`) and `site.yaml` records
-   `dcgmHostEngine: host`. Between enabling the hostengine in step 1 and this deploy's re-render two hostengines run on
-   each node (the exporter's embedded one and the host service), so keep that window short. Deploy even when the source
+   annotation `gpu-fault.io/dcgm-hostengine: host`), the cluster's Agents are re-installed in waves (a one-node canary
+   first, every wave through the safety gate and the failure-domain cap; Agent environment `GPU_FAULT_DCGM_HOSTENGINE=host`,
+   node annotation `gpu-fault.io/installer-dcgm-hostengine=host`, the installer template identity the Agents report folds
+   the mode, detailed design §2.4.1) and `site.yaml` records `dcgmHostEngine: host`. Between enabling the hostengine in
+   step 1 and this deploy's re-render two hostengines run on each node (the exporter's embedded one and the host
+   service), so keep that window short. Deploy even when the source
    did not change; before it, `status` shows the `next deploy: DATA_PLANE_COMPATIBLE (dcgm_hostengine: ...)` above. A
    refusal names every failed node on a line of its own (reasons whole, never cut; reasons beyond the line length are
    counted) and each remedy once: the preflight batch writes a per-node report to a private file the release engine
