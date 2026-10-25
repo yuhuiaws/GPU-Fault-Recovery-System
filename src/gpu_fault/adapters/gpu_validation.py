@@ -60,6 +60,42 @@ from gpu_fault.telemetry import (
 from gpu_fault.workflow_quarantine import quiesce_taint_nodes_held
 
 
+#: The per-interface link readings. The host collector writes one for every
+#: interface in its scope -- each interface on its required list, present or
+#: missing (``network_link_down=1``), and every device-backed netdev -- into
+#: every batch it delivers (``collectors/host/network.py``).
+INTERFACE_LINK_METRICS = frozenset({"network_link_down", "network_link_up"})
+
+
+def current_interface_readings(
+    latest: list[Any], newest_batch_at: datetime | None
+) -> list[Any]:
+    """Drop the link readings the node's newest complete host batch no longer has.
+
+    A latest-value row outlives the interface it describes: once an interface
+    leaves the collector's scope -- taken off its required-interface list, or
+    a test interface deleted and its collector window closed -- its last
+    reading stays inside the validation window, and a ``network_link_down=1``
+    (``network_link_up=0``) failed VALIDATE_HOST (VALIDATE_FABRIC) on an
+    interface the node no longer reports (live 2026-10-25,
+    GF-GENERAL-LIVE-008 interface_missing: the validated restore ended
+    FAILED). ``newest_batch_at`` must be the HOST_TELEMETRY status's last
+    success with no collection error since -- what the caller's collector
+    check already demands -- so that batch read every interface in scope and
+    a link row older than it is out of scope. Every other row is kept: not
+    every contributor reports every device in every batch.
+    """
+
+    if newest_batch_at is None:
+        return list(latest)
+    return [
+        item
+        for item in latest
+        if item.name not in INTERFACE_LINK_METRICS
+        or item.observed_at >= newest_batch_at
+    ]
+
+
 class GpuValidationAdapter:
     OPERATIONS = operations_for_adapter(OperationAdapter.GPU_VALIDATION)
 
@@ -393,6 +429,10 @@ class GpuValidationAdapter:
             if now - item.observed_at <= max_age
             and (readiness_after is None or item.observed_at > readiness_after)
         ]
+        host = statuses.get(CollectorKind.HOST_TELEMETRY)
+        if CollectorKind.HOST_TELEMETRY in required_collectors and host is not None:
+            # Checked above: fresh, and no collection error since its success.
+            latest = current_interface_readings(latest, host.last_success_at)
         return all_latest, latest
 
     def _validate_inventory(
