@@ -3737,14 +3737,37 @@ Other RDMA devices such as mlx5 are excluded. A bound device counts toward
 `efa_inventory_active_count` when any of its ports satisfies both
 `state=4: ACTIVE` and `phys_state=5: LinkUp`.
 
+The PCI root is `/sys/bus/pci/devices` by default: the node installer writes no
+`GPU_FAULT_PCI_DEVICES_ROOT`, and the host collector reads the real bus whenever the variable is
+unset or empty (`collectors/host/collector.build_from_environment`), so `PCI_DEVICE_MISSING` is
+reachable on every production node; only an explicit non-empty value points it at another tree
+(acceptance replays). EFA functions are counted by PCI vendor/device ID, not by netdev: the 16
+`rdmap*` devices of a p5en are 16 `0x1d0f:0xefa*` functions. The host collector unit's sandbox
+(`ProtectSystem=strict`, no `InaccessiblePaths`) leaves `/sys` readable. When the PCI root cannot
+be read (missing, not a directory, hidden by a sandbox) or the tree lists no PCI device at all (a
+bus always carries its bridges; an empty tree is a mis-pointed or hidden root), the whole EFA
+inventory step reports only the collection error `EFA inventory observation unavailable: ...`
+(UNKNOWN): no count or mismatch sample is produced, the consecutive-mismatch counter resets, and
+an unreadable bus is never read as zero cards.
+
+Every EFA inventory sample also carries a `pci_evidence` label saying whether the PCI listing is
+trustworthy: `LISTED` (trusted; the full tiering below applies); `INCONSISTENT` (the PCI listing
+is below the driver's bound count -- the driver cannot hold a function that is not on the bus, so
+this is an incomplete listing or a mis-pointed root, not a lost card; the verdict falls back to the
+driver and port evidence exactly as without a PCI listing, and the PCI count stays visible as read
+in `discovered_count`); `UNAVAILABLE` (no PCI listing; only test construction reaches it).
+`PCI_DEVICE_MISSING` therefore holds only when the PCI listing is trusted and two consecutive
+valid samples list fewer functions than expected.
+
 A mismatch therefore carries an explicit `failure_mode`:
 
 | failure mode | Criterion |
 | --- | --- |
-| `PCI_DEVICE_MISSING` | PCI discovered `< expected` |
+| `PCI_DEVICE_MISSING` | `pci_evidence=LISTED` and PCI discovered `< expected` |
 | `DRIVER_UNBOUND` | PCI complete, but driver bound `< expected` |
 | `LINK_INACTIVE` | driver complete, but ACTIVE/LinkUp `< expected` |
 | `EXCESS_DEVICE` | ACTIVE count greater than the node invariant |
+| `INVENTORY_UNAVAILABLE` | PCI listing not trusted (`INCONSISTENT`/`UNAVAILABLE`) and driver bound `< expected`: the shortfall cannot be classified, diagnostics only, no reboot |
 
 The expected values come from the node-local `GPU_FAULT_EXPECTED_GPU_COUNT` and
 `GPU_FAULT_EXPECTED_EFA_DEVICE_COUNT`, not from a global control-plane configuration. The HyperPod
