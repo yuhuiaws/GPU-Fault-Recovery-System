@@ -46,7 +46,13 @@ def run_survey(ctx: VariantContext) -> dict[str, Any]:
     residue = value.get("residue") or {}
     if any(
         residue.get(key)
-        for key in ("page_cache_files", "paused_units", "paused_processes")
+        for key in (
+            "page_cache_files",
+            "paused_units",
+            "paused_processes",
+            "pause_dropins",
+            "pause_hooks",
+        )
     ) or residue.get("log_collector_enabled_by_run"):
         raise VariantNotRun(
             "FIXTURE_NOT_READY", "an earlier attempt of this run left node residue"

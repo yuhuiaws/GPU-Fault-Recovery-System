@@ -76,6 +76,17 @@ PAUSABLE_UNITS = (
     "gpu-fault-log-collector.service",
 )
 LOG_COLLECTOR_UNIT = "gpu-fault-log-collector.service"
+#: A pause must outlive the product's own restart of the unit. The Node Agent's
+#: TRIGGER_HEALTH_SNAPSHOT step (``node_agent/operations/diagnostics.py``)
+#: runs ``systemctl restart`` on the metrics and host collectors; systemd
+#: follows SIGTERM with SIGCONT, so a bare SIGSTOP ends with the old process
+#: and the new one posts freely. Live 2026-10-25 the GPU inventory channel
+#: (180 s, same unit) tripped that refresh 183 s into a GPU_METRICS pause
+#: (420 s): the restarted collector kept GPU_METRICS FRESH_SUCCESS. A drop-in
+#: under this root stops every new main process; ``unit-resume`` and the
+#: deadman remove it (and reload) before SIGCONT, and a leftover is residue.
+PAUSE_DROPIN_ROOT = Path("/run/systemd/system")
+PAUSE_DROPIN_PREFIX = "90-gfrs-pause-"
 PRODUCT_UNITS = (
     *PAUSABLE_UNITS,
     "gpu-fault-node-agent.service",
@@ -520,6 +531,8 @@ def residue(run_id: str) -> dict[str, Any]:
             for pid, info in state["paused_processes"].items()
             if process_is_stopped(int(pid), info.get("start_ticks"))
         },
+        "pause_dropins": [str(path) for path in leftover_pause_dropins(run_id)],
+        "pause_hooks": loaded_pause_hooks(),
         "log_collector_enabled_by_run": bool(state.get("log_collector")),
     }
 
@@ -1107,11 +1120,87 @@ def process_is_stopped(pid: int, start_ticks: str | None) -> bool:
     return bool(fields) and fields[0] == "T"
 
 
+def pause_dropin_path(run_id: str, unit: str) -> Path:
+    return (
+        PAUSE_DROPIN_ROOT
+        / f"{unit}.d"
+        / f"{PAUSE_DROPIN_PREFIX}{run_digest(run_id)}.conf"
+    )
+
+
+def install_pause_dropin(run_id: str, unit: str) -> dict[str, Any]:
+    """Load a drop-in that SIGSTOPs every new main process of ``unit``.
+
+    ``ExecStartPost`` runs once the main process is forked (``Type=simple``),
+    before the collector has discovered a GPU or posted anything, so a product
+    restart during the pause leaves the channel silent instead of fresh.
+    """
+
+    kill = shutil.which("kill") or "/usr/bin/kill"
+    if not Path(kill).is_file():
+        raise ProbeError("no kill binary for the pause drop-in")
+    path = pause_dropin_path(run_id, unit)
+    created_dir = not path.parent.is_dir()
+    path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    path.write_text(
+        f"# gpu-fault acceptance pause of run {run_id}: a restarted main process\n"
+        "# is stopped again; removed by unit-resume and by the run's deadman.\n"
+        "[Service]\n"
+        f"ExecStartPost={kill} -STOP $MAINPID\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o644)
+    run(["systemctl", "daemon-reload"])
+    return {"path": str(path), "created_dir": created_dir}
+
+
+def remove_pause_dropin(run_id: str, unit: str, created_dir: bool) -> dict[str, Any]:
+    """Unload the pause drop-in; a reload that fails is reported, not hidden."""
+
+    path = pause_dropin_path(run_id, unit)
+    removed = path.is_file()
+    if removed:
+        path.unlink()
+    if created_dir and path.parent.is_dir() and not any(path.parent.iterdir()):
+        path.parent.rmdir()
+    reloaded = run(["systemctl", "daemon-reload"], check=False) if removed else None
+    return {
+        "path": str(path),
+        "removed": removed,
+        "reload_failed": bool(reloaded is not None and reloaded.returncode),
+    }
+
+
+def leftover_pause_dropins(run_id: str) -> list[Path]:
+    """This run's pause drop-ins still on disk, whatever the state file says."""
+
+    if not PAUSE_DROPIN_ROOT.is_dir():
+        return []
+    return sorted(
+        PAUSE_DROPIN_ROOT.glob(f"*.d/{PAUSE_DROPIN_PREFIX}{run_digest(run_id)}.conf")
+    )
+
+
+def loaded_pause_hooks() -> list[str]:
+    """Pausable units whose loaded ``ExecStartPost`` still stops the main process."""
+
+    return [
+        unit
+        for unit in PAUSABLE_UNITS
+        if "-STOP $MAINPID"
+        in run(
+            ["systemctl", "show", unit, "--property=ExecStartPost"], check=False
+        ).stdout
+    ]
+
+
 def unit_pause(arguments: argparse.Namespace) -> None:
     """SIGSTOP every process of one collector unit; the unit stays active.
 
     A pause is not a disable: systemd keeps the unit ``active`` and the Agent
     keeps reporting it enabled, which is what the silence scanner must see.
+    The pause drop-in (``PAUSE_DROPIN_ROOT``) is loaded before the SIGSTOP so
+    that a product restart of the unit re-stops the new main process.
     """
 
     run_id = checked_run_id(arguments.run_id)
@@ -1129,7 +1218,15 @@ def unit_pause(arguments: argparse.Namespace) -> None:
     }
     save_state(run_id, state)
     deadman = arm_deadman(run_id, kind, seconds, "--unit", unit)
-    run(["systemctl", "kill", "--kill-whom=all", "--signal=SIGSTOP", unit])
+    try:
+        dropin = install_pause_dropin(run_id, unit)
+        state = load_state(run_id)
+        state["paused_units"][unit]["dropin"] = dropin
+        save_state(run_id, state)
+        run(["systemctl", "kill", "--kill-whom=all", "--signal=SIGSTOP", unit])
+    except Exception:
+        resume_unit(run_id, unit)
+        raise
     emit(
         {
             "unit": unit,
@@ -1137,19 +1234,34 @@ def unit_pause(arguments: argparse.Namespace) -> None:
             "after": unit_state(unit),
             "stopped": unit_is_stopped(unit),
             "deadman": deadman,
+            "dropin": dropin["path"],
             "resume_after_seconds": seconds,
         }
     )
 
 
 def resume_unit(run_id: str, unit: str) -> dict[str, Any]:
-    run(["systemctl", "kill", "--kill-whom=all", "--signal=SIGCONT", unit], check=False)
+    """Unload the pause drop-in, then SIGCONT; the order keeps a restart that
+    races the resume from stopping the process again."""
+
     state = load_state(run_id)
-    info = state["paused_units"].pop(unit, None)
+    info = state["paused_units"].get(unit)
+    dropin = remove_pause_dropin(
+        run_id, unit, bool(((info or {}).get("dropin") or {}).get("created_dir"))
+    )
+    run(["systemctl", "kill", "--kill-whom=all", "--signal=SIGCONT", unit], check=False)
+    state["paused_units"].pop(unit, None)
     save_state(run_id, state)
     if info is not None:
         disarm_deadman(run_id, info["kind"])
-    return {"unit": unit, "after": unit_state(unit), "stopped": unit_is_stopped(unit)}
+    if dropin["reload_failed"]:
+        raise ProbeError(f"systemd did not reload after removing {dropin['path']}")
+    return {
+        "unit": unit,
+        "after": unit_state(unit),
+        "stopped": unit_is_stopped(unit),
+        "dropin": dropin,
+    }
 
 
 def unit_resume(arguments: argparse.Namespace) -> None:
@@ -1296,6 +1408,14 @@ def cleanup_kind(run_id: str, kind: str, unit: str | None) -> list[dict[str, Any
         for name in [item for item in state["units"] if "-oracle-" in item]:
             run(["systemctl", "stop", f"{name}.service"], check=False)
     paused = list(state["paused_units"]) if everything else [unit] if unit else []
+    if everything:
+        # A drop-in the state file no longer names (a lost state write) would
+        # otherwise stop the collector at its next product restart for good.
+        paused.extend(
+            path.parent.name.removesuffix(".d")
+            for path in leftover_pause_dropins(run_id)
+            if path.parent.name.removesuffix(".d") not in paused
+        )
     for item in paused:
         if item in PAUSABLE_UNITS:
             actions.append({"resumed": resume_unit(run_id, item)})
@@ -1357,7 +1477,14 @@ def cleanup(arguments: argparse.Namespace) -> None:
 
 def residue_is_clean(value: dict[str, Any]) -> bool:
     if any(
-        value[key] for key in ("page_cache_files", "paused_units", "paused_processes")
+        value.get(key)
+        for key in (
+            "page_cache_files",
+            "paused_units",
+            "paused_processes",
+            "pause_dropins",
+            "pause_hooks",
+        )
     ):
         return False
     if value.get("log_collector_enabled_by_run"):

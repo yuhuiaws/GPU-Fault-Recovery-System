@@ -412,3 +412,81 @@ def test_capability_and_replay_variants_are_deferred() -> None:
         "duplicate_slot",
     ):
         assert variant not in SPECS, variant
+
+
+def test_silence_advisory_must_name_the_silent_channel(tmp_path: Path) -> None:
+    """The metrics unit also carries GPU_INVENTORY (180 s): its advisory comes
+    first and must not stand in for the GPU_METRICS one (live 2026-10-25, the
+    advisory stage passed on the inventory key while GPU_METRICS stayed fresh)."""
+
+    spec = SPECS["metrics_silent"]
+    doc = silence_doc("GPU_METRICS")
+    doc["notifications"][0]["deduplication_key"] = (
+        f"collector-silent/c/{NODE}/GPU_INVENTORY/1"
+    )
+    ctx = context(spec, tmp_path, [doc, doc, fresh_success_doc("GPU_METRICS")])
+    result = spec.execute(ctx)
+    assert result["verdict"] == "FAIL", result["errors"]
+    assert result["stages"]["advisory"] == [
+        "no collector-silent advisory for GPU_METRICS"
+    ], result["stages"]
+
+
+def test_silence_recovery_needs_a_success_after_the_resume(tmp_path: Path) -> None:
+    """Resuming the producer must advance a new success time; the success the
+    channel already had before the resume proves nothing (spec 031)."""
+
+    spec = SPECS["host_silent"]
+    silent = silence_doc("HOST_TELEMETRY")
+    unchanged = fresh_success_doc("HOST_TELEMETRY")
+    unchanged["collector_statuses"][0]["last_success_at"] = silent[
+        "collector_statuses"
+    ][0]["last_success_at"]
+    ctx = context(spec, tmp_path, [silent, silent, unchanged])
+    result = spec.execute(ctx)
+    assert result["verdict"] == "FAIL", result["errors"]
+    assert result["stages"]["recovery"] == [
+        "HOST_TELEMETRY did not report a new success after recovery"
+    ], result["stages"]
+
+
+def test_silence_accepts_the_hours_deduplicated_advisory(tmp_path: Path) -> None:
+    """One advisory per collector per alert hour is the product's dedup: a
+    retry inside the hour finds no new notification, only the hour's key."""
+
+    spec = SPECS["host_silent"]
+    silent = silence_doc("HOST_TELEMETRY")
+    silent["notifications"] = []
+    now = col.utc_now()
+    bucket = int(now.timestamp() // col.SILENT_ALERT_INTERVAL)
+    earlier = silence_doc("HOST_TELEMETRY")
+    earlier["notifications"][0]["deduplication_key"] = (
+        f"collector-silent/c/{NODE}/HOST_TELEMETRY/{bucket}"
+    )
+    earlier["notifications"][0]["created_at"] = (
+        datetime.fromtimestamp(bucket * col.SILENT_ALERT_INTERVAL, tz=timezone.utc)
+    ).isoformat()
+    bucket_starts = {
+        datetime.fromtimestamp(
+            (bucket - shift) * col.SILENT_ALERT_INTERVAL, tz=timezone.utc
+        ).isoformat()
+        for shift in (0, 1)
+    }
+    node = node_probe(survey())
+    recovered = fresh_success_doc("HOST_TELEMETRY")
+
+    def responder(script: str, *arguments: str) -> dict[str, Any]:
+        if any(call and call[0] in RESUME_CALLS for call in node.calls):
+            return dict(recovered)
+        return dict(earlier if arguments[2] in bucket_starts else silent)
+
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=FakeRegional(cpu_python=responder),
+        settings=settings(spec, tmp_path),
+        probes={f"node@{NODE}": node},
+    )
+    result = spec.execute(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    assert any("deduplicated" in note for note in result["notes"]), result["notes"]

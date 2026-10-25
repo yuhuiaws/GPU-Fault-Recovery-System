@@ -12,10 +12,20 @@ one silent advisory. A disabled/masked unit is excluded, and resuming the
 producer must advance a new success time -- not merely leave the process
 running. The non-native DCGM source-replay variants and the inactive-cluster /
 notification-failure capability gaps are recorded NOT_RUN with their reason.
+
+The metrics collector unit carries two channels: GPU_INVENTORY (180 s) trips
+first and its refresh -- the Node Agent's TRIGGER_HEALTH_SNAPSHOT, a
+``systemctl restart`` of the metrics and host collectors -- would end a bare
+SIGSTOP (live 2026-10-25: the restarted process kept GPU_METRICS fresh 183 s
+into ``metrics_silent``). The node probe's pause therefore survives that
+restart, the advisory check names the silent channel (the inventory advisory
+is not the metrics one), the hour's deduplicated advisory counts for a retry
+inside the alert interval, and recovery needs a success *after* the resume.
 """
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from scripts.e2e.regional.general_live_common import activity, run_survey
@@ -54,6 +64,10 @@ SILENCE_THRESHOLDS = {
     "logs_silent": ("NODE_LOGS", "gpu-fault-log-collector.service", 900),
 }
 SILENCE_SCAN_MARGIN = 120
+#: ``GPU_FAULT_COLLECTOR_SILENT_ALERT_SECONDS`` default (app/periodic_services.py):
+#: one ``collector-silent/<cluster>/<node>/<channel>/<bucket>`` advisory per
+#: channel per bucket; a retry inside the bucket finds no new notification.
+SILENT_ALERT_INTERVAL = 3600
 
 
 # --------------------------------------------------------------------------- #
@@ -214,20 +228,40 @@ def _silence_variant(ctx: VariantContext, variant: str) -> dict[str, Any]:
         raise VariantInconclusive(f"{unit} did not stop under SIGSTOP")
     budget = threshold + SILENCE_SCAN_MARGIN + 180
     observed = _wait_observation_unknown(ctx, started, channel, budget)
+    notes: list[str] = []
+    advisory = _silent_advisory(observed, channel)
+    if advisory:
+        deduplicated = _deduplicated_advisory(ctx, started, channel)
+        if deduplicated:
+            advisory = []
+            notes.append(
+                f"the {channel} advisory of this alert hour was already sent and "
+                f"deduplicated: {', '.join(deduplicated)}"
+            )
     stages = {
         "unknown": _observation_unknown(observed, channel),
-        "advisory": _silent_advisory(observed, channel),
+        "advisory": advisory,
         "snapshot_cap": _one_snapshot_per_hour(observed),
         "hardware": hardware_errors(observed),
     }
+    # The success time the channel had while paused: the resume must advance it.
+    before = _channel_success(ctx, started, channel)
     ctx.node("unit-resume", "--unit", unit)
     ctx.cleanup.discard("pause")
-    recovered = _await_fresh_success(ctx, channel)
+    recovered = _await_fresh_success(ctx, channel, after=before)
     stages["recovery"] = recovered["errors"]
     if variant == "logs_silent":
         ctx.node("log-collector-disable")
         ctx.cleanup.discard("log-collector")
-    return _result(stages, extra={"channel": channel, "threshold_seconds": threshold})
+    return _result(
+        stages,
+        notes=notes,
+        extra={
+            "channel": channel,
+            "threshold_seconds": threshold,
+            "success_before_resume": before,
+        },
+    )
 
 
 def inventory_silent(ctx: VariantContext) -> dict[str, Any]:
@@ -412,19 +446,50 @@ def _one_snapshot_per_hour(activity_document: dict[str, Any]) -> list[str]:
     )
 
 
-def _silent_advisories(activity_document: dict[str, Any]) -> list[str]:
-    return [
+def _silent_advisories(
+    activity_document: dict[str, Any], channel: str | None = None
+) -> list[str]:
+    """The node's ``collector-silent/<cluster>/<node>/<channel>/<bucket>``
+    keys (the activity probe already keeps only this node's notifications);
+    with ``channel``, only that channel's -- the metrics unit's inventory
+    advisory is not its metrics advisory."""
+
+    keys = [
         str(item.get("deduplication_key"))
         for item in activity_document.get("notifications") or []
         if str(item.get("deduplication_key") or "").startswith("collector-silent/")
     ]
+    if channel is None:
+        return keys
+    return [key for key in keys if key.rsplit("/", 2)[-2] == channel]
 
 
 def _silent_advisory(activity_document: dict[str, Any], channel: str) -> list[str]:
-    advisories = _silent_advisories(activity_document)
-    if not advisories:
+    if not _silent_advisories(activity_document, channel):
         return [f"no collector-silent advisory for {channel}"]
     return []
+
+
+def _deduplicated_advisory(
+    ctx: VariantContext, started: Any, channel: str
+) -> list[str]:
+    """The channel's advisory of the current alert bucket, sent before this run
+    started: the product sends one per channel per bucket, so a retry inside
+    the hour must accept it instead of demanding a second."""
+
+    buckets = {
+        int(moment.timestamp() // SILENT_ALERT_INTERVAL)
+        for moment in (started, utc_now())
+    }
+    since = datetime.fromtimestamp(
+        min(buckets) * SILENT_ALERT_INTERVAL, tz=timezone.utc
+    )
+    document = activity(ctx, since, metrics=set(), kinds=())
+    return [
+        key
+        for key in _silent_advisories(document, channel)
+        if key.rsplit("/", 1)[-1] in {str(bucket) for bucket in buckets}
+    ]
 
 
 def _channel_success(ctx: VariantContext, since: Any, channel: str) -> str | None:

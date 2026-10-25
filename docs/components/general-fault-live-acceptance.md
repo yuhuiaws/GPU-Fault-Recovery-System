@@ -547,6 +547,15 @@ disabled/masked本来就排除，不能用它验证静默告警。日志通道�
 Agent过期/非活跃集群单独处理，不伪造成同一种静默。恢复后必须新成功时间推进，
 不能仅看进程running或一个子指标成功；保留各通道实采覆盖表。
 
+metrics 采集单元同时产出 GPU_INVENTORY（180 秒）与 GPU_METRICS（420 秒）：暂停该
+单元时库存通道先越过阈值，其每节点每小时一次的 snapshot 刷新（Node Agent 的
+TRIGGER_HEALTH_SNAPSHOT 会 `systemctl restart` metrics 与 host 采集器）会结束一次裸
+SIGSTOP 并启动一个不受暂停的新进程（实测：暂停 183 秒后新进程让 GPU_METRICS 一直
+FRESH_SUCCESS）。因此暂停必须跨越产品自身的重启；静默通知判定只认目标通道自己的
+`collector-silent/<cluster>/<node>/<channel>/<bucket>` 键（库存通道的通知不能代替
+metrics 通道的），同一告警小时内重试时接受该小时已发送、被去重的同通道通知并记入
+notes；恢复判定以恢复前的成功时间为基线，要求之后出现新的成功时间。
+
 ### GF-GENERAL-LIVE-032
 
 必测：`unknown_xid`、`unknown_product`、`missing_topology`、`missing_version`、
@@ -585,7 +594,10 @@ Agent过期/非活跃集群单独处理，不伪造成同一种静默。恢复�
 `_verdicts`）。主机探针为仅标准库的 `probes/general_live_node_probe.py`
 （CPU/内存/page cache 负载、小容量测试 cgroup 的自身 OOM（`memory-start
 --cgroup-oom-bytes` 与 `memory-status`）、oracle 采样、采集单元与 exporter 的限时
-SIGSTOP、节点日志采集器的 runtime 启用）、`probes/general_live_storage_probe.py`
+SIGSTOP（采集单元的暂停同时装载一个 `/run/systemd/system/<unit>.d/` drop-in，用
+`ExecStartPost` 再次停住被产品自身 TRIGGER_HEALTH_SNAPSHOT 重启出来的新主进程；
+`unit-resume` 与 deadman 先移除并 reload 再 SIGCONT，遗留的 drop-in 或已装载的钩子
+计为残留）、节点日志采集器的 runtime 启用）、`probes/general_live_storage_probe.py`
 （loop 文件系统与 loop+device-mapper 测试设备、O_DIRECT 写入）、
 `probes/general_live_net_probe.py`（host-local veth/dummy 测试接口、丢包生成器、
 009 `tcp_only` 的测试 netns+netem TCP 夹具）、`probes/general_live_deps_probe.py`

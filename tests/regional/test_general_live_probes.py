@@ -735,3 +735,58 @@ def test_node_exception_site_names_the_step_not_the_helper() -> None:
         site = nodep.exception_site(exc)
     assert site is not None and site.startswith("memory_status:"), site
     assert nodep.exception_site(ValueError("no traceback")) is None
+
+
+def test_node_unit_pause_survives_a_product_restart(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A pause outlives the product's own restart of the unit.
+
+    The Node Agent's TRIGGER_HEALTH_SNAPSHOT step restarts the metrics and host
+    collectors; a bare SIGSTOP ends with the old process (live 2026-10-25: the
+    inventory channel of the paused metrics unit tripped that refresh 183 s in,
+    and the new process kept GPU_METRICS fresh). The pause installs a /run
+    drop-in that stops every new main process, loaded before the SIGSTOP, and
+    the resume removes it before SIGCONT; a leftover is residue.
+    """
+
+    calls, emitted = _node_probe_runner(monkeypatch, tmp_path)
+    monkeypatch.setattr(nodep, "PAUSE_DROPIN_ROOT", tmp_path / "run-systemd")
+    monkeypatch.setattr(
+        nodep, "unit_state", lambda unit: {"ActiveState": "active", "MainPID": "7"}
+    )
+    monkeypatch.setattr(nodep, "unit_is_stopped", lambda unit: True)
+    monkeypatch.setattr(nodep, "disarm_deadman", lambda run_id, kind: None)
+    monkeypatch.setattr(nodep.shutil, "which", lambda name: "/usr/bin/kill")
+    unit = "gpu-fault-metrics-collector.service"
+    arguments = nodep.parser().parse_args(
+        ["unit-pause", "--run-id", RUN, "--unit", unit, "--seconds", "840"]
+    )
+    arguments.handler(arguments)
+
+    dropin = nodep.pause_dropin_path(RUN, unit)
+    assert dropin.is_file(), "the pause drop-in is installed"
+    assert "ExecStartPost=/usr/bin/kill -STOP $MAINPID" in dropin.read_text(), (
+        dropin.read_text()
+    )
+    reload_at = calls.index(["systemctl", "daemon-reload"])
+    stop_at = next(i for i, c in enumerate(calls) if "--signal=SIGSTOP" in c)
+    assert reload_at < stop_at, calls
+    assert emitted[-1]["stopped"] is True, emitted[-1]
+    assert emitted[-1]["dropin"] == str(dropin), emitted[-1]
+    held = nodep.residue(RUN)
+    assert held["pause_dropins"] == [str(dropin)], held
+    assert not nodep.residue_is_clean(held), held
+
+    resumed = nodep.resume_unit(RUN, unit)
+    assert not dropin.exists(), "the resume removes the drop-in"
+    reloads = [i for i, c in enumerate(calls) if c == ["systemctl", "daemon-reload"]]
+    cont_at = next(i for i, c in enumerate(calls) if "--signal=SIGCONT" in c)
+    assert len(reloads) == 2 and reloads[-1] < cont_at, calls
+    assert resumed["dropin"]["removed"] is True, resumed
+    cleared = nodep.residue(RUN)
+    assert cleared["pause_dropins"] == [] and cleared["paused_units"] == {}, cleared
+    assert nodep.residue_is_clean(cleared), cleared
+    assert not nodep.residue_is_clean({**cleared, "pause_hooks": [unit]}), (
+        "a loaded pause hook is residue"
+    )
