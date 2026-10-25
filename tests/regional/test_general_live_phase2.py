@@ -89,6 +89,9 @@ def test_the_executable_lane_variants_are_the_wired_ones() -> None:
         for spec in registry.values()
         if spec.number in LANE_CATEGORIES and spec.implemented
     )
+    # 005 runs natively on the test export fixture (shared_export_fixture.py +
+    # probes/general_live_shared_probe.py); three of its variants are expected
+    # FAILs that name their product gap.
     assert implemented == [
         "GF-GENERAL-LIVE-002.cgroup_only",
         "GF-GENERAL-LIVE-002.memory_pressure",
@@ -96,6 +99,13 @@ def test_the_executable_lane_variants_are_the_wired_ones() -> None:
         "GF-GENERAL-LIVE-002.read_failure",
         "GF-GENERAL-LIVE-002.recovery",
         "GF-GENERAL-LIVE-002.swap_pressure",
+        "GF-GENERAL-LIVE-005.capacity_full",
+        "GF-GENERAL-LIVE-005.healthy_other_mount",
+        "GF-GENERAL-LIVE-005.io_only_failure",
+        "GF-GENERAL-LIVE-005.mount_disappears",
+        "GF-GENERAL-LIVE-005.recovery",
+        "GF-GENERAL-LIVE-005.shared_failure_domain",
+        "GF-GENERAL-LIVE-005.stat_timeout",
         "GF-GENERAL-LIVE-007.health_failed",
         "GF-GENERAL-LIVE-007.healthy",
         "GF-GENERAL-LIVE-007.malformed_json",

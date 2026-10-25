@@ -56,6 +56,10 @@ NET_PROBE = PROBES / "general_live_net_probe.py"
 WINDOW_PROBE = PROBES / "collector_window_probe.py"
 DCGM_PROBE = PROBES / "general_live_dcgm_probe.py"
 DEPS_PROBE = PROBES / "general_live_deps_probe.py"
+SHARED_PROBE = PROBES / "general_live_shared_probe.py"
+#: The 005 test export server image comes from the command line or this
+#: variable (an immutable digest, like the host probe image).
+EXPORT_IMAGE_ENV = "GPU_FAULT_GENERAL_LIVE_EXPORT_IMAGE"
 #: Mount propagation for each probe's ``/host`` hostPath. Only the storage
 #: probe creates a test loop/dm filesystem that the installed host collector
 #: must statvfs and the ``systemd-run`` I/O writer must write to; both run in
@@ -121,6 +125,10 @@ class GeneralLiveSettings:
     hyperpod_cluster: str
     site_file: Path | None
     approvals: tuple[str, ...]
+    #: GF-GENERAL-LIVE-005: the test export server image and an optional node
+    #: pin for its Pod (default: any node but the client nodes).
+    export_image: str = ""
+    export_node: str = ""
 
     @property
     def key(self) -> str:
@@ -157,6 +165,19 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--host-probe-image", default="")
     parser.add_argument("--hyperpod-cluster", default="")
     parser.add_argument("--site-file", default="")
+    parser.add_argument(
+        "--export-image",
+        default="",
+        help=(
+            "005 test export server image (immutable digest); default "
+            f"${EXPORT_IMAGE_ENV}"
+        ),
+    )
+    parser.add_argument(
+        "--export-node",
+        default="",
+        help="pin the 005 test export server Pod to this node (default: not a client node)",
+    )
 
 
 def configure(arguments: argparse.Namespace) -> GeneralLiveSettings:
@@ -177,6 +198,10 @@ def configure(arguments: argparse.Namespace) -> GeneralLiveSettings:
         hyperpod_cluster=str(arguments.hyperpod_cluster or ""),
         site_file=site_file,
         approvals=tuple(sorted(set(arguments.approve))),
+        export_image=str(
+            getattr(arguments, "export_image", "") or os.getenv(EXPORT_IMAGE_ENV, "")
+        ),
+        export_node=str(getattr(arguments, "export_node", "") or ""),
     )
 
 
@@ -453,7 +478,8 @@ class VariantContext:
     sleep: Callable[[float], None] = time.sleep
 
     def probe(self, name: str, *, node: str | None = None) -> ProbeHandle:
-        """The probe Pod running ``name`` (node, storage, net, window, dcgm, deps)."""
+        """The probe Pod running ``name`` (node, storage, net, window, dcgm,
+        deps, shared)."""
 
         script = {
             "node": NODE_PROBE,
@@ -462,6 +488,7 @@ class VariantContext:
             "window": WINDOW_PROBE,
             "dcgm": DCGM_PROBE,
             "deps": DEPS_PROBE,
+            "shared": SHARED_PROBE,
         }[name]
         target = node or self.settings.node
         handle_key = f"{name}@{target}"
@@ -519,6 +546,15 @@ class VariantContext:
         """The temporary test package probe (``--run-id`` added)."""
 
         return self.probe("deps").execute(
+            *arguments, "--run-id", self.run_id, timeout=timeout
+        )
+
+    def shared(
+        self, *arguments: str, node: str | None = None, timeout: int = 180
+    ) -> dict[str, Any]:
+        """The 005 shared-mount probe on ``node`` (``--run-id`` added)."""
+
+        return self.probe("shared", node=node).execute(
             *arguments, "--run-id", self.run_id, timeout=timeout
         )
 
@@ -646,6 +682,7 @@ def require_module(
 
 __all__ = [
     "CleanupStack",
+    "EXPORT_IMAGE_ENV",
     "Evidence",
     "GeneralLiveSettings",
     "HOST_UNIT",
