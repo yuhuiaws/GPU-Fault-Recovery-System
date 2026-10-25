@@ -56,18 +56,34 @@ MEMINFO_FIXTURE = probe.MEMINFO_FIXTURE
 MAX_MEMINFO_KB = probe.MAX_MEMINFO_KB
 
 
-def build_pci_fixture(arguments: argparse.Namespace) -> None:
-    """A reviewed /sys/bus/pci/devices tree: non-EFA devices plus EFA functions."""
+#: Entries a real PCI root may list (a p5en has a few hundred functions).
+MAX_PCI_ENTRIES = 4096
+#: The regular file an ``--unreadable`` PCI root fixture is: every attempt of
+#: the product to list it fails with ENOTDIR, whatever the unit's privileges
+#: (a mode-0000 directory is readable to a CAP_DAC_OVERRIDE process).
+UNREADABLE_PCI_ROOT = b"gfrs-live: unreadable PCI root fixture (not a directory)\n"
 
-    run_id = safe_id(arguments.run_id)
-    efa_count = int(arguments.efa_count)
+
+def _pci_identity(entry: Path) -> tuple[str, str]:
+    """``(vendor, device)`` of one PCI function as ``is_efa_pci_device`` reads them."""
+
+    try:
+        vendor = (entry / "vendor").read_text(encoding="ascii").strip()
+        device = (entry / "device").read_text(encoding="ascii").strip()
+    except (OSError, UnicodeDecodeError) as error:
+        raise ProbeError(f"{entry.name}: vendor/device unreadable: {error}") from error
+    return vendor, device
+
+
+def _is_efa_function(vendor: str, device: str) -> bool:
+    return vendor.lower() == EFA_VENDOR and device.lower().startswith("0xefa")
+
+
+def _synthetic_pci_root(root: Path, efa_count: int, malformed: bool) -> list[str]:
+    """Two plausible non-EFA devices plus ``efa_count`` EFA functions."""
+
     if not 0 <= efa_count <= 32:
         raise ProbeError("efa-count is outside 0..32")
-    root = fixtures_dir(run_id) / "pci"
-    if root.exists():
-        shutil.rmtree(root)
-    root.mkdir(mode=0o755, parents=True, exist_ok=True)
-    # A couple of plausible non-EFA devices so the tree is realistic.
     for index, (vendor, device) in enumerate(
         (("0x10de", "0x2330"), ("0x1d0f", "0x8061"))
     ):
@@ -75,20 +91,122 @@ def build_pci_fixture(arguments: argparse.Namespace) -> None:
         slot.mkdir(mode=0o755)
         (slot / "vendor").write_text(vendor + "\n", encoding="ascii")
         (slot / "device").write_text(device + "\n", encoding="ascii")
+    functions = []
     for index in range(efa_count):
         slot = root / f"0000:53:{index:02x}.0"
         slot.mkdir(mode=0o755)
         (slot / "vendor").write_text(EFA_VENDOR + "\n", encoding="ascii")
-        device_id = "0xzz99" if arguments.malformed and index == 0 else "0xefa2"
+        device_id = "0xzz99" if malformed and index == 0 else "0xefa2"
         (slot / "device").write_text(device_id + "\n", encoding="ascii")
-    emit(
-        {
-            "run_id": run_id,
-            "path": str(root),
-            "efa_devices": efa_count,
-            "malformed": bool(arguments.malformed),
-        }
-    )
+        functions.append(slot.name)
+    return functions
+
+
+def _copied_pci_root(root: Path, source: Path, drop: set[str]) -> dict[str, Any]:
+    """The node's real PCI root (vendor/device of every function) minus ``drop``.
+
+    013 ``pci_missing``: the product counts EFA functions by vendor/device, so
+    the copy carries exactly those two files per function and the dropped
+    functions -- which must be EFA functions the source really lists -- are
+    simply absent, the way a function that fell off the bus is.
+    """
+
+    if not source.is_dir():
+        raise ProbeError(f"{source} is not a directory")
+    for name in drop:
+        if BDF.fullmatch(name) is None:
+            raise ProbeError(f"--drop names no PCI function: {name!r}")
+    entries = sorted(path for path in source.iterdir() if BDF.fullmatch(path.name))
+    if len(entries) > MAX_PCI_ENTRIES:
+        raise ProbeError(f"{source} lists more than {MAX_PCI_ENTRIES} functions")
+    functions: list[str] = []
+    dropped: list[str] = []
+    for entry in entries:
+        vendor, device = _pci_identity(entry)
+        efa = _is_efa_function(vendor, device)
+        if entry.name in drop:
+            if not efa:
+                raise ProbeError(
+                    f"--drop {entry.name} is not an EFA function ({vendor} {device})"
+                )
+            dropped.append(entry.name)
+            continue
+        slot = root / entry.name
+        slot.mkdir(mode=0o755)
+        (slot / "vendor").write_text(vendor + "\n", encoding="ascii")
+        (slot / "device").write_text(device + "\n", encoding="ascii")
+        if efa:
+            functions.append(entry.name)
+    missing = sorted(drop - set(dropped))
+    if missing:
+        raise ProbeError(f"--drop names no PCI function of {source}: {missing}")
+    return {
+        "efa_devices": len(functions),
+        "efa_functions": functions,
+        "dropped": dropped,
+        "entries": len(entries) - len(dropped),
+    }
+
+
+def build_pci_fixture(arguments: argparse.Namespace) -> None:
+    """A reviewed PCI root for the ``pci-root`` repoint, in one of three shapes.
+
+    ``--efa-count N [--malformed]``: a synthetic ``/sys/bus/pci/devices`` of two
+    non-EFA devices plus ``N`` EFA functions (one bad device id when malformed;
+    013 ``unreadable_state``). ``--source ROOT [--drop BDF ...]``: a copy of the
+    node's real root with the named EFA functions absent (013 ``pci_missing``:
+    the real BDFs, so the evidence names the function that "fell off").
+    ``--unreadable``: the fixture path is a regular file, so the product's
+    listing of the root fails (ENOTDIR) on every tick -- the read-failure
+    negative control that must be UNKNOWN, never zero functions.
+    """
+
+    run_id = safe_id(arguments.run_id)
+    source = getattr(arguments, "source", None)
+    drop = list(getattr(arguments, "drop", None) or [])
+    unreadable = bool(getattr(arguments, "unreadable", False))
+    modes = [arguments.efa_count is not None, source is not None, unreadable]
+    if sum(modes) != 1:
+        raise ProbeError("pass exactly one of --efa-count, --source, --unreadable")
+    if arguments.malformed and arguments.efa_count is None:
+        raise ProbeError("--malformed needs --efa-count")
+    if drop and source is None:
+        raise ProbeError("--drop needs --source")
+    root = fixtures_dir(run_id) / "pci"
+    if root.is_dir() and not root.is_symlink():
+        shutil.rmtree(root)
+    elif root.exists() or root.is_symlink():
+        root.unlink()
+    receipt: dict[str, Any] = {
+        "run_id": run_id,
+        "path": str(root),
+        "efa_devices": 0,
+        "malformed": bool(arguments.malformed),
+        "source": source,
+        "dropped": [],
+        "efa_functions": [],
+        "unreadable": unreadable,
+    }
+    if unreadable:
+        root.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        write_atomic(root, UNREADABLE_PCI_ROOT, 0o644)
+        emit(receipt)
+        return
+    root.mkdir(mode=0o755, parents=True, exist_ok=True)
+    try:
+        if source is not None:
+            receipt.update(_copied_pci_root(root, Path(source), set(drop)))
+        else:
+            functions = _synthetic_pci_root(
+                root, int(arguments.efa_count), bool(arguments.malformed)
+            )
+            receipt.update({"efa_devices": len(functions), "efa_functions": functions})
+    except ProbeError:
+        # A refused build leaves no half-built root a later window could repoint
+        # the unit at (fewer functions than the node has would read as missing).
+        shutil.rmtree(root, ignore_errors=True)
+        raise
+    emit(receipt)
 
 
 def _copy_text(source: Path, target: Path) -> bool:

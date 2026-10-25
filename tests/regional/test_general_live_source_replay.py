@@ -785,3 +785,88 @@ def test_build_commands_ship_the_builders_once_before_the_first_build(
         "the checkout's module is what ships"
     )
     assert helper.BUILDERS_MODULE.name == probe.BUILDERS_NAME, helper.BUILDERS_MODULE
+
+
+# --------------------------------------------------------------------------- #
+# PCI root shapes, snapshot and re-create after a reboot (013 pci_missing)
+# --------------------------------------------------------------------------- #
+def test_build_pci_sends_one_reviewed_shape_per_call(tmp_path: Path) -> None:
+    controller, fake = _controller(tmp_path, approvals=())
+    controller.build_pci(efa_count=16, malformed=True)
+    controller.build_pci(
+        source="/sys/bus/pci/devices", drop=["0000:53:00.0", "0000:53:01.0"]
+    )
+    controller.build_pci(unreadable=True)
+    builds = [call for call in fake.calls if call[0] == "build-pci-fixture"]
+    assert builds[0][1:5] == ("--efa-count", "16", "--malformed", "--run-id"), builds
+    assert builds[1][1:7] == (
+        "--source",
+        "/sys/bus/pci/devices",
+        "--drop",
+        "0000:53:00.0",
+        "--drop",
+        "0000:53:01.0",
+    ), builds[1]
+    assert builds[2][1:3] == ("--unreadable", "--run-id"), builds[2]
+    installs = [call for call in fake.calls if call[0] == "install-source"]
+    assert len(installs) == 1, "the builders ship once before the first build"
+    for kwargs in (
+        {},
+        {"efa_count": 1, "unreadable": True},
+        {"source": "/x", "unreadable": True},
+    ):
+        with pytest.raises(helper.HostSourceReplayError, match="exactly one"):
+            controller.build_pci(**kwargs)
+    # The PCI-root repoint stays a phase-1 mode: no token is needed to open it.
+    controller.open_pci_root(restore_seconds=600)
+    assert [call for call in fake.calls if call[0] == "open-window"], fake.calls
+
+
+def test_snapshot_and_recreate_after_a_reboot(tmp_path: Path) -> None:
+    class RebootedProbe(FakeProbe):
+        def __init__(self, script: dict[str, object]) -> None:
+            super().__init__(script)
+            self.events: list[str] = []
+
+        def cleanup(self) -> dict[str, bool]:
+            self.events.append("cleanup")
+            return {"pod": False, "configmap": False}
+
+        def create(self) -> None:
+            self.events.append("create")
+
+    fake = RebootedProbe(
+        _script(
+            snapshot={
+                "window_open": False,
+                "dropin": False,
+                "state_dir": False,
+                "deadman": False,
+                "unit_active_state": "active",
+                "unit_pci_root": None,
+            }
+        )
+    )
+    controller = helper.HostSourceReplay(
+        _Regional(),
+        node=NODE,
+        image="img@sha256:" + "0" * 64,
+        case_id="GF-GENERAL-LIVE-013.pci_missing",
+        run_id="gl013-pci-missing-a1-deadbeef",
+        case_dir=tmp_path / "case",
+        host=fake,
+        approvals=(TOKEN,),
+    )
+    controller.build_pci(unreadable=True)
+    controller.open_pci_root(restore_seconds=600)
+    receipt = controller.recreate()
+    assert receipt["recreated"] is True and fake.events == ["cleanup", "create"]
+    snapshot = controller.snapshot()
+    assert snapshot["dropin"] is False and snapshot["unit_pci_root"] is None
+    # Nothing is open on the new boot: cleanup closes no window, and the
+    # builders -- gone with /run -- are shipped again before the next build.
+    controller.cleanup()
+    assert "close-window" not in [call[0] for call in fake.calls], fake.calls
+    controller.build_pci(efa_count=16)
+    installs = [call for call in fake.calls if call[0] == "install-source"]
+    assert len(installs) == 2, "the builders are shipped again after the reboot"

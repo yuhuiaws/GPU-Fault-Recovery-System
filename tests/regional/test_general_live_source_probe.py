@@ -418,6 +418,8 @@ def test_bind_window_lifecycle(
         "dropin": True,
         "state_dir": True,
         "deadman": True,
+        "unit_active_state": "active",
+        "unit_pci_root": None,
     }, snap
 
     code, closed = _main("close-window", "--run-id", RUN, capsys=capsys)

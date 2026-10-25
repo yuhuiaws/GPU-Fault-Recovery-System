@@ -234,12 +234,44 @@ class HostSourceReplay:
             self.install(probe.BUILDERS_NAME, BUILDERS_MODULE.read_bytes())
             self._builders_installed = True
 
-    def build_pci(self, *, efa_count: int, malformed: bool = False) -> dict[str, Any]:
+    def build_pci(
+        self,
+        *,
+        efa_count: int | None = None,
+        malformed: bool = False,
+        source: str | None = None,
+        drop: Iterable[str] = (),
+        unreadable: bool = False,
+    ) -> dict[str, Any]:
+        """A reviewed PCI root for ``open_pci_root`` (``build-pci-fixture``).
+
+        One shape per call: ``efa_count`` synthetic EFA functions (``malformed``
+        gives one a bad device id; 013 ``unreadable_state``), a copy of the
+        node's real ``source`` root with the ``drop`` BDFs absent (013
+        ``pci_missing``), or ``unreadable`` -- a regular file at the fixture
+        path, so every listing by the product fails (ENOTDIR) and the reading
+        must be UNKNOWN, never zero functions. The PCI-root repoint is a
+        phase-1 mode and needs no approval; the receipt names the EFA
+        functions kept and dropped.
+        """
+
         self._require_host_unit("a PCI-root replay")
+        if sum((efa_count is not None, source is not None, unreadable)) != 1:
+            raise HostSourceReplayError(
+                "build_pci takes exactly one of efa_count, source, unreadable"
+            )
         self._install_builders()
-        arguments = ["build-pci-fixture", "--efa-count", str(int(efa_count))]
+        arguments = ["build-pci-fixture"]
+        if efa_count is not None:
+            arguments += ["--efa-count", str(int(efa_count))]
         if malformed:
             arguments.append("--malformed")
+        if source is not None:
+            arguments += ["--source", source]
+        for bdf in drop:
+            arguments += ["--drop", bdf]
+        if unreadable:
+            arguments.append("--unreadable")
         return self._execute(*arguments, timeout=120)
 
     def build_infiniband(
@@ -600,6 +632,36 @@ class HostSourceReplay:
         receipt = self._execute("close-window", timeout=150)
         self._opened = False
         return receipt
+
+    def snapshot(self) -> dict[str, Any]:
+        """What of this run is on the node: window, drop-in, state dir, deadman,
+        and the host collector unit's own PCI root (``unit_pci_root``)."""
+
+        self.create()
+        return self._execute("snapshot", timeout=60)
+
+    def recreate(self) -> dict[str, Any]:
+        """Replace the probe Pod after the node it ran on rebooted.
+
+        A host probe is a plain Pod pinned to one node (``restartPolicy:
+        Never``): a RESTART_NODE takes it down with the node and ``kubectl
+        exec`` into the Failed Pod is refused. The reboot also wiped ``/run``
+        -- the drop-in, the deadman's transient units, the fixture directory
+        and the probe copy -- so there is no window left to close; the caller
+        proves that with :meth:`snapshot` on the new boot. The host fixture's
+        own cleanup re-establishes the scoped channel on the same node UID,
+        removes what may be left and deletes the terminated Pod before a new
+        one is created; the installed files are gone, so they are shipped
+        again before the next build.
+        """
+
+        require_action_time(180)
+        residuals = self.host.cleanup()
+        self._opened = False
+        self._wrapper_installed = False
+        self._builders_installed = False
+        self.host.create()
+        return {"previous_residuals": residuals, "recreated": True}
 
     def cleanup(self) -> dict[str, Any]:
         receipts: dict[str, Any] = {}

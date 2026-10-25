@@ -507,6 +507,21 @@ def _rdma_driver(device: Path) -> tuple[str | None, list[str]]:
     return resolved, drivers
 
 
+def _pci_function(device: Path) -> str | None:
+    """The BDF of the PCI function an RDMA device sits on (``device`` link), or None.
+
+    013 ``pci_missing`` drops that function from the copied PCI root and the
+    device from the copied RDMA tree, the way one function that fell off the
+    bus takes its RDMA device with it.
+    """
+
+    try:
+        name = (device / "device").resolve(strict=True).name
+    except OSError:
+        return None
+    return name if BDF.fullmatch(name) else None
+
+
 def rdma_inventory(root: Path, netdev_root: Path) -> dict[str, Any]:
     """The node's RDMA devices as the host collector reads them (read-only)."""
 
@@ -542,6 +557,7 @@ def rdma_inventory(root: Path, netdev_root: Path) -> dict[str, Any]:
             if net.is_dir()
             else [],
             "ports": ports,
+            "pci": _pci_function(device),
         }
     physical = (
         sorted(
@@ -992,7 +1008,9 @@ def dropin_lines(
         state["env"][name] = value
     if arguments.pci_root:
         root = fixtures_dir(run_id) / "pci"
-        if not root.is_dir():
+        # A directory (synthetic or copied root) or the ``--unreadable`` regular
+        # file: the product's listing of the latter fails on every tick.
+        if not (root.is_dir() or root.is_file()):
             raise ProbeError("build the PCI fixture before opening a pci-root window")
         lines.append(f"Environment={PCI_ENV}={root}")
         state["pci_root"] = True
@@ -1254,8 +1272,16 @@ def close_window(arguments: argparse.Namespace) -> None:
 
 
 def snapshot(arguments: argparse.Namespace) -> None:
+    """What of this run is on the node now; after a reboot the proof it is nothing.
+
+    ``unit_pci_root`` is the running host collector's own ``GPU_FAULT_PCI_
+    DEVICES_ROOT`` (None when unset): a fixture path there is residue, a real
+    sysfs path or nothing is the product reading the real root again.
+    """
+
     run_id = safe_id(arguments.run_id)
     state = load_state(run_id)
+    unit = unit_state(HOST_UNIT)
     emit(
         {
             "run_id": run_id,
@@ -1264,6 +1290,10 @@ def snapshot(arguments: argparse.Namespace) -> None:
             "state_dir": state_dir(run_id).exists(),
             "deadman": unit_state(f"{deadman_unit(run_id)}.timer").get("ActiveState")
             == "active",
+            "unit_active_state": unit.get("ActiveState"),
+            "unit_pci_root": process_environment(
+                unit.get("MainPID", "0"), (PCI_ENV,)
+            ).get(PCI_ENV),
         }
     )
 
@@ -1293,8 +1323,10 @@ def parser() -> argparse.ArgumentParser:
         required=True,
     )
     item = command("build-pci-fixture", _builder("build_pci_fixture"))
-    item.add_argument("--efa-count", type=int, required=True)
-    add(item, "--malformed", **switch)
+    item.add_argument("--efa-count", type=int)
+    item.add_argument("--source")
+    add(item, "--drop", **many)
+    add(item, "--malformed --unreadable", **switch)
     item = command("build-infiniband-fixture", _builder("build_infiniband_fixture"))
     item.add_argument("--source", default="/sys/class/infiniband")
     item.add_argument("--netdev-root", default=NETDEV_ROOT)
