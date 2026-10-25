@@ -102,6 +102,23 @@ class GpuSurvey:
     def model(self, gpu: str) -> str:
         return str(self.entry(gpu).get("model") or "")
 
+    def pci_bdf(self, gpu: str) -> str:
+        """The exporter's PCI BDF label of ``gpu`` (``00000000:1B:00.0`` form)."""
+
+        return str(self.entry(gpu).get("pci_bdf") or "")
+
+    def temperature_limits(self, gpu: str) -> dict[str, float]:
+        """``nvidia-smi -q -x`` temperature limits of ``gpu`` (``survey --limits``)."""
+
+        for item in self.raw.get("temperature_limits") or []:
+            if item.get("gpu_uuid") == gpu:
+                return {
+                    str(name): float(value)
+                    for name, value in (item.get("limits") or {}).items()
+                    if isinstance(value, (int, float)) and not isinstance(value, bool)
+                }
+        return {}
+
     def setting(self, key: str, default: int) -> int:
         value = (self.raw.get("collector_env") or {}).get(key)
         try:

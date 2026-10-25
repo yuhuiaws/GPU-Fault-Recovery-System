@@ -346,6 +346,141 @@ def collection_errors(state: dict[str, Any]) -> list[str]:
     ]
 
 
+# --------------------------------------------------------------------------- #
+# Composite findings (``gpu_state`` finding history) and their de-duplication
+# --------------------------------------------------------------------------- #
+def composite_findings(
+    state: dict[str, Any], rule_id: str, *, gpu: str | None = None
+) -> list[dict[str, Any]]:
+    """The product's composite findings of ``rule_id`` since the read (history)."""
+
+    return sorted(
+        (
+            item
+            for item in [
+                *(state.get("findings") or []),
+                *(state.get("active_findings") or []),
+            ]
+            if item.get("correlation_rule_id") == rule_id
+            and (gpu is None or item.get("gpu_uuid") in (None, gpu))
+        ),
+        key=lambda item: str(item.get("observed_at")),
+    )
+
+
+def composite_grade_errors(
+    findings: Sequence[dict[str, Any]],
+    *,
+    rule_id: str,
+    severity: str,
+    action: str,
+    required_components: Iterable[str] = (),
+) -> list[str]:
+    """A composite stayed at its diagnostic grade and named its components.
+
+    ``severity``/``action`` are what every finding of the rule must carry
+    (a THERMAL_STRESS that escalated to CRITICAL/DRAIN fails here);
+    ``required_components`` must all appear in ``component_metrics``.
+    """
+
+    if not findings:
+        return [f"no {rule_id} composite finding was recorded"]
+    errors = []
+    for finding in findings:
+        if str(finding.get("severity")) != severity:
+            errors.append(
+                f"{rule_id} finding {finding.get('finding_id')} is "
+                f"{finding.get('severity')}, expected {severity}"
+            )
+        if str(finding.get("automatic_action")) != action:
+            errors.append(
+                f"{rule_id} finding {finding.get('finding_id')} plans "
+                f"{finding.get('automatic_action')}, expected {action}"
+            )
+    components = {
+        str(name)
+        for finding in findings
+        for name in finding.get("component_metrics") or []
+    }
+    missing = sorted(set(required_components) - components)
+    if missing:
+        errors.append(f"{rule_id} components {components or '{}'} lack {missing}")
+    return errors
+
+
+def composite_component_errors(
+    findings: Sequence[dict[str, Any]],
+    *,
+    rule_id: str,
+    allowed_components: Iterable[str],
+) -> list[str]:
+    """A composite is built only from its own metric components.
+
+    A kernel XID, another GPU's finding or a finding of another family inside
+    ``component_metrics``/``component_finding_ids`` means the composite covered
+    an event that was not its own.
+    """
+
+    allowed = set(allowed_components)
+    errors = []
+    for finding in findings:
+        foreign = sorted(
+            str(name)
+            for name in finding.get("component_metrics") or []
+            if str(name) not in allowed
+        )
+        if foreign:
+            errors.append(
+                f"{rule_id} finding {finding.get('finding_id')} composed foreign "
+                f"components {foreign}"
+            )
+        xid_components = sorted(
+            str(item)
+            for item in finding.get("component_finding_ids") or []
+            if "xid" in str(item).lower()
+        )
+        if xid_components:
+            errors.append(
+                f"{rule_id} finding {finding.get('finding_id')} absorbed XID "
+                f"components {xid_components}"
+            )
+    return errors
+
+
+def component_dedup_errors(
+    activity: dict[str, Any],
+    composites: Sequence[dict[str, Any]],
+    *,
+    components: Iterable[str],
+    gpu: str,
+) -> list[str]:
+    """The composite's components were suppressed into it, not minted beside it.
+
+    ``gpu_metrics.ingest`` suppresses a component finding's own incident once
+    its composite exists (``suppressed_by_composite``); a component that still
+    minted a NODE_HEALTH incident after the composite's creation was handled
+    twice. A component incident minted *before* the composite formed is the
+    product's design (the composite needed a later batch) and is not an error.
+    """
+
+    if not composites:
+        return [f"no composite incident to de-duplicate against on {gpu}"]
+    formed = min(str(item.get("created_at")) for item in composites)
+    errors = []
+    for name in components:
+        late = [
+            item
+            for item in metric_incidents(activity, name, gpu=gpu)
+            if str(item.get("created_at")) > formed
+        ]
+        if late:
+            errors.append(
+                f"{name} on {gpu} minted {len(late)} incident(s) after the composite "
+                "formed (" + ", ".join(str(item["incident_id"]) for item in late) + ")"
+            )
+    return errors
+
+
 __all__ = [
     "COMPLETENESS_FINDING",
     "FABRIC_FINDING",
@@ -357,6 +492,10 @@ __all__ = [
     "chain_errors",
     "collection_errors",
     "completeness_incidents",
+    "component_dedup_errors",
+    "composite_component_errors",
+    "composite_findings",
+    "composite_grade_errors",
     "composite_incidents",
     "executions_of",
     "fabric_incidents",

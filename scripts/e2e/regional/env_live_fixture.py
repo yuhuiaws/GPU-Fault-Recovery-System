@@ -422,6 +422,8 @@ class EnvReplayController:
         case_id: str,
         run_id: str,
         case_dir: Path,
+        active_deadline_seconds: int = 3600,
+        host: Any | None = None,
     ) -> None:
         self.regional = regional
         self.node = node
@@ -429,7 +431,9 @@ class EnvReplayController:
         self.case_dir = case_dir
         self._repointed = False
         self._armed = False
-        self.host = HostProbeFixture(
+        # A caller (the GF-GENERAL-LIVE 024 composites, a test) may hand in the
+        # host probe; production builds the node-pinned probe Pod itself.
+        self.host = host or HostProbeFixture(
             HostProbeSettings(
                 kubeconfig=regional.settings.gpu_kubeconfig,
                 context=regional.settings.gpu_context,
@@ -440,11 +444,13 @@ class EnvReplayController:
                 run_id=run_id,
                 probe_script=PROBE_SCRIPT,
                 state_directory=case_dir / "host-probes",
-                active_deadline_seconds=3600,
+                active_deadline_seconds=active_deadline_seconds,
             )
         )
 
     def create(self) -> None:
+        if getattr(self.host, "created", False):
+            return
         require_action_time(180)
         self.host.create()
 

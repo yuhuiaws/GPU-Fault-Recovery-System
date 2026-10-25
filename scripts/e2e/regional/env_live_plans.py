@@ -386,6 +386,121 @@ def transient_plans(
     }
 
 
+def temperature_field(decision: VariantDecision) -> str:
+    """The exporter field a core/memory temperature decision grades on."""
+
+    return _temperature_field(decision.variant)
+
+
+def warning_reading(decision: VariantDecision) -> float:
+    """A reading strictly inside the decision's warning band, on its scale."""
+
+    return _warning_value(decision)
+
+
+def thermal_stress_plan(
+    decision: VariantDecision,
+    *,
+    confirmation_samples: int,
+    baseline_us: float = 0.0,
+    step_us: float = 1_000_000.0,
+    warmup_reads: int = 3,
+    clear_reads: int | None = None,
+    reason_bit: int = SW_THERMAL_BIT,
+) -> dict[str, Any]:
+    """GF-GENERAL-LIVE-024 ``thermal_warning`` (GF-ENV-LIVE-006, warning band).
+
+    Warm up healthy, then hold the core temperature inside its *warning* band
+    while the thermal-violation duration rises by ``step_us`` per read under a
+    thermal clock reason (``0x20`` software thermal slowdown by default; never
+    the ``0x80`` brake). The product correlates the temperature finding with
+    the duration/throttle findings into THERMAL_STRESS, which must stay a
+    WARNING diagnostic. The tail holds the duration flat with the reason bit
+    cleared and the temperature back to the real reading, so the component
+    findings clear on a zero delta before the proxy passes through again.
+    ``baseline_us`` is the device's real counter so the first read is a rise,
+    not a counter reset.
+    """
+
+    if reason_bit & POWER_BRAKE_BIT:
+        raise EnvLivePlanError("a thermal warning plan must not assert the power brake")
+    field = _temperature_field(decision.variant)
+    warning = _warning_value(decision)
+    breaches = max(2, confirmation_samples) + 3
+    clear = max(3, confirmation_samples) if clear_reads is None else clear_reads
+    steps = [_reads(max(1, warmup_reads), {})]
+    for index in range(1, breaches + 1):
+        steps.append(
+            _reads(
+                1,
+                {
+                    field: warning,
+                    "thermal_violation_total_us": baseline_us + index * step_us,
+                    "clock_throttle_reasons": reason_bit,
+                },
+            )
+        )
+    steps.append(
+        _reads(
+            clear,
+            {
+                "thermal_violation_total_us": baseline_us + breaches * step_us,
+                "clock_throttle_reasons": 0,
+            },
+        )
+    )
+    return {"steps": steps}
+
+
+def power_limit_throttling_plan(
+    *,
+    confirmation_samples: int,
+    power_limit_w: float,
+    power_limit_ratio: float,
+    min_utilization_percent: float,
+    baseline_us: float = 0.0,
+    step_us: float = 1_000_000.0,
+    warmup_reads: int = 3,
+    clear_reads: int | None = None,
+    serve_limit: bool = False,
+) -> dict[str, Any]:
+    """GF-GENERAL-LIVE-024 ``power_performance``: an ordinary power cap.
+
+    The power-violation duration rises by ``step_us`` per read while the power
+    draw sits between ``power_limit_ratio`` of the enforced limit and the
+    limit itself under high utilization -- what DCGM reports for a GPU pinned
+    at its power cap. No clock reason bit is served: a thermal or brake reason
+    would be a temperature finding, which the product deliberately keeps out
+    of POWER_LIMIT_THROTTLING (``gpu_metrics._add_power_composite``). The
+    limit is the device's real reading unless ``serve_limit`` asks the proxy
+    to serve it too. The tail holds the duration flat and lets draw and
+    utilization pass through again so the component clears on a zero delta.
+    """
+
+    if power_limit_w <= 0:
+        raise EnvLivePlanError("a power cap plan needs a positive enforced power limit")
+    if not 0 < power_limit_ratio <= 1:
+        raise EnvLivePlanError("power_limit_ratio must be in (0, 1]")
+    usage = power_limit_w * (power_limit_ratio + (1.0 - power_limit_ratio) / 2)
+    utilization = min(100.0, max(min_utilization_percent + 10.0, 90.0))
+    breaches = max(2, confirmation_samples) + 3
+    clear = max(3, confirmation_samples) if clear_reads is None else clear_reads
+    steps = [_reads(max(1, warmup_reads), {})]
+    for index in range(1, breaches + 1):
+        values: dict[str, float | None] = {
+            "power_violation_total_us": baseline_us + index * step_us,
+            "power_usage_w": round(usage, 1),
+            "gpu_utilization_percent": utilization,
+        }
+        if serve_limit:
+            values["power_limit_w"] = float(power_limit_w)
+        steps.append(_reads(1, values))
+    steps.append(
+        _reads(clear, {"power_violation_total_us": baseline_us + breaches * step_us})
+    )
+    return {"steps": steps}
+
+
 def thermal_duration_plan(
     *, baseline_us: float = 0.0, increments: int = 4, step_us: float = 1_000_000.0
 ) -> dict[str, dict[str, Any]]:

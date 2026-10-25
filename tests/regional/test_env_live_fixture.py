@@ -322,3 +322,37 @@ def test_node_state_projects_one_bounded_node_read() -> None:
     assert [item["key"] for item in node["taints"]] == ["gpu-fault.io/quarantined"]
     assert seen[0][0] == ("get", "node", "node-a", "-o", "json")
     assert seen[0][1]["timeout"] == fixture.NODE_READ_TIMEOUT_SECONDS
+
+
+def test_controller_accepts_an_injected_created_host(tmp_path: Path) -> None:
+    class Host:
+        created = True
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, ...]] = []
+
+        def create(self) -> None:
+            raise AssertionError("an already created host is not re-created")
+
+        def execute(self, *arguments: str, timeout: int = 180) -> dict[str, Any]:
+            self.calls.append(arguments)
+            return {"status": {"armed": False}}
+
+        def cleanup(self) -> dict[str, bool]:
+            return {"pod": False, "configmap": False}
+
+    host = Host()
+    controller = fixture.EnvReplayController(
+        FakeRegional(device_xml=H200_XML),
+        node="node-a",
+        image="x@sha256:" + "0" * 64,
+        case_id="GF-GENERAL-LIVE-024.thermal_warning",
+        run_id="r1",
+        case_dir=tmp_path,
+        active_deadline_seconds=2400,
+        host=host,
+    )
+    controller.create()
+    assert controller.host is host
+    assert controller.status(port=9411) == {"status": {"armed": False}}
+    assert host.calls == [("status", "--run-id", "r1", "--port", "9411")]

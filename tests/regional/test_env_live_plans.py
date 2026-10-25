@@ -168,3 +168,81 @@ def test_unavailable_field_plans_cover_null_non_integer_and_blank() -> None:
     assert (
         family["dcgm_blank"]["steps"][0]["values"]["clock_throttle_reasons"] >= 9.0e18
     )
+
+
+def test_thermal_stress_plan_holds_the_warning_band_and_clears() -> None:
+    decision = _h200().decisions[plans.CORE_TLIMIT]
+    plan = plans.thermal_stress_plan(
+        decision, confirmation_samples=3, baseline_us=5_000_000.0
+    )
+    validate_plan(plan)
+    field = plans.temperature_field(decision)
+    assert field == "gpu_tlimit_c"
+    warning = plans.warning_reading(decision)
+    assert decision.critical_value is not None and decision.warning_value is not None
+    assert decision.critical_value < warning <= decision.warning_value
+    breach = [step for step in plan["steps"] if field in step["values"]]
+    assert len(breach) == 6, "confirmation samples plus three"
+    assert all(step["values"][field] == warning for step in breach), (
+        "every breach read sits at the warning reading"
+    )
+    assert all(
+        step["values"]["clock_throttle_reasons"] == plans.SW_THERMAL_BIT
+        for step in breach
+    ), "only the software thermal reason is asserted"
+    durations = [step["values"]["thermal_violation_total_us"] for step in breach]
+    assert durations == sorted(durations) and durations[0] > 5_000_000.0
+    assert plan["steps"][0] == {"reads": 3, "values": {}}, "pass-through warm-up"
+    tail = plan["steps"][-1]
+    assert tail["reads"] == 3
+    assert tail["values"] == {
+        "thermal_violation_total_us": durations[-1],
+        "clock_throttle_reasons": 0,
+    }, "the tail is flat with the reason cleared and the real temperature"
+    with pytest.raises(plans.EnvLivePlanError):
+        plans.thermal_stress_plan(
+            decision, confirmation_samples=3, reason_bit=plans.POWER_BRAKE_BIT
+        )
+
+
+def test_power_limit_throttling_plan_pins_draw_under_the_limit_without_reasons() -> (
+    None
+):
+    plan = plans.power_limit_throttling_plan(
+        confirmation_samples=3,
+        power_limit_w=700.0,
+        power_limit_ratio=0.95,
+        min_utilization_percent=80.0,
+        baseline_us=100.0,
+    )
+    validate_plan(plan)
+    breach = [step for step in plan["steps"] if "power_usage_w" in step["values"]]
+    assert len(breach) == 6
+    for step in breach:
+        values = step["values"]
+        assert 700.0 * 0.95 <= values["power_usage_w"] < 700.0, values
+        assert values["gpu_utilization_percent"] >= 80.0, values
+        assert "clock_throttle_reasons" not in values
+        assert "power_limit_w" not in values
+    durations = [step["values"]["power_violation_total_us"] for step in breach]
+    assert durations == sorted(durations) and durations[0] > 100.0
+    assert plan["steps"][-1]["values"] == {"power_violation_total_us": durations[-1]}
+    served = plans.power_limit_throttling_plan(
+        confirmation_samples=3,
+        power_limit_w=700.0,
+        power_limit_ratio=0.95,
+        min_utilization_percent=80.0,
+        serve_limit=True,
+    )
+    assert all(
+        step["values"].get("power_limit_w") == 700.0
+        for step in served["steps"]
+        if "power_usage_w" in step["values"]
+    ), "serve_limit serves the enforced limit with every breach read"
+    with pytest.raises(plans.EnvLivePlanError):
+        plans.power_limit_throttling_plan(
+            confirmation_samples=3,
+            power_limit_w=0.0,
+            power_limit_ratio=0.95,
+            min_utilization_percent=80.0,
+        )
