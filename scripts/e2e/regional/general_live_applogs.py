@@ -8,7 +8,12 @@ Two reviewed sources feed the node log collector's real rules
   real ``journalctl`` output. An out-of-memory line is a WARNING
   ``RUN_DIAGNOSTICS`` from any origin; NCCL and distributed-training errors are
   ``NO_ACTION`` evidence owned by the completion watcher -- never a hardware
-  marker or an extra diagnostic workflow.
+  marker or an extra diagnostic workflow. The OOM line is the kernel's own
+  ``Memory cgroup out of memory: Killed process ...`` (``CGROUP_OOM_MESSAGE``),
+  and every record travels under a per-run synthetic cursor: the cursor is the
+  entry id the control plane hashes into the incident's event id, so a second
+  run on the same node and boot must not inherit the first run's incident
+  (``general_live_kernel_source_probe``).
 * **CRI Pod logs** (``live_pid``, ``exited_pid``, ``old_pod``,
   ``cri_partial_rotation``): ``general_live_applog_fixture`` writes reviewed
   CRI records under ``/var/log/pods`` in the directory kubelet made for a
@@ -149,11 +154,27 @@ def _wait_incident(ctx: VariantContext, since: Any, name: str) -> dict[str, Any]
     return value if value is not None else last
 
 
+#: The kernel's memcg OOM-kill line, Linux v6.12 ``mm/oom_kill.c``
+#: ``oom_kill_process()`` -> ``__oom_kill_process()``: ``pr_err("%s: Killed
+#: process %d (%s) total-vm:%lukB, anon-rss:%lukB, file-rss:%lukB,
+#: shmem-rss:%lukB, UID:%u pgtables:%lukB oom_score_adj:%hd\n", message, ...)``
+#: with ``message`` = "Memory cgroup out of memory" for a cgroup limit
+#: (``out_of_memory()``: ``!is_memcg_oom(oc) ? "Out of memory" : "Memory
+#: cgroup out of memory"``). No ``pr_fmt`` prefix; the journal MESSAGE never
+#: carries the ``kernel:`` syslog identifier that ``dmesg -T``/syslog show.
+CGROUP_OOM_MESSAGE = (
+    "Memory cgroup out of memory: Killed process 44021 (python3) "
+    "total-vm:31485720kB, anon-rss:30961664kB, file-rss:12288kB, shmem-rss:0kB, "
+    "UID:1000 pgtables:61200kB oom_score_adj:994"
+)
+
+
 def cgroup_oom(ctx: VariantContext) -> dict[str, Any]:
     """A reviewed OOM-kill line is a diagnostic, never isolation or a STOP."""
 
-    message = "kernel: Out of memory: Killed process 44021 (python) total-vm:..., anon-rss:..."
-    started = _drive(ctx, [reviewed_record(message, transport="kernel", priority=3)])
+    started = _drive(
+        ctx, [reviewed_record(CGROUP_OOM_MESSAGE, transport="kernel", priority=3)]
+    )
     observed = _wait_incident(ctx, started, "oom-detect")
     incidents = _log_incidents(observed)
     stages = {
@@ -1281,7 +1302,8 @@ def _cri_spec(
 VARIANTS = [
     _spec(
         "cgroup_oom",
-        "reviewed kernel-transport OOM-kill line via the node log collector journal source",
+        "reviewed kernel-transport 'Memory cgroup out of memory: Killed process' line "
+        "(mm/oom_kill.c) via the node log collector journal source",
         "WARNING RUN_DIAGNOSTICS diagnostic; no isolation, no STOP without attribution, no hardware op",
         cgroup_oom,
     ),

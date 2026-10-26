@@ -561,6 +561,14 @@ corrected MCE不因上下文丢失而升错级，uncorrectable不被邻近correc
 训练stdout同文案、旧boot不得隔离当前节点。
 同时间戳多cursor及collector重启验证不饿死后续日志。禁止制造kernel panic/真实MCE；
 清理夹具与日志路径后保留隔离归属，按真实健康证据人工接纳。
+受检行取内核真实打印格式（Linux v6.12）：`kernel_lockup` 回放
+`watchdog: BUG: soft lockup - CPU#7 stuck for 23s! [python3:41234]`（`kernel/watchdog.c`）；`rdma_fatal`
+回放 `efa 0000:00:1d.0 efa_0: Wait for completion (polling) timeout`（`drivers/infiniband/hw/efa/efa_com.c`，
+经 `__ibdev_printk` 的 `"%s %s %s: %pV"` 前缀）。journal 回放的合成 cursor 带 run id
+（`gfrs-replay-<run>-<index>-<boot>`）：cursor 即采集器的 entry id，控制面由 (cluster, node, entry id) 派生
+incident 的 event id；同一节点同一 boot 上复用 cursor 时，后一次运行的 finding 被归入前一次运行的旧 incident
+（创建于本次开始之前，判定读不到），表现为“no severe kernel-log finding reached a NODE_HEALTH incident”
+而非产品缺陷。
 
 ### GF-GENERAL-LIVE-017
 
@@ -573,6 +581,10 @@ CRI P/F跨采集轮次、文件轮转和投递失败后仍可拼接，退出PID�
 普通 NCCL/分布式错误只保留日志和归属，不建额外诊断 workflow 或硬件 marker；
 真实非零退出由 watcher 通用处理并归028验证，不增加 NCCL 专用过滤。
 另验未退出且持续低 RDMA 的独立 hung 触发；清理日志夹具并核对没有误停对照任务。
+`cgroup_oom` 回放内核 `mm/oom_kill.c` 的真实格式 `Memory cgroup out of memory: Killed process 44021
+(python3) total-vm:…kB, anon-rss:…kB, file-rss:…kB, shmem-rss:…kB, UID:1000 pgtables:…kB
+oom_score_adj:994`（journal MESSAGE 不带 `kernel:` 标识），命中 OOM 规则 → WARNING/RUN_DIAGNOSTICS；
+journal 回放复用 016 的 per-run cursor，同一节点同一 boot 上的后续运行不再并入首个运行的旧 incident。
 
 ### GF-GENERAL-LIVE-019
 

@@ -304,6 +304,7 @@ ARMED = %(armed)r
 STATE = %(state)r
 EMISSIONS = %(emissions)r
 BOOT_ID = %(boot_id)r
+RUN_ID = %(run_id)r
 CURSOR_PREFIX = "gfrs-replay-"
 
 
@@ -353,8 +354,18 @@ def _emit_reviewed(out):
                     continue
                 counts[key] = done + 1
                 transport = record.get("transport") or "kernel"
+                # The cursor is the entry's identity all the way to the control
+                # plane: the collector makes it the entry id and the control
+                # plane hashes (cluster, node, entry id) into the incident's
+                # event id. It is stable within a run on purpose -- every
+                # emission of a record is one incident -- and it carries the
+                # run id so that record 0 of the next run on the same node and
+                # boot is a new event. Without the run id, every later run's
+                # finding was routed to the first run's incident (created
+                # before the later run started, so invisible to it) and no
+                # second variant ever reached a fresh incident on a node.
                 entry = {
-                    "__CURSOR": CURSOR_PREFIX + str(index) + "-" + BOOT_ID,
+                    "__CURSOR": CURSOR_PREFIX + RUN_ID + "-" + str(index) + "-" + BOOT_ID,
                     "__REALTIME_TIMESTAMP": str(now_us),
                     "__MONOTONIC_TIMESTAMP": str(now_us),
                     "MESSAGE": record["message"],
@@ -401,6 +412,7 @@ def write_wrapper(run_id: str) -> str:
             "state": str(emission_log_path(run_id)),
             "emissions": 4,
             "boot_id": boot_id(),
+            "run_id": run_id,
         },
         encoding="utf-8",
     )

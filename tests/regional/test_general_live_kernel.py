@@ -9,10 +9,16 @@ negative variants prove the trusted-source and current-boot gates.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
+from gpu_fault.host_health import NodeHealthPolicy, NodeLogBatch, NodeLogEntry
+from gpu_fault.models import RecoveryAction, Severity
 from scripts.e2e.regional import general_live_kernel as mod
 from scripts.e2e.regional.general_live_registry import coverage_rows
+from tests._builders import build_store
 from tests.regional._general_live_fakes import (
     FakeProbe,
     FakeRegional,
@@ -22,6 +28,7 @@ from tests.regional._general_live_fakes import (
 )
 
 NODE = "ip-10-0-43-5.us-west-2.compute.internal"
+NOW = datetime(2026, 10, 1, 12, tzinfo=timezone.utc)
 
 
 def _spec(variant: str) -> object:
@@ -195,6 +202,44 @@ def test_inconclusive_when_nothing_was_ingested(tmp_path: Path) -> None:
         assert "no reviewed records" in str(exc), str(exc)
     else:
         raise AssertionError("an empty injection oracle must be INCONCLUSIVE")
+
+
+def _product_decision(message: str) -> tuple[Severity, RecoveryAction, str]:
+    """What the product's own rule chain makes of a trusted kernel line."""
+
+    [finding] = NodeHealthPolicy(build_store()).evaluate_logs(
+        NodeLogBatch(
+            cluster_id="cluster-a",
+            node_id="node-a",
+            collected_at=NOW,
+            entries=[
+                NodeLogEntry(
+                    entry_id="gfrs-replay-run-0-boot",
+                    source="dmesg",
+                    observed_at=NOW,
+                    message=message,
+                    fields={"_TRANSPORT": "kernel"},
+                )
+            ],
+        )
+    )
+    return finding.severity, finding.recommended_action, finding.policy_source
+
+
+@pytest.mark.parametrize(
+    "variant", ["uncorrectable_mce", "readonly_storage", "rdma_fatal", "kernel_lockup"]
+)
+def test_severe_reviewed_lines_are_graded_critical_quarantine_by_the_product(
+    variant: str,
+) -> None:
+    # The harness and the product must agree on the reviewed text before a
+    # live run spends a node on it: a severe line reaches the kernel-log
+    # quarantine path, not a diagnostic one.
+    assert _product_decision(mod.SEVERE_MESSAGES[variant]) == (
+        Severity.CRITICAL,
+        RecoveryAction.QUARANTINE,
+        "SITE_KERNEL_LOG",
+    ), variant
 
 
 def test_corrected_mce_is_diagnostic_not_isolation(tmp_path: Path) -> None:

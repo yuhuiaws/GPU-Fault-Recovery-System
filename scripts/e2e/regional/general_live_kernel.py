@@ -15,6 +15,29 @@ workload) -> notification chain on a reviewed source, never a physical kernel
 fault. The negative variants are the point of the trust gate: a user-space line
 (``user_text``), an old-boot line (``old_boot``) and a corrected MCE
 (``corrected_mce``) must not isolate the current node.
+
+The reviewed lines are what the kernel prints, so the product grades the real
+format and not a paraphrase (Linux v6.12 unless noted):
+
+* ``kernel_lockup``: ``kernel/watchdog.c`` ``watchdog_timer_fn()``
+  ``pr_emerg("BUG: soft lockup - CPU#%d stuck for %us! [%s:%d]\n", ...)`` under
+  ``pr_fmt "watchdog: "``.
+* ``rdma_fatal``: ``drivers/infiniband/hw/efa/efa_com.c``
+  ``efa_com_wait_and_process_admin_cq_polling()`` ``ibdev_err_ratelimited(...,
+  "Wait for completion (polling) timeout\n")`` -- the device stopped answering
+  its admin queue and the driver closes it -- printed through
+  ``drivers/infiniband/core/device.c`` ``__ibdev_printk()`` as ``"%s %s %s:
+  %pV"`` = ``efa <pci address> efa_0: ...``.
+* ``uncorrectable_mce`` and ``readonly_storage`` keep their earlier reviewed
+  wording: the rule names the very words they carry (``uncorrected``,
+  ``Remounting filesystem read-only``), and the kernel's own forms of them
+  (``Machine Check Exception`` with UC set, ``EXT4-fs (dev): Remounting
+  filesystem read-only``) are pinned in the product's tests.
+
+Each reviewed record travels under a synthetic journal cursor that carries the
+run id (``probes/general_live_kernel_source_probe.py``): the cursor is the
+entry id, and the control plane derives the incident's event id from it, so a
+second run on the same node and boot must not reuse the first run's identity.
 """
 
 from __future__ import annotations
@@ -66,8 +89,8 @@ def _severe(
 SEVERE_MESSAGES = {
     "uncorrectable_mce": "mce: [Hardware Error]: Machine check events logged: uncorrected error CPU 3",
     "readonly_storage": "EXT4-fs (nvme1n1): Remounting filesystem read-only after I/O error",
-    "rdma_fatal": "efa: fatal error on device efa_0: link down, resetting",
-    "kernel_lockup": "kernel: watchdog: BUG: soft lockup - CPU#7 stuck for 23s",
+    "rdma_fatal": "efa 0000:00:1d.0 efa_0: Wait for completion (polling) timeout",
+    "kernel_lockup": "watchdog: BUG: soft lockup - CPU#7 stuck for 23s! [python3:41234]",
 }
 
 
@@ -432,14 +455,14 @@ VARIANTS = [
     ),
     _spec(
         "rdma_fatal",
-        "reviewed kernel-transport 'efa: fatal error ... link down' line",
+        "reviewed kernel-transport EFA admin-queue 'Wait for completion (polling) timeout' line",
         "RDMA CRITICAL -> cordon + quarantine + notification; no unauthorized reboot",
         rdma_fatal,
         risk="H",
     ),
     _spec(
         "kernel_lockup",
-        "reviewed kernel-transport 'soft lockup' line (never a real panic)",
+        "reviewed kernel-transport 'watchdog: BUG: soft lockup' line (never a real panic)",
         "SYSTEM_LOG CRITICAL -> cordon + quarantine + notification",
         kernel_lockup,
         risk="H",

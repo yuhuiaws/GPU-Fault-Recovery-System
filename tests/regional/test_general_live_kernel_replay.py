@@ -190,7 +190,9 @@ def test_controller_evidence_reports_scope_and_digest(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------- #
 # the rendered journalctl pass-through wrapper (journal mode)
 # --------------------------------------------------------------------------- #
-def _render_wrapper(tmp_path: Path, *, armed: bool) -> tuple[Path, Path]:
+def _render_wrapper(
+    tmp_path: Path, *, armed: bool, run_id: str = "gl016-test-a1-0000beef"
+) -> tuple[Path, Path]:
     """Render the wrapper against a stub journalctl; return (wrapper, argv-log)."""
 
     argv_log = tmp_path / "real-argv.json"
@@ -229,6 +231,7 @@ def _render_wrapper(tmp_path: Path, *, armed: bool) -> tuple[Path, Path]:
             "state": str(state),
             "emissions": 2,
             "boot_id": "boot-xyz",
+            "run_id": run_id,
         },
         encoding="utf-8",
     )
@@ -271,6 +274,41 @@ def test_wrapper_appends_reviewed_records_when_armed(tmp_path: Path) -> None:
     assert reviewed["__CURSOR"].startswith("gfrs-replay-"), (
         "injected records carry a replay cursor"
     )
+    assert reviewed["__CURSOR"] == "gfrs-replay-gl016-test-a1-0000beef-0-boot-xyz", (
+        "the cursor names the run, the record and the boot"
+    )
+
+
+def test_wrapper_cursor_is_stable_within_a_run_and_new_for_the_next_run(
+    tmp_path: Path,
+) -> None:
+    # The cursor becomes the collector's entry id and then the control plane's
+    # event id (sha256 of cluster, node, entry id): the same cursor on the same
+    # node means the same incident. Within one run that is the dedup the
+    # emissions rely on; across runs on one node and boot it routed the second
+    # run's finding into the first run's incident, created before the second
+    # run started and therefore never seen by it.
+    (tmp_path / "first").mkdir()
+    (tmp_path / "second").mkdir()
+    first, _ = _render_wrapper(tmp_path / "first", armed=True, run_id="gl016-a-1")
+    cursors = set()
+    for _poll in range(2):
+        lines = _run_wrapper(first, "--output=json", "--since", "@1", "--until", "@2")
+        cursors.update(
+            item["__CURSOR"] for item in lines if item["MESSAGE"].startswith("machine")
+        )
+    assert cursors == {"gfrs-replay-gl016-a-1-0-boot-xyz"}, (
+        "every emission of a record within one run shares one cursor"
+    )
+    second, _ = _render_wrapper(tmp_path / "second", armed=True, run_id="gl016-b-2")
+    lines = _run_wrapper(second, "--output=json", "--since", "@1", "--until", "@2")
+    [other] = [
+        item["__CURSOR"] for item in lines if item["MESSAGE"].startswith("machine")
+    ]
+    assert other == "gfrs-replay-gl016-b-2-0-boot-xyz", other
+    assert other not in cursors, (
+        "a later run on the same node and boot must mint a new entry identity"
+    )
 
 
 def test_wrapper_bounds_emissions(tmp_path: Path) -> None:
@@ -291,13 +329,27 @@ def test_wrapper_never_forwards_its_own_cursor(tmp_path: Path) -> None:
         "@1",
         "--until",
         "@2",
-        "--after-cursor=gfrs-replay-0-boot-xyz",
+        "--after-cursor=gfrs-replay-gl016-test-a1-0000beef-0-boot-xyz",
     )
     forwarded = json.loads(argv_log.read_text(encoding="utf-8"))
     assert not any("gfrs-replay-" in item for item in forwarded), (
         "the wrapper strips its own synthetic cursor before the real journalctl"
     )
     assert "--output=json" in forwarded, "every real flag is still forwarded"
+    _run_wrapper(
+        wrapper,
+        "--output=json",
+        "--since",
+        "@1",
+        "--until",
+        "@2",
+        "--after-cursor",
+        "gfrs-replay-gl016-earlier-run-0-boot-xyz",
+    )
+    forwarded = json.loads(argv_log.read_text(encoding="utf-8"))
+    assert not any("gfrs-replay-" in item for item in forwarded), (
+        "a cursor of an earlier run is stripped by its prefix as well"
+    )
 
 
 def test_wrapper_passes_a_real_cursor_through(tmp_path: Path) -> None:

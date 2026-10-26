@@ -143,6 +143,58 @@ def _ctx(variant: str, *, activity: dict[str, object], isolated: bool, tmp_path:
     )
 
 
+def test_cgroup_oom_installs_the_kernel_oom_kill_line(tmp_path: Path) -> None:
+    import base64
+    import json
+
+    activity = _activity(
+        [_incident("RUN_DIAGNOSTICS")],
+        [_workflow(["FREEZE_EVIDENCE", "VALIDATE_HOST"])],
+    )
+    ctx = _ctx("cgroup_oom", activity=activity, isolated=False, tmp_path=tmp_path)
+    mod.cgroup_oom(ctx)
+    fake = ctx.probes[f"kernel-replay-journal@{NODE}"]
+    install = next(call for call in fake.calls if call[0] == "install-records")
+    [record] = json.loads(base64.b64decode(install[install.index("--b64") + 1]))
+    assert record["message"] == mod.CGROUP_OOM_MESSAGE, record
+    assert record["message"].startswith(
+        "Memory cgroup out of memory: Killed process "
+    ), "the reviewed record is the kernel's oom_kill_process line, not a paraphrase"
+    assert not record["message"].startswith("kernel:"), (
+        "a journal MESSAGE never carries the syslog identifier"
+    )
+    assert record["transport"] == "kernel", record
+
+
+def test_cgroup_oom_line_is_graded_diagnostic_by_the_product() -> None:
+    from gpu_fault.host_health import NodeHealthPolicy, NodeLogBatch, NodeLogEntry
+    from gpu_fault.models import RecoveryAction, Severity
+    from tests._builders import build_store
+
+    now = datetime(2026, 10, 1, 12, tzinfo=timezone.utc)
+    [finding] = NodeHealthPolicy(build_store()).evaluate_logs(
+        NodeLogBatch(
+            cluster_id="cluster-a",
+            node_id="node-a",
+            collected_at=now,
+            entries=[
+                NodeLogEntry(
+                    entry_id="gfrs-replay-run-0-boot",
+                    source="dmesg",
+                    observed_at=now,
+                    message=mod.CGROUP_OOM_MESSAGE,
+                    fields={"_TRANSPORT": "kernel"},
+                )
+            ],
+        )
+    )
+    assert (finding.severity, finding.recommended_action, finding.policy_source) == (
+        Severity.WARNING,
+        RecoveryAction.RUN_DIAGNOSTICS,
+        "SITE_APPLICATION_LOG",
+    ), "the harness and the product agree on the reviewed OOM line"
+
+
 def test_cgroup_oom_is_a_diagnostic(tmp_path: Path) -> None:
     activity = _activity(
         [_incident("RUN_DIAGNOSTICS")],
