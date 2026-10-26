@@ -95,6 +95,16 @@ _EXCEPTION_CLASS = re.compile(
     r"^(?P<name>[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Exit|Interrupt|Iteration|"
     r"Warning|Timeout|Refused|Denied|Failed|Conflict|NotFound))\b"
 )
+#: kubectl's own lines around an exec'd command's stderr, never the command's:
+#: the trailer it appends to every failed exec, and the container notice it
+#: prints on a multi-container Pod. Live 2026-10-26 (gpu-eks-cluster, 019
+#: remap_failure): the traceback's ``RuntimeError: ...`` line was followed by
+#: ``command terminated with exit code 1``, so the class of every Pod-exec
+#: failure went unread and the evidence showed none.
+_KUBECTL_NOTICE_LINES = (
+    re.compile(r"^command terminated with exit code \d+$"),
+    re.compile(r'^Defaulted container "[^"]*" out of: .*$'),
+)
 #: kubectl's own failure heads for an exec that never reached the script.
 _KUBECTL_FAILURE_HEADS = (
     ("unable to upgrade connection", "unable to upgrade connection"),
@@ -117,10 +127,17 @@ def failure_class(stderr: str | None) -> str:
     the operator which half failed. Live 2026-10-07 (gpu-eks-cluster DESTR-003):
     the spare release probe raised StopIteration inside the executor Pod and
     the evidence read only ``command failed (1): <sensitive output redacted>
-    (step: kubectl exec)``.
+    (step: kubectl exec)``. kubectl's own trailer and notices
+    (``_KUBECTL_NOTICE_LINES``) are skipped first, wherever they land: the
+    trailer is the last line of every failed exec, not the traceback's.
     """
 
-    lines = [line.strip() for line in (stderr or "").splitlines() if line.strip()]
+    lines = [
+        stripped
+        for line in (stderr or "").splitlines()
+        if (stripped := line.strip())
+        and not any(notice.match(stripped) for notice in _KUBECTL_NOTICE_LINES)
+    ]
     if not lines:
         return ""
     match = _EXCEPTION_CLASS.match(lines[-1])

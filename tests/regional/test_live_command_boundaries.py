@@ -316,3 +316,75 @@ def test_command_failure_names_the_exception_class_but_not_its_message() -> None
     )
     assert failure_class("") == "" and failure_class(None) == ""
     assert failure_class(f"some unclassified text {secret}") == ""
+
+
+def test_failure_class_skips_the_kubectl_exec_trailer() -> None:
+    """Live 2026-10-26 (gpu-eks-cluster, GF-GENERAL-LIVE-019.remap_failure): the
+    restore probe raised RuntimeError inside the api-ha Pod, and kubectl's own
+    trailer followed the traceback, so the class was never read and the
+    evidence showed no class at all. The trailer and kubectl's container notice
+    are kubectl's lines, not the command's, wherever they land."""
+
+    from scripts.e2e.regional.regional_commands import (
+        RegionalCommandFailed,
+        exec_refused_before_script,
+        failure_class,
+    )
+
+    secret = "only-a-local-probe-fixture-secret"
+    captured = (
+        "Traceback (most recent call last):\n"
+        '  File "<stdin>", line 4, in <module>\n'
+        f"RuntimeError: probe: {secret}\n"
+        "command terminated with exit code 1\n"
+    )
+    assert failure_class(captured) == "RuntimeError", failure_class(captured)
+    failed = RegionalCommandFailed(1, captured, ["kubectl", "exec", "-i", "pod"])
+    assert "[RuntimeError]" in str(failed) and secret not in str(failed), str(failed)
+    assert "(step: kubectl exec)" in str(failed), str(failed)
+    assert exec_refused_before_script(failed) is False, (
+        "the script ran and raised; kubectl's trailer does not make it a refusal"
+    )
+
+    noticed = (
+        'Defaulted container "api" out of: api, sidecar (init)\n'
+        "Traceback (most recent call last):\n"
+        f"StopIteration: {secret}\n"
+        "command terminated with exit code 1\n"
+    )
+    assert failure_class(noticed) == "StopIteration", failure_class(noticed)
+    assert failure_class("command terminated with exit code 137\n") == "", (
+        "the trailer alone names no class and leaks nothing"
+    )
+    assert failure_class('Defaulted container "api" out of: api, sidecar\n') == "", (
+        "a notice alone names no class"
+    )
+
+
+def test_failure_class_still_reads_kubectl_failure_heads() -> None:
+    from scripts.e2e.regional.regional_commands import (
+        RegionalCommandFailed,
+        exec_refused_before_script,
+        failure_class,
+    )
+
+    secret = "only-a-local-kubectl-fixture-secret"
+    heads = {
+        f"error: unable to upgrade connection: container not found ({secret})": (
+            "kubectl: unable to upgrade connection"
+        ),
+        f"Error from server (NotFound): pods {secret} not found": "kubectl: not found",
+        f"Unable to connect to the server: dial tcp {secret}: connection refused": (
+            "kubectl: connection refused"
+        ),
+        f'Defaulted container "api" out of: api, sidecar\nerror: error dialing backend: {secret}': (
+            "kubectl: error dialing backend"
+        ),
+    }
+    for stderr, label in heads.items():
+        assert failure_class(stderr) == label, (stderr, failure_class(stderr))
+        failed = RegionalCommandFailed(1, stderr, ["kubectl", "exec", "-i", "pod"])
+        assert f"[{label}]" in str(failed) and secret not in str(failed), str(failed)
+        assert exec_refused_before_script(failed) is True, (
+            "kubectl never attached; another Pod repeats nothing"
+        )

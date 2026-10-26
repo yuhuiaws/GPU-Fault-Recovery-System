@@ -2901,7 +2901,13 @@ and nothing is retried (`tests/regional/test_general_live_gpu_memory.py`, over
 recorded fakes). The runner's post-case close of ESCALATED incidents lists
 only what is still ESCALATED, so it has nothing to do after the variant.
 What the proof does not cover: the close is the product's record exit; it
-does not show that an RMA happened, and the replay never damaged memory.
+does not show that an RMA happened, and the replay never damaged memory. The
+same finding exposed a reporting defect: `failure_class()` classified a Pod
+exec's stderr from its last line, which for every `kubectl exec` failure is
+kubectl's own trailer `command terminated with exit code N`, so the exception
+class (`[RuntimeError]`) was missing from every Pod-exec failure's evidence;
+kubectl's trailer and `Defaulted container ...` notice are now skipped before
+classifying (`tests/regional/test_live_command_boundaries.py`).
 
 The two variants that need a trusted independent kernel XID beside a held
 DCGM fault (020 `independent_fatal_event`, 024 `independent_xid`) reuse lane
