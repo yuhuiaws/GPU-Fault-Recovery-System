@@ -737,7 +737,7 @@ def missing_counter(ctx: VariantContext) -> dict[str, Any]:
 
     The marker is read from the product's batches, so the product must
     *deliver* the tick on which it changed: its edge filter keys the marker by
-    its content (``collectors/host/network.py`` ``not_supported_edge_reason``)
+    its content (``host_capability_markers.not_supported_edge_reason``)
     since the live 2026-10-25 run, where the marker named the withdrawn counter
     on every tick and no batch carrying it ever left the node. What each batch
     carried for the netdev is written as ``counter-present-readings`` and

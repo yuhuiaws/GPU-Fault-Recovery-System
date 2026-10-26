@@ -20,6 +20,7 @@ from gpu_fault.efa_traffic_state import traffic_observation
 from gpu_fault.env import env_bool
 from gpu_fault.efa_stall_episode import episode_parameters
 from gpu_fault.gpu_instance_inventory import gpu_instance_inventory
+from gpu_fault.host_capability_markers import CAPABILITY_MARKERS
 from gpu_fault.host_device_signals import (
     age_out_vanished_device_signals,
     device_gone,
@@ -355,7 +356,7 @@ class SyntheticNodeReplacementRequest(StrictModel):
         return value
 
 
-_HOST_VALIDATION_LATEST_METRICS = {
+_HOST_LATEST_METRICS = CAPABILITY_MARKERS | {
     "cpu_usage_percent",
     "load1_per_cpu",
     "memory_used_percent",
@@ -630,7 +631,7 @@ def metric_rule(
 
 
 class NodeHealthPolicy:
-    LATEST_METRICS_REQUIRED = _HOST_VALIDATION_LATEST_METRICS | {
+    LATEST_METRICS_REQUIRED = _HOST_LATEST_METRICS | {
         "gpu_inventory_expected_count",
         "gpu_inventory_active_count",
         "efa_inventory_expected_count",

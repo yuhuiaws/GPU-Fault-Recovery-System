@@ -18,6 +18,7 @@ from gpu_fault.collectors.host.mount_table import (
     read_mount_table,
 )
 from gpu_fault.collectors.host.observation import HostObservationError
+from gpu_fault.host_capability_markers import SMART_STATUS_UNSUPPORTED
 from gpu_fault.host_device_signals import DEVICE_STATE_GONE, DEVICE_STATE_LABEL
 from gpu_fault.host_health import (
     HostMetricSample,
@@ -1096,7 +1097,7 @@ class HostSystemMetricsMixin:
         """
 
         return HostMetricSample(
-            name="smart_status_unsupported",
+            name=SMART_STATUS_UNSUPPORTED,
             value=1,
             device=device,
             labels={"reason": reason},

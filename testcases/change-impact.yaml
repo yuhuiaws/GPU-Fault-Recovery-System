@@ -792,6 +792,11 @@ rules:
       - src/gpu_fault/host_device_signals.py
       - tests/host_health/test_device_signal_age_out.py
       - tests/app_services/test_device_signal_age_out_ingest.py
+      # Capability (NOT_SUPPORTED) markers: the edge they contribute and the
+      # latest record that keeps them readable (batch 187).
+      - src/gpu_fault/host_capability_markers.py
+      - tests/host_health/test_capability_marker_latest.py
+      - tests/app_services/test_capability_marker_ingest.py
       - src/gpu_fault/control_record_archive.py
       - src/gpu_fault/efa_traffic_state.py
       - src/gpu_fault/log_rules.py
@@ -820,6 +825,7 @@ rules:
       # managed-attempt gate and its per-attempt scope (batch 140).
       - tests/host_health
       - tests/app_services/test_device_signal_age_out_ingest.py
+      - tests/app_services/test_capability_marker_ingest.py
       - tests/fleet/test_dcgm_hostengine_heartbeat.py
       - tests/metrics/test_fabric_manager_state.py
       - tests/execution/test_validation_nvlink_fabric.py

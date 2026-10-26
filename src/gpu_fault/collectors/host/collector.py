@@ -16,11 +16,7 @@ from gpu_fault.collectors.gpu.discovery import expected_accelerator_counts
 from gpu_fault.collectors.host.bmc import IPMI_DEVICE_NODES, HostBmcMixin
 from gpu_fault.collectors.host.gpu_rank import HostGpuRankMixin
 from gpu_fault.collectors.host.inventory import HostInventoryMixin
-from gpu_fault.collectors.host.network import (
-    NOT_SUPPORTED_REASON_PREFIX,
-    HostNetworkMixin,
-    not_supported_edge_reason,
-)
+from gpu_fault.collectors.host.network import HostNetworkMixin
 from gpu_fault.collectors.host.observation import HostObservationError
 from gpu_fault.collectors.host.shared_filesystems import HostSharedFilesystemsMixin
 from gpu_fault.collectors.host.shared_mounts import (
@@ -41,6 +37,10 @@ from gpu_fault.collectors.sinks import (
     deliver_or_raise,
 )
 from gpu_fault.env import env_bool
+from gpu_fault.host_capability_markers import (
+    NOT_SUPPORTED_REASON_PREFIX,
+    not_supported_edge_reason,
+)
 from gpu_fault.host_device_signals import device_gone
 from gpu_fault.host_health import (
     HostMetricSample,
@@ -721,11 +721,12 @@ class HostTelemetryCollector(
         for sample in batch.samples:
             if device_gone(sample):
                 continue  # a clear, not a reading: never an edge of its own
-            # A NOT_SUPPORTED marker is keyed by its whole content: a counter
-            # the netdev stops (or starts) exposing changes the reason and is
+            # A NOT_SUPPORTED marker (BMC, SMART, EFA ethtool) is keyed by its
+            # whole content: one that appears, a reason that changes or a
+            # counter the netdev stops (or starts) exposing is a new reason,
             # delivered once; an unchanged marker is not an edge (live
-            # GF-GENERAL-LIVE-010 missing_counter: the marker that named the
-            # withdrawn counter never left the node).
+            # GF-GENERAL-LIVE-010 missing_counter and 015 command_failure: the
+            # marker rode every tick and no batch carrying it left the node).
             not_supported = not_supported_edge_reason(sample)
             if not_supported is not None:
                 reasons.add(not_supported)

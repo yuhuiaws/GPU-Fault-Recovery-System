@@ -39,7 +39,9 @@ training, thermal, spare-health or RMA policies from that review.
   `ipmitool` that finds no IPMI device node and none exists (EC2) -- is
   `bmc_status_unsupported` (TOOL_MISSING / NO_DEVICE) with no collection
   error, like SMART's; it used to be a `_bmc` error on every tick that held
-  host validation forever.
+  host validation forever. Like every capability marker it is a state, and
+  its appearance, a `reason` change and its clearing are edges while every
+  accepted batch keeps it in the node's latest records (see the EFA bullet).
 - SMART query failures are `smart_query_failed` plus a collection error and
   are retried, rather than masquerading as `smart_health_failed` and causing
   hardware quarantine. Genuine failed self-assessments remain unchanged. A
@@ -54,12 +56,20 @@ training, thermal, spare-health or RMA policies from that review.
   baseline, a reset or an unparseable counter is unknown (collection error), a
   failed or hung `ethtool` is a collection error for that netdev only, and a
   counter the netdev lacks is `efa_ethtool_counters_unsupported` instead of 0.
-  The marker is a state, not an edge of its own; a marker that appears,
-  changes or clears after the first tick is one
-  (`not-supported:<marker>:<netdev>:<reason>:<metrics>`), delivered once, so
-  the records say when a netdev stopped exposing a counter -- the first live
-  `missing_counter` run found the changed marker never delivered, the health
-  summary that carried it not kept as evidence.
+  Every capability marker -- this one, `bmc_status_unsupported` and
+  `smart_status_unsupported`, registered in
+  `host_capability_markers.CAPABILITY_MARKERS` -- is a state, not an edge of
+  its own; a marker that appears, changes or clears after the first tick is
+  one (`not-supported:<marker>:<device|node>:<reason>[:<metrics>]`), delivered
+  once, and every accepted batch, the health summary included, keeps the
+  marker with its `reason` and device in `telemetry_metric_latest`
+  (`NodeHealthPolicy.LATEST_METRICS_REQUIRED`), so the records say when a
+  netdev stopped exposing a counter and what a node's capability state is at
+  any moment. The first live `missing_counter` run found the changed EFA
+  marker never delivered, the health summary that carried it not kept as
+  evidence; the first live 015 `command_failure` and `unsupported_bmc` runs
+  found the BMC marker in no record at all -- it had no edge and no latest
+  record.
 - The sysfs RDMA port counters (`rdma_errors_delta`, `rdma_<counter>_delta`)
   and the netdev `statistics` counters (`network_errors_delta`,
   `network_drops_delta`) follow the same reset rule: a counter below its

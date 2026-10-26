@@ -1074,8 +1074,9 @@ keeps the fixed text `BMC reports a critical sensor`. A non-zero `ipmitool` exit
 row, or a table whose every status is `na` is UNKNOWN (a `_bmc` collection error, no sample); no `ipmitool`
 (TOOL_MISSING) or an `ipmitool` that reports no IPMI device node while none of `/dev/ipmi0`, `/dev/ipmi/0`,
 `/dev/ipmidev/0` exists (NO_DEVICE, EC2 instances) is NOT_SUPPORTED: `bmc_status_unsupported` on every tick, no
-collection error, no rule input. The SMART device scan ignores
-blank lines and other records that are not `/dev/*`; `#` comment lines carry meaning (see below).
+collection error, no rule input; its appearance, a `reason` change and its clearing are host edges, and every
+accepted batch keeps it in the node's latest records (see "NOT_SUPPORTED capability markers" below). The SMART
+device scan ignores blank lines and other records that are not `/dev/*`; `#` comment lines carry meaning (see below).
 
 SMART conclusions are cached per drive for 300 seconds, but `smartctl --scan-open` re-enumerates every cycle, so
 a swapped or newly attached disk does not have to wait for the cache to expire. Only a JSON boolean
@@ -1109,18 +1110,31 @@ emits `efa_ethtool_counters_unsupported` (`value` is the number of missing group
 delta names, `reason` is `MISSING_COUNTER` or `NO_STATISTICS`) instead of a 0, and records no collection error.
 All of these used to be reported as 0, which VALIDATE_FABRIC accepted as a clean link for counters it never measured.
 
-The marker is the state a netdev is in, not an event, and ships with every tick, so it is no edge of its own: a
-counter the node lacked from the start rides the baseline batch and the health summaries after it. The host
-collector's edge filter derives a reason from the whole marker,
-`not-supported:efa_ethtool_counters_unsupported:<netdev>:<reason>:<metrics>` (`collectors/host/network.py`
-`not_supported_edge_reason`, `collector.py` `_edge_reasons`): a counter that disappears from `ethtool -S` mid-run
-(one more name in `metrics`), one that reappears, or a `reason` moving between `MISSING_COUNTER` and
-`NO_STATISTICS` is a new reason, delivered once on that tick, and the old reason ending is a `recovered` edge; an
-unchanged marker is not delivered. On the first tick the reason is stripped like the low-utilisation ones (a state,
-not an edge) but still becomes active, so only a later change is the edge. Before this, a changed marker had no
-delivery reason at all, and a health summary without findings or collection errors writes no raw evidence
-(`app/ingest/telemetry.py`), so the product's records never said that a counter had gone (the first live run of
-GF-GENERAL-LIVE-010 `missing_counter` failed on exactly that).
+**Observability of the NOT_SUPPORTED capability markers.** The three markers -- `bmc_status_unsupported`,
+`smart_status_unsupported`, `efa_ethtool_counters_unsupported`, registered in
+`host_capability_markers.CAPABILITY_MARKERS`, whose constants the three contributors name their samples with -- are
+the state the node is in, not an event, and ship with every tick, so a marker is no edge of its own: a gap the node
+had from the start rides the baseline batch and the health summaries after it. The host collector's edge filter
+derives a reason from the whole marker, `not-supported:<marker>:<device|node>:<reason>[:<other label values>]`
+(the EFA marker's is `...:<reason>:<metrics>`, unchanged from the EFA-only rule;
+`host_capability_markers.not_supported_edge_reason`, `collector.py` `_edge_reasons`): a marker that appears (a
+node whose BMC answered becomes one without a device), a `reason` that changes (`TOOL_MISSING` -> `NO_DEVICE`,
+`MISSING_COUNTER` <-> `NO_STATISTICS`) and an EFA counter list that changes (one more or one fewer name in
+`metrics`) are each a new reason, delivered once on that tick; the old reason ending -- the marker clearing
+included -- is a `recovered` edge; an unchanged marker is not delivered. On the first tick the reason is stripped
+like the low-utilisation ones (a state, not an edge) but still becomes active, so only a later change is the edge.
+The markers are also in `NodeHealthPolicy.LATEST_METRICS_REQUIRED` (`host_health.py` `_HOST_LATEST_METRICS`):
+`evaluate_metrics` upserts the marker of every accepted batch -- including one delivered for `health-summary` alone,
+which by design writes no raw evidence -- into `telemetry_metric_latest` with its `reason` label and device, so the
+node's capability state is readable at any time; the record is latest-wins, a cleared marker keeps the stamp of its
+last appearance, and that is how a reader tells a current gap (stamped with the node's newest batch) from a closed
+one. A marker is still no rule input: no finding, no isolation, no held host validation. Before this only the EFA
+marker had an edge (the first live run of GF-GENERAL-LIVE-010 `missing_counter`: the marker named the withdrawn
+counter on every tick but had no delivery reason); a BMC or SMART marker that changed had no delivery reason and no
+latest record either, so GF-GENERAL-LIVE-015 `command_failure` could not read the NO_DEVICE marker that followed the
+replayed failure (it rode only the tick that closed the collection error; every steady tick after it was no edge),
+and `unsupported_bmc` read zero batches in a whole health summary period on a node without `ipmitool` (the steady
+marker rides only the summary, and the summary is not evidence).
 
 The sysfs RDMA error counters (`/sys/class/infiniband/<device>/ports/<port>/{counters,hw_counters}`, summed per port
 into `rdma_errors_delta`, each counter also reported as `rdma_<counter>_delta`) and the netdev `statistics` counters

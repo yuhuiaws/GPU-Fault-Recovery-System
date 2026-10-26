@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Any, Callable, NamedTuple
 
 from gpu_fault.collectors.host.observation import HostObservationError
+from gpu_fault.host_capability_markers import BMC_STATUS_UNSUPPORTED
 from gpu_fault.host_health import HostMetricSample
 
 #: ``ipmitool sensor`` prints ``name | reading | units | status | lnr | lcr |
@@ -181,9 +182,11 @@ class HostBmcMixin:
         ``TOOL_MISSING`` is a node without ipmitool, ``NO_DEVICE`` one whose
         ipmitool finds no IPMI device node. Not a rule input and not a
         collection error: a capability gap is neither a healthy sensor table
-        nor an unknown one.
+        nor an unknown one. Its appearance, a reason change and its clearing
+        are edges, and every delivered batch keeps it in the node's latest
+        records (``host_capability_markers``).
         """
 
         return HostMetricSample(
-            name="bmc_status_unsupported", value=1, labels={"reason": reason}
+            name=BMC_STATUS_UNSUPPORTED, value=1, labels={"reason": reason}
         )
