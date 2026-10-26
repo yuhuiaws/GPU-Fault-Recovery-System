@@ -216,7 +216,11 @@ def test_reporter_stopped_reads_the_pid_and_the_state() -> None:
 # the variant over the fakes
 # --------------------------------------------------------------------------- #
 class StoppedReporterJob:
-    """``ManagedProgressJob`` stand-in whose stop prints a stopped reporter."""
+    """``ManagedProgressJob`` stand-in whose stop prints a stopped reporter.
+
+    Carries the real job's ``ranks``/``rank_nodes`` surface (rank 0 on the lane
+    node, rank 1 on ``--node-b``): the records read names the job's nodes.
+    """
 
     output = STOPPED
 
@@ -225,13 +229,22 @@ class StoppedReporterJob:
     ) -> None:
         self.name = name
         self.attempt_id = f"{name}-a001"
-        self.ranks = ranks
+        self.ranks = tuple(sorted(set(ranks)))
+        self.rank_nodes = {
+            rank: ctx.settings.node if rank == 0 else ctx.settings.peer_node
+            for rank in self.ranks
+        }
 
     def start(self) -> dict[str, Any]:
         return {}
 
     def identity(self) -> dict[str, Any]:
-        return {"job_id": self.name, "attempt_id": self.attempt_id}
+        return {
+            "job_id": self.name,
+            "attempt_id": self.attempt_id,
+            "ranks": list(self.ranks),
+            "nodes": [self.rank_nodes[rank] for rank in self.ranks],
+        }
 
     def write_progress(self, rank: int, **fields: Any) -> dict[str, Any]:
         return {}
@@ -276,15 +289,25 @@ def records(*kinds: str) -> dict[str, Any]:
     }
 
 
-def context(tmp_path: Path, doc: dict[str, Any]) -> Any:
+def context(
+    tmp_path: Path, doc: dict[str, Any], reads: list[tuple[str, ...]] | None = None
+) -> Any:
+    """``reads`` collects the arguments of every records read (the probe's argv)."""
+
     (tmp_path / "site.yaml").write_text("site: test\n")
     settings = dataclasses.replace(
         make_settings(SPEC, node=NODE), site_file=tmp_path / "site.yaml"
     )
+
+    def cpu_python(script: str, *arguments: str) -> dict[str, Any]:
+        if reads is not None and script is pr.TRAINING_PROBE:
+            reads.append(arguments)
+        return doc
+
     ctx = make_context(
         SPEC,
         tmp_path=tmp_path,
-        regional=FakeRegional(cpu_python=lambda script, *a: doc),
+        regional=FakeRegional(cpu_python=cpu_python),
         probes={},
         settings=settings,
     )
@@ -296,7 +319,8 @@ def test_reporter_silent_journals_the_proven_stop_and_passes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(pr, "ManagedProgressJob", StoppedReporterJob)
-    ctx = context(tmp_path, records("reporter-silent"))
+    reads: list[tuple[str, ...]] = []
+    ctx = context(tmp_path, records("reporter-silent"), reads)
 
     result = SPEC.execute(ctx)
 
@@ -305,6 +329,8 @@ def test_reporter_silent_journals_the_proven_stop_and_passes(
         "pid": 4242,
         "state": "T (stopped)",
     }
+    # The single-rank job's records are read on the lane node, its only node.
+    assert reads and {arguments[1] for arguments in reads} == {NODE}, reads
 
 
 def test_reporter_silent_is_inconclusive_when_the_reporter_kept_running(

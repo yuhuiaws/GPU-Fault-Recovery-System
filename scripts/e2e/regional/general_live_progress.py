@@ -654,17 +654,28 @@ def _job(
     return job
 
 
-def _job_nodes(job: ManagedProgressJob) -> str:
+def _rank_node(ctx: VariantContext, job: Any, rank: int) -> str:
+    """The node ``rank`` of ``job`` runs on; the lane node when the job does
+    not say (a job without ``rank_nodes``, or none for the rank). A records
+    read never raises over the job's shape."""
+
+    rank_nodes = getattr(job, "rank_nodes", None)
+    node = rank_nodes.get(rank) if isinstance(rank_nodes, dict) else None
+    return str(node) if node else ctx.settings.node
+
+
+def _job_nodes(ctx: VariantContext, job: Any) -> str:
     """Every node the job's ranks run on, comma-joined for ``TRAINING_PROBE``.
 
     A training incident names the graded rank's node alone (the finding's
     ``node_id`` is that rank's node), and rank 1 of the two-node job runs on
     ``--node-b``: a read scoped to the lane node never lists it (live
     2026-10-26 17:43Z, HyperPod ``straggler_group``). One node for a
-    single-rank job, as before.
+    single-rank job, as before; the lane node only for a job that names none.
     """
 
-    return ",".join(dict.fromkeys(job.rank_nodes[rank] for rank in job.ranks))
+    ranks = getattr(job, "ranks", None) or (0,)
+    return ",".join(dict.fromkeys(_rank_node(ctx, job, rank) for rank in ranks))
 
 
 def _records(
@@ -673,7 +684,7 @@ def _records(
     document = ctx.regional.cpu_python(
         TRAINING_PROBE,
         ctx.settings.regional.cluster_id,
-        _job_nodes(job),
+        _job_nodes(ctx, job),
         job.name,
         job.attempt_id,
         since.isoformat(),
@@ -1119,7 +1130,7 @@ def straggler_group(ctx: VariantContext) -> dict[str, Any]:
             states=frozenset(),
         ),
         "same_group_only": _straggler_scope(
-            incident, records, reference_node=job.rank_nodes[0]
+            incident, records, reference_node=_rank_node(ctx, job, 0)
         ),
         "not_stalled": []
         if _incident(records, "hang") is None

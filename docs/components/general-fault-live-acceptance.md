@@ -1187,7 +1187,9 @@ straggler——training finding 绑在被判的 rank 上（`node_id` 为该 rank
 探针（拆到 `general_live_progress_probes.py`）现传入任务全部节点（同 011 的 HUNG_PROBE），输出各
 incident 的 `node_ids`、attempt 的观测（phase、容器 rank/节点/Pod UID/容器名）与控制面读时时钟；
 `same_group_only` 按 straggler incident 的 `node_ids` 是否含 rank 0 节点判断（incident 的 `reasons`
-只有 finding 文本、不含 rank）。
+只有 finding 文本、不含 rank）。记录读取不因任务对象的形状抛错：未声明 `rank_nodes`（或某 rank 无
+节点）的任务按车道节点读取；027 测试模块的任务替身带真实任务的 `ranks`/`rank_nodes` 面（live20 预门禁的
+`reporter_silent` 回放用无此面的 `StoppedReporterJob`，曾在 `_job_nodes` 崩溃），并断言其记录读取只带车道节点。
 
 ### GF-GENERAL-LIVE-028
 

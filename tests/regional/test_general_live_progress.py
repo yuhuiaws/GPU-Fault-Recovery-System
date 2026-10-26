@@ -782,6 +782,26 @@ def test_single_rank_job_records_are_read_on_the_lane_node_only(tmp_path: Path) 
     assert store.node_arguments == [NODE]
 
 
+def test_records_of_a_job_that_names_no_nodes_are_read_on_the_lane_node(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A job double without ``rank_nodes`` (the live20 pre-gate's
+    # StoppedReporterJob shape) is the lane node only, never an exception.
+    class NodelessJob(FakeProgressJob):
+        def __init__(self, ctx: Any, **kwargs: Any) -> None:
+            super().__init__(ctx, **kwargs)
+            del self.rank_nodes
+
+        def identity(self) -> dict[str, Any]:
+            return {"job_id": self.name, "attempt_id": self.attempt_id}
+
+    monkeypatch.setattr(pr, "ManagedProgressJob", NodelessJob)
+    store = RecordingStore(NAN_SETTLED)
+    result = SPECS["nan"].execute(_ctx(SPECS["nan"], tmp_path, store))
+    assert result["verdict"] == "PASS", result["errors"]
+    assert store.node_arguments == [NODE]
+
+
 def test_straggler_group_without_the_finding_keeps_reporter_logs_and_names_a_stall(
     tmp_path: Path,
 ) -> None:

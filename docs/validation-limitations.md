@@ -2993,6 +2993,12 @@ finding's text and never the rank, so the former "rank-0 in reasons" check could
 not fire. The module tests assert the two-node variant's reads name both nodes
 and a single-rank job's read names the lane node, that a straggler incident on
 rank 0's node fails the variant, and the scope rule on live-shaped incidents.
+A records read never raises over the job's shape: a job that names no nodes
+(no `rank_nodes`, or none for a rank) is read on the lane node, and the job
+doubles of the 027 test modules carry the real job's `ranks`/`rank_nodes`
+surface -- the live20 pre-gate's `reporter_silent` replay ran a
+`StoppedReporterJob` without it and crashed in `_job_nodes` before any
+verdict; its records read is now asserted to name the lane node.
 
 Every managed job also rendered its manifest's fixed name
 (`gpu-fault-single-node-warm-spare`, `gpu-fault-two-node-replace`), so one
