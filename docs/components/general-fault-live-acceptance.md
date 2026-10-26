@@ -883,6 +883,22 @@ allow_stop / checkpoint / no_restart 检查不变。`resumed_progress` 在原 ra
 之前合法地保持在途（`resumed_progress` 才跟到底）。现场 2026-10-26（plain EKS，R13g）`nan`
 曾在心跳后 4 s 的首个快照上把 ACTION_PENDING（COLLECT_DIAGNOSTIC_BUNDLE 在节点上等了 22 s）
 判为 FAIL "expected ESCALATED"，产品 22 s 后已 ESCALATED。
+`straggler_group` 是**两节点**变体（需 `--node-b`，rank 0 的 Master Pod 在车道节点、rank 1 的
+Worker Pod 在 node-b，取 `two-node-replace-pytorchjob.yaml`，每个 Pod 只带自己 rank 的 reporter
+sidecar，`expected_pods=2`、16 GPU）：产品把 rank 绑在 Pod 上——watcher 的 rank =
+Pod 的 replica index + `gpu-training-submit` 盖在各 role 模板上的 `gpu-fault.io/rank-offset`
+（Master 0、Worker 1；`completion_pod_parsing.py`、`training_submit_cli.py`），
+`/v1/training-progress` 的 ingest 对 attempt 分配里没有该 rank 容器的心跳回 `accepted=False`
+（`training_health.py` `ingest` → `_allocation`），扫描只比较分配内各 rank 的新鲜心跳，
+straggler 组至少两个 rank（`_group_stragglers`）。现场 2026-10-26 `straggler_group` 把两个 reporter
+放在同一个单节点 Pod 里：rank 1 的心跳从未进入存储（`progress_states` 只有 rank 0），组内只有一个
+rank，而 rank 0 只写了一次 step 100，145 s 后被判 `training_hang`（stalled step）而非 straggler。
+夹具现每次轮询（扫描前）同时推进两个 rank：rank 1 落后 rank 0 60 步（对两 rank 组的中位数落后
+30 ≥ `GPU_FAULT_TRAINING_MAX_STEP_LAG` 20），两者每轮各 +10（`last_progress_at` 持续移动，不触
+120 s stall）；写入记录在 `straggler-advance.json`；新增 stage `not_stalled`（不得出现 hang finding）；
+缺 finding 时把各 reporter sidecar 的日志尾存入 `straggler-reporters.json`（ingest 的拒绝只回给
+reporter）。无 `--node-b` 记 `NOT_RUN(FIXTURE_NOT_READY)`；plain-EKS 上 node-b 是另一条车道的节点，
+运行时须同时持有两条车道的 claim（同 011 两节点任务）。
 
 ### GF-GENERAL-LIVE-028
 
@@ -1821,7 +1837,9 @@ POST 预制 finding。类别模块 `general_live_nccl`/`_nccl_fr`/`_progress`/`_
   RECOVERED）。断言 incident 状态的变体（`nan`、`checkpoint_unverified`、
   `resumed_progress`）先等记录沉淀（工作流终态 + incident 离开在途状态，预算 = 单步上限
   600 s + 计划步数 × 5 s 轮询 + 180 s）再判状态；预算内未沉淀记 INCONCLUSIVE 并给出
-  观察到的状态与已执行步骤（见 027 节）。
+  观察到的状态与已执行步骤（见 027 节）。`straggler_group` 需 `--node-b`：产品一 Pod 一
+  rank，两个 rank 是两节点上的两个 Pod（Master rank 0 / Worker rank 1），两 rank 每轮同时
+  推进、rank 1 落后 60 步；plain-EKS 上须同时持有两条车道的 claim（见 027 节）。
 - **030（两条车道；热备候选 = `--spare-candidate`，默认为车道的 `--node-b`：plain-EKS 为
   另一台 EKS 节点，HyperPod 为 profile 的 node-b；recipe 不再把 `--fault-node` 指向热备）**：
   经 admin CLI 把候选节点声明为热备（`DECLARE_WARM_SPARE`：标签 + cordon，故障域组按

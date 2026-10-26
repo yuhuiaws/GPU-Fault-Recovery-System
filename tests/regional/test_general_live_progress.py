@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from scripts.e2e.regional import general_live_progress as pr
-from scripts.e2e.regional.general_live_fixture import VariantInconclusive
+from scripts.e2e.regional.general_live_fixture import VariantInconclusive, VariantNotRun
 from scripts.e2e.regional.general_live_registry import build_registry, coverage_rows
 from tests.regional._general_live_fakes import (
     FakeProbe,
@@ -23,6 +23,13 @@ from tests.regional._general_live_fakes import (
 
 SPECS = {spec.variant: spec for spec in pr.VARIANTS}
 NODE = "ip-10-0-43-5.us-west-2.compute.internal"
+PEER = "ip-10-0-32-162.us-west-2.compute.internal"
+#: The real job class, kept before the autouse fixture swaps the fake in.
+RealManagedProgressJob = pr.ManagedProgressJob
+MANIFESTS = Path(pr.__file__).with_name("manifests") / "training"
+RUNTIME_IMAGE = "111122223333.dkr.ecr.us-west-2.amazonaws.com/gpu-fault@sha256:" + (
+    "e" * 64
+)
 CLEAN_SURVEY = {
     "residue": {},
     "collector_env": {"GPU_FAULT_HOST_INTERVAL_SECONDS": "15"},
@@ -32,6 +39,8 @@ CLEAN_SURVEY = {
 
 class FakeProgressJob:
     created: list["FakeProgressJob"] = []
+    #: What ``reporter_logs`` answers (the straggler diagnostic).
+    logs: dict[str, str] = {}
 
     def __init__(
         self, ctx: Any, *, name: str, ranks: tuple[int, ...] = (0,), gpu_count: int = 8
@@ -40,8 +49,13 @@ class FakeProgressJob:
         self.name = name
         self.attempt_id = f"{name}-a001"
         self.ranks = ranks
+        self.rank_nodes = {
+            rank: (ctx.settings.node if rank == 0 else ctx.settings.peer_node or PEER)
+            for rank in ranks
+        }
         self.writes: list[tuple[int, dict[str, Any]]] = []
         self.stopped: list[int] = []
+        self.log_reads = 0
         FakeProgressJob.created.append(self)
 
     def start(self) -> dict[str, Any]:
@@ -52,6 +66,7 @@ class FakeProgressJob:
             "job_id": self.name,
             "attempt_id": self.attempt_id,
             "ranks": list(self.ranks),
+            "nodes": [self.rank_nodes[rank] for rank in self.ranks],
         }
 
     def write_progress(self, rank: int, **fields: Any) -> dict[str, Any]:
@@ -62,6 +77,10 @@ class FakeProgressJob:
         self.stopped.append(rank)
         return {}
 
+    def reporter_logs(self, *, tail: int = 50) -> dict[str, str]:
+        self.log_reads += 1
+        return dict(FakeProgressJob.logs)
+
     def delete(self) -> None:
         pass
 
@@ -69,6 +88,7 @@ class FakeProgressJob:
 @pytest.fixture(autouse=True)
 def _patch_job(monkeypatch: pytest.MonkeyPatch) -> None:
     FakeProgressJob.created = []
+    FakeProgressJob.logs = {}
     monkeypatch.setattr(pr, "ManagedProgressJob", FakeProgressJob)
 
 
@@ -562,3 +582,172 @@ def test_scan_variants_judge_the_planned_chain_on_the_first_read(
     assert result["verdict"] == "PASS", result["errors"]
     assert "settled" not in result
     assert store.reads == 1
+
+
+# --------------------------------------------------------------------------- #
+# straggler_group: two ranks are two Pods on two nodes, both advancing
+# --------------------------------------------------------------------------- #
+def _manifest(name: str) -> dict[str, Any]:
+    import yaml
+
+    return yaml.safe_load((MANIFESTS / name).read_text(encoding="utf-8"))
+
+
+def _templates(document: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        role: replica["template"]["spec"]
+        for role, replica in document["spec"]["pytorchReplicaSpecs"].items()
+    }
+
+
+def test_two_rank_job_renders_one_reporter_per_pod_on_two_nodes() -> None:
+    document = _manifest(pr.TWO_NODE_MANIFEST)
+    pr.pin_replicas(document, {"Master": NODE, "Worker": PEER})
+    pr.install_reporter(
+        document, "gl27-strag", {"Master": (0,), "Worker": (1,)}, RUNTIME_IMAGE
+    )
+    templates = _templates(document)
+    assert {role: spec["nodeName"] for role, spec in templates.items()} == {
+        "Master": NODE,
+        "Worker": PEER,
+    }
+    # gpu-training-submit stamps rank-offset 0 on the Master and 1 on the
+    # Worker: rank 0's reporter runs in the Master Pod, rank 1's in the Worker.
+    assert {
+        role: [item["name"] for item in spec["containers"]]
+        for role, spec in templates.items()
+    } == {
+        "Master": ["pytorch", "progress-reporter-0"],
+        "Worker": ["pytorch", "progress-reporter-1"],
+    }
+    worker = templates["Worker"]["containers"][1]
+    assert worker["command"][worker["command"].index("--rank") + 1] == "1"
+    assert worker["command"][-1] == "/var/run/gpu-fault/rank-1.json"
+    assert worker["image"] == RUNTIME_IMAGE
+    for spec in templates.values():
+        assert all(
+            any(mount["name"] == "gfrs-progress" for mount in item["volumeMounts"])
+            for item in spec["containers"]
+        ), "every container of a Pod shares that Pod's progress volume"
+        assert {item["name"] for item in spec["volumes"]} >= {
+            "gfrs-progress",
+            "gfrs-control-plane-ca",
+        }
+    assert {item["name"] for item in templates["Worker"]["volumes"]} >= {
+        "gfrs-reporter-1-state",
+        "gfrs-reporter-1-tmp",
+    }
+
+
+def test_single_rank_job_keeps_its_reporter_on_the_one_pod() -> None:
+    document = _manifest(pr.SINGLE_NODE_MANIFEST)
+    pr.install_reporter(document, "gl27-nan", {"Master": (0,)}, RUNTIME_IMAGE)
+    (spec,) = _templates(document).values()
+    assert [item["name"] for item in spec["containers"]] == [
+        "pytorch",
+        "progress-reporter-0",
+    ]
+
+
+def test_pin_replicas_refuses_a_role_the_manifest_lacks() -> None:
+    document = _manifest(pr.SINGLE_NODE_MANIFEST)
+    with pytest.raises(ValueError, match="exactly one Worker"):
+        pr.pin_replicas(document, {"Master": NODE, "Worker": PEER})
+
+
+def test_two_rank_job_needs_the_peer_node(tmp_path: Path) -> None:
+    ctx = _ctx(SPECS["straggler_group"], tmp_path, {})
+    assert ctx.settings.peer_node == "", "the lane has no --node-b here"
+    with pytest.raises(VariantNotRun) as caught:
+        RealManagedProgressJob(ctx, name="gl27-strag-a1-deadbeef", ranks=(0, 1))
+    assert caught.value.reason == "FIXTURE_NOT_READY"
+    assert "--node-b" in caught.value.detail
+    with pytest.raises(ValueError, match="rank 0 or ranks 0 and 1"):
+        RealManagedProgressJob(ctx, name="gl27-strag-a1-deadbeef", ranks=(0, 2))
+
+
+def test_straggler_group_is_a_two_node_variant() -> None:
+    spec = SPECS["straggler_group"]
+    assert "--node-b" in spec.injection and spec.max_minutes == 30, spec
+
+
+def _straggler_doc(incidents: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "progress_states": [],
+        "incidents": incidents,
+        "workflows": _workflow(
+            ("FREEZE_EVIDENCE", "VALIDATE_FABRIC"),
+            status="RUNNING",
+            executed=[("FREEZE_EVIDENCE", "SUCCEEDED"), ("VALIDATE_FABRIC", "WAITING")],
+        ),
+        "decision": None,
+        "notifications": [],
+    }
+
+
+def test_straggler_group_keeps_both_ranks_advancing_until_the_lagging_rank_is_flagged(
+    tmp_path: Path,
+) -> None:
+    empty = _straggler_doc([])
+    flagged = _straggler_doc(
+        [
+            _incident(
+                "straggler",
+                state="ACTION_PENDING",
+                reasons=["training rank is lagging peer progress"],
+            )
+        ]
+    )
+    store = RecordingStore(empty, empty, flagged)
+    ctx = _ctx(SPECS["straggler_group"], tmp_path, store)
+    result = SPECS["straggler_group"].execute(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    assert result["stages"]["not_stalled"] == []
+    job = FakeProgressJob.created[-1]
+    assert (job.ranks, result["attempt"]["nodes"]) == ((0, 1), [NODE, PEER])
+    # Every poll (scan + read) first wrote both ranks: rank 1 STRAGGLER_LAG
+    # steps behind rank 0 and both STRAGGLER_ADVANCE further than last time.
+    assert store.scans == store.reads == 3
+    polls = [job.writes[index : index + 2] for index in range(0, len(job.writes), 2)]
+    assert len(polls) == 3, job.writes
+    for index, ((rank_a, a), (rank_b, b)) in enumerate(polls):
+        assert (rank_a, rank_b) == (0, 1)
+        assert a["step"] == 100 + index * pr.STRAGGLER_ADVANCE
+        assert a["step"] - b["step"] == pr.STRAGGLER_LAG
+        assert a["labels"] == b["labels"] == {"progress_group": "data-parallel"}
+        assert a["loss"] == b["loss"] == 1.0
+    advance = json.loads((ctx.case_dir / "straggler-advance.json").read_text())
+    assert [item["steps"] for item in advance["writes"]] == [
+        {"0": 100, "1": 40},
+        {"0": 110, "1": 50},
+        {"0": 120, "1": 60},
+    ]
+    assert job.log_reads == 0, "reporter logs are read only for a missing finding"
+
+
+def test_straggler_group_without_the_finding_keeps_reporter_logs_and_names_a_stall(
+    tmp_path: Path,
+) -> None:
+    # The live 2026-10-26 shape: no straggler finding, rank 0 graded a stall.
+    FakeProgressJob.logs = {"progress-reporter-1": "heartbeat refused: accepted=False"}
+    stalled = _straggler_doc(
+        [
+            _incident(
+                "hang",
+                state="ACTION_PENDING",
+                reasons=["training step stopped advancing"],
+            )
+        ]
+    )
+    store = RecordingStore(stalled)
+    ctx = store_poll_clock(_ctx(SPECS["straggler_group"], tmp_path, store))
+    result = SPECS["straggler_group"].execute(ctx)
+    assert result["verdict"] == "FAIL"
+    assert result["errors"] == [
+        "chain: no training_straggler finding reached an incident",
+        "not_stalled: a lagging rank that keeps advancing was graded as a stall",
+    ]
+    assert FakeProgressJob.created[-1].log_reads == 1
+    written = json.loads((ctx.case_dir / "straggler-reporters.json").read_text())
+    assert written == FakeProgressJob.logs
+    assert store.reads == 600 // 20, "one read per poll over the detection budget"

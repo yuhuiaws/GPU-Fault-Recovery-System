@@ -2678,6 +2678,46 @@ then the settled one), and a scripted workflow record now carries a terminal
 `status` and its step executions, as live records do; a record without them
 would never settle.
 
+The same pass failed 027 `straggler_group` (2026-10-26 09:54-10:06Z, plain EKS)
+with "no training_straggler finding reached an incident", and the records show
+why no product rule could have fired: the attempt's `progress_states` held rank
+0 only (step 100, `progress_group` data-parallel), rank 1's heartbeat never
+reached the store, and at 09:57:33Z -- 145 s after rank 0's single write -- the
+product minted `training_hang` ("training step stopped advancing") for rank 0
+instead. The fixture had run both reporter sidecars in one single-node Pod. The
+product binds one rank per Pod: the completion watcher's rank is the Pod's
+replica index plus the `gpu-fault.io/rank-offset` that `gpu-training-submit`
+stamps per role (`completion_pod_parsing.py`, `training_submit_cli.py`: Master
+0, Worker 1), the progress ingest answers `accepted=False` to a heartbeat whose
+rank has no container in the attempt's allocation (`training_health.py`
+`ingest` -> `_allocation`), and the scan compares only the allocated ranks'
+fresh heartbeats, two at least per group (`scan`, `_group_stragglers`). So a
+single-Pod job can never show the product a straggler, and a rank written once
+and left is a stall by the product's own 120-s rule, which is the correct
+grading of what the fixture did. This is a fixture defect, not a product gap.
+`straggler_group` is now a two-node variant (`--node-b`, as 011's stall job):
+the two-node manifest with rank 0's Master Pod on the lane node and rank 1's
+Worker Pod on node-b, each Pod carrying only its own rank's reporter, two Pods
+and 16 GPUs expected; without `--node-b` it is NOT_RUN(FIXTURE_NOT_READY). On
+every poll (before the scan) the runner now writes both ranks -- rank 1 60
+steps behind rank 0 (30 behind the two-rank group's median, above
+`GPU_FAULT_TRAINING_MAX_STEP_LAG` 20), both 10 steps further than the previous
+poll, so `last_progress_at` keeps moving and neither rank stalls
+(`straggler-advance.json`); a new stage `not_stalled` fails the variant if a
+`training_hang` finding appears, and when the straggler finding is missing the
+tail of every reporter sidecar's log is kept as `straggler-reporters.json`
+(the ingest's refusal is answered to the reporter, which logs it, never to the
+runner). The module tests render both manifests through the real
+`_pin_replicas`/`_install_reporter` (one reporter per Pod, pinned nodes, `--rank
+1` and `rank-1.json` on the Worker), start the two-rank job against the
+in-memory cluster with a second node (one Pod per node, each rank's reporter
+posting that Pod's identity, the trainer's collective at the 16-GPU world
+size), drive the variant through a recording store (three polls, both ranks
+written each time, the lag constant) and replay the live shape (a hang instead
+of a straggler: FAIL naming the stall, reporter logs kept). On plain EKS node-b
+is the other lane's node, so the variant needs both lanes' claims at once, as
+011's two-node job does.
+
 Every managed job also rendered its manifest's fixed name
 (`gpu-fault-single-node-warm-spare`, `gpu-fault-two-node-replace`), so one
 leftover refused all later jobs whatever their job id: live 2026-10-25 every

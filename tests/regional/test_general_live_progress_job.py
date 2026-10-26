@@ -69,6 +69,7 @@ from scripts.e2e.regional.regional_live_fixture import (
 from tests.admin.test_admin_site import site_file as write_site_file
 
 NODE = "ip-10-0-43-5.us-west-2.compute.internal"
+PEER = "ip-10-0-32-162.us-west-2.compute.internal"  # --node-b of the two-rank job
 NAMESPACE = "gpu-fault-system"
 CLUSTER = "gpu-a"  # the site file's own cluster
 CONTEXT = "gpu-a"
@@ -161,10 +162,17 @@ class CapturingSink:
 
 
 class ProgressCluster:
-    """kubectl, a training operator and a kubelet for one GPU node, in memory."""
+    """kubectl, a training operator and a kubelet per GPU node, in memory."""
 
-    def __init__(self, root: Path, *, executor_image: str = EXECUTOR_IMAGE) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        executor_image: str = EXECUTOR_IMAGE,
+        nodes: tuple[str, ...] = (NODE,),
+    ) -> None:
         self.root = root
+        self.nodes = nodes
         self.objects: dict[tuple[str, str], dict[str, Any]] = {
             ("deployment", EXECUTOR_DEPLOYMENT): {
                 "apiVersion": "apps/v1",
@@ -255,8 +263,14 @@ class ProgressCluster:
             return json.dumps({"apiVersion": "v1", "kind": "List", "items": items})
         if arguments == ["node"]:
             images = [{"names": [TRAINING_IMAGE]}]  # the trainer image is cached
-            node = {"metadata": {"name": NODE}, "status": {"images": images}}
-            return json.dumps({"items": [node]})
+            return json.dumps(
+                {
+                    "items": [
+                        {"metadata": {"name": node}, "status": {"images": images}}
+                        for node in self.nodes
+                    ]
+                }
+            )
         kind, name = arguments
         value = self.objects.get((kind, name))
         if value is None:
@@ -291,9 +305,27 @@ class ProgressCluster:
         container = self.container(pod, name)
         if container["image"] != TRAINING_IMAGE or not self.running(pod, name):
             return ""
+        # The trainer's collective runs at the job's world size: every GPU of
+        # every replica Pod (one node's 8, or 16 across the two-node job).
+        job = self.objects[
+            ("pytorchjob", pod["metadata"]["ownerReferences"][0]["name"])
+        ]
+        world_size = sum(
+            int(replica.get("replicas", 1))
+            * int(
+                ((item.get("resources") or {}).get("limits") or {}).get(
+                    "nvidia.com/gpu", 0
+                )
+            )
+            for replica in job["spec"]["pytorchReplicaSpecs"].values()
+            for item in replica["template"]["spec"]["containers"]
+            if item["name"] == "pytorch"
+        )
+        all_reduce = managed_workload_fixture.expected_all_reduce(world_size)
         return "".join(
             f"HEARTBEAT rank=0 step={step} node={pod['metadata']['name']} "
-            f"world_size=8 all_reduce=36.0 elapsed={2.0 * step:.1f}\n"
+            f"world_size={world_size} all_reduce={all_reduce:.1f} "
+            f"elapsed={2.0 * step:.1f}\n"
             for step in range(1, 6)
         )
 
@@ -611,10 +643,15 @@ def progress_job(
     variant: str = "nan",
     ranks: tuple[int, ...] = (0,),
     executor_image: str = EXECUTOR_IMAGE,
+    peer: str = "",
 ) -> tuple[ProgressCluster, Any]:
     """The runner's own job wrapper over a private context and a fake cluster."""
 
-    cluster = ProgressCluster(tmp_path / "node", executor_image=executor_image)
+    cluster = ProgressCluster(
+        tmp_path / "node",
+        executor_image=executor_image,
+        nodes=(NODE, peer) if peer else (NODE,),
+    )
     monkeypatch.setattr(RegionalLiveFixture, "run", staticmethod(cluster.run))
     monkeypatch.setattr(managed_workload_fixture, "time", VirtualClock())
     kube = tmp_path / "kube"
@@ -637,7 +674,7 @@ def progress_job(
         case_id=spec.case_id,
         variant=spec.variant,
         node=NODE,
-        peer_node="",
+        peer_node=peer,
         host_probe_image="public.ecr.aws/gfrs/probe@sha256:" + "1" * 64,
         hyperpod_cluster="",
         site_file=write_site_file(site_root),
@@ -663,20 +700,31 @@ def test_the_progress_job_turns_ready_and_reports_what_the_runner_writes(
     ranks: tuple[int, ...], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     variant = "nan" if ranks == (0,) else "straggler_group"
-    cluster, job = progress_job(tmp_path, monkeypatch, variant=variant, ranks=ranks)
+    peer = PEER if len(ranks) == 2 else ""
+    cluster, job = progress_job(
+        tmp_path, monkeypatch, variant=variant, ranks=ranks, peer=peer
+    )
 
     snapshot = job.start()  # prewarm, gpu-training-submit render, create, health wait
 
-    (pod,) = snapshot["pods"]
-    assert (pod["phase"], pod["ready"], pod["node"]) == ("Running", True, NODE), (
-        cluster.objects[("pod", pod["name"])]["status"]
-    )
+    # One Pod per rank, on the node that rank was pinned to: the product binds
+    # one rank per Pod (rank 0 the Master on the lane node, rank 1 the Worker
+    # on --node-b), so a rank's reporter has to run in that rank's Pod.
+    assert [job.rank_nodes[rank] for rank in ranks] == [NODE, PEER][: len(ranks)]
+    pods_by_node = {pod["node"]: pod for pod in snapshot["pods"]}
+    assert len(snapshot["pods"]) == len(pods_by_node) == len(ranks), snapshot["pods"]
+    for pod in snapshot["pods"]:
+        assert (pod["phase"], pod["ready"]) == ("Running", True), cluster.objects[
+            ("pod", pod["name"])
+        ]["status"]
     reporters = [f"progress-reporter-{rank}" for rank in ranks]
-    assert sorted(name for _pod, name in cluster.reporters) == reporters, (
-        "every reporter is the product's own collector, started by its own CLI"
-    )
+    assert sorted(cluster.reporters) == sorted(
+        (pods_by_node[job.rank_nodes[rank]]["name"], reporter)
+        for rank, reporter in zip(ranks, reporters, strict=True)
+    ), "each rank's reporter is the product's own collector, in that rank's Pod"
     states: list[Path] = []
     for rank, reporter in zip(ranks, reporters, strict=True):
+        pod = pods_by_node[job.rank_nodes[rank]]
         key = (pod["name"], reporter)
         environment = cluster.environments[key]
         # TLS to the private control-plane endpoint trusts the Secret's CA.
@@ -706,7 +754,7 @@ def test_the_progress_job_turns_ready_and_reports_what_the_runner_writes(
         )
         # The identity the control plane matches against the trainer's allocation.
         assert (heartbeat.node_id, heartbeat.pod_uid, heartbeat.container_name) == (
-            NODE,
+            job.rank_nodes[rank],
             pod["uid"],
             "pytorch",
         )

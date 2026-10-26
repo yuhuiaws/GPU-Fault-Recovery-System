@@ -77,8 +77,15 @@ JOURNAL_VARIANTS = frozenset(
     f"GF-GENERAL-LIVE-017.{variant}"
     for variant in ("cgroup_oom", "nccl_error", "distributed_error")
 )
-#: Variants outside 011 that run the two-node NCCL job (``--node-b``).
-TWO_NODE_VARIANTS = frozenset({"GF-GENERAL-LIVE-017.missing_flight_recorder"})
+#: Variants outside 011 that run a two-node job (``--node-b``): the NCCL job of
+#: 017.missing_flight_recorder, the two-rank progress job of 027.straggler_group
+#: (the product binds one rank per Pod, so two ranks are two Pods on two nodes).
+TWO_NODE_VARIANTS = frozenset(
+    {
+        "GF-GENERAL-LIVE-017.missing_flight_recorder",
+        "GF-GENERAL-LIVE-027.straggler_group",
+    }
+)
 #: The 003 variants that drive the host and storage probes, not a managed job.
 HOST_VARIANTS = frozenset(
     f"GF-GENERAL-LIVE-003.{variant}"

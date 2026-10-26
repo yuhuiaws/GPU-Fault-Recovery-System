@@ -36,6 +36,7 @@ arrives, which ``resumed_progress`` follows to RECOVERED.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import json
 from pathlib import PurePosixPath
 import re
@@ -68,8 +69,34 @@ from scripts.e2e.regional.regional_live_fixture import component_python
 
 CASE = "GF-GENERAL-LIVE-027"
 SINGLE_NODE_MANIFEST = "single-node-warm-spare-pytorchjob.yaml"
+#: Two ranks are two Pods on two nodes. The product binds one rank per Pod --
+#: the watcher's rank is the Pod's replica index plus the role's
+#: ``gpu-fault.io/rank-offset`` that ``gpu-training-submit`` stamps
+#: (``completion_pod_parsing.py``, ``training_submit_cli.py``: Master 0, Worker
+#: 1) -- its ingest refuses a heartbeat whose rank has no container in the
+#: attempt's allocation (``training_health.py`` ``ingest`` -> ``_allocation``,
+#: ``accepted=False``), and its scan compares only the allocated ranks' fresh
+#: heartbeats (``scan`` walks the observation's containers; a straggler group
+#: needs two). Live 2026-10-26 straggler_group ran both reporters in one
+#: single-node Pod: rank 1's heartbeat never reached the store, the group had
+#: one rank, and rank 0's fixed step was graded a stall instead.
+TWO_NODE_MANIFEST = "two-node-replace-pytorchjob.yaml"
+#: The shared progress volume the trainer writes and the reporters read.
+PROGRESS_DIR = "/var/run/gpu-fault"
+#: The ``pytorchReplicaSpecs`` role of each rank of the two-node job, and the
+#: nodes they are pinned to: rank 0 on the lane node, rank 1 on ``--node-b``.
+RANK_ROLES = ("Master", "Worker")
 HEARTBEAT_TIMEOUT = 120
 STARTUP_GRACE = 300
+#: straggler_group: rank 1 starts STRAGGLER_LAG steps behind rank 0 and both
+#: advance STRAGGLER_ADVANCE steps per poll. The product grades a rank against
+#: its group's median step (``_group_stragglers``; two ranks: half the gap, 30)
+#: with ``GPU_FAULT_TRAINING_MAX_STEP_LAG`` (20), and a rank whose step moves
+#: every 20-s poll never crosses the 120-s stall timeout -- a lagging rank is
+#: a straggler, a frozen one a stall (live 2026-10-26: rank 0 written once,
+#: ``training_hang`` 145 s later).
+STRAGGLER_LAG = 60
+STRAGGLER_ADVANCE = 10
 #: The product's step cadence the settle budget is derived from
 #: (``execution/config.py``, ``execution/step_bounds.py``): the dispatcher
 #: re-dispatches a WAITING step one poll interval apart
@@ -286,7 +313,7 @@ class ManagedProgressJob:
     Pod and progress write.
     """
 
-    PROGRESS_DIR = "/var/run/gpu-fault"
+    PROGRESS_DIR = PROGRESS_DIR
 
     def __init__(
         self,
@@ -311,23 +338,48 @@ class ManagedProgressJob:
             raise VariantNotRun(
                 "FIXTURE_NOT_READY", "a managed progress job needs --site-file"
             )
+        self.ranks = tuple(sorted(set(ranks)))
+        if self.ranks not in {(0,), (0, 1)}:
+            raise ValueError(
+                f"the progress job runs rank 0 or ranks 0 and 1, not {self.ranks}"
+            )
+        two_node = len(self.ranks) == 2
+        if two_node and not ctx.settings.peer_node:
+            raise VariantNotRun(
+                "FIXTURE_NOT_READY",
+                "a two-rank progress job needs --node-b: the product binds one "
+                "rank per Pod and the fixture runs one Pod per node",
+            )
         # Read before anything is rendered or journaled: a refusal here is a
         # preparation failure that leaves nothing to clean up.
         self.reporter_image = reporter_image(ctx.regional)
-        source = (
-            Path(__file__).with_name("manifests") / "training" / SINGLE_NODE_MANIFEST
-        )
-        rendered = render_node_pinned_manifest(
-            source, ctx.case_dir / f"{name}.source.yaml", node=ctx.settings.node
-        )
-        document = yaml.safe_load(rendered.read_text(encoding="utf-8"))
+        manifests = Path(__file__).with_name("manifests") / "training"
+        rendered = ctx.case_dir / f"{name}.source.yaml"
+        if two_node:
+            self.rank_nodes = {0: ctx.settings.node, 1: ctx.settings.peer_node}
+            ranks_by_role = {role: (rank,) for role, rank in zip(RANK_ROLES, (0, 1))}
+            document = yaml.safe_load(
+                (manifests / TWO_NODE_MANIFEST).read_text(encoding="utf-8")
+            )
+            pin_replicas(
+                document,
+                {RANK_ROLES[rank]: node for rank, node in self.rank_nodes.items()},
+            )
+            rendered.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        else:
+            self.rank_nodes = {0: ctx.settings.node}
+            ranks_by_role = {RANK_ROLES[0]: self.ranks}
+            render_node_pinned_manifest(
+                manifests / SINGLE_NODE_MANIFEST, rendered, node=ctx.settings.node
+            )
+            document = yaml.safe_load(rendered.read_text(encoding="utf-8"))
         name_managed_workload(document, name)
-        self.ranks = tuple(sorted(set(ranks)))
-        _install_reporter(document, name, self.ranks, self.reporter_image)
+        install_reporter(document, name, ranks_by_role, self.reporter_image)
         document.setdefault("metadata", {}).setdefault("labels", {}).update(
             {"gpu-fault.io/job-id": name, "gpu-fault.io/attempt-id": f"{name}-a001"}
         )
         rendered.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+        rendered.chmod(0o600)
         self.ctx = ctx
         self.name = name
         self.attempt_id = f"{name}-a001"
@@ -346,8 +398,8 @@ class ManagedProgressJob:
                 job_id=name,
                 attempt_id=self.attempt_id,
                 restart_budget=0,
-                expected_pods=1,
-                expected_gpu_count=gpu_count,
+                expected_pods=len(self.rank_nodes),
+                expected_gpu_count=gpu_count * len(self.rank_nodes),
                 # The reporter sidecars make the template multi-container;
                 # gpu-training-submit refuses one without its training container.
                 training_container="pytorch",
@@ -360,10 +412,13 @@ class ManagedProgressJob:
             WorkloadOwnershipError,
         )
 
-        self.prewarm.create([self.ctx.settings.node])
+        self.prewarm.create([self.rank_nodes[rank] for rank in self.ranks])
         self.fixture.submit()
         try:
-            return self.fixture.wait_running(timeout_seconds=900)
+            # A two-node job brings up two Pods and a cross-node collective.
+            return self.fixture.wait_running(
+                timeout_seconds=900 if len(self.rank_nodes) == 1 else 1200
+            )
         except WorkloadOwnershipError:
             raise
         except RegionalFixtureError as exc:
@@ -415,7 +470,50 @@ class ManagedProgressJob:
             "job_id": self.name,
             "attempt_id": self.attempt_id,
             "ranks": list(self.ranks),
+            "nodes": [self.rank_nodes[rank] for rank in self.ranks],
         }
+
+    def pod_for(self, rank: int) -> str:
+        """The name of the Pod that runs ``rank`` (and its reporter): the job's
+        Pod on the node the rank was pinned to."""
+
+        node = self.rank_nodes.get(rank)
+        if node is None:
+            raise RegionalFixtureError(f"rank {rank} is not a rank of {self.name}")
+        names = [
+            str(item["name"])
+            for item in self.fixture.pods()
+            if item.get("node") == node
+        ]
+        if len(names) != 1:
+            raise RegionalFixtureError(
+                f"{self.name} has {len(names)} Pods on {node}, rank {rank} needs one"
+            )
+        return names[0]
+
+    def reporter_logs(self, *, tail: int = 50) -> dict[str, str]:
+        """The last lines of every reporter sidecar -- a diagnostic for a
+        heartbeat the store never showed (an ingest refusal is answered to the
+        reporter, which logs it, not to the runner). Never the verdict."""
+
+        logs: dict[str, str] = {}
+        for rank in self.ranks:
+            key = f"progress-reporter-{rank}"
+            try:
+                logs[key] = str(
+                    self.ctx.regional.kubectl(
+                        "gpu",
+                        "logs",
+                        self.pod_for(rank),
+                        "-c",
+                        key,
+                        f"--tail={tail}",
+                        timeout=60,
+                    )
+                )[-4000:]
+            except Exception as exc:  # noqa: BLE001 - a diagnostic, never the verdict
+                logs[key] = f"unreadable: {type(exc).__name__}: {exc}"
+        return logs
 
     def write_progress(self, rank: int, **fields: Any) -> dict[str, Any]:
         """Write one rank's progress JSON atomically from the trainer container.
@@ -429,7 +527,7 @@ class ManagedProgressJob:
         payload = json.dumps(
             {key: value for key, value in fields.items() if value is not None}
         )
-        pod = self.fixture.pods()[0]["name"]
+        pod = self.pod_for(rank)
         path = f"{self.PROGRESS_DIR}/rank-{rank}.json"
         # ``-i``: kubectl forwards its stdin only when asked, and without it the
         # ``cat`` read end-of-file and renamed an empty progress file in place.
@@ -448,7 +546,7 @@ class ManagedProgressJob:
         )
 
     def stop_reporter(self, rank: int) -> dict[str, Any]:
-        pod = self.fixture.pods()[0]["name"]
+        pod = self.pod_for(rank)
         return self.ctx.regional.kubectl(
             "gpu",
             "exec",
@@ -467,16 +565,37 @@ class ManagedProgressJob:
         return remove_managed_job(self.fixture, self.prewarm)
 
 
-def _install_reporter(
-    document: dict[str, Any], name: str, ranks: tuple[int, ...], image: str
+def pin_replicas(document: dict[str, Any], nodes_by_role: dict[str, str]) -> None:
+    """Pin each ``pytorchReplicaSpecs`` role's single Pod to its node."""
+
+    replicas = (document.get("spec") or {}).get("pytorchReplicaSpecs") or {}
+    for role, node in nodes_by_role.items():
+        replica = replicas.get(role)
+        if not isinstance(replica, dict) or replica.get("replicas") != 1:
+            raise ValueError(f"the two-node progress job needs exactly one {role}")
+        pod_spec = (replica.get("template") or {}).get("spec")
+        if not isinstance(pod_spec, dict):
+            raise ValueError(f"the {role} replica has no Pod spec")
+        pod_spec["nodeName"] = node
+
+
+def install_reporter(
+    document: dict[str, Any],
+    name: str,
+    ranks_by_role: dict[str, tuple[int, ...]],
+    image: str,
 ) -> None:
-    """Add the shared progress volume and one reporter sidecar per rank."""
+    """Add the shared progress volume and, per replica role, one reporter
+    sidecar for each of the ranks that role's Pod reports -- a reporter posts
+    its Pod's identity, so a rank's reporter must run in the Pod the product
+    allocated that rank to."""
 
     from scripts.e2e.regional.acceptance_gpu_load import set_gpu_duty_percent
 
     set_gpu_duty_percent(document, 20)
     replicas = (document.get("spec") or {}).get("pytorchReplicaSpecs") or {}
-    for replica in replicas.values():
+    for role, replica in replicas.items():
+        ranks = tuple(ranks_by_role.get(role, ()))
         template = (replica.get("template") or {}).get("spec")
         if not isinstance(template, dict):
             continue
@@ -491,7 +610,7 @@ def _install_reporter(
                 },
             }
         )
-        mount = {"name": "gfrs-progress", "mountPath": ManagedProgressJob.PROGRESS_DIR}
+        mount = {"name": "gfrs-progress", "mountPath": PROGRESS_DIR}
         containers = template.setdefault("containers", [])
         for container in containers:
             if isinstance(container, dict):
@@ -512,7 +631,7 @@ def _install_reporter(
 def _reporter_container(
     name: str, rank: int, mount: dict[str, Any], image: str
 ) -> dict[str, Any]:
-    progress_file = f"{ManagedProgressJob.PROGRESS_DIR}/rank-{rank}.json"
+    progress_file = f"{PROGRESS_DIR}/rank-{rank}.json"
     return {
         "name": f"progress-reporter-{rank}",
         "image": image,
@@ -634,11 +753,19 @@ def _wait_incident(
     *,
     name: str,
     scan: bool = False,
+    before_poll: Callable[[], Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """The records once the ``kind`` incident exists, polled every 20 s within
+    the detection budget. ``scan`` triggers the product's cluster scan before
+    each read; ``before_poll`` runs first on every poll (a variant that must
+    keep its ranks' progress moving while the product grades them)."""
+
     last: dict[str, Any] = {}
 
     def accept() -> dict[str, Any] | None:
         nonlocal last
+        if before_poll is not None:
+            before_poll()
         if scan:
             _scan(ctx)
         last = _records(ctx, job, since)
@@ -988,14 +1115,38 @@ def step_regression(ctx: VariantContext) -> dict[str, Any]:
 
 def straggler_group(ctx: VariantContext) -> dict[str, Any]:
     run_survey(ctx)
+    # Two ranks are two Pods on two nodes (``--node-b``): the product binds one
+    # rank per Pod and compares only allocated ranks (see TWO_NODE_MANIFEST).
     job = _job(ctx, "strag", ranks=(0, 1))
+    identity = job.identity()
     started = utc_now()
     labels = {"progress_group": "data-parallel"}
-    job.write_progress(0, step=100, loss=1.0, labels=labels)
-    job.write_progress(1, step=40, loss=1.0, labels=labels)  # >= 20 steps behind
+    steps = {0: 100, 1: 100 - STRAGGLER_LAG}
+    writes: list[dict[str, Any]] = []
+
+    def advance() -> None:
+        # Both ranks keep training every poll, rank 1 STRAGGLER_LAG steps
+        # behind: a lagging rank, never a frozen one (that would be a stall).
+        for rank in (0, 1):
+            job.write_progress(rank, step=steps[rank], loss=1.0, labels=labels)
+        writes.append({"at": utc_now().isoformat(), "steps": dict(steps)})
+        ctx.evidence.write("straggler-advance", {"writes": writes})
+        for rank in steps:
+            steps[rank] += STRAGGLER_ADVANCE
+
     records, incident = _wait_incident(
-        ctx, job, "straggler", started, name="straggler", scan=True
+        ctx,
+        job,
+        "straggler",
+        started,
+        name="straggler",
+        scan=True,
+        before_poll=advance,
     )
+    if incident is None:
+        # An ingest refusal is answered to the reporter, not to the runner:
+        # keep what each reporter logged next to the records that lack it.
+        ctx.evidence.write("straggler-reporters", job.reporter_logs())
     workflow = _workflow(records, incident or {})
     stages = {
         "chain": _chain_errors(
@@ -1007,9 +1158,18 @@ def straggler_group(ctx: VariantContext) -> dict[str, Any]:
             states=frozenset(),
         ),
         "same_group_only": _straggler_scope(incident, records),
+        "not_stalled": []
+        if _incident(records, "hang") is None
+        else ["a lagging rank that keeps advancing was graded as a stall"],
     }
     return _result(
-        stages, notes=["stragglers are compared only inside one progress_group"]
+        stages,
+        notes=[
+            "stragglers are compared only inside one progress_group",
+            f"rank 1 runs {STRAGGLER_LAG} steps behind rank 0 (two Pods, two nodes)"
+            " while both advance every poll",
+        ],
+        extra={"attempt": identity},
     )
 
 
@@ -1238,9 +1398,13 @@ VARIANTS = [
     ),
     _spec(
         "straggler_group",
-        "two ranks in one progress_group, rank 1 >= 20 steps behind",
-        "training_straggler bound to the lagging rank only; the reference rank is not flagged",
+        "two ranks (two Pods on the lane node and --node-b) in one progress_group,"
+        " rank 1 60 steps behind rank 0 (30 behind the group median >= 20) while"
+        " both keep advancing",
+        "training_straggler bound to the lagging rank only; the reference rank is"
+        " not flagged and neither rank is graded a stall",
         straggler_group,
+        max_minutes=30,
     ),
     _spec(
         "bounded_phase",
