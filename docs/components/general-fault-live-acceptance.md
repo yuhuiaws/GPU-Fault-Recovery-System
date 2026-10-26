@@ -1025,6 +1025,29 @@ T.Limit 对是热安全读数，profile 排除）。现在在 survey 之后、�
 `NOT_RUN(CAPABILITY_ABSENT, "no canonical field has two distinct exporter aliases on this node: …")`，
 不再中途 abort。
 
+`conflicting_alias` 2026-10-26 15:30Z 在 HyperPod 首次以可用别名对运行即 FAIL（`no_silent_overwrite: a
+conflicting alias slot was accepted as a value: 1.0`，`ambiguous_rejected` 通过）：那条 1.0 是冲突**之前**节点
+发布名的真实读数——结果窗口在 arm 之前打开，重指后采集器重启的 initial-baseline 批次带着真实读数，随后是
+计划的三次直通读取（15:31:43–15:32:24），别名从第 5 次读取（约 15:32:30）起才注入，而判定把窗口内该槽位所有
+被接受样本都算上了。产品语义相反：同一 canonical 字段的两个 exporter 名在同一 GPU 上取值不同，是同一
+`(device, canonical)` 槽位出现两次——`gpu_environment_policy.deduplicate_dcgm_aliases` 只在取值与标签都相等时
+合并别名对，`gpu_observation.normalize_gpu_observation` 把出现两次的槽位的每个样本都判为 `invalid or ambiguous
+GPU observation` 且一个都不保留，`GpuMetricsService.ingest` 只为被接受样本更新 `gpu_metric_latest`——所以自产品
+记录的首个冲突批次起（本次 15:33:01Z：节点采集器先用三次抓取确认别名带来的 clock-reason 候选再投递边沿，第 5、6
+次读取根本没到控制面），注入值与发布读数都不成为样本，槽位 latest 停在冲突前读数。变体现以该批次为锚
+（`first_conflicting_batch_at`）：锚前样本不判；注入值在任何批次成为样本或 latest 即 FAIL；锚后该槽位任何被接受
+样本、或时间戳落在窗口内的 latest 行即 FAIL；保留的读数记入 notes；产品若从未上报歧义，窗口从 oracle 门确认
+别名已投递的时刻起算（`window_opened_at`，之后每次读取都在保持的步骤上）。同类暴露一并修正：`duplicate_slot` 的
+`others_usable` 原来只要另一 GPU 曾有过 latest 行（arm 之前的也算）就放行，现要求其读数在产品首次拒绝重复
+槽位的批次之后被接受（锚记 `first_replayed_batch_at`）；`missing_field` 只认点名 `pcie_replay_total` 的全批消息
+（窗口内其他字段的真实缺口曾能满足它），无 GPU 上报该字段时 NOT_RUN(CAPABILITY_ABSENT)；`one_gpu_missing` 与
+`missing_field` 一样等到 omit 已投递再 settle，不再只窥视 journal。`nan_negative` 已按产品拒绝锚定；
+`exporter_timeout`/`sustained_unknown`/`post_refresh_success` 立即暂停 exporter，没有直通阶段。测试：
+`tests/regional/test_general_live_gpu_fields.py`（现场时序，修前 FAIL 修后 PASS，以及发布读数延续、注入值被接受、
+latest 行移动、门控窗口、重复槽位与缺字段的同类用例）、`tests/collectors/test_dcgm_per_gpu_completeness.py`
+（served 文本 → 采集器 → 控制面 ingest → store 的产品钉：两个样本都转发、候选确认时投递、整槽丢弃、保留早先
+读数及其时间、不开 finding、单名抓取即恢复边沿）。两集群仅用运行器重跑，不需要产品发布。
+
 ### GF-GENERAL-LIVE-026
 
 必测：`uuid_changed`、`bdf_changed`、`count_unchanged`、`unknown_expected_count`、

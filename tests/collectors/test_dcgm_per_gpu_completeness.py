@@ -403,6 +403,112 @@ def test_one_gpu_missing_reaches_the_bounded_diagnostic_and_clears() -> None:
     assert _incidents(context) == 1, "and opens nothing new"
 
 
+CLOCK_LEGACY = "DCGM_FI_DEV_CLOCK_THROTTLE_REASONS"
+CLOCK_CURRENT = "DCGM_FI_DEV_CLOCKS_EVENT_REASONS"
+CLOCK = "clock_throttle_reasons"
+
+
+def test_two_exporter_names_of_one_field_that_disagree_drop_the_whole_slot() -> None:
+    """GF-GENERAL-LIVE-025 ``conflicting_alias`` as served live (2026-10-26
+    15:32Z, HyperPod, H200): both GPUs publish the clock event reasons under the
+    legacy name (reading 1); on GPU-b the current name arrives beside it with
+    64 (``0x40``, HW slowdown) while GPU-a keeps its one name.
+
+    Two names of one canonical field with equal values and labels are one
+    reading (``deduplicate_dcgm_aliases``); disagreeing, they are one ``(device,
+    canonical)`` slot seen twice, which the control plane rejects whole as
+    "invalid or ambiguous" (``normalize_gpu_observation``): neither the injected
+    value nor the published reading is accepted, the slot's latest row stays the
+    earlier reading and its time, no finding opens on the slot (the injected
+    ``0x40`` would have been a thermal-limiting candidate), and GPU-a's reading
+    of the same field in the same scrape is accepted. The node forwards both
+    samples and delivers the scrape on its own edge: the alias's clock-reason
+    candidate is confirmed over three scrapes before the edge ships, which is
+    why the live product's first rejection (15:33:01Z) trailed the first
+    conflicting read (~15:32:30Z) by two scrapes. A scrape with one name again
+    is the recovery edge and advances the slot with its real value.
+    """
+
+    one_name = {"GPU-a": (CLOCK_CURRENT,), "GPU-b": (CLOCK_CURRENT,)}
+    legacy_one = {"GPU-a": {CLOCK_LEGACY: 1}, "GPU-b": {CLOCK_LEGACY: 1}}
+    healthy = scrape(omit=one_name, values=legacy_one)
+    conflicting = scrape(
+        omit={"GPU-a": (CLOCK_CURRENT,)},
+        values={
+            "GPU-a": {CLOCK_LEGACY: 1},
+            "GPU-b": {CLOCK_LEGACY: 1, CLOCK_CURRENT: 64},
+        },
+    )
+    sink = Sink()
+    reader = collector(sink)
+    delivered = []
+    plan = [(0, healthy), (15, healthy), (30, healthy), (45, healthy)]
+    plan += [(offset, conflicting) for offset in (60, 75, 90)]
+    for offset, text in plan:
+        before = len(sink.batches)
+        reader.collect_text(text, observed_at=START + timedelta(seconds=offset))
+        if len(sink.batches) > before:
+            delivered.append((offset, sink.batches[-1].edge_filter_reasons))
+    assert delivered == [(0, ["initial-baseline"]), (90, ["candidate-confirmed"])], (
+        "the pass-through scrapes are no edge; the conflicting scrape ships once "
+        f"the alias's clock-reason candidate is confirmed: {delivered}"
+    )
+    baseline, served = sink.batches
+    served_at = START + timedelta(seconds=90)
+    assert served.collection_errors == [], "the node reports no completeness gap"
+    assert {
+        (sample.metric_name, sample.value)
+        for sample in served.samples
+        if sample.gpu_uuid == "GPU-b" and sample.canonical_name == CLOCK
+    } == {(CLOCK_LEGACY, 1.0), (CLOCK_CURRENT, 64.0)}, (
+        "the node forwards both names of the disagreeing slot; the control plane judges"
+    )
+
+    context = ApplicationContext(store=InMemoryStore())
+    _post(context, baseline)
+    _post(context, served)
+
+    latest = _latest(context)
+    assert latest[("GPU-b", CLOCK)] == (1.0, START), (
+        "the ambiguous slot keeps the earlier accepted reading and its time: "
+        f"{latest[('GPU-b', CLOCK)]}"
+    )
+    assert latest[("GPU-a", CLOCK)] == (1.0, served_at), (
+        f"GPU-a's one-name reading of the same scrape is accepted: {latest[('GPU-a', CLOCK)]}"
+    )
+    assert _slot_finding(context, "GPU-b", CLOCK) is None, (
+        "the injected 0x40 never becomes a thermal-limiting finding"
+    )
+    (evidence,) = [
+        item
+        for item in context.store.list_raw_evidence(
+            CLUSTER, node_id=NODE, kind=EvidenceKind.GPU_METRICS, limit=10
+        )
+        if item.observed_at == served_at
+    ]
+    assert evidence.payload["collection_errors"] == [f"{INVALID}: GPU-b/{CLOCK}"], (
+        f"the stored batch names the ambiguous slot: {evidence.payload['collection_errors']}"
+    )
+    assert not [
+        sample
+        for sample in evidence.payload["samples"]
+        if sample["gpu_uuid"] == "GPU-b" and sample["canonical_name"] == CLOCK
+    ], "the stored batch holds neither reading of the ambiguous slot"
+    assert _incidents(context) == 0
+
+    recovered_at = START + timedelta(seconds=105)
+    reader.collect_text(healthy, observed_at=recovered_at)
+    recovered = sink.batches[-1]
+    assert recovered.observed_at == recovered_at and "candidate-recovered" in (
+        recovered.edge_filter_reasons
+    ), f"one name again is the recovery edge: {recovered.edge_filter_reasons}"
+    _post(context, recovered)
+    assert _latest(context)[("GPU-b", CLOCK)] == (1.0, recovered_at), (
+        "the real reading is accepted again at the recovery"
+    )
+    assert _incidents(context) == 0
+
+
 def _latest(
     context: ApplicationContext,
 ) -> dict[tuple[str, str], tuple[float, datetime]]:

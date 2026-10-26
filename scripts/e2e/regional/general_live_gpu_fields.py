@@ -13,10 +13,15 @@ completeness check:
   fields, so the field is still present on the others and the per-GPU
   omission is not reported. Expected FAIL (product gap);
 * ``conflicting_alias`` -- two exporter aliases of one field with different
-  values: both are rejected as an ambiguous slot, never silently overwritten.
-  The pair is the name the node publishes the field under plus the product's
-  other name for it (``alias_pair``), chosen from the survey before anything
-  is installed; a node without such a pair is NOT_RUN(CAPABILITY_ABSENT);
+  values: the product drops the whole slot of that batch and reports it as
+  ambiguous (``gpu_observation.normalize_gpu_observation``), so neither the
+  injected value nor the published reading is accepted while the conflict is
+  served and the slot's latest row stays the pre-conflict reading; graded from
+  the first conflicting batch the product recorded, never over the plan's
+  pass-through reads (``_alias_overwrite``). The pair is the name the node
+  publishes the field under plus the product's other name for it
+  (``alias_pair``), chosen from the survey before anything is installed; a
+  node without such a pair is NOT_RUN(CAPABILITY_ABSENT);
 * ``nan_negative`` -- a negative value is rejected and a NaN is dropped: neither
   slot's latest accepted sample moves past the first replayed scrape (the
   earlier real reading is retained; it never becomes a healthy zero);
@@ -26,6 +31,7 @@ completeness check:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -63,6 +69,12 @@ NAN_FIELD = "row_remap_failure"
 #: reading never carries at the same time (``0x40`` HW slowdown); halved when
 #: the real reading happens to be it, so the two aliases always disagree.
 ALIAS_VALUE = 64
+#: The product's scrape-wide completeness message naming the omitted field
+#: (``collectors/gpu/completeness.py``: ``DCGM exporter is missing required
+#: fields: <fields>``); the GPU-scoped shape reads ``... fields on <gpu>: ...``.
+BATCH_WIDE_OMISSION = re.compile(
+    rf"missing required fields: .*\b{re.escape(REQUIRED)}\b"
+)
 
 
 @dataclass(frozen=True)
@@ -158,9 +170,27 @@ def _state(ctx: VariantContext, since: Any, *names: str) -> dict[str, Any]:
     return state_now(ctx, since, names=list(names) or [REQUIRED])
 
 
+def _batch_wide_omission(errors: list[str]) -> bool:
+    """Whether the product reported ``REQUIRED`` missing from the whole scrape.
+
+    The batch-wide message is ``DCGM exporter is missing required fields:
+    <fields>``; a GPU-scoped gap reads ``... fields on <gpu>: <fields>`` and an
+    invalid slot ``invalid or ambiguous GPU observation: <gpu>/<field>``. The
+    stage used to accept any text carrying "missing required fields", which a
+    real gap of another field inside the result window (it opens before the
+    arm) would have satisfied without the replay.
+    """
+
+    return any(BATCH_WIDE_OMISSION.search(text) for text in errors)
+
+
 def missing_field(ctx: VariantContext) -> dict[str, Any]:
     survey = run_gpu_survey(ctx)
     gpus = survey.gpus_with(REQUIRED)
+    if not gpus:
+        raise VariantNotRun(
+            "CAPABILITY_ABSENT", f"no GPU on the node reports {REQUIRED}"
+        )
     since = utc_now()
     repl = DcgmReplay(
         ctx,
@@ -177,10 +207,7 @@ def missing_field(ctx: VariantContext) -> dict[str, Any]:
     errors = collection_errors(doc)
     stages = {
         "completeness": []
-        if any(
-            REQUIRED in text or "missing required fields" in text.lower()
-            for text in errors
-        )
+        if _batch_wide_omission(errors)
         else ["a batch-wide missing required field was not reported as incomplete"],
     }
     recover_counter(ctx, repl, since, names=[REQUIRED])
@@ -205,11 +232,10 @@ def one_gpu_missing(ctx: VariantContext) -> dict[str, Any]:
         ),
         _hold(ctx),
     )
-    arm_and_confirm(repl)  # the oracle gate below reads the audit for the omit
-    if not any(
-        f"{target}/{REQUIRED}" in str((rec.get("served") or {})) for rec in repl.records
-    ):
-        repl.audit()
+    # The same gate as ``missing_field``: the settle starts once the omit is
+    # served (the plan's pass-through reads come first), not right after the
+    # arm -- the journal peek this used to make asserted nothing.
+    arm_and_confirm(repl, f"{target}/{REQUIRED}")
     _settle(ctx, survey)
     doc = _state(ctx, since)
     errors = collection_errors(doc)
@@ -255,27 +281,33 @@ def conflicting_alias(ctx: VariantContext) -> dict[str, Any]:
         _hold(ctx),
     )
     arm_and_confirm(repl, f"{pair.gpu}/{pair.field}#alias:{pair.alias}")
+    served_at = ctx.clock()
     _settle(ctx, survey)
     doc = _state(ctx, since, pair.field)
-    errors = collection_errors(doc)
-    samples = accepted_samples(doc, pair.field, pair.gpu)
+    # The ambiguity error always names ``<gpu>/<field>``, on a one-GPU node too.
+    replayed_at = _first_replayed_at(doc, pair.gpu, (pair.field,), single_gpu=False)
+    overwritten, notes = _alias_overwrite(
+        doc, pair, value, replayed_at=replayed_at, served_at=served_at
+    )
     stages = {
         "ambiguous_rejected": []
-        if any(pair.gpu in text and pair.field in text for text in errors)
+        if replayed_at is not None
         else ["a conflicting field alias was not reported as an ambiguous slot"],
-        "no_silent_overwrite": []
-        if not samples
-        else [
-            f"a conflicting alias slot was accepted as a value: {samples[-1].get('value')}"
-        ],
+        "no_silent_overwrite": overwritten,
     }
     recover_counter(ctx, repl, since, names=[pair.field])
     return result(
         stages,
+        notes=notes,
         extra={
             "gpu_uuid": pair.gpu,
             "alias_pair": {**pair.describe(), "value": value},
-            "collection_errors": errors[:5],
+            "collection_errors": collection_errors(doc)[:5],
+            "first_conflicting_batch_at": (
+                replayed_at.isoformat() if replayed_at is not None else None
+            ),
+            "window_opened_at": (replayed_at or served_at).isoformat(),
+            "latest": latest_value(doc, pair.field, pair.gpu),
         },
     )
 
@@ -330,7 +362,8 @@ def _first_replayed_at(
 ) -> datetime | None:
     """When the product first processed a replayed scrape: the earliest batch
     since the arm whose collection errors carry its rejection of one of the
-    replayed slots (the negative value, or the NaN slot read as missing)."""
+    replayed slots (the negative value, the NaN slot read as missing, the
+    ambiguous alias or duplicate slot)."""
 
     times = [
         at
@@ -409,6 +442,92 @@ def _not_a_value(
             f"{replayed_at.isoformat()}; the {kind} reading was dropped"
         )
     return errors, None
+
+
+def _alias_overwrite(
+    doc: dict[str, Any],
+    pair: AliasPair,
+    value: int,
+    *,
+    replayed_at: datetime | None,
+    served_at: datetime,
+) -> tuple[list[str], list[str]]:
+    """Errors if the ambiguous slot produced a value; notes on what was kept.
+
+    Two exporter names of one field disagreeing on one GPU are one ``(device,
+    canonical)`` slot seen twice, and the product drops the whole slot of that
+    batch: ``gpu_environment_policy.deduplicate_dcgm_aliases`` collapses an
+    alias pair only when both values and labels are equal, and
+    ``gpu_observation.normalize_gpu_observation`` marks every sample of a slot
+    counted twice "invalid or ambiguous" and keeps none. The published reading
+    goes with the injected one; ``gpu_metric_latest`` is upserted for accepted
+    samples only, so the slot's latest row stays the pre-conflict reading. "No
+    silent overwrite" is therefore: the injected value is never a sample or
+    the latest (the real reading never equals it, ``conflicting_value``), and
+    from the first conflicting batch the product recorded (``replayed_at``)
+    the slot has no accepted sample at all and its latest row predates it.
+    The plan's pass-through reads before the conflict carry the published
+    reading legitimately and are not graded -- live 2026-10-26 15:30Z
+    (HyperPod, H200) the collector's initial-baseline scrape after the repoint
+    delivered 1.0 inside the result window, which opens before the arm, and
+    the variant FAILed on it. Without the product's own record of the conflict
+    the window opens at ``served_at``, when the oracle gate saw the alias
+    served: every later read is on the held step.
+    """
+
+    opened = replayed_at or served_at
+    anchor = (
+        f"the first conflicting batch at {opened.isoformat()}"
+        if replayed_at is not None
+        else f"the oracle gate at {opened.isoformat()}"
+    )
+    gpu, field = pair.gpu, pair.field
+    errors: list[str] = []
+    injected: list[str] = []
+    inside: list[str] = []
+    for sample in accepted_samples(doc, field, gpu):
+        at = _when(sample.get("observed_at"))
+        if _float(sample.get("value")) == float(value):
+            injected.append(str(sample.get("observed_at")))
+        elif at is not None and at >= opened:
+            inside.append(str(sample.get("value")))
+    if injected:
+        errors.append(
+            f"the injected alias value {value} was accepted as a {field} sample "
+            f"of {gpu} at {', '.join(injected)}"
+        )
+    if inside:
+        errors.append(
+            f"a {field} sample of {gpu} was accepted while the conflicting alias "
+            f"was served (from {opened.isoformat()}): values {sorted(set(inside))}; "
+            "the product drops the whole slot of an ambiguous batch"
+        )
+    latest = latest_value(doc, field, gpu)
+    if latest is None:
+        return errors, [f"{gpu}/{field} has no latest accepted sample"]
+    kept = _float(latest.get("value"))
+    at = _when(latest.get("observed_at"))
+    if kept == float(value):
+        errors.append(
+            f"the injected alias value {value} is the latest accepted {field} "
+            f"value of {gpu}"
+        )
+    elif at is None:
+        errors.append(
+            f"{field} latest value {kept} carries no readable observed_at: "
+            f"{latest.get('observed_at')!r}"
+        )
+    elif at >= opened:
+        errors.append(
+            f"a {field} reading of {gpu} became the latest accepted value {kept} "
+            f"at {at.isoformat()}, not before {anchor}"
+        )
+    else:
+        return errors, [
+            f"{gpu}/{field} kept its earlier accepted value {kept} from "
+            f"{at.isoformat()}, before {anchor}; the ambiguous slot was dropped"
+        ]
+    return errors, []
 
 
 def nan_negative(ctx: VariantContext) -> dict[str, Any]:
@@ -498,18 +617,53 @@ def duplicate_slot(ctx: VariantContext) -> dict[str, Any]:
     _settle(ctx, survey)
     doc = _state(ctx, since)
     errors = collection_errors(doc)
+    replayed_at = _first_replayed_at(doc, target, (REQUIRED,), single_gpu=False)
     stages = {
         "duplicate_rejected": []
-        if any(target in text and REQUIRED in text for text in errors)
+        if replayed_at is not None
         else ["a duplicate field slot was not reported as ambiguous"],
-        "others_usable": []
-        if latest_value(doc, REQUIRED, other) is not None
-        else [
-            f"a duplicate slot on {target} also dropped {other}'s independent sample"
-        ],
+        "others_usable": _others_usable(doc, other, target, replayed_at=replayed_at),
     }
     recover_counter(ctx, repl, since, names=[REQUIRED])
-    return result(stages, extra={"target_gpu": target, "collection_errors": errors[:5]})
+    return result(
+        stages,
+        extra={
+            "target_gpu": target,
+            "collection_errors": errors[:5],
+            "first_replayed_batch_at": (
+                replayed_at.isoformat() if replayed_at is not None else None
+            ),
+        },
+    )
+
+
+def _others_usable(
+    doc: dict[str, Any], other: str, target: str, *, replayed_at: datetime | None
+) -> list[str]:
+    """``other``'s reading of the duplicated field was accepted *inside* the
+    replay: a batch sample at/after the first batch the product rejected the
+    duplicate in, or its latest row timestamped there. A latest row is not
+    windowed by the read's ``since`` -- the stage used to pass on any row the
+    GPU ever had, from before the arm as well."""
+
+    if replayed_at is None:
+        return [
+            f"{other}'s samples cannot be judged: no batch since the arm carries "
+            f"the product's rejection of the duplicate slot on {target}"
+        ]
+    latest = latest_value(doc, REQUIRED, other)
+    kept = _when(latest.get("observed_at")) if latest is not None else None
+    if (kept is not None and kept >= replayed_at) or any(
+        (at := _when(sample.get("observed_at"))) is not None and at >= replayed_at
+        for sample in accepted_samples(doc, REQUIRED, other)
+    ):
+        return []
+    return [
+        f"a duplicate slot on {target} also dropped {other}'s independent sample: "
+        f"no {REQUIRED} sample of {other} was accepted at or after the first "
+        f"replayed scrape at {replayed_at.isoformat()} (latest row: "
+        f"{latest.get('observed_at') if latest else None})"
+    ]
 
 
 VARIANTS = [
@@ -534,7 +688,10 @@ VARIANTS = [
         CASE,
         "conflicting_alias",
         "serve the product's other exporter name of a field the node publishes under one name, with a different value",
-        "the ambiguous slot is rejected, never silently overwritten; no distinct alias pair on the node is NOT_RUN before anything is installed",
+        "the ambiguous slot is reported and dropped whole from the first conflicting batch on: neither the "
+        "injected value nor the published reading is accepted while the conflict is served and the slot's "
+        "latest row stays the pre-conflict reading (the pass-through reads before it are not graded); "
+        "no distinct alias pair on the node is NOT_RUN before anything is installed",
         conflicting_alias,
         max_minutes=14,
     ),

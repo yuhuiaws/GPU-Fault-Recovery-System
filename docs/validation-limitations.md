@@ -3666,6 +3666,57 @@ is NOT_RUN(CAPABILITY_ABSENT, "no canonical field has two distinct exporter
 aliases on this node: ...") instead of an abort mid-run. To be re-run on both
 clusters (live16).
 
+025 `conflicting_alias` FAILed on its first live run with a distinct pair
+(2026-10-26 15:30-15:35Z, HyperPod, the lane's H200 node, R13g, harness
+live18): `ambiguous_rejected` held (the product's "invalid or
+ambiguous GPU observation: <gpu>/clock_throttle_reasons" was in the window)
+and `no_silent_overwrite` read "a conflicting alias slot was accepted as a
+value: 1.0". That 1.0 was the published reading from *before* the conflict:
+the result window opens before the arm, the repoint's collector restart
+delivers its initial-baseline scrape with the real reading, the plan's three
+pass-through reads follow (15:31:43-15:32:24) and the alias was served from
+read 5 (~15:32:30), yet the stage graded every accepted sample of the slot
+since the window opened. The product's semantics run the other way: two
+exporter names of one canonical field that disagree on one GPU are one
+`(device, canonical)` slot seen twice -- `gpu_environment_policy.
+deduplicate_dcgm_aliases` collapses an alias pair only when values and labels
+are equal, `gpu_observation.normalize_gpu_observation` marks every sample of
+a slot counted twice invalid and keeps none, and `GpuMetricsService.ingest`
+upserts `gpu_metric_latest` for accepted samples only -- so from the first
+conflicting batch the product recorded (15:33:01Z here: the node collector
+confirms the alias's clock-reason candidate over three scrapes before it ships
+the edge, so reads 5 and 6 never reached the control plane) neither the
+injected value nor the published reading is a sample, and the slot's latest
+row stays the pre-conflict reading. The variant now anchors on that batch
+(`first_conflicting_batch_at`) and grades no sample before it; the injected
+value as a sample or as the latest row in any batch is a FAIL, as is any
+accepted sample of the slot or a latest row timestamped inside the window;
+the retained reading goes into `notes`. A product that never reported the
+ambiguity leaves no batch to anchor on, and the window then opens at the
+oracle gate's confirmation that the alias was served (`window_opened_at`;
+every later read is on the held step). The sibling field variants were read
+for the same exposure: `duplicate_slot`'s `others_usable` accepted any latest
+row the other GPU ever had, from before the arm as well, and now requires the
+other GPU's reading accepted at or after the first batch that rejected the
+duplicate (its anchor is recorded as `first_replayed_batch_at`);
+`missing_field` accepts only the scrape-wide message naming
+`pcie_replay_total` (a real gap of another field inside the window used to
+satisfy it) and is NOT_RUN(CAPABILITY_ABSENT) when no GPU reports the field;
+`one_gpu_missing` gates on the served omit like `missing_field` instead of a
+journal peek that asserted nothing. `nan_negative` already anchored on the
+product's rejection; `exporter_timeout`, `sustained_unknown` and
+`post_refresh_success` pause the exporter at once and have no pass-through
+phase. Harness oracle: `tests/regional/test_general_live_gpu_fields.py` (the
+live chronology, which FAILs on the previous oracle and PASSes now, the
+published reading continuing, the injected value accepted, the latest row
+moving, the gate-opened window, the duplicate and omission siblings); product
+pin: `tests/collectors/test_dcgm_per_gpu_completeness.py` (served text ->
+`DcgmMetricsCollector` -> control-plane ingest -> store: both samples
+forwarded, the scrape delivered at the candidate's confirmation, the slot
+dropped whole, the earlier reading and its time retained, no finding, the
+one-name scrape as the recovery edge). To be re-run on both clusters with the
+runner alone; no product release is needed.
+
 024 `thermal_warning` and `power_performance` reuse the GF-ENV-LIVE
 telemetry replay unchanged (`tools/gpu_environment_replay.py`,
 `probes/env_replay_proxy.py`, `env_live_fixture.EnvReplayController`) through

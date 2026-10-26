@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +12,12 @@ import pytest
 
 from scripts.e2e.regional import general_live_gpu_fields as fields
 from scripts.e2e.regional.general_live_fixture import VariantNotRun
-from tests.regional._general_live_fakes import FakeRegional, make_context, make_settings
+from tests.regional._general_live_fakes import (
+    FakeRegional,
+    make_context,
+    make_settings,
+    store_poll_clock,
+)
 from tests.regional._general_live_gpu_fakes import (
     audit_records,
     dcgm_probe,
@@ -186,7 +192,8 @@ def test_conflicting_alias_injects_the_name_the_node_does_not_publish(
     state = _state(
         batches=[
             _batch(
-                [f"invalid or ambiguous GPU observation: {G1}/clock_throttle_reasons"]
+                [f"invalid or ambiguous GPU observation: {G1}/clock_throttle_reasons"],
+                at="2026-10-26T15:33:01+00:00",
             )
         ]
     )
@@ -200,6 +207,9 @@ def test_conflicting_alias_injects_the_name_the_node_does_not_publish(
         )
     )
     assert out["verdict"] == "PASS", out["errors"]
+    assert out["notes"] == [
+        f"{G1}/clock_throttle_reasons has no latest accepted sample"
+    ]
     assert out["alias_pair"] == {
         "field": "clock_throttle_reasons",
         "published": published,
@@ -245,6 +255,197 @@ def test_conflicting_alias_value_always_differs_from_the_real_reading() -> None:
     assert fields.conflicting_value(1.0) == 64, "the usual idle bitmask"
     assert fields.conflicting_value(None) == 64, "no real reading"
     assert fields.conflicting_value(64.0) == 32, "the real reading is the alias value"
+
+
+# The live 2026-10-26 15:30Z chronology (HyperPod hpb, H200, R13g): the repoint
+# restarted the collector at 15:31:18 and its initial-baseline scrape delivered
+# the real clock reading 1.0; the plan's three pass-through reads followed
+# (15:31:43, 15:32:04, 15:32:24; one of them a delivered summary carrying 1.0
+# again); the alias was served from read 5 (~15:32:30) and the first conflicting
+# batch the product delivered and rejected was 15:33:01 (the collector confirms a
+# clock-reason candidate over three scrapes before it ships the edge). Every
+# conflicting batch holds the product's rejection and no sample of the slot; the
+# other GPU's reading of the same field is accepted beside it.
+CLOCK = "clock_throttle_reasons"
+AMBIGUOUS = f"invalid or ambiguous GPU observation: {G1}/{CLOCK}"
+BASELINE_AT = "2026-10-26T15:31:33.100000+00:00"
+PASS_THROUGH_AT = "2026-10-26T15:32:04.204132+00:00"
+CONFLICT_AT = "2026-10-26T15:33:01.312457+00:00"
+CONFLICT_LATER = (
+    "2026-10-26T15:33:16.412457+00:00",
+    "2026-10-26T15:33:31.512457+00:00",
+)
+
+
+def _clock_sample(gpu: str, value: float) -> dict[str, Any]:
+    return {"gpu": gpu, "name": CLOCK, "value": value}
+
+
+def _alias_chronology(
+    *,
+    inside: list[dict[str, Any]] | None = None,
+    latest_at: str = PASS_THROUGH_AT,
+    latest_value: float = 1.0,
+    rejected: bool = True,
+) -> dict[str, Any]:
+    """The live shape; ``inside`` adds samples to the first conflicting batch."""
+
+    rejection = [AMBIGUOUS] if rejected else []
+    return _state(
+        batches=[
+            _batch(
+                [],
+                samples=[_clock_sample(G0, 1.0), _clock_sample(G1, 1.0)],
+                at=BASELINE_AT,
+            ),
+            _batch(
+                [],
+                samples=[_clock_sample(G0, 1.0), _clock_sample(G1, 1.0)],
+                at=PASS_THROUGH_AT,
+            ),
+            _batch(
+                rejection,
+                samples=[_clock_sample(G0, 1.0), *(inside or [])],
+                at=CONFLICT_AT,
+            ),
+            *[
+                _batch(rejection, samples=[_clock_sample(G0, 1.0)], at=at)
+                for at in CONFLICT_LATER
+            ],
+        ],
+        latest=[
+            _latest(CLOCK, 1.0, CONFLICT_LATER[-1], gpu=G0),
+            _latest(CLOCK, latest_value, latest_at, gpu=G1),
+        ],
+    )
+
+
+def _conflicting_alias(tmp_path: Path, state: dict[str, Any], *, ctx_hook=None):
+    served = audit_records({f"{G1}/{CLOCK}#alias:{CURRENT_ALIAS}": 64})
+    ctx = _ctx(
+        tmp_path,
+        "conflicting_alias",
+        probe=dcgm_probe(alias_survey(LEGACY_ALIAS), audit=served),
+        cpu=gpu_cpu_python(gpu_state=[state, state]),
+    )
+    if ctx_hook is not None:
+        ctx_hook(ctx)
+    return fields.conflicting_alias(ctx)
+
+
+def test_conflicting_alias_passes_the_live_chronology(tmp_path: Path) -> None:
+    """The pass-through reads before the conflict delivered the real 1.0 and are
+    not graded; from the first conflicting batch the product dropped the whole
+    slot and kept the earlier reading as the latest row. The live run FAILed on
+    exactly this shape ("a conflicting alias slot was accepted as a value: 1.0")
+    because it graded every sample since a moment before the arm."""
+
+    out = _conflicting_alias(tmp_path, _alias_chronology())
+    assert out["verdict"] == "PASS", out["errors"]
+    assert out["first_conflicting_batch_at"] == CONFLICT_AT
+    assert out["window_opened_at"] == CONFLICT_AT
+    assert out["latest"] == _latest(CLOCK, 1.0, PASS_THROUGH_AT), out["latest"]
+    (note,) = out["notes"]
+    assert (
+        f"{G1}/{CLOCK} kept its earlier accepted value 1.0 from {PASS_THROUGH_AT}, "
+        f"before the first conflicting batch at {CONFLICT_AT}; the ambiguous slot "
+        "was dropped" == note
+    ), note
+
+
+def test_conflicting_alias_fails_when_the_published_reading_continues(
+    tmp_path: Path,
+) -> None:
+    """The product drops both readings of an ambiguous slot: the published name's
+    1.0 accepted beside the rejection is a sample the slot must not produce."""
+
+    out = _conflicting_alias(
+        tmp_path, _alias_chronology(inside=[_clock_sample(G1, 1.0)])
+    )
+    assert out["verdict"] == "FAIL"
+    assert out["stages"]["ambiguous_rejected"] == []
+    assert out["stages"]["no_silent_overwrite"] == [
+        f"a {CLOCK} sample of {G1} was accepted while the conflicting alias was "
+        f"served (from {CONFLICT_AT}): values ['1.0']; the product drops the whole "
+        "slot of an ambiguous batch"
+    ], out["stages"]
+
+
+def test_conflicting_alias_fails_when_the_injected_value_becomes_a_sample(
+    tmp_path: Path,
+) -> None:
+    """The alias value is never a reading of the slot, whatever the window and
+    whether or not the product also reported the ambiguity. With no rejection
+    to anchor on the window opens at the oracle gate (here between the last
+    pass-through read and the conflict), so the pass-through 1.0s stay out."""
+
+    gate = datetime(2026, 10, 26, 15, 32, 44, tzinfo=timezone.utc)
+    out = _conflicting_alias(
+        tmp_path,
+        _alias_chronology(
+            inside=[_clock_sample(G1, 64.0)],
+            latest_at=CONFLICT_AT,
+            latest_value=64.0,
+            rejected=False,
+        ),
+        ctx_hook=lambda ctx: store_poll_clock(ctx, start=gate),
+    )
+    assert out["verdict"] == "FAIL"
+    assert out["first_conflicting_batch_at"] is None
+    assert datetime.fromisoformat(out["window_opened_at"]) >= gate
+    assert out["stages"]["ambiguous_rejected"] == [
+        "a conflicting field alias was not reported as an ambiguous slot"
+    ]
+    assert out["stages"]["no_silent_overwrite"] == [
+        f"the injected alias value 64 was accepted as a {CLOCK} sample of {G1} at "
+        f"{CONFLICT_AT}",
+        f"the injected alias value 64 is the latest accepted {CLOCK} value of {G1}",
+    ], out["stages"]
+
+
+def test_conflicting_alias_fails_when_the_latest_row_moves_into_the_conflict(
+    tmp_path: Path,
+) -> None:
+    out = _conflicting_alias(tmp_path, _alias_chronology(latest_at=CONFLICT_LATER[0]))
+    assert out["verdict"] == "FAIL"
+    assert out["stages"]["no_silent_overwrite"] == [
+        f"a {CLOCK} reading of {G1} became the latest accepted value 1.0 at "
+        f"{CONFLICT_LATER[0]}, not before the first conflicting batch at {CONFLICT_AT}"
+    ], out["stages"]
+
+
+def test_conflicting_alias_window_opens_at_the_oracle_gate_without_a_rejection(
+    tmp_path: Path,
+) -> None:
+    """A product that never reported the ambiguity leaves no batch to anchor on;
+    the window then opens when the oracle gate saw the alias served (every
+    later read is on the held step). Samples before it are the pass-through
+    reads; a sample after it is the published reading kept beside an
+    unreported conflict."""
+
+    gate = datetime(2026, 10, 26, 15, 32, 44, tzinfo=timezone.utc)
+    later = "2026-10-26T15:40:00.123456+00:00"
+    state = _state(
+        batches=[
+            _batch([], samples=[_clock_sample(G1, 1.0)], at=BASELINE_AT),
+            _batch([], samples=[_clock_sample(G1, 1.0)], at=later),
+        ],
+        latest=[_latest(CLOCK, 1.0, later)],
+    )
+    out = _conflicting_alias(
+        tmp_path, state, ctx_hook=lambda ctx: store_poll_clock(ctx, start=gate)
+    )
+    assert out["verdict"] == "FAIL"
+    assert out["first_conflicting_batch_at"] is None
+    opened = datetime.fromisoformat(out["window_opened_at"])
+    assert gate <= opened < datetime.fromisoformat(later), out["window_opened_at"]
+    assert out["stages"]["no_silent_overwrite"] == [
+        f"a {CLOCK} sample of {G1} was accepted while the conflicting alias was "
+        f"served (from {opened.isoformat()}): values ['1.0']; the product drops the "
+        "whole slot of an ambiguous batch",
+        f"a {CLOCK} reading of {G1} became the latest accepted value 1.0 at {later}, "
+        f"not before the oracle gate at {opened.isoformat()}",
+    ], out["stages"]
 
 
 # The live 2026-10-26 shape (plain EKS, H200): the replayed scrape at REPLAYED_AT
@@ -441,15 +642,12 @@ def test_nan_negative_is_inconclusive_when_the_replay_never_served(
         )
 
 
-def test_duplicate_slot_rejects_and_keeps_other_gpus(tmp_path: Path) -> None:
+DUPLICATE_REJECTED = f"invalid or ambiguous GPU observation: {G1}/pcie_replay_total"
+
+
+def _duplicate_slot(tmp_path: Path, state: dict[str, Any]):
     served = audit_records({f"{G1}/pcie_replay_total#duplicate": 7})
-    state = _state(
-        batches=[
-            _batch([f"invalid or ambiguous GPU observation: {G1}/pcie_replay_total"])
-        ],
-        latest=[{"name": "pcie_replay_total", "gpu": G0, "value": 4.0}],
-    )
-    out = fields.duplicate_slot(
+    return fields.duplicate_slot(
         _ctx(
             tmp_path,
             "duplicate_slot",
@@ -457,4 +655,137 @@ def test_duplicate_slot_rejects_and_keeps_other_gpus(tmp_path: Path) -> None:
             cpu=gpu_cpu_python(gpu_state=[state, state]),
         )
     )
+
+
+def test_duplicate_slot_rejects_and_keeps_other_gpus(tmp_path: Path) -> None:
+    """The other GPU's reading of the duplicated field is accepted in the very
+    batch that rejects the duplicate: its latest row moves to that scrape."""
+
+    state = _state(
+        batches=[
+            _batch(
+                [DUPLICATE_REJECTED],
+                samples=[{"gpu": G0, "name": "pcie_replay_total", "value": 4.0}],
+                at=REPLAYED_AT,
+            )
+        ],
+        latest=[_latest("pcie_replay_total", 4.0, REPLAYED_AT, gpu=G0)],
+    )
+    out = _duplicate_slot(tmp_path, state)
     assert out["verdict"] == "PASS", out["errors"]
+    assert out["first_replayed_batch_at"] == REPLAYED_AT
+
+
+def test_duplicate_slot_accepts_the_other_gpus_latest_row_inside_the_replay(
+    tmp_path: Path,
+) -> None:
+    """A read whose batches carry no sample of the other GPU (the field filter
+    of an older probe) still proves it usable by the latest row's time."""
+
+    state = _state(
+        batches=[_batch([DUPLICATE_REJECTED], at=REPLAYED_AT)],
+        latest=[_latest("pcie_replay_total", 4.0, REPLAYED_AT, gpu=G0)],
+    )
+    assert _duplicate_slot(tmp_path, state)["verdict"] == "PASS"
+
+
+def test_duplicate_slot_fails_when_the_other_gpu_stopped_at_the_replay(
+    tmp_path: Path,
+) -> None:
+    """A latest row from before the arm proved nothing about the replay: the
+    stage used to pass on any row the other GPU ever had."""
+
+    state = _state(
+        batches=[_batch([DUPLICATE_REJECTED], at=REPLAYED_AT)],
+        latest=[_latest("pcie_replay_total", 4.0, EARLIER, gpu=G0)],
+    )
+    out = _duplicate_slot(tmp_path, state)
+    assert out["verdict"] == "FAIL"
+    assert out["stages"]["duplicate_rejected"] == []
+    assert out["stages"]["others_usable"] == [
+        f"a duplicate slot on {G1} also dropped {G0}'s independent sample: no "
+        f"pcie_replay_total sample of {G0} was accepted at or after the first "
+        f"replayed scrape at {REPLAYED_AT} (latest row: {EARLIER})"
+    ], out["stages"]
+
+
+def test_duplicate_slot_cannot_judge_the_others_without_the_rejection(
+    tmp_path: Path,
+) -> None:
+    state = _state(
+        batches=[_batch([], at=REPLAYED_AT)],
+        latest=[_latest("pcie_replay_total", 4.0, REPLAYED_AT, gpu=G0)],
+    )
+    out = _duplicate_slot(tmp_path, state)
+    assert out["verdict"] == "FAIL"
+    assert out["first_replayed_batch_at"] is None
+    assert out["stages"]["duplicate_rejected"] == [
+        "a duplicate field slot was not reported as ambiguous"
+    ]
+    assert out["stages"]["others_usable"] == [
+        f"{G0}'s samples cannot be judged: no batch since the arm carries the "
+        f"product's rejection of the duplicate slot on {G1}"
+    ]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"DCGM exporter is missing required fields on {G1}: pcie_replay_total",
+        "DCGM exporter is missing required fields: row_remap_failure",
+        f"invalid or ambiguous GPU observation: {G1}/pcie_replay_total",
+    ],
+)
+def test_missing_field_accepts_only_the_batch_wide_omission_of_its_field(
+    tmp_path: Path, text: str
+) -> None:
+    """A GPU-scoped gap, another field's gap or an invalid slot inside the
+    window (it opens before the arm) is not the replay's scrape-wide omission;
+    the stage used to pass on any "missing required fields" text."""
+
+    served = audit_records(
+        {f"{G0}/pcie_replay_total": "omitted", f"{G1}/pcie_replay_total": "omitted"}
+    )
+    state = _state(batches=[_batch([text])])
+    out = fields.missing_field(
+        _ctx(
+            tmp_path,
+            "missing_field",
+            probe=dcgm_probe(audit=served),
+            cpu=gpu_cpu_python(gpu_state=[state, state]),
+        )
+    )
+    assert out["verdict"] == "FAIL", out
+    assert fields.BATCH_WIDE_OMISSION.search(
+        "DCGM exporter is missing required fields: row_remap_failure, pcie_replay_total"
+    ), "a scrape-wide message listing several fields names the omitted one"
+
+
+def test_missing_field_needs_a_gpu_reporting_the_field(tmp_path: Path) -> None:
+    without = survey(fields=("ecc_dbe_volatile_total", "clock_throttle_reasons"))
+    probe = dcgm_probe(without)
+    ctx = _ctx(tmp_path, "missing_field", probe=probe, cpu=gpu_cpu_python())
+    with pytest.raises(VariantNotRun, match="CAPABILITY_ABSENT.*pcie_replay_total"):
+        fields.missing_field(ctx)
+    assert [call[0] for call in probe.calls] == ["survey"], probe.calls
+
+
+def test_one_gpu_missing_is_inconclusive_when_the_omit_was_never_served(
+    tmp_path: Path,
+) -> None:
+    """The gate ``missing_field`` has: the settle starts once the omit is served,
+    and a replay that never served it ends INCONCLUSIVE instead of grading the
+    pass-through reads."""
+
+    from scripts.e2e.regional.general_live_fixture import VariantInconclusive
+
+    state = _state(batches=[_batch([], at=REPLAYED_AT)])
+    with pytest.raises(VariantInconclusive, match="never served"):
+        fields.one_gpu_missing(
+            _ctx(
+                tmp_path,
+                "one_gpu_missing",
+                probe=dcgm_probe(audit=audit_records()),
+                cpu=gpu_cpu_python(gpu_state=[state, state]),
+            )
+        )
