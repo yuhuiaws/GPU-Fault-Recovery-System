@@ -208,6 +208,20 @@ def decode_flight_dump(raw: bytes) -> Any:
         ) from exc
 
 
+def summarize_flight_dump(raw: bytes) -> dict[str, Any]:
+    """What the reader reports for one dump file's bytes, either on-disk format.
+
+    The same summary ``_finish_flight_recorder`` attaches to a rank's
+    ``flight_recorder`` (``entry_count``, ``last_entry``, ``last_entries_by_pg``
+    with their ``progress`` and ``semantic_entries``, the unfinished entries);
+    the public entry for anything that sizes or replays a dump without a FIFO.
+    """
+
+    return FlightRecorderOperationsMixin._flight_recorder_summary(
+        decode_flight_dump(raw)
+    )
+
+
 class FlightRecorderOperationsMixin:
     # Attributes supplied by the composed concrete implementation.
     proc_root: Path
@@ -627,7 +641,13 @@ class FlightRecorderOperationsMixin:
         selected.extend(item for item in unfinished if item is not last)
         return {
             "entry_count": len(summaries),
-            "last_entry": last,
+            # ``last`` is the newest group's own row, which carries that
+            # group's ``semantic_entries``; repeating them here serialized
+            # every operation list twice per rank (28 KB of a live 29 KB dump)
+            # for nothing -- ``last_entries_by_pg`` is where readers find them.
+            "last_entry": {
+                key: value for key, value in last.items() if key != "semantic_entries"
+            },
             "last_entries_by_pg": [by_pg[name] for name in sorted(by_pg)[:64]],
             "process_groups_truncated": len(by_pg) > 64,
             "unfinished_entry_count": len(unfinished),

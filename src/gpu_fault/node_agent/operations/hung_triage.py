@@ -20,6 +20,7 @@ from gpu_fault.node_agent.operations.process_identity import (
     process_start_ticks,
     scoped_processes,
 )
+from gpu_fault.node_agent.operations.triage_budget import bounded_triage_result
 from gpu_fault.node_agent.operations.triage_samples import collect_process_series
 from gpu_fault.node_agent.operations.workload_scope import resolve_workload_scope
 from gpu_fault.node_agent.protocol import (
@@ -190,23 +191,28 @@ class HungTriageOperationsMixin:
             time.monotonic,
         )
 
-        return {
-            "triage_version": "nccl-hung-triage/v4",
-            "node_id": command.node_id,
-            "ranks": ranks,
-            "efa": self._counter_delta(efa_before, efa_after),
-            "errors": errors,
-            "elapsed_seconds": round(time.monotonic() - started, 6),
-            "flight_recorder_wait_seconds": flight_wait_seconds,
-            "read_only": True,
-            "workload_scope": workload_scope,
-            "process_coverage": {
-                "eligible": eligible_process_count,
-                "collected": len(ranks),
-                "truncated": eligible_process_count > max_processes,
-                "rank_inventory_complete": False,
-            },
-        }
+        # Eight ranks with two FR dumps each weighed ~1.2 MB live against the
+        # worker's 1 MiB result line and came back as nothing; the ladder in
+        # ``triage_budget`` keeps every rank and names what it shortened.
+        return bounded_triage_result(
+            {
+                "triage_version": "nccl-hung-triage/v4",
+                "node_id": command.node_id,
+                "ranks": ranks,
+                "efa": self._counter_delta(efa_before, efa_after),
+                "errors": errors,
+                "elapsed_seconds": round(time.monotonic() - started, 6),
+                "flight_recorder_wait_seconds": flight_wait_seconds,
+                "read_only": True,
+                "workload_scope": workload_scope,
+                "process_coverage": {
+                    "eligible": eligible_process_count,
+                    "collected": len(ranks),
+                    "truncated": eligible_process_count > max_processes,
+                    "rank_inventory_complete": False,
+                },
+            }
+        )
 
     def _gpu_triage_snapshot(
         self,

@@ -12,7 +12,11 @@ from pathlib import Path
 from typing import Any
 
 from gpu_fault.node_agent.diagnostic_process import DiagnosticProcessRunner
-from gpu_fault.node_agent.observation_limits import OBSERVATION_REQUEST_BUDGET_BYTES
+from gpu_fault.node_agent.observation_limits import (
+    OBSERVATION_REQUEST_BUDGET_BYTES,
+    OBSERVATION_RESULT_BUDGET_BYTES,
+    WORKER_OUTPUT,
+)
 from gpu_fault.node_agent.operations.diagnostics import DiagnosticOperationsMixin
 from gpu_fault.node_agent.operations.efa import EfaOperationsMixin
 from gpu_fault.node_agent.operations.flight_recorder import (
@@ -51,6 +55,44 @@ class ObservationAgent(
         self.partial_evidence_sink = lambda document: publish(document, final=False)
 
 
+def oversized_result(size: int, document: dict[str, Any]) -> dict[str, Any]:
+    """The stand-in for a result line the supervisor would refuse.
+
+    Live (GF-GENERAL-LIVE-011 ``fr_enabled`` on HyperPod, 2026-10-25), a triage
+    of eight ranks with two flight recorder dumps each weighed ~1.2 MB and came
+    back as the bare ``{"status": "RESULT_SIZE_LIMIT", "ranks": []}``: the
+    workflow recorded ``ObservationIncomplete: RESULT_SIZE_LIMIT`` for both
+    nodes, nobody could tell an oversized result from a lost one, and the
+    runner read "sampled no rank process" over eight sampled ranks. The
+    stand-in names the size, the budget, the heaviest fields and the stage, in
+    the shape every other refusal uses (``error``, ``failed_component``,
+    ``failure_stage``, ``worker_started``, ``evidence_complete``).
+    """
+
+    weights = sorted(
+        (
+            (len(json.dumps(value, separators=(",", ":"))), str(key))
+            for key, value in document.items()
+        ),
+        reverse=True,
+    )[:3]
+    heaviest = ", ".join(f"{key}={weight} bytes" for weight, key in weights)
+    return {
+        "status": "RESULT_SIZE_LIMIT",
+        "ranks": [],
+        "evidence_complete": False,
+        "error": (
+            "observation result exceeds budget: "
+            f"{size} > {OBSERVATION_RESULT_BUDGET_BYTES} bytes"
+            + (f"; largest fields: {heaviest}" if heaviest else "")
+        ),
+        "failed_component": "observation_worker",
+        "failure_stage": WORKER_OUTPUT,
+        "worker_started": True,
+        "result_bytes": size,
+    }
+
+
 def publish(document: dict[str, Any], *, final: bool) -> None:
     if not final:
         _PARTIAL.clear()
@@ -58,9 +100,11 @@ def publish(document: dict[str, Any], *, final: bool) -> None:
     raw = json.dumps(
         {"final": final, "result": document}, separators=(",", ":")
     ).encode()
-    if len(raw) > 1_048_576:
+    # The newline counts: the supervisor measures the line it buffers.
+    if len(raw) + 1 > OBSERVATION_RESULT_BUDGET_BYTES:
         raw = json.dumps(
-            {"final": final, "result": {"status": "RESULT_SIZE_LIMIT", "ranks": []}}
+            {"final": final, "result": oversized_result(len(raw) + 1, document)},
+            separators=(",", ":"),
         ).encode()
     sys.stdout.buffer.write(raw + b"\n")
     sys.stdout.buffer.flush()

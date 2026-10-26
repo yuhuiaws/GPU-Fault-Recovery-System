@@ -417,6 +417,20 @@ bundle 命令带到节点的 `hung_triage_decision` 是线上形式（`hung_bund
 manifest/结果的 `observation_request_trimmed` 列键），bundle 照常采集；裁后仍超才拒绝，拒绝带 `error` 消息、
 `failed_component`、`failure_stage`、`worker_started`。真机 `tid_namespace` 曾因 259 KB 全量判定在 5 ms 内整体失败
 （`error="ValueError"`，worker 未启动）。
+worker 交回的单条结果上限 1 MiB（`OBSERVATION_RESULT_BUDGET_BYTES`，含换行）。真机 HyperPod `fr_enabled`（2026-10-25 23:05Z）：
+triage 认全两节点 16 个 rank、每 rank 两次 dump 都在 triage 窗口内写入（PyTorch 日志 32 行 "preparing to dump debug info"，
+16 个 29.5 KB 的 dump 在 `/tmp/nccl_trace_rank_*`），但 8 rank × 2 份 dump × 64 条操作摘要被序列化四份
+（`last_entry`、`last_entries_by_pg`、series 的 `first` 与 `second`），叠在不开 FR 时 8 rank 约 290 KB 的进程/栈序列之上约 1.2 MB，
+worker 把整份结果换成 `{"status":"RESULT_SIZE_LIMIT","ranks":[]}`，两节点的 step `node_failures` 都是
+`ObservationIncomplete: RESULT_SIZE_LIMIT`、`node_results={}`，判定一个进程都没有，验收运行器读到 "sampled no rank process"——
+rank 发现、容器 scope 与 dump 位置都没有问题，任何开 FR 的 8 GPU 节点都会触发。现在 triage 交出结果前先按
+`operations/triage_budget.bounded_triage_result` 的阶梯压到 `TRIAGE_RESULT_BUDGET_BYTES`（1 MiB 减 64 KiB）以内：
+先无损地把 `last_entries_by_pg` 中 series 快照已带的操作列表换成 `semantic_entries_in` 指针，再去 `unfinished_entries`、
+把每组操作列表缩到前 32/16/8 条（未完成操作在前）、整列去掉（`progress` 水位保留），最后才把栈/进程序列只留最新一次采样；
+每个 rank 的身份、FR 状态、`progress`、`raw_evidence` 每一级都保留，结果的 `evidence_trimmed` 记预算、裁前/裁后字节数与各级名称。
+读取器的 `last_entry` 不再重复该组的 `semantic_entries`。阶梯走完仍超限的占位带 `error`（字节数、预算、最重字段）、
+`failed_component=observation_worker`、`failure_stage=WORKER_OUTPUT`、`result_bytes`。本地复现：真机 8 rank 形状
+1,006 KB → 781 KB（只用无损一级），16 rank 2,003 KB → 875 KB，两者的控制面判定与全量结果相同。
 hung 包跳过 DCGM diag、bug-report 与 strace；
 FR 文件读取上限 64 MiB，结构遍历有界，环形 pickle 不递归失控。
 20 秒是新版 triage 内部采样预算；生产 Agent 另用隔离只读 worker 约束父进程等待，

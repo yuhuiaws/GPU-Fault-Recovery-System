@@ -10527,6 +10527,12 @@ observation request exceeded the 256 KiB budget and the listed context parameter
 count and the SHA-256 (the node result carries the same field); the collection itself ran as usual. When a node refuses the bundle, the
 step's `node_failures` reads `ObservationIncomplete: <status>: <exception class: message>` and the node result's details carry
 `failed_component`/`failure_stage`/`worker_started`; a bare `error="ValueError"` without a message comes from an Agent older than this fix.
+A triage node result is bounded by the worker's 1 MiB result line too: an upgraded Agent first trims redundant or long FR
+operation lists along the result's `evidence_trimmed` ladder (every rank keeps its identity, status, `progress` and
+`raw_evidence`) and only a result still over the line becomes a `RESULT_SIZE_LIMIT` stand-in carrying `error` (size, budget,
+heaviest fields); a step whose `node_failures` reads `ObservationIncomplete: RESULT_SIZE_LIMIT` while the node result is a bare
+`{"status":"RESULT_SIZE_LIMIT","ranks":[]}` comes from an Agent older than this fix (live HyperPod `fr_enabled`, eight ranks with
+the recorder on).
 Without eligible candidates, the bounded passive bundle need not contain
 process stacks; eligible targeted bundles attach only to verified PIDs. Hung bundles omit strace,
 DCGM diag and bug-report. Per-process `flight_recorder_series` retains two compact summaries and

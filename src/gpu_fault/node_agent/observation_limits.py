@@ -32,3 +32,17 @@ def service_limits(
 #: supervisor refuses a larger request before it starts the worker, and the
 #: worker refuses it again on its own side of the pipe.
 OBSERVATION_REQUEST_BUDGET_BYTES = 262144
+#: What one result line may weigh on the worker's stdout, newline included: the
+#: supervisor drops the connection on a longer line, so the worker never sends
+#: one -- a document over it goes out as a ``RESULT_SIZE_LIMIT`` stand-in that
+#: names the size (``observation_worker.oversized_result``). The hung triage
+#: trims its own evidence under this line first
+#: (``operations.triage_budget.bounded_triage_result``).
+OBSERVATION_RESULT_BUDGET_BYTES = 1_048_576
+#: ``failure_stage`` of a result the supervisor could not obtain: the worker was
+#: never started (the request itself was refused, or the process could not be
+#: spawned), or it ran and its output could not be used. Defined here, where
+#: both sides of the pipe import from, so the worker can stamp its own
+#: oversized-output stand-in without importing the supervisor.
+WORKER_NOT_STARTED = "WORKER_NOT_STARTED"
+WORKER_OUTPUT = "WORKER_OUTPUT"

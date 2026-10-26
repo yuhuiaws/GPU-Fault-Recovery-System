@@ -14,13 +14,20 @@ import time
 from typing import Any, Callable
 
 from gpu_fault.node_agent import observation_guard
-from gpu_fault.node_agent.observation_limits import OBSERVATION_REQUEST_BUDGET_BYTES
+from gpu_fault.node_agent.observation_limits import (
+    OBSERVATION_REQUEST_BUDGET_BYTES,
+    OBSERVATION_RESULT_BUDGET_BYTES,
+    WORKER_NOT_STARTED,
+    WORKER_OUTPUT,
+)
 
-#: ``failure_stage`` of a result the supervisor could not obtain: the worker was
-#: never started (the request itself was refused, or the process could not be
-#: spawned), or it ran and its output could not be used.
-WORKER_NOT_STARTED = "WORKER_NOT_STARTED"
-WORKER_OUTPUT = "WORKER_OUTPUT"
+__all__ = [
+    "ObservationIncomplete",
+    "ObservationSupervisor",
+    "WORKER_NOT_STARTED",
+    "WORKER_OUTPUT",
+    "request_overflow",
+]
 
 
 class ObservationIncomplete(RuntimeError):
@@ -127,7 +134,10 @@ class ObservationSupervisor:
                             break
                         buffer.extend(block)
                         received += len(block)
-                        if len(buffer) > 1_048_576 or received > 4 * 1_048_576:
+                        if (
+                            len(buffer) > OBSERVATION_RESULT_BUDGET_BYTES
+                            or received > 4 * OBSERVATION_RESULT_BUDGET_BYTES
+                        ):
                             raise ValueError("observation output exceeds budget")
                         while b"\n" in buffer:
                             line, _, rest = buffer.partition(b"\n")

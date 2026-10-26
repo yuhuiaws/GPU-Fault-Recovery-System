@@ -3715,6 +3715,25 @@ parameters: ...`), `failed_component=observation_supervisor`, `failure_stage` (`
 hand-off mail state the cause. Live, a two-node `tid_namespace` run's 259 KB full decision pushed the request to 264 KB and
 the bundle failed as a whole within 5 ms with `{"status":"UNAVAILABLE","ranks":[],"error":"ValueError"}` -- neither thread
 namespaces nor thread discovery were involved; the worker never started.
+The result line the worker hands back is bounded too: 1 MiB (`observation_limits.OBSERVATION_RESULT_BUDGET_BYTES`, newline
+included; the supervisor drops a longer line). Before it returns, COLLECT_HUNG_TRIAGE brings its document under
+`TRIAGE_RESULT_BUDGET_BYTES` (1 MiB less 64 KiB for the wire wrapper, the command id the executor stamps on it and the
+request-trim notes) with `operations/triage_budget.bounded_triage_result`. The ladder is `flight_recorder.semantic_entries_in_series`
+(lossless: an operation list in `last_entries_by_pg` that the `flight_recorder_series` snapshot already carries becomes a
+`semantic_entries_in` pointer), `flight_recorder.unfinished_entries` (the count stays), `semantic_entries:32/16/8` (the first N
+operations of every group; the reader lists pending operations first, `semantic_entries_total`/`semantic_entries_truncated`
+record the original), `semantic_entries` (the lists go, `progress` watermarks and group identity stay),
+`stack_series.samples:last` and `process_series.samples:last` (the newest sample only, `windows` stay, `samples_trimmed` counts
+what went); it stops at the first step that fits. Every rank keeps pid/rank/identity, FR status, `progress` and `raw_evidence`
+at every step, and `evidence_trimmed` records the budget, the size before and after, each step with the ranks it touched and
+whether the document fits. The reader's `last_entry` no longer repeats its group's `semantic_entries`. A document still over the
+line after the whole ladder goes out as the stand-in `{"status":"RESULT_SIZE_LIMIT","ranks":[],"evidence_complete":false,
+"error":"observation result exceeds budget: <bytes> > 1048576 bytes; largest fields: ...","failed_component":"observation_worker",
+"failure_stage":"WORKER_OUTPUT","worker_started":true,"result_bytes":<bytes>}`, so the step's `node_failures` states the cause.
+Live, the two-node HyperPod `fr_enabled` run (2026-10-25 23:05Z) had the triage find all sixteen ranks and both dumps of every
+rank written inside the triage window; 8 ranks x 2 dumps x 64 operation summaries serialized four times made the result ~1.2 MB,
+both nodes were left with `ObservationIncomplete: RESULT_SIZE_LIMIT` and `node_results={}`, and the decision saw no process.
+Any eight-GPU node with the recorder on does the same; the node type and its cgroup layout play no part.
 Hung bundles omit DCGM diag, bug-report and strace.
 EFA/log suspicion goes to operator review; healthy fabric is not application recovery.
 The NCCL pipeline never uses training step/phase, including detection, target selection and completion.
