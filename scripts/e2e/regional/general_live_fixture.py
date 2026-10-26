@@ -633,6 +633,21 @@ class VariantContext:
     def host_summary(self) -> int:
         return self.setting("GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS", 300)
 
+    @property
+    def log_summary(self) -> int:
+        """``GPU_FAULT_NODE_LOG_HEALTH_SUMMARY_SECONDS``: the node log collector's
+        periodic post -- a health summary when the poll read cleanly, its
+        collection errors otherwise -- and, apart from a matching log line, the
+        only time it posts at all (``collectors/logs/node.py`` ``collect_once``)."""
+
+        return self.setting("GPU_FAULT_NODE_LOG_HEALTH_SUMMARY_SECONDS", 300)
+
+    @property
+    def log_interval(self) -> int:
+        """``GPU_FAULT_LOG_INTERVAL_SECONDS``: the node log collector's poll."""
+
+        return self.setting("GPU_FAULT_LOG_INTERVAL_SECONDS", 10)
+
     def remaining_seconds(self) -> float:
         return (self.deadline - self.clock()).total_seconds()
 

@@ -109,6 +109,10 @@ ENV_KEYS = (
     "GPU_FAULT_DCGM_HEALTH_SUMMARY_SECONDS",
     "GPU_FAULT_GPU_INVENTORY_INTERVAL_SECONDS",
     "GPU_FAULT_ENABLE_NODE_LOG_COLLECTOR",
+    # The node log collector's poll and its health-summary cadence: the 031
+    # recovery budget is sized from them (``general_live_collectors.recovery_budget``).
+    "GPU_FAULT_LOG_INTERVAL_SECONDS",
+    "GPU_FAULT_NODE_LOG_HEALTH_SUMMARY_SECONDS",
     "GPU_FAULT_EXPECTED_GPU_COUNT",
     "GPU_FAULT_METRICS_MODE",
     "GPU_FAULT_DCGM_METRICS_URL",

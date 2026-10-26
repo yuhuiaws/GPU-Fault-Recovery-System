@@ -73,12 +73,19 @@ def node_probe(survey_value: dict[str, Any], **extra: Any) -> FakeProbe:
     return FakeProbe(script)
 
 
-def observation(channel: str, state: str) -> dict[str, Any]:
+def observation(channel: str, state: str, reason: str | None = None) -> dict[str, Any]:
+    """The silence scan's ``collector_observation_valid`` sample
+    (``observation_health.record_observation``): a HEALTHY sample reads
+    FRESH_SUCCESS, an UNKNOWN one the reason -- a paused producer's silence is
+    STALE_OBSERVATION, a failing poll COLLECTION_ERROR."""
+
+    if reason is None:
+        reason = "FRESH_SUCCESS" if state == "HEALTHY" else "STALE_OBSERVATION"
     return {
         "name": "collector_observation_valid",
         "device": channel,
         "value": 1 if state == "HEALTHY" else 0,
-        "labels": {"state": state, "reason": "x"},
+        "labels": {"state": state, "reason": reason},
         "observed_at": "t",
     }
 
@@ -379,6 +386,128 @@ def exporter_timeout_context(
     return ctx, reads
 
 
+#: The node's producer-side steps, in the order the silence variants take them;
+#: a phased responder answers every store read with the document of the last
+#: step the node probe has taken.
+PHASE_CALLS = (
+    "log-collector-enable",
+    "unit-pause",
+    "unit-resume",
+    "log-collector-disable",
+    "exporter-pause",
+    "exporter-resume",
+)
+#: What the R13g node log collector's status carried live (2026-10-26, plain
+#: EKS ip-10-0-32-162, GF-GENERAL-LIVE-031.expired_agent plan at 11:04:01Z):
+#: b190's refusal, the cursor drop and the cumulative counters.
+LIVE_REFUSAL_ERRORS = [
+    "journalctl exited 1: Please specify only one of --since=, --cursor=, and --after-cursor=.",
+    "journal cursor unavailable; next poll replays timestamp window",
+    "cumulative loss since collector start: journal-window-capped-seconds=16779, journalctl-failures=72",
+]
+BASELINE_SUCCESS = "2026-10-24T00:00:00+00:00"
+FIRST_SUCCESS = "2026-10-24T00:10:00+00:00"
+RECOVERED_SUCCESS = "2026-10-24T01:00:00+00:00"
+
+
+def status(
+    channel: str,
+    *,
+    success: str | None,
+    error: str | None = None,
+    errors: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "collector": channel,
+        "last_success_at": success,
+        "last_error_at": error,
+        "errors": list(errors or []),
+    }
+
+
+def channel_doc(
+    channel: str,
+    *,
+    state: str,
+    success: str | None,
+    reason: str | None = None,
+    error: str | None = None,
+    errors: list[str] | None = None,
+    silent: bool = False,
+) -> dict[str, Any]:
+    """The node's activity as one read sees it: the channel's status and its
+    observation; ``silent`` adds the hour's advisory and the refresh workflow."""
+
+    document = {
+        **fresh_success_doc(channel),
+        "metric_latest": [observation(channel, state, reason)],
+        "collector_statuses": [
+            status(channel, success=success, error=error, errors=errors)
+        ],
+    }
+    if silent:
+        document["workflows"] = silence_doc(channel)["workflows"]
+        document["notifications"] = silence_doc(channel)["notifications"]
+    return document
+
+
+def logs_silent_phases(
+    *, enabled: dict[str, Any] | None = None, resumed: dict[str, Any] | None = None
+) -> dict[str, dict[str, Any]]:
+    """The live timeline of a clean ``logs_silent``: a success hours old before
+    the enable, the enabled collector's first success, the silence under the
+    pause (the success time it had at the pause), a new success after the
+    resume. ``enabled``/``resumed`` replace the two reads the product may fail."""
+
+    channel = "NODE_LOGS"
+    return {
+        "baseline": channel_doc(channel, state="UNKNOWN", success=BASELINE_SUCCESS),
+        "log-collector-enable": enabled
+        or channel_doc(channel, state="HEALTHY", success=FIRST_SUCCESS),
+        "unit-pause": channel_doc(
+            channel, state="UNKNOWN", success=FIRST_SUCCESS, silent=True
+        ),
+        "unit-resume": resumed
+        or channel_doc(channel, state="HEALTHY", success=RECOVERED_SUCCESS),
+    }
+
+
+def phased_context(
+    spec: Any,
+    tmp_path: Path,
+    phases: dict[str, Any],
+    *,
+    approvals=None,
+    survey_value: dict[str, Any] | None = None,
+) -> Any:
+    """Activity answers with ``phases[<last producer step>]`` (``"baseline"``
+    before any); a phase value may be a callable taking the read's ordinal."""
+
+    node = node_probe(survey_value or survey())
+    reads = {"count": 0}
+
+    def responder(script: str, *arguments: str) -> dict[str, Any]:
+        reads["count"] += 1
+        phase = "baseline"
+        for call in node.calls:
+            if call and call[0] in PHASE_CALLS and call[0] in phases:
+                phase = call[0]
+        value = phases[phase]
+        return dict(value(reads["count"]) if callable(value) else value)
+
+    return make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=FakeRegional(cpu_python=responder),
+        settings=settings(spec, tmp_path, approvals=approvals),
+        probes={f"node@{NODE}": node},
+    )
+
+
+def probe_calls(ctx: Any) -> list[str]:
+    return [call[0] for call in ctx.probes[f"node@{NODE}"].calls]
+
+
 def test_exporter_timeout_passes(tmp_path: Path) -> None:
     """Live 2026-10-26 (eksb): the variant demanded a finished VALIDATE_HOST
     while the exporter was still paused, which the product refuses by design
@@ -644,19 +773,201 @@ def test_logs_silent_requires_approval(tmp_path: Path) -> None:
 
 
 def test_logs_silent_passes_with_approval(tmp_path: Path) -> None:
+    """The live shape of a clean run: the enabled collector's first success is
+    awaited (not held for), the pause's UNKNOWN is the silence's own
+    STALE_OBSERVATION, the resume advances the success time again."""
+
     spec = SPECS["logs_silent"]
-    ctx = context(
-        spec,
-        tmp_path,
-        [
-            silence_doc("NODE_LOGS"),
-            silence_doc("NODE_LOGS"),
-            fresh_success_doc("NODE_LOGS"),
-        ],
-        approvals=("ENABLE_NODE_LOG_COLLECTOR",),
+    ctx = phased_context(
+        spec, tmp_path, logs_silent_phases(), approvals=("ENABLE_NODE_LOG_COLLECTOR",)
     )
     result = spec.execute(ctx)
     assert result["verdict"] == "PASS", result["errors"]
+    assert result["success_before_enable"] == BASELINE_SUCCESS, result
+    assert result["first_success"]["last_success_at"] == FIRST_SUCCESS, result
+    assert result["first_success"]["budget_seconds"] == 812, result["first_success"]
+    assert result["success_before_resume"] == FIRST_SUCCESS, result
+    assert result["recovery"]["last_success_at"] == RECOVERED_SUCCESS, result
+    calls = probe_calls(ctx)
+    assert calls.index("log-collector-enable") < calls.index("unit-pause"), calls
+    assert calls.index("unit-resume") < calls.index("log-collector-disable"), calls
+    timeline = ctx.case_dir / "log-first-success-timeline.json"
+    assert timeline.is_file(), "the first-success wait leaves its timeline"
+
+
+def test_logs_silent_awaits_the_first_success_instead_of_holding(
+    tmp_path: Path,
+) -> None:
+    """Live 2026-10-26 (R13g): the enabled collector never succeeded in the 900 s
+    the variant held blind, so the UNKNOWN it read came from a success five
+    hours old. A channel that never succeeds after the enable is not paused --
+    its silence would not be the pause's -- and the stage says what the
+    product reported: b190's refusal with the failures counting up."""
+
+    spec = SPECS["logs_silent"]
+
+    def refusing(read: int) -> dict[str, Any]:
+        errors = list(LIVE_REFUSAL_ERRORS)
+        if read < 20:
+            errors[-1] = errors[-1].replace(
+                "journalctl-failures=72", "journalctl-failures=22"
+            )
+        return channel_doc(
+            "NODE_LOGS",
+            state="UNKNOWN",
+            reason="STALE_OBSERVATION",
+            success=BASELINE_SUCCESS,
+            error="2026-10-24T00:05:00+00:00",
+            errors=errors,
+        )
+
+    ctx = phased_context(
+        spec,
+        tmp_path,
+        logs_silent_phases(enabled=refusing),
+        approvals=("ENABLE_NODE_LOG_COLLECTOR",),
+    )
+    result = spec.execute(ctx)
+    assert result["verdict"] == "FAIL", result
+    assert list(result["stages"]) == ["first_success"], result["stages"]
+    [error] = result["stages"]["first_success"]
+    assert error.startswith(
+        "NODE_LOGS did not report a new success after the enable within 812 s; "
+        "collector alternates refusals: known product gap b190 "
+        "(journalctl-failures 22->72: 'Please specify only one of --since=, "
+        "--cursor=, and --after-cursor=')"
+    ), error
+    calls = probe_calls(ctx)
+    assert "unit-pause" not in calls, calls
+    assert calls[-1] == "log-collector-disable", calls
+    assert any("was not paused" in note for note in result["notes"]), result["notes"]
+    assert result["first_success"]["journalctl_failures"] == [22, 72], result
+    assert result["first_success"]["latest_status"]["errors"] == LIVE_REFUSAL_ERRORS
+
+
+def test_logs_silent_recovery_names_the_refusal_pattern(tmp_path: Path) -> None:
+    """A resume after which no summary slot lands on a clean poll: still a FAIL,
+    but the stage names the product gap instead of a bare "no new success"."""
+
+    spec = SPECS["logs_silent"]
+    refusing = channel_doc(
+        "NODE_LOGS",
+        state="UNKNOWN",
+        reason="COLLECTION_ERROR",
+        success=FIRST_SUCCESS,
+        error="2026-10-24T00:40:00+00:00",
+        errors=LIVE_REFUSAL_ERRORS,
+    )
+    ctx = phased_context(
+        spec,
+        tmp_path,
+        logs_silent_phases(resumed=refusing),
+        approvals=("ENABLE_NODE_LOG_COLLECTOR",),
+    )
+    result = spec.execute(ctx)
+    assert result["verdict"] == "FAIL", result
+    assert result["stages"]["recovery"] == [
+        "NODE_LOGS did not report a new success after recovery within 812 s; "
+        "collector alternates refusals: known product gap b190 "
+        "(journalctl-failures=72: 'Please specify only one of --since=, "
+        "--cursor=, and --after-cursor=')"
+    ], result["stages"]
+    # The pause itself was judged: UNKNOWN for the silence, the advisory, the cap.
+    assert result["stages"]["unknown"] == [], result["stages"]
+    assert result["stages"]["advisory"] == [], result["stages"]
+    assert result["recovery"]["budget_seconds"] == 812, result["recovery"]
+    assert probe_calls(ctx)[-1] == "log-collector-disable", probe_calls(ctx)
+
+
+def test_recovery_distinguishes_a_success_without_a_healthy_observation(
+    tmp_path: Path,
+) -> None:
+    """The success time advanced but the silence scan never read the channel
+    HEALTHY: a different failure from "no new success", said as such."""
+
+    spec = SPECS["host_silent"]
+    silent = silence_doc("HOST_TELEMETRY")
+    advanced = channel_doc(
+        "HOST_TELEMETRY",
+        state="UNKNOWN",
+        reason="COLLECTION_ERROR",
+        success=RECOVERED_SUCCESS,
+        error="2026-10-24T01:00:30+00:00",
+        errors=["diskstats unreadable"],
+    )
+    ctx = context(spec, tmp_path, [silent, silent, advanced])
+    result = spec.execute(ctx)
+    assert result["verdict"] == "FAIL", result
+    assert result["stages"]["recovery"] == [
+        f"HOST_TELEMETRY reported a new success at {RECOVERED_SUCCESS} after "
+        "recovery but its observation never read HEALTHY within 817 s (latest "
+        "{'state': 'UNKNOWN', 'reason': 'COLLECTION_ERROR'}); the channel's "
+        "latest errors: ['diskstats unreadable']"
+    ], result["stages"]
+
+
+def test_silence_unknown_must_be_the_pauses_stale_observation(tmp_path: Path) -> None:
+    """An UNKNOWN for COLLECTION_ERROR is a failing poll, not the pause: with
+    b190 every other node-log poll fails, so a refused summary slot before the
+    pause would otherwise pass the "unknown" stage 20 s into the SIGSTOP."""
+
+    spec = SPECS["host_silent"]
+    failing = {
+        **silence_doc("HOST_TELEMETRY"),
+        "metric_latest": [observation("HOST_TELEMETRY", "UNKNOWN", "COLLECTION_ERROR")],
+    }
+    ctx = context(
+        spec, tmp_path, [failing, failing, fresh_success_doc("HOST_TELEMETRY")]
+    )
+    result = spec.execute(ctx)
+    assert result["verdict"] == "FAIL", result
+    assert result["stages"]["unknown"] == [
+        "HOST_TELEMETRY observation is UNKNOWN for COLLECTION_ERROR, not the "
+        "pause's STALE_OBSERVATION"
+    ], result["stages"]
+    assert result["stages"]["recovery"] == [], result["stages"]
+
+
+def test_recovery_budget_follows_the_channels_cadence(tmp_path: Path) -> None:
+    """Two posts at their longest (+-5 % phase move), the start-up spread and its
+    random part, one poll, the silence scan and the retry ladder; read from the
+    node's collector environment; never below the 600 s the wait had before."""
+
+    spec = SPECS["host_silent"]
+    ctx = context(spec, tmp_path, silence_doc("HOST_TELEMETRY"))
+    ctx.survey = survey()
+    assert col.recovery_budget(ctx, "NODE_LOGS") == 2 * 330 + 15 + 20 + 10 + 60 + 47
+    assert col.recovery_budget(ctx, "NODE_LOGS") == 812
+    assert (
+        col.recovery_budget(ctx, "HOST_TELEMETRY") == 2 * 330 + 15 + 20 + 15 + 60 + 47
+    )
+    assert col.recovery_budget(ctx, "GPU_METRICS") == 600
+    assert col.recovery_budget(ctx, "GPU_INVENTORY") == 600
+    assert col.recovery_budget(ctx, "NVIDIA_KERNEL") == 600
+    ctx.survey = {
+        **survey(),
+        "collector_env": {
+            **survey()["collector_env"],
+            "GPU_FAULT_NODE_LOG_HEALTH_SUMMARY_SECONDS": "600",
+            "GPU_FAULT_LOG_INTERVAL_SECONDS": "30",
+            "GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS": "120",
+        },
+    }
+    assert col.recovery_budget(ctx, "NODE_LOGS") == 2 * 660 + 15 + 20 + 30 + 60 + 47
+    assert col.recovery_budget(ctx, "HOST_TELEMETRY") == 600, "the floor holds"
+    assert col.STARTUP_JITTER == 20 and col.DELIVERY_LADDER == 47
+    assert col.SILENCE_SCAN == 60 and col.STARTUP_SPREAD == 15
+    assert SPECS["logs_silent"].max_minutes == 50, SPECS["logs_silent"]
+
+
+def test_journal_refusals_read_the_live_status() -> None:
+    refused, failures = col.journal_refusals({"errors": LIVE_REFUSAL_ERRORS})
+    assert (refused, failures) == (True, 72)
+    assert col.journal_refusals({"errors": []}) == (False, None)
+    assert col.journal_refusals(None) == (False, None)
+    assert col.journal_refusals(
+        {"errors": ["cumulative loss since collector start: journalctl-failures=3"]}
+    ) == (False, 3)
 
 
 def test_disabled_unit_and_expired_agent_and_new_success(tmp_path: Path) -> None:
@@ -752,9 +1063,11 @@ def test_silence_recovery_needs_a_success_after_the_resume(tmp_path: Path) -> No
     ctx = context(spec, tmp_path, [silent, silent, unchanged])
     result = spec.execute(ctx)
     assert result["verdict"] == "FAIL", result["errors"]
+    # Two 300 s host summaries at their longest + spread + poll + scan + ladder.
     assert result["stages"]["recovery"] == [
-        "HOST_TELEMETRY did not report a new success after recovery"
+        "HOST_TELEMETRY did not report a new success after recovery within 817 s"
     ], result["stages"]
+    assert result["recovery"]["budget_seconds"] == 817, result["recovery"]
 
 
 def test_silence_accepts_the_hours_deduplicated_advisory(tmp_path: Path) -> None:
@@ -807,15 +1120,8 @@ def test_pause_commands_ship_the_pause_module_once_before_the_first_pause(
     collector enable), never again for the unit pause that follows."""
 
     spec = SPECS["logs_silent"]
-    ctx = context(
-        spec,
-        tmp_path,
-        [
-            silence_doc("NODE_LOGS"),
-            silence_doc("NODE_LOGS"),
-            fresh_success_doc("NODE_LOGS"),
-        ],
-        approvals=("ENABLE_NODE_LOG_COLLECTOR",),
+    ctx = phased_context(
+        spec, tmp_path, logs_silent_phases(), approvals=("ENABLE_NODE_LOG_COLLECTOR",)
     )
     result = spec.execute(ctx)
     assert result["verdict"] == "PASS", result["errors"]

@@ -34,14 +34,40 @@ into ``metrics_silent``). The node probe's pause therefore survives that
 restart, the advisory check names the silent channel (the inventory advisory
 is not the metrics one), the hour's deduplicated advisory counts for a retry
 inside the alert interval, and recovery needs a success *after* the resume.
+
+A new success is not one poll away for every channel. GPU_METRICS posts every
+scrape and GPU_INVENTORY every minute; the host and node-log collectors post
+only on an edge or on their 300 s health summary, and the node log collector's
+summary slot is a success only when that poll read the journal cleanly -- it
+carries the collection errors otherwise, and an error-only batch does not move
+``last_success_at`` (``collectors/logs/node.py`` ``collect_once``). Live
+2026-10-26 (``logs_silent``, plain EKS, release R13g): the enabled collector
+never succeeded in the 900 s the variant held blind before the pause, so the
+UNKNOWN it then read came from a success five hours old, not from the pause;
+after the resume a 600 s wait covered one summary slot and a half and none was
+a success -- the R13g collector passes ``--since`` with ``--after-cursor``,
+systemd refuses every poll that has a cursor, and a slot that lands on a
+refused poll is an error batch (batch b190, ``journalctl-failures=72`` in 1457
+s). The log variant now waits for the first success after the enable instead
+of holding, the pause's UNKNOWN must be the silence's own reason
+(STALE_OBSERVATION, not a refused poll's COLLECTION_ERROR), every recovery
+wait is sized from the channel's cadence (``recovery_budget``), and a wait
+that runs out names the refusal pattern when the channel's status shows it --
+still a FAIL, never a bare one.
 """
 
 from __future__ import annotations
 
+import math
+import re
 from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 
+from gpu_fault.collectors.cadence import (
+    DEFAULT_JITTER_RATIO,
+    DEFAULT_STARTUP_JITTER_SECONDS,
+)
 from scripts.e2e.regional.general_live_common import activity, run_survey
 from scripts.e2e.regional.general_live_fixture import (
     VariantContext,
@@ -109,6 +135,38 @@ SILENCE_SCAN_MARGIN = 120
 #: one ``collector-silent/<cluster>/<node>/<channel>/<bucket>`` advisory per
 #: channel per bucket; a retry inside the bucket finds no new notification.
 SILENT_ALERT_INTERVAL = 3600
+#: The silence's own UNKNOWN (``observation_health.observation_reason``): the
+#: success aged past the threshold. A refused or failed poll reads UNKNOWN too
+#: (COLLECTION_ERROR), but that is not the pause's doing.
+SILENCE_REASONS = frozenset({"STALE_OBSERVATION"})
+#: ``GPU_FAULT_COLLECTOR_STARTUP_SPREAD_SECONDS`` default -- the metrics and host
+#: collectors' deterministic first-post spread -- and the random part every
+#: collector process adds to it (``collectors/cadence.py``). A pause is a
+#: SIGSTOP, not a restart, but the product restarts the paused unit from its
+#: snapshot refresh and the pause drop-in re-stops the new main process: the
+#: resume may start a collector from scratch.
+STARTUP_SPREAD = 15
+STARTUP_JITTER = int(DEFAULT_STARTUP_JITTER_SECONDS)
+#: ``GPU_FAULT_COLLECTOR_SILENCE_SCAN_SECONDS`` default (app/periodic_services.py):
+#: the scan that turns a new success into the HEALTHY observation.
+SILENCE_SCAN = 60
+#: The sink's full retry ladder, 4 x 10 s timeouts + 1 + 2 + 4 s backoff
+#: (``collectors/sinks.py``; ``tests/collectors/test_cadence_jitter.py`` pins it).
+DELIVERY_LADDER = 47
+#: The recovery wait before this batch, kept as the floor: GPU_METRICS posts
+#: every scrape (15 s) and GPU_INVENTORY every 60 s, so two of their intervals
+#: and the spread are far inside it.
+RECOVERY_FLOOR = 600
+#: Batch b190 (not in R13g): ``collectors/logs/node.py`` ``_journal_command``
+#: passes ``--since`` together with ``--after-cursor``, which systemd 252+
+#: refuses with this text. The refusal drops the cursor, the next
+#: ``--since``-only poll succeeds and learns one again, so every other poll
+#: fails for the life of the process (``journalctl-failures`` counting up in
+#: the status) and a summary slot that lands on a refused poll is an error
+#: batch, not a success.
+JOURNAL_REFUSAL = "Please specify only one of --since=, --cursor=, and --after-cursor="
+REFUSAL_GAP = "collector alternates refusals: known product gap b190"
+JOURNAL_FAILURES = re.compile(r"journalctl-failures=(\d+)")
 
 
 # --------------------------------------------------------------------------- #
@@ -404,12 +462,20 @@ def _silence_variant(ctx: VariantContext, variant: str) -> dict[str, Any]:
     channel, unit, threshold = SILENCE_THRESHOLDS[variant]
     survey = run_survey(ctx)
     require_tools(survey, "systemctl")
+    extra: dict[str, Any] = {"channel": channel, "threshold_seconds": threshold}
     if variant == "logs_silent":
         if "ENABLE_NODE_LOG_COLLECTOR" not in ctx.settings.approvals:
             raise VariantNotRun(
                 "NOT_AUTHORIZED",
                 "the node log collector is disabled in production; needs ENABLE_NODE_LOG_COLLECTOR",
             )
+        # The success the channel had before the enable -- hours old from an
+        # earlier run, or none. The pause may only begin once the enabled
+        # collector has advanced it: a channel that never succeeded after the
+        # enable is silent without any pause, and its UNKNOWN proves nothing
+        # about the pause (live 2026-10-26: the 900 s hold ended on a success
+        # five hours old and the UNKNOWN was read 20 s after the SIGSTOP).
+        baseline = _channel_success(ctx, utc_now(), channel)
         enabled = ctx.pause(
             "log-collector-enable",
             "--seconds",
@@ -418,7 +484,27 @@ def _silence_variant(ctx: VariantContext, variant: str) -> dict[str, Any]:
         )
         ctx.cleanup.push("log-collector", lambda: ctx.node("log-collector-disable"))
         ctx.evidence.write("log-collector-enable", enabled)
-        ctx.hold(threshold, name="log-first-success")
+        first = _await_fresh_success(
+            ctx,
+            channel,
+            after=baseline,
+            name="log-first-success",
+            what="after the enable",
+        )
+        ctx.evidence.write("log-first-success", first)
+        extra.update(success_before_enable=baseline, first_success=first)
+        if first["errors"]:
+            ctx.node("log-collector-disable")
+            ctx.cleanup.discard("log-collector")
+            return _result(
+                {"first_success": first["errors"]},
+                notes=[
+                    "the unit was not paused: a channel that never succeeded after "
+                    "the enable is silent without the pause, so UNKNOWN, advisory, "
+                    "snapshot cap and recovery were not judged"
+                ],
+                extra=extra,
+            )
     started = utc_now()
     hold = threshold + SILENCE_SCAN_MARGIN + 300
     paused = ctx.pause("unit-pause", "--unit", unit, "--seconds", str(hold))
@@ -427,7 +513,9 @@ def _silence_variant(ctx: VariantContext, variant: str) -> dict[str, Any]:
     if not paused.get("stopped"):
         raise VariantInconclusive(f"{unit} did not stop under SIGSTOP")
     budget = threshold + SILENCE_SCAN_MARGIN + 180
-    observed = _wait_observation_unknown(ctx, started, channel, budget)
+    observed = _wait_observation_unknown(
+        ctx, started, channel, budget, reasons=SILENCE_REASONS
+    )
     notes: list[str] = []
     advisory = _silent_advisory(observed, channel)
     if advisory:
@@ -439,7 +527,7 @@ def _silence_variant(ctx: VariantContext, variant: str) -> dict[str, Any]:
                 f"deduplicated: {', '.join(deduplicated)}"
             )
     stages = {
-        "unknown": _observation_unknown(observed, channel),
+        "unknown": _observation_unknown(observed, channel, reasons=SILENCE_REASONS),
         "advisory": advisory,
         "snapshot_cap": _one_snapshot_per_hour(observed),
         "hardware": hardware_errors(observed),
@@ -453,15 +541,8 @@ def _silence_variant(ctx: VariantContext, variant: str) -> dict[str, Any]:
     if variant == "logs_silent":
         ctx.node("log-collector-disable")
         ctx.cleanup.discard("log-collector")
-    return _result(
-        stages,
-        notes=notes,
-        extra={
-            "channel": channel,
-            "threshold_seconds": threshold,
-            "success_before_resume": before,
-        },
-    )
+    extra.update(success_before_resume=before, recovery=recovered)
+    return _result(stages, notes=notes, extra=extra)
 
 
 def inventory_silent(ctx: VariantContext) -> dict[str, Any]:
@@ -557,13 +638,20 @@ def new_success(ctx: VariantContext) -> dict[str, Any]:
     if not paused.get("stopped"):
         raise VariantInconclusive(f"{unit} did not stop")
     _wait_observation_unknown(
-        ctx, started, channel, threshold + SILENCE_SCAN_MARGIN + 180
+        ctx,
+        started,
+        channel,
+        threshold + SILENCE_SCAN_MARGIN + 180,
+        reasons=SILENCE_REASONS,
     )
     ctx.node("unit-resume", "--unit", unit)
     ctx.cleanup.discard("pause")
     recovered = _await_fresh_success(ctx, channel, after=before)
     stages = {"recovery": recovered["errors"]}
-    return _result(stages, extra={"channel": channel, "success_before": before})
+    return _result(
+        stages,
+        extra={"channel": channel, "success_before": before, "recovery": recovered},
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -586,16 +674,29 @@ def _observation_metric(
     ]
 
 
-def _observation_unknown(activity_document: dict[str, Any], channel: str) -> list[str]:
+def _observation_unknown(
+    activity_document: dict[str, Any],
+    channel: str,
+    *,
+    reasons: frozenset[str] | None = None,
+) -> list[str]:
+    """The channel's latest observation is UNKNOWN -- with ``reasons``, for one
+    of those reasons: a paused producer's silence is STALE_OBSERVATION, while a
+    collector whose polls fail reads UNKNOWN for COLLECTION_ERROR without any
+    pause (025 reads that one on purpose; 031 must not take it for the pause)."""
+
     records = _observation_metric(activity_document, channel)
     if not records:
         return [f"no collector_observation_valid sample for {channel}"]
     latest = records[-1]
-    if (
-        latest.get("value") != 0
-        or (latest.get("labels") or {}).get("state") != "UNKNOWN"
-    ):
-        return [f"{channel} observation is {latest.get('labels')}, expected UNKNOWN"]
+    labels = latest.get("labels") or {}
+    if latest.get("value") != 0 or labels.get("state") != "UNKNOWN":
+        return [f"{channel} observation is {labels}, expected UNKNOWN"]
+    if reasons is not None and labels.get("reason") not in reasons:
+        return [
+            f"{channel} observation is UNKNOWN for {labels.get('reason')}, not the "
+            f"pause's {'/'.join(sorted(reasons))}"
+        ]
     return []
 
 
@@ -605,14 +706,21 @@ def _observation_state(ctx: VariantContext, since: Any) -> dict[str, Any]:
 
 
 def _wait_observation_unknown(
-    ctx: VariantContext, since: Any, channel: str, budget: int
+    ctx: VariantContext,
+    since: Any,
+    channel: str,
+    budget: int,
+    *,
+    reasons: frozenset[str] | None = None,
 ) -> dict[str, Any]:
     last: dict[str, Any] = {}
 
     def accept() -> dict[str, Any] | None:
         nonlocal last
         last = activity(ctx, since, metrics={"collector_observation_valid"}, kinds=())
-        return last if not _observation_unknown(last, channel) else None
+        return (
+            last if not _observation_unknown(last, channel, reasons=reasons) else None
+        )
 
     value = ctx.wait_until(
         accept,
@@ -692,52 +800,176 @@ def _deduplicated_advisory(
     ]
 
 
-def _channel_success(ctx: VariantContext, since: Any, channel: str) -> str | None:
-    document = activity(ctx, since, metrics=set(), kinds=())
-    for status in document.get("collector_statuses") or []:
+def _channel_status(
+    activity_document: dict[str, Any], channel: str
+) -> dict[str, Any] | None:
+    for status in activity_document.get("collector_statuses") or []:
         if str(status.get("collector")) == channel:
-            return status.get("last_success_at")
+            return status
     return None
 
 
+def _channel_success(ctx: VariantContext, since: Any, channel: str) -> str | None:
+    status = _channel_status(activity(ctx, since, metrics=set(), kinds=()), channel)
+    return status.get("last_success_at") if status else None
+
+
+def recovery_budget(ctx: VariantContext, channel: str) -> int:
+    """How long a resumed (or just enabled) producer may take to a success the
+    harness can read: two of the channel's posts at their longest, the start-up
+    spread and its random part, one poll, the silence scan that writes the
+    HEALTHY observation and the sink's retry ladder -- never below the 600 s
+    the wait had before.
+
+    GPU_METRICS posts every scrape and GPU_INVENTORY every
+    ``GPU_FAULT_GPU_INVENTORY_INTERVAL_SECONDS``; the host and node-log
+    collectors post only on an edge or on their health summary
+    (``GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS`` /
+    ``GPU_FAULT_NODE_LOG_HEALTH_SUMMARY_SECONDS``, +-5 % phase move), and the
+    node log collector's summary slot is a success only when that poll read
+    its window cleanly (``collectors/logs/node.py`` ``collect_once``). Two
+    slots is the least that makes one failed slot survivable; the figures come
+    from the node's collector environment (the survey), not from fixed
+    numbers. Live 2026-10-26 (``logs_silent``, release R13g): 600 s covered one
+    node-log slot and a half.
+    """
+
+    cadences: dict[str, tuple[int, int]] = {
+        "NODE_LOGS": (ctx.log_summary, ctx.log_interval),
+        "HOST_TELEMETRY": (ctx.host_summary, ctx.host_interval),
+        "GPU_METRICS": (ctx.setting("GPU_FAULT_METRICS_INTERVAL_SECONDS", 15),) * 2,
+        "GPU_INVENTORY": (ctx.setting("GPU_FAULT_GPU_INVENTORY_INTERVAL_SECONDS", 60),)
+        * 2,
+    }
+    if channel not in cadences:
+        return RECOVERY_FLOOR
+    cadence, poll = cadences[channel]
+    derived = math.ceil(
+        2 * cadence * (1 + DEFAULT_JITTER_RATIO)
+        + STARTUP_SPREAD
+        + STARTUP_JITTER
+        + poll
+        + SILENCE_SCAN
+        + DELIVERY_LADDER
+    )
+    return max(RECOVERY_FLOOR, derived)
+
+
+def journal_refusals(status: dict[str, Any] | None) -> tuple[bool, int | None]:
+    """Whether the channel's status carries b190's refusal, and the collector's
+    cumulative ``journalctl-failures`` count if it reports one."""
+
+    errors = [str(item) for item in (status or {}).get("errors") or []]
+    joined = " ".join(errors)
+    match = JOURNAL_FAILURES.search(joined)
+    return JOURNAL_REFUSAL in joined, (int(match.group(1)) if match else None)
+
+
+def _no_success_detail(
+    channel: str,
+    budget: int,
+    what: str,
+    *,
+    advanced: str | None,
+    observation: dict[str, Any] | None,
+    status: dict[str, Any] | None,
+    failures: list[int],
+) -> str:
+    """Why the wait ran out, in the product's own words: the success that never
+    came (or came without a HEALTHY observation), b190's refusal pattern when
+    the status shows it, else the channel's latest collection errors."""
+
+    if advanced:
+        labels = (observation or {}).get("labels")
+        detail = (
+            f"{channel} reported a new success at {advanced} {what} but its "
+            f"observation never read HEALTHY within {budget} s (latest {labels})"
+        )
+    else:
+        detail = f"{channel} did not report a new success {what} within {budget} s"
+    refused, _count = journal_refusals(status)
+    if refused:
+        counted = (
+            f"journalctl-failures {failures[0]}->{failures[-1]}"
+            if len(failures) > 1 and failures[0] != failures[-1]
+            else f"journalctl-failures={failures[-1]}"
+            if failures
+            else "journalctl-failures not counted"
+        )
+        return f"{detail}; {REFUSAL_GAP} ({counted}: {JOURNAL_REFUSAL!r})"
+    errors = [str(item) for item in (status or {}).get("errors") or []]
+    if errors:
+        return f"{detail}; the channel's latest errors: {errors[:2]}"
+    return detail
+
+
 def _await_fresh_success(
-    ctx: VariantContext, channel: str, *, after: str | None = None
+    ctx: VariantContext,
+    channel: str,
+    *,
+    after: str | None = None,
+    name: str | None = None,
+    what: str = "after recovery",
 ) -> dict[str, Any]:
+    """A success newer than ``after`` that the silence scan has read as HEALTHY,
+    within ``recovery_budget``. The channel's status is kept from every read:
+    when the wait runs out, the stage says what the product reported instead."""
+
     started = utc_now()
+    budget = recovery_budget(ctx, channel)
+    seen: dict[str, Any] = {"advanced": None, "observation": None, "status": None}
+    failures: list[int] = []
 
     def accept() -> dict[str, Any] | None:
-        document = activity(ctx, started, metrics=set(), kinds=())
-        for status in document.get("collector_statuses") or []:
-            if str(status.get("collector")) != channel:
-                continue
-            success = status.get("last_success_at")
-            if success and (after is None or str(success) > str(after)):
-                observation = _observation_metric(
-                    activity(
-                        ctx, started, metrics={"collector_observation_valid"}, kinds=()
-                    ),
-                    channel,
-                )
-                healthy = (
-                    observation
-                    and (observation[-1].get("labels") or {}).get("state") == "HEALTHY"
-                )
-                return (
-                    {"last_success_at": success, "healthy": bool(healthy)}
-                    if healthy
-                    else None
-                )
-        return None
+        document = activity(
+            ctx, started, metrics={"collector_observation_valid"}, kinds=()
+        )
+        status = _channel_status(document, channel)
+        seen["status"] = status
+        _refused, count = journal_refusals(status)
+        if count is not None and (not failures or failures[-1] != count):
+            failures.append(count)
+        observation = _observation_metric(document, channel)
+        seen["observation"] = observation[-1] if observation else None
+        success = (status or {}).get("last_success_at")
+        if not success or (after is not None and str(success) <= str(after)):
+            return None
+        seen["advanced"] = seen["advanced"] or str(success)
+        labels = (seen["observation"] or {}).get("labels") or {}
+        if labels.get("state") != "HEALTHY":
+            return None
+        return {"last_success_at": success, "healthy": True}
 
     value = ctx.wait_until(
         accept,
-        timeout_seconds=600,
+        timeout_seconds=budget,
         poll_seconds=ctx.host_interval,
-        name=f"{channel}-fresh-success",
+        name=name or f"{channel}-fresh-success",
     )
+    record: dict[str, Any] = {
+        "budget_seconds": budget,
+        "waited_seconds": round((utc_now() - started).total_seconds(), 1),
+        "success_before": after,
+        "journalctl_failures": failures,
+        "latest_status": {
+            key: (seen["status"] or {}).get(key)
+            for key in ("last_success_at", "last_error_at", "errors")
+        }
+        if seen["status"]
+        else None,
+    }
     if value is None:
-        return {"errors": [f"{channel} did not report a new success after recovery"]}
-    return {"errors": [], **value}
+        detail = _no_success_detail(
+            channel,
+            budget,
+            what,
+            advanced=seen["advanced"],
+            observation=seen["observation"],
+            status=seen["status"],
+            failures=failures,
+        )
+        return {"errors": [detail], **record}
+    return {"errors": [], **value, **record}
 
 
 def _cleared_error(ctx: VariantContext, since: Any) -> list[str]:
@@ -852,10 +1084,13 @@ VARIANTS = [
     _spec(
         CASE_031,
         "logs_silent",
-        "enable and start the node log collector, then pause it (900 s)",
-        "UNKNOWN + silent advisory after the approved log channel first succeeds",
+        "enable and start the node log collector, wait for its first success, then pause it (900 s)",
+        "a first success after the enable, UNKNOWN (STALE_OBSERVATION) + silent advisory under the pause, a new success within two health summaries of the resume",
         logs_silent,
-        max_minutes=25,
+        # First success (two 300 s summaries + spread), the 900 s silence with
+        # its scan margin, the recovery (two summaries again) and the probe
+        # round trips: ~50 minutes at the defaults.
+        max_minutes=50,
         approvals=("ENABLE_NODE_LOG_COLLECTOR",),
     ),
     _spec(

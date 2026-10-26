@@ -1011,6 +1011,29 @@ product code and leaves the collector unit's own sandbox
 (`ProtectSystem=strict`, `PrivateTmp=true`) untouched. Only the storage probe
 asks for propagation; every read-only probe keeps its Pod-private default.
 
+The 031 silence variants judge recovery on the product's own success signal,
+which is not one poll away for every channel: GPU_METRICS posts every scrape
+and GPU_INVENTORY every minute, while the host and node-log collectors post
+only on an edge or on their 300 s health summary, and the node log collector's
+summary slot counts as a success only when that poll read the journal cleanly
+(an error-only batch does not move `last_success_at`). On 2026-10-26 (plain
+EKS, release R13g) `logs_silent` held 900 s blind after enabling the collector,
+read an UNKNOWN that came from a success five hours old, and then waited 600 s
+-- one summary slot and a half -- for a success that never came, because the
+R13g collector passes `--since` together with `--after-cursor`, systemd refuses
+every poll that holds a cursor and every other poll fails for the life of the
+process (`journalctl-failures=72` in 1457 s; batch b190, shipped in R13h). The
+variant now waits for the first success after the enable and does not pause a
+channel that never succeeded, accepts only the silence's own
+`STALE_OBSERVATION` as the pause's UNKNOWN, sizes every recovery wait from the
+node's collector environment (two posts at their longest plus start-up spread,
+poll, silence scan and retry ladder; 812 s for NODE_LOGS, 817 s for
+HOST_TELEMETRY, the former 600 s as the floor), and names b190's refusal
+pattern in the stage text when the channel's status shows it. That is still a
+FAIL: on R13g a resumed node log collector reports a fresh success only when a
+summary slot happens to land on a clean poll, so reruns of `logs_silent` on
+either cluster may fail with that text until R13h is live.
+
 The 006 disk-I/O variants use the same probe for a loop + device-mapper test
 device (`dm-N`, the name `/proc/diskstats` and the product report) and a
 `systemd-run` O_DIRECT writer, but mount visibility was not their blocker. On

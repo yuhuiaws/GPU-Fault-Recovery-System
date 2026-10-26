@@ -975,6 +975,32 @@ FRESH_SUCCESS）。因此暂停必须跨越产品自身的重启；静默通知�
 metrics 通道的），同一告警小时内重试时接受该小时已发送、被去重的同通道通知并记入
 notes；恢复判定以恢复前的成功时间为基线，要求之后出现新的成功时间。
 
+"新成功"并非每个通道都在一次轮询之内：GPU_METRICS 每次抓取（15 秒）都投递，
+GPU_INVENTORY 每 60 秒投递；host 与节点日志采集器只在边沿（信号变化、匹配规则的日志
+行）或 300 秒健康摘要时投递，而节点日志采集器的摘要时隙只有该轮询干净读完 journal
+窗口才是成功——否则该时隙带着 collection errors 投递，纯错误批不推进
+`last_success_at`（`collectors/logs/node.py` `collect_once`）。实测 2026-10-26
+（`logs_silent`，plain EKS，R13g）：启用后盲等 900 秒期间采集器从未成功，暂停后 20 秒读到的
+UNKNOWN 来自五小时前的成功而非暂停；恢复后 600 秒只覆盖一个半摘要时隙且无一成功——R13g
+的采集器把 `--since` 与 `--after-cursor` 同时传给 journalctl，systemd 252+ 拒绝每个带
+cursor 的轮询，拒绝使 cursor 丢失、下一次仅 `--since` 的轮询成功并再学到 cursor，于是每隔
+一次轮询失败一次（1457 秒内 `journalctl-failures=72`，10 秒轮询），落在被拒轮询上的摘要时隙
+就是错误批（b190，R13h 修复）。因此 `logs_silent` 不再盲等：以启用前的成功时间为基线等待
+启用后的首次成功（`log-first-success`），没有首次成功就不暂停（启用后从未成功的通道本来就
+静默，其 UNKNOWN 证明不了暂停），以 `first_success` 阶段 FAIL；暂停后的 UNKNOWN 必须是静默
+自己的原因 `STALE_OBSERVATION`（被拒轮询的 `COLLECTION_ERROR` 不算暂停的结果，025 读的才是
+它）；每个恢复/首次成功等待按通道节奏定预算（`recovery_budget`：两次投递取最长
+（±5 % 相位移动）+ 启动 spread 15 秒 + 随机启动 20 秒 + 一次轮询 + 静默扫描 60 秒 + 重试梯
+47 秒，不低于原来的 600 秒；默认环境下 NODE_LOGS 812 秒、HOST_TELEMETRY 817 秒，
+GPU_METRICS/GPU_INVENTORY 仍为 600 秒；探针 survey 现把
+`GPU_FAULT_LOG_INTERVAL_SECONDS`/`GPU_FAULT_NODE_LOG_HEALTH_SUMMARY_SECONDS` 带回）；预算
+用尽时阶段文字写明产品自己的说法——通道状态带有 b190 的拒绝文本时写
+"collector alternates refusals: known product gap b190（journalctl-failures 计数）"，成功
+时间推进而扫描始终未读到 HEALTHY 时写明这一区别，其余写该通道最新的 collection errors——
+仍是 FAIL，不是裸 FAIL。`logs_silent` 的 `max_minutes` 相应为 50。R13g 上的结论：节点日志
+采集器在恢复后确有可能上报新成功（摘要时隙恰落在干净轮询上，约每两个时隙一次），但不保证；
+两集群重跑前应知道这是 b190 的已知缺口，R13h 之前每次重跑都可能以该文字 FAIL。
+
 ### GF-GENERAL-LIVE-032
 
 必测：`unknown_xid`、`unknown_product`、`missing_topology`、`missing_version`、
