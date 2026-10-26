@@ -14,10 +14,13 @@ product's real correlation and de-duplication, not just a rule name:
   MULTI_GPU_NVLINK_FABRIC_FAILURE (diagnostic);
 * ``fresh_components`` -- a composite forms from components activated this batch;
 * ``reused_components`` -- holding the same components does not re-mint it;
-* ``wrong_scope_source`` -- components on different GPUs do not compose; the
+* ``wrong_scope_source`` -- components on different GPUs do not compose,
+  judged on the product's records (incidents and findings per GPU); the
   repair GPU's own pending-repair finding may run the product's authorized
   single-GPU service-window reset (``GPU_RESET`` approval, hardware judged per
-  incident) and settles RECOVERED by itself;
+  incident) and must settle RECOVERED by itself, so the pair is served for one
+  correlation window only and the plan returns to the real readings before
+  the reset is validated (``window_reads``);
 * ``independent_xid`` -- a trusted kernel XID on the GPU of a weak composite
   keeps its own catalog decision and incident; the composite never covers it
   (``general_live_kernel_xid``: XID 92 EXCESSIVE_SBE_INTERRUPTS, catalog
@@ -67,6 +70,7 @@ from scripts.e2e.regional.general_live_gpu_replay import (
     utc_now,
     wait_gpu_incident,
 )
+from scripts.e2e.regional.general_live_gpu_replay_close import wait_served_or_records
 from scripts.e2e.regional.general_live_gpu_verdicts import (
     GpuChain,
     chain_errors,
@@ -132,13 +136,39 @@ REPAIR_COMPANIONS = ("row_remap_pending", "retired_pages_pending")
 #: did, every step SUCCEEDED and the incident RECOVERED by itself, while the
 #: variant's unscoped hardware oracle failed on the plan although no cross-GPU
 #: composite had formed. The variant therefore declares ``GPU_RESET`` like 019
-#: ``pending_supported`` and judges hardware per incident.
+#: ``pending_supported`` and judges hardware per incident. The chain's
+#: post-reset VALIDATE_GPU re-grades the fresh readings: a plan still holding
+#: ``row_remap_pending=1`` fails it and the product escalates QUARANTINE ->
+#: RESTART_NODE (live 2026-10-26 14:54-15:06Z, HyperPod, R13g: the quiesce had
+#: stopped kubelet and with it the probe that would have closed the replay),
+#: so the plan is bounded (``window_reads``) and never relies on the runner.
 SERVICE_WINDOW_RESET = frozenset({"QUIESCE_GPU_SERVICES", "RESET_GPU"})
 KERNEL_SOURCE_REPLAY = "KERNEL_SOURCE_REPLAY"
+#: The product correlates component findings into a composite within this
+#: window (``gpu_metrics.GpuMetricThresholds.correlation_window_seconds``,
+#: default 45): a pair served for one whole window that did not compose never
+#: will, so a scoping plan serves its pair that long and no longer.
+COMPOSITE_WINDOW_SECONDS = 45
 
 
 def _hold(ctx: VariantContext) -> int:
     return min(ctx.spec.max_minutes * 60, 20 * 60)
+
+
+def window_reads(interval: int, seconds: int = COMPOSITE_WINDOW_SECONDS) -> int:
+    """The collector reads that cover ``seconds`` at ``interval`` s each (at
+    least two), the bound of a plan step that must end by itself.
+
+    The reset chain a replayed pending-repair flag starts quiesces the node
+    about 20 s after the mint and completes RESET_GPU 70-90 s after it (live
+    2026-10-26, both clusters); a bounded step of one correlation window
+    (three reads of a 15-s collector) has the tool back on the real readings
+    before the post-reset VALIDATE_GPU reads them, whether or not the runner
+    can still reach the node, and the product's own grading happens on the
+    first replayed scrape (both incidents 4 s after it, live).
+    """
+
+    return max(2, -(-int(seconds) // max(1, int(interval))))
 
 
 def composite_replay(
@@ -169,7 +199,7 @@ def composite_replay(
         raise VariantNotRun(
             "CAPABILITY_ABSENT", "the node does not report " + ", ".join(missing)
         )
-    return DcgmReplay(ctx, document, _hold(ctx))
+    return DcgmReplay(ctx, document, _hold(ctx), node_boot_id=survey.boot_id)
 
 
 def _correctable_replay(
@@ -441,17 +471,82 @@ def repair_settled_errors(
     return errors
 
 
+def scoping_errors(
+    activity: dict[str, Any],
+    state: dict[str, Any],
+    *,
+    error_gpu: str,
+    repair_gpu: str,
+    companion: str,
+) -> list[str]:
+    """The two replayed findings stayed per-GPU records.
+
+    Judged on the product's own records after the pair was served for a whole
+    correlation window: no GPU_MEMORY_DEGRADATION finding was recorded for
+    either GPU (the finding store, not only the incidents), the error GPU's
+    uncorrectable finding minted its own incident, and neither GPU carries an
+    incident of the reading the other one replayed.
+    """
+
+    errors = [
+        f"{MEMORY_RULE} finding {finding.get('finding_id')} formed on "
+        f"{finding.get('gpu_uuid') or 'an unnamed GPU'} from "
+        f"{sorted(str(name) for name in finding.get('component_metrics') or [])}"
+        for finding in composite_findings(state, MEMORY_RULE)
+    ]
+    if not metric_incidents(activity, UNCORRECTABLE_PRIMARY, gpu=error_gpu):
+        errors.append(
+            f"the replayed {UNCORRECTABLE_PRIMARY} on {error_gpu} minted no incident "
+            "of its own"
+        )
+    for name, gpu in ((UNCORRECTABLE_PRIMARY, repair_gpu), (companion, error_gpu)):
+        errors.extend(
+            f"{name} minted incident {item.get('incident_id')} on {gpu}, which did "
+            "not replay it"
+            for item in metric_incidents(activity, name, gpu=gpu)
+        )
+    return errors
+
+
+def _minted(
+    activity: dict[str, Any], error_gpu: str, repair_gpu: str, companion: str
+) -> bool:
+    """The product recorded the replayed pair: either GPU's own incident or a
+    (wrong) composite -- the oracle gate's stand-in when the journal is away."""
+
+    return bool(
+        composite_incidents(activity, MEMORY_RULE)
+        or _any_incident(activity, error_gpu)
+        or metric_incidents(activity, companion, gpu=repair_gpu)
+    )
+
+
 def wrong_scope_source(ctx: VariantContext) -> dict[str, Any]:
     """An error on one GPU and pending repair on another do not compose.
 
-    The two findings stay separate per-GPU incidents: the error GPU's
-    CRITICAL isolation (QUARANTINE, no hardware operation) and the repair
-    GPU's own pending-repair finding, which on a modern GPU is the product's
-    authorized single-GPU service-window RESET_GPU chain (``GPU_RESET``
-    approval, like 019 ``pending_supported``) and ends RECOVERED by itself
-    after RESTORE_SCHEDULING. The hardware oracle is scoped per incident, the
-    repair incident is left to settle on its own, and only the error GPU's
-    incident is released by the validated restore.
+    The subject is composite scoping, judged on the product's records: the two
+    findings stay separate per-GPU incidents -- the error GPU's CRITICAL
+    isolation (QUARANTINE, no hardware operation) and the repair GPU's own
+    pending-repair finding -- and no GPU_MEMORY_DEGRADATION finding or
+    incident spans the two GPUs (``scoping_errors``). On a modern GPU that
+    repair finding is the product's authorized single-GPU service-window
+    RESET_GPU chain (``GPU_RESET`` approval, like 019 ``pending_supported``):
+    the chain is the product's policy, not this variant's subject, and the
+    variant's duty is to let it end RECOVERED. The pair is therefore served for
+    one correlation window (``window_reads``) and the plan returns to the real
+    readings by itself -- as a reset applies a pending remap -- so the chain's
+    post-reset VALIDATE_GPU grades the real device whether or not the runner
+    still reaches the node. Live 2026-10-26 14:54-15:06Z (HyperPod, R13g) the
+    held plan was still serving ``row_remap_pending=1`` after the reset -- the
+    quiesce had stopped kubelet and with it the probe that would have closed
+    the replay -- and the product escalated QUARANTINE -> RESTART_NODE, its
+    documented policy for a remap a reset did not clear. The same quiesce
+    takes the journal away before the oracle gate can read it, so the gate
+    falls back to the records (``wait_served_or_records``) and the journal is
+    read at the close, which itself waits for the node to return. The hardware
+    oracle is scoped per incident, the repair incident is left to settle on
+    its own, and only the error GPU's incident is released by the validated
+    restore.
     """
 
     survey = run_gpu_survey(ctx)
@@ -466,19 +561,30 @@ def wrong_scope_source(ctx: VariantContext) -> dict[str, Any]:
         UNCORRECTABLE_PRIMARY, REPAIR_COMPANIONS, avoid=[error_gpu]
     )
     repair_gpu = repair.gpu
+    reads = window_reads(survey.interval)
     since = utc_now()
+    # Bounded, never held: after ``reads`` scrapes the tool serves the real
+    # readings again on its own (the pending flag as a reset leaves it).
     repl = composite_replay(
         ctx,
         survey,
         step(
-            60,
+            reads,
             add(UNCORRECTABLE_PRIMARY, [error_gpu]),
             put(repair.companion, [repair_gpu], 1),
-            hold=True,
         ),
     )
-    arm_and_confirm(repl, f"{error_gpu}/{UNCORRECTABLE_PRIMARY}")
-    detection = wait_gpu_incident(
+    repl.deploy()
+    repl.arm()
+    gate = wait_served_or_records(
+        repl,
+        [f"{error_gpu}/{UNCORRECTABLE_PRIMARY}"],
+        records_show=lambda: _minted(
+            activity_now(ctx, since), error_gpu, repair_gpu, repair.companion
+        ),
+        label="wrong_scope_source",
+    )
+    wait_gpu_incident(
         ctx,
         since,
         lambda doc: composite_incidents(doc, MEMORY_RULE)
@@ -486,17 +592,30 @@ def wrong_scope_source(ctx: VariantContext) -> dict[str, Any]:
         timeout_seconds=survey.health_summary + 300,
         name="detection",
     )
+    # The scoping is judged once the pair has been served for the whole
+    # correlation window: a composite that did not form within it never forms.
+    ctx.hold(COMPOSITE_WINDOW_SECONDS, name="composite-window")
+    final = activity_now(ctx, since)
+    state = state_now(ctx, since, names=[UNCORRECTABLE_PRIMARY, repair.companion])
     stages = {
         "no_cross_gpu_composite": []
-        if not composite_incidents(detection, MEMORY_RULE)
+        if not composite_incidents(final, MEMORY_RULE)
         else ["an error on one GPU composed with repair on another GPU"],
+        "scoped_incidents": scoping_errors(
+            final,
+            state,
+            error_gpu=error_gpu,
+            repair_gpu=repair_gpu,
+            companion=repair.companion,
+        ),
     }
+    # The plan has run out by itself; the close restores the collector (and,
+    # on a node the chain quiesced or rebooted, waits for it to come back).
     repl.close()
     ctx.cleanup.discard("dcgm-replay")
-    # The repair GPU's own incident runs its chain on the real (clean) reading
-    # once the replay is closed; it is given the service-window reset's time to
-    # settle, and the hardware oracle reads the record after that.
-    final = detection
+    # The repair GPU's own incident runs its chain on the real (clean) reading;
+    # it is given the service-window reset's time to settle, and the hardware
+    # oracle reads the record after that.
     repair_incidents = metric_incidents(final, repair.companion, gpu=repair_gpu)
     if not repair_incidents:
         final = wait_gpu_incident(
@@ -521,7 +640,7 @@ def wrong_scope_source(ctx: VariantContext) -> dict[str, Any]:
     stages["repair_settled"] = repair_settled_errors(
         final, repair_incidents, gpu=repair_gpu, component=repair.companion
     )
-    stages["recovery"] = _validated_restore(ctx, _any_incident(detection, error_gpu))
+    stages["recovery"] = _validated_restore(ctx, _any_incident(final, error_gpu))
     metrics = ", ".join(repair.exporter_metrics) or "exporter name not surveyed"
     return result(
         stages,
@@ -529,6 +648,9 @@ def wrong_scope_source(ctx: VariantContext) -> dict[str, Any]:
             "GPU_MEMORY_DEGRADATION is per-GPU; components on different GPUs do not compose",
             f"repair gauge exercised: {repair.companion} on {repair_gpu} (exporter "
             f"{metrics}) beside {UNCORRECTABLE_PRIMARY} on {error_gpu}",
+            f"the pair was served for {reads} scrapes (one {COMPOSITE_WINDOW_SECONDS}-s "
+            "correlation window) and the plan returned to the real readings by "
+            "itself, so the reset chain's VALIDATE_GPU graded the real device",
             "the repair GPU's own incident may run the authorized single-GPU "
             "service-window reset chain and settles RECOVERED by itself; only the "
             "error GPU's incident is released by the validated restore",
@@ -539,6 +661,8 @@ def wrong_scope_source(ctx: VariantContext) -> dict[str, Any]:
             "component_metrics": [UNCORRECTABLE_PRIMARY, repair.companion],
             "second_component": repair.companion,
             "exporter_metrics": list(repair.exporter_metrics),
+            "fault_reads": reads,
+            "oracle_gate": gate,
             "repair_incidents": [
                 str(item.get("incident_id")) for item in repair_incidents
             ],
@@ -712,12 +836,15 @@ VARIANTS = [
     gpu_spec(
         CASE,
         "wrong_scope_source",
-        f"an error on one GPU, repair on another ({REPAIR_PAIR_TEXT}); the repair "
+        f"an error on one GPU, repair on another ({REPAIR_PAIR_TEXT}), served for "
+        "one 45-s correlation window and then the real readings again; the repair "
         "GPU's own pending-repair finding runs the product's authorized single-GPU "
         "service-window RESET_GPU chain",
-        "components on different GPUs do not compose; the error GPU's isolation "
-        "plans no hardware operation; the repair GPU's reset chain settles RECOVERED "
-        "by itself (no NVSwitch reset, no reboot)",
+        "components on different GPUs do not compose (per-GPU incidents and "
+        "findings on the records); the error GPU's isolation plans no hardware "
+        "operation; the repair GPU's reset chain validates the real post-reset "
+        "device and settles RECOVERED by itself (no NVSwitch reset, no "
+        "RESTART_NODE escalation, no reboot)",
         wrong_scope_source,
         risk="H",
         flags="X",

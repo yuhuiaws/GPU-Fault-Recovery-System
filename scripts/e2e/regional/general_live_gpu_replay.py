@@ -32,7 +32,11 @@ already elapsed (or never armed) are reclaimed first, through the probe's
 fixture's. At the end, ``DcgmReplay.close`` runs the probe's ``close-run``
 whatever state the run reached -- a repoint that raised after it wrote its
 drop-in is undone like a finished run -- and names every object the probe
-still finds in the error that fails the variant.
+still finds in the error that fails the variant. A probe the product took away
+(a HyperPod quiesce stops kubelet; a RESTART_NODE reboots the node) does not
+end the close unproven: ``general_live_gpu_replay_close`` waits for the node
+inside the variant's budget, retries, and judges a rebooted node clean by its
+boot id -- its ``/run`` objects cannot have survived the boot.
 
 Nothing here decides a verdict and nothing posts a finding or workflow; the
 category modules judge the product's own records (``general_live_gpu_store``)
@@ -57,10 +61,16 @@ from scripts.e2e.regional.general_live_fixture import (
     utc_now,
 )
 from scripts.e2e.regional.general_live_common import activity as node_activity
+from scripts.e2e.regional.general_live_gpu_replay_close import (
+    close_after_probe_loss,
+    node_boot_id,
+    unreachable_detail,
+)
 from scripts.e2e.regional.general_live_gpu_store import gpu_state
 from scripts.e2e.regional.general_live_gpu_verdicts import node_hardware_errors
 from scripts.e2e.regional.general_live_registry import LIVE_REPLAY, VariantSpec
 from scripts.e2e.regional.general_live_verdicts import verdict
+from scripts.e2e.regional.host_probe_fixture import HostProbeError
 from scripts.e2e.regional.probes.general_live_dcgm_probe import PROFILE_NAME
 from tools.gpu_dcgm_field_replay import ABSENT_WHEN_HEALTHY, MAX_READS_PER_STEP
 from tools.gpu_dcgm_field_replay import PROFILES as FIELD_PROFILES
@@ -777,6 +787,10 @@ class DcgmReplay:
     inventory_plan: dict[str, Any] | None = None
     boot_id: str = ""
     unknown_expected_count: bool = False
+    #: The node's real boot id when the replay was deployed (the survey's, or
+    #: the Node object's at ``serve``): a different one at the close means the
+    #: node rebooted and its ``/run`` objects went with the boot.
+    node_boot_id: str = ""
     #: The repointed collector's scrape interval; ``deploy`` reads the real one.
     interval: int = DEFAULT_INTERVAL_SECONDS
     audit_offset: int = 0
@@ -827,6 +841,8 @@ class DcgmReplay:
         """
 
         self.ctx.cleanup.push("dcgm-replay", self.close)
+        if not self.node_boot_id:
+            self.node_boot_id = node_boot_id(self.ctx)
         self._install("gpu_dcgm_field_replay.py", FIELD_TOOL)
         self._install_json("plan.json", self.plan)
         if self.inventory_plan is not None:
@@ -1123,18 +1139,39 @@ class DcgmReplay:
         flag unset. The journals are read first (the run directory goes with
         the stop), and every object the probe still finds is named in the
         ``ReplayCleanupError`` that fails the variant.
+
+        A probe call the node cannot answer (``HostProbeError``: kubelet
+        stopped by a HyperPod quiesce, a node mid-reboot, a Pod the reboot
+        terminated) is handed to ``close_after_probe_loss``: the node is
+        waited for inside the variant's budget and ``close-run`` retried with
+        the journals read first, and a node whose boot id changed since the
+        deploy closes the run by its reboot. Only a node that never came back
+        without rebooting leaves the close unproven.
         """
 
         receipts: dict[str, Any] = {}
-        journals: list[tuple[str, Callable[[], Any]]] = [("audit", self.audit)]
-        if self.inventory_wrapper:
-            journals.append(("inventory_audit", self.inventory_audit))
-        for name, read in journals:
-            try:
-                read()
-            except Exception as exc:  # noqa: BLE001 - recorded; the close still runs
-                receipts[f"{name}_error"] = f"{type(exc).__name__}: {exc}"
-        closed = self.ctx.dcgm("close-run", "--port", str(PORT), timeout=300)
+        try:
+            closed = self._close_run(receipts)
+        except HostProbeError as error:
+            judged = close_after_probe_loss(
+                self.ctx,
+                error,
+                run_close=lambda: self._close_run(receipts),
+                node_boot_id=self.node_boot_id,
+                receipts=receipts,
+            )
+            if judged is None:
+                self.ctx.evidence.write("dcgm-replay-close", receipts)
+                raise ReplayCleanupError(
+                    cleanup_message(
+                        self.ctx.settings.node,
+                        [],
+                        [f"close-run: {type(error).__name__}: {error}"],
+                    )
+                    + " -- "
+                    + unreachable_detail(receipts.get("close_after_probe_loss") or [])
+                ) from error
+            closed = judged
         self.armed = False
         self.repointed = False
         receipts["close"] = closed
@@ -1149,6 +1186,21 @@ class DcgmReplay:
                 cleanup_message(self.ctx.settings.node, leftover, errors)
             )
         return receipts
+
+    def _close_run(self, receipts: dict[str, Any]) -> dict[str, Any]:
+        """Read the journals (errors recorded, never raised), then ``close-run``."""
+
+        journals: list[tuple[str, Callable[[], Any]]] = [("audit", self.audit)]
+        if self.inventory_wrapper:
+            journals.append(("inventory_audit", self.inventory_audit))
+        for name, read in journals:
+            try:
+                read()
+            except Exception as exc:  # noqa: BLE001 - recorded; the close still runs
+                receipts[f"{name}_error"] = f"{type(exc).__name__}: {exc}"
+            else:
+                receipts.pop(f"{name}_error", None)
+        return self.ctx.dcgm("close-run", "--port", str(PORT), timeout=300)
 
 
 def cleanup_message(node: str, leftover: Sequence[str], errors: Sequence[str]) -> str:

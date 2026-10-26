@@ -12,6 +12,7 @@ import pytest
 from scripts.e2e.regional import general_live_gpu_composite as comp
 from scripts.e2e.regional.general_live_fixture import VariantNotRun
 from scripts.e2e.regional.general_live_gpu_replay import GpuSurvey, add, step
+from scripts.e2e.regional.host_probe_fixture import HostProbeMissingResponseError
 from tests.regional._general_live_fakes import (
     FakeProbe,
     FakeRegional,
@@ -57,9 +58,16 @@ RESET_CHAIN = (
 )
 
 
-def _ctx(tmp_path: Path, variant: str, *, probe: Any, cpu: Any):
+def _ctx(
+    tmp_path: Path,
+    variant: str,
+    *,
+    probe: Any,
+    cpu: Any,
+    node: dict[str, Any] | None = None,
+):
     spec = SPECS[variant]
-    regional = FakeRegional(cpu_python=cpu)
+    regional = FakeRegional(cpu_python=cpu, node_snapshot=node)
     settings = make_settings(spec, node=regional.node_snapshot("")["name"])
     ctx = make_context(
         spec, tmp_path=tmp_path, regional=regional, probes={}, settings=settings
@@ -159,6 +167,11 @@ def test_registry_covers_024() -> None:
         "the GPU_RESET token names the replayed reading"
     )
     assert "RESET_GPU" in spec.injection and "RECOVERED by itself" in spec.expected
+    # The plan is bounded to one correlation window and the chain must end in
+    # RECOVERED, never in the RESTART_NODE escalation a held flag provoked live.
+    assert "correlation window" in spec.injection
+    assert "no RESTART_NODE escalation" in spec.expected
+    assert "on the records" in spec.expected
     for variant in ("corrected_memory", "fresh_components", "reused_components"):
         text = SPECS[variant].injection
         assert "retired-page counter on pre-Hopper" in text, variant
@@ -631,7 +644,14 @@ def _error_incident(
 
 
 def _wrong_scope(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, incidents: list, workflows: list
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    incidents: list,
+    workflows: list,
+    *,
+    gpu_state: dict[str, Any] | None = None,
+    probe: FakeProbe | None = None,
+    node: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     restored: list[list[str]] = []
     monkeypatch.setattr(
@@ -640,21 +660,49 @@ def _wrong_scope(
         lambda ctx, items: restored.append([str(i["incident_id"]) for i in items])
         or [],
     )
-    out = comp.wrong_scope_source(
-        _ctx(
-            tmp_path,
-            "wrong_scope_source",
-            probe=dcgm_probe(
-                audit=audit_records({f"{G0}/ecc_dbe_volatile_total": 1.0})
-            ),
-            cpu=gpu_cpu_python(
-                activity=_activity(incidents, workflows),
-                gpu_state={"active_findings": []},
-            ),
-        )
+    probe = probe or dcgm_probe(
+        audit=audit_records({f"{G0}/ecc_dbe_volatile_total": 1.0})
     )
+    ctx = _ctx(
+        tmp_path,
+        "wrong_scope_source",
+        probe=probe,
+        cpu=gpu_cpu_python(
+            activity=_activity(incidents, workflows),
+            gpu_state=gpu_state or {"active_findings": []},
+        ),
+        node=node,
+    )
+    out = comp.wrong_scope_source(ctx)
     out["_restored"] = restored
+    out["_probe"] = probe
+    out["_ctx"] = ctx
     return out
+
+
+def _exposition(dbe: float = 0, pending: float = 0) -> bytes:
+    """A two-GPU scrape of the two replayed fields, in the exporter's format."""
+
+    lines = []
+    for index, uuid in ((0, G0), (1, G1)):
+        labels = (
+            f'gpu="{index}",UUID="{uuid}",pci_bus_id="00000000:{index + 1:02d}:00.0",'
+            'modelName="NVIDIA H200"'
+        )
+        lines.append(f"DCGM_FI_DEV_ECC_DBE_VOL_TOTAL{{{labels}}} {dbe}")
+        lines.append(f"DCGM_FI_DEV_ROW_REMAP_PENDING{{{labels}}} {pending}")
+    return ("\n".join(lines) + "\n").encode()
+
+
+def _view(body: bytes) -> dict[tuple[str, str], float]:
+    """What the product's own DCGM parser reads from a served scrape."""
+
+    from gpu_fault.collectors.gpu.dcgm import parse_dcgm_samples
+
+    return {
+        (sample.gpu_uuid, sample.canonical_name): sample.value
+        for sample in parse_dcgm_samples(body.decode())
+    }
 
 
 def test_wrong_scope_source_passes_when_no_composite(
@@ -666,6 +714,7 @@ def test_wrong_scope_source_passes_when_no_composite(
     assert out["verdict"] == "PASS", out["errors"]
     assert set(out["stages"]) == {
         "no_cross_gpu_composite",
+        "scoped_incidents",
         "hardware",
         "repair_settled",
         "recovery",
@@ -677,6 +726,239 @@ def test_wrong_scope_source_passes_when_no_composite(
     assert out["_restored"] == [["inc"]], "only the error GPU's incident is restored"
     assert any("settles RECOVERED by itself" in note for note in out["notes"]), out[
         "notes"
+    ]
+    # The fault pair is served for one correlation window (three reads of the
+    # 15-s collector) in a bounded step -- never held -- and nothing advances.
+    assert (out["fault_reads"], out["oracle_gate"]) == (3, "journal")
+    document = _installed_plan(out["_probe"])
+    assert [
+        (item["reads"], item.get("until_advance", False)) for item in document["steps"]
+    ] == [(3, False), (3, False)]
+    assert "advance" not in [call[0] for call in out["_probe"].calls]
+    assert any("returned to the real readings by itself" in n for n in out["notes"]), (
+        out["notes"]
+    )
+
+
+def test_window_reads_cover_one_correlation_window_at_the_collector_interval() -> None:
+    assert comp.COMPOSITE_WINDOW_SECONDS == 45
+    assert comp.window_reads(15) == 3
+    assert comp.window_reads(10) == 5
+    assert comp.window_reads(30) == 2
+    assert comp.window_reads(60) == 2, "at least two reads, one spare for a skip"
+
+
+def test_wrong_scope_source_plan_returns_to_the_real_readings_by_itself(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The installed plan, run through the field tool over a real-shaped
+    scrape: three pass-through reads, three reads of the pair, then the real
+    readings for good -- what the reset chain's post-reset VALIDATE_GPU reads
+    (live 2026-10-26 14:54Z the held plan still said row_remap_pending=1 there
+    and the product escalated to RESTART_NODE)."""
+
+    from tools import gpu_dcgm_field_replay as tool
+
+    error, isolation = _error_incident()
+    repair, chain = _repair_incident()
+    out = _wrong_scope(tmp_path, monkeypatch, [error, repair], [isolation, chain])
+    replay = tool.Replay(tool.validate_plan(_installed_plan(out["_probe"])), 600)
+    replay.arm()
+    body = _exposition()
+    served = []
+    for _ in range(8):
+        output, receipt = replay.render(body)
+        replay.reads += 1
+        view = _view(output)
+        served.append(
+            (
+                output == body,
+                view[(G0, "ecc_dbe_volatile_total")],
+                view[(G1, "row_remap_pending")],
+                receipt.get("step"),
+            )
+        )
+    assert [item[1:] for item in served] == [
+        (0.0, 0.0, 0),
+        (0.0, 0.0, 0),
+        (0.0, 0.0, 0),
+        (1.0, 1.0, 1),
+        (2.0, 1.0, 1),
+        (3.0, 1.0, 1),
+        (0.0, 0.0, None),
+        (0.0, 0.0, None),
+    ]
+    assert [item[0] for item in served[6:]] == [True, True], (
+        "after the plan the scrape is the exporter's own, byte for byte"
+    )
+    assert replay.active() is None and not replay.disarmed
+    with pytest.raises(ValueError, match="not on a step"):
+        replay.advance()
+
+
+def _quiesced_probe(
+    records: list[dict[str, Any]], *, node: dict[str, bool]
+) -> tuple[FakeProbe, dict[str, int]]:
+    """A probe whose node stops answering while ``node["down"]``: the audit
+    read fails, and the first ``close-run`` fails and brings the node back
+    (the chain's RESTORE_GPU_SERVICES restarted kubelet before the next poll)."""
+
+    closes = {"count": 0}
+
+    def audit_read(arguments: tuple[str, ...]) -> dict[str, Any]:
+        if node["down"]:
+            raise HostProbeMissingResponseError(
+                "host probe response is missing (exit 1)"
+            )
+        offset = int(arguments[arguments.index("--offset") + 1])
+        chunk = records[offset:]
+        return {
+            "records": list(chunk),
+            "next_offset": offset + len(chunk),
+            "total": len(records),
+        }
+
+    def close_run(arguments: tuple[str, ...]) -> dict[str, Any]:
+        closes["count"] += 1
+        if node["down"]:
+            node["down"] = False
+            raise HostProbeMissingResponseError(
+                "host probe response is missing (exit 1)"
+            )
+        return dcgm_probe().script["close-run"]
+
+    return dcgm_probe(extra={"audit-read": audit_read, "close-run": close_run}), closes
+
+
+def test_wrong_scope_source_gates_on_the_records_while_the_node_is_quiesced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live 2026-10-26 14:54Z (HyperPod): the repair chain's QUIESCE stopped
+    kubelet ~20 s after the mint; the oracle gate's audit-read and the close
+    failed "response is missing". The records now gate the replay, the close
+    waits for the node and reads the journal before it closes."""
+
+    error, isolation = _error_incident()
+    repair, chain = _repair_incident()
+    records = audit_records(
+        {f"{G0}/ecc_dbe_volatile_total": 1.0, f"{G1}/row_remap_pending": 1.0}
+    )
+    node_state = {"down": True}
+    probe, closes = _quiesced_probe(records, node=node_state)
+    node = {**FakeRegional().node_snapshot(""), "boot_id": survey()["boot_id"]}
+    out = _wrong_scope(
+        tmp_path,
+        monkeypatch,
+        [error, repair],
+        [isolation, chain],
+        probe=probe,
+        node=node,
+    )
+    assert out["verdict"] == "PASS", out["errors"]
+    assert out["oracle_gate"] == "records"
+    ctx = out["_ctx"]
+    deferred = json.loads((ctx.case_dir / "replay-gate-deferred.json").read_text())
+    assert deferred["keys"] == [f"{G0}/ecc_dbe_volatile_total"]
+    assert deferred["probe_error"].startswith(
+        "HostProbeMissingResponseError: dcgm audit-read: host probe response is missing"
+    ), deferred
+    close = json.loads((ctx.case_dir / "dcgm-replay-close.json").read_text())
+    assert close["close_error"].startswith(
+        "HostProbeMissingResponseError: dcgm close-run: host probe response is missing"
+    ), close
+    assert close["close"]["clean"] is True and "judged_by" not in close["close"]
+    assert "rebooted" not in close["close"], "the same boot id: no reboot was read"
+    assert closes["count"] == 2
+    assert close["close_after_probe_loss"][-1]["close_run"] == "ok"
+    assert "audit_error" not in close, "the journal was read once the node answered"
+    oracle = [
+        json.loads(line)
+        for line in (ctx.case_dir / "oracle.jsonl").read_text().splitlines()
+    ]
+    assert [item["served"] for item in oracle] == [records[0]["served"]]
+    assert ctx.cleanup.pending() == []
+
+
+def test_wrong_scope_source_keeps_a_probe_failure_the_records_do_not_explain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No incident on either replayed reading: the lost probe is a fixture
+    # failure, raised as before, and the cleanup stack still owns the close.
+    monkeypatch.setattr(comp, "_validated_restore", lambda ctx, items: [])
+
+    def audit_read(arguments: tuple[str, ...]) -> dict[str, Any]:
+        raise HostProbeMissingResponseError("host probe response is missing (exit 1)")
+
+    probe = dcgm_probe(extra={"audit-read": audit_read})
+    ctx = _ctx(
+        tmp_path,
+        "wrong_scope_source",
+        probe=probe,
+        cpu=gpu_cpu_python(
+            activity=_activity([], []), gpu_state={"active_findings": []}
+        ),
+    )
+    with pytest.raises(
+        HostProbeMissingResponseError, match="^dcgm audit-read: host probe response"
+    ):
+        comp.wrong_scope_source(ctx)
+    assert ctx.cleanup.pending() == ["dcgm-replay"]
+    assert not (ctx.case_dir / "replay-gate-deferred.json").exists(), (
+        "nothing stood in for the journal"
+    )
+    assert "close-run" not in [call[0] for call in probe.calls]
+
+
+def test_wrong_scope_source_fails_when_a_finding_spans_the_gpus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The incident list alone would pass: the composite is in the finding
+    # store, which the scoping oracle reads too.
+    error, isolation = _error_incident()
+    repair, chain = _repair_incident()
+    finding = {
+        "finding_id": f"b-{G1}-composite-GPU_MEMORY_DEGRADATION",
+        "correlation_rule_id": "GPU_MEMORY_DEGRADATION",
+        "component_metrics": ["row_remap_pending", "ecc_dbe_volatile_total"],
+        "component_finding_ids": [f"b-{G0}-ecc_dbe_volatile_total"],
+        "gpu_uuid": G1,
+        "observed_at": "t",
+    }
+    out = _wrong_scope(
+        tmp_path,
+        monkeypatch,
+        [error, repair],
+        [isolation, chain],
+        gpu_state={"active_findings": [], "findings": [finding]},
+    )
+    assert out["verdict"] == "FAIL"
+    assert out["stages"]["no_cross_gpu_composite"] == []
+    assert out["stages"]["scoped_incidents"] == [
+        f"GPU_MEMORY_DEGRADATION finding b-{G1}-composite-GPU_MEMORY_DEGRADATION "
+        f"formed on {G1} from ['ecc_dbe_volatile_total', 'row_remap_pending']"
+    ]
+
+
+def test_scoping_errors_name_each_record_out_of_scope() -> None:
+    error, isolation = _error_incident()
+    repair, chain = _repair_incident()
+    kwargs: dict[str, Any] = {
+        "error_gpu": G0,
+        "repair_gpu": G1,
+        "companion": "row_remap_pending",
+    }
+    clean = _activity([error, repair], [isolation, chain])
+    assert comp.scoping_errors(clean, {"findings": []}, **kwargs) == []
+    stray = gpu_incident(
+        "inc-s", f"b-{G1}-ecc_dbe_volatile_total", action="QUARANTINE", workflow="wf-s"
+    )
+    swapped = gpu_incident(
+        "inc-t", f"b-{G0}-row_remap_pending", action="RESET_GPU", workflow="wf-t"
+    )
+    assert comp.scoping_errors(_activity([repair, stray, swapped]), {}, **kwargs) == [
+        f"the replayed ecc_dbe_volatile_total on {G0} minted no incident of its own",
+        f"ecc_dbe_volatile_total minted incident inc-s on {G1}, which did not replay it",
+        f"row_remap_pending minted incident inc-t on {G0}, which did not replay it",
     ]
 
 

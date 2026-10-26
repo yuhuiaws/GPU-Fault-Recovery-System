@@ -3534,6 +3534,62 @@ restores that incident) and restores only the error GPU's incident.
 `memory_failure` (both signals on one GPU) is unchanged: there the components
 are suppressed into the composite and no reset is planned (PASS 2026-10-26).
 
+024 `wrong_scope_source` FAILED again live (2026-10-26 14:51-14:55Z, the
+HyperPod lane's node, R13g, harness live17) as "cleanup did not prove
+the node clean: dcgm-replay: HostProbeMissingResponseError: dcgm close-run:
+host probe response is missing (exit 1)", after its oracle gate's `audit-read`
+had failed the same way at 14:54:25Z. The plan held the pair
+(`ecc_dbe_volatile_total` +1 on one GPU, `row_remap_pending=1` on another, 60
+reads, `until_advance`) and relied on the runner to close the replay after the
+detection. Both incidents were minted at 14:54:03Z, and on HyperPod the repair
+GPU's reset chain's QUIESCE_GPU_SERVICES stops kubelet about 20 s later
+(`adapters/node_action/quiesce_taint`: a plain-EKS node keeps kubelet and is
+tainted `gpu-fault.io/quiesce` instead, which the probe Pod tolerates), so the
+probe Pod could not be reached, the replay stayed armed, and the chain's
+post-reset VALIDATE_GPU re-graded a reading that still said
+`row_remap_pending=1`: QUARANTINE, then RESTART_NODE (NotReady ~14:57Z, Ready
+14:59:45Z; the workflow finished 15:06Z and lifted the quarantine) -- the
+product's documented policy for a pending remap a reset did not clear, right
+on what it was shown. The variant's subject is composite scoping, not that
+escalation, so three things changed in the harness. (1) The plan is bounded:
+the pair is served for one correlation window (`window_reads`:
+`GpuMetricThresholds.correlation_window_seconds`, 45 s, three reads of the
+15-s collector) and the tool then serves the real readings by itself -- as a
+reset applies a pending remap -- before RESET_GPU completes (70-90 s after the
+mint live), whether or not the runner still reaches the node; the scoping is
+judged on the records read after that window (`scoping_errors`: no
+GPU_MEMORY_DEGRADATION finding or incident on either GPU, the error GPU's own
+incident present, no incident of the other GPU's reading on either GPU), and
+the spec text now says the chain ends RECOVERED with no RESTART_NODE
+escalation. (2) The oracle gate falls back to the product's records when the
+journal cannot be read because the node is away (`wait_served_or_records`,
+evidence `replay-gate-deferred`) and the journal is read at the close; any
+other probe failure stays the fixture failure it was. (3) `DcgmReplay.close`
+no longer fails on a probe the product took away
+(`general_live_gpu_replay_close`): it polls the Node object inside the
+variant's remaining budget (15 min at most, 3 min kept back), waits for Ready
+to have held 45 s with no quiesce taint, retries `close-run` with the journals
+read first, and judges a node whose boot id changed since the deploy clean by
+its reboot (`judged_by: node reboot`: the drop-in, run directory, transient
+proxy unit and deadman live under /run and cannot survive a boot); only a node
+that never comes back without rebooting leaves the close unproven, and the
+error names the boot id and readiness it saw. Tests:
+`tests/regional/test_general_live_gpu_composite.py` (the installed plan driven
+through the field tool -- three pass-through reads, three served reads, then
+the exporter's own scrape byte for byte; the records gate; the scoping oracle
+over findings and incidents) and
+`tests/regional/test_general_live_gpu_replay_reboot_close.py` (the quiesce
+return, the Ready settle, the quiesce taint, the reboot verdict, unproven
+inside and outside the budget). The variants whose finding plans no reset --
+`memory_failure` (QUARANTINE only), `corrected_memory`, `fresh_components`,
+`reused_components`, `independent_xid`, `nvlink_multiple_gpus` (diagnostic
+composites) -- have no reset to outlast and keep their held plans; they gain
+the reboot-aware close. 019 `pending_supported` / `post_reset` hold
+`row_remap_pending=1` into the same chain and advance or close it through the
+probe (`post_reset` after RESET_GPU SUCCEEDED, while kubelet is still down on
+HyperPod), so they carry the same exposure there and are to be bounded the same
+way before their next HyperPod run.
+
 024 `independent_xid` FAILED live (2026-10-26 08:07Z, eks ip-10-0-43-5, R13g,
 harness live14) with two CORRECTABLE_MEMORY_DEGRADATION incidents for one held
 pair: `inc-gpu-dcgm-<node>-1793001279120143-GPU-053ab270-...-composite-CORRECTABLE_MEMORY_DEGRADATION`
