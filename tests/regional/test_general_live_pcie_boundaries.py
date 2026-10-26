@@ -384,12 +384,43 @@ def test_source_boot_change_arms_before_the_repoint_and_jumps_on_the_first_read(
         if c[0] == "repoint-collector"
     )
     assert repoint[repoint.index("--boot-id") + 1] == PRIOR_BOOT
+    assert "--before-repoint" in _arm_call(ctx), (
+        "live 2026-10-26 14:12Z (hp, then eks) the probe's one arm guard still "
+        "required the repointed endpoint and refused this order: 'the collector "
+        "does not read the replay', INCONCLUSIVE at arm"
+    )
     steps = _plan(ctx)["steps"]
     assert steps[0] == {
         "reads": 1,
         "ops": [{"op": "add", "field": PCIE, "gpus": [G1], "value": JUMP}],
     }, "the new boot's very first reading is the jump"
     assert steps[1]["ops"] == [] and steps[1]["until_advance"] is True
+
+
+def _arm_call(ctx: Any) -> tuple[str, ...]:
+    [call] = [c for c in ctx.probes[f"dcgm@{ctx.settings.node}"].calls if c[0] == "arm"]
+    return call
+
+
+def test_only_arm_before_repoint_tells_the_probe_the_order(tmp_path: Path) -> None:
+    """The flag is threaded from ``arm_before_repoint`` to the probe command;
+    the repoint-then-arm variants (``arm_and_confirm``) keep the default guard."""
+
+    before = _boot_ctx(tmp_path, _boot_state())
+    after = _reset_ctx(tmp_path, _reset_state())
+
+    assert links.source_boot_change(before)["verdict"] == "PASS"
+    assert links.pcie_counter_reset(after)["verdict"] == "PASS"
+
+    assert _arm_call(before) == (
+        "arm",
+        "--port",
+        "9412",
+        "--before-repoint",
+        "--run-id",
+        before.run_id,
+    )
+    assert _arm_call(after) == ("arm", "--port", "9412", "--run-id", after.run_id)
 
 
 def test_source_boot_change_passes_when_the_new_boot_starts_a_new_baseline(

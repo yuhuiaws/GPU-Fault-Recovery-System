@@ -39,7 +39,10 @@ control plane:
   read lacked the endpoint and the repoint was judged failed). The Node Agent
   is never in the allow-list.
 * **arm / disarm / status / audit-read** -- loopback control of the tool;
-  **collector-restart** -- one ``systemctl restart`` of the same unit.
+  ``arm --before-repoint`` arms while the collector still reads the real
+  exporter (022 ``source_boot_change``: the repoint's first scrape is the
+  plan's first read); **collector-restart** -- one ``systemctl restart`` of
+  the same unit.
 * **close-run** -- the runner's cleanup: disarm the tool if it answers, remove
   the drop-in and override, restart the unit on the real endpoint and verify
   the process, stop the tool, remove the run directory, then disarm the
@@ -451,15 +454,8 @@ def port_answers(port: int) -> bool:
 # survey: read-only facts a plan is built from
 # --------------------------------------------------------------------------- #
 def gpu_inventory() -> list[dict[str, str]]:
-    completed = run(
-        [
-            "nvidia-smi",
-            "--query-gpu=index,uuid,pci.bus_id,name",
-            "--format=csv,noheader",
-        ],
-        check=False,
-        timeout=60,
-    )
+    query = ["nvidia-smi", "--query-gpu=index,uuid,pci.bus_id,name"]
+    completed = run([*query, "--format=csv,noheader"], check=False, timeout=60)
     keys = ("index", "uuid", "pci_bus_id", "name")
     result = []
     for line in completed.stdout.splitlines():
@@ -734,13 +730,8 @@ def install_source(arguments: argparse.Namespace) -> None:
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     marker = root / RUN_MARKER
     if not marker.exists():
-        marker.write_text(
-            json.dumps(
-                {"run_id": run_id, "digest": digest(run_id), "created_at": utc_now()},
-                sort_keys=True,
-            ),
-            encoding="utf-8",
-        )
+        record = {"run_id": run_id, "digest": digest(run_id), "created_at": utc_now()}
+        marker.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
         marker.chmod(0o600)
     target = root / name
     if target.exists():
@@ -773,24 +764,11 @@ def tool_command(arguments: argparse.Namespace, root: Path) -> list[str]:
         raise ProbeError("the real exporter endpoint is not loopback /metrics")
     # ``-I`` keeps a file planted beside the tool from being imported; the
     # venv's own gpu_fault stays importable (site-packages, not user site).
-    common = [
-        str(VENV_PYTHON),
-        "-I",
-        str(tool),
-        "--plan",
-        str(plan),
-        "--upstream",
-        upstream,
-        "--port",
-        str(checked_port(arguments.port)),
-        "--max-seconds",
-        str(bounded(arguments.max_seconds, 60, MAX_TOOL_SECONDS, "max seconds")),
-        "--serve",
-        "--ack",
-        ACKNOWLEDGEMENT,
-        "--audit",
-        str(audit),
-    ]
+    port = str(checked_port(arguments.port))
+    seconds = str(bounded(arguments.max_seconds, 60, MAX_TOOL_SECONDS, "max seconds"))
+    common = [str(VENV_PYTHON), "-I", str(tool), "--plan", str(plan), "--upstream"]
+    common += [upstream, "--port", port, "--max-seconds", seconds, "--serve", "--ack"]
+    common += [ACKNOWLEDGEMENT, "--audit", str(audit)]
     if arguments.tool == FIELD_TOOL:
         if PROFILE_NAME.fullmatch(arguments.profile or "") is None:
             raise ProbeError(
@@ -896,21 +874,11 @@ def arm_deadman(run_id: str, seconds: int) -> dict[str, str]:
     name = deadman_unit(run_id)
     run(["systemctl", "stop", f"{name}.timer"], check=False)
     run(["systemctl", "reset-failed", f"{name}.service"], check=False)
+    timer = ["systemd-run", f"--unit={name}", f"--on-active={int(seconds)}s"]
+    timer += ["--timer-property=AccuracySec=1s", "--property=Restart=on-failure"]
+    timer += ["--property=RestartSec=30s", "--property=StartLimitIntervalSec=0"]
     run(
-        [
-            "systemd-run",
-            f"--unit={name}",
-            f"--on-active={int(seconds)}s",
-            "--timer-property=AccuracySec=1s",
-            "--property=Restart=on-failure",
-            "--property=RestartSec=30s",
-            "--property=StartLimitIntervalSec=0",
-            sys.executable,
-            str(probe_copy(run_id)),
-            "cleanup",
-            "--run-id",
-            run_id,
-        ]
+        [*timer, sys.executable, str(probe_copy(run_id)), "cleanup", "--run-id", run_id]
     )
     state = unit_state(f"{name}.timer")
     if state.get("ActiveState") != "active":
@@ -994,11 +962,7 @@ def repoint_collector(arguments: argparse.Namespace) -> None:
     if dropin.exists():
         raise ProbeError("a repoint drop-in for this run already exists")
     foreign = (
-        [
-            path.name
-            for path in DROPIN_DIR.glob("*.conf")
-            if DROPIN_DIR.is_dir() and path != dropin
-        ]
+        [path.name for path in DROPIN_DIR.glob("*.conf") if path != dropin]
         if DROPIN_DIR.is_dir()
         else []
     )
@@ -1011,27 +975,18 @@ def repoint_collector(arguments: argparse.Namespace) -> None:
     if arguments.inventory_wrapper:
         install_wrapper_link(run_id)
     override = override_env_path(run_id)
-    override.write_text(
-        "\n".join(
-            override_lines(
-                run_id,
-                port,
-                arguments.inventory_wrapper,
-                boot_id=arguments.boot_id,
-                unknown_expected_count=arguments.unknown_expected_count,
-            )
-        )
-        + "\n",
-        encoding="utf-8",
+    lines = override_lines(
+        run_id,
+        port,
+        arguments.inventory_wrapper,
+        boot_id=arguments.boot_id,
+        unknown_expected_count=arguments.unknown_expected_count,
     )
+    override.write_text("\n".join(lines) + "\n", encoding="utf-8")
     override.chmod(0o600)
-    (run_dir(run_id) / "repoint.json").write_text(
-        json.dumps(
-            {"run_id": run_id, "original_endpoint": original, "port": port},
-            sort_keys=True,
-        ),
-        encoding="utf-8",
-    )
+    record = {"run_id": run_id, "original_endpoint": original, "port": port}
+    text = json.dumps(record, sort_keys=True)
+    (run_dir(run_id) / "repoint.json").write_text(text, encoding="utf-8")
     DROPIN_DIR.mkdir(parents=True, exist_ok=True)
     # The wrapper journals its inventory calls into the run directory; the
     # unit's ProtectSystem=strict keeps everything else read-only.
@@ -1083,11 +1038,64 @@ def repoint_collector(arguments: argparse.Namespace) -> None:
     )
 
 
+def arm_preconditions(run_id: str, port: int, before: bool) -> dict[str, Any]:
+    """What ``arm``'s mode requires of the node: observed, checked, named.
+
+    After the repoint (default) the collector must read this run's replay.
+    Before it (``--before-repoint``: the runner arms, then repoints, so the
+    restarted collector's first scrape is the plan's first read) the collector
+    must still read the original exporter -- not this run's replay, not another
+    run's proxy -- while this run's proxy unit is up, answers, is unarmed and
+    has served no read. Live 2026-10-26 (022 ``source_boot_change``, both
+    clusters) the one after-repoint guard refused that order: INCONCLUSIVE at
+    ``arm``. A refusal names the mode and the endpoint seen; the facts travel
+    in its detail and in the receipt.
+    """
+
+    replay, seen = f"http://127.0.0.1:{port}/metrics", effective_endpoint()
+    facts: dict[str, Any] = {"before_repoint": before, "effective_endpoint": seen}
+    facts["replay_endpoint"] = replay
+    mode = "before" if before else "after"
+
+    def refuse(reason: str, why: str) -> ProbeError:
+        return ProbeError(f"refusing to arm {mode} the repoint: {why}", reason, facts)
+
+    if not before:
+        if seen != replay:
+            raise refuse(
+                "collector_not_repointed",
+                f"the collector reads {seen}, not the replay {replay}",
+            )
+        return facts
+    original, unit = baseline_endpoint(), f"{proxy_unit(run_id)}.service"
+    state = unit_state(unit).get("ActiveState")
+    facts.update(original_endpoint=original, proxy_unit=unit, proxy_unit_state=state)
+    if state != "active":
+        raise refuse("proxy_down", f"this run's proxy unit {unit} is {state}")
+    try:
+        status = tool_status(port)
+    except ProbeError as error:
+        raise refuse("no_status", f"this run's proxy on {port} gave no status: {error}")
+    facts["reads_before_arm"] = reads = status.get("reads")
+    if status.get("armed") is not False or reads != 0:
+        raise refuse(
+            "proxy_read_before_arm",
+            f"the proxy on port {port} reports armed={status.get('armed')} after "
+            f"{reads} reads; nothing may read it before the repoint",
+        )
+    if seen != original:
+        why = " (this run's replay)" if seen == replay else ""
+        raise refuse(
+            "collector_already_repointed",
+            f"the collector reads {seen}{why}, not the original exporter {original}",
+        )
+    return facts
+
+
 def arm(arguments: argparse.Namespace) -> None:
     run_id = checked_run_id(arguments.run_id)
     port = checked_port(arguments.port)
-    if effective_endpoint() != f"http://127.0.0.1:{port}/metrics":
-        raise ProbeError("refusing to arm: the collector does not read the replay")
+    facts = arm_preconditions(run_id, port, bool(arguments.before_repoint))
     status, body = loopback(f"http://127.0.0.1:{port}/arm", method="POST")
     if status != 200:
         raise ProbeError(f"arm returned {status}")
@@ -1097,6 +1105,7 @@ def arm(arguments: argparse.Namespace) -> None:
             "armed": True,
             "response": body.decode().strip(),
             "status": tool_status(port),
+            **facts,
         }
     )
 
@@ -1232,12 +1241,8 @@ def restore_collector(arguments: argparse.Namespace) -> None:
 
 
 def stop_of(run_digest: str, port: int | None) -> dict[str, Any]:
-    effective = effective_endpoint()
-    if (
-        effective
-        and effective.startswith("http://127.0.0.1:")
-        and effective != baseline_endpoint()
-    ):
+    effective = effective_endpoint() or ""
+    if effective.startswith("http://127.0.0.1:") and effective != baseline_endpoint():
         raise ProbeError("refusing to stop the replay while the collector reads it")
     unit = proxy_unit_of(run_digest)
     run(["systemctl", "stop", f"{unit}.service"], check=False)
@@ -1366,25 +1371,18 @@ def cleanup_leftover(arguments: argparse.Namespace) -> None:
         "run_id": before.get("run_id"),
         "before": before,
     }
-    if not before["objects"]:
-        emit(
-            {
-                **result,
-                "reclaimed": False,
-                "reason": "nothing of this run is left on the node",
-                "clean": True,
-                "leftover": [],
-                "errors": [],
-            }
+    if not before["objects"] or before["deadman_pending"]:
+        reason = (
+            "nothing of this run is left on the node"
+            if not before["objects"]
+            else "the run's deadman restore is still pending; left to fire"
         )
-        return
-    if before["deadman_pending"]:
         emit(
             {
                 **result,
                 "reclaimed": False,
-                "reason": "the run's deadman restore is still pending; left to fire",
-                "clean": False,
+                "reason": reason,
+                "clean": not before["objects"],
                 "leftover": before["objects"],
                 "errors": [],
             }
@@ -1435,7 +1433,8 @@ def parser() -> argparse.ArgumentParser:
     repoint.add_argument("--inventory-wrapper", action="store_true")
     repoint.add_argument("--boot-id", default="")
     repoint.add_argument("--unknown-expected-count", action="store_true")
-    command("arm", arm, port=True)
+    armed = command("arm", arm, port=True)
+    armed.add_argument("--before-repoint", action="store_true")
     command("disarm", disarm, port=True)
     command("advance", advance, port=True)
     command("status", status_command, port=True)

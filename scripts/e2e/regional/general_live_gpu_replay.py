@@ -834,8 +834,15 @@ class DcgmReplay:
         )
         self.ctx.evidence.write("dcgm-replay-deploy", self.receipts)
 
-    def arm(self) -> dict[str, Any]:
-        receipt = self.ctx.dcgm("arm", "--port", str(PORT), timeout=60)
+    def arm(self, *, before_repoint: bool = False) -> dict[str, Any]:
+        """Arm the plan. ``before_repoint`` tells the probe which guard applies:
+        the collector still reads the real exporter (``arm_before_repoint``)
+        rather than this run's replay (the default, after ``repoint``)."""
+
+        command = ["arm", "--port", str(PORT)]
+        if before_repoint:
+            command.append("--before-repoint")
+        receipt = self.ctx.dcgm(*command, timeout=60)
         self.armed = True
         self.receipts["arm"] = receipt
         self.ctx.evidence.write("dcgm-replay-arm", receipt)
@@ -1146,11 +1153,16 @@ def arm_before_repoint(replay: DcgmReplay, *served_keys: str) -> None:
     while the collector still scrapes the real exporter -- no read reaches the
     plan -- and the repoint's restart makes the plan's first read the first
     reading the product sees under the new boot, so the boundary itself
-    carries the plan's first step.
+    carries the plan's first step. The probe is told the order (``arm
+    --before-repoint``): its guard then requires the collector to still read
+    the real exporter and this run's proxy to be up, unarmed and unread, not
+    the repointed endpoint the default mode requires (live 2026-10-26 14:12Z,
+    both clusters: this order's first live run was refused as "the collector
+    does not read the replay" and the variant ended INCONCLUSIVE at ``arm``).
     """
 
     replay.serve()
-    replay.arm()
+    replay.arm(before_repoint=True)
     replay.repoint()
     if served_keys:
         replay.wait_served(*served_keys)

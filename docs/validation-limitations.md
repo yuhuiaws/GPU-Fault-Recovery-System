@@ -3490,6 +3490,32 @@ crossed at the real value and not exercised) (evidence `boot-readings`;
 `tests/regional/test_general_live_pcie_boundaries.py`). Both variants are
 rerun with the runner alone; no product release is needed.
 
+022 `source_boot_change` then ran its new order live for the first time on
+2026-10-26 (14:12Z HyperPod, the same minute on plain EKS; release R13g,
+harness live17) and ended INCONCLUSIVE at the fixture, not at the product:
+"harness fixture failed: HostProbeError: dcgm arm: host probe failed (exit 1;
+error ProbeError 98b43a124d35de96 at arm:1092)", `probe-error.json` saying
+"refusing to arm: the collector does not read the replay". The host
+controller's one `arm` guard required the running collector to already read
+this run's replay -- the repoint-then-arm order every other replay variant
+uses (the sibling 022 variants PASSed on the same node minutes before) --
+while `arm_before_repoint` arms first by design, and the unit tests mock the
+probe, so the two orders first met on the node. The probe's `arm` is now
+mode-aware (`--before-repoint`, threaded from `DcgmReplay.arm` only by
+`arm_before_repoint`): the default mode still requires the repointed endpoint;
+the before-repoint mode requires the collector to still read the original
+exporter (not this run's replay, not another run's proxy), this run's proxy
+unit to be active and answering `/status`, unarmed and with no read served,
+and records `before_repoint`, the endpoints, the unit state and the read count
+in the receipt. Every refusal names the mode and the endpoint it saw and
+carries the same facts as its detail. Arming before any scrape burns no plan
+step: the tool advances steps per `/metrics` read it serves (`Replay.active`
+counts `reads - start_read`; `/status` does not count), so the repointed
+collector's first scrape is the plan's first read as b193 intended
+(`tests/regional/test_general_live_dcgm_probe_arm.py`, the wiring in
+`tests/regional/test_general_live_pcie_boundaries.py`). The variant is rerun
+with the runner alone on both clusters; no product release is needed.
+
 020 `counter_reset` first ran live on 2026-10-26 (HyperPod, H200, the DL
 aggregate `nvlink_crc_aggregate_error_total`) and FAILed on its own plan and
 oracle, not on the product. Unlike the PCIe rate, the NVLink rule has no

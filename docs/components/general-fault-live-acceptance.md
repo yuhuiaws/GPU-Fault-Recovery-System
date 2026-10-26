@@ -777,7 +777,16 @@ WARNING 的前提，判定不受此影响。
 一次性抬升，之后保持）；判定：无 `pcie_replay_total` finding/incident（`no_cross_boot_rate`）、产品
 接受过回放 boot 下的读数且最新读数就是新 boot 的首读（换代从新基线起算，`new_baseline`）、无硬件
 步骤；新 boot 首个被接受的读数不是该跳变时记 INCONCLUSIVE（边界以真实值越过、未被检验）；证据
-`boot-readings`。两者重跑只需 live 运行器，不需要新产品版本。
+`boot-readings`。两者重跑只需 live 运行器，不需要新产品版本。该新顺序 2026-10-26 14:12Z 首次 live
+（hp 与 eks 同一分钟，R13g，运行器 live17）在 fixture 的 `arm` 即 INCONCLUSIVE（"refusing to arm:
+the collector does not read the replay"）：主机探针唯一的 arm 守卫仍要求采集器已在读回放端点，而
+`arm_before_repoint` 按设计先 arm 再重指；单测 mock 了探针，两种顺序首次在节点上相遇。现探针 `arm`
+分模式：默认仍要求已重指到本 run 回放；`--before-repoint`（只由 `arm_before_repoint` 经
+`DcgmReplay.arm` 传入）要求采集器仍读原始 exporter（非本 run 回放、非他 run 代理）、本 run 的代理
+单元 active 且应答 `/status`、未 arm、已服务 0 读，并把 `before_repoint`、各端点、单元状态与读数写入
+回执；每条拒绝文案点名模式与所见端点，detail 携带同样事实。先 arm 不会烧掉计划步：工具按它服务的
+`/metrics` 读数推进步骤（`/status` 不计），重指后采集器的首拍即计划首读。两集群用运行器重跑即可
+（`tests/regional/test_general_live_dcgm_probe_arm.py`）。
 
 2026-10-26 现场（plain EKS 两车道，R13g）`same_gpu_xid`、`wrong_gpu_xid`、`expired_xid`
 三个 XID 联合变体在 `deploy-proxy` 一步即 INCONCLUSIVE，结果只有
