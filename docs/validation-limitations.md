@@ -2884,6 +2884,29 @@ patches apply in memory so a spare is really declared and released -- up to the
 first host-probe mutation, asserts the release bookkeeping, and pins the window
 to the fixture identity `warm_spare_node_probe.binding_key` grants.
 
+027 `reporter_silent`'s injection stopped nothing live 2026-10-26 (plain EKS,
+release 37db33f254a1): the runner's `kubectl exec -c progress-reporter-0 --
+/bin/sh -c 'kill -STOP 1 || true'` targeted the reporter sidecar as its
+container's PID 1, and pid_namespaces(7) drops a SIGSTOP sent to a PID
+namespace's init from inside that namespace (`kill` returns 0). The reporter
+kept posting `step=10` every 15 s for thirteen minutes, and the product graded
+the stall it was shown -- `training_hang`, "training step stopped advancing",
+the `stalled_step` contract -- which the variant read as "reporter silence
+produced an NCCL/hang finding instead". The product was right; the fixture had
+injected nothing and never checked. The reporter container now runs a
+`/bin/sh` launcher as PID 1 with the reporter as its child and its PID on the
+container's `/tmp` emptyDir; `stop_reporter` SIGSTOPs that PID and prints its
+`/proc/<pid>/status` State, which `reporter_silent` journals
+(`silent-stop.json`) and judges -- a reporter not `T (stopped)` makes the
+variant INCONCLUSIVE at the stop rather than FAIL on the product.
+`tests/regional/test_general_live_progress_reporter_stop.py` runs the rendered
+launcher and stop script against a real local process through the kubelet fake
+of `test_general_live_progress_job.py` (the reporter's stand-in is the
+launcher's child, the stop lands, SIGTERM ends the launcher at once) and
+drives the variant over fakes for both outcomes. Not covered offline: the
+kernel rule itself on the node's container runtime (the launcher removes the
+dependency on it rather than testing it).
+
 ## GF-GENERAL-LIVE DCGM / GPU-inventory replay (phase 2)
 
 Phase 2 adds the DCGM-field and GPU-inventory categories (019 ECC/row remap/

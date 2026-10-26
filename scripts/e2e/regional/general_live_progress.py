@@ -140,6 +140,43 @@ CONNECTION_ENV = (
 CA_DIR = "/etc/gpu-fault/tls"
 #: Writable state: the collector's durable outbox.
 STATE_DIR = "/var/lib/gpu-fault"
+#: Where the reporter's launcher records the reporter's PID: the reporter
+#: container's own ``/tmp`` emptyDir.
+REPORTER_PID_FILE = "/tmp/gfrs-reporter.pid"
+#: The reporter container's PID 1 is this launcher shell; the reporter is its
+#: child. pid_namespaces(7): the init of a PID namespace -- a container's
+#: PID 1 -- receives only the signals it has handlers for; SIGSTOP and SIGKILL,
+#: which cannot be handled, are dropped when sent from inside the namespace,
+#: and ``kill`` still returns 0. ``kubectl exec`` runs inside it. Live
+#: 2026-10-26 (plain EKS, release 37db33f254a1) the reporter was PID 1 and
+#: ``reporter_silent``'s ``kill -STOP 1`` stopped nothing: the reporter kept
+#: posting ``step=10`` every 15 s for thirteen minutes and the product graded
+#: the stall it was shown (``training_hang``, "training step stopped
+#: advancing"). The trap forwards a Pod deletion's SIGTERM so the container
+#: still ends at once (as PID 1, a shell without a handler would ignore it
+#: until the grace period); the reporter's own exit status is the container's.
+REPORTER_LAUNCHER = (
+    "trap 'kill -TERM \"$reporter\" 2>/dev/null' TERM INT\n"
+    '"$@" & reporter=$!\n'
+    f"printf '%s\\n' \"$reporter\" > {REPORTER_PID_FILE}\n"
+    'wait "$reporter"\n'
+)
+#: ``kubectl exec`` script that stops the reporter and prints its PID and its
+#: ``/proc/<pid>/status`` ``State`` line -- the injection's proof, judged by
+#: ``reporter_stopped``. Shell builtins and coreutils ``sleep`` only: the
+#: runtime image is ubi9 python-minimal.
+STOP_REPORTER = (
+    f"read -r pid < {REPORTER_PID_FILE} || exit 2\n"
+    'kill -STOP "$pid" || exit 3\n'
+    "state=\n"
+    "for attempt in 1 2 3 4 5 6 7 8 9 10; do\n"
+    "  state=$(while IFS= read -r line; do case $line in State:*) "
+    'printf \'%s\' "${line#State:}";; esac; done < "/proc/$pid/status")\n'
+    "  case $state in *stopped*) break;; esac\n"
+    "  sleep 0.2\n"
+    "done\n"
+    'printf \'%s\\n%s\\n\' "$pid" "$state"\n'
+)
 #: Operations a training-progress chain must never contain: no hardware action,
 #: no node isolation, no automatic workload restart. STOP_WORKLOADS is allowed
 #: for the NaN/checkpoint branch only (and is asserted there explicitly).
@@ -556,7 +593,7 @@ class ManagedProgressJob:
             "--",
             "/bin/sh",
             "-c",
-            "kill -STOP 1 || true",
+            STOP_REPORTER,
         )
 
     def delete(self) -> dict[str, Any]:
@@ -637,6 +674,10 @@ def _reporter_container(
         "image": image,
         "imagePullPolicy": "IfNotPresent",
         "command": [
+            "/bin/sh",
+            "-c",
+            REPORTER_LAUNCHER,
+            "gfrs-progress-reporter",
             REPORTER_BIN,
             "training-progress",
             "--attempt-id",
@@ -691,6 +732,27 @@ def _reporter_container(
             "capabilities": {"drop": ["ALL"]},
         },
     }
+
+
+def reporter_stopped(output: Any) -> dict[str, Any]:
+    """The reporter's PID and process state ``STOP_REPORTER`` printed.
+
+    ``kubectl exec`` returns 0 whether or not the reporter stopped (the live
+    ``kill -STOP 1`` did); the injection is judged on the process state. A
+    reporter still running -- or one that is PID 1, which no in-namespace
+    SIGSTOP reaches -- injected nothing, so the variant is inconclusive
+    rather than graded on whatever the product then does.
+    """
+
+    lines = [line.strip() for line in str(output).splitlines() if line.strip()]
+    pid = int(lines[0]) if lines and lines[0].isdigit() else None
+    state = lines[1] if len(lines) > 1 else ""
+    if pid is None or pid == 1 or "(stopped)" not in state:
+        raise VariantInconclusive(
+            "the progress reporter did not stop, no reporter silence was "
+            f"injected: pid={lines[0] if lines else None!r} state={state!r}"
+        )
+    return {"pid": pid, "state": state}
 
 
 # --------------------------------------------------------------------------- #
@@ -1064,7 +1126,9 @@ def reporter_silent(ctx: VariantContext) -> dict[str, Any]:
     started = utc_now()
     job.write_progress(0, step=10, loss=1.0)
     ctx.hold(30, name="silent-warm")
-    job.stop_reporter(0)  # SIGSTOP the reporter: heartbeats stop, the Pod lives
+    # SIGSTOP the reporter: heartbeats stop, the Pod lives. Proven by the
+    # reporter's process state, never assumed from the exec's exit status.
+    ctx.evidence.write("silent-stop", reporter_stopped(job.stop_reporter(0)))
     ctx.cleanup.push("reporter", lambda: None)
     ctx.hold(HEARTBEAT_TIMEOUT + 30, name="silent-hold")
     records, incident = _wait_incident(

@@ -73,9 +73,9 @@ class FakeProgressJob:
         self.writes.append((rank, fields))
         return {}
 
-    def stop_reporter(self, rank: int) -> dict[str, Any]:
+    def stop_reporter(self, rank: int) -> str:
         self.stopped.append(rank)
-        return {}
+        return "4242\n\tT (stopped)\n"  # STOP_REPORTER's print: PID, State
 
     def reporter_logs(self, *, tail: int = 50) -> dict[str, str]:
         self.log_reads += 1

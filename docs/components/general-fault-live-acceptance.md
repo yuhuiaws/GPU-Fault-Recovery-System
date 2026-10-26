@@ -1827,7 +1827,13 @@ POST 预制 finding。类别模块 `general_live_nccl`/`_nccl_fr`/`_progress`/`_
   Deployment，须 digest 固定）运行 `/opt/gpu-fault/executor/bin/gpu-fault-collector`，
   连接取自 `gpu-fault-regional-connection`（URL、cluster id、cluster token，CA 经
   `SSL_CERT_FILE`），每个 reporter 有可写状态目录（outbox）；进度经
-  `kubectl exec -i` 写入。扫描类信号用
+  `kubectl exec -i` 写入。`reporter_silent` 的 SIGSTOP 由 `kubectl exec` 从容器内发出，
+  而 PID namespace 的 init（容器 PID 1）会丢弃命名空间内部发来的、无 handler 的
+  SIGSTOP/SIGKILL（pid_namespaces(7)，`kill` 仍返回 0；2026-10-26 实测 reporter 为
+  PID 1 时 `kill -STOP 1` 无效，reporter 继续每 15 s 上报 step=10，产品正确判为步数
+  停滞 `training_hang`），故 sidecar 以 `/bin/sh` launcher 作 PID 1、reporter 为其子进程
+  并记录 PID（`/tmp/gfrs-reporter.pid`）；停止后读 `/proc/<pid>/status` 证明
+  `T (stopped)` 并存为 `silent-stop.json`，未停住判 INCONCLUSIVE 而非 FAIL。扫描类信号用
   execution-token 的 `POST /v1/training-health/<cluster>/scan`（本集群一次），因此执行
   前须确认该测试任务是集群内唯一 RUNNING 受管 attempt（否则整集群扫描会误报正常
   任务 reporter 静默）。native 实测全部 9 个：`nan`（只停归属 attempt+ESCALATE，不
