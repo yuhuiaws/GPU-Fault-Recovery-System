@@ -24,6 +24,7 @@ from gpu_fault.log_recovery_context import log_event_id as product_log_event_id
 from gpu_fault.log_rules import matching_log_rules
 from scripts.e2e.regional import general_live_applog_fixture as helper
 from scripts.e2e.regional import general_live_applog_job as job_module
+from scripts.e2e.regional import general_live_applog_verdicts as verdicts
 from scripts.e2e.regional import general_live_applogs as mod
 from scripts.e2e.regional import host_probe_fixture as host
 from scripts.e2e.regional.general_live_fixture import GeneralLiveSettings
@@ -86,8 +87,8 @@ def test_reviewed_lines_match_the_products_rules_as_designed() -> None:
 def test_log_event_id_is_the_products() -> None:
     batch = SimpleNamespace(cluster_id="gpu-eks-cluster", node_id=NODE)
     entry = SimpleNamespace(entry_id="a" * 64)
-    expected = product_log_event_id(batch, entry, mod.safe_component)
-    assert mod.log_event_id("gpu-eks-cluster", NODE, "a" * 64) == expected
+    expected = product_log_event_id(batch, entry, verdicts.safe_component)
+    assert verdicts.log_event_id("gpu-eks-cluster", NODE, "a" * 64) == expected
     assert expected.startswith(
         "log-gpu-eks-cluster-ip-10-0-43-5.us-west-2.compute.internal-"
     ), "the event id names the cluster and node"

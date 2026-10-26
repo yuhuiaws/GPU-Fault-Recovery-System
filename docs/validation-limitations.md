@@ -2106,6 +2106,24 @@ directory under it and the installed collector unit, or the variant is
 `NOT_RUN(CAPABILITY_ABSENT)` naming the gap. Neither cluster has an `old_pod`
 PASS yet; the rerun needs nothing prepared on the node.
 
+017 `cri_partial_rotation` failed its first live run (HyperPod, 2026-10-26)
+only on the two stages that expected "one NO_ACTION evidence incident
+attributed to the attempt"; the stitched record itself was delivered from the
+rotated inode with the attempt's Pod UID/container and the P fragment's time,
+so the collector's CRI discovery and stitching work on HyperPod and the batch
+carrying the line was accepted (b190's journal refusals did not block the CRI
+tail). The expectation was wrong: `app/ingest/node_health.py` keeps a
+`SITE_APPLICATION_LOG` NO_ACTION finding as the NODE_LOGS record only -- no
+incident, marker or workflow ("log evidence is already durably captured by the
+ingest transaction; workload errors are not hardware markers or a second
+recovery owner"). The verdict now reads the record: no incident for it
+(`evidence_only`; one minted anyway is the failure) and its Pod UID/container
+is a live container of the attempt in the completion watcher's observation
+(`attributable`), with no incident wait. The same fact means the journal
+variants `nccl_error` / `distributed_error` wait their 420 s incident budget
+out by design and pass only on the absence of adverse handling; reading the
+product's delivery of a journal line needs a store probe extension (open).
+
 011 `fr_enabled` (the Flight Recorder configured as the operations manual
 prescribes: trace buffer, pipe, dump-file prefix and dump-on-timeout; at least
 one PID must show two real dumps as `PAIRED`) is registered as an expected FAIL

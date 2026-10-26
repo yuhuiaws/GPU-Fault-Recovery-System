@@ -617,6 +617,25 @@ withheld`。根因不是 HyperPod 的运行时布局——探针 `inspect`
 `test_general_live_applogs.py`，录制替身）。重跑前操作员须知：两个集群都尚无 `old_pod` 的 PASS
 （plain EKS 此前止于 preflight 缺陷的 NO_EVIDENCE），每轮最多多等 75 s；节点上无需任何准备。
 
+`cri_partial_rotation` 在 HyperPod 的首次真机运行（2026-10-26，hp 车道，R13g）FAIL 于
+`single_incident`/`attributed` 两阶段（"the stitched line did not produce one NO_ACTION evidence
+incident"、"attributed to None"），其余阶段全部通过：拼成的整行从轮转后的 `.1` inode 投递、
+`pod_uid`/`container_name` 与 CRI 事件时间（P 片段的时间戳）正确、P 片段曾被采集器状态记为
+pending——即采集器在 HyperPod 上的 CRI 发现、跨轮转与重启的拼接都正常，不是产品的布局缺口；
+该行所在批次已入库（写 F 后 0.2 s 内被采集），b190 的 journalctl 交替拒绝也没有挡住 CRI tail。
+根因在用例期望：产品自 2026-10-24（`app/ingest/node_health.py`
+`NodeHealthIngestionService.ingest`）起对 `SITE_APPLICATION_LOG` 且 `NO_ACTION` 的 finding
+**不铸 incident、marker 或 workflow**（"log evidence is already durably captured by the ingest
+transaction; workload errors are not hardware markers or a second recovery owner"），而拼成的
+"collective … timeout" 行正是 NO_ACTION 的 TRAINING 规则，用例却等了 420 s 的 incident。现在
+判定不再等 incident（incident 与记录在同一入库事务里决定，记录可见即终局）：`evidence_only`
+——该记录没有 incident，若有则按其 action 与诊断步骤点名判错；`attributable`——记录的
+`pod_uid`/`container_name` 正是 completion watcher 记录的本 attempt 在本节点上未终止的容器
+（产品 `_resolve_log_attempt` 绑定归属所用的键）；`stitched`/`held_across_polls`/
+`entry_identity` 不变。同一事实也说明 journal 源的 `nccl_error`/`distributed_error` 的 420 s
+incident 等待按设计必然超时，其 PASS 只证明"没有发生不该发生的事"，产品侧的投递证据需要扩展
+store 探针后才能读到（待办）。两集群尚无 `cri_partial_rotation` 的 PASS；重跑无需节点准备。
+
 ### GF-GENERAL-LIVE-019
 
 必测：`volatile_dbe`、`corrected_ecc`、`aggregate_dbe`、`retired_delta`、
@@ -1995,8 +2014,9 @@ Node Agent 回执 `details.node_results[<node>]`——`evidence_ref`/`sha256`/`s
 按节点回执；产品无缺口，两集群按原 release 重跑即可）、
 `exited_pid`（EXITED，不编排 bundle/不抓栈）、`old_pod`（产品 RESTART_WORKLOAD 后以旧 Pod UID
 写入，只能归 UNRESOLVED 或旧 attempt）、`cri_partial_rotation`（P 片段跨轮次、改名轮转与
-采集器重启后与 F 拼成一条，事件时间取 P 的时间戳；投递失败回滚由采集器单元测试钉住，不在线
-诱发），均需 `--site-file`；native 的 `missing_flight_recorder` 复用 011 的两节点 NCCL 任务且
+采集器重启后与 F 拼成一条，事件时间取 P 的时间戳；拼成的行是 NO_ACTION 应用日志规则，产品只留
+NODE_LOGS 记录、不铸 incident，判定读记录本身与 attempt observation；投递失败回滚由采集器单元
+测试钉住，不在线诱发），均需 `--site-file`；native 的 `missing_flight_recorder` 复用 011 的两节点 NCCL 任务且
 无 flight recorder，需 `--site-file --node-b`，判定独立 RDMA 空闲触发
 `detection_basis: ATTEMPT_SCOPED_RDMA_IDLE` 与 triage 的 `not_configured`；process capture 的请求读
 COLLECT_HUNG_TRIAGE 步骤参数（`capture_process_state: true`）并以 triage rank 行的

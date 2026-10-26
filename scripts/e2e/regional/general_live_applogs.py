@@ -8,7 +8,11 @@ Two reviewed sources feed the node log collector's real rules
   real ``journalctl`` output. An out-of-memory line is a WARNING
   ``RUN_DIAGNOSTICS`` from any origin; NCCL and distributed-training errors are
   ``NO_ACTION`` evidence owned by the completion watcher -- never a hardware
-  marker or an extra diagnostic workflow. The OOM line is the kernel's own
+  marker or an extra diagnostic workflow, and never an incident either
+  (``app/ingest/node_health.py`` keeps a ``SITE_APPLICATION_LOG`` NO_ACTION
+  finding as the NODE_LOGS record only, so the journal variants' incident wait
+  runs out by design and their stages check that nothing adverse happened).
+  The OOM line is the kernel's own
   ``Memory cgroup out of memory: Killed process ...`` (``CGROUP_OOM_MESSAGE``),
   and every record travels under a per-run synthetic cursor: the cursor is the
   entry id the control plane hashes into the incident's event id, so a second
@@ -49,9 +53,6 @@ bundle step's ``capture_process_state`` is the triage decision's targetability
 
 from __future__ import annotations
 
-import hashlib
-import json
-import re
 from datetime import datetime
 from typing import Any, Callable
 
@@ -68,6 +69,23 @@ from scripts.e2e.regional.general_live_applog_fixture import (
 )
 from scripts.e2e.regional.general_live_applog_hung import independent_trigger_errors
 from scripts.e2e.regional.general_live_applog_job import ManagedApplogJob
+from scripts.e2e.regional.general_live_applog_verdicts import (
+    DIAGNOSTIC_WORKFLOW_OPS,
+    attributable_errors,
+    attribution_errors,
+    attempt_of,
+    bundle_node_result,
+    container_of,
+    diagnostic_chain_errors,
+    entries_of,
+    entry_identity_errors,
+    evidence_only_errors,
+    incident_of,
+    new_attempt_errors,
+    stitch_errors,
+    stop_errors,
+    workflow_of,
+)
 from scripts.e2e.regional.general_live_common import activity, restore_incidents
 from scripts.e2e.regional.general_live_fixture import (
     GeneralLiveSettings,
@@ -94,7 +112,6 @@ from scripts.e2e.regional.general_live_verdicts import (
     operations,
     parse_time,
     settled,
-    step_parameters,
     verdict,
     workflows_of,
 )
@@ -103,9 +120,6 @@ from scripts.e2e.regional.host_probe_fixture import HostProbeError
 CASE = "GF-GENERAL-LIVE-017"
 ENABLE = "ENABLE_NODE_LOG_COLLECTOR"
 DETECTION_BUDGET = 420
-DIAGNOSTIC_WORKFLOW_OPS = frozenset(
-    {"RUN_DIAGNOSTICS", "COLLECT_DIAGNOSTIC_BUNDLE", "RUN_DCGM_DIAGNOSTIC"}
-)
 #: How long the collector (10 s poll) plus ingestion may take to deliver a line.
 ENTRY_BUDGET = 180
 #: How long the completion watcher (5 s poll) may take to record a Pod change.
@@ -128,7 +142,6 @@ OLD_POD_ATTEMPTS = 3
 #: right after the tick, the file lives the whole next period; seeded between
 #: two probe calls it lived 6 s live (HyperPod, 2026-10-26).
 OLD_POD_GC_WAIT_SECONDS = 75
-STEPS_WITH_DIAGNOSTIC_PARAMETERS = ("COLLECT_DIAGNOSTIC_BUNDLE", "COLLECT_HUNG_TRIAGE")
 
 
 # --------------------------------------------------------------------------- #
@@ -280,349 +293,6 @@ def _no_diagnostic_workflow(
                 errors.append(
                     f"an evidence-only application error ran a diagnostic workflow {found}"
                 )
-    return errors
-
-
-# --------------------------------------------------------------------------- #
-# CRI Pod-log attribution: product-record readers (pure)
-# --------------------------------------------------------------------------- #
-def safe_component(value: str) -> str:
-    """``HostHealthEvaluator._safe``: the event-id component sanitizer."""
-
-    return re.sub(r"[^a-zA-Z0-9_.-]+", "-", value)[:160]
-
-
-def log_event_id(cluster_id: str, node_id: str, entry_id: str) -> str:
-    """``log_recovery_context.log_event_id`` recomputed from a delivered entry."""
-
-    digest = hashlib.sha256(
-        json.dumps(
-            [cluster_id, node_id, entry_id], ensure_ascii=True, separators=(",", ":")
-        ).encode("utf-8")
-    ).hexdigest()[:32]
-    return f"log-{safe_component(cluster_id)}-{safe_component(node_id)}-{digest}"
-
-
-def entries_of(records: dict[str, Any], paths: set[str]) -> list[dict[str, Any]]:
-    """The delivered NODE_LOGS entries read from any of the fixture ``paths``."""
-
-    return [
-        item
-        for item in records.get("entries") or []
-        if str((item.get("fields") or {}).get("path")) in paths
-    ]
-
-
-def incident_of(
-    records: dict[str, Any], entry: dict[str, Any]
-) -> dict[str, Any] | None:
-    """The incident the product minted for ``entry`` (by its derived event id)."""
-
-    wanted = log_event_id(
-        str(records.get("cluster_id")),
-        str(records.get("node_id")),
-        str(entry.get("entry_id")),
-    )
-    for incident in records.get("incidents") or []:
-        if incident.get("event_id") == wanted:
-            return incident
-    return None
-
-
-def workflow_of(
-    records: dict[str, Any], incident: dict[str, Any] | None
-) -> dict[str, Any] | None:
-    if not incident or not incident.get("workflow_request_id"):
-        return None
-    value = (records.get("workflows") or {}).get(str(incident["workflow_request_id"]))
-    return dict(value) if isinstance(value, dict) else None
-
-
-def attempt_of(records: dict[str, Any], attempt_id: str) -> dict[str, Any] | None:
-    for item in records.get("attempts") or []:
-        if item.get("attempt_id") == attempt_id:
-            return item
-    return None
-
-
-def container_of(
-    attempt: dict[str, Any] | None, pod_uid: str, container: str
-) -> dict[str, Any] | None:
-    for item in (attempt or {}).get("containers") or []:
-        if item.get("pod_uid") == pod_uid and item.get("container_name") == container:
-            return item
-    return None
-
-
-def diagnostic_parameters(workflow: dict[str, Any] | None) -> list[dict[str, Any]]:
-    """The finding's attribution parameters, as copied onto the bundle steps."""
-
-    if not workflow:
-        return []
-    return [
-        parameters
-        for operation in STEPS_WITH_DIAGNOSTIC_PARAMETERS
-        for parameters in step_parameters(workflow, operation)
-    ]
-
-
-def capture_steps(workflow: dict[str, Any] | None) -> list[str]:
-    """Steps that would sample a process: capture requested or PIDs targeted."""
-
-    if not workflow:
-        return []
-    return [
-        str(step.get("operation"))
-        for step in workflow.get("official_steps") or []
-        if (step.get("parameters") or {}).get("capture_process_state")
-        or (step.get("parameters") or {}).get("target_pids_by_node")
-    ]
-
-
-def bundle_node_result(
-    execution: dict[str, Any] | None, node: str
-) -> dict[str, Any] | None:
-    """The Node Agent's COLLECT_DIAGNOSTIC_BUNDLE receipt for ``node``.
-
-    A node-agent step is recorded per node under ``details.node_results[<node>]``
-    (``adapters/node_action/step_execution``): ``evidence_ref``, ``sha256``,
-    ``size_bytes`` and the ``manifest_summary`` the agent wrote
-    (``capture_count``, ``failed_capture_count``, ``diagnostic_reason``,
-    ``capture_process_state``). Nothing is hoisted to the step's own
-    ``details``. Live (HyperPod, 2026-10-26) a bundle of 25 captures and 0
-    failures -- py-spy, ``/proc`` and strace of the targeted host PID -- read
-    as "did not capture the live process state" while this oracle looked for
-    ``details.manifest_summary``.
-    """
-
-    results = ((execution or {}).get("details") or {}).get("node_results")
-    value = results.get(node) if isinstance(results, dict) else None
-    return dict(value) if isinstance(value, dict) else None
-
-
-def entry_identity_errors(
-    entry: dict[str, Any] | None,
-    *,
-    pod_uid: str,
-    container: str,
-    stamp: str | None,
-    message: str | None = None,
-) -> list[str]:
-    """The delivered entry names the genuine Pod/container and the CRI time."""
-
-    if entry is None:
-        return ["no fixture line was delivered"]
-    errors = []
-    fields = entry.get("fields") or {}
-    if entry.get("source") != "training-log":
-        errors.append(f"entry source {entry.get('source')!r} is not training-log")
-    if fields.get("pod_uid") != pod_uid:
-        errors.append(f"entry pod_uid {fields.get('pod_uid')!r} != {pod_uid}")
-    if fields.get("container_name") != container:
-        errors.append(
-            f"entry container {fields.get('container_name')!r} != {container}"
-        )
-    if fields.get("timestamp_source") != "cri":
-        errors.append(f"timestamp source {fields.get('timestamp_source')!r} is not cri")
-    event_at = parse_time(entry.get("observed_at"))
-    stamped = parse_time(stamp) if stamp else None
-    if event_at is None or stamped is None:
-        errors.append("the entry or the fixture stamp has no readable time")
-    elif abs((event_at - stamped).total_seconds()) > 1.0:
-        errors.append(
-            f"event time {entry.get('observed_at')} is not the CRI stamp {stamp}"
-        )
-    if message is not None and entry.get("message") != message:
-        errors.append(f"entry message {entry.get('message')!r} != {message!r}")
-    return errors
-
-
-def attribution_errors(
-    incident: dict[str, Any] | None,
-    workflow: dict[str, Any] | None,
-    *,
-    job_id: str,
-    attempt_id: str,
-    process_state: str,
-    node: str,
-    pid: int | None,
-) -> list[str]:
-    """The incident names the attempt; the bundle step carries the attribution."""
-
-    if incident is None:
-        return ["the delivered line produced no incident"]
-    errors = []
-    if incident.get("job_id") != job_id or incident.get("attempt_id") != attempt_id:
-        errors.append(
-            f"incident attributed to {incident.get('job_id')}/{incident.get('attempt_id')}"
-            f", expected {job_id}/{attempt_id}"
-        )
-    parameters = diagnostic_parameters(workflow)
-    if process_state == "LIVE":
-        if not parameters:
-            errors.append(
-                "no diagnostic bundle step carries the attribution parameters"
-            )
-        for item in parameters:
-            if item.get("attribution") != "OBSERVED_PROCESS":
-                errors.append(
-                    f"attribution {item.get('attribution')!r} != OBSERVED_PROCESS"
-                )
-            if item.get("process_state") != "LIVE":
-                errors.append(f"process_state {item.get('process_state')!r} != LIVE")
-            if item.get("log_source") != "training-log":
-                errors.append(f"log_source {item.get('log_source')!r} != training-log")
-            targets = (item.get("target_pids_by_node") or {}).get(node)
-            if pid is not None and targets != [pid]:
-                errors.append(f"target pids {targets!r} != [{pid}] on {node}")
-            if item.get("capture_process_state") is not True:
-                errors.append("capture_process_state is not set for a live process")
-    return errors
-
-
-def diagnostic_chain_errors(
-    incident: dict[str, Any] | None,
-    workflow: dict[str, Any] | None,
-    *,
-    expect_bundle: bool,
-    node: str | None = None,
-) -> list[str]:
-    """RUN_DIAGNOSTICS; the bundle ran for a live process and never for an exited one.
-
-    ``node`` is the node whose agent collected the bundle (required when one is
-    expected): its receipt under ``details.node_results[<node>]`` says whether
-    the process capture ran (``manifest_summary.capture_process_state``), and
-    a node the step has no receipt for is named with the failure or skip the
-    step recorded for it instead of being read as a bundle without one.
-    """
-
-    if incident is None:
-        return ["no incident"]
-    errors = []
-    if incident.get("effective_action") != "RUN_DIAGNOSTICS":
-        errors.append(
-            f"effective action {incident.get('effective_action')!r} != RUN_DIAGNOSTICS"
-        )
-    if workflow is None:
-        return [*errors, "the incident has no workflow"]
-    ops = operations(workflow)
-    if expect_bundle:
-        if node is None:
-            raise ValueError("expect_bundle needs the node whose agent ran the bundle")
-        if "COLLECT_DIAGNOSTIC_BUNDLE" not in ops:
-            errors.append(f"no COLLECT_DIAGNOSTIC_BUNDLE for a live process: {ops}")
-        execution = final_execution(workflow, "COLLECT_DIAGNOSTIC_BUNDLE")
-        if execution is None or execution.get("status") != "SUCCEEDED":
-            errors.append(
-                "the diagnostic bundle did not succeed: "
-                f"{(execution or {}).get('status')} {(execution or {}).get('error')}"
-            )
-        else:
-            result = bundle_node_result(execution, node)
-            details = execution.get("details") or {}
-            if result is None:
-                cause = (details.get("node_failures") or {}).get(node) or details.get(
-                    "skipped"
-                )
-                errors.append(
-                    f"the bundle step recorded no result for {node}"
-                    + (f": {cause}" if cause else "")
-                )
-            elif (result.get("manifest_summary") or {}).get(
-                "capture_process_state"
-            ) is not True:
-                errors.append(
-                    f"the bundle on {node} did not run the live process capture: "
-                    f"manifest_summary {result.get('manifest_summary')!r}"
-                )
-    else:
-        sampled = capture_steps(workflow)
-        if sampled:
-            errors.append(
-                f"an exited process was still scheduled for sampling: {sampled}"
-            )
-        if "COLLECT_DIAGNOSTIC_BUNDLE" in ops:
-            errors.append(
-                "a diagnostic bundle (stack capture) was planned for an exited PID"
-            )
-    return errors
-
-
-def stop_errors(workflow: dict[str, Any] | None) -> list[str]:
-    if workflow and "STOP_WORKLOADS" in operations(workflow):
-        return [f"workflow {workflow.get('request_id')} stopped the attempt"]
-    return []
-
-
-def no_diagnostic_errors(workflow: dict[str, Any] | None) -> list[str]:
-    found = sorted(set(operations(workflow or {})) & DIAGNOSTIC_WORKFLOW_OPS)
-    return [f"an evidence-only line ran a diagnostic workflow {found}"] if found else []
-
-
-def new_attempt_errors(
-    incident: dict[str, Any] | None,
-    workflow: dict[str, Any] | None,
-    *,
-    new_attempt_id: str,
-    new_pid: int | None,
-    node: str,
-) -> list[str]:
-    """An old Pod's line never reaches the new attempt or its live PID."""
-
-    if incident is None:
-        return ["the delivered line produced no incident"]
-    errors = []
-    if incident.get("attempt_id") == new_attempt_id:
-        errors.append(
-            f"the old Pod's line was attributed to the new attempt {new_attempt_id}"
-        )
-    for item in diagnostic_parameters(workflow):
-        targets = (item.get("target_pids_by_node") or {}).get(node) or []
-        if new_pid is not None and new_pid in targets:
-            errors.append(f"the new attempt's PID {new_pid} was targeted for sampling")
-        if item.get("process_state") == "LIVE":
-            errors.append("an old Pod's line was graded as a LIVE process")
-    return errors
-
-
-def stitch_errors(
-    entries: list[dict[str, Any]],
-    *,
-    message: str,
-    rotated_path: str,
-    head_stamp: str | None,
-) -> list[str]:
-    """One record with the whole message, at the P fragment's time, on the rotated inode."""
-
-    if not entries:
-        return ["no record was delivered from the fixture file"]
-    errors = []
-    whole = [item for item in entries if item.get("message") == message]
-    if len(whole) != 1:
-        errors.append(
-            f"{len(whole)} records carry the stitched message, expected exactly one"
-        )
-    fragments = [
-        item.get("message") for item in entries if item.get("message") != message
-    ]
-    if fragments:
-        errors.append(f"fragments were delivered on their own: {fragments}")
-    if whole:
-        entry = whole[0]
-        if str((entry.get("fields") or {}).get("path")) != rotated_path:
-            errors.append(
-                f"the stitched record was read from {(entry.get('fields') or {}).get('path')}"
-                f", not the rotated file {rotated_path}"
-            )
-        event_at = parse_time(entry.get("observed_at"))
-        stamped = parse_time(head_stamp) if head_stamp else None
-        if event_at is None or stamped is None:
-            errors.append("the stitched record or the P stamp has no readable time")
-        elif abs((event_at - stamped).total_seconds()) > 1.0:
-            errors.append(
-                f"the stitched record's time {entry.get('observed_at')} is not the "
-                f"P fragment's stamp {head_stamp}"
-            )
     return errors
 
 
@@ -1273,12 +943,12 @@ def cri_partial_rotation(ctx: VariantContext) -> dict[str, Any]:
     message = PARTIAL_HEAD + PARTIAL_TAIL
     delivered = entries_of(records, paths)
     whole = [item for item in delivered if item.get("message") == message]
-    incident = workflow = None
-    if whole:
-        records = _wait_graded(ctx, since, job, needle, whole[0], name="partial-graded")
-        delivered = entries_of(records, paths)
-        incident = incident_of(records, whole[0])
-        workflow = workflow_of(records, incident)
+    entry = whole[0] if whole else None
+    # The stitched line is a NO_ACTION application-log rule: the product keeps
+    # it as the NODE_LOGS record and mints no incident (evidence_only_errors),
+    # so there is nothing to wait for once the record is in the store, and the
+    # attribution is read off the record and the attempt observation.
+    workflow = workflow_of(records, incident_of(records, entry)) if entry else None
     stages = {
         "stitched": stitch_errors(
             delivered,
@@ -1290,21 +960,21 @@ def cri_partial_rotation(ctx: VariantContext) -> dict[str, Any]:
         if pending is not None
         else ["the collector never recorded the P fragment as pending"],
         "entry_identity": entry_identity_errors(
-            whole[0] if whole else None,
+            entry,
             pod_uid=str(pod["uid"]),
             container=job.container,
             stamp=(head.get("stamps") or [None])[0],
             message=message,
         ),
-        "single_incident": []
-        if incident is not None and incident.get("effective_action") == "NO_ACTION"
-        else ["the stitched line did not produce one NO_ACTION evidence incident"],
-        "attributed": []
-        if incident is not None and incident.get("attempt_id") == job.attempt_id
-        else [
-            f"the stitched line was attributed to {(incident or {}).get('attempt_id')}"
-        ],
-        "evidence_only": no_diagnostic_errors(workflow),
+        "attributable": attributable_errors(
+            records,
+            entry,
+            attempt_id=job.attempt_id,
+            pod_uid=str(pod["uid"]),
+            container=job.container,
+            node=ctx.settings.node,
+        ),
+        "evidence_only": evidence_only_errors(records, entry),
         **_common_stages(ctx, records, workflow),
     }
     return _result(
@@ -1312,7 +982,10 @@ def cri_partial_rotation(ctx: VariantContext) -> dict[str, Any]:
         notes=[
             "the P fragment was held across polls, a rename rotation and a collector "
             "restart (persisted state), then stitched with its F; the rejected-batch "
-            "rollback of that state is pinned by the collector's unit tests, not induced live"
+            "rollback of that state is pinned by the collector's unit tests, not induced live",
+            "a NO_ACTION application-log line mints no incident, marker or workflow "
+            "(node_health.ingest): the delivered record is the evidence and names the "
+            "attempt's live Pod UID/container",
         ],
         extra={
             "attempt": job.identity(),
@@ -1480,7 +1153,9 @@ VARIANTS = [
         "a CRI P fragment, then a rename rotation and a collector restart, then the F "
         "fragment on the rotated inode",
         "one stitched record at the P fragment's time from the rotated file; no fragment "
-        "delivered alone; one NO_ACTION evidence incident attributed to the attempt",
+        "delivered alone; the record names the attempt's live Pod UID/container; no "
+        "incident, marker or workflow for a NO_ACTION application-log line (kept as the "
+        "NODE_LOGS record only)",
         cri_partial_rotation,
     ),
     VariantSpec(
