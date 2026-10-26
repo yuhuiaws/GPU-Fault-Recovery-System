@@ -2037,6 +2037,13 @@ boards rather than being dropped (every plan-only variant records its reason on
 both lanes: a site-wide gap is a fact about each cluster). No GF-GENERAL-LIVE
 case has live evidence yet.
 
+Every variant's optional `preflight` hook takes `(settings, regional)` -- the
+fixture is the second argument so a hook can read the cluster (the 030 spare
+candidate) -- and `read_only_preflight` calls every hook that way; a framework
+test pins the signature of each registered hook, after the 017 application-log
+hooks still took one argument and five variants ended NO_EVIDENCE on
+2026-10-26 with a `TypeError` before any evidence existed.
+
 011 `fr_enabled` (the Flight Recorder configured as the operations manual
 prescribes: trace buffer, pipe, dump-file prefix and dump-on-timeout; at least
 one PID must show two real dumps as `PAIRED`) is registered as an expected FAIL

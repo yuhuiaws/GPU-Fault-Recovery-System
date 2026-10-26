@@ -1222,8 +1222,11 @@ def _result(
 
 def _needs(
     *, site: bool = False, peer: bool = False
-) -> Callable[[GeneralLiveSettings], list[str]]:
-    def check(settings: GeneralLiveSettings) -> list[str]:
+) -> Callable[[GeneralLiveSettings, Any], list[str]]:
+    # ``spec.preflight`` hooks take ``(settings, regional)`` since the 030 candidate
+    # preflight (S15, 2026-10-26); live 017 live_pid/exited_pid crashed with
+    # "check() takes 1 positional argument but 2 were given" when this one did not.
+    def check(settings: GeneralLiveSettings, _regional: Any = None) -> list[str]:
         errors = []
         if site and settings.site_file is None:
             errors.append("a managed test job needs --site-file")

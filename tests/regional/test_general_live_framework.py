@@ -750,3 +750,32 @@ def test_chain_judgeable_waits_for_a_terminal_validation() -> None:
     assert v.pending_summary({"status": "WAITING", "error": "lease lost"}) == (
         "lease lost"
     )
+
+
+def test_every_preflight_hook_accepts_settings_and_regional() -> None:
+    """``read_only_preflight`` calls ``spec.preflight(settings, regional)``.
+
+    S15 widened the contract for the 030 spare candidate; the 017 ``_needs`` hooks
+    still took one argument and every 017 variant with a hook ended NO_EVIDENCE live
+    (2026-10-26 05:46Z, ``TypeError: check() takes 1 positional argument``). The
+    hook must accept the fixture as its second argument even when it ignores it.
+    """
+
+    import inspect
+
+    registry = reg.load_registry()
+    broken = []
+    for key, item in sorted(registry.items()):
+        hook = getattr(item, "preflight", None)
+        if hook is None:
+            continue
+        parameters = [
+            p
+            for p in inspect.signature(hook).parameters.values()
+            if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD, p.VAR_POSITIONAL)
+        ]
+        if len(parameters) < 2 and not any(
+            p.kind is p.VAR_POSITIONAL for p in parameters
+        ):
+            broken.append(key)
+    assert broken == [], broken
