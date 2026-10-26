@@ -3140,6 +3140,26 @@ validation and are unchanged. The WAITING summary of every chain verdict now
 prints the health-evidence reason and the missing observations instead of the
 detail keys. To be re-run on both clusters.
 
+025 `conflicting_alias` ended INCONCLUSIVE live (2026-10-26 08:53Z, eksb
+ip-10-0-32-162, R13g): "the replay aborted: DCGM_FI_DEV_CLOCK_THROTTLE_REASONS
+is not a distinct alias of DCGM_FI_DEV_CLOCK_THROTTLE_REASONS". The variant
+hard-coded the injected alias, and this node's dcgm-exporter 4.6.1 publishes
+`clock_throttle_reasons` under exactly that (legacy) name, so the tool's alias
+op refused it by design. No exporter publishes two names of one field (the
+survey's `exporter.gpus[uuid].metric_names` carries one name per canonical
+field on the H200 nodes); a distinct alias pair is the published name plus the
+product's other name for the same canonical field
+(`collectors/gpu/dcgm.DCGM_METRICS` inverted, limited to the completeness
+profile's fields -- only `clock_throttle_reasons`:
+DCGM_FI_DEV_CLOCK_THROTTLE_REASONS / DCGM_FI_DEV_CLOCKS_EVENT_REASONS; the
+T.Limit pair is a thermal-safety reading the profile excludes). The pair is now
+chosen from the survey before anything is installed (`alias_pair`, on the
+highest-index GPU reporting the field) and recorded in the result
+(`alias_pair`: field, published, injected, value); a node with no usable pair
+is NOT_RUN(CAPABILITY_ABSENT, "no canonical field has two distinct exporter
+aliases on this node: ...") instead of an abort mid-run. To be re-run on both
+clusters (live16).
+
 024 `thermal_warning` and `power_performance` reuse the GF-ENV-LIVE
 telemetry replay unchanged (`tools/gpu_environment_replay.py`,
 `probes/env_replay_proxy.py`, `env_live_fixture.EnvReplayController`) through

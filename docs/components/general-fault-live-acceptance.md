@@ -811,6 +811,18 @@ VALIDATE_HOST 不得在暂停期间 SUCCEEDED（`paused` 阶段：旧成功放�
 （检测 12 min + 验证 5 min + 新成功）。`sustained_unknown`/`post_refresh_success` 与五个字段变体
 不要求验证终态，没有同类时序问题。
 
+`conflicting_alias`（2026-10-26 08:53Z eksb INCONCLUSIVE 的根因："DCGM_FI_DEV_CLOCK_THROTTLE_REASONS
+is not a distinct alias of DCGM_FI_DEV_CLOCK_THROTTLE_REASONS"）：变体原来写死注入别名
+`DCGM_FI_DEV_CLOCK_THROTTLE_REASONS`，而本站 H200 的 dcgm-exporter 4.6.1 正是用这个（旧）名字发布
+`clock_throttle_reasons`，回放工具按设计中止。exporter 不会同时发布一个字段的两个名字（survey 的
+`exporter.gpus[uuid].metric_names` 每个 canonical 只有一个名字），"两个不同的别名" = 节点发布的那个 +
+产品同一 canonical 的另一个名字（`collectors/gpu/dcgm.DCGM_METRICS` 反查、限 completeness profile 允许的
+字段：只有 `clock_throttle_reasons` 的 `DCGM_FI_DEV_CLOCK_THROTTLE_REASONS`/`DCGM_FI_DEV_CLOCKS_EVENT_REASONS`；
+T.Limit 对是热安全读数，profile 排除）。现在在 survey 之后、装任何东西之前选定（`alias_pair`，取报告该
+字段的最高序号 GPU），结果记 `alias_pair{field, published, injected, value}`；没有可用对的节点记
+`NOT_RUN(CAPABILITY_ABSENT, "no canonical field has two distinct exporter aliases on this node: …")`，
+不再中途 abort。
+
 ### GF-GENERAL-LIVE-026
 
 必测：`uuid_changed`、`bdf_changed`、`count_unchanged`、`unknown_expected_count`、

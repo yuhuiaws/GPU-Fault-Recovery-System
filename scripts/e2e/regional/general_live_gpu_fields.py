@@ -13,7 +13,10 @@ completeness check:
   fields, so the field is still present on the others and the per-GPU
   omission is not reported. Expected FAIL (product gap);
 * ``conflicting_alias`` -- two exporter aliases of one field with different
-  values: both are rejected as an ambiguous slot, never silently overwritten;
+  values: both are rejected as an ambiguous slot, never silently overwritten.
+  The pair is the name the node publishes the field under plus the product's
+  other name for it (``alias_pair``), chosen from the survey before anything
+  is installed; a node without such a pair is NOT_RUN(CAPABILITY_ABSENT);
 * ``nan_negative`` -- a negative value is rejected and a NaN is dropped: neither
   slot's latest accepted sample moves past the first replayed scrape (the
   earlier real reading is retained; it never becomes a healthy zero);
@@ -23,12 +26,15 @@ completeness check:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from gpu_fault.collectors.gpu.dcgm import DCGM_METRICS
 from scripts.e2e.regional.general_live_fixture import VariantContext, VariantNotRun
 from scripts.e2e.regional.general_live_gpu_replay import (
     DcgmReplay,
+    GpuSurvey,
     arm_and_confirm,
     baseline,
     gpu_spec,
@@ -46,14 +52,98 @@ from scripts.e2e.regional.general_live_gpu_verdicts import (
     collection_errors,
     latest_value,
 )
+from tools.gpu_dcgm_field_replay import PROFILES as FIELD_PROFILES
 
 CASE = "GF-GENERAL-LIVE-025"
 REQUIRED = "pcie_replay_total"
 #: The reviewed gauge the ``nan_negative`` NaN is served on: a required field
 #: of the product's per-GPU completeness check, so the dropped slot is reported.
 NAN_FIELD = "row_remap_failure"
-ALIAS_FIELD = "clock_throttle_reasons"
-ALIAS_NAME = "DCGM_FI_DEV_CLOCK_THROTTLE_REASONS"
+#: The value served under the injected alias: a clock event bitmask the real
+#: reading never carries at the same time (``0x40`` HW slowdown); halved when
+#: the real reading happens to be it, so the two aliases always disagree.
+ALIAS_VALUE = 64
+
+
+@dataclass(frozen=True)
+class AliasPair:
+    """One canonical field, the exporter name the node publishes it under and
+    the product's other name for it -- what the ``alias`` op serves."""
+
+    gpu: str
+    field: str
+    published: str
+    alias: str
+
+    def describe(self) -> dict[str, str]:
+        return {
+            "field": self.field,
+            "published": self.published,
+            "injected": self.alias,
+        }
+
+
+def alias_families() -> dict[str, tuple[str, ...]]:
+    """Canonical fields the product reads under two or more exporter names
+    (``collectors/gpu/dcgm.DCGM_METRICS``) that the completeness profile may
+    serve (``tools/gpu_dcgm_field_replay.PROFILES``).
+
+    On the shipped product that is ``clock_throttle_reasons`` alone: DCGM 4
+    renamed ``DCGM_FI_DEV_CLOCK_THROTTLE_REASONS`` to
+    ``DCGM_FI_DEV_CLOCKS_EVENT_REASONS`` and an exporter publishes one of the
+    two; the T.Limit pair is a thermal-safety reading the profile excludes.
+    """
+
+    names: dict[str, set[str]] = {}
+    for exporter_name, (canonical, _unit) in DCGM_METRICS.items():
+        names.setdefault(canonical, set()).add(exporter_name)
+    allowed = FIELD_PROFILES["completeness"].fields
+    return {
+        canonical: tuple(sorted(members))
+        for canonical, members in sorted(names.items())
+        if len(members) >= 2 and canonical in allowed
+    }
+
+
+def alias_pair(survey: GpuSurvey) -> AliasPair:
+    """The pair ``conflicting_alias`` serves, decided from the survey before
+    anything is installed on the node.
+
+    Live 2026-10-26 (eksb, H200, dcgm-exporter 4.6.1) the exporter published
+    ``clock_throttle_reasons`` as ``DCGM_FI_DEV_CLOCK_THROTTLE_REASONS`` -- the
+    very name the variant injected -- and the replay aborted mid-run ("is not
+    a distinct alias"). No exporter publishes two names of one field, so the
+    pair is the published name and the family member the node does *not*
+    publish, on the highest-index GPU reporting the field. A node publishing
+    none, or every, name of each family is ``NOT_RUN(CAPABILITY_ABSENT)``
+    naming the candidates, with nothing armed.
+    """
+
+    candidates = []
+    for field, members in alias_families().items():
+        gpus = survey.gpus_with(field)
+        published_by_gpu = {gpu: survey.exporter_metrics(gpu, field) for gpu in gpus}
+        seen = sorted({name for names in published_by_gpu.values() for name in names})
+        candidates.append(
+            f"{field} ({'|'.join(members)}; published: {', '.join(seen) or 'none'})"
+        )
+        for gpu in reversed(gpus):
+            published = published_by_gpu[gpu]
+            bare = {name.removesuffix("_total") for name in published}
+            spare = [name for name in members if name not in bare]
+            if len(published) == 1 and spare:
+                return AliasPair(
+                    gpu=gpu, field=field, published=published[0], alias=spare[0]
+                )
+    raise VariantNotRun(
+        "CAPABILITY_ABSENT",
+        "no canonical field has two distinct exporter aliases on this node: "
+        + "; ".join(candidates),
+    )
+
+
+def conflicting_value(real: float | None) -> int:
+    return ALIAS_VALUE if real != ALIAS_VALUE else ALIAS_VALUE // 2
 
 
 def _hold(ctx: VariantContext) -> int:
@@ -142,7 +232,8 @@ def one_gpu_missing(ctx: VariantContext) -> dict[str, Any]:
 
 def conflicting_alias(ctx: VariantContext) -> dict[str, Any]:
     survey = run_gpu_survey(ctx)
-    gpu = survey.target(ALIAS_FIELD)
+    pair = alias_pair(survey)
+    value = conflicting_value(survey.value(pair.gpu, pair.field))
     since = utc_now()
     repl = DcgmReplay(
         ctx,
@@ -153,24 +244,24 @@ def conflicting_alias(ctx: VariantContext) -> dict[str, Any]:
                 40,
                 {
                     "op": "alias",
-                    "field": ALIAS_FIELD,
-                    "gpus": [gpu],
-                    "name": ALIAS_NAME,
-                    "value": 64,
+                    "field": pair.field,
+                    "gpus": [pair.gpu],
+                    "name": pair.alias,
+                    "value": value,
                 },
                 hold=True,
             ),
         ),
         _hold(ctx),
     )
-    arm_and_confirm(repl, f"{gpu}/{ALIAS_FIELD}#alias:{ALIAS_NAME}")
+    arm_and_confirm(repl, f"{pair.gpu}/{pair.field}#alias:{pair.alias}")
     _settle(ctx, survey)
-    doc = _state(ctx, since, ALIAS_FIELD)
+    doc = _state(ctx, since, pair.field)
     errors = collection_errors(doc)
-    samples = accepted_samples(doc, ALIAS_FIELD, gpu)
+    samples = accepted_samples(doc, pair.field, pair.gpu)
     stages = {
         "ambiguous_rejected": []
-        if any(gpu in text and ALIAS_FIELD in text for text in errors)
+        if any(pair.gpu in text and pair.field in text for text in errors)
         else ["a conflicting field alias was not reported as an ambiguous slot"],
         "no_silent_overwrite": []
         if not samples
@@ -178,8 +269,15 @@ def conflicting_alias(ctx: VariantContext) -> dict[str, Any]:
             f"a conflicting alias slot was accepted as a value: {samples[-1].get('value')}"
         ],
     }
-    recover_counter(ctx, repl, since, names=[ALIAS_FIELD])
-    return result(stages, extra={"gpu_uuid": gpu, "collection_errors": errors[:5]})
+    recover_counter(ctx, repl, since, names=[pair.field])
+    return result(
+        stages,
+        extra={
+            "gpu_uuid": pair.gpu,
+            "alias_pair": {**pair.describe(), "value": value},
+            "collection_errors": errors[:5],
+        },
+    )
 
 
 def _when(text: Any) -> datetime | None:
@@ -435,8 +533,8 @@ VARIANTS = [
     gpu_spec(
         CASE,
         "conflicting_alias",
-        "serve two exporter aliases of one field with different values",
-        "the ambiguous slot is rejected, never silently overwritten",
+        "serve the product's other exporter name of a field the node publishes under one name, with a different value",
+        "the ambiguous slot is rejected, never silently overwritten; no distinct alias pair on the node is NOT_RUN before anything is installed",
         conflicting_alias,
         max_minutes=14,
     ),

@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import base64
+import json
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from scripts.e2e.regional import general_live_gpu_fields as fields
+from scripts.e2e.regional.general_live_fixture import VariantNotRun
 from tests.regional._general_live_fakes import FakeRegional, make_context, make_settings
 from tests.regional._general_live_gpu_fakes import (
     audit_records,
@@ -131,10 +134,55 @@ def test_one_gpu_missing_fails_when_the_omission_stays_hidden(tmp_path: Path) ->
     assert "whole-batch" in out["errors"][0]
 
 
-def test_conflicting_alias_rejects_the_slot(tmp_path: Path) -> None:
-    served = audit_records(
-        {f"{G1}/clock_throttle_reasons#alias:DCGM_FI_DEV_CLOCK_THROTTLE_REASONS": 64}
-    )
+LEGACY_ALIAS = "DCGM_FI_DEV_CLOCK_THROTTLE_REASONS"
+CURRENT_ALIAS = "DCGM_FI_DEV_CLOCKS_EVENT_REASONS"
+
+
+def alias_survey(*published: str) -> dict[str, Any]:
+    """A Hopper-style survey whose exporter publishes ``clock_throttle_reasons``
+    under ``published`` (one name on a real exporter; the fake's default uses
+    the canonical name, which no exporter does)."""
+
+    value = survey()
+    for entry in value["exporter"]["gpus"].values():
+        entry["metric_names"]["clock_throttle_reasons"] = list(published)
+    return value
+
+
+def shipped_plan(probe: Any) -> dict[str, Any]:
+    """The ``plan.json`` the replay installed on the node, decoded."""
+
+    for call in probe.calls:
+        if (
+            call[0] == "install-source"
+            and call[call.index("--name") + 1] == "plan.json"
+        ):
+            return json.loads(base64.b64decode(call[call.index("--b64") + 1]))
+    raise AssertionError(f"no plan.json was installed: {[c[0] for c in probe.calls]}")
+
+
+def test_alias_families_are_the_products_pairs_the_profile_allows() -> None:
+    """``collectors/gpu/dcgm.DCGM_METRICS`` inverted and limited to the
+    completeness profile: the clock event reasons pair; the T.Limit pair is a
+    thermal-safety reading the profile excludes."""
+
+    assert fields.alias_families() == {
+        "clock_throttle_reasons": (CURRENT_ALIAS, LEGACY_ALIAS)
+    }, fields.alias_families()
+
+
+@pytest.mark.parametrize(
+    "published,injected", [(LEGACY_ALIAS, CURRENT_ALIAS), (CURRENT_ALIAS, LEGACY_ALIAS)]
+)
+def test_conflicting_alias_injects_the_name_the_node_does_not_publish(
+    tmp_path: Path, published: str, injected: str
+) -> None:
+    """Live 2026-10-26 (eksb, H200, dcgm-exporter 4.6.1): the exporter publishes
+    the legacy name the variant hard-coded as its alias, and the replay aborted
+    ("not a distinct alias"). The injected alias is now the family member the
+    survey does not show, for either exporter generation."""
+
+    served = audit_records({f"{G1}/clock_throttle_reasons#alias:{injected}": 64})
     state = _state(
         batches=[
             _batch(
@@ -142,15 +190,61 @@ def test_conflicting_alias_rejects_the_slot(tmp_path: Path) -> None:
             )
         ]
     )
+    probe = dcgm_probe(alias_survey(published), audit=served)
     out = fields.conflicting_alias(
         _ctx(
             tmp_path,
             "conflicting_alias",
-            probe=dcgm_probe(audit=served),
+            probe=probe,
             cpu=gpu_cpu_python(gpu_state=[state, state]),
         )
     )
     assert out["verdict"] == "PASS", out["errors"]
+    assert out["alias_pair"] == {
+        "field": "clock_throttle_reasons",
+        "published": published,
+        "injected": injected,
+        "value": 64,
+    }, out["alias_pair"]
+    assert out["gpu_uuid"] == G1, "the highest-index GPU reporting the field"
+    ops = [op for step in shipped_plan(probe)["steps"] for op in step["ops"]]
+    assert ops == [
+        {
+            "op": "alias",
+            "field": "clock_throttle_reasons",
+            "gpus": [G1],
+            "name": injected,
+            "value": 64,
+        }
+    ], ops
+
+
+def test_conflicting_alias_without_a_distinct_pair_is_not_run_before_arming(
+    tmp_path: Path,
+) -> None:
+    """An exporter publishing both names of the family leaves no distinct alias
+    to inject: NOT_RUN(CAPABILITY_ABSENT) naming the candidates, after the
+    survey and before anything is installed -- never an abort mid-run."""
+
+    probe = dcgm_probe(alias_survey(LEGACY_ALIAS, CURRENT_ALIAS))
+    ctx = _ctx(
+        tmp_path, "conflicting_alias", probe=probe, cpu=gpu_cpu_python(gpu_state=None)
+    )
+    with pytest.raises(VariantNotRun) as caught:
+        fields.conflicting_alias(ctx)
+    assert caught.value.reason == "CAPABILITY_ABSENT", caught.value.args
+    assert caught.value.detail == (
+        "no canonical field has two distinct exporter aliases on this node: "
+        f"clock_throttle_reasons ({CURRENT_ALIAS}|{LEGACY_ALIAS}; published: "
+        f"{CURRENT_ALIAS}, {LEGACY_ALIAS})"
+    ), caught.value.args
+    assert [call[0] for call in probe.calls] == ["survey"], probe.calls
+
+
+def test_conflicting_alias_value_always_differs_from_the_real_reading() -> None:
+    assert fields.conflicting_value(1.0) == 64, "the usual idle bitmask"
+    assert fields.conflicting_value(None) == 64, "no real reading"
+    assert fields.conflicting_value(64.0) == 32, "the real reading is the alias value"
 
 
 # The live 2026-10-26 shape (plain EKS, H200): the replayed scrape at REPLAYED_AT
