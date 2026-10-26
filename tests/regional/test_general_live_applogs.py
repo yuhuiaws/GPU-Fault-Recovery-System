@@ -4,8 +4,9 @@ The journal variants run the kernel-replay FakeProbe; the CRI attribution
 variants run a fake managed job, the CRI Pod-log FakeProbe and scripted
 ``APPLOG_PROBE`` records (attempt observations, delivered NODE_LOGS entries,
 the incident the product minted for the entry and its workflow with the
-attribution parameters on the bundle step); ``missing_flight_recorder`` runs
-011's fakes without a flight recorder.
+attribution parameters on the bundle step); ``missing_flight_recorder``'s
+context (``mfr_ctx``) runs 011's fakes without a flight recorder, its verdict
+tests are ``test_general_live_applogs_hung``.
 """
 
 from __future__ import annotations
@@ -370,8 +371,13 @@ def _replacement() -> dict[str, Any]:
     }
 
 
-@pytest.fixture(autouse=True)
-def _patch_jobs(monkeypatch: pytest.MonkeyPatch) -> None:
+def fake_jobs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Swap the managed jobs for the fakes and reset their class state.
+
+    Plain so ``test_general_live_applogs_hung`` can run it from its own autouse
+    fixture: a fixture defined here is not visible from another module.
+    """
+
     FakeApplogJob.instances = []
     FakeApplogJob.replacement = None
     FakeApplogJob.alive_value = True
@@ -382,6 +388,11 @@ def _patch_jobs(monkeypatch: pytest.MonkeyPatch) -> None:
     FakeNcclJob.alive_value = True
     FakeNcclJob.events = None
     monkeypatch.setattr(nc, "ManagedNcclJob", FakeNcclJob)
+
+
+@pytest.fixture(autouse=True)
+def _patch_jobs(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_jobs(monkeypatch)
 
 
 def _logs_probe(
@@ -1210,9 +1221,18 @@ def test_cri_partial_rotation_fails_when_the_fragment_was_never_held(
 # --------------------------------------------------------------------------- #
 # missing_flight_recorder (011's fakes, no flight recorder)
 # --------------------------------------------------------------------------- #
-def _mfr_ctx(
-    tmp_path: Path, *, ranks: list[dict[str, Any]], parameters: dict[str, Any] | None
+def mfr_ctx(
+    tmp_path: Path,
+    *,
+    ranks: list[dict[str, Any]],
+    parameters: dict[str, Any] | None,
+    bundle: dict[str, Any] | None = None,
 ):
+    """``parameters`` go on the COLLECT_HUNG_TRIAGE steps, ``bundle`` on the
+    COLLECT_DIAGNOSTIC_BUNDLE step (by default the conservative binding an
+    UNDETERMINED decision leaves -- the live HyperPod record); ``parameters=None``
+    leaves every step bare."""
+
     spec = _spec("missing_flight_recorder")
     base = make_settings(spec, node=NODE, peer=PEER)
     tmp_path.mkdir(parents=True, exist_ok=True)
@@ -1224,12 +1244,14 @@ def _mfr_ctx(
     def respond(script: str, *arguments: str) -> dict[str, Any]:
         if script == nc.HUNG_PROBE:
             records = hung_records(arguments[-1], ranks=ranks)
-            for step in records["workflows"]["wf"]["official_steps"]:
-                if (
-                    step["operation"] in mod.STEPS_WITH_DIAGNOSTIC_PARAMETERS
-                    and parameters is not None
-                ):
-                    step["parameters"] = dict(parameters)
+            if parameters is not None:
+                for step in records["workflows"]["wf"]["official_steps"]:
+                    if step["operation"] == "COLLECT_HUNG_TRIAGE":
+                        step["parameters"] = dict(parameters)
+                    elif step["operation"] == "COLLECT_DIAGNOSTIC_BUNDLE":
+                        step["parameters"] = dict(
+                            CONSERVATIVE_BUNDLE if bundle is None else bundle
+                        )
             return records
         return _activity([], [])
 
@@ -1248,55 +1270,45 @@ def _mfr_ctx(
     return ctx
 
 
+#: The finding's parameters as the hung DAG copies them onto its triage steps.
 HUNG_PARAMETERS = {
     "diagnostic_reason": "EFA_TRAFFIC_HUNG_SUSPECTED",
     "detection_basis": "ATTEMPT_SCOPED_RDMA_IDLE",
     "capture_process_state": True,
 }
-FR_OFF_RANK = {"pid": 4242, "rank": 0, "flight_recorder": {"status": "not_configured"}}
-
-
-def test_missing_flight_recorder_passes_on_the_independent_trigger(
-    tmp_path: Path,
-) -> None:
-    ctx = _mfr_ctx(tmp_path, ranks=[FR_OFF_RANK], parameters=HUNG_PARAMETERS)
-    result = mod.missing_flight_recorder(ctx)
-    assert result["verdict"] == "PASS", result["errors"]
-    job = FakeNcclJob.instances[-1]
-    assert job.flight_recorder is False and job.released == 1
-    assert (
-        result["proof_scope"] == "native" and result["application_log_incidents"] == []
-    )
-
-
-def test_missing_flight_recorder_fails_on_a_fabricated_dump_or_a_log_trigger(
-    tmp_path: Path,
-) -> None:
-    paired = {"pid": 4242, "rank": 0, "flight_recorder": {"status": "PAIRED"}}
-    result = mod.missing_flight_recorder(
-        _mfr_ctx(tmp_path / "dump", ranks=[paired], parameters=HUNG_PARAMETERS)
-    )
-    assert result["verdict"] == "FAIL" and any(
-        "FR was not configured" in e for e in result["errors"]
-    )
-    logged = {
-        **HUNG_PARAMETERS,
-        "detection_basis": "APPLICATION_LOG",
-        "diagnostic_reason": "APPLICATION_ERROR",
-    }
-    result = mod.missing_flight_recorder(
-        _mfr_ctx(tmp_path / "log", ranks=[FR_OFF_RANK], parameters=logged)
-    )
-    assert result["verdict"] == "FAIL"
-    assert any("detection basis" in error for error in result["errors"]), result[
-        "errors"
-    ]
-    result = mod.missing_flight_recorder(
-        _mfr_ctx(tmp_path / "none", ranks=[FR_OFF_RANK], parameters=None)
-    )
-    assert any("no diagnostic parameters" in error for error in result["errors"]), (
-        result["errors"]
-    )
+#: The decision a stall without a flight recorder leaves (live HyperPod,
+#: 2026-10-26): no FR timing, every rank alike, nothing to target.
+UNDETERMINED_DECISION = {
+    "classification": "UNDETERMINED",
+    "confidence": "NONE",
+    "reason": (
+        "no communication root cause identified; inspect process observations "
+        "and coverage"
+    ),
+    "culprit_ranks": [],
+    "control_ranks": [],
+    "candidate_count": 0,
+    "candidate_process_count": 0,
+    "targeted_capture_eligible": False,
+    "temporal_verified": False,
+    "flight_recorder_unavailable": True,
+    "flight_recorder_missing_count": 16,
+    "observed_rank_count": 16,
+    "undetermined_nodes": [],
+    "budget_exhausted": True,
+}
+#: The bundle step as ``bind_hung_bundle`` leaves it for that decision.
+CONSERVATIVE_BUNDLE = {
+    **HUNG_PARAMETERS,
+    "capture_process_state": False,
+    "hung_triage_decision": UNDETERMINED_DECISION,
+    "hung_triage_target_pending": False,
+    "target_pids_by_node": {},
+    "max_processes": 0,
+    "disable_strace": True,
+    "operator_escalation_required": True,
+    "bundle_scope": "bounded_triage_nodes",
+}
 
 
 # --------------------------------------------------------------------------- #

@@ -1967,7 +1967,15 @@ Node Agent 回执 `details.node_results[<node>]`——`evidence_ref`/`sha256`/`s
 采集器重启后与 F 拼成一条，事件时间取 P 的时间戳；投递失败回滚由采集器单元测试钉住，不在线
 诱发），均需 `--site-file`；native 的 `missing_flight_recorder` 复用 011 的两节点 NCCL 任务且
 无 flight recorder，需 `--site-file --node-b`，判定独立 RDMA 空闲触发
-`detection_basis: ATTEMPT_SCOPED_RDMA_IDLE` 与 triage 的 `not_configured`）、
+`detection_basis: ATTEMPT_SCOPED_RDMA_IDLE` 与 triage 的 `not_configured`；process capture 的请求读
+COLLECT_HUNG_TRIAGE 步骤参数（`capture_process_state: true`）并以 triage rank 行的
+`python_stack`/`stack_series`/`process_series` 证明已采样，bundle 步骤的 `capture_process_state` 是
+`bind_hung_bundle` 按 `hung_triage_decision` 绑定的结果（仅 `targeted_capture_eligible`——需 FR 时序证据的
+1–3 个已验身份候选——才 `identity_bound_candidates` 抓栈，否则 `bounded_triage_nodes`、无 PID、
+`operator_escalation_required`），判定只核对这四项与决定一致，不再要求 bundle 抓栈；HyperPod 首次有效运行
+（2026-10-26 12:0x Z，R13g）triage 两节点 16/16 rank 的 py-spy 栈均 COLLECTED、决定 UNDETERMINED/无候选、
+bundle 保守，却判 "did not request process state capture"，是 oracle 把 bundle 的绑定结果当请求
+（批次 197 修正，产品无缺口））、
 032 `unknown_xid`（判为 SITE_SAFETY）、`duplicate` 与 `missing_topology`、013
 `unreadable_state`（UNKNOWN 而非零卡）与整树回放的 `unknown_inventory`/`excess_device`/
 `link_inactive`，phase-1 文件源 001 `invalid_delta`、008 `statistics_failed`、

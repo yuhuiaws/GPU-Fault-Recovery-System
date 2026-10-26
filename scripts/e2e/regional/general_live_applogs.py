@@ -33,7 +33,11 @@ Two reviewed sources feed the node log collector's real rules
 flight recorder (``ManagedNcclJob(flight_recorder=False)``) stalls at zero EFA
 traffic while every process stays alive, and the product's independent
 RDMA-idle trigger (``ATTEMPT_SCOPED_RDMA_IDLE``) must raise the hung chain with
-``not_configured`` flight-recorder evidence -- no log line is involved.
+``not_configured`` flight-recorder evidence -- no log line is involved. The
+chain's process capture is read where the product puts it: requested on the
+COLLECT_HUNG_TRIAGE steps and shown by the rank rows the agents returned; the
+bundle step's ``capture_process_state`` is the triage decision's targetability
+(``hung_bundle.bind_hung_bundle``), conservative without a flight recorder.
 """
 
 from __future__ import annotations
@@ -53,6 +57,7 @@ from scripts.e2e.regional.general_live_applog_fixture import (
     cri_pod_logs,
     reviewed_line,
 )
+from scripts.e2e.regional.general_live_applog_hung import independent_trigger_errors
 from scripts.e2e.regional.general_live_applog_job import ManagedApplogJob
 from scripts.e2e.regional.general_live_common import activity, restore_incidents
 from scripts.e2e.regional.general_live_fixture import (
@@ -602,35 +607,6 @@ def stitch_errors(
                 f"P fragment's stamp {head_stamp}"
             )
     return errors
-
-
-def independent_trigger_errors(records: dict[str, Any]) -> list[str]:
-    """The hung chain came from the RDMA-idle rule, with process capture."""
-
-    incident = nccl.hung_incident(records)
-    if incident is None:
-        return ["no EFA hung_suspected incident"]
-    workflow = (records.get("workflows") or {}).get(
-        str(incident.get("workflow_request_id"))
-    )
-    parameters = [
-        item
-        for item in diagnostic_parameters(
-            workflow if isinstance(workflow, dict) else None
-        )
-        if item
-    ]
-    if not parameters:
-        return ["the hung workflow carries no diagnostic parameters"]
-    errors = []
-    for item in parameters:
-        if item.get("diagnostic_reason") != "EFA_TRAFFIC_HUNG_SUSPECTED":
-            errors.append(f"diagnostic reason {item.get('diagnostic_reason')!r}")
-        if item.get("detection_basis") != "ATTEMPT_SCOPED_RDMA_IDLE":
-            errors.append(f"detection basis {item.get('detection_basis')!r}")
-        if item.get("capture_process_state") is not True:
-            errors.append("the hung chain did not request process state capture")
-    return sorted(set(errors))
 
 
 # --------------------------------------------------------------------------- #
