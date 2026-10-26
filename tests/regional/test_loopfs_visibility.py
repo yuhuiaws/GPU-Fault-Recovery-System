@@ -25,7 +25,10 @@ import pytest
 from gpu_fault.collectors.host.system_metrics import HostSystemMetricsMixin
 from scripts.e2e.regional import general_live_storage as storage
 from scripts.e2e.regional import general_live_utilization as utilization
-from scripts.e2e.regional.general_live_fixture import PROBE_HOST_ROOT_PROPAGATION
+from scripts.e2e.regional.general_live_fixture import (
+    PROBE_HOST_ROOT_PROPAGATION,
+    READ_ONLY_PROBE_HOST_ROOT_PROPAGATION,
+)
 from scripts.e2e.regional.probes import collector_window_probe as window
 from scripts.e2e.regional.probes import general_live_storage_probe as probe
 from tests.regional._general_live_fakes import FakeRegional, make_context
@@ -88,8 +91,12 @@ def test_only_the_storage_probe_pod_propagates_to_the_host(tmp_path):
     assert (
         ctx.probe("storage").fixture.settings.host_root_propagation == "Bidirectional"
     )
+    # The read-only probes receive the host's mounts and let them go again
+    # (rslave): a private copy of the storage probe's test mount in a Pod
+    # started later (the window probe, 2026-10-26) pinned its superblock.
     for name in ("window", "node", "net", "dcgm"):
-        assert ctx.probe(name).fixture.settings.host_root_propagation == "None"
+        propagation = ctx.probe(name).fixture.settings.host_root_propagation
+        assert propagation == "HostToContainer" == READ_ONLY_PROBE_HOST_ROOT_PROPAGATION
     # The mounting probe (and only it) is the one named in the mapping.
     assert PROBE_HOST_ROOT_PROPAGATION == {"storage": "Bidirectional"}
     host_root, _container = _volume_mount(ctx.probe("storage").fixture, "host-root")

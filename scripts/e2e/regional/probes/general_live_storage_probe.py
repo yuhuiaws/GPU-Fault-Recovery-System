@@ -4,31 +4,19 @@
 Runs on the target node through ``host_probe_fixture.py`` (chroot into the
 host, the node's own Python), standard library only, one JSON object on the
 last stdout line -- the sibling of ``general_live_node_probe.py``, split off
-because one file may not exceed the repository's size limit. Everything it
-creates is test-only and named after a digest of the run id:
-
-* a loop file system (``fallocate``-preallocated backing file, ``mkfs.ext4 -m
-  0``) or a loop + device-mapper ``linear``/``delay`` device mounted under
-  ``/mnt/gfrs-live/<digest>/<name>``; the backing file lives only under an
-  allow-listed directory whose file system may not end above 80 % used;
-* a bounded O_DIRECT writer unit that writes only files inside that mount;
-* the 004 ``probe_error`` faulting mount: the same device carrying FAT16
-  (``--fstype vfat``) whose table ``dm-retarget`` swaps, under a fresh mount,
-  to one whose FAT segment is the ``error`` target built into ``dm_mod`` -- a
-  configured mount whose ``statvfs`` fails EIO every time while it stays
-  mounted read-write -- and back to its data table.
-
-Every creation is recorded in ``storage-state.json`` first and preceded by a
-``systemd-run --on-active`` deadman that undoes it from a copy of this file;
-``residue`` names whatever is still present. No raw disk, real mount, system
-or log disk is ever opened. ``dmsetup`` create/resume/remove block until the
-host udevd completes a libdevmapper cookie (a SysV semaphore, per IPC
-namespace) that never reaches the Pod's own IPC namespace (the 2026-10-25 live
-``dm-create`` ``TimeoutExpired``), so the setup runs as a bounded transient
-unit (``dm-create`` returns at once; the runner polls ``dm-status``) and every
+because one file may not exceed the repository's size limit. It creates only
+test-only objects named after a digest of the run id: a loop file system or a
+loop + device-mapper device mounted under ``/mnt/gfrs-live/<digest>/<name>``
+(the backing file under an allow-listed directory whose file system may not
+end above 80 % used), a bounded O_DIRECT writer unit inside that mount, and
+the 004 ``probe_error`` fault mapping (``fault_mapping``). Every creation is
+recorded in ``storage-state.json`` first and preceded by a ``systemd-run
+--on-active`` deadman that undoes it from a copy of this file; ``residue``
+names whatever is still present. ``dmsetup`` create/resume/remove block until
+the host udevd completes a libdevmapper cookie that never reaches the Pod's
+own IPC namespace, so the setup runs as a bounded transient unit and every
 other device command joins PID 1's IPC and mount namespaces
-(``host_command``). Each subcommand has a wall-clock budget
-(``CALL_BUDGET_SECONDS``) that ``run`` clamps every command to.
+(``host_command``); ``CALL_BUDGET_SECONDS`` bounds each subcommand.
 """
 
 from __future__ import annotations
@@ -36,6 +24,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import mmap
 import os
 import re
 import shlex
@@ -52,28 +41,25 @@ STATE_ROOT = Path("/run/gpu-fault-acceptance/general")
 MOUNT_ROOT = Path("/mnt/gfrs-live")
 #: The host root mount namespace's table (the Pod is hostPID).
 HOST_MOUNTINFO = Path("/proc/1/mountinfo")
+MOUNT_KEYS = ("devno", "mountpoint", "options", "fstype", "source")
 SYS_BLOCK = Path("/sys/block")
 SYS_MODULE = Path("/sys/module")
-#: The kernel modules this probe may load (``--load-module``, the
-#: KERNEL_MODULE_LOAD approval); unloaded again by ``cleanup``. ``dm-error``
-#: itself is a target built into ``dm_mod`` and needs no load.
+#: Modules ``--load-module`` (KERNEL_MODULE_LOAD) may load; ``cleanup`` unloads
+#: them again. ``dm-error`` is built into ``dm_mod`` and needs no load.
 DELAY_MODULE = "dm_delay"
 VFAT_MODULE = "vfat"
 LOADABLE_MODULES = (DELAY_MODULE, VFAT_MODULE)
 #: File systems a test device may carry. FAT16 is the 004 ``probe_error``
-#: carrier: ``statfs`` counts its free clusters from the FAT on the device
-#: until one count succeeds, then answers from memory (``retarget_once``);
-#: ext4 answers from memory from the start. ``errors=continue`` keeps FAT
-#: from remounting read-only.
+#: carrier: ``statfs`` counts its free clusters from the FAT on the device until
+#: one count succeeds (``fault_mapping``); ``errors=continue`` keeps it rw.
 MKFS = {
     "ext4": ("mkfs.ext4", "-q", "-F", "-m", "0", "-L"),
     "vfat": ("mkfs.vfat", "-F", "16", "-n"),
 }
 MOUNT_OPTIONS = {"ext4": (), "vfat": ("-o", "errors=continue,noatime")}
-#: The FAT16 carrier's error segment is page-aligned (sectors per page), so a
-#: user-space page read of the boot sector or root directory never touches it
-#: (no ``Buffer I/O error`` in the kernel log); the FAT must keep at least
-#: ``MIN_FAT_ERROR_SECTORS`` inside it.
+#: The FAT16 carrier's error segment is page-aligned, so a user-space page read
+#: of the boot sector or root directory never touches it (no ``Buffer I/O
+#: error`` in the kernel log); the FAT must keep this many sectors inside it.
 PAGE_SECTORS = os.sysconf("SC_PAGE_SIZE") // 512
 MIN_FAT_ERROR_SECTORS = 2 * PAGE_SECTORS
 #: Device commands run in PID 1's IPC namespace (udev completes the dmsetup
@@ -82,46 +68,37 @@ HOST_NAMESPACES = ("nsenter", "--target", "1", "--ipc", "--mount", "--")
 #: Per-command timeouts (seconds): systemd method calls give up after sd-bus's
 #: 25 s; ``dmsetup``/``losetup``/``blockdev`` return in well under a second.
 QUICK_SECONDS = 30
-#: ``TimeoutStopSec`` of every unit this probe starts: SIGTERM, then SIGKILL
-#: after the same timeout, so a ``systemctl stop`` returns within
-#: ``UNIT_STOP_SECONDS``.
+#: ``TimeoutStopSec`` of every unit this probe starts (SIGTERM, then SIGKILL
+#: after the same timeout), so ``systemctl stop`` returns within ``UNIT_STOP_SECONDS``.
 UNIT_TIMEOUT_STOP_SECONDS = 20
 UNIT_STOP_SECONDS = 2 * UNIT_TIMEOUT_STOP_SECONDS + 20
 MOUNT_SECONDS = 60
 UMOUNT_SECONDS = 120
-#: How long ``destroy_device`` waits for the mapping's openers to go after
-#: the unmount before ``dmsetup remove``; polled every ``REMOVE_POLL_SECONDS``.
+#: How long ``destroy_device`` waits for a mapping's openers after the unmount
+#: before removing it (deferred when one stays); polled every ``REMOVE_POLL_SECONDS``.
 REMOVE_WAIT_SECONDS = 90
 REMOVE_POLL_SECONDS = 3
-#: The setup unit's steps and their timeouts. Its ``RuntimeMaxSec`` adds
-#: ``SETUP_RECORD_SECONDS`` so the worker records a failed step before
-#: systemd would kill it.
+#: The setup unit's steps and their timeouts; its ``RuntimeMaxSec`` adds
+#: ``SETUP_RECORD_SECONDS`` so the worker records a failed step first.
 SETUP_STEP_SECONDS = {
     "fallocate": 120,
-    "losetup": QUICK_SECONDS,
-    "blockdev": QUICK_SECONDS,
-    "dmsetup-create": QUICK_SECONDS,
     "mkfs": 300,
     "mount": MOUNT_SECONDS,
+    **dict.fromkeys(("losetup", "blockdev", "dmsetup-create"), QUICK_SECONDS),
 }
 SETUP_RECORD_SECONDS = 30
 SETUP_MAX_SECONDS = sum(SETUP_STEP_SECONDS.values()) + SETUP_RECORD_SECONDS
-#: Worst-case wall time of one call (seconds), per subcommand: ``main`` arms
-#: the deadline and ``run`` clamps every command to what is left, so a call
-#: ends (with its JSON error) inside the runner's exec timeout; unlisted
-#: subcommands keep per-command timeouts only.
+#: Worst-case wall time of one call per subcommand: ``main`` arms the deadline
+#: and ``run`` clamps every command to what is left, so a call ends (with its
+#: JSON error) inside the runner's exec timeout; unlisted ones keep per-command timeouts.
 CALL_BUDGET_SECONDS = {
-    "dm-create": 300,
     "dm-status": 60,
     "dm-setup": SETUP_MAX_SECONDS - SETUP_RECORD_SECONDS,
-    "dm-suspend": 180,
-    "dm-resume": 180,
-    "dm-recreate": 300,
-    "dm-retarget": 300,
-    "dm-destroy": 600,
     "io-start": 180,
     "io-stop": 120,
-    "cleanup": 600,
+    **dict.fromkeys(("dm-create", "dm-recreate", "dm-retarget"), 300),
+    **dict.fromkeys(("dm-suspend", "dm-resume"), 180),
+    **dict.fromkeys(("dm-destroy", "cleanup"), 600),
 }
 #: What ``unit_state`` reads back from ``systemctl show``.
 UNIT_PROPERTIES = (
@@ -209,13 +186,10 @@ def tool_present(name: str) -> bool:
 def host_command(
     command: list[str], *, timeout: float = QUICK_SECONDS, **options: Any
 ) -> subprocess.CompletedProcess[str]:
-    """``command`` in PID 1's IPC and mount namespaces (the Pod is hostPID).
-
-    Only there does the host udevd's ``dmsetup udevcomplete`` wake a ``dmsetup``,
-    and a mount made there is the one the collector and the writer unit see.
-    ``options`` are ``run``'s (``check``, ``input_text`` -- a multi-segment
-    ``dmsetup reload`` table goes in on stdin; ``--table`` takes one line).
-    """
+    """``command`` in PID 1's IPC and mount namespaces (the Pod is hostPID): only
+    there does the host udevd's cookie wake ``dmsetup``, and a mount made there is
+    the one the collector sees. ``options`` are ``run``'s (``check``, ``input_text``
+    -- a multi-segment table goes to ``dmsetup`` on stdin)."""
 
     if not tool_present("nsenter"):
         raise ProbeError("nsenter is missing: device commands cannot reach the host")
@@ -326,16 +300,11 @@ def systemctl(
 
 
 def unit_state(unit: str) -> dict[str, str]:
-    completed = systemctl(
-        "show", unit, *(f"--property={key}" for key in UNIT_PROPERTIES)
-    )
-    values: dict[str, str] = {}
-    for line in completed.stdout.splitlines():
-        key, separator, value = line.partition("=")
-        if separator:
-            values[key] = value
-    values["returncode"] = str(completed.returncode)
-    return values
+    properties = [f"--property={key}" for key in UNIT_PROPERTIES]
+    completed = systemctl("show", unit, *properties)
+    pairs = (line.partition("=") for line in completed.stdout.splitlines())
+    values = {key: value for key, separator, value in pairs if separator}
+    return {**values, "returncode": str(completed.returncode)}
 
 
 def arm_deadman(run_id: str, kind: str, seconds: int) -> str:
@@ -345,26 +314,16 @@ def arm_deadman(run_id: str, kind: str, seconds: int) -> str:
     name = unit_name(run_id, f"{DEADMAN_PREFIX}-{kind}")
     systemctl("stop", f"{name}.timer")
     systemctl("reset-failed", f"{name}.service")
-    run(
-        [
-            "systemd-run",
-            f"--unit={name}",
-            f"--on-active={int(seconds)}s",
-            "--timer-property=AccuracySec=1s",
-            "--property=Restart=on-failure",
-            "--property=RestartSec=30s",
-            "--property=StartLimitIntervalSec=0",
-            f"--property=TimeoutStopSec={UNIT_TIMEOUT_STOP_SECONDS}",
-            sys.executable,
-            str(probe_copy(run_id)),
-            "cleanup",
-            "--run-id",
-            run_id,
-            "--kind",
-            kind,
-        ],
-        timeout=QUICK_SECONDS,
-    )
+    timer = [
+        f"--unit={name}",
+        f"--on-active={int(seconds)}s",
+        "--timer-property=AccuracySec=1s",
+    ]
+    properties = ("Restart=on-failure", "RestartSec=30s", "StartLimitIntervalSec=0")
+    properties += (f"TimeoutStopSec={UNIT_TIMEOUT_STOP_SECONDS}",)
+    cleanup = [sys.executable, str(probe_copy(run_id)), "cleanup", "--run-id", run_id]
+    unit = ["systemd-run", *timer, *(f"--property={item}" for item in properties)]
+    run([*unit, *cleanup, "--kind", kind], timeout=QUICK_SECONDS)
     if unit_state(f"{name}.timer").get("ActiveState") != "active":
         raise ProbeError(f"deadman {name} is not armed")
     return name
@@ -379,14 +338,9 @@ def disarm_deadman(run_id: str, kind: str) -> None:
 
 
 def start_unit(
-    run_id: str,
-    kind: str,
-    seconds: int,
-    command: list[str],
-    *properties: str,
+    run_id: str, kind: str, seconds: int, command: list[str], *properties: str
 ) -> str:
-    """A transient unit (host namespaces, PID 1 forks it) that stops itself
-    after ``seconds``; a stop is bounded by ``UNIT_TIMEOUT_STOP_SECONDS``."""
+    """A transient unit (host namespaces) that stops itself after ``seconds``."""
 
     bounded(seconds, 10, MAX_SECONDS, "unit seconds")
     name = unit_name(run_id, kind)
@@ -396,16 +350,13 @@ def start_unit(
         save_state(run_id, state)
     systemctl("stop", f"{name}.service", timeout=UNIT_STOP_SECONDS)
     systemctl("reset-failed", f"{name}.service")
+    bounds = (
+        f"RuntimeMaxSec={int(seconds)}",
+        f"TimeoutStopSec={UNIT_TIMEOUT_STOP_SECONDS}",
+    )
+    options = [f"--property={item}" for item in (*bounds, *properties)]
     run(
-        [
-            "systemd-run",
-            f"--unit={name}",
-            "--collect",
-            f"--property=RuntimeMaxSec={int(seconds)}",
-            f"--property=TimeoutStopSec={UNIT_TIMEOUT_STOP_SECONDS}",
-            *[f"--property={item}" for item in properties],
-            *command,
-        ],
+        ["systemd-run", f"--unit={name}", "--collect", *options, *command],
         timeout=QUICK_SECONDS,
     )
     return name
@@ -438,20 +389,23 @@ def statvfs_reading(path: str) -> dict[str, Any]:
 
 
 def mounts(table: Path = Path("/proc/self/mountinfo")) -> list[dict[str, str]]:
+    """One entry per ``mountinfo`` line: devno, mountpoint, options, fstype, source."""
+
     result = []
     for line in table.read_text().splitlines():
         fields = line.split()
-        try:
-            separator = fields.index("-")
-        except ValueError:
+        if "-" not in fields:
             continue
+        sep = fields.index("-")
+        source = fields[sep + 2] if len(fields) > sep + 2 else ""
+        devno, mountpoint, options, fstype = (
+            fields[2],
+            fields[4],
+            fields[5],
+            fields[sep + 1],
+        )
         result.append(
-            {
-                "mountpoint": fields[4],
-                "fstype": fields[separator + 1],
-                "source": fields[separator + 2] if len(fields) > separator + 2 else "",
-                "options": fields[5],
-            }
+            dict(zip(MOUNT_KEYS, (devno, mountpoint, options, fstype, source)))
         )
     return result
 
@@ -471,10 +425,8 @@ def mounted_on_host(target: str) -> bool:
 
 def backing_root(value: str, size_bytes: int) -> Path:
     root = Path(value)
-    if root not in BACKING_ROOTS:
-        raise ProbeError("backing root is not allow-listed")
-    if not root.parent.exists():
-        raise ProbeError("backing root's parent does not exist on this node")
+    if root not in BACKING_ROOTS or not root.parent.exists():
+        raise ProbeError("backing root is not allow-listed or its parent is absent")
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     reading = statvfs_reading(str(root))
     total = float(reading.get("total_bytes") or 0)
@@ -494,8 +446,7 @@ def run_backing_dir(run_id: str, root: Path) -> Path:
 
 
 def run_directories(run_id: str) -> list[Path]:
-    """The run's backing directory under each allow-listed root and its mount
-    root ``/mnt/gfrs-live/<digest>`` (made on demand)."""
+    """The run's backing directory under each allow-listed root and its mount root."""
 
     digest = run_digest(run_id)
     backing = [root / f"gfrs-live-{digest}" for root in BACKING_ROOTS]
@@ -503,8 +454,7 @@ def run_directories(run_id: str) -> list[Path]:
 
 
 def prune_run_directories(run_id: str) -> list[str]:
-    """Remove the run's directories once it holds no test file system or device
-    and they are empty (every destroy ends here); ``residue`` names the rest."""
+    """Remove the run's empty directories once it holds no file system or device."""
 
     state = load_state(run_id)
     if state["devices"] or state["filesystems"]:
@@ -540,12 +490,8 @@ def fs_create(arguments: argparse.Namespace) -> None:
     deadman = arm_deadman(run_id, f"fs-{name}", seconds)
     backing = run_backing_dir(run_id, root) / f"{name}.img"
     target = mountpoint(run_id, name)
-    state["filesystems"][name] = {
-        "backing": str(backing),
-        "mountpoint": str(target),
-        "loop": None,
-        "mounted": False,
-    }
+    record = {"backing": str(backing), "mountpoint": str(target), "loop": None}
+    state["filesystems"][name] = {**record, "mounted": False}
     save_state(run_id, state)
     run(["fallocate", "-l", f"{size_mib}M", str(backing)])
     loop = loop_attach(backing)
@@ -559,16 +505,8 @@ def fs_create(arguments: argparse.Namespace) -> None:
     run(["mount", "-t", "ext4", loop, str(target)])
     state["filesystems"][name]["mounted"] = True
     save_state(run_id, state)
-    emit(
-        {
-            "name": name,
-            "loop": loop,
-            "mountpoint": str(target),
-            "backing": str(backing),
-            "statvfs": statvfs_reading(str(target)),
-            "deadman": deadman,
-        }
-    )
+    reading = statvfs_reading(str(target))
+    emit({**record, "name": name, "loop": loop, "statvfs": reading, "deadman": deadman})
 
 
 def checked_filesystem(run_id: str, name: str) -> dict[str, Any]:
@@ -607,12 +545,9 @@ def fs_unfill(arguments: argparse.Namespace) -> None:
     run_id = checked_run_id(arguments.run_id)
     entry = checked_filesystem(run_id, arguments.name)
     target = Path(entry["mountpoint"])
-    removed = 0
-    fill = target / "gfrs-fill.bin"
-    if fill.exists():
-        fill.unlink()
-        removed += 1
-    inode_dir = target / "gfrs-inodes"
+    fill, inode_dir = target / "gfrs-fill.bin", target / "gfrs-inodes"
+    removed = int(fill.exists())
+    fill.unlink(missing_ok=True)
     if inode_dir.is_dir():
         for item in inode_dir.iterdir():
             item.unlink()
@@ -697,10 +632,9 @@ def destroy_filesystem(run_id: str, name: str) -> dict[str, Any]:
     if entry is None:
         return {"name": name, "absent": True}
     target = entry["mountpoint"]
-    if any(item["mountpoint"] == target for item in mounts()):
-        run(["umount", target], check=False, timeout=120)
+    for flags in ([], ["-l"]):
         if any(item["mountpoint"] == target for item in mounts()):
-            run(["umount", "-l", target], timeout=120)
+            run(["umount", *flags, target], check=bool(flags), timeout=120)
     if entry.get("loop"):
         run(["losetup", "-d", entry["loop"]], check=False)
     Path(entry["backing"]).unlink(missing_ok=True)
@@ -728,9 +662,8 @@ def dm_table(
     error: bool = False,
     fat: list[int] | None = None,
 ) -> str:
-    """The data table (``linear``/``delay``), the whole device ``error``, or with
-    ``fat`` ``[start, end)`` only the FAT segment ``error`` -- boot sector, root
-    directory and data stay ``linear`` (mounts and lists; every FAT read fails)."""
+    """The data table, the whole device ``error``, or with ``fat`` ``[start, end)``
+    only the FAT segment ``error`` (boot sector, root directory and data ``linear``)."""
 
     if error and fat:
         start, end = fat
@@ -747,18 +680,16 @@ def dm_table(
 
 
 def fat_region(device: str) -> list[int]:
-    """``[start, end)`` of the FAT16 carrier's FATs in 512-byte sectors, read
-    from its boot sector and rounded inwards to page boundaries."""
+    """``[start, end)`` of the FAT16 carrier's FATs in 512-byte sectors (from its
+    boot sector), rounded inwards to page boundaries."""
 
     with open(device, "rb", buffering=0) as handle:
         boot = handle.read(512)
     if len(boot) < 512 or boot[54:62] != b"FAT16   ":
         raise ProbeError("the test device does not carry a FAT16 boot sector")
-    # Bytes per sector, reserved sectors, FATs and sectors per FAT (BPB).
-    sector, _, reserved, fats, _, _, _, per_fat = struct.unpack_from(
-        "<HBHBHHBH", boot, 11
-    )
-    scale = sector // 512
+    # BPB: bytes per sector, reserved sectors, FATs and sectors per FAT.
+    bps, _, reserved, fats, _, _, _, per_fat = struct.unpack_from("<HBHBHHBH", boot, 11)
+    scale = bps // 512
     start = -(-reserved * scale // PAGE_SECTORS) * PAGE_SECTORS
     end = (reserved + fats * per_fat) * scale // PAGE_SECTORS * PAGE_SECTORS
     if scale < 1 or not reserved or end - start < MIN_FAT_ERROR_SECTORS:
@@ -767,8 +698,7 @@ def fat_region(device: str) -> list[int]:
 
 
 def dm_device_name(dm: str) -> str:
-    """``dm-N`` of the mapping ``dm`` (the ``/proc/diskstats`` name the product
-    reports), read from the kernel's own ``/sys/block/dm-N/dm/name``."""
+    """``dm-N`` of the mapping (the ``/proc/diskstats`` name the product reports)."""
 
     for entry in sorted(SYS_BLOCK.glob("dm-*")):
         try:
@@ -803,11 +733,9 @@ def update_device(run_id: str, name: str, **values: Any) -> dict[str, Any]:
 
 
 def dm_create(arguments: argparse.Namespace) -> None:
-    """Record the test device and start its bounded setup unit; return at once
-    (the runner polls ``dm-status``). Deadman first, record second, so
-    ``cleanup --kind dm-<name>`` undoes whatever the setup reached;
-    ``--load-module`` (KERNEL_MODULE_LOAD) loads a missing ``dm_delay`` or
-    ``vfat``, recorded before the load so ``cleanup`` unloads it."""
+    """Record the test device and start its bounded setup unit (the runner polls
+    ``dm-status``); deadman first, record second, so ``cleanup`` undoes whatever
+    the setup reached. ``--load-module`` loads a missing module, recorded first."""
 
     run_id = checked_run_id(arguments.run_id)
     name = checked_name(arguments.name)
@@ -830,21 +758,16 @@ def dm_create(arguments: argparse.Namespace) -> None:
     deadman = arm_deadman(run_id, f"dm-{name}", seconds)
     dm = dm_name(run_id, name)
     unit = unit_name(run_id, setup_kind(name))
-    state["devices"][name] = {
-        "backing": str(run_backing_dir(run_id, root) / f"{name}.img"),
-        "mountpoint": str(mountpoint(run_id, name)),
-        "loop": None,
+    record: dict[str, Any] = {
         "dm": dm,
         "dm_path": f"/dev/mapper/{dm}",
-        "delay_ms": delay_ms,
-        "size_mib": size_mib,
-        "fstype": fstype,
-        "target": "data",
-        "mounted": False,
-        "phase": "setup",
-        "step": None,
         "setup_unit": unit,
     }
+    record["backing"] = str(run_backing_dir(run_id, root) / f"{name}.img")
+    record["mountpoint"] = str(mountpoint(run_id, name))
+    record.update(loop=None, delay_ms=delay_ms, size_mib=size_mib, fstype=fstype)
+    record.update(target="data", mounted=False, phase="setup", step=None)
+    state["devices"][name] = record
     # Recorded before the load: it was not loaded, so loaded later is ours.
     state["modules"].extend(m for m in load if m not in state["modules"])
     save_state(run_id, state)
@@ -854,27 +777,14 @@ def dm_create(arguments: argparse.Namespace) -> None:
             raise ProbeError(f"{module} could not be loaded")
     command = [sys.executable, str(probe_copy(run_id)), "dm-setup", "--run-id", run_id]
     start_unit(run_id, setup_kind(name), SETUP_MAX_SECONDS, [*command, "--name", name])
-    emit(
-        {
-            "name": name,
-            "dm": dm,
-            "phase": "setup",
-            "setup_unit": unit,
-            "setup_max_seconds": SETUP_MAX_SECONDS,
-            "module_loaded_by_run": bool(load),
-            "modules_loaded_by_run": load,
-            "fstype": fstype,
-            "delay_ms": delay_ms,
-            "deadman": deadman,
-            "state": unit_state(f"{unit}.service"),
-        }
-    )
+    report = {"name": name, "setup_max_seconds": SETUP_MAX_SECONDS, "deadman": deadman}
+    report.update(module_loaded_by_run=bool(load), modules_loaded_by_run=load)
+    emit({**state["devices"][name], **report, "state": unit_state(f"{unit}.service")})
 
 
 def dm_setup(arguments: argparse.Namespace) -> None:
-    """The setup unit's body (host namespaces): back, map, format, mount. Each
-    step is recorded before it runs; a failure records the step, error class,
-    message digest and site, and exits non-zero."""
+    """The setup unit's body (host namespaces): back, map, format, mount; a failure
+    records the step it reached, error class, message digest and site."""
 
     run_id = checked_run_id(arguments.run_id)
     name = checked_name(arguments.name)
@@ -921,28 +831,18 @@ def build_device(run_id: str, name: str, entry: dict[str, Any]) -> dict[str, Any
     update_device(run_id, name, fat_sectors=fat)
     timeout = step("mount")
     Path(entry["mountpoint"]).mkdir(mode=0o755, parents=True, exist_ok=True)
-    host_command(
-        mount_command(fstype, entry["dm_path"], entry["mountpoint"]), timeout=timeout
-    )
+    mount = mount_command(fstype, entry["dm_path"], entry["mountpoint"])
+    host_command(mount, timeout=timeout)
     update_device(run_id, name, mounted=True, phase="ready", step=None)
-    return {
-        "name": name,
-        "phase": "ready",
-        "device": device,
-        "dm": entry["dm"],
-        "loop": loop,
-        "mountpoint": entry["mountpoint"],
-        "fstype": fstype,
-        "fat_sectors": fat,
-        "delay_ms": entry["delay_ms"],
-    }
+    built = {"name": name, "phase": "ready", "device": device, "loop": loop}
+    built.update(fstype=fstype, fat_sectors=fat, delay_ms=entry["delay_ms"])
+    return {**built, "dm": entry["dm"], "mountpoint": entry["mountpoint"]}
 
 
 def dm_status(arguments: argparse.Namespace) -> None:
-    """Where the device's setup stands: ``setup``, ``ready`` or ``failed`` (a
-    record still at ``setup`` behind a unit that no longer runs: the worker
-    died at the step it had reached). No ``error`` key: the host fixture would
-    read the answer as a failed call."""
+    """Where the device's setup stands: ``setup``, ``ready`` or ``failed`` (a record
+    still at ``setup`` behind a unit that no longer runs: the worker died at the
+    step it had reached). No ``error`` key: the fixture would read a failed call."""
 
     run_id = checked_run_id(arguments.run_id)
     name = checked_name(arguments.name)
@@ -951,26 +851,25 @@ def dm_status(arguments: argparse.Namespace) -> None:
     phase = str(entry.get("phase") or "ready")
     lost = phase == "setup" and unit.get("ActiveState") not in RUNNING_STATES
     failed = lost or phase == "failed"
-    error_class = "SetupUnitEnded" if lost else entry.get("setup_error_class")
-    emit(
-        {
-            "name": name,
-            "phase": "failed" if lost else phase,
-            "step": entry.get("step"),
-            "failed_step": (entry.get("step") or "start") if failed else None,
-            "setup_error_class": error_class,
-            "setup_error_code": entry.get("setup_error_code"),
-            "setup_error_site": entry.get("setup_error_site"),
-            "device": entry.get("device") if phase == "ready" else None,
-            "dm": entry.get("dm"),
-            "loop": entry.get("loop"),
-            "mountpoint": entry.get("mountpoint"),
-            "delay_ms": entry.get("delay_ms"),
-            "setup_unit": {
-                k: unit.get(k) for k in ("LoadState", "ActiveState", "SubState")
-            },
-        }
+    copied = (
+        "step",
+        "setup_error_code",
+        "setup_error_site",
+        "dm",
+        "loop",
+        "mountpoint",
     )
+    status = {key: entry.get(key) for key in (*copied, "delay_ms")}
+    status["name"], status["phase"] = name, "failed" if lost else phase
+    status["failed_step"] = (entry.get("step") or "start") if failed else None
+    status["setup_error_class"] = (
+        "SetupUnitEnded" if lost else entry.get("setup_error_class")
+    )
+    status["device"] = entry.get("device") if phase == "ready" else None
+    status["setup_unit"] = {
+        k: unit.get(k) for k in ("LoadState", "ActiveState", "SubState")
+    }
+    emit(status)
 
 
 def checked_device(run_id: str, name: str) -> dict[str, Any]:
@@ -1007,16 +906,21 @@ def dm_resume(arguments: argparse.Namespace) -> None:
     emit({"resumed": entry["dm"]})
 
 
+def refuse_running_writer(run_id: str, name: str, action: str) -> None:
+    if (
+        unit_state(f"{unit_name(run_id, f'io-{name}')}.service").get("ActiveState")
+        in RUNNING_STATES
+    ):
+        raise ProbeError(f"the writer still runs; stop it before the {action}")
+
+
 def dm_recreate(arguments: argparse.Namespace) -> None:
-    """Remove and recreate the mapping under the same name (counters restart);
-    the writer must be stopped first or the unmount fails ``EBUSY``."""
+    """Remove and recreate the mapping under the same name (counters restart)."""
 
     run_id = checked_run_id(arguments.run_id)
     name = checked_name(arguments.name)
     entry = ready_device(run_id, name)
-    writer = unit_state(f"{unit_name(run_id, f'io-{name}')}.service")
-    if writer.get("ActiveState") in RUNNING_STATES:
-        raise ProbeError("the writer still runs; stop it before the recreate")
+    refuse_running_writer(run_id, name, "recreate")
     before = dm_device_name(entry["dm"])
     if mounted_on_host(entry["mountpoint"]):
         host_command(["umount", entry["mountpoint"]], timeout=UMOUNT_SECONDS)
@@ -1024,53 +928,108 @@ def dm_recreate(arguments: argparse.Namespace) -> None:
     table = dm_table(int(entry["sectors"]), entry["loop"], int(entry["delay_ms"]))
     dmsetup("create", entry["dm"], "--table", table)
     fstype = str(entry.get("fstype") or "ext4")
-    host_command(
-        mount_command(fstype, entry["dm_path"], entry["mountpoint"]),
-        timeout=MOUNT_SECONDS,
-    )
+    mount = mount_command(fstype, entry["dm_path"], entry["mountpoint"])
+    host_command(mount, timeout=MOUNT_SECONDS)
     after = dm_device_name(entry["dm"])
     update_device(run_id, name, device=after, mounted=True, target="data")
     emit({"dm": entry["dm"], "device_before": before, "device_after": after})
 
 
-def retarget_once(entry: dict[str, Any], *, error: bool) -> dict[str, Any]:
-    """Load ``error`` or the data table under the test device; its statvfs.
+def mapping_devno(dm: str) -> str:
+    """``major:minor`` of the mapping, empty once it is gone."""
 
-    ``error`` on the FAT16 carrier: unmount, load the table whose FAT segment
-    is ``error``, drop the device's page cache (``blockdev --flushbufs``: no
-    FAT block survives from before), mount afresh. The FAT is unreadable
-    before the mount exists, so no statfs -- the collector's, an agent's, this
-    probe's -- can ever count the free clusters and cache them: every
-    ``statvfs`` fails EIO until ``--target data`` puts the data table back (in
-    place; the next count succeeds). Boot sector, root directory and data stay
-    readable and nothing is written to the error segment (a failed write would
-    log ``Buffer I/O error``, which the node log collector's storage rule
-    grades QUARANTINE -- not the fault under test).
+    columns = ("info", "-c", "--noheadings", "-o", "major,minor")
+    completed = dmsetup(*columns, dm, check=False)
+    match = re.fullmatch(r"\s*(\d+):\s*(\d+)\s*", completed.stdout)
+    return (
+        f"{int(match[1])}:{int(match[2])}" if match and not completed.returncode else ""
+    )
+
+
+def mount_devno(target: str) -> str:
+    """``major:minor`` of the file system a path resolves to."""
+
+    dev = os.stat(target).st_dev
+    return f"{os.major(dev)}:{os.minor(dev)}"
+
+
+def direct_read(device: str, sector: int) -> str:
+    """One page read at ``sector`` through ``device`` with O_DIRECT -- what the
+    table serves, no page cache in between: ``ok`` or the error."""
+
+    fd = os.open(device, os.O_RDONLY | os.O_DIRECT)
+    try:
+        os.preadv(fd, [mmap.mmap(-1, 512 * PAGE_SECTORS)], sector * 512)
+        return "ok"
+    except OSError as exc:
+        return f"{type(exc).__name__}: {exc.errno}"
+    finally:
+        os.close(fd)
+
+
+def fault_mapping(entry: dict[str, Any]) -> dict[str, Any]:
+    """The 004 ``probe_error`` injection: a second mapping over the same loop
+    device whose FAT segment is ``error``, mounted over the healthy mount.
+
+    A new block device gets a new superblock, so FAT counts its free clusters
+    afresh through the fault mapping: EIO on every statvfs, whatever an earlier
+    mount cached. The healthy mapping is never touched: a private copy of its
+    mount in another mount namespace (the live window probe Pod, started after
+    the mount with the default private propagation) keeps its superblock alive,
+    and a remount of the SAME device reused that superblock and its cached count
+    (the 2026-10-25/26 INCONCLUSIVE). O_DIRECT reads prove the table before the
+    mount (boot sector ok, first FAT sector EIO); nothing writes to the error
+    segment; ``--target data`` reloads the fault mapping to its data table in place.
     """
 
-    fresh = error and str(entry.get("fstype") or "ext4") == "vfat"
     target = str(entry["mountpoint"])
-    if fresh and mounted_on_host(target):
-        host_command(["umount", target], timeout=UMOUNT_SECONDS)
-    fat = entry.get("fat_sectors") if fresh else None
+    fault = str(entry.get("fault_dm") or f"{entry['dm']}-fault")
+    path = f"/dev/mapper/{fault}"
+    if mapping_devno(fault):
+        raise ProbeError("the fault mapping already exists; retarget data first")
+    fat = [int(value) for value in entry["fat_sectors"]]
+    table = dm_table(int(entry["sectors"]), entry["loop"], 0, error=True, fat=fat)
+    dmsetup("create", fault, input_text=table + "\n")
+    proof = {"boot": direct_read(path, 0), "fat": direct_read(path, fat[0])}
+    if proof["boot"] != "ok" or proof["fat"] == "ok":
+        raise ProbeError("the fault mapping does not serve the FAT segment as error")
+    host_command(mount_command("vfat", path, target), timeout=MOUNT_SECONDS)
+    reading, devno = statvfs_reading(target), mount_devno(target)
+    result = {"fault_dm": fault, "direct_reads": proof, "statvfs": reading}
+    result.update(mount_devno=devno, fault_devno=mapping_devno(fault), diagnosis=None)
+    if "error" not in reading:
+        result["diagnosis"] = (
+            "statfs answered over a mapping whose FAT reads fail: superblock reused"
+            if devno == result["fault_devno"]
+            else "the mount point does not resolve to the fault mapping"
+        )
+    return result
+
+
+def retarget_once(entry: dict[str, Any], *, error: bool) -> dict[str, Any]:
+    """Fault or restore the test device; its mount point's statvfs after it:
+    ``error`` is ``fault_mapping`` on the FAT16 carrier, else the whole-device
+    ``error`` table; ``data`` reloads the fault mapping (else the device) in place."""
+
+    fault = entry.get("fault_dm")
+    if error and str(entry.get("fstype") or "ext4") == "vfat":
+        return fault_mapping(entry)
     sectors, loop, delay = int(entry["sectors"]), entry["loop"], int(entry["delay_ms"])
-    table = dm_table(sectors, loop, delay, error=error, fat=fat)
-    dmsetup("suspend", "--nolockfs", "--noflush", entry["dm"])
-    dmsetup("reload", entry["dm"], input_text=table + "\n")
-    dmsetup("resume", entry["dm"])
-    if fresh:
-        host_command(["blockdev", "--flushbufs", entry["dm_path"]])
-        mount = mount_command("vfat", entry["dm_path"], target)
-        host_command(mount, timeout=MOUNT_SECONDS)
-    return statvfs_reading(target)
+    if not error and fault and mapping_devno(str(fault)):
+        dm, table = str(fault), dm_table(sectors, loop, 0)
+    else:
+        dm, table = entry["dm"], dm_table(sectors, loop, delay, error=error)
+    dmsetup("suspend", "--nolockfs", "--noflush", dm)
+    dmsetup("reload", dm, input_text=table + "\n")
+    dmsetup("resume", dm)
+    return {"statvfs": statvfs_reading(str(entry["mountpoint"]))}
 
 
 def dm_retarget(arguments: argparse.Namespace) -> None:
-    """Swap the test device between its data table and ``error``: the 004
-    ``probe_error`` injection (the mount stays, read-write in the host table,
-    every ``statvfs`` EIO until ``--target data``; ``faulted`` is the probe's own
-    reading). ``--delay-ms`` gives the data table a new delay first -- 0 takes the
-    injected latency out in place, the 006 ``sustained_latency`` recovery proof."""
+    """Swap the test device between ``data`` and ``error`` (the 004 ``probe_error``
+    injection: mount stays, rw in the host table, every ``statvfs`` EIO; ``faulted``
+    is the probe's own reading, ``diagnosis`` why it did not fail). ``--delay-ms``
+    gives the data table a new delay first (006 ``sustained_latency`` recovery)."""
 
     run_id = checked_run_id(arguments.run_id)
     name = checked_name(arguments.name)
@@ -1082,25 +1041,19 @@ def dm_retarget(arguments: argparse.Namespace) -> None:
         if delay and not module_loaded(DELAY_MODULE):
             raise ProbeError("dm_delay is not loaded on this node")
         entry = update_device(run_id, name, delay_ms=delay)
-    writer = unit_state(f"{unit_name(run_id, f'io-{name}')}.service")
-    if writer.get("ActiveState") in RUNNING_STATES:
-        raise ProbeError("the writer still runs; stop it before the retarget")
+    refuse_running_writer(run_id, name, "retarget")
     error = arguments.target == "error"
-    reading = retarget_once(entry, error=error)
-    update_device(run_id, name, target=arguments.target)
-    emit(
-        {
-            "name": name,
-            "dm": entry["dm"],
-            "target": arguments.target,
-            "delay_ms": int(entry["delay_ms"]),
-            "fat_sectors": entry.get("fat_sectors"),
-            "attempts": 1,
-            "statvfs": reading,
-            "faulted": error and "error" in reading,
-            "mounted_on_host": mounted_on_host(str(entry["mountpoint"])),
-        }
-    )
+    result = retarget_once(entry, error=error)
+    recorded = {"target": arguments.target}
+    if result.get("fault_dm"):
+        recorded["fault_dm"] = result["fault_dm"]
+    update_device(run_id, name, **recorded)
+    report = {"name": name, "dm": entry["dm"], "delay_ms": int(entry["delay_ms"])}
+    report.update({"fat_sectors": entry.get("fat_sectors"), "attempts": 1, **recorded})
+    report.update(result)
+    report["faulted"] = error and "error" in result["statvfs"]
+    report["mounted_on_host"] = mounted_on_host(str(entry["mountpoint"]))
+    emit(report)
 
 
 def loop_devices() -> list[dict[str, Any]]:
@@ -1133,43 +1086,111 @@ def open_count(dm: str) -> int:
     return int(count) if completed.returncode == 0 and count.isdigit() else 0
 
 
+def unmount_stack(target: str) -> int:
+    """Unmount every mount stacked on ``target`` in the host namespace (lazily when
+    one is busy); how many were taken down."""
+
+    taken = 0
+    while mounted_on_host(target) and taken < 8:
+        busy = host_command(["umount", target], check=False, timeout=UMOUNT_SECONDS)
+        if busy.returncode:
+            host_command(["umount", "-l", target], check=False, timeout=UMOUNT_SECONDS)
+        taken += 1
+    return taken
+
+
+def foreign_holders(devnos: set[str]) -> list[dict[str, Any]]:
+    """Mount namespaces other than the host's that still mount one of the mappings
+    (``/proc/<pid>/mountinfo``; the Pod is hostPID), one per namespace: a container
+    started after the mount with private propagation (the live window probe Pod)
+    keeps a copy the host unmount never reaches -- and with it the superblock and
+    the mapping's opener. ``locked``: owned by another user namespace, so the copy
+    cannot be unmounted from outside."""
+
+    host_mnt, host_user = os.readlink("/proc/1/ns/mnt"), os.readlink("/proc/1/ns/user")
+    seen: set[str] = set()
+    found: list[dict[str, Any]] = []
+    for proc in Path("/proc").glob("[0-9]*"):
+        try:
+            mnt = os.readlink(proc / "ns" / "mnt")
+            if mnt == host_mnt or mnt in seen:
+                continue
+            seen.add(mnt)
+            table = mounts(proc / "mountinfo")
+            hits = [item["mountpoint"] for item in table if item["devno"] in devnos]
+            if not hits:
+                continue
+            locked = os.readlink(proc / "ns" / "user") != host_user
+            comm = (proc / "comm").read_text().strip()
+            found.append(
+                dict(pid=int(proc.name), comm=comm, locked=locked, mountpoints=hits)
+            )
+        except OSError:
+            continue
+    return found
+
+
+def evict_holders(devnos: set[str]) -> list[dict[str, Any]]:
+    """Lazily unmount the mappings from every other mount namespace; the holders
+    with ``evicted`` (a locked copy stays until its namespace ends)."""
+
+    holders = foreign_holders(devnos)
+    for holder in holders:
+        for path in holder["mountpoints"]:
+            nsenter = ["nsenter", "--target", str(holder["pid"]), "--mount", "--"]
+            run([*nsenter, "umount", "-l", path], check=False, timeout=UMOUNT_SECONDS)
+    left = {holder["pid"] for holder in foreign_holders(devnos)}
+    for holder in holders:
+        holder["evicted"] = holder["pid"] not in left
+    return holders
+
+
 def destroy_device(run_id: str, name: str) -> dict[str, Any]:
+    """Unmount, evict foreign copies, remove the mappings (deferred while a locked
+    copy holds one), detach the loop, delete the backing file and the record."""
+
     state = load_state(run_id)
     entry = state["devices"].get(name)
     if entry is None:
         return {"name": name, "absent": True}
-    dm = entry["dm"]
-    present = tool_present("dmsetup")
-    present = present and dmsetup("info", dm, check=False).returncode == 0
-    if present:
-        dmsetup("resume", dm, check=False)
-        if entry.get("target") == "error":
-            # Back on the data table before the unmount writes its FAT flags.
-            retarget_once(entry, error=False)
     target = entry["mountpoint"]
-    if mounted_on_host(target):
-        host_command(["umount", target], check=False, timeout=UMOUNT_SECONDS)
-        if mounted_on_host(target):
-            host_command(["umount", "-l", target], timeout=UMOUNT_SECONDS)
-    if present:
-        # A lazily unmounted copy in another mount namespace or udev's blkid
-        # keeps the mapping open a while (the 2026-10-25 live cleanup's EBUSY).
-        deadline = time.monotonic() + REMOVE_WAIT_SECONDS
-        while (openers := open_count(dm)) and time.monotonic() < deadline:
+    names = [str(dm) for dm in (entry.get("fault_dm"), entry["dm"]) if dm]
+    present = [dm for dm in names if tool_present("dmsetup") and mapping_devno(dm)]
+    for dm in present:
+        dmsetup("resume", dm, check=False)
+    if entry.get("target") == "error" and present and not entry.get("fault_dm"):
+        # The whole-device error table: data back before the unmount writes.
+        retarget_once(entry, error=False)
+    devnos = {mapping_devno(dm) for dm in present}
+    unmount_stack(target)
+    holders = evict_holders(devnos) if present else []
+    deferred: list[str] = []
+    deadline = time.monotonic() + REMOVE_WAIT_SECONDS
+    for dm in present:
+        while open_count(dm) and time.monotonic() < deadline:
             time.sleep(REMOVE_POLL_SECONDS)
-        if openers:
-            raise ProbeError(f"the test device is still open ({openers} openers)")
-        dmsetup("remove", "--retry", dm)
+        if open_count(dm):
+            # Removed by the kernel once the last holder closes it.
+            dmsetup("remove", "--deferred", dm, check=False)
+            deferred.append(dm)
+        else:
+            dmsetup("remove", "--retry", dm)
     detached = backing_loops(entry["backing"])
     for loop in detached:
         run(["losetup", "-d", loop], check=False, timeout=QUICK_SECONDS)
     Path(entry["backing"]).unlink(missing_ok=True)
+    directory_removed = False
     if Path(target).is_dir():
-        Path(target).rmdir()
+        try:
+            Path(target).rmdir()
+            directory_removed = True
+        except OSError:
+            pass  # still a mount point inside a namespace that could not be evicted
     state = load_state(run_id)
     state["devices"].pop(name, None)
     save_state(run_id, state)
-    return {"name": name, "destroyed": True, "detached": detached}
+    result = {"name": name, "destroyed": True, "detached": detached, "holders": holders}
+    return {**result, "deferred": deferred, "directory_removed": directory_removed}
 
 
 def destroy_dm(run_id: str, name: str) -> dict[str, Any]:
@@ -1221,16 +1242,12 @@ path, threads, block, seconds, direct, span, pace = sys.argv[1], int(sys.argv[2]
 deadline = time.monotonic() + seconds
 flags = os.O_WRONLY | os.O_CREAT | (getattr(os, "O_DIRECT", 0) if direct else 0)
 def writer(index):
-    buffer = mmap.mmap(-1, block)
-    buffer.write(b"g" * block)
-    fd = os.open(f"{path}.{index}", flags, 0o600)
-    offset = 0
+    buffer = mmap.mmap(-1, block); buffer.write(b"g" * block)
+    fd = os.open(f"{path}.{index}", flags, 0o600); offset = 0
     try:
         while time.monotonic() < deadline:
-            os.pwrite(fd, buffer, offset)
-            offset = (offset + block) % span
-            if not direct:
-                os.fsync(fd)
+            os.pwrite(fd, buffer, offset); offset = (offset + block) % span
+            if not direct: os.fsync(fd)
             if pace: time.sleep(pace)
     finally:
         os.close(fd)
@@ -1254,34 +1271,23 @@ def io_start(arguments: argparse.Namespace) -> None:
     span = bounded(arguments.span_mib, 1, 64, "span MiB") * 1024 * 1024
     pace_ms = bounded(arguments.pace_ms, 0, 10_000, "pace ms")
     path = str(Path(entry["mountpoint"]) / "gfrs-io")
-    unit = start_unit(
-        run_id,
-        f"io-{name}",
+    numbers = (
+        threads,
+        block_kib * 1024,
         seconds,
-        [
-            sys.executable,
-            "-c",
-            IO_WRITER,
-            path,
-            str(threads),
-            str(block_kib * 1024),
-            str(seconds),
-            "1" if arguments.direct else "0",
-            str(span),
-            str(pace_ms / 1000),
-        ],
-        "Nice=19",
+        int(arguments.direct),
+        span,
+        pace_ms / 1000,
     )
-    emit(
-        {
-            "unit": unit,
-            "threads": threads,
-            "block_kib": block_kib,
-            "direct": arguments.direct,
-            "pace_ms": pace_ms,
-            "state": unit_state(f"{unit}.service"),
-        }
-    )
+    argv = [sys.executable, "-c", IO_WRITER, path, *(str(value) for value in numbers)]
+    unit = start_unit(run_id, f"io-{name}", seconds, argv, "Nice=19")
+    report = {
+        "unit": unit,
+        "threads": threads,
+        "block_kib": block_kib,
+        "pace_ms": pace_ms,
+    }
+    emit({**report, "direct": arguments.direct, "state": unit_state(f"{unit}.service")})
 
 
 def io_stop(arguments: argparse.Namespace) -> None:
@@ -1293,45 +1299,39 @@ def residue(run_id: str) -> dict[str, Any]:
     """The storage this run still holds on the node (empty lists mean clean)."""
 
     digest = run_digest(run_id)
-    own_mounts = [
+    prefix, root, backing = (
+        f"{UNIT_PREFIX}{digest}-",
+        str(MOUNT_ROOT / digest),
+        f"gfrs-live-{digest}",
+    )
+    own = [
         item["mountpoint"]
         for item in host_mounts()
-        if item["mountpoint"].startswith(str(MOUNT_ROOT / digest))
+        if item["mountpoint"].startswith(root)
     ]
     dms: list[str] = []
     if tool_present("dmsetup"):
         # ``ls`` sends no uevent, so it needs no cookie and no host namespace.
         listing = run(["dmsetup", "ls"], check=False, timeout=QUICK_SECONDS).stdout
         dms = [
-            line.split()[0]
-            for line in listing.splitlines()
-            if line.startswith(f"{UNIT_PREFIX}{digest}-")
+            line.split()[0] for line in listing.splitlines() if line.startswith(prefix)
         ]
     loops = [
-        str(item.get("name"))
-        for item in loop_devices()
-        if f"gfrs-live-{digest}" in str(item.get("back-file") or "")
+        str(x.get("name"))
+        for x in loop_devices()
+        if backing in str(x.get("back-file") or "")
     ]
-    files = sorted(
-        str(path)
-        for root in BACKING_ROOTS
-        for path in (root / f"gfrs-live-{digest}").glob("*.img")
-    )
-    listed = systemctl(
-        "list-units", "--all", "--no-legend", "--plain", f"{UNIT_PREFIX}{digest}-io-*"
-    )
+    files = sorted(str(p) for r in BACKING_ROOTS for p in (r / backing).glob("*.img"))
+    listed = systemctl("list-units", "--all", "--no-legend", "--plain", f"{prefix}io-*")
     units = [line.split()[0] for line in listed.stdout.splitlines() if line.strip()]
     modules = [name for name in load_state(run_id)["modules"] if module_loaded(name)]
+    directories = sorted(str(path) for path in run_directories(run_id) if path.exists())
+    found = {"mounts": own, "device_mapper": dms, "loop_devices": loops, "units": units}
     return {
-        "mounts": own_mounts,
-        "device_mapper": dms,
-        "loop_devices": loops,
+        **found,
         "backing_files": files,
-        "units": units,
         "modules_loaded_by_run": modules,
-        "directories": sorted(
-            str(path) for path in run_directories(run_id) if path.exists()
-        ),
+        "directories": directories,
     }
 
 
@@ -1376,15 +1376,8 @@ def cleanup(arguments: argparse.Namespace) -> None:
     if pruned:
         actions.append({"directories_removed": pruned})
     remaining = residue(run_id)
-    emit(
-        {
-            "run_id": run_id,
-            "kind": kind,
-            "actions": actions,
-            "residue": remaining,
-            "clean": residue_is_clean(remaining),
-        }
-    )
+    report = {"run_id": run_id, "kind": kind, "actions": actions, "residue": remaining}
+    emit({**report, "clean": residue_is_clean(remaining)})
 
 
 def show_residue(arguments: argparse.Namespace) -> None:
@@ -1475,16 +1468,13 @@ def main(argv: list[str] | None = None) -> int:
         arguments.handler(arguments)
     except Exception as exc:  # noqa: BLE001 - reported as the probe's JSON error
         # The host fixture shows only the class, message digest and site.
-        emit(
-            {
-                "error": type(exc).__name__,
-                "error_kind": "probe",
-                "error_class": type(exc).__name__,
-                "error_code": error_code(exc),
-                "error_site": exception_site(exc),
-                "command": arguments.command,
-            }
-        )
+        error = {
+            "error": type(exc).__name__,
+            "error_kind": "probe",
+            "command": arguments.command,
+        }
+        error.update(error_class=type(exc).__name__, error_code=error_code(exc))
+        emit({**error, "error_site": exception_site(exc)})
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
     finally:

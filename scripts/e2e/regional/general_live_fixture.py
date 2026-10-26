@@ -68,9 +68,14 @@ EXPORT_IMAGE_ENV = "GPU_FAULT_GENERAL_LIVE_EXPORT_IMAGE"
 #: probe creates a test loop/dm filesystem that the installed host collector
 #: must statvfs and the ``systemd-run`` I/O writer must write to; both run in
 #: the host root mount namespace, so that Pod propagates its mounts out of its
-#: own namespace (``Bidirectional``). Every other probe only reads and keeps
-#: the default private propagation, so its manifest is unchanged.
+#: own namespace (``Bidirectional``). Every other probe only reads, but it must
+#: not keep a *private* copy of the host's mounts either: a Pod started with the
+#: default private propagation after the storage probe mounted its test device
+#: (the window probe, 2026-10-26) holds that mount for its lifetime, pins the
+#: superblock the host unmount is meant to end, and keeps the mapping open, so
+#: the host's mounts flow in and out of the read-only probes (``HostToContainer``).
 PROBE_HOST_ROOT_PROPAGATION = {"storage": "Bidirectional"}
+READ_ONLY_PROBE_HOST_ROOT_PROPAGATION = "HostToContainer"
 HOST_UNIT = "gpu-fault-host-collector.service"
 #: The channels a host variant needs fresh before it starts; the node's own
 #: collector status is the product's record, not the runner's oracle.
@@ -509,7 +514,9 @@ class VariantContext:
                 run_id=self.run_id,
                 case_dir=self.case_dir,
                 deadline_seconds=self.spec.max_minutes * 60 + 1200,
-                host_root_propagation=PROBE_HOST_ROOT_PROPAGATION.get(name, "None"),
+                host_root_propagation=PROBE_HOST_ROOT_PROPAGATION.get(
+                    name, READ_ONLY_PROBE_HOST_ROOT_PROPAGATION
+                ),
             )
             self.probes[handle_key] = handle
         return handle

@@ -82,6 +82,12 @@ class FakeDmHost:
         self.tables: dict[str, str] = {}
         self.loops: dict[str, str] = {}
         self.mounts: dict[str, str] = {}
+        #: Mounts stacked on one target (``mounts`` keeps the top one), the
+        #: mappings whose removal was deferred, and the foreign mount
+        #: namespaces the probe's sweep finds (``evicted`` by ``nsenter``).
+        self.stack: dict[str, list[str]] = {}
+        self.deferred: list[str] = []
+        self.holders: list[dict[str, Any]] = []
         self.sys_block = root / "sys-block"
         self.sys_module = root / "sys-module"
         self.mountinfo = root / "mountinfo"
@@ -100,12 +106,22 @@ class FakeDmHost:
 
     def write_mountinfo(self) -> None:
         lines = ["22 1 259:1 / / rw,relatime shared:1 - xfs /dev/nvme0n1p1 rw"]
-        for index, target in enumerate(sorted(self.mounts), start=40):
-            lines.append(
-                f"{index} 22 253:{index} / {target} rw,relatime shared:{index} "
-                f"- ext4 {self.mounts[target]} rw"
-            )
+        index = 40
+        for target in sorted(self.stack):
+            for source in self.stack[target]:
+                minor = self.mappings.get(source.rpartition("/")[2], index)
+                lines.append(
+                    f"{index} 22 253:{minor} / {target} rw,relatime shared:{index} "
+                    f"- ext4 {source} rw"
+                )
+                index += 1
         self.mountinfo.write_text("\n".join(lines) + "\n")
+
+    def mount_devno(self, target: str) -> str:
+        """``major:minor`` of the top mount on ``target`` (the mapping's minor)."""
+
+        source = self.mounts[target].rpartition("/")[2]
+        return f"253:{self.mappings[source]}"
 
     def run(
         self, command: list[str], *, timeout: float, input: str | None = None, **_: Any
@@ -150,13 +166,31 @@ class FakeDmHost:
         if tool in {"mkfs.ext4", "mkfs.vfat"}:
             return 0, ""
         if tool == "mount":
+            self.stack.setdefault(args[-1], []).append(args[-2])
             self.mounts[args[-1]] = args[-2]
             self.write_mountinfo()
             return 0, ""
         if tool == "umount":
-            if self.mounts.pop(args[-1], None) is None:
+            target = args[-1]
+            if not self.stack.get(target):
                 return 32, ""
+            self.stack[target].pop()
+            if self.stack[target]:
+                self.mounts[target] = self.stack[target][-1]
+            else:
+                del self.stack[target]
+                del self.mounts[target]
             self.write_mountinfo()
+            return 0, ""
+        if tool == "nsenter":
+            # The sweep's ``nsenter --target PID --mount -- umount -l PATH``
+            # takes the holder's private copy down (a locked one stays).
+            pid = int(args[args.index("--target") + 1])
+            for holder in self.holders:
+                if holder["pid"] == pid and not holder.get("locked"):
+                    holder["gone"] = True
+                    for name, answers in self.open_counts.items():
+                        self.open_counts[name] = [max(0, answers[-1] - 1)]
             return 0, ""
         if tool == "modprobe":
             if args[0] == "-r":
@@ -210,12 +244,17 @@ class FakeDmHost:
         if verb == "info" and "-o" in args:
             if name not in self.mappings:
                 return 1, ""
+            if args[args.index("-o") + 1] == "major,minor":
+                return 0, f"253:{self.mappings[name]}\n"
             answers = self.open_counts.get(name) or [0]
             return 0, f"{answers.pop(0) if len(answers) > 1 else answers[0]}\n"
         if verb == "create":
             name = args[1]
-            assert args[2] == "--table", args
-            self.tables[name] = args[3]
+            if args[2:3] == ["--table"]:
+                self.tables[name] = args[3]
+            else:
+                assert self.stdin, args  # a multi-segment table arrives on stdin
+                self.tables[name] = self.stdin.rstrip("\n")
             self.minor += 1
             self.mappings[name] = self.minor
             node = self.sys_block / f"dm-{self.minor}" / "dm"
@@ -225,6 +264,9 @@ class FakeDmHost:
         if verb == "remove":
             if name not in self.mappings:
                 return 1, ""
+            if "--deferred" in args and (self.open_counts.get(name) or [0])[-1]:
+                self.deferred.append(name)  # goes once the last holder closes it
+                return 0, ""
             shutil.rmtree(self.sys_block / f"dm-{self.mappings.pop(name)}")
             return 0, ""
         if verb in {"resume", "suspend", "info"}:
@@ -275,8 +317,30 @@ def host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeDmHost:
     monkeypatch.setattr(storep, "DEADLINE", [])
     monkeypatch.setattr(storep, "tool_present", lambda name: True)
     monkeypatch.setattr(storep, "emit", fake.emitted.append)
-    # The fake device node cannot be read: the FAT16 geometry is pinned.
+    # The fake device node cannot be read: the FAT16 geometry is pinned, an
+    # O_DIRECT read answers from the mapping's table (EIO inside an ``error``
+    # segment), a path's devno is the top mount's and ``/proc`` is the fake's.
     monkeypatch.setattr(storep, "fat_region", lambda device: list(FAT_SECTORS))
+
+    def direct_read(device: str, sector: int) -> str:
+        table = fake.tables.get(device.rpartition("/")[2], "")
+        for line in table.splitlines():
+            start, length, target = line.split()[:3]
+            if int(start) <= sector < int(start) + int(length):
+                return "OSError: 5" if target == "error" else "ok"
+        return "ok"
+
+    monkeypatch.setattr(storep, "direct_read", direct_read)
+    monkeypatch.setattr(storep, "mount_devno", fake.mount_devno)
+    monkeypatch.setattr(
+        storep,
+        "foreign_holders",
+        lambda devnos: [
+            {k: v for k, v in holder.items() if k != "gone"}
+            for holder in fake.holders
+            if not holder.get("gone")
+        ],
+    )
     monkeypatch.setattr(
         storep,
         "subprocess",
@@ -638,13 +702,17 @@ FAT_SECTORS = [8, 520]
 FAT_ERROR_TABLE = (
     "0 8 linear /dev/loop0 0\n8 512 error\n520 4193784 linear /dev/loop0 520"
 )
+#: The 004 fault mapping: a second mapping over the same loop device.
+FAULT = f"{DM}-fault"
 
 
 def table_statvfs(host: FakeDmHost) -> Any:
-    """A ``statvfs_reading`` that fails EIO while a FAT read hits ``error``."""
+    """A ``statvfs_reading`` that fails EIO while the mapping under the TOP mount
+    of the path (each mapping gets its own superblock) has its FAT on ``error``."""
 
     def reading(path: str) -> dict[str, Any]:
-        if " error" in host.tables.get(DM, ""):
+        source = host.mounts.get(path, f"/dev/mapper/{DM}").rpartition("/")[2]
+        if " error" in host.tables.get(source, ""):
             return {"path": path, "error": "OSError: 5"}
         return {"path": path, "used_percent": 1.0, "read_only": False}
 
@@ -695,16 +763,16 @@ def test_a_vfat_device_is_formatted_fat16_and_mounted_with_errors_continue(
     ], mount
 
 
-def test_retarget_error_swaps_the_fat_segment_before_a_fresh_mount_and_data_restores(
+def test_retarget_error_mounts_a_fault_mapping_over_the_healthy_one_and_data_restores(
     host: FakeDmHost, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The 2026-10-25 live run: the whole-device error table was loaded under a
-    mount whose free-cluster count something had already read, and three
-    attempts later statvfs still answered. The FAT segment now turns to
-    ``error`` while the carrier is unmounted, the device's page cache is
-    dropped and the mount comes up over an unreadable FAT -- there is no
-    window in which a statfs could warm the count, so one attempt is the
-    whole injection and the probe's own reading is the proof."""
+    """The 2026-10-25/26 live runs: a remount of the SAME device reused the
+    superblock a private mount-namespace copy (the window probe Pod) kept
+    alive, and statvfs answered from its cached count. The injection is now a
+    second mapping over the same loop device whose FAT segment is ``error``,
+    proved by O_DIRECT reads and mounted over the healthy mount: a new block
+    device gets a new superblock, so the count has to read the FAT -- EIO.
+    The healthy mapping is never unmounted or reloaded for it."""
 
     synced = build_vfat(host, monkeypatch)
     host.calls.clear()
@@ -712,39 +780,47 @@ def test_retarget_error_swaps_the_fat_segment_before_a_fresh_mount_and_data_rest
     faulted = host.emitted[-1]
     assert faulted["faulted"] is True and faulted["attempts"] == 1, faulted
     assert faulted["statvfs"]["error"] == "OSError: 5" and faulted["mounted_on_host"]
-    assert faulted["fat_sectors"] == FAT_SECTORS, faulted
-    assert host.tables[DM] == FAT_ERROR_TABLE, host.tables
+    assert faulted["fat_sectors"] == FAT_SECTORS and faulted["diagnosis"] is None
+    assert faulted["fault_dm"] == FAULT == device()["fault_dm"], faulted
+    assert faulted["direct_reads"] == {"boot": "ok", "fat": "OSError: 5"}, faulted
+    assert (
+        faulted["mount_devno"]
+        == faulted["fault_devno"]
+        == f"253:{host.mappings[FAULT]}"
+    )
+    assert host.tables[FAULT] == FAT_ERROR_TABLE, host.tables
+    assert host.tables[DM] == "0 4194304 linear /dev/loop0 0", (
+        "the healthy mapping stays"
+    )
+    assert host.stack[device()["mountpoint"]] == [
+        device()["dm_path"],
+        f"/dev/mapper/{FAULT}",
+    ]
     assert device()["target"] == "error", device()
-    assert synced == [], "nothing to sync: the carrier is unmounted for the swap"
+    assert synced == [], "nothing is synced or unmounted for the injection"
     steps = [
         call[len(NS) :][:2] if call[: len(NS)] == NS else call[:2]
         for call in host.device_calls()
+        if call[len(NS) :][:2] != ["dmsetup", "info"]  # devno lookups
     ]
-    assert steps == [
-        ["umount", device()["mountpoint"]],
-        ["dmsetup", "suspend"],
-        ["dmsetup", "reload"],
-        ["dmsetup", "resume"],
-        ["blockdev", "--flushbufs"],
-        ["mount", "-t"],
-    ], steps
-    reload = next(
+    assert steps == [["dmsetup", "create"], ["mount", "-t"]], steps
+    created = next(
         call
         for call in host.calls
-        if call[len(NS) : len(NS) + 2] == ["dmsetup", "reload"]
+        if call[len(NS) : len(NS) + 2] == ["dmsetup", "create"]
     )
-    assert "--table" not in reload, (
-        "a three-segment table cannot go on the command line"
+    assert created[len(NS) :] == ["dmsetup", "create", FAULT], (
+        "the table arrives on stdin"
     )
-    flush = next(call for call in host.device_calls() if tool_of(call) == "blockdev")
-    assert flush[len(NS) :] == ["blockdev", "--flushbufs", device()["dm_path"]], flush
     mount = next(call for call in host.device_calls() if tool_of(call) == "mount")
-    assert mount[len(NS) :][:5] == [
+    assert mount[len(NS) :] == [
         "mount",
         "-t",
         "vfat",
         "-o",
         "errors=continue,noatime",
+        f"/dev/mapper/{FAULT}",
+        device()["mountpoint"],
     ]
     assert all(call[: len(NS)] == NS for call in host.device_calls()), (
         "every device command joins the host namespaces"
@@ -753,18 +829,26 @@ def test_retarget_error_swaps_the_fat_segment_before_a_fresh_mount_and_data_rest
     assert storep.main(call("dm-retarget", "--name", "io", "--target", "data")) == 0
     restored = host.emitted[-1]
     assert restored["faulted"] is False and "error" not in restored["statvfs"]
-    assert host.tables[DM] == "0 4194304 linear /dev/loop0 0", host.tables
-    assert device()["target"] == "data", device()
-    tools = [tool_of(call) for call in host.device_calls()]
-    assert tools == ["dmsetup", "dmsetup", "dmsetup"], "no remount on the way back"
+    assert host.tables[FAULT] == "0 4194304 linear /dev/loop0 0", host.tables
+    assert device()["target"] == "data" and device()["fault_dm"] == FAULT, device()
+    reloaded = [
+        call[len(NS) :][:3]
+        for call in host.device_calls()
+        if call[len(NS) :][:2] != ["dmsetup", "info"]
+    ]
+    assert reloaded == [
+        ["dmsetup", "suspend", "--nolockfs"],
+        ["dmsetup", "reload", FAULT],
+        ["dmsetup", "resume", FAULT],
+    ], "the fault mapping is restored in place; no remount, no touch of the device"
 
 
-def test_retarget_reports_a_reading_that_still_answers_after_its_one_attempt(
+def test_retarget_reports_a_reading_that_still_answers_with_its_diagnosis(
     host: FakeDmHost, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """No retry loop is left: a statvfs that answers over the FAT-error table
-    is reported ``faulted: false`` (the runner's INCONCLUSIVE), not masked by
-    another unmount/mount cycle."""
+    """A statvfs that answers although the fault mapping's FAT reads fail is
+    reported ``faulted: false`` with the diagnosis (the runner's INCONCLUSIVE
+    names it), after exactly one attempt -- no retry loop, no second mount."""
 
     build_vfat(host, monkeypatch)
     monkeypatch.setattr(
@@ -774,13 +858,29 @@ def test_retarget_reports_a_reading_that_still_answers_after_its_one_attempt(
     assert storep.main(call("dm-retarget", "--name", "io", "--target", "error")) == 0
     result = host.emitted[-1]
     assert result["faulted"] is False and result["attempts"] == 1, result
-    reloads = [
-        call
-        for call in host.calls
-        if call[len(NS) : len(NS) + 2] == ["dmsetup", "reload"]
+    assert result["direct_reads"]["fat"] == "OSError: 5", result
+    assert result["diagnosis"] == (
+        "statfs answered over a mapping whose FAT reads fail: superblock reused"
+    ), result
+    creates = [
+        c for c in host.calls if c[len(NS) : len(NS) + 2] == ["dmsetup", "create"]
     ]
-    assert len(reloads) == 1, reloads
-    assert host.tables[DM] == FAT_ERROR_TABLE, host.tables
+    assert len(creates) == 1 and host.tables[FAULT] == FAT_ERROR_TABLE, host.tables
+
+
+def test_retarget_refuses_a_fault_mapping_whose_fat_segment_reads(
+    host: FakeDmHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    build_vfat(host, monkeypatch)
+    monkeypatch.setattr(storep, "direct_read", lambda device, sector: "ok")
+    assert storep.main(call("dm-retarget", "--name", "io", "--target", "error")) == 1
+    error = host.emitted[-1]
+    assert error["error_class"] == "ProbeError", error
+    assert error["error_site"].startswith("fault_mapping:"), error
+    assert (
+        device()["mountpoint"] not in host.stack
+        or len(host.stack[device()["mountpoint"]]) == 1
+    ), "nothing was mounted over the healthy mount"
 
 
 def test_retarget_error_on_an_ext4_device_keeps_the_whole_device_table(
@@ -846,7 +946,7 @@ def test_retarget_refuses_a_running_writer_and_an_unfinished_device(
     assert host.device_calls() == [], "refused before any unmount or reload"
 
 
-def test_cleanup_of_a_faulted_device_puts_the_data_table_back_first(
+def test_cleanup_of_a_faulted_device_unmounts_the_stack_and_removes_both_mappings(
     host: FakeDmHost, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     build_vfat(host, monkeypatch)
@@ -859,10 +959,98 @@ def test_cleanup_of_a_faulted_device_puts_the_data_table_back_first(
         for call in host.device_calls()
         for inner in [call[len(NS) :] if call[: len(NS)] == NS else call]
     ]
-    reload_at = verbs.index(("dmsetup", "reload"))
-    umount_at = verbs.index(("umount", ""))
-    assert reload_at < umount_at, verbs
-    assert (host.mappings, host.loops, host.mounts) == ({}, {}, {})
+    assert verbs.count(("umount", "")) == 2, verbs
+    removes = [
+        inner[-1]
+        for call in host.device_calls()
+        for inner in [call[len(NS) :]]
+        if inner[:2] == ["dmsetup", "remove"]
+    ]
+    assert removes == [FAULT, DM], "the fault mapping (on top) goes first"
+    assert ("dmsetup", "reload") not in verbs, "no table is reloaded for the cleanup"
+    assert (host.mappings, host.loops, host.mounts, host.stack) == ({}, {}, {}, {})
+    destroyed = host.emitted[-1]["actions"][0]["device"]
+    assert destroyed["holders"] == [] and destroyed["deferred"] == [], destroyed
+    assert destroyed["directory_removed"] is True, destroyed
+
+
+def test_cleanup_of_an_ext4_error_table_puts_the_data_table_back_first(
+    host: FakeDmHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    built(host)
+    monkeypatch.setattr(storep, "statvfs_reading", table_statvfs(host))
+    assert storep.main(call("dm-retarget", "--name", "io", "--target", "error")) == 0
+    host.calls.clear()
+    assert storep.main(call("cleanup", "--kind", "dm-io")) == 0, host.emitted[-1]
+    assert host.emitted[-1]["clean"] is True, host.emitted[-1]["residue"]
+    verbs = [
+        (tool_of(call), inner[1] if inner[0] == "dmsetup" else "")
+        for call in host.device_calls()
+        for inner in [call[len(NS) :] if call[: len(NS)] == NS else call]
+    ]
+    assert verbs.index(("dmsetup", "reload")) < verbs.index(("umount", "")), verbs
+
+
+def test_destroy_evicts_a_private_copy_of_the_mount_from_another_namespace(
+    host: FakeDmHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The 2026-10-26 live cleanup: the window probe Pod, started after the
+    mount with private propagation, kept a copy of it; the host unmount left
+    the superblock alive, the mapping open (1), and ``dmsetup remove`` failed
+    ``Device or resource busy``. The destroy now finds the namespace by the
+    mappings' major:minor in ``/proc/<pid>/mountinfo``, lazily unmounts the
+    copy there, and removes once the open count drops."""
+
+    build_vfat(host, monkeypatch)
+    assert storep.main(call("dm-retarget", "--name", "io", "--target", "error")) == 0
+    host.holders = [
+        {"pid": 4242, "comm": "pause", "locked": False, "mountpoints": ["/host/mnt/x"]}
+    ]
+    host.open_counts[DM] = [1]
+    host.calls.clear()
+    assert storep.main(call("dm-destroy", "--name", "io")) == 0, host.emitted[-1]
+    result = host.emitted[-1]
+    evictions = [
+        call for call in host.calls if call[0] == "nsenter" and "1" not in call[:3]
+    ]
+    assert evictions == [
+        ["nsenter", "--target", "4242", "--mount", "--", "umount", "-l", "/host/mnt/x"]
+    ], evictions
+    assert result["holders"] == [
+        {
+            "pid": 4242,
+            "comm": "pause",
+            "locked": False,
+            "mountpoints": ["/host/mnt/x"],
+            "evicted": True,
+        }
+    ], result
+    assert result["deferred"] == [] and result["destroyed"] is True, result
+    assert (host.mappings, host.deferred) == ({}, []), "both mappings removed at once"
+    assert host.clock.now - 1000.0 == 0, "no waiting once the holder is gone"
+
+
+def test_destroy_defers_the_removal_when_a_locked_copy_keeps_the_mapping_open(
+    host: FakeDmHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A copy owned by another user namespace cannot be unmounted from outside:
+    the holder is named, the removal is deferred to the kernel (it completes
+    when that namespace ends), nothing raises, and the residue stays honest."""
+
+    built(host)
+    host.holders = [
+        {"pid": 777, "comm": "sleep", "locked": True, "mountpoints": ["/x/mnt"]}
+    ]
+    host.open_counts[DM] = [1]
+    started = host.clock.now
+    assert storep.main(call("cleanup", "--kind", "dm-io")) == 0, host.emitted[-1]
+    report = host.emitted[-1]
+    destroyed = report["actions"][0]["device"]
+    assert destroyed["holders"][0]["locked"] and not destroyed["holders"][0]["evicted"]
+    assert destroyed["deferred"] == [DM] and host.deferred == [DM], destroyed
+    assert host.clock.now - started >= storep.REMOVE_WAIT_SECONDS
+    assert report["clean"] is False and DM in report["residue"]["device_mapper"]
+    assert "io" not in storep.load_state(RUN_ID)["devices"], "the record is gone"
 
 
 def test_destroy_waits_for_the_mappings_openers_before_the_remove(
@@ -891,17 +1079,20 @@ def test_destroy_waits_for_the_mappings_openers_before_the_remove(
     assert DM not in host.mappings
 
 
-def test_destroy_gives_up_on_a_mapping_that_stays_open(host: FakeDmHost) -> None:
+def test_destroy_defers_an_unidentified_opener_after_the_wait(host: FakeDmHost) -> None:
+    """An opener no mount namespace explains (a process holding the device node)
+    is waited out, then the removal is deferred and reported -- never a raise
+    that would leave the loop device, the backing file and the record behind."""
+
     built(host)
     host.open_counts[DM] = [1]
     started = host.clock.now
-    assert storep.main(call("dm-destroy", "--name", "io")) == 1
-    error = host.emitted[-1]
-    assert error["error_class"] == "ProbeError", error
-    assert error["error_site"].startswith("destroy_device:"), error
+    assert storep.main(call("dm-destroy", "--name", "io")) == 0, host.emitted[-1]
+    result = host.emitted[-1]
+    assert result["holders"] == [] and result["deferred"] == [DM], result
     assert host.clock.now - started >= storep.REMOVE_WAIT_SECONDS
-    assert DM in host.mappings, "the mapping is left for the deadman's retry"
-    assert "io" in storep.load_state(RUN_ID)["devices"], "and stays recorded"
+    assert host.deferred == [DM] and host.loops == {}, "loop detached, mapping deferred"
+    assert "io" not in storep.load_state(RUN_ID)["devices"]
 
 
 def test_dm_create_loads_vfat_under_the_flag_and_cleanup_unloads_it(

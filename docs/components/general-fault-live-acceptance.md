@@ -201,20 +201,30 @@ inode耗尽、只读、必需挂载消失、EIO/EACCES分别验，不能用剩�
 容量 finding，不 reset/reboot/隔离，不可读状态记为不可用（UNKNOWN）而非健康，挂载
 不可用期间 hold 节点、还原后随信号清零受控接纳（批次163修复，此前按 capacity-only
 缺口记 FAIL）。`probe_error` 的故障挂载夹具：存储探针的 loop + device-mapper 测试设备改载
-FAT16（`dm-create --fstype vfat`），`dm-retarget --target error` 先卸载，再把表换成"仅 FAT
-区段为 `dm_mod` 内建 `error` 目标、引导扇区/根目录/数据区仍为 `linear`"的三段表（FAT 区段按
-引导扇区 BPB 计算并向内对齐到页边界，建设备时记入 `fat_sectors`），`blockdev --flushbufs`
-丢弃设备页缓存后重新挂载——挂载仍在（非 MOUNT_MISSING）、宿主表为 rw（非 READ_ONLY），而每次
-`statvfs` 都返回 EIO → PROBE_FAILED。原理：FAT 的 `statfs` 从设备读 FAT 计数空簇，但一旦某次计数
-成功就改为从内存应答；2026-10-25 live 曾在"新挂载→整盘 error 表"之间被别的 `statfs`（宿主采集器等）
-抢先计数，三次重试全部命中缓存而 INCONCLUSIVE；现在 FAT 在挂载存在之前就已不可读，任何 `statfs`
-都无法计数成功，不存在可输的竞态（ext4 自始至终在内存中应答，对 dm-error 无感）。`--target data`
-原地还原（无需重挂载，下一次计数即成功），探针自身读数是有效性 oracle（一次尝试未读到 EIO 即
-`INCONCLUSIVE`，不再重试）。error 区段既不被写入也不被用户态按页读取（写失败会记
-`Buffer I/O error`，节点日志采集器 `log_rules.py` 的存储规则会把它判成 QUARANTINE；内核只打
-`FAT-fs: FAT read failed` 行，不匹配该规则），但节点日志采集器处于 active 时仍记
-`NOT_RUN(FIXTURE_NOT_READY)`；销毁设备时先卸载，再轮询映射的 open_count 归零（最多 90 s，
-2026-10-25 live 清理曾在卸载后立刻 `dmsetup remove` 得 EBUSY）后 remove、detach；缺 `vfat`
+FAT16（`dm-create --fstype vfat`；FAT 区段按引导扇区 BPB 计算、向内对齐到页边界并记入
+`fat_sectors`），`dm-retarget --target error` 在**同一个 loop 设备上再建一个映射**
+`<dm>-fault`，其三段表仅 FAT 区段为 `dm_mod` 内建 `error` 目标、引导扇区/根目录/数据区仍为
+`linear`，先用 O_DIRECT 直读证明表确实生效（引导扇区可读、FAT 首扇区 EIO，否则夹具报
+ProbeError），再把它**叠加挂载**到已声明的挂载点之上——挂载仍在（非 MOUNT_MISSING）、宿主表为
+rw（非 READ_ONLY），而每次 `statvfs` 都返回 EIO → PROBE_FAILED。原理：FAT 的 `statfs` 从设备读 FAT
+计数空簇，一旦某次计数成功就改为从内存应答，且内核按块设备复用超级块（`sget`）；2026-10-25/26 的
+两次 live（整盘 error 表、FAT 区段 error 表 + `flushbufs` + 重挂载）都在"同一映射上卸载再挂载"，
+而窗口探针 Pod 在测试设备挂载之后才创建、其 hostPath `/` 为默认私有传播，持有该挂载的私有副本：
+宿主 umount 结束不了超级块，重挂载复用了缓存着计数的旧超级块，statvfs 继续应答，映射也始终有
+1 个 opener（清理 `dmsetup remove` EBUSY）。新映射是新的块设备 → 必然新建超级块 → 首次计数必须经
+`-fault` 映射读 FAT → EIO，与页缓存、旧超级块是否被钉住无关（本机用 `unshare -m --propagation
+private` 复现钉住后，三轮各 3 次 statvfs 全部 EIO）。`--target data` 原地把 `-fault` 映射的表换回
+`linear`（无需重挂载，下一次计数即成功）；探针自身读数是 oracle，一次尝试未读到 EIO 即
+`INCONCLUSIVE`，并带 `diagnosis`（直读 FAT 已 EIO 而 statfs 仍应答 = 超级块被复用；挂载点未解析到
+fault 映射 = 挂载未生效）与 `direct_reads` 写入 `injection.json`。error 区段既不被写入也不被用户态
+按页读取（写失败会记 `Buffer I/O error`，节点日志采集器 `log_rules.py` 的存储规则会把它判成
+QUARANTINE；内核只打 `FAT-fs: FAT read failed` 行，不匹配该规则），但节点日志采集器处于 active 时
+仍记 `NOT_RUN(FIXTURE_NOT_READY)`。销毁：卸载挂载点上的整栈 → 按映射的 major:minor 扫描
+`/proc/<pid>/mountinfo` 找出仍持有副本的其他 mount namespace，`nsenter --mount` 进去 `umount -l`
+（结果 `holders` 含 pid/comm/locked/evicted，记入 result.json 的 cleanup 结果）→ 轮询 open 归零
+（最多 90 s）→ `dmsetup remove`；归属其他 user namespace 的副本（locked）无法从外部卸载，则改用
+`dmsetup remove --deferred`（持有者退出即消失）并如实报 residue，不再抛错。只读探针 Pod 的 hostPath
+`/` 改为 `HostToContainer`（rslave）：宿主挂载/卸载事件可进可出，探针 Pod 不再钉住超级块；缺 `vfat`
 模块时在 `KERNEL_MODULE_LOAD` 下加载并在清理时卸载；节点需有 `mkfs.vfat`（dosfstools），缺它时记
 `NOT_RUN(CAPABILITY_ABSENT)` 并提示令牌，给可选令牌 `TEMP_TEST_PACKAGE_INSTALL` 则由共享的临时测试包
 步骤（`general_live_deps.ensure_dependencies`）在建设备前只安装 `dosfstools`，设备销毁后作为最后一步

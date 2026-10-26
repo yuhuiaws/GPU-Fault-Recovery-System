@@ -1723,36 +1723,55 @@ or a delivering collector whose shared latest records name other mounts only --
 the real "not discovered", the evidence of a sandbox view or a filtered root.
 
 004 `probe_error` has its faulting mount: the storage probe's loop +
-device-mapper device carrying FAT16 (`dm-create --fstype vfat`). `dm-retarget
---target error` unmounts it, swaps its table to a three-segment one whose FAT
-segment is the `error` target built into `dm_mod` while the boot sector, root
-directory and data stay `linear` (the FAT region is read from the boot
-sector's BPB at build time, page-aligned inwards, and recorded as
-`fat_sectors`), drops the device's page cache (`blockdev --flushbufs`) and
-mounts the carrier afresh, so the mount stays, reads read-write in the host
-table, and every `statvfs` fails EIO. The mechanism: FAT counts its free
-clusters from the FAT on the device until one count succeeds, then answers
-from memory; the 2026-10-25 live run (hpb lane) swapped the whole device to
-`error` under a fresh mount and lost the race three times to a `statfs` made
-in between (the host collector's own reading of the declared mount, or any
-agent's), so every later statvfs answered from the cached count and the
-variant was INCONCLUSIVE. A FAT that is unreadable before the mount exists can
-never be counted, so there is no race to lose; ext4 answers from memory from
-the start and never notices dm-error. `--target data` restores the data table
-in place (the next count succeeds, no remount), and the probe's own reading is
-the oracle (no EIO on its one attempt is `INCONCLUSIVE`; the retry loop is
-gone). The error segment is neither written nor page-read from user space --
-a failed write would log `Buffer I/O error`, which the node log collector's
-storage rule grades QUARANTINE; the kernel only logs `FAT-fs: FAT read failed`
-lines, which that rule does not match -- and the variant still refuses to run
-while that collector is active. The destroy unmounts, then waits (bounded, 90
-s) for the mapping's `open_count` to reach 0 before `dmsetup remove`: the
-2026-10-25 live cleanup removed right after the unmount and failed `Device or
-resource busy`. It needs `KERNEL_MODULE_LOAD` for a missing `vfat` and
-`mkfs.vfat` on the node; without the tool it is NOT_RUN(CAPABILITY_ABSENT)
-unless the optional `TEMP_TEST_PACKAGE_INSTALL` is given, which installs
-exactly `dosfstools` for the run before the device is built and removes it as
-the last LIFO cleanup after the device is destroyed.
+device-mapper device carrying FAT16 (`dm-create --fstype vfat`; the FAT region
+is read from the boot sector's BPB at build time, page-aligned inwards, and
+recorded as `fat_sectors`). `dm-retarget --target error` creates a SECOND
+mapping over the same loop device, `<dm>-fault`, whose three-segment table
+has only the FAT segment on the `error` target built into `dm_mod` (boot
+sector, root directory and data stay `linear`), proves the table with O_DIRECT
+reads before anything mounts it (boot sector readable, first FAT sector EIO --
+otherwise the fixture raises), and mounts it over the declared mount point, on
+top of the healthy mount: the mount stays, reads read-write in the host table,
+and every `statvfs` fails EIO. The mechanism: FAT counts its free clusters
+from the FAT on the device until one count succeeds and then answers from
+memory, and the kernel reuses a superblock per block device (`sget`). Both
+live attempts of 2026-10-25/26 (the whole-device `error` table; the FAT-segment
+table with `blockdev --flushbufs` and a remount) unmounted and remounted the
+SAME mapping -- but the window probe Pod, created right after the test device
+was mounted with its hostPath `/` on the default private propagation, held a
+private copy of that mount, so the host unmount never ended the superblock,
+the remount reused it with its cached count, statvfs kept answering, and the
+mapping kept exactly one opener (the cleanup's `dmsetup remove` failed `Device
+or resource busy` on both clusters). A new mapping is a new block device, so
+its mount gets a new superblock whose first count must read the FAT through
+the fault mapping: EIO, independent of the page cache and of whoever pins the
+old superblock (reproduced here with `unshare -m --propagation private`: three
+rounds of three statvfs, all EIO, while the pin was alive). `--target data`
+reloads the fault mapping's table to `linear` in place (the next count
+succeeds, no remount). The probe's own reading is the oracle: no EIO on its
+one attempt is `INCONCLUSIVE`, and the runner now writes `injection.json`
+with the reading, the `direct_reads` and a `diagnosis` ("statfs answered over
+a mapping whose FAT reads fail: superblock reused" when the mount point
+resolves to the fault mapping, otherwise "the mount point does not resolve to
+the fault mapping"). The error segment is neither written nor page-read from
+user space -- a failed write would log `Buffer I/O error`, which the node log
+collector's storage rule grades QUARANTINE; the kernel only logs `FAT-fs: FAT
+read failed` lines, which that rule does not match -- and the variant still
+refuses to run while that collector is active. The destroy unmounts the whole
+stack on the mount point, finds every other mount namespace that still holds
+a copy of either mapping (`/proc/<pid>/mountinfo` by major:minor), lazily
+unmounts it there with `nsenter --mount` and records the holders (pid, comm,
+`locked`, `evicted`) in the cleanup result, waits (bounded, 90 s) for the
+open count to reach 0 and removes; a copy owned by another user namespace is
+locked and cannot be unmounted from outside, so that mapping is removed
+`--deferred` (it goes when the holder exits) and reported as residue instead
+of raising. The read-only probe Pods' hostPath `/` now uses `HostToContainer`
+(rslave) so the host's mounts flow in and out of them and a probe started
+mid-case can no longer pin a superblock. It needs `KERNEL_MODULE_LOAD` for a
+missing `vfat` and `mkfs.vfat` on the node; without the tool it is
+NOT_RUN(CAPABILITY_ABSENT) unless the optional `TEMP_TEST_PACKAGE_INSTALL` is
+given, which installs exactly `dosfstools` for the run before the device is
+built and removes it as the last LIFO cleanup after the device is destroyed.
 
 ## GF-GENERAL-LIVE 029 store-level restart-budget variants
 

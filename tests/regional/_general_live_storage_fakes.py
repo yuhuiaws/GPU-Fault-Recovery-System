@@ -66,6 +66,9 @@ def retarget_answer(arguments: tuple[str, ...]) -> dict[str, Any]:
         "attempts": 1,
         "mounted_on_host": True,
         "faulted": error,
+        "fault_dm": "gfrs-deadbeef0000-err-fault",
+        "direct_reads": {"boot": "ok", "fat": "OSError: 5"},
+        "diagnosis": None,
         "statvfs": {"error": "OSError: 5"} if error else {"used_percent": 1.0},
     }
 
