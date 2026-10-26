@@ -163,6 +163,51 @@ class NvlinkCounter:
 
 
 @dataclass(frozen=True)
+class ComponentPair:
+    """Two components of one per-GPU composite, both reported by ``gpu``.
+
+    ``primary`` anchors the plan (every exporter generation reports it);
+    ``companion`` is the member of a candidate list the exporter really
+    publishes for the same GPU, so a composite plan never targets a reading
+    that is absent upstream -- the replay tool refuses to invent samples and
+    would abort the armed run INCONCLUSIVE instead (live 2026-10-26, p5en
+    H200: 024 ``fresh_components`` on ``retired_pages_sbe_total``, a counter
+    Hopper does not publish). ``exporter_metrics`` are the sample names the
+    companion arrives under, so a variant's evidence says which reading it
+    exercised.
+    """
+
+    gpu: str
+    primary: str
+    companion: str
+    exporter_metrics: tuple[str, ...]
+
+    @property
+    def components(self) -> tuple[str, str]:
+        return (self.primary, self.companion)
+
+    def keys(self) -> list[str]:
+        """The oracle keys (``<gpu>/<field>``) of both components."""
+
+        return [f"{self.gpu}/{name}" for name in self.components]
+
+    def note(self) -> str:
+        metrics = ", ".join(self.exporter_metrics) or "exporter name not surveyed"
+        return (
+            f"second component exercised: {self.companion} beside {self.primary} "
+            f"on {self.gpu} (exporter {metrics})"
+        )
+
+    def evidence(self) -> dict[str, Any]:
+        return {
+            "gpu_uuid": self.gpu,
+            "component_metrics": list(self.components),
+            "second_component": self.companion,
+            "exporter_metrics": list(self.exporter_metrics),
+        }
+
+
+@dataclass(frozen=True)
 class GpuSurvey:
     """The probe's read-only survey, with the questions plans ask of it."""
 
@@ -297,6 +342,43 @@ class GpuSurvey:
                 "CAPABILITY_ABSENT", f"no GPU on the node reports {name}"
             )
         return candidates[-1]
+
+    def component_pair(
+        self, primary: str, candidates: Sequence[str], *, avoid: Sequence[str] = ()
+    ) -> ComponentPair:
+        """``primary`` and the first of ``candidates`` one GPU reports beside it.
+
+        A composite plan alters two readings of one GPU, and the exporter
+        decides which second reading exists: Hopper retires no pages (row
+        remapping replaced it), so it publishes no ``retired_pages_*`` while
+        it reports the row-remap counters; a pre-Ampere part is the other way
+        round. The candidates are tried in order and the highest-index GPU
+        (not in ``avoid``) reporting both the primary and that candidate is
+        the target. No candidate beside the primary on any GPU is
+        ``NOT_RUN(CAPABILITY_ABSENT)`` naming every candidate -- before
+        anything is installed on the node.
+        """
+
+        anchors = [gpu for gpu in self.gpus_with(primary) if gpu not in avoid]
+        if not anchors:
+            raise VariantNotRun(
+                "CAPABILITY_ABSENT", f"no GPU on the node reports {primary}"
+            )
+        for companion in candidates:
+            gpus = [gpu for gpu in anchors if self.has(gpu, companion)]
+            if gpus:
+                gpu = gpus[-1]
+                return ComponentPair(
+                    gpu=gpu,
+                    primary=primary,
+                    companion=companion,
+                    exporter_metrics=tuple(self.exporter_metrics(gpu, companion)),
+                )
+        raise VariantNotRun(
+            "CAPABILITY_ABSENT",
+            f"no GPU on the node reports {primary} together with a second "
+            f"component ({', '.join(candidates)})",
+        )
 
 
 def require_replayable(

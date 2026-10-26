@@ -3007,6 +3007,56 @@ the variants therefore exercise `nvlink_crc_aggregate_error_total`,
 clusters and still have no product evidence. The flit/data split and the
 per-class counters themselves stay unexercised until a NVLink3 node joins.
 
+The 024 memory composites replayed a second component the exporter may not
+have. On 2026-10-26 (07:41Z, plain EKS, p5en H200, R13g) `fresh_components`
+ended INCONCLUSIVE "the replay aborted: targeted reading absent upstream;
+refusing invented samples: GPU-.../retired_pages_sbe_total": the variants
+hard-coded `retired_pages_sbe_total` beside `ecc_sbe_volatile_total`, but
+Hopper exposes no page retirement at all (row remapping replaced it; 019
+`retired_delta` is CAPABILITY_ABSENT on this site), so the replay tool refused
+to invent the sample and aborted after arm, and with both clusters on H200
+`fresh_components` and `reused_components` had no coverage. The second
+component is now chosen from the node's survey (`GpuSurvey.component_pair`):
+`retired_pages_sbe_total` where the part reports it (pre-Hopper), else
+`row_remap_correctable_total` -- both members of the product's
+CORRECTABLE_MEMORY_DEGRADATION rule (`gpu_metrics._add_memory_composites`
+takes any two of ecc_sbe_volatile_total, ecc_sbe_aggregate_total,
+retired_pages_sbe_total, row_remap_correctable_total; pinned by ingesting both
+pairs) -- on the same target GPU; `corrected_memory` and `independent_xid`
+take the same pair, and `memory_failure` / `wrong_scope_source` take the
+pending-repair flag the node reports (`row_remap_pending` on Ampere and later,
+else `retired_pages_pending`). The chosen component is in the result's
+`second_component` / `component_metrics` / `exporter_metrics` and notes, and
+every composite plan is checked against the survey before anything is
+installed (`composite_replay`): a plan naming a reading the node does not
+report is NOT_RUN(CAPABILITY_ABSENT) listing it, never INCONCLUSIVE mid-run.
+On this site the variants exercise `ecc_sbe_volatile_total` +
+`row_remap_correctable_total`; the retired-page pair stays unexercised until a
+pre-Hopper node joins. `fresh_components` and `reused_components` are to be
+re-run on both clusters.
+
+024 `wrong_scope_source` FAILED live (2026-10-26 07:51Z, eksb, R13g) on its
+hardware stage alone: the repair GPU's own `row_remap_pending` incident ran the
+product's authorized single-GPU service-window reset chain (FREEZE_EVIDENCE,
+MARK_UNSCHEDULABLE, QUARANTINE, QUIESCE_GPU_SERVICES, VERIFY_NO_GPU_CLIENTS,
+RESET_GPU, RESTORE_GPU_SERVICES, VALIDATE_GPU, RESTORE_SCHEDULING, every step
+SUCCEEDED 07:47:57-07:50:03Z -- a real reset of one GPU) and ended RECOVERED
+by itself, while the error GPU's incident was isolated and later released by
+the validated restore and no cross-GPU composite formed. That is the product's
+policy (a pending repair flag on a modern GPU is WARNING RESET_GPU, the chain
+019 `pending_supported` expects under `GPU_RESET`), contradicted only by the
+variant's unscoped `no_hardware` oracle. The variant now declares `GPU_RESET`
+(flags `X`, risk H, like 019's reset variants: it really resets a GPU and
+belongs with the dangerous, run-last variants), judges hardware per incident
+(the repair incident's workflows may plan QUIESCE_GPU_SERVICES and RESET_GPU
+and nothing else; the error GPU's incident and every other workflow on the
+node plan no hardware operation), waits for the repair incident to settle
+through its own chain (every workflow terminal, incident RECOVERED; a stalled
+or parked chain is the `repair_settled` stage's error and the fixture never
+restores that incident) and restores only the error GPU's incident.
+`memory_failure` (both signals on one GPU) is unchanged: there the components
+are suppressed into the composite and no reset is planned (PASS 2026-10-26).
+
 024 `thermal_warning` and `power_performance` reuse the GF-ENV-LIVE
 telemetry replay unchanged (`tools/gpu_environment_replay.py`,
 `probes/env_replay_proxy.py`, `env_live_fixture.EnvReplayController`) through

@@ -701,6 +701,37 @@ ENV流程，其余字段不在环境代理allowlist内。覆盖45秒窗口内外
 有依据的内存故障和独立致命Xid不应被弱复合覆盖。保存组件与复合到incident的对应关系，
 逐类恢复并验证无残留/重复恢复；危险分支须有独立维护授权。
 
+`corrected_memory`、`fresh_components`、`reused_components`、`independent_xid` 的第二个可纠正
+内存组件由 survey 决定（`GpuSurvey.component_pair`，读 survey 的 `values`/`metric_names`）：节点
+上报 `retired_pages_sbe_total`（仍做页退休的 Hopper 之前的卡，DCGM `DCGM_FI_DEV_RETIRED_SBE`）时
+取它，否则取 `row_remap_correctable_total`（Ampere/Hopper 及更新的卡，
+`DCGM_FI_DEV_CORRECTABLE_REMAPPED_ROWS`）；两者都是产品 CORRECTABLE_MEMORY_DEGRADATION 规则
+接受的成员（`gpu_metrics._add_memory_composites`：ecc_sbe_volatile / ecc_sbe_aggregate /
+retired_pages_sbe / row_remap_correctable 中任意两个不同成员）。Hopper 完全不暴露页退休（行重映射
+取代了它）——2026-10-26 本站 p5en H200 实测，原先硬编码的 `retired_pages_sbe_total` 使
+`fresh_components` 在 arm 之后 INCONCLUSIVE "the replay aborted: targeted reading absent
+upstream; refusing invented samples"（回放工具拒绝编造上游没有的样本），两集群同代 GPU，这两个
+变体此前零覆盖。同理 `memory_failure`/`wrong_scope_source` 的待修复 gauge 取节点上报的
+`row_remap_pending`（Ampere 及更新）或 `retired_pages_pending`（更早的卡）。所选组件写入结果的
+`second_component`/`component_metrics`/`exporter_metrics` 字段与 notes；目标 GPU 必须同时上报两个
+组件；任一复合变体的计划含节点未上报的读数时，在安装任何夹具之前记
+`NOT_RUN(CAPABILITY_ABSENT)` 并列出候选名（`composite_replay` 预检），不再在回放中途
+INCONCLUSIVE。本站实际驱动的是 `ecc_sbe_volatile_total` + `row_remap_correctable_total`，
+页退休那一对要等 Hopper 之前的节点加入才有覆盖。
+
+`wrong_scope_source` 的修复 GPU 自己的 pending finding 在现代 GPU 上就是产品授权的单卡
+service-window RESET_GPU 链（2026-10-26 07:47-07:50Z eksb 实测：FREEZE_EVIDENCE →
+MARK_UNSCHEDULABLE → QUARANTINE → QUIESCE_GPU_SERVICES → VERIFY_NO_GPU_CLIENTS → RESET_GPU →
+RESTORE_GPU_SERVICES → VALIDATE_GPU → RESTORE_SCHEDULING 全部 SUCCEEDED，incident 自行
+RECOVERED；错误 GPU 的 incident 被隔离后由 validated restore 释放，未形成跨卡复合——而原先不分
+incident 的硬件 oracle 把这条链判为 FAIL）。因此该变体与 019 `pending_supported` 一样需
+`--approve GPU_RESET`、标志 `X`、risk H，属于真实 reset 一张 GPU 的危险变体（最后单独跑）；硬件
+oracle 按 incident 分域：修复 GPU incident 的工作流只允许 QUIESCE_GPU_SERVICES/RESET_GPU（禁止
+NVSwitch 全重置、重启、换节点），错误 GPU incident 与节点上其他工作流不得计划任何硬件动作；修复
+GPU 的 incident 由产品链自行收敛（stage `repair_settled`：全部工作流终态且 incident RECOVERED，
+变体不对它做 restore），只有错误 GPU 的 incident 走 validated restore。`memory_failure`（同卡
+dbe + pending）不变：组件被压入复合，不计划 reset。
+
 ### GF-GENERAL-LIVE-025
 
 必测：`exporter_timeout`、`missing_field`、`one_gpu_missing`、`conflicting_alias`、
@@ -1945,7 +1976,8 @@ GF-REGIONAL-COLLECT-017 stage A（hp PASS 2026-10-22）、GF-REGIONAL-NET-007（
   以区分"采集器根本没抓回放"与"尚未走到回放步骤"。
 
 需审批与独占节点的变体：019 `pending_supported`/`post_reset` 单卡 service-window
-reset 需 `--approve GPU_RESET`；021 任一 finding 都驱动全 GPU+NVSwitch reset，故
+reset 需 `--approve GPU_RESET`（024 `wrong_scope_source` 的修复 GPU 自己的 pending finding 跑
+同一条单卡 reset 链，同需 `GPU_RESET`、`X` 标志、risk H）；021 任一 finding 都驱动全 GPU+NVSwitch reset，故
 该类变体需 `--approve GPU_FULL_FABRIC_RESET`（`recovery_failure` 另需
 `NODE_REBOOT`）并在两集群各车道的独占节点跑（X 标志持全部锁）；022 的 XID 联合变体只把 DCGM last-XID
 gauge 回放为 XID 32（`--approve DCGM_XID_GAUGE`）；019 `remap_failure` 的 RMA 现场

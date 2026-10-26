@@ -857,3 +857,55 @@ def test_a_held_plan_step_needs_a_boolean_hold():
         tool.validate_plan(
             {"profile": "nvlink", "steps": [{"reads": 1, "ops": [], "hold": True}]}
         )
+
+
+def test_composite_profile_serves_the_second_memory_component_the_exporter_has():
+    # The 2026-10-26 live INCONCLUSIVE of 024 fresh_components, had the survey
+    # not refused first: a Hopper scrape has no retired-page counter, so the
+    # composite replay aborts rather than invent it, while the correctable
+    # row-remap counter the same part publishes is served like any counter.
+    # The pending-repair flags the memory_failure / wrong_scope_source plans may
+    # choose are in the profile too.
+    for field in (
+        "ecc_sbe_volatile_total",
+        "retired_pages_sbe_total",
+        "row_remap_correctable_total",
+        "ecc_dbe_volatile_total",
+        "row_remap_pending",
+        "retired_pages_pending",
+    ):
+        assert field in tool.PROFILES["composite"].fields, field
+    assert {"add", "set"} <= tool.PROFILES["composite"].operations
+    assert tool.canonical_name("DCGM_FI_DEV_RETIRED_SBE") == "retired_pages_sbe_total"
+    assert (
+        tool.canonical_name("DCGM_FI_DEV_CORRECTABLE_REMAPPED_ROWS")
+        == "row_remap_correctable_total"
+    )
+    pair = [
+        {"op": "add", "field": "ecc_sbe_volatile_total", "gpus": [A], "value": 1},
+        {"op": "add", "field": "retired_pages_sbe_total", "gpus": [A], "value": 1},
+    ]
+    body = exporter()
+    output, receipt = serve_once(armed("composite", (2, pair)), body)
+    assert output == body
+    assert "refusing invented samples" in receipt["aborted"], receipt
+    assert f"{A}/retired_pages_sbe_total" in receipt["aborted"]
+    assert f"{A}/ecc_sbe_volatile_total" not in receipt["aborted"], (
+        "only the absent reading is named"
+    )
+    hopper = body + b"".join(
+        f'DCGM_FI_DEV_CORRECTABLE_REMAPPED_ROWS{{gpu="{gpu}",UUID="{uuid}",'
+        f'pci_bus_id="0000:{gpu}9:00.0",modelName="NVIDIA H200"}} 0\n'.encode()
+        for gpu, uuid in (("0", A), ("1", B))
+    )
+    pair[1]["field"] = "row_remap_correctable_total"
+    first, receipt = serve_once(armed("composite", (2, pair)), hopper)
+    view = product_view(first)
+    assert view[(A, "ecc_sbe_volatile_total")] == [1.0], view
+    assert view[(A, "row_remap_correctable_total")] == [1.0], view
+    assert view[(B, "row_remap_correctable_total")] == [0.0], "the other GPU untouched"
+    assert receipt["served"] == {
+        f"{A}/ecc_sbe_volatile_total": 1.0,
+        f"{A}/row_remap_correctable_total": 1.0,
+    }
+    assert receipt["aborted"] is None
