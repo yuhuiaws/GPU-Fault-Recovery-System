@@ -4,15 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from typing import Any, Callable
 
+from gpu_fault.mce_grading import MceGrade, grade_mce_line
 from gpu_fault.models import RecoveryAction, Severity, WorkloadState
 from gpu_fault.nccl_events import event_kind
 from gpu_fault.store.shared.errors import NotFoundError
-
-CORRECTED = re.compile(r"\bcorrect(?:ed|able)\b", re.I)
-UNCORRECTED = re.compile(r"\b(?:uncorrect(?:ed|able)|fatal)\b", re.I)
 
 
 def log_rule_decision(
@@ -23,12 +20,17 @@ def log_rule_decision(
             return None
         if not current_kernel_evidence(store, batch, entry):
             return None
-    if (
-        rule.category.value == "MCE"
-        and CORRECTED.search(entry.message)
-        and not UNCORRECTED.search(entry.message)
-    ):
-        return Severity.WARNING, RecoveryAction.RUN_DIAGNOSTICS
+    if rule.category.value == "MCE":
+        # The kernel prints a corrected record the same way as an uncorrected
+        # one; ``mce_grading`` reads the IA32_MCi_STATUS bits and the kernel's
+        # own words (quoted there). Corrected -> diagnostics, never isolation.
+        # A detail line (TSC/PROCESSOR/RIP, the GHES section body, ...) has
+        # no grade of its own: its header line already produced the finding.
+        grade = grade_mce_line(entry.message)
+        if grade is MceGrade.CORRECTED:
+            return Severity.WARNING, RecoveryAction.RUN_DIAGNOSTICS
+        if grade is MceGrade.DETAIL:
+            return None
     return rule.severity, rule.action
 
 

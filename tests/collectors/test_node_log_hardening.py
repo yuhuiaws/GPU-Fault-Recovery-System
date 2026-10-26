@@ -14,7 +14,8 @@ from gpu_fault.collectors.models import CollectorContext
 from gpu_fault.collectors.sinks import CollectorError
 from gpu_fault.fleet import AgentRecord
 from gpu_fault.host_health import NodeHealthPolicy, NodeLogBatch, NodeLogEntry
-from gpu_fault.models import RecoveryAction
+from gpu_fault.models import RecoveryAction, Severity
+from gpu_fault.models import WorkflowOperation as Op
 from tests._builders import attempt_observation, build_store, container_observation
 from tests.execution._health_policy_e2e_support import HealthRig
 
@@ -176,19 +177,25 @@ def test_oversize_line_resumes_with_bounded_raw_reads(tmp_path, monkeypatch):
     assert "truncated" in seen[0].message, seen
 
 
-@pytest.mark.parametrize(
-    "message,action",
-    [
-        (
-            "mce: uncorrectable hardware error; corrected errors were also logged",
-            RecoveryAction.QUARANTINE,
-        ),
-        ("mce: corrected hardware error", RecoveryAction.RUN_DIAGNOSTICS),
-        ("mce: corrected hardware error; efa fatal error", RecoveryAction.QUARANTINE),
-    ],
+#: Kernel formats (Linux v6.12; quoted in ``gpu_fault.mce_grading``).
+CORRECTED_MCE_HEADER = (
+    "mce: [Hardware Error]: CPU 1: Machine Check: 0 Bank 7: 8c00004000010090"
 )
-def test_corrected_context_never_masks_a_fatal_rule(message, action):
-    result = NodeHealthPolicy(build_store()).evaluate_logs(
+UNCORRECTED_MCE_HEADER = (
+    "mce: [Hardware Error]: CPU 3: Machine Check Exception: 5 Bank 7: be00000000800400"
+)
+MCE_EVENTS_LOGGED = "mce: [Hardware Error]: Machine check events logged"
+MCE_DETAIL_LINES = (
+    "mce: [Hardware Error]: TSC 2b5f3e1c0a ADDR 1234567890 MISC 86",
+    "mce: [Hardware Error]: PROCESSOR 0:50654 TIME 1761451200 SOCKET 0 APIC 6 "
+    "microcode 2007006",
+    "mce: [Hardware Error]: Run the above through 'mcelog --ascii'",
+    "{1}[Hardware Error]:   section_type: memory error",
+)
+
+
+def _evaluate(message):
+    return NodeHealthPolicy(build_store()).evaluate_logs(
         NodeLogBatch(
             cluster_id="cluster-a",
             node_id="node-a",
@@ -200,7 +207,147 @@ def test_corrected_context_never_masks_a_fatal_rule(message, action):
             ],
         )
     )
+
+
+@pytest.mark.parametrize(
+    "message,action",
+    [
+        (
+            "mce: uncorrectable hardware error; corrected errors were also logged",
+            RecoveryAction.QUARANTINE,
+        ),
+        ("mce: corrected hardware error", RecoveryAction.RUN_DIAGNOSTICS),
+        ("mce: corrected hardware error; efa fatal error", RecoveryAction.QUARANTINE),
+        # mm/oom_kill.c: the memcg kill line and the one-line killer context
+        # (``dump_oom_victim``) are the OOM rule's diagnostic, never isolation.
+        (
+            "Memory cgroup out of memory: Killed process 44021 (python3) "
+            "total-vm:31485720kB, anon-rss:30961664kB, file-rss:12288kB, shmem-rss:0kB, "
+            "UID:1000 pgtables:61200kB oom_score_adj:994",
+            RecoveryAction.RUN_DIAGNOSTICS,
+        ),
+        (
+            "oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=/,mems_allowed=0,"
+            "oom_memcg=/kubepods.slice/kubepods-pod0a1b.slice,task_memcg=/kubepods.slice/"
+            "kubepods-pod0a1b.slice/cri-containerd-5f6e.scope,task=python3,pid=44021,uid=1000",
+            RecoveryAction.RUN_DIAGNOSTICS,
+        ),
+        (
+            "Out of memory: Killed process 4242 (python3) total-vm:8192kB, anon-rss:4096kB, "
+            "file-rss:0kB, shmem-rss:0kB, UID:0 pgtables:64kB oom_score_adj:0",
+            RecoveryAction.RUN_DIAGNOSTICS,
+        ),
+        # The kernel's own header: graded by IA32_MCi_STATUS.UC, not by a word.
+        (CORRECTED_MCE_HEADER, RecoveryAction.RUN_DIAGNOSTICS),
+        (UNCORRECTED_MCE_HEADER, RecoveryAction.QUARANTINE),
+        # Polled header with UC set (uncorrected, no action required): still fatal.
+        (
+            "mce: [Hardware Error]: CPU 3: Machine Check: 0 Bank 7: ac00000000010090",
+            RecoveryAction.QUARANTINE,
+        ),
+        (MCE_EVENTS_LOGGED, RecoveryAction.RUN_DIAGNOSTICS),
+        (
+            "[Hardware Error]: CPU:0 (17:31:0) MC27_STATUS[-|CE|MiscV|-|AddrV|-|-|SyndV|CECC]: "
+            "0x9c2040000000011b",
+            RecoveryAction.RUN_DIAGNOSTICS,
+        ),
+        (
+            "[Hardware Error]: Corrected error, no action required.",
+            RecoveryAction.RUN_DIAGNOSTICS,
+        ),
+        (
+            "[Hardware Error]: Uncorrected, software restartable error.",
+            RecoveryAction.QUARANTINE,
+        ),
+        (
+            "{1}[Hardware Error]: event severity: corrected",
+            RecoveryAction.RUN_DIAGNOSTICS,
+        ),
+        ("{1}[Hardware Error]: event severity: fatal", RecoveryAction.QUARANTINE),
+        ("mce: CPU3 BANK7 CMCI inherited storm", RecoveryAction.RUN_DIAGNOSTICS),
+        # EDAC core reports an uncorrected memory error only with the UE token.
+        (
+            "EDAC MC0: 1 UE memory read error on CPU_SrcID#0_MC#0_Chan#0_DIMM#0 "
+            "(channel:0 slot:0 page:0x1a2b3c offset:0x0 grain:32 - err_code:0x00a0:0x0090)",
+            RecoveryAction.QUARANTINE,
+        ),
+    ],
+)
+def test_corrected_context_never_masks_a_fatal_rule(message, action):
+    result = _evaluate(message)
     assert result[0].recommended_action is action, result
+    expected_severity = (
+        Severity.WARNING
+        if action is RecoveryAction.RUN_DIAGNOSTICS
+        else Severity.CRITICAL
+    )
+    assert result[0].severity is expected_severity, result
+    assert result[0].policy_source == (
+        "SITE_APPLICATION_LOG"
+        if action is RecoveryAction.RUN_DIAGNOSTICS
+        else "SITE_KERNEL_LOG"
+    ), result
+
+
+@pytest.mark.parametrize("message", MCE_DETAIL_LINES)
+def test_mce_detail_lines_produce_no_finding_of_their_own(message):
+    # TSC/PROCESSOR/"Run the above" and the GHES section body describe the
+    # record whose header line was graded; a finding per line would isolate a
+    # node on a corrected error through its own details.
+    assert _evaluate(message) == [], message
+
+
+def test_edac_corrected_ce_line_is_not_a_finding():
+    # ``edac_ce_error`` reports corrected ECC; the rule deliberately keys on
+    # ``uncorrect``/``UE`` only, so a CE storm cannot flood diagnostics.
+    assert (
+        _evaluate(
+            "EDAC MC0: 1 CE memory read error on CPU_SrcID#0_MC#0_Chan#0_DIMM#0 "
+            "(channel:0 slot:0 page:0x1a2b3c offset:0x0 grain:32 syndrome:0x0)"
+        )
+        == []
+    ), "a corrected ECC line from the EDAC core is not graded"
+
+
+def test_corrected_mce_header_reaches_a_diagnostic_incident_without_isolation(
+    tmp_path, monkeypatch
+):
+    rig = HealthRig(tmp_path, monkeypatch)
+    try:
+        rig.log(CORRECTED_MCE_HEADER)
+        [workflow] = rig.store.list_workflows()
+        incident = rig.store.get_incident(workflow.incident_id)
+        assert incident.effective_action is RecoveryAction.RUN_DIAGNOSTICS, incident
+        assert incident.policy_source == "SITE_APPLICATION_LOG", incident
+        operations = [step.operation for step in workflow.official_steps]
+        assert Op.VALIDATE_HOST in operations, operations
+        assert Op.ESCALATE_SUPPORT in operations, operations
+        assert not {Op.MARK_UNSCHEDULABLE, Op.QUARANTINE, Op.STOP_WORKLOADS} & set(
+            operations
+        ), operations
+        assert rig.core.node["spec"]["unschedulable"] is False, rig.core.node
+        for message in MCE_DETAIL_LINES[:3]:
+            rig.log(message)
+        assert len(rig.store.list_workflows()) == 1, (
+            "the detail lines of the same record mint no further incident"
+        )
+    finally:
+        rig.store.close()
+
+
+def test_uncorrected_mce_header_still_plans_isolation(tmp_path, monkeypatch):
+    rig = HealthRig(tmp_path, monkeypatch)
+    try:
+        rig.log(UNCORRECTED_MCE_HEADER)
+        [workflow] = rig.store.list_workflows()
+        incident = rig.store.get_incident(workflow.incident_id)
+        assert incident.effective_action is RecoveryAction.QUARANTINE, incident
+        assert incident.policy_source == "SITE_KERNEL_LOG", incident
+        operations = [step.operation for step in workflow.official_steps]
+        assert Op.MARK_UNSCHEDULABLE in operations, operations
+        assert Op.QUARANTINE in operations, operations
+    finally:
+        rig.store.close()
 
 
 def test_exited_rank_keeps_identity_without_live_process_capture():

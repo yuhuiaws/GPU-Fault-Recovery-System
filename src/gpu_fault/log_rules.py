@@ -58,9 +58,18 @@ class NodeLogRule:
 
 
 NODE_LOG_RULES = (
+    # Every x86 machine-check print carries one of the first three tokens
+    # (``mce: [Hardware Error]: ...`` from mce/core.c, ``[Hardware Error]: ...``
+    # from edac/mce_amd.c, ``{N}[Hardware Error]: ...`` from apei/ghes.c,
+    # ``EDAC skx MC0: CPU n: Machine Check ...``). The EDAC core reports an
+    # uncorrected memory error only as ``EDAC MC0: 1 UE memory read error on
+    # ...`` (edac_mc.c ``edac_ue_error``), so the token ``UE`` -- upper case,
+    # case-insensitivity switched off for it -- is the fourth way in; its
+    # corrected twin ``CE`` is deliberately not a trigger (no finding). Whether
+    # a matched line is corrected is decided by ``mce_grading``.
     NodeLogRule(
         re.compile(
-            r"\b(machine check|mce:|hardware error|edac.*uncorrect)",
+            r"\b(machine check|mce:|hardware error|edac.*(?:uncorrect|(?-i:\bUE\b)))",
             re.I,
         ),
         LogHealthCategory.MCE,
