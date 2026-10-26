@@ -1344,7 +1344,7 @@ def shared_failure_domain(ctx: VariantContext) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # registry
 # --------------------------------------------------------------------------- #
-def _preflight(settings: GeneralLiveSettings) -> list[str]:
+def _preflight(settings: GeneralLiveSettings, _regional: Any = None) -> list[str]:
     image = settings.export_image
     if not image or "@sha256:" not in image:
         return [
@@ -1354,8 +1354,8 @@ def _preflight(settings: GeneralLiveSettings) -> list[str]:
     return []
 
 
-def _pair_preflight(settings: GeneralLiveSettings) -> list[str]:
-    errors = _preflight(settings)
+def _pair_preflight(settings: GeneralLiveSettings, regional: Any = None) -> list[str]:
+    errors = _preflight(settings, regional)
     if not settings.peer_node:
         errors.append("shared_failure_domain needs --node-b (a second client node)")
     return errors
@@ -1372,7 +1372,7 @@ def _spec(
     flags: str = "S",
     outcome: str = "PASS",
     gap: str = "",
-    preflight: Callable[[GeneralLiveSettings], list[str]] = _preflight,
+    preflight: Callable[[GeneralLiveSettings, Any], list[str]] = _preflight,
 ) -> VariantSpec:
     return VariantSpec(
         case_id=CASE,

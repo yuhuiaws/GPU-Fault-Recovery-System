@@ -1,10 +1,34 @@
 """GF-GENERAL-LIVE-030 warm spare unhealthy.
 
-This runs on the HyperPod lane. One otherwise-idle node is declared a warm
-spare through the product's admin CLI (``gpu-fault-admin config spare``,
-confirmation ``DECLARE_WARM_SPARE_CORDON``); the runner always releases it in
-cleanup (``RELEASE_WARM_SPARE_UNCORDON``), so no spare is left declared,
-reserved or isolated. Each block-only variant makes the declared spare
+Both lanes. One otherwise-idle GPU node of the lane's cluster -- the *spare
+candidate*, ``--spare-candidate`` or by default the lane's ``--node-b`` (on
+plain EKS the other EKS node, each lane's profile naming the other; on
+HyperPod the shared second node, or the profile's dedicated spare when the
+recipe passes it explicitly) -- is declared a warm spare for the variant's
+duration through the product's admin CLI (``gpu-fault-admin config spare``,
+confirmation ``DECLARE_WARM_SPARE_CORDON``: the spare label plus a cordon,
+keyed to the provider's failure-domain group -- HyperPod's instance group, the
+EKS managed node group -- and graded by the same ``HyperPodSpareCoordinator``
+the plain-EKS profile's ``nodeReplace`` warm-spare handover uses). The runner
+always releases it (``RELEASE_WARM_SPARE_UNCORDON``), so no spare is left
+declared, reserved or isolated; the variant releases before its verdict and
+records the candidate's labels, taints, cordon and spare annotations before
+and after, plus a cluster-wide census of the spare label
+(``warm_spare_residue.py`` is the same read for the lane runner's heal).
+
+Because the candidate is another lane's own node on plain EKS, the runnable
+variants hold every lock (``X``) and prove the candidate idle first -- Ready,
+schedulable, no gpu-fault ownership/taints/spare marks, only infrastructure
+Pods (the product's DaemonSets, kube-system, device plugins), no
+GPU-requesting Pod, an ACTIVE Agent with fresh channels, no open incident or
+workflow, and on EKS the GPU node groups' node auto repair off (the product's
+own join preflight requires it; ``eks_node_repair``) -- at plan time and again
+before declaring; a busy candidate is INCONCLUSIVE, never cordoned.
+``not_ready`` stops kubelet through the DESTR-008 service window (an on-node
+restore timer bounds the stop at 600 s; the Agent identity it pins is the EC2
+instance id on eks-managed), waits for the node to leave Ready, grades, then
+restores kubelet and waits for the node Ready and every Pod on it Ready before
+the release. Each block-only variant makes the declared spare
 ineligible for allocation in exactly one way -- NotReady, stale GPU telemetry,
 a configuration error (foreign reservation or a non-AVAILABLE pool state) --
 and reads the product's own spare-health grading, the exact gate
@@ -19,23 +43,31 @@ Site constraint (honest scope). The periodic ``HyperPodSpareHealthController``
 that turns a *trusted hardware* finding into a provider reboot, marks a spare
 UNAVAILABLE after a failed reboot and runs the bounded recheck is enabled only
 in a single-cluster control plane; this site's regional/multi-cluster control
-plane sets ``GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER=false``, so the executor
-only grades a spare during an allocation and never autonomously reboots an idle
-spare. The hardware-reboot, repair-failure and bounded-recheck variants
-therefore stay NOT_RUN(CAPABILITY_ABSENT); ``no_spare`` (the no-provider-replace
-fallback) lives on the dangerous REPLACE_NODE failover branch, whose assertions
-GF-REGIONAL-DESTR-008 S1 already made live on this site, and stays
-NOT_RUN(COVERED_BY_REGIONAL). Every required variant remains in the denominator.
+plane sets ``GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER=false`` site-wide, so the
+executor only grades a spare during an allocation and never autonomously
+reboots an idle spare. The hardware-reboot, repair-failure and bounded-recheck
+variants therefore stay NOT_RUN(CAPABILITY_ABSENT) on both clusters;
+``no_spare`` (the no-provider-replace fallback) lives on the dangerous
+REPLACE_NODE failover branch, whose assertions GF-REGIONAL-DESTR-008 S1 already
+made live on this site, and stays NOT_RUN(COVERED_BY_REGIONAL). Every required
+variant remains in the denominator.
 """
 
 from __future__ import annotations
 
+import json
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from scripts.e2e.regional.general_live_fixture import (
+    QUARANTINE_PREFIX,
+    GeneralLiveSettings,
     VariantContext,
     VariantInconclusive,
     VariantNotRun,
+    channel_errors,
+    node_provider,
+    utc_now,
 )
 from scripts.e2e.regional.general_live_registry import (
     LIVE_REPLAY,
@@ -43,9 +75,23 @@ from scripts.e2e.regional.general_live_registry import (
     VariantSpec,
     deferred_variant,
 )
+from scripts.e2e.regional.general_live_store import preflight_state
 from scripts.e2e.regional.general_live_verdicts import operations, verdict
+from scripts.e2e.regional.warm_spare_residue import spare_residue_report
 
 CASE = "GF-GENERAL-LIVE-030"
+#: ``not_ready``: kubelet is stopped 15 s after the window is armed and the node
+#: lifecycle controller marks the node Unknown after its 40 s grace, so the
+#: node leaves Ready well inside this; the on-node restore timer (600 s) is the
+#: independent bound on the stop itself.
+NOT_READY_WAIT_SECONDS = 240
+#: After kubelet is restored: the node Ready again, then every Pod on it Ready.
+READY_WAIT_SECONDS = 300
+PODS_READY_WAIT_SECONDS = 300
+#: After the metrics collector is resumed: a fresh success on every required
+#: channel, so the next case on that node (another lane's) meets a clean
+#: preflight; one GPU_METRICS interval is at most 180 s on this site.
+CHANNELS_FRESH_WAIT_SECONDS = 420
 #: The on-node service-window helper (``warm_spare_node_probe``) honours a
 #: kubelet/agent stop with an independent restart timer only for one fixture
 #: identity -- the DESTR-008 service-window fixture. ``SPARE_KUBELET_STOP``
@@ -152,40 +198,80 @@ class SpareSession:
 
         from scripts.e2e.regional.warm_spare_fixture import WarmSpareLiveFixture
 
-        if not ctx.settings.hyperpod_cluster:
+        candidate = spare_candidate(ctx.settings)
+        if not candidate:
             raise VariantNotRun(
-                "FIXTURE_NOT_READY", "a warm spare needs --hyperpod-cluster"
+                "FIXTURE_NOT_READY",
+                "a warm spare needs a spare candidate: --spare-candidate <node> "
+                "(default: --node-b, the lane's second node)",
             )
         self.ctx = ctx
-        self.node = ctx.settings.node
+        #: The spare node *name*; the snapshot accessor is ``node_snapshot``.
+        self.node = candidate
+        self.scope = spare_scope(ctx.settings)
         self.incident_id = f"inc-{ctx.run_id}"
         self.record = Path(ctx.case_dir) / "warm-spares" / f"{self.node}.json"
-        self.warm = WarmSpareLiveFixture(ctx.regional, ctx.settings.hyperpod_cluster)
+        self.warm = WarmSpareLiveFixture(ctx.regional, self.scope)
         self._declared = False
+        #: The candidate as found, before anything of ours touched it.
+        self.before: dict[str, Any] | None = None
+        self.spares_before: list[str] = []
+
+    def verify_idle(self) -> None:
+        """Re-prove the candidate idle right before declaring; never cordon a busy node."""
+
+        errors = candidate_errors(
+            self.ctx.settings, self.ctx.regional, recovery=self._recovery
+        )
+        self.ctx.evidence.write(
+            "spare-candidate",
+            {"node": self.node, "scope": self.scope, "errors": errors},
+        )
+        if errors:
+            raise VariantInconclusive(
+                "spare candidate is not idle; nothing declared: " + "; ".join(errors)
+            )
+
+    def _recovery(self) -> dict[str, Any]:
+        value = self.warm.cluster_recovery()
+        self.ctx.evidence.write("spare-cluster-recovery", value)
+        return value
 
     def declare(self) -> dict[str, Any]:
         from gpu_fault.admin import warm_spare
 
+        self.before = self.node_snapshot()
+        self.spares_before = self.warm.spare_nodes()
+        self.ctx.evidence.write(
+            "spare-before", {"node": self.before, "declared_spares": self.spares_before}
+        )
         # Register the release before the declaration can touch the cluster, so
         # a node that was labelled/cordoned is always put back even if the
         # declare raises after it mutated. ``release`` reads the on-disk record
         # to decide whether anything was in fact declared.
         self.ctx.cleanup.push("warm-spare", self.release)
-        report = warm_spare.perform_warm_spare(
-            self._node_api(),
-            warm_spare.WarmSpareRequest(
-                state_dir=self.record.parent,
-                node=self.node,
-                fault_node="",
+        try:
+            report = warm_spare.perform_warm_spare(
+                self._node_api(),
+                warm_spare.WarmSpareRequest(
+                    state_dir=self.record.parent,
+                    node=self.node,
+                    fault_node="",
+                    cluster_id=self.ctx.settings.regional.cluster_id,
+                    reference=f"general-live-030/{self.ctx.run_id}",
+                    mode="declare",
+                    confirmation=warm_spare.DECLARE_CONFIRMATION,
+                ),
                 cluster_id=self.ctx.settings.regional.cluster_id,
-                reference=f"general-live-030/{self.ctx.run_id}",
-                mode="declare",
-                confirmation=warm_spare.DECLARE_CONFIRMATION,
-            ),
-            cluster_id=self.ctx.settings.regional.cluster_id,
-            record=self.record,
-            agent_lookup=self._agent_lookup(),
-        )
+                record=self.record,
+                agent_lookup=self._agent_lookup(),
+            )
+        except warm_spare.WarmSpareError as exc:
+            # The admin refused (a stale reservation, a half-declared state,
+            # an unreadable Agent record) before any patch: the condition was
+            # never established and nothing about the product was graded.
+            self.ctx.evidence.write("spare-declare", {"refused": str(exc)})
+            raise VariantInconclusive(f"spare declaration refused: {exc}") from exc
         self._declared = True
         self.ctx.evidence.write("spare-declare", report)
         if report.get("refusals"):
@@ -317,10 +403,54 @@ class SpareSession:
             maintenance_expires_at=self.ctx.deadline,
         )
         service.create()
-        self.ctx.cleanup.push("spare-kubelet", service.cleanup)
+
+        def restore_kubelet() -> dict[str, Any]:
+            # One undo: restore the service, then prove the node is back --
+            # Ready, and every Pod on it Ready -- before the spare is released
+            # (the stack runs this before the release it was pushed after).
+            report: dict[str, Any] = {"service": service.cleanup()}
+            report["ready"] = self.warm.wait_node_ready(
+                self.node, ready=True, timeout_seconds=READY_WAIT_SECONDS
+            ).get("ready")
+            report["pods_not_ready"] = self.wait_pods_ready()
+            return report
+
+        self.ctx.cleanup.push("spare-kubelet", restore_kubelet)
         stopped = service.stop("kubelet.service", restore_seconds=600, delay_seconds=15)
         self.ctx.evidence.write("spare-kubelet", stopped)
         return stopped
+
+    def await_not_ready(self) -> dict[str, Any]:
+        """The candidate's snapshot once kubelet's stop has shown (Ready != True).
+
+        Returns the last snapshot either way; the caller's oracle reads
+        ``ready`` and records INCONCLUSIVE when the node never left Ready.
+        """
+
+        from scripts.e2e.regional.regional_commands import RegionalFixtureError
+
+        try:
+            self.warm.wait_node_ready(
+                self.node, ready=False, timeout_seconds=NOT_READY_WAIT_SECONDS
+            )
+        except RegionalFixtureError:
+            pass
+        return self.node_snapshot()
+
+    def wait_pods_ready(self) -> list[str]:
+        """Pods on the spare still not Ready when the bounded wait ends."""
+
+        def accept() -> list[str] | None:
+            pending = pods_not_ready(self.ctx.regional, self.node)
+            return [] if not pending else None
+
+        value = self.ctx.wait_until(
+            accept,
+            timeout_seconds=PODS_READY_WAIT_SECONDS,
+            poll_seconds=15,
+            name="spare-pods-ready",
+        )
+        return [] if value == [] else pods_not_ready(self.ctx.regional, self.node)
 
     def pause_metrics(self) -> dict[str, Any]:
         probe = self.ctx.probe("node", node=self.node)
@@ -332,18 +462,82 @@ class SpareSession:
             str(self.ctx.spec.max_minutes * 60),
             node=self.node,
         )
-        self.ctx.cleanup.push(
-            "spare-metrics",
-            lambda: probe.execute(
+
+        def resume_metrics() -> dict[str, Any]:
+            resumed = probe.execute(
                 "unit-resume",
                 "--unit",
                 "gpu-fault-metrics-collector.service",
                 "--run-id",
                 self.ctx.run_id,
-            ),
-        )
+            )
+            # The candidate is another lane's node: hand it back with fresh
+            # channels, or that lane's next preflight reads our pause as its
+            # stale collector.
+            return {"resumed": resumed, "stale_channels": self.wait_channels_fresh()}
+
+        self.ctx.cleanup.push("spare-metrics", resume_metrics)
         self.ctx.evidence.write("spare-metrics-pause", paused)
         return paused
+
+    def wait_channels_fresh(self) -> list[str]:
+        """Channel errors still present on the spare when the bounded wait ends."""
+
+        def read() -> list[str]:
+            store = preflight_state(
+                self.ctx.regional, self.ctx.settings.regional.cluster_id, self.node
+            )
+            return channel_errors(
+                list(store.get("collector_statuses") or []), utc_now()
+            )
+
+        value = self.ctx.wait_until(
+            lambda: [] if not read() else None,
+            timeout_seconds=CHANNELS_FRESH_WAIT_SECONDS,
+            poll_seconds=30,
+            name="spare-channels-fresh",
+        )
+        return [] if value == [] else read()
+
+    def finish(self) -> dict[str, Any]:
+        """Undo every injection, release the spare, read the candidate back.
+
+        Runs the variant's own LIFO undo stack now -- the injection's restore
+        first, the warm-spare release last -- so the verdict can carry the
+        candidate's after-state and the cluster-wide spare census; the runner's
+        teardown finds nothing pending.
+        """
+
+        cleanup = self.ctx.cleanup.run()
+        after = self.node_snapshot()
+        residue = spare_residue_report(
+            json.loads(self.ctx.regional.kubectl("gpu", "get", "node", "-o", "json")),
+            expected=self.spares_before,
+        )
+        store = preflight_state(
+            self.ctx.regional, self.ctx.settings.regional.cluster_id, self.node
+        )
+        receipt = {
+            "spare_before": self.before,
+            "spare_after": after,
+            "residue": residue,
+            "cleanup": cleanup,
+            "release": next(
+                (
+                    item.get("result")
+                    for item in reversed(cleanup)
+                    if item.get("name") == "warm-spare"
+                ),
+                None,
+            ),
+            # The product's own view of the handed-back node: what the next
+            # case's preflight on it will read (incidents a NotReady spare
+            # drew are the product's, closed by the lane's pre-case clean).
+            "open_incidents_after": list(store.get("open_incidents") or []),
+            "active_workflows_after": list(store.get("active_workflows") or []),
+        }
+        self.ctx.evidence.write("spare-finish", receipt)
+        return receipt
 
     def mutate(self, annotations: dict[str, str | None]) -> Any:
         from scripts.e2e.regional.warm_spare_fixture import (
@@ -360,6 +554,203 @@ class SpareSession:
         self.ctx.cleanup.push("spare-annotations", mutation.restore)
         mutation.apply(NodePatch(labels={}, annotations=annotations))
         return mutation
+
+
+# --------------------------------------------------------------------------- #
+# the spare candidate: resolution, read-only idleness proof, hand-back proof
+# --------------------------------------------------------------------------- #
+def spare_candidate(settings: GeneralLiveSettings) -> str:
+    """``--spare-candidate``, else the lane's ``--node-b``; never the target node."""
+
+    return settings.spare_candidate or settings.peer_node
+
+
+def spare_scope(settings: GeneralLiveSettings) -> str:
+    """The provider cluster the warm-spare fixture reads: HyperPod's cluster
+    name, or the EKS cluster name (= the lane's cluster id) on plain EKS."""
+
+    return settings.hyperpod_cluster or settings.regional.cluster_id
+
+
+def candidate_errors(
+    settings: GeneralLiveSettings,
+    regional: Any,
+    *,
+    recovery: Callable[[], Mapping[str, Any]] | None = None,
+) -> list[str]:
+    """Why the spare candidate must not be declared now; empty means idle.
+
+    Read-only, the same facts the lane preflight requires of the target node
+    plus the spare-specific ones: a node another lane owns is only borrowed
+    when nothing but infrastructure runs on it and the product holds nothing
+    on it. ``recovery`` reads the provider's cluster recovery fact (EKS node
+    auto repair per GPU node group); on plain EKS an enabled repair would race
+    the kubelet stop of ``not_ready`` with a provider reboot/replace.
+    """
+
+    candidate = spare_candidate(settings)
+    if not candidate:
+        return [
+            "030 needs a spare candidate: --spare-candidate <node> "
+            "(default: --node-b, the lane's second node)"
+        ]
+    if candidate == settings.node:
+        return [f"the spare candidate {candidate} is the target node itself"]
+    errors: list[str] = []
+    labels = regional.node_metadata(candidate).get("labels") or {}
+    provider = node_provider(labels)
+    target = node_provider(regional.node_metadata(settings.node).get("labels") or {})
+    if provider != target:
+        errors.append(
+            f"{candidate} is a {provider or 'unknown'} node; the target node "
+            f"{settings.node} is {target or 'unknown'}"
+        )
+    if labels.get(SPARE_LABEL) == "true":
+        errors.append(f"{candidate} already carries {SPARE_LABEL}=true")
+    node = regional.node_snapshot(candidate)
+    if node.get("ready") != "True":
+        errors.append(f"{candidate} is not Ready")
+    if node.get("unschedulable"):
+        errors.append(f"{candidate} is cordoned")
+    if node.get("ownership_annotations"):
+        errors.append(f"{candidate} has gpu-fault ownership annotations")
+    if any(
+        str(item.get("key", "")).startswith(QUARANTINE_PREFIX)
+        for item in node.get("taints") or []
+    ):
+        errors.append(f"{candidate} carries gpu-fault taints")
+    pool = node.get("spare_pool_annotations") or {}
+    if pool.get(RESERVATION_ANNOTATION):
+        errors.append(f"{candidate} carries a spare reservation")
+    if pool.get(POOL_STATE_ANNOTATION) not in (None, "AVAILABLE"):
+        errors.append(
+            f"{candidate} spare pool state is {pool.get(POOL_STATE_ANNOTATION)}"
+        )
+    workloads = regional.business_workloads(candidate)
+    if workloads:
+        names = sorted(f"{w.get('namespace')}/{w.get('name')}" for w in workloads)
+        errors.append(f"{candidate} runs a business workload: {names}")
+    gpu_pods = [p for p in regional.gpu_workloads() if p.get("node") == candidate]
+    if gpu_pods:
+        names = sorted(f"{p.get('namespace')}/{p.get('name')}" for p in gpu_pods)
+        errors.append(f"{candidate} has GPU-requesting Pods: {names}")
+    store = preflight_state(regional, settings.regional.cluster_id, candidate)
+    if (store.get("agent") or {}).get("lifecycle_state") != "ACTIVE":
+        errors.append(f"{candidate} Node Agent is not ACTIVE")
+    if store.get("open_incidents"):
+        errors.append(f"{candidate} has open incidents")
+    if store.get("active_workflows"):
+        errors.append(f"{candidate} has active workflows")
+    errors.extend(
+        f"{candidate}: {item}"
+        for item in channel_errors(
+            list(store.get("collector_statuses") or []), utc_now()
+        )
+    )
+    if provider == "eks" and recovery is not None:
+        repair = dict(recovery().get("node_repair_config") or {})
+        enabled = sorted(name for name, value in repair.items() if value is True)
+        if enabled:
+            errors.append(
+                f"EKS node auto repair is enabled on node group(s) {enabled}; a "
+                "NotReady spare would race the product with a provider repair"
+            )
+    return errors
+
+
+def pods_not_ready(regional: Any, node: str) -> list[str]:
+    """``namespace/name`` of every Pod on ``node`` that is not Ready yet.
+
+    Running and Pending Pods only: a Pod that already Succeeded or Failed is
+    done, not unready.
+    """
+
+    document = json.loads(
+        regional.kubectl(
+            "gpu",
+            "get",
+            "pod",
+            "--field-selector",
+            f"spec.nodeName={node}",
+            "-o",
+            "json",
+            all_namespaces=True,
+        )
+    )
+    pending: list[str] = []
+    for item in document.get("items") or []:
+        status = item.get("status") or {}
+        if status.get("phase") not in {"Running", "Pending"}:
+            continue
+        ready = next(
+            (
+                condition.get("status")
+                for condition in status.get("conditions") or []
+                if condition.get("type") == "Ready"
+            ),
+            None,
+        )
+        if ready != "True":
+            metadata = item.get("metadata") or {}
+            pending.append(f"{metadata.get('namespace')}/{metadata.get('name')}")
+    return sorted(pending)
+
+
+def restored_errors(receipt: Mapping[str, Any]) -> list[str]:
+    """Why the candidate was not handed back as found; empty means clean.
+
+    Judged on the runner's own reads after the release: the spare label gone,
+    the cordon back to the pre-declaration state, the spare annotations as
+    before, the node Ready, no spare label newly on any node of the cluster,
+    and every undo of the stack reported success.
+    """
+
+    before = receipt.get("spare_before") or {}
+    after = receipt.get("spare_after") or {}
+    errors: list[str] = []
+    if (after.get("labels") or {}).get(SPARE_LABEL) == "true":
+        errors.append("the spare label is still on the candidate")
+    if after.get("unschedulable") and not before.get("unschedulable"):
+        errors.append("the candidate is still cordoned")
+    if after.get("ready") != "True":
+        errors.append(
+            f"the candidate is not Ready after the release ({after.get('ready')})"
+        )
+    for key in (RESERVATION_ANNOTATION, RESERVED_AT_ANNOTATION, POOL_STATE_ANNOTATION):
+        was = (before.get("annotations") or {}).get(key)
+        now = (after.get("annotations") or {}).get(key)
+        if was != now:
+            errors.append(f"annotation {key} is {now!r}, was {was!r}")
+    residue = receipt.get("residue") or {}
+    if residue.get("unexpected"):
+        errors.append(f"the spare label is left on {residue['unexpected']}")
+    for item in receipt.get("cleanup") or []:
+        if not item.get("ok"):
+            errors.append(f"undo {item.get('name')} failed: {item.get('error')}")
+    return errors
+
+
+def finalize(result: dict[str, Any], receipt: Mapping[str, Any]) -> dict[str, Any]:
+    """Bind the hand-back proof into the verdict: a spare not handed back as
+    found fails the variant whatever the grading said."""
+
+    errors = restored_errors(receipt)
+    result.setdefault("stages", {})["restored"] = errors
+    if errors:
+        result["verdict"] = "FAIL"
+        result.setdefault("errors", []).extend(f"restored: {item}" for item in errors)
+    result.update(
+        {
+            "spare_candidate": (receipt.get("spare_after") or {}).get("name"),
+            "spare_before": receipt.get("spare_before"),
+            "spare_after": receipt.get("spare_after"),
+            "spare_residue": receipt.get("residue"),
+            "spare_release": receipt.get("release"),
+            "open_incidents_after": receipt.get("open_incidents_after"),
+            "active_workflows_after": receipt.get("active_workflows_after"),
+        }
+    )
+    return result
 
 
 # --------------------------------------------------------------------------- #
@@ -478,9 +869,9 @@ def block_only_verdict(
 def not_ready(ctx: VariantContext) -> dict[str, Any]:
     session = _declared(ctx)
     stopped = session.stop_kubelet()
-    node = session.node_snapshot()
+    node = session.await_not_ready()
     oracle_ok = node.get("ready") not in ("True", None)
-    return block_only_verdict(
+    result = block_only_verdict(
         node,
         session.grade(),
         expected_class=OBSERVATION,
@@ -489,6 +880,7 @@ def not_ready(ctx: VariantContext) -> dict[str, Any]:
         oracle_ok=oracle_ok,
         oracle_detail=f"the spare never left Ready: {node.get('ready')} ({stopped})",
     )
+    return finalize(result, session.finish())
 
 
 def stale_metrics(ctx: VariantContext) -> dict[str, Any]:
@@ -497,7 +889,7 @@ def stale_metrics(ctx: VariantContext) -> dict[str, Any]:
     ctx.hold(460, name="stale-hold")
     store = session.grade()
     observation = store.get("observation_reasons") or []
-    return block_only_verdict(
+    result = block_only_verdict(
         session.node_snapshot(),
         store,
         expected_class=OBSERVATION,
@@ -506,6 +898,7 @@ def stale_metrics(ctx: VariantContext) -> dict[str, Any]:
         oracle_ok=bool(observation),
         oracle_detail="GPU_INVENTORY/GPU_METRICS never went stale (UNKNOWN)",
     )
+    return finalize(result, session.finish())
 
 
 def configuration_error(ctx: VariantContext) -> dict[str, Any]:
@@ -515,7 +908,7 @@ def configuration_error(ctx: VariantContext) -> dict[str, Any]:
     oracle_ok = (node.get("annotations") or {}).get(
         POOL_STATE_ANNOTATION
     ) == "UNAVAILABLE"
-    return block_only_verdict(
+    result = block_only_verdict(
         node,
         session.grade(),
         expected_class=CONFIGURATION,
@@ -524,6 +917,7 @@ def configuration_error(ctx: VariantContext) -> dict[str, Any]:
         oracle_ok=oracle_ok,
         oracle_detail="the injected pool-state annotation was not observed",
     )
+    return finalize(result, session.finish())
 
 
 def reserved_spare(ctx: VariantContext) -> dict[str, Any]:
@@ -555,13 +949,25 @@ def reserved_spare(ctx: VariantContext) -> dict[str, Any]:
     result.setdefault("notes", []).append(
         "a spare reserved by one incident is rejected for any other incident"
     )
-    return result
+    return finalize(result, session.finish())
 
 
 def _declared(ctx: VariantContext) -> SpareSession:
     session = SpareSession(ctx)
+    session.verify_idle()
     session.declare()
     return session
+
+
+def _preflight(settings: GeneralLiveSettings, regional: Any) -> list[str]:
+    """The plan-time proof that the spare candidate is idle (read-only)."""
+
+    from scripts.e2e.regional.warm_spare_fixture import WarmSpareLiveFixture
+
+    def recovery() -> dict[str, Any]:
+        return WarmSpareLiveFixture(regional, spare_scope(settings)).cluster_recovery()
+
+    return candidate_errors(settings, regional, recovery=recovery)
 
 
 def _result(
@@ -589,30 +995,41 @@ def _spec(
     execute,
     *,
     risk: str = "M",
-    max_minutes: int = 25,
+    max_minutes: int = 30,
     approvals: tuple[str, ...] = ("DECLARE_WARM_SPARE",),
 ) -> VariantSpec:
     return VariantSpec(
         case_id=CASE,
         variant=variant,
         proof_mode=NATIVE,
-        lanes=("hp",),
+        lanes=("eks", "hp"),
         risk=risk,
-        flags="S",
+        # Every lock: the spare candidate is another lane's own node on plain
+        # EKS, so no other case may be in flight while it is cordoned.
+        flags="X",
         injection=injection,
         expected=expected,
-        cleanup="release the declared spare (uncordon); restore kubelet/metrics/annotations",
+        cleanup=(
+            "restore kubelet (node and its Pods Ready again) / resume the metrics "
+            "collector (channels fresh again) / restore the annotations, then release "
+            "the declared spare (uncordon, label gone) before the verdict; the result "
+            "records the candidate before and after and the cluster-wide spare census"
+        ),
         max_minutes=max_minutes,
         execute=execute,
         approvals=approvals,
+        preflight=_preflight,
     )
 
 
 VARIANTS = [
     _spec(
         "not_ready",
-        "declare a spare, then stop kubelet so it goes NotReady",
-        "graded ineligible (OBSERVATION 'Kubernetes node is not Ready'); no reboot, no REMEDIATING",
+        "declare the spare candidate, then stop kubelet on it (DESTR-008 service"
+        " window, 600 s on-node restore timer) until the node leaves Ready",
+        "graded ineligible (OBSERVATION 'Kubernetes node is not Ready'); no reboot,"
+        " no REMEDIATING; kubelet restored and the node and its Pods Ready again"
+        " before the release",
         not_ready,
         approvals=("DECLARE_WARM_SPARE", "SPARE_KUBELET_STOP"),
     ),
@@ -641,7 +1058,6 @@ VARIANTS = [
         "confirmed_hardware",
         proof_mode=LIVE_REPLAY,
         reason="CAPABILITY_ABSENT: turning a trusted hardware finding on an idle spare into a provider reboot is the HyperPodSpareHealthController, disabled in this site's regional control plane (GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER=false); provider reboot is also unauthorized",
-        lanes=("hp",),
         expected="only authorized fresh trusted hardware evidence drives a provider reboot of the spare",
     ),
     deferred_variant(
@@ -655,7 +1071,6 @@ VARIANTS = [
             "make on the REPLACE_NODE failover branch already passed live on this site; "
             "no fixture of its own (WARM_SPARE_FAILOVER territory when re-enabled)"
         ),
-        lanes=("hp",),
         expected="no available spare fails the step with the no-fallback literal; provider replacement stays disabled",
     ),
     deferred_variant(
@@ -663,7 +1078,6 @@ VARIANTS = [
         "repair_failure",
         proof_mode=LIVE_REPLAY,
         reason="CAPABILITY_ABSENT: the UNAVAILABLE-after-failed-reboot path is the spare-health controller, disabled on this regional site",
-        lanes=("hp",),
         expected="a spare still unhealthy after reboot becomes UNAVAILABLE with one alert; no recovery storm",
     ),
     deferred_variant(
@@ -671,7 +1085,6 @@ VARIANTS = [
         "bounded_recheck",
         proof_mode=LIVE_REPLAY,
         reason="CAPABILITY_ABSENT: the bounded UNAVAILABLE recheck/re-alert loop is the spare-health controller, disabled on this regional site",
-        lanes=("hp",),
         expected="UNAVAILABLE rechecks on a fixed timer and returns to AVAILABLE only after health validation",
     ),
 ]

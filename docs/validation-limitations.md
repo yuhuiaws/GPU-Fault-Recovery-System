@@ -1524,7 +1524,7 @@ reading and no record of what the collector or the counters did; the EKS PASS
 of 2026-10-24 (release bf1bb0037847) came from the older oracle that graded no
 hardware step only and noted the clamp as an observation -- it did not test
 the reset rule, so timing luck played no part in it either. 011
-`broken_pair` (`general_live_nccl_pair.py`, HyperPod lane) uses the same bind
+`broken_pair` (`general_live_nccl_pair.py`, both lanes) uses the same bind
 on one port's `hw_counters/tx_bytes` around a real two-node stall: while broken
 the product must record `efa_traffic_observation_valid=0` with no rate and
 start no zero streak although the probe's own pair oracle reads a real zero;
@@ -1942,7 +1942,8 @@ still plan-only by default and change no cluster state until an operator runs
 `--execute`; the module tests exercise only the injection/verdict logic against
 scripted product records and are not proof of a physical experiment.
 
-011 and 030 run on the HyperPod lane (011 needs `--node-b`: a dedicated
+011 and 030 run on both lanes (011 needs `--node-b`, the lane's second EFA
+node -- the other plain-EKS node, or the HyperPod profile's node-b: a dedicated
 two-node NCCL job, rendered from the two-node replace fixture's Pod templates,
 all-reduces 1.5 MiB every 2 s, sized to 1-4 MiB/s per node from the product's
 1 MiB/s active threshold and 4x spike ratio, and on the runner's pause file one
@@ -1954,9 +1955,31 @@ nodes and with the job alive, or the variant is INCONCLUSIVE; the source
 fixture's own trainer moved about 74 KB per node over a whole live case, so a
 FAIL against it measured an injection that never happened;
 `repeat_after_recovery` also needs the pair active between its two stalls for
-the product's rearm window; 030 declares
-one warm spare through the admin CLI under `DECLARE_WARM_SPARE` and always
-releases it). 027 enables the optional reporter only for its disposable test
+the product's rearm window; 030 declares its spare candidate --
+`--spare-candidate`, by default the lane's `--node-b` -- as the warm spare
+through the admin CLI under `DECLARE_WARM_SPARE` (label plus cordon, keyed to
+the provider's failure-domain group: HyperPod's instance group or the EKS
+managed node group, graded by the same `HyperPodSpareCoordinator` the plain-EKS
+profile's `nodeReplace` warm-spare handover uses), holds every lock (`X`)
+because on plain EKS that node is the other lane's own, proves it idle at plan
+time and again before declaring -- Ready, schedulable, no gpu-fault
+ownership/taints/spare marks, only infrastructure Pods, no GPU-requesting Pod,
+an ACTIVE Agent with fresh channels, no open incident or workflow, and on EKS
+the GPU node groups' `nodeRepairConfig` not enabled (the product's own join
+preflight requires node auto repair off) -- and is INCONCLUSIVE otherwise,
+never cordoning a busy node; it undoes its injection and releases the spare
+before its verdict, recording the candidate's labels, taints, cordon and spare
+annotations before and after, the release receipt and a cluster-wide
+spare-label census, any of which failing the `restored` stage fails the
+variant; `warm_spare_residue.py` is the same read-only census for the lane
+runner's heal between cases (exit 3 on a leftover label). `not_ready` stops
+kubelet through the DESTR-008 service window on both providers (the Agent
+identity it pins is the EC2 instance id on eks-managed; the on-node restore
+timer bounds the stop at 600 s), waits for the node to leave Ready, grades,
+then restores kubelet and waits for the node and every Pod on it Ready before
+the release; `stale_metrics` waits for the channels fresh again after the
+resume so the other lane's next preflight does not read the pause as its own
+stale collector). 027 enables the optional reporter only for its disposable test
 job (a Pod-local `training-progress` sidecar) and triggers a single per-cluster
 scan, never the global monitor. The flight-recorder forensics variants of 011
 (`general_live_nccl_fr`: `fr_temporal_completion`, `fr_second_missing`,
@@ -1977,8 +2000,8 @@ group is present and its per-rank watermarks are still read); and a D-state
 wait cannot be forced natively, so `fr_plus_process` keeps the write-mode
 checkpoint I/O (`HOST_WRITES_OBSERVED`) as its independent process evidence.
 The role, thread, process and attempt-change
-variants of 011 (`general_live_nccl_roles`, registered on both lanes: the
-plain-EKS cluster's second EFA node is `--node-b`) are the same stall on the
+variants of 011 (`general_live_nccl_roles`, on both lanes like every 011
+variant) are the same stall on the
 trainer's role modes (`general_live_nccl_role_trainer`): each rank declares
 PP/EP roles and container-native thread roles through its `rank-progress/v1`
 `diagnostic_context`, a keeper thread keeps the snapshot inside the product's
@@ -1997,8 +2020,10 @@ module tests check these graders against the product's own classification of
 synthetic triage rows, not against live evidence. Variants that need a
 128-node/1024-process scale or the HyperPod spare-health controller (disabled
 in this regional control plane, `GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER=false`)
-stay `NOT_RUN` with an explicit reason in the denominator rather than being
-dropped. No GF-GENERAL-LIVE case has live evidence yet.
+stay `NOT_RUN` with an explicit reason in the denominator on both clusters'
+boards rather than being dropped (every plan-only variant records its reason on
+both lanes: a site-wide gap is a fact about each cluster). No GF-GENERAL-LIVE
+case has live evidence yet.
 
 011 `fr_enabled` (the Flight Recorder configured as the operations manual
 prescribes: trace buffer, pipe, dump-file prefix and dump-on-timeout; at least
@@ -2055,9 +2080,15 @@ is not in `step_bounds.ATTEMPT_DETAIL_KEYS`), so the runner grades the deleted
 UID from the live-captured receipt when caught and otherwise from the Pod census
 (the original Pod gone, a new Ready Pod present). `expected_unknown` /
 `mig_timeslicing` (CAPABILITY_ABSENT) and `running_training` (FIXTURE_NOT_READY,
-a managed scale attempt, lane N) stay `NOT_RUN` in the denominator. These run on
-EKS first (no SageMaker health-monitoring agent) and on HyperPod with
-`NodeRecovery=None`; no live evidence yet.
+a managed scale attempt, lane N) stay `NOT_RUN` in the denominator. All five
+native variants are registered on both lanes: nothing in the freeze is
+provider-specific (the plugin Pods are found by their kubelet device-plugin
+socket mount, the EFA plugin's DaemonSet name comes from the node's provider,
+the SIGSTOP targets the plugin container's own process, and the product's
+restart/escalation runs on both providers), HyperPod's health-monitoring agent
+watches GPU/EFA hardware rather than the plugin registration, and the lane
+preflight requires `NodeRecovery=None` there; the EKS-first order of the first
+live runs was sequencing, not a constraint.
 
 ## GF-GENERAL-LIVE live acceptance runner (phase 2, lane K)
 
@@ -2769,8 +2800,10 @@ The reset-driving variants need an explicit approval and an exclusive node:
 019 `pending_supported` / `post_reset` need `--approve GPU_RESET` (a
 single-GPU service-window reset); every 021 finding drives a full GPU +
 NVSwitch reset, so those variants need `--approve GPU_FULL_FABRIC_RESET` (and
-`NODE_REBOOT` for `recovery_failure`) and run only on the HyperPod lane's
-exclusive node. 022's XID-join variants replay the DCGM last-XID gauge only as
+`NODE_REBOOT` for `recovery_failure`) and run on each lane's exclusive node on
+both clusters (the `X` flag holds every lock, so a plain-EKS lane's node is
+alone on its cluster while the fabric resets). 022's XID-join variants replay
+the DCGM last-XID gauge only as
 XID 32 (`--approve DCGM_XID_GAUGE`); 019 `remap_failure` needs
 `GPU_FIELD_DIAGNOSTIC`; 019 `pending_unsupported` (no legacy GPU) and
 `observe_profile` (no OBSERVE reset profile) are `CAPABILITY_ABSENT`.

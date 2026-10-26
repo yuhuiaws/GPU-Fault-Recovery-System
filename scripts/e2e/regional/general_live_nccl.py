@@ -1,8 +1,8 @@
 """GF-GENERAL-LIVE-011 EFA traffic stall / NCCL hung.
 
-HyperPod lane only: a hung collective needs at least two nodes with EFA/RDMA
-between them, which the single plain-EKS node cannot provide (intra-node NCCL
-uses NVLink, not EFA). A disposable, owned two-node managed NCCL test job
+Both lanes: a hung collective needs two nodes with EFA/RDMA between them
+(intra-node NCCL uses NVLink, not EFA); each cluster has them, and the lane's
+``--node-b`` is its second EFA node. A disposable two-node managed NCCL test job
 (``general_live_nccl_job``: a 1.5 MiB all-reduce every 2 s, one rank entering an
 extra collective on the runner's pause file while the others hold before it,
 bounded by an in-Pod watchdog) is brought up healthy, then stalled so its
@@ -1342,7 +1342,7 @@ def variant_spec(
         case_id=CASE,
         variant=variant,
         proof_mode=proof,
-        lanes=("hp",),
+        lanes=("eks", "hp"),
         risk=risk,
         flags="S",
         injection=injection,
@@ -1363,11 +1363,13 @@ def _deferred(
     variant: str, reason: str, expected: str, *, proof: str = LIVE_REPLAY
 ) -> VariantSpec:
     return deferred_variant(
-        CASE, variant, proof_mode=proof, reason=reason, lanes=("hp",), expected=expected
+        CASE, variant, proof_mode=proof, reason=reason, expected=expected
     )
 
 
-_SCALE = "SCALE: needs a 128-node/1024-process task; this site has one 4-node HyperPod cluster"
+_SCALE = (
+    "SCALE: needs a 128-node/1024-process task; this site has 4- and 2-node clusters"
+)
 
 
 VARIANTS = [

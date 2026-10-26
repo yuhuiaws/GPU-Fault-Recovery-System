@@ -200,7 +200,7 @@ def test_the_seven_variants_complete_the_011_registry_as_live_replay() -> None:
     assert set(SPECS) == set(replay.SHAPES) == set(CHECKS)
     for spec in nf.VARIANTS:
         assert registry[spec.key] is spec
-        assert spec.proof_mode == LIVE_REPLAY and spec.lanes == ("hp",)
+        assert spec.proof_mode == LIVE_REPLAY and spec.lanes == ("eks", "hp")
         assert spec.implemented and not spec.deferred and spec.approvals == ()
         assert spec.expected_outcome == "PASS"
         assert "test dump responder" in spec.injection

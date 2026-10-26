@@ -841,6 +841,16 @@ in order to catch a site with a stray label elsewhere, and a case that created
 its own spare would satisfy that assertion by construction even if
 `HyperPodSpareCoordinator.allocate(local_only=True)` had drifted away from it.
 
+`warm_spare_residue.py` is the read-only census of the warm-spare marks on the
+GPU cluster's nodes: every node carrying `gpu-fault.io/spare=true`, the cordoned
+ones among them, the spare reservations and any pool state other than
+absent/AVAILABLE, as one JSON document; exit 0 when no spare label is left that
+`--expect <node>` did not name, 3 otherwise. GF-GENERAL-LIVE-030 records the
+same census after releasing the node it borrowed as its spare (the lane's
+`--node-b`, another lane's own node on plain EKS), and the lane runner's heal
+can call it between cases. It mutates nothing: a leftover is released through
+the admin CLI or `declare_warm_spare.py --release`.
+
 `synthetic_replacement_route.py` opens and closes DESTR-003's other precondition:
 `POST /v1/admin/test/node-replacement` answers 404 unless
 `GPU_FAULT_ENABLE_SYNTHETIC_REPLACEMENT_TESTS=true` on every API replica, and the

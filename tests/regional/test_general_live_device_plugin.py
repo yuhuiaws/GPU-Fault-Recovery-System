@@ -409,8 +409,9 @@ def test_registry_shapes() -> None:
     assert SPECS["validation_failure"].flags == "X"
     for name in ("gpu_plugin", "efa_plugin", "one_sample", "replacement_uid"):
         assert mod.NODE_REBOOT not in SPECS[name].approvals
-    assert SPECS["gpu_plugin"].lanes == ("eks", "hp")
-    assert SPECS["efa_plugin"].lanes == ("eks", "hp")
+    assert all(spec.lanes == ("eks", "hp") for spec in mod.VARIANTS), (
+        "all five native 014 variants run on both clusters"
+    )
 
 
 # --------------------------------------------------------------------------- #

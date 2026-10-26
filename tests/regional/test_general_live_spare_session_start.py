@@ -41,6 +41,7 @@ from scripts.e2e.regional import run_general_live as runner
 from scripts.e2e.regional import warm_spare_fixture as wsf
 from scripts.e2e.regional.general_live_fixture import GeneralLiveSettings, ProbeHandle
 from scripts.e2e.regional.general_live_registry import VariantSpec
+from scripts.e2e.regional.general_live_store import PREFLIGHT_PROBE
 from scripts.e2e.regional.host_probe_fixture import HostProbeFixture
 from scripts.e2e.regional.probes import warm_spare_node_probe as probe
 from scripts.e2e.regional.regional_case_contract import case_evidence_path
@@ -55,8 +56,11 @@ from scripts.e2e.regional.warm_spare_fixture import (
 from scripts.e2e.regional.warm_spare_fixture import STORE_PROBE as WARM_STORE_PROBE
 from tests.admin.test_admin_site import site_file as write_site_file
 
+#: The spare candidate (the lane's --node-b) and the lane's own target node.
 NODE = "ip-10-0-43-9.us-west-2.compute.internal"
 NODE_UID = "11111111-2222-3333-4444-555555555555"
+TARGET = "ip-10-0-43-5.us-west-2.compute.internal"
+TARGET_UID = "66666666-7777-8888-9999-000000000000"
 NAMESPACE = "gpu-fault-system"
 CLUSTER = "gpu-a"  # the site file's own registration cluster id
 CONTEXT = "gpu-a"
@@ -75,11 +79,11 @@ class FirstMutation(BaseException):
     """
 
 
-def _fresh_node() -> dict[str, Any]:
+def _fresh_node(name: str = NODE, uid: str = NODE_UID) -> dict[str, Any]:
     return {
         "metadata": {
-            "name": NODE,
-            "uid": NODE_UID,
+            "name": name,
+            "uid": uid,
             "resourceVersion": "1000",
             "labels": {
                 HYPERPOD_HEALTH_LABEL: "Schedulable",
@@ -136,6 +140,8 @@ class SpareCluster:
 
     def __init__(self) -> None:
         self.node = _fresh_node()
+        #: The lane's own node: read by the candidate proof, never patched.
+        self.target = _fresh_node(TARGET, TARGET_UID)
         self.reads: list[tuple[str, ...]] = []
         self.node_patches: list[dict[str, Any]] = []
 
@@ -197,13 +203,21 @@ class SpareCluster:
             assert selector == f"{SPARE_LABEL}=true", selector
             labelled = self.node["metadata"]["labels"].get(SPARE_LABEL) == "true"
             return json.dumps({"items": [self.node] if labelled else []})
+        if rest[1].startswith("-"):
+            # get node -o json: the cluster-wide spare census after the release
+            return json.dumps({"items": [self.node, self.target]})
         # get node <name> -o json
         name = rest[1]
+        if name == TARGET:
+            return json.dumps(self.target)
         assert name == NODE, f"unexpected node: {name}"
         return json.dumps(self.node)
 
     def _patch(self, command: list[str]) -> str:
         assert command[command.index("patch") + 1] == "node"
+        assert command[command.index("patch") + 2] == NODE, (
+            f"only the spare candidate is ever patched: {command}"
+        )
         body = json.loads(command[command.index("-p") + 1])
         _apply_merge(self.node, body)
         self.node_patches.append(body)
@@ -213,6 +227,17 @@ class SpareCluster:
     def cpu_python(self, script: str, *arguments: str, **_: Any) -> dict[str, Any]:
         if script == WARM_STORE_PROBE:  # the warm-spare Agent lookup
             return {"agents": [{"node_id": NODE, "lifecycle_state": "ACTIVE"}]}
+        if script == PREFLIGHT_PROBE:  # the candidate's idleness proof
+            fresh = datetime.now(timezone.utc).isoformat()
+            return {
+                "agent": {"lifecycle_state": "ACTIVE"},
+                "open_incidents": [],
+                "active_workflows": [],
+                "collector_statuses": [
+                    {"collector": c, "last_success_at": fresh, "last_error_at": None}
+                    for c in ("HOST_TELEMETRY", "GPU_INVENTORY", "GPU_METRICS")
+                ],
+            }
         if script == sp.SPARE_STORE_PROBE:  # the read-only spare-health grade
             return {
                 "agent_reasons": [],
@@ -261,7 +286,8 @@ def configured(
         "namespace": NAMESPACE,
         "cluster_id": CLUSTER,
         "region": "us-west-2",
-        "fault_node": NODE,
+        "fault_node": TARGET,
+        "node_b": NODE,
         "hyperpod_cluster": HYPERPOD_CLUSTER,
         "host_probe_image": "public.ecr.aws/gfrs/probe@sha256:" + "1" * 64,
         "site_file": str(site),
@@ -289,7 +315,12 @@ def configured(
     parser = argparse.ArgumentParser()
     runner.add_arguments(parser)
     settings = runner.configure(parser.parse_args(argv))
-    assert (settings.node, settings.hyperpod_cluster) == (NODE, HYPERPOD_CLUSTER)
+    assert (settings.node, settings.peer_node, settings.hyperpod_cluster) == (
+        TARGET,
+        NODE,
+        HYPERPOD_CLUSTER,
+    )
+    assert sp.spare_candidate(settings) == NODE, "the spare is --node-b, not the target"
     assert set(spec.approvals) <= set(settings.approvals), settings.approvals
     return settings, run_dir
 
@@ -375,16 +406,30 @@ def test_a_declared_spare_is_released_and_the_receipt_proves_it(
     assert cluster.node["spec"]["unschedulable"] is False
     assert result["cleanup_pending"] == [], result
     assert "cleanup did not prove the node clean" not in result.get("errors", [])
+    # The lane's own node was only read, never touched.
+    assert cluster.target["metadata"]["labels"].get(SPARE_LABEL) is None
+    assert cluster.target["spec"]["unschedulable"] is False
+    if variant in ("configuration_error", "reserved_spare"):
+        # No host-probe mutation on the way: the variant ran to its verdict and
+        # handed the spare back before it, recording the proof.
+        assert result["verdict"] == "PASS", result.get("errors")
+        assert result["stages"]["restored"] == []
+        assert result["spare_candidate"] == NODE
+        assert result["spare_before"]["labels"][SPARE_LABEL] is None
+        assert result["spare_after"]["labels"][SPARE_LABEL] is None
+        assert result["spare_residue"]["clean"] is True
+        assert result["spare_release"]["released"] is True
 
 
-def test_a_declare_refused_before_any_cluster_change_cleans_up_as_nothing_declared(
+def test_a_candidate_that_is_already_a_spare_is_inconclusive_and_never_touched(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     spec = SPECS["configuration_error"]
     settings, run_dir = configured(tmp_path, monkeypatch, spec)
     cluster = SpareCluster()
-    # The node is already a declared spare: the declare refuses before it
-    # patches anything, so nothing changed on the cluster.
+    # The candidate is already a declared spare: the idleness proof that runs
+    # before the declaration refuses it, so nothing is declared, nothing is
+    # patched and there is no release to run.
     cluster.node["metadata"]["labels"][SPARE_LABEL] = "true"
     cluster.node["spec"]["unschedulable"] = True
     install_fakes(monkeypatch, cluster)
@@ -394,6 +439,41 @@ def test_a_declare_refused_before_any_cluster_change_cleans_up_as_nothing_declar
     # The node is left exactly as it was found (still the pre-existing spare).
     assert cluster.node["metadata"]["labels"].get(SPARE_LABEL) == "true"
     assert cluster.node["spec"]["unschedulable"] is True
+    assert cluster.node_patches == [], cluster.node_patches
+    assert result["verdict"] == "INCONCLUSIVE", result
+    detail = json.dumps(result)
+    assert "spare candidate is not idle; nothing declared" in detail, detail
+    assert f"{NODE} already carries {SPARE_LABEL}=true" in detail, detail
+    assert f"{NODE} is cordoned" in detail, detail
+    assert [
+        item for item in result.get("cleanup") or [] if item["name"] == "warm-spare"
+    ] == []
+    assert result["cleanup_pending"] == [], result
+
+
+def test_a_declare_refused_before_any_cluster_change_cleans_up_as_nothing_declared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = SPECS["configuration_error"]
+    settings, run_dir = configured(tmp_path, monkeypatch, spec)
+    cluster = SpareCluster()
+    install_fakes(monkeypatch, cluster)
+    # The candidate passes the idleness proof, then the admin declare refuses
+    # it (a stale spare reservation the proof does not read is simulated by
+    # refusing inside the admin module) before any patch: the registered
+    # release finds no record and cleans up as "nothing declared".
+    monkeypatch.setattr(
+        warm_spare,
+        "declare_refusals",
+        lambda *args, **kwargs: ["node already carries a spare reservation"],
+    )
+
+    result = run_variant(spec, settings, run_dir)
+
+    assert cluster.node_patches == [], cluster.node_patches
+    assert cluster.node["metadata"]["labels"].get(SPARE_LABEL) is None
+    assert cluster.node["spec"]["unschedulable"] is False
+    assert result["verdict"] == "INCONCLUSIVE", result
     receipt = warm_spare_receipt(result)
     assert receipt["ok"] is True, receipt
     assert receipt["result"]["released"] is False, receipt["result"]

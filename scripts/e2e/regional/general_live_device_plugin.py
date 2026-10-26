@@ -40,6 +40,16 @@ Variants:
 ``running_training`` (FIXTURE_NOT_READY, lane N) stay deferred in
 ``general_live_inventory``.
 
+All five native variants are registered on both clusters. Nothing in the
+freeze is provider-specific: the plugin Pods are found by their kubelet
+device-plugin socket mount, the EFA plugin's DaemonSet name comes from the
+node's provider (``node_provider.efa_device_plugin_name``), the SIGSTOP targets
+the plugin container's own process, and the product's restart/escalation runs
+on both providers; HyperPod's health-monitoring agent watches GPU/EFA hardware,
+not the plugin registration, and the lane preflight already requires
+``NodeRecovery=None`` there. The EKS-first ordering of the first live runs was
+sequencing, not a constraint.
+
 The reusable entry points another category (e.g. a lane-N ``running_training``
 on a managed attempt) calls are the probe's ``freeze`` / ``resume`` / ``cleanup``
 subcommands and :class:`DevicePluginRegistrationFixture` (discover, ``freeze_pod``,
@@ -996,7 +1006,7 @@ VARIANTS = [
             "no isolation; allocatable restored"
         ),
         execute=one_sample,
-        lanes=("eks",),
+        lanes=("eks", "hp"),
         risk="M",
         flags="S",
         max_minutes=20,
@@ -1015,7 +1025,7 @@ VARIANTS = [
             "not re-delete it (idempotent healthy branch)"
         ),
         execute=replacement_uid,
-        lanes=("eks",),
+        lanes=("eks", "hp"),
         risk="H",
         flags="S",
         max_minutes=30,
@@ -1035,7 +1045,7 @@ VARIANTS = [
             "the separate NODE_REBOOT authorization"
         ),
         execute=validation_failure,
-        lanes=("eks",),
+        lanes=("eks", "hp"),
         risk="H",
         flags="X",
         max_minutes=60,

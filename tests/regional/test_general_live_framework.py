@@ -14,6 +14,26 @@ from tests._builders import build_store, workflow_request
 from tests.regional._general_live_fakes import activity_read, save_diagnostic_incident
 
 
+def test_every_registered_variant_runs_on_both_clusters() -> None:
+    """The site has two EFA GPU nodes per cluster: no variant is single-lane now.
+
+    The two-node 011 job, the exclusive-node 021 resets, the 014 freezes and
+    the 030 spare declaration run on both; plan-only deferred variants record
+    their NOT_RUN reason on both boards (``deferred_variant`` defaults to both).
+    """
+
+    registry = reg.load_registry()
+    single = sorted(key for key, item in registry.items() if item.lanes != reg.LANES)
+    assert single == [], single
+    plan_only = reg.deferred_variant(
+        "GF-GENERAL-LIVE-031",
+        "inactive_cluster",
+        proof_mode=reg.CAPABILITY,
+        reason="CAPABILITY_ABSENT: x",
+    )
+    assert plan_only.lanes == reg.LANES and plan_only.flags == "P"
+
+
 def spec(**overrides):
     base = dict(
         case_id="GF-GENERAL-LIVE-001",

@@ -9,7 +9,9 @@ and reads the product's own grading.
 
 Producing the finding therefore drives a real RESET_ALL_GPUS_NVSWITCHES on the
 node, so every variant that crosses the window needs ``--approve
-GPU_FULL_FABRIC_RESET`` and runs only on the HyperPod lane's exclusive node
+GPU_FULL_FABRIC_RESET`` and runs on the lane's exclusive node on both clusters
+-- each plain-EKS lane owns its node and the ``X`` flag holds every lock, so
+nothing else is on the node or the cluster while the fabric resets
 (``recovery_failure`` also needs ``--approve NODE_REBOOT``). The held plan
 serves SUCCESS (3) once RESET_ALL has run so the post-reset VALIDATE_FABRIC
 reads a trained fabric. ``before_window`` (held under 300 s), ``ungraded_product``
@@ -328,7 +330,6 @@ VARIANTS = [
         not_started,
         risk="H",
         flags="X",
-        lanes=("hp",),
         max_minutes=40,
         approvals=("GPU_FULL_FABRIC_RESET",),
     ),
@@ -340,7 +341,6 @@ VARIANTS = [
         in_progress,
         risk="H",
         flags="X",
-        lanes=("hp",),
         max_minutes=40,
         approvals=("GPU_FULL_FABRIC_RESET",),
     ),
@@ -352,7 +352,6 @@ VARIANTS = [
         failed,
         risk="H",
         flags="X",
-        lanes=("hp",),
         max_minutes=40,
         approvals=("GPU_FULL_FABRIC_RESET",),
     ),
@@ -362,7 +361,6 @@ VARIANTS = [
         "hold an unsettled fabric state under 300 s",
         "no finding before the window elapses",
         before_window,
-        lanes=("hp",),
         max_minutes=12,
     ),
     gpu_spec(
@@ -371,7 +369,6 @@ VARIANTS = [
         "hold an unsettled state on a non-NVSwitch modelName",
         "an ungraded product is not fabric-graded",
         ungraded_product,
-        lanes=("hp",),
         max_minutes=12,
     ),
     gpu_spec(
@@ -380,7 +377,6 @@ VARIANTS = [
         "restart the metrics collector mid-hold",
         "the held-time clock restarts; no premature finding",
         monitor_restart,
-        lanes=("hp",),
         max_minutes=16,
     ),
     gpu_spec(
@@ -391,7 +387,6 @@ VARIANTS = [
         full_reset,
         risk="H",
         flags="X",
-        lanes=("hp",),
         max_minutes=45,
         approvals=("GPU_FULL_FABRIC_RESET",),
     ),
@@ -403,7 +398,6 @@ VARIANTS = [
         every_gpu_success,
         risk="H",
         flags="X",
-        lanes=("hp",),
         max_minutes=45,
         approvals=("GPU_FULL_FABRIC_RESET",),
     ),
@@ -415,7 +409,6 @@ VARIANTS = [
         recovery_failure,
         risk="H",
         flags="X",
-        lanes=("hp",),
         max_minutes=45,
         approvals=("GPU_FULL_FABRIC_RESET", "NODE_REBOOT"),
     ),

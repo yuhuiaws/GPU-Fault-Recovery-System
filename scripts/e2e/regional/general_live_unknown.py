@@ -904,7 +904,7 @@ VARIANTS = [
             "discovered GPU identity (H200, catalog-known), not from the reviewed source; "
             "a genuinely unknown product needs a GPU generation the catalog does not know"
         ),
-        lanes=("eks",),
+        lanes=("eks", "hp"),
         expected="an unknown product -> BLOCKED_MISSING_EVIDENCE, operator-required, no action",
     ),
     VariantSpec(
@@ -972,7 +972,7 @@ VARIANTS = [
             "NOT_AUTHORIZED: needs a reviewed OBSERVE Runtime Profile variant; the site's "
             "node-key custody chain is deliberately not configured (AUTH-015 BLOCKED)"
         ),
-        lanes=("eks",),
+        lanes=("eks", "hp"),
         expected="OBSERVE profile observes only; no isolation/reset without authority",
     ),
     deferred_variant(
@@ -983,7 +983,7 @@ VARIANTS = [
             "NOT_AUTHORIZED: a profile that permits isolation plus the custody/reset "
             "authority is not configured on this site (AUTH-015 BLOCKED)"
         ),
-        lanes=("eks",),
+        lanes=("eks", "hp"),
         expected="a profile that permits isolation performs the reviewed isolation only",
     ),
     deferred_variant(
@@ -995,7 +995,7 @@ VARIANTS = [
             "XID 154 linkage context under active change in fix/xid154-linkage-drain-p2p; "
             "the coordinator sequences it after that fix"
         ),
-        lanes=("eks",),
+        lanes=("eks", "hp"),
         expected="a known ordinary XID on an old driver still gets its original action, not blocked by XID 154 linkage",
     ),
     _implemented(

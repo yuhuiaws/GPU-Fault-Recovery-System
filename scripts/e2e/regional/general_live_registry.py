@@ -13,6 +13,16 @@ Every variant is planned and executed on its own guard key
 dangerous branches additionally need an ``--approve`` token bound into the
 plan. A variant whose ``deferred`` reason is set is recorded ``NOT_RUN`` with
 that reason and never touches the cluster.
+
+Lanes: every variant is registered on both clusters (``LANES``) unless its
+premise is one cluster's alone -- since the plain-EKS cluster has two EFA GPU
+nodes (each lane's ``--node-b`` is the other node), the two-node 011 stall
+job, the exclusive-node 021 fabric resets, the 014 device-plugin freezes and
+the 030 warm-spare declaration all run on both. A plan-only ``deferred``
+variant records its NOT_RUN reason on both clusters' boards for the same
+reason: a site-wide gap (no inactive cluster, no SR-IOV VF, custody not
+configured) is a fact about each cluster, so ``deferred_variant`` defaults to
+both lanes too.
 """
 
 from __future__ import annotations
@@ -244,7 +254,11 @@ class VariantSpec:
     product_gap: str = ""
     deferred: str = ""
     execute: Callable[[Any], Any] | None = None
-    preflight: Callable[[Any], list[str]] | None = None
+    #: ``(settings, regional) -> errors``: the variant's own read-only
+    #: prerequisites, run by ``read_only_preflight`` after the shared node
+    #: checks with the regional fixture so a hook can read the cluster (030
+    #: proves its spare candidate idle; 005 checks its export image).
+    preflight: Callable[[Any, Any], list[str]] | None = None
 
     @property
     def key(self) -> str:
@@ -296,10 +310,14 @@ def deferred_variant(
     *,
     proof_mode: str,
     reason: str,
-    lanes: tuple[str, ...] = ("eks",),
+    lanes: tuple[str, ...] = LANES,
     expected: str = "",
 ) -> VariantSpec:
-    """A required variant this phase records as NOT_RUN(``reason``)."""
+    """A required variant this phase records as NOT_RUN(``reason``).
+
+    Plan-only and one minute: it runs on both clusters' boards by default so
+    each carries the reason; pass ``lanes`` only for a cluster-specific one.
+    """
 
     return VariantSpec(
         case_id=case_id,

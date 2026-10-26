@@ -469,20 +469,21 @@ def test_every_005_variant_is_native_both_lanes_behind_kernel_module_load() -> N
 def test_preflight_needs_an_immutable_export_image_and_node_b_for_the_pair() -> None:
     spec = SPECS["stat_timeout"]
     assert spec.preflight is not None
+    regional = FakeRegional()
     assert (
-        spec.preflight(make_settings(spec))
-        and "export" in spec.preflight(make_settings(spec))[0]
+        spec.preflight(make_settings(spec), regional)
+        and "export" in spec.preflight(make_settings(spec), regional)[0]
     )
     settings = dataclasses.replace(make_settings(spec), export_image="repo/img:latest")
-    assert spec.preflight(settings), "a tag is not an immutable digest"
+    assert spec.preflight(settings, regional), "a tag is not an immutable digest"
     settings = dataclasses.replace(make_settings(spec), export_image=IMAGE)
-    assert spec.preflight(settings) == []
+    assert spec.preflight(settings, regional) == []
     pair = SPECS["shared_failure_domain"]
     assert pair.preflight is not None
-    assert any("--node-b" in item for item in pair.preflight(settings)), (
+    assert any("--node-b" in item for item in pair.preflight(settings, regional)), (
         "the pair variant must demand --node-b"
     )
-    assert pair.preflight(dataclasses.replace(settings, peer_node=PEER)) == []
+    assert pair.preflight(dataclasses.replace(settings, peer_node=PEER), regional) == []
 
 
 # --------------------------------------------------------------------------- #

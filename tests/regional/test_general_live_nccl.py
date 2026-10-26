@@ -406,13 +406,11 @@ def test_registry_covers_every_011_variant() -> None:
         "every role variant is executable"
     )
     assert all(
-        lane == "hp"
+        spec.lanes == ("eks", "hp")
         for spec in [*nc.VARIANTS, *nf.VARIANTS, *pair.VARIANTS]
-        if spec.variant != "unreachable_node"
-        for lane in spec.lanes
-    ), "the stall variants and their FR/pair modules run on the HyperPod lane"
-    assert SPECS["unreachable_node"].lanes == ("eks", "hp"), (
-        "the Agent-channel variant runs on both clusters (two EFA nodes each)"
+    ), (
+        "every stall variant, its FR/pair modules and the deferred scale variants "
+        "run on both clusters (two EFA nodes each; --node-b is the lane's second)"
     )
     assert all(spec.lanes == ("eks", "hp") for spec in roles.VARIANTS), (
         "the role/attempt variants run on both clusters (two EFA nodes each)"

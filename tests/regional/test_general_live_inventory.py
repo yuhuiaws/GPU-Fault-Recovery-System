@@ -206,7 +206,9 @@ def test_013_and_014_cover_every_variant() -> None:
         "GF-REGIONAL-NET-007",
     ):
         assert case in SPECS["driver_unbound"].deferred, case
-    assert SPECS["driver_unbound"].lanes == ("eks",), "lanes kept for re-enabling"
+    assert SPECS["driver_unbound"].lanes == ("eks", "hp"), (
+        "the cross-reference cites PASSes on both clusters; both boards carry it"
+    )
     assert SPECS["running_training"].deferred.startswith(
         "COVERED_BY_REGIONAL: GF-REGIONAL-COLLECT-017"
     ), SPECS["running_training"].deferred

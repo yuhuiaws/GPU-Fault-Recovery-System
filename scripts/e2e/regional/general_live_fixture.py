@@ -138,6 +138,9 @@ class GeneralLiveSettings:
     #: pin for its Pod (default: any node but the client nodes).
     export_image: str = ""
     export_node: str = ""
+    #: GF-GENERAL-LIVE-030: the idle GPU node the variant declares as the warm
+    #: spare for its duration; empty means the lane's ``--node-b``.
+    spare_candidate: str = ""
 
     @property
     def key(self) -> str:
@@ -187,6 +190,14 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         default="",
         help="pin the 005 test export server Pod to this node (default: not a client node)",
     )
+    parser.add_argument(
+        "--spare-candidate",
+        default="",
+        help=(
+            "030: the idle GPU node to declare as the warm spare for the variant "
+            "(default: --node-b, the lane's second node); released in cleanup"
+        ),
+    )
 
 
 def configure(arguments: argparse.Namespace) -> GeneralLiveSettings:
@@ -211,6 +222,7 @@ def configure(arguments: argparse.Namespace) -> GeneralLiveSettings:
             getattr(arguments, "export_image", "") or os.getenv(EXPORT_IMAGE_ENV, "")
         ),
         export_node=str(getattr(arguments, "export_node", "") or ""),
+        spare_candidate=str(getattr(arguments, "spare_candidate", "") or ""),
     )
 
 
@@ -340,7 +352,9 @@ def read_only_preflight(
     if settings.peer_node and settings.peer_node == settings.node:
         errors.append("the pair node equals the target node")
     if spec.preflight is not None:
-        errors.extend(spec.preflight(settings))
+        # The variant's own read-only prerequisites, with the fixture so a hook
+        # can read the cluster (030 proves its spare candidate idle).
+        errors.extend(spec.preflight(settings, regional))
     return {
         **identity,
         "planned_verdict": planned,

@@ -79,8 +79,11 @@ def test_registry_covers_021_and_reset_variants_need_approval() -> None:
         assert (
             "GPU_FULL_FABRIC_RESET" in spec.approvals
             and spec.flags == "X"
-            and spec.lanes == ("hp",)
-        )
+            and spec.lanes == ("eks", "hp")
+        ), "the fabric resets run on each lane's exclusive node, both clusters"
+    assert all(spec.lanes == ("eks", "hp") for spec in SPECS.values()), (
+        "every 021 variant is registered on both clusters"
+    )
     assert "NODE_REBOOT" in SPECS["recovery_failure"].approvals
 
 

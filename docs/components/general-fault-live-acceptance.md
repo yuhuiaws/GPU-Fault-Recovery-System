@@ -535,6 +535,11 @@ plugin Pod UID 且基名在允许清单内的进程，deadman 用 SIGCONT 兜底
 （`node_operations._restart_device_plugin_node` 终态分支不再带它），故原 UID 需实时抓取或由
 Pod 普查（原 Pod 已消失 + 新 Ready Pod）佐证。`expected_unknown`/`mig_timeslicing`
 （CAPABILITY_ABSENT）与 `running_training`（FIXTURE_NOT_READY，lane N）保持 NOT_RUN。
+五个 native 变体（含 `one_sample`/`replacement_uid`/`validation_failure`）在两条车道均注册：
+冻结过程没有 provider 特有之处（plugin Pod 以 kubelet device-plugin socket 挂载识别、EFA
+plugin 的 DaemonSet 名由节点 provider 决定、SIGSTOP 只对 plugin 容器自身进程、产品的重启/升级
+链两种 provider 相同），HyperPod 的健康监控代理只看 GPU/EFA 硬件而不看 plugin 注册，且车道
+预检已要求 `NodeRecovery=None`；此前“EKS 先跑”只是排期，不是约束。
 
 ### GF-GENERAL-LIVE-015
 
@@ -1420,8 +1425,9 @@ collector 的扩展模式；Node Agent 仍永不在允许列表内。只读的 `
 DAG、027 读 `SITE_TRAINING_HEALTH` incident/决策、030 读热备分级与注解），永不
 POST 预制 finding。类别模块 `general_live_nccl`/`_nccl_fr`/`_progress`/`_spares`。
 
-- **011（HyperPod 车道，需 `--node-b`；角色/线程/进程/换 attempt 变体同时注册
-  plain-EKS 车道，以其第二台 EFA 节点作 `--node-b`）**：专用受管两节点 NCCL 测试任务
+- **011（两条车道均注册，需 `--node-b`：plain-EKS 车道以另一台 EKS EFA 节点、HyperPod
+  车道以 profile 的 node-b 作第二节点；SCALE 延后变体也在两集群各记一条 NOT_RUN）**：专用
+  受管两节点 NCCL 测试任务
   （`scripts/e2e/regional/general_live_nccl_job.py`，由
   `two-node-replace-pytorchjob.yaml` 的 Pod 模板渲染，
   保留镜像、`FI_PROVIDER=efa`、`FI_EFA_USE_DEVICE_RDMA`、`FI_EFA_FORK_SAFE`、GPU duty
@@ -1565,15 +1571,30 @@ POST 预制 finding。类别模块 `general_live_nccl`/`_nccl_fr`/`_progress`/`_
   `step_regression`、`straggler_group`（同 `progress_group`）、`bounded_phase`、
   `old_attempt`、`checkpoint_unverified`、`resumed_progress`（原 rank 新有效进度才
   RECOVERED）。
-- **030（仅 HyperPod 车道，`--fault-node` 指向待声明热备）**：经 admin CLI 声明一台
-  空闲热备（`DECLARE_WARM_SPARE`），清理必定释放；每个阻断类变体只让该热备对分配
+- **030（两条车道；热备候选 = `--spare-candidate`，默认为车道的 `--node-b`：plain-EKS 为
+  另一台 EKS 节点，HyperPod 为 profile 的 node-b；recipe 不再把 `--fault-node` 指向热备）**：
+  经 admin CLI 把候选节点声明为热备（`DECLARE_WARM_SPARE`：标签 + cordon，故障域组按
+  provider 取 HyperPod instance group / EKS 托管节点组，分级同为 plain-EKS profile 的
+  `nodeReplace` 热备接管所用的 `HyperPodSpareCoordinator`）。因候选在 plain-EKS 上是另一条
+  车道的自有节点，可执行变体持全部锁（X），并在计划期与声明前两次只读证明候选空闲：Ready、
+  未 cordon、无 gpu-fault 所有权注解/污点/热备标记、只有基础设施 Pod（产品 DaemonSet、
+  kube-system、device plugin）、无 GPU Pod、Agent ACTIVE 且通道新鲜、无未闭 incident/工作流，
+  EKS 上还读 GPU 节点组的 `nodeRepairConfig` 并拒绝已开启的 node auto repair（产品加入预检
+  本就要求关闭）；不空闲则 INCONCLUSIVE，绝不 cordon 忙节点。变体在判定前即撤销注入并释放
+  热备（`RELEASE_WARM_SPARE_UNCORDON`），结果记录候选节点前后的标签/污点/cordon/热备注解、
+  整集群热备标签普查与释放回执（`restored` 阶段任一不洁即 FAIL）；`warm_spare_residue.py`
+  是同一只读普查，供车道 runner 的 heal 在用例间调用（有残留退出 3）。`not_ready` 经
+  DESTR-008 service window 停 kubelet（节点侧 600 s 独立恢复计时器为上界；两种 provider 均
+  适用，eks-managed 上钉住的 Agent 身份是 EC2 实例 id），等节点离开 Ready 后判级，再恢复
+  kubelet 并等节点及其全部 Pod 重新 Ready 才释放；`stale_metrics` 恢复采集器后等通道再次
+  新鲜才释放，以免另一条车道的下一次预检把本次暂停读成它的采集器失效。每个阻断类变体只让该热备对分配
   不合格一种方式，读取产品自身的分级（`HyperPodSpareCoordinator.health_reasons`
   的分配门）并断言按正确 reason class 拒绝、且未产生任何 provider 恢复。native 实测：
   `not_ready`（停 kubelet，需 `SPARE_KUBELET_STOP`）、`stale_metrics`（暂停 metrics
   采集器）、`configuration_error`（注入非 AVAILABLE pool state）、`reserved_spare`
   （注入他 incident 的 reservation，验证不被他任务复用）。本站为区域/多集群控制面
   （`GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER=false`），周期性 `HyperPodSpareHealth
-  Controller` 不运行，故 `confirmed_hardware`/`repair_failure`/`bounded_recheck` 记
+  Controller` 不运行，故 `confirmed_hardware`/`repair_failure`/`bounded_recheck` 在两集群各记
   `NOT_RUN(CAPABILITY_ABSENT)`；`no_spare`（无热备不回落 provider 替换）只在危险的
   REPLACE_NODE 失败转路径可见，其断言已由 GF-REGIONAL-DESTR-008 S1 在本站真机做过
   （hp PASS 2026-10-22：移除全部热备标签后 REPLACE_NODE 以精确的 no-fallback 字面量
@@ -1581,10 +1602,10 @@ POST 预制 finding。类别模块 `general_live_nccl`/`_nccl_fr`/`_progress`/`_
   `NOT_RUN(COVERED_BY_REGIONAL: GF-REGIONAL-DESTR-008 S1)`，不另建夹具。
 
 计划/执行形如 `--case GF-GENERAL-LIVE-011 --variant active_to_zero --site-file <F>
---node-b <N2> --hyperpod-cluster <HP>`（011/030 在 hp 车道，011/030 需 `--site-file`，
-011 需 `--node-b`，030 的热备节点用 `--fault-node`）；011 的角色/线程/进程/换 attempt
-变体在 eks 车道形如 `--case GF-GENERAL-LIVE-011 --variant role_mismatch --site-file <F>
---node-b <第二台 EFA 节点>`。
+--node-b <N2> --hyperpod-cluster <HP>`（011/030 两条车道均可；011 需 `--site-file` 与
+`--node-b`，`--node-b` 为车道的第二台 EFA 节点）；030 形如 `--case GF-GENERAL-LIVE-030
+--variant not_ready --fault-node <车道节点> --node-b <候选> --hyperpod-cluster <集群名>`
+（`--hyperpod-cluster` 在 plain-EKS 车道填 EKS 集群名；`--spare-candidate <N>` 覆盖默认候选）。
 
 ### phase 2 范围与前提（内核/应用日志、未知错误、EFA 库存）
 
@@ -1821,7 +1842,7 @@ GF-REGIONAL-COLLECT-017 stage A（hp PASS 2026-10-22）、GF-REGIONAL-NET-007（
 需审批与独占节点的变体：019 `pending_supported`/`post_reset` 单卡 service-window
 reset 需 `--approve GPU_RESET`；021 任一 finding 都驱动全 GPU+NVSwitch reset，故
 该类变体需 `--approve GPU_FULL_FABRIC_RESET`（`recovery_failure` 另需
-`NODE_REBOOT`）并只在 HyperPod 独占节点跑；022 的 XID 联合变体只把 DCGM last-XID
+`NODE_REBOOT`）并在两集群各车道的独占节点跑（X 标志持全部锁）；022 的 XID 联合变体只把 DCGM last-XID
 gauge 回放为 XID 32（`--approve DCGM_XID_GAUGE`）；019 `remap_failure` 的 RMA 现场
 诊断需 `GPU_FIELD_DIAGNOSTIC`。延后：019 `pending_unsupported`（无旧架构卡）、
 `observe_profile`（无 OBSERVE reset Profile）记 `CAPABILITY_ABSENT`。

@@ -17,9 +17,9 @@ DOWN/Disabled -> LINK_INACTIVE), ``excess_device`` (one real device duplicated -
 EXCESS_DEVICE) and ``unknown_inventory`` (one device's driver identity made
 ambiguous -> ``EFA inventory observation unavailable``, UNKNOWN). The PCI root
 stays real, so ``pci_discovered`` never drops and the PCI_DEVICE_MISSING reboot
-chain cannot be entered by these. PCI_DEVICE_MISSING drives REBOOT on the only
-EKS GPU node, and the driver-binding variants need a reserved native
-unbind/rebind; those stay NOT_RUN.
+chain cannot be entered by these. The PCI_DEVICE_MISSING reboot chain
+(``general_live_efa_pci``) and the reserved native unbind/rebind
+(``general_live_efa_driver``) live in their own modules, on both lanes.
 
 The product's design for LINK_INACTIVE is diagnose first, then escalate:
 ``families/health.py`` ``_resource_escalation`` tags the diagnostic
@@ -832,7 +832,7 @@ VARIANTS = [
             "REMEDIATE_EFA_DRIVER 7-step chain assertions already passed live on this "
             "site; no fixture of its own (EFA_DRIVER_UNBIND stays its token when re-enabled)"
         ),
-        lanes=("eks",),
+        lanes=("eks", "hp"),
         expected="DRIVER_UNBOUND -> targeted bind + plugin restart + snapshot + validation; not a reboot",
     ),
     _tree_variant(
@@ -904,7 +904,7 @@ VARIANTS = [
             "CAPABILITY_ABSENT: p5en.48xlarge has a known expected allocatable count; an unknown "
             "expected count needs an instance type absent from INSTANCE_ACCELERATOR_COUNTS"
         ),
-        lanes=("eks",),
+        lanes=("eks", "hp"),
         expected="an unknown expected count is taken for forensics, not treated as a physical shortfall",
     ),
     deferred_variant(
@@ -912,7 +912,7 @@ VARIANTS = [
         "mig_timeslicing",
         proof_mode=LIVE_REPLAY,
         reason="CAPABILITY_ABSENT: MIG / time-slicing is not configured on this site",
-        lanes=("eks",),
+        lanes=("eks", "hp"),
         expected="MIG/time-slicing allocatable is not treated as a physical card shortfall",
     ),
     deferred_variant(
