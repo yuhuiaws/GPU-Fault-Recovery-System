@@ -959,7 +959,7 @@ def _declared(ctx: VariantContext) -> SpareSession:
     return session
 
 
-def _preflight(settings: GeneralLiveSettings, regional: Any) -> list[str]:
+def spare_preflight(settings: GeneralLiveSettings, regional: Any) -> list[str]:
     """The plan-time proof that the spare candidate is idle (read-only)."""
 
     from scripts.e2e.regional.warm_spare_fixture import WarmSpareLiveFixture
@@ -1018,7 +1018,7 @@ def _spec(
         max_minutes=max_minutes,
         execute=execute,
         approvals=approvals,
-        preflight=_preflight,
+        preflight=spare_preflight,
     )
 
 

@@ -211,7 +211,7 @@ def test_registry_covers_every_030_variant_and_tokens() -> None:
             assert spec.flags == "X", (
                 f"{spec.variant}: the candidate is another lane's node"
             )
-            assert spec.preflight is sp._preflight, spec.variant
+            assert spec.preflight is sp.spare_preflight, spec.variant
             assert "release the declared spare" in spec.cleanup, spec.variant
     deferred = {
         s.variant: s.deferred.split(":", 1)[0] for s in sp.VARIANTS if s.deferred
