@@ -1959,6 +1959,23 @@ in this regional control plane, `GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER=false`
 stay `NOT_RUN` with an explicit reason in the denominator rather than being
 dropped. No GF-GENERAL-LIVE case has live evidence yet.
 
+011 `fr_enabled` (the Flight Recorder configured as the operations manual
+prescribes: trace buffer, pipe, dump-file prefix and dump-on-timeout; at least
+one PID must show two real dumps as `PAIRED`) is registered as an expected FAIL
+naming a product gap. The first gap -- the Node Agent reader knew only the
+legacy PyTorch variable names and default dump location -- was closed by batch
+182 and proven live. The gap registered now is `FR_RESULT_BUDGET_GAP`: on the
+2026-10-25 HyperPod run the triage found and dumped every rank twice, but the
+triage result of 8 ranks x 2 dumps (about 1.2 MB) exceeded the observation
+worker's 1 MiB single-line result limit, both nodes handed back only
+`ObservationIncomplete: RESULT_SIZE_LIMIT` with `node_results={}`, and the
+runner read "sampled no rank process". The runner now distinguishes a lost
+triage result (`<node>: no COLLECT_HUNG_TRIAGE result reached the record:
+<cause>`) from dumps the product never read; batch 186 trims an over-budget
+triage result stepwise on the node instead of dropping it, and once that Node
+Agent is live and the variant passes on both clusters its expectation flips
+back to PASS.
+
 ## GF-GENERAL-LIVE-014 Kubernetes allocatable (native device-plugin freeze)
 
 The five native 014 variants (`gpu_plugin`, `efa_plugin`, `one_sample`,
