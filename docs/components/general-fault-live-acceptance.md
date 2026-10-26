@@ -674,6 +674,21 @@ DCGM `*_ERROR_COUNT_TOTAL`）；Hopper/NVLink4 及更新的卡只上报 DL 聚�
 同卡可信Xid32/79窗口内联合才能更强处置，异卡/过期不联合；独立Xid本身的恢复仍要
 单独记录，不能误把它的reboot算作PCIe计数器授权。涉及硬件分支须另行批准。
 动作后读取新真实状态与通信结果，不能以清计数替代验证；source/boot变化不形成跨代速率。
+`counter_reset` 与 `source_boot_change` 判的是**边界**而非速率本身（2026-10-26 plain EKS 首次 live
+运行两者均 FAIL，根因在用例：前者每拍抬升 50——15 s 采集即 200/min；后者在重指后的透传首拍之后
+每拍 +5——20/min，即 `over_rate_limit` 的步长。产品对这两段合法风暴各铸一条 WARNING，oracle 却把它
+记在重置/换代头上；产品记录里重置拍按 `counter-reset` 边沿投递、delta 未知、无 finding，换代边界
+(0, 真实 boot)→(0, 回放 boot) 也无速率）。现在：`counter_reset` 的抬升取 `under_limit_increment`（8/min 预算的一半、
+至少 1，15 s 采集即每拍 1、4/min），再 clear；判定只读产品记录——接受过抬升读数（`raise`）、随后有低于
+前值的读数且其批次带 `counter-reset` 理由、最新读数即重置值（基线从重置值重新起算，`reset`）、该卡
+自 arm 起无任何 `pcie_replay_total` finding/incident/活动 finding（有则按时间点名"抬升期间铸造"或
+"重置铸造"，`no_fault`）、无硬件步骤；证据 `reset-readings`。`source_boot_change` 先 `serve`+`arm`
+再 `repoint`（`arm_before_repoint`），让重启到回放 boot id 下的采集器第一拍就读到计划首读的跳变
+`cross_boot_jump`（对真实 boot 的任何旧读数——最多一个健康摘要 + 一拍 + 重启之前——都超过 8/min 的
+一次性抬升，之后保持）；判定：无 `pcie_replay_total` finding/incident（`no_cross_boot_rate`）、产品
+接受过回放 boot 下的读数且最新读数就是新 boot 的首读（换代从新基线起算，`new_baseline`）、无硬件
+步骤；新 boot 首个被接受的读数不是该跳变时记 INCONCLUSIVE（边界以真实值越过、未被检验）；证据
+`boot-readings`。两者重跑只需 live 运行器，不需要新产品版本。
 
 2026-10-26 现场（plain EKS 两车道，R13g）`same_gpu_xid`、`wrong_gpu_xid`、`expired_xid`
 三个 XID 联合变体在 `deploy-proxy` 一步即 INCONCLUSIVE，结果只有

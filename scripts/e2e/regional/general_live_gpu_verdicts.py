@@ -412,6 +412,67 @@ def accepted_samples(
     return sorted(result, key=lambda item: str(item.get("observed_at")))
 
 
+def counter_reset_ticks(
+    state: dict[str, Any], canonical: str, gpu: str
+) -> list[dict[str, Any]]:
+    """The accepted batches in which ``canonical`` on ``gpu`` fell below its
+    previous accepted value: the product's own record of a counter reset.
+
+    Each tick carries the drop (``previous`` -> ``value``), the batch's
+    ``observed_at`` / ``batch_id`` and its ``edge_filter_reasons`` -- the
+    collector delivers such a tick as a ``counter-reset`` edge.
+    """
+
+    ticks: list[dict[str, Any]] = []
+    previous: float | None = None
+    for batch in state.get("batches") or []:
+        for sample in batch.get("samples") or []:
+            if sample.get("name") != canonical or sample.get("gpu") != gpu:
+                continue
+            value = sample.get("value")
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                continue
+            if previous is not None and value < previous:
+                ticks.append(
+                    {
+                        "value": value,
+                        "previous": previous,
+                        "observed_at": batch.get("observed_at"),
+                        "batch_id": batch.get("batch_id"),
+                        "edge_filter_reasons": list(
+                            batch.get("edge_filter_reasons") or []
+                        ),
+                    }
+                )
+            previous = value
+    return ticks
+
+
+def incident_finding(
+    state: dict[str, Any], incident: dict[str, Any]
+) -> dict[str, Any] | None:
+    """The finding (``gpu_state`` history) a ``gpu-<finding_id>`` NODE_HEALTH
+    incident was minted from, when the history since the moment holds it."""
+
+    event_id = str(incident.get("event_id") or "")
+    finding_id = event_id[4:] if event_id.startswith("gpu-") else event_id
+    for item in state.get("findings") or []:
+        if item.get("finding_id") == finding_id:
+            return item
+    return None
+
+
+def finding_text(finding: dict[str, Any] | None) -> str:
+    """``value=.. delta=.. rate=../min at <observed_at>`` of a finding view."""
+
+    if finding is None:
+        return "finding not in the product's history since the replay was armed"
+    return (
+        f"value={finding.get('value')} delta={finding.get('delta')} "
+        f"rate={finding.get('rate_per_minute')}/min at {finding.get('observed_at')}"
+    )
+
+
 def active_findings(
     state: dict[str, Any], canonical: str, *, gpu: str | None = None
 ) -> list[dict[str, Any]]:
@@ -595,9 +656,12 @@ __all__ = [
     "composite_findings",
     "composite_grade_errors",
     "composite_incidents",
+    "counter_reset_ticks",
     "executions_of",
     "fabric_incidents",
+    "finding_text",
     "history_findings",
+    "incident_finding",
     "inventory_incidents",
     "isolating_steps",
     "latest_value",

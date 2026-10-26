@@ -22,7 +22,16 @@ variant's notes and ``canonical_name`` / ``exporter_metrics`` evidence.
 022 drives the PCIe replay counter (``pcie``/``pcie_xid`` profiles). The rate
 is graded against the previous accepted sample, so ``at_rate_limit`` stays at
 or below 8/min (no finding) and ``over_rate_limit`` clears it (WARNING
-RUN_DIAGNOSTICS). ``same_gpu_xid`` / ``wrong_gpu_xid`` / ``expired_xid`` drive
+RUN_DIAGNOSTICS). ``counter_reset`` and ``source_boot_change`` grade a
+*boundary*, so the plan around it must not be a storm of its own: the raise
+before the drop stays under the rule (``under_limit_increment``) and the drop
+must be the product's ``counter-reset`` edge and new baseline; the boot change
+is crossed with the plan's first read already served (``arm_before_repoint``),
+a jump over the rule against any reading of the real boot
+(``cross_boot_jump``), which must form no rate and must become the new
+generation's baseline (live 2026-10-26 both plans were storms -- +50 per read,
++5 per read -- and the oracle blamed their legitimate WARNING on the boundary).
+``same_gpu_xid`` / ``wrong_gpu_xid`` / ``expired_xid`` drive
 the PCIe<->XID join through the DCGM last-XID gauge (replayed only as XID 32,
 catalog RESTART_APP and monitor-only on an idle node; ``--approve
 DCGM_XID_GAUGE``). ``expired_xid`` is an expected FAIL: the gauge fallback has
@@ -39,17 +48,25 @@ incident and is not absorbed by the counter diagnosis. The fatal-grade dispatch
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from datetime import datetime
 from typing import Any
 
-from scripts.e2e.regional.general_live_fixture import VariantContext, VariantNotRun
+from scripts.e2e.regional.general_live_fixture import (
+    VariantContext,
+    VariantInconclusive,
+    VariantNotRun,
+)
 from scripts.e2e.regional.general_live_gpu_replay import (
     DcgmReplay,
     activity_now,
     add,
     arm_and_confirm,
+    arm_before_repoint,
     at_limit_increment,
     baseline,
     clear,
+    cross_boot_jump,
     gpu_spec,
     no_hardware,
     over_limit_increment,
@@ -60,15 +77,24 @@ from scripts.e2e.regional.general_live_gpu_replay import (
     run_gpu_survey,
     state_now,
     step,
+    under_limit_increment,
     utc_now,
     wait_gpu_incident,
 )
 from scripts.e2e.regional.general_live_gpu_verdicts import (
     GpuChain,
+    accepted_samples,
+    active_findings,
     chain_errors,
     composite_incidents,
+    counter_reset_ticks,
+    finding_text,
+    history_findings,
+    incident_finding,
+    latest_value,
     metric_incidents,
     read_only_errors,
+    served_values,
 )
 from scripts.e2e.regional.general_live_kernel_xid import (
     independence_errors,
@@ -511,86 +537,330 @@ def over_rate_limit(ctx: VariantContext) -> dict[str, Any]:
     return result(stages, extra={"gpu_uuid": gpu})
 
 
+PCIE = "pcie_replay_total"
+
+
+def _when(value: Any) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _values(samples: list[dict[str, Any]]) -> list[float]:
+    return [
+        item["value"]
+        for item in samples
+        if isinstance(item.get("value"), (int, float))
+        and not isinstance(item.get("value"), bool)
+    ]
+
+
+def _number(value: float) -> str:
+    return str(int(value)) if float(value).is_integer() else str(value)
+
+
+def _fault_errors(
+    state: dict[str, Any],
+    activity: dict[str, Any],
+    gpu: str,
+    *,
+    place: Callable[[dict[str, Any] | None], str],
+    boundary: str,
+) -> list[str]:
+    """One error per ``pcie_replay_total`` finding on ``gpu`` -- an incident's
+    or a history one's -- worded by ``place`` (where the finding sits relative
+    to the boundary), plus any finding still active after the ``boundary``."""
+
+    errors: list[str] = []
+    seen: set[str] = set()
+    for incident in metric_incidents(activity, PCIE, gpu=gpu):
+        finding = incident_finding(state, incident)
+        if finding is not None:
+            seen.add(str(finding.get("finding_id")))
+        errors.append(
+            f"{place(finding)}: {finding_text(finding)}; "
+            f"incident {incident.get('incident_id')}"
+        )
+    for finding in history_findings(state, PCIE, gpu=gpu):
+        if str(finding.get("finding_id")) not in seen:
+            errors.append(f"{place(finding)}: {finding_text(finding)}")
+    for finding in active_findings(state, PCIE, gpu=gpu):
+        errors.append(f"{boundary} left an active finding: {finding_text(finding)}")
+    return errors
+
+
+def pcie_counter_reset_stages(
+    state: dict[str, Any], activity: dict[str, Any], gpu: str
+) -> tuple[dict[str, list[str]], dict[str, Any]]:
+    """Grade a PCIe replay counter reset on the product's own records.
+
+    ``raise``: the product accepted a reading above the first accepted one
+    (the under-limit raise reached it). ``reset``: a later accepted reading
+    fell below its predecessor, its batch is a ``counter-reset`` edge and the
+    product's latest reading is that reset value -- the baseline re-armed from
+    the drop, not held at the peak. ``no_fault``: no ``pcie_replay_total``
+    finding or incident on the GPU, each one named by where it sits -- during
+    the raise (the plan's own rate) or at/after the drop (the reset minted it)
+    -- and none still active. The readings document is returned for the
+    evidence.
+    """
+
+    samples = accepted_samples(state, PCIE, gpu)
+    values = _values(samples)
+    ticks = counter_reset_ticks(state, PCIE, gpu)
+    latest = latest_value(state, PCIE, gpu)
+    listed = ", ".join(_number(value) for value in values) or "none"
+    raised: list[str] = []
+    reset: list[str] = []
+    if not values or max(values) <= values[0]:
+        raised.append(
+            f"the product accepted no raised {PCIE} reading of {gpu} "
+            f"(accepted values: {listed})"
+        )
+    elif not ticks:
+        reset.append(
+            f"the product accepted no {PCIE} reading of {gpu} below its "
+            f"predecessor (accepted values: {listed})"
+        )
+    else:
+        tick = ticks[0]
+        if "counter-reset" not in tick["edge_filter_reasons"]:
+            reasons = ", ".join(tick["edge_filter_reasons"]) or "no reason"
+            reset.append(
+                f"the drop {_number(tick['previous'])} -> {_number(tick['value'])} "
+                f"at {tick['observed_at']} was delivered without a counter-reset "
+                f"edge reason ({reasons})"
+            )
+        latest_number = latest.get("value") if latest is not None else None
+        if latest_number != tick["value"]:
+            shown = (
+                _number(latest_number)
+                if isinstance(latest_number, (int, float))
+                else "absent"
+            )
+            reset.append(
+                f"the product's latest {PCIE} reading of {gpu} is {shown}, not the "
+                f"reset value {_number(tick['value'])}: the baseline was not "
+                "re-armed from the drop"
+            )
+    reset_at = _when(ticks[0]["observed_at"]) if ticks else None
+
+    def place(finding: dict[str, Any] | None) -> str:
+        when = _when(finding.get("observed_at")) if finding is not None else None
+        if reset_at is not None and when is not None and when < reset_at:
+            return (
+                "the raise before the reset minted a finding (the plan's increment "
+                "must stay under 8/min)"
+            )
+        return "a PCIe counter reset minted a finding"
+
+    stages = {
+        "raise": raised,
+        "reset": reset,
+        "no_fault": _fault_errors(
+            state, activity, gpu, place=place, boundary="a counter reset"
+        ),
+        "hardware": no_hardware(activity),
+    }
+    readings = {
+        "accepted": samples,
+        "reset_ticks": ticks,
+        "latest": latest,
+        "findings": history_findings(state, PCIE, gpu=gpu),
+    }
+    return stages, readings
+
+
 def pcie_counter_reset(ctx: VariantContext) -> dict[str, Any]:
+    """A PCIe replay counter that falls below its previous reading is no fault.
+
+    The raise before the drop stays clearly under the 8/min rule
+    (``under_limit_increment``: one per read on a 15-s collector, 4/min), so
+    the only reading that could mint a finding is the reset itself. Live
+    2026-10-26 the plan raised by 50 per read (200/min) and the WARNING that
+    legitimate storm minted was read as "a PCIe counter reset minted a
+    finding", while the product's records showed the reset tick graded unknown
+    and nothing minted at it. The stages read the product's own records
+    (``pcie_counter_reset_stages``).
+    """
+
     survey = run_gpu_survey(ctx)
-    gpu = survey.target("pcie_replay_total")
+    gpu = survey.target(PCIE)
+    increment = under_limit_increment(survey.interval)
     since = utc_now()
     repl = DcgmReplay(
         ctx,
         plan(
             "pcie",
             baseline(),
-            step(3, add("pcie_replay_total", [gpu], 50)),
-            step(20, clear("pcie_replay_total", [gpu]), hold=True),
+            step(3, add(PCIE, [gpu], increment)),
+            step(20, clear(PCIE, [gpu]), hold=True),
         ),
         _hold(ctx),
     )
-    arm_and_confirm(repl, f"{gpu}/pcie_replay_total")
-    ctx.hold(min(120, _hold(ctx)), name="reset-observe")
+    arm_and_confirm(repl, f"{gpu}/{PCIE}")
+    # Two more raised reads, the drop, and the product's ingest of it.
+    ctx.hold(min(max(120, 4 * repl.interval + 60), _hold(ctx)), name="reset-observe")
+    state = state_now(ctx, since, names=[PCIE])
     activity = wait_gpu_incident(
         ctx,
         since,
         lambda d: [],
-        metrics=("pcie_replay_total",),
+        metrics=(PCIE,),
         timeout_seconds=1,
         name="reset",
     )
-    stages = {
-        "no_fault": []
-        if not metric_incidents(activity, "pcie_replay_total", gpu=gpu)
-        else ["a PCIe counter reset minted a finding"],
-        "hardware": no_hardware(activity),
-    }
-    repl.close()
-    ctx.cleanup.discard("dcgm-replay")
-    return result(stages, extra={"gpu_uuid": gpu})
-
-
-def source_boot_change(ctx: VariantContext) -> dict[str, Any]:
-    from scripts.e2e.regional.general_live_gpu_replay import replay_boot_id
-
-    survey = run_gpu_survey(ctx)
-    gpu = survey.target("pcie_replay_total")
-    boot, origin = replay_boot_id(survey, ctx.run_id)
-    since = utc_now()
-    repl = DcgmReplay(
-        ctx,
-        plan(
-            "pcie",
-            baseline(),
-            step(
-                30,
-                add("pcie_replay_total", [gpu], over_limit_increment(survey.interval)),
-                hold=True,
-            ),
-        ),
-        _hold(ctx),
-        boot_id=boot,
-    )
-    arm_and_confirm(repl, f"{gpu}/pcie_replay_total")
-    ctx.hold(min(180, _hold(ctx)), name="boot-observe")
-    activity = wait_gpu_incident(
-        ctx,
-        since,
-        lambda d: [],
-        metrics=("pcie_replay_total",),
-        timeout_seconds=1,
-        name="boot",
-    )
-    stages = {
-        "no_cross_boot_rate": []
-        if not metric_incidents(activity, "pcie_replay_total", gpu=gpu)
-        else ["a source/boot change formed a cross-generation PCIe rate"],
-        "hardware": no_hardware(activity),
-    }
+    stages, readings = pcie_counter_reset_stages(state, activity, gpu)
+    ctx.evidence.write("reset-readings", readings)
     repl.close()
     ctx.cleanup.discard("dcgm-replay")
     return result(
         stages,
         notes=[
-            f"replayed boot id from {origin}; a boot change resets the counter baseline"
+            f"raised by {increment} per read ({increment * 60 / repl.interval:g}/min, "
+            "under the 8/min rule) then dropped: the drop is a counter-reset edge, "
+            "graded unknown, and the new baseline -- never a fault or a recovery"
         ],
-        extra={"gpu_uuid": gpu},
+        extra={"gpu_uuid": gpu, "increment": increment},
+    )
+
+
+def source_boot_change_stages(
+    state: dict[str, Any],
+    activity: dict[str, Any],
+    gpu: str,
+    *,
+    boot: str,
+    jump: float | None,
+) -> tuple[dict[str, list[str]], dict[str, Any]]:
+    """Grade a source/boot change on the product's own records.
+
+    ``no_cross_boot_rate``: no ``pcie_replay_total`` finding or incident on the
+    GPU (the only reading that could rate over the rule is the jump across the
+    boundary). ``new_baseline``: the product accepted a reading under the
+    replayed boot and its latest reading of the GPU is the new boot's first
+    one -- the boot change started a new baseline instead of being refused.
+    Raises ``VariantInconclusive`` when the new boot's first accepted reading
+    is not the served jump: the boundary was crossed at the real value and was
+    never exercised.
+    """
+
+    samples = accepted_samples(state, PCIE, gpu)
+    new_boot = [
+        item
+        for item in samples
+        if (item.get("labels") or {}).get("source_boot_id") == boot
+    ]
+    first = new_boot[0] if new_boot else None
+    if first is not None and jump is not None and first.get("value") != jump:
+        raise VariantInconclusive(
+            f"the new boot's first accepted {PCIE} reading of {gpu} was "
+            f"{_number(first['value'])}, not the replayed jump {_number(jump)}: the "
+            "collector scraped the tool before the arm reached it, so the boundary "
+            "was crossed at the real value and not exercised"
+        )
+    latest = latest_value(state, PCIE, gpu)
+    baseline_errors: list[str] = []
+    if first is None:
+        baseline_errors.append(
+            f"the product accepted no {PCIE} reading of {gpu} under the replayed "
+            f"boot {boot}: the new boot's readings never became a baseline"
+        )
+    elif latest is None or (
+        (latest.get("labels") or {}).get("source_boot_id") != boot
+        or latest.get("value") != first.get("value")
+    ):
+        shown = (
+            f"value={_number(latest['value'])} under boot "
+            f"{(latest.get('labels') or {}).get('source_boot_id') or 'unknown'}"
+            if latest is not None and isinstance(latest.get("value"), (int, float))
+            else "absent"
+        )
+        baseline_errors.append(
+            f"the product's latest {PCIE} reading of {gpu} is {shown}, not the new "
+            f"boot's first reading ({_number(first['value'])} under {boot}): the boot "
+            "change did not start a new baseline"
+        )
+    stages = {
+        "no_cross_boot_rate": _fault_errors(
+            state,
+            activity,
+            gpu,
+            place=lambda _finding: (
+                "a source/boot change formed a cross-generation PCIe rate"
+            ),
+            boundary="a source/boot change",
+        ),
+        "new_baseline": baseline_errors,
+        "hardware": no_hardware(activity),
+    }
+    readings = {
+        "accepted": samples,
+        "first_new_boot_reading": first,
+        "latest": latest,
+        "findings": history_findings(state, PCIE, gpu=gpu),
+    }
+    return stages, readings
+
+
+def source_boot_change(ctx: VariantContext) -> dict[str, Any]:
+    """A source/boot change forms no cross-generation PCIe rate and starts a
+    new baseline.
+
+    The plan's first read is a jump over the 8/min rule against any reading
+    of the real boot (``cross_boot_jump``), held afterwards; the proxy is
+    armed *before* the collector is repointed (``arm_before_repoint``), so the
+    repointed collector's first scrape -- the product's first reading under
+    the replayed boot id -- already carries the jump. A product that rated
+    across the boundary would mint; one that starts a new baseline must not,
+    and its latest reading must be the new boot's first. Live 2026-10-26 the
+    plan ramped +5 per read (20/min) after a pass-through first scrape: the
+    boundary was (0, real boot) -> (0, replayed boot) and the ramp inside the
+    new boot was the storm the oracle blamed on the boot change.
+    """
+
+    from scripts.e2e.regional.general_live_gpu_replay import replay_boot_id
+
+    survey = run_gpu_survey(ctx)
+    gpu = survey.target(PCIE)
+    boot, origin = replay_boot_id(survey, ctx.run_id)
+    jump = cross_boot_jump(survey.interval, survey.health_summary)
+    since = utc_now()
+    repl = DcgmReplay(
+        ctx,
+        plan("pcie", step(1, add(PCIE, [gpu], jump)), step(30, hold=True)),
+        _hold(ctx),
+        boot_id=boot,
+    )
+    key = f"{gpu}/{PCIE}"
+    arm_before_repoint(repl, key)
+    ctx.hold(min(180, _hold(ctx)), name="boot-observe")
+    state = state_now(ctx, since, names=[PCIE])
+    activity = wait_gpu_incident(
+        ctx,
+        since,
+        lambda d: [],
+        metrics=(PCIE,),
+        timeout_seconds=1,
+        name="boot",
+    )
+    served = [value for value in served_values(repl.records, key) if value is not None]
+    stages, readings = source_boot_change_stages(
+        state, activity, gpu, boot=boot, jump=served[0] if served else None
+    )
+    ctx.evidence.write("boot-readings", {**readings, "served": served})
+    repl.close()
+    ctx.cleanup.discard("dcgm-replay")
+    return result(
+        stages,
+        notes=[
+            f"replayed boot id from {origin}; the new boot's first reading is a jump "
+            f"of {jump} (over 8/min against any reading of the real boot), served "
+            "before the repointed collector's first scrape; a boot change starts a "
+            "new baseline and forms no cross-generation rate"
+        ],
+        extra={"gpu_uuid": gpu, "boot_id": boot, "jump": jump},
     )
 
 
@@ -826,16 +1096,19 @@ VARIANTS = [
     gpu_spec(
         CASE_022,
         "counter_reset",
-        "raise then drop the PCIe replay counter",
-        "a counter reset is no new fault",
+        "raise the PCIe replay counter under 8/min, then drop it",
+        "a counter reset is no new fault: the drop is the product's counter-reset "
+        "edge, graded unknown, and its new baseline",
         pcie_counter_reset,
         max_minutes=18,
     ),
     gpu_spec(
         CASE_022,
         "source_boot_change",
-        "increment PCIe replay under a changed source boot id",
-        "a source/boot change forms no cross-generation rate",
+        "a PCIe replay jump over 8/min as the first reading under a replayed "
+        "source boot id (armed before the repoint)",
+        "a source/boot change forms no cross-generation rate; the new boot's first "
+        "reading is the new baseline",
         source_boot_change,
         max_minutes=18,
     ),

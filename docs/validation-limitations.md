@@ -3110,3 +3110,35 @@ age check (022 `expired_xid`), the UUID-set-only identity comparison (026
 `bdf_changed`) and the inventory baseline that never compared the source boot
 id (026 `stale_boot`) -- are fixed by batch 160, so the variants now expect
 PASS; a product that regressed would FAIL them.
+
+022 `counter_reset` and `source_boot_change` first ran live on 2026-10-26
+(plain EKS, release R13g, one node each) and FAILed on their own plans, not on
+the product. `counter_reset` raised the counter by 50 per 15-s read (200/min
+against the 8/min rule) and read the WARNING that storm minted as "a PCIe
+counter reset minted a finding"; `source_boot_change` ramped +5 per read
+(20/min, the `over_rate_limit` increment) inside the replayed boot after the
+repointed collector's pass-through first scrape, so the only boundary it
+crossed was (0, real boot) -> (0, replayed boot) and the same-generation storm
+was read as "a cross-generation PCIe rate". The product's records grade both
+boundaries as unknown: the drop is delivered as a `counter-reset` edge, has no
+delta, mints nothing, neither clears nor re-mints an active finding and becomes
+the baseline; a sample whose `source_boot_id` differs from the previous
+accepted one has no delta and becomes the new generation's baseline, after
+which same-generation rates grade as always
+(`gpu_composites.metric_counter_delta`; no product change). The variants now drive the boundary itself. `counter_reset` raises by
+`under_limit_increment` (half the 8/min budget, at least one: one per read on
+a 15-s collector) before the clear and grades, on the product's records, the
+accepted raise, the accepted drop with its `counter-reset` edge reason, the
+latest reading equal to the reset value and every `pcie_replay_total` finding
+by its place (during the raise, or at/after the drop), plus no active finding
+and no hardware step (evidence `reset-readings`). `source_boot_change` arms the
+plan before the repoint (`arm_before_repoint`; `DcgmReplay.deploy` is now
+`serve` + `repoint`), so the restarted collector's first scrape under the
+replayed boot id is already a `cross_boot_jump` -- over 8/min against any
+reading of the real boot (twice the health summary plus a scrape and a
+minute), held afterwards -- and grades no finding, a reading accepted under
+the replayed boot and the latest reading being that first reading; a first
+new-boot reading that is not the jump is INCONCLUSIVE (the boundary was
+crossed at the real value and not exercised) (evidence `boot-readings`;
+`tests/regional/test_general_live_pcie_boundaries.py`). Both variants are
+rerun with the runner alone; no product release is needed.

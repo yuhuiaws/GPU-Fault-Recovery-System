@@ -643,6 +643,37 @@ def over_limit_increment(interval: int, rate_per_minute: float = 8.0) -> int:
     return int(rate_per_minute * interval // 60) * 2 + 1
 
 
+def under_limit_increment(interval: int, rate_per_minute: float = 8.0) -> int:
+    """A per-read PCIe increment whose rate stays clearly under ``rate``.
+
+    Half the at-limit budget, at least one: a raise that must never be the
+    finding -- ``counter_reset`` grades the drop that follows it -- cannot sit
+    on the 8/min edge, where two scrapes a little closer than one interval
+    already rate above the threshold. One per read on a 15-s collector (4/min).
+    """
+
+    return max(1, at_limit_increment(interval, rate_per_minute) // 2)
+
+
+def cross_boot_jump(
+    interval: int, health_summary: int, rate_per_minute: float = 8.0
+) -> int:
+    """A one-read PCIe jump that rates over ``rate`` against any reading of
+    the previous boot generation.
+
+    The repointed collector's first scrape under the replayed boot id is the
+    product's first reading of the new generation; the store's previous
+    sample is the real boot's, delivered by the old collector at most one
+    health summary, one scrape and the restart earlier. The jump clears the
+    threshold over twice that window (plus a minute), so a product that rated
+    across the boundary would have to mint and one that starts a new baseline
+    must not.
+    """
+
+    window = 2 * (health_summary + interval) + 60
+    return int(rate_per_minute * window // 60) + 1
+
+
 # --------------------------------------------------------------------------- #
 # The replay controller
 # --------------------------------------------------------------------------- #
@@ -710,6 +741,18 @@ class DcgmReplay:
     def deploy(self) -> None:
         """Install sources, serve the tool, repoint the collector, arm later."""
 
+        self.serve()
+        self.repoint()
+
+    def serve(self) -> None:
+        """Install the reviewed sources and serve the tool pass-through.
+
+        The cleanup is registered before the first file lands on the node.
+        Nothing scrapes the tool until ``repoint`` moves the collector to it,
+        so a plan armed between the two (``arm_before_repoint``) is first read
+        by the restarted collector's own first scrape.
+        """
+
         self.ctx.cleanup.push("dcgm-replay", self.close)
         self._install("gpu_dcgm_field_replay.py", FIELD_TOOL)
         self._install_json("plan.json", self.plan)
@@ -728,6 +771,15 @@ class DcgmReplay:
             str(self.seconds + TOOL_MARGIN_SECONDS),
             timeout=120,
         )
+        self.ctx.evidence.write("dcgm-replay-deploy", self.receipts)
+
+    def repoint(self) -> None:
+        """Repoint the one collector unit at the served tool (deadman first).
+
+        The probe restarts the unit; its first scrape after the restart is the
+        tool's first read, under the replayed boot id when one is given.
+        """
+
         repoint = [
             "repoint-collector",
             "--port",
@@ -990,6 +1042,28 @@ def arm_and_confirm(replay: DcgmReplay, *served_keys: str) -> None:
         replay.wait_served(*served_keys)
 
 
+def arm_before_repoint(replay: DcgmReplay, *served_keys: str) -> None:
+    """Serve and arm the plan first, repoint the collector after, then gate.
+
+    ``arm_and_confirm`` repoints before it arms, so a collector restarted under
+    a replayed boot id scrapes its first reading pass-through and the boot
+    boundary the product crosses is (v, real boot) -> (v, replayed boot): a
+    zero delta no grading could get wrong (live 2026-10-26, 022
+    ``source_boot_change``: the over-limit ramp that followed it was a
+    same-generation storm the product rightly minted). Here the proxy is armed
+    while the collector still scrapes the real exporter -- no read reaches the
+    plan -- and the repoint's restart makes the plan's first read the first
+    reading the product sees under the new boot, so the boundary itself
+    carries the plan's first step.
+    """
+
+    replay.serve()
+    replay.arm()
+    replay.repoint()
+    if served_keys:
+        replay.wait_served(*served_keys)
+
+
 def wait_accepted(
     ctx: VariantContext,
     since: Any,
@@ -1189,15 +1263,18 @@ __all__ = [
     "PORT",
     "add",
     "arm_and_confirm",
+    "arm_before_repoint",
     "at_limit_increment",
     "baseline",
     "cleanup_message",
     "collector_interval",
+    "cross_boot_jump",
     "passthrough_plan",
     "clear",
     "label",
     "leading_passthrough_reads",
     "over_limit_increment",
+    "under_limit_increment",
     "plan",
     "put",
     "reclaim_leftovers",
