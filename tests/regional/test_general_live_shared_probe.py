@@ -307,7 +307,16 @@ def test_cleanup_unmounts_everything_and_disarms_an_unrecorded_deadman(
     host.timers.add(f"gfrs-{DIGEST}-ndeadman-nfs-ghost")
     assert sharedp.main(call("cleanup", "--kind", "nfs-ghost")) == 0, host.emitted[-1]
     assert f"gfrs-{DIGEST}-ndeadman-nfs-ghost" not in host.timers
-    assert host.emitted[-1]["clean"] is False, "two mounts remain"
+    ghost = host.emitted[-1]
+    assert ghost["clean"] is True, (
+        "the ghost's own scope holds nothing; the two mounts are not its residue"
+    )
+    assert ghost["scope"] == {
+        "mounts": ["ghost"],
+        "run_level": False,
+        "remaining_mounts": ["other", "shared"],
+    }, ghost["scope"]
+    assert len(host.mounts) == 2, "the two mounts stay for their own cleanups"
     assert sharedp.main(call("cleanup")) == 0, host.emitted[-1]
     result = host.emitted[-1]
     assert result["clean"] is True, result["residue"]
@@ -581,3 +590,113 @@ def test_every_mount_failure_sentence_is_constant_and_distinct() -> None:
     assert len(set(sentences)) == len(sentences), sentences
     for sentence in sentences:
         assert sharedp.CONSTANT_MESSAGE.fullmatch(sentence), sentence
+
+
+# --------------------------------------------------------------------------- #
+# per-mount residue scope (live 2026-10-26: a two-mount run's false residue)
+# --------------------------------------------------------------------------- #
+def other_target() -> str:
+    return str(sharedp.MOUNT_ROOT / DIGEST / "other")
+
+
+def test_a_per_mount_cleanup_answers_for_its_own_mount_only(host: FakeHost) -> None:
+    """Live 2026-10-26 (``healthy_other_mount``, plain EKS): the LIFO stack ran
+    ``cleanup --kind nfs-other`` first and its run-scoped residue check listed
+    the still-mounted ``shared``, its deadman timer and the run's ``nfsv4`` as
+    residue of the *other* mount's cleanup; the verdict was forced to FAIL on a
+    node the next entry left clean. A per-mount cleanup now answers for its own
+    mount; the module and the run directory are the run's last cleanup's."""
+
+    (host.sys_module / sharedp.NFS_MODULE).rmdir()
+    assert sharedp.main(mount("--load-module")) == 0, host.emitted[-1]
+    assert sharedp.main(mount(name="other", server="10.0.9.8")) == 0, host.emitted[-1]
+    assert sharedp.main(call("cleanup", "--kind", "nfs-other")) == 0, host.emitted[-1]
+    first = host.emitted[-1]
+    assert first["clean"] is True, first["residue"]
+    assert first["scope"] == {
+        "mounts": ["other"],
+        "run_level": False,
+        "remaining_mounts": ["shared"],
+    }, first["scope"]
+    assert first["residue"] == {
+        "mounts": [],
+        "deadman_timers": [],
+        "mount_points": [],
+    }, "the sibling, its timer and the module are not this cleanup's residue"
+    assert first["deferred"]["remaining_mounts"] == ["shared"], first["deferred"]
+    assert "modules_loaded_by_run" in first["deferred"]["items"], first["deferred"]
+    assert (host.sys_module / "nfsv4").exists(), "the module stays for the sibling"
+    assert DEADMAN in host.timers and target() in host.mounts, (
+        host.timers,
+        host.mounts,
+    )
+    assert not Path(other_target()).exists(), "the other mount point is removed"
+    assert sharedp.main(call("cleanup", "--kind", "nfs-shared")) == 0, host.emitted[-1]
+    last = host.emitted[-1]
+    assert last["clean"] is True, last["residue"]
+    assert last["scope"] == {
+        "mounts": ["shared"],
+        "run_level": True,
+        "remaining_mounts": [],
+    }, last["scope"]
+    assert last["deferred"] is None, last
+    assert {"modules_unloaded": ["nfsv4"]} in last["actions"], last["actions"]
+    assert {"run_dir_removed": str(sharedp.MOUNT_ROOT / DIGEST)} in last["actions"], (
+        last["actions"]
+    )
+    assert set(last["residue"]) == {
+        "mounts",
+        "deadman_timers",
+        "mount_points",
+        "modules_loaded_by_run",
+        "run_dir",
+    }, last["residue"]
+    assert host.mounts == {} and host.timers == set(), (host.mounts, host.timers)
+    assert not (sharedp.MOUNT_ROOT / DIGEST).exists(), "the run directory is gone"
+    assert not (host.sys_module / "nfsv4").exists(), "the run's module is unloaded"
+
+
+def test_a_per_mount_cleanup_still_reports_its_own_leftovers(host: FakeHost) -> None:
+    """A real leftover inside the scope -- an NFS mount still below the mount
+    point -- is residue of the per-mount cleanup; the sibling is not."""
+
+    assert sharedp.main(mount()) == 0, host.emitted[-1]
+    assert sharedp.main(mount(name="other", server="10.0.9.8")) == 0, host.emitted[-1]
+    stray = f"{other_target()}/below"
+    host.mounts[stray] = "10.0.9.9:/b"
+    host.write_mountinfo()
+    assert sharedp.main(call("cleanup", "--kind", "nfs-other")) == 0, host.emitted[-1]
+    result = host.emitted[-1]
+    assert result["clean"] is False, result
+    assert result["residue"]["mounts"] == [stray], result["residue"]
+    assert target() not in str(result["residue"]), "the sibling is not blamed"
+    assert result["scope"]["run_level"] is False, result["scope"]
+
+
+def test_the_last_cleanup_reports_the_run_level_leftovers(host: FakeHost) -> None:
+    """A module that would not unload and a run directory that is not empty are
+    the last cleanup's residue (``modules_loaded_by_run``, ``run_dir``), keys a
+    per-mount receipt never carries."""
+
+    (host.sys_module / sharedp.NFS_MODULE).rmdir()
+    assert sharedp.main(mount("--load-module")) == 0, host.emitted[-1]
+    answer = host.answer
+
+    def keep_module(inner: list[str]) -> tuple[int, str]:
+        return (1, "") if inner[:2] == ["modprobe", "-r"] else answer(inner)
+
+    host.answer = keep_module  # type: ignore[method-assign]
+    (sharedp.MOUNT_ROOT / DIGEST / "stray").write_text("left behind")
+    assert sharedp.main(call("cleanup", "--kind", "nfs-shared")) == 0, host.emitted[-1]
+    result = host.emitted[-1]
+    assert result["scope"]["run_level"] is True, result["scope"]
+    assert result["clean"] is False, result
+    assert result["residue"]["modules_loaded_by_run"] == ["nfsv4"], result["residue"]
+    assert result["residue"]["run_dir"] == [str(sharedp.MOUNT_ROOT / DIGEST)], result[
+        "residue"
+    ]
+    assert result["residue"]["mounts"] == [], result["residue"]
+    assert result["residue"]["deadman_timers"] == [], result["residue"]
+    assert not any("run_dir_removed" in action for action in result["actions"]), result[
+        "actions"
+    ]

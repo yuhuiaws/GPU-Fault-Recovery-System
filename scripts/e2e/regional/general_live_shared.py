@@ -52,6 +52,12 @@ domain <id>`` reason, exactly one ``SHARED_STORAGE_FAILURE_DOMAIN`` notification
 goes out, both per-node chains stay diagnostic-only, and the record clears
 RECOVERED once both nodes report the export available again. Both clients must
 see the same export ``source`` before the hang, else the variant is NOT_READY.
+
+The delivery hold and the recovery reads -- how the host collector ships a held
+breach (its edge once, then the health summary) and its recovery (one
+``recovered`` edge, then summaries moving the latest record), what that means
+for every ``since`` stamp, and the two live verdicts of 2026-10-26 that were
+wrong about a right product -- live in ``general_live_shared_recovery.py``.
 """
 
 from __future__ import annotations
@@ -81,7 +87,16 @@ from scripts.e2e.regional.general_live_registry import (
     NATIVE,
     VariantSpec,
 )
-from scripts.e2e.regional.general_live_store import node_activity, signal_key
+from scripts.e2e.regional.general_live_shared_recovery import (
+    UNAVAILABLE,
+    USED,
+    await_clear,
+    await_used_recovery,
+    baseline_readings,
+    delivery_errors,
+    hold_hang_until_delivered,
+    read_activity,
+)
 from scripts.e2e.regional.host_probe_fixture import HostProbeError
 from scripts.e2e.regional.general_live_verdicts import (
     DIAGNOSTIC_ONLY_STATES,
@@ -91,7 +106,6 @@ from scripts.e2e.regional.general_live_verdicts import (
     collector_delivery,
     finding_incidents,
     hardware_errors,
-    latest_samples,
     parse_time,
     samples,
     settled,
@@ -105,12 +119,6 @@ from scripts.e2e.regional.shared_export_fixture import (
 )
 
 CASE = "GF-GENERAL-LIVE-005"
-UNAVAILABLE = "shared_filesystem_unavailable"
-USED = "shared_filesystem_used_percent"
-#: A host metric every tick carries: proof the collector kept delivering while
-#: one mount hung.
-COMPANION_METRIC = "memory_used_percent"
-ACTIVITY_METRICS = frozenset({UNAVAILABLE, USED, COMPANION_METRIC})
 PRIMARY = "shared"
 OTHER = "other"
 DETECTION_BUDGET = 420
@@ -292,10 +300,23 @@ def mount_export(
 
 
 def _checked_unmount(ctx: VariantContext, node: str, name: str) -> dict[str, Any]:
+    """``cleanup --kind nfs-<name>`` on ``node``; the receipt must be clean for its scope.
+
+    The probe answers for the named mount only -- its mount, its deadman timer,
+    its mount point -- and leaves the module and the run directory to the run's
+    last cleanup (the receipt's ``scope.run_level``), so in a two-mount run the
+    still-mounted sibling is never this entry's residue (live 2026-10-26,
+    ``healthy_other_mount``: the LIFO stack unmounted ``other`` first and a
+    run-scoped check blamed that entry for ``shared``, its timer and the module).
+    """
+
     value = ctx.shared("cleanup", "--kind", f"nfs-{name}", node=node, timeout=300)
     if value.get("clean") is not True:
+        scope = value.get("scope") or {}
+        level = "run-level" if scope.get("run_level") else "mount-scoped"
         raise RegionalFixtureError(
-            f"the shared mount cleanup on {node} left residue: {value.get('residue')}"
+            f"the shared mount cleanup of {name} on {node} ({level}) left residue: "
+            f"{value.get('residue')}"
         )
     return value
 
@@ -338,57 +359,6 @@ def _hung(reading: dict[str, Any]) -> bool:
 # --------------------------------------------------------------------------- #
 # product records, per node
 # --------------------------------------------------------------------------- #
-def _activity(
-    ctx: VariantContext,
-    node: str,
-    since: datetime,
-    *,
-    mount: str | None = None,
-    metrics: Iterable[str] = ACTIVITY_METRICS,
-) -> dict[str, Any]:
-    keys = (
-        [signal_key(ctx.settings.regional.cluster_id, node, UNAVAILABLE, mount)]
-        if mount
-        else []
-    )
-    return node_activity(
-        ctx.regional,
-        ctx.settings.regional.cluster_id,
-        node,
-        since,
-        metrics=metrics,
-        signal_keys=keys,
-    )
-
-
-def baseline_readings(
-    activity: dict[str, Any], metric: str, mount: str
-) -> list[dict[str, Any]]:
-    """The product's accepted readings of ``metric`` for ``mount`` inside the read.
-
-    Evidence batch samples first, then the latest-wins record when it moved
-    inside the window (``latest_samples``). A mount that appears *healthy* is
-    no edge for the host collector (``_edge_reasons``: a threshold crossing, a
-    collection error, the collector's own first tick, a cleared reason), so its
-    first readings travel with the next health summary -- a batch
-    ``app/ingest/telemetry.py`` by design never writes as raw evidence (no
-    finding, no collection error). What that batch does move is the
-    ``metric_latest`` record of every ``LATEST_METRICS_REQUIRED`` sample, both
-    shared metrics among them: in a quiet window it is the product's only
-    per-mount witness. Live 2026-10-26, both lanes, every 005 variant: the
-    export was mounted and read healthy, the summaries moved those records, and
-    an evidence-only read called the export "not discovered".
-    """
-
-    evidence = [
-        {**item, "record": "evidence"}
-        for item in samples(activity, metric, device=mount)
-    ]
-    latest = [
-        {**item, "record": "metric_latest"}
-        for item in latest_samples(activity, metric, device=mount)
-    ]
-    return evidence + latest
 
 
 def _baseline_view(activity: dict[str, Any], mount: str) -> dict[str, Any]:
@@ -462,7 +432,7 @@ def await_baseline(
     seen: dict[str, Any] = {}
 
     def accept() -> dict[str, Any] | None:
-        current = _activity(ctx, node, since, mount=mount)
+        current = read_activity(ctx, node, since, mount=mount)
         seen.clear()
         seen.update(_baseline_view(current, mount))
         zero = [
@@ -507,7 +477,7 @@ def wait_finding(
 
     def accept() -> dict[str, Any] | None:
         nonlocal last
-        last = _activity(ctx, node, since, mount=mount)
+        last = read_activity(ctx, node, since, mount=mount)
         if validation is not None:
             ready = chain_judgeable(last, metric, device=mount, validation=validation)
         else:
@@ -539,45 +509,6 @@ def wait_quiet(
     )
 
 
-def await_clear(
-    ctx: VariantContext, node: str, mount: str, since: datetime
-) -> dict[str, Any]:
-    """Fresh product evidence that the mount reads available again."""
-
-    key = signal_key(ctx.settings.regional.cluster_id, node, UNAVAILABLE, mount)
-
-    def accept() -> dict[str, Any] | None:
-        current = _activity(ctx, node, since, mount=mount)
-        fresh = [
-            item
-            for item in samples(current, UNAVAILABLE, device=mount)
-            if item.get("value") == 0
-        ]
-        signal = (current.get("health_signals") or {}).get(key) or {}
-        observed = parse_time(signal.get("observed_at"))
-        cleared = signal.get("active") is False and (
-            observed is not None and observed >= since
-        )
-        if len(fresh) >= 2 or (fresh and cleared):
-            return {"samples": fresh, "health_signal": signal}
-        return None
-
-    value = ctx.wait_until(
-        accept,
-        timeout_seconds=ctx.host_summary * 2 + ctx.host_interval * 6,
-        poll_seconds=ctx.host_interval,
-        name=f"recovery-{node}",
-    )
-    if value is None:
-        return {
-            "errors": [
-                f"{UNAVAILABLE} on {mount} ({node}) did not recover: no fresh 0 "
-                "reading with a cleared health signal, nor two fresh readings"
-            ]
-        }
-    return {"errors": [], **value}
-
-
 def wait_all_settled(
     ctx: VariantContext, node: str, since: datetime, incident_ids: list[str]
 ) -> dict[str, Any]:
@@ -585,7 +516,7 @@ def wait_all_settled(
 
     def accept() -> dict[str, Any] | None:
         nonlocal last
-        last = _activity(ctx, node, since)
+        last = read_activity(ctx, node, since)
         return last if settled(last, incident_ids) else None
 
     value = ctx.wait_until(
@@ -616,36 +547,6 @@ def diagnostic_chain(activity: dict[str, Any], metric: str, mount: str) -> list[
             incident_states=DIAGNOSTIC_ONLY_STATES,
         ),
     )
-
-
-def delivery_errors(activity: dict[str, Any], since: datetime) -> list[str]:
-    """The collector kept delivering bounded batches while a mount hung."""
-
-    batches = [
-        item
-        for item in activity.get("batches") or []
-        if (moment := parse_time(item.get("observed_at"))) is not None
-        and moment >= since
-    ]
-    with_companion = [
-        item
-        for item in batches
-        if any(
-            sample.get("name") == COMPANION_METRIC
-            for sample in item.get("samples") or []
-        )
-    ]
-    errors = []
-    if len(batches) < 2:
-        errors.append(
-            f"only {len(batches)} host batch(es) were accepted after the injection"
-        )
-    if not with_companion:
-        errors.append(
-            f"no host batch after the injection carried {COMPANION_METRIC}: the hung "
-            "mount stalled the collector's other metrics"
-        )
-    return errors
 
 
 def other_mount_errors(
@@ -955,18 +856,29 @@ def _hang_and_detect(
 
 
 def stat_timeout(ctx: VariantContext) -> dict[str, Any]:
+    """The export hangs: the finding, the delivery under the held hang, the recovery.
+
+    The hang is held past the finding until the collector's next scheduled
+    delivery is in the store (``hold_hang_until_delivered``), the stages are
+    graded on that last read under the hang -- no post-resume batch can be in
+    it -- and the recovery's ``since`` is stamped before the resume.
+    """
+
     server, mount, _since = _prepare(ctx)
-    started, detection = _hang_and_detect(ctx, server, mount)
-    stages = {
-        "chain": diagnostic_chain(detection, UNAVAILABLE, mount),
-        "bounded_delivery": delivery_errors(detection, started),
-        "hardware": hardware_errors(detection),
-    }
-    incidents = _incident_ids(detection, UNAVAILABLE, mount)
+    node = ctx.settings.node
+    started, _detection = _hang_and_detect(ctx, server, mount)
+    held = hold_hang_until_delivered(ctx, node, mount, started, name="hang-delivery")
+    undo_since = utc_now()
     _resume(ctx, server, "a")
-    recovered = await_clear(ctx, ctx.settings.node, mount, utc_now())
+    stages = {
+        "chain": diagnostic_chain(held, UNAVAILABLE, mount),
+        "bounded_delivery": delivery_errors(held, started),
+        "hardware": hardware_errors(held),
+    }
+    incidents = _incident_ids(held, UNAVAILABLE, mount)
+    recovered = await_clear(ctx, node, mount, undo_since)
     stages["recovery"] = list(recovered["errors"])
-    wait_all_settled(ctx, ctx.settings.node, started, incidents)
+    wait_all_settled(ctx, node, started, incidents)
     return _result(stages, extra={"mount": mount, "recovery": recovered})
 
 
@@ -1010,10 +922,11 @@ def capacity_full(ctx: VariantContext) -> dict[str, Any]:
         "hardware": hardware_errors(detection),
     }
     incidents = _incident_ids(detection, USED, mount)
+    undo_since = utc_now()
     unfilled = ctx.shared("nfs-unfill", "--name", PRIMARY, timeout=240)
     ctx.cleanup.discard("unfill")
     ctx.evidence.write("unfill", unfilled)
-    recovered = _await_used_recovery(ctx, node, mount, utc_now())
+    recovered = await_used_recovery(ctx, node, mount, undo_since)
     stages["recovery"] = list(recovered["errors"])
     wait_all_settled(ctx, node, started, incidents)
     return _result(
@@ -1043,29 +956,6 @@ def _short_fill(filled: dict[str, Any], used: Any) -> str:
         name = errno.errorcode.get(code, "") if isinstance(code, int) else ""
         notes.append(f"{fill['error']} errno {code} {name}".rstrip())
     return f"{text} ({'; '.join(notes)})" if notes else text
-
-
-def _await_used_recovery(
-    ctx: VariantContext, node: str, mount: str, since: datetime
-) -> dict[str, Any]:
-    def accept() -> dict[str, Any] | None:
-        current = _activity(ctx, node, since, mount=mount)
-        fresh = [
-            item
-            for item in samples(current, USED, device=mount)
-            if isinstance(item.get("value"), (int, float)) and item["value"] < 98
-        ]
-        return {"samples": fresh} if fresh else None
-
-    value = ctx.wait_until(
-        accept,
-        timeout_seconds=ctx.host_summary * 2 + ctx.host_interval * 6,
-        poll_seconds=ctx.host_interval,
-        name="used-recovery",
-    )
-    if value is None:
-        return {"errors": [f"{USED} on {mount} never read below 98 % after the unfill"]}
-    return {"errors": [], **value}
 
 
 def mount_disappears(ctx: VariantContext) -> dict[str, Any]:
@@ -1105,13 +995,17 @@ def mount_disappears(ctx: VariantContext) -> dict[str, Any]:
         "hardware": hardware_errors(detection),
     }
     incidents = _incident_ids(detection, UNAVAILABLE, mount)
+    # Stamped before the remount: the recovered edge can land between the
+    # mount syscall and the probe's answer (live 2026-10-26 14:33Z; see
+    # ``general_live_shared_recovery.await_clear``).
+    undo_since = utc_now()
     remounted = ctx.shared("nfs-remount", "--name", PRIMARY, node=node, timeout=240)
     ctx.evidence.write("remount", remounted)
     if remounted.get("host_mount") is None:
         raise VariantInconclusive(
             f"the test export could not be remounted at {mount}: no recovery to prove"
         )
-    recovered = await_clear(ctx, node, mount, utc_now())
+    recovered = await_clear(ctx, node, mount, undo_since)
     stages["recovery"] = list(recovered["errors"])
     wait_all_settled(ctx, node, started, incidents)
     return _result(
@@ -1159,6 +1053,7 @@ def io_only_failure(ctx: VariantContext) -> dict[str, Any]:
         "hardware": hardware_errors(detection),
     }
     incidents = _incident_ids(detection, UNAVAILABLE, mount)
+    undo_since = utc_now()
     restored = server.set_export_mode("1777")
     ctx.cleanup.discard("export-a-mode")
     proof = ctx.shared(
@@ -1169,7 +1064,7 @@ def io_only_failure(ctx: VariantContext) -> dict[str, Any]:
         if (proof.get("io") or {}).get("ok")
         else ["I/O did not recover after chmod 1777"]
     )
-    recovered = await_clear(ctx, node, mount, utc_now())
+    recovered = await_clear(ctx, node, mount, undo_since)
     stages["recovery"] = list(recovered["errors"])
     wait_all_settled(ctx, node, started, incidents)
     return _result(
@@ -1184,6 +1079,14 @@ def io_only_failure(ctx: VariantContext) -> dict[str, Any]:
 
 
 def healthy_other_mount(ctx: VariantContext) -> dict[str, Any]:
+    """One export hangs while a second stays healthy on the same node.
+
+    The hang is held past the finding until the collector's next scheduled
+    delivery is in the store (``hold_hang_until_delivered``); the stages are
+    graded on that last read under the hang, which the resume closes, and the
+    recovery's ``since`` is stamped before the resume.
+    """
+
     node = ctx.settings.node
     _require_client(ctx, node)
     server_a = start_export(ctx, "a", [node])
@@ -1194,25 +1097,27 @@ def healthy_other_mount(ctx: VariantContext) -> dict[str, Any]:
     mount, other = mount_path(ctx, PRIMARY), mount_path(ctx, OTHER)
     ctx.evidence.write("baseline-shared", await_baseline(ctx, node, mount, since))
     ctx.evidence.write("baseline-other", await_baseline(ctx, node, other, since))
-    started, detection = _hang_and_detect(ctx, server_a, mount)
+    started, _detection = _hang_and_detect(ctx, server_a, mount)
     healthy = _stat(ctx, node, OTHER)
     if _hung(healthy):
         _resume(ctx, server_a, "a")
         raise VariantInconclusive(
             f"the second export hung too ({healthy}); no healthy control"
         )
-    stages = {
-        "chain": diagnostic_chain(detection, UNAVAILABLE, mount),
-        "other_not_graded": chain_errors(
-            detection, ChainExpectation(metric=UNAVAILABLE, device=other, present=False)
-        ),
-        "other_still_reported": other_mount_errors(detection, other, started),
-        "bounded_delivery": delivery_errors(detection, started),
-        "hardware": hardware_errors(detection),
-    }
-    incidents = _incident_ids(detection, UNAVAILABLE, mount)
+    held = hold_hang_until_delivered(ctx, node, mount, started, name="hang-delivery")
+    undo_since = utc_now()
     _resume(ctx, server_a, "a")
-    recovered = await_clear(ctx, node, mount, utc_now())
+    stages = {
+        "chain": diagnostic_chain(held, UNAVAILABLE, mount),
+        "other_not_graded": chain_errors(
+            held, ChainExpectation(metric=UNAVAILABLE, device=other, present=False)
+        ),
+        "other_still_reported": other_mount_errors(held, other, started),
+        "bounded_delivery": delivery_errors(held, started),
+        "hardware": hardware_errors(held),
+    }
+    incidents = _incident_ids(held, UNAVAILABLE, mount)
+    recovered = await_clear(ctx, node, mount, undo_since)
     stages["recovery"] = list(recovered["errors"])
     wait_all_settled(ctx, node, started, incidents)
     return _result(
@@ -1270,7 +1175,7 @@ def _await_domain_recovered(
     """The failure-domain record cleared RECOVERED once both nodes reported 0."""
 
     def accept() -> str | None:
-        state = domain_state(_activity(ctx, node, since), domain_id)
+        state = domain_state(read_activity(ctx, node, since), domain_id)
         return state if state == "RECOVERED" else None
 
     value = ctx.wait_until(
@@ -1324,7 +1229,8 @@ def shared_failure_domain(ctx: VariantContext) -> dict[str, Any]:
     # Both findings exist (or the budget ran out): read both nodes again so the
     # record the second activation created is in both views.
     activities = {
-        client: _activity(ctx, client, started, mount=mount) for client in (node, peer)
+        client: read_activity(ctx, client, started, mount=mount)
+        for client in (node, peer)
     }
     node_incidents = {
         client: _incident_ids(activity, UNAVAILABLE, mount)
@@ -1338,8 +1244,8 @@ def shared_failure_domain(ctx: VariantContext) -> dict[str, Any]:
         activities, (node, peer), export, node_incidents
     )
     records = domain_records(activities, export)
-    _resume(ctx, server, "a")
     resumed_at = utc_now()
+    _resume(ctx, server, "a")
     for client, activity in activities.items():
         recovered = await_clear(ctx, client, mount, resumed_at)
         stages[f"recovery@{client}"] = list(recovered["errors"])
@@ -1422,7 +1328,8 @@ VARIANTS = [
     _spec(
         "stat_timeout",
         "a test NFSv4 export (userspace server Pod over a 256 MiB tmpfs) mounted soft "
-        "on the node, discovered by fstype; SIGSTOP the server so every statvfs hangs",
+        "on the node, discovered by fstype; SIGSTOP the server so every statvfs hangs, "
+        "held across the collector's next health summary",
         f"{UNAVAILABLE}=1 -> FREEZE_EVIDENCE, VALIDATE_HOST failing on it; other host "
         "metrics keep arriving (bounded statvfs); no isolation/hardware; 0 again on SIGCONT",
         stat_timeout,
@@ -1457,7 +1364,8 @@ VARIANTS = [
     ),
     _spec(
         "healthy_other_mount",
-        "two test exports mounted; SIGSTOP only the first",
+        "two test exports mounted; SIGSTOP only the first, held across the collector's "
+        "next health summary",
         f"{UNAVAILABLE}=1 on the hung mount -> VALIDATE_HOST fails on it despite the "
         "healthy second mount, which stays reported 0 and mints nothing",
         healthy_other_mount,

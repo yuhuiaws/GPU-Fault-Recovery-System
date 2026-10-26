@@ -25,6 +25,7 @@ from typing import Any
 import pytest
 
 from scripts.e2e.regional import general_live_shared as shared
+from scripts.e2e.regional import general_live_shared_recovery as recovery
 from scripts.e2e.regional.general_live_fixture import VariantInconclusive, VariantNotRun
 from scripts.e2e.regional.host_probe_fixture import HostProbeError
 from scripts.e2e.regional.regional_commands import RegionalFixtureError
@@ -265,7 +266,7 @@ def hang_activity(
     """
 
     companion_sample = (
-        [sample(shared.COMPANION_METRIC, None, 40.0)] if companion else []
+        [sample(recovery.COMPANION_METRIC, None, 40.0)] if companion else []
     )
     other_samples = [sample(shared.UNAVAILABLE, other, 0.0)] if other else []
     identity = {"source": source, "fstype": "nfs4"} if source else {}
@@ -1274,11 +1275,11 @@ def test_failure_domain_errors_read_one_record_from_both_nodes_once() -> None:
 
 def test_delivery_errors_need_two_batches_with_the_companion_metric() -> None:
     since = T0 + timedelta(minutes=1)
-    document = {"batches": [batch(2, sample(shared.COMPANION_METRIC, None, 1.0))]}
+    document = {"batches": [batch(2, sample(recovery.COMPANION_METRIC, None, 1.0))]}
     assert shared.delivery_errors(document, since), "one batch is not continuity"
     document["batches"].append(batch(3, sample(shared.UNAVAILABLE, "/m", 1.0)))
     assert shared.delivery_errors(document, since) == []
-    before = {"batches": [batch(-5, sample(shared.COMPANION_METRIC, None, 1.0))] * 2}
+    before = {"batches": [batch(-5, sample(recovery.COMPANION_METRIC, None, 1.0))] * 2}
     assert shared.delivery_errors(before, since), (
         "batches from before the injection do not count"
     )

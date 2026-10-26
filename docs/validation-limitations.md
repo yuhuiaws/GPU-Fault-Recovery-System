@@ -1871,6 +1871,79 @@ failure line, and passes the real fill and unfill readings through the real
 fixture; `tests/regional/test_general_live_shared.py` grades the short fill and
 the fill without a statvfs reading.
 
+The first live run of `healthy_other_mount` (plain EKS, release R13g) ended FAIL
+on two harness errors about a right product. (1) `bounded_delivery: only 1 host
+batch(es) were accepted after the injection`: the export was paused at 14:18:31Z,
+the finding accepted at 14:18:51Z, the export resumed at 14:19:03Z, and the
+oracle counted the host batches between the pause and the finding, wanting two.
+The host collector ships a held breach once, as its crossing's edge
+(`collect_once`: `delivery_reasons = reasons - _active_edge_reasons`), then only
+on its health summary, so a product that detects within 20 s leaves exactly one
+batch in that window and a stalled collector looks the same. `stat_timeout` and
+`healthy_other_mount` (the two variants that grade the claim) now keep the export
+paused until a second host batch after the pause is in the store -- the summary,
+kept as evidence because the finding rides along -- for at most one summary
+period plus the interval and the margin (`sustained_detection_budget(ctx, 0,
+summaries=1)`, 495 s on the site's 300 s / 15 s cadence; the polls are saved as
+`hang-delivery-timeline.json`), resume after it, and grade the delivery, the
+chain and the other mount on that last read under the hang, which no post-resume
+batch can reach; a collector the hang stalled runs the budget out and fails the
+stage. (2) `cleanup did not prove the node clean: mount-other@...: ... left
+residue: {'deadman_timers': ['...-ndeadman-nfs-shared.timer'],
+'modules_loaded_by_run': ['nfsv4'], 'mount_points': ['.../shared'], 'mounts':
+['.../shared']}` while the next entry, `mount-shared@...`, reported clean: the
+LIFO stack unmounts the second mount first and the probe's residue check was
+run-scoped, so a two-mount run always blamed the first cleanup for its
+still-mounted sibling, the sibling's deadman timer and the run's module. `cleanup
+--kind nfs-<name>` now answers for its own scope -- the mount (any NFS mount at or
+below its mount point), its deadman timer, its mount point directory -- and the
+run-level undo (unloading the module the run loaded; removing the run's root
+directory `/mnt/gfrs-live/<digest>`, which the fixture never removed before, so a
+node kept one empty directory per run) belongs to the run's last cleanup:
+`--kind all`, or the per-mount cleanup after which the state records no other
+mount (the first-mounted share's on the stack, or a deadman firing last). The
+receipt says which it was (`scope.mounts`, `scope.run_level`,
+`scope.remaining_mounts`) and what a non-last cleanup left to the last one
+(`deferred`); a run-level residue adds `modules_loaded_by_run` and `run_dir`,
+and the runner's error names the scope. The delivery hold and the recovery reads
+moved to `general_live_shared_recovery.py` (the variants module sits at the
+1500-line cap). Tests: `tests/regional/test_general_live_shared_recovery.py` (new; the
+variants module's own test file is at the 1500-line cap as well, and now
+reads `COMPANION_METRIC` from the recovery module) holds the
+hang over a scripted edge-only product (two polls, the resume after the second
+batch), runs a stalled collector out of the budget, and counts the window between
+the pause and the resume; `tests/regional/test_general_live_shared_probe.py` runs
+a two-mount LIFO cleanup without false residue, a per-mount leftover (an NFS
+mount below the mount point) still reported, the run-level leftovers (a module
+that would not unload, a run directory that is not empty) reported by the last
+cleanup alone, and its ghost-kind cleanup now asserts the per-mount scope instead
+of the run-scoped `clean=false`.
+
+The same day `mount_disappears` (plain EKS, release R13g) ended FAIL on
+`recovery: shared_filesystem_unavailable on ... did not recover: no fresh 0
+reading with a cleared health signal, nor two fresh readings` after 34 polls over
+twelve minutes -- and the product was right. The umount receipt is stamped
+14:33:25Z, the batch of 14:33:28Z carried `shared_filesystem_unavailable=1`, the
+batch of 14:33:43Z carried the recovery (`0` and a used %), and the remount
+receipt is stamped 14:33:45Z: the collector's tick landed between the mount
+syscall and the probe's answer, the variant took the recovery's `since` after
+that answer, and the only 0 evidence the product ever writes predated it (the
+recovery is one `recovered` edge, then summaries that move only the latest-metric
+record); the health signal cleared at 14:42:54Z, so `cleared` held with `fresh`
+empty. Every undo now stamps its `since` first (the remount; the SIGCONT of
+`stat_timeout`, `healthy_other_mount` and `shared_failure_domain`; the chmod back
+of `io_only_failure`; the unfill of `capacity_full`; `recovery` already did), and
+`await_clear` / `await_used_recovery` accept, besides two fresh evidence readings,
+one reading observed at or after `since` -- an evidence batch's or the
+latest-metric record's, which every accepted batch moves, summaries included --
+together with the health signal cleared at or after `since`, so a tick that beats
+the stamp by clock skew is still proven by the next summary. Tests:
+`tests/regional/test_general_live_shared_recovery.py` replays the chronology against
+`await_clear` (1.0 at T, 0.0 at T+15 s, `since` T+17 s, the signal cleared at
+T+9 min with the latest record it moved: accepted; without the record the budget
+runs out) and drives five variants' `utc_now` so that the recovered edge at
+T+45 s is fresh only against a stamp taken before the undo.
+
 004 `probe_error` has its faulting mount: the storage probe's loop +
 device-mapper device carrying FAT16 (`dm-create --fstype vfat`; the FAT region
 is read from the boot sector's BPB at build time, page-aligned inwards, and

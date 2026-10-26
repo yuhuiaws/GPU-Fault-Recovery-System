@@ -42,6 +42,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -882,18 +883,21 @@ def unload_modules(run_id: str) -> list[str]:
     return unloaded
 
 
-def residue(run_id: str) -> dict[str, Any]:
-    """The shared mounts this run still holds on the node (empty means clean)."""
+def run_root(run_id: str) -> Path:
+    """``/mnt/gfrs-live/<digest>``, the run's mount root; its last cleanup removes it."""
+
+    return MOUNT_ROOT / run_digest(run_id)
+
+
+def _below(path: str, base: str) -> bool:
+    return path == base or path.startswith(base.rstrip("/") + "/")
+
+
+def active_timers(run_id: str) -> list[str]:
+    """The run's deadman timers systemd lists active."""
 
     digest = run_digest(run_id)
-    root = str(MOUNT_ROOT / digest)
-    own = [
-        item["mountpoint"]
-        for item in mounts()
-        if item["mountpoint"].startswith(root + "/")
-        and item["fstype"].startswith("nfs")
-    ]
-    timers = [
+    return [
         line.split()[0]
         for line in run(
             [
@@ -909,17 +913,57 @@ def residue(run_id: str) -> dict[str, Any]:
         ).stdout.splitlines()
         if line.strip() and " active " in f" {line} "
     ]
+
+
+def residue(run_id: str, names: Iterable[str] | None = None) -> dict[str, Any]:
+    """What this run still holds on the node (every value empty means clean).
+
+    ``names`` scopes the check to those test mounts -- a per-mount cleanup's own
+    share: the mount (any NFS mount at or below its mount point), its deadman
+    timer, its mount point directory. Without ``names`` the check is the run's:
+    every NFS mount under the run's root, every active deadman timer of the run,
+    every mount point directory recorded or found under the root, the module
+    the run loaded, and the root directory itself (``run_dir``). Live
+    2026-10-26 (``healthy_other_mount``, two mounts): the LIFO stack ran
+    ``cleanup --kind nfs-other`` first, and the run-scoped check it made listed
+    the still-mounted sibling, its timer and the run's module as *that*
+    cleanup's residue; the verdict was forced to FAIL on a node the sibling's
+    own cleanup then left clean.
+    """
+
+    root = run_root(run_id)
     state = load_state(run_id)
-    return {
-        "mounts": own,
-        "deadman_timers": timers,
-        "mount_points": [
-            str(entry["mountpoint"])
-            for entry in state["mounts"].values()
-            if Path(str(entry["mountpoint"])).is_dir()
+    scoped = None if names is None else sorted({checked_name(n) for n in names})
+    if scoped is None:
+        bases = [f"{root}/"]
+        timers = active_timers(run_id)
+        points = {str(entry["mountpoint"]) for entry in state["mounts"].values()}
+        if root.is_dir():
+            points.update(str(path) for path in root.iterdir() if path.is_dir())
+    else:
+        bases = [str(mountpoint(run_id, name)) for name in scoped]
+        wanted = {
+            f"{unit_name(run_id, f'{DEADMAN_PREFIX}-nfs-{name}')}.timer"
+            for name in scoped
+        }
+        timers = [timer for timer in active_timers(run_id) if timer in wanted]
+        points = set(bases)
+    value: dict[str, Any] = {
+        "mounts": [
+            item["mountpoint"]
+            for item in mounts()
+            if item["fstype"].startswith("nfs")
+            and any(_below(item["mountpoint"], base) for base in bases)
         ],
-        "modules_loaded_by_run": [m for m in state["modules"] if module_loaded(m)],
+        "deadman_timers": timers,
+        "mount_points": sorted(point for point in points if Path(point).is_dir()),
     }
+    if scoped is None:
+        value["modules_loaded_by_run"] = [
+            name for name in state["modules"] if module_loaded(name)
+        ]
+        value["run_dir"] = [str(root)] if root.exists() else []
+    return value
 
 
 def residue_is_clean(value: dict[str, Any]) -> bool:
@@ -927,8 +971,18 @@ def residue_is_clean(value: dict[str, Any]) -> bool:
 
 
 def cleanup(arguments: argparse.Namespace) -> None:
-    """Unmount what ``--kind`` names (``all`` or ``nfs-<name>``), forget it,
-    disarm its deadman, unload the run's module; the deadman's entry point."""
+    """Unmount what ``--kind`` names (``all`` or ``nfs-<name>``), forget it and
+    disarm its deadman; the deadman's entry point.
+
+    A per-mount cleanup answers for its own mount only (``residue(names=...)``).
+    The run-level undo -- unloading the module the run loaded, removing the
+    run's root directory -- belongs to the run's *last* cleanup: ``all``, or the
+    per-mount cleanup after which the state records no other mount (on the
+    harness's LIFO stack the first-mounted share's; a deadman firing after the
+    others). The receipt says which this was (``scope``: the mounts in scope,
+    ``run_level``, the mounts the run still records) and, for a cleanup that is
+    not the last, what it left to the last one (``deferred``).
+    """
 
     run_id = checked_run_id(arguments.run_id)
     kind = str(arguments.kind)
@@ -939,9 +993,8 @@ def cleanup(arguments: argparse.Namespace) -> None:
     names = set(state["mounts"])
     if kind.startswith("nfs-"):
         names.add(kind[4:])
-    for name in sorted(names):
-        if kind not in {"all", f"nfs-{name}"}:
-            continue
+    scope = sorted(name for name in names if kind in {"all", f"nfs-{name}"})
+    for name in scope:
         entry = state["mounts"].get(name) or {}
         target = str(entry.get("mountpoint") or mountpoint(run_id, name))
         result = umount_cascade(target)
@@ -952,21 +1005,42 @@ def cleanup(arguments: argparse.Namespace) -> None:
         save_state(run_id, current)
         disarm_deadman(run_id, f"nfs-{name}")
         actions.append({"mount": name, "umount": result})
-    unloaded = unload_modules(run_id)
-    if unloaded:
-        actions.append({"modules_unloaded": unloaded})
-    if kind == "all":
-        own = MOUNT_ROOT / run_digest(run_id)
-        if own.is_dir() and not any(own.iterdir()):
-            own.rmdir()
-    remaining = residue(run_id)
+    remaining = sorted(load_state(run_id)["mounts"])
+    last = kind == "all" or not remaining
+    deferred: dict[str, Any] | None = None
+    if last:
+        unloaded = unload_modules(run_id)
+        if unloaded:
+            actions.append({"modules_unloaded": unloaded})
+        root = run_root(run_id)
+        if root.is_dir() and not any(root.iterdir()):
+            root.rmdir()
+            actions.append({"run_dir_removed": str(root)})
+        left = residue(run_id)
+    else:
+        deferred = {
+            "to": "the run's last cleanup",
+            "remaining_mounts": remaining,
+            "items": [
+                "modules_loaded_by_run",
+                "run_dir",
+                "deadman_timers of the remaining mounts",
+            ],
+        }
+        left = residue(run_id, names=scope)
     emit(
         {
             "run_id": run_id,
             "kind": kind,
+            "scope": {
+                "mounts": scope,
+                "run_level": last,
+                "remaining_mounts": remaining,
+            },
             "actions": actions,
-            "residue": remaining,
-            "clean": residue_is_clean(remaining),
+            "deferred": deferred,
+            "residue": left,
+            "clean": residue_is_clean(left),
         }
     )
 

@@ -374,6 +374,35 @@ withheld` 收场而无任何证据文件：填充片段无论成败都打印 `er
 errno 28 ENOSPC)")`——而非失败调用；真正的失败调用（读数超出子进程上界、片段未输出 JSON、清除无法删除
 填充文件）抛带 reason token 的 `ProbeError`（`fill_timeout`、`fill_unreadable`、`unfill_timeout`、
 `unfill_unreadable`、`unfill_failed`），夹具展示该 token 并把消息与读数记入 `probe-error.json`。
+`healthy_other_mount` 首次实况（plain EKS，R13g）FAIL 于两处判定侧错误，而产品是对的。其一
+`bounded_delivery: only 1 host batch(es) were accepted after the injection`：export 14:18:31Z 暂停、finding
+14:18:51Z 被接受、export 14:19:03Z 恢复，oracle 数的是暂停到 finding 之间的 host batch 并要求两条；host collector
+对持续的越界只送一次（越界时刻的边沿，`collect_once`：`delivery_reasons = reasons - _active_edge_reasons`），
+之后只随 health summary 送达，于是 20 s 内检出的产品在该窗口里恰好只有一条 batch，与被挂起拖停的 collector
+无从区分。修正：`stat_timeout` 与 `healthy_other_mount`（判定该主张的两个变体）在 finding 之后继续保持 export
+暂停，直到暂停之后的第二条 host batch 进入 store（即 summary——finding 随行，故被存为证据），预算为一个 summary
+周期加 interval 加余量（`sustained_detection_budget(ctx, 0, summaries=1)`，站点 300 s / 15 s 节拍下 495 s；
+轮询记入 `hang-delivery-timeline.json`），之后才恢复，并以挂起期间的最后一次读数判定送达、链与第二挂载；被拖停的
+collector 耗尽预算即 FAIL 该阶段。其二 `cleanup did not prove the node clean: mount-other@...: ... left residue:
+{... nfs-shared.timer, nfsv4, .../shared}` 而紧随的 `mount-shared@...` 报告 clean：LIFO 栈先卸第二个挂载，而探针的
+残留检查按整个 run 计，双挂载 run 必然把仍挂着的兄弟挂载、其 deadman timer 与 run 加载的模块算到第一次清理头上。
+修正：`cleanup --kind nfs-<name>` 只对自己的范围负责——该挂载（挂载点及其下的任何 NFS 挂载）、其 deadman timer、
+其挂载点目录；run 级撤销（卸载 run 加载的模块、删除 run 根目录 `/mnt/gfrs-live/<digest>`——此前夹具从不删除，
+节点上每个 run 留下一个空目录）归 run 的最后一次清理：`--kind all`，或清理后 state 已不记录其他挂载的那次按挂载
+清理（栈上即最先挂载者的那次，或最后触发的 deadman）。回执写明归属（`scope.mounts`、`scope.run_level`、
+`scope.remaining_mounts`）与非最后一次清理留给最后一次的内容（`deferred`），run 级残留另有
+`modules_loaded_by_run` 与 `run_dir`；runner 的报错也带范围。送达保持与恢复读数迁入
+`general_live_shared_recovery.py`（变体模块已到 1500 行上限）。同日 `mount_disappears`（plain EKS，R13g）FAIL 于
+`recovery: ... did not recover: no fresh 0 reading with a cleared health signal, nor two fresh readings`
+（12 分钟 34 次轮询）而产品是对的：umount 回执 14:33:25Z，14:33:28Z 的 batch 带 `shared_filesystem_unavailable=1`，
+14:33:43Z 的 batch 带恢复读数（0 与 used %），remount 回执 14:33:45Z——collector 的 tick 落在 mount 系统调用与探针
+应答之间，而变体在应答之后才取恢复判定的 `since`，产品唯一会写的 0 证据因此早于它（恢复是一条 `recovered` 边沿，
+之后只有移动 latest 记录的 summary）；health signal 于 14:42:54Z 清除，`cleared` 为真而 `fresh` 为空。修正：每个
+撤销先盖 `since` 再动手（remount、`stat_timeout`/`healthy_other_mount`/`shared_failure_domain` 的 SIGCONT、
+`io_only_failure` 的 chmod 回退、`capacity_full` 的 unfill；`recovery` 原本就如此），且
+`await_clear`/`await_used_recovery` 除两条新鲜证据读数外，也接受一条 `since` 之后观测到的读数（证据 batch 的，或
+每条被接受的 batch——含 summary——都会移动的 latest 记录的）加上 `since` 之后清除的 health signal，时钟偏差抢在
+盖戳之前的 tick 由下一次 summary 证明。
 计划/执行形如：
 
 ```bash
