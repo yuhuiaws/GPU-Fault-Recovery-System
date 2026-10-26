@@ -138,11 +138,14 @@ def test_volatile_dbe_quarantines_without_reset(
         action="QUARANTINE",
         workflow="wf-q",
     )
+    # An ended record is judged on executed steps (live 2026-10-26: a record
+    # that only planned them passed the chain): the containment ran.
     workflow = gpu_workflow(
         "wf-q",
         "inc-dbe",
         ["FREEZE_EVIDENCE", "MARK_UNSCHEDULABLE", "QUARANTINE"],
         status="BLOCKED",
+        executions=_succeeded("FREEZE_EVIDENCE", "MARK_UNSCHEDULABLE", "QUARANTINE"),
     )
     activity = _activity([incident], [workflow])
     restored = {}
@@ -235,6 +238,17 @@ def test_deferred_variants_record_their_reason() -> None:
         assert spec.execute is None
 
 
+def _succeeded(*operations: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "operation": operation,
+            "status": "SUCCEEDED",
+            "updated_at": f"2026-10-24T00:03:{index:02d}+00:00",
+        }
+        for index, operation in enumerate(operations)
+    ]
+
+
 def _activity(incidents: list, workflows: list) -> dict[str, Any]:
     return {
         "incidents": incidents,
@@ -265,6 +279,8 @@ REMAP_OPERATIONS = [
 
 
 def _isolated_node(incident_id: str) -> dict[str, Any]:
+    from gpu_fault.adapters.common import quarantine_taint_value
+
     return {
         "name": NODE,
         "uid": "node-uid",
@@ -274,7 +290,7 @@ def _isolated_node(incident_id: str) -> dict[str, Any]:
         "taints": [
             {
                 "key": "gpu-fault.io/quarantined",
-                "value": "q-digest",
+                "value": quarantine_taint_value(incident_id),
                 "effect": "NoSchedule",
             }
         ],
@@ -317,6 +333,7 @@ class OperatorExitProduct:
         close: dict[str, Any] | None = None,
         release_node: bool = True,
         after_close: dict[str, dict[str, Any]] | None = None,
+        activity: Any = None,
     ) -> None:
         self.regional = regional
         self.incident = {
@@ -324,12 +341,16 @@ class OperatorExitProduct:
             "cluster_id": "gpu-eks-cluster",
             "state": settled_state,
         }
-        self.workflow = {**workflow, "blocked_kind": "NEEDS_OPERATOR"}
+        self.workflow = {"blocked_kind": "NEEDS_OPERATOR", **workflow}
         self.close = close or {"closed": True, "refusal": None, "state": "RECOVERED"}
         self.release_node = release_node
         self.after_close = after_close or {}
         self.calls: list[tuple[str, tuple[str, ...]]] = []
-        self.inner = gpu_cpu_python(activity=_activity([incident], [workflow]))
+        self.inner = gpu_cpu_python(
+            activity=activity
+            if activity is not None
+            else _activity([incident], [workflow])
+        )
 
     def __call__(self, script: str, *arguments: str) -> dict[str, Any]:
         from scripts.e2e.regional import warm_spare_fixture as warm
@@ -373,7 +394,29 @@ class OperatorExitProduct:
         raise AssertionError(f"the operator exit must never run {name}")
 
 
-def _remap_ctx(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **product: Any):
+#: The record live 2026-10-26 06:25Z left behind: BLOCKED at compile time (no
+#: executable owner for memoryDiagnostics), superseded by the dispatcher sweep
+#: 35 ms later, no step ever executed, no command ever reached the node.
+HOLLOW_RECORD = {
+    "status": "SUPERSEDED",
+    "blocked_kind": "NEEDS_OPERATOR",
+    "blocked_reasons": ["no executable owner for memoryDiagnostics"],
+    "preemption_reason": (
+        "dispatcher reconciliation: closed compile-time BLOCKED workflow that never "
+        'changed a node; blocked_reasons=["no executable owner for memoryDiagnostics"]'
+    ),
+    "step_executions": [],
+}
+
+
+def _remap_ctx(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    record: dict[str, Any] | None = None,
+    node: dict[str, Any] | None = None,
+    **product: Any,
+):
     from scripts.e2e.regional import general_live_common as common
     from tests.regional._general_live_fakes import store_poll_clock
 
@@ -384,8 +427,26 @@ def _remap_ctx(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **product: Any):
         action="DRAIN",
         workflow="wf-drain",
     )
-    workflow = gpu_workflow("wf-drain", "inc-remap", REMAP_OPERATIONS, status="BLOCKED")
-    regional = FakeRegional(node_snapshot=_isolated_node("inc-remap"))
+    # The default record executed its containment and parked NEEDS_OPERATOR
+    # (the post-b192 shape); ``record`` overrides fields of it.
+    workflow = {
+        **gpu_workflow(
+            "wf-drain",
+            "inc-remap",
+            REMAP_OPERATIONS,
+            status="BLOCKED",
+            executions=_succeeded(
+                "FREEZE_EVIDENCE",
+                "MARK_UNSCHEDULABLE",
+                "QUARANTINE",
+                "COLLECT_DIAGNOSTIC_BUNDLE",
+                "VALIDATE_GPU",
+                "ESCALATE_SUPPORT",
+            ),
+        ),
+        **(record or {}),
+    }
+    regional = FakeRegional(node_snapshot=node or _isolated_node("inc-remap"))
     cpu = OperatorExitProduct(regional, incident, workflow, **product)
     regional.cpu_python_responder = cpu
     spec = SPECS["remap_failure"]
@@ -577,3 +638,118 @@ def test_operator_exit_problems_follow_the_products_open_workflow_rule() -> None
     ), problems
     assert any("taints gpu-fault.io/quarantined" in p for p in problems), problems
     assert any("still cordoned" in p for p in problems), problems
+
+
+def test_remap_failure_hollow_chain_fails_the_chain_and_closes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live 2026-10-26 06:22-06:27Z: the record planned the whole DRAIN chain
+    and executed none of it (compile-time BLOCKED, superseded 35 ms later); no
+    command reached the node, which stayed clean. The chain stage used to read
+    PASS from the planned steps; the operator exit would then have closed an
+    escalation whose chain never ran."""
+
+    ctx, product = _remap_ctx(tmp_path, monkeypatch, record=HOLLOW_RECORD, node=None)
+    ctx.regional.node_snapshot_value = _released_node()
+    out = mem.remap_failure(ctx)
+    assert out["verdict"] == "FAIL", out
+    assert out["stages"]["chain"] == [
+        f"row_remap_failure on {GPU} chain planned but never executed: compile-time "
+        "BLOCKED (no executable owner for memoryDiagnostics)"
+    ], out["stages"]["chain"]
+    assert out["stages"]["hardware"] == [], out["stages"]["hardware"]
+    (recovery,) = out["stages"]["recovery"]
+    assert "chain never isolated the node" in recovery, recovery
+    assert "not cordoned" in recovery and "names no incident" in recovery, recovery
+    names = [name for name, _ in product.calls]
+    assert "close" not in names and "restore" not in names, (
+        "nothing is closed or restored on a node the chain never isolated"
+    )
+    assert names.count("settle") == 1, names
+    assert out["operator_exit"] == [], "no exit record: the stage stopped first"
+    exit_evidence = json.loads((ctx.case_dir / "operator-exit.json").read_text())
+    assert exit_evidence["results"][0]["node_before"] == {
+        "ownership_annotations": {},
+        "taints": [],
+        "unschedulable": False,
+    }, exit_evidence
+
+
+def test_remap_failure_unisolated_node_is_a_recovery_error_before_the_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The record says the containment ran, the node says otherwise: the node
+    # is the proof, and the close is never attempted.
+    ctx, product = _remap_ctx(tmp_path, monkeypatch, node=_released_node())
+    out = mem.remap_failure(ctx)
+    assert out["verdict"] == "FAIL", out
+    assert out["stages"]["chain"] == [], out["stages"]["chain"]
+    (recovery,) = out["stages"]["recovery"]
+    assert recovery.startswith(
+        "operator close failed: RegionalFixtureError: chain never isolated the node"
+    ), recovery
+    assert "not cordoned" in recovery, recovery
+    assert "no gpu-fault.io/quarantined taint of the incident" in recovery, recovery
+    assert "gpu-fault.io/incident-id names no incident" in recovery, recovery
+    assert "close" not in [name for name, _ in product.calls], "never closed"
+
+
+def test_remap_failure_containment_owned_by_another_incident_is_not_the_chains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx, product = _remap_ctx(tmp_path, monkeypatch, node=_isolated_node("inc-other"))
+    out = mem.remap_failure(ctx)
+    (recovery,) = out["stages"]["recovery"]
+    assert "chain never isolated the node" in recovery, recovery
+    assert "the taint present is another incident's" in recovery, recovery
+    assert "gpu-fault.io/incident-id names inc-other" in recovery, recovery
+    assert "not cordoned" not in recovery, "the cordon is there; the ownership is not"
+    assert "close" not in [name for name, _ in product.calls], "never closed"
+
+
+def test_remap_failure_detection_waits_for_the_executed_containment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first read shows the record RUNNING with FREEZE_EVIDENCE done; the
+    chain is judged only once MARK_UNSCHEDULABLE and QUARANTINE have executed."""
+
+    incident = gpu_incident(
+        "inc-remap",
+        f"b-{GPU}-row_remap_failure",
+        state="ACTION_PENDING",
+        action="DRAIN",
+        workflow="wf-drain",
+    )
+    running = gpu_workflow(
+        "wf-drain",
+        "inc-remap",
+        REMAP_OPERATIONS,
+        status="RUNNING",
+        executions=_succeeded("FREEZE_EVIDENCE"),
+    )
+    contained = {
+        **running,
+        "status": "BLOCKED",
+        "blocked_kind": "NEEDS_OPERATOR",
+        "step_executions": _succeeded(
+            "FREEZE_EVIDENCE", "MARK_UNSCHEDULABLE", "QUARANTINE"
+        ),
+    }
+    escalated = {**incident, "state": "ESCALATED"}
+    ctx, product = _remap_ctx(
+        tmp_path,
+        monkeypatch,
+        activity=[
+            _activity([incident], [running]),
+            _activity([incident], [running]),
+            _activity([escalated], [contained]),
+        ],
+    )
+    out = mem.remap_failure(ctx)
+    assert out["verdict"] == "PASS", out["errors"]
+    timeline = json.loads((ctx.case_dir / "detection-timeline.json").read_text())
+    accepted = [entry["accepted"] for entry in timeline["entries"]]
+    assert accepted == [False, False, True], (
+        f"the incident alone does not end the detection wait: {accepted}"
+    )
+    assert [name for name, _ in product.calls].count("close") == 1, product.calls

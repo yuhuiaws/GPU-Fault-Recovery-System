@@ -8,7 +8,12 @@ reads the product's own grading (``gpu_metrics`` -> ``gpu_memory_policy``):
   RUN_DIAGNOSTICS (DIAGNOSTIC_ONLY): a VALIDATE_GPU that isolates nothing and
   resets nothing, cleared by a fresh zero-delta batch;
 * ``volatile_dbe`` is CRITICAL QUARANTINE: the node is isolated (no reset)
-  and read back through the product's validated restore;
+  and read back through the product's validated restore. Its chain and
+  ``remap_failure``'s are judged on executed steps: detection waits until the
+  isolating steps have run or the record has ended (``chain_executed``), and a
+  record that planned MARK_UNSCHEDULABLE/QUARANTINE and never executed them --
+  the compile-time BLOCKED record live 2026-10-26, superseded 35 ms after
+  creation with nothing ever reaching the node -- fails the chain stage;
 * ``remap_failure`` is CRITICAL DRAIN with the NVIDIA RMA field diagnostic and
   ESCALATE_SUPPORT -- the node stays cordoned until an operator closes it, and
   a field diagnosis is never read as "hardware already replaced". The variant
@@ -52,6 +57,7 @@ from scripts.e2e.regional.general_live_gpu_replay import (
 from scripts.e2e.regional.general_live_gpu_verdicts import (
     GpuChain,
     chain_errors,
+    chain_executed,
     metric_incidents,
     read_only_errors,
     settled,
@@ -138,6 +144,44 @@ def retired_delta(ctx: VariantContext) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # volatile DBE: CRITICAL QUARANTINE (isolation, no reset)
 # --------------------------------------------------------------------------- #
+#: The containment steps of the isolating variants execute seconds after the
+#: incident is minted; this is what the detection wait grants them on top of
+#: the detection budget before the chain is judged on executions.
+CONTAINMENT_SECONDS = 180
+
+
+def _wait_contained(
+    ctx: VariantContext,
+    since: Any,
+    canonical: str,
+    gpu: str,
+    chain: GpuChain,
+    *,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    """Detection that waits until the chain can be judged on executed steps.
+
+    The incident alone is not enough: the record is judged on what it executed
+    (``chain_errors`` / ``never_executed_errors``), so the wait ends once the
+    isolating steps have a terminal execution or the record has ended
+    (``chain_executed``) -- the compile-time BLOCKED record of live 2026-10-26
+    ended at once and reads as the hollow chain it was.
+    """
+
+    def contained(doc: dict[str, Any]) -> list[dict[str, Any]]:
+        found = metric_incidents(doc, canonical, gpu=gpu)
+        return found if found and chain_executed(doc, found, chain) else []
+
+    return wait_gpu_incident(
+        ctx,
+        since,
+        contained,
+        metrics=(canonical,),
+        timeout_seconds=timeout_seconds,
+        name="detection",
+    )
+
+
 def volatile_dbe(ctx: VariantContext) -> dict[str, Any]:
     survey = run_gpu_survey(ctx)
     gpu = survey.target("ecc_dbe_volatile_total")
@@ -152,27 +196,24 @@ def volatile_dbe(ctx: VariantContext) -> dict[str, Any]:
         _hold_seconds(ctx),
     )
     arm_and_confirm(replay, f"{gpu}/ecc_dbe_volatile_total")
-    detection = wait_gpu_incident(
+    chain = GpuChain(
+        label=f"ecc_dbe_volatile_total on {gpu}",
+        operations=("FREEZE_EVIDENCE", "MARK_UNSCHEDULABLE", "QUARANTINE"),
+        forbidden=RESET,
+        actions=frozenset({"QUARANTINE"}),
+        incident_states=frozenset({"QUARANTINED", "ACTION_PENDING"}),
+    )
+    detection = _wait_contained(
         ctx,
         since,
-        lambda doc: metric_incidents(doc, "ecc_dbe_volatile_total", gpu=gpu),
-        metrics=("ecc_dbe_volatile_total",),
-        timeout_seconds=survey.health_summary + 240,
-        name="detection",
+        "ecc_dbe_volatile_total",
+        gpu,
+        chain,
+        timeout_seconds=survey.health_summary + 240 + CONTAINMENT_SECONDS,
     )
     incidents = metric_incidents(detection, "ecc_dbe_volatile_total", gpu=gpu)
     stages = {
-        "chain": chain_errors(
-            detection,
-            incidents,
-            GpuChain(
-                label=f"ecc_dbe_volatile_total on {gpu}",
-                operations=("FREEZE_EVIDENCE", "MARK_UNSCHEDULABLE", "QUARANTINE"),
-                forbidden=RESET,
-                actions=frozenset({"QUARANTINE"}),
-                incident_states=frozenset({"QUARANTINED", "ACTION_PENDING"}),
-            ),
-        ),
+        "chain": chain_errors(detection, incidents, chain),
         "hardware": no_hardware(detection),
     }
     # The replay stops asserting so the node's real value (0) returns, then the
@@ -202,28 +243,23 @@ def remap_failure(ctx: VariantContext) -> dict[str, Any]:
         _hold_seconds(ctx),
     )
     arm_and_confirm(replay, f"{gpu}/row_remap_failure")
-    detection = wait_gpu_incident(
+    chain = GpuChain(
+        label=f"row_remap_failure on {gpu}",
+        operations=("FREEZE_EVIDENCE", "MARK_UNSCHEDULABLE", "QUARANTINE"),
+        forbidden=RESET,
+        incident_states=frozenset({"ESCALATED", "ACTION_PENDING", "QUARANTINED"}),
+    )
+    detection = _wait_contained(
         ctx,
         since,
-        lambda doc: metric_incidents(doc, "row_remap_failure", gpu=gpu),
-        metrics=("row_remap_failure",),
-        timeout_seconds=survey.health_summary + 240,
-        name="detection",
+        "row_remap_failure",
+        gpu,
+        chain,
+        timeout_seconds=survey.health_summary + 240 + CONTAINMENT_SECONDS,
     )
     incidents = metric_incidents(detection, "row_remap_failure", gpu=gpu)
     stages = {
-        "chain": chain_errors(
-            detection,
-            incidents,
-            GpuChain(
-                label=f"row_remap_failure on {gpu}",
-                operations=("FREEZE_EVIDENCE", "MARK_UNSCHEDULABLE", "QUARANTINE"),
-                forbidden=RESET,
-                incident_states=frozenset(
-                    {"ESCALATED", "ACTION_PENDING", "QUARANTINED"}
-                ),
-            ),
-        ),
+        "chain": chain_errors(detection, incidents, chain),
         "hardware": no_hardware(detection, allowed=("RUN_FIELD_DIAGNOSTIC",)),
     }
     replay.close()
@@ -371,8 +407,9 @@ def _operator_close(
 ) -> tuple[list[str], list[dict[str, Any]]]:
     """The operator exit as a recovery stage: ``(errors, per-incident records)``.
 
-    A refusal, an incident that was not left ESCALATED, or isolation left on
-    the node after the close is the stage's error; nothing is retried.
+    A node the chain never isolated, a refusal, an incident that was not left
+    ESCALATED, or isolation left on the node after the close is the stage's
+    error; nothing is retried and nothing is closed on an unisolated node.
     """
 
     from scripts.e2e.regional.general_live_common import operator_close_incidents

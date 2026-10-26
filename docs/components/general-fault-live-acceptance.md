@@ -598,11 +598,27 @@ pending仅支持架构和授权Profile才走service-window reset；OBSERVE/未�
 GPU/Fabric验证。remap failure的现场诊断/RMA审查不得直接算硬件已更换。清理夹具并人工验卡。
 
 `remap_failure` 的恢复阶段是**操作员出口**，不是 validated restore（2026-10-26 现场，
-plain EKS ip-10-0-43-5，R13g）：RMA 级 DRAIN 链按设计没有 RESTORE_SCHEDULING，
-ESCALATE_SUPPORT 之后记录停在 BLOCKED/NEEDS_OPERATOR、incident 为 ESCALATED，节点保持
-cordon + 隔离 taint 等操作员关闭；夹具的 validated restore 脚本对这种被操作员持有的记录
-以 "workflow still owns recovery; operator hold retained" 拒绝——产品拒绝得对，restore 是
-错误的出口。变体现在自己扮演操作员：先等 incident 的工作流静止（无活动工作流、无未结
+plain EKS ip-10-0-43-5，R13g）。RMA 级 DRAIN 链按设计没有 RESTORE_SCHEDULING，由操作员在
+RMA 完成后关闭；但现场记录是**编译期 BLOCKED**（`blocked_reasons` "no executable owner for
+memoryDiagnostics"：两个现场 Runtime Profile 的 memoryDiagnostics 均为 OBSERVE、adapter 为
+null，有意不做 DCGM level 2/3），创建 35 ms 后被 dispatcher sweep SUPERSEDED，没有任何命令
+到达节点、Node Agent 日志静默、从未 cordon/taint/注解，incident 留在 ESCALATED。链阶段却判
+PASS——`chain_errors` 只核对**计划**步骤（`official_steps`）与 incident 状态，空过了一条从未
+执行的链（同样威胁 019/020/022/024 全部 GpuChain 用户）；随后 validated restore 脚本以
+"workflow still owns recovery; operator hold retained" 拒绝，是该次运行里唯一诚实的 FAIL。
+产品车道 b192 正让 containment 在 NEEDS_OPERATOR 阻塞之前执行，R13h 之前 `remap_failure`
+在两集群保持 held。
+
+由此两条夹具规则。`chain_errors` 改判**已执行**步骤（`never_executed_errors`）：
+`preemption_reason` 含编译期关闭标记、或记录带 `blocked_reasons` 却无任何 step execution，
+判 "chain planned but never executed: compile-time BLOCKED (<原因>)"；链里每个隔离步骤
+（MARK_UNSCHEDULABLE/QUARANTINE/STOP_WORKLOADS/CHECKPOINT_WORKLOADS）在记录结束后须有
+SUCCEEDED 的最终执行，FAILED 单独判错，仍可能继续执行的记录只按已执行部分判定，故 019 两个
+隔离变体在判链前先等执行到位（`chain_executed`，检测预算加 `CONTAINMENT_SECONDS`）；只诊断
+的链不变（`tests/regional/test_general_live_gpu_chain.py`）。操作员出口在关闭前核对节点确已
+被该链隔离——cordon、归属该 incident 的 `gpu-fault.io/quarantined` taint、指名该 incident 的
+`gpu-fault.io/incident-id` 注解（`containment_missing`）——缺任一项判 "chain never isolated
+the node" 且不关闭。变体随后扮演操作员：先等 incident 的工作流静止（无活动工作流、无未结
 远程命令，`wait_incident_idle`，有界等待并记录所见状态；静止时不是 ESCALATED 即判错），
 再在 CPU Pod 内经 `IncidentClosureService.close_incident` 关闭——与
 `gpu-fault-admin workflow-reconcile --close-incident` 同一调用——附带夹具从 GPU

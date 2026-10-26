@@ -41,6 +41,10 @@ ISOLATING_OPERATIONS = frozenset(
     {"MARK_UNSCHEDULABLE", "QUARANTINE", "STOP_WORKLOADS", "CHECKPOINT_WORKLOADS"}
 )
 RESET_OPERATIONS = frozenset({"RESET_GPU", "RESET_ALL_GPUS_NVSWITCHES"})
+#: The dispatcher's wording on a record it closed because compilation blocked
+#: it before any step ran (``compile_blocked.CLOSE_MARKER``); such a record
+#: planned its steps and executed none of them.
+COMPILE_TIME_BLOCKED = "compile-time BLOCKED"
 
 
 def _gpu_incidents(activity: dict[str, Any]) -> list[dict[str, Any]]:
@@ -127,10 +131,101 @@ class GpuChain:
     notes: list[str] = field(default_factory=list)
 
 
+def isolating_steps(chain: GpuChain) -> list[str]:
+    """The containment steps the chain expects (``ISOLATING_OPERATIONS``), in order."""
+
+    return [item for item in chain.operations if item in ISOLATING_OPERATIONS]
+
+
+def never_executed_errors(workflow: dict[str, Any], chain: GpuChain) -> list[str]:
+    """Why ``workflow`` planned the chain's containment but did not do it.
+
+    ``chain_errors`` used to read the PLANNED steps (``official_steps``) only,
+    so a record that compilation blocked before any step ran passed the chain
+    stage: live 2026-10-26 (gpu-eks-cluster, 019 remap_failure) the DRAIN record
+    was BLOCKED/NEEDS_OPERATOR at compile time (``no executable owner for
+    memoryDiagnostics``), the dispatcher sweep superseded it 35 ms later, no
+    command ever reached the node, and the stage read PASS on a node nothing
+    had touched. Three readings of the product's own record catch that:
+
+    * a ``preemption_reason`` naming the compile-time close
+      (``COMPILE_TIME_BLOCKED``), or ``blocked_reasons`` on a record with no
+      step execution at all, is a chain that was planned and never run;
+    * every isolating step of ``chain.operations`` needs a SUCCEEDED final
+      execution once the record has ended (``TERMINAL_WORKFLOWS``): a missing
+      one is "planned but never executed", a FAILED one is its own error;
+    * a record that may still execute (PENDING/RUNNING) is judged on what it
+      has executed so far -- a FAILED containment is an error, a step still
+      ahead is not; a caller that needs the executions in hand waits for
+      ``chain_executed`` first (019 does).
+
+    A chain without isolating steps (the diagnostic-only shapes) is unchanged:
+    its validation step is already judged on its execution.
+    """
+
+    label = chain.label
+    reasons = [str(item) for item in workflow.get("blocked_reasons") or []]
+    preempted = COMPILE_TIME_BLOCKED in str(workflow.get("preemption_reason") or "")
+    executed_any = bool(workflow.get("step_executions"))
+    if preempted or (reasons and not executed_any):
+        return [
+            f"{label} chain planned but never executed: {COMPILE_TIME_BLOCKED} "
+            f"({', '.join(reasons) or 'no blocked reason recorded'})"
+        ]
+    ended = str(workflow.get("status")) in TERMINAL_WORKFLOWS
+    errors = []
+    for operation in isolating_steps(chain):
+        execution = final_execution(workflow, operation)
+        if execution is None:
+            if ended:
+                errors.append(
+                    f"{label} chain planned but never executed: {operation} has no "
+                    "execution"
+                )
+        elif execution.get("status") != "SUCCEEDED":
+            errors.append(
+                f"{label} {operation} ended {execution.get('status')}: "
+                f"{str(execution.get('error') or '')[:200]}"
+            )
+    return errors
+
+
+def chain_executed(
+    activity: dict[str, Any], incidents: Sequence[dict[str, Any]], chain: GpuChain
+) -> bool:
+    """Whether the chain's containment can be judged on executions.
+
+    True once the first workflow of ``incidents`` has a terminal execution of
+    every isolating step the chain expects, or has ended (``settled``: nothing
+    more will execute, and a record that ended without them is the hollow chain
+    ``chain_errors`` names). A detection wait that gates on this judges steps
+    the product did, not steps it planned.
+    """
+
+    if not incidents:
+        return False
+    workflows = workflows_of(activity, str(incidents[0]["incident_id"]))
+    if not workflows:
+        return False
+    if settled(activity, incidents):
+        return True
+    workflow = workflows[0]
+    return all(
+        (final_execution(workflow, operation) or {}).get("status")
+        in {"SUCCEEDED", "FAILED"}
+        for operation in isolating_steps(chain)
+    )
+
+
 def chain_errors(
     activity: dict[str, Any], incidents: Sequence[dict[str, Any]], chain: GpuChain
 ) -> list[str]:
-    """finding -> incident -> workflow -> step trace of one GPU expectation."""
+    """finding -> incident -> workflow -> step trace of one GPU expectation.
+
+    Planned steps, forbidden steps, the validation's execution, the incident
+    state -- and, for a chain with isolating steps, that the first workflow
+    executed them (``never_executed_errors``).
+    """
 
     label = chain.label
     if not chain.present:
@@ -163,6 +258,7 @@ def chain_errors(
     steps = operations(workflow)
     if chain.operations and not subsequence(chain.operations, steps):
         errors.append(f"{label} workflow steps {steps} lack {list(chain.operations)}")
+    errors.extend(never_executed_errors(workflow, chain))
     for item in workflows:
         found = sorted(set(operations(item)) & set(chain.forbidden))
         if found:
@@ -482,6 +578,7 @@ def component_dedup_errors(
 
 
 __all__ = [
+    "COMPILE_TIME_BLOCKED",
     "COMPLETENESS_FINDING",
     "FABRIC_FINDING",
     "GpuChain",
@@ -490,6 +587,7 @@ __all__ = [
     "accepted_samples",
     "active_findings",
     "chain_errors",
+    "chain_executed",
     "collection_errors",
     "completeness_incidents",
     "component_dedup_errors",
@@ -501,8 +599,10 @@ __all__ = [
     "fabric_incidents",
     "history_findings",
     "inventory_incidents",
+    "isolating_steps",
     "latest_value",
     "metric_incidents",
+    "never_executed_errors",
     "node_hardware_errors",
     "operation_count",
     "read_only_errors",

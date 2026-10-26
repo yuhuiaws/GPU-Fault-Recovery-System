@@ -15,6 +15,11 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any
 
+from gpu_fault.adapters.common import (
+    ANNOTATION_INCIDENT,
+    QUARANTINE_TAINT,
+    quarantine_taint_value,
+)
 from gpu_fault.models import BlockedKind, WorkflowStatus, workflow_is_open
 from scripts.e2e.regional.drill_incident_cleanup import isolation_evidence
 from scripts.e2e.regional.general_live_fixture import (
@@ -571,6 +576,38 @@ def node_residual_isolation(node: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def containment_missing(node: Mapping[str, Any], incident_id: str) -> list[str]:
+    """Why ``node`` (a ``node_snapshot``) does not carry the containment a DRAIN
+    or QUARANTINE chain of ``incident_id`` leaves: the cordon, the product's
+    ``gpu-fault.io/quarantined`` taint owned by the incident (its digest form
+    or the raw id an older release wrote, as ``incident_closure`` judges it) and
+    the ``gpu-fault.io/incident-id`` ownership annotation naming it. Empty when
+    all three are there.
+
+    Live 2026-10-26 (019 remap_failure): the record was BLOCKED at compile time
+    and superseded 35 ms later, nothing ever reached the node, and the variant
+    would have closed an escalation whose chain never ran; the exit now refuses
+    to proceed on a node the chain never isolated.
+    """
+
+    missing: list[str] = []
+    if not node.get("unschedulable"):
+        missing.append("not cordoned")
+    owned = {incident_id, quarantine_taint_value(incident_id)}
+    taints = [
+        item for item in node.get("taints") or [] if item.get("key") == QUARANTINE_TAINT
+    ]
+    if not any(str(item.get("value") or "") in owned for item in taints):
+        missing.append(
+            f"no {QUARANTINE_TAINT} taint of the incident"
+            + (" (the taint present is another incident's)" if taints else "")
+        )
+    owner = (node.get("ownership_annotations") or {}).get(ANNOTATION_INCIDENT)
+    if owner != incident_id:
+        missing.append(f"{ANNOTATION_INCIDENT} names {owner or 'no incident'}")
+    return missing
+
+
 def workflow_open(workflow: Mapping[str, Any]) -> bool:
     """Whether a workflow record (``WORKFLOW_BY_ID`` shape) still gates its node,
     by the product's own rule (``models.workflow_is_open``): executable, or
@@ -633,6 +670,7 @@ def operator_close_incidents(
     incidents: Sequence[dict[str, Any]],
     *,
     reason: str,
+    expect_isolation: bool = True,
 ) -> list[dict[str, Any]]:
     """The product's operator exit for each ESCALATED incident this variant caused.
 
@@ -654,7 +692,12 @@ def operator_close_incidents(
     workflow no longer open, and no ownership annotation, quarantine taint or
     cordon left on the node (``operator_exit_problems``); what is still there is
     the error. An incident that is not ESCALATED when it settles was not left to
-    an operator, which is an error too, never something to restore around.
+    an operator, which is an error too, never something to restore around; and
+    with ``expect_isolation`` (a containment chain) the node must carry the
+    chain's cordon, taint and ownership annotation before the close
+    (``containment_missing``) -- a chain that never isolated the node is the
+    error, and nothing is closed (live 2026-10-26: the DRAIN record was blocked
+    at compile time and the node was never touched).
     """
 
     warm = WarmSpareLiveFixture(ctx.regional, ctx.settings.hyperpod_cluster)
@@ -679,6 +722,12 @@ def operator_close_incidents(
         }
         results.append(entry)
         ctx.evidence.write("operator-exit", {"node": node, "results": results})
+        missing = containment_missing(before, incident_id) if expect_isolation else []
+        if missing:
+            raise RegionalFixtureError(
+                f"chain never isolated the node {node} for {incident_id}: "
+                + "; ".join(missing)
+            )
         state = str(settled_incident.get("state") or "")
         if state != "ESCALATED":
             raise RegionalFixtureError(
@@ -785,6 +834,7 @@ __all__ = [
     "await_oracle_crossing",
     "cadence_record",
     "close_window",
+    "containment_missing",
     "node_residual_isolation",
     "open_incident_ids",
     "open_window",

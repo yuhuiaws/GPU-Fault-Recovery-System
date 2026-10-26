@@ -331,11 +331,19 @@ def test_memory_failure_is_critical_isolation(
         action="QUARANTINE",
         workflow="wf",
     )
+    # An ended record is judged on executed steps (live 2026-10-26: a record
+    # that only planned its containment passed the chain): the steps ran.
     wf = gpu_workflow(
         "wf",
         "inc",
         ["FREEZE_EVIDENCE", "MARK_UNSCHEDULABLE", "QUARANTINE"],
         status="BLOCKED",
+        executions=[
+            {"operation": op, "status": "SUCCEEDED", "updated_at": f"t{i}"}
+            for i, op in enumerate(
+                ["FREEZE_EVIDENCE", "MARK_UNSCHEDULABLE", "QUARANTINE"]
+            )
+        ],
     )
     cpu = gpu_cpu_python(
         activity=_activity([inc], [wf]), gpu_state={"active_findings": []}

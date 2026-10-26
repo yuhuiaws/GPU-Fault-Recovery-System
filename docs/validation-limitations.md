@@ -2880,15 +2880,41 @@ XID 32 (`--approve DCGM_XID_GAUGE`); 019 `remap_failure` needs
 `observe_profile` (no OBSERVE reset profile) are `CAPABILITY_ABSENT`.
 
 019 `remap_failure`'s recovery stage is the operator exit, not a validated
-restore (live 2026-10-26, plain EKS ip-10-0-43-5, release R13g): the product
-detected the replayed `row_remap_failure`, ran FREEZE_EVIDENCE,
-MARK_UNSCHEDULABLE, QUARANTINE, COLLECT_DIAGNOSTIC_BUNDLE, VALIDATE_GPU and
-ESCALATE_SUPPORT, parked the record BLOCKED/NEEDS_OPERATOR and left the
-incident ESCALATED with the node cordoned -- exactly the documented RMA-class
-drain (no RESTORE_SCHEDULING, an operator closes it once the RMA is done) --
-and the fixture's validated-restore script was refused ("workflow still owns
-recovery; operator hold retained"), which failed the variant although every
-product stage was right. The variant now performs that exit itself: it waits
+restore (live 2026-10-26, plain EKS ip-10-0-43-5, release R13g). The product
+detected the replayed `row_remap_failure` and planned the documented RMA-class
+drain (FREEZE_EVIDENCE, MARK_UNSCHEDULABLE, QUARANTINE,
+COLLECT_DIAGNOSTIC_BUNDLE, RUN_FIELD_DIAGNOSTIC, VALIDATE_GPU,
+ESCALATE_SUPPORT; no RESTORE_SCHEDULING, an operator closes it once the RMA is
+done), but the record was BLOCKED at compile time -- `blocked_reasons` "no
+executable owner for memoryDiagnostics": both live Runtime Profiles declare
+memoryDiagnostics OBSERVE with a null adapter, deliberately (no DCGM level
+2/3 on this site) -- and the dispatcher sweep superseded it 35 ms after
+creation. No command reached the node, the Node Agent journal stayed silent,
+no cordon, taint or annotation was ever applied, and the incident was left
+ESCALATED. The variant's chain stage still read PASS, because `chain_errors`
+judged only the PLANNED steps (`official_steps`) and the incident state -- a
+hollow pass that threatened every GpuChain user (019/020/022/024) -- and the
+fixture's validated-restore script was then refused ("workflow still owns
+recovery; operator hold retained"), the one honest FAIL of the run. A product
+lane (b192) makes the containment execute before the NEEDS_OPERATOR block;
+until that release (R13h) `remap_failure` stays held on both clusters.
+
+Two harness rules follow. `chain_errors` now judges executed steps
+(`never_executed_errors`): a `preemption_reason` naming the compile-time
+close, or `blocked_reasons` on a record with no step execution at all, is
+"chain planned but never executed: compile-time BLOCKED (<reasons>)"; every
+isolating step of the chain (MARK_UNSCHEDULABLE, QUARANTINE, STOP_WORKLOADS,
+CHECKPOINT_WORKLOADS) needs a SUCCEEDED final execution once the record has
+ended, a FAILED one is its own error, and a record that may still execute is
+judged on what it has executed so far -- so 019's two containment variants
+wait for the executions before judging (`chain_executed`,
+`CONTAINMENT_SECONDS` on top of the detection budget); diagnostic-only chains
+are unchanged (`tests/regional/test_general_live_gpu_chain.py`). And the
+operator exit refuses a node the chain never isolated: before the close the
+node must carry the cordon, the product's `gpu-fault.io/quarantined` taint
+owned by the incident and the `gpu-fault.io/incident-id` annotation naming it
+(`containment_missing`), else the stage fails "chain never isolated the node"
+and closes nothing. The variant otherwise performs that exit itself: it waits
 for the incident's workflow to settle, closes the incident from inside the
 CPU Pod through `IncidentClosureService.close_incident` (the same call
 `gpu-fault-admin workflow-reconcile --close-incident` makes, with the node's
