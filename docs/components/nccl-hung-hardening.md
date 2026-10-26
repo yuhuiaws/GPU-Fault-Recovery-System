@@ -444,6 +444,18 @@ FR 文件读取上限 64 MiB，结构遍历有界，环形 pickle 不递归失�
 有 job/attempt 的 summary/triage/hung诊断包，各允许每节点每 300 秒最多两次新命令，
 使用持久化预算及节点文件锁，Agent 重启不清空限额；命令重试先命中原幂等结果。
 节点同时只准一个 summary/triage/hung诊断包运行，单节点最多 8 个 py-spy。
+该唯一 worker 槽也被每 30 秒的被动通信采样占用：真机 `fr_temporal_completion`（HyperPod，2026-10-26 04:21:31Z）两节点
+在采样 epoch 开始后 1.45 s 收到 triage，槽均被占，各 1.2 s 回 `WORKER_STILL_RUNNING`，无 worker 运行、判定零进程。
+现在控制面命令等待该槽（自身 timeout 的 0.3、至多 10 s 且在 timeout 内；triage 至多 8.4 s、bundle 至多 10 s，不超控制面单节点 30 s），
+占槽者为被动采样时抢占它（停整棵子树，下个 epoch 再采），命令间从不互抢；整段等待仍拿不到才回 `WORKER_STILL_RUNNING`，
+且是**可重试**（`worker_started=false`、点名占槽者与等待秒数），survey 适配器在单节点 30 s 内重发。
+worker 拿到槽后按"自到达起算的剩余 deadline 减 2.5 s"规划 triage 预算（默认 20 s），等过槽的命令照样把能采的采完；
+8 rank 两份 dump 实测约 4.5 s 配对完（`slot_wait` 0.05 s），远在 20 s 内。triage/bundle 在检查点发部分文档
+（triage：RANKS_DISCOVERED→PROCESS_SERIES_SAMPLED→FIRST_FLIGHT_DUMPS_READ，带 dump 的检查点在副本上走裁剪阶梯；
+bundle：每采完一项发 `BUNDLE_CAPTURING` 带已采/待采/`elapsed_seconds`），supervisor 的 deadline 或抢占落在最终结果前时
+交回最后检查点（`PARTIAL_TIMEOUT`/`PREEMPTED`），慢 triage/bundle 带回已采 rank/dump 与缺项而非空结果。
+真机 `fr_second_missing`（2026-10-26 04:46Z）bundle 仅在共享节点 `hyperpod-i-08d8…`（另载一 lane 的 prewarm/训练 Pod、
+被动采样目标更多）以 `WORKER_STILL_RUNNING` 整体失败、另一节点正常；本修复令其先抢占等待，真超时交回已采清单。
 诊断子进程 stdout+stderr 上限 1 MiB，超时后 kill 等待再限 0.2 秒，
 不在 subprocess.run 的无界 wait 上卡死。通信文件读取和 FR 解析使用最多四个
 有界等待的读取槽，超时线程仍占槽直到实际退出，防止故障期间无限创建线程。

@@ -47,7 +47,10 @@ from gpu_fault.node_agent.operations.clients import GpuClientsActive
 from gpu_fault.node_agent.operations.collector_outbox import CollectorOutboxRefused
 from gpu_fault.node_agent.operations.drain_p2p import recover_drain_p2p
 from gpu_fault.node_agent.operations.hung_summary import collect_hung_summary
-from gpu_fault.node_agent.observation_supervisor import ObservationIncomplete
+from gpu_fault.node_agent.observation_supervisor import (
+    ObservationIncomplete,
+    ObservationSlotBusy,
+)
 from gpu_fault.node_agent.operations.remediation import InstallOutcomeUnknownError
 from gpu_fault.node_agent.operations.workload_scope import quiesce_workload_scope
 from gpu_fault.node_agent.operations.reset import ResetProgressError
@@ -905,9 +908,18 @@ class NodeActionExecutor(
         # nvidia-smi is killed, and an installer killed part-way has left the
         # node half-applied.
         # An activity a quiesce window overlapped runs again after the window.
+        # A command the node's single observation worker slot refused for the
+        # whole bounded wait ran nothing: the slot frees when the holder's tree
+        # exits, so the same command runs on its next attempt.
         return isinstance(
             error,
-            (OSError, TimeoutError, subprocess.TimeoutExpired, GpuActivityOverlapped),
+            (
+                OSError,
+                TimeoutError,
+                subprocess.TimeoutExpired,
+                GpuActivityOverlapped,
+                ObservationSlotBusy,
+            ),
         )
 
 

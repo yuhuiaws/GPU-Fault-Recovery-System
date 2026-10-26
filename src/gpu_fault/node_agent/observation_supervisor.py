@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import selectors
+import signal
 import subprocess
 import sys
 import tempfile
@@ -15,6 +16,7 @@ from typing import Any, Callable
 
 from gpu_fault.node_agent import observation_guard
 from gpu_fault.node_agent.observation_limits import (
+    OBSERVATION_BUDGET_VARIABLE,
     OBSERVATION_REQUEST_BUDGET_BYTES,
     OBSERVATION_RESULT_BUDGET_BYTES,
     WORKER_NOT_STARTED,
@@ -23,11 +25,32 @@ from gpu_fault.node_agent.observation_limits import (
 
 __all__ = [
     "ObservationIncomplete",
+    "ObservationSlotBusy",
     "ObservationSupervisor",
+    "SLOT_BUSY",
+    "SLOT_WAIT_FRACTION",
+    "SLOT_WAIT_MAX_SECONDS",
     "WORKER_NOT_STARTED",
     "WORKER_OUTPUT",
     "request_overflow",
+    "slot_wait_for",
 ]
+
+#: Status of a request the supervisor could not give the node's single worker
+#: slot. Kept under its historical name: records, the hand-off mail and the
+#: acceptance runner read it.
+SLOT_BUSY = "WORKER_STILL_RUNNING"
+#: How long a control-plane command waits for the slot before it is refused: a
+#: share of its own timeout, at most ``SLOT_WAIT_MAX_SECONDS``. The wait is
+#: inside the timeout (the deadline runs from the request's arrival), so the
+#: control plane's 30-second per-node wait is never exceeded; a triage waits
+#: at most 8.4 s of its 28 and the worker plans within what is left.
+SLOT_WAIT_FRACTION = 0.3
+SLOT_WAIT_MAX_SECONDS = 10.0
+
+
+def slot_wait_for(timeout: float) -> float:
+    return round(min(SLOT_WAIT_MAX_SECONDS, max(0.0, timeout) * SLOT_WAIT_FRACTION), 3)
 
 
 class ObservationIncomplete(RuntimeError):
@@ -46,6 +69,20 @@ class ObservationIncomplete(RuntimeError):
             f"{status}: {error}" if isinstance(error, str) and error else status
         )
         self.action_details = result
+
+
+class ObservationSlotBusy(ObservationIncomplete):
+    """The node's one worker slot stayed held for the whole wait; nothing ran.
+
+    Live (GF-GENERAL-LIVE-011 ``fr_temporal_completion``, HyperPod, 2026-10-26
+    04:21:31Z), COLLECT_HUNG_TRIAGE reached both nodes 1.45 s into a 30-second
+    epoch -- while each Agent's passive communication sample held the slot --
+    and both answered ``WORKER_STILL_RUNNING`` within 1.2 s without waiting or
+    naming the holder; the control plane recorded both as failed and the
+    decision saw no process. This refusal is a retryable failure: the executor
+    says so in its result, so a resubmission of the same command runs a new
+    attempt instead of replaying the refusal from the ledger.
+    """
 
 
 def request_overflow(request: dict[str, Any], size: int) -> str:
@@ -78,6 +115,71 @@ class ObservationSupervisor:
     def __init__(self) -> None:
         self.slot = threading.BoundedSemaphore(1)
         self.last_result: dict[str, Any] = {}
+        self._holder_lock = threading.Lock()
+        #: Who holds the slot: ``operation``, ``since`` (monotonic), ``process``,
+        #: ``preemptible``, ``preempted_by`` and ``abandoned`` (its caller left
+        #: at its deadline; the reaper frees the slot when the tree exits).
+        self.holder: dict[str, Any] | None = None
+
+    @staticmethod
+    def _describe(holder: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "operation": holder["operation"],
+            "held_seconds": round(time.monotonic() - holder["since"], 3),
+            "preempted": holder.get("preempted_by") is not None,
+            "abandoned": bool(holder.get("abandoned")),
+        }
+
+    def _preempt(self, operation: str) -> dict[str, Any] | None:
+        """Stop a preemptible holder's worker tree; the holder, described.
+
+        The passive communication sample is the only preemptible activity: it
+        runs every 30 s on its own, and one missed epoch costs nothing against
+        a control-plane command that would otherwise be refused. A command's
+        worker is never stopped for another command.
+        """
+
+        with self._holder_lock:
+            holder = self.holder
+            if holder is None:
+                return None
+            process = holder.get("process")
+            if (
+                holder.get("preemptible")
+                and holder.get("preempted_by") is None
+                and process is not None
+                and process.poll() is None
+            ):
+                holder["preempted_by"] = operation
+                with contextlib.suppress(OSError):
+                    # The guard is its own session leader: the whole tree.
+                    os.killpg(process.pid, signal.SIGTERM)
+            return self._describe(holder)
+
+    @staticmethod
+    def _refusal(
+        waited: float, slot_wait: float, holder: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        if holder is None:
+            held = "an activity that already left"
+        else:
+            held = f"{holder['operation']} for {holder['held_seconds']:.1f} s"
+            if holder["preempted"]:
+                held += " (preempted, not yet exited)"
+            if holder["abandoned"]:
+                held += " (abandoned by its caller at its deadline)"
+        return {
+            "status": SLOT_BUSY,
+            "evidence_complete": False,
+            "ranks": [],
+            "error": f"observation worker slot held by {held}; waited {waited:.1f} s",
+            "failed_component": "observation_supervisor",
+            "failure_stage": WORKER_NOT_STARTED,
+            "worker_started": False,
+            "slot_holder": holder,
+            "slot_wait_seconds": round(waited, 3),
+            "slot_wait_allowed_seconds": round(slot_wait, 3),
+        }
 
     def run(
         self,
@@ -85,37 +187,65 @@ class ObservationSupervisor:
         timeout: float,
         *,
         release: Callable[[], None] = lambda: None,
+        preemptible: bool = False,
+        slot_wait: float = 0.0,
     ) -> dict[str, Any]:
-        if not self.slot.acquire(blocking=False):
+        started = time.monotonic()
+        deadline = started + timeout
+        operation = str(request.get("operation", "observation"))
+        acquired = self.slot.acquire(blocking=False)
+        seen: dict[str, Any] | None = None
+        if not acquired and slot_wait > 0:
+            seen = self._preempt(operation)
+            acquired = self.slot.acquire(
+                timeout=min(slot_wait, max(0.0, deadline - time.monotonic()))
+            )
+        waited = time.monotonic() - started if slot_wait > 0 else 0.0
+        if not acquired:
             release()
-            return {
-                "status": "WORKER_STILL_RUNNING",
-                "evidence_complete": False,
-                "ranks": [],
-            }
+            with self._holder_lock:
+                holder = self._describe(self.holder) if self.holder else seen
+            refusal = self._refusal(waited, slot_wait, holder)
+            self.last_result = refusal
+            return refusal
         process = None
         abandoned = False
+        record: dict[str, Any] = {
+            "operation": operation,
+            "since": time.monotonic(),
+            "process": None,
+            "preemptible": preemptible,
+            "preempted_by": None,
+            "abandoned": False,
+        }
+        with self._holder_lock:
+            self.holder = record
         result: dict[str, Any] = {"status": "COLLECTING", "ranks": []}
         try:
-            deadline = time.monotonic() + timeout
             with tempfile.TemporaryFile() as incoming:
                 raw = json.dumps(request).encode()
                 if len(raw) > OBSERVATION_REQUEST_BUDGET_BYTES:
                     raise ValueError(request_overflow(request, len(raw)))
                 incoming.write(raw)
                 incoming.seek(0)
+                environment = {
+                    key: value
+                    for key, value in os.environ.items()
+                    if not key.startswith("GPU_FAULT_")
+                }
+                environment[OBSERVATION_BUDGET_VARIABLE] = (
+                    f"{max(0.0, deadline - time.monotonic()):.3f}"
+                )
                 process = subprocess.Popen(
                     [sys.executable, "-m", observation_guard.__name__],
                     stdin=incoming,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
                     start_new_session=True,
-                    env={
-                        key: value
-                        for key, value in os.environ.items()
-                        if not key.startswith("GPU_FAULT_")
-                    },
+                    env=environment,
                 )
+            with self._holder_lock:
+                record["process"] = process
             buffer = bytearray()
             received = 0
             final = False
@@ -156,14 +286,26 @@ class ObservationSupervisor:
                             timeout=min(0.1, max(0.001, deadline - time.monotonic()))
                         )
                 if not final or process.poll() != 0:
+                    with self._holder_lock:
+                        preempted_by = record.get("preempted_by")
+                    # The deadline hands back the worker's last checkpoint
+                    # (``publish(..., final=False)``): the ranks it found, the
+                    # dumps it read and the stage it was in.
                     result = {
                         **result,
-                        "status": "PARTIAL_TIMEOUT"
+                        "status": "PREEMPTED"
+                        if preempted_by
+                        else "PARTIAL_TIMEOUT"
                         if process.poll() is None
                         else "WORKER_EXITED",
                         "evidence_complete": False,
                         "worker_returncode": process.poll(),
+                        "supervisor_timeout_seconds": timeout,
                     }
+                    if preempted_by:
+                        result["preempted_by"] = preempted_by
+            if waited >= 0.01:
+                result = {**result, "slot_wait_seconds": round(waited, 3)}
             self.last_result = result
             return result
         except (OSError, ValueError, KeyError) as exc:
@@ -178,6 +320,8 @@ class ObservationSupervisor:
                 failure_stage=WORKER_NOT_STARTED if process is None else WORKER_OUTPUT,
                 worker_started=process is not None,
             )
+            if waited >= 0.01:
+                result["slot_wait_seconds"] = round(waited, 3)
             self.last_result = result
             return result
         finally:
@@ -192,9 +336,14 @@ class ObservationSupervisor:
                 if process.poll() is None:
                     abandoned = True
                     result.update(worker_tree_running=True, evidence_complete=False)
+                    with self._holder_lock:
+                        record["abandoned"] = True
 
                     def reap() -> None:
                         process.wait()
+                        with self._holder_lock:
+                            if self.holder is record:
+                                self.holder = None
                         release()
                         self.slot.release()
 
@@ -202,5 +351,8 @@ class ObservationSupervisor:
                         target=reap, name="observation-reaper", daemon=True
                     ).start()
             if not abandoned:
+                with self._holder_lock:
+                    if self.holder is record:
+                        self.holder = None
                 release()
                 self.slot.release()

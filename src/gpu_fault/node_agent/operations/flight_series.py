@@ -137,8 +137,22 @@ def finish_flight_series(
     started: float,
     budget: float,
     monotonic: Callable[[], float],
+    *,
+    checkpoint: Callable[[str], None] | None = None,
 ) -> float:
+    """Both dumps of every process within one budget, the first ones checkpointed.
+
+    The first dumps of all processes were requested together before the process
+    series; here they are awaited together, then one interval passes once and
+    the second dumps are requested together (``collect_second_flight``): eight
+    ranks a node paired in ~5 s live, not eight intervals in a row. The
+    checkpoint between the two is what a deadline that falls inside the
+    interval or the second wait hands back.
+    """
+
     waited = agent._await_flight_dumps(requests, ranks, started + budget / 2)
+    if checkpoint is not None:
+        checkpoint("FIRST_FLIGHT_DUMPS_READ")
     waited += collect_second_flight(
         agent,
         command,

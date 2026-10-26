@@ -2383,6 +2383,30 @@ whole-group stall are node-local (eight ranks each; the cross-node default
 group is present and its per-rank watermarks are still read); and a D-state
 wait cannot be forced natively, so `fr_plus_process` keeps the write-mode
 checkpoint I/O (`HOST_WRITES_OBSERVED`) as its independent process evidence.
+On the first live runs these variants exposed a node-side contention gap, not
+an oracle error: a node's single isolated observation worker slot is shared by
+the 30-second passive communication sampler, and a triage or bundle that
+arrived while the sample held it was refused `WORKER_STILL_RUNNING` on arrival
+with no wait. Live, `fr_temporal_completion` (hp, 2026-10-26 04:21Z) landed
+1.45 s into an epoch and both nodes refused the triage (the decision saw no
+process, the oracle's `fr_paired`/`watermarks` read "sampled no ranked
+process"); `fr_second_missing` (hp, 04:46Z) sampled every rank but its bundle
+was refused on the shared node `hyperpod-i-08d8…` alone -- the node that also
+hosts the other lane's prewarm/training Pods, so its sampler had more targets
+holding the slot -- and the workflow failed and escalated. The fix makes a
+control-plane command wait for the slot (inside the control plane's 30-second
+per-node wait) and preempt the passive sample, makes a refusal after the whole
+wait a retryable failure the survey re-sends, and makes a worker past its
+deadline hand back its last partial checkpoint; the oracle is unchanged
+(`fr_temporal_completion`/`fr_second_missing` stay expected PASS). The other
+FR-replay variants run the same shared slot and the same budget: `fr_whole_group`
+and `fr_plus_process` pair two dumps on eight ranks exactly as
+`different_process_groups` does (measured ~4.5 s inside the 20 s budget) and
+`fr_enabled`/`fr_disabled` take one slot likewise, so any of them can be
+refused the same way if it lands on a busy slot -- their holds lift with this
+node_runtime roll rather than needing a separate product change. Re-run
+`fr_temporal_completion` and `fr_second_missing` on the hp lane (the eks lane
+pre-claimed) once the GPU nodes' Agents carry this fix.
 The role, thread, process and attempt-change
 variants of 011 (`general_live_nccl_roles`, on both lanes like every 011
 variant) are the same stall on the

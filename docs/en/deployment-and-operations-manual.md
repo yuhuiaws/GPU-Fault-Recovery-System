@@ -10534,6 +10534,16 @@ operation lists along the result's `evidence_trimmed` ladder, whose floor (`skel
 ranks it replaced); a step whose `node_failures` reads `ObservationIncomplete: RESULT_SIZE_LIMIT` while the node result is a bare
 `{"status":"RESULT_SIZE_LIMIT","ranks":[]}` comes from an Agent older than this fix (live HyperPod `fr_enabled`, eight ranks with
 the recorder on).
+A triage or bundle step whose `node_failures` reads `ObservationIncomplete: WORKER_STILL_RUNNING` for a node with empty
+`node_results` means that node's single observation worker slot was held by the 30-second passive communication sample when the
+command arrived. An upgraded Agent waits for the slot (a share of its timeout, at most 10 s, inside the control plane's 30-second
+per-node wait) and preempts the passive sample; a refusal after the whole wait is retryable and names the holder
+(`slot_holder`, `slot_wait_seconds`), so the survey re-sends and the bundle re-polls within the wait. A worker that got the slot but
+could not finish by its deadline now hands back a partial: `status=PARTIAL_TIMEOUT`/`PREEMPTED`, `collection_stage`, the ranks and
+dumps the triage read, or the bundle's `captures_done`/`captures_pending` and `elapsed_seconds`, with `evidence_complete=false` --
+read it as the evidence that was gathered, not an empty answer. A bare `WORKER_STILL_RUNNING` with no `slot_holder`/`slot_wait_seconds`
+is an Agent older than this fix (live HyperPod `fr_temporal_completion` 04:21Z refused both nodes; `fr_second_missing` 04:46Z failed
+the bundle on the shared node alone).
 Without eligible candidates, the bounded passive bundle need not contain
 process stacks; eligible targeted bundles attach only to verified PIDs. Hung bundles omit strace,
 DCGM diag and bug-report. Per-process `flight_recorder_series` retains two compact summaries and

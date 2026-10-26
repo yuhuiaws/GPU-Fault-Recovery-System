@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import subprocess
 import time
+from copy import deepcopy
 from typing import Any, Callable
 
 from gpu_fault.node_agent.diagnostic_process import run_probe
@@ -129,21 +130,41 @@ class HungTriageOperationsMixin:
             if identities[row["pid"]]["start_time_ticks"]
             == process_start_ticks(self.proc_root, row["pid"])
         ]
-        publish_partial(
-            self,
-            {
+
+        def checkpoint(
+            stage: str, rows: list[dict[str, Any]], *, bounded: bool = False
+        ) -> None:
+            # What the supervisor hands back if its deadline falls before the
+            # final result: the stage reached, the ranks found and what each
+            # had read by then, against the budget the triage planned with. A
+            # checkpoint that carries dumps goes through the same ladder as the
+            # result, so it never exceeds the worker's result line -- on a copy
+            # of the rows, so trimming a checkpoint never shortens the evidence
+            # the triage is still assembling.
+            document = {
                 "status": "COLLECTING",
+                "collection_stage": stage,
                 "node_id": command.node_id,
-                "ranks": [
-                    {
-                        "pid": row["pid"],
-                        "rank": row.get("rank"),
-                        "process_identity": identities[row["pid"]],
-                    }
-                    for row in process_rows
-                ],
+                "ranks": deepcopy(rows) if bounded else rows,
+                "errors": errors,
+                "elapsed_seconds": round(time.monotonic() - started, 6),
+                "triage_budget_seconds": timeout_seconds,
                 "evidence_complete": False,
-            },
+            }
+            publish_partial(
+                self, bounded_triage_result(document) if bounded else document
+            )
+
+        checkpoint(
+            "RANKS_DISCOVERED",
+            [
+                {
+                    "pid": row["pid"],
+                    "rank": row.get("rank"),
+                    "process_identity": identities[row["pid"]],
+                }
+                for row in process_rows
+            ],
         )
         flight_requests = {
             row["pid"]: request_flight(self, command, row, "first")
@@ -161,16 +182,7 @@ class HungTriageOperationsMixin:
         )
         if not process_rows and started + timeout_seconds - time.monotonic() >= 1:
             self.sleep(1)
-        publish_partial(
-            self,
-            {
-                "status": "COLLECTING",
-                "node_id": command.node_id,
-                "ranks": ranks,
-                "errors": errors,
-                "evidence_complete": False,
-            },
-        )
+        checkpoint("PROCESS_SERIES_SAMPLED", ranks)
         efa_after = self._efa_counter_snapshot()
         for row in ranks:
             row["flight_recorder"] = (
@@ -189,6 +201,7 @@ class HungTriageOperationsMixin:
             started,
             timeout_seconds,
             time.monotonic,
+            checkpoint=lambda stage: checkpoint(stage, ranks, bounded=True),
         )
 
         # Eight ranks with two FR dumps each weighed ~1.2 MB live against the
@@ -202,6 +215,7 @@ class HungTriageOperationsMixin:
                 "efa": self._counter_delta(efa_before, efa_after),
                 "errors": errors,
                 "elapsed_seconds": round(time.monotonic() - started, 6),
+                "triage_budget_seconds": timeout_seconds,
                 "flight_recorder_wait_seconds": flight_wait_seconds,
                 "read_only": True,
                 "workload_scope": workload_scope,

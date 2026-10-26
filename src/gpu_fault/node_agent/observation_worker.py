@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import resource
 import sys
@@ -13,9 +14,11 @@ from typing import Any
 
 from gpu_fault.node_agent.diagnostic_process import DiagnosticProcessRunner
 from gpu_fault.node_agent.observation_limits import (
+    OBSERVATION_BUDGET_VARIABLE,
     OBSERVATION_REQUEST_BUDGET_BYTES,
     OBSERVATION_RESULT_BUDGET_BYTES,
     RESULT_STAND_IN_RANKS_BUDGET_BYTES,
+    WORKER_BUDGET_MARGIN_SECONDS,
     WORKER_OUTPUT,
 )
 from gpu_fault.node_agent.operations.diagnostics import DiagnosticOperationsMixin
@@ -172,7 +175,38 @@ def publish(document: dict[str, Any], *, final: bool) -> None:
     sys.stdout.buffer.flush()
 
 
-def execute(request: dict[str, Any]) -> dict[str, Any]:
+def within_budget(
+    command: NodeActionCommand, budget_seconds: float | None
+) -> NodeActionCommand:
+    """The triage command with its sampling budget capped by what is left.
+
+    The supervisor's deadline runs from the moment the command reached the
+    node, and the wait for the node's single worker slot is inside it. A worker
+    that planned the documented 20 s against a shorter remaining deadline would
+    be cut during the second dump's interval and hand back a ``PARTIAL_TIMEOUT``;
+    planned within the remaining time less the margin it needs to trim and write
+    a result of the live size, it finishes what fits and says so (the FR series
+    reads ``BUDGET_EXHAUSTED``, ``triage_budget_seconds`` names the budget).
+    """
+
+    if budget_seconds is None or not math.isfinite(budget_seconds):
+        return command
+    parameters = dict(command.parameters)
+    try:
+        current = float(parameters.get("triage_timeout_seconds", 20))
+    except (TypeError, ValueError):
+        return command
+    capped = max(2.0, min(current, budget_seconds - WORKER_BUDGET_MARGIN_SECONDS))
+    if capped >= current:
+        return command
+    return command.model_copy(
+        update={"parameters": {**parameters, "triage_timeout_seconds": capped}}
+    )
+
+
+def execute(
+    request: dict[str, Any], *, budget_seconds: float | None = None
+) -> dict[str, Any]:
     agent = ObservationAgent(request["settings"])
     operation = request["operation"]
     if operation == "sample":
@@ -196,7 +230,7 @@ def execute(request: dict[str, Any]) -> dict[str, Any]:
     if operation == "summary":
         return collect_hung_summary(agent, command)
     if operation == "triage":
-        return agent._collect_hung_triage(command)
+        return agent._collect_hung_triage(within_budget(command, budget_seconds))
     if operation == "bundle":
         return agent._collect_diagnostic_bundle(command)
     raise ValueError("unsupported observation operation")
@@ -216,9 +250,13 @@ def main() -> None:
             f"{OBSERVATION_REQUEST_BUDGET_BYTES} bytes on stdin"
         )
     request = json.loads(raw)
+    try:
+        budget_seconds: float | None = float(os.environ[OBSERVATION_BUDGET_VARIABLE])
+    except (KeyError, ValueError):
+        budget_seconds = None
     publish({"status": "COLLECTING", "ranks": [], "read_only": True}, final=False)
     try:
-        result = execute(request)
+        result = execute(request, budget_seconds=budget_seconds)
     except Exception as exc:
         result = {
             **_PARTIAL,

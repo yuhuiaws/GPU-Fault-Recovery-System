@@ -15,8 +15,11 @@ from typing import Any
 from gpu_fault.communication_monitoring import CommunicationPlan
 from gpu_fault.models import WorkflowOperation as Op
 from gpu_fault.node_agent.observation_supervisor import (
+    SLOT_BUSY,
     ObservationIncomplete,
+    ObservationSlotBusy,
     ObservationSupervisor,
+    slot_wait_for,
 )
 from gpu_fault.node_agent.operations.hung_summary_io import read_bounded
 from gpu_fault.node_agent.observation_limits import (
@@ -151,13 +154,22 @@ class CommunicationRuntime:
                 "command": command.model_dump(mode="json"),
             }
         )
+        timeout = {"summary": 20, "triage": 28, "bundle": 120}[operation]
+        # A command waits for the node's single worker slot (preempting the
+        # passive sample if that is the holder) instead of being refused on
+        # arrival: live, two triages that landed 1.45 s into a sampling epoch
+        # were both answered WORKER_STILL_RUNNING within 1.2 s and the hung
+        # workflow saw no process on either node.
         result = self.supervisor.run(
             request,
-            {"summary": 20, "triage": 28, "bundle": 120}[operation],
+            timeout,
             release=lambda: self.agent.gpu_activity.release(activity),
+            slot_wait=slot_wait_for(timeout),
         )
         if trimmed:
             result = {**result, "observation_request_trimmed": trimmed}
+        if result.get("status") == SLOT_BUSY and result.get("worker_started") is False:
+            raise ObservationSlotBusy(result)
         if result.get("evidence_complete") is False or result.get("status") in {
             "UNAVAILABLE",
             "RESULT_SIZE_LIMIT",
@@ -193,6 +205,10 @@ class CommunicationRuntime:
                     f"passive/{target.attempt_id}/{epoch}",
                     "passive-observation",
                 )
+                # Preemptible: a control-plane command that finds this sample
+                # holding the slot stops it and runs; the epoch is sampled
+                # again 30 s later. The sample itself never waits for a slot a
+                # command holds.
                 result = self.supervisor.run(
                     {
                         "operation": "sample",
@@ -202,6 +218,7 @@ class CommunicationRuntime:
                     },
                     12,
                     release=lambda: self.agent.gpu_activity.release(activity),
+                    preemptible=True,
                 )
             except (OSError, ValueError, RuntimeError) as exc:
                 result = {"status": "UNAVAILABLE", "reason": str(exc)[:128]}

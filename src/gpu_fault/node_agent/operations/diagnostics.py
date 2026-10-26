@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import tarfile
+import time
 from datetime import datetime, timedelta
 from functools import partial
 from pathlib import Path
@@ -380,6 +381,8 @@ class DiagnosticOperationsMixin:
         capture_runner = (
             partial(run_probe, self.runner) if passive_hung else self.runner
         )
+        bundle_started = time.monotonic()
+        planned_files = [filename for filename, _, _ in captures]
         manifest = {
             "command_id": command.command_id,
             "workflow_request_id": command.workflow_request_id,
@@ -472,11 +475,25 @@ class DiagnosticOperationsMixin:
                     capture["error"] = error
                 manifest["captures"].append(capture)
                 if passive_hung:
+                    done = [item["file"] for item in manifest["captures"]]
+                    # What the supervisor hands back if its deadline (or a
+                    # preemption) falls mid-bundle: the captures written so
+                    # far, the ones still to run and the elapsed budget, so a
+                    # bundle a shared node could not finish in time comes back
+                    # as a partial, not a bare WORKER_STILL_RUNNING.
                     publish_partial(
                         self,
                         {
                             "status": "COLLECTING",
+                            "collection_stage": "BUNDLE_CAPTURING",
                             "manifest": manifest,
+                            "captures_done": done,
+                            "captures_pending": [
+                                name for name in planned_files if name not in done
+                            ],
+                            "elapsed_seconds": round(
+                                time.monotonic() - bundle_started, 6
+                            ),
                             "evidence_complete": False,
                         },
                     )

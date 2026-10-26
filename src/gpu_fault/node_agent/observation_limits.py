@@ -53,3 +53,11 @@ RESULT_STAND_IN_RANKS_BUDGET_BYTES = 16 * 1024
 #: oversized-output stand-in without importing the supervisor.
 WORKER_NOT_STARTED = "WORKER_NOT_STARTED"
 WORKER_OUTPUT = "WORKER_OUTPUT"
+#: The environment variable through which the supervisor tells the worker how
+#: many seconds of its deadline are left once the worker starts -- the wait for
+#: the node's single worker slot is inside that deadline. The worker plans a
+#: triage within it less ``WORKER_BUDGET_MARGIN_SECONDS``, the time it takes to
+#: trim and write a result of the live size, so a command that waited for the
+#: slot finishes what fits and says so instead of being cut at its deadline.
+OBSERVATION_BUDGET_VARIABLE = "OBSERVATION_BUDGET_SECONDS"
+WORKER_BUDGET_MARGIN_SECONDS = 2.5

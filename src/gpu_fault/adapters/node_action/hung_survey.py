@@ -19,6 +19,32 @@ from gpu_fault.node_agent.protocol import NodeActionResult, NodeActionStatus
 MAX_RESULT_BYTES = 8 * 1024 * 1024
 MAX_RAW_RESULT_BYTES = MAX_SURVEY_RAW_BYTES
 NODE_TIMEOUT_SECONDS = 30
+#: How long a node that refused the command before any worker ran is left
+#: alone before it is asked again, inside its ``NODE_TIMEOUT_SECONDS``.
+REFUSED_RESEND_SECONDS = 1.0
+
+
+def slot_refusal(response: NodeActionResult | WorkflowStepOutcome) -> bool:
+    """A node that ran nothing and asks to be sent the same command again.
+
+    Live (GF-GENERAL-LIVE-011 ``fr_temporal_completion``, HyperPod, 2026-10-26
+    04:21Z) both nodes answered COLLECT_HUNG_TRIAGE ``WORKER_STILL_RUNNING``
+    1.2 s after the step started -- their single observation worker slot was
+    held by the passive communication sample -- and both were recorded under
+    ``node_failures`` at once, inside a 30-second per-node wait that was never
+    used. An upgraded Agent waits for the slot itself and, if it still has to
+    refuse, says so as a retryable failure with ``worker_started`` false; such a
+    node stays pending and is re-sent within its wait, like a node that has
+    accepted the command and not answered yet. An older Agent's refusal is not
+    retryable and is recorded as before.
+    """
+
+    return (
+        isinstance(response, NodeActionResult)
+        and response.status is NodeActionStatus.FAILED
+        and response.retryable
+        and response.details.get("worker_started") is False
+    )
 
 
 def scoped_context(context: WorkflowStepContext, node: str) -> WorkflowStepContext:
@@ -105,6 +131,7 @@ def execute_hung_survey(
         window = list(pending)[:workers] + unseen[: max(0, workers - len(pending))]
         if not window:
             break
+        refused: set[str] = set()
         retained, raw_retained = collect_wave(
             window,
             send,
@@ -115,11 +142,12 @@ def execute_hung_survey(
             raw_retained,
             now,
             compress=True,
+            refused=refused,
         )
         if time.monotonic() >= slice_deadline:
             break
         if pending:
-            time.sleep(0.25)
+            time.sleep(REFUSED_RESEND_SECONDS if refused else 0.25)
     remaining = set(context.step.node_ids) - results.keys() - failures.keys()
     details = {
         "node_results": results,
@@ -155,6 +183,7 @@ def collect_wave(
     now: datetime,
     *,
     compress: bool = True,
+    refused: set[str] | None = None,
 ) -> tuple[int, int]:
     with ThreadPoolExecutor(
         max_workers=len(window), thread_name_prefix="hung-survey"
@@ -166,6 +195,15 @@ def collect_wave(
         for node, future in futures.items():
             response = future.result()
             sent_at = datetime.fromisoformat(pending.get(node, now.isoformat()))
+            if (
+                slot_refusal(response)
+                and (datetime.now(timezone.utc) - sent_at).total_seconds()
+                < NODE_TIMEOUT_SECONDS
+            ):
+                pending[node] = sent_at.isoformat()
+                if refused is not None:
+                    refused.add(node)
+                continue
             if (
                 isinstance(response, WorkflowStepOutcome)
                 and response.status is WorkflowStepStatus.WAITING

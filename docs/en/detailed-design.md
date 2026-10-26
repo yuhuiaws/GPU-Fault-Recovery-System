@@ -3692,6 +3692,37 @@ the triage step waiting indefinitely: each node has a 30-second wait and each wa
 Failures count as missing coverage. `VALIDATE_FABRIC` depends only on step 1, so the fabric conclusion can still be obtained in parallel
 when the deep-forensics node is unreachable.
 
+On a node, summary/triage/bundle share one isolated read-only worker slot (`ObservationSupervisor`), and the continuous passive
+communication monitor samples on it every 30 s. Live, a two-node `fr_temporal_completion` run (HyperPod, 2026-10-26 04:21:31Z) had
+COLLECT_HUNG_TRIAGE reach both nodes 1.45 s into a 30-second sampling epoch -- the passive sample held the slot on both -- and each
+answered `WORKER_STILL_RUNNING` within 1.2 s: no worker ran, the FR responders show 0 requests on all 16 ranks, the step recorded
+`node_failures` for both nodes, the control plane did not ask again and the decision saw no process. A control-plane command
+(summary/triage/bundle) now **waits** for the slot instead of being refused on arrival: it waits a share of its own timeout
+(`SLOT_WAIT_FRACTION` 0.3) up to `SLOT_WAIT_MAX_SECONDS` (10 s) and inside that timeout (triage 28 s → at most 8.4 s, bundle 120 s →
+at most 10 s, so the control plane's 30-second per-node wait is never exceeded); if the holder is the passive sample (the only
+`preemptible` activity) the command preempts it (`os.killpg` stops the whole subtree; the epoch is sampled again 30 s later), and a
+command never preempts another command. Only a slot that stays held for the whole wait is refused `WORKER_STILL_RUNNING`, and that
+refusal is a **retryable** failure (`worker_started=false`, naming the holder and the seconds waited): the executor marks it retryable,
+the survey adapter keeps the node pending and re-sends within the node's 30-second wait (`REFUSED_RESEND_SECONDS`, the path a node that
+accepted but has not answered already takes) rather than recording it at once. An Agent older than this fix returns a non-retryable
+`ObservationIncomplete: WORKER_STILL_RUNNING`, recorded in `node_failures` as before.
+
+Once a worker has the slot, the supervisor passes the deadline remaining from the command's arrival to the worker through
+`OBSERVATION_BUDGET_VARIABLE`; the triage plans its own sampling budget (20 s by default) within that remaining time less
+`WORKER_BUDGET_MARGIN_SECONDS` (2.5 s, the time to trim along the ladder and write a result of the live size), so a command that waited
+for the slot finishes what fits and says so instead of being cut mid second-dump interval. The two-dump pairing of eight ranks
+measured ~4.5 s inside the 20 s budget (`slot_wait` 0.05 s, `fr_wait` 0.28 s), matching the same release's `different_process_groups`
+(5.0 s a node); the two active-diagnostic passes keep their default budget of 8 nodes. The triage and bundle publish partial documents
+at checkpoints (`publish(..., final=False)`): the triage at `RANKS_DISCOVERED` → `PROCESS_SERIES_SAMPLED` → `FIRST_FLIGHT_DUMPS_READ`
+(a checkpoint that carries dumps goes through the same `bounded_triage_result` ladder as the result, on a copy of the rows so trimming
+a checkpoint never shortens the evidence the triage is assembling), the bundle after each capture as `BUNDLE_CAPTURING`
+(`captures_done`, `captures_pending`, `elapsed_seconds`). When the supervisor's deadline (or a preemption) falls before the final
+result, it hands back the last checkpoint (`PARTIAL_TIMEOUT`/`PREEMPTED`, `evidence_complete=false`, `supervisor_timeout_seconds`), so a
+slow triage or bundle comes back with the ranks/dumps it had read and what is missing, not empty. Live, the `fr_second_missing` run
+(HyperPod, 2026-10-26 04:46Z) had the bundle fail whole as `WORKER_STILL_RUNNING` on the shared node `hyperpod-i-08d8…` alone -- the
+node also hosting the other lane's prewarm/training Pods, with more passive-sample targets holding the slot -- while the other node
+finished; this fix makes it wait and preempt first, and a genuine timeout returns the captured manifest.
+
 The executor compares groups by name and membership, requiring at least three valid samples and a strict majority.
 A single snapshot yields at most `PLAUSIBLE` progress outliers, never confirmed root cause.
 Targeted collection additionally requires process-bound paired dumps and overlapping cross-rank observation
