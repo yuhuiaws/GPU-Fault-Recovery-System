@@ -9,11 +9,14 @@ from typing import Any
 import pytest
 
 from scripts.e2e.regional import general_live_gpu_links as links
-from scripts.e2e.regional.general_live_fixture import VariantNotRun
+from scripts.e2e.regional.general_live_fixture import VariantInconclusive, VariantNotRun
 from scripts.e2e.regional.general_live_gpu_replay import (
     NVLINK_FAMILY_MEMBERS,
     GpuSurvey,
+    put,
+    step,
 )
+from scripts.e2e.regional.general_live_gpu_replay import plan as replay_plan
 from tests.regional._general_live_fakes import FakeRegional, make_context, make_settings
 from tests.regional._general_live_gpu_fakes import (
     audit_records,
@@ -21,7 +24,9 @@ from tests.regional._general_live_gpu_fakes import (
     gpu_cpu_python,
     gpu_incident,
     gpu_workflow,
+    survey,
 )
+from tools import gpu_dcgm_field_replay as tool
 
 SPECS = {spec.variant: spec for spec in links.VARIANTS}
 #: 020 and 022 both have a ``counter_reset``; ``SPECS`` keeps 022's.
@@ -821,3 +826,144 @@ def test_product_grades_every_nvlink_family_member_alike() -> None:
         "WARNING",
         "RUN_DIAGNOSTICS",
     )
+
+
+# --------------------------------------------------------------------------- #
+# 022 XID join: the gauge the exporter omits while the GPU is healthy
+# --------------------------------------------------------------------------- #
+def _no_incident_cpu():
+    return gpu_cpu_python(
+        activity=_activity([]),
+        gpu_state={"active_findings": [], "batches": [{"observed_at": "t"}]},
+    )
+
+
+@pytest.mark.parametrize("variant", ["same_gpu_xid", "wrong_gpu_xid", "expired_xid"])
+def test_xid_join_plans_declare_the_gauge_absent_and_date_its_change(
+    tmp_path: Path, variant: str
+) -> None:
+    # The live survey (2026-10-26, p5en H200): no GPU publishes the gauge, and
+    # before this the three variants aborted at their first armed read.
+    assert "xid_last_error" not in survey()["exporter"]["gpus"][G1]["values"]
+    fake = dcgm_probe(audit=audit_records({f"{G1}/pcie_replay_total": 1.0}))
+    ctx = _ctx(
+        tmp_path,
+        variant,
+        probe=fake,
+        cpu=_no_incident_cpu(),
+        approvals=("DCGM_XID_GAUGE",),
+    )
+    out = getattr(links, variant)(ctx)
+    assert out["verdict"] in {"PASS", "FAIL"}, out
+    installed = json.loads((ctx.case_dir / "plan.json").read_text())
+    assert installed["profile"] == "pcie_xid"
+    assert installed["fields"] == {"xid_last_error": {"absent_when_healthy": True}}
+    assert tool.validate_plan(installed)["fields"] == installed["fields"]
+    steps = installed["steps"]
+    xid_gpu = G0 if variant == "wrong_gpu_xid" else G1
+
+    def sets(step: dict[str, Any]) -> set[tuple[str, int]]:
+        return {(op["field"], op["value"]) for op in step["ops"] if op["op"] == "set"}
+
+    def adds(step: dict[str, Any]) -> list[dict[str, Any]]:
+        return [op for op in step["ops"] if op["op"] == "add"]
+
+    assert steps[0] == {"reads": 3, "ops": []}, "pass-through baseline first"
+    # The gauge at 0 beside an under-limit PCIe step: every read delivered, the
+    # product's gauge baseline established before the change.
+    assert steps[1]["reads"] == links.GAUGE_BASELINE_READS == 3
+    assert sets(steps[1]) == {("xid_last_error", 0)}
+    assert adds(steps[1]) == [
+        {
+            "op": "add",
+            "field": "pcie_replay_total",
+            "gpus": [G1],
+            "value": links.under_limit_increment(15),
+        }
+    ]
+    held = steps[-1]
+    assert held["until_advance"] is True and held["reads"] == 40, held
+    assert sets(held) == {("xid_last_error", 32)}
+    assert [op["value"] for op in adds(held)] == [links.over_limit_increment(15)]
+    assert all(
+        op["gpus"] == [xid_gpu]
+        for step in steps[1:]
+        for op in step["ops"]
+        if op["field"] == "xid_last_error"
+    ), steps
+    if variant == "expired_xid":
+        # The dated change, then the gauge alone past the correlation window.
+        assert len(steps) == 4, steps
+        assert steps[2] == {
+            "reads": 4,
+            "ops": [
+                {"op": "set", "field": "xid_last_error", "gpus": [G1], "value": 32}
+            ],
+        }
+        assert out["gap_reads"] == 4
+    else:
+        assert len(steps) == 3, steps
+    assert out["second_component"] == "xid_last_error"
+    assert out["absent_when_healthy"] is True and out["xid_gauge_published"] is False
+    assert out["exporter_metrics"] == ["DCGM_FI_DEV_XID_ERRORS"]
+    assert any("omits it while healthy" in note for note in out["notes"]), out["notes"]
+    assert out["gpu_uuid"] == G1
+    if variant == "wrong_gpu_xid":
+        assert out["xid_gpu"] == G0
+    deploys = [call for call in fake.calls if call[0] == "deploy-proxy"]
+    assert len(deploys) == 1 and "pcie_xid" in deploys[0], fake.calls
+
+
+def test_expired_gap_outlasts_the_correlation_window() -> None:
+    from gpu_fault.gpu_metrics import GpuMetricsThresholds
+
+    assert (
+        links.CORRELATION_WINDOW_SECONDS
+        == GpuMetricsThresholds().correlation_window_seconds
+        == 45
+    )
+    assert links.expired_gap_reads(15) == 4
+    for interval in (5, 10, 15, 20, 30, 45, 60):
+        gap = links.expired_gap_reads(interval)
+        assert gap * interval > links.CORRELATION_WINDOW_SECONDS, (interval, gap)
+        assert gap >= 2, "one read for the change, one past the window"
+
+
+def test_component_pair_accepts_the_gauge_the_exporter_omits_while_healthy() -> None:
+    pair = GpuSurvey(survey()).component_pair("pcie_replay_total", ["xid_last_error"])
+    assert (pair.gpu, pair.companion, pair.absent_when_healthy) == (
+        G1,
+        "xid_last_error",
+        True,
+    )
+    assert pair.exporter_metrics == ("DCGM_FI_DEV_XID_ERRORS",)
+    assert pair.keys() == [f"{G1}/pcie_replay_total", f"{G1}/xid_last_error"]
+    assert "omits it while healthy" in pair.note(), pair.note()
+    assert pair.evidence()["absent_when_healthy"] is True
+    published = GpuSurvey(
+        survey(fields=("pcie_replay_total", "xid_last_error"))
+    ).component_pair("pcie_replay_total", ["xid_last_error"])
+    assert published.absent_when_healthy is False
+    assert published.exporter_metrics == ("xid_last_error",), "the surveyed name"
+    assert "exporter xid_last_error" in published.note(), published.note()
+    # Only the allow-listed gauge: any other absent companion stays NOT_RUN.
+    with pytest.raises(VariantNotRun) as absent:
+        GpuSurvey(survey()).component_pair(
+            "pcie_replay_total", ["retired_pages_sbe_total"]
+        )
+    assert absent.value.reason == "CAPABILITY_ABSENT"
+    # The declaration passes the runner's builder and the tool's validator alike.
+    built = replay_plan(
+        "pcie_xid",
+        step(1, put("xid_last_error", [G1], 32)),
+        absent_when_healthy=["xid_last_error"],
+    )
+    assert built["fields"] == {"xid_last_error": {"absent_when_healthy": True}}
+    assert tool.validate_plan(built)["fields"] == built["fields"]
+    assert "fields" not in replay_plan("pcie_xid", step(1)), "nothing declared"
+    with pytest.raises(VariantInconclusive, match="may not be declared"):
+        replay_plan(
+            "pcie_xid",
+            step(1, put("pcie_replay_total", [G1], 5)),
+            absent_when_healthy=["pcie_replay_total"],
+        )

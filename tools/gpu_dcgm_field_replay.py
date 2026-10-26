@@ -20,6 +20,24 @@ needs the real sample it derives from in the upstream scrape, and a real
 upstream change of a targeted reading during the run aborts the replay (a
 real fault is never masked by a replayed value).
 
+The one exception is declared, per field, in the plan and allow-listed here
+(``ABSENT_WHEN_HEALTHY``): the DCGM last-XID gauge, which the exporter does
+not publish until the GPU has had an XID -- its absence *is* the healthy
+reading, so a plan that must replay it can never find it upstream on a healthy
+node (live 2026-10-26, every XID-join variant of GF-GENERAL-LIVE-022 aborted
+at its baseline read, "targeted reading absent upstream"). With ``fields:
+{"xid_last_error": {"absent_when_healthy": true}}`` the baseline accepts the
+missing reading, a ``set`` synthesises the line from the same GPU's own
+published label set (plus the exporter's XID labels) under the exporter's
+HELP/TYPE header, a real appearance of the gauge upstream still aborts, and
+the line vanishes again with the step that set it, the disarm, the deadline or
+the end of the plan -- where the real exporter keeps the last XID published for
+as long as DCGM's cache holds the sample (its watch asks for the legacy
+10-minute keep-age: dcgm-exporter 4.8.4 ``internal/pkg/devicewatcher/const.go``
+lines 23-24, ``maxKeepAge = 600.0`` / ``maxKeepSamples = 0``; whether DCGM
+drops the lone event sample at that age was not verified; a hostengine restart
+clears it). Every other field keeps the refusal.
+
 No GPU, Kubernetes or collector configuration is changed by this tool. Do not
 point a production collector at this test endpoint. A replay proves the
 processing chain, never the physical fault: every receipt says
@@ -93,8 +111,105 @@ FABRIC_FIELDS = frozenset({"fabric_manager_status", "fabric_manager_error_code"}
 PCIE_FIELDS = frozenset({"pcie_replay_total"})
 #: The DCGM last-XID gauge. The product turns its every change into an XID
 #: event it trusts like a kernel one, so only XID 32 (catalog RESTART_APP,
-#: monitor-only on an idle node) may be replayed; 79 would plan a reboot.
+#: monitor-only on an idle node) may be replayed; 79 would plan a reboot. ``0``
+#: is the product's own "no XID" reading (``gpu_metrics._xid_event`` mints an
+#: event only for ``xid > 0`` and only against a stored baseline; the collector
+#: breaches only ``> 0``): a plan serves it first so the later 32 is a *dated
+#: change*, not a first-seen value the product baselines silently.
 XID_FIELDS = frozenset({"xid_last_error"})
+
+
+@dataclass(frozen=True)
+class AbsentGauge:
+    """How to synthesise one gauge the exporter omits while the GPU is healthy."""
+
+    #: The exporter sample name and the HELP text this product's exporter
+    #: configuration gives it (``deploy/dataplane/dcgm-counters.csv``).
+    name: str
+    documentation: str
+    #: Labels the exporter adds to this sample only, by value.
+    attributes: dict[int, dict[str, str]]
+
+    def labels(self, value: float) -> dict[str, str]:
+        return dict(self.attributes.get(int(value), {}))
+
+
+#: Fields whose *absence* is the healthy reading: a plan may declare one of
+#: these ``absent_when_healthy`` (``fields`` in the plan; nothing else, never a
+#: blanket switch) and the baseline then accepts the missing sample instead of
+#: refusing to invent it. The only member is the DCGM last-XID gauge, which
+#: dcgm-exporter publishes only once DCGM holds an XID for the GPU:
+#:
+#: * dcgm-exporter 4.8.4 (the image this product deploys is
+#:   ``nvcr.io/nvidia/k8s/dcgm-exporter:4.6.1-4.8.4-distroless``; tag 4.8.4 of
+#:   https://github.com/NVIDIA/dcgm-exporter, 2026-09-18),
+#:   ``internal/pkg/collector/gpu_collector.go``: ``toString`` (line 1022)
+#:   ``if value.Status != dcgm.DCGM_ST_OK { return skipDCGMValue }`` and
+#:   ``if isInt64Blank(v) { return skipDCGMValue }``; ``toMetric`` (line 902,
+#:   loop at 931-940) ``// Filter out counters with no value and ignored fields
+#:   for this entity`` -> ``if v == skipDCGMValue { ... continue }``;
+#:   ``internal/pkg/collector/utils.go`` ``isInt64Blank`` ("These values
+#:   indicate no valid data is available.", log text "Skipping blank DCGM field
+#:   value"). The same ``toMetric`` (lines 950-958) adds ``err_code`` /
+#:   ``err_msg`` labels to the XID sample from ``xid_errors.go`` (line 21
+#:   ``0: "No Error"``, line 53 ``32: "Invalid or corrupted push buffer
+#:   stream"``), rendered as labels by ``rendermetrics/render_metrics.go``
+#:   line 486 (``builder.addMap(metric.Attributes)``).
+#: * DCGM v4.6.1 (https://github.com/NVIDIA/DCGM, tag v4.6.1)
+#:   ``dcgmlib/src/DcgmCacheManager.cpp``: the polled-field switch, lines
+#:   13759-13761, ``case DCGM_FI_DEV_XID_ERROR: case DCGM_FI_DEV_NVLINK_ERROR:
+#:   break; /* These are handled by the NVML event thread (m_eventThread) */``;
+#:   ``RecordXidForGpu`` (line 7535) appends the value only when an XID event
+#:   arrives (``AppendEntityInt64(threadCtx, eventData, 0, now, expireTime)``,
+#:   from ``nvmlEventTypeXidCriticalError`` at lines 7883-7891 and the kmsg
+#:   parser at line 7804). Before the first XID the cache holds no sample of
+#:   field 230, so the exporter's read is not ``DCGM_ST_OK`` / is blank and the
+#:   line is skipped. ``dcgmlib/dcgm_fields.h`` lines 803-806: ``/** XID
+#:   errors. The value is the specific XID error */ #define
+#:   DCGM_FI_DEV_XID_ERROR 230`` (line 3659: ``DCGM_FI_DEV_XID_ERRORS`` is the
+#:   compatibility alias); ``dcgmlib/dcgm_structs.h`` lines 56-59: ``Base value
+#:   for 64 bits integer blank. can be used as an unspecified blank`` ->
+#:   ``#define DCGM_INT64_BLANK 0x7ffffffffffffff0``.
+#: * DCGM API docs "Field Identifiers",
+#:   https://docs.nvidia.com/datacenter/dcgm/latest/dcgm-api/dcgm-api-field-ids.html
+#:   ("Last updated on 2026-06-17"): ``DCGM_FI_DEV_XID_ERROR 230 -- XID errors.
+#:   The value is the specific XID error``. The vendor text does not say the
+#:   field is blank until an XID; that follows from the cache-manager source
+#:   above and from the live scrapes (2026-10-26 14:17-14:21Z, both HyperPod
+#:   nodes and the plain-EKS fault node: 28 ``DCGM_FI_*`` names per GPU, no
+#:   ``DCGM_FI_DEV_XID_ERRORS`` on any of the 16 GPUs, although
+#:   ``deploy/dataplane/dcgm-counters.csv`` line 14 requests it).
+#: * The product: ``adapters/gpu_validation.py`` ("DCGM omits XID_ERRORS on
+#:   healthy GPUs on some driver/DCGM combinations"),
+#:   ``docs/en/deployment-and-operations-manual.md`` A.2 ("an optional
+#:   persistent-state supplement and is therefore not listed as a default hard
+#:   requirement of the exporter") and ``docs/部署和运维手册.md``
+#:   ("可选的持久状态补充，因此未列为 exporter 的默认硬性条件").
+#:
+#: Whether any exporter generation publishes ``0`` while healthy is not stated
+#: by the vendor text read above; the replay's ``0`` is the product's own "no
+#: XID" value (``SET_VALUES``), served to give the product a baseline.
+ABSENT_WHEN_HEALTHY: dict[str, AbsentGauge] = {
+    "xid_last_error": AbsentGauge(
+        "DCGM_FI_DEV_XID_ERRORS",
+        # deploy/dataplane/dcgm-counters.csv line 14 (NVIDIA's own default CSV
+        # says "Value of the last XID error encountered."; the live exporter
+        # prints this product's text).
+        "Last XID error code",
+        {
+            0: {"err_code": "0", "err_msg": "No Error"},
+            32: {
+                "err_code": "32",
+                "err_msg": "Invalid or corrupted push buffer stream",
+            },
+        },
+    ),
+}
+#: The sample of the same GPU whose label set a synthesised line clones first
+#: (every GPU-scoped line of dcgm-exporter carries the same labels: gpu, UUID,
+#: pci_bus_id, device, modelName, Hostname, DCGM_FI_DRIVER_VERSION ...); any
+#: other GPU-scoped sample of that GPU serves when the counter is not there.
+LABEL_TEMPLATE_FIELD = "pcie_replay_total"
 #: The live thermal-safety readings. Structural operations never touch them:
 #: blinding the product's temperature protection is not a completeness test.
 SAFETY_FIELDS = frozenset(
@@ -125,7 +240,7 @@ SET_VALUES: dict[str, frozenset[int]] = {
     # dcgmFabricManagerStatus_t (gpu_fault.gpu_fabric_manager).
     "fabric_manager_status": frozenset(range(0, 7)),
     "fabric_manager_error_code": frozenset(range(0, 256)),
-    "xid_last_error": frozenset({32}),
+    "xid_last_error": frozenset({0, 32}),
 }
 LABEL_VALUES = {
     "modelName": re.compile(r"^NVIDIA [A-Za-z0-9][A-Za-z0-9 .-]{0,47}$"),
@@ -278,14 +393,46 @@ def validate_operation(operation: Any, profile: Profile) -> dict[str, Any]:
     return dict(operation)
 
 
+def validate_fields(value: Any, profile: Profile) -> dict[str, dict[str, bool]]:
+    """The plan's per-field declarations: ``absent_when_healthy`` and only on
+    the allow-list, inside the profile. Everything else keeps the refusal."""
+
+    if not isinstance(value, dict):
+        raise ValueError("fields must map field names to their declarations")
+    for name, declaration in value.items():
+        if name not in ABSENT_WHEN_HEALTHY:
+            raise ValueError(
+                f"{name} may not be declared absent_when_healthy; only "
+                f"{sorted(ABSENT_WHEN_HEALTHY)} is absent while healthy"
+            )
+        if name not in profile.fields:
+            raise ValueError(f"field {name!r} is not in this profile's allow-list")
+        if (
+            not isinstance(declaration, dict)
+            or set(declaration) != {"absent_when_healthy"}
+            or declaration["absent_when_healthy"] is not True
+        ):
+            raise ValueError(
+                f'{name} may only be declared {{"absent_when_healthy": true}}'
+            )
+    return {name: dict(declaration) for name, declaration in value.items()}
+
+
 def validate_plan(value: Any) -> dict[str, Any]:
     """The reviewed plan, or ValueError naming what a reviewer would refuse."""
 
-    if not isinstance(value, dict) or set(value) != {"profile", "steps"}:
-        raise ValueError("plan must contain exactly profile and steps")
+    if (
+        not isinstance(value, dict)
+        or not {"profile", "steps"} <= set(value)
+        or not set(value) <= {"profile", "steps", "fields"}
+    ):
+        raise ValueError(
+            "plan must contain exactly profile and steps (and may declare fields)"
+        )
     profile = PROFILES.get(value["profile"])
     if profile is None:
         raise ValueError(f"unknown profile {value['profile']!r}")
+    fields = validate_fields(value.get("fields", {}), profile)
     steps = value["steps"]
     if not isinstance(steps, list) or not 1 <= len(steps) <= MAX_STEPS:
         raise ValueError(f"plan requires 1..{MAX_STEPS} steps")
@@ -313,7 +460,21 @@ def validate_plan(value: Any) -> dict[str, Any]:
         validated.append({"reads": reads, "ops": checked, "until_advance": hold})
     if total > MAX_TOTAL_READS:
         raise ValueError(f"plan exceeds {MAX_TOTAL_READS} collector reads")
-    return {"profile": value["profile"], "steps": validated}
+    return {"profile": value["profile"], "steps": validated, "fields": fields}
+
+
+def absent_when_healthy(plan: dict[str, Any]) -> set[str]:
+    """The fields a validated plan declares absent while the GPU is healthy."""
+
+    return {
+        name
+        for name, declaration in (plan.get("fields") or {}).items()
+        if declaration.get("absent_when_healthy") is True
+    }
+
+
+def _reading(value: float | None) -> str:
+    return "absent" if value is None else str(value)
 
 
 def validate_upstream(url: str, listen_port: int) -> str:
@@ -390,7 +551,9 @@ class Replay:
     deadline: float = 0.0
     disarmed: bool = False
     aborted: str | None = None
-    baseline: dict[tuple[str, str], float] = field(default_factory=dict)
+    #: The real reading of every monitored target at the baseline; ``None``
+    #: for a declared absent-when-healthy gauge the upstream did not publish.
+    baseline: dict[tuple[str, str], float | None] = field(default_factory=dict)
     baseline_taken: bool = False
     offsets: dict[tuple[str, str], int] = field(default_factory=dict)
     outputs: deque = field(default_factory=lambda: deque(maxlen=STALE_DEPTH))
@@ -452,7 +615,14 @@ class Replay:
     def _check_baseline(self, readings: dict[tuple[str, str], float]) -> None:
         wanted = targets(self.plan)
         if not self.baseline_taken:
-            missing = sorted(f"{gpu}/{name}" for gpu, name in wanted - set(readings))
+            # A declared absent-when-healthy gauge may be missing; its GPU may
+            # not (the synthesised line clones that GPU's real label set).
+            tolerated = absent_when_healthy(self.plan)
+            missing = sorted(
+                f"{gpu}/{name}"
+                for gpu, name in wanted - set(readings)
+                if name not in tolerated
+            )
             absent_gpus = sorted(
                 gpu
                 for gpu in target_gpus(self.plan)
@@ -465,15 +635,17 @@ class Replay:
                 )
                 return
             self.baseline = {
-                key: readings[key] for key in wanted if key[1] in MONITORED_FIELDS
+                key: readings.get(key) for key in wanted if key[1] in MONITORED_FIELDS
             }
             self.baseline_taken = True
             return
         for key, value in self.baseline.items():
             current = readings.get(key)
-            if current is None or current != value:
+            # An absent gauge that appears is a real XID: never masked either.
+            if current != value:
                 self.aborted = (
-                    f"real upstream change of {key[0]}/{key[1]}: {value} -> {current}; "
+                    f"real upstream change of {key[0]}/{key[1]}: "
+                    f"{_reading(value)} -> {_reading(current)}; "
                     "a real reading is never masked"
                 )
                 return
@@ -529,6 +701,7 @@ class Replay:
                 for gpu in item["gpus"]:
                     self.offsets.pop((gpu, item["field"]), None)
         values: dict[tuple[str, str], float] = {}
+        puts: set[tuple[str, str]] = set()
         omitted: set[tuple[str, str]] = set()
         omitted_gpus: set[str] = set()
         labels: dict[tuple[str, str], dict[str, str]] = {}
@@ -542,6 +715,7 @@ class Replay:
                 key = (gpu, item["field"])
                 if kind == "set":
                     values[key] = float(item["value"])
+                    puts.add(key)
                 elif kind == "nan":
                     values[key] = math.nan
                 elif kind == "negative":
@@ -584,6 +758,8 @@ class Replay:
         for gpu in sorted(omitted_gpus):
             served[gpu] = "omitted"
         by_name = {family.name: family for family in families}
+        if not self._synthesise(puts, values, templates, families, by_name, served):
+            return body, {}
         for gpu, item in extras:
             template = templates.get((gpu, item["field"]))
             if template is None:
@@ -613,6 +789,55 @@ class Replay:
                 return families
 
         return generate_latest(Registry()), served
+
+    def _synthesise(
+        self,
+        puts: set[tuple[str, str]],
+        values: dict[tuple[str, str], float],
+        templates: dict[tuple[str, str], tuple[Any, Any]],
+        families: list[Any],
+        by_name: dict[str, Any],
+        served: dict[str, Any],
+    ) -> bool:
+        """Serve a ``set`` of a declared absent-when-healthy gauge the upstream
+        does not publish: the line is built from the same GPU's own published
+        label set (``LABEL_TEMPLATE_FIELD`` first) plus the exporter's labels
+        for that value, under the exporter's HELP/TYPE header -- an existing
+        upstream family of the gauge (another GPU's real XID) is joined, not
+        duplicated. Only a ``set`` synthesises; a real sample of the gauge is
+        served the ordinary way. False after an abort.
+        """
+
+        tolerated = absent_when_healthy(self.plan)
+        for key in sorted(puts):
+            gpu, name = key
+            if key in templates or name not in tolerated:
+                continue
+            template = templates.get((gpu, LABEL_TEMPLATE_FIELD)) or next(
+                (item for (owner, _field), item in templates.items() if owner == gpu),
+                None,
+            )
+            if template is None:
+                self.aborted = f"no real sample of {gpu} to clone a label set from"
+                return False
+            _family, sample = template
+            gauge = ABSENT_WHEN_HEALTHY[name]
+            target = by_name.get(gauge.name)
+            if target is None:
+                target = Metric(gauge.name, gauge.documentation, "gauge")
+                families.append(target)
+                by_name[gauge.name] = target
+            value = values[key]
+            target.samples.append(
+                sample._replace(
+                    name=gauge.name,
+                    labels={**sample.labels, **gauge.labels(value)},
+                    value=value,
+                )
+            )
+            served[f"{gpu}/{name}"] = value
+            served[f"{gpu}/{name}#synthesised"] = gauge.name
+        return True
 
 
 def make_server(upstream: str, port: int, replay: Replay, audit: Any) -> HTTPServer:

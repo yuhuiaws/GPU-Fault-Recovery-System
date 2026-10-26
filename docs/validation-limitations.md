@@ -3254,6 +3254,84 @@ in the case's `probe-error.json`
 (`tests/regional/test_general_live_dcgm_deploy_profile.py`). The trio is to be
 re-run on both clusters.
 
+022's XID-join trio then ran on both HyperPod lanes (2026-10-26 14:17-14:21Z,
+release R13g, harness live18) and ended INCONCLUSIVE at the replay's first
+armed read -- `the replay aborted: targeted reading absent upstream; refusing
+invented samples: GPU-80f702c5-…/xid_last_error` (`same_gpu_xid` and
+`expired_xid` on hp; `wrong_gpu_xid` on hpb, GPU-036afe17-…) -- and the same
+three were held on plain EKS, whose exporter publishes the same field set. The
+node was not the cause: the survey saw 28 `DCGM_FI_*` names on each of the 16
+GPUs and `DCGM_FI_DEV_XID_ERRORS` on none, although
+`deploy/dataplane/dcgm-counters.csv` line 14 requests it. dcgm-exporter
+publishes a field only when DCGM returns an OK, non-blank value: tag 4.8.4
+(2026-09-18; the deployed image is
+`nvcr.io/nvidia/k8s/dcgm-exporter:4.6.1-4.8.4-distroless`),
+`internal/pkg/collector/gpu_collector.go`, `toString` (line 1022: `if
+value.Status != dcgm.DCGM_ST_OK { return skipDCGMValue }`, `if isInt64Blank(v)
+{ return skipDCGMValue }`) and `toMetric` (lines 931-940: `// Filter out
+counters with no value and ignored fields for this entity` … `continue`),
+https://github.com/NVIDIA/dcgm-exporter/blob/4.8.4/internal/pkg/collector/gpu_collector.go
+(`internal/pkg/collector/utils.go` `isInt64Blank`: "These values indicate no
+valid data is available."). And DCGM fills field 230 only from an XID event:
+v4.6.1 `dcgmlib/src/DcgmCacheManager.cpp` lines 13759-13761 (`case
+DCGM_FI_DEV_XID_ERROR: case DCGM_FI_DEV_NVLINK_ERROR: break; /* These are
+handled by the NVML event thread (m_eventThread) */`) and `RecordXidForGpu`
+(line 7535, `AppendEntityInt64(threadCtx, eventData, 0, now, expireTime)`, on
+`nvmlEventTypeXidCriticalError` and from the kmsg parser),
+https://github.com/NVIDIA/DCGM/blob/v4.6.1/dcgmlib/src/DcgmCacheManager.cpp;
+`dcgmlib/dcgm_fields.h` lines 803-806 define it as `/** XID errors. The value
+is the specific XID error */ #define DCGM_FI_DEV_XID_ERROR 230`
+(`DCGM_FI_DEV_XID_ERRORS` is the compatibility alias, line 3659), and the DCGM
+API reference "Field Identifiers"
+(https://docs.nvidia.com/datacenter/dcgm/latest/dcgm-api/dcgm-api-field-ids.html,
+"Last updated on 2026-06-17") carries the same sentence. So on a healthy GPU
+the gauge's absence *is* its reading -- the product knows
+(`src/gpu_fault/adapters/gpu_validation.py`: "DCGM omits XID_ERRORS on healthy
+GPUs on some driver/DCGM combinations"; deployment manual A.2: "an optional
+persistent-state supplement and is therefore not listed as a default hard
+requirement of the exporter") -- and a plan that must put it could never find
+a real sample to derive from: the trio could not arm on any healthy node. The
+vendor text does not itself say "blank until an XID"; that follows from the
+cache-manager source and the live scrapes.
+
+A plan may now declare, per field and only for the tool's `ABSENT_WHEN_HEALTHY`
+allow-list (the gauge alone), `fields: {"xid_last_error": {"absent_when_healthy":
+true}}` -- written explicitly into the plan JSON on the node -- so the baseline
+accepts the missing reading; a `set` then synthesises the line from the same
+GPU's own published label set (its `DCGM_FI_DEV_PCIE_REPLAY_COUNTER` line first:
+gpu, UUID, pci_bus_id, device, modelName, Hostname, DCGM_FI_DRIVER_VERSION, plus
+the `err_code` / `err_msg` labels the exporter adds to that value, `xid_errors.go`)
+under the exporter's `# HELP DCGM_FI_DEV_XID_ERRORS Last XID error code` /
+`# TYPE … gauge` header; a real appearance of the gauge upstream aborts the
+run like any real change; every other field keeps the "refusing invented
+samples" refusal; and the runner's `ComponentPair` accepts the gauge as an
+unpublished companion (`absent_when_healthy` in the evidence). Two product
+facts shape the plans. The product mints a gauge-change event only against a
+stored baseline (`observe_xid_metric`: `previous is not None and xid > 0 and
+xid != previous.xid`) and baselines a first-seen value silently, so a first 32
+on this exporter -- or a 32 served again after an earlier run left the
+baseline at 32 -- would join nothing; every plan therefore serves the gauge at
+`0` (the product's own "no XID" value; whether any exporter generation
+publishes `0` while healthy is not stated by the vendor text read) beside an
+under-limit PCIe step for three delivered reads before the 32, and
+`expired_xid` holds the 32 alone for `expired_gap_reads` (4 reads at 15 s, one
+more than the 45 s correlation window) before its ramp. And the synthesised
+line vanishes with the step that stops setting it, the disarm, the deadline or
+the plan's end, where the real exporter keeps the last XID published for as
+long as DCGM's cache holds the sample -- its watch asks for the legacy
+10-minute keep-age (dcgm-exporter 4.8.4 `internal/pkg/devicewatcher/const.go`
+lines 23-24: `maxKeepAge = 600.0 // How long to keep data for this field in
+seconds`, `maxKeepSamples = 0`; `device_watcher.go` line 160: "preserves the
+legacy 10-minute age and unlimited-sample retention policy"); whether DCGM
+drops the lone event sample at that age was not verified, and a hostengine
+restart clears it: the plans serve it through every later step, both
+oracles are judged during the held step and the recovery wait reads only
+`pcie_replay_total` findings, so the vanishing changes no verdict -- its one
+trace is the product's gauge baseline left at 32, which the next plan's `0`
+resets (`tests/test_gpu_dcgm_field_replay.py`,
+`tests/regional/test_general_live_gpu_links.py`). The trio is to be re-run on
+both clusters.
+
 021's three no-finding variants (`before_window`, `ungraded_product`,
 `monitor_restart`) have no live evidence yet either. On 2026-10-26 (HyperPod,
 the hpb lane's exclusive node, release R13g, harness live17)

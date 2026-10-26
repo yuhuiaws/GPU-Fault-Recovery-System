@@ -62,7 +62,7 @@ from scripts.e2e.regional.general_live_gpu_verdicts import node_hardware_errors
 from scripts.e2e.regional.general_live_registry import LIVE_REPLAY, VariantSpec
 from scripts.e2e.regional.general_live_verdicts import verdict
 from scripts.e2e.regional.probes.general_live_dcgm_probe import PROFILE_NAME
-from tools.gpu_dcgm_field_replay import MAX_READS_PER_STEP
+from tools.gpu_dcgm_field_replay import ABSENT_WHEN_HEALTHY, MAX_READS_PER_STEP
 from tools.gpu_dcgm_field_replay import PROFILES as FIELD_PROFILES
 from tools.gpu_dcgm_field_replay import validate_plan
 
@@ -177,12 +177,22 @@ class ComponentPair:
     Hopper does not publish). ``exporter_metrics`` are the sample names the
     companion arrives under, so a variant's evidence says which reading it
     exercised.
+
+    The one companion whose absence is the healthy reading -- the DCGM
+    last-XID gauge, which dcgm-exporter publishes only once the GPU has had an
+    XID (the tool's ``ABSENT_WHEN_HEALTHY``, with the vendor sources) -- is
+    accepted unpublished: ``absent_when_healthy`` says the survey did not see
+    it on this GPU, the plan declares it so the tool synthesises the line from
+    the GPU's own label set, and ``exporter_metrics`` names the sample the
+    tool will serve (live 2026-10-26, p5en H200, every 022 XID-join variant
+    aborted at its baseline read: "targeted reading absent upstream").
     """
 
     gpu: str
     primary: str
     companion: str
     exporter_metrics: tuple[str, ...]
+    absent_when_healthy: bool = False
 
     @property
     def components(self) -> tuple[str, str]:
@@ -195,9 +205,15 @@ class ComponentPair:
 
     def note(self) -> str:
         metrics = ", ".join(self.exporter_metrics) or "exporter name not surveyed"
+        origin = (
+            "exporter omits it while healthy; the replay synthesises the line from "
+            "the GPU's own label set"
+            if self.absent_when_healthy
+            else f"exporter {metrics}"
+        )
         return (
             f"second component exercised: {self.companion} beside {self.primary} "
-            f"on {self.gpu} (exporter {metrics})"
+            f"on {self.gpu} ({origin})"
         )
 
     def evidence(self) -> dict[str, Any]:
@@ -206,6 +222,7 @@ class ComponentPair:
             "component_metrics": list(self.components),
             "second_component": self.companion,
             "exporter_metrics": list(self.exporter_metrics),
+            "absent_when_healthy": self.absent_when_healthy,
         }
 
 
@@ -358,7 +375,10 @@ class GpuSurvey:
         (not in ``avoid``) reporting both the primary and that candidate is
         the target. No candidate beside the primary on any GPU is
         ``NOT_RUN(CAPABILITY_ABSENT)`` naming every candidate -- before
-        anything is installed on the node.
+        anything is installed on the node. A candidate the exporter omits
+        while the GPU is healthy (``ABSENT_WHEN_HEALTHY``) is accepted on any
+        anchor and flagged ``absent_when_healthy`` when that GPU does not
+        publish it; the plan must declare it so the tool synthesises it.
         """
 
         anchors = [gpu for gpu in self.gpus_with(primary) if gpu not in avoid]
@@ -367,14 +387,23 @@ class GpuSurvey:
                 "CAPABILITY_ABSENT", f"no GPU on the node reports {primary}"
             )
         for companion in candidates:
-            gpus = [gpu for gpu in anchors if self.has(gpu, companion)]
+            omitted = ABSENT_WHEN_HEALTHY.get(companion)
+            gpus = [
+                gpu
+                for gpu in anchors
+                if self.has(gpu, companion) or omitted is not None
+            ]
             if gpus:
                 gpu = gpus[-1]
+                published = self.has(gpu, companion)
                 return ComponentPair(
                     gpu=gpu,
                     primary=primary,
                     companion=companion,
-                    exporter_metrics=tuple(self.exporter_metrics(gpu, companion)),
+                    exporter_metrics=tuple(self.exporter_metrics(gpu, companion))
+                    if published or omitted is None
+                    else (omitted.name,),
+                    absent_when_healthy=not published,
                 )
         raise VariantNotRun(
             "CAPABILITY_ABSENT",
@@ -558,7 +587,9 @@ def label(name: str, gpus: Iterable[str], key: str, value: str) -> dict[str, Any
     }
 
 
-def plan(profile: str, *steps: dict[str, Any]) -> dict[str, Any]:
+def plan(
+    profile: str, *steps: dict[str, Any], absent_when_healthy: Iterable[str] = ()
+) -> dict[str, Any]:
     """A field plan on one of the tool's profiles.
 
     The name is checked here, before the survey's node is touched, against
@@ -567,6 +598,11 @@ def plan(profile: str, *steps: dict[str, Any]) -> dict[str, Any]:
     accepted only ``[a-z]{3,16}`` while 022's XID-join plans use ``pcie_xid``,
     and the three variants ended INCONCLUSIVE at ``deploy-proxy`` with the
     refusal's message withheld.
+
+    ``absent_when_healthy`` names the fields the plan declares the exporter
+    omits while the GPU is healthy (``fields: {<name>: {"absent_when_healthy":
+    true}}`` in the plan JSON, explicit on the node too); the tool's validator
+    refuses any name outside its allow-list.
     """
 
     if profile not in FIELD_PROFILES or PROFILE_NAME.fullmatch(profile) is None:
@@ -574,7 +610,10 @@ def plan(profile: str, *steps: dict[str, Any]) -> dict[str, Any]:
             f"replay plan profile {profile!r} is not a field-tool profile the "
             "host controller serves (harness defect; nothing was deployed)"
         )
-    document = {"profile": profile, "steps": list(steps)}
+    document: dict[str, Any] = {"profile": profile, "steps": list(steps)}
+    declared = list(absent_when_healthy)
+    if declared:
+        document["fields"] = {name: {"absent_when_healthy": True} for name in declared}
     # The tool's own reviewer runs here too: a plan it would refuse at its
     # start (``parser.error``, exit 2) dies inside the transient unit, and the
     # runner reads only ``unit_down``. Live 2026-10-26 (HyperPod hpb, 021

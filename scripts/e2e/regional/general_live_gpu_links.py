@@ -34,8 +34,12 @@ generation's baseline (live 2026-10-26 both plans were storms -- +50 per read,
 ``same_gpu_xid`` / ``wrong_gpu_xid`` / ``expired_xid`` drive
 the PCIe<->XID join through the DCGM last-XID gauge (replayed only as XID 32,
 catalog RESTART_APP and monitor-only on an idle node; ``--approve
-DCGM_XID_GAUGE``). ``expired_xid`` is an expected FAIL: the gauge fallback has
-no age check, so a stale gauge keeps re-arming the CRITICAL DRAIN composite.
+DCGM_XID_GAUGE``). The exporter omits that gauge while the GPU is healthy, so
+the plans declare it ``absent_when_healthy`` and the tool synthesises the line
+from the GPU's own label set; each plan serves the gauge at 0 first, because
+the product dates a gauge change only against a stored baseline. Since batch
+160 ``expired_xid`` expects PASS: the gauge is dated by its change event, so a
+change older than the correlation window joins nothing.
 
 ``independent_fatal_event`` delivers a trusted kernel XID beside the held
 NVLink counter fault through lane K's kernel-source replay
@@ -1010,18 +1014,102 @@ def source_boot_change(ctx: VariantContext) -> dict[str, Any]:
     )
 
 
+#: Reads the plan serves the last-XID gauge at ``0`` -- beside an under-limit
+#: PCIe step, so every read is delivered (``counter-increased``) -- before the
+#: gauge changes. The product mints a gauge-change event only against a stored
+#: baseline (``store.observe_xid_metric``: ``previous is not None and xid > 0
+#: and xid != previous.xid``) and baselines a first-seen value silently; on an
+#: exporter that omits the gauge while healthy the first 32 would be exactly
+#: that, and so would a 32 served again after an earlier run left the
+#: baseline at 32. Three delivered reads cover a skipped scrape and the
+#: outbox's delay.
+GAUGE_BASELINE_READS = 3
+#: The control plane's PCIe<->XID correlation window: the product default
+#: (``gpu_fault.gpu_metrics.GpuMetricsThresholds``), which the live site's
+#: ``GPU_FAULT_DCGM_CORRELATION_WINDOW_SECONDS`` repeats; pinned by test.
+CORRELATION_WINDOW_SECONDS = 45
+
+
+def expired_gap_reads(interval: int) -> int:
+    """Reads ``expired_xid`` holds the gauge at 32 alone before the PCIe ramp.
+
+    The ramp's first breach must fall outside the correlation window of the
+    gauge's *change* (one read more than the window holds at the collector's
+    interval): 4 reads at 15 s. Inside it the join would be legitimate and the
+    variant would blame the product for its own plan.
+    """
+
+    return -(-CORRELATION_WINDOW_SECONDS // max(1, int(interval))) + 1
+
+
+def _xid_join_steps(
+    interval: int, gpu: str, xid_gpu: str, *, gap_reads: int = 0
+) -> list[dict[str, Any]]:
+    """The XID-join plan: pass-through baseline; the gauge at 0 (the product's
+    "no XID" reading) with an under-limit PCIe step; optionally the gauge at 32
+    alone for ``gap_reads``; then the gauge at 32 with the over-limit PCIe ramp,
+    held for the oracle. The gauge line stays served -- as the real exporter
+    keeps the last XID published for as long as DCGM's cache holds the sample
+    (the exporter's legacy 10-minute keep-age watch; a hostengine restart
+    clears it) -- through every step after its first, and vanishes with the
+    disarm."""
+
+    steps = [
+        baseline(),
+        step(
+            GAUGE_BASELINE_READS,
+            put("xid_last_error", [xid_gpu], 0),
+            add("pcie_replay_total", [gpu], under_limit_increment(interval)),
+        ),
+    ]
+    if gap_reads:
+        steps.append(step(gap_reads, put("xid_last_error", [xid_gpu], 32)))
+    steps.append(
+        step(
+            40,
+            put("xid_last_error", [xid_gpu], 32),
+            add("pcie_replay_total", [gpu], over_limit_increment(interval)),
+            hold=True,
+        )
+    )
+    return steps
+
+
 def _pcie_xid(ctx: VariantContext, *, same_gpu: bool) -> dict[str, Any]:
+    """The same-GPU join (CRITICAL DRAIN composite) and the cross-GPU no-join.
+
+    The gauge is replayed through the tool's absent-when-healthy declaration:
+    dcgm-exporter publishes ``DCGM_FI_DEV_XID_ERRORS`` only once DCGM holds an
+    XID for the GPU (live 2026-10-26 none of the 16 HyperPod GPUs nor the
+    plain-EKS fault node had the line, and every XID-join variant aborted at
+    its baseline read), so the survey cannot see it and the plan declares it
+    (``ComponentPair.absent_when_healthy``); the tool synthesises the line from
+    the GPU's own label set. After a real XID the exporter keeps that line for
+    as long as DCGM's cache holds the sample (its watch asks for the legacy
+    10-minute keep-age, dcgm-exporter 4.8.4 ``devicewatcher/const.go`` lines
+    23-24; a hostengine restart clears it); the replay's line vanishes at the
+    disarm instead. That changes no verdict here: both oracles are judged
+    during the
+    held step, a same-GPU composite is an incident already recorded, the
+    cross-GPU "no composite" and plain finding were judged with the line
+    served, and the recovery wait reads only ``pcie_replay_total`` findings.
+    What the vanishing leaves behind is the product's gauge baseline at 32
+    (``xid_metric_baseline``), which is why every plan serves ``0`` first.
+    """
+
     survey = run_gpu_survey(ctx)
-    gpu = survey.target("pcie_replay_total")
+    pair = survey.component_pair("pcie_replay_total", ["xid_last_error"])
+    gpu = pair.gpu
     xid_gpu = gpu if same_gpu else survey.target("pcie_replay_total", avoid=[gpu])
     since = utc_now()
-    increment = over_limit_increment(survey.interval)
-    operations = [
-        put("xid_last_error", [xid_gpu], 32),
-        add("pcie_replay_total", [gpu], increment),
-    ]
     repl = DcgmReplay(
-        ctx, plan("pcie_xid", baseline(), step(40, *operations, hold=True)), _hold(ctx)
+        ctx,
+        plan(
+            "pcie_xid",
+            *_xid_join_steps(survey.interval, gpu, xid_gpu),
+            absent_when_healthy=[pair.companion],
+        ),
+        _hold(ctx),
     )
     arm_and_confirm(repl, f"{gpu}/pcie_replay_total")
     detection = wait_gpu_incident(
@@ -1054,7 +1142,15 @@ def _pcie_xid(ctx: VariantContext, *, same_gpu: bool) -> dict[str, Any]:
             "hardware": no_hardware(detection),
         }
     recover_counter(ctx, repl, since, names=["pcie_replay_total"])
-    return result(stages, extra={"gpu_uuid": gpu, "xid_gpu": xid_gpu})
+    return result(
+        stages,
+        notes=[pair.note()],
+        extra={
+            **pair.evidence(),
+            "xid_gpu": xid_gpu,
+            "xid_gauge_published": survey.has(xid_gpu, "xid_last_error"),
+        },
+    )
 
 
 def same_gpu_xid(ctx: VariantContext) -> dict[str, Any]:
@@ -1066,25 +1162,35 @@ def wrong_gpu_xid(ctx: VariantContext) -> dict[str, Any]:
 
 
 def expired_xid(ctx: VariantContext) -> dict[str, Any]:
+    """A PCIe rate against a gauge whose change is older than the window.
+
+    The gauge goes 0 -> 32 (the dated change, one ``xid-changed`` delivery),
+    is held at 32 alone for ``expired_gap_reads`` and only then the PCIe ramp
+    starts, so the breach falls outside the correlation window of the change.
+    Since batch 160 the product dates the gauge by that change event, not by
+    the latest sample (which every scrape refreshes), so the composite must not
+    form and the plain PCIe finding appears: expected PASS. The gauge line is
+    served through both later steps and vanishes at the disarm, after the
+    oracle; the real exporter would keep it for as long as DCGM's cache holds
+    the sample (legacy 10-minute keep-age watch), and the difference is
+    invisible to this verdict (see ``_pcie_xid``).
+    """
+
     survey = run_gpu_survey(ctx)
-    gpu = survey.target("pcie_replay_total")
+    pair = survey.component_pair("pcie_replay_total", ["xid_last_error"])
+    gpu = pair.gpu
     since = utc_now()
-    # Establish the gauge at 32 first (an old event), let the product baseline
-    # it, then at a later unrelated window drive a PCIe rate. The gauge is
-    # "expired" (no fresh XID), yet the product has no age check and re-arms the
-    # CRITICAL DRAIN composite -- the spec says expired XIDs must not join.
     repl = DcgmReplay(
         ctx,
         plan(
             "pcie_xid",
-            baseline(),
-            step(4, put("xid_last_error", [gpu], 32)),
-            step(
-                40,
-                put("xid_last_error", [gpu], 32),
-                add("pcie_replay_total", [gpu], over_limit_increment(survey.interval)),
-                hold=True,
+            *_xid_join_steps(
+                survey.interval,
+                gpu,
+                gpu,
+                gap_reads=expired_gap_reads(survey.interval),
             ),
+            absent_when_healthy=[pair.companion],
         ),
         _hold(ctx),
     )
@@ -1099,8 +1205,6 @@ def expired_xid(ctx: VariantContext) -> dict[str, Any]:
         name="detection",
     )
     composite = composite_incidents(detection, "PCIE_XID_LINK_FAILURE")
-    # expected_outcome=FAIL: PASS only once the product gains an age check and
-    # the expired gauge no longer joins (then the composite is absent).
     stages = {
         "expired_not_joined": []
         if not composite
@@ -1109,7 +1213,15 @@ def expired_xid(ctx: VariantContext) -> dict[str, Any]:
         ],
     }
     recover_counter(ctx, repl, since, names=["pcie_replay_total"])
-    return result(stages, extra={"gpu_uuid": gpu})
+    return result(
+        stages,
+        notes=[pair.note()],
+        extra={
+            **pair.evidence(),
+            "gap_reads": expired_gap_reads(survey.interval),
+            "xid_gauge_published": survey.has(gpu, "xid_last_error"),
+        },
+    )
 
 
 def recovery_evidence(ctx: VariantContext) -> dict[str, Any]:

@@ -841,6 +841,52 @@ PROFILES 与该形状校验；`deploy-proxy` 的拒绝带固定 reason 标识进
 （`reason profile_shape`/`port_busy`/`unit_down`/`no_status`/`armed_at_start`/`source_missing`），
 探针消息经脱敏写入用例目录的 `probe-error.json`
 （`tests/regional/test_general_live_dcgm_deploy_profile.py`）。三个变体尚无现场证据，需在两集群重跑。
+2026-10-26 14:17-14:21Z（HyperPod hp/hpb 两车道，R13g，harness live18）`same_gpu_xid`、
+`expired_xid`（hp）与 `wrong_gpu_xid`（hpb）在回放第一拍即 INCONCLUSIVE："the replay aborted:
+targeted reading absent upstream; refusing invented samples: GPU-…/xid_last_error"；plain EKS 的同三
+变体因 exporter 字段集相同而 HELD。节点无过：survey 看到 16 张 GPU 每张 28 个 `DCGM_FI_*` 名字，
+`DCGM_FI_DEV_XID_ERRORS` 一张都没有，而 `deploy/dataplane/dcgm-counters.csv` 第 14 行请求了它。
+dcgm-exporter 只发布 DCGM 返回 OK 且非空白的值——tag 4.8.4（2026-09-18，部署镜像
+`nvcr.io/nvidia/k8s/dcgm-exporter:4.6.1-4.8.4-distroless`）`internal/pkg/collector/gpu_collector.go`
+的 `toString`（第 1022 行：`if value.Status != dcgm.DCGM_ST_OK { return skipDCGMValue }`、
+`if isInt64Blank(v) { return skipDCGMValue }`）与 `toMetric`（第 931-940 行：`// Filter out counters
+with no value and ignored fields for this entity` … `continue`），
+https://github.com/NVIDIA/dcgm-exporter/blob/4.8.4/internal/pkg/collector/gpu_collector.go ；
+而 DCGM 只在 XID 事件到来时才给字段 230 写值——v4.6.1 `dcgmlib/src/DcgmCacheManager.cpp` 第
+13759-13761 行（`case DCGM_FI_DEV_XID_ERROR: case DCGM_FI_DEV_NVLINK_ERROR: break; /* These are
+handled by the NVML event thread (m_eventThread) */`）与 `RecordXidForGpu`（第 7535 行，
+`AppendEntityInt64(threadCtx, eventData, 0, now, expireTime)`），
+https://github.com/NVIDIA/DCGM/blob/v4.6.1/dcgmlib/src/DcgmCacheManager.cpp ；`dcgm_fields.h` 第
+803-806 行 `/** XID errors. The value is the specific XID error */ #define DCGM_FI_DEV_XID_ERROR 230`
+（`DCGM_FI_DEV_XID_ERRORS` 为兼容别名，第 3659 行），DCGM API 文档 "Field Identifiers"
+（https://docs.nvidia.com/datacenter/dcgm/latest/dcgm-api/dcgm-api-field-ids.html ，"Last updated on
+2026-06-17"）同句。即健康 GPU 上该 gauge 的"缺席"就是它的读数（产品早已知道：
+`src/gpu_fault/adapters/gpu_validation.py` "DCGM omits XID_ERRORS on healthy GPUs on some
+driver/DCGM combinations"；部署手册 A.2 "可选的持久状态补充，因此未列为 exporter 的默认硬性条件"），
+要 `set` 它的计划在健康节点上永远找不到可派生的真实样本，三个变体在任何健康节点上都无法 arm。厂商
+文本本身没有写"XID 之前为空白"，这一点由 cache manager 源码与现场抓取推出。现在计划可按字段、且仅限
+工具 `ABSENT_WHEN_HEALTHY` 允许表（只有该 gauge）声明
+`fields: {"xid_last_error": {"absent_when_healthy": true}}`（显式写入节点上的 plan JSON）：基线接受
+缺失读数；`set` 时工具用同一张 GPU 自己已发布的标签集（优先其 `DCGM_FI_DEV_PCIE_REPLAY_COUNTER` 行：
+gpu、UUID、pci_bus_id、device、modelName、Hostname、DCGM_FI_DRIVER_VERSION，再加 exporter 对该值附加的
+`err_code`/`err_msg`，`xid_errors.go`）合成该行，置于 exporter 的
+`# HELP DCGM_FI_DEV_XID_ERRORS Last XID error code` / `# TYPE … gauge` 头之下；上游真的出现该 gauge 仍
+按真实变化中止；其他字段一律保留 "refusing invented samples" 拒绝；runner 的 `ComponentPair` 接受该
+gauge 作为未发布的 companion（证据带 `absent_when_healthy`）。计划形状由两个产品事实决定：产品只对已有
+基线的 gauge 变化铸造事件（`observe_xid_metric`：`previous is not None and xid > 0 and xid !=
+previous.xid`），首次见到的值静默作为基线——此 exporter 上的第一个 32、或上次运行把基线留在 32 后再次
+送 32 都不会联合——所以每个计划先在低于限额的 PCIe 步旁送 3 拍 gauge=0（产品自己的"无 XID"值；厂商
+文本未说明是否有 exporter 代际在健康时发布 0），再送 32；`expired_xid` 的 32 先单独持有
+`expired_gap_reads`（15 s 采集即 4 拍，比 45 s 关联窗多一拍）再起 PCIe 斜坡。合成行随停止 set 的步、
+disarm、deadline 或计划结束而消失，而真实 exporter 会在 DCGM 缓存仍保有该样本期间一直发布最后一个 XID
+（其 watch 申请的是遗留的 10 分钟保留期：dcgm-exporter 4.8.4 `internal/pkg/devicewatcher/const.go`
+第 23-24 行 `maxKeepAge = 600.0`、`maxKeepSamples = 0`，`device_watcher.go` 第 160 行 "preserves the
+legacy 10-minute age and unlimited-sample retention policy"；DCGM 是否在该时限丢弃这唯一的事件样本未经核实；
+hostengine 重启会清掉它）；计划在
+其后每一步都继续送该行，两个 oracle 都在持有步内判定，恢复等待只看 `pcie_replay_total` finding，所以
+消失不改变判定——唯一痕迹是产品的 gauge 基线留在 32，下一计划的 0 会重置它
+（`tests/test_gpu_dcgm_field_replay.py`、`tests/regional/test_general_live_gpu_links.py`）。三个变体
+需在两集群重跑。
 
 ### GF-GENERAL-LIVE-024
 

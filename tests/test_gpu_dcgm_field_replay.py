@@ -4,6 +4,7 @@ import io
 import json
 import math
 import threading
+from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -909,3 +910,274 @@ def test_composite_profile_serves_the_second_memory_component_the_exporter_has()
         f"{A}/row_remap_correctable_total": 1.0,
     }
     assert receipt["aborted"] is None
+
+
+# --------------------------------------------------------------------------- #
+# A gauge the exporter omits while the GPU is healthy: declared in the plan,
+# synthesised from the GPU's own labels, vanishing with the plan
+# --------------------------------------------------------------------------- #
+LIVE_GPUS = (("0", A, "59"), ("7", B, "A5"))
+#: dcgm-exporter 4.8.4's per-GPU label set as the p5en H200 nodes publish it.
+LIVE_LABELS = (
+    'gpu="{index}",UUID="{uuid}",pci_bus_id="00000000:{bus}:00.0",'
+    'device="nvidia{index}",modelName="NVIDIA H200",'
+    'Hostname="gpu-node-7",DCGM_FI_DRIVER_VERSION="580.95.05"'
+)
+#: The header the live exporter prints for the gauge (this product's
+#: ``deploy/dataplane/dcgm-counters.csv`` row, pinned below).
+XID_HEADER = (
+    "# HELP DCGM_FI_DEV_XID_ERRORS Last XID error code\n"
+    "# TYPE DCGM_FI_DEV_XID_ERRORS gauge\n"
+)
+XID_DECLARED = {"xid_last_error": {"absent_when_healthy": True}}
+
+
+def live_exporter(*, pcie: int = 0, xid: dict[str, int] | None = None) -> bytes:
+    """A two-GPU scrape shaped like the live p5en H200 exporter: HELP/TYPE
+    headers, the full per-GPU label set and -- as dcgm-exporter 4.8.4 does
+    until DCGM holds an XID for the GPU (``toString`` skips a non-OK or blank
+    value; DCGM 4.6.1 fills field 230 only from an XID event) -- no
+    ``DCGM_FI_DEV_XID_ERRORS`` line unless ``xid`` gives a GPU one."""
+
+    lines = [
+        "# HELP DCGM_FI_DEV_PCIE_REPLAY_COUNTER PCIe replay counter",
+        "# TYPE DCGM_FI_DEV_PCIE_REPLAY_COUNTER counter",
+    ]
+    for index, uuid, bus in LIVE_GPUS:
+        labels = LIVE_LABELS.format(index=index, uuid=uuid, bus=bus)
+        lines.append(f"DCGM_FI_DEV_PCIE_REPLAY_COUNTER{{{labels}}} {pcie}")
+    lines += [
+        "# HELP DCGM_FI_DEV_GPU_TEMP GPU temperature in Celsius",
+        "# TYPE DCGM_FI_DEV_GPU_TEMP gauge",
+    ]
+    for index, uuid, bus in LIVE_GPUS:
+        labels = LIVE_LABELS.format(index=index, uuid=uuid, bus=bus)
+        lines.append(f"DCGM_FI_DEV_GPU_TEMP{{{labels}}} 40")
+    if xid:
+        lines += XID_HEADER.rstrip("\n").split("\n")
+        for index, uuid, bus in LIVE_GPUS:
+            if uuid in xid:
+                labels = LIVE_LABELS.format(index=index, uuid=uuid, bus=bus)
+                lines.append(
+                    f'DCGM_FI_DEV_XID_ERRORS{{{labels},err_code="{xid[uuid]}",'
+                    f'err_msg="No Error"}} {xid[uuid]}'
+                )
+    return ("\n".join(lines) + "\n").encode()
+
+
+def labels_of(body: bytes, canonical: str) -> dict[str, dict[str, str]]:
+    """``{GPU UUID: labels}`` of every sample the product parses as ``canonical``."""
+
+    return {
+        sample.gpu_uuid: dict(sample.labels)
+        for sample in parse_dcgm_samples(body.decode())
+        if sample.canonical_name == canonical
+    }
+
+
+def declared_plan(*steps, fields=XID_DECLARED, profile="pcie_xid"):
+    return tool.validate_plan(
+        {
+            "profile": profile,
+            "steps": [{"reads": reads, "ops": ops} for reads, ops in steps],
+            "fields": fields,
+        }
+    )
+
+
+def xid(gpu: str, value: int) -> dict:
+    return {"op": "set", "field": "xid_last_error", "gpus": [gpu], "value": value}
+
+
+def pcie(gpu: str, value: int) -> dict:
+    return {"op": "add", "field": "pcie_replay_total", "gpus": [gpu], "value": value}
+
+
+def test_a_declared_absent_gauge_arms_and_is_synthesised_from_the_gpus_own_labels():
+    # The live 2026-10-26 abort: the plan's gauge is in no line of the scrape.
+    replay = tool.Replay(
+        declared_plan(
+            (1, []),
+            (1, [xid(B, 0), pcie(B, 1)]),
+            (1, [xid(B, 32), pcie(B, 5)]),
+            (1, [pcie(B, 1)]),
+        ),
+        600,
+    )
+    replay.arm()
+    body = live_exporter()
+    output, receipt = serve_once(replay, body)
+    assert receipt["aborted"] is None, receipt
+    assert product_view(output) == product_view(body), (
+        "the baseline serves the real readings"
+    )
+    assert receipt["real"][f"{B}/xid_last_error"] is None, receipt["real"]
+    output, receipt = serve_once(replay, body)
+    assert receipt["aborted"] is None, receipt
+    view = product_view(output)
+    assert view[(B, "xid_last_error")] == [0.0], view
+    assert (A, "xid_last_error") not in view, "the other GPU gets no line"
+    assert view[(B, "pcie_replay_total")] == [1.0], view
+    assert XID_HEADER in output.decode(), output
+    template = labels_of(body, "pcie_replay_total")[B]
+    assert set(template) == {
+        "gpu",
+        "UUID",
+        "pci_bus_id",
+        "device",
+        "modelName",
+        "Hostname",
+        "DCGM_FI_DRIVER_VERSION",
+    }, template
+    assert labels_of(output, "xid_last_error") == {
+        B: {**template, "err_code": "0", "err_msg": "No Error"}
+    }, "the GPU's own label set, plus the exporter's XID labels for the value"
+    assert receipt["served"] == {
+        f"{B}/pcie_replay_total": 1.0,
+        f"{B}/xid_last_error": 0.0,
+        f"{B}/xid_last_error#synthesised": "DCGM_FI_DEV_XID_ERRORS",
+    }, receipt["served"]
+    output, receipt = serve_once(replay, body)
+    assert product_view(output)[(B, "xid_last_error")] == [32.0], output
+    assert labels_of(output, "xid_last_error")[B] == {
+        **template,
+        "err_code": "32",
+        "err_msg": "Invalid or corrupted push buffer stream",
+    }
+    # A step that no longer sets the gauge no longer serves it; the counter
+    # offset of the earlier steps stays (1 + 5 + 1).
+    output, receipt = serve_once(replay, body)
+    assert b"DCGM_FI_DEV_XID_ERRORS" not in output, output
+    assert product_view(output)[(B, "pcie_replay_total")] == [7.0], output
+    assert f"{B}/xid_last_error" not in receipt["served"], receipt["served"]
+    assert serve_once(replay, body)[0] == body, "the finished plan passes through"
+
+
+def test_the_synthesised_line_vanishes_with_the_disarm_and_the_deadline(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(tool.time, "monotonic", lambda: clock[0])
+    body = live_exporter()
+    for ending in ("disarm", "deadline"):
+        replay = tool.Replay(declared_plan((1, []), (50, [xid(B, 32)])), 60)
+        replay.arm()
+        serve_once(replay, body)
+        assert b"DCGM_FI_DEV_XID_ERRORS" in serve_once(replay, body)[0], ending
+        if ending == "disarm":
+            replay.disarm()
+        else:
+            clock[0] += 61.0
+        output, receipt = serve_once(replay, body)
+        assert output == body, f"after the {ending} the real scrape passes through"
+        assert "served" not in receipt, receipt
+
+
+def test_the_declaration_is_refused_for_every_other_field_and_shape():
+    with pytest.raises(ValueError, match="may not be declared absent_when_healthy"):
+        declared_plan(
+            (1, [pcie(B, 1)]),
+            fields={"pcie_replay_total": {"absent_when_healthy": True}},
+        )
+    with pytest.raises(ValueError, match="not in this profile's allow-list"):
+        declared_plan((1, [pcie(B, 1)]), profile="pcie")
+    for shape in (
+        {"absent_when_healthy": False},
+        {"absent_when_healthy": 1},
+        {"absent_when_healthy": True, "since": "boot"},
+        True,
+    ):
+        with pytest.raises(ValueError, match="may only be declared"):
+            declared_plan((1, [xid(B, 32)]), fields={"xid_last_error": shape})
+    with pytest.raises(ValueError, match="fields must map"):
+        declared_plan((1, [xid(B, 32)]), fields=["xid_last_error"])
+    with pytest.raises(ValueError, match="exactly profile and steps"):
+        tool.validate_plan(
+            {
+                "profile": "pcie_xid",
+                "steps": [{"reads": 1, "ops": []}],
+                "absent_when_healthy": True,
+            }
+        )
+    assert set(tool.ABSENT_WHEN_HEALTHY) == {"xid_last_error"}, (
+        "widening the allow-list is a review event"
+    )
+    assert declared_plan((1, []), fields={})["fields"] == {}
+    assert plan("pcie_xid", (1, []))["fields"] == {}, "no declaration by default"
+
+
+def test_undeclared_the_live_abort_stands_and_a_declaration_never_invents_a_gpu():
+    body = live_exporter()
+    output, receipt = serve_once(armed("pcie_xid", (2, [xid(B, 32), pcie(B, 5)])), body)
+    assert output == body
+    assert receipt["aborted"] == (
+        "targeted reading absent upstream; refusing invented samples: "
+        f"{B}/xid_last_error"
+    ), "the live 2026-10-26 message, naming only the absent gauge"
+    ghost = "GPU-cccccccc-0000-0000-0000-000000000003"
+    for operations in ([xid(ghost, 32), pcie(B, 5)], [xid(B, 32), pcie(ghost, 5)]):
+        replay = tool.Replay(declared_plan((2, operations)), 600)
+        replay.arm()
+        output, receipt = serve_once(replay, body)
+        assert output == body
+        assert ghost in receipt["aborted"] and "invented" in receipt["aborted"], (
+            receipt["aborted"]
+        )
+        assert f"{B}/xid_last_error" not in receipt["aborted"], receipt["aborted"]
+
+
+def test_a_real_xid_appearing_upstream_aborts_the_declared_replay():
+    replay = tool.Replay(declared_plan((1, []), (3, [xid(B, 32), pcie(B, 5)])), 600)
+    replay.arm()
+    serve_once(replay, live_exporter())
+    real = live_exporter(xid={B: 79})
+    output, receipt = serve_once(replay, real)
+    assert output == real, "the real XID passes through unchanged"
+    assert receipt["aborted"] == (
+        f"real upstream change of {B}/xid_last_error: absent -> 79.0; "
+        "a real reading is never masked"
+    )
+
+
+def test_a_published_gauge_is_served_the_ordinary_way_despite_the_declaration():
+    replay = tool.Replay(declared_plan((1, []), (3, [xid(B, 32)])), 600)
+    replay.arm()
+    body = live_exporter(xid={A: 0, B: 0})
+    serve_once(replay, body)
+    output, receipt = serve_once(replay, body)
+    view = product_view(output)
+    assert view[(B, "xid_last_error")] == [32.0] and view[(A, "xid_last_error")] == [
+        0.0
+    ], view
+    assert output.count(b"DCGM_FI_DEV_XID_ERRORS{") == 2, "replaced, not duplicated"
+    assert receipt["served"] == {f"{B}/xid_last_error": 32.0}, receipt["served"]
+    gone = live_exporter()
+    output, receipt = serve_once(replay, gone)
+    assert output == gone
+    assert receipt["aborted"] == (
+        f"real upstream change of {B}/xid_last_error: 0.0 -> absent; "
+        "a real reading is never masked"
+    )
+
+
+def test_the_synthesised_gauge_follows_the_exporter_configuration_and_vendor_labels():
+    gauge = tool.ABSENT_WHEN_HEALTHY["xid_last_error"]
+    assert gauge.name == "DCGM_FI_DEV_XID_ERRORS"
+    assert tool.canonical_name(gauge.name) == "xid_last_error"
+    csv_path = (
+        Path(tool.__file__).resolve().parents[1] / "deploy/dataplane/dcgm-counters.csv"
+    )
+    rows = [
+        [cell.strip() for cell in line.split(",", 2)]
+        for line in csv_path.read_text(encoding="utf-8").splitlines()
+        if line.startswith(gauge.name + ",")
+    ]
+    assert rows == [[gauge.name, "gauge", gauge.documentation]], rows
+    # dcgm-exporter 4.8.4 internal/pkg/collector/xid_errors.go lines 21 and 53,
+    # attached by gpu_collector.go toMetric (lines 950-958).
+    assert gauge.labels(0) == {"err_code": "0", "err_msg": "No Error"}
+    assert gauge.labels(32) == {
+        "err_code": "32",
+        "err_msg": "Invalid or corrupted push buffer stream",
+    }
+    assert tool.SET_VALUES["xid_last_error"] == {0, 32}, "0 baselines, 32 joins"
+    with pytest.raises(ValueError, match="only be set"):
+        plan("pcie_xid", (1, [xid(A, 79)]))
