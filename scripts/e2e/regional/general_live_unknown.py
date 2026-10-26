@@ -70,6 +70,7 @@ from scripts.e2e.regional.general_live_gpu_replay import PORT as DCGM_PORT
 from scripts.e2e.regional.general_live_gpu_replay import GpuSurvey
 from scripts.e2e.regional.general_live_kernel_replay import (
     kernel_replay,
+    kmsg_follow_error,
     reviewed_record,
 )
 from scripts.e2e.regional.general_live_kernel_xid import (
@@ -318,6 +319,10 @@ def _drive_kmsg(ctx: VariantContext, message: str) -> Any:
     injected = oracle.get("injected") or {}
     if not injected.get("fixture_lines"):
         raise VariantInconclusive("the kmsg fixture received no reviewed records")
+    # A full fixture the collector never read proves nothing about the grading.
+    not_followed = kmsg_follow_error(injected)
+    if not_followed:
+        raise VariantInconclusive(not_followed)
     return started
 
 

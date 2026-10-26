@@ -56,6 +56,7 @@ from scripts.e2e.regional.general_live_fixture import (
 from scripts.e2e.regional.general_live_kernel_replay import (
     KernelLogReplay,
     kernel_replay,
+    kmsg_follow_error,
     records_sha256,
     reviewed_record,
 )
@@ -344,8 +345,10 @@ def inject_reviewed_kernel_line(
     for ``message``. ``inject_kernel_xid`` is the monitor-grade caller; 032
     ``missing_version`` first proves the decoder's version evidence is withheld
     inside the kernel collector, so its WORKFLOW_NVLINK5_ERR line can only be
-    BLOCKED. INCONCLUSIVE when the fixture file received no reviewed line. The
-    window's cleanup is on ``ctx.cleanup``.
+    BLOCKED. INCONCLUSIVE when the fixture file received no reviewed line, or
+    when the collector did not follow the fixture it was pointed at
+    (``kmsg_follow_error``: the line never left the node). The window's cleanup
+    is on ``ctx.cleanup``.
     """
 
     if ":" not in pci_bdf:
@@ -374,6 +377,9 @@ def inject_reviewed_kernel_line(
         raise VariantInconclusive(
             f"the kmsg fixture received no reviewed XID {xid} record"
         )
+    not_followed = kmsg_follow_error(injected)
+    if not_followed:
+        raise VariantInconclusive(f"XID {xid}: {not_followed}")
     return KernelXidInjection(
         replay=replay,
         xid=xid,

@@ -1920,7 +1920,17 @@ phase 2 新增经审查的 `live-replay` 类别，统一经产品自身的读取
   arm 后追加经审查记录，有界 emissions、去重为一条 incident），kmsg 模式用 `/run`
   drop-in 把内核采集器的 `GPU_FAULT_KMSG_PATH` 指到经审查夹具文件。`_TRANSPORT=kernel`
   为可信 `dmesg` 来源，其它 transport 保持不可信 `journal` 来源——这正是信任门禁。
-  lane R 的“独立可信 XID”变体后续复用此助手。
+  lane R 的“独立可信 XID”变体后续复用此助手。kmsg 模式的 oracle（探针 `status`）
+  不只数夹具里的行（`fixture_lines`/`fixture_bytes`），还从采集器自身读回它是否真的在读：
+  `collector`（主进程是否持有夹具的文件描述符及其 `fdinfo` 读偏移）、`stream_reopens`
+  （open-window 重启出的那次 invocation 的 journal 里 “kernel message stream ended;
+  reopening” 的次数）、`followed`（持有且从未重开）、`consumed`（跟随且偏移到达追加
+  内容末尾）。夹具非空而 `consumed=false` 时（`kmsg_follow_error`），经审查的行根本没
+  离开节点，变体记 INCONCLUSIVE 而不是对产品判 FAIL——R13g 的内核采集器把普通文件的
+  EOF 当作流结束、每秒重开并定位末尾，两次重开之间追加的记录全被跳过，024
+  `independent_xid`、032 `unknown_xid`/`missing_topology` 的夹具都满而 store 里没有任何
+  XID/SXID event；采集器自 `_follow_regular_file` 起按 `tail -f` 跟随普通文件，kmsg 模式
+  的 PASS 需要携带该修复的发布。
 - 主机采集器**原始源回放** `general_live_source_replay.py`（探针
   `probes/general_live_source_probe.py`）只在主机采集器自身私有环境内替换：
   `BindReadOnlyPaths` 的允许列表 procfs/sysfs 文件或整棵树、PATH 首位的透传命令包装、

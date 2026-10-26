@@ -204,12 +204,27 @@ def test_isolating_decisions_pick_actions_safety_and_workflows() -> None:
 # --------------------------------------------------------------------------- #
 # inject / wait over fakes
 # --------------------------------------------------------------------------- #
-def _host_script(lines: int = 6) -> dict[str, Any]:
+def _host_script(lines: int = 6, *, consumed: bool | None = True) -> dict[str, Any]:
+    injected: dict[str, Any] = {"mode": "kmsg", "fixture_lines": lines}
+    if consumed is not None:
+        injected.update(
+            {
+                "fixture_bytes": 110 * lines,
+                "consumed": consumed,
+                "followed": consumed,
+                "stream_reopens": 0 if consumed else 91,
+                "collector": {
+                    "main_pid": "2073979",
+                    "fixture_open": consumed,
+                    "offset": 110 * lines if consumed else None,
+                },
+            }
+        )
     return {
         "install-records": {"records": 1},
         "open-window": {"after": {"ActiveState": "active"}, "mode": "kmsg"},
         "arm": {"armed": True, "lines_written": lines},
-        "status": {"injected": {"mode": "kmsg", "fixture_lines": lines}},
+        "status": {"injected": injected},
         "close-window": {"clean": True},
     }
 
@@ -257,6 +272,32 @@ def test_inject_is_inconclusive_when_the_fixture_got_no_line(tmp_path: Path) -> 
     ctx = _ctx(tmp_path, lambda *_: {"decisions": []}, fake)
     with pytest.raises(VariantInconclusive, match="no reviewed XID 137"):
         kx.inject_kernel_xid(ctx, xid=137, pci_bdf="0000:1b:00", label="t")
+
+
+def test_inject_is_inconclusive_when_the_collector_never_read_the_fixture(
+    tmp_path: Path,
+) -> None:
+    """Live R13g: the fixture held every copy of the line and the collector,
+    reopening it at EOF once a second, read none -- not a grading verdict."""
+
+    fake = FakeProbe(_host_script(consumed=False))
+    ctx = _ctx(tmp_path, lambda *_: {"decisions": []}, fake)
+    with pytest.raises(VariantInconclusive) as caught:
+        kx.inject_kernel_xid(ctx, xid=137, pci_bdf="0000:1b:00", label="t")
+    message = str(caught.value)
+    assert message.startswith("XID 137: the kernel collector did not follow"), message
+    assert "91 time(s)" in message, message
+    assert "fixture open in the collector=False" in message, message
+    assert "kernel-replay-kmsg" in ctx.cleanup.pending(), (
+        "the window is still closed by the cleanup stack"
+    )
+
+
+def test_inject_accepts_a_probe_without_the_consumption_oracle(tmp_path: Path) -> None:
+    fake = FakeProbe(_host_script(consumed=None))
+    ctx = _ctx(tmp_path, lambda *_: {"decisions": []}, fake)
+    injection = kx.inject_kernel_xid(ctx, xid=137, pci_bdf="0000:1b:00", label="t")
+    assert injection.xid == 137
 
 
 def test_inject_refuses_a_non_monitor_grade_code_before_touching_the_node(

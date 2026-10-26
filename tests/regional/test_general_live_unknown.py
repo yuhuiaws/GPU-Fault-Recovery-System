@@ -34,12 +34,27 @@ def _spec(variant: str) -> object:
     return next(item for item in mod.VARIANTS if item.variant == variant)
 
 
-def _host_script() -> dict[str, object]:
+def _host_script(*, consumed: bool = True) -> dict[str, object]:
     return {
         "install-records": {"records": 1},
         "open-window": {"after": {"ActiveState": "active"}},
         "arm": {"armed": True, "fixture": "/run/.../kmsg.fixture"},
-        "status": {"injected": {"fixture_lines": 5}},
+        "status": {
+            "injected": {
+                "mode": "kmsg",
+                "armed": True,
+                "fixture_lines": 5,
+                "fixture_bytes": 440,
+                "consumed": consumed,
+                "followed": consumed,
+                "stream_reopens": 0 if consumed else 541,
+                "collector": {
+                    "main_pid": "2073979",
+                    "fixture_open": consumed,
+                    "offset": 440 if consumed else None,
+                },
+            }
+        },
         "close-window": {"clean": True},
     }
 
@@ -140,6 +155,42 @@ def test_unknown_xid_inconclusive_without_injection(tmp_path: Path) -> None:
         assert "no reviewed records" in str(exc), str(exc)
     else:
         raise AssertionError("an empty kmsg fixture must be INCONCLUSIVE")
+
+
+def test_unknown_xid_inconclusive_when_the_collector_never_read_the_fixture(
+    tmp_path: Path,
+) -> None:
+    """Live R13g (ip-10-0-32-162): five copies of the XID 987 line in the fixture,
+    the collector reopening it at EOF every second and reading none, no XID
+    event in the store -- the grading claim is unproven, not failed."""
+
+    from scripts.e2e.regional.general_live_fixture import VariantInconclusive
+
+    spec = _spec("unknown_xid")
+    fake = FakeProbe(_host_script(consumed=False))
+    regional = FakeRegional(cpu_python=_cpu_python([]))
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=regional,
+        probes={f"kernel-replay-kmsg@{NODE}": fake},
+        settings=make_settings(spec, node=NODE),
+        window_minutes=60,
+    )
+    try:
+        mod.unknown_xid(ctx)
+    except VariantInconclusive as exc:
+        assert "did not follow the reviewed kmsg fixture" in str(exc), str(exc)
+        assert "541 time(s)" in str(exc), str(exc)
+    else:
+        raise AssertionError("a fixture the collector never read must be INCONCLUSIVE")
+    assert [call[0] for call in fake.calls] == [
+        "install-records",
+        "open-window",
+        "arm",
+        "status",
+    ], "the decision wait is skipped; the cleanup stack still closes the window"
+    assert "kernel-replay-kmsg" in ctx.cleanup.pending()
 
 
 def test_duplicate_event_isolates_once(tmp_path: Path) -> None:

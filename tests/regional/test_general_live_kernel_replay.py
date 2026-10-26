@@ -10,6 +10,7 @@ own synthetic cursor back to the real binary.
 
 from __future__ import annotations
 
+import argparse
 import base64
 import json
 import subprocess
@@ -380,3 +381,211 @@ def test_kmsg_sequence_is_stable_per_run_and_distinct_across_runs() -> None:
     )
     with pytest.raises(probe.ProbeError):
         probe.kmsg_sequence(RUN_ID, probe.KMSG_SEQUENCE_STRIDE)
+
+
+# --------------------------------------------------------------------------- #
+# the kmsg-mode consumption oracle: did the collector read the fixture?
+# --------------------------------------------------------------------------- #
+def _kmsg_window(monkeypatch, tmp_path: Path, *, invocation: str = "a" * 32) -> Path:
+    """An open kmsg window under a private state root; returns the fixture."""
+
+    monkeypatch.setattr(probe, "STATE_ROOT", tmp_path / "state")
+    monkeypatch.setattr(probe, "PROC_ROOT", tmp_path / "proc")
+    probe.save_state(
+        RUN_ID,
+        {
+            "run_id": RUN_ID,
+            "mode": "kmsg",
+            "unit": probe.KERNEL_UNIT,
+            "after": {"InvocationID": invocation, "MainPID": "4242"},
+        },
+    )
+    fixture = probe.kmsg_fixture_path(RUN_ID)
+    fixture.write_text(
+        "3,900000001,1000,-;NVRM: Xid (PCI:0000:53:00): 987, one\n"
+        "3,900000001,2000,-;NVRM: Xid (PCI:0000:53:00): 987, two\n",
+        encoding="utf-8",
+    )
+    return fixture
+
+
+def _collector_holds(tmp_path: Path, fixture: Path, *, pid: str, offset: int) -> None:
+    """A /proc tree in which ``pid`` has the fixture open at ``offset``."""
+
+    fd_dir = tmp_path / "proc" / pid / "fd"
+    fd_dir.mkdir(parents=True)
+    (fd_dir / "3").symlink_to(tmp_path / "unrelated-file-that-does-not-exist")
+    (fd_dir / "7").symlink_to(fixture)
+    info_dir = tmp_path / "proc" / pid / "fdinfo"
+    info_dir.mkdir()
+    (info_dir / "7").write_text(f"pos:\t{offset}\nflags:\t0100000\nmnt_id:\t29\n")
+
+
+def _journal(monkeypatch, lines: list[str], *, returncode: int = 0) -> list[list[str]]:
+    calls: list[list[str]] = []
+
+    def fake_run(command, *, check=True, timeout=120):
+        calls.append(list(command))
+        return subprocess.CompletedProcess(
+            command,
+            returncode,
+            stdout="\n".join(lines) + ("\n" if lines else ""),
+            stderr="",
+        )
+
+    monkeypatch.setattr(probe, "run", fake_run)
+    return calls
+
+
+def test_kmsg_consumption_sees_a_collector_that_follows_the_fixture(
+    monkeypatch, tmp_path: Path
+) -> None:
+    fixture = _kmsg_window(monkeypatch, tmp_path)
+    _collector_holds(tmp_path, fixture, pid="4242", offset=fixture.stat().st_size)
+    calls = _journal(
+        monkeypatch, ["starting kernel collector", "health summary posted"]
+    )
+    state = probe.load_state(RUN_ID)
+    oracle = probe.kmsg_consumption(
+        RUN_ID, state, {"MainPID": "4242", "InvocationID": "b" * 32}
+    )
+    assert (
+        oracle["fixture_lines"] == 2
+        and oracle["fixture_bytes"] == fixture.stat().st_size
+    )
+    assert oracle["collector"] == {
+        "main_pid": "4242",
+        "fixture_open": True,
+        "offset": fixture.stat().st_size,
+    }, oracle
+    assert oracle["stream_reopens"] == 0 and oracle["followed"] is True, oracle
+    assert oracle["consumed"] is True, oracle
+    assert calls and f"_SYSTEMD_INVOCATION_ID={'a' * 32}" in calls[0], (
+        "the journal of the invocation open-window restarted is read, not the "
+        f"current unit state's: {calls}"
+    )
+
+
+def test_kmsg_consumption_sees_a_collector_that_reopens_the_fixture_at_eof(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The live R13g failure: the fixture is full, the collector holds no
+    descriptor on it and its journal shows a reopen a second."""
+
+    fixture = _kmsg_window(monkeypatch, tmp_path)
+    (tmp_path / "proc" / "4242" / "fd").mkdir(parents=True)
+    _journal(
+        monkeypatch,
+        [f"{probe.STREAM_REOPEN_MARKER} {fixture}" for _ in range(37)]
+        + ["kernel health summary"],
+    )
+    oracle = probe.kmsg_consumption(
+        RUN_ID, probe.load_state(RUN_ID), {"MainPID": "4242"}
+    )
+    assert oracle["fixture_lines"] == 2, oracle
+    assert (
+        oracle["collector"]["fixture_open"] is False
+        and oracle["collector"]["offset"] is None
+    )
+    assert oracle["stream_reopens"] == 37, oracle
+    assert oracle["followed"] is False and oracle["consumed"] is False, oracle
+
+
+def test_kmsg_consumption_without_a_journal_relies_on_the_descriptor(
+    monkeypatch, tmp_path: Path
+) -> None:
+    fixture = _kmsg_window(monkeypatch, tmp_path, invocation="")
+    _collector_holds(tmp_path, fixture, pid="77", offset=fixture.stat().st_size)
+    _journal(monkeypatch, [], returncode=1)
+    oracle = probe.kmsg_consumption(
+        RUN_ID, probe.load_state(RUN_ID), {"MainPID": "77", "InvocationID": "not-hex"}
+    )
+    assert oracle["stream_reopens"] is None, "an unreadable journal is not a count"
+    assert oracle["followed"] is True and oracle["consumed"] is True, oracle
+
+
+def test_kmsg_consumption_is_not_consumed_before_the_offset_reaches_the_end(
+    monkeypatch, tmp_path: Path
+) -> None:
+    fixture = _kmsg_window(monkeypatch, tmp_path)
+    _collector_holds(tmp_path, fixture, pid="4242", offset=fixture.stat().st_size - 10)
+    _journal(monkeypatch, [])
+    oracle = probe.kmsg_consumption(
+        RUN_ID, probe.load_state(RUN_ID), {"MainPID": "4242"}
+    )
+    assert oracle["followed"] is True and oracle["consumed"] is False, oracle
+
+
+def test_arm_then_status_in_kmsg_mode_report_armed_and_consumption(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    monkeypatch.setattr(probe, "STATE_ROOT", tmp_path / "state")
+    monkeypatch.setattr(probe, "PROC_ROOT", tmp_path / "proc")
+    monkeypatch.setattr(probe.time, "sleep", lambda _seconds: None)
+    probe.save_state(
+        RUN_ID,
+        {
+            "run_id": RUN_ID,
+            "mode": "kmsg",
+            "unit": probe.KERNEL_UNIT,
+            "after": {"InvocationID": "c" * 32, "MainPID": "4242"},
+        },
+    )
+    probe.records_path(RUN_ID).write_text(
+        json.dumps(
+            probe.validate_records(
+                [{"message": "NVRM: Xid (PCI:0000:53:00): 987, armed", "emissions": 3}]
+            )
+        ),
+        encoding="utf-8",
+    )
+    fixture = probe.kmsg_fixture_path(RUN_ID)
+    fixture.write_text("", encoding="utf-8")
+    probe.arm(argparse.Namespace(run_id=RUN_ID))
+    armed = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert armed["armed"] is True and armed["lines_written"] == 3, armed
+    assert probe.armed_path(RUN_ID).is_file(), "kmsg mode marks the run armed too"
+    lines = fixture.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 3 and len({line.split(",")[1] for line in lines}) == 1, (
+        f"three copies of one record share one sequence number: {lines}"
+    )
+
+    _collector_holds(tmp_path, fixture, pid="4242", offset=fixture.stat().st_size)
+    _journal(monkeypatch, [])
+    monkeypatch.setattr(
+        probe,
+        "unit_state",
+        lambda unit: {
+            "ActiveState": "active",
+            "MainPID": "4242",
+            "InvocationID": "c" * 32,
+        },
+    )
+    probe.status(argparse.Namespace(run_id=RUN_ID))
+    status = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    injected = status["injected"]
+    assert injected["mode"] == "kmsg" and injected["armed"] is True, injected
+    assert injected["fixture_lines"] == 3 and injected["consumed"] is True, injected
+    assert helper.kmsg_follow_error(injected) is None
+
+
+def test_kmsg_follow_error_judges_only_a_reported_consumed_false() -> None:
+    assert helper.kmsg_follow_error({"fixture_lines": 5}) is None, (
+        "a probe that reports no consumption is not judged (older fakes/probes)"
+    )
+    assert helper.kmsg_follow_error({"fixture_lines": 5, "consumed": True}) is None
+    message = helper.kmsg_follow_error(
+        {
+            "fixture_lines": 5,
+            "fixture_bytes": 440,
+            "consumed": False,
+            "followed": False,
+            "stream_reopens": 541,
+            "collector": {"main_pid": "2073979", "fixture_open": False, "offset": None},
+        }
+    )
+    assert message is not None
+    assert "did not follow the reviewed kmsg fixture" in message, message
+    assert "541 time(s)" in message, message
+    assert "fixture open in the collector=False" in message, message
+    assert "read offset None of 440 bytes" in message, message

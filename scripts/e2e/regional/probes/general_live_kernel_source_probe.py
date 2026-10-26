@@ -24,7 +24,12 @@ boot through the product's own readers, two ways, and nothing else:
   that one unit at a reviewed fixture file under ``/run``; ``arm`` appends the
   reviewed records in ``/dev/kmsg`` record syntax, so they travel through the
   real ``KernelLogCollector`` parser, dedup and NVIDIA_KERNEL delivery into the
-  real XID/SXID catalog. The real ``/dev/kmsg`` is never written.
+  real XID/SXID catalog. The real ``/dev/kmsg`` is never written. The collector
+  follows a regular file like ``tail -f`` (it keeps the file open at EOF and
+  reads what is appended); ``status`` reads that back from the collector's own
+  descriptor and journal, because a collector that instead reopens the fixture
+  at its end on every EOF skips everything appended in between and the
+  reviewed records never reach the control plane (``consumed`` false).
 
 Everything is bounded and reversible two ways -- the runner's cleanup and a
 ``systemd-run --on-active`` deadman that restores the baseline from a copy of
@@ -53,6 +58,16 @@ from typing import Any
 
 STATE_ROOT = Path("/run/gpu-fault-kernel-replay")
 DROPIN_ROOT = Path("/run/systemd/system")
+#: The host's procfs (the probe runs chroot'ed into the host with hostPID), where
+#: ``status`` reads the kernel collector's open descriptor on the fixture.
+PROC_ROOT = Path("/proc")
+#: What the kernel collector logs each time it takes EOF for an ended stream and
+#: reopens its source at the live tail (``collectors/logs/kernel.py``). On a
+#: regular fixture file that is the failure mode ``status`` detects: every
+#: reopen seeks past whatever ``arm`` appended meanwhile.
+STREAM_REOPEN_MARKER = "kernel message stream ended; reopening"
+#: Upper bound on the journal lines ``status`` scans for the marker.
+MAX_JOURNAL_SCAN_LINES = 5000
 LOG_UNIT = "gpu-fault-log-collector.service"
 KERNEL_UNIT = "gpu-fault-kernel-collector.service"
 KMSG_ENV = "GPU_FAULT_KMSG_PATH"
@@ -552,10 +567,12 @@ def open_window(arguments: argparse.Namespace) -> None:
     after = unit_state(unit)
     if after.get("ActiveState") != "active":
         raise ProbeError(f"{unit} is not active after the window opened")
+    # The restarted unit's invocation is what ``status`` reads the journal of.
+    state["after"] = after
+    save_state(run_id, state)
     emit(
         {
             **state,
-            "after": after,
             "deadman_timer": unit_state(f"{deadman}.timer"),
             "enabled_log_collector": enabled_log_collector,
             "proof_scope": "live-replay",
@@ -613,11 +630,13 @@ def arm(arguments: argparse.Namespace) -> None:
             }
         )
         return
-    # kmsg mode: append the reviewed records to the fixture the collector tails.
-    # The kernel collector reopens at the live tail on EOF, so each record is
-    # appended a bounded number of times; a sequence number stable within the
-    # run makes the parser dedup them to one event however many copies it
-    # reads, and distinct from every other run's (``kmsg_sequence``).
+    # kmsg mode: append the reviewed records to the fixture the collector
+    # follows. Each record is appended a bounded number of times (one pass per
+    # second, like the copies a real fault logs); a sequence number stable
+    # within the run makes the parser dedup them to one event however many
+    # copies it reads, and distinct from every other run's (``kmsg_sequence``).
+    # Whether the collector read them is not assumed here: ``status`` reads it
+    # back from the collector's own descriptor and journal.
     fixture = kmsg_fixture_path(run_id)
     passes = max(int(record.get("emissions", 4)) for record in records)
     written = 0
@@ -629,6 +648,7 @@ def arm(arguments: argparse.Namespace) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         time.sleep(1.0)
+    armed_path(run_id).write_text(utc_now(), encoding="utf-8")
     emit(
         {
             "run_id": run_id,
@@ -660,14 +680,120 @@ def status(arguments: argparse.Namespace) -> None:
             if log.is_file() and log.read_text(encoding="utf-8").strip()
             else {}
         )
-    else:
-        fixture = kmsg_fixture_path(run_id)
-        injected["fixture_lines"] = (
-            len(fixture.read_text(encoding="utf-8").splitlines())
-            if fixture.is_file()
-            else 0
-        )
-    emit({"run_id": run_id, "unit": unit_state(state["unit"]), "injected": injected})
+    unit = unit_state(state["unit"])
+    if state["mode"] == "kmsg":
+        injected.update(kmsg_consumption(run_id, state, unit))
+    emit({"run_id": run_id, "unit": unit, "injected": injected})
+
+
+def _collector_fixture_handle(main_pid: str, fixture: Path) -> dict[str, Any]:
+    """Whether the collector holds ``fixture`` open, and at what read offset.
+
+    Read from the host's procfs (``/proc/<pid>/fd`` resolved by device and inode,
+    ``fdinfo`` for the position). A collector that follows the file keeps one
+    descriptor on it with the offset at the file's end once everything appended
+    was read; one that reopens the file at EOF holds it only for the
+    microseconds between a reopen and the next EOF.
+    """
+
+    handle: dict[str, Any] = {
+        "main_pid": main_pid,
+        "fixture_open": False,
+        "offset": None,
+    }
+    if not main_pid.isdigit() or int(main_pid) <= 0:
+        return handle
+    try:
+        target = fixture.stat()
+        descriptors = list((PROC_ROOT / main_pid / "fd").iterdir())
+    except OSError:
+        return handle
+    for entry in descriptors:
+        try:
+            opened = entry.stat()
+        except OSError:
+            continue
+        if (opened.st_dev, opened.st_ino) != (target.st_dev, target.st_ino):
+            continue
+        handle["fixture_open"] = True
+        try:
+            info = (PROC_ROOT / main_pid / "fdinfo" / entry.name).read_text(
+                encoding="ascii"
+            )
+        except OSError:
+            break
+        for line in info.splitlines():
+            key, separator, value = line.partition(":")
+            if separator and key.strip() == "pos" and value.strip().isdigit():
+                handle["offset"] = int(value.strip())
+        break
+    return handle
+
+
+def _stream_reopens(invocation_id: str) -> int | None:
+    """How often this invocation of the collector reopened its source at EOF.
+
+    Counted from the unit's own journal (``_SYSTEMD_INVOCATION_ID`` of the
+    restart ``open-window`` performed), so an earlier invocation's lines on the
+    same boot do not count. ``None`` when the journal cannot be read.
+    """
+
+    if not re.fullmatch(r"[0-9a-f]{32}", invocation_id or ""):
+        return None
+    completed = run(
+        [
+            "journalctl",
+            f"_SYSTEMD_INVOCATION_ID={invocation_id}",
+            "-n",
+            str(MAX_JOURNAL_SCAN_LINES),
+            "--no-pager",
+            "-q",
+            "-o",
+            "cat",
+        ],
+        check=False,
+        timeout=60,
+    )
+    if completed.returncode:
+        return None
+    return sum(
+        1 for line in completed.stdout.splitlines() if STREAM_REOPEN_MARKER in line
+    )
+
+
+def kmsg_consumption(
+    run_id: str, state: dict[str, Any], unit: dict[str, str]
+) -> dict[str, Any]:
+    """The kmsg-mode oracle: what ``arm`` wrote and whether the collector read it.
+
+    ``fixture_lines``/``fixture_bytes`` are what the fixture holds. ``collector``
+    is the collector's descriptor on it and ``stream_reopens`` how often this
+    invocation reopened its source at EOF; ``followed`` is true when the
+    collector keeps the fixture open and never reopened it, ``consumed`` when
+    it has also read up to the end of what was appended. A false ``consumed``
+    with a non-empty fixture means the reviewed records never left the node --
+    the caller's claim about the product's grading is INCONCLUSIVE, not FAIL.
+    """
+
+    fixture = kmsg_fixture_path(run_id)
+    text = fixture.read_text(encoding="utf-8") if fixture.is_file() else ""
+    size = fixture.stat().st_size if fixture.is_file() else 0
+    collector = _collector_fixture_handle(str(unit.get("MainPID") or ""), fixture)
+    invocation = str((state.get("after") or {}).get("InvocationID") or "")
+    reopens = _stream_reopens(invocation or str(unit.get("InvocationID") or ""))
+    # A collector that reopens the fixture at EOF holds it open only for the
+    # microseconds between a reopen and the next EOF, so the descriptor alone
+    # tells; the reopen count (None when the journal is unreadable) corroborates.
+    followed = bool(collector["fixture_open"]) and not reopens
+    offset = collector["offset"]
+    return {
+        "fixture_lines": len(text.splitlines()),
+        "fixture_bytes": size,
+        "collector": collector,
+        "stream_reopens": reopens,
+        "followed": followed,
+        "consumed": followed and offset is not None and offset >= size,
+    }
 
 
 def close_window(arguments: argparse.Namespace) -> None:

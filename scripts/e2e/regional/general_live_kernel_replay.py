@@ -43,6 +43,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -88,6 +89,35 @@ def reviewed_record(
 
 def records_sha256(records: list[dict[str, Any]]) -> str:
     return hashlib.sha256(_encode(records)).hexdigest()
+
+
+def kmsg_follow_error(injected: Mapping[str, Any]) -> str | None:
+    """Why the kmsg-mode oracle says the collector never read the fixture (or None).
+
+    ``status`` in kmsg mode reports, beside ``fixture_lines``, whether the
+    kernel collector holds the fixture open at the end of what ``arm`` appended
+    (``consumed``) -- read from the collector's own descriptor and journal, not
+    assumed. A collector that takes a regular file's EOF for an ended stream
+    reopens it at its end every second and skips everything appended in
+    between; live (release R13g) that left every kmsg-mode variant with a full
+    fixture and no XID/SXID event in the store. A reviewed line that never left
+    the node proves nothing about the product's grading, so the caller raises
+    INCONCLUSIVE with this text instead of FAIL. A probe that does not report
+    ``consumed`` at all is not judged here.
+    """
+
+    if injected.get("consumed") is not False:
+        return None
+    collector = dict(injected.get("collector") or {})
+    return (
+        "the kernel collector did not follow the reviewed kmsg fixture: stream "
+        f"reopened at EOF {injected.get('stream_reopens')} time(s) in this invocation, "
+        f"fixture open in the collector={collector.get('fixture_open')}, read offset "
+        f"{collector.get('offset')} of {injected.get('fixture_bytes')} bytes; a kernel "
+        "collector that reopens a regular GPU_FAULT_KMSG_PATH at its end instead of "
+        "following it never reads what is appended, so the reviewed line never "
+        "reached the control plane (needs the release whose collector follows the file)"
+    )
 
 
 def _encode(records: list[dict[str, Any]]) -> bytes:
@@ -263,6 +293,7 @@ __all__ = [
     "MODES",
     "PROOF_SCOPE",
     "kernel_replay",
+    "kmsg_follow_error",
     "records_sha256",
     "reviewed_record",
 ]
