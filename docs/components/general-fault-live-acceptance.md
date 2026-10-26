@@ -1231,10 +1231,17 @@ expected FAIL 变体却 PASS），这种底线之下的读数以及无样本可�
   `rdma_<counter>_delta` ≥ 5000（计数器在产品读数里确实增长才算正向）→ WARNING
   RUN_DIAGNOSTICS → FREEZE_EVIDENCE + VALIDATE_FABRIC 实际执行（失败须点名该指标）、端口仍被
   观察、无硬件动作/隔离；`link_inactive` bind 端口 `state` 为 `1: DOWN`（phys_state 真实），且只
-  持有一个**有界曝光期**——窗口自己的 deadman 在开窗后 1.7 个采集周期（15 s 周期为 26 s，
-  `general_live_source_replay.bounded_exposure_seconds`）关窗：第一拍出 `rdma_link_down` WARNING，
+  持有一个**有界曝光期**——探针在节点上观测采集器自己的拍（`await-ticks`：单元的
+  `WatchdogTimestampMonotonic`，即采集器主进程每个 contributor 后与每拍投递后发出的 `WATCHDOG=1`），
+  在产品确认所需的第 N 拍（`GPU_FAULT_INVENTORY_MISMATCH_CONSECUTIVE_SAMPLES`，默认 2）结束后立即关窗
+  （`general_live_source_replay.observed_exposure`）：第一拍出 `rdma_link_down` WARNING，
   第二拍是其 VALIDATE_FABRIC 判定的新鲜读数（在持有的端口上 FAILED，并点名该指标）同时确认共现的
-  `efa_inventory_mismatch` `LINK_INACTIVE`，第三拍已读回真实树。批次 175 起该共现项的诊断按新鲜读数
+  `efa_inventory_mismatch` `LINK_INACTIVE`，第三拍已读回真实树。窗口的 deadman 只是运行器中途消失时的
+  兜底（`exposure_fallback_seconds`：启动相位 + 启动抖动 + N×(周期 + 10 s) + 20 s，本站 105 s）。
+  2026-10-26 之前用的是从重启起算的固定 1.7 个采集周期（26 s）：采集器重启后先睡一个节点相位
+  （`GPU_FAULT_COLLECTOR_STARTUP_SPREAD_SECONDS` 15 s 内）加 `[0, 20 s)` 启动抖动才打第一拍，
+  实况 013 第一拍落在开窗后 13 s，deadman 在第二拍前关窗（INCONCLUSIVE）；010 两次 PASS 只是相位凑巧
+  （第一拍 +8.4 s）。批次 175 起该共现项的诊断按新鲜读数
   判定、对仍不活动的端口按设计升级 REBOOT_NODE，故曝光期把它只留给已恢复的端口：其 VALIDATE_FABRIC
   须 SUCCEEDED、incident RECOVERED、不得等待 `missing_inventory_action_completion`、无 RESTART_NODE；
   产品在恢复后才判定链路（SUCCEEDED 时间晚于恢复）、恢复后仍有不活动读数（上界未守住）或窗口内无
@@ -1390,13 +1397,32 @@ base64 + sha256 装入 `/run/gfrs-live/source-<digest>/`（tmpfs）；Node Agent
   root 单元“不可读”，探针拒绝目录项；需要产品读目录失败时回放缺少该项的整棵树
   （012 `proc_unreadable` 用 `--omit-gpus`）。
 - **env**：`GPU_FAULT_EXPECTED_GPU_COUNT`/`GPU_FAULT_EXPECTED_EFA_DEVICE_COUNT`
-  的 0..64 覆盖（012 `expectation_wrong`）；以及 phase-1 的 **pci-root** 重指。
+  的 0..64 覆盖（012 `expectation_wrong`），写入本次运行的 `/run/gfrs-live/source-<digest>/env`
+  并以 `EnvironmentFile=` 交给单元，**不用** `Environment=`：安装器把真实期望数写进单元自己的
+  `EnvironmentFile=/etc/gpu-fault/collector.env`（`GPU_FAULT_EXPECTED_GPU_COUNT="8"`，按实例类型推导，
+  早于可追溯历史），而 systemd 把所有 `EnvironmentFile=` 应用在所有 `Environment=` **之后**，多个文件
+  按列出顺序后者覆盖前者，drop-in 又在单元文件之后解析（systemd.exec(5) `EnvironmentFile=`、
+  systemd.unit(5)），所以 drop-in 的 `EnvironmentFile=` 最后读、必胜；`UnsetEnvironment=` 是最后一步，
+  任何文件都不能复活被 unset 的变量。2026-10-26 eksb 实况 012 `expectation_wrong`：drop-in
+  `Environment=GPU_FAULT_EXPECTED_GPU_COUNT=9` 输给了单元文件的 `"8"`，窗口开了、单元重启了、
+  进程环境仍是 8，核验失败关窗（`ProbeError ce53d15331ea1884 at open_window:1161`）；本机 systemd 255
+  用户单元实验复现（drop-in `Environment=` 输、drop-in `EnvironmentFile=` 赢、`UnsetEnvironment=`
+  删掉文件设的键、文件里的 `X=` 得空串）。pci-root 仍用 `Environment=`（该键不在安装器的环境文件里）。
 
 `open-window` 在重启单元后用 `nsenter` **核验**：每个替换在单元 mount namespace /
 进程环境里可见，而在 PID 1 的命名空间里不可见（文件内容 sha256 与所在设备号、
 不可打开节点下的可读性——单元内 `cat` 必须失败、PID 1 必须成功——、PATH 首位与 shim、
 环境变量），核验不过即关闭窗口并报错；
-核验结果写入回执。除 phase-1 的 `/proc/stat`、gfrs 统计计数器 bind 与 pci-root 外，
+核验结果写入回执。关窗（`close-window`、deadman、`await-ticks --close`）删 drop-in 后
+`daemon-reload`，再读 `DropInPaths`/`NeedDaemonReload`——被删的 drop-in 在下一次 reload 之前仍被
+systemd 列出（本机 255 实验；2026-10-26 节点上 013 关窗后 SSM 看到的正是这种残留列出）——仍列出
+就再 reload 一次（回执 `reloads`、`residue.dropin_loaded`），重启单元后**读回真实配置**
+（`restore.checks`：每个被替换的源在单元内与 PID 1 看到的内容/设备号一致，每个被覆盖的变量回到开窗
+时记录的 `baseline_env` 值，unset 的保持不存在；`restore.ok`、`closed_at`）。探针失败时
+`host_probe_fixture` 的异常文本仍只带白名单令牌（类名、消息 sha256 前 16 位、`函数:行`），但现在把探针
+自己的消息与结构化细节（`ProbeError.detail`，如核验失败的 `checks`）**脱敏**（凭据样式令牌与长不透明
+串打码、长度有界）后写到用例目录 `probe-error.json`，异常文本末尾加 `detail in probe-error.json`——
+此前两条车道只能对摘要暴力反查。除 phase-1 的 `/proc/stat`、gfrs 统计计数器 bind 与 pci-root 外，
 其余模式都需要 `--approve HOST_SOURCE_REPLAY`（plan 与 execute 同时）。运行器 API：
 `host_source_replay(ctx)` → `install`/`install_wrapper(tool, plan)`/`replan`/
 `build_infiniband(...)`/`build_nvidia_proc(...)`/`open_window(binds, trees, wrappers,
@@ -1704,16 +1730,22 @@ phase 2 新增经审查的 `live-replay` 类别，统一经产品自身的读取
   incident RECOVERED、恢复满数。`link_inactive`（`risk M`，`S`，仅需 `HOST_SOURCE_REPLAY`，预期
   PASS——原缺口已由批次 175 关闭，不再需要 `NODE_REBOOT`）：该设备一个端口 `state`/`phys_state`
   改为 `1: DOWN`/`3: Disabled` → `failure_mode=LINK_INACTIVE` → RUN_DIAGNOSTICS。因该链的
-  VALIDATE_FABRIC 对仍不活动的端口按设计升级 REBOOT_NODE，端口只曝光一个**有界曝光期**：树窗口
-  自己的 deadman 在开窗后 1.7 个采集周期（15 s 周期为 26 s）关窗——在确认缺口、产出 finding 的
-  第二拍之后、第三拍之前——使诊断只读到恢复后的端口，而不靠运行器轮询（20 s 存储轮询加两次探针
-  往返追不上 15 s 的拍）；运行器随后的关窗只是确认（`closed_by: deadman`，deadman 迟到则自己关并
-  记 `runner`）。PASS 要求先诊断（首个工作流只有 FREEZE_EVIDENCE + VALIDATE_FABRIC、无硬件/隔离）、
+  VALIDATE_FABRIC 对仍不活动的端口按设计升级 REBOOT_NODE，端口只曝光一个**有界曝光期**：探针在
+  节点上观测采集器自己的拍（`await-ticks` 读单元的 `WatchdogTimestampMonotonic`，拍与拍之间静默
+  一个采集周期）并在确认缺口、产出 finding 的第 N 拍（`GPU_FAULT_INVENTORY_MISMATCH_CONSECUTIVE_SAMPLES`，
+  默认 2）结束后立即关窗——第三拍之前——使诊断只读到恢复后的端口（`observed_exposure`，证据
+  `link-inactive-exposure.json` 记每拍结束时刻、`closed_at`、`closed_by: probe`，兜底 deadman 先到则
+  `deadman`）；运行器不靠存储轮询追拍（20 s 存储轮询加探针往返追不上 15 s 的拍），也不再用从重启起算的
+  固定 1.7 个采集周期（26 s）：采集器重启后先睡节点相位（`GPU_FAULT_COLLECTOR_STARTUP_SPREAD_SECONDS`，
+  15 s 内）加 `[0, 20 s)` 启动抖动才打第一拍，2026-10-26 eksb 实况第一拍落在开窗后 13 s，deadman 在
+  第二拍前关窗，产品没有 finding（INCONCLUSIVE）。deadman 改为兜底 `exposure_fallback_seconds`
+  （相位 + 抖动 + N×(周期 + 10 s) + 20 s，本站 105 s），运行器消失时才由它还原。PASS 要求先诊断
+  （首个工作流只有 FREEZE_EVIDENCE + VALIDATE_FABRIC、无硬件/隔离）、
   该 VALIDATE_FABRIC SUCCEEDED 且 `details.inventory_evidence[<node>][efa_inventory_active_count]`
   为恢复后观测到的满数、无验证等待 `missing_inventory_action_completion`、incident RECOVERED、
-  无 RESTART_NODE、恢复满数。曝光期内未出 finding（两拍未都落在窗口内），或恢复后仍记录到
-  `efa_inventory_missing_count>=1`（上界未守住，此时产品对新鲜不活动证据的升级是设计所为）记
-  INCONCLUSIVE，不是对产品的判定。
+  无 RESTART_NODE、恢复满数。曝光期内未出 finding 或窗口内记录的缺口读数少于 N 拍（消息写明观测到的
+  拍数、曝光秒数与关窗者），或恢复后仍记录到 `efa_inventory_missing_count>=1`（上界未守住，此时产品对
+  新鲜不活动证据的升级是设计所为）记 INCONCLUSIVE，不是对产品的判定。
 - 013 `pci_missing`（`risk H`，`X`，两个集群，`--approve HOST_SOURCE_REPLAY NODE_REBOOT`，
   模块 `general_live_efa_pci.py`，`expected_outcome=PASS`）：先做规格要求的反向阶段——
   `build-pci-fixture --unreadable` 把夹具路径建成普通文件并以 `pci-root` 重指入 host collector

@@ -718,8 +718,13 @@ def test_inventory_and_read_back_need_no_token(tmp_path: Path) -> None:
     assert controller.inventory()["devices"] == {"rdmap79s0": {"efa": True}}
     dest = "/sys/class/infiniband/rdmap79s0/ports/1/state"
     assert controller.read_back(dest)["same"] is True
-    assert fake.calls[0][:3] == ("inventory", "--source", "/sys/class/infiniband")
-    assert fake.calls[1][:3] == ("read-source", "--path", dest)
+    # The read-only oracle commands live in the builders file (the probe is one
+    # file under the size limit), so the builders are shipped first, once.
+    assert fake.calls[0][0] == "install-source", fake.calls[0]
+    assert fake.calls[1][:3] == ("inventory", "--source", "/sys/class/infiniband")
+    assert fake.calls[2][:3] == ("read-source", "--path", dest)
+    controller.status()
+    assert [call[0] for call in fake.calls].count("install-source") == 1
     with pytest.raises(helper.HostSourceReplayError, match="not allow-listed"):
         controller.read_back("/etc/passwd")
 
@@ -768,14 +773,17 @@ def test_build_commands_ship_the_builders_once_before_the_first_build(
     controller.build_infiniband(drop=["rdmap80s0"])
     controller.build_pci(efa_count=2)
     assert [call[0] for call in fake.calls] == [
+        "install-source",
         "inventory",
         "read-source",
-        "install-source",
         "build-meminfo-fixture",
         "build-infiniband-fixture",
         "build-pci-fixture",
-    ], "read-only commands need no builders; one install precedes the first build"
-    shipped = fake.calls[2]
+    ], (
+        "one install of the builders precedes the first command that needs them "
+        "(inventory lives there; read-source and the window never need it)"
+    )
+    shipped = fake.calls[0]
     content = helper.BUILDERS_MODULE.read_bytes()
     assert shipped[shipped.index("--name") + 1] == probe.BUILDERS_NAME, shipped
     assert (
@@ -872,18 +880,134 @@ def test_snapshot_and_recreate_after_a_reboot(tmp_path: Path) -> None:
     assert len(installs) == 2, "the builders are shipped again after the reboot"
 
 
-def test_bounded_exposure_is_after_two_ticks_and_before_a_third() -> None:
-    """The deadman as the restore: the collector reads the replaced value on its
-    second tick and never on a third, whatever the runner's polling latency."""
+class _Cadence:
+    """The cadence surface ``exposure_fallback_seconds``/``observed_exposure`` read."""
 
-    for interval in (15, 30, 60):
-        exposure = helper.bounded_exposure_seconds(interval)
-        assert interval + 0.7 * interval <= exposure < 2 * interval, (
-            interval,
-            exposure,
-        )
-    assert helper.bounded_exposure_seconds(15) == 26, "the site's 15 s ticks"
-    assert helper.bounded_exposure_seconds(5) == probe.MIN_RESTORE_SECONDS, (
-        "never below the deadman floor"
+    def __init__(self, env: dict[str, str]) -> None:
+        self.env = env
+        self.written: dict[str, object] = {}
+        self.evidence = self
+
+    def write(self, name: str, document: object) -> None:
+        self.written[name] = document
+
+    def setting(self, key: str, default: int) -> int:
+        value = self.env.get(key)
+        return int(value) if value not in (None, "") else default
+
+    @property
+    def host_interval(self) -> int:
+        return self.setting("GPU_FAULT_HOST_INTERVAL_SECONDS", 15)
+
+
+def test_exposure_fallback_follows_the_collectors_cadence() -> None:
+    """The deadman of a bounded exposure is the fallback: after the collector's
+    restart phase (startup spread + start-up jitter) and the required ticks,
+    each with its own duration, plus the probe's close. A fixed 1.7-interval
+    bound from the restart is gone (live 2026-10-26: first tick 13 s in)."""
+
+    ctx = _Cadence({})
+    assert helper.confirmation_ticks(ctx) == 2, "two consecutive samples by default"
+    assert (
+        helper.exposure_fallback_seconds(ctx, 2) == 15 + 20 + 2 * (15 + 10) + 20 == 105
     )
-    assert probe.MIN_RESTORE_SECONDS == 20, "the floor admits the 15 s exposure"
+    ctx = _Cadence(
+        {
+            "GPU_FAULT_HOST_INTERVAL_SECONDS": "30",
+            "GPU_FAULT_INVENTORY_MISMATCH_CONSECUTIVE_SAMPLES": "3",
+            "GPU_FAULT_COLLECTOR_STARTUP_SPREAD_SECONDS": "5",
+            "GPU_FAULT_COLLECTOR_STARTUP_JITTER_SECONDS": "0",
+        }
+    )
+    assert helper.confirmation_ticks(ctx) == 3
+    assert helper.exposure_fallback_seconds(ctx, 3) == 5 + 0 + 3 * (30 + 10) + 20 == 145
+    assert (
+        helper.exposure_fallback_seconds(
+            _Cadence({"GPU_FAULT_HOST_INTERVAL_SECONDS": "3600"}), probe.MAX_TICKS
+        )
+        == probe.MAX_RESTORE_SECONDS
+    ), "never past the deadman's ceiling"
+    assert (
+        helper.confirmation_ticks(
+            _Cadence({"GPU_FAULT_INVENTORY_MISMATCH_CONSECUTIVE_SAMPLES": "99"})
+        )
+        == probe.MAX_TICKS
+    )
+    assert not hasattr(helper, "bounded_exposure_seconds"), (
+        "the fixed bound from the restart is retired"
+    )
+
+
+def _ticks(count: int) -> list[dict[str, object]]:
+    return [
+        {
+            "pings_seen": 17,
+            "first_ping_at": f"2026-10-26T03:34:{40 + 15 * index:02d}+00:00",
+            "last_ping_at": f"2026-10-26T03:34:{43 + 15 * index:02d}+00:00",
+        }
+        for index in range(count)
+    ]
+
+
+def test_observed_exposure_closes_on_the_probes_tick_count(tmp_path: Path) -> None:
+    """``await-ticks --close`` on the node is the restore; the record carries the
+    ticks the probe saw, when the real source was read again and who closed."""
+
+    close = {
+        "clean": True,
+        "closed_at": "2026-10-26T03:35:10+00:00",
+        "restore": {"ok": True, "checks": [{"kind": "source", "ok": True}]},
+        "after": {"ActiveState": "active"},
+    }
+    controller, fake = _controller(
+        tmp_path,
+        **{"await-ticks": {"completed": True, "ticks": _ticks(2), "close": close}},
+    )
+    controller.open_tree([("infiniband", "/sys/class/infiniband")], restore_seconds=105)
+    ctx = _Cadence({})
+    record = helper.observed_exposure(ctx, controller, ticks=2, name="link-inactive")
+    call = next(call for call in fake.calls if call[0] == "await-ticks")
+    assert call[:8] == (
+        "await-ticks",
+        "--count",
+        "2",
+        "--interval",
+        "15",
+        "--timeout",
+        "105",
+        "--close",
+    ), call
+    assert dict(fake.timeouts)["await-ticks"] == 105 + 120, (
+        "the close's own time on top"
+    )
+    assert record["closed_by"] == "probe" and record["completed"] is True
+    assert record["closed_at"] == "2026-10-26T03:35:10+00:00"
+    assert record["ticks_observed"] == 2 and record["ticks_required"] == 2
+    assert record["restore"] == close["restore"] and record["clean"] is True
+    assert ctx.written["link-inactive-exposure"]["receipt"]["completed"] is True
+    receipts = controller.cleanup()
+    assert "close" not in receipts, "the window is closed; cleanup closes nothing twice"
+    # The fallback deadman got there first: nothing to wait for, nothing to close.
+    controller, fake = _controller(
+        tmp_path,
+        **{"await-ticks": {"already_closed": True, "completed": False, "ticks": []}},
+    )
+    controller.open_tree([("infiniband", "/sys/class/infiniband")], restore_seconds=105)
+    record = helper.observed_exposure(ctx, controller, ticks=2, name="link-inactive")
+    assert record["closed_by"] == "deadman" and record["completed"] is False
+    assert record["clean"] is True and record["ticks_observed"] == 0
+    assert "close" not in controller.cleanup()
+    # A close that left residue fails the variant, like cleanup does.
+    controller, fake = _controller(
+        tmp_path,
+        **{
+            "await-ticks": {
+                "completed": True,
+                "ticks": _ticks(2),
+                "close": {"clean": False},
+            }
+        },
+    )
+    controller.open_tree([("infiniband", "/sys/class/infiniband")], restore_seconds=105)
+    with pytest.raises(helper.HostSourceReplayError, match="did not close clean"):
+        helper.observed_exposure(ctx, controller, ticks=2, name="link-inactive")

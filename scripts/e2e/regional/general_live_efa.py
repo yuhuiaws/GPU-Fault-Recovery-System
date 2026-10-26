@@ -103,7 +103,9 @@ from scripts.e2e.regional.general_live_registry import (
 )
 from scripts.e2e.regional.general_live_source_replay import (
     HOST_SOURCE_REPLAY,
-    bounded_exposure_seconds,
+    confirmation_ticks,
+    exposure_fallback_seconds,
+    observed_exposure,
     rule,
 )
 from scripts.e2e.regional.general_live_verdicts import (
@@ -332,11 +334,14 @@ def link_inactive(ctx: VariantContext) -> dict[str, Any]:
     -> the fabric diagnostic fails on the held port; the LINK_INACTIVE
     co-finding diagnoses the restored port; nothing reboots.
 
-    The window's own deadman closes it :func:`bounded_exposure_seconds` after
-    it opened: after the collector's second tick -- which the ``rdma_link_down``
-    chain's VALIDATE_FABRIC judges (FAILED on the held port) and which confirms
-    the ``efa_inventory_mismatch`` LINK_INACTIVE co-finding -- and before a
-    third. The co-finding's diagnostic judges fresh readings (batch 175) and
+    :func:`observed_exposure` closes the window right after the collector's
+    confirming tick as the probe observes it on the node: the second tick --
+    which the ``rdma_link_down`` chain's VALIDATE_FABRIC judges (FAILED on the
+    held port) and which confirms the ``efa_inventory_mismatch`` LINK_INACTIVE
+    co-finding -- and before a third; the deadman is only the fallback (a fixed
+    1.7-interval bound measured from the restart lost to the collector's
+    startup phase live, 2026-10-26). The co-finding's diagnostic judges fresh
+    readings (batch 175) and
     would escalate a port still inactive to REBOOT_NODE by design, so it only
     ever sees the restored port: SUCCEEDED, RECOVERED, no RESTART_NODE, under
     HOST_SOURCE_REPLAY alone. A verdict the product reached on the restored
@@ -349,17 +354,27 @@ def link_inactive(ctx: VariantContext) -> dict[str, Any]:
     target = state_target(fixture.survey())
     ctx.evidence.write("efa-target", target.describe())
     fixture.bind("efa-state", target.dest("state"), LINK_DOWN_TEXT)
-    exposure = bounded_exposure_seconds(ctx.host_interval)
+    ticks = confirmation_ticks(ctx)
     started = utc_now()
-    fixture.open(restore_seconds=exposure)
-    restore_at = utc_now() + timedelta(seconds=exposure)
+    opened = fixture.open(restore_seconds=exposure_fallback_seconds(ctx, ticks))
+    # The probe closes the window right after the collector's confirming tick,
+    # observed on the node; the deadman is only the fallback.
+    exposure = observed_exposure(
+        ctx, fixture.replay, ticks=ticks, name="link-inactive", opened=opened
+    )
+    fixture.closed_at = ctx.clock()
+    restore_at = parse_time(exposure["closed_at"]) or utc_now()
+    closed_by = str(exposure["closed_by"])
+    opened_at = parse_time(opened.get("opened_at")) or started
+    exposure_seconds = round((restore_at - opened_at).total_seconds(), 1)
+    ctx.evidence.write("source-window-close", exposure)
     metrics = {LINK_METRIC, INVENTORY_METRIC, MISSING_METRIC}
     detection = wait_for_incident(
         ctx,
         started,
         LINK_METRIC,
         device=target.port_device,
-        timeout_seconds=exposure + ctx.host_interval * 3 + 60,
+        timeout_seconds=ctx.host_interval * 3 + 120,
         metrics=metrics,
         name="link-inactive",
     )
@@ -369,16 +384,13 @@ def link_inactive(ctx: VariantContext) -> dict[str, Any]:
         if incidents
         else detection
     )
-    remaining = (restore_at - utc_now()).total_seconds()
-    if remaining > 0:
-        ctx.hold(remaining + CLOCK_TOLERANCE_SECONDS, name="exposure")
-    closed = fixture.close()
-    closed_by = "deadman" if closed.get("already_closed") else "runner"
     ctx.evidence.append_oracle(
         [
             {
                 "held_port": target.port_device,
-                "exposure_seconds": exposure,
+                "ticks_required": ticks,
+                "ticks_observed": exposure["ticks_observed"],
+                "exposure_seconds": exposure_seconds,
                 "restore_at": restore_at.isoformat(),
                 "closed_by": closed_by,
             }
@@ -387,7 +399,8 @@ def link_inactive(ctx: VariantContext) -> dict[str, Any]:
     )
     if not incidents and not metric_values(held, LINK_METRIC, target.port_device):
         raise VariantInconclusive(
-            f"the bounded exposure ({exposure} s) ended before the product read "
+            f"the bounded exposure ({exposure_seconds} s, closed by {closed_by}) ended "
+            f"before the product read "
             f"{LINK_METRIC} on {target.port_device}: no sample, nothing to judge"
         )
     judged = (
@@ -489,7 +502,8 @@ def link_inactive(ctx: VariantContext) -> dict[str, Any]:
         stages,
         notes=[
             f"bound {target.dest('state')} = {LINK_DOWN_TEXT!r} (phys_state real) for a "
-            f"bounded exposure of {exposure} s (closed by {closed_by}); VALIDATE_FABRIC "
+            f"bounded exposure of {exposure_seconds} s (closed by {closed_by} after "
+            f"{exposure['ticks_observed']} observed collector tick(s)); VALIDATE_FABRIC "
             "must fail on the held port and nothing may reboot or cordon",
             f"inventory co-finding samples: {len(inventory_samples)}; the co-finding's "
             "diagnostic judges the restored port",
@@ -497,7 +511,10 @@ def link_inactive(ctx: VariantContext) -> dict[str, Any]:
         extra={
             "target": target.describe(),
             "recovery": recovered,
-            "exposure_seconds": exposure,
+            "exposure_seconds": exposure_seconds,
+            "ticks_required": ticks,
+            "ticks_observed": exposure["ticks_observed"],
+            "ticks": exposure["ticks"],
             "restore_at": restore_at.isoformat(),
             "closed_by": closed_by,
         },

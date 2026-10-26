@@ -242,6 +242,42 @@ def _tree_summary(**mutations: Any) -> dict[str, Any]:
     }
 
 
+def _ticks_receipt(
+    *,
+    completed: bool = True,
+    observed: int = 2,
+    already_closed: bool = False,
+    closed_at: str | None = None,
+) -> dict[str, Any]:
+    """What ``await-ticks --close`` answers: the ticks the probe saw on the node
+    and its close of the window (or ``already_closed`` when the deadman won)."""
+
+    receipt: dict[str, Any] = {
+        "count": 2,
+        "completed": completed,
+        "waited_seconds": 36.3,
+        "ticks": [
+            {
+                "pings_seen": 17,
+                "first_ping_at": _soon(-60 + 15 * index),
+                "last_ping_at": _soon(-57 + 15 * index),
+            }
+            for index in range(observed)
+        ],
+    }
+    if already_closed:
+        receipt["already_closed"] = True
+    else:
+        receipt["close"] = {
+            "clean": True,
+            "closed_at": closed_at or _soon(0),
+            "reloads": 1,
+            "restore": {"ok": True, "checks": [{"kind": "source", "ok": True}]},
+            "after": {"ActiveState": "active"},
+        }
+    return receipt
+
+
 def _tree_probe(**extra: Any) -> FakeProbe:
     script: dict[str, Any] = {
         "build-infiniband-fixture": [_tree_summary(), _tree_summary(mutations=["x"])],
@@ -250,6 +286,7 @@ def _tree_probe(**extra: Any) -> FakeProbe:
             "proof_scope": "live-replay",
             "verification": {"ok": True, "checks": [{"kind": "tree", "ok": True}]},
         },
+        "await-ticks": _ticks_receipt(),
         "set-value": {},
         "status": {"fixtures": {}},
         "close-window": {"clean": True},
@@ -363,7 +400,11 @@ def _soon(seconds: float) -> str:
     return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
 
 
-EXPOSURE = mod.bounded_exposure_seconds(15)
+#: The fallback deadman at the site's cadence: 15 + 20 + 2 x (15 + 10) + 20.
+FALLBACK = 105
+#: Readings the fakes place after the probe's close (``_ticks_receipt`` closes
+#: at ``_soon(0)``).
+AFTER_RESTORE = 60
 STALE_WAITING = {
     "operation": "VALIDATE_FABRIC",
     "status": "WAITING",
@@ -627,7 +668,7 @@ def _link_docs(
     late_inactive: bool = False,
 ) -> list[dict[str, Any]]:
     verdict = verdict or fresh_verdict(
-        "SUCCEEDED", value=EXPECTED_EFA, observed_at=_soon(EXPOSURE + 20)
+        "SUCCEEDED", value=EXPECTED_EFA, observed_at=_soon(AFTER_RESTORE + 20)
     )
     detection = _base_doc(
         batches=[
@@ -667,7 +708,10 @@ def _link_docs(
     if late_inactive:
         settled["batches"].append(
             _efa_batch(
-                _soon(EXPOSURE + 30), failure_mode="LINK_INACTIVE", active=2, mismatch=1
+                _soon(AFTER_RESTORE + 30),
+                failure_mode="LINK_INACTIVE",
+                active=2,
+                mismatch=1,
             )
         )
     if reboot:
@@ -675,9 +719,12 @@ def _link_docs(
     return [_base_doc(), detection, detection, recovery, settled]
 
 
-def _closing_probe(*, already_closed: bool = True) -> FakeProbe:
+def _closing_probe(*, already_closed: bool = False, **ticks: Any) -> FakeProbe:
+    """A probe whose ``await-ticks`` closed the window itself (``probe``) or
+    found the fallback deadman had (``already_closed``)."""
+
     return _tree_probe(
-        **{"close-window": {"clean": True, "already_closed": already_closed}}
+        **{"await-ticks": _ticks_receipt(already_closed=already_closed, **ticks)}
     )
 
 
@@ -700,24 +747,42 @@ def test_link_inactive_passes_on_a_bounded_exposure_and_a_fresh_verdict(
         ctx.run_id,
     ), mutated
     opened = next(call for call in probe.calls if call[0] == "open-window")
-    assert opened[opened.index("--restore-seconds") + 1] == str(EXPOSURE), (
-        "the window's own deadman is the restore: 1.7 collector intervals"
+    assert opened[opened.index("--restore-seconds") + 1] == str(FALLBACK), (
+        "the deadman is the fallback: startup phase + jitter + 2 ticks + margins"
     )
-    assert EXPOSURE == 26, "15 s ticks: after the second tick, before the third"
+    waited = next(call for call in probe.calls if call[0] == "await-ticks")
+    assert waited[:8] == (
+        "await-ticks",
+        "--count",
+        "2",
+        "--interval",
+        "15",
+        "--timeout",
+        str(FALLBACK),
+        "--close",
+    ), "the probe closes right after the collector's second tick, seen on the node"
     names = [call[0] for call in probe.calls]
-    assert names.index("open-window") < names.index("close-window")
-    assert result["closed_by"] == "deadman" and result["exposure_seconds"] == EXPOSURE
+    assert names.index("open-window") < names.index("await-ticks")
+    assert "close-window" not in names, "await-ticks closed; nothing closes twice"
+    assert result["closed_by"] == "probe" and result["ticks_observed"] == 2
+    assert result["ticks_required"] == 2 and len(result["ticks"]) == 2
+    assert isinstance(result["exposure_seconds"], float), (
+        "the exposure is measured (open to the probe's close), not a fixed bound"
+    )
     assert result["device"] == "rdmap0s0" and result["port"] == "1"
     assert result["stages"]["fresh_evidence"] == [], result["stages"]
-    # A late deadman: the runner's own close restores and says so.
+    assert (ctx.case_dir / "link-inactive-exposure.json").is_file(), (
+        "the observed ticks and the close are case evidence"
+    )
+    # The fallback deadman got there first: the probe found the window closed.
     ctx = _tree_ctx(
         "link_inactive",
         docs=_link_docs(),
         tmp_path=tmp_path,
-        probe=_closing_probe(already_closed=False),
+        probe=_closing_probe(already_closed=True),
     )
-    assert mod.link_inactive(ctx)["closed_by"] == "runner"
-    # The exposure follows the node's own collector interval (the survey).
+    assert mod.link_inactive(ctx)["closed_by"] == "deadman"
+    # The cadence follows the node's own collector settings (the survey).
     probe = _closing_probe()
     ctx = _tree_ctx(
         "link_inactive",
@@ -728,10 +793,11 @@ def test_link_inactive_passes_on_a_bounded_exposure_and_a_fresh_verdict(
     )
     result = mod.link_inactive(ctx)
     opened = next(call for call in probe.calls if call[0] == "open-window")
-    assert opened[opened.index("--restore-seconds") + 1] == "51", (
-        "1.7 x 30 s: after the second tick, before the third"
+    assert opened[opened.index("--restore-seconds") + 1] == "135", (
+        "15 + 20 + 2 x (30 + 10) + 20"
     )
-    assert result["exposure_seconds"] == 51
+    waited = next(call for call in probe.calls if call[0] == "await-ticks")
+    assert waited[waited.index("--interval") + 1] == "30"
 
 
 def test_link_inactive_fails_on_the_old_deadline_reboot_gap(tmp_path: Path) -> None:
@@ -787,6 +853,25 @@ def test_link_inactive_is_inconclusive_when_the_bound_decided_nothing(
         probe=_closing_probe(),
     )
     with pytest.raises(VariantInconclusive, match="bounded exposure"):
+        mod.link_inactive(ctx)
+    # The probe saw one tick within the bound: the message says so.
+    ctx = _tree_ctx(
+        "link_inactive",
+        docs=_link_docs(detected=False),
+        tmp_path=tmp_path,
+        probe=_closing_probe(completed=False, observed=1),
+    )
+    with pytest.raises(VariantInconclusive, match="1 collector tick") as caught:
+        mod.link_inactive(ctx)
+    assert "needs 2 confirming ticks" in str(caught.value), str(caught.value)
+    # Both shortfall readings must lie inside the exposure (before the close).
+    docs = _link_docs()
+    for batch in docs[1]["batches"][1:]:
+        batch["observed_at"] = _soon(AFTER_RESTORE)
+    ctx = _tree_ctx(
+        "link_inactive", docs=docs, tmp_path=tmp_path, probe=_closing_probe()
+    )
+    with pytest.raises(VariantInconclusive, match="1 shortfall reading"):
         mod.link_inactive(ctx)
     ctx = _tree_ctx(
         "link_inactive",

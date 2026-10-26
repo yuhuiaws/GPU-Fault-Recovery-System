@@ -343,10 +343,11 @@ class EfaSourceFixture:
         """Open the window; its deadman fires after ``restore_seconds``.
 
         The default outlasts the variant. A variant whose replaced reading must
-        be seen on exactly two collector ticks and never a third (010
+        be seen on exactly the confirming collector ticks and never a third (010
         ``link_inactive``: a fresh inactive port is the diagnostic's designed
-        REBOOT_NODE) passes ``general_live_source_replay.bounded_exposure_seconds``
-        and lets the deadman be the restore.
+        REBOOT_NODE) passes ``general_live_source_replay.exposure_fallback_seconds``
+        as the deadman and closes through ``observed_exposure``, the probe
+        watching the collector's own ticks on the node.
         """
 
         restore = (

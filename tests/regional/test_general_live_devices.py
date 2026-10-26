@@ -206,7 +206,12 @@ def _ctx(
 
 
 def _plan_sent(probe: FakeProbe) -> dict[str, Any]:
-    installs = [call for call in probe.calls if call[0] == "install-source"]
+    installs = [
+        call
+        for call in probe.calls
+        if call[0] == "install-source" and "plan-nvidia-smi.json" in call
+    ]
+    assert installs, [call[:3] for call in probe.calls if call[0] == "install-source"]
     flags = dict(zip(installs[-1][1::2], installs[-1][2::2]))
     assert flags["--name"] == "plan-nvidia-smi.json", installs
     return json.loads(base64.b64decode(flags["--b64"]))

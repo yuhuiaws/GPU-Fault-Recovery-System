@@ -152,7 +152,7 @@ def test_kernel_collector_window_wraps_the_driver_version_query_only(
     assert host.environments[KERNEL_UNIT]["PATH"].split(":")[0] == str(
         probe.bin_dir(RUN)
     )
-    assert host.environments[UNIT] == {}, (
+    assert host.environments[UNIT] == {"GPU_FAULT_EXPECTED_GPU_COUNT": "8"}, (
         "the host collector's environment is untouched"
     )
 

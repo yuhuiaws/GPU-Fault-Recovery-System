@@ -38,6 +38,7 @@ from scripts.e2e.regional.general_live_source_replay import (
     HOST_SOURCE_REPLAY,
     host_source_replay,
 )
+from scripts.e2e.regional.probes import general_live_source_builders as builders
 from scripts.e2e.regional.probes import general_live_source_probe as probe
 from tests.collectors import _cov95_runtime_collect as cov_support
 from tests.collectors import _cov95_runtime_collect_host as cov_host
@@ -1144,7 +1145,7 @@ def test_the_real_collector_confirms_one_dropped_function_as_pci_device_missing(
     # The probe's read-only inventory (its ``inventory`` command runs ethtool
     # through shutil.which, which host_case stubs): the device -> BDF mapping
     # the runner picks the dropped function from.
-    listed = probe.rdma_inventory(ib_root, tmp_path / "sys" / "class" / "net")
+    listed = builders.rdma_inventory(ib_root, tmp_path / "sys" / "class" / "net")
     assert mod.efa_functions(listed) == list(zip(DEVICES, BDFS)), listed["devices"]
     pci = _probe_build(
         capsys, "build-pci-fixture", "--source", str(pci_root), "--drop", DROPPED_BDF

@@ -9,8 +9,10 @@ self-contained file (``host_probe_fixture.py``), so this module travels like the
 command wrapper does: the controller installs it through ``install-source``
 (base64 + sha256-checked, under ``/run/gfrs-live/source-<digest>/fixtures``)
 before the first build and the probe imports the installed copy by path. The
-window, deadman, verification and cleanup commands never need it, so a window
-closes with the probe alone. Standard library only, Python 3.9+.
+read-only oracle commands (``inventory``, ``audit-read``, ``status``,
+``journal-read``) live here too since 2026-10-26; the window, deadman,
+verification and cleanup commands never need it, so a window closes with the
+probe alone. Standard library only, Python 3.9+.
 
 All allow-lists stay in the probe; the builders take them from the probe module
 the loader registered (``PROBE_ALIAS``) or, in a checkout, the sibling module.
@@ -21,6 +23,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -39,8 +42,20 @@ else:
 ProbeError = probe.ProbeError
 emit = probe.emit
 safe_id = probe.safe_id
+utc_now = probe.utc_now
 fixtures_dir = probe.fixtures_dir
+audit_dir = probe.audit_dir
 write_atomic = probe.write_atomic
+window_unit = probe.window_unit
+checked_unit = probe.checked_unit
+checked_moment = probe.checked_moment
+WRAPPABLE_TOOLS = probe.WRAPPABLE_TOOLS
+MAX_AUDIT_LINES = probe.MAX_AUDIT_LINES
+MAX_JOURNAL_LINES = probe.MAX_JOURNAL_LINES
+MAX_JOURNAL_LINE_CHARS = probe.MAX_JOURNAL_LINE_CHARS
+MAX_INVENTORY_COUNTERS = probe.MAX_INVENTORY_COUNTERS
+MAX_ETHTOOL_NAMES = probe.MAX_ETHTOOL_NAMES
+MAX_SOURCE_VALUE_CHARS = probe.MAX_SOURCE_VALUE_CHARS
 DEVICE_NAME = probe.DEVICE_NAME
 PORT_NAME = probe.PORT_NAME
 PORT_STATE = probe.PORT_STATE
@@ -579,5 +594,237 @@ def build_meminfo_fixture(arguments: argparse.Namespace) -> None:
             "overrides_kb": overrides,
             "values_kb": {key: values[key] for key in sorted(values)},
             **meminfo_percentages(values),
+        }
+    )
+
+
+# --------------------------------------------------------------------------- #
+# read-only oracle commands (inventory, audit-read, status, journal-read)
+# --------------------------------------------------------------------------- #
+# Shipped here rather than in the probe so the probe stays one file under the
+# 1500-line limit; the controller installs this module before the first of
+# them (``HostSourceReplay._install_builders``). ``probe.run`` / ``unit_state``
+# / ``load_state`` are called through the probe module so the contract tests'
+# fakes (which replace them on the probe) see these commands too.
+def _text(path: Path, limit: int = MAX_SOURCE_VALUE_CHARS) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").strip()[:limit]
+    except OSError:
+        return None
+
+
+def _rdma_driver(device: Path) -> tuple[str | None, list[str]]:
+    """``(resolved driver, uevent DRIVER= values)`` the way ``is_efa_device`` reads them."""
+
+    try:
+        resolved: str | None = (device / "device" / "driver").resolve(strict=True).name
+    except OSError:
+        resolved = None
+    uevent = _text(device / "device" / "uevent", 4096) or ""
+    drivers = [
+        line[len("DRIVER=") :]
+        for line in uevent.splitlines()
+        if line.startswith("DRIVER=")
+    ]
+    return resolved, drivers
+
+
+def _pci_function(device: Path) -> str | None:
+    """The BDF of the PCI function an RDMA device sits on (``device`` link), or None.
+
+    013 ``pci_missing`` drops that function from the copied PCI root and the
+    device from the copied RDMA tree, the way one function that fell off the
+    bus takes its RDMA device with it.
+    """
+
+    try:
+        name = (device / "device").resolve(strict=True).name
+    except OSError:
+        return None
+    return name if BDF.fullmatch(name) else None
+
+
+def rdma_inventory(root: Path, netdev_root: Path) -> dict[str, Any]:
+    """The node's RDMA devices as the host collector reads them (read-only)."""
+
+    devices: dict[str, Any] = {}
+    for device in sorted(root.iterdir()) if root.is_dir() else []:
+        if DEVICE_NAME.fullmatch(device.name) is None:
+            continue
+        driver, uevent_drivers = _rdma_driver(device)
+        net = device / "device" / "net"
+        ports: dict[str, Any] = {}
+        ports_dir = device / "ports"
+        for port in sorted(ports_dir.iterdir()) if ports_dir.is_dir() else []:
+            if PORT_NAME.fullmatch(port.name) is None:
+                continue
+            entry: dict[str, Any] = {
+                "state": _text(port / "state"),
+                "phys_state": _text(port / "phys_state"),
+            }
+            for group in ("counters", "hw_counters"):
+                values: dict[str, str | None] = {}
+                group_dir = port / group
+                names = sorted(group_dir.iterdir()) if group_dir.is_dir() else []
+                for counter in names[:MAX_INVENTORY_COUNTERS]:
+                    if counter.is_file() and COUNTER_NAME.fullmatch(counter.name):
+                        values[counter.name] = _text(counter, 64)
+                entry[group] = values
+            ports[port.name] = entry
+        devices[device.name] = {
+            "driver": driver,
+            "uevent_drivers": uevent_drivers,
+            "efa": driver == "efa" or (driver is None and uevent_drivers == ["efa"]),
+            "netdevs": sorted(item.name for item in net.iterdir())
+            if net.is_dir()
+            else [],
+            "ports": ports,
+            "pci": _pci_function(device),
+        }
+    physical = (
+        sorted(
+            item.name
+            for item in netdev_root.iterdir()
+            if (item / "device").exists() and NETDEV_NAME.fullmatch(item.name)
+        )
+        if netdev_root.is_dir()
+        else []
+    )
+    return {"root": str(root), "devices": devices, "physical_netdevs": physical}
+
+
+def ethtool_names(interfaces: list[str]) -> dict[str, Any]:
+    """What the real ``ethtool -S`` prints for each netdev: counter names only."""
+
+    path = shutil.which("ethtool", path=probe.STANDARD_PATH)
+    result: dict[str, Any] = {"path": path, "statistics": {}}
+    if path is None:
+        return result
+    for interface in interfaces:
+        completed = probe.run([path, "-S", interface], check=False, timeout=30)
+        names = []
+        for line in completed.stdout.splitlines():
+            name, separator, value = line.partition(":")
+            # ``NIC statistics:`` heads the listing; a counter line has a value.
+            if separator and name.strip() and value.strip():
+                names.append(name.strip())
+        result["statistics"][interface] = {
+            "returncode": completed.returncode,
+            "counters": names[:MAX_ETHTOOL_NAMES],
+            "truncated": len(names) > MAX_ETHTOOL_NAMES,
+            "stderr": completed.stderr.strip()[:200],
+        }
+    return result
+
+
+def inventory(arguments: argparse.Namespace) -> None:
+    run_id = safe_id(arguments.run_id)
+    value = rdma_inventory(Path(arguments.source), Path(arguments.netdev_root))
+    owned = {
+        name
+        for device in value["devices"].values()
+        if device["efa"]
+        for name in device["netdevs"]
+    }
+    value["ethtool"] = ethtool_names(sorted(owned | set(value["physical_netdevs"])))
+    emit({"run_id": run_id, "captured_at": utc_now(), **value})
+
+
+def audit_read(arguments: argparse.Namespace) -> None:
+    run_id = safe_id(arguments.run_id)
+    tool = arguments.tool
+    if tool not in WRAPPABLE_TOOLS:
+        raise ProbeError(f"{tool!r} is not an allow-listed tool")
+    path = audit_dir(run_id) / f"{tool}.jsonl"
+    entries: list[Any] = []
+    if path.is_file():
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        tail = max(1, min(int(arguments.tail), MAX_AUDIT_LINES))
+        for line in lines[-tail:]:
+            try:
+                entries.append(json.loads(line))
+            except ValueError:
+                entries.append({"unparsable": line[:200]})
+    calls_path = audit_dir(run_id) / "calls.json"
+    calls = (
+        json.loads(calls_path.read_text(encoding="utf-8") or "{}")
+        if calls_path.is_file()
+        else {}
+    )
+    emit({"run_id": run_id, "tool": tool, "entries": entries, "calls": calls})
+
+
+def status(arguments: argparse.Namespace) -> None:
+    run_id = safe_id(arguments.run_id)
+    state = probe.load_state(run_id)
+    if not state:
+        raise ProbeError("no source replay window is open for this run")
+    fixtures = {}
+    directory = fixtures_dir(run_id)
+    if directory.is_dir():
+        for item in sorted(directory.iterdir()):
+            if item.is_file():
+                fixtures[item.name] = item.read_text(
+                    encoding="utf-8", errors="replace"
+                )[:64]
+            else:
+                fixtures[item.name] = f"<tree: {len(os.listdir(item))} entries>"
+    audits = {}
+    if audit_dir(run_id).is_dir():
+        for item in sorted(audit_dir(run_id).glob("*.jsonl")):
+            audits[item.stem] = sum(1 for _ in item.open(encoding="utf-8"))
+    emit(
+        {
+            "run_id": run_id,
+            "mode": state["mode"],
+            "unit": probe.unit_state(window_unit(state)),
+            "unit_name": window_unit(state),
+            "fixtures": fixtures,
+            "wrappers": sorted(state.get("wrappers", {})),
+            "audit_lines": audits,
+        }
+    )
+
+
+def journal_read(arguments: argparse.Namespace) -> None:
+    """The tail of one allow-listed unit's journal since a moment (read-only).
+
+    What the collector itself logged about its discovery is the unit's own
+    record of a replayed query (``collectors/context.py`` warns when the
+    version discovery is unavailable; ``collectors/gpu/discovery.py`` logs the
+    branch it found). Lines are bounded in number and length.
+    """
+
+    run_id = safe_id(arguments.run_id)
+    unit = checked_unit(arguments.unit)
+    since = checked_moment(arguments.since)
+    tail = max(1, min(int(arguments.tail), MAX_JOURNAL_LINES))
+    completed = probe.run(
+        [
+            "journalctl",
+            "-u",
+            unit,
+            "--since",
+            since,
+            "-n",
+            str(tail),
+            "--no-pager",
+            "-q",
+            "-o",
+            "cat",
+        ],
+        check=False,
+        timeout=60,
+    )
+    lines = [line[:MAX_JOURNAL_LINE_CHARS] for line in completed.stdout.splitlines()]
+    emit(
+        {
+            "run_id": run_id,
+            "unit": unit,
+            "since": since,
+            "returncode": completed.returncode,
+            "lines": lines,
+            "truncated": len(lines) >= tail,
+            "window_open": bool(probe.load_state(run_id)),
         }
     )

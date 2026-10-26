@@ -35,6 +35,53 @@ CONSTANT_MESSAGE_LABELS = {
     "recovery": "recovery refused",
     "nfs_mount": "nfs mount failed",
 }
+#: The case-directory record of a failed probe call (``probe-error.json``): the
+#: probe's own message and structured detail, redacted and bounded, so an
+#: operator reads what the probe refused instead of brute-forcing the 16-hex
+#: digest the exception text carries (two lanes did, 2026-10-26). The
+#: exception text itself keeps its whitelisted shape.
+PROBE_ERROR_RECORD = "probe-error.json"
+PROBE_ERROR_MESSAGE_CHARS = 2000
+PROBE_ERROR_DETAIL_CHARS = 65536
+#: Credential-looking tokens are masked before anything is written; a value
+#: that follows a secret-ish key, and any long opaque blob.
+_SECRET_PATTERNS = (
+    re.compile(r"(?i)\b(bearer|basic)(\s+)[^\s,;}\]\"']+"),
+    re.compile(
+        r"(?i)\b(token|secret|password|passwd|authorization|api[_-]?key|"
+        r"credential)s?\b([=: ]+)[^\s,;}\]\"']+"
+    ),
+    re.compile(r"(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/=_-]{40,}(?![A-Za-z0-9+/=_-])"),
+)
+
+
+def redact_probe_text(text: str, limit: int = PROBE_ERROR_MESSAGE_CHARS) -> str:
+    """``text`` with credential-shaped tokens masked and its length bounded."""
+
+    value = str(text)
+    for pattern in _SECRET_PATTERNS[:2]:
+        value = pattern.sub(lambda m: f"{m.group(1)}{m.group(2)}<redacted>", value)
+    value = _SECRET_PATTERNS[2].sub("<redacted>", value)
+    return value[:limit]
+
+
+def redact_probe_detail(value: Any, depth: int = 0) -> Any:
+    """``value`` (JSON) with every string redacted; depth- and width-bounded."""
+
+    if depth > 8:
+        return "<nested>"
+    if isinstance(value, str):
+        return redact_probe_text(value, 1024)
+    if isinstance(value, dict):
+        return {
+            redact_probe_text(str(key), 128): redact_probe_detail(item, depth + 1)
+            for key, item in list(value.items())[:200]
+        }
+    if isinstance(value, list):
+        return [redact_probe_detail(item, depth + 1) for item in value[:200]]
+    if isinstance(value, (bool, int, float)) or value is None:
+        return value
+    return redact_probe_text(repr(value), 256)
 
 
 class HostProbeError(RuntimeError):
@@ -247,6 +294,55 @@ class HostProbeFixture:
         if self._record is None:
             raise HostProbeError("host probe has no ownership record")
         write_json_atomic(self.state_path, self._record)
+
+    def _record_probe_error(
+        self,
+        payload: dict[str, Any],
+        returncode: int,
+        code: str | None,
+        site: str | None,
+    ) -> bool:
+        """Keep a failed probe call's message and detail, redacted, in the case dir.
+
+        ``probe-error.json`` sits next to ``host-probes/`` (the state directory
+        is ``<case dir>/host-probes`` by convention). The message is bounded and
+        credential-masked (``redact_probe_text``); the structured detail -- the
+        source-replay probe's verification checks, for one -- is redacted
+        string by string and bounded. Written only when the probe said more
+        than a class name; a write that fails never hides the failure itself.
+        """
+
+        message = payload.get("error_message")
+        detail = payload.get("error_detail")
+        if not isinstance(message, str) and detail is None:
+            return False
+        command = payload.get("command")
+        record = {
+            "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "probe": self.pod,
+            "node": self.settings.node,
+            "case_id": self.settings.case_id,
+            "run_id": self.settings.run_id,
+            "command": command if isinstance(command, str) else None,
+            "returncode": returncode,
+            "error_class": payload.get("error_class")
+            if isinstance(payload.get("error_class"), str)
+            else None,
+            "error_code": code,
+            "error_site": site,
+            "message": redact_probe_text(message) if isinstance(message, str) else None,
+            "detail": redact_probe_detail(detail),
+            "redacted": True,
+        }
+        if len(json.dumps(record["detail"], default=str)) > PROBE_ERROR_DETAIL_CHARS:
+            record["detail"] = {"truncated": True}
+        try:
+            write_json_atomic(
+                self.settings.state_directory.parent / PROBE_ERROR_RECORD, record
+            )
+        except OSError:
+            return False
+        return True
 
     def _read(self, kind: str, name: str) -> dict[str, Any] | None:
         result = self._kubectl(
@@ -700,6 +796,8 @@ class HostProbeFixture:
                         diagnostic += f" {code}"
                     if site:
                         diagnostic += f" at {site}"
+            if self._record_probe_error(payload, completed.returncode, code, site):
+                diagnostic += f"; detail in {PROBE_ERROR_RECORD}"
             raise HostProbeError(
                 f"host probe failed (exit {completed.returncode}{diagnostic}); output withheld"
             )

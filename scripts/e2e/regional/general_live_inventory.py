@@ -30,9 +30,11 @@ expected count, FAILED on a fresh mismatch -- when the reboot is the designed
 answer to a confirmed, still-inactive link -- and the reading it rests on is
 recorded in ``details.inventory_evidence``. ``link_inactive`` therefore shows
 the inactive port for a bounded exposure only
-(``general_live_source_replay.bounded_exposure_seconds``: the window's own
-deadman closes it 1.7 collector intervals after it opened, after the second
-tick that confirms the shortfall and before a third could be read), so the
+(``general_live_source_replay.observed_exposure``: the probe watches the
+collector's own ticks on the node and closes the window right after the
+confirming one -- the second by default -- before a third can read the port;
+the deadman is only the fallback: a fixed 1.7-interval bound measured from the
+restart lost to the collector's startup phase live, 2026-10-26), so the
 diagnostic only ever sees the restored port: PASS is a SUCCEEDED validation
 on fresh evidence, the incident RECOVERED, no RESTART_NODE, under
 HOST_SOURCE_REPLAY alone. An inactive reading the product recorded after the
@@ -82,8 +84,10 @@ from scripts.e2e.regional.general_live_source_replay import (
     HOST_SOURCE_REPLAY,
     INFINIBAND_TREE,
     HostSourceReplay,
-    bounded_exposure_seconds,
+    confirmation_ticks,
+    exposure_fallback_seconds,
     host_source_replay,
+    observed_exposure,
 )
 from scripts.e2e.regional.general_live_verdicts import (
     ChainExpectation,
@@ -587,17 +591,19 @@ def link_inactive(ctx: VariantContext) -> dict[str, Any]:
     """One real port DOWN/Disabled for a bounded exposure: LINK_INACTIVE diagnoses
     the restored link and concludes SUCCEEDED; no RESTART_NODE.
 
-    The window's own deadman closes it :func:`bounded_exposure_seconds` after
-    it opened -- after the collector's second tick, which confirms the
-    shortfall and mints the finding, and before a third could read the port --
-    so the diagnostic VALIDATE_FABRIC (judging fresh readings since batch 175)
-    only ever sees the real, ACTIVE port and the designed REBOOT_NODE
-    escalation has nothing fresh to fire on. The runner never races the
-    product: its own close afterwards finds the window already closed.
+    :func:`observed_exposure` closes the window right after the collector's
+    confirming tick -- the second by default, the one that mints the finding --
+    as the probe observes the ticks on the node, and before a third could read
+    the port, so the diagnostic VALIDATE_FABRIC (judging fresh readings since
+    batch 175) only ever sees the real, ACTIVE port and the designed
+    REBOOT_NODE escalation has nothing fresh to fire on. The window's deadman
+    is the fallback for a runner that never gets there (live 2026-10-26: a
+    fixed 1.7-interval deadman fired 13 s after the first tick, before the
+    second).
     """
 
-    # The exposure is sized from the node's own collector interval, so the
-    # survey (collector_env) comes first.
+    # The exposure follows the collector's own ticks (the survey's cadence
+    # settings size the fallback deadman), so the survey comes first.
     run_survey(ctx)
     replay = host_source_replay(ctx)
     _baseline, device, port, active = _real_tree(ctx, replay)
@@ -608,40 +614,48 @@ def link_inactive(ctx: VariantContext) -> dict[str, Any]:
         phys_state=[(device, port, INACTIVE_PHYS_STATE)],
     )
     ctx.evidence.write("infiniband-fixture", built)
-    exposure = bounded_exposure_seconds(ctx.host_interval)
+    ticks = confirmation_ticks(ctx)
     started = utc_now()
     opened = replay.open_tree(
-        [(INFINIBAND_TREE, INFINIBAND_ROOT)], restore_seconds=exposure
+        [(INFINIBAND_TREE, INFINIBAND_ROOT)],
+        restore_seconds=exposure_fallback_seconds(ctx, ticks),
     )
     ctx.evidence.write("source-window-open", opened)
-    restore_at = utc_now() + timedelta(seconds=exposure)
+    # The probe watches the collector's ticks on the node and closes the window
+    # right after the confirming one; the deadman only stands in for a runner
+    # that never gets there.
+    exposure = observed_exposure(
+        ctx, replay, ticks=ticks, name="link-inactive", opened=opened
+    )
+    restore_at = parse_time(exposure["closed_at"]) or utc_now()
+    closed_by = str(exposure["closed_by"])
+    opened_at = parse_time(opened.get("opened_at")) or started
+    exposure_seconds = round((restore_at - opened_at).total_seconds(), 1)
+    ctx.evidence.write("source-window-close", exposure)
     detection = wait_for_incident(
         ctx,
         started,
         "efa_inventory_mismatch",
-        timeout_seconds=exposure + ctx.host_interval * 3 + 60,
+        timeout_seconds=ctx.host_interval * 3 + 120,
         metrics=EFA_METRICS,
         name="link-inactive-detection",
     )
     incidents = finding_incidents(detection, "efa_inventory_mismatch")
-    missing = [
+    cutoff = restore_at + timedelta(seconds=RESTORE_CLOCK_TOLERANCE_SECONDS)
+    inside = [
         item
         for item in _efa_samples(detection, "efa_inventory_missing_count")
         if item["value"] >= 1
+        and (when := parse_time(item.get("observed_at"))) is not None
+        and when <= cutoff
     ]
-    # The deadman has closed the window by now; the runner's close confirms it
-    # (already_closed) or, should the timer have been late, closes it itself.
-    remaining = (restore_at - utc_now()).total_seconds()
-    if remaining > 0:
-        ctx.hold(remaining + RESTORE_CLOCK_TOLERANCE_SECONDS, name="exposure")
-    closed = replay.close()
-    closed_by = "deadman" if closed.get("already_closed") else "runner"
-    ctx.evidence.write("source-window-close", {**closed, "closed_by": closed_by})
     ctx.evidence.append_oracle(
         [
             {
                 "inactive_port": f"{device}/ports/{port}",
-                "exposure_seconds": exposure,
+                "ticks_required": ticks,
+                "ticks_observed": exposure["ticks_observed"],
+                "exposure_seconds": exposure_seconds,
                 "restore_at": restore_at.isoformat(),
                 "closed_by": closed_by,
                 **replay.evidence(device=device),
@@ -649,11 +663,13 @@ def link_inactive(ctx: VariantContext) -> dict[str, Any]:
         ],
         source="infiniband",
     )
-    if not incidents or not missing:
+    if not incidents or len(inside) < ticks:
         raise VariantInconclusive(
-            f"the bounded exposure ({exposure} s) ended before the product confirmed "
-            "the inactive port: no efa_inventory_mismatch finding (the collector's "
-            "two confirming ticks did not both fall inside the window)"
+            f"the bounded exposure ended ({exposure_seconds} s, closed by {closed_by}, "
+            f"{exposure['ticks_observed']} collector tick(s) observed on the node) with "
+            f"{len(inside)} shortfall reading(s) and {len(incidents)} "
+            f"efa_inventory_mismatch finding(s) recorded inside it; the product needs "
+            f"{ticks} confirming ticks"
         )
     recovered = _await_efa_recovery(ctx, restore_at, expected)
     settled = wait_settled(
@@ -725,15 +741,19 @@ def link_inactive(ctx: VariantContext) -> dict[str, Any]:
         stages,
         notes=[
             f"{device}/ports/{port} read {INACTIVE_STATE!r}/{INACTIVE_PHYS_STATE!r} in the "
-            f"replayed tree for a bounded exposure of {exposure} s (closed by "
-            f"{closed_by}); the real port stayed up",
+            f"replayed tree for a bounded exposure of {exposure_seconds} s (closed by "
+            f"{closed_by} after {exposure['ticks_observed']} observed collector "
+            f"tick(s)); the real port stayed up",
             "rdma_link_down co-fires from the same port (010 link_inactive semantics)",
         ],
         extra={
             "device": device,
             "port": port,
             "expected_count": expected,
-            "exposure_seconds": exposure,
+            "exposure_seconds": exposure_seconds,
+            "ticks_required": ticks,
+            "ticks_observed": exposure["ticks_observed"],
+            "ticks": exposure["ticks"],
             "restore_at": restore_at.isoformat(),
             "closed_by": closed_by,
             "validation_executions": validations,

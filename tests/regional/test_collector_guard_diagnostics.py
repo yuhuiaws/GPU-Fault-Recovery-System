@@ -269,3 +269,109 @@ def test_nfs_mount_sentence_is_surfaced_only_in_its_constant_shape(
     assert (f"; nfs mount failed: {message}" in text) is exposed, text
     if not exposed:
         assert "nfs mount failed" not in text and message[:5] not in text, text
+
+
+def test_probe_message_and_detail_are_kept_redacted_in_the_case_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A probe's generic failure line now carries its message and a structured
+    detail (the source-replay probe's verification checks). The exception text
+    keeps its whitelisted shape and names the record; the record itself lands
+    in the case directory (next to ``host-probes/``) with credential-shaped
+    tokens and long opaque blobs masked, so an operator reads what the probe
+    refused instead of brute-forcing the digest (two lanes did, 2026-10-26)."""
+
+    api = ProbeApi()
+    monkeypatch.setattr(host, "run_fixture_command", api.run)
+    fixture = host_probe(tmp_path)
+    fixture.create()
+    api.probe_returncode = 1
+    blob = "A" * 48
+    api.probe_stdout = json.dumps(
+        {
+            "error": "ProbeError",
+            "error_kind": "probe",
+            "error_class": "ProbeError",
+            "error_code": "b" * 16,
+            "error_site": "open_window:1161",
+            "error_message": (
+                "the replacement is not visible only inside the unit; closed: "
+                "token=abc123 Authorization: Bearer xyz"
+            ),
+            "error_detail": {
+                "checks": [
+                    {
+                        "kind": "env",
+                        "dest": "GPU_FAULT_EXPECTED_GPU_COUNT",
+                        "unit_value": "8",
+                        "ok": False,
+                        "note": f"secret=hunter2 {blob}",
+                    }
+                ],
+                "close": {"clean": True},
+            },
+            "command": "open-window",
+        }
+    )
+    with pytest.raises(host.HostProbeError) as caught:
+        fixture.execute("open-window")
+    message = str(caught.value)
+    assert message.endswith("; output withheld"), message
+    assert f"; error ProbeError {'b' * 16} at open_window:1161" in message, message
+    assert "; detail in probe-error.json" in message, message
+    assert "not visible" not in message and "hunter2" not in message, message
+    record = json.loads(
+        (tmp_path / host.PROBE_ERROR_RECORD).read_text(encoding="utf-8")
+    )
+    assert record["error_class"] == "ProbeError" and record["error_code"] == "b" * 16
+    assert (
+        record["error_site"] == "open_window:1161"
+        and record["command"] == "open-window"
+    )
+    assert record["returncode"] == 1 and record["redacted"] is True
+    assert record["case_id"] == "GF-REGIONAL-DESTR-001" and record["run_id"] == "run-a"
+    assert record["message"].startswith(
+        "the replacement is not visible only inside the unit; closed: "
+    ), record["message"]
+    assert "abc123" not in record["message"] and "xyz" not in record["message"]
+    assert "token=<redacted>" in record["message"], record["message"]
+    check = record["detail"]["checks"][0]
+    assert check["dest"] == "GPU_FAULT_EXPECTED_GPU_COUNT" and check["ok"] is False
+    assert check["unit_value"] == "8", "short plain values stay readable"
+    assert "hunter2" not in check["note"] and blob not in check["note"], check
+    assert record["detail"]["close"] == {"clean": True}
+    assert not any(fixture.cleanup().values()), "cleanup must still remove the probe"
+    # A probe that said only its class name writes no record.
+    (tmp_path / host.PROBE_ERROR_RECORD).unlink()
+    fixture = host_probe(tmp_path, run_id="run-b")
+    fixture.create()
+    api.probe_stdout = json.dumps(
+        {"error": "ProbeError", "error_kind": "probe", "error_class": "ProbeError"}
+    )
+    with pytest.raises(host.HostProbeError) as caught:
+        fixture.execute("open-window")
+    assert "probe-error.json" not in str(caught.value)
+    assert not (tmp_path / host.PROBE_ERROR_RECORD).exists(), (
+        "a bare class name is not worth a record"
+    )
+
+
+def test_redaction_masks_credential_shapes_and_bounds_the_record() -> None:
+    text = "password: p4ss api_key=K1 bearer tok; path=/run/gfrs-live/source-abc/env ok"
+    redacted = host.redact_probe_text(text)
+    assert "p4ss" not in redacted and "K1" not in redacted and "tok" not in redacted
+    assert "/run/gfrs-live/source-abc/env ok" in redacted, redacted
+    assert host.redact_probe_text("x" * 5000) == "<redacted>", "an opaque blob"
+    long_text = "word " * 1000
+    assert (
+        host.redact_probe_text(long_text) == long_text[: host.PROBE_ERROR_MESSAGE_CHARS]
+    )
+    nested: object = {"a": 1}
+    for _ in range(12):
+        nested = {"inner": nested}
+    flattened = json.dumps(host.redact_probe_detail(nested))
+    assert "<nested>" in flattened
+    assert host.redact_probe_detail([True, None, 2.5, "ok"]) == [True, None, 2.5, "ok"]
+    assert host.redact_probe_detail(object()).startswith("<object object"), (
+        "an unknown type is kept as its bounded repr"
+    )

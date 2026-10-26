@@ -53,8 +53,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import math
 import time
+from datetime import datetime, timedelta, timezone
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -96,13 +96,24 @@ TOOLS = tuple(wrapper.TOOLS)
 DEFAULT_PLAN_SECONDS = 3600
 
 
-#: ``bounded_exposure_seconds``: close the window this many host collector
-#: intervals after it opened. open-window restarts the unit right after arming
-#: the deadman; the collector's first tick follows within a few seconds, the
-#: next every interval. 1.7 intervals is after the second tick (its start plus
-#: duration stays under 0.7 interval) and before the third (two intervals): the
-#: reading is confirmed on exactly two ticks, never seen on a third.
-EXPOSURE_INTERVALS = 1.7
+#: A bounded exposure (010/013 ``link_inactive``) ends when the collector has
+#: read the replaced source on the ticks the product needs to confirm it
+#: (``GPU_FAULT_INVENTORY_MISMATCH_CONSECUTIVE_SAMPLES``, 2 by default) and
+#: before it reads it once more: ``observed_exposure`` lets the probe watch the
+#: unit's own ticks on the node (``await-ticks``: the ``WATCHDOG=1`` stamps the
+#: collector leaves on its unit) and close right after the required count.
+#: The window's deadman is only the fallback for a runner that never gets
+#: there, sized by ``exposure_fallback_seconds`` so it never fires first: the
+#: collector's restart phase (``GPU_FAULT_COLLECTOR_STARTUP_SPREAD_SECONDS`` plus
+#: ``GPU_FAULT_COLLECTOR_STARTUP_JITTER_SECONDS``, 15 + 20 s by default -- a
+#: fixed 1.7-interval deadman measured from the restart closed the live 013
+#: window 2026-10-26 after one tick, 13 s in), the required ticks each with
+#: their own duration, and the probe's close.
+STARTUP_SPREAD_ENV = "GPU_FAULT_COLLECTOR_STARTUP_SPREAD_SECONDS"
+STARTUP_JITTER_ENV = "GPU_FAULT_COLLECTOR_STARTUP_JITTER_SECONDS"
+CONSECUTIVE_SAMPLES_ENV = "GPU_FAULT_INVENTORY_MISMATCH_CONSECUTIVE_SAMPLES"
+TICK_DURATION_MARGIN_SECONDS = 10
+CLOSE_MARGIN_SECONDS = 20
 
 
 class HostSourceReplayError(RuntimeError):
@@ -137,22 +148,83 @@ def command_plan(
         raise HostSourceReplayError(f"{tool} plan rejected: {error}") from error
 
 
-def bounded_exposure_seconds(interval: int) -> int:
-    """How long a replaced reading may stay visible so the host collector reads
-    it on exactly two ticks and never on a third.
+def confirmation_ticks(ctx: VariantContext) -> int:
+    """The consecutive mismatch samples the host collector needs before it mints
+    an inventory finding (``collectors/host/inventory.py``), from the survey."""
 
-    The inventory rules confirm a shortfall on two consecutive samples; the
-    diagnostic chain they open judges the *fresh* readings observed after it
-    reached VALIDATE_FABRIC (``adapters/gpu_validation.py``, batch 175), and a
-    fresh reading still showing the fault is the designed escalation --
-    REBOOT_NODE for a LINK_INACTIVE port. A window the deadman closes at
-    :data:`EXPOSURE_INTERVALS` intervals (the unit restarts, the real tree is
-    read again) gives the detection its two ticks and the diagnostic only
-    restored readings, whatever the runner's own polling latency.
+    return max(1, min(ctx.setting(CONSECUTIVE_SAMPLES_ENV, 2), probe.MAX_TICKS))
+
+
+def exposure_fallback_seconds(ctx: VariantContext, ticks: int) -> int:
+    """The deadman of a bounded-exposure window: after the collector's restart
+    phase and ``ticks`` ticks, with margins, so the probe's own close comes first."""
+
+    seconds = (
+        ctx.setting(STARTUP_SPREAD_ENV, 15)
+        + ctx.setting(STARTUP_JITTER_ENV, 20)
+        + ticks * (ctx.host_interval + TICK_DURATION_MARGIN_SECONDS)
+        + CLOSE_MARGIN_SECONDS
+    )
+    return max(probe.MIN_RESTORE_SECONDS, min(probe.MAX_RESTORE_SECONDS, int(seconds)))
+
+
+def _moment(value: Any) -> datetime | None:
+    try:
+        moment = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
+
+
+def observed_exposure(
+    ctx: VariantContext,
+    replay: HostSourceReplay,
+    *,
+    ticks: int,
+    name: str,
+    opened: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Close the open window right after the collector's ``ticks`` ticks, as the
+    probe observes them on the node, and record the exposure that really was.
+
+    Blocks for the probe's wait (bounded by the window's deadman). The record
+    names when each observed tick ended, when the real source was read again
+    (``closed_at``), who closed the window (``probe``, or ``deadman`` when the
+    fallback fired first) and whether the ticks were seen at all
+    (``completed``); the probe's read-back of the real configuration rides
+    along as ``restore``. The caller judges the product's records against
+    ``closed_at`` and the tick count, never against a fixed bound. When the
+    deadman closed first, ``closed_at`` is its schedule read off the open
+    receipt (``opened``: ``opened_at`` + ``restore_seconds``).
     """
 
-    seconds = max(int(interval), 1) * EXPOSURE_INTERVALS
-    return max(probe.MIN_RESTORE_SECONDS, math.ceil(seconds))
+    fallback = exposure_fallback_seconds(ctx, ticks)
+    receipt = replay.await_ticks(ticks, interval=ctx.host_interval, timeout=fallback)
+    close = receipt.get("close") or {}
+    closed_at = _moment(close.get("closed_at"))
+    if closed_at is None and receipt.get("already_closed") and opened is not None:
+        opened_at = _moment(opened.get("opened_at"))
+        if opened_at is not None:
+            closed_at = opened_at + timedelta(
+                seconds=int(opened.get("restore_seconds") or fallback)
+            )
+    closed_at = closed_at or datetime.now(timezone.utc)
+    observed = list(receipt.get("ticks") or [])
+    record = {
+        "ticks_required": ticks,
+        "ticks_observed": len(observed),
+        "ticks": observed,
+        "completed": bool(receipt.get("completed")),
+        "closed_by": "deadman" if receipt.get("already_closed") else "probe",
+        "closed_at": closed_at.isoformat(),
+        "fallback_seconds": fallback,
+        "restore": close.get("restore"),
+        "clean": close.get("clean", receipt.get("already_closed", False)),
+    }
+    ctx.evidence.write(f"{name}-exposure", {**record, "receipt": receipt})
+    if not record["clean"]:
+        raise HostSourceReplayError(f"the exposure window did not close clean: {close}")
+    return record
 
 
 def legacy_bind(dest: str) -> bool:
@@ -356,7 +428,7 @@ class HostSourceReplay:
     def inventory(self, *, source: str = "/sys/class/infiniband") -> dict[str, Any]:
         """The node's RDMA tree as the product reads it (no window, no approval)."""
 
-        self.create()
+        self._install_builders()
         return self._execute("inventory", "--source", source, timeout=120)
 
     def read_back(self, dest: str) -> dict[str, Any]:
@@ -376,7 +448,7 @@ class HostSourceReplay:
     def journal(self, *, since: Any, tail: int = 200) -> dict[str, Any]:
         """The unit's own journal since ``since`` (a datetime): bounded, read-only."""
 
-        self.create()
+        self._install_builders()
         moment = since.isoformat() if hasattr(since, "isoformat") else str(since)
         return self._execute(
             "journal-read",
@@ -486,6 +558,7 @@ class HostSourceReplay:
     def audit(self, tool: str, *, tail: int = 100) -> dict[str, Any]:
         """The wrapper's journal for ``tool``: what the product asked and was served."""
 
+        self._install_builders()
         return self._execute(
             "audit-read", "--tool", tool, "--tail", str(int(tail)), timeout=60
         )
@@ -653,6 +726,7 @@ class HostSourceReplay:
         )
 
     def status(self) -> dict[str, Any]:
+        self._install_builders()
         return self._execute("status", timeout=60)
 
     def verify(self) -> dict[str, Any]:
@@ -663,6 +737,37 @@ class HostSourceReplay:
     def close(self) -> dict[str, Any]:
         receipt = self._execute("close-window", timeout=150)
         self._opened = False
+        return receipt
+
+    def await_ticks(
+        self, count: int, *, interval: int, timeout: int, close: bool = True
+    ) -> dict[str, Any]:
+        """Block until the unit completed ``count`` collector ticks since the
+        window opened (the probe watches ``WatchdogTimestampMonotonic`` on the
+        node), then close the window in the same call (``close``).
+
+        ``timeout`` is the longest the probe waits before it closes anyway (the
+        probe caps it at the window's deadman); the exec round trip gets the
+        close's own time on top. A window the deadman closed meanwhile answers
+        ``already_closed``.
+        """
+
+        arguments = [
+            "await-ticks",
+            "--count",
+            str(int(count)),
+            "--interval",
+            str(int(interval)),
+            "--timeout",
+            str(int(timeout)),
+        ]
+        if close:
+            arguments.append("--close")
+        receipt = self._execute(*arguments, timeout=int(timeout) + 120)
+        if close and (
+            receipt.get("close") is not None or receipt.get("already_closed")
+        ):
+            self._opened = False
         return receipt
 
     def snapshot(self) -> dict[str, Any]:
@@ -761,8 +866,9 @@ def kernel_collector_source_replay(ctx: VariantContext) -> HostSourceReplay:
 
 
 __all__ = [
+    "CLOSE_MARGIN_SECONDS",
+    "CONSECUTIVE_SAMPLES_ENV",
     "DEFAULT_PLAN_SECONDS",
-    "EXPOSURE_INTERVALS",
     "HOST_SOURCE_REPLAY",
     "HOST_UNIT",
     "INFINIBAND_TREE",
@@ -778,10 +884,15 @@ __all__ = [
     "UNIT_TOKENS",
     "HostSourceReplay",
     "HostSourceReplayError",
-    "bounded_exposure_seconds",
+    "STARTUP_JITTER_ENV",
+    "STARTUP_SPREAD_ENV",
+    "TICK_DURATION_MARGIN_SECONDS",
     "command_plan",
+    "confirmation_ticks",
+    "exposure_fallback_seconds",
     "host_source_replay",
     "kernel_collector_source_replay",
     "legacy_bind",
+    "observed_exposure",
     "rule",
 ]

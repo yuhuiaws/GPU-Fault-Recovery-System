@@ -58,9 +58,19 @@ def unopenable_on_host(path: str) -> bool:
 class FakeHost:
     """systemctl / systemd-run / nsenter as the probe sees them, without systemd.
 
-    Two units exist: the host collector (``MAIN_PID``) and the kernel collector
-    (``KERNEL_PID``), whose EnvironmentFile hands it a configured driver branch
-    that only an ``UnsetEnvironment=`` line of the window may remove. Both run
+    Two units exist: the host collector (``MAIN_PID``), whose own
+    ``EnvironmentFile=`` carries the installer's expected GPU count (``"8"``,
+    as live), and the kernel collector (``KERNEL_PID``), whose EnvironmentFile
+    hands it a configured driver branch that only an ``UnsetEnvironment=`` line
+    of the window may remove. The environment is assembled in systemd's order
+    (systemd.exec(5), proven on 255 2026-10-26): every ``Environment=`` first,
+    then every ``EnvironmentFile=`` in the order listed -- the unit's own file
+    before a drop-in's, later files winning -- and ``UnsetEnvironment=`` last;
+    so a drop-in ``Environment=`` override of a key the unit file sets never
+    reaches the process (the live 012 failure), a drop-in ``EnvironmentFile=``
+    does. ``daemon-reload`` is what makes systemd forget a removed drop-in
+    (``DropInPaths``/``NeedDaemonReload``; ``stale_reloads`` reloads that do
+    not take model the listing the live 013 close left behind). Both units run
     as root, like the real units: an ``InaccessiblePaths=`` node reads as an
     empty file or directory (``EMPTY_NODE``), and only a bind of an unopenable
     node (``unopenable_on_host``) makes a path fail to open.
@@ -77,13 +87,24 @@ class FakeHost:
         self.binds: dict[str, str] = {}
         self.inaccessible: set[str] = set()
         self.units = {UNIT: MAIN_PID, KERNEL_UNIT: KERNEL_PID}
-        self.base_environment: dict[str, dict[str, str]] = {
-            KERNEL_UNIT: {probe.DRIVER_BRANCH_ENV: "580"}
+        #: Each unit's own ``EnvironmentFile=`` (the installer's collector.env).
+        self.environment_files: dict[str, dict[str, str]] = {
+            UNIT: {"GPU_FAULT_EXPECTED_GPU_COUNT": "8"},
+            KERNEL_UNIT: {probe.DRIVER_BRANCH_ENV: "580"},
         }
         self.environments: dict[str, dict[str, str]] = {
-            unit: dict(self.base_environment.get(unit, {})) for unit in self.units
+            unit: dict(self.environment_files.get(unit, {})) for unit in self.units
         }
         self.journal: dict[str, str] = {}
+        #: Drop-ins systemd has loaded (refreshed by daemon-reload only).
+        self.loaded_dropins: dict[str, list[str]] = {unit: [] for unit in self.units}
+        self.reloads = 0
+        self.stale_reloads = 0
+        #: ``await-ticks``: a fake monotonic clock (us) and the main process's
+        #: WATCHDOG=1 pings as offsets (s) from the unit's last start.
+        self.clock_us = 1_000_000_000
+        self.exec_start_us = self.clock_us
+        self.pings: list[float] = []
 
     @property
     def environment(self) -> dict[str, str]:
@@ -92,8 +113,27 @@ class FakeHost:
         return self.environments[UNIT]
 
     # -- the drop-in is what systemd would apply on restart ------------------
+    @staticmethod
+    def read_environment_file(spec: str) -> dict[str, str]:
+        """``KEY=value`` lines of an ``EnvironmentFile=`` (a missing file without
+        the ``-`` prefix fails the unit's start, as it does on systemd)."""
+
+        path = Path(spec[1:] if spec.startswith("-") else spec)
+        if not path.is_file():
+            if spec.startswith("-"):
+                return {}
+            raise AssertionError(f"EnvironmentFile {path} is missing: the start fails")
+        values: dict[str, str] = {}
+        for line in path.read_text(encoding="utf-8").splitlines():
+            name, separator, value = line.partition("=")
+            if separator and name.strip() and not name.lstrip().startswith(("#", ";")):
+                values[name.strip()] = value.strip().strip('"')
+        return values
+
     def apply_dropin(self, unit: str = UNIT) -> None:
-        environment = dict(self.base_environment.get(unit, {}))
+        assignments: dict[str, str] = {}
+        files = [dict(self.environment_files.get(unit, {}))]
+        unset: list[str] = []
         binds: dict[str, str] = {}
         inaccessible: set[str] = set()
         path = probe.dropin_path(RUN, unit)
@@ -107,12 +147,49 @@ class FakeHost:
                     inaccessible.add(value.lstrip("-"))
                 elif key == "Environment":
                     name, _, setting = value.partition("=")
-                    environment[name] = setting
+                    assignments[name] = setting
+                elif key == "EnvironmentFile":
+                    files.append(self.read_environment_file(value))
                 elif key == "UnsetEnvironment":
-                    environment.pop(value, None)
+                    unset.append(value)
+        # systemd.exec(5): Environment=, then the files in order, UnsetEnvironment= last.
+        environment = dict(assignments)
+        for content in files:
+            environment.update(content)
+        for name in unset:
+            environment.pop(name, None)
         self.environments[unit] = environment
         if unit == UNIT:
             self.binds, self.inaccessible = binds, inaccessible
+
+    def dropins_on_disk(self, unit: str) -> list[str]:
+        directory = probe.DROPIN_ROOT / f"{unit}.d"
+        return (
+            sorted(str(path) for path in directory.glob("*.conf"))
+            if directory.is_dir()
+            else []
+        )
+
+    def daemon_reload(self) -> None:
+        self.reloads += 1
+        if self.stale_reloads > 0:
+            self.stale_reloads -= 1  # the reload "took" without refreshing the unit
+            return
+        for unit in self.units:
+            self.loaded_dropins[unit] = self.dropins_on_disk(unit)
+
+    def watchdog_stamp(self) -> int:
+        """The last WATCHDOG=1 ping at or before the fake clock, as systemd stamps it."""
+
+        elapsed = (self.clock_us - self.exec_start_us) / 1e6
+        past = [ping for ping in self.pings if ping <= elapsed]
+        return self.exec_start_us + int(max(past) * 1e6) if past else 0
+
+    def monotonic_us(self) -> int:
+        return self.clock_us
+
+    def pause(self, seconds: float) -> None:
+        self.clock_us += int(seconds * 1e6)
 
     def unit_view(self, path: str) -> str | None:
         """The path ``path`` resolves to inside the unit: a bind source, the
@@ -196,11 +273,21 @@ class FakeHost:
             return subprocess.CompletedProcess(command, 0, "", "")
         assert command[0] == "systemctl", command
         verb = command[1]
+        if verb == "daemon-reload":
+            self.daemon_reload()
         if verb == "show":
             unit = command[2]
             if unit in self.units:
                 state = "active" if self.unit_active or unit != UNIT else "failed"
-                text = f"LoadState=loaded\nActiveState={state}\nSubState=running\nMainPID={self.units[unit]}\nNRestarts=0\n"
+                text = (
+                    f"LoadState=loaded\nActiveState={state}\nSubState=running\n"
+                    f"MainPID={self.units[unit]}\nNRestarts=0\n"
+                    f"DropInPaths={' '.join(self.loaded_dropins[unit])}\n"
+                    "NeedDaemonReload="
+                    f"{'yes' if self.loaded_dropins[unit] != self.dropins_on_disk(unit) else 'no'}\n"
+                    f"ExecMainStartTimestampMonotonic={self.exec_start_us}\n"
+                    f"WatchdogTimestampMonotonic={self.watchdog_stamp()}\n"
+                )
             elif unit.endswith(".timer"):
                 state = "active" if unit in self.timers else "inactive"
                 text = f"LoadState=loaded\nActiveState={state}\nSubState=waiting\nMainPID=0\nNRestarts=0\n"
@@ -217,6 +304,7 @@ class FakeHost:
             self.restarts += 1
             self.restarted.append(command[2])
             self.apply_dropin(command[2])
+            self.exec_start_us = self.clock_us
         return subprocess.CompletedProcess(command, 0, "", "")
 
     def environment_of(self, pid: str, keys: tuple[str, ...]) -> dict[str, str]:
@@ -237,15 +325,23 @@ def _mode_0000_file(path: Path) -> None:
     path.chmod(0o000)
 
 
-@pytest.fixture
-def host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeHost:
+def make_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeHost:
+    """The ``host`` fixture's body, shared with the split-off probe test modules."""
+
     fake = FakeHost(tmp_path)
     monkeypatch.setattr(probe, "STATE_ROOT", tmp_path / "run" / "gfrs-live")
     monkeypatch.setattr(probe, "DROPIN_ROOT", tmp_path / "run" / "systemd" / "system")
     monkeypatch.setattr(probe, "run", fake.run)
     monkeypatch.setattr(probe, "process_environment", fake.environment_of)
     monkeypatch.setattr(probe, "make_unopenable_node", _mode_0000_file)
+    monkeypatch.setattr(probe, "monotonic_us", fake.monotonic_us)
+    monkeypatch.setattr(probe, "pause", fake.pause)
     return fake
+
+
+@pytest.fixture
+def host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeHost:
+    return make_host(tmp_path, monkeypatch)
 
 
 def _main(*argv: str, capsys: pytest.CaptureFixture[str]) -> tuple[int, dict[str, Any]]:
@@ -489,9 +585,11 @@ def test_bind_window_lifecycle(
     assert code == 0 and closed["clean"] is True, closed
     assert closed["residue"] == {
         "dropin": False,
+        "dropin_loaded": False,
         "deadman": False,
         "state_dir": False,
     }, closed
+    assert closed["restore"]["ok"] is True and closed["reloads"] == 1, closed
     assert not dropin.exists() and not probe.state_dir(RUN).exists() and not host.timers
     assert host.restarts == 2, (
         "closing restarts the unit once more, without the drop-in"
@@ -584,6 +682,18 @@ def test_window_that_fails_verification_is_closed_again(
         and not host.timers
     ), (
         "a window whose replacement is not visible inside the unit is closed, deadman disarmed"
+    )
+    # The message and the checks ride along for the controller's probe-error.json;
+    # the exception text the fixture raises still shows only the digest and site.
+    assert error["error_message"].startswith(
+        "the replacement is not visible only inside the unit; closed"
+    ), error
+    checks = error["error_detail"]["checks"]
+    assert checks and checks[0]["kind"] == "bind" and checks[0]["ok"] is False, checks
+    assert error["error_detail"]["close"]["clean"] is True
+    assert (
+        error["error_code"]
+        == hashlib.sha256(error["error_message"].encode()).hexdigest()[:16]
     )
 
 
@@ -905,8 +1015,9 @@ def test_nvidia_proc_fixture_inaccessible_and_env_in_one_window(
         "[Service]",
         f"BindReadOnlyPaths={tree}:/proc/driver/nvidia",
         f"BindReadOnlyPaths={probe.unreadable_node_path(RUN)}:/proc/meminfo",
-        "Environment=GPU_FAULT_EXPECTED_GPU_COUNT=7",
+        f"EnvironmentFile={probe.env_file(RUN)}",
     ], lines
+    assert probe.env_file(RUN).read_text() == "GPU_FAULT_EXPECTED_GPU_COUNT=7\n"
     kinds = {check["kind"]: check for check in opened["verification"]["checks"]}
     assert (
         kinds["inaccessible"]["unit_readable"] is False
@@ -922,8 +1033,21 @@ def test_nvidia_proc_fixture_inaccessible_and_env_in_one_window(
         code == 0
         and closed["clean"] is True
         and host.inaccessible == set()
-        and host.environment == {}
-    )
+        and host.environment == {"GPU_FAULT_EXPECTED_GPU_COUNT": "8"}
+    ), "the unit reads its own environment file again"
+    assert closed["restore"]["ok"] is True and closed["closed_at"], closed
+    kinds = {
+        (check["kind"], check["dest"]): check for check in closed["restore"]["checks"]
+    }
+    assert kinds[("env", "GPU_FAULT_EXPECTED_GPU_COUNT")] == {
+        "kind": "env",
+        "dest": "GPU_FAULT_EXPECTED_GPU_COUNT",
+        "baseline": "8",
+        "unit_value": "8",
+        "ok": True,
+    }
+    assert kinds[("source", "/proc/driver/nvidia")]["ok"] is True
+    assert kinds[("source", "/proc/meminfo")]["ok"] is True
 
 
 # --------------------------------------------------------------------------- #
@@ -1053,7 +1177,9 @@ def test_command_window_installs_a_shim_and_puts_it_first_on_the_units_path(
     assert code == 0 and closed["clean"] is True and not shim.exists(), (
         "the shim goes with the run directory"
     )
-    assert host.environment == {}, "the unit runs with its own PATH again"
+    assert host.environment == {"GPU_FAULT_EXPECTED_GPU_COUNT": "8"}, (
+        "the unit runs with its own PATH and environment file again"
+    )
 
 
 def test_command_window_needs_an_installed_wrapper(
@@ -1114,181 +1240,6 @@ def test_probe_is_standard_library_only_and_python39_grammar() -> None:
             f"{path.name} imports beyond the stdlib: {imported}"
         )
     assert shutil.which is not None
-
-
-# --------------------------------------------------------------------------- #
-# read-only inventory and read-source (010 / 011 broken_pair)
-# --------------------------------------------------------------------------- #
-def _physical_netdevs(root: Path, *names: str) -> Path:
-    net_root = root / "sys" / "class" / "net"
-    for name in names:
-        (net_root / name / "device").mkdir(parents=True)
-    (net_root / "veth0").mkdir(parents=True)  # no device: not physical
-    return net_root
-
-
-def test_inventory_lists_the_tree_as_the_product_reads_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    source = _sysfs_infiniband(tmp_path / "host", devices=2)
-    net_root = _physical_netdevs(tmp_path / "host", "eth0", "eth1", "ens5")
-    listing = "NIC statistics:\n     queue_0_tx_cnt: 5\n     rnr_nak_err: 7\n"
-    seen: list[list[str]] = []
-
-    def fake_run(command: list[str], *, check: bool = True, timeout: int = 120) -> Any:
-        seen.append(list(command))
-        return subprocess.CompletedProcess(command, 0, listing, "")
-
-    monkeypatch.setattr(probe, "run", fake_run)
-    monkeypatch.setattr(
-        probe.shutil, "which", lambda tool, path=None: f"/usr/sbin/{tool}"
-    )
-    code, value = _main(
-        "inventory",
-        "--run-id",
-        RUN,
-        "--source",
-        str(source),
-        "--netdev-root",
-        str(net_root),
-        capsys=capsys,
-    )
-    assert code == 0, value
-    device = value["devices"]["rdmap0s0"]
-    assert device["efa"] is True and device["driver"] == "efa", device
-    assert device["uevent_drivers"] == ["efa"] and device["netdevs"] == ["eth0"]
-    port = device["ports"]["1"]
-    assert port["state"] == "4: ACTIVE" and port["phys_state"] == "5: LinkUp"
-    assert port["hw_counters"] == {"rx_drops": "7", "tx_pkts": "100"}
-    assert port["counters"] == {"port_rcv_errors": "0"}
-    assert value["physical_netdevs"] == ["ens5", "eth0", "eth1"], (
-        "a netdev without a device (veth) is not physical"
-    )
-    assert value["ethtool"]["path"] == "/usr/sbin/ethtool"
-    statistics = value["ethtool"]["statistics"]
-    assert set(statistics) == {"eth0", "eth1", "ens5"}, (
-        "ethtool is listed for the EFA-owned and the physical netdevs"
-    )
-    assert statistics["eth0"]["counters"] == ["queue_0_tx_cnt", "rnr_nak_err"], (
-        "names only, the header line dropped"
-    )
-    assert all(command[1:2] == ["-S"] for command in seen), seen
-    assert not (tmp_path / "run").exists(), "the inventory writes nothing"
-
-
-def test_inventory_without_ethtool_or_devices_is_explicit(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    monkeypatch.setattr(probe.shutil, "which", lambda tool, path=None: None)
-    code, value = _main(
-        "inventory",
-        "--run-id",
-        RUN,
-        "--source",
-        str(tmp_path / "absent"),
-        "--netdev-root",
-        str(tmp_path / "absent-net"),
-        capsys=capsys,
-    )
-    assert code == 0 and value["devices"] == {} and value["physical_netdevs"] == []
-    assert value["ethtool"] == {"path": None, "statistics": {}}
-
-
-def test_read_source_refuses_paths_outside_the_allow_list(
-    host: FakeHost, capsys: pytest.CaptureFixture[str]
-) -> None:
-    for path in (
-        "/etc/passwd",
-        "/sys/class/infiniband/../../../etc/passwd",
-        "sys/class/infiniband/rdmap0s0/ports/1/state",
-        "/proc/driver/nvidia/../../etc/shadow",
-    ):
-        code, value = _main(
-            "read-source", "--run-id", RUN, "--path", path, capsys=capsys
-        )
-        assert code == 1 and value["error"] == "ProbeError", path
-    assert probe.checked_source_path("/proc/meminfo") == "/proc/meminfo"
-    assert (
-        probe.checked_source_path("/proc/driver/nvidia/gpus/0000:53:00.0/information")
-        == "/proc/driver/nvidia/gpus/0000:53:00.0/information"
-    ), "a file of a tree destination is readable too"
-
-
-def test_read_source_distinguishes_a_bound_fixture_from_the_real_file(
-    host: FakeHost, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    fixture = b"4: ACTIVE\n"
-    _install("state", fixture, capsys)
-    dest = "/sys/class/infiniband/rdmap0s0/ports/1/state"
-    code, opened = _main(
-        "open-window",
-        "--run-id",
-        RUN,
-        "--mode",
-        "bind",
-        "--bind",
-        f"state:{dest}",
-        "--skip-verify",
-        capsys=capsys,
-    )
-    assert code == 0, opened
-    code, value = _main("read-source", "--run-id", RUN, "--path", dest, capsys=capsys)
-    assert code == 0, value
-    assert value["window_open"] is True
-    assert value["unit"]["readable"] is True and value["unit"]["value"] == "4: ACTIVE"
-    assert value["unit"]["device"] is not None
-    assert value["host"]["readable"] is False, (
-        "PID 1 reads the real sysfs file, which this test host does not have"
-    )
-    assert value["same"] is False
-    code, closed = _main("close-window", "--run-id", RUN, capsys=capsys)
-    assert code == 0 and closed["clean"] is True
-    code, value = _main("read-source", "--run-id", RUN, "--path", dest, capsys=capsys)
-    assert code == 0 and value["window_open"] is False, value
-    assert value["unit"]["readable"] is False, (
-        "after the close the unit reads the real path again (absent on this test host)"
-    )
-
-
-def test_netdev_mutation_attaches_a_physical_netdev_only(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    monkeypatch.setattr(probe, "STATE_ROOT", tmp_path / "run" / "gfrs-live")
-    source = _sysfs_infiniband(tmp_path / "host", devices=1)
-    net_root = _physical_netdevs(tmp_path / "host", "ens5")
-    code, error = _main(
-        "build-infiniband-fixture",
-        "--run-id",
-        RUN,
-        "--source",
-        str(source),
-        "--netdev",
-        "rdmap0s0:veth0",
-        "--netdev-root",
-        str(net_root),
-        capsys=capsys,
-    )
-    assert code == 1 and error["error"] == "ProbeError", "a veth has no device"
-    code, built = _main(
-        "build-infiniband-fixture",
-        "--run-id",
-        RUN,
-        "--source",
-        str(source),
-        "--netdev",
-        "rdmap0s0:ens5",
-        "--netdev-root",
-        str(net_root),
-        capsys=capsys,
-    )
-    assert code == 0, built
-    tree = probe.fixtures_dir(RUN) / "infiniband"
-    assert (tree / "rdmap0s0" / "device" / "net" / "ens5").is_dir(), (
-        "the fixture tree attaches the netdev"
-    )
-    assert built["devices"]["rdmap0s0"]["netdevs"] == ["ens5", "eth0"]
-    assert "rdmap0s0/device/net/ens5 (attached)" in built["mutations"]
-    assert not (net_root / "ens5" / "net").exists(), "the real netdev is untouched"
 
 
 # --------------------------------------------------------------------------- #

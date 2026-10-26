@@ -50,23 +50,37 @@ combinable in one window:
   product must fail to read is replayed as a tree without the entry
   (``build-nvidia-proc-fixture --omit-gpus`` for 012 proc_unreadable, so the
   listing of ``gpus`` fails with ENOENT on the unit's own copy).
-* **env** -- an allow-listed expected-count override (012 expectation_wrong).
-* **pci-root** -- ``Environment=GPU_FAULT_PCI_DEVICES_ROOT=<fixture tree>`` (013).
+* **env** -- an allow-listed expected-count override (012 expectation_wrong),
+  written to the run's ``env`` file and handed to the unit as
+  ``EnvironmentFile=``: the installer puts the real counts into the unit's own
+  ``EnvironmentFile=/etc/gpu-fault/collector.env`` and systemd applies every
+  EnvironmentFile= after every Environment=, later files winning
+  (systemd.exec(5)); a drop-in ``Environment=`` override never reached the
+  process (live 2026-10-26). ``UnsetEnvironment=`` is applied last of all, so
+  an unset variable is not resurrected by any file.
+* **pci-root** -- ``Environment=GPU_FAULT_PCI_DEVICES_ROOT=<fixture tree>`` (013;
+  not a key of the installer's environment file).
 
 ``open-window`` arms the deadman *before* writing the drop-in, restarts the one
 unit and then **verifies** through ``nsenter`` that every replacement is visible
 in the unit's mount namespace / process environment and *not* in PID 1's.
-The Node Agent is never touched; no global mount is made and no real
-``/proc``/sysfs file is written. ``proof_scope`` is always ``live-replay``.
+``close-window`` (and the deadman) removes the drop-in, reloads until systemd no
+longer lists it (``DropInPaths``), restarts the unit and reads the real
+configuration back (``restore``: every source as PID 1 sees it, every touched
+variable at its recorded baseline). ``await-ticks`` waits on the node for the
+collector's own ticks (``WatchdogTimestampMonotonic``) and closes after the
+required count, so a bounded exposure follows the ticks the collector took,
+not the restart. The Node Agent is never touched; no global mount is made and
+no real ``/proc``/sysfs file is written. ``proof_scope`` is always ``live-replay``.
 
-Three read-only commands serve the variants' oracle: ``inventory`` lists the
-node's RDMA tree as the product reads it (driver identity, owned netdevs, port
-``state``/``phys_state``, every ``counters``/``hw_counters`` file with its value,
-the names ``ethtool -S`` prints per netdev), ``read-source --path`` shows
-one allow-listed source file as the unit sees it next to what PID 1 sees, so a
-closed window can prove the real value is read again, and ``journal-read``
-returns the tail of an allow-listed unit's own journal since a moment (what the
-collector itself logged about its discovery).
+Three read-only commands serve the variants' oracle: ``inventory`` (in the
+builders file) lists the node's RDMA tree as the product reads it (driver
+identity, owned netdevs, port ``state``/``phys_state``, every ``counters``/
+``hw_counters`` file with its value, the names ``ethtool -S`` prints per
+netdev), ``read-source --path`` shows one allow-listed source file as the unit
+sees it next to what PID 1 sees, so a closed window can prove the real value is
+read again, and ``journal-read`` returns the tail of an allow-listed unit's own
+journal since a moment (what the collector itself logged about its discovery).
 """
 
 from __future__ import annotations
@@ -82,7 +96,8 @@ import shutil
 import stat
 import subprocess
 import sys
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -155,12 +170,25 @@ MEMINFO_FIELDS = ("MemFree", "MemAvailable", "SwapTotal", "SwapFree")
 MEMINFO_FIXTURE = "meminfo"
 MAX_MEMINFO_KB = 1 << 50
 WINDOW_MODES = ("bind", "pci-root", "command", "tree", "mixed")
-#: The deadman's bounds. The floor admits a bounded exposure of one or two
-#: host collector ticks (``general_live_source_replay.bounded_exposure_seconds``:
-#: 1.7 intervals, 26 s at the default 15 s), which is how a replayed inactive
-#: port is confirmed on two ticks and never read on a third.
+#: The deadman's bounds. A bounded exposure (a replayed inactive port confirmed
+#: on the collector's required ticks and never read on one more) is closed by
+#: ``await-ticks`` from the ticks the collector actually took; its deadman is
+#: the fallback (``general_live_source_replay.exposure_fallback_seconds``).
 MIN_RESTORE_SECONDS = 20
 MAX_RESTORE_SECONDS = 5400
+#: The run's ``EnvironmentFile=`` for *env* overrides (see ``dropin_lines``).
+ENV_FILE = "env"
+#: ``await-ticks``: the host collector pings ``WATCHDOG=1`` after every
+#: contributor and once more when a tick's batch is posted (``collectors/host/
+#: collector.py`` ``_watchdog_heartbeat`` / ``collect_once``), and systemd
+#: records the last ping in the unit's ``WatchdogTimestampMonotonic``. Pings
+#: closer than ``TICK_GAP_RATIO`` of the interval (at least
+#: ``MIN_TICK_GAP_SECONDS``) belong to one tick; the tick has ended once that
+#: gap has passed in silence. The sleep between ticks is the whole interval.
+TICK_POLL_SECONDS = 0.5
+TICK_GAP_RATIO = 0.4
+MIN_TICK_GAP_SECONDS = 5.0
+MAX_TICKS = 16
 MAX_TREE_DEVICES = 64
 MAX_AUDIT_LINES = 400
 #: Bounds of the read-only ``inventory``: counter files per port group, counter
@@ -180,7 +208,13 @@ BDF = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$")
 
 
 class ProbeError(RuntimeError):
-    pass
+    """A refused or failed probe step. ``detail`` is a JSON object the error line
+    carries next to the message (the window verification's checks), so the
+    controller can keep it as redacted case evidence instead of a bare digest."""
+
+    def __init__(self, message: str, *, detail: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.detail = detail
 
 
 def emit(value: dict[str, Any]) -> None:
@@ -365,6 +399,65 @@ def unit_state(unit: str) -> dict[str, str]:
     return values
 
 
+def unit_dropins(unit: str) -> dict[str, Any]:
+    """The drop-ins systemd has *loaded* for ``unit`` and whether a reload is due.
+
+    A removed drop-in stays in ``DropInPaths`` (``NeedDaemonReload=yes``) until
+    ``daemon-reload`` (systemd 255, proven 2026-10-26); the live 013 window left
+    exactly that listing behind, so ``_close`` reads this back after its reload.
+    """
+
+    completed = run(
+        [
+            "systemctl",
+            "show",
+            unit,
+            "--property=DropInPaths",
+            "--property=NeedDaemonReload",
+        ],
+        check=False,
+    )
+    values = {"paths": [], "reload_needed": False}
+    for line in completed.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key == "DropInPaths":
+            values["paths"] = value.split()
+        elif separator and key == "NeedDaemonReload":
+            values["reload_needed"] = value.strip() == "yes"
+    return values
+
+
+def unit_stamps(unit: str) -> dict[str, int]:
+    """``ExecMainStartTimestampMonotonic`` / ``WatchdogTimestampMonotonic`` (us)."""
+
+    completed = run(
+        [
+            "systemctl",
+            "show",
+            unit,
+            "--property=ExecMainStartTimestampMonotonic",
+            "--property=WatchdogTimestampMonotonic",
+        ],
+        check=False,
+    )
+    values: dict[str, int] = {}
+    for line in completed.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and value.strip().isdigit():
+            values[key] = int(value)
+    return values
+
+
+def monotonic_us() -> int:
+    """CLOCK_MONOTONIC in microseconds, the clock systemd stamps with."""
+
+    return time.monotonic_ns() // 1000
+
+
+def pause(seconds: float) -> None:
+    time.sleep(seconds)
+
+
 def process_environment(pid: str, keys: tuple[str, ...]) -> dict[str, str]:
     """Allow-listed keys of a running process's real environment."""
 
@@ -422,6 +515,10 @@ def bin_dir(run_id: str) -> Path:
 
 def audit_dir(run_id: str) -> Path:
     return state_dir(run_id) / "audit"
+
+
+def env_file(run_id: str) -> Path:
+    return state_dir(run_id) / ENV_FILE
 
 
 def write_atomic(path: Path, content: bytes, mode: int) -> None:
@@ -527,130 +624,6 @@ def _builder(name: str) -> Any:
         getattr(load_builders_module(safe_id(arguments.run_id)), name)(arguments)
 
     return handler
-
-
-def _text(path: Path, limit: int = MAX_SOURCE_VALUE_CHARS) -> str | None:
-    try:
-        return path.read_text(encoding="utf-8", errors="replace").strip()[:limit]
-    except OSError:
-        return None
-
-
-def _rdma_driver(device: Path) -> tuple[str | None, list[str]]:
-    """``(resolved driver, uevent DRIVER= values)`` the way ``is_efa_device`` reads them."""
-
-    try:
-        resolved: str | None = (device / "device" / "driver").resolve(strict=True).name
-    except OSError:
-        resolved = None
-    uevent = _text(device / "device" / "uevent", 4096) or ""
-    drivers = [
-        line[len("DRIVER=") :]
-        for line in uevent.splitlines()
-        if line.startswith("DRIVER=")
-    ]
-    return resolved, drivers
-
-
-def _pci_function(device: Path) -> str | None:
-    """The BDF of the PCI function an RDMA device sits on (``device`` link), or None.
-
-    013 ``pci_missing`` drops that function from the copied PCI root and the
-    device from the copied RDMA tree, the way one function that fell off the
-    bus takes its RDMA device with it.
-    """
-
-    try:
-        name = (device / "device").resolve(strict=True).name
-    except OSError:
-        return None
-    return name if BDF.fullmatch(name) else None
-
-
-def rdma_inventory(root: Path, netdev_root: Path) -> dict[str, Any]:
-    """The node's RDMA devices as the host collector reads them (read-only)."""
-
-    devices: dict[str, Any] = {}
-    for device in sorted(root.iterdir()) if root.is_dir() else []:
-        if DEVICE_NAME.fullmatch(device.name) is None:
-            continue
-        driver, uevent_drivers = _rdma_driver(device)
-        net = device / "device" / "net"
-        ports: dict[str, Any] = {}
-        ports_dir = device / "ports"
-        for port in sorted(ports_dir.iterdir()) if ports_dir.is_dir() else []:
-            if PORT_NAME.fullmatch(port.name) is None:
-                continue
-            entry: dict[str, Any] = {
-                "state": _text(port / "state"),
-                "phys_state": _text(port / "phys_state"),
-            }
-            for group in ("counters", "hw_counters"):
-                values: dict[str, str | None] = {}
-                group_dir = port / group
-                names = sorted(group_dir.iterdir()) if group_dir.is_dir() else []
-                for counter in names[:MAX_INVENTORY_COUNTERS]:
-                    if counter.is_file() and COUNTER_NAME.fullmatch(counter.name):
-                        values[counter.name] = _text(counter, 64)
-                entry[group] = values
-            ports[port.name] = entry
-        devices[device.name] = {
-            "driver": driver,
-            "uevent_drivers": uevent_drivers,
-            "efa": driver == "efa" or (driver is None and uevent_drivers == ["efa"]),
-            "netdevs": sorted(item.name for item in net.iterdir())
-            if net.is_dir()
-            else [],
-            "ports": ports,
-            "pci": _pci_function(device),
-        }
-    physical = (
-        sorted(
-            item.name
-            for item in netdev_root.iterdir()
-            if (item / "device").exists() and NETDEV_NAME.fullmatch(item.name)
-        )
-        if netdev_root.is_dir()
-        else []
-    )
-    return {"root": str(root), "devices": devices, "physical_netdevs": physical}
-
-
-def ethtool_names(interfaces: list[str]) -> dict[str, Any]:
-    """What the real ``ethtool -S`` prints for each netdev: counter names only."""
-
-    path = shutil.which("ethtool", path=STANDARD_PATH)
-    result: dict[str, Any] = {"path": path, "statistics": {}}
-    if path is None:
-        return result
-    for interface in interfaces:
-        completed = run([path, "-S", interface], check=False, timeout=30)
-        names = []
-        for line in completed.stdout.splitlines():
-            name, separator, value = line.partition(":")
-            # ``NIC statistics:`` heads the listing; a counter line has a value.
-            if separator and name.strip() and value.strip():
-                names.append(name.strip())
-        result["statistics"][interface] = {
-            "returncode": completed.returncode,
-            "counters": names[:MAX_ETHTOOL_NAMES],
-            "truncated": len(names) > MAX_ETHTOOL_NAMES,
-            "stderr": completed.stderr.strip()[:200],
-        }
-    return result
-
-
-def inventory(arguments: argparse.Namespace) -> None:
-    run_id = safe_id(arguments.run_id)
-    value = rdma_inventory(Path(arguments.source), Path(arguments.netdev_root))
-    owned = {
-        name
-        for device in value["devices"].values()
-        if device["efa"]
-        for name in device["netdevs"]
-    }
-    value["ethtool"] = ethtool_names(sorted(owned | set(value["physical_netdevs"])))
-    emit({"run_id": run_id, "captured_at": utc_now(), **value})
 
 
 def read_source(arguments: argparse.Namespace) -> None:
@@ -780,30 +753,6 @@ def install_wrapper(arguments: argparse.Namespace) -> None:
         json.dumps(wrappers, sort_keys=True), encoding="utf-8"
     )
     emit({"run_id": run_id, "tool": tool, **wrappers[tool]})
-
-
-def audit_read(arguments: argparse.Namespace) -> None:
-    run_id = safe_id(arguments.run_id)
-    tool = arguments.tool
-    if tool not in WRAPPABLE_TOOLS:
-        raise ProbeError(f"{tool!r} is not an allow-listed tool")
-    path = audit_dir(run_id) / f"{tool}.jsonl"
-    entries: list[Any] = []
-    if path.is_file():
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        tail = max(1, min(int(arguments.tail), MAX_AUDIT_LINES))
-        for line in lines[-tail:]:
-            try:
-                entries.append(json.loads(line))
-            except ValueError:
-                entries.append({"unparsable": line[:200]})
-    calls_path = audit_dir(run_id) / "calls.json"
-    calls = (
-        json.loads(calls_path.read_text(encoding="utf-8") or "{}")
-        if calls_path.is_file()
-        else {}
-    )
-    emit({"run_id": run_id, "tool": tool, "entries": entries, "calls": calls})
 
 
 # --------------------------------------------------------------------------- #
@@ -1054,10 +1003,22 @@ def dropin_lines(
         for path in hidden:
             lines.append(f"BindReadOnlyPaths={node}:{path}")
             state["inaccessible"].append(path)
-    for pair in arguments.env:
-        name, value = checked_env_override(pair)
-        lines.append(f"Environment={name}={value}")
-        state["env"][name] = value
+    if arguments.env:
+        # Through a file, never ``Environment=``: the installer writes the
+        # expected counts into the unit's own ``EnvironmentFile=`` and systemd
+        # applies every EnvironmentFile= *after* every Environment= -- a drop-in
+        # ``Environment=GPU_FAULT_EXPECTED_GPU_COUNT=9`` lost to the unit's
+        # ``="8"`` (live 2026-10-26, 012 expectation_wrong). Among files the
+        # later-listed wins, and a drop-in is parsed after the unit file
+        # (systemd.exec(5) EnvironmentFile=, systemd.unit(5)), so this one is
+        # read last. An empty value stays an empty string, as before.
+        for pair in arguments.env:
+            name, value = checked_env_override(pair)
+            state["env"][name] = value
+        content = "".join(f"{name}={value}\n" for name, value in state["env"].items())
+        state_dir(run_id).mkdir(mode=0o755, parents=True, exist_ok=True)
+        write_atomic(env_file(run_id), content.encode("utf-8"), 0o644)
+        lines.append(f"EnvironmentFile={env_file(run_id)}")
     if arguments.pci_root:
         root = fixtures_dir(run_id) / "pci"
         # A directory (synthetic or copied root) or the ``--unreadable`` regular
@@ -1119,6 +1080,7 @@ def open_window(arguments: argparse.Namespace) -> None:
     before = unit_state(unit)
     if before.get("ActiveState") != "active":
         raise ProbeError(f"{unit} is not active at baseline")
+    unset = list(UNSET_ENV_BY_UNIT.get(unit, ()))
     state: dict[str, Any] = {
         "run_id": run_id,
         "mode": mode,
@@ -1129,9 +1091,14 @@ def open_window(arguments: argparse.Namespace) -> None:
         "wrappers": {},
         "inaccessible": [],
         "env": {},
-        "unset_env": list(UNSET_ENV_BY_UNIT.get(unit, ())),
+        "unset_env": unset,
         "pci_root": False,
         "before": before,
+        # The unit's real environment for every key a window may touch: what
+        # ``_close`` must read back after the restore.
+        "baseline_env": process_environment(
+            before.get("MainPID", "0"), (PCI_ENV, *ENV_OVERRIDES, *unset)
+        ),
         "opened_at": utc_now(),
         "restore_seconds": restore_seconds,
     }
@@ -1157,10 +1124,11 @@ def open_window(arguments: argparse.Namespace) -> None:
             _close(run_id, state)
             raise ProbeError(f"window verification failed: {error}; closed") from error
         if not verification["ok"]:
-            _close(run_id, state)
+            closed = _close(run_id, state)
             raise ProbeError(
                 "the replacement is not visible only inside the unit; closed: "
-                + json.dumps(verification["checks"], sort_keys=True)[:600]
+                + json.dumps(verification["checks"], sort_keys=True)[:600],
+                detail={"checks": verification["checks"], "close": closed},
             )
     emit(
         {
@@ -1190,82 +1158,6 @@ def apply_value(arguments: argparse.Namespace) -> None:
     )
 
 
-def status(arguments: argparse.Namespace) -> None:
-    run_id = safe_id(arguments.run_id)
-    state = load_state(run_id)
-    if not state:
-        raise ProbeError("no source replay window is open for this run")
-    fixtures = {}
-    directory = fixtures_dir(run_id)
-    if directory.is_dir():
-        for item in sorted(directory.iterdir()):
-            if item.is_file():
-                fixtures[item.name] = item.read_text(
-                    encoding="utf-8", errors="replace"
-                )[:64]
-            else:
-                fixtures[item.name] = f"<tree: {len(os.listdir(item))} entries>"
-    audits = {}
-    if audit_dir(run_id).is_dir():
-        for item in sorted(audit_dir(run_id).glob("*.jsonl")):
-            audits[item.stem] = sum(1 for _ in item.open(encoding="utf-8"))
-    emit(
-        {
-            "run_id": run_id,
-            "mode": state["mode"],
-            "unit": unit_state(window_unit(state)),
-            "unit_name": window_unit(state),
-            "fixtures": fixtures,
-            "wrappers": sorted(state.get("wrappers", {})),
-            "audit_lines": audits,
-        }
-    )
-
-
-def journal_read(arguments: argparse.Namespace) -> None:
-    """The tail of one allow-listed unit's journal since a moment (read-only).
-
-    What the collector itself logged about its discovery is the unit's own
-    record of a replayed query (``collectors/context.py`` warns when the
-    version discovery is unavailable; ``collectors/gpu/discovery.py`` logs the
-    branch it found). Lines are bounded in number and length.
-    """
-
-    run_id = safe_id(arguments.run_id)
-    unit = checked_unit(arguments.unit)
-    since = checked_moment(arguments.since)
-    tail = max(1, min(int(arguments.tail), MAX_JOURNAL_LINES))
-    completed = run(
-        [
-            "journalctl",
-            "-u",
-            unit,
-            "--since",
-            since,
-            "-n",
-            str(tail),
-            "--no-pager",
-            "-q",
-            "-o",
-            "cat",
-        ],
-        check=False,
-        timeout=60,
-    )
-    lines = [line[:MAX_JOURNAL_LINE_CHARS] for line in completed.stdout.splitlines()]
-    emit(
-        {
-            "run_id": run_id,
-            "unit": unit,
-            "since": since,
-            "returncode": completed.returncode,
-            "lines": lines,
-            "truncated": len(lines) >= tail,
-            "window_open": bool(load_state(run_id)),
-        }
-    )
-
-
 def verify(arguments: argparse.Namespace) -> None:
     run_id = safe_id(arguments.run_id)
     state = load_state(run_id)
@@ -1274,18 +1166,69 @@ def verify(arguments: argparse.Namespace) -> None:
     emit({"run_id": run_id, **verify_window(run_id, state)})
 
 
+def restore_checks(state: dict[str, Any], pid: str) -> list[dict[str, Any]]:
+    """The real configuration is read again: every replaced source on the device
+    PID 1 reads it from and as readable (a procfs reading never hashes equal
+    twice, so content is not compared), every touched variable at its baseline
+    value (absent stays absent)."""
+
+    checks: list[dict[str, Any]] = []
+    dests = [
+        item["dest"] for item in (*state.get("binds", []), *state.get("trees", []))
+    ]
+    for dest in (*dests, *state.get("inaccessible", [])):
+        unit, host = view_path(pid, dest), view_path("1", dest)
+        checks.append(
+            {
+                "kind": "source",
+                "dest": dest,
+                "unit_readable": unit["readable"],
+                "ok": unit["readable"] == host["readable"]
+                and unit["device"] == host["device"],
+            }
+        )
+    baseline = state.get("baseline_env")
+    if isinstance(baseline, dict):
+        keys = (
+            PCI_ENV,
+            *ENV_OVERRIDES,
+            *(str(k) for k in state.get("unset_env") or []),
+        )
+        environment = process_environment(pid, keys)
+        for name in sorted(set(keys) & (set(baseline) | set(state.get("env") or {}))):
+            checks.append(
+                {
+                    "kind": "env",
+                    "dest": name,
+                    "baseline": baseline.get(name),
+                    "unit_value": environment.get(name),
+                    "ok": environment.get(name) == baseline.get(name),
+                }
+            )
+    return checks
+
+
 def _close(run_id: str, state: dict[str, Any]) -> dict[str, Any]:
     unit = window_unit(state)
     dropin = Path(state.get("dropin") or dropin_path(run_id, unit))
     dropin.unlink(missing_ok=True)
-    run(["systemctl", "daemon-reload"])
+    reloads = 0
+    while True:
+        run(["systemctl", "daemon-reload"], timeout=180)
+        reloads += 1
+        loaded = unit_dropins(unit)
+        listed = str(dropin) in loaded["paths"]
+        if not (listed or loaded["reload_needed"]) or reloads >= 2:
+            break
     run(["systemctl", "restart", unit], timeout=120)
     after = unit_state(unit)
     if after.get("ActiveState") != "active":
         raise ProbeError(f"{unit} is not active after the window closed")
+    checks = restore_checks(state, after.get("MainPID", "0"))
     disarm_deadman(run_id)
     residue = {
         "dropin": dropin.exists(),
+        "dropin_loaded": listed,
         "deadman": unit_state(f"{deadman_unit(run_id)}.timer").get("ActiveState")
         == "active",
     }
@@ -1295,6 +1238,9 @@ def _close(run_id: str, state: dict[str, Any]) -> dict[str, Any]:
     return {
         "unit": unit,
         "after": after,
+        "closed_at": utc_now(),
+        "reloads": reloads,
+        "restore": {"checks": checks, "ok": all(item["ok"] for item in checks)},
         "residue": residue,
         "clean": not any(residue.values()),
     }
@@ -1321,6 +1267,79 @@ def close_window(arguments: argparse.Namespace) -> None:
         emit({"run_id": run_id, "already_closed": True, "clean": True})
         return
     emit({"run_id": run_id, **_close(run_id, state)})
+
+
+def await_ticks(arguments: argparse.Namespace) -> None:
+    """Wait on the node until the unit completed ``--count`` collector ticks since
+    the window opened, then (``--close``) restore within the same call.
+
+    The exposure is measured from the ticks the collector actually took, not
+    from the restart: after a restart the host collector sleeps a node-specific
+    startup phase (``GPU_FAULT_COLLECTOR_STARTUP_SPREAD_SECONDS`` plus the
+    start-up jitter, up to ~35 s by default) before its first tick, so a fixed
+    1.7-interval deadman closed the live 013 ``link_inactive`` window before
+    the second confirming tick (2026-10-26). The ticks are read from the
+    unit's own ``WatchdogTimestampMonotonic`` (``unit_stamps``), the time of
+    the last ``WATCHDOG=1`` the main process sent; pings closer than the gap
+    belong to one tick. The deadman armed at ``open-window`` stays the bound
+    for a runner that never gets here; ``--timeout`` never exceeds it.
+    """
+
+    run_id = safe_id(arguments.run_id)
+    state = load_state(run_id)
+    if not state:
+        # The deadman got there first: nothing to wait for, nothing to close.
+        emit(
+            {"run_id": run_id, "already_closed": True, "completed": False, "ticks": []}
+        )
+        return
+    unit = window_unit(state)
+    count = max(1, min(int(arguments.count), MAX_TICKS))
+    interval = max(1.0, min(float(arguments.interval), 3600.0))
+    gap = max(MIN_TICK_GAP_SECONDS, interval * TICK_GAP_RATIO)
+    timeout = max(1.0, min(float(arguments.timeout), float(state["restore_seconds"])))
+    started, ticks = monotonic_us(), []
+    while True:
+        stamps = unit_stamps(unit)
+        stamp, began = (
+            stamps.get("WatchdogTimestampMonotonic", 0),
+            stamps.get("ExecMainStartTimestampMonotonic", 0),
+        )
+        now = monotonic_us()
+        if stamp and stamp >= began:
+            if not ticks or stamp - ticks[-1]["last"] > gap * 1_000_000:
+                ticks.append({"first": stamp, "last": stamp, "pings": 1})
+            elif stamp != ticks[-1]["last"]:
+                ticks[-1].update(last=stamp, pings=ticks[-1]["pings"] + 1)
+        completed = len(ticks) >= count and now - ticks[-1]["last"] >= gap * 1_000_000
+        if completed or now - started >= timeout * 1_000_000:
+            break
+        pause(TICK_POLL_SECONDS)
+    at = datetime.now(timezone.utc)
+    result: dict[str, Any] = {
+        "run_id": run_id,
+        "unit": unit,
+        "count": count,
+        "interval_seconds": interval,
+        "gap_seconds": gap,
+        "completed": completed,
+        "waited_seconds": round((now - started) / 1e6, 1),
+        "ticks": [
+            {
+                "pings_seen": tick["pings"],
+                "first_ping_at": (
+                    at - timedelta(microseconds=now - tick["first"])
+                ).isoformat(),
+                "last_ping_at": (
+                    at - timedelta(microseconds=now - tick["last"])
+                ).isoformat(),
+            }
+            for tick in ticks
+        ],
+    }
+    if arguments.close:
+        result["close"] = _close(run_id, state)
+    emit(result)
 
 
 def snapshot(arguments: argparse.Namespace) -> None:
@@ -1385,10 +1404,15 @@ def parser() -> argparse.ArgumentParser:
     add(item, "--drop --duplicate --port-state --phys-state --driver --set", **many)
     add(item, "--remove-counter --no-ports --netdev", **many)
     add(item, "--allow-empty", **switch)
-    item = command("inventory", inventory)
+    item = command("inventory", _builder("inventory"))
     item.add_argument("--source", default="/sys/class/infiniband")
     item.add_argument("--netdev-root", default=NETDEV_ROOT)
     command("read-source", read_source).add_argument("--path", required=True)
+    item = command("await-ticks", await_ticks)
+    item.add_argument("--count", type=int, default=2)
+    item.add_argument("--interval", type=float, default=15)
+    item.add_argument("--timeout", type=float, default=120)
+    add(item, "--close", **switch)
     item = command("build-nvidia-proc-fixture", _builder("build_nvidia_proc_fixture"))
     item.add_argument("--source", default="/proc/driver/nvidia")
     item.add_argument("--version-text")
@@ -1410,14 +1434,14 @@ def parser() -> argparse.ArgumentParser:
     item = command("set-value", apply_value)
     add(item, "--name --value", required=True)
     item.add_argument("--path")
-    item = command("audit-read", audit_read)
+    item = command("audit-read", _builder("audit_read"))
     item.add_argument("--tool", required=True)
     item.add_argument("--tail", type=int, default=100)
-    item = command("journal-read", journal_read)
+    item = command("journal-read", _builder("journal_read"))
     add(item, "--unit --since", required=True)
     item.add_argument("--tail", type=int, default=200)
     for name, handler in (
-        ("status", status),
+        ("status", _builder("status")),
         ("verify", verify),
         ("close-window", close_window),
         ("snapshot", snapshot),
@@ -1443,9 +1467,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         arguments.handler(arguments)
     except Exception as exc:  # noqa: BLE001 - reported as the probe's JSON error
-        # The host fixture withholds this output and shows only the tokens it
+        # The host fixture's *exception text* shows only the tokens it
         # whitelists for ``error_kind: probe``: the class, a digest of the
-        # message and the site. The message itself never leaves the node.
+        # message and the site. The message and the structured detail (a
+        # ProbeError's ``detail``: the verification checks) travel in the same
+        # line and the fixture keeps them, redacted, as the case's
+        # ``probe-error.json`` -- two lanes brute-forced digests on 2026-10-26.
         emit(
             {
                 "error": type(exc).__name__,
@@ -1453,6 +1480,8 @@ def main(argv: list[str] | None = None) -> int:
                 "error_class": type(exc).__name__,
                 "error_code": hashlib.sha256(str(exc).encode()).hexdigest()[:16],
                 "error_site": exception_site(exc),
+                "error_message": str(exc)[:2000],
+                "error_detail": getattr(exc, "detail", None),
                 "command": getattr(arguments, "command", None),
             }
         )

@@ -1463,13 +1463,25 @@ inventory (the probe's read-only `inventory`: driver identity, owned netdevs,
 port states, every `counters`/`hw_counters` file, the real `ethtool -S` names)
 and replaces exactly one reading inside the host collector unit: a real port
 counter file bound at its real value and stepped (`rdma_error`), the port
-`state` bound to `1: DOWN` for a bounded exposure (`link_inactive`: the
-window's own deadman closes it 1.7 collector intervals after it opened --
-`general_live_source_replay.bounded_exposure_seconds`, 26 s at 15 s ticks --
-so the first tick mints the `rdma_link_down` WARNING, the second is the fresh
-reading its VALIDATE_FABRIC must fail on and the one that confirms the
+`state` bound to `1: DOWN` for a bounded exposure (`link_inactive`: the probe
+watches the collector's own ticks on the node -- `await-ticks` reads the unit's
+`WatchdogTimestampMonotonic`, the last `WATCHDOG=1` the collector's main
+process sent, one per contributor and one per posted batch, ticks separated by
+a whole interval of silence -- and closes the window right after the tick the
+product needs to confirm the shortfall (`GPU_FAULT_INVENTORY_MISMATCH_CONSECUTIVE_SAMPLES`,
+2 by default; `general_live_source_replay.observed_exposure`), so the first
+tick mints the `rdma_link_down` WARNING, the second is the fresh reading its
+VALIDATE_FABRIC must fail on and the one that confirms the
 `efa_inventory_mismatch` LINK_INACTIVE co-finding, and no third tick sees the
-port down; since batch 175 the co-finding's diagnostic judges fresh readings
+port down; the window's deadman is only the fallback for a runner that
+disappears (`exposure_fallback_seconds`: startup phase + startup jitter +
+N x (interval + 10 s) + 20 s, 105 s on this site). Until 2026-10-26 the
+deadman itself was the restore, 1.7 intervals (26 s) after the *restart*; a
+restarted host collector first sleeps a node phase of up to
+`GPU_FAULT_COLLECTOR_STARTUP_SPREAD_SECONDS` (15 s) plus a `[0, 20 s)` start-up
+jitter before its first tick, so that bound was a lottery on the phase -- the
+two 010 passes had their first tick 8.4 s in, the 013 run that failed 13 s in;
+since batch 175 the co-finding's diagnostic judges fresh readings
 and would escalate a port still inactive to REBOOT_NODE by design, so it only
 ever sees the restored port: SUCCEEDED, RECOVERED, no RESTART_NODE; a link
 verdict reached after the restore, an inactive reading after it or no
@@ -2121,8 +2133,37 @@ unit's PATH for `smartctl`, `ipmitool`, `ethtool` and the host collector's
 and deadline; a failed real query is passed through as it failed; every
 catalogued call is journaled), a path or tool binary made *inaccessible* inside
 the unit, an expected GPU/EFA count override, or the `GPU_FAULT_PCI_DEVICES_ROOT`
-repoint. After the unit restarts the probe verifies through `nsenter` that each
-replacement is visible inside the unit and not to PID 1, or closes the window.
+repoint. The count override is handed to the unit as an `EnvironmentFile=`
+(the run's `/run/gfrs-live/source-<digest>/env`), never as `Environment=`: the
+installer writes the real counts into the unit's own
+`EnvironmentFile=/etc/gpu-fault/collector.env` (`GPU_FAULT_EXPECTED_GPU_COUNT="8"`,
+derived from the instance type, older than the reachable history) and systemd
+applies every `EnvironmentFile=` after every `Environment=`, later-listed files
+winning, with drop-ins parsed after the unit file (systemd.exec(5)
+`EnvironmentFile=`, systemd.unit(5)); `UnsetEnvironment=` is applied last of
+all, so no file resurrects an unset variable. Live 2026-10-26 (eksb, 012
+`expectation_wrong`) the drop-in `Environment=GPU_FAULT_EXPECTED_GPU_COUNT=9`
+lost to the unit file's `"8"`: the window opened, the unit restarted, the
+process still read 8 and the verification closed the window (`ProbeError
+ce53d15331ea1884 at open_window:1161`); a systemd 255 user-unit experiment on
+the controller host reproduced all four rules (drop-in `Environment=` loses,
+drop-in `EnvironmentFile=` wins, `UnsetEnvironment=` removes a file-set key, a
+file line `X=` yields the empty string). After the unit restarts the probe
+verifies through `nsenter` that each replacement is visible inside the unit
+and not to PID 1, or closes the window. The close (`close-window`, the
+deadman, `await-ticks --close`) removes the drop-in, reloads and reads
+`DropInPaths`/`NeedDaemonReload` back -- a removed drop-in stays listed until
+the next reload (systemd 255; the listing SSM found after the live 013 close
+on 2026-10-26) -- reloading once more if it is still listed, restarts the unit
+and reads the real configuration back (`restore.checks`: every replaced source
+as PID 1 sees it, every touched variable at the `baseline_env` recorded at the
+open, unset ones absent; `restore.ok`, `closed_at`, `reloads`). A failed probe
+call still surfaces only whitelisted tokens in the exception text (class,
+16-hex digest, `function:line`), but the probe's own message and structured
+detail (`ProbeError.detail`, e.g. the failed verification's checks) are now
+written, redacted (credential-shaped tokens and long opaque blobs masked,
+bounded) to the case directory as `probe-error.json`, which the exception text
+names; two lanes had brute-forced the digest that day.
 No host binary is replaced, no global mount is made, the Node Agent is never in
 the allow-list and `py-spy` (run only by the Node Agent) is refused by name.
 Everything beyond the phase-1 binds and the PCI-root repoint needs
@@ -2156,19 +2197,29 @@ since batch 175 under `HOST_SOURCE_REPLAY` alone (`S`, risk M; the old
 deadline-then-RESTART_NODE gap and the `NODE_REBOOT` token are gone): because
 the diagnostic now judges fresh readings and a port still inactive is the
 designed REBOOT_NODE, the inactive port is shown for a bounded exposure only --
-the tree window's own deadman closes it 1.7 collector intervals (26 s) after it
-opened, after the second tick that confirms the shortfall and mints the finding
-and before a third could be read, which the runner's own polling (20 s store
-polls plus two probe round trips against a 15 s tick) could not guarantee; the
-runner's later close only confirms it (`closed_by`). PASS is a first workflow
+the probe watches the collector's own ticks on the node (`await-ticks`, the
+unit's `WatchdogTimestampMonotonic`) and closes the tree window right after
+the tick that confirms the shortfall and mints the finding
+(`GPU_FAULT_INVENTORY_MISMATCH_CONSECUTIVE_SAMPLES`, the second by default),
+before a third could be read (`observed_exposure`; the evidence
+`link-inactive-exposure.json` records when each observed tick ended,
+`closed_at` and `closed_by: probe`, or `deadman` when the fallback fired
+first). Neither the runner's store polling (20 s polls plus probe round trips
+against a 15 s tick) nor a fixed bound from the restart can do that: the
+deadman that closed the window 1.7 intervals (26 s) after it opened lost to
+the collector's startup phase live on 2026-10-26 (eksb: first tick 13 s after
+the open, deadman before the second, no finding, INCONCLUSIVE); it is now the
+fallback `exposure_fallback_seconds` (105 s here). PASS is a first workflow
 that diagnoses (FREEZE_EVIDENCE + VALIDATE_FABRIC, no hardware or isolation
 step), its VALIDATE_FABRIC SUCCEEDED with
 `details.inventory_evidence[node][efa_inventory_active_count]` at the restored
 count observed after the restore, no stale gate, the incident RECOVERED, no
-RESTART_NODE and the healthy count read back; no finding inside the exposure,
-or a shortfall reading recorded after the restore (the bound did not hold and
-the designed escalation applies), is INCONCLUSIVE rather than a verdict on the
-product. 013 `pci_missing`
+RESTART_NODE and the healthy count read back; no finding or fewer shortfall
+readings than confirming ticks inside the exposure (the message names the
+observed ticks, the exposure's length and who closed it), or a shortfall
+reading recorded after the restore (the bound did not hold and the designed
+escalation applies), is INCONCLUSIVE rather than a verdict on the product.
+013 `pci_missing`
 (`scripts/e2e/regional/general_live_efa_pci.py`, both clusters, risk H, every
 lock, `--approve HOST_SOURCE_REPLAY NODE_REBOOT`, expected PASS) is the
 PCI_DEVICE_MISSING reboot chain on a live-replay: first the spec's negative
