@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Sequence
+from typing import Any
 from dataclasses import replace
 
+from gpu_fault.execution.contained_handoff import (
+    ContainedHandoff,
+    notify_contained_operator_handoff,
+)
 from gpu_fault.execution.models import WorkflowStepOutcome
-from gpu_fault.execution.terminal_state import inconclusive_reason
+from gpu_fault.execution.terminal_state import TerminalDecision, inconclusive_reason
 from gpu_fault.markers import retire_markers_for_incident
 from gpu_fault.models import (
     FaultIncident,
@@ -145,6 +150,44 @@ def close_inconclusive_diagnostic(
             "notifying inconclusive diagnostic for incident %s workflow %s",
             incident.incident_id,
             workflow.request_id,
+        )
+
+
+def after_terminal_write(
+    executor: Any,
+    decision: TerminalDecision,
+    handoff: ContainedHandoff | None,
+    incident_written: bool,
+) -> None:
+    """The effects that follow a terminal write and must never undo it.
+
+    Both are read from ``decision`` -- the records as written -- and both are
+    skipped when the incident was not this workflow's to write (a stronger
+    successor took the pointer): the inconclusive-diagnostic close with its
+    advisory, and the hand-off notice of a settled containment prefix whose
+    plan an operator now owns (``execution/contained_handoff.py``).
+    """
+
+    if decision.incident is None or not incident_written:
+        return
+    if decision.diagnostic_inconclusive:
+        close_inconclusive_diagnostic(
+            executor.store,
+            decision.workflow,
+            decision.incident,
+            decision.error,
+            actor=executor.config.executor_id,
+            builder=executor.diagnostic_inconclusive_email_builder,
+            sender=executor.notification_sender,
+        )
+    if handoff is not None:
+        notify_contained_operator_handoff(
+            executor.store,
+            decision.workflow,
+            decision.incident,
+            handoff,
+            builder=executor.contained_handoff_email_builder,
+            sender=executor.notification_sender,
         )
 
 

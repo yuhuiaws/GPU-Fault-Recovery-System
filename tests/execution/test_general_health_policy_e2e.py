@@ -6,7 +6,15 @@ import json
 
 import pytest
 
-from gpu_fault.models import IncidentState, WorkflowStatus
+from gpu_fault.adapters.common import ANNOTATION_INCIDENT, quarantine_taint_value
+from gpu_fault.models import (
+    BlockedKind,
+    CapabilityMode,
+    CapabilityName,
+    EffectiveCapability,
+    IncidentState,
+    WorkflowStatus,
+)
 from gpu_fault.models import WorkflowOperation as Op
 from tests._builders import attempt_observation, container_observation
 from tests.execution._raw_health_e2e_support import RawHealthRig
@@ -140,6 +148,90 @@ def test_confirmed_thermal_fault_requires_review_after_cooling(rig):
     assert Op.RESTART_WORKLOAD not in rig.boundary.calls, rig.boundary.calls
     assert Op.ESCALATE_SUPPORT in rig.boundary.calls, rig.boundary.calls
     assert rig.store.get_incident(workflow.incident_id).state is IncidentState.ESCALATED
+
+
+def _observe(rig, *capabilities: CapabilityName) -> None:
+    """Declare ``capabilities`` the way both live Runtime Profiles do:
+    ``mode OBSERVE, owner gpu-fault-node-agent, adapter null``."""
+
+    profile = rig.store.get_profile("simulated-v1")
+    observed = set(capabilities)
+    rig.store.save_profile(
+        profile.model_copy(
+            update={
+                "capabilities": [
+                    EffectiveCapability(
+                        capability=item.capability,
+                        mode=CapabilityMode.OBSERVE,
+                        owner="gpu-fault-node-agent",
+                    )
+                    if item.capability in observed
+                    else item
+                    for item in profile.capabilities
+                ]
+            }
+        )
+    )
+
+
+def test_row_remap_failure_without_a_field_diagnostic_owner_is_contained_first(rig):
+    """GF-GENERAL-LIVE-019 ``remap_failure`` on a profile with
+    ``memoryDiagnostics: OBSERVE`` (both live clusters, 2026-10-26): the RMA
+    drain used to block at compile time for its one unowned step and leave the
+    node schedulable. Now FREEZE_EVIDENCE, MARK_UNSCHEDULABLE, QUARANTINE and
+    COLLECT_DIAGNOSTIC_BUNDLE execute, the record settles
+    BLOCKED/SAFETY_SETTLED at the diagnostic step, the incident is QUARANTINED
+    with the hand-off in its reasons, and one operator notice goes out."""
+
+    _observe(rig, CapabilityName.MEMORY_DIAGNOSTICS)
+    result = rig.gpu({"gpu_temperature_c": 40, "row_remap_failure": 1})
+    [workflow] = rig.store.list_workflows()
+    incident = rig.store.get_incident(workflow.incident_id)
+    assert incident.official_action == "RUN_FIELD_DIAGNOSTIC_FOR_RMA", result
+    assert workflow.status is WorkflowStatus.SAFETY_PENDING, workflow.blocked_reasons
+    assert workflow.blocked_reasons == ["no executable owner for memoryDiagnostics"]
+    assert [step.operation for step in workflow.safety_steps] == [
+        Op.FREEZE_EVIDENCE,
+        Op.MARK_UNSCHEDULABLE,
+        Op.QUARANTINE,
+        Op.COLLECT_DIAGNOSTIC_BUNDLE,
+    ]
+    assert incident.state is IncidentState.SAFETY_PENDING
+
+    outcome = rig.execute(workflow)
+
+    assert outcome.status is WorkflowStatus.BLOCKED, outcome
+    settled = rig.store.get_workflow(workflow.request_id)
+    assert settled.blocked_kind is BlockedKind.SAFETY_SETTLED
+    assert settled.completed_operations == [
+        Op.FREEZE_EVIDENCE,
+        Op.MARK_UNSCHEDULABLE,
+        Op.QUARANTINE,
+        Op.COLLECT_DIAGNOSTIC_BUNDLE,
+    ]
+    assert rig.boundary.calls == [Op.COLLECT_DIAGNOSTIC_BUNDLE], rig.boundary.calls
+    assert rig.boundary.running is True, "the containment prefix stops no job"
+    node = rig.core.node
+    assert node["spec"]["unschedulable"] is True, node
+    assert {(taint["key"], taint["value"]) for taint in node["spec"]["taints"]} >= {
+        ("gpu-fault.io/quarantined", quarantine_taint_value(incident.incident_id))
+    }
+    assert node["metadata"]["annotations"][ANNOTATION_INCIDENT] == incident.incident_id
+    closed = rig.store.get_incident(incident.incident_id)
+    assert closed.state is IncidentState.QUARANTINED
+    assert any(
+        "contained (cordoned and quarantined)" in reason
+        and "no executable owner for memoryDiagnostics" in reason
+        for reason in closed.reasons
+    ), closed.reasons
+    [notice] = [
+        item
+        for item in rig.store.list_notifications()
+        if "contained-operator-handoff" in item.deduplication_key
+    ]
+    assert notice.category == "OPERATOR_REVIEW"
+    assert "RUN_FIELD_DIAGNOSTIC" in notice.body_text
+    assert "--disposition restore" in notice.body_text
 
 
 def test_uncorrectable_ecc_stops_for_analysis_without_automatic_rma(rig):

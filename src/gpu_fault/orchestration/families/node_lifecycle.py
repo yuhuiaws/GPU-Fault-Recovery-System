@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from collections.abc import Sequence
 from typing import Any, Callable
 
 from gpu_fault.host_health import NodeHealthFinding
@@ -15,12 +16,14 @@ from gpu_fault.models import (
     WorkflowOperation,
     WorkflowRequest,
     WorkflowStatus,
+    WorkflowStepSpec,
     WorkloadState,
     bounded_reasons,
     resolved_step_indexes,
 )
 from gpu_fault.orchestration.disposition import Disposition, DispositionApplier
 from gpu_fault.orchestration.families.identity import derived_record_id
+from gpu_fault.orchestration.workflow_builder import containment_handoff_reason
 from gpu_fault.orchestration.provider_lifecycle_owner import (
     cluster_registration,
     pinned_profile_version,
@@ -322,7 +325,14 @@ class NodeLifecycleOperationService:
         context: ReplacementContext,
         state: ReplacementState,
         existing_workflow: WorkflowRequest | None,
-    ) -> tuple[list, list[str]]:
+    ) -> tuple[list, list[str], list[WorkflowStepSpec]]:
+        """``(steps, errors, containment)``; ``containment`` is the prefix the
+        plan runs first when its only refusal is a missing executable owner
+        (``WorkflowBuilder.containment_before_block``): a profile that keeps
+        ``nodeReplace``/``nodeReboot`` OBSERVE still cordons and quarantines
+        the node instead of leaving it schedulable behind a compile-time block.
+        A provider-owner mismatch is not that refusal and keeps the block."""
+
         finding = context.finding
         operations = [
             WorkflowOperation.FREEZE_EVIDENCE,
@@ -414,7 +424,15 @@ class NodeLifecycleOperationService:
                     }
                 )
             )
-        return result, [*context.profile_errors, *errors]
+        all_errors = [*context.profile_errors, *errors]
+        containment = self.builder.containment_before_block(
+            operations, context.profile, result, all_errors
+        )
+        if containment:
+            state.reasons.append(
+                containment_handoff_reason(containment, result, all_errors, operations)
+            )
+        return result, all_errors, containment
 
     def _build(
         self,
@@ -438,7 +456,7 @@ class NodeLifecycleOperationService:
             return self._merge_mixed(
                 context, state, existing_incident, existing_workflow, now
             )
-        steps, errors = self._compile_steps(
+        steps, errors, containment = self._compile_steps(
             context,
             state,
             existing_workflow,
@@ -471,7 +489,9 @@ class NodeLifecycleOperationService:
             existing_incident.fencing_token if existing_incident is not None else 1,
             existing_workflow.fencing_token if existing_workflow is not None else 1,
         )
-        incident = self._incident(context, state, errors, now, generation=generation)
+        incident = self._incident(
+            context, state, errors, now, generation=generation, containment=containment
+        )
         workflow = self._workflow(
             context,
             state,
@@ -480,6 +500,7 @@ class NodeLifecycleOperationService:
             predecessor,
             now,
             generation=generation,
+            containment=containment,
         )
         quarantine_source = existing_workflow if state.merge_existing else incumbent
         if quarantine_source is not None:
@@ -530,15 +551,29 @@ class NodeLifecycleOperationService:
         now: datetime,
     ) -> tuple[FaultIncident, WorkflowRequest]:
         candidate_state = self._state(context, None, None, now)
-        steps, errors = self._compile_steps(context, candidate_state, existing_workflow)
+        steps, errors, containment = self._compile_steps(
+            context, candidate_state, existing_workflow
+        )
         generation = max(
             existing_incident.fencing_token, existing_workflow.fencing_token
         )
         candidate = self._incident(
-            context, candidate_state, errors, now, generation=generation
+            context,
+            candidate_state,
+            errors,
+            now,
+            generation=generation,
+            containment=containment,
         )
         candidate_workflow = self._workflow(
-            context, candidate_state, steps, errors, None, now, generation=generation
+            context,
+            candidate_state,
+            steps,
+            errors,
+            None,
+            now,
+            generation=generation,
+            containment=containment,
         )
         disposition = self.merger.disposition(
             existing_workflow,
@@ -549,7 +584,7 @@ class NodeLifecycleOperationService:
         if disposition is Disposition.REPLACE_IN_PLACE:
             # The arbiter authorized replacing this still-unissued whole plan.
             # Recompile its complete fault scope, not only the latest reporter.
-            steps, errors = self._compile_steps(
+            steps, errors, containment = self._compile_steps(
                 context, merged_state, existing_workflow
             )
             candidate_workflow = self._workflow(
@@ -560,6 +595,7 @@ class NodeLifecycleOperationService:
                 None,
                 now,
                 generation=generation,
+                containment=containment,
             )
         workflow, winner = self.dispositions.apply(
             disposition,
@@ -609,6 +645,8 @@ class NodeLifecycleOperationService:
                     IncidentState.ACTION_PENDING
                     if workflow.status
                     in {WorkflowStatus.PENDING, WorkflowStatus.RUNNING}
+                    else IncidentState.SAFETY_PENDING
+                    if workflow.status is WorkflowStatus.SAFETY_PENDING
                     else IncidentState.ESCALATED
                 ),
                 "reasons": bounded_reasons(merged_state.reasons),
@@ -625,8 +663,15 @@ class NodeLifecycleOperationService:
         now: datetime,
         *,
         generation: int = 1,
+        containment: Sequence[WorkflowStepSpec] | None = None,
     ) -> FaultIncident:
         finding = context.finding
+        if errors and containment:
+            incident_state = IncidentState.SAFETY_PENDING
+        elif errors:
+            incident_state = IncidentState.ESCALATED
+        else:
+            incident_state = IncidentState.ACTION_PENDING
         return FaultIncident(
             incident_id=state.incident_id,
             event_id=state.primary_event_id,
@@ -647,7 +692,7 @@ class NodeLifecycleOperationService:
             official_action=None,
             effective_action=finding.recommended_action,
             drill_id=finding.drill_id,
-            state=(IncidentState.ESCALATED if errors else IncidentState.ACTION_PENDING),
+            state=incident_state,
             workflow_request_id=state.workflow_id,
             fencing_token=generation,
             reasons=state.reasons,
@@ -665,8 +710,18 @@ class NodeLifecycleOperationService:
         now: datetime,
         *,
         generation: int = 1,
+        containment: Sequence[WorkflowStepSpec] | None = None,
     ) -> WorkflowRequest:
-        status = WorkflowStatus.BLOCKED if errors else WorkflowStatus.PENDING
+        # The same three shapes as the node-health family: every owner present
+        # -> PENDING; refused only for missing owners with containment to run
+        # -> SAFETY_PENDING on that prefix; anything else -> the compile-time
+        # block an operator decides.
+        if errors and containment:
+            status = WorkflowStatus.SAFETY_PENDING
+        elif errors:
+            status = WorkflowStatus.BLOCKED
+        else:
+            status = WorkflowStatus.PENDING
         return WorkflowRequest(
             request_id=state.workflow_id,
             incident_id=state.incident_id,
@@ -674,10 +729,18 @@ class NodeLifecycleOperationService:
             status=status,
             official_action=context.finding.recommended_action.value,
             fencing_token=generation,
+            safety_steps=(
+                list(containment or ())
+                if status is WorkflowStatus.SAFETY_PENDING
+                else []
+            ),
+            safety_only=status is WorkflowStatus.SAFETY_PENDING,
             official_steps=steps,
             predecessor_workflow_id=predecessor,
             blocked_reasons=errors,
-            blocked_kind=(BlockedKind.NEEDS_OPERATOR if errors else None),
+            blocked_kind=(
+                BlockedKind.NEEDS_OPERATOR if status is WorkflowStatus.BLOCKED else None
+            ),
             not_before=state.not_before,
             aggregation_max_deadline=state.aggregation_max_deadline,
             created_at=state.opened_at,

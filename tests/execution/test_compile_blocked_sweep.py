@@ -647,3 +647,60 @@ def test_a_successor_that_is_not_a_verified_restore_closes_nothing() -> None:
     )
     assert store.get_workflow(parked.request_id).status is WorkflowStatus.BLOCKED
     assert store.get_incident(incident.incident_id).state is IncidentState.RECOVERED
+
+
+def test_a_settled_containment_prefix_is_not_a_compile_time_no_op() -> None:
+    """Since 2026-10-26 a plan refused only for a missing owner runs its
+    containment prefix first and settles BLOCKED/SAFETY_SETTLED: it ran steps
+    and holds a node through its QUARANTINED incident, so the compile-time
+    shape refuses it on every one of its guards, and the settled-incident shape
+    waits for the operator's exit (RECOVERED)."""
+
+    store = build_store()
+    incident, workflow = compile_blocked_pair(
+        store,
+        incident_state=IncidentState.QUARANTINED,
+        official_action="RUN_FIELD_DIAGNOSTIC_FOR_RMA",
+        blocked_reasons=["no executable owner for memoryDiagnostics"],
+        blocked_kind=BlockedKind.SAFETY_SETTLED,
+        safety_only=True,
+        safety_steps=[
+            workflow_step(WorkflowOperation.FREEZE_EVIDENCE),
+            workflow_step(WorkflowOperation.MARK_UNSCHEDULABLE),
+            workflow_step(WorkflowOperation.QUARANTINE),
+        ],
+        execution_epoch=1,
+        completed_step_indexes=[0, 1, 2],
+        completed_operations=[
+            WorkflowOperation.FREEZE_EVIDENCE,
+            WorkflowOperation.MARK_UNSCHEDULABLE,
+            WorkflowOperation.QUARANTINE,
+        ],
+        step_executions=[
+            workflow_step_execution(
+                0, WorkflowOperation.FREEZE_EVIDENCE, phase="safety"
+            ),
+            workflow_step_execution(
+                1, WorkflowOperation.MARK_UNSCHEDULABLE, phase="safety"
+            ),
+            workflow_step_execution(2, WorkflowOperation.QUARANTINE, phase="safety"),
+        ],
+    )
+
+    dispatcher(store).run_once()
+
+    assert store.get_workflow(WORKFLOW).status is WorkflowStatus.BLOCKED
+    assert reconcile_events(store) == []
+    assert store.get_incident(INCIDENT) == incident, "the incident is not written"
+
+    # The operator's exit (a validated restore, or a close on node evidence)
+    # recovers the incident; only then does the settled-incident shape end it.
+    store.save_incident(
+        incident.model_copy(update={"state": IncidentState.RECOVERED}),
+        expected=incident,
+    )
+    dispatcher(store).run_once()
+    ended = store.get_workflow(WORKFLOW)
+    assert ended.status is WorkflowStatus.SUPERSEDED
+    assert SETTLED_CLOSE_MARKER in (ended.preemption_reason or "")
+    assert "memoryDiagnostics" in (ended.preemption_reason or "")

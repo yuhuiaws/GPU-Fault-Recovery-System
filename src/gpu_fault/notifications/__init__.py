@@ -97,6 +97,10 @@ _EXPORTS = {
         "gpu_fault.notifications.diagnostic_inconclusive",
         "DiagnosticInconclusiveEmailBuilder",
     ),
+    "ContainedOperatorHandoffEmailBuilder": (
+        "gpu_fault.notifications.contained_operator_handoff",
+        "ContainedOperatorHandoffEmailBuilder",
+    ),
     "RestartGuardEmailBuilder": (
         "gpu_fault.notifications.restart_guard",
         "RestartGuardEmailBuilder",

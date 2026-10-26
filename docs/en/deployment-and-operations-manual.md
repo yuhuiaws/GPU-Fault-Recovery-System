@@ -8630,7 +8630,13 @@ NCCL/EFA hung diagnostic DAG uses `hung-support-handoff-zh-v1`, category `OPERAT
 `<cluster>/<incident>/hung-support-handoff/<workflow>`: the body states that the diagnostic is read-only (nothing cordoned, quarantined,
 stopped, reset or rebooted), lists each evidence step's result with its record key, the diagnostic bundle archive references with their
 sha256, the task-port fabric verdict (each node's reason for an UNKNOWN or partial scope) and the operator's next steps; every other support
-escalation still uses `hardware-escalation-zh-v3`, and XID 74 `xid74-support-zh-v3`. The regional executor only executes actions and writes the
+escalation still uses `hardware-escalation-zh-v3`, and XID 74 `xid74-support-zh-v3`. When a plan refused only for a
+missing executable owner (a Runtime Profile capability declared OBSERVE, such as `memoryDiagnostics`) has run its
+containment prefix and the record stops `BLOCKED/SAFETY_SETTLED` (incident `QUARANTINED`), the executor sends
+`contained-operator-handoff-zh-v1`, category `OPERATOR_REVIEW`, subject `[GPU FAULT][contained, operator action
+required] <cluster>: <nodes>`, deduplication key `<cluster>/<incident>/contained-operator-handoff/<workflow>`: the body
+names the cordoned + quarantined nodes, the steps run and not run, the capability without an owner, the `blocked_reasons`
+and the two exits (`submit-remediation --disposition restore`; a close on the departure proof once the node is replaced). The regional executor only executes actions and writes the
 notification ID/action result back to Aurora; notifications are always sent by the regional control-plane dispatcher, and the GPU
 cluster executor needs no SNS or SES permission.
 

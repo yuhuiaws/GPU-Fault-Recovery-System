@@ -490,7 +490,7 @@ The implementation splits it into three orthogonal state machines + several loca
 stateDiagram-v2
     [*] --> DETECTED: normalization + policy produces finding
     DETECTED --> ACTION_PENDING: official action is executable
-    DETECTED --> SAFETY_PENDING: only site-safety actions allowed
+    DETECTED --> SAFETY_PENDING: only site-safety actions allowed, or the plan is refused only for a missing executable owner and its containment prefix compiles
     ACTION_PENDING --> QUARANTINED: isolation step completed / repair did not pass
     SAFETY_PENDING --> QUARANTINED: safety step completed
     ACTION_PENDING --> RECOVERED: validation passed + isolation lifted

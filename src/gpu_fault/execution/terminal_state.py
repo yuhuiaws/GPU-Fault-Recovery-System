@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -171,12 +171,16 @@ def terminal_decision(
     incident_state: IncidentState | None = None,
     updates: Mapping[str, object] | None = None,
     predecessor: WorkflowRequest | None = None,
+    incident_reasons: Sequence[str] = (),
 ) -> TerminalDecision:
     """Build new records without changing the input records or writing anything.
 
     ``predecessor`` is the incident's previous workflow when this record names
     one: isolation it left on the nodes keeps the incident QUARANTINED whatever
     this record's own steps say (``predecessor_holds_isolation``).
+    ``incident_reasons`` are appended to the incident in the same write (a
+    settled containment prefix names the node contained and the capability an
+    operator owns); the inconclusive-diagnostic reason is derived here.
     """
 
     if has_unresolved_node_action(workflow):
@@ -233,10 +237,11 @@ def terminal_decision(
         )
     if incident is not None:
         update: dict[str, Any] = {"state": derived_state, "updated_at": now}
+        appended = list(incident_reasons)
         if inconclusive:
-            update["reasons"] = bounded_reasons(
-                [*incident.reasons, inconclusive_reason(reason)]
-            )
+            appended.append(inconclusive_reason(reason))
+        if appended:
+            update["reasons"] = bounded_reasons([*incident.reasons, *appended])
         incident = incident.model_copy(update=update)
     details: dict[str, Any] = {
         "execution_epoch": execution_epoch,

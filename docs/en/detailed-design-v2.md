@@ -1670,6 +1670,16 @@ Two additions after the control-plane review of 2026-09-08:
   recompiles in place under the original id (history preserved, generation +1), and once the workload becomes ACTIVE `compile_steps` passes
   naturally. As a result, the operations `compile-blocked` mode only has to handle NEEDS_OPERATOR /
   INTERNAL_ERROR records **that have run steps**.
+- **A plan refused only for a missing executable owner contains first, then blocks** (live 2026-10-26: on plain EKS a CRITICAL
+  `row_remap_failure` RMA drain blocked whole at compile time for `memoryDiagnostics: OBSERVE`, the node stayed schedulable
+  with no evidence frozen, and the sweep closed the record as one that "never changed a node"): the node-health and
+  node-lifecycle families now write the containment/evidence prefix compiled before the first unowned step
+  (FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → QUARANTINE [terminal-quarantine parameters kept] → COLLECT_DIAGNOSTIC_BUNDLE)
+  as `safety_steps` of a `SAFETY_PENDING` record (`WorkflowBuilder.containment_before_block`); the executor runs the prefix
+  and settles it `BLOCKED/SAFETY_SETTLED` with the incident `QUARANTINED` -- the fault family's safety-plan shape. The
+  record ran steps, so the compile-time sweep leaves it alone; the exit is the validated restore of §9.2 or the QUARANTINED
+  branch of §9.1. A plan whose first step is unowned, one with any other refusal as well (UNKNOWN workload, ARCH-B2), a
+  containment-only plan and a hung-triage DAG keep their previous behaviour.
 
 **⑨ Configuration parameters** — `GPU_FAULT_FAULT_ACTION_MAX_AGE_SECONDS=900`,
 `GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS=1800`,
@@ -2144,13 +2154,19 @@ PagerDuty, Slack or webhook integration (§11).
 **② Inputs and outputs**: in: notification records produced by orchestration and periodic tasks. Out: SNS publishes or SES emails; the database keeps the notification
 records and their delivery status.
 
-**③ Internal components**: `src/gpu_fault/notifications/registry.py` registers **21** notification template kinds
+**③ Internal components**: `src/gpu_fault/notifications/registry.py` registers **22** notification template kinds
 (XID investigation, SXID events, DCGM diagnostics, EFA/RDMA, NVLink7.4 mechanical parts and support, hardware upgrade and inventory,
 host resources, HyperPod advisory, warm spare, reboot guard, not-applicable notes, and so on, plus `DIAGNOSTIC_INCONCLUSIVE`, added by the control-plane review of 2026-09-08:
 template `diagnostic-inconclusive-zh-v1`, category `ADVISORY`,
 emitted when a workflow containing only forensic/diagnostic/validation steps ends FAILED, see §6.3; and `HUNG_SUPPORT_HANDOFF`: template
 `hung-support-handoff-zh-v1`, category `OPERATOR_REVIEW`, emitted by the `ESCALATE_SUPPORT` of the read-only NCCL/EFA hung diagnostic DAG
-in place of the hardware-escalation mail it used to send by mistake, see §6.3);
+in place of the hardware-escalation mail it used to send by mistake, see §6.3; and `CONTAINED_OPERATOR_HANDOFF`: template
+`contained-operator-handoff-zh-v1`, category `OPERATOR_REVIEW`, deduplication key
+`<cluster>/<incident>/contained-operator-handoff/<workflow>`, sent by the executor after the terminal write when a plan refused
+only for a missing executable owner has run its containment prefix and settled `BLOCKED/SAFETY_SETTLED`: the body names the
+cordoned + quarantined nodes, the steps run and not run, the capability without an owner and the two exits (§9.2 restore, the
+QUARANTINED branch of §9.1); its template and version live in `notifications/contained_operator_handoff.py` for the same reason
+as `HUNG_SUPPORT_HANDOFF`);
 `channel.py` selects the channel, `sns.py` / `ses.py` perform delivery, and `common.py` handles convergence and deduplication.
 The `HUNG_SUPPORT_HANDOFF` template and version live in `notifications/hung_support.py` rather than `common.py`: `common.py` also ships in the
 cluster executor wheel, and this notice is built and sent by the control plane alone.
@@ -3176,6 +3192,11 @@ one workflow per incident, it simultaneously starves the successor the incident 
   (`gpu_fault.orphaned_commands`), written with actor `dispatcher` onto
   `OPERATOR_RECONCILED` events. Every actual use of these modes was to unblock a release preflight, and the decisions
   are all Store predicates, so the runtime does them itself; the administrator command keeps only the one shape that needs GPU node evidence.
+  Since 2026-10-26 the compile-time shape is only a record whose first step is unowned or that has another refusal as well: a plan
+  refused **only** for a missing executable owner, with an isolation compiled before the first unowned step, first runs that
+  containment prefix as `SAFETY_PENDING` and then settles `BLOCKED/SAFETY_SETTLED` (incident `QUARANTINED`,
+  `WorkflowBuilder.containment_before_block`); it ran steps and changed a node, `never_dispatched_reasons` refuses the sweep on
+  exactly that, and the second/third shapes end it after the operator's restore or incident close.
   In that shape (`--close-quarantined`), when the node has no cordon, no quarantine taint of this incident, yet still carries this
   incident's isolation annotations (the operator manually removed the taint without touching the annotations), the administrator layer first uses a merge patch with a `resourceVersion`
   precondition to strip the three annotations, then re-reads the node and hands it to the Pod decision (`orphaned_isolation_nodes`);
@@ -3589,8 +3610,8 @@ workflow), `BLOCKED_MISSING_EVIDENCE` (missing evidence), `NOT_APPLICABLE` (not 
 |---|---|---|---|---|
 | → `DETECTED` | Event passes admission, decision completes, marker written | Create incident, `incident_by_event` link, send investigation-class notification | Incident persisted | Link conflict → decision `duplicate=true`, no new incident |
 | `DETECTED` → `DETECTED` | Correlation window not yet finalized (`companionWindowSeconds: 30`) | Companion events merge into the same incident, `reasons` accumulate | `xid_correlation.status=FINALIZED` | When the window `deadline` is reached the `gpu-fault-xid-correlation` thread force-finalizes; the lease guarantees a single finalize |
-| `DETECTED` → `ACTION_PENDING` | `disposition=EXECUTABLE` | Build `RecoveryPlan` + `WorkflowRequest`, issue fencing token | Workflow persisted with `status=PENDING` | Cannot be built (missing capability) → `BLOCKED` |
-| `DETECTED` → `SAFETY_PENDING` | `disposition=SITE_SAFETY` or `blocked_reasons` non-empty | Execute only `safety_steps` | Safety steps complete | Failure → `ESCALATED` |
+| `DETECTED` → `ACTION_PENDING` | `disposition=EXECUTABLE` | Build `RecoveryPlan` + `WorkflowRequest`, issue fencing token | Workflow persisted with `status=PENDING` | Cannot be built (missing capability) → `BLOCKED` when the first step is unowned or any other refusal stands (UNKNOWN workload, missing profile); refused **only** for a missing executable owner with a compiled containment prefix → `SAFETY_PENDING` (next row) |
+| `DETECTED` → `SAFETY_PENDING` | `disposition=SITE_SAFETY` or `blocked_reasons` non-empty (the fault family's fixed safety steps; since 2026-10-26 the node-health and node-lifecycle families too: when a plan is refused **only** for `no executable owner for <capability>` and an isolation compiled before the first unowned step, `safety_steps` = that prefix's FREEZE_EVIDENCE / MARK_UNSCHEDULABLE / QUARANTINE / COLLECT_DIAGNOSTIC_BUNDLE / TRIGGER_HEALTH_SNAPSHOT, `WorkflowBuilder.containment_before_block`; STOP_WORKLOADS is never in the prefix) | Execute only `safety_steps` | Safety steps complete → workflow `BLOCKED/SAFETY_SETTLED`, incident `QUARANTINED`; the missing-owner shape also writes "contained + which capability waits for an operator" into the incident `reasons` and sends `contained-operator-handoff-zh-v1` | Failure → `ESCALATED` |
 | `DETECTED` → `RECOVERED` | `MONITOR_ONLY` / `NOT_APPLICABLE` | Only write marker and notification, leave the node untouched | Marker persisted | — |
 | `ACTION_PENDING` → `QUARANTINED` | Plan contains `MARK_UNSCHEDULABLE` / `QUARANTINE` | One patch writes: `unschedulable=true`, the `gpu-fault.io/quarantined=incident-<sha256[:24]>` taint, and the three ownership annotations (see §9.4); then `STOP_WORKLOADS` | Node `unschedulable=true` and taint present | `resourceVersion` conflict retried; RBAC 403 → step `FAILED` |
 | `ACTION_PENDING` / `QUARANTINED` → `RECOVERED` | All steps `SUCCEEDED`, and the `VALIDATE_*` conclusion is PASS (the inventory requirement of `VALIDATE_GPU`/`VALIDATE_FABRIC` is frozen from the finding's configured value; at check time it is capped at the physical count from the instance-type list and `inventory_requirement_clamped` is recorded: a configured value above the physical ceiling is a configuration error and must not turn into a replace/support escalation chain) | `RESTORE_SCHEDULING`: after verifying ownership, one patch clears the taint + restores `unschedulable` to the value recorded before isolation + clears the three annotations; marker set to `active=false`. A workflow containing only evidence/diagnostics/validation (no isolation) likewise leaves the incident RECOVERED on success, and the executor's terminal hook `IncidentClosureService.on_terminal` immediately retires its marker (`retired_at/retired_reason/retired_by`, ARCH-I4) instead of leaving it to the TTL | Node has no `gpu-fault.io/quarantined` taint and scheduling state is back to pre-isolation | Validation conclusion `INCONCLUSIVE`/`BLOCKED`/`QUARANTINED` → **not released**, stays in `QUARANTINED` |

@@ -9,13 +9,17 @@ from gpu_fault.gpu_fabric_manager import graded_fabric_gpus
 from gpu_fault.models import (
     CapabilityMode,
     CapabilityName,
+    EffectiveRuntimeProfile,
     FaultIncident,
     RecoveryAction,
     WorkflowOperation,
     WorkflowStepSpec,
     WorkloadState,
 )
-from gpu_fault.operation_registry import NODE_MUTATING_OPERATIONS
+from gpu_fault.operation_registry import (
+    NODE_MUTATING_OPERATIONS,
+    OPERATION_CAPABILITY,
+)
 from gpu_fault.orchestration.xid45_policy import observe_only, solo_restart_fm
 from gpu_fault.policy import (
     NVIDIA_CODE_SPECIFIC_FULL_RESET_SXIDS,
@@ -30,8 +34,126 @@ from gpu_fault.policy import (
 # UNKNOWN workload state; the fault family has spelt it this way since the
 # coordinator first carried the gate, so operators and tests match on it.
 WORKLOAD_STATE_UNKNOWN_REASON = "node workload state is UNKNOWN"
+#: The compiler's refusal for an operation whose capability the Runtime
+#: Profile declares without an executable owner (OBSERVE, or not claimed):
+#: ``no executable owner for <capability>``. ``compile_blocked`` and the
+#: release preflight match on it; ``missing_owner_capabilities`` reads it back.
+MISSING_OWNER_REASON = "no executable owner for "
+#: The operations a plan refused only for missing owners may still run before
+#: the block: the fault family's safety set (FREEZE_EVIDENCE,
+#: MARK_UNSCHEDULABLE, QUARANTINE) plus the read-only evidence capture a plan
+#: orders before its unowned step. Never STOP_WORKLOADS (a stop is a
+#: remediation decision the operator now owns, the line the safety plan draws
+#: too), never RESTORE_SCHEDULING (it would release what was just held), never
+#: a node-mutating operation (a quiesce without its restore, a reset without
+#: its validation). Pinned by ``tests/orchestration/
+#: test_containment_before_compile_block.py``.
+CONTAINMENT_PREFIX_OPERATIONS = frozenset(
+    {
+        WorkflowOperation.FREEZE_EVIDENCE,
+        WorkflowOperation.MARK_UNSCHEDULABLE,
+        WorkflowOperation.QUARANTINE,
+        WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE,
+        WorkflowOperation.TRIGGER_HEALTH_SNAPSHOT,
+    }
+)
+#: What makes a prefix *containment*: without one of these the prefix only
+#: observed the node, and a settled safety plan would call the incident
+#: QUARANTINED over a node nothing isolated.
+ISOLATION_OPERATIONS = frozenset(
+    {WorkflowOperation.MARK_UNSCHEDULABLE, WorkflowOperation.QUARANTINE}
+)
 #: The catalog's "Solo: RESTART_FM" (XID 45).
 RESTART_FABRIC_MANAGER_ACTION = "RESTART_FM"
+
+
+def missing_owner_capabilities(reasons: Sequence[str]) -> list[str]:
+    """The capabilities named by the ``no executable owner for`` reasons in
+    ``reasons``, in order, each once."""
+
+    return list(
+        dict.fromkeys(
+            reason[len(MISSING_OWNER_REASON) :].strip()
+            for reason in reasons
+            if reason.startswith(MISSING_OWNER_REASON)
+        )
+    )
+
+
+def blocked_only_by_missing_owners(reasons: Sequence[str]) -> bool:
+    """Whether every reason in ``reasons`` is a missing executable owner.
+
+    This is the one refusal the containment prefix answers: the plan would
+    have run had the profile declared the owner, so what precedes the unowned
+    step is safe to run on its own. Any other reason -- the UNKNOWN workload
+    state (ARCH-B2), a missing profile, a missing GPU identity -- says the plan
+    itself is in doubt, and the record keeps the compile-time block.
+    """
+
+    return bool(reasons) and all(
+        reason.startswith(MISSING_OWNER_REASON) for reason in reasons
+    )
+
+
+def containment_prefix(steps: Sequence[WorkflowStepSpec]) -> list[WorkflowStepSpec]:
+    """The containment-and-evidence steps of ``steps`` (the compiled steps
+    before a plan's first unowned operation), or ``[]`` when they isolate
+    nothing.
+
+    Order is kept: the plan put evidence before the cordon and the cordon
+    before the quarantine for a reason.
+    """
+
+    prefix = [step for step in steps if step.operation in CONTAINMENT_PREFIX_OPERATIONS]
+    if not any(step.operation in ISOLATION_OPERATIONS for step in prefix):
+        return []
+    return prefix
+
+
+def containment_handoff_reason(
+    containment: Sequence[WorkflowStepSpec],
+    steps: Sequence[WorkflowStepSpec],
+    errors: Sequence[str],
+    operations: Sequence[WorkflowOperation],
+) -> str:
+    """The incident reason a plan writes when it contains before it blocks.
+
+    Names what runs first, what waits for an operator and why -- so the
+    incident reads "contained, then handed over" rather than "escalated" alone:
+    ``containment runs first (FREEZE_EVIDENCE -> MARK_UNSCHEDULABLE ->
+    QUARANTINE); RUN_FIELD_DIAGNOSTIC -> VALIDATE_GPU -> ESCALATE_SUPPORT wait
+    for an operator: no executable owner for memoryDiagnostics``.
+    """
+
+    ran = {step.operation for step in containment}
+    compiled = [step.operation for step in steps]
+    unowned = set(operations_without_owner(missing_owner_capabilities(errors)))
+    waiting = [
+        operation
+        for operation in operations
+        if operation not in ran and (operation in compiled or operation in unowned)
+    ]
+    return (
+        "containment runs first ("
+        + " -> ".join(step.operation.value for step in containment)
+        + "); "
+        + (" -> ".join(operation.value for operation in waiting) or "the rest")
+        + " wait for an operator: "
+        + "; ".join(errors)
+    )
+
+
+def operations_without_owner(capabilities: Sequence[str]) -> list[WorkflowOperation]:
+    """The operations whose capability is one of ``capabilities`` (values of
+    ``CapabilityName``), in registry order -- what an operator reads as "the
+    step that needs me" next to a ``no executable owner for`` reason."""
+
+    wanted = set(capabilities)
+    return [
+        operation
+        for operation, capability in OPERATION_CAPABILITY.items()
+        if capability.value in wanted
+    ]
 
 
 def parse_sxid_codes(name: str) -> set[int]:
@@ -808,6 +930,11 @@ class WorkflowBuilder:
         through -- so a reboot, a driver remediation or a plugin restart
         cannot run under a training job nobody stopped (ARCH-B2). Containment
         is exempt for the reason ``mutates_node`` gives.
+
+        An operation without an executable owner is left out of ``steps`` and
+        named in ``errors`` (``MISSING_OWNER_REASON``); the steps before the
+        first such operation compiled one to one, which is what
+        ``containment_before_block`` relies on.
         """
 
         steps = []
@@ -818,7 +945,7 @@ class WorkflowBuilder:
             capability = self.operation_capability[operation]
             owner = self.owner(profile, capability)
             if owner is None:
-                errors.append(f"no executable owner for {capability.value}")
+                errors.append(f"{MISSING_OWNER_REASON}{capability.value}")
                 continue
             steps.append(
                 WorkflowStepSpec(
@@ -830,6 +957,52 @@ class WorkflowBuilder:
                 )
             )
         return steps, errors
+
+    def first_unowned_index(
+        self,
+        operations: Sequence[WorkflowOperation],
+        profile: EffectiveRuntimeProfile | None,
+    ) -> int | None:
+        """The position in ``operations`` of the first operation ``profile``
+        gives no executable owner, or ``None`` when every one is owned."""
+
+        for index, operation in enumerate(operations):
+            if self.owner(profile, self.operation_capability[operation]) is None:
+                return index
+        return None
+
+    def containment_before_block(
+        self,
+        operations: Sequence[WorkflowOperation],
+        profile: EffectiveRuntimeProfile | None,
+        steps: Sequence[WorkflowStepSpec],
+        errors: Sequence[str],
+    ) -> list[WorkflowStepSpec]:
+        """The containment a plan refused only for missing owners runs first.
+
+        ``steps`` are the compiled (and, by the family, enriched) steps of
+        ``operations``; ``errors`` every reason the plan cannot run. Returns
+        the containment-and-evidence prefix -- the compiled steps before the
+        first unowned operation, kept to ``CONTAINMENT_PREFIX_OPERATIONS`` --
+        when every error is a missing owner and that prefix isolates the node;
+        ``[]`` otherwise, which leaves the family its compile-time block.
+
+        Live 2026-10-26 (gpu-eks-cluster, R13g): a CRITICAL ``row_remap_failure``
+        compiled FREEZE_EVIDENCE -> MARK_UNSCHEDULABLE -> QUARANTINE ->
+        COLLECT_DIAGNOSTIC_BUNDLE -> RUN_FIELD_DIAGNOSTIC -> ... under a profile
+        with ``memoryDiagnostics: OBSERVE``; the whole record blocked at compile
+        time for the one unowned step and the node stayed schedulable with no
+        evidence frozen. A plan whose first step is unowned has no prefix; a
+        containment-only plan has no error; a plan refused for anything else
+        is not this shape.
+        """
+
+        if not blocked_only_by_missing_owners(errors):
+            return []
+        index = self.first_unowned_index(operations, profile)
+        if not index:
+            return []
+        return containment_prefix(list(steps)[:index])
 
     def mutates_node(
         self,

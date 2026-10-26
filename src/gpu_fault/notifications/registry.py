@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from gpu_fault.notifications.contained_operator_handoff import (
+    ContainedOperatorHandoffEmailBuilder,
+)
 from gpu_fault.notifications.dcgm_diagnostic import (
     DcgmDiagnosticEmailBuilder,
 )
@@ -62,6 +65,7 @@ class NotificationKind(StrEnum):
     GPU_RESET_COMPLETED = "GPU_RESET_COMPLETED"
     DCGM_DIAGNOSTIC = "DCGM_DIAGNOSTIC"
     DIAGNOSTIC_INCONCLUSIVE = "DIAGNOSTIC_INCONCLUSIVE"
+    CONTAINED_OPERATOR_HANDOFF = "CONTAINED_OPERATOR_HANDOFF"
     HARDWARE_ESCALATION = "HARDWARE_ESCALATION"
     HUNG_SUPPORT_HANDOFF = "HUNG_SUPPORT_HANDOFF"
     NVLINK74_SUPPORT = "NVLINK74_SUPPORT"
@@ -124,6 +128,9 @@ NOTIFICATION_REGISTRY = {
     ),
     NotificationKind.DIAGNOSTIC_INCONCLUSIVE: NotificationDefinition(
         DiagnosticInconclusiveEmailBuilder
+    ),
+    NotificationKind.CONTAINED_OPERATOR_HANDOFF: NotificationDefinition(
+        ContainedOperatorHandoffEmailBuilder
     ),
     NotificationKind.HARDWARE_ESCALATION: NotificationDefinition(
         HardwareEscalationEmailBuilder

@@ -24,6 +24,7 @@ from gpu_fault.execution.config import (
     MAX_DAG_STEPS as MAX_DAG_STEPS,
     ProductionExecutorConfig,
 )
+from gpu_fault.execution.contained_handoff import settled_handoff
 from gpu_fault.execution.flat_step_failure import fail_flat_step
 from gpu_fault.execution.fleet_preflight import held_workflow_result
 from gpu_fault.execution.hung_classification import (
@@ -60,7 +61,7 @@ from gpu_fault.execution.transient_errors import (
 from gpu_fault.execution.workflow_notifications import (
     NotificationSender,
     TerminalHook as TerminalHook,
-    close_inconclusive_diagnostic,
+    after_terminal_write,
     notify_terminal_hooks,
     persist_spare_completion,
 )
@@ -82,6 +83,7 @@ from gpu_fault.models import (
     resolved_step_indexes,
 )
 from gpu_fault.notifications import (
+    ContainedOperatorHandoffEmailBuilder,
     DiagnosticInconclusiveEmailBuilder,
     RestartGuardEmailBuilder,
     WarmSpareReplacementEmailBuilder,
@@ -239,6 +241,9 @@ class ProductionWorkflowExecutor:
         self.diagnostic_inconclusive_email_builder = (
             DiagnosticInconclusiveEmailBuilder()
         )
+        # The hand-off of a settled containment prefix whose plan needs an
+        # operator (``execution/contained_handoff.py``).
+        self.contained_handoff_email_builder = ContainedOperatorHandoffEmailBuilder()
         # The budget-exhausted mail: sent by the restart preflight, which is
         # the only site that refuses a restart for a spent budget, using the
         # same template the restart adapters carry rather than a second one.
@@ -2073,6 +2078,8 @@ class ProductionWorkflowExecutor:
         if updates:
             workflow = workflow.model_copy(update=dict(updates))
         workflow = refresh_remote_action_state(self.store, workflow)
+        # A settled containment prefix names its hand-off in the terminal write.
+        handoff = settled_handoff(workflow, status)
         decision = terminal_state.terminal_decision(
             workflow,
             incident,
@@ -2083,18 +2090,12 @@ class ProductionWorkflowExecutor:
             actor=actor or self.config.executor_id,
             now=datetime.now(timezone.utc),
             predecessor=self._terminal_predecessor(workflow),
+            incident_reasons=handoff.incident_reasons if handoff else (),
         )
         incident_written = self._save_terminal(
             decision.workflow, decision.incident, execution_epoch
         )
-        if (
-            decision.diagnostic_inconclusive
-            and decision.incident is not None
-            and incident_written
-        ):
-            self._close_inconclusive_diagnostic(
-                decision.workflow, decision.incident, decision.error
-            )
+        after_terminal_write(self, decision, handoff, incident_written)
         return self._result(decision.workflow, decision.incident, error=decision.error)
 
     def _terminal_predecessor(
@@ -2106,22 +2107,6 @@ class ProductionWorkflowExecutor:
             return self.store.get_workflow(workflow.predecessor_workflow_id)
         except NotFoundError:
             return None
-
-    def _close_inconclusive_diagnostic(
-        self,
-        workflow: WorkflowRequest,
-        incident: FaultIncident,
-        error: str | None,
-    ) -> None:
-        close_inconclusive_diagnostic(
-            self.store,
-            workflow,
-            incident,
-            error,
-            actor=self.config.executor_id,
-            builder=self.diagnostic_inconclusive_email_builder,
-            sender=self.notification_sender,
-        )
 
     @classmethod
     def _terminal_incident_state(

@@ -9,6 +9,19 @@ incident's operator runs finds no isolation from this incident to undo, so no
 verified restore successor ever appears, and the restore reconcile refuses it by
 design (no source plan to carry the audit).
 
+Since 2026-10-26 that shape is the exception rather than the rule for a missing
+owner: a plan refused *only* for missing owners whose owned steps before the
+first unowned one isolate the node runs that containment first, as the fault
+family's safety plan always did -- SAFETY_PENDING, then BLOCKED/SAFETY_SETTLED
+with the incident QUARANTINED (``WorkflowBuilder.containment_before_block``;
+live, gpu-eks-cluster: a CRITICAL ``row_remap_failure`` whose RMA drain blocked
+at compile time for ``memoryDiagnostics`` and left the node schedulable). Such
+a record ran steps, so ``never_dispatched_reasons`` refuses it here; the
+settled-incident and verified-restore shapes below end it once its operator
+restored or closed the incident. What still blocks at compile time -- and is
+still this sweep's -- is a plan whose first step is unowned, or one refused for
+any other reason (the UNKNOWN workload state, a missing profile).
+
 Meanwhile the release preflight (``workflow_safety``) counted it as an active
 destructive workflow, so the record blocked exactly the release that would add
 the missing owner. Observed live on a regional site: a ``REMEDIATE_EFA_DRIVER``

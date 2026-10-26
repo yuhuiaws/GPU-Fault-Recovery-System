@@ -23,11 +23,13 @@ from gpu_fault.models import (
     WorkflowOperation,
     WorkflowRequest,
     WorkflowStatus,
+    WorkflowStepSpec,
     WorkloadState,
     bounded_reasons,
 )
 from gpu_fault.orchestration.families.identity import derived_record_id
 from gpu_fault.orchestration.reboot_window import RebootOwner, absorb_finding
+from gpu_fault.orchestration.workflow_builder import containment_handoff_reason
 from gpu_fault.regional_compatibility import ACTIVATION_INHIBITION_VERSION
 from gpu_fault.store import NotFoundError
 from gpu_fault.workflow_quarantine import (
@@ -158,13 +160,38 @@ class NodeHealthPlanBuilder:
             finding,
             context.hung_triage_requested,
         )
-        steps, errors = self._compile_steps(
+        steps, errors, containment = self._compile_steps(
             finding,
             context,
             incident,
             operations,
         )
-        workflow_status = WorkflowStatus.BLOCKED if errors else WorkflowStatus.PENDING
+        # A plan refused only for a missing executable owner runs the
+        # containment it compiled before it blocks: SAFETY_PENDING with the
+        # prefix as its safety steps, the fault family's safety-plan shape
+        # (``WorkflowBuilder.containment_before_block``). The executor settles
+        # it BLOCKED/SAFETY_SETTLED with the incident QUARANTINED -- the
+        # documented operator hand-off (validated restore, or a close on node
+        # evidence) -- instead of the compile-time block that left a CRITICAL
+        # row-remap failure's node schedulable (live 2026-10-26).
+        if errors and containment:
+            workflow_status = WorkflowStatus.SAFETY_PENDING
+            incident = incident.model_copy(
+                update={
+                    "reasons": bounded_reasons(
+                        [
+                            *incident.reasons,
+                            containment_handoff_reason(
+                                containment, steps, errors, operations
+                            ),
+                        ]
+                    )
+                }
+            )
+        elif errors:
+            workflow_status = WorkflowStatus.BLOCKED
+        else:
+            workflow_status = WorkflowStatus.PENDING
         workflow = WorkflowRequest(
             # Derived from the event, like the incident's ``inc-<event_id>``:
             # a rebuild after a dangling link re-creates the same record
@@ -178,12 +205,20 @@ class NodeHealthPlanBuilder:
                 finding.official_action or finding.recommended_action.value
             ),
             fencing_token=incident.fencing_token,
+            safety_steps=(
+                containment if workflow_status is WorkflowStatus.SAFETY_PENDING else []
+            ),
+            safety_only=workflow_status is WorkflowStatus.SAFETY_PENDING,
             official_steps=steps,
             dag_enabled=context.hung_triage_requested,
             dag_revision=1 if context.hung_triage_requested else 0,
             predecessor_workflow_id=None,
             blocked_reasons=errors,
-            blocked_kind=(BlockedKind.NEEDS_OPERATOR if errors else None),
+            blocked_kind=(
+                BlockedKind.NEEDS_OPERATOR
+                if workflow_status is WorkflowStatus.BLOCKED
+                else None
+            ),
             created_at=now,
             updated_at=now,
         )
@@ -592,7 +627,13 @@ class NodeHealthPlanBuilder:
         context: HealthBuildContext,
         incident: FaultIncident,
         operations: list[WorkflowOperation],
-    ) -> tuple[list, list[str]]:
+    ) -> tuple[list, list[str], list[WorkflowStepSpec]]:
+        """``(steps, errors, containment)``: the compiled official steps, why
+        the plan cannot run, and the containment prefix it runs first when the
+        only reason is a missing executable owner
+        (``WorkflowBuilder.containment_before_block``; ``[]`` otherwise, and
+        always for a hung-triage DAG, whose steps the DAG rewrite owns)."""
+
         profile, errors = self._profile(finding)
         if (
             finding.recommended_action is RecoveryAction.RESET_GPU
@@ -644,7 +685,14 @@ class NodeHealthPlanBuilder:
             errors.extend(triage_errors)
         steps = self._resource_escalation(steps, finding)
         errors.extend(compile_errors)
-        return steps, errors
+        containment = (
+            []
+            if context.hung_triage_requested
+            else self.workflow_builder.containment_before_block(
+                operations, profile, steps, errors
+            )
+        )
+        return steps, errors, containment
 
     def _profile(
         self,
@@ -1072,7 +1120,15 @@ class NodeHealthIngestionService:
                         incumbent,
                     )
                 )
-        state = IncidentState.ESCALATED if errors else IncidentState.ACTION_PENDING
+        if finalized_workflow.status is WorkflowStatus.SAFETY_PENDING:
+            # The containment prefix runs first; the incident follows the
+            # fault family's shape (``_incident_state_for_workflow``) and
+            # settles QUARANTINED with the record (``terminal_incident_state``).
+            state = IncidentState.SAFETY_PENDING
+        elif errors:
+            state = IncidentState.ESCALATED
+        else:
+            state = IncidentState.ACTION_PENDING
         return (
             finalized_incident.model_copy(
                 update={

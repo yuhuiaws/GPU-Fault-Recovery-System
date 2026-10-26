@@ -2848,7 +2848,14 @@ reset 需 `--approve GPU_RESET`（024 `wrong_scope_source` 的修复 GPU 自己�
 该类变体需 `--approve GPU_FULL_FABRIC_RESET`（`recovery_failure` 另需
 `NODE_REBOOT`）并在两集群各车道的独占节点跑（X 标志持全部锁）；022 的 XID 联合变体只把 DCGM last-XID
 gauge 回放为 XID 32（`--approve DCGM_XID_GAUGE`）；019 `remap_failure` 的 RMA 现场
-诊断需 `GPU_FIELD_DIAGNOSTIC`。延后：019 `pending_unsupported`（无旧架构卡）、
+诊断需 `GPU_FIELD_DIAGNOSTIC`。现网两套 profile 都把 `memoryDiagnostics` 声明为 OBSERVE：2026-10-26 06:25Z plain EKS 上该变体
+整条计划在编译期 BLOCKED（`no executable owner for memoryDiagnostics`）、节点保持可调度、清扫按「从未改动节点」
+关闭、incident 只显示 ESCALATED；产品修复（R13h）后预期为：FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → QUARANTINE →
+COLLECT_DIAGNOSTIC_BUNDLE 实际执行（节点 cordon + taint、不停作业），记录 `BLOCKED/SAFETY_SETTLED`、incident
+`QUARANTINED`、收到 `contained-operator-handoff-zh-v1`；变体的恢复阶段应是 `submit-remediation --disposition restore`
+（validated restore 现在接受该记录：`SAFETY_SETTLED` 不是 `NEEDS_OPERATOR`，`workflow_recovery_error` 不再报
+「workflow still owns recovery」），不是关闭 ESCALATED incident；该记录在 incident 收口前被发布前置 `workflow_safety`
+计为 blocker。延后：019 `pending_unsupported`（无旧架构卡）、
 `observe_profile`（无 OBSERVE reset Profile）记 `CAPABILITY_ABSENT`。
 
 **复用 K 车道的独立可信内核 XID**（020 `independent_fatal_event`、024

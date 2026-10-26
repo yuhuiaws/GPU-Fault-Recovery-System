@@ -1201,6 +1201,10 @@ rules:
       - tests/admin/test_node_action_confirmation.py
       - tests/execution/test_orphaned_commands_sweep.py
       - tests/orchestration/test_confirmed_node_action_release_path.py
+      # A plan refused only for a missing owner now contains first and settles
+      # BLOCKED/SAFETY_SETTLED: the sweep must leave it to its operator's exit.
+      - tests/execution/test_contained_operator_handoff.py
+      - tests/orchestration/test_contained_operator_block_release_path.py
       - tests/store/test_reconcile_epoch_cas.py
       - tests/store/test_reconcile_narrow_reads.py
       - tests/store/test_blocked_backlog_gauge.py
