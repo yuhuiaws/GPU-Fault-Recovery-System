@@ -2904,55 +2904,77 @@ in the case's `probe-error.json`
 (`tests/regional/test_general_live_dcgm_deploy_profile.py`). The trio is to be
 re-run on both clusters.
 
-019 `remap_failure`'s recovery stage is the operator exit, not a validated
-restore (live 2026-10-26, plain EKS ip-10-0-43-5, release R13g). The product
-detected the replayed `row_remap_failure` and planned the documented RMA-class
-drain (FREEZE_EVIDENCE, MARK_UNSCHEDULABLE, QUARANTINE,
-COLLECT_DIAGNOSTIC_BUNDLE, RUN_FIELD_DIAGNOSTIC, VALIDATE_GPU,
-ESCALATE_SUPPORT; no RESTORE_SCHEDULING, an operator closes it once the RMA is
-done), but the record was BLOCKED at compile time -- `blocked_reasons` "no
-executable owner for memoryDiagnostics": both live Runtime Profiles declare
-memoryDiagnostics OBSERVE with a null adapter, deliberately (no DCGM level
-2/3 on this site) -- and the dispatcher sweep superseded it 35 ms after
-creation. No command reached the node, the Node Agent journal stayed silent,
-no cordon, taint or annotation was ever applied, and the incident was left
-ESCALATED. The variant's chain stage still read PASS, because `chain_errors`
-judged only the PLANNED steps (`official_steps`) and the incident state -- a
-hollow pass that threatened every GpuChain user (019/020/022/024) -- and the
-fixture's validated-restore script was then refused ("workflow still owns
-recovery; operator hold retained"), the one honest FAIL of the run. A product
-lane (b192) makes the containment execute before the NEEDS_OPERATOR block;
-until that release (R13h) `remap_failure` stays held on both clusters.
+019 `remap_failure`'s recovery stage is the exit the settled record asks
+for (live 2026-10-26, plain EKS ip-10-0-43-5, release R13g; product lane b192,
+commit 69f87b5d, ships in R13h). On R13g the product detected the replayed
+`row_remap_failure` and planned the RMA-class drain (FREEZE_EVIDENCE,
+MARK_UNSCHEDULABLE, QUARANTINE, COLLECT_DIAGNOSTIC_BUNDLE, RUN_FIELD_DIAGNOSTIC,
+VALIDATE_GPU, ESCALATE_SUPPORT), but the record was BLOCKED at compile time --
+`blocked_reasons` "no executable owner for memoryDiagnostics": both live
+Runtime Profiles declare memoryDiagnostics OBSERVE with a null adapter,
+deliberately (no DCGM level 2/3 on this site) -- and the dispatcher sweep
+superseded it 35 ms after creation. No command reached the node, the Node
+Agent journal stayed silent, no cordon, taint or annotation was ever applied,
+and the incident was left ESCALATED. The variant's chain stage still read
+PASS, because `chain_errors` judged only the PLANNED steps (`official_steps`)
+and the incident state -- a hollow pass that threatened every GpuChain user
+(019/020/022/024) -- and the fixture's validated-restore script was then
+refused ("workflow still owns recovery; operator hold retained"), the one
+honest FAIL of the run. b192 makes a plan whose only compile errors are "no
+executable owner for <capability>" run its containment prefix
+(FREEZE_EVIDENCE, MARK_UNSCHEDULABLE, QUARANTINE, COLLECT_DIAGNOSTIC_BUNDLE,
+TRIGGER_HEALTH_SNAPSHOT) as a SAFETY plan: SAFETY_PENDING, then
+BLOCKED/SAFETY_SETTLED with that blocked reason, the incident QUARANTINED (not
+ESCALATED), the node cordoned with the incident's `gpu-fault.io/quarantined`
+taint and ownership annotation, a real COLLECT_DIAGNOSTIC_BUNDLE command on
+the node, the training job untouched, and a `contained-operator-handoff-zh-v1`
+notification (category OPERATOR_REVIEW, "[GPU FAULT][contained, operator
+action required] <cluster>: <node>"). The documented exit for that shape is
+the validated restore (`gpu-fault-admin submit-remediation --disposition
+restore`; `recovery_safety.workflow_recovery_error` accepts SAFETY_SETTLED),
+and `IncidentClosureService.close_incident` refuses it ("only an ESCALATED
+incident can be closed"); until R13h ships `remap_failure` stays held on both
+clusters.
 
-Two harness rules follow. `chain_errors` now judges executed steps
+Three harness rules follow. (1) `chain_errors` judges executed steps
 (`never_executed_errors`): a `preemption_reason` naming the compile-time
 close, or `blocked_reasons` on a record with no step execution at all, is
 "chain planned but never executed: compile-time BLOCKED (<reasons>)"; every
 isolating step of the chain (MARK_UNSCHEDULABLE, QUARANTINE, STOP_WORKLOADS,
 CHECKPOINT_WORKLOADS) needs a SUCCEEDED final execution once the record has
-ended, a FAILED one is its own error, and a record that may still execute is
+ended, a FAILED one is its own error, a record that may still execute is
 judged on what it has executed so far -- so 019's two containment variants
 wait for the executions before judging (`chain_executed`,
-`CONTAINMENT_SECONDS` on top of the detection budget); diagnostic-only chains
-are unchanged (`tests/regional/test_general_live_gpu_chain.py`). And the
-operator exit refuses a node the chain never isolated: before the close the
-node must carry the cordon, the product's `gpu-fault.io/quarantined` taint
-owned by the incident and the `gpu-fault.io/incident-id` annotation naming it
-(`containment_missing`), else the stage fails "chain never isolated the node"
-and closes nothing. The variant otherwise performs that exit itself: it waits
-for the incident's workflow to settle, closes the incident from inside the
-CPU Pod through `IncidentClosureService.close_incident` (the same call
-`gpu-fault-admin workflow-reconcile --close-incident` makes, with the node's
-isolation evidence, operator `acceptance-fixture`, the run id as reference and
-a reason naming the case's own injection), and proves it on fresh, bounded
-reads: incident RECOVERED, the owning workflow no longer open, no ownership
-annotation, quarantine taint or cordon left on the node; a refusal, an
-incident that did not settle ESCALATED, or any residue is the stage's error
-and nothing is retried (`tests/regional/test_general_live_gpu_memory.py`, over
-recorded fakes). The runner's post-case close of ESCALATED incidents lists
-only what is still ESCALATED, so it has nothing to do after the variant.
-What the proof does not cover: the close is the product's record exit; it
-does not show that an RMA happened, and the replay never damaged memory. The
+`CONTAINMENT_SECONDS` on top of the detection budget) -- and an operation the
+chain lists as `unexecuted` that did run (RUN_FIELD_DIAGNOSTIC here) is an
+error; planned steps are read from `safety_steps` and `official_steps`
+together, and diagnostic-only chains are unchanged
+(`tests/regional/test_general_live_gpu_chain.py`). (2) The exit follows the
+settled state (`_contained_exit`, after the replay has ended -- the restore's
+VALIDATE_GPU would rightly refuse while row_remap_failure=1 is still served):
+the node read first must carry the chain's containment (`containment_missing`:
+the cordon, the incident's quarantine taint, the incident-id annotation), else
+"chain never isolated the node" and nothing is restored or closed. QUARANTINED
+-> the product's handoff notification must be in its notification records
+(`handoff` stage: OPERATOR_REVIEW with the "contained" marker, polled 120 s)
+and the node is readmitted through the validated restore (`restore_incidents`:
+VALIDATE_GPU/HOST/FABRIC then RESTORE_SCHEDULING SUCCEEDED, no isolation left,
+the incident RECOVERED on a fresh read). ESCALATED (the product handed the
+node to an operator; on R13g that record is the hollow one and already fails
+the chain) -> the operator close through `IncidentClosureService.close_incident`
+(the call `gpu-fault-admin workflow-reconcile --close-incident` makes, with
+the node's isolation evidence, operator `acceptance-fixture`, the run id as
+reference, a reason naming the case's own injection), proven on fresh,
+bounded reads: incident RECOVERED, the owning workflow no longer open, no
+residue on the node. Any other settled state, a refusal on either path, or
+residue is the recovery error and nothing is retried
+(`tests/regional/test_general_live_gpu_memory.py`, over recorded fakes). (3)
+The plan's expected text says so: containment first, SAFETY_SETTLED, incident
+QUARANTINED, operator notified, readmitted by the validated restore. The
+runner's post-case close of ESCALATED incidents lists only what is still
+ESCALATED, so it has nothing to do after either exit. What the proof does not
+cover: the restore (or the close) is the product's record exit; it does not
+show that an RMA happened, and the replay never damaged memory. The
 same finding exposed a reporting defect: `failure_class()` classified a Pod
 exec's stderr from its last line, which for every `kubectl exec` failure is
 kubectl's own trailer `command terminated with exit code N`, so the exception

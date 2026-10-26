@@ -264,7 +264,7 @@ def _activity(incidents: list, workflows: list) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
-# remap_failure: the operator exit (live 2026-10-26, gpu-eks-cluster)
+# remap_failure: the contained exit (live 2026-10-26; the b192 / R13h shape)
 # --------------------------------------------------------------------------- #
 NODE = "ip-10-0-43-5.us-west-2.compute.internal"
 REMAP_OPERATIONS = [
@@ -272,9 +272,47 @@ REMAP_OPERATIONS = [
     "MARK_UNSCHEDULABLE",
     "QUARANTINE",
     "COLLECT_DIAGNOSTIC_BUNDLE",
+    "TRIGGER_HEALTH_SNAPSHOT",
     "RUN_FIELD_DIAGNOSTIC",
     "VALIDATE_GPU",
     "ESCALATE_SUPPORT",
+]
+CONTAINMENT = (
+    "FREEZE_EVIDENCE",
+    "MARK_UNSCHEDULABLE",
+    "QUARANTINE",
+    "COLLECT_DIAGNOSTIC_BUNDLE",
+    "TRIGGER_HEALTH_SNAPSHOT",
+)
+#: b192 / R13h: the containment prefix ran as the safety plan, the field
+#: diagnostic has no executable owner, the record settles SAFETY_SETTLED and
+#: the incident QUARANTINED with the node held.
+CONTAINED_RECORD = {
+    "status": "BLOCKED",
+    "blocked_kind": "SAFETY_SETTLED",
+    "blocked_reasons": ["no executable owner for memoryDiagnostics"],
+}
+#: The product escalated instead (pre-b192 shape with an executed chain):
+#: BLOCKED/NEEDS_OPERATOR after ESCALATE_SUPPORT, the incident ESCALATED.
+ESCALATED_RECORD = {"status": "BLOCKED", "blocked_kind": "NEEDS_OPERATOR"}
+#: The record live 2026-10-26 06:25Z left behind: BLOCKED at compile time (no
+#: executable owner for memoryDiagnostics), superseded by the dispatcher sweep
+#: 35 ms later, no step ever executed, no command ever reached the node.
+HOLLOW_RECORD = {
+    "status": "SUPERSEDED",
+    "blocked_kind": "NEEDS_OPERATOR",
+    "blocked_reasons": ["no executable owner for memoryDiagnostics"],
+    "preemption_reason": (
+        "dispatcher reconciliation: closed compile-time BLOCKED workflow that never "
+        'changed a node; blocked_reasons=["no executable owner for memoryDiagnostics"]'
+    ),
+    "step_executions": [],
+}
+RESTORE_STEPS = [
+    "VALIDATE_GPU",
+    "VALIDATE_HOST",
+    "VALIDATE_FABRIC",
+    "RESTORE_SCHEDULING",
 ]
 
 
@@ -313,14 +351,31 @@ def _released_node() -> dict[str, Any]:
     }
 
 
-class OperatorExitProduct:
-    """A recording double of the CPU-Pod reads and the one write the exit makes.
+def _handoff_notification() -> dict[str, Any]:
+    """The product's contained-operator-handoff row as the activity probe lists it."""
 
-    Scripts are matched by the fixture's own constants; the activity and GPU
-    state probes fall through to ``gpu_cpu_python``. ``close`` scripts what the
-    closure service answers; ``release_node`` makes the close release the
-    node (what the live site showed); ``after_close`` overrides the incident
-    and workflow documents the fresh reads return.
+    return {
+        "notification_id": "n-handoff",
+        "incident_id": "inc-remap",
+        "category": "OPERATOR_REVIEW",
+        "deduplication_key": f"contained-operator-handoff/gpu-eks-cluster/{NODE}/inc-remap",
+        "created_at": "2026-10-24T00:03:30+00:00",
+        "subject": f"[GPU FAULT][contained, operator action required] gpu-eks-cluster: {NODE}",
+        "status": "SENT",
+    }
+
+
+class ContainedExitProduct:
+    """A recording double of the CPU-Pod reads and writes the contained exit makes.
+
+    Scripts are matched by the fixtures' own constants; the activity, GPU state
+    and preflight probes fall through to ``gpu_cpu_python`` or a scripted
+    answer. ``restore`` scripts the validated-restore submission (a ``refusal``
+    raises as the Pod exec would); the restore releases the node and ends the
+    incident RECOVERED unless ``release_on_restore`` is False. ``close``
+    scripts what the closure service answers; ``release_node`` makes the close
+    release the node; ``after_close`` overrides the documents the fresh reads
+    return afterwards.
     """
 
     def __init__(
@@ -329,11 +384,14 @@ class OperatorExitProduct:
         incident: dict[str, Any],
         workflow: dict[str, Any],
         *,
-        settled_state: str = "ESCALATED",
+        settled_state: str,
+        activity: Any,
+        restore: dict[str, Any] | None = None,
+        release_on_restore: bool = True,
         close: dict[str, Any] | None = None,
         release_node: bool = True,
         after_close: dict[str, dict[str, Any]] | None = None,
-        activity: Any = None,
+        profile: str = "rp-12",
     ) -> None:
         self.regional = regional
         self.incident = {
@@ -341,19 +399,25 @@ class OperatorExitProduct:
             "cluster_id": "gpu-eks-cluster",
             "state": settled_state,
         }
-        self.workflow = {"blocked_kind": "NEEDS_OPERATOR", **workflow}
+        self.workflow = dict(workflow)
+        self.restore = restore or {
+            "workflow_request_id": "wf-restore",
+            "incident_id": incident["incident_id"],
+            "node_id": NODE,
+        }
+        self.release_on_restore = release_on_restore
+        self.restore_workflow: dict[str, Any] | None = None
         self.close = close or {"closed": True, "refusal": None, "state": "RECOVERED"}
         self.release_node = release_node
         self.after_close = after_close or {}
+        self.profile = profile
         self.calls: list[tuple[str, tuple[str, ...]]] = []
-        self.inner = gpu_cpu_python(
-            activity=activity
-            if activity is not None
-            else _activity([incident], [workflow])
-        )
+        self.inner = gpu_cpu_python(activity=activity)
 
     def __call__(self, script: str, *arguments: str) -> dict[str, Any]:
         from scripts.e2e.regional import warm_spare_fixture as warm
+        from scripts.e2e.regional.general_live_store import PREFLIGHT_PROBE
+        from scripts.e2e.regional.regional_commands import RegionalFixtureError
 
         names = {
             warm.INCIDENT_CLEANUP_STATE: "settle",
@@ -362,11 +426,14 @@ class OperatorExitProduct:
             warm.CREATE_RESTORE_WORKFLOW: "restore",
             warm.INCIDENT_BY_ID: "incident",
             warm.WORKFLOW_BY_ID: "workflow",
+            PREFLIGHT_PROBE: "preflight",
         }
         name = names.get(script)
         if name is None:
             return self.inner(script, *arguments)
         self.calls.append((name, arguments))
+        if name == "preflight":
+            return {"agent": {"runtime_profile_version": self.profile}}
         if name == "settle":
             return {
                 "incident": dict(self.incident),
@@ -374,6 +441,26 @@ class OperatorExitProduct:
                 "active_workflows": [],
                 "open_commands": [],
             }
+        if name == "restore":
+            if self.restore.get("refusal"):
+                raise RegionalFixtureError(str(self.restore["refusal"]))
+            # The product's validated restore: VALIDATE_* then RESTORE_SCHEDULING
+            # releases the node and ends the incident RECOVERED.
+            self.restore_workflow = gpu_workflow(
+                "wf-restore",
+                self.incident["incident_id"],
+                RESTORE_STEPS,
+                status="SUCCEEDED",
+                executions=_succeeded(*RESTORE_STEPS),
+            )
+            if self.release_on_restore:
+                self.regional.node_snapshot_value = _released_node()
+                self.incident = {
+                    **self.incident,
+                    "state": "RECOVERED",
+                    "workflow_request_id": "wf-restore",
+                }
+            return dict(self.restore)
         if name == "close":
             if self.close.get("closed"):
                 self.incident = {
@@ -390,23 +477,10 @@ class OperatorExitProduct:
         if name == "incident":
             return dict(self.incident)
         if name == "workflow":
+            if arguments[0] == "wf-restore" and self.restore_workflow is not None:
+                return dict(self.restore_workflow)
             return dict(self.workflow)
-        raise AssertionError(f"the operator exit must never run {name}")
-
-
-#: The record live 2026-10-26 06:25Z left behind: BLOCKED at compile time (no
-#: executable owner for memoryDiagnostics), superseded by the dispatcher sweep
-#: 35 ms later, no step ever executed, no command ever reached the node.
-HOLLOW_RECORD = {
-    "status": "SUPERSEDED",
-    "blocked_kind": "NEEDS_OPERATOR",
-    "blocked_reasons": ["no executable owner for memoryDiagnostics"],
-    "preemption_reason": (
-        "dispatcher reconciliation: closed compile-time BLOCKED workflow that never "
-        'changed a node; blocked_reasons=["no executable owner for memoryDiagnostics"]'
-    ),
-    "step_executions": [],
-}
+        raise AssertionError(f"the contained exit must never run {name}")
 
 
 def _remap_ctx(
@@ -414,40 +488,52 @@ def _remap_ctx(
     monkeypatch: pytest.MonkeyPatch,
     *,
     record: dict[str, Any] | None = None,
+    executed: tuple[str, ...] = CONTAINMENT,
+    incident_state: str = "QUARANTINED",
     node: dict[str, Any] | None = None,
+    handoff: bool = True,
+    activity: Any = None,
     **product: Any,
-):
+) -> tuple[Any, ContainedExitProduct]:
+    from types import SimpleNamespace
+
     from scripts.e2e.regional import general_live_common as common
+    from scripts.e2e.regional import warm_spare_fixture as warm
     from tests.regional._general_live_fakes import store_poll_clock
 
     incident = gpu_incident(
         "inc-remap",
         f"b-{GPU}-row_remap_failure",
-        state="ESCALATED",
+        state=incident_state,
         action="DRAIN",
         workflow="wf-drain",
     )
-    # The default record executed its containment and parked NEEDS_OPERATOR
-    # (the post-b192 shape); ``record`` overrides fields of it.
+    # The default record is the b192 shape (executed containment, SAFETY_SETTLED,
+    # incident QUARANTINED); ``record`` overrides fields of it.
     workflow = {
         **gpu_workflow(
             "wf-drain",
             "inc-remap",
             REMAP_OPERATIONS,
             status="BLOCKED",
-            executions=_succeeded(
-                "FREEZE_EVIDENCE",
-                "MARK_UNSCHEDULABLE",
-                "QUARANTINE",
-                "COLLECT_DIAGNOSTIC_BUNDLE",
-                "VALIDATE_GPU",
-                "ESCALATE_SUPPORT",
-            ),
+            executions=_succeeded(*executed),
         ),
+        **CONTAINED_RECORD,
         **(record or {}),
     }
+    if activity is None:
+        activity = _activity([incident], [workflow])
+        if handoff:
+            activity["notifications"] = [_handoff_notification()]
     regional = FakeRegional(node_snapshot=node or _isolated_node("inc-remap"))
-    cpu = OperatorExitProduct(regional, incident, workflow, **product)
+    cpu = ContainedExitProduct(
+        regional,
+        incident,
+        workflow,
+        settled_state=incident_state,
+        activity=activity,
+        **product,
+    )
     regional.cpu_python_responder = cpu
     spec = SPECS["remap_failure"]
     settings = make_settings(spec, node=NODE)
@@ -460,23 +546,234 @@ def _remap_ctx(
     )
     # The settle read is one quiet read in tests; live it is 15 s apart twice.
     monkeypatch.setattr(common, "OPERATOR_EXIT_QUIET_SECONDS", 0)
+    # The warm-spare fixture's own waits (restore_incidents' idle wait, the
+    # restore workflow poll) run on a virtual clock instead of sleeping.
+    clock = [0.0]
+    monkeypatch.setattr(
+        warm,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: clock[0],
+            sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+        ),
+    )
     store_poll_clock(ctx)
     return ctx, cpu
 
 
-def test_remap_failure_closes_the_escalation_through_the_operator_exit(
+def _names(product: ContainedExitProduct) -> list[str]:
+    return [name for name, _ in product.calls]
+
+
+# ------------------------------------------------------------ QUARANTINED
+def test_remap_failure_contained_node_is_readmitted_by_the_validated_restore(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Live 2026-10-26: the DRAIN chain ended ESCALATE_SUPPORT with the record
-    BLOCKED/NEEDS_OPERATOR, the incident ESCALATED and the node cordoned; the
-    validated restore was refused. The variant performs the operator close the
-    runner used to make afterwards, and proves the release itself."""
+    """The b192 / R13h shape: containment executed, the field diagnostic has no
+    executable owner, SAFETY_SETTLED, incident QUARANTINED, the operator told.
+    The documented exit is the validated restore, after the replay ended."""
 
     ctx, product = _remap_ctx(tmp_path, monkeypatch)
     out = mem.remap_failure(ctx)
     assert out["verdict"] == "PASS", out["errors"]
-    names = [name for name, _ in product.calls]
-    assert "restore" not in names, "a validated restore is the wrong exit here"
+    assert out["stages"]["handoff"] == [], out["stages"]
+    names = _names(product)
+    assert "close" not in names and "close-post" not in names, (
+        "a QUARANTINED incident is never closed by signature"
+    )
+    assert names.index("settle") < names.index("restore") < names.index("incident"), (
+        "settle, then the restore, then the fresh proof reads"
+    )
+    assert names.count("restore") == 1, "one restore workflow"
+    (restore,) = [args for name, args in product.calls if name == "restore"]
+    incident_id, node, profile, reason = restore
+    assert (incident_id, node, profile) == ("inc-remap", NODE, "rp-12"), restore
+    assert "GF-GENERAL-LIVE-019.remap_failure" in reason, reason
+    record = out["contained_exit"]
+    assert record["exit"] == "validated-restore", record
+    assert record["state_settled"] == "QUARANTINED", record
+    assert record["node_before"]["unschedulable"] is True, record
+    assert record["node_before"]["ownership_annotations"][
+        "gpu-fault.io/incident-id"
+    ] == ("inc-remap"), record
+    assert record["state_after"] == "RECOVERED", record
+    assert record["node_after"] == {
+        "ownership_annotations": {},
+        "taints": [],
+        "unschedulable": False,
+    }, record
+    assert record["restore"][0]["status"] == "SUCCEEDED", record["restore"]
+    assert record["restore"][0]["operations"] == RESTORE_STEPS, record["restore"]
+    assert record["handoff"][0]["subject"].startswith(
+        "[GPU FAULT][contained, operator action required]"
+    ), record["handoff"]
+    probe_calls = [c[0] for c in ctx.probes[f"dcgm@{NODE}"].calls]
+    assert "close-run" in probe_calls, "the replay ended before the restore"
+    assert (ctx.case_dir / "validated-restore.json").is_file(), "restore evidence"
+    assert (ctx.case_dir / "contained-exit.json").is_file(), "exit evidence"
+    assert any("validated restore" in note for note in out["notes"]), out["notes"]
+    assert "SAFETY_SETTLED" in SPECS["remap_failure"].expected, SPECS[
+        "remap_failure"
+    ].expected
+
+
+def test_remap_failure_missing_handoff_notification_is_a_handoff_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx, product = _remap_ctx(tmp_path, monkeypatch, handoff=False)
+    out = mem.remap_failure(ctx)
+    assert out["verdict"] == "FAIL", out
+    (error,) = out["stages"]["handoff"]
+    assert "no contained-operator-handoff notification (OPERATOR_REVIEW)" in error, (
+        error
+    )
+    assert "inc-remap" in error, error
+    assert out["stages"]["recovery"] == [], "the node is still readmitted"
+    assert "restore" in _names(product), "the restore ran regardless"
+    timeline = json.loads((ctx.case_dir / "handoff-timeline.json").read_text())
+    assert all(entry["accepted"] is False for entry in timeline["entries"]), timeline
+    assert len(timeline["entries"]) >= 6, "polled to the 120 s bound at 20 s"
+
+
+def test_remap_failure_handoff_of_another_kind_does_not_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.e2e.regional.general_live_common import handoff_notifications
+
+    other = {
+        **_handoff_notification(),
+        "subject": "[GPU FAULT][operator review] gpu-eks-cluster: unparsed XID line",
+        "deduplication_key": "operator-review/unparsed_xid_line/inc-remap",
+    }
+    assert handoff_notifications({"notifications": [other]}, "inc-remap") == [], (
+        "an OPERATOR_REVIEW row of another kind is not the handoff"
+    )
+    foreign = {**_handoff_notification(), "incident_id": "inc-other"}
+    assert handoff_notifications({"notifications": [foreign]}, "inc-remap") == [], (
+        "another incident's handoff is not this one's"
+    )
+    assert handoff_notifications(
+        {"notifications": [other, foreign, _handoff_notification()]}, "inc-remap"
+    ) == [_handoff_notification()], "the incident's own handoff row"
+
+
+def test_remap_failure_refused_restore_is_a_recovery_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx, product = _remap_ctx(
+        tmp_path,
+        monkeypatch,
+        restore={
+            "refusal": "cpu Pod probe failed: operator hold retained [RuntimeError]"
+        },
+    )
+    out = mem.remap_failure(ctx)
+    assert out["verdict"] == "FAIL", out
+    (error,) = out["stages"]["recovery"]
+    assert error.startswith("contained exit failed: RegionalFixtureError:"), error
+    assert "operator hold retained" in error, error
+    assert _names(product).count("restore") == 1, "a refusal is never retried"
+    assert "close" not in _names(product), "a refused restore is not closed around"
+    assert ctx.regional.node_snapshot(NODE)["unschedulable"] is True, (
+        "the harness never releases the node by hand"
+    )
+    assert out["contained_exit"]["exit"] == "validated-restore", out["contained_exit"]
+
+
+def test_remap_failure_restore_that_leaves_isolation_is_a_recovery_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx, _product = _remap_ctx(tmp_path, monkeypatch, release_on_restore=False)
+    out = mem.remap_failure(ctx)
+    assert out["verdict"] == "FAIL", out
+    (error,) = out["stages"]["recovery"]
+    assert "still isolated after the validated restore" in error, error
+
+
+def test_remap_failure_field_diagnostic_that_ran_is_a_chain_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx, _product = _remap_ctx(
+        tmp_path, monkeypatch, executed=(*CONTAINMENT, "RUN_FIELD_DIAGNOSTIC")
+    )
+    out = mem.remap_failure(ctx)
+    assert out["verdict"] == "FAIL", out
+    (error,) = out["stages"]["chain"]
+    assert (
+        "executed RUN_FIELD_DIAGNOSTIC (SUCCEEDED); it must not run on this site"
+        in (error)
+    ), error
+    assert out["stages"]["recovery"] == [], "the node is still readmitted"
+
+
+def test_remap_failure_detection_waits_for_the_executed_containment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first reads show the record SAFETY_PENDING with FREEZE_EVIDENCE done;
+    the chain is judged only once MARK_UNSCHEDULABLE and QUARANTINE executed."""
+
+    incident = gpu_incident(
+        "inc-remap",
+        f"b-{GPU}-row_remap_failure",
+        state="SAFETY_PENDING",
+        action="DRAIN",
+        workflow="wf-drain",
+    )
+    running = gpu_workflow(
+        "wf-drain",
+        "inc-remap",
+        REMAP_OPERATIONS,
+        status="SAFETY_PENDING",
+        executions=_succeeded("FREEZE_EVIDENCE"),
+    )
+    contained = {
+        **running,
+        **CONTAINED_RECORD,
+        "step_executions": _succeeded(*CONTAINMENT),
+    }
+    quarantined = {**incident, "state": "QUARANTINED"}
+    settled = _activity([quarantined], [contained])
+    settled["notifications"] = [_handoff_notification()]
+    ctx, product = _remap_ctx(
+        tmp_path,
+        monkeypatch,
+        activity=[
+            _activity([incident], [running]),
+            _activity([incident], [running]),
+            settled,
+        ],
+    )
+    out = mem.remap_failure(ctx)
+    assert out["verdict"] == "PASS", out["errors"]
+    timeline = json.loads((ctx.case_dir / "detection-timeline.json").read_text())
+    accepted = [entry["accepted"] for entry in timeline["entries"]]
+    assert accepted == [False, False, True], (
+        f"the incident alone does not end the detection wait: {accepted}"
+    )
+    assert _names(product).count("restore") == 1, product.calls
+
+
+# --------------------------------------------------------------- ESCALATED
+def test_remap_failure_escalated_record_is_closed_through_the_operator_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The product handed the node to an operator (pre-b192 shape with an
+    executed chain): ESCALATED is closed through IncidentClosureService, as
+    gpu-fault-admin workflow-reconcile --close-incident does, and proven."""
+
+    ctx, product = _remap_ctx(
+        tmp_path,
+        monkeypatch,
+        record=ESCALATED_RECORD,
+        executed=(*CONTAINMENT[:4], "VALIDATE_GPU", "ESCALATE_SUPPORT"),
+        incident_state="ESCALATED",
+        handoff=False,
+    )
+    out = mem.remap_failure(ctx)
+    assert out["verdict"] == "PASS", out["errors"]
+    assert "handoff" not in out["stages"], "the escalation's own notice is not asserted"
+    names = _names(product)
+    assert "restore" not in names, "a validated restore is refused for this record"
     assert names.index("settle") < names.index("close") < names.index("incident"), (
         "settle, then close, then the fresh proof reads"
     )
@@ -493,20 +790,17 @@ def test_remap_failure_closes_the_escalation_through_the_operator_exit(
     assert evidence[0]["node_id"] == NODE and evidence[0]["unschedulable"] is True, (
         "the evidence is the node as read before the close, cordoned by the drain"
     )
-    assert evidence[0]["isolation_annotations"]["gpu-fault.io/incident-id"] == (
-        "inc-remap"
-    ), evidence
-    (record,) = out["operator_exit"]
-    assert record["state_before"] == "ESCALATED", record
-    assert record["state_after"] == "RECOVERED", record
-    assert record["workflow_status_after"] == "SUPERSEDED", record
-    assert record["node_before"]["unschedulable"] is True, record
-    assert record["node_after"] == {
+    record = out["contained_exit"]
+    assert record["exit"] == "operator-close", record
+    assert record["state_settled"] == "ESCALATED", record
+    (closed,) = record["operator_exit"]
+    assert closed["state_after"] == "RECOVERED", closed
+    assert closed["workflow_status_after"] == "SUPERSEDED", closed
+    assert closed["node_after"] == {
         "ownership_annotations": {},
         "taints": [],
         "unschedulable": False,
-    }, record
-    assert any("operator exit" in note for note in out["notes"]), out["notes"]
+    }, closed
     assert (ctx.case_dir / "operator-exit.json").is_file(), "the exit is evidence"
 
 
@@ -520,30 +814,40 @@ def test_remap_failure_refused_close_is_a_recovery_error(
     ctx, product = _remap_ctx(
         tmp_path,
         monkeypatch,
+        record=ESCALATED_RECORD,
+        incident_state="ESCALATED",
+        handoff=False,
         close={"closed": False, "refusal": refusal, "state": None},
     )
     out = mem.remap_failure(ctx)
     assert out["verdict"] == "FAIL", out
     assert out["stages"]["chain"] == [] and out["stages"]["hardware"] == [], out
     (error,) = out["stages"]["recovery"]
-    assert error.startswith("operator close failed: RegionalFixtureError:"), error
+    assert error.startswith("contained exit failed: RegionalFixtureError:"), error
     assert "refused" in error and "BLOCKED/NEEDS_OPERATOR" in error, error
-    names = [name for name, _ in product.calls]
+    names = _names(product)
     assert names.count("close") == 1, "a refusal is never retried blindly"
-    assert "incident" not in names and "workflow" not in names, (
-        "nothing is proven after a refusal"
+    assert "incident" not in names and "restore" not in names, (
+        "nothing is proven or restored after a refusal"
     )
     assert ctx.regional.node_snapshot(NODE)["unschedulable"] is True, (
         "the harness never releases the node by hand"
     )
 
 
-def test_remap_failure_leftover_isolation_is_a_recovery_error(
+def test_remap_failure_leftover_isolation_after_the_close_is_a_recovery_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from scripts.e2e.regional import general_live_common as common
 
-    ctx, product = _remap_ctx(tmp_path, monkeypatch, release_node=False)
+    ctx, product = _remap_ctx(
+        tmp_path,
+        monkeypatch,
+        record=ESCALATED_RECORD,
+        incident_state="ESCALATED",
+        handoff=False,
+        release_node=False,
+    )
     out = mem.remap_failure(ctx)
     assert out["verdict"] == "FAIL", out
     (error,) = out["stages"]["recovery"]
@@ -551,22 +855,22 @@ def test_remap_failure_leftover_isolation_is_a_recovery_error(
     assert "gpu-fault.io/incident-id" in error, "the leftover annotation is named"
     assert "gpu-fault.io/quarantined" in error, "the leftover taint is named"
     assert "cordoned" in error, error
-    assert "not RECOVERED" not in error, "the incident itself did close"
-    reads = [name for name, _ in product.calls if name == "incident"]
+    reads = [name for name in _names(product) if name == "incident"]
     budget = common.OPERATOR_EXIT_PROOF_SECONDS // common.STORE_POLL_SECONDS
     assert budget <= len(reads) <= budget + 2, (
         f"the proof polls to its bound and stops: {len(reads)} reads"
     )
-    timeline = json.loads((ctx.case_dir / "operator-exit-0-timeline.json").read_text())
-    assert all(entry["accepted"] is False for entry in timeline["entries"]), timeline
 
 
-def test_remap_failure_workflow_left_open_is_a_recovery_error(
+def test_remap_failure_workflow_left_open_after_the_close_is_a_recovery_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     ctx, _product = _remap_ctx(
         tmp_path,
         monkeypatch,
+        record=ESCALATED_RECORD,
+        incident_state="ESCALATED",
+        handoff=False,
         after_close={
             "workflow": {"status": "BLOCKED", "blocked_kind": "NEEDS_OPERATOR"}
         },
@@ -579,18 +883,94 @@ def test_remap_failure_workflow_left_open_is_a_recovery_error(
     ), error
 
 
-def test_remap_failure_incident_not_left_escalated_is_a_recovery_error(
+# ------------------------------------------------------- neither / hollow
+def test_remap_failure_settled_recovered_is_neither_shape(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    ctx, product = _remap_ctx(tmp_path, monkeypatch, settled_state="RECOVERED")
+    ctx, product = _remap_ctx(
+        tmp_path, monkeypatch, incident_state="RECOVERED", handoff=False
+    )
     out = mem.remap_failure(ctx)
     assert out["verdict"] == "FAIL", out
     (error,) = out["stages"]["recovery"]
-    assert "settled RECOVERED, not ESCALATED" in error, error
-    assert "nothing was left to close" in error, error
-    assert [name for name, _ in product.calls if name == "close"] == [], (
-        "an incident that is not ESCALATED is never closed by the variant"
+    assert "settled RECOVERED: neither the contained QUARANTINED shape" in error, error
+    assert "nor an ESCALATED hand-off" in error, error
+    names = _names(product)
+    assert "close" not in names and "restore" not in names, (
+        "an incident in neither shape is neither closed nor restored"
     )
+
+
+def test_remap_failure_hollow_chain_fails_the_chain_and_exits_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live 2026-10-26 06:22-06:27Z: the record planned the whole DRAIN chain
+    and executed none of it (compile-time BLOCKED, superseded 35 ms later); no
+    command reached the node, which stayed clean. The chain stage used to read
+    PASS from the planned steps; the operator exit would then have closed an
+    escalation whose chain never ran."""
+
+    ctx, product = _remap_ctx(
+        tmp_path,
+        monkeypatch,
+        record=HOLLOW_RECORD,
+        incident_state="ESCALATED",
+        node=_released_node(),
+        handoff=False,
+    )
+    out = mem.remap_failure(ctx)
+    assert out["verdict"] == "FAIL", out
+    assert out["stages"]["chain"] == [
+        f"row_remap_failure on {GPU} chain planned but never executed: compile-time "
+        "BLOCKED (no executable owner for memoryDiagnostics)"
+    ], out["stages"]["chain"]
+    assert out["stages"]["hardware"] == [], out["stages"]["hardware"]
+    (recovery,) = out["stages"]["recovery"]
+    assert "chain never isolated the node" in recovery, recovery
+    assert "not cordoned" in recovery and "names no incident" in recovery, recovery
+    names = _names(product)
+    assert "close" not in names and "restore" not in names, (
+        "nothing is closed or restored on a node the chain never isolated"
+    )
+    assert out["contained_exit"]["node_before"] == {
+        "ownership_annotations": {},
+        "taints": [],
+        "unschedulable": False,
+    }, out["contained_exit"]
+    assert "exit" not in out["contained_exit"], "no exit was chosen"
+
+
+def test_remap_failure_unisolated_node_is_a_recovery_error_before_any_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The record says the containment ran, the node says otherwise: the node
+    # is the proof, and neither the restore nor the close is attempted.
+    ctx, product = _remap_ctx(tmp_path, monkeypatch, node=_released_node())
+    out = mem.remap_failure(ctx)
+    assert out["verdict"] == "FAIL", out
+    assert out["stages"]["chain"] == [], out["stages"]["chain"]
+    (recovery,) = out["stages"]["recovery"]
+    assert recovery.startswith(
+        "contained exit failed: RegionalFixtureError: chain never isolated the node"
+    ), recovery
+    assert "not cordoned" in recovery, recovery
+    assert "no gpu-fault.io/quarantined taint of the incident" in recovery, recovery
+    assert "gpu-fault.io/incident-id names no incident" in recovery, recovery
+    names = _names(product)
+    assert "close" not in names and "restore" not in names, "never exited"
+
+
+def test_remap_failure_containment_owned_by_another_incident_is_not_the_chains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx, product = _remap_ctx(tmp_path, monkeypatch, node=_isolated_node("inc-other"))
+    out = mem.remap_failure(ctx)
+    (recovery,) = out["stages"]["recovery"]
+    assert "chain never isolated the node" in recovery, recovery
+    assert "the taint present is another incident's" in recovery, recovery
+    assert "gpu-fault.io/incident-id names inc-other" in recovery, recovery
+    assert "not cordoned" not in recovery, "the cordon is there; the ownership is not"
+    assert "restore" not in _names(product), "never restored"
 
 
 def test_operator_exit_problems_follow_the_products_open_workflow_rule() -> None:
@@ -638,118 +1018,3 @@ def test_operator_exit_problems_follow_the_products_open_workflow_rule() -> None
     ), problems
     assert any("taints gpu-fault.io/quarantined" in p for p in problems), problems
     assert any("still cordoned" in p for p in problems), problems
-
-
-def test_remap_failure_hollow_chain_fails_the_chain_and_closes_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Live 2026-10-26 06:22-06:27Z: the record planned the whole DRAIN chain
-    and executed none of it (compile-time BLOCKED, superseded 35 ms later); no
-    command reached the node, which stayed clean. The chain stage used to read
-    PASS from the planned steps; the operator exit would then have closed an
-    escalation whose chain never ran."""
-
-    ctx, product = _remap_ctx(tmp_path, monkeypatch, record=HOLLOW_RECORD, node=None)
-    ctx.regional.node_snapshot_value = _released_node()
-    out = mem.remap_failure(ctx)
-    assert out["verdict"] == "FAIL", out
-    assert out["stages"]["chain"] == [
-        f"row_remap_failure on {GPU} chain planned but never executed: compile-time "
-        "BLOCKED (no executable owner for memoryDiagnostics)"
-    ], out["stages"]["chain"]
-    assert out["stages"]["hardware"] == [], out["stages"]["hardware"]
-    (recovery,) = out["stages"]["recovery"]
-    assert "chain never isolated the node" in recovery, recovery
-    assert "not cordoned" in recovery and "names no incident" in recovery, recovery
-    names = [name for name, _ in product.calls]
-    assert "close" not in names and "restore" not in names, (
-        "nothing is closed or restored on a node the chain never isolated"
-    )
-    assert names.count("settle") == 1, names
-    assert out["operator_exit"] == [], "no exit record: the stage stopped first"
-    exit_evidence = json.loads((ctx.case_dir / "operator-exit.json").read_text())
-    assert exit_evidence["results"][0]["node_before"] == {
-        "ownership_annotations": {},
-        "taints": [],
-        "unschedulable": False,
-    }, exit_evidence
-
-
-def test_remap_failure_unisolated_node_is_a_recovery_error_before_the_close(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # The record says the containment ran, the node says otherwise: the node
-    # is the proof, and the close is never attempted.
-    ctx, product = _remap_ctx(tmp_path, monkeypatch, node=_released_node())
-    out = mem.remap_failure(ctx)
-    assert out["verdict"] == "FAIL", out
-    assert out["stages"]["chain"] == [], out["stages"]["chain"]
-    (recovery,) = out["stages"]["recovery"]
-    assert recovery.startswith(
-        "operator close failed: RegionalFixtureError: chain never isolated the node"
-    ), recovery
-    assert "not cordoned" in recovery, recovery
-    assert "no gpu-fault.io/quarantined taint of the incident" in recovery, recovery
-    assert "gpu-fault.io/incident-id names no incident" in recovery, recovery
-    assert "close" not in [name for name, _ in product.calls], "never closed"
-
-
-def test_remap_failure_containment_owned_by_another_incident_is_not_the_chains(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    ctx, product = _remap_ctx(tmp_path, monkeypatch, node=_isolated_node("inc-other"))
-    out = mem.remap_failure(ctx)
-    (recovery,) = out["stages"]["recovery"]
-    assert "chain never isolated the node" in recovery, recovery
-    assert "the taint present is another incident's" in recovery, recovery
-    assert "gpu-fault.io/incident-id names inc-other" in recovery, recovery
-    assert "not cordoned" not in recovery, "the cordon is there; the ownership is not"
-    assert "close" not in [name for name, _ in product.calls], "never closed"
-
-
-def test_remap_failure_detection_waits_for_the_executed_containment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The first read shows the record RUNNING with FREEZE_EVIDENCE done; the
-    chain is judged only once MARK_UNSCHEDULABLE and QUARANTINE have executed."""
-
-    incident = gpu_incident(
-        "inc-remap",
-        f"b-{GPU}-row_remap_failure",
-        state="ACTION_PENDING",
-        action="DRAIN",
-        workflow="wf-drain",
-    )
-    running = gpu_workflow(
-        "wf-drain",
-        "inc-remap",
-        REMAP_OPERATIONS,
-        status="RUNNING",
-        executions=_succeeded("FREEZE_EVIDENCE"),
-    )
-    contained = {
-        **running,
-        "status": "BLOCKED",
-        "blocked_kind": "NEEDS_OPERATOR",
-        "step_executions": _succeeded(
-            "FREEZE_EVIDENCE", "MARK_UNSCHEDULABLE", "QUARANTINE"
-        ),
-    }
-    escalated = {**incident, "state": "ESCALATED"}
-    ctx, product = _remap_ctx(
-        tmp_path,
-        monkeypatch,
-        activity=[
-            _activity([incident], [running]),
-            _activity([incident], [running]),
-            _activity([escalated], [contained]),
-        ],
-    )
-    out = mem.remap_failure(ctx)
-    assert out["verdict"] == "PASS", out["errors"]
-    timeline = json.loads((ctx.case_dir / "detection-timeline.json").read_text())
-    accepted = [entry["accepted"] for entry in timeline["entries"]]
-    assert accepted == [False, False, True], (
-        f"the incident alone does not end the detection wait: {accepted}"
-    )
-    assert [name for name, _ in product.calls].count("close") == 1, product.calls

@@ -201,3 +201,76 @@ def test_diagnostic_only_chains_are_unchanged() -> None:
     assert chain_executed(_activity(inc, never_ran), [inc], DIAGNOSTIC) is True, (
         "a chain without isolating steps has no containment to wait for"
     )
+
+
+def test_an_unexecuted_operation_that_ran_is_an_error() -> None:
+    """RUN_FIELD_DIAGNOSTIC is planned by the DRAIN but has no executable owner
+    on this site (memoryDiagnostics OBSERVE); a record that ran it anyway fails."""
+
+    chain = GpuChain(
+        label="row_remap_failure",
+        operations=("FREEZE_EVIDENCE", "MARK_UNSCHEDULABLE", "QUARANTINE"),
+        forbidden=frozenset({"RESET_GPU"}),
+        unexecuted=frozenset({"RUN_FIELD_DIAGNOSTIC"}),
+    )
+    planned_only, incidents, _wf = _case(
+        {
+            "status": "BLOCKED",
+            "blocked_kind": "SAFETY_SETTLED",
+            "blocked_reasons": ["no executable owner for memoryDiagnostics"],
+            "step_executions": _executed(
+                "FREEZE_EVIDENCE", "MARK_UNSCHEDULABLE", "QUARANTINE"
+            ),
+        },
+        state="QUARANTINED",
+    )
+    assert chain_errors(planned_only, incidents, chain) == [], (
+        "planned but not executed is exactly what the OBSERVE capability means"
+    )
+    ran, incidents, _wf = _case(
+        {
+            "status": "BLOCKED",
+            "blocked_kind": "SAFETY_SETTLED",
+            "step_executions": _executed(
+                "FREEZE_EVIDENCE",
+                "MARK_UNSCHEDULABLE",
+                "QUARANTINE",
+                "RUN_FIELD_DIAGNOSTIC",
+            ),
+        },
+        state="QUARANTINED",
+    )
+    assert chain_errors(ran, incidents, chain) == [
+        "row_remap_failure workflow wf-drain executed RUN_FIELD_DIAGNOSTIC "
+        "(SUCCEEDED); it must not run on this site"
+    ], chain_errors(ran, incidents, chain)
+
+
+def test_a_safety_plan_lists_its_containment_under_safety_steps() -> None:
+    """b192 runs the containment prefix as a SAFETY plan; whether the record
+    lists it under safety_steps or official_steps, the chain reads both."""
+
+    inc = gpu_incident(
+        "inc-remap",
+        f"b-{GPU}-row_remap_failure",
+        state="QUARANTINED",
+        action="DRAIN",
+        workflow="wf-drain",
+    )
+    wf = {
+        **gpu_workflow(
+            "wf-drain",
+            "inc-remap",
+            ["RUN_FIELD_DIAGNOSTIC", "VALIDATE_GPU", "ESCALATE_SUPPORT"],
+            status="BLOCKED",
+            executions=_executed("FREEZE_EVIDENCE", "MARK_UNSCHEDULABLE", "QUARANTINE"),
+        ),
+        "blocked_kind": "SAFETY_SETTLED",
+        "safety_steps": [
+            {"operation": op, "parameters": {}}
+            for op in ("FREEZE_EVIDENCE", "MARK_UNSCHEDULABLE", "QUARANTINE")
+        ],
+    }
+    assert chain_errors(_activity(inc, wf), [inc], CHAIN) == [], (
+        "the containment planned as safety steps and executed is the chain"
+    )

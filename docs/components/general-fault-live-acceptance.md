@@ -597,40 +597,53 @@ pending仅支持架构和授权Profile才走service-window reset；OBSERVE/未�
 执行reset的变体须有无GPU客户端证明、实际命令回执、动作后新pending/recovery状态及
 GPU/Fabric验证。remap failure的现场诊断/RMA审查不得直接算硬件已更换。清理夹具并人工验卡。
 
-`remap_failure` 的恢复阶段是**操作员出口**，不是 validated restore（2026-10-26 现场，
-plain EKS ip-10-0-43-5，R13g）。RMA 级 DRAIN 链按设计没有 RESTORE_SCHEDULING，由操作员在
-RMA 完成后关闭；但现场记录是**编译期 BLOCKED**（`blocked_reasons` "no executable owner for
-memoryDiagnostics"：两个现场 Runtime Profile 的 memoryDiagnostics 均为 OBSERVE、adapter 为
-null，有意不做 DCGM level 2/3），创建 35 ms 后被 dispatcher sweep SUPERSEDED，没有任何命令
-到达节点、Node Agent 日志静默、从未 cordon/taint/注解，incident 留在 ESCALATED。链阶段却判
-PASS——`chain_errors` 只核对**计划**步骤（`official_steps`）与 incident 状态，空过了一条从未
-执行的链（同样威胁 019/020/022/024 全部 GpuChain 用户）；随后 validated restore 脚本以
-"workflow still owns recovery; operator hold retained" 拒绝，是该次运行里唯一诚实的 FAIL。
-产品车道 b192 正让 containment 在 NEEDS_OPERATOR 阻塞之前执行，R13h 之前 `remap_failure`
-在两集群保持 held。
+`remap_failure` 的恢复阶段按**记录静止后的状态**选出口（2026-10-26 现场，plain EKS
+ip-10-0-43-5，R13g；产品车道 b192，提交 69f87b5d，随 R13h 发布）。R13g 现场：产品检出回放
+的 `row_remap_failure` 并计划了 RMA 级 DRAIN 链（FREEZE_EVIDENCE、MARK_UNSCHEDULABLE、
+QUARANTINE、COLLECT_DIAGNOSTIC_BUNDLE、RUN_FIELD_DIAGNOSTIC、VALIDATE_GPU、ESCALATE_SUPPORT），
+但记录是**编译期 BLOCKED**（`blocked_reasons` "no executable owner for memoryDiagnostics"：
+两个现场 Runtime Profile 的 memoryDiagnostics 均为 OBSERVE、adapter 为 null，有意不做 DCGM
+level 2/3），创建 35 ms 后被 dispatcher sweep SUPERSEDED，没有任何命令到达节点、Node Agent
+日志静默、从未 cordon/taint/注解，incident 留在 ESCALATED。链阶段却判 PASS——`chain_errors`
+只核对**计划**步骤与 incident 状态，空过了一条从未执行的链（同样威胁 019/020/022/024 全部
+GpuChain 用户）；随后 validated restore 脚本以 "workflow still owns recovery; operator hold
+retained" 拒绝，是该次运行里唯一诚实的 FAIL。b192 让"唯一编译错误是 no executable owner for
+<capability>"的计划先以 SAFETY 计划执行其 containment 前缀（FREEZE_EVIDENCE、
+MARK_UNSCHEDULABLE、QUARANTINE、COLLECT_DIAGNOSTIC_BUNDLE、TRIGGER_HEALTH_SNAPSHOT）：
+SAFETY_PENDING → BLOCKED/SAFETY_SETTLED 并带该 blocked reason，incident **QUARANTINED**
+（不是 ESCALATED），节点 cordon + 该 incident 的 `gpu-fault.io/quarantined` taint + 归属注解，
+节点上有真实的 COLLECT_DIAGNOSTIC_BUNDLE 远程命令，训练任务不受影响，并发出
+`contained-operator-handoff-zh-v1` 通知（类别 OPERATOR_REVIEW，"[GPU FAULT][contained,
+operator action required] <cluster>: <node>"）。这种形状的文档化出口是 validated restore
+（`gpu-fault-admin submit-remediation --disposition restore`；`recovery_safety.
+workflow_recovery_error` 对 SAFETY_SETTLED 放行），而 `IncidentClosureService.close_incident`
+会拒绝它（"only an ESCALATED incident can be closed"）；R13h 发布前 `remap_failure` 在两集群
+保持 held。
 
-由此两条夹具规则。`chain_errors` 改判**已执行**步骤（`never_executed_errors`）：
+由此三条夹具规则。（1）`chain_errors` 改判**已执行**步骤（`never_executed_errors`）：
 `preemption_reason` 含编译期关闭标记、或记录带 `blocked_reasons` 却无任何 step execution，
 判 "chain planned but never executed: compile-time BLOCKED (<原因>)"；链里每个隔离步骤
 （MARK_UNSCHEDULABLE/QUARANTINE/STOP_WORKLOADS/CHECKPOINT_WORKLOADS）在记录结束后须有
 SUCCEEDED 的最终执行，FAILED 单独判错，仍可能继续执行的记录只按已执行部分判定，故 019 两个
-隔离变体在判链前先等执行到位（`chain_executed`，检测预算加 `CONTAINMENT_SECONDS`）；只诊断
-的链不变（`tests/regional/test_general_live_gpu_chain.py`）。操作员出口在关闭前核对节点确已
-被该链隔离——cordon、归属该 incident 的 `gpu-fault.io/quarantined` taint、指名该 incident 的
-`gpu-fault.io/incident-id` 注解（`containment_missing`）——缺任一项判 "chain never isolated
-the node" 且不关闭。变体随后扮演操作员：先等 incident 的工作流静止（无活动工作流、无未结
-远程命令，`wait_incident_idle`，有界等待并记录所见状态；静止时不是 ESCALATED 即判错），
-再在 CPU Pod 内经 `IncidentClosureService.close_incident` 关闭——与
-`gpu-fault-admin workflow-reconcile --close-incident` 同一调用——附带夹具从 GPU
-kubeconfig 读到的节点隔离证据（CLI 证据遍所交付的同一形状），operator 为
-`acceptance-fixture`，reference 为本次 run id，reason 注明 "escalation left by the
-case's own fault injection (by design)"；拒绝（409 同义的 refusal）直接判该阶段失败、
-不盲目重试。最后以新读数证明出口：incident RECOVERED、原工作流不再 open（产品的
-`workflow_is_open` 规则：SUPERSEDED 或非占用的 BLOCKED）、节点无 `gpu-fault.io/` 归属注解、
-无隔离 taint、不 cordon（有界轮询，任何残留逐项点名判错）。`plan.json` 的期望文案同步写明
-由变体自行关闭；运行器收尾"关闭本例 ESCALATED incident"一步只列 ESCALATED 的记录，变体
-已关闭时无事可做，保持幂等。`volatile_dbe`（CRITICAL QUARANTINE）仍走 validated restore，
-pending 系列不变。
+隔离变体在判链前先等执行到位（`chain_executed`，检测预算加 `CONTAINMENT_SECONDS`）；链声明为
+`unexecuted` 的操作若执行了（此处 RUN_FIELD_DIAGNOSTIC）判错；计划步骤同时读 `safety_steps`
+与 `official_steps`；只诊断的链不变（`tests/regional/test_general_live_gpu_chain.py`）。
+（2）出口按静止后的状态选（`_contained_exit`，且先关回放——restore 的 VALIDATE_GPU 在
+row_remap_failure=1 仍被回放时理应拒绝）：先读节点，须带该链的 containment
+（`containment_missing`：cordon、归属该 incident 的 quarantine taint、指名它的
+`gpu-fault.io/incident-id` 注解），否则判 "chain never isolated the node" 且既不 restore 也不
+close。QUARANTINED → 产品的 handoff 通知须在其通知记录里（`handoff` 阶段：OPERATOR_REVIEW 且带
+"contained" 标记，轮询 120 s），节点经 validated restore 回收（`restore_incidents`：
+VALIDATE_GPU/HOST/FABRIC → RESTORE_SCHEDULING 成功、无残留隔离、新读 incident RECOVERED）。
+ESCALATED（产品把节点交给了操作员；R13g 上这就是那条空链记录，链阶段已先判错）→ 经
+`IncidentClosureService.close_incident` 的操作员关闭（与 `gpu-fault-admin workflow-reconcile
+--close-incident` 同一调用，附节点隔离证据，operator=`acceptance-fixture`，reference=run id，
+reason 注明本例自身注入），并以有界新读数证明：incident RECOVERED、原工作流不再 open、节点无
+残留。其他静止状态、任一路径的拒绝或残留都判恢复阶段失败，不重试
+（`tests/regional/test_general_live_gpu_memory.py`，录制替身）。（3）`plan.json` 期望文案同步：
+containment first → SAFETY_SETTLED、incident QUARANTINED、操作员已通知、回放结束后由 validated
+restore 回收。运行器收尾"关闭本例 ESCALATED incident"一步只列 ESCALATED 的记录，两种出口之后都
+无事可做。`volatile_dbe`（CRITICAL QUARANTINE）仍走 validated restore，pending 系列不变。
 
 ### GF-GENERAL-LIVE-020
 

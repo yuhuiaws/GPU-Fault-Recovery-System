@@ -62,6 +62,14 @@ OPERATOR_EXIT_QUIET_SECONDS = 15
 #: closure service settles the BLOCKED record in the same call, or leaves it to
 #: the dispatcher's next sweep when its write was refused.
 OPERATOR_EXIT_PROOF_SECONDS = 180
+#: The category of the product's contained-operator-handoff notification (b192,
+#: ``contained-operator-handoff-zh-v1``: a containment that ran but whose
+#: diagnostic has no executable owner; the operator is told, the node is held)
+#: and the marker its subject carries; how long after the record settled the
+#: notification row may still take to appear.
+HANDOFF_CATEGORY = "OPERATOR_REVIEW"
+HANDOFF_MARKER = "contained"
+HANDOFF_SECONDS = 120
 
 
 def sustained_detection_budget(
@@ -560,6 +568,79 @@ def restore_incidents(
     return results
 
 
+def settle_incident(ctx: VariantContext, incident_id: str) -> dict[str, Any]:
+    """The incident as read once its workflow has settled (no active workflow,
+    no open command, a terminal or BLOCKED status -- ``wait_incident_idle``),
+    bounded by ``OPERATOR_EXIT_SETTLE_SECONDS``. The state it returns is what
+    decides a contained variant's exit: QUARANTINED (containment ran, the
+    diagnostic has no owner, SAFETY_SETTLED) is readmitted by the validated
+    restore; ESCALATED is closed by the operator."""
+
+    warm = WarmSpareLiveFixture(ctx.regional, ctx.settings.hyperpod_cluster)
+    return warm.wait_incident_idle(
+        incident_id,
+        timeout_seconds=OPERATOR_EXIT_SETTLE_SECONDS,
+        quiet_seconds=OPERATOR_EXIT_QUIET_SECONDS,
+    )
+
+
+def handoff_notifications(
+    activity_document: Mapping[str, Any], incident_id: str
+) -> list[dict[str, Any]]:
+    """The contained-operator-handoff notifications of ``incident_id`` in the
+    node activity document: category ``HANDOFF_CATEGORY`` and the handoff marker
+    in the subject or deduplication key (the activity probe exposes no template
+    id). An OPERATOR_REVIEW row of another kind -- an unparsed XID line, an
+    inventory identity change -- names another subject and is not counted."""
+
+    return [
+        item
+        for item in activity_document.get("notifications") or []
+        if str(item.get("incident_id") or "") == incident_id
+        and str(item.get("category") or "") == HANDOFF_CATEGORY
+        and HANDOFF_MARKER
+        in (
+            str(item.get("subject") or "")
+            + " "
+            + str(item.get("deduplication_key") or "")
+        ).lower()
+    ]
+
+
+def await_handoff_notification(
+    ctx: VariantContext, since: datetime, incident_id: str
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """``(errors, rows)``: the product told an operator about the contained node.
+
+    Polls the node activity for ``HANDOFF_SECONDS`` after the record settled;
+    no row is the error, named with the incident. Read from the product's own
+    notification records, never from a mailbox.
+    """
+
+    found: list[dict[str, Any]] = []
+
+    def accept() -> list[dict[str, Any]] | None:
+        nonlocal found
+        found = handoff_notifications(activity(ctx, since), incident_id)
+        return found or None
+
+    rows = ctx.wait_until(
+        accept,
+        timeout_seconds=HANDOFF_SECONDS,
+        poll_seconds=STORE_POLL_SECONDS,
+        name="handoff",
+    )
+    if not rows:
+        return (
+            [
+                f"no contained-operator-handoff notification ({HANDOFF_CATEGORY}) was "
+                f"recorded for {incident_id} within {HANDOFF_SECONDS} s"
+            ],
+            [],
+        )
+    return [], [dict(item) for item in rows]
+
+
 def node_residual_isolation(node: Mapping[str, Any]) -> dict[str, Any]:
     """What of the product's isolation ``node`` (a ``node_snapshot``) still carries:
     the ``gpu-fault.io/`` ownership annotations, its ``gpu-fault.io/`` taints and
@@ -824,17 +905,22 @@ def unsettled_workflows(activity_document: dict[str, Any]) -> list[str]:
 
 __all__ = [
     "CHAIN_MARGIN_SECONDS",
+    "HANDOFF_CATEGORY",
+    "HANDOFF_MARKER",
+    "HANDOFF_SECONDS",
     "OPERATOR_EXIT_OPERATOR",
     "OPERATOR_EXIT_PROOF_SECONDS",
     "OPERATOR_EXIT_QUIET_SECONDS",
     "OPERATOR_EXIT_SETTLE_SECONDS",
     "Oracle",
     "activity",
+    "await_handoff_notification",
     "await_metric_recovery",
     "await_oracle_crossing",
     "cadence_record",
     "close_window",
     "containment_missing",
+    "handoff_notifications",
     "node_residual_isolation",
     "open_incident_ids",
     "open_window",
@@ -843,6 +929,7 @@ __all__ = [
     "restore_incidents",
     "run_survey",
     "runtime_profile_version",
+    "settle_incident",
     "sustained_detection_budget",
     "sustained_negative_window",
     "unsettled_workflows",

@@ -14,14 +14,18 @@ reads the product's own grading (``gpu_metrics`` -> ``gpu_memory_policy``):
   record that planned MARK_UNSCHEDULABLE/QUARANTINE and never executed them --
   the compile-time BLOCKED record live 2026-10-26, superseded 35 ms after
   creation with nothing ever reaching the node -- fails the chain stage;
-* ``remap_failure`` is CRITICAL DRAIN with the NVIDIA RMA field diagnostic and
-  ESCALATE_SUPPORT -- the node stays cordoned until an operator closes it, and
-  a field diagnosis is never read as "hardware already replaced". The variant
-  is that operator: it closes the ESCALATED incident through the product's
-  operator exit (``IncidentClosureService.close_incident``, the call
-  ``gpu-fault-admin workflow-reconcile --close-incident`` makes) and proves the
-  node released on fresh reads; a validated restore is refused for an
-  operator-held record and is not attempted (live 2026-10-26);
+* ``remap_failure`` is CRITICAL DRAIN: containment first (FREEZE_EVIDENCE,
+  MARK_UNSCHEDULABLE, QUARANTINE, the diagnostic bundle), then the NVIDIA RMA
+  field diagnostic -- which has no executable owner on this site
+  (memoryDiagnostics OBSERVE, b192 / R13h), so the record settles
+  BLOCKED/SAFETY_SETTLED, the incident QUARANTINED, the operator is told
+  (contained-operator-handoff) and the node stays held; a field diagnosis is
+  never read as "hardware already replaced". The variant proves the executed
+  containment on the node, then readmits it through the product's validated
+  restore once the replay has ended (the documented exit for that shape). A
+  record the product escalated instead (pre-b192: ESCALATED, an operator
+  closes it) takes the operator-close branch; a record that planned the chain
+  and never ran it (live 2026-10-26, compile-time BLOCKED) fails the chain;
 * ``pending_supported`` / ``post_reset`` are the authorized service-window
   single-GPU reset (``row_remap_pending`` on a modern GPU); they hold the
   reading until RESET_GPU has run, then serve a clean reading so the post-reset
@@ -247,7 +251,12 @@ def remap_failure(ctx: VariantContext) -> dict[str, Any]:
         label=f"row_remap_failure on {gpu}",
         operations=("FREEZE_EVIDENCE", "MARK_UNSCHEDULABLE", "QUARANTINE"),
         forbidden=RESET,
-        incident_states=frozenset({"ESCALATED", "ACTION_PENDING", "QUARANTINED"}),
+        # Planned by the DRAIN, owned by nobody here: memoryDiagnostics is
+        # OBSERVE on both live profiles, so the field diagnostic must not run.
+        unexecuted=frozenset({"RUN_FIELD_DIAGNOSTIC"}),
+        incident_states=frozenset(
+            {"QUARANTINED", "SAFETY_PENDING", "ACTION_PENDING", "ESCALATED"}
+        ),
     )
     detection = _wait_contained(
         ctx,
@@ -262,25 +271,27 @@ def remap_failure(ctx: VariantContext) -> dict[str, Any]:
         "chain": chain_errors(detection, incidents, chain),
         "hardware": no_hardware(detection, allowed=("RUN_FIELD_DIAGNOSTIC",)),
     }
+    # The replay ends before the exit: the restore's VALIDATE_GPU rightly
+    # refuses a node still reading row_remap_failure=1.
     replay.close()
     ctx.cleanup.discard("dcgm-replay")
-    # An RMA-class drain has no RESTORE_SCHEDULING and ends ESCALATED with the
-    # node cordoned, for an operator to close once the RMA is done; the
-    # validated restore is refused for that record ("operator hold retained",
-    # live 2026-10-26). The variant performs and proves that operator exit.
-    stages["recovery"], exits = _operator_close(ctx, incidents)
+    exit_stages, exit_record = _contained_exit(ctx, since, incidents)
+    stages.update(exit_stages)
     return result(
         stages,
         notes=[
-            "row remap failure drains and runs the NVIDIA RMA field diagnostic; "
-            "the diagnosis is never read as hardware already replaced",
-            "the node stays cordoned until the escalation is closed; the variant "
-            "closes it through the product's operator exit "
-            "(IncidentClosureService.close_incident, as gpu-fault-admin "
-            "workflow-reconcile --close-incident does) and proves the release; "
-            "a validated restore is refused for the operator-held record",
+            "row remap failure drains the node first; the NVIDIA RMA field "
+            "diagnostic has no executable owner on this site (memoryDiagnostics "
+            "OBSERVE), so the record settles SAFETY_SETTLED with the incident "
+            "QUARANTINED and the operator notified; the diagnosis is never read "
+            "as hardware already replaced",
+            "the contained node is readmitted through the product's validated "
+            "restore once the replay has ended (gpu-fault-admin "
+            "submit-remediation --disposition restore); only a record the "
+            "product escalated (ESCALATED) is closed through the operator exit "
+            "(IncidentClosureService.close_incident) instead",
         ],
-        extra={"gpu_uuid": gpu, "operator_exit": exits},
+        extra={"gpu_uuid": gpu, "contained_exit": exit_record},
     )
 
 
@@ -402,31 +413,109 @@ def _validated_restore(
     return []
 
 
-def _operator_close(
-    ctx: VariantContext, incidents: list[dict[str, Any]]
-) -> tuple[list[str], list[dict[str, Any]]]:
-    """The operator exit as a recovery stage: ``(errors, per-incident records)``.
+def _contained_exit(
+    ctx: VariantContext, since: Any, incidents: list[dict[str, Any]]
+) -> tuple[dict[str, list[str]], dict[str, Any]]:
+    """The exit the settled record asks for: ``({stage: errors}, record)``.
 
-    A node the chain never isolated, a refusal, an incident that was not left
-    ESCALATED, or isolation left on the node after the close is the stage's
-    error; nothing is retried and nothing is closed on an unisolated node.
+    Once the incident's workflow has settled, the node must carry the chain's
+    containment (cordon, the incident's quarantine taint, its ownership
+    annotation) -- a chain that never isolated the node is the recovery error
+    and nothing is restored or closed. Then the state decides:
+
+    * QUARANTINED (b192 / R13h: containment ran, the field diagnostic has no
+      executable owner, BLOCKED/SAFETY_SETTLED) -- the product's
+      contained-operator-handoff notification is required (the ``handoff``
+      stage) and the node is readmitted through the validated restore
+      (``restore_incidents``: VALIDATE_GPU/HOST/FABRIC then RESTORE_SCHEDULING,
+      the restore SUCCEEDED, no isolation left), the incident RECOVERED on a
+      fresh read;
+    * ESCALATED (the product handed the node to an operator) -- the operator
+      close, proven as ``operator_close_incidents`` proves it;
+    * anything else is the recovery error.
+
+    A refusal on either path is the stage's error and is never retried.
     """
 
-    from scripts.e2e.regional.general_live_common import operator_close_incidents
+    from scripts.e2e.regional.general_live_common import (
+        await_handoff_notification,
+        containment_missing,
+        node_residual_isolation,
+        operator_close_incidents,
+        restore_incidents,
+        settle_incident,
+    )
+    from scripts.e2e.regional.regional_commands import RegionalFixtureError
+    from scripts.e2e.regional.warm_spare_fixture import WarmSpareLiveFixture
 
+    node = ctx.settings.node
+    record: dict[str, Any] = {}
+    stages: dict[str, list[str]] = {}
     try:
-        closed = operator_close_incidents(
-            ctx,
-            incidents,
-            reason=(
-                f"{ctx.spec.key} live acceptance: escalation left by the case's own "
-                "fault injection (by design); closed by the variant's operator-exit "
-                "stage"
-            ),
-        )
+        if not incidents:
+            raise RegionalFixtureError("no incident to exit from")
+        incident_id = str(incidents[0]["incident_id"])
+        settled = settle_incident(ctx, incident_id)
+        before = ctx.regional.node_snapshot(node)
+        state = str(settled.get("state") or "")
+        record = {
+            "incident_id": incident_id,
+            "workflow_request_id": settled.get("workflow_request_id"),
+            "state_settled": state,
+            "node_before": node_residual_isolation(before),
+        }
+        ctx.evidence.write("contained-exit", record)
+        missing = containment_missing(before, incident_id)
+        if missing:
+            raise RegionalFixtureError(
+                f"chain never isolated the node {node} for {incident_id}: "
+                + "; ".join(missing)
+            )
+        if state == "QUARANTINED":
+            record["exit"] = "validated-restore"
+            stages["handoff"], record["handoff"] = await_handoff_notification(
+                ctx, since, incident_id
+            )
+            restored = restore_incidents(
+                ctx, incidents, reason=f"{ctx.spec.key} acceptance restore"
+            )
+            record["restore"] = restored
+            warm = WarmSpareLiveFixture(ctx.regional, ctx.settings.hyperpod_cluster)
+            fresh = warm.incident_by_id(incident_id)
+            record["state_after"] = fresh.get("state")
+            record["node_after"] = node_residual_isolation(
+                ctx.regional.node_snapshot(node)
+            )
+            if fresh.get("state") != "RECOVERED":
+                raise RegionalFixtureError(
+                    f"incident {incident_id} is {fresh.get('state')} after the "
+                    "validated restore succeeded, not RECOVERED"
+                )
+        elif state == "ESCALATED":
+            record["exit"] = "operator-close"
+            record["operator_exit"] = operator_close_incidents(
+                ctx,
+                incidents,
+                reason=(
+                    f"{ctx.spec.key} live acceptance: escalation left by the case's "
+                    "own fault injection (by design); closed by the variant's "
+                    "operator-exit stage"
+                ),
+            )
+        else:
+            raise RegionalFixtureError(
+                f"incident {incident_id} settled {state or 'unknown'}: neither the "
+                "contained QUARANTINED shape (validated restore) nor an ESCALATED "
+                "hand-off (operator close)"
+            )
     except Exception as exc:  # noqa: BLE001 - recorded as the stage's error
-        return [f"operator close failed: {type(exc).__name__}: {exc}"], []
-    return [], closed
+        stages["recovery"] = [f"contained exit failed: {type(exc).__name__}: {exc}"]
+    else:
+        stages["recovery"] = []
+    finally:
+        if record:
+            ctx.evidence.write("contained-exit", record)
+    return stages, record
 
 
 VARIANTS = [
@@ -488,9 +577,10 @@ VARIANTS = [
         CASE,
         "remap_failure",
         "set row_remap_failure=1 on a modern GPU",
-        "CRITICAL DRAIN with the RMA field diagnostic + ESCALATE_SUPPORT, no reset; "
-        "cordoned until the variant itself closes the escalation through the "
-        "product's operator exit and proves the node released",
+        "CRITICAL DRAIN containment first; the RMA field diagnostic has no "
+        "executable owner on this site (memoryDiagnostics OBSERVE) -> SAFETY_SETTLED, "
+        "incident QUARANTINED, operator notified; readmitted by the validated "
+        "restore after the replay ends; no reset",
         remap_failure,
         risk="M",
         max_minutes=30,

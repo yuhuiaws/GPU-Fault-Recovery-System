@@ -28,7 +28,6 @@ from scripts.e2e.regional.general_live_registry import HARDWARE_OPERATIONS
 from scripts.e2e.regional.general_live_verdicts import (
     TERMINAL_WORKFLOWS,
     final_execution,
-    operations,
     subsequence,
     workflows_of,
 )
@@ -128,7 +127,26 @@ class GpuChain:
     forbidden: frozenset[str] = HARDWARE_OPERATIONS
     #: Effective actions the incident may carry (``effective_action``).
     actions: frozenset[str] = frozenset()
+    #: Operations that may be planned but must not have executed on this site
+    #: (a capability the Runtime Profile holds at OBSERVE: 019 remap_failure's
+    #: RUN_FIELD_DIAGNOSTIC, memoryDiagnostics with no executable owner).
+    unexecuted: frozenset[str] = frozenset()
     notes: list[str] = field(default_factory=list)
+
+
+def planned_operations(workflow: dict[str, Any]) -> list[str]:
+    """Every step the record plans, safety steps first: a plan the product runs
+    as a SAFETY plan (b192: the containment prefix of a DRAIN whose diagnostic
+    has no executable owner) lists them under ``safety_steps``, the rest under
+    ``official_steps``; a chain is judged on both."""
+
+    return [
+        str(step.get("operation"))
+        for step in [
+            *(workflow.get("safety_steps") or []),
+            *(workflow.get("official_steps") or []),
+        ]
+    ]
 
 
 def isolating_steps(chain: GpuChain) -> list[str]:
@@ -255,14 +273,21 @@ def chain_errors(
         return [*errors, f"{label} incident {incident['incident_id']} has no workflow"]
     first = workflows_of(activity, str(incident["incident_id"]))
     workflow = first[0] if first else workflows[0]
-    steps = operations(workflow)
+    steps = planned_operations(workflow)
     if chain.operations and not subsequence(chain.operations, steps):
         errors.append(f"{label} workflow steps {steps} lack {list(chain.operations)}")
     errors.extend(never_executed_errors(workflow, chain))
     for item in workflows:
-        found = sorted(set(operations(item)) & set(chain.forbidden))
+        found = sorted(set(planned_operations(item)) & set(chain.forbidden))
         if found:
             errors.append(f"{label} workflow {item.get('request_id')} plans {found}")
+        for operation in sorted(chain.unexecuted):
+            execution = final_execution(item, operation)
+            if execution is not None:
+                errors.append(
+                    f"{label} workflow {item.get('request_id')} executed {operation} "
+                    f"({execution.get('status')}); it must not run on this site"
+                )
     if chain.validation is not None:
         execution = final_execution(workflow, chain.validation)
         if execution is None:
@@ -293,7 +318,7 @@ def read_only_errors(
     errors = []
     for incident in incidents:
         for workflow in workflows_of(activity, str(incident["incident_id"])):
-            steps = set(operations(workflow))
+            steps = set(planned_operations(workflow))
             isolating = sorted(steps & ISOLATING_OPERATIONS)
             hardware = sorted(steps & HARDWARE_OPERATIONS)
             if isolating:
@@ -316,7 +341,10 @@ def node_hardware_errors(
     return [
         f"workflow {workflow.get('request_id')} plans {sorted(found)}"
         for workflow in activity.get("workflows") or []
-        if (found := (set(operations(workflow)) & HARDWARE_OPERATIONS) - permitted)
+        if (
+            found := (set(planned_operations(workflow)) & HARDWARE_OPERATIONS)
+            - permitted
+        )
     ]
 
 
@@ -338,7 +366,7 @@ def operation_count(
     activity: dict[str, Any], operation: str, incidents: Sequence[dict[str, Any]]
 ) -> int:
     return sum(
-        operations(workflow).count(operation)
+        planned_operations(workflow).count(operation)
         for incident in incidents
         for workflow in workflows_of(activity, str(incident["incident_id"]))
     )
@@ -669,6 +697,7 @@ __all__ = [
     "never_executed_errors",
     "node_hardware_errors",
     "operation_count",
+    "planned_operations",
     "read_only_errors",
     "replay_effective",
     "served_values",
