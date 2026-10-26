@@ -645,8 +645,8 @@ def reporter_stopped(output: Any) -> dict[str, Any]:
 def _job(
     ctx: VariantContext, suffix: str, *, ranks: tuple[int, ...] = (0,)
 ) -> ManagedProgressJob:
-    name = run_identity(CASE, suffix, ctx.attempt, ctx.case_dir).replace(
-        "gl027", "gl27"
+    name = ctx.identity(
+        run_identity(CASE, suffix, ctx.attempt, ctx.case_dir).replace("gl027", "gl27")
     )
     job = ManagedProgressJob(ctx, name=name, ranks=ranks)
     ctx.cleanup.push(f"job-{name}", job.delete)

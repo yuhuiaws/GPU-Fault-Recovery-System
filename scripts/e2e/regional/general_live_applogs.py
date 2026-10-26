@@ -315,8 +315,8 @@ def _records(
 def _job(
     ctx: VariantContext, suffix: str, *, mode: str, restart_budget: int = 0
 ) -> ManagedApplogJob:
-    name = run_identity(CASE, suffix, ctx.attempt, ctx.case_dir).replace(
-        "gl017", "gl17"
+    name = ctx.identity(
+        run_identity(CASE, suffix, ctx.attempt, ctx.case_dir).replace("gl017", "gl17")
     )
     job = ManagedApplogJob(ctx, name=name, mode=mode, restart_budget=restart_budget)
     ctx.cleanup.push(f"job-{name}", job.delete)

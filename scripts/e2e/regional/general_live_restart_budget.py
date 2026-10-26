@@ -379,7 +379,13 @@ class SeededRestartBudget:
         self.ctx = ctx
         self.cluster_id = ctx.settings.regional.cluster_id
         digest = hashlib.sha256(ctx.run_id.encode()).hexdigest()[:8]
-        self.job_id = f"{TEST_JOB_PREFIX}{tag}-{digest}-a{int(ctx.attempt)}"
+        # The run's identity for the id: ``-r<n>`` on a rerun whose earlier
+        # managed job (024 creates one under this id) left closed journals, so
+        # the ledger row and the job stay one identity; a variant without a
+        # managed job has no journals and keeps the base.
+        self.job_id = ctx.identity(
+            f"{TEST_JOB_PREFIX}{tag}-{digest}-a{int(ctx.attempt)}"
+        )
         self.workflow_id = f"{self.job_id}-workflow"
         self.attempt_id = f"{self.job_id}-a001"
         self.budget = int(budget)

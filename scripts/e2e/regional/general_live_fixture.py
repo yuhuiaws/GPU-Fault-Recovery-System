@@ -107,20 +107,83 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+#: What every probe's ``--run-id`` and every fixture named after it accept.
+RUN_ID = re.compile(r"[a-z0-9][a-z0-9-]{2,62}")
+#: Where a case keeps its host-probe ownership records (``host_probe_fixture``):
+#: ``cases/<key>/host-probes/<pod>.json``, the Pod name a digest of the run id,
+#: node, case and probe script.
+HOST_PROBE_STATE = "host-probes"
+
+
 def run_identity(case_id: str, variant: str, attempt: int, run_dir: Path) -> str:
     """A run id unique per run directory, stable between plan and execute.
 
     Round run directories end in the same lane token every round; the digest
     of the resolved directory keeps two rounds from sharing on-node state.
+    This is the base: ``rerun_run_id`` adds ``-r<n>`` for a rerun of the same
+    lane and attempt.
     """
 
     number = case_id.rsplit("-", 1)[-1]
     digest = hashlib.sha256(str(run_dir.resolve()).encode()).hexdigest()[:8]
     stem = variant.replace("_", "-")[:28].strip("-")
     value = f"gl{number}-{stem}-a{int(attempt)}-{digest}"
-    if re.fullmatch(r"[a-z0-9][a-z0-9-]{2,62}", value) is None:
+    if RUN_ID.fullmatch(value) is None:
         raise RegionalFixtureError(f"cannot derive a safe run id from {variant!r}")
     return value
+
+
+def host_probe_records(case_dir: Path) -> list[tuple[str, bool]]:
+    """``(run id, closed)`` of every host-probe ownership record under
+    ``case_dir``'s state directories (``host-probes/``, 030's
+    ``spare-service/``): records a run keeps per probe Pod, named after a
+    digest of the run id, closed by that run's cleanup."""
+
+    records: list[tuple[str, bool]] = []
+    if not case_dir.is_dir():
+        return records
+    for directory in sorted(path for path in case_dir.iterdir() if path.is_dir()):
+        for path in sorted(directory.glob("*.json")):
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue  # not a record this rule can attribute to a run
+            scope = record.get("scope") if isinstance(record, dict) else None
+            if (
+                isinstance(scope, dict)
+                and isinstance(scope.get("run_id"), str)
+                and type(record.get("closed")) is bool
+            ):
+                records.append((scope["run_id"], record["closed"]))
+    return records
+
+
+def rerun_run_id(case_dir: Path, base: str) -> str:
+    """The run id of this run: ``base`` (``run_identity``), or ``base-r<n>``
+    once the case directory holds closed host-probe records of earlier runs
+    under it.
+
+    A host-probe ownership record is named after the run id and compared by
+    its whole scope -- the probe script's digest and the image included --
+    before ``create`` looks at anything: a rerun of the same lane and attempt
+    under the stable run id met the earlier run's record and, when a landing
+    had changed the probe script in between, refused "host probe ownership
+    record does not match this run" (live 2026-10-26 22:40Z, HyperPod lane hpb,
+    022.recovery_evidence after its 14:1xZ run). A new run id names new records
+    and new on-node state (``--run-id``: the node probe's state directory and
+    units, the DCGM replay and the source-replay run directories). A record
+    still open keeps its run id, so the fixture meets it and resumes or refuses
+    it as before (``fixture_ownership.rerun_ordinal_identity``).
+    """
+
+    from scripts.e2e.regional.fixture_ownership import rerun_ordinal_identity
+
+    records = host_probe_records(case_dir)
+    return rerun_ordinal_identity(
+        base,
+        lambda candidate: [closed for run_id, closed in records if run_id == candidate],
+        valid=RUN_ID,
+    )
 
 
 @dataclass(frozen=True)
@@ -461,7 +524,7 @@ class ProbeHandle:
                 case_id=key,
                 run_id=run_id,
                 probe_script=script,
-                state_directory=case_dir / "host-probes",
+                state_directory=case_dir / HOST_PROBE_STATE,
                 active_deadline_seconds=max(600, min(7200, deadline_seconds)),
                 host_root_propagation=host_root_propagation,
             )
@@ -499,8 +562,33 @@ class VariantContext:
     survey: dict[str, Any] = field(default_factory=dict)
     #: ``<file>@<node>`` of every second node-side file installed in this run.
     shipped: set[str] = field(default_factory=set)
+    #: Managed-job identity base -> the identity this run uses (``identity``).
+    identities: dict[str, str] = field(default_factory=dict)
     clock: Callable[[], datetime] = utc_now
     sleep: Callable[[float], None] = time.sleep
+
+    def identity(self, base: str) -> str:
+        """The managed-job identity this run uses for ``base``.
+
+        ``base`` itself, or ``base-r<n>`` once the case directory holds closed
+        custody journals of earlier runs under it
+        (``fixture_ownership.rerun_identity``); an earlier journal still open
+        keeps its identity so the fixture refuses it as cleanup-only. Decided
+        once per run and base: a second use in the same run -- 011's second
+        attempt of a job after the first attempt's journals were completed in
+        this very run -- names the same job again, and an identity this run
+        already derived (024 hands its ledger's job id to ``start_job``) is
+        returned as it is.
+        """
+
+        from scripts.e2e.regional.fixture_ownership import rerun_identity
+
+        value = self.identities.get(base)
+        if value is None and base in self.identities.values():
+            return base
+        if value is None:
+            value = self.identities[base] = rerun_identity(self.case_dir, base)
+        return value
 
     def probe(self, name: str, *, node: str | None = None) -> ProbeHandle:
         """The probe Pod running ``name`` (node, storage, net, window, dcgm,
@@ -767,11 +855,13 @@ __all__ = [
     "backing_root",
     "channel_errors",
     "configure",
+    "host_probe_records",
     "hyperpod_node_recovery",
     "node_provider",
     "read_only_preflight",
     "require_module",
     "require_tools",
+    "rerun_run_id",
     "run_identity",
     "utc_now",
 ]

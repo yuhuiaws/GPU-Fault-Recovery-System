@@ -1440,6 +1440,30 @@ sha256 前 10 位（不超过 43 字符，产品 `-r-<8位>` 重启副本与训�
 工作负载并记入日志，清理记录列出删除的每个对象；工作负载与预热 Pod 两部分清理
 总是都执行。创建前名称或 job id 已被占用时拒绝，并逐个列出占用者（kind/name、
 UID、job id、attempt、owner、状态，是否为其他验收运行的遗留），绝不自动删除。
+同一 lane 对同一 attempt 的重跑不再撞上自己的旧账本（2026-10-26 hpb lane 的 017
+三个变体重跑均 INCONCLUSIVE "an existing fixture is cleanup-only" 的根因）：受管作业
+身份（`run_identity` 派生的 `gl17-op-a6-<digest>`、003 的 `gl3-idle-<attempt>`、028/029
+的 `gl28…-<digest>-<attempt>`、024 的重启预算 job id，以及 GF-ENV-LIVE-010 的 control
+task）按 `fixture_ownership.rerun_identity` 取 base；当 case 目录里该 base 的
+`.ownership.json`/`.prewarm.json` 已全部关闭（completed，或从未 begin 且无任何
+creation——夹具自身"nothing created"的证明）时取首个无账本的 `<base>-r2`、`-r3`……；
+已 begin 未 completed 的账本仍沿用原身份，由夹具拒绝为 cleanup-only（崩溃运行的托管
+绝不被跳过，其 cleanup-only 续跑先清掉残留，再下一次重跑才用 `-r2`）。派生只读磁盘
+账本、不写账本、不碰集群，plan 与 execute 结果一致；`VariantContext.identity` 每次运行
+每个 base 只判一次（011 的第二 attempt 仍是同一 job），派生身份仍是不超过 58 字符的
+label 值（`-a<nnn>` attempt id 不超 63），结果 `identities` 记录 base→实际身份。
+run id 本身按同一规则看 host-probe 所有权记录（`cases/<key>/host-probes/<pod>.json`，
+030 的 `spare-service/`）：记录名是 run id/节点/case/探针脚本的摘要，夹具在 `create`
+之前先比对整个 scope（含探针脚本摘要与镜像），同一 lane 同一 attempt 用稳定 run id
+重跑便撞上上次的记录，中间若有 landing 改了探针脚本即拒绝 "host probe ownership record
+does not match this run"（2026-10-26 22:40Z hpb 022.recovery_evidence 重跑；其 14:1xZ
+记录因协调器磁盘满仍是 open）。`rerun_run_id` 取 base 或首个无记录的 `<base>-r<n>`，
+前提是更早的记录全部 closed；仍 open 的记录沿用原 run id，由夹具照旧续跑或拒绝（那条
+live 022 记录是 open 的，该 lane 仍被拒，直到记录被其 cleanup-only 续跑关闭或人工移除，
+属设计所为）。由 run id 派生的一切随之改变：host-probe 记录与 Pod 名、节点探针的
+on-node 状态目录与 deadman 单元、DCGM 回放与源回放的运行目录、预热的 `run_id`；plan 在
+`details.run_id` 记下 execute 将用的 run id，两者读同一 case 目录、结果一致
+（`tests/regional/test_general_live_rerun_identity.py`）。
 
 ### 证据与判定
 

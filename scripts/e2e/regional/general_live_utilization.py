@@ -181,6 +181,7 @@ def _request_gpus(document: dict[str, Any], gpu_count: int) -> None:
 
 
 def _managed_job(ctx: VariantContext, name: str, gpu_count: int = 8) -> ManagedIdleJob:
+    name = ctx.identity(name)
     job = ManagedIdleJob(ctx, name=name, gpu_count=gpu_count)
     ctx.cleanup.push(f"job-{name}", job.cleanup)
     job.start()
@@ -602,7 +603,7 @@ def attempt_change(ctx: VariantContext) -> dict[str, Any]:
     ctx.hold(200, name="attempt-a")
     # Replace attempt A with a fresh attempt B on the same node.
     job_a.cleanup()
-    ctx.cleanup.discard(f"job-gl3-attA-{ctx.attempt}")
+    ctx.cleanup.discard(f"job-{job_a.name}")
     job_b = _managed_job(ctx, f"gl3-attB-{ctx.attempt}")
     identity_b = job_b.identity()
     started_b = utc_now()

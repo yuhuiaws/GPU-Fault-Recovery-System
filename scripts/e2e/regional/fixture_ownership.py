@@ -6,6 +6,7 @@ import argparse
 import copy
 import hashlib
 import json
+import re
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict
@@ -594,3 +595,110 @@ def creation_document(raw: str) -> dict[str, Any]:
         raise RegionalFixtureError(
             "fixture creation acknowledgement is not a bounded object"
         ) from None
+
+
+#: The custody journals one managed-job identity keeps in its case directory:
+#: ``<identity>.ownership.json`` (``ManagedWorkloadFixture``) and
+#: ``<identity>.prewarm.json`` (``ImagePrewarmFixture``); a job's later attempt
+#: journals under ``<identity>-a<nnn>`` (``ManagedNcclJob.attempt_number``).
+JOURNAL_KINDS = ("ownership", "prewarm")
+ATTEMPT_STEM = re.compile(r"-a[0-9]{3}$")
+#: ``-r<n>``: the n-th run of the same identity in the same case directory.
+RERUN_LIMIT = 99
+#: A derived identity is a job id: a label value (``training_submit_cli``
+#: ``LABEL_PATTERN``; 003's ``gl3-attA-1`` keeps its case) that leaves room for
+#: its ``-a<nnn>`` attempt id inside the 63-character label both must fit.
+RERUN_IDENTITY = re.compile(r"[A-Za-z0-9][-_.A-Za-z0-9]{1,56}[A-Za-z0-9]")
+
+
+def custody_closed(path: Path) -> bool:
+    """Whether the custody journal at ``path`` holds nothing any more.
+
+    Closed is a completed journal (its cleanup proved every creation gone), or
+    one that was never begun and journaled nothing: ``begin`` precedes every
+    intent and every intent precedes its create, so such a journal is the proof
+    a failed preparation leaves (``nothing_intended``). A journal that was begun
+    and not completed is a crashed run's custody and stays cleanup-only; one
+    that cannot be read as a private journal counts the same way.
+    """
+
+    try:
+        record = OwnershipRecord.model_validate(read_private_document(path))
+    except (RegionalFixtureError, ValueError, TypeError, OSError):
+        return False
+    if record.completed:
+        return True
+    return not (
+        record.started or record.creations or record.observed or record.cleanup_custody
+    )
+
+
+def custody_journals(directory: Path, identity: str) -> list[Path]:
+    """The custody journals ``identity`` has in ``directory``: its own and
+    those of its later attempts (``<identity>-a<nnn>``)."""
+
+    if not directory.is_dir():
+        return []
+    found = []
+    for path in sorted(directory.iterdir()):
+        for kind in JOURNAL_KINDS:
+            suffix = f".{kind}.json"
+            if not path.name.endswith(suffix):
+                continue
+            stem = path.name[: -len(suffix)]
+            if stem == identity or ATTEMPT_STEM.sub("", stem, count=1) == identity:
+                found.append(path)
+    return found
+
+
+def rerun_ordinal_identity(
+    base: str,
+    custody: Callable[[str], list[bool]],
+    *,
+    valid: re.Pattern[str] = RERUN_IDENTITY,
+) -> str:
+    """``base``, or ``base-r<n>``: the first identity without on-disk records,
+    once every earlier one's records are closed.
+
+    ``custody(identity)`` is whether each record that identity left in the
+    case directory is closed (``[]``: none). The first of ``base``,
+    ``base-r2``, ``base-r3``, ... with no record is this run's; an earlier one
+    with a record still open is returned as it is, so the fixture that keeps
+    that record meets it and refuses or resumes it the way it always did -- a
+    crashed run's custody is never skipped. Nothing here touches the cluster
+    or writes a record: plan and execute, minutes apart in one lane, read the
+    same files and agree.
+    """
+
+    for ordinal in range(1, RERUN_LIMIT + 1):
+        candidate = base if ordinal == 1 else f"{base}-r{ordinal}"
+        if valid.fullmatch(candidate) is None:
+            raise RegionalFixtureError(f"cannot derive a rerun identity from {base!r}")
+        states = custody(candidate)
+        if not states or not all(states):
+            return candidate
+    raise RegionalFixtureError(f"{base!r} has used every rerun identity")
+
+
+def rerun_identity(directory: Path, base: str) -> str:
+    """The managed-job identity a run uses for ``base`` in ``directory``:
+    ``base``, or ``base-r<n>`` once the case directory holds closed custody
+    journals of earlier runs under it.
+
+    Managed-job identities are stable per lane and attempt (the run id is a
+    digest of the run directory), and a journaled fixture is create-once: a
+    rerun of the same variant by the same lane found its own earlier journals
+    and refused "an existing fixture is cleanup-only" before any mutation (live
+    2026-10-26, HyperPod lane hpb: 017.old_pod, cri_partial_rotation and
+    live_pid, each rerun after a landing, INCONCLUSIVE; the other lane's reruns
+    had a different digest and passed). Closed is ``custody_closed``; an
+    identity with a journal still open is returned as it is, so the fixture
+    refuses it as cleanup-only.
+    """
+
+    return rerun_ordinal_identity(
+        base,
+        lambda identity: [
+            custody_closed(path) for path in custody_journals(directory, identity)
+        ],
+    )

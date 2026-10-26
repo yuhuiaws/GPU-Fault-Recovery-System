@@ -2940,6 +2940,76 @@ managed-job variant with the runner's own settings, fixtures and journals --
 only the kubectl subprocess, the store read and the host probes are fakes --
 up to its first cluster mutation.
 
+A rerun of a managed-job variant by the same lane then met its own earlier
+journals. Every managed-job identity is stable per lane and attempt
+(`run_identity`: case number, job suffix, attempt and a digest of the case
+directory, e.g. `gl17-op-a6-227ee78d`; 003's `gl3-idle-<attempt>` and the
+`gl28..-<digest>-<attempt>` ids of 028/029 likewise), and a journaled fixture
+is create-once: an identity whose `.ownership.json` / `.prewarm.json` already
+exist in the case directory is cleanup-only. Right for a crashed run, that
+refused every deliberate rerun of a variant the same lane had already run and
+cleaned up within one campaign attempt -- live 2026-10-26 on the HyperPod lane
+hpb, 017.old_pod, 017.cri_partial_rotation and 017.live_pid, each rerun released
+by a landing after its fix, INCONCLUSIVE "harness fixture failed:
+RegionalFixtureError: an existing fixture is cleanup-only" at the prewarm's
+`begin`, while the morning's run of the same variant had completed both
+journals; reruns the other lane picked up had another digest and passed, so it
+looked sporadic. The identity rule is now rerun-aware
+(`fixture_ownership.rerun_identity`): a run uses the base identity, or
+`<base>-r2`, `-r3`, ... -- the first without journals in the case directory --
+provided every earlier one is closed, where closed is a completed journal or
+one never begun that journaled nothing (the fixtures' own proof that nothing
+was created); an earlier journal begun and not completed keeps its identity,
+so the fixture still refuses it as cleanup-only and a crashed run's custody is
+never skipped (its cleanup-only resumption removes what the crashed run left,
+and the rerun after that starts fresh under `-r2`). The derivation reads the
+journals and writes nothing, and touches no cluster, so plan and execute,
+minutes apart in one lane, agree. `VariantContext.identity` memoises the rule
+per run and base -- 011's second attempt of a job still names the same job --
+and every naming site goes through it: the `_job` helpers of 011, 017, 027,
+028/029, 003's `_managed_job`, 024's `start_job` and the restart-ledger id of
+`SeededRestartBudget` (the ledger row and the managed job stay one identity; a
+variant without a managed job has no journals and keeps its id), and the
+GF-ENV-LIVE-010 control task (`env_live_scope.ControlTask`; its run id already
+carries the start time, the rule covers a reuse). A derived identity is a
+label value of at most 58 characters so its `-a<nnn>` attempt id fits the
+63-character label, and the workload name is its own digest
+(`managed_workload_name`). The result records `identities` (base to the
+identity used).
+
+The run id itself has the same rule over the host-probe ownership records.
+Every host-probe Pod of a run keeps a record under
+`cases/<key>/host-probes/<pod>.json` (030's spare service under
+`spare-service/`), its name a digest of the run id, node, case and probe
+script, and the fixture compares the record's whole scope -- the probe
+script's digest and the image included -- before `create` looks at anything
+else, so a rerun of the same lane and attempt under the stable run id met the
+earlier run's record; when a landing had changed the probe script in between,
+it refused "host probe ownership record does not match this run" (live
+2026-10-26 22:40Z, HyperPod lane hpb, 022.recovery_evidence rerun after its
+14:1xZ run, whose record was still open because that run's result was lost to
+the coordinator's disk-full event). `rerun_run_id` names the run `base` or
+`base-r<n>`: the first run id without records in the case directory, provided
+every earlier one's records are closed; a record still open keeps its run id,
+so the fixture meets it and resumes or refuses it exactly as before (that live
+022 record is open, so its lane stays refused until the record is closed or
+removed by hand -- by design). Everything derived from the run id follows:
+the host-probe record and Pod names, the node probe's on-node state directory
+and deadman units, the DCGM replay and source-replay run directories, the
+prewarm's `run_id`. The plan records the run id the execute will use
+(`details.run_id`); both derive it from the same case directory and agree.
+`tests/regional/test_general_live_rerun_identity.py` runs 028.nonzero_exit
+three times in one case directory against the fake cluster (the base, `-r2`,
+`-r3`, each a PASS under its own job, the earlier journals untouched), reruns
+over a crashed run's open journals (refused as cleanup-only, the crashed
+custody removed, the next rerun under `-r2`), the control task's second
+construction, every wrapper's journal names, the journal states the rule
+reads, and the host-probe side with the real fixture over the in-memory API:
+a closed record and a changed probe script give a new run id and a fresh
+record, an open record keeps the run id and is refused as before until its
+own cleanup-only resumption closes it, and the runner names the run after the
+records it finds.
+
 Past that mutation, all nine executable 027 variants then failed before any
 fault (live 2026-10-24, plain-EKS lane): "managed workload did not become
 healthy", the job's only Pod Running and NotReady for the whole 900-s start

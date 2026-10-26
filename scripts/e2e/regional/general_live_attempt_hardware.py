@@ -597,6 +597,9 @@ class ManagedTrainingJob:
 def start_job(ctx: VariantContext, *, name: str, restart_budget: int) -> Any:
     """Create, register on the LIFO stack, start and wait for the job."""
 
+    # ``name`` is the restart ledger's job id, already this run's identity
+    # (``SeededRestartBudget``); a second derivation returns the same value.
+    name = ctx.identity(name)
     job = ManagedTrainingJob(ctx, name=name, restart_budget=restart_budget)
     ctx.cleanup.push(f"job-{name}", job.cleanup)
     running = job.start()

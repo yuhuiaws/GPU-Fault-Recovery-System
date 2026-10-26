@@ -345,6 +345,7 @@ def _job(
     gpu_count: int = 8,
     ranks: int = 1,
 ) -> ManagedFailJob:
+    name = ctx.identity(name)
     job = ManagedFailJob(
         ctx,
         name=name,

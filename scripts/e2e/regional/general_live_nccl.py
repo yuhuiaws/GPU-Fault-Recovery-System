@@ -768,8 +768,8 @@ def _job(
     keep_active: bool = True,
     stall_mode: str = "quiet",
 ) -> ManagedNcclJob:
-    name = run_identity(CASE, suffix, ctx.attempt, ctx.case_dir).replace(
-        "gl011", "gl11"
+    name = ctx.identity(
+        run_identity(CASE, suffix, ctx.attempt, ctx.case_dir).replace("gl011", "gl11")
     )
     job = ManagedNcclJob(
         ctx,

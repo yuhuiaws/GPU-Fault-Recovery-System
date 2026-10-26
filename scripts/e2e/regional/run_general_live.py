@@ -47,6 +47,7 @@ from scripts.e2e.regional.general_live_fixture import (  # noqa: E402
     add_arguments,
     configure,
     read_only_preflight,
+    rerun_run_id,
     run_identity,
     utc_now,
 )
@@ -74,11 +75,19 @@ SCHEMA_VERSION = 2
 
 
 def plan_details(
-    spec: VariantSpec, settings: GeneralLiveSettings, preflight: dict[str, Any]
+    spec: VariantSpec,
+    settings: GeneralLiveSettings,
+    preflight: dict[str, Any],
+    *,
+    run_id: str = "",
 ) -> dict[str, Any]:
     return {
         "variant": spec.describe(),
         "risk": {"L": "diagnostic", "M": "isolation", "H": "dangerous"}[spec.risk],
+        # The run id the execute will use (``rerun_run_id``: the base, or
+        # ``-r<n>`` on a rerun of this lane and attempt); informational, the
+        # execute derives it again from the same case directory.
+        "run_id": run_id,
         "target_node": settings.node,
         "peer_node": settings.peer_node or None,
         "approvals_required": list(spec.approvals),
@@ -157,7 +166,9 @@ def execute_variant(
         settings=settings,
         regional=regional,
         case_dir=case_dir,
-        run_id=run_identity(spec.case_id, spec.variant, attempt, run_dir),
+        run_id=rerun_run_id(
+            case_dir, run_identity(spec.case_id, spec.variant, attempt, run_dir)
+        ),
         attempt=attempt,
         deadline=deadline,
         evidence=evidence,
@@ -221,6 +232,9 @@ def _teardown(ctx: VariantContext, result: dict[str, Any]) -> None:
     result["cleanup"] = cleanup
     result["probe_residuals"] = probe_residuals
     result["cleanup_pending"] = ctx.cleanup.pending()
+    # Which identity each managed job ran under: its base, or ``<base>-r<n>``
+    # on a rerun of the same lane and attempt (``VariantContext.identity``).
+    result["identities"] = dict(ctx.identities)
     dirty = (
         ctx.cleanup.failed
         or ctx.cleanup.pending()
@@ -288,6 +302,10 @@ def main() -> int:
     confirmation = spec.confirmation
     if not arguments.execute:
         passed = not preflight.get("errors")
+        run_id = rerun_run_id(
+            case_dir,
+            run_identity(spec.case_id, spec.variant, arguments.attempt, run_dir),
+        )
         plan = build_plan(
             arguments=arguments,
             preflight_passed=passed,
@@ -296,7 +314,10 @@ def main() -> int:
             attempt=arguments.attempt,
             confirmation=confirmation,
             environment=settings.environment(),
-            details={**plan_details(spec, settings, preflight), "preflight": preflight},
+            details={
+                **plan_details(spec, settings, preflight, run_id=run_id),
+                "preflight": preflight,
+            },
         )
         print(json.dumps(plan, indent=2, sort_keys=True))
         return 0 if (passed or spec.deferred) else 1

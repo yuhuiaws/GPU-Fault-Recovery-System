@@ -144,6 +144,7 @@ class ControlTask:
         node: str,
         gpu_count: int = CONTROL_TASK_GPU_COUNT,
     ) -> None:
+        from scripts.e2e.regional.fixture_ownership import rerun_identity
         from scripts.e2e.regional.managed_workload_fixture import (
             ImagePrewarmFixture,
             ManagedWorkloadFixture,
@@ -154,7 +155,10 @@ class ControlTask:
 
         yaml = __import__("yaml")
         self.node = node
-        self.name = control_task_name(case_id, run_id)
+        # ``-r<n>`` when the case directory already holds closed journals of
+        # this run id's task (a rerun under one run id); an open journal keeps
+        # the name and the fixture refuses it as cleanup-only.
+        self.name = rerun_identity(case_dir, control_task_name(case_id, run_id))
         self.attempt_id = f"{self.name}-a001"
         source = (
             Path(__file__).with_name("manifests") / "training" / CONTROL_TASK_MANIFEST
