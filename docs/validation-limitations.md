@@ -3057,6 +3057,35 @@ restores that incident) and restores only the error GPU's incident.
 `memory_failure` (both signals on one GPU) is unchanged: there the components
 are suppressed into the composite and no reset is planned (PASS 2026-10-26).
 
+024 `independent_xid` FAILED live (2026-10-26 08:07Z, eks ip-10-0-43-5, R13g,
+harness live14) with two CORRECTABLE_MEMORY_DEGRADATION incidents for one held
+pair: `inc-gpu-dcgm-<node>-1793001279120143-GPU-053ab270-...-composite-CORRECTABLE_MEMORY_DEGRADATION`
+(batch 07:54:39.12Z, the first replayed scrape, WARNING) and
+`...-1793001309238684-...` (batch 07:55:09.24Z, the third consecutive scrape).
+Both lie inside the run's window (started 07:52:34Z) and precede the kernel
+XID injection (07:55:57Z), and the replay journal shows both counters rising
+by one on every read with no gap or abort, so neither the activity window nor
+the XID replay minted the second one. It is the product's own escalation:
+`GpuMetricsService._add_memory_composites` (`gpu_metrics.py`) turns the
+composite CRITICAL at `correctable_memory_drain_consecutive_samples` (3)
+consecutive breaches, the store's `update_gpu_findings` treats a severity
+change as a new activation (`store/memory/telemetry.py`,
+`store/postgres/gpu_telemetry.py`), the composite finding id is stamped with
+the batch (`gpu_composites.composite_finding`), and the ingest mints one
+NODE_HEALTH incident per activated finding id (`app/ingest/gpu_findings.py`,
+`event_id gpu-<finding id>`), so a sustained correctable-memory episode opens
+a second incident while the first is still open -- against the 024 rule that
+sustained (reused) components keep one composite incident
+(`reused_components`, whose 80-read hold crosses the same third sample). The
+harness oracle is unchanged pending the product lane's ruling; a strict-xfail
+test in `tests/regional/test_general_live_gpu_composite.py` records the
+expected contract and reproduces the two activations with the product's own
+service. The same run's XID 92 reached no decision within 420 s although the
+kmsg fixture was armed (07:55:57Z, the run's own sequence band, a current
+monotonic stamp, the window's open and arm receipts clean); the product's XID
+event records and the kernel collector's log for that window are to be read
+before the variant is re-run -- the fixture side shows nothing wrong.
+
 024 `thermal_warning` and `power_performance` reuse the GF-ENV-LIVE
 telemetry replay unchanged (`tools/gpu_environment_replay.py`,
 `probes/env_replay_proxy.py`, `env_live_fixture.EnvReplayController`) through

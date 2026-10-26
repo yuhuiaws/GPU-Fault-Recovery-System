@@ -817,3 +817,66 @@ def test_product_composes_either_second_component_with_the_primary() -> None:
         finding = composite_of(comp.UNCORRECTABLE_PRIMARY, companion)
         assert finding.correlation_rule_id == comp.MEMORY_RULE, companion
         assert finding.automatic_action == "QUARANTINE", companion
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "product gap, live 2026-10-26 08:07Z (eks ip-10-0-43-5, R13g, 024 "
+        "independent_xid): the CORRECTABLE_MEMORY_DEGRADATION composite turns "
+        "CRITICAL at correctable_memory_drain_consecutive_samples "
+        "(gpu_metrics._add_memory_composites) and the severity change is a new "
+        "activation -- a batch-stamped second finding id (gpu_composites.composite_finding) "
+        "and a second NODE_HEALTH incident (app/ingest/gpu_findings: event_id "
+        "gpu-<finding id>) for one sustained episode; awaiting the product lane"
+    ),
+)
+def test_a_sustained_correctable_pair_activates_one_composite() -> None:
+    """One composite activation per sustained episode -- the 024 contract that
+    reused components keep one composite incident (``reused_components``) and
+    what ``independent_xid``'s single-incident chain check expects. Live, the
+    held pair (both counters +1 on every scrape) minted a WARNING composite on
+    the first replayed scrape (batch 07:54:39.12Z) and a CRITICAL one on the
+    third (07:55:09.24Z), 30 s apart and before the kernel XID was injected.
+    """
+
+    from datetime import datetime, timedelta, timezone
+
+    from gpu_fault.gpu_metrics import (
+        GpuMetricBatch,
+        GpuMetricSample,
+        GpuMetricSource,
+        GpuMetricsService,
+    )
+
+    start = datetime(2026, 10, 26, 7, 54, 9, tzinfo=timezone.utc)
+    service = GpuMetricsService()
+    activations = []
+    for tick in range(6):
+        outcome = service.ingest(
+            GpuMetricBatch(
+                batch_id=f"b{tick}",
+                cluster_id="gpu-eks-cluster",
+                node_id="ip-10-0-43-5.us-west-2.compute.internal",
+                observed_at=start + timedelta(seconds=15 * tick),
+                source=GpuMetricSource.DCGM_EXPORTER,
+                samples=[
+                    GpuMetricSample(
+                        metric_name=f"DCGM_{name.upper()}",
+                        canonical_name=name,
+                        value=tick,
+                        gpu_index="1",
+                        gpu_uuid=G1,
+                        pci_bdf="0000:01:00.0",
+                    )
+                    for name in (PRIMARY, "row_remap_correctable_total")
+                ],
+            )
+        )
+        activations.append(
+            [
+                (finding.correlation_rule_id, str(finding.severity.value))
+                for finding in outcome.new_composite_findings
+            ]
+        )
+    assert activations == [[], [(comp.CORRECTABLE_RULE, "WARNING")], [], [], [], []]

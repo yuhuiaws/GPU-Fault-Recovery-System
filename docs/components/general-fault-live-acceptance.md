@@ -732,6 +732,19 @@ GPU 的 incident 由产品链自行收敛（stage `repair_settled`：全部工�
 变体不对它做 restore），只有错误 GPU 的 incident 走 validated restore。`memory_failure`（同卡
 dbe + pending）不变：组件被压入复合，不计划 reset。
 
+`independent_xid` 2026-10-26 08:07Z（eks ip-10-0-43-5，R13g）FAIL "2 CORRECTABLE_MEMORY_DEGRADATION
+incidents (expected one)"：两个复合 incident 的 batch 分别为 07:54:39.12Z（第一次回放读，WARNING）
+与 07:55:09.24Z（第三次连续突破），都在本次运行窗口内且都早于内核 XID 注入（07:55:57Z），回放
+日志里两个计数器每次读各 +1、无中断无 abort，所以既不是活动窗口算入旧案例，也不是 XID 回放所致，
+而是产品行为：`gpu_metrics._add_memory_composites` 在 `correctable_memory_drain_consecutive_samples`
+（3）次连续突破时把复合升为 CRITICAL，store 的 `update_gpu_findings` 以 severity 变化判定为新激活，
+复合 finding id 带 batch（`gpu_composites.composite_finding`），ingest 以 `gpu-<finding id>` 铸
+第二个 NODE_HEALTH incident——同一持续事件两个复合 incident，与本节"检查实际工作流去重"及
+`reused_components`（80 读保持同样跨过第 3 个样本）的预期相悖。夹具 oracle 未改，待产品车道裁定；
+`tests/regional/test_general_live_gpu_composite.py` 以 strict xfail 记录应有合同。同次运行的
+XID 92 在 420 s 内无任何决策记录，夹具侧（每运行独立 kmsg 序号带、当前单调时间戳、窗口开启/
+写入回执）未见异常，重跑前需查产品 store 的 XID 事件与内核采集器日志。
+
 ### GF-GENERAL-LIVE-025
 
 必测：`exporter_timeout`、`missing_field`、`one_gpu_missing`、`conflicting_alias`、
