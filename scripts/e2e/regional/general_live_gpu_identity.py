@@ -16,15 +16,32 @@ Two variants are expected FAIL against the current product:
 change is never diagnosed) and ``stale_boot`` (the baseline is keyed on
 cluster+node and the snapshot's boot id is never compared, so old-boot
 inventory overrides the current one).
+
+The oracle gate (``_replay``) waits for the wrapper's first rewritten real
+inventory query from the repoint on, inside ``inventory_window_seconds``: the
+restarted collector queries the inventory on its first tick (start-up spread
+plus start-up jitter) and then every inventory interval, so a journal judged
+once right after the repoint holds nothing (live 2026-10-26, plain EKS,
+``bdf_changed`` and ``count_unchanged`` INCONCLUSIVE 14-15 s after the
+collector restart, the first real query 6-21 s after it). The reviewed plan's
+``not_after`` is composed before the first file lands on the node, as the
+deploy allowance plus the variant's hold; a deploy that overran the allowance
+is a named fixture failure, never a plan that expires under the variant.
 """
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
-from scripts.e2e.regional.general_live_fixture import VariantContext, VariantNotRun
+from scripts.e2e.regional.general_live_fixture import (
+    VariantContext,
+    VariantInconclusive,
+    VariantNotRun,
+)
 from scripts.e2e.regional.general_live_gpu_replay import (
     DcgmReplay,
+    GpuSurvey,
     activity_now,
     no_hardware,
     passthrough_plan,
@@ -50,37 +67,137 @@ MISMATCH = "gpu_inventory_mismatch"
 RESET = frozenset(
     {"RESET_GPU", "RESET_ALL_GPUS_NVSWITCHES", "RESTART_NODE", "REPLACE_NODE"}
 )
+#: The restarted collector's first tick -- and with it its first inventory
+#: query (``collectors/gpu/inventory_cadence.GpuInventoryCadence.is_due``: due
+#: while nothing was delivered yet) -- follows the start-up spread
+#: (``collectors/gpu/dcgm.py``: ``next_stable_phase`` over
+#: ``GPU_FAULT_COLLECTOR_STARTUP_SPREAD_SECONDS``, product default 15 s) plus
+#: the random start-up jitter (``collectors/cadence.CadenceJitter``:
+#: ``[0, GPU_FAULT_COLLECTOR_STARTUP_JITTER_SECONDS)``, default 20 s); the next
+#: queries come every ``GPU_FAULT_GPU_INVENTORY_INTERVAL_SECONDS`` (60 s on
+#: this site). The gate allows that first tick, two inventory intervals (a
+#: failed first query is retried on the next ticks) and a grace for the probe
+#: round trips: 185 s on this site, from the repoint receipt.
+STARTUP_SPREAD_KEY = "GPU_FAULT_COLLECTOR_STARTUP_SPREAD_SECONDS"
+STARTUP_JITTER_KEY = "GPU_FAULT_COLLECTOR_STARTUP_JITTER_SECONDS"
+DEFAULT_STARTUP_SPREAD_SECONDS = 15
+DEFAULT_STARTUP_JITTER_SECONDS = 20
+INVENTORY_GATE_INTERVALS = 2
+INVENTORY_GATE_GRACE_SECONDS = 30
+#: The time the fixture allows between composing the reviewed plan and the
+#: collector's restart (four source installs, deploy-proxy, repoint-collector:
+#: about a minute live, each call bounded by its own probe timeout). The plan's
+#: ``not_after`` is composed before the first file lands on the node
+#: (``install-source`` refuses a second copy), so it is this allowance plus the
+#: variant's hold: from the repoint on, the plan stays valid for the whole hold
+#: -- the gate window, the detection wait and the rebaseline hold are inside
+#: it -- and a deploy that overran the allowance is reported with its duration
+#: instead of expiring the plan under the running variant.
+INVENTORY_DEPLOY_ALLOWANCE_SECONDS = 600
 
 
 def _hold(ctx: VariantContext) -> int:
     return min(ctx.spec.max_minutes * 60, 20 * 60)
 
 
-def _inventory_plan(
-    ctx: VariantContext, operations: list[dict[str, Any]]
-) -> dict[str, Any]:
-    import time
+def _seconds(survey: GpuSurvey, key: str, default: int) -> int:
+    """A collector setting the product reads as a number of seconds."""
 
-    return {"operations": operations, "not_after": time.time() + _hold(ctx) + 600}
+    raw = (survey.raw.get("collector_env") or {}).get(key)
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 0 else default
+
+
+def inventory_window_seconds(survey: GpuSurvey) -> int:
+    """How long the first rewritten inventory query may take after the repoint."""
+
+    return (
+        _seconds(survey, STARTUP_SPREAD_KEY, DEFAULT_STARTUP_SPREAD_SECONDS)
+        + _seconds(survey, STARTUP_JITTER_KEY, DEFAULT_STARTUP_JITTER_SECONDS)
+        + INVENTORY_GATE_INTERVALS * survey.inventory_interval
+        + INVENTORY_GATE_GRACE_SECONDS
+    )
+
+
+def inventory_plan(
+    operations: list[dict[str, Any]], *, composed_at: float, hold: int
+) -> dict[str, Any]:
+    """The reviewed plan: valid for the deploy allowance plus the hold."""
+
+    return {
+        "operations": operations,
+        "not_after": composed_at + INVENTORY_DEPLOY_ALLOWANCE_SECONDS + hold,
+    }
+
+
+def _iso(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat()
 
 
 def _replay(
     ctx: VariantContext,
+    survey: GpuSurvey,
     operations: list[dict[str, Any]],
     *,
     boot_id: str = "",
     unknown_expected_count: bool = False,
 ) -> DcgmReplay:
+    """Deploy the inventory wrapper and gate on its first rewritten query.
+
+    The clock is the context's (the wall clock live; a virtual one in tests),
+    read as an epoch for the plan the node-side wrapper compares against
+    ``time.time()``. The gate evidence (``inventory-gate.json``) records the
+    window, the deploy duration and the plan's remaining validity.
+    """
+
+    hold = _hold(ctx)
+    composed_at = ctx.clock().timestamp()
+    plan = inventory_plan(operations, composed_at=composed_at, hold=hold)
     replay = DcgmReplay(
         ctx,
         passthrough_plan(),
-        _hold(ctx),
-        inventory_plan=_inventory_plan(ctx, operations),
+        hold,
+        inventory_plan=plan,
         boot_id=boot_id,
         unknown_expected_count=unknown_expected_count,
     )
     replay.deploy()  # pass-through field tool; the wrapper rewrites on its own
-    replay.require_inventory()
+    repointed_at = ctx.clock().timestamp()
+    window = inventory_window_seconds(survey)
+    deploy_seconds = repointed_at - composed_at
+    remaining = plan["not_after"] - repointed_at
+    gate: dict[str, Any] = {
+        "inventory_interval_seconds": survey.inventory_interval,
+        "startup_spread_seconds": _seconds(
+            survey, STARTUP_SPREAD_KEY, DEFAULT_STARTUP_SPREAD_SECONDS
+        ),
+        "startup_jitter_seconds": _seconds(
+            survey, STARTUP_JITTER_KEY, DEFAULT_STARTUP_JITTER_SECONDS
+        ),
+        "window_seconds": window,
+        "hold_seconds": hold,
+        "deploy_allowance_seconds": INVENTORY_DEPLOY_ALLOWANCE_SECONDS,
+        "plan_composed_at": _iso(composed_at),
+        "repointed_at": _iso(repointed_at),
+        "deploy_seconds": round(deploy_seconds, 1),
+        "plan_not_after": _iso(plan["not_after"]),
+        "plan_remaining_seconds": round(remaining, 1),
+    }
+    ctx.evidence.write("inventory-gate", gate)
+    required = max(hold, window)
+    if remaining < required:
+        raise VariantInconclusive(
+            "harness fixture failed: the reviewed inventory plan stays valid "
+            f"{remaining:.0f} s after the repoint, below the {required} s the variant "
+            f"needs (the deploy took {deploy_seconds:.0f} s against a "
+            f"{INVENTORY_DEPLOY_ALLOWANCE_SECONDS} s allowance; hold {hold} s, "
+            f"first-query window {window} s); nothing was graded"
+        )
+    gate["rewritten"] = replay.wait_inventory_rewritten(window)
+    ctx.evidence.write("inventory-gate", gate)
     return replay
 
 
@@ -104,7 +221,9 @@ def uuid_changed(ctx: VariantContext) -> dict[str, Any]:
     index = int(gpus[-1]["index"])
     since = utc_now()
     replay = _replay(
-        ctx, [{"op": "replace_uuid", "index": index, "uuid": replay_uuid(ctx.run_id)}]
+        ctx,
+        survey,
+        [{"op": "replace_uuid", "index": index, "uuid": replay_uuid(ctx.run_id)}],
     )
     detection = wait_gpu_incident(
         ctx,
@@ -147,7 +266,7 @@ def bdf_changed(ctx: VariantContext) -> dict[str, Any]:
         raise VariantNotRun("CAPABILITY_ABSENT", "need two GPUs to swap PCI bus ids")
     indexes = [int(gpus[0]["index"]), int(gpus[-1]["index"])]
     since = utc_now()
-    replay = _replay(ctx, [{"op": "swap_bdf", "indexes": indexes}])
+    replay = _replay(ctx, survey, [{"op": "swap_bdf", "indexes": indexes}])
     detection = wait_gpu_incident(
         ctx,
         since,
@@ -176,7 +295,9 @@ def count_unchanged(ctx: VariantContext) -> dict[str, Any]:
     index = int(survey.inventory[-1]["index"])
     since = utc_now()
     replay = _replay(
-        ctx, [{"op": "replace_uuid", "index": index, "uuid": replay_uuid(ctx.run_id)}]
+        ctx,
+        survey,
+        [{"op": "replace_uuid", "index": index, "uuid": replay_uuid(ctx.run_id)}],
     )
     detection = wait_gpu_incident(
         ctx,
@@ -211,6 +332,7 @@ def unknown_expected_count(ctx: VariantContext) -> dict[str, Any]:
     # count and an unknown instance type -> gpu_expected_count_unknown.
     replay = _replay(
         ctx,
+        survey,
         [
             {
                 "op": "replace_uuid",
@@ -259,6 +381,7 @@ def stale_boot(ctx: VariantContext) -> dict[str, Any]:
     since = utc_now()
     replay = _replay(
         ctx,
+        survey,
         [
             {
                 "op": "replace_uuid",
@@ -302,6 +425,7 @@ def approved_rebaseline(ctx: VariantContext) -> dict[str, Any]:
     # old identity is not re-reported for ever.
     replay = _replay(
         ctx,
+        survey,
         [
             {
                 "op": "replace_uuid",
@@ -347,6 +471,7 @@ def no_unapproved_reset(ctx: VariantContext) -> dict[str, Any]:
     since = utc_now()
     replay = _replay(
         ctx,
+        survey,
         [
             {
                 "op": "replace_uuid",

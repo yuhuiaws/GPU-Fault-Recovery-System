@@ -3211,6 +3211,37 @@ age check (022 `expired_xid`), the UUID-set-only identity comparison (026
 id (026 `stale_boot`) -- are fixed by batch 160, so the variants now expect
 PASS; a product that regressed would FAIL them.
 
+026's inventory oracle gate is now waited for. On 2026-10-26 (plain EKS,
+release R13g) `bdf_changed` (ip-10-0-43-5, 09:14-09:18Z) and `count_unchanged`
+(ip-10-0-32-162, 09:18-09:21Z) ended INCONCLUSIVE "the inventory replay was not
+effective: the wrapper never rewrote a real inventory query" with no product
+record consulted: `require_inventory` read the wrapper's journal exactly once,
+14-15 s after `repoint-collector` had restarted the collector, while the
+restarted collector queries the inventory on its first tick -- the start-up
+spread (`GPU_FAULT_COLLECTOR_STARTUP_SPREAD_SECONDS`, 15 s) plus the start-up
+jitter (`GPU_FAULT_COLLECTOR_STARTUP_JITTER_SECONDS`, `[0, 20 s)`) -- and then
+every `GPU_FAULT_GPU_INVENTORY_INTERVAL_SECONDS` (60 s here). The first real
+query of the `bdf_changed` run was rewritten 20 s after the restart, 5 s after
+the verdict (its record is in the case's `oracle.jsonl`); `uuid_changed` had
+passed at 09:03Z with a first tick 6 s after the restart. The reviewed plans'
+deadlines (`not_after` 09:41:45Z and 09:48:55Z) had not expired. The gate
+(`DcgmReplay.wait_inventory_rewritten`, the same for all seven variants) now
+polls the journal from the repoint on, bounded by spread + jitter + two
+inventory intervals + 30 s, all read from the survey's collector environment
+(185 s on this site); a real query the wrapper passed through unchanged (an
+unreadable or expired plan, an index not in the real inventory, a replay UUID
+naming a real GPU) is final and INCONCLUSIVE at once with the wrapper's reason,
+a failed real query is retried by the product and waited out, and a deadline
+names whether any query reached the wrapper. The plan's deadline is composed
+before the first source lands on the node (the probe refuses a second copy) as
+a 600 s deploy allowance plus the variant's hold, so the plan stays valid for
+the whole hold after the repoint; a deploy that overran the allowance is a
+named fixture failure ("harness fixture failed: the reviewed inventory plan
+stays valid N s after the repoint, below ..."), never a plan expiring under the
+running variant (`inventory-gate.json` records the window, the deploy duration
+and the remaining validity; `tests/regional/test_general_live_gpu_identity.py`).
+All 026 variants are to be re-run on both clusters with the runner alone.
+
 022 `counter_reset` and `source_boot_change` first ran live on 2026-10-26
 (plain EKS, release R13g, one node each) and FAILed on their own plans, not on
 the product. `counter_reset` raised the counter by 50 per 15-s read (200/min

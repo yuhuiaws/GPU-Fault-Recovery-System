@@ -833,6 +833,27 @@ T.Limit 对是热安全读数，profile 排除）。现在在 survey 之后、�
 实际只读工作流；合法维护建立新baseline后不永久重报旧身份。
 夹具不得留下伪造UUID供后续真实reset使用；结束后验证每张真实GPU并恢复原配置。
 
+本站实现（`general_live_gpu_identity.py`）的库存回放有效性门**从重指起等待**，七个变体同一条规则：
+`repoint-collector` 重启采集器后，运行器轮询包装器的 `inventory.jsonl`（探针 `audit-read`）直到出现
+第一条 `rewritten: true` 的真实库存查询；上限 `inventory_window_seconds` = 启动相位
+（`GPU_FAULT_COLLECTOR_STARTUP_SPREAD_SECONDS`，产品默认 15 s）+ 启动抖动
+（`GPU_FAULT_COLLECTOR_STARTUP_JITTER_SECONDS`，`[0, 20 s)`）+ 2 个库存周期
+（`GPU_FAULT_GPU_INVENTORY_INTERVAL_SECONDS`，本站 60 s）+ 30 s 探针往返宽限，三者都取自 survey 的采集器
+环境（本站 185 s）。重启后的采集器在第一拍（相位 + 抖动之内）就查库存，之后每个库存周期一次；包装器
+原样放行的真实查询（计划不可读/已过期、索引不在真实库存、回放 UUID 撞上真实卡）是终局的，立即
+INCONCLUSIVE 并写明包装器给出的原因；真实查询失败（returncode 非 0）由产品下一拍重试，不终止等待；
+超时的 INCONCLUSIVE 写明窗口长度与日志里到底有没有查询到达包装器。经审查计划的 `not_after` 在第一个
+文件落到节点之前就要定下（`install-source` 拒绝第二份），取"部署容限 600 s + 变体 hold"：重指后计划至少
+在整个 hold 内有效（有效性门、检出等待、rebaseline 观察都在其中），部署超过容限时以 "harness fixture
+failed: the reviewed inventory plan stays valid N s after the repoint, below ..." 的明确原因失败，而不是
+让计划在变体运行中悄悄过期；证据 `inventory-gate.json` 记窗口参数、部署用时、计划剩余有效期与首条改写
+记录。2026-10-26 实况（plain EKS 两车道，R13g，harness live15）：`bdf_changed`（ip-10-0-43-5，
+09:14-09:18Z）与 `count_unchanged`（ip-10-0-32-162，09:18-09:21Z）INCONCLUSIVE "the wrapper never rewrote a
+real inventory query"——旧门只在重指回执后读一次日志（采集器重启后 14-15 s），而该次重启的第一拍落在
+重启后 20 s（`oracle.jsonl` 中 09:17:01Z 的改写记录比判定晚 5 s）；同机制的 `uuid_changed` 09:03Z PASS
+只是第一拍凑巧落在重启后 6 s。两次计划的 `not_after`（09:41:45Z / 09:48:55Z）都没有过期，过期不是
+原因。两个变体及其余 026 变体在两集群重跑，无需产品发布。
+
 ### GF-GENERAL-LIVE-027
 
 必测：`nan`、`stalled_step`、`reporter_silent`、`step_regression`、`straggler_group`、

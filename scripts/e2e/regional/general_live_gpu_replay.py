@@ -864,23 +864,81 @@ class DcgmReplay:
         self.inventory_audit()
         return any(record.get("rewritten") for record in self.inventory_records)
 
-    def require_inventory(self) -> None:
-        """The oracle gate for an inventory replay: the wrapper really rewrote."""
+    def inventory_refusals(self) -> list[str]:
+        """Why the wrapper left real inventory queries unchanged (final reasons).
 
-        aborted = [
-            str(record.get("unchanged_reason"))
+        Every journal record is one real inventory query of the collector. One
+        the wrapper could not apply -- an unreadable or expired plan, a GPU
+        index not in the real inventory, a replay UUID that names a real GPU --
+        is passed through unchanged for the run's whole life, so the first such
+        record ends the gate. A failed real query (``returncode`` not 0) is no
+        refusal: the product retries the inventory on its next tick.
+        """
+
+        return [
+            "; ".join(str(item) for item in record.get("unchanged_reason") or [])
+            or "unchanged"
             for record in self.inventory_records
-            if record.get("returncode") not in (0, None) and not record.get("rewritten")
+            if not record.get("rewritten") and record.get("returncode") == 0
         ]
-        if not self.inventory_rewritten():
-            detail = (
-                ("; ".join(aborted))
-                if aborted
-                else "the wrapper never rewrote a real inventory query"
-            )
-            raise VariantInconclusive(
-                f"the inventory replay was not effective: {detail}"
-            )
+
+    def wait_inventory_rewritten(self, timeout_seconds: int) -> dict[str, Any]:
+        """The oracle gate for an inventory replay, waited for: poll the
+        wrapper's journal until it has rewritten one real inventory query.
+
+        The collector queries the inventory on its own cadence -- first on its
+        first tick after the restart (start-up spread plus start-up jitter),
+        then every inventory interval -- so a journal judged once, right after
+        the repoint, holds nothing (live 2026-10-26, plain EKS, 026
+        ``bdf_changed`` and ``count_unchanged``: judged 14-15 s after the
+        collector restart; the wrapper rewrote the first real query 20 s after
+        it, 5 s after the verdict). A query the wrapper refused to rewrite is
+        final and raised at once with the wrapper's reason; a deadline names
+        what the journal held, so "no query reached the wrapper" reads
+        differently from "every query failed".
+        """
+
+        def rewritten() -> dict[str, Any] | None:
+            if self.inventory_rewritten():
+                first = next(
+                    record
+                    for record in self.inventory_records
+                    if record.get("rewritten")
+                )
+                return {
+                    "rewritten_at": first.get("at"),
+                    "inventory_queries": len(self.inventory_records),
+                }
+            refusals = self.inventory_refusals()
+            if refusals:
+                raise VariantInconclusive(
+                    "the inventory replay was not effective: the wrapper left a real "
+                    f"inventory query unchanged: {refusals[0]}"
+                )
+            return None
+
+        value = self.ctx.wait_until(
+            rewritten,
+            timeout_seconds=timeout_seconds,
+            poll_seconds=SERVE_POLL_SECONDS,
+            name="inventory-rewritten",
+        )
+        if value is not None:
+            return value
+        failed = sum(
+            1 for record in self.inventory_records if record.get("returncode") != 0
+        )
+        seen = (
+            "no inventory query reached the wrapper"
+            if not self.inventory_records
+            else f"{len(self.inventory_records)} inventory quer"
+            f"{'ies' if len(self.inventory_records) != 1 else 'y'} journaled, "
+            f"{failed} failed"
+        )
+        raise VariantInconclusive(
+            "the inventory replay was not effective: the wrapper never rewrote a real "
+            f"inventory query within {timeout_seconds} s of the repoint: {seen}"
+        )
 
     def _served(self, key: str) -> bool:
         return any(
