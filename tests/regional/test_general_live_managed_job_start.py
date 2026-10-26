@@ -40,6 +40,7 @@ from gpu_fault.training_submit_cli import TRAINING_CONTAINER_ANNOTATION
 from scripts.e2e.regional import run_general_live as runner
 from scripts.e2e.regional.general_live_fixture import GeneralLiveSettings, ProbeHandle
 from scripts.e2e.regional.general_live_registry import VariantSpec
+from scripts.e2e.regional.host_probe_fixture import HostProbeFixture
 from scripts.e2e.regional.managed_workload_fixture import (
     NOTHING_CREATED,
     OWNER_LABEL,
@@ -330,11 +331,46 @@ def configured(
     return settings, run_dir
 
 
+#: The CRI Pod-log probe's read-only ``preflight`` of a node that has what the
+#: window binds by (``general_live_applog_fixture.capability_gaps``): 017's CRI
+#: variants read it before they create their managed job.
+CRI_PREFLIGHT = {
+    "pod_log_root": True,
+    "pod_log_root_path": "/var/log/pods",
+    "pod_log_layout": {"directories": 9, "kubelet_shape": 9, "with_container_log": 9},
+    "unit": {"LoadState": "loaded", "ActiveState": "inactive"},
+}
+
+
+def host_probe_create(fixture: HostProbeFixture) -> None:
+    """The probe Pod is the fixture's own object, not the managed job's."""
+
+
+def host_probe_execute(
+    fixture: HostProbeFixture, *arguments: str, timeout: int = 180
+) -> dict[str, Any]:
+    script = fixture.settings.probe_script.name
+    if script == "general_live_applog_probe.py" and arguments[0] == "preflight":
+        return dict(CRI_PREFLIGHT)
+    raise FirstMutation(f"host probe {script} {arguments[0]}")
+
+
+def host_probe_cleanup(fixture: HostProbeFixture) -> dict[str, bool]:
+    return {"pod": False, "configmap": False}
+
+
 def install_fakes(monkeypatch: pytest.MonkeyPatch, api: ClusterApi) -> None:
     monkeypatch.setattr(RegionalLiveFixture, "run", staticmethod(api.run))
     monkeypatch.setattr(RegionalLiveFixture, "cpu_python", unexpected_store_read)
     monkeypatch.setattr(ProbeHandle, "execute", probe_execute)
     monkeypatch.setattr(ProbeHandle, "cleanup", probe_cleanup)
+    # The CRI Pod-log fixture (017) owns a HostProbeFixture directly, not a
+    # ProbeHandle, and asks it for the node's capabilities before the managed
+    # job exists: its create and read-only preflight are fakes like the rest
+    # of the host-probe calls, so the job's create stays the first mutation.
+    monkeypatch.setattr(HostProbeFixture, "create", host_probe_create)
+    monkeypatch.setattr(HostProbeFixture, "execute", host_probe_execute)
+    monkeypatch.setattr(HostProbeFixture, "cleanup", host_probe_cleanup)
 
 
 def execute(
@@ -475,7 +511,15 @@ def test_a_target_node_the_cluster_lacks_is_refused_and_cleans_up_as_nothing_cre
         "cluster: " + ", ".join(targets)
     ), result
     assert api.mutations == [], "a refused preparation sends nothing"
-    (job,) = result["cleanup"]
+    # 017's CRI variants also own their log probe (created, read-only, before
+    # the job); its cleanup is a second entry that proves no residue.
+    probes = [item for item in result["cleanup"] if item["name"] == "cri-pod-logs"]
+    for item in probes:
+        assert (item["ok"], item["result"]["probe_residuals"]) == (
+            True,
+            {"pod": False, "configmap": False},
+        ), item
+    (job,) = [item for item in result["cleanup"] if item["name"] != "cri-pod-logs"]
     assert (job["ok"], job["result"]) == (
         True,
         {"workload": NOTHING_CREATED, "prewarm": NOTHING_CREATED},

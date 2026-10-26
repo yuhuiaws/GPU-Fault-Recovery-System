@@ -85,7 +85,12 @@ def redact_probe_detail(value: Any, depth: int = 0) -> Any:
 
 
 class HostProbeError(RuntimeError):
-    pass
+    #: The probe's own reason token (its ``error_reason``, in the closed
+    #: ``[a-z][a-z0-9_]{2,40}`` shape) when the failed call named one, else
+    #: ``None``. A caller branches on this instead of parsing the exception
+    #: text: 017 ``old_pod`` repeats a round whose directory kubelet's GC took
+    #: (``fixture_gone`` / ``directory_removed``) and fails on anything else.
+    reason: str | None = None
 
 
 class HostProbeTransportError(HostProbeError):
@@ -817,9 +822,11 @@ class HostProbeFixture:
                 payload, completed.returncode, code, site, reason
             ):
                 diagnostic += f"; detail in {PROBE_ERROR_RECORD}"
-            raise HostProbeError(
+            failure = HostProbeError(
                 f"host probe failed (exit {completed.returncode}{diagnostic}); output withheld"
             )
+            failure.reason = reason
+            raise failure
         self._check_target()
         return payload
 

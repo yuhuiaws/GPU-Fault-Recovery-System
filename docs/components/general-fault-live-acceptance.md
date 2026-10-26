@@ -586,6 +586,37 @@ CRI P/F跨采集轮次、文件轮转和投递失败后仍可拼接，退出PID�
 oom_score_adj:994`（journal MESSAGE 不带 `kernel:` 标识），命中 OOM 规则 → WARNING/RUN_DIAGNOSTICS；
 journal 回放复用 016 的 per-run cursor，同一节点同一 boot 上的后续运行不再并入首个运行的旧 incident。
 
+`old_pod` 在 HyperPod 的首次真机运行（2026-10-26，hpb 车道的 HyperPod GPU 节点，R13g）
+INCONCLUSIVE：`harness fixture failed: HostProbeError: host probe failed (exit 1); output
+withheld`。根因不是 HyperPod 的运行时布局——探针 `inspect`
+读到的新 Pod 目录 `/var/log/pods/<ns>_<pod>_<uid>/pytorch/0.log` 与 cgroup v2 systemd 切片和探针
+硬编码完全一致——而是 kubelet 的容器 GC（`ContainerGCPeriod` 1 min，`evictPodLogsDirectories`
+删除所有 UID 已不认识的 `/var/log/pods` 目录）落在探针 `create-log` 与 `write` 两次独立
+`kubectl exec` 之间（相隔约 6 s）：重建的旧 Pod 目录被整个删掉，`write` 在
+`general_live_applog_probe.py` 的"the fixture log file is gone (kubelet removed the directory?)"
+退出 1；探针当时的失败行只有 `{"error":"ProbeError","error_kind":"probe"}`，fixture 对
+`error_kind: probe` 读的是不存在的 `error_class`，又没有 `error_message` 可写
+`probe-error.json`，于是只剩"output withheld"；而 `old_pod` 的轮次循环只把**读取**阶段的丢失当可
+重复轮次，创建与写入之间的丢失是硬失败。现在：（1）`seed-log` 一次探针调用完成目录、文件与
+日志行——先把旧 Pod 自己的目录（空重建的，或 kubelet 尚未删除的真实目录）当 GC 节拍的"金丝雀"
+（`--await-gc-seconds`，运行器给 75 s：一个 GC 周期加余量），看到它被删除后立刻重建并写入，文件
+因此在整个下一周期内存在，采集器 10 s 轮询必然访问到（`OLD_POD_INITIAL_TAIL` 让首次访问读完整个
+文件）；75 s 内没看到节拍则在金丝雀目录里直接播种并把它记为本次创建；（2）探针的每个拒绝都带
+封闭词表 `REASONS` 中的一个原因 token（`fixture_gone`、`directory_removed`、`unit_missing`、
+`directory_missing` …，构造时校验），失败行按 S20 的形状带 `error_class`、句子的 sha256 摘要、
+`function:line` 站点、`error_reason` 与 `error_message`，fixture 把前四项放进异常文本
+（`HostProbeError.reason` 可直接读）、句子脱敏后写入本例的 `probe-error.json`；运行器只对
+`GC_LOST_REASONS`（`fixture_gone`/`directory_removed`）重复轮次（最多 3 轮，`old-lost-<n>.json`
+记阶段与原因），其他原因即它命名的失败；（3）四个 CRI 变体在建受管任务和开窗之前先做探针只读
+`preflight`：`/var/log/pods` 不存在、其下没有 kubelet 形状的 `<ns>_<pod>_<uid>/<容器>/0.log`
+目录（产品 `pod_identity` 绑定的形状，也是 `old_pod` 重建旧目录的约定）、或
+`gpu-fault-log-collector.service` 未安装 → `NOT_RUN(CAPABILITY_ABSENT)` 并点名缺失项
+（`cri-preflight.json`）；`old_pod` 另在开窗前读新 Pod 的真实目录（`inspect-<uid>.json`），
+没有则 INCONCLUSIVE 而不开窗。结果里 `seed_rounds`/`gc` 记录轮次与节拍观察
+（`tests/regional/test_general_live_applog_probe.py`、`test_general_live_applog_fixture.py`、
+`test_general_live_applogs.py`，录制替身）。重跑前操作员须知：两个集群都尚无 `old_pod` 的 PASS
+（plain EKS 此前止于 preflight 缺陷的 NO_EVIDENCE），每轮最多多等 75 s；节点上无需任何准备。
+
 ### GF-GENERAL-LIVE-019
 
 必测：`volatile_dbe`、`corrected_ecc`、`aggregate_dbe`、`retired_delta`、

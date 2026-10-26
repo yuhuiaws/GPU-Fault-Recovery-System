@@ -12,6 +12,7 @@ tests are ``test_general_live_applogs_hung``.
 from __future__ import annotations
 
 import itertools
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -28,8 +29,10 @@ from scripts.e2e.regional.general_live_applog_fixture import (
 from scripts.e2e.regional.general_live_fixture import (
     GeneralLiveSettings,
     VariantInconclusive,
+    VariantNotRun,
 )
 from scripts.e2e.regional.general_live_registry import coverage_rows
+from scripts.e2e.regional.host_probe_fixture import HostProbeError
 from tests.regional._general_live_fakes import (
     FakeProbe,
     FakeRegional,
@@ -395,18 +398,78 @@ def _patch_jobs(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_jobs(monkeypatch)
 
 
+#: The probe's read-only ``preflight`` of a node that has what the window binds
+#: by: kubelet's root, kubelet-shaped Pod directories with a container log, the
+#: installed collector unit (the live HyperPod and plain-EKS receipts' shape).
+PREFLIGHT_OK: dict[str, Any] = {
+    "boot_id": "f288cbf5-12e8-4a03-8911-e8307594c8e5",
+    "python": "3.9.20",
+    "pod_log_root": True,
+    "pod_log_root_path": "/var/log/pods",
+    "pod_log_layout": {"directories": 9, "kubelet_shape": 9, "with_container_log": 9},
+    "collector_state": True,
+    "unit": {"LoadState": "loaded", "ActiveState": "inactive"},
+}
+#: ``seed-log``'s receipt: the file, the stamps and the GC tick it waited for.
+SEEDED: dict[str, Any] = {
+    "file": {"path": PATH},
+    "created_dirs": [PATH.rsplit("/", 2)[0], PATH.rsplit("/", 1)[0]],
+    "kubelet_directory": False,
+    "gc": {
+        "awaited_seconds": 75,
+        "canary": True,
+        "observed": True,
+        "after_seconds": 12.5,
+    },
+    "records": 1,
+    "stamps": [STAMP],
+    "flags": ["F"],
+}
+
+
+def _gc_lost(reason: str = "fixture_gone") -> Any:
+    """A ``seed-log`` the probe refused with ``reason`` (its token on the error)."""
+
+    def refuse(_arguments: tuple[str, ...]) -> dict[str, Any]:
+        failure = HostProbeError(
+            "host probe failed (exit 1; error ProbeError 0123456789abcdef at "
+            f"_append_records:700; reason {reason}; detail in probe-error.json); "
+            "output withheld"
+        )
+        failure.reason = reason
+        raise failure
+
+    return refuse
+
+
 def _logs_probe(
-    *, statuses: list[dict[str, Any]] | None = None, pid: int = PID
+    *,
+    statuses: list[dict[str, Any]] | None = None,
+    pid: int = PID,
+    preflight: dict[str, Any] | None = None,
+    directories: list[dict[str, Any]] | None = None,
 ) -> FakeProbe:
     tracked = {"collector": {"tracked": {PATH: {"offset": 0}}, "pending": {}}}
     return FakeProbe(
         {
+            "preflight": PREFLIGHT_OK if preflight is None else preflight,
             "open-window": {
                 "after": {"ActiveState": "active"},
                 "proof_scope": "live-replay",
             },
-            "inspect": {"process": {"init_pid": pid}},
+            "inspect": {
+                "process": {"init_pid": pid},
+                "directories": [
+                    {
+                        "path": PATH.rsplit("/", 2)[0],
+                        "containers": {"pytorch": ["0.log"]},
+                    }
+                ]
+                if directories is None
+                else directories,
+            },
             "create-log": {"file": {"path": PATH}},
+            "seed-log": dict(SEEDED),
             "status": statuses or [tracked],
             "write": {"stamps": [STAMP], "file": {"path": PATH}},
             "rotate": {"rotated": {"path": ROTATED}, "current": {"path": PATH}},
@@ -731,13 +794,54 @@ def test_live_pid_passes_when_the_live_process_is_targeted(tmp_path: Path) -> No
     assert result["host_pid"] == PID and result["proof_scope"] == "live-replay"
     probe = ctx.probes[f"cri-pod-logs@{NODE}"]
     names = [call[0] for call in probe.calls]  # type: ignore[attr-defined]
-    assert names[:3] == ["open-window", "inspect", "create-log"]
+    assert names[:4] == ["preflight", "open-window", "inspect", "create-log"], (
+        "the node proves its capabilities (read-only) before the window opens"
+    )
     assert "write" in names and names.index("status") < names.index("write"), (
         "the file is tracked by the collector before the line is written"
+    )
+    assert ctx.cleanup.pending()[0] == "cri-pod-logs", (
+        "the probe is created before the managed job, so its cleanup runs last"
     )
     assert ctx.cleanup.pending()[-1].startswith("restore-inc-log-"), (
         "the diagnostic incident is restored in cleanup"
     )
+    assert (ctx.case_dir / "cri-preflight.json").is_file(), (
+        "the read-only preflight receipt is evidence"
+    )
+
+
+@pytest.mark.parametrize(
+    "preflight, needle",
+    [
+        ({**PREFLIGHT_OK, "pod_log_root": False}, "/var/log/pods does not exist"),
+        (
+            {**PREFLIGHT_OK, "pod_log_layout": {"with_container_log": 0}},
+            "no kubelet-shaped",
+        ),
+        ({**PREFLIGHT_OK, "unit": {"LoadState": "not-found"}}, "not installed"),
+        ({}, "does not exist on the node"),
+    ],
+)
+def test_cri_variants_are_not_run_on_a_node_without_the_capability(
+    tmp_path: Path, preflight: dict[str, Any], needle: str
+) -> None:
+    FakeApplogJob.replacement = _replacement()
+    probe = _logs_probe(preflight=preflight)
+    ctx = _cri_ctx(
+        "old_pod",
+        tmp_path,
+        applog=_Applog([_old_pod_records(incident_attempt=None)]),
+        probe=probe,
+    )
+    with pytest.raises(VariantNotRun) as caught:
+        mod.old_pod(ctx)
+    assert caught.value.reason == "CAPABILITY_ABSENT"
+    assert needle in caught.value.detail, caught.value.detail
+    assert [call[0] for call in probe.calls] == ["preflight"], (
+        "a read-only preflight is the only probe call; the window never opened"
+    )
+    assert FakeApplogJob.instances == [], "no managed job was created"
 
 
 @pytest.mark.parametrize(
@@ -1039,14 +1143,45 @@ def test_old_pod_passes_when_the_line_stays_unresolved(tmp_path: Path) -> None:
     assert job.annotations == [("pod-1", NEW_PID)], "the new Pod declares its PID"
     assert result["attributed_attempt"] is None and result["old_pod_uid"] == POD_UID
     probe = ctx.probes[f"cri-pod-logs@{NODE}"]
+    names = [call[0] for call in probe.calls]  # type: ignore[attr-defined]
+    assert names.index("inspect") < names.index("open-window"), (
+        "the new Pod's real log directory is read before the window opens"
+    )
     opened = next(call for call in probe.calls if call[0] == "open-window")  # type: ignore[attr-defined]
     assert opened[opened.index("--initial-tail-bytes") + 1] == str(
         mod.OLD_POD_INITIAL_TAIL
     )
-    created = next(call for call in probe.calls if call[0] == "create-log")  # type: ignore[attr-defined]
-    assert (
-        "--allow-create-dir" in created
-        and created[created.index("--pod-uid") + 1] == POD_UID
+    seeded = next(call for call in probe.calls if call[0] == "seed-log")  # type: ignore[attr-defined]
+    assert "--allow-create-dir" in seeded
+    assert seeded[seeded.index("--pod-uid") + 1] == POD_UID
+    assert seeded[seeded.index("--await-gc-seconds") + 1] == str(
+        mod.OLD_POD_GC_WAIT_SECONDS
+    )
+    assert "create-log" not in names and "write" not in names, (
+        "the old Pod's directory, file and line are one probe call"
+    )
+    assert result["seed_rounds"] == 1 and result["gc"]["observed"] is True
+    assert any(
+        "12.5 s after kubelet's log-directory GC tick" in n for n in result["notes"]
+    ), result["notes"]
+    assert (ctx.case_dir / "old-seed-0.json").is_file(), "the seed receipt is evidence"
+
+
+def test_old_pod_is_inconclusive_when_the_new_pod_has_no_log_directory(
+    tmp_path: Path,
+) -> None:
+    FakeApplogJob.replacement = _replacement()
+    probe = _logs_probe(pid=NEW_PID, directories=[])
+    ctx = _cri_ctx(
+        "old_pod",
+        tmp_path,
+        applog=_Applog([_old_pod_records(incident_attempt=None)]),
+        probe=probe,
+    )
+    with pytest.raises(VariantInconclusive, match="no log directory for the new Pod"):
+        mod.old_pod(ctx)
+    assert "open-window" not in [call[0] for call in probe.calls], (
+        "the window is not opened on a node whose layout the convention cannot follow"
     )
 
 
@@ -1086,7 +1221,9 @@ def test_old_pod_is_inconclusive_without_a_restart(tmp_path: Path) -> None:
         mod.old_pod(_cri_ctx("old_pod", tmp_path, applog=_Applog([records])))
 
 
-def test_old_pod_retries_a_file_kubelet_removed(tmp_path: Path) -> None:
+def test_old_pod_retries_a_file_kubelet_removed_before_the_collector_read_it(
+    tmp_path: Path,
+) -> None:
     FakeApplogJob.replacement = _replacement()
     records = _old_pod_records(
         incident_attempt=None,
@@ -1095,15 +1232,83 @@ def test_old_pod_retries_a_file_kubelet_removed(tmp_path: Path) -> None:
     probe = _logs_probe(pid=NEW_PID)
     # The first round's file is gone before the collector visits it (kubelet's
     # GC): nothing is ever delivered from it. The second round's file is read.
-    probe.script["create-log"] = [
-        {"file": {"path": OLD_PATH + ".lost"}},
-        {"file": {"path": OLD_PATH}},
+    probe.script["seed-log"] = [
+        {**SEEDED, "file": {"path": OLD_PATH + ".lost"}},
+        dict(SEEDED),
     ]
     ctx = _cri_ctx("old_pod", tmp_path, applog=_Applog([records]), probe=probe)
     result = mod.old_pod(ctx)
     assert result["verdict"] == "PASS", result["errors"]
     names = [call[0] for call in probe.calls]
-    assert names.count("create-log") == 2 and names.count("write") == 2
+    assert names.count("seed-log") == 2 and result["seed_rounds"] == 2
+    lost = json.loads((ctx.case_dir / "old-lost-0.json").read_text())
+    assert lost["stage"] == "read" and "status" in lost
+
+
+@pytest.mark.parametrize("reason", ["fixture_gone", "directory_removed"])
+def test_old_pod_repeats_a_round_the_gc_took_while_seeding(
+    tmp_path: Path, reason: str
+) -> None:
+    # Live 2026-10-26 (HyperPod hpb): kubelet's GC removed the recreated
+    # directory between the probe's create-log and write and the variant ended
+    # INCONCLUSIVE "output withheld". The probe now names the reason and the
+    # runner repeats the round.
+    FakeApplogJob.replacement = _replacement()
+    records = _old_pod_records(
+        incident_attempt=None,
+        ops=("FREEZE_EVIDENCE", "VALIDATE_HOST", "ESCALATE_SUPPORT"),
+    )
+    probe = _logs_probe(pid=NEW_PID)
+    outcomes = iter([_gc_lost(reason), lambda _arguments: dict(SEEDED)])
+    probe.script["seed-log"] = lambda arguments: next(outcomes)(arguments)
+    ctx = _cri_ctx("old_pod", tmp_path, applog=_Applog([records]), probe=probe)
+    result = mod.old_pod(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    names = [call[0] for call in probe.calls]
+    assert names.count("seed-log") == 2 and result["seed_rounds"] == 2
+    lost = json.loads((ctx.case_dir / "old-lost-0.json").read_text())
+    assert lost == {
+        "stage": "seed",
+        "reason": reason,
+        "error": (
+            "host probe failed (exit 1; error ProbeError 0123456789abcdef at "
+            f"_append_records:700; reason {reason}; detail in probe-error.json); "
+            "output withheld"
+        ),
+    }
+
+
+def test_old_pod_fails_on_any_other_probe_refusal(tmp_path: Path) -> None:
+    FakeApplogJob.replacement = _replacement()
+    probe = _logs_probe(pid=NEW_PID)
+    probe.script["seed-log"] = _gc_lost("fixture_exists")
+    ctx = _cri_ctx(
+        "old_pod",
+        tmp_path,
+        applog=_Applog([_old_pod_records(incident_attempt=None)]),
+        probe=probe,
+    )
+    with pytest.raises(HostProbeError) as caught:
+        mod.old_pod(ctx)
+    assert caught.value.reason == "fixture_exists"
+    assert [call[0] for call in probe.calls].count("seed-log") == 1, (
+        "a refusal that is not the GC is not repeated"
+    )
+
+
+def test_old_pod_gives_up_after_the_rounds(tmp_path: Path) -> None:
+    FakeApplogJob.replacement = _replacement()
+    probe = _logs_probe(pid=NEW_PID)
+    probe.script["seed-log"] = _gc_lost()
+    ctx = _cri_ctx(
+        "old_pod",
+        tmp_path,
+        applog=_Applog([_old_pod_records(incident_attempt=None)]),
+        probe=probe,
+    )
+    with pytest.raises(VariantInconclusive, match=f"in {mod.OLD_POD_ATTEMPTS} rounds"):
+        mod.old_pod(ctx)
+    assert [call[0] for call in probe.calls].count("seed-log") == mod.OLD_POD_ATTEMPTS
 
 
 # --------------------------------------------------------------------------- #

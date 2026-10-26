@@ -27,7 +27,14 @@ Two reviewed sources feed the node log collector's real rules
   process is targeted and its bundle ran the process capture, an exited one is
   never stack-sampled, an old Pod never reaches the new attempt, and a
   ``P``/``F`` record stitches across polls, a rename rotation and a collector
-  restart.
+  restart. Before a window is opened the probe's read-only ``preflight`` must
+  show the node has what the collector binds by (``/var/log/pods``,
+  kubelet-shaped Pod directories, the installed unit) or the variant is
+  ``NOT_RUN(CAPABILITY_ABSENT)`` naming the gap. ``old_pod`` seeds the old
+  Pod's directory, file and line in ONE probe call right after kubelet's
+  log-directory GC tick (``seed-log``); a round the GC still takes
+  (``HostProbeError.reason`` in ``GC_LOST_REASONS``) is repeated, any other
+  probe refusal is the failure its reason token names.
 
 ``missing_flight_recorder`` is native: a managed two-node NCCL job without a
 flight recorder (``ManagedNcclJob(flight_recorder=False)``) stalls at zero EFA
@@ -51,9 +58,11 @@ from typing import Any, Callable
 from scripts.e2e.regional import general_live_nccl as nccl
 from scripts.e2e.regional.general_live_applog_fixture import (
     CUDA_OOM_LINE,
+    GC_LOST_REASONS,
     PARTIAL_HEAD,
     PARTIAL_TAIL,
     CriPodLogFixture,
+    capability_gaps,
     cri_pod_logs,
     reviewed_line,
 )
@@ -64,6 +73,7 @@ from scripts.e2e.regional.general_live_fixture import (
     GeneralLiveSettings,
     VariantContext,
     VariantInconclusive,
+    VariantNotRun,
     run_identity,
     utc_now,
 )
@@ -88,6 +98,7 @@ from scripts.e2e.regional.general_live_verdicts import (
     verdict,
     workflows_of,
 )
+from scripts.e2e.regional.host_probe_fixture import HostProbeError
 
 CASE = "GF-GENERAL-LIVE-017"
 ENABLE = "ENABLE_NODE_LOG_COLLECTOR"
@@ -111,6 +122,12 @@ ATTRIBUTION_FRESHNESS_SECONDS = 120
 #: is read on the collector's first visit (one 10 s poll, no second visit).
 OLD_POD_INITIAL_TAIL = 65536
 OLD_POD_ATTEMPTS = 3
+#: ``old_pod``: how long one ``seed-log`` call may watch the old Pod's directory
+#: for kubelet's container GC tick before seeding -- kubelet's
+#: ``ContainerGCPeriod`` is one minute, so one period plus a margin. Seeded
+#: right after the tick, the file lives the whole next period; seeded between
+#: two probe calls it lived 6 s live (HyperPod, 2026-10-26).
+OLD_POD_GC_WAIT_SECONDS = 75
 STEPS_WITH_DIAGNOSTIC_PARAMETERS = ("COLLECT_DIAGNOSTIC_BUNDLE", "COLLECT_HUNG_TRIAGE")
 
 
@@ -696,11 +713,32 @@ def _wait_container(
     return records, container
 
 
-def _open_logs(
-    ctx: VariantContext, job: ManagedApplogJob, *, initial_tail_bytes: int = 0
-) -> CriPodLogFixture:
+def _cri_logs(ctx: VariantContext) -> CriPodLogFixture:
+    """The CRI Pod-log fixture, after the node proved it has what it binds by.
+
+    The probe's ``preflight`` is read-only; a gap it shows (no ``/var/log/pods``,
+    no kubelet-shaped Pod directory under it, the collector unit not installed)
+    is ``NOT_RUN(CAPABILITY_ABSENT)`` naming it, before the managed job exists
+    and before anything on the node is touched.
+    """
+
     logs = cri_pod_logs(ctx)
     logs.create()
+    preflight = logs.preflight()
+    ctx.evidence.write("cri-preflight", preflight)
+    gaps = capability_gaps(preflight)
+    if gaps:
+        raise VariantNotRun("CAPABILITY_ABSENT", "; ".join(gaps))
+    return logs
+
+
+def _open(
+    ctx: VariantContext,
+    logs: CriPodLogFixture,
+    job: ManagedApplogJob,
+    *,
+    initial_tail_bytes: int = 0,
+) -> dict[str, Any]:
     opened = logs.open(
         container=job.container,
         approved=True,
@@ -708,7 +746,7 @@ def _open_logs(
         initial_tail_bytes=initial_tail_bytes,
     )
     ctx.evidence.write("cri-window-open", opened)
-    return logs
+    return opened
 
 
 def _declare_pid(
@@ -716,8 +754,12 @@ def _declare_pid(
     job: ManagedApplogJob,
     logs: CriPodLogFixture,
     pod: dict[str, Any],
-) -> int:
-    """Read the container's init PID from its cgroup and declare it on the Pod."""
+) -> tuple[int, dict[str, Any]]:
+    """Read the container's init PID from its cgroup and declare it on the Pod.
+
+    Returns the PID and the probe's read-only ``inspect`` receipt (the Pod's
+    real log directories under the collector's root, its process rows).
+    """
 
     container_id = (pod.get("container") or {}).get("container_id")
     if not container_id:
@@ -728,7 +770,7 @@ def _declare_pid(
     if pid < 1:
         raise VariantInconclusive("the container's init PID could not be read")
     job.annotate_host_pid(str(pod["name"]), pid)
-    return pid
+    return pid, inspected
 
 
 def _wait_entry(
@@ -850,10 +892,11 @@ def _common_stages(
 def live_pid(ctx: VariantContext) -> dict[str, Any]:
     """A reviewed OOM line from a live container targets its genuine PID."""
 
+    logs = _cri_logs(ctx)
     job = _job(ctx, "lp", mode="trainer")
     pod = _first_pod(job)
-    logs = _open_logs(ctx, job)
-    pid = _declare_pid(ctx, job, logs, pod)
+    _open(ctx, logs, job)
+    pid, _ = _declare_pid(ctx, job, logs, pod)
     _, container = _wait_container(
         ctx,
         job,
@@ -940,10 +983,11 @@ def live_pid(ctx: VariantContext) -> dict[str, Any]:
 def exited_pid(ctx: VariantContext) -> dict[str, Any]:
     """A reviewed OOM line from an exited container is EXITED: no stack capture."""
 
+    logs = _cri_logs(ctx)
     job = _job(ctx, "ep", mode="hold")
     pod = _first_pod(job)
-    logs = _open_logs(ctx, job)
-    pid = _declare_pid(ctx, job, logs, pod)
+    _open(ctx, logs, job)
+    pid, _ = _declare_pid(ctx, job, logs, pod)
     _, live = _wait_container(
         ctx,
         job,
@@ -1037,6 +1081,7 @@ def exited_pid(ctx: VariantContext) -> dict[str, Any]:
 def old_pod(ctx: VariantContext) -> dict[str, Any]:
     """A line under the previous Pod's UID never reaches the restarted attempt."""
 
+    logs = _cri_logs(ctx)
     job = _job(ctx, "op", mode="fail_once", restart_budget=1)
     old = _first_pod(job)
     ctx.evidence.write("old-pod", old)
@@ -1052,8 +1097,17 @@ def old_pod(ctx: VariantContext) -> dict[str, Any]:
     new_attempt = str(new.get("attempt_id") or "")
     if not new_attempt or new_attempt == job.attempt_id:
         raise VariantInconclusive(f"the restarted Pod carries attempt {new_attempt!r}")
-    logs = _open_logs(ctx, job, initial_tail_bytes=OLD_POD_INITIAL_TAIL)
-    new_pid = _declare_pid(ctx, job, logs, new)
+    # Read-only first: the new Pod's real log directory proves kubelet keeps
+    # this node's Pod logs where the collector binds them, which is the layout
+    # the old Pod's directory is recreated in below. Then the window.
+    new_pid, inspected = _declare_pid(ctx, job, logs, new)
+    if not inspected.get("directories"):
+        raise VariantInconclusive(
+            f"kubelet made no log directory for the new Pod {new.get('name')} under "
+            "the collector's root; the old Pod's directory cannot be placed by its "
+            "convention"
+        )
+    _open(ctx, logs, job, initial_tail_bytes=OLD_POD_INITIAL_TAIL)
     _, container = _wait_container(
         ctx,
         job,
@@ -1070,36 +1124,52 @@ def old_pod(ctx: VariantContext) -> dict[str, Any]:
     entry: dict[str, Any] | None = None
     path = ""
     written: dict[str, Any] = {}
+    rounds = 0
     for round_index in range(OLD_POD_ATTEMPTS):
-        # kubelet's GC removes a directory of a Pod it no longer knows within
-        # a minute; the collector reads the whole file on its first visit, so
-        # one poll is enough and a lost round is simply repeated.
-        created = logs.create_log(
-            str(old["uid"]),
-            container=job.container,
-            namespace=str(old["namespace"]),
-            pod_name=str(old["name"]),
-            allow_create_dir=True,
-        )
-        path = _file_path(created)
-        written = logs.write(
-            str(old["uid"]),
-            container=job.container,
-            records=[reviewed_line(CUDA_OOM_LINE)],
-        )
-        ctx.evidence.write(f"old-write-{round_index}", {"created": created, **written})
+        # kubelet's GC removes a directory of a Pod it no longer knows at every
+        # one-minute tick. One probe call seeds directory, file and line right
+        # after the tick it watched for, so the file is there for the
+        # collector's next poll, which reads the whole file on its first visit
+        # (OLD_POD_INITIAL_TAIL). A round the GC still takes -- the probe says
+        # so with its reason token -- is simply repeated; every other refusal is
+        # the failure its token names (live 2026-10-26 the two-call version lost
+        # the file between create-log and write and read "output withheld").
+        rounds = round_index + 1
+        try:
+            written = logs.seed_log(
+                str(old["uid"]),
+                container=job.container,
+                namespace=str(old["namespace"]),
+                pod_name=str(old["name"]),
+                records=[reviewed_line(CUDA_OOM_LINE)],
+                allow_create_dir=True,
+                await_gc_seconds=OLD_POD_GC_WAIT_SECONDS,
+            )
+        except HostProbeError as failure:
+            if failure.reason not in GC_LOST_REASONS:
+                raise
+            ctx.evidence.write(
+                f"old-lost-{round_index}",
+                {"stage": "seed", "reason": failure.reason, "error": str(failure)},
+            )
+            continue
+        path = _file_path(written)
+        ctx.evidence.write(f"old-seed-{round_index}", written)
         try:
             records = _wait_entry(
                 ctx, since, job, needle, {path}, name=f"old-entry-{round_index}"
             )
         except VariantInconclusive:
-            ctx.evidence.write(f"old-lost-{round_index}", logs.status())
+            ctx.evidence.write(
+                f"old-lost-{round_index}", {"stage": "read", "status": logs.status()}
+            )
             continue
         entry = entries_of(records, {path})[0]
         break
     if entry is None:
         raise VariantInconclusive(
-            "the collector never read the old Pod's fixture file (removed by kubelet first?)"
+            "the collector never read the old Pod's fixture file in "
+            f"{OLD_POD_ATTEMPTS} rounds (kubelet's GC took each one first?)"
         )
     records = _wait_graded(ctx, since, job, needle, entry, name="old-graded")
     incident = incident_of(records, entry)
@@ -1124,11 +1194,20 @@ def old_pod(ctx: VariantContext) -> dict[str, Any]:
         else ["the restarted attempt did not survive the old Pod's line"],
     }
     attributed = (incident or {}).get("attempt_id")
+    gc = written.get("gc") or {}
     return _result(
         stages,
         notes=[
             "an old Pod UID resolves to the prior attempt or stays UNRESOLVED, never the "
-            f"new attempt (attributed: {attributed or 'UNRESOLVED'})"
+            f"new attempt (attributed: {attributed or 'UNRESOLVED'})",
+            "the old Pod's directory, file and line were seeded in one probe call "
+            + (
+                f"{gc.get('after_seconds')} s after kubelet's log-directory GC tick"
+                if gc.get("observed")
+                else "without seeing kubelet's log-directory GC tick in "
+                f"{OLD_POD_GC_WAIT_SECONDS} s"
+            )
+            + f" (round {rounds} of {OLD_POD_ATTEMPTS})",
         ],
         extra={
             "attempt": job.identity(),
@@ -1136,6 +1215,8 @@ def old_pod(ctx: VariantContext) -> dict[str, Any]:
             "new_attempt_id": new_attempt,
             "new_pod_uid": new["uid"],
             "attributed_attempt": attributed,
+            "seed_rounds": rounds,
+            "gc": gc,
         },
     )
 
@@ -1143,9 +1224,10 @@ def old_pod(ctx: VariantContext) -> dict[str, Any]:
 def cri_partial_rotation(ctx: VariantContext) -> dict[str, Any]:
     """A CRI P fragment then its F stitches across polls, a rename and a restart."""
 
+    logs = _cri_logs(ctx)
     job = _job(ctx, "cp", mode="trainer")
     pod = _first_pod(job)
-    logs = _open_logs(ctx, job)
+    _open(ctx, logs, job)
     created = logs.create_log(
         str(pod["uid"]),
         container=job.container,
@@ -1385,7 +1467,9 @@ VARIANTS = [
     _cri_spec(
         "old_pod",
         "a managed job whose first attempt fails and is restarted by the product; the "
-        "line is written under the previous Pod's UID while the new attempt runs",
+        "line is written under the previous Pod's UID while the new attempt runs "
+        "(directory, file and line seeded in one probe call right after kubelet's "
+        "log-directory GC tick; a round the GC still takes is repeated)",
         "the line resolves to the prior attempt or UNRESOLVED, never to the new attempt; "
         "the new attempt's PID is never targeted; the new attempt keeps running",
         old_pod,

@@ -11,11 +11,17 @@ input, not a look-alike.
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
+import functools
 import hashlib
+import itertools
 import json
+import re
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -25,6 +31,8 @@ from scripts.e2e.regional.probes import general_live_applog_probe as probe
 RUN = "gl17-live-pid-a1-deadbeef"
 UID = "0f3b7c2e-4d5a-4b6c-8d9e-0a1b2c3d4e5f"
 CONTAINER_ID = "ab" * 32
+#: The host fixture's shape for a probe's reason token (``host_probe_fixture``).
+REASON_SHAPE = re.compile(r"[a-z][a-z0-9_]{2,40}")
 
 
 class _Budget:
@@ -36,6 +44,73 @@ class _Budget:
 
     def consume_bytes(self, raw_bytes: int) -> None:
         self.bytes_read += raw_bytes
+
+
+# --------------------------------------------------------------------------- #
+# every refusal names its reason; the failure line the host fixture reads
+# --------------------------------------------------------------------------- #
+def test_every_probe_error_names_a_reason_from_the_closed_vocabulary() -> None:
+    assert all(REASON_SHAPE.fullmatch(token) for token in probe.REASONS), (
+        "every token has the shape the host fixture shows"
+    )
+    assert {"fixture_gone", "directory_removed", "unit_missing"} <= probe.REASONS
+    with pytest.raises(TypeError):
+        probe.ProbeError("no reason")  # type: ignore[call-arg]
+    with pytest.raises(ValueError, match="not in REASONS"):
+        probe.ProbeError("x", "Fixture Gone")
+    tree = ast.parse(Path(probe.__file__).read_text(encoding="utf-8"))
+    sites = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "ProbeError"
+    ]
+    assert len(sites) >= 30, "the probe's refusals are ProbeError calls"
+    for node in sites:
+        reason = node.args[1] if len(node.args) > 1 else None
+        assert isinstance(reason, ast.Constant) and reason.value in probe.REASONS, (
+            f"line {node.lineno}: a ProbeError without a vocabulary reason"
+        )
+
+
+def test_main_reports_class_digest_site_reason_and_message(
+    tree: dict[str, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The failure line is the shape ``host_probe_fixture.execute`` reads --
+    the live 2026-10-26 old_pod failure printed only the class under ``error``
+    and the operator read "output withheld"."""
+
+    content = json.dumps([{"message": "x"}], sort_keys=True).encode()
+    code = probe.main(
+        [
+            "write",
+            "--run-id",
+            "gl17-op-a6-other",
+            "--pod-uid",
+            UID,
+            "--container",
+            "pytorch",
+            "--sha256",
+            hashlib.sha256(content).hexdigest(),
+            "--b64",
+            base64.b64encode(content).decode(),
+        ]
+    )
+    assert code == 1
+    captured = capsys.readouterr()
+    failure = json.loads(captured.out.strip().splitlines()[-1])
+    sentence = "no applog window is open for this run"
+    assert failure["error_kind"] == "probe" and failure["command"] == "write"
+    assert failure["error_class"] == "ProbeError"
+    assert failure["error"] == f"ProbeError: {sentence}"
+    assert failure["error_message"] == sentence
+    assert failure["error_reason"] == "no_window"
+    assert failure["error_code"] == hashlib.sha256(sentence.encode()).hexdigest()[:16]
+    assert re.fullmatch(r"open_state:[1-9][0-9]*", failure["error_site"]), failure
+    assert captured.err.strip() == f"ProbeError: {sentence}"
+    fields = probe.error_fields(ValueError("bad"), None)
+    assert fields["error_reason"] is None and fields["error_class"] == "ValueError"
 
 
 # --------------------------------------------------------------------------- #
@@ -372,6 +447,288 @@ def test_write_rotate_and_write_rotated_follow_the_inode(
     state = probe.load_state(RUN)
     entry = state["logs"][f"{UID}/pytorch"]
     assert entry["rotated"] == [str(rotated_path)] and entry["writes"] == 2
+
+
+def _seed(
+    pod_uid: str,
+    records: list[dict[str, str]],
+    *,
+    allow: bool = False,
+    await_gc_seconds: int = 0,
+) -> argparse.Namespace:
+    content = json.dumps(records, sort_keys=True).encode()
+    return argparse.Namespace(
+        run_id=RUN,
+        pod_uid=pod_uid,
+        container="pytorch",
+        namespace="gpu-fault-system",
+        pod_name="job-master-0",
+        sha256=hashlib.sha256(content).hexdigest(),
+        b64=base64.b64encode(content).decode(),
+        allow_create_dir=allow,
+        await_gc_seconds=await_gc_seconds,
+    )
+
+
+def _old_pod_dir(tree: dict[str, Path]) -> Path:
+    return tree["pods"] / f"gpu-fault-system_job-master-0_{UID}"
+
+
+def test_seed_log_creates_the_directory_the_file_and_the_line_in_one_call(
+    tree: dict[str, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    probe.seed_log(_seed(UID, [{"message": "oom"}], allow=True))
+    receipt = _emitted(capsys)
+    directory = _old_pod_dir(tree)
+    path = Path(str(receipt["file"]["path"]))  # type: ignore[index]
+    assert path == directory / "pytorch" / probe.fixture_file_name(RUN)
+    assert receipt["created_dirs"] == [str(directory), str(directory / "pytorch")]
+    assert receipt["kubelet_directory"] is False and receipt["gc"] is None
+    assert receipt["records"] == 1 and receipt["flags"] == ["F"]
+    assert receipt["target"] == "current" and receipt["proof_scope"] == "live-replay"
+    text = path.read_text()
+    assert text.startswith(str(receipt["stamps"][0])) and text.endswith(
+        " stdout F oom\n"
+    )  # type: ignore[index]
+    decoded = decode_record(text.encode(), 0, datetime.now(timezone.utc), {}, 65536)
+    assert decoded is not None and decoded[2] == "oom"
+    entry = probe.load_state(RUN)["logs"][f"{UID}/pytorch"]
+    assert entry["writes"] == 1 and entry["seeded"] is True and "gc" not in entry
+    assert entry["created_dirs"] == receipt["created_dirs"] and entry["rotated"] == []
+    with pytest.raises(probe.ProbeError) as again:
+        probe.seed_log(_seed(UID, [{"message": "oom"}], allow=True))
+    assert again.value.reason == "fixture_exists"
+    # kubelet's GC took it: the next round starts over and counts it.
+    shutil.rmtree(directory)
+    probe.seed_log(_seed(UID, [{"message": "oom"}], allow=True))
+    assert _emitted(capsys)["recreated"] == 1
+
+
+def test_seed_log_checks_everything_before_touching_the_node(
+    tree: dict[str, Path],
+) -> None:
+    directory = _old_pod_dir(tree)
+    with pytest.raises(probe.ProbeError) as missing:
+        probe.seed_log(_seed(UID, [{"message": "oom"}]))
+    assert missing.value.reason == "directory_missing" and not directory.exists()
+    bad = _seed(UID, [{"message": "oom"}], allow=True)
+    bad.sha256 = "0" * 64
+    with pytest.raises(probe.ProbeError) as digest:
+        probe.seed_log(bad)
+    assert digest.value.reason == "input_shape" and not directory.exists()
+    with pytest.raises(probe.ProbeError) as too_long:
+        probe.seed_log(
+            _seed(
+                UID,
+                [{"message": "oom"}],
+                allow=True,
+                await_gc_seconds=probe.MAX_GC_WAIT_SECONDS + 1,
+            )
+        )
+    assert too_long.value.reason == "input_shape" and not directory.exists()
+    other = _seed(UID, [{"message": "oom"}], allow=True)
+    other.container = "other"
+    with pytest.raises(probe.ProbeError) as container:
+        probe.seed_log(other)
+    assert container.value.reason == "container_mismatch"
+
+
+def test_seed_log_uses_kubelets_directory_when_it_is_still_there(
+    tree: dict[str, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    kubelet_dir = _old_pod_dir(tree) / "pytorch"
+    kubelet_dir.mkdir(parents=True)
+    (kubelet_dir / "0.log").write_text("2026-10-26T11:36:00Z stdout F real\n")
+    probe.seed_log(_seed(UID, [{"message": "oom"}]))
+    receipt = _emitted(capsys)
+    assert receipt["created_dirs"] == [] and receipt["kubelet_directory"] is True
+    assert (kubelet_dir / "0.log").read_text().endswith("real\n"), (
+        "kubelet's own log file is untouched"
+    )
+
+
+def _gc_wait(remove_at_poll: int | None, directory: Path) -> dict[str, Any]:
+    """``await_directory_gc`` with a virtual clock (0.5 s per read) and a sleep
+    that plays kubelet's GC at ``remove_at_poll`` (never, when ``None``)."""
+
+    ticks = itertools.count()
+    polls = itertools.count(1)
+
+    def sleep(_seconds: float) -> None:
+        if remove_at_poll is not None and next(polls) == remove_at_poll:
+            shutil.rmtree(directory)
+
+    return probe.await_directory_gc(
+        directory, 75, clock=lambda: 0.5 * next(ticks), sleep=sleep
+    )
+
+
+def test_await_directory_gc_sees_the_tick_on_the_old_pods_own_directory(
+    tree: dict[str, Path],
+) -> None:
+    directory = _old_pod_dir(tree)
+    gc = _gc_wait(3, directory)
+    assert gc["canary"] is True, "the old Pod's directory was recreated as the canary"
+    assert gc["observed"] is True and not directory.exists()
+    assert gc["awaited_seconds"] == 75 and 1.0 <= gc["after_seconds"] <= 3.0
+    assert len(list(tree["pods"].iterdir())) == 0, "nothing else was created"
+    # kubelet's real directory still there: no canary, same wait.
+    directory.mkdir()
+    gc = _gc_wait(1, directory)
+    assert gc["canary"] is False and gc["observed"] is True
+
+
+def test_await_directory_gc_gives_up_after_the_budget(tree: dict[str, Path]) -> None:
+    directory = _old_pod_dir(tree)
+    gc = _gc_wait(None, directory)
+    assert gc["canary"] is True and gc["observed"] is False
+    assert gc["after_seconds"] >= 75 and directory.is_dir(), (
+        "the canary stays and is seeded as this run's directory"
+    )
+
+
+def test_seed_log_seeds_right_after_the_gc_tick(
+    tree: dict[str, Path],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory = _old_pod_dir(tree)
+    ticks = itertools.count()
+
+    def sleep(_seconds: float) -> None:
+        if directory.exists():
+            shutil.rmtree(directory)  # kubelet's GC tick
+
+    monkeypatch.setattr(
+        probe,
+        "await_directory_gc",
+        functools.partial(
+            probe.await_directory_gc, clock=lambda: 0.5 * next(ticks), sleep=sleep
+        ),
+    )
+    probe.seed_log(_seed(UID, [{"message": "oom"}], allow=True, await_gc_seconds=75))
+    receipt = _emitted(capsys)
+    assert receipt["gc"]["observed"] is True and receipt["gc"]["canary"] is True
+    assert receipt["created_dirs"] == [str(directory), str(directory / "pytorch")], (
+        "the directory is recreated after the tick and recorded as this run's"
+    )
+    path = Path(str(receipt["file"]["path"]))  # type: ignore[index]
+    assert path.read_text().endswith(" stdout F oom\n"), "the line is in the new file"
+    entry = probe.load_state(RUN)["logs"][f"{UID}/pytorch"]
+    assert entry["gc"]["observed"] is True and entry["writes"] == 1
+
+
+def test_seed_log_keeps_the_canary_when_no_tick_came(
+    tree: dict[str, Path],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory = _old_pod_dir(tree)
+    ticks = itertools.count(step=40)
+    monkeypatch.setattr(
+        probe,
+        "await_directory_gc",
+        functools.partial(
+            probe.await_directory_gc,
+            clock=lambda: float(next(ticks)),
+            sleep=lambda _seconds: None,
+        ),
+    )
+    probe.seed_log(_seed(UID, [{"message": "oom"}], allow=True, await_gc_seconds=75))
+    receipt = _emitted(capsys)
+    assert receipt["gc"]["observed"] is False and receipt["gc"]["canary"] is True
+    assert receipt["created_dirs"] == [str(directory), str(directory / "pytorch")], (
+        "the canary directory is this run's and is removed by the cleanup"
+    )
+    assert Path(str(receipt["file"]["path"])).is_file(), receipt  # type: ignore[index]
+
+
+def test_seed_log_names_a_directory_the_gc_took_while_seeding(
+    tree: dict[str, Path],
+) -> None:
+    directory = _old_pod_dir(tree)
+
+    def gc_between_steps(stage: str) -> None:
+        if stage == "directory":
+            shutil.rmtree(directory)
+
+    with pytest.raises(probe.ProbeError) as caught:
+        probe.seed_log(
+            _seed(UID, [{"message": "oom"}], allow=True), interrupt=gc_between_steps
+        )
+    assert caught.value.reason == "directory_removed"
+    assert "kubelet's GC" in str(caught.value)
+    assert f"{UID}/pytorch" not in probe.load_state(RUN)["logs"], (
+        "a round the GC took left no fixture record behind"
+    )
+
+
+def test_write_and_rotate_name_a_file_the_gc_took(
+    tree: dict[str, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The live 2026-10-26 old_pod failure: write found the file gone."""
+
+    probe.create_log(_create(UID, allow=True))
+    path = Path(str(_emitted(capsys)["file"]["path"]))  # type: ignore[index]
+    shutil.rmtree(path.parent.parent)
+    with pytest.raises(probe.ProbeError) as gone:
+        probe.write(_write([{"message": "x"}]))
+    assert gone.value.reason == "fixture_gone"
+    assert str(gone.value) == (
+        "the fixture log file is gone (kubelet removed the directory?)"
+    )
+    with pytest.raises(probe.ProbeError) as rotate:
+        probe.rotate(argparse.Namespace(run_id=RUN, pod_uid=UID, container="pytorch"))
+    assert rotate.value.reason == "fixture_gone"
+    with pytest.raises(probe.ProbeError) as missing:
+        probe.create_log(_create(UID.replace("0f3b", "1a2b")))
+    assert missing.value.reason == "directory_missing"
+
+
+def test_pod_log_layout_counts_kubelets_shape(
+    tree: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pods = tree["pods"]
+    shaped = pods / f"kube-system_aws-node-x_{UID}" / "aws-node"
+    shaped.mkdir(parents=True)
+    (shaped / "0.log").write_text("x\n")
+    (pods / f"gpu-fault-system_probe_{UID.replace('0f3b', '1a2b')}").mkdir()
+    (pods / "not-a-pod-dir").mkdir()
+    (pods / "a-file").write_text("")
+    assert probe.pod_log_layout() == {
+        "directories": 3,
+        "kubelet_shape": 2,
+        "with_container_log": 1,
+    }
+    monkeypatch.setattr(probe, "POD_LOG_ROOT", pods / "missing")
+    assert probe.pod_log_layout() == {
+        "directories": 0,
+        "kubelet_shape": 0,
+        "with_container_log": 0,
+    }
+
+
+def test_preflight_reports_the_root_the_layout_and_the_unit(
+    tree: dict[str, Path],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(probe, "boot_id", lambda: "boot")
+    monkeypatch.setattr(
+        probe,
+        "unit_state",
+        lambda unit: {"LoadState": "loaded", "ActiveState": "inactive"},
+    )
+    probe.preflight(argparse.Namespace())
+    receipt = _emitted(capsys)
+    assert receipt["pod_log_root"] is True
+    assert receipt["pod_log_root_path"] == str(tree["pods"])
+    assert receipt["pod_log_layout"] == {
+        "directories": 0,
+        "kubelet_shape": 0,
+        "with_container_log": 0,
+    }
+    assert receipt["unit"]["LoadState"] == "loaded" and receipt["boot_id"] == "boot"
 
 
 def test_write_refuses_a_rotated_target_before_any_rotation(

@@ -9,12 +9,16 @@ log *text* is reviewed input (``docs/components/general-fault-live-acceptance.md
 ``probes/general_live_applog_probe.py``:
 
     logs = cri_pod_logs(ctx)                     # cleanup registered (LIFO)
+    gaps = capability_gaps(logs.preflight())     # read-only: root, layout, unit
     logs.open(container="pytorch", approved=True)  # drop-in + deadman; the unit
                                                  # reads only this run's file
     logs.create_log(pod_uid, container="pytorch", namespace=..., pod_name=...)
     logs.wait_tracked(ctx, pod_uid, container="pytorch")  # the collector saw it
     receipt = logs.write(pod_uid, container="pytorch", records=[reviewed_line(...)])
     logs.rotate(...) / logs.write(..., target="rotated") / logs.restart_collector()
+    logs.seed_log(old_uid, ..., records=[...], allow_create_dir=True,
+                  await_gc_seconds=75)           # old_pod: one call, after the
+                                                 # kubelet GC tick (see the probe)
     view = logs.status()                         # files + the collector's state
     ...                                          # the caller reads product records
     logs.cleanup()                               # files, drop-in, unit, deadman
@@ -26,6 +30,11 @@ The product reads a training log only through ``GPU_FAULT_TRAINING_LOG_PATHS``
 it). ``pod_identity`` then binds each record to the UID and container of the
 directory kubelet made for the runner's own Pod; ``log_recovery_context``
 attributes it to the attempt observation the completion watcher recorded.
+
+A failed probe call raises ``HostProbeError`` whose ``reason`` is the probe's
+own token (``probes/general_live_applog_probe.py`` ``REASONS``); the sentence
+behind it is in the case's ``probe-error.json``. ``GC_LOST_REASONS`` are the
+two a caller may repeat a round on.
 
 A reviewed record is ``{"message", "stream"?, "flag"?}`` (``stdout``/``stderr``,
 CRI ``P`` partial or ``F`` full); the node stamps it with its own clock when it
@@ -51,6 +60,19 @@ if TYPE_CHECKING:
 PROBE_SCRIPT = Path(__file__).with_name("probes") / "general_live_applog_probe.py"
 PROOF_SCOPE = "live-replay"
 PROBE_KEY = "cri-pod-logs"
+#: The node log collector unit the window drives (``probe.LOG_UNIT``).
+LOG_UNIT = "gpu-fault-log-collector.service"
+#: Where the product binds a CRI log to its Pod (``node_sources.pod_log_root``
+#: default, fixed in the collector) and where kubelet keeps them on both of
+#: this site's runtimes (``probe.POD_LOG_ROOT``).
+POD_LOG_ROOT = "/var/log/pods"
+#: Probe reason tokens that mean kubelet's container GC took the fixture's
+#: directory between two steps: a round a caller may repeat (017 ``old_pod``).
+#: Every other reason is the failure it names.
+GC_LOST_REASONS = frozenset({"fixture_gone", "directory_removed"})
+#: ``seed-log``: the probe's own bound on ``--await-gc-seconds`` (``probe.
+#: MAX_GC_WAIT_SECONDS``); the exec timeout and the action-time guard add it.
+MAX_GC_WAIT_SECONDS = 180
 #: The Pod annotation the completion watcher reads a container's host PID from
 #: (``completion_pod_parsing.HOST_PID_ANNOTATION``): the workload's declaration
 #: of attribution element four (detailed design v2 section 5.5). The runner
@@ -99,6 +121,43 @@ def records_sha256(records: list[dict[str, Any]]) -> str:
 
 def _encode(records: list[dict[str, Any]]) -> bytes:
     return json.dumps(records, sort_keys=True).encode("utf-8")
+
+
+def capability_gaps(preflight: dict[str, Any]) -> list[str]:
+    """What the node lacks for a CRI Pod-log window, from the read-only ``preflight``.
+
+    Each sentence names the exact missing capability (``NOT_RUN(CAPABILITY_ABSENT)``
+    before anything on the node is touched): kubelet's Pod-log root, at least
+    one kubelet-shaped ``<namespace>_<pod>_<uid>/<container>/0.log`` directory
+    under it -- the shape the product's ``pod_identity`` binds by and
+    ``old_pod`` recreates an old Pod's directory in -- and the installed node
+    log collector unit. The receipt is the probe's; a key it did not send is a
+    gap, never a pass.
+    """
+
+    gaps: list[str] = []
+    root = str(preflight.get("pod_log_root_path") or POD_LOG_ROOT)
+    if preflight.get("pod_log_root") is not True:
+        gaps.append(
+            f"kubelet's CRI Pod-log directory {root} does not exist on the node"
+        )
+    else:
+        layout = preflight.get("pod_log_layout") or {}
+        if not isinstance(layout, dict) or not int(
+            layout.get("with_container_log") or 0
+        ):
+            gaps.append(
+                "no kubelet-shaped <namespace>_<pod>_<uid>/<container>/0.log "
+                f"directory under {root}: the collector's pod_identity cannot bind a "
+                "CRI log to a Pod on this node"
+            )
+    unit = preflight.get("unit") or {}
+    load_state = unit.get("LoadState") if isinstance(unit, dict) else None
+    if load_state != "loaded":
+        gaps.append(
+            f"{LOG_UNIT} is not installed on the node (LoadState={load_state!r})"
+        )
+    return gaps
 
 
 class CriPodLogFixture:
@@ -258,6 +317,67 @@ class CriPodLogFixture:
         )
         return receipt
 
+    def seed_log(
+        self,
+        pod_uid: str,
+        *,
+        container: str,
+        namespace: str,
+        pod_name: str,
+        records: list[dict[str, Any]],
+        allow_create_dir: bool = False,
+        await_gc_seconds: int = 0,
+    ) -> dict[str, Any]:
+        """``create_log`` and ``write`` in one probe call (``seed-log``).
+
+        For a directory kubelet is going to remove (``old_pod``): with
+        ``await_gc_seconds`` the probe first watches the old Pod's directory
+        for kubelet's GC tick and seeds right after it, so the file lives a
+        whole GC period for the collector's poll. A ``HostProbeError`` whose
+        ``reason`` is in ``GC_LOST_REASONS`` is a round the caller may repeat.
+        """
+
+        if not records:
+            raise ValueError("seed_log needs at least one reviewed record")
+        if not 0 <= int(await_gc_seconds) <= MAX_GC_WAIT_SECONDS:
+            raise ValueError(f"await_gc_seconds is outside 0..{MAX_GC_WAIT_SECONDS}")
+        require_action_time(120 + int(await_gc_seconds))
+        arguments = [
+            "seed-log",
+            "--run-id",
+            self.run_id,
+            "--pod-uid",
+            pod_uid,
+            "--container",
+            container,
+            "--namespace",
+            namespace,
+            "--pod-name",
+            pod_name,
+            "--sha256",
+            records_sha256(records),
+            "--b64",
+            base64.b64encode(_encode(records)).decode("ascii"),
+            "--await-gc-seconds",
+            str(int(await_gc_seconds)),
+        ]
+        if allow_create_dir:
+            arguments.append("--allow-create-dir")
+        receipt = self.host.execute(*arguments, timeout=120 + int(await_gc_seconds))
+        self._written.append(
+            {
+                "pod_uid": pod_uid,
+                "container": container,
+                "target": "current",
+                "records": list(records),
+                "sha256": records_sha256(records),
+                "stamps": list(receipt.get("stamps") or []),
+                "seeded": True,
+                "gc": receipt.get("gc"),
+            }
+        )
+        return receipt
+
     def rotate(self, pod_uid: str, *, container: str) -> dict[str, Any]:
         require_action_time(60)
         return self.host.execute(
@@ -388,12 +508,17 @@ def cri_pod_logs(ctx: VariantContext) -> CriPodLogFixture:
 __all__ = [
     "CUDA_OOM_LINE",
     "CriPodLogFixture",
+    "GC_LOST_REASONS",
     "HOST_PID_ANNOTATION",
+    "LOG_UNIT",
+    "MAX_GC_WAIT_SECONDS",
     "NCCL_ERROR_LINE",
     "PARTIAL_HEAD",
     "PARTIAL_TAIL",
+    "POD_LOG_ROOT",
     "PROBE_KEY",
     "PROOF_SCOPE",
+    "capability_gaps",
     "cri_pod_logs",
     "records_sha256",
     "reviewed_line",

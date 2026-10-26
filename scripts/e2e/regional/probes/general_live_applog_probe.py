@@ -29,9 +29,32 @@ managed training attempt the runner created, and nothing else:
   survives -- and ``write --target rotated`` continues on that inode.
   ``restart-collector`` restarts the unit so a pending partial record must come
   back from the collector's persisted state.
+* ``seed-log`` is ``create-log`` and ``write`` in ONE process, for a directory
+  kubelet is going to remove: kubelet's container GC (``ContainerGCPeriod``,
+  one minute) deletes every ``/var/log/pods`` directory whose Pod UID it no
+  longer knows, so a directory recreated for an old Pod lives an unknown
+  remainder of that minute. Two separate probe calls lost that race live
+  (HyperPod, 2026-10-26: ``create-log`` succeeded, ``write`` found the file
+  gone 6 s later). ``seed-log`` first uses the old Pod's own directory --
+  recreated empty, or kubelet's real one if it is still there -- as the canary
+  for the GC tick (``--await-gc-seconds``), then recreates directory, file and
+  records right after the tick, so the file is there for the whole next period
+  and the collector's 10 s poll is sure to visit it. The canary is this run's
+  directory under this run's old Pod UID and nothing else.
 * ``status`` is the runner's raw-source oracle: the fixture files' inodes and
   sizes and, read-only, what the collector's own state file records about them
   (offset, inode, a pending CRI fragment).
+
+Every refusal is a ``ProbeError`` that names its reason with one token from the
+closed vocabulary :data:`REASONS` (``fixture_gone``, ``directory_removed``,
+``unit_missing`` ...). The failure line ``main`` prints carries the exception
+class, the sha256 digest of the sentence, the ``function:line`` site, that
+reason token and the sentence itself: the host fixture shows the first four in
+the exception text and keeps the sentence, redacted, as the case's
+``probe-error.json`` (``host_probe_fixture.py``). Before this, the line was
+``{"error": "ProbeError", "error_kind": "probe"}`` -- a shape the fixture reads
+``error_class`` from -- so the live failure read "output withheld" and nothing
+else.
 
 Everything is bounded and reversible two ways -- the runner's cleanup and a
 ``systemd-run --on-active`` deadman that restores the baseline from a copy of
@@ -53,9 +76,10 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 STATE_ROOT = Path("/run/gpu-fault-applog-replay")
 DROPIN_ROOT = Path("/run/systemd/system")
@@ -96,10 +120,55 @@ CGROUP_PATTERNS = (
     "pids/kubepods/*/{id}/cgroup.procs",
     "pids/kubepods/*/*/{id}/cgroup.procs",
 )
+#: ``seed-log``: how long the old Pod's directory may be watched for kubelet's
+#: container GC tick, at most. kubelet's ``ContainerGCPeriod`` is one minute,
+#: so the runner asks for a little more than one period; nothing is created or
+#: observed by the wait except this run's directory.
+MAX_GC_WAIT_SECONDS = 180
+GC_POLL_SECONDS = 0.5
+
+#: The closed vocabulary of ``ProbeError.reason`` tokens. The host fixture
+#: shows the token beside the class, digest and site of a failed call
+#: (``host_probe_fixture.py``: ``[a-z][a-z0-9_]{2,40}``) and the runner branches
+#: on it -- 017 ``old_pod`` repeats a round whose directory kubelet's GC took
+#: (``fixture_gone``, ``directory_removed``) and refuses everything else -- so a
+#: new refusal needs a token here before it can be raised.
+REASONS = frozenset(
+    {
+        "input_shape",  # an argument failed its shape check (id, uid, records)
+        "command_failed",  # a systemctl/systemd-run call exited non-zero
+        "not_approved",  # the window needs ENABLE_NODE_LOG_COLLECTOR
+        "window_open",  # an applog window for this run is already open
+        "dropin_untracked",  # a replay drop-in exists that no window tracks
+        "unit_missing",  # the node log collector unit is not installed
+        "unit_inactive",  # the unit did not come back active
+        "pod_log_root_missing",  # /var/log/pods does not exist on the node
+        "deadman_inactive",  # the restore timer did not arm
+        "no_window",  # no applog window is open for this run
+        "window_identity",  # the window state belongs to another run
+        "container_mismatch",  # the container differs from the window's glob
+        "fixture_exists",  # a fixture log already exists for this Pod/container
+        "directory_missing",  # the Pod's directory is gone and may not be made
+        "directory_removed",  # kubelet's GC took the directory while seeding
+        "fixture_gone",  # kubelet's GC took the fixture file before a write
+        "no_fixture",  # no fixture log was created for this Pod/container
+        "never_rotated",  # write --target rotated before any rotation
+        "rotation_exists",  # the rotation target already exists
+        "no_process",  # the container's cgroup lists no process
+    }
+)
 
 
 class ProbeError(RuntimeError):
-    pass
+    def __init__(self, message: str, reason: str) -> None:
+        if reason not in REASONS:
+            raise ValueError(f"probe error reason {reason!r} is not in REASONS")
+        super().__init__(message)
+        #: One token from :data:`REASONS` naming the refusal. The host fixture
+        #: shows it in the exception text (the sentence itself only reaches the
+        #: redacted ``probe-error.json``) and the runner reads it back as
+        #: ``HostProbeError.reason``.
+        self.reason = reason
 
 
 def utc_now() -> datetime:
@@ -124,7 +193,8 @@ def run(
     if check and completed.returncode:
         raise ProbeError(
             f"command failed ({completed.returncode}): {' '.join(command)}: "
-            f"{completed.stderr.strip()[:300]}"
+            f"{completed.stderr.strip()[:300]}",
+            "command_failed",
         )
     return completed
 
@@ -134,7 +204,7 @@ def run(
 # --------------------------------------------------------------------------- #
 def safe_id(value: str) -> str:
     if SAFE_ID.fullmatch(value) is None:
-        raise ProbeError("unsafe run ID")
+        raise ProbeError("unsafe run ID", "input_shape")
     return value
 
 
@@ -173,33 +243,34 @@ def source_glob(container: str, run_id: str) -> str:
 def checked_restore_seconds(value: int) -> int:
     if not MIN_RESTORE_SECONDS <= int(value) <= MAX_RESTORE_SECONDS:
         raise ProbeError(
-            f"restore seconds is outside {MIN_RESTORE_SECONDS}..{MAX_RESTORE_SECONDS}"
+            f"restore seconds is outside {MIN_RESTORE_SECONDS}..{MAX_RESTORE_SECONDS}",
+            "input_shape",
         )
     return int(value)
 
 
 def checked_pod_uid(value: str) -> str:
     if POD_UID.fullmatch(value or "") is None:
-        raise ProbeError("a Pod UID must be a lower-case UUID")
+        raise ProbeError("a Pod UID must be a lower-case UUID", "input_shape")
     return value
 
 
 def checked_name(value: str, what: str) -> str:
     if DNS_NAME.fullmatch(value or "") is None:
-        raise ProbeError(f"{what} is not a DNS-1123 name")
+        raise ProbeError(f"{what} is not a DNS-1123 name", "input_shape")
     return value
 
 
 def checked_label(value: str) -> str:
     if DNS_LABEL.fullmatch(value or "") is None:
-        raise ProbeError("a container name must be a DNS-1123 label")
+        raise ProbeError("a container name must be a DNS-1123 label", "input_shape")
     return value
 
 
 def checked_container_id(value: str) -> str:
     value = (value or "").split("://")[-1]
     if CONTAINER_ID.fullmatch(value) is None:
-        raise ProbeError("a container id must be 64 hex digits")
+        raise ProbeError("a container id must be 64 hex digits", "input_shape")
     return value
 
 
@@ -247,7 +318,7 @@ def load_state(run_id: str) -> dict[str, Any]:
         return {}
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict) or value.get("run_id") != run_id:
-        raise ProbeError("applog window identity mismatch")
+        raise ProbeError("applog window identity mismatch", "window_identity")
     return value
 
 
@@ -278,7 +349,7 @@ def log_key(pod_uid: str, container: str) -> str:
 def open_state(run_id: str) -> dict[str, Any]:
     state = load_state(run_id)
     if not state:
-        raise ProbeError("no applog window is open for this run")
+        raise ProbeError("no applog window is open for this run", "no_window")
     return state
 
 
@@ -289,39 +360,49 @@ def validate_records(records: Any) -> list[dict[str, str]]:
     """Check a reviewed record set; never mutate it."""
 
     if not isinstance(records, list) or not records:
-        raise ProbeError("reviewed records must be a non-empty list")
+        raise ProbeError("reviewed records must be a non-empty list", "input_shape")
     if len(records) > MAX_RECORDS:
-        raise ProbeError(f"at most {MAX_RECORDS} reviewed records may be written")
+        raise ProbeError(
+            f"at most {MAX_RECORDS} reviewed records may be written", "input_shape"
+        )
     result = []
     for item in records:
         if not isinstance(item, dict):
-            raise ProbeError("each reviewed record must be an object")
+            raise ProbeError("each reviewed record must be an object", "input_shape")
         message = item.get("message")
         if not isinstance(message, str) or not message:
-            raise ProbeError("a reviewed record needs a non-empty message")
+            raise ProbeError(
+                "a reviewed record needs a non-empty message", "input_shape"
+            )
         if "\n" in message or "\r" in message:
-            raise ProbeError("a reviewed record message is one line")
+            raise ProbeError("a reviewed record message is one line", "input_shape")
         if len(message.encode("utf-8")) > MAX_MESSAGE_BYTES:
-            raise ProbeError("reviewed record message is too large")
+            raise ProbeError("reviewed record message is too large", "input_shape")
         stream = str(item.get("stream") or "stdout")
         if stream not in STREAMS:
-            raise ProbeError(f"stream {stream!r} is not stdout or stderr")
+            raise ProbeError(
+                f"stream {stream!r} is not stdout or stderr", "input_shape"
+            )
         flag = str(item.get("flag") or "F")
         if flag not in FLAGS:
-            raise ProbeError(f"CRI flag {flag!r} is not P or F")
+            raise ProbeError(f"CRI flag {flag!r} is not P or F", "input_shape")
         result.append({"message": message, "stream": stream, "flag": flag})
     return result
 
 
 def decode_records(sha256: str, b64: str) -> list[dict[str, str]]:
     if SHA256.fullmatch(sha256 or "") is None:
-        raise ProbeError("a sha256 is required for the reviewed record set")
+        raise ProbeError(
+            "a sha256 is required for the reviewed record set", "input_shape"
+        )
     try:
         content = base64.b64decode(b64, validate=True)
     except (ValueError, TypeError) as error:
-        raise ProbeError(f"records are not valid base64: {error}") from error
+        raise ProbeError(
+            f"records are not valid base64: {error}", "input_shape"
+        ) from error
     if hashlib.sha256(content).hexdigest() != sha256:
-        raise ProbeError("reviewed record set sha256 does not match")
+        raise ProbeError("reviewed record set sha256 does not match", "input_shape")
     return validate_records(json.loads(content.decode("utf-8")))
 
 
@@ -367,7 +448,7 @@ def container_init_pid(
         except OSError:
             continue
     if not pids:
-        raise ProbeError("the container's cgroup lists no process")
+        raise ProbeError("the container's cgroup lists no process", "no_process")
     rows = []
     for pid in sorted(set(pids)):
         rows.append(_process_row(proc_root, pid))
@@ -491,7 +572,9 @@ def arm_deadman(run_id: str, seconds: int) -> str:
         ]
     )
     if unit_state(f"{name}.timer").get("ActiveState") != "active":
-        raise ProbeError("applog replay deadman timer is not active")
+        raise ProbeError(
+            "applog replay deadman timer is not active", "deadman_inactive"
+        )
     return name
 
 
@@ -506,6 +589,36 @@ def disarm_deadman(run_id: str) -> None:
 # --------------------------------------------------------------------------- #
 # Subcommands
 # --------------------------------------------------------------------------- #
+def pod_log_layout() -> dict[str, int]:
+    """What kubelet keeps under the root, read-only: how many directories, how
+    many in kubelet's ``<namespace>_<pod>_<uid>`` shape, how many of those hold
+    a ``<container>/0.log``. The product binds a CRI log to its Pod through that
+    shape (``node_records.pod_identity``) and ``old_pod`` recreates an old Pod's
+    directory by it; a node whose kubelet keeps Pod logs elsewhere (a
+    ``podLogsDir`` kubelet setting) has no such directory and the runner says so
+    before it opens a window there.
+    """
+
+    layout = {"directories": 0, "kubelet_shape": 0, "with_container_log": 0}
+    if not POD_LOG_ROOT.is_dir():
+        return layout
+    for directory in POD_LOG_ROOT.iterdir():
+        if not directory.is_dir():
+            continue
+        layout["directories"] += 1
+        parts = directory.name.rsplit("_", 2)
+        if len(parts) != 3 or POD_UID.fullmatch(parts[2]) is None:
+            continue
+        layout["kubelet_shape"] += 1
+        try:
+            children = list(directory.iterdir())
+        except OSError:
+            continue
+        if any(child.is_dir() and (child / "0.log").exists() for child in children):
+            layout["with_container_log"] += 1
+    return layout
+
+
 def preflight(arguments: argparse.Namespace) -> None:
     emit(
         {
@@ -513,6 +626,8 @@ def preflight(arguments: argparse.Namespace) -> None:
             "boot_id": boot_id(),
             "python": sys.version.split()[0],
             "pod_log_root": POD_LOG_ROOT.is_dir(),
+            "pod_log_root_path": str(POD_LOG_ROOT),
+            "pod_log_layout": pod_log_layout(),
             "collector_state": COLLECTOR_STATE_PATH.is_file(),
             "unit": unit_state(LOG_UNIT),
         }
@@ -529,22 +644,29 @@ def open_window(arguments: argparse.Namespace) -> None:
     restore_seconds = checked_restore_seconds(arguments.restore_seconds)
     initial_tail = int(arguments.initial_tail_bytes)
     if not 0 <= initial_tail <= MAX_INITIAL_TAIL_BYTES:
-        raise ProbeError(f"initial tail bytes is outside 0..{MAX_INITIAL_TAIL_BYTES}")
+        raise ProbeError(
+            f"initial tail bytes is outside 0..{MAX_INITIAL_TAIL_BYTES}", "input_shape"
+        )
     if not arguments.approved:
         raise ProbeError(
             "the node log collector is disabled in production; the CRI Pod-log "
-            "window needs the runner's ENABLE_NODE_LOG_COLLECTOR approval"
+            "window needs the runner's ENABLE_NODE_LOG_COLLECTOR approval",
+            "not_approved",
         )
     if load_state(run_id):
-        raise ProbeError("an applog window for this run is already open")
+        raise ProbeError("an applog window for this run is already open", "window_open")
     dropin = dropin_path(run_id)
     if dropin.exists():
-        raise ProbeError("an untracked applog replay drop-in already exists")
+        raise ProbeError(
+            "an untracked applog replay drop-in already exists", "dropin_untracked"
+        )
     before = unit_state(LOG_UNIT)
     if before.get("LoadState") != "loaded":
-        raise ProbeError("the node log collector unit is not installed")
+        raise ProbeError("the node log collector unit is not installed", "unit_missing")
     if not POD_LOG_ROOT.is_dir():
-        raise ProbeError(f"{POD_LOG_ROOT} does not exist on this node")
+        raise ProbeError(
+            f"{POD_LOG_ROOT} does not exist on this node", "pod_log_root_missing"
+        )
 
     probe_copy(run_id)
     glob = source_glob(container, run_id)
@@ -585,7 +707,9 @@ def open_window(arguments: argparse.Namespace) -> None:
     run(["systemctl", "restart", LOG_UNIT], timeout=120)
     after = unit_state(LOG_UNIT)
     if after.get("ActiveState") != "active":
-        raise ProbeError(f"{LOG_UNIT} is not active after the window opened")
+        raise ProbeError(
+            f"{LOG_UNIT} is not active after the window opened", "unit_inactive"
+        )
     emit(
         {
             **state,
@@ -611,44 +735,92 @@ def inspect(arguments: argparse.Namespace) -> None:
     emit(value)
 
 
-def create_log(arguments: argparse.Namespace) -> None:
-    run_id = safe_id(arguments.run_id)
-    state = open_state(run_id)
-    container = checked_label(arguments.container)
+def _window_container(state: dict[str, Any], container: str) -> str:
+    container = checked_label(container)
     if container != state["container"]:
-        raise ProbeError("the container name differs from the open window's glob")
-    key = log_key(arguments.pod_uid, container)
+        raise ProbeError(
+            "the container name differs from the open window's glob",
+            "container_mismatch",
+        )
+    return container
+
+
+def _recreation_count(state: dict[str, Any], key: str) -> int:
+    """How many times this Pod/container's fixture was started over.
+
+    kubelet's GC took the recreated directory and the file with it before the
+    collector read it (``old_pod``): the run may try again from scratch, but
+    never while a file of the earlier round still exists.
+    """
+
     previous = state["logs"].get(key)
-    recreated = 0
-    if previous is not None:
-        gone = [previous["path"], *previous.get("rotated", [])]
-        if any(Path(item).exists() for item in gone):
-            raise ProbeError("a fixture log already exists for this Pod and container")
-        # kubelet's GC took the recreated directory and the file with it before
-        # the collector read it (old_pod): the run may try again from scratch.
-        recreated = int(previous.get("recreated", 0)) + 1
-    directory = pod_log_dir(arguments.namespace, arguments.pod_name, arguments.pod_uid)
-    created_dirs: list[str] = []
-    if not directory.is_dir():
-        if not arguments.allow_create_dir:
-            raise ProbeError(
-                "the Pod's log directory does not exist; only an old Pod's "
-                "directory may be created (--allow-create-dir)"
-            )
-        directory.mkdir(mode=0o755)
-        created_dirs.append(str(directory))
-    container_dir = directory / container
-    if not container_dir.is_dir():
-        container_dir.mkdir(mode=0o755)
-        created_dirs.append(str(container_dir))
-    path = container_dir / fixture_file_name(run_id)
-    if path.exists() or Path(str(path) + ".1").exists():
-        raise ProbeError("the fixture log file already exists")
-    with path.open("x", encoding="utf-8"):
-        pass
-    path.chmod(0o644)
-    state["logs"][key] = {
-        "pod_uid": checked_pod_uid(arguments.pod_uid),
+    if previous is None:
+        return 0
+    gone = [previous["path"], *previous.get("rotated", [])]
+    if any(Path(item).exists() for item in gone):
+        raise ProbeError(
+            "a fixture log already exists for this Pod and container",
+            "fixture_exists",
+        )
+    return int(previous.get("recreated", 0)) + 1
+
+
+def _directory_missing() -> ProbeError:
+    return ProbeError(
+        "the Pod's log directory does not exist; only an old Pod's "
+        "directory may be created (--allow-create-dir)",
+        "directory_missing",
+    )
+
+
+def _materialize(
+    directory: Path,
+    container_dir: Path,
+    path: Path,
+    created_dirs: list[str],
+    interrupt: Callable[[str], None] | None = None,
+) -> None:
+    """Make the directory, the container directory and the empty fixture file.
+
+    ``interrupt(stage)`` is a test seam called after each step; production
+    passes nothing. A ``FileNotFoundError`` on the way is kubelet's GC taking
+    the directory between two steps -- the reason token says so.
+    """
+
+    try:
+        if not directory.is_dir():
+            directory.mkdir(mode=0o755)
+            created_dirs.append(str(directory))
+        if interrupt is not None:
+            interrupt("directory")
+        if not container_dir.is_dir():
+            container_dir.mkdir(mode=0o755)
+            created_dirs.append(str(container_dir))
+        if interrupt is not None:
+            interrupt("container")
+        if path.exists() or Path(str(path) + ".1").exists():
+            raise ProbeError("the fixture log file already exists", "fixture_exists")
+        with path.open("x", encoding="utf-8"):
+            pass
+        path.chmod(0o644)
+    except FileNotFoundError as error:
+        raise ProbeError(
+            "the Pod's log directory was removed while the fixture was being "
+            "created (kubelet's GC took it)",
+            "directory_removed",
+        ) from error
+
+
+def _log_record(
+    pod_uid: str,
+    container: str,
+    directory: Path,
+    path: Path,
+    created_dirs: list[str],
+    recreated: int,
+) -> dict[str, Any]:
+    return {
+        "pod_uid": checked_pod_uid(pod_uid),
         "container": container,
         "directory": str(directory),
         "path": str(path),
@@ -657,6 +829,50 @@ def create_log(arguments: argparse.Namespace) -> None:
         "writes": 0,
         "recreated": recreated,
     }
+
+
+def _append_records(path: Path, records: list[dict[str, str]]) -> list[str]:
+    """Append the reviewed records at the node clock; the CRI stamps written."""
+
+    if not path.is_file():
+        raise ProbeError(
+            "the fixture log file is gone (kubelet removed the directory?)",
+            "fixture_gone",
+        )
+    stamps = []
+    now = utc_now()
+    try:
+        with path.open("a", encoding="utf-8") as handle:
+            for index, record in enumerate(records):
+                at = now + timedelta(microseconds=index)
+                stamps.append(cri_stamp(at))
+                handle.write(cri_line(record, at))
+            handle.flush()
+            os.fsync(handle.fileno())
+    except FileNotFoundError as error:
+        raise ProbeError(
+            "the fixture log file is gone (kubelet removed the directory?)",
+            "fixture_gone",
+        ) from error
+    return stamps
+
+
+def create_log(arguments: argparse.Namespace) -> None:
+    run_id = safe_id(arguments.run_id)
+    state = open_state(run_id)
+    container = _window_container(state, arguments.container)
+    key = log_key(arguments.pod_uid, container)
+    recreated = _recreation_count(state, key)
+    directory = pod_log_dir(arguments.namespace, arguments.pod_name, arguments.pod_uid)
+    if not directory.is_dir() and not arguments.allow_create_dir:
+        raise _directory_missing()
+    created_dirs: list[str] = []
+    container_dir = directory / container
+    path = container_dir / fixture_file_name(run_id)
+    _materialize(directory, container_dir, path, created_dirs)
+    state["logs"][key] = _log_record(
+        arguments.pod_uid, container, directory, path, created_dirs, recreated
+    )
     save_state(run_id, state)
     emit(
         {
@@ -671,10 +887,114 @@ def create_log(arguments: argparse.Namespace) -> None:
     )
 
 
+def await_directory_gc(
+    directory: Path,
+    seconds: int,
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> dict[str, Any]:
+    """Wait for kubelet's container GC to remove ``directory`` (``seconds`` at most).
+
+    The old Pod's own directory is the canary: kubelet's
+    ``evictPodLogsDirectories`` judges a ``/var/log/pods`` directory by the Pod
+    UID in its name, whether kubelet made it (the real one, if still there) or
+    this probe recreated it empty, so its removal marks the GC tick. A
+    directory recreated right after lives for the whole next period (one
+    minute) instead of an unknown remainder of it, which is what the
+    collector's 10 s poll needs. The dictionary says whether the canary was
+    created here, whether the tick was seen and after how long.
+    """
+
+    canary = False
+    if not directory.exists():
+        directory.mkdir(mode=0o755)
+        canary = True
+    started_at = utc_now()
+    start = clock()
+    observed = False
+    while clock() - start < seconds:
+        sleep(GC_POLL_SECONDS)
+        if not directory.exists():
+            observed = True
+            break
+    return {
+        "awaited_seconds": int(seconds),
+        "canary": canary,
+        "observed": observed,
+        "after_seconds": round(clock() - start, 1),
+        "started_at": started_at.isoformat(),
+    }
+
+
+def seed_log(
+    arguments: argparse.Namespace, *, interrupt: Callable[[str], None] | None = None
+) -> None:
+    """``create-log`` and ``write`` in one process, after kubelet's GC tick.
+
+    Everything is checked before the node is touched: the reviewed records and
+    their digest, the window, the container, an earlier round's leftovers.
+    """
+
+    run_id = safe_id(arguments.run_id)
+    records = decode_records(arguments.sha256, arguments.b64)
+    await_seconds = int(arguments.await_gc_seconds)
+    if not 0 <= await_seconds <= MAX_GC_WAIT_SECONDS:
+        raise ProbeError(
+            f"await-gc-seconds is outside 0..{MAX_GC_WAIT_SECONDS}", "input_shape"
+        )
+    state = open_state(run_id)
+    container = _window_container(state, arguments.container)
+    key = log_key(arguments.pod_uid, container)
+    recreated = _recreation_count(state, key)
+    directory = pod_log_dir(arguments.namespace, arguments.pod_name, arguments.pod_uid)
+    if not directory.is_dir() and not arguments.allow_create_dir:
+        raise _directory_missing()
+    created_dirs: list[str] = []
+    gc: dict[str, Any] | None = None
+    if await_seconds:
+        gc = await_directory_gc(directory, await_seconds)
+        if gc["canary"] and not gc["observed"]:
+            # The canary stayed: it is this run's directory and is seeded as is.
+            created_dirs.append(str(directory))
+    container_dir = directory / container
+    path = container_dir / fixture_file_name(run_id)
+    _materialize(directory, container_dir, path, created_dirs, interrupt)
+    stamps = _append_records(path, records)
+    record = _log_record(
+        arguments.pod_uid, container, directory, path, created_dirs, recreated
+    )
+    record["writes"] = len(records)
+    record["seeded"] = True
+    if gc is not None:
+        record["gc"] = gc
+    state["logs"][key] = record
+    save_state(run_id, state)
+    emit(
+        {
+            "run_id": run_id,
+            "key": key,
+            "file": file_view(path),
+            "created_dirs": created_dirs,
+            "recreated": recreated,
+            "kubelet_directory": not created_dirs or created_dirs[0] != str(directory),
+            "gc": gc,
+            "target": "current",
+            "records": len(records),
+            "stamps": stamps,
+            "flags": [item["flag"] for item in records],
+            "sha256": arguments.sha256,
+            "proof_scope": "live-replay",
+        }
+    )
+
+
 def _log_entry(state: dict[str, Any], pod_uid: str, container: str) -> dict[str, Any]:
     entry = state["logs"].get(log_key(pod_uid, container))
     if entry is None:
-        raise ProbeError("no fixture log was created for this Pod and container")
+        raise ProbeError(
+            "no fixture log was created for this Pod and container", "no_fixture"
+        )
     return entry
 
 
@@ -684,26 +1004,14 @@ def write(arguments: argparse.Namespace) -> None:
     entry = _log_entry(state, arguments.pod_uid, arguments.container)
     records = decode_records(arguments.sha256, arguments.b64)
     if arguments.target not in TARGETS:
-        raise ProbeError(f"target must be one of {TARGETS}")
+        raise ProbeError(f"target must be one of {TARGETS}", "input_shape")
     if arguments.target == "rotated":
         if not entry["rotated"]:
-            raise ProbeError("the fixture log was never rotated")
+            raise ProbeError("the fixture log was never rotated", "never_rotated")
         path = Path(entry["rotated"][-1])
     else:
         path = Path(entry["path"])
-    if not path.is_file():
-        raise ProbeError(
-            "the fixture log file is gone (kubelet removed the directory?)"
-        )
-    stamps = []
-    now = utc_now()
-    with path.open("a", encoding="utf-8") as handle:
-        for index, record in enumerate(records):
-            at = now + timedelta(microseconds=index)
-            stamps.append(cri_stamp(at))
-            handle.write(cri_line(record, at))
-        handle.flush()
-        os.fsync(handle.fileno())
+    stamps = _append_records(path, records)
     entry["writes"] = int(entry.get("writes", 0)) + len(records)
     save_state(run_id, state)
     emit(
@@ -727,10 +1035,11 @@ def rotate(arguments: argparse.Namespace) -> None:
     path = Path(entry["path"])
     rotated = Path(str(path) + f".{len(entry['rotated']) + 1}")
     if rotated.exists():
-        raise ProbeError("the rotation target already exists")
+        raise ProbeError("the rotation target already exists", "rotation_exists")
     if not path.is_file():
         raise ProbeError(
-            "the fixture log file is gone (kubelet removed the directory?)"
+            "the fixture log file is gone (kubelet removed the directory?)",
+            "fixture_gone",
         )
     before = file_view(path)
     os.rename(path, rotated)
@@ -757,7 +1066,7 @@ def restart_collector(arguments: argparse.Namespace) -> None:
     run(["systemctl", "restart", LOG_UNIT], timeout=120)
     after = unit_state(LOG_UNIT)
     if after.get("ActiveState") != "active":
-        raise ProbeError(f"{LOG_UNIT} is not active after the restart")
+        raise ProbeError(f"{LOG_UNIT} is not active after the restart", "unit_inactive")
     emit({"run_id": run_id, "before": before, "after": after})
 
 
@@ -806,7 +1115,9 @@ def close_window(arguments: argparse.Namespace) -> None:
         run(["systemctl", "restart", LOG_UNIT], timeout=120)
     after = unit_state(LOG_UNIT)
     if not state.get("enabled_log_collector") and after.get("ActiveState") != "active":
-        raise ProbeError(f"{LOG_UNIT} is not active after the window closed")
+        raise ProbeError(
+            f"{LOG_UNIT} is not active after the window closed", "unit_inactive"
+        )
     disarm_deadman(run_id)
     residue = window_residue(run_id, state)
     if state_dir(run_id).is_dir():
@@ -908,6 +1219,18 @@ def parser() -> argparse.ArgumentParser:
     item.add_argument("--allow-create-dir", action="store_true")
     item.set_defaults(handler=create_log)
 
+    item = commands.add_parser("seed-log")
+    item.add_argument("--run-id", required=True)
+    item.add_argument("--pod-uid", required=True)
+    item.add_argument("--container", required=True)
+    item.add_argument("--namespace", required=True)
+    item.add_argument("--pod-name", required=True)
+    item.add_argument("--sha256", required=True)
+    item.add_argument("--b64", required=True)
+    item.add_argument("--allow-create-dir", action="store_true")
+    item.add_argument("--await-gc-seconds", type=int, default=0)
+    item.set_defaults(handler=seed_log)
+
     item = commands.add_parser("write")
     item.add_argument("--run-id", required=True)
     item.add_argument("--pod-uid", required=True)
@@ -941,18 +1264,46 @@ def parser() -> argparse.ArgumentParser:
     return value
 
 
+def exception_site(exc: BaseException) -> str | None:
+    """The innermost ``function:line`` of this file on the exception's path."""
+
+    site = None
+    frame = exc.__traceback__
+    while frame is not None:
+        if frame.tb_frame.f_code.co_filename == __file__:
+            site = f"{frame.tb_frame.f_code.co_name}:{frame.tb_lineno}"
+        frame = frame.tb_next
+    return site
+
+
+def error_fields(exc: BaseException, command: str | None) -> dict[str, Any]:
+    """The failure line (the shape ``host_probe_fixture.execute`` reads).
+
+    Class, message digest, site and the reason token are what the fixture may
+    show in the exception text; the sentence goes into the case's redacted
+    ``probe-error.json``. Live 2026-10-26 (017 ``old_pod``, HyperPod) the line
+    carried the class under ``error`` only, which the fixture does not read for
+    ``error_kind: probe``, and the operator got "output withheld".
+    """
+
+    return {
+        "error": f"{type(exc).__name__}: {exc}",
+        "error_kind": "probe",
+        "error_class": type(exc).__name__,
+        "error_code": hashlib.sha256(str(exc).encode()).hexdigest()[:16],
+        "error_site": exception_site(exc),
+        "error_reason": getattr(exc, "reason", "") or None,
+        "error_message": str(exc)[:2000],
+        "command": command,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = parser().parse_args(argv)
     try:
         arguments.handler(arguments)
     except Exception as exc:  # noqa: BLE001 - reported as the probe's JSON error
-        emit(
-            {
-                "error": type(exc).__name__,
-                "error_kind": "probe",
-                "command": getattr(arguments, "command", None),
-            }
-        )
+        emit(error_fields(exc, getattr(arguments, "command", None)))
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
     return 0

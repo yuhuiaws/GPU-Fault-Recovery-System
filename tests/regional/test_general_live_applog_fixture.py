@@ -9,6 +9,7 @@ id the verdict recomputes is the product's.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 from collections.abc import Iterator
@@ -24,8 +25,11 @@ from gpu_fault.log_rules import matching_log_rules
 from scripts.e2e.regional import general_live_applog_fixture as helper
 from scripts.e2e.regional import general_live_applog_job as job_module
 from scripts.e2e.regional import general_live_applogs as mod
+from scripts.e2e.regional import host_probe_fixture as host
 from scripts.e2e.regional.general_live_fixture import GeneralLiveSettings
+from scripts.e2e.regional.probes import general_live_applog_probe as probe
 from tests.regional._general_live_fakes import FakeProbe, FakeRegional, make_context
+from tests.regional._host_probe_support import ProbeApi, host_probe
 
 NODE = "ip-10-0-43-5.us-west-2.compute.internal"
 UID = "0f3b7c2e-4d5a-4b6c-8d9e-0a1b2c3d4e5f"
@@ -186,6 +190,173 @@ def test_create_log_inspect_rotate_restart_and_status(tmp_path: Path) -> None:
     assert controller.tracked(view, "/other") is None
     assert controller.pending_fragment(view, "/p") == {"message": "col "}
     assert controller.pending_fragment(view, "/p", stream="stderr") is None
+
+
+def test_seed_log_sends_the_records_the_directory_flag_and_the_gc_wait(
+    tmp_path: Path,
+) -> None:
+    controller, fake = _controller(
+        tmp_path,
+        {
+            "seed-log": {
+                "file": {"path": "/p"},
+                "stamps": ["2026-10-26T11:37:52.000000000Z"],
+                "gc": {"observed": True, "after_seconds": 12.5, "canary": True},
+            }
+        },
+    )
+    records = [helper.reviewed_line(helper.CUDA_OOM_LINE)]
+    receipt = controller.seed_log(
+        UID,
+        container="pytorch",
+        namespace="ns",
+        pod_name="pod",
+        records=records,
+        allow_create_dir=True,
+        await_gc_seconds=75,
+    )
+    call = _call(fake, "seed-log")
+    assert call[call.index("--sha256") + 1] == helper.records_sha256(records)
+    sent = json.loads(base64.b64decode(call[call.index("--b64") + 1]))
+    assert sent == records
+    assert call[call.index("--namespace") + 1] == "ns"
+    assert call[call.index("--pod-name") + 1] == "pod"
+    assert call[call.index("--await-gc-seconds") + 1] == "75"
+    assert "--allow-create-dir" in call
+    assert fake.timeouts[-1] == ("seed-log", 120 + 75), (
+        "the exec timeout covers the GC wait"
+    )
+    assert receipt["gc"]["observed"] is True
+    written = controller.evidence()["writes"][-1]
+    assert written["seeded"] is True and written["gc"]["after_seconds"] == 12.5
+    assert written["stamps"] == ["2026-10-26T11:37:52.000000000Z"]
+    controller.seed_log(
+        UID, container="pytorch", namespace="ns", pod_name="pod", records=records
+    )
+    assert "--allow-create-dir" not in fake.calls[-1]
+    assert fake.calls[-1][fake.calls[-1].index("--await-gc-seconds") + 1] == "0"
+    with pytest.raises(ValueError, match="at least one"):
+        controller.seed_log(
+            UID, container="pytorch", namespace="ns", pod_name="pod", records=[]
+        )
+    with pytest.raises(ValueError, match="await_gc_seconds"):
+        controller.seed_log(
+            UID,
+            container="pytorch",
+            namespace="ns",
+            pod_name="pod",
+            records=records,
+            await_gc_seconds=helper.MAX_GC_WAIT_SECONDS + 1,
+        )
+
+
+def test_fixture_constants_follow_the_probe() -> None:
+    assert helper.GC_LOST_REASONS <= probe.REASONS, (
+        "the rounds a caller may repeat are reasons the probe can name"
+    )
+    assert helper.GC_LOST_REASONS == {"fixture_gone", "directory_removed"}
+    assert helper.MAX_GC_WAIT_SECONDS == probe.MAX_GC_WAIT_SECONDS
+    assert helper.LOG_UNIT == probe.LOG_UNIT
+    assert helper.POD_LOG_ROOT == str(probe.POD_LOG_ROOT)
+    assert mod.OLD_POD_GC_WAIT_SECONDS == 75, (
+        "kubelet's ContainerGCPeriod (one minute) plus a margin"
+    )
+    assert 60 < mod.OLD_POD_GC_WAIT_SECONDS <= helper.MAX_GC_WAIT_SECONDS
+
+
+PREFLIGHT_OK = {
+    "pod_log_root": True,
+    "pod_log_root_path": "/var/log/pods",
+    "pod_log_layout": {"directories": 9, "kubelet_shape": 9, "with_container_log": 9},
+    "unit": {"LoadState": "loaded"},
+}
+
+
+@pytest.mark.parametrize(
+    "preflight, expected",
+    [
+        (PREFLIGHT_OK, []),
+        (
+            {**PREFLIGHT_OK, "pod_log_root": False},
+            [
+                "kubelet's CRI Pod-log directory /var/log/pods does not exist on the node"
+            ],
+        ),
+        (
+            {**PREFLIGHT_OK, "pod_log_root_path": "/data/pods", "pod_log_root": False},
+            ["kubelet's CRI Pod-log directory /data/pods does not exist on the node"],
+        ),
+        (
+            {**PREFLIGHT_OK, "pod_log_layout": {"directories": 4, "kubelet_shape": 0}},
+            [
+                "no kubelet-shaped <namespace>_<pod>_<uid>/<container>/0.log directory "
+                "under /var/log/pods: the collector's pod_identity cannot bind a CRI "
+                "log to a Pod on this node"
+            ],
+        ),
+        (
+            {**PREFLIGHT_OK, "unit": {"LoadState": "not-found"}},
+            [
+                "gpu-fault-log-collector.service is not installed on the node "
+                "(LoadState='not-found')"
+            ],
+        ),
+        (
+            {},
+            [
+                "kubelet's CRI Pod-log directory /var/log/pods does not exist on the node",
+                "gpu-fault-log-collector.service is not installed on the node "
+                "(LoadState=None)",
+            ],
+        ),
+    ],
+)
+def test_capability_gaps_name_the_missing_capability(
+    preflight: dict[str, Any], expected: list[str]
+) -> None:
+    assert helper.capability_gaps(preflight) == expected
+
+
+def test_host_fixture_exposes_the_probes_reason_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The live old_pod failure, replayed through the real host fixture with the
+    probe's new failure line: the reason is on the exception, the sentence in
+    the case's probe-error.json, and nothing else leaves the node."""
+
+    sentence = "the fixture log file is gone (kubelet removed the directory?)"
+    payload = probe.error_fields(probe.ProbeError(sentence, "fixture_gone"), "write")
+    payload["error_site"] = "_append_records:700"
+    api = ProbeApi()
+    monkeypatch.setattr(host, "run_fixture_command", api.run)
+    fixture = host_probe(tmp_path)
+    fixture.create()
+    api.probe_returncode = 1
+    api.probe_stdout = json.dumps(payload) + "\n"
+    with pytest.raises(host.HostProbeError) as caught:
+        fixture.execute("write", "--run-id", "gl17-op-a6-x")
+    digest = hashlib.sha256(sentence.encode()).hexdigest()[:16]
+    assert str(caught.value) == (
+        f"host probe failed (exit 1; error ProbeError {digest} at "
+        "_append_records:700; reason fixture_gone; detail in probe-error.json); "
+        "output withheld"
+    )
+    assert caught.value.reason == "fixture_gone"
+    assert caught.value.reason in helper.GC_LOST_REASONS
+    assert sentence not in str(caught.value)
+    record = json.loads((tmp_path / "probe-error.json").read_text())
+    assert record["message"] == sentence and record["error_reason"] == "fixture_gone"
+    assert record["command"] == "write" and record["error_class"] == "ProbeError"
+    # The old failure line (class under ``error`` only) stays "output withheld"
+    # with no reason: the shape the live 2026-10-26 result.json carried.
+    api.probe_stdout = (
+        json.dumps({"error": "ProbeError", "error_kind": "probe", "command": "write"})
+        + "\n"
+    )
+    with pytest.raises(host.HostProbeError) as legacy:
+        fixture.execute("write", "--run-id", "gl17-op-a6-x")
+    assert str(legacy.value) == "host probe failed (exit 1); output withheld"
+    assert legacy.value.reason is None
 
 
 def test_cleanup_closes_an_open_window_and_fails_on_residue(tmp_path: Path) -> None:

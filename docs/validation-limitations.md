@@ -2085,6 +2085,27 @@ print formats (Linux v6.12): the `kernel/watchdog.c` soft-lockup line, the EFA
 `mm/oom_kill.c` "Memory cgroup out of memory: Killed process" line without a
 `kernel:` tag, so the rules are exercised on what a node really logs.
 
+017 `old_pod` writes its reviewed line under the UID of a Pod the product has
+already restarted away, in a directory kubelet is going to remove: kubelet's
+container GC (one-minute `ContainerGCPeriod`) deletes every `/var/log/pods`
+directory whose Pod UID it no longer knows. The first live run (HyperPod,
+2026-10-26) lost that race between two separate probe calls -- `create-log`
+succeeded, `write` found the file gone six seconds later -- and read only
+"host probe failed (exit 1); output withheld", because the probe's failure
+line carried the class under `error` alone. The node's layout was not the
+cause: the probe's `inspect` showed the same `/var/log/pods/<ns>_<pod>_<uid>/
+<container>/0.log` and cgroup v2 layout as plain EKS. The fixture now seeds
+directory, file and line in one probe call (`seed-log`) right after the GC tick
+it watches for on the old Pod's own directory (at most 75 s), repeats a round
+the GC still takes (the probe's `fixture_gone` / `directory_removed` reason
+tokens, read back as `HostProbeError.reason`) and fails on any other reason by
+name; every refusal of this probe carries a token from a closed vocabulary and
+its sentence lands in the case's `probe-error.json`. Before a window opens, the
+probe's read-only `preflight` must show kubelet's root, a kubelet-shaped Pod
+directory under it and the installed collector unit, or the variant is
+`NOT_RUN(CAPABILITY_ABSENT)` naming the gap. Neither cluster has an `old_pod`
+PASS yet; the rerun needs nothing prepared on the node.
+
 011 `fr_enabled` (the Flight Recorder configured as the operations manual
 prescribes: trace buffer, pipe, dump-file prefix and dump-on-timeout; at least
 one PID must show two real dumps as `PAIRED`) is registered as an expected FAIL
