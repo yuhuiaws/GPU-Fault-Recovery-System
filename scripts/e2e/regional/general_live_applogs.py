@@ -21,11 +21,13 @@ Two reviewed sources feed the node log collector's real rules
   UID, container name, attempt and host PID the product attributes by are
   genuine. The verdict reads the attempt observation, the delivered NODE_LOGS
   entries (``pod_uid``/``container_name``, the CRI event time), the incident's
-  attempt and the diagnostic bundle step's attribution parameters
-  (``attribution``, ``process_state``, ``target_pids_by_node``): a live process
-  is targeted, an exited one is never stack-sampled, an old Pod never reaches
-  the new attempt, and a ``P``/``F`` record stitches across polls, a rename
-  rotation and a collector restart.
+  attempt, the diagnostic bundle step's attribution parameters
+  (``attribution``, ``process_state``, ``target_pids_by_node``) and the Node
+  Agent's per-node bundle receipt (``details.node_results[<node>]``): a live
+  process is targeted and its bundle ran the process capture, an exited one is
+  never stack-sampled, an old Pod never reaches the new attempt, and a
+  ``P``/``F`` record stitches across polls, a rename rotation and a collector
+  restart.
 
 ``missing_flight_recorder`` is native: a managed two-node NCCL job without a
 flight recorder (``ManagedNcclJob(flight_recorder=False)``) stalls at zero EFA
@@ -355,6 +357,27 @@ def capture_steps(workflow: dict[str, Any] | None) -> list[str]:
     ]
 
 
+def bundle_node_result(
+    execution: dict[str, Any] | None, node: str
+) -> dict[str, Any] | None:
+    """The Node Agent's COLLECT_DIAGNOSTIC_BUNDLE receipt for ``node``.
+
+    A node-agent step is recorded per node under ``details.node_results[<node>]``
+    (``adapters/node_action/step_execution``): ``evidence_ref``, ``sha256``,
+    ``size_bytes`` and the ``manifest_summary`` the agent wrote
+    (``capture_count``, ``failed_capture_count``, ``diagnostic_reason``,
+    ``capture_process_state``). Nothing is hoisted to the step's own
+    ``details``. Live (HyperPod, 2026-10-26) a bundle of 25 captures and 0
+    failures -- py-spy, ``/proc`` and strace of the targeted host PID -- read
+    as "did not capture the live process state" while this oracle looked for
+    ``details.manifest_summary``.
+    """
+
+    results = ((execution or {}).get("details") or {}).get("node_results")
+    value = results.get(node) if isinstance(results, dict) else None
+    return dict(value) if isinstance(value, dict) else None
+
+
 def entry_identity_errors(
     entry: dict[str, Any] | None,
     *,
@@ -440,8 +463,16 @@ def diagnostic_chain_errors(
     workflow: dict[str, Any] | None,
     *,
     expect_bundle: bool,
+    node: str | None = None,
 ) -> list[str]:
-    """RUN_DIAGNOSTICS; the bundle ran for a live process and never for an exited one."""
+    """RUN_DIAGNOSTICS; the bundle ran for a live process and never for an exited one.
+
+    ``node`` is the node whose agent collected the bundle (required when one is
+    expected): its receipt under ``details.node_results[<node>]`` says whether
+    the process capture ran (``manifest_summary.capture_process_state``), and
+    a node the step has no receipt for is named with the failure or skip the
+    step recorded for it instead of being read as a bundle without one.
+    """
 
     if incident is None:
         return ["no incident"]
@@ -454,6 +485,8 @@ def diagnostic_chain_errors(
         return [*errors, "the incident has no workflow"]
     ops = operations(workflow)
     if expect_bundle:
+        if node is None:
+            raise ValueError("expect_bundle needs the node whose agent ran the bundle")
         if "COLLECT_DIAGNOSTIC_BUNDLE" not in ops:
             errors.append(f"no COLLECT_DIAGNOSTIC_BUNDLE for a live process: {ops}")
         execution = final_execution(workflow, "COLLECT_DIAGNOSTIC_BUNDLE")
@@ -463,9 +496,23 @@ def diagnostic_chain_errors(
                 f"{(execution or {}).get('status')} {(execution or {}).get('error')}"
             )
         else:
-            summary = (execution.get("details") or {}).get("manifest_summary") or {}
-            if summary.get("capture_process_state") is not True:
-                errors.append("the bundle did not capture the live process state")
+            result = bundle_node_result(execution, node)
+            details = execution.get("details") or {}
+            if result is None:
+                cause = (details.get("node_failures") or {}).get(node) or details.get(
+                    "skipped"
+                )
+                errors.append(
+                    f"the bundle step recorded no result for {node}"
+                    + (f": {cause}" if cause else "")
+                )
+            elif (result.get("manifest_summary") or {}).get(
+                "capture_process_state"
+            ) is not True:
+                errors.append(
+                    f"the bundle on {node} did not run the live process capture: "
+                    f"manifest_summary {result.get('manifest_summary')!r}"
+                )
     else:
         sampled = capture_steps(workflow)
         if sampled:
@@ -876,18 +923,41 @@ def live_pid(ctx: VariantContext) -> dict[str, Any]:
             node=ctx.settings.node,
             pid=pid,
         ),
-        "diagnostic": diagnostic_chain_errors(incident, workflow, expect_bundle=True),
+        "diagnostic": diagnostic_chain_errors(
+            incident, workflow, expect_bundle=True, node=ctx.settings.node
+        ),
         **_common_stages(ctx, records, workflow),
         "job_alive": []
         if job.alive().get("alive")
         else ["the live job did not survive"],
     }
+    # The agent's receipt travels with the result so a reviewer reads what the
+    # bundle holds (archive, digest, capture counts) without the Store.
+    bundle = bundle_node_result(
+        final_execution(workflow, "COLLECT_DIAGNOSTIC_BUNDLE") if workflow else None,
+        ctx.settings.node,
+    )
+    summary = (bundle or {}).get("manifest_summary") or {}
+    failed = summary.get("failed_capture_count")
     return _result(
         stages,
         notes=[
-            "a live container's line is OBSERVED_PROCESS/LIVE with its host PID targeted"
+            "a live container's line is OBSERVED_PROCESS/LIVE with its host PID targeted",
+            *(
+                [
+                    f"{failed} of {summary.get('capture_count')} bundle captures on "
+                    f"{ctx.settings.node} failed; the archive names them"
+                ]
+                if isinstance(failed, int) and failed > 0
+                else []
+            ),
         ],
-        extra={"attempt": job.identity(), "pod_uid": pod["uid"], "host_pid": pid},
+        extra={
+            "attempt": job.identity(),
+            "pod_uid": pod["uid"],
+            "host_pid": pid,
+            "diagnostic_bundle": bundle,
+        },
     )
 
 

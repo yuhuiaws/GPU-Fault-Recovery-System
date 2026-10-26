@@ -1945,7 +1945,13 @@ phase 2 新增经审查的 `live-replay` 类别，统一经产品自身的读取
 
 已实现变体：016 严重内核日志（全部 9 个，含 user_text/old_boot/corrected_mce 的
 反向门禁）、017 应用错误日志（journal 源的 cgroup_oom 诊断与 nccl_error/distributed_error
-仅证据；CRI Pod 日志归属 `live_pid`（LIVE，目标 PID 即声明的 host PID，bundle 实际抓取）、
+仅证据；CRI Pod 日志归属 `live_pid`（LIVE，目标 PID 即声明的 host PID，bundle 实际抓取：判定读 bundle 步骤按节点的
+Node Agent 回执 `details.node_results[<node>]`——`evidence_ref`/`sha256`/`size_bytes` 与 `manifest_summary` 的
+`capture_count`/`failed_capture_count`/`capture_process_state`，回执随 result 的 `diagnostic_bundle` 留存，失败采集数
+以 note 点名；步骤 `details` 本身不提升任何摘要。HyperPod 首次有效运行（2026-10-26 11:32Z，R13g）bundle 25 项采集、
+0 失败——含目标 host PID 的 3 份 py-spy 栈、`/proc` status/cmdline 与 3 轮 stack/wchan + strace——却判
+"did not capture the live process state"，是 oracle 读了 `details.manifest_summary` 这个产品从不写的键（批次 197 改读
+按节点回执；产品无缺口，两集群按原 release 重跑即可）、
 `exited_pid`（EXITED，不编排 bundle/不抓栈）、`old_pod`（产品 RESTART_WORKLOAD 后以旧 Pod UID
 写入，只能归 UNRESOLVED 或旧 attempt）、`cri_partial_rotation`（P 片段跨轮次、改名轮转与
 采集器重启后与 F 拼成一条，事件时间取 P 的时间戳；投递失败回滚由采集器单元测试钉住，不在线

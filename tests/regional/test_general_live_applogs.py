@@ -486,6 +486,69 @@ def _parameters(
     return value
 
 
+#: The archive and digest a Node Agent names in its bundle receipt.
+BUNDLE_ARCHIVE = (
+    "s3://control-records/node-diagnostics/{node}/gpu-diagnostic-e87b32e8.tar.gz"
+)
+BUNDLE_SHA256 = "70c4b0b3327483e8c26f91d86f6a6ffbac3a2fdb6ad39232b31a8e7a71eb5312"
+
+
+def _bundle_receipt(
+    node: str, *, capture: bool = True, failed_captures: int = 0
+) -> dict[str, Any]:
+    """What one Node Agent returns for COLLECT_DIAGNOSTIC_BUNDLE (``diagnostics.py``).
+
+    The live HyperPod receipt of 2026-10-26 (release 37db33f254a1): 25 captures,
+    none failed -- the eight node-wide captures plus the targeted PID's compute
+    row, ``ps``/``ss``, three py-spy dumps, ``/proc`` status/cmdline and three
+    rounds of ``/proc`` stack/wchan + strace.
+    """
+
+    return {
+        "evidence_ref": BUNDLE_ARCHIVE.format(node=node),
+        "manifest_summary": {
+            "capture_count": 25,
+            "capture_process_state": capture,
+            "diagnostic_reason": "APPLICATION_ERROR",
+            "failed_capture_count": failed_captures,
+        },
+        "node_action_command_id": f"wf-log/1/COLLECT_DIAGNOSTIC_BUNDLE/{node}/agent-26",
+        "sha256": BUNDLE_SHA256,
+        "size_bytes": 5777487,
+    }
+
+
+def _bundle_details(
+    *,
+    capture: bool = True,
+    node: str | None = NODE,
+    failure: str | None = None,
+    failed_captures: int = 0,
+) -> dict[str, Any]:
+    """The bundle step's ``details`` as ``step_execution._finalize`` records them.
+
+    A node-agent step keeps every agent's receipt under ``node_results[<node>]``
+    and hoists nothing; a node that answered nothing usable is under
+    ``node_failures`` with its cause (``failure``) and has no receipt.
+    """
+
+    return {
+        "failed_nodes": [NODE] if failure else [],
+        "node_failures": {NODE: failure} if failure else {},
+        "node_results": (
+            {
+                node: _bundle_receipt(
+                    node, capture=capture, failed_captures=failed_captures
+                )
+            }
+            if node
+            else {}
+        ),
+        "node_waiting": {},
+        "waiting_nodes": [],
+    }
+
+
 def _records(
     *,
     attempts: list[dict[str, Any]],
@@ -501,6 +564,9 @@ def _records(
     parameters: dict[str, Any] | None = None,
     bundle_status: str = "SUCCEEDED",
     bundle_capture: bool = True,
+    bundle_node: str | None = NODE,
+    bundle_node_failure: str | None = None,
+    bundle_failed_captures: int = 0,
     workflow_status: str = "SUCCEEDED",
     graded_entry: int = 0,
 ) -> dict[str, Any]:
@@ -542,7 +608,12 @@ def _records(
                 if op == "COLLECT_DIAGNOSTIC_BUNDLE"
                 else "SUCCEEDED",
                 "details": (
-                    {"manifest_summary": {"capture_process_state": bundle_capture}}
+                    _bundle_details(
+                        capture=bundle_capture,
+                        node=bundle_node,
+                        failure=bundle_node_failure,
+                        failed_captures=bundle_failed_captures,
+                    )
                     if op == "COLLECT_DIAGNOSTIC_BUNDLE"
                     else {}
                 ),
@@ -673,6 +744,15 @@ def test_live_pid_passes_when_the_live_process_is_targeted(tmp_path: Path) -> No
             "no COLLECT_DIAGNOSTIC_BUNDLE",
         ),
         ({"bundle_status": "FAILED"}, "did not succeed"),
+        ({"bundle_capture": False}, "did not run the live process capture"),
+        (
+            {
+                "bundle_node": None,
+                "bundle_node_failure": "ObservationIncomplete: RESULT_SIZE_LIMIT",
+            },
+            f"recorded no result for {NODE}: ObservationIncomplete: RESULT_SIZE_LIMIT",
+        ),
+        ({"bundle_node": PEER}, f"recorded no result for {NODE}"),
         (
             {"ops": ("FREEZE_EVIDENCE", "STOP_WORKLOADS", "COLLECT_DIAGNOSTIC_BUNDLE")},
             "stopped the attempt",
@@ -722,6 +802,112 @@ def test_live_pid_is_inconclusive_when_the_watcher_never_sees_the_pid(
     )
     with pytest.raises(VariantInconclusive, match="host PID"):
         mod.live_pid(_cri_ctx("live_pid", tmp_path, applog=_Applog([records])))
+
+
+def test_live_pid_result_carries_the_agents_bundle_receipt(tmp_path: Path) -> None:
+    records = _live_records(bundle_failed_captures=2)
+    result = mod.live_pid(_cri_ctx("live_pid", tmp_path, applog=_Applog([records])))
+    assert result["verdict"] == "PASS", result["errors"]
+    assert result["diagnostic_bundle"] == _bundle_receipt(NODE, failed_captures=2), (
+        "the receipt the Node Agent returned travels with the verdict"
+    )
+    assert any(
+        note.startswith(f"2 of 25 bundle captures on {NODE} failed")
+        for note in result["notes"]
+    ), result["notes"]
+
+
+# --------------------------------------------------------------------------- #
+# the bundle oracle over the step record
+# --------------------------------------------------------------------------- #
+RUN_DIAGNOSTICS = {"effective_action": "RUN_DIAGNOSTICS"}
+
+
+def _bundle_execution(details: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "step_index": 1,
+        "operation": "COLLECT_DIAGNOSTIC_BUNDLE",
+        "status": "SUCCEEDED",
+        "details": details,
+        "updated_at": "2026-10-24T00:01:00+00:00",
+    }
+
+
+def _bundle_workflow(execution: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "official_steps": [
+            {"operation": "COLLECT_DIAGNOSTIC_BUNDLE", "parameters": _parameters()}
+        ],
+        "step_executions": [execution],
+    }
+
+
+def test_bundle_oracle_reads_the_receipt_under_node_results() -> None:
+    """The live shape (HyperPod, 2026-10-26): the receipt is per node, never hoisted."""
+
+    execution = _bundle_execution(_bundle_details())
+    assert mod.bundle_node_result(execution, NODE) == _bundle_receipt(NODE)
+    assert mod.bundle_node_result(execution, PEER) is None, (
+        "another node's receipt is not this node's"
+    )
+    assert (
+        mod.diagnostic_chain_errors(
+            RUN_DIAGNOSTICS, _bundle_workflow(execution), expect_bundle=True, node=NODE
+        )
+        == []
+    )
+
+
+def test_bundle_oracle_rejects_a_summary_the_product_never_hoists() -> None:
+    """The key the oracle used to read; the live FAIL of 2026-10-26 was this."""
+
+    hoisted = _bundle_execution({"manifest_summary": {"capture_process_state": True}})
+    assert mod.diagnostic_chain_errors(
+        RUN_DIAGNOSTICS, _bundle_workflow(hoisted), expect_bundle=True, node=NODE
+    ) == [f"the bundle step recorded no result for {NODE}"]
+
+
+@pytest.mark.parametrize(
+    "details, expected",
+    [
+        (
+            _bundle_details(
+                node=None, failure="ObservationIncomplete: RESULT_SIZE_LIMIT"
+            ),
+            f"the bundle step recorded no result for {NODE}: "
+            "ObservationIncomplete: RESULT_SIZE_LIMIT",
+        ),
+        (
+            {"node_results": {}, "skipped": "hung_target_exited"},
+            f"the bundle step recorded no result for {NODE}: hung_target_exited",
+        ),
+        (
+            _bundle_details(capture=False),
+            f"the bundle on {NODE} did not run the live process capture: "
+            f"manifest_summary {_bundle_receipt(NODE, capture=False)['manifest_summary']!r}",
+        ),
+    ],
+)
+def test_bundle_oracle_names_the_missing_receipt_or_capture(
+    details: dict[str, Any], expected: str
+) -> None:
+    errors = mod.diagnostic_chain_errors(
+        RUN_DIAGNOSTICS,
+        _bundle_workflow(_bundle_execution(details)),
+        expect_bundle=True,
+        node=NODE,
+    )
+    assert errors == [expected]
+
+
+def test_bundle_oracle_needs_the_node_only_when_a_bundle_is_expected() -> None:
+    workflow = _bundle_workflow(_bundle_execution(_bundle_details()))
+    with pytest.raises(ValueError, match="node"):
+        mod.diagnostic_chain_errors(RUN_DIAGNOSTICS, workflow, expect_bundle=True)
+    errors = mod.diagnostic_chain_errors(RUN_DIAGNOSTICS, workflow, expect_bundle=False)
+    assert errors[:1] == [
+        "an exited process was still scheduled for sampling: ['COLLECT_DIAGNOSTIC_BUNDLE']"
+    ], "an exited PID's chain is judged without a node"
 
 
 # --------------------------------------------------------------------------- #
