@@ -678,7 +678,8 @@ DCGM `*_ERROR_COUNT_TOTAL`）；Hopper/NVLink4 及更新的卡只上报 DL 聚�
 运行两者均 FAIL，根因在用例：前者每拍抬升 50——15 s 采集即 200/min；后者在重指后的透传首拍之后
 每拍 +5——20/min，即 `over_rate_limit` 的步长。产品对这两段合法风暴各铸一条 WARNING，oracle 却把它
 记在重置/换代头上；产品记录里重置拍按 `counter-reset` 边沿投递、delta 未知、无 finding，换代边界
-(0, 真实 boot)→(0, 回放 boot) 也无速率）。现在：`counter_reset` 的抬升取 `under_limit_increment`（8/min 预算的一半、
+(0, 真实 boot)→(0, 回放 boot) 也无速率，`tests/metrics/test_pcie_counter_boundaries.py` 以真实采集器
+投递过滤与 ingest 钉住）。现在：`counter_reset` 的抬升取 `under_limit_increment`（8/min 预算的一半、
 至少 1，15 s 采集即每拍 1、4/min），再 clear；判定只读产品记录——接受过抬升读数（`raise`）、随后有低于
 前值的读数且其批次带 `counter-reset` 理由、最新读数即重置值（基线从重置值重新起算，`reset`）、该卡
 自 arm 起无任何 `pcie_replay_total` finding/incident/活动 finding（有则按时间点名"抬升期间铸造"或

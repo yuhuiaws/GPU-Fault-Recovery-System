@@ -3125,7 +3125,9 @@ delta, mints nothing, neither clears nor re-mints an active finding and becomes
 the baseline; a sample whose `source_boot_id` differs from the previous
 accepted one has no delta and becomes the new generation's baseline, after
 which same-generation rates grade as always
-(`gpu_composites.metric_counter_delta`; no product change). The variants now drive the boundary itself. `counter_reset` raises by
+(`gpu_composites.metric_counter_delta`; pinned on the real collector filter
+and ingest by `tests/metrics/test_pcie_counter_boundaries.py`, no product
+change). The variants now drive the boundary itself. `counter_reset` raises by
 `under_limit_increment` (half the 8/min budget, at least one: one per read on
 a 15-s collector) before the clear and grades, on the product's records, the
 accepted raise, the accepted drop with its `counter-reset` edge reason, the
