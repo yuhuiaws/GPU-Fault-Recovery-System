@@ -111,6 +111,16 @@ curl --fail -X POST -H 'X-GFRS-Replay-Ack: ISOLATED_GPU_TEST_NODE' \
 且原始状态安全的对应设备。其他型号按真实同刻度 W/C 生成本轮审阅过的计划，
 不要照搬示例数值。工具拒绝修改硬件限值元数据。
 
+exporter 把 `DCGM_FI_DEV_THERMAL_VIOLATION`/`DCGM_FI_DEV_POWER_VIOLATION` 声明为
+`counter`（`deploy/dataplane/dcgm-counters.csv`），`prometheus_client` 的文本解析器会把
+这类族的样本改名为 `<name>_total`。工具与采集器解析器一样按裸名回退匹配
+（`canonical_mapping`，对应 `collectors/gpu/dcgm.parse_dcgm_samples`），变换后的文本仍以
+`_total` 名发布，由采集器的同一回退读回。2026-10-26 现网 GF-ENV-LIVE-006 `hw_thermal`
+之前因缺少该回退，每次 armed 读取都被工具以 503 拒绝（审计行 "requested fields are
+absent"），采集器每个周期记 `cannot scrape DCGM exporter`、代理 `reads` 停在 arm 时计数，
+用例以 "consumed 0 of 7" INCONCLUSIVE。`/status` 现在带 `failed_reads`/`last_error`：
+被拒绝的读取是有名字的计数，不再只是停住的 `reads`。
+
 ## 单项验收
 
 ### GF-ENV-LIVE-001
@@ -171,6 +181,12 @@ warning 后一次严重；每个变体至少再观察三个有效采集周期。
 warning 区间的重复由 GF-GENERAL-LIVE-024 `thermal_warning` 用同一回放工具与探针执行
 （`env_live_plans.thermal_stress_plan`，见通用故障真机验收 phase 2 DCGM 节），
 功耗复合由 024 `power_performance`（`power_limit_throttling_plan`，不服务 `0x80`）执行。
+2026-10-26 现网（plain EKS `ip-10-0-43-5`，R13g）首次执行 `hw_thermal` 为 INCONCLUSIVE
+"the collector consumed 0 of 7 planned replay reads"：repoint 证明已成立（首次透传读取
+18.1 秒后出现，arm 前 `reads` 0→2），但工具对 counter 族（`_total` 改名）的字段匹配缺失，
+arm 后每次读取都被 503 拒绝，见"回放工具与接线"。两条 duration 计划（`sw_thermal`、
+`hw_thermal`）与 024 `thermal_warning`/`power_performance`（`thermal_violation_total_us`、
+`power_violation_total_us`）同受影响，修复后重跑；判据不变。
 
 ### GF-ENV-LIVE-007
 
@@ -359,15 +375,33 @@ arm 只是实验开始：正常安装的 collector 每个采集周期经代理�
   NODE_HEALTH incident、工作流及其步骤执行、通知；以及 Node 对象。共享的
   `store_snapshot` 以 XID 事件为键，看不到 `inc-gpu-<finding>` 环境 incident，
   因此不再使用。每次读取有超时，失败只记一次轮询的读错误。
-- **截止时间**：自 arm（001 为 repoint）起，计划读数 × 节点 `collector.env` 中的
-  采集周期，加一个周期与 30 秒处理余量，再加用例项：严重确认类加旧冷却 300 秒
-  （`COOLDOWN_SECONDS`）+ 一个周期 + 30 秒派发；warning/duration 加
-  max(3 × 周期 + 30 秒保持, VALIDATE_GPU 热告警宽限 120 秒 + 30 秒)；瞬时、非 brake
-  位与不可用字段加 3 × 周期 + 30 秒保持；001 为启动错峰 15 秒 + 一个周期 + 3 个
-  透传周期 + 30 秒。上限是 arm + 代理 `max_seconds`、repoint + collector deadman
+- **截止时间**：按节点 `collector.env` 的采集节奏定界（与 repoint 首次读取预算同一组
+  项）：自 arm（001 为 repoint）起，计划读数 × 采集周期，加节奏抖动（读数 × 周期 ×
+  `GPU_FAULT_COLLECTOR_CADENCE_JITTER_RATIO`，默认 0.1）、启动错峰与随机启动抖动
+  （`GPU_FAULT_COLLECTOR_STARTUP_SPREAD_SECONDS` 15 秒 + `GPU_FAULT_COLLECTOR_STARTUP_
+  JITTER_SECONDS` 20 秒，窗口内重启的 collector 首次抓取所需），加一个周期与 30 秒处理
+  余量，再加用例项：严重确认类加旧冷却 300 秒（`COOLDOWN_SECONDS`）+ 一个周期 + 30 秒
+  派发；warning/duration 加 max(3 × 周期 + 30 秒保持, VALIDATE_GPU 热告警宽限 120 秒 +
+  30 秒)；瞬时、非 brake 位与不可用字段加 3 × 周期 + 30 秒保持；001 为启动错峰 15 秒 +
+  启动抖动 20 秒 + 一个周期 + 3 个透传周期 + 其抖动 + 30 秒。各项写入记录
+  `observation.window.terms`。上限是 arm + 代理 `max_seconds`、repoint + collector deadman
   与维护窗口结束三者最早者减 90 秒清理余量；必需工作流仍在其自身 execution
   deadline 内运行、或保持期未满时，等待可延长到该上限，绝不超过。清理顺序与
   deadman 不变。
+- **残留检查、repoint 证明与零读取复核**：探针 `preflight` 列出节点上残留的上一轮运行——
+  `/run/gpu-fault-env-replay` 下未关闭的窗口、仍加载在 collector 单元上的 repoint drop-in、
+  systemd 仍列出的 `gpu-fault-env-*` 瞬态单元（代理、恢复 deadman、暂停等待器）、进程读取的
+  endpoint 与 `collector.env` 不一致——任一存在即不部署、INCONCLUSIVE 并逐条点名
+  （`env_live_fixture.node_leftovers`）。repoint 回执必须带完整证明（`repointed`、进程环境
+  指向代理、首次透传读取已出现：`env_live_fixture.repoint_proof`，与 024 共用），arm 前再读
+  一次 `status`：进程 endpoint 仍是代理、代理未 armed、`reads` 不低于证明时的计数
+  （`require_proxy_read_before_arm`）。arm 后若到首次读取应到时刻（一个带抖动的周期 +
+  启动错峰 + 启动抖动，`CollectorCadence.first_read_due_seconds`）代理仍计 0 次读取，运行器
+  读回一次单元 `snapshot`，与 repoint 回执对比并点名原因（`env_live_watch.diagnose_zero_reads`）：
+  `endpoint-reverted`、`dropin-gone`、`unit-restarted`/`unit-inactive`、`proxy-refused-reads`
+  （`/status` `failed_reads`/`last_error`，503）或 `collector-silent`，写入
+  `replay.zero_reads_diagnosis` 与 INCONCLUSIVE 文字。证据范围仍为 `live-telemetry-replay`；
+  复核只说明没有证明什么，不替代任何正向证据。
 - **判定**：计划未读完、代理因真实安全读数中止、collector 不再读代理、或没有任何
   已接受记录证明回放值进入控制面并被分级，为 INCONCLUSIVE，绝不 PASS；值已进入但
   预期反应缺失或错误（只读信号出现隔离/禁止步骤、GPU/节点作用域错误、规格要求的

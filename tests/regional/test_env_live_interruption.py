@@ -179,7 +179,9 @@ def test_execute_009_schedules_the_pause_right_after_the_arm(
     runner.execute_case(_settings(), tmp_path, 1, _window())
     calls = WorldController.instances[0].calls
     assert calls.index("arm") + 1 == calls.index("pause_collector")
-    assert world.pause_target == 4, "absolute proxy reads: arm at 0 + pause read 4"
+    assert world.pause_target == 1 + 4, (
+        "absolute proxy reads: the proven repoint's pass-through read (1) + pause read 4"
+    )
     receipt = _read_case(tmp_path)["receipts"]["pause_schedule"]
     assert receipt["waiter"]["ActiveState"] == "active"
 

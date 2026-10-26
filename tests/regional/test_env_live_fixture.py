@@ -32,6 +32,37 @@ DEVICES = [
         "limits": {"gpu_tlimit_c": 60.0, "gpu_slowdown_tlimit_c": -2.0},
     },
 ]
+REAL = "http://127.0.0.1:9400/metrics"
+PROXY = "http://127.0.0.1:9411/metrics"
+DROPIN = (
+    "/run/systemd/system/gpu-fault-metrics-collector.service.d/"
+    "gpu-fault-env-replay-0123456789abcdef.conf"
+)
+#: The probe's proven repoint receipt (live shape, 2026-10-26): the unit
+#: restarted, its process reads the proxy, the proxy counted the first read.
+PROVEN_REPOINT: dict[str, Any] = {
+    "repointed": True,
+    "run_id": "r1",
+    "unit": "gpu-fault-metrics-collector.service",
+    "original_endpoint": REAL,
+    "proxy_endpoint": PROXY,
+    "dropin": DROPIN,
+    "process_environment": {fixture.ENDPOINT_ENV: PROXY},
+    "first_read": {
+        "observed": True,
+        "reads_before": 0,
+        "reads_after": 1,
+        "waited_seconds": 18.1,
+        "budget_seconds": 65,
+    },
+    "after": {
+        "ActiveState": "active",
+        "MainPID": "3798726",
+        "InvocationID": "52ac4fabb52d4b77beb6d0e928da732e",
+        "ExecMainStartTimestamp": "Mon 2026-10-26 12:50:14 UTC",
+        "DropInPaths": DROPIN,
+    },
+}
 
 
 def test_select_target_gpu_prefers_requested_then_lowest_index() -> None:
@@ -195,6 +226,18 @@ class FakeHostProbe:
             return {"name": arguments[arguments.index("--name") + 1]}
         if arguments[0] == "deploy-proxy":
             return {"status": {"armed": False}}
+        if arguments[0] == "repoint-collector":
+            # The proven receipt: the controller refuses anything less.
+            return dict(PROVEN_REPOINT)
+        if arguments[0] == "status":
+            return {"status": {"armed": False, "reads": 1}, "effective_endpoint": PROXY}
+        if arguments[0] == "snapshot":
+            return {
+                "metrics_unit": dict(PROVEN_REPOINT["after"]),
+                "effective_endpoint": PROXY,
+                "open_windows": ["0123456789abcdef"],
+                "leftover_units": [],
+            }
         if arguments[0] == "restore-collector":
             return {"restored_endpoint": "http://127.0.0.1:9400/metrics"}
         return {"ok": True}
@@ -305,6 +348,167 @@ def test_controller_fails_the_fixture_when_the_probe_rolled_the_repoint_back(
     verbs = [call[0] for call in host.calls]
     assert verbs.index("restore-collector") < verbs.index("stop-proxy")
     assert "restore" in receipts and "stop_proxy" in receipts
+
+
+def test_controller_refuses_an_unproven_repoint_receipt_and_still_restores(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An older probe copy answers without ``repointed``/``first_read``: that is
+    # no proof, nothing may be armed on it, and the unit is still restored.
+    controller = _controller(monkeypatch, tmp_path)
+    controller.create()
+    host = controller.host
+    original = host.execute
+
+    def execute(*arguments: str, timeout: int = 180) -> dict[str, Any]:
+        if arguments[0] == "repoint-collector":
+            host.calls.append(arguments)
+            return {"ok": True}
+        return original(*arguments, timeout=timeout)
+
+    monkeypatch.setattr(host, "execute", execute)
+    with pytest.raises(fixture.RepointNotProven, match="no first-read proof"):
+        controller.repoint()
+    assert controller.proof == {}
+    receipts = controller.cleanup()
+    verbs = [call[0] for call in host.calls]
+    assert verbs.index("restore-collector") < verbs.index("stop-proxy")
+    assert "restore" in receipts and "stop_proxy" in receipts
+
+
+def test_controller_keeps_the_proof_and_snapshot_reads_the_unit_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = _controller(monkeypatch, tmp_path)
+    controller.create()
+    receipt = controller.repoint()
+    assert receipt["repointed"] is True
+    assert controller.proof == {
+        "process_endpoint": PROXY,
+        "first_read": PROVEN_REPOINT["first_read"],
+    }
+    snapshot = controller.snapshot()
+    assert snapshot["effective_endpoint"] == PROXY
+    assert (
+        snapshot["metrics_unit"]["InvocationID"] == "52ac4fabb52d4b77beb6d0e928da732e"
+    )
+    assert controller.host.calls[-1] == ("snapshot",), controller.host.calls[-1]
+
+
+def test_repoint_proof_is_one_rule_for_the_runner_and_the_024_variants() -> None:
+    from scripts.e2e.regional import general_live_env_replay as er
+
+    assert er.repoint_proof is fixture.repoint_proof
+    assert issubclass(fixture.RepointNotProven, RegionalFixtureError), (
+        "the 024 variants keep catching RegionalFixtureError"
+    )
+    assert issubclass(fixture.NodeNotClean, fixture.EnvLiveNotShown), (
+        "the runner maps every not-shown fixture failure to INCONCLUSIVE"
+    )
+    with pytest.raises(fixture.RepointNotProven, match="did not take effect: gone"):
+        fixture.repoint_proof({"repointed": False, "reason": "gone"}, PROXY)
+    assert fixture.repoint_proof(dict(PROVEN_REPOINT), PROXY) == {
+        "process_endpoint": PROXY,
+        "first_read": PROVEN_REPOINT["first_read"],
+    }
+
+
+def test_node_leftovers_names_each_leftover_and_passes_a_clean_node() -> None:
+    clean = {
+        "open_windows": [],
+        "leftover_units": [],
+        "metrics_unit": {
+            "ActiveState": "active",
+            # The site's own drop-in is not a replay leftover.
+            "DropInPaths": (
+                "/etc/systemd/system/gpu-fault-metrics-collector.service.d/10-site.conf"
+            ),
+        },
+        "effective_endpoint": REAL,
+        "baseline_endpoint": REAL,
+    }
+    assert fixture.node_leftovers(clean) == []
+    assert fixture.node_leftovers(None) == []
+    dirty = {
+        "open_windows": ["239299cded976dc8", "63f7c3094292bf79"],
+        "leftover_units": [
+            {
+                "unit": "gpu-fault-env-replay-63f7c3094292bf79.service",
+                "load": "loaded",
+                "active": "failed",
+                "sub": "failed",
+            },
+            {
+                "unit": "gpu-fault-env-collector-restore-239299cded976dc8.timer",
+                "load": "loaded",
+                "active": "active",
+                "sub": "waiting",
+            },
+        ],
+        "metrics_unit": {
+            "ActiveState": "active",
+            "DropInPaths": f"/x/10-site.conf {DROPIN}",
+        },
+        "effective_endpoint": PROXY,
+        "collector_env": {fixture.ENDPOINT_ENV: REAL},
+    }
+    reasons = fixture.node_leftovers(dirty)
+    assert len(reasons) == 4, reasons
+    assert reasons[0] == (
+        "a previous replay window is still open on the node: "
+        "239299cded976dc8, 63f7c3094292bf79"
+    )
+    assert reasons[1] == (
+        "a repoint drop-in of a previous run is still loaded on "
+        f"gpu-fault-metrics-collector.service: {DROPIN}"
+    )
+    assert reasons[2] == (
+        "transient units of a previous run are still loaded: "
+        "gpu-fault-env-collector-restore-239299cded976dc8.timer (active/waiting), "
+        "gpu-fault-env-replay-63f7c3094292bf79.service (failed/failed)"
+    )
+    assert reasons[3] == (
+        f"the collector process reads {PROXY!r}, not its configured endpoint {REAL!r}"
+    )
+    # Without a configured endpoint to compare against, a proxy endpoint is
+    # still a leftover; the real exporter is not.
+    assert fixture.node_leftovers({"effective_endpoint": PROXY}) == [
+        f"the collector process still reads a replay proxy ({PROXY})"
+    ]
+    assert fixture.node_leftovers({"effective_endpoint": REAL}) == []
+
+
+def test_require_proxy_read_before_arm_refuses_reverted_armed_or_reset() -> None:
+    proof = fixture.repoint_proof(dict(PROVEN_REPOINT), PROXY)
+    good = {"status": {"armed": False, "reads": 2}, "effective_endpoint": PROXY}
+    assert fixture.require_proxy_read_before_arm(good, proof, proxy_endpoint=PROXY) == {
+        "effective_endpoint": PROXY,
+        "reads": 2,
+        "first_read_reads_after": 1,
+        "armed": False,
+    }
+    with pytest.raises(fixture.RepointNotProven, match="reverted to 'http://127"):
+        fixture.require_proxy_read_before_arm(
+            {**good, "effective_endpoint": REAL}, proof, proxy_endpoint=PROXY
+        )
+    with pytest.raises(fixture.RepointNotProven, match="armed=True"):
+        fixture.require_proxy_read_before_arm(
+            {**good, "status": {"armed": True, "reads": 2}}, proof, proxy_endpoint=PROXY
+        )
+    with pytest.raises(fixture.RepointNotProven, match="went back from 1"):
+        fixture.require_proxy_read_before_arm(
+            {**good, "status": {"armed": False, "reads": 0}},
+            proof,
+            proxy_endpoint=PROXY,
+        )
+    # A status without the endpoint (an older probe) is not a reversal.
+    older = {"status": {"armed": False, "reads": 1}}
+    assert (
+        fixture.require_proxy_read_before_arm(older, proof, proxy_endpoint=PROXY)[
+            "effective_endpoint"
+        ]
+        is None
+    )
 
 
 def test_control_plane_reads_use_the_general_live_probes() -> None:

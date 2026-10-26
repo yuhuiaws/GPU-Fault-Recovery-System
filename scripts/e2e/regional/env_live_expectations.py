@@ -7,7 +7,11 @@ that must be graded, and the deadline terms derived from the product's own
 windows:
 
 * every plan read is one collector interval (the proxy serves one read per
-  scrape), plus one more interval and the ingestion path as delivery margin;
+  scrape), plus the most the cadence jitter can stretch those reads, plus the
+  start-up spread and start-up jitter a collector restarted inside the window
+  needs before its first scrape, plus one more interval and the ingestion path
+  as delivery margin -- the same cadence terms the repoint's first-read budget
+  is sized from (``probes/env_replay_proxy.first_read_seconds``);
 * ``gpu_environment_policy.confirm_environment_decision`` confirms a CRITICAL
   temperature or Power Brake sample on the third consecutive accepted sample at
   most 60 s apart (an absolute shutdown breach on the first); before that it is
@@ -43,7 +47,6 @@ from scripts.e2e.regional import env_live_verdicts as verdicts
 from scripts.e2e.regional.env_live_watch import (
     PASSTHROUGH_READS,
     PROCESSING_MARGIN_SECONDS,
-    STARTUP_SPREAD_SECONDS,
     CollectorCadence,
     plan_reads,
 )
@@ -222,10 +225,12 @@ def _interruption_expectation(
         terms={
             **replay,
             # The pause stops the proxy reads for its whole length; the
-            # restart's first scrape waits for the startup spread; its
-            # delivery and one hold after the clear complete the case.
+            # restart's first scrape waits for the startup spread and jitter;
+            # its delivery and one hold after the clear complete the case.
             "collection_pause": pause_seconds,
-            "collector_restart_first_read": STARTUP_SPREAD_SECONDS + interval,
+            "collector_restart_first_read": (
+                cadence.startup_allowance_seconds + interval
+            ),
             "restart_delivery_margin": PROCESSING_MARGIN_SECONDS,
             "hold": hold,
         },
@@ -335,6 +340,12 @@ def expectation_for(
     interval = cadence.interval_seconds
     replay = {
         "replay_reads_x_interval": cadence.replay_seconds(reads),
+        # The cadence jitter over the plan's reads, and the start-up spread and
+        # jitter a collector restarted inside the window needs before its
+        # first scrape (``CollectorCadence``): sized from the node's own
+        # collector.env like the repoint's first-read budget.
+        "cadence_jitter": cadence.jitter_seconds(reads),
+        "collector_startup_spread_and_jitter": cadence.startup_allowance_seconds,
         "delivery_margin": cadence.delivery_margin_seconds,
     }
     # A read-only signal is held for one confirmation window after it was
@@ -366,9 +377,12 @@ def expectation_for(
             names=tuple(dict.fromkeys(names)),
             terms={
                 # The repoint restarts the collector: its first scrape waits for
-                # the startup spread, then one read per interval.
-                "collector_restart_first_read": STARTUP_SPREAD_SECONDS + interval,
+                # the startup spread and jitter, then one read per interval.
+                "collector_restart_first_read": (
+                    cadence.startup_allowance_seconds + interval
+                ),
                 "passthrough_reads_x_interval": PASSTHROUGH_READS * interval,
+                "cadence_jitter": cadence.jitter_seconds(PASSTHROUGH_READS),
                 "delivery_margin": PROCESSING_MARGIN_SECONDS,
             },
             hold_seconds=0.0,

@@ -94,6 +94,26 @@ def validate_upstream(url: str, listen_port: int) -> str:
     return url
 
 
+def canonical_mapping(sample_name: str) -> tuple[str, str | None] | None:
+    """The product's ``(canonical, unit)`` for one parsed exporter sample.
+
+    ``prometheus_client``'s text parser renames the samples of a family the
+    exporter declares ``counter`` to ``<name>_total`` (``DCGM_FI_DEV_THERMAL_
+    VIOLATION`` and ``DCGM_FI_DEV_POWER_VIOLATION`` are counters in
+    ``deploy/dataplane/dcgm-counters.csv``), so the bare name misses them. The
+    collector's own parser (``collectors/gpu/dcgm.parse_dcgm_samples``) falls
+    back to the bare name; this tool must see the same fields it does, or it
+    refuses a plan the collector would have accepted (live 2026-10-26,
+    GF-ENV-LIVE-006 ``hw_thermal``: every armed read answered 503 "requested
+    fields are absent" and the collector consumed 0 of 7 reads).
+    """
+
+    mapping = DCGM_METRICS.get(sample_name)
+    if mapping is None and sample_name.endswith("_total"):
+        mapping = DCGM_METRICS.get(sample_name[:-6])
+    return mapping
+
+
 def transform(text: str, gpu_uuid: str, values: dict[str, float | None]) -> bytes:
     families = list(text_string_to_metric_families(text))
     found = set()
@@ -101,7 +121,7 @@ def transform(text: str, gpu_uuid: str, values: dict[str, float | None]) -> byte
     for family in families:
         replaced = []
         for sample in family.samples:
-            mapping = DCGM_METRICS.get(sample.name)
+            mapping = canonical_mapping(sample.name)
             target = (
                 sample.labels.get("UUID") or sample.labels.get("uuid")
             ) == gpu_uuid
@@ -134,7 +154,7 @@ def transform(text: str, gpu_uuid: str, values: dict[str, float | None]) -> byte
 def unsafe_upstream(body: bytes, gpu_stop: float, memory_stop: float) -> str | None:
     for family in text_string_to_metric_families(body.decode("utf-8")):
         for sample in family.samples:
-            mapping = DCGM_METRICS.get(sample.name)
+            mapping = canonical_mapping(sample.name)
             if mapping is None:
                 continue
             name, _ = mapping
@@ -184,6 +204,11 @@ class Replay:
         self.reads = 0
         self.gpu_stop, self.memory_stop = gpu_stop, memory_stop
         self.aborted: str | None = None
+        #: ``GET /metrics`` requests answered 503 (upstream or replay failure);
+        #: they consume no read, so a collector that keeps scraping a proxy that
+        #: keeps refusing shows up here, not as a frozen ``reads`` count only.
+        self.failed_reads = 0
+        self.last_error: str | None = None
 
     def values(self) -> dict[str, float | None]:
         if self.start_read is None or self.aborted or time.monotonic() >= self.deadline:
@@ -239,6 +264,8 @@ def make_server(upstream: str, port: int, replay: Replay, audit: Any) -> HTTPSer
                         "proof_scope": "live-telemetry-replay",
                         "aborted": replay.aborted,
                         "armed": replay.start_read is not None,
+                        "failed_reads": replay.failed_reads,
+                        "last_error": replay.last_error,
                     }
                 ).encode()
                 self.respond(200, body, "application/json")
@@ -251,6 +278,8 @@ def make_server(upstream: str, port: int, replay: Replay, audit: Any) -> HTTPSer
                     original = response.read(MAX_BYTES + 1)
                 output, receipt = replay.render(original)
             except (OSError, ValueError, UnicodeError) as error:
+                replay.failed_reads += 1
+                replay.last_error = str(error)
                 audit.write(
                     json.dumps({"error": str(error), "read": replay.reads + 1}) + "\n"
                 )

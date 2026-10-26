@@ -18,6 +18,7 @@ import pytest
 
 from gpu_fault.adapters.common import QUARANTINE_TAINT
 from gpu_fault.adapters.gpu_validation import GpuValidationAdapter
+from gpu_fault.collectors.cadence import CadenceJitter
 from gpu_fault.collectors.context import CollectorContext
 from gpu_fault.collectors.gpu.dcgm import DcgmMetricsCollector
 from gpu_fault.health_recovery_contract import COOLDOWN_SECONDS
@@ -27,10 +28,14 @@ from scripts.e2e.regional import env_live_watch as watch
 from scripts.e2e.regional import run_env_live as runner
 from tests.regional._env_live_world import (
     DIAGNOSTIC_OPERATIONS,
+    DROPIN,
     GPU,
     NODE,
     PROXY,
+    REAL,
+    REFUSAL,
     REVIEW_OPERATIONS,
+    UNIT_INVOCATION,
     World,
     baseline_values,
     h200_preflight,
@@ -51,9 +56,18 @@ def _plan(case_id: str, name: str) -> dict[str, Any]:
 
 
 def _run(
-    world: World, case_id: str, plan_name: str, *, before: dict[str, Any] | None = None
+    world: World,
+    case_id: str,
+    plan_name: str,
+    *,
+    before: dict[str, Any] | None = None,
+    reverify: bool = False,
 ) -> tuple[watch.WatchResult, watch.ObservationWindow]:
-    """What ``run_env_live._run_replay`` does after the deploy, on the world."""
+    """What ``run_env_live._run_replay`` does after the deploy, on the world.
+
+    ``reverify`` binds the zero-read re-verification the runner binds: the
+    first-read due time, the repoint receipt's baseline and the unit snapshot.
+    """
 
     preflight = h200_preflight()
     cadence = watch.CollectorCadence.from_probe({"collector_env": COLLECTOR_ENV})
@@ -66,10 +80,14 @@ def _run(
         node=NODE,
     )
     node_before = world.node_snapshot()
-    world.repoint()
+    receipt = world.repoint()
     armed = expectation.kind != "baseline"
     progress = watch.ReplayProgress(
-        planned_reads=expectation.planned_reads, armed=armed, proxy_endpoint=PROXY
+        planned_reads=expectation.planned_reads,
+        armed=armed,
+        proxy_endpoint=PROXY,
+        first_read_due_seconds=cadence.first_read_due_seconds if reverify else None,
+        repoint_baseline=watch.repoint_baseline(receipt) if reverify else {},
     )
     if armed:
         start = world.now
@@ -97,6 +115,7 @@ def _run(
         gpu_state=world.gpu_state,
         activity=world.activity,
         node=world.node_snapshot,
+        repoint=world.snapshot if reverify else None,
     )
     outcome = watch.watch(
         judge,
@@ -169,6 +188,39 @@ def test_cadence_reads_the_nodes_collector_env_and_keeps_defaults() -> None:
     assert not watch.CollectorCadence(interval_seconds=61).confirmation_gap_ok(), (
         "a 61 s interval cannot confirm within the 60 s gap"
     )
+    # The start-up spread, start-up jitter and cadence jitter ratio default to
+    # the product's, come from collector.env when set (zero included), and
+    # size the jittered tick, the start-up allowance and the first-read due.
+    assert (cadence.startup_spread_seconds, cadence.startup_jitter_seconds) == (15, 20)
+    assert cadence.jitter_ratio == 0.1
+    assert cadence.max_interval_seconds == 30 * 1.1
+    assert cadence.startup_allowance_seconds == 35
+    assert cadence.first_read_due_seconds == 30 * 1.1 + 35
+    assert cadence.jitter_seconds(7) == 7 * 30 * 0.1
+    tuned = watch.CollectorCadence.from_probe(
+        {
+            "collector_env": {
+                "GPU_FAULT_COLLECTOR_STARTUP_SPREAD_SECONDS": "5",
+                "GPU_FAULT_COLLECTOR_STARTUP_JITTER_SECONDS": "0",
+                "GPU_FAULT_COLLECTOR_CADENCE_JITTER_RATIO": "0.2",
+            }
+        }
+    )
+    assert (tuned.startup_spread_seconds, tuned.startup_jitter_seconds) == (5, 0)
+    assert tuned.jitter_ratio == 0.2 and tuned.first_read_due_seconds == 15 * 1.2 + 5
+    assert set(tuned.configured) == {
+        "GPU_FAULT_COLLECTOR_STARTUP_SPREAD_SECONDS",
+        "GPU_FAULT_COLLECTOR_STARTUP_JITTER_SECONDS",
+        "GPU_FAULT_COLLECTOR_CADENCE_JITTER_RATIO",
+    }
+    assert tuned.evidence()["first_read_due_seconds"] == 15 * 1.2 + 5
+
+
+def test_cadence_jitter_defaults_are_the_products_own() -> None:
+    jitter = CadenceJitter()
+    assert watch.STARTUP_JITTER_SECONDS == jitter.startup_seconds == 20
+    assert watch.CADENCE_JITTER_RATIO == jitter.ratio == 0.1
+    assert watch.CollectorCadence().max_interval_seconds == jitter.max_interval(15)
 
 
 def test_review_terms_derive_from_the_plan_cadence_and_cooldown() -> None:
@@ -184,8 +236,13 @@ def test_review_terms_derive_from_the_plan_cadence_and_cooldown() -> None:
     assert four.kind == "review" and four.field == "gpu_tlimit_c"
     assert four.trigger_values == (-3.0,) and four.required_samples == 3
     assert four.threshold_source == "NVIDIA_DEVICE_TLIMIT"
+    # Sized from the collector cadence like the repoint's first-read budget:
+    # the reads at the interval, the cadence jitter over them, the start-up
+    # spread and jitter a restarted collector needs, the delivery margin.
     assert four.terms == {
         "replay_reads_x_interval": 5 * 15,
+        "cadence_jitter": 5 * 15 * 0.1,
+        "collector_startup_spread_and_jitter": 15 + 20,
         "delivery_margin": 15 + watch.PROCESSING_MARGIN_SECONDS,
         "cooldown_hold": COOLDOWN_SECONDS + 15,
         "workflow_dispatch": watch.PROCESSING_MARGIN_SECONDS,
@@ -243,8 +300,15 @@ def test_window_is_capped_by_the_earliest_hard_end_minus_cleanup() -> None:
 
 def test_progress_counts_reads_from_the_arm_receipt() -> None:
     world = World()
-    world.repoint()
-    world.sleep(60)  # four pass-through scrapes before the arm
+    receipt = world.repoint()  # returns after the first pass-through read (one tick)
+    assert receipt["first_read"] == {
+        "observed": True,
+        "reads_before": 0,
+        "reads_after": 1,
+        "waited_seconds": 15.0,
+        "budget_seconds": 65,
+    }
+    world.sleep(45)  # four pass-through scrapes before the arm (60 s in all)
     progress = watch.ReplayProgress(planned_reads=3, armed=True, proxy_endpoint=PROXY)
     progress.begin(world.arm(), world.now)
     assert progress.start_reads == 4 and progress.served == 0
@@ -273,6 +337,117 @@ def test_progress_counts_reads_from_the_arm_receipt() -> None:
     reasons = "\n".join(stuck.inconclusive())
     assert "aborted on a real upstream safety reading" in reasons
     assert "stopped reading the proxy" in reasons and "consumed 0 of 9" in reasons
+
+
+def _baseline() -> dict[str, Any]:
+    world = World()
+    return watch.repoint_baseline(world.repoint())
+
+
+def _snapshot(world: World | None = None, **unit: Any) -> dict[str, Any]:
+    world = world or World()
+    world.repoint()
+    value = world.snapshot()
+    value["metrics_unit"].update(unit)
+    return value
+
+
+def test_repoint_baseline_pins_the_unit_the_receipt_left() -> None:
+    baseline = _baseline()
+    assert baseline["proxy_endpoint"] == PROXY and baseline["original_endpoint"] == REAL
+    assert baseline["dropin"] == DROPIN
+    assert baseline["invocation_id"] == UNIT_INVOCATION
+    assert baseline["exec_main_start"] and baseline["main_pid"] == "4242"
+    assert baseline["first_read"]["observed"] is True
+    assert watch.repoint_baseline(None)["invocation_id"] is None
+
+
+def test_diagnose_zero_reads_names_the_reason_in_order_of_decisiveness() -> None:
+    baseline = _baseline()
+    diagnose = watch.diagnose_zero_reads
+    # The live 2026-10-26 GF-ENV-LIVE-006 shape: unit and drop-in unchanged,
+    # the process on the proxy, the proxy refusing every armed read.
+    refused = diagnose(
+        baseline,
+        _snapshot(),
+        {"failed_reads": 4, "last_error": REFUSAL},
+        proxy_endpoint=PROXY,
+    )
+    assert refused["reason"] == watch.ZERO_READS_PROXY_REFUSED
+    assert "4 collector read(s) with 503" in refused["detail"]
+    assert REFUSAL in refused["detail"]
+    assert refused["dropin_loaded"] is True and refused["unit_restarted"] is False
+    # The endpoint wins over everything else; the drop-in over a restart.
+    world = World()
+    world.endpoint = REAL
+    world.dropin_loaded = False
+    reverted = diagnose(
+        baseline, _snapshot(world, InvocationID="other"), {}, proxy_endpoint=PROXY
+    )
+    assert reverted["reason"] == watch.ZERO_READS_ENDPOINT_REVERTED
+    assert "reads 'http://127.0.0.1:9400/metrics', not the proxy" in reverted["detail"]
+    assert "drop-in is no longer loaded" in reverted["detail"]
+    assert "the unit restarted" in reverted["detail"]
+    gone = diagnose(baseline, _snapshot(DropInPaths=""), {}, proxy_endpoint=PROXY)
+    assert gone["reason"] == watch.ZERO_READS_DROPIN_GONE
+    inactive = diagnose(
+        baseline, _snapshot(ActiveState="failed"), {}, proxy_endpoint=PROXY
+    )
+    assert inactive["reason"] == watch.ZERO_READS_UNIT_INACTIVE
+    assert "is failed, not active" in inactive["detail"]
+    restarted = diagnose(
+        baseline,
+        _snapshot(InvocationID="0f1e2d3c", ExecMainStartTimestamp="later"),
+        {"failed_reads": 0},
+        proxy_endpoint=PROXY,
+    )
+    assert restarted["reason"] == watch.ZERO_READS_UNIT_RESTARTED
+    assert f"InvocationID {UNIT_INVOCATION} -> 0f1e2d3c" in restarted["detail"]
+    assert "started later" in restarted["detail"]
+    silent = diagnose(baseline, _snapshot(), {"failed_reads": 0}, proxy_endpoint=PROXY)
+    assert silent["reason"] == watch.ZERO_READS_COLLECTOR_SILENT
+    assert "refused none" in silent["detail"]
+    older_tool = diagnose(baseline, _snapshot(), {}, proxy_endpoint=PROXY)
+    assert older_tool["reason"] == watch.ZERO_READS_COLLECTOR_SILENT
+    assert "reports no refusal count" in older_tool["detail"]
+    unverified = diagnose(baseline, None, {}, proxy_endpoint=PROXY)
+    assert unverified["reason"] == watch.ZERO_READS_UNVERIFIED
+
+
+def test_watch_reverifies_the_repoint_once_when_the_first_read_is_overdue() -> None:
+    world = World()
+    world.refuse_armed_reads = True
+    outcome, _window = _run(world, "GF-ENV-LIVE-006", "hw_thermal", reverify=True)
+    assert outcome.judgement.outcome == "INCONCLUSIVE"
+    reasons = "\n".join(outcome.judgement.inconclusive)
+    assert "consumed 0 of 7 planned replay reads" in reasons
+    assert f"({watch.ZERO_READS_PROXY_REFUSED})" in reasons and REFUSAL in reasons
+    assert world.snapshots == 1, "one snapshot, not one per poll"
+    replay = outcome.judgement.evidence["replay"]
+    assert replay["zero_reads_diagnosis"]["reason"] == watch.ZERO_READS_PROXY_REFUSED
+    assert replay["failed_reads"] >= 3 and replay["served"] == 0
+    assert replay["first_read_due_seconds"] == 15 * 1.1 + 35
+    assert world.armed_at is not None
+    diagnosed_at = replay["zero_reads_diagnosis"]["at"]
+    assert (
+        diagnosed_at >= (world.armed_at + timedelta(seconds=15 * 1.1 + 35)).isoformat()
+    )
+
+
+def test_watch_without_the_snapshot_reader_or_a_served_read_never_diagnoses() -> None:
+    # No reader bound (an older runner wiring): the old inconclusive text only.
+    world = World()
+    world.freeze_reads_at_arm = True
+    outcome, _window = _run(world, "GF-ENV-LIVE-004", "core_tlimit/severe")
+    assert outcome.judgement.evidence["replay"]["zero_reads_diagnosis"] is None
+    assert world.snapshots == 0
+    # A collector that reads (late or not) is never re-verified.
+    served = World()
+    outcome, _window = _run(
+        served, "GF-ENV-LIVE-004", "core_tlimit/severe", reverify=True
+    )
+    assert outcome.judgement.evidence["replay"]["consumed_at"] is not None
+    assert served.snapshots == 0
 
 
 def test_a_failing_read_is_recorded_and_the_loop_still_ends() -> None:
@@ -352,7 +527,9 @@ def test_review_full_chain_passes_only_after_the_cooldown_hold() -> None:
 
 def test_review_that_is_not_consumed_is_inconclusive() -> None:
     world = review_chain(World())
-    world.reads_frozen_at = 2  # the collector stopped reading after two
+    # The collector stopped after one plan read (absolute reads: the arm's
+    # own pass-through read plus one).
+    world.reads_frozen_at = 1 + 1
     outcome, _window = _run(world, "GF-ENV-LIVE-004", "core_tlimit/severe")
     assert outcome.judgement.outcome == "INCONCLUSIVE"
     assert any("consumed" in item for item in outcome.judgement.inconclusive), (

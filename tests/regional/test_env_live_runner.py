@@ -18,7 +18,11 @@ from scripts.e2e.regional import env_live_fixture as fixture
 from scripts.e2e.regional import run_env_live as runner
 from scripts.e2e.regional.regional_commands import RegionalFixtureError
 from tests.regional._env_live_world import (
+    DROPIN,
     H200_LIMITS,
+    PROXY,
+    REAL,
+    UNIT_INVOCATION,
     World,
     baseline_values,
     h200_preflight,
@@ -104,8 +108,13 @@ class RecordingController:
     def preflight(self) -> dict[str, Any]:
         self.calls.append("preflight")
         return {
-            "metrics_unit": {"ActiveState": "active"},
+            "metrics_unit": {"ActiveState": "active", "DropInPaths": ""},
             "collector_env": COLLECTOR_ENV,
+            "effective_endpoint": REAL,
+            "baseline_endpoint": REAL,
+            "open_windows": [],
+            "leftover_units": [],
+            **self.world.preflight_extra,
         }
 
     def deploy_proxy(
@@ -122,6 +131,10 @@ class RecordingController:
     def status(self, **options: Any) -> dict[str, Any]:
         self.calls.append("status")
         return self.world.status()
+
+    def snapshot(self) -> dict[str, Any]:
+        self.calls.append("snapshot")
+        return self.world.snapshot()
 
     def arm(self, **options: Any) -> dict[str, Any]:
         self.calls.append("arm")
@@ -441,6 +454,170 @@ def test_plan_details_names_the_observation_rule() -> None:
         runner.plan_details(_settings("GF-ENV-LIVE-012"), _preflight())["observation"]
         is None
     )
+
+
+# --------------------------------------------------------------------------- #
+# Leftovers, the repoint proof and the zero-read re-verification
+# (live 2026-10-26, GF-ENV-LIVE-006 on ip-10-0-43-5 after 004 on the same node)
+# --------------------------------------------------------------------------- #
+def test_execute_refuses_a_node_with_leftovers_of_a_previous_run(
+    tmp_path: Path, world: World
+) -> None:
+    # Whatever an earlier run left (its window, its restore deadman, its
+    # drop-in, a collector still on a proxy) is named before anything is
+    # deployed; the case is INCONCLUSIVE, not a FAIL the product did not earn.
+    world.preflight_extra = {
+        "open_windows": ["239299cded976dc8"],
+        "leftover_units": [
+            {
+                "unit": "gpu-fault-env-collector-restore-239299cded976dc8.timer",
+                "load": "loaded",
+                "active": "active",
+                "sub": "waiting",
+            }
+        ],
+        "metrics_unit": {"ActiveState": "active", "DropInPaths": DROPIN},
+        "effective_endpoint": PROXY,
+        "baseline_endpoint": REAL,
+    }
+    code = runner.execute_case(_settings("GF-ENV-LIVE-006"), tmp_path, 1, _window())
+    result = _read_case(tmp_path, "GF-ENV-LIVE-006")
+    assert code == 1 and result["verdict"] == "INCONCLUSIVE", result["stages"]
+    text = "\n".join(result["inconclusive"])
+    assert "previous replay window is still open" in text and "239299cded976dc8" in text
+    assert "restore-239299cded976dc8.timer (active/waiting)" in text
+    assert "drop-in of a previous run is still loaded" in text
+    assert "not its configured endpoint" in text
+    calls = RecordingController.instances[0].calls
+    assert "deploy_proxy" not in calls and "repoint" not in calls and "arm" not in calls
+    assert calls[-1] == "cleanup"
+    # Nothing was repointed, so there is nothing the cleanup failed to restore.
+    assert result["stages"]["cleanup"] == [], result["stages"]["cleanup"]
+    assert len(result["receipts"]["node_leftovers"]) == 4
+    assert result["proof_scope"] == "live-telemetry-replay"
+
+
+@pytest.mark.parametrize(
+    ("overrides", "fragment"),
+    [
+        ({"repointed": None, "first_read": None}, "no first-read proof"),
+        (
+            {"process_environment": {"GPU_FAULT_DCGM_METRICS_URL": REAL}},
+            "not the proxy",
+        ),
+        (
+            {"first_read": {"observed": False, "reads_before": 0, "reads_after": 0}},
+            "no pass-through read of the proxy",
+        ),
+    ],
+)
+def test_execute_refuses_to_arm_without_the_repoint_proof(
+    tmp_path: Path, world: World, overrides: dict[str, Any], fragment: str
+) -> None:
+    # The runner applies the proof itself (an older probe copy, a process that
+    # reads another endpoint, no first read): nothing is armed, the unit is
+    # restored, the case is INCONCLUSIVE with the reason.
+    world.repoint_receipt_overrides = overrides
+    code = runner.execute_case(_settings("GF-ENV-LIVE-004"), tmp_path, 1, _window())
+    result = _read_case(tmp_path, "GF-ENV-LIVE-004")
+    assert code == 1 and result["verdict"] == "INCONCLUSIVE", result["stages"]
+    assert fragment in "\n".join(result["inconclusive"]), result["inconclusive"]
+    calls = RecordingController.instances[0].calls
+    assert "arm" not in calls and calls[-1] == "cleanup"
+    assert "restore" in result["receipts"]["cleanup"]
+    assert result["stages"]["cleanup"] == [], result["stages"]["cleanup"]
+
+
+def test_execute_refuses_to_arm_when_the_collector_endpoint_reverted(
+    tmp_path: Path, world: World
+) -> None:
+    # The repoint receipt proved the proxy, but the status read right before
+    # the arm shows the process back on the real exporter.
+    world.endpoint = REAL
+    code = runner.execute_case(_settings("GF-ENV-LIVE-004"), tmp_path, 1, _window())
+    result = _read_case(tmp_path, "GF-ENV-LIVE-004")
+    assert code == 1 and result["verdict"] == "INCONCLUSIVE", result["stages"]
+    text = "\n".join(result["inconclusive"])
+    assert "reverted to 'http://127.0.0.1:9400/metrics' before the arm" in text
+    calls = RecordingController.instances[0].calls
+    assert "arm" not in calls and "repoint" in calls
+    assert "repoint_proof" in result["receipts"]
+    assert "arm_precheck" not in result["receipts"]
+
+
+def test_execute_006_names_a_proxy_that_refuses_every_armed_read(
+    tmp_path: Path, world: World
+) -> None:
+    # The live record: reads frozen at the arm count, served 0, the collector
+    # logging "cannot scrape" every tick -- the proxy answered 503. The runner
+    # now reads the unit back once the first read is overdue and names it.
+    world.refuse_armed_reads = True
+    code = runner.execute_case(_settings("GF-ENV-LIVE-006"), tmp_path, 1, _window())
+    result = _read_case(tmp_path, "GF-ENV-LIVE-006")
+    assert code == 1 and result["verdict"] == "INCONCLUSIVE", result["stages"]
+    assert result["armed_plan"] == "hw_thermal"
+    text = "\n".join(result["inconclusive"])
+    assert "consumed 0 of 7 planned replay reads" in text
+    assert "proxy-refused-reads" in text and "with 503" in text
+    assert "requested fields are absent" in text
+    observation = result["receipts"]["observation"]
+    replay = observation["replay"]
+    diagnosis = replay["zero_reads_diagnosis"]
+    assert diagnosis["reason"] == "proxy-refused-reads"
+    assert replay["served"] == 0 and replay["failed_reads"] >= 3
+    assert diagnosis["effective_endpoint"] == PROXY
+    assert diagnosis["dropin_loaded"] is True and diagnosis["unit_restarted"] is False
+    calls = RecordingController.instances[0].calls
+    assert calls.count("snapshot") == 1, "the unit is read back once, not per poll"
+    # The re-verification waited until the first read was due: one jittered
+    # interval plus the collector's start-up spread and jitter after the arm.
+    assert world.armed_at is not None
+    at = datetime.fromisoformat(diagnosis["at"])
+    due = timedelta(seconds=15 * 1.1 + 15 + 20)
+    assert at - world.armed_at >= due, (at, world.armed_at)
+    assert observation["replay"]["first_read_due_seconds"] == 15 * 1.1 + 15 + 20
+    terms = observation["window"]["terms"]
+    assert terms["cadence_jitter"] == 7 * 15 * 0.1
+    assert terms["collector_startup_spread_and_jitter"] == 35
+    assert observation["cadence"]["jitter_ratio"] == 0.1
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason", "fragment"),
+    [
+        (
+            lambda w: w.restart_unit(),
+            "unit-restarted",
+            f"InvocationID {UNIT_INVOCATION} ->",
+        ),
+        (
+            lambda w: setattr(w, "dropin_loaded", False),
+            "dropin-gone",
+            "drop-in is no longer loaded",
+        ),
+        (lambda w: setattr(w, "endpoint", REAL), "endpoint-reverted", "not the proxy"),
+        (
+            lambda w: setattr(w, "unit_active", "failed"),
+            "unit-inactive",
+            "is failed, not active",
+        ),
+        (lambda w: None, "collector-silent", "counted no read and refused none"),
+    ],
+)
+def test_execute_names_why_an_armed_proxy_counted_no_read(
+    tmp_path: Path, world: World, mutation: Any, reason: str, fragment: str
+) -> None:
+    world.freeze_reads_at_arm = True
+    world.at(20, mutation)
+    runner.execute_case(_settings("GF-ENV-LIVE-004"), tmp_path, 1, _window())
+    result = _read_case(tmp_path, "GF-ENV-LIVE-004")
+    assert result["verdict"] == "INCONCLUSIVE", result["stages"]
+    diagnosis = result["receipts"]["observation"]["replay"]["zero_reads_diagnosis"]
+    assert diagnosis["reason"] == reason, diagnosis
+    assert fragment in diagnosis["detail"], diagnosis
+    text = "\n".join(result["inconclusive"])
+    assert f"re-verified repoint at {diagnosis['at']} ({reason})" in text
+    assert "consumed 0 of 5 planned replay reads" in text
 
 
 def _read_case(run_dir: Path, case_id: str) -> dict[str, Any]:

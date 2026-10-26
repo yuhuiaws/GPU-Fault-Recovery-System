@@ -200,6 +200,91 @@ def test_install_source_verifies_sha_and_refuses_foreign_names() -> None:
     assert bad["code"] == 1 and "only the replay tool and plan" in bad["error"]
 
 
+def test_preflight_reports_cadence_keys_leftover_units_and_the_baseline_endpoint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Live 2026-10-26: GF-ENV-LIVE-006 ran on the node 004 had just used; the
+    # preflight now carries what an earlier run may have left -- its window,
+    # its transient units, its drop-in, the endpoint the collector reads --
+    # and the cadence keys the runner sizes its windows from.
+    (tmp_path / "collector.env").write_text(
+        f"{ENDPOINT}={REAL}\n"
+        "GPU_FAULT_METRICS_MODE=dcgm\n"
+        "GPU_FAULT_METRICS_INTERVAL_SECONDS=15\n"
+        "GPU_FAULT_COLLECTOR_STARTUP_SPREAD_SECONDS=15\n"
+        "GPU_FAULT_COLLECTOR_STARTUP_JITTER_SECONDS=20\n"
+        "GPU_FAULT_COLLECTOR_CADENCE_JITTER_RATIO=0.1\n"
+        "GPU_FAULT_NODE_ACTION_KEY=never-reported\n"
+    )
+    listed: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kw: Any) -> Any:
+        if cmd[:2] == ["systemctl", "list-units"]:
+            listed.append(cmd)
+            stdout = (
+                "gpu-fault-env-collector-restore-239299cded976dc8.timer loaded "
+                "active waiting gpu-fault-env-collector-restore-239299cded976dc8.timer\n"
+                "gpu-fault-env-replay-239299cded976dc8.service loaded failed failed "
+                "/opt/gpu-fault/current/venv/bin/python -I /run/.../tool.py\n"
+                "other.service loaded active running Other\n"
+            )
+            return type("R", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
+        if cmd[:2] == ["systemctl", "show"]:
+            stdout = (
+                "ActiveState=active\nMainPID=7\nInvocationID=abc\n"
+                "DropInPaths=/run/systemd/system/gpu-fault-metrics-collector.service.d/"
+                "gpu-fault-env-replay-239299cded976dc8.conf\n"
+            )
+            return type("R", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
+        return _ok()
+
+    monkeypatch.setattr(probe, "run", fake_run)
+    monkeypatch.setattr(probe, "effective_endpoint", lambda unit, **kw: PROXY)
+    monkeypatch.setattr(probe, "device_limits", lambda: [])
+    monkeypatch.setattr(probe, "gpu_inventory", lambda: [])
+    monkeypatch.setattr(probe, "current_tlimit_readings", lambda: {})
+    (probe.ACCEPTANCE_ROOT / "239299cded976dc8").mkdir(parents=True)
+    out = _run(["preflight"])
+    assert out["code"] == 0, out
+    receipt = out["json"]
+    assert receipt["collector_env"] == {
+        ENDPOINT: REAL,
+        "GPU_FAULT_METRICS_MODE": "dcgm",
+        "GPU_FAULT_METRICS_INTERVAL_SECONDS": "15",
+        "GPU_FAULT_COLLECTOR_STARTUP_SPREAD_SECONDS": "15",
+        "GPU_FAULT_COLLECTOR_STARTUP_JITTER_SECONDS": "20",
+        "GPU_FAULT_COLLECTOR_CADENCE_JITTER_RATIO": "0.1",
+    }, "only the allow-listed keys leave the node"
+    assert receipt["baseline_endpoint"] == REAL
+    assert receipt["effective_endpoint"] == PROXY
+    assert receipt["open_windows"] == ["239299cded976dc8"]
+    assert receipt["leftover_units"] == [
+        {
+            "unit": "gpu-fault-env-collector-restore-239299cded976dc8.timer",
+            "load": "loaded",
+            "active": "active",
+            "sub": "waiting",
+        },
+        {
+            "unit": "gpu-fault-env-replay-239299cded976dc8.service",
+            "load": "loaded",
+            "active": "failed",
+            "sub": "failed",
+        },
+    ]
+    assert (
+        "gpu-fault-env-replay-239299cded976dc8.conf"
+        in (receipt["metrics_unit"]["DropInPaths"])
+    )
+    assert listed and "--all" in listed[0] and listed[0][-1] == "gpu-fault-env-*"
+    # ``snapshot`` lists the same leftovers (the zero-read re-verification).
+    out = _run(["snapshot"])
+    assert out["code"] == 0, out
+    assert out["json"]["leftover_units"] == receipt["leftover_units"]
+    assert out["json"]["open_windows"] == ["239299cded976dc8"]
+    assert out["json"]["effective_endpoint"] == PROXY
+
+
 def test_deploy_proxy_validates_its_arguments(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[list[str]] = []
     monkeypatch.setattr(probe, "run", lambda cmd, **kw: calls.append(cmd) or _ok())

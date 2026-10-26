@@ -75,6 +75,10 @@ PLAN_FILE = "plan.json"
 TOOL_FILE = "gpu_environment_replay.py"
 #: The endpoint variable the probe reads back from the collector process.
 ENDPOINT_ENV = "GPU_FAULT_DCGM_METRICS_URL"
+#: The one unit the probe repoints (``probes/env_replay_proxy.METRICS_UNIT``)
+#: and the name every drop-in and transient unit of a replay run carries.
+METRICS_UNIT = "gpu-fault-metrics-collector.service"
+REPLAY_RUN_MARK = "gpu-fault-env"
 EXPORTER_POD_PREFIX = "gpu-fault-dcgm-exporter"
 #: The live T.Limit reading must be at least this far above zero before the run
 #: arms, so the device is plainly in a safe state (the tool aborts at <= 0).
@@ -89,6 +93,168 @@ NODE_READ_TIMEOUT_SECONDS = 30
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+class EnvLiveNotShown(RegionalFixtureError):
+    """The fixture could not show anything, so the case is INCONCLUSIVE.
+
+    Raised before a plan is armed (or before anything is deployed): the node is
+    not the clean fixture the run needs, or the repoint is not proven. Never a
+    product verdict -- nothing the product did or failed to do is in it.
+    """
+
+
+class NodeNotClean(EnvLiveNotShown):
+    """A previous replay run left a window, drop-in, unit or endpoint behind."""
+
+
+class RepointNotProven(EnvLiveNotShown):
+    """The repoint receipt or the pre-arm status does not prove the collector
+    reads the proxy; refuse to arm."""
+
+
+def repoint_proof(receipt: dict[str, Any], proxy_endpoint: str) -> dict[str, Any]:
+    """The repoint receipt's proof that the collector really reads the proxy.
+
+    Three facts, all from the node: the probe judged the repoint effective
+    (``repointed``), the restarted process's own environment names the proxy
+    (``process_environment``) and the proxy counted that process's first
+    pass-through read (``first_read.observed``). Anything less -- including a
+    receipt from an older probe copy that carries none of them -- is a fixture
+    error with the reason, raised before anything is armed. Shared by the
+    GF-ENV-LIVE runner and the GF-GENERAL-LIVE 024 variants.
+    """
+
+    reason = receipt.get("reason")
+    if receipt.get("repointed") is False:
+        raise RepointNotProven(
+            f"the metrics collector repoint did not take effect: {reason}"
+        )
+    process = receipt.get("process_environment")
+    first_read = receipt.get("first_read")
+    if receipt.get("repointed") is not True or not isinstance(first_read, dict):
+        raise RepointNotProven(
+            "the repoint receipt carries no first-read proof (repointed="
+            f"{receipt.get('repointed')!r}, first_read={first_read!r}); refuse to arm"
+        )
+    endpoint = (process or {}).get(ENDPOINT_ENV)
+    if endpoint != proxy_endpoint:
+        raise RepointNotProven(
+            f"the collector process reads {endpoint!r}, not the proxy "
+            f"{proxy_endpoint}; refuse to arm"
+        )
+    if first_read.get("observed") is not True:
+        raise RepointNotProven(
+            "the repointed collector made no pass-through read of the proxy "
+            f"({first_read}); refuse to arm"
+        )
+    return {"process_endpoint": endpoint, "first_read": first_read}
+
+
+def node_leftovers(
+    probe_preflight: dict[str, Any] | None, *, proxy_port: int = 9411
+) -> list[str]:
+    """What an earlier replay run left on the node, from the probe's ``preflight``.
+
+    An open run directory under ``/run/gpu-fault-env-replay``, a repoint
+    drop-in still loaded on the collector unit, a transient unit of the probe
+    still listed (a proxy, a restore deadman, a pause waiter) or a collector
+    process that reads something other than its configured endpoint. Each is a
+    named reason; the runner deploys nothing while any is present.
+    """
+
+    preflight = dict(probe_preflight or {})
+    reasons: list[str] = []
+    windows = [str(item) for item in preflight.get("open_windows") or []]
+    if windows:
+        reasons.append(
+            "a previous replay window is still open on the node: "
+            + ", ".join(sorted(windows))
+        )
+    unit = dict(preflight.get("metrics_unit") or {})
+    dropins = [
+        path
+        for path in str(unit.get("DropInPaths") or "").split()
+        if REPLAY_RUN_MARK in path
+    ]
+    if dropins:
+        reasons.append(
+            f"a repoint drop-in of a previous run is still loaded on {METRICS_UNIT}: "
+            + ", ".join(sorted(dropins))
+        )
+    units = [
+        item for item in preflight.get("leftover_units") or [] if isinstance(item, dict)
+    ]
+    if units:
+        reasons.append(
+            "transient units of a previous run are still loaded: "
+            + ", ".join(
+                f"{item.get('unit')} ({item.get('active')}/{item.get('sub')})"
+                for item in sorted(units, key=lambda item: str(item.get("unit")))
+            )
+        )
+    effective = preflight.get("effective_endpoint")
+    configured = preflight.get("baseline_endpoint") or (
+        preflight.get("collector_env") or {}
+    ).get(ENDPOINT_ENV)
+    if effective is not None and configured and effective != configured:
+        reasons.append(
+            f"the collector process reads {effective!r}, not its configured "
+            f"endpoint {configured!r}"
+        )
+    elif isinstance(effective, str) and effective.endswith(f":{proxy_port}/metrics"):
+        reasons.append(
+            f"the collector process still reads a replay proxy ({effective})"
+        )
+    return reasons
+
+
+def require_proxy_read_before_arm(
+    status_receipt: dict[str, Any] | None,
+    proof: dict[str, Any] | None,
+    *,
+    proxy_endpoint: str,
+) -> dict[str, Any]:
+    """Right before the arm: the collector still reads the proxy, which is still
+    pass-through and still counting from the first-read proof.
+
+    ``status_receipt`` is the probe's ``status`` (the proxy ``/status`` plus the
+    endpoint the collector process reads now); ``proof`` is ``repoint_proof``'s
+    result. A reverted endpoint, an already armed proxy or a read count behind
+    the proof's (a restarted tool counts from zero) refuses the arm.
+    """
+
+    receipt = dict(status_receipt or {})
+    status = dict(receipt.get("status") or {})
+    effective = receipt.get("effective_endpoint")
+    if "effective_endpoint" in receipt and effective != proxy_endpoint:
+        raise RepointNotProven(
+            f"the collector endpoint reverted to {effective!r} before the arm "
+            f"(proxy {proxy_endpoint}); refuse to arm"
+        )
+    if status.get("armed") is not False:
+        raise RepointNotProven(
+            f"the proxy reports armed={status.get('armed')!r} before the arm; "
+            "refuse to arm"
+        )
+    reads = status.get("reads")
+    after = ((proof or {}).get("first_read") or {}).get("reads_after")
+    if (
+        isinstance(reads, int)
+        and isinstance(after, int)
+        and not isinstance(reads, bool)
+        and reads < after
+    ):
+        raise RepointNotProven(
+            f"the proxy read count went back from {after} (first-read proof) to "
+            f"{reads}: a restarted proxy counts from zero; refuse to arm"
+        )
+    return {
+        "effective_endpoint": effective,
+        "reads": reads,
+        "first_read_reads_after": after,
+        "armed": status.get("armed"),
+    }
 
 
 @dataclass(frozen=True)
@@ -592,6 +758,8 @@ class EnvReplayController:
         self._repointed = False
         self._armed = False
         self._pause_scheduled = False
+        #: ``repoint_proof`` of the last repoint receipt (empty until proven).
+        self.proof: dict[str, Any] = {}
         # A caller (the GF-GENERAL-LIVE 024 composites, a test) may hand in the
         # host probe; production builds the node-pinned probe Pod itself.
         self.host = host or HostProbeFixture(
@@ -686,6 +854,9 @@ class EnvReplayController:
         well over a minute). A repoint the probe rolled back as ineffective
         answers ``repointed: false`` with a constant reason; that is a fixture
         error here, raised with the reason, never a replay budget to wait out.
+        A receipt that carries no proof at all (an older probe copy, a process
+        that reads another endpoint, no first read) is refused the same way
+        (``repoint_proof``), so nothing is ever armed on an unproven repoint.
         The unit is marked for restore *before* the call: a call that fails
         midway (a timeout after the drop-in was written) must still be undone
         by ``cleanup``.
@@ -705,7 +876,7 @@ class EnvReplayController:
         if receipt.get("repointed") is False:
             rollback = receipt.get("rollback") or {}
             process = receipt.get("process_environment") or {}
-            raise RegionalFixtureError(
+            raise RepointNotProven(
                 "the metrics collector repoint did not take effect on "
                 f"{self.node}: {receipt.get('reason') or 'no reason given'} "
                 f"(process endpoint {process.get(ENDPOINT_ENV)!r}, first read "
@@ -713,12 +884,20 @@ class EnvReplayController:
                 f"restarted={rollback.get('restarted')}, "
                 f"restored_endpoint={rollback.get('restored_endpoint')!r})"
             )
+        self.proof = repoint_proof(receipt, f"http://127.0.0.1:{port}/metrics")
         return receipt
 
     def status(self, *, port: int = 9411) -> dict[str, Any]:
         return self.host.execute(
             "status", "--run-id", self.run_id, "--port", str(port), timeout=60
         )
+
+    def snapshot(self) -> dict[str, Any]:
+        """The collector unit as the node sees it now (``systemctl show``, the
+        endpoint its process reads, open windows, leftover units): a read that
+        changes nothing, taken when an armed proxy counts no read."""
+
+        return self.host.execute("snapshot", timeout=60)
 
     def arm(self, *, port: int = 9411) -> dict[str, Any]:
         receipt = self.execute(

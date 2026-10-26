@@ -20,6 +20,16 @@ GPU = "GPU-aaaa"
 NODE = "ip-10-0-43-5"
 BOOT = "boot-1"
 PROXY = "http://127.0.0.1:9411/metrics"
+REAL = "http://127.0.0.1:9400/metrics"
+#: The run's repoint drop-in as the probe names it, and the collector unit's
+#: identity after the repoint restart (``systemctl show``).
+DROPIN = (
+    "/run/systemd/system/gpu-fault-metrics-collector.service.d/"
+    "gpu-fault-env-replay-0123456789abcdef.conf"
+)
+UNIT_INVOCATION = "52ac4fabb52d4b77beb6d0e928da732e"
+#: The live proxy's refusal text (tools/gpu_environment_replay.transform).
+REFUSAL = "target GPU or requested fields are absent; refusing invented samples"
 REVIEW_OPERATIONS = (
     "FREEZE_EVIDENCE",
     "MARK_UNSCHEDULABLE",
@@ -44,6 +54,9 @@ class World:
         self.repoint_at: datetime | None = None
         self.armed_at: datetime | None = None
         self.armed = False
+        #: The proxy's read count at the arm (the proven repoint's pass-through
+        #: read): plan reads in ``at_read``/``tick_time`` count from here.
+        self.reads_at_arm: int | None = None
         self.reads_frozen_at: int | None = None
         self.aborted: str | None = None
         self.endpoint: str | None = PROXY
@@ -99,6 +112,22 @@ class World:
                 "attempt_id": "envctl-a001",
             }
         ]
+        # The collector unit as the repoint left it and as a later ``snapshot``
+        # sees it; the proxy's refusal counters; what the probe preflight finds.
+        self.unit_invocation = UNIT_INVOCATION
+        self.unit_started: str | None = None
+        self.unit_active = "active"
+        self.dropin_loaded = True
+        self.failed_reads: int | None = 0
+        self.last_error: str | None = None
+        #: Live 2026-10-26 GF-ENV-LIVE-006: every armed read answered 503, the
+        #: read count frozen at the arm; one refusal per collector tick.
+        self.refuse_armed_reads = False
+        #: A collector that stops scraping at the arm (no refusals counted).
+        self.freeze_reads_at_arm = False
+        self.repoint_receipt_overrides: dict[str, Any] = {}
+        self.preflight_extra: dict[str, Any] = {}
+        self.snapshots = 0
 
     # -- time --------------------------------------------------------------- #
     def clock(self) -> datetime:
@@ -116,10 +145,18 @@ class World:
         return self.armed_at or self.repoint_at or self.now
 
     def at_read(self, reads: int, action: Callable[[World], None]) -> World:
-        """Fire once the collector consumed ``reads`` proxy reads (pause-aware)."""
+        """Fire once the collector consumed ``reads`` plan reads (pause-aware).
+
+        Plan reads count from the arm: the proven repoint already cost one
+        pass-through read, so plan read ``n`` is absolute proxy read
+        ``reads_at_arm + n`` (absolute before an arm, for the baseline case).
+        """
 
         self.read_events.append((reads, action))
         return self
+
+    def _absolute(self, reads: int) -> int:
+        return reads + (self.reads_at_arm or 0)
 
     def at_restart(self, offset: float, action: Callable[[World], None]) -> World:
         """Fire ``offset`` seconds after the 009 collector restart."""
@@ -139,7 +176,9 @@ class World:
             self.events.remove(item)
             item[1](self)
         reads = self.reads()
-        for item in [item for item in self.read_events if item[0] <= reads]:
+        for item in [
+            item for item in self.read_events if self._absolute(item[0]) <= reads
+        ]:
             self.read_events.remove(item)
             item[1](self)
         if self.restart_at is not None:
@@ -192,9 +231,10 @@ class World:
         return count
 
     def tick_time(self, reads: int) -> datetime:
-        """When the collector took its ``reads``-th read (pause-aware)."""
+        """When the collector took its ``reads``-th plan read (pause-aware)."""
 
         assert self.repoint_at is not None, "no reads before the repoint"
+        target = self._absolute(reads)
         count, k = 0, 1
         while True:
             tick = self.repoint_at + timedelta(seconds=k * self.interval)
@@ -206,10 +246,24 @@ class World:
             ):
                 continue
             count += 1
-            if count == reads:
+            if count == target:
                 return tick
 
+    def refused_reads(self) -> int | None:
+        """The proxy's refusals: one per collector tick since the arm when the
+        armed reads are refused, else the scripted count."""
+
+        if not self.refuse_armed_reads or self.armed_at is None:
+            return self.failed_reads
+        ticks = 0
+        k = 1
+        while self.armed_at + timedelta(seconds=k * self.interval) <= self.now:
+            ticks += 1
+            k += 1
+        return ticks
+
     def status(self) -> dict[str, Any]:
+        refused = self.refused_reads()
         return {
             "run_id": "r1",
             "status": {
@@ -218,20 +272,80 @@ class World:
                 "proof_scope": "live-telemetry-replay",
                 "aborted": self.aborted,
                 "armed": self.armed,
+                "failed_reads": refused,
+                "last_error": (
+                    REFUSAL if self.refuse_armed_reads and refused else self.last_error
+                ),
             },
             "effective_endpoint": self.endpoint,
         }
 
-    def repoint(self) -> dict[str, Any]:
-        self.repoint_at = self.now
+    def unit_state(self) -> dict[str, str]:
         return {
-            "proxy_endpoint": PROXY,
-            "original_endpoint": "http://127.0.0.1:9400/metrics",
+            "ActiveState": self.unit_active,
+            "SubState": "running" if self.unit_active == "active" else "dead",
+            "MainPID": "4242",
+            "InvocationID": self.unit_invocation,
+            "ExecMainStartTimestamp": self.unit_started or iso(self.now),
+            "DropInPaths": DROPIN if self.dropin_loaded else "",
         }
+
+    def repoint(self) -> dict[str, Any]:
+        """The probe's proven repoint: the unit restarted, its process reads
+        the proxy, and the proxy counted the first pass-through read before
+        the call returned (one collector tick plus a little, as live)."""
+
+        self.repoint_at = self.now
+        self.unit_started = iso(self.now)
+        # The probe returns only after the restarted collector's first
+        # pass-through read: one tick on the collector's grid. The wait is the
+        # probe's, not a runner poll, so it is not recorded in ``sleeps``.
+        self.now += timedelta(seconds=self.interval)
+        receipt: dict[str, Any] = {
+            "repointed": True,
+            "run_id": "r1",
+            "proxy_endpoint": PROXY,
+            "original_endpoint": REAL,
+            "dropin": DROPIN,
+            "process_environment": {"GPU_FAULT_DCGM_METRICS_URL": PROXY},
+            "first_read": {
+                "observed": True,
+                "reads_before": 0,
+                "reads_after": self.reads(),
+                "waited_seconds": self.interval,
+                "budget_seconds": 65,
+            },
+            "after": self.unit_state(),
+        }
+        receipt.update(self.repoint_receipt_overrides)
+        return receipt
+
+    def snapshot(self) -> dict[str, Any]:
+        """The probe's ``snapshot``: the unit now, and the endpoint it reads."""
+
+        self._fire()
+        self.snapshots += 1
+        return {
+            "captured_at": iso(self.now),
+            "metrics_unit": self.unit_state(),
+            "effective_endpoint": self.endpoint,
+            "baseline_endpoint": REAL,
+            "open_windows": [],
+            "leftover_units": [],
+        }
+
+    def restart_unit(self) -> None:
+        """The collector unit restarted (a new InvocationID, a new start)."""
+
+        self.unit_invocation = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+        self.unit_started = iso(self.now)
 
     def arm(self) -> dict[str, Any]:
         self.armed_at = self.now
         self.armed = True
+        self.reads_at_arm = self.reads()
+        if self.refuse_armed_reads or self.freeze_reads_at_arm:
+            self.reads_frozen_at = self.reads_at_arm
         return {"run_id": "r1", "armed": True, "status": self.status()["status"]}
 
     # -- 009: pause / resume / restart ------------------------------------- #
@@ -807,8 +921,13 @@ class WorldController:
     def preflight(self) -> dict[str, Any]:
         self.calls.append("preflight")
         return {
-            "metrics_unit": {"ActiveState": "active"},
+            "metrics_unit": {"ActiveState": "active", "DropInPaths": ""},
             "collector_env": dict(COLLECTOR_ENV),
+            "effective_endpoint": REAL,
+            "baseline_endpoint": REAL,
+            "open_windows": [],
+            "leftover_units": [],
+            **self.world.preflight_extra,
         }
 
     def deploy_proxy(self, plan_path: Any, gpu_uuid: str, **options: Any) -> Any:
@@ -823,6 +942,10 @@ class WorldController:
     def status(self, **options: Any) -> dict[str, Any]:
         self.calls.append("status")
         return self.world.status()
+
+    def snapshot(self) -> dict[str, Any]:
+        self.calls.append("snapshot")
+        return self.world.snapshot()
 
     def arm(self, **options: Any) -> dict[str, Any]:
         self.calls.append("arm")

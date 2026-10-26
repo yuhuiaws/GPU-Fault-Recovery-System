@@ -107,6 +107,30 @@ nvidia-smi source switch (installation only) and the cross-boot path are not
 driven and are recorded as gaps. The preflight admits only a node without
 business workloads, so task progress and suspension are reported as not measured.
 
+The replay tool matches exporter samples the way the collector's parser does:
+dcgm-exporter declares the thermal and power violation durations `counter`
+(`deploy/dataplane/dcgm-counters.csv`), the Prometheus text parser renames those
+samples `<name>_total`, and the tool now falls back to the bare name
+(`canonical_mapping`). Before that fallback (live 2026-10-26, GF-ENV-LIVE-006
+`hw_thermal` on plain EKS) every armed read was answered 503 "requested fields
+are absent", the collector logged `cannot scrape DCGM exporter` each tick, the
+proxy's read count froze at the arm, and the case ended "consumed 0 of 7" while
+the repoint proof itself had held; the two duration plans and the 024
+`thermal_warning`/`power_performance` plans share the fix. The proxy `/status`
+now reports `failed_reads`/`last_error`. The ENV-LIVE windows are sized from the
+node's collector cadence like the repoint's first-read budget (reads x interval,
+the cadence jitter over them, the start-up spread and start-up jitter a
+collector restarted inside the window needs, the delivery margin), the probe's
+preflight names leftovers of an earlier run (an open replay window, a loaded
+repoint drop-in, a `gpu-fault-env-*` transient unit, a collector reading a
+foreign endpoint) and the runner deploys nothing while any is present, the
+repoint proof is required before the arm and re-checked against the status read
+right before it, and an armed proxy that counts no read by the time the first
+one is due has the unit read back once and the reason named (endpoint
+reverted, drop-in gone, unit restarted or inactive, proxy refused the reads,
+collector silent). All of these are INCONCLUSIVE with the reason, never a
+product verdict; the proof scope stays `live-telemetry-replay`.
+
 AUTH-016 follows the real administrator rotation contract using controlled I/O.
 Same-release Node key activation tests bind durable progress, projected key
 ordering and actual local Agent/FleetRegistry behavior. They are not deployed

@@ -43,9 +43,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from scripts.e2e.regional.env_live_fixture import (
-    ENDPOINT_ENV,
     PLAN_FILE,
     EnvReplayController,
+    repoint_proof,
     replay_tool_sha256,
     write_plan_file,
 )
@@ -110,41 +110,8 @@ def checked_plan(plan: dict[str, Any]) -> dict[str, Any]:
     return plan
 
 
-def repoint_proof(receipt: dict[str, Any], proxy_endpoint: str) -> dict[str, Any]:
-    """The repoint receipt's proof that the collector really reads the proxy.
-
-    Three facts, all from the node: the probe judged the repoint effective
-    (``repointed``), the restarted process's own environment names the proxy
-    (``process_environment``) and the proxy counted that process's first
-    pass-through read (``first_read.observed``). Anything less -- including a
-    receipt from an older probe copy that carries none of them -- is a fixture
-    error with the reason, raised before anything is armed.
-    """
-
-    reason = receipt.get("reason")
-    if receipt.get("repointed") is False:
-        raise RegionalFixtureError(
-            f"the metrics collector repoint did not take effect: {reason}"
-        )
-    process = receipt.get("process_environment")
-    first_read = receipt.get("first_read")
-    if receipt.get("repointed") is not True or not isinstance(first_read, dict):
-        raise RegionalFixtureError(
-            "the repoint receipt carries no first-read proof (repointed="
-            f"{receipt.get('repointed')!r}, first_read={first_read!r}); refuse to arm"
-        )
-    endpoint = (process or {}).get(ENDPOINT_ENV)
-    if endpoint != proxy_endpoint:
-        raise RegionalFixtureError(
-            f"the collector process reads {endpoint!r}, not the proxy "
-            f"{proxy_endpoint}; refuse to arm"
-        )
-    if first_read.get("observed") is not True:
-        raise RegionalFixtureError(
-            "the repointed collector made no pass-through read of the proxy "
-            f"({first_read}); refuse to arm"
-        )
-    return {"process_endpoint": endpoint, "first_read": first_read}
+# ``repoint_proof`` lives in ``env_live_fixture`` since the GF-ENV-LIVE runner
+# and the controller apply the same proof; it stays importable from here.
 
 
 @dataclass

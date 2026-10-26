@@ -16,7 +16,13 @@ product's records show the case's expected reaction (``env_live_watch``,
 ``env_live_judges``), and restores everything. The tool never declares a LIVE
 PASS; the verdict comes from those records: PASS only on positive evidence,
 FAIL on a missing or wrong reaction, INCONCLUSIVE when the replay or its
-ingestion cannot be shown.
+ingestion cannot be shown. Nothing is deployed while the probe's preflight
+shows a leftover of an earlier run (an open replay window, a repoint drop-in,
+a transient unit, a collector reading a foreign endpoint), nothing is armed
+without the repoint proof (``env_live_fixture.repoint_proof``, re-checked
+against the proxy status right before the arm), and an armed proxy that counts
+no read by the time the first one is due has the repoint re-verified on the
+node and the reason named (``env_live_watch.diagnose_zero_reads``).
 
 GF-ENV-LIVE-009 pauses the metrics collector read-synchronously after two
 severe samples (``probes/env_replay_proxy.py pause-collector``, a deadman
@@ -319,6 +325,25 @@ def plan_details(
                 "exporter, plain EKS) by a transient host probe that is deleted again"
             ),
             "max_window_seconds": WINDOW_SECONDS,
+            "preflight_leftovers": (
+                "the probe preflight lists open replay windows, repoint drop-ins, "
+                "gpu-fault-env-* transient units and the endpoint the collector "
+                "process reads; any leftover of an earlier run is INCONCLUSIVE "
+                "with the reason and deploys nothing"
+            ),
+            "repoint_proof": (
+                "arm only after the repoint receipt proves the restarted collector "
+                "process reads the proxy and made its first pass-through read, "
+                "and the status right before the arm still shows that endpoint, "
+                "an unarmed proxy and a read count at or past the proof"
+            ),
+            "zero_read_reverification": (
+                "an armed proxy that counts no read by one jittered interval plus "
+                "the collector's start-up spread and jitter after the arm has the "
+                "unit read back and the reason named: unit restarted or inactive, "
+                "drop-in gone, endpoint reverted, proxy refused the reads (503), or "
+                "collector silent"
+            ),
         },
         "replay_plans": replay.get("plans", {}),
         "not_run_variants": replay.get("not_run", {}),
@@ -331,6 +356,9 @@ def plan_details(
         "stop_conditions": [
             "predecessor evidence is not PASS",
             "node not clean (workload, ownership, non-ACTIVE Agent) or <3 fresh samples",
+            "a previous replay run's window, drop-in, transient unit or endpoint "
+            "override is still on the node (nothing deployed)",
+            "the repoint is not proven before the arm (nothing armed)",
             "device does not report the scale a variant grades on (that variant NOT_RUN)",
             "real upstream HW thermal/Power Brake, T.Limit<=0, GPU>=80C or memory>=85C",
             "collector endpoint cannot be restored or a probe resource remains",
@@ -576,7 +604,10 @@ def execute_case(
             receipts["observation"] = outcome["observation"]
             stages.update(outcome["stages"])
             inconclusive.extend(outcome["inconclusive"])
-    except PauseNotTaken as exc:
+    except (PauseNotTaken, fixture.EnvLiveNotShown) as exc:
+        # Nothing was shown (a leftover of an earlier run, an unproven repoint,
+        # a pause not taken): INCONCLUSIVE with the reason, never a FAIL the
+        # product did not earn.
         result["error"] = f"{type(exc).__name__}: {exc}"
         inconclusive.append(f"{settings.case_id}: {exc}")
     except BaseException as exc:  # noqa: BLE001 - recorded; cleanup still runs
@@ -710,6 +741,16 @@ def _run_replay(
     plan_name, first_plan = _first_plan(settings.case_id, replay.get("plans") or {})
     plan_path = fixture.write_plan_file(case_dir, fixture.PLAN_FILE, first_plan)
     receipts["probe_preflight"] = controller.preflight()
+    # A leftover of an earlier run (its window, drop-in, deadman or waiter, or
+    # a collector still reading another endpoint) would be read as this run's
+    # doing: name it and deploy nothing.
+    leftovers = fixture.node_leftovers(receipts["probe_preflight"], proxy_port=PORT)
+    receipts["node_leftovers"] = leftovers
+    if leftovers:
+        raise fixture.NodeNotClean(
+            "the node carries leftovers of a previous replay run; nothing was "
+            "deployed: " + "; ".join(leftovers)
+        )
     cadence = watch.CollectorCadence.from_probe(receipts["probe_preflight"])
     expectation = expectations.expectation_for(
         case_id=settings.case_id,
@@ -739,6 +780,12 @@ def _run_replay(
     receipts["node_before"] = regional.node_snapshot(settings.node)
     repoint_at = fixture.utc_now()
     receipts["repoint"] = controller.repoint(port=PORT, restore_seconds=WINDOW_SECONDS)
+    # The receipt's own proof, recorded: the restarted process reads the proxy
+    # and the proxy counted its first pass-through read (the controller refused
+    # anything less).
+    receipts["repoint_proof"] = fixture.repoint_proof(
+        receipts["repoint"], PROXY_ENDPOINT
+    )
     # A few pass-through cycles must reach the control plane unchanged before
     # arming (001's contract, required by every case).
     passthrough_at = fixture.utc_now()
@@ -747,8 +794,17 @@ def _run_replay(
         planned_reads=expectation.planned_reads,
         armed=arms_a_plan,
         proxy_endpoint=PROXY_ENDPOINT,
+        first_read_due_seconds=cadence.first_read_due_seconds,
+        repoint_baseline=watch.repoint_baseline(receipts["repoint"]),
     )
     if arms_a_plan:
+        # Right before the arm: the collector still reads the proxy, which is
+        # still pass-through and still counting from the proof.
+        receipts["arm_precheck"] = fixture.require_proxy_read_before_arm(
+            receipts["passthrough_status"],
+            receipts["repoint_proof"],
+            proxy_endpoint=PROXY_ENDPOINT,
+        )
         start = fixture.utc_now()
         receipts["arm"] = controller.arm(port=PORT)
         progress.begin(receipts["arm"], start)
@@ -929,6 +985,8 @@ def _observe(
         activity=lambda: fixture.node_records(regional, settings.node, activity_since),
         node=lambda: fixture.node_state(regional, settings.node),
         extra=extra,
+        # The unit read back when an armed proxy counts no read in time.
+        repoint=getattr(controller, "snapshot", None),
     )
     outcome = watch.watch(
         judge,
@@ -979,13 +1037,26 @@ def _cleanup_errors(case_id: str, receipts: dict[str, Any]) -> list[str]:
     # override, so only a missing original, an inactive unit or a foreign
     # override is a failed restore.
     endpoint = restore.get("restored_endpoint")
+    # A run that never repointed the collector (refused on a leftover before
+    # the deploy, or failed before the repoint call) has nothing to restore:
+    # the collector endpoint is untouched, and the proxy stop needs no
+    # restore before it.
+    repointed = (
+        "repoint" in receipts or "restore" in cleanup or "restore_error" in cleanup
+    )
     errors = verdicts.cleanup_errors(
-        collector_endpoint_restored=bool(restore.get("original_endpoint"))
-        and (restore.get("after") or {}).get("ActiveState") == "active"
-        and endpoint in (None, restore.get("original_endpoint")),
+        collector_endpoint_restored=(
+            not repointed
+            or (
+                bool(restore.get("original_endpoint"))
+                and (restore.get("after") or {}).get("ActiveState") == "active"
+                and endpoint in (None, restore.get("original_endpoint"))
+            )
+        ),
         single_producer_after=True,
         fresh_batches_after=3,
-        proxy_closed_after_endpoint="restore" in cleanup and "stop_proxy" in cleanup,
+        proxy_closed_after_endpoint="stop_proxy" in cleanup
+        and (not repointed or "restore" in cleanup),
         probe_residuals_absent=bool(residuals)
         and all(value is False for value in residuals.values()),
         label=case_id,

@@ -113,6 +113,28 @@ SETTLE_SECONDS = 45
 #: bounds the whole repoint call).
 STARTUP_SPREAD_ENV = "GPU_FAULT_COLLECTOR_STARTUP_SPREAD_SECONDS"
 STARTUP_JITTER_ENV = "GPU_FAULT_COLLECTOR_STARTUP_JITTER_SECONDS"
+JITTER_RATIO_ENV = "GPU_FAULT_COLLECTOR_CADENCE_JITTER_RATIO"
+#: The ``collector.env`` keys ``preflight`` reports: the endpoint and mode, the
+#: cadence the runner sizes its windows from (interval, edge confirmation,
+#: health summary, start-up spread, start-up jitter, cadence jitter ratio).
+PREFLIGHT_ENV_KEYS = frozenset(
+    {
+        ENDPOINT_ENV,
+        "GPU_FAULT_METRICS_MODE",
+        INTERVAL_ENV,
+        "GPU_FAULT_DCGM_EDGE_CONFIRMATION_SAMPLES",
+        "GPU_FAULT_DCGM_HEALTH_SUMMARY_SECONDS",
+        "GPU_FAULT_DCGM_EXPORTER_INTERVAL_SECONDS",
+        STARTUP_SPREAD_ENV,
+        STARTUP_JITTER_ENV,
+        JITTER_RATIO_ENV,
+    }
+)
+#: Every transient unit this probe creates starts with this prefix (the proxy,
+#: the restore deadman, the pause waiter, the resume deadman); ``preflight``
+#: and ``snapshot`` list what is still loaded so a leftover of an earlier run
+#: is named before anything is deployed.
+UNIT_PREFIX = "gpu-fault-env-"
 DEFAULT_INTERVAL_SECONDS = 15.0
 DEFAULT_STARTUP_SPREAD_SECONDS = 15.0
 DEFAULT_STARTUP_JITTER_SECONDS = 20.0
@@ -316,6 +338,50 @@ def unit_state(unit: str) -> dict[str, str]:
             values[key] = value
     values["returncode"] = str(completed.returncode)
     return values
+
+
+def leftover_units(prefix: str = UNIT_PREFIX) -> list[dict[str, str]]:
+    """The probe's transient units systemd still lists (any state).
+
+    A finished transient unit is unloaded, so anything listed here -- a proxy
+    still serving, a restore deadman still waiting, a pause waiter, a failed
+    unit kept for its status -- is a run that did not end cleanly.
+    """
+
+    completed = run(
+        [
+            "systemctl",
+            "list-units",
+            "--all",
+            "--plain",
+            "--no-legend",
+            "--no-pager",
+            f"{prefix}*",
+        ],
+        check=False,
+    )
+    units: list[dict[str, str]] = []
+    for line in completed.stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 4 or not fields[0].startswith(prefix):
+            continue
+        units.append(
+            {
+                "unit": fields[0],
+                "load": fields[1],
+                "active": fields[2],
+                "sub": fields[3],
+            }
+        )
+    return sorted(units, key=lambda item: item["unit"])
+
+
+def open_windows() -> list[str]:
+    """The run directories still present under ``ACCEPTANCE_ROOT``."""
+
+    if not ACCEPTANCE_ROOT.is_dir():
+        return []
+    return sorted(path.name for path in ACCEPTANCE_ROOT.glob("*") if path.is_dir())
 
 
 def process_environment(
@@ -558,26 +624,16 @@ def preflight(arguments: argparse.Namespace) -> None:
             "collector_env": {
                 key: value
                 for key, value in parse_env().items()
-                if key
-                in {
-                    ENDPOINT_ENV,
-                    "GPU_FAULT_METRICS_MODE",
-                    "GPU_FAULT_METRICS_INTERVAL_SECONDS",
-                    "GPU_FAULT_DCGM_EDGE_CONFIRMATION_SAMPLES",
-                    "GPU_FAULT_DCGM_HEALTH_SUMMARY_SECONDS",
-                    "GPU_FAULT_DCGM_EXPORTER_INTERVAL_SECONDS",
-                }
+                if key in PREFLIGHT_ENV_KEYS
             },
             "metrics_unit": unit_state(METRICS_UNIT),
             "effective_endpoint": effective_endpoint(METRICS_UNIT),
+            "baseline_endpoint": baseline_endpoint(),
             "device_limits": device_limits(),
             "gpu_inventory": gpu_inventory(),
             "current_tlimit_readings": current_tlimit_readings(),
-            "open_windows": sorted(
-                path.name for path in ACCEPTANCE_ROOT.glob("*") if path.is_dir()
-            )
-            if ACCEPTANCE_ROOT.is_dir()
-            else [],
+            "open_windows": open_windows(),
+            "leftover_units": leftover_units(),
         }
     )
 
@@ -1217,11 +1273,8 @@ def snapshot(arguments: argparse.Namespace) -> None:
             "metrics_unit": unit_state(METRICS_UNIT),
             "effective_endpoint": effective_endpoint(METRICS_UNIT),
             "baseline_endpoint": baseline_endpoint(),
-            "open_windows": sorted(
-                path.name for path in ACCEPTANCE_ROOT.glob("*") if path.is_dir()
-            )
-            if ACCEPTANCE_ROOT.is_dir()
-            else [],
+            "open_windows": open_windows(),
+            "leftover_units": leftover_units(),
         }
     )
 
