@@ -34,12 +34,24 @@ class Journal:
 
     def __call__(self, argv, **_):
         self.commands.append(argv)
-        since = float(argv[argv.index("--since") + 1].removeprefix("@"))
-        until = float(argv[argv.index("--until") + 1].removeprefix("@"))
         cursor = next(
             (arg.split("=", 1)[1] for arg in argv if arg.startswith("--after-cursor=")),
             None,
         )
+        if cursor is not None and "--since" in argv:
+            # systemd 252: one positioning option, or nothing is read.
+            return subprocess.CompletedProcess(
+                argv,
+                1,
+                "",
+                "Please specify only one of --since=, --cursor=, and --after-cursor=.",
+            )
+        since = (
+            float(argv[argv.index("--since") + 1].removeprefix("@"))
+            if "--since" in argv
+            else float("-inf")
+        )
+        until = float(argv[argv.index("--until") + 1].removeprefix("@"))
         first = 0
         if cursor is not None:
             positions = [
@@ -117,6 +129,8 @@ def test_vacuumed_cursor_replays_timestamp_window(tmp_path, monkeypatch):
         state={
             "journal_since": (NOW - timedelta(seconds=60)).isoformat(),
             "journal_cursor": "vacuumed",
+            # Saved by this boot, so the collector tries to resume from it.
+            "boot_id": "boot-current",
         },
     )
     first = value.collect_once()

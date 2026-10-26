@@ -321,19 +321,49 @@ EMISSIONS = %(emissions)r
 BOOT_ID = %(boot_id)r
 RUN_ID = %(run_id)r
 CURSOR_PREFIX = "gfrs-replay-"
+# The --until of the call that last emitted reviewed records, kept in STATE
+# next to the emission counts: the window the collector had read to when it
+# learned a synthetic cursor.
+WINDOW_KEY = "_until"
+
+
+def _option_value(argv, name):
+    for index, item in enumerate(argv):
+        if item.startswith(name + "="):
+            return item.split("=", 1)[1]
+        if item == name and index + 1 < len(argv):
+            return argv[index + 1]
+    return None
+
+
+def _emitted_window():
+    # Where the collector had read to when it learned the synthetic cursor.
+    # Reading from there again repeats at most the entry on the boundary, under
+    # its own cursor id; five minutes (the collector's own cold-start window)
+    # when no emission was recorded.
+    try:
+        with open(STATE, encoding="utf-8") as handle:
+            return json.load(handle).get(WINDOW_KEY) or "-5min"
+    except (OSError, ValueError):
+        return "-5min"
 
 
 def _forward_args(argv):
     # A synthetic cursor this wrapper emitted must never reach the real
     # journalctl (it would fail to seek); drop only our own after-cursor, in
     # either --after-cursor=<c> or --after-cursor <c> form, and forward a real
-    # journal cursor untouched.
+    # journal cursor untouched. The collector positions a resumed poll by that
+    # cursor alone (journalctl refuses --since next to --after-cursor), so a
+    # dropped cursor would leave the real read unbounded -- the whole journal
+    # up to --until; the window the cursor was emitted in stands in for it.
     argv = list(argv)
     kept = []
+    stripped = False
     index = 0
     while index < len(argv):
         item = argv[index]
         if item.startswith("--after-cursor=" + CURSOR_PREFIX):
+            stripped = True
             index += 1
             continue
         if (
@@ -341,10 +371,13 @@ def _forward_args(argv):
             and index + 1 < len(argv)
             and argv[index + 1].startswith(CURSOR_PREFIX)
         ):
+            stripped = True
             index += 2
             continue
         kept.append(item)
         index += 1
+    if stripped and _option_value(kept, "--since") is None:
+        kept.extend(["--since", _emitted_window()])
     return kept
 
 
@@ -362,12 +395,15 @@ def _emit_reviewed(out):
             text = handle.read().strip()
             counts = json.loads(text) if text else {}
             now_us = int(time.time() * 1_000_000)
+            until = _option_value(sys.argv[1:], "--until")
             for index, record in enumerate(records):
                 key = str(index)
                 done = int(counts.get(key, 0))
                 if done >= int(record.get("emissions", EMISSIONS)):
                     continue
                 counts[key] = done + 1
+                if until is not None:
+                    counts[WINDOW_KEY] = until
                 transport = record.get("transport") or "kernel"
                 # The cursor is the entry's identity all the way to the control
                 # plane: the collector makes it the entry id and the control

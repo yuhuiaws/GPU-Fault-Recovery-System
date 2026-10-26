@@ -353,6 +353,55 @@ def test_wrapper_never_forwards_its_own_cursor(tmp_path: Path) -> None:
     )
 
 
+def test_wrapper_stands_the_emitted_window_in_for_its_own_cursor(
+    tmp_path: Path,
+) -> None:
+    """A stripped synthetic cursor must not leave the real read unbounded.
+
+    The collector positions a resumed poll by the cursor alone -- journalctl
+    refuses ``--since`` next to ``--after-cursor`` -- so dropping the wrapper's
+    own cursor without a substitute would hand the real binary ``--until`` only:
+    the whole journal. The ``--until`` of the call that emitted the cursor is
+    where the collector had read to; it stands in as ``--since``.
+    """
+
+    wrapper, argv_log = _render_wrapper(tmp_path, armed=True)
+    _run_wrapper(wrapper, "--output=json", "--since", "@1", "--until", "@2")
+
+    _run_wrapper(
+        wrapper,
+        "--after-cursor=gfrs-replay-0-boot-xyz",
+        "--until",
+        "@3",
+        "--output=json",
+    )
+
+    forwarded = json.loads(argv_log.read_text(encoding="utf-8"))
+    assert not any("gfrs-replay-" in item for item in forwarded), forwarded
+    assert forwarded[forwarded.index("--since") + 1] == "@2", (
+        f"the emitted window stands in for the synthetic cursor: {forwarded}"
+    )
+    assert forwarded[forwarded.index("--until") + 1] == "@3", (
+        f"the asked-for window end is kept: {forwarded}"
+    )
+    assert [item for item in forwarded if item in ("--since", "--cursor")] == [
+        "--since"
+    ], f"exactly one positioning option reaches the real journalctl: {forwarded}"
+
+
+def test_wrapper_falls_back_to_five_minutes_without_an_emitted_window(
+    tmp_path: Path,
+) -> None:
+    wrapper, argv_log = _render_wrapper(tmp_path, armed=True)
+
+    _run_wrapper(wrapper, "--output=json", "--after-cursor", "gfrs-replay-0-boot-xyz")
+
+    forwarded = json.loads(argv_log.read_text(encoding="utf-8"))
+    assert forwarded[forwarded.index("--since") + 1] == "-5min", (
+        f"no recorded window: the collector's own cold-start window: {forwarded}"
+    )
+
+
 def test_wrapper_passes_a_real_cursor_through(tmp_path: Path) -> None:
     wrapper, argv_log = _render_wrapper(tmp_path, armed=True)
     _run_wrapper(wrapper, "--output=json", "--after-cursor", "s=real-journal-cursor")

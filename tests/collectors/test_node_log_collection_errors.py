@@ -119,8 +119,12 @@ def test_a_failed_journalctl_holds_the_cursor_and_names_the_exit_code(
     assert batch.entries == [], "a failed read has no entries to report"
     assert batch.collection_errors == [
         "journalctl exited 1: Failed to open journal: Permission denied",
-        "cumulative loss since collector start: journalctl-failures=1",
-    ], "the batch has to carry the exit code, the reason, and the running total"
+        "cumulative loss since collector start: journalctl-failures=1, "
+        "journalctl-failures-permission-denied=1",
+    ], (
+        "the batch has to carry the exit code, the reason, the running total and "
+        "the total of this failure class"
+    )
     assert batch.edge_filter_reasons == ["collection-error"], (
         "an error-only batch must not be reported as a health summary"
     )

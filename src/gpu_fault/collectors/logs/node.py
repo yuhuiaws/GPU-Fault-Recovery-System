@@ -5,7 +5,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import shutil
 import subprocess
 import threading
@@ -31,7 +30,13 @@ from gpu_fault.collectors.sinks import EventSink, deliver_event
 from gpu_fault.host_health import NodeLogBatch, NodeLogEntry
 from gpu_fault.log_rules import log_signal_priority, matching_log_rules
 from .node_io import TrainingReadWorker, journal_lines
-from .node_state import decode_pending, save_state
+from .node_journal import (
+    CURSOR_DROPPING_FAILURES,
+    PeriodicReport,
+    journal_command,
+    journalctl_failure_class,
+)
+from .node_state import load_state, save_state
 from .node_records import journal_fields
 
 LOGGER = logging.getLogger(__name__)
@@ -101,36 +106,6 @@ def _stderr_detail(stderr: str | None) -> str:
 
 def _entry_size(entry: NodeLogEntry) -> int:
     return len(entry.model_dump_json().encode("utf-8"))
-
-
-def _decode_files(stored: dict[str, Any]) -> dict[str, dict[str, int]]:
-    """Reads both the offset-only and the file-identity state form.
-
-    An agent that is already running has `{path: offset}` on disk under the
-    old key, and it keeps it: rejecting that would send the collector back to
-    `initial_tail_bytes` on the upgrade, which at the default of 0 means
-    skipping every line written since the last poll. A legacy record is kept
-    without a device or inode rather than with a placeholder, so the first
-    poll afterwards adopts the file it finds instead of reporting that every
-    training log rotated.
-    """
-
-    if not isinstance(stored, dict):
-        raise ValueError("node log file checkpoints must be an object")
-    files: dict[str, dict[str, int]] = {}
-    for key, item in stored.items():
-        record = (
-            {
-                "device": int(item.get("device", 0)),
-                "inode": int(item.get("inode", 0)),
-                "offset": int(item.get("offset", 0)),
-            }
-            if isinstance(item, dict)
-            else {"offset": int(item)}
-        )
-        if record["offset"] >= 0:
-            files[str(key)] = record
-    return files
 
 
 def _with_context(
@@ -205,27 +180,6 @@ def _limit_entries(
     return sorted(selected, key=lambda entry: entry.observed_at)
 
 
-def _journal_command(
-    since: datetime, until: datetime, cursor: str | None = None
-) -> list[str]:
-    return [
-        "journalctl",
-        "--since",
-        f"@{since.timestamp()}",
-        "--until",
-        f"@{until.timestamp()}",
-        "--output=json",
-        # Without --all journald replaces any field over 4096 bytes with a
-        # null value, so a long driver line arrived as MESSAGE: null, became
-        # "", matched no rule and was dropped without a trace -- and the long
-        # lines are the ones this collector exists to catch. The collector
-        # bounds entries itself (`max_entry_bytes`).
-        "--all",
-        "--no-pager",
-        *([f"--after-cursor={cursor}"] if cursor else []),
-    ]
-
-
 def _budget_error(
     budget: _ScanBudget, since: datetime, until: datetime, *, kept: int
 ) -> str:
@@ -233,8 +187,9 @@ def _budget_error(
     if budget.stop_reason == "entries":
         # `--lines=N` used to make journalctl hand back the newest N of the
         # window and the cursor then jumped past everything older, which is
-        # loss that looked like a quiet node. The boundary entry is read
-        # again next poll and de-duplicated by its cursor id.
+        # loss that looked like a quiet node. The next poll resumes after the
+        # last entry read (`--after-cursor`); only the time-window fallback
+        # reads the boundary entry again, under the same cursor id.
         return (
             f"{window} filled the batch, read the oldest {kept} entries and "
             "left the rest for the next poll"
@@ -372,6 +327,9 @@ class NodeLogCollector:
         self.self_unit_entries_total = 0
         self._journal_timed_out = False
         self._cold_start_reason: str | None = "no state was loaded"
+        # What the periodic batch owes about the quiet polls in between, and
+        # whether this node's journalctl refused to be positioned by cursor.
+        self._report = PeriodicReport()
         self.state_path = Path(state_path) if state_path else None
         self.initial_tail_bytes = (
             initial_tail_bytes
@@ -525,12 +483,12 @@ class NodeLogCollector:
         except Exception:
             self._restore(snapshot)
             raise
-        errors = self._batch_errors()
         # One periodic slot carries whichever of the two an empty batch means: a
         # health summary when nothing failed, the collection errors when
         # something did. Both are reported on the same schedule so a node whose
         # journalctl is broken does not post every interval.
         periodic_due = not entries and collected_at >= self._next_health_summary
+        errors = self._batch_errors(self._report.lines() if periodic_due else [])
         health_summary = periodic_due and not errors
         batch = NodeLogBatch(
             batch_id=f"logs-{self.node_id}-{int(collected_at.timestamp() * 1_000_000)}",
@@ -582,6 +540,7 @@ class NodeLogCollector:
                 self._journal_since = journal.consumed_until
                 self._journal_cursor = journal.cursor or self._journal_cursor
             self._save_state()
+            self._report.settle(errors, periodic=periodic_due, entries=len(entries))
         except Exception:
             self._restore(snapshot)
             raise
@@ -686,7 +645,7 @@ class NodeLogCollector:
         if amount > 0:
             self._discarded[reason] = self._discarded.get(reason, 0) + amount
 
-    def _batch_errors(self) -> list[str]:
+    def _batch_errors(self, periodic: list[str] | None = None) -> list[str]:
         """What this batch reports it could not read.
 
         The running totals are attached only to a batch that already carries a
@@ -695,10 +654,13 @@ class NodeLogCollector:
         ``last_success_at``, and the node lands in
         ``gpu_fault_collector_erroring_nodes`` -- so a summary on every batch
         would pin the node in that count forever and there would be nothing left
-        that could clear it.
+        that could clear it. ``periodic`` is what the periodic report adds about
+        the quiet polls since the last one (``PeriodicReport.lines``): it is
+        bounded to that period, so a clean period clears the node again. A line
+        the poll itself already produced is not repeated.
         """
 
-        errors = list(self._collection_errors)
+        errors = list(dict.fromkeys([*self._collection_errors, *(periodic or [])]))
         if self._suppressed_errors:
             errors.append(
                 f"{self._suppressed_errors} further collection errors suppressed "
@@ -814,7 +776,7 @@ class NodeLogCollector:
             self._journal_cursor = None
         self._journal_timed_out = False
         child = self.runner(
-            _journal_command(since, until, self._journal_cursor),
+            journal_command(since, until, self._journal_cursor),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -882,18 +844,15 @@ class NodeLogCollector:
             # Whatever it printed before failing is still worth posting, but the
             # window was not read: leaving `consumed_until` unset holds the cursor
             # so the next poll asks for the same span instead of stepping over it.
-            errors.append(
-                f"journalctl exited {scan.returncode}: {_stderr_detail(scan.stderr)}"
-            )
+            failure = journalctl_failure_class(scan.returncode, scan.stderr)
+            detail = _stderr_detail(scan.stderr)
+            errors.append(f"journalctl exited {scan.returncode}: {detail}")
             self._record_discard("journalctl-failures")
+            self._record_discard(f"journalctl-failures-{failure}")
             consumed_until = None
-            if self._journal_cursor and re.search(
-                r"cursor|seek", scan.stderr, re.IGNORECASE
-            ):
+            if self._journal_cursor and failure in CURSOR_DROPPING_FAILURES:
                 self._journal_cursor = None
-                errors.append(
-                    "journal cursor unavailable; next poll replays timestamp window"
-                )
+                errors.append(self._report.cursor_dropped(failure, detail, until))
         else:
             if scan.stderr.strip():
                 # A zero exit read the window, so the cursor may advance; the
@@ -918,7 +877,7 @@ class NodeLogCollector:
             errors,
             consumed_until=consumed_until,
             bytes_read=budget.bytes_read,
-            cursor=scan.cursor,
+            cursor=self._report.resume_cursor(scan.cursor),
         )
 
     def _scan_journal(
@@ -1041,46 +1000,17 @@ class NodeLogCollector:
         return str(value or "")
 
     def _load_state(self) -> None:
-        if self.state_path is None:
-            self._cold_start_reason = "this collector keeps no state file"
-            return
-        if not self.state_path.exists():
-            self._cold_start_reason = f"no state file at {self.state_path}"
-            return
-        try:
-            value = json.loads(self.state_path.read_text())
-            if not isinstance(value, dict):
-                raise ValueError("node log collector state must be an object")
-            since = value.get("journal_since")
-            self._journal_since = datetime.fromisoformat(since) if since else None
-            cursor = value.get("journal_cursor")
-            self._journal_cursor = (
-                cursor if isinstance(cursor, str) and cursor else None
-            )
-            self._cold_start_reason = (
-                None
-                if self._journal_since is not None
-                else "the state file held no journal cursor"
-            )
-            self._training.files = _decode_files(
-                value.get("training_log_files")
-                or value.get("training_log_offsets")
-                or {}
-            )
-            resume_after = value.get("training_log_resume_after")
-            self._training.resume_after = str(resume_after) if resume_after else None
-            pending = value.get("training_log_pending", {})
-            self._training.pending = decode_pending(
-                pending, self._training.files, self.max_entry_bytes
-            )
-        except (OSError, ValueError, TypeError, KeyError, AttributeError):
-            LOGGER.exception("cannot load node log collector state")
-            self._journal_since = None
-            self._journal_cursor = None
-            self._training.files = {}
-            self._training.pending = {}
-            self._training.resume_after = None
-            self._cold_start_reason = "the state file could not be read"
+        """Take the positions the state file proves (``node_state.load_state``)."""
+
+        loaded = load_state(
+            self.state_path, boot_id=self.boot_id, max_entry_bytes=self.max_entry_bytes
+        )
+        self._journal_since = loaded.journal_since
+        self._journal_cursor = loaded.journal_cursor
+        self._cold_start_reason = loaded.cold_start_reason
+        self._training.files = loaded.files
+        self._training.pending = loaded.pending
+        self._training.resume_after = loaded.resume_after
 
     def _save_state(self) -> None:
         """Write the cursor and the offsets so a crash cannot lose them.
@@ -1100,6 +1030,9 @@ class NodeLogCollector:
                     self._journal_since.isoformat() if self._journal_since else None
                 ),
                 "journal_cursor": self._journal_cursor,
+                # The boot the cursor was read in: only that boot resumes from
+                # it (`node_state.resumable_cursor`).
+                "boot_id": self.boot_id,
                 "training_log_pending": self._training.pending,
                 # A new key, because the value shape changed: an agent
                 # rolled back to the offset-only reader finds no

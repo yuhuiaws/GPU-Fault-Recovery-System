@@ -3502,6 +3502,24 @@ a reading of 0 means that release declared none. Every metric family on the dash
 - **First check**: read the channel's `errors` field in `GET /v1/collector-status/{cluster_id}`,
   which is the reason the node itself wrote (for example a journalctl exit code, training log rotation, an abandoned time window); then look at
   the collector's journal on the node.
+- **`journalctl exited <code>: <stderr>` on the NODE_LOGS channel**: the `cumulative loss since
+  collector start` line counts by class, `journalctl-failures-<class>=<n>`, after the total
+  `journalctl-failures=<n>`; read it with the table below. A quiet poll is not posted, so its failures are
+  carried by the next periodic report as `N of the M polls since the last periodic report ended in
+  collection errors that were not posted; last: …` -- the failures that never reached the control plane
+  between two reports, which is why an intermittent fault (every other poll failing) stays erroring until a
+  clean period; while that line is present the node has not recovered. The collector passes exactly one
+  positioning option per `journalctl` call (Detailed Design §2.5); `Please specify only one of --since=,
+  --cursor=, and --after-cursor=.` must not appear on a fixed release.
+
+  | `collection_errors` fragment | Meaning | Action |
+  |---|---|---|
+  | `journalctl-failures-refused-arguments` | The node's journalctl refused the argv itself (`Please specify only one of …`, `--since= must be before --until=.`, `unrecognized option`); nothing was read this poll | Product defect or a node clock that stepped back. After a refusal while positioned by cursor the collector reads by time window for the life of the process and repeats `journalctl refused the cursor arguments at …` on every periodic report: restart `gpu-fault-log-collector.service` once the fix is released; for a clock step wait until the clock passes `journal_since` -- the cursor holds, no gap |
+  | `journalctl-failures-cursor-rejected` | `Failed to seek to cursor`: the saved cursor could not be parsed | Self-healing: the next poll re-reads the time window from `journal_since`, no gap, the boundary entry may repeat once (same entry id); if it keeps appearing the state file `/var/lib/gpu-fault/log-collector-state.json` is being rewritten from outside |
+  | `journalctl-failures-permission-denied` | `Permission denied` / `Operation not permitted`: the unit cannot read the journal | Check the unit's `SupplementaryGroups=systemd-journal` (node unit table, Detailed Design v2) and the `/var/log/journal` permissions; the cursor holds, no gap once fixed |
+  | `journalctl-failures-journal-unavailable` | `No journal files were found` / `Failed to open journal`: journald is not running or the journal directory is unreadable | `systemctl status systemd-journald`, disk space; the cursor holds |
+  | `journalctl-failures-killed` | The `journalctl` child was ended by a signal (the collector's own 30 s read timeout is counted separately as `journal-read-timeouts`) | Look at the node's OOM records and `dmesg` |
+  | `journalctl-failures-other` | Any other stderr | Read the stderr text after `journalctl exited …:` in the same batch |
 - **Boundary**: the only way this alert self-heals is the node really delivering successfully once -- do not change thresholds, do not delete
   `collector_status` records. Repair entry points REG-6, REG-14.5.
 - **Relation to incidents**: the control plane books GPU_METRICS error batches as the node-level WARNING

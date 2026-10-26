@@ -171,9 +171,11 @@ def test_node_log_collector_advances_the_cursor_when_the_batch_is_buffered(
 
     collector.collect_once()
 
-    since = calls[-1][calls[-1].index("--since") + 1]
-    assert since == f"@{NOW.timestamp()}", (
-        "the next poll re-read the window the outbox already took"
+    assert "--after-cursor=c-1" in calls[-1], (
+        f"the next poll must resume after the entry the outbox took: {calls[-1]}"
+    )
+    assert "--since" not in calls[-1], (
+        f"a resumed poll is positioned by the cursor alone: {calls[-1]}"
     )
 
 

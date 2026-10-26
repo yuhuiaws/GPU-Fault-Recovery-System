@@ -226,7 +226,8 @@ def test_the_collectors_own_journal_lines_are_not_counted_as_loss(
 
     assert batch.entries == [], "the collector's own line is not node evidence"
     assert batch.collection_errors[-1] == (
-        "cumulative loss since collector start: journalctl-failures=1"
+        "cumulative loss since collector start: journalctl-failures=1, "
+        "journalctl-failures-journal-unavailable=1"
     ), f"an excluded unit is not loss: {batch.collection_errors}"
     assert collector.self_unit_entries_total == 1, (
         "the exclusions still need a count of their own, separate from loss"

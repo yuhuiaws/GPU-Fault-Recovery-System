@@ -1190,6 +1190,39 @@ collector process. The log collectors (kernel, Fabric Manager) additionally repo
 "collection is dead" even during event-free periods. The systemd units enabled by default on each node, the cluster-level replica counts and the items disabled by default are listed in the production-status column of High-Level Design
 §4.2.
 
+**NodeLogCollector journal positioning and failure reporting** (`collectors/logs/node_journal.py`,
+`node_state.py`). Every `journalctl` invocation carries exactly one positioning option: with a cursor held,
+`--after-cursor=<cursor> --until=@<now>` (resume; the cursor is the last entry read, nothing after it is
+skipped and the entry itself is not read again -- several entries within one microsecond resume correctly,
+which a time window cannot do); without one, `--since=@<since> --until=@<now>` (time window: the first read
+starts at the five-minute default and reports it as a gap; after the 900 s window cap; when the state file's
+cursor belongs to another boot -- the state file records `boot_id` next to the cursor and only the boot that
+saved it resumes from it (`node_state.resumable_cursor`); after journalctl could not seek to the cursor;
+after journalctl refused the cursor arguments). The window's `since` is where the last complete read ended
+(the time of the last entry taken when a budget stopped the read), so nothing is skipped; the entry on the
+boundary can be read twice but keeps its `__CURSOR` as `entry_id`, and the control plane keys the log event by
+(cluster, node, entry_id) (`log_recovery_context.log_event_id`), so a repeat is not a second event. The two
+positioning options cannot be combined: in systemd v252 (the version on AL2023 nodes) `parse_argv` in
+`src/journal/journalctl.c` exits before reading anything with
+`Please specify only one of --since=, --cursor=, and --after-cursor=.`
+(<https://github.com/systemd/systemd/blob/v252/src/journal/journalctl.c>; reproduced on systemd 255, exit
+status 1; in v257 the same check also counts `--cursor-file=`); `--until` is not part of that check; the meaning of `--after-cursor=` is in journalctl(1)
+(<https://www.freedesktop.org/software/systemd/man/latest/journalctl.html#--after-cursor=>). Before the fix
+the collector passed both as soon as it knew a cursor: every resumed poll was refused, the refusal mentions
+"cursor" and was taken for a lost cursor, which dropped the cursor, so every other poll read nothing, and the
+control plane saw it only when the periodic slot happened to land on a refused poll (`journalctl-failures=17`
+in a collector status). The cursor string itself is never parsed -- sd_journal_get_cursor(3): "The cursor
+string should be considered opaque and not be parsed by clients."
+(<https://www.freedesktop.org/software/systemd/man/latest/sd_journal_get_cursor.html>). Failure visibility:
+a non-zero exit is counted by stderr class under `journalctl-failures-<class>` (`refused-arguments`,
+`cursor-rejected`, `permission-denied`, `journal-unavailable`, `killed`, `other`) next to the total
+`journalctl-failures` in the `cumulative loss since collector start` line; a quiet poll is not posted, so
+its failures are carried by the next periodic report (`PeriodicReport`) as `N of the M polls since the last
+periodic report ended in collection errors that were not posted; last: …`, which keeps an intermittently
+failing node erroring for `GpuFaultCollectorCollectionErrors` until a clean period; a node whose journalctl
+refused cursor positioning reads by time window for the life of the process and repeats that on every
+periodic report until it is restarted with a fix.
+
 The `gpu_fault.collector_sinks` entry point registers two sinks: `http` (`HttpEventSink`) and
 `sqs` (`SqsEventSink`). The public CollectorContext fields include cluster, profile, GPU
 product, driver, CUDA, workload and checkpoint.

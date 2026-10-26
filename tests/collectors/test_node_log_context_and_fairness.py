@@ -354,12 +354,14 @@ def test_the_running_totals_stay_off_a_healthy_batch(tmp_path, monkeypatch) -> N
     clock[0] = NOW + timedelta(seconds=800)
     third = collector.collect_once()
 
-    assert first.collection_errors[-1].endswith("journalctl-failures=1"), (
-        f"the first failure starts the total: {first.collection_errors}"
-    )
-    assert second.collection_errors[-1].endswith("journalctl-failures=2"), (
-        "the total is what distinguishes one bad poll from a node that is down"
-    )
+    assert first.collection_errors[-1] == (
+        "cumulative loss since collector start: journalctl-failures=1, "
+        "journalctl-failures-journal-unavailable=1"
+    ), f"the first failure starts the total: {first.collection_errors}"
+    assert second.collection_errors[-1] == (
+        "cumulative loss since collector start: journalctl-failures=2, "
+        "journalctl-failures-journal-unavailable=2"
+    ), "the total is what distinguishes one bad poll from a node that is down"
     assert third.collection_errors == [], (
         "a poll that read its window reports nothing, so the node stops counting "
         "as erroring"
