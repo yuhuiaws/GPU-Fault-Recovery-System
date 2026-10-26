@@ -2044,6 +2044,19 @@ test pins the signature of each registered hook, after the 017 application-log
 hooks still took one argument and five variants ended NO_EVIDENCE on
 2026-10-26 with a `TypeError` before any evidence existed.
 
+The 016/017 journal replays write a synthetic cursor that carries the run id
+(`gfrs-replay-<run>-<index>-<boot>`). The cursor is the collector's entry id and
+the control plane derives an incident's event id from (cluster, node, entry id),
+so a cursor reused on the same node and boot merged a later run's finding into
+the earlier run's incident -- created before the run began, hence unreadable by
+the grade -- and 016 `kernel_lockup` / `rdma_fatal` and 017 `cgroup_oom` ended
+"no severe kernel-log finding reached a NODE_HEALTH incident" on 2026-10-26
+without a product defect. Their reviewed lines now follow the kernel's real
+print formats (Linux v6.12): the `kernel/watchdog.c` soft-lockup line, the EFA
+`efa_com.c` completion timeout through the `__ibdev_printk` prefix and the
+`mm/oom_kill.c` "Memory cgroup out of memory: Killed process" line without a
+`kernel:` tag, so the rules are exercised on what a node really logs.
+
 011 `fr_enabled` (the Flight Recorder configured as the operations manual
 prescribes: trace buffer, pipe, dump-file prefix and dump-on-timeout; at least
 one PID must show two real dumps as `PAIRED`) is registered as an expected FAIL
