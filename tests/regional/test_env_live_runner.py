@@ -348,7 +348,15 @@ def test_plan_details_builds_for_every_case(number: int) -> None:
     case_id = f"GF-ENV-LIVE-{number:03d}"
     details = runner.plan_details(_settings(case_id), _preflight())
     assert details["case_id"] == case_id
-    assert details["proxy_mechanism"]["max_window_seconds"] == 600
+    # 009's window carries its recount hold (two polling rounds, 120 s at the
+    # default cadence): the proxy window and the collector deadman grow by it.
+    assert details["proxy_mechanism"]["max_window_seconds"] == 600 + (
+        120 if number == 9 else 0
+    )
+    assert (
+        details["rollback"]["replay_window_max_seconds"]
+        == (details["proxy_mechanism"]["max_window_seconds"])
+    )
     assert isinstance(details["replay_plans"], dict), details
     # Temperature / brake / duration / unknown / interruption cases arm a plan.
     if number in {3, 4, 5, 6, 7, 8, 9}:

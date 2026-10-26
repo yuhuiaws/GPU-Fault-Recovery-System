@@ -11,6 +11,7 @@ the ones ``general_live_gpu_store.GPU_STATE_PROBE``,
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -45,6 +46,44 @@ def iso(moment: datetime) -> str:
     return moment.isoformat()
 
 
+@dataclass
+class _Pause:
+    """One scheduled read-synchronous pause of the 009 world (gap or hold)."""
+
+    target: int | None = None
+    scheduled_at: datetime | None = None
+    paused_at: datetime | None = None
+    resumed_at: datetime | None = None
+    timed_out: bool = False
+    waiter_dead: bool = False
+
+
+def _pause_record(pause: _Pause | None, label: str, now: datetime) -> dict[str, Any]:
+    """The probe's pause record for one label, with its waiter's state."""
+
+    if pause is None:
+        return {"waiter": {"ActiveState": "inactive"}}
+    record: dict[str, Any] = {
+        "run_id": "r1",
+        "label": label,
+        "target_reads": pause.target,
+        "scheduled_at": iso(pause.scheduled_at or now),
+    }
+    if pause.paused_at is not None:
+        record.update(
+            paused_at=iso(pause.paused_at), reads_at_pause=pause.target, missed=False
+        )
+    if pause.resumed_at is not None:
+        record["resumed_at"] = iso(pause.resumed_at)
+    if pause.timed_out:
+        record["timed_out_at"] = iso(now)
+    waiting = pause.paused_at is None and not pause.timed_out
+    record["waiter"] = {
+        "ActiveState": "active" if waiting and not pause.waiter_dead else "inactive"
+    }
+    return record
+
+
 class World:
     """Fake time, proxy and store; events fire at offsets from the arm."""
 
@@ -62,7 +101,14 @@ class World:
         self.endpoint: str | None = PROXY
         self.events: list[tuple[float, Callable[[World], None]]] = []
         self.latest: dict[str, dict[str, Any]] = {}
+        #: Every finding recorded, by id; ``history`` is the subset the product
+        #: would keep durably (``gpu_finding_history``: the first finding of a
+        #: GPU/field key or a severity / automatic-action change), ``state`` the
+        #: current finding per key (``gpu_finding_state``), ``active`` the ids
+        #: the ``active_findings`` read lists.
         self.findings: dict[str, dict[str, Any]] = {}
+        self.history: dict[str, dict[str, Any]] = {}
+        self.state: dict[tuple[str, str], str] = {}
         self.active: set[str] = set()
         self.batches: list[dict[str, Any]] = []
         self.collector_errors: list[str] = []
@@ -80,13 +126,20 @@ class World:
         }
         self.sleeps: list[float] = []
         self.polls = 0
-        # GF-ENV-LIVE-009: the scheduled read-synchronous pause and the restart.
-        self.pause_target: int | None = None
-        self.pause_scheduled_at: datetime | None = None
-        self.paused_at: datetime | None = None
-        self.resumed_at: datetime | None = None
+        #: What one remote read of the runner costs (a ``kubectl exec`` live:
+        #: 6-8 s); zero keeps the reads instantaneous. A poll's reads advance
+        #: the clock by it, so a polling round is the sleep plus the reads --
+        #: the live cadence that missed the 15 s regrade state of 009.
+        self.read_latency_seconds = 0.0
+        # GF-ENV-LIVE-009: the scheduled read-synchronous pauses (the gap pause
+        # under "", the recount hold under its label) and the restart.
+        self.pauses: dict[str, _Pause] = {}
         self.pause_timed_out = False
         self.waiter_dead = False
+        self.hold_timed_out = False
+        self.hold_waiter_dead = False
+        #: ``pause-collector --label hold`` refused by the node.
+        self.hold_schedule_fails = False
         self.restart_at: datetime | None = None
         self.restart_events: list[tuple[float, Callable[[World], None]]] = []
         self.read_events: list[tuple[int, Callable[[World], None]]] = []
@@ -136,6 +189,45 @@ class World:
     def sleep(self, seconds: float) -> None:
         self.sleeps.append(seconds)
         self.now += timedelta(seconds=seconds)
+
+    def latency(self) -> None:
+        """One remote read of the runner costs ``read_latency_seconds``."""
+
+        if self.read_latency_seconds:
+            self.now += timedelta(seconds=self.read_latency_seconds)
+
+    def _remote_read(self) -> None:
+        """A store or Node read: its latency, then the product's events."""
+
+        self.latency()
+        self._fire()
+
+    # -- 009 pauses (legacy single-pause view: the gap pause) ------------------ #
+    @property
+    def pause_target(self) -> int | None:
+        return self.pauses[""].target if "" in self.pauses else None
+
+    @property
+    def paused_at(self) -> datetime | None:
+        return self.pauses[""].paused_at if "" in self.pauses else None
+
+    @property
+    def resumed_at(self) -> datetime | None:
+        return self.pauses[""].resumed_at if "" in self.pauses else None
+
+    @property
+    def hold(self) -> _Pause | None:
+        return self.pauses.get("hold")
+
+    def _inside_pause(self, tick: datetime) -> bool:
+        """A collector tick no pause lets through (the unit is SIGSTOPped)."""
+
+        return any(
+            pause.paused_at is not None
+            and tick > pause.paused_at
+            and (pause.resumed_at is None or tick < pause.resumed_at)
+            for pause in self.pauses.values()
+        )
 
     def at(self, offset: float, action: Callable[[World], None]) -> World:
         self.events.append((offset, action))
@@ -211,21 +303,20 @@ class World:
             if tick > self.now:
                 break
             k += 1
-            if (
-                self.paused_at is not None
-                and tick > self.paused_at
-                and (self.resumed_at is None or tick < self.resumed_at)
-            ):
+            if self._inside_pause(tick):
                 continue
             count += 1
-            if (
-                self.pause_target is not None
-                and self.paused_at is None
-                and not self.pause_timed_out
-                and not self.waiter_dead
-                and count >= self.pause_target
-            ):
-                self.paused_at = tick + timedelta(milliseconds=250)
+            for pause in self.pauses.values():
+                if (
+                    pause.target is not None
+                    and pause.paused_at is None
+                    and not pause.timed_out
+                    and not pause.waiter_dead
+                    and count >= pause.target
+                ):
+                    # The waiter's SIGSTOP: a quarter second after the read
+                    # (its /status poll; the live probe adds a settle).
+                    pause.paused_at = tick + timedelta(milliseconds=250)
         if self.reads_frozen_at is not None:
             count = min(count, self.reads_frozen_at)
         return count
@@ -239,11 +330,7 @@ class World:
         while True:
             tick = self.repoint_at + timedelta(seconds=k * self.interval)
             k += 1
-            if (
-                self.paused_at is not None
-                and tick > self.paused_at
-                and (self.resumed_at is None or tick < self.resumed_at)
-            ):
+            if self._inside_pause(tick):
                 continue
             count += 1
             if count == target:
@@ -348,55 +435,56 @@ class World:
             self.reads_frozen_at = self.reads_at_arm
         return {"run_id": "r1", "armed": True, "status": self.status()["status"]}
 
-    # -- 009: pause / resume / restart ------------------------------------- #
+    # -- 009: pause / hold / resume / restart ------------------------------- #
     def pause_collector(self, **options: Any) -> dict[str, Any]:
-        self.pause_target = int(options["after_reads"])
-        self.pause_scheduled_at = self.now
+        """``pause-collector``: the gap pause (no label) or the recount hold."""
+
+        label = str(options.get("label") or "")
+        if label and self.hold_schedule_fails:
+            raise RuntimeError(f"pause-collector[{label}] refused by the node")
+        pause = _Pause(
+            target=int(options["after_reads"]),
+            scheduled_at=self.now,
+            timed_out=self.hold_timed_out if label else self.pause_timed_out,
+            waiter_dead=self.hold_waiter_dead if label else self.waiter_dead,
+        )
+        self.pauses[label] = pause
         return {
             "run_id": "r1",
-            "target_reads": self.pause_target,
-            "waiter": {"ActiveState": "inactive" if self.waiter_dead else "active"},
+            "label": label,
+            "target_reads": pause.target,
+            "waiter": {"ActiveState": "inactive" if pause.waiter_dead else "active"},
             "status": self.status()["status"],
         }
 
     def pause_status(self) -> dict[str, Any]:
-        self._fire()
-        record: dict[str, Any] = {}
-        if self.pause_target is not None:
-            record = {
-                "run_id": "r1",
-                "target_reads": self.pause_target,
-                "scheduled_at": iso(self.pause_scheduled_at or self.now),
-            }
-        if self.paused_at is not None:
-            record.update(
-                paused_at=iso(self.paused_at),
-                reads_at_pause=self.pause_target,
-                missed=False,
-            )
-        if self.resumed_at is not None:
-            record["resumed_at"] = iso(self.resumed_at)
-        if self.pause_timed_out:
-            record["timed_out_at"] = iso(self.now)
-        waiting = self.pause_target is not None and self.paused_at is None
+        self._remote_read()
+        records = {
+            label: _pause_record(pause, label, self.now)
+            for label, pause in self.pauses.items()
+        }
+        gap = records.get("") or _pause_record(None, "", self.now)
         return {
             "run_id": "r1",
-            "pause": record,
-            "stopped": self.paused_at is not None and self.resumed_at is None,
-            "waiter": {
-                "ActiveState": "active"
-                if waiting and not self.pause_timed_out and not self.waiter_dead
-                else "inactive"
-            },
+            "pause": {key: value for key, value in gap.items() if key != "waiter"},
+            "stopped": any(
+                pause.paused_at is not None and pause.resumed_at is None
+                for pause in self.pauses.values()
+            ),
+            "waiter": gap["waiter"],
+            "pauses": records,
             "effective_endpoint": self.endpoint,
         }
 
-    def resume_collector(self) -> dict[str, Any]:
-        self.resumed_at = self.now
+    def resume_collector(self, label: str = "") -> dict[str, Any]:
+        pause = self.pauses.get(label)
+        if pause is not None and pause.resumed_at is None:
+            pause.resumed_at = self.now
         return {
             "run_id": "r1",
+            "label": label,
             "stopped": False,
-            "pause": {"resumed_at": iso(self.now)},
+            "pause": {"label": label, "resumed_at": iso(self.now)},
         }
 
     def restart_collector(self) -> dict[str, Any]:
@@ -432,7 +520,7 @@ class World:
 
     # -- product records ---------------------------------------------------- #
     def gpu_state(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
-        self._fire()
+        self._remote_read()
         self.polls += 1
         return {
             "since": iso(self.now),
@@ -442,7 +530,10 @@ class World:
                 for key in sorted(self.active)
                 if key in self.findings
             ],
-            "findings": list(self.findings.values()),
+            # The durable set only: a finding that merely changed its
+            # confirmation count is in ``active_findings`` while it is the
+            # current state and nowhere once a later reading replaced it.
+            "findings": list(self.history.values()),
             "xid_events": [],
             "batches": list(self.batches),
             "collector_statuses": [
@@ -457,7 +548,7 @@ class World:
         }
 
     def activity(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
-        self._fire()
+        self._remote_read()
         return {
             "since": iso(self.now),
             "batches": [],
@@ -473,7 +564,7 @@ class World:
         }
 
     def node_snapshot(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
-        self._fire()
+        self._remote_read()
         return {**self.node, "taints": list(self.node["taints"])}
 
     # -- builders ----------------------------------------------------------- #
@@ -559,16 +650,30 @@ class World:
         active: bool = True,
         gpu: str = GPU,
         reason: str = "",
+        history: bool | None = None,
     ) -> None:
-        self.findings[finding_id] = {
+        """A finding the product graded now.
+
+        ``history`` defaults to the product's own rule (``store.update_gpu_
+        findings``): the ``gpu_finding_history`` row is written only when the
+        finding *activates* -- the first finding of its GPU/field key, or a
+        severity or automatic-action change against the key's current state.
+        A confirmation-count change alone (1/3 -> 2/3, or the post-gap 2/3 ->
+        1/3 regrade) replaces the current state and leaves no durable row. An
+        active finding replaces the key's previous one as the current state.
+        """
+
+        automatic_action = action or (
+            "DRAIN" if severity == "CRITICAL" else "RUN_DIAGNOSTICS"
+        )
+        finding = {
             "finding_id": finding_id,
             "canonical_name": name,
             "severity": severity,
             "value": value,
             "gpu_uuid": gpu,
             "observed_at": iso(observed_at),
-            "automatic_action": action
-            or ("DRAIN" if severity == "CRITICAL" else "RUN_DIAGNOSTICS"),
+            "automatic_action": automatic_action,
             "official_action": None,
             "policy_source": policy,
             "threshold_source": source,
@@ -579,7 +684,21 @@ class World:
             "finding_kind": "METRIC",
             "affected_gpu_uuids": [],
         }
+        key = (gpu, name)
+        previous = self.findings.get(self.state.get(key, ""))
+        if history is None:
+            history = (
+                previous is None
+                or previous["severity"] != severity
+                or previous["automatic_action"] != automatic_action
+            )
+        self.findings[finding_id] = finding
+        if history:
+            self.history[finding_id] = finding
         if active:
+            if previous is not None and previous["finding_id"] != finding_id:
+                self.active.discard(previous["finding_id"])
+            self.state[key] = finding_id
             self.active.add(finding_id)
 
     def finding(
@@ -941,6 +1060,9 @@ class WorldController:
 
     def status(self, **options: Any) -> dict[str, Any]:
         self.calls.append("status")
+        # A proxy read costs the runner the same exec, but fires no product
+        # event (the proxy is not the product).
+        self.world.latency()
         return self.world.status()
 
     def snapshot(self) -> dict[str, Any]:
@@ -952,15 +1074,19 @@ class WorldController:
         return self.world.arm()
 
     def pause_collector(self, **options: Any) -> dict[str, Any]:
-        self.calls.append("pause_collector")
+        label = str(options.get("label") or "")
+        self.calls.append(f"pause_collector:{label}" if label else "pause_collector")
         return self.world.pause_collector(**options)
 
     def pause_status(self) -> dict[str, Any]:
         self.calls.append("pause_status")
         return self.world.pause_status()
 
-    def resume_collector(self) -> dict[str, Any]:
-        self.calls.append("resume_collector")
+    def resume_collector(self, **options: Any) -> dict[str, Any]:
+        label = str(options.get("label") or "")
+        self.calls.append(f"resume_collector:{label}" if label else "resume_collector")
+        if label:
+            return self.world.resume_collector(label=label)
         return self.world.resume_collector()
 
     def restart_collector(self) -> dict[str, Any]:

@@ -94,6 +94,15 @@ CLEANUP_MARGIN_SECONDS = 90.0
 READ_GRACE_SECONDS = 30.0
 MIN_POLL_SECONDS = 10.0
 MAX_POLL_SECONDS = 30.0
+#: The remote reads of one poll -- the proxy status, gpu_state, activity, the
+#: Node and the judge's extra read, each a ``kubectl exec`` -- as the live runs
+#: cost them: GF-ENV-LIVE-009 (plain EKS, 2026-10-26) spent 31 s on its five
+#: reads and 41 s when a maintenance step ran in the same round, so one polling
+#: round is ``poll_seconds`` plus this (46-56 s live), not the 15 s sleep. A
+#: product state that lives for one collector interval (15 s) is not something
+#: such a round can be relied on to see; the 009 recount hold
+#: (``env_live_expectations.recount_hold_seconds``) is sized from it.
+POLL_READ_BUDGET_SECONDS = 45.0
 TIMELINE_LIMIT = 80
 READ_ERROR_LIMIT = 20
 
@@ -166,6 +175,12 @@ class CollectorCadence:
     @property
     def poll_seconds(self) -> float:
         return min(MAX_POLL_SECONDS, max(MIN_POLL_SECONDS, self.interval_seconds))
+
+    @property
+    def polling_round_seconds(self) -> float:
+        """One poll of :func:`watch`: its sleep plus its remote reads."""
+
+        return self.poll_seconds + POLL_READ_BUDGET_SECONDS
 
     @property
     def max_interval_seconds(self) -> float:
@@ -821,6 +836,7 @@ __all__ = [
     "Judgement",
     "ObservationWindow",
     "PASSTHROUGH_READS",
+    "POLL_READ_BUDGET_SECONDS",
     "PROCESSING_MARGIN_SECONDS",
     "ReplayProgress",
     "STARTUP_JITTER_SECONDS",

@@ -26,8 +26,11 @@ node and the reason named (``env_live_watch.diagnose_zero_reads``).
 
 GF-ENV-LIVE-009 pauses the metrics collector read-synchronously after two
 severe samples (``probes/env_replay_proxy.py pause-collector``, a deadman
-resumes it), resumes it past the policy's 60 s confirmation gap and restarts
-it once at a normal temperature (``env_live_interruption``). GF-ENV-LIVE-010
+resumes it), resumes it past the policy's 60 s confirmation gap, holds it a
+second time right after the first post-gap read until the judge has read the
+product's regraded finding state (the *recount hold*: that state lives one
+collector interval, far shorter than one poll), and restarts it once at a
+normal temperature (``env_live_interruption``). GF-ENV-LIVE-010
 runs the 004 chain on one GPU of the target node while an independent control
 task runs on the control node (``--node-b``; ``env_live_scope``); without a
 control node it is NOT_RUN. Both run on plain EKS and HyperPod: a host-mode
@@ -41,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 import time
@@ -97,6 +101,19 @@ SLEEP = time.sleep
 #: pause read was due (collector ticks after the arm plus a margin).
 PAUSE_WAIT_EXTRA_READS = 2
 PAUSE_WAIT_MARGIN_SECONDS = 60
+
+
+def window_seconds(expectation: expectations.Expectation) -> int:
+    """The proxy's replay window and the collector deadman for one case.
+
+    ``WINDOW_SECONDS`` plus the 009 recount hold: that hold stops the collector
+    a second time inside the window, and the window's terms grow by the same
+    amount (``env_live_expectations.recount_hold_seconds``).
+    """
+
+    return WINDOW_SECONDS + int(math.ceil(expectation.recount_hold_seconds))
+
+
 #: GF-ENV-LIVE-010 is NOT_RUN without these.
 SCOPE_NEEDS = (
     "GF-ENV-LIVE-010 needs a second GPU test node (--node-b, the site profile's "
@@ -294,6 +311,12 @@ def plan_details(
     number = case_number(case_id)
     not_run = case_id in NOT_RUN_CASES
     replay = {} if not_run else replay_plans_for_case(case_id, preflight)
+    observation = observation_plan(case_id, preflight, replay.get("plans") or {})
+    # 009's window carries its recount hold (the proxy window and the collector
+    # deadman grow by the hold's bound, at the default cadence here).
+    window = WINDOW_SECONDS + int(
+        math.ceil(float((observation or {}).get("recount_hold_seconds") or 0.0))
+    )
     details: dict[str, Any] = {
         "case_id": case_id,
         "risk": "live-non-destructive"
@@ -324,7 +347,7 @@ def plan_details(
                 "exporter Pod where the exporter is a DaemonSet, else (host-mode "
                 "exporter, plain EKS) by a transient host probe that is deleted again"
             ),
-            "max_window_seconds": WINDOW_SECONDS,
+            "max_window_seconds": window,
             "preflight_leftovers": (
                 "the probe preflight lists open replay windows, repoint drop-ins, "
                 "gpu-fault-env-* transient units and the endpoint the collector "
@@ -364,14 +387,14 @@ def plan_details(
             "collector endpoint cannot be restored or a probe resource remains",
         ],
         "rollback": {
-            "collector_repoint_deadman_seconds": WINDOW_SECONDS,
+            "collector_repoint_deadman_seconds": window,
             "runner_restores_endpoint_before_stopping_proxy": True,
             "runner_finally_deletes_probe_resources": True,
-            "replay_window_max_seconds": WINDOW_SECONDS,
+            "replay_window_max_seconds": window,
             "job_restart_after_remediation": False,
         },
         "verdict_if_not_run": "NOT_RUN" if not_run else None,
-        "observation": observation_plan(case_id, preflight, replay.get("plans") or {}),
+        "observation": observation,
         "preflight": preflight,
     }
     if number == 9:
@@ -404,25 +427,44 @@ def plan_details(
     return details
 
 
-def interruption_details(replay_plans: dict[str, Any]) -> dict[str, Any]:
-    """How GF-ENV-LIVE-009 pauses, resumes and restarts the collector."""
+def interruption_details(
+    replay_plans: dict[str, Any],
+    cadence: watch.CollectorCadence | None = None,
+) -> dict[str, Any]:
+    """How GF-ENV-LIVE-009 pauses, holds, resumes and restarts the collector."""
 
     plan = replay_plans.get("core_tlimit/interruption")
     pause_seconds = (
         verdicts.CONFIRMATION_MAX_GAP_SECONDS + expectations.PAUSE_MARGIN_SECONDS
     )
+    pause_after = plans.pause_read_index(plan) if plan else None
+    recount_hold = expectations.recount_hold_seconds(
+        cadence or watch.CollectorCadence()
+    )
     return {
-        "pause_after_reads": plans.pause_read_index(plan) if plan else None,
+        "pause_after_reads": pause_after,
         "pause_seconds": pause_seconds,
         "pause_deadman_seconds": pause_seconds
+        + expectations.PAUSE_DEADMAN_MARGIN_SECONDS,
+        "recount_hold_label": interruption.RECOUNT_HOLD_LABEL,
+        "recount_hold_after_reads": None if pause_after is None else pause_after + 1,
+        "recount_hold_seconds": recount_hold,
+        "recount_hold_deadman_seconds": recount_hold
         + expectations.PAUSE_DEADMAN_MARGIN_SECONDS,
         "mechanism": (
             "env_replay_proxy.py pause-collector: a transient waiter unit on the "
             "node polls the proxy /status and SIGSTOPs gpu-fault-metrics-collector"
-            ".service the moment the pause read is served (the same systemctl kill "
-            "pause as general_live_node_probe unit-pause); a systemd-run deadman "
-            "resumes it; the runner resumes it after the pause and restarts it "
-            "once (restart-collector) after the clear at a normal temperature"
+            ".service once the pause read is served and its batch is posted (the "
+            "same systemctl kill pause as general_live_node_probe unit-pause); a "
+            "systemd-run deadman resumes it; the runner resumes it after the "
+            "pause -- scheduling first, while the unit is still stopped, a second "
+            "labelled pause (the recount hold) one read later, so the product's "
+            "regraded 1/N finding state (a current-state row the clearing read "
+            "replaces; no history, incident or marker records a count change) "
+            "stays readable until the judge has read it -- resumes the hold the "
+            "moment a finding on the post-gap sample is read, and restarts the "
+            "collector once (restart-collector) after the clear at a normal "
+            "temperature"
         ),
         "not_driven": [
             "DCGM -> nvidia-smi source switch (normal installation only)",
@@ -763,11 +805,12 @@ def _run_replay(
         cadence=cadence,
         node=settings.node,
     )
+    window = window_seconds(expectation)
     receipts["deploy"] = controller.deploy_proxy(
         plan_path,
         str(preflight["target_gpu"]["gpu_uuid"]),
         port=PORT,
-        max_seconds=WINDOW_SECONDS,
+        max_seconds=window,
     )
     # What the real exporter delivered before the repoint, and the node as the
     # run found it: the baseline's unchanged-value check and the "isolated by
@@ -782,7 +825,7 @@ def _run_replay(
             receipts["before_error"] = f"{type(exc).__name__}: {exc}"
     receipts["node_before"] = regional.node_snapshot(settings.node)
     repoint_at = fixture.utc_now()
-    receipts["repoint"] = controller.repoint(port=PORT, restore_seconds=WINDOW_SECONDS)
+    receipts["repoint"] = controller.repoint(port=PORT, restore_seconds=window)
     # The receipt's own proof, recorded: the restarted process reads the proxy
     # and the proxy counted its first pass-through read (the controller refused
     # anything less).
@@ -830,6 +873,7 @@ def _run_replay(
         node_before=receipts["node_before"],
         control=control,
         start=start,
+        progress=progress,
     )
     return _observe(
         settings,
@@ -844,6 +888,7 @@ def _run_replay(
         repoint_at=repoint_at,
         maintenance_window_end=maintenance_window_end,
         case_dir=case_dir,
+        window_seconds=window,
     )
 
 
@@ -890,6 +935,55 @@ def _schedule_pause(
     return receipt
 
 
+def _schedule_hold(
+    controller: Any,
+    expectation: expectations.Expectation,
+    progress: watch.ReplayProgress,
+    cadence: watch.CollectorCadence,
+) -> dict[str, Any]:
+    """GF-ENV-LIVE-009: schedule the recount hold right before the gap resume.
+
+    A second labelled pause one read past the gap pause's target: the waiter
+    stops the collector again as soon as it has posted the first post-gap read,
+    so the product's regraded finding state -- a current-state row the next
+    accepted reading overwrites, with no durable record of its own -- stays
+    readable until the judge has read it (bounded by
+    ``recount_hold_seconds``; the deadman adds its margin). The judge calls
+    this while the collector is still stopped by the gap pause, so no read can
+    slip in before the waiter runs; a schedule that comes back without a
+    running waiter is refused here and recorded by the judge, and the resume
+    goes ahead regardless.
+    """
+
+    if progress.start_reads is None:
+        raise PauseNotTaken(
+            "the arm receipt carried no proxy read count; the hold point is unknown"
+        )
+    target = int(progress.start_reads) + int(expectation.pause_after_reads) + 1
+    # The post-gap read follows the resume within one jittered tick (the
+    # collector's sleep expired during the gap); the resume exec itself may
+    # take up to its own timeout.
+    wait = int(
+        PAUSE_WAIT_EXTRA_READS * cadence.max_interval_seconds
+        + PAUSE_WAIT_MARGIN_SECONDS
+    )
+    receipt = controller.pause_collector(
+        after_reads=target,
+        seconds=int(
+            expectation.recount_hold_seconds + expectations.PAUSE_DEADMAN_MARGIN_SECONDS
+        ),
+        wait_seconds=wait,
+        port=PORT,
+        label=interruption.RECOUNT_HOLD_LABEL,
+    )
+    state = str((receipt.get("waiter") or {}).get("ActiveState") or "")
+    if state not in {"active", "activating"}:
+        raise PauseNotTaken(
+            f"the recount hold waiter is not running ({state or 'unknown'})"
+        )
+    return receipt
+
+
 def _judge_and_extra(
     settings: fixture.EnvLiveSettings,
     regional: Any,
@@ -902,16 +996,25 @@ def _judge_and_extra(
     node_before: dict[str, Any] | None,
     control: dict[str, Any],
     start: datetime,
+    progress: watch.ReplayProgress | None = None,
 ) -> tuple[Any, Callable[[], dict[str, Any]] | None]:
     """The case's judge and, for 009 / 010, the poll's fifth read."""
 
     if expectation.kind == "interruption":
+        steps = interruption.InterruptionSteps(
+            resume=controller.resume_collector,
+            restart=controller.restart_collector,
+        )
+        if progress is not None:
+            steps.hold = lambda: _schedule_hold(
+                controller, expectation, progress, cadence
+            )
+            steps.resume_hold = lambda: controller.resume_collector(
+                label=interruption.RECOUNT_HOLD_LABEL
+            )
         judge = interruption.InterruptionJudge(
             expectation,
-            steps=interruption.InterruptionSteps(
-                resume=controller.resume_collector,
-                restart=controller.restart_collector,
-            ),
+            steps=steps,
             interval_seconds=cadence.interval_seconds,
             node_before=node_before,
         )
@@ -961,21 +1064,24 @@ def _observe(
     repoint_at: datetime,
     maintenance_window_end: datetime,
     case_dir: Path,
+    window_seconds: int = WINDOW_SECONDS,
 ) -> dict[str, Any]:
     """Poll the proxy, the store and the node until the case is decided.
 
     The deadline is the expectation's product-derived terms from ``start``
     (arm, or the repoint for the pass-through baseline), never past the
-    proxy's replay window, the collector deadman or the maintenance window.
+    proxy's replay window, the collector deadman or the maintenance window
+    (``window_seconds``: the proxy's ``max_seconds`` and the deadman's
+    ``restore_seconds`` as deployed for this case).
     """
 
     window = watch.observation_window(
         started_at=start,
         terms=expectation.terms,
         replay_end=(
-            start + timedelta(seconds=WINDOW_SECONDS) if progress.armed else None
+            start + timedelta(seconds=window_seconds) if progress.armed else None
         ),
-        deadman_at=repoint_at + timedelta(seconds=WINDOW_SECONDS),
+        deadman_at=repoint_at + timedelta(seconds=window_seconds),
         maintenance_end=maintenance_window_end,
     )
     state_since = start - timedelta(seconds=STATE_SKEW_SECONDS)
@@ -1064,17 +1170,20 @@ def _cleanup_errors(case_id: str, receipts: dict[str, Any]) -> list[str]:
         and all(value is False for value in residuals.values()),
         label=case_id,
     )
-    # A paused collector that could not be resumed, or a control task that
-    # could not be removed, is a failed cleanup like a leftover probe.
-    if cleanup.get("resume_error"):
-        errors.append(
-            f"{case_id}: the paused collector was not resumed: "
-            f"{cleanup['resume_error']}"
-        )
-    if (cleanup.get("resume") or {}).get("stopped") is True:
-        errors.append(
-            f"{case_id}: the metrics collector is still stopped after cleanup"
-        )
+    # A paused collector that could not be resumed (the gap pause or the 009
+    # recount hold), or a control task that could not be removed, is a failed
+    # cleanup like a leftover probe.
+    for key in ("resume", f"resume_{interruption.RECOUNT_HOLD_LABEL}"):
+        if cleanup.get(f"{key}_error"):
+            errors.append(
+                f"{case_id}: the paused collector was not resumed ({key}): "
+                f"{cleanup[f'{key}_error']}"
+            )
+        if (cleanup.get(key) or {}).get("stopped") is True:
+            errors.append(
+                f"{case_id}: the metrics collector is still stopped after cleanup "
+                f"({key})"
+            )
     for key, value in sorted(receipts.items()):
         if key.endswith("_cleanup_error"):
             errors.append(

@@ -80,6 +80,25 @@ PAUSE_MARGIN_SECONDS = 15.0
 #: How long the pause deadman waits beyond the planned pause before it resumes
 #: the unit itself (the runner normally resumes first).
 PAUSE_DEADMAN_MARGIN_SECONDS = 120.0
+#: GF-ENV-LIVE-009's recount hold: the collector is stopped a second time right
+#: after the first post-gap read, for at most this many polling rounds, so the
+#: product's regraded finding state is read by at least one poll before the
+#: clearing read replaces it. The product keeps a confirmation-count change
+#: only in the current ``gpu_finding_state`` row (the next accepted reading
+#: overwrites it; ``gpu_finding_history`` records a severity or action change
+#: only), so the regrade "2/3 -> 1/3" is a 15 s state at the default cadence
+#: while one polling round is 46-56 s (``env_live_watch.POLL_READ_BUDGET_
+#: SECONDS``). Live 2026-10-26 (plain EKS, R13g): the post-gap sample was
+#: accepted 13:32:57Z, cleared 13:33:12Z, polled 13:32:20Z and 13:33:16Z --
+#: INCONCLUSIVE "no finding graded it yet". The judge resumes the hold as soon
+#: as it has read the regrade; the bound is for failed reads.
+RECOUNT_HOLD_POLLS = 2
+
+
+def recount_hold_seconds(cadence: CollectorCadence) -> float:
+    """The most the 009 recount hold keeps the collector stopped."""
+
+    return RECOUNT_HOLD_POLLS * cadence.polling_round_seconds
 
 
 def number_or_none(value: Any) -> float | None:
@@ -134,6 +153,9 @@ class Expectation:
     #: for how long (0 = no pause step in this expectation).
     pause_after_reads: int = 0
     pause_seconds: float = 0.0
+    #: GF-ENV-LIVE-009: the most the recount hold (the second pause, right
+    #: after the first post-gap read) keeps the collector stopped (0 = none).
+    recount_hold_seconds: float = 0.0
     #: GF-ENV-LIVE-010: the control node whose task and records must not change.
     control_node: str | None = None
 
@@ -153,6 +175,7 @@ class Expectation:
             "require_clear": self.require_clear,
             "pause_after_reads": self.pause_after_reads,
             "pause_seconds": self.pause_seconds,
+            "recount_hold_seconds": self.recount_hold_seconds,
             "control_node": self.control_node,
             "not_covered_by_this_attempt": list(self.notes),
         }
@@ -216,6 +239,7 @@ def _interruption_expectation(
     name = _single_field(values, case_id)
     pause_after = plan_pause_read(plan)
     pause_seconds = CONFIRMATION_MAX_GAP_SECONDS + PAUSE_MARGIN_SECONDS
+    recount_hold = recount_hold_seconds(cadence)
     return Expectation(
         **base,
         kind="interruption",
@@ -224,10 +248,14 @@ def _interruption_expectation(
         names=(name, "gpu_temperature_c"),
         terms={
             **replay,
-            # The pause stops the proxy reads for its whole length; the
-            # restart's first scrape waits for the startup spread and jitter;
-            # its delivery and one hold after the clear complete the case.
+            # The pause stops the proxy reads for its whole length; the recount
+            # hold stops them again after the first post-gap read until the
+            # judge has read the regraded state (at most ``recount_hold``);
+            # the restart's first scrape waits for the startup spread and
+            # jitter; its delivery and one hold after the clear complete the
+            # case.
             "collection_pause": pause_seconds,
+            "recount_hold": recount_hold,
             "collector_restart_first_read": (
                 cadence.startup_allowance_seconds + interval
             ),
@@ -241,6 +269,7 @@ def _interruption_expectation(
         require_clear=True,
         pause_after_reads=pause_after,
         pause_seconds=pause_seconds,
+        recount_hold_seconds=recount_hold,
         boot_id=str((preflight.get("node") or {}).get("boot_id") or "") or None,
         notes=(
             "the DCGM -> nvidia-smi source switch runs only through the normal "

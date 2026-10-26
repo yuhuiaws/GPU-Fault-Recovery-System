@@ -328,18 +328,43 @@ GF-ENV-LIVE-001..011（012 始终 NOT_RUN）。默认只计划，不动集群。
   deadman（`resume-collector`，暂停时长 + 120 秒）；运行器在暂停满
   `CONFIRMATION_MAX_GAP_SECONDS + 15` = 75 秒后 `resume-collector`，待计划读完、清除
   读数被接受且该字段 finding 失效后 `restart-collector`（drop-in 保留，一次
-  `systemctl restart`，核对 endpoint 不变）。等待单元没有起来则该案 INCONCLUSIVE 并
+  `systemctl restart`，核对 endpoint 不变）。等待单元看到目标读数后再等
+  `PAUSE_SETTLE_SECONDS`（2 秒）才 SIGSTOP：collector 在同一个周期内同步完成
+  抓取、edge filter 与上报，这样被暂停的那次读数的批次一定已到控制面，而下一次抓取
+  至少还有一个周期（15 × (1 − 0.1 抖动) = 13.5 秒）才来；settle 之后再读一次计数，
+  期间若有读数溜进来记为 `missed`。等待单元没有起来则该案 INCONCLUSIVE 并
   立即还原 endpoint（在严重读开始之前）；等待单元超时或暂停落在目标读之后同样记
-  INCONCLUSIVE（此时产品对三个连续严重样本的反应不是本例证据）。判据
+  INCONCLUSIVE（此时产品对三个连续严重样本的反应不是本例证据）。
+  **重计数保持（recount hold）**：产品只把确认计数的变化写进当前 finding 状态
+  （`store.update_gpu_findings`：`gpu_finding_state` 行被该字段每一次被接受的读数覆盖；
+  `gpu_finding_history` 只在严重度或自动动作变化时写入；计数变化不产生 incident
+  reason、marker 或通知），所以间隔后"2/3 → 1/3"的重判只在当前状态里存活一个采集周期，
+  直到清除读数替换它——默认节奏下 15 秒，而本运行器一轮轮询（15 秒 sleep + 5 次
+  `kubectl exec` 读取）现网实测 46–56 秒（`env_live_watch.POLL_READ_BUDGET_SECONDS`）。
+  现网 plain EKS 首次执行即如此：间隔后严重样本 13:32:57Z 被接受，13:33:12Z 被清除，
+  轮询落在 13:32:20Z 与 13:33:16Z，用例 INCONCLUSIVE "no finding graded it yet"。因此
+  判据在恢复 gap 暂停之前（collector 仍被 SIGSTOP，不会有读数溜进）先用
+  `pause-collector --label hold` 在节点上再装一个等待单元，目标读数 = gap 暂停目标 + 1
+  （间隔后第一个严重读）：collector 上报完该读数即再次被停住，重判后的 1/N 状态保持
+  可读，判据读到该样本的 finding 后立刻 `resume-collector --label hold`
+  （上限 `recount_hold_seconds` = 2 轮轮询 = 120 秒，供读取失败时兜底；其 deadman 再加
+  120 秒），随后清除读数、重启照旧。保持的等待单元、deadman 与记录文件各自带 `-hold`
+  后缀（`pause-status` 以 `pauses` 列出所有暂停），代理窗口与 collector deadman 为此
+  加长 120 秒（009 为 720 秒，`MAX_SECONDS_LIMIT` 900）。保持装不上（节点拒绝、等待单元
+  未起、超时或晚到）只记录在 `observation.pause.hold` 并照常恢复，判定仍由记录给出：
+  读到了 1/N 即 PASS，没读到则 INCONCLUSIVE 并点名保持为何未成立。判据
   （`scripts/e2e/regional/env_live_interruption.py`）：暂停前已接受 2 个严重样本
   （WARNING `confirmation 2/3`），暂停后第一个被接受的严重样本与上一个相隔 >60 秒且
   其 finding `confirmation_count` 为 1、无 CRITICAL、无隔离/禁止步骤、无
   RESTORE_SCHEDULING（不越权恢复）；间隔内没有任何被接受的读数，暂停期间已激活的
-  finding 不得在没有读数的情况下消失（缺测不当健康）；清除读数穿过 edge filter；重启
-  后出现带节点 boot id 的 `initial-baseline` 批次，所有读数只有一个 `source`，重启后的
-  批次速率不超过单个 producer（只有一个 producer）。DCGM→nvidia-smi 的来源切换只能经
-  正常安装流程（`GPU_FAULT_METRICS_MODE`）完成，跨 boot 需另行批准的节点维护重启：
-  本运行器都不驱动，记为未覆盖缺口而不是 PASS。
+  finding 不得在没有读数的情况下消失（缺测不当健康）；保持期间状态被读到 ≥2 次、批次
+  在而该字段的 finding 状态始终没有指向该样本，判 FAIL（样本被接受却未分级）；清除读数
+  穿过 edge filter；重启后出现带节点 boot id 的 `initial-baseline` 批次，所有读数只有
+  一个 `source`，重启后的批次速率不超过单个 producer（只有一个 producer）。
+  DCGM→nvidia-smi 的来源切换只能经正常安装流程（`GPU_FAULT_METRICS_MODE`）完成，跨
+  boot 需另行批准的节点维护重启：本运行器都不驱动，记为未覆盖缺口而不是 PASS。
+  产品侧建议（未改 `src/`）：确认计数变化若也写一行 `gpu_finding_history`（或在
+  incident reasons / marker 上追加），重判就有耐久记录，保持即可省去。
 - **010 作用域与并发**：需要 `--node-b`（站点 profile 的 `node-b`）指定对照节点、
   `--site-file`（提交对照任务）与至少两张 GPU 的目标节点，缺一则 NOT_RUN 并写明原因。
   执行前先对对照节点做与目标节点相同的洁净 preflight；再在对照节点上以
@@ -435,8 +460,9 @@ arm 只是实验开始：正常安装的 collector 每个采集周期经代理�
   - 007 非 brake 位：该位被接受且没有任何该字段 finding。
   - 008：有 collection error/UNKNOWN 记录点名该字段；若已接受的批次缺该 GPU 的字段
     却无人报告 UNKNOWN（多 GPU 时按批次字段集合判完整），判 FAIL。
-  - 009：见上节"009 间断与来源切换"；轮询多读一项节点侧暂停状态（`pause-status`），
-    恢复与重启两个维护步骤由判据按记录触发。
+  - 009：见上节"009 间断与来源切换"；轮询多读一项节点侧暂停状态（`pause-status`，含
+    gap 暂停与重计数保持两条记录），恢复 gap 暂停、装与解除重计数保持、重启四个维护
+    步骤由判据按记录触发；截止时间项多一项 `recount_hold`（120 秒）。
   - 010：004 的全部判据，外加对照 GPU、对照节点、对照任务与并发合并/去重的检查；轮询
     多读一项对照节点的 Node、活动记录与对照任务 Pod。
   - 001：repoint 后 collector 的 `initial-baseline` 批次带目标 GPU 的必需字段、

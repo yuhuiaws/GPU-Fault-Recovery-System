@@ -47,13 +47,19 @@ and a ``systemd-run`` deadman:
   consumes a replay step.
 * **pause-collector / pause-status / resume-collector** -- the GF-ENV-LIVE-009
   collection interruption: a transient waiter unit polls the proxy's
-  ``/status`` on loopback and ``SIGSTOP``s the metrics unit the moment the
-  collector has consumed the requested read (the same ``systemctl kill``
-  pause as ``general_live_node_probe.py unit-pause``, taken read-synchronously
-  on the node because a runner-timed pause could land one collector tick late
-  and let a third severe sample confirm). A ``systemd-run`` deadman resumes
-  the unit after the bounded pause even if the runner dies; ``restore-collector``
-  resumes first as well.
+  ``/status`` on loopback and ``SIGSTOP``s the metrics unit once the collector
+  has consumed the requested read (the same ``systemctl kill`` pause as
+  ``general_live_node_probe.py unit-pause``, taken read-synchronously on the
+  node because a runner-timed pause could land one collector tick late and let
+  a third severe sample confirm). The stop lands ``PAUSE_SETTLE_SECONDS`` after
+  the read was counted, so the collector's synchronous post of that read has
+  reached the control plane; the next scrape is still a whole interval away. A
+  ``systemd-run`` deadman resumes the unit after the bounded pause even if the
+  runner dies; ``restore-collector`` resumes first as well. ``--label`` names a
+  second, independent pause of the same run with its own waiter, deadman and
+  record (the 009 *recount hold* right after the first post-gap read, keeping
+  the product's regraded finding state readable until the runner has read it);
+  ``pause-status`` lists every pause under ``pauses``.
 * **restart-collector** -- one ``systemctl restart`` of the same unit with the
   drop-in in place (the 009 freshness / single-producer check).
 * **restore-collector / stop-proxy** -- remove the drop-in and its environment
@@ -160,7 +166,10 @@ SHA256 = re.compile(r"^[0-9a-f]{64}$")
 MIN_RESTORE_SECONDS = 60
 MAX_RESTORE_SECONDS = 1800
 MIN_PORT, MAX_PORT = 1024, 65535
-MAX_SECONDS_LIMIT = 600
+#: The proxy's replay window: the runner's 600 s plus the 009 recount hold
+#: (``env_live_expectations.recount_hold_seconds``, 120 s at the default
+#: cadence), which stops the collector a second time inside the window.
+MAX_SECONDS_LIMIT = 900
 #: A collection pause (009) is bounded like the node probe's ``unit-pause``:
 #: the deadman that resumes the unit is at least a minute and at most 1500 s
 #: out; the waiter that takes the pause gives up after ``MAX_WAIT_SECONDS``.
@@ -168,7 +177,19 @@ MIN_PAUSE_SECONDS = 60
 MAX_PAUSE_SECONDS = 1500
 MAX_WAIT_SECONDS = 600
 WAIT_POLL_SECONDS = 0.25
+#: The SIGSTOP lands this long after the target read was counted: the collector
+#: posts a read synchronously inside the same tick (``collect_once``: scrape,
+#: edge filter, post), so the pause read's batch has reached the control plane
+#: before the unit stops, while the next scrape is still ``interval x (1 -
+#: jitter ratio)`` (13.5 s at the defaults) away. Live 2026-10-26 (009, plain
+#: EKS) the stop came 0.35 s after the read and the batch got through: a race.
+PAUSE_SETTLE_SECONDS = 2.0
 PAUSE_FILE = "pause.json"
+#: A labelled pause is a second, independent pause of the same run (the 009
+#: recount hold): the label becomes part of its waiter and deadman unit names
+#: and of its record file (``pause-<label>.json``); the default label is the
+#: collection gap (``pause.json``).
+PAUSE_LABEL = re.compile(r"^[a-z][a-z0-9-]{0,15}$")
 
 
 class ProbeError(RuntimeError):
@@ -220,20 +241,47 @@ def deadman_unit(run_id: str) -> str:
     return f"gpu-fault-env-collector-restore-{digest(run_id)}"
 
 
-def pause_waiter_unit(run_id: str) -> str:
-    return f"gpu-fault-env-pause-wait-{digest(run_id)}"
+def safe_label(value: str | None) -> str:
+    """A pause label (empty: the collection gap pause)."""
+
+    label = (value or "").strip()
+    if label and PAUSE_LABEL.fullmatch(label) is None:
+        raise ProbeError("unsafe pause label")
+    return label
 
 
-def resume_deadman_unit(run_id: str) -> str:
-    return f"gpu-fault-env-collector-resume-{digest(run_id)}"
+def _label_suffix(label: str) -> str:
+    return f"-{label}" if label else ""
 
 
-def pause_path(run_id: str) -> Path:
-    return run_dir(run_id) / PAUSE_FILE
+def pause_waiter_unit(run_id: str, label: str = "") -> str:
+    return f"gpu-fault-env-pause-wait-{digest(run_id)}{_label_suffix(label)}"
 
 
-def read_pause(run_id: str) -> dict[str, Any]:
-    path = pause_path(run_id)
+def resume_deadman_unit(run_id: str, label: str = "") -> str:
+    return f"gpu-fault-env-collector-resume-{digest(run_id)}{_label_suffix(label)}"
+
+
+def pause_path(run_id: str, label: str = "") -> Path:
+    name = f"pause-{label}.json" if label else PAUSE_FILE
+    return run_dir(run_id) / name
+
+
+def pause_labels(run_id: str) -> list[str]:
+    """Every pause record of the run: the gap pause (``""``) and the labelled ones."""
+
+    root = run_dir(run_id)
+    if not root.is_dir():
+        return []
+    return sorted(
+        "" if path.name == PAUSE_FILE else path.name[len("pause-") : -len(".json")]
+        for path in root.glob("pause*.json")
+        if path.name == PAUSE_FILE or path.name.startswith("pause-")
+    )
+
+
+def read_pause(run_id: str, label: str = "") -> dict[str, Any]:
+    path = pause_path(run_id, label)
     if not path.is_file():
         return {}
     try:
@@ -243,8 +291,10 @@ def read_pause(run_id: str) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def write_pause(run_id: str, value: dict[str, Any]) -> None:
-    pause_path(run_id).write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
+def write_pause(run_id: str, value: dict[str, Any], label: str = "") -> None:
+    pause_path(run_id, label).write_text(
+        json.dumps(value, sort_keys=True), encoding="utf-8"
+    )
 
 
 def unit_is_stopped(unit: str) -> bool:
@@ -963,6 +1013,7 @@ def pause_collector(arguments: argparse.Namespace) -> None:
     """
 
     run_id = safe_id(arguments.run_id, "run ID")
+    label = safe_label(getattr(arguments, "label", ""))
     port = checked_port(arguments.port)
     after = int(arguments.after_reads)
     if after < 1:
@@ -972,27 +1023,32 @@ def pause_collector(arguments: argparse.Namespace) -> None:
     probe_copy = run_dir(run_id) / "probe.py"
     if not probe_copy.is_file():
         raise ProbeError("repoint the collector before scheduling a pause")
-    if read_pause(run_id):
+    if read_pause(run_id, label):
         raise ProbeError("a pause is already scheduled or taken for this run")
+    # A SIGSTOPped unit is still ``active`` to systemd: the 009 recount hold is
+    # scheduled while the gap pause holds the collector (no read slips in).
     if unit_state(METRICS_UNIT).get("ActiveState") != "active":
         raise ProbeError(f"{METRICS_UNIT} is not active at baseline")
     status = proxy_status(port)
     if int(status.get("reads") or 0) >= after:
         raise ProbeError("the collector already consumed the pause read")
-    waiter = pause_waiter_unit(run_id)
+    waiter = pause_waiter_unit(run_id, label)
     run(["systemctl", "stop", f"{waiter}.service"], check=False)
     run(["systemctl", "reset-failed", f"{waiter}.service"], check=False)
     write_pause(
         run_id,
         {
             "run_id": run_id,
+            "label": label,
             "target_reads": after,
             "pause_seconds": seconds,
             "wait_seconds": wait,
+            "settle_seconds": PAUSE_SETTLE_SECONDS,
             "scheduled_at": datetime.now(timezone.utc).isoformat(),
             "reads_at_schedule": status.get("reads"),
             "waiter_unit": f"{waiter}.service",
         },
+        label,
     )
     run(
         [
@@ -1015,19 +1071,22 @@ def pause_collector(arguments: argparse.Namespace) -> None:
             str(seconds),
             "--wait-seconds",
             str(wait),
+            *(["--label", label] if label else []),
         ]
     )
     state = unit_state(f"{waiter}.service")
     if state.get("ActiveState") not in {"active", "activating"}:
         raise ProbeError(f"pause waiter unit did not start: {state}")
-    emit({**read_pause(run_id), "waiter": state, "status": status})
+    emit({**read_pause(run_id, label), "waiter": state, "status": status})
 
 
-def take_pause(run_id: str, seconds: int, reads: int, target: int) -> dict[str, Any]:
+def take_pause(
+    run_id: str, seconds: int, reads: int, target: int, label: str = ""
+) -> dict[str, Any]:
     """Arm the resume deadman, then SIGSTOP the metrics unit (in that order)."""
 
     probe_copy = run_dir(run_id) / "probe.py"
-    deadman = resume_deadman_unit(run_id)
+    deadman = resume_deadman_unit(run_id, label)
     run(["systemctl", "stop", f"{deadman}.timer"], check=False)
     run(["systemctl", "reset-failed", f"{deadman}.service"], check=False)
     run(
@@ -1044,27 +1103,33 @@ def take_pause(run_id: str, seconds: int, reads: int, target: int) -> dict[str, 
             "resume-collector",
             "--run-id",
             run_id,
+            *(["--label", label] if label else []),
         ]
     )
     if unit_state(f"{deadman}.timer").get("ActiveState") != "active":
         raise ProbeError("collector resume deadman timer is not active")
     run(["systemctl", "kill", "--kill-whom=all", "--signal=SIGSTOP", METRICS_UNIT])
     record = {
-        **read_pause(run_id),
+        **read_pause(run_id, label),
         "paused_at": datetime.now(timezone.utc).isoformat(),
         "reads_at_pause": reads,
         "missed": reads > target,
         "deadman_unit": f"{deadman}.timer",
         "stopped": unit_is_stopped(METRICS_UNIT),
     }
-    write_pause(run_id, record)
+    write_pause(run_id, record, label)
     return record
 
 
 def pause_wait(arguments: argparse.Namespace) -> None:
-    """The waiter's body: poll the proxy until the pause read, then pause."""
+    """The waiter's body: poll the proxy until the pause read, settle, pause.
+
+    The read count is taken again after the settle: a tick that slipped in
+    meanwhile is recorded as ``missed``.
+    """
 
     run_id = safe_id(arguments.run_id, "run ID")
+    label = safe_label(getattr(arguments, "label", ""))
     port = checked_port(arguments.port)
     target = int(arguments.after_reads)
     seconds = checked_pause_seconds(arguments.seconds)
@@ -1076,16 +1141,22 @@ def pause_wait(arguments: argparse.Namespace) -> None:
         except (ProbeError, ValueError, TypeError):
             reads = -1
         if reads >= target:
-            emit(take_pause(run_id, seconds, reads, target))
+            time.sleep(PAUSE_SETTLE_SECONDS)
+            try:
+                reads = int(proxy_status(port, timeout=2).get("reads") or reads)
+            except (ProbeError, ValueError, TypeError):
+                pass
+            emit(take_pause(run_id, seconds, reads, target, label))
             return
         time.sleep(WAIT_POLL_SECONDS)
     write_pause(
         run_id,
         {
-            **read_pause(run_id),
+            **read_pause(run_id, label),
             "timed_out_at": datetime.now(timezone.utc).isoformat(),
             "reads_at_timeout": reads,
         },
+        label,
     )
     raise ProbeError("the collector did not reach the pause read in time")
 
@@ -1098,20 +1169,29 @@ def pause_status(arguments: argparse.Namespace) -> None:
             "pause": read_pause(run_id),
             "stopped": unit_is_stopped(METRICS_UNIT),
             "waiter": unit_state(f"{pause_waiter_unit(run_id)}.service"),
+            # Every pause of the run by label (the gap pause under ""), each
+            # with its waiter: the 009 recount hold is read from here.
+            "pauses": {
+                label: {
+                    **read_pause(run_id, label),
+                    "waiter": unit_state(f"{pause_waiter_unit(run_id, label)}.service"),
+                }
+                for label in pause_labels(run_id)
+            },
             "metrics_unit": unit_state(METRICS_UNIT),
             "effective_endpoint": effective_endpoint(METRICS_UNIT),
         }
     )
 
 
-def resume_paused(run_id: str) -> dict[str, Any]:
+def resume_paused(run_id: str, label: str = "") -> dict[str, Any]:
     """SIGCONT the unit, stop the waiter and the resume deadman (unless we are it)."""
 
     run(["systemctl", "kill", "--kill-whom=all", "--signal=SIGCONT", METRICS_UNIT])
-    waiter = pause_waiter_unit(run_id)
+    waiter = pause_waiter_unit(run_id, label)
     run(["systemctl", "stop", f"{waiter}.service"], check=False)
     run(["systemctl", "reset-failed", f"{waiter}.service"], check=False)
-    deadman = resume_deadman_unit(run_id)
+    deadman = resume_deadman_unit(run_id, label)
     run(["systemctl", "stop", f"{deadman}.timer"], check=False)
     if unit_state(f"{deadman}.service").get("MainPID") != str(os.getpid()):
         run(["systemctl", "stop", f"{deadman}.service"], check=False)
@@ -1119,12 +1199,13 @@ def resume_paused(run_id: str) -> dict[str, Any]:
         ["systemctl", "reset-failed", f"{deadman}.service", f"{deadman}.timer"],
         check=False,
     )
-    record = read_pause(run_id)
+    record = read_pause(run_id, label)
     if record and "resumed_at" not in record:
         record["resumed_at"] = datetime.now(timezone.utc).isoformat()
-        write_pause(run_id, record)
+        write_pause(run_id, record, label)
     return {
         "run_id": run_id,
+        "label": label,
         "pause": record,
         "stopped": unit_is_stopped(METRICS_UNIT),
         "metrics_unit": unit_state(METRICS_UNIT),
@@ -1132,7 +1213,12 @@ def resume_paused(run_id: str) -> dict[str, Any]:
 
 
 def resume_collector(arguments: argparse.Namespace) -> None:
-    emit(resume_paused(safe_id(arguments.run_id, "run ID")))
+    emit(
+        resume_paused(
+            safe_id(arguments.run_id, "run ID"),
+            safe_label(getattr(arguments, "label", "")),
+        )
+    )
 
 
 def restart_collector(arguments: argparse.Namespace) -> None:
@@ -1187,9 +1273,12 @@ def restore_unit(run_id: str) -> dict[str, Any]:
         except (ValueError, KeyError):
             pass
     # A paused collector is resumed first (and its deadman disarmed): systemd
-    # would SIGCONT it for the restart anyway, but the pause record and the
-    # waiter must not outlive the window.
-    resumed = resume_paused(run_id) if read_pause(run_id) else None
+    # would SIGCONT it for the restart anyway, but no pause record or waiter --
+    # the gap pause's or a labelled pause's -- must outlive the window.
+    resumed_pauses = {
+        label: resume_paused(run_id, label) for label in pause_labels(run_id)
+    }
+    resumed = resumed_pauses.get("")
     present = dropin.exists()
     dropin.unlink(missing_ok=True)
     override_present = override.exists()
@@ -1234,6 +1323,7 @@ def restore_unit(run_id: str) -> dict[str, Any]:
         "process_environment": environment,
         "after": after,
         "resumed_pause": resumed,
+        "resumed_pauses": resumed_pauses,
     }
 
 
@@ -1327,6 +1417,8 @@ def parser() -> argparse.ArgumentParser:
     pause.add_argument("--port", type=int, default=9411)
     pause.add_argument("--seconds", type=int, required=True)
     pause.add_argument("--wait-seconds", type=int, default=300)
+    # A second, independent pause of the same run (the 009 recount hold).
+    pause.add_argument("--label", default="")
     pause.set_defaults(handler=pause_collector)
 
     waiter = commands.add_parser("pause-wait")
@@ -1335,6 +1427,7 @@ def parser() -> argparse.ArgumentParser:
     waiter.add_argument("--port", type=int, default=9411)
     waiter.add_argument("--seconds", type=int, required=True)
     waiter.add_argument("--wait-seconds", type=int, default=300)
+    waiter.add_argument("--label", default="")
     waiter.set_defaults(handler=pause_wait)
 
     pause_state = commands.add_parser("pause-status")
@@ -1343,6 +1436,7 @@ def parser() -> argparse.ArgumentParser:
 
     resume = commands.add_parser("resume-collector")
     resume.add_argument("--run-id", required=True)
+    resume.add_argument("--label", default="")
     resume.set_defaults(handler=resume_collector)
 
     restart = commands.add_parser("restart-collector")

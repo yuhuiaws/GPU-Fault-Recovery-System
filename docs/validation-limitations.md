@@ -108,6 +108,28 @@ nvidia-smi source switch (installation only) and the cross-boot path are not
 driven and are recorded as gaps. The preflight admits only a node without
 business workloads, so task progress and suspension are reported as not measured.
 
+The product records a confirmation-count change only in the current finding
+state (`gpu_finding_state`, overwritten by the field's next accepted reading);
+the finding history is written on a severity or automatic-action change alone,
+and no incident reason, marker or notification follows a count change. The
+post-gap regrade "2/3 -> 1/3" of GF-ENV-LIVE-009 is therefore a state that lives
+one collector interval (15 s) until the clearing read replaces it, while one
+poll of the runner (its sleep plus five `kubectl exec` reads) costs 46-56 s on a
+live site: the first live run ended INCONCLUSIVE "no finding graded it yet"
+although the product had regraded correctly. The runner now schedules a second
+read-synchronous pause (the recount hold, `pause-collector --label hold`, its
+own waiter, deadman and record) while the gap pause still holds the collector,
+one read past the gap pause's target: the collector stops again as soon as it
+has posted the first post-gap read, the regraded state stays readable, and the
+judge resumes the hold the moment it has read a finding on that sample (bounded
+by two polling rounds, 120 s; the proxy window and the collector deadman grow by
+the same amount for 009). Every pause now lands a 2 s settle after its target
+read so the read's batch has reached the control plane. The proof is still the
+product's own current state, read while current; a hold the node refuses or
+that never lands is recorded, the resume goes ahead and the records decide. A
+durable product record of a count change (a history row, an incident reason) is
+a suggestion, not implemented here.
+
 The replay tool matches exporter samples the way the collector's parser does:
 dcgm-exporter declares the thermal and power violation durations `counter`
 (`deploy/dataplane/dcgm-counters.csv`), the Prometheus text parser renames those

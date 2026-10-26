@@ -836,17 +836,33 @@ def test_controller_pause_verbs_and_cleanup_resume_first(
     controller.create()
     controller.repoint()
     controller.pause_collector(after_reads=7, seconds=195, wait_seconds=150)
+    # The 009 recount hold: a second, labelled pause one read later.
+    controller.pause_collector(
+        after_reads=8, seconds=240, wait_seconds=93, label="hold"
+    )
     controller.pause_status()
     controller.restart_collector()
     receipts = controller.cleanup()
     host = controller.host
     verbs = [call[0] for call in host.calls]
-    pause = next(call for call in host.calls if call[0] == "pause-collector")
+    pauses = [call for call in host.calls if call[0] == "pause-collector"]
+    pause, hold = pauses
     assert pause[pause.index("--after-reads") + 1] == "7"
     assert pause[pause.index("--seconds") + 1] == "195"
     assert pause[pause.index("--wait-seconds") + 1] == "150"
+    assert "--label" not in pause
+    assert hold[hold.index("--after-reads") + 1] == "8"
+    assert hold[hold.index("--label") + 1] == "hold"
     assert "pause-status" in verbs and "restart-collector" in verbs
-    # A scheduled pause is resumed before the endpoint restore, then the proxy stops.
-    assert verbs.index("resume-collector") < verbs.index("restore-collector")
+    # Every scheduled pause is resumed before the endpoint restore (the gap
+    # pause as ``resume``, the hold as ``resume_hold``), then the proxy stops.
+    resumes = [call for call in host.calls if call[0] == "resume-collector"]
+    assert len(resumes) == 2
+    assert [
+        call[call.index("--label") + 1] for call in resumes if "--label" in call
+    ] == ["hold"]
+    assert max(i for i, verb in enumerate(verbs) if verb == "resume-collector") < (
+        verbs.index("restore-collector")
+    )
     assert verbs.index("restore-collector") < verbs.index("stop-proxy")
-    assert "resume" in receipts and "restore" in receipts
+    assert "resume" in receipts and "resume_hold" in receipts and "restore" in receipts

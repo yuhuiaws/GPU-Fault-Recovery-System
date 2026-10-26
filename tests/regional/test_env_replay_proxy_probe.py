@@ -760,11 +760,13 @@ def test_pause_wait_arms_the_resume_deadman_then_stops_the_unit(
     monkeypatch.setattr(
         probe, "unit_state", lambda unit: {"ActiveState": "active", "MainPID": "0"}
     )
-    reads = iter([2, 3, 4])
+    # The read count is taken again after the settle (the fourth answer).
+    reads = iter([2, 3, 4, 4])
     monkeypatch.setattr(
         probe, "proxy_status", lambda port, **kw: {"reads": next(reads)}
     )
-    monkeypatch.setattr(probe.time, "sleep", lambda seconds: None)
+    sleeps: list[float] = []
+    monkeypatch.setattr(probe.time, "sleep", sleeps.append)
     out = _run(
         [
             "pause-wait",
@@ -783,13 +785,181 @@ def test_pause_wait_arms_the_resume_deadman_then_stops_the_unit(
     deadman = next(i for i, cmd in enumerate(order) if cmd[0] == "systemd-run")
     stop = next(i for i, cmd in enumerate(order) if "--signal=SIGSTOP" in cmd)
     assert deadman < stop, "the resume deadman is armed before the SIGSTOP"
-    assert "resume-collector" in order[deadman]
+    assert "resume-collector" in order[deadman] and "--label" not in order[deadman]
     assert any(item.startswith("--on-active=195s") for item in order[deadman]), order[
         deadman
     ]
     assert probe.METRICS_UNIT in order[stop]
+    # The stop lands a settle after the read was counted, so the collector's
+    # synchronous post of that read is complete; the waiter polls in between.
+    assert sleeps[-1] == probe.PAUSE_SETTLE_SECONDS and probe.PAUSE_SETTLE_SECONDS >= 2
+    assert sleeps[:-1] == [probe.WAIT_POLL_SECONDS] * 2
     record = json.loads((root / probe.PAUSE_FILE).read_text())
     assert record["paused_at"] and record["target_reads"] == 4
+
+
+def test_pause_wait_records_a_tick_that_slipped_in_during_the_settle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = probe.run_dir("r1")
+    _repointed_run(root)
+    probe.write_pause("r1", {"run_id": "r1", "target_reads": 4})
+    monkeypatch.setattr(probe, "run", lambda cmd, **kw: _ok())
+    monkeypatch.setattr(
+        probe, "unit_state", lambda unit: {"ActiveState": "active", "MainPID": "0"}
+    )
+    reads = iter([4, 5])
+    monkeypatch.setattr(
+        probe, "proxy_status", lambda port, **kw: {"reads": next(reads)}
+    )
+    monkeypatch.setattr(probe.time, "sleep", lambda seconds: None)
+    out = _run(
+        ["pause-wait", "--run-id", "r1", "--after-reads", "4", "--seconds", "195"]
+    )
+    assert out["code"] == 0, out
+    assert out["json"]["reads_at_pause"] == 5 and out["json"]["missed"] is True
+
+
+def test_labelled_pause_has_its_own_waiter_deadman_and_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 009 recount hold: a second pause of the run, independent of the gap pause."""
+
+    root = probe.run_dir("r1")
+    _repointed_run(root)
+    order: list[list[str]] = []
+    monkeypatch.setattr(probe, "run", _recording_run(order))
+    monkeypatch.setattr(probe, "unit_state", lambda unit: {"ActiveState": "active"})
+    monkeypatch.setattr(probe, "proxy_status", lambda port, **kw: {"reads": 6})
+    monkeypatch.setattr(probe, "unit_is_stopped", lambda unit: True)
+    monkeypatch.setattr(probe, "effective_endpoint", lambda unit, **kw: PROXY)
+    # The gap pause is taken; the hold is scheduled one read later, while the
+    # unit is still stopped (``active`` to systemd).
+    probe.write_pause(
+        "r1", {"run_id": "r1", "target_reads": 6, "paused_at": "2031-01-01T00:00:00Z"}
+    )
+    bad = _run(
+        [
+            "pause-collector",
+            "--run-id",
+            "r1",
+            "--after-reads",
+            "7",
+            "--seconds",
+            "240",
+            "--label",
+            "Hold!",
+        ]
+    )
+    assert bad["code"] == 1 and "unsafe pause label" in bad["error"]
+    out = _run(
+        [
+            "pause-collector",
+            "--run-id",
+            "r1",
+            "--after-reads",
+            "7",
+            "--seconds",
+            "240",
+            "--label",
+            "hold",
+        ]
+    )
+    assert out["code"] == 0, out
+    assert out["json"]["label"] == "hold" and out["json"]["target_reads"] == 7
+    assert out["json"]["settle_seconds"] == probe.PAUSE_SETTLE_SECONDS
+    waiter = next(cmd for cmd in order if cmd[0] == "systemd-run")
+    assert waiter[waiter.index("--label") + 1] == "hold"
+    assert any(
+        item == f"--unit={probe.pause_waiter_unit('r1', 'hold')}" for item in waiter
+    ), waiter
+    assert probe.pause_waiter_unit("r1", "hold") == (
+        probe.pause_waiter_unit("r1") + "-hold"
+    )
+    assert probe.resume_deadman_unit("r1", "hold") == (
+        probe.resume_deadman_unit("r1") + "-hold"
+    )
+    assert (root / "pause-hold.json").is_file() and (root / probe.PAUSE_FILE).is_file()
+    assert probe.pause_labels("r1") == ["", "hold"]
+    # A second hold schedule is refused; the gap pause's record is untouched.
+    again = _run(
+        [
+            "pause-collector",
+            "--run-id",
+            "r1",
+            "--after-reads",
+            "7",
+            "--seconds",
+            "240",
+            "--label",
+            "hold",
+        ]
+    )
+    assert again["code"] == 1 and "already scheduled" in again["error"]
+    assert probe.read_pause("r1")["target_reads"] == 6
+    # pause-status lists every pause by label, the gap pause also as before.
+    status = _run(["pause-status", "--run-id", "r1"])
+    assert status["json"]["pause"]["target_reads"] == 6
+    assert set(status["json"]["pauses"]) == {"", "hold"}
+    assert status["json"]["pauses"]["hold"]["target_reads"] == 7
+    assert "waiter" in status["json"]["pauses"]["hold"]
+    # The hold's waiter takes the hold with a labelled deadman and record.
+    order.clear()
+    monkeypatch.setattr(
+        probe, "unit_state", lambda unit: {"ActiveState": "active", "MainPID": "0"}
+    )
+    reads = iter([7, 7])
+    monkeypatch.setattr(
+        probe, "proxy_status", lambda port, **kw: {"reads": next(reads)}
+    )
+    monkeypatch.setattr(probe.time, "sleep", lambda seconds: None)
+    taken = _run(
+        [
+            "pause-wait",
+            "--run-id",
+            "r1",
+            "--after-reads",
+            "7",
+            "--seconds",
+            "240",
+            "--label",
+            "hold",
+        ]
+    )
+    assert taken["code"] == 0, taken
+    deadman = next(cmd for cmd in order if cmd[0] == "systemd-run")
+    assert deadman[deadman.index("--label") + 1] == "hold"
+    assert any(
+        item == f"--unit={probe.resume_deadman_unit('r1', 'hold')}" for item in deadman
+    ), deadman
+    hold = probe.read_pause("r1", "hold")
+    assert hold["paused_at"] and hold["label"] == "hold" and hold["missed"] is False
+    assert "paused_at" not in probe.read_pause("r1") or (
+        probe.read_pause("r1")["paused_at"] == "2031-01-01T00:00:00Z"
+    )
+    # Resuming the hold touches the hold's units only and stamps its record.
+    order.clear()
+    resumed = _run(["resume-collector", "--run-id", "r1", "--label", "hold"])
+    assert resumed["code"] == 0 and resumed["json"]["label"] == "hold"
+    assert resumed["json"]["pause"]["resumed_at"]
+    stopped_units = [cmd[2] for cmd in order if cmd[:2] == ["systemctl", "stop"]]
+    assert stopped_units and all(
+        unit.split(".")[0].endswith("-hold") for unit in stopped_units
+    ), stopped_units
+    assert "resumed_at" not in probe.read_pause("r1")
+    # The restore resumes every pause of the run (the gap pause as before).
+    order.clear()
+    dropin = root / "present.conf"
+    dropin.write_text("[Service]\n")
+    monkeypatch.setattr(probe, "dropin_path", lambda run_id: dropin)
+    monkeypatch.setattr(probe, "settled_environment", _settled(REAL, "1"))
+    monkeypatch.setattr(probe, "unit_state", lambda unit: _active("1"))
+    monkeypatch.setattr(probe, "effective_endpoint", lambda unit, **kw: REAL)
+    out = _run(["restore-collector", "--run-id", "r1"])
+    assert out["code"] == 0, out
+    assert out["json"]["resumed_pause"]["pause"]["resumed_at"]
+    assert set(out["json"]["resumed_pauses"]) == {"", "hold"}
+    assert probe.read_pause("r1")["resumed_at"]
 
 
 def test_pause_wait_times_out_without_pausing(monkeypatch: pytest.MonkeyPatch) -> None:

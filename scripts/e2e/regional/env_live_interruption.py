@@ -11,24 +11,47 @@ neither and records both as gaps.
 
 Mechanism (``probes/env_replay_proxy.py``): ``pause-collector`` schedules a
 waiter unit on the node that SIGSTOPs ``gpu-fault-metrics-collector.service``
-the moment the proxy has served the pause read, with a ``systemd-run`` deadman
+once the proxy has served the pause read, with a ``systemd-run`` deadman
 that resumes the unit; ``resume-collector`` and ``restart-collector`` are the
-two maintenance steps this judge takes, through :class:`InterruptionSteps`,
-once the records call for them. Everything else here only reads: the pause
-state (the poll's ``extra`` read), the accepted GPU_METRICS batches, the
-findings and their ``confirmation_count``, the node's workflows and the Node.
+maintenance steps this judge takes, through :class:`InterruptionSteps`, once
+the records call for them. Everything else here only reads: the pause state
+(the poll's ``extra`` read), the accepted GPU_METRICS batches, the findings and
+their ``confirmation_count``, the node's workflows and the Node.
+
+The recount hold. The product keeps a confirmation-count change only in the
+current finding state (``store.update_gpu_findings``: the ``gpu_finding_state``
+row is overwritten by every accepted reading of the field, the
+``gpu_finding_history`` row is written only when the severity or the automatic
+action changes, and no incident reason, marker or notification follows a
+count change). The post-gap regrade "2/3 -> 1/3" (``gpu_environment_policy.
+confirm_environment_decision``: a gap over 60 s makes the previous confirmation
+incomparable) is therefore a state that lives exactly one collector interval,
+until the clearing read replaces it -- 15 s at the default cadence, while one
+poll of this runner costs 46-56 s on a live site (live 2026-10-26, plain EKS:
+accepted 13:32:57Z, cleared 13:33:12Z, polled 13:32:20Z and 13:33:16Z,
+INCONCLUSIVE "no finding graded it yet"). So, right before the gap pause is
+resumed, the judge schedules a second read-synchronous pause (the *recount
+hold*, label :data:`RECOUNT_HOLD_LABEL`) one read past the gap pause's target:
+the collector stops again as soon as it has posted the first post-gap read, the
+regraded state stays readable, and the judge resumes the hold the moment it has
+read a finding on that sample (or after ``recount_hold_seconds``, the bound for
+failed reads). The clearing read then follows as before. The proof is the
+product's own current state, read while it is current -- not a weaker rule.
 
 Verdict rule:
 
 * INCONCLUSIVE, never PASS, when the pause did not land on its read (the
   waiter timed out, died or was late), the plan was not consumed, the gap the
-  records show is not wider than the policy's 60 s, or the restarted
+  records show is not wider than the policy's 60 s, no finding on the post-gap
+  sample was read (the hold not taken, its waiter dead, late or timed out,
+  or the state read fewer times than the hold allows), or the restarted
   collector's first batch was not observed before the deadline;
 * FAIL when the gap was shown and the product still confirmed on it (a
   CRITICAL finding, an isolating step, a node isolation), when a reading was
   accepted inside the gap or the pre-gap finding was cleared by the mere
-  absence of readings, when more than one producer delivered, or when the
-  cleared reading never passed the edge filter;
+  absence of readings, when the post-gap sample was held readable for the
+  hold's polls and no finding graded it, when more than one producer
+  delivered, or when the cleared reading never passed the edge filter;
 * PASS only on positive evidence: the first post-gap severe sample graded
   ``confirmation 1/N`` (WARNING), the clear accepted, the restarted collector's
   ``initial-baseline`` batch with the node's own boot id, one producer.
@@ -44,7 +67,11 @@ from typing import Any
 from gpu_fault.gpu_environment_policy import CONFIRMATION_MAX_GAP_SECONDS
 
 from scripts.e2e.regional import env_live_verdicts as verdicts
-from scripts.e2e.regional.env_live_expectations import Expectation, same_value
+from scripts.e2e.regional.env_live_expectations import (
+    RECOUNT_HOLD_POLLS,
+    Expectation,
+    same_value,
+)
 from scripts.e2e.regional.env_live_judges import BaseJudge
 from scripts.e2e.regional.env_live_watch import (
     PROCESSING_MARGIN_SECONDS,
@@ -61,6 +88,9 @@ RESTART_DELIVERY_SECONDS = STARTUP_SPREAD_SECONDS + PROCESSING_MARGIN_SECONDS
 #: One collector keeps at most this many batches per interval over a window;
 #: a second producer of the same identity doubles the rate.
 PRODUCER_RATE_SLACK = 2
+#: The probe's label of the recount hold (``pause-collector --label``): its
+#: waiter, deadman and record are the gap pause's with this suffix.
+RECOUNT_HOLD_LABEL = "hold"
 
 
 def _time(value: Any) -> datetime | None:
@@ -70,12 +100,101 @@ def _time(value: Any) -> datetime | None:
         return None
 
 
+def _iso(value: datetime | None) -> str | None:
+    return None if value is None else value.isoformat()
+
+
+def _receipt_time(receipt: Mapping[str, Any] | None, key: str) -> datetime | None:
+    """The node's own stamp from a pause/resume receipt (``pause.<key>``)."""
+
+    return _time(((receipt or {}).get("pause") or {}).get(key))
+
+
 @dataclass
 class InterruptionSteps:
-    """The two maintenance steps the judge takes, bound to the controller."""
+    """The maintenance steps the judge takes, bound to the controller.
+
+    ``hold`` schedules the recount hold (right before ``resume``), and
+    ``resume_hold`` resumes it; both are optional so that a controller without
+    the labelled pause still runs the case (then the regrade is read only if a
+    poll happens to land inside its one-interval life, as before).
+    """
 
     resume: Callable[[], dict[str, Any]]
     restart: Callable[[], dict[str, Any]]
+    hold: Callable[[], dict[str, Any]] | None = None
+    resume_hold: Callable[[], dict[str, Any]] | None = None
+
+
+@dataclass
+class HoldFacts:
+    """The recount hold: what the node's record and the judge's steps say."""
+
+    scheduled: bool = False
+    schedule_receipt: dict[str, Any] | None = None
+    schedule_error: str | None = None
+    target_reads: int | None = None
+    paused_at: datetime | None = None
+    reads_at_pause: int | None = None
+    missed: bool = False
+    timed_out: bool = False
+    waiter_state: str | None = None
+    resumed_at: datetime | None = None
+    resume_receipt: dict[str, Any] | None = None
+    #: Store reads taken while the hold was in place (a poll that started
+    #: after the hold landed, before its resume), and those among them that
+    #: already showed the post-gap sample's batch: what the hold bought.
+    reads_while_held: int = 0
+    reads_with_post_sample: int = 0
+    #: When a finding on the post-gap sample was first read (any count).
+    regrade_seen_at: datetime | None = None
+
+    @property
+    def taken(self) -> bool:
+        return self.paused_at is not None
+
+    def evidence(self) -> dict[str, Any]:
+        return {
+            "label": RECOUNT_HOLD_LABEL,
+            "scheduled": self.scheduled,
+            "schedule_error": self.schedule_error,
+            "target_reads": self.target_reads,
+            "paused_at": _iso(self.paused_at),
+            "reads_at_pause": self.reads_at_pause,
+            "missed": self.missed,
+            "timed_out": self.timed_out,
+            "waiter_state": self.waiter_state,
+            "resumed_at": _iso(self.resumed_at),
+            "reads_while_held": self.reads_while_held,
+            "reads_with_post_sample": self.reads_with_post_sample,
+            "regrade_seen_at": _iso(self.regrade_seen_at),
+            "schedule_receipt": self.schedule_receipt,
+            "resume_receipt": self.resume_receipt,
+        }
+
+    def note(self) -> str:
+        """Why the regraded state was (not) readable, for the INCONCLUSIVE text."""
+
+        if self.schedule_error:
+            return f"the recount hold could not be scheduled ({self.schedule_error})"
+        if not self.scheduled:
+            return "no recount hold was scheduled"
+        if self.timed_out:
+            return "the recount hold waiter did not reach the post-gap read in time"
+        if self.missed:
+            return (
+                f"the recount hold landed after read {self.reads_at_pause}, past its "
+                f"target {self.target_reads}"
+            )
+        if not self.taken:
+            return (
+                "the recount hold never landed (waiter "
+                f"{self.waiter_state or 'unknown'})"
+            )
+        return (
+            f"the collector was held after the post-gap read and the state was read "
+            f"{self.reads_while_held} time(s) meanwhile"
+        )
 
 
 @dataclass
@@ -99,25 +218,24 @@ class PauseFacts:
     #: one of them vanished before any post-gap reading was accepted.
     active_while_paused: set[str] = field(default_factory=set)
     cleared_in_gap: list[str] = field(default_factory=list)
+    hold: HoldFacts = field(default_factory=HoldFacts)
 
     def evidence(self) -> dict[str, Any]:
-        def iso(value: datetime | None) -> str | None:
-            return None if value is None else value.isoformat()
-
         return {
             "scheduled": self.scheduled,
             "target_reads": self.target_reads,
-            "paused_at": iso(self.paused_at),
+            "paused_at": _iso(self.paused_at),
             "reads_at_pause": self.reads_at_pause,
             "missed": self.missed,
             "timed_out": self.timed_out,
             "waiter_state": self.waiter_state,
             "stopped": self.stopped,
-            "resumed_at": iso(self.resumed_at),
+            "resumed_at": _iso(self.resumed_at),
             "resume_receipt": self.resume_receipt,
-            "restart_at": iso(self.restart_at),
+            "restart_at": _iso(self.restart_at),
             "restart_receipt": self.restart_receipt,
             "cleared_in_gap": list(self.cleared_in_gap),
+            "hold": self.hold.evidence(),
         }
 
 
@@ -145,7 +263,9 @@ class InterruptionJudge(BaseJudge):
         super().observe(snapshot, progress)
         if snapshot.extra is not None:
             self._absorb_pause(snapshot.extra, snapshot.at)
+            self._absorb_hold(snapshot.extra)
         self._track_gap_health(snapshot.at)
+        self._track_hold(snapshot)
         self._take_steps(progress, snapshot.at)
 
     def _absorb_pause(self, extra: Mapping[str, Any], at: datetime) -> None:
@@ -169,6 +289,29 @@ class InterruptionJudge(BaseJudge):
         if resumed is not None and pause.resumed_at is None:
             pause.resumed_at = resumed
 
+    def _absorb_hold(self, extra: Mapping[str, Any]) -> None:
+        """The recount hold's record (``pauses[<label>]`` of ``pause-status``)."""
+
+        record = dict((extra.get("pauses") or {}).get(RECOUNT_HOLD_LABEL) or {})
+        if not record:
+            return
+        hold = self.pause.hold
+        hold.scheduled = True
+        if record.get("target_reads") is not None:
+            hold.target_reads = int(record["target_reads"])
+        paused = _time(record.get("paused_at"))
+        if paused is not None and hold.paused_at is None:
+            hold.paused_at = paused
+        if record.get("reads_at_pause") is not None:
+            hold.reads_at_pause = int(record["reads_at_pause"])
+        hold.missed = hold.missed or bool(record.get("missed"))
+        hold.timed_out = hold.timed_out or bool(record.get("timed_out_at"))
+        hold.waiter_state = str((record.get("waiter") or {}).get("ActiveState") or "")
+        resumed = _time(record.get("resumed_at"))
+        if resumed is not None and hold.resumed_at is None:
+            # The node's stamp: the runner's own resume or the deadman's.
+            hold.resumed_at = resumed
+
     def _track_gap_health(self, at: datetime) -> None:
         """The pre-gap finding must survive the gap until a reading says otherwise."""
 
@@ -182,22 +325,82 @@ class InterruptionJudge(BaseJudge):
             if finding_id not in pause.cleared_in_gap:
                 pause.cleared_in_gap.append(finding_id)
 
+    def _track_hold(self, snapshot: Snapshot) -> None:
+        """What the hold bought: store reads taken while the state was held."""
+
+        hold = self.pause.hold
+        if hold.regrade_seen_at is None and self.post_gap_findings():
+            hold.regrade_seen_at = snapshot.at
+        if (
+            snapshot.gpu_state is None
+            or hold.paused_at is None
+            or hold.resumed_at is not None
+            # The poll's ``at`` precedes its reads: a poll that started after
+            # the hold landed read the held state.
+            or snapshot.at <= hold.paused_at
+        ):
+            return
+        hold.reads_while_held += 1
+        if self.first_post_sample() is not None:
+            hold.reads_with_post_sample += 1
+
     def _take_steps(self, progress: ReplayProgress, now: datetime) -> None:
         pause = self.pause
+        hold = pause.hold
         due = (
             pause.paused_at is not None
             and pause.resumed_at is None
             and now >= pause.paused_at + timedelta(seconds=self.x.pause_seconds)
         )
         if due:
+            # The hold is scheduled while the collector is still stopped, so no
+            # read can slip in between the schedule and the resume; a schedule
+            # that fails is recorded and the resume goes ahead regardless.
+            if (
+                self.steps.hold is not None
+                and not hold.scheduled
+                and hold.schedule_error is None
+            ):
+                try:
+                    hold.schedule_receipt = self.steps.hold()
+                    hold.scheduled = True
+                    target = (hold.schedule_receipt or {}).get("target_reads")
+                    if target is not None:
+                        hold.target_reads = int(target)
+                except Exception as exc:  # noqa: BLE001 - recorded; the resume goes on
+                    hold.schedule_error = (
+                        f"pause-collector[{RECOUNT_HOLD_LABEL}]: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
             try:
                 pause.resume_receipt = self.steps.resume()
             except Exception as exc:  # noqa: BLE001 - recorded; the case fails
                 self.step_errors.append(
                     f"resume-collector: {type(exc).__name__}: {exc}"
                 )
-            pause.resumed_at = now
+            # The node's stamp of the SIGCONT when the receipt carries it: the
+            # poll's ``now`` precedes the step by the poll's reads (live: 36 s).
+            pause.resumed_at = _receipt_time(pause.resume_receipt, "resumed_at") or now
             self.mark("resumed", now)
+        hold_due = (
+            hold.paused_at is not None
+            and hold.resumed_at is None
+            and self.steps.resume_hold is not None
+            and (
+                bool(self.post_gap_findings())
+                or now
+                >= hold.paused_at + timedelta(seconds=self.x.recount_hold_seconds)
+            )
+        )
+        if hold_due:
+            try:
+                hold.resume_receipt = self.steps.resume_hold()
+            except Exception as exc:  # noqa: BLE001 - recorded; the case fails
+                self.step_errors.append(
+                    f"resume-collector[{RECOUNT_HOLD_LABEL}]: {type(exc).__name__}: {exc}"
+                )
+            hold.resumed_at = _receipt_time(hold.resume_receipt, "resumed_at") or now
+            self.mark("hold_resumed", now)
         if (
             pause.resumed_at is not None
             and pause.restart_at is None
@@ -345,13 +548,31 @@ class InterruptionJudge(BaseJudge):
             and (item.get("labels") or {}).get("source_boot_id")
         }
 
+    def ungraded_while_held(self) -> bool:
+        """The post-gap sample's batch was readable for the hold's polls and no
+        finding on it appeared: the state the hold froze does not grade it."""
+
+        hold = self.pause.hold
+        return (
+            hold.taken
+            and self.first_post_sample() is not None
+            and not self.post_gap_findings()
+            and hold.reads_with_post_sample >= RECOUNT_HOLD_POLLS
+        )
+
     def wait_until(self, progress: ReplayProgress, now: datetime) -> datetime | None:
         pause = self.pause
+        hold = pause.hold
         moments: list[datetime] = []
         if pause.paused_at is not None and pause.resumed_at is None:
             moments.append(
                 pause.paused_at
                 + timedelta(seconds=self.x.pause_seconds + self.interval)
+            )
+        if hold.paused_at is not None and hold.resumed_at is None:
+            moments.append(
+                hold.paused_at
+                + timedelta(seconds=self.x.recount_hold_seconds + self.interval)
             )
         if pause.restart_at is not None and self.fresh_after_restart() is None:
             moments.append(
@@ -421,6 +642,16 @@ class InterruptionJudge(BaseJudge):
                     f"counted confirmation {count}, not 1"
                 )
             self.mark("recounted", now)
+        if self.ungraded_while_held():
+            sample = self.first_post_sample() or {}
+            hold = self.pause.hold
+            stages["recount"].append(
+                f"{label}: the severe {self.x.field} sample accepted at "
+                f"{sample.get('observed_at')} after the {gap or 0:.0f}s gap was not "
+                "graded into a finding while the collector was held after it "
+                f"({hold.reads_with_post_sample} store reads showed the batch, the "
+                "field's finding state never named the sample)"
+            )
         inside = self.inside_gap()
         if inside:
             stages["gap"].append(
@@ -457,14 +688,12 @@ class InterruptionJudge(BaseJudge):
         return stages
 
     def evidence(self, progress: ReplayProgress) -> dict[str, Any]:
-        def iso(value: datetime | None) -> str | None:
-            return None if value is None else value.isoformat()
-
         pre = self.pre_gap_samples()
         post = self.first_post_sample()
         cleared = self.cleared_at()
         return {
             "pause": self.pause.evidence(),
+            "recount_hold_seconds": self.x.recount_hold_seconds,
             "pre_gap_severe_samples": len(pre),
             "pre_gap_findings": [
                 {
@@ -486,7 +715,7 @@ class InterruptionJudge(BaseJudge):
                 }
                 for item in self.post_gap_findings()
             ][-8:],
-            "cleared_at": iso(cleared),
+            "cleared_at": _iso(cleared),
             "sources": sorted(self.sources()),
             "fresh_batch_after_restart": self.fresh_after_restart(),
             "batches_after_restart": len(self.batches_after_restart()),
@@ -570,8 +799,12 @@ class InterruptionJudge(BaseJudge):
         if not self.post_gap_findings():
             return [
                 f"{label}: the post-gap severe sample was accepted but no finding "
-                "graded it yet"
+                f"graded it in any store read; {pause.hold.note()} (the product "
+                "keeps a confirmation-count change only in the current finding "
+                "state, which the clearing read replaces)"
             ]
+        if pause.hold.taken and pause.hold.resumed_at is None:
+            return [f"{label}: the recount hold was not resumed before the deadline"]
         if self.cleared_at() is None:
             return [
                 f"{label}: the clearing reading was not accepted before the deadline"
@@ -593,8 +826,10 @@ NO_TASK_009 = (
 )
 
 __all__ = [
+    "HoldFacts",
     "InterruptionJudge",
     "InterruptionSteps",
     "PauseFacts",
+    "RECOUNT_HOLD_LABEL",
     "RESTART_DELIVERY_SECONDS",
 ]

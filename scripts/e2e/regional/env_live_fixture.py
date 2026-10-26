@@ -757,7 +757,10 @@ class EnvReplayController:
         self.case_dir = case_dir
         self._repointed = False
         self._armed = False
-        self._pause_scheduled = False
+        #: The pauses scheduled on the node by label ("" is the collection gap
+        #: pause, ``env_live_interruption.RECOUNT_HOLD_LABEL`` the recount hold);
+        #: each still scheduled at cleanup is resumed before the restore.
+        self._pauses_scheduled: set[str] = set()
         #: ``repoint_proof`` of the last repoint receipt (empty until proven).
         self.proof: dict[str, Any] = {}
         # A caller (the GF-GENERAL-LIVE 024 composites, a test) may hand in the
@@ -913,8 +916,14 @@ class EnvReplayController:
         seconds: int,
         wait_seconds: int,
         port: int = 9411,
+        label: str = "",
     ) -> dict[str, Any]:
-        """Schedule the read-synchronous pause (GF-ENV-LIVE-009) on the node."""
+        """Schedule a read-synchronous pause (GF-ENV-LIVE-009) on the node.
+
+        ``label`` names a second, independent pause of the run with its own
+        waiter, deadman and record (the recount hold); the default is the
+        collection gap pause.
+        """
 
         receipt = self.execute(
             "pause-collector",
@@ -928,19 +937,24 @@ class EnvReplayController:
             str(int(seconds)),
             "--wait-seconds",
             str(int(wait_seconds)),
+            *(["--label", label] if label else []),
             timeout=60,
         )
-        self._pause_scheduled = True
+        self._pauses_scheduled.add(label)
         return receipt
 
     def pause_status(self) -> dict[str, Any]:
         return self.host.execute("pause-status", "--run-id", self.run_id, timeout=60)
 
-    def resume_collector(self) -> dict[str, Any]:
+    def resume_collector(self, *, label: str = "") -> dict[str, Any]:
         receipt = self.host.execute(
-            "resume-collector", "--run-id", self.run_id, timeout=60
+            "resume-collector",
+            "--run-id",
+            self.run_id,
+            *(["--label", label] if label else []),
+            timeout=60,
         )
-        self._pause_scheduled = False
+        self._pauses_scheduled.discard(label)
         return receipt
 
     def restart_collector(self) -> dict[str, Any]:
@@ -951,7 +965,7 @@ class EnvReplayController:
             "restore-collector", "--run-id", self.run_id, timeout=120
         )
         self._repointed = False
-        self._pause_scheduled = False
+        self._pauses_scheduled.clear()
         return receipt
 
     def stop_proxy(self, *, port: int = 9411) -> dict[str, Any]:
@@ -967,13 +981,16 @@ class EnvReplayController:
         """
 
         receipts: dict[str, Any] = {}
-        if self._pause_scheduled:
-            # The restore resumes a paused unit itself; an explicit resume first
-            # keeps the receipt even when the restore is refused by the window.
+        # The restore resumes a paused unit itself; an explicit resume of every
+        # scheduled pause first (the gap pause as ``resume``, a labelled one as
+        # ``resume_<label>``) keeps the receipt even when the restore is
+        # refused by the window.
+        for label in sorted(self._pauses_scheduled):
+            key = f"resume_{label}" if label else "resume"
             try:
-                receipts["resume"] = self.resume_collector()
+                receipts[key] = self.resume_collector(label=label)
             except Exception as exc:  # noqa: BLE001 - recorded; cleanup continues
-                receipts["resume_error"] = f"{type(exc).__name__}: {exc}"
+                receipts[f"{key}_error"] = f"{type(exc).__name__}: {exc}"
         if self._repointed:
             try:
                 receipts["restore"] = self.restore()
