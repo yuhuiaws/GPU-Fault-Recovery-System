@@ -1917,6 +1917,16 @@ summary line from `/dev/kmsg` and delivers it to `/v1/collector-events/nvidia-ke
 `Data` lines of the same error are diagnostic continuation lines and do not create a separate SXID event or workflow. The event keeps the kernel sequence,
 boot ID, monotonic timestamp and a `kmsg://` evidence reference.
 
+When `GPU_FAULT_KMSG_PATH` names a **regular file** (the kernel source replay's reviewed fixture; the production default
+`/dev/kmsg` is unaffected) the collector **follows** it like `tail -f`: it opens at the file's end (no backlog is replayed, as
+with `/dev/kmsg`), keeps the file open at EOF and reads on from the same offset after the reopen delay (1 s); a line still being
+written (no newline yet) is held until the rest arrives; only a file truncated below the read offset or replaced at its path ends
+the stream and is reopened (again at the new file's end). `/dev/kmsg` blocks in `select` until the kernel writes the next record
+and never reports EOF, whereas a regular file reports EOF at once; the collector used to take that EOF for an ended stream,
+closing, reopening and seeking to the end every second, so every record appended between two reopens was skipped -- a replayed
+XID/SXID was read only if appended in the microseconds between the seek and the first read, i.e. it never reached the control
+plane (`tests/collectors/test_kernel_regular_file_follow.py`).
+
 kmsg **reading and delivery are two stages**: the reader thread pushes records into an in-process bounded queue (2048 entries), and a
 delivery thread drains it. The reader thread never waits for delivery -- `HttpEventSink` spends up to about 47 seconds retrying each record
 before handing it to the outbox, and the kernel ring keeps overwriting old records during that time -- so backpressure can only land on the queue:

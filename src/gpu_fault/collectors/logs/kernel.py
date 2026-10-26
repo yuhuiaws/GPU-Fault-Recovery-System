@@ -9,6 +9,7 @@ import os
 import re
 import select
 import signal
+import stat
 import threading
 import time
 from collections import deque
@@ -212,6 +213,99 @@ def _stop_handlers(
     return make_handler
 
 
+def _read_boot_id() -> str:
+    """The kernel's boot id, or a marker unique to this collector.
+
+    The fallback used to be the constant ``unknown-boot``. kmsg sequence
+    numbers restart at boot and the control plane's ``event_id`` is scoped
+    to the cluster, so ``kmsg-unknown-boot-42`` recurred after every reboot
+    and the first XID of the new boot was dropped as a duplicate of the last
+    one before it. One random marker per collector -- so one per process,
+    since the unit runs a single collector -- keeps the ids apart across
+    reboots and across nodes; it is read once, in ``__init__``, so the ids
+    of one process stay stable.
+    """
+
+    try:
+        return (
+            Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+        ) or f"unknown-{uuid4().hex[:12]}"
+    except OSError:
+        return f"unknown-{uuid4().hex[:12]}"
+
+
+def _is_regular_file(descriptor: int) -> bool:
+    try:
+        return stat.S_ISREG(os.fstat(descriptor).st_mode)
+    except OSError:
+        return False
+
+
+def _regular_file_is_current(descriptor: int, path: str) -> bool:
+    """False once the followed file was replaced at ``path`` or truncated."""
+
+    try:
+        opened = os.fstat(descriptor)
+        at_path = os.stat(path)
+        position = os.lseek(descriptor, 0, os.SEEK_CUR)
+    except OSError:
+        return False
+    if (opened.st_dev, opened.st_ino) != (at_path.st_dev, at_path.st_ino):
+        return False
+    return opened.st_size >= position
+
+
+def _follow_regular_file(
+    stream: Any,
+    descriptor: int,
+    *,
+    path: str,
+    stopping: threading.Event,
+    collect: Callable[[Iterable[str]], Any],
+    settle: Callable[[datetime], None],
+    now: Callable[[], datetime],
+    sleep: Callable[[float], None],
+    delay_seconds: float,
+) -> None:
+    """Follow a regular kmsg source like ``tail -f``; never reopen it at EOF.
+
+    ``/dev/kmsg`` blocks in ``select`` until the kernel writes the next record
+    and never reports EOF. A regular file -- the kernel source replay's
+    reviewed fixture, named by the collector's kmsg path setting -- is always
+    "ready" and reports EOF at once, and the live-stream loop took that EOF for
+    an ended stream: ``_run_forever`` closed the file, slept the reopen delay,
+    reopened it and sought to its end again, so a record appended between two
+    reopens was skipped. The collector read a replayed line only if it was
+    appended in the microseconds between the seek and the first read (live: no
+    kmsg-mode replay -- 024 ``independent_xid``, 032
+    ``unknown_xid``/``missing_topology`` -- ever reached the control plane).
+
+    At EOF the file stays open and is re-read from the same offset after
+    ``delay_seconds``; a line still being written (no newline yet) is held until
+    the rest arrives; only a file truncated below the read offset or replaced at
+    its path ends the stream, and the reopen starts at the new file's end like
+    every open (``start_at_end``). ``settle`` is the collector's per-read
+    housekeeping (identity refresh, health summary), ``collect`` its parser.
+    """
+
+    partial = ""
+    while not stopping.is_set():
+        line = stream.readline()
+        if line:
+            partial += line
+            if partial.endswith("\n"):
+                collect([partial])
+                partial = ""
+        elif not _regular_file_is_current(descriptor, path):
+            LOGGER.warning(
+                "kernel message file %s was truncated or replaced; reopening", path
+            )
+            return
+        else:
+            sleep(delay_seconds)
+        settle(now())
+
+
 # GPU identity after a boot: ``context_from_environment`` discovers the product
 # once, at start, and a collector that comes up before the driver answers would
 # stamp ``product=None`` on every XID for its whole life -- the control plane's
@@ -248,7 +342,7 @@ class KernelLogCollector:
         self.node_id = node_id
         self.kmsg_path = kmsg_path
         self.uptime_path = uptime_path
-        self.boot_id = boot_id or self._read_boot_id()
+        self.boot_id = boot_id or _read_boot_id()
         self.now = now or (lambda: datetime.now(timezone.utc))
         self.start_at_end = start_at_end
         self.reopen_delay_seconds = reopen_delay_seconds
@@ -761,6 +855,19 @@ class KernelLogCollector:
             self._last_read_at = self.now()
             self._maybe_health_summary_without_interrupting_stream(self._last_read_at)
             return
+        if _is_regular_file(descriptor):
+            _follow_regular_file(
+                stream,
+                descriptor,
+                path=self.kmsg_path,
+                stopping=self._shutdown,
+                collect=self.collect_lines,
+                settle=self._maybe_health_summary_without_interrupting_stream,
+                now=self.now,
+                sleep=self.sleep,
+                delay_seconds=self.reopen_delay_seconds,
+            )
+            return
         while not self._shutdown.is_set():
             now = self.now()
             timeout = min(
@@ -991,29 +1098,6 @@ class KernelLogCollector:
         self._seen_order.append(record_id)
         while len(self._seen_order) > self._deduplication_window:
             self._seen.discard(self._seen_order.popleft())
-
-    @staticmethod
-    def _read_boot_id() -> str:
-        """The kernel's boot id, or a marker unique to this collector.
-
-        The fallback used to be the constant ``unknown-boot``. kmsg sequence
-        numbers restart at boot and the control plane's ``event_id`` is scoped
-        to the cluster, so ``kmsg-unknown-boot-42`` recurred after every reboot
-        and the first XID of the new boot was dropped as a duplicate of the last
-        one before it. One random marker per collector -- so one per process,
-        since the unit runs a single collector -- keeps the ids apart across
-        reboots and across nodes; it is read once, in ``__init__``, so the ids
-        of one process stay stable.
-        """
-
-        try:
-            return (
-                Path("/proc/sys/kernel/random/boot_id")
-                .read_text(encoding="ascii")
-                .strip()
-            ) or f"unknown-{uuid4().hex[:12]}"
-        except OSError:
-            return f"unknown-{uuid4().hex[:12]}"
 
 
 def build_from_environment(

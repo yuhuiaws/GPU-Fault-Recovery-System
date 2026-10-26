@@ -4115,6 +4115,19 @@ dangerous kmsg-XID lanes; a PASS here must be read with that limit. The
 kmsg probe now gives every run its own sequence band (`kmsg_sequence`): the
 product dedups the XID event id derived from `kmsg-<boot>-<sequence>`, so a
 second run on the same boot used to be graded a duplicate of the first.
+Through release R13g no kmsg-mode replay could reach the product at all: the
+kernel collector took a regular `GPU_FAULT_KMSG_PATH` file's EOF for an ended
+stream and reopened it at its end every second, skipping whatever the probe
+appended in between (live 2026-10-26, plain EKS: 024 `independent_xid` XID 92,
+032 `unknown_xid` XID 987 and 032 `missing_topology` SXID 11001 each left five
+or six copies of the reviewed line in the fixture and no XID/SXID event in the
+store). The collector now follows a regular file like `tail -f`
+(`collectors/logs/kernel.py` `_follow_regular_file`,
+`tests/collectors/test_kernel_regular_file_follow.py`); every kmsg-mode PASS
+needs a release that carries it, and the probe's `status` reads back whether
+the collector holds the fixture open at the end of what was appended
+(`consumed`) so a window the collector never read is INCONCLUSIVE, not a
+grading FAIL.
 
 The 020 NVLink counter variants had no live coverage until the harness
 followed the exporter's counter generation. On 2026-10-26 (06:45-06:58Z,

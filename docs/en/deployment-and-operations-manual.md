@@ -8194,7 +8194,7 @@ gpu-fault-collector training-progress \
 | `GPU_FAULT_WORKLOAD_STATE` | `UNKNOWN` | `UNKNOWN/IDLE/ACTIVE`; the deploy does not set it, and the control plane fills UNKNOWN from the attempt observations. `IDLE` is only for nodes that never run training: low CPU/GPU utilisation edges are no longer delivered and the two rules do not grade the node; `ACTIVE` is only a pre-filter and never replaces the managed attempt the control plane resolves |
 | `GPU_FAULT_CHECKPOINT_MANIFEST_REF` | Empty | Checkpoint manifest of the current workload |
 | `GPU_FAULT_GPU_UUIDS` | Empty | Comma-separated GPU UUIDs used by Training Progress |
-| `GPU_FAULT_KMSG_PATH` | `/dev/kmsg` | Kernel Collector input |
+| `GPU_FAULT_KMSG_PATH` | `/dev/kmsg` | Kernel Collector input; a regular file is followed like `tail -f` (from its end at open, only records appended afterwards are read; it is reopened only when truncated or replaced) |
 | `GPU_FAULT_TRAINING_PROGRESS_FILE` | `/var/run/gpu-fault/progress.json` | Progress file |
 | `GPU_FAULT_TRAINING_PROGRESS_INTERVAL_SECONDS` | 15 | Progress reporting period |
 
