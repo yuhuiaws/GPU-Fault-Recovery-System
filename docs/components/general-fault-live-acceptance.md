@@ -1429,9 +1429,14 @@ POST 预制 finding。类别模块 `general_live_nccl`/`_nccl_fr`/`_progress`/`_
   `/tmp/nccl_trace_rank_<rank>` 移到 `$HOME/.cache/torch/comm_lib_trace_rank_<rank>`
   并优先读 `TORCH_FR_DUMP_TEMP_FILE`，而产品 `flight_recorder.py` 的读取器只认旧变量名与
   旧默认位置，手册的注入又不钉 dump 位置，于是 FIFO 找到、写入成功但全部 rank
-  `dump_missing`、无 `PAIRED`（批次 182 让读取器认两代变量与两个默认目录、手册钉住 dump 前缀，随其上线翻回 PASS）；运行器在释放前把两 Pod 内三处候选位置的 `stat` 清单与
+  `dump_missing`、无 `PAIRED`（批次 182 让读取器认两代变量与两个默认目录、手册钉住 dump 前缀）；182 上线后的 HyperPod 实测
+  （2026-10-25 23:05Z）dump 被找到并每 rank 请求两次，但 8 rank × 2 份 dump 的 triage 结果约 1.2 MB，超过 Node Agent worker 的
+  1 MiB 单行结果上限，两节点都只剩 `ObservationIncomplete: RESULT_SIZE_LIMIT`、`node_results={}`，运行器又读到 "sampled no rank
+  process"——现登记的缺口即此（`FR_RESULT_BUDGET_GAP`；批次 186 让 triage 在交出前按 `evidence_trimmed` 阶梯自裁、占位写明字节数，
+  随 GPU 节点 Agent 上线翻回 PASS）；运行器在释放前把两 Pod 内三处候选位置的 `stat` 清单与
   PyTorch 自己的 FR 日志行写入 `<suffix>-fr-forensics.json`，`fr_dumps` 判定指出 dump
-  实际所在——写在 2.9 默认位置、写在产品读取位置但读取过早、或根本未写）、
+  实际所在——写在 2.9 默认位置、写在产品读取位置但读取过早、写在产品读取位置且已请求但节点结果未到记录（点名 step `node_failures`
+  的节点与原因）、或根本未写）、
   `fr_disabled`（trace buffer 为 0，只能 `not_configured`；同样留存 forensics 证据）、
   `simultaneous_nodes`（合并 incident 须含两节点各自的 hung 证据）。
   live-replay 实测（`general_live_nccl_fr`，经审查的测试 FR dump 响应器
@@ -1839,6 +1844,6 @@ endpoint 再等待无活动 finding 的新批次（不要求硬件累计计数�
 计算，漏查单卡）、022 `expired_xid`（PCIe↔XID gauge 回退无时效检查）、026
 `bdf_changed`（身份只比 UUID 集）、026 `stale_boot`（库存基线不比 source_boot_id）
 ——已由批次 160 修复，对应变体改为预期 PASS；产品回退时这些变体判 FAIL。当前登记的
-预期 FAIL 缺口：011 `fr_enabled`（产品 FR 读取器不认 PyTorch 2.9 的默认 dump 位置
-`$HOME/.cache/torch/comm_lib_trace_rank_<rank>` 与 `TORCH_FR_DUMP_TEMP_FILE`，手册注入
-亦不钉 dump 文件；见该用例的变体说明），产品修复并经该变体 PASS 后改回预期 PASS。
+预期 FAIL 缺口：011 `fr_enabled`（Node Agent worker 的 1 MiB 单行结果上限：8 rank × 2 份 FR dump 的 triage 结果约 1.2 MB，
+整份被换成 `RESULT_SIZE_LIMIT`，两节点 `node_results={}`；此前的 dump 位置缺口已由批次 182 修复并经真机证实；见该用例的变体说明），
+产品修复（批次 186）随 GPU 节点 Agent 上线并经该变体 PASS 后改回预期 PASS。

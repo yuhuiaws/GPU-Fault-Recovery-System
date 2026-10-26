@@ -155,6 +155,30 @@ FR_LOG_MARKERS = (
 )
 FR_LOG_TAIL = 2000
 FR_DUMP_REQUEST_MARKER = FR_LOG_MARKERS[0]
+#: Why ``fr_enabled`` is an expected FAIL on this product. The dump-location gap
+#: before it (PyTorch 2.9's ``$HOME/.cache/torch/comm_lib_trace_rank_<rank>``
+#: default, ``TORCH_FR_DUMP_TEMP_FILE``) was closed and proven live on HyperPod
+#: on 2026-10-25: the dumps were found and requested twice per rank.
+FR_RESULT_BUDGET_GAP = (
+    "Node Agent COLLECT_HUNG_TRIAGE result budget (src/gpu_fault/node_agent/"
+    "observation_worker.py::publish, OBSERVATION_RESULT_BUDGET_BYTES = 1 MiB a"
+    " worker result line): with the flight recorder on, a node of eight ranks"
+    " returns two dumps per rank and 64 operation summaries per dump, serialized"
+    " four times a rank on top of the ~290 KB an FR-less eight-rank triage weighs"
+    " -- ~1.2 MB, so the worker replaces the whole document by {status:"
+    " RESULT_SIZE_LIMIT, ranks: []}: the step records node_failures ="
+    " ObservationIncomplete: RESULT_SIZE_LIMIT for every node, node_results = {},"
+    " the decision sees no process and this oracle reads 'sampled no rank process'"
+    " (HyperPod 2026-10-25 23:05Z: both nodes, 16 fresh dumps under"
+    " /tmp/nccl_trace_rank_*, 32 dump requests). Any eight-GPU node with the"
+    " recorder on overflows the same way. Fix (node Agent): the triage bounds its"
+    " own result (operations/triage_budget.py -- drop the recorder's operation"
+    " list the series already carries, then shorten the lists, pending operations"
+    " first; every rank keeps identity, status, progress and raw-dump reference;"
+    " evidence_trimmed names the steps) and the worker's stand-in names size,"
+    " budget and heaviest fields. Flips to PASS once a release with that Agent is"
+    " live and this variant pairs its dumps."
+)
 #: Variables the renderer owns; any copy in the source manifest is replaced
 #: (``TORCH_FR_BUFFER_SIZE`` too: 2.9 would read it before the ``0`` above).
 MANAGED_ENV = frozenset(
@@ -628,7 +652,11 @@ def parse_fr_forensics(listing: str, log_text: str) -> dict[str, Any]:
     return {"home": home, "files": files, "log_lines": lines[:200]}
 
 
-def fr_location_errors(forensics: Mapping[str, Mapping[str, Any]]) -> list[str]:
+def fr_location_errors(
+    forensics: Mapping[str, Mapping[str, Any]],
+    *,
+    triage_lost: Mapping[str, str] | None = None,
+) -> list[str]:
     """Where the trainer's recorder left its dumps, when the product paired none.
 
     The product reads ``TORCH_NCCL_DEBUG_INFO_TEMP_FILE`` or, unset, the PyTorch
@@ -638,6 +666,12 @@ def fr_location_errors(forensics: Mapping[str, Mapping[str, Any]]) -> list[str]:
     early; none anywhere is a trainer that never dumped -- each named with
     PyTorch's own count of dump requests. A Pod the forensics could not read
     is named too; nothing read means nothing to attribute.
+
+    ``triage_lost`` (node -> cause) says the triage ran but no node result
+    reached the record (live: ``ObservationIncomplete: RESULT_SIZE_LIMIT`` on
+    both HyperPod nodes while sixteen fresh dumps sat where the product reads).
+    Then dumps where the product reads were read, and lost on the way back;
+    the sentence says so instead of blaming the read.
     """
 
     errors: list[str] = []
@@ -666,7 +700,16 @@ def fr_location_errors(forensics: Mapping[str, Mapping[str, Any]]) -> list[str]:
         return errors
     where = ", ".join(f"{base}*" for base in sorted(bases))
     asked = f"{requests} '{FR_DUMP_REQUEST_MARKER}' line(s)"
-    if legacy:
+    if legacy and triage_lost:
+        lost = "; ".join(
+            f"{node}: {cause}" for node, cause in sorted(triage_lost.items())
+        )
+        errors.append(
+            f"the trainer's {legacy} FR dump file(s) are under {LEGACY_DUMP_BASE}* where"
+            f" the product reads and were requested ({asked}); the product's triage"
+            f" result never reached the record -- {lost}"
+        )
+    elif legacy:
         errors.append(
             f"the trainer's {legacy} FR dump file(s) are under {LEGACY_DUMP_BASE}* where"
             " the product reads, yet the product read none within its triage budget"

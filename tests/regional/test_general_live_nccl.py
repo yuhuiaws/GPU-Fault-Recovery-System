@@ -221,11 +221,15 @@ def hung_records(
     workflow: str = "wf",
     predecessor: str | None = None,
     encoded: bool = True,
+    triage_failures: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """One stall wave's records; ``tag`` keeps a later wave's ids apart.
 
     A triage node result is stored as the executor stores it: the summary
     codec's zlib/JSON envelope (``encoded=False``: a plain legacy document).
+    ``triage_failures`` (node -> cause) is a first wave whose node results the
+    executor rejected: ``node_results`` empty, the causes under
+    ``node_failures`` -- the live HyperPod ``fr_enabled`` record.
     """
 
     started = datetime.fromisoformat(since)
@@ -266,6 +270,14 @@ def hung_records(
             result = {"node_id": NODE, "ranks": ranks or []}
             stored = encode_summary(result) if encoded else result
             details = {"node_results": {NODE: stored} if first else {}}
+            if first and triage_failures:
+                details = {
+                    "node_results": {},
+                    "node_failures": dict(triage_failures),
+                    "undetermined_nodes": sorted(triage_failures),
+                    "retained_bytes": 0,
+                    "retained_raw_bytes": 0,
+                }
         executions.append(
             {
                 "step_index": index,
@@ -900,31 +912,6 @@ def _torch29_forensics(*pods: str) -> dict[str, Any]:
         }
         for rank, pod in enumerate(pods)
     }
-
-
-def test_fr_enabled_is_an_expected_fail_naming_the_dump_location_gap() -> None:
-    """The product reads the pre-2.9 PyTorch dump location; the DLC image is 2.9.
-
-    A job injected exactly as the manual prescribes (buffer, pipe,
-    dump-on-timeout, no TEMP_FILE) dumps to ``$HOME/.cache/torch/
-    comm_lib_trace_rank_<rank>``, which the product's reader never visits.
-    """
-
-    spec = SPECS["fr_enabled"]
-    assert spec.expected_outcome == "FAIL"
-    for needle in (
-        "flight_recorder.py",
-        "_flight_dump_candidates",
-        "TORCH_NCCL_DEBUG_INFO_TEMP_FILE",
-        "TORCH_FR_DUMP_TEMP_FILE",
-        "/tmp/nccl_trace_rank_",
-        ".cache/torch/comm_lib_trace_rank_",
-        "部署和运维手册",
-        "dump_missing",
-    ):
-        assert needle in spec.product_gap, needle
-    assert SPECS["fr_disabled"].expected_outcome == "PASS"
-    assert SPECS["fr_disabled"].product_gap == ""
 
 
 def test_fr_variants_keep_the_trainers_own_fr_files_as_evidence_and_attribute_a_miss(

@@ -67,6 +67,7 @@ from scripts.e2e.regional.general_live_fixture import (
 )
 from scripts.e2e.regional.general_live_fr_replay import FlightRecorderReplay
 from scripts.e2e.regional.general_live_nccl_job import (
+    FR_RESULT_BUDGET_GAP,
     MIN_ACTIVE_BPS,
     ManagedNcclJob,
     fr_location_errors,
@@ -111,26 +112,6 @@ RECOVERY_MAX_GAP_SECONDS = 60
 #: The recovery threshold without a trusted pre-stall baseline; with one it is a
 #: quarter of that baseline, under the active threshold for this job (< 4x it).
 RECOVERY_FALLBACK_BPS = 1048576
-#: Why ``fr_enabled`` is an expected FAIL on this product: PyTorch 2.9.0 (the
-#: DLC image) writes the flight-recorder dump of a job that pins no dump file to
-#: ``$HOME/.cache/torch/comm_lib_trace_rank_<rank>`` and prefers
-#: ``TORCH_FR_DUMP_TEMP_FILE``; the product's reader knows only the <= 2.8 names.
-FR_DUMP_LOCATION_GAP = (
-    "Node Agent COLLECT_HUNG_TRIAGE flight-recorder reader (src/gpu_fault/node_agent/"
-    "operations/flight_recorder.py::_flight_dump_candidates, lines 204-249): the dump"
-    " prefix comes only from TORCH_NCCL_DEBUG_INFO_TEMP_FILE, else the PyTorch <= 2.8"
-    " default /tmp/nccl_trace_rank_<rank>. PyTorch 2.9.0 (the DLC image; c10d::"
-    "DebugInfoWriter::getWriter in torch/csrc/distributed/c10d/FlightRecorder.cpp)"
-    " prefers TORCH_FR_DUMP_TEMP_FILE and defaults to $HOME/.cache/torch/"
-    "comm_lib_trace_rank_<rank>, so a job injected exactly as docs/部署和运维手册.md"
-    " prescribes (trace buffer, pipe, dump-on-timeout; no TEMP_FILE) dumps where the"
-    " product never looks: every rank ends dump_missing after the half-budget wait and"
-    " no series is PAIRED (the FIFO is found and written; the file is not). Fix: read"
-    " TORCH_FR_DUMP_TEMP_FILE first, add <HOME or /tmp>/.cache/torch/"
-    "comm_lib_trace_rank_<rank> to the dump candidates, and pin the dump file in the"
-    " manual's injection (CN and EN); the variant's <suffix>-fr-forensics.json shows"
-    " where the trainer's dumps are."
-)
 #: The step a trainer line is about (``STALL step=``, ``RESUMED step=``).
 STEP = re.compile(r"\bstep=(\d+)")
 #: Incident states the hung chain does not leave on its own.
@@ -707,12 +688,35 @@ def triage_ranks(
     return rows, unreadable
 
 
+def triage_node_failures(records: dict[str, Any]) -> dict[str, str]:
+    """Nodes whose COLLECT_HUNG_TRIAGE result never reached the record, by cause.
+
+    The executor keeps a node that answered nothing usable under the step's
+    ``node_failures`` (live: ``ObservationIncomplete: RESULT_SIZE_LIMIT`` on both
+    HyperPod nodes, 2026-10-25, while the dumps it had requested sat on disk).
+    Without this, an empty ``node_results`` reads as a node that sampled nothing.
+    """
+
+    failures: dict[str, str] = {}
+    for execution in hung_workflow(records).get("step_executions") or []:
+        if execution.get("operation") != "COLLECT_HUNG_TRIAGE":
+            continue
+        reported = (execution.get("details") or {}).get("node_failures") or {}
+        for node, cause in sorted(reported.items()):
+            if isinstance(cause, list):
+                cause = "; ".join(str(item) for item in cause)
+            failures.setdefault(str(node), str(cause))
+    return failures
+
+
 def fr_errors(records: dict[str, Any], *, expect_configured: bool) -> list[str]:
     """What COLLECT_HUNG_TRIAGE read from each rank's flight recorder.
 
     Configured: no rank reads ``not_configured`` and at least one PID got two
     real dumps (``flight_recorder_series`` PAIRED). Not configured: nothing but
-    ``not_configured`` (or an exhausted budget), and no dump series at all.
+    ``not_configured`` (or an exhausted budget), and no dump series at all. A
+    triage with no rank row names the node results the executor rejected, so a
+    result the node lost is not read as a node that sampled nothing.
     """
 
     if hung_incident(records) is None:
@@ -722,7 +726,14 @@ def fr_errors(records: dict[str, Any], *, expect_configured: bool) -> list[str]:
         return ["no COLLECT_HUNG_TRIAGE execution to read FR status from"]
     rows, errors = triage
     if not rows:
-        return [*errors, "COLLECT_HUNG_TRIAGE sampled no rank process"]
+        return [
+            *errors,
+            "COLLECT_HUNG_TRIAGE sampled no rank process",
+            *(
+                f"{node}: no COLLECT_HUNG_TRIAGE result reached the record: {cause}"
+                for node, cause in triage_node_failures(records).items()
+            ),
+        ]
     statuses = [(row.get("flight_recorder") or {}).get("status") for row in rows]
     series = [(row.get("flight_recorder_series") or {}).get("status") for row in rows]
     if expect_configured:
@@ -1105,8 +1116,13 @@ def fr_enabled(ctx: VariantContext) -> dict[str, Any]:
     errors = fr_errors(records, expect_configured=True)
     if errors:
         # A miss is attributed, not just counted: where the trainer's dumps
-        # really are tells the product gap from a trainer that never dumped.
-        errors.extend(fr_location_errors(forensics))
+        # really are tells the product gap from a trainer that never dumped,
+        # and a result the node lost from a dump the product never read.
+        errors.extend(
+            fr_location_errors(
+                forensics, triage_lost=triage_node_failures(records) or None
+            )
+        )
     stages["fr_dumps"] = errors
     return variant_result(
         stages,
@@ -1393,7 +1409,7 @@ VARIANTS = [
         "triage takes two real FR dumps per PID; chain -> ESCALATED",
         fr_enabled,
         expected_outcome="FAIL",
-        product_gap=FR_DUMP_LOCATION_GAP,
+        product_gap=FR_RESULT_BUDGET_GAP,
     ),
     variant_spec(
         "fr_disabled",
