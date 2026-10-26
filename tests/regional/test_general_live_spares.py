@@ -494,7 +494,9 @@ def test_finalize_fails_a_graded_pass_when_the_spare_was_not_handed_back() -> No
         _receipt(residue={"declared_spares": [NODE], "unexpected": [NODE]}),
     )
     assert dirty["verdict"] == "FAIL"
-    assert any("restored:" in item and "left on" in item for item in dirty["errors"])
+    assert any("restored:" in item and "left on" in item for item in dirty["errors"]), (
+        "the hand-back residue must fail the verdict"
+    )
 
 
 def test_preflight_hook_is_the_candidate_proof_with_the_provider_recovery_read(
@@ -622,7 +624,7 @@ def test_every_variant_fails_when_the_spare_is_not_handed_back(
         assert result["verdict"] == "FAIL", (variant, result["errors"])
         assert any(
             "spare label is still on the candidate" in e for e in result["errors"]
-        )
+        ), f"{variant}: a spare left labelled fails the verdict"
         assert sessions[-1].finished, variant
 
 
@@ -643,7 +645,9 @@ def test_a_busy_candidate_is_inconclusive_before_anything_is_declared(
         SPECS["configuration_error"].execute(
             _ctx(SPECS["configuration_error"], tmp_path)
         )
-    assert not FakeSpareSession.instances[-1].declared
+    assert not FakeSpareSession.instances[-1].declared, (
+        "a busy candidate is never declared"
+    )
 
 
 def test_configuration_error_passes(
