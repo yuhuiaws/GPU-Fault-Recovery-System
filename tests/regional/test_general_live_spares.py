@@ -377,6 +377,50 @@ def test_pods_not_ready_lists_running_or_pending_pods_without_ready_true() -> No
     assert sp.pods_not_ready(Regional(), NODE) == ["gpu-fault-system/dcgm", "x/pending"]
 
 
+def test_spare_residue_report_lists_every_spare_mark_and_honours_expected() -> None:
+    from scripts.e2e.regional import warm_spare_residue as residue
+
+    def node(
+        name: str, *, label: bool = False, cordoned: bool = False, **annotations: str
+    ):
+        return {
+            "metadata": {
+                "name": name,
+                "labels": {residue.SPARE_LABEL: "true"} if label else {},
+                "annotations": annotations,
+            },
+            "spec": {"unschedulable": cordoned},
+        }
+
+    document = {
+        "items": [
+            node("clean"),
+            node("kept", label=True, cordoned=True),
+            node(
+                "left",
+                label=True,
+                **{
+                    residue.RESERVATION_ANNOTATION: "inc-1",
+                    residue.POOL_STATE_ANNOTATION: "ALLOCATED",
+                },
+            ),
+            node("available", **{residue.POOL_STATE_ANNOTATION: "AVAILABLE"}),
+        ]
+    }
+    report = residue.spare_residue_report(document, expected=["kept"])
+    assert report == {
+        "declared_spares": ["kept", "left"],
+        "cordoned_spares": ["kept"],
+        "unexpected": ["left"],
+        "reserved": {"left": "inc-1"},
+        "pool_state": {"left": "ALLOCATED"},
+        "expected": ["kept"],
+        "clean": False,
+    }
+    assert residue.spare_residue_report({"items": [node("clean")]})["clean"] is True
+    assert residue.RESIDUE_EXIT == 3
+
+
 def _receipt(**overrides: Any) -> dict[str, Any]:
     before = {
         "name": NODE,
