@@ -61,6 +61,8 @@ from scripts.e2e.regional.general_live_gpu_store import gpu_state
 from scripts.e2e.regional.general_live_gpu_verdicts import node_hardware_errors
 from scripts.e2e.regional.general_live_registry import LIVE_REPLAY, VariantSpec
 from scripts.e2e.regional.general_live_verdicts import verdict
+from scripts.e2e.regional.probes.general_live_dcgm_probe import PROFILE_NAME
+from tools.gpu_dcgm_field_replay import PROFILES as FIELD_PROFILES
 
 ROOT = Path(__file__).resolve().parents[3]
 FIELD_TOOL = ROOT / "tools" / "gpu_dcgm_field_replay.py"
@@ -473,6 +475,21 @@ def label(name: str, gpus: Iterable[str], key: str, value: str) -> dict[str, Any
 
 
 def plan(profile: str, *steps: dict[str, Any]) -> dict[str, Any]:
+    """A field plan on one of the tool's profiles.
+
+    The name is checked here, before the survey's node is touched, against
+    both gates it has to pass on the node: the tool's ``PROFILES`` and the
+    host controller's ``PROFILE_NAME`` shape. Live 2026-10-26 the controller
+    accepted only ``[a-z]{3,16}`` while 022's XID-join plans use ``pcie_xid``,
+    and the three variants ended INCONCLUSIVE at ``deploy-proxy`` with the
+    refusal's message withheld.
+    """
+
+    if profile not in FIELD_PROFILES or PROFILE_NAME.fullmatch(profile) is None:
+        raise VariantInconclusive(
+            f"replay plan profile {profile!r} is not a field-tool profile the "
+            "host controller serves (harness defect; nothing was deployed)"
+        )
     return {"profile": profile, "steps": list(steps)}
 
 

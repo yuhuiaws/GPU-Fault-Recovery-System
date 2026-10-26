@@ -301,6 +301,7 @@ class HostProbeFixture:
         returncode: int,
         code: str | None,
         site: str | None,
+        reason: str | None = None,
     ) -> bool:
         """Keep a failed probe call's message and detail, redacted, in the case dir.
 
@@ -330,6 +331,7 @@ class HostProbeFixture:
             else None,
             "error_code": code,
             "error_site": site,
+            "error_reason": reason,
             "message": redact_probe_text(message) if isinstance(message, str) else None,
             "detail": redact_probe_detail(detail),
             "redacted": True,
@@ -796,7 +798,24 @@ class HostProbeFixture:
                         diagnostic += f" {code}"
                     if site:
                         diagnostic += f" at {site}"
-            if self._record_probe_error(payload, completed.returncode, code, site):
+            # A probe may name *why* it refused with a fixed identifier from its
+            # own closed vocabulary (the DCGM controller's ``ProbeError(...,
+            # "profile_shape")``): one token, like ``failure_class`` beside a
+            # redacted command output, never the message. Live 2026-10-26 three
+            # 022 variants read ``error ProbeError <digest> at tool_command:800``
+            # and nothing else; the digest had to be brute-forced.
+            reason = payload.get("error_reason")
+            if not (
+                kind == "probe"
+                and isinstance(reason, str)
+                and re.fullmatch(r"[a-z][a-z0-9_]{2,40}", reason)
+            ):
+                reason = None
+            if reason:
+                diagnostic += f"; reason {reason}"
+            if self._record_probe_error(
+                payload, completed.returncode, code, site, reason
+            ):
                 diagnostic += f"; detail in {PROBE_ERROR_RECORD}"
             raise HostProbeError(
                 f"host probe failed (exit {completed.returncode}{diagnostic}); output withheld"

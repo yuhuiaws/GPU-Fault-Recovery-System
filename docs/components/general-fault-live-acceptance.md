@@ -675,6 +675,20 @@ DCGM `*_ERROR_COUNT_TOTAL`）；Hopper/NVLink4 及更新的卡只上报 DL 聚�
 单独记录，不能误把它的reboot算作PCIe计数器授权。涉及硬件分支须另行批准。
 动作后读取新真实状态与通信结果，不能以清计数替代验证；source/boot变化不形成跨代速率。
 
+2026-10-26 现场（plain EKS 两车道，R13g）`same_gpu_xid`、`wrong_gpu_xid`、`expired_xid`
+三个 XID 联合变体在 `deploy-proxy` 一步即 INCONCLUSIVE，结果只有
+`HostProbeError: dcgm deploy-proxy: host probe failed (exit 1; error ProbeError
+ae2c099c21f98eb7 at tool_command:800); output withheld`：节点侧控制器
+（`probes/general_live_dcgm_probe.py`）只接受 `[a-z]{3,16}` 形状的 `--profile`，而这三个
+变体的计划 profile 是 `pcie_xid`——回放工具 `tools/gpu_dcgm_field_replay.py` PROFILES 中唯一
+带下划线的名字；邻居变体的 `pcie`/`composite` 不受影响。摘要就是那句拒绝语的 sha256 前 16 位，
+探针没有回传消息，`probe-error.json` 也未写出。修复后控制器按工具的 profile 命名形状
+（小写单词以单下划线连接，`PROFILE_NAME`）放行；runner 的 `plan()` 在触碰节点前同时按工具
+PROFILES 与该形状校验；`deploy-proxy` 的拒绝带固定 reason 标识进入 result 的 error 文本
+（`reason profile_shape`/`port_busy`/`unit_down`/`no_status`/`armed_at_start`/`source_missing`），
+探针消息经脱敏写入用例目录的 `probe-error.json`
+（`tests/regional/test_general_live_dcgm_deploy_profile.py`）。三个变体尚无现场证据，需在两集群重跑。
+
 ### GF-GENERAL-LIVE-024
 
 必测：`thermal_warning`、`power_performance`、`corrected_memory`、`memory_failure`、

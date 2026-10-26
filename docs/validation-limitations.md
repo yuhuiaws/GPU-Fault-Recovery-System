@@ -2879,6 +2879,26 @@ XID 32 (`--approve DCGM_XID_GAUGE`); 019 `remap_failure` needs
 `GPU_FIELD_DIAGNOSTIC`; 019 `pending_unsupported` (no legacy GPU) and
 `observe_profile` (no OBSERVE reset profile) are `CAPABILITY_ABSENT`.
 
+022's three XID-join variants (`same_gpu_xid`, `wrong_gpu_xid`,
+`expired_xid`) have no live evidence yet. On 2026-10-26 (plain EKS, both
+lanes, release R13g) all three ended INCONCLUSIVE at `deploy-proxy` --
+`HostProbeError: dcgm deploy-proxy: host probe failed (exit 1; error
+ProbeError ae2c099c21f98eb7 at tool_command:800); output withheld`. The
+node-side controller (`probes/general_live_dcgm_probe.py`) accepted only
+`[a-z]{3,16}` as the field tool's `--profile`, and these are the only plans on
+the `pcie_xid` profile, the one underscored name in
+`tools/gpu_dcgm_field_replay.py`; the neighbours' `pcie` and `composite`
+deployed. The digest is the first 16 hex of the refusal sentence's sha256; the
+probe sent no message and no `probe-error.json` was written. The controller
+now accepts the tool's profile-name shape (`PROFILE_NAME`), the runner's
+`plan()` checks a profile against both the tool's `PROFILES` and that shape
+before the node is touched, a refused deploy names a fixed reason token in the
+error (`reason profile_shape` / `port_busy` / `unit_down` / `no_status` /
+`armed_at_start` / `source_missing`) and the probe's message lands, redacted,
+in the case's `probe-error.json`
+(`tests/regional/test_general_live_dcgm_deploy_profile.py`). The trio is to be
+re-run on both clusters.
+
 019 `remap_failure`'s recovery stage is the operator exit, not a validated
 restore (live 2026-10-26, plain EKS ip-10-0-43-5, release R13g). The product
 detected the replayed `row_remap_failure` and planned the documented RMA-class

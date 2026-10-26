@@ -55,8 +55,9 @@ control plane:
 
 Every answer is one JSON object on the last stdout line; only allow-listed
 environment keys are read, so secrets never leave the node. A failure prints
-the exception class, a digest of its message and its ``function:line`` site --
-the message-free trail the host fixture may show the runner.
+the exception class, a digest of its message, its ``function:line`` site and a
+fixed reason token -- what the host fixture may show the runner -- plus the
+message the fixture keeps, redacted, as the case's ``probe-error.json``.
 """
 
 from __future__ import annotations
@@ -138,6 +139,11 @@ SAFE_RUN_ID = re.compile(r"^[a-z0-9][a-z0-9-]{2,62}$")
 DIGEST = re.compile(r"^[0-9a-f]{12}$")
 BOOT_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 GPU_UUID = re.compile(r"^GPU-[0-9a-fA-F-]{8,64}$")
+#: A field-tool profile name (``tools/gpu_dcgm_field_replay.py`` PROFILES):
+#: lowercase words joined by single underscores. Live 2026-10-26 a
+#: ``[a-z]{3,16}`` shape refused ``pcie_xid`` -- the one underscored profile --
+#: and the three 022 XID-join variants ended INCONCLUSIVE at ``deploy-proxy``.
+PROFILE_NAME = re.compile(r"^[a-z]{2,16}(?:_[a-z]{2,16}){0,2}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 MIN_PORT, MAX_PORT = 1024, 65535
 MIN_RESTORE_SECONDS, MAX_RESTORE_SECONDS = 120, 5400
@@ -157,7 +163,12 @@ PENDING_SERVICE_STATES = frozenset(
 
 
 class ProbeError(RuntimeError):
-    pass
+    def __init__(self, message: str, reason: str = "") -> None:
+        super().__init__(message)
+        #: A fixed identifier of the refusal (``profile_shape``, ``port_busy``)
+        #: from this file's closed vocabulary; the host fixture shows it beside
+        #: the class, digest and site, and keeps the message only redacted.
+        self.reason = reason
 
 
 def utc_now() -> str:
@@ -441,18 +452,12 @@ def gpu_inventory() -> list[dict[str, str]]:
         check=False,
         timeout=60,
     )
+    keys = ("index", "uuid", "pci_bus_id", "name")
     result = []
     for line in completed.stdout.splitlines():
         values = [item.strip() for item in line.split(",", 3)]
         if len(values) == 4:
-            result.append(
-                {
-                    "index": values[0],
-                    "uuid": values[1],
-                    "pci_bus_id": values[2],
-                    "name": values[3],
-                }
-            )
+            result.append(dict(zip(keys, values)))
     return result
 
 
@@ -539,11 +544,7 @@ def run_state(run_digest: str) -> dict[str, Any]:
     proxy_name = f"{proxy_unit_of(run_digest)}.service"
     timer_name = f"{deadman_unit_of(run_digest)}.timer"
     service_name = f"{deadman_unit_of(run_digest)}.service"
-    proxy, timer, service = (
-        unit_state(proxy_name),
-        unit_state(timer_name),
-        unit_state(service_name),
-    )
+    proxy, timer, service = map(unit_state, (proxy_name, timer_name, service_name))
     run_id = recorded_run_id(run_digest)
     objects: list[str] = []
     if dropin.exists():
@@ -757,7 +758,7 @@ def install_source(arguments: argparse.Namespace) -> None:
 def installed(run_id: str, name: str) -> Path:
     path = run_dir(run_id) / name
     if not path.is_file():
-        raise ProbeError(f"install {name} before using it")
+        raise ProbeError(f"install {name} before using it", "source_missing")
     return path
 
 
@@ -796,8 +797,10 @@ def tool_command(arguments: argparse.Namespace, root: Path) -> list[str]:
         str(audit),
     ]
     if arguments.tool == FIELD_TOOL:
-        if not re.fullmatch(r"[a-z]{3,16}", arguments.profile or ""):
-            raise ProbeError("the field tool needs its plan's --profile")
+        if PROFILE_NAME.fullmatch(arguments.profile or "") is None:
+            raise ProbeError(
+                "the field tool needs its plan's --profile", "profile_shape"
+            )
         return [*common, "--profile", arguments.profile]
     if GPU_UUID.fullmatch(arguments.gpu_uuid or "") is None:
         raise ProbeError("the environment tool needs a physical --gpu-uuid")
@@ -818,7 +821,8 @@ def deploy_proxy(arguments: argparse.Namespace) -> None:
     run(["systemctl", "reset-failed", f"{unit}.service"], check=False)
     if port_answers(port):
         raise ProbeError(
-            "a replay tool already answers on the port; not starting a second"
+            "a replay tool already answers on the port; not starting a second",
+            "port_busy",
         )
     run(
         [
@@ -852,12 +856,15 @@ def deploy_proxy(arguments: argparse.Namespace) -> None:
             except ProbeError:
                 pass
         if state.get("ActiveState") in {"failed", "inactive"}:
-            raise ProbeError("the replay unit did not stay up")
+            raise ProbeError("the replay unit did not stay up", "unit_down")
         time.sleep(0.5)
     if not status:
-        raise ProbeError("the replay tool did not answer /status")
+        raise ProbeError("the replay tool did not answer /status", "no_status")
     if status.get("armed") is not False:
-        raise ProbeError("the replay tool came up armed; it must start pass-through")
+        raise ProbeError(
+            "the replay tool came up armed; it must start pass-through",
+            "armed_at_start",
+        )
     emit(
         {
             "run_id": run_id,
@@ -1458,8 +1465,9 @@ def exception_site(exc: BaseException) -> str | None:
 
 
 def error_fields(exc: BaseException, command: str) -> dict[str, Any]:
-    """The failure line: class, message digest and site are what the host
-    fixture may show; the message itself stays on the node."""
+    """The failure line: class, message digest, site and reason token are what
+    the host fixture may show; the message goes into the case's redacted
+    ``probe-error.json`` (live 2026-10-26 it was withheld and brute-forced)."""
 
     return {
         "error": f"{type(exc).__name__}: {exc}",
@@ -1467,6 +1475,8 @@ def error_fields(exc: BaseException, command: str) -> dict[str, Any]:
         "error_class": type(exc).__name__,
         "error_code": hashlib.sha256(str(exc).encode()).hexdigest()[:16],
         "error_site": exception_site(exc),
+        "error_reason": getattr(exc, "reason", "") or None,
+        "error_message": str(exc)[:2000],
         "command": command,
     }
 
