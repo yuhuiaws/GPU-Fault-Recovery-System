@@ -3551,17 +3551,33 @@ post-reset VALIDATE_GPU re-graded a reading that still said
 14:59:45Z; the workflow finished 15:06Z and lifted the quarantine) -- the
 product's documented policy for a pending remap a reset did not clear, right
 on what it was shown. The variant's subject is composite scoping, not that
-escalation, so three things changed in the harness. (1) The plan is bounded:
-the pair is served for one correlation window (`window_reads`:
-`GpuMetricThresholds.correlation_window_seconds`, 45 s, three reads of the
-15-s collector) and the tool then serves the real readings by itself -- as a
-reset applies a pending remap -- before RESET_GPU completes (70-90 s after the
-mint live), whether or not the runner still reaches the node; the scoping is
-judged on the records read after that window (`scoping_errors`: no
-GPU_MEMORY_DEGRADATION finding or incident on either GPU, the error GPU's own
-incident present, no incident of the other GPU's reading on either GPU), and
-the spec text now says the chain ends RECOVERED with no RESTART_NODE
-escalation. (2) The oracle gate falls back to the product's records when the
+escalation, so three things changed in the harness. (1) The plan is bounded
+to exactly the one scrape that mints both findings (`MINTING_READS`, never a
+spare), and the tool is back on the real readings by itself -- as a reset
+applies a pending remap -- before the chain's quiesce stops the collector.
+A window of reads would not do (S36's finding on 019): QUIESCE_GPU_SERVICES
+stops `gpu-fault-metrics-collector` and the exporter container on both
+providers (`node_agent/common.py` DEFAULT_QUIESCE_SERVICES /
+DEFAULT_QUIESCE_CONTAINERS) within ~10 s of the mint (eksb 07:48Z journal:
+read 4 served the pair, the next scrape 15 s later was "Connection refused"),
+the field tool consumes a read only on a scrape it could serve
+(`make_server`: a failed upstream fetch is journaled as an error and `reads`
+does not advance), so any fault read left unconsumed is served to the first
+scrape after RESTORE_GPU_SERVICES -- the batch the post-reset VALIDATE_GPU
+grades (fresh metrics after the RESET_GPU readiness barrier, then the GPU's
+active findings, no grace for `row_remap_pending`) -- and
+`escalation.next_rung` turns a validation failed after a reset into
+RESTART_NODE. One scrape mints every record the variant judges
+(`gpu_memory_policy.memory_decision`: DBE > 0 is CRITICAL, the pending flag
+WARNING RESET_GPU, no delta, confirmation or sustain; the same-GPU composite
+forms on that first batch too -- pinned by ingesting one batch through
+`GpuMetricsService`). The records are judged once the repair record has
+ended (`scoping_errors`: no GPU_MEMORY_DEGRADATION finding or incident on
+either GPU, the error GPU's own incident present, no incident of the other
+GPU's reading on either GPU; hardware per incident; the repair incident
+RECOVERED by itself), the replay is closed after the chain -- never inside
+it, where its collector restart would fight the quiesce -- and the spec text
+now says the chain ends RECOVERED with no RESTART_NODE escalation. (2) The oracle gate falls back to the product's records when the
 journal cannot be read because the node is away (`wait_served_or_records`,
 evidence `replay-gate-deferred`) and the journal is read at the close; any
 other probe failure stays the fixture failure it was. (3) `DcgmReplay.close`
@@ -3575,20 +3591,25 @@ proxy unit and deadman live under /run and cannot survive a boot); only a node
 that never comes back without rebooting leaves the close unproven, and the
 error names the boot id and readiness it saw. Tests:
 `tests/regional/test_general_live_gpu_composite.py` (the installed plan driven
-through the field tool -- three pass-through reads, three served reads, then
-the exporter's own scrape byte for byte; the records gate; the scoping oracle
-over findings and incidents) and
+through the field tool -- three pass-through reads, one served read, then the
+exporter's own scrape byte for byte; the product facts the one-read bound
+rests on; the close after the settled record; the records gate; the scoping
+oracle over findings and incidents) and
 `tests/regional/test_general_live_gpu_replay_reboot_close.py` (the quiesce
 return, the Ready settle, the quiesce taint, the reboot verdict, unproven
 inside and outside the budget). The variants whose finding plans no reset --
 `memory_failure` (QUARANTINE only), `corrected_memory`, `fresh_components`,
 `reused_components`, `independent_xid`, `nvlink_multiple_gpus` (diagnostic
-composites) -- have no reset to outlast and keep their held plans; they gain
-the reboot-aware close. 019 `pending_supported` / `post_reset` hold
-`row_remap_pending=1` into the same chain and advance or close it through the
-probe (`post_reset` after RESET_GPU SUCCEEDED, while kubelet is still down on
-HyperPod), so they carry the same exposure there and are to be bounded the same
-way before their next HyperPod run.
+composites) -- plan no reset, and only the reset family's chain
+(`orchestration/families/health._reset_operations`) carries the quiesce, so
+their collector never stops under a held plan and no fault read can be
+served late; they keep their held plans and gain the reboot-aware close. 019
+`pending_supported` / `post_reset` held `row_remap_pending=1` into the same
+chain and advanced or closed it through the probe (`post_reset` after
+RESET_GPU SUCCEEDED, while kubelet is still down on HyperPod) -- the same
+exposure on both providers; S36 bounded them to the one minting scrape the
+same way (`pending_fault_reads`), gated on the journal or the records, judged
+on the settled record and closed after the chain.
 
 019 `pending_supported` and `post_reset` are now bounded and judged on the
 records (S36, 2026-10-26; both are X variants under `GPU_RESET` that have never

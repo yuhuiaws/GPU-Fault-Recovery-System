@@ -167,9 +167,9 @@ def test_registry_covers_024() -> None:
         "the GPU_RESET token names the replayed reading"
     )
     assert "RESET_GPU" in spec.injection and "RECOVERED by itself" in spec.expected
-    # The plan is bounded to one correlation window and the chain must end in
+    # The plan is bounded to the one scrape that mints and the chain must end in
     # RECOVERED, never in the RESTART_NODE escalation a held flag provoked live.
-    assert "correlation window" in spec.injection
+    assert "exactly the one scrape" in spec.injection
     assert "no RESTART_NODE escalation" in spec.expected
     assert "on the records" in spec.expected
     for variant in ("corrected_memory", "fresh_components", "reused_components"):
@@ -727,32 +727,246 @@ def test_wrong_scope_source_passes_when_no_composite(
     assert any("settles RECOVERED by itself" in note for note in out["notes"]), out[
         "notes"
     ]
-    # The fault pair is served for one correlation window (three reads of the
-    # 15-s collector) in a bounded step -- never held -- and nothing advances.
-    assert (out["fault_reads"], out["oracle_gate"]) == (3, "journal")
+    # The fault pair is served for exactly the one scrape that mints it, in a
+    # bounded step -- never held -- and nothing advances.
+    assert (out["fault_reads"], out["oracle_gate"]) == (1, "journal")
     document = _installed_plan(out["_probe"])
     assert [
         (item["reads"], item.get("until_advance", False)) for item in document["steps"]
-    ] == [(3, False), (3, False)]
+    ] == [(3, False), (1, False)]
     assert "advance" not in [call[0] for call in out["_probe"].calls]
     assert any("returned to the real readings by itself" in n for n in out["notes"]), (
         out["notes"]
     )
 
 
-def test_window_reads_cover_one_correlation_window_at_the_collector_interval() -> None:
-    assert comp.COMPOSITE_WINDOW_SECONDS == 45
-    assert comp.window_reads(15) == 3
-    assert comp.window_reads(10) == 5
-    assert comp.window_reads(30) == 2
-    assert comp.window_reads(60) == 2, "at least two reads, one spare for a skip"
+def test_the_fault_pair_mints_on_one_scrape_and_a_spare_would_land_after_the_restore(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Why the plan serves the pair for exactly one scrape (``MINTING_READS``).
+
+    The product mints every record the variant judges on the batch that
+    carries the pair; the repair chain's quiesce stops the collector and the
+    exporter on both providers; the field tool consumes a read only on a
+    scrape it could serve, so a spare fault read waits for the first scrape
+    after the restore -- the batch the post-reset VALIDATE_GPU grades -- and a
+    validation failed after a reset is the RESTART_NODE rung.
+    """
+
+    import io
+    import threading
+    from datetime import datetime, timedelta, timezone
+    from urllib.error import HTTPError
+    from urllib.request import Request, urlopen
+
+    from gpu_fault.adapters.gpu_validation import TELEMETRY_READINESS_OPERATIONS
+    from gpu_fault.gpu_metrics import (
+        GpuMetricBatch,
+        GpuMetricSample,
+        GpuMetricSource,
+        GpuMetricsService,
+    )
+    from gpu_fault.models import WorkflowOperation
+    from gpu_fault.node_agent.common import (
+        DEFAULT_QUIESCE_CONTAINERS,
+        DEFAULT_QUIESCE_SERVICES,
+    )
+    from gpu_fault.orchestration.escalation import next_rung
+    from tools import gpu_dcgm_field_replay as tool
+
+    assert comp.MINTING_READS == 1
+    node = "ip-10-0-43-5.us-west-2.compute.internal"
+    start = datetime(2026, 10, 26, 14, 53, 59, tzinfo=timezone.utc)
+
+    def sample(name: str, value: float, gpu: str, index: str) -> GpuMetricSample:
+        return GpuMetricSample(
+            metric_name=f"DCGM_{name.upper()}",
+            canonical_name=name,
+            value=value,
+            gpu_index=index,
+            gpu_uuid=gpu,
+            pci_bdf=f"00000000:0{int(index) + 1}:00.0",
+            labels={"modelName": "NVIDIA H200"},
+        )
+
+    def ingest(service: GpuMetricsService, tick: int, samples: list) -> Any:
+        return service.ingest(
+            GpuMetricBatch(
+                batch_id=f"b{tick}",
+                cluster_id="gpu-eks-cluster",
+                node_id=node,
+                observed_at=start + timedelta(seconds=15 * tick),
+                source=GpuMetricSource.DCGM_EXPORTER,
+                samples=samples,
+            )
+        )
+
+    # One batch carrying the pair on two GPUs mints two per-GPU findings and no
+    # composite (the live 14:54:03Z records, 4 s behind the first replayed
+    # scrape); the next real reading clears both, nothing waits for a later one.
+    service = GpuMetricsService()
+    first = ingest(
+        service,
+        0,
+        [
+            sample("ecc_dbe_volatile_total", 1.0, G0, "0"),
+            sample("row_remap_pending", 1.0, G1, "1"),
+        ],
+    )
+    assert {
+        (item.gpu_uuid, item.canonical_name): item.automatic_action
+        for item in first.new_findings
+    } == {
+        (G0, "ecc_dbe_volatile_total"): "QUARANTINE",
+        (G1, "row_remap_pending"): "RESET_GPU",
+    }
+    assert first.new_composite_findings == []
+    second = ingest(
+        service,
+        1,
+        [
+            sample("ecc_dbe_volatile_total", 0.0, G0, "0"),
+            sample("row_remap_pending", 0.0, G1, "1"),
+        ],
+    )
+    assert second.new_findings == [] and service.findings("gpu-eks-cluster", node) == []
+    # The same pair on one GPU composes on that first batch too (memory_failure).
+    same = ingest(
+        GpuMetricsService(),
+        0,
+        [
+            sample("ecc_dbe_volatile_total", 1.0, G1, "1"),
+            sample("row_remap_pending", 1.0, G1, "1"),
+        ],
+    )
+    assert [item.correlation_rule_id for item in same.new_composite_findings] == [
+        comp.MEMORY_RULE
+    ]
+
+    # The quiesce stops the collector and the exporter container on both
+    # providers; the post-reset VALIDATE_GPU grades readings newer than the
+    # reset; a validation failed after a reset is the reboot rung.
+    assert "gpu-fault-metrics-collector" in DEFAULT_QUIESCE_SERVICES
+    assert "gpu-fault-system/exporter" in DEFAULT_QUIESCE_CONTAINERS
+    assert WorkflowOperation.RESET_GPU in TELEMETRY_READINESS_OPERATIONS
+    assert (
+        next_rung(WorkflowOperation.VALIDATE_GPU, {WorkflowOperation.RESET_GPU})
+        is WorkflowOperation.RESTART_NODE
+    )
+
+    # The tool consumes a read only on a scrape it could serve: a two-read
+    # fault step keeps its second read for the first scrape after the exporter
+    # is back (the validation's batch); the one-read step is already done.
+    exporter_down = [False]
+
+    def open_upstream(*_args: Any, **_kwargs: Any) -> io.BytesIO:
+        if exporter_down[0]:
+            raise OSError("Connection refused")
+        return io.BytesIO(_exposition())
+
+    monkeypatch.setattr(tool, "open_upstream", open_upstream)
+    pair = [
+        {"op": "add", "field": "ecc_dbe_volatile_total", "gpus": [G0], "value": 1},
+        {"op": "set", "field": "row_remap_pending", "gpus": [G1], "value": 1},
+    ]
+
+    def scrape_through(reads: int) -> tuple[list[Any], list[dict[str, Any]]]:
+        replay = tool.Replay(
+            tool.validate_plan(
+                {
+                    "profile": "composite",
+                    "steps": [{"reads": 3, "ops": []}, {"reads": reads, "ops": pair}],
+                }
+            ),
+            600,
+        )
+        audit = io.StringIO()
+        server = tool.make_server("http://127.0.0.1:9400/metrics", 0, replay, audit)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        pendings: list[Any] = []
+        try:
+            with urlopen(
+                Request(
+                    base + "/arm",
+                    method="POST",
+                    headers={"X-GFRS-Replay-Ack": tool.ACKNOWLEDGEMENT},
+                ),
+                timeout=5,
+            ):
+                pass
+            for _ in range(4):  # three baseline scrapes and the minting one
+                with urlopen(base + "/metrics", timeout=5) as response:
+                    pendings.append(_view(response.read())[(G1, "row_remap_pending")])
+            exporter_down[0] = True  # the quiesce: the exporter is gone
+            with pytest.raises(HTTPError) as refused:
+                urlopen(base + "/metrics", timeout=5)
+            assert refused.value.code == 503
+            assert replay.reads == 4, "a scrape the tool could not serve is no read"
+            exporter_down[0] = False  # RESTORE_GPU_SERVICES: the first scrape after
+            with urlopen(base + "/metrics", timeout=5) as response:
+                pendings.append(_view(response.read())[(G1, "row_remap_pending")])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(5)
+        return pendings, [json.loads(line) for line in audit.getvalue().splitlines()]
+
+    spare, journal = scrape_through(2)
+    assert spare == [0.0, 0.0, 0.0, 1.0, 1.0], (
+        "the spare read is served after the restore: the escalation"
+    )
+    assert [item.get("read") for item in journal if "error" in item] == [5]
+    minting, _journal = scrape_through(comp.MINTING_READS)
+    assert minting == [0.0, 0.0, 0.0, 1.0, 0.0], (
+        "the one-read plan is done before the quiesce; the restore reads the device"
+    )
+
+
+def test_wrong_scope_source_closes_the_replay_after_the_repair_record_ended(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The close restarts the collector; inside the chain that would fight the
+    # quiesce, so it comes after the settled record and before the restore.
+    order: list[str] = []
+    real_settled = comp.settled
+
+    def settled(activity: dict[str, Any], incidents: Any) -> bool:
+        value = real_settled(activity, incidents)
+        if value:
+            order.append("settled")
+        return value
+
+    def close_run(arguments: tuple[str, ...]) -> dict[str, Any]:
+        order.append("close-run")
+        return dcgm_probe().script["close-run"]
+
+    monkeypatch.setattr(comp, "settled", settled)
+    probe = dcgm_probe(
+        audit=audit_records({f"{G0}/ecc_dbe_volatile_total": 1.0}),
+        extra={"close-run": close_run},
+    )
+    error, isolation = _error_incident()
+    repair, chain = _repair_incident()
+    out = _wrong_scope(
+        tmp_path, monkeypatch, [error, repair], [isolation, chain], probe=probe
+    )
+    assert out["verdict"] == "PASS", out["errors"]
+    assert order[0] == "settled" and order[-1] == "close-run", order
+    assert order.count("close-run") == 1
+    assert out["_restored"] == [["inc"]]
+    assert any("closed after the chain" in note for note in out["notes"]), out["notes"]
+    assert "composite-window-hold.json" not in {
+        p.name for p in out["_ctx"].case_dir.iterdir()
+    }
 
 
 def test_wrong_scope_source_plan_returns_to_the_real_readings_by_itself(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The installed plan, run through the field tool over a real-shaped
-    scrape: three pass-through reads, three reads of the pair, then the real
+    scrape: three pass-through reads, one read of the pair, then the real
     readings for good -- what the reset chain's post-reset VALIDATE_GPU reads
     (live 2026-10-26 14:54Z the held plan still said row_remap_pending=1 there
     and the product escalated to RESTART_NODE)."""
@@ -783,12 +997,12 @@ def test_wrong_scope_source_plan_returns_to_the_real_readings_by_itself(
         (0.0, 0.0, 0),
         (0.0, 0.0, 0),
         (1.0, 1.0, 1),
-        (2.0, 1.0, 1),
-        (3.0, 1.0, 1),
+        (0.0, 0.0, None),
+        (0.0, 0.0, None),
         (0.0, 0.0, None),
         (0.0, 0.0, None),
     ]
-    assert [item[0] for item in served[6:]] == [True, True], (
+    assert [item[0] for item in served[4:]] == [True] * 4, (
         "after the plan the scrape is the exporter's own, byte for byte"
     )
     assert replay.active() is None and not replay.disarmed

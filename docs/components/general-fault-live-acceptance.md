@@ -979,27 +979,41 @@ dcgm close-run: host probe response is missing (exit 1)"，oracle gate 的 audit
 探针 Pod 容忍它），探针 Pod 无法 exec，回放一直 armed，链的 reset 后 VALIDATE_GPU 重新评分时读到的
 仍是 `row_remap_pending=1`：QUARANTINE → RESTART_NODE（节点 ~14:57Z NotReady，14:59:45Z Ready，
 工作流 15:06Z 结束并解除隔离）——这是产品对 reset 未清除 pending remap 的既定策略，就其所见是正确
-的。该变体的主题是复合 scoping 而非这条升级链，夹具因此改三点：(1) 计划有界：这一对只服务一个关联
-窗口（`window_reads`：`correlation_window_seconds` 45 s，15 s 采集器即 3 读），随后工具自行回到真实
-读数（如同 reset 应用了 pending remap），早于 RESET_GPU 完成（实测铸出后 70-90 s），且不依赖 runner
-是否还能到达节点；scoping 在窗口过后按记录判定（`scoping_errors`：两卡均无 GPU_MEMORY_DEGRADATION
-finding/incident、错误 GPU 自己的 incident 存在、任一卡没有对方读数的 incident），spec 文本写明链以
-RECOVERED 结束、不升级 RESTART_NODE。(2) 节点离线导致 journal 不可读时，oracle gate 退回产品记录
+的。该变体的主题是复合 scoping 而非这条升级链，夹具因此改三点：(1) 计划有界到恰好铸出两个 finding 的
+那一次 scrape（`MINTING_READS`，绝不多留一读），随后工具自行回到真实读数（如同 reset 应用了 pending
+remap），早于链的 quiesce 停掉采集器。一个读数窗口并不够（S36 在 019 上的发现）：QUIESCE_GPU_SERVICES
+在两种 provider 上都停掉 `gpu-fault-metrics-collector` 与 exporter 容器（`node_agent/common.py`
+DEFAULT_QUIESCE_SERVICES / DEFAULT_QUIESCE_CONTAINERS），距铸出约 10 s（eksb 07:48Z journal：第 4 读
+服务了这一对，15 s 后的下一次 scrape 即 "Connection refused"）；字段工具只对能服务的 scrape 计读
+（`make_server`：上游取数失败只记 error、`reads` 不前进），所以 quiesce 时尚未消耗的故障读会被服务给
+RESTORE_GPU_SERVICES 之后的第一次 scrape——正是 reset 后 VALIDATE_GPU 评分的那一批（RESET_GPU 就绪屏障
+之后的新鲜 metrics，再看该 GPU 的 active finding，对 `row_remap_pending` 无宽限），而
+`escalation.next_rung` 把 reset 后失败的 validation 升为 RESTART_NODE。一次 scrape 就铸出该变体要判的
+全部记录（`gpu_memory_policy.memory_decision`：DBE > 0 即 CRITICAL、pending 标志即 WARNING
+RESET_GPU，无 delta/确认/持续要求；同卡复合也在这第一批形成——以 `GpuMetricsService` 灌一批样本钉住）。
+记录在修复 incident 的 record 结束后判定（`scoping_errors`：两卡均无 GPU_MEMORY_DEGRADATION
+finding/incident、错误 GPU 自己的 incident 存在、任一卡没有对方读数的 incident；硬件按 incident 分域；
+修复 incident 自行 RECOVERED），回放在链结束后才 close——绝不在链中间 close，那会用采集器重启去对抗
+quiesce——spec 文本写明链以 RECOVERED 结束、不升级 RESTART_NODE。(2) 节点离线导致 journal 不可读时，oracle gate 退回产品记录
 （`wait_served_or_records`，证据 `replay-gate-deferred`），journal 在 close 时补读；其他探针失败仍按
 夹具失败处理。(3) `DcgmReplay.close` 不再因产品拿走探针而失败（`general_live_gpu_replay_close`）：
 在变体剩余预算内（最多 15 min，预留 3 min）轮询 Node 对象，等 Ready 持续 45 s 且无 quiesce taint 后
 先读 journal 再重试 `close-run`；boot id 相对部署时改变的节点按重启判清（`judged_by: node reboot`：
 drop-in、run 目录、transient proxy unit 与 deadman 都在 /run，重启后不可能残留）；只有未重启且始终
 不应答的节点才算 close 未证明，错误写明所见 boot id 与 Ready 状态。测试见
-`tests/regional/test_general_live_gpu_composite.py`（装入的计划经字段工具驱动：3 读透传、3 读服务、
-之后逐字节是 exporter 自己的 scrape；记录 gate；finding 与 incident 的 scoping oracle）与
+`tests/regional/test_general_live_gpu_composite.py`（装入的计划经字段工具驱动：3 读透传、1 读服务、
+之后逐字节是 exporter 自己的 scrape；一读上界所依赖的产品事实；record 结束后才 close；记录 gate；
+finding 与 incident 的 scoping oracle）与
 `tests/regional/test_general_live_gpu_replay_reboot_close.py`（quiesce 恢复、Ready 稳定期、quiesce
 taint、重启判清、预算内外的未证明）。不计划 reset 的变体（`memory_failure` 仅 QUARANTINE，
 `corrected_memory`/`fresh_components`/`reused_components`/`independent_xid`/`nvlink_multiple_gpus`
-为诊断复合）没有要熬过的 reset，保持原计划，同样受益于重启感知的 close；019
-`pending_supported`/`post_reset` 把 `row_remap_pending=1` 保持进同一条链并经探针 advance/close
-（`post_reset` 在 RESET_GPU SUCCEEDED 后、HyperPod 上 kubelet 仍停着时），在 HyperPod 上有同样的
-暴露，下次 HyperPod 运行前应同样改为有界计划。
+为诊断复合）不计划 reset，而只有 reset 族的链（`orchestration/families/health._reset_operations`）带
+quiesce，所以它们的采集器不会在保持计划下停掉、不存在被延后服务的故障读，保持原计划，同样受益于重启
+感知的 close；019
+`pending_supported`/`post_reset` 原先把 `row_remap_pending=1` 保持进同一条链并经探针 advance/close
+（`post_reset` 在 RESET_GPU SUCCEEDED 后、HyperPod 上 kubelet 仍停着时），两种 provider 上都有同样的
+暴露，S36 已同样改为只服务铸出的那一次 scrape（`pending_fault_reads`）、journal 或记录 gate、按结束后的
+record 判定、链结束后再 close。
 
 `independent_xid` 2026-10-26 08:07Z（eks ip-10-0-43-5，R13g）FAIL "2 CORRECTABLE_MEMORY_DEGRADATION
 incidents (expected one)"：两个复合 incident 的 batch 分别为 07:54:39.12Z（第一次回放读，WARNING）

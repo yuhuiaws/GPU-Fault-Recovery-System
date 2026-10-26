@@ -18,9 +18,11 @@ product's real correlation and de-duplication, not just a rule name:
   judged on the product's records (incidents and findings per GPU); the
   repair GPU's own pending-repair finding may run the product's authorized
   single-GPU service-window reset (``GPU_RESET`` approval, hardware judged per
-  incident) and must settle RECOVERED by itself, so the pair is served for one
-  correlation window only and the plan returns to the real readings before
-  the reset is validated (``window_reads``);
+  incident) and must settle RECOVERED by itself, so the pair is served for
+  exactly the one scrape that mints both findings (``MINTING_READS``) and the
+  tool is back on the real readings before the chain's quiesce stops the
+  collector; the records are judged once the record has ended and the replay
+  is closed after the chain, never inside it;
 * ``independent_xid`` -- a trusted kernel XID on the GPU of a weak composite
   keeps its own catalog decision and incident; the composite never covers it
   (``general_live_kernel_xid``: XID 92 EXCESSIVE_SBE_INTERRUPTS, catalog
@@ -141,34 +143,35 @@ REPAIR_COMPANIONS = ("row_remap_pending", "retired_pages_pending")
 #: ``row_remap_pending=1`` fails it and the product escalates QUARANTINE ->
 #: RESTART_NODE (live 2026-10-26 14:54-15:06Z, HyperPod, R13g: the quiesce had
 #: stopped kubelet and with it the probe that would have closed the replay),
-#: so the plan is bounded (``window_reads``) and never relies on the runner.
+#: so the plan is bounded (``MINTING_READS``) and never relies on the runner.
 SERVICE_WINDOW_RESET = frozenset({"QUIESCE_GPU_SERVICES", "RESET_GPU"})
 KERNEL_SOURCE_REPLAY = "KERNEL_SOURCE_REPLAY"
-#: The product correlates component findings into a composite within this
-#: window (``gpu_metrics.GpuMetricThresholds.correlation_window_seconds``,
-#: default 45): a pair served for one whole window that did not compose never
-#: will, so a scoping plan serves its pair that long and no longer.
-COMPOSITE_WINDOW_SECONDS = 45
+#: The scrapes the fault pair is served to: exactly the one that mints, never
+#: a spare. The product grades both readings on the batch that carries them
+#: (``gpu_memory_policy.memory_decision``: ``ecc_dbe_volatile_total`` > 0 is
+#: CRITICAL QUARANTINE, ``row_remap_pending`` = 1 is WARNING RESET_GPU, no
+#: delta, confirmation or sustain; the same-GPU GPU_MEMORY_DEGRADATION
+#: composite forms on that first batch too, ``gpu_metrics._add_memory_
+#: composites``), so one scrape mints every record the variant judges -- live
+#: 2026-10-26 both incidents were 4 s behind the first replayed scrape. A
+#: second read would not be a spare but the escalation: the repair chain's
+#: QUIESCE_GPU_SERVICES stops gpu-fault-metrics-collector and the exporter
+#: container on both providers (``node_agent/common.py``
+#: DEFAULT_QUIESCE_SERVICES / DEFAULT_QUIESCE_CONTAINERS) within ~10 s of the
+#: mint (live eksb 07:48Z: read 4 served the pair, the next scrape 15 s later
+#: was "Connection refused"), the field tool consumes a read only on a scrape
+#: it could serve (``make_server``: a failed upstream fetch is journaled as an
+#: error and ``reads`` does not advance), so any fault read left unconsumed is
+#: served to the FIRST scrape after RESTORE_GPU_SERVICES -- the batch the
+#: post-reset VALIDATE_GPU grades (``adapters/gpu_validation``: fresh metrics
+#: after the RESET_GPU readiness barrier, then the GPU's active findings, no
+#: grace for ``row_remap_pending``), and ``escalation.next_rung`` turns a
+#: validation failed after a reset into RESTART_NODE.
+MINTING_READS = 1
 
 
 def _hold(ctx: VariantContext) -> int:
     return min(ctx.spec.max_minutes * 60, 20 * 60)
-
-
-def window_reads(interval: int, seconds: int = COMPOSITE_WINDOW_SECONDS) -> int:
-    """The collector reads that cover ``seconds`` at ``interval`` s each (at
-    least two), the bound of a plan step that must end by itself.
-
-    The reset chain a replayed pending-repair flag starts quiesces the node
-    about 20 s after the mint and completes RESET_GPU 70-90 s after it (live
-    2026-10-26, both clusters); a bounded step of one correlation window
-    (three reads of a 15-s collector) has the tool back on the real readings
-    before the post-reset VALIDATE_GPU reads them, whether or not the runner
-    can still reach the node, and the product's own grading happens on the
-    first replayed scrape (both incidents 4 s after it, live).
-    """
-
-    return max(2, -(-int(seconds) // max(1, int(interval))))
 
 
 def composite_replay(
@@ -481,8 +484,8 @@ def scoping_errors(
 ) -> list[str]:
     """The two replayed findings stayed per-GPU records.
 
-    Judged on the product's own records after the pair was served for a whole
-    correlation window: no GPU_MEMORY_DEGRADATION finding was recorded for
+    Judged on the product's own records once the repair record has ended:
+    no GPU_MEMORY_DEGRADATION finding was recorded for
     either GPU (the finding store, not only the incidents), the error GPU's
     uncorrectable finding minted its own incident, and neither GPU carries an
     incident of the reading the other one replayed.
@@ -533,20 +536,24 @@ def wrong_scope_source(ctx: VariantContext) -> dict[str, Any]:
     RESET_GPU chain (``GPU_RESET`` approval, like 019 ``pending_supported``):
     the chain is the product's policy, not this variant's subject, and the
     variant's duty is to let it end RECOVERED. The pair is therefore served for
-    one correlation window (``window_reads``) and the plan returns to the real
-    readings by itself -- as a reset applies a pending remap -- so the chain's
+    exactly the one scrape that mints both findings (``MINTING_READS``) and
+    the tool is back on the real readings by itself -- as a reset applies a
+    pending remap -- before the chain's quiesce stops the collector, so the
     post-reset VALIDATE_GPU grades the real device whether or not the runner
-    still reaches the node. Live 2026-10-26 14:54-15:06Z (HyperPod, R13g) the
-    held plan was still serving ``row_remap_pending=1`` after the reset -- the
-    quiesce had stopped kubelet and with it the probe that would have closed
-    the replay -- and the product escalated QUARANTINE -> RESTART_NODE, its
-    documented policy for a remap a reset did not clear. The same quiesce
-    takes the journal away before the oracle gate can read it, so the gate
-    falls back to the records (``wait_served_or_records``) and the journal is
-    read at the close, which itself waits for the node to return. The hardware
-    oracle is scoped per incident, the repair incident is left to settle on
-    its own, and only the error GPU's incident is released by the validated
-    restore.
+    still reaches the node; a spare fault read would be served to the first
+    scrape after RESTORE_GPU_SERVICES and be the RESTART_NODE escalation. Live
+    2026-10-26 14:54-15:06Z (HyperPod, R13g) the held plan was still serving
+    ``row_remap_pending=1`` after the reset -- the quiesce had stopped kubelet
+    and with it the probe that would have closed the replay -- and the product
+    escalated QUARANTINE -> RESTART_NODE, its documented policy for a remap a
+    reset did not clear. The same quiesce takes the journal away before the
+    oracle gate can read it, so the gate falls back to the records
+    (``wait_served_or_records``) and the journal is read at the close. The
+    records are judged once the repair record has ended (scoping on incidents
+    and findings, hardware per incident, the repair incident settled RECOVERED
+    by itself), the replay is closed after the chain -- never inside it, where
+    its collector restart would fight the quiesce -- and only the error GPU's
+    incident is released by the validated restore.
     """
 
     survey = run_gpu_survey(ctx)
@@ -561,10 +568,11 @@ def wrong_scope_source(ctx: VariantContext) -> dict[str, Any]:
         UNCORRECTABLE_PRIMARY, REPAIR_COMPANIONS, avoid=[error_gpu]
     )
     repair_gpu = repair.gpu
-    reads = window_reads(survey.interval)
+    reads = MINTING_READS
     since = utc_now()
-    # Bounded, never held: after ``reads`` scrapes the tool serves the real
-    # readings again on its own (the pending flag as a reset leaves it).
+    # Bounded, never held: after the minting scrape the tool serves the real
+    # readings again on its own (the pending flag as a reset leaves it), and
+    # no fault read is left for the first scrape after the chain's restore.
     repl = composite_replay(
         ctx,
         survey,
@@ -584,7 +592,7 @@ def wrong_scope_source(ctx: VariantContext) -> dict[str, Any]:
         ),
         label="wrong_scope_source",
     )
-    wait_gpu_incident(
+    final = wait_gpu_incident(
         ctx,
         since,
         lambda doc: composite_incidents(doc, MEMORY_RULE)
@@ -592,30 +600,9 @@ def wrong_scope_source(ctx: VariantContext) -> dict[str, Any]:
         timeout_seconds=survey.health_summary + 300,
         name="detection",
     )
-    # The scoping is judged once the pair has been served for the whole
-    # correlation window: a composite that did not form within it never forms.
-    ctx.hold(COMPOSITE_WINDOW_SECONDS, name="composite-window")
-    final = activity_now(ctx, since)
-    state = state_now(ctx, since, names=[UNCORRECTABLE_PRIMARY, repair.companion])
-    stages = {
-        "no_cross_gpu_composite": []
-        if not composite_incidents(final, MEMORY_RULE)
-        else ["an error on one GPU composed with repair on another GPU"],
-        "scoped_incidents": scoping_errors(
-            final,
-            state,
-            error_gpu=error_gpu,
-            repair_gpu=repair_gpu,
-            companion=repair.companion,
-        ),
-    }
-    # The plan has run out by itself; the close restores the collector (and,
-    # on a node the chain quiesced or rebooted, waits for it to come back).
-    repl.close()
-    ctx.cleanup.discard("dcgm-replay")
     # The repair GPU's own incident runs its chain on the real (clean) reading;
-    # it is given the service-window reset's time to settle, and the hardware
-    # oracle reads the record after that.
+    # every record is judged once that record has ended (a RESTART_NODE
+    # escalation only shows in full on a settled record).
     repair_incidents = metric_incidents(final, repair.companion, gpu=repair_gpu)
     if not repair_incidents:
         final = wait_gpu_incident(
@@ -634,12 +621,28 @@ def wrong_scope_source(ctx: VariantContext) -> dict[str, Any]:
             timeout_seconds=survey.health_summary + 600,
             name="repair-settled",
         )
-    stages["hardware"] = scoped_hardware_errors(
-        final, repair_incidents=repair_incidents
-    )
-    stages["repair_settled"] = repair_settled_errors(
-        final, repair_incidents, gpu=repair_gpu, component=repair.companion
-    )
+    state = state_now(ctx, since, names=[UNCORRECTABLE_PRIMARY, repair.companion])
+    stages = {
+        "no_cross_gpu_composite": []
+        if not composite_incidents(final, MEMORY_RULE)
+        else ["an error on one GPU composed with repair on another GPU"],
+        "scoped_incidents": scoping_errors(
+            final,
+            state,
+            error_gpu=error_gpu,
+            repair_gpu=repair_gpu,
+            companion=repair.companion,
+        ),
+        "hardware": scoped_hardware_errors(final, repair_incidents=repair_incidents),
+        "repair_settled": repair_settled_errors(
+            final, repair_incidents, gpu=repair_gpu, component=repair.companion
+        ),
+    }
+    # The plan ran out by itself at the minting scrape; the close restores the
+    # collector after the chain, never inside it (its restart would fight the
+    # quiesce), and on a node the chain quiesced or rebooted waits for it.
+    repl.close()
+    ctx.cleanup.discard("dcgm-replay")
     stages["recovery"] = _validated_restore(ctx, _any_incident(final, error_gpu))
     metrics = ", ".join(repair.exporter_metrics) or "exporter name not surveyed"
     return result(
@@ -648,9 +651,12 @@ def wrong_scope_source(ctx: VariantContext) -> dict[str, Any]:
             "GPU_MEMORY_DEGRADATION is per-GPU; components on different GPUs do not compose",
             f"repair gauge exercised: {repair.companion} on {repair_gpu} (exporter "
             f"{metrics}) beside {UNCORRECTABLE_PRIMARY} on {error_gpu}",
-            f"the pair was served for {reads} scrapes (one {COMPOSITE_WINDOW_SECONDS}-s "
-            "correlation window) and the plan returned to the real readings by "
-            "itself, so the reset chain's VALIDATE_GPU graded the real device",
+            f"the pair was served for {reads} scrape{'s' if reads != 1 else ''} (the "
+            "one that mints) and the plan returned to the real readings by itself "
+            "before the chain's quiesce stopped the collector, so the post-reset "
+            "VALIDATE_GPU graded the real device",
+            "judged on the product's records once the repair record had ended; the "
+            "replay was closed after the chain, never inside it",
             "the repair GPU's own incident may run the authorized single-GPU "
             "service-window reset chain and settles RECOVERED by itself; only the "
             "error GPU's incident is released by the validated restore",
@@ -837,14 +843,14 @@ VARIANTS = [
         CASE,
         "wrong_scope_source",
         f"an error on one GPU, repair on another ({REPAIR_PAIR_TEXT}), served for "
-        "one 45-s correlation window and then the real readings again; the repair "
-        "GPU's own pending-repair finding runs the product's authorized single-GPU "
-        "service-window RESET_GPU chain",
+        "exactly the one scrape that mints both findings and then the real "
+        "readings again; the repair GPU's own pending-repair finding runs the "
+        "product's authorized single-GPU service-window RESET_GPU chain",
         "components on different GPUs do not compose (per-GPU incidents and "
-        "findings on the records); the error GPU's isolation plans no hardware "
-        "operation; the repair GPU's reset chain validates the real post-reset "
-        "device and settles RECOVERED by itself (no NVSwitch reset, no "
-        "RESTART_NODE escalation, no reboot)",
+        "findings on the records, judged once the repair record has ended); the "
+        "error GPU's isolation plans no hardware operation; the repair GPU's reset "
+        "chain validates the real post-reset device and settles RECOVERED by "
+        "itself (no NVSwitch reset, no RESTART_NODE escalation, no reboot)",
         wrong_scope_source,
         risk="H",
         flags="X",
