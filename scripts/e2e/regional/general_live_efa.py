@@ -105,6 +105,7 @@ from scripts.e2e.regional.general_live_source_replay import (
     HOST_SOURCE_REPLAY,
     confirmation_ticks,
     exposure_fallback_seconds,
+    exposure_reading_gaps,
     observed_exposure,
     rule,
 )
@@ -329,6 +330,30 @@ def _late_readings(
     ]
 
 
+def _gaps(
+    exposure: Mapping[str, Any],
+    document: Mapping[str, Any],
+    metric: str,
+    ticks: int,
+    *,
+    device: str | None = None,
+) -> str:
+    """The INCONCLUSIVE's naming of the reading a bounded exposure missed: the
+    tick that was no collector read (the restarted unit's READY=1 stamp, live
+    eks 2026-10-26), the batch without the reading, the reading after the close
+    (``general_live_source_replay.exposure_reading_gaps``)."""
+
+    lines = exposure_reading_gaps(
+        exposure,
+        document.get("batches") or [],
+        metric=metric,
+        required=ticks,
+        tolerance_seconds=CLOCK_TOLERANCE_SECONDS,
+        device=device,
+    )
+    return "".join(f"; {line}" for line in lines)
+
+
 def link_inactive(ctx: VariantContext) -> dict[str, Any]:
     """A bound port state != ACTIVE for a bounded exposure -> ``rdma_link_down=1``
     -> the fabric diagnostic fails on the held port; the LINK_INACTIVE
@@ -402,6 +427,7 @@ def link_inactive(ctx: VariantContext) -> dict[str, Any]:
             f"the bounded exposure ({exposure_seconds} s, closed by {closed_by}) ended "
             f"before the product read "
             f"{LINK_METRIC} on {target.port_device}: no sample, nothing to judge"
+            + _gaps(exposure, held, LINK_METRIC, ticks, device=target.port_device)
         )
     judged = (
         final_execution(

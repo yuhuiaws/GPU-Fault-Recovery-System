@@ -105,6 +105,10 @@ class FakeHost:
         self.clock_us = 1_000_000_000
         self.exec_start_us = self.clock_us
         self.pings: list[float] = []
+        #: READY=1, s after the start: systemd's start-post stamps the unit's
+        #: watchdog then, 30 us before ActiveEnterTimestampMonotonic (the live
+        #: eks collector 2026-10-26: 1.9 s, taken for the first tick).
+        self.ready_offset = 1.9
 
     @property
     def environment(self) -> dict[str, str]:
@@ -178,12 +182,23 @@ class FakeHost:
         for unit in self.units:
             self.loaded_dropins[unit] = self.dropins_on_disk(unit)
 
+    def active_enter_us(self) -> int:
+        """``ActiveEnterTimestampMonotonic``: 0 while the unit is still activating."""
+
+        ready = self.exec_start_us + int(self.ready_offset * 1e6)
+        return ready + 30 if self.clock_us >= ready else 0
+
     def watchdog_stamp(self) -> int:
-        """The last WATCHDOG=1 ping at or before the fake clock, as systemd stamps it."""
+        """The last WATCHDOG=1 ping at or before the fake clock, as systemd stamps
+        it; before any ping, the stamp start-post left on READY=1 (30 us before
+        the activation), and 0 while the unit is still activating."""
 
         elapsed = (self.clock_us - self.exec_start_us) / 1e6
         past = [ping for ping in self.pings if ping <= elapsed]
-        return self.exec_start_us + int(max(past) * 1e6) if past else 0
+        if past:
+            return self.exec_start_us + int(max(past) * 1e6)
+        active = self.active_enter_us()
+        return active - 30 if active else 0
 
     def monotonic_us(self) -> int:
         return self.clock_us
@@ -286,6 +301,7 @@ class FakeHost:
                     "NeedDaemonReload="
                     f"{'yes' if self.loaded_dropins[unit] != self.dropins_on_disk(unit) else 'no'}\n"
                     f"ExecMainStartTimestampMonotonic={self.exec_start_us}\n"
+                    f"ActiveEnterTimestampMonotonic={self.active_enter_us()}\n"
                     f"WatchdogTimestampMonotonic={self.watchdog_stamp()}\n"
                 )
             elif unit.endswith(".timer"):

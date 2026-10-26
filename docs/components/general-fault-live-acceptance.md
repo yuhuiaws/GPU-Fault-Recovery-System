@@ -1787,7 +1787,9 @@ expected FAIL 变体却 PASS），这种底线之下的读数以及无样本可�
   RUN_DIAGNOSTICS → FREEZE_EVIDENCE + VALIDATE_FABRIC 实际执行（失败须点名该指标）、端口仍被
   观察、无硬件动作/隔离；`link_inactive` bind 端口 `state` 为 `1: DOWN`（phys_state 真实），且只
   持有一个**有界曝光期**——探针在节点上观测采集器自己的拍（`await-ticks`：单元的
-  `WatchdogTimestampMonotonic`，即采集器主进程每个 contributor 后与每拍投递后发出的 `WATCHDOG=1`），
+  `WatchdogTimestampMonotonic`，即采集器主进程每个 contributor 后与每拍投递后发出的 `WATCHDOG=1`；
+  只计 `ActiveEnterTimestampMonotonic` 之后的戳，因为 systemd 在 start-post 收到 `READY=1` 时也会打一次戳，
+  见下文 013 的 2026-10-26 eks INCONCLUSIVE），
   在产品确认所需的第 N 拍（`GPU_FAULT_INVENTORY_MISMATCH_CONSECUTIVE_SAMPLES`，默认 2）结束后立即关窗
   （`general_live_source_replay.observed_exposure`）：第一拍出 `rdma_link_down` WARNING，
   第二拍是其 VALIDATE_FABRIC 判定的新鲜读数（在持有的端口上 FAILED，并点名该指标）同时确认共现的
@@ -2337,6 +2339,23 @@ bundle 保守，却判 "did not request process state capture"，是 oracle 把 
   无 RESTART_NODE、恢复满数。曝光期内未出 finding 或窗口内记录的缺口读数少于 N 拍（消息写明观测到的
   拍数、曝光秒数与关窗者），或恢复后仍记录到 `efa_inventory_missing_count>=1`（上界未守住，此时产品对
   新鲜不活动证据的升级是设计所为）记 INCONCLUSIVE，不是对产品的判定。
+  2026-10-26 18:59Z 同一设计在 eks（R13g）再跑仍 INCONCLUSIVE（21.4 s 曝光期、探针"两拍"后关窗、
+  窗内只有 1 个缺口读数、无 finding），而 hpb 当天同一 harness PASS：问题在探针计拍的时序，不在设计。
+  systemd 在 `Type=notify` 单元进入 start-post（收到 `READY=1`）时也会给 `WatchdogTimestampMonotonic`
+  打一次戳——比 `ActiveEnterTimestampMonotonic` 早 30 µs、在采集器启动相位之前（systemd 255 上用临时
+  用户单元复现）——探针循环若在第一真实拍之前开始，就把这枚戳读成一次 ping：eks 上重启后 1.9 s 收到
+  READY、12.6 s 才打第一真实拍，循环 11.1 s 开始（exec 往返），READY 戳成了"第一拍"，采集器第一次
+  真实读取后即关窗；hpb 的第一真实拍（10 s）先于循环开始（12 s），已把那枚戳覆盖。产品记录指明缺的是
+  哪个读数：`rdma_link_down` 由 18:59:13.83Z 那一拍触发（批次 `observed_at` 是该拍开始、各 contributor
+  读取之前的戳，不是投递时刻），03.1Z 附近没有任何读取，窗内没有被"晚投递"的读数——缺的是第二次确认
+  读取本身在关窗前从未发生。现在 `await-ticks` 只计严格晚于 `ActiveEnterTimestampMonotonic` 的戳
+  （`STAMP_PROPERTIES`；回执与 `link-inactive-exposure.json` 带 `unit_active_at`），deadman 仍是硬上界，
+  INCONCLUSIVE 文本点名缺失的读数（`general_live_source_replay.exposure_reading_gaps`，010
+  `link_inactive` 的"no sample"同样引用：没有批次的拍 = "不是采集器读取，或批次未投递"，批次无缺口 =
+  "该拍未读到缺口"，关窗后观测到的缺口 = "恢复后读取、在上界之外"，再写明还有几次确认读数在关窗前
+  未发生）；测试在探针的假 systemd（`FakeHost.ready_offset`：READY 戳 1.9 s、真实拍 12.6–13.0 s 与
+  27.6–28.0 s、循环 11.1 s 开始，关窗须在第二真实拍之后、第三拍 42.6 s 之前——旧规则 19–21 s 即关）
+  与产品记录（12.6 s 一个缺口批次、无 finding）上回放 eks 时间线，并钉住三类 gap 文本。
 - 013 `pci_missing`（`risk H`，`X`，两个集群，`--approve HOST_SOURCE_REPLAY NODE_REBOOT`，
   模块 `general_live_efa_pci.py`，`expected_outcome=PASS`）：先做规格要求的反向阶段——
   `build-pci-fixture --unreadable` 把夹具路径建成普通文件并以 `pci-root` 重指入 host collector

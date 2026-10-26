@@ -883,6 +883,110 @@ def test_link_inactive_is_inconclusive_when_the_bound_decided_nothing(
         mod.link_inactive(ctx)
 
 
+def test_link_inactive_names_the_reading_the_exposure_missed(tmp_path: Path) -> None:
+    """The live eks run of 2026-10-26 (18:59Z, R13g) replayed on the product's
+    records: the probe took the restarted unit's READY=1 stamp (1.9 s after the
+    open; systemd's start-post watchdog reset, not a ping) for tick 1, the
+    collector's first real tick read the port 12.6 s in -- the one shortfall
+    batch, ``observed_at`` the tick's start -- and the probe closed 21.4 s in,
+    before the second confirming read; no finding. The INCONCLUSIVE names the
+    tick that was no collector read and the confirming reading that never
+    happened; a batch without the shortfall and a shortfall observed after the
+    close are named as such."""
+
+    def exposure(**ticks: Any) -> FakeProbe:
+        receipt = _ticks_receipt(closed_at=_soon(0))
+        receipt.update(ticks)
+        return _tree_probe(**{"await-ticks": receipt})
+
+    def tick(first: float, last: float, pings: int = 2) -> dict[str, Any]:
+        return {
+            "pings_seen": pings,
+            "first_ping_at": _soon(first),
+            "last_ping_at": _soon(last),
+        }
+
+    def shortfall(seconds: float) -> dict[str, Any]:
+        return _efa_batch(
+            _soon(seconds), failure_mode="LINK_INACTIVE", active=2, mismatch=0
+        )
+
+    def healthy(seconds: float) -> dict[str, Any]:
+        return _efa_batch(_soon(seconds), failure_mode="HEALTHY", active=3, mismatch=0)
+
+    # The eks chronology, on the old receipt (no unit_active_at, the READY stamp
+    # as tick 1): open -21.4 s, READY -19.5 s, read -8.8 s, pings -8.6..-8.4 s.
+    detection = _base_doc(batches=[shortfall(-8.8)])
+    ctx = _tree_ctx(
+        "link_inactive",
+        docs=[_base_doc(), detection, detection],
+        tmp_path=tmp_path,
+        probe=exposure(ticks=[tick(-19.5, -19.5, 1), tick(-8.6, -8.4)]),
+    )
+    with pytest.raises(VariantInconclusive) as caught:
+        mod.link_inactive(ctx)
+    text = str(caught.value)
+    assert "1 shortfall reading(s) and 0 efa_inventory_mismatch finding(s)" in text
+    assert (
+        "tick 1 ended " in text
+        and (
+            "no batch of it reached the product -- not a collector read, or its batch "
+            "was never delivered"
+        )
+        in text
+    ), text
+    assert "tick 2 ended" not in text, "the real tick's batch is matched"
+    assert (
+        "1 of the 2 confirming efa_inventory_missing_count readings never happened "
+        "before the close at "
+    ) in text, text
+    # The fixed probe's receipt: real ticks only, the activation named; the
+    # second tick's batch read no shortfall (the real tree).
+    detection = _base_doc(batches=[shortfall(-23.6), healthy(-8.8)])
+    ctx = _tree_ctx(
+        "link_inactive",
+        docs=[_base_doc(), detection, detection],
+        tmp_path=tmp_path,
+        probe=exposure(
+            unit_active_at=_soon(-34.5), ticks=[tick(-23.4, -23.2), tick(-8.6, -8.4)]
+        ),
+    )
+    with pytest.raises(VariantInconclusive) as caught:
+        mod.link_inactive(ctx)
+    text = str(caught.value)
+    assert "tick 1 ended" not in text, text
+    assert "tick 2 ended " in text and "(26.1 s after the unit became active)" in text
+    assert (
+        "its batch carries no efa_inventory_missing_count >= 1 -- the collector read "
+        "no shortfall on it"
+    ) in text, text
+    # A shortfall observed after the close (plus tolerance) is outside the bound.
+    detection = _base_doc(batches=[shortfall(-23.6), shortfall(12.0)])
+    active = _soon(-34.5)
+    ctx = _tree_ctx(
+        "link_inactive",
+        docs=[_base_doc(), detection, detection],
+        tmp_path=tmp_path,
+        probe=exposure(
+            unit_active_at=active, ticks=[tick(-23.4, -23.2), tick(-8.6, -8.4)]
+        ),
+    )
+    with pytest.raises(VariantInconclusive) as caught:
+        mod.link_inactive(ctx)
+    text = str(caught.value)
+    assert (
+        "1 efa_inventory_missing_count reading(s) observed after the close at" in text
+    )
+    assert "read after the restore, outside the bound" in text, text
+    assert "tick 2 ended " in text and "no batch of it reached the product" in text
+    exposure_record = json.loads(
+        (ctx.case_dir / "link-inactive-exposure.json").read_text(encoding="utf-8")
+    )
+    assert exposure_record["unit_active_at"] == active, (
+        "the exposure evidence carries when the unit became active"
+    )
+
+
 def test_tree_variants_block_without_an_active_port(tmp_path: Path) -> None:
     down = _tree_summary()
     for summary in down["devices"].values():

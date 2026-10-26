@@ -180,11 +180,19 @@ MAX_RESTORE_SECONDS = 5400
 ENV_FILE = "env"
 #: ``await-ticks``: the host collector pings ``WATCHDOG=1`` after every
 #: contributor and once more when a tick's batch is posted (``collectors/host/
-#: collector.py`` ``_watchdog_heartbeat`` / ``collect_once``), and systemd
-#: records the last ping in the unit's ``WatchdogTimestampMonotonic``. Pings
-#: closer than ``TICK_GAP_RATIO`` of the interval (at least
+#: collector.py`` ``_watchdog_heartbeat`` / ``collect_once``); systemd records
+#: the last ping in the unit's ``WatchdogTimestampMonotonic`` -- and stamps it
+#: once more when the unit enters start-post on ``READY=1`` (its activation, a
+#: few us before ``ActiveEnterTimestampMonotonic``, before the collector's
+#: startup phase), which is not a tick: only stamps after the activation count.
+#: Pings closer than ``TICK_GAP_RATIO`` of the interval (at least
 #: ``MIN_TICK_GAP_SECONDS``) belong to one tick; the tick has ended once that
 #: gap has passed in silence. The sleep between ticks is the whole interval.
+STAMP_PROPERTIES = (
+    "ExecMainStartTimestampMonotonic",
+    "ActiveEnterTimestampMonotonic",
+    "WatchdogTimestampMonotonic",
+)
 TICK_POLL_SECONDS = 0.5
 TICK_GAP_RATIO = 0.4
 MIN_TICK_GAP_SECONDS = 5.0
@@ -428,16 +436,10 @@ def unit_dropins(unit: str) -> dict[str, Any]:
 
 
 def unit_stamps(unit: str) -> dict[str, int]:
-    """``ExecMainStartTimestampMonotonic`` / ``WatchdogTimestampMonotonic`` (us)."""
+    """``STAMP_PROPERTIES`` of ``unit`` in us; absent when systemd reports none."""
 
     completed = run(
-        [
-            "systemctl",
-            "show",
-            unit,
-            "--property=ExecMainStartTimestampMonotonic",
-            "--property=WatchdogTimestampMonotonic",
-        ],
+        ["systemctl", "show", unit, "--property=" + ",".join(STAMP_PROPERTIES)],
         check=False,
     )
     values: dict[str, int] = {}
@@ -1271,18 +1273,16 @@ def close_window(arguments: argparse.Namespace) -> None:
 
 def await_ticks(arguments: argparse.Namespace) -> None:
     """Wait on the node until the unit completed ``--count`` collector ticks since
-    the window opened, then (``--close``) restore within the same call.
+    it became active, then (``--close``) restore within the same call.
 
-    The exposure is measured from the ticks the collector actually took, not
-    from the restart: after a restart the host collector sleeps a node-specific
-    startup phase (``GPU_FAULT_COLLECTOR_STARTUP_SPREAD_SECONDS`` plus the
-    start-up jitter, up to ~35 s by default) before its first tick, so a fixed
-    1.7-interval deadman closed the live 013 ``link_inactive`` window before
-    the second confirming tick (2026-10-26). The ticks are read from the
-    unit's own ``WatchdogTimestampMonotonic`` (``unit_stamps``), the time of
-    the last ``WATCHDOG=1`` the main process sent; pings closer than the gap
-    belong to one tick. The deadman armed at ``open-window`` stays the bound
-    for a runner that never gets here; ``--timeout`` never exceeds it.
+    The exposure is measured from the ticks the collector actually took (the
+    unit's stamps, ``STAMP_PROPERTIES``), not from the restart: a restarted
+    host collector first sleeps its startup phase (up to ~35 s by default), so
+    a fixed 1.7-interval deadman closed the live 013 ``link_inactive`` window
+    before the second confirming tick, and its ``READY=1`` stamp 1.9 s in
+    passed as the first tick on eks, closing after one real read (2026-10-26).
+    The deadman armed at ``open-window`` stays the bound for a runner that
+    never gets here; ``--timeout`` never exceeds it.
     """
 
     run_id = safe_id(arguments.run_id)
@@ -1301,12 +1301,13 @@ def await_ticks(arguments: argparse.Namespace) -> None:
     started, ticks = monotonic_us(), []
     while True:
         stamps = unit_stamps(unit)
-        stamp, began = (
-            stamps.get("WatchdogTimestampMonotonic", 0),
-            stamps.get("ExecMainStartTimestampMonotonic", 0),
+        stamp = stamps.get("WatchdogTimestampMonotonic", 0)
+        # The activation's own stamp (start-post) is no tick: strictly after it.
+        active = stamps.get("ActiveEnterTimestampMonotonic") or stamps.get(
+            "ExecMainStartTimestampMonotonic", 0
         )
         now = monotonic_us()
-        if stamp and stamp >= began:
+        if stamp > active:
             if not ticks or stamp - ticks[-1]["last"] > gap * 1_000_000:
                 ticks.append({"first": stamp, "last": stamp, "pings": 1})
             elif stamp != ticks[-1]["last"]:
@@ -1324,6 +1325,9 @@ def await_ticks(arguments: argparse.Namespace) -> None:
         "gap_seconds": gap,
         "completed": completed,
         "waited_seconds": round((now - started) / 1e6, 1),
+        "unit_active_at": (
+            (at - timedelta(microseconds=now - active)).isoformat() if active else None
+        ),
         "ticks": [
             {
                 "pings_seen": tick["pings"],

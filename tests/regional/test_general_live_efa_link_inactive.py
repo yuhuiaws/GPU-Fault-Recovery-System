@@ -198,6 +198,13 @@ def test_link_inactive_is_inconclusive_when_the_bound_decided_nothing(
             source=source_probe(inventory(), read_back="4: ACTIVE"),
         )
     assert "closed by probe" in str(caught.value), str(caught.value)
+    assert "tick 1 ended " in str(caught.value) and (
+        "no batch of it reached the product -- not a collector read, or its batch "
+        "was never delivered"
+    ) in str(caught.value), "the missing reading is named (live eks 2026-10-26)"
+    assert "2 of the 2 confirming rdma_link_down readings never happened" in str(
+        caught.value
+    ), str(caught.value)
     # The fallback deadman got there first: the record says so, the verdict stands.
     result, _source = run(
         "link_inactive",

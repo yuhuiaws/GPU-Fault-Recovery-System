@@ -217,6 +217,7 @@ def observed_exposure(
         "completed": bool(receipt.get("completed")),
         "closed_by": "deadman" if receipt.get("already_closed") else "probe",
         "closed_at": closed_at.isoformat(),
+        "unit_active_at": receipt.get("unit_active_at"),
         "fallback_seconds": fallback,
         "restore": close.get("restore"),
         "clean": close.get("clean", receipt.get("already_closed", False)),
@@ -225,6 +226,101 @@ def observed_exposure(
     if not record["clean"]:
         raise HostSourceReplayError(f"the exposure window did not close clean: {close}")
     return record
+
+
+def exposure_reading_gaps(
+    exposure: Mapping[str, Any],
+    batches: Sequence[Mapping[str, Any]],
+    *,
+    metric: str,
+    required: int,
+    tolerance_seconds: float = 0.0,
+    device: str | None = None,
+) -> list[str]:
+    """Why a bounded exposure ended with fewer confirming readings than the
+    product needs: which reading is missing and whether its tick was never read
+    or its record lies outside the bound.
+
+    A host batch's ``observed_at`` is the tick's start (stamped before any
+    contributor read), the ``WATCHDOG=1`` pings the probe saw end the tick, so
+    each observed tick owns the batches observed after the previous tick ended
+    and no later than its own last ping. A tick without a batch left nothing in
+    the product -- the stamp was not a collector read (live eks 2026-10-26: the
+    restarted unit's ``READY=1`` stamp) or the batch never arrived; a tick whose
+    batch carries no ``metric`` >= 1 read no shortfall; a shortfall observed
+    after the close (plus ``tolerance_seconds``) was read after the restore.
+    """
+
+    ticks = list(exposure.get("ticks") or [])
+    closed_at = _moment(exposure.get("closed_at"))
+    active_at = _moment(exposure.get("unit_active_at"))
+    stamped = sorted(
+        (
+            (moment, batch)
+            for batch in batches
+            if (moment := _moment(batch.get("observed_at"))) is not None
+        ),
+        key=lambda pair: pair[0],
+    )
+
+    def shortfall(batch: Mapping[str, Any]) -> bool:
+        return any(
+            item.get("name") == metric
+            and (device is None or item.get("device") == device)
+            and isinstance(item.get("value"), (int, float))
+            and item["value"] >= 1
+            for item in batch.get("samples") or []
+        )
+
+    lines: list[str] = []
+    confirmed = 0
+    previous = active_at
+    for index, tick in enumerate(ticks, start=1):
+        ended = _moment(tick.get("last_ping_at"))
+        if ended is None:
+            continue
+        own = [
+            batch
+            for moment, batch in stamped
+            if (previous is None or moment > previous) and moment <= ended
+        ]
+        previous = ended
+        when = ended.isoformat()
+        if active_at is not None:
+            when += (
+                f" ({(ended - active_at).total_seconds():.1f} s after the unit became "
+                "active)"
+            )
+        if not own:
+            lines.append(
+                f"tick {index} ended {when}: no batch of it reached the product -- not "
+                "a collector read, or its batch was never delivered"
+            )
+        elif not any(shortfall(batch) for batch in own):
+            lines.append(
+                f"tick {index} ended {when}: its batch carries no {metric} >= 1 -- the "
+                "collector read no shortfall on it"
+            )
+        else:
+            confirmed += 1
+    if closed_at is not None:
+        cutoff = closed_at + timedelta(seconds=tolerance_seconds)
+        late = [
+            moment for moment, batch in stamped if shortfall(batch) and moment > cutoff
+        ]
+        if late:
+            lines.append(
+                f"{len(late)} {metric} reading(s) observed after the close at "
+                f"{closed_at.isoformat()} (first {late[0].isoformat()}): read after the "
+                "restore, outside the bound"
+            )
+    if confirmed < required:
+        lines.append(
+            f"{required - confirmed} of the {required} confirming {metric} readings "
+            "never happened before the close"
+            + (f" at {closed_at.isoformat()}" if closed_at is not None else "")
+        )
+    return lines
 
 
 def legacy_bind(dest: str) -> bool:
@@ -890,6 +986,7 @@ __all__ = [
     "command_plan",
     "confirmation_ticks",
     "exposure_fallback_seconds",
+    "exposure_reading_gaps",
     "host_source_replay",
     "kernel_collector_source_replay",
     "legacy_bind",

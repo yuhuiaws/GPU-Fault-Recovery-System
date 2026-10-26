@@ -961,11 +961,21 @@ def test_observed_exposure_closes_on_the_probes_tick_count(tmp_path: Path) -> No
     }
     controller, fake = _controller(
         tmp_path,
-        **{"await-ticks": {"completed": True, "ticks": _ticks(2), "close": close}},
+        **{
+            "await-ticks": {
+                "completed": True,
+                "unit_active_at": "2026-10-26T03:34:30+00:00",
+                "ticks": _ticks(2),
+                "close": close,
+            }
+        },
     )
     controller.open_tree([("infiniband", "/sys/class/infiniband")], restore_seconds=105)
     ctx = _Cadence({})
     record = helper.observed_exposure(ctx, controller, ticks=2, name="link-inactive")
+    assert record["unit_active_at"] == "2026-10-26T03:34:30+00:00", (
+        "the receipt's activation stamp rides along (the ticks are counted after it)"
+    )
     call = next(call for call in fake.calls if call[0] == "await-ticks")
     assert call[:8] == (
         "await-ticks",
@@ -1011,3 +1021,116 @@ def test_observed_exposure_closes_on_the_probes_tick_count(tmp_path: Path) -> No
     controller.open_tree([("infiniband", "/sys/class/infiniband")], restore_seconds=105)
     with pytest.raises(helper.HostSourceReplayError, match="did not close clean"):
         helper.observed_exposure(ctx, controller, ticks=2, name="link-inactive")
+
+
+def test_exposure_reading_gaps_name_the_missing_reading() -> None:
+    """The live eks 013 run of 2026-10-26: the probe's tick 1 (18:59:03.1Z) was
+    the restarted unit's READY=1 stamp -- no batch of it exists -- and the one
+    shortfall batch (observed 18:59:13.83Z, the tick's start, before its pings
+    13.98-14.16Z) belongs to tick 2; the close at 18:59:22.6Z came before the
+    second confirming read. The lines say so; a batch without the shortfall, a
+    shortfall observed after the close and another device's sample are told
+    apart."""
+
+    def batch(observed_at: str, value: float, device: str | None = None) -> dict:
+        return {
+            "observed_at": observed_at,
+            "samples": [
+                {
+                    "name": "efa_inventory_missing_count",
+                    "device": device,
+                    "value": value,
+                }
+            ],
+        }
+
+    def tick(first: str, last: str, pings: int = 2) -> dict:
+        return {"pings_seen": pings, "first_ping_at": first, "last_ping_at": last}
+
+    live = {
+        "closed_at": "2026-10-26T18:59:22.611068+00:00",
+        "ticks": [
+            tick(
+                "2026-10-26T18:59:03.103206+00:00",
+                "2026-10-26T18:59:03.103206+00:00",
+                1,
+            ),
+            tick(
+                "2026-10-26T18:59:13.978503+00:00", "2026-10-26T18:59:14.157629+00:00"
+            ),
+        ],
+    }
+    assert helper.exposure_reading_gaps(
+        live,
+        [batch("2026-10-26T18:59:13.829889+00:00", 1)],
+        metric="efa_inventory_missing_count",
+        required=2,
+        tolerance_seconds=5,
+    ) == [
+        "tick 1 ended 2026-10-26T18:59:03.103206+00:00: no batch of it reached the "
+        "product -- not a collector read, or its batch was never delivered",
+        "1 of the 2 confirming efa_inventory_missing_count readings never happened "
+        "before the close at 2026-10-26T18:59:22.611068+00:00",
+    ]
+    # The fixed probe's receipt: the activation named, real ticks only.
+    fixed = {
+        "closed_at": "2026-10-26T18:59:36.900000+00:00",
+        "unit_active_at": "2026-10-26T18:59:03.103236+00:00",
+        "ticks": [
+            tick(
+                "2026-10-26T18:59:13.978503+00:00", "2026-10-26T18:59:14.157629+00:00"
+            ),
+            tick(
+                "2026-10-26T18:59:28.900000+00:00", "2026-10-26T18:59:29.100000+00:00"
+            ),
+        ],
+    }
+    first, second = (
+        batch("2026-10-26T18:59:13.829889+00:00", 1),
+        batch("2026-10-26T18:59:28.800000+00:00", 0),
+    )
+    assert helper.exposure_reading_gaps(
+        fixed, [first, second], metric="efa_inventory_missing_count", required=2
+    ) == [
+        "tick 2 ended 2026-10-26T18:59:29.100000+00:00 (26.0 s after the unit became "
+        "active): its batch carries no efa_inventory_missing_count >= 1 -- the "
+        "collector read no shortfall on it",
+        "1 of the 2 confirming efa_inventory_missing_count readings never happened "
+        "before the close at 2026-10-26T18:59:36.900000+00:00",
+    ]
+    second["samples"][0]["value"] = 1
+    late = batch("2026-10-26T18:59:44+00:00", 1)
+    assert helper.exposure_reading_gaps(
+        fixed,
+        [first, second, late],
+        metric="efa_inventory_missing_count",
+        required=2,
+        tolerance_seconds=5,
+    ) == [
+        "1 efa_inventory_missing_count reading(s) observed after the close at "
+        "2026-10-26T18:59:36.900000+00:00 (first 2026-10-26T18:59:44+00:00): read after "
+        "the restore, outside the bound"
+    ], "both confirming readings happened; only the late one is named"
+    assert (
+        helper.exposure_reading_gaps(
+            fixed, [first, second], metric="efa_inventory_missing_count", required=2
+        )
+        == []
+    )
+    # Another device's sample is not this port's reading.
+    port = [
+        batch("2026-10-26T18:59:13.829889+00:00", 1, "rdmap110s0/1"),
+        batch("2026-10-26T18:59:28.800000+00:00", 1, "rdmap111s0/1"),
+    ]
+    lines = helper.exposure_reading_gaps(
+        fixed,
+        port,
+        metric="efa_inventory_missing_count",
+        required=2,
+        device="rdmap110s0/1",
+    )
+    assert len(lines) == 2 and lines[0].startswith("tick 2 ended "), lines
+    assert "read no shortfall on it" in lines[0], lines
+    assert helper.exposure_reading_gaps({}, [], metric="x", required=2) == [
+        "2 of the 2 confirming x readings never happened before the close"
+    ], "a deadman close without a receipt still says what is missing"

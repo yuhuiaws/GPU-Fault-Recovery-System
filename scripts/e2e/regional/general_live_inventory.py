@@ -86,6 +86,7 @@ from scripts.e2e.regional.general_live_source_replay import (
     HostSourceReplay,
     confirmation_ticks,
     exposure_fallback_seconds,
+    exposure_reading_gaps,
     host_source_replay,
     observed_exposure,
 )
@@ -664,12 +665,22 @@ def link_inactive(ctx: VariantContext) -> dict[str, Any]:
         source="infiniband",
     )
     if not incidents or len(inside) < ticks:
+        # Name the missing reading: the tick that was no collector read (live
+        # eks 2026-10-26: the restarted unit's READY=1 stamp), the batch that
+        # carried no shortfall, or the reading recorded after the close.
+        gaps = exposure_reading_gaps(
+            exposure,
+            detection.get("batches") or [],
+            metric="efa_inventory_missing_count",
+            required=ticks,
+            tolerance_seconds=RESTORE_CLOCK_TOLERANCE_SECONDS,
+        )
         raise VariantInconclusive(
             f"the bounded exposure ended ({exposure_seconds} s, closed by {closed_by}, "
             f"{exposure['ticks_observed']} collector tick(s) observed on the node) with "
             f"{len(inside)} shortfall reading(s) and {len(incidents)} "
             f"efa_inventory_mismatch finding(s) recorded inside it; the product needs "
-            f"{ticks} confirming ticks"
+            f"{ticks} confirming ticks" + "".join(f"; {line}" for line in gaps)
         )
     recovered = _await_efa_recovery(ctx, restore_at, expected)
     settled = wait_settled(

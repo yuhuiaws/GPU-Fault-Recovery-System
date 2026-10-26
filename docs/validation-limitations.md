@@ -1571,7 +1571,10 @@ counter file bound at its real value and stepped (`rdma_error`), the port
 watches the collector's own ticks on the node -- `await-ticks` reads the unit's
 `WatchdogTimestampMonotonic`, the last `WATCHDOG=1` the collector's main
 process sent, one per contributor and one per posted batch, ticks separated by
-a whole interval of silence -- and closes the window right after the tick the
+a whole interval of silence, counting only stamps after
+`ActiveEnterTimestampMonotonic` because systemd stamps the watchdog once more
+at start-post on `READY=1` (the 013 eks INCONCLUSIVE of 2026-10-26, below) --
+and closes the window right after the tick the
 product needs to confirm the shortfall (`GPU_FAULT_INVENTORY_MISMATCH_CONSECUTIVE_SAMPLES`,
 2 by default; `general_live_source_replay.observed_exposure`), so the first
 tick mints the `rdma_link_down` WARNING, the second is the fresh reading its
@@ -2488,6 +2491,40 @@ readings than confirming ticks inside the exposure (the message names the
 observed ticks, the exposure's length and who closed it), or a shortfall
 reading recorded after the restore (the bound did not hold and the designed
 escalation applies), is INCONCLUSIVE rather than a verdict on the product.
+
+The second live run of that design on eks (2026-10-26 18:59Z, R13g, lane node
+ip-10-0-43-5) was INCONCLUSIVE again -- a 21.4 s exposure, `closed_by: probe`
+after two "ticks", one shortfall reading and no finding inside it -- while hpb
+PASSed the same morning on the same harness: a timing exposure in the probe's
+tick count, not in the design. systemd stamps a `Type=notify` unit's
+`WatchdogTimestampMonotonic` when the unit enters start-post on `READY=1`, 30 us
+before `ActiveEnterTimestampMonotonic` and before the collector's startup phase
+(reproduced on systemd 255 with a transient user unit), so a probe loop that
+starts before the collector's first real tick reads that stamp as a ping: on
+eks the restarted collector's READY came 1.9 s after the restart, the first real
+tick 12.6 s after it, and the loop began 11.1 s in (the exec round trip) --
+the READY stamp became tick 1 and the window closed after one real read. On
+hpb the first real tick (10 s in) preceded the loop start (12 s in) and had
+already overwritten the stamp. The product's own records show which reading
+was missing: `rdma_link_down` fired from the tick observed at 18:59:13.83Z
+(`observed_at` is the tick's start, stamped before any contributor reads --
+not the delivery time), nothing was read near the 18:59:03.1Z "tick", so no
+inside reading was recorded late; the second confirming read never happened
+before the close. `await-ticks` now counts only stamps strictly after
+`ActiveEnterTimestampMonotonic` (`STAMP_PROPERTIES`; the receipt and
+`link-inactive-exposure.json` carry `unit_active_at`), the deadman stays the
+hard bound, and the INCONCLUSIVE names the missing reading
+(`general_live_source_replay.exposure_reading_gaps`, also on 010
+`link_inactive`'s "no sample": a tick with no batch is "not a collector read,
+or its batch was never delivered", a batch without the shortfall "read no
+shortfall on it", a shortfall observed after the close "read after the restore,
+outside the bound", then how many confirming readings never happened before
+the close). The tests replay the eks chronology on the probe's fake systemd
+(`FakeHost.ready_offset`: the READY stamp 1.9 s in, real ticks 12.6-13.0 s
+and 27.6-28.0 s, the loop starting 11.1 s in; the close must follow the second
+real tick and precede the third at 42.6 s -- the old rule closed 19-21 s in)
+and on the product's records (one shortfall batch 12.6 s in, no finding), and
+pin the three gap lines.
 013 `pci_missing`
 (`scripts/e2e/regional/general_live_efa_pci.py`, both clusters, risk H, every
 lock, `--approve HOST_SOURCE_REPLAY NODE_REBOOT`, expected PASS) is the

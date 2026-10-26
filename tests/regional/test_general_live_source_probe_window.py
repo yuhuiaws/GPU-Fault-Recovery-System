@@ -11,6 +11,7 @@ reload re-check and read-back of the real configuration, and ``await-ticks``.
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -224,3 +225,74 @@ def test_await_ticks_closes_after_the_collectors_required_ticks(
         "completed": False,
         "ticks": [],
     }
+
+
+def test_await_ticks_skips_the_units_start_post_watchdog_stamp(
+    host: FakeHost, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The live eks 013 ``link_inactive`` run of 2026-10-26 (18:59Z, R13g)
+    replayed: systemd stamps a ``Type=notify`` unit's watchdog when it enters
+    start-post on READY=1 -- 30 us before ``ActiveEnterTimestampMonotonic``,
+    before the collector's startup phase (systemd 255, reproduced on a transient
+    unit) -- and the restarted collector's READY came 1.9 s in; its first real
+    tick read the port 12.6 s in and pinged until 13.0 s; the probe's loop
+    began 11.1 s in (the exec round trip). Counting every stamp since the main
+    process started took the READY stamp for tick 1 and closed ~19-21 s in,
+    after one real read (one shortfall reading inside, no finding: the second
+    confirming read never happened). Only stamps after the activation are
+    ticks: the close follows the second real tick (27.6-28.0 s) and precedes
+    the third (42.6 s); the receipt names when the unit became active."""
+
+    _install("stat", b"cpu  1 0 1 1 0 0 0 0 0 0\n", capsys)
+    code, _opened = _main(
+        "open-window",
+        "--run-id",
+        RUN,
+        "--mode",
+        "bind",
+        "--bind",
+        "stat:/proc/stat",
+        "--restore-seconds",
+        "105",
+        capsys=capsys,
+    )
+    assert code == 0
+    host.ready_offset = 1.9
+    host.pings = [12.6, 12.8, 13.0, 27.6, 27.8, 28.0, 42.6, 42.8, 43.0]
+    host.pause(11.1)  # the exec round trip: the loop starts before the first tick
+    assert host.watchdog_stamp() == host.active_enter_us() - 30, (
+        "what the unit shows when the loop starts is the READY stamp, no ping yet"
+    )
+    code, waited = _main(
+        "await-ticks",
+        "--run-id",
+        RUN,
+        "--count",
+        "2",
+        "--interval",
+        "15",
+        "--timeout",
+        "105",
+        "--close",
+        capsys=capsys,
+    )
+    assert code == 0, waited
+    assert waited["completed"] is True and len(waited["ticks"]) == 2, waited
+    closed = 11.1 + waited["waited_seconds"]
+    assert 34.0 <= closed < 42.6, (
+        f"closed {closed} s after the restart: the second real tick ended at 28.0 s "
+        "and its gap passed in silence at 34.0 s, before the third tick at 42.6 s "
+        "(the live close after the READY stamp and one real tick came 19-21 s in)"
+    )
+    assert 22.5 <= waited["waited_seconds"] <= 24.0, waited
+    ticks = waited["ticks"]
+    assert all(1 <= tick["pings_seen"] <= 3 for tick in ticks), ticks
+    active = datetime.fromisoformat(waited["unit_active_at"])
+    first = datetime.fromisoformat(ticks[0]["first_ping_at"])
+    second = datetime.fromisoformat(ticks[1]["first_ping_at"])
+    assert 10.5 <= (first - active).total_seconds() <= 11.0, (
+        "the first tick is the collector's first read, 12.6 s in, not the READY "
+        "stamp 1.9 s in"
+    )
+    assert 14.5 <= (second - first).total_seconds() <= 15.5, "a whole interval apart"
+    assert waited["close"]["clean"] is True and not probe.dropin_path(RUN).exists()
