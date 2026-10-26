@@ -223,25 +223,6 @@ def test_expired_xid_fails_while_the_composite_joins(tmp_path: Path) -> None:
     assert "expired" in out["errors"][0]
 
 
-def test_counter_reset_passes_with_no_finding(tmp_path: Path) -> None:
-    cpu = gpu_cpu_python(
-        activity=_activity([]),
-        gpu_state={"active_findings": [], "batches": [{"observed_at": "t"}]},
-    )
-    out = links.counter_reset(
-        _ctx(
-            tmp_path,
-            "counter_reset",
-            probe=dcgm_probe(
-                audit=audit_records({f"{G1}/nvlink_crc_flit_error_total": 5.0})
-            ),
-            cpu=cpu,
-            case=links.CASE_020,
-        )
-    )
-    assert out["verdict"] == "PASS", out["errors"]
-
-
 def _xid_decision(**overrides: Any) -> dict[str, Any]:
     base: dict[str, Any] = {
         "event_id": "kernel-log-kmsg-boot-900000064-xid-137-cluster-abc",
@@ -599,7 +580,46 @@ def _pass_records(
             clean_state,
             audit_records({f"{G0}/{canonical}": 1.0, f"{G1}/{canonical}": 1.0}),
         )
-    # counter_reset / stale_sample: a quiet product is the expected outcome.
+    if variant == "counter_reset":
+        # The raise mints (every NVLink increase is the WARNING); the drop is a
+        # counter-reset edge that keeps that finding active and re-arms the
+        # baseline. ``test_general_live_gpu_links_reset.py`` grades the rest.
+        at = "2026-10-26T13:{:02d}:{:02d}+00:00".format
+        finding = {
+            "finding_id": f"b-{G1}-{canonical}",
+            "canonical_name": canonical,
+            "severity": "WARNING",
+            "value": 1,
+            "delta": 1,
+            "rate_per_minute": None,
+            "gpu_uuid": G1,
+            "observed_at": at(24, 45),
+        }
+
+        def batch(value: float, when: str, reason: str) -> dict[str, Any]:
+            return {
+                "batch_id": f"b-{when}",
+                "observed_at": when,
+                "edge_filter_reasons": [reason],
+                "collection_errors": [],
+                "samples": [
+                    {"gpu": G1, "name": canonical, "value": value, "labels": {}}
+                ],
+            }
+
+        state = {
+            "latest": [{"gpu": G1, "name": canonical, "value": 0, "labels": {}}],
+            "active_findings": [finding],
+            "findings": [finding],
+            "batches": [
+                batch(0, at(23, 45), "initial-baseline"),
+                batch(1, at(24, 45), "counter-increased"),
+                batch(2, at(25, 0), "counter-increased"),
+                batch(0, at(25, 15), "counter-reset"),
+            ],
+        }
+        return _activity([gpu_incident("inc", finding["finding_id"])]), state, served
+    # stale_sample: a quiet product is the expected outcome.
     return _activity([]), clean_state, served
 
 

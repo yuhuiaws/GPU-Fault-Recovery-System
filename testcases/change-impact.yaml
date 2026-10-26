@@ -685,6 +685,7 @@ rules:
       - tests/regional/test_general_live_gpu_memory.py
       - tests/regional/test_general_live_gpu_links.py
       - tests/regional/test_general_live_pcie_boundaries.py
+      - tests/regional/test_general_live_gpu_links_reset.py
       - tests/regional/test_general_live_gpu_fabric.py
       - tests/regional/test_general_live_gpu_composite.py
       - tests/regional/test_general_live_gpu_environment.py

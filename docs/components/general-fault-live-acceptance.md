@@ -713,6 +713,17 @@ DCGM `*_ERROR_COUNT_TOTAL`）；Hopper/NVLink4 及更新的卡只上报 DL 聚�
 指标名。产品对同族成员判定一致（阈值、速率窗口、计数回退、复合与恢复），回放工具的
 `nvlink`/`composite` profile 同样接受并改写 DL 聚合字段（仍拒绝未知字段）。
 单卡和多卡counter相关都应实际只读诊断，无DRAIN/reset；回退/旧样本不算新故障或修复。
+`counter_reset` 判的是回退这一拍而非抬升：NVLink 错误计数的规则是 `delta >= nvlink_error_delta_critical`
+（默认 1，`gpu_metrics._link_decision`），任何增量都是 WARNING，没有"低于阈值的抬升"（与 022 的
+8/min 速率规则不同）。2026-10-26 HyperPod 首次 live 运行（H200 DL 聚合计数）FAIL 的根因在用例：
+每拍 +5 的抬升合法铸出一条 WARNING，oracle 把它记成"回退铸造"，又要求回退后无活动 finding——而产品
+契约正相反：回退是 invalid delta，finding 保留、不清除也不重铸，只有之后一个零增量的正常批次才算恢复
+（`recovered` 变体所证）。现在抬升每拍 +1（最小的真实增量）再 clear，判定只读首次出现回退拍的产品记录
+快照：`raise`（接受过抬升读数且回退前形成一条 finding）、`reset`（低于前值的读数以 `counter-reset` 理由
+投递、最新读数即重置值）、`no_fault`（回退当拍及之后无 finding、无第二条 incident）、`no_recovery`
+（该 finding 在快照里仍活动；若快照里已有回退之后的计数批次——如健康摘要——则不判并写入
+`reset-readings`）、`hardware`。`stale_sample`/`recovered`/`independent_fatal_event` 的抬升本就是要铸出
+WARNING 的前提，判定不受此影响。
 独立致命Xid/SXid必须由对应原始源进入并按其catalog处置，不能被counter诊断吸收丢失。
 记录链路、组件/复合finding和各自执行回执；恢复要求新正常增量与通信验证，
 不要求累计值归零。自然链路坏损的物理验证另列，不拔链路当通用注入方法。

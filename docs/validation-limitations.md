@@ -3443,3 +3443,30 @@ new-boot reading that is not the jump is INCONCLUSIVE (the boundary was
 crossed at the real value and not exercised) (evidence `boot-readings`;
 `tests/regional/test_general_live_pcie_boundaries.py`). Both variants are
 rerun with the runner alone; no product release is needed.
+
+020 `counter_reset` first ran live on 2026-10-26 (HyperPod, H200, the DL
+aggregate `nvlink_crc_aggregate_error_total`) and FAILed on its own plan and
+oracle, not on the product. Unlike the PCIe rate, the NVLink rule has no
+under-limit raise: `gpu_metrics._link_decision` grades every increase of an
+NVLink error counter (`delta >= nvlink_error_delta_critical`, default 1) as
+the WARNING, so the variant's +5 per read raise minted the one incident the
+oracle then blamed on the reset ("a counter reset minted a finding"), and its
+`active` stage demanded no active finding after the reset -- the opposite of
+the product's contract, by which a decrease is an invalid delta that keeps the
+finding (neither a new fault nor a recovery; only a later zero-delta batch
+recovers it, which `recovered` proves). Replayed through the real collector
+filter and ingest, the live reads (0, 0, 0, 5, 10, 15, 0, ...) mint at the
+first raised read and nothing at the reset tick, which ships as a
+`counter-reset` edge and leaves the finding active with the latest reading at
+0. The variant now raises by one per read (the smallest honest increase) and
+grades the snapshot of the product's records that first holds the drop:
+`raise` (the raised readings accepted and one finding before the drop),
+`reset` (the drop delivered with its `counter-reset` reason, the latest
+reading equal to the reset value), `no_fault` (no finding at or after the
+drop, no second incident), `no_recovery` (the raise's finding still active --
+judged only while no later batch of the counter, such as a health summary,
+intervened in the snapshot; otherwise recorded in `reset-readings` as not
+judged) and `hardware`. `stale_sample`, `recovered` and
+`independent_fatal_event` raise in order to mint and are unaffected;
+`tests/regional/test_general_live_gpu_links_reset.py`. The variant is rerun
+with the runner alone; no product release is needed.

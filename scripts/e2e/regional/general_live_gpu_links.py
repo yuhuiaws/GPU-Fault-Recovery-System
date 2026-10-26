@@ -79,6 +79,7 @@ from scripts.e2e.regional.general_live_gpu_replay import (
     step,
     under_limit_increment,
     utc_now,
+    wait_accepted,
     wait_gpu_incident,
 )
 from scripts.e2e.regional.general_live_gpu_verdicts import (
@@ -240,50 +241,195 @@ def multiple_gpus(ctx: VariantContext) -> dict[str, Any]:
     )
 
 
+#: The NVLink rule has no under-limit raise: ``gpu_metrics._link_decision``
+#: grades every increase of an NVLink error counter
+#: (``delta >= nvlink_error_delta_critical``, default 1) as the WARNING, so the
+#: raise before a reset mints once whatever its size. The smallest honest one.
+NVLINK_RAISE = 1
+
+
+def nvlink_counter_reset_stages(
+    state: dict[str, Any], activity: dict[str, Any], canonical: str, gpu: str
+) -> tuple[dict[str, list[str]], dict[str, Any]]:
+    """Grade an NVLink error counter reset on the product's own records.
+
+    The raise before the drop *is* the fault by the product's rule (every
+    increase >= 1 is the WARNING), so the reset is judged against it.
+    ``raise``: the raised readings were accepted and formed a finding before
+    the drop. ``reset``: a later reading fell below its predecessor, delivered
+    as a ``counter-reset`` edge, and the latest reading is that reset value
+    (the baseline re-armed from the drop). ``no_fault``: no finding at or
+    after the drop and no second incident -- the reset minted nothing.
+    ``no_recovery``: the raise's finding is still active in the snapshot that
+    first holds the drop (a decrease is an invalid delta that keeps the
+    finding; only a later zero-delta batch recovers it, which ``recovered``
+    proves) -- judged only while no later batch of the counter, such as a
+    health summary, intervened in that snapshot; otherwise recorded as not
+    judged. ``hardware``: nothing hardware. The readings document is returned
+    for the evidence.
+    """
+
+    samples = accepted_samples(state, canonical, gpu)
+    values = _values(samples)
+    ticks = counter_reset_ticks(state, canonical, gpu)
+    latest = latest_value(state, canonical, gpu)
+    listed = ", ".join(_number(value) for value in values) or "none"
+    reset_at = _when(ticks[0]["observed_at"]) if ticks else None
+    findings = history_findings(state, canonical, gpu=gpu)
+
+    def before_reset(finding: dict[str, Any]) -> bool:
+        when = _when(finding.get("observed_at"))
+        return reset_at is None or (when is not None and when < reset_at)
+
+    raised_findings = [item for item in findings if before_reset(item)]
+    late_findings = [item for item in findings if not before_reset(item)]
+    raised: list[str] = []
+    reset: list[str] = []
+    accepted_raise = bool(values) and max(values) > values[0]
+    if not accepted_raise:
+        raised.append(
+            f"the product accepted no raised {canonical} reading of {gpu} "
+            f"(accepted values: {listed})"
+        )
+    elif not raised_findings:
+        raised.append(
+            f"the raise minted no {canonical} finding on {gpu}: every NVLink error "
+            "increase (delta >= 1) is the WARNING the reset is judged against"
+        )
+    if accepted_raise and not ticks:
+        reset.append(
+            f"the product accepted no {canonical} reading of {gpu} below its "
+            f"predecessor (accepted values: {listed})"
+        )
+    elif accepted_raise:
+        tick = ticks[0]
+        if "counter-reset" not in tick["edge_filter_reasons"]:
+            reasons = ", ".join(tick["edge_filter_reasons"]) or "no reason"
+            reset.append(
+                f"the drop {_number(tick['previous'])} -> {_number(tick['value'])} "
+                f"at {tick['observed_at']} was delivered without a counter-reset "
+                f"edge reason ({reasons})"
+            )
+        latest_number = latest.get("value") if latest is not None else None
+        if latest_number != tick["value"]:
+            shown = (
+                _number(latest_number)
+                if isinstance(latest_number, (int, float))
+                else "absent"
+            )
+            reset.append(
+                f"the product's latest {canonical} reading of {gpu} is {shown}, not "
+                f"the reset value {_number(tick['value'])}: the baseline was not "
+                "re-armed from the drop"
+            )
+    incidents = metric_incidents(activity, canonical, gpu=gpu)
+    no_fault = [
+        f"a counter reset minted a finding: {finding_text(item)}"
+        for item in late_findings
+    ]
+    no_fault.extend(
+        "a counter reset minted a second incident: "
+        f"{finding_text(incident_finding(state, incident))}; "
+        f"incident {incident.get('incident_id')}"
+        for incident in incidents[1:]
+    )
+    active = active_findings(state, canonical, gpu=gpu)
+    later = [
+        item
+        for item in samples
+        if reset_at is not None
+        and (when := _when(item.get("observed_at"))) is not None
+        and when > reset_at
+    ]
+    no_recovery: list[str] = []
+    judgement = "not judged: no reset tick"
+    if ticks and raised_findings:
+        if later:
+            judgement = (
+                "not judged: a later batch of the counter intervened before the "
+                "snapshot ("
+                + ", ".join(str(item.get("observed_at")) for item in later)
+                + "); a zero delta over a real window is the product's recovery"
+            )
+        elif active:
+            judgement = "the raise's finding is still active after the drop"
+        else:
+            judgement = "the drop cleared the finding"
+            no_recovery.append(
+                f"the counter reset cleared the active {canonical} finding on {gpu}: "
+                "a decrease is an invalid delta that keeps the finding, not a recovery"
+            )
+    stages = {
+        "raise": raised,
+        "reset": reset,
+        "no_fault": no_fault,
+        "no_recovery": no_recovery,
+        "hardware": no_hardware(activity),
+    }
+    readings = {
+        "accepted": samples,
+        "reset_ticks": ticks,
+        "latest": latest,
+        "findings": findings,
+        "active_findings": active,
+        "incidents": [str(item.get("incident_id")) for item in incidents],
+        "no_recovery_judgement": judgement,
+    }
+    return stages, readings
+
+
 def counter_reset(ctx: VariantContext) -> dict[str, Any]:
+    """An NVLink error counter that falls below its previous reading is neither
+    a new fault nor a recovery.
+
+    The NVLink rule has no under-limit raise (``NVLINK_RAISE``): the raise
+    before the drop mints the WARNING the reset is judged against. Live
+    2026-10-26 (HyperPod, H200 DL aggregate) the +5 per read raise minted that
+    one incident, the oracle blamed it on the reset and demanded no active
+    finding afterwards -- the opposite of the product's contract (a decrease
+    is an invalid delta that keeps the finding). The stages read the snapshot
+    of the product's records that first holds the drop
+    (``nvlink_counter_reset_stages``).
+    """
+
     survey = run_gpu_survey(ctx)
     counter = survey.nvlink_counter(NVLINK["crc"])
     canonical = counter.canonical
     gpu = survey.target(canonical)
     since = utc_now()
-    # Raise the counter (the product baselines above the real value), then drop
-    # it: the decrease is a counter-reset edge, never a new fault.
     repl = DcgmReplay(
         ctx,
         plan(
             "nvlink",
             baseline(),
-            step(3, add(canonical, [gpu], 5)),
+            step(3, add(canonical, [gpu], NVLINK_RAISE)),
             step(20, clear(canonical, [gpu]), hold=True),
         ),
         _hold(ctx),
     )
     arm_and_confirm(repl, f"{gpu}/{canonical}")
-    ctx.hold(min(120, _hold(ctx)), name="reset-observe")
-    doc = state_now(ctx, since, names=[canonical])
-    activity = wait_gpu_incident(
+    # The snapshot that first holds the drop: two more raised reads, the drop
+    # and its ingest, with slack for a late scrape.
+    state = wait_accepted(
         ctx,
         since,
-        lambda d: [] if True else d.get("incidents"),
-        metrics=(canonical,),
-        timeout_seconds=1,
-        name="reset-check",
+        lambda doc: bool(counter_reset_ticks(doc, canonical, gpu)),
+        names=[canonical],
+        timeout_seconds=4 * repl.interval + 120,
+        name="reset",
     )
-    stages = {
-        "no_fault": []
-        if not metric_incidents(activity, canonical, gpu=gpu)
-        else ["a counter reset minted a finding"],
-        "hardware": no_hardware(activity),
-        "active": []
-        if not doc.get("active_findings")
-        else ["a counter reset left an active finding"],
-    }
+    activity = activity_now(ctx, since, metrics=(canonical,))
+    stages, readings = nvlink_counter_reset_stages(state, activity, canonical, gpu)
+    ctx.evidence.write("reset-readings", readings)
     repl.close()
     ctx.cleanup.discard("dcgm-replay")
     return result(
         stages,
         notes=[
-            "a counter reset (decrease) is not a new fault or a recovery",
+            f"raised by {NVLINK_RAISE} per read -- every NVLink error increase is "
+            "the WARNING (delta >= 1), so the raise mints once -- then dropped: the "
+            "drop is a counter-reset edge, graded unknown, the new baseline, and it "
+            "keeps the finding; neither a new fault nor a recovery",
             counter.note(),
         ],
         extra={"gpu_uuid": gpu, **counter.evidence()},
@@ -1041,8 +1187,10 @@ VARIANTS = [
     gpu_spec(
         CASE_020,
         "counter_reset",
-        "raise then drop an NVLink counter",
-        "a counter decrease is no new fault or recovery",
+        "raise the NVLink CRC counter by one per read (every increase is the WARNING: "
+        "delta >= 1), then drop it",
+        "the drop is the product's counter-reset edge, graded unknown and the new "
+        "baseline; it keeps the raise's finding -- neither a new fault nor a recovery",
         counter_reset,
         max_minutes=18,
     ),
