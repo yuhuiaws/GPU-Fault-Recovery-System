@@ -1176,6 +1176,18 @@ rank，而 rank 0 只写了一次 step 100，145 s 后被判 `training_hang`（s
 缺 finding 时把各 reporter sidecar 的日志尾存入 `straggler-reporters.json`（ingest 的拒绝只回给
 reporter）。无 `--node-b` 记 `NOT_RUN(FIXTURE_NOT_READY)`；plain-EKS 上 node-b 是另一条车道的节点，
 运行时须同时持有两条车道的 claim（同 011 两节点任务）。
+现场 2026-10-26 17:43Z（HyperPod，R13g）两节点版再次 FAIL "no training_straggler finding reached
+an incident"，但两个 rank 都已入库（rank 0 step 240、rank 1 step 180，同组、均新鲜）：产品确已判出
+straggler——training finding 绑在被判的 rank 上（`node_id` 为该 rank 所在节点），其 incident 的
+`node_ids` 只含该节点（`--node-b`），而夹具的记录探针只按车道节点过滤 incident
+（`list_incidents_by_state(node_ids={车道节点})`），永远读不到 rank 1 的 incident；信号激活后不再重复
+发出，后续每次 scan 的 body 都是 `findings: []`。属夹具缺陷，非产品缺口：产品行为由
+`tests/execution/test_general_health_policy_e2e.py` 在真实规划器上钉住（两节点一 attempt、同组、
+仅滞后 rank 一个 finding、incident 只含其节点、计划 FREEZE_EVIDENCE/VALIDATE_FABRIC 且无 STOP）。
+探针（拆到 `general_live_progress_probes.py`）现传入任务全部节点（同 011 的 HUNG_PROBE），输出各
+incident 的 `node_ids`、attempt 的观测（phase、容器 rank/节点/Pod UID/容器名）与控制面读时时钟；
+`same_group_only` 按 straggler incident 的 `node_ids` 是否含 rank 0 节点判断（incident 的 `reasons`
+只有 finding 文本、不含 rank）。
 
 ### GF-GENERAL-LIVE-028
 

@@ -101,17 +101,21 @@ def _settings(spec: Any, tmp_path: Path):
 class RecordingStore:
     """A ``cpu_python`` double that serves the training-records documents in
     order (the last one repeats), answers the scan POST, and counts the reads --
-    so a test can say how many store reads a verdict took."""
+    so a test can say how many store reads a verdict took -- keeping the node
+    list each records read was scoped to (``TRAINING_PROBE``'s ``argv[2]``)."""
 
     def __init__(self, *documents: dict[str, Any]) -> None:
         self.documents = list(documents)
         self.reads = 0
         self.scans = 0
+        self.node_arguments: list[str] = []
 
     def __call__(self, script: str, *arguments: str) -> dict[str, Any]:
         if "training-health" in script:
             self.scans += 1
             return {"status": 200, "body": {}}
+        assert script is pr.TRAINING_PROBE, "a records read runs the probe script"
+        self.node_arguments.append(arguments[1])
         document = self.documents[min(self.reads, len(self.documents) - 1)]
         self.reads += 1
         return copy.deepcopy(document)
@@ -131,7 +135,7 @@ def _ctx(spec: Any, tmp_path: Path, doc: Any):
     return ctx
 
 
-def _incident(kind: str, state: str = "ESCALATED", reasons=()):
+def _incident(kind: str, state: str = "ESCALATED", reasons=(), **fields: Any):
     return {
         "incident_id": f"inc-training-{kind}",
         "event_id": f"training-{kind}-deadbeef",
@@ -139,6 +143,7 @@ def _incident(kind: str, state: str = "ESCALATED", reasons=()):
         "attempt_id": "a",
         "workflow_request_id": "wf",
         "reasons": list(reasons),
+        **fields,
     }
 
 
@@ -685,16 +690,23 @@ def _straggler_doc(incidents: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+@pytest.mark.parametrize(
+    "scope", [{"node_ids": [PEER]}, {}], ids=["lagging-ranks-node", "no-node_ids"]
+)
 def test_straggler_group_keeps_both_ranks_advancing_until_the_lagging_rank_is_flagged(
-    tmp_path: Path,
+    tmp_path: Path, scope: dict[str, Any]
 ) -> None:
     empty = _straggler_doc([])
+    # As live: the incident names the lagging rank's node (node-b) alone and
+    # its reasons carry the finding's text, never a rank; a record without
+    # node_ids is not the reference rank either.
     flagged = _straggler_doc(
         [
             _incident(
                 "straggler",
                 state="ACTION_PENDING",
                 reasons=["training rank is lagging peer progress"],
+                **scope,
             )
         ]
     )
@@ -703,8 +715,12 @@ def test_straggler_group_keeps_both_ranks_advancing_until_the_lagging_rank_is_fl
     result = SPECS["straggler_group"].execute(ctx)
     assert result["verdict"] == "PASS", result["errors"]
     assert result["stages"]["not_stalled"] == []
+    assert result["stages"]["same_group_only"] == []
     job = FakeProgressJob.created[-1]
     assert (job.ranks, result["attempt"]["nodes"]) == ((0, 1), [NODE, PEER])
+    # Every records read was scoped to both nodes of the job: live 2026-10-26
+    # 17:43Z the lane-node-only read never listed rank 1's incident on node-b.
+    assert store.node_arguments == [f"{NODE},{PEER}"] * 3
     # Every poll (scan + read) first wrote both ranks: rank 1 STRAGGLER_LAG
     # steps behind rank 0 and both STRAGGLER_ADVANCE further than last time.
     assert store.scans == store.reads == 3
@@ -723,6 +739,47 @@ def test_straggler_group_keeps_both_ranks_advancing_until_the_lagging_rank_is_fl
         {"0": 120, "1": 60},
     ]
     assert job.log_reads == 0, "reporter logs are read only for a missing finding"
+
+
+def test_straggler_group_fails_when_the_reference_rank_is_flagged(
+    tmp_path: Path,
+) -> None:
+    # A straggler incident naming rank 0's node is the reference rank flagged
+    # as its own straggler; the lagging rank's incident alone is the PASS.
+    both = _straggler_doc(
+        [
+            _incident(
+                "straggler",
+                state="ACTION_PENDING",
+                reasons=["training rank is lagging peer progress"],
+                node_ids=[PEER],
+            ),
+            {
+                **_incident(
+                    "straggler",
+                    state="ACTION_PENDING",
+                    reasons=["training rank is lagging peer progress"],
+                    node_ids=[NODE],
+                ),
+                "incident_id": "inc-training-straggler-reference",
+                "event_id": "training-straggler-cafebabe",
+            },
+        ]
+    )
+    result = SPECS["straggler_group"].execute(
+        _ctx(SPECS["straggler_group"], tmp_path, RecordingStore(both))
+    )
+    assert result["verdict"] == "FAIL"
+    assert result["errors"] == [
+        "same_group_only: the reference rank was flagged as its own straggler"
+    ]
+
+
+def test_single_rank_job_records_are_read_on_the_lane_node_only(tmp_path: Path) -> None:
+    store = RecordingStore(NAN_SETTLED)
+    result = SPECS["nan"].execute(_ctx(SPECS["nan"], tmp_path, store))
+    assert result["verdict"] == "PASS", result["errors"]
+    assert store.node_arguments == [NODE]
 
 
 def test_straggler_group_without_the_finding_keeps_reporter_logs_and_names_a_stall(

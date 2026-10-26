@@ -8,6 +8,7 @@ import pytest
 
 from gpu_fault.models import IncidentState, WorkflowStatus
 from gpu_fault.models import WorkflowOperation as Op
+from tests._builders import attempt_observation, container_observation
 from tests.execution._raw_health_e2e_support import RawHealthRig
 
 
@@ -400,3 +401,96 @@ def test_hung_validation_requires_new_application_progress_not_healthy_fabric(ri
             break
     assert outcome.status is WorkflowStatus.SUCCEEDED, outcome
     assert Op.STOP_WORKLOADS not in rig.boundary.calls, rig.boundary.calls
+
+
+def test_straggler_across_two_pods_binds_to_the_lagging_ranks_node_only(rig):
+    """GF-GENERAL-LIVE-027 ``straggler_group`` as live (HyperPod 2026-10-26
+    17:43Z): one attempt, two Pods on two nodes, both ranks in one
+    ``progress_group``, rank 1 60 steps behind rank 0 and both advancing every
+    poll. The product grades the pair across the Pods and flags the lagging
+    rank only; the incident names that rank's node alone and plans the
+    diagnostic chain without a stop, so a records read scoped to the reference
+    rank's node sees nothing while one scoped to both nodes sees the incident.
+    """
+
+    nodes = {0: "node-a", 1: "node-b"}
+    pods = {0: "pod-master-0", 1: "pod-worker-0"}
+
+    def observe():
+        rig.store.save_attempt_observation(
+            attempt_observation(
+                "strag",
+                "attempt-strag",
+                rig.clock,
+                expected_critical_ranks=2,
+                workload_ids=["training/job/strag"],
+                containers=[
+                    container_observation(
+                        pods[rank],
+                        pods[rank],
+                        rank,
+                        nodes[rank],
+                        container_name="pytorch",
+                        role="master" if rank == 0 else "worker",
+                        gpu_uuids=[f"GPU-{rank}-{index}" for index in range(8)],
+                    )
+                    for rank in (0, 1)
+                ],
+            )
+        )
+
+    def heartbeat(rank, step):
+        return rig.post(
+            "/v1/training-progress",
+            {
+                "cluster_id": "cluster-a",
+                "attempt_id": "attempt-strag",
+                "rank": rank,
+                "observed_at": rig.clock.isoformat(),
+                "node_id": nodes[rank],
+                "pod_uid": pods[rank],
+                "container_name": "pytorch",
+                "step": step,
+                "loss": 1.0,
+                "labels": {"progress_group": "data-parallel"},
+            },
+        )
+
+    steps = {0: 100, 1: 40}
+    findings = []
+    for _ in range(3):
+        observe()
+        for rank in (0, 1):
+            assert heartbeat(rank, steps[rank])["accepted"] is True
+            steps[rank] += 10
+        findings.extend(rig.post("/v1/training-health/cluster-a/scan", {})["findings"])
+        rig.advance(41)
+
+    assert [
+        (item["metric_name"], item["node_id"], item["device"]) for item in findings
+    ] == [("training_straggler", "node-b", "rank-1")], (
+        "one straggler finding, on the lagging rank's node, emitted once"
+    )
+    incident = rig.store.get_incident_by_event(findings[0]["event_id"])
+    assert incident is not None
+    assert incident.node_ids == ["node-b"], "the incident names rank 1's node only"
+    assert incident.attempt_id == "attempt-strag"
+    operations = [
+        step.operation
+        for step in rig.store.get_workflow(incident.workflow_request_id).official_steps
+    ]
+    assert Op.FREEZE_EVIDENCE in operations and Op.VALIDATE_FABRIC in operations, (
+        operations
+    )
+    assert Op.STOP_WORKLOADS not in operations, operations
+    states = list(IncidentState)
+    assert (
+        rig.store.list_incidents_by_state("cluster-a", states, node_ids={"node-a"})
+        == []
+    ), "a read scoped to the reference rank's node lists no straggler"
+    assert [
+        item.incident_id
+        for item in rig.store.list_incidents_by_state(
+            "cluster-a", states, node_ids={"node-a", "node-b"}
+        )
+    ] == [incident.incident_id]

@@ -54,6 +54,10 @@ from scripts.e2e.regional.general_live_fixture import (
     run_identity,
     utc_now,
 )
+from scripts.e2e.regional.general_live_progress_probes import (
+    SCAN_POST,
+    TRAINING_PROBE,
+)
 from scripts.e2e.regional.general_live_registry import (
     HARDWARE_OPERATIONS,
     NATIVE,
@@ -94,7 +98,11 @@ STARTUP_GRACE = 300
 #: with ``GPU_FAULT_TRAINING_MAX_STEP_LAG`` (20), and a rank whose step moves
 #: every 20-s poll never crosses the 120-s stall timeout -- a lagging rank is
 #: a straggler, a frozen one a stall (live 2026-10-26: rank 0 written once,
-#: ``training_hang`` 145 s later).
+#: ``training_hang`` 145 s later). The finding is bound to the lagging rank
+#: and its incident names that rank's node alone, so the records read names
+#: every node of the job (``_job_nodes``): live 2026-10-26 17:43Z (HyperPod)
+#: the two-node job had both ranks fresh in the store (240/180, one group) and
+#: the lane-node-only read never listed rank 1's straggler on ``--node-b``.
 STRAGGLER_LAG = 60
 STRAGGLER_ADVANCE = 10
 #: The product's step cadence the settle budget is derived from
@@ -185,130 +193,6 @@ FORBIDDEN = HARDWARE_OPERATIONS | {
     "QUARANTINE",
     "RESTART_WORKLOAD",
 }
-
-#: Read-only: this attempt's training-progress state, its SITE_TRAINING_HEALTH
-#: incidents (training findings), their workflows and step executions, the
-#: completion decision and the training notifications. Never writes.
-TRAINING_PROBE = r"""
-import json
-import sys
-from datetime import datetime
-
-from gpu_fault.app import ApplicationContext
-from gpu_fault.models import IncidentState
-from gpu_fault.store import NotFoundError
-
-cluster_id, node_id, job_id, attempt_id, since_text = sys.argv[1:6]
-since = datetime.fromisoformat(since_text.replace("Z", "+00:00"))
-store = ApplicationContext.from_environment().store
-
-progress = []
-for state in store.list_training_progress_states(cluster_id, attempt_id):
-    heartbeat = state.heartbeat
-    progress.append({
-        "rank": heartbeat.rank,
-        "node_id": heartbeat.node_id,
-        "pod_uid": heartbeat.pod_uid,
-        "container_name": heartbeat.container_name,
-        "step": heartbeat.step,
-        "loss": heartbeat.loss,
-        "numerical_error": heartbeat.numerical_error,
-        "checkpoint_ref": heartbeat.checkpoint_ref,
-        "labels": heartbeat.labels,
-        "observed_at": heartbeat.observed_at.isoformat(),
-        "last_progress_at": state.last_progress_at.isoformat(),
-    })
-
-incidents = []
-workflows = {}
-for incident in store.list_incidents_by_state(
-    cluster_id, list(IncidentState), node_ids={node_id}
-):
-    if not str(incident.event_id).startswith("training-"):
-        continue
-    if incident.created_at < since and incident.updated_at < since:
-        continue
-    incidents.append({
-        "incident_id": incident.incident_id,
-        "event_id": incident.event_id,
-        "state": incident.state.value,
-        "policy_source": incident.policy_source,
-        "job_id": incident.job_id,
-        "attempt_id": incident.attempt_id,
-        "reasons": list(incident.reasons or []),
-        "official_action": incident.official_action,
-        "workflow_request_id": incident.workflow_request_id,
-    })
-    if incident.workflow_request_id and incident.workflow_request_id not in workflows:
-        try:
-            workflow = store.get_workflow(incident.workflow_request_id)
-        except NotFoundError:
-            continue
-        workflows[incident.workflow_request_id] = workflow.model_dump(mode="json")
-
-try:
-    decision = store.get_decision_by_attempt(cluster_id, attempt_id).model_dump(
-        mode="json"
-    )
-except NotFoundError:
-    decision = None
-
-notifications = []
-incident_ids = {item["incident_id"] for item in incidents}
-for notification in store.list_notifications(limit=500, newest_first=True):
-    if notification.incident_id not in incident_ids:
-        continue
-    result = store.get_notification_result(notification.notification_id)
-    notifications.append({
-        "notification_id": notification.notification_id,
-        "incident_id": notification.incident_id,
-        "deduplication_key": notification.deduplication_key,
-        "category": notification.category,
-        "status": result.status.value if result else None,
-    })
-
-print(json.dumps({
-    "progress_states": progress,
-    "incidents": incidents,
-    "workflows": workflows,
-    "decision": decision,
-    "notifications": notifications,
-}, sort_keys=True, default=str))
-"""
-
-#: Trigger one cluster scan through the product route (execution token); the
-#: global monitor stays disabled. Mirrors warm_spare_fixture's in-Pod POST.
-SCAN_POST = r"""
-import json
-import os
-import sys
-from urllib.error import HTTPError
-from urllib.parse import quote
-from urllib.request import Request, urlopen
-
-cluster_id = sys.argv[1]
-request = Request(
-    "http://127.0.0.1:8080/v1/training-health/" + quote(cluster_id, safe="") + "/scan",
-    data=b"{}",
-    method="POST",
-    headers={
-        "Content-Type": "application/json",
-        "X-GPU-Fault-Execution-Token": os.environ["GPU_FAULT_EXECUTION_TOKEN"],
-    },
-)
-try:
-    with urlopen(request, timeout=60) as response:
-        content = response.read()
-        result = {"status": response.status, "body": json.loads(content) if content else {}}
-except HTTPError as exc:
-    content = exc.read()
-    try:
-        decoded = json.loads(content) if content else {}
-    except ValueError:
-        decoded = {"detail": content.decode(errors="replace")}
-    result = {"status": exc.code, "body": decoded}
-print(json.dumps(result, sort_keys=True))
-"""
 
 
 def reporter_image(regional: Any) -> str:
@@ -770,13 +654,26 @@ def _job(
     return job
 
 
+def _job_nodes(job: ManagedProgressJob) -> str:
+    """Every node the job's ranks run on, comma-joined for ``TRAINING_PROBE``.
+
+    A training incident names the graded rank's node alone (the finding's
+    ``node_id`` is that rank's node), and rank 1 of the two-node job runs on
+    ``--node-b``: a read scoped to the lane node never lists it (live
+    2026-10-26 17:43Z, HyperPod ``straggler_group``). One node for a
+    single-rank job, as before.
+    """
+
+    return ",".join(dict.fromkeys(job.rank_nodes[rank] for rank in job.ranks))
+
+
 def _records(
     ctx: VariantContext, job: ManagedProgressJob, since: Any
 ) -> dict[str, Any]:
     document = ctx.regional.cpu_python(
         TRAINING_PROBE,
         ctx.settings.regional.cluster_id,
-        ctx.settings.node,
+        _job_nodes(job),
         job.name,
         job.attempt_id,
         since.isoformat(),
@@ -1221,7 +1118,9 @@ def straggler_group(ctx: VariantContext) -> dict[str, Any]:
             allow_stop=False,
             states=frozenset(),
         ),
-        "same_group_only": _straggler_scope(incident, records),
+        "same_group_only": _straggler_scope(
+            incident, records, reference_node=job.rank_nodes[0]
+        ),
         "not_stalled": []
         if _incident(records, "hang") is None
         else ["a lagging rank that keeps advancing was graded as a stall"],
@@ -1358,17 +1257,23 @@ def _checkpoint_errors(workflow: dict[str, Any]) -> list[str]:
 
 
 def _straggler_scope(
-    incident: dict[str, Any] | None, records: dict[str, Any]
+    incident: dict[str, Any] | None,
+    records: dict[str, Any],
+    *,
+    reference_node: str,
 ) -> list[str]:
     if incident is None:
         return []
     # Only rank 1 (the lagging rank) may carry a straggler finding; rank 0 is
-    # the reference and must not.
+    # the reference and must not. A training incident names the graded rank's
+    # node alone (``node_ids``); its ``reasons`` carry the finding's text and
+    # never the rank (live: "training rank is lagging peer progress"), so a
+    # straggler incident on rank 0's node is the reference rank flagged.
     offenders = [
         item["event_id"]
         for item in records.get("incidents") or []
         if str(item.get("event_id", "")).startswith("training-straggler-")
-        and "rank-0" in str(item.get("reasons"))
+        and reference_node in (item.get("node_ids") or [])
     ]
     return ["the reference rank was flagged as its own straggler"] if offenders else []
 

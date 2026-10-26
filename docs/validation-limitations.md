@@ -2962,6 +2962,38 @@ of a straggler: FAIL naming the stall, reporter logs kept). On plain EKS node-b
 is the other lane's node, so the variant needs both lanes' claims at once, as
 011's two-node job does.
 
+The two-node `straggler_group` then failed again on HyperPod (2026-10-26
+17:30-17:43Z, release 37db33f254a1) with the same "no training_straggler finding
+reached an incident", this time with both ranks in the store: rank 0 at step
+240 on the lane node, rank 1 at step 180 on node-b, both in `progress_group`
+data-parallel, both fresh, a lag of 30 against the pair's median. The product
+had graded the pair. A `training_straggler` finding is bound to the rank it
+grades -- its `node_id` is that rank's node (`training_health.py` `_claim`) --
+and the incident the scan route raises from it names that node alone
+(`node_ids`). The fixture's records probe read the incidents scoped to the lane
+node (`list_incidents_by_state(..., node_ids={<lane node>})`), so rank 1's
+incident on node-b was never listed; the straggler signal stayed active, and a
+claim emits on the transition only (`claim_health_signal_transition`), so every
+later scan body showed `findings: []`. This is a harness defect, not a product
+gap. The product's behaviour is pinned by
+`tests/execution/test_general_health_policy_e2e.py` on the real planner: two
+Pods on two nodes in one attempt, the fixture's labels and steps, one straggler
+finding on the lagging rank's node emitted once, its incident naming that node
+only with FREEZE_EVIDENCE and VALIDATE_FABRIC planned and no STOP_WORKLOADS,
+and the lane-node-scoped read returning nothing while the two-node read returns
+the incident. The records probe (`general_live_progress_probes.py`, split out
+of the fixture module for the 1500-line cap) now takes every node the job's
+ranks run on, as 011's `HUNG_PROBE` does, lists each incident's `node_ids`, and
+records the attempt's observation (phase, first and last observed, containers
+with rank, node, Pod UID and container name) and the control plane's clock at
+the read, so a binding, phase or clock cause is visible in
+`training-records.json` next time. `same_group_only` judges a straggler
+incident's `node_ids` against rank 0's node: an incident's `reasons` carry the
+finding's text and never the rank, so the former "rank-0 in reasons" check could
+not fire. The module tests assert the two-node variant's reads name both nodes
+and a single-rank job's read names the lane node, that a straggler incident on
+rank 0's node fails the variant, and the scope rule on live-shaped incidents.
+
 Every managed job also rendered its manifest's fixed name
 (`gpu-fault-single-node-warm-spare`, `gpu-fault-two-node-replace`), so one
 leftover refused all later jobs whatever their job id: live 2026-10-25 every
