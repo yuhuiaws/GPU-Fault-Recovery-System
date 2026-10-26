@@ -2635,6 +2635,49 @@ Not covered offline: whether a GPU node can pull the runtime image (the
 executor's Pods may run elsewhere), and the product-side outcome of each 027
 variant.
 
+The first live pass with that job (2026-10-26, plain EKS, release
+37db33f254a1) failed 027 `nan` with "training_nonfinite-loss incident is
+ACTION_PENDING, expected ['ESCALATED']" while the product did exactly what the
+variant expects: the heartbeat at 09:35:53Z minted the incident and its
+STOP_WORKLOAD chain within 60 ms, FREEZE_EVIDENCE and STOP_WORKLOADS succeeded
+within 4 s, COLLECT_DIAGNOSTIC_BUNDLE (a remote command to the Node Agent) ran
+for 22 s, and ESCALATE_SUPPORT completed the workflow SUCCEEDED and moved the
+incident to ESCALATED at 09:36:19Z. The runner's detection wait accepted the
+first store read that showed the incident at all (09:35:57Z, the bundle step
+WAITING, the workflow RUNNING) and the verdict judged the incident state on
+that snapshot; the incident later read RECOVERED only because the runner's
+post-case step closed the escalation. ACTION_PENDING is the state of a record
+whose workflow is still executing, and ESCALATED is the terminal write of the
+chain's last step, so no first read can show it. `nan` and
+`checkpoint_unverified` now wait for the record to settle before judging the
+state -- the incident's workflow terminal (SUCCEEDED/FAILED/BLOCKED/SUPERSEDED)
+and the incident out of DETECTED/ACTION_PENDING/SAFETY_PENDING -- within a
+budget derived from the product's step cadence: the per-step cap
+`GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS` (600 s, past which the product fails
+the step itself) plus one dispatcher poll interval
+`GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS` (5 s) per planned step plus the
+180-s chain margin, 800 s for the four-step chain, read every 20 s. They
+record how long they waited, the reads, the state and the planned and executed
+steps (`<variant>-settled.json`, the polls in `<variant>-settle-timeline.json`)
+and report a record still in flight at the end of that budget as INCONCLUSIVE
+naming the observed state and the executed steps (for example
+`COLLECT_DIAGNOSTIC_BUNDLE WAITING`) rather than a FAIL; a record that settled
+without the workflow SUCCEEDED -- an ESCALATED reached through a failed or
+blocked step, not the planned ESCALATE_SUPPORT hand-off -- is a FAIL that names
+the executed steps (stage `settled`). The required-operations, STOP allowance,
+checkpoint-disposition and no-restart checks are unchanged. `resumed_progress`
+reads afresh after the original rank's new progress and waits for RECOVERED
+with the same settle semantics (another settled state is its FAIL, an in-flight
+record past the budget INCONCLUSIVE). The scan-driven variants
+(`stalled_step`, `reporter_silent`, `step_regression`, `straggler_group`) judge
+the planned chain and the finding's classification on the first read and
+assert no state: their VALIDATE_FABRIC legitimately stays in flight until newer
+progress arrives, which `resumed_progress` is the variant for. The module tests
+replay the live sequence through a recording store double (two in-flight reads,
+then the settled one), and a scripted workflow record now carries a terminal
+`status` and its step executions, as live records do; a record without them
+would never settle.
+
 Every managed job also rendered its manifest's fixed name
 (`gpu-fault-single-node-warm-spare`, `gpu-fault-two-node-replace`), so one
 leftover refused all later jobs whatever their job id: live 2026-10-25 every

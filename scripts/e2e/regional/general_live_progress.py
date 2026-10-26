@@ -22,6 +22,16 @@ Pod. ``training_nonfinite-loss`` stops only the attributed attempt
 auto-restarts, and the checkpoint reference is evidence only. A stall is
 cleared only by the original rank's newer finite progress, never by healthy
 GPU/fabric telemetry alone.
+
+A variant that asserts an incident state judges a settled record: the
+incident's workflow terminal and the incident out of its in-flight state
+(``_settle``). The first store read that shows an incident shows its chain
+mid-flight -- live 2026-10-26 (plain EKS, release 37db33f254a1) ``nan`` read
+ACTION_PENDING with COLLECT_DIAGNOSTIC_BUNDLE WAITING 4 s after the heartbeat
+and failed "expected ESCALATED"; the product completed ESCALATE_SUPPORT and
+moved the incident to ESCALATED 22 s later. The scan-driven variants assert no
+state: their VALIDATE_FABRIC legitimately stays in flight until newer progress
+arrives, which ``resumed_progress`` follows to RECOVERED.
 """
 
 from __future__ import annotations
@@ -31,7 +41,11 @@ from pathlib import PurePosixPath
 import re
 from typing import Any
 
-from scripts.e2e.regional.general_live_common import run_survey
+from scripts.e2e.regional.general_live_common import (
+    CHAIN_MARGIN_SECONDS,
+    STORE_POLL_SECONDS,
+    run_survey,
+)
 from scripts.e2e.regional.general_live_fixture import (
     VariantContext,
     VariantInconclusive,
@@ -44,7 +58,11 @@ from scripts.e2e.regional.general_live_registry import (
     NATIVE,
     VariantSpec,
 )
-from scripts.e2e.regional.general_live_verdicts import operations, verdict
+from scripts.e2e.regional.general_live_verdicts import (
+    TERMINAL_WORKFLOWS,
+    operations,
+    verdict,
+)
 from scripts.e2e.regional.regional_commands import RegionalFixtureError
 from scripts.e2e.regional.regional_live_fixture import component_python
 
@@ -52,6 +70,23 @@ CASE = "GF-GENERAL-LIVE-027"
 SINGLE_NODE_MANIFEST = "single-node-warm-spare-pytorchjob.yaml"
 HEARTBEAT_TIMEOUT = 120
 STARTUP_GRACE = 300
+#: The product's step cadence the settle budget is derived from
+#: (``execution/config.py``, ``execution/step_bounds.py``): the dispatcher
+#: re-dispatches a WAITING step one poll interval apart
+#: (``GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS``, 5 s) and fails a step that
+#: stays non-terminal past the per-step cap
+#: (``GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS``, 600 s), so a record whose
+#: remote step never answers still settles -- FAILED -- within the cap.
+WORKFLOW_POLL_INTERVAL = 5
+WORKFLOW_STEP_CAP = 600
+#: Incident states of a record whose workflow is still executing
+#: (``orchestration/coordinator.py`` ``_incident_state_for_workflow``:
+#: PENDING/RUNNING -> ACTION_PENDING, SAFETY_PENDING -> SAFETY_PENDING). The
+#: terminal write of the last step moves the incident with the workflow
+#: (``execution/terminal_state.py`` ``terminal_incident_state``: SUCCEEDED with
+#: ESCALATE_SUPPORT completed -> ESCALATED, otherwise RECOVERED/QUARANTINED;
+#: FAILED/BLOCKED -> the failure state).
+IN_FLIGHT_STATES = frozenset({"DETECTED", "ACTION_PENDING", "SAFETY_PENDING"})
 #: The reporter sidecar runs the product's own ``gpu-fault-collector`` from the
 #: GPU-side runtime image -- the image the release stamps on the executor, the
 #: completion watcher and the in-cluster collector, whose console scripts sit
@@ -619,6 +654,153 @@ def _wait_incident(
     return records, _incident(records, kind)
 
 
+def settle_budget_seconds(workflow: dict[str, Any]) -> int:
+    """How long a chain may still take to settle once its incident is first read.
+
+    One step may stay non-terminal for the product's per-step cap (the remote
+    COLLECT_DIAGNOSTIC_BUNDLE took 22 s live, 2026-10-26), every planned step
+    is dispatched one poll interval apart, and the chain margin covers ingest
+    and the store read. A chain whose steps each run to the cap is not waited
+    out: the budget bounds a product that is working, and a record still in
+    flight past it is reported with the step still waiting.
+    """
+
+    steps = max(1, len(workflow.get("official_steps") or []))
+    return WORKFLOW_STEP_CAP + steps * WORKFLOW_POLL_INTERVAL + CHAIN_MARGIN_SECONDS
+
+
+def record_settled(incident: dict[str, Any], workflow: dict[str, Any]) -> bool:
+    """Whether the incident's record has settled: its state out of the in-flight
+    states and its workflow terminal. An incident that names no workflow (the
+    plan compiled to nothing) is settled once its state is not in flight."""
+
+    if incident.get("state") in IN_FLIGHT_STATES:
+        return False
+    if not incident.get("workflow_request_id"):
+        return True
+    return str(workflow.get("status")) in TERMINAL_WORKFLOWS
+
+
+def _executed(workflow: dict[str, Any]) -> list[str]:
+    """``OPERATION STATUS`` per recorded step execution, in step order."""
+
+    return [
+        f"{item.get('operation')} {item.get('status')}"
+        for item in workflow.get("step_executions") or []
+    ]
+
+
+def _settle_record(
+    incident: dict[str, Any] | None, workflow: dict[str, Any]
+) -> dict[str, Any]:
+    if incident is None:
+        return {"incident_id": None, "settled": False}
+    return {
+        "incident_id": incident.get("incident_id"),
+        "state": incident.get("state"),
+        "workflow_request_id": incident.get("workflow_request_id"),
+        "workflow_status": workflow.get("status"),
+        "planned": operations(workflow),
+        "executed": _executed(workflow),
+        "settled": record_settled(incident, workflow),
+    }
+
+
+def _settle(
+    ctx: VariantContext,
+    job: ManagedProgressJob,
+    kind: str,
+    since: Any,
+    records: dict[str, Any] | None,
+    *,
+    name: str,
+) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any]]:
+    """The records once the ``kind`` incident has settled, and how long that took.
+
+    Starts from ``records`` (the snapshot that first showed the incident; a
+    fresh read when ``None``) and polls the store every ``STORE_POLL_SECONDS``
+    until ``record_settled`` holds, within ``settle_budget_seconds`` of the planned
+    chain. Returns the settled records, the incident and the settle record --
+    the budget, the seconds waited, the polls, the state, the workflow status,
+    the planned and the executed steps -- which is also written as
+    ``<name>-settled``. No incident is nothing to settle (one read at most;
+    the chain check reports the missing finding). A record still in flight at
+    the end of the budget raises ``VariantInconclusive`` naming the observed
+    state and the executed steps: the product was still executing, or stuck,
+    and nothing about its terminal state was graded.
+    """
+
+    started = ctx.clock()
+    polls = 0
+    if records is None:
+        records = _records(ctx, job, since)
+        polls = 1
+    incident = _incident(records, kind)
+    budget = settle_budget_seconds(_workflow(records, incident or {}))
+    if incident is not None and not record_settled(
+        incident, _workflow(records, incident)
+    ):
+        last = records
+
+        def accept() -> dict[str, Any] | None:
+            nonlocal last, polls
+            last = _records(ctx, job, since)
+            polls += 1
+            current = _incident(last, kind)
+            if current is None:
+                return None
+            return last if record_settled(current, _workflow(last, current)) else None
+
+        value = ctx.wait_until(
+            accept,
+            timeout_seconds=budget,
+            poll_seconds=STORE_POLL_SECONDS,
+            name=f"{name}-settle",
+        )
+        records = value if value is not None else last
+        incident = _incident(records, kind)
+    workflow = _workflow(records, incident or {})
+    settle = {
+        "budget_seconds": budget,
+        "waited_seconds": round((ctx.clock() - started).total_seconds(), 1),
+        "polls": polls,
+        **_settle_record(incident, workflow),
+    }
+    ctx.evidence.write(f"{name}-settled", settle)
+    if incident is not None and not settle["settled"]:
+        executed = ", ".join(settle["executed"]) or "nothing"
+        planned = ", ".join(settle["planned"]) or "nothing"
+        raise VariantInconclusive(
+            f"training_{kind} incident {settle['incident_id']} did not settle "
+            f"within {budget} s ({settle['waited_seconds']} s waited, {polls} "
+            f"reads): state {settle['state']}, workflow "
+            f"{settle['workflow_request_id']} {settle['workflow_status']}; "
+            f"executed {executed}; planned {planned}"
+        )
+    return records, incident, settle
+
+
+def _settled_errors(settle: dict[str, Any], *, kind: str) -> list[str]:
+    """The settled chain ran to its end: the workflow SUCCEEDED.
+
+    An ESCALATED reached through a FAILED or BLOCKED step is the product's
+    failure exit, not the planned ESCALATE_SUPPORT hand-off; a SUPERSEDED
+    record was replaced by another chain. A missing incident is the chain
+    check's error, not this one's.
+    """
+
+    if not settle.get("incident_id"):
+        return []
+    status = settle.get("workflow_status")
+    if status == "SUCCEEDED":
+        return []
+    executed = ", ".join(settle.get("executed") or []) or "nothing"
+    return [
+        f"training_{kind} workflow settled {status}, not SUCCEEDED "
+        f"(executed {executed})"
+    ]
+
+
 def _chain_errors(
     incident: dict[str, Any] | None,
     workflow: dict[str, Any],
@@ -659,6 +841,10 @@ def nan(ctx: VariantContext) -> dict[str, Any]:
         0, step=10, numerical_error=True, checkpoint_ref="s3://test/unchecked"
     )
     records, incident = _wait_incident(ctx, job, "nonfinite-loss", started, name="nan")
+    # ESCALATED is the terminal write of the last step: judge the settled record.
+    records, incident, settle = _settle(
+        ctx, job, "nonfinite-loss", started, records, name="nan"
+    )
     workflow = _workflow(records, incident or {})
     stages = {
         "chain": _chain_errors(
@@ -669,10 +855,11 @@ def nan(ctx: VariantContext) -> dict[str, Any]:
             allow_stop=True,
             states=frozenset({"ESCALATED"}),
         ),
+        "settled": _settled_errors(settle, kind="nonfinite-loss"),
         "no_restart": _no_restart_errors(records),
         "checkpoint_not_trusted": _checkpoint_errors(workflow),
     }
-    return _result(stages, extra={"attempt": identity})
+    return _result(stages, extra={"attempt": identity, "settled": settle})
 
 
 def checkpoint_unverified(ctx: VariantContext) -> dict[str, Any]:
@@ -686,6 +873,9 @@ def checkpoint_unverified(ctx: VariantContext) -> dict[str, Any]:
     records, incident = _wait_incident(
         ctx, job, "nonfinite-loss", started, name="checkpoint"
     )
+    records, incident, settle = _settle(
+        ctx, job, "nonfinite-loss", started, records, name="checkpoint"
+    )
     workflow = _workflow(records, incident or {})
     stages = {
         "chain": _chain_errors(
@@ -696,6 +886,7 @@ def checkpoint_unverified(ctx: VariantContext) -> dict[str, Any]:
             allow_stop=True,
             states=frozenset({"ESCALATED"}),
         ),
+        "settled": _settled_errors(settle, kind="nonfinite-loss"),
         "checkpoint_not_trusted": _checkpoint_errors(workflow),
         "no_restart": _no_restart_errors(records),
     }
@@ -704,6 +895,7 @@ def checkpoint_unverified(ctx: VariantContext) -> dict[str, Any]:
         notes=[
             "an unvalidated checkpoint is evidence, never auto-selected or restarted"
         ],
+        extra={"settled": settle},
     )
 
 
@@ -890,48 +1082,31 @@ def resumed_progress(ctx: VariantContext) -> dict[str, Any]:
     )
     if incident is None:
         raise VariantInconclusive("no hang finding to recover from")
-    # The original rank makes new valid progress; only that clears the stall.
+    # The original rank makes new valid progress while the stall chain is in
+    # flight (its VALIDATE_FABRIC waits for evidence newer than itself); only
+    # that clears the stall. RECOVERED is the chain's terminal write: judge the
+    # record once it has settled, from a read after the new progress.
     job.write_progress(0, step=11, loss=1.0)
-    recovered = _await_recovered(ctx, job, incident, started)
+    records, recovered, settle = _settle(ctx, job, "hang", started, None, name="resume")
+    state = (recovered or {}).get("state")
     stages = {
         "recovered": []
-        if (recovered.get("state") == "RECOVERED")
-        else [f"the stall incident is {recovered.get('state')}, not RECOVERED"],
-        "validated_by_progress": _validated_by_progress(records, recovered, job),
+        if state == "RECOVERED"
+        else [f"the stall incident is {state}, not RECOVERED"],
+        "validated_by_progress": _validated_by_progress(records, recovered or {}, job),
     }
     return _result(
         stages,
         notes=[
             "recovery requires the original rank's newer finite progress, not healthy fabric"
         ],
+        extra={"settled": settle},
     )
 
 
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
-def _await_recovered(
-    ctx: VariantContext, job: ManagedProgressJob, incident: dict[str, Any], since: Any
-) -> dict[str, Any]:
-    last = incident
-
-    def accept() -> dict[str, Any] | None:
-        nonlocal last
-        records = _records(ctx, job, since)
-        current = _incident(records, "hang")
-        if current is not None:
-            last = current
-        return current if current and current.get("state") == "RECOVERED" else None
-
-    value = ctx.wait_until(
-        accept,
-        timeout_seconds=HEARTBEAT_TIMEOUT + 600,
-        poll_seconds=20,
-        name="recovered",
-    )
-    return value if value is not None else last
-
-
 def _no_restart_errors(records: dict[str, Any]) -> list[str]:
     decision = records.get("decision") or {}
     if (

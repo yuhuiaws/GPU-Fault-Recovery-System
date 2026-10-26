@@ -864,6 +864,25 @@ NaN只停止匹配attempt并要求人工验证checkpoint，不自动恢复不可
 心跳失联不等同NCCL挂起，straggler只比较同progress_group。
 初始化/加载/保存phase有界，超时不能永久抑制；旧attempt/伪归属不授权STOP。
 恢复必须原rank的新有效进度，Pod Ready/Fabric正常不够；删除测试文件和任务并核对对照。
+本站实现（`general_live_progress.py`）：断言 incident 状态的变体只判**已沉淀**的记录。
+`nan`/`checkpoint_unverified` 在判 `ESCALATED` 前先等 incident 的工作流到达终态
+（SUCCEEDED/FAILED/BLOCKED/SUPERSEDED）且 incident 离开在途状态
+（DETECTED/ACTION_PENDING/SAFETY_PENDING）——ESCALATED 是最后一步 ESCALATE_SUPPORT 的终态写入
+（`execution/terminal_state.py`），首个读到 incident 的快照看到的是执行中的链。沉淀预算取自产品
+步进节拍：单步非终态上限 `GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS`（600 s）+ 计划步数 ×
+调度器轮询 `GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS`（5 s）+ 180 s 链余量（四步 NaN 链为
+800 s），每 20 s 读一次产品记录，等待时长、读次数、状态、计划/已执行步骤写入
+`<变体>-settled.json`（轮询时间线 `<变体>-settle-timeline.json`）。预算内未沉淀记
+`INCONCLUSIVE`（给出观察到的状态与已执行步骤，如 `COLLECT_DIAGNOSTIC_BUNDLE WAITING`），
+不记 FAIL；沉淀后工作流非 SUCCEEDED（经失败/阻塞步骤到达的 ESCALATED，而非计划的
+ESCALATE_SUPPORT 交接）记 FAIL 并列出已执行步骤（stage `settled`）；required_ops /
+allow_stop / checkpoint / no_restart 检查不变。`resumed_progress` 在原 rank 写入新进度后
+重新读取并以同一沉淀语义等 RECOVERED（沉淀为其他状态记 FAIL，预算内未沉淀记 INCONCLUSIVE）。
+`stalled_step`/`reporter_silent`/`step_regression`/`straggler_group` 只判计划链
+（official_steps）与 finding 分类、不断言状态、不等沉淀：其 VALIDATE_FABRIC 在更新的进度到来
+之前合法地保持在途（`resumed_progress` 才跟到底）。现场 2026-10-26（plain EKS，R13g）`nan`
+曾在心跳后 4 s 的首个快照上把 ACTION_PENDING（COLLECT_DIAGNOSTIC_BUNDLE 在节点上等了 22 s）
+判为 FAIL "expected ESCALATED"，产品 22 s 后已 ESCALATED。
 
 ### GF-GENERAL-LIVE-028
 
@@ -1799,7 +1818,10 @@ POST 预制 finding。类别模块 `general_live_nccl`/`_nccl_fr`/`_progress`/`_
   重启不 cordon，checkpoint 只作证据）、`stalled_step`、`reporter_silent`、
   `step_regression`、`straggler_group`（同 `progress_group`）、`bounded_phase`、
   `old_attempt`、`checkpoint_unverified`、`resumed_progress`（原 rank 新有效进度才
-  RECOVERED）。
+  RECOVERED）。断言 incident 状态的变体（`nan`、`checkpoint_unverified`、
+  `resumed_progress`）先等记录沉淀（工作流终态 + incident 离开在途状态，预算 = 单步上限
+  600 s + 计划步数 × 5 s 轮询 + 180 s）再判状态；预算内未沉淀记 INCONCLUSIVE 并给出
+  观察到的状态与已执行步骤（见 027 节）。
 - **030（两条车道；热备候选 = `--spare-candidate`，默认为车道的 `--node-b`：plain-EKS 为
   另一台 EKS 节点，HyperPod 为 profile 的 node-b；recipe 不再把 `--fault-node` 指向热备）**：
   经 admin CLI 把候选节点声明为热备（`DECLARE_WARM_SPARE`：标签 + cordon，故障域组按
