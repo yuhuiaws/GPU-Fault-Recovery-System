@@ -17,7 +17,10 @@ serves SUCCESS (3) once RESET_ALL has run so the post-reset VALIDATE_FABRIC
 reads a trained fabric. ``before_window`` (held under 300 s), ``ungraded_product``
 (a non-NVSwitch modelName) and ``monitor_restart`` (the held clock restarts
 with the collector) never cross the window, so they isolate nothing and need
-no reset approval.
+no reset approval. Their held steps are bounded by ``held_reads`` -- the hold
+at the collector's interval, within the tool's 200-read step limit; live
+2026-10-26 (HyperPod hpb) a 400-read bound was refused at the tool's start and
+``before_window`` ended INCONCLUSIVE with the unit dead.
 """
 
 from __future__ import annotations
@@ -30,6 +33,7 @@ from scripts.e2e.regional.general_live_gpu_replay import (
     arm_and_confirm,
     baseline,
     gpu_spec,
+    held_reads,
     label,
     no_hardware,
     plan,
@@ -51,6 +55,10 @@ from scripts.e2e.regional.general_live_gpu_verdicts import (
 
 CASE = "GF-GENERAL-LIVE-021"
 WINDOW = 300
+#: What a collector restart adds to ``monitor_restart``'s two holds when its
+#: held step's read bound is sized: the restart, the sandbox settle and two
+#: scrapes on the real endpoint.
+RESTART_SECONDS = 180
 STATES = {"not_started": 1, "in_progress": 2, "failed": 4}
 FULL_RESET = (
     "QUIESCE_GPU_SERVICES",
@@ -200,17 +208,22 @@ def before_window(ctx: VariantContext) -> dict[str, Any]:
     survey = run_gpu_survey(ctx)
     gpus = _graded_gpus(survey)
     since = utc_now()
+    held = min(WINDOW - 30, _hold(ctx))
     repl = DcgmReplay(
         ctx,
         plan(
             "fabric",
             baseline(),
-            step(400, put("fabric_manager_status", gpus, 2), hold=True),
+            step(
+                held_reads(survey.interval, held),
+                put("fabric_manager_status", gpus, 2),
+                hold=True,
+            ),
         ),
         _hold(ctx),
     )
     arm_and_confirm(repl, *[f"{gpu}/fabric_manager_status" for gpu in gpus])
-    ctx.hold(min(WINDOW - 30, _hold(ctx)), name="under-window")
+    ctx.hold(held, name="under-window")
     activity = wait_gpu_incident(
         ctx, since, lambda d: [], timeout_seconds=1, name="under-window-check"
     )
@@ -233,13 +246,14 @@ def ungraded_product(ctx: VariantContext) -> dict[str, Any]:
     survey = run_gpu_survey(ctx)
     gpus = _graded_gpus(survey)[:1]
     since = utc_now()
+    held = min(WINDOW + 60, _hold(ctx))
     repl = DcgmReplay(
         ctx,
         plan(
             "fabric",
             baseline(),
             step(
-                400,
+                held_reads(survey.interval, held),
                 put("fabric_manager_status", gpus, 2),
                 label("fabric_manager_status", gpus, "modelName", "NVIDIA L40S"),
                 hold=True,
@@ -248,7 +262,7 @@ def ungraded_product(ctx: VariantContext) -> dict[str, Any]:
         _hold(ctx),
     )
     arm_and_confirm(repl, *[f"{gpu}/fabric_manager_status" for gpu in gpus])
-    ctx.hold(min(WINDOW + 60, _hold(ctx)), name="ungraded")
+    ctx.hold(held, name="ungraded")
     activity = wait_gpu_incident(
         ctx, since, lambda d: [], timeout_seconds=1, name="ungraded-check"
     )
@@ -271,19 +285,24 @@ def monitor_restart(ctx: VariantContext) -> dict[str, Any]:
     survey = run_gpu_survey(ctx)
     gpus = _graded_gpus(survey)
     since = utc_now()
+    held = min(WINDOW - 60, _hold(ctx))
     repl = DcgmReplay(
         ctx,
         plan(
             "fabric",
             baseline(),
-            step(800, put("fabric_manager_status", gpus, 2), hold=True),
+            step(
+                held_reads(survey.interval, 2 * held + RESTART_SECONDS),
+                put("fabric_manager_status", gpus, 2),
+                hold=True,
+            ),
         ),
         _hold(ctx),
     )
     arm_and_confirm(repl, *[f"{gpu}/fabric_manager_status" for gpu in gpus])
-    ctx.hold(min(WINDOW - 60, _hold(ctx)), name="before-restart")
+    ctx.hold(held, name="before-restart")
     restart = repl.collector_restart()
-    ctx.hold(min(WINDOW - 60, _hold(ctx)), name="after-restart")
+    ctx.hold(held, name="after-restart")
     activity = wait_gpu_incident(
         ctx, since, lambda d: [], timeout_seconds=1, name="restart-check"
     )

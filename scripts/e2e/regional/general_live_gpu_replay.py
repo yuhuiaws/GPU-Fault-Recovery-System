@@ -62,7 +62,9 @@ from scripts.e2e.regional.general_live_gpu_verdicts import node_hardware_errors
 from scripts.e2e.regional.general_live_registry import LIVE_REPLAY, VariantSpec
 from scripts.e2e.regional.general_live_verdicts import verdict
 from scripts.e2e.regional.probes.general_live_dcgm_probe import PROFILE_NAME
+from tools.gpu_dcgm_field_replay import MAX_READS_PER_STEP
 from tools.gpu_dcgm_field_replay import PROFILES as FIELD_PROFILES
+from tools.gpu_dcgm_field_replay import validate_plan
 
 ROOT = Path(__file__).resolve().parents[3]
 FIELD_TOOL = ROOT / "tools" / "gpu_dcgm_field_replay.py"
@@ -572,7 +574,39 @@ def plan(profile: str, *steps: dict[str, Any]) -> dict[str, Any]:
             f"replay plan profile {profile!r} is not a field-tool profile the "
             "host controller serves (harness defect; nothing was deployed)"
         )
-    return {"profile": profile, "steps": list(steps)}
+    document = {"profile": profile, "steps": list(steps)}
+    # The tool's own reviewer runs here too: a plan it would refuse at its
+    # start (``parser.error``, exit 2) dies inside the transient unit, and the
+    # runner reads only ``unit_down``. Live 2026-10-26 (HyperPod hpb, 021
+    # ``before_window``) a held step of 400 reads was over the tool's 200.
+    try:
+        validate_plan(document)
+    except ValueError as error:
+        raise VariantInconclusive(
+            f"replay plan refused by the field tool: {error} "
+            "(harness defect; nothing was deployed)"
+        ) from error
+    return document
+
+
+def held_reads(interval: int, seconds: int) -> int:
+    """The read bound of a step held for ``seconds`` (``until_advance``).
+
+    A held step that outlasts its read bound passes through -- the bound is
+    the tool's safety limit -- so it must outlast the hold: twice the reads a
+    collector scraping every ``interval`` s makes in ``seconds``, plus four.
+    The tool serves at most ``MAX_READS_PER_STEP`` reads per step; a hold that
+    needs more is refused here rather than clipped, because a replay that ends
+    under a still-running hold would grade the real reading and pass hollow.
+    """
+
+    needed = 2 * -(-int(seconds) // max(1, int(interval))) + 4
+    if needed > MAX_READS_PER_STEP:
+        raise VariantInconclusive(
+            f"a {seconds} s hold needs {needed} reads at {interval} s per read; "
+            f"the field tool serves at most {MAX_READS_PER_STEP} per step"
+        )
+    return needed
 
 
 def passthrough_plan() -> dict[str, Any]:

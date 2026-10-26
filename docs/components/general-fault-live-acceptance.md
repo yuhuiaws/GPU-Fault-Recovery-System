@@ -739,6 +739,20 @@ WARNING 的前提，判定不受此影响。
 每张卡新Success与Fabric验证后才能接纳。单独重启FM成功不等于GPU完成注册。
 失败分支保留隔离并按授权升级；清理状态夹具和服务，NVL5需分别核对FM/NVLSM而非只看一个PID。
 
+2026-10-26 hpb 现场（HyperPod 车道 b 的独占节点，R13g，harness live17）`before_window`
+在 `deploy-proxy` 一步 INCONCLUSIVE：`reason unit_down`，`probe-error.json` 只有一句
+"the replay unit did not stay up"。根因不在节点：`fabric` 三个不越窗变体的持有步
+（`before_window`/`ungraded_product` 400 reads，`monitor_restart` 800 reads）超过回放工具
+`tools/gpu_dcgm_field_replay.py` 的 `MAX_READS_PER_STEP`（200，`monitor_restart` 还超过
+`MAX_TOTAL_READS` 400），工具启动即 `error: reads must be an integer in 1..200`、exit 2，
+瞬态 unit 随之死亡；同节点几分钟前 `nvlink` 计划（3/40 reads）正常部署。修复：runner 的
+`plan()` 在触碰节点前运行工具自己的 `validate_plan`（被拒即 INCONCLUSIVE 并带工具原话）；
+持有步读数改由 `held_reads(interval, seconds)` 按持有时长与采集间隔推算（2×读数+4，
+超过 200 时拒绝而非截断——持有期内回放结束会让"无 finding"空通过）；`unit_down`/`no_status`
+时探针把 unit 的 `Result`/`ExecMainStatus` 与 journal 末 40 行（每行 ≤300 字，脱敏）放进
+`probe-error.json`，下次失败自带解释（`tests/regional/test_general_live_fabric_plan_bounds.py`）。
+三个不越窗变体尚无现场证据，需在两集群重跑。
+
 ### GF-GENERAL-LIVE-022
 
 必测：`at_rate_limit`、`over_rate_limit`、`counter_reset`、`source_boot_change`、

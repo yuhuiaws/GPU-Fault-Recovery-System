@@ -101,6 +101,15 @@ SOURCES = {
     INVENTORY_PLAN: "plan",
 }
 UNIT_PREFIX = "gfrs-live-"
+LIST_UNITS = ("systemctl", "list-units", "--all", "--plain", "--no-legend")
+#: ``systemctl show`` properties a unit state carries; ``Result`` and
+#: ``ExecMainStatus`` say how a dead unit died (the tool's exit code).
+UNIT_PROPERTIES = (
+    "LoadState ActiveState SubState MainPID NRestarts InvocationID DropInPaths "
+    "ExecMainStartTimestamp NextElapseUSecRealtime Result ExecMainStatus"
+).split()
+#: The last lines of a dead unit's journal: the tool's own refusal or traceback.
+JOURNAL_TAIL = ("journalctl", "--no-pager", "-o", "cat", "-n", "40", "-u")
 #: Written into a run directory when it is created: which run owns it.
 RUN_MARKER = "run.json"
 #: Collector settings a plan may depend on; nothing else is ever read out.
@@ -165,12 +174,14 @@ PENDING_SERVICE_STATES = frozenset(
 
 
 class ProbeError(RuntimeError):
-    def __init__(self, message: str, reason: str = "") -> None:
+    def __init__(self, message: str, reason: str = "", detail: Any = None) -> None:
         super().__init__(message)
-        #: A fixed identifier of the refusal (``profile_shape``, ``port_busy``)
-        #: from this file's closed vocabulary; the host fixture shows it beside
-        #: the class, digest and site, and keeps the message only redacted.
+        #: ``reason``: a fixed identifier of the refusal (``profile_shape``,
+        #: ``unit_down``) from this file's closed vocabulary, shown by the host
+        #: fixture beside the class, digest and site. ``detail``: JSON the
+        #: fixture keeps, redacted, in the case's probe-error.json (a journal).
         self.reason = reason
+        self.detail = detail
 
 
 def utc_now() -> str:
@@ -294,20 +305,7 @@ def baseline_endpoint() -> str:
 
 def unit_state(unit: str) -> dict[str, str]:
     completed = run(
-        [
-            "systemctl",
-            "show",
-            unit,
-            "--property=LoadState",
-            "--property=ActiveState",
-            "--property=SubState",
-            "--property=MainPID",
-            "--property=NRestarts",
-            "--property=InvocationID",
-            "--property=DropInPaths",
-            "--property=ExecMainStartTimestamp",
-            "--property=NextElapseUSecRealtime",
-        ],
+        ["systemctl", "show", unit, *(f"--property={p}" for p in UNIT_PROPERTIES)],
         check=False,
     )
     values: dict[str, str] = {}
@@ -321,6 +319,16 @@ def unit_state(unit: str) -> dict[str, str]:
 
 def loaded(state: dict[str, str]) -> bool:
     return state.get("LoadState") == "loaded"
+
+
+def journal(unit: str, state: dict[str, str]) -> dict[str, Any]:
+    """Why a transient unit died: its exit result and its last journal lines
+    (the tool's argparse refusal, a traceback), bounded; the host fixture
+    redacts every string before anything is written."""
+
+    tail = run([*JOURNAL_TAIL, f"{unit}.service"], check=False)
+    lines = [line[:300] for line in tail.stdout.splitlines()[-40:]]
+    return {"unit": f"{unit}.service", "service": state, "journal": lines}
 
 
 def process_environment(pid: str) -> dict[str, str]:
@@ -362,10 +370,8 @@ def wait_active(unit: str, *, seconds: int = 60) -> dict[str, str]:
     state = unit_state(unit)
     while time.monotonic() < deadline:
         state = unit_state(unit)
-        if state.get("ActiveState") == "active" and state.get("MainPID") not in {
-            "",
-            "0",
-        }:
+        active = state.get("ActiveState") == "active"
+        if active and state.get("MainPID") not in {"", "0"}:
             return state
         time.sleep(1)
     return state
@@ -595,21 +601,8 @@ def residue(port: int | None = None) -> dict[str, Any]:
         if DROPIN_DIR.is_dir()
         else []
     )
-    units = sorted(
-        item
-        for item in run(
-            [
-                "systemctl",
-                "list-units",
-                "--all",
-                "--plain",
-                "--no-legend",
-                f"{UNIT_PREFIX}*",
-            ],
-            check=False,
-        ).stdout.split()
-        if item.startswith(UNIT_PREFIX)
-    )
+    listing = run([*LIST_UNITS, f"{UNIT_PREFIX}*"], check=False).stdout.split()
+    units = sorted(item for item in listing if item.startswith(UNIT_PREFIX))
     run_dirs = (
         sorted(path.name for path in STATE_ROOT.glob("*") if path.is_dir())
         if STATE_ROOT.is_dir()
@@ -849,6 +842,7 @@ def deploy_proxy(arguments: argparse.Namespace) -> None:
     )
     deadline = time.monotonic() + 30
     status: dict[str, Any] = {}
+    state: dict[str, str] = {}
     while time.monotonic() < deadline:
         state = unit_state(f"{unit}.service")
         if state.get("ActiveState") == "active":
@@ -858,10 +852,14 @@ def deploy_proxy(arguments: argparse.Namespace) -> None:
             except ProbeError:
                 pass
         if state.get("ActiveState") in {"failed", "inactive"}:
-            raise ProbeError("the replay unit did not stay up", "unit_down")
+            raise ProbeError(
+                "the replay unit did not stay up", "unit_down", journal(unit, state)
+            )
         time.sleep(0.5)
     if not status:
-        raise ProbeError("the replay tool did not answer /status", "no_status")
+        raise ProbeError(
+            "the replay tool did not answer /status", "no_status", journal(unit, state)
+        )
     if status.get("armed") is not False:
         raise ProbeError(
             "the replay tool came up armed; it must start pass-through",
@@ -1479,6 +1477,7 @@ def error_fields(exc: BaseException, command: str) -> dict[str, Any]:
         "error_site": exception_site(exc),
         "error_reason": getattr(exc, "reason", "") or None,
         "error_message": str(exc)[:2000],
+        "error_detail": getattr(exc, "detail", None),
         "command": command,
     }
 

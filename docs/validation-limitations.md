@@ -3096,6 +3096,28 @@ in the case's `probe-error.json`
 (`tests/regional/test_general_live_dcgm_deploy_profile.py`). The trio is to be
 re-run on both clusters.
 
+021's three no-finding variants (`before_window`, `ungraded_product`,
+`monitor_restart`) have no live evidence yet either. On 2026-10-26 (HyperPod,
+the hpb lane's exclusive node, release R13g, harness live17)
+`before_window` ended INCONCLUSIVE at `deploy-proxy` with `reason unit_down`
+and a `probe-error.json` that said only "the replay unit did not stay up". The
+node was not the cause: the three plans' held steps asked 400 reads
+(`monitor_restart` 800) while `tools/gpu_dcgm_field_replay.py` serves at most
+`MAX_READS_PER_STEP` 200 per step (and `MAX_TOTAL_READS` 400 per plan), so the
+tool refused the plan at its start (`error: reads must be an integer in
+1..200`, exit 2) and the transient unit died; the `nvlink` plans (3/40 reads)
+on the same node had deployed minutes earlier. The runner's `plan()` now runs
+the tool's own `validate_plan` before the node is touched (a refusal is
+INCONCLUSIVE with the tool's sentence), the held steps' read bounds come from
+`held_reads(interval, seconds)` -- twice the reads of the hold at the
+collector's interval plus four, refused rather than clipped above 200 because
+a replay ending under a running hold would grade the real reading and pass
+hollow -- and on `unit_down` / `no_status` the controller puts the unit's
+`Result` / `ExecMainStatus` and the last 40 journal lines (300 chars each,
+redacted by the fixture) into `probe-error.json`
+(`tests/regional/test_general_live_fabric_plan_bounds.py`). The three are to be
+re-run on both clusters.
+
 019 `remap_failure`'s recovery stage is the exit the settled record asks
 for (live 2026-10-26, plain EKS ip-10-0-43-5, release R13g; product lane b192,
 commit 69f87b5d, ships in R13h). On R13g the product detected the replayed
