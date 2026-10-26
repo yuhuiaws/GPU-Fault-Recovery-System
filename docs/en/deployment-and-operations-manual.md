@@ -10528,9 +10528,10 @@ count and the SHA-256 (the node result carries the same field); the collection i
 step's `node_failures` reads `ObservationIncomplete: <status>: <exception class: message>` and the node result's details carry
 `failed_component`/`failure_stage`/`worker_started`; a bare `error="ValueError"` without a message comes from an Agent older than this fix.
 A triage node result is bounded by the worker's 1 MiB result line too: an upgraded Agent first trims redundant or long FR
-operation lists along the result's `evidence_trimmed` ladder (every rank keeps its identity, status, `progress` and
-`raw_evidence`) and only a result still over the line becomes a `RESULT_SIZE_LIMIT` stand-in carrying `error` (size, budget,
-heaviest fields); a step whose `node_failures` reads `ObservationIncomplete: RESULT_SIZE_LIMIT` while the node result is a bare
+operation lists along the result's `evidence_trimmed` ladder, whose floor (`skeleton`) keeps every rank's identity, status,
+`progress` and `raw_evidence` and drops everything else, and only a result whose skeleton alone is over the line becomes a
+`RESULT_SIZE_LIMIT` stand-in carrying `error` (size, budget, heaviest fields) and `ranks_summary` (pid, rank and status of the
+ranks it replaced); a step whose `node_failures` reads `ObservationIncomplete: RESULT_SIZE_LIMIT` while the node result is a bare
 `{"status":"RESULT_SIZE_LIMIT","ranks":[]}` comes from an Agent older than this fix (live HyperPod `fr_enabled`, eight ranks with
 the recorder on).
 Without eligible candidates, the bounded passive bundle need not contain

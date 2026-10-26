@@ -2289,6 +2289,7 @@ POST 预制 finding。类别模块 `general_live_nccl`/`_nccl_fr`/`_progress`/`_
   （2026-10-25 23:05Z）dump 被找到并每 rank 请求两次，但 8 rank × 2 份 dump 的 triage 结果约 1.2 MB，超过 Node Agent worker 的
   1 MiB 单行结果上限，两节点都只剩 `ObservationIncomplete: RESULT_SIZE_LIMIT`、`node_results={}`，运行器又读到 "sampled no rank
   process"——现登记的缺口即此（`FR_RESULT_BUDGET_GAP`；批次 186 让 triage 在交出前按 `evidence_trimmed` 阶梯自裁、占位写明字节数，
+  186b 给阶梯加 `skeleton` 地板（每个 rank 的身份与判定字段必留）并让占位以 `ranks_summary` 点名 rank，
   随 GPU 节点 Agent 上线翻回 PASS）；运行器在释放前把两 Pod 内三处候选位置的 `stat` 清单与
   PyTorch 自己的 FR 日志行写入 `<suffix>-fr-forensics.json`，`fr_dumps` 判定指出 dump
   实际所在——写在 2.9 默认位置、写在产品读取位置但读取过早、写在产品读取位置且已请求但节点结果未到记录（点名 step `node_failures`

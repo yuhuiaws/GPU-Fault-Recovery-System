@@ -465,9 +465,19 @@ def test_sixteen_ranks_shorten_the_operation_lists_before_any_process_evidence()
     ) == classify_hung_signals(full["ranks"], undetermined_nodes=[])
 
 
-def test_process_evidence_is_the_last_to_go_and_is_never_dropped_whole() -> None:
+def test_process_evidence_is_the_last_to_go_before_the_floor() -> None:
+    """Above the skeleton floor the process evidence is cut to its last sample,
+    never dropped whole; the budget here is what sixteen ranks weigh at that
+    step (measured on a copy), so the ladder stops exactly there."""
+
     result = live_shaped_result(16)
-    budget = 300_000
+    probe = bounded_triage_result(copy.deepcopy(result), budget=1)
+    last_sample = next(
+        step["bytes"]
+        for step in probe["evidence_trimmed"]["steps"]
+        if step["step"] == "process_series.samples:last"
+    )
+    budget = last_sample + 1_000
 
     bounded = bounded_triage_result(result, budget=budget)
 
@@ -481,9 +491,7 @@ def test_process_evidence_is_the_last_to_go_and_is_never_dropped_whole() -> None
         "stack_series.samples:last",
         "process_series.samples:last",
     ], note
-    assert note["within_budget"] is False, (
-        "sixteen ranks' identities and watermarks weigh more than 300 KB"
-    )
+    assert note["within_budget"] is True, note
     assert note["bytes_after"] == encoded_size(bounded)
     for row in bounded["ranks"]:
         assert len(row["stack_series"]["samples"]) == 1
@@ -507,13 +515,18 @@ def test_a_single_dump_series_drops_the_recorders_copy_against_its_first_snapsho
     row["flight_recorder_series"]["status"] = "SECOND_UNAVAILABLE"
     row["flight_recorder_series"]["first"] = snapshot(first)
     row["flight_recorder_series"]["second"] = {"status": "dump_missing"}
-    result = {"ranks": [row], "padding": "x" * TRIAGE_RESULT_BUDGET_BYTES}
+    result = {"ranks": [row]}
+    # One byte over: the lossless step alone brings the document under.
+    budget = encoded_size(result) - 1
 
-    bounded_triage_result(result)
+    bounded_triage_result(result, budget=budget)
 
     [group] = row["flight_recorder"]["last_entries_by_pg"]
     assert group["semantic_entries_in"] == "flight_recorder_series.first"
     assert "semantic_entries" not in group
+    assert [step["step"] for step in result["evidence_trimmed"]["steps"]] == [
+        "flight_recorder.semantic_entries_in_series"
+    ]
 
 
 def published_line(document: dict[str, Any], *, final: bool = True) -> dict[str, Any]:

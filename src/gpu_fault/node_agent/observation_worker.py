@@ -15,6 +15,7 @@ from gpu_fault.node_agent.diagnostic_process import DiagnosticProcessRunner
 from gpu_fault.node_agent.observation_limits import (
     OBSERVATION_REQUEST_BUDGET_BYTES,
     OBSERVATION_RESULT_BUDGET_BYTES,
+    RESULT_STAND_IN_RANKS_BUDGET_BYTES,
     WORKER_OUTPUT,
 )
 from gpu_fault.node_agent.operations.diagnostics import DiagnosticOperationsMixin
@@ -55,6 +56,61 @@ class ObservationAgent(
         self.partial_evidence_sink = lambda document: publish(document, final=False)
 
 
+def rank_status(row: dict[str, Any]) -> str | None:
+    """One word for a rank the stand-in names.
+
+    The row's own ``status`` or ``error`` first (a summary row's
+    ``PROCESS_CHANGED_OR_UNREADABLE``), else the recorder series' status
+    (``PAIRED``/``SECOND_UNAVAILABLE``/...), else the recorder's
+    (``dumped``/``not_configured``/``process_changed``), else a summary row's
+    ``communication_status``.
+    """
+
+    candidates: list[Any] = [row.get("status"), row.get("error")]
+    for key in ("flight_recorder_series", "flight_recorder"):
+        nested = row.get(key)
+        if isinstance(nested, dict):
+            candidates.append(nested.get("status"))
+    candidates.append(row.get("communication_status"))
+    for value in candidates:
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def ranks_summary(
+    document: dict[str, Any], budget: int = RESULT_STAND_IN_RANKS_BUDGET_BYTES
+) -> dict[str, Any]:
+    """pid, rank and status of as many of ``document``'s ranks as fit in
+    ``budget`` bytes, in the result's own order; the total and whether the list
+    stopped short are counted next to it."""
+
+    ranks = document.get("ranks")
+    rows = (
+        [row for row in ranks if isinstance(row, dict)]
+        if isinstance(ranks, list)
+        else []
+    )
+    listed: list[dict[str, Any]] = []
+    size = 2  # the brackets
+    for row in rows:
+        entry = {
+            "pid": row.get("pid"),
+            "rank": row.get("rank"),
+            "status": rank_status(row),
+        }
+        weight = len(json.dumps(entry, separators=(",", ":")).encode()) + bool(listed)
+        if size + weight > budget:
+            break
+        listed.append(entry)
+        size += weight
+    return {
+        "ranks_summary": listed,
+        "ranks_total": len(rows),
+        "ranks_summary_truncated": len(listed) < len(rows),
+    }
+
+
 def oversized_result(size: int, document: dict[str, Any]) -> dict[str, Any]:
     """The stand-in for a result line the supervisor would refuse.
 
@@ -66,7 +122,12 @@ def oversized_result(size: int, document: dict[str, Any]) -> dict[str, Any]:
     runner read "sampled no rank process" over eight sampled ranks. The
     stand-in names the size, the budget, the heaviest fields and the stage, in
     the shape every other refusal uses (``error``, ``failed_component``,
-    ``failure_stage``, ``worker_started``, ``evidence_complete``).
+    ``failure_stage``, ``worker_started``, ``evidence_complete``), and it names
+    the ranks it replaces: ``ranks_summary`` lists pid, rank and status for as
+    many ranks as fit in ``RESULT_STAND_IN_RANKS_BUDGET_BYTES``, with
+    ``ranks_total`` and ``ranks_summary_truncated`` beside it. The hung triage
+    trims itself down to a skeleton of every rank before it gets here, so this
+    is reached only by a document whose skeleton alone is over the line.
     """
 
     weights = sorted(
@@ -90,6 +151,7 @@ def oversized_result(size: int, document: dict[str, Any]) -> dict[str, Any]:
         "failure_stage": WORKER_OUTPUT,
         "worker_started": True,
         "result_bytes": size,
+        **ranks_summary(document),
     }
 
 

@@ -2455,9 +2455,11 @@ worker's 1 MiB single-line result limit, both nodes handed back only
 runner read "sampled no rank process". The runner now distinguishes a lost
 triage result (`<node>: no COLLECT_HUNG_TRIAGE result reached the record:
 <cause>`) from dumps the product never read; batch 186 trims an over-budget
-triage result stepwise on the node instead of dropping it, and once that Node
-Agent is live and the variant passes on both clusters its expectation flips
-back to PASS.
+triage result stepwise on the node instead of dropping it, batch 186b gives
+that ladder a `skeleton` floor (every rank's identity, status, watermarks and
+raw-dump reference survive; the stand-in names its ranks in `ranks_summary`),
+and once that Node Agent is live and the variant passes on both clusters its
+expectation flips back to PASS.
 
 ## GF-GENERAL-LIVE-014 Kubernetes allocatable (native device-plugin freeze)
 

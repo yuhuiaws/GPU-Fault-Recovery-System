@@ -426,11 +426,17 @@ worker 把整份结果换成 `{"status":"RESULT_SIZE_LIMIT","ranks":[]}`，两�
 rank 发现、容器 scope 与 dump 位置都没有问题，任何开 FR 的 8 GPU 节点都会触发。现在 triage 交出结果前先按
 `operations/triage_budget.bounded_triage_result` 的阶梯压到 `TRIAGE_RESULT_BUDGET_BYTES`（1 MiB 减 64 KiB）以内：
 先无损地把 `last_entries_by_pg` 中 series 快照已带的操作列表换成 `semantic_entries_in` 指针，再去 `unfinished_entries`、
-把每组操作列表缩到前 32/16/8 条（未完成操作在前）、整列去掉（`progress` 水位保留），最后才把栈/进程序列只留最新一次采样；
-每个 rank 的身份、FR 状态、`progress`、`raw_evidence` 每一级都保留，结果的 `evidence_trimmed` 记预算、裁前/裁后字节数与各级名称。
-读取器的 `last_entry` 不再重复该组的 `semantic_entries`。阶梯走完仍超限的占位带 `error`（字节数、预算、最重字段）、
-`failed_component=observation_worker`、`failure_stage=WORKER_OUTPUT`、`result_bytes`。本地复现：真机 8 rank 形状
-1,006 KB → 781 KB（只用无损一级），16 rank 2,003 KB → 875 KB，两者的控制面判定与全量结果相同。
+把每组操作列表缩到前 32/16/8 条（未完成操作在前）、整列去掉（`progress` 水位保留），再把栈/进程序列只留最新一次采样，
+最后是地板 `skeleton`：每个 rank 行只剩 pid/rank/身份（完整 `process_identity`）、角色与状态字段、FR 状态与 dump 路径/大小/
+`raw_evidence` 引用（不含内容）、各组的组身份、最新操作位置与 `progress` 水位及 `semantic_entries_total`、series 的 `status`
+（PAIRED/…）、时间戳与计数、栈/进程/GPU 序列的计数和 `python_stack`/`proc` 的状态，行盖 `skeleton: true`，节点级字段原样；
+每个 rank 的身份、FR 状态、`progress`、`raw_evidence` 每一级都保留，结果的 `evidence_trimmed` 记预算、裁前/裁后字节数与各级名称
+（用到地板时含 `skeleton` 及其字节数）。读取器的 `last_entry` 不再重复该组的 `semantic_entries`。只有骨架本身就超线的文档才换成占位，
+占位带 `error`（字节数、预算、最重字段）、`failed_component=observation_worker`、`failure_stage=WORKER_OUTPUT`、`result_bytes`，
+并以 `ranks_summary`（pid、rank、状态，按结果顺序装满 16 KiB 为止）、`ranks_total`、`ranks_summary_truncated` 点名被替换的 rank。
+本地复现：真机 8 rank 形状 1,006 KB → 781 KB（只用无损一级），16 rank 2,003 KB → 875 KB，两者的控制面判定与全量结果相同；
+64 rank 8.85 MB → 369 KB（地板，5.7 KB 一个 rank），FR 时序/快照分支的判定与全量相同。summary 与 bundle 走同一条 worker 结果线，
+但 bundle 结果只是引用（不到 1 KB）、summary 按构造有界（每节点最多 256 行、实测 365 字节一行），都不设地板。
 hung 包跳过 DCGM diag、bug-report 与 strace；
 FR 文件读取上限 64 MiB，结构遍历有界，环形 pickle 不递归失控。
 20 秒是新版 triage 内部采样预算；生产 Agent 另用隔离只读 worker 约束父进程等待，

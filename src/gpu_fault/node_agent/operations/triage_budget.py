@@ -17,6 +17,21 @@ The ladder below shrinks the heaviest, most redundant evidence first and stops
 as soon as the document fits. Every rank keeps its identity, status, progress
 watermarks and raw-dump reference at every step; what was removed is named in
 ``evidence_trimmed`` so the record says why a field is short.
+
+The ladder has a floor. A document still over the budget after every sample
+list was cut used to go back as it was, and the worker replaced the whole of it
+by the ``RESULT_SIZE_LIMIT`` stand-in with ``ranks: []`` -- every rank identity,
+status, watermark and raw-dump reference lost in that last resort. The
+``skeleton`` step reduces every rank row to exactly those fields (pid, rank,
+process identity, role and status, the recorder's status with its dump path,
+size and preserved-copy reference, the group identities with their ``progress``
+watermarks and the newest operation's position, the series' status, timestamps
+and counts, the sample series' counts and the stack's status) and leaves the
+node-level fields whole: a rank of the live shape (two 64-operation dumps of a
+16-member group, three stack and process samples) weighs 5.7 KB at the floor,
+so 64 such ranks come to 369 KB against the 960 KiB budget and more than 170 of
+them fit. Only a document whose skeleton alone is over the line reaches the
+stand-in, and the stand-in names its ranks.
 """
 
 from __future__ import annotations
@@ -36,6 +51,101 @@ TRIAGE_RESULT_BUDGET_BYTES = OBSERVATION_RESULT_BUDGET_BYTES - 64 * 1024
 #: the control plane's semantics matcher compares across ranks.
 SEMANTIC_ENTRY_STEPS = (32, 16, 8)
 TRIMMED_MARKER = "trimmed"
+#: The floor of the ladder; the name ``evidence_trimmed.steps`` records for it.
+SKELETON_STEP = "skeleton"
+#: Row fields the skeleton keeps: identity, role and status. ``process_identity``
+#: stays whole (verified, start ticks, namespace pids, container id).
+SKELETON_ROW_KEYS = (
+    "node_id",
+    "pid",
+    "rank",
+    "local_rank",
+    "world_size",
+    "gpu_uuid",
+    "gpu_uuids",
+    "process_name",
+    "process_identity",
+    "status",
+    "error",
+    "role",
+    "participant_basis",
+    "communication_status",
+)
+#: Recorder fields the skeleton keeps: the status, where the dump is and how
+#: big, the parse error, the counts and the preserved copy's reference (path,
+#: digest, bytes) -- never an operation list.
+SKELETON_RECORDER_KEYS = (
+    "status",
+    "pipe",
+    "pipe_candidates",
+    "dump_file",
+    "dump_size_bytes",
+    "dump_source",
+    "dump_prefix_variable",
+    "dump_candidates",
+    "source_mtime_ns",
+    "parse_error",
+    "error",
+    "trace_buffer",
+    "entry_count",
+    "process_groups_truncated",
+    "unfinished_entry_count",
+    "unfinished_entries_truncated",
+    "raw_evidence",
+)
+#: An operation-group row (``last_entry``, ``last_entries_by_pg``, the series'
+#: ``groups``) keeps its identity, the newest operation's position and state
+#: and the ``progress`` watermarks; operation lists, shapes and dtypes go.
+SKELETON_ENTRY_KEYS = (
+    "pg_name",
+    "pg_id",
+    "pg_config_key",
+    "pg_members",
+    "pg_rank_order",
+    "pg_member_count",
+    "pg_membership_sha256",
+    "pg_members_compacted",
+    "collective_seq_id",
+    "record_id",
+    "op_id",
+    "p2p_seq_id",
+    "is_p2p",
+    "state",
+    "profiling_name",
+    "retired",
+    "time_created",
+    "time_discovered_started",
+    "time_discovered_completed",
+    "timeout_ms",
+    "progress",
+    "semantic_entries_total",
+)
+SKELETON_SERIES_KEYS = (
+    "version",
+    "status",
+    "first_observed_at",
+    "process_start_ticks",
+    "clock_uncertainty_seconds",
+    "second_requested_at",
+    "interval_seconds",
+    "second_observed_at",
+)
+SKELETON_SNAPSHOT_KEYS = (
+    "status",
+    "parse_error",
+    "raw_evidence",
+    "process_groups_truncated",
+)
+#: What a sample series keeps besides its emptied lists and their counts.
+SKELETON_SAMPLES_KEYS = (
+    "version",
+    "requested_samples",
+    "scope",
+    "mapping_verified",
+    "shared_with_other_processes",
+)
+#: What the last stack sample and the last process window keep.
+SKELETON_STATUS_KEYS = ("status", "error", "returncode")
 
 
 def encoded_size(document: Any) -> int:
@@ -179,7 +289,137 @@ def keep_last_sample(series_key: str) -> Callable[[list[dict[str, Any]]], int]:
     return step
 
 
-#: Heaviest and most redundant first; process evidence last.
+def _scalar(value: Any) -> bool:
+    return value is None or isinstance(value, (str, int, float, bool))
+
+
+def _pick(document: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
+    return {key: document[key] for key in keys if key in document}
+
+
+def _series_totals(row: dict[str, Any]) -> dict[Any, int]:
+    """Operation counts per group the series still knows, for a recorder group
+    whose list became a ``semantic_entries_in`` pointer at the lossless step."""
+
+    totals: dict[Any, int] = {}
+    for group in _series_groups(row):
+        entries = group.get("semantic_entries")
+        total = group.get("semantic_entries_total")
+        if type(total) is int:
+            totals[group.get("pg_name")] = total
+        elif isinstance(entries, list):
+            totals[group.get("pg_name")] = len(entries)
+    return totals
+
+
+def _skeleton_entry(entry: dict[str, Any], totals: dict[Any, int]) -> dict[str, Any]:
+    kept = _pick(entry, SKELETON_ENTRY_KEYS)
+    entries = entry.get("semantic_entries")
+    if isinstance(entries, list):
+        kept.setdefault("semantic_entries_total", len(entries))
+        kept["semantic_entries_trimmed"] = True
+    elif entry.get("semantic_entries_in") or entry.get("semantic_entries_trimmed"):
+        if "semantic_entries_total" not in kept and entry.get("pg_name") in totals:
+            kept["semantic_entries_total"] = totals[entry["pg_name"]]
+        kept["semantic_entries_trimmed"] = True
+    return kept
+
+
+def _skeleton_recorder(
+    recorder: dict[str, Any], totals: dict[Any, int]
+) -> dict[str, Any]:
+    kept = _pick(recorder, SKELETON_RECORDER_KEYS)
+    last = recorder.get("last_entry")
+    if isinstance(last, dict):
+        kept["last_entry"] = _skeleton_entry(last, totals)
+    groups = recorder.get("last_entries_by_pg")
+    if isinstance(groups, list):
+        kept["last_entries_by_pg"] = [
+            _skeleton_entry(group, totals)
+            for group in groups
+            if isinstance(group, dict)
+        ]
+    if "unfinished_entries" in recorder:
+        kept["unfinished_entries"] = []
+        if recorder["unfinished_entries"] or recorder.get("unfinished_entries_trimmed"):
+            kept["unfinished_entries_trimmed"] = True
+    return kept
+
+
+def _skeleton_series(series: dict[str, Any]) -> dict[str, Any]:
+    kept = _pick(series, SKELETON_SERIES_KEYS)
+    for which in ("first", "second"):
+        snapshot = series.get(which)
+        if not isinstance(snapshot, dict):
+            continue
+        compact = _pick(snapshot, SKELETON_SNAPSHOT_KEYS)
+        groups = snapshot.get("groups")
+        if isinstance(groups, list):
+            compact["groups"] = [
+                _skeleton_entry(group, {})
+                for group in groups
+                if isinstance(group, dict)
+            ]
+        kept[which] = compact
+    return kept
+
+
+def _skeleton_samples(series: dict[str, Any]) -> dict[str, Any]:
+    kept = _pick(series, SKELETON_SAMPLES_KEYS)
+    samples = series.get("samples")
+    trimmed = series.get("samples_trimmed")
+    kept["samples"] = []
+    kept["samples_trimmed"] = (trimmed if type(trimmed) is int else 0) + (
+        len(samples) if isinstance(samples, list) else 0
+    )
+    if "windows" in series:
+        windows = series["windows"]
+        kept["windows"] = []
+        kept["windows_trimmed"] = len(windows) if isinstance(windows, list) else 0
+    return kept
+
+
+def _skeleton_row(row: dict[str, Any]) -> dict[str, Any]:
+    kept = _pick(row, SKELETON_ROW_KEYS)
+    kept["skeleton"] = True
+    context = row.get("comparison_context")
+    if isinstance(context, dict):
+        kept["comparison_context"] = {
+            key: value for key, value in context.items() if _scalar(value)
+        }
+    recorder = row.get("flight_recorder")
+    if isinstance(recorder, dict):
+        kept["flight_recorder"] = _skeleton_recorder(recorder, _series_totals(row))
+    series = row.get("flight_recorder_series")
+    if isinstance(series, dict):
+        kept["flight_recorder_series"] = _skeleton_series(series)
+    for key in ("process_series", "stack_series", "gpu_series"):
+        samples = row.get(key)
+        if isinstance(samples, dict):
+            kept[key] = _skeleton_samples(samples)
+    for key in ("python_stack", "proc"):
+        document = row.get(key)
+        if isinstance(document, dict):
+            kept[key] = _pick(document, SKELETON_STATUS_KEYS)
+    return kept
+
+
+def skeleton(ranks: list[dict[str, Any]]) -> int:
+    """The floor: every rank row down to identity, status, watermarks and
+    references, in place; a row already at the floor is left alone."""
+
+    changed = 0
+    for row in ranks:
+        if row.get("skeleton") is True:
+            continue
+        compact = _skeleton_row(row)
+        row.clear()
+        row.update(compact)
+        changed += 1
+    return changed
+
+
+#: Heaviest and most redundant first; process evidence last; the floor below.
 LADDER: tuple[tuple[str, Callable[[list[dict[str, Any]]], int]], ...] = (
     (
         "flight_recorder.semantic_entries_in_series",
@@ -193,6 +433,7 @@ LADDER: tuple[tuple[str, Callable[[list[dict[str, Any]]], int]], ...] = (
     ("semantic_entries", drop_semantic_entries),
     ("stack_series.samples:last", keep_last_sample("stack_series")),
     ("process_series.samples:last", keep_last_sample("process_series")),
+    (SKELETON_STEP, skeleton),
 )
 
 
@@ -202,10 +443,12 @@ def bounded_triage_result(
     """``result`` within ``budget`` where the ladder can get it, annotated.
 
     The ladder is walked in place and stops at the first step that brings the
-    document under the budget. ``evidence_trimmed`` names the budget, the size
-    before and after, every step that changed a rank and whether the document
-    fits; a document still over the budget after the whole ladder is returned
-    as it is, for the worker's stand-in to name its size.
+    document under the budget; its last step is the skeleton floor, which keeps
+    every rank's identity and verdict and nothing else. ``evidence_trimmed``
+    names the budget, the size before and after, every step that changed a rank
+    and whether the document fits; a document still over the budget at the
+    floor is returned as it is, for the worker's stand-in to name its size and
+    its ranks.
     """
 
     before = encoded_size(result)

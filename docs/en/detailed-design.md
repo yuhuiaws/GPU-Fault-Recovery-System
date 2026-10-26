@@ -3724,12 +3724,33 @@ request-trim notes) with `operations/triage_budget.bounded_triage_result`. The l
 operations of every group; the reader lists pending operations first, `semantic_entries_total`/`semantic_entries_truncated`
 record the original), `semantic_entries` (the lists go, `progress` watermarks and group identity stay),
 `stack_series.samples:last` and `process_series.samples:last` (the newest sample only, `windows` stay, `samples_trimmed` counts
-what went); it stops at the first step that fits. Every rank keeps pid/rank/identity, FR status, `progress` and `raw_evidence`
-at every step, and `evidence_trimmed` records the budget, the size before and after, each step with the ranks it touched and
-whether the document fits. The reader's `last_entry` no longer repeats its group's `semantic_entries`. A document still over the
-line after the whole ladder goes out as the stand-in `{"status":"RESULT_SIZE_LIMIT","ranks":[],"evidence_complete":false,
+what went) and, as the floor, `skeleton`: every rank row reduced to its identity and verdict-bearing fields -- `node_id`, `pid`,
+`rank`, `local_rank`, `gpu_uuid`/`gpu_uuids`, `process_name`, `process_identity` whole (verified, start ticks, namespace pids,
+container id), `status`/`error`/`role`/`participant_basis`/`communication_status`, the scalars of `comparison_context`,
+`flight_recorder` down to its status, `pipe`, `dump_file`, `dump_size_bytes`, `dump_source`, `parse_error`, `entry_count`,
+`unfinished_entry_count` and `raw_evidence` (path, SHA-256, bytes; never the contents) with its `last_entry`/`last_entries_by_pg`
+groups cut to the group identity (`pg_name`, `pg_members`, `pg_membership_sha256`, `pg_member_count`), the newest operation's
+`collective_seq_id`/`state`/`profiling_name`/times, the `progress` watermarks and `semantic_entries_total`,
+`flight_recorder_series` down to its `status` (PAIRED/...), timestamps, `interval_seconds`, `process_start_ticks` and the two
+snapshots' status, `raw_evidence` and groups in the same compact form, the stack/process/GPU series down to their counts
+(`samples_trimmed`, `windows_trimmed`) and `python_stack`/`proc` down to `status`/`error`/`returncode`; the row is stamped
+`skeleton: true` and the node-level fields (`status`, `process_coverage`, `workload_scope`, `efa`, `errors`) stay whole. The
+ladder stops at the first step that fits. Every rank keeps pid/rank/identity, FR status, `progress` and `raw_evidence` at every
+step, and `evidence_trimmed` records the budget, the size before and after, each step with the ranks it touched and whether the
+document fits (`steps` carries `skeleton` with its bytes when the floor was applied). The reader's `last_entry` no longer repeats
+its group's `semantic_entries`. A rank of the live shape weighs 5.7 KB at the floor (64 ranks with two 64-operation dumps each:
+8.85 MB -> 369 KB; eight and sixteen ranks never reach it), so only a document whose skeleton alone is over the line goes out as
+the stand-in `{"status":"RESULT_SIZE_LIMIT","ranks":[],"evidence_complete":false,
 "error":"observation result exceeds budget: <bytes> > 1048576 bytes; largest fields: ...","failed_component":"observation_worker",
-"failure_stage":"WORKER_OUTPUT","worker_started":true,"result_bytes":<bytes>}`, so the step's `node_failures` states the cause.
+"failure_stage":"WORKER_OUTPUT","worker_started":true,"result_bytes":<bytes>,"ranks_summary":[{"pid":..,"rank":..,"status":..},...],
+"ranks_total":<n>,"ranks_summary_truncated":<bool>}` -- `ranks_summary` lists pid, rank and status (the row's own
+`status`/`error`, else the series' status, else the recorder's, else `communication_status`) for as many ranks as fit in 16 KiB
+(`RESULT_STAND_IN_RANKS_BUDGET_BYTES`), in the result's own order -- so even the last resort names the ranks and the step's
+`node_failures` states the cause. COLLECT_HUNG_SUMMARY and COLLECT_DIAGNOSTIC_BUNDLE share the worker's result line but need no
+floor: a bundle result is a reference (`evidence_ref`, SHA-256, size, capture counts; under 1 KB, its partial carries at most the
+256 KiB request context), and a summary is bounded by construction (at most 256 scoped processes a node, scalar/delta rows of 365
+bytes -- 95 KB for 256; the passive sampler strips `semantic_entries` before caching, `cached_fr` holds at most 256 pairs), so its
+own 1 MiB self-check is out of reach of any realistic node shape.
 Live, the two-node HyperPod `fr_enabled` run (2026-10-25 23:05Z) had the triage find all sixteen ranks and both dumps of every
 rank written inside the triage window; 8 ranks x 2 dumps x 64 operation summaries serialized four times made the result ~1.2 MB,
 both nodes were left with `ObservationIncomplete: RESULT_SIZE_LIMIT` and `node_results={}`, and the decision saw no process.

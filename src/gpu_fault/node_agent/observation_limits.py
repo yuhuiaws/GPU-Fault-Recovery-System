@@ -37,8 +37,15 @@ OBSERVATION_REQUEST_BUDGET_BYTES = 262144
 #: one -- a document over it goes out as a ``RESULT_SIZE_LIMIT`` stand-in that
 #: names the size (``observation_worker.oversized_result``). The hung triage
 #: trims its own evidence under this line first
-#: (``operations.triage_budget.bounded_triage_result``).
+#: (``operations.triage_budget.bounded_triage_result``), down to a skeleton of
+#: every rank's identity and verdict, so only a document whose skeleton alone
+#: is over the line reaches the stand-in.
 OBSERVATION_RESULT_BUDGET_BYTES = 1_048_576
+#: What the stand-in spends on naming the ranks of the result it replaces
+#: (``ranks_summary``: pid, rank and status per rank, in the result's own
+#: order, as many as fit). The operator's rule for the last resort: never drop
+#: everything and just report an error.
+RESULT_STAND_IN_RANKS_BUDGET_BYTES = 16 * 1024
 #: ``failure_stage`` of a result the supervisor could not obtain: the worker was
 #: never started (the request itself was refused, or the process could not be
 #: spawned), or it ran and its output could not be used. Defined here, where
