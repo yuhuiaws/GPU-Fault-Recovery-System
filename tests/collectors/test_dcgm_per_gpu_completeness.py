@@ -31,6 +31,7 @@ from gpu_fault.gpu_metrics import GpuMetricBatch, GpuMetricSample
 from gpu_fault.gpu_temperature_policy import TLIMIT_READING
 from gpu_fault.models import RecoveryAction, WorkflowOperation
 from gpu_fault.store import InMemoryStore
+from gpu_fault.telemetry import EvidenceKind
 from tests._builders import asgi_client
 
 CLUSTER = "completeness-cluster"
@@ -48,6 +49,8 @@ START = next_stable_phase(
 GPUS = {"GPU-a": ("0", "00000000:97:00.0"), "GPU-b": ("1", "00000000:A8:00.0")}
 VALUES = {"DCGM_FI_DEV_GPU_TEMP": 40, "DCGM_FI_DEV_POWER_MGMT_LIMIT": 700}
 PCIE = "DCGM_FI_DEV_PCIE_REPLAY_COUNTER"
+ROW_REMAP_FAILURE = "DCGM_FI_DEV_ROW_REMAP_FAILURE"
+INVALID = "invalid or ambiguous GPU observation"
 NVLINK_CRC = (
     "DCGM_FI_DEV_NVLINK_CRC_FLIT_ERROR_COUNT_TOTAL",
     "DCGM_FI_DEV_NVLINK_CRC_DATA_ERROR_COUNT_TOTAL",
@@ -398,3 +401,127 @@ def test_one_gpu_missing_reaches_the_bounded_diagnostic_and_clears() -> None:
     state = context.store.get_gpu_finding_state(COMPLETENESS_KEY)
     assert state is not None and state.finding is None, "the recovery clears it"
     assert _incidents(context) == 1, "and opens nothing new"
+
+
+def _latest(
+    context: ApplicationContext,
+) -> dict[tuple[str, str], tuple[float, datetime]]:
+    return {
+        (str(item.sample.gpu_uuid), item.sample.canonical_name): (
+            item.sample.value,
+            item.observed_at,
+        )
+        for item in context.store.list_gpu_metrics_latest(CLUSTER, NODE)
+    }
+
+
+def _slot_finding(context: ApplicationContext, gpu: str, name: str):
+    state = context.store.get_gpu_finding_state((CLUSTER, NODE, gpu, name))
+    return None if state is None else state.finding
+
+
+def test_a_nan_and_a_negative_reading_keep_the_earlier_accepted_value() -> None:
+    """GF-GENERAL-LIVE-025 ``nan_negative`` as served live (2026-10-26, H200):
+    GPU-b's row remap failure flag reads the Prometheus literal ``NaN`` and its
+    PCIe replay counter ``-1.0`` while GPU-a stays healthy.
+
+    Neither reading may become a value. The NaN slot is gone at the node's
+    parser and reads as GPU-b's missing required field; the negative counter is
+    forwarded (a counter reset is a delivery edge) and rejected by the control
+    plane as an invalid observation. The product's latest accepted sample of
+    both slots stays the earlier healthy one, timestamped by the scrape that
+    carried it -- retained, not converted -- while GPU-a's slots advance. No
+    finding on either slot, no incident; the clean scrape afterwards is the
+    recovery edge and advances both slots with their real value.
+    """
+
+    sink = Sink()
+    reader = collector(sink)
+    reader.collect_text(scrape(), observed_at=START)
+    served_at = START + timedelta(seconds=15)
+    reader.collect_text(
+        scrape(values={"GPU-b": {PCIE: "-1.0", ROW_REMAP_FAILURE: "NaN"}}),
+        observed_at=served_at,
+    )
+    baseline, served = sink.batches
+    assert {"fields-incomplete", "counter-reset"} <= set(served.edge_filter_reasons), (
+        f"the invalid scrape is delivered on its own edges: {served.edge_filter_reasons}"
+    )
+    assert served.collection_errors == [f"{MISSING} on GPU-b: row_remap_failure"], (
+        f"the NaN slot is GPU-b's missing field, not a reading: {served.collection_errors}"
+    )
+    assert [
+        sample.value
+        for sample in served.samples
+        if sample.gpu_uuid == "GPU-b" and sample.canonical_name == "pcie_replay_total"
+    ] == [-1.0], (
+        "the node forwards the negative counter as served; the control plane judges it"
+    )
+
+    context = ApplicationContext(store=InMemoryStore())
+    _post(context, baseline)
+    _post(context, served)
+
+    latest = _latest(context)
+    for name in ("pcie_replay_total", "row_remap_failure"):
+        assert latest[("GPU-b", name)] == (0.0, START), (
+            f"GPU-b/{name} keeps the earlier accepted sample and its time, it is not "
+            f"converted to a healthy value at the invalid scrape: {latest[('GPU-b', name)]}"
+        )
+        assert latest[("GPU-a", name)] == (0.0, served_at), (
+            f"GPU-a's valid readings of the same scrape are accepted: {latest[('GPU-a', name)]}"
+        )
+        assert _slot_finding(context, "GPU-b", name) is None, (
+            f"an invalid reading is no fault on GPU-b/{name}"
+        )
+    (evidence,) = [
+        item
+        for item in context.store.list_raw_evidence(
+            CLUSTER, node_id=NODE, kind=EvidenceKind.GPU_METRICS, limit=10
+        )
+        if item.observed_at == served_at
+    ]
+    assert evidence.payload["collection_errors"] == [
+        f"{MISSING} on GPU-b: row_remap_failure",
+        f"{INVALID}: GPU-b/pcie_replay_total",
+    ], (
+        f"the stored batch names both rejections: {evidence.payload['collection_errors']}"
+    )
+    assert not [
+        sample
+        for sample in evidence.payload["samples"]
+        if sample["gpu_uuid"] == "GPU-b"
+        and sample["canonical_name"] in {"pcie_replay_total", "row_remap_failure"}
+    ], "the stored batch holds no accepted sample of either rejected slot"
+    completeness = context.store.get_gpu_finding_state(COMPLETENESS_KEY)
+    assert completeness is not None and completeness.finding is not None
+    assert completeness.finding.automatic_action == RecoveryAction.NO_ACTION.value
+    assert "GPU-b/pcie_replay_total" in completeness.finding.reason, (
+        completeness.finding.reason
+    )
+    assert "GPU-b: row_remap_failure" in completeness.finding.reason, (
+        completeness.finding.reason
+    )
+    assert _incidents(context) == 0, "inside the sustain window nothing opens"
+
+    recovered_at = START + timedelta(seconds=30)
+    reader.collect_text(scrape(), observed_at=recovered_at)
+    recovered = sink.batches[-1]
+    assert "collection-recovered" in recovered.edge_filter_reasons, (
+        recovered.edge_filter_reasons
+    )
+    _post(context, recovered)
+
+    latest = _latest(context)
+    for name in ("pcie_replay_total", "row_remap_failure"):
+        assert latest[("GPU-b", name)] == (0.0, recovered_at), (
+            f"the real reading is accepted again at the recovery: {latest[('GPU-b', name)]}"
+        )
+        assert _slot_finding(context, "GPU-b", name) is None, (
+            "the negative-to-zero step is no counter fault"
+        )
+    completeness = context.store.get_gpu_finding_state(COMPLETENESS_KEY)
+    assert completeness is not None and completeness.finding is None, (
+        "the clean scrape clears the completeness finding"
+    )
+    assert _incidents(context) == 0
