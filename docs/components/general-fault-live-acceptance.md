@@ -1465,6 +1465,30 @@ on-node 状态目录与 deadman 单元、DCGM 回放与源回放的运行目录�
 `details.run_id` 记下 execute 将用的 run id，两者读同一 case 目录、结果一致
 （`tests/regional/test_general_live_rerun_identity.py`）。
 
+主机探针句柄全部归变体上下文所有：`VariantContext.host_probe` 是变体与夹具取得探针
+的唯一入口（键 `<用途>@<节点>`；已登记的句柄——测试的假探针、先前调用建立的句柄——
+原样返回，否则新建并登记），`ctx.probe` 与环境回放、CRI Pod 日志、内核回放、源回放、
+EFA 驱动、隔离、device-plugin 夹具都经它取句柄；`ctx.probes` 是 `ProbeRegistry`，在
+已占用的键下换入另一个句柄时先清理原句柄（同一身份的两个句柄会争同一条归属记录）并
+以 `<键>#<n>` 保留，拆除阶段清理并在 `probe_residuals` 中列出每一个句柄（在用的与被
+替换的）；已自证干净的句柄在下一次 create/execute 之前以该证明回答拆除阶段的二次
+`cleanup`。每个变体开始时 `run_general_live` 先用
+`scripts/e2e/regional/host_probe_sweep.py` 扫描本例目录下 `closed: false` 的归属记录
+（证据 `host-probe-sweep`、结果 `host_probe_sweep`）：Pod 已不存在或已终止
+（Failed/Succeeded）的记录属于已死探针——按夹具自身的归属证明（case/run 标签、owner 注解、
+脚本摘要、节点与节点 UID、UID 前置条件）删除其 Pod 与 ConfigMap 并以 `swept` 备注关闭，
+记录保留其脚本摘要为 `stale_host_script_sha256`，同一身份的下一个探针据此覆盖已死探针留
+在 `/run` 的那一份脚本副本（其他副本仍拒绝）；Pod 仍在运行（Pending/Running）的记录只
+报告、原样保留，夹具对活探针的归属拒绝不变；被其他进程持有、Pod/ConfigMap 不属于该记
+录、删除未被确认的记录保持打开并带原因报告。`HostProbeFixture.cleanup` 在记录无法重写
+（运行器主机磁盘满）时仍删除其所有资源，之后才以 `host probe ownership record could not
+be saved` 失败。2026-10-26 两集群各留下的 Failed（exit 143，activeDeadline）探针 Pod 与
+ConfigMap 即源于 024 组合变体关闭环境回放后 `discard` 其清理（该探针不在 `ctx.probes`
+中）与 022 `recovery_evidence` 拆除阶段的 ENOSPC；同目录重跑因探针名稳定而撞上旧记录
+（`host probe ownership record does not match this run`）。测试：
+`tests/regional/test_general_live_probe_ownership.py`、
+`tests/regional/test_host_probe_sweep.py`。
+
 ### 证据与判定
 
 判定只读产品自己的记录（accepted batch、health-signal、latest metric、incident、

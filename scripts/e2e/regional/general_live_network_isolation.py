@@ -285,21 +285,7 @@ def isolation_probe(ctx: VariantContext, node: str) -> ProbeHandle:
     """The isolation probe Pod on ``node`` (created lazily, torn down with the
     other probes)."""
 
-    key = f"isolation@{node}"
-    handle = ctx.probes.get(key)
-    if handle is None:
-        handle = ProbeHandle(
-            ctx.regional,
-            script=ISOLATION_PROBE,
-            node=node,
-            image=ctx.settings.host_probe_image,
-            key=ctx.spec.key,
-            run_id=ctx.run_id,
-            case_dir=ctx.case_dir,
-            deadline_seconds=ctx.spec.max_minutes * 60 + 1200,
-        )
-        ctx.probes[key] = handle
-    return handle
+    return ctx.host_probe("isolation", script=ISOLATION_PROBE, node=node)
 
 
 # --------------------------------------------------------------------------- #

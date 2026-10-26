@@ -255,6 +255,14 @@ def probe_execute(
 ) -> dict[str, Any]:
     if handle.script.name == "general_live_node_probe.py" and arguments[0] == "survey":
         return dict(SURVEY)
+    if (
+        handle.script.name == "general_live_applog_probe.py"
+        and arguments[0] == "preflight"
+    ):
+        # 017's CRI variants read the node's capabilities (read-only) before
+        # they create their managed job; the CRI fixture's probe is a
+        # context-owned handle like every other host probe.
+        return dict(CRI_PREFLIGHT)
     raise FirstMutation(f"host probe {handle.script.name} {arguments[0]}")
 
 
@@ -364,10 +372,9 @@ def install_fakes(monkeypatch: pytest.MonkeyPatch, api: ClusterApi) -> None:
     monkeypatch.setattr(RegionalLiveFixture, "cpu_python", unexpected_store_read)
     monkeypatch.setattr(ProbeHandle, "execute", probe_execute)
     monkeypatch.setattr(ProbeHandle, "cleanup", probe_cleanup)
-    # The CRI Pod-log fixture (017) owns a HostProbeFixture directly, not a
-    # ProbeHandle, and asks it for the node's capabilities before the managed
-    # job exists: its create and read-only preflight are fakes like the rest
-    # of the host-probe calls, so the job's create stays the first mutation.
+    # A fixture handed a HostProbeFixture directly (a test's own construction)
+    # gets the same fakes: its create and read-only preflight never count, so
+    # the job's create stays the first mutation.
     monkeypatch.setattr(HostProbeFixture, "create", host_probe_create)
     monkeypatch.setattr(HostProbeFixture, "execute", host_probe_execute)
     monkeypatch.setattr(HostProbeFixture, "cleanup", host_probe_cleanup)

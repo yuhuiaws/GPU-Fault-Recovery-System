@@ -108,6 +108,17 @@ class HostProbeMissingResponseError(HostProbeError):
 POD_DELETE_WAIT_SECONDS = 120
 POD_FORCE_DELETE_WAIT_SECONDS = 30
 PROBE_KEY = "probe.py"
+#: Record keys written by ``host_probe_sweep`` when it closes a dead probe's
+#: record: the sweep note, and the digest of the probe script copy the dead
+#: probe may have left under ``/run`` on the node (no Pod is left to remove
+#: it). ``execute`` lets the next probe of the same identity overwrite a copy
+#: with exactly that digest instead of refusing it as foreign; the key is
+#: carried into the record ``create`` mints and dropped once a call installed
+#: the current script over it.
+SWEPT_KEY = "swept"
+STALE_HOST_SCRIPT_KEY = "stale_host_script_sha256"
+#: The probe's own refusal of the install step (a foreign copy at its path).
+SETUP_REJECTED = {"error": "host probe setup rejected"}
 #: Kubernetes mount-propagation modes for the ``/host`` hostPath. ``None`` is
 #: rprivate (the probe's own mounts stay inside its Pod mount namespace),
 #: ``HostToContainer`` is rslave (host mounts flow in only), ``Bidirectional``
@@ -162,6 +173,119 @@ class HostProbeSettings:
             )
 
 
+def failure_diagnostic(
+    payload: dict[str, Any],
+) -> tuple[str, str | None, str | None, str | None]:
+    """The whitelisted diagnostic of a failed probe call, and its tokens.
+
+    Returns ``(diagnostic, error_code, error_site, error_reason)``: the
+    suffix the ``HostProbeError`` text carries and the three tokens kept
+    beside it (``probe-error.json``, ``HostProbeError.reason``). Every token
+    shown is whitelisted by shape; the probe's message itself never leaves
+    the node.
+    """
+
+    # An ``error`` key is a failed call whatever its value -- ``null``
+    # too -- so a probe's failure line with a null or empty error is
+    # never graded as a success payload; probes keep the key out of
+    # success results (a reading spread into a result carried
+    # ``error: null`` and ended 005 capacity_full withheld, 2026-10-26).
+    # Every shown token is whitelisted by shape: a 16-hex digest of the
+    # message, an ``identifier:line`` site, an identifier class name.
+    # The message itself (``error``) never leaves the node.
+    diagnostic = (
+        "; error key null" if "error" in payload and payload["error"] is None else ""
+    )
+    code = payload.get("error_code")
+    if not (isinstance(code, str) and re.fullmatch(r"[a-f0-9]{16}", code)):
+        code = None
+    site = payload.get("error_site")
+    if not (
+        isinstance(site, str)
+        and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*:[1-9][0-9]*", site)
+    ):
+        site = None
+    kind = payload.get("error_kind")
+    missing = payload.get("missing_binary")
+    if (
+        kind == "missing_binary"
+        and isinstance(missing, str)
+        and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", missing)
+    ):
+        # The basename of a binary the probe needs and the node lacks:
+        # a fixed token (iptables, systemd-run, python3), never a path.
+        diagnostic += f"; missing binary on the node: {missing}"
+    if kind == "collector_env_guard":
+        if code:
+            diagnostic += f"; collector-env guard {code}"
+        if site:
+            diagnostic += f" at {site}"
+    message = payload.get("message")
+    if (
+        kind in CONSTANT_MESSAGE_LABELS
+        and isinstance(message, str)
+        and re.fullmatch(r"[A-Za-z0-9 ,;:'()./_-]{1,160}", message)
+    ):
+        # The recovery probe's refusals and the shared-storage probe's
+        # mount-failure classes are constant sentences; a message in
+        # this shape names the condition and carries no path or
+        # credential (the mount helper's stderr itself never leaves
+        # the node).
+        diagnostic += f"; {CONSTANT_MESSAGE_LABELS[kind]}: {message}"
+    if kind == "power_identity":
+        # A power restore refused after a reboot (exit 78): the digest
+        # and site as above, plus the *kinds* of files the operation
+        # left on the node -- fixed identifiers, never paths -- so the
+        # operator knows what the cleanup-only restore has to close.
+        if code:
+            diagnostic += f"; power identity {code}"
+        if site:
+            diagnostic += f" at {site}"
+        left = payload.get("left_behind")
+        if (
+            isinstance(left, list)
+            and left
+            and all(
+                isinstance(item, str) and re.fullmatch(r"[a-z_]{1,40}", item)
+                for item in left
+            )
+        ):
+            diagnostic += "; left behind: " + ",".join(left)
+    # A probe's generic failure line carries ``error_kind: probe`` with
+    # the exception class, digest and site (collector_node_probe.main);
+    # older probes print ``{"error": <ExceptionType>}`` and the bare
+    # type name is the one clue left. Anything wordier (a message, a
+    # path) stays withheld.
+    error = (
+        payload.get("error_class")
+        if kind in {"probe", "power_identity"}
+        else payload.get("error")
+    )
+    if isinstance(error, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", error):
+        diagnostic += f"; error {error}"
+        if kind == "probe":
+            if code:
+                diagnostic += f" {code}"
+            if site:
+                diagnostic += f" at {site}"
+    # A probe may name *why* it refused with a fixed identifier from its
+    # own closed vocabulary (the DCGM controller's ``ProbeError(...,
+    # "profile_shape")``): one token, like ``failure_class`` beside a
+    # redacted command output, never the message. Live 2026-10-26 three
+    # 022 variants read ``error ProbeError <digest> at tool_command:800``
+    # and nothing else; the digest had to be brute-forced.
+    reason = payload.get("error_reason")
+    if not (
+        kind == "probe"
+        and isinstance(reason, str)
+        and re.fullmatch(r"[a-z][a-z0-9_]{2,40}", reason)
+    ):
+        reason = None
+    if reason:
+        diagnostic += f"; reason {reason}"
+    return diagnostic, code, site, reason
+
+
 class HostProbeFixture:
     def __init__(self, settings: HostProbeSettings) -> None:
         self.settings = settings
@@ -194,6 +318,10 @@ class HostProbeFixture:
             "script_sha256": hashlib.sha256(self._script.encode()).hexdigest(),
         }
         self._record: dict[str, Any] | None = None
+        #: While ``cleanup`` deletes, a record that cannot be rewritten is kept
+        #: as this error and raised after the deletions instead of before them.
+        self._deleting = False
+        self._save_error: OSError | None = None
 
     def _acquire(self) -> None:
         if self._lock_fd is not None:
@@ -298,7 +426,18 @@ class HostProbeFixture:
     def _save(self) -> None:
         if self._record is None:
             raise HostProbeError("host probe has no ownership record")
-        write_json_atomic(self.state_path, self._record)
+        try:
+            write_json_atomic(self.state_path, self._record)
+        except OSError as exc:
+            if not self._deleting:
+                raise
+            # Cleanup goes on deleting what it owns -- every receipt it needs
+            # is in memory -- and fails afterwards. A runner host out of disk
+            # (GF-GENERAL-LIVE-022 recovery_evidence, 2026-10-26 14:24Z: ENOSPC
+            # in the teardown) used to abort here, before the Pod delete, and
+            # left the Pod to its activeDeadline with the record open.
+            if self._save_error is None:
+                self._save_error = exc
 
     def _record_probe_error(
         self,
@@ -605,6 +744,7 @@ class HostProbeFixture:
                 raise HostProbeError(
                     "pre-existing host probe resources have no active ownership"
                 )
+            stale = (self._record or {}).get(STALE_HOST_SCRIPT_KEY)
             self._record = {
                 "schema_version": 1,
                 "scope": self._scope,
@@ -617,6 +757,14 @@ class HostProbeFixture:
                 "script_may_exist": False,
                 "closed": False,
             }
+            if (
+                isinstance(stale, str)
+                and stale
+                and stale != self._scope["script_sha256"]
+            ):
+                # A swept record's dead probe may have left its script copy on
+                # the node; the first call overwrites it (``execute``).
+                self._record[STALE_HOST_SCRIPT_KEY] = stale
             self._save()
         if self._record["node_uid"] != node_uid:
             raise HostProbeError("host probe node UID changed")
@@ -668,13 +816,20 @@ class HostProbeFixture:
             '{\\"error\\":\\"host probe interpreter missing\\",'
             '\\"error_kind\\":\\"missing_binary\\",\\"missing_binary\\":\\"python3\\"}'
         )
+        # An existing copy at the probe's own path is overwritten only when it
+        # is this script or the one a swept record says a dead probe of the
+        # same identity left there (``STALE_HOST_SCRIPT_KEY``); anything else
+        # at that path is foreign and rejected.
+        stale = self._record.get(STALE_HOST_SCRIPT_KEY)
+        if not (isinstance(stale, str) and re.fullmatch(r"[a-f0-9]{64}", stale)):
+            stale = "-"
         command = (
             "reject() { printf '%s\\n' "
             """'{"error":"host probe setup rejected"}'; exit 1; }; """
             'test ! -L "$2" || reject; if test -e "$2"; then '
             'digest="$(sha256sum -- "$2" 2>/dev/null)" || reject; '
-            'test "${digest%% *}" = "$3" || reject; fi; '
-            'install -m 0700 "$1" "$2" 2>/dev/null || reject; shift 3; '
+            'test "${digest%% *}" = "$3" || test "${digest%% *}" = "$4" || reject; fi; '
+            'install -m 0700 "$1" "$2" 2>/dev/null || reject; shift 4; '
             "exec chroot /host /bin/sh -c '"
             f'for p in {interpreters}; do test -x "$p" && exec "$p" "$@"; done; '
             f'printf "%s\\n" "{missing}"; exit 1'
@@ -693,6 +848,7 @@ class HostProbeFixture:
             f"/probe/{PROBE_KEY}",
             f"/host{self.host_script}",
             self._scope["script_sha256"],
+            stale,
             self.host_script,
             *arguments,
             check=False,
@@ -724,109 +880,13 @@ class HostProbeFixture:
             raise HostProbeError(
                 f"host probe returned an empty or non-object result (exit {completed.returncode})"
             )
+        if STALE_HOST_SCRIPT_KEY in self._record and payload != SETUP_REJECTED:
+            # Any answer past the install step means the current script now
+            # sits at the path; the stale copy a dead probe left is gone.
+            del self._record[STALE_HOST_SCRIPT_KEY]
+            self._save()
         if completed.returncode or "error" in payload:
-            # An ``error`` key is a failed call whatever its value -- ``null``
-            # too -- so a probe's failure line with a null or empty error is
-            # never graded as a success payload; probes keep the key out of
-            # success results (a reading spread into a result carried
-            # ``error: null`` and ended 005 capacity_full withheld, 2026-10-26).
-            # Every shown token is whitelisted by shape: a 16-hex digest of the
-            # message, an ``identifier:line`` site, an identifier class name.
-            # The message itself (``error``) never leaves the node.
-            diagnostic = (
-                "; error key null"
-                if "error" in payload and payload["error"] is None
-                else ""
-            )
-            code = payload.get("error_code")
-            if not (isinstance(code, str) and re.fullmatch(r"[a-f0-9]{16}", code)):
-                code = None
-            site = payload.get("error_site")
-            if not (
-                isinstance(site, str)
-                and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*:[1-9][0-9]*", site)
-            ):
-                site = None
-            kind = payload.get("error_kind")
-            missing = payload.get("missing_binary")
-            if (
-                kind == "missing_binary"
-                and isinstance(missing, str)
-                and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", missing)
-            ):
-                # The basename of a binary the probe needs and the node lacks:
-                # a fixed token (iptables, systemd-run, python3), never a path.
-                diagnostic += f"; missing binary on the node: {missing}"
-            if kind == "collector_env_guard":
-                if code:
-                    diagnostic += f"; collector-env guard {code}"
-                if site:
-                    diagnostic += f" at {site}"
-            message = payload.get("message")
-            if (
-                kind in CONSTANT_MESSAGE_LABELS
-                and isinstance(message, str)
-                and re.fullmatch(r"[A-Za-z0-9 ,;:'()./_-]{1,160}", message)
-            ):
-                # The recovery probe's refusals and the shared-storage probe's
-                # mount-failure classes are constant sentences; a message in
-                # this shape names the condition and carries no path or
-                # credential (the mount helper's stderr itself never leaves
-                # the node).
-                diagnostic += f"; {CONSTANT_MESSAGE_LABELS[kind]}: {message}"
-            if kind == "power_identity":
-                # A power restore refused after a reboot (exit 78): the digest
-                # and site as above, plus the *kinds* of files the operation
-                # left on the node -- fixed identifiers, never paths -- so the
-                # operator knows what the cleanup-only restore has to close.
-                if code:
-                    diagnostic += f"; power identity {code}"
-                if site:
-                    diagnostic += f" at {site}"
-                left = payload.get("left_behind")
-                if (
-                    isinstance(left, list)
-                    and left
-                    and all(
-                        isinstance(item, str) and re.fullmatch(r"[a-z_]{1,40}", item)
-                        for item in left
-                    )
-                ):
-                    diagnostic += "; left behind: " + ",".join(left)
-            # A probe's generic failure line carries ``error_kind: probe`` with
-            # the exception class, digest and site (collector_node_probe.main);
-            # older probes print ``{"error": <ExceptionType>}`` and the bare
-            # type name is the one clue left. Anything wordier (a message, a
-            # path) stays withheld.
-            error = (
-                payload.get("error_class")
-                if kind in {"probe", "power_identity"}
-                else payload.get("error")
-            )
-            if isinstance(error, str) and re.fullmatch(
-                r"[A-Za-z_][A-Za-z0-9_]*", error
-            ):
-                diagnostic += f"; error {error}"
-                if kind == "probe":
-                    if code:
-                        diagnostic += f" {code}"
-                    if site:
-                        diagnostic += f" at {site}"
-            # A probe may name *why* it refused with a fixed identifier from its
-            # own closed vocabulary (the DCGM controller's ``ProbeError(...,
-            # "profile_shape")``): one token, like ``failure_class`` beside a
-            # redacted command output, never the message. Live 2026-10-26 three
-            # 022 variants read ``error ProbeError <digest> at tool_command:800``
-            # and nothing else; the digest had to be brute-forced.
-            reason = payload.get("error_reason")
-            if not (
-                kind == "probe"
-                and isinstance(reason, str)
-                and re.fullmatch(r"[a-z][a-z0-9_]{2,40}", reason)
-            ):
-                reason = None
-            if reason:
-                diagnostic += f"; reason {reason}"
+            diagnostic, code, site, reason = failure_diagnostic(payload)
             if self._record_probe_error(
                 payload, completed.returncode, code, site, reason
             ):
@@ -911,8 +971,15 @@ class HostProbeFixture:
         self._save()
 
     def cleanup(self) -> dict[str, bool]:
-        """Delete only proved-owned resources and retain a failed cleanup journal."""
+        """Delete only proved-owned resources and retain a failed cleanup journal.
+
+        A record that cannot be rewritten while the deletions run (the runner
+        host out of disk) does not stop them: the resources are deleted on the
+        receipts in memory and the save failure is raised afterwards, leaving
+        the record open for ``host_probe_sweep`` to close at the next start.
+        """
         self._acquire()
+        self._deleting, self._save_error = True, None
         try:
             if self._record is None:
                 residuals = self.residuals()
@@ -948,6 +1015,13 @@ class HostProbeFixture:
                 raise HostProbeError("host probe cleanup has residual resources")
             self._record["closed"] = True
             self._save()
+            if self._save_error is not None:
+                reason = self._save_error.strerror or type(self._save_error).__name__
+                raise HostProbeError(
+                    "host probe ownership record could not be saved "
+                    f"({reason}); the probe resources were deleted"
+                ) from None
             return residuals
         finally:
+            self._deleting = False
             self._release()

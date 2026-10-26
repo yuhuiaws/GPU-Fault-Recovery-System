@@ -938,7 +938,11 @@ def host_source_replay(
     """Build a ``HostSourceReplay`` from a variant context and register cleanup."""
 
     handle = UNIT_HANDLES.get(unit, "source-replay")
-    host = ctx.probes.get(f"{handle}@{ctx.settings.node}")
+    host = ctx.host_probe(
+        handle,
+        script=PROBE_SCRIPT,
+        deadline_seconds=ctx.spec.max_minutes * 60 + 1200,
+    )
     replay = HostSourceReplay(
         ctx.regional,
         node=ctx.settings.node,

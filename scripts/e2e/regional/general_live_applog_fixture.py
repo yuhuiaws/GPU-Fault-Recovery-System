@@ -490,7 +490,11 @@ def cri_pod_logs(ctx: VariantContext) -> CriPodLogFixture:
     ``ctx.probes["cri-pod-logs@<node>"]``; production never sets it.
     """
 
-    host = ctx.probes.get(f"{PROBE_KEY}@{ctx.settings.node}")
+    host = ctx.host_probe(
+        PROBE_KEY,
+        script=PROBE_SCRIPT,
+        deadline_seconds=ctx.spec.max_minutes * 60 + 1200,
+    )
     fixture = CriPodLogFixture(
         ctx.regional,
         node=ctx.settings.node,

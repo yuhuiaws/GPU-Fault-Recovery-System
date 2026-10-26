@@ -58,6 +58,10 @@ from scripts.e2e.regional.general_live_registry import (  # noqa: E402
     select,
 )
 from scripts.e2e.regional.host_probe_fixture import HostProbeError  # noqa: E402
+from scripts.e2e.regional.host_probe_sweep import (  # noqa: E402
+    SWEEP_EVIDENCE,
+    sweep_dead_host_probe_records,
+)
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     authorize_execution,
     build_plan,
@@ -177,6 +181,7 @@ def execute_variant(
     assert spec.execute is not None  # guaranteed by validate_spec for implemented specs
     try:
         with action_window(deadline):
+            result["host_probe_sweep"] = sweep_host_probes(ctx)
             outcome = spec.execute(ctx)
         result.update(outcome)
         result.setdefault("verdict", "FAIL")
@@ -221,10 +226,29 @@ def execute_variant(
     return result
 
 
+def sweep_host_probes(ctx: VariantContext) -> dict[str, Any]:
+    """Close the records of this case directory's dead host probes (evidence
+    ``host-probe-sweep``), so a rerun is not refused by a probe that died with
+    an earlier run; a record whose Pod still runs is reported and left alone."""
+
+    report = sweep_dead_host_probe_records(
+        ctx.case_dir / "host-probes",
+        kubeconfig=ctx.regional.settings.gpu_kubeconfig,
+        context=ctx.regional.settings.gpu_context,
+        namespace=ctx.regional.settings.namespace,
+    )
+    if report["records"]:
+        ctx.evidence.write(SWEEP_EVIDENCE, report)
+    return report
+
+
 def _teardown(ctx: VariantContext, result: dict[str, Any]) -> None:
     cleanup = ctx.cleanup.run()
     probe_residuals = {}
-    for name, handle in ctx.probes.items():
+    # Every handle the context owns -- the live ones and those a later handle
+    # replaced under the same key -- is cleaned and listed; a probe built
+    # outside the registry has no place to hide from this loop any more.
+    for name, handle in ctx.probes.handles():
         try:
             probe_residuals[name] = handle.cleanup()
         except Exception as exc:  # noqa: BLE001 - recorded, verdict downgraded

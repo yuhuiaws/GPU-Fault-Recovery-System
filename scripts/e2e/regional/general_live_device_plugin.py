@@ -285,21 +285,7 @@ class DevicePluginRegistrationFixture:
         return owned
 
     def _probe(self) -> ProbeHandle:
-        key = f"plugin@{self.node}"
-        handle = self.ctx.probes.get(key)
-        if handle is None:
-            handle = ProbeHandle(
-                self.ctx.regional,
-                script=DEVICE_PLUGIN_PROBE,
-                node=self.node,
-                image=self.ctx.settings.host_probe_image,
-                key=self.ctx.spec.key,
-                run_id=self.ctx.run_id,
-                case_dir=self.ctx.case_dir,
-                deadline_seconds=self.ctx.spec.max_minutes * 60 + 1200,
-            )
-            self.ctx.probes[key] = handle
-        return handle
+        return self.ctx.host_probe("plugin", script=DEVICE_PLUGIN_PROBE, node=self.node)
 
     def freeze_pod(self, pod_uid: str, *, seconds: int) -> dict[str, Any]:
         """SIGSTOP the plugin process of ``pod_uid`` (deadman-backed)."""

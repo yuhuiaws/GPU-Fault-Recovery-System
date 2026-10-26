@@ -498,7 +498,15 @@ class Evidence:
 
 
 class ProbeHandle:
-    """One node-pinned host probe Pod for one probe script, created lazily."""
+    """One node-pinned host probe Pod for one probe script, created lazily.
+
+    Every handle belongs to the ``VariantContext`` that built it
+    (``VariantContext.host_probe``): the runner's teardown cleans each one and
+    lists it in ``probe_residuals``. A handle that proved itself clean answers
+    the next ``cleanup`` from that proof until it creates or executes again,
+    so a fixture that cleaned its own probe in the LIFO stack costs the
+    teardown no second round of API reads.
+    """
 
     def __init__(
         self,
@@ -514,6 +522,7 @@ class ProbeHandle:
         host_root_propagation: str = "None",
     ) -> None:
         self.script = script
+        self.node = node
         self.fixture = HostProbeFixture(
             HostProbeSettings(
                 kubeconfig=regional.settings.gpu_kubeconfig,
@@ -530,19 +539,83 @@ class ProbeHandle:
             )
         )
         self.created = False
+        self._clean: dict[str, bool] | None = None
+
+    def create(self) -> None:
+        """Create the probe Pod now (``execute`` does so on its first call)."""
+
+        if self.created:
+            return
+        require_action_time(180)
+        self._clean = None
+        self.fixture.create()
+        self.created = True
 
     def execute(self, *arguments: str, timeout: int = 180) -> dict[str, Any]:
         finite_seconds(timeout)
-        if not self.created:
-            require_action_time(180)
-            self.fixture.create()
-            self.created = True
+        self.create()
+        self._clean = None
         return self.fixture.execute(*arguments, timeout=timeout)
 
     def cleanup(self) -> dict[str, bool]:
-        if not self.created:
-            return self.fixture.residuals()
-        return self.fixture.cleanup()
+        """Delete the probe (or audit its residuals when never created).
+
+        After a cleanup that proved clean the handle is uncreated again: a
+        fixture that recreates its probe after a node reboot calls ``create``
+        and gets a new Pod under a new ownership record.
+        """
+
+        if self._clean is not None:
+            return dict(self._clean)
+        residuals = self.fixture.cleanup() if self.created else self.fixture.residuals()
+        if not any(residuals.values()):
+            self.created = False
+            self._clean = dict(residuals)
+        return residuals
+
+
+class ProbeRegistry(dict[str, ProbeHandle]):
+    """The context's host-probe handles by ``<purpose>@<node>``.
+
+    No handle registered here is ever dropped: assigning a different handle
+    under a key another handle holds cleans the earlier one first (its Pod,
+    ConfigMap and host script, its record closed) and keeps it under
+    ``<key>#<n>`` so the teardown lists it in ``probe_residuals`` -- a cleanup
+    that failed is retried and recorded there. Two live handles for one probe
+    identity cannot coexist anyway: they would compete for one ownership record.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.replaced: dict[str, ProbeHandle] = {}
+
+    def __setitem__(self, key: str, handle: ProbeHandle) -> None:
+        previous = self.get(key)
+        if previous is not None and previous is not handle:
+            serial = 1 + sum(1 for name in self.replaced if name.startswith(f"{key}#"))
+            self.replaced[f"{key}#{serial}"] = previous
+            try:
+                previous.cleanup()
+            except Exception:  # noqa: BLE001 - the teardown retries and records it
+                pass
+        super().__setitem__(key, handle)
+
+    def handles(self) -> list[tuple[str, ProbeHandle]]:
+        """Every handle the context owns: the live ones, then the replaced."""
+
+        return [*self.items(), *self.replaced.items()]
+
+
+#: The probe scripts ``VariantContext.probe`` knows by name.
+PROBE_SCRIPTS = {
+    "node": NODE_PROBE,
+    "storage": STORAGE_PROBE,
+    "net": NET_PROBE,
+    "window": WINDOW_PROBE,
+    "dcgm": DCGM_PROBE,
+    "deps": DEPS_PROBE,
+    "shared": SHARED_PROBE,
+}
 
 
 @dataclass
@@ -558,7 +631,9 @@ class VariantContext:
     deadline: datetime
     evidence: Evidence
     cleanup: CleanupStack = field(default_factory=CleanupStack)
-    probes: dict[str, ProbeHandle] = field(default_factory=dict)
+    #: Every host-probe handle of the run, by ``<purpose>@<node>``; the
+    #: teardown cleans each and lists each in ``probe_residuals``.
+    probes: ProbeRegistry = field(default_factory=ProbeRegistry)
     survey: dict[str, Any] = field(default_factory=dict)
     #: ``<file>@<node>`` of every second node-side file installed in this run.
     shipped: set[str] = field(default_factory=set)
@@ -590,21 +665,28 @@ class VariantContext:
             value = self.identities[base] = rerun_identity(self.case_dir, base)
         return value
 
-    def probe(self, name: str, *, node: str | None = None) -> ProbeHandle:
-        """The probe Pod running ``name`` (node, storage, net, window, dcgm,
-        deps, shared)."""
+    def host_probe(
+        self,
+        purpose: str,
+        *,
+        script: Path,
+        node: str | None = None,
+        deadline_seconds: int | None = None,
+        host_root_propagation: str = "None",
+    ) -> ProbeHandle:
+        """The context-owned handle for ``script`` on ``node`` as ``purpose``.
 
-        script = {
-            "node": NODE_PROBE,
-            "storage": STORAGE_PROBE,
-            "net": NET_PROBE,
-            "window": WINDOW_PROBE,
-            "dcgm": DCGM_PROBE,
-            "deps": DEPS_PROBE,
-            "shared": SHARED_PROBE,
-        }[name]
+        The one way a variant or fixture gets a host probe: the handle under
+        ``<purpose>@<node>`` is returned when it exists (a test's fake, the
+        handle an earlier call built) and otherwise built and registered, so
+        the runner's teardown cleans it and ``probe_residuals`` names it. A
+        probe built outside the registry is what leaked live on 2026-10-26
+        (the 024 environment replay's, closed and discarded by the variant,
+        never torn down).
+        """
+
         target = node or self.settings.node
-        handle_key = f"{name}@{target}"
+        handle_key = f"{purpose}@{target}"
         handle = self.probes.get(handle_key)
         if handle is None:
             handle = ProbeHandle(
@@ -615,13 +697,28 @@ class VariantContext:
                 key=self.spec.key,
                 run_id=self.run_id,
                 case_dir=self.case_dir,
-                deadline_seconds=self.spec.max_minutes * 60 + 1200,
-                host_root_propagation=PROBE_HOST_ROOT_PROPAGATION.get(
-                    name, READ_ONLY_PROBE_HOST_ROOT_PROPAGATION
+                deadline_seconds=(
+                    self.spec.max_minutes * 60 + 1200
+                    if deadline_seconds is None
+                    else deadline_seconds
                 ),
+                host_root_propagation=host_root_propagation,
             )
             self.probes[handle_key] = handle
         return handle
+
+    def probe(self, name: str, *, node: str | None = None) -> ProbeHandle:
+        """The probe Pod running ``name`` (node, storage, net, window, dcgm,
+        deps, shared)."""
+
+        return self.host_probe(
+            name,
+            script=PROBE_SCRIPTS[name],
+            node=node,
+            host_root_propagation=PROBE_HOST_ROOT_PROPAGATION.get(
+                name, READ_ONLY_PROBE_HOST_ROOT_PROPAGATION
+            ),
+        )
 
     def node(self, *arguments: str, timeout: int = 180) -> dict[str, Any]:
         return self.probe("node").execute(
@@ -846,7 +943,9 @@ __all__ = [
     "Evidence",
     "GeneralLiveSettings",
     "HOST_UNIT",
+    "PROBE_SCRIPTS",
     "ProbeHandle",
+    "ProbeRegistry",
     "VariantBlocked",
     "VariantContext",
     "VariantInconclusive",

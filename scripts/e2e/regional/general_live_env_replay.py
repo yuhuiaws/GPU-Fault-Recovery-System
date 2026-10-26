@@ -44,6 +44,7 @@ from typing import Any
 
 from scripts.e2e.regional.env_live_fixture import (
     PLAN_FILE,
+    PROBE_SCRIPT as ENV_PROBE_SCRIPT,
     EnvReplayController,
     repoint_proof,
     replay_tool_sha256,
@@ -167,7 +168,16 @@ class EnvReplay:
                 "the environment replay needs a physical GPU UUID"
             )
         ctx = self.ctx
-        host = ctx.probes.get(f"{PROBE_KEY}@{ctx.settings.node}")
+        # The replay's probe is the context's handle (``env-replay@<node>``;
+        # a test pre-registers its fake there): the runner's teardown deletes
+        # it and lists it whatever the variant did with ``cleanup`` -- the 024
+        # composites close the replay themselves and discard the undo, which
+        # left this probe to its activeDeadline on both clusters (2026-10-26).
+        host = ctx.host_probe(
+            PROBE_KEY,
+            script=ENV_PROBE_SCRIPT,
+            deadline_seconds=ctx.spec.max_minutes * 60 + 1200,
+        )
         self.controller = EnvReplayController(
             ctx.regional,
             node=ctx.settings.node,

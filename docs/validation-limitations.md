@@ -4173,3 +4173,79 @@ judged) and `hardware`. `stale_sample`, `recovered` and
 `independent_fatal_event` raise in order to mint and are unaffected;
 `tests/regional/test_general_live_gpu_links_reset.py`. The variant is rerun
 with the runner alone; no product release is needed.
+
+## GF-GENERAL-LIVE host-probe handle ownership and the dead-record sweep
+
+Read-only on both clusters on 2026-10-26 (22:4xZ): seven host-probe Pods in
+`gpu-fault-system` in phase Failed (container exit 143 -- killed by their own
+`activeDeadlineSeconds` 30-45 min after start) with their ConfigMaps still
+present, each with an ownership record `host-probes/<name>.json` left
+`closed: false` in its case directory. Two leak paths, read from the records
+and the lane logs. (1) The 024 composites (`thermal_warning`,
+`power_performance`, HyperPod and plain EKS; five Pods) PASSed while their
+`probe_residuals` named only `dcgm@<node>`: the leaked record's script digest
+is `probes/env_replay_proxy.py`. `_composite_flow` closes the replay and
+discards its undo (`replay.close(); ctx.cleanup.discard(CLEANUP_NAME)`);
+`EnvReplay.close` restores the endpoint and stops the proxy but never deletes
+the probe, `EnvReplay.cleanup` -- the one caller of `controller.host.cleanup()`
+-- was the discarded undo, and the replay controller had built its
+`HostProbeFixture` itself, outside `ctx.probes`, so the runner's teardown had
+no handle to clean. The CRI Pod-log, kernel-replay and source-replay fixtures
+built their probes the same way. (2) 022 `recovery_evidence` (HyperPod 14:19Z)
+died of `OSError: [Errno 28] No space left on device` on the runner host inside
+`_teardown` -- its dcgm handle was registered, but `_delete_owned` saves the
+record before it deletes, so ENOSPC stopped the cleanup before the Pod delete
+and killed the process before `result.json`. In both cases the rerun of the
+case in the same run directory derives the same probe name (`run_identity` is
+stable), met the open record carrying the earlier probe script's digest, and
+was refused: `dcgm survey: host probe ownership record does not match this
+run` (022, 22:40Z). 022's probe was a registered handle; only its teardown was
+cut short.
+
+Fix, harness only. Every host probe is the context's: `VariantContext.host_probe`
+is the one way a variant or fixture gets a handle (`<purpose>@<node>`; an
+existing handle under the key -- a test's fake, an earlier call's handle -- is
+returned, a new one registered), `ctx.probe` and the environment-replay,
+CRI Pod-log, kernel-replay, source-replay, EFA-driver, isolation and
+device-plugin fixtures all go through it, and `ctx.probes` is a `ProbeRegistry`:
+assigning a different handle under a held key cleans the earlier handle first
+(two handles of one identity would compete for one record) and keeps it as
+`<key>#<n>`, and the teardown cleans and lists every handle, live or replaced,
+in `probe_residuals`. A handle that proved itself clean (a fixture's own LIFO
+cleanup) answers the teardown's second `cleanup` from that proof until it
+creates or executes again, and is uncreated afterwards, so a fixture that
+recreates its probe after a node reboot gets a new Pod under a new record.
+`HostProbeFixture.cleanup` goes on deleting what it owns when the record cannot
+be rewritten (ENOSPC) and raises `host probe ownership record could not be
+saved (...); the probe resources were deleted` afterwards. At variant start
+`run_general_live` runs `scripts/e2e/regional/host_probe_sweep.py` over the case
+directory's records (evidence `host-probe-sweep`, result `host_probe_sweep`):
+an open record whose Pod is gone or terminal (Failed/Succeeded) is a dead
+probe's -- its Pod and ConfigMap are deleted under the fixture's own proof
+(case/run labels, owner annotation, script digest, node and node UID, UID
+precondition) and the record closed with a `swept` note; a record whose Pod
+still runs (Pending/Running) is reported and left exactly as it is, and the
+fixture's refusal of a changed script against a live record stands; a record
+another process holds, a terminal Pod or ConfigMap that is not the record's, or
+a delete not acknowledged keep the record open and are reported with the
+reason. The script copy a dead probe installed under `/run` cannot be removed
+without a Pod: the swept record keeps its digest as `stale_host_script_sha256`,
+the record the rerun mints carries it, and `HostProbeFixture.execute` lets its
+install step overwrite a copy with exactly that digest (any other copy at the
+path is still rejected) and drops the marker once a call installed the current
+script. Tests: `tests/regional/test_general_live_probe_ownership.py` runs the
+runner's `execute_variant` over an in-memory cluster with the dcgm probe and
+each wrapped probe on one node and the wrapper's cleanup discarded -- zero Pods,
+zero ConfigMaps, zero host-script copies, both records closed, both handles
+listed with all-false residuals (red before this change for all four
+wrappers); a replaced handle cleaned at replacement and listed as `#1`; a
+proven-clean handle costing the teardown no API call; a rerun after a dead
+probe sweeping its record and proceeding; a live probe of an earlier attempt
+reported and untouched. `tests/regional/test_host_probe_sweep.py` covers the
+sweep's outcomes (dead, absent with ConfigMap, running, pending, foreign Pod or
+ConfigMap, unacknowledged delete, locked record, other context, closed and
+unreadable records), the changed-script rerun refused before the sweep and
+clean after it with the stale digest passed to the install step, a foreign
+copy still rejected, and the out-of-disk cleanup that deletes, fails and is
+closed by the next sweep. The seven leaked Pods and ConfigMaps were deleted by
+hand before this change; no product release is needed.

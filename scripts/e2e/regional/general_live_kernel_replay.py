@@ -270,9 +270,14 @@ def kernel_replay(ctx: VariantContext, *, mode: str = "journal") -> KernelLogRep
     variant.
     """
 
-    # A test may pre-register a fake host under this key (like ``ctx.probes``);
-    # production never sets it, so a real host-probe Pod is built.
-    host = ctx.probes.get(f"kernel-replay-{mode}@{ctx.settings.node}")
+    # The context's handle under ``kernel-replay-<mode>@<node>`` (a test
+    # pre-registers a fake there): torn down by the runner whatever happens
+    # to the cleanup pushed below.
+    host = ctx.host_probe(
+        f"kernel-replay-{mode}",
+        script=PROBE_SCRIPT,
+        deadline_seconds=ctx.spec.max_minutes * 60 + 1200,
+    )
     replay = KernelLogReplay(
         ctx.regional,
         node=ctx.settings.node,

@@ -54,7 +54,6 @@ from scripts.e2e.regional.general_live_common import (
     wait_for_incident,
 )
 from scripts.e2e.regional.general_live_fixture import (
-    ProbeHandle,
     VariantBlocked,
     VariantContext,
     VariantInconclusive,
@@ -115,21 +114,11 @@ class EfaDriverFixture:
         self.ctx = ctx
         self._bdf: str | None = None
         self._injected = False
-        key = f"efa-driver@{ctx.settings.node}"
-        handle = ctx.probes.get(key)
-        if handle is None:
-            handle = ProbeHandle(
-                ctx.regional,
-                script=EFA_DRIVER_PROBE,
-                node=ctx.settings.node,
-                image=ctx.settings.host_probe_image,
-                key=ctx.spec.key,
-                run_id=ctx.run_id,
-                case_dir=ctx.case_dir,
-                deadline_seconds=ctx.spec.max_minutes * 60 + 1800,
-            )
-            ctx.probes[key] = handle
-        self.handle = handle
+        self.handle = ctx.host_probe(
+            "efa-driver",
+            script=EFA_DRIVER_PROBE,
+            deadline_seconds=ctx.spec.max_minutes * 60 + 1800,
+        )
         ctx.cleanup.push("efa-driver", self.release)
 
     def _execute(self, *arguments: str, timeout: int = 180) -> dict[str, Any]:
