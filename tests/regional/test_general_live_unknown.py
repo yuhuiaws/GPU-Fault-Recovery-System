@@ -632,14 +632,19 @@ def test_missing_version_blocks_for_the_driver_branch_on_a_blackwell_node(
         "Fatal XC0 i0 Link 08 (0x004505c6 0x00000000)"
     ), result["xid_line"]
     window_calls = fakes["kernel_window"].calls
+    # The wrapper and its plan, the window, then -- once -- the builders file
+    # that carries the read-only ``audit-read``/``journal-read`` since
+    # 2026-10-26, before the first of them.
     assert [call[0] for call in window_calls] == [
         "install-source",
         "install-source",
         "install-wrapper",
         "open-window",
+        "install-source",
         "audit-read",
         "journal-read",
     ], window_calls
+    assert "general_live_source_builders.py" in window_calls[4], window_calls[4]
     plan = _b64_payload(
         next(
             call

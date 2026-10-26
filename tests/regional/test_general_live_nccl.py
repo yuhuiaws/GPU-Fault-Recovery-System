@@ -1357,11 +1357,17 @@ def test_broken_pair_starts_the_streak_only_on_real_readings(tmp_path: Path) -> 
         result["proof_scope"] == "live-replay"
         and result["target"]["counter"] == "tx_bytes"
     )
-    assert ("install-source",) == source.calls[1][:1] and source.calls[1][
-        2
-    ] == "efa-tx-bytes"
-    opened = source.calls[2]
-    assert opened[0] == "open-window" and f"efa-tx-bytes:{PAIR_DEST}" in opened, opened
+    # The builders ship first (the read-only ``inventory`` lives there since
+    # 2026-10-26), then the inventory is read, then the counter fixture lands.
+    assert [call[0] for call in source.calls[:3]] == [
+        "install-source",
+        "inventory",
+        "install-source",
+    ], source.calls[:3]
+    assert "general_live_source_builders.py" in source.calls[0], source.calls[0]
+    assert source.calls[2][2] == "efa-tx-bytes", source.calls[2]
+    opened = next(call for call in source.calls if call[0] == "open-window")
+    assert f"efa-tx-bytes:{PAIR_DEST}" in opened, opened
     order = [call[0] for call in source.calls]
     assert order.index("close-window") < order.index("read-source")
     assert "closed_at" in state
