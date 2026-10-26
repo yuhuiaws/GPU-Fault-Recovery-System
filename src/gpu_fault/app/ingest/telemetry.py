@@ -152,6 +152,7 @@ class TelemetryIngestionService:
         )
         if (
             result.new_findings
+            or result.updated_composite_findings
             or result.xid_events
             or set(batch.edge_filter_reasons) != {"health-summary"}
         ):
@@ -200,6 +201,13 @@ class TelemetryIngestionService:
         node_findings = gpu_node_health_findings(self.context, result.new_findings)
         if node_findings:
             self.node_health.ingest(batch.batch_id, node_findings)
+        # A composite re-graded within its episode keeps its finding id, hence
+        # its event id and incident: the incident is updated, not re-minted.
+        regraded = gpu_node_health_findings(
+            self.context, result.updated_composite_findings
+        )
+        if regraded:
+            self.node_health.record_regrades(batch.batch_id, regraded)
         return result.model_copy(update={"decisions": decisions})
 
     def _persist_host_telemetry(

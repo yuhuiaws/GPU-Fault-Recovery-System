@@ -1176,8 +1176,14 @@ incidents (expected one)"：两个复合 incident 的 batch 分别为 07:54:39.1
 （3）次连续突破时把复合升为 CRITICAL，store 的 `update_gpu_findings` 以 severity 变化判定为新激活，
 复合 finding id 带 batch（`gpu_composites.composite_finding`），ingest 以 `gpu-<finding id>` 铸
 第二个 NODE_HEALTH incident——同一持续事件两个复合 incident，与本节"检查实际工作流去重"及
-`reused_components`（80 读保持同样跨过第 3 个样本）的预期相悖。夹具 oracle 未改，待产品车道裁定；
-`tests/regional/test_general_live_gpu_composite.py` 以 strict xfail 记录应有合同。同次运行的
+`reused_components`（80 读保持同样跨过第 3 个样本）的预期相悖；`corrected_memory` 在第 3 个样本前判定
+所以 PASS。产品已修（b194，随 R13h 上线）：复合在一次事件期内只有一个 finding id、一个 event id、一个
+incident（`gpu_composites.composite_episode_identity`），第 3 个样本的 CRITICAL 作为
+`updated_composite_findings` 上报，落在已开 incident 上一条有界 reason
+（`composite:CORRECTABLE_MEMORY_DEGRADATION escalated to CRITICAL: ...`）并以新 severity 重写 marker；
+清除后再成立、动作改变、或 GPU 停报超过相关窗口后再触发才是新 incident（详细设计 §2.4.2
+"复合身份"）。夹具 oracle 不变（一个复合 incident），`tests/regional/test_general_live_gpu_composite.py`
+钉住每个事件期只激活一次；`independent_xid` 与 `reused_components` 待 R13h 在两个集群重跑。同次运行的
 XID 92 在 420 s 内无任何决策记录，夹具侧（每运行独立 kmsg 序号带、当前单调时间戳、窗口开启/
 写入回执）未见异常，重跑前需查产品 store 的 XID 事件与内核采集器日志。
 

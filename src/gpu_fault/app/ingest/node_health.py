@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Sequence
 
 from gpu_fault.host_health import (
     NodeHealthCategory,
@@ -215,4 +216,53 @@ class NodeHealthIngestionService:
             incident_ids=incidents,
             workflow_request_ids=workflows,
             notification_ids=notifications,
+        )
+
+    def record_regrades(
+        self, batch_id: str, findings: Sequence[NodeHealthFinding]
+    ) -> NodeHealthIngestionResult:
+        """Record re-graded findings on the incidents their events already have.
+
+        A GPU composite keeps one finding id -- one event id, one incident --
+        for as long as its episode lasts (``gpu_composites.composite_episode_identity``).
+        When its severity changes within the episode the finding arrives here
+        instead of through :meth:`ingest`: the open incident gains the new grade
+        as a bounded reason, the node marker is rewritten at the new severity
+        and nothing new is planned -- the automatic action did not change (a
+        changed action is a new finding id and comes through :meth:`ingest`).
+        A re-grade whose event has no incident -- the activation's incident
+        write never committed on a nontransactional backend -- is ingested as
+        new, the same repair F-M1 asks for: a CRITICAL finding gets its incident.
+        """
+
+        markers = []
+        incidents = []
+        pending = []
+        for finding in findings:
+            incident = self.context.orchestrator.record_health_regrade(finding)
+            if incident is None:
+                pending.append(finding)
+                continue
+            marker = finding.marker().model_copy(
+                update={"incident_id": incident.incident_id}
+            )
+            self.context.completion.add_marker(marker)
+            markers.append(marker.marker_id)
+            incidents.append(incident.incident_id)
+        result = NodeHealthIngestionResult(
+            batch_id=batch_id,
+            findings=list(findings),
+            marker_ids=markers,
+            incident_ids=incidents,
+        )
+        if not pending:
+            return result
+        minted = self.ingest(batch_id, pending)
+        return result.model_copy(
+            update={
+                "marker_ids": [*markers, *minted.marker_ids],
+                "incident_ids": [*incidents, *minted.incident_ids],
+                "workflow_request_ids": minted.workflow_request_ids,
+                "notification_ids": minted.notification_ids,
+            }
         )

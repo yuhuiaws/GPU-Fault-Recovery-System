@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import re
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING, Mapping, Sequence
 
 from gpu_fault.gpu_metric_models import (
     GpuFindingState,
@@ -109,6 +109,64 @@ def composite_finding(
         affected_gpu_uuids=gpu_uuids,
         confidence=confidence,
     )
+
+
+def episode_composite_state(
+    state: GpuFindingState | None, observed_at: datetime, window: timedelta
+) -> GpuFindingState | None:
+    """``state`` if a batch observed at ``observed_at`` continues its episode.
+
+    An active composite scope is re-evaluated by every batch that touches its
+    GPU, and once a component stops breaching the composite clears within one
+    correlation window (``_evaluate_composite_findings`` keeps components no
+    older than the window). An active state the window does not reach was
+    therefore left by a GPU that stopped reporting: it is the previous
+    episode's. It neither counts consecutive samples for nor lends its
+    identity to a breach observed now -- the device-signal rule (a vanished
+    device's signal must not swallow the next episode), applied to composites;
+    the caller still clears or replaces the stored state. A cleared state is
+    returned as it is: the PCIe join reads its clear time.
+    """
+
+    if (
+        state is None
+        or state.finding is None
+        or observed_at - state.observed_at <= window
+    ):
+        return state
+    return None
+
+
+def composite_episode_identity(
+    candidate: GpuHealthFinding, episode: GpuFindingState | None
+) -> GpuHealthFinding:
+    """``candidate`` carrying the finding id of the episode it continues.
+
+    A composite's finding id is minted with the batch that opens its episode
+    (:func:`composite_finding`) and kept for as long as the composite stays
+    active with the same automatic action. The id is what the incident, the
+    marker and the workflow are derived from (``app/ingest/gpu_findings``:
+    event id ``gpu-<finding id>``), so a re-grade of the open episode --
+    CORRECTABLE_MEMORY_DEGRADATION turning CRITICAL at
+    ``correctable_memory_drain_consecutive_samples`` -- updates the incident it
+    already has instead of minting a second one (GF-GENERAL-LIVE-024
+    ``independent_xid``, live 2026-10-26: two incidents 30 s apart for one
+    held pair). A changed automatic action is a new recovery decision and keeps
+    the candidate's own id: a DRAIN plan has to supersede the diagnostic, which
+    only a new incident does. So does a breach after the episode cleared or
+    after its GPU stopped reporting (``episode`` is ``None`` or cleared,
+    :func:`episode_composite_state`). The per-batch component finding ids are
+    left alone: they are the batch's evidence, not the composite's identity.
+    """
+
+    if (
+        episode is None
+        or episode.finding is None
+        or episode.finding.automatic_action != candidate.automatic_action
+        or episode.finding.finding_id == candidate.finding_id
+    ):
+        return candidate
+    return candidate.model_copy(update={"finding_id": episode.finding.finding_id})
 
 
 def composite_update_time(
@@ -531,6 +589,112 @@ def pcie_xid_link_failure(
     )
 
 
+def resolve_composite_updates(
+    service: GpuMetricsService,
+    batch: GpuMetricBatch,
+    *,
+    scopes: Sequence[str],
+    rule_ids: Sequence[str],
+    pcie_gpu_keys: set[str],
+    candidates: Mapping[tuple[str, str], GpuHealthFinding],
+    previous_states: Mapping[tuple[str, str, str, str], GpuFindingState | None],
+    episode_states: Mapping[tuple[str, str, str, str], GpuFindingState | None],
+    fresh_components: set[str],
+    latest_by_gpu: Mapping[str, dict[str, GpuMetricLatest]],
+    findings_by_gpu: Mapping[str, dict[str, GpuHealthFinding]],
+) -> tuple[
+    list[GpuHealthFinding],
+    list[GpuHealthFinding],
+    list[GpuHealthFinding],
+    list[str],
+]:
+    """Write the batch's composite candidates over the stored states and sort
+    the outcome: ``(composite findings, activations, re-grades, suppressed ids)``.
+
+    ``previous_states`` are the stored states (what is cleared or replaced);
+    ``episode_states`` the ones this batch continues
+    (:func:`episode_composite_state`), which lend the candidates their
+    identity (:func:`composite_episode_identity`). An activation is a
+    composite whose episode starts with this batch -- it gets an incident of
+    its own; a re-grade is an active composite whose severity changed under
+    the episode's id -- the store reports the grade change as an activation,
+    the unchanged id tells it apart, and the ingest updates the incident the
+    id already has.
+    """
+
+    composite_findings: list[GpuHealthFinding] = []
+    new_composite_findings: list[GpuHealthFinding] = []
+    updated_composite_findings: list[GpuHealthFinding] = []
+    suppressed_ids: set[str] = set()
+    updates: list[
+        tuple[tuple[str, str, str, str], GpuHealthFinding | None, datetime]
+    ] = []
+    candidate_updates: list[tuple[tuple[str, str, str, str], GpuHealthFinding]] = []
+    for scope_key in scopes:
+        for rule_id in rule_ids:
+            # Only PCIe/XID inputs share the cross-replica correlation lock.
+            # An unrelated scrape is not evidence that a PCIe episode cleared.
+            if rule_id == PCIE_XID_RULE and scope_key not in pcie_gpu_keys:
+                continue
+            key = (batch.cluster_id, batch.node_id, scope_key, f"composite:{rule_id}")
+            candidate = candidates.get((scope_key, rule_id))
+            previous = previous_states.get(key)
+            if candidate is not None:
+                # One finding id per episode: the incident is derived from it.
+                candidate = composite_episode_identity(
+                    candidate, episode_states.get(key)
+                )
+            if candidate is not None and previous is not None and previous.finding:
+                if set(candidate.component_finding_ids) == set(
+                    previous.finding.component_finding_ids
+                ) or (
+                    rule_id != PCIE_XID_RULE
+                    and not set(candidate.component_finding_ids) <= fresh_components
+                ):
+                    composite_findings.append(previous.finding)
+                    suppressed_ids.update(previous.finding.component_finding_ids)
+                    continue
+            if candidate is None and (previous is None or previous.finding is None):
+                continue
+            observed_at = composite_update_time(
+                batch,
+                candidate,
+                previous,
+                latest_by_gpu.get(scope_key, {}),
+                findings_by_gpu.get(scope_key, {}),
+            )
+            updates.append((key, candidate, observed_at))
+            if candidate is not None:
+                candidate_updates.append((key, candidate))
+    activated_values = service.store.update_gpu_findings(updates)
+    activated_by_key = {
+        key: activated
+        for (key, _candidate, _observed_at), activated in zip(
+            updates, activated_values, strict=True
+        )
+    }
+    for key, candidate in candidate_updates:
+        composite_findings.append(candidate)
+        suppressed_ids.update(candidate.component_finding_ids)
+        if not activated_by_key.get(key, False):
+            continue
+        episode = episode_states.get(key)
+        if (
+            episode is not None
+            and episode.finding is not None
+            and episode.finding.finding_id == candidate.finding_id
+        ):
+            updated_composite_findings.append(candidate)
+        else:
+            new_composite_findings.append(candidate)
+    return (
+        composite_findings,
+        new_composite_findings,
+        updated_composite_findings,
+        sorted(suppressed_ids),
+    )
+
+
 def correlate_kernel_xid(
     service: GpuMetricsService, event: XidEvent
 ) -> list[GpuHealthFinding]:
@@ -572,7 +736,7 @@ def correlate_kernel_xid(
             continue
         key = (stored.cluster_id, stored.node_id, gpu_key, f"composite:{PCIE_XID_RULE}")
         previous: GpuFindingState | None = service.store.get_gpu_finding_state(key)
-        candidate = pcie_xid_link_failure(
+        minted = pcie_xid_link_failure(
             service,
             stored,
             gpu_key,
@@ -581,8 +745,20 @@ def correlate_kernel_xid(
             previous,
             [stored],
         )
-        if candidate is None:
+        if minted is None:
             continue
+        # A kernel event that re-confirms an open PCIe episode continues it
+        # under the episode's finding id (``composite_episode_identity``); a
+        # second XID 32/79 while the composite is active is not a second
+        # incident. Only an episode this event opens keeps the event's own id.
+        candidate = composite_episode_identity(
+            minted,
+            episode_composite_state(
+                previous,
+                minted.observed_at,
+                timedelta(seconds=service.thresholds.correlation_window_seconds),
+            ),
+        )
         activated = service.store.update_gpu_findings(
             [(key, candidate, candidate.observed_at)]
         )[0]
@@ -591,8 +767,9 @@ def correlate_kernel_xid(
         elif (
             previous is not None
             and previous.finding is not None
-            and previous.finding.finding_id == candidate.finding_id
+            and previous.finding.finding_id == minted.finding_id
         ):
+            # An exact replay of the event that opened the episode.
             # Nontransactional stores may have persisted activation before an
             # incident write failed. Retry the same idempotent ingestion.
             findings.append(previous.finding)

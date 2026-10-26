@@ -5,7 +5,11 @@ from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Callable, ContextManager, Literal, Sequence, cast
 
-from gpu_fault.gpu_metric_models import GpuFindingState, GpuHealthFinding
+from gpu_fault.gpu_metric_models import (
+    GpuFindingState,
+    GpuHealthFinding,
+    gpu_finding_transition,
+)
 from gpu_fault.gpu_metrics import (
     GpuInventorySnapshot,
     GpuMetricLatest,
@@ -140,30 +144,10 @@ class SqliteTelemetryMixin:
                 if previous is not None and observed_at <= previous.observed_at:
                     activated_values.append(False)
                     continue
-                activated = finding is not None and (
-                    previous is None
-                    or previous.finding is None
-                    or finding.severity != previous.finding.severity
-                    or finding.automatic_action != previous.finding.automatic_action
+                state, activated = gpu_finding_transition(
+                    previous, finding, observed_at
                 )
-                consecutive_breaches = (
-                    previous.consecutive_breaches + 1
-                    if finding is not None
-                    and previous is not None
-                    and previous.finding is not None
-                    else 1
-                    if finding is not None
-                    else 0
-                )
-                self._put(
-                    "gpu_finding_state",
-                    storage_key,
-                    GpuFindingState(
-                        observed_at=observed_at,
-                        finding=finding,
-                        consecutive_breaches=consecutive_breaches,
-                    ),
-                )
+                self._put("gpu_finding_state", storage_key, state)
                 activated_values.append(activated)
                 if activated and finding is not None:
                     self._put(

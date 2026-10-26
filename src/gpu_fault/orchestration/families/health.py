@@ -20,6 +20,7 @@ from gpu_fault.models import (
     FaultIncident,
     IncidentState,
     RecoveryAction,
+    Severity,
     WorkflowOperation,
     WorkflowRequest,
     WorkflowStatus,
@@ -71,6 +72,24 @@ def host_resource_signal(finding: NodeHealthFinding) -> tuple[str, str] | None:
     if not finding.metric_name or not isinstance(rule_id, str) or not rule_id:
         return None
     return finding.metric_name, rule_id
+
+
+def regrade_reason(finding: NodeHealthFinding) -> str:
+    """The incident reason that records ``finding``'s new grade.
+
+    One line per grade, so a replay of the batch that re-graded finds its own
+    line and writes nothing (``NodeHealthIngestionService.record_regrade``).
+    """
+
+    verb = (
+        "escalated to"
+        if finding.severity in {Severity.CRITICAL, Severity.FATAL}
+        else "re-graded"
+    )
+    return (
+        f"{finding.metric_name or 'node health'} {verb} "
+        f"{finding.severity.value.upper()}: {finding.reason}"
+    )
 
 
 def incident_opened_by_host_resource_signal(
@@ -918,6 +937,52 @@ class NodeHealthIngestionService:
                 )
             )
             return persisted_incident, persisted_workflow
+
+    def record_regrade(self, finding: NodeHealthFinding) -> FaultIncident | None:
+        """The incident of ``finding``'s event with its new grade recorded, or
+        ``None`` when the event has no incident yet (the caller ingests it).
+
+        A GPU composite re-graded within its episode keeps its finding id and
+        with it the event id this incident was minted (or absorbed) under
+        (``gpu_composites.composite_episode_identity``): the grade lands on
+        that incident as one bounded reason -- the automatic action is
+        unchanged, so its plan stands and nothing is scheduled -- and the
+        incident keeps its state, whichever it is: an operator who closed it
+        while the signal held reads the escalation there, and the next episode
+        after a clear opens anew. A replay of the same grade writes nothing.
+        """
+
+        with self.lock:
+            incident: FaultIncident | None = self.store.get_incident_by_event(
+                finding.event_id
+            )
+            if incident is None:
+                return None
+            reason = regrade_reason(finding)
+            if reason in incident.reasons:
+                return incident
+            updated = incident.model_copy(
+                update={
+                    "reasons": bounded_reasons([*incident.reasons, reason]),
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            )
+            # Compare-and-set on the copy read above (ARCH-D1), like the
+            # host-resource absorption: a concurrent state change raises
+            # ``StaleWriteError`` out of the ingest and the batch is re-posted.
+            self.store.save_incident(
+                updated, expected=incident, extra_event_ids=[finding.event_id]
+            )
+            LOGGER.info(
+                "recorded %s %s on incident %s (%s) for %s/%s",
+                finding.metric_name,
+                finding.severity.value,
+                incident.incident_id,
+                incident.state.value,
+                finding.node_id,
+                finding.device or "node",
+            )
+            return updated
 
     def _existing_or_grouped(
         self,

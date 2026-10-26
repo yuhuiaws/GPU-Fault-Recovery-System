@@ -10,7 +10,11 @@ from gpu_fault.attempt_observation_state import (
     attempt_observation_state_is_terminal,
     terminal_attempt_observation_state,
 )
-from gpu_fault.gpu_metric_models import GpuFindingState, GpuHealthFinding
+from gpu_fault.gpu_metric_models import (
+    GpuFindingState,
+    GpuHealthFinding,
+    gpu_finding_transition,
+)
 from gpu_fault.gpu_metrics import (
     GpuInventorySnapshot,
     GpuMetricLatest,
@@ -181,27 +185,10 @@ class MemoryTelemetryMixin(MemoryAttemptEventState):
                 if previous is not None and observed_at <= previous.observed_at:
                     activated_values.append(False)
                     continue
-                previous_finding = previous.finding if previous is not None else None
-                consecutive_breaches = (
-                    previous.consecutive_breaches + 1
-                    if finding is not None
-                    and previous is not None
-                    and previous.finding is not None
-                    else 1
-                    if finding is not None
-                    else 0
-                )
-                state = GpuFindingState(
-                    observed_at=observed_at,
-                    finding=finding,
-                    consecutive_breaches=consecutive_breaches,
+                state, activated = gpu_finding_transition(
+                    previous, finding, observed_at
                 )
                 self._gpu_finding_states[key] = state
-                activated = finding is not None and (
-                    previous_finding is None
-                    or finding.severity != previous_finding.severity
-                    or finding.automatic_action != previous_finding.automatic_action
-                )
                 activated_values.append(activated)
                 if activated and finding is not None:
                     self._gpu_finding_history[finding.finding_id] = finding

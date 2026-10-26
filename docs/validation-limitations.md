@@ -4407,11 +4407,23 @@ NODE_HEALTH incident per activated finding id (`app/ingest/gpu_findings.py`,
 `event_id gpu-<finding id>`), so a sustained correctable-memory episode opens
 a second incident while the first is still open -- against the 024 rule that
 sustained (reused) components keep one composite incident
-(`reused_components`, whose 80-read hold crosses the same third sample). The
-harness oracle is unchanged pending the product lane's ruling; a strict-xfail
-test in `tests/regional/test_general_live_gpu_composite.py` records the
-expected contract and reproduces the two activations with the product's own
-service. The same run's XID 92 reached no decision within 420 s although the
+(`reused_components`, whose 80-read hold crosses the same third sample);
+`corrected_memory` judges the detection document before it and passed. Fixed
+in the product (lane b194, for R13h): a composite keeps one finding id -- one
+event id, one incident -- for its episode
+(`gpu_composites.composite_episode_identity`); the third sample's CRITICAL is
+reported as `updated_composite_findings` and lands on the open incident as
+one bounded reason (`composite:CORRECTABLE_MEMORY_DEGRADATION escalated to
+CRITICAL: ...`) with the marker rewritten at the new severity; a breach after
+a clear, after a changed action, or after the GPU stopped reporting for
+longer than the correlation window opens a new incident (Detailed Design
+§2.4.2, "Composite identity"). `tests/metrics/test_composite_episode_identity.py`
+drives the live shape through the service, both key/value stores and the
+ingestion route; `tests/regional/test_general_live_gpu_composite.py` pins the
+single activation per episode. The oracle of `independent_xid` and
+`reused_components` is unchanged (one composite incident); both are to be
+re-run on both clusters on R13h, together with the XID 92 decision check of
+the same run. The same run's XID 92 reached no decision within 420 s although the
 kmsg fixture was armed (07:55:57Z, the run's own sequence band, a current
 monotonic stamp, the window's open and arm receipts clean); the product's XID
 event records and the kernel collector's log for that window are to be read

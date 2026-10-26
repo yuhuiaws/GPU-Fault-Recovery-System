@@ -53,3 +53,53 @@ class GpuFindingState(StrictModel):
     observed_at: datetime
     finding: GpuHealthFinding | None = None
     consecutive_breaches: int = Field(default=0, ge=0)
+
+
+def gpu_finding_transition(
+    previous: GpuFindingState | None,
+    finding: GpuHealthFinding | None,
+    observed_at: datetime,
+) -> tuple[GpuFindingState, bool]:
+    """The state that replaces ``previous`` and whether that write is an
+    activation -- a finding that warrants an incident of its own.
+
+    The one rule every store applies (memory, SQLite, PostgreSQL) once it has
+    rejected a stale observation. A METRIC finding activates when none was
+    active or its grade (severity) or automatic action changed; its id is
+    stamped with every batch, so the id says nothing about identity. A
+    COMPOSITE finding carries one id per episode
+    (``gpu_composites.composite_episode_identity``): a new id is a new episode
+    -- it activates even at the grade the stale state held and restarts the
+    consecutive count -- while the same id with a changed grade is a re-grade
+    of the open episode, counted here as an activation (the history keeps the
+    latest grade) and told apart by the caller through the unchanged id.
+    """
+
+    previous_finding = previous.finding if previous is not None else None
+    new_episode = (
+        finding is not None
+        and previous_finding is not None
+        and finding.finding_kind == "COMPOSITE"
+        and finding.finding_id != previous_finding.finding_id
+    )
+    consecutive_breaches = (
+        0
+        if finding is None
+        else 1
+        if previous is None or previous_finding is None or new_episode
+        else previous.consecutive_breaches + 1
+    )
+    activated = finding is not None and (
+        previous_finding is None
+        or new_episode
+        or finding.severity != previous_finding.severity
+        or finding.automatic_action != previous_finding.automatic_action
+    )
+    return (
+        GpuFindingState(
+            observed_at=observed_at,
+            finding=finding,
+            consecutive_breaches=consecutive_breaches,
+        ),
+        activated,
+    )

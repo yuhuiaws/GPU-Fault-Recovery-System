@@ -1501,8 +1501,7 @@ class IncidentOrchestrator:
             profile = self.store.get_profile(event.runtime_profile_version)
         except NotFoundError:
             return None, None
-        # HyperPod and plain EKS both land on REBOOT_NODE, through their own
-        # provider call; neither is an EC2 stop/start.
+        # Both reach REBOOT_NODE via their provider call; neither is an EC2 stop/start.
         return restart_vm_effective_action(profile.environment)
 
     def ingest_node_health(
@@ -1515,9 +1514,8 @@ class IncidentOrchestrator:
         _skip_terminal_quarantine_merge: bool = False,
         _persist: bool = True,
     ) -> tuple[FaultIncident, WorkflowRequest | None]:
-        # The health family's own ``with self.lock`` re-enters this scope;
-        # see ``NodeLocks``. Re-entrant from the drain and grouped-health
-        # callbacks, which ingest the finding they already hold.
+        # Re-entrant (``NodeLocks``): the health family's ``with self.lock`` and the
+        # drain/grouped-health callbacks ingest the finding they already hold here.
         with self._node_locks.held([(finding.cluster_id, finding.node_id)]):
             return self._node_health.ingest(
                 finding,
@@ -1527,6 +1525,10 @@ class IncidentOrchestrator:
                 skip_terminal_quarantine_merge=(_skip_terminal_quarantine_merge),
                 persist=_persist,
             )
+
+    def record_health_regrade(self, finding: NodeHealthFinding) -> FaultIncident | None:
+        with self._node_locks.held([(finding.cluster_id, finding.node_id)]):
+            return self._node_health.record_regrade(finding)
 
     @staticmethod
     def _is_dcgm_gpu_finding(
@@ -1617,12 +1619,11 @@ class IncidentOrchestrator:
     def simulate(
         self, request_id: str, expected_fencing_token: int
     ) -> WorkflowExecutionResult:
-        # Only a workflow id arrives, so the nodes to lock on are read first,
-        # outside the lock. That read is not the one acted on: the workflow
-        # and incident are re-read under the lock below, and the fencing
-        # token check plus the compare-and-set save reject anything that
-        # moved in between. A workflow whose incident names no node takes
-        # the process-wide fallback.
+        # Only a workflow id arrives, so the nodes to lock on are read first, outside
+        # the lock. That read is not the one acted on: workflow and incident are
+        # re-read under the lock below, and the fencing token check plus the
+        # compare-and-set save reject anything that moved in between. A workflow
+        # whose incident names no node takes the process-wide fallback.
         scoped_incident = self.store.get_incident(
             self.store.get_workflow(request_id).incident_id
         )
@@ -1680,14 +1681,13 @@ class IncidentOrchestrator:
                     "updated_at": now,
                 }
             )
-            # Compare-and-set on the copy read above: a merge or lease change
-            # by another replica between the read and this write surfaces as
-            # ``StaleWriteError`` instead of being overwritten. It propagates,
-            # like ``WorkflowFencingError`` from the same method: the caller
-            # re-reads and retries, this method holds no state to retry with.
-            # ``save_incident_and_workflow`` is not used because it has no
-            # ``expected`` and stamps a merge revision on an existing row
-            # (store review 2026-09-07, item B).
+            # Compare-and-set on the copy read above: a merge or lease change by another
+            # replica between the read and this write surfaces as ``StaleWriteError``
+            # instead of being overwritten. It propagates, like ``WorkflowFencingError``
+            # from the same method: the caller re-reads and retries, this method holds no
+            # state to retry with. ``save_incident_and_workflow`` is not used because it
+            # has no ``expected`` and stamps a merge revision on an existing row (store
+            # review 2026-09-07, item B).
             self.store.save_workflow(workflow, expected=read_workflow)
             self.store.save_incident(incident, expected=read_incident)
             return WorkflowExecutionResult(

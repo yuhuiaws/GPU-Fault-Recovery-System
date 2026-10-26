@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from gpu_fault.gpu_metric_models import GpuFindingState
+from gpu_fault.gpu_metric_models import gpu_finding_transition
 from gpu_fault.store.postgres.hot_layout import metric_latest_table
 from gpu_fault.store.shared.time import (
     utc_text as _utc_text,
@@ -320,25 +320,8 @@ class PostgresGpuTelemetryMixin:
                 if previous is not None and observed_at <= previous.observed_at:
                     activated_values.append(False)
                     continue
-                activated = finding is not None and (
-                    previous is None
-                    or previous.finding is None
-                    or finding.severity != previous.finding.severity
-                    or finding.automatic_action != previous.finding.automatic_action
-                )
-                consecutive_breaches = (
-                    previous.consecutive_breaches + 1
-                    if finding is not None
-                    and previous is not None
-                    and previous.finding is not None
-                    else 1
-                    if finding is not None
-                    else 0
-                )
-                state = GpuFindingState(
-                    observed_at=observed_at,
-                    finding=finding,
-                    consecutive_breaches=consecutive_breaches,
+                state, activated = gpu_finding_transition(
+                    previous, finding, observed_at
                 )
                 current_by_key[storage_key] = state
                 final_states[storage_key] = state

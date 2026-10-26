@@ -695,16 +695,35 @@ def test_correctable_memory_trend_escalates_after_three_samples() -> None:
 
     first = results[0].new_composite_findings[0]
     second = results[1].composite_findings[0]
-    third = results[2].new_composite_findings[0]
     assert first.correlation_rule_id == ("CORRECTABLE_MEMORY_DEGRADATION")
     assert first.severity == "WARNING"
     assert first.automatic_action == "RUN_DIAGNOSTICS"
     assert second.severity == "WARNING"
+    assert second.finding_id == first.finding_id, "one identity per episode"
     assert not results[1].new_findings, "expected results[1].new_findings to be falsy"
+    # The third consecutive breach re-grades the *same* composite: the episode
+    # keeps its finding id, so the escalation updates the incident it already
+    # has instead of minting a second one (GF-GENERAL-LIVE-024 independent_xid,
+    # live 2026-10-26: two incidents 30 s apart for one held pair).
+    assert results[2].new_composite_findings == []
+    assert results[2].new_findings == []
+    third = results[2].updated_composite_findings[0]
+    assert third.finding_id == first.finding_id
     assert third.severity == "CRITICAL"
     assert third.automatic_action == "RUN_DIAGNOSTICS"
-    assert results[2].new_findings == [third]
+    assert "3 consecutive samples" in third.reason
     assert set(third.component_metrics) == set(names)
+    assert third.component_finding_ids != first.component_finding_ids, (
+        "component finding ids stay per-batch evidence"
+    )
+    assert results[2].composite_findings == [third]
+    active = [
+        item
+        for item in service.findings("hp-cluster", "worker-1", active_only=True)
+        if item.finding_kind == "COMPOSITE"
+    ]
+    assert [item.finding_id for item in active] == [first.finding_id]
+    assert active[0].severity == "CRITICAL"
 
 
 def test_new_retired_dbe_page_requests_diagnostics() -> None:

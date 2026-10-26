@@ -17,11 +17,12 @@ from gpu_fault.gpu_collection_errors import (
 from gpu_fault.gpu_composites import (
     PCIE_XID_RULE,
     composite_finding,
-    composite_update_time,
     correlate_kernel_xid,
+    episode_composite_state,
     link_xid_events,
     metric_counter_delta,
     pcie_xid_link_failure,
+    resolve_composite_updates,
 )
 from gpu_fault.gpu_composites import (
     SITE_CORRELATION_POLICY_VERSION as SITE_CORRELATION_POLICY_VERSION,
@@ -309,6 +310,11 @@ class GpuMetricsIngestionResult(StrictModel):
     new_findings: list[GpuHealthFinding] = Field(default_factory=list)
     composite_findings: list[GpuHealthFinding] = Field(default_factory=list)
     new_composite_findings: list[GpuHealthFinding] = Field(default_factory=list)
+    #: Active composites re-graded within their episode (severity changed, same
+    #: finding id and automatic action): the incident the episode already has
+    #: is updated with the new grade, none is minted (``new_findings`` and
+    #: ``new_composite_findings`` carry only activations).
+    updated_composite_findings: list[GpuHealthFinding] = Field(default_factory=list)
     suppressed_finding_ids: list[str] = Field(default_factory=list)
     xid_events: list[XidEvent] = Field(default_factory=list)
     decisions: list[FaultPolicyDecision] = Field(default_factory=list)
@@ -554,6 +560,7 @@ class GpuMetricsService:
             (
                 composite_findings,
                 new_composite_findings,
+                updated_composite_findings,
                 suppressed_finding_ids,
             ) = self._evaluate_composite_findings(batch, touched_gpu_keys, xid_events)
             suppressed = set(suppressed_finding_ids)
@@ -573,6 +580,7 @@ class GpuMetricsService:
                 new_findings=effective_new_findings,
                 composite_findings=composite_findings,
                 new_composite_findings=(new_composite_findings),
+                updated_composite_findings=updated_composite_findings,
                 suppressed_finding_ids=suppressed_finding_ids,
                 xid_events=xid_events,
             )
@@ -609,10 +617,14 @@ class GpuMetricsService:
     ) -> tuple[
         list[GpuHealthFinding],
         list[GpuHealthFinding],
+        list[GpuHealthFinding],
         list[str],
     ]:
+        """``(composite findings, activations, re-grades, suppressed ids)``;
+        see ``gpu_composites.resolve_composite_updates``."""
+
         if not touched_gpu_keys:
-            return [], [], []
+            return [], [], [], []
         pcie_gpu_keys = touched_gpu_keys.intersection(
             sample.gpu_uuid or sample.pci_bdf or sample.gpu_index or "node"
             for sample in batch.samples
@@ -631,9 +643,16 @@ class GpuMetricsService:
                 strict=True,
             )
         )
-        cutoff = batch.observed_at - timedelta(
-            seconds=self.thresholds.correlation_window_seconds
-        )
+        window = timedelta(seconds=self.thresholds.correlation_window_seconds)
+        # The states this batch's episodes continue: an active state the
+        # window does not reach was left by a GPU that stopped reporting and
+        # shapes neither the consecutive count nor the identity of what is
+        # observed now. The stored state is still cleared or replaced below.
+        episode_states = {
+            key: episode_composite_state(state, batch.observed_at, window)
+            for key, state in previous_composite_states.items()
+        }
+        cutoff = batch.observed_at - window
         active_components = [
             finding
             for finding in self.store.list_gpu_findings(
@@ -734,70 +753,25 @@ class GpuMetricsService:
                 gpu_key,
                 findings_by_gpu.get(gpu_key, {}),
                 latest_by_gpu.get(gpu_key, {}),
-                previous_composite_states,
+                episode_states,
                 nvlink_gpu_uuids,
                 candidates,
                 link_events,
                 evaluate_pcie=gpu_key in pcie_gpu_keys,
             )
 
-        composite_findings = []
-        new_composite_findings = []
-        suppressed_ids: set[str] = set()
-        ordered_rule_ids = sorted(self._COMPOSITE_RULE_IDS)
-        updates = []
-        candidate_updates = []
-        for scope_key in composite_scopes:
-            for rule_id in ordered_rule_ids:
-                # Only PCIe/XID inputs share the cross-replica correlation lock.
-                # An unrelated scrape is not evidence that a PCIe episode cleared.
-                if rule_id == PCIE_XID_RULE and scope_key not in pcie_gpu_keys:
-                    continue
-                key = self._composite_key(batch, scope_key, rule_id)
-                candidate = candidates.get((scope_key, rule_id))
-                previous = previous_composite_states.get(key)
-                if candidate is not None and previous is not None and previous.finding:
-                    if set(candidate.component_finding_ids) == set(
-                        previous.finding.component_finding_ids
-                    ) or (
-                        rule_id != PCIE_XID_RULE
-                        and not set(candidate.component_finding_ids) <= fresh_components
-                    ):
-                        composite_findings.append(previous.finding)
-                        suppressed_ids.update(previous.finding.component_finding_ids)
-                        continue
-                if candidate is None and (previous is None or previous.finding is None):
-                    continue
-                observed_at = composite_update_time(
-                    batch,
-                    candidate,
-                    previous,
-                    latest_by_gpu.get(scope_key, {}),
-                    findings_by_gpu.get(scope_key, {}),
-                )
-                updates.append((key, candidate, observed_at))
-                if candidate is not None:
-                    candidate_updates.append((key, candidate))
-        activated_values = self.store.update_gpu_findings(updates)
-        activated_by_key = {
-            key: activated
-            for (
-                key,
-                _candidate,
-                _observed_at,
-            ), activated in zip(updates, activated_values, strict=True)
-        }
-        for key, candidate in candidate_updates:
-            if candidate is None:
-                continue
-            composite_findings.append(candidate)
-            suppressed_ids.update(candidate.component_finding_ids)
-            if activated_by_key.get(key, False):
-                new_composite_findings.append(candidate)
-        return (
-            composite_findings,
-            new_composite_findings,
-            sorted(suppressed_ids),
+        return resolve_composite_updates(
+            self,
+            batch,
+            scopes=composite_scopes,
+            rule_ids=sorted(self._COMPOSITE_RULE_IDS),
+            pcie_gpu_keys=pcie_gpu_keys,
+            candidates=candidates,
+            previous_states=previous_composite_states,
+            episode_states=episode_states,
+            fresh_components=fresh_components,
+            latest_by_gpu=latest_by_gpu,
+            findings_by_gpu=findings_by_gpu,
         )
 
     def _add_gpu_composite_candidates(

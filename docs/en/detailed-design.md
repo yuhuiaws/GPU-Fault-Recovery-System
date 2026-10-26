@@ -1001,7 +1001,48 @@ Single-metric findings keep their existing thresholds and NVIDIA/site provenance
 the control plane reads the related active findings and latest metrics by `cluster + node + GPU UUID/PCI BDF`
 and runs the `SITE_DCGM_CORRELATION` state machine within the event time window. The default window is 45 seconds; state is persisted
 under the key `composite:<rule-id>`, storing active/clear, consecutive count, severity and action.
-Repeated samples do not re-trigger; a warning escalating to critical or a change of action produces a new state edge.
+Repeated samples do not re-trigger; a warning escalating to critical is a **re-grade** of the same composite, and only a change of action is a new state edge.
+
+**Composite identity: one finding id, one incident, per sustained episode.** A composite's finding id
+is minted with the batch that opens its episode (`gpu_composites.composite_finding`:
+`<batch id>-<scope>-composite-<rule>`) and every later batch's recomputed candidate inherits it for as
+long as the composite stays active with the same automatic action
+(`gpu_composites.composite_episode_identity`). The incident, the marker and the workflow are derived
+from it (`app/ingest/gpu_findings`: event id `gpu-<finding id>` → `inc-gpu-<finding id>`), hence:
+
+- A severity change within the episode (`CORRECTABLE_MEMORY_DEGRADATION` turning CRITICAL at
+  `correctable_memory_drain_consecutive_samples`=3 consecutive breaches) no longer mints a second
+  incident: the stores' `gpu_finding_transition` still counts the grade change as an activation (the
+  history keeps the latest grade), `gpu_composites.resolve_composite_updates` recognises it as a
+  re-grade by the unchanged id and reports it in
+  `GpuMetricsIngestionResult.updated_composite_findings` (`new_findings`/`new_composite_findings`
+  carry activations only); on the ingest side `NodeHealthIngestionService.record_regrades` goes
+  through `orchestrator.record_health_regrade`, which appends one bounded reason to the incident
+  that event id already has (`composite:<rule> escalated to CRITICAL: ...`; a replay of the same grade
+  writes nothing) and rewrites the node marker at the new severity; the action is unchanged, so the
+  plan stands and no workflow is scheduled. An incident an operator already closed keeps the
+  escalation as a reason and is not reopened; only a breach after a clear opens anew. A re-grade whose
+  event has no incident (the activation's incident write never committed on a nontransactional
+  backend) is ingested as a new finding -- the repair F-M1 asks for.
+- A changed automatic action (`THERMAL_STRESS` moving from RUN_DIAGNOSTICS to DRAIN with a CRITICAL
+  temperature, `GPU_MEMORY_DEGRADATION` following its components' actions) is a new recovery decision:
+  the candidate keeps this batch's id and mints a new incident and plan (serialized behind or
+  preempting the diagnostic as before), because only a new incident lets a DRAIN plan supersede a
+  diagnostic.
+- A composite that cleared (its components stopped breaching, the state's finding is None) and forms
+  again is a new episode: new id, new incident, the consecutive count restarts at 1.
+- The device-signal rule (b183: a vanished device's signal must not swallow the next episode) applies
+  too: an active composite scope is re-evaluated by every batch and clears within one correlation
+  window once a component stops breaching, so an active composite state older than
+  `GPU_FAULT_DCGM_CORRELATION_WINDOW_SECONDS` (45 s) relative to the batch can only have been left by a
+  GPU that stopped reporting -- the previous episode's (`gpu_composites.episode_composite_state`). It
+  neither counts consecutive samples for nor lends its identity to what is observed now; the breach
+  activates as a new episode even at the same grade, and the stored state is replaced or cleared.
+- Component finding ids stay per batch (`<batch id>-<gpu>-<metric>`): they are evidence
+  (`component_finding_ids`), not identity; every batch's composite names that batch's component ids.
+- The three stores (memory/SQLite/PostgreSQL) share `gpu_metric_models.gpu_finding_transition`: a
+  METRIC finding activates on first appearance or on a severity/action change; a COMPOSITE finding
+  additionally activates on an id change (a new episode), which resets the consecutive count to 1.
 
 | Rule ID | Required correlated signals | Conclusion and action |
 |---|---|---|
@@ -1011,7 +1052,7 @@ Repeated samples do not re-trigger; a warning escalating to critical or a change
 | `PCIE_XID_LINK_FAILURE` | PCIe replay rate finding + XID 32/79 on the same GPU inside the window (a trusted kernel event, or a change of the DCGM last-XID gauge inside the window; an expired gauge does not join) | `DRAIN` and retain the combined PCIe/XID evidence |
 | `NVLINK_LINK_DEGRADATION` | at least two kinds of NVLink error finding on the same GPU | `DRAIN` and run link/fabric diagnostics |
 | `MULTI_GPU_NVLINK_FABRIC_FAILURE` | at least two GPUs on the same node with NVLink error findings | Generate one node-level composite and `DRAIN` |
-| `CORRECTABLE_MEMORY_DEGRADATION` | at least two of SBE, retired SBE page and correctable row-remap increasing at the same time | Diagnostics first; `DRAIN` after 3 consecutive hits by default |
+| `CORRECTABLE_MEMORY_DEGRADATION` | at least two of SBE, retired SBE page and correctable row-remap increasing at the same time | WARNING/diagnostics first; after 3 consecutive hits by default the same composite is re-graded CRITICAL (action still diagnostics, the same incident updated) and the running VALIDATE_GPU fails on the CRITICAL finding and `DRAIN`s through the existing ladder |
 
 Thermal slowdown uses the software/hardware thermal slowdown bits `0x20/0x40` of
 `DCGM_FI_DEV_CLOCK_THROTTLE_REASONS`. `SM_CLOCK` and `MEM_CLOCK` serve only as performance-impact context; a low clock on its own may come from
