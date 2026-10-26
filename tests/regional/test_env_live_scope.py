@@ -12,7 +12,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
+from scripts.e2e.regional import acceptance_gpu_load as load
 from scripts.e2e.regional import env_live_expectations as expectations
 from scripts.e2e.regional import env_live_fixture as fixture
 from scripts.e2e.regional import env_live_scope as scope
@@ -277,6 +279,133 @@ def test_execute_010_fails_when_the_control_node_receives_an_incident(
     assert any("incidents/inc-ctl" in item for item in result["stages"]["control"]), (
         result["stages"]
     )
+    # Not a low-utilization incident: no duty diagnosis is attached.
+    assert not any("diagnosis" in item for item in result["stages"]["control"]), result[
+        "stages"
+    ]
+    assert result["receipts"]["observation"]["control_utilization_incidents"] == []
+
+
+def test_execute_010_diagnoses_the_control_task_graded_for_low_utilization(
+    tmp_path: Path, world: World
+) -> None:
+    """Live 2026-10-26 (plain EKS, core_tlimit/severe): the product's
+    LOW_GPU/LOW_CPU_UTILIZATION rules graded the harness's idle control task.
+    Still FAIL, but the control-stage error names the cause (the task's duty)."""
+
+    review_chain(world)
+    incident = (
+        f"inc-host-{CONTROL}-1793023102533329-host_gpu_utilization_percent-"
+        "GPU-80e1ad6c-ca4f-c21b-07ac-80d802782c62-low_gpu_utilization"
+    )
+    cpu_incident = (
+        f"inc-host-{CONTROL}-1793023102533329-training_rank_cpu_percent-"
+        "GPU-49f1a9d9-a439-0480-2ea7-c5fd8d375c92-low_cpu_utilization"
+    )
+
+    def graded(w: World) -> None:
+        for incident_id in (incident, cpu_incident):
+            w.control_incidents[incident_id] = {
+                "incident_id": incident_id,
+                "event_id": incident_id.removeprefix("inc-"),
+                "state": "ACTION_PENDING",
+                "created_at": w.now.isoformat(),
+            }
+        w.control_workflows["workflow-6510fd499456d7013aa2902b"] = {
+            "request_id": "workflow-6510fd499456d7013aa2902b",
+            "state": "RUNNING",
+            "created_at": w.now.isoformat(),
+        }
+
+    world.at(100, graded)
+    runner.execute_case(_settings(tmp_path), tmp_path, 1, _window())
+    result = _read_case(tmp_path)
+    assert result["verdict"] == "FAIL"
+    [control] = result["stages"]["control"]
+    assert f"incidents/{incident}" in control and "received" in control
+    assert "diagnosis: 2 of them are LOW_GPU_UTILIZATION / LOW_CPU_UTILIZATION" in (
+        control
+    )
+    assert "control task's own utilization" in control
+    assert "check the control task's GPU duty" in control
+    assert f"{load.GPU_DUTY_ENV} in the rendered manifest" in control
+    assert f"expected {scope.CONTROL_TASK_GPU_DUTY_PERCENT}" in control
+    observation = result["receipts"]["observation"]
+    # Sorted keys: the GPU-utilization incident sorts before the CPU one.
+    assert observation["control_utilization_incidents"] == [
+        f"incidents/{incident}",
+        f"incidents/{cpu_incident}",
+    ]
+    assert (
+        "workflows/workflow-6510fd499456d7013aa2902b"
+        in (observation["control_node_activity"])
+    )
+
+
+def test_the_control_task_is_rendered_gpu_active_at_the_acceptance_duty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rendered control task (the manifest the live run submits) carries the
+    acceptance default duty, never 0: an idle enrolled job is a low-utilization
+    fault to the product by design (live 2026-10-26, the control stage FAILed on
+    the harness's own duty-0 task about nine minutes after it started)."""
+
+    from scripts.e2e.regional import fixture_ownership
+    from scripts.e2e.regional.regional_live_fixture import (
+        RegionalLiveFixture,
+        RegionalLiveSettings,
+    )
+
+    monkeypatch.setattr(fixture_ownership, "host_identity", lambda: "a" * 64)
+    cpu = tmp_path / "cpu.kubeconfig"
+    gpu = tmp_path / "gpu.kubeconfig"
+    cpu.write_text("apiVersion: v1\n", encoding="utf-8")
+    gpu.write_text("apiVersion: v1\n", encoding="utf-8")
+    regional = RegionalLiveFixture(
+        RegionalLiveSettings(
+            cpu_kubeconfig=cpu,
+            gpu_kubeconfig=gpu,
+            gpu_context="gpu-context",
+            namespace="gpu-fault-system",
+            cluster_id="gpu-eks-cluster",
+            region="us-west-2",
+        )
+    )
+    site = tmp_path / "site.yaml"
+    site.write_text("clusters: []\n", encoding="utf-8")
+    case_dir = tmp_path / "cases" / CASE
+
+    task = scope.ControlTask(
+        regional,
+        site_file=site,
+        case_dir=case_dir,
+        case_id=CASE,
+        run_id="gf-env-live-010-a7-1793022554",
+        node=CONTROL,
+    )
+
+    rendered = task.fixture.settings.manifest
+    assert rendered == case_dir / f"{task.name}.source.yaml"
+    document = yaml.safe_load(rendered.read_text(encoding="utf-8"))
+    assert document["kind"] == "PyTorchJob"
+    assert document["metadata"]["labels"]["gpu-fault.io/job-id"] == task.name
+    assert document["metadata"]["labels"]["gpu-fault.io/attempt-id"] == task.attempt_id
+    duties: dict[str, list[str]] = {}
+    for replica in document["spec"]["pytorchReplicaSpecs"].values():
+        pod = replica["template"]["spec"]
+        assert pod["nodeName"] == CONTROL, "pinned to the control node"
+        for container in pod["containers"]:
+            duties[container["name"]] = [
+                str(item["value"])
+                for item in container.get("env") or []
+                if item.get("name") == load.GPU_DUTY_ENV
+            ]
+    assert duties == {"pytorch": [str(load.DEFAULT_GPU_DUTY_PERCENT)]}, duties
+    assert duties["pytorch"] != ["0"], "the control task must not run idle"
+    assert scope.CONTROL_TASK_GPU_DUTY_PERCENT == load.DEFAULT_GPU_DUTY_PERCENT
+    assert 0 < scope.CONTROL_TASK_GPU_DUTY_PERCENT <= load.MAX_GPU_DUTY_PERCENT
+    assert task.fixture.settings.expected_gpu_count == scope.CONTROL_TASK_GPU_COUNT
+    assert task.fixture.settings.job_id == task.name
 
 
 def test_control_task_names_are_dns_labels_bound_to_the_run() -> None:

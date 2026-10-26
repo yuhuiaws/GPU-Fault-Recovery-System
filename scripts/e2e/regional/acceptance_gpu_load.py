@@ -56,7 +56,8 @@ Inventory: every GPU workload the regional harness submits.
   ``run_collector_destructive.render_named_training_manifest`` and
   ``training_topology.render_topology_manifest``),
   ``two-node-replace-pytorchjob.yaml`` (DESTR-014/015/026),
-  ``single-node-warm-spare-pytorchjob.yaml`` (DESTR-003/008) and
+  ``single-node-warm-spare-pytorchjob.yaml`` (DESTR-003/008; GF-ENV-LIVE-010's
+  control task at the default duty, ``env_live_scope.ControlTask``) and
   ``xid11-single-node-job.yaml`` (DESTR-012 group D; one GPU, so the node's
   seven other GPUs stay idle -- the product grades only the GPUs an attempt
   holds, so they are not graded).

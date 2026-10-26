@@ -81,8 +81,9 @@ absolute-core and absolute-shutdown (GF-ENV-LIVE-011) variants are NOT_RUN,
 GF-ENV-LIVE-002 reuses GF-REGIONAL-COLLECT-002's controlled power path.
 GF-ENV-LIVE-010 runs only with a control node (`--node-b`), `--site-file` and a
 multi-GPU target node: an independent control task (the node-pinned single-node
-training fixture, idle GPU duty) runs on the control node while one GPU of the
-target node is replayed, and the scope judge grades the control GPUs, the control
+training fixture, GPU-active at the acceptance GPU duty) runs on the control node
+while one GPU of the target node is replayed, and the scope judge grades the
+control GPUs, the control
 node and the task as untouched and the fault as one merged workflow / one sent
 notification; without those it is NOT_RUN. The target node carries no owned
 distributed job, so the STOP scope of an affected job is reported as not measured.
@@ -130,6 +131,35 @@ one is due has the unit read back once and the reason named (endpoint
 reverted, drop-in gone, unit restarted or inactive, proxy refused the reads,
 collector silent). All of these are INCONCLUSIVE with the reason, never a
 product verdict; the proof scope stays `live-telemetry-replay`.
+
+GF-ENV-LIVE-010's control task runs the acceptance GPU duty
+(`acceptance_gpu_load.DEFAULT_GPU_DUTY_PERCENT`, 30 %), written explicitly into
+the rendered manifest (`env_live_scope.CONTROL_TASK_GPU_DUTY_PERCENT`) and into
+the `control_task_before` receipt. Its first valid plain-EKS run (2026-10-26,
+`core_tlimit/severe`, release R13g) FAILed on the control stage alone, with every
+other stage clean: the task was rendered at duty 0 ("idle"), and the product's
+`LOW_GPU_UTILIZATION` / `LOW_CPU_UTILIZATION` rules -- the two
+`active_workload_only` rules, which time a window while exactly one managed
+attempt with a live container holds the node's GPUs and open an incident once
+utilization stays at or below 5 % for 300 s -- graded the harness's own control
+task about nine minutes after it started (two `low_gpu_utilization` /
+`low_cpu_utilization` incidents, one workflow and three notifications on the
+control node), which the scope judge counted as activity the control node
+"received". The product behaved as designed (the same rule is what the
+acceptance training workloads were made GPU-active for); the oracle's fixture
+contradicted the product's rules. In the same live rounds no other case produced
+a low-utilization incident. The duty cannot coincide with the replayed plan: the
+scope checks read the target node's batches and findings only (its other GPUs
+run nothing), the control node is read for records only, and the 010 plans serve
+on the one target GPU a temperature one degree past the device's own slowdown or
+maximum-operating limit -- a control GPU reporting such a value would be a real
+thermal fault, not a product of a bounded load sized for a fraction of the power
+limit. A control node that still receives a low-utilization incident FAILs the
+control stage as before; the error text now adds the diagnosis (the product
+graded the control task's own utilization: check its GPU duty) and the evidence
+lists those incidents (`control_utilization_incidents`). The unit tests pin the
+rendered duty and the diagnosis; the case is to be re-run live on both clusters
+(harness only, no product release).
 
 AUTH-016 follows the real administrator rotation contract using controlled I/O.
 Same-release Node key activation tests bind durable progress, projected key

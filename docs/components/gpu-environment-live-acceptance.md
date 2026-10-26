@@ -344,12 +344,25 @@ GF-ENV-LIVE-001..011（012 始终 NOT_RUN）。默认只计划，不动集群。
   `--site-file`（提交对照任务）与至少两张 GPU 的目标节点，缺一则 NOT_RUN 并写明原因。
   执行前先对对照节点做与目标节点相同的洁净 preflight；再在对照节点上以
   `gpu-training-submit` 提交节点固定的单节点训练夹具（`env_live_scope.ControlTask`，
-  GPU duty 0，镜像预热），等待其 Running 且心跳正常，记录 Pod UID 与对照节点状态；
+  以验收默认 GPU duty 运行——`acceptance_gpu_load.DEFAULT_GPU_DUTY_PERCENT`，30 %，
+  通过 `set_gpu_duty_percent` 显式写入渲染清单并记入 `control_task_before` 回执
+  （`gpu_duty_percent`）——镜像预热），等待其 Running 且心跳正常，记录 Pod UID 与对照
+  节点状态。对照任务不能空闲：产品的 `LOW_GPU_UTILIZATION`/`LOW_CPU_UTILIZATION`
+  （`active_workload_only` 规则）只对节点上唯一有活容器的受管 attempt 所持 GPU 计时，
+  利用率 ≤5 % 持续 300 秒即开 incident，一个 GPU duty 0 的受管对照任务约 9 分钟后就会被
+  产品按设计判为低利用率故障，使 control 阶段因 harness 自己的夹具而 FAIL。该 duty 不会
+  与回放计划巧合：scope 判据只读目标节点的批次与 finding（目标节点其余 GPU 无负载），
+  对照节点只读记录不读样本，而 010 的严重计划在目标 GPU 上投放的是超过设备自身
+  slowdown/最高工作温度一度的温度值，对照 GPU 出现这种读数是真实热故障而非有界负载
+  （平均功耗只是功率上限的一部分）的产物；
   然后在目标节点的一张 GPU 上 arm 与 004 相同的严重 T.Limit 计划。判据
   （`env_live_scope.ScopeJudge`，在 004 判据之上）：目标节点其他 GPU 的该字段无
   finding、其被接受样本不含回放值（原始对照指标未改动）；incident 的 GPU/节点作用域
   只含目标 GPU/节点；对照节点全程无 cordon、无 `gpu-fault.io/` taint、无归属注解、无新
-  incident/workflow/notification；对照任务 Pod 的 UID 集合不变且始终 Running；同一故障
+  incident/workflow/notification（新 incident 若为 `low_gpu_utilization`/
+  `low_cpu_utilization`，仍判 FAIL，但 control 阶段错误文本附加诊断——产品判的是对照
+  任务自身的利用率，核对其 GPU duty——证据列出 `control_utilization_incidents`）；
+  对照任务 Pod 的 UID 集合不变且始终 Running；同一故障
   只有一个带隔离步骤的工作流、评审 incident 最多一条 SENT 通知（其余 DUPLICATE）、
   STOP_WORKLOADS 最多执行一次。目标节点按 preflight 要求没有归属训练任务，因此受影响
   分布式任务的 STOP 范围未测量，记入证据。清理顺序：还原 endpoint → 停代理 → 删探针 →

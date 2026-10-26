@@ -381,8 +381,11 @@ def plan_details(
         details["scope"] = {
             "control_node": settings.control_node or None,
             "control_task": (
-                f"{scope.CONTROL_TASK_MANIFEST} pinned to the control node, idle GPU "
-                "duty, submitted through gpu-training-submit and removed in cleanup"
+                f"{scope.CONTROL_TASK_MANIFEST} pinned to the control node, GPU-active "
+                f"at the acceptance GPU duty ({scope.CONTROL_TASK_GPU_DUTY_PERCENT} %, "
+                "never idle: an idle enrolled job is a LOW_GPU/LOW_CPU_UTILIZATION "
+                "fault to the product), submitted through gpu-training-submit and "
+                "removed in cleanup"
             ),
             "locks": (
                 "the two-node run holds the target and the control node (both "

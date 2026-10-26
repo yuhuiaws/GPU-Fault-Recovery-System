@@ -12,7 +12,8 @@ and no duplicate STOP; an independent control task on the control node proves
 This module owns the two parts the 004 chain does not have:
 
 * :class:`ControlTask` -- the independent control task: the single-node
-  training fixture pinned to the control node, idle GPU duty, submitted and
+  training fixture pinned to the control node, GPU-active at the acceptance
+  GPU duty (:data:`CONTROL_TASK_GPU_DUTY_PERCENT`, below), submitted and
   removed through ``managed_workload_fixture`` (``gpu-training-submit``, the
   product's own enrolment; the fixture's ownership journal decides what is
   deleted) and image-prewarmed like the GF-GENERAL-LIVE managed jobs;
@@ -21,9 +22,53 @@ This module owns the two parts the 004 chain does not have:
   read (the control node's Node document, its activity since the arm and the
   control task's Pods).
 
+The control task's GPU duty. To the product an enrolled training job whose
+GPUs idle is a fault, by design: ``LOW_GPU_UTILIZATION`` and
+``LOW_CPU_UTILIZATION`` (``host_health.NodeHealthPolicy``, the two
+``active_workload_only`` rules of ``host_low_utilization``) time a window while
+exactly one managed attempt with a live container is on the node, for the GPUs
+it holds, and open an incident once ``host_gpu_utilization_percent`` /
+``training_rank_cpu_percent`` stay at or below the policy's threshold (5 %) for
+its window (300 s). The control task used to be rendered at duty 0 ("idle"),
+so about nine minutes after it started the product graded it -- two
+``low_gpu_utilization`` / ``low_cpu_utilization`` incidents, their workflow
+and notifications on the control node -- and the control stage FAILed on the
+harness's own fixture (live 2026-10-26, plain EKS, ``core_tlimit/severe``,
+release R13g). It now runs the acceptance duty like every other acceptance
+training workload (``acceptance_gpu_load``, the b141 rule): nvidia-smi reads
+about 28 % at the default 30 % and the ranks spin a share of a core, so
+neither rule can time a window; in the same live rounds no other case (every
+GF-GENERAL-LIVE managed job runs this duty) produced a low-utilization incident.
+
+Why that duty cannot coincide with the replayed plan. The scope stage reads the
+target node's accepted batches and findings only (``env_live_fixture.
+gpu_records`` of the target node): ``control_gpu_trigger_samples`` and
+``control_gpu_findings`` concern the target node's other GPUs, which run
+nothing (the preflight admits only a clean node), so the control task's duty
+never reaches them. Of the control node the poll reads records only (its Node
+document, incidents / workflows / notifications, the task's Pods), never
+samples. The plans 010 arms are the 004 severe plans
+(``run_env_live.replay_plans_for_case``: ``core_tlimit/severe``,
+``core_absolute/severe``, ``memory_absolute/severe``, whichever the device can
+run; one per attempt), and each serves, on the one target GPU, a temperature
+one degree past the device's own limit (``env_live_plans._severe_value``:
+T.Limit critical - 1, so -3.0 on an H200 whose slowdown T.Limit is -2.0;
+absolute slowdown or maximum-operating + 1). A GPU reporting such a value is a
+device at its slowdown point -- a real thermal fault the product must grade and
+the judge must FAIL on -- not a product of the bounded load: the acceptance
+duty is sized for an average draw that is a fraction of the power limit (its
+T.Limit margins stay wide) and far below the ~80 % utilization
+POWER_LIMIT_THROTTLING correlates with. The default is therefore safe, and the
+task sets it explicitly through ``set_gpu_duty_percent`` so the rendered
+manifest states it.
+
 Nothing here decides a verdict for the control plane: the records are the
 product's own; a control task that moved, a control node that was touched or
-a second workflow for the same fault is FAIL on positive evidence.
+a second workflow for the same fault is FAIL on positive evidence. A control
+node that received a ``low_gpu_utilization`` / ``low_cpu_utilization``
+incident still FAILs the control stage; its error text then carries the
+diagnosis (the product graded the control task's own utilization: check the
+task's GPU duty) so the next such failure explains itself.
 """
 
 from __future__ import annotations
@@ -35,6 +80,11 @@ from pathlib import Path
 from typing import Any
 
 from scripts.e2e.regional import env_live_verdicts as verdicts
+from scripts.e2e.regional.acceptance_gpu_load import (
+    DEFAULT_GPU_DUTY_PERCENT,
+    GPU_DUTY_ENV,
+    set_gpu_duty_percent,
+)
 from scripts.e2e.regional.env_live_expectations import Expectation, same_value
 from scripts.e2e.regional.env_live_judges import (
     SENT_NOTIFICATIONS,
@@ -50,10 +100,18 @@ from scripts.e2e.regional.general_live_verdicts import (
 from scripts.e2e.regional.regional_live_fixture import RegionalLiveFixture
 
 #: The GF-GENERAL-LIVE single-node training fixture (``torchrun`` on the node's
-#: eight GPUs, heartbeat lines); rendered node-pinned with idle GPU duty.
+#: eight GPUs, heartbeat lines); rendered node-pinned and GPU-active at
+#: :data:`CONTROL_TASK_GPU_DUTY_PERCENT` (never idle: see the module docstring).
 CONTROL_TASK_MANIFEST = "single-node-warm-spare-pytorchjob.yaml"
 CONTROL_TASK_GPU_COUNT = 8
 CONTROL_TASK_START_SECONDS = 900
+#: The control task's GPU duty: the acceptance default every acceptance training
+#: workload runs (``acceptance_gpu_load``), written into the rendered manifest.
+CONTROL_TASK_GPU_DUTY_PERCENT = DEFAULT_GPU_DUTY_PERCENT
+#: How the product's two ``active_workload_only`` rules name their incidents:
+#: ``host_health`` ends the event id (``inc-<event id>``) with the rule id in
+#: lower case. A control node that received one graded the control task itself.
+LOW_UTILIZATION_INCIDENT_MARKERS = ("low_gpu_utilization", "low_cpu_utilization")
 #: The ``gpu-fault.io/`` taints and ownership marks a touched node carries.
 ISOLATION_TAINT_PREFIX = "gpu-fault.io/"
 
@@ -93,7 +151,6 @@ class ControlTask:
             name_managed_workload,
             render_node_pinned_manifest,
         )
-        from scripts.e2e.regional.acceptance_gpu_load import set_gpu_duty_percent
 
         yaml = __import__("yaml")
         self.node = node
@@ -107,7 +164,9 @@ class ControlTask:
         )
         document = yaml.safe_load(rendered.read_text(encoding="utf-8"))
         name_managed_workload(document, self.name)
-        set_gpu_duty_percent(document, 0)
+        # GPU-active: an idle enrolled job is a LOW_GPU/LOW_CPU_UTILIZATION fault
+        # to the product by design (module docstring).
+        set_gpu_duty_percent(document, CONTROL_TASK_GPU_DUTY_PERCENT)
         document.setdefault("metadata", {}).setdefault("labels", {})
         document["metadata"]["labels"].update(
             {
@@ -150,6 +209,7 @@ class ControlTask:
             "job_id": self.name,
             "attempt_id": self.attempt_id,
             "node": self.node,
+            "gpu_duty_percent": CONTROL_TASK_GPU_DUTY_PERCENT,
             "pods": self.fixture.pods(),
         }
 
@@ -291,6 +351,20 @@ class ScopeJudge(ReviewJudge):
             and any(same_value(item.get("value"), v) for v in self.x.trigger_values)
         ]
 
+    def control_utilization_incidents(self) -> list[str]:
+        """Control-node incidents of the product's two low-utilization rules.
+
+        These grade the one managed attempt on the node -- the control task
+        itself -- so they point at the task's GPU duty, not at the replay.
+        """
+
+        return sorted(
+            key
+            for key, item in self.control_activity.items()
+            if item.get("kind") == "incidents"
+            and any(marker in key for marker in LOW_UTILIZATION_INCIDENT_MARKERS)
+        )
+
     def review_workflows(self) -> list[dict[str, Any]]:
         """Workflows with an isolating step among the target field's incidents."""
 
@@ -338,10 +412,24 @@ class ScopeJudge(ReviewJudge):
                 "taken into ownership during the run"
             )
         if self.control_activity:
-            stages["control"].append(
+            received = (
                 f"{label}: control node {self.control_node} received "
                 f"{sorted(self.control_activity)[:6]} during the run"
             )
+            graded = self.control_utilization_incidents()
+            if graded:
+                # Still FAIL: the diagnosis names the likely cause, it does not
+                # soften the verdict.
+                received += (
+                    f"; diagnosis: {len(graded)} of them are LOW_GPU_UTILIZATION / "
+                    "LOW_CPU_UTILIZATION incidents, the product grading the control "
+                    "task's own utilization (an enrolled job idle for the policy's "
+                    "low-utilization window, 300 s by default, is a fault by "
+                    f"design) -- check the control task's GPU duty ({GPU_DUTY_ENV} "
+                    f"in the rendered manifest, expected "
+                    f"{CONTROL_TASK_GPU_DUTY_PERCENT})"
+                )
+            stages["control"].append(received)
         if any(item["changed"] or item["unhealthy"] for item in self.task_timeline):
             last = self.task_timeline[-1]
             stages["control"].append(
@@ -385,6 +473,7 @@ class ScopeJudge(ReviewJudge):
                     i["touched"] for i in self.control_timeline
                 ),
                 "control_node_activity": sorted(self.control_activity)[:20],
+                "control_utilization_incidents": self.control_utilization_incidents(),
                 "control_task": {
                     "pods_before": sorted(self.task_before),
                     "pods_last": last_task.get("uids"),
@@ -427,7 +516,9 @@ class ScopeJudge(ReviewJudge):
 
 __all__ = [
     "CONTROL_TASK_GPU_COUNT",
+    "CONTROL_TASK_GPU_DUTY_PERCENT",
     "CONTROL_TASK_MANIFEST",
+    "LOW_UTILIZATION_INCIDENT_MARKERS",
     "ControlTask",
     "ScopeJudge",
     "control_task_name",
