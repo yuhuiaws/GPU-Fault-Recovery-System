@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 from enum import StrEnum
 
+from gpu_fault.efa_kernel_log import EFA_DEGRADED_REGEX, EFA_FATAL_REGEX
 from gpu_fault.models import RecoveryAction, Severity
 
 
@@ -21,8 +22,8 @@ class LogHealthCategory(StrEnum):
 #: ``journal`` are read by the node collector from the kernel ring buffer and
 #: the systemd journal (see ``collectors/logs/node.py`` ``_parse_journal``); a
 #: training job cannot write into either. A hardware-fatal rule (MCE, ECC,
-#: RDMA/EFA link loss, kernel panic) may only fire from one of these, because a
-#: match drives isolation/quarantine.
+#: a dead RDMA/EFA device, kernel panic) may only fire from one of these,
+#: because a match drives isolation/quarantine.
 KERNEL_LOG_SOURCES: frozenset[str] = frozenset({"dmesg", "journal"})
 
 #: Origins that a workload can influence -- the training log is a file the job
@@ -118,10 +119,18 @@ NODE_LOG_RULES = (
         "distributed training failure",
         ALL_LOG_SOURCES,
     ),
+    # EFA prints no "link down" / "fatal error" line; what means a dead device
+    # is its admin queue -- "Admin queue is closed", "Wait for completion
+    # (polling) timeout", "The device didn't send any completion ...", a failed
+    # reset handshake. The reviewed vocabulary, quoted from Linux
+    # v6.1.188/v6.12.103 and amzn-drivers r3.4.0, lives in
+    # ``gpu_fault.efa_kernel_log``; the kernel's spelling is fixed, so that part
+    # is case-sensitive. Other fabrics keep the keyword form: a line naming
+    # RDMA/InfiniBand with a fatal/error/timeout/link-down word.
     NodeLogRule(
         re.compile(
-            r"(?:\brdma\b|\binfiniband\b|\bib_[a-z0-9_]+\b|"
-            r"(?:^|[\s\[])efa(?=[:\s])).{0,160}"
+            rf"(?-i:{EFA_FATAL_REGEX})|"
+            r"(?:\brdma\b|\binfiniband\b|\bib_[a-z0-9_]+\b).{0,160}"
             r"\b(?:fatal|error|timeout|(?:link|port)\s+down)\b",
             re.I,
         ),
@@ -129,6 +138,20 @@ NODE_LOG_RULES = (
         Severity.CRITICAL,
         RecoveryAction.QUARANTINE,
         "RDMA/EFA/InfiniBand failure",
+        KERNEL_LOG_SOURCES,
+    ),
+    # The EFA driver reporting the device or firmware misbehaving, or the
+    # device failing to probe (unexpected completion ids, EQ/CQ anomalies,
+    # version/BAR/MSI-X failures): the device is still answering, so this is
+    # read-only fabric diagnostics (FREEZE_EVIDENCE -> VALIDATE_FABRIC), not
+    # isolation. Per-command failures the device answered ("Failed to create
+    # qp [-12]") are a job's resource problem and match nothing here.
+    NodeLogRule(
+        re.compile(EFA_DEGRADED_REGEX),
+        LogHealthCategory.RDMA,
+        Severity.WARNING,
+        RecoveryAction.RUN_DIAGNOSTICS,
+        "RDMA/EFA device degraded (kernel driver reports a failing device or probe)",
         KERNEL_LOG_SOURCES,
     ),
     NodeLogRule(

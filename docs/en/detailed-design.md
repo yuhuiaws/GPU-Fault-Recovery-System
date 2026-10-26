@@ -1152,6 +1152,25 @@ A single node log message can match several rules at once. The policy first pick
 then picks the stronger action by the global RecoveryAction rank; on a complete tie it keeps the more specific rule that appears earlier in the rule table. Therefore a single line containing both OOM text and an EFA fatal is ultimately ruled an RDMA
 critical quarantine, not the memory warning that matched first.
 
+The RDMA log rules grade what the EFA driver really prints; the vocabulary and its quotes live in `efa_kernel_log.py`
+(Linux v6.1.188 / v6.12.103 `drivers/infiniband/hw/efa/` `efa_com.c`, `efa_main.c`, `efa_com_cmd.c`, `efa_verbs.c`;
+amzn-drivers r3.4.0 `kernel/linux/efa/src`; the line prefix is `__ibdev_printk()` in `drivers/infiniband/core/device.c`,
+`"%s %s %s: %pV"`, i.e. `efa <PCI BDF> efa_N: `, a device not yet registered at probe time prints `(null): `,
+`dev_err(&pdev->dev)` prints `efa <PCI BDF>: `). The fatal vocabulary -- the admin queue no longer answers / is closed /
+the reset handshake failed: `Wait for completion (polling) timeout`, `The device didn't send any completion for admin cmd`,
+`The device sent a completion but the driver didn't receive any MSI-X interrupt`, `Admin queue is closed`, `Failed to submit
+command`, `Failed to process command` only with `err -110`, `Reading register timed out`, `Device isn't ready, abort com init` /
+`can't reset device`, `Reset indication didn't turn on|off` -- keeps CRITICAL/`QUARANTINE` (`SITE_KERNEL_LOG`); the degraded
+vocabulary -- unexpected or checksum-failed completions, EQ/CQ anomalies, unknown events, version / DMA width / MSI-X / BAR / irq
+probe failures, probe-time attribute queries -- is graded WARNING/`RUN_DIAGNOSTICS` by a second RDMA rule (`SITE_APPLICATION_LOG`:
+FREEZE_EVIDENCE → VALIDATE_FABRIC → ESCALATE_SUPPORT, no isolation); the register / unregister / irq information lines and a
+single command the device answered with an error (`Failed to create qp [-12]`, `Failed to process command … err -12|-22`,
+`efa_com_comp_status_to_errno()`) match no rule. EFA has no link-down wording (`efa_query_port()` always reports
+`IB_PORT_ACTIVE`); the port state belongs to the `rdma_link_down` metric rule; `efa` is no longer a keyword trigger, and
+`rdma|infiniband|ib_*` + `fatal|error|timeout|link/port down` serves other fabrics only. Both RDMA rules are `KERNEL_LOG_SOURCES`;
+the node-side `matching_log_rules` decides from the same vocabulary which lines are shipped, so a vocabulary change ships with
+the control plane, the executor and the node runtime together. The quotes are pinned by `tests/test_efa_kernel_log.py`.
+
 #### 2.4.4 Training Health `training_health.py`
 
 Each rank heartbeat contains step, throughput, loss, numerical error and checkpoint. Detects:

@@ -41,7 +41,9 @@ def rig(tmp_path, monkeypatch):
     [
         "mce: uncorrectable hardware error",
         "remounting filesystem read-only",
-        "efa: fatal error",
+        # ``efa_com_submit_admin_cmd()``: every admin command fails once the
+        # queue is closed (gpu_fault.efa_kernel_log).
+        "efa 0000:00:1d.0 efa_0: Admin queue is closed",
         "kernel panic",
     ],
     ids=["mce", "storage", "rdma", "lockup"],
@@ -57,6 +59,29 @@ def test_fatal_host_log_stops_the_owned_attempt_before_quarantine(rig, message):
     assert (
         rig.store.get_incident(workflow.incident_id).state is IncidentState.QUARANTINED
     )
+
+
+def test_degraded_efa_log_runs_read_only_fabric_diagnostics(rig):
+    # ``efa_com_handle_single_admin_completion()``: the device answered with a
+    # command id the driver never issued. The driver keeps running, so the
+    # product looks at the fabric and hands the evidence over, nothing more.
+    result = rig.log(
+        "efa 0000:00:1d.0 efa_0: Received completion with unexpected command "
+        "id[7], sq producer: 12, sq consumer: 11, cq consumer: 11"
+    )
+    [finding] = result["findings"]
+    assert finding["category"] == "RDMA", finding
+    assert finding["recommended_action"] == "RUN_DIAGNOSTICS", finding
+    [workflow_id] = result["workflow_request_ids"]
+    workflow = rig.store.get_workflow(workflow_id)
+    operations = [step.operation for step in workflow.official_steps]
+    assert operations[0] is Op.FREEZE_EVIDENCE, operations
+    assert Op.VALIDATE_FABRIC in operations, operations
+    assert not {Op.MARK_UNSCHEDULABLE, Op.QUARANTINE, Op.STOP_WORKLOADS} & set(
+        operations
+    ), operations
+    assert rig.core.node["spec"]["unschedulable"] is False, rig.core.node
+    assert rig.boundary.running is True, "the attempt keeps running"
 
 
 @pytest.mark.parametrize("source", ["journal", "training-log"])
