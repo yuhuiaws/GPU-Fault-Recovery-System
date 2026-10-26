@@ -87,8 +87,10 @@ from scripts.e2e.regional.general_live_verdicts import (
     ChainExpectation,
     chain_errors,
     chain_judgeable,
+    collector_delivery,
     finding_incidents,
     hardware_errors,
+    latest_samples,
     parse_time,
     samples,
     settled,
@@ -358,24 +360,116 @@ def _activity(
     )
 
 
+def baseline_readings(
+    activity: dict[str, Any], metric: str, mount: str
+) -> list[dict[str, Any]]:
+    """The product's accepted readings of ``metric`` for ``mount`` inside the read.
+
+    Evidence batch samples first, then the latest-wins record when it moved
+    inside the window (``latest_samples``). A mount that appears *healthy* is
+    no edge for the host collector (``_edge_reasons``: a threshold crossing, a
+    collection error, the collector's own first tick, a cleared reason), so its
+    first readings travel with the next health summary -- a batch
+    ``app/ingest/telemetry.py`` by design never writes as raw evidence (no
+    finding, no collection error). What that batch does move is the
+    ``metric_latest`` record of every ``LATEST_METRICS_REQUIRED`` sample, both
+    shared metrics among them: in a quiet window it is the product's only
+    per-mount witness. Live 2026-10-26, both lanes, every 005 variant: the
+    export was mounted and read healthy, the summaries moved those records, and
+    an evidence-only read called the export "not discovered".
+    """
+
+    evidence = [
+        {**item, "record": "evidence"}
+        for item in samples(activity, metric, device=mount)
+    ]
+    latest = [
+        {**item, "record": "metric_latest"}
+        for item in latest_samples(activity, metric, device=mount)
+    ]
+    return evidence + latest
+
+
+def _baseline_view(activity: dict[str, Any], mount: str) -> dict[str, Any]:
+    """What the store showed while the baseline was awaited: the host
+    collector's delivery inside the read, the mounts its shared latest records
+    name, and the readings of ``mount`` itself."""
+
+    return {
+        "since": activity.get("since"),
+        "host_delivery": collector_delivery(
+            activity, "HOST_TELEMETRY", batch_prefix="host-"
+        ),
+        "evidence_batches": len(activity.get("batches") or []),
+        "shared_latest": [
+            {key: item.get(key) for key in ("name", "device", "value", "observed_at")}
+            for item in activity.get("metric_latest") or []
+            if item.get("name") in {UNAVAILABLE, USED}
+        ],
+        "mount_readings": {
+            metric: [
+                item.get("value") for item in baseline_readings(activity, metric, mount)
+            ]
+            for metric in (UNAVAILABLE, USED)
+        },
+    }
+
+
+def _baseline_shortfall(seen: dict[str, Any], mount: str) -> str:
+    """One clause on why the baseline read came up empty: a silent collector,
+    a mount read but never healthy, or a mount the collector does not list."""
+
+    delivery = seen.get("host_delivery")
+    if delivery is None:
+        return (
+            "the host collector delivered no batch since the mount (no HOST_TELEMETRY "
+            "host- status inside the read): the collector, not the mount, is silent"
+        )
+    readings = seen.get("mount_readings") or {}
+    if readings.get(UNAVAILABLE) or readings.get(USED):
+        return (
+            f"{mount} was read but never healthy: {UNAVAILABLE}="
+            f"{readings.get(UNAVAILABLE)} {USED}={readings.get(USED)}"
+        )
+    devices = sorted(
+        {str(item.get("device")) for item in seen.get("shared_latest") or []}
+    )
+    return (
+        "the test export was not discovered as a shared mount (the host collector "
+        f"delivered until {delivery.get('last_success_at')}; its shared latest "
+        f"records name {devices if devices else 'no mount'})"
+    )
+
+
 def await_baseline(
     ctx: VariantContext, node: str, mount: str, since: datetime
 ) -> dict[str, Any]:
     """The product discovered the test export: a 0 reading and a used % sample.
 
-    The collector delivers an unchanged normal reading once per health summary,
-    so one delivered sample (the mount's first appearance is an edge) is the
-    baseline; the spec's three normal samples would cost three summaries.
+    One accepted reading is the baseline (the spec's three normal samples would
+    cost three health summaries). It is read from evidence batches *and* the
+    latest-metric records (``baseline_readings``): a healthy new mount reaches
+    the store only inside a health summary, which is never raw evidence, so the
+    budget is one summary period plus margin. When it runs out the error says
+    what the store did show -- whether the host collector delivered at all since
+    ``since``, which mounts its shared latest records name -- so a mount the
+    collector truly does not list (a sandbox view, a filtered root) is told
+    apart from a quiet window; the last read is saved as
+    ``baseline-<node>-last-read.json``.
     """
+
+    seen: dict[str, Any] = {}
 
     def accept() -> dict[str, Any] | None:
         current = _activity(ctx, node, since, mount=mount)
+        seen.clear()
+        seen.update(_baseline_view(current, mount))
         zero = [
             item
-            for item in samples(current, UNAVAILABLE, device=mount)
+            for item in baseline_readings(current, UNAVAILABLE, mount)
             if item.get("value") == 0
         ]
-        used = samples(current, USED, device=mount)
+        used = baseline_readings(current, USED, mount)
         return current if zero and used else None
 
     value = ctx.wait_until(
@@ -385,9 +479,10 @@ def await_baseline(
         name=f"baseline-{node}",
     )
     if value is None:
+        ctx.evidence.write(f"baseline-{node}-last-read", seen)
         raise VariantInconclusive(
             f"the product never delivered a healthy {UNAVAILABLE}/{USED} reading "
-            f"for {mount} on {node}: the test export was not discovered as a shared mount"
+            f"for {mount} on {node}: {_baseline_shortfall(seen, mount)}"
         )
     return value
 
@@ -638,7 +733,7 @@ def export_sources(activity: dict[str, Any], mount: str) -> set[str]:
 
     return {
         str(sample["labels"]["source"])
-        for sample in samples(activity, UNAVAILABLE, device=mount)
+        for sample in baseline_readings(activity, UNAVAILABLE, mount)
         if isinstance(sample.get("labels"), dict) and sample["labels"].get("source")
     }
 

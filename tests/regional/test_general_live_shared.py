@@ -16,6 +16,7 @@ from __future__ import annotations
 import dataclasses
 import itertools
 import json
+from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -554,11 +555,152 @@ def test_stat_timeout_is_inconclusive_when_the_pause_does_not_hang(
     assert servers_by_suffix()["a"].paused is False, "resumed on the way out"
 
 
+def store_view(
+    document: dict[str, Any],
+    *,
+    delivered_minutes: float | None = 1.0,
+    latest: Iterable[tuple[str, str, float, dict[str, str] | None]] = (),
+) -> dict[str, Any]:
+    """``document`` as the probe prints it when it also lists the host collector's
+    status row and the latest-metric records: ``since`` just before the read,
+    one ``host-`` HOST_TELEMETRY status delivered at ``delivered_minutes`` (None:
+    no delivery), ``latest`` as ``(name, device, value, labels)`` observed after
+    ``since``."""
+
+    # Before the fakes' fixed incident ``created_at`` (``minted_in_read``) and
+    # before every timestamp ``at`` yields.
+    view = {**document, "since": "2026-10-24T00:00:00+00:00"}
+    view["collector_statuses"] = (
+        []
+        if delivered_minutes is None
+        else [
+            {
+                "collector": "HOST_TELEMETRY",
+                "batch_id": f"host-{NODE}-{int(delivered_minutes * 60)}",
+                "node_id": NODE,
+                "last_success_at": at(delivered_minutes),
+                "observed_at": at(delivered_minutes),
+                "sample_count": 40,
+                "errors": [],
+            }
+        ]
+    )
+    view["metric_latest"] = [
+        {
+            "name": name,
+            "device": device,
+            "value": value,
+            "observed_at": at(2),
+            "labels": dict(labels or {}),
+        }
+        for name, device, value, labels in latest
+    ]
+    return view
+
+
+def test_a_summary_only_baseline_is_read_from_the_latest_metric_records(
+    tmp_path: Path,
+) -> None:
+    """Live 2026-10-26, both lanes: the mounted export read healthy, but a healthy
+    new mount is no edge for the host collector, so its readings travelled with
+    the health summary -- never raw evidence, only the latest-metric records
+    (``LATEST_METRICS_REQUIRED``). The baseline is read from those too."""
+
+    ctx = context("stat_timeout", tmp_path, activity=None)
+    mount = shared.mount_path(ctx, shared.PRIMARY)
+    document = hang_activity(mount, source="10.0.46.250:/a")
+    first = document["batches"].pop(0)
+    assert {item["name"] for item in first["samples"]} == {
+        shared.UNAVAILABLE,
+        shared.USED,
+    }
+    identity = {"source": "10.0.46.250:/a", "fstype": "nfs4"}
+    ctx.regional.cpu_python_responder = store_script(
+        {
+            "activity": store_view(
+                document,
+                latest=[
+                    (shared.UNAVAILABLE, mount, 0.0, identity),
+                    (shared.USED, mount, 0.0, identity),
+                ],
+            )
+        }
+    )
+    result = SPECS["stat_timeout"].execute(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    baseline = json.loads((ctx.case_dir / "baseline-shared.json").read_text())
+    readings = shared.baseline_readings(baseline, shared.UNAVAILABLE, mount)
+    # The scripted document is static, so the later fault and recovery batches
+    # show as evidence too; the healthy reading that made the baseline is the
+    # latest record (no evidence batch carries a healthy used % any more).
+    assert any(
+        item["record"] == "metric_latest" and item["value"] == 0 for item in readings
+    ), readings
+    assert [
+        item["record"]
+        for item in shared.baseline_readings(baseline, shared.USED, mount)
+    ] == ["evidence", "metric_latest"], "batch 9's recovery reading and the record"
+    assert shared.export_sources(baseline, mount) == {"10.0.46.250:/a"}, (
+        "the failure-domain identity is read from the latest record's labels too"
+    )
+    timeline = json.loads((ctx.case_dir / f"baseline-{NODE}-timeline.json").read_text())
+    assert timeline["entries"][-1]["accepted"] is True, timeline
+
+
 def test_the_export_must_be_discovered_before_any_injection(tmp_path: Path) -> None:
-    ctx = context("stat_timeout", tmp_path, activity=quiet_activity("/elsewhere"))
-    with pytest.raises(VariantInconclusive, match="not discovered"):
+    """A delivering collector whose shared records name another mount only: the
+    export is not discovered, and the error says which mounts the product does
+    list; the last read is saved."""
+
+    ctx = context("stat_timeout", tmp_path, activity=None)
+    ctx.regional.cpu_python_responder = store_script(
+        {
+            "activity": store_view(
+                quiet_activity("/elsewhere"),
+                latest=[
+                    (shared.UNAVAILABLE, "/elsewhere", 0.0, None),
+                    (shared.USED, "/elsewhere", 3.0, None),
+                ],
+            )
+        }
+    )
+    with pytest.raises(VariantInconclusive, match="not discovered") as caught:
         SPECS["stat_timeout"].execute(ctx)
+    message = str(caught.value)
+    assert "['/elsewhere']" in message and f"delivered until {at(1)}" in message, (
+        message
+    )
     assert servers_by_suffix()["a"].calls == ["create", "wait_ready"], "never paused"
+    last = json.loads((ctx.case_dir / f"baseline-{NODE}-last-read.json").read_text())
+    assert [item["device"] for item in last["shared_latest"]] == ["/elsewhere"] * 2
+    assert last["host_delivery"]["batch_id"].startswith("host-"), last
+
+
+def test_a_silent_host_collector_is_named_instead_of_the_mount(tmp_path: Path) -> None:
+    ctx = context("stat_timeout", tmp_path, activity=None)
+    ctx.regional.cpu_python_responder = store_script(
+        {"activity": store_view(quiet_activity("/elsewhere"), delivered_minutes=None)}
+    )
+    with pytest.raises(VariantInconclusive, match="delivered no batch since the mount"):
+        SPECS["stat_timeout"].execute(ctx)
+
+
+def test_a_mount_read_unhealthy_from_the_start_is_not_a_discovery(
+    tmp_path: Path,
+) -> None:
+    ctx = context("stat_timeout", tmp_path, activity=None)
+    mount = shared.mount_path(ctx, shared.PRIMARY)
+    ctx.regional.cpu_python_responder = store_script(
+        {
+            "activity": store_view(
+                quiet_activity("/elsewhere"),
+                latest=[(shared.UNAVAILABLE, mount, 1.0, {"failure_mode": "IO_ERROR"})],
+            )
+        }
+    )
+    with pytest.raises(VariantInconclusive, match="read but never healthy") as caught:
+        SPECS["stat_timeout"].execute(ctx)
+    assert f"{shared.UNAVAILABLE}=[1.0]" in str(caught.value), str(caught.value)
 
 
 def test_an_unbounded_export_capacity_is_a_fixture_problem(tmp_path: Path) -> None:

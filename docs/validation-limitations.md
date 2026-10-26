@@ -1700,6 +1700,28 @@ reason into `export-<suffix>.json` (`export_failure`, `log`), and the error carr
 the FSAL/EXPORT/CONFIG CRIT/MAJ lines logged within eight lines before the marker
 (`preceded by: ...`), never the DBUS start-up noise.
 
+The third live run (both lanes' `stat_timeout`, then every 005 variant) mounted
+the export and read it healthy, yet ended INCONCLUSIVE with `the product never
+delivered a healthy ... reading ...: the test export was not discovered as a
+shared mount`. The cause was the verdict's read, not the product: `await_baseline`
+took the baseline from stored raw batches only, while a newly appearing healthy
+shared mount is no edge for the host collector (`_edge_reasons` knows threshold
+crossings, collection errors, the collector's own first tick and a cleared
+reason), so its first readings travel with the next health summary -- a batch
+`app/ingest/telemetry.py` by design never writes as raw evidence (only the
+`health-summary` reason, no finding, no collection error). What that batch does
+move is the `metric_latest` record of every `LATEST_METRICS_REQUIRED` sample, both
+shared metrics among them: in a quiet window the product's only per-mount
+witness. The fix reads the baseline from evidence batch samples plus the latest
+records that moved inside the window (`baseline_readings`, the rule 002's
+`memory_used_percent` baseline already follows), reads the `shared_failure_domain`
+`source` label from them too, and keeps the budget at one summary period plus
+margin. On timeout the error now tells three cases apart and saves the last read
+as `baseline-<node>-last-read.json`: no `host-` HOST_TELEMETRY delivery inside the
+read (a silent collector), a mount read but never healthy (its readings listed),
+or a delivering collector whose shared latest records name other mounts only --
+the real "not discovered", the evidence of a sandbox view or a filtered root.
+
 004 `probe_error` has its faulting mount: the storage probe's loop +
 device-mapper device carrying FAT16 (`dm-create --fstype vfat`). `dm-retarget
 --target error` unmounts it, swaps its table to a three-segment one whose FAT

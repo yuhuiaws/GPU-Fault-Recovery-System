@@ -340,6 +340,19 @@ directory`：NFS-Ganesha 的 FSAL_VFS 通过 glibc 的 `MOUNTED`（`/etc/mtab`�
 `statvfs` 为 256 MiB、root 写入落为 65534:65534，而未修正的 Pod 仍答 `reason given by server: No such file or
 directory`。`wait_ready` 失败时把服务端日志尾部与原因写入 `export-<suffix>.json`（`export_failure`、`log`），
 错误行在标记行之后附带其前 8 行内的 FSAL/EXPORT/CONFIG CRIT/MAJ 行（`preceded by: ...`），DBUS 启动噪音不计。
+第三次实况（两条车道的 `stat_timeout`，随后每个 005 变体）export 已挂载且读数健康，却全部 INCONCLUSIVE：
+`the product never delivered a healthy ... reading ...: the test export was not discovered as a shared mount`。
+原因在判定侧而非产品：`await_baseline` 只从**已存储的原始 batch** 读基线，而一个新出现且健康的共享挂载
+对 host collector 不是边沿（`_edge_reasons` 只认阈值越界、采集错误、collector 自身首个 tick、已激活原因
+的消失），其首批读数随下一次 health summary 送达，而 `app/ingest/telemetry.py` 按设计不把只带
+`health-summary` 原因、无 finding、无采集错误的 batch 写成原始证据；该 batch 会更新的是每个
+`LATEST_METRICS_REQUIRED` 样本的 `metric_latest` 记录（两项共享指标都在其中）——安静窗口里这是产品
+对该挂载唯一的逐样本见证。修正：基线读数 = 证据 batch 样本 + 窗口内移动过的 latest 记录
+（`baseline_readings`，与 002 的 `memory_used_percent` 基线同一规则），`shared_failure_domain` 的
+`source` 标签也从 latest 记录读取；预算仍为一个 summary 周期加余量。超时时错误分三种并把最后一次读到的
+内容存为 `baseline-<node>-last-read.json`：窗口内 host collector 没有任何 `host-` 送达（collector 沉默）、
+挂载被读到但从未健康（列出读数）、或 collector 送达了而其共享 latest 记录命名的挂载里没有测试 export
+（列出它命名的挂载，这才是"未被发现"——沙箱视图或根目录过滤的产品缺口证据）。
 计划/执行形如：
 
 ```bash
