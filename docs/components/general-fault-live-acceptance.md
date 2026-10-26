@@ -786,6 +786,13 @@ XID 92 在 420 s 内无任何决策记录，夹具侧（每运行独立 kmsg 序
 判定按产品的事件 id 认采集不完整 incident：`inc-gpu-<错误串首批 batch>-dcgm-fields`
 （GPU finding 以 `gpu-<finding id>` 进入节点健康链路），id 中不含指标名
 `dcgm_field_completeness`。
+`nan_negative` 的"不得变成健康零"按时间锚判定：产品 `gpu_metric_latest` 一行是该槽位
+**最近被接受**的样本，锚为 arm 后首个带产品拒绝记录（`invalid or ambiguous GPU
+observation: <gpu>/<field>`，或 NaN 槽位被读成该 GPU 缺失的必需字段）的批次时间；两个
+目标槽位的 latest 必须早于该锚（保留回放前的真实读数、不被改写），期间没有被接受的样本，
+也不得出现负值。早于锚的保留零是 PASS 并记入 notes，而不是"NaN 变成了健康零"
+（2026-10-26 现场该变体即因把保留的真实零当作转换而误判 FAIL）。NaN 字段
+（`row_remap_failure`）须经 survey 确认目标 GPU 真实上报，否则 CAPABILITY_ABSENT。
 
 ### GF-GENERAL-LIVE-026
 

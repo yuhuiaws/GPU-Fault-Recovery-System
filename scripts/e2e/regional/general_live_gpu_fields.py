@@ -14,14 +14,16 @@ completeness check:
   omission is not reported. Expected FAIL (product gap);
 * ``conflicting_alias`` -- two exporter aliases of one field with different
   values: both are rejected as an ambiguous slot, never silently overwritten;
-* ``nan_negative`` -- a negative value is rejected and a NaN is dropped: a slot
-  never becomes a healthy zero;
+* ``nan_negative`` -- a negative value is rejected and a NaN is dropped: neither
+  slot's latest accepted sample moves past the first replayed scrape (the
+  earlier real reading is retained; it never becomes a healthy zero);
 * ``duplicate_slot`` -- a duplicated ``(device, field)`` slot is rejected while
   other GPUs' independent samples stay usable.
 """
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from scripts.e2e.regional.general_live_fixture import VariantContext, VariantNotRun
@@ -47,6 +49,9 @@ from scripts.e2e.regional.general_live_gpu_verdicts import (
 
 CASE = "GF-GENERAL-LIVE-025"
 REQUIRED = "pcie_replay_total"
+#: The reviewed gauge the ``nan_negative`` NaN is served on: a required field
+#: of the product's per-GPU completeness check, so the dropped slot is reported.
+NAN_FIELD = "row_remap_failure"
 ALIAS_FIELD = "clock_throttle_reasons"
 ALIAS_NAME = "DCGM_FI_DEV_CLOCK_THROTTLE_REASONS"
 
@@ -177,9 +182,141 @@ def conflicting_alias(ctx: VariantContext) -> dict[str, Any]:
     return result(stages, extra={"gpu_uuid": gpu, "collection_errors": errors[:5]})
 
 
+def _when(text: Any) -> datetime | None:
+    """A product record's ``observed_at`` as an aware datetime (None: unreadable)."""
+
+    try:
+        value = datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+def _float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _nan_negative_target(survey) -> str:
+    """The highest-index GPU reporting both replayed fields.
+
+    The NaN field used to be taken on trust (S19 audit): a GPU whose exporter
+    does not report it has no slot to serve the NaN on, and the tool would
+    refuse to invent one.
+    """
+
+    gpus = [gpu for gpu in survey.gpus_with(REQUIRED) if survey.has(gpu, NAN_FIELD)]
+    if not gpus:
+        raise VariantNotRun(
+            "CAPABILITY_ABSENT",
+            f"no GPU on the node reports both {REQUIRED} and {NAN_FIELD}",
+        )
+    return gpus[-1]
+
+
+def _names_slot(text: str, gpu: str, name: str, *, single_gpu: bool) -> bool:
+    """Whether a collection error is about ``gpu``'s ``name`` slot.
+
+    The invalid-observation error names ``<gpu>/<field>``; a required field
+    only some GPUs lack is reported ``on <gpu>``, one no GPU reports in the
+    batch-wide message, which names no GPU (a one-GPU node).
+    """
+
+    return name in text and (gpu in text or single_gpu)
+
+
+def _first_replayed_at(
+    doc: dict[str, Any], gpu: str, names: tuple[str, ...], *, single_gpu: bool
+) -> datetime | None:
+    """When the product first processed a replayed scrape: the earliest batch
+    since the arm whose collection errors carry its rejection of one of the
+    replayed slots (the negative value, or the NaN slot read as missing)."""
+
+    times = [
+        at
+        for batch in doc.get("batches") or []
+        if any(
+            _names_slot(str(text), gpu, name, single_gpu=single_gpu)
+            for text in batch.get("collection_errors") or []
+            for name in names
+        )
+        and (at := _when(batch.get("observed_at"))) is not None
+    ]
+    return min(times) if times else None
+
+
+def _not_a_value(
+    doc: dict[str, Any],
+    name: str,
+    gpu: str,
+    *,
+    kind: str,
+    replayed_at: datetime | None,
+) -> tuple[list[str], str | None]:
+    """Errors if an invalid ``name`` reading became a value; else what was kept.
+
+    The product's latest row of a slot is its latest *accepted* sample, so a
+    row older than the first replayed scrape is the earlier real reading,
+    retained because the invalid one was dropped -- the live 2026-10-26 run
+    read that retained zero as "became a healthy zero". A row timestamped at
+    or after that scrape, an accepted batch sample inside the replay, or a
+    negative value anywhere is the conversion the variant forbids.
+    """
+
+    errors: list[str] = []
+    accepted = [
+        sample
+        for sample in accepted_samples(doc, name, gpu)
+        if replayed_at is not None
+        and (at := _when(sample.get("observed_at"))) is not None
+        and at >= replayed_at
+    ]
+    if accepted:
+        values = sorted({str(sample.get("value")) for sample in accepted})
+        errors.append(
+            f"a {kind} {name} reading was accepted as a sample while it was "
+            f"served: values {values}"
+        )
+    latest = latest_value(doc, name, gpu)
+    if latest is None:
+        return errors, f"{gpu}/{name} has no latest accepted sample"
+    value = _float(latest.get("value"))
+    at = _when(latest.get("observed_at"))
+    if value is not None and value < 0:
+        errors.append(
+            f"a negative {name} reading is the latest accepted value: {value}"
+        )
+    elif replayed_at is None:
+        errors.append(
+            f"{name} latest value {value} cannot be judged: no batch since the arm "
+            "carries the product's rejection of a replayed reading"
+        )
+    elif at is None:
+        errors.append(
+            f"{name} latest value {value} carries no readable observed_at: "
+            f"{latest.get('observed_at')!r}"
+        )
+    elif at >= replayed_at:
+        errors.append(
+            f"a {kind} {name} reading became the latest accepted value {value} at "
+            f"{at.isoformat()}, not before the first replayed scrape at "
+            f"{replayed_at.isoformat()}"
+        )
+    else:
+        return errors, (
+            f"{gpu}/{name} kept its earlier accepted value {value} from "
+            f"{at.isoformat()}, before the first replayed scrape at "
+            f"{replayed_at.isoformat()}; the {kind} reading was dropped"
+        )
+    return errors, None
+
+
 def nan_negative(ctx: VariantContext) -> dict[str, Any]:
     survey = run_gpu_survey(ctx)
-    gpu = survey.target(REQUIRED)
+    gpu = _nan_negative_target(survey)
+    single_gpu = len(survey.gpus) == 1
     since = utc_now()
     repl = DcgmReplay(
         ctx,
@@ -189,32 +326,51 @@ def nan_negative(ctx: VariantContext) -> dict[str, Any]:
             step(
                 40,
                 {"op": "negative", "field": REQUIRED, "gpus": [gpu]},
-                {"op": "nan", "field": "row_remap_failure", "gpus": [gpu]},
+                {"op": "nan", "field": NAN_FIELD, "gpus": [gpu]},
                 hold=True,
             ),
         ),
         _hold(ctx),
     )
-    arm_and_confirm(repl)
+    arm_and_confirm(repl, f"{gpu}/{REQUIRED}", f"{gpu}/{NAN_FIELD}")
     _settle(ctx, survey)
-    doc = _state(ctx, since, REQUIRED, "row_remap_failure")
+    doc = _state(ctx, since, REQUIRED, NAN_FIELD)
     errors = collection_errors(doc)
-    negative_latest = latest_value(doc, REQUIRED, gpu)
-    nan_latest = latest_value(doc, "row_remap_failure", gpu)
+    replayed_at = _first_replayed_at(
+        doc, gpu, (REQUIRED, NAN_FIELD), single_gpu=single_gpu
+    )
+    negative_errors, negative_note = _not_a_value(
+        doc, REQUIRED, gpu, kind="negative", replayed_at=replayed_at
+    )
+    nan_errors, nan_note = _not_a_value(
+        doc, NAN_FIELD, gpu, kind="NaN", replayed_at=replayed_at
+    )
     stages = {
         "negative_rejected": []
         if any(gpu in text and REQUIRED in text for text in errors)
         else ["a negative counter was not reported as an invalid observation"],
-        "no_healthy_zero": [],
-    }
-    if negative_latest is not None and float(negative_latest.get("value", -1)) >= 0:
-        stages["no_healthy_zero"].append(
-            "a negative reading became a non-negative value"
+        "nan_dropped": []
+        if any(
+            _names_slot(text, gpu, NAN_FIELD, single_gpu=single_gpu) for text in errors
         )
-    if nan_latest is not None and float(nan_latest.get("value", 1)) == 0:
-        stages["no_healthy_zero"].append("a NaN reading became a healthy zero")
-    recover_counter(ctx, repl, since, names=[REQUIRED])
-    return result(stages, extra={"gpu_uuid": gpu, "collection_errors": errors[:5]})
+        else [f"a NaN {NAN_FIELD} was not reported as a missing field of {gpu}"],
+        "no_healthy_zero": [*negative_errors, *nan_errors],
+    }
+    recover_counter(ctx, repl, since, names=[REQUIRED, NAN_FIELD])
+    return result(
+        stages,
+        notes=[note for note in (negative_note, nan_note) if note],
+        extra={
+            "gpu_uuid": gpu,
+            "collection_errors": errors[:5],
+            "first_replayed_batch_at": (
+                replayed_at.isoformat() if replayed_at is not None else None
+            ),
+            "latest": {
+                name: latest_value(doc, name, gpu) for name in (REQUIRED, NAN_FIELD)
+            },
+        },
+    )
 
 
 def duplicate_slot(ctx: VariantContext) -> dict[str, Any]:
@@ -288,7 +444,8 @@ VARIANTS = [
         CASE,
         "nan_negative",
         "serve a negative value and a NaN",
-        "a negative value is rejected and a NaN is dropped; neither becomes a healthy zero",
+        "a negative value is rejected and a NaN is dropped; neither becomes a value: "
+        "both slots keep their earlier accepted sample from before the replayed scrape",
         nan_negative,
         max_minutes=14,
     ),
