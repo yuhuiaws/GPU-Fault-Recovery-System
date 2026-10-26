@@ -733,7 +733,45 @@ reason 注明本例自身注入），并以有界新读数证明：incident RECO
 （`tests/regional/test_general_live_gpu_memory.py`，录制替身）。（3）`plan.json` 期望文案同步：
 containment first → SAFETY_SETTLED、incident QUARANTINED、操作员已通知、回放结束后由 validated
 restore 回收。运行器收尾"关闭本例 ESCALATED incident"一步只列 ESCALATED 的记录，两种出口之后都
-无事可做。`volatile_dbe`（CRITICAL QUARANTINE）仍走 validated restore，pending 系列不变。
+无事可做。`volatile_dbe`（CRITICAL QUARANTINE）仍走 validated restore；pending 系列见下段。
+
+`pending_supported`/`post_reset` 改为有界计划并全按记录判定（S36，2026-10-26；两者都是
+`GPU_RESET` 下的 X 变体，从未现场运行）。原计划把 `row_remap_pending=1` 保持 120 读
+（`until_advance`）并经探针 advance/close——`post_reset` 在 RESET_GPU SUCCEEDED 之后，而 HyperPod
+上这正是 quiesce 窗口（QUIESCE_GPU_SERVICES 停掉 kubelet 直到 RESTORE_GPU_SERVICES，探针 Pod 一起
+失联；plain EKS 只打 `gpu-fault.io/quiesce` taint，探针 Pod 容忍）。按产品与现场 journal 定界发现
+"一个窗口的读数"也不够：quiesce 在两种节点上都会停掉 `gpu-fault-metrics-collector` 本身和 exporter
+容器（`node_agent/common.py` `DEFAULT_QUIESCE_SERVICES`/`DEFAULT_QUIESCE_CONTAINERS`），而字段回放
+工具只计它真正服务过的 scrape（`tools/gpu_dcgm_field_replay.py` `make_server`：上游取数失败只记
+error、`reads` 不前进），所以 quiesce 时尚未消耗的故障读会被端给 RESTORE_GPU_SERVICES 之后的第一次
+scrape——正是 reset 后 VALIDATE_GPU 判定的那一批（`adapters/gpu_validation.py`：RESET_GPU 之后的
+新鲜 GPU 指标，再看该 GPU 的活动 finding，pending 标志无宽限），随后 `escalation.next_rung` 把 reset
+后失败的校验升为 RESTART_NODE。eksb 2026-10-26 07:48Z（024 `wrong_scope_source`，held 计划）的
+journal：第 4 读端出故障对，15 s 后的下一次 scrape 已 "Connection refused"——exporter 在铸造后约
+10 s 内消失。产品在首次回放 scrape 后约 4 s 判定（`gpu_memory_policy.memory_decision`：标志一次
+>0 读数即铸造，无增量/确认/持续要求；下一次被接受的 0 读数即清除）。因此标志只端给铸造它的那一次
+scrape（`pending_fault_reads`：15 s 采集器为 1，绝不多留一读——晚到的备读就是升级，采集器没能做的
+scrape 不是计划丢失的读），计划不再 hold，collector 停掉前工具已回到设备的真实读数。两变体部署、arm
+后以 journal 或（探针已被 quiesce 带走时）产品记录为 gate（`wait_served_or_records`），等 incident、
+再等记录**结束**（health summary 外加 `RESET_SETTLE_SECONDS` 600 s；现场链 2 min 6 s，RESTART_NODE
+升级 12 min），之后才经重启感知的 close 关回放，从不 advance。判定全在记录上：`pending_supported`
+证策略与已执行的链（QUIESCE_GPU_SERVICES、VERIFY_NO_GPU_CLIENTS、RESET_GPU、RESTORE_GPU_SERVICES、
+VALIDATE_GPU 均 SUCCEEDED，RESET_GPU 已执行，incident RECOVERED，该 incident 的任何工作流不得计划
+RESET_ALL_GPUS_NVSWITCHES/RESTART_NODE/REPLACE_NODE，节点上无其他硬件步骤）；`post_reset` 再加 reset
+后状态（`post_reset_errors`：恰一次 SUCCEEDED 的 RESET_GPU，VALIDATE_GPU SUCCEEDED 且不早于 reset
+完成，该 incident 只有一条工作流——后继工作流就是梯子的下一级、即本变体排除的盲目重启循环）；两者
+都要求链结束后无活动的 `row_remap_pending` finding（`recovered_errors`）。019 其余计划同样按自身
+读数定界（`fault_reads`：所需等待加两读；诊断计数器按检测预算，`volatile_dbe`/`remap_failure` 按
+检测加 `CONTAINMENT_SECONDS`；`remap_failure` 本就不计划 reset——CRITICAL DRAIN 无 quiesce，故障
+端满 containment 等待是因为行重映射失败不会自行清除，回放仍在出口前结束），每个 019 回放都记录
+节点 boot id 供 close 判重启。同一结论也适用于 024 `wrong_scope_source` 的三读窗口：第二、三读落在
+exporter 消失之后，会被端给 reset 后的 scrape，留给其所属车道处理。测试见
+`tests/regional/test_general_live_gpu_memory_reset.py`（装入计划经字段工具驱动：3 读透传、1 读标志、之后
+逐字节为 exporter 自身 scrape 且拒绝 advance；模拟 kubelet 失联下的记录 gate、settle 等待、close 与
+不 advance；RESTART_NODE 后继记录在 incident 最终 RECOVERED 时仍每个阶段判错；finding 仍活动；两次
+reset 或校验早于 reset；记录在 settle 上限仍未结束；单读界所依据的产品事实——`GpuMetricsService.
+ingest` 的铸造与清除、quiesce 服务/容器清单、readiness barrier、`next_rung`、工具服务端对失效上游
+不消耗读）与 `tests/regional/test_general_live_gpu_memory.py`（019 无任何 hold 步骤）。
 
 ### GF-GENERAL-LIVE-020
 

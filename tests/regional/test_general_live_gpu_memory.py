@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 from typing import Any
@@ -9,7 +10,12 @@ from typing import Any
 import pytest
 
 from scripts.e2e.regional import general_live_gpu_memory as mem
-from tests.regional._general_live_fakes import FakeRegional, make_context, make_settings
+from tests.regional._general_live_fakes import (
+    FakeProbe,
+    FakeRegional,
+    make_context,
+    make_settings,
+)
 from tests.regional._general_live_gpu_fakes import (
     audit_records,
     dcgm_probe,
@@ -190,36 +196,99 @@ def test_volatile_dbe_fails_if_a_reset_appears(
     assert out["verdict"] == "FAIL" and any("RESET_GPU" in e for e in out["errors"])
 
 
-def test_pending_supported_requires_a_reset_chain(tmp_path: Path) -> None:
-    spec = SPECS["pending_supported"]
-    assert spec.approvals == ("GPU_RESET",) and spec.flags == "X" and spec.risk == "H"
+def _installed_plan(probe: FakeProbe) -> dict[str, Any]:
+    """The field plan the controller installed on the node (``install-source``)."""
+
+    for call in probe.calls:
+        if (
+            call[0] == "install-source"
+            and call[call.index("--name") + 1] == "plan.json"
+        ):
+            return json.loads(base64.b64decode(call[call.index("--b64") + 1]))
+    raise AssertionError("no plan.json was installed")
+
+
+def test_no_019_plan_holds_a_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every fault is bounded by its own read count, sized from the wait that
+    needs it; nothing waits for the runner to advance or close it."""
+
+    plans: dict[str, dict[str, Any]] = {}
+    # corrected_ecc: the detection wait (health summary 300 + 240) at 15 s.
     incident = gpu_incident(
-        "inc-pend", f"b-{GPU}-row_remap_pending", action="RESET_GPU", workflow="wf-r"
+        "inc-ecc", f"b-{GPU}-ecc_sbe_volatile_total", state="RECOVERED"
     )
     workflow = gpu_workflow(
-        "wf-r",
-        "inc-pend",
-        [
-            "QUIESCE_GPU_SERVICES",
-            "VERIFY_NO_GPU_CLIENTS",
-            "RESET_GPU",
-            "RESTORE_GPU_SERVICES",
-            "VALIDATE_GPU",
+        "wf-1",
+        "inc-ecc",
+        ["FREEZE_EVIDENCE", "VALIDATE_GPU"],
+        status="FAILED",
+        executions=[
+            {
+                "operation": "VALIDATE_GPU",
+                "status": "FAILED",
+                "details": {"host_diagnostic_failure": True},
+            }
         ],
-        status="RUNNING",
     )
-    activity = _activity([incident], [workflow])
-    settings = make_settings(spec, node="ip-10-0-43-5.us-west-2.compute.internal")
-    object.__setattr__(settings, "approvals", ("GPU_RESET",))
+    activity = {**_activity([incident], [workflow]), "batches": [{"observed_at": "t"}]}
+    probe = dcgm_probe(audit=audit_records({f"{GPU}/ecc_sbe_volatile_total": 1.0}))
     ctx = _ctx(
-        tmp_path,
-        "pending_supported",
-        probe=dcgm_probe(audit=audit_records({f"{GPU}/row_remap_pending": 1.0})),
-        cpu=gpu_cpu_python(activity=activity),
-        settings=settings,
+        tmp_path / "ecc",
+        "corrected_ecc",
+        probe=probe,
+        cpu=gpu_cpu_python(
+            activity=activity,
+            gpu_state={"active_findings": [], "batches": [{"observed_at": "t"}]},
+        ),
     )
-    out = mem.pending_supported(ctx)
-    assert out["verdict"] == "PASS", out["errors"]
+    assert mem.corrected_ecc(ctx)["verdict"] == "PASS"
+    plans["corrected_ecc"] = _installed_plan(probe)
+    # volatile_dbe: detection plus the containment's execution time.
+    dbe = gpu_incident(
+        "inc-dbe",
+        f"b-{GPU}-ecc_dbe_volatile_total",
+        state="QUARANTINED",
+        action="QUARANTINE",
+        workflow="wf-q",
+    )
+    contained = gpu_workflow(
+        "wf-q",
+        "inc-dbe",
+        ["FREEZE_EVIDENCE", "MARK_UNSCHEDULABLE", "QUARANTINE"],
+        status="BLOCKED",
+        executions=_succeeded("FREEZE_EVIDENCE", "MARK_UNSCHEDULABLE", "QUARANTINE"),
+    )
+    monkeypatch.setattr(mem, "_validated_restore", lambda ctx, incidents: [])
+    probe = dcgm_probe(audit=audit_records({f"{GPU}/ecc_dbe_volatile_total": 1.0}))
+    ctx = _ctx(
+        tmp_path / "dbe",
+        "volatile_dbe",
+        probe=probe,
+        cpu=gpu_cpu_python(activity=_activity([dbe], [contained])),
+    )
+    assert mem.volatile_dbe(ctx)["verdict"] == "PASS"
+    plans["volatile_dbe"] = _installed_plan(probe)
+    # remap_failure: the same containment wait; no reset to outlast.
+    ctx, _product = _remap_ctx(tmp_path / "remap", monkeypatch)
+    assert mem.remap_failure(ctx)["verdict"] == "PASS"
+    plans["remap_failure"] = _installed_plan(ctx.probes[f"dcgm@{NODE}"])
+
+    expected_reads = {"corrected_ecc": 38, "volatile_dbe": 50, "remap_failure": 50}
+    for variant, document in plans.items():
+        assert "until_advance" not in json.dumps(document), variant
+        baseline, fault = document["steps"]
+        assert baseline == {"reads": 3, "ops": []}, variant
+        assert fault["reads"] == expected_reads[variant], (variant, fault)
+        assert len(fault["ops"]) == 1, variant
+    assert plans["volatile_dbe"]["steps"][1]["ops"][0]["op"] == "add"
+    assert plans["remap_failure"]["steps"][1]["ops"][0] == {
+        "op": "set",
+        "field": "row_remap_failure",
+        "gpus": [GPU],
+        "value": 1,
+    }
 
 
 def test_pending_rejects_a_non_modern_gpu(tmp_path: Path) -> None:

@@ -3590,6 +3590,73 @@ probe (`post_reset` after RESET_GPU SUCCEEDED, while kubelet is still down on
 HyperPod), so they carry the same exposure there and are to be bounded the same
 way before their next HyperPod run.
 
+019 `pending_supported` and `post_reset` are now bounded and judged on the
+records (S36, 2026-10-26; both are X variants under `GPU_RESET` that have never
+run live). Their plan held `row_remap_pending=1` for 120 reads
+(`until_advance`) and advanced or closed it through the probe -- `post_reset`
+right after RESET_GPU SUCCEEDED, which on HyperPod is inside the quiesce window
+with kubelet and the probe Pod gone. Sizing the bound from the product and the
+live journals showed that a window of reads is not enough. The quiesce stops
+`gpu-fault-metrics-collector` itself and the exporter container on both
+providers (`node_agent/common.py` `DEFAULT_QUIESCE_SERVICES` /
+`DEFAULT_QUIESCE_CONTAINERS`), and the field tool counts only the scrapes it
+could serve (`tools/gpu_dcgm_field_replay.py` `make_server`: a failed upstream
+fetch is journaled as an error and `reads` does not advance), so every fault
+read the quiesce finds unconsumed is served to the first scrape after
+RESTORE_GPU_SERVICES -- the batch the post-reset VALIDATE_GPU grades
+(`adapters/gpu_validation.py`: fresh GPU metrics after the RESET_GPU readiness
+barrier, then the GPU's active findings, no grace for the pending flag) -- and
+`orchestration/escalation.next_rung` turns a validation that fails after a
+reset into RESTART_NODE. The eksb 2026-10-26 07:48Z replay journal (024
+`wrong_scope_source`, the held plan) shows read 4 serving the pair and
+"Connection refused" at the very next scrape 15 s later: the exporter was gone
+within ~10 s of the mint. The product grades the first replayed scrape within
+~4 s (`gpu_memory_policy.memory_decision`: the flag mints on one reading > 0 --
+no delta, confirmation or sustain -- and clears on the next accepted reading of
+0). So the flag is served for exactly the one scrape that mints it
+(`pending_fault_reads`: one at the 15-s collector, never a spare -- a spare
+that lands after the quiesce is the escalation, and a scrape the collector
+could not make is not a read the plan loses), the plan is never held, and the
+tool is back on the device's real reading before the collector stops. Both
+variants deploy, arm, gate on the journal or -- when the quiesce has already
+taken the probe -- on the product's records (`wait_served_or_records`), wait
+for the incident and then for the record to END (`RESET_SETTLE_SECONDS` 600 s
+beyond the health summary: the chain took 2 min 6 s live, its RESTART_NODE
+escalation 12 min), and only then close the replay through the reboot-aware
+close; nothing is advanced. The oracle is the records: `pending_supported`
+proves the policy and the executed chain (QUIESCE_GPU_SERVICES,
+VERIFY_NO_GPU_CLIENTS, RESET_GPU, RESTORE_GPU_SERVICES, VALIDATE_GPU
+SUCCEEDED; RESET_GPU executed; the incident RECOVERED; no workflow of the
+incident planning RESET_ALL_GPUS_NVSWITCHES / RESTART_NODE / REPLACE_NODE; no
+other hardware step on the node), `post_reset` the post-action state on top
+(`post_reset_errors`: exactly one SUCCEEDED RESET_GPU, VALIDATE_GPU SUCCEEDED
+and not before the reset completed, a single workflow for the incident -- a
+successor is the ladder's rung and the blind reboot loop the variant rules
+out), and both require no `row_remap_pending` finding active after the chain
+(`recovered_errors`). The other 019 plans are bounded by their own read counts
+too (`fault_reads`: the wait that needs the fault plus two reads -- the
+diagnostic counters for the detection wait, the isolating `volatile_dbe` /
+`remap_failure` for detection plus `CONTAINMENT_SECONDS`; `remap_failure`
+plans no reset at all: its CRITICAL DRAIN has no quiesce, the failure is
+served for the containment wait because a remap failure does not clear by
+itself, and the replay ends before the exit as before), and every 019 replay
+records the node's boot id for the close. The same reading applies to 024
+`wrong_scope_source`'s three-read window: its second and third fault reads
+fall after the exporter is gone and would be served to the post-reset scrape;
+that is left to its own lane. Tests:
+`tests/regional/test_general_live_gpu_memory_reset.py` (the installed plan driven
+through the field tool -- three pass-through reads, one read of the flag, then
+the exporter's own scrape byte for byte, `advance` refused; the records gate,
+settle wait, close and no advance across a simulated kubelet gap; the
+RESTART_NODE successor record failing every stage but recovery although the
+incident ends RECOVERED; a finding still active; two resets or a validation
+before the reset; a chain still running at the settle bound; the product facts
+the one-read bound rests on -- the flag's mint and clear through
+`GpuMetricsService.ingest`, the quiesce service and container lists, the
+readiness barrier, `next_rung`, and the tool's server refusing a dead upstream
+without consuming a read) and `tests/regional/test_general_live_gpu_memory.py`
+(no 019 plan holds a step).
+
 024 `independent_xid` FAILED live (2026-10-26 08:07Z, eks ip-10-0-43-5, R13g,
 harness live14) with two CORRECTABLE_MEMORY_DEGRADATION incidents for one held
 pair: `inc-gpu-dcgm-<node>-1793001279120143-GPU-053ab270-...-composite-CORRECTABLE_MEMORY_DEGRADATION`
