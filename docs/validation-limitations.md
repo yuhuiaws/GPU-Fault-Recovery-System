@@ -2079,6 +2079,40 @@ NOT_RUN(CAPABILITY_ABSENT) unless the optional `TEMP_TEST_PACKAGE_INSTALL` is
 given, which installs exactly `dosfstools` for the run before the device is
 built and removes it as the last LIFO cleanup after the device is destroyed.
 
+`healthy_other_mount` on HyperPod (2026-10-26 19:46-19:55Z, release
+37db33f254a1) failed `bounded_delivery` with the oracle that holds the export
+paused until the store shows a second host batch: none appeared in 495 s, read
+as "the collector's next scheduled delivery never arrived while the mount
+hung". That is not a collector stall but what the oracle counts. The API keeps
+a host batch as raw evidence only when it carries findings, collection errors
+or a reason other than `health-summary` (`app/ingest/telemetry.py`,
+`_persist_host_telemetry`), and `evaluate_metrics` emits a finding only on a
+health-signal claim transition, so a summary that re-reports an already
+claimed `shared_filesystem_unavailable=1` is never evidence and
+`list_raw_evidence` -- the activity probe's `batches` -- cannot count it; the
+run's own baseline read shows the rule (no batch since 19:41:04 while the
+HOST_TELEMETRY collector status and the latest-metric rows named the 19:46:12
+summary of 105 samples). The chronology is a ticking collector on a 15 s
+interval: this node's summaries fall on 19:41:15 / 19:46:15 / 19:51:15 /
+19:56:15 (`stable_phase_seconds` 75, jitter +-15 s); the detection edge went
+out at 19:46:43; the 19:51 summary moved only the collector status and the
+latest-metric rows; the `recovered` edge at 19:55:32 carried no
+`health-summary` reason (its phase had been served) and the collector status
+read 19:56:18 afterwards. A tick blocked until the 19:55:24 SIGCONT could not
+have been followed by a tick starting at 19:55:32. The collector side is
+pinned by `tests/collectors/test_host_hung_mount_summary_cadence.py`: every
+`os`/`io` path call under a hung mount is trapped and only the
+`gpu-fault-mount-probe` worker may park there (one worker for the whole hang);
+two health summaries go out under the hang with the neighbour and the
+configured filesystem still read, and a bare `stat` of the mount from the
+tick's thread fails the test by name. What proves a summary during a hang is
+the HOST_TELEMETRY collector status (`observed_at`, `batch_id`) or the
+latest-metric record of the hung mount's `shared_filesystem_unavailable`
+moving to a later `observed_at` at value 1 -- both latest-only, so the hold
+has to read them while the export is paused; raw-evidence `batches` can only
+ever hold the detection edge. Until the oracle reads those records,
+`healthy_other_mount` and `stat_timeout` fail on a right product.
+
 ## GF-GENERAL-LIVE 029 store-level restart-budget variants
 
 029 `concurrent_claim` and `missing_context` run no managed job. The harness

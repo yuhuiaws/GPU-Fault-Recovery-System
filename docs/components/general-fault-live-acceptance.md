@@ -425,6 +425,24 @@ batch id），或挂起挂载 `shared_filesystem_unavailable` / `memory_used_per
 FAIL，错误文本点名所读记录。测试：`tests/regional/test_general_live_shared_recovery.py` 以 HyperPod 时间线回放两个
 变体（status 前进、latest 行移动、或两者），把钉住的记录跑完预算，合并三种记录写法，在恢复时刻截断窗口，忽略
 `k8s-efa-` 与其他通道的 status，读取健康挂载的 latest 记录，并钉住该实况节点的相位网格。
+HyperPod 上的 `healthy_other_mount`（2026-10-26 19:46-19:55Z，发布 37db33f254a1）在“挂起保持到 store 出现第二个
+host batch”的判定下记 `bounded_delivery` FAIL：495 秒内没有第二个 batch，被读作“挂载挂起期间 collector 的下一次
+定时投递从未到达”。这不是 collector 停住，而是判定数错了对象：API 只在 host batch 带 finding、采集错误或
+`health-summary` 之外的理由时才把它存为原始证据（`app/ingest/telemetry.py` 的 `_persist_host_telemetry`），而
+`evaluate_metrics` 只在健康信号的 claim 发生转换时产出 finding，因此重复报告已 claim 的
+`shared_filesystem_unavailable=1` 的健康摘要从不是证据，活动探针的 `batches`（`list_raw_evidence`）数不到它；该次
+运行自己的基线读数即是例证（自 19:41:04 起无 batch，而 HOST_TELEMETRY 的 collector status 与 latest-metric 行都指向
+19:46:12 的 105 样本摘要）。时间线就是一个以 15 秒周期正常 tick 的 collector：该节点的摘要相位落在
+19:41:15 / 19:46:15 / 19:51:15 / 19:56:15（`stable_phase_seconds` 75，抖动 ±15 秒）；检测边沿 19:46:43 投递；
+19:51 的摘要只移动了 collector status 与 latest-metric 行；19:55:32 的 `recovered` 边沿不带 `health-summary`
+理由（该相位已被服务过），之后 collector status 读到 19:56:18。一个阻塞到 19:55:24 SIGCONT 才返回的 tick 不可能
+紧接着在 19:55:32 开始下一个 tick。collector 侧由 `tests/collectors/test_host_hung_mount_summary_cadence.py`
+钉住：拦截挂起挂载下的每个 `os`/`io` 路径调用，只允许 `gpu-fault-mount-probe` 工作线程停在那里（整个挂起只占
+一个线程），两个摘要周期内摘要照常投递、相邻挂载与配置文件系统照常读出，而 tick 线程对该挂载点的一次裸 `stat`
+会让测试点名失败。能证明挂起期间摘要到达的记录是 HOST_TELEMETRY 的 collector status（`observed_at`、`batch_id`）
+或该挂载 `shared_filesystem_unavailable` 的 latest-metric 记录以值 1 移到更晚的 `observed_at`——两者都只保留
+最新值，必须在 export 仍挂起时读取；原始证据 `batches` 永远只会有检测边沿那一个。判定改读这些记录之前，
+`healthy_other_mount` 与 `stat_timeout` 会在正确的产品上 FAIL。
 计划/执行形如：
 
 ```bash
