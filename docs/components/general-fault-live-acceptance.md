@@ -403,6 +403,28 @@ collector 耗尽预算即 FAIL 该阶段。其二 `cleanup did not prove the nod
 `await_clear`/`await_used_recovery` 除两条新鲜证据读数外，也接受一条 `since` 之后观测到的读数（证据 batch 的，或
 每条被接受的 batch——含 summary——都会移动的 latest 记录的）加上 `since` 之后清除的 health signal，时钟偏差抢在
 盖戳之前的 tick 由下一次 summary 证明。
+同日 HyperPod 的 `healthy_other_mount`（19:46-19:55Z，发布 37db33f254a1）与 plain EKS 的 `stat_timeout`（15:30Z）
+又在上述保持判定下 FAIL：`bounded_delivery: only 1 host batch(es) were accepted after the injection ... the
+collector's next scheduled delivery never arrived while the mount hung`，495 秒耗尽——产品是对的，collector 一直在
+tick（产品侧审计为 b200 车道的 host collector 挂起挂载摘要节拍测试，落地前在其分支上），错在判定数的对象：它数原始证据
+batch（`list_raw_evidence`），而重复报告已 claim 的 `shared_filesystem_unavailable=1` 的 health summary 从来不是
+证据（`_persist_host_telemetry` 只在 batch 带 finding、采集错误或 `health-summary` 之外的理由时才存证据，
+`evaluate_metrics` 只在 claim 转换时产出 finding）。该节点的摘要落在 `host-telemetry` 通道的稳定相位网格上
+（`stable_phase_seconds` 为 75 秒：19:41:15 / 19:46:15 / 19:51:15 / 19:56:15，抖动 ±15 秒），19:51:17 的摘要只移动了
+HOST_TELEMETRY 的 collector status（`observed_at`、`batch_id`）与 latest-metric 行（挂起挂载的
+`shared_filesystem_unavailable=1` PROBE_TIMEOUT 读数换上新时间戳，`memory_used_percent` 亦然），`batches` 则停在
+19:46:43 的边沿直到恢复后 19:55:32 的 `recovered` 边沿。修正：`hold_hang_until_delivered`/`delivery_errors` 改用
+`deliveries` 计数——把 store 为一条已接受 batch 保留的三种记录按 batch 的 `observed_at` 合并（status 写作 `...Z`、
+latest 行写作 `...+00:00`，按时刻比较）：原始证据 batch、节点 HOST_TELEMETRY status 前进到暂停之后（只认 `host-`
+batch id），或挂起挂载 `shared_filesystem_unavailable` / `memory_used_percent` 的 latest 行移到暂停之后——要求两条且
+其中一条已知携带 `memory_used_percent`；后两种记录只保留最新值，必须在 export 仍暂停时读取，判定仍以挂起期间的最后
+一次读数为准，`until`（恢复时刻）之后的 status 不计；`other_still_reported` 同样接受健康挂载的 latest 0 记录。预算仍为
+`sustained_detection_budget(ctx, 0, summaries=1)`（站点 300 s / 15 s 下 495 s）：摘要落在相位网格上，暂停后的下一次
+摘要最多在 interval + 抖动 + tick（330 秒）之后到达，而非边沿后一个 interval；保持过程把所见投递与该节点算出的摘要
+网格（`summary_schedule`）写入 `hang-delivery-deliveries.json`，status 与 latest 行钉在边沿不动的 collector 仍耗尽预算
+FAIL，错误文本点名所读记录。测试：`tests/regional/test_general_live_shared_recovery.py` 以 HyperPod 时间线回放两个
+变体（status 前进、latest 行移动、或两者），把钉住的记录跑完预算，合并三种记录写法，在恢复时刻截断窗口，忽略
+`k8s-efa-` 与其他通道的 status，读取健康挂载的 latest 记录，并钉住该实况节点的相位网格。
 计划/执行形如：
 
 ```bash

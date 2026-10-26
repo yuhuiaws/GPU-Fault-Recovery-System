@@ -1947,6 +1947,61 @@ T+9 min with the latest record it moved: accepted; without the record the budget
 runs out) and drives five variants' `utc_now` so that the recovered edge at
 T+45 s is fresh only against a stamp taken before the undo.
 
+The hold's own count then failed a right product on HyperPod
+(`healthy_other_mount`, 2026-10-26 19:46-19:55Z, release 37db33f254a1) and on
+plain EKS (`stat_timeout`, 15:30Z): `bounded_delivery: only 1 host batch(es)
+were accepted after the injection ... the collector's next scheduled delivery
+never arrived while the mount hung` after the full 495 s. The collector was
+ticking -- the product-side audit is lane b200's hung-mount summary-cadence
+test of the host collector (on its branch until it lands: only the
+`gpu-fault-mount-probe` worker parks on the hung mount; two summaries go out
+under the hang) -- and the oracle counted the wrong record. It counted
+raw-evidence batches (`list_raw_evidence`), and the summary that re-reports an
+already claimed `shared_filesystem_unavailable=1` is never one:
+`app/ingest/telemetry.py` `_persist_host_telemetry` keeps a batch as evidence
+only with a finding, a collection error or a reason other than
+`health-summary`, and `evaluate_metrics` mints a finding only on a claim
+transition. The run's own records show it: the pause at 19:46:30Z, the
+`threshold:` edge batch at 19:46:43Z, then no batch until the `recovered` edge
+at 19:55:32Z after the 19:55:24Z SIGCONT, while the node's summaries fall on
+its stable phase grid (`stable_phase_seconds` of the `host-telemetry` channel,
+75 s on that node: 19:41:15 / 19:46:15 / 19:51:15 / 19:56:15, jitter +-15 s)
+and the 19:51:17Z summary moved the HOST_TELEMETRY collector status
+(`observed_at`, `batch_id`) and the latest-metric rows -- the hung mount's
+`shared_filesystem_unavailable=1` `PROBE_TIMEOUT` reading with a new stamp,
+`memory_used_percent` too -- as the baseline read before the pause had already
+shown (`batches=[]` since 19:41:04Z, status and latest rows at the 19:46:12Z
+summary of 105 samples). `hold_hang_until_delivered` and `delivery_errors` now
+count with `deliveries`: the records the store keeps of one accepted batch,
+folded by the batch's `observed_at` (the status spells it `...Z`, the latest
+rows `...+00:00`; the fold compares moments) -- a raw-evidence batch, the
+node's HOST_TELEMETRY status (`host-` batch ids only; the `k8s-efa-` producer
+shares the channel) advanced to a stamp after the pause, or the latest-metric
+row of the hung mount's `shared_filesystem_unavailable` / of
+`memory_used_percent` moved there -- and want two of them, `memory_used_percent`
+known to be carried by one (an evidence sample or a moved latest row). The two
+latest-only records witness a delivery only while it is the newest, so the hold
+reads them under the hang; the stages are graded on that last read, and a bound
+`until` (the resume) excludes a later status. `other_still_reported` likewise
+accepts the healthy mount's latest 0 record (`baseline_readings`). The budget
+stays `sustained_detection_budget(ctx, 0, summaries=1)` on the survey's
+summary/interval seconds (495 s on 300 s / 15 s): because the summaries sit on
+the phase grid, the next one is up to interval + jitter + tick (330 s) after the
+pause, not one interval after the edge; the hold writes the deliveries it saw
+and the node's computed grid (`summary_schedule`: channel, phase, jitter, the
+due phases inside the budget) as `hang-delivery-deliveries.json`, and a stalled
+collector -- status and rows pinned at the edge -- still runs the budget out and
+fails the stage, the error now naming the records read and the last batch they
+witness. Tests: `tests/regional/test_general_live_shared_recovery.py` replays
+the HyperPod chronology over both variants with the status advancing, the latest
+rows moving, or both (one hold poll with the edge alone, the second accepted,
+the resume after it), runs the pinned records out of the budget (25 polls, the
+same sentence plus the witness), folds the three record spellings, bounds the
+window at the resume, drops `k8s-efa-` and other channels' statuses, ignores
+latest rows in a document without `since`, reads the healthy mount's latest
+record, and pins the live node's phase grid (75 s; one due phase, 19:51:15,
+inside the budget after a 19:46:28 pause).
+
 004 `probe_error` has its faulting mount: the storage probe's loop +
 device-mapper device carrying FAT16 (`dm-create --fstype vfat`; the FAT region
 is read from the boot sector's BPB at build time, page-aligned inwards, and

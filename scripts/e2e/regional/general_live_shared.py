@@ -552,11 +552,16 @@ def diagnostic_chain(activity: dict[str, Any], metric: str, mount: str) -> list[
 def other_mount_errors(
     activity: dict[str, Any], other: str, since: datetime
 ) -> list[str]:
-    """The healthy second export stayed reported as available."""
+    """The healthy second export stayed reported as available.
+
+    An evidence batch's 0 reading of ``other`` or its latest-metric record moved
+    to a stamp at or after ``since``: the summary under the hang carries the
+    healthy mount but is no raw evidence (``baseline_readings``).
+    """
 
     fresh = [
         item
-        for item in samples(activity, UNAVAILABLE, device=other)
+        for item in baseline_readings(activity, UNAVAILABLE, other)
         if item.get("value") == 0
         and (moment := parse_time(item.get("observed_at"))) is not None
         and moment >= since
@@ -565,7 +570,8 @@ def other_mount_errors(
         []
         if fresh
         else [
-            f"no {UNAVAILABLE}=0 reading for the healthy mount {other} after the hang"
+            f"no {UNAVAILABLE}=0 reading for the healthy mount {other} after the hang "
+            "(no evidence batch sample, no moved latest-metric record)"
         ]
     )
 
@@ -872,7 +878,7 @@ def stat_timeout(ctx: VariantContext) -> dict[str, Any]:
     _resume(ctx, server, "a")
     stages = {
         "chain": diagnostic_chain(held, UNAVAILABLE, mount),
-        "bounded_delivery": delivery_errors(held, started),
+        "bounded_delivery": delivery_errors(held, started, mount=mount),
         "hardware": hardware_errors(held),
     }
     incidents = _incident_ids(held, UNAVAILABLE, mount)
@@ -1113,7 +1119,7 @@ def healthy_other_mount(ctx: VariantContext) -> dict[str, Any]:
             held, ChainExpectation(metric=UNAVAILABLE, device=other, present=False)
         ),
         "other_still_reported": other_mount_errors(held, other, started),
-        "bounded_delivery": delivery_errors(held, started),
+        "bounded_delivery": delivery_errors(held, started, mount=mount),
         "hardware": hardware_errors(held),
     }
     incidents = _incident_ids(held, UNAVAILABLE, mount)
