@@ -2879,6 +2879,30 @@ XID 32 (`--approve DCGM_XID_GAUGE`); 019 `remap_failure` needs
 `GPU_FIELD_DIAGNOSTIC`; 019 `pending_unsupported` (no legacy GPU) and
 `observe_profile` (no OBSERVE reset profile) are `CAPABILITY_ABSENT`.
 
+019 `remap_failure`'s recovery stage is the operator exit, not a validated
+restore (live 2026-10-26, plain EKS ip-10-0-43-5, release R13g): the product
+detected the replayed `row_remap_failure`, ran FREEZE_EVIDENCE,
+MARK_UNSCHEDULABLE, QUARANTINE, COLLECT_DIAGNOSTIC_BUNDLE, VALIDATE_GPU and
+ESCALATE_SUPPORT, parked the record BLOCKED/NEEDS_OPERATOR and left the
+incident ESCALATED with the node cordoned -- exactly the documented RMA-class
+drain (no RESTORE_SCHEDULING, an operator closes it once the RMA is done) --
+and the fixture's validated-restore script was refused ("workflow still owns
+recovery; operator hold retained"), which failed the variant although every
+product stage was right. The variant now performs that exit itself: it waits
+for the incident's workflow to settle, closes the incident from inside the
+CPU Pod through `IncidentClosureService.close_incident` (the same call
+`gpu-fault-admin workflow-reconcile --close-incident` makes, with the node's
+isolation evidence, operator `acceptance-fixture`, the run id as reference and
+a reason naming the case's own injection), and proves it on fresh, bounded
+reads: incident RECOVERED, the owning workflow no longer open, no ownership
+annotation, quarantine taint or cordon left on the node; a refusal, an
+incident that did not settle ESCALATED, or any residue is the stage's error
+and nothing is retried (`tests/regional/test_general_live_gpu_memory.py`, over
+recorded fakes). The runner's post-case close of ESCALATED incidents lists
+only what is still ESCALATED, so it has nothing to do after the variant.
+What the proof does not cover: the close is the product's record exit; it
+does not show that an RMA happened, and the replay never damaged memory.
+
 The two variants that need a trusted independent kernel XID beside a held
 DCGM fault (020 `independent_fatal_event`, 024 `independent_xid`) reuse lane
 K's kmsg-mode kernel-source replay through

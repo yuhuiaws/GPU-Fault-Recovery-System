@@ -597,6 +597,25 @@ pending仅支持架构和授权Profile才走service-window reset；OBSERVE/未�
 执行reset的变体须有无GPU客户端证明、实际命令回执、动作后新pending/recovery状态及
 GPU/Fabric验证。remap failure的现场诊断/RMA审查不得直接算硬件已更换。清理夹具并人工验卡。
 
+`remap_failure` 的恢复阶段是**操作员出口**，不是 validated restore（2026-10-26 现场，
+plain EKS ip-10-0-43-5，R13g）：RMA 级 DRAIN 链按设计没有 RESTORE_SCHEDULING，
+ESCALATE_SUPPORT 之后记录停在 BLOCKED/NEEDS_OPERATOR、incident 为 ESCALATED，节点保持
+cordon + 隔离 taint 等操作员关闭；夹具的 validated restore 脚本对这种被操作员持有的记录
+以 "workflow still owns recovery; operator hold retained" 拒绝——产品拒绝得对，restore 是
+错误的出口。变体现在自己扮演操作员：先等 incident 的工作流静止（无活动工作流、无未结
+远程命令，`wait_incident_idle`，有界等待并记录所见状态；静止时不是 ESCALATED 即判错），
+再在 CPU Pod 内经 `IncidentClosureService.close_incident` 关闭——与
+`gpu-fault-admin workflow-reconcile --close-incident` 同一调用——附带夹具从 GPU
+kubeconfig 读到的节点隔离证据（CLI 证据遍所交付的同一形状），operator 为
+`acceptance-fixture`，reference 为本次 run id，reason 注明 "escalation left by the
+case's own fault injection (by design)"；拒绝（409 同义的 refusal）直接判该阶段失败、
+不盲目重试。最后以新读数证明出口：incident RECOVERED、原工作流不再 open（产品的
+`workflow_is_open` 规则：SUPERSEDED 或非占用的 BLOCKED）、节点无 `gpu-fault.io/` 归属注解、
+无隔离 taint、不 cordon（有界轮询，任何残留逐项点名判错）。`plan.json` 的期望文案同步写明
+由变体自行关闭；运行器收尾"关闭本例 ESCALATED incident"一步只列 ESCALATED 的记录，变体
+已关闭时无事可做，保持幂等。`volatile_dbe`（CRITICAL QUARANTINE）仍走 validated restore，
+pending 系列不变。
+
 ### GF-GENERAL-LIVE-020
 
 必测：`crc`、`replay`、`recovery_counter`、`multiple_gpus`、

@@ -11,10 +11,12 @@ hand.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any
 
+from gpu_fault.models import BlockedKind, WorkflowStatus, workflow_is_open
+from scripts.e2e.regional.drill_incident_cleanup import isolation_evidence
 from scripts.e2e.regional.general_live_fixture import (
     HOST_UNIT,
     VariantContext,
@@ -33,13 +35,28 @@ from scripts.e2e.regional.general_live_verdicts import (
     settled,
 )
 from scripts.e2e.regional.regional_commands import RegionalFixtureError
-from scripts.e2e.regional.warm_spare_fixture import WarmSpareLiveFixture
+from scripts.e2e.regional.warm_spare_fixture import (
+    WORKFLOW_BY_ID,
+    WarmSpareLiveFixture,
+)
 
 ORACLE_POLL_SECONDS = 15
 STORE_POLL_SECONDS = 20
 #: Ingest, dispatch and the +-5 % health-summary jitter on top of a budget's
 #: cadence terms (the margin 003 high_page_cache settled on live, 2026-10-25).
 CHAIN_MARGIN_SECONDS = 180
+#: The operator identity the fixture signs its incident closes with; the same
+#: one its validated restores carry (``CREATE_RESTORE_WORKFLOW``).
+OPERATOR_EXIT_OPERATOR = "acceptance-fixture"
+#: How long an escalation's workflow may still take to settle after detection
+#: (the ESCALATE_SUPPORT step and the record's BLOCKED/NEEDS_OPERATOR parking),
+#: and how long two consecutive quiet reads must be apart to call it settled.
+OPERATOR_EXIT_SETTLE_SECONDS = 300
+OPERATOR_EXIT_QUIET_SECONDS = 15
+#: How long the fresh reads after the close may take to show the exit: the
+#: closure service settles the BLOCKED record in the same call, or leaves it to
+#: the dispatcher's next sweep when its write was refused.
+OPERATOR_EXIT_PROOF_SECONDS = 180
 
 
 def sustained_detection_budget(
@@ -538,6 +555,194 @@ def restore_incidents(
     return results
 
 
+def node_residual_isolation(node: Mapping[str, Any]) -> dict[str, Any]:
+    """What of the product's isolation ``node`` (a ``node_snapshot``) still carries:
+    the ``gpu-fault.io/`` ownership annotations, its ``gpu-fault.io/`` taints and
+    the cordon. Empty on every count means the node is released."""
+
+    return {
+        "ownership_annotations": dict(node.get("ownership_annotations") or {}),
+        "taints": [
+            item
+            for item in node.get("taints") or []
+            if str(item.get("key") or "").startswith("gpu-fault.io/")
+        ],
+        "unschedulable": bool(node.get("unschedulable")),
+    }
+
+
+def workflow_open(workflow: Mapping[str, Any]) -> bool:
+    """Whether a workflow record (``WORKFLOW_BY_ID`` shape) still gates its node,
+    by the product's own rule (``models.workflow_is_open``): executable, or
+    BLOCKED with an occupying kind. A status the product does not name is not a
+    proven exit either."""
+
+    try:
+        status = WorkflowStatus(str(workflow.get("status")))
+        raw_kind = workflow.get("blocked_kind")
+        kind = BlockedKind(str(raw_kind)) if raw_kind not in (None, "") else None
+    except ValueError:
+        return True
+    return workflow_is_open(status, kind)
+
+
+def operator_exit_problems(
+    incident: Mapping[str, Any],
+    workflow: Mapping[str, Any] | None,
+    node: Mapping[str, Any],
+) -> list[str]:
+    """Why fresh reads do not yet show the operator exit of ``incident``.
+
+    Empty when the incident is RECOVERED, its owning workflow (``None`` when the
+    incident names none) is no longer open and ``node`` carries no residual
+    isolation; otherwise one line per failing read, naming the state, the
+    workflow's status/kind, or the annotation keys, taint keys and cordon left.
+    """
+
+    problems: list[str] = []
+    incident_id = str(incident.get("incident_id") or "")
+    state = str(incident.get("state") or "")
+    if state != "RECOVERED":
+        problems.append(
+            f"incident {incident_id} is {state or 'unknown'}, not RECOVERED"
+        )
+    if workflow is not None and workflow_open(workflow):
+        status = str(workflow.get("status") or "unknown")
+        kind = workflow.get("blocked_kind")
+        if kind:
+            status = f"{status}/{kind}"
+        problems.append(
+            f"workflow {workflow.get('request_id')} of {incident_id} is still open "
+            f"({status})"
+        )
+    residue = node_residual_isolation(node)
+    name = str(node.get("name") or "the node")
+    if residue["ownership_annotations"]:
+        keys = ", ".join(sorted(residue["ownership_annotations"]))
+        problems.append(f"{name} still carries the ownership annotations {keys}")
+    if residue["taints"]:
+        keys = ", ".join(sorted(str(item.get("key")) for item in residue["taints"]))
+        problems.append(f"{name} still carries the taints {keys}")
+    if residue["unschedulable"]:
+        problems.append(f"{name} is still cordoned (unschedulable)")
+    return problems
+
+
+def operator_close_incidents(
+    ctx: VariantContext,
+    incidents: Sequence[dict[str, Any]],
+    *,
+    reason: str,
+) -> list[dict[str, Any]]:
+    """The product's operator exit for each ESCALATED incident this variant caused.
+
+    An RMA-class DRAIN chain (``orchestration/families/health.py``) ends in
+    ESCALATE_SUPPORT with the node cordoned and tainted on purpose -- there is no
+    RESTORE_SCHEDULING, the record parks BLOCKED/NEEDS_OPERATOR and the incident
+    is ESCALATED, "the one state an operator may close by hand". The validated
+    restore is the wrong exit for it and the product refuses it ("workflow still
+    owns recovery; operator hold retained"; live 2026-10-26, 019 remap_failure on
+    gpu-eks-cluster). The documented exit is the operator's close, and this is
+    it, performed from inside the CPU Pod: once the incident's workflow has
+    settled (``WarmSpareLiveFixture.wait_incident_idle``), the incident is closed
+    through ``IncidentClosureService.close_incident`` -- the call
+    ``gpu-fault-admin workflow-reconcile --close-incident`` makes -- with the
+    node's isolation evidence the CLI's evidence pass would read, signed
+    ``OPERATOR_EXIT_OPERATOR`` with the run id as the reference. A refusal is the
+    service's own wording and is not retried. The exit is then proven on fresh
+    reads, within ``OPERATOR_EXIT_PROOF_SECONDS``: the incident RECOVERED, its
+    workflow no longer open, and no ownership annotation, quarantine taint or
+    cordon left on the node (``operator_exit_problems``); what is still there is
+    the error. An incident that is not ESCALATED when it settles was not left to
+    an operator, which is an error too, never something to restore around.
+    """
+
+    warm = WarmSpareLiveFixture(ctx.regional, ctx.settings.hyperpod_cluster)
+    node = ctx.settings.node
+    results: list[dict[str, Any]] = []
+    ordered = list(dict.fromkeys(str(item["incident_id"]) for item in incidents))
+    for index, incident_id in enumerate(ordered):
+        settled_incident = warm.wait_incident_idle(
+            incident_id,
+            timeout_seconds=OPERATOR_EXIT_SETTLE_SECONDS,
+            quiet_seconds=OPERATOR_EXIT_QUIET_SECONDS,
+        )
+        before = ctx.regional.node_snapshot(node)
+        workflow_id = str(settled_incident.get("workflow_request_id") or "")
+        entry: dict[str, Any] = {
+            "incident_id": incident_id,
+            "workflow_request_id": workflow_id or None,
+            "state_before": settled_incident.get("state"),
+            "node_before": node_residual_isolation(before),
+            "operator": OPERATOR_EXIT_OPERATOR,
+            "reference": ctx.run_id,
+        }
+        results.append(entry)
+        ctx.evidence.write("operator-exit", {"node": node, "results": results})
+        state = str(settled_incident.get("state") or "")
+        if state != "ESCALATED":
+            raise RegionalFixtureError(
+                f"incident {incident_id} settled {state or 'unknown'}, not "
+                "ESCALATED; the operator exit applies to an escalation left to an "
+                "operator"
+                + (" (nothing was left to close)" if state == "RECOVERED" else "")
+            )
+        outcome = warm.close_incident_with_evidence(
+            incident_id,
+            reason=reason,
+            operator=OPERATOR_EXIT_OPERATOR,
+            reference=ctx.run_id,
+            evidence=[isolation_evidence(node, before)],
+        )
+        entry["close"] = outcome
+        ctx.evidence.write("operator-exit", {"node": node, "results": results})
+        if outcome.get("refusal") or not outcome.get("closed"):
+            raise RegionalFixtureError(
+                f"operator close of {incident_id} was refused: "
+                f"{outcome.get('refusal') or 'the service closed nothing'}"
+            )
+        last: dict[str, Any] = {}
+
+        def proven() -> dict[str, Any] | None:
+            nonlocal last
+            fresh_incident = warm.incident_by_id(incident_id)
+            fresh_workflow = (
+                ctx.regional.cpu_python(WORKFLOW_BY_ID, workflow_id)
+                if workflow_id
+                else None
+            )
+            after = ctx.regional.node_snapshot(node)
+            problems = operator_exit_problems(fresh_incident, fresh_workflow, after)
+            last = {
+                "state_after": fresh_incident.get("state"),
+                "workflow_status_after": (
+                    fresh_workflow.get("status") if fresh_workflow else None
+                ),
+                "workflow_blocked_kind_after": (
+                    fresh_workflow.get("blocked_kind") if fresh_workflow else None
+                ),
+                "node_after": node_residual_isolation(after),
+                "problems": problems,
+            }
+            return last if not problems else None
+
+        proof = ctx.wait_until(
+            proven,
+            timeout_seconds=OPERATOR_EXIT_PROOF_SECONDS,
+            poll_seconds=STORE_POLL_SECONDS,
+            name=f"operator-exit-{index}",
+        )
+        entry.update(last)
+        ctx.evidence.write("operator-exit", {"node": node, "results": results})
+        if proof is None:
+            raise RegionalFixtureError(
+                f"the operator close of {incident_id} is not proven after "
+                f"{OPERATOR_EXIT_PROOF_SECONDS} s: "
+                + "; ".join(last.get("problems") or [])
+            )
+    return results
+
+
 def runtime_profile_version(ctx: VariantContext) -> str:
     """The Runtime Profile version the target node's Agent runs."""
 
@@ -570,14 +775,21 @@ def unsettled_workflows(activity_document: dict[str, Any]) -> list[str]:
 
 __all__ = [
     "CHAIN_MARGIN_SECONDS",
+    "OPERATOR_EXIT_OPERATOR",
+    "OPERATOR_EXIT_PROOF_SECONDS",
+    "OPERATOR_EXIT_QUIET_SECONDS",
+    "OPERATOR_EXIT_SETTLE_SECONDS",
     "Oracle",
     "activity",
     "await_metric_recovery",
     "await_oracle_crossing",
     "cadence_record",
     "close_window",
+    "node_residual_isolation",
     "open_incident_ids",
     "open_window",
+    "operator_close_incidents",
+    "operator_exit_problems",
     "restore_incidents",
     "run_survey",
     "runtime_profile_version",
@@ -586,4 +798,5 @@ __all__ = [
     "unsettled_workflows",
     "wait_for_incident",
     "wait_settled",
+    "workflow_open",
 ]

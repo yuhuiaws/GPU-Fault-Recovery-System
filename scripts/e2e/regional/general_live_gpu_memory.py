@@ -11,7 +11,12 @@ reads the product's own grading (``gpu_metrics`` -> ``gpu_memory_policy``):
   and read back through the product's validated restore;
 * ``remap_failure`` is CRITICAL DRAIN with the NVIDIA RMA field diagnostic and
   ESCALATE_SUPPORT -- the node stays cordoned until an operator closes it, and
-  a field diagnosis is never read as "hardware already replaced";
+  a field diagnosis is never read as "hardware already replaced". The variant
+  is that operator: it closes the ESCALATED incident through the product's
+  operator exit (``IncidentClosureService.close_incident``, the call
+  ``gpu-fault-admin workflow-reconcile --close-incident`` makes) and proves the
+  node released on fresh reads; a validated restore is refused for an
+  operator-held record and is not attempted (live 2026-10-26);
 * ``pending_supported`` / ``post_reset`` are the authorized service-window
   single-GPU reset (``row_remap_pending`` on a modern GPU); they hold the
   reading until RESET_GPU has run, then serve a clean reading so the post-reset
@@ -223,14 +228,23 @@ def remap_failure(ctx: VariantContext) -> dict[str, Any]:
     }
     replay.close()
     ctx.cleanup.discard("dcgm-replay")
-    stages["recovery"] = _validated_restore(ctx, incidents)
+    # An RMA-class drain has no RESTORE_SCHEDULING and ends ESCALATED with the
+    # node cordoned, for an operator to close once the RMA is done; the
+    # validated restore is refused for that record ("operator hold retained",
+    # live 2026-10-26). The variant performs and proves that operator exit.
+    stages["recovery"], exits = _operator_close(ctx, incidents)
     return result(
         stages,
         notes=[
             "row remap failure drains and runs the NVIDIA RMA field diagnostic; "
-            "the diagnosis is never read as hardware already replaced"
+            "the diagnosis is never read as hardware already replaced",
+            "the node stays cordoned until the escalation is closed; the variant "
+            "closes it through the product's operator exit "
+            "(IncidentClosureService.close_incident, as gpu-fault-admin "
+            "workflow-reconcile --close-incident does) and proves the release; "
+            "a validated restore is refused for the operator-held record",
         ],
-        extra={"gpu_uuid": gpu},
+        extra={"gpu_uuid": gpu, "operator_exit": exits},
     )
 
 
@@ -352,6 +366,32 @@ def _validated_restore(
     return []
 
 
+def _operator_close(
+    ctx: VariantContext, incidents: list[dict[str, Any]]
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """The operator exit as a recovery stage: ``(errors, per-incident records)``.
+
+    A refusal, an incident that was not left ESCALATED, or isolation left on
+    the node after the close is the stage's error; nothing is retried.
+    """
+
+    from scripts.e2e.regional.general_live_common import operator_close_incidents
+
+    try:
+        closed = operator_close_incidents(
+            ctx,
+            incidents,
+            reason=(
+                f"{ctx.spec.key} live acceptance: escalation left by the case's own "
+                "fault injection (by design); closed by the variant's operator-exit "
+                "stage"
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - recorded as the stage's error
+        return [f"operator close failed: {type(exc).__name__}: {exc}"], []
+    return [], closed
+
+
 VARIANTS = [
     gpu_spec(
         CASE,
@@ -411,7 +451,9 @@ VARIANTS = [
         CASE,
         "remap_failure",
         "set row_remap_failure=1 on a modern GPU",
-        "CRITICAL DRAIN with the RMA field diagnostic + ESCALATE_SUPPORT; cordoned until an operator closes, no reset",
+        "CRITICAL DRAIN with the RMA field diagnostic + ESCALATE_SUPPORT, no reset; "
+        "cordoned until the variant itself closes the escalation through the "
+        "product's operator exit and proves the node released",
         remap_failure,
         risk="M",
         max_minutes=30,
