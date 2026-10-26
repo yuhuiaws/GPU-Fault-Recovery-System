@@ -9,6 +9,8 @@ negative variants prove the trusted-source and current-boot gates.
 
 from __future__ import annotations
 
+import base64
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -240,6 +242,41 @@ def test_severe_reviewed_lines_are_graded_critical_quarantine_by_the_product(
         RecoveryAction.QUARANTINE,
         "SITE_KERNEL_LOG",
     ), variant
+
+
+def test_corrected_reviewed_line_is_graded_diagnostic_by_the_product() -> None:
+    assert _product_decision(mod.CORRECTED_MCE_MESSAGE) == (
+        Severity.WARNING,
+        RecoveryAction.RUN_DIAGNOSTICS,
+        "SITE_APPLICATION_LOG",
+    ), "the __print_mce header with UC clear is a corrected MCE"
+
+
+def test_corrected_mce_installs_the_kernel_header_line(tmp_path: Path) -> None:
+    activity = _activity(
+        incidents=[
+            _log_incident(
+                policy_source="SITE_APPLICATION_LOG",
+                action="RUN_DIAGNOSTICS",
+                state="ACTION_PENDING",
+            )
+        ],
+        workflows=[_log_workflow(["FREEZE_EVIDENCE", "VALIDATE_HOST"])],
+    )
+    regional = FakeRegional(
+        cpu_python=store_script({"activity": activity}),
+        node_snapshot=_isolated_node(False),
+    )
+    ctx, fake = _ctx("corrected_mce", regional=regional, tmp_path=tmp_path)
+    mod.corrected_mce(ctx)
+    install = next(call for call in fake.calls if call[0] == "install-records")
+    encoded = install[install.index("--b64") + 1]
+    [record] = json.loads(base64.b64decode(encoded))
+    assert record["message"] == mod.CORRECTED_MCE_MESSAGE, record
+    assert record["message"].startswith(
+        "mce: [Hardware Error]: CPU 1: Machine Check: 0 Bank 7: "
+    ), "the reviewed record is the kernel's __print_mce header, not a paraphrase"
+    assert record["transport"] == "kernel", record
 
 
 def test_corrected_mce_is_diagnostic_not_isolation(tmp_path: Path) -> None:

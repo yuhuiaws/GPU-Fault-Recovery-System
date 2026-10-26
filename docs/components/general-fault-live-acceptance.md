@@ -691,7 +691,10 @@ corrected MCE不因上下文丢失而升错级，uncorrectable不被邻近correc
 训练stdout同文案、旧boot不得隔离当前节点。
 同时间戳多cursor及collector重启验证不饿死后续日志。禁止制造kernel panic/真实MCE；
 清理夹具与日志路径后保留隔离归属，按真实健康证据人工接纳。
-受检行取内核真实打印格式（Linux v6.12）：`kernel_lockup` 回放
+受检行取内核真实打印格式（Linux v6.12）：`corrected_mce` 回放 `__print_mce()` 头行
+`mce: [Hardware Error]: CPU 1: Machine Check: 0 Bank 7: 8c00004000010090`（无 ` Exception`，
+IA32_MCi_STATUS.UC 清零），产品按状态位降级为 WARNING/RUN_DIAGNOSTICS，因此该变体要求部署含
+`mce_grading` 的发布——旧发布把同一头行当作 uncorrected 并隔离节点；`kernel_lockup` 回放
 `watchdog: BUG: soft lockup - CPU#7 stuck for 23s! [python3:41234]`（`kernel/watchdog.c`）；`rdma_fatal`
 回放 `efa 0000:00:1d.0 efa_0: Wait for completion (polling) timeout`（`drivers/infiniband/hw/efa/efa_com.c`，
 经 `__ibdev_printk` 的 `"%s %s %s: %pV"` 前缀）。journal 回放的合成 cursor 带 run id

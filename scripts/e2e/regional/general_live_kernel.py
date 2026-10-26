@@ -19,6 +19,14 @@ fault. The negative variants are the point of the trust gate: a user-space line
 The reviewed lines are what the kernel prints, so the product grades the real
 format and not a paraphrase (Linux v6.12 unless noted):
 
+* ``corrected_mce``: the ``__print_mce()`` header of a polled record,
+  ``arch/x86/kernel/cpu/mce/core.c`` ``pr_emerg(HW_ERR "CPU %d: Machine
+  Check%s: %Lx Bank %d: %016Lx\n", ...)`` with no " Exception" (MCG_STATUS.MCIP
+  clear) and an IA32_MCi_STATUS whose UC bit 61 is clear -- "the processor was
+  able to correct the error condition" (Intel SDM Vol. 3B 253669-093US
+  18.3.2.2). The product grades it by those bits (``gpu_fault.mce_grading``),
+  so this variant needs a release that carries that grading; an earlier
+  release reads the same header as an uncorrected MCE and quarantines.
 * ``kernel_lockup``: ``kernel/watchdog.c`` ``watchdog_timer_fn()``
   ``pr_emerg("BUG: soft lockup - CPU#%d stuck for %us! [%s:%d]\n", ...)`` under
   ``pr_fmt "watchdog: "``.
@@ -92,6 +100,12 @@ SEVERE_MESSAGES = {
     "rdma_fatal": "efa 0000:00:1d.0 efa_0: Wait for completion (polling) timeout",
     "kernel_lockup": "watchdog: BUG: soft lockup - CPU#7 stuck for 23s! [python3:41234]",
 }
+#: ``__print_mce()`` header of a corrected, polled record: "Machine Check:"
+#: (no " Exception") and IA32_MCi_STATUS 0x8c00004000010090 = VAL|MISCV|ADDRV
+#: with UC (bit 61) and PCC (bit 57) clear.
+CORRECTED_MCE_MESSAGE = (
+    "mce: [Hardware Error]: CPU 1: Machine Check: 0 Bank 7: 8c00004000010090"
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -238,11 +252,10 @@ def kernel_lockup(ctx: VariantContext) -> dict[str, Any]:
 def corrected_mce(ctx: VariantContext) -> dict[str, Any]:
     """A corrected MCE must be a diagnostic, never isolation."""
 
-    message = (
-        "mce: [Hardware Error]: Machine check events logged: corrected error CPU 1"
-    )
     started, _ = _drive(
-        ctx, _severe(message), restore_seconds=ctx.spec.max_minutes * 60
+        ctx,
+        _severe(CORRECTED_MCE_MESSAGE),
+        restore_seconds=ctx.spec.max_minutes * 60,
     )
     observed = _wait_log_incident(
         ctx,
@@ -441,7 +454,8 @@ VARIANTS = [
     ),
     _spec(
         "corrected_mce",
-        "reviewed kernel-transport MCE 'corrected error' line",
+        "reviewed kernel-transport __print_mce header 'CPU n: Machine Check: ... Bank b: <status>' "
+        "with IA32_MCi_STATUS.UC clear (needs a release with mce_grading)",
         "downgraded to WARNING RUN_DIAGNOSTICS; no quarantine, no isolation",
         corrected_mce,
         risk="L",
