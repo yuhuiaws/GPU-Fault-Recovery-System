@@ -7,14 +7,18 @@ three phases -- the replayed table, the healthy table after the replan, and
 after the window closes. The tests pin the reviewed tables, the QUARANTINE
 chain and its recovery/restore order, the sensor identity the ``critical``
 variant demands of the sample labels, the incident reasons and the marker,
-the zero-critical, UNKNOWN and NOT_SUPPORTED gradings, and the read-only
-capability record of ``unsupported_bmc``.
+the zero-critical, UNKNOWN and NOT_SUPPORTED gradings, the read-only
+capability record of ``unsupported_bmc``, and where the capability marker is
+read from: the accepted batches, or the product's latest record when no batch
+in the read carries it (live 2026-10-26 on both plain-EKS lanes).
 """
 
 from __future__ import annotations
 
 import base64
 import json
+from collections.abc import Callable
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +65,18 @@ def unsupported(reason: str) -> dict[str, Any]:
         "name": bmc.UNSUPPORTED,
         "device": None,
         "value": 1.0,
+        "labels": {"reason": reason},
+    }
+
+
+def latest(reason: str, observed_at: datetime) -> dict[str, Any]:
+    """The product's ``telemetry_metric_latest`` row of the marker, as the probe lists it."""
+
+    return {
+        "name": bmc.UNSUPPORTED,
+        "device": None,
+        "value": 1.0,
+        "observed_at": observed_at.isoformat(),
         "labels": {"reason": reason},
     }
 
@@ -131,16 +147,22 @@ def survey(ipmitool: bool = False) -> dict[str, Any]:
     }
 
 
+Phase = dict[str, Any] | Callable[[datetime], dict[str, Any]]
+
+
 class Scenario:
-    """Records during the replayed table, after the healthy replan, after close."""
+    """Records during the replayed table, after the healthy replan, after close.
+
+    A phase is the document itself, or a callable given the read's ``since``
+    (the activity probe's third argument) for records whose place relative to
+    the read matters -- the latest-record readers count only a record observed
+    inside the read, and a finding only when it was minted inside it.
+    """
 
     def __init__(
-        self,
-        during: dict[str, Any],
-        recovered: dict[str, Any] | None = None,
-        after: dict[str, Any] | None = None,
+        self, during: Phase, recovered: Phase | None = None, after: Phase | None = None
     ) -> None:
-        self.phases = {
+        self.phases: dict[str, Phase] = {
             "during": during,
             "recovered": during if recovered is None else recovered,
             "after": silent() if after is None else after,
@@ -149,8 +171,11 @@ class Scenario:
         self.plans = 0
         self.events: list[str] = []
 
-    def activity(self, _script: str, *_arguments: str) -> dict[str, Any]:
-        return self.phases[self.phase]
+    def activity(self, _script: str, *arguments: str) -> dict[str, Any]:
+        phase = self.phases[self.phase]
+        if callable(phase):
+            return phase(datetime.fromisoformat(arguments[2]))
+        return phase
 
     def install_source(self, arguments: tuple[str, ...]) -> dict[str, Any]:
         if "plan-ipmitool.json" in arguments:
@@ -601,6 +626,110 @@ def test_command_failure_fails_when_the_missing_device_stays_an_error(
     ), result["errors"]
 
 
+def with_since(since: datetime, document: dict[str, Any]) -> dict[str, Any]:
+    """A document the way the activity probe returns it: naming its read."""
+
+    return {
+        **document,
+        "since": since.isoformat(),
+        "cluster_id": "gpu-eks-cluster",
+        "node_id": NODE,
+    }
+
+
+def test_command_failure_reads_the_marker_from_the_latest_record_when_no_batch_has_it(
+    tmp_path: Path,
+) -> None:
+    """The live 2026-10-26 eks timeline: the one tick that carried NO_DEVICE was
+    stamped a few seconds before the read's ``since`` and nothing after it was
+    an edge, so the read held no batch; the product's latest record, moved by
+    that tick, says NO_DEVICE and is admitted from one collector interval back."""
+
+    def after_replan(since: datetime) -> dict[str, Any]:
+        return with_since(
+            since,
+            doc(metric_latest=[latest("NO_DEVICE", since - timedelta(seconds=9))]),
+        )
+
+    result, _source = run(
+        "command_failure", Scenario(doc(UNKNOWN_BATCH), after_replan), tmp_path
+    )
+    assert result["verdict"] == "PASS", result["errors"]
+    assert result["no_device_markers"] == [], "no accepted batch carried the marker"
+    witness = result["no_device_marker"]
+    assert witness["source"] == "metric_latest", witness
+    assert witness["latest"]["labels"] == {"reason": "NO_DEVICE"}
+    assert any(
+        note.startswith("the NO_DEVICE marker was read from metric_latest")
+        for note in result["notes"]
+    ), result["notes"]
+
+
+def test_command_failure_fails_on_a_stale_latest_record_or_another_reason(
+    tmp_path: Path,
+) -> None:
+    """A latest record older than one collector interval before the read is the
+    node's state before the replan, not the answer to it; a fresh record with
+    another reason is the wrong answer. Both name what the product has."""
+
+    def stale(since: datetime) -> dict[str, Any]:
+        return with_since(
+            since,
+            doc(metric_latest=[latest("NO_DEVICE", since - timedelta(seconds=16))]),
+        )
+
+    result, _source = run(
+        "command_failure", Scenario(doc(UNKNOWN_BATCH), stale), tmp_path
+    )
+    assert result["verdict"] == "FAIL"
+    (error,) = [e for e in result["errors"] if e.startswith("no_device_unsupported:")]
+    assert "none of the 0 accepted batches" in error and "no latest" in error, error
+
+    def wrong_reason(since: datetime) -> dict[str, Any]:
+        return with_since(
+            since,
+            doc(metric_latest=[latest("TOOL_MISSING", since + timedelta(seconds=30))]),
+        )
+
+    result, _source = run(
+        "command_failure", Scenario(doc(UNKNOWN_BATCH), wrong_reason), tmp_path / "b"
+    )
+    assert result["verdict"] == "FAIL"
+    (error,) = [e for e in result["errors"] if e.startswith("no_device_unsupported:")]
+    assert "reason='TOOL_MISSING'" in error, error
+    assert result["no_device_marker"]["source"] is None
+
+
+def test_command_failure_still_fails_on_a_finding_beside_a_latest_record_marker(
+    tmp_path: Path,
+) -> None:
+    """The latest record proves the marker, never the grading: an incident the
+    BMC metric minted inside the read fails the variant as before."""
+
+    def minted(since: datetime) -> dict[str, Any]:
+        inc = incident("inc-m", bmc.METRIC, state="QUARANTINED", workflow="wf-m")
+        inc["created_at"] = (since + timedelta(seconds=20)).isoformat()
+        inc["cluster_id"] = "gpu-eks-cluster"
+        return with_since(
+            since,
+            doc(
+                incidents=[inc],
+                workflows=[
+                    workflow("wf-m", "inc-m", ["FREEZE_EVIDENCE", "QUARANTINE"])
+                ],
+                metric_latest=[latest("NO_DEVICE", since + timedelta(seconds=10))],
+            ),
+        )
+
+    result, _source = run(
+        "command_failure", Scenario(doc(UNKNOWN_BATCH), minted), tmp_path
+    )
+    assert result["verdict"] == "FAIL"
+    stages = {error.split(":", 1)[0] for error in result["errors"]}
+    assert stages == {"no_device_no_finding"}, result["errors"]
+    assert result["no_device_marker"]["source"] == "metric_latest"
+
+
 # --------------------------------------------------------------------------- #
 # unsupported_bmc: the read-only capability record
 # --------------------------------------------------------------------------- #
@@ -616,6 +745,8 @@ def test_unsupported_bmc_records_the_product_capability_marker(tmp_path: Path) -
         "bmc_collection_errors": 0,
         "unsupported_reasons": ["TOOL_MISSING"],
         "batches": 1,
+        "marker_source": "evidence",
+        "latest_marker": None,
     }
     assert any("capability record" in note for note in result["notes"]), result["notes"]
     assert source.calls == [], "a read-only observation touches no source window"
@@ -631,6 +762,49 @@ def test_unsupported_bmc_records_the_product_capability_marker(tmp_path: Path) -
     assert result["capability"]["unsupported_reasons"] == ["NO_DEVICE"]
 
 
+def test_unsupported_bmc_reads_the_steady_marker_from_the_latest_record(
+    tmp_path: Path,
+) -> None:
+    """The live 2026-10-26 eksb timeline: zero batches in a whole summary period
+    (the steady marker is no edge and the summary is not evidence); the latest
+    record the summary moved inside the read is the capability record."""
+
+    def summary_only(since: datetime) -> dict[str, Any]:
+        return with_since(
+            since,
+            doc(metric_latest=[latest("TOOL_MISSING", since + timedelta(seconds=290))]),
+        )
+
+    result, _source = run("unsupported_bmc", Scenario(summary_only), tmp_path)
+    assert result["verdict"] == "PASS", result["errors"]
+    assert result["capability"]["batches"] == 0
+    assert result["capability"]["marker_source"] == "metric_latest"
+    assert result["capability"]["unsupported_reasons"] == ["TOOL_MISSING"]
+    assert result["capability"]["latest_marker"]["labels"] == {"reason": "TOOL_MISSING"}
+    assert any(
+        note.startswith("the marker was read from metric_latest")
+        for note in result["notes"]
+    ), result["notes"]
+
+
+def test_unsupported_bmc_fails_when_the_latest_record_predates_the_read(
+    tmp_path: Path,
+) -> None:
+    """A record from before the read is not this window's witness."""
+
+    def stale(since: datetime) -> dict[str, Any]:
+        return with_since(
+            since,
+            doc(metric_latest=[latest("TOOL_MISSING", since - timedelta(seconds=60))]),
+        )
+
+    result, _source = run("unsupported_bmc", Scenario(stale), tmp_path)
+    assert result["verdict"] == "FAIL"
+    (error,) = result["errors"]
+    assert error.startswith("capability_marker:") and "no latest" in error, error
+    assert result["capability"]["marker_source"] is None
+
+
 def test_unsupported_bmc_fails_without_the_marker_or_with_a_permanent_error(
     tmp_path: Path,
 ) -> None:
@@ -643,6 +817,7 @@ def test_unsupported_bmc_fails_without_the_marker_or_with_a_permanent_error(
         "capability_marker"
     ], result["errors"]
     assert "reason=TOOL_MISSING" in result["errors"][0]
+    assert "from nowhere" in " ".join(result["notes"]), result["notes"]
 
     wrong_reason = doc(batch(T1, unsupported("TOOL_MISSING")))
     result, _source = run(
@@ -674,7 +849,8 @@ def test_unsupported_bmc_blocks_on_a_real_bmc(tmp_path: Path) -> None:
 def test_unsupported_bmc_waits_one_summary_period_for_the_steady_marker(
     tmp_path: Path,
 ) -> None:
-    """The marker rides the routine health summary: no edge announces it."""
+    """The marker rides the routine health summary: no edge announces it, and
+    the latest record it moves is read within one summary period."""
 
     scenario = Scenario(doc(batch(T1, unsupported("TOOL_MISSING"))))
     spec = SPECS["unsupported_bmc"]

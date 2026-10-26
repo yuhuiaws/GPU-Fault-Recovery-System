@@ -2014,12 +2014,24 @@ expected FAIL 变体却 PASS），这种底线之下的读数以及无样本可�
   采集错误、无样本、无 `bmc_status_unsupported`、无 finding；再 replan 为无 IPMI 设备节点
   的退出（退出码 1 “Could not open device at /dev/ipmi0 ...: No such file or directory”，
   即 EC2 上已安装 `ipmitool` 的真实输出）→ 须读到 `bmc_status_unsupported`（`reason=NO_DEVICE`）
-  且采集错误停止、仍无样本无 finding。`unsupported_bmc` 是只读 observation（如 002
+  且采集错误停止、仍无样本无 finding。能力标记从产品的两处记录读取（`marker_witness`）：
+  读窗内被接受的批次——标记出现、`reason` 变化或消失的那一拍以 `not-supported:…` 理由投递一次
+  （`host_capability_markers`）——以及节点的 `telemetry_metric_latest` 最新值记录——每个被接受的
+  批次（含不写 raw evidence 的健康摘要）都移动它，是稳态标记唯一的见证。第二段允许最新值记录
+  早于读窗起点一个采集间隔（`MARKER_LOOKBACK_TICKS`）：采集器在拍开始时打时间戳而 `_bmc` 最后
+  运行，回答 replan 的那一拍可能带着 replan 落地之前的时间戳（plain EKS 首次 live 运行即如此：
+  那一拍是唯一携带 NO_DEVICE 的投递，之后每拍都是不变的标记、不是边沿，读窗一个批次也没有）。
+  结果 `no_device_marker.source` 与 notes 说明读自 evidence 还是 metric_latest；最新值记录
+  `reason` 不符或早于允许范围、仍有 finding 或隔离，照旧 FAIL。两段顺序不必调整：开窗重启了采集器
+  单元，第一段的采集错误是活动理由，第二段的 NO_DEVICE 标记对它必是新理由（与节点开窗前是
+  TOOL_MISSING 还是 NO_DEVICE 无关）。`unsupported_bmc` 是只读 observation（如 002
   `no_swap`）：记录 `ipmitool` 是否安装，等待一个 health summary 周期读产品自己的能力标记——
   无 `ipmitool` 须为 `bmc_status_unsupported` TOOL_MISSING，有 `ipmitool` 无 BMC 须为
-  NO_DEVICE——且无 BMC 样本、无 `_bmc` 采集错误、无 finding；缺标记或仍每 tick `_bmc`
-  采集错误记 FAIL（永久能力缺口不是采集错误）；若节点真的有 BMC 应答则 BLOCKED（该变体
-  不适用）。`healthy` 仍 `NOT_RUN(CAPABILITY_ABSENT)`。
+  NO_DEVICE——且无 BMC 样本、无 `_bmc` 采集错误、无 finding；稳态标记不是边沿、摘要不是
+  evidence，所以它通常只从读窗内移动过的 `telemetry_metric_latest` 记录读到（首次 live 运行在
+  整个摘要周期里读到零个批次，`capability.marker_source` 记录来源）；缺标记（无批次携带且最新值
+  记录不在读窗内）或仍每 tick `_bmc` 采集错误记 FAIL（永久能力缺口不是采集错误）；若节点真的有
+  BMC 应答则 BLOCKED（该变体不适用）。`healthy` 仍 `NOT_RUN(CAPABILITY_ABSENT)`。
 
 - 010 EFA/RDMA 计数（模块 `general_live_efa`，复用夹具 `general_live_efa_fixture`，8 个变体
   全部 `live-replay`，需 `HOST_SOURCE_REPLAY`，eks/hp 两车道）。每个变体先用共享回放器的

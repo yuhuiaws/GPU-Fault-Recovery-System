@@ -14,7 +14,7 @@ import math
 import re
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from scripts.e2e.regional.general_live_registry import HARDWARE_OPERATIONS
@@ -299,6 +299,7 @@ def latest_samples(
     metric: str,
     *,
     device: str | None = None,
+    lookback_seconds: float = 0.0,
 ) -> list[dict[str, Any]]:
     """The product's latest record of ``metric`` when it moved inside the read.
 
@@ -314,11 +315,19 @@ def latest_samples(
     counts, and a document that names no ``since`` yields none. Live
     2026-10-25 002 cgroup_only on both lanes: two summaries landed in the
     window (the host collector status moved to 16:31:25), no evidence did.
+
+    ``lookback_seconds`` admits a record stamped that much *before* ``since``:
+    the host collector stamps a batch when its tick starts and runs its
+    contributors after, so the tick whose tool call answered a change made
+    moments before ``since`` can carry a stamp from before it (015
+    ``command_failure``, 2026-10-26: the one delivered NO_DEVICE tick). One
+    collector interval covers that; a caller reading a steady state passes 0.
     """
 
     since = _moment(activity.get("since"))
     if since is None:
         return []
+    since -= timedelta(seconds=lookback_seconds)
     result = []
     for item in activity.get("metric_latest") or []:
         if item.get("name") != metric:

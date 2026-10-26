@@ -1552,12 +1552,38 @@ count the collector used to post names nothing and was the registered gap. 015
 Device ID command failed`) must be a `_bmc` collection error with no sample, a
 host without an IPMI device node (`Could not open device at /dev/ipmi0 ...: No
 such file or directory`, what an installed `ipmitool` prints on EC2) must be
-`bmc_status_unsupported` NO_DEVICE with the error gone. 015 `unsupported_bmc` is
-the read-only capability record of the BMC-less site (like 002 `no_swap`): the
-product must mark the node `bmc_status_unsupported` TOOL_MISSING (no
-`ipmitool`) or NO_DEVICE (`ipmitool`, no BMC) on its routine host batches with
-no `_bmc` collection error; FAIL without the marker or with the permanent
-error, BLOCKED if a BMC answers.
+`bmc_status_unsupported` NO_DEVICE with the error gone. The capability marker
+is read from two product records (`marker_witness`): the accepted batches
+inside the read -- the tick on which a marker appears, changes its `reason` or
+clears is delivered once with a `not-supported:...` reason
+(`host_capability_markers`) -- and the node's `telemetry_metric_latest` record,
+which every accepted batch moves (the health summary included, which writes no
+raw evidence) and which is the only witness of a steady marker. The second
+phase admits a latest record stamped up to one collector interval before the
+read's start (`MARKER_LOOKBACK_TICKS`): the collector stamps a tick when it
+starts and runs `_bmc` last, so the tick that answers the replan can carry a
+stamp from before the plan landed -- the first live run on plain EKS did
+exactly that: that tick was the only delivery carrying NO_DEVICE, every tick
+after it was the unchanged marker (no edge), and the read held no batch at
+all. The result's `no_device_marker.source` and notes say whether the marker
+came from evidence or from `metric_latest`; a latest record with another
+reason or older than the allowance, a finding or an isolation still FAIL. The
+phase order needs no change: the window restarts the collector unit, the first
+phase's collection error is the active reason, and the NO_DEVICE marker of the
+second is a new reason against it whatever the node's marker was before the
+window (TOOL_MISSING without `ipmitool`, NO_DEVICE with it). 015
+`unsupported_bmc` is the read-only capability record of the BMC-less site (like
+002 `no_swap`): the product must mark the node `bmc_status_unsupported`
+TOOL_MISSING (no `ipmitool`) or NO_DEVICE (`ipmitool`, no BMC) with no `_bmc`
+collection error; a steady marker is no edge and the summary is not evidence,
+so it is normally read from the `telemetry_metric_latest` record that moved
+inside the read (the first live run saw zero batches in a whole summary
+period; `capability.marker_source` records the source); FAIL without the marker
+(no batch carries it and no latest record inside the read) or with the
+permanent error, BLOCKED if a BMC answers. Both variants need the release that
+makes the markers edges and latest records: without it `unsupported_bmc`
+cannot PASS on a quiet node, and `command_failure` passes only when the
+delivered tick's stamp happens to fall after the read's start.
 
 The 010 EFA/RDMA counter variants are wired on the shared host source replay
 (`scripts/e2e/regional/general_live_efa.py` on the reusable

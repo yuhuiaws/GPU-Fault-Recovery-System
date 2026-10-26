@@ -28,6 +28,18 @@ the product asked. ``unsupported_bmc`` is the read-only capability record of
 this BMC-less site; ``healthy`` would need a real BMC. A critical table is
 replaced by a healthy one (the product reads the recovery) before the window
 closes and the validated restore runs. ``proof_scope`` is ``live-replay``.
+
+The capability marker is read from two product records (``marker_witness``):
+the accepted host batches, which carry it on the tick it appears, changes or
+clears (``host_capability_markers``: a ``not-supported:...`` edge, delivered
+once), and the node's latest ``bmc_status_unsupported`` record, which every
+accepted batch -- the routine health summary included -- moves and which is
+the only witness of a marker that is the node's steady state (no edge, and a
+summary without findings or collection errors is not evidence). Live 2026-10-26
+on plain EKS: ``unsupported_bmc`` read zero batches in a whole summary period,
+and ``command_failure``'s one delivered NO_DEVICE tick was stamped before the
+read's ``since`` (the collector stamps a tick when it starts and runs ``_bmc``
+last), so a read admits the latest record from one tick before ``since``.
 """
 
 from __future__ import annotations
@@ -69,6 +81,7 @@ from scripts.e2e.regional.general_live_verdicts import (
     chain_errors,
     finding_incidents,
     hardware_errors,
+    latest_samples,
     node_isolated,
     samples,
     verdict,
@@ -98,6 +111,14 @@ IPMI_FAILED_EXIT = 1
 UNSUPPORTED = "bmc_status_unsupported"
 #: Every BMC sample the activity reads keep.
 METRICS = frozenset({METRIC, UNSUPPORTED})
+#: How many collector intervals before a read's ``since`` the product's latest
+#: marker record may be stamped and still be the window's. The host collector
+#: stamps a batch when its tick starts and runs ``_bmc`` last, so the tick
+#: whose ``ipmitool`` call answered a replan made moments before ``since`` is
+#: stamped before it (live 2026-10-26 015 ``command_failure`` on eks: that one
+#: tick carried the NO_DEVICE marker, the read missed it, every later tick was
+#: the unchanged marker). A read of a steady state passes no lookback.
+MARKER_LOOKBACK_TICKS = 1
 
 #: Sensor rows in ``ipmitool sensor`` shape:
 #: ``name | value | units | status | lnr | lcr | lnc | unc | ucr | unr``.
@@ -316,6 +337,14 @@ def settled_read(
     return activity(ctx, since, metrics=METRICS)
 
 
+def marker_reason(record: Mapping[str, Any] | None) -> str:
+    """The ``reason`` label of a marker sample or record; ``""`` without one."""
+
+    return (
+        "" if record is None else str((record.get("labels") or {}).get("reason") or "")
+    )
+
+
 def unsupported_markers(
     observed: Mapping[str, Any], reason: str
 ) -> list[dict[str, Any]]:
@@ -324,8 +353,64 @@ def unsupported_markers(
     return [
         sample
         for sample in samples(dict(observed), UNSUPPORTED)
-        if (sample.get("labels") or {}).get("reason") == reason
+        if marker_reason(sample) == reason
     ]
+
+
+def latest_marker(
+    observed: Mapping[str, Any], *, lookback_seconds: float = 0.0
+) -> dict[str, Any] | None:
+    """The product's latest ``bmc_status_unsupported`` record inside the read.
+
+    ``host_health.evaluate_metrics`` keeps the marker of every accepted batch,
+    the health summary included (``LATEST_METRICS_REQUIRED``), so this is the
+    witness of a marker no edge announces, and of the one delivered tick a
+    read's ``since`` fell just after (``lookback_seconds``, see
+    ``MARKER_LOOKBACK_TICKS``). Whatever its reason -- the caller names a wrong
+    one; ``None`` when the record is older than the read or absent.
+    """
+
+    records = latest_samples(
+        dict(observed), UNSUPPORTED, lookback_seconds=lookback_seconds
+    )
+    return records[-1] if records else None
+
+
+def describe_latest(record: Mapping[str, Any] | None) -> str:
+    if record is None:
+        return f"no latest {UNSUPPORTED} record inside the read"
+    return (
+        f"latest {UNSUPPORTED} record reason={marker_reason(record)!r} "
+        f"observed_at={record.get('observed_at')}"
+    )
+
+
+def marker_witness(
+    observed: Mapping[str, Any], reason: str, *, lookback_seconds: float = 0.0
+) -> dict[str, Any]:
+    """Where the product recorded ``bmc_status_unsupported`` with ``reason``.
+
+    ``source`` is ``evidence`` when an accepted batch inside the read carries
+    the marker, ``metric_latest`` when only the node's latest record does (a
+    steady marker, or the one delivered tick stamped just before ``since``),
+    ``None`` when neither does; ``latest`` is the latest record inside the read
+    whatever its reason, ``evidence`` the last two batch samples.
+    """
+
+    evidence = unsupported_markers(observed, reason)
+    latest = latest_marker(observed, lookback_seconds=lookback_seconds)
+    if evidence:
+        source: str | None = "evidence"
+    elif latest is not None and marker_reason(latest) == reason:
+        source = "metric_latest"
+    else:
+        source = None
+    return {
+        "reason": reason,
+        "source": source,
+        "evidence": evidence[-2:],
+        "latest": latest,
+    }
 
 
 def close_bmc_window(ctx: VariantContext, replay: HostSourceReplay) -> list[str]:
@@ -716,7 +801,12 @@ def command_failure(ctx: VariantContext) -> dict[str, Any]:
     )
     # Read from after the plan landed: a tick served the previous rule in the
     # seconds the install took would otherwise count as a lingering error.
+    # The marker itself may also sit on the product's latest record alone:
+    # the tick that answers the new plan is stamped when it started, which
+    # can be before the plan landed (``MARKER_LOOKBACK_TICKS``), and every
+    # tick after it is the unchanged marker, no edge.
     no_device_at = utc_now()
+    lookback = ctx.host_interval * MARKER_LOOKBACK_TICKS
     unsupported = settled_read(
         ctx,
         no_device_at,
@@ -724,9 +814,11 @@ def command_failure(ctx: VariantContext) -> dict[str, Any]:
             samples(current, UNSUPPORTED)
             or samples(current, METRIC)
             or bmc_errors(current)
+            or latest_marker(current, lookback_seconds=lookback)
         ),
         "bmc-no-device",
     )
+    witness = marker_witness(unsupported, "NO_DEVICE", lookback_seconds=lookback)
     marked = _no_bmc_batches(unsupported)
     batches = [
         batch for batch in unsupported.get("batches") or [] if isinstance(batch, dict)
@@ -734,10 +826,12 @@ def command_failure(ctx: VariantContext) -> dict[str, Any]:
     last = batches[-1] if batches else {}
     stages["no_device_unsupported"] = (
         []
-        if marked
+        if witness["source"]
         else [
-            f"no {UNSUPPORTED} sample with reason=NO_DEVICE after ipmitool answered "
-            f"'Could not open device'; errors: {[e[:120] for e in bmc_errors(unsupported)][-3:]}"
+            f"no {UNSUPPORTED} reason=NO_DEVICE after ipmitool answered 'Could not "
+            f"open device': none of the {len(batches)} accepted batches in the read "
+            f"carries it and the product has {describe_latest(witness['latest'])}; "
+            f"errors: {[e[:120] for e in bmc_errors(unsupported)][-3:]}"
         ]
     )
     stages["no_device_no_error"] = [
@@ -772,11 +866,18 @@ def command_failure(ctx: VariantContext) -> dict[str, Any]:
             "collection error (UNKNOWN), never a healthy zero and never an isolation; "
             "exit 1 ('Could not open device at /dev/ipmi0 ...: No such file or "
             "directory') on this BMC-less host is bmc_status_unsupported NO_DEVICE "
-            "with no collection error"
+            "with no collection error",
+            f"the NO_DEVICE marker was read from {witness['source'] or 'nowhere'}: "
+            + (
+                f"{len(marked)} accepted batch(es) carry it"
+                if witness["source"] == "evidence"
+                else describe_latest(witness["latest"])
+            ),
         ],
         extra={
             "collection_errors": errors,
-            "no_device_markers": unsupported_markers(unsupported, "NO_DEVICE")[-2:],
+            "no_device_markers": witness["evidence"],
+            "no_device_marker": witness,
             **replay.evidence(tool=TOOL),
         },
     )
@@ -800,7 +901,10 @@ def unsupported_bmc(ctx: VariantContext) -> dict[str, Any]:
     expected_reason = "NO_DEVICE" if tool_present else "TOOL_MISSING"
     started_at = utc_now()
     # No edge ever fires here: a steady capability marker travels with the
-    # routine health summary, so the wait spans one summary period.
+    # routine health summary, which is not evidence, so the marker is read
+    # from the product's latest record, which that summary moves; the wait
+    # spans one summary period. Live 2026-10-26 (eksb): zero batches in the
+    # whole period, the marker in no record the read could see.
     observed = await_bmc(
         ctx,
         started_at,
@@ -808,6 +912,7 @@ def unsupported_bmc(ctx: VariantContext) -> dict[str, Any]:
             samples(current, UNSUPPORTED)
             or samples(current, METRIC)
             or bmc_errors(current)
+            or latest_marker(current)
         ),
         name="bmc-capability",
         timeout_seconds=ctx.host_summary + ctx.host_interval * MARKER_TICKS + 60,
@@ -815,9 +920,9 @@ def unsupported_bmc(ctx: VariantContext) -> dict[str, Any]:
     readings = samples(observed, METRIC)
     errors = bmc_errors(observed)
     markers = samples(observed, UNSUPPORTED)
+    witness = marker_witness(observed, expected_reason)
     reasons = sorted(
-        {str((sample.get("labels") or {}).get("reason") or "") for sample in markers}
-        - {""}
+        {marker_reason(sample) for sample in [*markers, witness["latest"]]} - {""}
     )
     if readings and not errors:
         raise VariantBlocked(
@@ -838,11 +943,13 @@ def unsupported_bmc(ctx: VariantContext) -> dict[str, Any]:
             f"(holds host validation): {errors[-1][:120]}"
         ],
         "capability_marker": []
-        if expected_reason in reasons
+        if witness["source"]
         else [
             f"no {UNSUPPORTED} sample with reason={expected_reason} (ipmitool "
             + ("installed" if tool_present else "absent")
-            + f"); reasons seen: {reasons}, batches: {len(observed.get('batches') or [])}"
+            + f"): none of the {len(observed.get('batches') or [])} accepted batches "
+            f"carries it and the product has {describe_latest(witness['latest'])}; "
+            f"reasons seen: {reasons}"
         ],
         "hardware": hardware_errors(observed),
     }
@@ -852,6 +959,8 @@ def unsupported_bmc(ctx: VariantContext) -> dict[str, Any]:
         "bmc_collection_errors": len(errors),
         "unsupported_reasons": reasons,
         "batches": len(observed.get("batches") or []),
+        "marker_source": witness["source"],
+        "latest_marker": witness["latest"],
     }
     ctx.evidence.write("bmc-capability", capability)
     return _result(
@@ -861,7 +970,13 @@ def unsupported_bmc(ctx: VariantContext) -> dict[str, Any]:
             + (" and without ipmitool" if not tool_present else " (ipmitool installed)")
             + f"; the product records bmc_status_unsupported {expected_reason} and "
             "emits no bmc_critical_sensor reading, so the BMC variants needing a real "
-            "BMC stay NOT_RUN(CAPABILITY_ABSENT)"
+            "BMC stay NOT_RUN(CAPABILITY_ABSENT)",
+            f"the marker was read from {witness['source'] or 'nowhere'}: "
+            + (
+                f"{len(markers)} accepted batch sample(s)"
+                if witness["source"] == "evidence"
+                else describe_latest(witness["latest"])
+            ),
         ],
         extra={"capability": capability},
     )
@@ -944,8 +1059,9 @@ VARIANTS = [
         "wrapper makes ipmitool sensor exit 1 ('Get Device ID command failed'), then exit 1 "
         "('Could not open device at /dev/ipmi0 ...: No such file or directory')",
         "first a _bmc collection error (UNKNOWN), no bmc_critical_sensor sample, no finding, "
-        "no isolation; then bmc_status_unsupported NO_DEVICE, the error stops, still no "
-        "sample and no finding",
+        "no isolation; then bmc_status_unsupported NO_DEVICE (read from the accepted "
+        "batches or the product's latest record), the error stops, still no sample and "
+        "no finding",
         command_failure,
         max_minutes=20,
     ),
@@ -958,9 +1074,10 @@ VARIANTS = [
         flags="S",
         injection="none (read-only): survey ipmitool and watch the BMC contributor",
         expected="bmc_status_unsupported TOOL_MISSING (no ipmitool) or NO_DEVICE (ipmitool, "
-        "no BMC), no BMC reading, no _bmc collection error and no finding: the capability "
-        "gap is recorded by the product (not a PASS of any BMC grading); a permanent _bmc "
-        "error on a BMC-less node is a FAIL",
+        "no BMC) on the accepted batches or the product's latest record, no BMC reading, "
+        "no _bmc collection error and no finding: the capability gap is recorded by the "
+        "product (not a PASS of any BMC grading); a permanent _bmc error on a BMC-less "
+        "node is a FAIL",
         cleanup="none",
         max_minutes=12,
         execute=unsupported_bmc,
@@ -974,6 +1091,7 @@ __all__ = [
     "HEALTHY_TABLE",
     "IPMI_NO_DEVICE_STDERR",
     "IPMI_TRANSIENT_STDERR",
+    "MARKER_LOOKBACK_TICKS",
     "METRIC",
     "METRICS",
     "NONRECOVERABLE_TABLE",
@@ -984,6 +1102,10 @@ __all__ = [
     "bmc_errors",
     "close_bmc_window",
     "command_failure_rules",
+    "describe_latest",
+    "latest_marker",
+    "marker_reason",
+    "marker_witness",
     "no_device_rules",
     "open_bmc_window",
     "require_served",
