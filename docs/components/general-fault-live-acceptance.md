@@ -621,6 +621,18 @@ pending 系列不变。
 必测：`crc`、`replay`、`recovery_counter`、`multiple_gpus`、
 `counter_reset`、`stale_sample`、`independent_fatal_event`、`recovered`。
 通过受检DCGM源夹具逐个增加目标链路计数，保持UUID/BDF/source/boot和有效分母。
+每个变体按产品的 NVLink 错误计数**族**（`gpu_fault.dcgm_fields`：crc / replay /
+recovery）选取节点真正上报的成员（`GpuSurvey.nvlink_counter`，读 survey 的
+`metric_names`）：NVLink3 及更早的卡上报按类计数（`nvlink_crc_flit_error_total` 等，
+DCGM `*_ERROR_COUNT_TOTAL`）；Hopper/NVLink4 及更新的卡只上报 DL 聚合计数
+（`nvlink_*_aggregate_error_total`，`DCGM_FI_DEV_NVLINK_ERROR_DL_CRC/REPLAY/RECOVERY`；
+2026-10-26 本站 p5en H200 实测，原先硬编码的 flit 名使 8 个变体全部
+`NOT_RUN(CAPABILITY_ABSENT)`）。两代同时上报时取按类计数，`multiple_gpus`
+取多数 GPU 上报的成员；整族缺失才记 CAPABILITY_ABSENT 并列出全部成员名。计划文本只
+承诺"NVLink CRC counter（NVLink3 flit total，NVLink4+ DL aggregate）"，结果的
+`canonical_name`/`exporter_metrics` 字段与 notes 记录实际驱动的计数器与 exporter
+指标名。产品对同族成员判定一致（阈值、速率窗口、计数回退、复合与恢复），回放工具的
+`nvlink`/`composite` profile 同样接受并改写 DL 聚合字段（仍拒绝未知字段）。
 单卡和多卡counter相关都应实际只读诊断，无DRAIN/reset；回退/旧样本不算新故障或修复。
 独立致命Xid/SXid必须由对应原始源进入并按其catalog处置，不能被counter诊断吸收丢失。
 记录链路、组件/复合finding和各自执行回执；恢复要求新正常增量与通信验证，

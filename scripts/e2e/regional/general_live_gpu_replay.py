@@ -95,11 +95,71 @@ DEFAULT_INTERVAL_SECONDS = 15
 SERVE_SLACK_READS = 2
 SERVE_GRACE_SECONDS = 90
 SERVE_POLL_SECONDS = 10
+#: The NVLink error-counter families the product grades alike
+#: (``gpu_fault.dcgm_fields.DCGM_FABRIC_CANONICAL_GROUPS``; every member is a
+#: ``nvlink_*_error_total`` counter to ``gpu_metrics._link_decision`` and the
+#: NVLink composites), each member in the order a plan prefers it: the legacy
+#: per-class counter (``DCGM_FI_DEV_NVLINK_*_ERROR_COUNT_TOTAL``, NVLink3 and
+#: earlier parts) before the DL aggregate (``DCGM_FI_DEV_NVLINK_ERROR_DL_*``,
+#: the only NVLink error counters a Hopper/NVLink4 exporter publishes: live
+#: 2026-10-26, p5en H200, DCGM 4.6/4.7, every 020 variant NOT_RUN "no GPU on
+#: the node reports nvlink_crc_flit_error_total").
+NVLINK_FAMILY_MEMBERS: dict[str, tuple[str, ...]] = {
+    "nvlink_crc": (
+        "nvlink_crc_flit_error_total",
+        "nvlink_crc_aggregate_error_total",
+        "nvlink_crc_data_error_total",
+    ),
+    "nvlink_replay": (
+        "nvlink_replay_error_total",
+        "nvlink_replay_aggregate_error_total",
+    ),
+    "nvlink_recovery": (
+        "nvlink_recovery_error_total",
+        "nvlink_recovery_aggregate_error_total",
+    ),
+}
 
 
 # --------------------------------------------------------------------------- #
 # Survey: what the node really reports
 # --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class NvlinkCounter:
+    """The member of one NVLink error family this node reports.
+
+    ``gpus`` are the exporter GPUs reporting it in index order and
+    ``exporter_metrics`` the sample names it arrives under (for example
+    ``DCGM_FI_DEV_NVLINK_ERROR_DL_CRC_total``), so a variant's evidence says
+    which counter it exercised.
+    """
+
+    family: str
+    canonical: str
+    gpus: tuple[str, ...]
+    exporter_metrics: tuple[str, ...]
+
+    @property
+    def generation(self) -> str:
+        if "_aggregate_" in self.canonical:
+            return "DL aggregate, NVLink4 and later"
+        return "legacy per-class counter, NVLink3 and earlier"
+
+    def note(self) -> str:
+        metrics = ", ".join(self.exporter_metrics) or "exporter name not surveyed"
+        return (
+            f"NVLink {self.family.removeprefix('nvlink_')} counter exercised: "
+            f"{self.canonical} ({self.generation}; exporter {metrics})"
+        )
+
+    def evidence(self) -> dict[str, Any]:
+        return {
+            "nvlink_family": self.family,
+            "canonical_name": self.canonical,
+            "exporter_metrics": list(self.exporter_metrics),
+        }
+
+
 @dataclass(frozen=True)
 class GpuSurvey:
     """The probe's read-only survey, with the questions plans ask of it."""
@@ -189,6 +249,42 @@ class GpuSurvey:
 
     def gpus_with(self, name: str) -> list[str]:
         return [gpu for gpu in self.gpus if self.has(gpu, name)]
+
+    def exporter_metrics(self, gpu: str, name: str) -> list[str]:
+        """The exporter sample names ``gpu`` reports canonical ``name`` under."""
+
+        names = (self.entry(gpu).get("metric_names") or {}).get(name) or []
+        return [str(item) for item in names]
+
+    def nvlink_counter(self, family: str) -> NvlinkCounter:
+        """The member of NVLink error ``family`` this node reports.
+
+        The product grades every member of a family alike, so a plan targets
+        the one the exporter publishes: in ``NVLINK_FAMILY_MEMBERS`` order,
+        the member the most GPUs report (a Hopper exporter has only the DL
+        aggregate; an older part only the legacy per-class counter). No member
+        on any GPU is ``NOT_RUN(CAPABILITY_ABSENT)`` naming the whole family.
+        """
+
+        members = NVLINK_FAMILY_MEMBERS[family]
+        reporting = {member: self.gpus_with(member) for member in members}
+        canonical = max(members, key=lambda member: len(reporting[member]))
+        gpus = reporting[canonical]
+        if not gpus:
+            raise VariantNotRun(
+                "CAPABILITY_ABSENT",
+                f"no GPU on the node reports an NVLink {family.removeprefix('nvlink_')} "
+                f"counter ({', '.join(members)})",
+            )
+        metrics = sorted(
+            {name for gpu in gpus for name in self.exporter_metrics(gpu, canonical)}
+        )
+        return NvlinkCounter(
+            family=family,
+            canonical=canonical,
+            gpus=tuple(gpus),
+            exporter_metrics=tuple(metrics),
+        )
 
     def target(self, name: str, *, avoid: Sequence[str] = ()) -> str:
         """The highest-index GPU that reports ``name`` (not in ``avoid``)."""
@@ -988,6 +1084,8 @@ __all__ = [
     "no_hardware",
     "result",
     "GpuSurvey",
+    "NVLINK_FAMILY_MEMBERS",
+    "NvlinkCounter",
     "PASS_THROUGH_READS",
     "PORT",
     "add",

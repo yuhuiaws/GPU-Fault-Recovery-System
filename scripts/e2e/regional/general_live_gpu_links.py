@@ -6,6 +6,19 @@ WARNING RUN_DIAGNOSTICS per class; two classes on one GPU or one class on two
 GPUs form the NVLink composites). A counter reset or a stale (unrefreshed)
 scrape must not be read as a new fault or a recovery.
 
+Each 020 variant names an NVLink error *family* (``NVLINK``: crc, replay,
+recovery; ``gpu_fault.dcgm_fields.DCGM_FABRIC_CANONICAL_GROUPS``) and the
+survey picks the member this node's exporter really publishes
+(``GpuSurvey.nvlink_counter``): the legacy per-class counter on NVLink3 and
+earlier parts (``nvlink_crc_flit_error_total`` from
+``DCGM_FI_DEV_NVLINK_CRC_FLIT_ERROR_COUNT_TOTAL``), the DL aggregate on
+Hopper/NVLink4 and later (``nvlink_crc_aggregate_error_total`` from
+``DCGM_FI_DEV_NVLINK_ERROR_DL_CRC``) -- live 2026-10-26 the p5en H200 nodes
+report only the aggregates and the flit name hard-coded here before left all
+eight variants NOT_RUN(CAPABILITY_ABSENT). The product grades every member of
+a family alike; the chosen canonical name and its exporter metric go into the
+variant's notes and ``canonical_name`` / ``exporter_metrics`` evidence.
+
 022 drives the PCIe replay counter (``pcie``/``pcie_xid`` profiles). The rate
 is graded against the previous accepted sample, so ``at_rate_limit`` stays at
 or below 8/min (no finding) and ``over_rate_limit`` clears it (WARNING
@@ -68,11 +81,15 @@ from scripts.e2e.regional.general_live_kernel_xid import (
 
 CASE_020 = "GF-GENERAL-LIVE-020"
 CASE_022 = "GF-GENERAL-LIVE-022"
+#: The NVLink error family each 020 variant drives; the survey resolves the
+#: family to the canonical counter the node reports (``NVLINK_FAMILY_MEMBERS``).
 NVLINK = {
-    "crc": "nvlink_crc_flit_error_total",
-    "replay": "nvlink_replay_error_total",
-    "recovery_counter": "nvlink_recovery_error_total",
+    "crc": "nvlink_crc",
+    "replay": "nvlink_replay",
+    "recovery_counter": "nvlink_recovery",
 }
+#: The plan text of the CRC counter: never a promise of the flit counter alone.
+CRC_COUNTER = "the NVLink CRC counter (flit total on NVLink3, DL aggregate on NVLink4+)"
 RESET = frozenset(
     {"RESET_GPU", "RESET_ALL_GPUS_NVSWITCHES", "RESTART_NODE", "REPLACE_NODE"}
 )
@@ -104,8 +121,10 @@ def _diag_chain(doc: dict[str, Any], canonical: str, gpu: str) -> list[str]:
 # --------------------------------------------------------------------------- #
 # 020 NVLink counters
 # --------------------------------------------------------------------------- #
-def _nvlink_single(ctx: VariantContext, canonical: str) -> dict[str, Any]:
+def _nvlink_single(ctx: VariantContext, family: str) -> dict[str, Any]:
     survey = run_gpu_survey(ctx)
+    counter = survey.nvlink_counter(family)
+    canonical = counter.canonical
     gpu = survey.target(canonical)
     since = utc_now()
     replay = DcgmReplay(
@@ -130,7 +149,9 @@ def _nvlink_single(ctx: VariantContext, canonical: str) -> dict[str, Any]:
         "hardware": no_hardware(detection),
     }
     recover_counter(ctx, replay, since, names=[canonical])
-    return result(stages, extra={"gpu_uuid": gpu})
+    return result(
+        stages, notes=[counter.note()], extra={"gpu_uuid": gpu, **counter.evidence()}
+    )
 
 
 def crc(ctx: VariantContext) -> dict[str, Any]:
@@ -147,11 +168,13 @@ def recovery_counter(ctx: VariantContext) -> dict[str, Any]:
 
 def multiple_gpus(ctx: VariantContext) -> dict[str, Any]:
     survey = run_gpu_survey(ctx)
-    canonical = NVLINK["crc"]
-    gpus = survey.gpus_with(canonical)[:2]
+    counter = survey.nvlink_counter(NVLINK["crc"])
+    canonical = counter.canonical
+    gpus = list(counter.gpus[:2])
     if len(gpus) < 2:
         raise VariantNotRun(
-            "CAPABILITY_ABSENT", "fewer than two GPUs report NVLink counters"
+            "CAPABILITY_ABSENT",
+            f"fewer than two GPUs report NVLink counters ({canonical})",
         )
     since = utc_now()
     repl = DcgmReplay(
@@ -183,14 +206,18 @@ def multiple_gpus(ctx: VariantContext) -> dict[str, Any]:
     recover_counter(ctx, repl, since, names=[canonical])
     return result(
         stages,
-        notes=["multi-GPU NVLink correlation is diagnostic, never a fatal verdict"],
-        extra={"gpus": gpus},
+        notes=[
+            "multi-GPU NVLink correlation is diagnostic, never a fatal verdict",
+            counter.note(),
+        ],
+        extra={"gpus": gpus, **counter.evidence()},
     )
 
 
 def counter_reset(ctx: VariantContext) -> dict[str, Any]:
     survey = run_gpu_survey(ctx)
-    canonical = NVLINK["crc"]
+    counter = survey.nvlink_counter(NVLINK["crc"])
+    canonical = counter.canonical
     gpu = survey.target(canonical)
     since = utc_now()
     # Raise the counter (the product baselines above the real value), then drop
@@ -229,14 +256,18 @@ def counter_reset(ctx: VariantContext) -> dict[str, Any]:
     ctx.cleanup.discard("dcgm-replay")
     return result(
         stages,
-        notes=["a counter reset (decrease) is not a new fault or a recovery"],
-        extra={"gpu_uuid": gpu},
+        notes=[
+            "a counter reset (decrease) is not a new fault or a recovery",
+            counter.note(),
+        ],
+        extra={"gpu_uuid": gpu, **counter.evidence()},
     )
 
 
 def stale_sample(ctx: VariantContext) -> dict[str, Any]:
     survey = run_gpu_survey(ctx)
-    canonical = NVLINK["crc"]
+    counter = survey.nvlink_counter(NVLINK["crc"])
+    canonical = counter.canonical
     gpu = survey.target(canonical)
     since = utc_now()
     # One armed increment, then serve the same scrape again (stale): the
@@ -270,8 +301,11 @@ def stale_sample(ctx: VariantContext) -> dict[str, Any]:
     recover_counter(ctx, repl, since, names=[canonical])
     return result(
         stages,
-        notes=["an unrefreshed (stale) scrape carries no new information"],
-        extra={"gpu_uuid": gpu},
+        notes=[
+            "an unrefreshed (stale) scrape carries no new information",
+            counter.note(),
+        ],
+        extra={"gpu_uuid": gpu, **counter.evidence()},
     )
 
 
@@ -288,7 +322,8 @@ def independent_fatal_event(ctx: VariantContext) -> dict[str, Any]:
 
     entry = require_monitor_grade(INDEPENDENT_XID)
     survey = run_gpu_survey(ctx)
-    canonical = NVLINK["crc"]
+    counter = survey.nvlink_counter(NVLINK["crc"])
+    canonical = counter.canonical
     gpu = survey.target(canonical)
     pci_bdf = kmsg_pci_bdf(survey.pci_bdf(gpu))
     if pci_bdf is None:
@@ -314,7 +349,11 @@ def independent_fatal_event(ctx: VariantContext) -> dict[str, Any]:
     if not metric_incidents(detection, canonical, gpu=gpu):
         stages = {"counter": [f"no {canonical} finding on {gpu} reached an incident"]}
         recover_counter(ctx, repl, since, names=[canonical])
-        return result(stages, extra={"gpu_uuid": gpu})
+        return result(
+            stages,
+            notes=[counter.note()],
+            extra={"gpu_uuid": gpu, **counter.evidence()},
+        )
     injection = inject_kernel_xid(
         ctx, xid=INDEPENDENT_XID, pci_bdf=pci_bdf, label="020-independent-event"
     )
@@ -345,6 +384,7 @@ def independent_fatal_event(ctx: VariantContext) -> dict[str, Any]:
             f"XID {INDEPENDENT_XID} ({entry.mnemonic}) is monitor grade in catalog "
             f"{entry.catalog_version}: {entry.immediate_action} -> MONITOR_ONLY; the "
             "fatal-grade dispatch beside a counter diagnosis is not driven live here",
+            counter.note(),
         ],
         extra={
             "gpu_uuid": gpu,
@@ -352,13 +392,15 @@ def independent_fatal_event(ctx: VariantContext) -> dict[str, Any]:
             "pci_bdf": pci_bdf,
             "decisions": decisions,
             "kernel_replay": injection.evidence(),
+            **counter.evidence(),
         },
     )
 
 
 def recovered(ctx: VariantContext) -> dict[str, Any]:
     survey = run_gpu_survey(ctx)
-    canonical = NVLINK["replay"]
+    counter = survey.nvlink_counter(NVLINK["replay"])
+    canonical = counter.canonical
     gpu = survey.target(canonical)
     since = utc_now()
     repl = DcgmReplay(
@@ -381,7 +423,9 @@ def recovered(ctx: VariantContext) -> dict[str, Any]:
         if recovered_state.get("batches") and not recovered_state.get("active_findings")
         else ["recovery needs a new normal increment, not a counter zeroing"],
     }
-    return result(stages, extra={"gpu_uuid": gpu})
+    return result(
+        stages, notes=[counter.note()], extra={"gpu_uuid": gpu, **counter.evidence()}
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -693,7 +737,7 @@ VARIANTS = [
     gpu_spec(
         CASE_020,
         "crc",
-        "increment nvlink_crc_flit_error_total",
+        f"increment {CRC_COUNTER}",
         "WARNING RUN_DIAGNOSTICS; read-only, no reset",
         crc,
         max_minutes=20,
@@ -701,7 +745,8 @@ VARIANTS = [
     gpu_spec(
         CASE_020,
         "replay",
-        "increment nvlink_replay_error_total",
+        "increment the NVLink replay counter (per-class total on NVLink3, DL "
+        "aggregate on NVLink4+)",
         "WARNING RUN_DIAGNOSTICS; read-only",
         replay,
         max_minutes=20,
@@ -709,7 +754,8 @@ VARIANTS = [
     gpu_spec(
         CASE_020,
         "recovery_counter",
-        "increment nvlink_recovery_error_total",
+        "increment the NVLink recovery counter (per-class total on NVLink3, DL "
+        "aggregate on NVLink4+)",
         "WARNING RUN_DIAGNOSTICS; read-only",
         recovery_counter,
         max_minutes=20,
@@ -741,7 +787,7 @@ VARIANTS = [
     gpu_spec(
         CASE_020,
         "independent_fatal_event",
-        "hold nvlink_crc_flit_error_total on one GPU, then a reviewed trusted kernel "
+        f"hold {CRC_COUNTER} on one GPU, then a reviewed trusted kernel "
         f"XID {INDEPENDENT_XID} (NVLINK_PRIV_ERR, catalog IGNORE) on that GPU through "
         "the kmsg source",
         "the XID keeps its own catalog decision (MONITOR_ONLY, own RECOVERED incident, "

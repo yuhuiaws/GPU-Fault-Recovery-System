@@ -81,6 +81,11 @@ MEMORY_FIELDS = frozenset(
         "row_remap_uncorrectable_total",
     }
 )
+#: Every member of the product's NVLink error families: the legacy per-class
+#: counters (``DCGM_FI_DEV_NVLINK_*_ERROR_COUNT_TOTAL``, NVLink3 and earlier)
+#: and the DL aggregates (``DCGM_FI_DEV_NVLINK_ERROR_DL_*``, the only NVLink
+#: error counters a Hopper/NVLink4 exporter publishes). Both reach the same
+#: canonical names through ``canonical_name`` and are served and altered alike.
 NVLINK_FIELDS = frozenset(
     name for group in DCGM_FABRIC_CANONICAL_GROUPS.values() for name in group
 )

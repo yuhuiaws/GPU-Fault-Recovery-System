@@ -54,6 +54,39 @@ def exporter(**overrides: float) -> bytes:
     return ("\n".join(lines) + "\n").encode()
 
 
+#: The DL aggregate NVLink counters and their canonical names: what a Hopper
+#: (NVLink4) exporter publishes instead of the per-class counters above
+#: (live 2026-10-26, p5en H200, DCGM 4.6/4.7).
+DL_AGGREGATES = (
+    ("DCGM_FI_DEV_NVLINK_ERROR_DL_CRC", "nvlink_crc_aggregate_error_total"),
+    ("DCGM_FI_DEV_NVLINK_ERROR_DL_REPLAY", "nvlink_replay_aggregate_error_total"),
+    ("DCGM_FI_DEV_NVLINK_ERROR_DL_RECOVERY", "nvlink_recovery_aggregate_error_total"),
+)
+
+
+def hopper_exporter(**overrides: float) -> bytes:
+    """A two-GPU Hopper scrape: typed DL aggregate counters, no per-class ones.
+
+    The exporter declares the DL fields ``counter``, so the product's parser
+    (and this tool's) sees them as ``<name>_total`` samples -- the shape the
+    live survey recorded (``DCGM_FI_DEV_NVLINK_ERROR_DL_CRC_total``).
+    """
+
+    values = {"crc": 0, "replay": 0, "recovery": 0, "pcie": 0, **overrides}
+    lines = []
+    for name, _canonical in DL_AGGREGATES:
+        lines.append(f"# TYPE {name} counter")
+        key = name.rsplit("_", 1)[1].lower()
+        for gpu, uuid in (("0", A), ("1", B)):
+            labels = f'gpu="{gpu}",UUID="{uuid}",pci_bus_id="0000:{gpu}9:00.0",modelName="NVIDIA H200"'
+            lines.append(f"{name}{{{labels}}} {values[key]}")
+    for gpu, uuid in (("0", A), ("1", B)):
+        labels = f'gpu="{gpu}",UUID="{uuid}",pci_bus_id="0000:{gpu}9:00.0",modelName="NVIDIA H200"'
+        lines.append(f"DCGM_FI_DEV_PCIE_REPLAY_COUNTER{{{labels}}} {values['pcie']}")
+        lines.append(f"DCGM_FI_DEV_GPU_TEMP{{{labels}}} 40")
+    return ("\n".join(lines) + "\n").encode()
+
+
 def product_view(body: bytes) -> dict[tuple[str, str], list[float]]:
     """What the deployed collector's own parser makes of a served scrape."""
 
@@ -619,6 +652,118 @@ def test_cli_validates_by_default_and_serving_needs_ack_audit_and_profile(
                 str(audit),
             ]
         )
+
+
+def test_nvlink_profile_spans_both_counter_generations():
+    from gpu_fault.dcgm_fields import DCGM_FABRIC_CANONICAL_GROUPS
+
+    members = {
+        name for group in DCGM_FABRIC_CANONICAL_GROUPS.values() for name in group
+    }
+    assert tool.PROFILES["nvlink"].fields == members
+    assert tool.PROFILES["composite"].fields >= members
+    assert members <= tool.MONITORED_FIELDS, "a real DL error aborts the replay too"
+    for name, canonical in DL_AGGREGATES:
+        assert tool.canonical_name(name) == canonical
+        assert tool.canonical_name(name + "_total") == canonical, "typed counter"
+        assert canonical in tool.PROFILES["nvlink"].fields
+    with pytest.raises(ValueError, match="allow-list"):
+        plan(
+            "nvlink",
+            (
+                1,
+                [
+                    {
+                        "op": "add",
+                        "field": "nvlink_dl_crc_error_total",
+                        "gpus": [A],
+                        "value": 1,
+                    }
+                ],
+            ),
+        )
+    with pytest.raises(ValueError, match="allow-list"):
+        plan(
+            "nvlink",
+            (
+                1,
+                [
+                    {
+                        "op": "add",
+                        "field": "DCGM_FI_DEV_NVLINK_ERROR_DL_CRC",
+                        "gpus": [A],
+                        "value": 1,
+                    }
+                ],
+            ),
+        )
+
+
+@pytest.mark.parametrize(("metric", "field"), DL_AGGREGATES)
+def test_nvlink_profile_alters_a_dl_aggregate_like_a_legacy_counter(metric, field):
+    key = metric.rsplit("_", 1)[1].lower()
+    replay = armed(
+        "nvlink",
+        (2, [{"op": "add", "field": field, "gpus": [A], "value": 1}]),
+        (1, [{"op": "clear", "field": field, "gpus": [A]}]),
+        (1, [{"op": "stale", "age": 1}]),
+    )
+    body = hopper_exporter(**{key: 4})
+    first, receipt = serve_once(replay, body)
+    view = product_view(first)
+    assert view[(A, field)] == [5.0], view
+    assert view[(B, field)] == [4.0], "the other GPU is untouched"
+    assert receipt["served"] == {f"{A}/{field}": 5.0}
+    assert receipt["real"] == {f"{A}/{field}": 4.0}, (
+        "the DL sample is the real baseline"
+    )
+    assert f"{metric}_total{{" in first.decode(), "served under its typed exporter name"
+    assert product_view(serve_once(replay, body)[0])[(A, field)] == [6.0], "accumulates"
+    cleared = product_view(serve_once(replay, body)[0])
+    assert cleared[(A, field)] == [4.0], "clear drops the offset: a counter reset"
+    stale, receipt = serve_once(replay, body)
+    assert receipt["served"] == {"stale_age_reads": 1}
+    assert product_view(stale) == cleared, "the stale step re-serves the last scrape"
+    assert serve_once(replay, body)[0] == body, "plan done: byte-identical pass-through"
+    others = {k: v for k, v in product_view(first).items() if k[1] != field}
+    assert others == {k: v for k, v in product_view(body).items() if k[1] != field}
+
+
+def test_a_legacy_counter_targeted_on_a_hopper_scrape_aborts_as_absent():
+    # The failure mode behind the 2026-10-26 live NOT_RUNs, had the survey not
+    # refused first: the flit counter does not exist upstream, so the replay
+    # aborts rather than invent it, and the scrape passes through unchanged.
+    replay = armed(
+        "nvlink",
+        (
+            2,
+            [
+                {
+                    "op": "add",
+                    "field": "nvlink_crc_flit_error_total",
+                    "gpus": [A],
+                    "value": 1,
+                }
+            ],
+        ),
+    )
+    body = hopper_exporter()
+    output, receipt = serve_once(replay, body)
+    assert output == body
+    assert "refusing invented samples" in receipt["aborted"], receipt
+    assert f"{A}/nvlink_crc_flit_error_total" in receipt["aborted"]
+
+
+def test_a_real_dl_aggregate_change_aborts_and_is_never_masked():
+    field = "nvlink_replay_aggregate_error_total"
+    replay = armed(
+        "nvlink", (5, [{"op": "add", "field": field, "gpus": [A], "value": 1}])
+    )
+    serve_once(replay, hopper_exporter())
+    real_fault = hopper_exporter(replay=3)
+    output, receipt = serve_once(replay, real_fault)
+    assert output == real_fault, "a real DL error passes through unchanged"
+    assert "real upstream change" in receipt["aborted"], receipt
 
 
 def test_canonical_names_follow_the_product_parser():

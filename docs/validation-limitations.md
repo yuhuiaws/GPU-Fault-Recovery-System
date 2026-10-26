@@ -2931,6 +2931,36 @@ kmsg probe now gives every run its own sequence band (`kmsg_sequence`): the
 product dedups the XID event id derived from `kmsg-<boot>-<sequence>`, so a
 second run on the same boot used to be graded a duplicate of the first.
 
+The 020 NVLink counter variants had no live coverage until the harness
+followed the exporter's counter generation. On 2026-10-26 (06:45-06:58Z,
+plain EKS, p5en.48xlarge, 8x H200, DCGM host engine 4.6/4.7, release R13g)
+all eight variants ended `NOT_RUN(CAPABILITY_ABSENT)` ("no GPU on the node
+reports nvlink_crc_flit_error_total" / `..._replay_error_total` /
+`..._recovery_error_total`, "fewer than two GPUs report NVLink counters"):
+the variants hard-coded the legacy per-class canonical names, but a
+Hopper/NVLink4 exporter publishes only the DL aggregates
+(`DCGM_FI_DEV_NVLINK_ERROR_DL_CRC` / `_REPLAY` / `_RECOVERY`, read as
+`nvlink_*_aggregate_error_total`; field 409 and the per-class counters print
+N/A on this part), and the HyperPod cluster has the same GPU generation. Each
+variant now names an NVLink error *family* (`gpu_fault.dcgm_fields`
+`DCGM_FABRIC_CANONICAL_GROUPS`: crc, replay, recovery) and the survey picks
+the member the node really reports (`GpuSurvey.nvlink_counter`: the legacy
+per-class counter where published, else the DL aggregate; `multiple_gpus` the
+member the most GPUs report); the chosen canonical name and its exporter
+metric are in the result's `canonical_name` / `exporter_metrics` and notes.
+The product grades every member of a family alike -- the counter set, the
+delta threshold, the counter-reset and zero-delta recovery handling, the
+GPU_FABRIC class and both NVLink composites key on `nvlink_*_error_total` or
+list all seven names (pinned by `tests/regional/test_general_live_gpu_links.py`)
+-- and the replay tool's `nvlink` / `composite` profiles serve and alter the
+DL aggregates exactly as the legacy counters (`tests/test_gpu_dcgm_field_replay.py`
+over a typed Hopper scrape) while still refusing unknown fields. On this site
+the variants therefore exercise `nvlink_crc_aggregate_error_total`,
+`nvlink_replay_aggregate_error_total` and
+`nvlink_recovery_aggregate_error_total`; they are to be re-run on both
+clusters and still have no product evidence. The flit/data split and the
+per-class counters themselves stay unexercised until a NVLink3 node joins.
+
 024 `thermal_warning` and `power_performance` reuse the GF-ENV-LIVE
 telemetry replay unchanged (`tools/gpu_environment_replay.py`,
 `probes/env_replay_proxy.py`, `env_live_fixture.EnvReplayController`) through

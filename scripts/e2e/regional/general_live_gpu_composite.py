@@ -194,23 +194,24 @@ def memory_failure(ctx: VariantContext) -> dict[str, Any]:
 
 
 def nvlink_multiple_gpus(ctx: VariantContext) -> dict[str, Any]:
+    # The CRC family member this node reports (the DL aggregate on Hopper/NVLink4+,
+    # the flit counter on older parts); the product grades both alike.
     survey = run_gpu_survey(ctx)
-    gpus = survey.gpus_with("nvlink_crc_flit_error_total")[:2]
+    counter = survey.nvlink_counter("nvlink_crc")
+    canonical = counter.canonical
+    gpus = list(counter.gpus[:2])
     if len(gpus) < 2:
         raise VariantNotRun(
-            "CAPABILITY_ABSENT", "fewer than two GPUs report NVLink counters"
+            "CAPABILITY_ABSENT",
+            f"fewer than two GPUs report NVLink counters ({canonical})",
         )
     since = utc_now()
     repl = DcgmReplay(
         ctx,
-        plan(
-            "composite",
-            baseline(),
-            step(40, add("nvlink_crc_flit_error_total", gpus), hold=True),
-        ),
+        plan("composite", baseline(), step(40, add(canonical, gpus), hold=True)),
         _hold(ctx),
     )
-    arm_and_confirm(repl, *[f"{gpu}/nvlink_crc_flit_error_total" for gpu in gpus])
+    arm_and_confirm(repl, *[f"{gpu}/{canonical}" for gpu in gpus])
     detection = wait_gpu_incident(
         ctx,
         since,
@@ -230,8 +231,10 @@ def nvlink_multiple_gpus(ctx: VariantContext) -> dict[str, Any]:
         ),
         "hardware": no_hardware(detection),
     }
-    recover_counter(ctx, repl, since, names=["nvlink_crc_flit_error_total"])
-    return result(stages, extra={"gpus": gpus})
+    recover_counter(ctx, repl, since, names=[canonical])
+    return result(
+        stages, notes=[counter.note()], extra={"gpus": gpus, **counter.evidence()}
+    )
 
 
 def fresh_components(ctx: VariantContext) -> dict[str, Any]:
@@ -519,7 +522,8 @@ VARIANTS = [
     gpu_spec(
         CASE,
         "nvlink_multiple_gpus",
-        "one NVLink class on two GPUs",
+        "one NVLink class on two GPUs (the CRC counter: flit total on NVLink3, DL "
+        "aggregate on NVLink4+)",
         "MULTI_GPU_NVLINK_FABRIC_FAILURE diagnostic",
         nvlink_multiple_gpus,
         max_minutes=20,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -176,6 +177,71 @@ def test_independent_xid_fails_when_the_xid_is_dropped(tmp_path: Path) -> None:
     out = comp.independent_xid(_independent_ctx(tmp_path, []))
     assert out["verdict"] == "FAIL"
     assert any("reached no decision" in error for error in out["errors"]), out["errors"]
+
+
+def _hopper_survey() -> dict[str, Any]:
+    """The live 2026-10-26 H200 shape: NVLink counters only as DL aggregates."""
+
+    from tests.regional._general_live_gpu_fakes import survey
+
+    aggregates = {
+        "nvlink_crc_aggregate_error_total": "DCGM_FI_DEV_NVLINK_ERROR_DL_CRC_total",
+        "nvlink_replay_aggregate_error_total": "DCGM_FI_DEV_NVLINK_ERROR_DL_REPLAY_total",
+        "nvlink_recovery_aggregate_error_total": (
+            "DCGM_FI_DEV_NVLINK_ERROR_DL_RECOVERY_total"
+        ),
+    }
+    value = survey(
+        fields=("ecc_sbe_volatile_total", "ecc_dbe_volatile_total", *aggregates)
+    )
+    for entry in value["exporter"]["gpus"].values():
+        for canonical, metric in aggregates.items():
+            entry["metric_names"][canonical] = [metric]
+    return value
+
+
+def test_nvlink_multiple_gpus_targets_the_counter_the_node_reports(
+    tmp_path: Path,
+) -> None:
+    import base64
+
+    canonical = "nvlink_crc_aggregate_error_total"
+    comp_incident = gpu_incident(
+        "inc-c",
+        "b-node-composite-MULTI_GPU_NVLINK_FABRIC_FAILURE",
+        state="RECOVERED",
+        workflow="wf-c",
+    )
+    wf = gpu_workflow("wf-c", "inc-c", ["FREEZE_EVIDENCE"], status="SUCCEEDED")
+    probe = dcgm_probe(
+        _hopper_survey(),
+        audit=audit_records({f"{G0}/{canonical}": 1.0, f"{G1}/{canonical}": 1.0}),
+    )
+    out = comp.nvlink_multiple_gpus(
+        _ctx(
+            tmp_path,
+            "nvlink_multiple_gpus",
+            probe=probe,
+            cpu=gpu_cpu_python(
+                activity=_activity([comp_incident], [wf]),
+                gpu_state={"active_findings": [], "batches": [{"observed_at": "t"}]},
+            ),
+        )
+    )
+    assert out["verdict"] == "PASS", out["errors"]
+    assert out["gpus"] == [G0, G1]
+    assert out["canonical_name"] == canonical
+    assert out["exporter_metrics"] == ["DCGM_FI_DEV_NVLINK_ERROR_DL_CRC_total"]
+    assert any(canonical in note for note in out["notes"]), out["notes"]
+    plans = [
+        json.loads(base64.b64decode(call[call.index("--b64") + 1]))
+        for call in probe.calls
+        if call[0] == "install-source" and "plan.json" in call
+    ]
+    assert len(plans) == 1 and plans[0]["profile"] == "composite"
+    assert {
+        operation["field"] for item in plans[0]["steps"] for operation in item["ops"]
+    } == {canonical}
 
 
 def test_corrected_memory_forms_a_diagnostic_composite(tmp_path: Path) -> None:
