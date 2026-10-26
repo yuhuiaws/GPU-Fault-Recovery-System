@@ -794,6 +794,23 @@ observation: <gpu>/<field>`，或 NaN 槽位被读成该 GPU 缺失的必需字�
 （2026-10-26 现场该变体即因把保留的真实零当作转换而误判 FAIL）。NaN 字段
 （`row_remap_failure`）须经 survey 确认目标 GPU 真实上报，否则 CAPABILITY_ABSENT。
 
+`exporter_timeout` 的判定顺序（2026-10-26 eksb 现场 FAIL 的根因）：产品的 VALIDATE_HOST 在
+OBSERVABILITY 恢复合约下只认比 finding 新、且不超过 120 s 的 GPU_METRICS 成功采集
+（`health_evidence_validation.validate_observability`），exporter 暂停期间它按设计 WAITING
+（`health_evidence_pending="collector state is UNKNOWN"`、`missing_observations`），300 s 起落
+`step_waiting_slow` 闩锁并触发步骤等待告警，600 s 到每步等待上限才 FAILED、incident 以
+"diagnostic inconclusive" 收口（`execution/step_bounds.bounded_waiting_outcome`、
+`execution/terminal_state.py`）——有界，不是产品缺口。旧变体却在 exporter 仍暂停（900 s）时要求
+VALIDATE_HOST 终态，自己的 720 s 等待预算先用完，FAIL 是 harness 的时序错误。现改为两次读取：
+暂停期间只要求 incident、计划的 TRIGGER_HEALTH_SNAPSHOT + VALIDATE_HOST、无硬件/诊断步骤，且
+VALIDATE_HOST 不得在暂停期间 SUCCEEDED（`paused` 阶段：旧成功放行即 FAIL）；链路一到 VALIDATE_HOST
+（有执行记录）就 `exporter-resume`，再等它终态（`VALIDATION_BUDGET` 300 s，产品上限的一半），
+`chain` 阶段要求 SUCCEEDED，`validation` 阶段记录它等了多久（`started_at`→`updated_at`）、暂停期间
+产品自述的等待原因与 `step_waiting_seconds`/`step_waiting_slow`、是否在恢复之后才完成；比恢复更早的
+成功或撞到产品 600 s 上限的 FAILED 都点名记 FAIL。deadman 仍 900 s 只作保底；`max_minutes` 20
+（检测 12 min + 验证 5 min + 新成功）。`sustained_unknown`/`post_refresh_success` 与五个字段变体
+不要求验证终态，没有同类时序问题。
+
 ### GF-GENERAL-LIVE-026
 
 必测：`uuid_changed`、`bdf_changed`、`count_unchanged`、`unknown_expected_count`、

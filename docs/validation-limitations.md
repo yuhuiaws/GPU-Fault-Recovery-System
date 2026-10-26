@@ -3113,6 +3113,33 @@ monotonic stamp, the window's open and arm receipts clean); the product's XID
 event records and the kernel collector's log for that window are to be read
 before the variant is re-run -- the fixture side shows nothing wrong.
 
+025 `exporter_timeout` FAILED live (2026-10-26 08:34-08:48Z, eksb
+ip-10-0-32-162, R13g, harness live14) with "VALIDATE_HOST did not finish:
+still WAITING (health_evidence_pending, host_diagnostic_failure,
+missing_observations, step_waiting_seconds, step_waiting_slow)" while its
+hardware, unknown and recovery stages were clean. That was the runner's order,
+not the product: under the OBSERVABILITY recovery contract VALIDATE_HOST
+passes only on a GPU_METRICS success newer than the finding and at most 120 s
+old (`health_evidence_validation.validate_observability`), so with the node's
+only exporter paused it waits by design, latches `step_waiting_slow` at 300 s
+(the step-waiting alert over `gpu_fault_workflow_step_waiting_seconds` is the
+escalation) and fails "diagnostic inconclusive" at the executor's 600 s
+per-step cap (`execution/step_bounds.bounded_waiting_outcome`; no override for
+VALIDATE_* on this site) -- bounded, no product gap. The variant paused the
+exporter for 900 s and demanded a terminal validation inside a 720 s wait,
+which could not happen before its own resume (last read 08:47:22Z, resume
+08:47:43Z, fresh success 08:48:10Z). It now judges in two reads: while paused,
+the incident, the planned bounded chain (TRIGGER_HEALTH_SNAPSHOT +
+VALIDATE_HOST, nothing hardware) and a validation that has not passed on
+evidence that cannot exist; after `exporter-resume`, the validation's
+completion within 300 s -- SUCCEEDED, dated after the resume, not through the
+cap -- with the product's own waiting reasons and the waited seconds kept in
+the result (`validation`). The deadman stays 900 s; `max_minutes` is 20.
+`sustained_unknown` and `post_refresh_success` never required a terminal
+validation and are unchanged. The WAITING summary of every chain verdict now
+prints the health-evidence reason and the missing observations instead of the
+detail keys. To be re-run on both clusters.
+
 024 `thermal_warning` and `power_performance` reuse the GF-ENV-LIVE
 telemetry replay unchanged (`tools/gpu_environment_replay.py`,
 `probes/env_replay_proxy.py`, `env_live_fixture.EnvReplayController`) through

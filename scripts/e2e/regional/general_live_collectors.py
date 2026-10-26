@@ -5,7 +5,20 @@ cuts the product-owned DCGM exporter's scrape (``exporter-pause``): the metrics
 collector's failed scrape becomes a sustained ``dcgm_field_completeness``
 collection error that, past ``collection_error_sustain_seconds`` (180 s),
 requests one bounded TRIGGER_HEALTH_SNAPSHOT + read-only validation -- never a
-reset. 031 pauses one collector unit while the Agent lease stays valid
+reset. That validation (VALIDATE_HOST under the OBSERVABILITY recovery
+contract, ``health_evidence_validation.validate_observability``) passes only
+on a GPU_METRICS success newer than the finding and no older than 120 s, so
+while the exporter is paused it is WAITING by design (``health_evidence_pending``
+"collector state is UNKNOWN", ``missing_observations``), latches
+``step_waiting_slow`` at 300 s and FAILS "diagnostic inconclusive" at the 600 s
+per-step cap (``execution/step_bounds.bounded_waiting_outcome``). Live
+2026-10-26 ``exporter_timeout`` demanded a finished validation while the pause
+(900 s) still outlasted its own 720 s wait and FAILED on the harness's order,
+not the product's. It is judged in two reads now: while paused, the incident,
+the planned bounded chain and a validation that has *not* passed on evidence
+that cannot exist; after ``exporter-resume``, the validation's completion --
+SUCCEEDED once evidence returned, how long it waited, and never through the
+product's cap. 031 pauses one collector unit while the Agent lease stays valid
 (``unit-pause``): the silence scanner records ``collector_observation_valid``
 UNKNOWN, mints at most one snapshot-refresh workflow per node/hour, and sends
 one silent advisory. A disabled/masked unit is excluded, and resuming the
@@ -25,6 +38,7 @@ inside the alert interval, and recovery needs a success *after* the resume.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 
@@ -43,12 +57,18 @@ from scripts.e2e.regional.general_live_registry import (
 )
 from scripts.e2e.regional.general_live_verdicts import (
     DIAGNOSTIC_ONLY_STATES,
+    TERMINAL_WORKFLOWS,
     ChainExpectation,
     chain_errors,
     chain_judgeable,
+    executions,
+    final_execution,
     finding_incidents,
     hardware_errors,
+    judged_chain,
     operations,
+    parse_time,
+    pending_summary,
     verdict,
 )
 
@@ -56,6 +76,27 @@ CASE_025 = "GF-GENERAL-LIVE-025"
 CASE_031 = "GF-GENERAL-LIVE-031"
 DCGM_SUSTAIN = 180
 DCGM_BUDGET = DCGM_SUSTAIN + 420 + 120
+COMPLETENESS = "dcgm_field_completeness"
+VALIDATION = "VALIDATE_HOST"
+#: ``exporter_timeout`` resumes the exporter itself once the product's chain
+#: has reached its validation; the pause's deadman only covers a runner that
+#: dies (the same 900 s the variant armed before).
+EXPORTER_DEADMAN = DCGM_BUDGET + 180
+#: After the resume one exporter scrape and the metrics collector's ingest put
+#: a fresh GPU_METRICS success in the store (15-30 s) and the executor's next
+#: 5 s poll re-reads VALIDATE_HOST: ten times that, and half the product's
+#: 600 s per-step cap, so a cap-failed validation is still read as such.
+VALIDATION_BUDGET = 300
+#: What the waiting validation records (``health_evidence_validation.pending``)
+#: and the executor's wait accounting adds (``execution/step_bounds``): kept in
+#: the result as the product's own statement of why and how long it waited.
+WAITING_DETAIL_KEYS = (
+    "health_evidence_pending",
+    "missing_observations",
+    "step_waiting_seconds",
+    "step_waiting_slow",
+    "step_waiting_timeout_seconds",
+)
 #: Inventory 180 s, metrics/host 420 s, logs 900 s (collector_kinds.py).
 SILENCE_THRESHOLDS = {
     "inventory_silent": ("GPU_INVENTORY", "gpu-fault-metrics-collector.service", 180),
@@ -89,62 +130,221 @@ def _pause_exporter(ctx: VariantContext, seconds: int) -> dict[str, Any]:
     return paused
 
 
+def _completion_activity(ctx: VariantContext, since: Any) -> dict[str, Any]:
+    return activity(
+        ctx, since, metrics={"collector_observation_valid"}, kinds=("GPU_METRICS",)
+    )
+
+
 def _wait_completion_error(
-    ctx: VariantContext, since: Any, *, name: str, validation: str | None = None
+    ctx: VariantContext,
+    since: Any,
+    *,
+    name: str,
+    until: Callable[[dict[str, Any]], bool] | None = None,
+    timeout: float = DCGM_BUDGET,
 ) -> dict[str, Any]:
-    """The field-completeness incident; with ``validation``, its chain
-    judgeable (the step terminal), not the first snapshot showing it."""
+    """The field-completeness incident -- or, with ``until``, the first read of
+    the node's activity it accepts (the chain at its validation, the
+    validation terminal). The last read when the budget runs out."""
 
     last: dict[str, Any] = {}
 
     def accept() -> dict[str, Any] | None:
         nonlocal last
-        last = activity(
-            ctx, since, metrics={"collector_observation_valid"}, kinds=("GPU_METRICS",)
+        last = _completion_activity(ctx, since)
+        ready = (
+            bool(finding_incidents(last, COMPLETENESS))
+            if until is None
+            else until(last)
         )
-        if validation is not None:
-            ready = chain_judgeable(
-                last, "dcgm_field_completeness", validation=validation
-            )
-        else:
-            ready = bool(finding_incidents(last, "dcgm_field_completeness"))
         return last if ready else None
 
     value = ctx.wait_until(
-        accept, timeout_seconds=DCGM_BUDGET, poll_seconds=ctx.host_interval, name=name
+        accept, timeout_seconds=timeout, poll_seconds=ctx.host_interval, name=name
     )
     return value if value is not None else last
 
 
-def exporter_timeout(ctx: VariantContext) -> dict[str, Any]:
-    started = utc_now()
-    hold = DCGM_BUDGET + 60
-    _pause_exporter(ctx, hold + 120)
-    detection = _wait_completion_error(
-        ctx, started, name="dcgm-error", validation="VALIDATE_HOST"
+def _completion_workflow(document: dict[str, Any]) -> dict[str, Any] | None:
+    """The field-completeness incident's first workflow, or None."""
+
+    chain = judged_chain(document, COMPLETENESS)
+    return None if chain is None else chain[1]
+
+
+def _validation_reached(document: dict[str, Any]) -> bool:
+    """The chain's VALIDATE_HOST has read its evidence at least once (an
+    execution record in any status), or the workflow ended before it ran."""
+
+    workflow = _completion_workflow(document)
+    if workflow is None:
+        return False
+    return str(workflow.get("status")) in TERMINAL_WORKFLOWS or bool(
+        executions(workflow, VALIDATION)
     )
-    incidents = finding_incidents(detection, "dcgm_field_completeness")
-    stages = {
-        "chain": chain_errors(
-            detection,
-            ChainExpectation(
-                metric="dcgm_field_completeness",
-                operations=("TRIGGER_HEALTH_SNAPSHOT", "VALIDATE_HOST"),
-                validation="VALIDATE_HOST",
-                forbidden=_hardware() | {"RUN_DCGM_DIAGNOSTIC"},
-                incident_states=DIAGNOSTIC_ONLY_STATES,
-            ),
-        ),
-        "hardware": hardware_errors(detection),
-        "unknown": _observation_unknown(detection, "GPU_METRICS"),
+
+
+def _validation_terminal(document: dict[str, Any]) -> bool:
+    return chain_judgeable(document, COMPLETENESS, validation=VALIDATION)
+
+
+def _validation_execution(document: dict[str, Any]) -> dict[str, Any] | None:
+    workflow = _completion_workflow(document)
+    return None if workflow is None else final_execution(workflow, VALIDATION)
+
+
+def _completeness_chain(*, validation: str | None) -> ChainExpectation:
+    """The bounded chain: a snapshot and the observation validation, nothing
+    hardware or stress; with ``validation``, that step finished SUCCEEDED and
+    the incident is in a diagnostic-only state."""
+
+    return ChainExpectation(
+        metric=COMPLETENESS,
+        operations=("TRIGGER_HEALTH_SNAPSHOT", VALIDATION),
+        validation=validation,
+        forbidden=_hardware() | {"RUN_DCGM_DIAGNOSTIC"},
+        incident_states=DIAGNOSTIC_ONLY_STATES if validation else frozenset(),
+    )
+
+
+def _moment(value: Any) -> datetime | None:
+    try:
+        moment = parse_time(value)
+    except ValueError:
+        return None
+    if moment is not None and moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment
+
+
+def _paused_errors(
+    document: dict[str, Any], execution: dict[str, Any] | None
+) -> list[str]:
+    """While the exporter is paused: the incident and its bounded chain, and a
+    validation that has not passed on a success that cannot exist yet."""
+
+    errors = chain_errors(document, _completeness_chain(validation=None))
+    if execution is not None and execution.get("status") == "SUCCEEDED":
+        errors.append(
+            f"{VALIDATION} SUCCEEDED while the exporter was still paused: a stale "
+            "success passed the observation validation"
+        )
+    return errors
+
+
+def _validation_errors(
+    execution: dict[str, Any] | None, resumed_at: datetime
+) -> list[str]:
+    """What the chain stage does not say about a terminal validation: a
+    success older than the resume, or a wait that ran into the product's
+    per-step cap instead of finding fresh evidence."""
+
+    if execution is None:
+        return []
+    details = execution.get("details") or {}
+    status = execution.get("status")
+    if status == "SUCCEEDED":
+        finished = _moment(execution.get("updated_at"))
+        if finished is not None and finished < resumed_at:
+            return [
+                f"{VALIDATION} succeeded at {finished.isoformat()}, before the "
+                f"exporter was resumed at {resumed_at.isoformat()}: a stale "
+                "success passed the observation validation"
+            ]
+    elif status == "FAILED" and "step_waiting_timeout_seconds" in details:
+        return [
+            f"{VALIDATION} failed on the product's "
+            f"{details['step_waiting_timeout_seconds']} s per-step cap before "
+            "fresh GPU_METRICS evidence arrived: "
+            + str(execution.get("error") or "")[:200]
+        ]
+    return []
+
+
+def _validation_record(
+    paused: dict[str, Any] | None,
+    final: dict[str, Any] | None,
+    resumed_at: datetime,
+) -> dict[str, Any]:
+    """The product's own account of the wait: what VALIDATE_HOST reported while
+    the exporter was paused, and when and how it finished after the resume."""
+
+    record: dict[str, Any] = {
+        "resumed_at": resumed_at.isoformat(),
+        "status": None if final is None else final.get("status"),
     }
-    if not incidents:
-        stages["chain"].append("no dcgm_field_completeness finding reached an incident")
+    if paused is not None:
+        details = paused.get("details") or {}
+        record["while_paused"] = {
+            "status": paused.get("status"),
+            "pending": pending_summary(paused),
+            **{key: details[key] for key in WAITING_DETAIL_KEYS if key in details},
+        }
+    if final is not None:
+        started = _moment(final.get("started_at"))
+        finished = _moment(final.get("updated_at"))
+        record["started_at"] = final.get("started_at")
+        record["finished_at"] = final.get("updated_at")
+        if started is not None and finished is not None:
+            record["waited_seconds"] = int((finished - started).total_seconds())
+        if finished is not None:
+            record["finished_after_resume"] = finished >= resumed_at
+        details = final.get("details") or {}
+        record.update(
+            {key: details[key] for key in WAITING_DETAIL_KEYS if key in details}
+        )
+        if final.get("error"):
+            record["error"] = str(final["error"])[:300]
+    return record
+
+
+def exporter_timeout(ctx: VariantContext) -> dict[str, Any]:
+    """Pause the exporter until the product's chain has reached its validation,
+    judge the bounded chain and the waiting validation on that read, resume the
+    exporter, then judge the validation's completion on the evidence it waited
+    for. The deadman only backs a runner that dies."""
+
+    started = utc_now()
+    _pause_exporter(ctx, EXPORTER_DEADMAN)
+    paused = _wait_completion_error(
+        ctx, started, name="dcgm-error", until=_validation_reached
+    )
+    paused_execution = _validation_execution(paused)
+    stages = {
+        "paused": _paused_errors(paused, paused_execution),
+        "unknown": _observation_unknown(paused, "GPU_METRICS"),
+    }
+    resumed_at = ctx.clock()
     ctx.node("exporter-resume")
     ctx.cleanup.discard("exporter")
+    if _completion_workflow(paused) is None:
+        # No chain to wait for: one read after the resume says what is there.
+        final = _completion_activity(ctx, started)
+    else:
+        final = _wait_completion_error(
+            ctx,
+            started,
+            name="dcgm-validation",
+            until=_validation_terminal,
+            timeout=VALIDATION_BUDGET,
+        )
+    execution = _validation_execution(final)
+    stages["chain"] = chain_errors(final, _completeness_chain(validation=VALIDATION))
+    stages["validation"] = _validation_errors(execution, resumed_at)
+    stages["hardware"] = hardware_errors(final)
     recovered = _await_fresh_success(ctx, "GPU_METRICS")
     stages["recovery"] = recovered["errors"]
-    return _result(stages)
+    return _result(
+        stages,
+        notes=[
+            "the observation validation waits for a GPU_METRICS success newer than "
+            "the finding; it is judged after the exporter resumed, never while paused"
+        ],
+        extra={
+            "validation": _validation_record(paused_execution, execution, resumed_at)
+        },
+    )
 
 
 def sustained_unknown(ctx: VariantContext) -> dict[str, Any]:
@@ -604,10 +804,10 @@ VARIANTS = [
     _spec(
         CASE_025,
         "exporter_timeout",
-        "pause the product-owned dcgm-exporter so its scrape times out",
-        "sustained dcgm_field_completeness error -> one bounded TRIGGER_HEALTH_SNAPSHOT + VALIDATE_HOST; no reset",
+        "pause the product-owned dcgm-exporter so its scrape times out; resume it once the chain waits at its validation",
+        "sustained dcgm_field_completeness error -> one bounded TRIGGER_HEALTH_SNAPSHOT + VALIDATE_HOST that waits for fresh evidence while paused and succeeds after the resume; no reset",
         exporter_timeout,
-        max_minutes=18,
+        max_minutes=20,
     ),
     _spec(
         CASE_025,

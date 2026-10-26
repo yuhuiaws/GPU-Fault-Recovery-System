@@ -123,12 +123,76 @@ def test_completeness_matcher_takes_the_incident_the_product_mints() -> None:
     assert [item["incident_id"] for item in selected] == [f"inc-{event}"], event
 
 
-def dcgm_error_doc(
-    *, state: str = "UNKNOWN", with_workflow: bool = True
+#: What the product's VALIDATE_HOST records while the exporter is paused: the
+#: OBSERVABILITY contract's wait (``health_evidence_validation.pending``) plus
+#: the executor's wait accounting (``execution/step_bounds``) past 300 s.
+WAITING_DETAILS = {
+    "host_diagnostic_failure": True,
+    "health_evidence_pending": "collector state is UNKNOWN",
+    "missing_observations": {f"{NODE}/GPU_METRICS": "COLLECTION_ERROR"},
+    "step_waiting_seconds": 412,
+    "step_waiting_slow": True,
+}
+#: The fake clock of ``make_context`` starts 2026-10-24T00:00Z and moves one
+#: second per reading: a validation that finished at 00:30Z finished after the
+#: resume, one that finished the day before did not.
+VALIDATION_STARTED = "2026-10-24T00:24:00+00:00"
+VALIDATION_FINISHED = "2026-10-24T00:30:00+00:00"
+VALIDATION_STALE = "2026-10-23T23:59:00+00:00"
+
+
+def validation_execution(
+    status: str,
+    *,
+    details: dict[str, Any] | None = None,
+    error: str | None = None,
+    started_at: str = VALIDATION_STARTED,
+    updated_at: str = VALIDATION_FINISHED,
 ) -> dict[str, Any]:
+    return {
+        "step_index": 2,
+        "operation": "VALIDATE_HOST",
+        "status": status,
+        "details": dict(WAITING_DETAILS if details is None else details),
+        "error": error,
+        "started_at": started_at,
+        "updated_at": updated_at,
+    }
+
+
+WAITING_EXECUTION = validation_execution("WAITING", updated_at=VALIDATION_STARTED)
+SUCCEEDED_EXECUTION = validation_execution(
+    "SUCCEEDED", details={"validation": "VALIDATE_HOST", "observation_state": "HEALTHY"}
+)
+#: The executor's per-step cap (``bounded_waiting_outcome``): FAILED with the
+#: cap in the details and the diagnostic-only incident closed RECOVERED.
+CAP_EXECUTION = validation_execution(
+    "FAILED",
+    details={**WAITING_DETAILS, "step_waiting_timeout_seconds": 600},
+    error="step 2/VALIDATE_HOST stayed non-terminal for 600s, past the 600s per-step cap",
+)
+
+
+def dcgm_error_doc(
+    *,
+    state: str = "UNKNOWN",
+    with_workflow: bool = True,
+    execution: dict[str, Any] | None = WAITING_EXECUTION,
+    workflow_status: str = "RUNNING",
+    incident_state: str = "ACTION_PENDING",
+    collector_statuses: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """The node's activity while the exporter is paused: the completeness
+    incident, its chain at VALIDATE_HOST (``execution``; None = not yet run)."""
+
     event = completeness_event()
     inc = {
-        **incident("inc-dcgm", "dcgm_field_completeness", workflow="wf-dcgm"),
+        **incident(
+            "inc-dcgm",
+            "dcgm_field_completeness",
+            workflow="wf-dcgm",
+            state=incident_state,
+        ),
         "event_id": event,
         "incident_id": "inc-dcgm",
     }
@@ -139,10 +203,8 @@ def dcgm_error_doc(
                 "wf-dcgm",
                 "inc-dcgm",
                 ["FREEZE_EVIDENCE", "TRIGGER_HEALTH_SNAPSHOT", "VALIDATE_HOST"],
-                status="SUCCEEDED",
-                executions=[
-                    {"operation": "VALIDATE_HOST", "status": "SUCCEEDED", "details": {}}
-                ],
+                status=workflow_status,
+                executions=[execution] if execution is not None else [],
             )
         ]
     return {
@@ -154,7 +216,8 @@ def dcgm_error_doc(
         "commands": [],
         "health_signals": {},
         "notifications": [],
-        "collector_statuses": [
+        "collector_statuses": collector_statuses
+        or [
             {
                 "collector": "GPU_METRICS",
                 "last_error_at": "2026-10-24T00:05:00+00:00",
@@ -162,6 +225,28 @@ def dcgm_error_doc(
                 "errors": ["scrape failed"],
             }
         ],
+    }
+
+
+def recovered_dcgm_doc(
+    execution: dict[str, Any] = SUCCEEDED_EXECUTION,
+    *,
+    workflow_status: str = "SUCCEEDED",
+    incident_state: str = "RECOVERED",
+) -> dict[str, Any]:
+    """The node's activity after the resume: the chain terminal on fresh
+    GPU_METRICS evidence, the channel HEALTHY with a new success."""
+
+    fresh = fresh_success_doc("GPU_METRICS")
+    return {
+        **dcgm_error_doc(
+            state="HEALTHY",
+            execution=execution,
+            workflow_status=workflow_status,
+            incident_state=incident_state,
+            collector_statuses=fresh["collector_statuses"],
+        ),
+        "agent": fresh["agent"],
     }
 
 
@@ -268,12 +353,222 @@ def context(
     )
 
 
-def test_exporter_timeout_passes(tmp_path: Path) -> None:
+def exporter_timeout_context(
+    tmp_path: Path, paused: dict[str, Any], recovered: dict[str, Any]
+) -> tuple[Any, list[bool]]:
+    """``exporter_timeout`` over two activity shapes -- ``paused`` until the node
+    probe resumed the exporter, ``recovered`` after -- recording for every
+    store read whether the resume had already happened."""
+
     spec = SPECS["exporter_timeout"]
-    docs = [dcgm_error_doc(), dcgm_error_doc(), fresh_success_doc("GPU_METRICS")]
-    ctx = context(spec, tmp_path, docs)
+    node = node_probe(survey())
+    reads: list[bool] = []
+
+    def responder(script: str, *arguments: str) -> dict[str, Any]:
+        resumed = any(call and call[0] == "exporter-resume" for call in node.calls)
+        reads.append(resumed)
+        return dict(recovered if resumed else paused)
+
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=FakeRegional(cpu_python=responder),
+        settings=settings(spec, tmp_path),
+        probes={f"node@{NODE}": node},
+    )
+    return ctx, reads
+
+
+def test_exporter_timeout_passes(tmp_path: Path) -> None:
+    """Live 2026-10-26 (eksb): the variant demanded a finished VALIDATE_HOST
+    while the exporter was still paused, which the product refuses by design
+    (it waits for a GPU_METRICS success newer than the finding). The proof is
+    now ordered: paused -> incident + planned bounded chain + a validation that
+    waits; resume; then the validation SUCCEEDED on the evidence it waited for.
+    """
+
+    spec = SPECS["exporter_timeout"]
+    ctx, reads = exporter_timeout_context(
+        tmp_path, dcgm_error_doc(), recovered_dcgm_doc()
+    )
     result = spec.execute(ctx)
     assert result["verdict"] == "PASS", result["errors"]
+    assert set(result["stages"]) == {
+        "paused",
+        "unknown",
+        "chain",
+        "validation",
+        "hardware",
+        "recovery",
+    }, result["stages"]
+    node = ctx.probes[f"node@{NODE}"]
+    names = [call[0] for call in node.calls]
+    assert names.count("exporter-resume") == 1, names
+    assert names.index("exporter-pause") < names.index("exporter-resume"), names
+    # The chain was read while paused and judged terminal only after the resume.
+    assert reads[0] is False and reads[-1] is True, reads
+    validation = result["validation"]
+    assert validation["status"] == "SUCCEEDED", validation
+    assert validation["finished_after_resume"] is True, validation
+    assert validation["waited_seconds"] == 360, validation
+    paused = validation["while_paused"]
+    assert paused["status"] == "WAITING", paused
+    assert paused["health_evidence_pending"] == "collector state is UNKNOWN", paused
+    assert f"{NODE}/GPU_METRICS" in paused["missing_observations"], paused
+    assert paused["step_waiting_slow"] is True, paused
+    assert paused["step_waiting_seconds"] == 412, paused
+    assert "GPU_METRICS" in paused["pending"], paused
+
+
+def test_exporter_timeout_waits_for_the_validation_to_be_reached(
+    tmp_path: Path,
+) -> None:
+    """The paused read is taken once VALIDATE_HOST has a record: a chain that
+    only reached its snapshot is polled again, with the exporter still paused."""
+
+    spec = SPECS["exporter_timeout"]
+    node = node_probe(survey())
+    before = [dcgm_error_doc(execution=None)] * 3 + [dcgm_error_doc()]
+    served = iter(before)
+    polls: list[str] = []
+
+    def responder(script: str, *arguments: str) -> dict[str, Any]:
+        if any(call and call[0] == "exporter-resume" for call in node.calls):
+            polls.append("after")
+            return recovered_dcgm_doc()
+        polls.append("before")
+        return dict(next(served, before[-1]))
+
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=FakeRegional(cpu_python=responder),
+        settings=settings(spec, tmp_path),
+        probes={f"node@{NODE}": node},
+    )
+    result = spec.execute(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    assert polls.count("before") == 4, polls
+    assert polls.index("after") == 4, polls
+
+
+def test_exporter_timeout_fails_a_validation_passed_while_paused(
+    tmp_path: Path,
+) -> None:
+    """A SUCCEEDED VALIDATE_HOST while the only GPU_METRICS source is paused is
+    a stale success passing the observation validation (spec 025)."""
+
+    spec = SPECS["exporter_timeout"]
+    stale = dcgm_error_doc(
+        execution=validation_execution("SUCCEEDED", updated_at=VALIDATION_STALE),
+        workflow_status="SUCCEEDED",
+        incident_state="RECOVERED",
+    )
+    ctx, _reads = exporter_timeout_context(tmp_path, stale, recovered_dcgm_doc())
+    result = spec.execute(ctx)
+    assert result["verdict"] == "FAIL", result["errors"]
+    assert result["stages"]["paused"] == [
+        "VALIDATE_HOST SUCCEEDED while the exporter was still paused: a stale "
+        "success passed the observation validation"
+    ], result["stages"]
+
+
+def test_exporter_timeout_fails_a_validation_that_predates_the_resume(
+    tmp_path: Path,
+) -> None:
+    """The terminal record is dated: a success stamped before the resume did
+    not come from the evidence the resume produced."""
+
+    spec = SPECS["exporter_timeout"]
+    early = recovered_dcgm_doc(
+        validation_execution("SUCCEEDED", updated_at=VALIDATION_STALE)
+    )
+    ctx, _reads = exporter_timeout_context(tmp_path, dcgm_error_doc(), early)
+    result = spec.execute(ctx)
+    assert result["verdict"] == "FAIL", result["errors"]
+    assert result["stages"]["chain"] == [], result["stages"]
+    assert len(result["stages"]["validation"]) == 1, result["stages"]
+    assert "before the exporter was resumed" in result["stages"]["validation"][0]
+    assert result["validation"]["finished_after_resume"] is False
+
+
+def test_exporter_timeout_names_the_product_cap(tmp_path: Path) -> None:
+    """A VALIDATE_HOST that ran into the executor's 600 s per-step cap before
+    fresh evidence arrived is named as such, next to the chain's verdict."""
+
+    spec = SPECS["exporter_timeout"]
+    capped = recovered_dcgm_doc(CAP_EXECUTION, workflow_status="FAILED")
+    ctx, _reads = exporter_timeout_context(tmp_path, dcgm_error_doc(), capped)
+    result = spec.execute(ctx)
+    assert result["verdict"] == "FAIL", result["errors"]
+    assert result["stages"]["validation"] == [
+        "VALIDATE_HOST failed on the product's 600 s per-step cap before fresh "
+        "GPU_METRICS evidence arrived: step 2/VALIDATE_HOST stayed non-terminal "
+        "for 600s, past the 600s per-step cap"
+    ], result["stages"]
+    assert any("ended FAILED" in error for error in result["stages"]["chain"]), result[
+        "stages"
+    ]
+    assert result["validation"]["step_waiting_timeout_seconds"] == 600
+
+
+def test_exporter_timeout_reports_a_validation_still_waiting(tmp_path: Path) -> None:
+    """A validation that never finishes inside VALIDATION_BUDGET after the
+    resume is reported with what it waits for -- the product's words."""
+
+    spec = SPECS["exporter_timeout"]
+    stuck = recovered_dcgm_doc(WAITING_EXECUTION, workflow_status="RUNNING")
+    ctx, reads = exporter_timeout_context(tmp_path, dcgm_error_doc(), stuck)
+    result = spec.execute(ctx)
+    assert result["verdict"] == "FAIL", result["errors"]
+    assert result["stages"]["chain"] == [
+        "VALIDATE_HOST did not finish: still WAITING (collector state is UNKNOWN: "
+        f"{NODE}/GPU_METRICS=COLLECTION_ERROR)"
+    ], result["stages"]
+    assert result["stages"]["validation"] == [], result["stages"]
+    # The post-resume wait ran its 300 s budget on the fixture clock.
+    assert reads.count(True) >= col.VALIDATION_BUDGET // 2, len(reads)
+
+
+def test_exporter_timeout_without_a_chain_reads_once_after_the_resume(
+    tmp_path: Path,
+) -> None:
+    """No incident inside DCGM_BUDGET: the resume is not followed by a
+    validation wait -- one read, and both stages say the chain never came."""
+
+    spec = SPECS["exporter_timeout"]
+    empty = {**dcgm_error_doc(), "incidents": [], "workflows": []}
+    ctx, reads = exporter_timeout_context(
+        tmp_path, empty, {**recovered_dcgm_doc(), "incidents": [], "workflows": []}
+    )
+    result = spec.execute(ctx)
+    assert result["verdict"] == "FAIL", result["errors"]
+    assert result["stages"]["paused"] == [
+        "no dcgm_field_completeness finding reached an incident"
+    ], result["stages"]
+    assert result["stages"]["chain"] == [
+        "no dcgm_field_completeness finding reached an incident"
+    ], result["stages"]
+    # one activity read for the chain after the resume, then the fresh-success
+    # read pair -- never the 300 s validation wait.
+    assert reads.count(True) <= 4, reads
+
+
+def test_exporter_timeout_budgets_follow_the_product(tmp_path: Path) -> None:
+    """The deadman outlives the detection budget (720 s) by three minutes as
+    before; the post-resume validation budget is half the product's 600 s
+    per-step cap; the window covers detection + validation + a fresh success."""
+
+    assert col.EXPORTER_DEADMAN == 900, col.EXPORTER_DEADMAN
+    assert col.VALIDATION_BUDGET == 300, col.VALIDATION_BUDGET
+    assert SPECS["exporter_timeout"].max_minutes == 20, SPECS["exporter_timeout"]
+    ctx, _reads = exporter_timeout_context(
+        tmp_path, dcgm_error_doc(), recovered_dcgm_doc()
+    )
+    SPECS["exporter_timeout"].execute(ctx)
+    node = ctx.probes[f"node@{NODE}"]
+    pause = next(call for call in node.calls if call[0] == "exporter-pause")
+    assert pause[pause.index("--seconds") + 1] == "900", pause
 
 
 def test_exporter_timeout_inconclusive_without_exporter(tmp_path: Path) -> None:
@@ -289,9 +584,19 @@ def test_exporter_timeout_fails_on_hardware_step(tmp_path: Path) -> None:
     bad["workflows"][0]["official_steps"].append(
         {"operation": "RESET_GPU", "parameters": {}}
     )
-    ctx = context(spec, tmp_path, [bad, bad, fresh_success_doc("GPU_METRICS")])
+    recovered = recovered_dcgm_doc()
+    recovered["workflows"][0]["official_steps"].append(
+        {"operation": "RESET_GPU", "parameters": {}}
+    )
+    ctx, _reads = exporter_timeout_context(tmp_path, bad, recovered)
     result = spec.execute(ctx)
     assert result["verdict"] == "FAIL"
+    assert any("RESET_GPU" in error for error in result["stages"]["paused"]), result[
+        "stages"
+    ]
+    assert any("RESET_GPU" in error for error in result["stages"]["hardware"]), result[
+        "stages"
+    ]
 
 
 def test_sustained_unknown_and_post_refresh_pass(tmp_path: Path) -> None:

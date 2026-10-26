@@ -230,7 +230,14 @@ def chain_judgeable(
 
 
 def pending_summary(execution: dict[str, Any]) -> str:
-    """What a WAITING validation says it waits for, one line."""
+    """What a WAITING validation says it waits for, one line.
+
+    The adapter's ``node_pending`` when it has one; the health-evidence wait
+    (``health_evidence_validation.pending``: ``health_evidence_pending`` with
+    the ``missing_observations`` it names -- live 2026-10-26 025
+    ``exporter_timeout`` reported only the detail keys); else the error or
+    the detail keys.
+    """
 
     details = execution.get("details") or {}
     pending = details.get("node_pending")
@@ -241,6 +248,15 @@ def pending_summary(execution: dict[str, Any]) -> str:
             else f"{node}: {reasons}"
             for node, reasons in sorted(pending.items())
         )[:300]
+    evidence = details.get("health_evidence_pending")
+    if evidence:
+        missing = details.get("missing_observations")
+        text = str(evidence)
+        if isinstance(missing, dict) and missing:
+            text += ": " + ", ".join(
+                f"{key}={value}" for key, value in sorted(missing.items())
+            )
+        return text[:300]
     return str(execution.get("error") or sorted(details) or "no detail")[:300]
 
 
