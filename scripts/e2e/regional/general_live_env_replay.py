@@ -9,10 +9,24 @@ replay tool ``tools/gpu_environment_replay.py`` may change (its
 does not carry them). This module runs that tool the way ``run_env_live.py``
 does -- the audited loopback proxy served by ``probes/env_replay_proxy.py`` on
 the node, the one metrics collector unit repointed through a ``/run`` drop-in
-with a ``systemd-run`` deadman armed first, pass-through until ``arm`` -- but
-inside a variant's ``VariantContext``: cleanup on the LIFO stack, receipts and
-the proxy's ``/status`` readings in the evidence, and the general-live error
-semantics (``VariantInconclusive`` when the injection cannot be shown).
+(a run-scoped ``EnvironmentFile=``, restarted, the endpoint read back from the
+new process) with a ``systemd-run`` deadman armed first, pass-through until
+``arm`` -- but inside a variant's ``VariantContext``: cleanup on the LIFO stack,
+receipts and the proxy's ``/status`` readings in the evidence, and the
+general-live error semantics (``VariantInconclusive`` when the injection cannot
+be shown).
+
+``deploy`` arms nothing until the repoint is **proven**: the probe's receipt
+must say the restarted collector process reads the proxy and made its first
+pass-through read of it (``repoint_proof``). A repoint without that proof is a
+``RegionalFixtureError`` -- the runner's INCONCLUSIVE "harness fixture failed"
+with the reason -- and never a replay budget to wait out: live 2026-10-26
+(plain EKS, 024 ``thermal_warning`` and ``power_performance``) the probe's
+former ``Environment=`` drop-in restarted the collector, ``systemctl show``
+reported the override, the process kept reading the real exporter, and the
+variants spent their 12-read budget on "the collector consumed 0 of the 12
+armed replay reads". ``close`` restores whenever a repoint was *attempted*, not
+only when it answered, so a call that failed midway is undone as well.
 
 Only the reviewed plan is new per variant (``env_live_plans.thermal_stress_plan``,
 ``power_limit_throttling_plan``); the tool, its allow-list, the probe and the
@@ -29,6 +43,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from scripts.e2e.regional.env_live_fixture import (
+    ENDPOINT_ENV,
     PLAN_FILE,
     EnvReplayController,
     replay_tool_sha256,
@@ -95,17 +110,56 @@ def checked_plan(plan: dict[str, Any]) -> dict[str, Any]:
     return plan
 
 
+def repoint_proof(receipt: dict[str, Any], proxy_endpoint: str) -> dict[str, Any]:
+    """The repoint receipt's proof that the collector really reads the proxy.
+
+    Three facts, all from the node: the probe judged the repoint effective
+    (``repointed``), the restarted process's own environment names the proxy
+    (``process_environment``) and the proxy counted that process's first
+    pass-through read (``first_read.observed``). Anything less -- including a
+    receipt from an older probe copy that carries none of them -- is a fixture
+    error with the reason, raised before anything is armed.
+    """
+
+    reason = receipt.get("reason")
+    if receipt.get("repointed") is False:
+        raise RegionalFixtureError(
+            f"the metrics collector repoint did not take effect: {reason}"
+        )
+    process = receipt.get("process_environment")
+    first_read = receipt.get("first_read")
+    if receipt.get("repointed") is not True or not isinstance(first_read, dict):
+        raise RegionalFixtureError(
+            "the repoint receipt carries no first-read proof (repointed="
+            f"{receipt.get('repointed')!r}, first_read={first_read!r}); refuse to arm"
+        )
+    endpoint = (process or {}).get(ENDPOINT_ENV)
+    if endpoint != proxy_endpoint:
+        raise RegionalFixtureError(
+            f"the collector process reads {endpoint!r}, not the proxy "
+            f"{proxy_endpoint}; refuse to arm"
+        )
+    if first_read.get("observed") is not True:
+        raise RegionalFixtureError(
+            "the repointed collector made no pass-through read of the proxy "
+            f"({first_read}); refuse to arm"
+        )
+    return {"process_endpoint": endpoint, "first_read": first_read}
+
+
 @dataclass
 class EnvReplay:
     """One reviewed environment replay on the node, cleanup registered.
 
     ``deploy`` ships the audited tool and the plan, starts the proxy pass-through,
-    repoints the collector (deadman first, inside the probe) and proves the
-    proxy is still unarmed; ``arm`` starts the plan. ``wait_served`` is the raw
-    -source oracle: the proxy's ``/status`` must show the collector really
-    consumed the plan's reads and the tool never aborted on a real unsafe
-    reading. ``close`` restores the endpoint before it stops the proxy (one
-    producer at every moment) and verifies both.
+    repoints the collector (deadman first, inside the probe), requires the
+    probe's proof that the restarted collector reads the proxy
+    (``repoint_proof``) and proves the proxy is still unarmed; ``arm`` starts
+    the plan. ``wait_served`` is the raw-source oracle: the proxy's ``/status``
+    must show the collector really consumed the plan's reads and the tool never
+    aborted on a real unsafe reading. ``close`` restores the endpoint (whenever
+    a repoint was attempted) before it stops the proxy (one producer at every
+    moment) and verifies both.
     """
 
     ctx: VariantContext
@@ -117,6 +171,10 @@ class EnvReplay:
     statuses: list[dict[str, Any]] = field(default_factory=list)
     reads_at_arm: int | None = None
     armed_at: Any = None
+    #: Set before the repoint call: a call that failed midway may have changed
+    #: the node, so ``close`` restores whenever this is set.
+    repoint_attempted: bool = False
+    proof: dict[str, Any] = field(default_factory=dict)
     deployed: bool = False
     armed: bool = False
     closed: bool = False
@@ -158,7 +216,7 @@ class EnvReplay:
 
     # -- lifecycle ------------------------------------------------------- #
     def deploy(self) -> dict[str, Any]:
-        """Install, serve pass-through, repoint; the plan is not armed yet."""
+        """Install, serve pass-through, repoint and prove it; nothing is armed."""
 
         self.ctx.cleanup.push(CLEANUP_NAME, self.cleanup)
         self.controller.create()
@@ -170,11 +228,15 @@ class EnvReplay:
             port=PORT,
             max_seconds=self.window_seconds,
         )
+        self.repoint_attempted = True
         self.receipts["repoint"] = self.controller.repoint(
             port=PORT,
             restore_seconds=min(
                 MAX_RESTORE_SECONDS, self.window_seconds + DEADMAN_MARGIN_SECONDS
             ),
+        )
+        self.proof = repoint_proof(
+            self.receipts["repoint"], f"http://127.0.0.1:{PORT}/metrics"
         )
         self.deployed = True
         status = self.status()
@@ -254,8 +316,11 @@ class EnvReplay:
         if self.closed:
             return dict(self.receipts.get("close") or {})
         receipts: dict[str, Any] = {}
-        if self.deployed:
+        if self.repoint_attempted:
+            # Whatever the repoint call answered (or failed to): the probe's
+            # restore is idempotent and restarts nothing on a clean unit.
             receipts["restore"] = self.controller.restore()
+            self.repoint_attempted = False
             self.deployed = False
         receipts["stop_proxy"] = self.controller.stop_proxy(port=PORT)
         self.closed = True
@@ -301,6 +366,8 @@ class EnvReplay:
             "plan_fields": sorted(plan_fields(self.plan)),
             "gpu_uuid": self.gpu_uuid,
             "window_seconds": self.window_seconds,
+            "collector_process_endpoint": self.proof.get("process_endpoint"),
+            "collector_first_read": self.proof.get("first_read"),
             "armed": self.armed,
             "armed_at": self.armed_at.isoformat() if self.armed_at else None,
             "reads_at_arm": self.reads_at_arm,
@@ -331,4 +398,5 @@ __all__ = [
     "plan_fields",
     "plan_reads",
     "plan_sha256",
+    "repoint_proof",
 ]

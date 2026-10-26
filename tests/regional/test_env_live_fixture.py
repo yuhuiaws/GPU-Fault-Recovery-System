@@ -257,6 +257,56 @@ def test_controller_cleanup_restores_endpoint_before_stopping_proxy(
     assert controller.host.cleaned, controller.host.calls
 
 
+def test_controller_fails_the_fixture_when_the_probe_rolled_the_repoint_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The probe restarted the unit, read its process environment, waited for
+    # the first pass-through read and judged the repoint ineffective: it has
+    # rolled the drop-in back and answers ``repointed: false`` with the reason.
+    # That is a fixture error here -- raised with the reason, never a replay
+    # budget to wait out -- and the unit is still marked for the restore.
+    controller = _controller(monkeypatch, tmp_path)
+    controller.create()
+    host = controller.host
+    original = host.execute
+
+    def execute(*arguments: str, timeout: int = 180) -> dict[str, Any]:
+        if arguments[0] == "repoint-collector":
+            host.calls.append(arguments)
+            return {
+                "repointed": False,
+                "reason": "the repointed collector made no pass-through read of "
+                "the proxy inside the first-read budget",
+                "process_environment": {
+                    fixture.ENDPOINT_ENV: "http://127.0.0.1:9411/metrics"
+                },
+                "first_read": {
+                    "observed": False,
+                    "reads_before": 0,
+                    "reads_after": 0,
+                    "waited_seconds": 65.0,
+                    "budget_seconds": 65,
+                },
+                "rollback": {
+                    "restarted": True,
+                    "restored_endpoint": "http://127.0.0.1:9400/metrics",
+                },
+            }
+        return original(*arguments, timeout=timeout)
+
+    monkeypatch.setattr(host, "execute", execute)
+    with pytest.raises(RegionalFixtureError) as info:
+        controller.repoint()
+    message = str(info.value)
+    assert "did not take effect on node-a" in message
+    assert "no pass-through read of the proxy" in message
+    assert "restarted=True" in message and "9400/metrics" in message
+    receipts = controller.cleanup()
+    verbs = [call[0] for call in host.calls]
+    assert verbs.index("restore-collector") < verbs.index("stop-proxy")
+    assert "restore" in receipts and "stop_proxy" in receipts
+
+
 def test_control_plane_reads_use_the_general_live_probes() -> None:
     """The node's GPU records and NODE_HEALTH activity, not the XID snapshot.
 

@@ -73,6 +73,8 @@ SCOPE_CASE_ID = "GF-ENV-LIVE-010"
 #: The file names the node side writes the plan and the tool under.
 PLAN_FILE = "plan.json"
 TOOL_FILE = "gpu_environment_replay.py"
+#: The endpoint variable the probe reads back from the collector process.
+ENDPOINT_ENV = "GPU_FAULT_DCGM_METRICS_URL"
 EXPORTER_POD_PREFIX = "gpu-fault-dcgm-exporter"
 #: The live T.Limit reading must be at least this far above zero before the run
 #: arms, so the device is plainly in a safe state (the tool aborts at <= 0).
@@ -676,6 +678,20 @@ class EnvReplayController:
     def repoint(
         self, *, port: int = 9411, restore_seconds: int = 600
     ) -> dict[str, Any]:
+        """Repoint the metrics collector at the proxy and require the proof.
+
+        The probe restarts the unit, reads the endpoint back from the new
+        process and waits for its first pass-through read of the proxy (up to
+        the collector's start-up spread plus one interval, so the call may take
+        well over a minute). A repoint the probe rolled back as ineffective
+        answers ``repointed: false`` with a constant reason; that is a fixture
+        error here, raised with the reason, never a replay budget to wait out.
+        The unit is marked for restore *before* the call: a call that fails
+        midway (a timeout after the drop-in was written) must still be undone
+        by ``cleanup``.
+        """
+
+        self._repointed = True
         receipt = self.execute(
             "repoint-collector",
             "--run-id",
@@ -684,9 +700,19 @@ class EnvReplayController:
             str(port),
             "--restore-seconds",
             str(restore_seconds),
-            timeout=120,
+            timeout=180,
         )
-        self._repointed = True
+        if receipt.get("repointed") is False:
+            rollback = receipt.get("rollback") or {}
+            process = receipt.get("process_environment") or {}
+            raise RegionalFixtureError(
+                "the metrics collector repoint did not take effect on "
+                f"{self.node}: {receipt.get('reason') or 'no reason given'} "
+                f"(process endpoint {process.get(ENDPOINT_ENV)!r}, first read "
+                f"{receipt.get('first_read')}; the probe restored the unit: "
+                f"restarted={rollback.get('restarted')}, "
+                f"restored_endpoint={rollback.get('restored_endpoint')!r})"
+            )
         return receipt
 
     def status(self, *, port: int = 9411) -> dict[str, Any]:

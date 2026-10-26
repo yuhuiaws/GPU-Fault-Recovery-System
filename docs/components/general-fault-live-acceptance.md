@@ -2035,7 +2035,11 @@ GPU 解析到目标卡；复合的 `component_metrics`/`component_finding_ids` �
 `general_live_gpu_environment.py` + `general_live_env_replay.py`，无需新令牌）：
 `tools/gpu_environment_replay.py` 的 `ALLOWED_FIELDS` 原样覆盖温度/T.Limit、热/功耗
 violation、clock reason、功耗/限值/利用率，由 `probes/env_replay_proxy.py` 装入并以
-`/run` drop-in 重指 `gpu-fault-metrics-collector.service`（deadman 先布置，透传到 arm）。
+`/run` drop-in 重指 `gpu-fault-metrics-collector.service`（deadman 先布置；drop-in 以
+run 级 `EnvironmentFile=-/run/gpu-fault-env-replay/<id>/collector.env` 交给单元而**不用**
+`Environment=`；重启单元后从新进程的 `/proc/<MainPID>/environ` 读回 endpoint，并等到该
+进程对代理的**第一次透传读**（代理 `/status` 的 `reads` 前进，预算 = 启动 spread + 启动
+jitter + 一个采集周期 + 余量，不超过 90 s）才算重指成立；透传到 arm）。
 计划来自 `env_live_plans.thermal_stress_plan`（warning 区间核心温度，刻度按设备自身
 `nvidia-smi` 限值决定，与 003/006 相同；thermal violation 从设备真实计数之上递增；
 `0x20` 软件热 reason，绝不 `0x80`）和 `power_limit_throttling_plan`（violation 递增、
@@ -2048,6 +2052,22 @@ workflow：恰一条复合 incident，组件 finding 被抑制进复合（复合
 组件 incident），复合只由自己的指标组成；代理 `/status` 证明采集器确实消费了全部回放
 读数、工具未因真实不安全读数中止，产品接受过回放的 warning 样本；尾部平直/清零后先还原
 endpoint 再等待无活动 finding 的新批次（不要求硬件累计计数器归零）。
+
+重指必须先被**证明**再 arm（`general_live_env_replay.repoint_proof`）：2026-10-26 两个变体在
+plain EKS 的首次实况（R13g）都以 INCONCLUSIVE “the collector consumed 0 of the 12 armed
+replay reads inside the budget” 结束、未判任何产品行为——共用的环境回放探针当时用 drop-in
+`Environment=GPU_FAULT_DCGM_METRICS_URL=<代理>` 重指并确实重启了单元（回执里 InvocationID、
+MainPID 都变了），但单元自己的 `EnvironmentFile=/etc/gpu-fault/collector.env`（节点安装器把
+真实 exporter URL 写在那里）覆盖一切 `Environment=`（systemd.exec(5)），新进程仍读真实
+exporter，而 `systemctl show` 只列 `Environment=` 指令，让探针的校验假阳性通过。GF-ENV-LIVE
+全部用例走同一探针，10-24 HyperPod 一轮的 “consumed 0 of N reads” 同因；更早的 GF-ENV-LIVE
+PASS 未判读数。现在探针在节点上自行判定：进程环境不含代理 endpoint、或预算内没有第一次透传读，
+就立即回滚（删 drop-in 与环境文件、reload、重启、读回真实 endpoint、停 deadman）并回答
+`repointed:false` + 固定 `reason`；`EnvReplayController.repoint` 把它抛成 `RegionalFixtureError`
+（运行器记 INCONCLUSIVE “harness fixture failed: ... did not take effect”），不再等 12 读预算。
+回执缺少证明（旧探针副本）、进程 endpoint 不是代理、`first_read.observed` 不为真，夹具同样拒绝
+arm。还原幂等（干净单元不重启），且只要发起过重指（即便调用中途失败）`close` 都会先还原再停代理。
+两个变体需在两集群重跑，目前仍无产品证据。
 
 规格明示、注入有效但产品不足的按 `expected_outcome="FAIL"` + `product_gap` 记录，不
 掩盖。首批记为预期 FAIL 的四个产品缺口——025 `one_gpu_missing`（完整性按全批 union

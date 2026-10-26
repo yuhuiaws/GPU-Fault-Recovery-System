@@ -15,6 +15,7 @@ from scripts.e2e.regional import general_live_registry as reg
 from scripts.e2e.regional.general_live_env_replay import PROBE_KEY
 from scripts.e2e.regional.general_live_fixture import VariantInconclusive, VariantNotRun
 from scripts.e2e.regional.general_live_gpu_replay import GpuSurvey
+from scripts.e2e.regional.regional_commands import RegionalFixtureError
 from tests.regional._general_live_fakes import (
     FakeProbe,
     FakeRegional,
@@ -93,9 +94,21 @@ def _env_script() -> dict[str, Any]:
         "preflight": {"boot_id": "b"},
         "install-source": {"ok": True},
         "deploy-proxy": {"status": {"armed": False}, "endpoint": PROXY},
+        # The probe's proof rides in the repoint receipt: the restarted
+        # collector process reads the proxy and the proxy counted its first
+        # pass-through read.
         "repoint-collector": {
+            "repointed": True,
             "original_endpoint": REAL,
             "proxy_endpoint": PROXY,
+            "process_environment": {"GPU_FAULT_DCGM_METRICS_URL": PROXY},
+            "first_read": {
+                "observed": True,
+                "reads_before": 0,
+                "reads_after": 1,
+                "waited_seconds": 21.0,
+                "budget_seconds": 65,
+            },
             "after": {"ActiveState": "active"},
         },
         "arm": {"armed": True, "status": {"armed": True, "reads": 3}},
@@ -308,6 +321,80 @@ def test_thermal_warning_is_a_warning_diagnostic_composite(tmp_path: Path) -> No
     assert verbs.index("repoint-collector") < verbs.index("arm")
     assert verbs.index("restore-collector") < verbs.index("stop-proxy")
     assert ctx.cleanup.pending() == [], "the replay closed itself before recovery"
+    assert out["replay"]["collector_process_endpoint"] == PROXY
+    assert out["replay"]["collector_first_read"]["observed"] is True
+
+
+def test_thermal_warning_keeps_the_env_replay_call_sequence(tmp_path: Path) -> None:
+    # Pinned deliberately: the proof that the restarted collector reads the
+    # proxy (process environment + first pass-through read) rides in the
+    # repoint-collector receipt, so the variant arms after one pass-through
+    # status with no extra probe call; one served status, then the endpoint is
+    # restored before the proxy stops and before the recovery wait.
+    incident, workflow = _diagnostic("THERMAL_STRESS")
+    cpu = gpu_cpu_python(
+        activity=_activity([incident], [workflow]),
+        gpu_state=_state(
+            [_finding("THERMAL_STRESS", THERMAL_COMPONENTS)],
+            [{"gpu": G1, "name": "gpu_tlimit_c", "value": WARNING_READING}],
+        ),
+    )
+    ctx = _ctx(tmp_path, "thermal_warning", survey_value=_survey(), cpu=cpu)
+    assert envc.thermal_warning(ctx)["verdict"] == "PASS"
+    env = ctx.probes[f"{PROBE_KEY}@{ctx.settings.node}"]
+    assert [call[0] for call in env.calls] == [
+        "preflight",
+        "install-source",
+        "install-source",
+        "deploy-proxy",
+        "repoint-collector",
+        "status",
+        "arm",
+        "status",
+        "restore-collector",
+        "stop-proxy",
+    ]
+
+
+def test_thermal_warning_is_a_fixture_error_when_the_repoint_did_not_take_effect(
+    tmp_path: Path,
+) -> None:
+    # Live 2026-10-26 (plain EKS): the collector restarted into the drop-in
+    # but kept reading the real exporter, and the variant spent its 12-read
+    # budget on INCONCLUSIVE "consumed 0 of the 12 armed replay reads". The
+    # probe now judges that on the node and rolls back; the variant fails as
+    # a fixture error with the reason before anything is armed, and the
+    # runner's teardown still restores the unit before it stops the proxy.
+    incident, workflow = _diagnostic("THERMAL_STRESS")
+    cpu = gpu_cpu_python(
+        activity=_activity([incident], [workflow]),
+        gpu_state=_state([_finding("THERMAL_STRESS", THERMAL_COMPONENTS)], []),
+    )
+    script = _env_script()
+    script["repoint-collector"] = {
+        "repointed": False,
+        "reason": "the restarted collector process does not read the proxy "
+        "endpoint; the override never reached it",
+        "original_endpoint": REAL,
+        "proxy_endpoint": PROXY,
+        "process_environment": {"GPU_FAULT_DCGM_METRICS_URL": REAL},
+        "rollback": {"restarted": True, "restored_endpoint": REAL},
+        "after": {"ActiveState": "active"},
+    }
+    ctx = _ctx(
+        tmp_path, "thermal_warning", survey_value=_survey(), cpu=cpu, env_script=script
+    )
+    with pytest.raises(RegionalFixtureError, match="did not take effect"):
+        envc.thermal_warning(ctx)
+    env = ctx.probes[f"{PROBE_KEY}@{ctx.settings.node}"]
+    verbs = [call[0] for call in env.calls]
+    assert "arm" not in verbs, "nothing is armed on an unproven repoint"
+    assert verbs[-1] == "repoint-collector"
+    assert ctx.cleanup.pending() == ["env-replay"]
+    results = ctx.cleanup.run()
+    assert all(item["ok"] for item in results), results
+    verbs = [call[0] for call in env.calls]
+    assert verbs[-2:] == ["restore-collector", "stop-proxy"]
 
 
 def test_thermal_warning_fails_when_the_composite_escalates(tmp_path: Path) -> None:

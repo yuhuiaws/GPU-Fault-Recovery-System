@@ -17,13 +17,34 @@ and a ``systemd-run`` deadman:
   ``--serve`` against the real exporter (``127.0.0.1:9400``) on a loopback-only
   port (``127.0.0.1:9411``) with a hard ``RuntimeMaxSec``; it starts pass-through
   and only injects after ``arm``.
-* **repoint-collector** -- a systemd drop-in on the one allow-listed unit
-  (``gpu-fault-metrics-collector.service``) overrides ``GPU_FAULT_DCGM_METRICS_URL``
-  to the proxy. The real exporter config and ``collector.env`` are untouched and
-  no second producer of the same identity is started. A ``systemd-run`` deadman
-  restores the original endpoint if the runner dies.
-* **arm** -- one ``POST /arm`` with the acknowledgement header. ``status`` is a
-  read that never consumes a replay step.
+* **repoint-collector** -- the deadman is armed *first*; then a ``/run`` systemd
+  drop-in on the one allow-listed unit (``gpu-fault-metrics-collector.service``)
+  adds ``EnvironmentFile=-/run/gpu-fault-env-replay/<id>/collector.env``, a
+  run-scoped file holding only ``GPU_FAULT_DCGM_METRICS_URL=<proxy>``. An
+  environment *file*, never ``Environment=``: the installer writes the real
+  endpoint into the unit's own ``EnvironmentFile=/etc/gpu-fault/collector.env``
+  and systemd applies every ``EnvironmentFile=`` after every ``Environment=``,
+  later-listed files winning (systemd.exec(5)) -- the drop-in
+  ``Environment=`` this probe used to write restarted the collector but never
+  reached its process (live 2026-10-26, GF-GENERAL-LIVE-024 ``thermal_warning``
+  and ``power_performance`` on plain EKS; the same signature on every
+  GF-ENV-LIVE case of the HyperPod round of 2026-10-24: "consumed 0 of N
+  reads"). The unit is restarted and the effective endpoint is read from the
+  running process (``/proc/<MainPID>/environ``, once it has exec'd), never
+  from ``systemctl show`` (which lists ``Environment=`` directives only and
+  reported the override as effective). The repoint then waits for the restarted
+  collector's **first pass-through read** of the proxy (``/status`` ``reads``
+  advancing) inside the collector's start-up spread plus one interval; an
+  override the process did not pick up or a collector that never read the proxy
+  is rolled back on the node at once and answered with ``repointed: false`` and
+  a constant ``reason``, so the runner fails the fixture with that reason
+  instead of waiting out a replay budget. The real exporter config and
+  ``collector.env`` are untouched and no second producer of the same identity
+  is started. The ``systemd-run`` deadman restores the original endpoint if the
+  runner dies.
+* **arm** -- one ``POST /arm`` with the acknowledgement header, refused while the
+  collector process does not read the proxy. ``status`` is a read that never
+  consumes a replay step.
 * **pause-collector / pause-status / resume-collector** -- the GF-ENV-LIVE-009
   collection interruption: a transient waiter unit polls the proxy's
   ``/status`` on loopback and ``SIGSTOP``s the metrics unit the moment the
@@ -35,10 +56,15 @@ and a ``systemd-run`` deadman:
   resumes first as well.
 * **restart-collector** -- one ``systemctl restart`` of the same unit with the
   drop-in in place (the 009 freshness / single-producer check).
-* **restore-collector / stop-proxy** -- remove the drop-in and the unit; the
+* **restore-collector / stop-proxy** -- remove the drop-in and its environment
+  file, reload, restart the unit when the drop-in was in place or the process
+  still reads another endpoint, and read the real endpoint back from the new
+  process (a second restore finds nothing to undo and restarts nothing); the
   proxy is stopped only after the endpoint is back on the real exporter.
 
-Every answer is one JSON object on the last stdout line. The Node Agent is
+Every answer is one JSON object on the last stdout line; a failure carries the
+``error_kind: probe`` fields (class, digest, site, message, detail) the host
+fixture keeps redacted in the case's ``probe-error.json``. The Node Agent is
 never in the allow-list; no GPU, workload or exporter configuration is changed.
 """
 
@@ -52,6 +78,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -61,11 +88,47 @@ from urllib.request import Request, build_opener, ProxyHandler
 COLLECTOR_ENV = Path("/etc/gpu-fault/collector.env")
 VENV_PYTHON = Path("/opt/gpu-fault/current/venv/bin/python")
 ACCEPTANCE_ROOT = Path("/run/gpu-fault-env-replay")
+#: Where a running process's environment is read from (``<pid>/environ``).
+PROC_ROOT = Path("/proc")
 #: The one unit a window may repoint. The Node Agent and every other collector
 #: are deliberately absent.
 METRICS_UNIT = "gpu-fault-metrics-collector.service"
 ENDPOINT_ENV = "GPU_FAULT_DCGM_METRICS_URL"
 DEFAULT_UPSTREAM = "http://127.0.0.1:9400/metrics"
+#: The run-scoped environment file the repoint drop-in hands to the unit.
+OVERRIDE_ENV_NAME = "collector.env"
+#: The allow-listed keys read back from the collector process's environment
+#: (``/proc/<MainPID>/environ``) into receipts.
+INTERVAL_ENV = "GPU_FAULT_METRICS_INTERVAL_SECONDS"
+PROCESS_KEYS = (ENDPOINT_ENV, INTERVAL_ENV, "GPU_FAULT_METRICS_MODE")
+#: How long a restarted ``Type=simple`` unit may take to exec its program: the
+#: unit is active from the fork on, and until the child has built its sandbox
+#: and exec'd, ``/proc/<pid>/environ`` is still systemd's own.
+SETTLE_SECONDS = 45
+#: The restarted collector's first scrape follows its start-up spread
+#: (``GPU_FAULT_COLLECTOR_STARTUP_SPREAD_SECONDS``, product default 15) plus a
+#: random start-up jitter (``GPU_FAULT_COLLECTOR_STARTUP_JITTER_SECONDS``,
+#: default 20); the first-read wait allows both, one interval and a margin, and
+#: never more than ``MAX_FIRST_READ_SECONDS`` (the controller's exec timeout
+#: bounds the whole repoint call).
+STARTUP_SPREAD_ENV = "GPU_FAULT_COLLECTOR_STARTUP_SPREAD_SECONDS"
+STARTUP_JITTER_ENV = "GPU_FAULT_COLLECTOR_STARTUP_JITTER_SECONDS"
+DEFAULT_INTERVAL_SECONDS = 15.0
+DEFAULT_STARTUP_SPREAD_SECONDS = 15.0
+DEFAULT_STARTUP_JITTER_SECONDS = 20.0
+FIRST_READ_MARGIN_SECONDS = 15
+MAX_FIRST_READ_SECONDS = 90
+FIRST_READ_POLL_SECONDS = 1.0
+#: The constant reasons a repoint answers ``repointed: false`` with (the probe
+#: has rolled the unit back by then).
+REASON_NOT_PICKED_UP = (
+    "the restarted collector process does not read the proxy endpoint; the "
+    "override never reached it"
+)
+REASON_NO_FIRST_READ = (
+    "the repointed collector made no pass-through read of the proxy inside the "
+    "first-read budget"
+)
 ACKNOWLEDGEMENT = "ISOLATED_GPU_TEST_NODE"
 REPLAY_TOOL_NAME = "gpu_environment_replay.py"
 PLAN_NAME = "plan.json"
@@ -184,6 +247,12 @@ def dropin_path(run_id: str) -> Path:
     return dropin_dir() / f"gpu-fault-env-replay-{digest(run_id)}.conf"
 
 
+def override_env_path(run_id: str) -> Path:
+    """The run's environment file the drop-in lists (``EnvironmentFile=-``)."""
+
+    return run_dir(run_id) / OVERRIDE_ENV_NAME
+
+
 def checked_port(value: int) -> int:
     if not MIN_PORT <= int(value) <= MAX_PORT:
         raise ProbeError(f"port is outside {MIN_PORT}..{MAX_PORT}")
@@ -218,6 +287,11 @@ def baseline_endpoint() -> str:
 
 
 def unit_state(unit: str) -> dict[str, str]:
+    """``systemctl show`` of ``unit``. ``Environment`` lists the unit's
+    ``Environment=`` directives only -- never what an ``EnvironmentFile=``
+    hands the process -- and is kept for the receipts, not for any decision;
+    ``DropInPaths`` is what the restore reads back after its reload."""
+
     completed = run(
         [
             "systemctl",
@@ -229,6 +303,8 @@ def unit_state(unit: str) -> dict[str, str]:
             "--property=NRestarts",
             "--property=MainPID",
             "--property=InvocationID",
+            "--property=ExecMainStartTimestamp",
+            "--property=DropInPaths",
             "--property=Environment",
         ],
         check=False,
@@ -242,16 +318,132 @@ def unit_state(unit: str) -> dict[str, str]:
     return values
 
 
-def effective_endpoint(unit: str) -> str | None:
-    """The ``GPU_FAULT_DCGM_METRICS_URL`` the unit would run with now."""
+def process_environment(
+    pid: str, keys: tuple[str, ...] = PROCESS_KEYS
+) -> dict[str, str]:
+    """The allow-listed keys of a running process's real environment."""
 
-    environment = unit_state(unit).get("Environment") or ""
-    found: str | None = None
-    for token in environment.split():
-        name, separator, value = token.partition("=")
-        if separator and name == ENDPOINT_ENV:
-            found = value
-    return found
+    if not pid or not pid.isdigit() or pid == "0":
+        return {}
+    try:
+        raw = (PROC_ROOT / pid / "environ").read_bytes()
+    except OSError:
+        return {}
+    values: dict[str, str] = {}
+    for item in raw.split(b"\0"):
+        key, separator, value = item.partition(b"=")
+        name = key.decode("utf-8", "replace")
+        if separator and name in keys:
+            values[name] = value.decode("utf-8", "replace")
+    return values
+
+
+def has_execed(pid: str) -> bool:
+    """Whether ``pid`` runs its own program yet, not systemd's pre-exec child.
+
+    systemd names the forked child ``(<exec basename>)`` until it execs and its
+    ``exe`` is still systemd's; from the exec on, ``comm`` and ``exe`` are the
+    service's and ``/proc/<pid>/environ`` is the unit's environment.
+    """
+
+    try:
+        comm = (PROC_ROOT / pid / "comm").read_text(encoding="utf-8", errors="replace")
+        exe = os.readlink(str(PROC_ROOT / pid / "exe"))
+    except OSError:
+        return False
+    return not comm.strip().startswith("(") and Path(exe).name != "systemd"
+
+
+def settled_environment(
+    unit: str, *, seconds: float = SETTLE_SECONDS
+) -> tuple[dict[str, str], dict[str, str]]:
+    """The unit's state and its main process's environment once it has exec'd.
+
+    Returns what it last saw when the window closes; callers check for the
+    endpoint key, which every exec'd collector carries from ``collector.env``.
+    """
+
+    deadline = time.monotonic() + seconds
+    while True:
+        state = unit_state(unit)
+        pid = state.get("MainPID", "")
+        environment = process_environment(pid)
+        if (
+            state.get("ActiveState") == "active"
+            and pid not in {"", "0"}
+            and (ENDPOINT_ENV in environment or has_execed(pid))
+        ):
+            return state, environment
+        if time.monotonic() >= deadline:
+            return state, environment
+        time.sleep(0.5)
+
+
+def effective_endpoint(unit: str, *, seconds: float = 15.0) -> str | None:
+    """The ``GPU_FAULT_DCGM_METRICS_URL`` the unit's running process uses.
+
+    Read from ``/proc/<MainPID>/environ`` (allowing a just-restarted unit its
+    exec), never from ``systemctl show``: a drop-in ``Environment=`` shows there
+    while the unit's ``EnvironmentFile=`` overrides it in the process.
+    """
+
+    _state, environment = settled_environment(unit, seconds=seconds)
+    return environment.get(ENDPOINT_ENV)
+
+
+def dropin_loaded(unit: str, dropin: Path) -> bool:
+    """Whether systemd still lists ``dropin`` for ``unit`` (``DropInPaths``)."""
+
+    return str(dropin) in (unit_state(unit).get("DropInPaths") or "").split()
+
+
+def _positive_seconds(values: dict[str, str], key: str, default: float) -> float:
+    try:
+        value = float(values.get(key, "") or default)
+    except ValueError:
+        return default
+    return value if value >= 0 else default
+
+
+def first_read_seconds(values: dict[str, str]) -> int:
+    """The first-read budget from the node's ``collector.env`` cadence keys:
+    start-up spread + start-up jitter + one interval + a margin, capped."""
+
+    total = (
+        _positive_seconds(values, STARTUP_SPREAD_ENV, DEFAULT_STARTUP_SPREAD_SECONDS)
+        + _positive_seconds(values, STARTUP_JITTER_ENV, DEFAULT_STARTUP_JITTER_SECONDS)
+        + _positive_seconds(values, INTERVAL_ENV, DEFAULT_INTERVAL_SECONDS)
+        + FIRST_READ_MARGIN_SECONDS
+    )
+    return int(min(MAX_FIRST_READ_SECONDS, max(FIRST_READ_MARGIN_SECONDS, total)))
+
+
+def wait_first_read(port: int, reads_before: int, seconds: int) -> dict[str, Any]:
+    """Wait until the proxy's ``reads`` advanced past ``reads_before``.
+
+    The proxy counts every ``GET /metrics`` (pass-through included), so the
+    first advance after the restart is the repointed collector's first scrape
+    of the proxy -- the only proof the override took effect end to end.
+    """
+
+    started = time.monotonic()
+    deadline = started + seconds
+    reads_after = reads_before
+    while True:
+        try:
+            reads_after = int(proxy_status(port, timeout=2).get("reads") or 0)
+        except (ProbeError, ValueError, TypeError):
+            pass
+        observed = reads_after > reads_before
+        if observed or time.monotonic() >= deadline:
+            return {
+                "observed": observed,
+                "reads_before": reads_before,
+                "reads_after": reads_after,
+                "waited_seconds": round(time.monotonic() - started, 1),
+                "budget_seconds": seconds,
+            }
+        time.sleep(FIRST_READ_POLL_SECONDS)
 
 
 # --------------------------------------------------------------------------- #
@@ -518,20 +710,10 @@ def deploy_proxy(arguments: argparse.Namespace) -> None:
 # --------------------------------------------------------------------------- #
 # repoint-collector: drop-in + deadman restore
 # --------------------------------------------------------------------------- #
-def repoint_collector(arguments: argparse.Namespace) -> None:
-    run_id = safe_id(arguments.run_id, "run ID")
-    port = checked_port(arguments.port)
-    restore_seconds = checked_restore_seconds(arguments.restore_seconds)
-    before = unit_state(METRICS_UNIT)
-    if before.get("ActiveState") != "active":
-        raise ProbeError(f"{METRICS_UNIT} is not active at baseline")
-    dropin = dropin_path(run_id)
-    if dropin.exists():
-        raise ProbeError("a repoint drop-in for this run already exists")
-    original = baseline_endpoint()
-    proxy_endpoint = f"http://127.0.0.1:{port}/metrics"
-    # Arm the deadman before the drop-in exists, so a crash between the two
-    # still restores the real endpoint.
+def arm_deadman(run_id: str, restore_seconds: int) -> str:
+    """Arm the restore deadman (before the drop-in exists, so a crash between
+    the two still restores the real endpoint); returns the unit name."""
+
     deadman = deadman_unit(run_id)
     probe_copy = run_dir(run_id) / "probe.py"
     if not probe_copy.exists():
@@ -557,47 +739,123 @@ def repoint_collector(arguments: argparse.Namespace) -> None:
     )
     if unit_state(f"{deadman}.timer").get("ActiveState") != "active":
         raise ProbeError("collector restore deadman timer is not active")
-    dropin.parent.mkdir(parents=True, exist_ok=True)
-    dropin.write_text(
-        "[Service]\n"
-        f"# gpu-fault env-live acceptance repoint (run {run_id})\n"
-        f"Environment={ENDPOINT_ENV}={proxy_endpoint}\n",
-        encoding="utf-8",
-    )
+    return deadman
+
+
+def checked_first_read_seconds(value: int, env: dict[str, str]) -> int:
+    """``--first-read-seconds`` (0 = derive from the node's ``collector.env``)."""
+
+    if int(value) <= 0:
+        return first_read_seconds(env)
+    if not FIRST_READ_MARGIN_SECONDS <= int(value) <= MAX_FIRST_READ_SECONDS:
+        raise ProbeError(
+            "first-read seconds is outside "
+            f"{FIRST_READ_MARGIN_SECONDS}..{MAX_FIRST_READ_SECONDS}"
+        )
+    return int(value)
+
+
+def repoint_collector(arguments: argparse.Namespace) -> None:
+    run_id = safe_id(arguments.run_id, "run ID")
+    port = checked_port(arguments.port)
+    restore_seconds = checked_restore_seconds(arguments.restore_seconds)
+    env = parse_env()
+    budget = checked_first_read_seconds(arguments.first_read_seconds, env)
+    before = unit_state(METRICS_UNIT)
+    if before.get("ActiveState") != "active":
+        raise ProbeError(f"{METRICS_UNIT} is not active at baseline")
+    dropin = dropin_path(run_id)
+    if dropin.exists():
+        raise ProbeError("a repoint drop-in for this run already exists")
+    override = override_env_path(run_id)
+    if override.exists():
+        raise ProbeError("a repoint override for this run already exists")
+    original = env.get(ENDPOINT_ENV, DEFAULT_UPSTREAM)
+    proxy_endpoint = f"http://127.0.0.1:{port}/metrics"
+    # The proxy must be serving pass-through before the collector is sent to
+    # it; its read count now is the baseline the first-read proof advances from.
+    status = proxy_status(port)
+    if status.get("armed") is not False:
+        raise ProbeError("refusing to repoint the collector at an armed proxy")
+    reads_before = int(status.get("reads") or 0)
+    deadman = arm_deadman(run_id, restore_seconds)
+    # Through a file, never ``Environment=``: see the module docstring.
+    override.write_text(f"{ENDPOINT_ENV}={proxy_endpoint}\n", encoding="utf-8")
+    override.chmod(0o600)
     (run_dir(run_id) / "repoint.json").write_text(
         json.dumps(
             {
                 "run_id": run_id,
                 "original_endpoint": original,
                 "proxy_endpoint": proxy_endpoint,
+                "override": str(override),
             },
             sort_keys=True,
         ),
         encoding="utf-8",
     )
+    dropin.parent.mkdir(parents=True, exist_ok=True)
+    dropin.write_text(
+        "[Service]\n"
+        f"# gpu-fault env-live acceptance repoint (run {run_id})\n"
+        f"EnvironmentFile=-{override}\n",
+        encoding="utf-8",
+    )
     run(["systemctl", "daemon-reload"])
     run(["systemctl", "restart", METRICS_UNIT], timeout=120)
-    after = unit_state(METRICS_UNIT)
+    after, environment = settled_environment(METRICS_UNIT)
+    receipt: dict[str, Any] = {
+        "run_id": run_id,
+        "unit": METRICS_UNIT,
+        "original_endpoint": original,
+        "proxy_endpoint": proxy_endpoint,
+        "dropin": str(dropin),
+        "override": str(override),
+        "process_environment": environment,
+        "deadman_timer": unit_state(f"{deadman}.timer"),
+        "before": before,
+        "after": after,
+    }
     if after.get("ActiveState") != "active":
-        raise ProbeError(f"{METRICS_UNIT} is not active after the repoint")
-    if effective_endpoint(METRICS_UNIT) != proxy_endpoint:
-        raise ProbeError("collector did not pick up the proxy endpoint")
-    emit(
-        {
-            "run_id": run_id,
-            "unit": METRICS_UNIT,
-            "original_endpoint": original,
-            "proxy_endpoint": proxy_endpoint,
-            "deadman_timer": unit_state(f"{deadman}.timer"),
-            "before": before,
-            "after": after,
-        }
-    )
+        restore_unit(run_id)
+        raise ProbeError(f"{METRICS_UNIT} is not active after the repoint; restored")
+    if ENDPOINT_ENV not in environment:
+        restore_unit(run_id)
+        raise ProbeError(
+            "the restarted collector did not exec within the settle window; restored"
+        )
+    if environment.get(ENDPOINT_ENV) != proxy_endpoint:
+        # The verification this probe used to make through ``systemctl show``
+        # passed here while the process still read the real exporter.
+        emit(
+            {
+                **receipt,
+                "repointed": False,
+                "reason": REASON_NOT_PICKED_UP,
+                "rollback": restore_unit(run_id),
+            }
+        )
+        return
+    first_read = wait_first_read(port, reads_before, budget)
+    receipt["first_read"] = first_read
+    if not first_read["observed"]:
+        emit(
+            {
+                **receipt,
+                "repointed": False,
+                "reason": REASON_NO_FIRST_READ,
+                "rollback": restore_unit(run_id),
+            }
+        )
+        return
+    emit({**receipt, "repointed": True})
 
 
 def arm(arguments: argparse.Namespace) -> None:
     run_id = safe_id(arguments.run_id, "run ID")
     port = checked_port(arguments.port)
+    if effective_endpoint(METRICS_UNIT) != f"http://127.0.0.1:{port}/metrics":
+        raise ProbeError("refusing to arm: the collector does not read the proxy")
     status, body = _loopback(f"http://127.0.0.1:{port}/arm", method="POST", timeout=10)
     if status != 200:
         raise ProbeError(f"arm returned {status}: {body.strip()}")
@@ -832,10 +1090,10 @@ def restart_collector(arguments: argparse.Namespace) -> None:
     expected = effective_endpoint(METRICS_UNIT)
     before = unit_state(METRICS_UNIT)
     run(["systemctl", "restart", METRICS_UNIT], timeout=120)
-    after = unit_state(METRICS_UNIT)
+    after, environment = settled_environment(METRICS_UNIT)
     if after.get("ActiveState") != "active":
         raise ProbeError(f"{METRICS_UNIT} is not active after the restart")
-    effective = effective_endpoint(METRICS_UNIT)
+    effective = environment.get(ENDPOINT_ENV)
     if effective != expected:
         raise ProbeError(
             f"collector endpoint {effective} changed across the restart ({expected})"
@@ -846,15 +1104,25 @@ def restart_collector(arguments: argparse.Namespace) -> None:
             "unit": METRICS_UNIT,
             "restarted_at": datetime.now(timezone.utc).isoformat(),
             "effective_endpoint": effective,
+            "process_environment": environment,
             "before": before,
             "after": after,
         }
     )
 
 
-def restore_collector(arguments: argparse.Namespace) -> None:
-    run_id = safe_id(arguments.run_id, "run ID")
+def restore_unit(run_id: str) -> dict[str, Any]:
+    """Undo the repoint and prove the real endpoint is read again (idempotent).
+
+    Removes the drop-in and its environment file, reloads, restarts the unit
+    when the drop-in was in place or the running process still reads another
+    endpoint (a second restore finds nothing to undo and restarts nothing), and
+    reads the endpoint back from the new process. The deadman is disarmed
+    unless this process *is* the deadman.
+    """
+
     dropin = dropin_path(run_id)
+    override = override_env_path(run_id)
     original = DEFAULT_UPSTREAM
     repoint = run_dir(run_id) / "repoint.json"
     if repoint.is_file():
@@ -866,18 +1134,31 @@ def restore_collector(arguments: argparse.Namespace) -> None:
     # would SIGCONT it for the restart anyway, but the pause record and the
     # waiter must not outlive the window.
     resumed = resume_paused(run_id) if read_pause(run_id) else None
-    removed = dropin.exists()
+    present = dropin.exists()
     dropin.unlink(missing_ok=True)
+    override_present = override.exists()
+    override.unlink(missing_ok=True)
     run(["systemctl", "daemon-reload"])
-    run(["systemctl", "restart", METRICS_UNIT], timeout=120)
-    after = unit_state(METRICS_UNIT)
+    restarted = present
+    if not present:
+        # Nothing to unload: restart only a process that still reads another
+        # endpoint (a drop-in removed without a restart), never a clean unit.
+        current = effective_endpoint(METRICS_UNIT, seconds=SETTLE_SECONDS)
+        restarted = current is not None and current != original
+    if restarted:
+        run(["systemctl", "restart", METRICS_UNIT], timeout=120)
+    after, environment = settled_environment(METRICS_UNIT)
     if after.get("ActiveState") != "active":
         raise ProbeError(f"{METRICS_UNIT} is not active after the restore")
-    effective = effective_endpoint(METRICS_UNIT)
+    if restarted and ENDPOINT_ENV not in environment:
+        raise ProbeError("the restored collector did not exec within the settle window")
+    effective = environment.get(ENDPOINT_ENV)
     if effective is not None and effective != original:
         raise ProbeError(
             f"collector endpoint {effective} is not the original {original}"
         )
+    if dropin_loaded(METRICS_UNIT, dropin):
+        raise ProbeError("systemd still lists the repoint drop-in after the reload")
     deadman = deadman_unit(run_id)
     if unit_state(f"{deadman}.service").get("MainPID") != str(os.getpid()):
         run(["systemctl", "stop", f"{deadman}.timer"], check=False)
@@ -886,17 +1167,22 @@ def restore_collector(arguments: argparse.Namespace) -> None:
         ["systemctl", "reset-failed", f"{deadman}.service", f"{deadman}.timer"],
         check=False,
     )
-    emit(
-        {
-            "run_id": run_id,
-            "unit": METRICS_UNIT,
-            "dropin_removed": removed and not dropin.exists(),
-            "restored_endpoint": effective,
-            "original_endpoint": original,
-            "after": after,
-            "resumed_pause": resumed,
-        }
-    )
+    return {
+        "run_id": run_id,
+        "unit": METRICS_UNIT,
+        "dropin_removed": present and not dropin.exists(),
+        "override_removed": override_present and not override.exists(),
+        "restarted": restarted,
+        "restored_endpoint": effective,
+        "original_endpoint": original,
+        "process_environment": environment,
+        "after": after,
+        "resumed_pause": resumed,
+    }
+
+
+def restore_collector(arguments: argparse.Namespace) -> None:
+    emit(restore_unit(safe_id(arguments.run_id, "run ID")))
 
 
 def stop_proxy(arguments: argparse.Namespace) -> None:
@@ -968,6 +1254,8 @@ def parser() -> argparse.ArgumentParser:
     repoint.add_argument("--run-id", required=True)
     repoint.add_argument("--port", type=int, default=9411)
     repoint.add_argument("--restore-seconds", type=int, default=600)
+    # 0: derive the first-read budget from the node's collector.env cadence.
+    repoint.add_argument("--first-read-seconds", type=int, default=0)
     repoint.set_defaults(handler=repoint_collector)
 
     arm_parser = commands.add_parser("arm")
@@ -1019,12 +1307,39 @@ def parser() -> argparse.ArgumentParser:
     return value
 
 
+def exception_site(exc: BaseException) -> str | None:
+    """The innermost ``function:line`` of this file on the exception's path."""
+
+    site = None
+    frame = exc.__traceback__
+    while frame is not None:
+        if frame.tb_frame.f_code.co_filename == __file__:
+            site = f"{frame.tb_frame.f_code.co_name}:{frame.tb_lineno}"
+        frame = frame.tb_next
+    return site
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = parser().parse_args(argv)
     try:
         arguments.handler(arguments)
     except Exception as exc:  # noqa: BLE001 - reported as the probe's JSON error
-        emit({"error": f"{type(exc).__name__}: {exc}", "command": arguments.command})
+        # The host fixture's exception text shows only the tokens it whitelists
+        # for ``error_kind: probe`` (class, digest, site); the message travels
+        # in the same line and is kept, redacted, as the case's probe-error.json.
+        emit(
+            {
+                "error": type(exc).__name__,
+                "error_kind": "probe",
+                "error_class": type(exc).__name__,
+                "error_code": hashlib.sha256(str(exc).encode()).hexdigest()[:16],
+                "error_site": exception_site(exc),
+                "error_message": str(exc)[:2000],
+                "error_detail": getattr(exc, "detail", None),
+                "command": getattr(arguments, "command", None),
+            }
+        )
+        sys.stderr.write(f"{type(exc).__name__}: {exc}\n")
         return 1
     return 0
 

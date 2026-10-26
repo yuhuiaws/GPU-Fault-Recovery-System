@@ -64,7 +64,12 @@ collector/ingestion logic, not physical overheating.
 
 The GF-ENV-LIVE acceptance runner (`scripts/e2e/regional/run_env_live.py`) drives
 the audited loopback replay proxy and repoints only the single metrics collector
-through a bounded, deadman-restored maintenance change; it proves the
+through a bounded, deadman-restored maintenance change (a `/run` drop-in handing
+the unit a run-scoped `EnvironmentFile=`, the unit restarted, the endpoint read
+back from the new process's `/proc/<pid>/environ` and that process's first
+pass-through read of the proxy awaited before anything is armed -- a repoint
+that does not take effect is rolled back on the node and fails the fixture with
+its reason); it proves the
 normally-installed collector, real control plane and scheduling run end to end,
 never that a sensor truly reported the fault or that hardware was repaired. Its
 unit tests use fakes for the device, Kubernetes and systemd I/O. Every
@@ -3103,7 +3108,33 @@ product's own records (one composite incident, no component incident minted
 after it formed, components only its own metrics, severity WARNING and
 RUN_DIAGNOSTICS on the finding and the incident). A device without a gradable
 core scale, without the power fields or with a real thermal/brake reason at
-preflight is `NOT_RUN`. No case has live evidence yet. The four product gaps these variants
+preflight is `NOT_RUN`.
+
+Their first live runs (2026-10-26, plain EKS, release R13g) ended INCONCLUSIVE
+with "the collector consumed 0 of the 12 armed replay reads inside the budget",
+and no product behaviour was graded: the shared env-replay probe
+(`probes/env_replay_proxy.py`) repointed `gpu-fault-metrics-collector.service`
+through a drop-in `Environment=GPU_FAULT_DCGM_METRICS_URL=<proxy>` and did
+restart the unit (the receipts carry a new InvocationID and MainPID), but the
+unit's own `EnvironmentFile=/etc/gpu-fault/collector.env` -- where the node
+installer writes the real exporter URL -- overrides any `Environment=`
+(systemd.exec(5)), so the new process kept reading the real exporter while
+`systemctl show`, which lists `Environment=` directives only, reported the
+override as effective and the probe's verification passed. The same probe
+serves every GF-ENV-LIVE case, whose HyperPod round of 2026-10-24 ended with
+the identical "consumed 0 of N reads" signature; the earlier GF-ENV-LIVE PASS
+verdicts graded no served reads. The probe now hands the override to the unit
+as a run-scoped `EnvironmentFile=` (later-listed files win), reads the endpoint
+back from the restarted process and waits for that process's first pass-through
+read of the proxy (start-up spread + start-up jitter + one interval, at most
+90 s) before the fixture arms; an override the process did not pick up or a
+collector that never read the proxy is rolled back on the node and reported as
+`repointed: false` with a constant reason, which the fixture raises as a
+harness failure (INCONCLUSIVE "harness fixture failed: ... did not take effect")
+instead of spending the replay budget. The restore is idempotent (nothing is
+restarted on a clean unit) and runs whenever a repoint was attempted. Both
+variants are to be re-run on both clusters; they still have no product
+evidence. The four product gaps these variants
 first recorded as expected FAIL -- the whole-batch (not per-GPU) DCGM
 completeness check (025 `one_gpu_missing`), the PCIe<->XID gauge join with no
 age check (022 `expired_xid`), the UUID-set-only identity comparison (026

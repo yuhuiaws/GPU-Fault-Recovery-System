@@ -32,6 +32,16 @@ What the product must show (spec 024: "热warning、普通power cap ... 不独�
 Verdicts read the product's own records (``general_live_gpu_store``,
 ``general_live_gpu_verdicts``); the proxy's ``/status`` and the accepted
 replayed samples are the raw-source oracle. ``proof_scope`` is ``live-replay``.
+
+The replay arms only after the repoint is proven (``general_live_env_replay``):
+the probe restarts ``gpu-fault-metrics-collector.service`` into a run-scoped
+``EnvironmentFile=`` drop-in, reads the endpoint back from the new process and
+waits for that process's first pass-through read of the proxy. A repoint that
+did not take effect is a fixture error with its reason (the runner's
+INCONCLUSIVE "harness fixture failed"), never the 12-read budget both variants
+spent live on 2026-10-26 ("the collector consumed 0 of the 12 armed replay
+reads") when the former ``Environment=`` drop-in lost to the unit's own
+``EnvironmentFile=/etc/gpu-fault/collector.env``.
 """
 
 from __future__ import annotations

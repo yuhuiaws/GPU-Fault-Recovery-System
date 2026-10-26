@@ -5,12 +5,17 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from scripts.e2e.regional.probes import env_replay_proxy as probe
+
+REAL = "http://127.0.0.1:9400/metrics"
+PROXY = "http://127.0.0.1:9411/metrics"
+ENDPOINT = probe.ENDPOINT_ENV
 
 
 @pytest.fixture(autouse=True)
@@ -26,7 +31,7 @@ def _on_disk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _run(argv: list[str]) -> dict[str, Any]:
-    """Capture the single JSON line the probe emits."""
+    """Capture the single JSON line the probe emits (``error``: its message)."""
 
     captured: list[str] = []
     import builtins
@@ -41,7 +46,46 @@ def _run(argv: list[str]) -> dict[str, Any]:
         code = probe.main(argv)
     finally:
         builtins.print = original
-    return {"code": code, "json": json.loads(captured[-1])}
+    payload = json.loads(captured[-1])
+    return {
+        "code": code,
+        "json": payload,
+        "error": payload.get("error_message") or payload.get("error"),
+    }
+
+
+def _ok() -> Any:
+    return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+
+def _recording_run(order: list[list[str]]) -> Any:
+    def fake_run(cmd: list[str], **kw: Any) -> Any:
+        order.append(list(cmd))
+        return _ok()
+
+    return fake_run
+
+
+def _active(pid: str = "7", dropins: str = "") -> dict[str, str]:
+    return {"ActiveState": "active", "MainPID": pid, "DropInPaths": dropins}
+
+
+def _settled(endpoint: str | None, pid: str = "7") -> Any:
+    """A ``settled_environment`` double: the exec'd process reads ``endpoint``."""
+
+    environment = {} if endpoint is None else {ENDPOINT: endpoint}
+    return lambda unit, **kw: (_active(pid), dict(environment))
+
+
+def _dropins(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Route the drop-in under ``tmp_path``; returns the drop-in path of run r1."""
+
+    directory = tmp_path / "dropins" / f"{probe.METRICS_UNIT}.d"
+    monkeypatch.setattr(probe, "dropin_dir", lambda: directory)
+    monkeypatch.setattr(
+        probe, "dropin_path", lambda run_id: directory / f"env-{run_id}.conf"
+    )
+    return directory / "env-r1.conf"
 
 
 def test_safe_id_and_digest_are_stable_and_checked() -> None:
@@ -65,6 +109,30 @@ def test_port_and_restore_bounds() -> None:
 
 def test_parse_env_and_baseline_endpoint() -> None:
     assert probe.baseline_endpoint() == "http://127.0.0.1:9400/metrics"
+
+
+def test_failures_carry_the_probe_error_fields_for_the_host_fixture() -> None:
+    out = _run(
+        [
+            "install-source",
+            "--run-id",
+            "bad id",
+            "--name",
+            probe.PLAN_NAME,
+            "--sha256",
+            "0" * 64,
+            "--b64",
+            "AA==",
+        ]
+    )
+    assert out["code"] == 1
+    payload = out["json"]
+    assert payload["error_kind"] == "probe"
+    assert payload["error"] == payload["error_class"] == "ProbeError"
+    assert re.fullmatch(r"[0-9a-f]{16}", payload["error_code"]), payload["error_code"]
+    assert payload["error_site"].startswith("safe_id:"), payload["error_site"]
+    assert payload["error_message"] == "unsafe run ID"
+    assert payload["command"] == "install-source"
 
 
 def test_install_source_verifies_sha_and_refuses_foreign_names() -> None:
@@ -99,7 +167,7 @@ def test_install_source_verifies_sha_and_refuses_foreign_names() -> None:
             b64,
         ]
     )
-    assert again["code"] == 1 and "already installed" in again["json"]["error"]
+    assert again["code"] == 1 and "already installed" in again["error"]
     # A wrong sha is refused.
     wrong = _run(
         [
@@ -114,7 +182,7 @@ def test_install_source_verifies_sha_and_refuses_foreign_names() -> None:
             b64,
         ]
     )
-    assert wrong["code"] == 1 and "sha256 does not match" in wrong["json"]["error"]
+    assert wrong["code"] == 1 and "sha256 does not match" in wrong["error"]
     # A foreign file name is refused.
     bad = _run(
         [
@@ -129,7 +197,7 @@ def test_install_source_verifies_sha_and_refuses_foreign_names() -> None:
             b64,
         ]
     )
-    assert bad["code"] == 1 and "only the replay tool and plan" in bad["json"]["error"]
+    assert bad["code"] == 1 and "only the replay tool and plan" in bad["error"]
 
 
 def test_deploy_proxy_validates_its_arguments(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -137,14 +205,10 @@ def test_deploy_proxy_validates_its_arguments(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(probe, "run", lambda cmd, **kw: calls.append(cmd) or _ok())
     # Bad GPU UUID.
     out = _run(["deploy-proxy", "--run-id", "r1", "--gpu-uuid", "notauuid"])
-    assert out["code"] == 1 and "physical GPU UUID" in out["json"]["error"]
+    assert out["code"] == 1 and "physical GPU UUID" in out["error"]
     # Missing installed sources.
     out = _run(["deploy-proxy", "--run-id", "r1", "--gpu-uuid", "GPU-" + "a" * 12])
-    assert out["code"] == 1 and "install the replay tool" in out["json"]["error"]
-
-
-def _ok() -> Any:
-    return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    assert out["code"] == 1 and "install the replay tool" in out["error"]
 
 
 def test_deploy_proxy_launches_and_waits_for_passthrough(
@@ -176,83 +240,354 @@ def test_deploy_proxy_refuses_an_armed_startup(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(probe, "unit_state", lambda unit: {"ActiveState": "active"})
     monkeypatch.setattr(probe, "proxy_status", lambda port, **kw: {"armed": True})
     out = _run(["deploy-proxy", "--run-id", "r1", "--gpu-uuid", "GPU-" + "a" * 12])
-    assert out["code"] == 1 and "came up armed" in out["json"]["error"]
+    assert out["code"] == 1 and "came up armed" in out["error"]
 
 
-def test_repoint_arms_the_deadman_before_the_dropin(
+# --------------------------------------------------------------------------- #
+# The effective endpoint is the process's, never ``systemctl show``'s
+# --------------------------------------------------------------------------- #
+def test_effective_endpoint_reads_the_process_environment_not_systemctl_show(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    proc = tmp_path / "proc"
+    (proc / "42").mkdir(parents=True)
+    (proc / "42" / "environ").write_bytes(
+        b"PATH=/usr/bin\0"
+        b"GPU_FAULT_DCGM_METRICS_URL=http://127.0.0.1:9400/metrics\0"
+        b"GPU_FAULT_METRICS_MODE=dcgm\0"
+        b"GPU_FAULT_CONTROL_PLANE_TOKEN=secret\0"
+    )
+    (proc / "42" / "comm").write_text("gpu-fault-colle\n")
+    (proc / "42" / "exe").symlink_to("/opt/gpu-fault/current/venv/bin/python3.12")
+    monkeypatch.setattr(probe, "PROC_ROOT", proc)
+    # The live 2026-10-26 state: the drop-in ``Environment=`` shows in
+    # ``systemctl show`` while the process runs with collector.env's endpoint.
+    monkeypatch.setattr(
+        probe,
+        "unit_state",
+        lambda unit: {
+            "ActiveState": "active",
+            "MainPID": "42",
+            "Environment": f"{ENDPOINT}={PROXY}",
+        },
+    )
+    assert probe.effective_endpoint(probe.METRICS_UNIT, seconds=0) == REAL
+    assert probe.process_environment("42") == {
+        ENDPOINT: REAL,
+        "GPU_FAULT_METRICS_MODE": "dcgm",
+    }, "allow-listed keys only"
+    assert probe.has_execed("42") is True
+    # systemd's pre-exec child: ``(<basename>)`` as comm, systemd's exe.
+    (proc / "43").mkdir()
+    (proc / "43" / "comm").write_text("(gpu-fault-coll)\n")
+    (proc / "43" / "exe").symlink_to("/usr/lib/systemd/systemd")
+    assert probe.has_execed("43") is False
+    assert probe.process_environment("0") == {}
+    assert probe.process_environment("nope") == {}
+    assert probe.process_environment("44") == {}, "a vanished process reads empty"
+
+
+def test_settled_environment_waits_for_the_restarted_collector_to_exec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(probe, "unit_state", lambda unit: _active("9"))
+    environments = iter([{}, {}, {ENDPOINT: PROXY}])
+    monkeypatch.setattr(
+        probe,
+        "process_environment",
+        lambda pid, keys=probe.PROCESS_KEYS: dict(
+            next(environments, {ENDPOINT: PROXY})
+        ),
+    )
+    monkeypatch.setattr(probe, "has_execed", lambda pid: False)
+    slept: list[float] = []
+    monkeypatch.setattr(probe.time, "sleep", slept.append)
+    state, environment = probe.settled_environment(probe.METRICS_UNIT, seconds=30)
+    assert state["MainPID"] == "9" and environment == {ENDPOINT: PROXY}
+    assert len(slept) == 2, "the two pre-exec reads were waited out"
+
+
+def test_first_read_budget_follows_the_collector_cadence_and_is_capped() -> None:
+    assert probe.first_read_seconds({}) == 65, "15 spread + 20 jitter + 15 + 15"
+    assert (
+        probe.first_read_seconds(
+            {
+                probe.INTERVAL_ENV: "30",
+                probe.STARTUP_SPREAD_ENV: "10",
+                probe.STARTUP_JITTER_ENV: "5",
+            }
+        )
+        == 60
+    )
+    assert (
+        probe.first_read_seconds({probe.INTERVAL_ENV: "120"})
+        == probe.MAX_FIRST_READ_SECONDS
+    )
+    assert (
+        probe.first_read_seconds(
+            {probe.INTERVAL_ENV: "bad", probe.STARTUP_JITTER_ENV: "-3"}
+        )
+        == 65
+    ), "malformed or negative values fall back to the product defaults"
+    assert probe.checked_first_read_seconds(0, {}) == 65
+    assert probe.checked_first_read_seconds(30, {}) == 30
+    for bad in (5, 500):
+        with pytest.raises(probe.ProbeError, match="first-read seconds"):
+            probe.checked_first_read_seconds(bad, {})
+
+
+# --------------------------------------------------------------------------- #
+# repoint-collector: EnvironmentFile= drop-in, process proof, first read
+# --------------------------------------------------------------------------- #
+REPOINT = [
+    "repoint-collector",
+    "--run-id",
+    "r1",
+    "--port",
+    "9411",
+    "--restore-seconds",
+    "600",
+]
+
+
+def test_repoint_hands_the_override_as_an_environment_file_and_proves_the_first_read(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     root = probe.run_dir("r1")
     root.mkdir(parents=True)
-    dropin_root = tmp_path / "dropins"
-    monkeypatch.setattr(
-        probe, "dropin_dir", lambda: dropin_root / f"{probe.METRICS_UNIT}.d"
-    )
+    dropin = _dropins(monkeypatch, tmp_path)
+    order: list[list[str]] = []
+    monkeypatch.setattr(probe, "run", _recording_run(order))
+    monkeypatch.setattr(probe, "unit_state", lambda unit: _active())
+    # The restarted unit is systemd's pre-exec child for one read, then the
+    # collector running with the override.
+    environments = iter([{}, {ENDPOINT: PROXY, probe.INTERVAL_ENV: "15"}])
     monkeypatch.setattr(
         probe,
-        "dropin_path",
-        lambda run_id: dropin_root / f"{probe.METRICS_UNIT}.d" / f"env-{run_id}.conf",
+        "process_environment",
+        lambda pid, keys=probe.PROCESS_KEYS: dict(
+            next(environments, {ENDPOINT: PROXY})
+        ),
     )
-    order: list[str] = []
-
-    def fake_run(cmd: list[str], **kw: Any) -> Any:
-        order.append(" ".join(cmd[:3]))
-        return _ok()
-
-    monkeypatch.setattr(probe, "run", fake_run)
-    monkeypatch.setattr(probe, "unit_state", lambda unit: {"ActiveState": "active"})
+    monkeypatch.setattr(probe, "has_execed", lambda pid: False)
+    # The proxy's reads: the pass-through baseline at the repoint, then the
+    # first-read polls (none yet, then the restarted collector's scrape).
+    reads = iter([0, 0, 1])
     monkeypatch.setattr(
-        probe, "effective_endpoint", lambda unit: "http://127.0.0.1:9411/metrics"
+        probe,
+        "proxy_status",
+        lambda port, **kw: {"armed": False, "reads": next(reads, 1)},
     )
-    out = _run(
-        [
-            "repoint-collector",
-            "--run-id",
-            "r1",
-            "--port",
-            "9411",
-            "--restore-seconds",
-            "600",
-        ]
+    monkeypatch.setattr(probe.time, "sleep", lambda seconds: None)
+    out = _run(REPOINT)
+    assert out["code"] == 0, out
+    receipt = out["json"]
+    assert receipt["repointed"] is True
+    assert receipt["proxy_endpoint"] == PROXY and receipt["original_endpoint"] == REAL
+    assert receipt["process_environment"] == {ENDPOINT: PROXY, probe.INTERVAL_ENV: "15"}
+    first = receipt["first_read"]
+    assert first["observed"] is True
+    assert first["reads_before"] == 0 and first["reads_after"] == 1
+    assert first["budget_seconds"] == 65
+    # The override travels as the drop-in's EnvironmentFile=, never Environment=.
+    override = probe.override_env_path("r1")
+    text = dropin.read_text()
+    assert f"EnvironmentFile=-{override}" in text, text
+    assert "\nEnvironment=" not in text, text
+    assert override.read_text() == f"{ENDPOINT}={PROXY}\n"
+    assert receipt["dropin"] == str(dropin) and receipt["override"] == str(override)
+    repoint = json.loads((root / "repoint.json").read_text())
+    assert repoint["original_endpoint"] == REAL and repoint["override"] == str(override)
+    # The deadman is armed before the drop-in is loaded and the unit restarted.
+    deadman = next(i for i, cmd in enumerate(order) if cmd[0] == "systemd-run")
+    assert "restore-collector" in order[deadman]
+    reload = order.index(["systemctl", "daemon-reload"])
+    restart = order.index(["systemctl", "restart", probe.METRICS_UNIT])
+    assert deadman < reload < restart
+    assert order.count(["systemctl", "restart", probe.METRICS_UNIT]) == 1
+
+
+def test_repoint_rolls_back_an_override_the_process_did_not_pick_up(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    probe.run_dir("r1").mkdir(parents=True)
+    dropin = _dropins(monkeypatch, tmp_path)
+    order: list[list[str]] = []
+    monkeypatch.setattr(probe, "run", _recording_run(order))
+    monkeypatch.setattr(probe, "unit_state", lambda unit: _active())
+    # What the live node did on 2026-10-26: the unit restarted, the process
+    # kept collector.env's endpoint.
+    monkeypatch.setattr(
+        probe,
+        "process_environment",
+        lambda pid, keys=probe.PROCESS_KEYS: {ENDPOINT: REAL},
     )
-    assert out["code"] == 0
-    assert out["json"]["proxy_endpoint"] == "http://127.0.0.1:9411/metrics"
-    # systemd-run (the deadman) ran before the daemon-reload / restart.
-    assert any("systemd-run" in step for step in order), order
-    assert order.index("systemctl daemon-reload") > next(
-        index for index, step in enumerate(order) if "systemd-run" in step
+    monkeypatch.setattr(
+        probe, "proxy_status", lambda port, **kw: {"armed": False, "reads": 0}
     )
+    monkeypatch.setattr(probe.time, "sleep", lambda seconds: None)
+    out = _run(REPOINT)
+    assert out["code"] == 0, "a rolled-back repoint is an answer, not a probe failure"
+    receipt = out["json"]
+    assert receipt["repointed"] is False
+    assert receipt["reason"] == probe.REASON_NOT_PICKED_UP
+    assert receipt["process_environment"] == {ENDPOINT: REAL}
+    assert "first_read" not in receipt, "no first read is awaited on a dead override"
+    rollback = receipt["rollback"]
+    assert rollback["dropin_removed"] is True and rollback["override_removed"] is True
+    assert rollback["restarted"] is True and rollback["restored_endpoint"] == REAL
+    assert not dropin.exists() and not probe.override_env_path("r1").exists()
+    restarts = [i for i, cmd in enumerate(order) if cmd[:2] == ["systemctl", "restart"]]
+    assert len(restarts) == 2, "the repoint's restart and the rollback's"
+    deadman = probe.deadman_unit("r1")
+    assert ["systemctl", "stop", f"{deadman}.timer"] in order[restarts[-1] :]
+
+
+def test_repoint_rolls_back_when_the_collector_never_reads_the_proxy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    probe.run_dir("r1").mkdir(parents=True)
+    dropin = _dropins(monkeypatch, tmp_path)
+    order: list[list[str]] = []
+    monkeypatch.setattr(probe, "run", _recording_run(order))
+    monkeypatch.setattr(probe, "unit_state", lambda unit: _active())
+    # The process reads the proxy after the repoint's restart and the real
+    # exporter again after the rollback's.
+    environments = iter([{ENDPOINT: PROXY}, {ENDPOINT: REAL}])
+    monkeypatch.setattr(
+        probe,
+        "process_environment",
+        lambda pid, keys=probe.PROCESS_KEYS: dict(next(environments, {ENDPOINT: REAL})),
+    )
+    monkeypatch.setattr(
+        probe, "proxy_status", lambda port, **kw: {"armed": False, "reads": 4}
+    )
+    clock = iter(float(30 * step) for step in range(100))
+    monkeypatch.setattr(probe.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(probe.time, "sleep", lambda seconds: None)
+    out = _run([*REPOINT, "--first-read-seconds", "45"])
+    assert out["code"] == 0, out
+    receipt = out["json"]
+    assert receipt["repointed"] is False
+    assert receipt["reason"] == probe.REASON_NO_FIRST_READ
+    first = receipt["first_read"]
+    assert first["observed"] is False and first["budget_seconds"] == 45
+    assert first["reads_before"] == 4 and first["reads_after"] == 4
+    assert receipt["rollback"]["restored_endpoint"] == REAL
+    assert not dropin.exists(), "the rollback removed the drop-in"
+
+
+def test_repoint_refuses_an_armed_proxy_and_a_duplicate_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    probe.run_dir("r1").mkdir(parents=True)
+    dropin = _dropins(monkeypatch, tmp_path)
+    order: list[list[str]] = []
+    monkeypatch.setattr(probe, "run", _recording_run(order))
+    monkeypatch.setattr(probe, "unit_state", lambda unit: _active())
+    monkeypatch.setattr(
+        probe, "proxy_status", lambda port, **kw: {"armed": True, "reads": 0}
+    )
+    out = _run(REPOINT)
+    assert out["code"] == 1 and "armed proxy" in out["error"]
+    assert order == [] and not dropin.exists(), "nothing changed before the refusal"
+    dropin.parent.mkdir(parents=True)
+    dropin.write_text("[Service]\n")
+    out = _run(REPOINT)
+    assert out["code"] == 1 and "already exists" in out["error"]
+
+
+def test_arm_refuses_while_the_collector_does_not_read_the_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    posted: list[str] = []
+    monkeypatch.setattr(
+        probe, "_loopback", lambda url, **kw: posted.append(url) or (200, "armed\n")
+    )
+    monkeypatch.setattr(probe, "proxy_status", lambda port, **kw: {"armed": True})
+    monkeypatch.setattr(probe, "effective_endpoint", lambda unit, **kw: REAL)
+    out = _run(["arm", "--run-id", "r1", "--port", "9411"])
+    assert out["code"] == 1 and "does not read the proxy" in out["error"]
+    assert posted == []
+    monkeypatch.setattr(probe, "effective_endpoint", lambda unit, **kw: PROXY)
+    out = _run(["arm", "--run-id", "r1", "--port", "9411"])
+    assert out["code"] == 0 and out["json"]["armed"] is True
+    assert posted == ["http://127.0.0.1:9411/arm"]
 
 
 def test_stop_proxy_refuses_while_the_collector_still_points_at_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        probe, "effective_endpoint", lambda unit: "http://127.0.0.1:9411/metrics"
-    )
+    monkeypatch.setattr(probe, "effective_endpoint", lambda unit, **kw: PROXY)
     out = _run(["stop-proxy", "--run-id", "r1", "--port", "9411"])
-    assert out["code"] == 1 and "still points at it" in out["json"]["error"]
+    assert out["code"] == 1 and "still points at it" in out["error"]
 
 
-def test_restore_collector_puts_the_endpoint_back(
-    monkeypatch: pytest.MonkeyPatch,
+# --------------------------------------------------------------------------- #
+# restore-collector: symmetric and idempotent
+# --------------------------------------------------------------------------- #
+def test_restore_collector_puts_the_endpoint_back_and_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     root = probe.run_dir("r1")
     root.mkdir(parents=True)
-    (root / "repoint.json").write_text(
-        json.dumps({"original_endpoint": "http://127.0.0.1:9400/metrics"})
-    )
-    monkeypatch.setattr(probe, "run", lambda cmd, **kw: _ok())
-    monkeypatch.setattr(
-        probe, "unit_state", lambda unit: {"ActiveState": "active", "MainPID": "1"}
-    )
-    monkeypatch.setattr(
-        probe, "effective_endpoint", lambda unit: "http://127.0.0.1:9400/metrics"
-    )
-    monkeypatch.setattr(probe, "dropin_path", lambda run_id: root / "missing.conf")
+    (root / "repoint.json").write_text(json.dumps({"original_endpoint": REAL}))
+    dropin = tmp_path / "env-r1.conf"
+    dropin.write_text("[Service]\n")
+    override = probe.override_env_path("r1")
+    override.write_text(f"{ENDPOINT}={PROXY}\n")
+    monkeypatch.setattr(probe, "dropin_path", lambda run_id: dropin)
+    order: list[list[str]] = []
+    monkeypatch.setattr(probe, "run", _recording_run(order))
+    monkeypatch.setattr(probe, "unit_state", lambda unit: _active("1"))
+    monkeypatch.setattr(probe, "settled_environment", _settled(REAL, "1"))
     out = _run(["restore-collector", "--run-id", "r1"])
-    assert out["code"] == 0
-    assert out["json"]["restored_endpoint"] == "http://127.0.0.1:9400/metrics"
+    assert out["code"] == 0, out
+    receipt = out["json"]
+    assert receipt["restored_endpoint"] == REAL
+    assert receipt["dropin_removed"] is True and receipt["override_removed"] is True
+    assert receipt["restarted"] is True
+    assert receipt["process_environment"] == {ENDPOINT: REAL}
+    assert not dropin.exists() and not override.exists()
+    restart = ["systemctl", "restart", probe.METRICS_UNIT]
+    assert order.index(["systemctl", "daemon-reload"]) < order.index(restart)
+    # A second restore finds nothing to undo and restarts nothing.
+    order.clear()
+    monkeypatch.setattr(probe, "effective_endpoint", lambda unit, **kw: REAL)
+    again = _run(["restore-collector", "--run-id", "r1"])
+    assert again["code"] == 0, again
+    assert again["json"]["restarted"] is False
+    assert again["json"]["dropin_removed"] is False
+    assert again["json"]["restored_endpoint"] == REAL
+    assert restart not in order
+    # A process still reading the proxy with no drop-in left is restarted.
+    order.clear()
+    monkeypatch.setattr(probe, "effective_endpoint", lambda unit, **kw: PROXY)
+    third = _run(["restore-collector", "--run-id", "r1"])
+    assert third["code"] == 0 and third["json"]["restarted"] is True
+    assert restart in order
+
+
+def test_restore_collector_refuses_a_foreign_endpoint_or_a_loaded_dropin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = probe.run_dir("r1")
+    root.mkdir(parents=True)
+    (root / "repoint.json").write_text(json.dumps({"original_endpoint": REAL}))
+    dropin = tmp_path / "env-r1.conf"
+    dropin.write_text("[Service]\n")
+    monkeypatch.setattr(probe, "dropin_path", lambda run_id: dropin)
+    monkeypatch.setattr(probe, "run", lambda cmd, **kw: _ok())
+    monkeypatch.setattr(probe, "unit_state", lambda unit: _active("1"))
+    monkeypatch.setattr(probe, "settled_environment", _settled(PROXY, "1"))
+    out = _run(["restore-collector", "--run-id", "r1"])
+    assert out["code"] == 1 and "is not the original" in out["error"]
+    # systemd still listing the removed drop-in means the reload did not land.
+    dropin.write_text("[Service]\n")
+    monkeypatch.setattr(probe, "settled_environment", _settled(REAL, "1"))
+    monkeypatch.setattr(probe, "unit_state", lambda unit: _active("1", str(dropin)))
+    out = _run(["restore-collector", "--run-id", "r1"])
+    assert out["code"] == 1 and "still lists the repoint drop-in" in out["error"]
 
 
 # --------------------------------------------------------------------------- #
@@ -271,14 +606,6 @@ def _repointed_run(root: Path) -> None:
     )
 
 
-def _recording_run(order: list[list[str]]) -> Any:
-    def fake_run(cmd: list[str], **kw: Any) -> Any:
-        order.append(list(cmd))
-        return _ok()
-
-    return fake_run
-
-
 def test_pause_collector_schedules_a_waiter_unit_before_the_pause_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -291,7 +618,7 @@ def test_pause_collector_schedules_a_waiter_unit_before_the_pause_read(
     out = _run(
         ["pause-collector", "--run-id", "r1", "--after-reads", "7", "--seconds", "195"]
     )
-    assert out["code"] == 1 and "repoint the collector" in out["json"]["error"]
+    assert out["code"] == 1 and "repoint the collector" in out["error"]
     _repointed_run(root)
     out = _run(
         ["pause-collector", "--run-id", "r1", "--after-reads", "7", "--seconds", "195"]
@@ -308,7 +635,7 @@ def test_pause_collector_schedules_a_waiter_unit_before_the_pause_read(
     again = _run(
         ["pause-collector", "--run-id", "r1", "--after-reads", "7", "--seconds", "195"]
     )
-    assert again["code"] == 1 and "already scheduled" in again["json"]["error"]
+    assert again["code"] == 1 and "already scheduled" in again["error"]
 
 
 def test_pause_collector_refuses_a_pause_read_already_consumed(
@@ -321,7 +648,7 @@ def test_pause_collector_refuses_a_pause_read_already_consumed(
     out = _run(
         ["pause-collector", "--run-id", "r1", "--after-reads", "7", "--seconds", "195"]
     )
-    assert out["code"] == 1 and "already consumed" in out["json"]["error"]
+    assert out["code"] == 1 and "already consumed" in out["error"]
     for bad in ("30", "5000"):
         out = _run(
             [
@@ -334,7 +661,7 @@ def test_pause_collector_refuses_a_pause_read_already_consumed(
                 bad,
             ]
         )
-        assert out["code"] == 1 and "pause seconds" in out["json"]["error"]
+        assert out["code"] == 1 and "pause seconds" in out["error"]
 
 
 def test_pause_wait_arms_the_resume_deadman_then_stops_the_unit(
@@ -403,7 +730,7 @@ def test_pause_wait_times_out_without_pausing(monkeypatch: pytest.MonkeyPatch) -
             "1",
         ]
     )
-    assert out["code"] == 1 and "did not reach the pause read" in out["json"]["error"]
+    assert out["code"] == 1 and "did not reach the pause read" in out["error"]
     assert not any("--signal=SIGSTOP" in cmd for cmd in order), order
     record = json.loads((root / probe.PAUSE_FILE).read_text())
     assert record["timed_out_at"] and record["reads_at_timeout"] == 1
@@ -419,13 +746,9 @@ def test_pause_status_resume_and_restore_resume_first(
     )
     order: list[list[str]] = []
     monkeypatch.setattr(probe, "run", _recording_run(order))
-    monkeypatch.setattr(
-        probe, "unit_state", lambda unit: {"ActiveState": "active", "MainPID": "1"}
-    )
+    monkeypatch.setattr(probe, "unit_state", lambda unit: _active("1"))
     monkeypatch.setattr(probe, "unit_is_stopped", lambda unit: True)
-    monkeypatch.setattr(
-        probe, "effective_endpoint", lambda unit: "http://127.0.0.1:9400/metrics"
-    )
+    monkeypatch.setattr(probe, "effective_endpoint", lambda unit, **kw: REAL)
     status = _run(["pause-status", "--run-id", "r1"])
     assert status["code"] == 0 and status["json"]["stopped"] is True
     assert status["json"]["pause"]["target_reads"] == 4
@@ -440,7 +763,10 @@ def test_pause_status_resume_and_restore_resume_first(
     probe.write_pause(
         "r1", {"run_id": "r1", "target_reads": 4, "paused_at": "2031-01-01T00:00:00Z"}
     )
-    monkeypatch.setattr(probe, "dropin_path", lambda run_id: root / "missing.conf")
+    dropin = root / "present.conf"
+    dropin.write_text("[Service]\n")
+    monkeypatch.setattr(probe, "dropin_path", lambda run_id: dropin)
+    monkeypatch.setattr(probe, "settled_environment", _settled(REAL, "1"))
     out = _run(["restore-collector", "--run-id", "r1"])
     assert out["code"] == 0 and out["json"]["resumed_pause"]["pause"]["resumed_at"]
     cont = next(i for i, cmd in enumerate(order) if "--signal=SIGCONT" in cmd)
@@ -458,25 +784,22 @@ def test_restart_collector_needs_the_dropin_and_a_running_unit(
     dropin = tmp_path / "env-r1.conf"
     monkeypatch.setattr(probe, "dropin_path", lambda run_id: dropin)
     monkeypatch.setattr(probe, "run", lambda cmd, **kw: _ok())
-    monkeypatch.setattr(
-        probe, "unit_state", lambda unit: {"ActiveState": "active", "MainPID": "1"}
-    )
-    monkeypatch.setattr(
-        probe, "effective_endpoint", lambda unit: "http://127.0.0.1:9411/metrics"
-    )
+    monkeypatch.setattr(probe, "unit_state", lambda unit: _active("1"))
+    monkeypatch.setattr(probe, "effective_endpoint", lambda unit, **kw: PROXY)
+    monkeypatch.setattr(probe, "settled_environment", _settled(PROXY, "1"))
     out = _run(["restart-collector", "--run-id", "r1"])
-    assert out["code"] == 1 and "drop-in" in out["json"]["error"]
+    assert out["code"] == 1 and "drop-in" in out["error"]
     dropin.write_text("[Service]\n")
     monkeypatch.setattr(probe, "unit_is_stopped", lambda unit: True)
     out = _run(["restart-collector", "--run-id", "r1"])
-    assert out["code"] == 1 and "resume the paused collector" in out["json"]["error"]
+    assert out["code"] == 1 and "resume the paused collector" in out["error"]
     monkeypatch.setattr(probe, "unit_is_stopped", lambda unit: False)
     out = _run(["restart-collector", "--run-id", "r1"])
     assert out["code"] == 0
-    assert out["json"]["effective_endpoint"] == "http://127.0.0.1:9411/metrics"
+    assert out["json"]["effective_endpoint"] == PROXY
+    assert out["json"]["process_environment"] == {ENDPOINT: PROXY}
     assert out["json"]["restarted_at"]
     # An endpoint that changed across the restart is refused.
-    endpoints = iter(["http://127.0.0.1:9411/metrics", "http://127.0.0.1:9400/metrics"])
-    monkeypatch.setattr(probe, "effective_endpoint", lambda unit: next(endpoints))
+    monkeypatch.setattr(probe, "settled_environment", _settled(REAL, "1"))
     out = _run(["restart-collector", "--run-id", "r1"])
-    assert out["code"] == 1 and "changed across the restart" in out["json"]["error"]
+    assert out["code"] == 1 and "changed across the restart" in out["error"]
