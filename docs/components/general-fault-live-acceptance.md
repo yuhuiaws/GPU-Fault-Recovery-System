@@ -363,6 +363,17 @@ directory`。`wait_ready` 失败时把服务端日志尾部与原因写入 `expo
 内容存为 `baseline-<node>-last-read.json`：窗口内 host collector 没有任何 `host-` 送达（collector 沉默）、
 挂载被读到但从未健康（列出读数）、或 collector 送达了而其共享 latest 记录命名的挂载里没有测试 export
 （列出它命名的挂载，这才是"未被发现"——沙箱视图或根目录过滤的产品缺口证据）。
+`capacity_full` 首次真正走到填充步骤的实况（plain EKS，R13g）以 `host probe failed (exit 0); output
+withheld` 收场而无任何证据文件：填充片段无论成败都打印 `error` 键（成功为 `null`），`nfs_fill` 把该读数
+平铺进结果，而 `host_probe_fixture` 以 `error` 键**是否存在**判定调用失败并只展示白名单形状的 token，
+`null` 一个都不匹配。修正：夹具保留"键存在即失败"（探针失败行若带 `null`/空 `error` 绝不能被当成功结果
+判定，其他探针的失败行不变），该情形现在标注 `error key null`；填充/清除片段把自身记录嵌在 `fill`/`unfill`
+下（顶层只有 `statvfs`，片段字段不可能撞上夹具词表），捕获全部 `OSError` 并以类名、`errno`、`enospc`
+记首个失败；export 提前满（目标之前 ENOSPC、配额）是交给 runner 判定的读数——
+`VariantInconclusive("the test export only reached 61.2 % used (fill wrote 160 of 251 MiB; OSError
+errno 28 ENOSPC)")`——而非失败调用；真正的失败调用（读数超出子进程上界、片段未输出 JSON、清除无法删除
+填充文件）抛带 reason token 的 `ProbeError`（`fill_timeout`、`fill_unreadable`、`unfill_timeout`、
+`unfill_unreadable`、`unfill_failed`），夹具展示该 token 并把消息与读数记入 `probe-error.json`。
 计划/执行形如：
 
 ```bash

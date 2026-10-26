@@ -89,15 +89,27 @@ RUNNING_STATES = frozenset({"active", "activating", "deactivating", "reloading"}
 
 
 class ProbeError(RuntimeError):
-    pass
+    """A refused or failed action, reported on the probe's failure line.
+
+    ``reason``: a fixed identifier from this file's closed vocabulary
+    (``fill_timeout``, ``fill_unreadable``, ``unfill_timeout``,
+    ``unfill_unreadable``, ``unfill_failed``) the host fixture shows beside the
+    class, digest and site; ``detail``: JSON the fixture keeps, redacted, in the
+    case's ``probe-error.json`` (the reading that was refused).
+    """
+
+    def __init__(self, message: str, reason: str = "", detail: Any = None) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.detail = detail
 
 
 class MountError(ProbeError):
-    """``mount -t nfs4`` failed; ``reason`` is one constant sentence below."""
+    """``mount -t nfs4`` failed; ``reason`` is one constant sentence below
+    (``error_kind: nfs_mount``'s shown ``message``, not a reason token)."""
 
     def __init__(self, message: str, reason: str) -> None:
-        super().__init__(message)
-        self.reason = reason
+        super().__init__(message, reason)
 
 
 #: The shape the runner lets through for ``error_kind: nfs_mount`` (the same
@@ -499,62 +511,90 @@ print(json.dumps(result))
 """
 
 #: Fill the mount to ``percent`` used (statvfs-driven, 1 MiB writes, fsync).
+#: The reading is ``{"fill": {...}, "statvfs": {...}}``: ``fill`` records what
+#: was wanted and written and, only when a call failed, the first failure's
+#: class (``error``, an identifier), ``errno`` and whether it was ENOSPC. A
+#: fill that stops short is a reading the runner grades (INCONCLUSIVE with the
+#: reached percentage), not a failed call. Nothing of the snippet's own sits at
+#: the top level: ``nfs_fill`` spreads this reading into its result, and the
+#: host fixture reads any top-level ``error`` key -- even ``null`` -- as a failed
+#: call (live 2026-10-26 the first fill ever reached ended 005 ``capacity_full``
+#: on "host probe failed (exit 0); output withheld" for exactly that).
 FILL_SNIPPET = r"""
 import json, os, sys
 root, percent = sys.argv[1], float(sys.argv[2])
-path = os.path.join(root, "gfrs-fill.bin")
-stat = os.statvfs(root)
-total = stat.f_blocks * stat.f_frsize
-used = total - stat.f_bavail * stat.f_frsize
-wanted = max(0, int(total * percent / 100) - used)
 block = b"f" * (1 << 20)
-written, enospc, error = 0, False, None
-fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+fill = {"path": os.path.join(root, "gfrs-fill.bin"), "wanted_bytes": 0, "fill_bytes": 0, "enospc": False}
+result = {"fill": fill}
+def usage():
+    stat = os.statvfs(root)
+    total = stat.f_blocks * stat.f_frsize
+    available = stat.f_bavail * stat.f_frsize
+    return {"total_bytes": total, "available_bytes": available,
+            "used_percent": 100 * (total - available) / total if total else None}
+def failed(exc):
+    fill.setdefault("error", type(exc).__name__)
+    fill.setdefault("errno", exc.errno)
+    fill["enospc"] = fill["enospc"] or exc.errno == 28
 try:
-    while written + len(block) <= wanted:
-        try:
-            os.write(fd, block)
-            written += len(block)
-        except OSError as exc:
-            enospc = exc.errno == 28
-            error = f"{type(exc).__name__}: {exc.errno}"
-            break
+    before = usage()
+    fill["wanted_bytes"] = max(
+        0, int(before["total_bytes"] * percent / 100) - (before["total_bytes"] - before["available_bytes"]))
+    fd = os.open(fill["path"], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        os.fsync(fd)
-    except OSError as exc:
-        enospc = enospc or exc.errno == 28
-        error = error or f"{type(exc).__name__}: {exc.errno}"
-finally:
-    os.close(fd)
-stat = os.statvfs(root)
-total = stat.f_blocks * stat.f_frsize
-available = stat.f_bavail * stat.f_frsize
-print(json.dumps({
-    "path": path, "wanted_bytes": wanted, "fill_bytes": written, "enospc": enospc, "error": error,
-    "statvfs": {"total_bytes": total, "available_bytes": available,
-                "used_percent": 100 * (total - available) / total if total else None},
-}))
+        while fill["fill_bytes"] + len(block) <= fill["wanted_bytes"]:
+            try:
+                fill["fill_bytes"] += os.write(fd, block)
+            except OSError as exc:
+                failed(exc)
+                break
+        try:
+            os.fsync(fd)
+        except OSError as exc:
+            failed(exc)
+    finally:
+        os.close(fd)
+except OSError as exc:
+    failed(exc)
+try:
+    result["statvfs"] = usage()
+except OSError as exc:
+    failed(exc)
+print(json.dumps(result))
 """
 
-#: Remove what the fill and the I/O proof left on the mount.
+#: Remove what the fill and the I/O proof left on the mount. The reading is
+#: ``{"unfill": {"removed": N, ...}, "statvfs": {...}}``; a removal that fails
+#: names its class and errno under ``unfill`` and ``nfs_unfill`` turns it into
+#: the probe's own failure (the export would stay full).
 UNFILL_SNIPPET = r"""
 import json, os, shutil, sys
 root = sys.argv[1]
-removed = 0
+unfill = {"removed": 0}
+result = {"unfill": unfill}
+def failed(exc):
+    unfill.setdefault("error", type(exc).__name__)
+    unfill.setdefault("errno", exc.errno)
 fill = os.path.join(root, "gfrs-fill.bin")
-if os.path.exists(fill):
-    os.unlink(fill)
-    removed += 1
-proofs = os.path.join(root, "gfrs-io")
-if os.path.isdir(proofs):
-    removed += len(os.listdir(proofs))
-    shutil.rmtree(proofs, ignore_errors=True)
-stat = os.statvfs(root)
-total = stat.f_blocks * stat.f_frsize
-available = stat.f_bavail * stat.f_frsize
-print(json.dumps({"removed": removed, "statvfs": {
-    "total_bytes": total, "available_bytes": available,
-    "used_percent": 100 * (total - available) / total if total else None}}))
+try:
+    if os.path.exists(fill):
+        os.unlink(fill)
+        unfill["removed"] += 1
+    proofs = os.path.join(root, "gfrs-io")
+    if os.path.isdir(proofs):
+        unfill["removed"] += len(os.listdir(proofs))
+        shutil.rmtree(proofs)
+except OSError as exc:
+    failed(exc)
+try:
+    stat = os.statvfs(root)
+    total = stat.f_blocks * stat.f_frsize
+    available = stat.f_bavail * stat.f_frsize
+    result["statvfs"] = {"total_bytes": total, "available_bytes": available,
+                         "used_percent": 100 * (total - available) / total if total else None}
+except OSError as exc:
+    failed(exc)
+print(json.dumps(result))
 """
 
 
@@ -767,6 +807,30 @@ def nfs_io(arguments: argparse.Namespace) -> None:
     emit({"name": arguments.name, "mountpoint": target, "io": reading})
 
 
+def checked_reading(reading: dict[str, Any], what: str) -> dict[str, Any]:
+    """A ``host_python`` result that is no reading is this probe's own failure.
+
+    Two shapes: the subprocess bound (``timed_out``) and a snippet that printed
+    no JSON (``error``: reading failed). The fill and unfill readings are spread
+    into the command's result, so they never carry a top-level ``error`` key of
+    their own -- the host fixture reads that key, whatever its value, as a
+    failed call. Here the failure is named instead: ``<what>_timeout`` or
+    ``<what>_unreadable`` as the reason token, the reading as the detail.
+    """
+
+    if reading.get("timed_out"):
+        raise ProbeError(
+            f"the {what} did not finish within {READING_MAX_SECONDS} s",
+            f"{what}_timeout",
+            reading,
+        )
+    if "error" in reading:
+        raise ProbeError(
+            f"the {what} produced no reading", f"{what}_unreadable", reading
+        )
+    return reading
+
+
 def nfs_fill(arguments: argparse.Namespace) -> None:
     run_id = checked_run_id(arguments.run_id)
     entry = checked_mount(run_id, arguments.name)
@@ -774,8 +838,9 @@ def nfs_fill(arguments: argparse.Namespace) -> None:
     if not 1.0 <= percent <= 100.0:
         raise ProbeError("fill percent is outside 1..100")
     target = str(entry["mountpoint"])
-    reading = host_python(
-        FILL_SNIPPET, target, str(percent), timeout=READING_MAX_SECONDS
+    reading = checked_reading(
+        host_python(FILL_SNIPPET, target, str(percent), timeout=READING_MAX_SECONDS),
+        "fill",
     )
     emit({"name": arguments.name, "mountpoint": target, **reading})
 
@@ -784,7 +849,19 @@ def nfs_unfill(arguments: argparse.Namespace) -> None:
     run_id = checked_run_id(arguments.run_id)
     entry = checked_mount(run_id, arguments.name)
     target = str(entry["mountpoint"])
-    reading = host_python(UNFILL_SNIPPET, target, timeout=READING_MAX_SECONDS)
+    reading = checked_reading(
+        host_python(UNFILL_SNIPPET, target, timeout=READING_MAX_SECONDS), "unfill"
+    )
+    unfill = reading.get("unfill")
+    if isinstance(unfill, dict) and "error" in unfill:
+        # The fill file (or a proof) is still on the export: the export stays
+        # full, so this is the probe's failure, with the errno in the detail.
+        raise ProbeError(
+            f"the fill could not be removed ({unfill['error']} errno "
+            f"{unfill.get('errno')})",
+            "unfill_failed",
+            reading,
+        )
     emit({"name": arguments.name, "mountpoint": target, **reading})
 
 
@@ -952,24 +1029,36 @@ def exception_site(exc: BaseException) -> str | None:
     return site
 
 
+def error_fields(exc: BaseException, command: str) -> dict[str, Any]:
+    """The failure line: class, digest, site and reason token are what the host
+    fixture may show; the message and detail go into the case's redacted
+    ``probe-error.json`` (the reading the probe refused, for one)."""
+
+    report: dict[str, Any] = {
+        "error": type(exc).__name__,
+        "error_kind": "probe",
+        "error_class": type(exc).__name__,
+        "error_code": error_code(exc),
+        "error_site": exception_site(exc),
+        "error_message": str(exc)[:2000],
+        "error_detail": getattr(exc, "detail", None),
+        "command": command,
+    }
+    if isinstance(exc, MountError):
+        # A classified mount failure: the constant sentence may be shown.
+        report["error_kind"] = "nfs_mount"
+        report["message"] = exc.reason
+    elif isinstance(exc, ProbeError) and exc.reason:
+        report["error_reason"] = exc.reason
+    return report
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = parser().parse_args(argv)
     try:
         arguments.handler(arguments)
     except Exception as exc:  # noqa: BLE001 - reported as the probe's JSON error
-        report: dict[str, Any] = {
-            "error": type(exc).__name__,
-            "error_kind": "probe",
-            "error_class": type(exc).__name__,
-            "error_code": error_code(exc),
-            "error_site": exception_site(exc),
-            "command": arguments.command,
-        }
-        if isinstance(exc, MountError):
-            # A classified mount failure: the constant sentence may be shown.
-            report["error_kind"] = "nfs_mount"
-            report["message"] = exc.reason
-        emit(report)
+        emit(error_fields(exc, arguments.command))
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
     return 0

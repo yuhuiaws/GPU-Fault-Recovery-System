@@ -13,6 +13,8 @@ snippets themselves run once for real on ``tmp_path``.
 from __future__ import annotations
 
 import json
+import re
+import shutil
 import subprocess
 import sys
 import types
@@ -147,8 +149,14 @@ def host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeHost:
     readings: dict[str, dict[str, Any]] = {
         sharedp.STATVFS_SNIPPET: {"total_bytes": 256 << 20, "used_percent": 1.0},
         sharedp.IO_SNIPPET: {"ok": True, "sha256_match": True},
-        sharedp.FILL_SNIPPET: {"fill_bytes": 1, "statvfs": {"used_percent": 99.0}},
-        sharedp.UNFILL_SNIPPET: {"removed": 1},
+        sharedp.FILL_SNIPPET: {
+            "fill": {"fill_bytes": 1 << 20, "wanted_bytes": 1 << 20, "enospc": False},
+            "statvfs": {"used_percent": 99.0},
+        },
+        sharedp.UNFILL_SNIPPET: {
+            "unfill": {"removed": 1},
+            "statvfs": {"used_percent": 0.0},
+        },
     }
     fake.readings = readings  # type: ignore[attr-defined]
     fake.python_calls = []  # type: ignore[attr-defined]
@@ -323,10 +331,15 @@ def test_readings_run_in_the_host_namespace_with_their_bounds(host: FakeHost) ->
     assert host.emitted[-1]["io"]["ok"] is True
     assert sharedp.main(call("nfs-io", "--name", "shared", "--mib", "999")) == 1
     assert sharedp.main(call("nfs-fill", "--name", "shared", "--percent", "99")) == 0
-    assert host.emitted[-1]["statvfs"]["used_percent"] == 99.0
+    filled = host.emitted[-1]
+    assert (
+        filled["statvfs"]["used_percent"] == 99.0 and filled["fill"]["enospc"] is False
+    )
+    assert "error" not in filled, "a reading is never the fixture's failed call"
     assert sharedp.main(call("nfs-fill", "--name", "shared", "--percent", "0")) == 1
     assert sharedp.main(call("nfs-unfill", "--name", "shared")) == 0
-    assert host.emitted[-1]["removed"] == 1
+    unfilled = host.emitted[-1]
+    assert unfilled["unfill"]["removed"] == 1 and "error" not in unfilled
     assert sharedp.main(call("nfs-stat", "--name", "ghost")) == 1
     assert host.emitted[-1]["error_class"] == "ProbeError"
 
@@ -392,15 +405,100 @@ def test_io_snippet_writes_fsyncs_reads_back_and_cleans_up(tmp_path: Path) -> No
 def test_fill_and_unfill_snippets_are_statvfs_driven(tmp_path: Path) -> None:
     # A target below the current usage writes nothing; the shape is what counts.
     filled = snippet(sharedp.FILL_SNIPPET, str(tmp_path), "0.0000001")
-    assert filled["fill_bytes"] == 0 and filled["enospc"] is False
-    assert "used_percent" in filled["statvfs"]
+    assert set(filled) == {"fill", "statvfs"}, filled
+    assert filled["fill"]["fill_bytes"] == 0 and filled["fill"]["enospc"] is False
+    assert "error" not in filled["fill"] and "used_percent" in filled["statvfs"]
     (tmp_path / "gfrs-io").mkdir()
     (tmp_path / "gfrs-io" / "proof-1.bin").write_bytes(b"x")
     cleaned = snippet(sharedp.UNFILL_SNIPPET, str(tmp_path))
-    assert cleaned["removed"] == 2 and not (tmp_path / "gfrs-io").exists()
+    assert set(cleaned) == {"unfill", "statvfs"}, cleaned
+    assert cleaned["unfill"] == {"removed": 2} and not (tmp_path / "gfrs-io").exists()
     assert not (tmp_path / "gfrs-fill.bin").exists(), (
         "(tmp_path / 'gfrs-fill.bin').exists() is still present"
     )
+
+
+# --------------------------------------------------------------------------- #
+# the fill's own failures are readings the runner grades, never a withheld call
+# (live: the first fill ever reached ended on "exit 0; output withheld" because
+# the snippet printed "error": null and the fixture reads the key's presence)
+# --------------------------------------------------------------------------- #
+def test_fill_snippet_hands_a_short_fill_over_as_a_reading(tmp_path: Path) -> None:
+    """ENOSPC before the target is a reading: the bytes written, the first
+    failure's class and errno and ``enospc`` under ``fill`` -- nothing at the top
+    level the host fixture would read as a failed call."""
+
+    if not Path("/dev/full").exists():
+        pytest.skip("no /dev/full on this host")
+    if shutil.disk_usage(tmp_path).free < (2 << 20):
+        pytest.skip("the test filesystem has no room for a 1 MiB fill target")
+    (tmp_path / "gfrs-fill.bin").symlink_to("/dev/full")
+    filled = snippet(sharedp.FILL_SNIPPET, str(tmp_path), "100")
+    assert set(filled) == {"fill", "statvfs"}, filled
+    fill = filled["fill"]
+    assert fill["wanted_bytes"] >= (1 << 20) and fill["fill_bytes"] == 0, fill
+    assert fill["error"] == "OSError" and fill["errno"] == 28, fill
+    assert fill["enospc"] is True and "used_percent" in filled["statvfs"]
+
+
+def test_fill_snippet_reports_a_root_it_cannot_read_as_a_reading(
+    tmp_path: Path,
+) -> None:
+    blocker = tmp_path / "file.txt"
+    blocker.write_text("not a directory")
+    filled = snippet(sharedp.FILL_SNIPPET, str(blocker / "below"), "99")
+    assert set(filled) == {"fill"}, "no statvfs reading either"
+    fill = filled["fill"]
+    assert fill["error"] == "NotADirectoryError" and fill["errno"] == 20, fill
+    assert fill["fill_bytes"] == 0 and fill["enospc"] is False, fill
+
+
+def test_unfill_snippet_names_a_fill_file_it_cannot_remove(tmp_path: Path) -> None:
+    (tmp_path / "gfrs-fill.bin").mkdir()
+    cleaned = snippet(sharedp.UNFILL_SNIPPET, str(tmp_path))
+    unfill = cleaned["unfill"]
+    assert unfill["removed"] == 0 and unfill["error"] == "IsADirectoryError", unfill
+    assert unfill["errno"] == 21 and "used_percent" in cleaned["statvfs"], cleaned
+
+
+TIMED_OUT = {"timed_out": True, "elapsed": 180, "error": "TimeoutExpired"}
+NO_JSON = {"error": "reading failed (1)", "stderr": "Traceback"}
+NOT_REMOVED = {
+    "unfill": {"removed": 0, "error": "IsADirectoryError", "errno": 21},
+    "statvfs": {"used_percent": 99.0},
+}
+
+
+@pytest.mark.parametrize(
+    ("command", "reading", "reason"),
+    [
+        ("nfs-fill", TIMED_OUT, "fill_timeout"),
+        ("nfs-fill", NO_JSON, "fill_unreadable"),
+        ("nfs-unfill", TIMED_OUT, "unfill_timeout"),
+        ("nfs-unfill", NO_JSON, "unfill_unreadable"),
+        ("nfs-unfill", NOT_REMOVED, "unfill_failed"),
+    ],
+)
+def test_a_fill_or_unfill_without_a_reading_names_its_reason(
+    host: FakeHost, command: str, reading: dict[str, Any], reason: str
+) -> None:
+    """``host_python``'s two non-reading shapes (the subprocess bound, no JSON)
+    and a removal that failed are the probe's own failure line: class, digest,
+    site and a reason token in the fixture's shape, the reading as the detail."""
+
+    assert sharedp.main(mount()) == 0, host.emitted[-1]
+    key = sharedp.FILL_SNIPPET if command == "nfs-fill" else sharedp.UNFILL_SNIPPET
+    host.readings[key] = reading  # type: ignore[attr-defined]
+    extra = ("--percent", "99") if command == "nfs-fill" else ()
+    assert sharedp.main(call(command, "--name", "shared", *extra)) == 1
+    result = host.emitted[-1]
+    assert result["error_kind"] == "probe" and result["error_class"] == "ProbeError"
+    assert result["error_reason"] == reason, result
+    assert re.fullmatch(r"[a-z][a-z0-9_]{2,40}", reason), "the fixture's token shape"
+    assert re.fullmatch(
+        r"nfs_(un)?fill:[0-9]+|checked_reading:[0-9]+", result["error_site"]
+    ), result
+    assert result["error_detail"] == reading and result["error_message"], result
 
 
 # --------------------------------------------------------------------------- #
@@ -463,6 +561,8 @@ def test_a_failed_mount_names_its_cause_in_a_constant_sentence(
     result = host.emitted[-1]
     assert result["error_kind"] == "nfs_mount", result
     assert result["error_class"] == "MountError", result
+    assert "error_reason" not in result, "the sentence is the message, not a token"
+    assert result["error_message"].startswith("command failed (32)"), result
     message = result["message"]
     assert needle.casefold() in message.casefold(), (message, stderr)
     assert message == sharedp.classify_mount_failure(stderr), (message, stderr)

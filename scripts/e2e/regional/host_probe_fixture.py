@@ -725,9 +725,19 @@ class HostProbeFixture:
                 f"host probe returned an empty or non-object result (exit {completed.returncode})"
             )
         if completed.returncode or "error" in payload:
+            # An ``error`` key is a failed call whatever its value -- ``null``
+            # too -- so a probe's failure line with a null or empty error is
+            # never graded as a success payload; probes keep the key out of
+            # success results (a reading spread into a result carried
+            # ``error: null`` and ended 005 capacity_full withheld, 2026-10-26).
             # Every shown token is whitelisted by shape: a 16-hex digest of the
             # message, an ``identifier:line`` site, an identifier class name.
             # The message itself (``error``) never leaves the node.
+            diagnostic = (
+                "; error key null"
+                if "error" in payload and payload["error"] is None
+                else ""
+            )
             code = payload.get("error_code")
             if not (isinstance(code, str) and re.fullmatch(r"[a-f0-9]{16}", code)):
                 code = None
@@ -738,7 +748,6 @@ class HostProbeFixture:
             ):
                 site = None
             kind = payload.get("error_kind")
-            diagnostic = ""
             missing = payload.get("missing_binary")
             if (
                 kind == "missing_binary"

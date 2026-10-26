@@ -1838,6 +1838,39 @@ read (a silent collector), a mount read but never healthy (its readings listed),
 or a delivering collector whose shared latest records name other mounts only --
 the real "not discovered", the evidence of a sandbox view or a filtered root.
 
+The first live run in which 005 `capacity_full` reached its fill (plain EKS,
+release R13g) ended INCONCLUSIVE on `harness fixture failed: HostProbeError:
+host probe failed (exit 0); output withheld` -- no fill evidence, no
+`probe-error.json`, no token -- while the cleanup's unfill removed one file from
+an export that read 0 % used afterwards. The cause was the probe's result shape,
+not the fill: the fill snippet printed an `error` key on every run (`null` on
+success, `OSError: 28` on a failure), `nfs_fill` spread that reading into its
+result, and `host_probe_fixture.execute` classifies a result by the *presence*
+of an `error` key, then shows only whitelisted tokens; `null` matched none. The
+fixture keeps presence as the signal -- a probe's failure line whose error is
+null or empty must never be graded as a success payload, and the other probes'
+failure lines are unchanged -- and now says `error key null` for that case. The
+probe side changed: the fill and unfill snippets nest their records under
+`fill` / `unfill` beside the top-level `statvfs` (no snippet field can collide
+with the fixture's vocabulary), catch every `OSError` and name the first one by
+class, `errno` and `enospc` inside that record, and a fill the export stopped
+short (ENOSPC before the target, a quota) is a reading the runner grades --
+`VariantInconclusive("the test export only reached 61.2 % used (fill wrote 160
+of 251 MiB; OSError errno 28 ENOSPC)")` -- not a failed call. What is a failed
+call -- the fill's subprocess bound (`timed_out`), a snippet that printed no
+JSON, an unfill that could not remove the fill file -- raises `ProbeError` with
+a reason token (`fill_timeout`, `fill_unreadable`, `unfill_timeout`,
+`unfill_unreadable`, `unfill_failed`) the fixture shows and records with the
+message and the reading in `probe-error.json`. Tests:
+`tests/regional/test_general_live_shared_probe.py` runs the snippets for real
+(a `/dev/full` fill for the ENOSPC reading, a fill root that is a file, a fill
+file that is a directory) and the reason tokens through `main`;
+`tests/regional/test_host_probe_error_key.py` pins the fixture's classification
+of null, empty, class-shaped and sentence-shaped `error` values, the probe's
+failure line, and passes the real fill and unfill readings through the real
+fixture; `tests/regional/test_general_live_shared.py` grades the short fill and
+the fill without a statvfs reading.
+
 004 `probe_error` has its faulting mount: the storage probe's loop +
 device-mapper device carrying FAT16 (`dm-create --fstype vfat`; the FAT region
 is read from the boot sector's BPB at build time, page-aligned inwards, and

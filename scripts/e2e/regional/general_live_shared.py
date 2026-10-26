@@ -56,6 +56,7 @@ see the same export ``source`` before the hang, else the variant is NOT_READY.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 from collections.abc import Callable, Iterable
 from datetime import datetime
@@ -982,7 +983,7 @@ def capacity_full(ctx: VariantContext) -> dict[str, Any]:
     ctx.evidence.write("fill", filled)
     used = (filled.get("statvfs") or {}).get("used_percent")
     if not isinstance(used, (int, float)) or used < 98:
-        raise VariantInconclusive(f"the test export only reached {used}% used")
+        raise VariantInconclusive(_short_fill(filled, used))
     # The 98 % rule has no sustain: the fill's edge batch mints the finding, and
     # VALIDATE_HOST is judged on the health summary after it -- wait for that
     # step to be terminal before grading the chain (one summary, not the first
@@ -1018,6 +1019,30 @@ def capacity_full(ctx: VariantContext) -> dict[str, Any]:
     return _result(
         stages, extra={"mount": mount, "used_percent": used, "recovery": recovered}
     )
+
+
+def _short_fill(filled: dict[str, Any], used: Any) -> str:
+    """Why the fill left the export below 98 %: the percentage it reached (or
+    that the fill read no statvfs), what was written against what was wanted,
+    and the fill's own first failure -- class, errno and its name (ENOSPC before
+    the target, a quota). The probe hands a short fill over as a reading; the
+    verdict is INCONCLUSIVE, never a failed call."""
+
+    fill = filled.get("fill") if isinstance(filled.get("fill"), dict) else {}
+    text = (
+        f"the test export only reached {used:.1f} % used"
+        if isinstance(used, (int, float))
+        else "the fill left no statvfs reading of the test export"
+    )
+    notes = []
+    written, wanted = fill.get("fill_bytes"), fill.get("wanted_bytes")
+    if isinstance(written, int) and isinstance(wanted, int):
+        notes.append(f"fill wrote {written >> 20} of {wanted >> 20} MiB")
+    if isinstance(fill.get("error"), str):
+        code = fill.get("errno")
+        name = errno.errorcode.get(code, "") if isinstance(code, int) else ""
+        notes.append(f"{fill['error']} errno {code} {name}".rstrip())
+    return f"{text} ({'; '.join(notes)})" if notes else text
 
 
 def _await_used_recovery(

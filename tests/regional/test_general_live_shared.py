@@ -172,8 +172,11 @@ def shared_probe(node: str) -> FakeProbe:
             },
             "nfs-stat": stat,
             "nfs-io": io,
-            "nfs-fill": {"statvfs": {"used_percent": 99.2, "total_bytes": SIZE}},
-            "nfs-unfill": {"statvfs": {"used_percent": 1.0}},
+            "nfs-fill": {
+                "fill": {"fill_bytes": 253 << 20, "wanted_bytes": 253 << 20},
+                "statvfs": {"used_percent": 99.2, "total_bytes": SIZE},
+            },
+            "nfs-unfill": {"unfill": {"removed": 1}, "statvfs": {"used_percent": 1.0}},
             "nfs-umount": {
                 "host_mount": None,
                 "unmounted": f"/mnt/x/{node}",
@@ -813,15 +816,60 @@ def test_capacity_full_fails_on_a_quarantine(tmp_path: Path) -> None:
 
 
 def test_capacity_full_is_inconclusive_below_98(tmp_path: Path) -> None:
+    """A fill the export stopped short (ENOSPC before the target, a quota) is a
+    reading the probe hands over, not a failed call: the verdict names the
+    reached percentage, the bytes written against the target and the fill's
+    first failure by class, errno and errno name."""
+
     probe = shared_probe(NODE)
-    probe.script["nfs-fill"] = {"statvfs": {"used_percent": 90.0}}
+    probe.script["nfs-fill"] = {
+        "fill": {
+            "fill_bytes": 160 << 20,
+            "wanted_bytes": 251 << 20,
+            "enospc": True,
+            "error": "OSError",
+            "errno": 28,
+        },
+        "statvfs": {"used_percent": 61.2},
+    }
     ctx = context(
         "capacity_full", tmp_path, activity=None, probes={f"shared@{NODE}": probe}
     )
     mount = shared.mount_path(ctx, shared.PRIMARY)
     ctx.regional.cpu_python_responder = store_script({"activity": full_activity(mount)})
-    with pytest.raises(VariantInconclusive, match="only reached"):
+    with pytest.raises(VariantInconclusive) as caught:
         SPECS["capacity_full"].execute(ctx)
+    assert str(caught.value) == (
+        "the test export only reached 61.2 % used (fill wrote 160 of 251 MiB; "
+        "OSError errno 28 ENOSPC)"
+    )
+    assert "unfill" in ctx.cleanup.pending(), "the fill is undone by the stack"
+
+
+def test_capacity_full_is_inconclusive_without_a_statvfs_reading(
+    tmp_path: Path,
+) -> None:
+    probe = shared_probe(NODE)
+    probe.script["nfs-fill"] = {
+        "fill": {
+            "fill_bytes": 0,
+            "wanted_bytes": 0,
+            "enospc": False,
+            "error": "NotADirectoryError",
+            "errno": 20,
+        }
+    }
+    ctx = context(
+        "capacity_full", tmp_path, activity=None, probes={f"shared@{NODE}": probe}
+    )
+    mount = shared.mount_path(ctx, shared.PRIMARY)
+    ctx.regional.cpu_python_responder = store_script({"activity": full_activity(mount)})
+    with pytest.raises(VariantInconclusive) as caught:
+        SPECS["capacity_full"].execute(ctx)
+    assert str(caught.value) == (
+        "the fill left no statvfs reading of the test export (fill wrote 0 of 0 MiB; "
+        "NotADirectoryError errno 20 ENOTDIR)"
+    )
     assert "unfill" in ctx.cleanup.pending(), "the fill is undone by the stack"
 
 
