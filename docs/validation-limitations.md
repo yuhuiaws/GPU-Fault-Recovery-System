@@ -2523,6 +2523,42 @@ records through the probe's wrapper, the real collector, the control-plane API
 and the activity probe, so the grade is tested against what the product writes
 rather than a scripted record.
 
+Every GF-GENERAL-LIVE matcher of node-health incidents now takes one label set,
+`NODE_HEALTH_EVENT_TYPES` in `scripts/e2e/regional/general_live_verdicts.py`.
+The product mints a node-health finding's incident as `NODE_HEALTH`
+(`orchestration/families/health.py`) and re-labels that record when it routes
+more evidence into it instead of opening another: `NODE_HEALTH_GROUP` when a
+critical quarantine joins the node's in-flight isolation (`families/drain.py`
+`ingest_terminal_node_quarantine`), `NODE_RESOURCE_GROUP` when a
+device-resource finding joins it (`ingest_grouped_node_resource_finding`),
+`GPU_FAULT_GROUP` for a finding of a managed attempt
+(`families/grouped_health.py`); a reboot or replacement finding of a running
+attempt opens `NODE_HEALTH_GROUP` itself (`families/node_lifecycle.py`, under a
+derived `incident-<digest>` id and its own event id). 008 and 016 took the set
+after live runs read FAIL over records the product had grouped; the 017
+journal variants, 002 `cgroup_only`'s log grading and the DCGM and inventory
+selectors of `general_live_gpu_verdicts` (019, 020, 021, 022, 024, 026) still
+took `NODE_HEALTH` alone, so a grouped record was invisible to them: a positive
+stage found no incident for a finding the record held (the DCGM chain's "no
+... finding reached an incident"), and an evidence-only stage read PASS over a
+node-log isolation opened inside its window. They take the set now. The event id still says which
+finding minted a record, and a finding that joined another finding's record is
+followed through its marker (`marker-<event id>`, whose `incident_id` names the
+incident ingestion routed it to), as 016 `cursor_pagination` does. Checked
+variant by variant, no other variant's own injection lets two of its findings
+share a record (one finding, or none that claims the node exclusively or is a
+critical quarantine); the one exception, 024 `wrong_scope_source`, would group
+only if the exporter emitted the pending-repair reading before the
+uncorrectable one, and the site's `deploy/dataplane/dcgm-counters.csv` lists
+the volatile DBE first, so it keeps its per-GPU incidents.
+`tests/regional/test_general_live_node_health_labels.py` drives the product's
+own ingestion (kernel lines and DCGM scrapes through the control-plane API)
+through every routing, pins the labels they give to the set exactly -- the
+product's other record labels (the shared-storage failure domain, the placement
+hold, operator maintenance, XID/SXID) stay out of it -- and grades each matcher
+on a product-made record two findings share, which every one of them missed
+under `NODE_HEALTH` alone.
+
 017 `old_pod` writes its reviewed line under the UID of a Pod the product has
 already restarted away, in a directory kubelet is going to remove: kubelet's
 container GC (one-minute `ContainerGCPeriod`) deletes every `/var/log/pods`

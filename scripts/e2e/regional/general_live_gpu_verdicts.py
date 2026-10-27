@@ -1,10 +1,14 @@
 """Chain checks of the GF-GENERAL-LIVE DCGM / GPU-inventory categories.
 
 A DCGM finding reaches the control plane's node-health path as
-``gpu-<finding_id>`` (``app/ingest/gpu_findings.py``), so its NODE_HEALTH
-incident is ``inc-gpu-<finding_id>``. The finding id names the batch, the
-scope and the reading (``gpu_metrics.py`` / ``gpu_composites.py`` /
-``gpu_fabric_manager.py`` / ``gpu_collection_errors.py``):
+``gpu-<finding_id>`` (``app/ingest/gpu_findings.py``), so the incident it mints
+is ``inc-gpu-<finding_id>`` -- under any label the product gives a node-health
+record (``general_live_verdicts.NODE_HEALTH_EVENT_TYPES``: a critical
+quarantine joining its in-flight isolation re-labels it ``NODE_HEALTH_GROUP``,
+a device-resource finding ``NODE_RESOURCE_GROUP``, a managed attempt's grouping
+``GPU_FAULT_GROUP``). The finding id names the batch, the scope and the reading
+(``gpu_metrics.py`` / ``gpu_composites.py`` / ``gpu_fabric_manager.py`` /
+``gpu_collection_errors.py``):
 
 * a metric finding:     ``<batch>-<gpu_key>-<canonical>``
 * a composite:          ``<batch>-<scope>-composite-<RULE_ID>``
@@ -26,6 +30,7 @@ from typing import Any
 
 from scripts.e2e.regional.general_live_registry import HARDWARE_OPERATIONS
 from scripts.e2e.regional.general_live_verdicts import (
+    NODE_HEALTH_EVENT_TYPES,
     TERMINAL_WORKFLOWS,
     final_execution,
     subsequence,
@@ -47,11 +52,13 @@ COMPILE_TIME_BLOCKED = "compile-time BLOCKED"
 
 
 def _gpu_incidents(activity: dict[str, Any]) -> list[dict[str, Any]]:
+    """Incidents a GPU finding minted, under every node-health label."""
+
     return sorted(
         (
             item
             for item in activity.get("incidents") or []
-            if item.get("event_type") == "NODE_HEALTH"
+            if item.get("event_type") in NODE_HEALTH_EVENT_TYPES
             and str(item.get("event_id") or "").startswith("gpu-")
         ),
         key=lambda item: str(item.get("created_at")),
@@ -61,7 +68,7 @@ def _gpu_incidents(activity: dict[str, Any]) -> list[dict[str, Any]]:
 def metric_incidents(
     activity: dict[str, Any], canonical: str, *, gpu: str | None = None
 ) -> list[dict[str, Any]]:
-    """NODE_HEALTH incidents of a DCGM metric finding on ``canonical``."""
+    """Incidents a DCGM metric finding on ``canonical`` minted (any label)."""
 
     suffix = f"-{gpu}-{canonical}" if gpu else f"-{canonical}"
     return [
@@ -100,12 +107,12 @@ def completeness_incidents(activity: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def inventory_incidents(activity: dict[str, Any], metric: str) -> list[dict[str, Any]]:
-    """NODE_HEALTH incidents of an inventory finding (``gpu_inventory_*``)."""
+    """Incidents an inventory finding (``gpu_inventory_*``) minted (any label)."""
 
     return [
         item
         for item in activity.get("incidents") or []
-        if item.get("event_type") == "NODE_HEALTH"
+        if item.get("event_type") in NODE_HEALTH_EVENT_TYPES
         and metric in str(item.get("event_id") or "")
     ]
 
@@ -479,7 +486,7 @@ def counter_reset_ticks(
 def incident_finding(
     state: dict[str, Any], incident: dict[str, Any]
 ) -> dict[str, Any] | None:
-    """The finding (``gpu_state`` history) a ``gpu-<finding_id>`` NODE_HEALTH
+    """The finding (``gpu_state`` history) a ``gpu-<finding_id>`` node-health
     incident was minted from, when the history since the moment holds it."""
 
     event_id = str(incident.get("event_id") or "")
@@ -643,7 +650,7 @@ def component_dedup_errors(
 
     ``gpu_metrics.ingest`` suppresses a component finding's own incident once
     its composite exists (``suppressed_by_composite``); a component that still
-    minted a NODE_HEALTH incident after the composite's creation was handled
+    minted a node-health incident after the composite's creation was handled
     twice. A component incident minted *before* the composite formed is the
     product's design (the composite needed a later batch) and is not an error.
     """

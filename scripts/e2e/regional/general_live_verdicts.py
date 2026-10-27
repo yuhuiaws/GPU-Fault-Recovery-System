@@ -44,22 +44,32 @@ def safe_device(value: str | None) -> str:
 #: never ``-dcgm_field_completeness-``. It is node-level, with no rule.
 UNNAMED_FINDINGS = {"dcgm_field_completeness": ("gpu-", "-dcgm-fields")}
 
-#: The event types an incident minted by a node-health finding carries. The
-#: health family mints ``NODE_HEALTH`` (``families/health.py``), and the
-#: product re-labels that same record -- same ``inc-<event id>``, same minting
-#: ``event_id`` -- when it routes more evidence into it instead of opening a
-#: second incident: a critical QUARANTINE that joins the node's in-flight
-#: isolation makes the incumbent ``NODE_HEALTH_GROUP``
-#: (``families/drain.py`` ``ingest_terminal_node_quarantine``), a device-resource
-#: finding ``NODE_RESOURCE_GROUP`` (``ingest_grouped_node_resource_finding``),
-#: and a finding on a node a managed attempt holds is opened as
-#: ``GPU_FAULT_GROUP`` (``families/grouped_health.py`` ``_candidate``). Live
+#: The event types an incident minted by a node-health finding carries -- the
+#: one set every GF-GENERAL-LIVE matcher of node-health incidents takes (008,
+#: 016, 017, 002, the DCGM/inventory selectors of ``general_live_gpu_verdicts``;
+#: pinned against the product's own routes by
+#: ``tests/regional/test_general_live_node_health_labels.py``). The health family
+#: mints ``NODE_HEALTH`` (``families/health.py``), and the product re-labels
+#: that same record -- same ``inc-<event id>``, same minting ``event_id`` --
+#: when it routes more evidence into it instead of opening a second incident: a
+#: critical QUARANTINE that joins the node's in-flight isolation makes the
+#: incumbent ``NODE_HEALTH_GROUP`` (``families/drain.py``
+#: ``ingest_terminal_node_quarantine``), a device-resource finding
+#: ``NODE_RESOURCE_GROUP`` (``ingest_grouped_node_resource_finding``), and a
+#: finding on a node a managed attempt holds is opened as ``GPU_FAULT_GROUP``
+#: (``families/grouped_health.py`` ``_candidate``; an XID that merges into an
+#: attempt's record re-labels it so too, ``families/grouped_faults.py``). A
+#: reboot or replacement finding of a running attempt opens
+#: ``NODE_HEALTH_GROUP`` itself (``families/node_lifecycle.py``), under a
+#: derived ``incident-<digest>`` id but its own event id. Live
 #: 2026-10-25 008 ``required_link_down``: the test veth's peer, also declared
 #: required, read ``lowerlayerdown`` in the same tick, its finding joined the
 #: ``-network_link_down-<a>`` incident, which became NODE_HEALTH_GROUP and was
 #: QUARANTINED -- and the runner, taking only NODE_HEALTH, reported "no
 #: network_link_down on <a> finding reached an incident". The event id, not the
-#: label, says which finding minted an incident.
+#: label, says which finding minted an incident; the finding that joined one
+#: is found through its marker (``marker-<event id>``, whose ``incident_id`` is
+#: the incident ingestion routed it to; 016 ``cursor_pagination``).
 NODE_HEALTH_EVENT_TYPES = frozenset(
     {"NODE_HEALTH", "NODE_HEALTH_GROUP", "NODE_RESOURCE_GROUP", "GPU_FAULT_GROUP"}
 )

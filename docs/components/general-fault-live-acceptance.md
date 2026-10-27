@@ -1756,6 +1756,28 @@ decision、restart 预算账本），绝不 POST 预制 finding/workflow。运�
 `TimeoutExpired`，看板上是一条空备注的 FAIL）。夹具失败之后清理仍未能证明节点干净的，
 按清理失败记 `FAIL`。
 
+节点健康 incident 的标签统一按一个集合匹配：`scripts/e2e/regional/general_live_verdicts.py`
+的 `NODE_HEALTH_EVENT_TYPES`。产品为节点健康 finding 生成的 incident 标为 `NODE_HEALTH`
+（`orchestration/families/health.py`），把更多证据并入同一条记录而不另开 incident 时改标：节点隔离
+进行中到达的关键隔离（critical QUARANTINE）并入后为 `NODE_HEALTH_GROUP`（`families/drain.py`
+`ingest_terminal_node_quarantine`），设备资源类 finding 并入后为 `NODE_RESOURCE_GROUP`
+（`ingest_grouped_node_resource_finding`），受管 attempt 的 finding 归组为 `GPU_FAULT_GROUP`
+（`families/grouped_health.py`）；运行中 attempt 的重启/替换 finding 直接生成 `NODE_HEALTH_GROUP`
+（`families/node_lifecycle.py`，incident id 为派生的 `incident-<digest>`，event id 仍是该 finding 的）。
+008 与 016 在真机读到被产品归组的记录判 FAIL 后已改用该集合；017 的 journal 变体、002 `cgroup_only`
+的日志定级以及 `general_live_gpu_verdicts` 的 DCGM/库存选择器（019、020、021、022、024、026）此前仍只认
+`NODE_HEALTH`，归组后的记录对它们不可见：正向阶段找不到持有该 finding 的记录（DCGM 链报“no ...
+finding reached an incident”），证据类阶段在窗口内一条进行中的节点日志隔离上读 PASS。现在它们都使用该集合；生成记录的
+finding 仍由 event id 识别，并入他人记录的 finding 沿其 marker（`marker-<event id>`，其 `incident_id`
+即 ingestion 归入的 incident）追踪，如 016 `cursor_pagination`。逐个核对后，其余变体自己的注入不会让
+两个 finding 归组（单个 finding，或没有 finding 独占节点/没有关键隔离）；唯一例外是 024
+`wrong_scope_source` 在 exporter 先输出 pending-repair 读数时才可能归组，而本站
+`deploy/dataplane/dcgm-counters.csv` 的字段顺序是 volatile DBE 在前，故保持按 GPU 各自生成 incident 判定。
+`tests/regional/test_general_live_node_health_labels.py` 用产品自身的 ingestion（内核日志与 DCGM
+抓取经控制面 API）驱动每一条归组路由，把各路由给出的标签与该集合逐一钉住（产品的其他记录标签——共享存储
+故障域、placement hold、运维维护、XID/SXID——不得进入），并在两个 finding 共享一条记录的产品记录上
+判定每个匹配器，只认 `NODE_HEALTH` 时这些判定全部不成立。
+
 ### phase 1 范围与前提
 
 首批 native 变体：001 CPU 过载、003 低利用率/资源异常、004 本地盘满、

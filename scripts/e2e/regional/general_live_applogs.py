@@ -106,8 +106,10 @@ from scripts.e2e.regional.general_live_registry import (
 )
 from scripts.e2e.regional.general_live_store import applog_records
 from scripts.e2e.regional.general_live_verdicts import (
+    NODE_HEALTH_EVENT_TYPES,
     final_execution,
     hardware_errors,
+    minted_in_read,
     node_isolated,
     operations,
     parse_time,
@@ -148,12 +150,23 @@ OLD_POD_GC_WAIT_SECONDS = 75
 # journal replay variants (phase 2)
 # --------------------------------------------------------------------------- #
 def _log_incidents(activity_document: dict[str, Any]) -> list[dict[str, Any]]:
+    """Incidents a node-log entry on this node minted since the read's ``since``.
+
+    Under every label the product gives that record (``NODE_HEALTH_EVENT_TYPES``,
+    as 016's matcher): a critical quarantine that joins the node's in-flight
+    isolation re-labels it ``NODE_HEALTH_GROUP``, so a log isolation opened in
+    an evidence-only window hid from those stages under ``NODE_HEALTH`` alone
+    once a second critical finding had joined it. ``minted_in_read`` keeps out
+    an older incident the read lists only because a workflow of it is newer.
+    """
+
     return sorted(
         (
             item
             for item in activity_document.get("incidents") or []
-            if item.get("event_type") == "NODE_HEALTH"
+            if item.get("event_type") in NODE_HEALTH_EVENT_TYPES
             and str(item.get("event_id") or "").startswith("log-")
+            and minted_in_read(activity_document, item)
         ),
         key=lambda item: str(item.get("created_at")),
     )

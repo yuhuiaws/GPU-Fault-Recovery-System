@@ -92,6 +92,7 @@ from scripts.e2e.regional.probes.general_live_node_probe import (
 from scripts.e2e.regional.regional_commands import RegionalFixtureError
 from scripts.e2e.regional.general_live_verdicts import (
     DIAGNOSTIC_ONLY_STATES,
+    NODE_HEALTH_EVENT_TYPES,
     ChainExpectation,
     chain_errors,
     collector_delivery,
@@ -453,12 +454,18 @@ def _log_grading_errors(observed: dict[str, Any]) -> list[str]:
     The node log collector (disabled by default) grades ``out of memory`` /
     ``killed process`` lines WARNING RUN_DIAGNOSTICS from any origin
     (``log_rules.py``); the kernel collector only extracts XID/SXID records.
+    A log incident counts under every label the product gives it
+    (``NODE_HEALTH_EVENT_TYPES``): were the repeated OOM lines graded as
+    critical quarantines, the later ones would join the first one's isolation
+    and the record would read ``NODE_HEALTH_GROUP``.
     """
 
     errors = []
     for item in observed.get("incidents") or []:
         event_id = str(item.get("event_id") or "")
-        if item.get("event_type") != "NODE_HEALTH" or not event_id.startswith("log-"):
+        if item.get("event_type") not in NODE_HEALTH_EVENT_TYPES:
+            continue
+        if not event_id.startswith("log-"):
             continue
         if not minted_in_read(observed, item):
             continue
