@@ -23,6 +23,9 @@ from gpu_fault.models import (
 )
 from gpu_fault.orchestration.disposition import Disposition, DispositionApplier
 from gpu_fault.orchestration.families.identity import derived_record_id
+from gpu_fault.orchestration.families.incident_labels import (
+    NODE_HEALTH_GROUP_EVENT_TYPE,
+)
 from gpu_fault.orchestration.workflow_builder import containment_handoff_reason
 from gpu_fault.orchestration.provider_lifecycle_owner import (
     cluster_registration,
@@ -675,7 +678,7 @@ class NodeLifecycleOperationService:
         return FaultIncident(
             incident_id=state.incident_id,
             event_id=state.primary_event_id,
-            event_type="NODE_HEALTH_GROUP",
+            event_type=NODE_HEALTH_GROUP_EVENT_TYPE,
             cluster_id=finding.cluster_id,
             node_ids=state.fault_nodes,
             gpu_uuids=state.gpu_uuids,

@@ -3712,7 +3712,18 @@ same export unavailable within a 600 s window (node clocks), one more cluster-sc
 member nodes, `reasons[0]` naming the export and the nodes, then one line per member with its per-node incident id;
 `effective_action=None` and no workflow (a record, never dispatched). Every member's per-node incident gets one
 `common failure domain <id>: ...` reason pointing back; the node chain itself (action, state, steps) is untouched --
-nothing is isolated, no job is stopped. The whole domain mails once (`SHARED_STORAGE_FAILURE_DOMAIN`, deduplicated
+nothing is isolated, no job is stopped. A member's per-node incident is the record holding its activation, under any
+node-health label the product gives it (`NODE_HEALTH`, or the group labels `NODE_HEALTH_GROUP`/`NODE_RESOURCE_GROUP`/
+`GPU_FAULT_GROUP`, `src/gpu_fault/orchestration/families/incident_labels.py`): while a managed attempt's recovery is in
+flight (an XID 13 stop-and-restart, an XID 48 GPU reset) the attempt grouping folds the node's finding into that
+recovery record -- `GPU_FAULT_GROUP` under the event id, policy source and node scope of the fault that minted it, and
+a record-only fold does not even add the node to `node_ids` -- so only the finding's marker (`marker-<event id>`,
+re-pointed by ingestion at the record it routed the finding to) ties the node to the record; the peer look, the safety
+net and the member-incident lookup all follow it. Before, only `event_type=NODE_HEALTH` records whose event id names
+the metric counted: when the node that activated first had been folded into a recovery, the peer activating after it
+never saw it, and a two-node outage of one export formed no record (or the safety net named the node `none open`)
+(b213, `tests/host_health/test_grouped_node_health_incidents.py`). The whole domain mails once
+(`SHARED_STORAGE_FAILURE_DOMAIN`, deduplicated
 per cluster/export/record id); a node that joins later is added to `node_ids` and `reasons` without another mail. The
 export identity comes from the collector's sample label `source` (the mountinfo mount source, e.g. `10.0.0.5:/export`,
 `fs-0abc@tcp:/fsname`) or `server`+`export`; **a mount point is not an identity** (nodes may mount different exports at

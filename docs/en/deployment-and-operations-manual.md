@@ -10386,7 +10386,9 @@ by changing only `action` to:
 
 You cannot just set the state to `NORMAL` while keeping the old baseline, or the next sample triggers SPIKE again.
 The endpoint requires the Event ID in the email to still be the active SPIKE of that job/attempt on that node; an old Event ID,
-wrong node or old attempt returns `409`. The endpoint uses the Event ID and action to guarantee idempotency, and saves the administrator,
+wrong node or old attempt returns `409`. A SPIKE raised while a managed attempt's recovery is in flight is folded into that
+recovery's incident (the email names that `GPU_FAULT_GROUP` recovery record, not one of the SPIKE's own); the Event ID in
+the email works all the same. The endpoint uses the Event ID and action to guarantee idempotency, and saves the administrator,
 reason, old/new baseline and the accepted traffic sample as `ADMIN_ACTION` evidence.
 
 Regional sites release these parameters via the source Manifests and the role-aware renderer (rendered into

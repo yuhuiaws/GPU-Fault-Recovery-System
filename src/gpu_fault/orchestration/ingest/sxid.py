@@ -33,6 +33,7 @@ from gpu_fault.orchestration.arbitration import RecoveryArbiter, gpu_shares_unkn
 from gpu_fault.orchestration.dag_branching import DagBrancher
 from gpu_fault.orchestration.disposition import Disposition, DispositionApplier
 from gpu_fault.orchestration.families.evidence import stops_attempt_before
+from gpu_fault.orchestration.families.incident_labels import GPU_FAULT_GROUP_EVENT_TYPE
 from gpu_fault.orchestration.reset_window import fixed_scope_step_indexes
 from gpu_fault.orchestration.workflow_builder import WorkflowBuilder
 from gpu_fault.orchestration.workflow_merge import workflow_is_mutable
@@ -386,7 +387,7 @@ class SxidIngestionService:
         decision = context.decision
         incident = existing_incident.model_copy(
             update={
-                "event_type": "GPU_FAULT_GROUP",
+                "event_type": GPU_FAULT_GROUP_EVENT_TYPE,
                 "event_source": winner.event_source or existing_incident.event_source,
                 "source_boot_id": (
                     winner.source_boot_id or existing_incident.source_boot_id
@@ -522,7 +523,7 @@ class SxidIngestionService:
         incident = FaultIncident(
             incident_id=incident_id,
             event_id=event.event_id,
-            event_type="GPU_FAULT_GROUP",
+            event_type=GPU_FAULT_GROUP_EVENT_TYPE,
             event_source=event.event_source,
             source_boot_id=event.source_boot_id,
             cluster_id=event.cluster_id,

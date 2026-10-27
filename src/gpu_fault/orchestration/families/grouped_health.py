@@ -18,6 +18,7 @@ from gpu_fault.models import (
 )
 from gpu_fault.orchestration.disposition import Disposition, DispositionApplier
 from gpu_fault.orchestration.families.evidence import stops_attempt_before
+from gpu_fault.orchestration.families.incident_labels import GPU_FAULT_GROUP_EVENT_TYPE
 from gpu_fault.orchestration.workflow_merge import workflow_is_mutable
 from gpu_fault.orchestration.hung_episode import diagnostic_only_hung, new_hung_episode
 
@@ -275,7 +276,7 @@ class GroupedHealthService:
         )
         incident = incident.model_copy(
             update={
-                "event_type": "GPU_FAULT_GROUP",
+                "event_type": GPU_FAULT_GROUP_EVENT_TYPE,
                 "job_id": context.observation.job_id,
                 "attempt_id": context.observation.attempt_id,
                 "workload_identity_source": ("SOLE_ACTIVE_ATTEMPT_ON_NODE"),
@@ -470,7 +471,7 @@ class GroupedHealthService:
         )
         incident = existing_incident.model_copy(
             update={
-                "event_type": "GPU_FAULT_GROUP",
+                "event_type": GPU_FAULT_GROUP_EVENT_TYPE,
                 **scope,
                 "job_id": context.observation.job_id,
                 "attempt_id": context.observation.attempt_id,

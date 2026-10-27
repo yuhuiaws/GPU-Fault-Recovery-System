@@ -44,10 +44,16 @@ from gpu_fault.host_health import (
 from gpu_fault.models import (
     EfaTrafficAdminDecision,
     EfaTrafficAdminRequest,
+    FaultIncident,
     RecoveryAction,
     Severity,
     WorkflowOperation,
     WorkloadState,
+)
+from gpu_fault.orchestration.families.incident_labels import (
+    NODE_HEALTH_INCIDENT_EVENT_TYPES,
+    finding_marker_id,
+    routed_finding_markers,
 )
 from gpu_fault.processor_diagnostics import (
     report_processor_replay_phase,
@@ -522,6 +528,45 @@ async def ingest_processor_telemetry_batch(
     )
 
 
+#: ``NodeHealthPolicy._evaluate_efa_traffic`` stamps every EFA traffic finding.
+EFA_TRAFFIC_POLICY_SOURCE = "SITE_EFA_TRAFFIC"
+
+
+def _holds_node_efa_traffic_event(
+    store: Any, incident: FaultIncident, request: EfaTrafficAdminRequest
+) -> bool:
+    """Whether ``incident`` -- the record ingestion routed ``request.event_id``
+    to -- holds the requested node's EFA traffic finding of that event.
+
+    Under any node-health label (``incident_labels``): the SPIKE's own record
+    is ``NODE_HEALTH``, or under the attempt's group label when the attempt
+    grouping opens it (an attempt a recovery restarted, say), and carries the
+    finding's policy source and node. The grouping may instead fold the SPIKE
+    into the attempt's in-flight recovery, a record minted by another fault
+    (an XID's, ``NVIDIA_CATALOG``) that later routes may re-label, and a
+    later fold may take over the policy source of the SPIKE's own record:
+    then the finding's marker, re-pointed at the record by ingestion, still
+    names the finding's policy source and node. The SPIKE itself -- this
+    node and attempt, still the active transition -- is the store's check.
+    """
+
+    if (
+        incident.cluster_id != request.cluster_id
+        or incident.event_type not in NODE_HEALTH_INCIDENT_EVENT_TYPES
+    ):
+        return False
+    own_record = incident.policy_source == EFA_TRAFFIC_POLICY_SOURCE
+    if own_record and incident.node_ids == [request.node_id]:
+        return True
+    marker_id = finding_marker_id(request.event_id)
+    return any(
+        marker.marker_id == marker_id
+        and marker.event_source == EFA_TRAFFIC_POLICY_SOURCE
+        and marker.scope.node_ids == [request.node_id]
+        for marker in routed_finding_markers(store, incident)
+    )
+
+
 @router.post(
     "/v1/efa-traffic/admin-actions",
     response_model=EfaTrafficAdminDecision,
@@ -550,12 +595,7 @@ async def apply_efa_traffic_admin_action(
         incident = ctx.store.get_incident_by_event(request.event_id)
         if incident is None:
             raise NotFoundError(request.event_id)
-        if (
-            incident.event_type != "NODE_HEALTH"
-            or incident.policy_source != "SITE_EFA_TRAFFIC"
-            or incident.cluster_id != request.cluster_id
-            or incident.node_ids != [request.node_id]
-        ):
+        if not _holds_node_efa_traffic_event(ctx.store, incident, request):
             raise EfaTrafficAdminConflict(
                 "event_id is not the requested node's EFA traffic event"
             )

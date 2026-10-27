@@ -25,6 +25,12 @@ This module is the additive, control-plane-only correlation on top of that:
   way (diagnostic-only, no isolation, no STOP). Every member's per-node
   incident gets one reason line pointing back at the domain record, so a
   later per-node notification carries the reference.
+* **Member incident.** A member's per-node incident is the one holding its
+  activation, under any label the product gives it: the activation's own
+  record, or the record of a managed attempt's in-flight recovery the
+  grouping folded the finding into (under the attempt's group label and the
+  identity of the fault that minted it, possibly not even naming the node),
+  which only the finding's marker ties to the node (b213; ``_activation_nodes``).
 * **Window.** A domain forms when at least two nodes report the same identity
   unavailable within :data:`SHARED_STORAGE_FAILURE_DOMAIN_WINDOW_SECONDS` of
   each other (node clocks); a node whose activation comes later joins the
@@ -80,6 +86,11 @@ from gpu_fault.models import (
     bounded_reasons,
 )
 from gpu_fault.orchestration.families.identity import derived_record_id
+from gpu_fault.orchestration.families.incident_labels import (
+    GROUPED_INCIDENT_EVENT_TYPES,
+    NODE_HEALTH_INCIDENT_EVENT_TYPES,
+    routed_finding_markers,
+)
 from gpu_fault.store import NotFoundError
 from gpu_fault.store.shared.errors import StaleWriteError
 from gpu_fault.store.shared.health_signals import health_signal_key
@@ -327,11 +338,12 @@ class SharedStorageFailureDomainCorrelator:
     ) -> list[_Member]:
         """Other nodes whose latest reading of ``identity`` is a fresh failure.
 
-        Candidates are the nodes with an open per-node incident for the metric
-        (their VALIDATE_HOST holds while the export stays unavailable) and the
-        members of open domain records; each candidate's latest telemetry row
-        for the identity decides. A node whose reading is older than the
-        window, or reads available, is not a peer.
+        Candidates are the nodes with an open per-node incident holding an
+        activation of the metric (their VALIDATE_HOST holds while the export
+        stays unavailable; :meth:`_activation_nodes`) and the members of open
+        domain records; each candidate's latest telemetry row for the identity
+        decides. A node whose reading is older than the window, or reads
+        available, is not a peer.
         """
 
         candidates: dict[str, str | None] = {}
@@ -341,11 +353,11 @@ class SharedStorageFailureDomainCorrelator:
             if is_shared_storage_failure_domain(incident):
                 for node_id in incident.node_ids:
                     candidates.setdefault(node_id, None)
-            elif _is_shared_filesystem_incident(incident):
-                for node_id in incident.node_ids:
-                    # Newest first: the first incident seen for a node is the
-                    # one its current activation opened.
-                    candidates.setdefault(node_id, incident.incident_id)
+                continue
+            for node_id in self._activation_nodes(incident):
+                # Newest first: the first incident seen for a node is the one
+                # its current activation opened or was folded into.
+                candidates.setdefault(node_id, incident.incident_id)
         candidates.pop(member.node_id, None)
         peers: list[_Member] = []
         for node_id in sorted(candidates):
@@ -683,7 +695,7 @@ class SharedStorageFailureDomainCorrelator:
         return max(pool, key=lambda item: item.observed_at)
 
     def _node_incident_id(self, finding: NodeHealthFinding) -> str | None:
-        """The per-node incident ``finding`` minted: by its event first (the
+        """The per-node incident holding ``finding``: by its event first (the
         orchestrator may have routed it into an incident with another id),
         else the node's open incident for the metric and device."""
 
@@ -698,16 +710,64 @@ class SharedStorageFailureDomainCorrelator:
     def _open_node_incident_id(
         self, cluster_id: str, node_id: str, device: str | None
     ) -> str | None:
+        """The open incident holding ``node_id``'s activation on ``device``.
+
+        Among the incidents naming the node first; then the grouped records
+        that do not: a record-only fold into an attempt's recovery leaves the
+        record's node scope alone, so only the activation's marker names it.
+        """
+
         suffix = f"-{SHARED_FILESYSTEM_METRIC}-{event_id_component(device or 'node')}"
         for incident in self.store.list_incidents_by_state(
             cluster_id, _OPEN_NODE_INCIDENT_STATES, node_ids={node_id}
         ):
-            if incident.event_type == "NODE_HEALTH" and incident.event_id.endswith(
-                suffix
-            ):
+            if node_id in self._activation_nodes(incident, suffix):
                 incident_id: str = incident.incident_id
                 return incident_id
+        for incident in self.store.list_incidents_by_state(
+            cluster_id, _OPEN_NODE_INCIDENT_STATES
+        ):
+            if (
+                incident.event_type in GROUPED_INCIDENT_EVENT_TYPES
+                and node_id not in incident.node_ids
+                and node_id in self._activation_nodes(incident, suffix)
+            ):
+                incident_id = incident.incident_id
+                return incident_id
         return None
+
+    def _activation_nodes(
+        self, incident: FaultIncident, suffix: str | None = None
+    ) -> list[str]:
+        """The nodes whose activation of the metric ``incident`` holds (on the
+        device ``suffix`` ends an event id with, when given).
+
+        The record an activation minted names the metric in its event id,
+        under whichever label the product's grouping gives it later
+        (``incident_labels.NODE_HEALTH_INCIDENT_EVENT_TYPES``). A grouped
+        record may instead hold an activation the product *folded* into it --
+        a node-health finding of a managed attempt whose recovery is in
+        flight joins that attempt's record, under the attempt's group label
+        and the identity of the fault that minted it, and a record-only fold
+        does not even add the node: the activation's marker, which ingestion
+        re-points at the record it routed the finding to, is what names the
+        node. A ``NODE_HEALTH`` record holds only its own finding.
+        """
+
+        if incident.event_type not in NODE_HEALTH_INCIDENT_EVENT_TYPES:
+            return []
+        if incident.event_type in GROUPED_INCIDENT_EVENT_TYPES:
+            held = {
+                node_id
+                for marker in routed_finding_markers(self.store, incident)
+                if _names_activation(marker.marker_id, suffix)
+                for node_id in marker.scope.node_ids
+            }
+            if held:
+                return sorted(held)
+        if _names_activation(incident.event_id, suffix):
+            return list(incident.node_ids)
+        return []
 
     def _incident(self, incident_id: str) -> FaultIncident | None:
         try:
@@ -728,11 +788,13 @@ class SharedStorageFailureDomainCorrelator:
         )
 
 
-def _is_shared_filesystem_incident(incident: FaultIncident) -> bool:
-    return (
-        incident.event_type == "NODE_HEALTH"
-        and f"-{SHARED_FILESYSTEM_METRIC}-" in incident.event_id
-    )
+def _names_activation(identifier: str, suffix: str | None) -> bool:
+    """Whether an event id, or a finding's ``marker-<event id>``, is an
+    activation of the metric -- on ``suffix``'s device when given."""
+
+    if suffix is not None:
+        return identifier.endswith(suffix)
+    return f"-{SHARED_FILESYSTEM_METRIC}-" in identifier
 
 
 def _failing(value: float) -> bool:

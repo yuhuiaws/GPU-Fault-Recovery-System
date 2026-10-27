@@ -13,6 +13,7 @@ from gpu_fault.models import (
     bounded_reasons,
 )
 from gpu_fault.orchestration.disposition import DispositionApplier
+from gpu_fault.orchestration.families.incident_labels import GPU_FAULT_GROUP_EVENT_TYPE
 from gpu_fault.orchestration.workflow_merge import workflow_is_mutable
 from gpu_fault.policy import (
     ActionDisposition,
@@ -164,7 +165,7 @@ class NodeScopedFaultService:
         incident = FaultIncident(
             incident_id=decision.marker.incident_id,
             event_id=event.event_id,
-            event_type="GPU_FAULT_GROUP",
+            event_type=GPU_FAULT_GROUP_EVENT_TYPE,
             event_source=event.event_source,
             source_boot_id=event.source_boot_id,
             cluster_id=event.cluster_id,
@@ -328,7 +329,7 @@ class NodeScopedFaultService:
         )
         return existing.model_copy(
             update={
-                "event_type": "GPU_FAULT_GROUP",
+                "event_type": GPU_FAULT_GROUP_EVENT_TYPE,
                 "event_source": winner.event_source or existing.event_source,
                 "source_boot_id": (winner.source_boot_id or existing.source_boot_id),
                 "node_ids": sorted(set(existing.node_ids) | {event.node_id}),

@@ -34,6 +34,7 @@ from gpu_fault.models import (
     bounded_reasons,
 )
 from gpu_fault.orchestration.families.identity import derived_record_id
+from gpu_fault.orchestration.families.incident_labels import NODE_HEALTH_EVENT_TYPE
 from gpu_fault.orchestration.reboot_window import RebootOwner, absorb_finding
 from gpu_fault.orchestration.workflow_builder import containment_handoff_reason
 from gpu_fault.regional_compatibility import ACTIVATION_INHIBITION_VERSION
@@ -377,7 +378,7 @@ class NodeHealthPlanBuilder:
         return FaultIncident(
             incident_id=f"inc-{finding.event_id}",
             event_id=finding.event_id,
-            event_type="NODE_HEALTH",
+            event_type=NODE_HEALTH_EVENT_TYPE,
             cluster_id=finding.cluster_id,
             node_ids=target_node_ids,
             gpu_uuids=finding.gpu_uuids,

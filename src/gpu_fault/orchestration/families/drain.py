@@ -15,6 +15,10 @@ from gpu_fault.models import (
     bounded_reasons,
 )
 from gpu_fault.orchestration.disposition import Disposition, DispositionApplier
+from gpu_fault.orchestration.families.incident_labels import (
+    NODE_HEALTH_GROUP_EVENT_TYPE,
+    NODE_RESOURCE_GROUP_EVENT_TYPE,
+)
 from gpu_fault.orchestration.workflow_merge import workflow_is_mutable
 
 
@@ -242,7 +246,7 @@ class DrainOperationService:
             )
             incident = target_incident.model_copy(
                 update={
-                    "event_type": "NODE_HEALTH_GROUP",
+                    "event_type": NODE_HEALTH_GROUP_EVENT_TYPE,
                     "node_ids": sorted(
                         set(target_incident.node_ids) | {finding.node_id}
                     ),
@@ -338,7 +342,7 @@ class DrainOperationService:
             finding_name = finding.metric_name or finding.category.value
             incident = target_incident.model_copy(
                 update={
-                    "event_type": "NODE_RESOURCE_GROUP",
+                    "event_type": NODE_RESOURCE_GROUP_EVENT_TYPE,
                     "workflow_request_id": merged.request_id,
                     "fencing_token": merged.fencing_token,
                     "state": self.callbacks.incident_state_for_workflow(merged),

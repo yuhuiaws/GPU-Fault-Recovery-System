@@ -3791,6 +3791,17 @@ already recovered naturally returns `409` and cannot overwrite the newer state; 
 per-attempt row moves to the node row together with the decision. The decision uses the Event ID and action as its idempotency key
 and is saved as `ADMIN_ACTION` evidence.
 
+Before the Store checks, the route confirms that the Event ID is the requested node's EFA traffic finding: the incident it
+was routed to must belong to the requested cluster, carry one of the node-health labels
+(`src/gpu_fault/orchestration/families/incident_labels.py`), and be either the SPIKE's own record
+(`policy_source=SITE_EFA_TRAFFIC`, `node_ids` only that node -- `NODE_HEALTH`, or the `GPU_FAULT_GROUP` the attempt
+grouping opens for it) or a record the finding's marker (`marker-<event id>`, re-pointed at it by ingestion) names with
+`event_source=SITE_EFA_TRAFFIC` and that node alone. The latter is a SPIKE raised while a managed attempt's recovery is in
+flight: the attempt grouping folds it into that recovery record (under the XID's event id and `NVIDIA_CATALOG`), or a
+later finding folds into the SPIKE's own record and takes over its policy source. The route used to take `NODE_HEALTH`
+only and answered `409` for both (b213); another node's, another cluster's or a non-EFA-traffic Event ID still returns
+`409`.
+
 #### 2.20.3 Read-only forensics chain for HUNG_SUSPECTED
 
 Zero traffic is the only branch in this section that triggers deep forensics. Its difficulty is that "zero traffic may be a hang, or it may be
