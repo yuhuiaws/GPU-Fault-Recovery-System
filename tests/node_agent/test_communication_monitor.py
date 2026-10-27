@@ -32,6 +32,21 @@ def use_imported_package(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PYTHONPATH", str(Path(gpu_fault.__file__).resolve().parents[1]))
 
 
+#: The supervisor budget a test gives a real observation worker it expects to
+#: finish. Not the product's budgets (``CommunicationRuntime``: summary 20 s,
+#: triage 28 s, bundle 120 s, the passive sample 12 s), which stay as they are:
+#: under test the same worker -- two cold interpreters, the guard and the
+#: worker, each importing the package, then the operation at the worker's own
+#: ``os.nice(10)`` -- shares a release-gate host with other ``-n 16`` suites,
+#: and 15 s ran out there (deploy release gate, 2026-10-27: the summary came
+#: back ``PARTIAL_TIMEOUT``). Idle, an operation on an empty scope answers in
+#: under 2 s; with 24 busy loops on its one CPU, in about 20 s. A worker that
+#: never answers still fails, as ``PARTIAL_TIMEOUT``, only later: this is the
+#: longest budget the product itself gives the worker (the bundle's). Tests of
+#: the deadline itself keep their own short budgets.
+REAL_WORKER_BUDGET_SECONDS = 120.0
+
+
 def ras_document():
     return {
         "nccl_version": "2.28.9",

@@ -21,6 +21,7 @@ from tests.execution._flight_series_support import NOW
 from tests.node_agent._cov95_runtime_hung import process
 from tests.node_agent._support import command
 from tests.node_agent.test_communication_monitor import (
+    REAL_WORKER_BUDGET_SECONDS,
     ras_document,
     use_imported_package,
 )
@@ -191,7 +192,11 @@ def test_real_readonly_worker_handles_all_three_evidence_operations(
                 "python_stack_tool": "",
             },
         },
-        15,
+        # Completion is the claim, not speed: the supervisor marks any result
+        # short of the worker's final document (PARTIAL_TIMEOUT, evidence
+        # incomplete, for one its deadline cut) and the asserts below refuse
+        # it, so a hang still fails -- after the budget.
+        REAL_WORKER_BUDGET_SECONDS,
     )
     assert result.get("status") not in {
         "UNAVAILABLE",

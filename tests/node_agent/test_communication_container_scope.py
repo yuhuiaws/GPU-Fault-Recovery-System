@@ -52,7 +52,10 @@ from tests._builders import (
 )
 from tests.execution._flight_series_support import NOW
 from tests.fleet._support import heartbeat, registry, signed
-from tests.node_agent.test_communication_monitor import use_imported_package
+from tests.node_agent.test_communication_monitor import (
+    REAL_WORKER_BUDGET_SECONDS,
+    use_imported_package,
+)
 from tests.node_agent.test_heartbeat_cadence import _reporter
 from tests.node_agent.test_hung_collection_hardening import stat_text
 
@@ -497,7 +500,7 @@ def test_the_owned_worker_reads_a_v2_target_from_the_lease(
             "target": lease_target.model_dump(mode="json"),
             "plan": plan.model_dump(mode="json"),
         },
-        10,
+        REAL_WORKER_BUDGET_SECONDS,
     )
 
     assert result["status"] == "SAMPLED" and result["process_count"] == 1, result

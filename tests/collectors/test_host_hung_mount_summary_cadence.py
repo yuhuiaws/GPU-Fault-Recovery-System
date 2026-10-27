@@ -17,7 +17,10 @@ tick.
 
 Deliberately not on ``isolated_runtime``: that fixture answers every
 ``statvfs`` with ENOENT, and this audit needs the collector's real syscalls on
-real directories, with only the hung one trapped.
+real directories, with only the hung one trapped. Real syscalls, not the
+host's numbers, though: the directories sit on the host's own filesystem, so
+every ``statvfs`` under the test's root reports a fixed capacity once it has
+answered (:data:`CAPACITY`) -- the host's disk usage must not choose the edges.
 """
 
 from __future__ import annotations
@@ -46,6 +49,17 @@ SUMMARY_SECONDS = 60
 #: A tick that waits on the hung mount is caught here; a bounded one is
 #: milliseconds plus one ``statvfs_timeout_seconds`` on the detection tick.
 TICK_BOUND_SECONDS = 5.0
+#: What every ``statvfs`` under the test's root answers once the real call has
+#: returned: ``f_blocks``, ``f_bavail`` (and ``f_bfree``), ``f_files``,
+#: ``f_ffree`` (and ``f_favail``) -- 60 % of the bytes and 10 % of the inodes
+#: in use, under every capacity rule the edge filter reads (the 90 %
+#: ``local_filesystem_used_percent`` warning, the 98 % ``*_used_percent``
+#: thresholds). The mounts are directories on the host's root filesystem, so
+#: the real numbers are the host's: with its ``/`` 90 % used (the deploy's
+#: release gate, 2026-10-27) the baseline carried
+#: ``sustained:local_filesystem_used_percent`` next to ``baseline``.
+CAPACITY = (1000, 400, 1000, 900)
+USED_PERCENT = 60.0
 
 
 class HungFilesystem:
@@ -110,6 +124,40 @@ class HungFilesystem:
             return original(*args, **kwargs)
 
         return wrapper
+
+
+def _fixed_capacity(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``os.statvfs`` under ``root``: the real syscall, then :data:`CAPACITY`.
+
+    The call still reaches the kernel -- a missing directory is still ENOENT,
+    and :class:`HungFilesystem`, installed over this, still parks it -- but the
+    blocks and inodes it reports are the test's, not the host's.
+    """
+
+    real = os.statvfs
+    prefix = str(root) + os.sep
+
+    def statvfs(path: Any, *args: Any, **kwargs: Any) -> os.statvfs_result:
+        result = real(path, *args, **kwargs)
+        if isinstance(path, int) or not os.fsdecode(path).startswith(prefix):
+            return result
+        blocks, free, files, files_free = CAPACITY
+        return os.statvfs_result(
+            (
+                result.f_bsize,
+                result.f_frsize,
+                blocks,
+                free,
+                free,
+                files,
+                files_free,
+                files_free,
+                result.f_flag,
+                result.f_namemax,
+            )
+        )
+
+    monkeypatch.setattr(os, "statvfs", statvfs)
 
 
 def _nfs_line(mount_id: int, mount_point: str, export: str) -> str:
@@ -188,7 +236,8 @@ def _collector(
     Only the mount tables are faked (``/proc/self/mountinfo`` and PID 1's,
     both listing the same mounts so the sandbox check sees them); the mount
     points are real directories and the probes are the collector's own
-    ``os.statvfs`` (trapped by the caller) and its directory-entry read.
+    ``os.statvfs`` (trapped, and given :data:`CAPACITY`, by the caller) and its
+    directory-entry read.
     """
 
     proc = tmp_path / "proc"
@@ -251,6 +300,10 @@ def test_the_summary_keeps_arriving_while_one_mount_hangs_for_two_intervals(
     )
     sink = common.RecordingSink()
     clock = common.Clock()
+    # Installed first, so the trap wraps it: the collector still calls the
+    # trap, and the capacity it reads is the test's, whatever the host's disk
+    # holds.
+    _fixed_capacity(tmp_path, monkeypatch)
     # Trapped before the collector binds ``os.statvfs``: the audit is of the
     # collector's own syscalls, not of a scripted probe.
     hung = HungFilesystem(str(hung_mount), monkeypatch)
@@ -302,7 +355,10 @@ def test_the_summary_keeps_arriving_while_one_mount_hangs_for_two_intervals(
             ), "a hung mount poisoned the probe of its healthy neighbour"
             values = _values(batch)
             assert values[("filesystem_unavailable", str(configured))] == 0, values
-            assert ("filesystem_used_percent", str(configured)) in values, values
+            # Read through the collector's statvfs, at the test's capacity.
+            assert values[("filesystem_used_percent", str(configured))] == (
+                USED_PERCENT
+            ), values
             assert _probe_workers() - workers_before <= parked + 1, (
                 "the hung mount parked a new worker on a later tick"
             )
