@@ -1943,6 +1943,81 @@ collector runs as root under `ProtectSystem=strict`, and the read-only binds do 
 transient unit under the same directives (a write under `/var/lib` fails EROFS, a unix connect there succeeds). No unit
 or node template change is needed.
 
+**The restart deletes the plugin Pod gracefully, never forced (b212).** `_restart_device_plugin_node` deletes the plugin
+Pod with `grace_period_seconds=PLUGIN_POD_DELETE_GRACE_SECONDS` (5 s); up to R13h it force-deleted it (grace 0). Live
+GF-GENERAL-LIVE-014 `efa_plugin` on plain EKS (R13h, p5en.48xlarge): the EFA plugin process was SIGSTOPped at 19:22:36Z,
+`efa_device_plugin_unresponsive` was minted at 19:23:03Z and RESTART_EFA_DEVICE_PLUGIN force-deleted the frozen Pod. The
+API server removed the Pod at once and the DaemonSet created the replacement at once; the replacement -- the EFA chart runs
+`hostNetwork: true` with no init container -- registered with kubelet before kubelet's SIGKILL ended the frozen container (a
+stopped process acts on no SIGTERM, and kubelet waits at least `minimumGracePeriodInSeconds` = 2 s even after a force
+delete). When the frozen plugin's `ListAndWatch` stream then ended, kubelet's device manager disconnected the client
+registered *last* under `vpc.amazonaws.com/efa` -- the replacement's: `runClient` re-reads `s.getClient(name)` after
+`c.Run()` returns -- and `PluginDisconnected` marked every device unhealthy; nothing makes a disconnected plugin register
+again. The node showed a Ready replacement Pod and allocatable 0 for the restart's whole 180 s, the step FAILED (`device
+plugin did not restore vpc.amazonaws.com/efa`), the escalation (QUARANTINE + REBOOT) rebooted the node, and only the reboot
+(kubelet restarted, the plugins registered afresh) brought the 16 devices back. The same freeze of the NVIDIA plugin PASSED
+on both clusters because that replacement (pod network, NVML start-up) registered only after the frozen container had
+died: timing, not safety. With a positive grace the API server keeps the Pod, terminating, until kubelet has stopped its
+containers and removed it, and a non-surge DaemonSet (`OnDelete`, or the charts' `RollingUpdate` without `maxSurge`)
+creates no Pod for a node whose daemon Pod is still terminating, so the replacement registers only after the hung plugin's
+stream ended and kubelet keeps it. 5 s because the restart runs only for a plugin that is hung or has lost its devices: a
+responsive plugin exits on SIGTERM at once, a hung one is killed when the grace ends. The delete pass's receipt records
+`delete_grace_period_seconds` and `delete_policy_reference`; the confirmation is unchanged (a Ready Pod of another UID and
+the full allocatable), and during the grace the terminating Pod is set aside as before (`split_plugin_pods`). Not covered:
+a plugin DaemonSet with `maxSurge > 0` still starts its replacement beside the terminating Pod, so on kubelet up to v1.36
+such a restart can fail the same way and escalates per `failure_escalation_action`; keep `maxSurge` unset on the plugin
+DaemonSets (both charts' default).
+
+Evidence:
+
+- Kubernetes documentation, *Pod Lifecycle*, section *Forced Pod termination*,
+  <https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination-forced> (kubernetes/website
+  `content/en/docs/concepts/workloads/pods/pod-lifecycle.md` at b4811b23fdc1): "When a force deletion is performed, the
+  API server does not wait for confirmation from the kubelet that the Pod has been terminated on the node it was running
+  on. It removes the Pod in the API immediately so a new Pod can be created with the same name. On the node, Pods that are
+  set to terminate immediately will still be given a small grace period before being force killed." Same page, section
+  *Pod Termination Flow* (`#pod-termination-flow`): "When the grace period expires, if there is still any container
+  running in the Pod, the kubelet triggers forcible shutdown. The container runtime sends `SIGKILL` to any processes still
+  running in any container in the Pod." and "The kubelet triggers forcible removal of the Pod object from the API server,
+  by setting grace period to 0 (immediate deletion)."
+- kubelet v1.33.5 device manager:
+  <https://github.com/kubernetes/kubernetes/blob/v1.33.5/pkg/kubelet/cm/devicemanager/plugin/v1beta1/handler.go#L107-L118>
+  (`runClient`: `c.Run()`, then `c = s.getClient(name)` and `s.disconnectClient(name, c)`; the same code on every release
+  branch from release-1.33 to release-1.36) and
+  <https://github.com/kubernetes/kubernetes/blob/v1.33.5/pkg/kubelet/cm/devicemanager/manager.go#L243-L253>
+  (`PluginDisconnected` → `markResourceUnhealthy`).
+- Kubernetes issue <https://github.com/kubernetes/kubernetes/issues/121994> ("kubelet: Device plugin fails to connect to
+  new instance of plugin if previous one is terminated"): "kubelet would disconnect from "the most recently" connected
+  plugin, namely `second-device-plugin`, and thus would get into a situation where neither the first or second device
+  plugin would be connected." Fixed for v1.37 by <https://github.com/kubernetes/kubernetes/pull/135437> (milestone v1.37),
+  which keys the clients by socket path and refuses a second plugin on the same socket path ("device plugin already
+  connected") until the first one disconnected; a graceful delete is right there as well.
+- POSIX.1-2024, XSH 2.4.3 *Signal Actions*, SIG_DFL,
+  <https://pubs.opengroup.org/onlinepubs/9799919799/functions/V2_chap02.html#tag_16_04_03_01>: "While a process is
+  stopped, any additional signals that are sent to the process shall not be delivered until the process is continued,
+  except SIGKILL which always terminates the receiving process."
+- kubelet v1.33.5 grace periods:
+  <https://github.com/kubernetes/kubernetes/blob/v1.33.5/pkg/kubelet/pod_workers.go#L978-L1009>
+  (`calculateEffectiveGracePeriod`: "no matter what, we always supply a grace period of 1") and
+  <https://github.com/kubernetes/kubernetes/blob/v1.33.5/pkg/kubelet/kuberuntime/kuberuntime_container.go#L853-L856>
+  ("always give containers a minimal shutdown window to avoid unnecessary SIGKILLs"; `minimumGracePeriodInSeconds = 2`
+  in `kuberuntime_manager.go` L79).
+- kube-apiserver v1.33.5:
+  <https://github.com/kubernetes/kubernetes/blob/v1.33.5/staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go#L1041-L1117>
+  (a positive grace keeps the object; grace 0: "we are intentionally delete gracelessly. In this case, we may enter a race
+  with other k8s components").
+- kube-controller-manager v1.33.5:
+  <https://github.com/kubernetes/kubernetes/blob/v1.33.5/pkg/controller/daemon/daemon_controller.go#L752-L778>
+  (`getNodesToDaemonPods` drops a Pod only when it is both terminal and deleted) and
+  <https://github.com/kubernetes/kubernetes/blob/v1.33.5/pkg/controller/daemon/daemon_controller.go#L816-L882>
+  (`podsShouldBeOnNode`, non-surge, only a terminating Pod on the node: "There are no excess pods to be pruned, and no pods
+  to create"; with surge: "We are surging so we need to have at least one non-deleted pod on the node").
+- Charts: eks-charts `aws-efa-k8s-device-plugin` <https://aws.github.io/eks-charts/aws-efa-k8s-device-plugin-v0.5.33.tgz>
+  (plain EKS, appVersion v0.5.21-eksbuild.13) and <https://aws.github.io/eks-charts/aws-efa-k8s-device-plugin-v0.5.20.tgz>
+  (the version the HyperPod Helm chart, `sagemaker-hyperpod-cli` `helm_chart/HyperPodHelmChart/Chart.yaml`, depends on)
+  render `hostNetwork: true` (`templates/daemonset.yaml` line 64), no `terminationGracePeriodSeconds` and no init
+  container; the NVIDIA `nvidia-device-plugin` chart v0.17.1 runs the plugin on the pod network.
+
 **⑫ Unit test scope**: idempotency of cordon+taint; lifting isolation must clear both cordon and taint;
 node disappearing during isolation → FAILED (`safety_rejection`/`absent`) while 404 when lifting isolation → no-op; RBAC 403 is non-retryable and lands on `executor-internal-error`; `STOP_WORKLOADS` covers the three carriers Job/PyTorchJob/
 JobSet; assertion that **the Eviction API is not used** (to prevent someone "casually switching to evict").

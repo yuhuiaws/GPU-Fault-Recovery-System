@@ -1503,7 +1503,14 @@ Semantics and boundaries of `eks-managed`:
   the product's own step record: every record after the delete (`details.node_results[<node>]` of the WAITING, the
   confirmed SUCCEEDED and the timed-out FAILED record) carries the deleted Pod's `deleted_pod_uid` (and the
   `deleted_pod` of this step's earlier receipt), and the SUCCEEDED record adds the new Pod's `replacement_pod_uids`; a
-  record with `already_healthy: true` deleted nothing.
+  record with `already_healthy: true` deleted nothing. The restart deletes the plugin Pod gracefully (5 s,
+  `delete_grace_period_seconds` in the delete receipt), never forced. Do not force-delete a hung device-plugin Pod by
+  hand either (`kubectl delete pod --force --grace-period=0`), and keep `maxSurge` unset on the plugin DaemonSets (both
+  charts' default): either way the replacement can register while the hung plugin is still connected, and kubelet (up to
+  v1.36) drops the replacement when the hung plugin's stream ends -- a Ready plugin Pod beside an allocatable of 0 that
+  never recovers by itself (live GF-GENERAL-LIVE-014 `efa_plugin`, plain EKS). To recover that state delete the plugin
+  Pod once more without `--force`: the hung instance is gone by then, so the next replacement registers and stays
+  (detailed design v2 §3.8, b212).
 - DCGM: the HyperPod AMI runs DCGM as a host service and the exporter DaemonSet dials the node's nv-hostengine at
   `127.0.0.1:5555`; the plain EKS AL2023 NVIDIA AMI has no host nv-hostengine (a `dcgmi` binary may still be present,
   from the image or installed by hand), so in the default embedded mode an `eks-managed` cluster's

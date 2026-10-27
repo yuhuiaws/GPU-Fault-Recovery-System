@@ -2791,6 +2791,33 @@ patterns resolve to one socket per family (`gpu=nvidia-*.sock` →
 frozen socket's basename the variants should expect in `sockets` is one of
 those two.
 
+Live R13h (2026-10-27, plain EKS `ip-10-0-43-5`, case 19:21:28Z-19:30:47Z) the
+`efa_plugin` variant FAILed on a product defect, not the harness: the probe path
+worked (SIGSTOP 19:22:36Z, `efa_device_plugin_unresponsive` with two timed-out
+ticks at 19:23:03Z) and RESTART_EFA_DEVICE_PLUGIN deleted the frozen Pod, but
+with grace 0. The force delete let the DaemonSet start the replacement at once,
+the EFA replacement (hostNetwork, no init container) registered before kubelet's
+SIGKILL ended the stopped container, and when the frozen stream ended kubelet's
+device manager (up to release-1.36 it disconnects the client registered last
+under the resource name, kubernetes issue 121994) dropped the replacement:
+allocatable 0 behind a Ready replacement Pod, the restart FAILED at 180 s
+(`final_allocatable: 0`, `restart_error: device plugin did not restore
+vpc.amazonaws.com/efa`), the escalation QUARANTINE + REBOOT rebooted the node
+(Ready again 19:27:56Z with 16 EFA devices), and the variant's cleanup probe,
+running on the rebooting node, ended in `HostProbeMissingResponseError`. The
+same freeze of the NVIDIA plugin passed on both clusters only because that
+replacement (pod network, NVML start-up) registered after the frozen container
+had died. Lane b212 deletes the plugin Pod gracefully (5 s,
+`node_operations.PLUGIN_POD_DELETE_GRACE_SECONDS`): the Pod stays terminating
+until kubelet stopped its containers, a non-surge DaemonSet starts no
+replacement meanwhile, and the replacement registers only after the frozen
+stream ended (unit model and evidence:
+`tests/execution/test_device_plugin_restart_graceful_delete.py`, detailed design
+v2 §3.8). The rerun on the release carrying b212 should see the delete pass's
+receipt with `delete_grace_period_seconds=5`, `replacement_pod_uids` and the
+full allocatable; HyperPod's `efa_plugin` runs the same eks-charts EFA plugin
+(hostNetwork) and would have failed the same way on R13h.
+
 ## GF-GENERAL-LIVE live acceptance runner (phase 2, lane K)
 
 Phase 2 adds reviewed `live-replay` categories that drive the product's own

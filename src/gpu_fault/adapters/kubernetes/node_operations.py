@@ -72,6 +72,62 @@ ANNOTATION_EFA_PLUGIN_RESTART_INCIDENT = "gpu-fault.io/efa-plugin-restart-incide
 
 ANNOTATION_GPU_PLUGIN_RESTART_INCIDENT = "gpu-fault.io/gpu-plugin-restart-incident"
 
+#: The restart deletes a device plugin Pod gracefully, never with grace 0 (forced).
+#: A force delete removes the Pod from the API at once, so the DaemonSet creates
+#: the replacement while kubelet is still killing the old container -- which,
+#: hung or SIGSTOPped, acts on no SIGTERM and dies only on kubelet's SIGKILL
+#: (``minimumGracePeriodInSeconds`` 2 s; POSIX.1-2024 XSH 2.4.3 SIG_DFL: "While
+#: a process is stopped, any additional signals that are sent to the process
+#: shall not be delivered until the process is continued, except SIGKILL which
+#: always terminates the receiving process."). A replacement that registers inside
+#: that window (live GF-GENERAL-LIVE-014 ``efa_plugin``: the EFA plugin is
+#: hostNetwork with no init container) is the client kubelet's device manager
+#: drops when the old ``ListAndWatch`` stream ends: it keeps one client per
+#: resource name and disconnects the one registered last (``runClient``), "and
+#: thus would get into a situation where neither the first or second device
+#: plugin would be connected" (kubernetes issue 121994) -- every device is
+#: marked unhealthy and nothing makes the replacement register again:
+#: allocatable 0 behind a Ready Pod until the node rebooted. A positive grace
+#: keeps the Pod terminating until kubelet has stopped its containers (the API
+#: server deletes a Pod at once only for grace 0, ``store.go`` ``lastGraceful``;
+#: kubelet removes it once finished, ``status_manager.go`` ``canBeDeleted``), and
+#: a non-surge DaemonSet creates no Pod for a node whose Pod is still
+#: terminating (``daemon_controller.go`` ``podsShouldBeOnNode``), so the
+#: replacement registers only after the hung plugin's stream ended. Short: the
+#: restart runs only for a plugin that is hung or lost its devices, and a
+#: responsive plugin exits on SIGTERM at once.
+PLUGIN_POD_DELETE_GRACE_SECONDS = 5
+#: Kubernetes documentation, Pod Lifecycle > Forced Pod termination
+#: (kubernetes/website ``pod-lifecycle.md`` at b4811b23fdc1), verbatim.
+KUBERNETES_FORCED_POD_TERMINATION_REFERENCE = (
+    "https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/"
+    "#pod-termination-forced"
+)
+KUBERNETES_FORCED_POD_TERMINATION_QUOTE = (
+    "When a force deletion is performed, the API server does not wait for "
+    "confirmation from the kubelet that the Pod has been terminated on the node "
+    "it was running on. It removes the Pod in the API immediately so a new Pod "
+    "can be created with the same name. On the node, Pods that are set to "
+    "terminate immediately will still be given a small grace period before "
+    "being force killed."
+)
+#: kubelet's ``runClient`` (v1.33.5; the same on every release branch up to
+#: release-1.36): ``c = s.getClient(name)`` after ``c.Run()`` returns, then
+#: ``s.disconnectClient(name, c)``. The fix for v1.37 (kubernetes PR 135437)
+#: keys clients by socket path and refuses a second plugin on the same path.
+KUBELET_DEVICE_PLUGIN_RECONNECT_REFERENCE = (
+    "https://github.com/kubernetes/kubernetes/blob/v1.33.5/pkg/kubelet/cm/"
+    "devicemanager/plugin/v1beta1/handler.go#L107-L118"
+)
+KUBELET_DEVICE_PLUGIN_RECONNECT_ISSUE = (
+    "https://github.com/kubernetes/kubernetes/issues/121994"
+)
+#: What the delete pass's receipt says about how the Pod was deleted.
+PLUGIN_POD_DELETE_RECEIPT = {
+    "delete_grace_period_seconds": PLUGIN_POD_DELETE_GRACE_SECONDS,
+    "delete_policy_reference": KUBERNETES_FORCED_POD_TERMINATION_REFERENCE,
+}
+
 
 @dataclass(frozen=True)
 class _PluginRestartKeys:
@@ -160,14 +216,13 @@ class KubernetesNodeOperationsMixin:
                 },
             )
         timeout_seconds = int(parameters.get("restart_timeout_seconds", 180))
-        # A plugin the node's socket probe found hung (``plugin_unresponsive``,
-        # stamped by the planner from a ``*_device_plugin_unresponsive``
-        # finding) still advertises every device: kubelet holds its
-        # ListAndWatch stream open without a deadline, so allocatable never
-        # drops. Judged on allocatable alone the first pass would call the
-        # node ``already_healthy`` and delete nothing; it must delete the Pod,
-        # and the replacement is confirmed as for any restart (a new Ready
-        # Pod, the full allocatable).
+        # A plugin the node's socket probe found hung (``plugin_unresponsive``, stamped
+        # by the planner from a ``*_device_plugin_unresponsive`` finding) still
+        # advertises every device: kubelet holds its ListAndWatch stream open without a
+        # deadline, so allocatable never drops. Judged on allocatable alone the first
+        # pass would call the node ``already_healthy`` and delete nothing; it must
+        # delete the Pod, and the replacement is confirmed as for any restart (a new
+        # Ready Pod, the full allocatable).
         unresponsive = bool(parameters.get(PLUGIN_UNRESPONSIVE_PARAMETER))
         node_results: dict[str, dict[str, Any]] = {}
         waiting = False
@@ -330,7 +385,7 @@ class KubernetesNodeOperationsMixin:
             self.core.delete_namespaced_pod(
                 pod_name,
                 namespace,
-                grace_period_seconds=0,
+                grace_period_seconds=PLUGIN_POD_DELETE_GRACE_SECONDS,
             )
         except Exception as exc:
             if getattr(exc, "status", None) != 404:
@@ -348,6 +403,7 @@ class KubernetesNodeOperationsMixin:
         result = {
             "deleted_pod": f"{namespace}/{pod_name}",
             "deleted_pod_uid": pod_uid,
+            **PLUGIN_POD_DELETE_RECEIPT,
             "allocatable": allocatable,
             "expected": expected,
         }

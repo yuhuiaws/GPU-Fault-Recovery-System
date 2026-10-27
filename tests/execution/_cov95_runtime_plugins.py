@@ -8,6 +8,9 @@ from typing import Any
 from kubernetes import client
 
 from gpu_fault.adapters import KubernetesWorkflowAdapter
+from gpu_fault.adapters.kubernetes.node_operations import (
+    PLUGIN_POD_DELETE_GRACE_SECONDS,
+)
 from gpu_fault.execution import WorkflowExecutionRequest, WorkflowStepContext
 from gpu_fault.execution.step_bounds import record_attempt
 from gpu_fault.models import WorkflowOperation
@@ -74,7 +77,10 @@ class PluginCore(FakeCore):
         return SimpleNamespace(items=deepcopy(self.pods))
 
     def delete_namespaced_pod(self, name: str, namespace: str, **kwargs: Any) -> None:
-        assert kwargs == {"grace_period_seconds": 0}, kwargs
+        assert kwargs == {"grace_period_seconds": PLUGIN_POD_DELETE_GRACE_SECONDS}, (
+            "the plugin Pod is deleted gracefully, never forced",
+            kwargs,
+        )
         self.deleted.append((namespace, name))
         if self.delete_error is not None:
             raise self.delete_error
@@ -82,7 +88,12 @@ class PluginCore(FakeCore):
 
 class PluginHarness:
     def __init__(
-        self, family: str = "gpu", *, typed: bool = False, **parameters: Any
+        self,
+        family: str = "gpu",
+        *,
+        typed: bool = False,
+        core: PluginCore | None = None,
+        **parameters: Any,
     ) -> None:
         self.family = family
         self.resource = "vpc.amazonaws.com/efa" if family == "efa" else "nvidia.com/gpu"
@@ -91,7 +102,7 @@ class PluginHarness:
             if family == "efa"
             else WorkflowOperation.RESTART_GPU_DEVICE_PLUGIN
         )
-        self.core = PluginCore(self.resource, typed=typed)
+        self.core = PluginCore(self.resource, typed=typed) if core is None else core
         self.node = self.core.nodes["node-a"]
         self.annotations = self.node["metadata"]["annotations"]
         store = InMemoryStore()
