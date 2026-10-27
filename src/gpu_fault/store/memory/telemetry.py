@@ -192,7 +192,9 @@ class MemoryTelemetryMixin(MemoryAttemptEventState):
                 self._gpu_finding_states[key] = state
                 activated_values.append(activated)
                 if finding is not None and records_finding_history(
-                    previous_finding, finding, activated=activated
+                    previous.finding if previous is not None else None,
+                    finding,
+                    activated=activated,
                 ):
                     self._gpu_finding_history[finding.finding_id] = finding
             return activated_values
