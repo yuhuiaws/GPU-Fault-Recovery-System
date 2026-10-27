@@ -15,6 +15,8 @@ from typing import Any
 import pytest
 
 from scripts.e2e.regional import general_live_gpu_memory as mem
+from scripts.e2e.regional.general_live_gpu_store import GPU_STATE_PROBE
+from scripts.e2e.regional.general_live_store import ACTIVITY_PROBE
 from scripts.e2e.regional.host_probe_fixture import HostProbeMissingResponseError
 from tests.regional._general_live_fakes import (
     FakeProbe,
@@ -247,6 +249,38 @@ def test_pending_supported_proves_the_executed_chain_on_the_records(
     assert "RESTART_NODE escalation" in spec.expected, spec.expected
     assert "until_advance" not in json.dumps(
         _installed_plan(ctx.probes[f"dcgm@{ctx.settings.node}"])
+    )
+
+
+@pytest.mark.parametrize("variant", ["pending_supported", "post_reset"])
+def test_pending_variants_are_not_gated_on_the_product_generation(
+    tmp_path: Path, variant: str
+) -> None:
+    """019's plans deliver the flag for exactly the confirmation samples and the
+    next scrape clears it before the product's validation, so they do not
+    depend on the product re-judging a pending flag: live 2026-10-27 on R13g
+    both PASSED on HyperPod (08:35Z / 08:49Z) and plain EKS (11:36Z / 11:56Z).
+    The variants run their full oracle and read nothing from the control plane
+    but the GPU state and the node activity -- no product-generation probe, no
+    up-front INCONCLUSIVE (S54 had gated them; that was a regression)."""
+
+    ctx = _pending_ctx(tmp_path, variant, activity=_reset_stages())
+    inner = ctx.regional.cpu_python_responder
+    seen: list[str] = []
+
+    def recording(script: str, *arguments: str) -> dict[str, Any]:
+        seen.append(script)
+        return inner(script, *arguments)
+
+    ctx.regional.cpu_python_responder = recording
+    out = getattr(mem, variant)(ctx)
+    assert out["verdict"] == "PASS", out["errors"]
+    assert seen and set(seen) <= {GPU_STATE_PROBE, ACTIVITY_PROBE}, (
+        "019 reads only the GPU state and the node activity"
+    )
+    assert "product_generation" not in out, out.keys()
+    assert not (ctx.case_dir / "product-generation.json").exists(), (
+        "no product-generation evidence: 019 is not gated"
     )
 
 

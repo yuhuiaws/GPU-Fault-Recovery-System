@@ -4579,10 +4579,18 @@ RECOVERED); a product that judges at once (R13g, the R13h candidate) is
 INCONCLUSIVE after the survey and before anything is installed, "expected on
 this product generation: ..." with the mechanism and the generation cited, the
 node untouched; a probe the product's code shape defeats refuses the same way
-("could not be decided") -- no reset on a guess. 019 `pending_supported` /
-`post_reset` depend on the same property and carry the same gate
-(`require_rejudging_product`); the other 024 variants plan no reset and have no
-such dependence. On a re-judging product a chain that still ends QUARANTINED
+("could not be decided") -- no reset on a guess. The gate's reason is recorded
+as known product gap 30 ("VALIDATE_GPU after RESET_GPU fails a
+pending-remap/retired-pages flag on the pre-reset reading; b202's newer-batch
+wait covers only the thermal/memory/power WARNING families"), quoted in the
+INCONCLUSIVE text. The gate is on 024 `wrong_scope_source` only: 019
+`pending_supported` / `post_reset` deliver the flag for exactly the
+confirmation samples and the next scrape clears it before the product's
+validation, so they do not depend on the product re-judging a pending flag --
+on R13g both PASSED live on HyperPod (2026-10-27 08:35Z / 08:49Z) and plain EKS
+(11:36Z / 11:56Z), and a gate there would be a regression (a test pins that
+their control-plane reads are the GPU state and the node activity only); the
+other 024 variants plan no reset and have no such dependence. On a re-judging product a chain that still ends QUARANTINED
 is the FAIL it was, but the validated restore then also releases the repair
 GPU's incident (only once its chain has ended with the node still isolated; a
 chain still running is not restored over), so the node is left clean either
@@ -4595,8 +4603,9 @@ real adapter: both pending flags judged at once, the thermal family graced;
 the classifier and its texts; the R13g / R13h-shaped answers -> INCONCLUSIVE
 before the deploy with the probe having run the survey only; a re-judging
 product -> PASS with the record kept; a QUARANTINED chain -> FAIL with both
-incidents restored; the 019 gate; the gate declared exactly where `GPU_RESET`
-is).
+incidents restored; the gate on 024 `wrong_scope_source` only) and
+`tests/regional/test_general_live_gpu_memory_reset.py` (019's two reset
+variants ungated, their full oracle on any generation).
 
 019 `pending_supported` and `post_reset` are now bounded and judged on the
 records (S36, 2026-10-26; both are X variants under `GPU_RESET` that have never

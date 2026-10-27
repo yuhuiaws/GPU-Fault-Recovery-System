@@ -1,5 +1,5 @@
-"""The pending-remap reset chain's product generation (024 ``wrong_scope_source``,
-019 ``pending_supported`` / ``post_reset``), decided before the deploy.
+"""The pending-remap reset chain's product generation (024 ``wrong_scope_source``
+only; product gap 30), decided before the deploy.
 
 Live 2026-10-27 14:33-14:41Z (HyperPod, R13g, harness int/r13c-live28) the
 one-read plan served the pair at read 4, reads 5-9 were the device's own, and
@@ -11,7 +11,8 @@ probe reads the generation from the deployed code, a product that judges the
 flag at once ends the variants INCONCLUSIVE with nothing deployed, a product
 that re-judges on newer data runs the full oracle to PASS, and a chain that
 ends QUARANTINED on such a product is a FAIL whose record is kept and whose
-isolation the validated restore releases.
+isolation the validated restore releases. 019 ``pending_supported`` /
+``post_reset`` are not gated (``test_general_live_gpu_memory_reset``).
 """
 
 from __future__ import annotations
@@ -154,7 +155,7 @@ def test_the_inconclusive_texts_cite_the_mechanism() -> None:
     r13g = gen.PendingFlagGeneration("row_remap_pending", gen.judging_at_once_answer())
     text = gen.judges_at_once_detail(r13g, chain="the repair chain")
     for needle in (
-        "expected on this product generation",
+        "expected on this product generation (product gap 30: VALIDATE_GPU",
         "_validate_active_findings",
         "b202 / gap 26",
         "QUARANTINED",
@@ -278,6 +279,7 @@ def test_wrong_scope_source_is_inconclusive_before_the_deploy_on_a_product_that_
     ]
     assert "row_remap_pending WARNING finding at once" in out["detail"]
     assert "the repair GPU's service-window RESET_GPU chain" in out["detail"]
+    assert gen.PRODUCT_GAP in out["detail"], "the known product gap is named"
     # The survey ran (read-only); nothing was installed, deployed or armed.
     assert [call[0] for call in out["_probe"].calls] == ["survey"]
     assert out["_restored"] == []
@@ -402,39 +404,15 @@ def test_isolated_repair_and_record_helpers() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# 019 pending_supported / post_reset share the dependence; the other 024
-# variants do not
+# Only 024 wrong_scope_source is gated: 019's reset variants and the other
+# 024 variants are not
 # --------------------------------------------------------------------------- #
-def test_019_pending_variants_are_inconclusive_before_the_deploy_on_r13g(
-    tmp_path: Path,
-) -> None:
-    for variant in ("pending_supported", "post_reset"):
-        spec = {item.variant: item for item in mem.VARIANTS}[variant]
-        probe = dcgm_probe()
-        regional = FakeRegional(
-            cpu_python=gpu_cpu_python(generation=gen.judging_at_once_answer())
-        )
-        settings = make_settings(spec, node=regional.node_snapshot("")["name"])
-        ctx = make_context(
-            spec,
-            tmp_path=tmp_path / variant,
-            regional=regional,
-            probes={},
-            settings=settings,
-        )
-        ctx.probes[f"dcgm@{ctx.settings.node}"] = probe
-        with pytest.raises(VariantInconclusive, match="expected on this product"):
-            spec.execute(ctx)
-        assert [call[0] for call in probe.calls] == ["survey"]
-        assert (ctx.case_dir / f"{gen.GENERATION_EVIDENCE}.json").is_file(), (
-            "the probe's answer is evidence even when the variant refuses"
-        )
-
-
-def test_only_the_reset_variants_depend_on_the_generation() -> None:
+def test_the_gate_is_declared_on_024_wrong_scope_source_only() -> None:
     """The sibling 024 variants plan no reset (QUARANTINE or diagnostic
-    composites), so no post-reset VALIDATE_GPU judges a held flag there: the
-    gate is declared exactly where ``GPU_RESET`` is."""
+    composites); 019's reset variants carry ``GPU_RESET`` too but are not
+    gated -- their plans clear the flag before the validation and they PASSED
+    live on R13g on both clusters (pinned in
+    ``test_general_live_gpu_memory_reset``)."""
 
     reset_variants = {
         spec.variant for spec in comp.VARIANTS if "GPU_RESET" in spec.approvals
@@ -445,3 +423,6 @@ def test_only_the_reset_variants_depend_on_the_generation() -> None:
         "post_reset",
     }
     assert "re-judges the pending flag" in comp.VARIANTS[5].expected
+    assert gen.PRODUCT_GAP.startswith("product gap 30: VALIDATE_GPU after RESET_GPU"), (
+        gen.PRODUCT_GAP
+    )

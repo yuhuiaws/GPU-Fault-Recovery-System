@@ -1,9 +1,15 @@
 """Which product the pending-remap reset chain faces, decided before the reset.
 
-GF-GENERAL-LIVE-024 ``wrong_scope_source`` and 019 ``pending_supported`` /
-``post_reset`` mint a ``row_remap_pending`` (``retired_pages_pending`` on older
-parts) WARNING finding whose policy is the product's single-GPU service-window
-RESET_GPU chain, and the chain's post-reset VALIDATE_GPU decides the record.
+GF-GENERAL-LIVE-024 ``wrong_scope_source`` mints a ``row_remap_pending``
+(``retired_pages_pending`` on older parts) WARNING finding whose policy is the
+product's single-GPU service-window RESET_GPU chain, and the chain's post-reset
+VALIDATE_GPU decides the record. Only 024 is gated here: 019
+``pending_supported`` / ``post_reset`` PASSED live on R13g on both clusters
+(2026-10-27: HyperPod 08:35Z / 08:49Z, plain EKS 11:36Z / 11:56Z) -- their
+plans deliver the flag for exactly the confirmation samples and the next
+scrape clears it before the product's validation -- so they do not depend on
+the product re-judging a pending flag. The gate's reason is recorded as
+product gap 30 (``PRODUCT_GAP``).
 The replay is bounded to the minting scrape, so the first batch after
 RESTORE_GPU_SERVICES is the device's real reading -- but whether that batch
 re-judges the flag is the exporter's and the collector's business, not the
@@ -51,6 +57,12 @@ from scripts.e2e.regional.general_live_fixture import (
 #: The pending-repair flags ``gpu_memory_policy.memory_decision`` grades
 #: WARNING RESET_GPU on a modern GPU.
 PENDING_FLAGS = ("row_remap_pending", "retired_pages_pending")
+#: The known product gap the gate names (the coordinator's record, 2026-10-27).
+PRODUCT_GAP = (
+    "product gap 30: VALIDATE_GPU after RESET_GPU fails a pending-remap/"
+    "retired-pages flag on the pre-reset reading; b202's newer-batch wait covers "
+    "only the thermal/memory/power WARNING families"
+)
 #: Evidence file of the probe's answer (the 014 fixture's name).
 GENERATION_EVIDENCE = "product-generation"
 
@@ -241,9 +253,9 @@ def judges_at_once_detail(generation: PendingFlagGeneration, *, chain: str) -> s
     """Why the variant is INCONCLUSIVE on a product that judges the flag at once."""
 
     return (
-        "expected on this product generation: the post-reset VALIDATE_GPU of "
-        f"{chain} judges the {generation.flag} WARNING finding at once on the state "
-        "the minting batch left -- adapters/gpu_validation._validate_active_findings "
+        f"expected on this product generation ({PRODUCT_GAP}): the post-reset "
+        f"VALIDATE_GPU of {chain} judges the {generation.flag} WARNING finding at "
+        "once on the state the minting batch left -- adapters/gpu_validation._validate_active_findings "
         "grants the pending flag neither the warning grace nor the wait for a "
         "GPU-metrics batch newer than the finding (b202 / gap 26 covers the "
         "thermal, correctable-memory and power families only) -- so unless the "
@@ -320,6 +332,7 @@ def judging_at_once_answer(
 __all__ = [
     "GENERATION_EVIDENCE",
     "PENDING_FLAGS",
+    "PRODUCT_GAP",
     "PENDING_FLAG_VERDICT_PROBE",
     "PendingFlagGeneration",
     "judges_at_once_detail",

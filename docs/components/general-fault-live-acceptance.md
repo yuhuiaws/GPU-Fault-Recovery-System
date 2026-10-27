@@ -1244,8 +1244,13 @@ Pod 内只读运行已部署的 `GpuValidationAdapter._validate_active_findings`
 `product-generation.json`。过宽限仍 WAITING（`rejudges`）的产品才部署回放、跑完整 oracle（reset →
 真实读数 → VALIDATE_GPU → RECOVERED）；立刻失败的产品（R13g、R13h 候选）在 survey 之后、部署之前即
 INCONCLUSIVE "expected on this product generation: ..."，写明机制与代际，节点未被触碰；探针读不出
-答案同样拒跑（"could not be decided"），绝不凭猜测 reset。019 `pending_supported`/`post_reset` 依赖同一
-属性，同样加门（`require_rejudging_product`）；024 其余变体不计划 reset，无此依赖。在会重判的产品上，
+答案同样拒跑（"could not be decided"），绝不凭猜测 reset。该门的原因记为已知产品缺口 30（"VALIDATE_GPU
+after RESET_GPU fails a pending-remap/retired-pages flag on the pre-reset reading; b202's newer-batch wait
+covers only the thermal/memory/power WARNING families"），INCONCLUSIVE 文案逐字引用。门只加在 024
+`wrong_scope_source` 上：019 `pending_supported`/`post_reset` 的计划恰好端满确认样本数、下一次 scrape
+在产品校验前就把标志清掉，不依赖产品重判，2026-10-27 R13g 上两变体在 HyperPod（08:35Z/08:49Z）与
+plain EKS（11:36Z/11:56Z）均 PASS，加门即回归，故不加（测试钉住其控制面读取只有 GPU state 与 activity
+两个探针）；024 其余变体不计划 reset，无此依赖。在会重判的产品上，
 链若仍以 QUARANTINED 结束则 FAIL 照记，但 validated restore 这时也释放修复 GPU 的 incident（仅限其链
 已结束且节点仍被隔离时；链仍在跑时不覆盖），节点两种结局都干净；两个 incident 的完整记录（工作流、
 步骤执行与时间戳）写入 `repair-record.json`——本次证据只有 incident id 与轮询时间线，哪一步失败、为何
@@ -1253,7 +1258,8 @@ INCONCLUSIVE "expected on this product generation: ..."，写明机制与代际�
 `tests/regional/test_general_live_gpu_generation.py`（探针对真实适配器：两个 pending 标志立刻失败、
 thermal 族有宽限；分类器与文案；R13g/R13h 形状的记录 → 部署前 INCONCLUSIVE 且探针只跑过 survey；
 会重判的产品 → PASS 并留下 repair-record；QUARANTINED 链 → FAIL 且两个 incident 都被 restore；
-019 两变体同样门禁；只有带 `GPU_RESET` 的变体声明该门）。
+门只在 024 `wrong_scope_source`）与 `tests/regional/test_general_live_gpu_memory_reset.py`（019 两变体不加门、
+对任何代际都跑完整 oracle）。
 
 `independent_xid` 2026-10-26 08:07Z（eks ip-10-0-43-5，R13g）FAIL "2 CORRECTABLE_MEMORY_DEGRADATION
 incidents (expected one)"：两个复合 incident 的 batch 分别为 07:54:39.12Z（第一次回放读，WARNING）

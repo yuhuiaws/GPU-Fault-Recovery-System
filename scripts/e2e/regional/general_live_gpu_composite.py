@@ -162,8 +162,10 @@ REPAIR_COMPANIONS = ("row_remap_pending", "retired_pages_pending")
 #: this time without a reboot (boot id cc70db9b unchanged since the 14:11Z
 #: boot; Ready 14:37:40Z is kubelet back after the quiesce; record settled
 #: 14:38:43Z). The product generation therefore decides before the deploy
-#: (``require_rejudging_product``): a product that judges the flag at once is
-#: INCONCLUSIVE with the mechanism cited, the node untouched.
+#: (``require_rejudging_product``, recorded as product gap 30): a product that
+#: judges the flag at once is INCONCLUSIVE with the mechanism cited, the node
+#: untouched. 019's reset variants are not gated (their plans clear the flag
+#: before the validation; live PASS on R13g on both clusters).
 SERVICE_WINDOW_RESET = frozenset({"QUIESCE_GPU_SERVICES", "RESET_GPU"})
 #: What the repair GPU's chain is called in the generation verdict.
 REPAIR_CHAIN = "the repair GPU's service-window RESET_GPU chain"
