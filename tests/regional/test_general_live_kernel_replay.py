@@ -278,6 +278,11 @@ def test_wrapper_appends_reviewed_records_when_armed(tmp_path: Path) -> None:
     assert reviewed["__CURSOR"] == "gfrs-replay-gl016-test-a1-0000beef-0-boot-xyz", (
         "the cursor names the run, the record and the boot"
     )
+    # What a grade matches a product record's entry id against (016
+    # cursor_pagination follows each record through its finding's marker).
+    assert reviewed["__CURSOR"] == (
+        helper.replay_entry_prefix("gl016-test-a1-0000beef", 0) + "boot-xyz"
+    ), "replay_entry_prefix spells the wrapper's cursor up to the boot"
 
 
 def test_wrapper_cursor_is_stable_within_a_run_and_new_for_the_next_run(

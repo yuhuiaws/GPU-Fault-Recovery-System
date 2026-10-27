@@ -103,11 +103,12 @@ def _activity(
     incidents: list[dict[str, object]],
     workflows: list[dict[str, object]],
     notifications: list[dict[str, object]] | None = None,
+    markers: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     return {
         "incidents": incidents,
         "workflows": workflows,
-        "markers": [],
+        "markers": markers or [],
         "notifications": notifications or [],
         "batches": [],
         "metric_latest": [],
@@ -358,7 +359,124 @@ def test_unknown_attempt_fails_if_it_stops_a_workload(tmp_path: Path) -> None:
     ]
 
 
-def test_cursor_pagination_requires_every_record(tmp_path: Path) -> None:
+#: The boot the reviewed records' synthetic cursors name (``open-window``'s
+#: ``boot_id``); the run id is ``make_context``'s.
+BOOT = "7679ce8a-3ab8-484a-8d34-4ca9eab39fe5"
+PAGINATION_RUN = "gl-cursor-pagination-a1-deadbeef"
+PAGINATION_LABELS = ("mce", "storage", "lockup")
+
+
+def _record_marker(index: int, incident_id: str) -> dict[str, object]:
+    """The marker the product writes for reviewed record ``index``'s finding.
+
+    ``NodeHealthFinding.marker()``: ``marker-<event id>``, the entry it was read
+    from in ``raw_evidence_ref`` (``dmesg://<node>/<entry id>``, the entry id
+    being the wrapper's cursor) and, once ingestion picked the incident,
+    that incident's id -- the incident the finding was *routed* to, which for
+    the second and third finding of a burst is the first one's.
+    """
+
+    return {
+        "marker_id": f"marker-log-gpu-eks-cluster-{NODE}-{index:032x}",
+        "incident_id": incident_id,
+        "raw_evidence_ref": (
+            f"dmesg://{NODE}/gfrs-replay-{PAGINATION_RUN}-{index}-{BOOT}"
+        ),
+        "raw_reason": [
+            "CPU or memory hardware error",
+            "persistent storage I/O failure",
+            "kernel liveness failure",
+        ][index],
+        "severity": "critical",
+        "trusted": True,
+    }
+
+
+def _group_incident() -> dict[str, object]:
+    """The live record of 2026-10-27 18:46:32Z, R13h: one incident for the burst.
+
+    The first finding (record 0, the MCE) minted ``inc-<its event id>``; the
+    storage and lockup findings joined that in-flight isolation
+    (``families/drain.py`` ``ingest_terminal_node_quarantine``), which
+    re-labelled the record ``NODE_HEALTH_GROUP`` and added one reason each.
+    """
+
+    return {
+        **_log_incident(
+            incident_id="inc-log-burst",
+            event_id="log-gpu-eks-cluster-burst-0",
+            state="ACTION_PENDING",
+            workflow="wf-burst",
+        ),
+        "event_type": "NODE_HEALTH_GROUP",
+        "reasons": [
+            "CPU or memory hardware error",
+            f"{NODE}: STORAGE: persistent storage I/O failure",
+            f"{NODE}: SYSTEM_LOG: kernel liveness failure",
+        ],
+    }
+
+
+def _pagination_ctx(tmp_path: Path, activity: dict[str, object]) -> object:
+    regional = FakeRegional(
+        cpu_python=store_script({"activity": activity}),
+        node_snapshot=_isolated_node(True),
+    )
+    spec = _spec("cursor_pagination")
+    script = {
+        **_host_script(),
+        "open-window": {
+            "after": {"ActiveState": "active"},
+            "boot_id": BOOT,
+            "proof_scope": "live-replay",
+        },
+        "status": {"injected": {"emission_counts": {"0": 4, "1": 4, "2": 4}}},
+    }
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=regional,
+        probes={f"kernel-replay-journal@{NODE}": FakeProbe(script)},
+        settings=make_settings(spec, node=NODE),
+        window_minutes=60,
+    )
+    assert ctx.run_id == PAGINATION_RUN, ctx.run_id
+    return ctx
+
+
+def test_cursor_pagination_passes_on_the_products_one_isolation_for_the_burst(
+    tmp_path: Path,
+) -> None:
+    # Live 2026-10-27 18:45:47-18:55:56Z (R13h, plain EKS ip-10-0-43-5) and
+    # 2026-10-26 (R13g, HyperPod and EKS): FAIL "only 0/3 severe kernel records
+    # reached an incident; the cursor starved the rest" -- while the first
+    # armed poll had delivered all three records in one batch and the product
+    # had folded them into one NODE_HEALTH_GROUP incident (three reasons, three
+    # markers) and quarantined the node. The grade took only NODE_HEALTH and
+    # wanted one incident per record.
+    activity = _activity(
+        incidents=[_group_incident()],
+        workflows=[
+            _log_workflow(
+                ["FREEZE_EVIDENCE", "MARK_UNSCHEDULABLE", "QUARANTINE"],
+                incident_id="inc-log-burst",
+                request_id="wf-burst",
+            )
+        ],
+        markers=[_record_marker(index, "inc-log-burst") for index in range(3)],
+    )
+    result = mod.cursor_pagination(_pagination_ctx(tmp_path, activity))
+    assert result["verdict"] == "PASS", result["errors"]
+    assert result["incidents"] == ["inc-log-burst"], result
+    assert {
+        label: (link or {}).get("incident_id")
+        for label, link in result["records"].items()
+    } == dict.fromkeys(PAGINATION_LABELS, "inc-log-burst"), result["records"]
+
+
+def test_cursor_pagination_does_not_depend_on_the_grouping(tmp_path: Path) -> None:
+    # Records that reach the control plane after the first isolation settled
+    # mint incidents of their own; each record's marker still names its own.
     incidents = [
         _log_incident(
             incident_id=f"inc-log-{i}", event_id=f"log-c-{i}", workflow=f"wf-{i}"
@@ -373,16 +491,82 @@ def test_cursor_pagination_requires_every_record(tmp_path: Path) -> None:
         )
         for i in range(3)
     ]
-    regional = FakeRegional(
-        cpu_python=store_script(
-            {"activity": _activity(incidents=incidents, workflows=workflows)}
-        ),
-        node_snapshot=_isolated_node(True),
+    activity = _activity(
+        incidents=incidents,
+        workflows=workflows,
+        markers=[_record_marker(i, f"inc-log-{i}") for i in range(3)],
     )
-    ctx, _ = _ctx("cursor_pagination", regional=regional, tmp_path=tmp_path)
-    result = mod.cursor_pagination(ctx)
+    result = mod.cursor_pagination(_pagination_ctx(tmp_path, activity))
     assert result["verdict"] == "PASS", result["errors"]
     assert len(result["incidents"]) == 3, result
+
+
+def test_cursor_pagination_names_the_record_that_reached_no_incident(
+    tmp_path: Path,
+) -> None:
+    activity = _activity(
+        incidents=[_group_incident()],
+        workflows=[
+            _log_workflow(
+                ["FREEZE_EVIDENCE", "MARK_UNSCHEDULABLE", "QUARANTINE"],
+                incident_id="inc-log-burst",
+                request_id="wf-burst",
+            )
+        ],
+        # The lockup record's finding is missing: it was starved.
+        markers=[_record_marker(index, "inc-log-burst") for index in range(2)],
+    )
+    result = mod.cursor_pagination(_pagination_ctx(tmp_path, activity))
+    assert result["verdict"] == "FAIL", result
+    [error] = result["stages"]["all_processed"]
+    assert error.startswith("only 2/3 severe kernel records"), error
+    assert "lockup" in error and "storage" not in error, error
+    assert result["records"]["lockup"] is None, result["records"]
+
+
+def test_cursor_pagination_counts_no_incident_older_than_the_injection(
+    tmp_path: Path,
+) -> None:
+    # The activity read also lists the incident of any workflow created since
+    # the injection (a validated restore of an older incident): a marker on
+    # such an incident is not this run's finding reaching an incident.
+    old = {**_group_incident(), "created_at": "2026-10-23T23:00:00+00:00"}
+    activity = {
+        **_activity(
+            incidents=[old],
+            workflows=[],
+            markers=[_record_marker(index, "inc-log-burst") for index in range(3)],
+        ),
+        "since": "2026-10-24T00:00:00+00:00",
+        "cluster_id": "gpu-eks-cluster",
+        "node_id": NODE,
+    }
+    result = mod.cursor_pagination(_pagination_ctx(tmp_path, activity))
+    assert result["verdict"] == "FAIL", result
+    assert result["incidents"] == [], result
+
+
+@pytest.mark.parametrize(
+    "label",
+    ["NODE_HEALTH", "NODE_HEALTH_GROUP", "NODE_RESOURCE_GROUP", "GPU_FAULT_GROUP"],
+)
+def test_a_severe_record_counts_under_every_label_the_product_gives_its_incident(
+    tmp_path: Path, label: str
+) -> None:
+    activity = _activity(
+        incidents=[{**_log_incident(), "event_type": label}],
+        workflows=[
+            _log_workflow(["FREEZE_EVIDENCE", "MARK_UNSCHEDULABLE", "QUARANTINE"])
+        ],
+        notifications=[_notification()],
+    )
+    regional = FakeRegional(
+        cpu_python=store_script({"activity": activity}),
+        node_snapshot=_isolated_node(True),
+    )
+    ctx, _ = _ctx("kernel_lockup", regional=regional, tmp_path=tmp_path)
+    result = mod.kernel_lockup(ctx)
+    assert result["verdict"] == "PASS", (label, result["errors"])
 
 
 def test_variants_match_the_coverage_row() -> None:

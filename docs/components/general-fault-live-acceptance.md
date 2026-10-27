@@ -721,6 +721,26 @@ incident 的 event id；同一节点同一 boot 上复用 cursor 时，后一次
 （创建于本次开始之前，判定读不到），表现为“no severe kernel-log finding reached a NODE_HEALTH incident”
 而非产品缺陷。
 
+`cursor_pagination` 每次真机运行都判 FAIL——2026-10-26（R13g）HyperPod 与 plain EKS、2026-10-27
+（R13h，b190 已改 journalctl 定位之后）plain EKS——报“only 0/3 severe kernel records reached an
+incident; the cursor starved the rest”，而产品已完成该变体要证明的事。R13h 上 arm 之后的首轮采集在同一
+批次读到三条受检记录（同一次 wrapper 调用、同一时间戳、三个 cursor）：首条（MCE）finding 于 18:46:32Z
+生成 `inc-log-<节点>-<MCE 记录的 event id>` 并发起节点隔离（FREEZE_EVIDENCE、MARK_UNSCHEDULABLE、
+QUARANTINE），存储与 lockup 两条 finding 并入这一进行中的隔离（`orchestration/families/drain.py`
+`ingest_terminal_node_quarantine`）：同一条记录改标 `NODE_HEALTH_GROUP`，带三条 finding 的原因与三个
+marker，节点保持隔离直到 runner 于 18:56:35Z 提交经验证的恢复。两次 R13g 运行留下同样的记录（HyperPod
+11:00:13Z 含全部三条原因；plain EKS 05:13:07Z 只有两条——当时 MCE 记录的 cursor 还不带 run id，被并入
+更早一次运行的 incident）。判定只认 `NODE_HEALTH`，且要求每条记录各有一个 incident——节点隔离进行中时
+产品按设计不会这样做。b190（journalctl 只按 cursor 或只按时间窗定位）确是采集器缺陷，但不是本次原因：两个
+发布上三条记录都已送达。变体现在沿每条记录自己 finding 的 marker 追踪：产品为每个 finding 写一个
+marker，`raw_evidence_ref` 指明读取的条目（`dmesg://<节点>/<回放 cursor>`），`incident_id` 指向 ingestion
+归入的 incident；每条记录的 marker 都指向注入之后生成的节点日志 incident（产品给出的任一标签，
+`NODE_HEALTH_EVENT_TYPES`）即通过，隔离链在该突发首个生成的 incident 上判定。016 的 incident 匹配对
+所有变体同样接受这些标签并经 `minted_in_read` 排除更早的 incident。回放无法在同时间戳条目之间放置分页
+边界（三条落在同一次读取），跨页续读仍由 `tests/collectors/test_node_log_journal_positioning.py` 证明；
+`tests/regional/test_general_live_kernel_burst.py` 把变体自己的记录经探针 wrapper、真实采集器、控制面
+API 与 activity 探针跑通，判定对照的是产品真实写出的记录而不是手写文档。
+
 ### GF-GENERAL-LIVE-017
 
 必测：`cgroup_oom`、`nccl_error`、`distributed_error`、`live_pid`、`exited_pid`、

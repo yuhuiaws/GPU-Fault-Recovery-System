@@ -46,6 +46,10 @@ Each reviewed record travels under a synthetic journal cursor that carries the
 run id (``probes/general_live_kernel_source_probe.py``): the cursor is the
 entry id, and the control plane derives the incident's event id from it, so a
 second run on the same node and boot must not reuse the first run's identity.
+A severe finding on a node whose isolation is already in flight joins that
+incident instead of minting one (``NODE_HEALTH_GROUP``), so incidents are
+matched under every label the product gives them and ``cursor_pagination``
+follows each record through its own finding's marker.
 """
 
 from __future__ import annotations
@@ -60,6 +64,7 @@ from scripts.e2e.regional.general_live_fixture import (
 )
 from scripts.e2e.regional.general_live_kernel_replay import (
     kernel_replay,
+    replay_entry_prefix,
     reviewed_record,
 )
 from scripts.e2e.regional.general_live_registry import (
@@ -67,7 +72,9 @@ from scripts.e2e.regional.general_live_registry import (
     VariantSpec,
 )
 from scripts.e2e.regional.general_live_verdicts import (
+    NODE_HEALTH_EVENT_TYPES,
     hardware_errors,
+    minted_in_read,
     node_isolated,
     notification_errors,
     operations,
@@ -140,13 +147,23 @@ def _drive(
 def _log_incidents(
     activity_document: dict[str, Any], *, policy_source: str | None = None
 ) -> list[dict[str, Any]]:
-    """NODE_HEALTH incidents minted from a node-log entry on this node."""
+    """Incidents a node-log entry on this node minted since the read's ``since``.
+
+    Under every label the product gives that record (``NODE_HEALTH_EVENT_TYPES``):
+    a second severe finding on a node whose isolation is in flight joins it,
+    and the minted incident -- same id, same ``log-`` event id -- becomes
+    ``NODE_HEALTH_GROUP`` (``families/drain.py``
+    ``ingest_terminal_node_quarantine``). ``minted_in_read`` keeps out an older
+    incident the read lists only because a workflow of it is newer.
+    """
 
     result = []
     for incident in activity_document.get("incidents") or []:
-        if incident.get("event_type") != "NODE_HEALTH":
+        if incident.get("event_type") not in NODE_HEALTH_EVENT_TYPES:
             continue
         if not str(incident.get("event_id") or "").startswith("log-"):
+            continue
+        if not minted_in_read(activity_document, incident):
             continue
         if policy_source is not None and incident.get("policy_source") != policy_source:
             continue
@@ -367,8 +384,85 @@ def _no_stop_without_attribution(
     return errors
 
 
+def _record_links(
+    activity_document: dict[str, Any],
+    incidents: list[dict[str, Any]],
+    prefixes: dict[str, str],
+) -> dict[str, dict[str, Any] | None]:
+    """The incident of this run each reviewed record's finding was routed to.
+
+    A finding's marker (``NodeHealthFinding.marker``) names the entry it was
+    read from -- ``raw_evidence_ref`` is ``<origin>://<node>/<entry id>`` and
+    the entry id is the replay cursor (``replay_entry_prefix``) -- and, once
+    ingestion picked the incident, that incident: the finding's own, or the
+    one an earlier finding of the burst minted and this one joined. ``None``
+    for a record no marker on one of ``incidents`` names: the product never
+    read it, or never graded it onto an incident of this run.
+    """
+
+    minted = {str(item.get("incident_id")): item for item in incidents}
+    links: dict[str, dict[str, Any] | None] = {}
+    for label, prefix in prefixes.items():
+        links[label] = None
+        for marker in activity_document.get("markers") or []:
+            entry_id = str(marker.get("raw_evidence_ref") or "").rpartition("/")[2]
+            incident = minted.get(str(marker.get("incident_id") or ""))
+            if incident is None or not entry_id.startswith(prefix):
+                continue
+            links[label] = {
+                "entry_id": entry_id,
+                "marker_id": marker.get("marker_id"),
+                "incident_id": incident.get("incident_id"),
+                "event_type": incident.get("event_type"),
+            }
+            break
+    return links
+
+
+def _wait_records_linked(
+    ctx: VariantContext, since: Any, prefixes: dict[str, str], *, name: str
+) -> dict[str, Any]:
+    """Read the node's activity until every record's finding names an incident."""
+
+    last: dict[str, Any] = {}
+
+    def accept() -> dict[str, Any] | None:
+        nonlocal last
+        last = activity(ctx, since, kinds=("NODE_LOGS",))
+        incidents = _log_incidents(last, policy_source="SITE_KERNEL_LOG")
+        return last if all(_record_links(last, incidents, prefixes).values()) else None
+
+    value = ctx.wait_until(
+        accept, timeout_seconds=DETECTION_BUDGET, poll_seconds=15, name=name
+    )
+    return value if value is not None else last
+
+
 def cursor_pagination(ctx: VariantContext) -> dict[str, Any]:
-    """Several severe records at once: each reaches its own incident, none starved."""
+    """A burst of severe records in one read: every one reaches an incident.
+
+    Three reviewed severe records, emitted by one wrapper call with one
+    timestamp and three cursors, must each be read, graded and routed to an
+    incident of this run -- none lost to the cursor, the entry identity or the
+    batch limits. How many incidents that makes is the product's choice: the
+    first finding mints one and opens the node's isolation, the others join
+    that isolation while it is in flight, as reasons of the same record
+    re-labelled ``NODE_HEALTH_GROUP`` (``families/drain.py``
+    ``ingest_terminal_node_quarantine``) -- one cordon and quarantine of the
+    node, not three racing ones. Each record is therefore followed through its
+    own finding's marker (``_record_links``), and the isolation chain is graded
+    on the incident the burst minted first.
+
+    Live 2026-10-26 (R13g, HyperPod and plain EKS) and 2026-10-27 (R13h, plain
+    EKS) this variant read FAIL "only 0/3 severe kernel records reached an
+    incident; the cursor starved the rest" while the first armed poll had
+    delivered all three records in one batch and the product had folded them
+    into one NODE_HEALTH_GROUP incident and quarantined the node: the grade
+    took only ``NODE_HEALTH`` and wanted one incident per record. A page
+    boundary between same-timestamp entries cannot be placed through the
+    replay (the three land in one read); the collector's resume across one is
+    ``tests/collectors/test_node_log_journal_positioning.py``.
+    """
 
     records = [
         reviewed_record(SEVERE_MESSAGES["uncorrectable_mce"], priority=2, label="mce"),
@@ -377,29 +471,42 @@ def cursor_pagination(ctx: VariantContext) -> dict[str, Any]:
         ),
         reviewed_record(SEVERE_MESSAGES["kernel_lockup"], priority=2, label="lockup"),
     ]
+    prefixes = {
+        str(record["label"]): replay_entry_prefix(ctx.run_id, index)
+        for index, record in enumerate(records)
+    }
     started, _ = _drive(ctx, records, restore_seconds=ctx.spec.max_minutes * 60)
-    observed = _wait_log_incident(
-        ctx,
-        started,
-        policy_source="SITE_KERNEL_LOG",
-        minimum=len(records),
-        name="pagination",
-    )
+    observed = _wait_records_linked(ctx, started, prefixes, name="pagination")
     incidents = _log_incidents(observed, policy_source="SITE_KERNEL_LOG")
+    links = _record_links(observed, incidents, prefixes)
+    starved = [label for label, link in links.items() if link is None]
+    reached = sorted({str(link["incident_id"]) for link in links.values() if link})
     stages = {
-        "all_processed": []
-        if len(incidents) >= len(records)
-        else [
-            f"only {len(incidents)}/{len(records)} severe kernel records reached an "
-            "incident; the cursor starved the rest"
-        ],
+        "all_processed": [
+            f"only {len(records) - len(starved)}/{len(records)} severe kernel "
+            f"records reached an incident of this run; no finding of "
+            f"{', '.join(starved)} names one (marker raw_evidence_ref = replay "
+            "cursor)"
+        ]
+        if starved
+        else [],
+        # Graded once something was minted; nothing minted is all_processed's.
+        "chain": _quarantine_chain_errors(observed, incidents) if incidents else [],
         "hardware": hardware_errors(observed),
     }
     return _result(
         ctx,
         stages,
-        extra={"incidents": [item["incident_id"] for item in incidents]},
-        notes=["same-timestamp records across cursor pages must not starve later ones"],
+        extra={
+            "incidents": [item["incident_id"] for item in incidents],
+            "records": links,
+        },
+        notes=[
+            "same-timestamp records of one read must not starve one another; "
+            f"{len(records) - len(starved)} record(s) reached {len(reached)} "
+            "incident(s): a later severe finding joins the node's in-flight "
+            "isolation (NODE_HEALTH_GROUP)"
+        ],
     )
 
 
@@ -497,8 +604,10 @@ VARIANTS = [
     ),
     _spec(
         "cursor_pagination",
-        "three reviewed severe records in one window (same-timestamp across cursor pages)",
-        "each reaches its own incident; none is starved by the cursor",
+        "three reviewed severe records in one journal read (one timestamp, three "
+        "cursors)",
+        "every record's finding reaches an incident of this run -- the first mints "
+        "it, the others join that one isolation (NODE_HEALTH_GROUP); none is starved",
         cursor_pagination,
         risk="M",
     ),

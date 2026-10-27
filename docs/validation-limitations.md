@@ -2487,6 +2487,42 @@ print formats (Linux v6.12): the `kernel/watchdog.c` soft-lockup line, the EFA
 `mm/oom_kill.c` "Memory cgroup out of memory: Killed process" line without a
 `kernel:` tag, so the rules are exercised on what a node really logs.
 
+016 `cursor_pagination` read FAIL on every live run -- HyperPod and plain EKS
+on 2026-10-26 (R13g) and plain EKS on 2026-10-27 (R13h, after b190 changed the
+collector's journalctl positioning) -- with "only 0/3 severe kernel records
+reached an incident; the cursor starved the rest", while the product had done
+what the variant exists to prove. On R13h the first poll after `arm` read the
+three reviewed records (one wrapper call, one timestamp, three cursors) in one
+batch. The first finding (the MCE record) minted `inc-log-<node>-<its event
+id>` at 18:46:32Z and opened the node's isolation (FREEZE_EVIDENCE,
+MARK_UNSCHEDULABLE, QUARANTINE); the storage and lockup findings joined that
+isolation while it was in flight (`orchestration/families/drain.py`
+`ingest_terminal_node_quarantine`): one record, re-labelled
+`NODE_HEALTH_GROUP`, carrying the three findings' reasons and three markers,
+and the node stayed quarantined until the runner's validated restore at
+18:56:35Z. Both R13g runs left the same record (HyperPod 11:00:13Z with all
+three reasons; plain EKS 05:13:07Z with two, the MCE record's cursor not yet
+carrying the run id and so routed to an earlier run's incident). The grade
+took only `NODE_HEALTH` incidents and wanted one per record, which the product
+does not mint while the node's isolation is in flight, by design. b190 (journalctl positioned by its cursor
+or by a time window, never both) fixed a real collector defect, but not this
+one: the records were delivered on both releases. The variant now follows each
+record through its own finding's marker -- the product writes one per
+finding, naming the entry it was read from in `raw_evidence_ref`
+(`dmesg://<node>/<replay cursor>`) and the incident ingestion routed it to --
+and passes when every record's marker points at a node-log incident minted
+since the injection, under any label the product gives it
+(`NODE_HEALTH_EVENT_TYPES`); the isolation chain is graded on the incident the
+burst minted first. The 016 incident matcher takes the same labels, and
+`minted_in_read`, for every variant. The replay cannot place a page boundary
+between same-timestamp entries (all three land in one read), so the
+collector's resume across one stays proven by
+`tests/collectors/test_node_log_journal_positioning.py`;
+`tests/regional/test_general_live_kernel_burst.py` drives the variant's own
+records through the probe's wrapper, the real collector, the control-plane API
+and the activity probe, so the grade is tested against what the product writes
+rather than a scripted record.
+
 017 `old_pod` writes its reviewed line under the UID of a Pod the product has
 already restarted away, in a directory kubelet is going to remove: kubelet's
 container GC (one-minute `ContainerGCPeriod`) deletes every `/var/log/pods`

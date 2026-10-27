@@ -58,6 +58,22 @@ PROBE_SCRIPT = (
 )
 PROOF_SCOPE = "live-replay"
 MODES = ("journal", "kmsg")
+#: The synthetic journal cursor the journal-mode wrapper gives reviewed record
+#: ``index`` of run ``run_id`` is ``gfrs-replay-<run>-<index>-<boot>``
+#: (``WRAPPER_SCRIPT`` in the probe). The collector makes it the entry id, the
+#: control plane derives the finding's event id from it and the finding's
+#: marker names it in ``raw_evidence_ref`` (``dmesg://<node>/<entry id>``).
+REPLAY_CURSOR_PREFIX = "gfrs-replay-"
+
+
+def replay_entry_prefix(run_id: str, index: int) -> str:
+    """The start of reviewed record ``index``'s entry id in run ``run_id``.
+
+    Everything but the boot, which the wrapper appends: what a grade matches a
+    product record's entry id against to say which reviewed record it is.
+    """
+
+    return f"{REPLAY_CURSOR_PREFIX}{run_id}-{int(index)}-"
 
 
 def reviewed_record(
@@ -297,8 +313,10 @@ __all__ = [
     "KernelLogReplay",
     "MODES",
     "PROOF_SCOPE",
+    "REPLAY_CURSOR_PREFIX",
     "kernel_replay",
     "kmsg_follow_error",
     "records_sha256",
+    "replay_entry_prefix",
     "reviewed_record",
 ]
