@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -94,9 +94,22 @@ class FakeSpareSession:
     def grade(self) -> dict[str, Any]:
         return self._store
 
+    #: When the window's on-node unit restores kubelet, from the stop: the live
+    #: 15 s delay + 600 s timer by default; a test moves it before the grade.
+    restore_in_seconds: float = 615.0
+
     def stop_kubelet(self) -> dict[str, Any]:
         self.kubelet_stopped = True
-        return {}
+        restore_at = self.ctx.clock() + timedelta(seconds=self.restore_in_seconds)
+        return {
+            "phase": "SCHEDULED",
+            "record_kind": "RECOVERY_REQUIRED",
+            "after": None,
+            "stop_requested": False,
+            "stop_acknowledged": False,
+            "restore_at": int(restore_at.timestamp()),
+            "expires_at": int(restore_at.timestamp()) + 180,
+        }
 
     def await_not_ready(self) -> dict[str, Any]:
         assert self.kubelet_stopped, "waiting for NotReady before the stop"
@@ -594,6 +607,85 @@ def test_not_ready_passes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     )
     assert result["stages"]["restored"] == [] and result["spare_after"]["name"] == NODE
     assert result["spare_release"] == {"released": True}
+    window = json.loads(
+        (session.ctx.case_dir / "spare-grading-window.json").read_text(encoding="utf-8")
+    )
+    assert window["errors"] == [] and window["restore_at"] > window["graded_at"], (
+        "the grade was read while kubelet was down, before the on-node restore"
+    )
+
+
+def test_grading_window_errors_need_not_ready_on_both_sides_of_an_early_grade() -> None:
+    graded_at = datetime(2026, 10, 27, 14, 19, 4, tzinfo=timezone.utc)
+    stopped = {
+        "restore_at": int(graded_at.timestamp()) + 498,  # live: 14:27:22Z
+        "expires_at": int(graded_at.timestamp()) + 678,
+    }
+    down = _node(ready="Unknown")
+    assert sp.grading_window_errors(down, down, graded_at, stopped) == []
+    assert sp.grading_window_errors(down, down, graded_at, {}) == [], (
+        "a report without deadlines skips the deadline check, nothing else"
+    )
+    assert sp.grading_window_errors(_node(ready="True"), down, graded_at, stopped) == [
+        "the spare never left Ready: True"
+    ]
+    assert sp.grading_window_errors(down, _node(ready="True"), graded_at, stopped) == [
+        "the spare was Ready again when the grade had been read: kubelet was "
+        "already restored"
+    ]
+    late = graded_at + timedelta(seconds=498)
+    assert sp.grading_window_errors(down, down, late, stopped) == [
+        f"the grade was read at {late.isoformat()}, not before the on-node restore "
+        f"deadline {late.isoformat()}"
+    ]
+
+
+def test_not_ready_is_inconclusive_when_the_grade_was_not_read_while_kubelet_was_down(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The claim is the product's grade of a NotReady spare: a grade read after
+    the on-node restore deadline, or a node Ready again right after the grade,
+    proves nothing about it -- INCONCLUSIVE, never PASS, and still handed back."""
+
+    class RestoredBeforeTheGrade(FakeSpareSession):
+        restore_in_seconds = -1.0
+
+    monkeypatch.setattr(
+        sp,
+        "SpareSession",
+        lambda ctx: RestoredBeforeTheGrade(
+            ctx, node=_node(ready="Unknown"), store=_store()
+        ),
+    )
+    FakeSpareSession.instances = []
+    result = SPECS["not_ready"].execute(_ctx(SPECS["not_ready"], tmp_path))
+    assert result["verdict"] == "INCONCLUSIVE", result
+    assert any(
+        "not before the on-node restore deadline" in e for e in result["errors"]
+    ), result["errors"]
+    assert "not before the on-node restore deadline" in result["detail"], (
+        "an INCONCLUSIVE carries its reason in the result, not only the verdict"
+    )
+    assert result["inconclusive"] == [result["detail"]]
+    assert FakeSpareSession.instances[-1].finished, "the spare is still released"
+
+    class ReadyAgainAfterTheGrade(FakeSpareSession):
+        def grade(self) -> dict[str, Any]:
+            self._node = _node(ready="True")
+            return self._store
+
+    monkeypatch.setattr(
+        sp,
+        "SpareSession",
+        lambda ctx: ReadyAgainAfterTheGrade(
+            ctx, node=_node(ready="Unknown"), store=_store()
+        ),
+    )
+    result = SPECS["not_ready"].execute(_ctx(SPECS["not_ready"], tmp_path))
+    assert result["verdict"] == "INCONCLUSIVE", result
+    assert any("kubelet was already restored" in e for e in result["errors"]), result[
+        "errors"
+    ]
 
 
 def test_every_variant_fails_when_the_spare_is_not_handed_back(

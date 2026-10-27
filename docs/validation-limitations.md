@@ -3858,6 +3858,40 @@ patches apply in memory so a spare is really declared and released -- up to the
 first host-probe mutation, asserts the release bookkeeping, and pins the window
 to the fixture identity `warm_spare_node_probe.binding_key` grants.
 
+The kubelet undo of 030 `not_ready` is awaited through the node, not read
+through the stopped kubelet (`service_window_node_restore.py`). Every request
+the service window makes to the node (`restore-service`, `cleanup`) travels
+over `kubectl exec` into the host-probe Pod, and the API server hands an exec
+to that node's own kubelet; with kubelet stopped the channel is gone, the exec
+returns no output and the fixture raises `HostProbeMissingResponseError`, which
+says nothing about the node. Live 2026-10-27 (plain EKS, release 37db33f254a1,
+attempt 7) the explicit undo was issued about 80 s into the stop, got exactly
+that, and the variant judged `restored: the candidate is not Ready after the
+release (Unknown)` and `cleanup did not prove the node clean` at 14:19:20Z,
+while the window's own on-node restore unit brought kubelet back at `restore_at`
+14:27:22Z and the node was Ready at 14:27:23Z -- the node-side deadman worked;
+the harness judged the hand-back eight minutes early (the next EKS case started
+on a NotReady node and ended NOT_RUN(FIXTURE_NOT_READY)). The undo now attempts
+the explicit undo first (with kubelet up -- stop timer not yet fired, restore
+unit already done, HyperPod or EKS alike -- it cancels or closes the window at
+once); a missing response or transport error while the node is not Ready is
+recorded as the expected shape, the undo is deferred to the on-node unit, the
+node is polled through the API until Ready with the deadline `expires_at` (the
+unit's authority bound, `restore_at` + 180 s) + 120 s, and the explicit undo is
+then repeated over the restored channel -- the window's CLOSED report (kubelet
+running, stop and restore units quiescent, `restore_reason` naming who restored
+it) is the proof; then every Pod on the node is awaited Ready before the spare
+is released and `restored` is judged. Only a node that has not returned by that
+deadline fails the undo, with a message naming `restore_at`, `expires_at`, the
+wait deadline and the last node condition observed (`spare-kubelet-restore.json`
+carries the poll timeline). The oracle is tightened to the claim -- the product
+graded the spare while kubelet was down: the node is read again after the grade
+and must be not Ready on both sides of it, and the grade must precede
+`restore_at` (`spare-grading-window.json`), else INCONCLUSIVE. The sibling
+variants (`stale_metrics`, `configuration_error`, `reserved_spare`) never stop
+kubelet; GF-REGIONAL-DESTR-008 S3 always waited for the node Ready before its
+`restore()` and did not have the defect.
+
 027 `reporter_silent`'s injection stopped nothing live 2026-10-26 (plain EKS,
 release 37db33f254a1): the runner's `kubectl exec -c progress-reporter-0 --
 /bin/sh -c 'kill -STOP 1 || true'` targeted the reporter sidecar as its

@@ -26,9 +26,17 @@ own join preflight requires it; ``eks_node_repair``) -- at plan time and again
 before declaring; a busy candidate is INCONCLUSIVE, never cordoned.
 ``not_ready`` stops kubelet through the DESTR-008 service window (an on-node
 restore timer bounds the stop at 600 s; the Agent identity it pins is the EC2
-instance id on eks-managed), waits for the node to leave Ready, grades, then
-restores kubelet and waits for the node Ready and every Pod on it Ready before
-the release. Each block-only variant makes the declared spare
+instance id on eks-managed), waits for the node to leave Ready, grades, reads
+the node once more to prove the grade was taken while kubelet was down and
+before the on-node restore deadline, then undoes the stop *through the node*
+(``service_window_node_restore``): the explicit undo is attempted, a missing
+response while the node is not Ready is the expected shape -- the probe's exec
+channel is kubelet itself (live 2026-10-27, plain EKS) -- the node is awaited
+Ready through the API until ``expires_at`` plus a margin, the window is closed
+over the restored channel as the proof, every Pod on the node is awaited Ready,
+and only then is the spare released and ``restored`` judged; a node that does
+not return by the deadline fails the undo naming ``restore_at``/``expires_at``
+and the last condition seen. Each block-only variant makes the declared spare
 ineligible for allocation in exactly one way -- NotReady, stale GPU telemetry,
 a configuration error (foreign reservation or a non-AVAILABLE pool state) --
 and reads the product's own spare-health grading, the exact gate
@@ -57,6 +65,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Mapping
+from datetime import datetime
 from typing import Any
 
 from scripts.e2e.regional.general_live_fixture import (
@@ -77,6 +86,11 @@ from scripts.e2e.regional.general_live_registry import (
 )
 from scripts.e2e.regional.general_live_store import preflight_state
 from scripts.e2e.regional.general_live_verdicts import operations, verdict
+from scripts.e2e.regional.service_window_node_restore import (
+    NodeRestoreOverdue,
+    restore_through_node,
+    window_deadlines,
+)
 from scripts.e2e.regional.warm_spare_residue import spare_residue_report
 
 CASE = "GF-GENERAL-LIVE-030"
@@ -85,7 +99,10 @@ CASE = "GF-GENERAL-LIVE-030"
 #: node leaves Ready well inside this; the on-node restore timer (600 s) is the
 #: independent bound on the stop itself.
 NOT_READY_WAIT_SECONDS = 240
-#: After kubelet is restored: the node Ready again, then every Pod on it Ready.
+#: After an explicit kubelet restore over a working probe channel: the node
+#: Ready again. When the channel was down (kubelet stopped) the wait runs to the
+#: window's ``expires_at`` plus ``service_window_node_restore``'s margin
+#: instead. Then every Pod on the node Ready.
 READY_WAIT_SECONDS = 300
 PODS_READY_WAIT_SECONDS = 300
 #: After the metrics collector is resumed: a fresh success on every required
@@ -403,20 +420,51 @@ class SpareSession:
             maintenance_expires_at=self.ctx.deadline,
         )
         service.create()
+        state: dict[str, Any] = {}
+
+        def undo_service() -> dict[str, Any]:
+            # The window's own CLOSED report is the proof: kubelet running
+            # again, the stop timer/service and the restore unit quiescent, and
+            # ``restore_reason`` naming who restored it ("deadline" = the
+            # on-node unit at restore_at, "cleanup" = this undo).
+            residuals = service.cleanup()
+            return {
+                "residuals": residuals,
+                "window": service.window.data.get("host_cleanup"),
+            }
 
         def restore_kubelet() -> dict[str, Any]:
-            # One undo: restore the service, then prove the node is back --
-            # Ready, and every Pod on it Ready -- before the spare is released
-            # (the stack runs this before the release it was pushed after).
-            report: dict[str, Any] = {"service": service.cleanup()}
-            report["ready"] = self.warm.wait_node_ready(
-                self.node, ready=True, timeout_seconds=READY_WAIT_SECONDS
-            ).get("ready")
+            # One undo, through the node: the explicit undo is attempted, but
+            # its channel is kubelet's own exec path, so with kubelet stopped
+            # the missing response is expected and the on-node restore unit is
+            # the restore -- awaited via the API until ``expires_at`` plus a
+            # margin, then proven over the restored channel. Then every Pod on
+            # the node Ready, before the spare is released (the stack runs this
+            # before the release it was pushed after).
+            try:
+                report = restore_through_node(
+                    service="kubelet.service",
+                    node=self.node,
+                    undo=undo_service,
+                    node_snapshot=lambda: self.warm.node_snapshot(self.node),
+                    binding=service.window.data.get("binding"),
+                    restore_unit=str(
+                        (state.get("stopped") or {}).get("restore_unit") or ""
+                    ),
+                    clock=self.ctx.clock,
+                    sleep=self.ctx.sleep,
+                    ready_timeout_seconds=READY_WAIT_SECONDS,
+                )
+            except NodeRestoreOverdue as exc:
+                self.ctx.evidence.write("spare-kubelet-restore", exc.report)
+                raise
+            self.ctx.evidence.write("spare-kubelet-restore", report)
             report["pods_not_ready"] = self.wait_pods_ready()
             return report
 
         self.ctx.cleanup.push("spare-kubelet", restore_kubelet)
         stopped = service.stop("kubelet.service", restore_seconds=600, delay_seconds=15)
+        state["stopped"] = stopped
         self.ctx.evidence.write("spare-kubelet", stopped)
         return stopped
 
@@ -863,6 +911,38 @@ def block_only_verdict(
     )
 
 
+def grading_window_errors(
+    node: Mapping[str, Any],
+    after_grade: Mapping[str, Any],
+    graded_at: datetime,
+    stopped: Mapping[str, Any],
+) -> list[str]:
+    """Why "graded while kubelet was down" is not proven; empty means it is.
+
+    ``node`` is the snapshot the NotReady wait ended on, ``after_grade`` the
+    one read right after the product's grade, ``graded_at`` the clock then and
+    ``stopped`` the window's SCHEDULED report (``restore_at`` is when the
+    on-node unit restores kubelet on its own). The claim needs the node not
+    Ready on both sides of the grade and the grade before that deadline.
+    """
+
+    errors: list[str] = []
+    if node.get("ready") in ("True", None):
+        errors.append(f"the spare never left Ready: {node.get('ready')}")
+    if after_grade.get("ready") == "True":
+        errors.append(
+            "the spare was Ready again when the grade had been read: kubelet was "
+            "already restored"
+        )
+    deadlines = window_deadlines(stopped)
+    if deadlines is not None and graded_at >= deadlines["restore_at"]:
+        errors.append(
+            f"the grade was read at {graded_at.isoformat()}, not before the on-node "
+            f"restore deadline {deadlines['restore_at'].isoformat()}"
+        )
+    return errors
+
+
 # --------------------------------------------------------------------------- #
 # variants
 # --------------------------------------------------------------------------- #
@@ -870,15 +950,30 @@ def not_ready(ctx: VariantContext) -> dict[str, Any]:
     session = _declared(ctx)
     stopped = session.stop_kubelet()
     node = session.await_not_ready()
-    oracle_ok = node.get("ready") not in ("True", None)
+    store = session.grade()
+    # The claim is "the product graded the spare while kubelet was down": the
+    # node is read again after the grade and the grade must precede the on-node
+    # restore deadline; the undo then awaits the node's return (through the
+    # node, not the stopped kubelet) before the release and ``restored``.
+    graded_at = ctx.clock()
+    window = grading_window_errors(node, session.node_snapshot(), graded_at, stopped)
+    deadlines = window_deadlines(stopped) or {}
+    ctx.evidence.write(
+        "spare-grading-window",
+        {
+            "graded_at": graded_at.isoformat(),
+            "errors": window,
+            **{key: value.isoformat() for key, value in deadlines.items()},
+        },
+    )
     result = block_only_verdict(
         node,
-        session.grade(),
+        store,
         expected_class=OBSERVATION,
         expected_fragment="Kubernetes node is not Ready",
         our_incident=session.incident_id,
-        oracle_ok=oracle_ok,
-        oracle_detail=f"the spare never left Ready: {node.get('ready')} ({stopped})",
+        oracle_ok=not window,
+        oracle_detail="; ".join(window),
     )
     return finalize(result, session.finish())
 
@@ -977,13 +1072,18 @@ def _result(
     inconclusive: list[str] | None = None,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    # An INCONCLUSIVE carries its reason: ``detail`` is the key the runner uses
+    # for its own verdict reasons, and the errors list is what the board shows.
     return {
         "verdict": verdict(stages, inconclusive=inconclusive),
         "stages": stages,
         "errors": [
             f"{stage}: {error}" for stage, items in stages.items() for error in items
-        ],
+        ]
+        + [f"inconclusive: {item}" for item in inconclusive or []],
         "notes": notes or [],
+        "inconclusive": list(inconclusive or []),
+        **({"detail": "; ".join(inconclusive)} if inconclusive else {}),
         **(extra or {}),
     }
 
@@ -1010,7 +1110,10 @@ def _spec(
         injection=injection,
         expected=expected,
         cleanup=(
-            "restore kubelet (node and its Pods Ready again) / resume the metrics "
+            "restore kubelet through the node (explicit undo attempted; with kubelet "
+            "down the on-node restore unit restores it and the node is awaited Ready "
+            "via the API until expires_at + margin, then the window is closed over the "
+            "restored channel; node and its Pods Ready again) / resume the metrics "
             "collector (channels fresh again) / restore the annotations, then release "
             "the declared spare (uncordon, label gone) before the verdict; the result "
             "records the candidate before and after and the cluster-wide spare census"
@@ -1027,9 +1130,10 @@ VARIANTS = [
         "not_ready",
         "declare the spare candidate, then stop kubelet on it (DESTR-008 service"
         " window, 600 s on-node restore timer) until the node leaves Ready",
-        "graded ineligible (OBSERVATION 'Kubernetes node is not Ready'); no reboot,"
-        " no REMEDIATING; kubelet restored and the node and its Pods Ready again"
-        " before the release",
+        "graded ineligible (OBSERVATION 'Kubernetes node is not Ready') while kubelet"
+        " was down and before the on-node restore deadline; no reboot, no REMEDIATING;"
+        " kubelet restored (awaited through the node, not read through the stopped"
+        " kubelet) and the node and its Pods Ready again before the release",
         not_ready,
         approvals=("DECLARE_WARM_SPARE", "SPARE_KUBELET_STOP"),
     ),

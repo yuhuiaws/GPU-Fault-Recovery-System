@@ -2516,6 +2516,27 @@ POST 预制 finding。类别模块 `general_live_nccl`/`_nccl_fr`/`_progress`/`_
   拒绝、CloudTrail 无 BatchReplaceClusterNodes），记
   `NOT_RUN(COVERED_BY_REGIONAL: GF-REGIONAL-DESTR-008 S1)`，不另建夹具。
 
+030 `not_ready` 的 kubelet 撤销走**节点**而不是读被停掉的 kubelet
+（`service_window_node_restore.py`）。service window 对节点的每个请求（`restore-service`、
+`cleanup`）都经 `kubectl exec` 进 host-probe Pod，而 API server 把 exec 交给该节点自己的
+kubelet：kubelet 停着时这条通道不存在，exec 无输出、夹具抛 `HostProbeMissingResponseError`，
+它对节点状态什么也没说。真机 2026-10-27（plain EKS）：显式撤销在停机约 80 s 时发出并得到
+该错误，变体随即在 14:19:20Z 判 `restored: the candidate is not Ready after the release
+(Unknown)` 与 `cleanup did not prove the node clean`，而窗口自己的节点侧恢复单元在
+`restore_at` 14:27:22Z 准时拉起 kubelet、节点 14:27:23Z 重新 Ready——节点侧 deadman 工作正常，
+是 harness 提前 8 分钟判了交还。现在的撤销顺序：先尝试显式撤销（kubelet 在线——停机定时器尚未
+触发、或恢复单元已完成，HyperPod/EKS 同样——它当场取消或关闭窗口）；节点非 Ready 时的无响应/传输
+错误记为**预期形态**而非失败，撤销交给节点侧恢复单元，经 API 轮询节点直到重新 Ready，截止 =
+`expires_at`（恢复单元的授权终点 = `restore_at` + 180 s）+ 120 s 余量；节点回来后再在恢复的通道上
+重做显式撤销——窗口自己的 CLOSED 报告（kubelet running、stop/restore 单元静止、`restore_reason`
+注明由谁恢复）就是服务恢复的证明；之后等节点上全部 Pod Ready，才释放热备并判 `restored`。节点到
+截止仍未回来才让撤销失败，错误文本点名 `restore_at`/`expires_at`/等待截止与最后观测到的节点
+条件（证据 `spare-kubelet-restore.json` 含轮询时间线）。oracle 也随之收紧：判级后再读一次节点，
+节点须在判级前后都非 Ready、且判级时间早于 `restore_at`（`spare-grading-window.json`），否则
+INCONCLUSIVE——该变体的论断是"产品在 kubelet 停着时把热备判为不合格"。同胞变体
+`stale_metrics`/`configuration_error`/`reserved_spare` 不停 kubelet，撤销不受影响；
+GF-REGIONAL-DESTR-008 S3 一向先等节点 Ready 再 `restore()`，没有这个缺陷。
+
 计划/执行形如 `--case GF-GENERAL-LIVE-011 --variant active_to_zero --site-file <F>
 --node-b <N2> --hyperpod-cluster <HP>`（011/030 两条车道均可；011 需 `--site-file` 与
 `--node-b`，`--node-b` 为车道的第二台 EFA 节点）；030 形如 `--case GF-GENERAL-LIVE-030
