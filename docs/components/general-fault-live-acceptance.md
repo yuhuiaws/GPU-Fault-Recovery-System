@@ -1734,13 +1734,22 @@ deadman（探针自身副本执行 `cleanup --strict`，失败重试）、再在
 紧急保底（`GPU_FAULT_PASSIVE_STOP_FALLBACK_SECONDS`）须自行 suspend 工作负载并写上
 `gpu-fault.io/passive-stop-mode=emergency-fallback` 与 termination-initiator 注解，attempt
 的 Pod 被 operator 删除后终态在 watcher 侧产生并缓冲于 outbox；有效性 oracle：阻断至少 150 s
-后，控制面的 watcher coverage heartbeat `observed_at` 仍早于阻断时刻，且该 attempt 无
+后，控制面的 watcher coverage heartbeat 与该任务各 attempt 的工作负载观测的 `observed_at`
+仍早于阻断时刻（繁忙集群不发 heartbeat，观测才是 watcher 每轮的写入），且该 attempt 无
 event/decision，否则 `INCONCLUSIVE`（阻断未生效）。恢复后判定只读产品记录：紧急停止注解
 指向该 attempt 的 containment incident；event/decision 各恰好一条且 decision 为
 `PLAN_CREATED`（被动 containment 发起的 STOPPED 终态仍按预算重启一次）；containment
-工作流 STOP_WORKLOADS 恰好成功一次、recovery 工作流至多一个且 RESTART_WORKLOAD 至多成功一次、
-账本 `restart_count ≤ 1` 且等于 reservation 数；该 attempt 各 incident 的通知无重复
-deduplication key；恢复后出现新的 coverage heartbeat（`observed_at` 晚于恢复时刻）。清理删除
+工作流 STOP_WORKLOADS 恰好成功一次、recovery 工作流至多一个且 RESTART_WORKLOAD 至多成功一次
+（recovery 历史只含终态决策开出的工作流：`ATTEMPT_PROBE` 以 `include_terminal=True` 读
+`list_job_recovery_workflow_incidents` 时，被动 containment 自己的 STOP 工作流——同一 job 与
+attempt——也在列表里，探针把它只记在 `containment_workflows`；2026-10-27 HyperPod 首跑曾把
+一次 STOP 加一次 RESTART 数成"2 recovery workflows"）、账本 `restart_count ≤ 1` 且等于
+reservation 数；该 attempt 各 incident 的通知无重复 deduplication key；恢复后出现 watcher
+自己的新写入（`observed_at` 晚于恢复时刻）：coverage heartbeat，或该任务最新的工作负载观测。
+heartbeat 只是"集群空闲"的陈述——产品只在一次全量扫描既无运行中 Pod 也无存活 attempt 时才发布
+（`completion_attempt_state.publish_coverage_heartbeat`），而本变体预期的重启副本会一直运行到
+清理：2026-10-27 实测 heartbeat 行在恢复后 300 s 内停留在阻断前的值，重启副本的 RUNNING 观测与
+该 attempt 的终态却都已送达，因此只认 heartbeat 是 oracle 错误而非产品缺陷。清理删除
 带本次 tag 的全部规则并停 deadman，探针回读链上无残留且 timer 未激活，否则记清理失败。
 `worker_restart`（`--approve CONTROL_PLANE_RESTART`）：受管任务 `exit:1`、预算 1；每 5 s
 读取 attempt 记录直到 claim 打开——账本已有 recovery 工作流的 reservation 且 RESTART_WORKLOAD
@@ -1750,7 +1759,8 @@ watcher Pod，等待 Deployment 重建出新 UID 且 Ready（≤ 600 s，与 sta
 recovery 工作流终结。判定：账本 `restart_count == 1` 且唯一 reservation 属于该 recovery
 工作流（未丢失、未重复扣减）；RESTART_WORKLOAD 恰好成功一次、recovery 工作流恰好一个且
 SUCCEEDED、STOP_WORKLOADS 恰好成功一次、decision 为 `PLAN_CREATED`；watcher 发布的观测中除源
-attempt 外恰好一个重启 attempt；通知无重复；重建后出现新的 coverage heartbeat。两变体都在
+attempt 外恰好一个重启 attempt；通知无重复；重建后出现 watcher 的新写入（集群空闲后的
+coverage heartbeat，或对重启 attempt 的观测）。两变体都在
 `eks`/`hp` 车道、需 `--fault-node`（跑受管任务的 GPU 节点）与 `--site-file`；清理按重启血缘删
 除受管任务及其副本。
 

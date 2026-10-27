@@ -624,8 +624,9 @@ def old_terminal(ctx: VariantContext) -> dict[str, Any]:
     )
 
 
-#: The block holds at least this long after it is proven, so a coverage
-#: heartbeat that did not advance (posted every 120 s at most) is an oracle.
+#: The block holds at least this long after it is proven, so a watcher write
+#: that did not advance (an observation every pass; the idle heartbeat every
+#: 120 s at most) is an oracle.
 API_BLOCK_SETTLE_SECONDS = 150
 #: The watcher's emergency fallback arms 30 s after its first failed POST and
 #: fires on a later pass; the operator then deletes the suspended job's Pods.
@@ -633,7 +634,9 @@ API_BLOCK_SETTLE_SECONDS = 150
 EMERGENCY_WAIT_SECONDS = 180
 PODS_GONE_WAIT_SECONDS = 150
 RUNNING_WAIT_SECONDS = 900
-HEARTBEAT_WAIT_SECONDS = 300
+#: The watcher's first write after the restore: the restart copy's RUNNING
+#: observation once it runs, or the idle heartbeat (120 s cadence) otherwise.
+WATCHER_RESTORED_WAIT_SECONDS = 300
 
 
 def api_unreachable(ctx: VariantContext) -> dict[str, Any]:
@@ -685,7 +688,7 @@ def api_unreachable(ctx: VariantContext) -> dict[str, Any]:
         )
     records = _wait_decision(ctx, job, name="api-unreachable")
     entry = _attempt(records, job.attempt_id)
-    after = _wait_heartbeat_after(ctx, job, entry, since=restored_at)
+    after = _wait_watcher_restored(ctx, job, entry, since=restored_at)
     decision = entry.get("decision") or {}
     containment_id = (entry.get("containment_incident") or {}).get("incident_id")
     stages = {
@@ -707,7 +710,7 @@ def api_unreachable(ctx: VariantContext) -> dict[str, Any]:
         "notifications": isolation.duplicate_notification_errors(
             after.get("notifications") or []
         ),
-        "watcher_restored": isolation.restored_heartbeat_errors(
+        "watcher_restored": isolation.watcher_restored_errors(
             after, restored_at=restored_at
         ),
     }
@@ -839,11 +842,12 @@ def _wait_pods_gone(ctx: VariantContext, job: ManagedFailJob) -> list[dict[str, 
     return value if value is not None else last
 
 
-def _wait_heartbeat_after(
+def _wait_watcher_restored(
     ctx: VariantContext, job: ManagedFailJob, entry: dict[str, Any], *, since: Any
 ) -> dict[str, Any]:
-    """The isolation records once the watcher's coverage heartbeat postdates
-    ``since`` (or the last read, which the grader then fails)."""
+    """The isolation records once a watcher write -- the coverage heartbeat or
+    the job's latest workload observation -- postdates ``since`` (or the last
+    read, which the grader then fails)."""
 
     cluster_id = ctx.settings.regional.cluster_id
     incident_ids = isolation.attempt_incident_ids(entry)
@@ -856,15 +860,15 @@ def _wait_heartbeat_after(
         )
         return (
             last
-            if not isolation.restored_heartbeat_errors(last, restored_at=since)
+            if not isolation.watcher_restored_errors(last, restored_at=since)
             else None
         )
 
     value = ctx.wait_until(
         accept,
-        timeout_seconds=HEARTBEAT_WAIT_SECONDS,
+        timeout_seconds=WATCHER_RESTORED_WAIT_SECONDS,
         poll_seconds=20,
-        name="heartbeat",
+        name="watcher-restored",
     )
     return value if value is not None else last
 
@@ -1056,7 +1060,7 @@ def worker_restart(ctx: VariantContext) -> dict[str, Any]:
     records = _wait_recovery_settled(ctx, job)
     entry = _attempt(records, job.attempt_id)
     ready_at = datetime.fromisoformat(str(restarted["ready_at"]))
-    after = _wait_heartbeat_after(ctx, job, entry, since=ready_at)
+    after = _wait_watcher_restored(ctx, job, entry, since=ready_at)
     stages = {
         "watcher_replaced": watcher_restart.replacement_errors(restarted),
         "single_restart": watcher_restart.worker_restart_errors(entry, records),
@@ -1068,7 +1072,7 @@ def worker_restart(ctx: VariantContext) -> dict[str, Any]:
         "notifications": isolation.duplicate_notification_errors(
             after.get("notifications") or []
         ),
-        "watcher_restored": isolation.restored_heartbeat_errors(
+        "watcher_restored": isolation.watcher_restored_errors(
             after, restored_at=ready_at
         ),
     }
@@ -1326,12 +1330,12 @@ VARIANTS = [
             "reaches the control plane while blocked; after the restore the failure "
             "and terminal are delivered once: one containment with one STOP_WORKLOADS, "
             "one decision (PLAN_CREATED), at most one RESTART_WORKLOAD, the budget "
-            "consumed once, no duplicate notification, a coverage heartbeat after the "
-            "restore"
+            "consumed once, no duplicate notification, a watcher write after the "
+            "restore (the restart copy's observation, or the idle heartbeat)"
         ),
         cleanup=(
             "delete the tagged rules and the deadman, prove the chain clean and a "
-            "watcher heartbeat after the restore; delete the test job and its restart"
+            "watcher write after the restore; delete the test job and its restart"
         ),
         max_minutes=45,
         approvals=("WATCHER_NETWORK_ISOLATION",),

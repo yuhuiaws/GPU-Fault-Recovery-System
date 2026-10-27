@@ -725,6 +725,35 @@ def test_ineffective_block_reasons_read_the_heartbeat_and_the_terminal() -> None
         and "still reached" in reasons[0]
         and "terminal reached" in reasons[1]
     )
+    # A busy cluster publishes no heartbeat at all, so the observation the
+    # watcher posts every pass is what shows a block that did not bite.
+    observed = {
+        "attempt_id": "job-a001",
+        "job_id": "job",
+        "workload_phase": "FAILED",
+        "observed_at": (blocked_at + timedelta(seconds=20)).isoformat(),
+    }
+    before = {
+        **observed,
+        "observed_at": (blocked_at - timedelta(seconds=5)).isoformat(),
+    }
+    assert (
+        iso.ineffective_block_reasons(
+            {"heartbeat": heartbeat(T0), "observations": [before]},
+            {},
+            blocked_at=blocked_at,
+        )
+        == []
+    )
+    reasons = iso.ineffective_block_reasons(
+        {"heartbeat": heartbeat(T0), "observations": [before, observed]},
+        {},
+        blocked_at=blocked_at,
+    )
+    assert reasons == [
+        "the watcher's workload observation of job-a001 still reached the control "
+        f"plane at {observed['observed_at']} during the block"
+    ]
 
 
 def test_emergency_stop_errors_need_the_mode_and_the_containment_incident() -> None:
@@ -783,19 +812,55 @@ def test_single_action_errors_count_every_action_once() -> None:
 def test_heartbeat_notification_incident_and_observation_helpers() -> None:
     restored_at = T0 + timedelta(minutes=10)
     assert (
-        iso.restored_heartbeat_errors(
+        iso.watcher_restored_errors(
             {"heartbeat": heartbeat(restored_at + timedelta(seconds=90))},
             restored_at=restored_at,
         )
         == []
     )
-    assert iso.restored_heartbeat_errors(
+    assert iso.watcher_restored_errors(
         {"heartbeat": None}, restored_at=restored_at
-    ) == ["no watcher coverage heartbeat is recorded after the restore"]
-    stale = iso.restored_heartbeat_errors(
+    ) == [
+        "no watcher coverage heartbeat or workload observation is recorded after "
+        "the restore"
+    ]
+    stale = iso.watcher_restored_errors(
         {"heartbeat": heartbeat(T0)}, restored_at=restored_at
     )
-    assert stale[0].startswith("the watcher's last coverage heartbeat"), stale
+    assert stale == [
+        f"the watcher's last coverage heartbeat ({T0.isoformat()}) and last workload "
+        f"observation (none) predate the restore ({restored_at.isoformat()})"
+    ]
+    # Only an idle pass publishes a heartbeat (``publish_coverage_heartbeat``
+    # says nothing while a Pod or an attempt is active), and after the restore
+    # the product's own restart copy is running: the watcher's write back to
+    # the control plane is that copy's RUNNING observation (live 2026-10-27).
+    running = {
+        "attempt_id": "job-a001-r-0000000a",
+        "job_id": "job",
+        "workload_phase": "RUNNING",
+        "observed_at": (restored_at + timedelta(seconds=40)).isoformat(),
+    }
+    old = {**running, "attempt_id": "job-a001", "observed_at": T0.isoformat()}
+    assert (
+        iso.watcher_restored_errors(
+            {"heartbeat": heartbeat(T0), "observations": [old, running]},
+            restored_at=restored_at,
+        )
+        == []
+    )
+    assert (
+        iso.watcher_restored_errors(
+            {"heartbeat": None, "observations": [running]}, restored_at=restored_at
+        )
+        == []
+    )
+    assert iso.watcher_restored_errors(
+        {"heartbeat": heartbeat(T0), "observations": [old]}, restored_at=restored_at
+    ) == [
+        f"the watcher's last coverage heartbeat ({T0.isoformat()}) and last workload "
+        f"observation ({T0.isoformat()}) predate the restore ({restored_at.isoformat()})"
+    ]
     notifications = [
         {"incident_id": "inc-c", "category": "containment", "deduplication_key": "k1"},
         {"incident_id": "inc-c", "category": "containment", "deduplication_key": "k1"},

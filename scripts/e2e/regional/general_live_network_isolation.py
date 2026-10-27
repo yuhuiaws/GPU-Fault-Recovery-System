@@ -13,7 +13,12 @@ the probe Pod and the control plane are all gone:
   match, so no other Pod, no host unit and no other destination is touched,
   and the block never outlives ``WATCHER_BLOCK_SECONDS`` (the control plane
   reads a cluster's coverage UNKNOWN 600 s after the watcher's last heartbeat
-  and blocks node-mutating plans; the deadman fires before that).
+  and blocks node-mutating plans; the deadman fires before that). The
+  watcher's return after the restore is read from its own writes: a coverage
+  heartbeat is the *idle* statement (``publish_coverage_heartbeat`` says
+  nothing while a pass sees a running Pod or a live attempt), and after the
+  restore the product's own restart copy is running, so the job's latest
+  workload observation counts as that write too.
 * 011 ``unreachable_node`` -- ``agent-ingress``: on the attempt's second GPU
   node, one INPUT rule rejects TCP to the Node Agent's listening port -- the
   channel the cluster executor pushes node actions to
@@ -435,6 +440,19 @@ def _observed_at(heartbeat: Mapping[str, Any] | None) -> datetime | None:
     return parse_time((heartbeat or {}).get("observed_at"))
 
 
+def _latest_observation(
+    records: Mapping[str, Any],
+) -> tuple[datetime | None, str | None]:
+    """``(observed_at, attempt_id)`` of the newest workload observation listed."""
+
+    latest: tuple[datetime | None, str | None] = (None, None)
+    for item in records.get("observations") or []:
+        observed = parse_time(item.get("observed_at"))
+        if observed is not None and (latest[0] is None or observed > latest[0]):
+            latest = (observed, str(item.get("attempt_id") or ""))
+    return latest
+
+
 def ineffective_block_reasons(
     during: Mapping[str, Any],
     attempt_entry: Mapping[str, Any],
@@ -443,9 +461,11 @@ def ineffective_block_reasons(
 ) -> list[str]:
     """Why the block did not cut the watcher off (the effectiveness oracle).
 
-    The watcher's coverage heartbeat must not advance past the block, and the
-    attempt's terminal/decision must not reach the control plane while the
-    block holds. Either is INCONCLUSIVE, never a product verdict.
+    None of the watcher's writes may land past the block: its coverage
+    heartbeat, the job's workload observations (what a busy cluster's watcher
+    posts every pass -- a heartbeat is only ever published by an idle one) and
+    the attempt's terminal/decision. Any of them is INCONCLUSIVE, never a
+    product verdict.
     """
 
     reasons = []
@@ -454,6 +474,12 @@ def ineffective_block_reasons(
         reasons.append(
             "the watcher's coverage heartbeat still reached the control plane at "
             f"{observed.isoformat()} during the block"
+        )
+    latest, attempt_id = _latest_observation(during)
+    if latest is not None and latest >= blocked_at:
+        reasons.append(
+            f"the watcher's workload observation of {attempt_id} still reached the "
+            f"control plane at {latest.isoformat()} during the block"
         )
     if attempt_entry.get("event") or attempt_entry.get("decision"):
         reasons.append(
@@ -537,17 +563,36 @@ def single_action_errors(
     return errors
 
 
-def restored_heartbeat_errors(
+def watcher_restored_errors(
     after: Mapping[str, Any], *, restored_at: datetime
 ) -> list[str]:
-    """The watcher reached the control plane again: a heartbeat after the restore."""
+    """The watcher reached the control plane again: a write of its own after
+    the restore.
 
-    observed = _observed_at(after.get("heartbeat"))
-    if observed is None:
-        return ["no watcher coverage heartbeat is recorded after the restore"]
-    if observed < restored_at:
+    Either the coverage heartbeat or the job's latest workload observation
+    postdates the restore. The heartbeat alone is the wrong oracle here: the
+    product publishes it only from a full pass that saw no running Pod and no
+    live attempt (``completion_attempt_state.publish_coverage_heartbeat``),
+    and the restart the variant expects keeps the cluster busy until the
+    cleanup -- live 2026-10-27 the restart copy ran through the whole wait and
+    the heartbeat row stayed at its pre-block value while the watcher's
+    observations of the copy, and the attempt's terminal, were all delivered.
+    """
+
+    heartbeat_at = _observed_at(after.get("heartbeat"))
+    observation_at, _attempt_id = _latest_observation(after)
+    written = [item for item in (heartbeat_at, observation_at) if item is not None]
+    if not written:
         return [
-            f"the watcher's last coverage heartbeat ({observed.isoformat()}) predates "
+            "no watcher coverage heartbeat or workload observation is recorded after "
+            "the restore"
+        ]
+    if max(written) < restored_at:
+        return [
+            "the watcher's last coverage heartbeat "
+            f"({heartbeat_at.isoformat() if heartbeat_at else 'none'}) and last "
+            "workload observation "
+            f"({observation_at.isoformat() if observation_at else 'none'}) predate "
             f"the restore ({restored_at.isoformat()})"
         ]
     return []
@@ -790,7 +835,7 @@ __all__ = [
     "later_step_statuses",
     "no_isolation_errors",
     "observed_running",
-    "restored_heartbeat_errors",
     "single_action_errors",
     "watcher_pod",
+    "watcher_restored_errors",
 ]

@@ -242,8 +242,10 @@ print(json.dumps({
 """
 
 #: One training attempt's completion records (terminal event, decision,
-#: containment incident and workflow, recovery incidents/workflows, the
-#: notifications of those incidents) and its job's restart ledger. Read-only.
+#: containment incident and workflow, recovery incidents/workflows -- the
+#: workflows the terminal decision opened, never the containment's own STOP --
+#: the notifications of those incidents) and its job's restart ledger.
+#: Read-only.
 ATTEMPT_PROBE = r"""
 import json
 import sys
@@ -277,6 +279,16 @@ for attempt_id in attempt_ids:
     for incident, workflow in store.list_job_recovery_workflow_incidents(
         cluster_id, job_id, attempt_id, include_terminal=True
     ):
+        # With terminal workflows included, the listing is every workflow of
+        # the attempt's incidents -- the passive containment's own
+        # STOP_WORKLOADS workflow among them (same job and attempt). That one
+        # is the containment, reported below; the recovery history is what
+        # the terminal decision opened (live 2026-10-27: counting it there
+        # read one stop and one restart as two recovery workflows).
+        if incident.event_type == "TRAINING_ATTEMPT_FAILURE_DETECTED" or (
+            containment is not None and incident.incident_id == containment.incident_id
+        ):
+            continue
         incident_ids.add(incident.incident_id)
         recovery.append({
             "incident": incident.model_dump(mode="json"),

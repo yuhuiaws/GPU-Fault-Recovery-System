@@ -357,6 +357,33 @@ def activity_read(store: Any, arguments: Sequence[str]) -> dict[str, Any]:
     return json.loads(output.getvalue())
 
 
+ATTEMPT_CODE = compile(ATTEMPT_PROBE, "<general-live-attempt-probe>", "exec")
+
+
+def attempt_read(store: Any, arguments: Sequence[str]) -> dict[str, Any]:
+    """Run the real ``ATTEMPT_PROBE`` in-process over ``store``.
+
+    ``arguments`` are what ``general_live_store.attempt_records`` passes the
+    probe in the API Pod (cluster, job, attempt ids); the probe reads the
+    attempt's completion records through the product's own store API and
+    prints the document the single-action graders receive. A test that needs
+    to know what the probe lists as the attempt's recovery history runs it
+    over records the product's own service wrote instead of scripting them.
+    """
+
+    from gpu_fault.app import ApplicationContext
+
+    output = io.StringIO()
+    context = types.SimpleNamespace(store=store)
+    with (
+        mock.patch.object(ApplicationContext, "from_environment", lambda: context),
+        mock.patch.object(sys, "argv", ["attempt-probe", *arguments]),
+        contextlib.redirect_stdout(output),
+    ):
+        exec(ATTEMPT_CODE, {"__name__": "__main__"})
+    return json.loads(output.getvalue())
+
+
 BUDGET_CODE = compile(BUDGET_PROBE, "<general-live-budget-probe>", "exec")
 
 

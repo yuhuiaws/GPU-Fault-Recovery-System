@@ -21,7 +21,8 @@ ledger (count 1 == one reservation, belonging to the recovery workflow), the
 recovery workflow (one, with one successful RESTART_WORKLOAD), the containment
 (one successful STOP_WORKLOADS), the decision, the notifications of the
 attempt's incidents (none twice), the watcher's observation of exactly one
-restart attempt, and a coverage heartbeat from the replacement.
+restart attempt, and a write from the replacement (its coverage heartbeat once
+the cluster is idle, or its observation of the restart attempt).
 """
 
 from __future__ import annotations

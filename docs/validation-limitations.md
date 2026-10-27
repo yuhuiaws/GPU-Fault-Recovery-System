@@ -2161,14 +2161,27 @@ IP: no other Pod, host unit or destination is affected, and the systemd deadman
 600 s after which the control plane reads the cluster's coverage UNKNOWN. What
 is proven: the watcher's emergency fallback suspends the workload itself
 (annotated `emergency-fallback`, naming the containment incident), nothing
-reaches the control plane while the block holds (the coverage heartbeat stops
-advancing and the attempt has no event/decision -- otherwise INCONCLUSIVE), and
-after the restore every action is recorded once: one containment with one
-successful STOP_WORKLOADS, one decision (PLAN_CREATED: a STOPPED terminal
-initiated by the passive containment is still the failure's terminal and
-restarts once within budget), at most one RESTART_WORKLOAD, a ledger whose
-count equals its reservations, no notification twice, and a coverage heartbeat
-after the restore. Limits: the block holds the resolved IPv4 addresses of the
+reaches the control plane while the block holds (the coverage heartbeat and the
+job's workload observations stop advancing and the attempt has no
+event/decision -- otherwise INCONCLUSIVE), and after the restore every action
+is recorded once: one containment with one successful STOP_WORKLOADS, one
+decision (PLAN_CREATED: a STOPPED terminal initiated by the passive containment
+is still the failure's terminal and restarts once within budget), at most one
+recovery workflow with at most one RESTART_WORKLOAD, a ledger whose count
+equals its reservations, no notification twice, and a write of the watcher's
+own after the restore. Two readings the first HyperPod run (2026-10-27) got
+wrong and the oracle now makes: the recovery history is what the terminal
+decision opened -- the store's job/attempt listing
+(`list_job_recovery_workflow_incidents`, terminal workflows included) returns
+the passive containment's own STOP workflow beside it, which the attempt probe
+reports under `containment_workflows` only, so one stop and one restart are
+not "2 recovery workflows"; and the watcher's return is its heartbeat *or* the
+job's latest workload observation, because a coverage heartbeat is the idle
+statement only (`publish_coverage_heartbeat` says nothing from a pass that saw
+a running Pod or a live attempt) and the restart the variant expects keeps the
+cluster busy until the cleanup -- that run waited 300 s on a heartbeat row that
+could not move while the restart copy's RUNNING observations and the attempt's
+terminal had all been delivered. Limits: the block holds the resolved IPv4 addresses of the
 endpoint at block time (a CIDR list can be given instead); a DNS change during
 the window is reported by the probe's `status` and would show up as an
 ineffective block (INCONCLUSIVE), never as a product verdict. The REJECT makes
@@ -2199,7 +2212,8 @@ from the product's own ConfigMaps and must not re-decide, re-reserve or re-send:
 the ledger keeps exactly the one reservation of the recovery workflow (not lost,
 not doubled), one RESTART_WORKLOAD succeeds, one STOP_WORKLOADS, one decision,
 exactly one restart attempt is observed, no notification is recorded twice and
-a coverage heartbeat follows from the replacement. The module tests drive the
+a write from the replacement follows (its coverage heartbeat once the cluster is
+idle, or its observation of the restart attempt). The module tests drive the
 sequence over fakes (a phase-driven store, an inventory that flips on the fenced
 delete); the live run is the only proof of the real outbox replay.
 

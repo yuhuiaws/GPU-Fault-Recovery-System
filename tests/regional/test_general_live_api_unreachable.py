@@ -11,19 +11,33 @@ from __future__ import annotations
 
 import base64
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from gpu_fault.app import ApplicationContext
+from gpu_fault.models import (
+    DecisionStatus,
+    TerminalEvent,
+    TerminalStatus,
+    WorkflowOperation,
+    WorkflowStatus,
+    WorkflowStepExecution,
+    WorkflowStepStatus,
+)
+from gpu_fault.passive import PassiveWorkflowCompiler
+from gpu_fault.service import CompletionService
+from gpu_fault.watcher import AllocationCompleteness, FailureDetectedEvent
 from scripts.e2e.regional import general_live_attempts as att
 from scripts.e2e.regional import general_live_network_isolation as iso
 from scripts.e2e.regional.general_live_fixture import VariantInconclusive
 from scripts.e2e.regional.general_live_registry import APPROVALS
 from scripts.e2e.regional.general_live_store import ATTEMPT_PROBE
 from scripts.e2e.regional.regional_commands import RegionalFixtureError
-from tests.regional._general_live_fakes import FakeProbe
+from tests._builders import copy_model
+from tests.regional._general_live_fakes import FakeProbe, attempt_read
 from tests.regional._general_live_isolation_fakes import (
     NODE,
     POD_IP,
@@ -46,6 +60,11 @@ class Phases:
         self.phase = "before"
         self.triggered = False
         self.heartbeat_during = T0
+        # After the restore: the coverage heartbeat the store answers (None for
+        # no row) and, when set, the RUNNING observation of the product's
+        # restart copy -- the busy cluster's only watcher write.
+        self.heartbeat_restored: datetime | None = T0 + timedelta(days=1)
+        self.restart_observed_at: datetime | None = None
         self.stops = 1
         self.decision = "PLAN_CREATED"
         self.emergency = True
@@ -153,25 +172,33 @@ def _store(phases: Phases, job_name: str) -> Any:
             entry = _attempt_entry(phases)
             return {**attempt_records(entry), "attempts": {f"{job_name}-a001": entry}}
         if script == iso.ISOLATION_RECORDS_PROBE:
-            at = (
-                T0 + timedelta(days=1)
-                if phases.phase == "restored"
-                else phases.heartbeat_during
-            )
+            restored = phases.phase == "restored"
+            at = phases.heartbeat_restored if restored else phases.heartbeat_during
             notifications = phases.notifications * (
                 2 if phases.dup_notifications else 1
             )
-            return {
-                "heartbeat": heartbeat(at),
-                "observations": [
+            observations = [
+                {
+                    "attempt_id": f"{job_name}-a001",
+                    "job_id": job_name,
+                    "workload_phase": "RUNNING",
+                    "observed_at": T0.isoformat(),
+                    "containers": 1,
+                }
+            ]
+            if restored and phases.restart_observed_at is not None:
+                observations.append(
                     {
-                        "attempt_id": f"{job_name}-a001",
+                        "attempt_id": f"{job_name}-a001-r-0000000a",
                         "job_id": job_name,
                         "workload_phase": "RUNNING",
-                        "observed_at": T0.isoformat(),
+                        "observed_at": phases.restart_observed_at.isoformat(),
                         "containers": 1,
                     }
-                ],
+                )
+            return {
+                "heartbeat": heartbeat(at) if at is not None else None,
+                "observations": observations,
                 "notifications": notifications if arguments[3] else [],
                 "agent": None,
             }
@@ -299,6 +326,41 @@ def test_api_unreachable_passes_when_every_action_happens_once(
     )
 
 
+def test_api_unreachable_reads_the_restart_copys_observation_as_the_watchers_return(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live 2026-10-27 (HyperPod): the product's restart copy kept the cluster
+    busy, so no idle heartbeat followed the restore; the watcher's RUNNING
+    observation of that copy is its write back to the control plane."""
+
+    phases = Phases()
+    phases.heartbeat_restored = T0
+    phases.restart_observed_at = T0 + timedelta(days=1)
+    ctx, _fake = _variant_context(tmp_path, phases, monkeypatch)
+    result = ctx.spec.execute(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    assert result["stages"]["watcher_restored"] == []
+    assert (ctx.evidence.case_dir / "watcher-restored-timeline.json").is_file(), (
+        "the wait for the watcher's return is evidence"
+    )
+
+
+def test_api_unreachable_fails_when_the_watcher_writes_nothing_after_the_restore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    phases = Phases()
+    phases.heartbeat_restored = T0
+    ctx, _fake = _variant_context(tmp_path, phases, monkeypatch)
+    result = ctx.spec.execute(ctx)
+    assert result["verdict"] == "FAIL"
+    (error,) = result["stages"]["watcher_restored"]
+    assert error.startswith(
+        f"the watcher's last coverage heartbeat ({T0.isoformat()}) and last workload "
+        f"observation ({T0.isoformat()}) predate the restore ("
+    ), error
+    assert result["stages"]["single_action"] == []
+
+
 def test_api_unreachable_is_inconclusive_when_the_watcher_still_reaches_the_control_plane(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -382,3 +444,90 @@ def test_the_approval_tokens_describe_the_scoped_blocks() -> None:
         "heartbeats, collectors and kubelet untouched"
         in APPROVALS["NODE_AGENT_NETWORK_ISOLATION"]
     )
+
+
+# --------------------------------------------------------------------------- #
+# the attempt probe over the product's own records (live 2026-10-27, HyperPod)
+# --------------------------------------------------------------------------- #
+def test_attempt_probe_reports_the_passive_containment_apart_from_the_recovery(
+    context: ApplicationContext, failed_event: TerminalEvent, ended_at: datetime
+) -> None:
+    """The product's own 028 ``api_unreachable`` records, read by the real probe.
+
+    Over the product's service: the replayed failure opens the passive
+    containment (one STOP_WORKLOADS workflow); the emergency fallback's STOPPED
+    terminal, naming that containment, is decided PLAN_CREATED with one
+    recovery workflow. The store's recovery listing for the attempt matches the
+    containment's own workflow as well (same job and attempt, terminal status
+    included), which the live run counted as "2 recovery workflows for one
+    attempt". The probe reports the containment under
+    ``containment_workflows`` only; the recovery history is the restart.
+    """
+
+    service = CompletionService(
+        context.store, workflow_compiler=PassiveWorkflowCompiler(context.store)
+    )
+    workload_ids = ["training/pytorchjob/distributed-training"]
+    containment = service.handle_failure_detected(
+        FailureDetectedEvent(
+            cluster_id=failed_event.cluster_id,
+            job_id=failed_event.job_id,
+            attempt_id=failed_event.attempt_id,
+            detected_at=ended_at,
+            runtime_profile_version=failed_event.runtime_profile_version,
+            workload_ids=workload_ids,
+            node_ids=["node-a", "node-b"],
+            gpu_uuids=["GPU-a", "GPU-b"],
+            first_failed_rank=0,
+            node_id="node-a",
+            exit_code=1,
+            reason="critical container exited non-zero",
+            allocation_completeness=AllocationCompleteness.COMPLETE,
+        )
+    )
+    stop = context.store.get_workflow(containment.workflow_request_id)
+    context.store.save_workflow(
+        copy_model(
+            stop,
+            status=WorkflowStatus.SUCCEEDED,
+            step_executions=[
+                WorkflowStepExecution(
+                    step_index=1,
+                    operation=WorkflowOperation.STOP_WORKLOADS,
+                    status=WorkflowStepStatus.SUCCEEDED,
+                )
+            ],
+        )
+    )
+    decision = service.handle_terminal(
+        copy_model(
+            failed_event,
+            terminal_status=TerminalStatus.STOPPED,
+            termination_initiator_incident_id=containment.incident_id,
+            workload_ids=workload_ids,
+        )
+    )
+    assert decision.status is DecisionStatus.PLAN_CREATED
+    restart = context.store.get_plan(decision.recovery_plan_id).workflow_request_id
+    assert restart and restart != containment.workflow_request_id
+
+    records = attempt_read(
+        context.store,
+        [failed_event.cluster_id, failed_event.job_id, failed_event.attempt_id],
+    )
+    entry = records["attempts"][failed_event.attempt_id]
+    assert [item["request_id"] for item in entry["containment_workflows"]] == [
+        containment.workflow_request_id
+    ]
+    assert [item["workflow"]["request_id"] for item in entry["recovery"]] == [
+        restart
+    ], "the containment's own STOP workflow is not part of the recovery history"
+    assert [item["incident"]["event_type"] for item in entry["recovery"]] == [
+        "TRAINING_ATTEMPT_TERMINAL"
+    ]
+    assert iso.single_action_errors(entry, records) == []
+    # Both incidents still scope the notification read (nothing twice).
+    assert iso.attempt_incident_ids(entry) == [
+        containment.incident_id,
+        entry["recovery"][0]["incident"]["incident_id"],
+    ]
