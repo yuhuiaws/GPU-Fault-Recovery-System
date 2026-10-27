@@ -1915,7 +1915,9 @@ does kubelet's `/healthz` `syncloop` check report `sync Loop took longer than ex
 throughout, the product without any signal. The host collector therefore gained the `_device_plugins` contributor
 (`collectors/host/device_plugin.py`): every tick, for each socket in the kubelet `device-plugins` directory
 (`GPU_FAULT_DEVICE_PLUGIN_SOCKET_DIR`) that matches a resource family (default `nvidia-*.sock` / `*efa*.sock`,
-`GPU_FAULT_DEVICE_PLUGIN_SOCKET_PATTERNS`; never `kubelet.sock`) it speaks one HTTP/2 + gRPC exchange with the
+`GPU_FAULT_DEVICE_PLUGIN_SOCKET_PATTERNS`; never `kubelet.sock`; verified by a read-only listing on 2026-10-27: a HyperPod
+node and a plain-EKS node both hold exactly `aws-efa-device-plugin.sock`, `nvidia-gpu.sock`, `kubelet.sock` and
+`kubelet_internal_checkpoint`, no MIG sockets, so each default glob resolves to one socket) it speaks one HTTP/2 + gRPC exchange with the
 standard library alone (`collectors/host/device_plugin_probe.py`: connection preface, SETTINGS, literal HPACK headers,
 one empty length-prefixed message) calling the side-effect-free `GetDevicePluginOptions` -- not `ListAndWatch`: the
 NVIDIA and EFA plugins serve `ListAndWatch` from one shared health channel, so a second stream would race kubelet's

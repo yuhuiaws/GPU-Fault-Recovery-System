@@ -2710,6 +2710,15 @@ carrying that identity when they differ, and a product-side
 reader of the executor's effective environment; the per-provider default is
 what it expects) -- `scripts/e2e/regional/general_live_device_plugin_targets.py`.
 
+The socket names are verified: a read-only listing of
+`/var/lib/kubelet/device-plugins/` on the HyperPod node and on the plain-EKS node
+(2026-10-27) shows exactly `aws-efa-device-plugin.sock`, `nvidia-gpu.sock`,
+`kubelet.sock` and `kubelet_internal_checkpoint`, no MIG sockets, so the default
+patterns resolve to one socket per family (`gpu=nvidia-*.sock` →
+`nvidia-gpu.sock`, `efa=*efa*.sock` → `aws-efa-device-plugin.sock`) and the
+frozen socket's basename the variants should expect in `sockets` is one of
+those two.
+
 ## GF-GENERAL-LIVE live acceptance runner (phase 2, lane K)
 
 Phase 2 adds reviewed `live-replay` categories that drive the product's own

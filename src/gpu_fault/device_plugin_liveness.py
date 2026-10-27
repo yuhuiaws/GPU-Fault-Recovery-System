@@ -74,7 +74,11 @@ class DevicePluginFamily:
     #: NVIDIA plugin names its socket ``nvidia-<resource suffix>.sock``
     #: (``internal/plugin/server.go`` ``getPluginSocketPath``); the EFA plugin's
     #: basename is matched by the resource word, so a renamed build still
-    #: counts. ``GPU_FAULT_DEVICE_PLUGIN_SOCKET_PATTERNS`` overrides.
+    #: counts. Verified live on a HyperPod and a plain-EKS node (read-only
+    #: listing, 2026-10-27): the directory holds exactly
+    #: ``aws-efa-device-plugin.sock``, ``nvidia-gpu.sock``, ``kubelet.sock`` and
+    #: the ``kubelet_internal_checkpoint`` file, so each default glob resolves
+    #: to one socket. ``GPU_FAULT_DEVICE_PLUGIN_SOCKET_PATTERNS`` overrides.
     patterns: tuple[str, ...]
     #: ``host_health.NodeHealthCategory`` member name; the enum itself lives in
     #: ``host_health``, which imports this module, so it is named, not imported.

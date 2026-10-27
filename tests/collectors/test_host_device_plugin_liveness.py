@@ -14,6 +14,7 @@ import shutil
 import socket
 import tempfile
 from collections.abc import Iterator
+from fnmatch import fnmatch
 from pathlib import Path
 
 import pytest
@@ -349,3 +350,58 @@ def test_the_defaults_name_the_kubelet_directory_and_both_plugins() -> None:
 def test_malformed_socket_patterns_refuse_to_start(text: str) -> None:
     with pytest.raises(ValueError, match="GPU_FAULT_DEVICE_PLUGIN_SOCKET_PATTERNS"):
         parse_socket_patterns(text)
+
+
+#: What ``/var/lib/kubelet/device-plugins/`` held on the HyperPod node and on the
+#: plain-EKS node (read-only listing, 2026-10-27): one socket per plugin, kubelet's
+#: registration socket and its checkpoint file; no MIG sockets.
+LIVE_LISTING = (
+    "aws-efa-device-plugin.sock",
+    "nvidia-gpu.sock",
+    "kubelet.sock",
+    "kubelet_internal_checkpoint",
+)
+
+
+def test_the_default_patterns_resolve_the_live_listing_to_one_socket_each() -> None:
+    patterns = parse_socket_patterns(None)
+    matched = {
+        family: [
+            name
+            for name in LIVE_LISTING
+            if name != "kubelet.sock" and any(fnmatch(name, glob) for glob in globs)
+        ]
+        for family, globs in patterns.items()
+    }
+
+    assert matched == {
+        "gpu": ["nvidia-gpu.sock"],
+        "efa": ["aws-efa-device-plugin.sock"],
+    }, matched
+
+
+def test_the_live_listing_is_probed_as_two_plugins_and_nothing_else(
+    socket_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fixture already made ``kubelet.sock``; the checkpoint is a regular
+    file. Only the two plugin sockets are probed, each under its own family."""
+
+    make_socket(socket_dir / "aws-efa-device-plugin.sock")
+    make_socket(socket_dir / "nvidia-gpu.sock")
+    (socket_dir / "kubelet_internal_checkpoint").write_text("{}")
+    assert sorted(item.name for item in socket_dir.iterdir()) == sorted(LIVE_LISTING)
+    probe = ScriptedProbe()
+    host = collector(socket_dir, probe, monkeypatch)
+
+    batch = host.collect_once()
+
+    gpu, efa = by_name(batch)[GPU], by_name(batch)[EFA]
+    assert gpu.labels["sockets"] == "nvidia-gpu.sock"
+    assert gpu.labels["probe_state"] == "RESPONDED"
+    assert efa.labels["sockets"] == "aws-efa-device-plugin.sock"
+    assert efa.labels["probe_state"] == "RESPONDED"
+    assert gpu.value == 0 and efa.value == 0
+    assert sorted(name for name, _ in probe.calls) == [
+        "aws-efa-device-plugin.sock",
+        "nvidia-gpu.sock",
+    ], "kubelet.sock and the checkpoint file are never probed"
