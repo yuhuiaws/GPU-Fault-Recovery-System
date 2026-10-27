@@ -6,15 +6,32 @@ Runs on the target GPU node through ``host_probe_fixture.py`` (a privileged,
 node's own Python). Standard library only, Python 3.9+, one JSON object on the
 last stdout line.
 
-It makes a Kubernetes device plugin stop answering kubelet *without* removing
-its DaemonSet from the node and *without* touching ``Node.status``: a SIGSTOP
-of the plugin container's own process. A frozen plugin no longer serves the
-kubelet device-plugin ``ListAndWatch`` stream, so kubelet de-registers its
-resource and the node's allocatable for that resource decays while the Pod
-stays ``Running`` -- the genuine registration fault the product must repair by
-deleting and replacing the Pod (``RESTART_{GPU,EFA}_DEVICE_PLUGIN``), unlike the
-COLLECT-017 fixture, which excludes the DaemonSet by affinity and restores it
-before the product acts.
+It makes a Kubernetes device plugin hang *without* removing its DaemonSet from
+the node and *without* touching ``Node.status``: a SIGSTOP of the plugin
+container's own process. The frozen plugin keeps its unix socket open, so
+kubelet -- whose ``ListAndWatch`` stream to it has no deadline and no keepalive
+-- never notices: the Pod stays ``Running`` and allocatable stays full (live
+2026-10-27, HyperPod ``gpu_plugin``: ``nvidia.com/gpu`` 8 for four frozen
+minutes). What does notice is the product's host collector, which probes every
+plugin socket with a bounded ``GetDevicePluginOptions`` each tick
+(``collectors/host/device_plugin.py``) and raises
+``<gpu|efa>_device_plugin_unresponsive`` after two timed-out ticks -- the fault
+the product repairs by deleting and replacing the Pod
+(``RESTART_{GPU,EFA}_DEVICE_PLUGIN`` stamped ``plugin_unresponsive``), unlike
+the COLLECT-017 fixture, which excludes the DaemonSet by affinity and restores
+it before the product acts. A product without that probe (pre-R13h) sees
+nothing, which the control-plane fixture reports as INCONCLUSIVE, not FAIL.
+
+Three read-only companions serve the fixture's oracle. ``feature`` says which
+product generation this node runs (whether the host collector's installed
+package carries the probe modules, the unit's ``GPU_FAULT_DEVICE_PLUGIN_*``
+settings); ``probe-log`` lists the host collector's own journal lines about
+the probe since a moment (each timed-out tick is one WARNING naming the socket
+and the consecutive count); and ``freeze --resume-after-first-timeout`` tails
+that journal after the SIGSTOP and SIGCONTs the plugin the instant the *first*
+timed-out tick is logged, before the second can confirm the finding (the
+``one_sample`` window, decided on the node in well under a second rather than
+through the control plane).
 
 Every signalled process must satisfy *both* gates: its cgroup names the plugin
 Pod UID the control-plane fixture discovered (``kubepods.../pod<uid>``) *and*
@@ -75,6 +92,45 @@ RESUME_KIND = "resume-plugin"
 #: window (its SIGCONT at cleanup resumed the same pid).
 STOP_CONFIRM_SECONDS = 5.0
 STOP_POLL_SECONDS = 0.05
+#: The product's host collector unit, whose journal carries one WARNING per
+#: timed-out ``GetDevicePluginOptions`` tick (``collectors/host/device_plugin.py``
+#: ``_device_plugins``) and whose installed package says whether the probe
+#: exists on this node at all.
+HOST_COLLECTOR_UNIT = "gpu-fault-host-collector.service"
+#: The node runtime's venv (``deploy/systemd/gpu-fault-host-collector.service``
+#: ``ExecStart=/opt/gpu-fault/current/venv/bin/gpu-fault-collector host``); the
+#: unit's own ``ExecStart`` path wins when it names another.
+AGENT_VENV = Path("/opt/gpu-fault/current/venv")
+AGENT_CURRENT = Path("/opt/gpu-fault/current")
+#: The unit's environment file (the node probe's ``collector_env`` source).
+COLLECTOR_ENV = Path("/etc/gpu-fault/collector.env")
+#: Package files that exist only on a product with the device-plugin liveness
+#: probe (b204, R13h): the collector contributor, the gRPC probe and the shared
+#: metric/rule names. All three or none; a partial set is reported as it is.
+FEATURE_MODULES = {
+    "device_plugin": "gpu_fault/collectors/host/device_plugin.py",
+    "device_plugin_probe": "gpu_fault/collectors/host/device_plugin_probe.py",
+    "device_plugin_liveness": "gpu_fault/device_plugin_liveness.py",
+}
+DEVICE_PLUGIN_ENV_PREFIX = "GPU_FAULT_DEVICE_PLUGIN_"
+#: The host collector's WARNING for one timed-out probe tick (the message of
+#: ``LOGGER.warning`` in ``collectors/host/device_plugin.py``: the sockets that
+#: timed out, the bound, the consecutive count and the count that opens the
+#: finding), and its INFO for a node it does not probe.
+PROBE_LINE = re.compile(
+    r"device plugin (?P<sockets>\S+) did not answer GetDevicePluginOptions within "
+    r"(?P<timeout>[0-9.]+)s \((?P<count>\d+) consecutive; finding after "
+    r"(?P<required>\d+)\)"
+)
+DIRECTORY_ABSENT_LINE = re.compile(
+    r"device plugin socket directory (?P<directory>\S+) is absent"
+)
+JOURNAL_POLL_SECONDS = 0.5
+MAX_JOURNAL_ENTRIES = 200
+#: ``freeze --resume-after-first-timeout`` never leaves the plugin frozen past
+#: this window whether or not a timed-out tick was logged.
+MIN_FIRST_TIMEOUT_WINDOW_SECONDS = 5
+MAX_FIRST_TIMEOUT_WINDOW_SECONDS = 600
 
 
 class ProbeError(RuntimeError):
@@ -418,6 +474,196 @@ def plugin_processes(pod_uid: str, binaries: list[str]) -> list[dict[str, Any]]:
 
 
 # --------------------------------------------------------------------------- #
+# Product generation and the host collector's own probe journal (read-only)
+# --------------------------------------------------------------------------- #
+def unit_properties(unit: str, names: list[str]) -> dict[str, str]:
+    completed = run(
+        ["systemctl", "show", unit, f"--property={','.join(names)}"], check=False
+    )
+    values: dict[str, str] = {}
+    for line in completed.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key in names:
+            values[key] = value
+    return values
+
+
+def exec_start_path(text: str) -> str | None:
+    """The executable of a ``systemctl show --property=ExecStart`` value."""
+
+    match = re.search(r"path=(\S+) ;", text or "")
+    return match.group(1) if match else None
+
+
+def installed_modules(venv: Path) -> dict[str, bool]:
+    """Which ``FEATURE_MODULES`` the venv's installed ``gpu_fault`` carries."""
+
+    return {
+        name: any(venv.glob(f"lib/python3*/site-packages/{relative}"))
+        for name, relative in FEATURE_MODULES.items()
+    }
+
+
+def device_plugin_environment(unit_environment: str) -> dict[str, str]:
+    """The unit's ``GPU_FAULT_DEVICE_PLUGIN_*`` settings (file, then unit)."""
+
+    values: dict[str, str] = {}
+    if COLLECTOR_ENV.is_file():
+        for line in COLLECTOR_ENV.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, value = stripped.split("=", 1)
+            if key.startswith(DEVICE_PLUGIN_ENV_PREFIX):
+                values[key] = value.strip().strip("'\"")
+    for token in (unit_environment or "").split():
+        key, separator, value = token.partition("=")
+        if separator and key.startswith(DEVICE_PLUGIN_ENV_PREFIX):
+            values[key] = value.strip("'\"")
+    return values
+
+
+def feature(arguments: argparse.Namespace) -> None:
+    """Which product generation this node's host collector is."""
+
+    checked_run_id(arguments.run_id)
+    properties = unit_properties(
+        HOST_COLLECTOR_UNIT, ["ExecStart", "Environment", "ActiveState"]
+    )
+    executable = exec_start_path(properties.get("ExecStart", ""))
+    venv = Path(executable).parent.parent if executable else AGENT_VENV
+    current = None
+    if AGENT_CURRENT.is_symlink():
+        current = os.readlink(AGENT_CURRENT)
+    modules = installed_modules(venv)
+    emit(
+        {
+            "unit": HOST_COLLECTOR_UNIT,
+            "active_state": properties.get("ActiveState"),
+            "exec_start_path": executable,
+            "venv": str(venv),
+            "venv_present": venv.is_dir(),
+            "current_release": current,
+            "modules": modules,
+            "liveness_probe": all(modules.values()),
+            "device_plugin_env": device_plugin_environment(
+                properties.get("Environment", "")
+            ),
+        }
+    )
+
+
+def collector_journal(since_epoch: float) -> list[dict[str, Any]]:
+    """The host collector's device-plugin probe lines since ``since_epoch``."""
+
+    completed = run(
+        [
+            "journalctl",
+            "-u",
+            HOST_COLLECTOR_UNIT,
+            "--since",
+            f"@{since_epoch:.6f}",
+            "--output=json",
+            "--no-pager",
+            "--quiet",
+        ],
+        check=False,
+        timeout=60,
+    )
+    entries: list[dict[str, Any]] = []
+    for line in completed.stdout.splitlines():
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        message = value.get("MESSAGE")
+        if isinstance(message, list):
+            message = bytes(item for item in message if isinstance(item, int)).decode(
+                errors="replace"
+            )
+        message = str(message or "")
+        timed_out = PROBE_LINE.search(message)
+        absent = DIRECTORY_ABSENT_LINE.search(message)
+        if timed_out is None and absent is None:
+            continue
+        try:
+            realtime = int(value.get("__REALTIME_TIMESTAMP") or 0) / 1_000_000
+        except (TypeError, ValueError):
+            realtime = 0.0
+        entry: dict[str, Any] = {
+            "realtime_epoch": realtime,
+            "message": message[:400],
+        }
+        if timed_out is not None:
+            entry.update(
+                {
+                    "kind": "timeout",
+                    "sockets": timed_out.group("sockets").split(","),
+                    "timeout_seconds": float(timed_out.group("timeout")),
+                    "consecutive": int(timed_out.group("count")),
+                    "required": int(timed_out.group("required")),
+                }
+            )
+        else:
+            entry.update(
+                {"kind": "directory_absent", "directory": absent.group("directory")}
+            )
+        entries.append(entry)
+        if len(entries) >= MAX_JOURNAL_ENTRIES:
+            break
+    return entries
+
+
+def probe_log(arguments: argparse.Namespace) -> None:
+    checked_run_id(arguments.run_id)
+    since = float(arguments.since_epoch)
+    if since <= 0:
+        raise ProbeError("--since-epoch must be a positive epoch time")
+    entries = collector_journal(since)
+    emit(
+        {
+            "since_epoch": since,
+            "read_at_epoch": time.time(),
+            "entries": entries,
+            "timeouts": [item for item in entries if item["kind"] == "timeout"],
+            "directory_absent": any(
+                item["kind"] == "directory_absent" for item in entries
+            ),
+        }
+    )
+
+
+def await_first_timeout(since_epoch: float, window_seconds: float) -> dict[str, Any]:
+    """Watch the host collector's journal until its first timed-out probe tick.
+
+    Returns as soon as a ``PROBE_LINE`` with any consecutive count is logged
+    after ``since_epoch`` (``first_timeout``), or at the end of the window with
+    ``first_timeout`` None. ``second_timeout_seen`` says whether a second
+    consecutive tick had already been logged -- then the finding may have
+    opened before the caller could resume.
+    """
+
+    deadline = time.monotonic() + max(0.0, window_seconds)
+    started = time.monotonic()
+    while True:
+        timeouts = [
+            item for item in collector_journal(since_epoch) if item["kind"] == "timeout"
+        ]
+        if timeouts or time.monotonic() >= deadline:
+            return {
+                "first_timeout": timeouts[0] if timeouts else None,
+                "second_timeout_seen": any(
+                    item["consecutive"] >= 2 for item in timeouts
+                ),
+                "timeouts": timeouts[:20],
+                "waited_seconds": round(time.monotonic() - started, 3),
+            }
+        time.sleep(JOURNAL_POLL_SECONDS)
+
+
+# --------------------------------------------------------------------------- #
 # freeze / resume
 # --------------------------------------------------------------------------- #
 def freeze(arguments: argparse.Namespace) -> None:
@@ -449,10 +695,22 @@ def freeze(arguments: argparse.Namespace) -> None:
                 "pod_processes": pod_cgroup_processes(pod_uid),
             },
         )
+    resume_on_first = bool(getattr(arguments, "resume_after_first_timeout", False))
+    window = (
+        bounded(
+            getattr(arguments, "window_seconds", None) or 0,
+            MIN_FIRST_TIMEOUT_WINDOW_SECONDS,
+            MAX_FIRST_TIMEOUT_WINDOW_SECONDS,
+            "window seconds",
+        )
+        if resume_on_first
+        else None
+    )
     state = load_state(run_id)
     # Arm the resume deadman before the first SIGSTOP: a crash after this leaves
     # a frozen plugin the deadman resumes on its own.
     deadman = arm_deadman(run_id, RESUME_KIND, seconds)
+    frozen_since = time.time()
     stopped = []
     for process in processes:
         state["paused_processes"][str(process["pid"])] = {
@@ -475,15 +733,45 @@ def freeze(arguments: argparse.Namespace) -> None:
                 "state": process_state(process["pid"], process["start_ticks"]),
             }
         )
-    emit(
-        {
-            "run_id": run_id,
-            "pod_uid": pod_uid,
-            "frozen": stopped,
-            "deadman": deadman,
-            "resume_after_seconds": seconds,
-        }
-    )
+    receipt: dict[str, Any] = {
+        "run_id": run_id,
+        "pod_uid": pod_uid,
+        "frozen": stopped,
+        "frozen_since_epoch": frozen_since,
+        "deadman": deadman,
+        "resume_after_seconds": seconds,
+    }
+    if window is not None and all(item["stopped"] for item in stopped):
+        # The one_sample window: SIGCONT the instant the host collector logs
+        # its first timed-out tick, before the second tick can confirm the
+        # finding; never past the window either way.
+        watch = await_first_timeout(frozen_since, window)
+        resumed = resume_processes(run_id)
+        disarm_deadman(run_id, RESUME_KIND)
+        resumed_at = time.time()
+        first = watch["first_timeout"]
+        receipt.update(
+            {
+                "window_seconds": window,
+                "first_timeout": first,
+                "second_timeout_seen": watch["second_timeout_seen"],
+                "timeouts": watch["timeouts"],
+                "waited_seconds": watch["waited_seconds"],
+                "resumed": resumed,
+                "resumed_at_epoch": resumed_at,
+                "resume_latency_seconds": (
+                    round(resumed_at - first["realtime_epoch"], 3)
+                    if first and first["realtime_epoch"]
+                    else None
+                ),
+            }
+        )
+    elif window is not None:
+        # A task that never reached the stopped state is not a hang; leave
+        # nothing paused behind the receipt the fixture is about to refuse.
+        receipt["resumed"] = resume_processes(run_id)
+        disarm_deadman(run_id, RESUME_KIND)
+    emit(receipt)
 
 
 def resume_processes(run_id: str) -> list[dict[str, Any]]:
@@ -572,11 +860,16 @@ def parser() -> argparse.ArgumentParser:
 
     command("survey", survey)
     command("residue", show_residue)
+    command("feature", feature)
+    item = command("probe-log", probe_log)
+    item.add_argument("--since-epoch", type=float, required=True)
     item = command("freeze", freeze)
     item.add_argument("--pod-uid", required=True)
     item.add_argument("--binary", action="append", default=[], required=True)
     item.add_argument("--pod-command-binary", action="append", default=[])
     item.add_argument("--seconds", type=int, required=True)
+    item.add_argument("--resume-after-first-timeout", action="store_true")
+    item.add_argument("--window-seconds", type=int, default=0)
     command("resume", resume)
     item = command("cleanup", cleanup)
     item.add_argument("--kind", default="all")
@@ -597,6 +890,8 @@ HELPER_FRAMES = frozenset(
         "checked_pod_binaries",
         "load_state",
         "save_state",
+        "unit_properties",
+        "collector_journal",
     }
 )
 

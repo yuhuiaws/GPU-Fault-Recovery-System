@@ -380,3 +380,332 @@ def test_checked_pod_binaries_shape() -> None:
     assert probe.checked_pod_binaries(
         ["efa-real", "has space", "x" * 65, "ok_1.2"]
     ) == ["efa-real", "ok_1.2"]
+
+
+# --------------------------------------------------------------------------- #
+# product generation (``feature``) and the host collector's probe journal
+# --------------------------------------------------------------------------- #
+EXEC_START = (
+    "{ path=/opt/gpu-fault/current/venv/bin/gpu-fault-collector ; "
+    "argv[]=/opt/gpu-fault/current/venv/bin/gpu-fault-collector host ; "
+    "ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; "
+    "code=(null) ; status=0/0 }"
+)
+TIMEOUT_LINE = (
+    "2026-10-27 10:00:05,123 WARNING gpu_fault.collectors.host.device_plugin device "
+    "plugin nvidia-gpu.sock did not answer GetDevicePluginOptions within 5s "
+    "(1 consecutive; finding after 2): nvidia-gpu.sock: no bytes from the plugin "
+    "within 5s"
+)
+
+
+def _journal(*messages: tuple[int, str]) -> str:
+    import json
+
+    return "\n".join(
+        json.dumps({"__REALTIME_TIMESTAMP": str(stamp), "MESSAGE": message})
+        for stamp, message in messages
+    )
+
+
+def _venv(tmp_path: Path, *, modules: bool) -> Path:
+    venv = tmp_path / "venv"
+    site = venv / "lib" / "python3.12" / "site-packages" / "gpu_fault"
+    (site / "collectors" / "host").mkdir(parents=True)
+    (site / "collectors" / "host" / "collector.py").write_text("", encoding="utf-8")
+    if modules:
+        for relative in probe.FEATURE_MODULES.values():
+            path = venv / "lib" / "python3.12" / "site-packages" / relative
+            path.write_text("", encoding="utf-8")
+    return venv
+
+
+def test_exec_start_path_reads_the_unit_executable() -> None:
+    assert (
+        probe.exec_start_path(EXEC_START)
+        == "/opt/gpu-fault/current/venv/bin/gpu-fault-collector"
+    )
+    assert probe.exec_start_path("") is None
+
+
+def test_installed_modules_reports_each_probe_module(tmp_path: Path) -> None:
+    assert probe.installed_modules(_venv(tmp_path, modules=True)) == {
+        name: True for name in probe.FEATURE_MODULES
+    }
+    assert probe.installed_modules(_venv(tmp_path / "old", modules=False)) == {
+        name: False for name in probe.FEATURE_MODULES
+    }
+
+
+def _feature_run(venv: Path, environment: str = "") -> Any:
+    def fake_run(command: list[str], *, check: bool = True, timeout: int = 120):
+        import subprocess
+
+        assert command[:2] == ["systemctl", "show"], command
+        exec_start = EXEC_START.replace("/opt/gpu-fault/current/venv", str(venv))
+        stdout = (
+            f"ExecStart={exec_start}\nEnvironment={environment}\nActiveState=active\n"
+        )
+        return subprocess.CompletedProcess(command, 0, stdout, "")
+
+    return fake_run
+
+
+def test_feature_names_the_liveness_generation_from_the_unit_venv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    venv = _venv(tmp_path, modules=True)
+    monkeypatch.setattr(
+        probe, "run", _feature_run(venv, "GPU_FAULT_HOST_INTERVAL_SECONDS=15")
+    )
+    monkeypatch.setattr(probe, "AGENT_CURRENT", tmp_path / "no-such-link")
+    env_file = tmp_path / "collector.env"
+    env_file.write_text(
+        "GPU_FAULT_FILESYSTEMS=/\nGPU_FAULT_DEVICE_PLUGIN_SOCKET_DIR=''\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(probe, "COLLECTOR_ENV", env_file)
+    probe.feature(_args(run_id=RUN))
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["liveness_probe"] is True
+    assert payload["venv"] == str(venv)
+    assert payload["exec_start_path"] == f"{venv}/bin/gpu-fault-collector"
+    assert payload["device_plugin_env"] == {"GPU_FAULT_DEVICE_PLUGIN_SOCKET_DIR": ""}
+    assert payload["active_state"] == "active"
+
+
+def test_feature_reports_the_earlier_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    venv = _venv(tmp_path, modules=False)
+    monkeypatch.setattr(probe, "run", _feature_run(venv))
+    monkeypatch.setattr(probe, "AGENT_CURRENT", tmp_path / "no-such-link")
+    monkeypatch.setattr(probe, "COLLECTOR_ENV", tmp_path / "absent.env")
+    probe.feature(_args(run_id=RUN))
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["liveness_probe"] is False
+    assert payload["modules"] == {name: False for name in probe.FEATURE_MODULES}
+    assert payload["device_plugin_env"] == {}
+
+
+def test_collector_journal_parses_timeout_and_absent_lines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess
+
+    def fake_run(command: list[str], *, check: bool = True, timeout: int = 120):
+        assert command[:3] == ["journalctl", "-u", probe.HOST_COLLECTOR_UNIT], command
+        assert command[3:5] == ["--since", "@1700000000.000000"], command
+        stdout = _journal(
+            (1700000001000000, "host collector started"),
+            (1700000005123000, TIMEOUT_LINE),
+            (
+                1700000006000000,
+                "INFO gpu_fault.collectors.host.device_plugin device plugin socket "
+                "directory /var/lib/kubelet/device-plugins is absent; the device "
+                "plugin liveness probe is not running on this node",
+            ),
+        )
+        return subprocess.CompletedProcess(command, 0, stdout + "\nnot json", "")
+
+    monkeypatch.setattr(probe, "run", fake_run)
+    entries = probe.collector_journal(1700000000.0)
+    assert [item["kind"] for item in entries] == ["timeout", "directory_absent"]
+    first = entries[0]
+    assert first["sockets"] == ["nvidia-gpu.sock"]
+    assert first["consecutive"] == 1 and first["required"] == 2
+    assert first["timeout_seconds"] == 5.0
+    assert first["realtime_epoch"] == pytest.approx(1700000005.123)
+    assert entries[1]["directory"] == "/var/lib/kubelet/device-plugins"
+
+
+def test_await_first_timeout_returns_on_the_first_logged_tick(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reads = iter(
+        [
+            [],
+            [
+                {
+                    "kind": "timeout",
+                    "consecutive": 1,
+                    "required": 2,
+                    "realtime_epoch": 1700000005.1,
+                    "sockets": ["nvidia-gpu.sock"],
+                }
+            ],
+        ]
+    )
+    monkeypatch.setattr(probe, "collector_journal", lambda since: next(reads, []))
+    monkeypatch.setattr(probe.time, "sleep", lambda _s: None)
+    watch = probe.await_first_timeout(1700000000.0, 30)
+    assert watch["first_timeout"]["consecutive"] == 1
+    assert watch["second_timeout_seen"] is False
+
+
+def test_await_first_timeout_gives_up_at_the_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(probe, "collector_journal", lambda since: [])
+    monkeypatch.setattr(probe.time, "sleep", lambda _s: None)
+    clock = iter(float(index) for index in range(0, 1000))
+    monkeypatch.setattr(probe.time, "monotonic", lambda: next(clock))
+    watch = probe.await_first_timeout(1700000000.0, 5)
+    assert watch["first_timeout"] is None
+    assert watch["second_timeout_seen"] is False
+
+
+def _frozen_plugin(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        probe,
+        "plugin_processes",
+        lambda pod_uid, binaries: [
+            {
+                "pid": 4242,
+                "start_ticks": "100",
+                "binary": "nvidia-device-plugin",
+                "argv": ["nvidia-device-plugin"],
+            }
+        ],
+    )
+    monkeypatch.setattr(probe, "process_state", lambda pid, ticks: "T")
+    monkeypatch.setattr(probe.time, "sleep", lambda _s: None)
+
+
+def test_freeze_resumes_the_instant_the_first_timeout_is_logged(
+    host: FakeRun, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    _frozen_plugin(monkeypatch)
+    entry = {
+        "kind": "timeout",
+        "consecutive": 1,
+        "required": 2,
+        "realtime_epoch": 1700000005.1,
+        "sockets": ["nvidia-gpu.sock"],
+        "message": TIMEOUT_LINE,
+    }
+    reads = iter([[], [entry]])
+    monkeypatch.setattr(probe, "collector_journal", lambda since: next(reads, [entry]))
+    probe.freeze(
+        _args(
+            run_id=RUN,
+            pod_uid=POD,
+            binary=["nvidia-device-plugin"],
+            pod_command_binary=[],
+            seconds=300,
+            resume_after_first_timeout=True,
+            window_seconds=40,
+        )
+    )
+    assert host.kills == [(4242, probe.signal.SIGSTOP), (4242, probe.signal.SIGCONT)]
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["first_timeout"]["consecutive"] == 1
+    assert payload["second_timeout_seen"] is False
+    assert payload["window_seconds"] == 40
+    assert payload["resumed"][0]["resumed"] is True
+    assert payload["frozen_since_epoch"] > 0
+    assert probe.residue_is_clean(probe.residue(RUN)), "nothing stays paused"
+    assert not host.timer_active, "the resume deadman is disarmed with the resume"
+
+
+def test_freeze_resumes_at_the_window_without_a_logged_tick(
+    host: FakeRun, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    _frozen_plugin(monkeypatch)
+    monkeypatch.setattr(probe, "collector_journal", lambda since: [])
+    clock = iter(float(index) for index in range(0, 100000))
+    monkeypatch.setattr(probe.time, "monotonic", lambda: next(clock))
+    probe.freeze(
+        _args(
+            run_id=RUN,
+            pod_uid=POD,
+            binary=["nvidia-device-plugin"],
+            pod_command_binary=[],
+            seconds=300,
+            resume_after_first_timeout=True,
+            window_seconds=5,
+        )
+    )
+    assert (4242, probe.signal.SIGCONT) in host.kills
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["first_timeout"] is None
+    assert payload["resume_latency_seconds"] is None
+    assert probe.residue_is_clean(probe.residue(RUN)), "the window always resumes"
+
+
+def test_freeze_window_is_bounded(
+    host: FakeRun, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _frozen_plugin(monkeypatch)
+    with pytest.raises(probe.ProbeError, match="window seconds"):
+        probe.freeze(
+            _args(
+                run_id=RUN,
+                pod_uid=POD,
+                binary=["nvidia-device-plugin"],
+                pod_command_binary=[],
+                seconds=300,
+                resume_after_first_timeout=True,
+                window_seconds=0,
+            )
+        )
+    assert host.kills == [], "a refused window signals nothing"
+
+
+def test_probe_log_requires_a_positive_since(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(probe, "collector_journal", lambda since: [])
+    with pytest.raises(probe.ProbeError, match="since-epoch"):
+        probe.probe_log(_args(run_id=RUN, since_epoch=0.0))
+
+
+def test_probe_log_emits_timeouts_and_absence(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    monkeypatch.setattr(
+        probe,
+        "collector_journal",
+        lambda since: [
+            {"kind": "timeout", "consecutive": 1, "required": 2, "realtime_epoch": 1.0},
+            {"kind": "directory_absent", "directory": "/x", "realtime_epoch": 2.0},
+        ],
+    )
+    probe.probe_log(_args(run_id=RUN, since_epoch=1700000000.0))
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert len(payload["timeouts"]) == 1
+    assert payload["directory_absent"] is True
+    assert payload["since_epoch"] == 1700000000.0
+
+
+def test_parser_knows_the_read_only_companions() -> None:
+    parser = probe.parser()
+    feature = parser.parse_args(["feature", "--run-id", RUN])
+    assert feature.handler is probe.feature
+    log = parser.parse_args(["probe-log", "--run-id", RUN, "--since-epoch", "17.5"])
+    assert log.handler is probe.probe_log and log.since_epoch == 17.5
+    frozen = parser.parse_args(
+        [
+            "freeze",
+            "--run-id",
+            RUN,
+            "--pod-uid",
+            POD,
+            "--binary",
+            "nvidia-device-plugin",
+            "--seconds",
+            "300",
+            "--resume-after-first-timeout",
+            "--window-seconds",
+            "40",
+        ]
+    )
+    assert frozen.resume_after_first_timeout is True and frozen.window_seconds == 40

@@ -2384,10 +2384,11 @@ back to PASS.
 ## GF-GENERAL-LIVE-014 Kubernetes allocatable (native device-plugin freeze)
 
 The five native 014 variants (`gpu_plugin`, `efa_plugin`, `one_sample`,
-`replacement_uid`, `validation_failure`) are implemented in
+`replacement_uid`, `validation_failure`) live in
 `scripts/e2e/regional/general_live_device_plugin.py` with the probe
 `probes/general_live_device_plugin_probe.py` and the `DEVICE_PLUGIN_RESTART`
-approval. The spec forbids patching `Node.status` or faking allocatable, and the
+approval; four execute, `validation_failure` is `NOT_RUN(CAPABILITY_ABSENT)`
+(below). The spec forbids patching `Node.status` or faking allocatable, and the
 COLLECT-017 B/C fixture excludes the DaemonSet by affinity and restores it
 *before* the product acts (so the product takes the `already_healthy` branch and
 never deletes a Pod); neither reaches the product's own pod-delete/re-register
@@ -2398,47 +2399,131 @@ basenames read from the discovered Pod spec, since the HyperPod EFA plugin's
 process basename is none of the static names), deadman-backed with SIGCONT. The
 probe confirms the task actually reached the kernel stopped state (`T`) before
 it returns -- `os.kill` only queues SIGSTOP, so a read on the next line races
-the transition and can report `stopped:false` for a process that did freeze;
-a freeze the probe cannot confirm stopped is refused immediately with that
-reason, never waited out. A stopped plugin stops answering kubelet's
-`ListAndWatch`; whether that drops allocatable depends on kubelet breaking the
-stream, which a SIGSTOP'd-but-socket-connected plugin does not force, so a
-confirmed-stopped plugin that keeps its devices advertised is `INCONCLUSIVE`
-(the product's own allocatable-mismatch detector keys on the same reading and
-likewise sees no shortfall), not a product fault. When allocatable does drop,
-the product must delete and replace the Pod itself. `gpu_plugin`/`efa_plugin`
-grade the full `RESTART_*_DEVICE_PLUGIN` +
-`TRIGGER_HEALTH_SNAPSHOT` + `VALIDATE_{GPU,FABRIC}` chain SUCCEEDED, a new Ready
-`replacement_pod_uids` different from the deleted Pod, allocatable back to
-baseline, incident RECOVERED and no reboot; `one_sample` resumes the plugin after
-one mismatch sample to prove the `required_consecutive_samples=2` rule leaves no
-finding; `replacement_uid` grades the new UID is recorded, differs from the
-deleted one and is not re-deleted; `validation_failure` keeps the registration
-broken across the replacement (re-freezing each new Pod) so the restart's own
-allocatable snapshot never confirms, the step fails at `restart_timeout_seconds`
-and -- tagged `failure_escalation_action=REBOOT_NODE` by
-`orchestration/families/health._resource_escalation` -- escalates to
-`RESTART_NODE` under the separate `NODE_REBOOT` authorization (flag `X`). The
-effectiveness oracle is the raw kubelet allocatable reading: a confirmed-stopped
-freeze that does not reduce it is `INCONCLUSIVE`, not a pass. Cleanup resumes any still-frozen
-process and proves allocatable back to baseline with exactly one plugin Pod on
-the node. Observed product gap: the final `RESTART_*_DEVICE_PLUGIN` step receipt
-persists only `replacement_pod_uids`; the deleted Pod's `deleted_pod_uid` lives
-only in the transient delete-attempt receipt
-(`node_operations._restart_device_plugin_node`'s terminal branch drops it and it
-is not in `step_bounds.ATTEMPT_DETAIL_KEYS`), so the runner grades the deleted
-UID from the live-captured receipt when caught and otherwise from the Pod census
-(the original Pod gone, a new Ready Pod present). `expected_unknown` /
-`mig_timeslicing` (CAPABILITY_ABSENT) and `running_training` (FIXTURE_NOT_READY,
-a managed scale attempt, lane N) stay `NOT_RUN` in the denominator. All five
-native variants are registered on both lanes: nothing in the freeze is
-provider-specific (the plugin Pods are found by their kubelet device-plugin
-socket mount, the EFA plugin's DaemonSet name comes from the node's provider,
-the SIGSTOP targets the plugin container's own process, and the product's
-restart/escalation runs on both providers), HyperPod's health-monitoring agent
-watches GPU/EFA hardware rather than the plugin registration, and the lane
-preflight requires `NodeRecovery=None` there; the EKS-first order of the first
-live runs was sequencing, not a constraint.
+the transition and can report `stopped:false` for a process that did freeze; a
+freeze the probe cannot confirm stopped is refused immediately with that reason,
+never waited out.
+
+What the freeze does and does not break (live result, HyperPod, lane S45, and
+kubelet as written). The harness first assumed kubelet would de-register the
+resource and allocatable would decay while the Pod stays `Running`; it does not:
+the `gpu_plugin` freeze left `nvidia.com/gpu` at 8 for about four frozen
+minutes, so the allocatable oracle returned `INCONCLUSIVE`. kubelet's device
+manager dials the plugin without keepalive and runs `ListAndWatch` under
+`context.Background()`, blocking in `stream.Recv()` until an error
+(`pkg/kubelet/cm/devicemanager/plugin/v1beta1/client.go`, `dial`/`Run`); only
+an error ends the client and reaches `PluginDisconnected` →
+`markResourceUnhealthy` (`manager.go`), and capacity/allocatable disappear only
+after `endpointStopGracePeriod` (5 min, `types.go`). A stopped process keeps the
+socket open and the kernel keeps the connection, so nothing ever errors. What a
+frozen plugin does break is admission: `endpoint.allocate` calls the plugin's
+`Allocate` with `context.Background()` (`endpoint.go`; `GetPreferredAllocation`
+likewise, `PreStartContainer` alone has 30 s), reached from topology manager
+`admitPolicyNone` → device manager `Allocate` on the kubelet sync loop
+(`kubelet.go` `syncLoopIteration` → `HandlePodAdditions` → `canAdmitPod`), so the
+first Pod that asks for the resource wedges the whole sync loop: no
+`UnexpectedAdmissionError` event (that reason is produced only when `Allocate`
+*returns* an error), the Pod stays Pending, the node stays Ready, and kubelet's
+`/healthz` `syncloop` check fails only after 5 min. The product (R13h) detects
+the hang from the node: the host collector probes each plugin socket with a
+bounded `GetDevicePluginOptions` (`collectors/host/device_plugin.py`,
+`device_plugin_probe.py`) and raises `gpu_device_plugin_unresponsive` /
+`efa_device_plugin_unresponsive` after two consecutive timed-out ticks; the
+planner stamps the `RESTART_*_DEVICE_PLUGIN` step `plugin_unresponsive=true` so
+it deletes the Pod although allocatable is full (receipt
+`restart_reason=DEVICE_PLUGIN_UNRESPONSIVE`) and confirms only a Ready Pod of
+another UID with the full allocatable (`already_healthy=false`).
+
+The variants assert that probe path (lane S47); the effectiveness oracle is the
+probe sample, not kubelet's advertisement, and S45's "frozen but connected"
+`INCONCLUSIVE` is retired for the product that has the probe. Before the freeze
+the fixture decides which product it faces (`ProductGeneration`, evidence
+`product-generation.json`): the probe's read-only `feature` reports whether the
+node's host-collector venv (the unit's `ExecStart` path, default
+`/opt/gpu-fault/current/venv`) carries `collectors/host/device_plugin.py`,
+`device_plugin_probe.py` and `device_plugin_liveness.py`, plus the unit's
+`GPU_FAULT_DEVICE_PLUGIN_*` settings; an API Pod answers whether the control
+plane's `NodeHealthPolicy.METRIC_RULES` grades the family's
+`*_device_plugin_unresponsive` metric. The installed package is the signal
+rather than the node's latest-metric set because the liveness metric is not in
+`LATEST_METRICS_REQUIRED` and a healthy tick's value-0 sample travels only in
+health-summary batches, which are graded but kept as no raw evidence. A node
+that probes under a control plane without the rule, or a node whose unit sets
+`GPU_FAULT_DEVICE_PLUGIN_SOCKET_DIR` empty, is `INCONCLUSIVE` before anything is
+frozen. Against the liveness-probe product `gpu_plugin`/`efa_plugin` assert, in
+stages: `detected` -- within two host ticks (each stretched by the 5 s probe
+timeout) plus the timeout plus 60 s of ingest, a `*_device_plugin_unresponsive`
+= 1 sample with `probe_state=TIMEOUT`, `transport_answered=false` (a stopped
+process sends no HTTP/2 frame), `failure_mode=DEVICE_PLUGIN_UNRESPONSIVE` and
+the frozen plugin's socket (`nvidia-gpu.sock` / `aws-efa-device-plugin.sock`,
+verified live on both clusters) in `sockets`; `restart_chain` -- that metric's
+incident runs `RESTART_*_DEVICE_PLUGIN` → `TRIGGER_HEALTH_SNAPSHOT` →
+`VALIDATE_{GPU,FABRIC}` all SUCCEEDED and ends RECOVERED; `deleted_original` --
+`deleted_pod_uid` is the frozen Pod (or, without any receipt, the census shows
+it gone) and, when the delete pass's own receipt was caught,
+`restart_reason=DEVICE_PLUGIN_UNRESPONSIVE` (the executor replaces the step
+record on every pass, so a 5 s poll can miss that pass; the result then carries
+a note, and the later passes' `deleted_pod_uid`, which
+`node_operations.deleted_plugin_pod_receipt` carries forward, proves the
+delete); `replacement_ready` -- `replacement_pod_uids` names another UID, the
+one Ready plugin Pod on the node is it, and the SUCCEEDED receipt says
+`already_healthy=false` (a restart that read the full allocatable as healthy and
+deleted nothing FAILs here); `allocatable_full_while_frozen` -- every raw kubelet
+reading the runner took between the freeze and the product's finding equals the
+baseline (a drop would mean the hung-but-connected premise did not hold on that
+node, and is reported as such); `allocatable_restored`, `no_reboot`,
+`not_isolated`; `replacement_uid` adds `no_redelete`. The result records the
+detection latency, the readings while frozen and the host collector's own probe
+journal (`probe-log`: one WARNING per timed-out tick). `one_sample` is decided
+on the node: `freeze --resume-after-first-timeout --window-seconds <tick + 5 s +
+20 s>` tails `gpu-fault-host-collector.service`'s journal after the SIGSTOP and
+SIGCONTs the plugin the instant the first timed-out tick is logged (`(1
+consecutive; finding after 2)`), well under a second later -- a control-plane
+round trip could not win that window, because the first tick's value-0 sample
+never reaches the store as evidence and the second tick follows one interval
+later; the variant then watches two ticks plus 60 s and asserts no
+`*_device_plugin_unresponsive` = 1 sample, no finding, no
+`RESTART_GPU_DEVICE_PLUGIN`, no isolation, with the journal showing exactly one
+timed-out tick. No logged tick within the window, a second tick logged before
+the resume, or a journal with two ticks is `INCONCLUSIVE` (the window was not
+achieved), not FAIL. Against the earlier product (no probe modules on the node)
+the freeze is confirmed, allocatable is watched for eight ticks plus 120 s, and
+when it does not drop the variant is `INCONCLUSIVE` with the kubelet mechanism
+and the generation cited -- a product that lacks the feature by design is not
+FAILed; if allocatable did drop, the allocatable-mismatch chain is graded as
+before (`one_sample` has no allocatable-rule window any more and is
+`INCONCLUSIVE` either way). Before R13h is deployed the live checkout carrying
+this harness therefore records the four executable variants `INCONCLUSIVE` with
+that reason; the rerun after the R13h deploy grades the probe path.
+
+`validation_failure` is `NOT_RUN(CAPABILITY_ABSENT)` on both products, with the
+mechanism in its reason. Its former definition (re-freeze every replacement so
+the restart's allocatable snapshot never confirms) has no kubelet-level
+mechanism left: a re-frozen replacement is Ready with the full allocatable, so
+R13h's restart confirms it and the next probe tick opens a *new* finding instead
+of failing this chain. The step's real failure path for a hang is a kubelet
+already blocked in the frozen plugin's `Allocate`, which neither kills the frozen
+container nor starts the replacement, so the step FAILs at
+`restart_timeout_seconds` and escalates to `RESTART_NODE` under
+`failure_escalation_action=REBOOT_NODE`; producing it means admitting a Pod that
+requests the resource onto the node while the plugin is frozen, which wedges
+kubelet's sync loop for every Pod on that node until the product's reboot -- not
+something the harness may do to a live shared node. A replacement that never
+becomes Ready cannot be made with a SIGSTOP (the plugin DaemonSets carry no
+readiness probe, so a Pod is Ready as soon as its container runs), and excluding
+the DaemonSet is COLLECT-017's path on a cluster-wide object the other lane
+shares. The reboot escalation stays covered by the product's own unit tests of the
+restart step and of the planner's `plugin_unresponsive` stamp (R13h).
+
+Cleanup resumes any still-frozen process and proves allocatable at the baseline
+with exactly one plugin Pod on the node. `expected_unknown` / `mig_timeslicing`
+(CAPABILITY_ABSENT) and `running_training` (COVERED_BY_REGIONAL) stay `NOT_RUN`
+in the denominator. All variants are registered on both lanes: nothing in the
+freeze is provider-specific (the plugin Pods are found by their kubelet
+device-plugin socket mount, the EFA plugin's DaemonSet name comes from the
+node's provider, the SIGSTOP targets the plugin container's own process, and the
+product's probe and restart run on both providers), HyperPod's
+health-monitoring agent watches GPU/EFA hardware rather than the plugin, and
+the lane preflight requires `NodeRecovery=None` there.
 
 ## GF-GENERAL-LIVE live acceptance runner (phase 2, lane K)
 

@@ -589,26 +589,75 @@ plugin Pod UID 且基名在允许清单内的进程，deadman 用 SIGCONT 兜底
 取该 plugin 容器自身的 command/image 基名一并下发；找不到允许进程时拒绝会记录该 Pod 内实际
 存在的进程（写入 `probe-error.json`）。探针在返回前确认任务确已进入内核停止态（`T`）——
 `os.kill` 只是投递 SIGSTOP，紧随其后的 `/proc` 读会与状态切换竞争而把真正冻结的进程记成
-`stopped:false`；无法确认停止的冻结立即判 INCONCLUSIVE 并带出原因，绝不空等。冻结后 plugin 不再
-应答 kubelet 的 `ListAndWatch`，但 allocatable 是否下降取决于 kubelet 是否因此断流——被
-SIGSTOP 但 socket 仍连通的 plugin 不会迫使断流，故确认已停止却仍在广告设备的情形判
-INCONCLUSIVE（产品自身的 allocatable 失配探测读的是同一数值，同样看不到缺额），不是产品故障；
-确有下降时由产品自己删除并替换 Pod。`gpu_plugin`/`efa_plugin` 判 `RESTART_*_DEVICE_PLUGIN` +
-`TRIGGER_HEALTH_SNAPSHOT` + `VALIDATE_{GPU,FABRIC}` 均 SUCCEEDED、`replacement_pod_uids`
-为新 Ready Pod、allocatable 回基线、incident RECOVERED、无 reboot；`one_sample` 在产品记录
-一次失配后立即 SIGCONT，验证两次确认规则不成 finding/不动作；`replacement_uid` 验证新 UID
-被记录、异于被删 UID 且不被二次删除；`validation_failure` 跨替换持续冻结使重启的 allocatable
-快照不达标，`RESTART_*_DEVICE_PLUGIN` 失败并经 `failure_escalation_action=REBOOT_NODE`
-升级到 `RESTART_NODE`（单独 `NODE_REBOOT` 审批，X 标志）。观察到的产品不足：最终步骤回执只
-持久化 `replacement_pod_uids`，被删 Pod 的 `deleted_pod_uid` 只在删除那次尝试的瞬时回执里
-（`node_operations._restart_device_plugin_node` 终态分支不再带它），故原 UID 需实时抓取或由
-Pod 普查（原 Pod 已消失 + 新 Ready Pod）佐证。`expected_unknown`/`mig_timeslicing`
-（CAPABILITY_ABSENT）与 `running_training`（FIXTURE_NOT_READY，lane N）保持 NOT_RUN。
-五个 native 变体（含 `one_sample`/`replacement_uid`/`validation_failure`）在两条车道均注册：
-冻结过程没有 provider 特有之处（plugin Pod 以 kubelet device-plugin socket 挂载识别、EFA
-plugin 的 DaemonSet 名由节点 provider 决定、SIGSTOP 只对 plugin 容器自身进程、产品的重启/升级
-链两种 provider 相同），HyperPod 的健康监控代理只看 GPU/EFA 硬件而不看 plugin 注册，且车道
-预检已要求 `NodeRecovery=None`；此前“EKS 先跑”只是排期，不是约束。
+`stopped:false`；无法确认停止的冻结立即判 INCONCLUSIVE 并带出原因，绝不空等。
+
+冻结破坏的是什么（HyperPod 现场，S45 车道；kubelet 源码亦如此）：kubelet **不会**察觉——它到
+插件的 `ListAndWatch` 流没有 deadline 也没有 keepalive（`pkg/kubelet/cm/devicemanager/
+plugin/v1beta1/client.go`），被 SIGSTOP 的进程仍持有 socket，流永不出错，Pod 保持 Running、
+allocatable 保持满额（`gpu_plugin` 冻结四分钟，`nvidia.com/gpu` 始终 8；夹具此前"kubelet 会
+注销资源、allocatable 衰减"的假设是错的）。被破坏的是准入：新 Pod 的 `Allocate` RPC 走
+`context.Background()` 无超时，会把 kubelet 的 sync loop 整体阻塞。产品自 R13h 起由节点侧
+发现这种挂起：host collector 每 tick 对每个插件 socket 发有界的 `GetDevicePluginOptions`
+（`collectors/host/device_plugin.py`、`device_plugin_probe.py`），连续两个超时 tick 置
+`gpu_device_plugin_unresponsive` / `efa_device_plugin_unresponsive` = 1；planner 给
+`RESTART_*_DEVICE_PLUGIN` 打上 `plugin_unresponsive=true`，使重启在 allocatable 满额时仍删除
+Pod（回执 `restart_reason=DEVICE_PLUGIN_UNRESPONSIVE`），且只有另一 UID 的 Ready Pod 加满额
+allocatable 才算确认（`already_healthy=false`）。
+
+因此判定以探针样本为效果 oracle，不再以 allocatable 下降为准（S47 车道；S45 的"已冻结但仍连通"
+INCONCLUSIVE 对具备探针的产品退役）。冻结前先判断面对的是哪一代产品（`ProductGeneration`，
+证据 `product-generation.json`）：探针只读子命令 `feature` 读 host collector 单元 `ExecStart`
+所在 venv（缺省 `/opt/gpu-fault/current/venv`）里是否装有 `collectors/host/device_plugin.py`、
+`device_plugin_probe.py`、`device_plugin_liveness.py`，并带出单元的 `GPU_FAULT_DEVICE_PLUGIN_*`
+设置；控制面在 API Pod 内回答 `NodeHealthPolicy.METRIC_RULES` 是否含该族的
+`*_device_plugin_unresponsive` 规则。以安装包而非节点 latest 指标集为信号，是因为该指标不在
+`LATEST_METRICS_REQUIRED` 内，健康 tick 的 0 值样本只随 health summary 投递且不落为原始证据。
+节点有探针而控制面无规则、或单元把 `GPU_FAULT_DEVICE_PLUGIN_SOCKET_DIR` 置空，都在冻结前判
+INCONCLUSIVE。面对带探针的产品，`gpu_plugin`/`efa_plugin` 分阶段判：`detected`——两个 host tick
+（各含 5 s 探针超时）+ 超时 + 60 s 入库裕量内出现 `*_device_plugin_unresponsive`=1 样本，
+`probe_state=TIMEOUT`、`transport_answered=false`（被停进程不发任何 HTTP/2 帧）、
+`failure_mode=DEVICE_PLUGIN_UNRESPONSIVE`，`sockets` 含被冻结插件的 socket（`nvidia-gpu.sock` /
+`aws-efa-device-plugin.sock`，两集群现场核实）；`restart_chain`——该指标的 incident 走
+`RESTART_*_DEVICE_PLUGIN` → `TRIGGER_HEALTH_SNAPSHOT` → `VALIDATE_{GPU,FABRIC}` 全部 SUCCEEDED、
+终态 RECOVERED；`deleted_original`——`deleted_pod_uid` 即被冻结 Pod（无任何回执时以普查证明其
+消失），且当删除那一遍的回执被抓到时须带 `restart_reason=DEVICE_PLUGIN_UNRESPONSIVE`（executor
+每遍替换步骤记录，5 s 轮询可能错过该遍；错过则记 note，由后续各遍带着的 `deleted_pod_uid`——
+`node_operations.deleted_plugin_pod_receipt` 向前携带——证明删除）；`replacement_ready`——
+`replacement_pod_uids` 为另一 UID、节点上唯一 Ready 插件 Pod 即它、SUCCEEDED 回执
+`already_healthy=false`（把满额 allocatable 当健康而未删 Pod 的重启在此判错）；
+`allocatable_full_while_frozen`——冻结到产品出 finding 之间运行器读到的每个 kubelet allocatable
+都等于基线（下降意味着"挂起但仍连通"的前提在该节点不成立，按此报出）；`allocatable_restored`、
+`no_reboot`、`not_isolated`；`replacement_uid` 另加 `no_redelete`。结果记录检出时延、冻结期读数
+与 host collector 自己的探针日志（`probe-log`：每个超时 tick 一行 WARNING）。`one_sample` 在
+节点上决断：`freeze --resume-after-first-timeout --window-seconds <tick + 5 s + 20 s>` 在 SIGSTOP
+后尾随 `gpu-fault-host-collector.service` 的 journal，看到第一个超时 tick 的日志行
+（`(1 consecutive; finding after 2)`）即刻 SIGCONT（亚秒级）——经控制面往返赢不了这个窗口：第一个
+tick 的 0 值样本不会作为证据入库，而第二个 tick 只隔一个周期；随后观察两个 tick + 60 s，判无
+`*_device_plugin_unresponsive`=1 样本、无 finding、无 `RESTART_GPU_DEVICE_PLUGIN`、无隔离，且
+journal 恰有一个超时 tick。窗口内没有日志行、恢复前已记第二个 tick、或 journal 有两个 tick 都判
+INCONCLUSIVE（窗口未达成），不是 FAIL。面对不带探针的早期产品（节点上无探针模块）：确认冻结后观察
+allocatable 八个 tick + 120 s，未下降即 INCONCLUSIVE 并带出 kubelet 机制与产品代际——按设计没有
+该能力的产品不判 FAIL；若 allocatable 确有下降，仍按 allocatable 失配链判定（`one_sample` 不再有
+allocatable 规则的单样本窗口，两种情形都是 INCONCLUSIVE）。R13h 部署前，带本夹具的现场检出会把四个
+可执行变体记为 INCONCLUSIVE 并带该原因；R13h 部署后的重跑才判探针路径。
+
+`validation_failure` 在两代产品上都是 `NOT_RUN(CAPABILITY_ABSENT)`，原因里写明机制。其旧定义
+（跨替换持续冻结使重启的 allocatable 快照不达标）已没有 kubelet 层面的机制可依：被再次冻结的替换
+Pod 是 Ready 且 allocatable 满额，R13h 的重启会确认它，下一个探针 tick 开的是**新** finding 而不是
+让本链失败。挂起插件重启的真实失败路径是 kubelet 已阻塞在该插件的 `Allocate` 里——既不杀冻结容器也
+不起替换 Pod，步骤在 `restart_timeout_seconds` 后 FAILED 并按 `failure_escalation_action=REBOOT_NODE`
+升级 `RESTART_NODE`；要制造它须在插件冻结时把一个申请该资源的 Pod 准入到该节点，这会把该节点 kubelet
+的 sync loop 对所有 Pod 一直阻塞到产品 reboot——不是夹具可以对共享真机节点做的事。用 SIGSTOP 做不出
+"永不 Ready 的替换 Pod"（插件 DaemonSet 没有 readiness probe，容器一运行 Pod 即 Ready），排除
+DaemonSet 则是 COLLECT-017 的路径且作用于另一车道共享的集群级对象。reboot 升级本身由产品自己对重启步骤与 planner `plugin_unresponsive` 标记的单元测试覆盖
+（R13h）。
+
+清理：恢复仍冻结的进程并证明 allocatable 回基线、节点上恰一个插件 Pod。`expected_unknown`/
+`mig_timeslicing`（CAPABILITY_ABSENT）与 `running_training`（COVERED_BY_REGIONAL）保持 NOT_RUN。
+全部变体在两条车道均注册：冻结过程没有 provider 特有之处（plugin Pod 以 kubelet device-plugin
+socket 挂载识别、EFA plugin 的 DaemonSet 名由节点 provider 决定、SIGSTOP 只对 plugin 容器自身进程、
+产品的探针与重启两种 provider 相同），HyperPod 的健康监控代理只看 GPU/EFA 硬件而不看 plugin，且车道
+预检已要求 `NodeRecovery=None`。
 
 ### GF-GENERAL-LIVE-015
 

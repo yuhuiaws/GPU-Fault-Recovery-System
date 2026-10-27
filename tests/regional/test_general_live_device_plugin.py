@@ -1,14 +1,17 @@
-"""GF-GENERAL-LIVE-014 native device-plugin registration faults.
+"""GF-GENERAL-LIVE-014 native device-plugin faults, against both products.
 
 No cluster and no node: a ``FakeProbe`` answers the device-plugin probe's
-``freeze``/``resume``/``cleanup`` subcommands (and models kubelet de-registering
-the resource when the plugin is frozen), a ``FakeCluster`` answers the read-only
-kubectl/store reads the fixture and verdict make, and a scripted ``activity``
-document carries the product's records -- the finding, the
-``RESTART_*_DEVICE_PLUGIN`` workflow with its step receipts, the escalation. The
-tests drive every variant's real ``execute`` and assert the verdict and the
-stage errors the product's records produce (PASS / FAIL / INCONCLUSIVE), plus
-the cleanup refusals.
+``feature`` / ``freeze`` / ``resume`` / ``cleanup`` / ``probe-log`` subcommands
+(modelling kubelet keeping allocatable full while the plugin is frozen, and the
+host collector's journal of timed-out probe ticks), a ``FakeCluster`` answers
+the read-only kubectl/store reads the fixture and verdict make (including the
+control-plane feature probe), and a scripted ``activity`` document carries the
+product's records -- the ``*_device_plugin_unresponsive`` sample with its
+labels, the finding, the ``RESTART_*_DEVICE_PLUGIN`` workflow with its delete
+and confirm receipts. The tests drive every variant's real ``execute`` and
+assert the verdict and the stage errors (PASS / FAIL / INCONCLUSIVE) for the
+liveness-probe product and the earlier allocatable-only product, plus the
+cleanup refusals.
 """
 
 from __future__ import annotations
@@ -36,7 +39,25 @@ CASE = mod.CASE_014
 SINCE = "2026-10-24T00:00:00+00:00"
 U0 = "00000000-0000-0000-0000-00000000aaaa"
 U1 = "00000000-0000-0000-0000-00000000bbbb"
+U2 = "00000000-0000-0000-0000-00000000cccc"
 SPECS = {spec.variant: spec for spec in mod.VARIANTS}
+FROZEN_EPOCH = 1_761_559_200.0
+FIRST_TIMEOUT = {
+    "kind": "timeout",
+    "realtime_epoch": FROZEN_EPOCH + 12.4,
+    "sockets": ["nvidia-gpu.sock"],
+    "timeout_seconds": 5.0,
+    "consecutive": 1,
+    "required": 2,
+    "message": "device plugin nvidia-gpu.sock did not answer ... (1 consecutive; "
+    "finding after 2)",
+}
+PRESENT_MODULES = {
+    "device_plugin": True,
+    "device_plugin_probe": True,
+    "device_plugin_liveness": True,
+}
+ABSENT_MODULES = {key: False for key in PRESENT_MODULES}
 
 
 # --------------------------------------------------------------------------- #
@@ -72,7 +93,7 @@ def _pod(
 ) -> dict[str, Any]:
     return {
         "metadata": {
-            "name": f"plugin-{uid[:4]}",
+            "name": f"plugin-{uid[-4:]}",
             "uid": uid,
             "ownerReferences": [{"kind": "DaemonSet", "uid": ds_uid}],
         },
@@ -97,7 +118,8 @@ class FakeCluster:
         baseline: int,
         daemonset: dict[str, Any],
         pods: list[dict[str, Any]],
-        activity: Callable[[tuple[str, ...]], dict[str, Any]],
+        activity: Callable[[tuple[str, ...]], dict[str, Any]] | None = None,
+        control_plane: dict[str, Any] | None = None,
     ) -> None:
         self.settings = RegionalLiveSettings(
             cpu_kubeconfig=_kubeconfig("cpu"),
@@ -111,7 +133,16 @@ class FakeCluster:
         self.allocatable_value = baseline
         self.daemonset = daemonset
         self.pods = pods
-        self.activity_responder = activity
+        self.activity_responder = activity or (
+            lambda a: _doc(incidents=[], workflows=[])
+        )
+        #: The API Pod's answer to the control-plane feature probe.
+        self.control_plane = (
+            control_plane
+            if control_plane is not None
+            else {"present": True, "rule": True, "severity": "critical"}
+        )
+        self.feature_probes: list[tuple[str, ...]] = []
 
     def node_snapshot(self, node: str) -> dict[str, Any]:
         return {
@@ -133,6 +164,9 @@ class FakeCluster:
             return self.activity_responder(arguments)
         if script == PREFLIGHT_PROBE:
             return {"agent": {"lifecycle_state": "ACTIVE"}}
+        if script == mod.LIVENESS_FEATURE_PROBE:
+            self.feature_probes.append(arguments)
+            return dict(self.control_plane)
         raise AssertionError("unexpected cpu_python script")
 
     def kubectl(
@@ -160,25 +194,80 @@ class FakeCluster:
         raise AssertionError(f"unexpected kubectl: {args}")
 
 
+def _cluster(target: mod.PluginTarget, **options: Any) -> FakeCluster:
+    ds = _daemonset(f"{target.daemonset_token}-ds", target.daemonset_token, "ds-uid")
+    return FakeCluster(
+        resource=target.resource,
+        baseline=8,
+        daemonset=ds,
+        pods=[_pod(U0, ds_uid="ds-uid")],
+        **options,
+    )
+
+
 def _node_probe() -> FakeProbe:
     return FakeProbe({"survey": {"residue": {}, "clean": True}})
 
 
 def _plugin_probe(
-    cluster: FakeCluster, *, on_freeze: Callable[[], None] | None = None
+    cluster: FakeCluster,
+    *,
+    modules: dict[str, bool] | None = None,
+    device_plugin_env: dict[str, str] | None = None,
+    drop_allocatable: bool = False,
+    first_timeout: dict[str, Any] | None = FIRST_TIMEOUT,
+    second_timeout_seen: bool = False,
+    journal_timeouts: list[dict[str, Any]] | None = None,
+    on_freeze: Callable[[], None] | None = None,
 ) -> FakeProbe:
-    def freeze(_arguments: tuple[str, ...]) -> dict[str, Any]:
-        cluster.allocatable_value = 0
+    """The device-plugin probe: ``feature`` names the node generation, ``freeze``
+    models kubelet (allocatable stays full unless ``drop_allocatable``) and the
+    journal-driven first-timeout resume, ``probe-log`` the host collector's
+    timed-out ticks."""
+
+    def freeze(arguments: tuple[str, ...]) -> dict[str, Any]:
+        if drop_allocatable:
+            cluster.allocatable_value = 0
         if on_freeze is not None:
             on_freeze()
-        return {
-            "frozen": [{"pid": 4242, "binary": "nvidia-device-plugin", "stopped": True}]
+        receipt: dict[str, Any] = {
+            "frozen": [
+                {"pid": 4242, "binary": "nvidia-device-plugin", "stopped": True}
+            ],
+            "frozen_since_epoch": FROZEN_EPOCH,
         }
+        if "--resume-after-first-timeout" in arguments:
+            receipt.update(
+                {
+                    "window_seconds": int(
+                        arguments[arguments.index("--window-seconds") + 1]
+                    ),
+                    "first_timeout": first_timeout,
+                    "second_timeout_seen": second_timeout_seen,
+                    "timeouts": [first_timeout] if first_timeout else [],
+                    "resumed": [{"pid": 4242, "resumed": True}],
+                    "resumed_at_epoch": FROZEN_EPOCH + 12.9,
+                    "resume_latency_seconds": 0.5 if first_timeout else None,
+                }
+            )
+        return receipt
 
+    timeouts = (
+        journal_timeouts
+        if journal_timeouts is not None
+        else ([first_timeout] if first_timeout else [])
+    )
     return FakeProbe(
         {
+            "feature": {
+                "unit": "gpu-fault-host-collector.service",
+                "venv": "/opt/gpu-fault/current/venv",
+                "modules": PRESENT_MODULES if modules is None else modules,
+                "device_plugin_env": device_plugin_env or {},
+            },
             "freeze": freeze,
             "resume": {"processes": [{"pid": 4242, "resumed": True}]},
+            "probe-log": {"timeouts": timeouts, "entries": timeouts},
             "cleanup": {
                 "processes": [],
                 "residue": {"paused_processes": {}},
@@ -199,6 +288,10 @@ def _context(spec_variant: str, cluster: FakeCluster, plugin: FakeProbe):
         settings=settings,
     )
     return spec, ctx
+
+
+def _calls(plugin: FakeProbe, subcommand: str) -> list[tuple[str, ...]]:
+    return [call for call in plugin.calls if call[0] == subcommand]
 
 
 # --------------------------------------------------------------------------- #
@@ -289,84 +382,138 @@ def _count_batch(metric_prefix: str, count: int, *, mismatch: int) -> dict[str, 
     }
 
 
-def _restart_plugin_scenario(
+def liveness_labels(target: mod.PluginTarget, **overrides: str) -> dict[str, str]:
+    """The host collector's sample labels for a hung plugin (b204
+    ``collectors/host/device_plugin.py``)."""
+
+    labels = {
+        "resource": target.kind.upper(),
+        "resource_name": target.resource,
+        "node_instance_type": "p5en.48xlarge",
+        "sockets": target.socket_name,
+        "probe_state": "TIMEOUT",
+        "probe_states": f"{target.socket_name}=TIMEOUT",
+        "probe_detail": f"{target.socket_name}: no bytes from the plugin within 5s",
+        "transport_answered": "false",
+        "latency_ms": "5000.4",
+        "timeout_seconds": "5",
+        "consecutive_timeout_samples": "2",
+        "required_consecutive_samples": "2",
+        "failure_mode": mod.UNRESPONSIVE_FAILURE_MODE,
+        "expected_count": "8",
+    }
+    labels.update(overrides)
+    return labels
+
+
+def _liveness_batch(
+    target: mod.PluginTarget,
+    value: int,
+    *,
+    observed_at: str = "2026-10-24T00:01:40+00:00",
+    **overrides: str,
+) -> dict[str, Any]:
+    return {
+        "observed_at": observed_at,
+        "batch_id": f"host-{observed_at[-14:-6]}",
+        "edge_filter_reasons": (
+            [f"threshold:{target.liveness_metric}"] if value else ["recovered"]
+        ),
+        "collection_errors": [],
+        "samples": [
+            {
+                "name": target.liveness_metric,
+                "device": None,
+                "value": value,
+                "labels": liveness_labels(target, **overrides),
+            }
+        ],
+    }
+
+
+def _restart_scenario(
     target: mod.PluginTarget,
     cluster: FakeCluster,
     *,
+    liveness: bool = True,
     extra_ops: list[str] = (),
-    restart_status: str = "SUCCEEDED",
-    wf_status: str = "SUCCEEDED",
+    delete_receipt: dict[str, Any] | None = None,
+    final_receipt: dict[str, Any] | None = None,
     incident_state: str = "RECOVERED",
+    sample_overrides: dict[str, str] | None = None,
 ) -> Callable[[tuple[str, ...]], dict[str, Any]]:
-    """An activity responder: ACTION_PENDING with the delete receipt first, then
-    the settled RECOVERED document (restoring the cluster's allocatable+Pod)."""
+    """An activity responder for the restart variants.
 
+    Liveness product: the detection read returns the ``*_device_plugin_
+    unresponsive`` = 1 edge batch, the first settle poll the ACTION_PENDING
+    document with the delete-pass receipt, every later poll the settled
+    RECOVERED document (restoring the cluster's Pod). Earlier product: the
+    allocatable-mismatch chain, no liveness batch, no ``restart_reason``.
+    """
+
+    metric = target.liveness_metric if liveness else target.mismatch_metric
     prefix = target.kind + "_kubernetes"
     restart = target.restart_operation
     ops = [restart, "TRIGGER_HEALTH_SNAPSHOT", target.validate_operation, *extra_ops]
+    edge = [_liveness_batch(target, 1, **(sample_overrides or {}))] if liveness else []
+    if delete_receipt is None:
+        delete_receipt = {
+            "deleted_pod": f"kube-system/plugin-{U0[-4:]}",
+            "deleted_pod_uid": U0,
+            "allocatable": 8 if liveness else 0,
+            "expected": 8,
+        }
+        if liveness:
+            delete_receipt["restart_reason"] = mod.UNRESPONSIVE_FAILURE_MODE
+    if final_receipt is None:
+        final_receipt = {
+            "already_healthy": False,
+            "deleted_pod_uid": U0,
+            "deleted_pod": f"kube-system/plugin-{U0[-4:]}",
+            "replacement_pod_uids": [U1],
+            "allocatable": 8,
+            "expected": 8,
+        }
     pending = _doc(
-        incidents=[
-            _incident(
-                "inc-1", f"b0-{target.mismatch_metric}-node", "ACTION_PENDING", "wf-1"
-            )
-        ],
+        incidents=[_incident("inc-1", f"b0-{metric}-node", "ACTION_PENDING", "wf-1")],
         workflows=[
             _workflow(
                 "wf-1",
                 "inc-1",
                 ops,
                 "RUNNING",
-                [
-                    _exec(
-                        restart,
-                        "WAITING",
-                        {
-                            "node_results": {
-                                NODE: {
-                                    "deleted_pod_uid": U0,
-                                    "allocatable": 0,
-                                    "expected": cluster.allocatable_value or 8,
-                                }
-                            }
-                        },
-                    )
-                ],
+                [_exec(restart, "WAITING", {"node_results": {NODE: delete_receipt}})],
             )
         ],
+        batches=edge,
     )
     settled_execs = [
-        _exec(
-            restart,
-            restart_status,
-            {
-                "node_results": {
-                    NODE: {
-                        "already_healthy": False,
-                        "replacement_pod_uids": [U1],
-                        "allocatable": 8,
-                        "expected": 8,
-                    }
-                }
-            },
-        ),
+        _exec(restart, "SUCCEEDED", {"node_results": {NODE: final_receipt}}),
         _exec("TRIGGER_HEALTH_SNAPSHOT", "SUCCEEDED"),
         _exec(target.validate_operation, "SUCCEEDED"),
     ]
     settled = _doc(
-        incidents=[
-            _incident(
-                "inc-1", f"b0-{target.mismatch_metric}-node", incident_state, "wf-1"
-            )
+        incidents=[_incident("inc-1", f"b0-{metric}-node", incident_state, "wf-1")],
+        workflows=[_workflow("wf-1", "inc-1", ops, "SUCCEEDED", settled_execs)],
+        batches=[
+            *edge,
+            _count_batch(prefix, 8, mismatch=0),
+            *(
+                [_liveness_batch(target, 0, observed_at="2026-10-24T00:06:10+00:00")]
+                if liveness
+                else []
+            ),
         ],
-        workflows=[_workflow("wf-1", "inc-1", ops, wf_status, settled_execs)],
-        batches=[_count_batch(prefix, 8, mismatch=0)],
     )
-
     calls = {"n": 0}
 
     def responder(_arguments: tuple[str, ...]) -> dict[str, Any]:
         calls["n"] += 1
-        if calls["n"] == 1:
+        # Liveness product: read 1 is the detection poll (edge only), read 2
+        # the first settle poll; earlier product: read 1 is the settle poll.
+        if liveness and calls["n"] == 1:
+            return _doc(incidents=[], workflows=[], batches=edge)
+        if calls["n"] == (2 if liveness else 1):
             return pending
         cluster.allocatable_value = 8
         cluster.pods = [_pod(U1, ds_uid=cluster.daemonset["metadata"]["uid"])]
@@ -378,79 +525,227 @@ def _restart_plugin_scenario(
 # --------------------------------------------------------------------------- #
 # registry
 # --------------------------------------------------------------------------- #
-def test_registry_covers_native_014_variants() -> None:
+def test_registry_covers_every_014_variant_with_the_reboot_path_deferred() -> None:
     registry = load_registry()
-    native = {
-        key.split(".", 1)[1]
-        for key in registry
-        if key.startswith(CASE + ".") and registry[key].implemented
+    keys = {key.split(".", 1)[1] for key in registry if key.startswith(CASE + ".")}
+    assert keys == set(coverage_rows()[CASE])
+    implemented = {
+        spec.variant for spec in mod.VARIANTS if registry[spec.key].implemented
     }
-    assert native == {
-        "gpu_plugin",
-        "efa_plugin",
-        "one_sample",
-        "replacement_uid",
-        "validation_failure",
-    }
-    coverage = set(coverage_rows()[CASE])
-    assert {spec.variant for spec in mod.VARIANTS} <= coverage
+    assert implemented == {"gpu_plugin", "efa_plugin", "one_sample", "replacement_uid"}
+    deferred = SPECS["validation_failure"]
+    assert deferred.deferred.startswith("CAPABILITY_ABSENT:"), deferred.deferred
+    assert "Allocate" in deferred.deferred and "kubelet" in deferred.deferred, (
+        "the NOT_RUN reason cites the kubelet mechanism the harness cannot produce"
+    )
+    assert deferred.execute is None
+    assert "re-frozen replacement" in deferred.deferred
 
 
 def test_registry_shapes() -> None:
     for spec in mod.VARIANTS:
         assert spec.proof_mode == "native"
         assert spec.expected_outcome == "PASS"
-        assert mod.DEVICE_PLUGIN_RESTART in spec.approvals
-        assert mod.DEVICE_PLUGIN_RESTART in APPROVALS
-    assert SPECS["validation_failure"].approvals == (
-        mod.DEVICE_PLUGIN_RESTART,
-        mod.NODE_REBOOT,
-    )
-    assert SPECS["validation_failure"].flags == "X"
+        assert spec.lanes == ("eks", "hp"), "every 014 variant runs on both clusters"
     for name in ("gpu_plugin", "efa_plugin", "one_sample", "replacement_uid"):
+        assert SPECS[name].approvals == (mod.DEVICE_PLUGIN_RESTART,)
         assert mod.NODE_REBOOT not in SPECS[name].approvals
-    assert all(spec.lanes == ("eks", "hp") for spec in mod.VARIANTS), (
-        "all five native 014 variants run on both clusters"
-    )
+        assert "INCONCLUSIVE" in SPECS[name].expected or name in {
+            "one_sample",
+            "replacement_uid",
+        }
+    assert mod.DEVICE_PLUGIN_RESTART in APPROVALS
+    assert "nvidia-gpu.sock" in SPECS["gpu_plugin"].expected
+    assert "aws-efa-device-plugin.sock" in SPECS["efa_plugin"].expected
+    assert mod.GPU_TARGET.liveness_metric in mod.GPU_TARGET.metrics
+    assert mod.efa_target().socket_name == "aws-efa-device-plugin.sock"
 
 
 # --------------------------------------------------------------------------- #
-# gpu_plugin / efa_plugin
+# gpu_plugin / efa_plugin against the liveness-probe product
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize(
     "variant,target", [("gpu_plugin", mod.GPU_TARGET), ("efa_plugin", mod.efa_target())]
 )
-def test_plugin_restart_pass(variant: str, target: mod.PluginTarget) -> None:
-    ds = _daemonset(f"{target.daemonset_token}-ds", target.daemonset_token, "ds-uid")
-    cluster = FakeCluster(
-        resource=target.resource,
-        baseline=8,
-        daemonset=ds,
-        pods=[_pod(U0, ds_uid="ds-uid")],
-        activity=lambda a: None,  # replaced below
-    )
-    cluster.activity_responder = _restart_plugin_scenario(target, cluster)
+def test_plugin_restart_pass_on_the_liveness_product(
+    variant: str, target: mod.PluginTarget
+) -> None:
+    cluster = _cluster(target)
+    cluster.activity_responder = _restart_scenario(target, cluster)
     plugin = _plugin_probe(cluster)
     spec, ctx = _context(variant, cluster, plugin)
     result = spec.execute(ctx)
     assert result["verdict"] == "PASS", result["errors"]
-    assert result["restart_receipt"]["deleted_pod_uid"] == U0
-    assert result["restart_receipt"]["replacement_pod_uids"] == [U1]
+    assert set(result["stages"]) >= {
+        "detected",
+        "restart_chain",
+        "deleted_original",
+        "replacement_ready",
+        "allocatable_full_while_frozen",
+        "allocatable_restored",
+        "no_reboot",
+        "not_isolated",
+    }
+    receipt = result["restart_receipt"]
+    assert receipt["deleted_pod_uid"] == U0
+    assert receipt["restart_reason"] == mod.UNRESPONSIVE_FAILURE_MODE
+    assert receipt["replacement_pod_uids"] == [U1]
+    assert receipt["already_healthy"] is False
+    assert receipt["delete_pass_seen"] is True
+    assert result["liveness_sample"]["labels"]["sockets"] == target.socket_name
+    assert result["generation"]["liveness"] is True
+    assert all(
+        item["allocatable"] == 8 for item in result["allocatable_while_frozen"]
+    ), result["allocatable_while_frozen"]
+    assert result["probe_journal_timeouts"] == [FIRST_TIMEOUT]
+    # The generation was read before the freeze: feature probe (node) and the
+    # control-plane rule probe for this family's metric.
+    assert [call[0] for call in plugin.calls][:2] == ["feature", "freeze"]
+    assert cluster.feature_probes == [(target.liveness_metric,)]
     assert result["proof_scope"] == "native"
+
+
+def test_detection_fails_when_the_probe_sample_never_comes() -> None:
+    target = mod.GPU_TARGET
+    cluster = _cluster(target)
+    # The node carries the probe, the plugin is frozen, yet the product
+    # records neither a sample nor a finding.
+    spec, ctx = _context("gpu_plugin", cluster, _plugin_probe(cluster))
+    result = spec.execute(ctx)
+    assert result["verdict"] == "FAIL"
+    assert any(
+        error.startswith("detected:") and "no gpu_device_plugin_unresponsive=1" in error
+        for error in result["errors"]
+    ), result["errors"]
+    assert result["liveness_sample"] is None
+
+
+def test_detection_fails_on_wrong_sample_labels() -> None:
+    target = mod.GPU_TARGET
+    cluster = _cluster(target)
+    cluster.activity_responder = _restart_scenario(
+        target,
+        cluster,
+        sample_overrides={
+            "transport_answered": "true",
+            "sockets": "nvidia-mig-1g.10gb.sock",
+            "probe_state": "REFUSED",
+        },
+    )
+    spec, ctx = _context("gpu_plugin", cluster, _plugin_probe(cluster))
+    result = spec.execute(ctx)
+    assert result["verdict"] == "FAIL"
+    detected = result["stages"]["detected"]
+    assert any("transport_answered" in error for error in detected), detected
+    assert any("nvidia-gpu.sock" in error for error in detected), detected
+    assert any("probe_state" in error for error in detected), detected
+
+
+def test_restart_that_reads_the_hung_plugin_as_already_healthy_fails() -> None:
+    target = mod.GPU_TARGET
+    cluster = _cluster(target)
+    # The restart step confirmed the node on its full allocatable and deleted
+    # nothing: the frozen Pod stays, the receipt says already_healthy.
+    cluster.activity_responder = _restart_scenario(
+        target,
+        cluster,
+        delete_receipt={"allocatable": 8, "expected": 8, "already_healthy": True},
+        final_receipt={
+            "allocatable": 8,
+            "expected": 8,
+            "already_healthy": True,
+            "replacement_pod_uids": [U0],
+        },
+    )
+    responder = cluster.activity_responder
+
+    def keep_frozen_pod(arguments: tuple[str, ...]) -> dict[str, Any]:
+        doc = responder(arguments)
+        cluster.pods = [_pod(U0, ds_uid="ds-uid")]
+        return doc
+
+    cluster.activity_responder = keep_frozen_pod
+    spec, ctx = _context("gpu_plugin", cluster, _plugin_probe(cluster))
+    result = spec.execute(ctx)
+    assert result["verdict"] == "FAIL"
+    assert any(
+        "already_healthy" in error for error in result["stages"]["replacement_ready"]
+    ), result["errors"]
+    assert any(
+        "still on the node" in error for error in result["stages"]["deleted_original"]
+    ), result["errors"]
+
+
+def test_delete_receipt_without_restart_reason_fails() -> None:
+    target = mod.GPU_TARGET
+    cluster = _cluster(target)
+    cluster.activity_responder = _restart_scenario(
+        target,
+        cluster,
+        delete_receipt={
+            "deleted_pod": "kube-system/plugin-aaaa",
+            "deleted_pod_uid": U0,
+            "allocatable": 8,
+            "expected": 8,
+        },
+    )
+    spec, ctx = _context("gpu_plugin", cluster, _plugin_probe(cluster))
+    result = spec.execute(ctx)
+    assert result["verdict"] == "FAIL"
+    assert any(
+        "restart_reason=None" in error for error in result["stages"]["deleted_original"]
+    ), result["errors"]
+
+
+def test_missed_delete_pass_is_a_note_not_a_failure() -> None:
+    target = mod.GPU_TARGET
+    cluster = _cluster(target)
+    responder = _restart_scenario(target, cluster)
+
+    def skip_delete_pass(arguments: tuple[str, ...]) -> dict[str, Any]:
+        doc = responder(arguments)
+        for workflow in doc["workflows"]:
+            for execution in workflow["step_executions"]:
+                if execution["status"] == "WAITING":
+                    # The poll landed on a later waiting pass: no restart_reason.
+                    execution["details"] = {
+                        "node_results": {
+                            NODE: {
+                                "allocatable": 8,
+                                "expected": 8,
+                                "waiting_for_replacement_pod": True,
+                                "deleted_pod_uid": U0,
+                            }
+                        }
+                    }
+        return doc
+
+    cluster.activity_responder = skip_delete_pass
+    spec, ctx = _context("gpu_plugin", cluster, _plugin_probe(cluster))
+    result = spec.execute(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    assert "delete_pass_seen" not in result["restart_receipt"]
+    assert any("restart_reason" in note for note in result["notes"]), result["notes"]
+
+
+def test_allocatable_drop_while_frozen_is_reported() -> None:
+    target = mod.GPU_TARGET
+    cluster = _cluster(target)
+    cluster.activity_responder = _restart_scenario(target, cluster)
+    # kubelet did de-register (not the premise): the stage names it.
+    spec, ctx = _context(
+        "gpu_plugin", cluster, _plugin_probe(cluster, drop_allocatable=True)
+    )
+    result = spec.execute(ctx)
+    assert result["verdict"] == "FAIL"
+    assert result["stages"]["allocatable_full_while_frozen"], result["stages"]
+    assert "premise" in result["stages"]["allocatable_full_while_frozen"][0]
 
 
 def test_gpu_plugin_fail_on_reboot() -> None:
     target = mod.GPU_TARGET
-    ds = _daemonset("nvidia-device-plugin-ds", target.daemonset_token, "ds-uid")
-    cluster = FakeCluster(
-        resource=target.resource,
-        baseline=8,
-        daemonset=ds,
-        pods=[_pod(U0, ds_uid="ds-uid")],
-        activity=lambda a: None,
-    )
-    # The product restarted the plugin AND planned a RESTART_NODE: no_reboot fails.
-    cluster.activity_responder = _restart_plugin_scenario(
+    cluster = _cluster(target)
+    cluster.activity_responder = _restart_scenario(
         target, cluster, extra_ops=["RESTART_NODE"]
     )
     spec, ctx = _context("gpu_plugin", cluster, _plugin_probe(cluster))
@@ -459,45 +754,85 @@ def test_gpu_plugin_fail_on_reboot() -> None:
     assert any("no_reboot" in error for error in result["errors"]), result["errors"]
 
 
-def test_gpu_plugin_inconclusive_when_allocatable_never_drops() -> None:
+# --------------------------------------------------------------------------- #
+# the earlier product (allocatable-only detection) and mixed generations
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("variant", ["gpu_plugin", "one_sample", "replacement_uid"])
+def test_earlier_product_is_inconclusive_when_allocatable_never_drops(
+    variant: str,
+) -> None:
     target = mod.GPU_TARGET
-    ds = _daemonset("nvidia-device-plugin-ds", target.daemonset_token, "ds-uid")
-    cluster = FakeCluster(
-        resource=target.resource,
-        baseline=8,
-        daemonset=ds,
-        pods=[_pod(U0, ds_uid="ds-uid")],
-        activity=lambda a: _doc(incidents=[], workflows=[]),
+    cluster = _cluster(target, control_plane={"present": False, "rule": False})
+    plugin = _plugin_probe(cluster, modules=ABSENT_MODULES)
+    spec, ctx = _context(variant, cluster, plugin)
+    with pytest.raises(VariantInconclusive) as exc:
+        spec.execute(ctx)
+    text = str(exc.value)
+    assert (
+        "ListAndWatch" in text and "predates the device-plugin liveness probe" in text
     )
-    # A freeze that does not reduce allocatable (kubelet kept the devices).
-    plugin = FakeProbe(
-        {
-            "freeze": {"frozen": [{"pid": 4242, "stopped": True}]},
-            "cleanup": {
-                "processes": [],
-                "residue": {"paused_processes": {}},
-                "clean": True,
-            },
-        }
+    assert "R13h" in text
+    # The plugin was frozen (and the freeze confirmed) before the verdict.
+    assert _calls(plugin, "freeze"), plugin.calls
+    assert not any(
+        "--resume-after-first-timeout" in call for call in _calls(plugin, "freeze")
+    ), "the earlier product has no journal line to resume on"
+
+
+def test_earlier_product_allocatable_chain_still_passes_when_it_does_drop() -> None:
+    target = mod.GPU_TARGET
+    cluster = _cluster(target, control_plane={"present": False, "rule": False})
+    cluster.activity_responder = _restart_scenario(target, cluster, liveness=False)
+    plugin = _plugin_probe(cluster, modules=ABSENT_MODULES, drop_allocatable=True)
+    spec, ctx = _context("gpu_plugin", cluster, plugin)
+    result = spec.execute(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    assert "detected" not in result["stages"]
+    assert result["generation"]["liveness"] is False
+    assert result["restart_receipt"]["deleted_pod_uid"] == U0
+    assert result["probe_journal_timeouts"] is None
+
+
+def test_earlier_product_one_sample_after_a_drop_is_inconclusive() -> None:
+    target = mod.GPU_TARGET
+    cluster = _cluster(target, control_plane={"present": False, "rule": False})
+    plugin = _plugin_probe(cluster, modules=ABSENT_MODULES, drop_allocatable=True)
+    spec, ctx = _context("one_sample", cluster, plugin)
+    with pytest.raises(VariantInconclusive, match="single-sample window"):
+        spec.execute(ctx)
+    assert _calls(plugin, "resume"), "the plugin is resumed before the verdict"
+
+
+def test_mixed_generations_refuse_before_the_freeze() -> None:
+    target = mod.GPU_TARGET
+    # The node probes but this control plane has no rule for the metric.
+    cluster = _cluster(target, control_plane={"present": False, "rule": False})
+    plugin = _plugin_probe(cluster)
+    spec, ctx = _context("gpu_plugin", cluster, plugin)
+    with pytest.raises(VariantInconclusive, match="mixed product generations"):
+        spec.execute(ctx)
+    assert not _calls(plugin, "freeze"), "nothing is frozen on a mixed site"
+
+
+def test_probe_disabled_by_configuration_refuses_before_the_freeze() -> None:
+    target = mod.GPU_TARGET
+    cluster = _cluster(target)
+    plugin = _plugin_probe(
+        cluster, device_plugin_env={"GPU_FAULT_DEVICE_PLUGIN_SOCKET_DIR": ""}
     )
     spec, ctx = _context("gpu_plugin", cluster, plugin)
-    with pytest.raises(VariantInconclusive):
+    with pytest.raises(VariantInconclusive, match="disabled by configuration"):
         spec.execute(ctx)
+    assert not _calls(plugin, "freeze"), "a disabled probe freezes nothing"
 
 
 def test_freeze_inconclusive_when_no_process() -> None:
     target = mod.GPU_TARGET
-    ds = _daemonset("nvidia-device-plugin-ds", target.daemonset_token, "ds-uid")
-    cluster = FakeCluster(
-        resource=target.resource,
-        baseline=8,
-        daemonset=ds,
-        pods=[_pod(U0, ds_uid="ds-uid")],
-        activity=lambda a: _doc(incidents=[], workflows=[]),
-    )
-    plugin = FakeProbe({"freeze": {"frozen": []}})
+    cluster = _cluster(target)
+    plugin = _plugin_probe(cluster)
+    plugin.script["freeze"] = {"frozen": []}
     spec, ctx = _context("gpu_plugin", cluster, plugin)
-    with pytest.raises(VariantInconclusive):
+    with pytest.raises(VariantInconclusive, match="froze no plugin process"):
         spec.execute(ctx)
 
 
@@ -507,42 +842,20 @@ def test_freeze_inconclusive_when_no_process() -> None:
 def test_freeze_inconclusive_immediately_when_not_stopped(
     variant: str, target: mod.PluginTarget
 ) -> None:
-    ds = _daemonset(f"{target.daemonset_token}-ds", target.daemonset_token, "ds-uid")
-    cluster = FakeCluster(
-        resource=target.resource,
-        baseline=8,
-        daemonset=ds,
-        pods=[_pod(U0, ds_uid="ds-uid")],
-        activity=lambda a: _doc(incidents=[], workflows=[]),
-    )
+    cluster = _cluster(target)
+    plugin = _plugin_probe(cluster)
     # The probe SIGSTOPped the process but it never reached the stopped state:
-    # a running plugin keeps answering kubelet, so the fixture must refuse now
-    # rather than wait out the allocatable-drop window.
-    plugin = FakeProbe(
-        {
-            "freeze": {
-                "frozen": [
-                    {
-                        "pid": 4242,
-                        "binary": target.binaries[0],
-                        "stopped": False,
-                        "state": "S",
-                    }
-                ]
-            },
-            "cleanup": {
-                "processes": [],
-                "residue": {"paused_processes": {}},
-                "clean": True,
-            },
-        }
-    )
+    # a running plugin keeps answering the product's probe, so the fixture
+    # refuses now rather than waiting out the detection window.
+    plugin.script["freeze"] = {
+        "frozen": [
+            {"pid": 4242, "binary": target.binaries[0], "stopped": False, "state": "S"}
+        ]
+    }
     spec, ctx = _context(variant, cluster, plugin)
     with pytest.raises(VariantInconclusive, match="did not enter the stopped state"):
         spec.execute(ctx)
-    # Immediate refusal: the only probe call was the freeze, and the fixture
-    # never advanced to the allocatable-drop poll loop.
-    assert [call[0] for call in plugin.calls] == ["freeze"], plugin.calls
+    assert [call[0] for call in plugin.calls] == ["feature", "freeze"], plugin.calls
 
 
 def test_plugin_binary_candidates_prefers_real_command_and_image_basenames() -> None:
@@ -559,7 +872,6 @@ def test_plugin_binary_candidates_prefers_real_command_and_image_basenames() -> 
     }
     got = mod.plugin_binary_candidates(pod)
     assert "sh" not in got
-    # The image basename is captured even behind a shim entrypoint.
     assert "efa-device-plugin" in got
 
 
@@ -577,38 +889,25 @@ def test_plugin_binary_candidates_from_explicit_command() -> None:
 # --------------------------------------------------------------------------- #
 def test_replacement_uid_pass() -> None:
     target = mod.GPU_TARGET
-    ds = _daemonset("nvidia-device-plugin-ds", target.daemonset_token, "ds-uid")
-    cluster = FakeCluster(
-        resource=target.resource,
-        baseline=8,
-        daemonset=ds,
-        pods=[_pod(U0, ds_uid="ds-uid")],
-        activity=lambda a: None,
-    )
-    cluster.activity_responder = _restart_plugin_scenario(target, cluster)
+    cluster = _cluster(target)
+    cluster.activity_responder = _restart_scenario(target, cluster)
     spec, ctx = _context("replacement_uid", cluster, _plugin_probe(cluster))
     result = spec.execute(ctx)
     assert result["verdict"] == "PASS", result["errors"]
     assert "no_redelete" in result["stages"]
+    assert result["final_plugin_pod_uids"] == [U1]
 
 
 def test_replacement_uid_fail_on_redelete() -> None:
     target = mod.GPU_TARGET
-    ds = _daemonset("nvidia-device-plugin-ds", target.daemonset_token, "ds-uid")
-    cluster = FakeCluster(
-        resource=target.resource,
-        baseline=8,
-        daemonset=ds,
-        pods=[_pod(U0, ds_uid="ds-uid")],
-        activity=lambda a: None,
-    )
-    responder = _restart_plugin_scenario(target, cluster)
+    cluster = _cluster(target)
+    responder = _restart_scenario(target, cluster)
 
     def redelete(arguments: tuple[str, ...]) -> dict[str, Any]:
         doc = responder(arguments)
         # A third, different Pod is on the node: the product re-deleted the
         # recorded replacement.
-        cluster.pods = [_pod("00000000-0000-0000-0000-00000000cccc", ds_uid="ds-uid")]
+        cluster.pods = [_pod(U2, ds_uid="ds-uid")]
         return doc
 
     cluster.activity_responder = redelete
@@ -624,192 +923,87 @@ def test_replacement_uid_fail_on_redelete() -> None:
 # --------------------------------------------------------------------------- #
 # one_sample
 # --------------------------------------------------------------------------- #
-def _one_sample_activity(
-    consecutive_seq: list[int],
-) -> Callable[[tuple[str, ...]], dict[str, Any]]:
-    prefix = "gpu_kubernetes"
-    calls = {"n": 0}
-
-    def responder(_arguments: tuple[str, ...]) -> dict[str, Any]:
-        index = min(calls["n"], len(consecutive_seq) - 1)
-        consecutive = consecutive_seq[index]
-        calls["n"] += 1
-        labels = {"consecutive_mismatch_samples": str(consecutive)}
-        batch = {
-            "observed_at": f"2026-10-24T00:0{index}:30+00:00",
-            "batch_id": f"k8s-{index}",
-            "edge_filter_reasons": [],
-            "collection_errors": [],
-            "samples": [
-                {
-                    "name": f"{prefix}_allocatable_mismatch",
-                    "device": None,
-                    "value": 1 if consecutive >= 2 else 0,
-                    "labels": labels,
-                },
-                {
-                    "name": f"{prefix}_allocatable_count",
-                    "device": None,
-                    "value": 0 if consecutive else 8,
-                    "labels": labels,
-                },
-            ],
-        }
-        return _doc(incidents=[], workflows=[], batches=[batch])
-
-    return responder
-
-
 def test_one_sample_pass() -> None:
     target = mod.GPU_TARGET
-    ds = _daemonset("nvidia-device-plugin-ds", target.daemonset_token, "ds-uid")
-    cluster = FakeCluster(
-        resource=target.resource,
-        baseline=8,
-        daemonset=ds,
-        pods=[_pod(U0, ds_uid="ds-uid")],
-        activity=_one_sample_activity([1, 0]),
-    )
-    plugin = _plugin_probe(cluster, on_freeze=lambda: None)
+    cluster = _cluster(target)
+    plugin = _plugin_probe(cluster)
     spec, ctx = _context("one_sample", cluster, plugin)
     result = spec.execute(ctx)
     assert result["verdict"] == "PASS", result["errors"]
-    # the plugin was resumed at once (single-sample window)
-    assert any(call[0] == "resume" for call in plugin.calls), plugin.calls
-
-
-def test_one_sample_inconclusive_when_confirmed() -> None:
-    target = mod.GPU_TARGET
-    ds = _daemonset("nvidia-device-plugin-ds", target.daemonset_token, "ds-uid")
-    cluster = FakeCluster(
-        resource=target.resource,
-        baseline=8,
-        daemonset=ds,
-        pods=[_pod(U0, ds_uid="ds-uid")],
-        activity=_one_sample_activity([2, 2]),
+    assert set(result["stages"]) == {
+        "no_confirmed_sample",
+        "no_finding",
+        "no_action",
+        "not_isolated",
+    }
+    freeze = _calls(plugin, "freeze")[0]
+    assert "--resume-after-first-timeout" in freeze
+    # one tick (15 s default) + the 5 s probe timeout + the margin
+    assert freeze[freeze.index("--window-seconds") + 1] == str(
+        15 + mod.LIVENESS_PROBE_TIMEOUT_SECONDS + mod.FIRST_TIMEOUT_MARGIN_SECONDS
     )
-    spec, ctx = _context("one_sample", cluster, _plugin_probe(cluster))
-    with pytest.raises(VariantInconclusive):
+    assert result["first_timeout"]["consecutive"] == 1
+    assert result["resume_latency_seconds"] == 0.5
+    assert result["probe_journal_timeouts"] == [FIRST_TIMEOUT]
+    # The resume happened on the node inside the freeze call; no control-plane
+    # round trip was needed.
+    assert not _calls(plugin, "resume"), plugin.calls
+
+
+def test_one_sample_inconclusive_without_a_logged_tick() -> None:
+    target = mod.GPU_TARGET
+    cluster = _cluster(target)
+    plugin = _plugin_probe(cluster, first_timeout=None)
+    spec, ctx = _context("one_sample", cluster, plugin)
+    with pytest.raises(
+        VariantInconclusive, match="no timed-out GetDevicePluginOptions"
+    ):
         spec.execute(ctx)
 
 
-# --------------------------------------------------------------------------- #
-# validation_failure
-# --------------------------------------------------------------------------- #
-def _validation_failure_activity(
-    cluster: "FakeCluster",
-) -> Callable[[tuple[str, ...]], dict[str, Any]]:
-    restart = mod.GPU_TARGET.restart_operation
-    incidents = [
-        _incident(
-            "inc-1", f"b0-{mod.GPU_TARGET.mismatch_metric}-node", "ESCALATED", "wf-1"
-        ),
-        {
-            "incident_id": "inc-reboot",
-            "event_id": "reboot-after-wf-1",
-            "event_type": "NODE_HEALTH",
-            "state": "QUARANTINED",
-            "created_at": "2026-10-24T00:10:00+00:00",
-            "workflow_request_id": "wf-reboot",
-            "cluster_id": "gpu-eks-cluster",
-            "node_ids": [NODE],
-        },
-    ]
-    workflows = [
-        _workflow(
-            "wf-1",
-            "inc-1",
-            [restart, "TRIGGER_HEALTH_SNAPSHOT", "VALIDATE_GPU"],
-            "FAILED",
-            [
-                _exec(
-                    restart,
-                    "FAILED",
-                    {
-                        "node_results": {NODE: {"allocatable": 0, "expected": 8}},
-                        "error": "device plugin did not restore nvidia.com/gpu",
-                    },
-                )
-            ],
-        ),
-        _workflow(
-            "wf-reboot",
-            "inc-reboot",
-            ["MARK_UNSCHEDULABLE", "QUARANTINE", "RESTART_NODE", "VALIDATE_GPU"],
-            "RUNNING",
-            [],
-        ),
-    ]
-
-    calls = {"n": 0}
-
-    def responder(_arguments: tuple[str, ...]) -> dict[str, Any]:
-        calls["n"] += 1
-        if calls["n"] == 1:
-            # The product deleted the frozen original; a replacement appears
-            # (the next poll's re-freeze loop will re-break it). No escalation
-            # yet.
-            cluster.pods = [_pod(U1, ds_uid="ds-uid")]
-            return _doc(incidents=[incidents[0]], workflows=[workflows[0]])
-        return _doc(incidents=incidents, workflows=workflows)
-
-    return responder
-
-
-def test_validation_failure_pass() -> None:
+def test_one_sample_inconclusive_when_the_second_tick_timed_out_first() -> None:
     target = mod.GPU_TARGET
-    ds = _daemonset("nvidia-device-plugin-ds", target.daemonset_token, "ds-uid")
-    cluster = FakeCluster(
-        resource=target.resource,
-        baseline=8,
-        daemonset=ds,
-        pods=[_pod(U0, ds_uid="ds-uid")],
-        activity=lambda a: None,
-    )
-    cluster.activity_responder = _validation_failure_activity(cluster)
-    # A replacement Pod appears on the first poll and is re-frozen; allocatable
-    # stays short across the restart's confirmation window.
-    plugin = _plugin_probe(cluster)
-    spec, ctx = _context("validation_failure", cluster, plugin)
-    result = spec.execute(ctx)
-    assert result["verdict"] == "PASS", result["errors"]
-    assert result["reboot_escalations"] == ["inc-reboot"]
-    # the replacement Pod was re-frozen
-    assert sum(1 for call in plugin.calls if call[0] == "freeze") >= 2
+    cluster = _cluster(target)
+    plugin = _plugin_probe(cluster, second_timeout_seen=True)
+    spec, ctx = _context("one_sample", cluster, plugin)
+    with pytest.raises(VariantInconclusive, match="second consecutive"):
+        spec.execute(ctx)
 
 
-def test_validation_failure_fail_without_escalation() -> None:
+def test_one_sample_inconclusive_when_the_journal_shows_two_ticks() -> None:
     target = mod.GPU_TARGET
-    ds = _daemonset("nvidia-device-plugin-ds", target.daemonset_token, "ds-uid")
+    cluster = _cluster(target)
+    second = {**FIRST_TIMEOUT, "consecutive": 2, "realtime_epoch": FROZEN_EPOCH + 32.4}
+    plugin = _plugin_probe(cluster, journal_timeouts=[FIRST_TIMEOUT, second])
+    spec, ctx = _context("one_sample", cluster, plugin)
+    with pytest.raises(VariantInconclusive, match="2 timed-out ticks"):
+        spec.execute(ctx)
+
+
+def test_one_sample_fails_when_the_product_confirms_anyway() -> None:
+    target = mod.GPU_TARGET
+    cluster = _cluster(target)
     restart = target.restart_operation
     doc = _doc(
         incidents=[
-            _incident("inc-1", f"b0-{target.mismatch_metric}-node", "ESCALATED", "wf-1")
+            _incident(
+                "inc-1", f"b0-{target.liveness_metric}-node", "ACTION_PENDING", "wf-1"
+            )
         ],
         workflows=[
             _workflow(
-                "wf-1",
-                "inc-1",
-                [restart],
-                "FAILED",
-                [_exec(restart, "FAILED", {"error": "device plugin did not restore"})],
+                "wf-1", "inc-1", [restart, "TRIGGER_HEALTH_SNAPSHOT"], "RUNNING", []
             )
         ],
+        batches=[_liveness_batch(target, 1)],
     )
-    cluster = FakeCluster(
-        resource=target.resource,
-        baseline=8,
-        daemonset=ds,
-        pods=[_pod(U1, ds_uid="ds-uid")],
-        activity=lambda a: doc,
-    )
-    spec, ctx = _context("validation_failure", cluster, _plugin_probe(cluster))
-    cluster.pods = [_pod(U1, ds_uid="ds-uid")]
+    cluster.activity_responder = lambda a: doc
+    spec, ctx = _context("one_sample", cluster, _plugin_probe(cluster))
     result = spec.execute(ctx)
     assert result["verdict"] == "FAIL"
-    assert any("reboot_escalation" in error for error in result["errors"]), result[
-        "errors"
-    ]
+    assert result["stages"]["no_confirmed_sample"], result["stages"]
+    assert result["stages"]["no_finding"], result["stages"]
+    assert result["stages"]["no_action"], result["stages"]
 
 
 # --------------------------------------------------------------------------- #
@@ -817,15 +1011,8 @@ def test_validation_failure_fail_without_escalation() -> None:
 # --------------------------------------------------------------------------- #
 def test_cleanup_refuses_when_allocatable_not_restored() -> None:
     target = mod.GPU_TARGET
-    ds = _daemonset("nvidia-device-plugin-ds", target.daemonset_token, "ds-uid")
-    cluster = FakeCluster(
-        resource=target.resource,
-        baseline=8,
-        daemonset=ds,
-        pods=[_pod(U0, ds_uid="ds-uid")],
-        activity=lambda a: _doc(incidents=[], workflows=[]),
-    )
-    plugin = _plugin_probe(cluster)
+    cluster = _cluster(target)
+    plugin = _plugin_probe(cluster, drop_allocatable=True)
     spec, ctx = _context("gpu_plugin", cluster, plugin)
     fixture = mod.DevicePluginRegistrationFixture(ctx, target)
     fixture.discover()
@@ -836,20 +1023,12 @@ def test_cleanup_refuses_when_allocatable_not_restored() -> None:
 
 def test_cleanup_refuses_on_extra_pod() -> None:
     target = mod.GPU_TARGET
-    ds = _daemonset("nvidia-device-plugin-ds", target.daemonset_token, "ds-uid")
-    cluster = FakeCluster(
-        resource=target.resource,
-        baseline=8,
-        daemonset=ds,
-        pods=[_pod(U0, ds_uid="ds-uid")],
-        activity=lambda a: _doc(incidents=[], workflows=[]),
-    )
+    cluster = _cluster(target)
     plugin = _plugin_probe(cluster)
     spec, ctx = _context("gpu_plugin", cluster, plugin)
     fixture = mod.DevicePluginRegistrationFixture(ctx, target)
     fixture.discover()
     fixture.freeze_pod(U0, seconds=120)
-    cluster.allocatable_value = 8
     cluster.pods = [_pod(U0, ds_uid="ds-uid"), _pod(U1, ds_uid="ds-uid")]
     with pytest.raises(RegionalFixtureError, match="exactly one"):
         fixture.restore()
@@ -857,25 +1036,12 @@ def test_cleanup_refuses_on_extra_pod() -> None:
 
 def test_cleanup_refuses_when_probe_not_clean() -> None:
     target = mod.GPU_TARGET
-    ds = _daemonset("nvidia-device-plugin-ds", target.daemonset_token, "ds-uid")
-    cluster = FakeCluster(
-        resource=target.resource,
-        baseline=8,
-        daemonset=ds,
-        pods=[_pod(U0, ds_uid="ds-uid")],
-        activity=lambda a: _doc(incidents=[], workflows=[]),
-    )
-    plugin = FakeProbe(
-        {
-            "freeze": (
-                lambda a: (
-                    setattr(cluster, "allocatable_value", 0),
-                    {"frozen": [{"pid": 1, "stopped": True}]},
-                )[1]
-            ),
-            "cleanup": {"residue": {"paused_processes": {"1": {}}}, "clean": False},
-        }
-    )
+    cluster = _cluster(target)
+    plugin = _plugin_probe(cluster)
+    plugin.script["cleanup"] = {
+        "residue": {"paused_processes": {"1": {}}},
+        "clean": False,
+    }
     spec, ctx = _context("gpu_plugin", cluster, plugin)
     fixture = mod.DevicePluginRegistrationFixture(ctx, target)
     fixture.discover()
@@ -889,14 +1055,23 @@ def test_discover_blocks_on_missing_daemonset() -> None:
 
     target = mod.GPU_TARGET
     ds = _daemonset("other", "something-else", "ds-uid")
-    cluster = FakeCluster(
-        resource=target.resource,
-        baseline=8,
-        daemonset=ds,
-        pods=[],
-        activity=lambda a: _doc(incidents=[], workflows=[]),
-    )
+    cluster = FakeCluster(resource=target.resource, baseline=8, daemonset=ds, pods=[])
     spec, ctx = _context("gpu_plugin", cluster, _plugin_probe(cluster))
     fixture = mod.DevicePluginRegistrationFixture(ctx, target)
     with pytest.raises(VariantBlocked):
         fixture.discover()
+
+
+def test_generation_record_describes_both_sides() -> None:
+    target = mod.GPU_TARGET
+    cluster = _cluster(target)
+    spec, ctx = _context("gpu_plugin", cluster, _plugin_probe(cluster))
+    fixture = mod.DevicePluginRegistrationFixture(ctx, target)
+    fixture.discover()
+    generation = fixture.generation()
+    assert generation.liveness is True
+    record = generation.record()
+    assert record["node_modules"] == PRESENT_MODULES
+    assert record["control_plane"]["rule"] is True
+    assert "carries the liveness probe" in record["description"]
+    assert "grades gpu_device_plugin_unresponsive" in record["description"]
