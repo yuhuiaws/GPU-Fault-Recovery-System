@@ -43,6 +43,8 @@ CONSTANT_MESSAGE_LABELS = {
 PROBE_ERROR_RECORD = "probe-error.json"
 PROBE_ERROR_MESSAGE_CHARS = 2000
 PROBE_ERROR_DETAIL_CHARS = 65536
+#: How many earlier failed calls ``probe-error.json`` keeps under ``previous``.
+PROBE_ERROR_HISTORY = 8
 #: Credential-looking tokens are masked before anything is written; a value
 #: that follows a secret-ish key, and any long opaque blob.
 _SECRET_PATTERNS = (
@@ -82,6 +84,30 @@ def redact_probe_detail(value: Any, depth: int = 0) -> Any:
     if isinstance(value, (bool, int, float)) or value is None:
         return value
     return redact_probe_text(repr(value), 256)
+
+
+def earlier_probe_errors(path: Path) -> list[dict[str, Any]]:
+    """The records earlier failed calls of the case left in ``probe-error.json``.
+
+    One case may fail more than once -- the injection, then its own cleanup
+    (013 bind_failure 2026-10-27: ``_preconditions`` refused the read-back,
+    then ``release`` refused the same one) -- and the later write must not
+    erase the earlier message: the newest record stays at the top, the earlier
+    ones follow under ``previous``, newest first and bounded. An unreadable or
+    foreign file is simply replaced.
+    """
+
+    try:
+        earlier = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(earlier, dict):
+        return []
+    older = earlier.pop("previous", None)
+    chain = [earlier]
+    if isinstance(older, list):
+        chain.extend(item for item in older if isinstance(item, dict))
+    return chain[:PROBE_ERROR_HISTORY]
 
 
 class HostProbeError(RuntimeError):
@@ -482,10 +508,12 @@ class HostProbeFixture:
         }
         if len(json.dumps(record["detail"], default=str)) > PROBE_ERROR_DETAIL_CHARS:
             record["detail"] = {"truncated": True}
+        path = self.settings.state_directory.parent / PROBE_ERROR_RECORD
+        earlier = earlier_probe_errors(path)
+        if earlier:
+            record["previous"] = earlier
         try:
-            write_json_atomic(
-                self.settings.state_directory.parent / PROBE_ERROR_RECORD, record
-            )
+            write_json_atomic(path, record)
         except OSError:
             return False
         return True

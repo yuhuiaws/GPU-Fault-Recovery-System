@@ -2672,7 +2672,35 @@ only on the product's own records (the incident reasons, the step receipts, the
 EFA inventory, a changed boot id, no isolation beyond the remediation chain's
 own cordon), are scoped to one function, node-reversible (one write to
 `driver_override`, or a reboot) and deadman-restorable, and their cleanup binds
-the function back to `efa` or fails loudly. 032 `missing_version` stays
+the function back to `efa` or fails loudly. The probe's "no override" is the
+kernel's own read-back: the attribute's show callback prints the
+`pdev->driver_override` pointer with `"%s\n"` (`drivers/pci/pci-sysfs.c`
+`driver_override_show()`: `sprintf(buf, "%s\n", pdev->driver_override)` at
+v3.16, `sysfs_emit(...)` at v5.18 and v6.1) and vsprintf renders a NULL `%s`
+argument as the literal `(null)` (`lib/vsprintf.c`: `string()` at v4.19,
+`if ((unsigned long)s < PAGE_SIZE) s = "(null)";`; `check_pointer_msg()` at
+v6.1, `if (!ptr) return "(null)";`), so an unset override reads `(null)`, never
+an empty string -- the store side turns `""` and `"\n"` into a NULL pointer
+(`driver_override_store()` through v5.18, `drivers/base/driver.c`
+`driver_set_override()` from v5.19, read at v6.12: `/* Empty string passed -
+clear override */`, `/* "\n" passed - clear override */`;
+`Documentation/ABI/testing/sysfs-bus-pci`: "may be cleared with an empty string
+(echo > driver_override)") and the attribute is unconditional
+(`DEVICE_ATTR_RW(driver_override)` in `pci_dev_attrs[]`). Any other read-back
+(`efa`, `vfio-pci`, the ABI's own opt-out example `none`) is a stored override
+and the probe refuses to inject (`reason driver_override_set`). The first live
+run (HyperPod, kernel 6.12.103) compared `(null)` against a made-up `(none)` and
+refused every real node (`bind_failure` INCONCLUSIVE; the cleanup misreported
+"not restored" on the same comparison); one `KERNEL_NO_OVERRIDE` /
+`override_name()` in the probe now decides, the survey keeps the raw read-back
+as `driver_override_sysfs`, and `tests/regional/test_general_live_efa_probe.py`
+pins it. The probe's refusal message and structured detail travel with its
+failure line into the case directory's `probe-error.json` (the source-replay
+probe's lane; a later failure keeps the earlier record under `previous`), the
+trap unit starts as systemd-run's default `Type=simple` service (`Type=oneshot`
+would block `systemd-run` until the process exits and `RuntimeMaxSec` has no
+effect on it -- systemd-run(1), systemd.service(5)) and waits for the fixture's
+own unbind before it waits for the product's bind. 032 `missing_version` stays
 `FIXTURE_NOT_READY`: the NVLink5 decoder gates on the `driver_branch` the
 *kernel collector's* own CollectorContext stamps on the XID event, and the host
 source replay is allow-listed for `gpu-fault-host-collector.service` only.

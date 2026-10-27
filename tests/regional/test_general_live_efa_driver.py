@@ -51,7 +51,8 @@ def _functions(bound: int = 16, *, module: bool = True) -> list[dict[str, Any]]:
             "pci_bdf": f"0000:{0x30 + index:02x}:00.0",
             "driver": "efa" if index < bound else None,
             "bound": index < bound,
-            "driver_override": "(none)",
+            # The probe's parsed value of the kernel's "(null)" read-back.
+            "driver_override": None,
             "rdma_device": f"rdmap{index}",
         }
         for index in range(16)
@@ -80,7 +81,8 @@ def _probe(
         "module_loaded": module,
         "boot_id": BASE_BOOT,
         "trap_fired": trap_fired,
-        "driver_override": "(none)",
+        "driver_override": None,
+        "driver_override_sysfs": "(null)",
         "bound": False,
     }
     return FakeProbe(

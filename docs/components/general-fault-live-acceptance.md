@@ -2471,6 +2471,26 @@ bundle 保守，却判 "did not request process state capture"，是 oracle 把 
   `driver_override` 一次写入或重启即可还原、仅作用于一个功能、由保底独立重绑，判定只读产品
   记录（incident 原因、步骤回执、allocatable、boot id、无越界隔离），清理循环把功能绑回
   `efa`、清掉 override，否则大声失败。
+  探针判定“无 override”以内核的真实读回为准：`driver_override` 的 show 回调用 `"%s\n"` 打印
+  `pdev->driver_override` 指针（`drivers/pci/pci-sysfs.c` `driver_override_show()`：v3.16 为
+  `sprintf(buf, "%s\n", pdev->driver_override)`，v5.18、v6.1 为 `sysfs_emit(...)`），vsprintf 把
+  空指针渲染为字面量 `(null)`（`lib/vsprintf.c`：v4.19 `string()` 的
+  `if ((unsigned long)s < PAGE_SIZE) s = "(null)";`，v6.1 `check_pointer_msg()` 的
+  `if (!ptr) return "(null)";`），所以未设置 override 的功能读到 `(null)` 而不是空串——store 侧把
+  `""` 与 `"\n"` 都置为空指针（v5.18 及之前 `driver_override_store()`，v5.19 起
+  `drivers/base/driver.c` `driver_set_override()`，v6.12 原文注释
+  `/* Empty string passed - clear override */`、`/* "\n" passed - clear override */`；ABI 文档
+  `Documentation/ABI/testing/sysfs-bus-pci`：“may be cleared with an empty string (echo >
+  driver_override)”），该属性在 `pci_dev_attrs[]` 中无条件存在（`DEVICE_ATTR_RW(driver_override)`）。
+  其他任何读回（`efa`、`vfio-pci`、ABI 示例中的退出名 `none`）都是真实 override，探针拒绝注入
+  （`reason driver_override_set`）。首次实跑（HyperPod，内核 6.12.103）把 `(null)` 与自造的
+  `(none)` 比较而拒绝了每个真实节点（`bind_failure` INCONCLUSIVE，清理也以同一比较误报“未还原”）；
+  现以探针的 `KERNEL_NO_OVERRIDE`/`override_name()` 统一判定，survey 同时记录原始读回
+  `driver_override_sysfs`，由 `tests/regional/test_general_live_efa_probe.py` 钉住。探针的拒绝
+  信息与结构化细节随失败行进入用例目录的 `probe-error.json`（与源重放探针同一通道；后一次失败把
+  前一次保留在 `previous` 下）；trap 单元按 systemd-run 默认 `Type=simple` 启动（`Type=oneshot`
+  会让 `systemd-run` 阻塞到进程退出，且 `RuntimeMaxSec` 对其无效——systemd-run(1)、
+  systemd.service(5)），并先等到夹具自身的解绑、再等产品的重绑之后才再次解绑。
 
 计划/执行守卫键仍为 `<case>.<variant>`，确认串 `GENERALLIVE<NNN>_EXECUTE`。新 `--approve`
 令牌：`KERNEL_SOURCE_REPLAY`（kmsg 源重指，032）、`KERNEL_COLLECTOR_SOURCE_REPLAY`（内核采集器

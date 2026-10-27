@@ -23,9 +23,9 @@ spec requires:
   kernel attribute that one write (``printf '\\n' > driver_override``) or a
   reboot clears.
 * ``trap-unbind`` (``post_repair_failure``): the unbind, plus a bounded
-  one-shot transient unit that waits for the product's bind of the same
-  function, lets the Node Agent's own read-back verification finish (a
-  grace of a few seconds), unbinds it once more and records when. The
+  transient unit that waits for this unbind and then for the product's bind
+  of the same function, lets the Node Agent's own read-back verification
+  finish (a grace of a few seconds), unbinds it once more and records when. The
   action's receipt therefore says SUCCEEDED (bound 16/16, ``rebound_pci_bdfs``
   = [BDF]) while every later reading shows the shortfall again, so the
   post-action validation fails on fresh evidence.
@@ -50,6 +50,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -66,7 +67,34 @@ EFA_DEVICE_PREFIX = "0xefa"
 #: The ``driver_override`` value of a held function: a driver no module
 #: provides, so no bind can satisfy it until the override is cleared.
 HOLD_OVERRIDE = "gfrs-live-hold"
-NO_OVERRIDE = "(none)"
+#: What ``driver_override`` reads back when NO override is set. The attribute
+#: formats the ``pdev->driver_override`` pointer with ``"%s\n"`` --
+#: ``drivers/pci/pci-sysfs.c`` ``driver_override_show()``: ``sprintf(buf,
+#: "%s\n", pdev->driver_override)`` at v3.16 (the attribute's first release),
+#: ``sysfs_emit(buf, "%s\n", pdev->driver_override)`` at v5.18 and v6.1 -- and
+#: vsprintf renders a NULL ``%s`` argument as the literal ``(null)``
+#: (``lib/vsprintf.c``: ``string()`` at v4.19, ``if ((unsigned long)s <
+#: PAGE_SIZE) s = "(null)";``; ``check_pointer_msg()`` at v6.1, ``if (!ptr)
+#: return "(null)";``). So an unset override reads ``"(null)\n"``, never an
+#: empty string: the store side turns ``""`` and ``"\n"`` into a NULL pointer
+#: (``driver_override_store()`` in pci-sysfs.c through v5.18 -- ``if
+#: (strlen(driver_override)) ... else { kfree(driver_override);
+#: pdev->driver_override = NULL; }`` -- and ``drivers/base/driver.c``
+#: ``driver_set_override()`` from v5.19, read at v6.12: ``/* Empty string
+#: passed - clear override */`` and ``/* "\n" passed - clear override */``),
+#: as ``Documentation/ABI/testing/sysfs-bus-pci`` promises ("may be cleared
+#: with an empty string (echo > driver_override)"). The attribute is
+#: unconditional (``static DEVICE_ATTR_RW(driver_override)`` in
+#: ``pci_dev_attrs[]``), so a function without it is not a PCI device of a
+#: kernel this fixture knows. Live read-backs: ``(null)`` on every EFA
+#: function of the HyperPod test node (kernel 6.12.103, AL2023, 2026-10-27
+#: efa-driver-survey.json) and on every PCI function of the controller host
+#: (kernel 7.0.0-1012-aws). The first live run compared this against a
+#: made-up ``"(none)"`` and refused every real node.
+KERNEL_NO_OVERRIDE = "(null)"
+#: The product's own boolean tokens (``gpu_fault.env.TRUE_TOKENS``; the probe
+#: is stdlib-only and cannot import them): the installer writes ``"true"``.
+TRUE_TOKENS = frozenset({"1", "true", "yes", "on"})
 SAFE_RUN_ID = re.compile(r"^[a-z0-9][a-z0-9-]{2,62}$")
 SAFE_BDF = re.compile(r"^0000:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$")
 MIN_RESTORE_SECONDS = 60
@@ -86,11 +114,40 @@ MODES = ("hold", "trap")
 
 
 class ProbeError(RuntimeError):
-    pass
+    """A refused or failed step.
+
+    ``reason`` is one token of a closed vocabulary (``[a-z][a-z0-9_]{2,40}``)
+    the host fixture shows in its exception text (``; reason
+    driver_override_set``); ``detail`` is a JSON object that travels with the
+    message into the case's ``probe-error.json``.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str | None = None,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.detail = detail
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def monotonic_clock() -> float:
+    """``time.monotonic`` behind a name the tests can script."""
+
+    return time.monotonic()
+
+
+def pause(seconds: float) -> None:
+    """``time.sleep`` behind a name the tests can script."""
+
+    time.sleep(seconds)
 
 
 def emit(value: dict[str, Any]) -> None:
@@ -220,11 +277,47 @@ def is_bound(bdf: str) -> bool:
     return (driver_root() / bdf).exists()
 
 
-def read_override(bdf: str) -> str:
+def override_name(text: str) -> str | None:
+    """The driver name a ``driver_override`` read-back carries, or ``None``.
+
+    ``(null)`` is the kernel's rendering of the unset (NULL) override, see
+    ``KERNEL_NO_OVERRIDE``; an empty read-back counts as unset too because the
+    kernel never stores an empty name (the store clears instead), so nothing
+    real is hidden by accepting it. Anything else -- ``efa``, ``vfio-pci``,
+    the ABI's own opt-out example ``none``, the old harness constant
+    ``(none)`` -- is a stored override. (A name spelled literally ``(null)``
+    would read the same as unset; the kernel ABI itself cannot tell them
+    apart, and this fixture's own hold value never collides.)
+    """
+
+    value = text.strip()
+    if value in {"", KERNEL_NO_OVERRIDE}:
+        return None
+    return value
+
+
+def override_sysfs_text(bdf: str) -> str:
+    """The raw ``driver_override`` read-back, for the evidence receipts."""
+
+    return read_text(device_dir(bdf) / "driver_override")
+
+
+def read_override(bdf: str) -> str | None:
+    """The function's stored override name, ``None`` when none is set."""
+
     path = device_dir(bdf) / "driver_override"
     if not path.exists():
-        raise ProbeError(f"{bdf} has no driver_override attribute")
-    return read_text(path) or NO_OVERRIDE
+        raise ProbeError(
+            f"{bdf} has no driver_override attribute", reason="no_override_attribute"
+        )
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as error:
+        raise ProbeError(
+            f"{bdf} driver_override is unreadable: {error.strerror}",
+            reason="override_unreadable",
+        ) from error
+    return override_name(text)
 
 
 def infiniband_map() -> dict[str, str]:
@@ -262,7 +355,7 @@ def efa_functions() -> list[dict[str, Any]]:
                 "driver": bound_driver(bdf),
                 "bound": is_bound(bdf),
                 "driver_override": (
-                    read_text(override_path) or NO_OVERRIDE
+                    override_name(read_text(override_path))
                     if override_path.exists()
                     else None
                 ),
@@ -347,6 +440,9 @@ def summary(run_id: str, bdf: str) -> dict[str, Any]:
         "bound": is_bound(bdf),
         "driver": bound_driver(bdf),
         "driver_override": read_override(bdf),
+        # The kernel's own words next to the parsed value: the read-back that
+        # proved the "(none)" comparison wrong lives in the survey evidence.
+        "driver_override_sysfs": override_sysfs_text(bdf),
         "rdma_device": infiniband_map().get(bdf),
         "module_loaded": efa_module_loaded(),
         "efa_function_count": len(functions),
@@ -427,27 +523,46 @@ def _preconditions(bdf: str) -> dict[str, Any]:
     """
 
     if not device_dir(bdf).is_dir():
-        raise ProbeError(f"{bdf} is not a PCI device on this node")
+        raise ProbeError(
+            f"{bdf} is not a PCI device on this node", reason="not_a_pci_device"
+        )
     if not is_efa_function(bdf):
-        raise ProbeError(f"{bdf} is not an EFA data function (vendor/device)")
+        raise ProbeError(
+            f"{bdf} is not an EFA data function (vendor/device)",
+            reason="not_an_efa_function",
+        )
     if bound_driver(bdf) != DRIVER:
-        raise ProbeError(f"{bdf} is not bound to {DRIVER} at baseline")
+        raise ProbeError(
+            f"{bdf} is not bound to {DRIVER} at baseline", reason="not_bound_to_efa"
+        )
     if not efa_module_loaded():
-        raise ProbeError(f"the {DRIVER} module is not loaded; refusing to inject")
+        raise ProbeError(
+            f"the {DRIVER} module is not loaded; refusing to inject",
+            reason="module_not_loaded",
+        )
     functions = efa_functions()
     bound = [item for item in functions if item["driver"] == DRIVER]
     if len(bound) < 2:
         raise ProbeError(
-            f"only {len(bound)} EFA function(s) bound; refusing to unbind the last one"
+            f"only {len(bound)} EFA function(s) bound; refusing to unbind the last one",
+            reason="last_bound_function",
         )
+    # ``None`` is the kernel's "(null)" read-back (KERNEL_NO_OVERRIDE); any
+    # stored name -- efa, vfio-pci, the ABI's opt-out "none" -- means another
+    # actor holds this function and the fixture must not touch it.
     override = read_override(bdf)
-    if override != NO_OVERRIDE:
-        raise ProbeError(f"{bdf} already has a driver_override: {override!r}")
+    if override is not None:
+        raise ProbeError(
+            f"{bdf} already has a driver_override: {override!r}",
+            reason="driver_override_set",
+        )
     env = node_env()
-    if env.get("GPU_FAULT_NODE_ALLOW_EFA_DRIVER_REMEDIATION") not in {"true", "1"}:
+    enabled = env.get("GPU_FAULT_NODE_ALLOW_EFA_DRIVER_REMEDIATION", "")
+    if enabled.strip().lower() not in TRUE_TOKENS:
         raise ProbeError(
             "GPU_FAULT_NODE_ALLOW_EFA_DRIVER_REMEDIATION is not enabled; the "
-            "product cannot run its REMEDIATE_EFA_DRIVER branch"
+            "product cannot run its REMEDIATE_EFA_DRIVER branch",
+            reason="remediation_disabled",
         )
     return {
         "baseline_bound_count": len(bound),
@@ -532,11 +647,12 @@ def trap_unbind(arguments: argparse.Namespace) -> None:
     binds it back, so the action's receipt succeeds and the post-action
     validation fails on fresh evidence.
 
-    A bounded one-shot transient unit waits for the function to be bound again
-    (the product's REMEDIATE_EFA_DRIVER), lets the Node Agent's synchronous
-    read-back verification finish (``grace`` seconds), unbinds it once more and
-    records when. No ``driver_override`` is used, so the second unbind is the
-    only change and the deadman's plain rebind restores the baseline.
+    A bounded transient unit waits for this unbind and then for the function to
+    be bound again (the product's REMEDIATE_EFA_DRIVER), lets the Node Agent's
+    synchronous read-back verification finish (``grace`` seconds), unbinds it
+    once more and records when. No ``driver_override`` is used, so the second
+    unbind is the only change and the deadman's plain rebind restores the
+    baseline.
     """
 
     run_id = checked_run_id(arguments.run_id)
@@ -585,7 +701,18 @@ def trap_unbind(arguments: argparse.Namespace) -> None:
 
 
 def _arm_trap(run_id: str, bdf: str, *, grace: int, window: int) -> str:
-    """A bounded one-shot unit that re-unbinds the function once, later."""
+    """A bounded transient unit that re-unbinds the function once, later.
+
+    The unit keeps systemd-run's default ``Type=simple``: ``systemd-run`` waits
+    for the start job unless ``--no-block`` ("systemd-run will wait until the
+    unit's start-up is completed", systemd-run(1)), and a ``Type=oneshot``
+    service completes its start job only when its process exits ("the service
+    manager will consider the unit up after the main process exits",
+    systemd.service(5)), so ``Type=oneshot`` would block this call for the
+    trap's whole wait, past ``run()``'s timeout; and ``RuntimeMaxSec`` "does
+    not have any effect on Type=oneshot services" (systemd.service(5)) -- it
+    is the kill switch only for a simple service.
+    """
 
     name = unit_name(run_id, "trap")
     run(["systemctl", "stop", f"{name}.service"], check=False)
@@ -595,7 +722,6 @@ def _arm_trap(run_id: str, bdf: str, *, grace: int, window: int) -> str:
             "systemd-run",
             f"--unit={name}",
             f"--property=RuntimeMaxSec={int(window) + grace + 30}",
-            "--property=Type=oneshot",
             sys.executable,
             str(probe_copy(run_id)),
             "trap-run",
@@ -615,13 +741,12 @@ def _arm_trap(run_id: str, bdf: str, *, grace: int, window: int) -> str:
 
 
 def trap_run(arguments: argparse.Namespace) -> None:
-    """Inside the trap unit: wait for the product's bind, then re-unbind once.
+    """Inside the trap unit: wait for the fixture's unbind, then the product's
+    bind, then re-unbind once.
 
     Prints nothing the runner reads (it runs detached); it records its own
     outcome in ``trap-fired`` so ``summary`` can report it.
     """
-
-    import time
 
     run_id = checked_run_id(arguments.run_id)
     bdf = normalize_bdf(arguments.pci_bdf)
@@ -633,23 +758,40 @@ def trap_run(arguments: argparse.Namespace) -> None:
     )
     directory = state_dir(run_id)
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    deadline = time.monotonic() + window
+    deadline = monotonic_clock() + window
+
+    def not_fired(reason: str) -> None:
+        (directory / "trap-fired").write_text(
+            json.dumps({"fired": False, "reason": reason, "at": utc_now()}),
+            encoding="utf-8",
+        )
+
+    # The trap is armed BEFORE trap_unbind's own unbind (state first, then the
+    # mutation), so the baseline binding still stands when this starts: wait
+    # for the fixture's unbind first, or the baseline would count as the
+    # product's bind, the function would be unbound twice at once, the
+    # product's later bind would stand, and the variant would fail the product
+    # for the harness's own race.
+    unbound_seen = False
+    while monotonic_clock() < deadline:
+        if not is_bound(bdf):
+            unbound_seen = True
+            break
+        pause(1)
+    if not unbound_seen:
+        not_fired("unbind not observed")
+        return
     bound_seen = False
-    while time.monotonic() < deadline:
+    while monotonic_clock() < deadline:
         if is_bound(bdf) and bound_driver(bdf) == DRIVER:
             bound_seen = True
             break
-        time.sleep(1)
+        pause(1)
     if not bound_seen:
-        (directory / "trap-fired").write_text(
-            json.dumps(
-                {"fired": False, "reason": "bind not observed", "at": utc_now()}
-            ),
-            encoding="utf-8",
-        )
+        not_fired("bind not observed")
         return
     # Let the Node Agent's synchronous bind read-back record SUCCEEDED first.
-    time.sleep(grace)
+    pause(grace)
     _unbind(bdf)
     (directory / "trap-fired").write_text(
         json.dumps({"fired": True, "bound": is_bound(bdf), "at": utc_now()}),
@@ -690,13 +832,16 @@ def release(arguments: argparse.Namespace) -> None:
     state = load_state(run_id)
     # Stop the trap first so it cannot re-unbind after we rebind.
     disarmed = _disarm(run_id)
-    override_before = read_override(bdf) if device_dir(bdf).is_dir() else None
-    if device_dir(bdf).is_dir() and read_override(bdf) != NO_OVERRIDE:
+    present = device_dir(bdf).is_dir()
+    override_before = read_override(bdf) if present else None
+    if override_before is not None:
+        # The ABI's clearing write ("echo > driver_override"); the kernel's
+        # "(null)" read-back needs none and is never a stored name.
         _set_override(bdf, "")
     _bind(bdf)
     # The end state the deadman and the harness both guarantee.
     bound = is_bound(bdf) and bound_driver(bdf) == DRIVER
-    override = read_override(bdf) if device_dir(bdf).is_dir() else NO_OVERRIDE
+    override = read_override(bdf) if present else None
     module = efa_module_loaded()
     remaining = run_units(run_id)
     # Only the units that are still loaded block "clean"; a .timer/.service
@@ -704,7 +849,7 @@ def release(arguments: argparse.Namespace) -> None:
     stuck = [
         name for name in remaining if unit_state(name).get("LoadState") != "not-found"
     ]
-    clean = bound and override == NO_OVERRIDE and module and not stuck
+    clean = bound and override is None and module and not stuck
     receipt = {
         "run_id": run_id,
         "pci_bdf": bdf,
@@ -714,6 +859,7 @@ def release(arguments: argparse.Namespace) -> None:
         "bound": bound,
         "driver": bound_driver(bdf),
         "driver_override": override,
+        "driver_override_sysfs": override_sysfs_text(bdf) if present else None,
         "module_loaded": module,
         "trap_fired": read_text(state_dir(run_id) / "trap-fired") or None,
         "disarmed": disarmed,
@@ -730,16 +876,20 @@ def release(arguments: argparse.Namespace) -> None:
                 path.unlink()
         emit(receipt)
         if not clean:
+            # The receipt line above is not what the host fixture reads (it
+            # keeps the last line only): carry it as the error's detail.
             raise ProbeError(
                 f"EFA driver fixture did not restore {bdf}: "
                 f"bound={bound} override={override!r} module_loaded={module} "
-                f"units={stuck}"
+                f"units={stuck}",
+                reason="not_restored",
+                detail=receipt,
             )
     else:
         emit(receipt)
         if not clean:
             # A nonzero exit makes the deadman's Restart=on-failure retry.
-            raise ProbeError(f"deadman could not restore {bdf}")
+            raise ProbeError(f"deadman could not restore {bdf}", reason="not_restored")
 
 
 def show_summary(arguments: argparse.Namespace) -> None:
@@ -800,7 +950,16 @@ def parser() -> argparse.ArgumentParser:
 
 #: This file's own helpers: the failing *step* is the frame above them.
 HELPER_FRAMES = frozenset(
-    {"run", "bounded", "checked_run_id", "normalize_bdf", "emit", "read_text"}
+    {
+        "run",
+        "bounded",
+        "checked_run_id",
+        "normalize_bdf",
+        "emit",
+        "read_text",
+        "read_override",
+        "override_name",
+    }
 )
 
 
@@ -819,6 +978,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         arguments.handler(arguments)
     except Exception as exc:  # noqa: BLE001 - reported as the probe's JSON error
+        # The host fixture's exception text shows only whitelisted tokens (the
+        # class, the message digest, the site, a closed-vocabulary reason);
+        # the message and the structured detail travel on the same line and
+        # the fixture keeps them, redacted, as the case's ``probe-error.json``
+        # -- the lane the source-replay probe uses. The first live refusal
+        # (2026-10-27) carried only the digest, and the message ("... already
+        # has a driver_override: '(null)'") had to be rebuilt from the survey.
         emit(
             {
                 "error": type(exc).__name__,
@@ -826,6 +992,9 @@ def main(argv: list[str] | None = None) -> int:
                 "error_class": type(exc).__name__,
                 "error_code": hashlib.sha256(str(exc).encode()).hexdigest()[:16],
                 "error_site": exception_site(exc),
+                "error_reason": getattr(exc, "reason", None),
+                "error_message": str(exc)[:2000],
+                "error_detail": getattr(exc, "detail", None),
                 "command": arguments.command,
             }
         )
