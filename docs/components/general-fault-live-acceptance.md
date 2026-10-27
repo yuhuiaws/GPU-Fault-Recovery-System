@@ -661,6 +661,16 @@ socket 挂载识别、EFA plugin 的 DaemonSet 名由节点 provider 决定、SI
 产品的探针与重启两种 provider 相同），HyperPod 的健康监控代理只看 GPU/EFA 硬件而不看 plugin，且车道
 预检已要求 `NodeRecovery=None`。
 
+EFA plugin 的 DaemonSet 名现由目标节点标签推出的 provider 经产品自身的按 provider 表
+（`node_provider.EFA_DEVICE_PLUGIN_NAMES`）解析，而不再读夹具进程自身的环境：协调主机上没有
+`GPU_FAULT_CLUSTER_PROVIDER`，产品助手缺省即 HyperPod，plain EKS 车道的 `efa_plugin` 因此曾被判
+BLOCKED（2026-10-27 10:53Z，`FIXTURE_NOT_READY expected one
+hyperpod-dependencies-aws-efa-k8s-device-plugin DaemonSet on the cluster, found 0`）；发现步骤还交叉
+核对所选 DaemonSet 带 chart 身份标签 `app.kubernetes.io/name=aws-efa-k8s-device-plugin`（或同名镜像）
+及产品重启所选的 `name=` 标签，不符时的 FIXTURE_NOT_READY 同时列出期望名、其来源与集群上实际带该身份的
+DaemonSet，产品侧 `GPU_FAULT_EFA_DEVICE_PLUGIN_NAME` 覆盖值夹具不读取（按 provider 缺省名；
+`general_live_device_plugin_targets.py`）。
+
 ### GF-GENERAL-LIVE-015
 
 必测：`critical`、`nonrecoverable`、`healthy`、`wrong_column`、

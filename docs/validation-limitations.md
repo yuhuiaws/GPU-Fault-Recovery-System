@@ -2583,6 +2583,21 @@ product's probe and restart run on both providers), HyperPod's
 health-monitoring agent watches GPU/EFA hardware rather than the plugin, and
 the lane preflight requires `NodeRecovery=None` there.
 
+Live 2026-10-27 10:53Z the plain-EKS `efa_plugin` ended BLOCKED
+`FIXTURE_NOT_READY expected one hyperpod-dependencies-aws-efa-k8s-device-plugin
+DaemonSet on the cluster, found 0` because the fixture read the product helper
+`node_provider.efa_device_plugin_name()` with the coordinator process's own
+environment, which carries no `GPU_FAULT_CLUSTER_PROVIDER` and therefore means
+HyperPod; the name is now resolved from the target node's provider (its labels,
+the lane preflight's own test) through the product's per-provider table, the
+discovery cross-checks the selected DaemonSet's chart identity
+(`app.kubernetes.io/name=aws-efa-k8s-device-plugin` or the image basename) and
+the product's `name=` restart selector and lists the DaemonSets actually
+carrying that identity when they differ, and a product-side
+`GPU_FAULT_EFA_DEVICE_PLUGIN_NAME` override is not read (the harness has no
+reader of the executor's effective environment; the per-provider default is
+what it expects) -- `scripts/e2e/regional/general_live_device_plugin_targets.py`.
+
 ## GF-GENERAL-LIVE live acceptance runner (phase 2, lane K)
 
 Phase 2 adds reviewed `live-replay` categories that drive the product's own

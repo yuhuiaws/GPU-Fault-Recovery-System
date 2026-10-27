@@ -45,7 +45,9 @@ harness may do to a live shared node produces. ``expected_unknown`` /
 ``mig_timeslicing`` / ``running_training`` stay deferred in
 ``general_live_inventory``. Every variant is registered on both clusters:
 nothing in the freeze or in the product's probe and restart is
-provider-specific, and the lane preflight requires ``NodeRecovery=None`` on
+provider-specific -- the EFA plugin's DaemonSet name follows the target node's
+provider (``general_live_device_plugin_targets``), never this process's
+environment -- and the lane preflight requires ``NodeRecovery=None`` on
 HyperPod.
 
 Reusable entry points: the probe's ``freeze`` / ``resume`` / ``cleanup`` /
@@ -58,7 +60,6 @@ Reusable entry points: the probe's ``freeze`` / ``resume`` / ``cleanup`` /
 from __future__ import annotations
 
 import json
-import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -68,9 +69,15 @@ from gpu_fault.adapters.kubernetes.node_operations import (
     companion_pod,
     pod_terminating,
 )
-from gpu_fault.node_provider import efa_device_plugin_name
-from scripts.e2e.regional.collector_device_plugin_fixture import companion_daemonset
 from scripts.e2e.regional.general_live_common import activity, run_survey
+from scripts.e2e.regional.general_live_device_plugin_targets import (
+    GPU_TARGET,
+    PluginTarget,
+    efa_target,
+    plugin_binary_candidates,
+    plugin_daemonset,
+    target_cluster_provider,
+)
 from scripts.e2e.regional.general_live_fixture import (
     PROBES,
     ProbeHandle,
@@ -172,82 +179,6 @@ VALIDATION_FAILURE_DEFERRED = (
     "replacement that never becomes Ready cannot be produced without excluding the "
     "DaemonSet (the COLLECT-017 path on a cluster-wide object the other lane shares)"
 )
-
-
-@dataclass(frozen=True)
-class PluginTarget:
-    """One device plugin: how it is discovered and how the product grades it."""
-
-    kind: str  # "gpu" | "efa"
-    resource: str  # the kubelet resource name
-    daemonset_token: str  # the substring that identifies its DaemonSet
-    binaries: tuple[str, ...]  # candidate process basenames (probe allow-list)
-    restart_operation: str
-    validate_operation: str
-    #: The plugin's socket under ``/var/lib/kubelet/device-plugins`` (verified
-    #: live on both clusters); the liveness sample's ``sockets`` must name it.
-    socket_name: str
-
-    @property
-    def liveness_metric(self) -> str:
-        return f"{self.kind}_device_plugin_unresponsive"
-
-    @property
-    def mismatch_metric(self) -> str:
-        return f"{self.kind}_kubernetes_allocatable_mismatch"
-
-    @property
-    def allocatable_metric(self) -> str:
-        return f"{self.kind}_kubernetes_allocatable_count"
-
-    @property
-    def expected_metric(self) -> str:
-        return f"{self.kind}_kubernetes_expected_count"
-
-    @property
-    def metrics(self) -> set[str]:
-        return {
-            self.liveness_metric,
-            self.mismatch_metric,
-            self.allocatable_metric,
-            self.expected_metric,
-            f"{self.kind}_kubernetes_allocatable_missing_count",
-        }
-
-
-GPU_TARGET = PluginTarget(
-    kind="gpu",
-    resource="nvidia.com/gpu",
-    daemonset_token="nvidia-device-plugin",
-    binaries=("nvidia-device-plugin",),
-    restart_operation="RESTART_GPU_DEVICE_PLUGIN",
-    validate_operation="VALIDATE_GPU",
-    socket_name="nvidia-gpu.sock",
-)
-
-
-def efa_target() -> PluginTarget:
-    """The EFA plugin target; its DaemonSet name label is provider-specific."""
-
-    return PluginTarget(
-        kind="efa",
-        resource="vpc.amazonaws.com/efa",
-        daemonset_token=efa_device_plugin_name(),
-        # The process basename differs by provider: the HyperPod EFA plugin's
-        # container runs ``efa-k8s-device-plugin`` although its Pod command/
-        # image basename is ``aws-efa-k8s-device-plugin`` (live refusal record,
-        # hp lane 2026-10-27); the probe signals only the intersection of this
-        # request with its own static allow-list.
-        binaries=(
-            "efa-k8s-device-plugin",
-            "aws-efa-k8s-device-plugin",
-            "k8s-device-plugin",
-            "device-plugin",
-        ),
-        restart_operation="RESTART_EFA_DEVICE_PLUGIN",
-        validate_operation="VALIDATE_FABRIC",
-        socket_name="aws-efa-device-plugin.sock",
-    )
 
 
 # --------------------------------------------------------------------------- #
@@ -364,21 +295,13 @@ class DevicePluginRegistrationFixture:
         daemonsets = self._gpu_json(
             "get", "daemonset", "-o", "json", all_namespaces=True
         )
-        matches = [
-            item
-            for item in daemonsets.get("items", [])
-            if self.target.daemonset_token.lower()
-            in json.dumps(item, sort_keys=True).lower()
-            and int((item.get("status") or {}).get("desiredNumberScheduled") or 0) > 0
-            and not companion_daemonset(item)
-        ]
-        if len(matches) != 1:
-            raise VariantBlocked(
-                "FIXTURE_NOT_READY",
-                f"expected one {self.target.daemonset_token} DaemonSet on the "
-                f"cluster, found {len(matches)}",
-            )
-        item = matches[0]
+        # The one DaemonSet the target names, cross-checked against the chart's
+        # identity label / image and the product's own restart selector; the
+        # refusal names the expected DaemonSet and the ones actually present
+        # (the plain-EKS efa_plugin BLOCKED of 2026-10-27 had asked for the
+        # HyperPod name: the coordinator's environment, not the target node's
+        # provider, had chosen it).
+        item = plugin_daemonset(list(daemonsets.get("items", [])), self.target)
         self.namespace = str(item["metadata"]["namespace"])
         self.daemonset = str(item["metadata"]["name"])
         self.daemonset_uid = str(item["metadata"].get("uid") or "")
@@ -407,6 +330,9 @@ class DevicePluginRegistrationFixture:
             "namespace": self.namespace,
             "daemonset": self.daemonset,
             "daemonset_uid": self.daemonset_uid,
+            "daemonset_token": self.target.daemonset_token,
+            "daemonset_name_source": self.target.name_source,
+            "product_selector": self.target.selector,
             "resource": self.target.resource,
             "socket_name": self.target.socket_name,
             "baseline_allocatable": self.baseline_allocatable,
@@ -1009,9 +935,15 @@ def gpu_plugin(ctx: VariantContext) -> dict[str, Any]:
 
 
 def efa_plugin(ctx: VariantContext) -> dict[str, Any]:
-    """Freeze the EFA device plugin; the product restarts it, no reboot."""
+    """Freeze the EFA device plugin; the product restarts it, no reboot.
 
-    return _restart_variant(ctx, efa_target(), grade_replacement=False)
+    The plugin's DaemonSet name follows the target node's provider
+    (``target_cluster_provider``), never this process's environment.
+    """
+
+    return _restart_variant(
+        ctx, efa_target(target_cluster_provider(ctx)), grade_replacement=False
+    )
 
 
 def replacement_uid(ctx: VariantContext) -> dict[str, Any]:
@@ -1280,46 +1212,6 @@ def _no_plugin_restart_errors(
 # --------------------------------------------------------------------------- #
 # shared helpers
 # --------------------------------------------------------------------------- #
-#: Launcher/shim basenames that are never the plugin itself; a ``/bin/sh -c``
-#: entrypoint must not widen the set of processes the probe may signal.
-_BINARY_NOISE = frozenset(
-    {"sh", "bash", "dash", "ash", "env", "tini", "dumb-init", "pause", "exec"}
-)
-_SAFE_BINARY = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
-
-
-def plugin_binary_candidates(pod: dict[str, Any]) -> tuple[str, ...]:
-    """Process basenames the plugin container might run, from the Pod spec.
-
-    The probe's static allow-list is provider-blind; these are the discovered
-    Pod's *own* declared command and image basenames, passed as
-    ``--pod-command-binary`` so the probe matches the real plugin process (the
-    HyperPod EFA plugin's basename is none of the static names) while still
-    requiring the pod-UID cgroup match. Shim names are dropped.
-    """
-
-    candidates: list[str] = []
-
-    def add(value: Any) -> None:
-        if not isinstance(value, str) or not value:
-            return
-        base = value.rsplit("/", 1)[-1]
-        if base and base not in _BINARY_NOISE and _SAFE_BINARY.fullmatch(base):
-            if base not in candidates:
-                candidates.append(base)
-
-    spec = pod.get("spec") or {}
-    for container in spec.get("containers") or []:
-        command = container.get("command") or []
-        if command:
-            add(command[0])
-        image = container.get("image")
-        if isinstance(image, str):
-            last = image.rsplit("/", 1)[-1].split("@", 1)[0].split(":", 1)[0]
-            add(last)
-    return tuple(candidates)
-
-
 def _pod_ready(pod: dict[str, Any]) -> bool:
     conditions = (pod.get("status") or {}).get("conditions") or []
     return any(
@@ -1427,8 +1319,8 @@ VARIANTS = [
     _spec(
         "efa_plugin",
         injection=(
-            "SIGSTOP the EFA device-plugin container process on the node; "
-            + _FREEZE_EFFECT
+            "SIGSTOP the EFA device-plugin container process on the node (its "
+            "DaemonSet named by the target node's provider); " + _FREEZE_EFFECT
         ),
         expected=_RESTART_EXPECTED.format(
             metric="efa_device_plugin_unresponsive",

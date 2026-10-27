@@ -22,8 +22,14 @@ from typing import Any, Callable
 
 import pytest
 
+from gpu_fault.cluster_scope import PROVIDER_ENV, ClusterProvider
+from gpu_fault.node_provider import EFA_DEVICE_PLUGIN_ENV, EFA_DEVICE_PLUGIN_NAMES
 from scripts.e2e.regional import general_live_device_plugin as mod
-from scripts.e2e.regional.general_live_fixture import VariantInconclusive
+from scripts.e2e.regional import general_live_device_plugin_targets as targets
+from scripts.e2e.regional.general_live_fixture import (
+    VariantBlocked,
+    VariantInconclusive,
+)
 from scripts.e2e.regional.general_live_registry import (
     APPROVALS,
     coverage_rows,
@@ -32,6 +38,17 @@ from scripts.e2e.regional.general_live_registry import (
 from scripts.e2e.regional.general_live_store import ACTIVITY_PROBE, PREFLIGHT_PROBE
 from scripts.e2e.regional.regional_commands import RegionalFixtureError
 from scripts.e2e.regional.regional_live_fixture import RegionalLiveSettings
+from tests.regional._device_plugin_listings import (
+    DEVICE_PLUGINS_MOUNT,
+    EFA_IMAGE,
+    EFA_UID,
+    EKS_LABELS,
+    HP_LABELS,
+    NVDP_IMAGE,
+    chart_daemonset,
+    eks_daemonsets,
+    hp_daemonsets,
+)
 from tests.regional._general_live_fakes import FakeProbe, make_context, make_settings
 
 NODE = "ip-10-0-43-5.us-west-2.compute.internal"
@@ -41,6 +58,9 @@ U0 = "00000000-0000-0000-0000-00000000aaaa"
 U1 = "00000000-0000-0000-0000-00000000bbbb"
 U2 = "00000000-0000-0000-0000-00000000cccc"
 SPECS = {spec.variant: spec for spec in mod.VARIANTS}
+#: The EFA target per provider; a ``FakeCluster`` node is plain-EKS by default.
+EFA_EKS = mod.efa_target(ClusterProvider.EKS_MANAGED)
+EFA_HP = mod.efa_target(ClusterProvider.HYPERPOD)
 FROZEN_EPOCH = 1_761_559_200.0
 FIRST_TIMEOUT = {
     "kind": "timeout",
@@ -71,16 +91,27 @@ def _kubeconfig(name: str) -> Path:
     return path
 
 
-def _daemonset(name: str, token: str, uid: str) -> dict[str, Any]:
+def _daemonset(
+    name: str, token: str, uid: str, *, identity: str | None = None
+) -> dict[str, Any]:
+    # The product's restart selector (``name=`` for EFA, the identity label for
+    # the GPU plugin) and the chart's identity label, as the live charts carry.
+    labels = {"name": token, targets.IDENTITY_LABEL: identity or token}
     return {
-        "metadata": {"namespace": "kube-system", "name": name, "uid": uid},
+        "metadata": {
+            "namespace": "kube-system",
+            "name": name,
+            "uid": uid,
+            "labels": labels,
+        },
         "spec": {
             "template": {
+                "metadata": {"labels": labels},
                 "spec": {
                     "volumes": [
                         {"hostPath": {"path": "/var/lib/kubelet/device-plugins"}}
                     ]
-                }
+                },
             }
         },
         "status": {"desiredNumberScheduled": 1},
@@ -120,6 +151,8 @@ class FakeCluster:
         pods: list[dict[str, Any]],
         activity: Callable[[tuple[str, ...]], dict[str, Any]] | None = None,
         control_plane: dict[str, Any] | None = None,
+        daemonsets: list[dict[str, Any]] | None = None,
+        labels: dict[str, str] | None = None,
     ) -> None:
         self.settings = RegionalLiveSettings(
             cpu_kubeconfig=_kubeconfig("cpu"),
@@ -132,6 +165,10 @@ class FakeCluster:
         self.resource = resource
         self.allocatable_value = baseline
         self.daemonset = daemonset
+        #: The whole ``get daemonset -A`` listing; default: ``daemonset`` alone.
+        self.daemonsets = daemonsets
+        #: The target node's labels: a plain-EKS node-group node by default.
+        self.labels = labels or {"eks.amazonaws.com/nodegroup": "g"}
         self.pods = pods
         self.activity_responder = activity or (
             lambda a: _doc(incidents=[], workflows=[])
@@ -154,7 +191,7 @@ class FakeCluster:
         }
 
     def node_metadata(self, node: str) -> dict[str, Any]:
-        return {"name": NODE, "labels": {"eks.amazonaws.com/nodegroup": "g"}}
+        return {"name": NODE, "labels": dict(self.labels)}
 
     def evidence_identity(self, **_: Any) -> dict[str, str]:
         return {"release_id": "rel", "cluster_id": "gpu-eks-cluster"}
@@ -180,7 +217,8 @@ class FakeCluster:
     ) -> str:
         args = list(arguments)
         if args[:2] == ["get", "daemonset"]:
-            return json.dumps({"items": [self.daemonset]})
+            listing = [self.daemonset] if self.daemonsets is None else self.daemonsets
+            return json.dumps({"items": listing})
         if args[:2] == ["get", "pod"]:
             return json.dumps({"items": self.pods})
         if args[:2] == ["get", "node"]:
@@ -195,7 +233,12 @@ class FakeCluster:
 
 
 def _cluster(target: mod.PluginTarget, **options: Any) -> FakeCluster:
-    ds = _daemonset(f"{target.daemonset_token}-ds", target.daemonset_token, "ds-uid")
+    ds = _daemonset(
+        f"{target.daemonset_token}-ds",
+        target.daemonset_token,
+        "ds-uid",
+        identity=target.identity_name,
+    )
     return FakeCluster(
         resource=target.resource,
         baseline=8,
@@ -558,14 +601,14 @@ def test_registry_shapes() -> None:
     assert "nvidia-gpu.sock" in SPECS["gpu_plugin"].expected
     assert "aws-efa-device-plugin.sock" in SPECS["efa_plugin"].expected
     assert mod.GPU_TARGET.liveness_metric in mod.GPU_TARGET.metrics
-    assert mod.efa_target().socket_name == "aws-efa-device-plugin.sock"
+    assert EFA_EKS.socket_name == EFA_HP.socket_name == "aws-efa-device-plugin.sock"
 
 
 # --------------------------------------------------------------------------- #
 # gpu_plugin / efa_plugin against the liveness-probe product
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize(
-    "variant,target", [("gpu_plugin", mod.GPU_TARGET), ("efa_plugin", mod.efa_target())]
+    "variant,target", [("gpu_plugin", mod.GPU_TARGET), ("efa_plugin", EFA_EKS)]
 )
 def test_plugin_restart_pass_on_the_liveness_product(
     variant: str, target: mod.PluginTarget
@@ -837,7 +880,7 @@ def test_freeze_inconclusive_when_no_process() -> None:
 
 
 @pytest.mark.parametrize(
-    "variant,target", [("gpu_plugin", mod.GPU_TARGET), ("efa_plugin", mod.efa_target())]
+    "variant,target", [("gpu_plugin", mod.GPU_TARGET), ("efa_plugin", EFA_EKS)]
 )
 def test_freeze_inconclusive_immediately_when_not_stopped(
     variant: str, target: mod.PluginTarget
@@ -1051,8 +1094,6 @@ def test_cleanup_refuses_when_probe_not_clean() -> None:
 
 
 def test_discover_blocks_on_missing_daemonset() -> None:
-    from scripts.e2e.regional.general_live_fixture import VariantBlocked
-
     target = mod.GPU_TARGET
     ds = _daemonset("other", "something-else", "ds-uid")
     cluster = FakeCluster(resource=target.resource, baseline=8, daemonset=ds, pods=[])
@@ -1086,7 +1127,7 @@ def test_plugin_targets_request_only_allow_listed_binaries() -> None:
 
     from scripts.e2e.regional.probes import general_live_device_plugin_probe as probe
 
-    for target in (mod.GPU_TARGET, mod.efa_target()):
+    for target in (mod.GPU_TARGET, EFA_EKS, EFA_HP):
         off_list = [
             item
             for item in target.binaries
@@ -1095,4 +1136,269 @@ def test_plugin_targets_request_only_allow_listed_binaries() -> None:
         assert off_list == [], (
             f"{target.kind} requests binaries the probe drops: {off_list}"
         )
-    assert "efa-k8s-device-plugin" in mod.efa_target().binaries
+    assert "efa-k8s-device-plugin" in EFA_HP.binaries
+
+
+# --------------------------------------------------------------------------- #
+# the EFA DaemonSet name follows the target cluster's provider; chart siblings
+# (both clusters' live DaemonSet listings: tests/regional/_device_plugin_listings)
+# --------------------------------------------------------------------------- #
+def _listing_cluster(
+    items: list[dict[str, Any]],
+    *,
+    resource: str,
+    labels: dict[str, str],
+    pods: list[dict[str, Any]] | None = None,
+) -> FakeCluster:
+    return FakeCluster(
+        resource=resource,
+        baseline=8,
+        daemonset=items[0],
+        daemonsets=items,
+        pods=[_pod(U0, ds_uid=EFA_UID)] if pods is None else pods,
+        labels=labels,
+    )
+
+
+def test_efa_target_follows_the_target_provider_not_the_coordinator_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The harness process's own environment never decides the EFA DaemonSet
+    name: not its absence of ``GPU_FAULT_CLUSTER_PROVIDER`` (the live
+    coordinator state that asked the plain-EKS cluster for the HyperPod name),
+    not any value of it, not an EFA-name override set there. The target
+    cluster's provider does, through the product's own per-provider table."""
+
+    monkeypatch.delenv(PROVIDER_ENV, raising=False)
+    monkeypatch.delenv(EFA_DEVICE_PLUGIN_ENV, raising=False)
+    assert (
+        mod.efa_target(ClusterProvider.EKS_MANAGED).daemonset_token
+        == "aws-efa-k8s-device-plugin"
+    )
+    assert (
+        mod.efa_target(ClusterProvider.HYPERPOD).daemonset_token
+        == "hyperpod-dependencies-aws-efa-k8s-device-plugin"
+    )
+    monkeypatch.setenv(PROVIDER_ENV, ClusterProvider.HYPERPOD.value)
+    monkeypatch.setenv(EFA_DEVICE_PLUGIN_ENV, "coordinator-only-override")
+    for provider in ClusterProvider:
+        target = mod.efa_target(provider)
+        assert target.daemonset_token == EFA_DEVICE_PLUGIN_NAMES[provider]
+        assert target.selector == f"name={EFA_DEVICE_PLUGIN_NAMES[provider]}"
+        assert target.identity_name == "aws-efa-k8s-device-plugin"
+        assert target.image_basename == "aws-efa-k8s-device-plugin"
+        assert f"{PROVIDER_ENV}={provider.value}" in target.name_source
+    assert targets.GPU_TARGET.selector == "app.kubernetes.io/name=nvidia-device-plugin"
+
+
+@pytest.mark.parametrize(
+    "labels,provider",
+    [(EKS_LABELS, ClusterProvider.EKS_MANAGED), (HP_LABELS, ClusterProvider.HYPERPOD)],
+    ids=["eks", "hp"],
+)
+def test_target_cluster_provider_reads_the_target_nodes_labels(
+    labels: dict[str, str], provider: ClusterProvider
+) -> None:
+    cluster = _listing_cluster(
+        eks_daemonsets(), resource="vpc.amazonaws.com/efa", labels=labels
+    )
+    spec, ctx = _context("efa_plugin", cluster, _plugin_probe(cluster))
+    assert targets.target_cluster_provider(ctx) is provider
+
+
+def test_target_cluster_provider_refuses_a_node_of_unknown_provider() -> None:
+    cluster = _listing_cluster(
+        eks_daemonsets(),
+        resource="vpc.amazonaws.com/efa",
+        labels={"kubernetes.io/hostname": "somewhere"},
+    )
+    spec, ctx = _context("efa_plugin", cluster, _plugin_probe(cluster))
+    with pytest.raises(VariantBlocked, match="FIXTURE_NOT_READY.*cannot be derived"):
+        targets.target_cluster_provider(ctx)
+
+
+@pytest.mark.parametrize(
+    "labels,listing,expected",
+    [
+        (EKS_LABELS, eks_daemonsets, "aws-efa-k8s-device-plugin"),
+        (HP_LABELS, hp_daemonsets, "hyperpod-dependencies-aws-efa-k8s-device-plugin"),
+    ],
+    ids=["eks", "hp"],
+)
+def test_efa_discovery_selects_the_providers_daemonset_on_each_cluster(
+    labels: dict[str, str], listing: Callable[[], list[dict[str, Any]]], expected: str
+) -> None:
+    cluster = _listing_cluster(
+        listing(), resource="vpc.amazonaws.com/efa", labels=labels
+    )
+    spec, ctx = _context("efa_plugin", cluster, _plugin_probe(cluster))
+    target = mod.efa_target(targets.target_cluster_provider(ctx))
+    evidence = mod.DevicePluginRegistrationFixture(ctx, target).discover()
+    assert evidence["namespace"] == "kube-system"
+    assert evidence["daemonset"] == expected
+    assert evidence["daemonset_uid"] == EFA_UID
+    assert evidence["product_selector"] == f"name={expected}"
+    assert "derived from the target node's labels" in evidence["daemonset_name_source"]
+
+
+def test_efa_plugin_passes_against_the_plain_eks_listing() -> None:
+    """The whole variant against the plain-EKS cluster's DaemonSet set -- the
+    run that ended BLOCKED live -- on a plain-EKS node."""
+
+    cluster = _listing_cluster(
+        eks_daemonsets(), resource="vpc.amazonaws.com/efa", labels=EKS_LABELS
+    )
+    cluster.activity_responder = _restart_scenario(EFA_EKS, cluster)
+    plugin = _plugin_probe(cluster)
+    spec, ctx = _context("efa_plugin", cluster, plugin)
+    result = spec.execute(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    discovered = json.loads(
+        (ctx.case_dir / "plugin-discover.json").read_text(encoding="utf-8")
+    )
+    assert discovered["daemonset"] == "aws-efa-k8s-device-plugin"
+    assert discovered["daemonset_token"] == "aws-efa-k8s-device-plugin"
+    assert (
+        result["liveness_sample"]["labels"]["sockets"] == "aws-efa-device-plugin.sock"
+    )
+
+
+def test_efa_discovery_refusal_names_the_expected_and_the_present_daemonsets() -> None:
+    """The live 2026-10-27 shape: the HyperPod name asked of the plain-EKS
+    cluster. The refusal names the expected DaemonSet and where its name came
+    from, and the EFA DaemonSet actually present under the chart's identity."""
+
+    cluster = _listing_cluster(
+        eks_daemonsets(), resource="vpc.amazonaws.com/efa", labels=EKS_LABELS
+    )
+    spec, ctx = _context("efa_plugin", cluster, _plugin_probe(cluster))
+    with pytest.raises(VariantBlocked) as caught:
+        mod.DevicePluginRegistrationFixture(ctx, EFA_HP).discover()
+    message = str(caught.value)
+    assert message.startswith(
+        "FIXTURE_NOT_READY: expected one "
+        "hyperpod-dependencies-aws-efa-k8s-device-plugin DaemonSet (the product's "
+        "hyperpod default, GPU_FAULT_CLUSTER_PROVIDER=hyperpod derived from the "
+        "target node's labels) whose Pod template carries "
+        "name=hyperpod-dependencies-aws-efa-k8s-device-plugin on the cluster, "
+        "found 0; "
+    ), message
+    assert (
+        "DaemonSets carrying the efa plugin's identity "
+        "(app.kubernetes.io/name=aws-efa-k8s-device-plugin or image "
+        "aws-efa-k8s-device-plugin): kube-system/aws-efa-k8s-device-plugin "
+        f"({EFA_IMAGE}:v0.5.21-eksbuild.13; without the product's selector label "
+        "name=hyperpod-dependencies-aws-efa-k8s-device-plugin)"
+    ) in message
+    assert "nvdp" not in message
+
+
+def test_efa_discovery_refuses_the_eks_name_on_the_hyperpod_listing() -> None:
+    """The mirror image: the plain-EKS name is a substring of the HyperPod
+    DaemonSet's name and labels, so the token alone would have accepted it;
+    the product's ``name=`` selector label is what refuses it."""
+
+    cluster = _listing_cluster(
+        hp_daemonsets(), resource="vpc.amazonaws.com/efa", labels=HP_LABELS
+    )
+    spec, ctx = _context("efa_plugin", cluster, _plugin_probe(cluster))
+    with pytest.raises(VariantBlocked) as caught:
+        mod.DevicePluginRegistrationFixture(ctx, EFA_EKS).discover()
+    message = str(caught.value)
+    assert "expected one aws-efa-k8s-device-plugin DaemonSet" in message
+    assert "found 0;" in message
+    assert (
+        "kube-system/hyperpod-dependencies-aws-efa-k8s-device-plugin "
+        f"({EFA_IMAGE}:v0.5.12; without the product's selector label "
+        "name=aws-efa-k8s-device-plugin)"
+    ) in message
+
+
+def test_efa_discovery_refuses_a_daemonset_that_only_shares_the_name() -> None:
+    """A DaemonSet named and labelled like the plugin but neither carrying the
+    chart's identity label nor running its image is not the plugin; the reason
+    says what it carries instead and that nothing else carries the identity."""
+
+    impostor = chart_daemonset(
+        "aws-efa-k8s-device-plugin",
+        labels={
+            "name": "aws-efa-k8s-device-plugin",
+            "app.kubernetes.io/name": "something-else",
+        },
+        image="registry.example/other/thing:1",
+        volumes=[DEVICE_PLUGINS_MOUNT],
+        uid=EFA_UID,
+    )
+    cluster = _listing_cluster(
+        [impostor], resource="vpc.amazonaws.com/efa", labels=EKS_LABELS
+    )
+    spec, ctx = _context("efa_plugin", cluster, _plugin_probe(cluster))
+    with pytest.raises(VariantBlocked) as caught:
+        mod.DevicePluginRegistrationFixture(ctx, EFA_EKS).discover()
+    message = str(caught.value)
+    assert (
+        "kube-system/aws-efa-k8s-device-plugin is the one aws-efa-k8s-device-plugin "
+        "DaemonSet but carries neither app.kubernetes.io/name=aws-efa-k8s-device-plugin "
+        "nor an image named aws-efa-k8s-device-plugin (labels "
+    ) in message
+    assert '"app.kubernetes.io/name": "something-else"' in message
+    assert "registry.example/other/thing:1" in message
+    assert message.endswith("or image aws-efa-k8s-device-plugin): none"), message
+
+
+@pytest.mark.parametrize(
+    "listing,expected",
+    [
+        (eks_daemonsets, "nvdp-nvidia-device-plugin"),
+        (hp_daemonsets, "hyperpod-dependencies-nvidia-device-plugin"),
+    ],
+    ids=["eks", "hp"],
+)
+def test_gpu_discovery_never_selects_the_charts_siblings(
+    listing: Callable[[], list[dict[str, Any]]], expected: str
+) -> None:
+    """The plain-EKS nvdp chart's gpu-feature-discovery and mps-control-daemon
+    DaemonSets carry the plugin's labels and image; the kubelet device-plugins
+    mount is what tells the plugin from them, and only it is selected."""
+
+    items = listing()
+    plugin_uid = next(
+        item["metadata"]["uid"]
+        for item in items
+        if item["metadata"]["name"] == expected
+    )
+    cluster = _listing_cluster(
+        items,
+        resource="nvidia.com/gpu",
+        labels=EKS_LABELS,
+        pods=[_pod(U0, ds_uid=plugin_uid)],
+    )
+    spec, ctx = _context("gpu_plugin", cluster, _plugin_probe(cluster))
+    evidence = mod.DevicePluginRegistrationFixture(ctx, mod.GPU_TARGET).discover()
+    assert evidence["daemonset"] == expected
+    assert evidence["daemonset_uid"] == plugin_uid
+
+
+def test_gpu_discovery_refusal_explains_the_siblings_when_the_plugin_is_absent() -> (
+    None
+):
+    items = [
+        item
+        for item in eks_daemonsets()
+        if item["metadata"]["name"] != "nvdp-nvidia-device-plugin"
+    ]
+    cluster = _listing_cluster(
+        items, resource="nvidia.com/gpu", labels=EKS_LABELS, pods=[]
+    )
+    spec, ctx = _context("gpu_plugin", cluster, _plugin_probe(cluster))
+    with pytest.raises(VariantBlocked) as caught:
+        mod.DevicePluginRegistrationFixture(ctx, mod.GPU_TARGET).discover()
+    message = str(caught.value)
+    assert "expected one nvidia-device-plugin DaemonSet" in message
+    assert "found 0;" in message
+    for sibling in ("gpu-feature-discovery", "mps-control-daemon"):
+        assert (
+            f"kube-system/nvdp-nvidia-device-plugin-{sibling} ({NVDP_IMAGE}:v0.17.1; "
+            "companion: no kubelet device-plugins mount)"
+        ) in message
+    assert "aws-efa" not in message
