@@ -4231,7 +4231,14 @@ observed the node failing before the cap (`node_failures_observed` non-empty), o
 own (`failed_nodes`), escalates as designed; so does a plugin/driver recovery chain whose action itself failed.
 Before this the request applied to any FAILED validation, and with the collectors dark the cap's failure rebooted
 a node nothing had been learned about (GF-GENERAL-LIVE-013 `link_inactive`, live). The samples that raised the
-finding predate that moment and are not diagnostic evidence.
+finding predate that moment and are not diagnostic evidence. A count the host collector reported since the action is
+a verdict even when a collector the step waits for is stale or erroring: the gate fails the node on the fresh row and
+keeps the batch's collection errors beside it (`host_collector_errors`), but passes nothing on such a batch and reads
+no verdict from one whose inventory contributor itself failed (live 2026-10-27, GF-GENERAL-LIVE-013
+`post_repair_failure` on both clusters: the re-unbound function's 15/16 count arrived seconds after
+TRIGGER_HEALTH_SNAPSHOT, and the same batches' `_rdma` coverage error -- an inventory shortfall the traffic
+contributor no longer reports as a collection error -- kept the collector check from reading it until the cap
+withheld the reboot).
 Both modes record the reading each verdict rests on in the step record's `inventory_evidence` (node → metric →
 `value`/`expected`/`observed_at`). Before this, the validation waited for an action completion no step in the plan
 would produce, failed at the 600 s per-step cap, and the cap's failure escalated a node whose port had long been

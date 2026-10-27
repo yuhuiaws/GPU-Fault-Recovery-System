@@ -1605,7 +1605,13 @@ Semantics and boundaries of `eks-managed`:
   the node's gpu-fault DaemonSets/collectors first, then reruns the diagnostic or acts by hand. A validation that
   had observed the node failing before the cap, or whose verdict is the adapter's own, escalates as designed.
   (2026-10-25, plain EKS, GF-GENERAL-LIVE-013 `link_inactive`: with the collectors dark the validation waited out
-  the cap and the REBOOT_NODE request rebooted a node nothing had been learned about.)
+  the cap and the REBOOT_NODE request rebooted a node nothing had been learned about.) An inventory count the host
+  collector reported since the action is such a verdict even while the collector's status is erroring on another
+  contributor (`details.host_collector_errors` names the errors beside it), so a function that is unbound again
+  after the rebind ends the chain FAILED on `efa_inventory_active_count=15,expected=16` and opens the reboot rung
+  instead of this hand-off (2026-10-27, both clusters, GF-GENERAL-LIVE-013 `post_repair_failure`: the 15/16 count
+  arrived seconds after TRIGGER_HEALTH_SNAPSHOT, the `_rdma` coverage error of the same batches kept it unread for
+  600 s, and the reboot was withheld).
   **A workload restart waits for device-plugin health first**: before it creates the new attempt, RESTART_WORKLOAD
   reads, for every target node (the nodes the Pod templates pin with `nodeName`/`kubernetes.io/hostname`, plus the
   nodes this workflow repaired, minus `avoid_node_ids`), the `nvidia.com/gpu` `capacity` and `allocatable`, the

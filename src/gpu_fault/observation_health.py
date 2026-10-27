@@ -34,6 +34,32 @@ def observation_reason(
     return None
 
 
+def reported_since(
+    status: Any,
+    now: datetime,
+    max_age_seconds: float,
+    *,
+    after: datetime | None = None,
+) -> bool:
+    """Whether the collector delivered a batch -- clean or carrying a
+    collection error -- no older than ``max_age_seconds`` and after ``after``.
+
+    ``observation_reason`` judges the last *clean* batch (``last_success_at``);
+    this reads the newest batch of either kind: ``CollectorStatus.observed_at``
+    is the batch's own time and the store's merge keeps the newest
+    (``telemetry.merge_collector_status``). A validation that may fail a node
+    on what an erroring batch still read -- its inventory rows -- asks this
+    before it asks for a clean one.
+    """
+
+    if status is None or status.observed_at is None:
+        return False
+    age = (now - status.observed_at).total_seconds()
+    if age < 0 or age > max_age_seconds:
+        return False
+    return after is None or status.observed_at > after
+
+
 def record_observation(
     store: Any,
     cluster_id: str,

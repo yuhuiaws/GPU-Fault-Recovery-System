@@ -458,10 +458,20 @@ class HostNetworkMixin:
                     )
         expected = getattr(self, "expected_efa_device_count", None)
         if expected is not None and device_count != expected:
+            # The RDMA tree lists the functions the driver holds (the live
+            # probe's survey read ``rdma_device: null`` for the unbound one), so
+            # the aggregate covers part of the node's traffic and is withheld
+            # (``efa_traffic_observation_valid=0``). The shortfall itself is the
+            # inventory contributor's verdict -- ``efa_inventory_mismatch`` with
+            # ``failure_mode`` DRIVER_UNBOUND / PCI_DEVICE_MISSING /
+            # EXCESS_DEVICE -- not a reading this contributor failed to take. As
+            # a collection error it kept HOST_TELEMETRY erroring for exactly as
+            # long as the node was faulty: live 2026-10-27 (GF-GENERAL-LIVE-013
+            # ``post_repair_failure``, both clusters) the post-repair
+            # VALIDATE_FABRIC read no inventory from the erroring collector,
+            # waited out its 600 s cap and the reboot it asked for was withheld
+            # as missing evidence while every batch carried the 15/16 count.
             traffic_complete = False
-            errors.append(
-                f"incomplete EFA traffic coverage: {device_count}/{expected} devices"
-            )
         valid = traffic_complete and port_count > 0
         result.append(self._sample("efa_traffic_observation_valid", int(valid)))
         if valid:

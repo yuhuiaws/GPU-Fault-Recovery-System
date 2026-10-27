@@ -2786,6 +2786,42 @@ bundle 保守，却判 "did not request process state capture"，是 oracle 把 
   等细节一并记录）。清理补上交接路径的出口：`hand_back` 在夹具 release 之后（LIFO）、节点仍被隔离且本轮
   有 incident 时走产品的 validated restore（`restore_incidents`），重启路径下节点已被产品释放则跳过。
   HyperPod 节点在该次实跑后极可能仍带补救链的 cordon 与 ESCALATED incident，需按此出口放行。
+- 013 `post_repair_failure` 实测暴露的产品缺口与修复（2026-10-27，R13g，两个集群：HyperPod 07:08–07:51Z，
+  plain EKS ip-10-0-43-5 10:18–10:33Z）：REMEDIATE_EFA_DRIVER 重绑成功（SUCCEEDED 10:19:46.7Z），trap 4 s 后
+  再次解绑（10:19:50.3Z），RESTART_EFA_DEVICE_PLUGIN 已按插件未变的 allocatable 通过（10:19:48.2Z），
+  TRIGGER_HEALTH_SNAPSHOT 重启两个采集器（10:20:01.7Z），VALIDATE_FABRIC 等满 600 s 单步上限（10:30:06.2Z），
+  `node_pending = {node: {missing_or_stale_collectors: [HOST_TELEMETRY]}}`；产品扣住计划携带的 REBOOT_NODE
+  （`validation_evidence_missing`），开 `workflow-support-after-<record>`，节点保持 cordon 交人工。证据其实并不缺：
+  重启后的 host collector 第一拍（`host.request` 强制快照跳过启动错峰）读到 16 个 RDMA 设备中的 15 个，在最后一个
+  恢复步骤之后几秒就送出 `efa_inventory_active_count=15`（DRIVER_UNBOUND 判定）——正是 `inventory_observation_window`
+  要的样本——并持续送出（第二拍的 mismatch 边沿、每 300 s ±10 % 的健康摘要）。但同一批次还带着 RDMA 流量贡献者的
+  collection error `incomplete EFA traffic coverage: 15/16 devices`（`collectors/host/network.py` `_rdma`），
+  ingest 把带错误的批次记为 `last_success_at=None`（`app/ingest/telemetry_context.py` `_record_collector_status`），
+  HOST_TELEMETRY 状态在功能解绑期间一直是 COLLECTION_ERROR / NO_POST_ACTION_OBSERVATION，验证 adapter 的 collector
+  检查（`adapters/gpu_validation.py` `_recent_host_metrics`、`observation_health.observation_reason`）在读任何一行
+  之前就返回 `missing_or_stale_collectors`。阻塞的不是边沿过滤（harness 记在 `product_gap` 里的假设），也不是节拍：
+  “功能未绑定”本身被上报成采集器故障，所以节点保持解绑时的动作后验证在两个集群上都**确定性地**到不了库存判定。
+  修复分两半，对应根因的两半：库存门现在即使所等的 collector 陈旧或报错，也按 host collector 在动作之后送达的库存行
+  判节点失败（`adapters/inventory_verdict.py` `inventory_failure_despite_collection_error`、`observation_health.reported_since`：不论干净与否的
+  最新批次，在动作后样本年龄内且晚于最后一个恢复步骤；`details.host_collector_errors` 把该批次的错误记在判定旁）；
+  这样的批次不能让验证通过（带错误的批次缺的那些行会被读成干净，SUCCEEDED 仍只走干净路径），库存贡献者自己失败的
+  批次也不出判定（`inventory_contributor_error`：`_gpu_inventory` 查询非零退出时把仍应答的 GPU 连同错误一起送出，
+  `_efa_inventory` 源不可读时什么都不送），于是 `pci_missing`/`unreadable_state` 的不可读 → UNKNOWN 不变，动作前的
+  行照旧排除。RDMA 流量贡献者不再把节点自身的库存短缺归为 collection error：补不全的聚合仍扣住
+  （`efa_traffic_observation_valid=0`），短缺由库存贡献者的 `efa_inventory_mismatch`（DRIVER_UNBOUND /
+  PCI_DEVICE_MISSING / EXCESS_DEVICE）表达，HOST_TELEMETRY 不再在设备缺失或 `expected_efa_device_count` 配错的
+  整个期间报错（连带每小时一条 `collector_observation_unknown` 刷新 finding）。仅 adapter 一处改动就让实测链在
+  重启后采集器第一批送达后的首次验证尝试 FAILED 于 `efa_inventory_active_count=15,expected=16`，
+  `validation_without_observed_failure` 为假，计划携带的 REBOOT_NODE 开出变体期待的 reboot 梯级；`bind_failure`
+  的 reboot-after VALIDATE_FABRIC 不变（重启后全部功能都被持有、批次干净、走干净路径）。
+  `tests/execution/test_validation_inventory_despite_collection_error.py` 以实测形状（链上三个已完成步骤、解绑前
+  粘住的 `last_success_at`、重启后带 15 行的报错批次）跑到梯子应承担的判定，并钉住保留的行为（带错误批次读到期望数
+  仍等待、早于最后恢复步骤的计数不是判定、库存源不可读保持 UNKNOWN、GPU 部分查询不是判定而并存的 `_smart` 错误是、
+  陈旧的报错状态不是判定、DCGM 全黑不掩盖新鲜的 host 库存失败）；
+  `tests/collectors/test_host_rdma_coverage_is_inventory.py` 用真实 host collector 在假 sysfs 上跑两个功能解绑
+  一个（无 collection error、`efa_inventory_mismatch=1` DRIVER_UNBOUND、流量扣住）与全部持有（第二拍流量完整）。
+  `int/r13c-live26` 上的 harness 判定（S49）把扣住的移交当产品路径、只判 `post_repair_failure_observed` 失败；
+  本版发布后变体的链会到达 reboot 梯级，同一判定器的 `post_repair_verdict` 读到 `observed`。
 
 计划/执行守卫键仍为 `<case>.<variant>`，确认串 `GENERALLIVE<NNN>_EXECUTE`。新 `--approve`
 令牌：`KERNEL_SOURCE_REPLAY`（kmsg 源重指，032）、`KERNEL_COLLECTOR_SOURCE_REPLAY`（内核采集器

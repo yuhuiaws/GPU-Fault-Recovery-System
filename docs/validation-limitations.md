@@ -3141,6 +3141,78 @@ variants (a managed attempt with CRI Pod logs, lane N territory), and 004
 since batch 163, but injecting a real one needs a faulting test mount -- a
 read-only file bind cannot, statvfs resolving the mount, not the bound file).
 
+Live 2026-10-27 (R13g, both clusters: HyperPod 07:08-07:51Z, plain EKS
+ip-10-0-43-5 10:18-10:33Z) `post_repair_failure` took the product's other path
+and exposed a product gap behind it. REMEDIATE_EFA_DRIVER rebound the function
+(SUCCEEDED 10:19:46.7Z), the trap re-unbound it 4 s later (10:19:50.3Z),
+RESTART_EFA_DEVICE_PLUGIN had already passed on the plugin's unchanged
+allocatable (10:19:48.2Z), TRIGGER_HEALTH_SNAPSHOT restarted both collectors
+(10:20:01.7Z), and VALIDATE_FABRIC waited out the 600 s cap (10:30:06.2Z) with
+`node_pending = {node: {missing_or_stale_collectors: [HOST_TELEMETRY]}}`; the
+product withheld the REBOOT_NODE the plan asked for (`validation_evidence_missing`)
+and opened `workflow-support-after-<record>`, leaving the node cordoned for an
+operator. The missing evidence was not missing. The restarted host collector's
+first tick (the `host.request` force snapshot skips the start-up spread) read 15
+of 16 RDMA devices and delivered `efa_inventory_active_count=15` with the
+DRIVER_UNBOUND verdict seconds after the last recovery step -- exactly the sample
+`inventory_observation_window` asks for -- and kept delivering it (the mismatch
+edge on the second tick, the health summary every 300 s +-10 %). But the same
+batches carried the RDMA traffic contributor's `incomplete EFA traffic coverage:
+15/16 devices` as a collection error (`collectors/host/network.py` `_rdma`), the
+ingest records an erroring batch with `last_success_at=None`
+(`app/ingest/telemetry_context.py` `_record_collector_status`), so HOST_TELEMETRY's
+status read COLLECTION_ERROR / NO_POST_ACTION_OBSERVATION for as long as the
+function was unbound, and the validation adapter's collector check
+(`adapters/gpu_validation.py` `_recent_host_metrics`,
+`observation_health.observation_reason`) returned `missing_or_stale_collectors`
+before it read a single row. The edge filter was not the blocker (the hypothesis
+the harness recorded as `product_gap`), and neither was the cadence: an unbound
+function was itself reported as a collector failure, so a post-repair validation
+of a node that stays unbound could never reach its inventory verdict on either
+cluster -- deterministically, not by timing. Two changes, one per half of the
+root cause. The inventory gate now fails a node on an inventory row its host
+collector delivered since the action even when a collector the step waits for is
+stale or erroring (`adapters/inventory_verdict.py` `inventory_failure_despite_collection_error`,
+`observation_health.reported_since`: the newest batch of either kind, within the
+post-action age and after the last recovery step; `details.host_collector_errors`
+keeps the batch's errors beside the verdict). It passes nothing on such a batch
+-- the rows an erroring batch lacks would read as clean, so the clean path is
+still the only way to SUCCEEDED -- and reads no verdict from a batch whose
+inventory contributor itself failed (`inventory_contributor_error`: a
+`_gpu_inventory` query that exited non-zero after listing the GPUs that still
+answer ships the partial count with its error; an unreadable `_efa_inventory`
+source ships none), so the unreadable-source UNKNOWN of `pci_missing` /
+`unreadable_state` stays UNKNOWN and the pre-action row stays excluded. And the
+RDMA traffic contributor no longer classifies the node's own inventory shortfall
+as a collection error: the aggregate it cannot complete is still withheld
+(`efa_traffic_observation_valid=0`), the shortfall is the inventory contributor's
+`efa_inventory_mismatch` (DRIVER_UNBOUND / PCI_DEVICE_MISSING / EXCESS_DEVICE),
+and HOST_TELEMETRY is no longer erroring -- with its hourly
+`collector_observation_unknown` refresh finding -- for the lifetime of a missing
+device or of a mistyped `expected_efa_device_count`. With the adapter change
+alone the live chain ends FAILED on `efa_inventory_active_count=15,expected=16`
+at the validation's first attempt after the restarted collector's first batch,
+`validation_without_observed_failure` is false, and the plan's REBOOT_NODE opens
+the reboot rung the variant expects; `bind_failure`'s reboot-after
+VALIDATE_FABRIC is unchanged (after the reboot every function is held, the batch
+is clean, the clean path judges it).
+`tests/execution/test_validation_inventory_despite_collection_error.py` runs the
+live shape (the chain's three completed steps, the sticky `last_success_at` from
+before the unbind, the erroring post-restart batch with the 15 row) to a verdict
+the ladder owes, and pins the preserved behaviours (an erroring batch with the
+expected count still waits, a count from before the last recovery step is no
+verdict, an unreadable inventory source stays UNKNOWN, a partial GPU query is no
+verdict while a coexisting `_smart` error is, a stale erroring status is no
+verdict, a dark DCGM does not hide a fresh host inventory failure);
+`tests/collectors/test_host_rdma_coverage_is_inventory.py` runs the real host
+collector over a fake sysfs with one of two functions unbound (no collection
+error, `efa_inventory_mismatch=1` DRIVER_UNBOUND, traffic withheld) and with
+both held (complete traffic on the second tick). The harness grading on
+`int/r13c-live26` (S49) reads the withheld hand-off as the product's path and
+fails `post_repair_failure_observed` alone; with this release the variant's
+chain reaches the reboot rung and the same grader's `post_repair_verdict` reads
+`observed`.
+
 A sixth deferral reason, `COVERED_BY_REGIONAL: <case ids>`, names GF-REGIONAL
 cases that already PASSED live on this site with the very injection and
 assertions the variant would make, so the variant gets no fixture of its own

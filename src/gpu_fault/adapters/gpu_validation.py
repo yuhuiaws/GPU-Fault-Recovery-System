@@ -48,6 +48,10 @@ from gpu_fault.models import (
     WorkflowStepSpec,
     WorkflowStepStatus,
 )
+from gpu_fault.adapters.inventory_verdict import (
+    collector_statuses,
+    inventory_failure_despite_collection_error,
+)
 from gpu_fault.observation_health import observation_reason
 from gpu_fault.operation_registry import (
     OperationAdapter,
@@ -243,44 +247,48 @@ class GpuValidationAdapter:
             }
             for execution in context.workflow.step_executions
         )
-        readiness_after = None
-        if operation in {
-            WorkflowOperation.VALIDATE_GPU,
-            WorkflowOperation.VALIDATE_HOST,
-            WorkflowOperation.VALIDATE_FABRIC,
-        }:
-            readiness_barriers = [
-                execution.updated_at
-                for execution in context.workflow.step_executions
-                if (
-                    execution.step_index < context.step_index
-                    and execution.status is WorkflowStepStatus.SUCCEEDED
-                    and execution.operation in TELEMETRY_READINESS_OPERATIONS
-                )
-            ]
-            if readiness_barriers:
-                readiness_after = max(readiness_barriers)
-        if operation is WorkflowOperation.VALIDATE_HOST:
-            required_collectors = {CollectorKind.HOST_TELEMETRY}
-        elif operation is WorkflowOperation.VALIDATE_FABRIC:
-            required_collectors = {
-                CollectorKind.GPU_METRICS,
-                CollectorKind.HOST_TELEMETRY,
-            }
+        readiness_after = telemetry_readiness_after(context)
+        required_collectors = required_collectors_for(
+            operation,
+            host_telemetry=bool(
+                inventory_requirements or completed_node_recovery or probe
+            ),
+        )
+        if operation is WorkflowOperation.VALIDATE_FABRIC:
             required = set()
-        else:
-            required_collectors = {CollectorKind.GPU_METRICS}
-        if inventory_requirements or completed_node_recovery or probe:
-            required_collectors.add(CollectorKind.HOST_TELEMETRY)
+        # Per node, the host collector's collection errors at a verdict the
+        # inventory gate read from its erroring batch (``host_collector_errors``).
+        collector_errors: dict[str, list[str]] = {}
         for node_id in context.step.node_ids:
+            statuses = collector_statuses(
+                self.store, context.incident.cluster_id, node_id
+            )
             recent = self._recent_host_metrics(
                 context,
                 node_id,
                 now,
                 readiness_after,
                 required_collectors,
+                statuses,
             )
             if isinstance(recent, dict):
+                if inventory_failure_despite_collection_error(
+                    self,
+                    context,
+                    node_id,
+                    operation,
+                    inventory_requirements,
+                    inventory_recovery_operations,
+                    completed_node_recovery,
+                    now,
+                    readiness_after,
+                    statuses,
+                    failures,
+                    clamped,
+                    evidence,
+                    collector_errors,
+                ):
+                    continue
                 dark = self._restore_collectors_dark(context, node_id, recent, now)
                 if dark is not None:
                     return dark
@@ -348,6 +356,9 @@ class GpuValidationAdapter:
         reset_unproven_cooldown(self.store, context, now, pending, failures)
         if prevents_hardware_escalation(context.step.parameters):
             diagnostic_details["host_diagnostic_failure"] = True
+        erroring: dict[str, Any] = {}
+        if collector_errors:
+            erroring["host_collector_errors"] = collector_errors
         if pending:
             return WorkflowStepOutcome.waiting(
                 details={
@@ -356,6 +367,7 @@ class GpuValidationAdapter:
                     "failed_nodes_observed": sorted(failures),
                     "node_failures_observed": failures,
                     **diagnostic_details,
+                    **erroring,
                 }
             )
         if failures:
@@ -374,6 +386,7 @@ class GpuValidationAdapter:
                     "node_failures": failures,
                     "validation": operation.value,
                     **diagnostic_details,
+                    **erroring,
                     **({"node_findings": node_findings} if node_findings else {}),
                     **inventory_details(clamped, evidence),
                 },
@@ -435,18 +448,17 @@ class GpuValidationAdapter:
         now,
         readiness_after,
         required_collectors,
+        statuses=None,
     ):
         max_age = (
             self.post_action_max_sample_age
             if readiness_after is not None
             else self.max_sample_age
         )
-        statuses = {
-            item.collector: item
-            for item in self.store.list_collector_statuses(
-                context.incident.cluster_id, node_id
+        if statuses is None:
+            statuses = collector_statuses(
+                self.store, context.incident.cluster_id, node_id
             )
-        }
         stale = sorted(
             collector.value
             for collector in required_collectors
@@ -477,18 +489,18 @@ class GpuValidationAdapter:
 
     def _validate_inventory(
         self,
-        context,
-        node_id,
-        operation,
-        requirements,
-        recovery_operations,
-        completed_recovery,
-        all_latest,
-        latest,
-        failures,
-        clamped=None,
-        evidence=None,
-    ):
+        context: WorkflowStepContext,
+        node_id: str,
+        operation: WorkflowOperation,
+        requirements: dict[str, Any],
+        recovery_operations: frozenset[WorkflowOperation],
+        completed_recovery: bool,
+        all_latest: list[Any],
+        latest: list[Any],
+        failures: dict[str, list[str]],
+        clamped: dict[str, Any] | None = None,
+        evidence: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         """Judge the node's ACTIVE inventory against the plan's requirement on
         a reading from the window ``inventory_observation_window`` opens; the
         reading each verdict rests on goes into ``evidence``
@@ -1360,3 +1372,49 @@ def awaiting_newer_gpu_metrics(
         "step_cap_at": step_cap_at.isoformat(),
         "reason": awaiting_newer_gpu_metrics_reason(entries, grace_end, step_cap_at),
     }
+
+
+_VALIDATIONS = frozenset(
+    {
+        WorkflowOperation.VALIDATE_GPU,
+        WorkflowOperation.VALIDATE_HOST,
+        WorkflowOperation.VALIDATE_FABRIC,
+    }
+)
+
+
+def telemetry_readiness_after(context: WorkflowStepContext) -> datetime | None:
+    """The completion of the last ``TELEMETRY_READINESS_OPERATIONS`` step ahead
+    of this validation, after which its telemetry starts over; ``None`` without
+    one."""
+
+    if context.step.operation not in _VALIDATIONS:
+        return None
+    barriers = [
+        execution.updated_at
+        for execution in context.workflow.step_executions
+        if (
+            execution.step_index < context.step_index
+            and execution.status is WorkflowStepStatus.SUCCEEDED
+            and execution.operation in TELEMETRY_READINESS_OPERATIONS
+        )
+    ]
+    return max(barriers) if barriers else None
+
+
+def required_collectors_for(
+    operation: WorkflowOperation, *, host_telemetry: bool
+) -> set[CollectorKind]:
+    """The collectors a validation needs fresh before it judges a node;
+    ``host_telemetry`` adds the host collector (an inventory requirement, a
+    completed node recovery, a host diagnostic probe)."""
+
+    if operation is WorkflowOperation.VALIDATE_HOST:
+        required = {CollectorKind.HOST_TELEMETRY}
+    elif operation is WorkflowOperation.VALIDATE_FABRIC:
+        required = {CollectorKind.GPU_METRICS, CollectorKind.HOST_TELEMETRY}
+    else:
+        required = {CollectorKind.GPU_METRICS}
+    if host_telemetry:
+        required.add(CollectorKind.HOST_TELEMETRY)
+    return required
