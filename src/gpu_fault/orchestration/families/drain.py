@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from gpu_fault.device_plugin_liveness import NODE_DEVICE_RESOURCE_METRICS
 from gpu_fault.host_health import NodeHealthFinding
 from gpu_fault.models import (
     FaultIncident,
@@ -286,11 +287,7 @@ class DrainOperationService:
         finding: NodeHealthFinding,
     ) -> tuple[FaultIncident, WorkflowRequest] | None:
         """Arbitrate related device-resource findings beyond the time window."""
-        if finding.metric_name not in {
-            "efa_inventory_mismatch",
-            "efa_kubernetes_allocatable_mismatch",
-            "gpu_kubernetes_allocatable_mismatch",
-        }:
+        if finding.metric_name not in NODE_DEVICE_RESOURCE_METRICS:
             return None
         incumbent = self.callbacks.active_node_exclusive_workflow(
             finding.cluster_id, {finding.node_id}

@@ -75,8 +75,16 @@ TRANSIENT_INVENTORY_FINDINGS = {
     "gpu_kubernetes_allocatable_mismatch": (
         TRANSIENT_GPU_INVENTORY_OPERATIONS | DEVICE_PLUGIN_UNAVAILABLE_OPERATIONS
     ),
+    # The node's socket probe (``gpu_device_plugin_unresponsive``) sees the
+    # same plugin the chain stops, restores or replaces.
+    "gpu_device_plugin_unresponsive": (
+        TRANSIENT_GPU_INVENTORY_OPERATIONS | DEVICE_PLUGIN_UNAVAILABLE_OPERATIONS
+    ),
     "efa_inventory_mismatch": TRANSIENT_GPU_INVENTORY_OPERATIONS,
     "efa_kubernetes_allocatable_mismatch": (
+        TRANSIENT_GPU_INVENTORY_OPERATIONS | DEVICE_PLUGIN_UNAVAILABLE_OPERATIONS
+    ),
+    "efa_device_plugin_unresponsive": (
         TRANSIENT_GPU_INVENTORY_OPERATIONS | DEVICE_PLUGIN_UNAVAILABLE_OPERATIONS
     ),
     "dcgm_field_completeness": DCGM_TELEMETRY_UNAVAILABLE_OPERATIONS,
@@ -95,8 +103,10 @@ _EFA_VALIDATIONS = _GPU_VALIDATIONS | {WorkflowOperation.VALIDATE_FABRIC}
 INVENTORY_FINDING_VALIDATIONS = {
     "gpu_inventory_mismatch": _GPU_VALIDATIONS,
     "gpu_kubernetes_allocatable_mismatch": _GPU_VALIDATIONS,
+    "gpu_device_plugin_unresponsive": _GPU_VALIDATIONS,
     "efa_inventory_mismatch": _EFA_VALIDATIONS,
     "efa_kubernetes_allocatable_mismatch": _EFA_VALIDATIONS,
+    "efa_device_plugin_unresponsive": _EFA_VALIDATIONS,
     "dcgm_field_completeness": _GPU_VALIDATIONS,
     "fabric_manager_status": _GPU_VALIDATIONS,
 }

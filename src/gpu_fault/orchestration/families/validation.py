@@ -11,11 +11,13 @@ class ValidationOperationService:
         gpu_metrics = {
             "gpu_inventory_mismatch",
             "gpu_kubernetes_allocatable_mismatch",
+            "gpu_device_plugin_unresponsive",
         }
         if finding.metric_name not in {
             *gpu_metrics,
             "efa_inventory_mismatch",
             "efa_kubernetes_allocatable_mismatch",
+            "efa_device_plugin_unresponsive",
         }:
             return {}
         configured = {

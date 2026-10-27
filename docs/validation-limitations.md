@@ -2598,7 +2598,10 @@ bounded `GetDevicePluginOptions` (`collectors/host/device_plugin.py`,
 planner stamps the `RESTART_*_DEVICE_PLUGIN` step `plugin_unresponsive=true` so
 it deletes the Pod although allocatable is full (receipt
 `restart_reason=DEVICE_PLUGIN_UNRESPONSIVE`) and confirms only a Ready Pod of
-another UID with the full allocatable (`already_healthy=false`).
+another UID with the full allocatable (`already_healthy=false`). The sample
+carries `consecutive_timeout_samples` (1 after the first timed-out tick, the
+finding after the second) and the finding on that metric plans
+`RESTART_{GPU,EFA}_DEVICE_PLUGIN` (lane b204).
 
 The variants assert that probe path (lane S47); the effectiveness oracle is the
 probe sample, not kubelet's advertisement, and S45's "frozen but connected"

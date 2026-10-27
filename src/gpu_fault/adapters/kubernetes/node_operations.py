@@ -39,6 +39,10 @@ from gpu_fault.models import (
     execution_matches_step,
     execution_phase,
 )
+from gpu_fault.device_plugin_liveness import (
+    PLUGIN_UNRESPONSIVE_PARAMETER,
+    UNRESPONSIVE_FAILURE_MODE,
+)
 from gpu_fault.node_provider import efa_device_plugin_name
 from gpu_fault.orchestration.escalation import (
     escalation_descends_from,
@@ -156,6 +160,15 @@ class KubernetesNodeOperationsMixin:
                 },
             )
         timeout_seconds = int(parameters.get("restart_timeout_seconds", 180))
+        # A plugin the node's socket probe found hung (``plugin_unresponsive``,
+        # stamped by the planner from a ``*_device_plugin_unresponsive``
+        # finding) still advertises every device: kubelet holds its
+        # ListAndWatch stream open without a deadline, so allocatable never
+        # drops. Judged on allocatable alone the first pass would call the
+        # node ``already_healthy`` and delete nothing; it must delete the Pod,
+        # and the replacement is confirmed as for any restart (a new Ready
+        # Pod, the full allocatable).
+        unresponsive = bool(parameters.get(PLUGIN_UNRESPONSIVE_PARAMETER))
         node_results: dict[str, dict[str, Any]] = {}
         waiting = False
         now = datetime.now(timezone.utc)
@@ -171,6 +184,7 @@ class KubernetesNodeOperationsMixin:
                     expected=expected,
                     timeout_seconds=timeout_seconds,
                     now=now,
+                    unresponsive=unresponsive,
                 )
             except NodePatchConflict:
                 # The node is unchanged; the next pass re-reads and retries.
@@ -204,6 +218,7 @@ class KubernetesNodeOperationsMixin:
         expected: int,
         timeout_seconds: int,
         now: datetime,
+        unresponsive: bool = False,
     ) -> WorkflowStepOutcome | tuple[dict[str, Any], bool]:
         node = self.core.read_node(node_id)
         quiesce_hold = quiesce_taint_hold(
@@ -249,7 +264,13 @@ class KubernetesNodeOperationsMixin:
             for pod in pods
             if self._pod_ready(pod) and self._pod_uid(pod) != old_uid
         ]
-        if allocatable >= expected and (operation is None or ready_new_pods):
+        # Before any restart is marked the node's Ready plugin Pod is the one
+        # the probe found hung, not a replacement: only a Pod of another UID
+        # than the one the restart deleted confirms it.
+        if allocatable >= expected and (
+            (operation is None and not unresponsive)
+            or (operation is not None and ready_new_pods)
+        ):
             result: dict[str, Any] = {
                 "allocatable": allocatable,
                 "expected": expected,
@@ -330,6 +351,10 @@ class KubernetesNodeOperationsMixin:
             "allocatable": allocatable,
             "expected": expected,
         }
+        if unresponsive:
+            # The receipt says why a Pod on a node advertising every device
+            # was deleted.
+            result["restart_reason"] = UNRESPONSIVE_FAILURE_MODE
         if report["companion_pods"]:
             result["companion_pods"] = report["companion_pods"]
         if took_over is not None:

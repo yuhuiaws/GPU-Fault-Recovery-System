@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from functools import cached_property
 from typing import Any, Sequence
 
+from gpu_fault.device_plugin_liveness import NODE_DEVICE_RESOURCE_METRICS
 from gpu_fault.env import env_bool
 from gpu_fault.host_health import NodeHealthFinding
 from gpu_fault.node_provider import restart_vm_effective_action
@@ -1561,12 +1562,7 @@ class IncidentOrchestrator:
                 and finding.severity.value == "critical"
             )
             or (
-                finding.metric_name
-                in {
-                    "efa_inventory_mismatch",
-                    "efa_kubernetes_allocatable_mismatch",
-                    "gpu_kubernetes_allocatable_mismatch",
-                }
+                finding.metric_name in NODE_DEVICE_RESOURCE_METRICS
                 and finding.recommended_action
                 in {
                     RecoveryAction.REMEDIATE_EFA_DRIVER,

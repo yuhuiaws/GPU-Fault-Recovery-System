@@ -9,11 +9,16 @@ import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 
 from gpu_fault.channel_registry import HOST_TELEMETRY_PATH
 from gpu_fault.collectors.gpu.discovery import expected_accelerator_counts
 from gpu_fault.collectors.host.bmc import IPMI_DEVICE_NODES, HostBmcMixin
+from gpu_fault.collectors.host.device_plugin import HostDevicePluginMixin
+from gpu_fault.collectors.host.device_plugin_probe import (
+    ProbeResult,
+    probe_device_plugin,
+)
 from gpu_fault.collectors.host.gpu_rank import HostGpuRankMixin
 from gpu_fault.collectors.host.inventory import HostInventoryMixin
 from gpu_fault.collectors.host.network import HostNetworkMixin
@@ -35,6 +40,12 @@ from gpu_fault.collectors.sinks import (
     CollectorError,
     EventSink,
     deliver_or_raise,
+)
+from gpu_fault.device_plugin_liveness import (
+    DEFAULT_CONSECUTIVE_SAMPLES,
+    DEFAULT_PROBE_TIMEOUT_SECONDS,
+    DEFAULT_SOCKET_DIR,
+    parse_socket_patterns,
 )
 from gpu_fault.env import env_bool
 from gpu_fault.host_capability_markers import (
@@ -117,8 +128,10 @@ class HostTelemetryCollector(
     HostSharedFilesystemsMixin,
     HostSystemMetricsMixin,
     HostBmcMixin,
+    HostDevicePluginMixin,
 ):
-    """Collects host, storage, network, RDMA, SMART and BMC signals."""
+    """Collects host, storage, network, RDMA, SMART, BMC and device-plugin
+    liveness signals."""
 
     def __init__(
         self,
@@ -154,6 +167,11 @@ class HostTelemetryCollector(
         nvidia_smi_breaker_rounds: int = 3,
         nvidia_smi_breaker_cooldown_rounds: int = 4,
         ipmi_device_nodes: Sequence[str] | None = None,
+        device_plugin_socket_dir: str | None = DEFAULT_SOCKET_DIR,
+        device_plugin_socket_patterns: Mapping[str, Sequence[str]] | None = None,
+        device_plugin_probe_timeout_seconds: float = DEFAULT_PROBE_TIMEOUT_SECONDS,
+        device_plugin_unresponsive_samples: int = DEFAULT_CONSECUTIVE_SAMPLES,
+        device_plugin_probe: Callable[[Path, float], ProbeResult] | None = None,
     ) -> None:
         self.sink = sink
         self.context = context
@@ -226,6 +244,33 @@ class HostTelemetryCollector(
             if ipmi_device_nodes is not None
             else IPMI_DEVICE_NODES
         )
+        # The device-plugin liveness probe (``HostDevicePluginMixin``): the
+        # kubelet socket directory (``None``/empty disables the contributor),
+        # which socket basenames belong to which resource family, the bound on
+        # one ``GetDevicePluginOptions`` call and how many consecutive
+        # timed-out ticks open the finding.
+        if device_plugin_probe_timeout_seconds <= 0:
+            raise ValueError("device plugin probe timeout must be positive")
+        if device_plugin_unresponsive_samples < 1:
+            raise ValueError("device plugin unresponsive samples must be positive")
+        self.device_plugin_socket_dir = (
+            Path(device_plugin_socket_dir) if device_plugin_socket_dir else None
+        )
+        self.device_plugin_socket_patterns = {
+            key: tuple(value)
+            for key, value in (
+                device_plugin_socket_patterns or parse_socket_patterns(None)
+            ).items()
+        }
+        self.device_plugin_probe_timeout_seconds = device_plugin_probe_timeout_seconds
+        self.device_plugin_unresponsive_samples = device_plugin_unresponsive_samples
+        self._device_plugin_probe = (
+            device_plugin_probe
+            if device_plugin_probe is not None
+            else probe_device_plugin
+        )
+        self._device_plugin_timeouts = {}
+        self._device_plugin_directory_logged = False
         if statvfs_timeout_seconds <= 0:
             raise ValueError("statvfs timeout must be positive")
         if statvfs_budget_seconds <= 0:
@@ -423,6 +468,7 @@ class HostTelemetryCollector(
         "_rank_liveness",
         "_gpu_inventory",
         "_efa_inventory",
+        "_device_plugins",
         "_rdma",
         "_efa_network",
         "_nvswitch_topology",
@@ -881,5 +927,26 @@ def build_from_environment(
         shared_filesystem_state_path=os.getenv(
             "GPU_FAULT_HOST_SHARED_FILESYSTEM_STATE_PATH",
             "/var/lib/gpu-fault/host-collector-shared-filesystems.json",
+        ),
+        # The kubelet device-plugin socket directory the liveness probe reads
+        # (empty disables the probe), the resource-family socket globs, the
+        # bound on one probe call and the consecutive-timeout confirmation.
+        # The literals are the documented defaults (the environment reference
+        # is generated from them); ``device_plugin_liveness`` holds the same
+        # values for the constructor, and the factory test pins the two equal.
+        device_plugin_socket_dir=os.getenv(
+            "GPU_FAULT_DEVICE_PLUGIN_SOCKET_DIR", "/var/lib/kubelet/device-plugins"
+        ),
+        device_plugin_socket_patterns=parse_socket_patterns(
+            os.getenv(
+                "GPU_FAULT_DEVICE_PLUGIN_SOCKET_PATTERNS",
+                "gpu=nvidia-*.sock,efa=*efa*.sock",
+            )
+        ),
+        device_plugin_probe_timeout_seconds=float(
+            os.getenv("GPU_FAULT_DEVICE_PLUGIN_PROBE_TIMEOUT_SECONDS", "5")
+        ),
+        device_plugin_unresponsive_samples=int(
+            os.getenv("GPU_FAULT_DEVICE_PLUGIN_UNRESPONSIVE_CONSECUTIVE_SAMPLES", "2")
         ),
     )

@@ -12,6 +12,11 @@ from gpu_fault.health_recovery_contract import (
     is_hung_finding,
     recovery_contract,
 )
+from gpu_fault.device_plugin_liveness import (
+    DEVICE_PLUGIN_UNRESPONSIVE_METRICS,
+    NODE_DEVICE_RESOURCE_METRICS,
+    PLUGIN_UNRESPONSIVE_PARAMETER,
+)
 from gpu_fault.host_diagnostics import HOST_DIAGNOSTIC_PROBE, diagnostic_probe
 from gpu_fault.host_health import NodeHealthFinding
 from gpu_fault.hung_task_summary import hung_task_summary
@@ -828,12 +833,12 @@ class NodeHealthPlanBuilder:
         steps: list,
         finding: NodeHealthFinding,
     ) -> list:
-        if finding.metric_name not in {
-            "efa_inventory_mismatch",
-            "efa_kubernetes_allocatable_mismatch",
-            "gpu_kubernetes_allocatable_mismatch",
-        }:
+        if finding.metric_name not in NODE_DEVICE_RESOURCE_METRICS:
             return steps
+        # A plugin the node's socket probe found hung still advertises every
+        # device, so the restart step must be told not to read the full
+        # allocatable as "already healthy" (node_operations).
+        unresponsive = finding.metric_name in DEVICE_PLUGIN_UNRESPONSIVE_METRICS
         reboot_allowed = finding.metric_name != "efa_inventory_mismatch" or (
             finding.diagnostic_parameters.get("failure_mode")
             in {"PCI_DEVICE_MISSING", "DRIVER_UNBOUND", "LINK_INACTIVE"}
@@ -858,6 +863,8 @@ class NodeHealthPlanBuilder:
                 WorkflowOperation.RESTART_GPU_DEVICE_PLUGIN,
             }:
                 parameters["expected_count"] = expected
+                if unresponsive:
+                    parameters[PLUGIN_UNRESPONSIVE_PARAMETER] = True
                 if reboot_allowed:
                     parameters["failure_escalation_action"] = (
                         RecoveryAction.REBOOT_NODE.value

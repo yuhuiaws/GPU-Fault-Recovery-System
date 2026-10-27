@@ -16,6 +16,7 @@ from pydantic import (
     model_serializer,
 )
 
+from gpu_fault.device_plugin_liveness import kubernetes_device_plugin_rules
 from gpu_fault.efa_traffic_state import traffic_observation
 from gpu_fault.env import env_bool
 from gpu_fault.efa_stall_episode import episode_parameters
@@ -184,6 +185,7 @@ _GPU_METRIC_FAULT_CLASSES = {
     "gpu_expected_count_unknown": "GPU_INVENTORY",
     "gpu_expected_count_contradicted": "GPU_INVENTORY",
     "gpu_kubernetes_allocatable_mismatch": "GPU_INVENTORY",
+    "gpu_device_plugin_unresponsive": "GPU_INVENTORY",
     # These signals do not establish a narrower hardware failure domain.
     "dcgm_field_completeness": "GPU",
     "host_gpu_utilization_percent": "GPU",
@@ -896,20 +898,10 @@ class NodeHealthPolicy:
             RecoveryAction.REBOOT_NODE,
             "active EFA device inventory does not match the configured node invariant",
         ),
-        "efa_kubernetes_allocatable_mismatch": (
-            1.0,
-            NodeHealthCategory.RDMA,
-            Severity.CRITICAL,
-            RecoveryAction.RESTART_EFA_DEVICE_PLUGIN,
-            "Kubernetes EFA allocatable does not match the host EFA inventory",
-        ),
-        "gpu_kubernetes_allocatable_mismatch": (
-            1.0,
-            NodeHealthCategory.GPU,
-            Severity.CRITICAL,
-            RecoveryAction.RESTART_GPU_DEVICE_PLUGIN,
-            "Kubernetes GPU allocatable does not match the host GPU inventory",
-        ),
+        # The Kubernetes device-plugin availability rules: the control plane's
+        # allocatable comparison and the node's socket liveness probe
+        # (``device_plugin_liveness.py``), every one a CRITICAL plugin restart.
+        **kubernetes_device_plugin_rules(NodeHealthCategory),
         "bmc_critical_sensor": _BMC_CRITICAL_SENSOR_RULE,
     }
 

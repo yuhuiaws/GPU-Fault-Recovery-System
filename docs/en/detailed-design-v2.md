@@ -1897,6 +1897,50 @@ and the SUCCEEDED record adds `replacement_pod_uids` (the UIDs of the newly Read
 the terminal record held only `replacement_pod_uids` and the deleted Pod's UID vanished with the replaced WAITING
 record, so the product's own record could not prove which Pod had been restarted (GF-GENERAL-LIVE-014).
 
+**A device plugin that is hung but still connected (`*_device_plugin_unresponsive`).** Everything above judges by
+kubelet's allocatable, and a plugin whose process is SIGSTOPped, deadlocked or frozen by the OOM path while its socket
+stays open never changes allocatable: kubelet's device manager holds the plugin's `ListAndWatch` stream without a
+deadline or a gRPC keepalive (`pkg/kubelet/cm/devicemanager/plugin/v1beta1/client.go` `dial`/`Run`, `stream.Recv()`
+blocking for ever); only a stream error leads to `PluginDisconnected` → `markResourceUnhealthy` (`manager.go`), and
+capacity/allocatable vanish only once the endpoint is stopped and `endpointStopGracePeriod` (5 min, `types.go`) has
+passed. Meanwhile a new Pod asking for the resource is admitted through topology manager `admitPolicyNone` →
+`allocateAlignedResources` → device manager `Allocate` → `endpoint.allocate`, which calls the plugin with
+`context.Background()` (`endpoint.go`; `GetPreferredAllocation` has no timeout either, only `PreStartContainer` has
+30 s), on the call stack of kubelet's main loop `syncLoopIteration` → `HandlePodAdditions` → `canAdmitPod`
+(`kubelet.go`): kubelet's whole sync loop blocks, there is no `UnexpectedAdmissionError` event (that exists only when
+`Allocate` *returns* an error, such as `no healthy devices present` / `requested number of devices unavailable`), the
+Pod stays Pending for ever, the node stays Ready (node status is reported by its own goroutine), and only after 5 min
+does kubelet's `/healthz` `syncloop` check report `sync Loop took longer than expected`. Live GF-GENERAL-LIVE-014
+`gpu_plugin` (HyperPod): the NVIDIA plugin SIGSTOPped for about four minutes, `nvidia.com/gpu` allocatable 8
+throughout, the product without any signal. The host collector therefore gained the `_device_plugins` contributor
+(`collectors/host/device_plugin.py`): every tick, for each socket in the kubelet `device-plugins` directory
+(`GPU_FAULT_DEVICE_PLUGIN_SOCKET_DIR`) that matches a resource family (default `nvidia-*.sock` / `*efa*.sock`,
+`GPU_FAULT_DEVICE_PLUGIN_SOCKET_PATTERNS`; never `kubelet.sock`) it speaks one HTTP/2 + gRPC exchange with the
+standard library alone (`collectors/host/device_plugin_probe.py`: connection preface, SETTINGS, literal HPACK headers,
+one empty length-prefixed message) calling the side-effect-free `GetDevicePluginOptions` -- not `ListAndWatch`: the
+NVIDIA and EFA plugins serve `ListAndWatch` from one shared health channel, so a second stream would race kubelet's
+for the "device unhealthy" events. The kernel accepts the connection into the stopped process's listen backlog, so
+connect succeeds and no frame within `GPU_FAULT_DEVICE_PLUGIN_PROBE_TIMEOUT_SECONDS` (5 s) is a TIMEOUT; any answer on
+the stream (response headers, a message, trailers, RST_STREAM, GOAWAY) proves the process runs; a missing socket or a
+refused connection is a plugin that exited (kubelet sees the stream end) and belongs to the allocatable rule.
+`GPU_FAULT_DEVICE_PLUGIN_UNRESPONSIVE_CONSECUTIVE_SAMPLES` (2) consecutive timed-out ticks set
+`gpu_device_plugin_unresponsive` / `efa_device_plugin_unresponsive` to 1 (labels `sockets`, `probe_state`,
+`probe_states`, `probe_detail`, `transport_answered`, `latency_ms`, `timeout_seconds`, `expected_count`);
+`host_health` grades it CRITICAL `RESTART_*_DEVICE_PLUGIN` (the rule sits beside the allocatable rules in
+`device_plugin_liveness.py`), and the planner builds the same plugin-restart chain with `plugin_unresponsive=true`
+stamped on the restart step: for such a finding `_restart_device_plugin_node` no longer reads the full allocatable as
+`already_healthy`, deletes the plugin Pod on its first pass (receipt `restart_reason=DEVICE_PLUGIN_UNRESPONSIVE`) and
+then succeeds only on a Ready Pod of another UID with allocatable restored. A kubelet already blocked in that plugin's
+`Allocate` (a Pod happened to be scheduled to the node during the hang) neither kills the frozen container nor starts
+the replacement, so the restart step FAILS at `restart_timeout_seconds` and escalates per
+`failure_escalation_action=REBOOT_NODE`; a host-side kill of the frozen process by the Node Agent (which would both
+unblock kubelet and make it restart the container) is a follow-up that needs a new node action and approval. The host
+collector runs as root under `ProtectSystem=strict`, and the read-only binds do not forbid connecting to a unix socket
+(`net/unix/af_unix.c` `unix_find_bsd` asks only `path_permission(MAY_WRITE)` of the socket inode; the EROFS in
+`fs/namei.c` `sb_permission` applies to regular files, directories and symlinks); verified on the deploy host with a
+transient unit under the same directives (a write under `/var/lib` fails EROFS, a unix connect there succeeds). No unit
+or node template change is needed.
+
 **⑫ Unit test scope**: idempotency of cordon+taint; lifting isolation must clear both cordon and taint;
 node disappearing during isolation → FAILED (`safety_rejection`/`absent`) while 404 when lifting isolation → no-op; RBAC 403 is non-retryable and lands on `executor-internal-error`; `STOP_WORKLOADS` covers the three carriers Job/PyTorchJob/
 JobSet; assertion that **the Eviction API is not used** (to prevent someone "casually switching to evict").
