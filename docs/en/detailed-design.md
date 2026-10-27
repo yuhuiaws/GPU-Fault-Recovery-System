@@ -3898,10 +3898,21 @@ the survey adapter keeps the node pending and re-sends within the node's 30-seco
 accepted but has not answered already takes) rather than recording it at once. An Agent older than this fix returns a non-retryable
 `ObservationIncomplete: WORKER_STILL_RUNNING`, recorded in `node_failures` as before.
 
-Once a worker has the slot, the supervisor passes the deadline remaining from the command's arrival to the worker through
-`OBSERVATION_BUDGET_VARIABLE`; the triage plans its own sampling budget (20 s by default) within that remaining time less
-`WORKER_BUDGET_MARGIN_SECONDS` (2.5 s, the time to trim along the ladder and write a result of the live size), so a command that waited
-for the slot finishes what fits and says so instead of being cut mid second-dump interval. The two-dump pairing of eight ranks
+Once a worker has the slot, the supervisor hands the worker the deadline itself through `OBSERVATION_DEADLINE_VARIABLE` (the
+environment variable `OBSERVATION_DEADLINE_MONOTONIC`): the `time.monotonic()` reading, counted from the command's arrival, on
+`CLOCK_MONOTONIC`, the clock every process on the host shares. The worker reads what is left of it (deadline minus now) only when it
+is about to run the triage, and the triage plans its own sampling budget (20 s by default, at least 2 s) within that remaining time
+less `WORKER_BUDGET_MARGIN_SECONDS` (2.5 s, the time to trim along the ladder and write a result of the live size), so a command that
+waited for the slot finishes what fits and says so instead of being cut mid second-dump interval. The slot wait and the start of the
+guard and of the worker (two fresh interpreters, the worker importing the package) all run on that clock: measured on the
+release-gate host, from spawn to the worker's first line takes about 0.3 s idle and about 3.3 s with eight busy loops on its CPU. An
+Agent older than this fix handed over the seconds left at the spawn (`OBSERVATION_BUDGET_SECONDS`) and the worker never subtracted its
+start: after a triage slot wait of more than 5.5 s only the 2.5 s margin was left for it, and on a node whose CPU a training job
+saturates the triage ran past the deadline and came back `PARTIAL_TIMEOUT` with its last checkpoint. The guard also starts the
+worker by name only (`observation_guard.WORKER_ENTRY_POINT`, in the `module:callable` form the component wheel closure follows, so
+the node-runtime wheel still carries the worker) instead of importing the worker's whole closure (pydantic, the models, every
+operation mixin) to read its module name: about 0.25 s of CPU less per observation, and from spawn to the first line 5.3 s → 3.3 s
+with eight busy loops. The two-dump pairing of eight ranks
 measured ~4.5 s inside the 20 s budget (`slot_wait` 0.05 s, `fr_wait` 0.28 s), matching the same release's `different_process_groups`
 (5.0 s a node); the two active-diagnostic passes keep their default budget of 8 nodes. The triage and bundle publish partial documents
 at checkpoints (`publish(..., final=False)`): the triage at `RANKS_DISCOVERED` → `PROCESS_SERIES_SAMPLED` → `FIRST_FLIGHT_DUMPS_READ`

@@ -477,10 +477,12 @@ def test_the_worker_plans_the_triage_within_the_budget_it_was_handed(
         "settings": settings,
         "command": triage_command().model_dump(mode="json"),
     }
-    observation_worker.execute(request)
-    observation_worker.execute(request, budget_seconds=9.5)
-    observation_worker.execute(request, budget_seconds=3.0)
-    observation_worker.execute(request, budget_seconds=float("inf"))
+    # The deadline it was handed, read at the plan (here, at once: no start).
+    now = 1000.0
+    observation_worker.execute(request, monotonic=lambda: now)
+    observation_worker.execute(request, deadline=now + 9.5, monotonic=lambda: now)
+    observation_worker.execute(request, deadline=now + 3.0, monotonic=lambda: now)
+    observation_worker.execute(request, deadline=float("inf"), monotonic=lambda: now)
     assert seen == [20, 9.5 - WORKER_BUDGET_MARGIN_SECONDS, 2.0, 20], seen
 
 

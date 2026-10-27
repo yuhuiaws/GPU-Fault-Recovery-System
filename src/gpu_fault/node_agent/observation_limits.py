@@ -53,11 +53,19 @@ RESULT_STAND_IN_RANKS_BUDGET_BYTES = 16 * 1024
 #: oversized-output stand-in without importing the supervisor.
 WORKER_NOT_STARTED = "WORKER_NOT_STARTED"
 WORKER_OUTPUT = "WORKER_OUTPUT"
-#: The environment variable through which the supervisor tells the worker how
-#: many seconds of its deadline are left once the worker starts -- the wait for
-#: the node's single worker slot is inside that deadline. The worker plans a
-#: triage within it less ``WORKER_BUDGET_MARGIN_SECONDS``, the time it takes to
-#: trim and write a result of the live size, so a command that waited for the
-#: slot finishes what fits and says so instead of being cut at its deadline.
-OBSERVATION_BUDGET_VARIABLE = "OBSERVATION_BUDGET_SECONDS"
+#: The environment variable through which the supervisor hands the worker its
+#: deadline: the ``time.monotonic()`` reading (``CLOCK_MONOTONIC``, one clock
+#: for every process on the host) at which the supervisor stops waiting and
+#: hands back the last checkpoint. The wait for the node's single worker slot
+#: and the start of the guard and of the worker -- two interpreters, the
+#: worker importing the package: 0.3 s idle, 3.3 s with eight busy loops on
+#: its CPU -- all run on that clock. The worker plans a triage when it is
+#: about to run it, within ``deadline - now`` less
+#: ``WORKER_BUDGET_MARGIN_SECONDS``, the time it takes to trim and write a
+#: result of the live size, so a command that waited for the slot or started
+#: on a CPU-starved node finishes what fits and says so instead of being cut
+#: at its deadline. The seconds left at the spawn (the variable this replaces,
+#: ``OBSERVATION_BUDGET_SECONDS``) did not count the start, and with a long
+#: slot wait the margin was all that was left for it.
+OBSERVATION_DEADLINE_VARIABLE = "OBSERVATION_DEADLINE_MONOTONIC"
 WORKER_BUDGET_MARGIN_SECONDS = 2.5

@@ -16,7 +16,7 @@ from typing import Any, Callable
 
 from gpu_fault.node_agent import observation_guard
 from gpu_fault.node_agent.observation_limits import (
-    OBSERVATION_BUDGET_VARIABLE,
+    OBSERVATION_DEADLINE_VARIABLE,
     OBSERVATION_REQUEST_BUDGET_BYTES,
     OBSERVATION_RESULT_BUDGET_BYTES,
     WORKER_NOT_STARTED,
@@ -233,9 +233,10 @@ class ObservationSupervisor:
                     for key, value in os.environ.items()
                     if not key.startswith("GPU_FAULT_")
                 }
-                environment[OBSERVATION_BUDGET_VARIABLE] = (
-                    f"{max(0.0, deadline - time.monotonic()):.3f}"
-                )
+                # The deadline itself, not the seconds left now: the guard's
+                # and the worker's start run on the same clock, and the worker
+                # plans the triage from what is left when it plans it.
+                environment[OBSERVATION_DEADLINE_VARIABLE] = repr(deadline)
                 process = subprocess.Popen(
                     [sys.executable, "-m", observation_guard.__name__],
                     stdin=incoming,

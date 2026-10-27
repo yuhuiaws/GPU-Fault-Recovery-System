@@ -10557,6 +10557,13 @@ dumps the triage read, or the bundle's `captures_done`/`captures_pending` and `e
 read it as the evidence that was gathered, not an empty answer. A bare `WORKER_STILL_RUNNING` with no `slot_holder`/`slot_wait_seconds`
 is an Agent older than this fix (live HyperPod `fr_temporal_completion` 04:21Z refused both nodes; `fr_second_missing` 04:46Z failed
 the bundle on the shared node alone).
+A triage the worker planned is sized to finish by the supervisor's deadline: the worker reads what is left of the deadline when it
+plans (the supervisor hands it the deadline, not the seconds left when it spawned the worker), so the start of the guard and the
+worker -- seconds on a node whose CPU a training job saturates -- shortens `triage_budget_seconds` instead of pushing the triage past
+the deadline. A triage that waited for the slot on a busy node and came back `PARTIAL_TIMEOUT` at `FIRST_FLIGHT_DUMPS_READ` with a
+`triage_budget_seconds` that, added to its `slot_wait_seconds` and the 2.5 s margin, fills the whole 28 s comes from an Agent older
+than this fix, which planned from the seconds left at the spawn; an upgraded Agent's `triage_budget_seconds` is that much shorter
+and its result final.
 Without eligible candidates, the bounded passive bundle need not contain
 process stacks; eligible targeted bundles attach only to verified PIDs. Hung bundles omit strace,
 DCGM diag and bug-report. Per-process `flight_recorder_series` retains two compact summaries and

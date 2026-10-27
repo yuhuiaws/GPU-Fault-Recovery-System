@@ -8,13 +8,14 @@ import os
 import resource
 import sys
 import time
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from gpu_fault.node_agent.diagnostic_process import DiagnosticProcessRunner
 from gpu_fault.node_agent.observation_limits import (
-    OBSERVATION_BUDGET_VARIABLE,
+    OBSERVATION_DEADLINE_VARIABLE,
     OBSERVATION_REQUEST_BUDGET_BYTES,
     OBSERVATION_RESULT_BUDGET_BYTES,
     RESULT_STAND_IN_RANKS_BUDGET_BYTES,
@@ -175,18 +176,32 @@ def publish(document: dict[str, Any], *, final: bool) -> None:
     sys.stdout.buffer.flush()
 
 
+def handed_deadline(environment: Mapping[str, str]) -> float | None:
+    """The supervisor's deadline, a ``time.monotonic()`` reading, if handed."""
+
+    try:
+        deadline = float(environment[OBSERVATION_DEADLINE_VARIABLE])
+    except (KeyError, ValueError):
+        return None
+    return deadline if math.isfinite(deadline) else None
+
+
 def within_budget(
     command: NodeActionCommand, budget_seconds: float | None
 ) -> NodeActionCommand:
     """The triage command with its sampling budget capped by what is left.
 
     The supervisor's deadline runs from the moment the command reached the
-    node, and the wait for the node's single worker slot is inside it. A worker
-    that planned the documented 20 s against a shorter remaining deadline would
-    be cut during the second dump's interval and hand back a ``PARTIAL_TIMEOUT``;
-    planned within the remaining time less the margin it needs to trim and write
-    a result of the live size, it finishes what fits and says so (the FR series
-    reads ``BUDGET_EXHAUSTED``, ``triage_budget_seconds`` names the budget).
+    node; the wait for the node's single worker slot and the start of the guard
+    and of this worker are inside it. A worker that planned the documented 20 s
+    against a shorter remaining deadline would be cut during the second dump's
+    interval and hand back a ``PARTIAL_TIMEOUT``; planned within the remaining
+    time less the margin it needs to trim and write a result of the live size,
+    it finishes what fits and says so (the FR series reads
+    ``BUDGET_EXHAUSTED``, ``triage_budget_seconds`` names the budget).
+    ``budget_seconds`` is what is left when the triage is planned (``execute``
+    reads it off the deadline right before), never the seconds left at the
+    spawn.
     """
 
     if budget_seconds is None or not math.isfinite(budget_seconds):
@@ -205,8 +220,23 @@ def within_budget(
 
 
 def execute(
-    request: dict[str, Any], *, budget_seconds: float | None = None
+    request: dict[str, Any],
+    *,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
+    """Run ``request``; a triage is planned within what is left of ``deadline``.
+
+    ``deadline`` is the supervisor's (``OBSERVATION_DEADLINE_VARIABLE``) on
+    ``monotonic``'s clock, which is the supervisor's. What is left is read when
+    the triage is planned, after this process and the guard have started: on a
+    node whose CPU a training job saturates that start alone took seconds
+    (3.3 s from spawn to this worker's first line with eight busy loops on its
+    CPU), and the seconds left at the spawn, planned less the 2.5 s margin
+    after a long slot wait, then ran past the deadline into a
+    ``PARTIAL_TIMEOUT``.
+    """
+
     agent = ObservationAgent(request["settings"])
     operation = request["operation"]
     if operation == "sample":
@@ -230,7 +260,8 @@ def execute(
     if operation == "summary":
         return collect_hung_summary(agent, command)
     if operation == "triage":
-        return agent._collect_hung_triage(within_budget(command, budget_seconds))
+        left = None if deadline is None else deadline - monotonic()
+        return agent._collect_hung_triage(within_budget(command, left))
     if operation == "bundle":
         return agent._collect_diagnostic_bundle(command)
     raise ValueError("unsupported observation operation")
@@ -250,13 +281,9 @@ def main() -> None:
             f"{OBSERVATION_REQUEST_BUDGET_BYTES} bytes on stdin"
         )
     request = json.loads(raw)
-    try:
-        budget_seconds: float | None = float(os.environ[OBSERVATION_BUDGET_VARIABLE])
-    except (KeyError, ValueError):
-        budget_seconds = None
     publish({"status": "COLLECTING", "ranks": [], "read_only": True}, final=False)
     try:
-        result = execute(request, budget_seconds=budget_seconds)
+        result = execute(request, deadline=handed_deadline(os.environ))
     except Exception as exc:
         result = {
             **_PARTIAL,
