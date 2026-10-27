@@ -223,6 +223,42 @@ digests and `mapping_version` stay as they are); A100 keeps `RESTART_FM` (NVIDIA
 incident's `policy_reference` is the debug-guidelines URL above; a site that wants the catalog behaviour sets
 `GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM=true`.
 
+### Evidence: the post-reset VALIDATE_GPU re-judges a pending row remap / page retirement on a newer batch
+
+Every page below was verified against NVIDIA's live page (docs version 615):
+
+- NVIDIA GPU Memory Error Management, section "Error Recovery and Response Flags", item "Row-remapping pending flag";
+  page "Last updated on Sep 09, 2026":
+  `https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/error-recovery-and-response-flags.html#error-recovery-and-response-flags`
+  Verbatim:
+  "This flag indicates that row-remapping will happen at the next GPU reset."
+- The same manual, section "Row Remapping":
+  `https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/row-remapping.html#row-remapping`
+  Verbatim: "The process of row-remapping requires a GPU reset to take effect and will remain persistent throughout the life of the life of the GPU."
+  Table 2 "Page Retirement vs. Row-Remapping", row "Application of pending changes": Ampere and later "GPU reset is required.";
+  legacy page retirement "Needed a kernel module reload or driver re-initialization or GPU reset".
+- NVIDIA Dynamic Page Retirement, section "Visibility" > "nvidia-smi"; page "Last updated on Sep 09, 2026":
+  `https://docs.nvidia.com/deploy/dynamic-page-retirement/visibility.html#nvidia-smi`
+  Verbatim: "The nvidia-smi “Pending Page Blacklist” field indicates whether a page has been recently retired and will be blacklisted on the next system reboot or driver load."
+  The same document, "Blacklisting and ECC Error Recovery" > "Reattaching the GPU"
+  (`https://docs.nvidia.com/deploy/dynamic-page-retirement/blacklisting-and-ecc-error-recovery.html#reattaching-the-gpu`),
+  lists the ways to apply pending retirements, in order of cost: "Re-attach the GPUs (persistence mode disabled only)",
+  "Reset the GPUs", "Reload the kernel module (nvidia.ko)", "Reboot the machine (or VM)".
+- NVIDIA GPU Debug Guidelines -- GPU Node Triage, "Understanding Xid Messages", row 63 "A100: Row-remapping recording
+  event"; page "Last updated on Oct 04, 2026":
+  `https://docs.nvidia.com/deploy/gpu-debug-guidelines/gpu-node-triage.html#understanding-xid-messages`
+  Excerpt: "until there is a convenient time to reset the GPU (refer to GPU reset capabilities/limitations section below) or reboot for row remapping to activate."
+
+Conclusion: a pending row remap or page retirement takes effect at the next GPU reset (or node reboot), so after this
+workflow's `RESET_GPU` (on that GPU), `RESET_ALL_GPUS_NVSWITCHES` or `RESTART_NODE` a pending finding whose reading is not
+newer than that completion is no verdict on the reset GPU: `VALIDATE_GPU` keeps `WAITING` (`awaiting_newer_gpu_metrics` and
+`pending_repair_reset` in `node_pending.<node>`, `policy_references` the flag's URL above) until a GPU metrics batch newer
+than the reset re-judges it; cleared succeeds, still set fails on the existing path; the bound is the executor's per-step
+cap. `RECOVER_DRAIN_P2P` (it can succeed with `reset_skipped`), `REMEDIATE_DRIVER`, `UPDATE_SOFTWARE_FIRMWARE` and
+`REPLACE_NODE` do not count as applying the repair. Implementation `src/gpu_fault/adapters/pending_repair_rejudge.py`; the
+quotes are pinned by `tests/execution/test_validation_pending_repair_after_reset.py`. The gap was latent, found by code
+reading and never seen live (see the DCGM diagnostics section of [Detailed Design](../detailed-design.md)).
+
 ## SXID
 
 SXID recovery follows the Fabric Manager User Guide:

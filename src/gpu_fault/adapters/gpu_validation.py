@@ -5,6 +5,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from gpu_fault.adapters.common import quarantine_taint_value
+from gpu_fault.adapters.pending_repair_rejudge import (
+    awaited_findings_text,
+    pending_repair_reset,
+    pending_repair_wait,
+)
 from gpu_fault.cluster_scope import FABRIC_MANAGER_UNIT
 from gpu_fault.dcgm_fields import missing_fabric_metric_groups
 from gpu_fault.execution import (
@@ -105,6 +110,32 @@ TELEMETRY_READINESS_OPERATIONS = frozenset(
         WorkflowOperation.RESTART_NODE,
         WorkflowOperation.REPLACE_NODE,
     }
+)
+#: The WARNING families VALIDATE_GPU grants the warning grace and, past it,
+#: b202's wait for newer GPU metrics: thermal (the temperature grace),
+#: correctable memory and power (the transient grace). The pending-repair
+#: flags are judged against the reset instead (``pending_repair_rejudge``).
+THERMAL_WARNING_NAMES = frozenset(
+    {
+        "gpu_temperature_c",
+        TLIMIT_READING,
+        "memory_temperature_c",
+        "thermal_violation_total_us",
+        "clock_throttle_reasons",
+        "composite:THERMAL_STRESS",
+    }
+)
+MEMORY_WARNING_NAMES = frozenset(
+    {
+        "ecc_sbe_volatile_total",
+        "ecc_sbe_aggregate_total",
+        "retired_pages_sbe_total",
+        "row_remap_correctable_total",
+        "composite:CORRECTABLE_MEMORY_DEGRADATION",
+    }
+)
+POWER_WARNING_NAMES = frozenset(
+    {"power_violation_total_us", "composite:POWER_LIMIT_THROTTLING"}
 )
 
 
@@ -906,30 +937,11 @@ class GpuValidationAdapter:
         ):
             reset_cooldown(self.store, context, node_id, now)
             return {"thermal_cooling": [item.finding_id for item in findings]}
-        thermal_names = {
-            "gpu_temperature_c",
-            TLIMIT_READING,
-            "memory_temperature_c",
-            "thermal_violation_total_us",
-            "clock_throttle_reasons",
-            "composite:THERMAL_STRESS",
-        }
-        memory_names = {
-            "ecc_sbe_volatile_total",
-            "ecc_sbe_aggregate_total",
-            "retired_pages_sbe_total",
-            "row_remap_correctable_total",
-            "composite:CORRECTABLE_MEMORY_DEGRADATION",
-        }
-        power_names = {
-            "power_violation_total_us",
-            "composite:POWER_LIMIT_THROTTLING",
-        }
         warning_grace = None
-        if _warning_only(findings, thermal_names):
+        if _warning_only(findings, THERMAL_WARNING_NAMES):
             warning_grace = self.temperature_warning_grace
-        elif _warning_only(findings, memory_names) or _warning_only(
-            findings, power_names
+        elif _warning_only(findings, MEMORY_WARNING_NAMES) or _warning_only(
+            findings, POWER_WARNING_NAMES
         ):
             warning_grace = self.transient_warning_grace
         if operation is WorkflowOperation.VALIDATE_GPU and warning_grace is not None:
@@ -950,6 +962,12 @@ class GpuValidationAdapter:
                     grace_end,
                     now,
                 )
+        if operation is WorkflowOperation.VALIDATE_GPU and (
+            waiting := awaiting_reset_rejudgement(
+                self.metrics, self.step_waiting_cap, context, node_id, findings, now
+            )
+        ):
+            return waiting
         failures.setdefault(node_id, []).append("active_gpu_health_findings")
         if node_findings is not None:
             node_findings[node_id] = [finding_summary(item) for item in findings]
@@ -1202,7 +1220,7 @@ def node_failure_text(
     return f"{node_id} ({', '.join(items)})"
 
 
-def _warning_only(findings, names: set[str]) -> bool:
+def _warning_only(findings, names: frozenset[str]) -> bool:
     return all(
         getattr(finding, "canonical_name", None) in names
         and getattr(getattr(finding, "severity", None), "value", None) == "WARNING"
@@ -1286,16 +1304,9 @@ def awaiting_newer_gpu_metrics_reason(
     already arrived without re-judging it (a counter reset), that the grace
     has elapsed, and when the executor's per-step cap ends the wait."""
 
-    named = []
-    for entry in entries:
-        text = f"finding {entry['finding_id']} (observed {entry['observed_at']}"
-        newest = entry.get("newest_sample_observed_at")
-        if newest:
-            text += f"; the newest sample, {newest}, did not re-judge it"
-        named.append(text + ")")
     return (
         "awaiting a GPU metrics batch newer than "
-        + ", ".join(named)
+        + awaited_findings_text(entries)
         + f" to re-judge it; grace elapsed {grace_end.isoformat()}, "
         f"step cap {step_cap_at.isoformat()}"
     )
@@ -1344,6 +1355,53 @@ def awaiting_newer_gpu_metrics(
     active: that fails as before.
     """
 
+    entries, step_cap_at = awaited_gpu_metrics(
+        metrics, step_waiting_cap, context, node_id, findings, now
+    )
+    return {
+        "awaiting_newer_gpu_metrics": [entry["finding_id"] for entry in entries],
+        "awaiting_newer_gpu_metrics_findings": entries,
+        "grace_elapsed_at": grace_end.isoformat(),
+        "step_cap_at": step_cap_at.isoformat(),
+        "reason": awaiting_newer_gpu_metrics_reason(entries, grace_end, step_cap_at),
+    }
+
+
+def awaiting_reset_rejudgement(
+    metrics: Any,
+    step_waiting_cap: timedelta,
+    context: WorkflowStepContext,
+    node_id: str,
+    findings: Sequence[Any],
+    now: datetime,
+) -> dict[str, Any] | None:
+    """The wait pending-repair flags earn after this workflow's GPU reset or
+    node reboot while no batch newer than the reset has re-judged them (b209,
+    ``pending_repair_rejudge``); ``None`` when the existing verdict stands."""
+
+    reset = pending_repair_reset(context, node_id, findings)
+    if reset is None or not all(
+        finding_unjudged_since(item, reset.updated_at) for item in findings
+    ):
+        return None
+    entries, step_cap_at = awaited_gpu_metrics(
+        metrics, step_waiting_cap, context, node_id, findings, now
+    )
+    return pending_repair_wait(entries, reset, step_cap_at)
+
+
+def awaited_gpu_metrics(
+    metrics: Any,
+    step_waiting_cap: timedelta,
+    context: WorkflowStepContext,
+    node_id: str,
+    findings: Sequence[Any],
+    now: datetime,
+) -> tuple[list[dict[str, Any]], datetime]:
+    """The findings a wait for newer GPU metrics names, each with the newest
+    sample of its metric when that one is newer and did not re-judge it, and
+    when the executor's per-step cap ends the wait."""
+
     newest = newest_gpu_sample_times(
         metrics.latest(context.incident.cluster_id, node_id)
     )
@@ -1365,13 +1423,7 @@ def awaiting_newer_gpu_metrics(
                 ),
             }
         )
-    return {
-        "awaiting_newer_gpu_metrics": [entry["finding_id"] for entry in entries],
-        "awaiting_newer_gpu_metrics_findings": entries,
-        "grace_elapsed_at": grace_end.isoformat(),
-        "step_cap_at": step_cap_at.isoformat(),
-        "reason": awaiting_newer_gpu_metrics_reason(entries, grace_end, step_cap_at),
-    }
+    return entries, step_cap_at
 
 
 _VALIDATIONS = frozenset(

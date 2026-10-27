@@ -216,6 +216,42 @@ GB300 属于 GB200 列。
 incident 的 `policy_reference` 就是上面排障指南的 URL；站点需要 catalog 行为时设置
 `GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM=true`。
 
+### 依据（Evidence）：复位后的 VALIDATE_GPU 以更新的批次重判 pending 行重映射 / 页退役
+
+以下页面均已对照 NVIDIA 在线页面核实（docs version 615）：
+
+- NVIDIA GPU Memory Error Management，章节「Error Recovery and Response Flags」，条目「Row-remapping
+  pending flag」；页面 "Last updated on Sep 09, 2026"：
+  `https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/error-recovery-and-response-flags.html#error-recovery-and-response-flags`
+  原文（英文，逐字）：
+  "This flag indicates that row-remapping will happen at the next GPU reset."
+- 同一手册，章节「Row Remapping」：
+  `https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/row-remapping.html#row-remapping`
+  原文："The process of row-remapping requires a GPU reset to take effect and will remain persistent throughout the life of the life of the GPU."
+  Table 2「Page Retirement vs. Row-Remapping」的「Application of pending changes」行：Ampere 及更新
+  "GPU reset is required."；早期页退役 "Needed a kernel module reload or driver re-initialization or GPU reset"。
+- NVIDIA Dynamic Page Retirement，章节「Visibility」>「nvidia-smi」；页面 "Last updated on Sep 09, 2026"：
+  `https://docs.nvidia.com/deploy/dynamic-page-retirement/visibility.html#nvidia-smi`
+  原文："The nvidia-smi “Pending Page Blacklist” field indicates whether a page has been recently retired and will be blacklisted on the next system reboot or driver load."
+  同一文档「Blacklisting and ECC Error Recovery」>「Reattaching the GPU」
+  （`https://docs.nvidia.com/deploy/dynamic-page-retirement/blacklisting-and-ecc-error-recovery.html#reattaching-the-gpu`）
+  列出应用待退役页的方式，按代价从低到高："Re-attach the GPUs (persistence mode disabled only)"、
+  "Reset the GPUs"、"Reload the kernel module (nvidia.ko)"、"Reboot the machine (or VM)"。
+- NVIDIA GPU Debug Guidelines — GPU Node Triage，「Understanding Xid Messages」中 63 行
+  「A100: Row-remapping recording event」；页面 "Last updated on Oct 04, 2026"：
+  `https://docs.nvidia.com/deploy/gpu-debug-guidelines/gpu-node-triage.html#understanding-xid-messages`
+  原文节选："until there is a convenient time to reset the GPU (refer to GPU reset capabilities/limitations section below) or reboot for row remapping to activate."
+
+结论：pending 行重映射 / 页退役在下一次 GPU reset（或节点重启）时才生效，所以本 workflow 的
+`RESET_GPU`（复位过该 GPU）、`RESET_ALL_GPUS_NVSWITCHES` 或 `RESTART_NODE` 完成后，读数不晚于该完成
+时刻的 pending finding 不是复位后 GPU 的判定依据：`VALIDATE_GPU` 继续 `WAITING`（`node_pending.<node>`
+的 `awaiting_newer_gpu_metrics` 与 `pending_repair_reset`，`policy_references` 为上面对应标志的 URL），
+等比复位更新的 GPU 指标批次重判；清除即成功，仍置位即按既有路径失败；上限为执行器单步上限。
+`RECOVER_DRAIN_P2P`（可能 `reset_skipped`）、`REMEDIATE_DRIVER`、`UPDATE_SOFTWARE_FIRMWARE`、
+`REPLACE_NODE` 不计为应用修复。实现 `src/gpu_fault/adapters/pending_repair_rejudge.py`，引文由
+`tests/execution/test_validation_pending_repair_after_reset.py` 钉住；该缺口为读代码发现的潜在缺口，
+未在真机出现（详见 [详细设计](../详细设计.md) DCGM 诊断一节）。
+
 ## SXID
 
 SXID 恢复依据 Fabric Manager User Guide：

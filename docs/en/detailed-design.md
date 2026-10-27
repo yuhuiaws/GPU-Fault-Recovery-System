@@ -798,7 +798,8 @@ A GPU metric finding stores `policy_source`, `policy_version`,
 - NVIDIA DCGM Health warnings go to diagnostics.
 - NVIDIA DCGM Health errors use `DRAIN`: stop the affected jobs, isolate, collect the diagnostic bundle and
   validate the GPU; never reset or replace on the authority of a single raw counter.
-- Pending row remap uses the controlled reset workflow.
+- Pending row remap uses the controlled reset workflow; the post-reset `VALIDATE_GPU` does not fail it on a reading from
+  before the reset but waits for a GPU metrics batch newer than the reset to re-judge it (see the pending-repair paragraph below).
 - Row-remap failure uses drain/quarantine; only after NVIDIA Field Diagnostic validation can it
   proceed to the RMA/replacement decision.
 - Device temperature limit derivation rules (absolute and T.Limit scale) use `SITE_NVIDIA_DEVICE_LIMIT_DERIVED`;
@@ -838,6 +839,40 @@ phases inconclusive for the same data). On `FAIL/INCONCLUSIVE`, or when newer da
 after the grace, the original workflow fails and idempotently escalates to `DRAIN`: mark unschedulable, stop the affected jobs, isolate the node, collect the full
 diagnostic bundle and validate the GPU. This escalation does not include `RESTORE_SCHEDULING` or `RESTART_WORKLOAD`; recovery is only possible after
 the fault clears and an administrator has handled it.
+
+A pending-repair flag is re-judged on newer data after the reset (b209). `row_remap_pending` (Ampere and later) and
+`retired_pages_pending` (earlier parts) mean a repair is recorded and not yet applied, and NVIDIA applies it at the next GPU
+reset, so once this workflow has reset the GPU or rebooted the node, a pending finding whose current state (the batch that
+minted or re-graded it) is not newer than that step's completion describes the GPU before the reset and cannot say whether
+the reset applied the repair. `VALIDATE_GPU` failed it at once all the same: the grace and the newer-batch wait above cover
+only the thermal / correctable-memory / power WARNING families. Now, while every blocking finding is a pending-repair flag
+whose current state is not newer than the completion of the last GPU reset or node reboot this workflow ran on the node
+(`RESET_GPU` -- which must have reset the finding's GPU --, `RESET_ALL_GPUS_NVSWITCHES`, `RESTART_NODE`), `VALIDATE_GPU`
+keeps `WAITING` on the same mechanism: `node_pending.<node>` carries `awaiting_newer_gpu_metrics`,
+`awaiting_newer_gpu_metrics_findings`, `pending_repair_reset` (`operation`, `step_index`, `completed_at`, in place of
+`grace_elapsed_at`), `step_cap_at`, `policy_references` and the reason text `awaiting a GPU metrics batch newer than finding
+<id> (observed <ts>) to re-judge it; RESET_GPU completed <ts> and NVIDIA applies a pending row remap at the next GPU reset
+(<url>); step cap <ts>`. The bound is still the executor's per-step cap (600 seconds by default), no new knob, and there is
+no grace: the reset, not a timer, is the barrier. The first GPU metrics batch newer than the reset decides: the flag cleared
+-> the finding is cleared and the step succeeds; still set -> the ingest re-grades the finding at that batch's time, newer
+than the reset, and the existing failure path fails it (`active_gpu_health_findings`, then the escalation ladder). Not counted
+as applying the repair: `RECOVER_DRAIN_P2P` (it resets only the GPUs whose driver recovery action asks for it and can succeed
+with `reset_skipped`), `REMEDIATE_DRIVER` / `UPDATE_SOFTWARE_FIRMWARE` (a site-configured command the product cannot see
+reset the GPU) and `REPLACE_NODE` (other hardware); with no reset in the workflow the flag fails at once as before -- nothing
+short of a reset applies the repair. The gap was latent: found by code reading during the GF-GENERAL-LIVE-024 analysis,
+never seen live. The freshness gates in front of the finding check (the GPU_METRICS collector status and every targeted
+GPU's metric presence must postdate the reset) already wait while the latest batch is still the pre-reset one, and the
+collector delivers whole scrapes, so it does not bite today; it bites whenever post-reset GPU data passes those gates
+without re-judging the flag (a scrape without the flag's field, the post-reset batch's finding-state write not visible yet,
+a caller of the finding check alone). HyperPod and plain EKS nodes run the same DCGM collector and the same `RESET_GPU` node
+action, so the behaviour is the same on both. Implementation: `src/gpu_fault/adapters/pending_repair_rejudge.py`; tests:
+`tests/execution/test_validation_pending_repair_after_reset.py`. Evidence (NVIDIA docs version 615): GPU Memory Error
+Management, "Error Recovery and Response Flags", Row-remapping pending flag
+(`https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/error-recovery-and-response-flags.html#error-recovery-and-response-flags`):
+"This flag indicates that row-remapping will happen at the next GPU reset."; Dynamic Page Retirement, "Visibility" >
+"nvidia-smi" (`https://docs.nvidia.com/deploy/dynamic-page-retirement/visibility.html#nvidia-smi`): "The nvidia-smi “Pending
+Page Blacklist” field indicates whether a page has been recently retired and will be blacklisted on the next system reboot
+or driver load."; the full quotes are in [NVIDIA Official Policy Implementation Audit](components/nvidia-policy.md).
 
 DCGM JSON parsing uses bounded structured processing: at most 100 results, each with at most 20 messages of at most 512 characters, are
 written into the workflow; the full stdout/stderr is kept only in the evidence file. Each result contains
