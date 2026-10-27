@@ -2437,7 +2437,11 @@ bundle 保守，却判 "did not request process state capture"，是 oracle 把 
   模块 `general_live_efa_pci.py`，`expected_outcome=PASS`）：先做规格要求的反向阶段——
   `build-pci-fixture --unreadable` 把夹具路径建成普通文件并以 `pci-root` 重指入 host collector
   单元（任何权限下列目录都 ENOTDIR），持续 4 个 tick（两倍于 2 样本确认窗）；PASS 要求 collection
-  error `EFA inventory observation unavailable`、**没有**任何 EFA 计数/mismatch 样本、无 finding、
+  error `EFA inventory observation unavailable`、**没有**任何 EFA inventory 计数/mismatch 样本
+  （只判 `EFA_INVENTORY_METRICS`，即 `_efa_inventory` 自己的 `efa_inventory_*`；该窗口内 RDMA 树是
+  真实的，`_rdma` 逐端口的 `rdma_link_down` 照常上报，只记录（oracle `rdma_samples_recorded`）不判定——
+  实测 hp 2026-10-27 曾把每拍 16 个 `rdma_link_down=0` 判为"从不可读根上报计数"而 FAIL 了正确的
+  产品）、无 finding、
   无硬件步骤、无隔离（`_efa_inventory` 在该路径上还会清零确认计数；模块测试用真实采集器钉住
   missing→不可读→missing→missing 只在第 4 个 tick 确认）。反向阶段若产出 finding 记 FAIL、等待
   其链结束且不再执行正向阶段。正向阶段：`inventory` 选一个端口 ACTIVE 的真实 EFA 设备及其 PCI
@@ -2454,8 +2458,17 @@ bundle 保守，却判 "did not request process state capture"，是 oracle 把 
   与 expected/observed/missing/discovered/driver_bound 计数、恰好一个 SUCCEEDED 的 RESTART_NODE
   执行与节点范围的远程命令、无 REPLACE_NODE、无第二次重启、incident RECOVERED、节点 Ready 且
   可调度、EFA/GPU allocatable 回到基线、重启后新鲜的 `efa_inventory_active_count=期望`/
-  `mismatch=0`、CloudTrail 中 provider 的重启回执（EKS `RebootInstances`/HyperPod
-  `BatchRebootClusterNodes`）只命名本实例，以及 `--node-b`（同车道另一节点）未被触及。重启安全：
+  `mismatch=0`（"新鲜"的锚点是产品记录里 RESTART_NODE 执行 SUCCEEDED 的 `updated_at`——与产品
+  自己的 inventory gate 相同，`adapters/gpu_validation.inventory_observation_window`——而不是运行器
+  在等待 settle、重建探针、snapshot、read-back 之后的本地时间：新 boot 的第一批次是 edge filter 在
+  下一次 health summary 之前唯一投递的一批，实测 hp 2026-10-27 它落在两个锚点之间，SUCCEEDED 的链
+  被判 "no fresh ... (latest None)"；两个锚点记在 `fresh-inventory-anchor.json`）、CloudTrail 中
+  provider 的重启回执（EKS `RebootInstances`/HyperPod `BatchRebootClusterNodes`）只命名本节点——
+  EKS 以实例 id，HyperPod 以产品提交的 `NodeLogicalId`（`hyperpod.py` `NodeLogicalIds`，回执里
+  `request_node_ids` 为 null），运行器在开窗前用 `sagemaker list-cluster-nodes
+  --include-node-logical-ids` 把它绑到本实例（`hyperpod_logical_id`，记在 `node-before.json` 的
+  `hyperpod_binding`；解析失败或不唯一按名 FAIL 回执阶段；实测 hp 2026-10-27 按实例 id 匹配曾把
+  命名本节点的回执判为 "another target"）——以及 `--node-b`（同车道另一节点）未被触及。重启安全：
   关窗在 RESTART_NODE 之前完成；若产品比关窗更快，/run 下的 drop-in、deadman transient 单元与
   夹具都不会跨重启存在，deadman 在关机期间最多失败一次 `systemctl restart`，残留由新 boot 上的
   `snapshot` 证伪。Spot 回收导致 Node UID 变化记 INCONCLUSIVE；链结束后节点仍被隔离时清理走

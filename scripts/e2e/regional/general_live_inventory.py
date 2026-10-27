@@ -120,6 +120,15 @@ EFA_METRICS = {
     "efa_inventory_discovered_count",
     "rdma_link_down",
 }
+#: The inventory's own samples (``collectors/host/inventory._efa_inventory``):
+#: what an UNKNOWN inventory must withhold. ``rdma_link_down`` is ``_rdma``'s
+#: per-port reading of ``/sys/class/infiniband`` (``collectors/host/network.py``)
+#: and keeps flowing while that tree is real -- an unreadable PCI root makes
+#: the inventory UNKNOWN, not the RDMA counters (live hp 2026-10-27: 16
+#: ``rdma_link_down=0`` per tick beside the inventory's collection error).
+EFA_INVENTORY_METRICS = frozenset(
+    name for name in EFA_METRICS if name.startswith("efa_inventory_")
+)
 INFINIBAND_ROOT = "/sys/class/infiniband"
 #: The duplicated device of ``excess_device``; a name no real EFA device has.
 EXCESS_DEVICE_NAME = "gfrs-excess0"

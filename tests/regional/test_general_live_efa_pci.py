@@ -15,6 +15,7 @@ root is UNKNOWN on every tick and resets the confirmation streak.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -438,8 +439,14 @@ class World(FakeRegional):
         allocatable_after: str = "32",
         events: tuple[dict[str, Any], ...] = (_event(),),
         peer_after: dict[str, Any] | None = None,
+        labels: dict[str, str] | None = None,
+        run_output: Callable[[list[str]], str] | None = None,
     ) -> None:
-        super().__init__(cpu_python=self._store)
+        super().__init__(
+            cpu_python=self._store,
+            run_output=run_output,
+            node_metadata={"name": NODE, "labels": labels} if labels else None,
+        )
         self.probe_fake = probe_fake
         self.docs = {"negative": negative, "detection": detection, "settled": settled}
         self.reboots = reboots
@@ -1247,3 +1254,221 @@ def test_the_real_collector_reads_an_unreadable_root_as_unknown_and_resets_the_s
         "a failed read never counts toward the confirmation streak"
     )
     assert _values(fourth)["efa_inventory_mismatch"] == 1, fourth
+
+
+# --------------------------------------------------------------------------- #
+# live hp 2026-10-27: three oracle defects on a chain the product got right
+# --------------------------------------------------------------------------- #
+# Synthetic HyperPod identities: the public-release gate refuses literal ones.
+LOGICAL_ID = "11111111-2222-4333-8444-555555555555"
+OTHER_LOGICAL_ID = "66666666-7777-4888-9999-000000000000"
+HP_LABELS = {"sagemaker.amazonaws.com/compute-type": "hyperpod"}
+
+
+def _rdma_batch(observed_at: str) -> dict[str, Any]:
+    """The negative window as the live node delivered it: the inventory UNKNOWN,
+    ``_rdma``'s per-port readings of the real RDMA tree still in the batch."""
+
+    batch = _unknown_batch(observed_at)
+    batch["samples"] = [
+        {
+            "name": "rdma_link_down",
+            "device": device,
+            "value": 0,
+            "labels": {"port": "1"},
+        }
+        for device in DEVICES
+    ]
+    return batch
+
+
+def _healthy_batch(observed_at: str) -> dict[str, Any]:
+    return _efa_batch(
+        observed_at, failure_mode="HEALTHY", active=EXPECTED, mismatch=0, streak=0
+    )
+
+
+def _hp_inventory(command: list[str]) -> str:
+    if "list-cluster-nodes" not in command:
+        return "null"
+    assert "--include-node-logical-ids" in command, command
+    assert command[command.index("--cluster-name") + 1] == "hp-cluster", command
+    return json.dumps(
+        {
+            "ClusterNodeSummaries": [
+                {"InstanceId": OTHER_INSTANCE, "NodeLogicalId": OTHER_LOGICAL_ID},
+                {"InstanceId": INSTANCE, "NodeLogicalId": LOGICAL_ID},
+            ]
+        }
+    )
+
+
+def _hp_event(*logical: str, **extra: Any) -> dict[str, Any]:
+    return _event(
+        event_name="BatchRebootClusterNodes",
+        request_node_ids=None,
+        request_node_logical_ids=list(logical or (LOGICAL_ID,)),
+        **extra,
+    )
+
+
+def test_unreadable_root_records_the_real_trees_rdma_counters_without_grading_them(
+    tmp_path: Path,
+) -> None:
+    negative = _base_doc(
+        batches=[
+            _rdma_batch("2026-10-24T00:00:15+00:00"),
+            _rdma_batch("2026-10-24T00:00:35+00:00"),
+        ]
+    )
+    world = _world(tmp_path, negative=negative)
+    stages = mod.unreadable_root(world.ctx, host_source_replay(world.ctx))["stages"]
+    assert stages["negative_no_count"] == [], stages["negative_no_count"]
+    assert stages["negative_unknown"] == [], stages["negative_unknown"]
+    oracle = json.loads(
+        (world.ctx.case_dir / "oracle.jsonl").read_text().splitlines()[-1]
+    )
+    assert (oracle["counts_reported"], oracle["rdma_samples_recorded"]) == (
+        0,
+        2 * len(DEVICES),
+    ), oracle
+    assert inventory.EFA_INVENTORY_METRICS == inventory.EFA_METRICS - {
+        "rdma_link_down"
+    }, inventory.EFA_INVENTORY_METRICS
+
+
+def test_the_live_hp_negative_window_passes_end_to_end(tmp_path: Path) -> None:
+    negative = _base_doc(batches=[_rdma_batch("2026-10-24T00:00:15+00:00")])
+    result = mod.pci_missing(_world(tmp_path, negative=negative).ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+
+
+def test_fresh_inventory_is_anchored_on_the_products_restart_node_completion(
+    tmp_path: Path,
+) -> None:
+    # The new boot's first batch landed after RESTART_NODE SUCCEEDED (00:20:00,
+    # the execution's updated_at) and before the runner finished its post-reboot
+    # bookkeeping (its clock here is the real one): the live hp timeline.
+    settled = _settled_doc(fresh=False)
+    settled["batches"].append(_healthy_batch("2026-10-24T00:21:00+00:00"))
+    world = _world(tmp_path, settled=settled)
+    result = mod.pci_missing(world.ctx)
+    assert result["stages"]["fresh_inventory"] == [], result["stages"]
+    assert result["verdict"] == "PASS", result["errors"]
+    anchor = json.loads(
+        (world.ctx.case_dir / "fresh-inventory-anchor.json").read_text()
+    )
+    assert anchor["restart_node_completed_at"] == "2026-10-24T00:20:00+00:00", anchor
+    assert mod.parse_time(anchor["new_boot_observed_at"]) is not None, anchor
+
+
+def test_a_reading_older_than_the_restart_node_completion_is_not_fresh(
+    tmp_path: Path,
+) -> None:
+    settled = _settled_doc(fresh=False)
+    settled["batches"].append(_healthy_batch("2026-10-24T00:19:00+00:00"))
+    result = mod.pci_missing(_world(tmp_path, settled=settled).ctx)
+    errors = result["stages"]["fresh_inventory"]
+    assert len(errors) == 2, errors
+    assert all("completed at 2026-10-24T00:20:00+00:00" in error for error in errors), (
+        errors
+    )
+
+
+def test_reboot_completed_at_reads_the_succeeded_restart_node_execution() -> None:
+    assert mod.reboot_completed_at(_settled_doc(), ["inc-efa"]) == datetime(
+        2026, 10, 24, 0, 20, tzinfo=timezone.utc
+    )
+    running = _settled_doc(workflows=[_workflow("RUNNING")])
+    assert mod.reboot_completed_at(running, ["inc-efa"]) is None
+    assert mod.reboot_completed_at(_settled_doc(), []) is None
+
+
+def test_the_hyperpod_receipt_is_matched_by_the_nodes_logical_id(
+    tmp_path: Path,
+) -> None:
+    world = _world(
+        tmp_path, labels=HP_LABELS, run_output=_hp_inventory, events=(_hp_event(),)
+    )
+    result = mod.pci_missing(world.ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    assert (result["provider"], result["node_logical_id"]) == ("hp", LOGICAL_ID)
+    wait = world.regional.provider_waits[0]
+    assert wait["event_names"] == {"BatchRebootClusterNodes", "RebootClusterNodes"}
+    assert wait["event_source"] == "sagemaker.amazonaws.com", wait
+    assert result["provider_events"][0]["request_node_logical_ids"] == [LOGICAL_ID]
+    before = json.loads((world.ctx.case_dir / "node-before.json").read_text())
+    assert before["hyperpod_binding"] == {
+        "node_logical_id": LOGICAL_ID,
+        "error": None,
+        "cluster": "hp-cluster",
+    }, before
+    assert before["node"]["node_logical_id"] == LOGICAL_ID, before
+
+
+@pytest.mark.parametrize(
+    ("events", "run_output", "needle"),
+    [
+        ((_hp_event(OTHER_LOGICAL_ID),), _hp_inventory, "another target"),
+        (
+            (_hp_event(),),
+            lambda command: json.dumps({"ClusterNodeSummaries": []}),
+            "NodeLogicalId is unresolved (0 HyperPod nodes",
+        ),
+        (
+            (_hp_event(LOGICAL_ID, OTHER_LOGICAL_ID),),
+            _hp_inventory,
+            "together with another target",
+        ),
+        ((), _hp_inventory, f"or its NodeLogicalId {LOGICAL_ID} within"),
+    ],
+)
+def test_hyperpod_receipt_fail_branches(
+    tmp_path: Path,
+    events: tuple[dict[str, Any], ...],
+    run_output: Callable[[list[str]], str],
+    needle: str,
+) -> None:
+    world = _world(tmp_path, labels=HP_LABELS, run_output=run_output, events=events)
+    result = mod.pci_missing(world.ctx)
+    assert result["verdict"] == "FAIL", result["stages"]
+    receipt = result["stages"]["provider_receipt"]
+    assert any(needle in error for error in receipt), receipt
+    others = {
+        name: errors
+        for name, errors in result["stages"].items()
+        if errors and name != "provider_receipt"
+    }
+    assert others == {}, others
+
+
+def test_hyperpod_logical_id_names_a_failed_or_ambiguous_binding(
+    tmp_path: Path,
+) -> None:
+    def refused(command: list[str]) -> str:
+        raise RuntimeError("aws refused")
+
+    def duplicated(command: list[str]) -> str:
+        return json.dumps(
+            {
+                "ClusterNodeSummaries": [
+                    {"InstanceId": INSTANCE, "NodeLogicalId": "a"},
+                    {"InstanceId": INSTANCE, "NodeLogicalId": "b"},
+                ],
+                "NextToken": "more",
+            }
+        )
+
+    world = _world(tmp_path, labels=HP_LABELS, run_output=refused)
+    binding = mod.hyperpod_logical_id(world.ctx, INSTANCE)
+    assert binding == {
+        "node_logical_id": None,
+        "error": "RuntimeError: aws refused",
+        "cluster": "hp-cluster",
+    }, binding
+    world = _world(tmp_path / "dup", labels=HP_LABELS, run_output=duplicated)
+    binding = mod.hyperpod_logical_id(world.ctx, INSTANCE)
+    assert binding["error"] == (
+        f"2 HyperPod nodes of hp-cluster bind {INSTANCE} (inventory incomplete)"
+    ), binding
+    assert mod.hyperpod_logical_id(world.ctx, None)["node_logical_id"] is None

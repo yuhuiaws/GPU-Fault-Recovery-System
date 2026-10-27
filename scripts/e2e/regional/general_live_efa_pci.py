@@ -27,10 +27,14 @@ the known risk that two failed reads are counted as zero cards): the PCI root
 is made *unreadable* -- the fixture path is a regular file, so every listing
 fails with ENOTDIR whatever the unit's privileges -- and held for twice the
 confirmation window. The product must record ``EFA inventory observation
-unavailable`` (UNKNOWN), report no count or mismatch sample, mint no finding,
-plan no hardware step and isolate nothing; ``_efa_inventory`` also resets the
-confirmation streak on that path, which the module tests pin against the real
-collector. A finding from the unreadable root is FAIL, its chain is waited
+unavailable`` (UNKNOWN), report no inventory count or mismatch sample, mint no
+finding, plan no hardware step and isolate nothing; ``_efa_inventory`` also
+resets the confirmation streak on that path, which the module tests pin
+against the real collector. Only the inventory's own samples are graded
+(``EFA_INVENTORY_METRICS``): the RDMA tree is real in this window, so
+``_rdma``'s per-port ``rdma_link_down`` keeps flowing and is recorded, not
+counted -- grading it as an inventory count failed a correct product (live hp
+2026-10-27). A finding from the unreadable root is FAIL, its chain is waited
 out (it may reboot) and the missing-function stage is not run.
 
 Positive stage: the window is closed the moment the finding exists -- the
@@ -52,15 +56,21 @@ re-created). Grading reads the product's records only: the confirmed sample's
 remote command scoped to the node, no REPLACE_NODE, no second reboot, the
 incident RECOVERED, the node Ready and schedulable with the EFA and GPU
 allocatable at baseline, fresh post-reboot ``efa_inventory_active_count ==
-expected`` / ``efa_inventory_mismatch == 0``, the provider's own receipt in
-CloudTrail (EC2 ``RebootInstances`` on plain EKS, SageMaker ``BatchReboot
-ClusterNodes`` on HyperPod) naming this instance and no other, and -- when
-``--node-b`` is given -- the pair node untouched (same boot id, Ready, not
-isolated, no incident). The runner's oracle is the fixture receipt that names
-the dropped BDF and RDMA device; the product's own records carry the counts
-(it names no BDF). A node that vanishes during the reboot wait (Spot reclaim)
-is INCONCLUSIVE, not a product verdict. If the chain ends with the node still
-isolated, cleanup hands it back through the product's validated restore.
+expected`` / ``efa_inventory_mismatch == 0`` -- newer than the product's own
+RESTART_NODE completion, the anchor its inventory gate reads from
+(``adapters/gpu_validation.inventory_observation_window``), not the runner's
+later bookkeeping --, the provider's own receipt in CloudTrail (EC2
+``RebootInstances`` on plain EKS, SageMaker ``BatchRebootClusterNodes`` on
+HyperPod) naming this node and no other -- EC2 by instance id, SageMaker by
+the ``NodeLogicalId`` the product submits (``hyperpod.py`` ``NodeLogicalIds``),
+bound to the instance through ``list-cluster-nodes --include-node-logical-ids``
+before the window opens --, and -- when ``--node-b`` is given -- the pair node
+untouched (same boot id, Ready, not isolated, no incident). The runner's
+oracle is the fixture receipt that names the dropped BDF and RDMA device; the
+product's own records carry the counts (it names no BDF). A node that vanishes
+during the reboot wait (Spot reclaim) is INCONCLUSIVE, not a product verdict.
+If the chain ends with the node still isolated, cleanup hands it back through
+the product's validated restore.
 """
 
 from __future__ import annotations
@@ -96,6 +106,7 @@ from scripts.e2e.regional.general_live_fixture import (
 from scripts.e2e.regional.general_live_inventory import (
     CASE_013,
     DETECTION_BUDGET,
+    EFA_INVENTORY_METRICS,
     EFA_METRICS,
     INFINIBAND_ROOT,
     NODE_REBOOT,
@@ -150,6 +161,8 @@ REBOOT_BUDGET = 1500
 POST_REBOOT_SETTLE_BUDGET = 3 * STEP_TIMEOUT_SECONDS + 300
 #: CloudTrail is eventually consistent: typically 5 minutes, guaranteed 15.
 PROVIDER_RECEIPT_BUDGET = 900
+#: ``sagemaker list-cluster-nodes``: the instance <-> NodeLogicalId binding.
+HYPERPOD_INVENTORY_TIMEOUT = 180
 #: The maintenance window the positive stage needs ahead of it.
 POSITIVE_WINDOW_SECONDS = DETECTION_BUDGET + REBOOT_BUDGET + POST_REBOOT_SETTLE_BUDGET
 #: The product's REBOOT_NODE plan (``families/health.py`` ``_reboot_operations``;
@@ -260,9 +273,17 @@ def unreadable_root(ctx: VariantContext, replay: HostSourceReplay) -> dict[str, 
     observed = activity(ctx, started, metrics=EFA_METRICS)
     ctx.evidence.write("unreadable-root-close", replay.close())
     errors = efa_collection_errors(observed)
+    # Only the inventory's own samples are counts here: the RDMA tree is real
+    # in this window, so ``_rdma``'s per-port ``rdma_link_down`` keeps flowing
+    # (live hp 2026-10-27: 16 per delivered tick) and is recorded, not graded.
     counts = [
         (name, item)
-        for name in sorted(EFA_METRICS)
+        for name in sorted(EFA_INVENTORY_METRICS)
+        for item in _numeric(samples(observed, name))
+    ]
+    rdma_samples = [
+        item
+        for name in sorted(EFA_METRICS - EFA_INVENTORY_METRICS)
         for item in _numeric(samples(observed, name))
     ]
     incidents = finding_incidents(observed, MISMATCH_METRIC)
@@ -273,6 +294,7 @@ def unreadable_root(ctx: VariantContext, replay: HostSourceReplay) -> dict[str, 
                 "ticks_held": NEGATIVE_TICKS,
                 "hold_seconds": hold_seconds,
                 "counts_reported": len(counts),
+                "rdma_samples_recorded": len(rdma_samples),
                 **replay.evidence(fixture=built.get("path"), unreadable=True),
             }
         ],
@@ -527,17 +549,45 @@ def fresh_inventory_errors(
     errors = []
     active = fresh("efa_inventory_active_count")
     mismatch = fresh(MISMATCH_METRIC)
+    anchor = f"after the reboot completed at {after.isoformat()}"
     if not active or active[-1]["value"] != expected:
         errors.append(
-            f"no fresh efa_inventory_active_count={expected} after the reboot "
+            f"no fresh efa_inventory_active_count={expected} {anchor} "
             f"(latest {active[-1]['value'] if active else None})"
         )
     if not mismatch or mismatch[-1]["value"] != 0:
         errors.append(
-            f"no fresh {MISMATCH_METRIC}=0 after the reboot "
+            f"no fresh {MISMATCH_METRIC}=0 {anchor} "
             f"(latest {mismatch[-1]['value'] if mismatch else None})"
         )
     return errors
+
+
+def reboot_completed_at(
+    observed: dict[str, Any], incident_ids: Iterable[str]
+) -> datetime | None:
+    """When the chain's RESTART_NODE SUCCEEDED, by the product's own record.
+
+    The product's inventory gate judges only samples newer than its completed
+    recovery step (``adapters/gpu_validation.inventory_observation_window``:
+    the latest ``updated_at`` of the SUCCEEDED recovery executions), so the
+    runner's freshness anchor is the same moment. Anchoring on the runner's
+    clock after its post-reboot bookkeeping (node settle, probe re-create,
+    snapshot, read-back) rejected the new boot's first batch -- the only one
+    the edge filter delivers until the next health summary -- and failed a
+    SUCCEEDED chain (live hp 2026-10-27: "no fresh efa_inventory_active_count
+    =16 after the reboot (latest None)").
+    """
+
+    moments = [
+        moment
+        for incident_id in incident_ids
+        for workflow in workflows_of(observed, incident_id)
+        for item in executions(workflow, "RESTART_NODE")
+        if item.get("status") == "SUCCEEDED"
+        and (moment := parse_time(item.get("updated_at"))) is not None
+    ]
+    return max(moments) if moments else None
 
 
 def node_restored_errors(
@@ -563,14 +613,96 @@ def node_restored_errors(
     return errors
 
 
+def hyperpod_logical_id(ctx: VariantContext, instance_id: str | None) -> dict[str, Any]:
+    """The SageMaker ``NodeLogicalId`` bound to ``instance_id`` on the lane's cluster.
+
+    The product reboots a HyperPod node by logical id (``hyperpod.py``:
+    ``BatchRebootClusterNodes(NodeLogicalIds=...)``, ``IncludeNodeLogicalIds``
+    required), so its CloudTrail receipt carries ``request_node_logical_ids``
+    and a null ``request_node_ids``: matching the instance id there never
+    succeeds (live hp 2026-10-27: "no accepted [...] event naming i-...; 1
+    accepted reboot events name another target: BatchRebootClusterNodes:None"
+    on the receipt that named this very node). The binding is the provider's
+    own -- ``list-cluster-nodes --include-node-logical-ids``, the COLLECT-004
+    scope's read (``collector_reboot_scope``) -- taken before anything is
+    mutated; a read that fails or binds no single node is returned as its
+    error and fails the receipt stage by name, never silently.
+    """
+
+    cluster = ctx.settings.hyperpod_cluster
+    if not instance_id or not cluster:
+        return {
+            "node_logical_id": None,
+            "error": "no EC2 instance id or no --hyperpod-cluster to resolve it on",
+            "cluster": cluster or None,
+        }
+    try:
+        page = json.loads(
+            ctx.regional.run(
+                [
+                    "aws",
+                    "sagemaker",
+                    "list-cluster-nodes",
+                    "--cluster-name",
+                    cluster,
+                    "--include-node-logical-ids",
+                    "--region",
+                    ctx.regional.settings.region,
+                    "--output",
+                    "json",
+                ],
+                timeout=HYPERPOD_INVENTORY_TIMEOUT,
+            ).stdout
+            or "null"
+        )
+    except Exception as error:  # recorded and graded by the receipt stage
+        return {
+            "node_logical_id": None,
+            "error": f"{type(error).__name__}: {str(error)[:200]}",
+            "cluster": cluster,
+        }
+    page = page if isinstance(page, dict) else {}
+    bound = sorted(
+        {
+            str(row["NodeLogicalId"])
+            for row in page.get("ClusterNodeSummaries") or []
+            if isinstance(row, dict)
+            and row.get("InstanceId") == instance_id
+            and row.get("NodeLogicalId")
+        }
+    )
+    if len(bound) != 1 or page.get("NextToken"):
+        return {
+            "node_logical_id": None,
+            "error": f"{len(bound)} HyperPod nodes of {cluster} bind {instance_id}"
+            + (" (inventory incomplete)" if page.get("NextToken") else ""),
+            "cluster": cluster,
+        }
+    return {"node_logical_id": bound[0], "error": None, "cluster": cluster}
+
+
+def _targets_text(item: dict[str, Any]) -> str:
+    return (
+        f"{item.get('event_name')}:{item.get('request_node_ids')}/"
+        f"{item.get('request_node_logical_ids')}"
+    )
+
+
 def provider_receipt(
     ctx: VariantContext,
     *,
     provider: str | None,
     instance_id: str | None,
     since: datetime,
+    node_logical_id: str | None = None,
+    binding_error: str | None = None,
 ) -> tuple[list[str], list[dict[str, Any]]]:
-    """The provider's own reboot record (CloudTrail) names this instance, no other."""
+    """The provider's own reboot record (CloudTrail) names this node, no other.
+
+    EC2 ``RebootInstances`` names the instance; SageMaker ``BatchRebootCluster
+    Nodes`` names the ``NodeLogicalId`` the product submitted, which
+    :func:`hyperpod_logical_id` bound to the instance (``node_logical_id``).
+    """
 
     key = PROVIDER_KEYS.get(provider or "")
     if key is None:
@@ -587,31 +719,52 @@ def provider_receipt(
     )
     accepted = [item for item in events if not item.get("api_error_code")]
 
-    def names_instance(item: dict[str, Any]) -> bool:
-        targets = [
-            *(item.get("request_node_ids") or []),
-            *(item.get("request_node_logical_ids") or []),
-        ]
-        return any(instance_id in str(target) for target in targets)
+    def ours(target: Any) -> bool:
+        text = str(target)
+        return instance_id in text or (
+            node_logical_id is not None and text == node_logical_id
+        )
 
-    mine = [item for item in accepted if names_instance(item)]
-    foreign = [item for item in accepted if not names_instance(item)]
+    judged = [
+        (
+            item,
+            [
+                ours(target)
+                for target in (
+                    *(item.get("request_node_ids") or []),
+                    *(item.get("request_node_logical_ids") or []),
+                )
+            ],
+        )
+        for item in accepted
+    ]
+    mine = [item for item, flags in judged if any(flags)]
+    foreign = [item for item, flags in judged if not any(flags)]
+    shared = [item for item, flags in judged if any(flags) and not all(flags)]
     errors = []
+    if key == "hyperpod" and node_logical_id is None:
+        errors.append(
+            f"the node's HyperPod NodeLogicalId is unresolved ({binding_error}); "
+            "BatchRebootClusterNodes names logical ids only"
+        )
     if not mine:
         errors.append(
-            f"no accepted {sorted(names)} event naming {instance_id} within "
-            f"{PROVIDER_RECEIPT_BUDGET}s"
+            f"no accepted {sorted(names)} event naming {instance_id}"
+            + (f" or its NodeLogicalId {node_logical_id}" if node_logical_id else "")
+            + f" within {PROVIDER_RECEIPT_BUDGET}s"
             + (" (CloudTrail may still be delivering)" if not events else "")
         )
     if len(mine) > 1:
         errors.append(f"{len(mine)} reboot events name {instance_id} (expected one)")
+    if shared:
+        errors.append(
+            f"{len(shared)} reboot events name this node together with another "
+            "target: " + ", ".join(_targets_text(item) for item in shared)[:400]
+        )
     if foreign:
         errors.append(
             f"{len(foreign)} accepted reboot events name another target: "
-            + ", ".join(
-                f"{item.get('event_name')}:{item.get('request_node_ids')}"
-                for item in foreign
-            )[:400]
+            + ", ".join(_targets_text(item) for item in foreign)[:400]
         )
     return errors, accepted
 
@@ -835,6 +988,9 @@ def _follow_reboot(
             f"{REBOOT_BUDGET}s of the plan"
         ]
         return None
+    # When the new boot was first seen: the freshness anchor's fallback when
+    # the product's RESTART_NODE record carries no completion time.
+    rebooted = {**rebooted, "observed_at": utc_now().isoformat()}
     stages["rebooted"] = []
     settled_node = wait_node_settled_after_reboot(
         ctx.regional,
@@ -868,9 +1024,14 @@ def _grade_settled(
     rebooted: dict[str, Any] | None,
     rebooted_at: datetime,
     expected: int,
+    binding: dict[str, Any],
     stages: dict[str, list[str]],
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Grade the settled chain on the product's records; returns (observed, events)."""
+    """Grade the settled chain on the product's records; returns (observed, events).
+
+    ``rebooted_at`` is when the runner first saw the new boot: the fresh-inventory
+    anchor only when the product's record names no RESTART_NODE completion.
+    """
 
     settled = wait_settled(
         ctx,
@@ -898,8 +1059,18 @@ def _grade_settled(
     after = node_identity(ctx)
     ctx.evidence.write("node-after", after)
     stages["node_restored"] = node_restored_errors(before, after, rebooted)
+    completed_at = reboot_completed_at(observed, incident_ids)
+    ctx.evidence.write(
+        "fresh-inventory-anchor",
+        {
+            "restart_node_completed_at": (
+                completed_at.isoformat() if completed_at else None
+            ),
+            "new_boot_observed_at": rebooted_at.isoformat(),
+        },
+    )
     stages["fresh_inventory"] = fresh_inventory_errors(
-        observed, expected=expected, after=rebooted_at
+        observed, expected=expected, after=completed_at or rebooted_at
     )
     events: list[dict[str, Any]] = []
     if rebooted is None:
@@ -908,7 +1079,12 @@ def _grade_settled(
         ]
     else:
         stages["provider_receipt"], events = provider_receipt(
-            ctx, provider=provider, instance_id=before.get("instance_id"), since=started
+            ctx,
+            provider=provider,
+            instance_id=before.get("instance_id"),
+            since=started,
+            node_logical_id=binding.get("node_logical_id"),
+            binding_error=binding.get("error"),
         )
     ctx.evidence.write("provider-events", {"events": events})
     stages["peer_untouched"] = peer_errors(ctx, peer_before, started)
@@ -929,8 +1105,22 @@ def pci_missing(ctx: VariantContext) -> dict[str, Any]:
     provider = node_provider(
         (ctx.regional.node_metadata(ctx.settings.node) or {}).get("labels") or {}
     )
+    # HyperPod reboots by NodeLogicalId: bind it to the instance before anything
+    # is mutated, so the receipt is read against the provider's own mapping.
+    binding = (
+        hyperpod_logical_id(ctx, before.get("instance_id"))
+        if provider == "hp"
+        else {"node_logical_id": None, "error": None}
+    )
+    before["node_logical_id"] = binding.get("node_logical_id")
     ctx.evidence.write(
-        "node-before", {"node": before, "peer": peer_before, "provider": provider}
+        "node-before",
+        {
+            "node": before,
+            "peer": peer_before,
+            "provider": provider,
+            "hyperpod_binding": binding,
+        },
     )
     inventory = replay.inventory(source=INFINIBAND_ROOT)
     ctx.evidence.write("infiniband-inventory", inventory)
@@ -987,8 +1177,13 @@ def pci_missing(ctx: VariantContext) -> dict[str, Any]:
         incident_ids=incident_ids,
         stages=stages,
     )
-    rebooted_at = utc_now()
+    rebooted_at = parse_time((rebooted or {}).get("observed_at")) or utc_now()
     extra["boot_id_after"] = (rebooted or {}).get("boot_id")
+    if provider == "hp" and binding.get("node_logical_id") is None:
+        # The pre-window read failed: one more try before the receipt is graded.
+        binding = hyperpod_logical_id(ctx, before.get("instance_id"))
+        before["node_logical_id"] = binding.get("node_logical_id")
+    extra["node_logical_id"] = binding.get("node_logical_id")
     observed, events = _grade_settled(
         ctx,
         before=before,
@@ -999,6 +1194,7 @@ def pci_missing(ctx: VariantContext) -> dict[str, Any]:
         rebooted=rebooted,
         rebooted_at=rebooted_at,
         expected=expected,
+        binding=binding,
         stages=stages,
     )
     notes.append(
@@ -1016,6 +1212,7 @@ def pci_missing(ctx: VariantContext) -> dict[str, Any]:
                     "event_name": item.get("event_name"),
                     "event_time": item.get("event_time"),
                     "request_node_ids": item.get("request_node_ids"),
+                    "request_node_logical_ids": item.get("request_node_logical_ids"),
                 }
                 for item in events
             ],
@@ -1047,14 +1244,16 @@ VARIANTS = [
             "unit until the finding exists"
         ),
         expected=(
-            "unreadable root: 'EFA inventory observation unavailable' only, no count, "
+            "unreadable root: 'EFA inventory observation unavailable' only, no "
+            "inventory count (the real RDMA tree's rdma_link_down keeps flowing), "
             "no finding, no reboot, no isolation; missing function: "
             "efa_inventory_mismatch failure_mode=PCI_DEVICE_MISSING confirmed after the "
             "consecutive samples -> REBOOT_NODE (MARK_UNSCHEDULABLE, QUARANTINE, exactly "
             "one RESTART_NODE through the provider, VALIDATE_GPU/HOST/FABRIC on "
             "post-reboot evidence, RESTORE_SCHEDULING); new boot id, node Ready and "
             "schedulable, EFA/GPU allocatable at baseline, incident RECOVERED, no "
-            "REPLACE_NODE, CloudTrail names this instance only, --node-b untouched"
+            "REPLACE_NODE, CloudTrail names this node only (EC2 by instance id, "
+            "SageMaker by its NodeLogicalId), --node-b untouched"
         ),
         cleanup=(
             "close the window the moment the finding exists (deadman-backed); the "
@@ -1085,11 +1284,13 @@ __all__ = [
     "expected_efa_count",
     "fresh_inventory_errors",
     "hand_back",
+    "hyperpod_logical_id",
     "node_identity",
     "node_restored_errors",
     "pci_missing",
     "peer_errors",
     "provider_receipt",
+    "reboot_completed_at",
     "reboot_receipt_errors",
     "residue_errors",
     "single_reboot_errors",

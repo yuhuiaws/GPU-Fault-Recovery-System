@@ -2598,8 +2598,14 @@ PCI_DEVICE_MISSING reboot chain on a live-replay: first the spec's negative
 stage -- `build-pci-fixture --unreadable` makes the PCI-root fixture a regular
 file, so the product's listing fails (ENOTDIR) under any privilege, held for
 four host ticks (twice the two-sample confirmation window); the product must
-record `EFA inventory observation unavailable` and no count, mismatch, finding,
-hardware step or isolation (its error path also resets the confirmation streak,
+record `EFA inventory observation unavailable` and no inventory count, mismatch,
+finding, hardware step or isolation -- only the inventory's own `efa_inventory_*`
+samples are graded (`EFA_INVENTORY_METRICS`): the RDMA tree is real in that
+window, so `_rdma`'s per-port `rdma_link_down` keeps flowing and is recorded
+(oracle `rdma_samples_recorded`), not counted; live hp 2026-10-27 the 16
+`rdma_link_down=0` of every delivered tick were graded as counts from the
+unreadable root and failed a correct product -- (its error path also resets
+the confirmation streak,
 pinned by running the real collector over missing -> unreadable -> missing ->
 missing: only the fourth tick confirms); a finding from the unreadable root is
 FAIL, its chain is waited out and the positive stage is skipped. Then the node's
@@ -2619,9 +2625,24 @@ Graded on the product's records only: the confirmed sample's failure mode and
 counts, exactly one SUCCEEDED RESTART_NODE execution and node-scoped remote
 command, no REPLACE_NODE or second reboot, the incident RECOVERED, the node
 Ready and schedulable with the EFA and GPU allocatable at baseline, fresh
-post-reboot `efa_inventory_active_count`/`efa_inventory_mismatch`, the
-provider's CloudTrail reboot record (EC2 `RebootInstances`, SageMaker
-`BatchRebootClusterNodes`) naming this instance and no other, and `--node-b`
+post-reboot `efa_inventory_active_count`/`efa_inventory_mismatch` -- fresh
+meaning newer than the SUCCEEDED RESTART_NODE execution's `updated_at` in the
+product's record, the anchor its own inventory gate reads from
+(`adapters/gpu_validation.inventory_observation_window`), not the runner's
+clock after its post-reboot settle, probe re-create, snapshot and read-back:
+the new boot's first batch is the only one the edge filter delivers before the
+next health summary, live hp 2026-10-27 it fell between the two anchors and a
+SUCCEEDED chain read "no fresh ... (latest None)"; both anchors are recorded in
+`fresh-inventory-anchor.json` --, the provider's CloudTrail reboot record (EC2
+`RebootInstances`, SageMaker `BatchRebootClusterNodes`) naming this node and
+no other -- EC2 by instance id, SageMaker by the `NodeLogicalId` the product
+submits (`hyperpod.py` `NodeLogicalIds`; `request_node_ids` is null in the
+receipt), which the runner binds to the instance before the window opens with
+`sagemaker list-cluster-nodes --include-node-logical-ids`
+(`hyperpod_logical_id`, recorded as `hyperpod_binding` in `node-before.json`;
+an unresolved or ambiguous binding fails the receipt stage by name; live hp
+2026-10-27 the instance-id match graded the receipt that named this very node
+as "another target") --, and `--node-b`
 untouched. Reboot safety: the close precedes RESTART_NODE; if the product is
 faster, nothing of the window lives outside `/run`, a deadman firing during
 shutdown can only fail a `systemctl restart` the shutdown kills, and the new
