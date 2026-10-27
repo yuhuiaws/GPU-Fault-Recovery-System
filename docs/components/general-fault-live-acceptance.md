@@ -939,6 +939,35 @@ WARNING 的前提，判定不受此影响。
 `probe-error.json`，下次失败自带解释（`tests/regional/test_general_live_fabric_plan_bounds.py`）。
 三个不越窗变体尚无现场证据，需在两集群重跑。
 
+2026-10-27 05:04-05:26Z hp 现场（HyperPod 车道的独占节点，R13g，
+harness int/r13c-live23）`recovery_failure` FAIL "a fabric that stayed failed after the reset did
+not escalate/hold isolation"。记录表明产品没有错：回放在 RESET_ALL_GPUS_NVSWITCHES 之后继续端出
+状态 4，reset 后的 VALIDATE_GPU 立即 FAILED（`gpu_fabric_manager.fabric_validation`：FAILURE 立判，
+1/2 作为训练等待至多一个窗口），`orchestration/escalation.next_rung` 把 reset 后失败的校验升为
+RESTART_NODE，`execution/branch_escalation` 把这一级连同 VALIDATE_GPU/HOST/FABRIC + RESTORE_SCHEDULING
+尾巴追加到**同一条**记录（单节点扁平计划被收编为单分支 DAG）；RESTART_NODE 在两个 provider 上都是同一
+实例的重启（HyperPod `BatchRebootClusterNodes`，plain EKS EC2 `RebootInstances`，
+`node_provider.restart_vm_effective_action`），节点 boot id aa20cf7c→b7e017d9、05:19:58Z Ready；回放的
+全部对象都在 `/run`（tmpfs），随重启消失，产品随后校验的是节点真实、已训练的 fabric，恢复调度、incident
+RECOVERED——正是设计路径。旧 oracle 在 settled 记录上要求 ESCALATED/QUARANTINED，那是梯子的终态，只有
+重启**之后** fabric 仍失败才会出现；该分支用 `/run` 回放在任一 provider 上都观测不到，也不得让回放跨重启
+存活（S34：存活的回放会把产品拖进 reboot/quarantine 循环）。现在 `recovery_failure` 在产品写下重启
+**之前与当时**的记录上判定（`held_failure_errors`，阶段 `recovery_failure`）：reset 后的校验必须在被持有
+的故障上 FAILED、节点在 fabric 读失败期间未被放行（RESTART_NODE 之前无 RESTORE_SCHEDULING SUCCEEDED，
+无升级时一次也不能有）、升级随后到来——RESTART_NODE 执行记录，或不重启的站点上的运维移交
+（ESCALATED/QUARANTINED）；再等记录 settle 并判出口（`escalation_exit_errors`，阶段 `escalation_exit`）：
+恰好一次 RESET_ALL、至多一次 RESTART_NODE、无 REPLACE_NODE、SUCCEEDED 的 RESTART_NODE 确实换了 boot id、
+记录 SUCCEEDED 则 incident RECOVERED 且节点无残余隔离，FAILED/BLOCKED 则 incident 在运维手里；证据
+`fabric-escalation.json`（incident/工作流状态、reset/校验/升级/放行各步执行、两个 boot id），notes 写明
+重启后分支按设计不可观测。reset-only 的五个 X 变体共享同一暴露：quiesce 时未消耗的持有读会端给
+RESTORE_GPU_SERVICES 之后的第一次 scrape，状态 4 的 `failed` 立判 FAILED→RESTART_NODE（1/2 等待训练，
+advance 通常来得及）；reset-done 等待改为 10 s 轮询，`advance` 在 kubelet 尚未随 RESTORE 回来时按
+HostProbeError 重试至多 180 s（仍到不了即 INCONCLUSIVE 并说明），记录里出现 RESTART_NODE 或 boot id
+变化时判 INCONCLUSIVE 并说明原因——不以重启当 PASS，也不把产品的设计响应判 FAIL（`reboot_exposure`）；
+链判定补入 MARK_UNSCHEDULABLE（产品目录链自带的 cordon）。`recovery_failure` 需在两集群重跑（eks 尚无
+现场记录），五个 reset-only 变体同样两集群重跑；无变体因此变为 NOT_RUN
+（`tests/regional/test_general_live_fabric_reboot.py`）。
+
 ### GF-GENERAL-LIVE-022
 
 必测：`at_rate_limit`、`over_rate_limit`、`counter_reset`、`source_boot_change`、

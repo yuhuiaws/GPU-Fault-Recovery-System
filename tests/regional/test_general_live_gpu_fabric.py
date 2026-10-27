@@ -121,7 +121,12 @@ def test_full_reset_requires_the_full_fabric_chain(tmp_path: Path) -> None:
     inc = gpu_incident(
         "inc", "b-node-fabric_manager_status", action="RESET_GPU", workflow="wf"
     )
-    executions = [{"operation": "RESET_ALL_GPUS_NVSWITCHES", "status": "SUCCEEDED"}]
+    # The cordon is an isolating step of the chain: a record that ended must
+    # have executed it (``never_executed_errors``), as the live one does.
+    executions = [
+        {"operation": "MARK_UNSCHEDULABLE", "status": "SUCCEEDED"},
+        {"operation": "RESET_ALL_GPUS_NVSWITCHES", "status": "SUCCEEDED"},
+    ]
     wf = gpu_workflow(
         "wf", "inc", list(fab.FULL_RESET), status="SUCCEEDED", executions=executions
     )

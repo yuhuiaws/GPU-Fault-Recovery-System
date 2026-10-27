@@ -1311,8 +1311,14 @@ def wait_gpu_incident(
     metrics: Sequence[str] = (),
     timeout_seconds: float,
     name: str,
+    poll_seconds: float = 20,
 ) -> dict[str, Any]:
-    """Poll the product until ``select`` finds an incident (or the deadline)."""
+    """Poll the product until ``select`` finds an incident (or the deadline).
+
+    ``poll_seconds`` is the cadence between store reads; a wait whose answer
+    the runner must act on at once (021's reset-done, which releases the held
+    fault before the product's post-reset validation reads it) polls faster.
+    """
 
     last: dict[str, Any] = {}
 
@@ -1322,7 +1328,7 @@ def wait_gpu_incident(
         return last if select(last) else None
 
     value = ctx.wait_until(
-        probe, timeout_seconds=timeout_seconds, poll_seconds=20, name=name
+        probe, timeout_seconds=timeout_seconds, poll_seconds=poll_seconds, name=name
     )
     return value if value is not None else last
 

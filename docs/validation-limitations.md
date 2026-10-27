@@ -3699,6 +3699,56 @@ redacted by the fixture) into `probe-error.json`
 (`tests/regional/test_general_live_fabric_plan_bounds.py`). The three are to be
 re-run on both clusters.
 
+021 `recovery_failure` graded the product's designed reboot as a failure (live
+2026-10-27 05:04-05:26Z, the HyperPod lane's exclusive node, release R13g,
+harness int/r13c-live23: FAIL "a fabric that stayed failed after the reset did
+not escalate/hold isolation"). The record shows the product right: the replay
+kept serving FAILURE (4) after RESET_ALL_GPUS_NVSWITCHES, the post-reset
+VALIDATE_GPU failed at once (`gpu_fabric_manager.fabric_validation`: a FAILURE
+state fails immediately, 1/2 wait as training for the window),
+`orchestration/escalation.next_rung` sent the failed validation to
+RESTART_NODE and `execution/branch_escalation` appended that rung with its
+VALIDATE_GPU/HOST/FABRIC + RESTORE_SCHEDULING tail to the same record (a flat
+single-node plan is adopted into a one-branch DAG). RESTART_NODE is a reboot
+of the same instance on both providers (HyperPod `BatchRebootClusterNodes`,
+plain EKS EC2 `RebootInstances`; `node_provider.restart_vm_effective_action`):
+the node came back on boot id b7e017d9 (Ready 05:19:58Z), every replay object
+lives under `/run` and went with the boot, the post-reboot validations graded
+the node's real, trained fabric and the incident RECOVERED. The oracle asked
+the settled record for ESCALATED / QUARANTINED -- the ladder's end state,
+reached only when the fabric is still failed AFTER the reboot -- which a
+`/run`-based replay cannot show on either provider and must not be made to
+show (a replay that survives the boot drives the product into a
+reboot/quarantine loop: 024 `wrong_scope_source`, 2026-10-26 14:54Z). Now
+`recovery_failure` grades the escalation on the record the product writes
+before and at the rung (`held_failure_errors`, stage `recovery_failure`): the
+post-reset validation FAILED on the held fault, the node was not released
+while the fabric read failed (no RESTORE_SCHEDULING SUCCEEDED before
+RESTART_NODE, none at all without a rung) and the rung followed -- a
+RESTART_NODE execution, or an operator hand-off (ESCALATED / QUARANTINED) on a
+site that does not reboot; it then waits for the record to settle and judges
+the exit (`escalation_exit_errors`, stage `escalation_exit`): exactly one
+RESET_ALL, at most one RESTART_NODE, no REPLACE_NODE, a SUCCEEDED RESTART_NODE
+that changed the boot id, and a settled record whose incident matches it
+(SUCCEEDED -> RECOVERED with no residual isolation on the node; FAILED/BLOCKED
+-> ESCALATED/QUARANTINED). The evidence file `fabric-escalation.json` carries
+the incident and workflow states, every reset/validation/rung/release
+execution and both boot ids; the notes say the post-reboot branch is
+unobservable by design. The five reset-only `X` variants share the exposure:
+a held read not consumed before the quiesce is served to the first scrape
+after RESTORE_GPU_SERVICES, and for `failed` (state 4) that fails VALIDATE_GPU
+at once and the product reboots the node (1/2 wait as training, which the
+advance normally beats). Their reset-done wait now polls every 10 s, the
+`advance` retries on `HostProbeError` for up to 180 s while kubelet is still
+down after the quiesce (INCONCLUSIVE with the reason if it never lands), and a
+record that carries a RESTART_NODE rung or a changed boot id is INCONCLUSIVE
+with the reason -- never PASS on a reboot, never FAIL on the product's
+designed response (`reboot_exposure`); the chain check includes
+MARK_UNSCHEDULABLE, the cordon of the product's catalog chain.
+`recovery_failure` is to be re-run on both clusters (no plain-EKS record yet),
+the five reset-only variants too; no 021 variant becomes NOT_RUN by this
+change (`tests/regional/test_general_live_fabric_reboot.py`).
+
 019 `remap_failure`'s recovery stage is the exit the settled record asks
 for (live 2026-10-26, plain EKS ip-10-0-43-5, release R13g; product lane b192,
 commit 69f87b5d, ships in R13h). On R13g the product detected the replayed
