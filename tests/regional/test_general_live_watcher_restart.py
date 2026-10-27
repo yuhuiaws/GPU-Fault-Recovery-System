@@ -1,15 +1,16 @@
 """GF-GENERAL-LIVE-029 ``worker_restart``: the watcher replaced inside the
 restart transaction, timed from the source failure.
 
-The source-failure watch over a fake Pod API (cadence, no store read, fixture
-failure), the settle bound against the product's constants, the transaction
-timeline and the delete classification over scripted records, the UID-fenced
-delete's exact request, the replacement wait and the graders; then the variant
-end to end over a fake job, a fake Pod inventory that fails the source and
-flips the watcher on the fenced delete, and a store whose records date the
-transaction around the delete -- every landing, both publish orders and the
-INCONCLUSIVE rules. The last tests pin the approval wording and the product
-facts the design rests on.
+The source-failure watch over a fake Pod/PyTorchJob API (the three end
+signals, cadence, no store read, the live Running-to-absent shape, the
+fixture-failure message), the settle bound against the product's constants,
+the transaction timeline and the delete classification over scripted records,
+the UID-fenced delete's exact request, the replacement wait and the graders;
+then the variant end to end over a fake job, a fake inventory that ends the
+source and flips the watcher on the fenced delete, and a store whose records
+date the transaction around the delete -- every landing, both publish orders
+and the INCONCLUSIVE rules. The last tests pin the approval wording and the
+product facts the design rests on.
 """
 
 from __future__ import annotations
@@ -44,6 +45,8 @@ T0 = datetime(2026, 10, 24, tzinfo=timezone.utc)
 JOB = "gl29wr-deadbeef-1"
 ATTEMPT = f"{JOB}-a001"
 COPY = f"{ATTEMPT}-r-0a1b2c3d"
+RUNNING_JOB = "Created,Running"
+FAILED_JOB = "Created,Failed(PyTorchJobFailed)"
 
 
 def _seconds(value: float) -> timedelta:
@@ -238,7 +241,7 @@ def _context(tmp_path: Path, regional: Any):
 
 
 # --------------------------------------------------------------------------- #
-# the fake GPU cluster: the job's Pods and the watcher inventory
+# the fake GPU cluster: the job's Pods and PyTorchJob, the watcher inventory
 # --------------------------------------------------------------------------- #
 def _pod(uid: str, *, ready: bool = True, rv: str = "100") -> dict[str, Any]:
     return {
@@ -264,9 +267,19 @@ def _pod(uid: str, *, ready: bool = True, rv: str = "100") -> dict[str, Any]:
     }
 
 
-def _job_pod(
+def _labels(job_id: str, attempt_id: str) -> dict[str, str]:
+    return {
+        "gpu-fault.io/managed": "true",
+        "gpu-fault.io/job-id": job_id,
+        "gpu-fault.io/attempt-id": attempt_id,
+    }
+
+
+def _pod_item(
     job_id: str, attempt_id: str, phase: str, *, exit_code: int | None = None
 ) -> dict[str, Any]:
+    """A Pod as ``kubectl get pod,pytorchjob -o json`` lists it (``kind`` set)."""
+
     suffix = "master-0" if attempt_id == f"{job_id}-a001" else "r-master-0"
     state: dict[str, Any] = (
         {
@@ -280,13 +293,11 @@ def _job_pod(
         else ({"running": {}} if phase == "Running" else {"waiting": {}})
     )
     return {
+        "kind": "Pod",
         "metadata": {
             "name": f"gpu-fault-single-node-{suffix}",
             "uid": f"pod-{attempt_id}",
-            "labels": {
-                "gpu-fault.io/job-id": job_id,
-                "gpu-fault.io/attempt-id": attempt_id,
-            },
+            "labels": _labels(job_id, attempt_id),
         },
         "spec": {"nodeName": NODE},
         "status": {
@@ -298,8 +309,89 @@ def _job_pod(
     }
 
 
+def _conditions(spec: str) -> list[dict[str, Any]]:
+    """``"Created,Failed(PyTorchJobFailed)"`` as training-operator conditions."""
+
+    conditions = []
+    for part in spec.split(","):
+        kind, _, reason = part.partition("(")
+        conditions.append(
+            {
+                "type": kind,
+                "status": "True",
+                # The operator stamps a reason on every condition; the vectors
+                # spell it only where a test reads it, so the rendered state
+                # stays ``Created,Failed(PyTorchJobFailed)``.
+                "reason": reason.rstrip(")") or None,
+                "message": f"PyTorchJob is {kind.lower()}.",
+                "lastUpdateTime": "2026-10-24T00:00:31Z",
+                "lastTransitionTime": "2026-10-24T00:00:31Z",
+            }
+        )
+    return conditions
+
+
+def _job_item(job_id: str, attempt_id: str, conditions: str) -> dict[str, Any]:
+    """The PyTorchJob as the same listing shows it."""
+
+    copy = attempt_id != f"{job_id}-a001"
+    return {
+        "kind": "PyTorchJob",
+        "metadata": {
+            "name": "gpu-fault-single-node-warm-spare-25496919f6"
+            + ("-r-e5a41535" if copy else ""),
+            "uid": f"job-{attempt_id}",
+            "labels": _labels(job_id, attempt_id),
+        },
+        "status": {
+            "conditions": _conditions(conditions),
+            "replicaStatuses": {
+                "Master": {"failed": 1} if "Failed" in conditions else {"active": 1}
+            },
+        },
+    }
+
+
+def _frame(
+    pod: str | None,
+    job: str | None,
+    *,
+    exit_code: int | None = None,
+    copy: bool = False,
+) -> dict[str, Any]:
+    """What one read of the job's objects shows: the source Pod's phase (None =
+    not listed), the source PyTorchJob's held conditions (None = not listed),
+    the source container's exit code, and whether the restart copy is listed."""
+
+    return {"pod": pod, "job": job, "exit_code": exit_code, "copy": copy}
+
+
+#: The source as the API shows it on successive reads; the last frame repeats.
+DEFAULT_FRAMES = [
+    _frame("Pending", "Created"),
+    _frame("Running", RUNNING_JOB),
+    _frame("Failed", FAILED_JOB, exit_code=1, copy=True),
+]
+#: HyperPod, 2026-10-27 12:40: Running, then gone -- the containment's STOP
+#: deleted the Pod before a read could list its terminated state; the job's
+#: Failed condition is what remains.
+LIVE_SHAPE = [
+    _frame("Running", RUNNING_JOB),
+    _frame("Running", RUNNING_JOB),
+    _frame(None, FAILED_JOB, copy=True),
+]
+RUNNING_THEN_ABSENT_NO_JOB = [_frame("Running", RUNNING_JOB), _frame(None, None)]
+RUNNING_FAILED_ABSENT = [
+    _frame("Running", RUNNING_JOB),
+    _frame("Failed", FAILED_JOB, exit_code=1),
+    _frame(None, FAILED_JOB, copy=True),
+]
+NEVER_RUNNING_JOB_FAILED = [_frame("Pending", "Created"), _frame(None, FAILED_JOB)]
+NEVER_ENDS = [_frame("Pending", "Created"), _frame("Running", RUNNING_JOB)]
+
+
 class Cluster:
-    """A fake GPU cluster: the source Pod runs and fails, the watcher
+    """A fake GPU cluster: the source ends as its frames say, the watcher
     inventory flips on the fenced delete."""
 
     def __init__(self) -> None:
@@ -308,37 +400,49 @@ class Cluster:
         self.polls_before_ready = 1
         self.replacement_appears = True
         self.on_delete: Any = None
-        # The source attempt's Pod as the API shows it on successive reads:
-        # these phases first, then Failed (exit 1) beside the restart copy.
-        self.source_phases = ["Pending", "Running"]
-        self.source_never_ends = False
+        self.frames = list(DEFAULT_FRAMES)
         self.source_reads = 0
         self.source_reads_at_delete: int | None = None
 
     def source_items(self, job_id: str) -> list[dict[str, Any]]:
-        """The job's Pods as the API lists them for ``job_id`` (the variant's
-        own run identity, not a constant): the source attempt ``-a001``, then
-        the product's restart copy beside its failed source."""
+        """The job's Pods and PyTorchJobs as the API lists them for ``job_id``
+        (the variant's own run identity, not a constant)."""
 
         self.source_reads += 1
         attempt_id = f"{job_id}-a001"
-        if self.source_never_ends or self.source_reads <= len(self.source_phases):
-            index = min(self.source_reads, len(self.source_phases)) - 1
-            return [_job_pod(job_id, attempt_id, self.source_phases[index])]
-        return [
-            _job_pod(job_id, attempt_id, "Failed", exit_code=1),
-            _job_pod(job_id, f"{attempt_id}-r-0a1b2c3d", "Running"),
-        ]
+        frame = self.frames[min(self.source_reads, len(self.frames)) - 1]
+        items: list[dict[str, Any]] = []
+        if frame["pod"] is not None:
+            items.append(
+                _pod_item(
+                    job_id, attempt_id, frame["pod"], exit_code=frame["exit_code"]
+                )
+            )
+        if frame["job"] is not None:
+            items.append(_job_item(job_id, attempt_id, frame["job"]))
+        if frame["copy"]:
+            copy = f"{attempt_id}-r-0a1b2c3d"
+            items.append(_pod_item(job_id, copy, "Running"))
+            items.append(_job_item(job_id, copy, RUNNING_JOB))
+        return items
 
     def kubectl(
         self, plane: str, arguments: tuple[str, ...], options: dict[str, Any]
     ) -> str:
-        if arguments[:2] == ("get", "pod"):
+        if arguments[:1] == ("get",):
             selector = arguments[3] if len(arguments) > 3 else ""
             if selector.startswith("gpu-fault.io/job-id="):
-                assert arguments == ("get", "pod", "-l", selector, "-o", "json")
+                assert arguments == (
+                    "get",
+                    "pod,pytorchjob",
+                    "-l",
+                    selector,
+                    "-o",
+                    "json",
+                )
                 job_id = selector.split("=", 1)[1]
                 return json.dumps({"items": self.source_items(job_id)})
+            assert arguments[:2] == ("get", "pod"), arguments
             assert selector == f"app={iso.WATCHER_APP}", selector
             if self.polls_before_ready > 0 and any(
                 p["metadata"]["uid"] == "uid-new" for p in self.pods
@@ -400,16 +504,19 @@ def test_settle_bound_is_derived_from_the_product_constants() -> None:
         "the settle bound fits the variant's window beside the job start and the "
         "watcher-restored wait"
     )
+    # The restart copy outlives a warm replacement start and still ends inside
+    # the watcher-restored wait that starts when the replacement is Ready.
+    assert 60 < wr.COPY_RUN_SECONDS < att.WATCHER_RESTORED_WAIT_SECONDS
 
 
-def test_source_pods_reads_the_attempt_pods_through_the_api() -> None:
+def test_source_objects_reads_the_attempt_pods_and_job_in_one_listing() -> None:
     cluster = Cluster()
-    cluster.source_phases = []
-    pods = wr.source_pods(Regional(cluster), JOB, ATTEMPT)
-    assert [pod["name"] for pod in pods] == ["gpu-fault-single-node-master-0"], (
-        "the restart copy carries another attempt id and is not the source"
-    )
-    (pod,) = pods
+    cluster.frames = [DEFAULT_FRAMES[-1]]
+    objects = wr.source_objects(Regional(cluster), JOB, ATTEMPT)
+    assert [pod["name"] for pod in objects["pods"]] == [
+        "gpu-fault-single-node-master-0"
+    ], "the restart copy carries another attempt id and is not the source"
+    (pod,) = objects["pods"]
     assert pod["ended"] is True and pod["phase"] == "Failed"
     assert pod["containers"] == [
         {
@@ -420,17 +527,128 @@ def test_source_pods_reads_the_attempt_pods_through_the_api() -> None:
             "finished_at": "2026-10-24T00:00:30Z",
         }
     ]
-    cluster.source_phases = ["Running"]
-    cluster.source_reads = 0
-    (running,) = wr.source_pods(Regional(cluster), JOB, ATTEMPT)
-    assert running["ended"] is False and running["containers"][0]["terminated"] is False
+    job = objects["job"]
+    assert job["name"] == "gpu-fault-single-node-warm-spare-25496919f6"
+    assert job["ended"] is True
+    assert [item["type"] for item in job["conditions"]] == ["Created", "Failed"]
+    assert job["conditions"][1]["reason"] == "PyTorchJobFailed"
+    assert job["conditions"][1]["last_transition_time"] == "2026-10-24T00:00:31Z"
+    assert job["replica_statuses"] == {"Master": {"failed": 1}}
+    assert wr.source_pods(Regional(cluster), JOB, ATTEMPT) == objects["pods"]
+    cluster.frames = [_frame("Running", RUNNING_JOB)]
+    running = wr.source_objects(Regional(cluster), JOB, ATTEMPT)
+    assert running["pods"][0]["ended"] is False and running["job"]["ended"] is False
+    cluster.frames = [_frame(None, None)]
+    assert wr.source_objects(Regional(cluster), JOB, ATTEMPT) == {
+        "pods": [],
+        "job": None,
+    }
 
 
-def test_wait_source_failure_polls_the_api_each_second_once_running(
+@pytest.mark.parametrize(
+    ("frames", "trigger", "signals", "timeline", "running_seen"),
+    [
+        (
+            LIVE_SHAPE,
+            wr.JOB_ENDED,
+            [wr.JOB_ENDED, wr.POD_ABSENT],
+            [
+                ("Running", RUNNING_JOB, ["pod", "job"]),
+                ("absent", FAILED_JOB, ["pod", "job"]),
+            ],
+            True,
+        ),
+        (
+            RUNNING_THEN_ABSENT_NO_JOB,
+            wr.POD_ABSENT,
+            [wr.POD_ABSENT],
+            [
+                ("Running", RUNNING_JOB, ["pod", "job"]),
+                ("absent", "absent", ["pod", "job"]),
+            ],
+            True,
+        ),
+        (
+            RUNNING_FAILED_ABSENT,
+            wr.POD_TERMINATED,
+            [wr.POD_TERMINATED, wr.JOB_ENDED],
+            [
+                ("Running", RUNNING_JOB, ["pod", "job"]),
+                ("Failed(exit 1)", FAILED_JOB, ["pod", "job"]),
+            ],
+            True,
+        ),
+        (
+            NEVER_RUNNING_JOB_FAILED,
+            wr.JOB_ENDED,
+            [wr.JOB_ENDED],
+            [
+                ("Pending", "Created", ["pod", "job"]),
+                ("absent", FAILED_JOB, ["pod", "job"]),
+            ],
+            False,
+        ),
+    ],
+    ids=[
+        "running-absent-live",
+        "running-absent-no-job",
+        "running-failed-absent",
+        "never-running-job-failed",
+    ],
+)
+def test_wait_source_failure_takes_the_earliest_end_signal(
+    tmp_path: Path,
+    frames: list[dict[str, Any]],
+    trigger: str,
+    signals: list[str],
+    timeline: list[tuple[str, str, list[str]]],
+    running_seen: bool,
+) -> None:
+    cluster = Cluster()
+    cluster.frames = frames
+    ctx = _context(tmp_path, Regional(cluster))
+    failure = wr.wait_source_failure(ctx, job_id=JOB, attempt_id=ATTEMPT)
+    assert failure["trigger"] == trigger
+    assert failure["signals"] == signals
+    ending = next(
+        index
+        for index, frame in enumerate(frames, start=1)
+        if frame["exit_code"] is not None
+        or (frame["job"] or "").find("Failed") >= 0
+        or (frame["pod"] is None and index > 1)
+    )
+    assert failure["polls"] == ending, "the delete follows the first ending read"
+    assert (failure["last_running_at"] is not None) == running_seen
+    assert failure["pod_state"] == timeline[-1][0]
+    assert failure["job_state"] == timeline[-1][1]
+    written = json.loads(
+        (ctx.evidence.case_dir / "source-failure-timeline.json").read_text()
+    )
+    assert [
+        (item["pod"], item["job"], item["changed"]) for item in written["entries"]
+    ] == timeline, "every transition of either side, with its source"
+    if frames[ending - 1]["pod"] is None:
+        assert failure["pods"] == [], "nothing listed: the Pod is gone"
+    else:
+        assert failure["pods"][0]["containers"][0]["exit_code"] == 1
+    if frames[ending - 1]["job"] is not None:
+        assert failure["job"]["ended"] is True
+        assert failure["job"]["conditions"][-1]["reason"] == "PyTorchJobFailed"
+    else:
+        assert failure["job"] is None
+
+
+def test_wait_source_failure_polls_every_five_seconds_until_a_pod_is_listed(
     tmp_path: Path,
 ) -> None:
     cluster = Cluster()
-    cluster.source_phases = ["Pending", "Running", "Running"]
+    cluster.frames = [
+        _frame(None, None),
+        _frame("Pending", "Created"),
+        _frame("Running", RUNNING_JOB),
+        _frame("Running", RUNNING_JOB),
+        _frame("Failed", FAILED_JOB, exit_code=1),
+    ]
     ctx = _context(tmp_path, Regional(cluster))
     sleeps: list[float] = []
     ctx.sleep = sleeps.append
@@ -439,28 +657,35 @@ def test_wait_source_failure_polls_the_api_each_second_once_running(
         wr.SOURCE_START_POLL_SECONDS,
         wr.SOURCE_POLL_SECONDS,
         wr.SOURCE_POLL_SECONDS,
-    ], "five seconds while the Pod starts, one second once it runs"
-    assert failure["polls"] == 4 and failure["waited_seconds"] == 4.0
-    (pod,) = failure["pods"]
-    assert pod["phase"] == "Failed" and pod["containers"][0]["exit_code"] == 1
-    timeline = json.loads(
+        wr.SOURCE_POLL_SECONDS,
+    ], "five seconds while nothing is listed, one second from the first Pod on"
+    assert failure["polls"] == 5 and failure["waited_seconds"] == 5.0
+    assert failure["trigger"] == wr.POD_TERMINATED
+    written = json.loads(
         (ctx.evidence.case_dir / "source-failure-timeline.json").read_text()
     )
-    assert [item["state"] for item in timeline["entries"]] == [
+    assert [item["pod"] for item in written["entries"]] == [
+        "absent",
         "Pending",
         "Running",
         "Failed(exit 1)",
-    ], "only state transitions are written"
+    ], "only transitions are written; the repeated Running read is not"
+    assert written["entries"][0]["changed"] == ["pod", "job"]
 
 
-def test_wait_source_failure_is_a_fixture_failure_when_the_source_never_ends(
+def test_wait_source_failure_is_a_fixture_failure_naming_both_last_states(
     tmp_path: Path,
 ) -> None:
     cluster = Cluster()
-    cluster.source_never_ends = True
+    cluster.frames = NEVER_ENDS
     ctx = _context(tmp_path, Regional(cluster))
-    with pytest.raises(RegionalFixtureError, match="did not end within 30 s"):
+    with pytest.raises(RegionalFixtureError) as raised:
         wr.wait_source_failure(ctx, job_id=JOB, attempt_id=ATTEMPT, timeout_seconds=30)
+    assert str(raised.value) == (
+        f"the source attempt {ATTEMPT} did not end within 30 s (last Pod state "
+        f"Running; last job condition {RUNNING_JOB})"
+    )
+    assert cluster.deletes == []
 
 
 # --------------------------------------------------------------------------- #
@@ -773,11 +998,13 @@ class FakeFailJob:
         restart_budget: int = 1,
         gpu_count: int = 8,
         ranks: int = 1,
+        copy_run_seconds: int | None = None,
     ) -> None:
         self.name = name
         self.attempt_id = f"{name}-a001"
         self.mode = mode
         self.restart_budget = restart_budget
+        self.copy_run_seconds = copy_run_seconds
         self.fixture = type("F", (), {"delete": staticmethod(lambda: None)})()
         self.prewarm = type("P", (), {"cleanup": staticmethod(lambda: None)})()
         FakeFailJob.instances.append(self)
@@ -910,7 +1137,7 @@ def _variant(
     original = cluster.kubectl
 
     def guarded(plane: str, arguments: tuple[str, ...], options: dict[str, Any]) -> str:
-        if arguments[:2] == ("get", "pod"):
+        if arguments[:1] == ("get",):
             # The job is every managed-job variant's first mutation
             # (test_general_live_managed_job_start); the watcher comes after.
             assert FakeFailJob.instances, "the watcher was looked up before the job"
@@ -956,7 +1183,7 @@ def test_worker_restart_passes_for_every_landing_inside_the_transaction(
     assert result["verdict"] == "PASS", result["errors"]
     assert result["delete_landed"] == landed
     assert store.reads_before_delete == 0, "no store read before the delete"
-    assert cluster.source_reads_at_delete == len(cluster.source_phases) + 1, (
+    assert cluster.source_reads_at_delete == len(cluster.frames), (
         "the delete follows the first read that showed the source ended"
     )
     assert len(cluster.deletes) == 1
@@ -982,15 +1209,49 @@ def test_worker_restart_passes_for_every_landing_inside_the_transaction(
         result["notes"]
     )
     job = FakeFailJob.instances[-1]
-    assert job.mode == "exit:1" and job.restart_budget == 1
+    assert job.mode == "exit_once:1" and job.restart_budget == 1
+    assert job.copy_run_seconds == wr.COPY_RUN_SECONDS, (
+        "the restart copy runs COPY_RUN_SECONDS, then exits 0"
+    )
     assert ctx.cleanup.pending() == [f"job-{job.name}"]
     for name in ("source-failure-timeline", "watcher-restart", "delete-timing"):
         assert (ctx.evidence.case_dir / f"{name}.json").is_file(), name
     document = json.loads((ctx.evidence.case_dir / "delete-timing.json").read_text())
     assert document["landing"] == timing
     assert document["settle_bound"]["total_seconds"] == 1935.0
+    assert document["source_failure"]["trigger"] == wr.POD_TERMINATED
+    assert document["source_failure"]["signals"] == [wr.POD_TERMINATED, wr.JOB_ENDED]
     assert document["source_failure"]["pods"][0]["containers"][0]["exit_code"] == 1
     assert set(document["stages"]) == set(result["stages"])
+
+
+def test_worker_restart_passes_on_the_live_running_to_absent_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """HyperPod, 2026-10-27 12:40: the source Pod went from Running straight to
+    absent and the job's Failed condition was what remained; the delete fires
+    on that read instead of waiting 900 s for a terminated state."""
+
+    store, cluster = Store(), Cluster()
+    cluster.frames = LIVE_SHAPE
+    ctx = _variant(tmp_path, monkeypatch, store, cluster)
+    result = ctx.spec.execute(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    assert cluster.source_reads_at_delete == len(LIVE_SHAPE)
+    failure = json.loads((ctx.evidence.case_dir / "delete-timing.json").read_text())[
+        "source_failure"
+    ]
+    assert failure["trigger"] == wr.JOB_ENDED
+    assert failure["signals"] == [wr.JOB_ENDED, wr.POD_ABSENT]
+    assert failure["pod_state"] == "absent" and failure["job_state"] == FAILED_JOB
+    assert failure["last_running_at"] is not None
+    timeline = json.loads(
+        (ctx.evidence.case_dir / "source-failure-timeline.json").read_text()
+    )
+    assert [(item["pod"], item["job"]) for item in timeline["entries"]] == [
+        ("Running", RUNNING_JOB),
+        ("absent", FAILED_JOB),
+    ]
 
 
 def test_worker_restart_is_inconclusive_when_the_delete_landed_after_settle(
@@ -1033,10 +1294,14 @@ def test_worker_restart_is_a_fixture_failure_when_the_source_never_ends(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store, cluster = Store(), Cluster()
-    cluster.source_never_ends = True
+    cluster.frames = NEVER_ENDS
     ctx = _variant(tmp_path, monkeypatch, store, cluster)
-    with pytest.raises(RegionalFixtureError, match="did not end within 900 s"):
+    with pytest.raises(RegionalFixtureError) as raised:
         ctx.spec.execute(ctx)
+    assert str(raised.value).endswith(
+        f"did not end within 900 s (last Pod state Running; last job condition "
+        f"{RUNNING_JOB})"
+    ), str(raised.value)
     assert cluster.deletes == [], "no watcher Pod is deleted without a source failure"
     assert store.reads_before_delete == 0
 
@@ -1103,8 +1368,12 @@ def test_control_plane_restart_approval_and_spec_name_the_transaction() -> None:
     meaning = APPROVALS["CONTROL_PLANE_RESTART"]
     assert "inside the restart transaction" in meaning, meaning
     assert "open restart claim" not in meaning, meaning
+    assert "the Pod gone after Running, or the PyTorchJob's Failed condition" in meaning
     spec = _spec()
-    assert "first API observation of the source Pod's failure" in spec.injection
+    assert "first API observation of the source's end" in spec.injection
+    assert "the Pod gone after Running, or the PyTorchJob's Failed condition" in (
+        spec.injection
+    )
     assert "no store read" in spec.injection
     assert "a delete dated after the settle is INCONCLUSIVE" in spec.expected
 
@@ -1137,3 +1406,4 @@ def test_open_claim_is_one_control_loop_round_trip_in_the_product() -> None:
         wr.AFTER_SETTLE,
         wr.UNDATED,
     )
+    assert wr.SOURCE_END_SIGNALS == (wr.POD_TERMINATED, wr.JOB_ENDED, wr.POD_ABSENT)

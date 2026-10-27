@@ -1764,7 +1764,8 @@ heartbeat 只是"集群空闲"的陈述——产品只在一次全量扫描既�
 清理：2026-10-27 实测 heartbeat 行在恢复后 300 s 内停留在阻断前的值，重启副本的 RUNNING 观测与
 该 attempt 的终态却都已送达，因此只认 heartbeat 是 oracle 错误而非产品缺陷。清理删除
 带本次 tag 的全部规则并停 deadman，探针回读链上无残留且 timer 未激活，否则记清理失败。
-`worker_restart`（`--approve CONTROL_PLANE_RESTART`）：受管任务 `exit:1`、预算 1；在受管任务的
+`worker_restart`（`--approve CONTROL_PLANE_RESTART`）：受管任务 `exit_once:1`（重启副本运行
+`COPY_RUN_SECONDS` = 240 s 后以 0 退出，见下）、预算 1；在受管任务的
 重启事务内替换 watcher，时点取自源 Pod 的失败而非"claim 打开"。原因是 restart reservation 只打开
 一个控制环往返：executor 在 claim 的同一 tick 预留预算并铸出数据面命令（`regional.py:945-1020`），
 集群执行器被该命令的 NOTIFY 唤醒，创建重启副本并在同一次调用中返回 SUCCEEDED
@@ -1774,11 +1775,24 @@ STATUSES`）记下 SUCCEEDED——实测 1 至数秒（2026-10-27 HyperPod：相
 关闭），短于一次记录读取（`kubectl exec` 探针约 5 s），任何轮询都无法以它为门，任务模板里的 Pod 级
 启动栅栏也拉宽不了它。而整个事务（失败→发布→containment→terminal→decision→recovery→settle）长达
 数十秒，起点无需查库即可见：运行器以 GPU 集群 API 每 1 s 读源 Pod（启动阶段每 5 s；
-`wait_source_failure`，不读 store），首次观测到关键容器 terminated / phase Failed 即刻
+`wait_source_failure`，一次带标签的 `get pod,pytorchjob` 同时读源 Pod 与其 PyTorchJob——二者都带
+产品提交路径打在模板与对象上的 `gpu-fault.io/job-id`/`attempt-id` 标签，不读 store）。源 attempt 的
+结束取三种信号中最早观测到者：Pod 关键容器 terminated / phase Failed（`pod-terminated`）、
+PyTorchJob 带 `Failed`（或 `Succeeded`）条件（`job-ended`，training-operator 的 `PyTorchJobFailed`，
+Pod 消失后仍在，也覆盖 Pod 未被看到 Running 就失败的情形）、曾见 Running 的 Pod 不再列出
+（`pod-absent`：containment 的 STOP_WORKLOADS 在发布后一秒内以 grace 0 删除 attempt Pod，
+`workload_operations._delete_terminating_pods`；2026-10-27 12:40 HyperPod 实测源 Pod 在相邻两次 1 s
+读取之间由 Running 直接变为 absent，从未列出 terminated 态，旧版只认 terminated 因而等满 900 s）。
+Pod/任务两侧的每次状态变化连同变化来源写入 `source-failure-timeline.json`；900 s 内三者皆未出现为
+fixture 失败（INCONCLUSIVE），消息同时给出最后的 Pod 状态与任务条件。观测到结束即刻
 （`DELETE_OFFSET_SECONDS` = 0）以 `DeleteOptions.preconditions{uid,resourceVersion}`、grace 0
 删除唯一的 watcher Pod，由此删除按构造落在事务内：落在 watcher 发布失败之前，则重建者须从
 outbox/自身观测发布它且仍恰好一次 decision、一次 reservation、一次 restart；落在之后，则重建者的
-重观测不得再发布/再决策/再预留——两者都是产品自己的主张。随后等待 Deployment 重建出新 UID 且
+重观测不得再发布/再决策/再预留——两者都是产品自己的主张。受管任务用 `exit_once:1` 而非 `exit:1`：
+`exit:1` 的重启副本 30 s 后再次失败，产品的第二次 containment 随即删除其 Pod，与重建 watcher 的冷启动
+赛跑，重建者可能永远观测不到副本（`attempt_once` 误判）；`exit_once` 的副本经 `GFRS_COPY_RUN_SECONDS`
+运行 240 s 后以 0 退出——无第二次失败/升级/通知，副本 Pod（cleanPodPolicy None）留在原地供重建者观测，
+其终态读数也是重建 Ready 之后、300 s watcher-restored 等待之内的一次新写入。随后等待 Deployment 重建出新 UID 且
 Ready（≤ 600 s，与 startupProbe 一致），再等 recovery 工作流终结，上限由产品常量推导
 （`settle_bound`：重建 600 s + STOP_WORKLOADS 与 RESTART_WORKLOAD 各一个 step cap 600 s
 （`execution/config.py:293`，二者均无 override）+ 两次 dispatcher 回退轮询 5 s（`:522`）+ 一次

@@ -2221,10 +2221,33 @@ records read (a `kubectl exec` probe, about 5 s), so no poll can gate on it and
 no start barrier on the restart copy's Pod can widen it. The transaction as a
 whole -- failure, publish, containment, terminal, decision, recovery, settle --
 is tens of seconds, and its start is visible without the store: the runner
-reads the source Pod through the GPU-cluster API every second (every five
-while it still starts; `wait_source_failure`, no store read) and deletes the
-watcher Pod at the first observation of a terminated critical container or a
-Failed phase (`DELETE_OFFSET_SECONDS` = 0). The delete therefore lands inside
+reads the source Pod and its PyTorchJob through the GPU-cluster API every
+second (every five while it still starts; one labelled `get pod,pytorchjob` --
+both carry the `gpu-fault.io/job-id`/`attempt-id` labels the product's submit
+path stamps on the templates and the object; `wait_source_failure`, no store
+read) and takes the source's end from whichever of three signals it observes
+first: a terminated critical container or a Failed phase (`pod-terminated`), a
+`Failed` (or `Succeeded`) condition on the PyTorchJob (`job-ended`, the
+training operator's `PyTorchJobFailed`, which outlives the Pod and also covers
+a Pod that fails before it was ever seen Running), or a Pod no longer listed
+after it was seen Running (`pod-absent`: the containment's STOP_WORKLOADS
+deletes the attempt's Pods with no grace within a second of the publish,
+`workload_operations._delete_terminating_pods`; live on HyperPod, 2026-10-27
+12:40, the source went from Running straight to absent between two one-second
+reads and no terminated state was ever listed, so the previous watch, which
+knew only the terminated state, waited the full 900 s). Every change on either
+side is written with its source to `source-failure-timeline.json`; none of the
+three within 900 s is a fixture failure (INCONCLUSIVE) naming the last Pod
+state and the last job condition. The watcher Pod is deleted at that
+observation (`DELETE_OFFSET_SECONDS` = 0). The job runs `exit_once:1` rather
+than `exit:1`: the `exit:1` copy failed again 30 s after its start and the
+product's second containment deleted its Pod, a race against the replacement
+watcher's cold start that `attempt_once` could lose; the `exit_once` copy runs
+`COPY_RUN_SECONDS` = 240 s (`GFRS_COPY_RUN_SECONDS`) and exits 0 -- no second
+failure, escalation or notification on the job, the copy's Pod stays
+(cleanPodPolicy None) for the replacement to observe, and its terminal reading
+is a watcher write after the replacement is Ready, inside the 300 s
+watcher-restored wait. The delete therefore lands inside
 the transaction by construction: before the watcher published the failure, and
 the replacement must publish it (from its write-ahead outbox or its own
 observation) and still yield exactly one decision, one reservation and one

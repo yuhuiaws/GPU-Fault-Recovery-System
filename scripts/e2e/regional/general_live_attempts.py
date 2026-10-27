@@ -125,6 +125,7 @@ class ManagedFailJob:
         restart_budget: int = 1,
         gpu_count: int = 8,
         ranks: int = 1,
+        copy_run_seconds: int | None = None,
     ) -> None:
         from pathlib import Path
 
@@ -150,7 +151,7 @@ class ManagedFailJob:
         name_managed_workload(document, name)
         _add_worker_ranks(document, ranks)
         fit_gpu_count(document, gpu_count)
-        _apply_mode(document, mode)
+        _apply_mode(document, mode, copy_run_seconds=copy_run_seconds)
         document.setdefault("metadata", {}).setdefault("labels", {}).update(
             {"gpu-fault.io/job-id": name, "gpu-fault.io/attempt-id": f"{name}-a001"}
         )
@@ -255,6 +256,8 @@ def suspend_workload(fixture: ManagedWorkloadFixture) -> None:
 #: container can tell the first attempt from a restart.
 ATTEMPT_ID_ENV = "GFRS_ATTEMPT_ID"
 ATTEMPT_ID_LABEL = "gpu-fault.io/attempt-id"
+#: ``exit_once``: the restart copy's run before it exits 0 (``copy_run_seconds``).
+COPY_RUN_SECONDS_ENV = "GFRS_COPY_RUN_SECONDS"
 #: ``trigger:<code>`` exits the code once the runner creates this file in the
 #: container (028 api_unreachable: the exit must happen under the block).
 EXIT_TRIGGER_PATH = "/tmp/gfrs-live-exit"
@@ -262,11 +265,12 @@ MODE_COMMANDS = {
     "exit": "sleep 30; exit ${CODE:-1}",
     "stop": "trap 'exit 143' TERM; sleep 3600",
     "hang": "trap '' TERM; sleep 3600",
-    # The first attempt exits CODE; the product's restart copy keeps running
-    # until stopped, so a replayed old terminal has a live new attempt to leave
-    # alone (028 old_terminal).
+    # The first attempt exits CODE; the restart copy runs until stopped (028
+    # old_terminal) or, with COPY_RUN_SECONDS_ENV set, that long and exits 0
+    # (029 worker_restart: the replacement watcher observes it, then its end).
     "exit_once": (
-        f"case \"${{{ATTEMPT_ID_ENV}:-}}\" in *-r-*) trap 'exit 143' TERM; sleep 3600;; "
+        f"case \"${{{ATTEMPT_ID_ENV}:-}}\" in *-r-*) trap 'exit 143' TERM; "
+        f"sleep ${{{COPY_RUN_SECONDS_ENV}:-3600}}; exit 0;; "
         "*) sleep 30; exit ${CODE:-1};; esac"
     ),
     "trigger": f"while [ ! -e {EXIT_TRIGGER_PATH} ]; do sleep 1; done; exit ${{CODE:-1}}",
@@ -293,7 +297,12 @@ def _add_worker_ranks(document: dict[str, Any], ranks: int) -> None:
         replicas["Worker"] = worker
 
 
-def _apply_mode(document: dict[str, Any], mode: str | Mapping[str, str]) -> None:
+def _apply_mode(
+    document: dict[str, Any],
+    mode: str | Mapping[str, str],
+    *,
+    copy_run_seconds: int | None = None,
+) -> None:
     replicas = document.get("spec", {}).get("pytorchReplicaSpecs") or {}
     modes: Mapping[str, str] = (
         mode if isinstance(mode, Mapping) else dict.fromkeys(replicas, mode)
@@ -322,7 +331,12 @@ def _apply_mode(document: dict[str, Any], mode: str | Mapping[str, str]) -> None
                             "fieldPath": f"metadata.labels['{ATTEMPT_ID_LABEL}']"
                         }
                     },
-                }
+                },
+                *(
+                    [{"name": COPY_RUN_SECONDS_ENV, "value": str(copy_run_seconds)}]
+                    if copy_run_seconds is not None
+                    else []
+                ),
             ]
             if kind == "exit_once"
             else []
@@ -346,6 +360,7 @@ def _job(
     restart_budget: int = 1,
     gpu_count: int = 8,
     ranks: int = 1,
+    copy_run_seconds: int | None = None,
 ) -> ManagedFailJob:
     name = ctx.identity(name)
     job = ManagedFailJob(
@@ -355,6 +370,8 @@ def _job(
         restart_budget=restart_budget,
         gpu_count=gpu_count,
         ranks=ranks,
+        # Only when set: the other variants' job doubles predate the knob.
+        **({"copy_run_seconds": copy_run_seconds} if copy_run_seconds else {}),
     )
     ctx.cleanup.push(f"job-{name}", job.delete)
     job.start()
@@ -1040,11 +1057,14 @@ def missing_context(ctx: VariantContext) -> dict[str, Any]:
 def worker_restart(ctx: VariantContext) -> dict[str, Any]:
     """029: the completion watcher is replaced inside the restart transaction.
 
-    A managed job fails within budget. Its source Pod is watched through the
-    GPU-cluster API (one-second cadence, no store read) and at the first
-    observation of its terminated container the one completion-watcher Pod is
-    deleted (UID-fenced, no grace) and the Deployment replaces it; the
-    recovery then settles under the product-derived bound. Whichever side of
+    A managed job fails within budget. Its source Pod and PyTorchJob are
+    watched through the GPU-cluster API (one-second cadence, no store read)
+    and at the first observation of the source's end -- a terminated
+    container, the Pod gone after Running, or the job's Failed condition --
+    the one completion-watcher Pod is deleted (UID-fenced, no grace) and the
+    Deployment replaces it; the recovery then settles under the
+    product-derived bound. The restart copy runs ``COPY_RUN_SECONDS`` and
+    exits 0, so the replacement observes it. Whichever side of
     the watcher's publish the delete landed on, the replacement must not
     re-decide, re-reserve or re-send: the ledger keeps exactly the one
     reservation of the recovery workflow, one RESTART_WORKLOAD succeeds, one
@@ -1054,7 +1074,13 @@ def worker_restart(ctx: VariantContext) -> dict[str, Any]:
     (``general_live_watcher_restart``).
     """
 
-    job = _job(ctx, "gl29wr-" + _suffix(ctx), "exit:1", restart_budget=1)
+    job = _job(
+        ctx,
+        "gl29wr-" + _suffix(ctx),
+        "exit_once:1",
+        restart_budget=1,
+        copy_run_seconds=watcher_restart.COPY_RUN_SECONDS,
+    )
     _watcher_singleton(ctx)
     restarted = watcher_restart.replace_watcher_at_source_failure(
         ctx, job_id=job.name, attempt_id=job.attempt_id
@@ -1400,8 +1426,9 @@ VARIANTS = [
         flags="X",
         injection=(
             "inside the restart transaction of the managed job: at the first API "
-            "observation of the source Pod's failure (one-second watch, no store "
-            "read) the one completion-watcher Pod is deleted fenced on its "
+            "observation of the source's end -- its Pod's terminated container, the "
+            "Pod gone after Running, or the PyTorchJob's Failed condition (one-second "
+            "watch, no store read) -- the one completion-watcher Pod is deleted fenced on its "
             "UID/resourceVersion with no grace, so the Deployment replaces it; where "
             "the delete landed (before the publish, between publish and restart, "
             "after the restart) is dated from the records afterwards"

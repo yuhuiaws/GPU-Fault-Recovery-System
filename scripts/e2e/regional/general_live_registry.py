@@ -102,8 +102,9 @@ APPROVALS: dict[str, str] = {
     ),
     "CONTROL_PLANE_RESTART": (
         "delete the one completion-watcher Pod of the GPU cluster inside the "
-        "restart transaction of the managed job, timed from the source Pod's "
-        "failure as the GPU-cluster API shows it (worker restart)"
+        "restart transaction of the managed job, timed from the source's end as "
+        "the GPU-cluster API shows it: its Pod's terminated container, the Pod "
+        "gone after Running, or the PyTorchJob's Failed condition (worker restart)"
     ),
     "DECLARE_WARM_SPARE": (
         "declare one warm spare GPU node through gpu-fault-admin config spare "

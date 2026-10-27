@@ -141,6 +141,47 @@ def test_managed_fail_job_applies_mode(
         assert att.ATTEMPT_ID_ENV not in env
 
 
+def test_managed_fail_job_bounds_the_restart_copy_of_exit_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """029 worker_restart: the restart copy runs ``copy_run_seconds`` and exits
+    0 so the replacement watcher can observe it; without the knob the copy runs
+    until stopped, as 028 old_terminal and 029 duplicate_event need."""
+
+    _patch_workload(monkeypatch)
+    spec = next(s for s in att.VARIANTS if s.variant == "worker_restart")
+    ctx = _ctx(spec, tmp_path)
+
+    def master_container(name: str) -> dict:
+        document = yaml.safe_load((ctx.case_dir / f"{name}.source.yaml").read_text())
+        (container,) = document["spec"]["pytorchReplicaSpecs"]["Master"]["template"][
+            "spec"
+        ]["containers"]
+        return container
+
+    att.ManagedFailJob(
+        ctx, name="gl29w", mode="exit_once:1", restart_budget=1, copy_run_seconds=240
+    )
+    bounded = master_container("gl29w")
+    env = {item["name"]: item for item in bounded["env"]}
+    assert env[att.COPY_RUN_SECONDS_ENV] == {
+        "name": att.COPY_RUN_SECONDS_ENV,
+        "value": "240",
+    }
+    assert env["CODE"]["value"] == "1"
+    command = bounded["command"][-1]
+    assert (
+        f"*-r-*) trap 'exit 143' TERM; sleep ${{{att.COPY_RUN_SECONDS_ENV}:-3600}}; exit 0;;"
+        in command
+    ), command
+    assert "*) sleep 30; exit ${CODE:-1};; esac" in command, command
+
+    att.ManagedFailJob(ctx, name="gl28o", mode="exit_once:1", restart_budget=1)
+    plain = master_container("gl28o")
+    assert att.COPY_RUN_SECONDS_ENV not in {item["name"] for item in plain["env"]}
+    assert plain["command"][-1] == command, "the same script; the env decides"
+
+
 # --------------------------------------------------------------------------- #
 # run_general_live.main()
 # --------------------------------------------------------------------------- #

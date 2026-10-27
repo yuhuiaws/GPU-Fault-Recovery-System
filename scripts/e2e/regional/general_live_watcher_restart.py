@@ -32,12 +32,32 @@ few seconds (HyperPod, 2026-10-27: opened and closed between two records reads
 10 s apart), shorter than one records read, so no poll could gate on it and no
 start barrier on the restart copy's Pod could widen it. The transaction as a
 whole, from the failure to the settled recovery, is tens of seconds, and its
-start is visible without the store: the source Pod's terminated container,
-read through the GPU-cluster API at a one-second cadence
-(``wait_source_failure``). The runner deletes the one completion-watcher Pod at
-that moment (``DELETE_OFFSET_SECONDS`` after the first observation), fenced on
-its UID and resourceVersion with no grace, so the Deployment (``replicas: 1``,
-Recreate) replaces it -- inside the transaction by construction.
+start is visible without the store, through the GPU-cluster API at a
+one-second cadence (``wait_source_failure``): the source Pod's terminated
+critical container or Failed phase, the Pod's disappearance after it was seen
+Running, or the PyTorchJob's own Failed (or Succeeded) condition -- whichever
+is observed first. The disappearance counts because the product removes the
+evidence within a second of the publish: the containment's STOP_WORKLOADS
+deletes the attempt's Pods with no grace (``workload_operations._delete_
+terminating_pods``), so live (HyperPod, 2026-10-27 12:40) the source went from
+Running straight to absent between two one-second reads and no terminated
+state was ever listed. The job's Failed condition (the training operator's
+``PyTorchJobFailed``) outlives the Pod and also covers a Pod that fails before
+it was ever seen Running. The Pods carry the ``gpu-fault.io/job-id`` and
+``gpu-fault.io/attempt-id`` labels the product's submit path stamps on every
+template (``training_submit_cli._inject_template``) and the PyTorchJob the
+same on its metadata, so one labelled ``get pod,pytorchjob`` reads both per
+tick. The runner deletes the one completion-watcher Pod at that moment
+(``DELETE_OFFSET_SECONDS`` after the first observation), fenced on its UID and
+resourceVersion with no grace, so the Deployment (``replicas: 1``, Recreate)
+replaces it -- inside the transaction by construction. The job runs in the
+``exit_once`` mode with its restart copy bounded to ``COPY_RUN_SECONDS``: the
+copy must still be there for the replacement to observe (the ``exit`` mode's
+copy died 30 s after its start and the product's second containment deleted
+its Pod -- a race against the replacement's cold start that ``attempt_once``
+would lose), and it exits 0, so its end is a terminal reading the replacement
+publishes after it is Ready -- the write ``watcher_restored`` needs -- with no
+second failure, escalation or notification on the job.
 
 Where the delete landed is dated afterwards from the product's own records
 (``transaction_timeline``: the containment incident's ``created_at`` is the
@@ -104,6 +124,19 @@ SOURCE_START_POLL_SECONDS = 5.0
 #: The Pod start plus the 30 s run; the attempt budget the other managed-job
 #: variants give the product is the ceiling.
 SOURCE_FAILURE_TIMEOUT_SECONDS = 900
+#: How long the ``exit_once`` restart copy runs before it exits 0 (the
+#: ``GFRS_COPY_RUN_SECONDS`` knob of ``general_live_attempts``): long enough
+#: for the replacement watcher's cold start to observe it (the startupProbe
+#: allows 600 s; a warm start takes well under a minute), short enough that
+#: its terminal reading lands inside the 300 s watcher-restored wait that
+#: starts when the replacement is Ready.
+COPY_RUN_SECONDS = 240
+#: What ends the source attempt as the API shows it, in the order one tick
+#: reports them when several hold at once.
+POD_TERMINATED = "pod-terminated"
+JOB_ENDED = "job-ended"
+POD_ABSENT = "pod-absent"
+SOURCE_END_SIGNALS = (POD_TERMINATED, JOB_ENDED, POD_ABSENT)
 #: ``KubernetesCompletionController.poll_interval_seconds`` default
 #: (``completion_controller.py:146``; the deployment's
 #: ``GPU_FAULT_WATCHER_POLL_SECONDS`` at :573 defaults to the same).
@@ -168,46 +201,97 @@ def settle_bound() -> dict[str, float]:
 # --------------------------------------------------------------------------- #
 # the source failure, read through the GPU-cluster API
 # --------------------------------------------------------------------------- #
-def source_pods(regional: Any, job_id: str, attempt_id: str) -> list[dict[str, Any]]:
-    """The source attempt's Pods as the API shows them: phase and, per
-    container, whether it has terminated and how (no store read)."""
+def _pod_record(item: Mapping[str, Any]) -> dict[str, Any]:
+    metadata = item.get("metadata") or {}
+    status = item.get("status") or {}
+    containers = []
+    for container in status.get("containerStatuses") or []:
+        terminated = (container.get("state") or {}).get("terminated") or {}
+        containers.append(
+            {
+                "name": container.get("name"),
+                "terminated": bool(terminated),
+                "exit_code": terminated.get("exitCode"),
+                "reason": terminated.get("reason"),
+                "finished_at": terminated.get("finishedAt"),
+            }
+        )
+    phase = status.get("phase")
+    return {
+        "name": metadata.get("name"),
+        "uid": metadata.get("uid"),
+        "node": (item.get("spec") or {}).get("nodeName"),
+        "phase": phase,
+        "containers": containers,
+        "ended": phase in {"Failed", "Succeeded"}
+        or any(entry["terminated"] for entry in containers),
+    }
+
+
+def _job_record(item: Mapping[str, Any]) -> dict[str, Any]:
+    metadata = item.get("metadata") or {}
+    status = item.get("status") or {}
+    conditions = [
+        {
+            "type": condition.get("type"),
+            "status": condition.get("status"),
+            "reason": condition.get("reason"),
+            "message": condition.get("message"),
+            "last_transition_time": condition.get("lastTransitionTime"),
+        }
+        for condition in status.get("conditions") or []
+        if isinstance(condition, dict)
+    ]
+    held = [
+        entry for entry in conditions if str(entry.get("status", "")).lower() == "true"
+    ]
+    return {
+        "name": metadata.get("name"),
+        "uid": metadata.get("uid"),
+        "conditions": conditions,
+        "replica_statuses": status.get("replicaStatuses") or {},
+        "ended": any(entry["type"] in {"Failed", "Succeeded"} for entry in held),
+    }
+
+
+def source_objects(regional: Any, job_id: str, attempt_id: str) -> dict[str, Any]:
+    """The source attempt's Pods and its PyTorchJob as the API shows them, in
+    one labelled read (no store read): per Pod the phase and each container's
+    termination, per job its conditions. The restart copy carries another
+    attempt id on both and is left out."""
 
     value = json.loads(
         regional.kubectl(
-            "gpu", "get", "pod", "-l", f"{JOB_ID_LABEL}={job_id}", "-o", "json"
+            "gpu",
+            "get",
+            "pod,pytorchjob",
+            "-l",
+            f"{JOB_ID_LABEL}={job_id}",
+            "-o",
+            "json",
         )
     )
-    pods = []
+    pods: list[dict[str, Any]] = []
+    jobs: list[dict[str, Any]] = []
     for item in value.get("items") or []:
-        metadata = item.get("metadata") or {}
-        if (metadata.get("labels") or {}).get(ATTEMPT_ID_LABEL) != attempt_id:
+        labels = (item.get("metadata") or {}).get("labels") or {}
+        if labels.get(ATTEMPT_ID_LABEL) != attempt_id:
             continue
-        status = item.get("status") or {}
-        containers = []
-        for container in status.get("containerStatuses") or []:
-            terminated = (container.get("state") or {}).get("terminated") or {}
-            containers.append(
-                {
-                    "name": container.get("name"),
-                    "terminated": bool(terminated),
-                    "exit_code": terminated.get("exitCode"),
-                    "reason": terminated.get("reason"),
-                    "finished_at": terminated.get("finishedAt"),
-                }
-            )
-        phase = status.get("phase")
-        pods.append(
-            {
-                "name": metadata.get("name"),
-                "uid": metadata.get("uid"),
-                "node": (item.get("spec") or {}).get("nodeName"),
-                "phase": phase,
-                "containers": containers,
-                "ended": phase in {"Failed", "Succeeded"}
-                or any(item["terminated"] for item in containers),
-            }
-        )
-    return sorted(pods, key=lambda item: str(item["name"]))
+        kind = str(item.get("kind") or "")
+        if kind == "Pod":
+            pods.append(_pod_record(item))
+        elif kind == "PyTorchJob":
+            jobs.append(_job_record(item))
+    return {
+        "pods": sorted(pods, key=lambda entry: str(entry["name"])),
+        "job": jobs[0] if jobs else None,
+    }
+
+
+def source_pods(regional: Any, job_id: str, attempt_id: str) -> list[dict[str, Any]]:
+    """The Pod half of ``source_objects``."""
+
+    return source_objects(regional, job_id, attempt_id)["pods"]
 
 
 def _source_state(pods: Sequence[Mapping[str, Any]]) -> str:
@@ -230,6 +314,17 @@ def _source_state(pods: Sequence[Mapping[str, Any]]) -> str:
     )
 
 
+def _job_state(job: Mapping[str, Any] | None) -> str:
+    if job is None:
+        return "absent"
+    held = [
+        f"{item['type']}({item['reason']})" if item.get("reason") else str(item["type"])
+        for item in job.get("conditions") or []
+        if str(item.get("status", "")).lower() == "true"
+    ]
+    return ",".join(held) if held else "no condition"
+
+
 def wait_source_failure(
     ctx: VariantContext,
     *,
@@ -239,44 +334,84 @@ def wait_source_failure(
 ) -> dict[str, Any]:
     """The first API observation of the source attempt's end.
 
-    Reads the job's Pods every ``SOURCE_POLL_SECONDS`` once one runs (every
+    Reads the job's Pods and its PyTorchJob together (``source_objects``)
+    every ``SOURCE_POLL_SECONDS`` once a Pod is listed (every
     ``SOURCE_START_POLL_SECONDS`` before), never the store, and returns at the
-    first Pod whose critical container has terminated or whose phase is
-    Failed/Succeeded, with the kubelet's ``finishedAt`` beside the runner's
-    clock. The state transitions are written as ``source-failure-timeline``.
-    A source that never ends is a fixture failure.
+    first tick that shows any of ``SOURCE_END_SIGNALS``: a Pod whose critical
+    container has terminated or whose phase is Failed/Succeeded
+    (``pod-terminated``), the job holding a Failed or Succeeded condition
+    (``job-ended``), or no Pod listed after one was seen Running
+    (``pod-absent``: the containment's STOP deleted it before a read could
+    list the terminated state). Every change of either reading is written to
+    ``source-failure-timeline`` with the runner's clock and which side changed;
+    the document names the trigger, every signal the tick showed, the kubelet's
+    ``finishedAt`` and the job's conditions, and the last Running reading. A
+    source that shows none of them within the bound is a fixture failure that
+    names the last Pod state and the last job condition.
     """
 
     start = ctx.clock()
     timeline: list[dict[str, Any]] = []
-    last_state: str | None = None
+    last: tuple[str, str] | None = None
+    seen_running = False
+    last_running_at: datetime | None = None
     polls = 0
     while True:
-        pods = source_pods(ctx.regional, job_id, attempt_id)
+        objects = source_objects(ctx.regional, job_id, attempt_id)
         now = ctx.clock()
         polls += 1
-        state = _source_state(pods)
-        if state != last_state:
-            timeline.append({"observed_at": now.isoformat(), "state": state})
+        pods, job = objects["pods"], objects["job"]
+        pod_state, job_state = _source_state(pods), _job_state(job)
+        if (pod_state, job_state) != last:
+            previous = last or (None, None)
+            timeline.append(
+                {
+                    "observed_at": now.isoformat(),
+                    "pod": pod_state,
+                    "job": job_state,
+                    "changed": [
+                        name
+                        for name, value, before in (
+                            ("pod", pod_state, previous[0]),
+                            ("job", job_state, previous[1]),
+                        )
+                        if value != before
+                    ],
+                }
+            )
             ctx.evidence.write("source-failure-timeline", {"entries": timeline})
-            last_state = state
-        ended = [pod for pod in pods if pod["ended"]]
-        if ended:
+            last = (pod_state, job_state)
+        if any(pod["phase"] == "Running" for pod in pods):
+            seen_running = True
+            last_running_at = now
+        signals = []
+        if any(pod["ended"] for pod in pods):
+            signals.append(POD_TERMINATED)
+        if job is not None and job["ended"]:
+            signals.append(JOB_ENDED)
+        if not pods and seen_running:
+            signals.append(POD_ABSENT)
+        if signals:
             return {
                 "observed_at": now.isoformat(),
                 "waited_seconds": round((now - start).total_seconds(), 3),
                 "polls": polls,
-                "pods": ended,
+                "trigger": signals[0],
+                "signals": signals,
+                "pod_state": pod_state,
+                "job_state": job_state,
+                "pods": pods,
+                "job": job,
+                "last_running_at": _iso(last_running_at),
             }
         if (now - start).total_seconds() >= timeout_seconds:
             raise RegionalFixtureError(
                 f"the source attempt {attempt_id} did not end within "
-                f"{timeout_seconds:.0f} s (last state {state})"
+                f"{timeout_seconds:.0f} s (last Pod state {pod_state}; last job "
+                f"condition {job_state})"
             )
         ctx.sleep(
-            SOURCE_POLL_SECONDS
-            if any(pod["phase"] == "Running" for pod in pods)
-            else SOURCE_START_POLL_SECONDS
+            SOURCE_POLL_SECONDS if pods or seen_running else SOURCE_START_POLL_SECONDS
         )
 
 
@@ -695,11 +830,16 @@ __all__ = [
     "ATTEMPT_ID_LABEL",
     "BEFORE_PUBLISH",
     "BETWEEN_PUBLISH_AND_RESTART",
+    "COPY_RUN_SECONDS",
     "DELETE_OFFSET_SECONDS",
+    "JOB_ENDED",
     "JOB_ID_LABEL",
     "LANDINGS",
+    "POD_ABSENT",
+    "POD_TERMINATED",
     "REPLACEMENT_TIMEOUT_SECONDS",
     "SETTLE_MARGIN_SECONDS",
+    "SOURCE_END_SIGNALS",
     "SOURCE_FAILURE_TIMEOUT_SECONDS",
     "SOURCE_POLL_SECONDS",
     "SOURCE_START_POLL_SECONDS",
@@ -715,6 +855,7 @@ __all__ = [
     "replacement_errors",
     "restart_watcher",
     "settle_bound",
+    "source_objects",
     "source_pods",
     "transaction_timeline",
     "wait_recovery_settled",
