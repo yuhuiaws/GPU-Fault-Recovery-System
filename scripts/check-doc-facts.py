@@ -45,6 +45,9 @@ XID45_EVIDENCE_URL = (
     "https://docs.nvidia.com/deploy/gpu-debug-guidelines/gpu-node-triage.html"
     "#understanding-xid-messages"
 )
+# The XID table row the citation names; the URL fact must sit in the citation
+# block that carries it (batch 209 cites the same URL for row 63).
+XID45_EVIDENCE_ROW = "45 Robust Channel Preemptive Removal"
 XID45_EVIDENCE_QUOTE = (
     "No action, informative only. Indicates channels affected by another "
     "failure. On A100, this error could be seen by itself due to unexpected "
@@ -98,12 +101,19 @@ class Statement:
 
     ``truth`` returns ``None`` when the code backs the statement, otherwise a
     short description of what contradicts it.
+
+    ``block``, when set, ties the phrase to one citation: the phrase must sit
+    in the same top-level block (a Markdown list item or paragraph, see
+    :func:`_blocks`) as this marker. A phrase that several citations share --
+    the GPU debug guidelines URL is cited for XID 45 and for XID 63 -- would
+    otherwise keep the fact satisfied after the guarded citation lost it.
     """
 
     id: str
     document: str
     phrase: str
     truth: Predicate
+    block: str | None = None
 
 
 Fact = Forbidden | Statement
@@ -316,6 +326,7 @@ FACTS: tuple[Fact, ...] = (
         document=NVIDIA_POLICY,
         phrase=XID45_EVIDENCE_URL,
         truth=xid45_policy_records_the_evidence,
+        block=XID45_EVIDENCE_ROW,
     ),
     Statement(
         id="xid45-evidence-quote",
@@ -328,6 +339,7 @@ FACTS: tuple[Fact, ...] = (
         document=NVIDIA_POLICY_EN,
         phrase=XID45_EVIDENCE_URL,
         truth=xid45_policy_records_the_evidence,
+        block=XID45_EVIDENCE_ROW,
     ),
     Statement(
         id="xid45-evidence-quote-en",
@@ -344,6 +356,31 @@ def _read(root: Path, relative: str) -> str | None:
     if not path.is_file():
         return None
     return path.read_text(encoding="utf-8")
+
+
+_BLOCK_START = re.compile(r"(#|[-*+]\s|\d+[.)]\s)")
+
+
+def _blocks(text: str) -> list[str]:
+    """Split a document into top-level blocks.
+
+    A block starts at a heading (a heading is a block of its own), at a list
+    item that begins in column 0, or at the first unindented line after a blank
+    line (a new paragraph). Everything else -- a list item's indented
+    continuation lines such as the URL and the quoted row of a citation, or the
+    next line of a wrapped paragraph -- stays with the block that introduces it.
+    """
+
+    blocks: list[list[str]] = []
+    previous_closes = True
+    for line in text.splitlines():
+        unindented = bool(line) and not line[0].isspace()
+        starts = unindented and (previous_closes or _BLOCK_START.match(line))
+        if not blocks or starts:
+            blocks.append([])
+        blocks[-1].append(line)
+        previous_closes = not line.strip() or line.startswith("#")
+    return ["\n".join(block) for block in blocks]
 
 
 def _check_forbidden(root: Path, fact: Forbidden) -> list[str]:
@@ -373,6 +410,15 @@ def _check_statement(root: Path, fact: Statement) -> list[str]:
             f"{fact.id}: {fact.document}: statement not found: {fact.phrase!r}; "
             "the guarded sentence was removed or reworded -- update the fact "
             "table together with the document"
+        ]
+    if fact.block is not None and not any(
+        fact.block in block and fact.phrase in block for block in _blocks(text)
+    ):
+        return [
+            f"{fact.id}: {fact.document}: statement not found in the block that "
+            f"names {fact.block!r}: {fact.phrase!r} (the document still carries "
+            "it elsewhere, for another citation) -- the guarded citation lost "
+            "it; update the fact table together with the document"
         ]
     problem = fact.truth(root)
     if problem is not None:

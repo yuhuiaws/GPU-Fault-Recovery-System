@@ -207,15 +207,138 @@ def test_the_xid45_evidence_is_cited_by_the_policy_and_both_docs(
     assert MODULE.check_facts(tmp_path, _facts(*XID45_FACTS)) == []
 
 
+def _drop_the_url_from_the_xid45_citation(text: str) -> str:
+    row = text.index(MODULE.XID45_EVIDENCE_ROW)
+    start = text.index(MODULE.XID45_EVIDENCE_URL, row)
+    end = start + len(MODULE.XID45_EVIDENCE_URL)
+    return text[:start] + "(link removed)" + text[end:]
+
+
 def test_dropping_the_xid45_citation_from_a_doc_is_reported(tmp_path: Path) -> None:
+    """Batch 209 cites the same GPU debug guidelines URL for XID 63, so the
+    document keeps the URL after the XID 45 citation lost it; the fact is tied
+    to the citation block that names the XID 45 row and still reports it."""
+
     _copy_doc(tmp_path, NVIDIA_POLICY, None)
-    _copy_doc(tmp_path, NVIDIA_POLICY_EN, (MODULE.XID45_EVIDENCE_URL, "(link removed)"))
+    english = _copy_doc(tmp_path, NVIDIA_POLICY_EN, None)
+    english.write_text(
+        _drop_the_url_from_the_xid45_citation(english.read_text(encoding="utf-8")),
+        encoding="utf-8",
+    )
+    assert MODULE.XID45_EVIDENCE_URL in english.read_text(encoding="utf-8")
     _copy_source(tmp_path, XID45_POLICY, None)
 
     failures = MODULE.check_facts(tmp_path, _facts(*XID45_FACTS))
 
     assert len(failures) == 1, failures
     assert NVIDIA_POLICY_EN in failures[0] and "statement not found" in failures[0]
+    assert "xid45-evidence-url-en" in failures[0]
+    assert MODULE.XID45_EVIDENCE_ROW in failures[0]
+
+
+def test_dropping_every_copy_of_the_xid45_url_is_reported(tmp_path: Path) -> None:
+    _copy_doc(tmp_path, NVIDIA_POLICY_EN, None)
+    chinese = _copy_doc(tmp_path, NVIDIA_POLICY, None)
+    chinese.write_text(
+        chinese.read_text(encoding="utf-8").replace(
+            MODULE.XID45_EVIDENCE_URL, "(link removed)"
+        ),
+        encoding="utf-8",
+    )
+    _copy_source(tmp_path, XID45_POLICY, None)
+
+    failures = MODULE.check_facts(tmp_path, _facts(*XID45_FACTS))
+
+    assert len(failures) == 1, failures
+    assert "xid45-evidence-url:" in failures[0] and NVIDIA_POLICY in failures[0]
+
+
+def test_a_block_tied_phrase_is_satisfied_only_inside_its_citation(
+    tmp_path: Path,
+) -> None:
+    document = "docs/cited.md"
+    fact = MODULE.Statement(
+        id="cited-url",
+        document=document,
+        phrase="https://example.invalid/guide#xid",
+        truth=lambda _root: None,
+        block='row "45"',
+    )
+    shared = textwrap.dedent(
+        """\
+        # Evidence
+
+        - Guide, row "63":
+          `https://example.invalid/guide#xid`
+          Excerpt: something else.
+        - Guide, row "45":
+          {url}
+          Verbatim:
+
+          > informative only.
+        """
+    )
+    target = tmp_path / document
+    target.parent.mkdir(parents=True)
+
+    target.write_text(
+        shared.format(url="`https://example.invalid/guide#xid`"), encoding="utf-8"
+    )
+    assert MODULE.check_facts(tmp_path, [fact]) == []
+
+    target.write_text(shared.format(url="(link removed)"), encoding="utf-8")
+    failures = MODULE.check_facts(tmp_path, [fact])
+    assert len(failures) == 1 and "statement not found in the block" in failures[0]
+
+
+def test_a_citation_block_spans_continuations_but_not_the_next_item_or_heading(
+    tmp_path: Path,
+) -> None:
+    """A block runs over a list item's indented continuation lines (also after
+    a blank line) and over a wrapped paragraph; it ends at the next list item
+    and at a heading, which is a block of its own."""
+
+    document = "docs/blocks.md"
+    target = tmp_path / document
+    target.parent.mkdir(parents=True)
+    target.write_text(
+        textwrap.dedent(
+            """\
+            # Marker heading
+            A paragraph that
+            wraps onto a second line.
+
+            - item one
+              continues here
+
+              > quoted after a blank line
+            - item two
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    def tied(phrase: str, block: str) -> object:
+        return MODULE.Statement(
+            id="tied",
+            document=document,
+            phrase=phrase,
+            truth=lambda _root: None,
+            block=block,
+        )
+
+    holds = [
+        tied("wraps onto a second line", "A paragraph that"),
+        tied("quoted after a blank line", "item one"),
+    ]
+    fails = [tied("A paragraph that", "Marker heading"), tied("item two", "item one")]
+
+    assert MODULE.check_facts(tmp_path, holds) == []
+    failures = MODULE.check_facts(tmp_path, fails)
+    assert len(failures) == 2, failures
+    assert all("statement not found in the block" in item for item in failures), (
+        failures
+    )
 
 
 def test_dropping_the_xid45_evidence_from_the_policy_is_reported(

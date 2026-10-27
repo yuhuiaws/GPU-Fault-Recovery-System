@@ -5437,7 +5437,7 @@ The numerator uses the actual `covered_lines + covered_branches`; the partial-br
 The test scale is not hard-coded in this document: `scripts/check-doc-facts.py` forbids the total file count of `tests/` from appearing as a literal
 (v1 §8 keeps only the recomputable structural assertion "`tests/regional/` is the largest"). **`make docs-check`
 only checks that the few document assertions declared in the `scripts/check-doc-facts.py` table agree with the code**; everything else still only checks that referenced
-paths/symbols exist, generated artifacts are in sync, and command order. The numbers in this document (264/277 metric families for the worker role,
+paths/symbols exist, generated artifacts are in sync, and command order. A statement can be tied to one citation block of the document (a top-level list item or paragraph): the XID 45 evidence URL must sit in the citation that names the row "45 Robust Channel Preemptive Removal" -- the XID 63 citation uses the same URL, so a whole-document search would still pass after the XID 45 citation lost its link. The numbers in this document (264/277 metric families for the worker role,
 `regional_mode` off/on, 92 routes, 47 Store codec kinds, 20 notification types, 33 operations,
 81 declared indexes, 18 schema versions) were all obtained by assembling the real app, instantiating the Store codec or reading the
 machine sources and recounting; recount them after changing code. The route total, the five-bucket distribution and the
