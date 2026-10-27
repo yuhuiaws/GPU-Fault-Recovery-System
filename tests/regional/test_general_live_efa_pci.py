@@ -45,6 +45,7 @@ from tests.collectors import _cov95_runtime_collect_host as cov_host
 from tests.regional._general_live_fakes import (
     FakeProbe,
     FakeRegional,
+    StatefulSourceProbe,
     make_context,
     make_settings,
     store_script,
@@ -118,8 +119,12 @@ def test_013_denominator_is_complete_across_both_modules() -> None:
 # --------------------------------------------------------------------------- #
 # the fakes: a phase-aware probe, store and cluster
 # --------------------------------------------------------------------------- #
-class RebootableProbe(FakeProbe):
-    """A source-replay probe whose Pod can be deleted and re-created."""
+class RebootableProbe(StatefulSourceProbe):
+    """A source-replay probe whose Pod can be deleted and re-created.
+
+    It keeps the node's state dir per run like the live probe: the close
+    removes the installed builders, the new boot removes everything.
+    """
 
     def __init__(self, script: dict[str, Any]) -> None:
         super().__init__(script)
@@ -132,6 +137,7 @@ class RebootableProbe(FakeProbe):
 
     def create(self) -> None:
         self.creates += 1
+        super().create()
 
 
 def _inventory_doc(*, efa: bool = True) -> dict[str, Any]:
@@ -623,6 +629,14 @@ def test_pci_missing_passes_end_to_end(tmp_path: Path) -> None:
     # the new boot and asked for the residue and the real tree.
     commands = [call[0] for call in world.probe.calls]
     assert commands.index("close-window") < commands.index("build-infiniband-fixture")
+    # The unreadable-root close removed the node's state dir with the builders
+    # in it: they ship again before the missing-function build (skipped live on
+    # HyperPod 2026-10-27, "install general_live_source_builders.py before
+    # building a fixture", INCONCLUSIVE).
+    first_close = commands.index("close-window")
+    second_build = commands.index("build-pci-fixture", first_close)
+    assert "install-source" in commands[first_close:second_build], commands
+    assert world.probe.wipes[0] == ("close-window", world.ctx.run_id), world.probe.wipes
     builds = _calls(world.probe, "build-pci-fixture")
     assert _flags(builds[0]).get("--unreadable") == [""], builds[0]
     assert _flags(builds[1])["--source"] == [mod.PCI_ROOT], builds[1]

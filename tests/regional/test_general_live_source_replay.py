@@ -25,10 +25,12 @@ from scripts.e2e.regional.general_live_registry import (
     VariantSpec,
     validate_spec,
 )
+from scripts.e2e.regional.host_probe_fixture import HostProbeError
 from scripts.e2e.regional.probes import general_live_source_probe as probe
 from tests.regional._general_live_fakes import (
     FakeProbe,
     FakeRegional,
+    StatefulSourceProbe,
     make_context,
     make_settings,
 )
@@ -878,6 +880,152 @@ def test_snapshot_and_recreate_after_a_reboot(tmp_path: Path) -> None:
     controller.build_pci(efa_count=16)
     installs = [call for call in fake.calls if call[0] == "install-source"]
     assert len(installs) == 2, "the builders are shipped again after the reboot"
+
+
+# --------------------------------------------------------------------------- #
+# the state dir leaves with the window (013 pci_missing, HyperPod 2026-10-27)
+# --------------------------------------------------------------------------- #
+def _stateful(tmp_path: Path, **extra: object):
+    fake = StatefulSourceProbe(_script(**extra))
+    controller = helper.HostSourceReplay(
+        _Regional(),
+        node=NODE,
+        image="img@sha256:" + "0" * 64,
+        case_id="GF-GENERAL-LIVE-013.pci_missing",
+        run_id="gl013-pci-missing-a6-471be317",
+        case_dir=tmp_path / "case",
+        host=fake,
+        approvals=(TOKEN,),
+    )
+    return controller, fake
+
+
+def test_the_stateful_fake_refuses_what_the_live_probe_refuses() -> None:
+    """The fake is only worth driving if it refuses a build without the builders
+    (per run id, like ``fixtures_dir(run_id)``) and forgets them on a close."""
+
+    fake = StatefulSourceProbe(_script())
+    build = ("build-pci-fixture", "--unreadable", "--run-id", "gl013-x")
+    with pytest.raises(HostProbeError, match="install general_live_source_builders"):
+        fake.execute(*build)
+    with pytest.raises(HostProbeError, match="install host_command_replay.py"):
+        fake.execute("install-wrapper", "--tool", "smartctl", "--run-id", "gl013-x")
+    fake.execute(
+        "install-source",
+        "--name",
+        probe.BUILDERS_NAME,
+        "--sha256",
+        "0" * 64,
+        "--b64",
+        "",
+        "--run-id",
+        "gl013-x",
+    )
+    assert fake.execute(*build) == {"efa_devices": 15}
+    with pytest.raises(HostProbeError, match="install general_live_source_builders"):
+        fake.execute("build-pci-fixture", "--unreadable", "--run-id", "gl013-x-r2")
+    fake.execute("close-window", "--run-id", "gl013-x")
+    assert fake.wipes == [("close-window", "gl013-x")]
+    with pytest.raises(HostProbeError, match="install general_live_source_builders"):
+        fake.execute(*build)
+
+
+def test_builders_ship_again_after_the_close_removed_the_state_dir(
+    tmp_path: Path,
+) -> None:
+    """013 ``pci_missing``'s order on a node-faithful probe (HyperPod 2026-10-27).
+
+    ``inventory`` ships the builders once and the unreadable-root build rides on
+    them; ``close-window`` removes ``state_dir(run_id)`` -- fixtures, wrapper,
+    builders -- on the node; the missing-function build must ship them again.
+    Red before the fix: the once-per-run flag survived the close, the install
+    was skipped and the probe refused ``build-pci-fixture`` ("install
+    general_live_source_builders.py before building a fixture",
+    ``load_builders_module``), ending the variant INCONCLUSIVE.
+    """
+
+    controller, fake = _stateful(tmp_path)
+    controller.inventory(source="/sys/class/infiniband")
+    controller.build_pci(unreadable=True)
+    controller.open_pci_root(restore_seconds=600)
+    controller.close()
+    controller.build_pci(source="/sys/bus/pci/devices", drop=["0000:53:00.0"])
+    controller.build_infiniband(source="/sys/class/infiniband", drop=["rdmap0s0"])
+    assert [call[0] for call in fake.calls] == [
+        "install-source",
+        "inventory",
+        "build-pci-fixture",
+        "open-window",
+        "close-window",
+        "install-source",
+        "build-pci-fixture",
+        "build-infiniband-fixture",
+    ], (
+        "the builders ship once per node state: before the first command that "
+        "needs them and again after the close removed them -- not per build"
+    )
+    digest = hashlib.sha256(helper.BUILDERS_MODULE.read_bytes()).hexdigest()
+    for call in (call for call in fake.calls if call[0] == "install-source"):
+        flags = _flags(call)
+        assert flags["--name"] == probe.BUILDERS_NAME, call
+        assert flags["--sha256"] == digest, "sha256-checked on every install"
+        assert flags["--run-id"] == controller.run_id, (
+            "install and build name the same run: the probe keeps both under "
+            "fixtures_dir(run_id)"
+        )
+    assert fake.wipes == [("close-window", controller.run_id)]
+
+
+def test_await_ticks_close_and_an_already_closed_window_forget_the_installed_files(
+    tmp_path: Path,
+) -> None:
+    """``await-ticks --close`` restores on the node (013 ``link_inactive``); a
+    window the deadman closed meanwhile answers ``already_closed``. Both removed
+    the state dir, so the next build ships the builders again."""
+
+    for receipt in (
+        {"completed": True, "ticks": [1, 2], "close": {"clean": True}},
+        {"already_closed": True, "completed": False, "ticks": []},
+    ):
+        controller, fake = _stateful(tmp_path, **{"await-ticks": receipt})
+        controller.build_infiniband(source="/sys/class/infiniband", drop=["rdmap0s0"])
+        controller.open_tree(
+            [(helper.INFINIBAND_TREE, "/sys/class/infiniband")], restore_seconds=300
+        )
+        controller.await_ticks(2, interval=15, timeout=120)
+        controller.build_infiniband(source="/sys/class/infiniband", drop=["rdmap1s0"])
+        installs = [call for call in fake.calls if call[0] == "install-source"]
+        assert len(installs) == 2, (receipt, [call[0] for call in fake.calls])
+        assert fake.wipes == [("await-ticks", controller.run_id)], receipt
+        controller.cleanup()
+        assert "close-window" not in [call[0] for call in fake.calls], (
+            "the window was already closed on the node; cleanup closes nothing"
+        )
+
+
+def test_the_wrapper_ships_again_after_a_close(tmp_path: Path) -> None:
+    """A second command window after a close: the wrapper left with the state dir
+    ("install host_command_replay.py before wrapping a tool" otherwise)."""
+
+    controller, fake = _stateful(tmp_path)
+    plan = helper.command_plan(
+        "smartctl", [helper.rule("scan", "exit", exit_code=2)], now=1.0
+    )
+    controller.install_wrapper("smartctl", plan)
+    controller.open_command(["smartctl"], restore_seconds=600)
+    controller.close()
+    controller.install_wrapper("smartctl", plan)
+    controller.open_command(["smartctl"], restore_seconds=600)
+    names = [
+        _flags(call)["--name"] for call in fake.calls if call[0] == "install-source"
+    ]
+    assert names == [
+        probe.WRAPPER_NAME,
+        "plan-smartctl.json",
+        probe.WRAPPER_NAME,
+        "plan-smartctl.json",
+    ], names
+    assert [call[0] for call in fake.calls].count("install-wrapper") == 2
 
 
 class _Cadence:

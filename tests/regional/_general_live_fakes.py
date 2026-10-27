@@ -38,6 +38,8 @@ from scripts.e2e.regional.general_live_store import (
     ATTEMPT_PROBE,
     PREFLIGHT_PROBE,
 )
+from scripts.e2e.regional.host_probe_fixture import HostProbeError
+from scripts.e2e.regional.probes import general_live_source_probe as source_probe
 from scripts.e2e.regional.regional_live_fixture import RegionalLiveSettings
 
 
@@ -74,6 +76,82 @@ class FakeProbe:
 
     def cleanup(self) -> dict[str, bool]:
         return {"pod": False, "configmap": False}
+
+
+class StatefulSourceProbe(FakeProbe):
+    """A ``FakeProbe`` that keeps the source probe's node-side state per run.
+
+    The live ``general_live_source_probe`` writes every ``install-source`` under
+    ``state_dir(run_id)/fixtures`` and its ``close-window`` -- the path
+    ``await-ticks --close`` and the deadman run as well -- ends with
+    ``rmtree(state_dir(run_id))``; a reboot wipes ``/run``. This fake tracks the
+    installed names per ``--run-id``, forgets them on a close receipt and on a
+    re-created Pod (``create``), and refuses what the probe refuses without
+    them: every ``build-*`` command, ``inventory``, ``status``, ``audit-read``
+    and ``journal-read`` load the builders module, ``install-wrapper`` needs
+    the wrapper file. The refusal is the ``HostProbeError`` the runner raises
+    for a probe that exited 1, so a controller that skips an install after a
+    close fails here the way 013 ``pci_missing`` failed live
+    (``load_builders_module``: "install general_live_source_builders.py before
+    building a fixture").
+    """
+
+    NEEDS_BUILDERS = frozenset(
+        {
+            "build-pci-fixture",
+            "build-infiniband-fixture",
+            "build-nvidia-proc-fixture",
+            "build-meminfo-fixture",
+            "inventory",
+            "status",
+            "audit-read",
+            "journal-read",
+        }
+    )
+
+    def __init__(self, script: dict[str, Any] | None = None) -> None:
+        super().__init__(script)
+        self.installed: dict[str, set[str]] = {}
+        self.wipes: list[tuple[str, str]] = []
+
+    @staticmethod
+    def _option(arguments: tuple[str, ...], flag: str) -> str:
+        for index, item in enumerate(arguments[:-1]):
+            if item == flag:
+                return arguments[index + 1]
+        return ""
+
+    @staticmethod
+    def _refuse(command: str, name: str, site: str) -> None:
+        raise HostProbeError(
+            f"host probe failed (exit 1; error ProbeError at {site}: install {name} "
+            f"before {command}; detail in probe-error.json); output withheld"
+        )
+
+    def execute(self, *arguments: str, timeout: int = 180) -> dict[str, Any]:
+        command = arguments[0]
+        run_id = self._option(arguments, "--run-id")
+        names = self.installed.setdefault(run_id, set())
+        if command in self.NEEDS_BUILDERS and source_probe.BUILDERS_NAME not in names:
+            self._refuse(command, source_probe.BUILDERS_NAME, "load_builders_module")
+        if command == "install-wrapper" and source_probe.WRAPPER_NAME not in names:
+            self._refuse(command, source_probe.WRAPPER_NAME, "install_wrapper")
+        receipt = super().execute(*arguments, timeout=timeout)
+        if command == "install-source":
+            names.add(self._option(arguments, "--name"))
+        elif command == "close-window" or (
+            command == "await-ticks"
+            and "--close" in arguments
+            and (receipt.get("close") is not None or receipt.get("already_closed"))
+        ):
+            self.installed.pop(run_id, None)
+            self.wipes.append((command, run_id))
+        return receipt
+
+    def create(self) -> None:
+        """A re-created Pod stands on a new boot: nothing under ``/run`` survived."""
+
+        self.installed.clear()
 
 
 class FakeRegional:

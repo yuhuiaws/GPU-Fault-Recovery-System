@@ -2,7 +2,8 @@
 
 Owns the host probe (``probes/general_live_source_probe.py``; its fixture
 builders ``probes/general_live_source_builders.py`` are installed sha256-checked
-through ``install-source`` before the first build, like the command wrapper)
+through ``install-source`` before the first build, like the command wrapper,
+and again after a close or re-create removed the run's state dir on the node)
 that replaces allow-listed raw readings in the host collector unit's private
 environment and nothing else: a procfs/sysfs *file* bound read-only into the unit's mount
 namespace (001 invalid_delta, 008 statistics_failed, 009 errors_delta, 002
@@ -421,11 +422,13 @@ class HostSourceReplay:
         )
 
     def _install_builders(self) -> None:
-        """Ship the sha256-checked fixture builders once per run, before a build.
+        """Ship the sha256-checked fixture builders once per node state, before a build.
 
         A probe is one self-contained file on the node, so the builders travel
         as a second installed file that the probe imports by path; the window,
-        deadman and cleanup commands never need it.
+        deadman and cleanup commands never need it. "Once" is per state dir:
+        the file lives under ``fixtures_dir(run_id)``, which leaves with the
+        window (:meth:`_node_state_gone`).
         """
 
         if not self._builders_installed:
@@ -830,9 +833,31 @@ class HostSourceReplay:
 
         return self._execute("verify", timeout=120)
 
+    def _node_state_gone(self) -> None:
+        """The run's state dir on the node is gone: forget what was shipped.
+
+        The probe's ``close-window`` (``_close``, the path ``await-ticks
+        --close`` and the deadman run too) ends with ``rmtree(state_dir(run_id))``:
+        the wrapper and the builders under ``fixtures/`` and the shims under
+        ``bin/`` leave with the window, and a reboot (:meth:`recreate`) wipes
+        ``/run`` the same way. The once-per-run flags must say so, or the next
+        build or wrap on this controller skips the install and the probe
+        refuses it: 013 ``pci_missing`` closed its unreadable-root window and
+        built the missing-function root on the same controller -- "install
+        general_live_source_builders.py before building a fixture"
+        (``load_builders_module``), INCONCLUSIVE on HyperPod 2026-10-27. The
+        install and every build carry this controller's ``run_id`` -- the key
+        the probe derives ``fixtures_dir`` from -- so the flags here track
+        exactly the directory the probe reads.
+        """
+
+        self._opened = False
+        self._wrapper_installed = False
+        self._builders_installed = False
+
     def close(self) -> dict[str, Any]:
         receipt = self._execute("close-window", timeout=150)
-        self._opened = False
+        self._node_state_gone()
         return receipt
 
     def await_ticks(
@@ -863,7 +888,7 @@ class HostSourceReplay:
         if close and (
             receipt.get("close") is not None or receipt.get("already_closed")
         ):
-            self._opened = False
+            self._node_state_gone()
         return receipt
 
     def snapshot(self) -> dict[str, Any]:
@@ -890,9 +915,7 @@ class HostSourceReplay:
 
         require_action_time(180)
         residuals = self.host.cleanup()
-        self._opened = False
-        self._wrapper_installed = False
-        self._builders_installed = False
+        self._node_state_gone()
         self.host.create()
         return {"previous_residuals": residuals, "recreated": True}
 
