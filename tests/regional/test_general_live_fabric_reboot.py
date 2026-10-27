@@ -13,6 +13,33 @@ over fake product timelines with and without the reboot and pin the new
 reading: the escalation is graded on the record before and at the rung, the
 exit on the settled record, and a reset-only variant whose record carries the
 rung is INCONCLUSIVE, not PASS and not FAIL.
+
+The advance the tool refuses (S52)
+----------------------------------
+Live 2026-10-27 13:14-13:28Z (plain EKS ip-10-0-43-5, R13g, harness
+int/r13c-live27) ``not_started`` ended INCONCLUSIVE "the node did not answer
+the probe in 13 attempts over 187 s" while the node answered every attempt:
+the probe's loopback ``POST /advance`` got HTTP 409 Conflict from the replay
+tool. The tool's journal (the case's ``oracle.jsonl``) shows why -- the
+collector scraped through the quiesce (read 27: upstream ``Connection
+refused`` while the exporter was down) and its first scrape after the exporter
+returned read the real ``fabric_manager_status`` 2.0 (Fabric Manager
+re-training after the reset) against the baseline 3.0, so the tool aborted
+("a real reading is never masked"), left its steps for good and passed the
+real readings through; ``Replay.advance`` then raises "the replay is not on a
+step" and ``do_POST`` answers 409. HyperPod's collector pauses with the
+quiesce (27 reads in 589 s, no upstream error) and its first post-restore
+scrape read 3.0, so the advance landed there. These tests pin the runner's
+reading of the refusal: a probe error that is not a transport failure makes
+the runner read the tool's ``/status`` and classify it (``plan_release``) --
+an abort or a lapsed hold is the plan's release (the product grades the real
+fabric; PASS with a note), a plan already past the hold is an advance whose
+receipt was lost, a disarmed or unarmed tool is INCONCLUSIVE with the 409's
+meaning, a plan still on its held step is retried -- while transport errors
+never consult the tool; ``recovery_failure`` released this way is INCONCLUSIVE,
+not FAIL on the product; and the held step's read bound outlasts the
+detection and the chain (the live 36-read bound lapsed after 585 s of scrapes,
+reset-done came at 569 s).
 """
 
 from __future__ import annotations
@@ -26,7 +53,10 @@ import pytest
 from scripts.e2e.regional import general_live_gpu_fabric as fab
 from scripts.e2e.regional import general_live_gpu_replay as replay
 from scripts.e2e.regional.general_live_fixture import VariantInconclusive
-from scripts.e2e.regional.host_probe_fixture import HostProbeTransportError
+from scripts.e2e.regional.host_probe_fixture import (
+    HostProbeError,
+    HostProbeTransportError,
+)
 from tests.regional._general_live_fakes import FakeRegional, make_context, make_settings
 from tests.regional._general_live_gpu_fakes import (
     audit_records,
@@ -35,6 +65,7 @@ from tests.regional._general_live_gpu_fakes import (
     gpu_incident,
     gpu_workflow,
 )
+from tools import gpu_dcgm_field_replay as tool
 
 SPECS = {spec.variant: spec for spec in fab.VARIANTS}
 GPUS = [
@@ -153,6 +184,39 @@ REBOOTED_RECOVERED = _doc(
     status="SUCCEEDED",
     operations=CHAIN + TAIL,
 )
+#: A clean reset: the post-reset validations passed, the node was released.
+TRAINED = _doc(
+    [
+        *THROUGH_RESET,
+        _exec(5, "RESTORE_GPU_SERVICES", "SUCCEEDED", "05:16:20"),
+        _exec(6, "VALIDATE_GPU", "SUCCEEDED", "05:17:40"),
+        _exec(7, "VALIDATE_FABRIC", "SUCCEEDED", "05:17:50"),
+        _exec(8, "RESTORE_SCHEDULING", "SUCCEEDED", "05:18:00"),
+    ],
+    state="RECOVERED",
+    status="SUCCEEDED",
+)
+#: The tool's ``/status`` on the plain-EKS node once it had aborted (live
+#: 2026-10-27 13:25Z, journal read 27), as ``general_live_dcgm_probe``'s
+#: ``status`` relays it.
+ABORTED_STATUS = {
+    "reads": 27,
+    "profile": "fabric",
+    "proof_scope": "live-replay",
+    "armed": True,
+    "disarmed": False,
+    "aborted": (
+        "real upstream change of GPU-5d4a1121-2b96-2054-1968-e74914e7bc20/"
+        "fabric_manager_status: 3.0 -> 2.0; a real reading is never masked"
+    ),
+    "step": None,
+    "offsets": {},
+}
+#: The runner's error for the probe exit the 409 produced (13 times live).
+REFUSED = (
+    "host probe failed (exit 1; error ProbeError 4a771a58aed3bc76 at loopback:430; "
+    "detail in probe-error.json); output withheld"
+)
 
 
 class Product:
@@ -186,6 +250,7 @@ def _run(
     *,
     reboot_at: int | None = None,
     advance: Any = None,
+    extra: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], Any, Any]:
     spec = SPECS[variant]
     regional = FakeRegional()
@@ -198,10 +263,12 @@ def _run(
     ctx = make_context(
         spec, tmp_path=tmp_path, regional=regional, probes={}, settings=settings
     )
-    extra = {"advance": advance} if advance is not None else None
+    scripted = dict(extra or {})
+    if advance is not None:
+        scripted["advance"] = advance
     probe = dcgm_probe(
         audit=audit_records({f"{gpu}/fabric_manager_status": 4.0 for gpu in GPUS}),
-        extra=extra,
+        extra=scripted or None,
     )
     ctx.probes[f"dcgm@{ctx.settings.node}"] = probe
     out = getattr(fab, variant)(ctx)
@@ -524,7 +591,11 @@ def test_advance_retries_while_the_node_cannot_answer(tmp_path: Path) -> None:
     )
     assert out["verdict"] == "PASS", out["errors"]
     assert out["plan_advance"]["attempts"] == 3
-    assert [c[0] for c in probe.calls].count("advance") == 3
+    assert out["plan_advance"]["advanced"] is True
+    assert out["plan_advance"]["release"] is None
+    names = [c[0] for c in probe.calls]
+    assert names.count("advance") == 3
+    assert names.count("status") == 0, "a transport failure never consults the tool"
     attempts = _evidence(ctx, "plan-advance")["attempts"]
     assert [a.get("ok", False) for a in attempts] == [False, False, True]
     assert "HostProbeTransportError: dcgm advance:" in attempts[0]["error"]
@@ -592,3 +663,223 @@ def test_specs_tell_the_reader_about_the_rung() -> None:
     ):
         assert "INCONCLUSIVE, not a product error" in SPECS[variant].expected, variant
     assert fab.FULL_RESET[0] == "MARK_UNSCHEDULABLE"
+
+
+# --------------------------------------------------------------------------- #
+# the advance the tool refuses (HTTP 409 Conflict): plain EKS 2026-10-27 (S52)
+# --------------------------------------------------------------------------- #
+def _refusing(
+    status: dict[str, Any], *, land_after: int | None = None
+) -> dict[str, Any]:
+    """``advance`` exits 1 the way the probe did when its loopback POST got the
+    tool's 409 (every attempt, or the first ``land_after``); ``status`` answers
+    with the tool's ``/status``."""
+
+    seen = {"advance": 0}
+
+    def advance(arguments: tuple[str, ...]) -> dict[str, Any]:
+        seen["advance"] += 1
+        if land_after is not None and seen["advance"] > land_after:
+            return {"advanced": True, "status": {**status, "step": 2}}
+        raise HostProbeError(REFUSED)
+
+    return {"advance": advance, "status": {"run_id": "r", "status": status}}
+
+
+def test_plan_release_reads_the_tools_status() -> None:
+    plan = {
+        "steps": [
+            {"reads": 3, "ops": []},
+            {"reads": 124, "ops": [], "until_advance": True},
+            {"reads": 40, "ops": []},
+        ]
+    }
+    aborted = fab.plan_release(plan, ABORTED_STATUS)
+    assert aborted is not None and aborted["kind"] == "aborted"
+    assert "3.0 -> 2.0" in aborted["reason"], aborted
+    lapsed = fab.plan_release(plan, {**ABORTED_STATUS, "aborted": None})
+    assert lapsed is not None and lapsed["kind"] == "lapsed"
+    advanced = fab.plan_release(plan, {**ABORTED_STATUS, "aborted": None, "step": 2})
+    assert advanced is not None and advanced["kind"] == "advanced"
+    disarmed = fab.plan_release(
+        plan, {**ABORTED_STATUS, "aborted": None, "disarmed": True}
+    )
+    assert disarmed is not None and disarmed["kind"] == "disarmed"
+    unarmed = fab.plan_release(
+        plan, {**ABORTED_STATUS, "aborted": None, "armed": False}
+    )
+    assert unarmed is not None and unarmed["kind"] == "unarmed"
+    for release in (aborted, lapsed, advanced, disarmed, unarmed):
+        assert "HTTP 409" in release["meaning"] and "held step" in release["meaning"]
+    # Still on the held step: the exec failed, not the tool -- retry. An older
+    # probe's status without the tool's fields explains nothing either.
+    assert (
+        fab.plan_release(plan, {**ABORTED_STATUS, "aborted": None, "step": 1}) is None
+    )
+    assert fab.plan_release(plan, {"armed": True}) is None
+    assert fab.plan_release(plan, None) is None
+
+
+def test_advance_refused_after_the_tools_abort_is_the_plans_release(
+    tmp_path: Path,
+) -> None:
+    """The live plain-EKS shape: 409 on the advance, ``/status`` aborted on the
+    real post-reset fabric transition; the product graded the real fabric."""
+
+    out, ctx, probe = _run(
+        tmp_path,
+        "not_started",
+        [DETECTED, RESET_DONE, TRAINED],
+        extra=_refusing(ABORTED_STATUS),
+    )
+    assert out["verdict"] == "PASS", out
+    advance = out["plan_advance"]
+    assert advance["attempts"] == 1 and advance["advanced"] is False
+    assert advance["release"]["kind"] == "aborted"
+    names = [c[0] for c in probe.calls]
+    assert names.count("advance") == 1 and names.count("status") == 1, names
+    assert names.index("status") < names.index("close-run"), names
+    record = _evidence(ctx, "plan-advance")
+    assert record["attempts"][0]["error"] == f"HostProbeError: dcgm advance: {REFUSED}"
+    assert record["release"]["kind"] == "aborted"
+    assert record["release"]["status"] == ABORTED_STATUS
+    (note,) = out["notes"]
+    assert "HTTP 409" in note and "not on a held step" in note, note
+    assert "3.0 -> 2.0" in note and "never masked" in note, note
+    assert "real fabric" in note, note
+    for timeline in ("detection", "reset-done", "settled"):
+        assert (ctx.case_dir / f"{timeline}-timeline.json").exists(), timeline
+
+
+def test_advance_refused_on_a_lapsed_hold_is_a_release_with_the_409_meaning(
+    tmp_path: Path,
+) -> None:
+    status = {**ABORTED_STATUS, "aborted": None, "reads": 40}
+    out, _ctx, _probe = _run(
+        tmp_path,
+        "in_progress",
+        [DETECTED, RESET_DONE, TRAINED],
+        extra=_refusing(status),
+    )
+    assert out["verdict"] == "PASS", out
+    assert out["plan_advance"]["advanced"] is False
+    assert out["plan_advance"]["release"]["kind"] == "lapsed"
+    (note,) = out["notes"]
+    assert "HTTP 409" in note and "read bound" in note and "40 reads" in note, note
+
+
+def test_advance_refused_past_the_hold_counts_as_an_advance_that_landed(
+    tmp_path: Path,
+) -> None:
+    status = {**ABORTED_STATUS, "aborted": None, "step": 2, "reads": 28}
+    out, _ctx, probe = _run(
+        tmp_path, "failed", [DETECTED, RESET_DONE, TRAINED], extra=_refusing(status)
+    )
+    assert out["verdict"] == "PASS", out
+    assert out["plan_advance"]["attempts"] == 1
+    assert out["plan_advance"]["advanced"] is True
+    assert out["plan_advance"]["release"]["kind"] == "advanced"
+    assert out["notes"] == [], "an advance that landed needs no note"
+    assert [c[0] for c in probe.calls].count("status") == 1
+
+
+def test_advance_failure_on_the_held_step_is_retried_not_classified(
+    tmp_path: Path,
+) -> None:
+    status = {**ABORTED_STATUS, "aborted": None, "step": 1, "reads": 20}
+    out, ctx, probe = _run(
+        tmp_path,
+        "full_reset",
+        [DETECTED, RESET_DONE, TRAINED],
+        extra=_refusing(status, land_after=1),
+    )
+    assert out["verdict"] == "PASS", out
+    assert out["plan_advance"]["attempts"] == 2
+    assert out["plan_advance"]["advanced"] is True
+    assert out["plan_advance"]["release"] is None
+    names = [c[0] for c in probe.calls]
+    assert names.count("advance") == 2 and names.count("status") == 1, names
+    attempts = _evidence(ctx, "plan-advance")["attempts"]
+    assert [a.get("ok", False) for a in attempts] == [False, True]
+
+
+@pytest.mark.parametrize(
+    ("status", "word"),
+    [
+        ({**ABORTED_STATUS, "aborted": None, "disarmed": True}, "disarmed"),
+        ({**ABORTED_STATUS, "aborted": None, "armed": False}, "not armed"),
+    ],
+)
+def test_advance_refused_by_an_ended_tool_is_inconclusive_and_names_the_409(
+    tmp_path: Path, status: dict[str, Any], word: str
+) -> None:
+    with pytest.raises(VariantInconclusive) as refused:
+        _run(
+            tmp_path,
+            "every_gpu_success",
+            [DETECTED, RESET_DONE, TRAINED],
+            extra=_refusing(status),
+        )
+    text = str(refused.value)
+    assert "could not be advanced after the reset" in text
+    assert "HTTP 409" in text and "not on a held step" in text, text
+    assert word in text and "not a product error" in text, text
+    assert "did not answer" not in text, text
+
+
+def test_advance_that_never_lands_names_the_probe_failure_not_the_node(
+    tmp_path: Path,
+) -> None:
+    """A probe exit whose status read fails too (the tool itself is gone) is
+    not "the node did not answer"; the text says what was and was not seen."""
+
+    def status(arguments: tuple[str, ...]) -> dict[str, Any]:
+        raise HostProbeError("dcgm status: host probe failed (exit 1); output withheld")
+
+    extra = {**_refusing(ABORTED_STATUS), "status": status}
+    with pytest.raises(VariantInconclusive) as refused:
+        _run(tmp_path, "not_started", [DETECTED, RESET_DONE], extra=extra)
+    text = str(refused.value)
+    assert "could not be advanced after the reset" in text
+    assert "the probe ran" in text and "status" in text, text
+    assert "HTTP 409" in text, text
+    assert "did not answer the probe" not in text, text
+
+
+def test_recovery_failure_released_by_the_tools_abort_is_inconclusive_not_fail(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(VariantInconclusive) as refused:
+        _run(
+            tmp_path,
+            "recovery_failure",
+            [DETECTED, RESET_DONE, REBOOTED_RECOVERED],
+            extra=_refusing(ABORTED_STATUS),
+        )
+    text = str(refused.value)
+    assert "held FAILURE" in text and "HTTP 409" in text, text
+    assert "RESTART_NODE rung cannot be driven" in text, text
+    assert "3.0 -> 2.0" in text and "not a product error" in text, text
+
+
+def test_reset_variants_hold_outlasts_detection_and_the_chain(tmp_path: Path) -> None:
+    """The held step's read bound: the live 36 reads ((300 + 180) / 15 + 4)
+    lapsed after 39 scrapes, 585 s at 15 s; plain EKS's reset-done came 569 s
+    after arm with the collector scraping through the quiesce."""
+
+    _out, ctx, _probe = _run(tmp_path, "not_started", [DETECTED, RESET_DONE, TRAINED])
+    plan = json.loads((ctx.case_dir / "plan.json").read_text(encoding="utf-8"))
+    held = [step for step in plan["steps"] if step.get("until_advance")]
+    assert len(held) == 1, plan
+    assert held[0]["reads"] == fab.reset_hold_reads(15, 300) == 124
+    assert held[0]["reads"] == replay.held_reads(
+        15, fab.WINDOW + 300 + fab.RESET_CHAIN_SECONDS
+    )
+    assert held[0]["reads"] > 36, "the live bound was a near miss"
+    assert sum(step["reads"] for step in plan["steps"]) <= tool.MAX_TOTAL_READS
+    assert tool.validate_plan(plan)["steps"][1]["until_advance"] is True
+    # The bound outlasts the runner's own detection horizon plus the chain.
+    assert (3 + 36) * 15 < 600, "the live bound did not reach the detection horizon"
+    assert held[0]["reads"] * 15 >= fab.WINDOW + 300 + fab.RESET_CHAIN_SECONDS
+    with pytest.raises(VariantInconclusive, match="at most 200 per step"):
+        fab.reset_hold_reads(5, 300)

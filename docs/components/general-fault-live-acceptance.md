@@ -1001,6 +1001,31 @@ HostProbeError 重试至多 180 s（仍到不了即 INCONCLUSIVE 并说明），
 现场记录），五个 reset-only 变体同样两集群重跑；无变体因此变为 NOT_RUN
 （`tests/regional/test_general_live_fabric_reboot.py`）。
 
+2026-10-27 13:14-13:28Z eks 现场（plain EKS 节点 ip-10-0-43-5，R13g，harness int/r13c-live27）
+`not_started`——以及 13:44-13:59Z 的 `in_progress`——INCONCLUSIVE "the held plan could not be advanced
+after the reset: the node did not answer the probe in 13 attempts over 187 s"，但节点其实每次都答了：
+`probe-error.json` 是 `loopback:430`、"loopback POST failed: HTTP Error 409: Conflict"，从 13:25:19Z
+（reset-done 被接受后 8 ms）到 13:28:26Z 13 次相同。409 来自回放工具本身：`tools/gpu_dcgm_field_replay.py`
+的 `do_POST`（`/advance`）把 `Replay.advance()` 抛出的 ValueError 作 409 返回，而 `Replay.advance()` 在
+`Replay.active()` 为 None 时说 "the replay is not on a step"。工具的 journal（用例目录的 `oracle.jsonl`）
+给出为什么：EKS 的采集器在 quiesce 期间继续 scrape（第 27 读上游 `Connection refused`——exporter 随 host
+engine 停了），exporter 回来后的第一次 scrape 读到一张卡真实的 `fabric_manager_status` 2.0（reset 后
+Fabric Manager 重新训练）而基线是 3.0，`Replay._check_baseline` 于是 abort（"a real reading is never
+masked"），此后 `active()` 永远为 None、真实读数透传，advance 不可能再成功；旧的 `_advance_when_reachable`
+把任何 `HostProbeError` 都当成"节点没应答"重试 180 s。HyperPod 同一变体 12:11Z PASS 的原因是那里的采集器
+随 quiesce 停下（589 s 内只有 27 读、无上游错误），RESTORE 后第一次 scrape 读到的真实 fabric 已经是 3.0，
+advance 在第 27 读落地（journal `ADVANCE read 27 step 2`）。两边产品的判定其实一样——reset 后的校验读到的
+都是已训练的 fabric，端出的或真实的。现在：探针跑了但 exit 1（非 transport 失败）时 runner 读工具 `/status`
+并分类（`plan_release`）：abort 或持有步读数/期限用尽（`lapsed`）即计划已由工具释放——PASS 并加 note 说明
+409 的含义；计划已过持有步即 advance 其实落地过（回执丢失）；工具已 disarm/未 arm 则 INCONCLUSIVE 并写明
+409 的含义（"the replay is not on a held step"）；仍在持有步则重试；kubelet 未回来的 transport 失败照旧
+重试、不读 status。`recovery_failure` 被工具这样释放时 INCONCLUSIVE（这种节点上 FAILURE 无法持有过真实的
+训练转变，RESTART_NODE 一级驱动不出来），不判产品 FAIL。持有步读数本身也是险情：36 读（(300+180)/15+4）
+加 3 个基线读在 585 s 后失效，而 EKS 的 reset-done 在 arm 后 569 s 才到；现在 `reset_hold_reads` 用
+`held_reads(interval, 300 + health_summary + 300)`（15 s 即 124 读）覆盖检测窗与链。证据：
+`plan-advance.json` 带 `release`（kind/reason/工具 status）。EKS 上六个 reset 变体需重跑
+（`tests/regional/test_general_live_fabric_reboot.py`、`tests/regional/test_general_live_fabric_plan_bounds.py`）。
+
 ### GF-GENERAL-LIVE-022
 
 必测：`at_rate_limit`、`over_rate_limit`、`counter_reset`、`source_boot_change`、

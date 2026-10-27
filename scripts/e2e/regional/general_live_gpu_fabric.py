@@ -66,6 +66,40 @@ polls faster and the advance retries through a quiesce that still has kubelet
 down, and a record that nevertheless carries a RESTART_NODE rung (or a node
 whose boot id changed) is INCONCLUSIVE with the reason, never PASS on a reboot
 nor FAIL on the product (``reboot_exposure``).
+
+The advance the tool refuses (plain EKS, 2026-10-27)
+----------------------------------------------------
+Live 2026-10-27 13:14-13:28Z (plain EKS ip-10-0-43-5, R13g, harness
+int/r13c-live27) ``not_started`` -- and ``in_progress`` at 13:44-13:59Z --
+ended INCONCLUSIVE "the node did not answer the probe in 13 attempts over
+187 s" while the node answered every attempt: the probe's loopback ``POST
+/advance`` got HTTP 409 Conflict from the replay tool (``probe-error.json``
+``loopback:430``), the same answer from 13:25:19Z (8 ms after reset-done was
+accepted) to 13:28:26Z. The tool's journal (the case's ``oracle.jsonl``) says
+why: the EKS collector scrapes through the quiesce (journal read 27: upstream
+``Connection refused`` while the exporter was down with the host engine), and
+its first scrape after the exporter returned read the real
+``fabric_manager_status`` 2.0 of one GPU -- Fabric Manager re-training after
+the reset -- against the baseline 3.0, so ``Replay._check_baseline`` aborted
+("a real reading is never masked"), ``Replay.active`` is ``None`` for good,
+the real readings pass through, ``Replay.advance`` raises "the replay is not
+on a step" and ``do_POST`` answers 409. On HyperPod the collector pauses with
+the quiesce (27 reads in 589 s, no upstream error) and its first post-restore
+scrape read the fabric already trained (3.0), so the advance landed at read 27
+and the variant passed at 12:11Z. The product's grading is the same either
+way -- its post-reset validation reads a trained fabric, served or real -- so a
+probe exit that is not a transport failure now makes the runner read the
+tool's ``/status`` and classify the refusal (``plan_release``): an abort or a
+lapsed hold is the plan's release (PASS with a note), a plan already past the
+hold is an advance whose receipt was lost, an ended tool is INCONCLUSIVE with
+the 409's meaning, a plan still on its held step is retried; kubelet-down
+transport failures are retried as before without consulting the tool.
+``recovery_failure`` released this way is INCONCLUSIVE (the FAILURE cannot be
+held past the real transition on such a node), never FAIL on the product. The
+held step's read bound was a near miss of its own: 36 reads ((300 + 180) / 15
++ 4) lapse after 39 scrapes, 585 s at 15 s, and plain EKS's reset-done came
+569 s after arm; ``reset_hold_reads`` now sizes it over the detection horizon
+and the chain with ``held_reads``.
 """
 
 from __future__ import annotations
@@ -104,7 +138,11 @@ from scripts.e2e.regional.general_live_gpu_verdicts import (
     settled,
 )
 from scripts.e2e.regional.general_live_verdicts import parse_time, workflows_of
-from scripts.e2e.regional.host_probe_fixture import HostProbeError
+from scripts.e2e.regional.host_probe_fixture import (
+    HostProbeError,
+    HostProbeMissingResponseError,
+    HostProbeTransportError,
+)
 
 CASE = "GF-GENERAL-LIVE-021"
 WINDOW = 300
@@ -140,6 +178,21 @@ RESET_POLL_SECONDS = 10
 #: completed just before the poll leaves the probe unanswered for a while.
 ADVANCE_RETRY_SECONDS = 180
 ADVANCE_POLL_SECONDS = 10
+#: The product's chain from the finding to RESET_ALL SUCCEEDED, allowed for in
+#: the held step's read bound beyond the detection horizon (WINDOW plus the
+#: health summary's latency): live 165 s (plain EKS 2026-10-27 13:22:34 ->
+#: 13:25:19Z) and 202 s (HyperPod 12:05:57 -> 12:09:19Z).
+RESET_CHAIN_SECONDS = 300
+#: What the replay tool's HTTP 409 Conflict on ``POST /advance`` means
+#: (``tools/gpu_dcgm_field_replay.py`` ``Replay.advance`` / ``do_POST``).
+CONFLICT_MEANING = (
+    "HTTP 409 Conflict from the replay tool means the plan is not on a held step "
+    "(tools/gpu_dcgm_field_replay.py Replay.advance: the replay aborted, lapsed, "
+    "ended or already moved on), never that the node did not answer"
+)
+#: ``plan_release`` kinds that end the replay without the runner: nothing
+#: holds the fault and nothing serves the tail.
+ENDED_RELEASES = frozenset({"disarmed", "unarmed"})
 #: How long the product has to fail its post-reset validation and take the
 #: rung (live: reset done 05:16, rung 05:17), and how long the escalated
 #: record has to settle (live: reboot + validations + release, 05:17-05:25).
@@ -182,7 +235,7 @@ def _unsettled_reset(
             "fabric",
             baseline(),
             step(
-                int((WINDOW + 180) / max(1, survey.interval)) + 4,
+                reset_hold_reads(survey.interval, survey.health_summary),
                 put("fabric_manager_status", gpus, status),
                 hold=True,
             ),
@@ -227,11 +280,14 @@ def _unsettled_reset(
         poll_seconds=RESET_POLL_SECONDS,
     )
     advance = _advance_when_reachable(ctx, repl)
-    notes: list[str] = []
+    notes: list[str] = release_notes(advance)
     inconclusive: list[str] = []
     if recovery_failure:
-        graded, notes = _graded_escalation(ctx, repl, since, incidents)
+        if not advance["advanced"]:
+            raise VariantInconclusive(held_failure_release(advance))
+        graded, escalation = _graded_escalation(ctx, repl, since, incidents)
         stages.update(graded)
+        notes += escalation
     else:
         final = wait_gpu_incident(
             ctx,
@@ -266,19 +322,206 @@ def _unsettled_reset(
     )
 
 
+def reset_hold_reads(interval: int, health_summary: int) -> int:
+    """The read bound of the six reset variants' held fault.
+
+    The hold must outlast the detection (the 300 s window plus the health
+    summary's latency) and the product's chain up to RESET_ALL SUCCEEDED as
+    the reset-done wait observes it; ``held_reads`` doubles the reads a
+    collector makes over that horizon and refuses what the tool cannot bound.
+    Live 2026-10-27 the bound was ``(300 + 180) / interval + 4`` = 36 reads:
+    with the 3 baseline reads it lapses after 39 scrapes, 585 s at 15 s, and
+    plain EKS's reset-done came 569 s after arm with the collector scraping
+    through the quiesce (HyperPod's pauses with it: 27 reads in 589 s). A
+    lapsed hold passes the real reading through and the advance is refused
+    (HTTP 409) with that meaning.
+    """
+
+    return held_reads(interval, WINDOW + health_summary + RESET_CHAIN_SECONDS)
+
+
+def plan_release(plan: dict[str, Any], status: Any) -> dict[str, Any] | None:
+    """What the tool's ``/status`` says about an advance it refused.
+
+    ``None`` when the status does not explain a refusal -- the plan is still
+    on its held step (the probe exec failed, not the tool) or the status lacks
+    the tool's fields (an older probe) -- so the caller retries. Otherwise
+    ``kind`` names the release: ``aborted`` (the tool aborted on a real
+    upstream change or an absent target and passes the real readings through
+    -- the 2026-10-27 plain-EKS shape, Fabric Manager re-training after the
+    reset read 2 against the baseline 3), ``lapsed`` (armed, no abort, on no
+    step: the held step's read bound or the tool's deadline passed;
+    pass-through too), ``advanced`` (the plan is already past the held step: an
+    earlier advance landed and its receipt was lost), ``disarmed`` /
+    ``unarmed`` (the replay ended or never started: nothing holds the fault,
+    nothing serves the tail).
+    """
+
+    if not isinstance(status, dict) or "step" not in status or "armed" not in status:
+        return None
+    step = status.get("step")
+    if status.get("aborted"):
+        kind, reason = "aborted", f"the tool aborted: {status['aborted']}"
+    elif status.get("disarmed"):
+        kind, reason = "disarmed", "the replay is disarmed"
+    elif not status.get("armed"):
+        kind, reason = (
+            "unarmed",
+            "the replay is not armed (a restarted tool serves a fresh pass-through "
+            "replay)",
+        )
+    elif step is None:
+        kind, reason = (
+            "lapsed",
+            "the held step's read bound or the tool's deadline passed after "
+            f"{status.get('reads')} reads; the tool passes the real readings through",
+        )
+    else:
+        steps = plan.get("steps") or []
+        if (
+            not isinstance(step, int)
+            or not 0 <= step < len(steps)
+            or steps[step].get("until_advance")
+        ):
+            return None
+        kind, reason = (
+            "advanced",
+            f"the plan is already on step {step}, which is not held: an earlier "
+            "advance landed and its receipt was lost",
+        )
+    return {
+        "kind": kind,
+        "reason": reason,
+        "status": status,
+        "meaning": CONFLICT_MEANING,
+    }
+
+
+def release_notes(advance: dict[str, Any]) -> list[str]:
+    """The reader's note when the plan was released without the advance."""
+
+    release = advance.get("release")
+    if not release or advance.get("advanced"):
+        return []
+    note = (
+        "the held plan was released by the replay tool, not by the runner's "
+        f"advance: {release['reason']}; the tool refused the advance with HTTP 409 "
+        "Conflict (the replay is not on a held step) and passes the node's real "
+        "readings through, so the product's post-reset validation graded the real "
+        "fabric -- the trained state the plan's tail would have served"
+    )
+    if release["kind"] == "aborted":
+        note += (
+            " (plain-EKS shape 2026-10-27: the collector scrapes through the quiesce "
+            "and its first scrape after the exporter returns catches Fabric Manager "
+            "re-training, 3 -> 2, which a replay never masks)"
+        )
+    return [note]
+
+
+def held_failure_release(advance: dict[str, Any]) -> str:
+    """Why ``recovery_failure`` is INCONCLUSIVE when the tool released the hold."""
+
+    release = advance["release"]
+    return (
+        "the replay released the held FAILURE before the product's post-reset "
+        f"validation read it ({release['reason']}); the tool refused the advance "
+        "with HTTP 409 Conflict (the replay is not on a held step) and passes the "
+        "real fabric through, so the RESTART_NODE rung cannot be driven on this "
+        "node: its collector scrapes through the quiesce and the real post-reset "
+        "Fabric Manager transition (3 -> 2 -> 3) reaches the tool first, and a real "
+        "reading is never masked -- not a product error; the rung is observable "
+        "where the collector pauses with the quiesce (HyperPod, 2026-10-27 05:04Z)"
+    )
+
+
+def _unreachable(error: BaseException) -> bool:
+    """Whether the probe never ran: the transport, not a rejected host action."""
+
+    return isinstance(error, (HostProbeTransportError, HostProbeMissingResponseError))
+
+
+def _refusal(repl: DcgmReplay) -> tuple[dict[str, Any] | None, str | None]:
+    """Read the tool's status after a probe exit: ``(release, status_error)``."""
+
+    try:
+        answer = repl.status()
+    except HostProbeError as error:
+        return None, f"{type(error).__name__}: {error}"
+    status = answer.get("status") if isinstance(answer, dict) else None
+    return plan_release(repl.plan, status), None
+
+
+def _never_advanced(
+    attempts: list[dict[str, Any]],
+    elapsed: float,
+    error: BaseException,
+    status_failure: str | None,
+) -> str:
+    count = f"{len(attempts)} attempts over {int(elapsed)} s ({attempts[-1]['error']})"
+    if _unreachable(error):
+        seen = f"the node did not answer the probe in {count}"
+    else:
+        seen = (
+            f"the probe ran but the advance failed in {count} and the tool's status "
+            "explained no refusal"
+            + (f" (status read: {status_failure})" if status_failure else "")
+            + f"; {CONFLICT_MEANING}"
+        )
+    return (
+        f"the held plan could not be advanced after the reset: {seen}; until the "
+        "plan moves, the product's post-reset validation grades the held fabric "
+        "state (a RESTART_NODE rung for a FAILURE state)"
+    )
+
+
+def _released(
+    release: dict[str, Any], attempts: list[dict[str, Any]], seconds: int
+) -> dict[str, Any]:
+    """The advance's result for a refusal the tool explained; an ended tool
+    (disarmed / unarmed) is INCONCLUSIVE with the 409's meaning."""
+
+    kind = release["kind"]
+    if kind in ENDED_RELEASES:
+        raise VariantInconclusive(
+            "the held plan could not be advanced after the reset: the replay tool "
+            "refused the advance with HTTP 409 Conflict -- the replay is not on a "
+            f"held step: {release['reason']}; nothing holds the fault and nothing "
+            "serves the plan's tail, so the product's post-reset validation read "
+            "the node's real fabric; harness/node state, not a product error"
+        )
+    return {
+        "attempts": len(attempts),
+        "seconds": seconds,
+        "advanced": kind == "advanced",
+        "release": release,
+    }
+
+
 def _advance_when_reachable(ctx: VariantContext, repl: DcgmReplay) -> dict[str, Any]:
     """Leave the held step, retrying while the node cannot answer the probe.
 
     The reset completes inside the quiesce window; on a HyperPod node kubelet
     is still down until RESTORE_GPU_SERVICES, and the probe exec fails with a
-    ``HostProbeError`` for those seconds. The retry is bounded: a node that
-    never answers leaves the plan at the held fault, which the product's
-    post-reset validation then grades (a reboot rung for a FAILURE state), so
-    the variant is INCONCLUSIVE with that said rather than graded on it.
+    transport ``HostProbeError`` for those seconds: retried, bounded. A probe
+    that ran and exited 1 is another matter -- live 2026-10-27 (plain EKS) the
+    tool answered the loopback ``POST /advance`` with HTTP 409 Conflict for 13
+    attempts because it had aborted on the real post-reset fabric transition
+    (3 -> 2) and was passing the real readings through -- so the runner reads
+    the tool's ``/status`` and classifies the refusal (``plan_release``): an
+    abort or a lapsed hold is the plan's release (the product grades the real
+    fabric), a plan past the hold is an advance whose receipt was lost, an
+    ended tool is INCONCLUSIVE with the 409's meaning, a plan still held is
+    retried. A node that never answers leaves the plan at the held fault,
+    which the product's post-reset validation then grades (a reboot rung for
+    a FAILURE state), so the variant is INCONCLUSIVE with that said rather
+    than graded on it. Returns ``attempts``, ``seconds``, ``advanced`` and
+    ``release`` (``None`` for a plain advance).
     """
 
     started = ctx.clock()
     attempts: list[dict[str, Any]] = []
+    status_failure: str | None = None
     while True:
         now = ctx.clock()
         try:
@@ -290,15 +533,19 @@ def _advance_when_reachable(ctx: VariantContext, repl: DcgmReplay) -> dict[str, 
                     "error": f"{type(error).__name__}: {error}",
                 }
             )
-            ctx.evidence.write("plan-advance", {"attempts": attempts})
+            release = None
+            if not _unreachable(error):
+                release, status_failure = _refusal(repl)
             elapsed = (now - started).total_seconds()
+            if release is not None:
+                ctx.evidence.write(
+                    "plan-advance", {"attempts": attempts, "release": release}
+                )
+                return _released(release, attempts, int(elapsed))
+            ctx.evidence.write("plan-advance", {"attempts": attempts})
             if elapsed >= ADVANCE_RETRY_SECONDS:
                 raise VariantInconclusive(
-                    "the held plan could not be advanced after the reset: the node "
-                    f"did not answer the probe in {len(attempts)} attempts over "
-                    f"{int(elapsed)} s ({attempts[-1]['error']}); until the plan "
-                    "moves, the product's post-reset validation grades the held "
-                    "fabric state (a RESTART_NODE rung for a FAILURE state)"
+                    _never_advanced(attempts, elapsed, error, status_failure)
                 ) from error
             ctx.sleep(ADVANCE_POLL_SECONDS)
             continue
@@ -307,6 +554,8 @@ def _advance_when_reachable(ctx: VariantContext, repl: DcgmReplay) -> dict[str, 
         return {
             "attempts": len(attempts),
             "seconds": int((now - started).total_seconds()),
+            "advanced": True,
+            "release": None,
         }
 
 

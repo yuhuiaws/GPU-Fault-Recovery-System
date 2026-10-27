@@ -141,6 +141,24 @@ def test_held_reads_refuses_a_hold_the_tool_cannot_bound() -> None:
         replay.held_reads(5, 2700)
 
 
+def test_reset_hold_reads_covers_the_detection_horizon_and_the_chain() -> None:
+    """The six reset variants' held fault (S52): ``held_reads`` over the window,
+    the health summary's latency and the product's chain up to RESET_ALL --
+    the live 36-read bound ((300 + 180) / 15 + 4) lapsed after 585 s of
+    scrapes while plain EKS's reset-done came 569 s after arm."""
+
+    horizon = fab.WINDOW + 300 + fab.RESET_CHAIN_SECONDS
+    assert fab.RESET_CHAIN_SECONDS == 300 and horizon == 900
+    assert fab.reset_hold_reads(15, 300) == replay.held_reads(15, horizon) == 124
+    assert fab.reset_hold_reads(15, 300) > int((fab.WINDOW + 180) / 15) + 4 == 36
+    for interval, summary in ((15, 300), (10, 300), (15, 600), (30, 300)):
+        reads = fab.reset_hold_reads(interval, summary)
+        assert reads <= tool.MAX_READS_PER_STEP, (interval, summary, reads)
+        assert reads * interval > fab.WINDOW + summary + fab.RESET_CHAIN_SECONDS
+    with pytest.raises(VariantInconclusive, match="at most 200 per step"):
+        fab.reset_hold_reads(5, 300)
+
+
 # --------------------------------------------------------------------------- #
 # the three no-finding variants install plans the tool accepts
 # --------------------------------------------------------------------------- #
