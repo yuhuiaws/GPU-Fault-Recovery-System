@@ -3867,9 +3867,10 @@ served late; they keep their held plans and gain the reboot-aware close. 019
 `pending_supported` / `post_reset` held `row_remap_pending=1` into the same
 chain and advanced or closed it through the probe (`post_reset` after
 RESET_GPU SUCCEEDED, while kubelet is still down on HyperPod) -- the same
-exposure on both providers; S36 bounded them to the one minting scrape the
-same way (`pending_fault_reads`), gated on the journal or the records, judged
-on the settled record and closed after the chain.
+exposure on both providers; S36 bounded them the same way (`pending_fault_reads`,
+since S46 the node's edge-filter confirmation count of reads rather than one),
+gated on the journal or the records, judged on the settled record and closed
+after the chain.
 
 019 `pending_supported` and `post_reset` are now bounded and judged on the
 records (S36, 2026-10-26; both are X variants under `GPU_RESET` that have never
@@ -3894,11 +3895,46 @@ reset into RESTART_NODE. The eksb 2026-10-26 07:48Z replay journal (024
 within ~10 s of the mint. The product grades the first replayed scrape within
 ~4 s (`gpu_memory_policy.memory_decision`: the flag mints on one reading > 0 --
 no delta, confirmation or sustain -- and clears on the next accepted reading of
-0). So the flag is served for exactly the one scrape that mints it
-(`pending_fault_reads`: one at the 15-s collector, never a spare -- a spare
-that lands after the quiesce is the escalation, and a scrape the collector
-could not make is not a read the plan loses), the plan is never held, and the
-tool is back on the device's real reading before the collector stops. Both
+0). S36 therefore served the flag for exactly the one scrape that mints it --
+and live 2026-10-27 04:05-04:18Z (HyperPod, the hp lane's fault node,
+R13g, harness int/r13c-live23) that one read minted nothing: the replay journal
+shows read 5 serving `row_remap_pending=1` and reads 6-43 the device's own,
+no incident, no error record, the node untouched (FAIL "no row_remap_pending
+... finding reached an incident"). The ingest grades a *delivered* batch on one
+reading, but the batch has to leave the node first, and the node's collector
+delivers a changed `row_remap_pending` only once the flag has been a "breached"
+candidate on `GPU_FAULT_DCGM_EDGE_CONFIRMATION_SAMPLES` consecutive scrapes
+(`collectors/gpu/dcgm.py` `_candidate_keys` / `_should_deliver`
+`candidate-confirmed`; 3 on the live nodes, per the case's `gpu-survey.json`
+`collector_env`). The flag is a gauge -- not a counter (`_is_counter`:
+`*_total`, the `counter-increased` edge) and not a state gauge
+(`STATE_CHANGE_REASONS`: the last XID and the fabric state) -- so one read of
+it is no delivery edge at all and the batch is suppressed; S36's bound had been
+pinned against `GpuMetricsService.ingest` alone. 024 `wrong_scope_source`
+mints on one read only because the DBE counter in the same batch is a
+`counter-increased` edge (eksb 2026-10-26 07:48Z, read 4). So (S46, 2026-10-27)
+the flag is served for exactly the node's confirmation count of consecutive
+scrapes (`pending_fault_reads(confirmation)`: the last one is the delivery and
+the mint; fewer never reach the control plane, a spare is the escalation; one
+read where the survey shows `GPU_FAULT_DCGM_EDGE_FILTER_ENABLED` off, because
+then every batch is delivered), the plan is checked against the node's count
+before anything is deployed (`require_pending_plan`, a `RegionalFixtureError`),
+the plan is never held, and the tool is back on the device's real reading
+before the collector stops. The reads before the confirmation must not be
+delivered early either: the one delivery an idle node makes by itself is the
+health summary, which would mint the flag on the first flag read and leave the
+two behind it for the first scrape after RESTORE_GPU_SERVICES (the RESTART_NODE
+exposure). Summaries go out on the node's restart-stable phase
+(`collectors/scheduling.next_stable_phase` of cluster, node and the
+`gpu-metrics` channel), moved by at most `GPU_FAULT_COLLECTOR_CADENCE_JITTER_
+RATIO` (0.1, not set by this site) x 300 / 2 = 15 s and delivered on the first
+scrape at or after the moved phase, so the arm waits (`summary_clear_wait_
+seconds`, evidence `summary-phase-clearance`) until the pre-confirmation reads'
+window -- `(A + 3 x 15 s, A + 6 x 15 s]` for an arm at `A`, the tick phase
+unknown and one scrape of slack -- meets no phase's `[P - 25 s, P + 40 s]`;
+at most 109 s, most of the time nothing. A stray counter edge on the idle node
+during those two scrapes would still deliver early; the plan cannot rule that
+out and the records would show it as the escalation. Both
 variants deploy, arm, gate on the journal or -- when the quiesce has already
 taken the probe -- on the product's records (`wait_served_or_records`), wait
 for the incident and then for the record to END (`RESET_SETTLE_SECONDS` 600 s
@@ -3926,17 +3962,29 @@ records the node's boot id for the close. The same reading applies to 024
 fall after the exporter is gone and would be served to the post-reset scrape;
 that is left to its own lane. Tests:
 `tests/regional/test_general_live_gpu_memory_reset.py` (the installed plan driven
-through the field tool -- three pass-through reads, one read of the flag, then
-the exporter's own scrape byte for byte, `advance` refused; the records gate,
+through the field tool -- three pass-through reads, the flag on exactly the
+node's three confirmation scrapes, then the exporter's own scrape byte for byte,
+`advance` refused; one read where the edge filter is off; the plan guard's
+refusals; the summary-clear wait against the product's scheduler for every
+second of a cycle and the variant holding before its arm; the records gate,
 settle wait, close and no advance across a simulated kubelet gap; the
 RESTART_NODE successor record failing every stage but recovery although the
 incident ends RECOVERED; a finding still active; two resets or a validation
 before the reset; a chain still running at the settle bound; the product facts
-the one-read bound rests on -- the flag's mint and clear through
-`GpuMetricsService.ingest`, the quiesce service and container lists, the
-readiness barrier, `next_rung`, and the tool's server refusing a dead upstream
-without consuming a read) and `tests/regional/test_general_live_gpu_memory.py`
-(no 019 plan holds a step).
+the read bound rests on -- the flag's mint and clear of a *delivered* reading
+through `GpuMetricsService.ingest`, the quiesce service and container lists,
+the readiness barrier, `next_rung`, and the tool's server refusing a dead
+upstream without consuming a read),
+`tests/regional/test_general_live_pending_edge.py` (the harness's plan through
+the real field tool, the real `DcgmMetricsCollector` delivery filter and the
+real `GpuMetricsService.ingest`: the confirmation count of flag reads is
+delivered on the third and mints the RESET_GPU finding, the first real reading
+clears it; S36's one-read shape ships nothing but the baseline and never mints
+-- the live 2026-10-27 failure; a spare read rides the restarted collector's
+initial baseline to the post-reset VALIDATE_GPU with the finding still active;
+a health summary on a pre-confirmation read mints early, and the arm's
+clearance moves that window past the phase) and
+`tests/regional/test_general_live_gpu_memory.py` (no 019 plan holds a step).
 
 024 `independent_xid` FAILED live (2026-10-26 08:07Z, eks ip-10-0-43-5, R13g,
 harness live14) with two CORRECTABLE_MEMORY_DEGRADATION incidents for one held

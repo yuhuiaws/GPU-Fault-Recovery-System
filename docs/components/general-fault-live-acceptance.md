@@ -777,10 +777,33 @@ scrape——正是 reset 后 VALIDATE_GPU 判定的那一批（`adapters/gpu_val
 新鲜 GPU 指标，再看该 GPU 的活动 finding，pending 标志无宽限），随后 `escalation.next_rung` 把 reset
 后失败的校验升为 RESTART_NODE。eksb 2026-10-26 07:48Z（024 `wrong_scope_source`，held 计划）的
 journal：第 4 读端出故障对，15 s 后的下一次 scrape 已 "Connection refused"——exporter 在铸造后约
-10 s 内消失。产品在首次回放 scrape 后约 4 s 判定（`gpu_memory_policy.memory_decision`：标志一次
->0 读数即铸造，无增量/确认/持续要求；下一次被接受的 0 读数即清除）。因此标志只端给铸造它的那一次
-scrape（`pending_fault_reads`：15 s 采集器为 1，绝不多留一读——晚到的备读就是升级，采集器没能做的
-scrape 不是计划丢失的读），计划不再 hold，collector 停掉前工具已回到设备的真实读数。两变体部署、arm
+10 s 内消失。产品在首次**被投递的**回放 scrape 后约 4 s 判定（`gpu_memory_policy.memory_decision`：
+标志一次 >0 读数即铸造，无增量/确认/持续要求；下一次被接受的 0 读数即清除）。S36 据此只把标志端给
+铸造它的那一次 scrape（`pending_fault_reads` 为 1），计划不再 hold，collector 停掉前工具已回到设备的
+真实读数。
+
+但一读到不了控制面（S46，2026-10-27 现场 04:05-04:18Z，HyperPod hp 车道的故障节点，
+R13g，夹具 int/r13c-live23）：`pending_supported` FAIL "no row_remap_pending ... finding reached an
+incident"，节点未被触碰。回放 journal 第 5 读端出 `row_remap_pending=1`，第 6-43 读是设备自身读数，无
+incident、无 error 记录。批次先要离开节点：节点采集器只在标志连续 `GPU_FAULT_DCGM_EDGE_CONFIRMATION_
+SAMPLES` 次 scrape 都为 "breached" 候选后才投递（`collectors/gpu/dcgm.py` `_candidate_keys`：
+`row_remap_pending > 0` 为候选；`_should_deliver`：确认流达到阈值才有 `candidate-confirmed`；本站节点
+为 3，见该例 `gpu-survey.json` `collector_env`）。该标志是 gauge，既非计数器（`_is_counter`：`*_total`
+才有 `counter-increased` 边沿）也非状态 gauge（`STATE_CHANGE_REASONS`：最后一个 XID 与 fabric 状态），
+所以单读毫无投递边沿，批次被抑制；S36 的单读上界只钉在 `GpuMetricsService.ingest` 上，没有经过采集器。
+024 `wrong_scope_source` 一读能铸造，只因同批里错误 GPU 的 DBE 计数器 +1 本身就是 `counter-increased`
+边沿（eksb 2026-10-26 07:48Z 第 4 读）。因此标志改为端给**恰好节点确认样本数**的连续 scrape
+（`pending_fault_reads(confirmation)`：最后一读即投递与铸造；少一读到不了控制面，多一读就是升级；survey
+显示 `GPU_FAULT_DCGM_EDGE_FILTER_ENABLED` 关闭时为 1 读，因为那时每批都投递），部署前先按节点自身
+计数核对计划（`require_pending_plan`，不符即 `RegionalFixtureError`），计划仍不 hold，collector 停掉前
+工具已回到真实读数。确认前的读数也不能被提前投递：空闲节点自己唯一会做的投递是 health summary，它若落
+在第一读标志上就会提前铸造，把后两读留给 RESTORE_GPU_SERVICES 之后的第一次 scrape（即 RESTART_NODE
+暴露）。summary 按节点的重启稳定相位发出（`collectors/scheduling.next_stable_phase`，以 cluster、node 与
+`gpu-metrics` 通道散列），最多被 `GPU_FAULT_COLLECTOR_CADENCE_JITTER_RATIO`（0.1，本站未设）x 300 / 2
+= 15 s 抖动，并在移动后相位之后的首次 scrape 投递；因此 arm 先等（`summary_clear_wait_seconds`，证据
+`summary-phase-clearance`）到确认前读数的窗口——arm 时刻 `A` 起 `(A + 3 x 15 s, A + 6 x 15 s]`，tick 相位
+未知并留一次迟到 scrape——与任一相位的 `[P - 25 s, P + 40 s]` 不相交，最多等 109 s，多数时候无需等待。
+空闲节点在这两次 scrape 里若恰有零散计数器边沿仍会提前投递，计划无法排除，记录会把它显示为升级。两变体部署、arm
 后以 journal 或（探针已被 quiesce 带走时）产品记录为 gate（`wait_served_or_records`），等 incident、
 再等记录**结束**（health summary 外加 `RESET_SETTLE_SECONDS` 600 s；现场链 2 min 6 s，RESTART_NODE
 升级 12 min），之后才经重启感知的 close 关回放，从不 advance。判定全在记录上：`pending_supported`
@@ -795,12 +818,19 @@ RESET_ALL_GPUS_NVSWITCHES/RESTART_NODE/REPLACE_NODE，节点上无其他硬件�
 端满 containment 等待是因为行重映射失败不会自行清除，回放仍在出口前结束），每个 019 回放都记录
 节点 boot id 供 close 判重启。同一结论也适用于 024 `wrong_scope_source` 的三读窗口：第二、三读落在
 exporter 消失之后，会被端给 reset 后的 scrape，留给其所属车道处理。测试见
-`tests/regional/test_general_live_gpu_memory_reset.py`（装入计划经字段工具驱动：3 读透传、1 读标志、之后
-逐字节为 exporter 自身 scrape 且拒绝 advance；模拟 kubelet 失联下的记录 gate、settle 等待、close 与
-不 advance；RESTART_NODE 后继记录在 incident 最终 RECOVERED 时仍每个阶段判错；finding 仍活动；两次
-reset 或校验早于 reset；记录在 settle 上限仍未结束；单读界所依据的产品事实——`GpuMetricsService.
-ingest` 的铸造与清除、quiesce 服务/容器清单、readiness barrier、`next_rung`、工具服务端对失效上游
-不消耗读）与 `tests/regional/test_general_live_gpu_memory.py`（019 无任何 hold 步骤）。
+`tests/regional/test_general_live_gpu_memory_reset.py`（装入计划经字段工具驱动：3 读透传、恰好节点
+3 个确认样本的标志读、之后逐字节为 exporter 自身 scrape 且拒绝 advance；边沿过滤关闭时为 1 读；计划
+守卫的各种拒绝；对产品调度器逐秒验证 summary 避让等待，以及变体 arm 前的等待；模拟 kubelet 失联下的
+记录 gate、settle 等待、close 与不 advance；RESTART_NODE 后继记录在 incident 最终 RECOVERED 时仍每个
+阶段判错；finding 仍活动；两次 reset 或校验早于 reset；记录在 settle 上限仍未结束；读数上界所依据的
+产品事实——`GpuMetricsService.ingest` 对已投递读数的铸造与清除、quiesce 服务/容器清单、readiness
+barrier、`next_rung`、工具服务端对失效上游不消耗读）、
+`tests/regional/test_general_live_pending_edge.py`（夹具计划经真实字段工具、真实 `DcgmMetricsCollector`
+边沿过滤与真实 `GpuMetricsService.ingest`：确认样本数的标志读在第三读投递并铸造 RESET_GPU finding、
+首个真实读数清除之；S36 的单读形状只投递 initial-baseline、从未铸造——即 2026-10-27 现场；多一读会随
+重启后采集器的 initial-baseline 端给 reset 后的 VALIDATE_GPU，finding 仍活动；落在确认前读数上的
+health summary 会提前铸造，而 arm 避让把该窗口移到相位之后）与
+`tests/regional/test_general_live_gpu_memory.py`（019 无任何 hold 步骤）。
 
 ### GF-GENERAL-LIVE-020
 
@@ -1041,8 +1071,9 @@ quiesce，所以它们的采集器不会在保持计划下停掉、不存在被�
 感知的 close；019
 `pending_supported`/`post_reset` 原先把 `row_remap_pending=1` 保持进同一条链并经探针 advance/close
 （`post_reset` 在 RESET_GPU SUCCEEDED 后、HyperPod 上 kubelet 仍停着时），两种 provider 上都有同样的
-暴露，S36 已同样改为只服务铸出的那一次 scrape（`pending_fault_reads`）、journal 或记录 gate、按结束后的
-record 判定、链结束后再 close。
+暴露，S36 已同样改为有界计划、journal 或记录 gate、按结束后的 record 判定、链结束后再 close；其单读
+上界在 2026-10-27 现场证明到不了采集器的边沿过滤，S46 改为节点确认样本数的连续读（`pending_fault_reads`，
+见 019 节）——024 本例一读即可，只因同批 DBE 计数器自身就是投递边沿。
 
 `independent_xid` 2026-10-26 08:07Z（eks ip-10-0-43-5，R13g）FAIL "2 CORRECTABLE_MEMORY_DEGRADATION
 incidents (expected one)"：两个复合 incident 的 batch 分别为 07:54:39.12Z（第一次回放读，WARNING）

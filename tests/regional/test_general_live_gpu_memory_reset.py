@@ -1,7 +1,8 @@
-"""GF-GENERAL-LIVE-019 ``pending_supported`` / ``post_reset``: the flag for one
-scrape, the chain judged on the records, and a runner that never has to reach
-the node while the product acts on it (the HyperPod quiesce stops kubelet and
-the probe Pod with it)."""
+"""GF-GENERAL-LIVE-019 ``pending_supported`` / ``post_reset``: the flag for
+exactly the node's edge-filter confirmation count of scrapes, armed clear of
+the health-summary phase, the chain judged on the records, and a runner that
+never has to reach the node while the product acts on it (the HyperPod quiesce
+stops kubelet and the probe Pod with it)."""
 
 from __future__ import annotations
 
@@ -36,8 +37,9 @@ GPU = "GPU-11111111-1111-4111-8111-111111111111"
 
 
 # --------------------------------------------------------------------------- #
-# pending_supported / post_reset: the flag for one scrape, the chain's records,
-# and a runner that never has to reach the node while the product acts on it
+# pending_supported / post_reset: the flag for the confirmation count of
+# scrapes, the chain's records, and a runner that never has to reach the node
+# while the product acts on it
 # --------------------------------------------------------------------------- #
 #: The live eksb 2026-10-26 07:47:57-07:50:03Z record of a pending incident's
 #: service-window reset (024 wrong_scope_source's repair GPU): every step
@@ -219,8 +221,19 @@ def test_pending_supported_proves_the_executed_chain_on_the_records(
     out = mem.pending_supported(ctx)
     assert out["verdict"] == "PASS", out["errors"]
     assert set(out["stages"]) == {"chain", "hardware", "recovery"}, out["stages"]
-    assert out["fault_reads"] == 1 and out["oracle_gate"] == "journal", out
+    assert out["fault_reads"] == 3 and out["oracle_gate"] == "journal", out
+    assert out["confirmation_samples"] == 3, "the fake node confirms on the default"
     assert out["incident_ids"] == ["inc-pend"]
+    shape = json.loads((ctx.case_dir / "pending-plan-shape.json").read_text())
+    assert shape == {
+        "confirmation_samples": 3,
+        "edge_filter_enabled": True,
+        "fault_reads": 3,
+        "passthrough_reads": 3,
+    }, shape
+    clearance = json.loads((ctx.case_dir / "summary-phase-clearance.json").read_text())
+    assert clearance["wait_seconds"] == out["summary_clearance_wait_seconds"]
+    assert clearance["fault_window"] and clearance["summary_windows"], clearance
     calls = [call[0] for call in ctx.probes[f"dcgm@{ctx.settings.node}"].calls]
     assert "advance" not in calls, "nothing is held, nothing is advanced"
     assert calls.count("close-run") == 1
@@ -237,12 +250,13 @@ def test_pending_supported_proves_the_executed_chain_on_the_records(
     )
 
 
-def test_pending_plan_serves_the_flag_once_then_the_real_reading_for_good(
+def test_pending_plan_serves_the_flag_for_the_confirmation_then_the_real_reading(
     tmp_path: Path,
 ) -> None:
     """The installed plan, run through the field tool over a real-shaped
-    scrape: three pass-through reads, ONE read of the flag, then the device's
-    own reading byte for byte -- what the first scrape after
+    scrape: three pass-through reads, the flag on exactly the node's three
+    confirmation scrapes (the third is the delivery the product mints on),
+    then the device's own reading byte for byte -- what the first scrape after
     RESTORE_GPU_SERVICES serves to the post-reset VALIDATE_GPU, however many
     scrapes the quiesce window swallowed in between."""
 
@@ -256,7 +270,7 @@ def test_pending_plan_serves_the_flag_once_then_the_real_reading_for_good(
     assert document["steps"] == [
         {"reads": 3, "ops": []},
         {
-            "reads": 1,
+            "reads": 3,
             "ops": [
                 {"op": "set", "field": "row_remap_pending", "gpus": [GPU], "value": 1}
             ],
@@ -267,7 +281,7 @@ def test_pending_plan_serves_the_flag_once_then_the_real_reading_for_good(
     body = _exposition()
     served = []
     verbatim = []
-    for _ in range(8):
+    for _ in range(9):
         output, receipt = replay.render(body)
         replay.reads += 1
         (sample,) = parse_dcgm_samples(output.decode())
@@ -278,17 +292,182 @@ def test_pending_plan_serves_the_flag_once_then_the_real_reading_for_good(
         (0.0, 0),
         (0.0, 0),
         (1.0, 1),
-        (0.0, None),
+        (1.0, 1),
+        (1.0, 1),
         (0.0, None),
         (0.0, None),
         (0.0, None),
     ], served
-    assert verbatim[4:] == [True] * 4, (
+    assert verbatim[6:] == [True] * 3, (
         "after the plan the scrape is the exporter's own, byte for byte"
     )
     assert replay.active() is None and not replay.disarmed
     with pytest.raises(ValueError, match="not on a step"):
         replay.advance()
+
+
+def test_pending_plan_is_one_read_where_the_edge_filter_is_off(tmp_path: Path) -> None:
+    """A collector without the edge filter delivers every batch, so the first
+    read mints and any further read would be the escalation: one read, and
+    nothing before the confirmation to keep clear of a summary."""
+
+    off = survey()
+    off["collector_env"][mem.EDGE_FILTER_KEY] = "false"
+    probe = dcgm_probe(off, audit=PENDING_RECORDS)
+    ctx = _pending_ctx(
+        tmp_path, "pending_supported", activity=_reset_stages(), probe=probe
+    )
+    out = mem.pending_supported(ctx)
+    assert out["verdict"] == "PASS", out["errors"]
+    assert out["fault_reads"] == 1 and out["summary_clearance_wait_seconds"] == 0
+    assert _installed_plan(probe)["steps"][1]["reads"] == 1
+
+
+def test_pending_variant_waits_for_a_summary_clear_window_before_arming(
+    tmp_path: Path,
+) -> None:
+    """A runner whose arm would put the reads before the confirmation on the
+    node's health-summary phase holds first (``summary-phase-clearance``),
+    then arms; the plan itself is unchanged."""
+
+    import itertools
+    from datetime import datetime, timedelta, timezone
+
+    from gpu_fault.collectors.scheduling import next_stable_phase
+
+    ctx = _pending_ctx(tmp_path, "post_reset", activity=_reset_stages())
+    phase = next_stable_phase(
+        datetime(2026, 10, 27, 4, 0, tzinfo=timezone.utc),
+        cluster_id=ctx.settings.regional.cluster_id,
+        node_id=ctx.settings.node,
+        channel="gpu-metrics",
+        interval_seconds=300,
+    )
+    # The clock moves 1 s per reading; whatever reading the arm lands on, the
+    # first fault read (45 s later) meets the phase's window [P-25, P+40].
+    counter = itertools.count()
+    ctx.clock = lambda: phase - timedelta(seconds=50) + timedelta(seconds=next(counter))
+    out = mem.post_reset(ctx)
+    assert out["verdict"] == "PASS", out["errors"]
+    wait = out["summary_clearance_wait_seconds"]
+    assert 0 < wait <= 300, out
+    clearance = json.loads((ctx.case_dir / "summary-phase-clearance.json").read_text())
+    start = datetime.fromisoformat(clearance["fault_window"][0])
+    assert start >= phase + timedelta(seconds=40), clearance
+    calls = [call[0] for call in ctx.probes[f"dcgm@{ctx.settings.node}"].calls]
+    assert calls.index("arm") > calls.index("repoint-collector")
+    assert any("clear of the node's health-summary phase" in n for n in out["notes"]), (
+        out["notes"]
+    )
+
+
+def test_require_pending_plan_refuses_another_count_a_hold_or_another_op() -> None:
+    """The guard before the deploy: the flag step serves exactly the node's
+    count (one read on a node confirming on three was the live 2026-10-27
+    failure; a spare is the RESTART_NODE exposure), sets the flag and nothing
+    else, and never holds."""
+
+    from scripts.e2e.regional.general_live_gpu_replay import baseline, plan, put, step
+
+    def document(reads: int, **extra: Any) -> dict[str, Any]:
+        flag = step(reads, put("row_remap_pending", [GPU], 1))
+        flag.update(extra)
+        return plan("memory", baseline(), flag)
+
+    mem.require_pending_plan(document(3), gpu=GPU, reads=3, variant="post_reset")
+    with pytest.raises(ValueError, match="serves 1 read.*3-sample confirmation"):
+        mem.require_pending_plan(document(1), gpu=GPU, reads=3, variant="post_reset")
+    with pytest.raises(ValueError, match="serves 4 read"):
+        mem.require_pending_plan(document(4), gpu=GPU, reads=3, variant="post_reset")
+    with pytest.raises(ValueError, match="never holds"):
+        mem.require_pending_plan(
+            document(3, until_advance=True), gpu=GPU, reads=3, variant="post_reset"
+        )
+    other = plan("memory", baseline(), step(3, put("row_remap_failure", [GPU], 1)))
+    with pytest.raises(ValueError, match="must set row_remap_pending=1"):
+        mem.require_pending_plan(other, gpu=GPU, reads=3, variant="post_reset")
+    held = plan("memory", step(3, put("row_remap_pending", [GPU], 1)))
+    with pytest.raises(ValueError, match="pass-through reads then one flag step"):
+        mem.require_pending_plan(held, gpu=GPU, reads=3, variant="post_reset")
+
+
+def test_summary_clear_wait_keeps_the_pre_confirmation_reads_off_every_phase() -> None:
+    """Against the product's own scheduler: for every second of a summary
+    cycle the arm time it returns keeps the reads before the confirmation
+    (``(A + 45 s, A + 90 s]`` for three pass-through and three fault reads at
+    15 s) off every phase's delivery window (``[P - 15 - 10, P + 15 + 15 + 10]``:
+    the jitter, one scrape, the skew), waits at most that window plus the
+    plan's own (65 + 45 s: a window whose last second meets the first second of
+    the phase's), and most of the time not at all."""
+
+    from datetime import datetime, timedelta, timezone
+
+    from gpu_fault.collectors.scheduling import next_stable_phase
+
+    cluster, node = "gpu-eks-cluster", "ip-10-0-43-5.us-west-2.compute.internal"
+    origin = datetime(2026, 10, 27, 4, 7, tzinfo=timezone.utc)
+    waits = []
+    for second in range(300):
+        now = origin + timedelta(seconds=second)
+        answer = mem.summary_clear_wait_seconds(
+            now,
+            cluster_id=cluster,
+            node_id=node,
+            interval=15,
+            health_summary=300,
+            passthrough_reads=3,
+            fault_reads=3,
+        )
+        wait = answer["wait_seconds"]
+        waits.append(wait)
+        assert 0 <= wait <= 110, (second, answer)
+        arm_at = datetime.fromisoformat(answer["arm_at"])
+        assert arm_at == now + timedelta(seconds=wait)
+        start, end = (datetime.fromisoformat(v) for v in answer["fault_window"])
+        assert (start, end) == (
+            arm_at + timedelta(seconds=45),
+            arm_at + timedelta(seconds=90),
+        )
+        probe = start - timedelta(seconds=400)
+        for _ in range(4):
+            phase = next_stable_phase(
+                probe,
+                cluster_id=cluster,
+                node_id=node,
+                channel="gpu-metrics",
+                interval_seconds=300,
+            )
+            lower, upper = phase - timedelta(seconds=25), phase + timedelta(seconds=40)
+            assert upper <= start or lower >= end, (second, phase, answer)
+            probe = phase
+    assert waits.count(0.0) >= 190, "most arm times need no wait"
+    assert max(waits) == 109, (
+        "the delivery window plus the plan's own at most (a window that only "
+        "touches the phase's is clear)"
+    )
+
+    single = mem.summary_clear_wait_seconds(
+        origin,
+        cluster_id=cluster,
+        node_id=node,
+        interval=15,
+        health_summary=300,
+        passthrough_reads=3,
+        fault_reads=1,
+    )
+    assert single["wait_seconds"] == 0 and single["fault_window"] is None, (
+        "one read has nothing before its confirmation"
+    )
+    with pytest.raises(ValueError, match="no summary-clear window"):
+        mem.summary_clear_wait_seconds(
+            origin,
+            cluster_id=cluster,
+            node_id=node,
+            interval=100,
+            health_summary=300,
+            passthrough_reads=3,
+            fault_reads=3,
+        )
 
 
 def test_post_reset_grades_the_records_through_the_kubelet_gap(tmp_path: Path) -> None:
@@ -438,12 +617,14 @@ def test_reset_chain_still_running_at_the_settle_bound_fails_the_chain(
     assert calls.count("close-run") == 1, "the replay is still closed"
 
 
-def test_pending_fault_reads_rest_on_the_products_own_cadence() -> None:
-    """One scrape at the 15-s collector, and why: the pending flag mints on
-    one reading and clears on the next real one; the quiesce stops the
-    collector; a scrape the collector could not make is not a read the plan
-    consumes; RESET_GPU is the validation's readiness barrier; and a validation
-    that fails after a reset escalates to RESTART_NODE."""
+def test_pending_fault_reads_are_the_nodes_confirmation_count() -> None:
+    """Exactly the node's ``GPU_FAULT_DCGM_EDGE_CONFIRMATION_SAMPLES`` scrapes,
+    and why: the control plane mints the flag on one *delivered* reading and
+    clears it on the next real one, but the collector delivers the flag only
+    at its confirmation streak (``test_general_live_pending_edge``); the
+    quiesce stops the collector; a scrape the collector could not make is not
+    a read the plan consumes; RESET_GPU is the validation's readiness barrier;
+    and a validation that fails after a reset escalates to RESTART_NODE."""
 
     import io
     import threading
@@ -464,17 +645,30 @@ def test_pending_fault_reads_rest_on_the_products_own_cadence() -> None:
         DEFAULT_QUIESCE_SERVICES,
     )
     from gpu_fault.orchestration.escalation import next_rung
+    from scripts.e2e.regional.general_live_gpu_replay import GpuSurvey
     from tools import gpu_dcgm_field_replay as tool
 
-    assert mem.QUIESCE_LEAD_SECONDS == 10
-    assert mem.pending_fault_reads(15) == 1, "the live collectors"
-    assert mem.pending_fault_reads(10) == 1
-    assert mem.pending_fault_reads(30) == 1
-    assert mem.pending_fault_reads(5) == 2, "a second read only where it lands early"
-    assert mem.pending_fault_reads(1) == 10
+    assert mem.pending_fault_reads(3) == 3, "the live nodes confirm on three"
+    assert mem.pending_fault_reads(1) == 1
+    assert mem.pending_fault_reads(5) == 5
+    assert mem.pending_fault_reads(0) == 1
+    assert mem.pending_fault_reads(3, edge_filter_enabled=False) == 1, (
+        "every batch delivered: the first read mints, a second is the escalation"
+    )
+    assert mem.edge_filter_enabled(GpuSurvey(survey())) is True, "the default"
+    for token, expected in (
+        ("false", False),
+        ("0", False),
+        ("TRUE", True),
+        ("?", True),
+    ):
+        raw = survey()
+        raw["collector_env"][mem.EDGE_FILTER_KEY] = token
+        assert mem.edge_filter_enabled(GpuSurvey(raw)) is expected, token
 
-    # The product mints the WARNING RESET_GPU finding on one reading > 0 and
-    # closes it on the next reading of 0: no delta, confirmation or sustain.
+    # The product mints the WARNING RESET_GPU finding on one delivered reading
+    # > 0 and closes it on the next reading of 0: no delta, confirmation or
+    # sustain of its own -- the confirmation is the collector's.
     service = GpuMetricsService()
     start = datetime(2026, 10, 26, 7, 47, tzinfo=timezone.utc)
 
@@ -522,14 +716,15 @@ def test_pending_fault_reads_rest_on_the_products_own_cadence() -> None:
     )
 
     # A scrape the tool could not serve (the exporter gone) is journaled as an
-    # error and consumes no read: the fault read waits for the next scrape.
+    # error and consumes no read: a fault read left over waits for the next
+    # scrape -- the restarted collector's, after RESTORE_GPU_SERVICES.
     replay = tool.Replay(
         tool.validate_plan(
             {
                 "profile": "memory",
                 "steps": [
                     {
-                        "reads": 1,
+                        "reads": 3,
                         "ops": [
                             {
                                 "op": "set",

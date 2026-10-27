@@ -28,17 +28,23 @@ reads the product's own grading (``gpu_metrics`` -> ``gpu_memory_policy``):
   and never ran it (live 2026-10-26, compile-time BLOCKED) fails the chain;
 * ``pending_supported`` / ``post_reset`` are the authorized service-window
   single-GPU reset (``row_remap_pending`` on a modern GPU). The flag is served
-  for exactly the one scrape that mints it (``pending_fault_reads``) and the
-  tool is back on the device's real reading before the chain's quiesce stops
-  the collector, so the post-reset VALIDATE_GPU grades the real device whether
-  or not the runner can still reach the node; both are judged on the product's
-  records once the record has ended. ``pending_supported`` proves the policy
-  and the executed chain (QUIESCE_GPU_SERVICES, VERIFY_NO_GPU_CLIENTS,
-  RESET_GPU, RESTORE_GPU_SERVICES, VALIDATE_GPU; the incident RECOVERED; no
-  NVSwitch reset, reboot or RESTART_NODE escalation), ``post_reset`` the
-  post-action state on top (``post_reset_errors``: one RESET_GPU, VALIDATE_GPU
-  SUCCEEDED after it on the fresh reading, the pending finding cleared, no
-  follow-up workflow). They need ``--approve GPU_RESET``.
+  for exactly the node's edge-filter confirmation count of consecutive scrapes
+  (``pending_fault_reads``: the last one is the batch the collector delivers
+  and the product mints on; fewer never reach the control plane, live
+  2026-10-27) and the tool is back on the device's real reading before the
+  chain's quiesce stops the collector, so the post-reset VALIDATE_GPU grades
+  the real device whether or not the runner can still reach the node. The
+  reads before the confirmation are armed clear of the node's health-summary
+  phase (``summary_clear_wait_seconds``), the one delivery that could mint the
+  flag early and leave a read for the first scrape after RESTORE_GPU_SERVICES.
+  Both are judged on the product's records once the record has ended.
+  ``pending_supported`` proves the policy and the executed chain
+  (QUIESCE_GPU_SERVICES, VERIFY_NO_GPU_CLIENTS, RESET_GPU,
+  RESTORE_GPU_SERVICES, VALIDATE_GPU; the incident RECOVERED; no NVSwitch
+  reset, reboot or RESTART_NODE escalation), ``post_reset`` the post-action
+  state on top (``post_reset_errors``: one RESET_GPU, VALIDATE_GPU SUCCEEDED
+  after it on the fresh reading, the pending finding cleared, no follow-up
+  workflow). They need ``--approve GPU_RESET``.
 
 No 019 plan holds a step (``until_advance``): every fault is bounded by its
 own read count, sized from the wait that needs it (``fault_reads``), and the
@@ -53,8 +59,11 @@ NOT_RUN with their reason.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from typing import Any
 
+from gpu_fault.collectors.scheduling import next_stable_phase
+from gpu_fault.env import env_bool
 from scripts.e2e.regional.general_live_fixture import (
     VariantContext,
     VariantInconclusive,
@@ -68,6 +77,7 @@ from scripts.e2e.regional.general_live_gpu_replay import (
     arm_and_confirm,
     baseline,
     gpu_spec,
+    leading_passthrough_reads,
     no_hardware,
     plan,
     put,
@@ -422,62 +432,268 @@ RESET_ESCALATION = frozenset(
 #: 07:50:03Z); its RESTART_NODE escalation, which must be read to be failed,
 #: took until 15:06Z after a 14:54Z mint (HyperPod).
 RESET_SETTLE_SECONDS = 600
-#: Live 2026-10-26, both clusters: the product graded the first replayed
-#: scrape within ~4 s (``gpu_memory_policy.memory_decision``: the pending flag
-#: mints on one reading > 0 -- no delta, confirmation or sustain) and the
-#: chain's QUIESCE_GPU_SERVICES followed within ~20 s of the mint. The quiesce
-#: stops the metrics collector itself and the exporter container on both
-#: providers (``node_agent.common.DEFAULT_QUIESCE_SERVICES`` /
+#: Live 2026-10-26, both clusters: the product graded the first *delivered*
+#: replayed scrape within ~4 s (``gpu_memory_policy.memory_decision``: the
+#: pending flag mints on one reading > 0 -- no delta, confirmation or sustain)
+#: and the chain's QUIESCE_GPU_SERVICES followed within ~20 s of the mint. The
+#: quiesce stops the metrics collector itself and the exporter container on
+#: both providers (``node_agent.common.DEFAULT_QUIESCE_SERVICES`` /
 #: ``DEFAULT_QUIESCE_CONTAINERS``), and on eksb (07:48Z, 024
 #: ``wrong_scope_source``) the scrape 15 s after the first replayed one
 #: already found the exporter gone ("Connection refused" in the replay
-#: journal). The window a second fault read could land in is therefore
-#: shorter than this, at every collector interval the product runs.
-QUIESCE_LEAD_SECONDS = 10
+#: journal). No fault read may be left for a scrape after that: the field tool
+#: counts only the scrapes it could serve (``gpu_dcgm_field_replay.
+#: make_server``: a failed upstream fetch is journaled as an error and
+#: ``reads`` does not advance), so a fault read the quiesce finds unconsumed
+#: is served to the first scrape after RESTORE_GPU_SERVICES -- the batch the
+#: post-reset VALIDATE_GPU grades (``adapters/gpu_validation``: fresh GPU
+#: metrics after the RESET_GPU readiness barrier, then the GPU's active
+#: findings, no grace for the pending flag) -- and ``escalation.next_rung``
+#: turns a validation failed after a reset into RESTART_NODE (live 2026-10-26
+#: 14:54-15:06Z, HyperPod, a held plan).
+#:
+#: Live 2026-10-27 04:05-04:18Z (HyperPod, the hp lane's fault node, R13g):
+#: the flag served for ONE scrape (the bound S36 drew from the ingest alone)
+#: minted nothing -- oracle read 5 served ``row_remap_pending=1``, reads 6-43
+#: were the device's own, no incident, the node untouched. The batch has to
+#: be *delivered* first, and the node's collector delivers a changed
+#: ``row_remap_pending`` only once the flag has been read on
+#: ``GPU_FAULT_DCGM_EDGE_CONFIRMATION_SAMPLES`` consecutive scrapes
+#: (``collectors/gpu/dcgm.py`` ``_candidate_keys``: ``row_remap_pending > 0``
+#: is a "breached" candidate; ``_should_deliver``: ``candidate-confirmed`` at
+#: the confirmation streak, 3 on the live nodes). The flag is a gauge, not a
+#: counter (``_is_counter``: ``*_total``) and not a state gauge
+#: (``STATE_CHANGE_REASONS``: the last XID and the fabric state), so one read
+#: of it is no delivery edge at all and the batch is suppressed. 024
+#: ``wrong_scope_source`` mints on one read only because the DBE counter in
+#: the same batch is a ``counter-increased`` edge (eksb 07:48Z, read 4).
+EDGE_FILTER_KEY = "GPU_FAULT_DCGM_EDGE_FILTER_ENABLED"
+#: The health summary moves each phase by at most ``ratio x interval / 2``
+#: (``collectors/cadence.CadenceJitter``, ``GPU_FAULT_COLLECTOR_CADENCE_JITTER_
+#: RATIO`` default 0.1, not set by this site's deploy) and goes out on the
+#: first scrape at or after the moved phase (``collectors/gpu/dcgm.py``
+#: ``_should_deliver`` "health-summary", ``jittered_next_phase``).
+SUMMARY_JITTER_RATIO = 0.1
+#: Runner-to-node clock skew plus the arm's probe round trip, both ways.
+ARM_SKEW_SECONDS = 10
 
 
-def pending_fault_reads(interval: int) -> int:
-    """The scrapes a replayed ``row_remap_pending`` is served to: one at the
-    15-s collector, the one that mints the WARNING RESET_GPU finding.
+def edge_filter_enabled(survey: GpuSurvey) -> bool:
+    """Whether the node's collector runs the DCGM edge filter (its default).
 
-    The field tool counts only the scrapes it could serve
-    (``gpu_dcgm_field_replay.make_server``: a failed upstream fetch is
-    journaled as an error and ``reads`` does not advance), so a fault read the
-    quiesce finds unconsumed is served to the first scrape after
-    RESTORE_GPU_SERVICES -- the very batch the post-reset VALIDATE_GPU grades
-    (``adapters/gpu_validation``: fresh GPU metrics after the RESET_GPU
-    readiness barrier, then the GPU's active findings, no grace for the
-    pending flag). That read fails the validation on the real device, and
-    ``escalation.next_rung`` turns a validation failed after a reset into
-    RESTART_NODE (live 2026-10-26 14:54-15:06Z, HyperPod, a held plan). The
-    step therefore carries only the reads that land before the quiesce can
-    stop the collector (``QUIESCE_LEAD_SECONDS`` after the first replayed
-    scrape, at ``interval`` s apart), never fewer than the one that mints and
-    never a spare: a spare that is served late is the escalation, and a scrape
-    the collector could not make is not a read the plan loses.
+    Read as the product reads it (``env_bool``); a token the product would
+    refuse at start-up cannot belong to a running collector and reads as the
+    default.
     """
 
-    return 1 + max(0, (QUIESCE_LEAD_SECONDS - 1) // max(1, int(interval)))
+    environment = {
+        str(key): str(value)
+        for key, value in (survey.raw.get("collector_env") or {}).items()
+    }
+    try:
+        return env_bool(EDGE_FILTER_KEY, True, environ=environment)
+    except ValueError:
+        return True
+
+
+def pending_fault_reads(confirmation: int, *, edge_filter_enabled: bool = True) -> int:
+    """The scrapes a replayed ``row_remap_pending`` is served to: exactly the
+    node's edge-filter confirmation count, consecutively.
+
+    The ``confirmation``-th consecutive read is the one the collector delivers
+    (``candidate-confirmed``) and the product mints on; the plan has no read
+    after it, so the tool is back on the device's real reading before the
+    chain's quiesce stops the collector. Fewer reads never reach the control
+    plane (live 2026-10-27, one read); a spare read is the escalation (a fault
+    read the quiesce finds unconsumed is served to the post-reset VALIDATE_GPU's
+    batch, RESTART_NODE). With the edge filter disabled every batch is
+    delivered and the first read mints: one read.
+    """
+
+    if not edge_filter_enabled:
+        return 1
+    return max(1, int(confirmation))
+
+
+def require_pending_plan(
+    document: dict[str, Any], *, gpu: str, reads: int, variant: str
+) -> None:
+    """The plan serves the flag on exactly ``reads`` consecutive scrapes after
+    pass-through reads, nothing else, and holds nothing (``until_advance``).
+
+    ``reads`` is the node's own count (``pending_fault_reads``): a plan built
+    for another count -- one read on a node confirming on three (live
+    2026-10-27), or a spare read -- is refused before anything is deployed.
+    """
+
+    steps = list(document.get("steps") or [])
+    if any(item.get("until_advance") for item in steps):
+        raise ValueError(f"{CASE} {variant}: a pending plan never holds a step")
+    if len(steps) != 2 or steps[0].get("ops") or int(steps[0].get("reads") or 0) < 1:
+        raise ValueError(
+            f"{CASE} {variant}: expected pass-through reads then one flag step, "
+            f"got {len(steps)} step(s)"
+        )
+    expected = {"op": "set", "field": PENDING, "gpus": [gpu], "value": 1}
+    if steps[1].get("ops") != [expected]:
+        raise ValueError(
+            f"{CASE} {variant}: the flag step must set {PENDING}=1 on {gpu} and "
+            f"nothing else, got {steps[1].get('ops')}"
+        )
+    if int(steps[1].get("reads") or 0) != reads:
+        raise ValueError(
+            f"{CASE} {variant}: the flag step serves {steps[1].get('reads')} read(s); "
+            f"the node's edge filter delivers the {reads}-sample confirmation and "
+            "nothing earlier, and a read past it is served to the post-reset "
+            f"VALIDATE_GPU (RESTART_NODE); the step must serve exactly {reads}"
+        )
+
+
+def summary_clear_wait_seconds(
+    now: datetime,
+    *,
+    cluster_id: str,
+    node_id: str,
+    interval: int,
+    health_summary: int,
+    passthrough_reads: int,
+    fault_reads: int,
+    jitter_ratio: float = SUMMARY_JITTER_RATIO,
+) -> dict[str, Any]:
+    """How long to wait before arming so no health summary can deliver a
+    fault read before the confirmation, and the windows that say why.
+
+    A fault read delivered early -- the summary is the one delivery an idle
+    node makes on its own -- mints the flag with the later fault reads still
+    unconsumed when the quiesce stops the collector, and those are served to
+    the post-reset VALIDATE_GPU (RESTART_NODE). The node's summaries go out on
+    its restart-stable phase (``collectors/scheduling.next_stable_phase`` of
+    cluster, node and the ``gpu-metrics`` channel), moved by at most
+    ``jitter_ratio x health_summary / 2`` and delivered on the first scrape at
+    or after the moved phase. Armed at ``A``, fault read ``k`` is scraped in
+    ``(A + (p + k - 1) x i, A + (p + k) x i]`` for ``p`` pass-through reads at
+    ``i`` s (the tick phase is unknown; one more interval covers a late scrape),
+    so the reads before the confirmation lie in ``(A + p x i, A + (p + N) x i]``
+    plus the skew. Returns the first ``A >= now`` whose window meets no summary
+    window, as ``{"wait_seconds", "arm_at", "fault_window", "summary_windows"}``.
+    A plan with one fault read has nothing before its confirmation: no wait.
+    """
+
+    reads_before = max(0, int(fault_reads) - 1)
+    answer: dict[str, Any] = {
+        "wait_seconds": 0.0,
+        "arm_at": now.isoformat(),
+        "fault_window": None,
+        "summary_windows": [],
+    }
+    if reads_before == 0:
+        return answer
+    tick = max(1, int(interval))
+    # The reads before the confirmation: from the first tick after the
+    # pass-through reads to one tick past the last of them (a late scrape).
+    lead = tick * max(0, int(passthrough_reads))
+    span = tick * (reads_before + 1)
+    jitter = float(health_summary) / 2 * float(jitter_ratio)
+    before = jitter + ARM_SKEW_SECONDS
+    after = jitter + tick + ARM_SKEW_SECONDS
+    if span + before + after >= int(health_summary):
+        raise ValueError(
+            f"no summary-clear window: {reads_before + 1} fault reads at {tick} s "
+            f"span {span} s and every {health_summary} s summary excludes "
+            f"{before + after:.0f} s"
+        )
+    arm_at = now
+    for _ in range(4):
+        start = arm_at + timedelta(seconds=lead)
+        end = start + timedelta(seconds=span)
+        phase = next_stable_phase(
+            start - timedelta(seconds=after),
+            cluster_id=cluster_id,
+            node_id=node_id,
+            channel="gpu-metrics",
+            interval_seconds=int(health_summary),
+        )
+        window = (phase - timedelta(seconds=before), phase + timedelta(seconds=after))
+        answer["summary_windows"].append([window[0].isoformat(), window[1].isoformat()])
+        if window[1] <= start or window[0] >= end:
+            answer["wait_seconds"] = (arm_at - now).total_seconds()
+            answer["arm_at"] = arm_at.isoformat()
+            answer["fault_window"] = [start.isoformat(), end.isoformat()]
+            return answer
+        arm_at = window[1] - timedelta(seconds=lead)
+    raise ValueError("no summary-clear window found within four summary phases")
 
 
 def _pending_incidents(doc: dict[str, Any], gpu: str) -> list[dict[str, Any]]:
     return metric_incidents(doc, PENDING, gpu=gpu)
 
 
+def _pending_plan(ctx: VariantContext, survey: GpuSurvey, gpu: str) -> dict[str, Any]:
+    """The checked plan: the flag on the node's confirmation count of reads."""
+
+    from scripts.e2e.regional.regional_commands import RegionalFixtureError
+
+    filtered = edge_filter_enabled(survey)
+    reads = pending_fault_reads(survey.confirmation, edge_filter_enabled=filtered)
+    document = plan("memory", baseline(), step(reads, put(PENDING, [gpu], 1)))
+    try:
+        require_pending_plan(document, gpu=gpu, reads=reads, variant=ctx.spec.variant)
+    except ValueError as exc:
+        raise RegionalFixtureError(f"pending replay plan rejected: {exc}") from exc
+    ctx.evidence.write(
+        "pending-plan-shape",
+        {
+            "confirmation_samples": survey.confirmation,
+            "edge_filter_enabled": filtered,
+            "fault_reads": reads,
+            "passthrough_reads": leading_passthrough_reads(document),
+        },
+    )
+    return document
+
+
+def _arm_clear_of_summary(
+    ctx: VariantContext, replay: DcgmReplay, survey: GpuSurvey, reads: int
+) -> dict[str, Any]:
+    """Arm once the reads before the confirmation cannot meet a health summary."""
+
+    from scripts.e2e.regional.regional_commands import RegionalFixtureError
+
+    try:
+        clearance = summary_clear_wait_seconds(
+            ctx.clock(),
+            cluster_id=ctx.settings.regional.cluster_id,
+            node_id=ctx.settings.node,
+            interval=replay.interval,
+            health_summary=survey.health_summary,
+            passthrough_reads=leading_passthrough_reads(replay.plan),
+            fault_reads=reads,
+        )
+    except ValueError as exc:
+        raise RegionalFixtureError(f"pending replay cannot be armed: {exc}") from exc
+    ctx.evidence.write("summary-phase-clearance", clearance)
+    if clearance["wait_seconds"] > 0:
+        ctx.hold(clearance["wait_seconds"], name="summary-phase-clearance")
+    replay.arm()
+    return clearance
+
+
 def _pending_reset(ctx: VariantContext, *, verify_recovery: bool) -> dict[str, Any]:
-    """Serve the pending flag once, let the product's chain run, judge the records.
+    """Serve the pending flag for the confirmation, let the chain run, judge
+    the records.
 
     The plan is bounded (``pending_fault_reads``) and never held: after the
-    minting scrape the tool serves the device's real reading (``row_remap_
+    confirming scrape the tool serves the device's real reading (``row_remap_
     pending=0``) by itself, so the chain's post-reset VALIDATE_GPU grades the
     real device and the runner never has to reach the node while the product
-    acts on it. On HyperPod the quiesce stops kubelet and with it the probe
-    Pod, so the oracle gate falls back to the product's records when the
-    journal cannot be read (``wait_served_or_records``; the journal is read at
-    the close) and the close itself waits for the node to return
-    (``DcgmReplay.close``). The record is waited for until it has ended, then
-    judged on executed steps and the state it settled in; the replay is closed
-    after that, never inside the chain.
+    acts on it. The arm waits for a window no health summary can reach
+    (``_arm_clear_of_summary``). On HyperPod the quiesce stops kubelet and
+    with it the probe Pod, so the oracle gate falls back to the product's
+    records when the journal cannot be read (``wait_served_or_records``; the
+    journal is read at the close) and the close itself waits for the node to
+    return (``DcgmReplay.close``). The record is waited for until it has
+    ended, then judged on executed steps and the state it settled in; the
+    replay is closed after that, never inside the chain.
     """
 
     survey = run_gpu_survey(ctx)
@@ -487,11 +703,12 @@ def _pending_reset(ctx: VariantContext, *, verify_recovery: bool) -> dict[str, A
             "CAPABILITY_ABSENT",
             f"{gpu} is {survey.model(gpu)!r}; row_remap_pending reset needs a modern GPU",
         )
-    reads = pending_fault_reads(survey.interval)
+    document = _pending_plan(ctx, survey, gpu)
+    reads = int(document["steps"][1]["reads"])
     since = utc_now()
-    replay = _replay(ctx, survey, step(reads, put(PENDING, [gpu], 1)))
+    replay = DcgmReplay(ctx, document, _hold_seconds(ctx), node_boot_id=survey.boot_id)
     replay.deploy()
-    replay.arm()
+    clearance = _arm_clear_of_summary(ctx, replay, survey, reads)
     gate = wait_served_or_records(
         replay,
         [f"{gpu}/{PENDING}"],
@@ -552,16 +769,23 @@ def _pending_reset(ctx: VariantContext, *, verify_recovery: bool) -> dict[str, A
         stages,
         notes=[
             "single-GPU service-window reset; no NVSwitch reset, no reboot",
-            f"{PENDING}=1 was served for {reads} scrape{'s' if reads != 1 else ''} "
-            "(the one that mints) and the plan returned to the device's real "
-            "reading by itself before the chain's quiesce stopped the collector, "
-            "so the post-reset VALIDATE_GPU graded the real device",
+            f"{PENDING}=1 was served for {reads} consecutive scrape"
+            f"{'s' if reads != 1 else ''} (the node's edge-filter confirmation "
+            "count: the last one is the batch the collector delivers and the "
+            "product mints on) and the plan returned to the device's real reading "
+            "by itself before the chain's quiesce stopped the collector, so the "
+            "post-reset VALIDATE_GPU graded the real device",
+            f"armed {clearance['wait_seconds']:.0f} s after the repoint settled, "
+            "clear of the node's health-summary phase, so no summary could "
+            "deliver a read before the confirmation",
             "judged on the product's records once the record had ended; the "
             "replay was closed after the chain, never inside it",
         ],
         extra={
             "gpu_uuid": gpu,
             "fault_reads": reads,
+            "confirmation_samples": survey.confirmation,
+            "summary_clearance_wait_seconds": clearance["wait_seconds"],
             "oracle_gate": gate,
             "incident_ids": [str(item.get("incident_id")) for item in incidents],
         },
@@ -866,8 +1090,9 @@ VARIANTS = [
     gpu_spec(
         CASE,
         "pending_supported",
-        "set row_remap_pending=1 on a modern GPU for the one scrape that mints it; "
-        "the device's real reading returns by itself before the chain's quiesce",
+        "set row_remap_pending=1 on a modern GPU for exactly the node's edge-filter "
+        "confirmation scrapes (the last one mints it); the device's real reading "
+        "returns by itself before the chain's quiesce",
         "authorized single-GPU service-window RESET_GPU chain executed "
         "(QUIESCE_GPU_SERVICES, VERIFY_NO_GPU_CLIENTS, RESET_GPU, RESTORE_GPU_SERVICES, "
         "VALIDATE_GPU) and the incident RECOVERED, judged on the records; no NVSwitch "
@@ -903,8 +1128,9 @@ VARIANTS = [
     gpu_spec(
         CASE,
         "post_reset",
-        "set row_remap_pending=1 on a modern GPU for the one scrape that mints it; "
-        "the post-reset VALIDATE_GPU grades the device's own clean reading",
+        "set row_remap_pending=1 on a modern GPU for exactly the node's edge-filter "
+        "confirmation scrapes (the last one mints it); the post-reset VALIDATE_GPU "
+        "grades the device's own clean reading",
         "after the single-GPU reset VALIDATE_GPU passes on the fresh clean reading, "
         "the pending finding clears, exactly one RESET_GPU, the incident RECOVERED; "
         "no blind reboot loop (no follow-up workflow, no RESTART_NODE)",
