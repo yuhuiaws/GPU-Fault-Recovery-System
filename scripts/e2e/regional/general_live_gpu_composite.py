@@ -22,7 +22,12 @@ product's real correlation and de-duplication, not just a rule name:
   exactly the one scrape that mints both findings (``MINTING_READS``) and the
   tool is back on the real readings before the chain's quiesce stops the
   collector; the records are judged once the record has ended and the replay
-  is closed after the chain, never inside it;
+  is closed after the chain, never inside it. Whether that chain can end
+  RECOVERED is a product property -- its post-reset VALIDATE_GPU must re-judge
+  the pending flag on a batch newer than the finding instead of failing at
+  once on the state the minting batch left -- decided before anything is
+  deployed (``general_live_gpu_generation``): a product that judges at once
+  ends the variant INCONCLUSIVE with the mechanism cited, the node untouched;
 * ``independent_xid`` -- a trusted kernel XID on the GPU of a weak composite
   keeps its own catalog decision and incident; the composite never covers it
   (``general_live_kernel_xid``: XID 92 EXCESSIVE_SBE_INTERRUPTS, catalog
@@ -52,6 +57,9 @@ from collections.abc import Iterable, Sequence
 from typing import Any
 
 from scripts.e2e.regional.general_live_fixture import VariantContext, VariantNotRun
+from scripts.e2e.regional.general_live_gpu_generation import (
+    require_rejudging_product,
+)
 from scripts.e2e.regional.general_live_gpu_replay import (
     ComponentPair,
     DcgmReplay,
@@ -144,7 +152,21 @@ REPAIR_COMPANIONS = ("row_remap_pending", "retired_pages_pending")
 #: RESTART_NODE (live 2026-10-26 14:54-15:06Z, HyperPod, R13g: the quiesce had
 #: stopped kubelet and with it the probe that would have closed the replay),
 #: so the plan is bounded (``MINTING_READS``) and never relies on the runner.
+#: The bounded plan is not enough on its own: live 2026-10-27 14:33-14:41Z
+#: (HyperPod, R13g, the one-read plan, journal reads 5-9 the device's own) the
+#: repair incident still ended QUARANTINED, the post-reset VALIDATE_GPU having
+#: judged the pending finding the minting batch left -- ``adapters/
+#: gpu_validation._validate_active_findings`` grants it no grace and no wait
+#: for a newer batch (the b202 / gap 26 wait covers the thermal, correctable-
+#: memory and power families only; the R13h candidate reads the same here) --
+#: this time without a reboot (boot id cc70db9b unchanged since the 14:11Z
+#: boot; Ready 14:37:40Z is kubelet back after the quiesce; record settled
+#: 14:38:43Z). The product generation therefore decides before the deploy
+#: (``require_rejudging_product``): a product that judges the flag at once is
+#: INCONCLUSIVE with the mechanism cited, the node untouched.
 SERVICE_WINDOW_RESET = frozenset({"QUIESCE_GPU_SERVICES", "RESET_GPU"})
+#: What the repair GPU's chain is called in the generation verdict.
+REPAIR_CHAIN = "the repair GPU's service-window RESET_GPU chain"
 KERNEL_SOURCE_REPLAY = "KERNEL_SOURCE_REPLAY"
 #: The scrapes the fault pair is served to: exactly the one that mints, never
 #: a spare. The product grades both readings on the batch that carries them
@@ -568,6 +590,11 @@ def wrong_scope_source(ctx: VariantContext) -> dict[str, Any]:
         UNCORRECTABLE_PRIMARY, REPAIR_COMPANIONS, avoid=[error_gpu]
     )
     repair_gpu = repair.gpu
+    # The product decides whether this chain can end RECOVERED at all: its
+    # post-reset VALIDATE_GPU must re-judge the pending flag on a batch newer
+    # than the finding. A product that judges at once (R13g, the R13h
+    # candidate) is INCONCLUSIVE here, before anything reaches the node.
+    generation = require_rejudging_product(ctx, repair.companion, chain=REPAIR_CHAIN)
     reads = MINTING_READS
     since = utc_now()
     # Bounded, never held: after the minting scrape the tool serves the real
@@ -621,6 +648,15 @@ def wrong_scope_source(ctx: VariantContext) -> dict[str, Any]:
             timeout_seconds=survey.health_summary + 600,
             name="repair-settled",
         )
+    error_incidents = _any_incident(final, error_gpu)
+    # The record the verdict rests on -- both incidents' workflows with their
+    # step executions and timestamps -- so a chain that ended QUARANTINED can
+    # be read step by step afterwards (2026-10-27 the evidence held only the
+    # incident ids and the poll timelines; which step failed, and why there
+    # was no reboot, could not be told).
+    ctx.evidence.write(
+        "repair-record", record_of(final, [*repair_incidents, *error_incidents])
+    )
     state = state_now(ctx, since, names=[UNCORRECTABLE_PRIMARY, repair.companion])
     stages = {
         "no_cross_gpu_composite": []
@@ -641,9 +677,14 @@ def wrong_scope_source(ctx: VariantContext) -> dict[str, Any]:
     # The plan ran out by itself at the minting scrape; the close restores the
     # collector after the chain, never inside it (its restart would fight the
     # quiesce), and on a node the chain quiesced or rebooted waits for it.
+    # The error GPU's incident is released by the validated restore; the
+    # repair GPU's only when its chain has ended with the node still isolated
+    # (QUARANTINED / ESCALATED -- the stage error above stands), so the node is
+    # left clean either way. A chain still running is not restored over.
+    isolated = isolated_repair(final, repair_incidents)
     repl.close()
     ctx.cleanup.discard("dcgm-replay")
-    stages["recovery"] = _validated_restore(ctx, _any_incident(final, error_gpu))
+    stages["recovery"] = _validated_restore(ctx, [*error_incidents, *isolated])
     metrics = ", ".join(repair.exporter_metrics) or "exporter name not surveyed"
     return result(
         stages,
@@ -658,8 +699,10 @@ def wrong_scope_source(ctx: VariantContext) -> dict[str, Any]:
             "judged on the product's records once the repair record had ended; the "
             "replay was closed after the chain, never inside it",
             "the repair GPU's own incident may run the authorized single-GPU "
-            "service-window reset chain and settles RECOVERED by itself; only the "
-            "error GPU's incident is released by the validated restore",
+            "service-window reset chain and settles RECOVERED by itself; the "
+            "validated restore releases the error GPU's incident, and the repair "
+            "GPU's only when its chain ended with the node still isolated",
+            f"product generation decided before the deploy: {generation.describe()}",
         ],
         extra={
             "error_gpu": error_gpu,
@@ -672,8 +715,53 @@ def wrong_scope_source(ctx: VariantContext) -> dict[str, Any]:
             "repair_incidents": [
                 str(item.get("incident_id")) for item in repair_incidents
             ],
+            "repair_incidents_restored": [
+                str(item.get("incident_id")) for item in isolated
+            ],
+            "product_generation": generation.record(),
         },
     )
+
+
+def record_of(
+    activity: dict[str, Any], incidents: Sequence[dict[str, Any]]
+) -> dict[str, Any]:
+    """``incidents`` as the settled read shows them, with every workflow of
+    theirs (step executions, timestamps, errors) -- the evidence a failed
+    chain is read from afterwards."""
+
+    ids = {str(item.get("incident_id")) for item in incidents}
+    return {
+        "incidents": [
+            item
+            for item in activity.get("incidents") or []
+            if str(item.get("incident_id")) in ids
+        ],
+        "workflows": [
+            item
+            for item in activity.get("workflows") or []
+            if str(item.get("incident_id")) in ids
+        ],
+    }
+
+
+def isolated_repair(
+    activity: dict[str, Any], repair_incidents: Sequence[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """The repair incidents whose chain has ended (every workflow terminal)
+    with the incident not RECOVERED -- QUARANTINED or ESCALATED, the node
+    still isolated -- as the settled read shows them."""
+
+    current = {
+        str(item.get("incident_id")): item for item in activity.get("incidents") or []
+    }
+    return [
+        current.get(str(incident.get("incident_id")), incident)
+        for incident in repair_incidents
+        if settled(activity, [incident])
+        and str(current.get(str(incident.get("incident_id")), incident).get("state"))
+        != "RECOVERED"
+    ]
 
 
 def independent_xid(ctx: VariantContext) -> dict[str, Any]:
@@ -850,7 +938,11 @@ VARIANTS = [
         "findings on the records, judged once the repair record has ended); the "
         "error GPU's isolation plans no hardware operation; the repair GPU's reset "
         "chain validates the real post-reset device and settles RECOVERED by "
-        "itself (no NVSwitch reset, no RESTART_NODE escalation, no reboot)",
+        "itself (no NVSwitch reset, no RESTART_NODE escalation, no reboot). Run "
+        "only against a product whose post-reset VALIDATE_GPU re-judges the pending "
+        "flag on a batch newer than the finding (decided read-only before the "
+        "deploy); a product that judges the flag at once is INCONCLUSIVE, the node "
+        "untouched",
         wrong_scope_source,
         risk="H",
         flags="X",

@@ -4540,6 +4540,64 @@ since S46 the node's edge-filter confirmation count of reads rather than one),
 gated on the journal or the records, judged on the settled record and closed
 after the chain.
 
+024 `wrong_scope_source` FAILED a third time live (2026-10-27 14:33-14:41Z, the
+HyperPod lane's node, R13g 37db33f254a1, harness int/r13c-live28, the one-read
+plan): "repair_settled: the row_remap_pending incident ... is QUARANTINED, not
+RECOVERED by its own chain". The journal shows read 4 serving the pair
+(replay-served accepted 14:36:20Z, detection 14:36:26Z) and reads 5-9 the
+exporter's own scrape byte for byte with no upstream error; the repair-settled
+polls 14:36:32-14:38:17Z found the record still running, 14:38:43Z found it
+ended with the incident QUARANTINED; the close restored the collector at
+14:39:06Z with the drop-in and the audit file still present, and the validated
+restore released both incidents (node Ready, schedulable, no annotations).
+There was NO reboot this time: the preflight (14:33:02Z), the survey (14:34Z)
+and the post-restore Node object all carry boot id cc70db9b (the 14:11Z boot
+of an earlier case), and Ready 14:37:40Z is kubelet coming back after the
+quiesce had stopped it -- which is also why the `/run` objects survived. The
+bounded plan is therefore not enough by itself: the post-reset VALIDATE_GPU
+judged the pending finding the minting batch left.
+`adapters/gpu_validation._validate_active_findings` grants a WARNING-only
+finding its grace for the thermal, correctable-memory and power families
+only, and b202's past-the-grace wait for a GPU-metrics batch newer than the
+finding (gap 26, "the verdict follows the data") hangs off that same grace;
+`row_remap_pending` / `retired_pages_pending` are in none of the name sets,
+`warning_grace` stays `None` and the step fails at once with
+`active_gpu_health_findings`. The R13h candidate
+(`int/r13c-staging-r13h-cand`) answers the same for both flags (probe run
+against its `src/gpu_fault`: thermal and `ecc_sbe_volatile_total` WAIT past
+the grace with `awaiting_newer_gpu_metrics`, the pending flags fail at once).
+Whether the variant can PASS is thus a product property, and S54 decides it as
+a product generation before the deploy (`general_live_gpu_generation`, the
+rule S47 set for the 014 freeze path): `PENDING_FLAG_VERDICT_PROBE` runs the
+deployed `GpuValidationAdapter._validate_active_findings` read-only in an API
+Pod (the finding and `latest` come from the script; nothing reads or writes
+the store) for a WARNING pending-flag finding 30 s and 10 min after the
+workflow's creation, and the answer is the evidence `product-generation.json`.
+Only a product that keeps WAITING past the grace (`rejudges`) deploys the
+replay and runs the full oracle (reset, real reading, VALIDATE_GPU,
+RECOVERED); a product that judges at once (R13g, the R13h candidate) is
+INCONCLUSIVE after the survey and before anything is installed, "expected on
+this product generation: ..." with the mechanism and the generation cited, the
+node untouched; a probe the product's code shape defeats refuses the same way
+("could not be decided") -- no reset on a guess. 019 `pending_supported` /
+`post_reset` depend on the same property and carry the same gate
+(`require_rejudging_product`); the other 024 variants plan no reset and have no
+such dependence. On a re-judging product a chain that still ends QUARANTINED
+is the FAIL it was, but the validated restore then also releases the repair
+GPU's incident (only once its chain has ended with the node still isolated; a
+chain still running is not restored over), so the node is left clean either
+way, and both incidents' full record -- workflows, step executions,
+timestamps -- is written to `repair-record.json`: the 2026-10-27 evidence held
+only the incident ids and the poll timelines, so which step failed and why the
+ladder did not reboot remain open questions for the product records. Tests:
+`tests/regional/test_general_live_gpu_generation.py` (the probe against the
+real adapter: both pending flags judged at once, the thermal family graced;
+the classifier and its texts; the R13g / R13h-shaped answers -> INCONCLUSIVE
+before the deploy with the probe having run the survey only; a re-judging
+product -> PASS with the record kept; a QUARANTINED chain -> FAIL with both
+incidents restored; the 019 gate; the gate declared exactly where `GPU_RESET`
+is).
+
 019 `pending_supported` and `post_reset` are now bounded and judged on the
 records (S36, 2026-10-26; both are X variants under `GPU_RESET` that have never
 run live). Their plan held `row_remap_pending=1` for 120 reads

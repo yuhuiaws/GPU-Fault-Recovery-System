@@ -69,6 +69,9 @@ from scripts.e2e.regional.general_live_fixture import (
     VariantInconclusive,
     VariantNotRun,
 )
+from scripts.e2e.regional.general_live_gpu_generation import (
+    require_rejudging_product,
+)
 from scripts.e2e.regional.general_live_gpu_replay import (
     DcgmReplay,
     GpuSurvey,
@@ -703,6 +706,13 @@ def _pending_reset(ctx: VariantContext, *, verify_recovery: bool) -> dict[str, A
             "CAPABILITY_ABSENT",
             f"{gpu} is {survey.model(gpu)!r}; row_remap_pending reset needs a modern GPU",
         )
+    # The same product property 024 ``wrong_scope_source`` depends on: the
+    # chain's post-reset VALIDATE_GPU must re-judge the flag on a batch newer
+    # than the finding; a product that judges it at once (R13g, the R13h
+    # candidate) is INCONCLUSIVE before anything reaches the node.
+    generation = require_rejudging_product(
+        ctx, PENDING, chain="the single-GPU service-window RESET_GPU chain"
+    )
     document = _pending_plan(ctx, survey, gpu)
     reads = int(document["steps"][1]["reads"])
     since = utc_now()
@@ -780,6 +790,7 @@ def _pending_reset(ctx: VariantContext, *, verify_recovery: bool) -> dict[str, A
             "deliver a read before the confirmation",
             "judged on the product's records once the record had ended; the "
             "replay was closed after the chain, never inside it",
+            f"product generation decided before the deploy: {generation.describe()}",
         ],
         extra={
             "gpu_uuid": gpu,
@@ -788,6 +799,7 @@ def _pending_reset(ctx: VariantContext, *, verify_recovery: bool) -> dict[str, A
             "summary_clearance_wait_seconds": clearance["wait_seconds"],
             "oracle_gate": gate,
             "incident_ids": [str(item.get("incident_id")) for item in incidents],
+            "product_generation": generation.record(),
         },
     )
 

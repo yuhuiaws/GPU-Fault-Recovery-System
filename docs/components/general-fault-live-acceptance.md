@@ -1223,6 +1223,38 @@ quiesce，所以它们的采集器不会在保持计划下停掉、不存在被�
 上界在 2026-10-27 现场证明到不了采集器的边沿过滤，S46 改为节点确认样本数的连续读（`pending_fault_reads`，
 见 019 节）——024 本例一读即可，只因同批 DBE 计数器自身就是投递边沿。
 
+`wrong_scope_source` 2026-10-27 14:33-14:41Z（HyperPod hp 车道节点，R13g 37db33f254a1，夹具
+int/r13c-live28，一读计划）第三次 FAIL "repair_settled: the row_remap_pending incident ... is
+QUARANTINED, not RECOVERED by its own chain"。journal：第 4 读端出这一对（replay-served 14:36:20Z
+接受，detection 14:36:26Z），第 5-9 读逐字节是 exporter 自身的 scrape、无上游错误；repair-settled 轮询
+14:36:32-14:38:17Z 五次未结束、14:38:43Z 记录结束且 incident 为 QUARANTINED；close 14:39:06Z 恢复采集器，
+drop-in 与 audit 文件仍在；validated restore 释放了两个 incident，节点 Ready/可调度、无注解。本次**没有
+重启**：preflight（14:33:02Z）、survey（14:34Z）与 restore 后的 Node 对象 boot id 同为 cc70db9b（来自
+14:11Z 的上一次启动），Ready 14:37:40Z 是 quiesce 停掉的 kubelet 被 RESTORE_GPU_SERVICES 拉回，/run
+下的回放对象因此得以保留。有界计划本身不够：reset 后的 VALIDATE_GPU 判的是铸造批次留下的 pending
+finding——`adapters/gpu_validation._validate_active_findings` 只给 thermal/可纠正内存/功耗三族 WARNING
+finding 宽限，b202（gap 26，"verdict follows data"）的"等待比 finding 更新的 GPU metrics 批次"也只接在
+这一宽限之后，`row_remap_pending`/`retired_pages_pending` 不在任一名单里，`warning_grace` 为 None，步骤
+立刻以 `active_gpu_health_findings` 失败；R13h 候选（int/r13c-staging-r13h-cand）的同一函数对这两个
+标志答案相同（探针实测：thermal/ecc_sbe 过宽限后 WAITING `awaiting_newer_gpu_metrics`，pending 标志仍
+立刻失败）。该变体能否 PASS 因此是产品属性而非夹具问题，S54 把它作为**产品代际**在部署前判定
+（`general_live_gpu_generation`，沿用 S47 对 014 freeze 的规则）：`PENDING_FLAG_VERDICT_PROBE` 在 API
+Pod 内只读运行已部署的 `GpuValidationAdapter._validate_active_findings`（finding 与 latest 都由脚本自备，
+不碰 store），分别在工作流创建后 30 s 与 10 min 问一个 WARNING pending finding 的裁决；答案写入证据
+`product-generation.json`。过宽限仍 WAITING（`rejudges`）的产品才部署回放、跑完整 oracle（reset →
+真实读数 → VALIDATE_GPU → RECOVERED）；立刻失败的产品（R13g、R13h 候选）在 survey 之后、部署之前即
+INCONCLUSIVE "expected on this product generation: ..."，写明机制与代际，节点未被触碰；探针读不出
+答案同样拒跑（"could not be decided"），绝不凭猜测 reset。019 `pending_supported`/`post_reset` 依赖同一
+属性，同样加门（`require_rejudging_product`）；024 其余变体不计划 reset，无此依赖。在会重判的产品上，
+链若仍以 QUARANTINED 结束则 FAIL 照记，但 validated restore 这时也释放修复 GPU 的 incident（仅限其链
+已结束且节点仍被隔离时；链仍在跑时不覆盖），节点两种结局都干净；两个 incident 的完整记录（工作流、
+步骤执行与时间戳）写入 `repair-record.json`——本次证据只有 incident id 与轮询时间线，哪一步失败、为何
+没有 RESTART_NODE 都无从查起，是待产品记录核对的开放问题。测试见
+`tests/regional/test_general_live_gpu_generation.py`（探针对真实适配器：两个 pending 标志立刻失败、
+thermal 族有宽限；分类器与文案；R13g/R13h 形状的记录 → 部署前 INCONCLUSIVE 且探针只跑过 survey；
+会重判的产品 → PASS 并留下 repair-record；QUARANTINED 链 → FAIL 且两个 incident 都被 restore；
+019 两变体同样门禁；只有带 `GPU_RESET` 的变体声明该门）。
+
 `independent_xid` 2026-10-26 08:07Z（eks ip-10-0-43-5，R13g）FAIL "2 CORRECTABLE_MEMORY_DEGRADATION
 incidents (expected one)"：两个复合 incident 的 batch 分别为 07:54:39.12Z（第一次回放读，WARNING）
 与 07:55:09.24Z（第三次连续突破），都在本次运行窗口内且都早于内核 XID 注入（07:55:57Z），回放
