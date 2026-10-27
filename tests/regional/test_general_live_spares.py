@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -11,13 +12,21 @@ from typing import Any
 import pytest
 
 from scripts.e2e.regional import general_live_spares as sp
-from scripts.e2e.regional.general_live_fixture import VariantInconclusive
+from scripts.e2e.regional.general_live_collectors import SILENCE_THRESHOLDS
+from scripts.e2e.regional.general_live_fixture import VariantInconclusive, pause_bound
 from scripts.e2e.regional.general_live_registry import (
     APPROVALS,
     build_registry,
     coverage_rows,
 )
-from tests.regional._general_live_fakes import FakeRegional, make_context, make_settings
+from scripts.e2e.regional.probes import general_live_node_pause as pausep
+from scripts.e2e.regional.probes import general_live_node_probe as nodep
+from tests.regional._general_live_fakes import (
+    FakeProbe,
+    FakeRegional,
+    make_context,
+    make_settings,
+)
 
 SPECS = {spec.variant: spec for spec in sp.VARIANTS}
 #: The spare candidate (the lane's --node-b) and the lane's own target node.
@@ -774,3 +783,120 @@ def test_stale_metrics_fails_when_product_rebooted(
     result = SPECS["stale_metrics"].execute(_ctx(SPECS["stale_metrics"], tmp_path))
     assert result["verdict"] == "FAIL"
     assert any("RESTART_NODE" in item for item in result["errors"]), result["errors"]
+
+
+# --------------------------------------------------------------------------- #
+# stale_metrics: the pause the real session ships to the node probe
+# --------------------------------------------------------------------------- #
+METRICS_UNIT = "gpu-fault-metrics-collector.service"
+#: ``error ProbeError 6420bbc8692c83af`` -- the digest both clusters reported
+#: live 2026-10-27 (HyperPod 14:47Z, plain EKS 14:51Z), and nothing else.
+LIVE_REFUSAL_DIGEST = "6420bbc8692c83af"
+
+
+def _real_session(tmp_path: Path, **pause: Any) -> tuple[sp.SpareSession, FakeProbe]:
+    """A real ``SpareSession`` whose node probe on the spare is a scripted fake."""
+
+    spec = SPECS["stale_metrics"]
+    probe = FakeProbe(
+        {"unit-pause": {"unit": METRICS_UNIT, "stopped": True, "deadman": "d", **pause}}
+    )
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=FakeRegional(),
+        probes={f"node@{NODE}": probe},
+        settings=make_settings(spec, node=TARGET, peer=NODE),
+    )
+    return sp.SpareSession(ctx), probe
+
+
+def test_pause_metrics_ships_a_pause_the_node_probe_accepts_not_the_spec_budget(
+    tmp_path: Path,
+) -> None:
+    """Live 2026-10-27 on both clusters: ``unit-pause --seconds 1800`` -- the
+    variant's 30-minute budget, ``max_minutes * 60`` -- was refused by the node
+    probe before anything was stopped (``pause seconds is outside 60..1500``),
+    and the case ended INCONCLUSIVE on the digest alone. The pause is sized
+    from the hold and the grade, inside the probe's pause bound; the mechanism
+    itself (SIGSTOP of the host unit under a pause drop-in) is the same on
+    HyperPod and plain EKS and needs no provider branch."""
+
+    session, probe = _real_session(tmp_path)
+    paused = session.pause_metrics()
+
+    install, pause = probe.calls[0], probe.calls[1]
+    assert install[:3] == ("install-source", "--name", "general_live_node_pause.py")
+    assert pause[:3] == ("unit-pause", "--unit", METRICS_UNIT), pause
+    seconds = int(pause[pause.index("--seconds") + 1])
+    assert seconds == sp.METRICS_PAUSE_SECONDS, pause
+    assert nodep.MIN_DEADMAN_SECONDS <= seconds <= pausep.MAX_PAUSE_SECONDS, seconds
+    budget = SPECS["stale_metrics"].max_minutes * 60
+    assert budget > pausep.MAX_PAUSE_SECONDS, (
+        "the spec budget is what the probe refused"
+    )
+    assert seconds != budget, "the pause is not the variant's budget"
+    low, high = nodep.MIN_DEADMAN_SECONDS, pausep.MAX_PAUSE_SECONDS
+    refusal = f"pause seconds is outside {low}..{high}"
+    assert hashlib.sha256(refusal.encode()).hexdigest()[:16] == LIVE_REFUSAL_DIGEST, (
+        "the live digest is the probe's refusal of the budget against this bound"
+    )
+    assert paused["stopped"] is True
+    assert session.ctx.cleanup.pending() == ["spare-metrics"], "the resume is queued"
+    assert (session.ctx.case_dir / "spare-metrics-pause.json").is_file(), (
+        "the pause receipt is evidence"
+    )
+
+
+def test_pause_metrics_is_inconclusive_when_the_collector_did_not_stop(
+    tmp_path: Path,
+) -> None:
+    """Like 031's pauses: a unit that did not stop under SIGSTOP cannot make the
+    telemetry stale, so the variant is INCONCLUSIVE with the resume still queued
+    and the pause receipt kept as evidence."""
+
+    session, probe = _real_session(tmp_path, stopped=False)
+    with pytest.raises(VariantInconclusive, match=f"{METRICS_UNIT} did not stop"):
+        session.pause_metrics()
+    assert session.ctx.cleanup.pending() == ["spare-metrics"], "the resume stays queued"
+    assert (session.ctx.case_dir / "spare-metrics-pause.json").is_file(), (
+        "the receipt of the pause that did not stop is still evidence"
+    )
+    assert [call[0] for call in probe.calls] == ["install-source", "unit-pause"]
+
+
+def test_stale_hold_crosses_the_metrics_threshold_inside_the_pause() -> None:
+    """The hold carries GPU_METRICS past the product's staleness threshold; the
+    pause outlives the hold, the grade and the runner's slack and stays inside
+    the node probe's bound (the on-node deadman hands another lane's node back)."""
+
+    threshold = SILENCE_THRESHOLDS["metrics_silent"][2]
+    assert sp.STALE_HOLD_SECONDS > threshold, (sp.STALE_HOLD_SECONDS, threshold)
+    assert sp.METRICS_PAUSE_SECONDS >= sp.STALE_HOLD_SECONDS + 300
+    assert sp.METRICS_PAUSE_SECONDS <= pausep.MAX_PAUSE_SECONDS
+
+
+def test_context_pause_refuses_a_hold_outside_the_node_probe_bound_before_shipping(
+    tmp_path: Path,
+) -> None:
+    """The runner checks a pause's ``--seconds`` against the node probe's bound
+    before it ships anything: the refusal is read at once, by name, instead of
+    as a digest from the node after the install and the pause attempt."""
+
+    session, probe = _real_session(tmp_path)
+    budget = SPECS["stale_metrics"].max_minutes * 60
+    with pytest.raises(
+        ValueError, match=rf"{budget} s .*60\.\.{pausep.MAX_PAUSE_SECONDS}"
+    ):
+        session.ctx.pause(
+            "unit-pause", "--unit", METRICS_UNIT, "--seconds", str(budget), node=NODE
+        )
+    assert probe.calls == [], "nothing shipped: no install-source, no pause"
+    # The bound is the command's own: the log collector's runtime enable is a
+    # deadman (031 asks for its whole budget plus slack), a resume has no hold.
+    enable = ("log-collector-enable", "--seconds", "3300", "--approved")
+    assert pause_bound(enable) == 3300, "the enable's deadman is not a pause"
+    assert pause_bound(("exporter-pause", "--seconds", "1500")) == 1500
+    assert pause_bound(("unit-resume", "--unit", METRICS_UNIT)) is None
+    with pytest.raises(ValueError, match=r"exporter-pause of 1501 s"):
+        pause_bound(("exporter-pause", "--seconds", "1501"))

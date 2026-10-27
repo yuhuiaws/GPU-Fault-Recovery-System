@@ -3892,6 +3892,42 @@ variants (`stale_metrics`, `configuration_error`, `reserved_spare`) never stop
 kubelet; GF-REGIONAL-DESTR-008 S3 always waited for the node Ready before its
 `restore()` and did not have the defect.
 
+030 `stale_metrics` then failed identically on both clusters live 2026-10-27
+(HyperPod 14:47Z, plain EKS 14:51Z, release 37db33f254a1): the first step after
+the declaration -- the metrics pause -- ended `HostProbeError: host probe failed
+(exit 1; error ProbeError 6420bbc8692c83af); output withheld`, INCONCLUSIVE,
+with neither `spare-metrics-pause.json` nor `probe-error.json` in the case
+directory. The digest is the first 16 hex digits of the sha256 of the node
+probe's `pause seconds is outside 60..1500`: `SpareSession.pause_metrics`
+shipped the variant's budget, `max_minutes * 60`, as `unit-pause --seconds`, and
+once the 030 spec budget grew from 25 to 30 minutes (2026-10-26) that was
+1800 s, past the pause module's 60..1500 s bound, so the probe refused before
+stopping anything. Nothing provider-specific was involved: on both providers the
+metrics collector is the same host systemd unit,
+`gpu-fault-metrics-collector.service`, paused by SIGSTOP under the pause drop-in
+(the dcgm-exporter container is 025's target, not this variant's), and the
+2026-10-25 HyperPod attempt had paused it with the then 1500 s budget. The pause
+is now sized as 031 sizes its pauses, from the threshold it waits for:
+`STALE_HOLD_SECONDS` (460 s, the 420 s GPU_METRICS threshold plus one scan) +
+120 + 300 = 880 s of on-node deadman (`METRICS_PAUSE_SECONDS`, pinned by test
+inside `general_live_node_pause.MAX_PAUSE_SECONDS` = 1500); a unit that did not
+stop is INCONCLUSIVE with the resume still queued; and
+`general_live_fixture.pause_bound` refuses an out-of-bound `--seconds` by name
+on the runner before the pause module ships. The second gap: the node probe's
+failure line carried `error_code`/`error_site` but no `error_message`, so the
+host fixture's `probe-error.json` record never fired for it, and because the
+pause commands are dispatched through `_shipped`'s lambda while
+`exception_site` admitted only the probe file's own frames, the site landed on
+`<lambda>`, which the fixture's whitelist drops -- the exception text showed
+the digest alone. The failure line now carries `error_message` (truncated on
+the node, redacted by the fixture) and `exception_site` admits the installed
+pause module's frames, so the text reads `error ProbeError 6420bbc8692c83af at
+unit_pause:NN; detail in probe-error.json` and every node-probe failure leaves
+`probe-error.json` in the case directory. `tests/regional/test_general_live_probes.py`
+pins the live digest to the refused budget and drives the recorded failure
+through the host fixture; `tests/regional/test_general_live_spares.py` drives
+the real session's pause over a scripted node probe.
+
 027 `reporter_silent`'s injection stopped nothing live 2026-10-26 (plain EKS,
 release 37db33f254a1): the runner's `kubectl exec -c progress-reporter-0 --
 /bin/sh -c 'kill -STOP 1 || true'` targeted the reporter sidecar as its

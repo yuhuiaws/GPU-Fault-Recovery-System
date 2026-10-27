@@ -12,6 +12,7 @@ import argparse
 import base64
 import hashlib
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -19,10 +20,12 @@ from typing import Any
 
 import pytest
 
+from scripts.e2e.regional import host_probe_fixture as host
 from scripts.e2e.regional.probes import general_live_net_probe as netp
 from scripts.e2e.regional.probes import general_live_node_pause as pausep
 from scripts.e2e.regional.probes import general_live_node_probe as nodep
 from scripts.e2e.regional.probes import general_live_storage_probe as storep
+from tests.regional._host_probe_support import ProbeApi, host_probe
 
 
 # --------------------------------------------------------------------------- #
@@ -1119,3 +1122,77 @@ def test_node_pause_module_is_no_probe_and_keeps_the_probe_under_the_limit() -> 
     assert probe_lines + len(module_text.splitlines()) > 1500, (
         "the split is what keeps the probe under the architecture limit"
     )
+
+
+# --------------------------------------------------------------------------- #
+# a refused pause names its step and its sentence; the host fixture keeps them
+# --------------------------------------------------------------------------- #
+#: Live 2026-10-27, 030 stale_metrics on HyperPod and plain EKS alike.
+LIVE_030_DIGEST = "6420bbc8692c83af"
+METRICS_UNIT = "gpu-fault-metrics-collector.service"
+
+
+def test_node_probe_main_names_a_refused_pause_budget_with_message_and_step(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``unit-pause --seconds 1800`` (030's spec budget) ended live as ``error
+    ProbeError 6420bbc8692c83af`` and nothing else: no site, because the
+    innermost probe-file frame was ``_shipped``'s lambda (the fixture's site
+    whitelist drops ``<lambda>``), and no message, because the failure line
+    carried no ``error_message`` (so no ``probe-error.json``). The failure line
+    now names the pause module's step and carries the sentence the digest was
+    made of; the bound itself is accepted."""
+
+    calls, emitted = _pause_shaped(monkeypatch, tmp_path)
+    argv = ["unit-pause", "--unit", METRICS_UNIT, "--run-id", RUN, "--seconds"]
+    assert nodep.main([*argv, "1800"]) == 1
+    failure = emitted[-1]
+    assert failure["error_kind"] == "probe" and failure["error_class"] == "ProbeError"
+    assert failure["error_message"] == "pause seconds is outside 60..1500", failure
+    assert failure["error_code"] == LIVE_030_DIGEST, failure
+    digest = hashlib.sha256(failure["error_message"].encode()).hexdigest()[:16]
+    assert failure["error_code"] == digest
+    assert failure["error_site"].startswith("unit_pause:"), failure
+    assert failure["command"] == "unit-pause"
+    assert not any("--signal=SIGSTOP" in call for call in calls), calls
+
+    assert nodep.main([*argv, str(pausep.MAX_PAUSE_SECONDS)]) == 0
+    assert emitted[-1]["stopped"] is True, emitted[-1]
+    assert emitted[-1]["resume_after_seconds"] == pausep.MAX_PAUSE_SECONDS
+
+
+def test_node_probe_refusal_is_recorded_in_the_case_directory_by_the_host_fixture(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The node probe's failure line feeds ``HostProbeFixture.execute`` like the
+    EFA and DCGM probes' do: the exception text names the step and points at
+    ``probe-error.json``, which holds the probe's own sentence."""
+
+    _calls, emitted = _pause_shaped(monkeypatch, tmp_path)
+    argv = ["unit-pause", "--unit", METRICS_UNIT, "--seconds", "1800", "--run-id", RUN]
+    assert nodep.main(argv) == 1
+    failure = emitted[-1]
+    assert failure["error_code"] == LIVE_030_DIGEST
+    case_dir = tmp_path / "case"
+    case_dir.mkdir()
+    api = ProbeApi()
+    monkeypatch.setattr(host, "run_fixture_command", api.run)
+    fixture = host_probe(
+        case_dir, case_id="GF-GENERAL-LIVE-030.stale_metrics", run_id=RUN
+    )
+    fixture.create()
+    api.probe_returncode = 1
+    api.probe_stdout = json.dumps(failure) + "\n"
+    with pytest.raises(host.HostProbeError) as caught:
+        fixture.execute(*argv)
+    assert re.fullmatch(
+        r"host probe failed \(exit 1; error ProbeError 6420bbc8692c83af at "
+        r"unit_pause:[0-9]+; detail in probe-error\.json\); output withheld",
+        str(caught.value),
+    ), str(caught.value)
+    record = json.loads((case_dir / host.PROBE_ERROR_RECORD).read_text())
+    assert record["message"] == "pause seconds is outside 60..1500", record
+    assert record["error_site"].startswith("unit_pause:"), record
+    assert record["command"] == "unit-pause"
+    assert record["case_id"] == "GF-GENERAL-LIVE-030.stale_metrics"
+    assert record["error_code"] == LIVE_030_DIGEST

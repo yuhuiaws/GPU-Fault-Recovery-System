@@ -1459,15 +1459,16 @@ def parser() -> argparse.ArgumentParser:
 
 #: This file's own helpers: the failing *step* is the frame above them.
 HELPER_FRAMES = frozenset({"run", "bounded", "checked_run_id", "checked_name", "emit"})
+SITE_FILES = (__file__, f"/{PAUSE_NAME}")  # this probe and the shipped pause module
 
 
 def exception_site(exc: BaseException) -> str | None:
-    """Innermost ``function:line`` of this file above its helpers: the failing step."""
+    """Innermost ``function:line`` of the probe or pause module above the helpers."""
 
     site, frame = None, exc.__traceback__
     while frame is not None:
         code = frame.tb_frame.f_code
-        if code.co_filename == __file__ and code.co_name not in HELPER_FRAMES:
+        if code.co_filename.endswith(SITE_FILES) and code.co_name not in HELPER_FRAMES:
             site = f"{code.co_name}:{frame.tb_lineno}"
         frame = frame.tb_next
     return site
@@ -1485,6 +1486,7 @@ def main(argv: list[str] | None = None) -> int:
                 "error_class": type(exc).__name__,
                 "error_code": hashlib.sha256(str(exc).encode()).hexdigest()[:16],
                 "error_site": exception_site(exc),
+                "error_message": str(exc)[:2000],
                 "command": arguments.command,
             }
         )

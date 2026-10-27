@@ -42,6 +42,11 @@ from scripts.e2e.regional.host_probe_fixture import (
     HostProbeSettings,
 )
 from scripts.e2e.regional.live_driver_guard import add_live_arguments
+from scripts.e2e.regional.probes.general_live_node_pause import MAX_PAUSE_SECONDS
+from scripts.e2e.regional.probes.general_live_node_probe import (
+    MAX_DEADMAN_SECONDS,
+    MIN_DEADMAN_SECONDS,
+)
 from scripts.e2e.regional.regional_commands import RegionalFixtureError
 from scripts.e2e.regional.regional_live_fixture import (
     RegionalLiveFixture,
@@ -734,8 +739,11 @@ class VariantContext:
         Their arm side is the node probe's second file (a probe ships as one
         file): it is installed sha256-checked once per run and node before the
         first pause; the resumes, ``residue`` and ``cleanup`` need no shipping.
+        A ``--seconds`` outside the probe's pause bound is refused here first
+        (``pause_bound``), by name, before anything ships.
         """
 
+        pause_bound(arguments)
         handle = self.probe("node", node=node)
         key = f"{PAUSE_MODULE.name}@{node or self.settings.node}"
         if key not in self.shipped:
@@ -882,6 +890,39 @@ class VariantContext:
                 self.evidence.write(f"{name}-hold", {"observations": observations})
             self.sleep(min(30.0, budget))
         return observations
+
+
+#: The node probe's bound on each pause command's ``--seconds``: a producer
+#: pause holds at most ``MAX_PAUSE_SECONDS``; the log collector's runtime enable
+#: is a deadman like any other (``MAX_DEADMAN_SECONDS``).
+PAUSE_BOUNDS = {
+    "unit-pause": MAX_PAUSE_SECONDS,
+    "exporter-pause": MAX_PAUSE_SECONDS,
+    "log-collector-enable": MAX_DEADMAN_SECONDS,
+}
+
+
+def pause_bound(arguments: tuple[str, ...]) -> int | None:
+    """The ``--seconds`` a pause command carries, inside the node probe's bound.
+
+    Checked before the pause module ships and the node is asked: a hold outside
+    the command's ``PAUSE_BOUNDS`` is a runner sizing error the operator reads
+    by name at once. Live 2026-10-27, 030 ``stale_metrics`` on both clusters:
+    the variant's 30-minute budget went out as ``unit-pause --seconds 1800`` and
+    came back as the probe's bare digest (``error ProbeError 6420bbc8692c83af``),
+    the case INCONCLUSIVE.
+    """
+
+    high = PAUSE_BOUNDS.get(arguments[0]) if arguments else None
+    if high is None or "--seconds" not in arguments:
+        return None
+    seconds = int(arguments[arguments.index("--seconds") + 1])
+    if not MIN_DEADMAN_SECONDS <= seconds <= high:
+        raise ValueError(
+            f"a {arguments[0]} of {seconds} s is outside the node probe's "
+            f"{MIN_DEADMAN_SECONDS}..{high} s bound"
+        )
+    return seconds
 
 
 def backing_root(survey: dict[str, Any]) -> str:

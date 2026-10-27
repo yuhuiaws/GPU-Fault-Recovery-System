@@ -48,6 +48,13 @@ from typing import TYPE_CHECKING, Any
 
 #: ``sys.modules`` name the probe registers itself under before loading this file.
 PROBE_ALIAS = "gfrs_general_live_node_probe"
+#: The longest producer pause (``--seconds``, the on-node deadman's bound): 25
+#: minutes. A runner sizes a pause from the threshold it waits for plus its
+#: grade and slack, never from a case budget -- 030's 30-minute budget (1800 s)
+#: was refused here live 2026-10-27 on both clusters before any pause ("pause
+#: seconds is outside 60..1500", the case read only the digest);
+#: ``general_live_fixture.pause_bound`` checks the bound before shipping.
+MAX_PAUSE_SECONDS = 1500
 
 if TYPE_CHECKING:
     from scripts.e2e.regional.probes import general_live_node_probe as probe
@@ -94,7 +101,7 @@ def unit_pause(arguments: argparse.Namespace) -> None:
     run_id = probe.checked_run_id(arguments.run_id)
     unit = probe.checked_pausable(arguments.unit)
     seconds = probe.bounded(
-        arguments.seconds, probe.MIN_DEADMAN_SECONDS, 1500, "pause seconds"
+        arguments.seconds, probe.MIN_DEADMAN_SECONDS, MAX_PAUSE_SECONDS, "pause seconds"
     )
     before = probe.unit_state(unit)
     if before.get("ActiveState") != "active":
@@ -135,7 +142,7 @@ def exporter_pause(arguments: argparse.Namespace) -> None:
 
     run_id = probe.checked_run_id(arguments.run_id)
     seconds = probe.bounded(
-        arguments.seconds, probe.MIN_DEADMAN_SECONDS, 1500, "pause seconds"
+        arguments.seconds, probe.MIN_DEADMAN_SECONDS, MAX_PAUSE_SECONDS, "pause seconds"
     )
     processes = probe.exporter_processes()
     if len(processes) != 1:

@@ -109,6 +109,24 @@ PODS_READY_WAIT_SECONDS = 300
 #: channel, so the next case on that node (another lane's) meets a clean
 #: preflight; one GPU_METRICS interval is at most 180 s on this site.
 CHANNELS_FRESH_WAIT_SECONDS = 420
+#: The spare's metrics collector: one host systemd unit on both providers
+#: (``general_live_node_probe.PAUSABLE_UNITS``; the dcgm-exporter container is
+#: 025's target, not this one). ``stale_metrics`` pauses it through the node
+#: probe's ``unit-pause`` -- SIGSTOP under the pause drop-in that re-stops a
+#: product restart -- the same mechanism on HyperPod and plain EKS.
+METRICS_UNIT = "gpu-fault-metrics-collector.service"
+#: ``stale_metrics``: the unit produces GPU_INVENTORY (180 s) and GPU_METRICS
+#: (420 s, ``general_live_collectors.SILENCE_THRESHOLDS``); the hold carries the
+#: metrics channel past its threshold plus one scan before the grade.
+STALE_HOLD_SECONDS = 460
+#: The pause's on-node deadman (``unit-pause --seconds``): the hold, the grade
+#: and the runner's slack -- sized as 031 sizes its pauses -- inside the node
+#: probe's pause bound (``general_live_node_pause.MAX_PAUSE_SECONDS``, 1500 s),
+#: never the variant's budget. Live 2026-10-27 on both clusters the 30-minute
+#: spec budget (``max_minutes * 60`` = 1800 s) shipped as the pause and the
+#: probe refused it before stopping anything ("pause seconds is outside
+#: 60..1500"; the case read only the digest 6420bbc8692c83af).
+METRICS_PAUSE_SECONDS = STALE_HOLD_SECONDS + 120 + 300
 #: The on-node service-window helper (``warm_spare_node_probe``) honours a
 #: kubelet/agent stop with an independent restart timer only for one fixture
 #: identity -- the DESTR-008 service-window fixture. ``SPARE_KUBELET_STOP``
@@ -501,23 +519,28 @@ class SpareSession:
         return [] if value == [] else pods_not_ready(self.ctx.regional, self.node)
 
     def pause_metrics(self) -> dict[str, Any]:
+        """SIGSTOP the spare's metrics collector under the node probe's pause drop-in.
+
+        The deadman is ``METRICS_PAUSE_SECONDS`` -- the hold, the grade and the
+        runner's slack, inside the node probe's pause bound -- not the variant's
+        budget (live 2026-10-27 the budget was refused on both clusters before
+        any pause). A unit that did not stop makes the variant INCONCLUSIVE, as
+        031's pauses do, with the resume still queued and the receipt kept.
+        """
+
         probe = self.ctx.probe("node", node=self.node)
         paused = self.ctx.pause(
             "unit-pause",
             "--unit",
-            "gpu-fault-metrics-collector.service",
+            METRICS_UNIT,
             "--seconds",
-            str(self.ctx.spec.max_minutes * 60),
+            str(METRICS_PAUSE_SECONDS),
             node=self.node,
         )
 
         def resume_metrics() -> dict[str, Any]:
             resumed = probe.execute(
-                "unit-resume",
-                "--unit",
-                "gpu-fault-metrics-collector.service",
-                "--run-id",
-                self.ctx.run_id,
+                "unit-resume", "--unit", METRICS_UNIT, "--run-id", self.ctx.run_id
             )
             # The candidate is another lane's node: hand it back with fresh
             # channels, or that lane's next preflight reads our pause as its
@@ -526,6 +549,10 @@ class SpareSession:
 
         self.ctx.cleanup.push("spare-metrics", resume_metrics)
         self.ctx.evidence.write("spare-metrics-pause", paused)
+        if not paused.get("stopped"):
+            raise VariantInconclusive(
+                f"{METRICS_UNIT} did not stop under SIGSTOP on the spare {self.node}"
+            )
         return paused
 
     def wait_channels_fresh(self) -> list[str]:
@@ -981,7 +1008,7 @@ def not_ready(ctx: VariantContext) -> dict[str, Any]:
 def stale_metrics(ctx: VariantContext) -> dict[str, Any]:
     session = _declared(ctx)
     session.pause_metrics()
-    ctx.hold(460, name="stale-hold")
+    ctx.hold(STALE_HOLD_SECONDS, name="stale-hold")
     store = session.grade()
     observation = store.get("observation_reasons") or []
     result = block_only_verdict(

@@ -2537,6 +2537,28 @@ INCONCLUSIVE——该变体的论断是"产品在 kubelet 停着时把热备判�
 `stale_metrics`/`configuration_error`/`reserved_spare` 不停 kubelet，撤销不受影响；
 GF-REGIONAL-DESTR-008 S3 一向先等节点 Ready 再 `restore()`，没有这个缺陷。
 
+`stale_metrics` 实测（2026-10-27，HyperPod 14:47Z 与 plain EKS 14:51Z 同一形状，release
+37db33f254a1）：声明热备后的第一步——暂停 metrics 采集器——就以 `HostProbeError: host
+probe failed (exit 1; error ProbeError 6420bbc8692c83af); output withheld` 结束，
+INCONCLUSIVE，case 目录里既无 `spare-metrics-pause.json` 也无 `probe-error.json`。该摘要是
+节点探针拒绝语句 `pause seconds is outside 60..1500` 的 sha256 前 16 位：
+`SpareSession.pause_metrics` 把变体预算 `max_minutes * 60` 当作 `unit-pause --seconds`
+送上节点，而 030 的预算 2026-10-26 从 25 分钟改为 30 分钟后即为 1800 s，越过暂停模块
+60..1500 s 的界，探针在停任何进程之前拒绝。与 provider 无关：两种 provider 上 metrics
+采集器都是同一个宿主机 systemd 单元 `gpu-fault-metrics-collector.service`，机制同为
+SIGSTOP + 暂停 drop-in（dcgm-exporter 容器是 025 的目标，不是本变体的），2026-10-25 的
+HyperPod 实测曾以当时的 1500 s 预算成功暂停。现在暂停按 031 的方式从等待的阈值定尺：
+`STALE_HOLD_SECONDS`（460 s，GPU_METRICS 420 s 阈值加一次扫描）+ 120 + 300 = 880 s 的
+节点侧 deadman（`METRICS_PAUSE_SECONDS`，测试钉在 `general_live_node_pause.MAX_PAUSE_SECONDS`
+= 1500 之内），`stopped` 为假时像 031 一样 INCONCLUSIVE 且恢复仍留在清理栈；runner 侧
+`general_live_fixture.pause_bound` 在装载暂停模块之前就按名拒绝越界的 `--seconds`。第二个
+缺口：节点探针的失败行只带 `error_code`/`error_site` 而无 `error_message`，host 夹具的
+`probe-error.json` 记录（S42）对它从不触发；且暂停命令经 `_shipped` 的 lambda 分派、
+`exception_site` 只认探针文件自身的帧，站点落在 `<lambda>` 上被白名单丢弃，异常文本只剩
+摘要。现在失败行带 `error_message`（节点侧截断、夹具侧脱敏），`exception_site` 也认已装载的
+暂停模块的帧，异常文本为 `error ProbeError 6420bbc8692c83af at unit_pause:NN; detail in
+probe-error.json`，每次节点探针失败都在 case 目录留下 `probe-error.json`。
+
 计划/执行形如 `--case GF-GENERAL-LIVE-011 --variant active_to_zero --site-file <F>
 --node-b <N2> --hyperpod-cluster <HP>`（011/030 两条车道均可；011 需 `--site-file` 与
 `--node-b`，`--node-b` 为车道的第二台 EFA 节点）；030 形如 `--case GF-GENERAL-LIVE-030
