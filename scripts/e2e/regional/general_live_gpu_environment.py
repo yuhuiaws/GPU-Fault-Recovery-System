@@ -29,6 +29,17 @@ What the product must show (spec 024: "热warning、普通power cap ... 不独�
   the composite built only from its own metrics, and a recovery on flat/clear
   readings without a hardware counter reset.
 
+Both plans rise on exactly the node's confirmation samples and their tail
+repeats the confirmed read's violation duration (``env_live_plans``): the DCGM
+edge filter delivers the confirmed read and the first cleared read only, so a
+tail above the confirmed read is a rise the product grades on the cleared read
+as a fresh WARNING that nothing clears before VALIDATE_GPU's grace -- GF-ENV-
+LIVE-006's live failure (2026-10-27, HyperPod), and the former shape of both
+plans here. ``env_live_expectations.require_counter_tail_at_confirmed_read``
+checks the built plan against the node's own confirmation count before
+anything is deployed; a refusal is the runner's INCONCLUSIVE "harness fixture
+failed", never a product verdict.
+
 Verdicts read the product's own records (``general_live_gpu_store``,
 ``general_live_gpu_verdicts``); the proxy's ``/status`` and the accepted
 replayed samples are the raw-source oracle. ``proof_scope`` is ``live-replay``.
@@ -53,6 +64,9 @@ from typing import Any
 from gpu_fault.gpu_metrics import GpuMetricsThresholds
 
 from scripts.e2e.regional import env_live_plans as plans
+from scripts.e2e.regional.env_live_expectations import (
+    require_counter_tail_at_confirmed_read,
+)
 from scripts.e2e.regional.env_live_fixture import SAFE_TLIMIT_MARGIN_C
 from scripts.e2e.regional.general_live_env_replay import (
     CLEANUP_NAME,
@@ -88,6 +102,7 @@ from scripts.e2e.regional.general_live_gpu_verdicts import (
     composite_incidents,
     read_only_errors,
 )
+from scripts.e2e.regional.regional_commands import RegionalFixtureError
 
 CASE = "GF-GENERAL-LIVE-024"
 THERMAL_RULE = "THERMAL_STRESS"
@@ -113,6 +128,31 @@ WARNING = "WARNING"
 
 def _hold(ctx: VariantContext) -> int:
     return min(ctx.spec.max_minutes * 60, 20 * 60)
+
+
+def checked_tail(
+    plan: dict[str, Any], survey: GpuSurvey, *, variant: str, counter: str, marker: str
+) -> dict[str, Any]:
+    """The plan whose cleared read the node's edge filter grades as a zero delta.
+
+    ``env_live_expectations.require_counter_tail_at_confirmed_read`` against
+    the node's own ``GPU_FAULT_DCGM_EDGE_CONFIRMATION_SAMPLES``; a refusal is a
+    fixture error (the runner's INCONCLUSIVE "harness fixture failed"), raised
+    before the proxy or the repoint touch the node.
+    """
+
+    try:
+        require_counter_tail_at_confirmed_read(
+            plan,
+            survey.confirmation,
+            counter=counter,
+            marker=marker,
+            case_id=CASE,
+            plan_name=variant,
+        )
+    except ValueError as exc:
+        raise RegionalFixtureError(f"environment replay plan rejected: {exc}") from exc
+    return plan
 
 
 def _throttle_mask(survey: GpuSurvey, gpu: str) -> int:
@@ -221,10 +261,16 @@ def thermal_warning(ctx: VariantContext) -> dict[str, Any]:
     survey = run_gpu_survey(ctx, limits=True)
     target = thermal_target(survey, thresholds)
     require_cool(survey, target)
-    plan = plans.thermal_stress_plan(
-        target.decision,
-        confirmation_samples=survey.confirmation,
-        baseline_us=target.baseline_us,
+    plan = checked_tail(
+        plans.thermal_stress_plan(
+            target.decision,
+            confirmation_samples=survey.confirmation,
+            baseline_us=target.baseline_us,
+        ),
+        survey,
+        variant="thermal_warning",
+        counter="thermal_violation_total_us",
+        marker="clock_throttle_reasons",
     )
     ctx.evidence.write(
         "thermal-target",
@@ -292,12 +338,20 @@ def power_performance(ctx: VariantContext) -> dict[str, Any]:
             f"the GPU really reports thermal/brake clock reasons {mask:#x}; refuse to arm",
         )
     baseline_us = survey.value(gpu, "power_violation_total_us") or 0.0
-    plan = plans.power_limit_throttling_plan(
-        confirmation_samples=survey.confirmation,
-        power_limit_w=limit,
-        power_limit_ratio=thresholds.power_limit_ratio,
-        min_utilization_percent=thresholds.power_correlation_min_utilization_percent,
-        baseline_us=baseline_us,
+    plan = checked_tail(
+        plans.power_limit_throttling_plan(
+            confirmation_samples=survey.confirmation,
+            power_limit_w=limit,
+            power_limit_ratio=thresholds.power_limit_ratio,
+            min_utilization_percent=(
+                thresholds.power_correlation_min_utilization_percent
+            ),
+            baseline_us=baseline_us,
+        ),
+        survey,
+        variant="power_performance",
+        counter="power_violation_total_us",
+        marker="power_usage_w",
     )
     usage = next(
         float(step["values"]["power_usage_w"])
@@ -523,6 +577,7 @@ __all__ = [
     "THERMAL_SIGNALS",
     "VARIANTS",
     "ThermalTarget",
+    "checked_tail",
     "power_performance",
     "power_target",
     "require_cool",

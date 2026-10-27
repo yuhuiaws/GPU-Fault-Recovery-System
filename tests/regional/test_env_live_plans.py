@@ -272,7 +272,7 @@ def test_thermal_stress_plan_holds_the_warning_band_and_clears() -> None:
     assert decision.critical_value is not None and decision.warning_value is not None
     assert decision.critical_value < warning <= decision.warning_value
     breach = [step for step in plan["steps"] if field in step["values"]]
-    assert len(breach) == 6, "confirmation samples plus three"
+    assert len(breach) == 3, "one rising read per confirmation sample"
     assert all(step["values"][field] == warning for step in breach), (
         "every breach read sits at the warning reading"
     )
@@ -288,11 +288,159 @@ def test_thermal_stress_plan_holds_the_warning_band_and_clears() -> None:
     assert tail["values"] == {
         "thermal_violation_total_us": durations[-1],
         "clock_throttle_reasons": 0,
-    }, "the tail is flat with the reason cleared and the real temperature"
+    }, "the tail repeats the confirmed read with the reason cleared"
     with pytest.raises(plans.EnvLivePlanError):
         plans.thermal_stress_plan(
             decision, confirmation_samples=3, reason_bit=plans.POWER_BRAKE_BIT
         )
+    with pytest.raises(plans.EnvLivePlanError, match="confirmation sample"):
+        plans.thermal_stress_plan(decision, confirmation_samples=0)
+
+
+@pytest.mark.parametrize("samples", [1, 2, 3, 5])
+def test_ramp_plans_rise_on_the_confirmation_samples_and_hold_the_confirmed_read(
+    samples: int,
+) -> None:
+    """The edge filter delivers the confirmation read and the first cleared read
+    only (GF-ENV-LIVE-006 live 2026-10-27): the 024 plans rise once per
+    confirmation sample and their tail is a zero delta against that read."""
+
+    decision = _h200().decisions[plans.CORE_TLIMIT]
+    thermal = plans.thermal_stress_plan(
+        decision, confirmation_samples=samples, baseline_us=2_000_000.0
+    )
+    power = plans.power_limit_throttling_plan(
+        confirmation_samples=samples,
+        power_limit_w=700.0,
+        power_limit_ratio=0.95,
+        min_utilization_percent=80.0,
+        baseline_us=100.0,
+    )
+    for plan, counter, marker in (
+        (thermal, "thermal_violation_total_us", "clock_throttle_reasons"),
+        (power, "power_violation_total_us", "power_usage_w"),
+    ):
+        validate_plan(plan)
+        rising = [s for s in plan["steps"] if s["values"].get(marker)]
+        assert len(rising) == samples, "one rising read per confirmation sample"
+        assert all(step["reads"] == 1 for step in rising), (
+            "every rising read is served once"
+        )
+        values = [s["values"][counter] for s in rising]
+        assert values == sorted(values) and len(set(values)) == samples, (
+            "the ramp still rises"
+        )
+        (tail,) = [
+            s for s in plan["steps"] if s["values"] and not s["values"].get(marker)
+        ]
+        assert tail["reads"] == max(3, samples)
+        assert tail["values"][counter] == values[-1], (
+            "the cleared read is a zero delta against the delivered confirmation"
+        )
+        expectations.require_counter_tail_at_confirmed_read(
+            plan,
+            samples,
+            counter=counter,
+            marker=marker,
+            case_id="GF-GENERAL-LIVE-024",
+            plan_name="shape",
+        )
+
+
+def _old_thermal_shape(baseline_us: float = 0.0) -> dict[str, object]:
+    """The shape both 024 plans had live on 2026-10-26: confirmation samples
+    plus three rising reads, the tail holding the last of them."""
+
+    return {
+        "steps": [
+            {"reads": 3, "values": {}},
+            *(
+                {
+                    "reads": 1,
+                    "values": {
+                        "gpu_tlimit_c": 0.5,
+                        "thermal_violation_total_us": baseline_us + index * 1e6,
+                        "clock_throttle_reasons": plans.SW_THERMAL_BIT,
+                    },
+                }
+                for index in range(1, 7)
+            ),
+            {
+                "reads": 3,
+                "values": {
+                    "thermal_violation_total_us": baseline_us + 6e6,
+                    "clock_throttle_reasons": 0,
+                },
+            },
+        ]
+    }
+
+
+def test_counter_tail_guard_refuses_a_rise_between_confirmation_and_clear() -> None:
+    def refuse(plan: dict[str, object], samples: int, **fields: str) -> str:
+        with pytest.raises(ValueError) as caught:
+            expectations.require_counter_tail_at_confirmed_read(
+                plan, samples, case_id="GF-GENERAL-LIVE-024", plan_name="t", **fields
+            )
+        return str(caught.value)
+
+    thermal = {
+        "counter": "thermal_violation_total_us",
+        "marker": "clock_throttle_reasons",
+    }
+    message = refuse(_old_thermal_shape(), 3, **thermal)
+    # Warm-up reads count: the confirmation is read 6, the cleared read 10.
+    assert "read 10 clears clock_throttle_reasons and serves 6e+06" in message
+    assert "read 6 (the 3-sample confirmation) with 3e+06" in message
+    assert "reads [7, 8, 9, 10] change the counter" in message
+    # A plan built for three samples on a node that confirms on two: read 5
+    # is delivered with 2e6, read 6 raises it.
+    decision = _h200().decisions[plans.CORE_TLIMIT]
+    good = plans.thermal_stress_plan(decision, confirmation_samples=3)
+    message = refuse(good, 2, **thermal)
+    assert "read 5 (the 2-sample confirmation) with 2e+06" in message
+    assert "reads [6, 7] change the counter" in message
+    # Too few candidate reads for the node's count: nothing would be delivered.
+    message = refuse(good, 4, **thermal)
+    assert "no 4 consecutive reads serve a non-zero clock_throttle_reasons" in message
+    # A tail that drops the counter passes the real reset through.
+    reset = plans.thermal_stress_plan(decision, confirmation_samples=3)
+    reset["steps"][-1]["values"].pop("thermal_violation_total_us")
+    message = refuse(reset, 3, **thermal)
+    assert "omits it for thermal_violation_total_us" in message
+    # The power plan is judged on its draw-at-the-cap marker.
+    power = plans.power_limit_throttling_plan(
+        confirmation_samples=3,
+        power_limit_w=700.0,
+        power_limit_ratio=0.95,
+        min_utilization_percent=80.0,
+    )
+    power["steps"].insert(4, {"reads": 1, "values": dict(power["steps"][3]["values"])})
+    power["steps"][4]["values"]["power_violation_total_us"] = 4e6
+    power["steps"][-1]["values"]["power_violation_total_us"] = 4e6
+    message = refuse(
+        power, 3, counter="power_violation_total_us", marker="power_usage_w"
+    )
+    assert "read 8 clears power_usage_w and serves 4e+06" in message
+    # Plans that replay neither field are not this guard's business.
+    expectations.require_counter_tail_at_confirmed_read(
+        plans.power_brake_plans(confirmation_samples=3)["transient"],
+        3,
+        counter="thermal_violation_total_us",
+        marker="power_usage_w",
+        case_id="GF-ENV-LIVE-007",
+        plan_name="transient",
+    )
+
+
+def test_served_reads_lines_every_field_up_per_read() -> None:
+    reads = expectations.served_reads(_old_thermal_shape())
+    assert len(reads) == 12 and reads[:3] == [{}, {}, {}]
+    assert reads[3]["gpu_tlimit_c"] == 0.5 and reads[8]["clock_throttle_reasons"] == 32
+    assert reads[9] == {"thermal_violation_total_us": 6e6, "clock_throttle_reasons": 0}
+    assert expectations.served_reads(
+        {"steps": [{"reads": 2, "values": {"a": None}}]}
+    ) == [{"a": None}, {"a": None}]
 
 
 def test_power_limit_throttling_plan_pins_draw_under_the_limit_without_reasons() -> (
@@ -307,7 +455,7 @@ def test_power_limit_throttling_plan_pins_draw_under_the_limit_without_reasons()
     )
     validate_plan(plan)
     breach = [step for step in plan["steps"] if "power_usage_w" in step["values"]]
-    assert len(breach) == 6
+    assert len(breach) == 3, "one rising read per confirmation sample"
     for step in breach:
         values = step["values"]
         assert 700.0 * 0.95 <= values["power_usage_w"] < 700.0, values

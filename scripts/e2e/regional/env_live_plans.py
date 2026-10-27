@@ -413,23 +413,45 @@ def thermal_stress_plan(
     Warm up healthy, then hold the core temperature inside its *warning* band
     while the thermal-violation duration rises by ``step_us`` per read under a
     thermal clock reason (``0x20`` software thermal slowdown by default; never
-    the ``0x80`` brake). The product correlates the temperature finding with
-    the duration/throttle findings into THERMAL_STRESS, which must stay a
-    WARNING diagnostic. The tail holds the duration flat with the reason bit
-    cleared and the temperature back to the real reading, so the component
-    findings clear on a zero delta before the proxy passes through again.
-    ``baseline_us`` is the device's real counter so the first read is a rise,
-    not a counter reset.
+    the ``0x80`` brake) -- on exactly ``confirmation_samples`` reads, one per
+    sample the DCGM edge filter needs before it delivers the warning-band
+    temperature and the clock reason as ``candidate-confirmed``. The product
+    correlates the temperature finding with the duration/throttle findings
+    into THERMAL_STRESS, which must stay a WARNING diagnostic. The tail clears
+    the reason bit, lets the temperature pass through to the real reading and
+    repeats the confirmed read's duration, so the first cleared read
+    (``candidate-recovered``) is a zero delta that clears the component
+    findings and the composite with them. ``baseline_us`` is the device's real
+    counter so the first read is a rise, not a counter reset.
+
+    The tail must not hold a *later* value: only the confirmed read and the
+    first cleared read are delivered (a confirmed candidate is no new edge),
+    so whatever the cleared read serves is graded against the confirmed read
+    (``thermal_duration_decision``: a delta of 10000 us is a fresh WARNING),
+    and a rise there is cleared by nothing before VALIDATE_GPU's temperature
+    warning grace -- the flat tail is no edge, the pass-through real counter
+    is a reset the ingest keeps the finding through (GF-ENV-LIVE-006 live
+    2026-10-27, HyperPod). The former shape rose on three more reads than the
+    confirmation needed and held the last of them: at a 1e6 us step per 15 s
+    read the violation counter is a duty-cycle candidate of its own (0.067 >
+    the collector's 0.05) and confirmed one read after the temperature, so
+    live 2026-10-26 (both clusters) the product accepted two breach batches
+    and the cleared read carried 2e6 us over the last delivered one -- a rise
+    the product graded two ways on the two clusters for 006.
     """
 
     if reason_bit & POWER_BRAKE_BIT:
         raise EnvLivePlanError("a thermal warning plan must not assert the power brake")
+    rising = int(confirmation_samples)
+    if rising < 1:
+        raise EnvLivePlanError("a thermal warning plan needs a confirmation sample")
     field = _temperature_field(decision.variant)
     warning = _warning_value(decision)
-    breaches = max(2, confirmation_samples) + 3
-    clear = max(3, confirmation_samples) if clear_reads is None else clear_reads
+    clear = max(3, rising) if clear_reads is None else int(clear_reads)
+    if clear < 1:
+        raise EnvLivePlanError("a thermal warning plan needs a clearing read")
     steps = [_reads(max(1, warmup_reads), {})]
-    for index in range(1, breaches + 1):
+    for index in range(1, rising + 1):
         steps.append(
             _reads(
                 1,
@@ -444,7 +466,7 @@ def thermal_stress_plan(
         _reads(
             clear,
             {
-                "thermal_violation_total_us": baseline_us + breaches * step_us,
+                "thermal_violation_total_us": baseline_us + rising * step_us,
                 "clock_throttle_reasons": 0,
             },
         )
@@ -469,24 +491,36 @@ def power_limit_throttling_plan(
     The power-violation duration rises by ``step_us`` per read while the power
     draw sits between ``power_limit_ratio`` of the enforced limit and the
     limit itself under high utilization -- what DCGM reports for a GPU pinned
-    at its power cap. No clock reason bit is served: a thermal or brake reason
-    would be a temperature finding, which the product deliberately keeps out
-    of POWER_LIMIT_THROTTLING (``gpu_metrics._add_power_composite``). The
-    limit is the device's real reading unless ``serve_limit`` asks the proxy
-    to serve it too. The tail holds the duration flat and lets draw and
-    utilization pass through again so the component clears on a zero delta.
+    at its power cap -- on exactly ``confirmation_samples`` reads, one per
+    sample the DCGM edge filter needs before it delivers the draw-at-the-cap
+    correlation as ``candidate-confirmed``. No clock reason bit is served: a
+    thermal or brake reason would be a temperature finding, which the product
+    deliberately keeps out of POWER_LIMIT_THROTTLING
+    (``gpu_metrics._add_power_composite``). The limit is the device's real
+    reading unless ``serve_limit`` asks the proxy to serve it too. The tail
+    lets draw and utilization pass through again and repeats the confirmed
+    read's duration, so the first cleared read (``candidate-recovered``) is a
+    zero delta that clears the component whatever the real draw is. The former
+    shape held the last of three extra rising reads instead (see
+    :func:`thermal_stress_plan`); ``power_violation_decision`` let that rise
+    pass only because the pass-through draw of an idle GPU sits under the
+    ratio, not because the tail was flat.
     """
 
     if power_limit_w <= 0:
         raise EnvLivePlanError("a power cap plan needs a positive enforced power limit")
     if not 0 < power_limit_ratio <= 1:
         raise EnvLivePlanError("power_limit_ratio must be in (0, 1]")
+    rising = int(confirmation_samples)
+    if rising < 1:
+        raise EnvLivePlanError("a power cap plan needs a confirmation sample")
     usage = power_limit_w * (power_limit_ratio + (1.0 - power_limit_ratio) / 2)
     utilization = min(100.0, max(min_utilization_percent + 10.0, 90.0))
-    breaches = max(2, confirmation_samples) + 3
-    clear = max(3, confirmation_samples) if clear_reads is None else clear_reads
+    clear = max(3, rising) if clear_reads is None else int(clear_reads)
+    if clear < 1:
+        raise EnvLivePlanError("a power cap plan needs a clearing read")
     steps = [_reads(max(1, warmup_reads), {})]
-    for index in range(1, breaches + 1):
+    for index in range(1, rising + 1):
         values: dict[str, float | None] = {
             "power_violation_total_us": baseline_us + index * step_us,
             "power_usage_w": round(usage, 1),
@@ -496,7 +530,7 @@ def power_limit_throttling_plan(
             values["power_limit_w"] = float(power_limit_w)
         steps.append(_reads(1, values))
     steps.append(
-        _reads(clear, {"power_violation_total_us": baseline_us + breaches * step_us})
+        _reads(clear, {"power_violation_total_us": baseline_us + rising * step_us})
     )
     return {"steps": steps}
 

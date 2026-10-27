@@ -265,6 +265,105 @@ def _require_duration_tail_at_confirmed_read(
         )
 
 
+def served_reads(plan: Mapping[str, Any]) -> list[dict[str, float | None]]:
+    """What the proxy serves on every armed read, in order.
+
+    A pass-through read is ``{}``; a field the step omits (``None``) stays
+    ``None``. Unlike :func:`replayed_values` the reads of every field line up,
+    so a read's counter can be set against the same read's candidate marker.
+    """
+
+    reads: list[dict[str, float | None]] = []
+    for step in plan.get("steps") or []:
+        values = {
+            str(name): None if value is None else float(value)
+            for name, value in (step.get("values") or {}).items()
+        }
+        reads.extend(dict(values) for _ in range(int(step.get("reads") or 0)))
+    return reads
+
+
+def require_counter_tail_at_confirmed_read(
+    plan: Mapping[str, Any],
+    confirmation_samples: int,
+    *,
+    counter: str,
+    marker: str,
+    case_id: str,
+    plan_name: str,
+) -> None:
+    """A ramp plan's cleared read must repeat the confirmed read's counter.
+
+    ``marker`` is the served field that makes a read a DCGM edge candidate --
+    a non-zero clock reason, a power draw pinned at the cap -- and ``counter``
+    the violation duration that rises with it. The edge filter delivers the
+    ``confirmation_samples``-th consecutive candidate read and the first read
+    without the marker (``candidate-recovered``), nothing in between: a
+    confirmed candidate is no new edge and a violation counter is judged by
+    duty cycle. Whatever the cleared read serves is graded against the
+    confirmed read, and a higher duration is a fresh WARNING
+    (``thermal_duration_decision``, ``power_violation_decision``) that no later
+    read clears before VALIDATE_GPU's temperature-warning grace: the flat tail
+    is no edge and the pass-through real counter is a reset the ingest keeps
+    the finding through (GF-ENV-LIVE-006 live 2026-10-27, HyperPod; the GF-
+    GENERAL-LIVE-024 plans had the same shape, both clusters 2026-10-26). So
+    every read from the confirmed one through the first cleared one must serve
+    the confirmed read's counter, and the candidate reads must reach the
+    node's own confirmation count at all -- a plan built for another count is
+    refused before anything is armed. Plans that replay neither field are not
+    this module's business and pass.
+    """
+
+    reads = served_reads(plan)
+    samples = int(confirmation_samples)
+    if samples < 1 or not any(counter in read or marker in read for read in reads):
+        return
+    confirmed = None
+    streak = 0
+    for index, read in enumerate(reads):
+        streak = streak + 1 if number_or_none(read.get(marker)) else 0
+        if streak == samples:
+            confirmed = index
+            break
+    if confirmed is None:
+        raise ValueError(
+            f"{case_id} {plan_name}: no {samples} consecutive reads serve a non-zero "
+            f"{marker}, so the edge filter never delivers the plan on a node that "
+            f"confirms a candidate on {samples} samples"
+        )
+    cleared = next(
+        (
+            index
+            for index in range(confirmed + 1, len(reads))
+            if not number_or_none(reads[index].get(marker))
+        ),
+        None,
+    )
+    served_confirmed = number_or_none(reads[confirmed].get(counter))
+    if cleared is None or served_confirmed is None:
+        return
+    rising = [
+        index
+        for index in range(confirmed + 1, cleared + 1)
+        if not same_value(reads[index].get(counter), served_confirmed)
+    ]
+    if rising:
+        served_cleared = reads[cleared].get(counter)
+        shown = "omits it" if served_cleared is None else f"serves {served_cleared:g}"
+        raise ValueError(
+            f"{case_id} {plan_name}: read {cleared + 1} clears {marker} and {shown} "
+            f"for {counter}, but the edge filter delivers read {confirmed + 1} (the "
+            f"{samples}-sample confirmation) with {served_confirmed:g} and nothing in "
+            f"between; reads {[index + 1 for index in rising]} change the counter, "
+            "and the control plane would grade the difference as a fresh WARNING "
+            "that no later read clears before VALIDATE_GPU's grace (a flat duration "
+            "is no edge, the pass-through counter is a reset). Every read from the "
+            "confirmation through the first cleared read must repeat the confirmed "
+            "read's counter (env_live_plans.thermal_stress_plan, "
+            "power_limit_throttling_plan)"
+        )
+
+
 def _single_field(values: Mapping[str, list[float | None]], case_id: str) -> str:
     names = [
         name for name, items in values.items() if any(v is not None for v in items)
@@ -613,5 +712,7 @@ __all__ = [
     "number_or_none",
     "plan_pause_read",
     "replayed_values",
+    "require_counter_tail_at_confirmed_read",
     "same_value",
+    "served_reads",
 ]

@@ -2634,7 +2634,27 @@ PASS 未判读数。现在探针在节点上自行判定：进程环境不含代
 （运行器记 INCONCLUSIVE “harness fixture failed: ... did not take effect”），不再等 12 读预算。
 回执缺少证明（旧探针副本）、进程 endpoint 不是代理、`first_read.observed` 不为真，夹具同样拒绝
 arm。还原幂等（干净单元不重启），且只要发起过重指（即便调用中途失败）`close` 都会先还原再停代理。
-两个变体需在两集群重跑，目前仍无产品证据。
+重指证明落地后，2026-10-26 21:26-22:03Z 两个变体在两集群各 PASS 一次（eks/hpb `thermal_warning`、
+eksb/hp `power_performance`，R13g），每次产品恰接受两个回放 breach 批次（`accepted_injected_samples: 2`）。
+
+计划形状：两条计划的递增读数恰为节点自己的确认样本数（`survey.confirmation`，即 collector 的
+`GPU_FAULT_DCGM_EDGE_CONFIRMATION_SAMPLES`，默认 3），尾部重复确认读的 violation duration
+（`thermal_stress_plan` 清零 reason 位、温度透传；`power_limit_throttling_plan` 功耗/利用率透传），
+不再是"确认样本 + 3 读递增、尾部持最后一读"。原因与 GF-ENV-LIVE-006 相同（见 GPU 环境真机验收 006
+节）：edge filter 只投递确认读与第一条清除读（`candidate-recovered`），清除读的 duration 与确认读之差
+被产品判为新的 WARNING（`thermal_duration_decision` / `power_violation_decision`，delta ≥ 10000 us），
+而平台尾不是边沿、透传回真实计数是 counter reset（无效 delta 保留 finding），VALIDATE_GPU 在 120 秒
+热告警宽限后 FAILED。旧形状下 10-26 的四次 PASS 并非尾部安全：每读 1e6 us / 15 s 的 duty cycle 0.067
+高于 collector 的 0.05 阈值，violation 计数器自身也是候选并在温度/功耗键之后一读确认（第 7 读，4e6）——
+这就是 `accepted_injected_samples: 2` 的来源——清除读（第 10 读）带 6e6，比最后投递值高 2e6；同一输入
+006 在 HyperPod 重判 WARNING 而在 plain EKS 清除（两集群投递序列完全相同），`power_performance` 的清除读
+之所以未重判，只因 `power_violation_decision` 要求同批次功耗/利用率仍在 cap 上而尾部透传了空闲卡的真实
+功耗。现在清除读是零 delta，组件 finding 与复合在 recovered 批次即清除；
+`general_live_gpu_environment.checked_tail`（`env_live_expectations.require_counter_tail_at_confirmed_read`）
+在部署前按节点真实确认样本数校验计划——确认读到第一条清除读之间 duration 必须不变、候选读数必须达到
+确认数——不满足即 `RegionalFixtureError`（INCONCLUSIVE "harness fixture failed"），不 arm。判据不变；
+两个变体需在两集群重跑（harness 专属，无需发布）。真实服务回归：
+`tests/regional/test_general_live_env_tail_edge.py`（真实 DCGM 投递过滤 + 真实 ingest + 复合）钉住两种形状。
 
 规格明示、注入有效但产品不足的按 `expected_outcome="FAIL"` + `product_gap` 记录，不
 掩盖。首批记为预期 FAIL 的四个产品缺口——025 `one_gpu_missing`（完整性按全批 union

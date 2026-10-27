@@ -307,14 +307,17 @@ def test_thermal_warning_is_a_warning_diagnostic_composite(tmp_path: Path) -> No
     }
     plan = _plan(ctx)
     breach = [step for step in plan["steps"] if "gpu_tlimit_c" in step["values"]]
-    assert len(breach) == 6 and all(
+    assert len(breach) == 3 and all(
         step["values"]["gpu_tlimit_c"] == WARNING_READING
         and step["values"]["clock_throttle_reasons"] == 0x20
         for step in breach
-    )
+    ), "one warning-band read per confirmation sample of the surveyed node"
     durations = [step["values"]["thermal_violation_total_us"] for step in breach]
     assert durations[0] > 5_000_000.0 and durations == sorted(durations), (
         "the duration rises from above the device's real counter"
+    )
+    assert plan["steps"][-1]["values"]["thermal_violation_total_us"] == durations[-1], (
+        "the cleared read repeats the confirmed read's duration"
     )
     env = ctx.probes[f"{PROBE_KEY}@{ctx.settings.node}"]
     verbs = [call[0] for call in env.calls]
@@ -395,6 +398,87 @@ def test_thermal_warning_is_a_fixture_error_when_the_repoint_did_not_take_effect
     assert all(item["ok"] for item in results), results
     verbs = [call[0] for call in env.calls]
     assert verbs[-2:] == ["restore-collector", "stop-proxy"]
+
+
+def _old_shape(plan: dict[str, Any]) -> dict[str, Any]:
+    """The 2026-10-26 live shape: three more rising reads, the tail at the last."""
+
+    rising = [
+        step for step in plan["steps"] if step["values"].get("clock_throttle_reasons")
+    ]
+    step_us = (
+        rising[1]["values"]["thermal_violation_total_us"]
+        - rising[0]["values"]["thermal_violation_total_us"]
+    )
+    extra = [
+        {
+            "reads": 1,
+            "values": {
+                **rising[-1]["values"],
+                "thermal_violation_total_us": (
+                    rising[-1]["values"]["thermal_violation_total_us"] + index * step_us
+                ),
+            },
+        }
+        for index in range(1, 4)
+    ]
+    tail = dict(plan["steps"][-1])
+    tail["values"] = {
+        **tail["values"],
+        "thermal_violation_total_us": extra[-1]["values"]["thermal_violation_total_us"],
+    }
+    return {"steps": [plan["steps"][0], *rising, *extra, tail]}
+
+
+def test_checked_tail_refuses_a_rise_on_the_cleared_read(tmp_path: Path) -> None:
+    """The guard reads the surveyed node's own confirmation count (3 here)."""
+
+    survey = GpuSurvey(_survey())
+    target = envc.thermal_target(survey, GpuMetricsThresholds())
+    good = envc.plans.thermal_stress_plan(
+        target.decision, confirmation_samples=3, baseline_us=target.baseline_us
+    )
+    assert (
+        envc.checked_tail(
+            good,
+            survey,
+            variant="thermal_warning",
+            counter="thermal_violation_total_us",
+            marker="clock_throttle_reasons",
+        )
+        is good
+    )
+    with pytest.raises(RegionalFixtureError, match="plan rejected") as info:
+        envc.checked_tail(
+            _old_shape(good),
+            survey,
+            variant="thermal_warning",
+            counter="thermal_violation_total_us",
+            marker="clock_throttle_reasons",
+        )
+    assert "read 10 clears clock_throttle_reasons and serves 1.1e+07" in str(info.value)
+    assert "read 6 (the 3-sample confirmation) with 8e+06" in str(info.value)
+
+
+def test_thermal_warning_refuses_a_rising_tail_before_anything_is_deployed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plan builder that regresses to the live 2026-10-26 shape is caught by
+    the pre-deploy guard: a fixture error, no probe call, nothing to clean."""
+
+    builder = envc.plans.thermal_stress_plan
+    monkeypatch.setattr(
+        envc.plans,
+        "thermal_stress_plan",
+        lambda *args, **kwargs: _old_shape(builder(*args, **kwargs)),
+    )
+    cpu = gpu_cpu_python(activity=_activity([]), gpu_state=_state([], []))
+    ctx = _ctx(tmp_path, "thermal_warning", survey_value=_survey(), cpu=cpu)
+    with pytest.raises(RegionalFixtureError, match="change the counter"):
+        envc.thermal_warning(ctx)
+    env = ctx.probes[f"{PROBE_KEY}@{ctx.settings.node}"]
+    assert env.calls == [], "nothing was deployed"
+    assert ctx.cleanup.pending() == []
 
 
 def test_thermal_warning_fails_when_the_composite_escalates(tmp_path: Path) -> None:
@@ -537,7 +621,7 @@ def test_power_performance_is_a_warning_diagnostic_composite(tmp_path: Path) -> 
     assert out["power_limit_w"] == 700.0 and out["served_power_usage_w"] == SERVED_USAGE
     plan = _plan(ctx)
     breach = [step for step in plan["steps"] if "power_usage_w" in step["values"]]
-    assert len(breach) == 6
+    assert len(breach) == 3, "one at-the-cap read per confirmation sample"
     for step in breach:
         values = step["values"]
         assert 700.0 * 0.95 <= values["power_usage_w"] <= 700.0, values
