@@ -55,11 +55,19 @@ re-created). Grading reads the product's records only: the confirmed sample's
 ``failure_mode``/counts, exactly one SUCCEEDED RESTART_NODE execution and
 remote command scoped to the node, no REPLACE_NODE, no second reboot, the
 incident RECOVERED, the node Ready and schedulable with the EFA and GPU
-allocatable at baseline, fresh post-reboot ``efa_inventory_active_count ==
-expected`` / ``efa_inventory_mismatch == 0`` -- newer than the product's own
-RESTART_NODE completion, the anchor its inventory gate reads from
-(``adapters/gpu_validation.inventory_observation_window``), not the runner's
-later bookkeeping --, the provider's own receipt in CloudTrail (EC2
+allocatable at baseline, the post-reboot inventory as the product records it
+-- the latest ``efa_inventory_active_count`` (a ``LATEST_METRICS_REQUIRED``
+row, advanced by every delivered batch, the health summary included) newer
+than the RESTART_NODE completion the product's own gate reads from
+(``adapters/gpu_validation.inventory_observation_window``), waited one
+health-summary phase at most; the new boot's first inventory batch (the
+collector's ``baseline`` delivery, always raw evidence) reading
+``efa_inventory_mismatch`` / ``efa_inventory_missing_count`` 0 -- the gauge
+has no latest row and a healthy steady state delivers health summaries only,
+which are never raw evidence (live hp 2026-10-27 r3: "latest None" on a
+SUCCEEDED chain) --; and the chain's VALIDATE_FABRIC
+``details.inventory_evidence`` reading of the restored count after that
+completion --, the provider's own receipt in CloudTrail (EC2
 ``RebootInstances`` on plain EKS, SageMaker ``BatchRebootClusterNodes`` on
 HyperPod) naming this node and no other -- EC2 by instance id, SageMaker by
 the ``NodeLogicalId`` the product submits (``hyperpod.py`` ``NodeLogicalIds``),
@@ -113,6 +121,7 @@ from scripts.e2e.regional.general_live_inventory import (
     STEP_TIMEOUT_SECONDS,
     efa_collection_errors,
     efa_failure_mode_errors,
+    fresh_evidence_errors,
     port_active,
 )
 from scripts.e2e.regional.general_live_registry import (
@@ -163,6 +172,18 @@ POST_REBOOT_SETTLE_BUDGET = 3 * STEP_TIMEOUT_SECONDS + 300
 PROVIDER_RECEIPT_BUDGET = 900
 #: ``sagemaker list-cluster-nodes``: the instance <-> NodeLogicalId binding.
 HYPERPOD_INVENTORY_TIMEOUT = 180
+#: The inventory's shortfall readings. Neither has a latest-value row
+#: (``host_health.NodeHealthPolicy.LATEST_METRICS_REQUIRED`` keeps the EFA
+#: expected/active counts only), so after a reboot they exist in the new boot's
+#: first batch -- the collector's ``baseline`` delivery, always raw evidence --
+#: and in no later healthy one: a steady healthy node delivers health
+#: summaries only, which ``app/ingest/telemetry.py`` never writes as raw
+#: evidence (live hp 2026-10-27 r3: "no fresh efa_inventory_mismatch=0 ...
+#: (latest None)" on a SUCCEEDED chain).
+POST_REBOOT_SHORTFALL_METRICS = (
+    "efa_inventory_mismatch",
+    "efa_inventory_missing_count",
+)
 #: The maintenance window the positive stage needs ahead of it.
 POSITIVE_WINDOW_SECONDS = DETECTION_BUDGET + REBOOT_BUDGET + POST_REBOOT_SETTLE_BUDGET
 #: The product's REBOOT_NODE plan (``families/health.py`` ``_reboot_operations``;
@@ -524,9 +545,19 @@ def single_reboot_errors(observed: dict[str, Any]) -> list[str]:
 
 
 def fresh_inventory_errors(
-    observed: dict[str, Any], *, expected: int, after: datetime
+    observed: dict[str, Any], *, expected: int, after: datetime, requested: datetime
 ) -> list[str]:
-    """Post-reboot product samples: the full count, no mismatch, newer than ``after``."""
+    """The product's post-reboot inventory record.
+
+    The latest ``efa_inventory_active_count`` newer than ``after`` (the
+    RESTART_NODE completion the product's own gate reads from) is the restored
+    count: the metric has a latest-value row that every delivered batch
+    advances. The shortfall readings (``POST_REBOOT_SHORTFALL_METRICS``) have
+    none, so they are read off the new boot's first inventory batch: every
+    batch newer than ``requested`` (when RESTART_NODE started) is the old
+    boot's last tick at most and then the new boot's, so the latest reading
+    after it is the new boot's and must be 0.
+    """
 
     def fresh(name: str) -> list[dict[str, Any]]:
         found = [
@@ -548,19 +579,159 @@ def fresh_inventory_errors(
 
     errors = []
     active = fresh("efa_inventory_active_count")
-    mismatch = fresh(MISMATCH_METRIC)
-    anchor = f"after the reboot completed at {after.isoformat()}"
     if not active or active[-1]["value"] != expected:
         errors.append(
-            f"no fresh efa_inventory_active_count={expected} {anchor} "
+            f"no fresh efa_inventory_active_count={expected} after the reboot "
+            f"completed at {after.isoformat()} "
             f"(latest {active[-1]['value'] if active else None})"
         )
-    if not mismatch or mismatch[-1]["value"] != 0:
-        errors.append(
-            f"no fresh {MISMATCH_METRIC}=0 {anchor} "
-            f"(latest {mismatch[-1]['value'] if mismatch else None})"
-        )
+    for name, reading in post_reboot_readings(observed, requested).items():
+        if reading is None:
+            errors.append(
+                f"no {name} reading was recorded after the reboot was requested at "
+                f"{requested.isoformat()}: the new boot's first inventory batch is "
+                "missing"
+            )
+        elif reading["value"] != 0:
+            errors.append(
+                f"the latest {name} after the reboot was requested at "
+                f"{requested.isoformat()} is {reading['value']:g} (observed "
+                f"{reading['observed_at']}), not 0"
+            )
     return errors
+
+
+def post_reboot_readings(
+    observed: dict[str, Any], requested: datetime
+) -> dict[str, dict[str, Any] | None]:
+    """The latest shortfall reading recorded after the reboot was requested, per metric."""
+
+    readings: dict[str, dict[str, Any] | None] = {}
+    for name in POST_REBOOT_SHORTFALL_METRICS:
+        found = [
+            item
+            for item in _numeric(samples(observed, name))
+            if (moment := parse_time(item.get("observed_at"))) is not None
+            and moment > requested
+        ]
+        readings[name] = found[-1] if found else None
+    return readings
+
+
+def reboot_requested_at(
+    observed: dict[str, Any], incident_ids: Iterable[str]
+) -> datetime | None:
+    """When the chain's RESTART_NODE started, by the product's own record."""
+
+    moments = [
+        moment
+        for incident_id in incident_ids
+        for workflow in workflows_of(observed, incident_id)
+        for item in executions(workflow, "RESTART_NODE")
+        if (moment := parse_time(item.get("started_at"))) is not None
+    ]
+    return min(moments) if moments else None
+
+
+def judged_inventory_reading(
+    observed: dict[str, Any], incident_ids: Iterable[str], node: str
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """The chain's SUCCEEDED VALIDATE_FABRIC and the inventory reading it judged.
+
+    Every verdict of the inventory gate records the reading it rests on as
+    ``details.inventory_evidence[node][metric]`` (``adapters/gpu_validation``,
+    batch 175); after RESTART_NODE the gate reads only samples newer than that
+    completion, so this is the product's own fresh post-reboot reading.
+    """
+
+    validations = [
+        item
+        for incident_id in incident_ids
+        for workflow in workflows_of(observed, incident_id)
+        for item in executions(workflow, "VALIDATE_FABRIC")
+        if item.get("status") == "SUCCEEDED"
+    ]
+    if not validations:
+        return None, None
+    execution = validations[-1]
+    evidence = ((execution.get("details") or {}).get("inventory_evidence") or {}).get(
+        node
+    ) or {}
+    reading = evidence.get("efa_inventory_active_count")
+    return execution, reading if isinstance(reading, dict) else None
+
+
+def judged_reading_errors(
+    observed: dict[str, Any],
+    incident_ids: Iterable[str],
+    *,
+    node: str,
+    expected: int,
+    after: datetime,
+) -> list[str]:
+    """The chain's VALIDATE_FABRIC judged the restored count on a post-reboot reading."""
+
+    execution, _ = judged_inventory_reading(observed, incident_ids, node)
+    if execution is None:
+        return [
+            "no SUCCEEDED VALIDATE_FABRIC carries the post-reboot inventory reading "
+            "the chain was judged on"
+        ]
+    return fresh_evidence_errors(execution, node=node, expected=expected, after=after)
+
+
+def await_fresh_inventory(
+    ctx: VariantContext,
+    observed: dict[str, Any],
+    *,
+    since: datetime,
+    expected: int,
+    after: datetime,
+    requested: datetime,
+) -> tuple[list[str], dict[str, Any], int]:
+    """``fresh_inventory_errors`` with one health-summary phase of patience.
+
+    The latest-value rows advance only when a batch is delivered, and a steady
+    healthy node delivers one per ``GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS``; a
+    chain that settles before the first summary after the reboot is judged on
+    the next one. Returns ``(errors, last read, polls)``.
+    """
+
+    errors = fresh_inventory_errors(
+        observed, expected=expected, after=after, requested=requested
+    )
+    if not errors:
+        return [], observed, 0
+    polls = 0
+    last = observed
+
+    def accept() -> dict[str, Any] | None:
+        nonlocal polls, last
+        polls += 1
+        last = activity(ctx, since, metrics=EFA_METRICS)
+        return (
+            last
+            if not fresh_inventory_errors(
+                last, expected=expected, after=after, requested=requested
+            )
+            else None
+        )
+
+    value = ctx.wait_until(
+        accept,
+        timeout_seconds=ctx.host_summary + ctx.host_interval * 2,
+        poll_seconds=max(STORE_POLL_SECONDS, ctx.host_interval),
+        name="fresh-inventory",
+    )
+    if value is not None:
+        return [], value, polls
+    return (
+        fresh_inventory_errors(
+            last, expected=expected, after=after, requested=requested
+        ),
+        last,
+        polls,
+    )
 
 
 def reboot_completed_at(
@@ -1060,17 +1231,35 @@ def _grade_settled(
     ctx.evidence.write("node-after", after)
     stages["node_restored"] = node_restored_errors(before, after, rebooted)
     completed_at = reboot_completed_at(observed, incident_ids)
+    requested_at = reboot_requested_at(observed, incident_ids) or started
+    anchor = completed_at or rebooted_at
+    fresh_errors, fresh_read, polls = await_fresh_inventory(
+        ctx,
+        observed,
+        since=started,
+        expected=expected,
+        after=anchor,
+        requested=requested_at,
+    )
+    reading_errors = judged_reading_errors(
+        observed, incident_ids, node=ctx.settings.node, expected=expected, after=anchor
+    )
+    stages["fresh_inventory"] = fresh_errors + reading_errors
+    _execution, judged = judged_inventory_reading(
+        observed, incident_ids, ctx.settings.node
+    )
     ctx.evidence.write(
         "fresh-inventory-anchor",
         {
+            "restart_node_requested_at": requested_at.isoformat(),
             "restart_node_completed_at": (
                 completed_at.isoformat() if completed_at else None
             ),
             "new_boot_observed_at": rebooted_at.isoformat(),
+            "fresh_inventory_polls": polls,
+            "post_reboot_readings": post_reboot_readings(fresh_read, requested_at),
+            "judged_reading": judged,
         },
-    )
-    stages["fresh_inventory"] = fresh_inventory_errors(
-        observed, expected=expected, after=completed_at or rebooted_at
     )
     events: list[dict[str, Any]] = []
     if rebooted is None:
@@ -1278,20 +1467,26 @@ __all__ = [
     "REBOOT_BUDGET",
     "REBOOT_CHAIN",
     "UNKNOWN_MARKER",
+    "POST_REBOOT_SHORTFALL_METRICS",
     "VARIANTS",
+    "await_fresh_inventory",
     "confirmed_sample_errors",
     "efa_functions",
     "expected_efa_count",
     "fresh_inventory_errors",
     "hand_back",
     "hyperpod_logical_id",
+    "judged_inventory_reading",
+    "judged_reading_errors",
     "node_identity",
     "node_restored_errors",
     "pci_missing",
     "peer_errors",
+    "post_reboot_readings",
     "provider_receipt",
     "reboot_completed_at",
     "reboot_receipt_errors",
+    "reboot_requested_at",
     "residue_errors",
     "single_reboot_errors",
     "unreadable_root",

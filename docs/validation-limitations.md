@@ -2723,16 +2723,33 @@ that no drop-in, deadman, state directory or fixture PCI root survived
 Graded on the product's records only: the confirmed sample's failure mode and
 counts, exactly one SUCCEEDED RESTART_NODE execution and node-scoped remote
 command, no REPLACE_NODE or second reboot, the incident RECOVERED, the node
-Ready and schedulable with the EFA and GPU allocatable at baseline, fresh
-post-reboot `efa_inventory_active_count`/`efa_inventory_mismatch` -- fresh
-meaning newer than the SUCCEEDED RESTART_NODE execution's `updated_at` in the
-product's record, the anchor its own inventory gate reads from
-(`adapters/gpu_validation.inventory_observation_window`), not the runner's
-clock after its post-reboot settle, probe re-create, snapshot and read-back:
-the new boot's first batch is the only one the edge filter delivers before the
-next health summary, live hp 2026-10-27 it fell between the two anchors and a
-SUCCEEDED chain read "no fresh ... (latest None)"; both anchors are recorded in
-`fresh-inventory-anchor.json` --, the provider's CloudTrail reboot record (EC2
+Ready and schedulable with the EFA and GPU allocatable at baseline, the
+post-reboot inventory on the signals the product really records -- (1) the
+latest `efa_inventory_active_count` (in
+`host_health.NodeHealthPolicy.LATEST_METRICS_REQUIRED`, so every delivered
+batch, health summaries included, advances its latest-value row) newer than
+the SUCCEEDED RESTART_NODE execution's `updated_at`, the anchor the product's
+own inventory gate reads from
+(`adapters/gpu_validation.inventory_observation_window`), waited at most one
+more health-summary phase (`GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS` + 2 ticks);
+(2) the new boot's first inventory batch -- the collector's `baseline`
+delivery, always raw evidence -- reading `efa_inventory_mismatch` /
+`efa_inventory_missing_count` 0, taken as the latest reading after the
+RESTART_NODE execution's `started_at` (the old boot delivers at most one more
+tick, then the new boot's): neither gauge has a latest-value row and a steady
+healthy node delivers health summaries only, which the ingest never writes as
+raw evidence, so "a mismatch=0 sample after the reboot completed" does not
+exist in the product's record (live hp 2026-10-27 r3: SUCCEEDED chain, fresh
+`active_count`, yet "no fresh efa_inventory_mismatch=0 ... (latest None)");
+(3) the chain's SUCCEEDED VALIDATE_FABRIC
+`details.inventory_evidence[node][efa_inventory_active_count]` (batch 175: the
+gate records the reading every verdict rests on) at the expected count,
+observed after that completion. The requested/completed/new-boot moments, the
+wait's polls, the new boot's readings and the gate's judged reading are
+recorded in `fresh-inventory-anchor.json` (the earlier anchor, the runner's
+clock after its post-reboot settle, probe re-create, snapshot and read-back,
+failed even the `active_count` half on hp 2026-10-27 r2 with "latest None")
+--, the provider's CloudTrail reboot record (EC2
 `RebootInstances`, SageMaker `BatchRebootClusterNodes`) naming this node and
 no other -- EC2 by instance id, SageMaker by the `NodeLogicalId` the product
 submits (`hyperpod.py` `NodeLogicalIds`; `request_node_ids` is null in the

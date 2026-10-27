@@ -2576,12 +2576,22 @@ bundle 保守，却判 "did not request process state capture"，是 oracle 把 
   不是夹具路径，`read-source` 证明读回真实 RDMA 树。判定只读产品记录：确认样本的 failure_mode
   与 expected/observed/missing/discovered/driver_bound 计数、恰好一个 SUCCEEDED 的 RESTART_NODE
   执行与节点范围的远程命令、无 REPLACE_NODE、无第二次重启、incident RECOVERED、节点 Ready 且
-  可调度、EFA/GPU allocatable 回到基线、重启后新鲜的 `efa_inventory_active_count=期望`/
-  `mismatch=0`（"新鲜"的锚点是产品记录里 RESTART_NODE 执行 SUCCEEDED 的 `updated_at`——与产品
-  自己的 inventory gate 相同，`adapters/gpu_validation.inventory_observation_window`——而不是运行器
-  在等待 settle、重建探针、snapshot、read-back 之后的本地时间：新 boot 的第一批次是 edge filter 在
-  下一次 health summary 之前唯一投递的一批，实测 hp 2026-10-27 它落在两个锚点之间，SUCCEEDED 的链
-  被判 "no fresh ... (latest None)"；两个锚点记在 `fresh-inventory-anchor.json`）、CloudTrail 中
+  可调度、EFA/GPU allocatable 回到基线、重启后的 inventory 按产品真实记录的信号判定：
+  (1) `efa_inventory_active_count` 的 latest 值（它在 `host_health.NodeHealthPolicy.
+  LATEST_METRICS_REQUIRED` 里，每一批投递——含 health summary——都推进其 latest 行）新于产品记录里
+  RESTART_NODE 执行 SUCCEEDED 的 `updated_at`——与产品自己的 inventory gate 同一锚点
+  （`adapters/gpu_validation.inventory_observation_window`），最多再等一个 health-summary 周期
+  （`GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS` + 2 个 tick）；(2) 新 boot 的第一批 inventory 批次
+  （采集器的 `baseline` 投递，必然写成 raw evidence）里 `efa_inventory_mismatch`/
+  `efa_inventory_missing_count` 为 0——取 RESTART_NODE 执行 `started_at` 之后最新的读数，旧 boot 最多
+  再投一拍、之后就是新 boot；这两个 gauge 没有 latest 行，健康稳态只投 health summary 而 ingest 从不把
+  它写成 raw evidence，所以"重启完成之后的 mismatch=0 样本"在产品记录里不存在（实测 hp 2026-10-27
+  r3：链 SUCCEEDED、`active_count` 新鲜、却判 "no fresh efa_inventory_mismatch=0 ... (latest
+  None)"）；(3) 该链 SUCCEEDED 的 VALIDATE_FABRIC 的 `details.inventory_evidence[node]
+  [efa_inventory_active_count]`（批次 175，gate 每次判定都记录所依据的读数）值为期望且观测于重启完成
+  之后。请求/完成/新 boot 三个时刻、等待轮数、新 boot 读数与 gate 的判定读数都记在
+  `fresh-inventory-anchor.json`（此前的锚点取运行器 settle、重建探针、snapshot、read-back 之后的本地
+  时间，实测 hp 2026-10-27 r2 连 `active_count` 也被判 "latest None"）、CloudTrail 中
   provider 的重启回执（EKS `RebootInstances`/HyperPod `BatchRebootClusterNodes`）只命名本节点——
   EKS 以实例 id，HyperPod 以产品提交的 `NodeLogicalId`（`hyperpod.py` `NodeLogicalIds`，回执里
   `request_node_ids` 为 null），运行器在开窗前用 `sagemaker list-cluster-nodes
