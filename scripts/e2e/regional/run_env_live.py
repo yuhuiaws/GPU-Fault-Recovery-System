@@ -285,7 +285,11 @@ def replay_plans_for_case(case_id: str, preflight: dict[str, Any]) -> dict[str, 
             else:
                 not_run[plans.CORE_TLIMIT] = decision.reason
         elif number == 6:
-            runnable.update(plans.thermal_duration_plan())
+            # One rising read per confirmation sample, the tail at the confirmed
+            # read's duration: the cleared read the edge filter delivers next is
+            # a zero delta (live 2026-10-27, HyperPod: a rise on it re-minted
+            # the WARNING and VALIDATE_GPU failed at the grace).
+            runnable.update(plans.thermal_duration_plan(confirmation_samples=samples))
         elif number == 7:
             runnable.update(plans.power_brake_plans(confirmation_samples=samples))
         elif number == 8:

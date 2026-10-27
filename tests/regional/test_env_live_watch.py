@@ -420,7 +420,7 @@ def test_watch_reverifies_the_repoint_once_when_the_first_read_is_overdue() -> N
     outcome, _window = _run(world, "GF-ENV-LIVE-006", "hw_thermal", reverify=True)
     assert outcome.judgement.outcome == "INCONCLUSIVE"
     reasons = "\n".join(outcome.judgement.inconclusive)
-    assert "consumed 0 of 7 planned replay reads" in reasons
+    assert "consumed 0 of 6 planned replay reads" in reasons
     assert f"({watch.ZERO_READS_PROXY_REFUSED})" in reasons and REFUSAL in reasons
     assert world.snapshots == 1, "one snapshot, not one per poll"
     replay = outcome.judgement.evidence["replay"]

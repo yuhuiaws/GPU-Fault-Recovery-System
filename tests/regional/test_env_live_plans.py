@@ -5,7 +5,10 @@ from __future__ import annotations
 import pytest
 
 from gpu_fault.gpu_metrics import GpuMetricsThresholds
+from scripts.e2e.regional import env_live_expectations as expectations
 from scripts.e2e.regional import env_live_plans as plans
+from scripts.e2e.regional.env_live_watch import CollectorCadence
+from tests.regional._env_live_world import h200_preflight
 from tools.gpu_environment_replay import validate_plan
 
 # Live p5en H200 (2026-10-24): only the T.Limit scale is published.
@@ -107,7 +110,7 @@ def test_every_built_and_auxiliary_plan_validates_against_the_tool() -> None:
     decision = device.decisions[plans.CORE_TLIMIT]
     families = [
         plans.transient_plans(decision, confirmation_samples=3),
-        plans.thermal_duration_plan(),
+        plans.thermal_duration_plan(confirmation_samples=3),
         plans.power_brake_plans(confirmation_samples=3),
         plans.unavailable_field_plans(decision),
     ]
@@ -146,7 +149,7 @@ def test_power_brake_plan_covers_transient_sustained_non_brake_and_mixed() -> No
 
 
 def test_thermal_duration_plan_rises_and_clears_under_both_bits() -> None:
-    family = plans.thermal_duration_plan(increments=3, step_us=1_000_000.0)
+    family = plans.thermal_duration_plan(confirmation_samples=3, step_us=1_000_000.0)
     for label, bit in (
         ("sw_thermal", plans.SW_THERMAL_BIT),
         ("hw_thermal", plans.HW_THERMAL_BIT),
@@ -156,6 +159,93 @@ def test_thermal_duration_plan_rises_and_clears_under_both_bits() -> None:
         assert durations == sorted(durations)
         assert steps[0]["values"]["clock_throttle_reasons"] == bit
         assert steps[-1]["values"]["clock_throttle_reasons"] == 0
+
+
+def test_thermal_duration_plan_tail_repeats_the_confirmed_read() -> None:
+    """The edge filter delivers the confirmation read and the first cleared read
+    only; a rise between them surfaces on the cleared read as a fresh WARNING
+    (live 2026-10-27, HyperPod). One rising read per confirmation sample, the
+    tail at that read's duration."""
+
+    for samples in (2, 3, 5):
+        family = plans.thermal_duration_plan(confirmation_samples=samples)
+        for plan in family.values():
+            validate_plan(plan)
+            steps = plan["steps"]
+            rising = [s for s in steps if s["values"]["clock_throttle_reasons"]]
+            assert len(rising) == samples, "one rising read per confirmation sample"
+            assert all(step["reads"] == 1 for step in rising), (
+                "every rising read is served once"
+            )
+            (tail,) = [s for s in steps if not s["values"]["clock_throttle_reasons"]]
+            assert tail["reads"] == max(3, samples)
+            confirmed = rising[-1]["values"]["thermal_violation_total_us"]
+            assert confirmed == (samples - 1) * 1_000_000.0, "the ramp still rises"
+            assert tail["values"]["thermal_violation_total_us"] == confirmed, (
+                "the cleared read is a zero delta against the delivered confirmation"
+            )
+    with pytest.raises(plans.EnvLivePlanError, match="at least two"):
+        plans.thermal_duration_plan(confirmation_samples=1)
+
+
+def test_duration_expectation_refuses_a_rise_on_the_cleared_read() -> None:
+    """``expectation_for`` grades the plan's shape against the node's own
+    confirmation count before anything is armed."""
+
+    preflight = h200_preflight()
+    good = plans.thermal_duration_plan(confirmation_samples=3)["hw_thermal"]
+    expectation = expectations.expectation_for(
+        case_id="GF-ENV-LIVE-006",
+        plan_name="hw_thermal",
+        plan=good,
+        preflight=preflight,
+        cadence=CollectorCadence(),
+        node="worker-1",
+    )
+    assert expectation.kind == "duration" and expectation.planned_reads == 6
+    assert expectation.trigger_values == (float(plans.HW_THERMAL_BIT),)
+    # The shape that failed live: one rising read more than the confirmation
+    # samples, so the cleared read carried 3e6 over the delivered 2e6.
+    live = {
+        "steps": [
+            *good["steps"][:3],
+            {
+                "reads": 1,
+                "values": {
+                    "thermal_violation_total_us": 3_000_000.0,
+                    "clock_throttle_reasons": plans.HW_THERMAL_BIT,
+                },
+            },
+            {
+                "reads": 3,
+                "values": {
+                    "thermal_violation_total_us": 3_000_000.0,
+                    "clock_throttle_reasons": 0,
+                },
+            },
+        ]
+    }
+    with pytest.raises(ValueError, match="read 5 clears the clock reason") as caught:
+        expectations.expectation_for(
+            case_id="GF-ENV-LIVE-006",
+            plan_name="hw_thermal",
+            plan=live,
+            preflight=preflight,
+            cadence=CollectorCadence(),
+            node="worker-1",
+        )
+    assert "read 3 (the 3-sample confirmation) with 2e+06" in str(caught.value)
+    # A node that confirms on fewer samples than the plan was built for would
+    # deliver an earlier read: the same rise, refused the same way.
+    with pytest.raises(ValueError, match="2-sample confirmation"):
+        expectations.expectation_for(
+            case_id="GF-ENV-LIVE-006",
+            plan_name="hw_thermal",
+            plan=good,
+            preflight=preflight,
+            cadence=CollectorCadence(edge_confirmation_samples=2),
+            node="worker-1",
+        )
 
 
 def test_unavailable_field_plans_cover_null_non_integer_and_blank() -> None:

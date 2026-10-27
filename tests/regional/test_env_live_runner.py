@@ -565,7 +565,7 @@ def test_execute_006_names_a_proxy_that_refuses_every_armed_read(
     assert code == 1 and result["verdict"] == "INCONCLUSIVE", result["stages"]
     assert result["armed_plan"] == "hw_thermal"
     text = "\n".join(result["inconclusive"])
-    assert "consumed 0 of 7 planned replay reads" in text
+    assert "consumed 0 of 6 planned replay reads" in text
     assert "proxy-refused-reads" in text and "with 503" in text
     assert "requested fields are absent" in text
     observation = result["receipts"]["observation"]
@@ -585,7 +585,9 @@ def test_execute_006_names_a_proxy_that_refuses_every_armed_read(
     assert at - world.armed_at >= due, (at, world.armed_at)
     assert observation["replay"]["first_read_due_seconds"] == 15 * 1.1 + 15 + 20
     terms = observation["window"]["terms"]
-    assert terms["cadence_jitter"] == 7 * 15 * 0.1
+    # Six planned reads: three rising (one per confirmation sample) and three
+    # clearing at the confirmed duration (``plans.thermal_duration_plan``).
+    assert terms["cadence_jitter"] == 6 * 15 * 0.1
     assert terms["collector_startup_spread_and_jitter"] == 35
     assert observation["cadence"]["jitter_ratio"] == 0.1
 

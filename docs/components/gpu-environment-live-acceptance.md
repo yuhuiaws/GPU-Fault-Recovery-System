@@ -188,6 +188,25 @@ arm 后每次读取都被 503 拒绝，见"回放工具与接线"。两条 durat
 `hw_thermal`）与 024 `thermal_warning`/`power_performance`（`thermal_violation_total_us`、
 `power_violation_total_us`）同受影响，修复后重跑；判据不变。
 
+计划形状：duration 的递增读数恰为确认样本数（`confirmation_samples`，默认 3，即 collector 的
+`GPU_FAULT_DCGM_EDGE_CONFIRMATION_SAMPLES`），尾部以原因位 0 重复最后一个递增读数的 duration
+（`env_live_plans.thermal_duration_plan`）。edge filter 只投递两次 armed 读取：原因位确认的那一读
+（finding 与只读诊断工作流由此产生）和原因位清除的第一读（`candidate-recovered`，候选清除立即投递）；
+确认之后再递增的读数不会单独投递（已确认候选不是新边沿，violation 计数器按 duty cycle 而非变化判边），
+其数值只会随清除读一起到达控制面，被产品判成一条新的 WARNING（`thermal_duration_decision`：delta ≥
+10000 us），而此后没有读数能在 VALIDATE_GPU 的热告警宽限内清除它：平台尾不是边沿，透传回真实计数（0）
+是 counter reset，ingest 视为无效 delta 而保留 finding。2026-10-27 现网（HyperPod 故障节点，R13g）
+`hw_thermal` 即如此 FAIL：四读递增（0/1e6/2e6/3e6）+ 平台尾 3e6，
+确认读投递 2e6，清除读投递 3e6，产品重判 WARNING（delta 1e6），健康摘要在节点稳定相位（01:49:47Z）
+带回透传的 0，两条只读诊断工作流在创建后恰 120 秒以 `active_gpu_health_findings[thermal_violation_total_us
+WARNING 3e+06>10000]` FAILED，incident RECOVERED 并发 diagnostic-inconclusive 通知——产品按设计
+（`adapters/gpu_validation._validate_active_findings` 的 `temperature_warning_grace`、
+`execution/terminal_state.terminal_decision`）。plain EKS 前一日同一计划 PASS（recovered 批次后 1.3 秒
+VALIDATE_GPU 即 SUCCEEDED），同一输入两集群结果不同，判据不能依赖它。现在尾部重复确认读的 duration，
+清除读对 duration 是零 delta，ingest 在 recovered 批次就清除两条 finding，VALIDATE_GPU 的下一次尝试
+（新鲜样本）SUCCEEDED；`env_live_expectations.expectation_for` 在 `--plan` 与 `--execute` 时按节点真实
+确认样本数校验该形状，不满足即报错、不 arm。判据不变。
+
 ### GF-ENV-LIVE-007
 
 **Power Brake。** 使用 `power-brake.json`，先验证一次 `0x80` 后清除不隔离，

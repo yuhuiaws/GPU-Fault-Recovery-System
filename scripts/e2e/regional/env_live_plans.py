@@ -542,7 +542,11 @@ def pause_read_index(plan: dict[str, Any]) -> int:
 
 
 def thermal_duration_plan(
-    *, baseline_us: float = 0.0, increments: int = 4, step_us: float = 1_000_000.0
+    *,
+    confirmation_samples: int,
+    baseline_us: float = 0.0,
+    step_us: float = 1_000_000.0,
+    clear_reads: int | None = None,
 ) -> dict[str, dict[str, Any]]:
     """GF-ENV-LIVE-006: a rising thermal-violation duration under 0x20 / 0x40.
 
@@ -550,8 +554,39 @@ def thermal_duration_plan(
     nanosecond wire units. The core temperature stays healthy (only the field
     the device already reports is changed), so this exercises the duration /
     composite path, which must stay read-only diagnostic and never DRAIN.
+
+    The duration rises on exactly ``confirmation_samples`` reads -- one per
+    sample the DCGM edge filter needs before it delivers the thermal clock
+    reason as ``candidate-confirmed`` -- and the tail repeats the last rising
+    read's duration with the reason bit cleared. Only two armed reads reach the
+    control plane: the confirmed read (the findings and their read-only
+    diagnostic workflows) and the first cleared read (``candidate-recovered``,
+    delivered at once). A rising read after the confirmed one is never
+    delivered by itself (a confirmed candidate is no new edge and a violation
+    counter is judged by duty cycle, not by change), so its value would surface
+    only on the cleared read -- as a fresh rise the ingest grades into a new
+    WARNING (``thermal_duration_decision``) that nothing clears before
+    VALIDATE_GPU's temperature-warning grace: the flat tail is no edge and the
+    pass-through real counter is a reset the ingest keeps the finding through.
+    Live 2026-10-27 (HyperPod, R13g) the four-read ramp did exactly that:
+    ``candidate-recovered`` carried 3e6 over the delivered 2e6, VALIDATE_GPU
+    failed on the re-minted finding at the grace and both read-only workflows
+    ended FAILED (diagnostic inconclusive). With the tail at the confirmed
+    read's duration the cleared read is a zero delta and the ingest clears both
+    findings before the validation re-checks on that fresh sample.
     """
 
+    rising = int(confirmation_samples)
+    if rising < 2:
+        raise EnvLivePlanError(
+            "a thermal duration plan needs at least two confirmation samples: the "
+            "first read repeats the device's counter and only the later reads rise "
+            "before the clock reason confirms"
+        )
+    clear = max(3, rising) if clear_reads is None else int(clear_reads)
+    if clear < 1:
+        raise EnvLivePlanError("a thermal duration plan needs a clearing read")
+    confirmed_us = baseline_us + (rising - 1) * step_us
     result: dict[str, dict[str, Any]] = {}
     for label, bit in (("sw_thermal", SW_THERMAL_BIT), ("hw_thermal", HW_THERMAL_BIT)):
         steps = [
@@ -562,14 +597,13 @@ def thermal_duration_plan(
                     "clock_throttle_reasons": bit,
                 },
             )
-            for index in range(increments)
+            for index in range(rising)
         ]
         steps.append(
             _reads(
-                3,
+                clear,
                 {
-                    "thermal_violation_total_us": baseline_us
-                    + (increments - 1) * step_us,
+                    "thermal_violation_total_us": confirmed_us,
                     "clock_throttle_reasons": 0,
                 },
             )

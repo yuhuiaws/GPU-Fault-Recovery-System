@@ -208,6 +208,63 @@ def _crosses(value: float, decision: Mapping[str, Any]) -> bool:
     return value <= critical if decision.get("scale") == "tlimit" else value >= critical
 
 
+def _require_duration_tail_at_confirmed_read(
+    values: Mapping[str, list[float | None]],
+    confirmation_samples: int,
+    *,
+    case_id: str,
+    plan_name: str,
+) -> None:
+    """A duration plan's first cleared read must repeat the confirmed duration.
+
+    The DCGM edge filter delivers the thermal clock reason on its
+    ``confirmation_samples``-th consecutive read and the first read without it
+    at once (``candidate-recovered``); a rising read between the two is never
+    delivered by itself (a confirmed candidate is no new edge and a violation
+    counter is judged by duty cycle). Whatever duration the cleared read serves
+    is therefore graded against the confirmed read's: a higher value is a fresh
+    WARNING (``thermal_duration_decision``) that no later read clears before
+    VALIDATE_GPU's temperature-warning grace -- the flat tail is no edge and
+    the pass-through real counter is a reset the ingest keeps the finding
+    through. Live 2026-10-27 (HyperPod, R13g): 2e6 confirmed, 3e6 on the
+    cleared read, both read-only workflows FAILED at the grace with the
+    re-minted finding active. The node's own confirmation count is used, so a
+    plan built for another count is refused before anything is armed.
+    """
+
+    clocks = values.get("clock_throttle_reasons") or []
+    durations = values.get("thermal_violation_total_us") or []
+    confirmed = int(confirmation_samples) - 1
+    if len(durations) != len(clocks) or not 0 <= confirmed < len(clocks):
+        return
+    if not all(number_or_none(value) for value in clocks[: confirmed + 1]):
+        return
+    cleared = next(
+        (
+            index
+            for index in range(confirmed + 1, len(clocks))
+            if clocks[index] is not None and same_value(clocks[index], 0.0)
+        ),
+        None,
+    )
+    if cleared is None:
+        return
+    served_confirmed, served_cleared = durations[confirmed], durations[cleared]
+    if served_confirmed is None or served_cleared is None:
+        return
+    if not same_value(served_cleared, served_confirmed):
+        raise ValueError(
+            f"{case_id} {plan_name}: read {cleared + 1} clears the clock reason while "
+            f"serving thermal_violation_total_us={served_cleared:g}, but the edge "
+            f"filter delivers read {confirmed + 1} (the {int(confirmation_samples)}-"
+            f"sample confirmation) with {served_confirmed:g} and nothing in between; "
+            "the control plane would grade the difference as a fresh WARNING that no "
+            "later read clears before VALIDATE_GPU's grace (a flat duration is no "
+            "edge, the pass-through counter is a reset). The tail must repeat the "
+            "confirmed read's duration (env_live_plans.thermal_duration_plan)"
+        )
+
+
 def _single_field(values: Mapping[str, list[float | None]], case_id: str) -> str:
     names = [
         name for name, items in values.items() if any(v is not None for v in items)
@@ -488,6 +545,12 @@ def expectation_for(
         )
     if number == 6:
         bits = [value for value in _served(values, "clock_throttle_reasons") if value]
+        _require_duration_tail_at_confirmed_read(
+            values,
+            cadence.edge_confirmation_samples,
+            case_id=case_id,
+            plan_name=plan_name,
+        )
         return Expectation(
             **base,
             kind="duration",
