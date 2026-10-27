@@ -1,15 +1,20 @@
-"""GF-GENERAL-LIVE-029 ``worker_restart``: the watcher replaced mid-claim.
+"""GF-GENERAL-LIVE-029 ``worker_restart``: the watcher replaced inside the
+restart transaction, timed from the source failure.
 
-The claim-state reader, the open-claim wait (open, closed-first, never), the
-product-dated claim window and the delete judged against it, the UID-fenced
-delete's exact request, the replacement wait, and the graders over scripted
-completion records; then the variant end to end over a fake job, a fake
-watcher inventory that flips on the delete, and a phase-driven store. The last
-test pins the product facts the window reasoning rests on.
+The source-failure watch over a fake Pod API (cadence, no store read, fixture
+failure), the settle bound against the product's constants, the transaction
+timeline and the delete classification over scripted records, the UID-fenced
+delete's exact request, the replacement wait and the graders; then the variant
+end to end over a fake job, a fake Pod inventory that fails the source and
+flips the watcher on the fenced delete, and a store whose records date the
+transaction around the delete -- every landing, both publish orders and the
+INCONCLUSIVE rules. The last tests pin the approval wording and the product
+facts the design rests on.
 """
 
 from __future__ import annotations
 
+import inspect
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,6 +22,7 @@ from typing import Any
 
 import pytest
 
+from gpu_fault.completion_controller import KubernetesCompletionController
 from gpu_fault.execution.config import (
     ProductionExecutorConfig,
     WorkflowDispatcherConfig,
@@ -27,6 +33,7 @@ from scripts.e2e.regional import general_live_attempts as att
 from scripts.e2e.regional import general_live_network_isolation as iso
 from scripts.e2e.regional import general_live_watcher_restart as wr
 from scripts.e2e.regional.general_live_fixture import VariantInconclusive
+from scripts.e2e.regional.general_live_registry import APPROVALS
 from scripts.e2e.regional.general_live_store import ATTEMPT_PROBE
 from scripts.e2e.regional.regional_commands import RegionalFixtureError
 from tests.regional._general_live_fakes import FakeRegional, make_context, make_settings
@@ -36,12 +43,11 @@ WATCHER_NODE = "ip-10-0-40-9.us-west-2.compute.internal"
 T0 = datetime(2026, 10, 24, tzinfo=timezone.utc)
 JOB = "gl29wr-deadbeef-1"
 ATTEMPT = f"{JOB}-a001"
-#: The claim as the product dates it in the scripted records: reserved at the
-#: recovery workflow's CLAIM, closed when the terminal RESTART_WORKLOAD record
-#: was written. The fake clock of ``make_context`` starts at T0 and advances a
-#: second per reading, so the default window brackets every reading of a test.
-CLAIMED_AT = T0 - timedelta(hours=1)
-CLOSED_AT = T0 + timedelta(hours=1)
+COPY = f"{ATTEMPT}-r-0a1b2c3d"
+
+
+def _seconds(value: float) -> timedelta:
+    return timedelta(seconds=value)
 
 
 def _workflow(
@@ -52,6 +58,7 @@ def _workflow(
     *,
     claimed_at: datetime | None = None,
     updated_at: datetime | None = None,
+    settled_at: datetime | None = None,
 ) -> dict[str, Any]:
     events = []
     if claimed_at is not None:
@@ -79,6 +86,7 @@ def _workflow(
             for item in statuses
         ],
         "events": events,
+        **({"updated_at": settled_at.isoformat()} if settled_at else {}),
     }
 
 
@@ -89,8 +97,12 @@ def _entry(
     decision: str = "PLAN_CREATED",
     stops: int = 1,
     recoveries: int = 1,
+    ended_at: datetime | None = None,
+    published_at: datetime | None = None,
+    decided_at: datetime | None = None,
     claimed_at: datetime | None = None,
-    updated_at: datetime | None = None,
+    closed_at: datetime | None = None,
+    settled_at: datetime | None = None,
 ) -> dict[str, Any]:
     containment = _workflow("wf-c", "STOP_WORKLOADS", ["SUCCEEDED"] * stops)
     recovery = []
@@ -102,6 +114,9 @@ def _entry(
                         "incident_id": f"inc-r{index}",
                         "job_id": JOB,
                         "state": "RECOVERED",
+                        **(
+                            {"created_at": decided_at.isoformat()} if decided_at else {}
+                        ),
                     },
                     "workflow": _workflow(
                         f"wf-r{index}",
@@ -109,17 +124,22 @@ def _entry(
                         restart,
                         recovery_status,
                         claimed_at=claimed_at,
-                        updated_at=updated_at,
+                        updated_at=closed_at,
+                        settled_at=settled_at,
                     ),
                 }
             )
     return {
-        "event": {"terminal_status": "FAILED"},
+        "event": {
+            "terminal_status": "FAILED",
+            **({"ended_at": ended_at.isoformat()} if ended_at else {}),
+        },
         "decision": {"status": decision},
         "containment_incident": {
             "incident_id": "inc-c",
             "job_id": JOB,
             "state": "RECOVERED",
+            **({"created_at": published_at.isoformat()} if published_at else {}),
         },
         "containment_workflows": [containment],
         "recovery": recovery,
@@ -141,25 +161,64 @@ def _records(
     }
 
 
-# --------------------------------------------------------------------------- #
-# claim state and waits
-# --------------------------------------------------------------------------- #
-def test_claim_state_reads_the_reservation_and_the_restart_execution() -> None:
-    assert wr.claim_state(_records(_entry(restart=None), count=0), ATTEMPT) == wr.NONE
-    assert wr.claim_state(_records(_entry(restart=[])), ATTEMPT) == wr.OPEN
-    assert (
-        wr.claim_state(
-            _records(_entry(restart=["WAITING", "WAITING"], recovery_status="RUNNING")),
-            ATTEMPT,
-        )
-        == wr.OPEN
+def _dated(
+    anchor: datetime, offsets: dict[str, float], **changes: Any
+) -> dict[str, Any]:
+    """Records whose transaction markers sit at ``offsets`` seconds from ``anchor``."""
+
+    entry = _entry(
+        restart=changes.pop("restart", ["WAITING", "SUCCEEDED"]),
+        ended_at=anchor + _seconds(offsets["ended"]),
+        published_at=anchor + _seconds(offsets["published"]),
+        decided_at=anchor + _seconds(offsets["decided"]),
+        claimed_at=anchor + _seconds(offsets["claimed"]),
+        closed_at=anchor + _seconds(offsets["closed"]),
+        settled_at=anchor + _seconds(offsets["settled"]),
     )
-    assert (
-        wr.claim_state(_records(_entry(restart=["WAITING", "SUCCEEDED"])), ATTEMPT)
-        == wr.CLOSED
-    )
-    assert wr.claim_state(_records(_entry(restart=["FAILED"])), ATTEMPT) == wr.CLOSED
-    assert wr.claim_state({"attempts": {}}, ATTEMPT) == wr.NONE
+    return _records(entry, **changes)
+
+
+#: Transaction markers relative to the delete request's first clock reading
+#: (the bracket is [0, 1] s under the fake clock), one set per landing.
+LANDINGS: dict[str, dict[str, float]] = {
+    wr.BEFORE_PUBLISH: {
+        "ended": -2,
+        "published": 4,
+        "decided": 8,
+        "claimed": 9,
+        "closed": 12,
+        "settled": 12,
+    },
+    wr.BETWEEN_PUBLISH_AND_RESTART: {
+        "ended": -4,
+        "published": -3,
+        "decided": -1,
+        "claimed": 2,
+        "closed": 5,
+        "settled": 5,
+    },
+    wr.AFTER_RESTART_BEFORE_SETTLE: {
+        "ended": -12,
+        "published": -10,
+        "decided": -8,
+        "claimed": -7,
+        "closed": -2,
+        "settled": 6,
+    },
+    wr.AFTER_SETTLE: {
+        "ended": -32,
+        "published": -30,
+        "decided": -25,
+        "claimed": -24,
+        "closed": -20,
+        "settled": -15,
+    },
+}
+INSIDE = [
+    wr.BEFORE_PUBLISH,
+    wr.BETWEEN_PUBLISH_AND_RESTART,
+    wr.AFTER_RESTART_BEFORE_SETTLE,
+]
 
 
 def _spec():
@@ -178,173 +237,8 @@ def _context(tmp_path: Path, regional: Any):
     )
 
 
-def test_wait_open_claim_returns_the_first_open_read_and_refuses_a_closed_one(
-    tmp_path: Path,
-) -> None:
-    ctx = _context(tmp_path, FakeRegional())
-    sequence = iter(
-        [
-            _records(_entry(restart=None), count=0),
-            _records(_entry(restart=["WAITING"], recovery_status="RUNNING")),
-            _records(_entry(restart=["WAITING", "SUCCEEDED"])),
-        ]
-    )
-    opened = wr.wait_open_claim(
-        ctx, lambda: next(sequence), ATTEMPT, timeout_seconds=600
-    )
-    assert wr.claim_state(opened, ATTEMPT) == wr.OPEN
-    timeline = json.loads(
-        (ctx.evidence.case_dir / "open-claim-timeline.json").read_text()
-    )
-    assert [item["accepted"] for item in timeline["entries"]] == [False, True], (
-        "the wait writes its timeline: one NONE read, then the OPEN one"
-    )
-    assert not (ctx.evidence.case_dir / "open-claim-window.json").is_file(), (
-        "an open claim is not a miss; the window is dated after the records settle"
-    )
-
-    closed = _records(_entry(restart=["SUCCEEDED"]))
-    with pytest.raises(VariantInconclusive, match="closed before the watcher"):
-        wr.wait_open_claim(ctx, lambda: closed, ATTEMPT, timeout_seconds=600)
-
-    never = _records(_entry(restart=None), count=0)
-    with pytest.raises(VariantInconclusive, match="no open restart claim appeared"):
-        wr.wait_open_claim(ctx, lambda: never, ATTEMPT, timeout_seconds=30)
-
-
-def test_wait_open_claim_dates_the_window_it_missed_from_the_product_records(
-    tmp_path: Path,
-) -> None:
-    """Closed at the first read: the detail says how long the claim was open and
-    how long a records read takes, and the window is written as evidence."""
-
-    ctx = _context(tmp_path, FakeRegional())
-    claimed = T0 + timedelta(seconds=30)
-    closed = _records(
-        _entry(
-            restart=["SUCCEEDED"],
-            claimed_at=claimed,
-            updated_at=claimed + timedelta(seconds=2, milliseconds=400),
-        )
-    )
-    with pytest.raises(VariantInconclusive) as raised:
-        wr.wait_open_claim(ctx, lambda: closed, ATTEMPT, timeout_seconds=600)
-    detail = str(raised.value)
-    assert "closed before the watcher could be replaced" in detail
-    assert (
-        f"date the claim open from {claimed.isoformat()} to "
-        f"{(claimed + timedelta(seconds=2, milliseconds=400)).isoformat()}, 2.4 s"
-    ) in detail, detail
-    # The fake clock moves one second per reading: a read "takes" 1 s.
-    assert f"a records read takes up to 1.0 s plus {wr.CLAIM_POLL_SECONDS} s" in detail
-    window = json.loads((ctx.evidence.case_dir / "open-claim-window.json").read_text())
-    assert window["open_seconds"] == 2.4
-    assert window["read_seconds"] == [1.0]
-    assert window["first_read_state"] == wr.CLOSED
-
-    undated = _records(_entry(restart=["SUCCEEDED"]))
-    with pytest.raises(VariantInconclusive, match="records do not date the claim"):
-        wr.wait_open_claim(ctx, lambda: undated, ATTEMPT, timeout_seconds=600)
-
-
-def test_claim_window_dates_the_claim_from_the_recovery_workflow_records() -> None:
-    claimed = T0 + timedelta(seconds=30)
-    closed = claimed + timedelta(seconds=1, milliseconds=750)
-    records = _records(
-        _entry(restart=["SUCCEEDED"], claimed_at=claimed, updated_at=closed)
-    )
-    records["restart_budget"]["updated_at"] = claimed.isoformat()
-    assert wr.claim_window(records, ATTEMPT) == {
-        "reserved_at": claimed.isoformat(),
-        "dispatched_at": (claimed + timedelta(milliseconds=400)).isoformat(),
-        "closed_at": closed.isoformat(),
-        "open_seconds": 1.75,
-        "ledger_updated_at": claimed.isoformat(),
-    }
-    # Still WAITING: the claim has not closed; a workflow without events is
-    # not dated at all; an attempt without records neither.
-    waiting = wr.claim_window(
-        _records(
-            _entry(restart=["WAITING"], recovery_status="RUNNING", claimed_at=claimed)
-        ),
-        ATTEMPT,
-    )
-    assert (waiting["reserved_at"], waiting["closed_at"], waiting["open_seconds"]) == (
-        claimed.isoformat(),
-        None,
-        None,
-    )
-    undated = wr.claim_window(_records(_entry(restart=["SUCCEEDED"])), ATTEMPT)
-    assert undated["reserved_at"] is None and undated["open_seconds"] is None
-    assert wr.claim_window({"attempts": {}}, ATTEMPT)["closed_at"] is None
-
-
-def test_delete_timing_errors_judge_the_delete_bracket_against_the_window() -> None:
-    claimed = T0 + timedelta(seconds=30)
-    window = wr.claim_window(
-        _records(
-            _entry(
-                restart=["SUCCEEDED"],
-                claimed_at=claimed,
-                updated_at=claimed + timedelta(seconds=3),
-            )
-        ),
-        ATTEMPT,
-    )
-
-    def document(before: float, after: float) -> dict[str, str]:
-        return {
-            "deleted_at": (claimed + timedelta(seconds=before)).isoformat(),
-            "deletion_returned_at": (claimed + timedelta(seconds=after)).isoformat(),
-        }
-
-    assert wr.delete_timing_errors(window, document(0.5, 1.5)) == []
-    (late,) = wr.delete_timing_errors(window, document(7.0, 8.0))
-    assert "4.0 s after the claim closed" in late and "3.0 s" in late, late
-    (early,) = wr.delete_timing_errors(window, document(-5.0, -4.0))
-    assert "4.0 s before the claim opened" in early, early
-    (straddle,) = wr.delete_timing_errors(window, document(2.5, 3.5))
-    assert "straddles the window's edge" in straddle, straddle
-    assert wr.delete_timing_errors(
-        wr.claim_window(_records(_entry(restart=["SUCCEEDED"])), ATTEMPT),
-        document(0.5, 1.5),
-    ) == [
-        "the product's records do not date the claim (no CLAIM event on the "
-        "recovery workflow or no terminal RESTART_WORKLOAD record)"
-    ]
-    assert wr.delete_timing_errors(window, {}) == [
-        "the restart document does not date the delete"
-    ]
-    # A document from before the bracket existed is judged on its one stamp.
-    assert (
-        wr.delete_timing_errors(
-            window, {"deleted_at": document(1.0, 1.0)["deleted_at"]}
-        )
-        == []
-    )
-
-
-def test_recovery_settled_needs_every_recovery_workflow_terminal() -> None:
-    assert (
-        wr.recovery_settled(_records(_entry(restart=None), count=0), ATTEMPT) is False
-    )
-    assert (
-        wr.recovery_settled(
-            _records(_entry(restart=["WAITING"], recovery_status="RUNNING")), ATTEMPT
-        )
-        is False
-    )
-    assert wr.recovery_settled(_records(_entry(restart=["SUCCEEDED"])), ATTEMPT) is True
-    assert (
-        wr.recovery_settled(
-            _records(_entry(restart=["FAILED"], recovery_status="FAILED")), ATTEMPT
-        )
-        is True
-    )
-
-
 # --------------------------------------------------------------------------- #
-# the fenced delete and the replacement
+# the fake GPU cluster: the job's Pods and the watcher inventory
 # --------------------------------------------------------------------------- #
 def _pod(uid: str, *, ready: bool = True, rv: str = "100") -> dict[str, Any]:
     return {
@@ -370,20 +264,82 @@ def _pod(uid: str, *, ready: bool = True, rv: str = "100") -> dict[str, Any]:
     }
 
 
+def _job_pod(
+    job_id: str, attempt_id: str, phase: str, *, exit_code: int | None = None
+) -> dict[str, Any]:
+    suffix = "master-0" if attempt_id == f"{job_id}-a001" else "r-master-0"
+    state: dict[str, Any] = (
+        {
+            "terminated": {
+                "exitCode": exit_code,
+                "reason": "Error" if exit_code else "Completed",
+                "finishedAt": "2026-10-24T00:00:30Z",
+            }
+        }
+        if exit_code is not None
+        else ({"running": {}} if phase == "Running" else {"waiting": {}})
+    )
+    return {
+        "metadata": {
+            "name": f"gpu-fault-single-node-{suffix}",
+            "uid": f"pod-{attempt_id}",
+            "labels": {
+                "gpu-fault.io/job-id": job_id,
+                "gpu-fault.io/attempt-id": attempt_id,
+            },
+        },
+        "spec": {"nodeName": NODE},
+        "status": {
+            "phase": phase,
+            "containerStatuses": [
+                {"name": "pytorch", "ready": phase == "Running", "state": state}
+            ],
+        },
+    }
+
+
 class Cluster:
-    """A fake GPU cluster: the watcher inventory flips on the fenced delete."""
+    """A fake GPU cluster: the source Pod runs and fails, the watcher
+    inventory flips on the fenced delete."""
 
     def __init__(self) -> None:
         self.pods = [_pod("uid-old")]
         self.deletes: list[tuple[tuple[str, ...], dict[str, Any]]] = []
         self.polls_before_ready = 1
-        self.exec_calls: list[tuple[str, ...]] = []
+        self.replacement_appears = True
         self.on_delete: Any = None
+        # The source attempt's Pod as the API shows it on successive reads:
+        # these phases first, then Failed (exit 1) beside the restart copy.
+        self.source_phases = ["Pending", "Running"]
+        self.source_never_ends = False
+        self.source_reads = 0
+        self.source_reads_at_delete: int | None = None
+
+    def source_items(self, job_id: str) -> list[dict[str, Any]]:
+        """The job's Pods as the API lists them for ``job_id`` (the variant's
+        own run identity, not a constant): the source attempt ``-a001``, then
+        the product's restart copy beside its failed source."""
+
+        self.source_reads += 1
+        attempt_id = f"{job_id}-a001"
+        if self.source_never_ends or self.source_reads <= len(self.source_phases):
+            index = min(self.source_reads, len(self.source_phases)) - 1
+            return [_job_pod(job_id, attempt_id, self.source_phases[index])]
+        return [
+            _job_pod(job_id, attempt_id, "Failed", exit_code=1),
+            _job_pod(job_id, f"{attempt_id}-r-0a1b2c3d", "Running"),
+        ]
 
     def kubectl(
         self, plane: str, arguments: tuple[str, ...], options: dict[str, Any]
     ) -> str:
         if arguments[:2] == ("get", "pod"):
+            selector = arguments[3] if len(arguments) > 3 else ""
+            if selector.startswith("gpu-fault.io/job-id="):
+                assert arguments == ("get", "pod", "-l", selector, "-o", "json")
+                job_id = selector.split("=", 1)[1]
+                return json.dumps({"items": self.source_items(job_id)})
+            assert selector == f"app={iso.WATCHER_APP}", selector
             if self.polls_before_ready > 0 and any(
                 p["metadata"]["uid"] == "uid-new" for p in self.pods
             ):
@@ -396,7 +352,8 @@ class Cluster:
             assert body["preconditions"]["uid"] == self.pods[0]["metadata"]["uid"], (
                 "fenced on the live UID"
             )
-            self.pods = [_pod("uid-new", rv="200")]
+            self.source_reads_at_delete = self.source_reads
+            self.pods = [_pod("uid-new", rv="200")] if self.replacement_appears else []
             if self.on_delete is not None:
                 self.on_delete()
             return ""
@@ -412,6 +369,201 @@ class Regional(FakeRegional):
         return self.cluster.kubectl(plane, arguments, options)
 
 
+# --------------------------------------------------------------------------- #
+# the settle bound and the source-failure watch
+# --------------------------------------------------------------------------- #
+def test_settle_bound_is_derived_from_the_product_constants() -> None:
+    executor = ProductionExecutorConfig(
+        enabled=False, executor_id="pin", allowed_operations=frozenset()
+    )
+    bound = wr.settle_bound()
+    assert bound == {
+        "replacement_timeout_seconds": float(wr.REPLACEMENT_TIMEOUT_SECONDS),
+        "stop_workloads_cap_seconds": float(
+            executor.step_waiting_limit(WorkflowOperation.STOP_WORKLOADS)
+        ),
+        "restart_workload_cap_seconds": float(
+            executor.step_waiting_limit(WorkflowOperation.RESTART_WORKLOAD)
+        ),
+        "dispatcher_polls_seconds": 2
+        * WorkflowDispatcherConfig(enabled=False).poll_interval_seconds,
+        "watcher_poll_seconds": wr.WATCHER_POLL_SECONDS,
+        "margin_seconds": wr.SETTLE_MARGIN_SECONDS,
+        "total_seconds": 1935.0,
+    }
+    # The watcher poll the harness names is the controller's own default.
+    parameters = inspect.signature(KubernetesCompletionController.__init__).parameters
+    assert parameters["poll_interval_seconds"].default == wr.WATCHER_POLL_SECONDS
+    assert 0 <= wr.DELETE_OFFSET_SECONDS <= 2, "the delete follows the failure at once"
+    assert wr.SOURCE_POLL_SECONDS == 1.0 and wr.SOURCE_START_POLL_SECONDS == 5.0
+    assert bound["total_seconds"] <= _spec().max_minutes * 60 - 900, (
+        "the settle bound fits the variant's window beside the job start and the "
+        "watcher-restored wait"
+    )
+
+
+def test_source_pods_reads_the_attempt_pods_through_the_api() -> None:
+    cluster = Cluster()
+    cluster.source_phases = []
+    pods = wr.source_pods(Regional(cluster), JOB, ATTEMPT)
+    assert [pod["name"] for pod in pods] == ["gpu-fault-single-node-master-0"], (
+        "the restart copy carries another attempt id and is not the source"
+    )
+    (pod,) = pods
+    assert pod["ended"] is True and pod["phase"] == "Failed"
+    assert pod["containers"] == [
+        {
+            "name": "pytorch",
+            "terminated": True,
+            "exit_code": 1,
+            "reason": "Error",
+            "finished_at": "2026-10-24T00:00:30Z",
+        }
+    ]
+    cluster.source_phases = ["Running"]
+    cluster.source_reads = 0
+    (running,) = wr.source_pods(Regional(cluster), JOB, ATTEMPT)
+    assert running["ended"] is False and running["containers"][0]["terminated"] is False
+
+
+def test_wait_source_failure_polls_the_api_each_second_once_running(
+    tmp_path: Path,
+) -> None:
+    cluster = Cluster()
+    cluster.source_phases = ["Pending", "Running", "Running"]
+    ctx = _context(tmp_path, Regional(cluster))
+    sleeps: list[float] = []
+    ctx.sleep = sleeps.append
+    failure = wr.wait_source_failure(ctx, job_id=JOB, attempt_id=ATTEMPT)
+    assert sleeps == [
+        wr.SOURCE_START_POLL_SECONDS,
+        wr.SOURCE_POLL_SECONDS,
+        wr.SOURCE_POLL_SECONDS,
+    ], "five seconds while the Pod starts, one second once it runs"
+    assert failure["polls"] == 4 and failure["waited_seconds"] == 4.0
+    (pod,) = failure["pods"]
+    assert pod["phase"] == "Failed" and pod["containers"][0]["exit_code"] == 1
+    timeline = json.loads(
+        (ctx.evidence.case_dir / "source-failure-timeline.json").read_text()
+    )
+    assert [item["state"] for item in timeline["entries"]] == [
+        "Pending",
+        "Running",
+        "Failed(exit 1)",
+    ], "only state transitions are written"
+
+
+def test_wait_source_failure_is_a_fixture_failure_when_the_source_never_ends(
+    tmp_path: Path,
+) -> None:
+    cluster = Cluster()
+    cluster.source_never_ends = True
+    ctx = _context(tmp_path, Regional(cluster))
+    with pytest.raises(RegionalFixtureError, match="did not end within 30 s"):
+        wr.wait_source_failure(ctx, job_id=JOB, attempt_id=ATTEMPT, timeout_seconds=30)
+
+
+# --------------------------------------------------------------------------- #
+# dating the transaction and the delete
+# --------------------------------------------------------------------------- #
+def test_transaction_timeline_dates_the_markers_from_the_records() -> None:
+    anchor = T0 + _seconds(100)
+    offsets = LANDINGS[wr.BETWEEN_PUBLISH_AND_RESTART]
+    records = _dated(anchor, offsets)
+    records["restart_budget"]["updated_at"] = (anchor + _seconds(2)).isoformat()
+    assert wr.transaction_timeline(records, ATTEMPT) == {
+        "source_ended_at": (anchor + _seconds(-4)).isoformat(),
+        "published_at": (anchor + _seconds(-3)).isoformat(),
+        "decided_at": (anchor + _seconds(-1)).isoformat(),
+        "reserved_at": (anchor + _seconds(2)).isoformat(),
+        "dispatched_at": (anchor + _seconds(2.4)).isoformat(),
+        "restart_closed_at": (anchor + _seconds(5)).isoformat(),
+        "settled_at": (anchor + _seconds(5)).isoformat(),
+        "claim_open_seconds": 3.0,
+        "transaction_seconds": 8.0,
+        "ledger_updated_at": (anchor + _seconds(2)).isoformat(),
+    }
+    # A recovery still running dates no settle and no restart end.
+    open_records = _records(
+        _entry(
+            restart=["WAITING"],
+            recovery_status="RUNNING",
+            published_at=anchor,
+            claimed_at=anchor + _seconds(3),
+            settled_at=anchor + _seconds(4),
+        )
+    )
+    timeline = wr.transaction_timeline(open_records, ATTEMPT)
+    assert (timeline["restart_closed_at"], timeline["settled_at"]) == (None, None)
+    assert timeline["reserved_at"] == (anchor + _seconds(3)).isoformat()
+    undated = wr.transaction_timeline(_records(_entry(restart=["SUCCEEDED"])), ATTEMPT)
+    assert all(value is None for value in undated.values()), undated
+    assert wr.transaction_timeline({"attempts": {}}, ATTEMPT)["published_at"] is None
+
+
+def _bracket(
+    anchor: datetime, before: float = 0.0, after: float = 1.0
+) -> dict[str, str]:
+    return {
+        "deleted_at": (anchor + _seconds(before)).isoformat(),
+        "deletion_returned_at": (anchor + _seconds(after)).isoformat(),
+    }
+
+
+@pytest.mark.parametrize("landed", list(LANDINGS))
+def test_classify_delete_places_the_bracket_in_the_transaction(landed: str) -> None:
+    anchor = T0 + _seconds(100)
+    timeline = wr.transaction_timeline(_dated(anchor, LANDINGS[landed]), ATTEMPT)
+    landing = wr.classify_delete(timeline, _bracket(anchor))
+    assert landing["landed"] == landed
+    assert landing["after_publish_seconds"] == -LANDINGS[landed]["published"]
+    assert landing["before_settle_seconds"] == LANDINGS[landed]["settled"] - 1.0
+    assert landing["detail"].startswith(
+        f"the delete request ran {anchor.isoformat()} -> "
+        f"{(anchor + _seconds(1)).isoformat()}, "
+    ), landing["detail"]
+    assert f"settled_at {timeline['settled_at']}" in landing["detail"]
+    assert (wr.landing_inconclusive_reason(landing) is None) == (
+        landed != wr.AFTER_SETTLE
+    )
+
+
+def test_classify_delete_is_conservative_at_the_settle_and_without_dates() -> None:
+    anchor = T0 + _seconds(100)
+    offsets = {**LANDINGS[wr.AFTER_SETTLE], "settled": 0.5}
+    timeline = wr.transaction_timeline(_dated(anchor, offsets), ATTEMPT)
+    straddle = wr.classify_delete(timeline, _bracket(anchor))
+    assert straddle["landed"] == wr.AFTER_SETTLE, (
+        "a bracket straddling the settle may have acted on a finished transaction"
+    )
+    reason = wr.landing_inconclusive_reason(straddle)
+    assert reason is not None and reason.startswith(
+        "the watcher was replaced after the restart transaction had settled: "
+    )
+    # Before the publish on the single stamp of a document without a bracket.
+    single = wr.classify_delete(
+        wr.transaction_timeline(_dated(anchor, LANDINGS[wr.BEFORE_PUBLISH]), ATTEMPT),
+        {"deleted_at": anchor.isoformat()},
+    )
+    assert single["landed"] == wr.BEFORE_PUBLISH
+    assert single["deletion_returned_at"] == anchor.isoformat()
+    undated = wr.classify_delete(
+        wr.transaction_timeline(_records(_entry(restart=["SUCCEEDED"])), ATTEMPT),
+        _bracket(anchor),
+    )
+    assert undated["landed"] == wr.UNDATED
+    assert "do not date the transaction's publish" in undated["detail"]
+    assert wr.landing_inconclusive_reason(undated) is None, "the graders judge"
+    no_document = wr.classify_delete(timeline, {})
+    assert no_document["landed"] == wr.UNDATED
+    assert no_document["detail"].startswith("the restart document does not date"), (
+        no_document["detail"]
+    )
+
+
+# --------------------------------------------------------------------------- #
+# the fenced delete and the replacement
+# --------------------------------------------------------------------------- #
 def test_delete_watcher_pod_sends_a_uid_and_version_fenced_raw_delete() -> None:
     cluster = Cluster()
     regional = Regional(cluster)
@@ -442,7 +594,7 @@ def test_restart_watcher_waits_for_a_ready_pod_with_a_new_uid(tmp_path: Path) ->
     cluster = Cluster()
     cluster.polls_before_ready = 2
     ctx = _context(tmp_path, Regional(cluster))
-    document = wr.restart_watcher(ctx)
+    document = wr.restart_watcher(ctx, source_failure={"polls": 3})
     assert (
         document["deleted"]["uid"] == "uid-old"
         and document["replacement"]["uid"] == "uid-new"
@@ -454,6 +606,8 @@ def test_restart_watcher_waits_for_a_ready_pod_with_a_new_uid(tmp_path: Path) ->
         "the delete request is bracketed by two clock readings before the "
         "replacement wait"
     )
+    assert document["source_failure"] == {"polls": 3}
+    assert document["delete_offset_seconds"] == wr.DELETE_OFFSET_SECONDS
     assert wr.replacement_errors(document) == []
     assert (ctx.evidence.case_dir / "watcher-restart.json").is_file(), (
         "the restart document is evidence"
@@ -471,6 +625,25 @@ def test_wait_replacement_gives_up_after_the_timeout(tmp_path: Path) -> None:
     ctx = _context(tmp_path, Regional(cluster))
     with pytest.raises(RegionalFixtureError, match="no Ready replacement"):
         wr.wait_replacement(ctx, "uid-old", timeout_seconds=30)
+
+
+def test_recovery_settled_needs_every_recovery_workflow_terminal() -> None:
+    assert (
+        wr.recovery_settled(_records(_entry(restart=None), count=0), ATTEMPT) is False
+    )
+    assert (
+        wr.recovery_settled(
+            _records(_entry(restart=["WAITING"], recovery_status="RUNNING")), ATTEMPT
+        )
+        is False
+    )
+    assert wr.recovery_settled(_records(_entry(restart=["SUCCEEDED"])), ATTEMPT) is True
+    assert (
+        wr.recovery_settled(
+            _records(_entry(restart=["FAILED"], recovery_status="FAILED")), ATTEMPT
+        )
+        is True
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -519,11 +692,7 @@ def test_worker_restart_errors_pin_one_restart_and_the_kept_reservation() -> Non
 
 def test_attempt_once_errors_need_exactly_one_restart_attempt() -> None:
     source = {"attempt_id": ATTEMPT, "job_id": JOB, "workload_phase": "FAILED"}
-    restart = {
-        "attempt_id": f"{ATTEMPT}-r-0a1b2c3d",
-        "job_id": JOB,
-        "workload_phase": "RUNNING",
-    }
+    restart = {"attempt_id": COPY, "job_id": JOB, "workload_phase": "RUNNING"}
     assert (
         wr.attempt_once_errors([source, restart], job_id=JOB, source_attempt_id=ATTEMPT)
         == []
@@ -548,6 +717,43 @@ def test_attempt_once_errors_need_exactly_one_restart_attempt() -> None:
         wr.attempt_once_errors(
             [source, restart, other], job_id=JOB, source_attempt_id=ATTEMPT
         )
+        == []
+    )
+
+
+def test_attempt_once_passes_when_the_replacement_published_the_source_terminal() -> (
+    None
+):
+    """BEFORE_PUBLISH: the deleted watcher never published the source; the
+    replacement publishes its terminal from the outbox after the delete and
+    later observes the copy -- the same two attempt ids, one restart."""
+
+    deleted_at = T0 + _seconds(100)
+    observations = [
+        {
+            "attempt_id": ATTEMPT,
+            "job_id": JOB,
+            "workload_phase": "FAILED",
+            "observed_at": (deleted_at + _seconds(6)).isoformat(),
+            "watcher_instance": "w2",
+        },
+        {
+            "attempt_id": COPY,
+            "job_id": JOB,
+            "workload_phase": "RUNNING",
+            "observed_at": (deleted_at + _seconds(40)).isoformat(),
+            "watcher_instance": "w2",
+        },
+    ]
+    assert (
+        wr.attempt_once_errors(observations, job_id=JOB, source_attempt_id=ATTEMPT)
+        == []
+    )
+    # And the other order: the deleted watcher published the source before it went.
+    observations[0]["observed_at"] = (deleted_at - _seconds(3)).isoformat()
+    observations[0]["watcher_instance"] = "w1"
+    assert (
+        wr.attempt_once_errors(observations, job_id=JOB, source_attempt_id=ATTEMPT)
         == []
     )
 
@@ -584,18 +790,25 @@ class FakeFailJob:
 
 
 class Store:
-    """The completion records by phase: none -> open -> (delete) -> closed."""
+    """The completion records, dated around the delete.
+
+    ``anchor`` is the delete request's first clock reading (set by the fenced
+    delete); the transaction markers sit at ``offsets`` seconds from it, so
+    the same scripted store yields every landing. A read before the delete
+    is counted: the variant must not read the store before it deletes.
+    """
 
     def __init__(self) -> None:
-        self.phase = "none"
-        self.reads_before_open = 1
+        self.anchor: datetime | None = None
+        self.offsets = dict(LANDINGS[wr.BETWEEN_PUBLISH_AND_RESTART])
+        self.reads_before_delete = 0
         self.restart_statuses = ["WAITING", "SUCCEEDED"]
         self.count = 1
         self.reservations: list[str] | None = None
         self.restart_observed = 1
-        # The product-dated claim window in the settled records.
-        self.claimed_at: datetime | None = CLAIMED_AT
-        self.closed_at: datetime | None = CLOSED_AT
+        # The source observation's publisher: the deleted watcher, before the
+        # delete (negative), or the replacement, after it (positive).
+        self.source_observed_offset = -3.0
         self.notifications = [
             {
                 "incident_id": "inc-c",
@@ -612,43 +825,38 @@ class Store:
                 "status": "SENT",
             },
         ]
-        self.deleted_in_phase: str | None = None
 
     def respond(self, script: str, *arguments: str) -> dict[str, Any]:
         job = arguments[1]
         attempt = f"{job}-a001"
         if script == ATTEMPT_PROBE:
-            if self.phase == "none":
-                if self.reads_before_open == 0:
-                    self.phase = "open"
-                else:
-                    self.reads_before_open -= 1
-                    entry = _entry(restart=None)
-                    return {"attempts": {attempt: entry}, "restart_budget": None}
-            if self.phase == "open":
-                entry = _entry(restart=["WAITING"], recovery_status="RUNNING")
+            if self.anchor is None:
+                self.reads_before_delete += 1
                 return {
-                    "attempts": {attempt: entry},
-                    "restart_budget": {
-                        "restart_count": 1,
-                        "reservation_ids": ["wf-r0/0/RESTART_WORKLOAD"],
-                        "budget": 1,
-                    },
+                    "attempts": {attempt: _entry(restart=None)},
+                    "restart_budget": None,
                 }
-            entry = _entry(
+            records = _dated(
+                self.anchor,
+                self.offsets,
                 restart=self.restart_statuses,
-                claimed_at=self.claimed_at,
-                updated_at=self.closed_at,
+                count=self.count,
+                reservations=self.reservations,
             )
-            records = _records(entry, count=self.count, reservations=self.reservations)
-            return {**records, "attempts": {attempt: entry}}
+            return {**records, "attempts": {attempt: records["attempts"][ATTEMPT]}}
         if script == iso.ISOLATION_RECORDS_PROBE:
+            anchor = self.anchor or T0
             observations = [
                 {
                     "attempt_id": attempt,
                     "job_id": job,
                     "workload_phase": "FAILED",
-                    "observed_at": T0.isoformat(),
+                    "observed_at": (
+                        anchor + _seconds(self.source_observed_offset)
+                    ).isoformat(),
+                    "watcher_instance": "w1"
+                    if self.source_observed_offset < 0
+                    else "w2",
                     "containers": 1,
                 }
             ]
@@ -657,7 +865,8 @@ class Store:
                     "attempt_id": f"{attempt}-r-{index:08x}",
                     "job_id": job,
                     "workload_phase": "RUNNING",
-                    "observed_at": T0.isoformat(),
+                    "observed_at": (anchor + _seconds(40)).isoformat(),
+                    "watcher_instance": "w2",
                     "containers": 1,
                 }
                 for index in range(self.restart_observed)
@@ -665,7 +874,7 @@ class Store:
             return {
                 "heartbeat": {
                     "cluster_id": "gpu-eks-cluster",
-                    "observed_at": (T0 + timedelta(days=1)).isoformat(),
+                    "observed_at": (anchor + timedelta(days=1)).isoformat(),
                     "watched_pods": 1,
                     "watched_attempts": 1,
                     "watcher_instance": "w2",
@@ -682,10 +891,20 @@ def _variant(
 ):
     FakeFailJob.instances = []
     monkeypatch.setattr(att, "ManagedFailJob", FakeFailJob)
+    ctx = _context(tmp_path, Regional(cluster, cpu_python=store.respond))
+    readings: list[datetime] = []
+    base_clock = ctx.clock
+
+    def clock() -> datetime:
+        value = base_clock()
+        readings.append(value)
+        return value
+
+    ctx.clock = clock
 
     def on_delete() -> None:
-        store.deleted_in_phase = store.phase
-        store.phase = "closed"
+        # The reading the runner took just before the delete request.
+        store.anchor = readings[-1]
 
     cluster.on_delete = on_delete
     original = cluster.kubectl
@@ -698,7 +917,6 @@ def _variant(
         return original(plane, arguments, options)
 
     cluster.kubectl = guarded  # type: ignore[method-assign]
-    ctx = _context(tmp_path, Regional(cluster, cpu_python=store.respond))
     return ctx
 
 
@@ -713,12 +931,20 @@ def test_a_missing_watcher_after_the_job_started_is_a_fixture_failure(
     (job,) = FakeFailJob.instances
     assert ctx.cleanup.pending() == [f"job-{job.name}"], "the job's undo is registered"
     assert cluster.deletes == [], "nothing is deleted without a watcher"
+    assert cluster.source_reads == 0, "the source is not watched without a watcher"
 
 
-def test_worker_restart_passes_when_the_claim_survives_the_replacement(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("source_observed_offset", [-3.0, 6.0], ids=["w1", "w2"])
+@pytest.mark.parametrize("landed", INSIDE)
+def test_worker_restart_passes_for_every_landing_inside_the_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    landed: str,
+    source_observed_offset: float,
 ) -> None:
     store, cluster = Store(), Cluster()
+    store.offsets = dict(LANDINGS[landed])
+    store.source_observed_offset = source_observed_offset
     ctx = _variant(tmp_path, monkeypatch, store, cluster)
     spec = ctx.spec
     assert (
@@ -728,9 +954,12 @@ def test_worker_restart_passes_when_the_claim_survives_the_replacement(
     )
     result = spec.execute(ctx)
     assert result["verdict"] == "PASS", result["errors"]
-    assert store.deleted_in_phase == "open", "the Pod went while the claim was open"
+    assert result["delete_landed"] == landed
+    assert store.reads_before_delete == 0, "no store read before the delete"
+    assert cluster.source_reads_at_delete == len(cluster.source_phases) + 1, (
+        "the delete follows the first read that showed the source ended"
+    )
     assert len(cluster.deletes) == 1
-    assert result["claim_state_at_delete"] == wr.OPEN
     assert result["watcher"] == {
         "deleted": "uid-old",
         "replacement": "uid-new",
@@ -743,75 +972,73 @@ def test_worker_restart_passes_when_the_claim_survives_the_replacement(
         "notifications",
         "watcher_restored",
     }
+    timing = result["delete_timing"]
+    assert timing["after_publish_seconds"] == -store.offsets["published"]
+    assert (
+        result["transaction"]["published_at"]
+        == (store.anchor + _seconds(store.offsets["published"])).isoformat()
+    )
+    assert any(f"the delete landed {landed}: " in note for note in result["notes"]), (
+        result["notes"]
+    )
     job = FakeFailJob.instances[-1]
     assert job.mode == "exit:1" and job.restart_budget == 1
     assert ctx.cleanup.pending() == [f"job-{job.name}"]
-    assert (ctx.evidence.case_dir / "open-claim-records.json").is_file(), (
-        "the records at the open claim are evidence"
-    )
-    assert result["claim_window"] == {
-        "reserved_at": CLAIMED_AT.isoformat(),
-        "dispatched_at": (CLAIMED_AT + timedelta(milliseconds=400)).isoformat(),
-        "closed_at": CLOSED_AT.isoformat(),
-        "open_seconds": 7200.0,
-        "ledger_updated_at": None,
-    }
-    window = json.loads((ctx.evidence.case_dir / "open-claim-window.json").read_text())
-    assert window["timing"] == [] and set(window["stages"]) == set(result["stages"])
-    assert window["deleted_at"] < window["deletion_returned_at"], (
-        "the delete bracket is on the window evidence"
-    )
+    for name in ("source-failure-timeline", "watcher-restart", "delete-timing"):
+        assert (ctx.evidence.case_dir / f"{name}.json").is_file(), name
+    document = json.loads((ctx.evidence.case_dir / "delete-timing.json").read_text())
+    assert document["landing"] == timing
+    assert document["settle_bound"]["total_seconds"] == 1935.0
+    assert document["source_failure"]["pods"][0]["containers"][0]["exit_code"] == 1
+    assert set(document["stages"]) == set(result["stages"])
 
 
-def test_worker_restart_is_inconclusive_when_the_restart_ended_before_the_delete(
+def test_worker_restart_is_inconclusive_when_the_delete_landed_after_settle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store, cluster = Store(), Cluster()
-    store.phase = "closed"
-    store.claimed_at = T0 + timedelta(seconds=1)
-    store.closed_at = T0 + timedelta(seconds=3, milliseconds=200)
-    ctx = _variant(tmp_path, monkeypatch, store, cluster)
-    with pytest.raises(
-        VariantInconclusive, match="closed before the watcher"
-    ) as raised:
-        ctx.spec.execute(ctx)
-    assert "2.2 s" in str(raised.value), str(raised.value)
-    assert cluster.deletes == [], "no watcher Pod is deleted outside the window"
-
-
-def test_worker_restart_is_inconclusive_when_the_delete_missed_the_dated_window(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The first read was OPEN, but the settled records date the claim closed
-    before the delete request went out: the condition was not established,
-    whatever the oracle would have said, and the stages stay as evidence."""
-
-    store, cluster = Store(), Cluster()
-    store.claimed_at = T0 + timedelta(seconds=1)
-    store.closed_at = T0 + timedelta(seconds=3)
+    store.offsets = dict(LANDINGS[wr.AFTER_SETTLE])
     ctx = _variant(tmp_path, monkeypatch, store, cluster)
     with pytest.raises(VariantInconclusive) as raised:
         ctx.spec.execute(ctx)
     detail = str(raised.value)
-    assert detail.startswith("the watcher was not replaced inside the open claim: "), (
-        detail
+    assert detail.startswith(
+        "the watcher was replaced after the restart transaction had settled: "
+    ), detail
+    assert (
+        "15.0 s after the publish" not in detail
+        and "30.0 s after the publish" in detail
     )
-    assert "after the claim closed" in detail and "2.0 s" in detail, detail
-    assert store.deleted_in_phase == "open", "the delete did go out on an OPEN read"
-    assert len(cluster.deletes) == 1
-    window = json.loads((ctx.evidence.case_dir / "open-claim-window.json").read_text())
-    assert window["open_seconds"] == 2.0
-    assert window["timing"] == [detail.split(": ", 1)[1]]
-    assert set(window["stages"]) == {
-        "watcher_replaced",
-        "single_restart",
-        "attempt_once",
-        "notifications",
-        "watcher_restored",
-    }
-    assert window["stages"]["single_restart"] == [], (
+    assert len(cluster.deletes) == 1, "the delete did go out at the source failure"
+    document = json.loads((ctx.evidence.case_dir / "delete-timing.json").read_text())
+    assert document["landing"]["landed"] == wr.AFTER_SETTLE
+    assert document["stages"]["single_restart"] == [], (
         "the oracle itself was clean; only the precondition failed"
     )
+
+
+def test_worker_restart_is_a_fixture_failure_without_a_ready_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, cluster = Store(), Cluster()
+    cluster.replacement_appears = False
+    ctx = _variant(tmp_path, monkeypatch, store, cluster)
+    with pytest.raises(RegionalFixtureError, match="no Ready replacement"):
+        ctx.spec.execute(ctx)
+    assert len(cluster.deletes) == 1
+    assert store.reads_before_delete == 0, "no store read before the delete"
+
+
+def test_worker_restart_is_a_fixture_failure_when_the_source_never_ends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, cluster = Store(), Cluster()
+    cluster.source_never_ends = True
+    ctx = _variant(tmp_path, monkeypatch, store, cluster)
+    with pytest.raises(RegionalFixtureError, match="did not end within 900 s"):
+        ctx.spec.execute(ctx)
+    assert cluster.deletes == [], "no watcher Pod is deleted without a source failure"
+    assert store.reads_before_delete == 0
 
 
 @pytest.mark.parametrize(
@@ -870,11 +1097,22 @@ def test_worker_restart_fails_on_duplicate_notifications(
 
 
 # --------------------------------------------------------------------------- #
-# the product facts the window reasoning rests on
+# the wording and the product facts the design rests on
 # --------------------------------------------------------------------------- #
+def test_control_plane_restart_approval_and_spec_name_the_transaction() -> None:
+    meaning = APPROVALS["CONTROL_PLANE_RESTART"]
+    assert "inside the restart transaction" in meaning, meaning
+    assert "open restart claim" not in meaning, meaning
+    spec = _spec()
+    assert "first API observation of the source Pod's failure" in spec.injection
+    assert "no store read" in spec.injection
+    assert "a delete dated after the settle is INCONCLUSIVE" in spec.expected
+
+
 def test_open_claim_is_one_control_loop_round_trip_in_the_product() -> None:
-    """The harness dates the window instead of trying to widen it because of
-    these product facts; a change to any of them is the cue to revisit.
+    """The variant times its delete from the source failure instead of an
+    "open claim" because of these product facts; a change to any of them is
+    the cue to revisit.
 
     The data plane's RESTART_WORKLOAD returns SUCCEEDED in the call that
     creates the restart copy, without reading a Pod of it (pinned by the
@@ -882,9 +1120,7 @@ def test_open_claim_is_one_control_loop_round_trip_in_the_product() -> None:
     ``test_terminal_pytorch_restart_creates_retry_object``: ``core_api`` is an
     unused double). The dispatcher is woken by the command's terminal status,
     so the step is recorded SUCCEEDED within the round trip rather than at the
-    next poll. A product-side hold after the submission would run under the
-    step's waiting cap; a start barrier the harness then puts on the restart
-    copy must stay below it with margin (``N + margin < cap``).
+    next poll; the poll is the fallback the settle bound counts.
     """
 
     assert WAKING_REMOTE_COMMAND_STATUSES == frozenset({"SUCCEEDED", "FAILED"})
@@ -892,8 +1128,12 @@ def test_open_claim_is_one_control_loop_round_trip_in_the_product() -> None:
     cap = ProductionExecutorConfig(
         enabled=False, executor_id="pin", allowed_operations=frozenset()
     ).step_waiting_limit(WorkflowOperation.RESTART_WORKLOAD)
-    assert cap == 600, (
-        "the RESTART_WORKLOAD waiting cap any post-submission hold runs under"
-    )
-    assert wr.CLAIM_POLL_SECONDS == 5
+    assert cap == 600, "the RESTART_WORKLOAD waiting cap the settle bound counts"
     assert wr.TERMINAL_STEPS == frozenset({"SUCCEEDED", "FAILED"})
+    assert wr.LANDINGS == (
+        wr.BEFORE_PUBLISH,
+        wr.BETWEEN_PUBLISH_AND_RESTART,
+        wr.AFTER_RESTART_BEFORE_SETTLE,
+        wr.AFTER_SETTLE,
+        wr.UNDATED,
+    )

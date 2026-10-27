@@ -43,7 +43,9 @@ deduction, no new notification (``general_live_terminal_replay``).
 028 ``api_unreachable`` cuts the one completion-watcher Pod off from the
 control plane on its node (``general_live_network_isolation``, tagged FORWARD
 REJECT with a deadman) while a managed job fails, and 029 ``worker_restart``
-deletes that Pod, UID-fenced, while a restart claim is open
+deletes that Pod, UID-fenced, inside the restart transaction -- at the first
+API observation of the source Pod's failure, since the restart reservation
+itself is open for one control-loop round trip only
 (``general_live_watcher_restart``); both grade the same completion records for
 every action happening exactly once.
 """
@@ -1036,31 +1038,33 @@ def missing_context(ctx: VariantContext) -> dict[str, Any]:
 
 
 def worker_restart(ctx: VariantContext) -> dict[str, Any]:
-    """029: the completion watcher is replaced while a restart claim is open.
+    """029: the completion watcher is replaced inside the restart transaction.
 
-    A managed job fails within budget; once the executor has reserved the
-    recovery workflow's RESTART_WORKLOAD and the step has not ended, the one
-    completion-watcher Pod is deleted (UID-fenced, no grace) and the Deployment
-    replaces it. The replacement must not re-decide, re-reserve or re-send:
-    the ledger keeps exactly the one reservation of the recovery workflow,
-    one RESTART_WORKLOAD succeeds, one STOP_WORKLOADS, one decision, one
-    restart attempt observed, no notification twice. The claim is open for one
-    control-loop round trip only (``general_live_watcher_restart``), so once
-    the records settle the delete is dated against the product's own window:
-    a delete outside it is INCONCLUSIVE with the stages kept as evidence.
+    A managed job fails within budget. Its source Pod is watched through the
+    GPU-cluster API (one-second cadence, no store read) and at the first
+    observation of its terminated container the one completion-watcher Pod is
+    deleted (UID-fenced, no grace) and the Deployment replaces it; the
+    recovery then settles under the product-derived bound. Whichever side of
+    the watcher's publish the delete landed on, the replacement must not
+    re-decide, re-reserve or re-send: the ledger keeps exactly the one
+    reservation of the recovery workflow, one RESTART_WORKLOAD succeeds, one
+    STOP_WORKLOADS, one decision, one restart attempt observed, no
+    notification twice. Where the delete landed is dated from the records and
+    classified; only a delete after the settle is INCONCLUSIVE
+    (``general_live_watcher_restart``).
     """
 
     job = _job(ctx, "gl29wr-" + _suffix(ctx), "exit:1", restart_budget=1)
     _watcher_singleton(ctx)
-    opened = watcher_restart.wait_open_claim(
+    restarted = watcher_restart.replace_watcher_at_source_failure(
+        ctx, job_id=job.name, attempt_id=job.attempt_id
+    )
+    records = watcher_restart.wait_recovery_settled(
         ctx,
         lambda: _records(ctx, job),
         job.attempt_id,
-        timeout_seconds=ATTEMPT_BUDGET,
+        deleted_at=datetime.fromisoformat(str(restarted["deleted_at"])),
     )
-    ctx.evidence.write("open-claim-records", opened)
-    restarted = watcher_restart.restart_watcher(ctx)
-    records = _wait_recovery_settled(ctx, job)
     entry = _attempt(records, job.attempt_id)
     ready_at = datetime.fromisoformat(str(restarted["ready_at"]))
     after = _wait_watcher_restored(ctx, job, entry, since=ready_at)
@@ -1079,28 +1083,29 @@ def worker_restart(ctx: VariantContext) -> dict[str, Any]:
             after, restored_at=ready_at
         ),
     }
-    window = watcher_restart.claim_window(records, job.attempt_id)
-    timing = watcher_restart.delete_timing_errors(window, restarted)
+    timeline = watcher_restart.transaction_timeline(records, job.attempt_id)
+    landing = watcher_restart.classify_delete(timeline, restarted)
     ctx.evidence.write(
-        "open-claim-window",
+        "delete-timing",
         {
-            **window,
-            "deleted_at": restarted.get("deleted_at"),
-            "deletion_returned_at": restarted.get("deletion_returned_at"),
-            "timing": timing,
+            "landing": landing,
+            "transaction": timeline,
+            "source_failure": restarted.get("source_failure"),
+            "settle_bound": watcher_restart.settle_bound(),
             "stages": stages,
         },
     )
-    if timing:
-        raise VariantInconclusive(
-            "the watcher was not replaced inside the open claim: " + "; ".join(timing)
-        )
+    reason = watcher_restart.landing_inconclusive_reason(landing)
+    if reason is not None:
+        raise VariantInconclusive(reason)
     return _result(
         stages,
         notes=[
-            "the watcher Pod was deleted fenced on its UID/resourceVersion while the "
-            "recovery workflow's RESTART_WORKLOAD reservation was open; the replacement "
-            "restored its state from the product's own ConfigMaps",
+            "the watcher Pod was deleted fenced on its UID/resourceVersion at the first "
+            "API observation of the source Pod's failure, inside the restart "
+            "transaction; the replacement restored its state from the product's own "
+            "ConfigMaps",
+            f"the delete landed {landing['landed']}: {landing['detail']}",
             "a reservation that survives the restart as the consumed budget is the "
             "product's record of no double decrement and no lost claim",
         ],
@@ -1111,27 +1116,12 @@ def worker_restart(ctx: VariantContext) -> dict[str, Any]:
                 "replacement": (restarted.get("replacement") or {}).get("uid"),
                 "node": (restarted.get("replacement") or {}).get("node"),
             },
-            "claim_state_at_delete": watcher_restart.claim_state(
-                opened, job.attempt_id
-            ),
-            "claim_window": window,
+            "delete_landed": landing["landed"],
+            "delete_timing": landing,
+            "transaction": timeline,
             "restart_budget": records.get("restart_budget"),
         },
     )
-
-
-def _wait_recovery_settled(ctx: VariantContext, job: ManagedFailJob) -> dict[str, Any]:
-    last: dict[str, Any] = {}
-
-    def accept() -> dict[str, Any] | None:
-        nonlocal last
-        last = _records(ctx, job)
-        return last if watcher_restart.recovery_settled(last, job.attempt_id) else None
-
-    value = ctx.wait_until(
-        accept, timeout_seconds=ATTEMPT_BUDGET, poll_seconds=20, name="recovery-settled"
-    )
-    return value if value is not None else last
 
 
 # --------------------------------------------------------------------------- #
@@ -1409,17 +1399,19 @@ VARIANTS = [
         risk="H",
         flags="X",
         injection=(
-            "while the recovery workflow's RESTART_WORKLOAD reservation is open "
-            "(reserved on the ledger, step not yet ended), the one completion-watcher "
-            "Pod is deleted fenced on its UID/resourceVersion with no grace, so the "
-            "Deployment replaces it"
+            "inside the restart transaction of the managed job: at the first API "
+            "observation of the source Pod's failure (one-second watch, no store "
+            "read) the one completion-watcher Pod is deleted fenced on its "
+            "UID/resourceVersion with no grace, so the Deployment replaces it; where "
+            "the delete landed (before the publish, between publish and restart, "
+            "after the restart) is dated from the records afterwards"
         ),
         expected=(
             "the replacement re-posts nothing that counts: restart_count 1 == the one "
             "reservation of the recovery workflow (not lost, not doubled), one "
             "RESTART_WORKLOAD SUCCEEDED, one STOP_WORKLOADS, one decision, exactly one "
-            "restart attempt observed, no notification twice, a coverage heartbeat from "
-            "the replacement"
+            "restart attempt observed, no notification twice, a write from the "
+            "replacement; a delete dated after the settle is INCONCLUSIVE"
         ),
         cleanup=(
             "delete the test job and its restart replica; the watcher Deployment has "

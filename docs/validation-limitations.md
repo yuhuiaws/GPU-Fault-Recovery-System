@@ -2066,7 +2066,8 @@ is the ledger layer against the live store -- the same-reservation idempotency,
 the over-budget refusal, the exactly-once release and the context check before
 any budget read, serialised by the Postgres advisory lock the product uses --
 and not two real executor replicas racing a claimed workflow through the
-dispatcher (a watcher restart mid-claim is 029 `worker_restart`, below). The
+dispatcher (a watcher restart inside the restart transaction is 029
+`worker_restart`, below). The
 product offers no way to delete a ledger
 row, so the cleanup releases this run's reservations through the API and then
 removes the emptied test row with the store's `_delete` primitive (the one
@@ -2204,34 +2205,58 @@ heartbeat lost), a node whose host collector is also unreachable, and the
 10-minute waiting cap a node action would hit if the channel stayed cut.
 
 029 `worker_restart` (`CONTROL_PLANE_RESTART`) deletes the watcher Pod fenced on
-its UID/resourceVersion, with no grace, while the recovery workflow's
-RESTART_WORKLOAD reservation is open (reserved on the ledger, step not yet
-terminal). That window is one control-loop round trip, not the replica's
-start: the claim mints the data-plane command in the tick that reserved, the
-NOTIFY-woken cluster executor creates the restart copy and returns SUCCEEDED
-in the same call (`workload_operations._set_workloads` reads no Pod of the
-copy -- no wait for scheduling or Running), and the command's terminal status
-wakes the dispatcher, which records the step SUCCEEDED. Live it lasts one to a
-few seconds (HyperPod, 2026-10-27: open and closed between two records reads
-10 s apart), shorter than one records read (a `kubectl exec` probe, about
-5 s), so no poll interval and no start barrier in the job's Pod template can
-widen or deliberately hit it from the harness. The runner dates the window
-from the product's records (first CLAIM event of the recovery workflow to the
-terminal RESTART_WORKLOAD record's `updated_at`) and judges its delete against
-it: a claim already closed at the first read, or a delete whose request
-bracket the settled records place outside the window, is INCONCLUSIVE with the
-dated window in the detail (`open-claim-window.json` keeps the stages). A
-deterministic window needs the product to hold the step after the submission
-(WAITING with `restart_submitted: true` until the copy's Pods run); a start
-barrier on the restart copy would then set its length. The replacement restores its state
-from the product's own ConfigMaps and must not re-decide, re-reserve or re-send:
-the ledger keeps exactly the one reservation of the recovery workflow (not lost,
-not doubled), one RESTART_WORKLOAD succeeds, one STOP_WORKLOADS, one decision,
-exactly one restart attempt is observed, no notification is recorded twice and
-a write from the replacement follows (its coverage heartbeat once the cluster is
-idle, or its observation of the restart attempt). The module tests drive the
-sequence over fakes (a phase-driven store, an inventory that flips on the fenced
-delete); the live run is the only proof of the real outbox replay.
+its UID/resourceVersion, with no grace, inside the restart transaction of the
+managed job, timed from the source failure rather than from an "open claim".
+The reservation on the ledger is open for one control-loop round trip only: the
+executor reserves the restart in the tick that claims the recovery workflow and
+mints the data-plane command in the same tick (`regional.py:945-1020`), the
+cluster executor is woken by the command's NOTIFY, creates the restart copy and
+returns SUCCEEDED in the same call (`adapters/kubernetes/workload_operations
+._set_workloads`, 156-235: no Pod of the copy is read, no wait for scheduling
+or Running), and the command's terminal status wakes the dispatcher
+(`execution/dispatcher_wakeups.WAKING_REMOTE_COMMAND_STATUSES`), which records
+the step SUCCEEDED. Live it lasts one to a few seconds (HyperPod, 2026-10-27:
+open and closed between two records reads 10 s apart), shorter than one
+records read (a `kubectl exec` probe, about 5 s), so no poll can gate on it and
+no start barrier on the restart copy's Pod can widen it. The transaction as a
+whole -- failure, publish, containment, terminal, decision, recovery, settle --
+is tens of seconds, and its start is visible without the store: the runner
+reads the source Pod through the GPU-cluster API every second (every five
+while it still starts; `wait_source_failure`, no store read) and deletes the
+watcher Pod at the first observation of a terminated critical container or a
+Failed phase (`DELETE_OFFSET_SECONDS` = 0). The delete therefore lands inside
+the transaction by construction: before the watcher published the failure, and
+the replacement must publish it (from its write-ahead outbox or its own
+observation) and still yield exactly one decision, one reservation and one
+restart; or after it, and the replacement's re-observation must not
+re-publish, re-decide or re-reserve -- both are the product's claims. The
+replacement is then awaited (a new Ready UID within 600 s, the startupProbe
+window) and the recovery's settle under a bound derived from the product's
+constants (`settle_bound`: the 600 s replacement window + one step cap each
+for STOP_WORKLOADS and RESTART_WORKLOAD, 600 s with no override for either
+(`execution/config.py:293`, `:175-182`) + two fallback dispatcher polls of 5 s
+(`:522`) + one watcher poll of 5 s (`completion_controller.py:146`) + a 120 s
+margin = 1935 s from the delete). Where the delete landed is dated afterwards
+from the records (`transaction_timeline`: the containment incident's
+`created_at` is the publish, the recovery incident's `created_at` the
+decision, the recovery workflow's first CLAIM event the reservation, the
+terminal RESTART_WORKLOAD record's and the workflow's terminal `updated_at` the
+restart's end and the settle) and the delete request's bracket is classified
+BEFORE_PUBLISH / BETWEEN_PUBLISH_AND_RESTART / AFTER_RESTART_BEFORE_SETTLE /
+AFTER_SETTLE (`classify_delete`; `delete-timing.json`, and `delete_landed` /
+`delete_timing` in the result). Only AFTER_SETTLE, a fenced delete that did not
+happen and a replacement that never became Ready are INCONCLUSIVE. The
+replacement restores its state from the product's own ConfigMaps and must not
+re-decide, re-reserve or re-send: the ledger keeps exactly the one reservation
+of the recovery workflow (not lost, not doubled), one RESTART_WORKLOAD succeeds,
+one STOP_WORKLOADS, one decision, exactly one restart attempt is observed
+besides the source (by attempt id, whichever watcher instance published it), no
+notification is recorded twice and a write from the replacement follows (its
+coverage heartbeat once the cluster is idle, or its observation of the restart
+attempt). The module tests drive the sequence over fakes (a Pod inventory that
+fails the source and flips the watcher on the fenced delete, a store whose
+records date the transaction around the delete); the live run is the only proof
+of the real outbox replay.
 
 Both watcher variants start their managed job first -- every managed-job
 variant's first cluster mutation is the job pinned to `--fault-node` (the

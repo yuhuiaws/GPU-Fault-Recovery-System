@@ -1514,8 +1514,9 @@ dm_mod，无需加载）、`ENABLE_NODE_LOG_COLLECTOR`（临时启用被禁用�
 所在节点，仅以该 Pod IP 为源的 FORWARD REJECT 切断其到控制面端点的 TCP，deadman 不超过
 600 s 覆盖期限）、`NODE_AGENT_NETWORK_ISOLATION`（011 `unreachable_node`：在第二节点
 INPUT REJECT 其 Node Agent 监听端口——执行器下发节点动作的通道，心跳/采集器/kubelet 不受
-影响，带 deadman）、`CONTROL_PLANE_RESTART`（029 `worker_restart`：在 restart claim 打开期间
-按 UID/resourceVersion 栅栏删除唯一的 completion watcher Pod，由 Deployment 重建）、
+影响，带 deadman）、`CONTROL_PLANE_RESTART`（029 `worker_restart`：在受管任务的重启事务内——以
+GPU 集群 API 首次观测到源 Pod 失败为时点——按 UID/resourceVersion 栅栏删除唯一的 completion
+watcher Pod，由 Deployment 重建）、
 `DECLARE_WARM_SPARE`（经 admin CLI 声明一台热备并 cordon，清理时释放/解除 cordon）、
 `SPARE_KUBELET_STOP`（停热备上的 kubelet 使其 NotReady，带宿主机自动重启定时器）；
 缺令牌记 `NOT_RUN(NOT_AUTHORIZED)`。可选令牌只解锁一个附加分支、不影响变体本身是否
@@ -1753,25 +1754,36 @@ heartbeat 只是"集群空闲"的陈述——产品只在一次全量扫描既�
 清理：2026-10-27 实测 heartbeat 行在恢复后 300 s 内停留在阻断前的值，重启副本的 RUNNING 观测与
 该 attempt 的终态却都已送达，因此只认 heartbeat 是 oracle 错误而非产品缺陷。清理删除
 带本次 tag 的全部规则并停 deadman，探针回读链上无残留且 timer 未激活，否则记清理失败。
-`worker_restart`（`--approve CONTROL_PLANE_RESTART`）：受管任务 `exit:1`、预算 1；每 5 s
-读取 attempt 记录直到 claim 打开——账本已有 recovery 工作流的 reservation 且 RESTART_WORKLOAD
-尚无 SUCCEEDED/FAILED 执行。claim 打开的时长由产品控制环决定而非副本启动：claim 的同一 tick
-铸出数据面命令，集群执行器被 NOTIFY 唤醒后创建重启副本并在同一次调用中返回 SUCCEEDED
-（`workload_operations._set_workloads` 不读副本的 Pod，既不等调度也不等 Running），该终态再唤醒
-dispatcher 记下 SUCCEEDED——实测 1 至数秒（2026-10-27 HyperPod：相隔 10 s 的两次读取之间打开又
-关闭），短于一次记录读取（`kubectl exec` 探针约 5 s），任何轮询间隔或任务模板里的 Pod 级启动
-栅栏都无法从 harness 侧拉宽或命中它。因此运行器按产品自己的记录给窗口定时（recovery 工作流
-首个 CLAIM 事件到 RESTART_WORKLOAD 终态记录的 `updated_at`，`claim_window`）：首次读到即已关闭记
-`INCONCLUSIVE`，detail 带该窗口与每次读取耗时；删除后记录稳定时若删除请求的往返区间落在窗口之外
-或跨其边界，同样记 `INCONCLUSIVE`（`delete_timing_errors`，各判定阶段仍写入
-`open-claim-window.json`）。要让窗口可控，产品需在提交后以 `restart_submitted: true` 的 WAITING
-持步直到副本 Pod 运行，届时重启副本上的启动栅栏才决定窗口长度。随后以
-`DeleteOptions.preconditions{uid,resourceVersion}`、grace 0 删除唯一的
-watcher Pod，等待 Deployment 重建出新 UID 且 Ready（≤ 600 s，与 startupProbe 一致），再等
-recovery 工作流终结。判定：账本 `restart_count == 1` 且唯一 reservation 属于该 recovery
+`worker_restart`（`--approve CONTROL_PLANE_RESTART`）：受管任务 `exit:1`、预算 1；在受管任务的
+重启事务内替换 watcher，时点取自源 Pod 的失败而非"claim 打开"。原因是 restart reservation 只打开
+一个控制环往返：executor 在 claim 的同一 tick 预留预算并铸出数据面命令（`regional.py:945-1020`），
+集群执行器被该命令的 NOTIFY 唤醒，创建重启副本并在同一次调用中返回 SUCCEEDED
+（`adapters/kubernetes/workload_operations._set_workloads`，156-235：不读副本的 Pod，既不等调度也
+不等 Running），命令终态再唤醒 dispatcher（`execution/dispatcher_wakeups.WAKING_REMOTE_COMMAND_
+STATUSES`）记下 SUCCEEDED——实测 1 至数秒（2026-10-27 HyperPod：相隔 10 s 的两次记录读取之间打开又
+关闭），短于一次记录读取（`kubectl exec` 探针约 5 s），任何轮询都无法以它为门，任务模板里的 Pod 级
+启动栅栏也拉宽不了它。而整个事务（失败→发布→containment→terminal→decision→recovery→settle）长达
+数十秒，起点无需查库即可见：运行器以 GPU 集群 API 每 1 s 读源 Pod（启动阶段每 5 s；
+`wait_source_failure`，不读 store），首次观测到关键容器 terminated / phase Failed 即刻
+（`DELETE_OFFSET_SECONDS` = 0）以 `DeleteOptions.preconditions{uid,resourceVersion}`、grace 0
+删除唯一的 watcher Pod，由此删除按构造落在事务内：落在 watcher 发布失败之前，则重建者须从
+outbox/自身观测发布它且仍恰好一次 decision、一次 reservation、一次 restart；落在之后，则重建者的
+重观测不得再发布/再决策/再预留——两者都是产品自己的主张。随后等待 Deployment 重建出新 UID 且
+Ready（≤ 600 s，与 startupProbe 一致），再等 recovery 工作流终结，上限由产品常量推导
+（`settle_bound`：重建 600 s + STOP_WORKLOADS 与 RESTART_WORKLOAD 各一个 step cap 600 s
+（`execution/config.py:293`，二者均无 override）+ 两次 dispatcher 回退轮询 5 s（`:522`）+ 一次
+watcher 轮询 5 s（`completion_controller.py:146`）+ 120 s 余量 = 1935 s，自删除时刻起算）。
+事后按产品记录给删除定位（`transaction_timeline`：containment incident 的 `created_at` 为发布，
+recovery incident 的 `created_at` 为 decision，recovery 工作流首个 CLAIM 事件为 reservation，
+RESTART_WORKLOAD 终态记录与工作流终态的 `updated_at` 为 restart 结束与 settle），把删除请求的
+往返区间归类为 `BEFORE_PUBLISH` / `BETWEEN_PUBLISH_AND_RESTART` / `AFTER_RESTART_BEFORE_SETTLE` /
+`AFTER_SETTLE`（`classify_delete`，写入 `delete-timing.json` 与 result 的 `delete_landed`/
+`delete_timing`）；仅 `AFTER_SETTLE`、栅栏删除未发生、无 Ready 重建者记 `INCONCLUSIVE`。判定：
+账本 `restart_count == 1` 且唯一 reservation 属于该 recovery
 工作流（未丢失、未重复扣减）；RESTART_WORKLOAD 恰好成功一次、recovery 工作流恰好一个且
 SUCCEEDED、STOP_WORKLOADS 恰好成功一次、decision 为 `PLAN_CREATED`；watcher 发布的观测中除源
-attempt 外恰好一个重启 attempt；通知无重复；重建后出现 watcher 的新写入（集群空闲后的
+attempt 外恰好一个重启 attempt（按 attempt id 计，不论由被删 watcher 还是重建者发布）；通知无
+重复；重建后出现 watcher 的新写入（集群空闲后的
 coverage heartbeat，或对重启 attempt 的观测）。两变体都在
 `eks`/`hp` 车道、需 `--fault-node`（跑受管任务的 GPU 节点）与 `--site-file`；清理按重启血缘删
 除受管任务及其副本。
