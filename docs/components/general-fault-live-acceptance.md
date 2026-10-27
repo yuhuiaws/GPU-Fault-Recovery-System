@@ -1008,20 +1008,32 @@ after the reset: the node did not answer the probe in 13 attempts over 187 s"，
 （reset-done 被接受后 8 ms）到 13:28:26Z 13 次相同。409 来自回放工具本身：`tools/gpu_dcgm_field_replay.py`
 的 `do_POST`（`/advance`）把 `Replay.advance()` 抛出的 ValueError 作 409 返回，而 `Replay.advance()` 在
 `Replay.active()` 为 None 时说 "the replay is not on a step"。工具的 journal（用例目录的 `oracle.jsonl`）
-给出为什么：EKS 的采集器在 quiesce 期间继续 scrape（第 27 读上游 `Connection refused`——exporter 随 host
-engine 停了），exporter 回来后的第一次 scrape 读到一张卡真实的 `fabric_manager_status` 2.0（reset 后
-Fabric Manager 重新训练）而基线是 3.0，`Replay._check_baseline` 于是 abort（"a real reading is never
-masked"），此后 `active()` 永远为 None、真实读数透传，advance 不可能再成功；旧的 `_advance_when_reachable`
-把任何 `HostProbeError` 都当成"节点没应答"重试 180 s。HyperPod 同一变体 12:11Z PASS 的原因是那里的采集器
-随 quiesce 停下（589 s 内只有 27 读、无上游错误），RESTORE 后第一次 scrape 读到的真实 fabric 已经是 3.0，
-advance 在第 27 读落地（journal `ADVANCE read 27 step 2`）。两边产品的判定其实一样——reset 后的校验读到的
-都是已训练的 fabric，端出的或真实的。现在：探针跑了但 exit 1（非 transport 失败）时 runner 读工具 `/status`
+给出为什么：采集器在 RESTORE_GPU_SERVICES 之后的第一次 scrape 读到一张卡真实的 `fabric_manager_status` 2.0
+（reset 后 Fabric Manager 重新训练）而基线是 3.0，`Replay._check_baseline` 于是 abort（"a real reading is
+never masked"），此后 `active()` 永远为 None、真实读数透传，advance 不可能再成功；旧的
+`_advance_when_reachable` 把任何 `HostProbeError` 都当成"节点没应答"重试 180 s。采集器在 quiesce 期间两个
+provider 上都会停（产品 b208 核对）：`gpu-fault-metrics-collector` 在 Agent 的 DEFAULT_QUIESCE_SERVICES 里
+（`DEFAULT_QUIESCE_SERVICES`（`src/gpu_fault/node_agent/common.py` 第 77-85 行）），eks-managed 的 quiesce 只保护 kubelet 与 containerd
+（`EKS_MANAGED_PROTECTED_QUIESCE_SERVICES`（`src/gpu_fault/node_agent/config.py::protected_quiesce_services` 第 195-209 行）），停止顺序"后配置先停"
+（`src/gpu_fault/node_agent/quiesce_persistence.py::TargetPersistence.stop_services`（第 240-257 行）），恢复顺序 FM → dcgm → persistence → collector →
+host-collector →（HyperPod）kubelet（`src/gpu_fault/node_agent/quiesce.py::GpuServiceQuiesceManager._restore_locked`（第 985-1000 行））；EKS 两次 journal 与 HP
+一样有约 12 读（约 3 min）的空档，advance 时都停在 27 读。唯一一次上游 `Connection refused`（第 27 读）落在
+窗口起点 13:22:34Z（detection 被接受之时）：eks-managed 在下发 quiesce 之前给节点打
+`gpu-fault.io/quiesce:NoExecute` 污点（`src/gpu_fault/adapters/node_action/quiesce_taint.py::apply_quiesce_taint`（模块文档第 12-14 行）），plain EKS 的
+dcgm-exporter DaemonSet 不容忍它（`docs/components/plain-eks-gpu-cluster.md:67-68`；HyperPod 清单保留
+`operator: Exists`，`deploy/dataplane/hyperpod-dcgm-exporter.yaml:59-60`），exporter Pod 在 Agent 停采集器前几秒
+被驱逐、一次 scrape 失败。差别在 RESTORE 之后 exporter 回来的时机：plain EKS 的 kubelet 从未停过，污点一撤
+exporter Pod 立刻重建，恢复后的采集器第一次 scrape 撞上 FM 训练中（2.0）；HyperPod 的 exporter 容器要等 kubelet
+（最后恢复的单元），第一次 scrape 更晚、读到的已是 3.0，advance 在第 27 读落地（journal `ADVANCE read 27 step 2`，
+12:11Z PASS）。两边产品的判定其实一样——reset 后的校验读到的都是已训练的 fabric，端出的或真实的。现在：探针跑了但 exit 1（非 transport 失败）时 runner 读工具 `/status`
 并分类（`plan_release`）：abort 或持有步读数/期限用尽（`lapsed`）即计划已由工具释放——PASS 并加 note 说明
 409 的含义；计划已过持有步即 advance 其实落地过（回执丢失）；工具已 disarm/未 arm 则 INCONCLUSIVE 并写明
 409 的含义（"the replay is not on a held step"）；仍在持有步则重试；kubelet 未回来的 transport 失败照旧
-重试、不读 status。`recovery_failure` 被工具这样释放时 INCONCLUSIVE（这种节点上 FAILURE 无法持有过真实的
-训练转变，RESTART_NODE 一级驱动不出来），不判产品 FAIL。持有步读数本身也是险情：36 读（(300+180)/15+4）
-加 3 个基线读在 585 s 后失效，而 EKS 的 reset-done 在 arm 后 569 s 才到；现在 `reset_hold_reads` 用
+重试、不读 status。`recovery_failure` 被工具这样释放时 INCONCLUSIVE（exporter 先于采集器第一次 scrape 回来的
+节点上 FAILURE 无法持有过真实的训练转变，RESTART_NODE 一级驱动不出来），不判产品 FAIL。持有步读数本身也是险情：
+36 读（(300+180)/15+4）加 3 个基线读只代表 585 s 的 scrape，而 arm→reset-done 实际用了 569 s（EKS）/589 s（HP）；
+现场停在 27 读只因 quiesce 让采集器停了约 3 min，若 detection 吃满 health summary 的 300 s 延迟
+（300+300 s 即 40 读），持有步在 quiesce 开始前就会失效；现在 `reset_hold_reads` 用
 `held_reads(interval, 300 + health_summary + 300)`（15 s 即 124 读）覆盖检测窗与链。证据：
 `plan-advance.json` 带 `release`（kind/reason/工具 status）。EKS 上六个 reset 变体需重跑
 （`tests/regional/test_general_live_fabric_reboot.py`、`tests/regional/test_general_live_fabric_plan_bounds.py`）。

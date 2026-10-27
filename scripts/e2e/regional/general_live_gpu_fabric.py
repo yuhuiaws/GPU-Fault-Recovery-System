@@ -76,30 +76,53 @@ ended INCONCLUSIVE "the node did not answer the probe in 13 attempts over
 /advance`` got HTTP 409 Conflict from the replay tool (``probe-error.json``
 ``loopback:430``), the same answer from 13:25:19Z (8 ms after reset-done was
 accepted) to 13:28:26Z. The tool's journal (the case's ``oracle.jsonl``) says
-why: the EKS collector scrapes through the quiesce (journal read 27: upstream
-``Connection refused`` while the exporter was down with the host engine), and
-its first scrape after the exporter returned read the real
+why: the collector's first scrape after RESTORE_GPU_SERVICES read the real
 ``fabric_manager_status`` 2.0 of one GPU -- Fabric Manager re-training after
 the reset -- against the baseline 3.0, so ``Replay._check_baseline`` aborted
 ("a real reading is never masked"), ``Replay.active`` is ``None`` for good,
 the real readings pass through, ``Replay.advance`` raises "the replay is not
-on a step" and ``do_POST`` answers 409. On HyperPod the collector pauses with
-the quiesce (27 reads in 589 s, no upstream error) and its first post-restore
-scrape read the fabric already trained (3.0), so the advance landed at read 27
-and the variant passed at 12:11Z. The product's grading is the same either
-way -- its post-reset validation reads a trained fabric, served or real -- so a
-probe exit that is not a transport failure now makes the runner read the
-tool's ``/status`` and classify the refusal (``plan_release``): an abort or a
-lapsed hold is the plan's release (PASS with a note), a plan already past the
-hold is an advance whose receipt was lost, an ended tool is INCONCLUSIVE with
-the 409's meaning, a plan still on its held step is retried; kubelet-down
-transport failures are retried as before without consulting the tool.
-``recovery_failure`` released this way is INCONCLUSIVE (the FAILURE cannot be
-held past the real transition on such a node), never FAIL on the product. The
-held step's read bound was a near miss of its own: 36 reads ((300 + 180) / 15
-+ 4) lapse after 39 scrapes, 585 s at 15 s, and plain EKS's reset-done came
-569 s after arm; ``reset_hold_reads`` now sizes it over the detection horizon
-and the chain with ``held_reads``.
+on a step" and ``do_POST`` answers 409. The collector itself pauses during the
+quiesce on BOTH providers: ``gpu-fault-metrics-collector`` is in the Agent's
+DEFAULT_QUIESCE_SERVICES (``src/gpu_fault/node_agent/common.py:77-85``), an
+eks-managed quiesce protects only kubelet and containerd
+(``src/gpu_fault/node_agent/config.py:195-209``), the services stop last
+configured first (``src/gpu_fault/node_agent/quiesce_persistence.py:240-257``)
+and restore FM -> dcgm -> persistence -> collector -> host-collector ->
+(HyperPod) kubelet (``src/gpu_fault/node_agent/quiesce.py:985-1000``); both
+EKS journals show the same ~12-read (~3 min) gap as HyperPod's, 27 reads at
+the advance on each. The single upstream ``Connection refused`` (journal read
+27) sits at the window's START, 13:22:34Z = detection accepted: eks-managed
+taints the node ``gpu-fault.io/quiesce:NoExecute`` before it dispatches the
+quiesce (``src/gpu_fault/adapters/node_action/quiesce_taint.py:12-14``), the
+plain-EKS dcgm-exporter DaemonSet does not tolerate that key
+(``docs/components/plain-eks-gpu-cluster.md:67-68``; the HyperPod manifest
+keeps ``operator: Exists``,
+``deploy/dataplane/hyperpod-dcgm-exporter.yaml:59-60``), so the exporter Pod
+is evicted seconds before the Agent stops the collector and one scrape fails.
+What differs is the exporter's return after RESTORE: on plain EKS kubelet
+never stopped and the Pod is recreated as soon as the taint is lifted ahead of
+the restore, so the restored collector's first scrape catches Fabric Manager
+re-training (2.0); on HyperPod the exporter container waits for kubelet, the
+last restored unit, so the first scrape comes later and already reads 3.0 --
+the advance landed at read 27 and the variant passed at 12:11Z. The product's
+grading is the same either way -- its post-reset validation reads a trained
+fabric, served or real -- so a probe exit that is not a transport failure now
+makes the runner read the tool's ``/status`` and classify the refusal
+(``plan_release``): an abort or a lapsed hold is the plan's release (PASS
+with a note), a plan already past the hold is an advance whose receipt was
+lost, an ended tool is INCONCLUSIVE with the 409's meaning, a plan still on
+its held step is retried; kubelet-down transport failures are retried as
+before without consulting the tool. ``recovery_failure`` released this way is
+INCONCLUSIVE (the FAILURE cannot be held past the real transition where the
+exporter returns before the collector's first scrape), never FAIL on the
+product. The held step's read bound was a near miss of its own: 36 reads
+((300 + 180) / 15 + 4) with the 3 baseline reads stand for 585 s of scrapes at
+15 s, while arm -> reset-done took 569 s (plain EKS) and 589 s (HyperPod); the
+live runs stayed at 27 reads only because the quiesce pauses the collector for
+~3 min, and a detection that takes the health summary's full latency (300 +
+300 s = 40 reads) lapses the bound before the quiesce even starts;
+``reset_hold_reads`` now sizes it over the detection horizon and the chain
+with ``held_reads``.
 """
 
 from __future__ import annotations
@@ -330,9 +353,13 @@ def reset_hold_reads(interval: int, health_summary: int) -> int:
     the reset-done wait observes it; ``held_reads`` doubles the reads a
     collector makes over that horizon and refuses what the tool cannot bound.
     Live 2026-10-27 the bound was ``(300 + 180) / interval + 4`` = 36 reads:
-    with the 3 baseline reads it lapses after 39 scrapes, 585 s at 15 s, and
-    plain EKS's reset-done came 569 s after arm with the collector scraping
-    through the quiesce (HyperPod's pauses with it: 27 reads in 589 s). A
+    with the 3 baseline reads it stands for 39 scrapes, 585 s at 15 s, while
+    arm -> reset-done took 569 s (plain EKS) and 589 s (HyperPod). The live
+    runs stayed at 27 reads only because the quiesce pauses the collector for
+    ~3 min on both providers (``gpu-fault-metrics-collector`` is in the Agent's
+    DEFAULT_QUIESCE_SERVICES, ``src/gpu_fault/node_agent/common.py:77-85``);
+    a detection that takes the health summary's full latency (300 + 300 s =
+    40 reads at 15 s) lapses the bound before the quiesce even starts. A
     lapsed hold passes the real reading through and the advance is refused
     (HTTP 409) with that meaning.
     """
@@ -412,9 +439,12 @@ def release_notes(advance: dict[str, Any]) -> list[str]:
     )
     if release["kind"] == "aborted":
         note += (
-            " (plain-EKS shape 2026-10-27: the collector scrapes through the quiesce "
-            "and its first scrape after the exporter returns catches Fabric Manager "
-            "re-training, 3 -> 2, which a replay never masks)"
+            " (plain-EKS shape 2026-10-27: the exporter Pod, evicted by the quiesce "
+            "taint at the window's start, is recreated as soon as the taint is lifted "
+            "because kubelet never stopped, so the restored collector's first scrape "
+            "catches Fabric Manager re-training, 3 -> 2, which a replay never masks; "
+            "HyperPod's exporter waits for kubelet, the last restored unit, and its "
+            "first scrape already reads 3)"
         )
     return [note]
 
@@ -428,10 +458,12 @@ def held_failure_release(advance: dict[str, Any]) -> str:
         f"validation read it ({release['reason']}); the tool refused the advance "
         "with HTTP 409 Conflict (the replay is not on a held step) and passes the "
         "real fabric through, so the RESTART_NODE rung cannot be driven on this "
-        "node: its collector scrapes through the quiesce and the real post-reset "
-        "Fabric Manager transition (3 -> 2 -> 3) reaches the tool first, and a real "
-        "reading is never masked -- not a product error; the rung is observable "
-        "where the collector pauses with the quiesce (HyperPod, 2026-10-27 05:04Z)"
+        "node: its exporter Pod returns as soon as the quiesce taint is lifted "
+        "(kubelet never stopped) and the restored collector's first scrape reads "
+        "the real post-reset Fabric Manager transition (3 -> 2 -> 3) before the "
+        "plan's tail, and a real reading is never masked -- not a product error; "
+        "the rung is observable where the exporter waits for kubelet, the last "
+        "restored unit (HyperPod, 2026-10-27 05:04Z)"
     )
 
 

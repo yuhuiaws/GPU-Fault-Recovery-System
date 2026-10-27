@@ -21,15 +21,23 @@ int/r13c-live27) ``not_started`` ended INCONCLUSIVE "the node did not answer
 the probe in 13 attempts over 187 s" while the node answered every attempt:
 the probe's loopback ``POST /advance`` got HTTP 409 Conflict from the replay
 tool. The tool's journal (the case's ``oracle.jsonl``) shows why -- the
-collector scraped through the quiesce (read 27: upstream ``Connection
-refused`` while the exporter was down) and its first scrape after the exporter
-returned read the real ``fabric_manager_status`` 2.0 (Fabric Manager
-re-training after the reset) against the baseline 3.0, so the tool aborted
-("a real reading is never masked"), left its steps for good and passed the
-real readings through; ``Replay.advance`` then raises "the replay is not on a
-step" and ``do_POST`` answers 409. HyperPod's collector pauses with the
-quiesce (27 reads in 589 s, no upstream error) and its first post-restore
-scrape read 3.0, so the advance landed there. These tests pin the runner's
+collector's first scrape after RESTORE_GPU_SERVICES read the real
+``fabric_manager_status`` 2.0 (Fabric Manager re-training after the reset)
+against the baseline 3.0, so the tool aborted ("a real reading is never
+masked"), left its steps for good and passed the real readings through;
+``Replay.advance`` then raises "the replay is not on a step" and ``do_POST``
+answers 409. The collector pauses during the quiesce on both providers
+(``gpu-fault-metrics-collector`` is in the Agent's DEFAULT_QUIESCE_SERVICES,
+``src/gpu_fault/node_agent/common.py:77-85``; both journals show the same
+~12-read gap, 27 reads at the advance); the one upstream ``Connection
+refused`` at the window's start is the plain-EKS exporter Pod evicted by the
+``gpu-fault.io/quiesce:NoExecute`` taint it does not tolerate
+(``src/gpu_fault/adapters/node_action/quiesce_taint.py:12-14``). On plain EKS
+that Pod is back as soon as the taint is lifted (kubelet never stopped), so
+the restored collector's first scrape catches the re-training fabric; on
+HyperPod the exporter waits for kubelet, the last restored unit
+(``src/gpu_fault/node_agent/quiesce.py:985-1000``), so the first scrape read
+3.0 and the advance landed there. These tests pin the runner's
 reading of the refusal: a probe error that is not a transport failure makes
 the runner read the tool's ``/status`` and classify it (``plan_release``) --
 an abort or a lapsed hold is the plan's release (the product grades the real
@@ -38,8 +46,9 @@ receipt was lost, a disarmed or unarmed tool is INCONCLUSIVE with the 409's
 meaning, a plan still on its held step is retried -- while transport errors
 never consult the tool; ``recovery_failure`` released this way is INCONCLUSIVE,
 not FAIL on the product; and the held step's read bound outlasts the
-detection and the chain (the live 36-read bound lapsed after 585 s of scrapes,
-reset-done came at 569 s).
+detection and the chain (the live 36-read bound stands for 585 s of scrapes
+while arm -> reset-done took 569-589 s; the runs stayed at 27 reads only
+because the quiesce pauses the collector).
 """
 
 from __future__ import annotations
@@ -864,8 +873,9 @@ def test_recovery_failure_released_by_the_tools_abort_is_inconclusive_not_fail(
 
 def test_reset_variants_hold_outlasts_detection_and_the_chain(tmp_path: Path) -> None:
     """The held step's read bound: the live 36 reads ((300 + 180) / 15 + 4)
-    lapsed after 39 scrapes, 585 s at 15 s; plain EKS's reset-done came 569 s
-    after arm with the collector scraping through the quiesce."""
+    stand for 39 scrapes, 585 s at 15 s, while arm -> reset-done took 569 s
+    (plain EKS) and 589 s (HyperPod); the runs stayed at 27 reads only because
+    the quiesce pauses the collector on both providers."""
 
     _out, ctx, _probe = _run(tmp_path, "not_started", [DETECTED, RESET_DONE, TRAINED])
     plan = json.loads((ctx.case_dir / "plan.json").read_text(encoding="utf-8"))

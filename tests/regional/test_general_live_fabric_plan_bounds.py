@@ -144,8 +144,9 @@ def test_held_reads_refuses_a_hold_the_tool_cannot_bound() -> None:
 def test_reset_hold_reads_covers_the_detection_horizon_and_the_chain() -> None:
     """The six reset variants' held fault (S52): ``held_reads`` over the window,
     the health summary's latency and the product's chain up to RESET_ALL --
-    the live 36-read bound ((300 + 180) / 15 + 4) lapsed after 585 s of
-    scrapes while plain EKS's reset-done came 569 s after arm."""
+    the live 36-read bound ((300 + 180) / 15 + 4) stands for 585 s of scrapes
+    while arm -> reset-done took 569-589 s; the runs stayed at 27 reads only
+    because the quiesce pauses the collector on both providers."""
 
     horizon = fab.WINDOW + 300 + fab.RESET_CHAIN_SECONDS
     assert fab.RESET_CHAIN_SECONDS == 300 and horizon == 900

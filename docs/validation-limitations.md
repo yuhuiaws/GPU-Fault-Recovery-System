@@ -4144,20 +4144,38 @@ same from 13:25:19Z (8 ms after reset-done was accepted) to 13:28:26Z. The 409
 is the replay tool's own answer -- `tools/gpu_dcgm_field_replay.py` `do_POST`
 turns the `ValueError` of `Replay.advance()` into 409, and `Replay.advance()`
 says "the replay is not on a step" whenever `Replay.active()` is `None`. The
-tool's journal (the case's `oracle.jsonl`) shows why: the EKS collector scrapes
-through the quiesce (journal read 27: upstream `Connection refused` while the
-exporter went down with the host engine), and its first scrape after the
-exporter returned read one GPU's real `fabric_manager_status` 2.0 -- Fabric
-Manager re-training after the reset -- against the baseline 3.0, so
-`Replay._check_baseline` aborted ("a real reading is never masked"); from then
-on `active()` is `None` for good, the real readings pass through and no
+tool's journal (the case's `oracle.jsonl`) shows why: the collector's first
+scrape after RESTORE_GPU_SERVICES read one GPU's real `fabric_manager_status`
+2.0 -- Fabric Manager re-training after the reset -- against the baseline 3.0,
+so `Replay._check_baseline` aborted ("a real reading is never masked"); from
+then on `active()` is `None` for good, the real readings pass through and no
 advance can land; the old `_advance_when_reachable` took every
-`HostProbeError` for an unanswered node and retried for 180 s. HyperPod passed
-the same variant at 12:11Z because its collector pauses with the quiesce (27
-reads in 589 s, no upstream error) and its first post-restore scrape read the
-fabric already trained (3.0): the advance landed at read 27 (journal `ADVANCE
-read 27 step 2`). The product's grading is the same on both -- its post-reset
-validation reads a trained fabric, served or real. Now a probe that ran and
+`HostProbeError` for an unanswered node and retried for 180 s. The collector
+itself pauses during the quiesce on BOTH providers (verified by product lane
+b208): `gpu-fault-metrics-collector` is in the Agent's DEFAULT_QUIESCE_SERVICES
+(`src/gpu_fault/node_agent/common.py`, lines 77-85), an eks-managed quiesce protects
+only kubelet and containerd (EKS_MANAGED_PROTECTED_QUIESCE_SERVICES, `src/gpu_fault/node_agent/config.py::protected_quiesce_services`, lines 195-209),
+the services stop last configured first
+(`src/gpu_fault/node_agent/quiesce_persistence.py::TargetPersistence.stop_services`, lines 240-257) and restore FM ->
+dcgm -> persistence -> collector -> host-collector -> (HyperPod) kubelet
+(`src/gpu_fault/node_agent/quiesce.py::GpuServiceQuiesceManager._restore_locked`, lines 985-1000); both EKS journals show the
+same ~12-read (~3 min) gap as HyperPod's, 27 reads at the advance on each. The
+single upstream `Connection refused` (journal read 27) sits at the window's
+START, 13:22:34Z = detection accepted: eks-managed taints the node
+`gpu-fault.io/quiesce:NoExecute` before it dispatches the quiesce
+(`src/gpu_fault/adapters/node_action/quiesce_taint.py::apply_quiesce_taint`, module docstring lines 12-14), the plain-EKS
+dcgm-exporter DaemonSet does not tolerate that key
+(`docs/components/plain-eks-gpu-cluster.md:67-68`; the HyperPod manifest keeps
+`operator: Exists`, `deploy/dataplane/hyperpod-dcgm-exporter.yaml:59-60`), so
+the exporter Pod is evicted seconds before the Agent stops the collector and
+one scrape fails. What differs is the exporter's return after RESTORE: on
+plain EKS kubelet never stopped and the Pod is recreated as soon as the taint
+is lifted ahead of the restore, so the restored collector's first scrape
+catches Fabric Manager re-training (2.0); on HyperPod the exporter container
+waits for kubelet, the last restored unit, so the first scrape comes later and
+already reads 3.0 -- the advance landed at read 27 (journal `ADVANCE read 27
+step 2`) and the variant passed at 12:11Z. The product's grading is the same
+on both -- its post-reset validation reads a trained fabric, served or real. Now a probe that ran and
 exited 1 (not a transport failure) makes the runner read the tool's `/status`
 and classify the refusal (`plan_release`): an abort or a lapsed hold (read
 bound or deadline) is the plan's release -- PASS with a note that names the
@@ -4166,13 +4184,17 @@ was lost; a disarmed or unarmed tool is INCONCLUSIVE with the meaning ("the
 replay is not on a held step"); a plan still on its held step is retried;
 kubelet-down transport failures retry as before without consulting the tool.
 `recovery_failure` released this way is INCONCLUSIVE (the FAILURE cannot be
-held past the real transition on such a node, so the RESTART_NODE rung cannot
-be driven there), never FAIL on the product. The held step's read bound was a
-near miss of its own: 36 reads ((300 + 180) / 15 + 4) plus the 3 baseline
-reads lapse after 585 s while plain EKS's reset-done came 569 s after arm;
-`reset_hold_reads` now sizes it with `held_reads(interval, 300 +
-health_summary + 300)` (124 reads at 15 s) over the detection horizon and the
-chain. Evidence: `plan-advance.json` carries `release` (kind, reason, the
+held past the real transition where the exporter returns before the
+collector's first scrape, so the RESTART_NODE rung cannot be driven there),
+never FAIL on the product. The held step's read bound was a near miss of its
+own: 36 reads ((300 + 180) / 15 + 4) plus the 3 baseline reads stand for
+585 s of scrapes while arm -> reset-done took 569 s (plain EKS) and 589 s
+(HyperPod); the live runs stayed at 27 reads only because the quiesce pauses
+the collector for ~3 min, and a detection that takes the health summary's
+full latency (300 + 300 s = 40 reads at 15 s) lapses the bound before the
+quiesce even starts; `reset_hold_reads` now sizes it with
+`held_reads(interval, 300 + health_summary + 300)` (124 reads at 15 s) over
+the detection horizon and the chain. Evidence: `plan-advance.json` carries `release` (kind, reason, the
 tool's status). The six reset variants are to be re-run on plain EKS
 (`tests/regional/test_general_live_fabric_reboot.py`,
 `tests/regional/test_general_live_fabric_plan_bounds.py`).
