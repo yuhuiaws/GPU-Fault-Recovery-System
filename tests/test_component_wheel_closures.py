@@ -194,6 +194,31 @@ def test_node_runtime_does_not_ship_the_control_plane_orchestration_families() -
         assert module in control_plane, f"the coordinator still composes {module}"
 
 
+def test_the_node_runtime_wheel_carries_the_worker_the_guard_starts_by_name() -> None:
+    """``observation_guard`` starts the read-only observation worker with
+    ``python -m`` and names it by string, so that starting the guard does not
+    import the worker's whole closure on every observation (b214). Nothing else
+    imports the worker, so the ``module:callable`` reference is what keeps it --
+    and ``passive_communication`` and ``ras_observation``, which only it
+    imports -- in the node-runtime wheel: without it every GPU node's guard
+    would die on ModuleNotFoundError, the role launcher's failure above."""
+    from gpu_fault.node_agent import observation_guard, observation_worker
+
+    assert observation_guard.WORKER_ENTRY_POINT == f"{observation_worker.__name__}:main"
+    assert observation_guard.WORKER_MODULE == observation_worker.__name__
+    # The walk follows the guard's reference to the worker it starts.
+    assert observation_worker.__name__ in component_wheels.local_imports(
+        observation_guard.__name__
+    )
+    node_runtime = component_wheels.component_modules("node_runtime")
+    for module in (
+        observation_worker.__name__,
+        "gpu_fault.node_agent.passive_communication",
+        "gpu_fault.ras_observation",
+    ):
+        assert module in node_runtime, f"the node-runtime wheel would lack {module}"
+
+
 ROLE_MANIFESTS = (
     "deploy/control-plane/base/control-plane-deployment.yaml",
     "deploy/control-plane/regional/generated/gpu-fault-api-ha-ingress.yaml",

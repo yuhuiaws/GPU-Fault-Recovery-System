@@ -11,7 +11,18 @@ import time
 from pathlib import Path
 from types import FrameType
 
-from gpu_fault.node_agent import observation_worker
+#: The read-only worker this guard starts, named by string the way an entry
+#: point names a callable. Importing the worker to read its ``__name__`` made
+#: this process -- which never runs any of it, the worker's own interpreter
+#: imports it again -- load the worker's whole import closure (pydantic, the
+#: models, every operation mixin) on every observation: 0.25 s of CPU idle;
+#: from spawn to the worker's first line 0.54 s idle and 5.3 s with eight busy
+#: loops on its CPU, 0.30 s and 3.3 s without it. The ``module:callable`` form
+#: is the one ``scripts/component_wheels.referenced_modules`` follows, so the
+#: worker and what only it imports (``passive_communication``,
+#: ``ras_observation``) stay in the node_runtime wheel without the import.
+WORKER_ENTRY_POINT = "gpu_fault.node_agent.observation_worker:main"
+WORKER_MODULE = WORKER_ENTRY_POINT.partition(":")[0]
 
 
 def children() -> list[int]:
@@ -57,7 +68,7 @@ def main() -> None:
     code = 1
     try:
         process = subprocess.Popen(
-            [sys.executable, "-m", observation_worker.__name__],
+            [sys.executable, "-m", WORKER_MODULE],
             stdin=sys.stdin.buffer,
             stdout=sys.stdout.buffer,
             stderr=subprocess.DEVNULL,
