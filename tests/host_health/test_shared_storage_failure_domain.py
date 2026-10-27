@@ -10,10 +10,17 @@ the nodes, references it from every per-node incident, and mails once.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import timedelta
+from typing import Any
 
 from gpu_fault.app import ApplicationContext
-from gpu_fault.host_health import HostMetricSample, HostTelemetryBatch
+from gpu_fault.host_health import (
+    HostMetricSample,
+    HostTelemetryBatch,
+    NodeHealthFinding,
+)
 from gpu_fault.models import (
     FaultIncident,
     IncidentState,
@@ -26,6 +33,7 @@ from gpu_fault.shared_storage_failure_domain import (
     SHARED_STORAGE_FAILURE_DOMAIN_POLICY_SOURCE,
     shared_filesystem_identity,
 )
+from gpu_fault.store import InMemoryStore, NotFoundError
 from tests._builders import asgi_client, host_telemetry_batch
 from tests.host_health._support import NOW, RecordingNotifier
 
@@ -75,6 +83,73 @@ def ingest(context: ApplicationContext, *batches: HostTelemetryBatch) -> list[di
         return results
 
     return asyncio.run(scenario())
+
+
+class InFlightPeerStore:
+    """The store as one node's ingestion transaction sees it while another's is open.
+
+    Live, every batch is ingested in its own transaction
+    (``collector_ingestion_transaction`` takes one advisory lock per
+    cluster/node/batch) under READ COMMITTED: node-b's reads do not see node-a's
+    incident, latest row or event link until node-a commits. The in-memory store
+    writes through, so this wrapper hides ``hidden``'s rows for the duration of
+    every *other* node's ingestion transaction and lifts the veil when that
+    transaction exits -- what node-b's finish half sees once both commits are
+    durable.
+    """
+
+    def __init__(self, store: Any, hidden: str) -> None:
+        self._store = store
+        self._hidden = hidden
+        self._veiled = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._store, name)
+
+    @contextmanager
+    def collector_ingestion_transaction(
+        self, cluster_id: str, node_id: str, batch_id: str
+    ) -> Iterator[None]:
+        self._veiled = node_id != self._hidden
+        try:
+            with self._store.collector_ingestion_transaction(
+                cluster_id, node_id, batch_id
+            ):
+                yield
+        finally:
+            self._veiled = False
+
+    def list_incidents_by_state(
+        self, cluster_id: str, states: Any, **kwargs: Any
+    ) -> list[FaultIncident]:
+        incidents: list[FaultIncident] = self._store.list_incidents_by_state(
+            cluster_id, states, **kwargs
+        )
+        if not self._veiled:
+            return incidents
+        return [item for item in incidents if self._hidden not in item.node_ids]
+
+    def get_incident(self, incident_id: str) -> FaultIncident:
+        incident: FaultIncident = self._store.get_incident(incident_id)
+        if self._veiled and self._hidden in incident.node_ids:
+            raise NotFoundError(incident_id)
+        return incident
+
+    def get_incident_by_event(self, event_id: str) -> FaultIncident | None:
+        incident: FaultIncident | None = self._store.get_incident_by_event(event_id)
+        if incident is not None and self._veiled and self._hidden in incident.node_ids:
+            return None
+        return incident
+
+    def list_telemetry_metrics_latest(self, cluster_id: str, node_id: str) -> list:
+        if self._veiled and node_id == self._hidden:
+            return []
+        rows: list = self._store.list_telemetry_metrics_latest(cluster_id, node_id)
+        return rows
+
+
+def findings_of(response: dict) -> list[NodeHealthFinding]:
+    return [NodeHealthFinding.model_validate(item) for item in response["findings"]]
 
 
 def domain_records(context: ApplicationContext) -> list[FaultIncident]:
@@ -315,6 +390,93 @@ def test_failing_sample_after_a_missed_activation_joins_via_the_safety_net() -> 
     assert any(incident.incident_id in reason for reason in domain.reasons), (
         "the domain record must reference node-b's incident"
     )
+    assert len(notifier.notifications) == 1
+
+
+def test_two_activations_in_flight_at_once_meet_once_both_committed() -> None:
+    # Live on HyperPod (one NFS export SIGSTOPped under two nodes): both
+    # per-node incidents, 3.4 s apart, same export label, and no domain record.
+    # Each activation's look inside its own ingestion transaction saw no
+    # committed peer, and the collector delivers a sustained reading only with
+    # its next health summary, so the per-batch safety net never ran before the
+    # export came back. The look after the commit is what ties the two together.
+    notifier = RecordingNotifier()
+    store = InFlightPeerStore(InMemoryStore(), hidden="node-a")
+    context = ApplicationContext(notification_notifier=notifier, store=store)
+
+    first, second = ingest(
+        context,
+        shared_batch("a-1", "node-a", 1),
+        shared_batch("b-1", "node-b", 1, NOW + timedelta(seconds=3)),
+    )
+
+    (domain,) = domain_records(context)
+    assert domain.node_ids == ["node-a", "node-b"]
+    assert domain.state is IncidentState.DETECTED
+    assert domain.policy_reference == f"shared-filesystem:{EXPORT}"
+    assert domain.effective_action is None and domain.workflow_request_id is None
+    for node_id in ("node-a", "node-b"):
+        (incident,) = node_incidents(context, node_id)
+        assert any(
+            f"member {node_id}: incident {incident.incident_id}" in reason
+            for reason in domain.reasons
+        ), f"the record must name {node_id}'s incident"
+        assert any(
+            reason.startswith(f"common failure domain {domain.incident_id}:")
+            for reason in incident.reasons
+        ), f"{node_id}'s incident must point back at the record"
+        assert incident.effective_action is RecoveryAction.RUN_DIAGNOSTICS
+    assert first["notification_ids"] == []
+    assert len(second["notification_ids"]) == 1, "the later commit's look mails once"
+    assert len(notifier.notifications) == 1
+    assert notifier.notifications[0].incident_id == domain.incident_id
+
+
+def test_a_late_look_from_the_other_activation_adds_no_record_and_no_mail() -> None:
+    # Both activations in flight at once, both commit, both finish halves look:
+    # node-b's look created the record; node-a's, running after that, finds the
+    # same member set -- the same record id -- and keeps quiet.
+    notifier = RecordingNotifier()
+    store = InFlightPeerStore(InMemoryStore(), hidden="node-a")
+    context = ApplicationContext(notification_notifier=notifier, store=store)
+    batch_a = shared_batch("a-1", "node-a", 1)
+    first, _second = ingest(
+        context, batch_a, shared_batch("b-1", "node-b", 1, NOW + timedelta(seconds=3))
+    )
+    (domain,) = domain_records(context)
+    before = {
+        node_id: node_incidents(context, node_id) for node_id in ("node-a", "node-b")
+    }
+
+    late = context.shared_storage_domains.observe_committed(batch_a, findings_of(first))
+
+    assert late == []
+    assert domain_records(context) == [domain]
+    assert {
+        node_id: node_incidents(context, node_id) for node_id in ("node-a", "node-b")
+    } == before
+    assert len(notifier.notifications) == 1
+
+
+def test_the_look_after_the_commit_minds_only_shared_activations_with_an_identity() -> (
+    None
+):
+    notifier = RecordingNotifier()
+    context = ApplicationContext(notification_notifier=notifier)
+    batch_a = shared_batch("a-1", "node-a", 1)
+    (first,) = ingest(context, batch_a)
+    (finding,) = findings_of(first)
+    other_metric = finding.model_copy(update={"metric_name": "memory_used_percent"})
+    no_identity = finding.model_copy(update={"diagnostic_parameters": {}})
+    ingest(context, shared_batch("b-1", "node-b", 1, NOW + timedelta(seconds=3)))
+    (domain,) = domain_records(context)
+
+    looked = context.shared_storage_domains.observe_committed(
+        batch_a, [other_metric, no_identity]
+    )
+
+    assert looked == []
+    assert domain_records(context) == [domain]
     assert len(notifier.notifications) == 1
 
 

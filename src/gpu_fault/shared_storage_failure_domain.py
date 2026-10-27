@@ -29,6 +29,23 @@ This module is the additive, control-plane-only correlation on top of that:
   unavailable within :data:`SHARED_STORAGE_FAILURE_DOMAIN_WINDOW_SECONDS` of
   each other (node clocks); a node whose activation comes later joins the
   open record. One notification per domain record.
+* **Two looks per activation.** A shared outage hits every node in the same
+  collector tick, so the activations arrive seconds apart and are ingested in
+  separate transactions (one per batch, on whichever replica took the POST;
+  READ COMMITTED). The look inside the transaction
+  (:meth:`~SharedStorageFailureDomainCorrelator.observe_finding`) sees only
+  peers that had already committed, so two activations in flight at once both
+  stand alone -- live on HyperPod: two nodes, one NFS export, incidents 3.4 s
+  apart, no record. The host collector re-delivers an unchanged "unavailable"
+  reading only with its health summary (300 s jittered, ``_edge_reasons``),
+  never per tick, so the per-batch safety net
+  (:meth:`~SharedStorageFailureDomainCorrelator.observe_batch`) cannot close
+  that gap inside a shorter outage. Hence the second look
+  (:meth:`~SharedStorageFailureDomainCorrelator.observe_committed`) after the
+  batch's own commit: whichever of two concurrent activations commits last
+  sees the other. Identical member sets derive identical record ids and the
+  notification is deduplicated per record, so two late looks converge on one
+  record and one mail.
 * **Clearing.** The record closes (``RECOVERED``) when every member's latest
   reading of the identity is "available" -- positive evidence from each node.
   A member that stops reporting while its last reading was "unavailable" is
@@ -78,8 +95,11 @@ SHARED_STORAGE_FAILURE_DOMAIN_NOTIFICATION_CATEGORY = "SHARED_STORAGE_FAILURE_DO
 #: Two nodes' readings of one export count as the same outage when they lie
 #: within this many seconds of each other; a member's "unavailable" reading
 #: older than this against the current observation is silence, not a fresh
-#: failure. The host collector ticks every 15 s and a bounded ``statvfs``
-#: adds seconds, so 10 minutes is tens of ticks of slack and still bounded.
+#: failure. The host collector ticks every 15 s but *delivers* an unchanged
+#: reading only with its health summary (300 s, jittered), so the window
+#: spans one summary period with margin: a member's latest row is at most one
+#: summary old while its export is still down, and the per-batch safety net
+#: gets one summary inside the window.
 SHARED_STORAGE_FAILURE_DOMAIN_WINDOW_SECONDS = 600.0
 #: The states an open domain record can be in: DETECTED while a member still
 #: reports a fresh failure, ESCALATED once only silent members are left.
@@ -191,7 +211,10 @@ class SharedStorageFailureDomainCorrelator:
         A reading of 0 settles the open records naming this node; a reading of
         1 that minted no finding (the signal was already active) is the safety
         net for an activation whose peers were not yet visible -- bounded to
-        the correlation window after the activation.
+        the correlation window after the activation. The collector delivers
+        such a reading only with its next health summary, so this net catches
+        outages that outlive a summary period; the shorter ones are the job of
+        :meth:`observe_committed`.
         """
 
         notifications: list[str] = []
@@ -215,6 +238,44 @@ class SharedStorageFailureDomainCorrelator:
             ):
                 continue  # the activation path (observe_finding) handled it
             notification_id = self._recheck(batch, sample, identity)
+            if notification_id is not None:
+                notifications.append(notification_id)
+        return notifications
+
+    def observe_committed(
+        self, batch: HostTelemetryBatch, findings: Sequence[NodeHealthFinding]
+    ) -> list[str]:
+        """After the batch's ingestion transaction committed: look again.
+
+        :meth:`observe_finding` ran inside the transaction and could see only
+        peers whose own transaction had committed by then; two nodes losing one
+        export are detected by the same collector tick on each, their batches
+        land seconds apart on separate replicas, and when both are in flight
+        at once each stands alone. Called from the finish half of host
+        ingestion, after this batch's incident and latest row are durable, so
+        the activation that commits last sees the one before it. Only the
+        activations this batch minted are looked at (an incident is what a
+        member is); a node that already belongs to a record, or one whose
+        peers are still not visible, costs one indexed read. Returns the
+        notification ids sent (one per record created).
+        """
+
+        notifications: list[str] = []
+        for finding in findings:
+            if finding.metric_name != SHARED_FILESYSTEM_METRIC:
+                continue
+            identity = shared_filesystem_identity(finding.diagnostic_parameters)
+            if identity is None:
+                continue
+            incident_id = self._node_incident_id(finding)
+            if incident_id is None:
+                continue  # minted no incident: nothing a member could be
+            member = _Member(
+                finding.node_id, finding.device, incident_id, finding.observed_at
+            )
+            _domain, notification_id = self._correlate(
+                batch.cluster_id, identity, member
+            )
             if notification_id is not None:
                 notifications.append(notification_id)
         return notifications
@@ -620,6 +681,19 @@ class SharedStorageFailureDomainCorrelator:
         failing = [item for item in rows if _failing(item.value)]
         pool = failing or rows
         return max(pool, key=lambda item: item.observed_at)
+
+    def _node_incident_id(self, finding: NodeHealthFinding) -> str | None:
+        """The per-node incident ``finding`` minted: by its event first (the
+        orchestrator may have routed it into an incident with another id),
+        else the node's open incident for the metric and device."""
+
+        incident = self.store.get_incident_by_event(finding.event_id)
+        if incident is not None and incident.state in _OPEN_NODE_INCIDENT_STATES:
+            incident_id: str = incident.incident_id
+            return incident_id
+        return self._open_node_incident_id(
+            finding.cluster_id, finding.node_id, finding.device
+        )
 
     def _open_node_incident_id(
         self, cluster_id: str, node_id: str, device: str | None

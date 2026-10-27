@@ -303,6 +303,23 @@ class TelemetryIngestionService:
                 notified_at=notified_at,
                 semantic_fingerprint=finding_health_signal_fingerprint(finding),
             )
+        # The shared-storage failure-domain look inside the transaction saw
+        # only peers committed before it; two nodes losing one export activate
+        # seconds apart in separate transactions and can both stand alone.
+        # Now that this batch's incident is durable, look once more
+        # (shared_storage_failure_domain.observe_committed).
+        correlator = getattr(self.context, "shared_storage_domains", None)
+        if correlator is not None and result.findings:
+            domain_notifications = correlator.observe_committed(batch, result.findings)
+            if domain_notifications:
+                result = result.model_copy(
+                    update={
+                        "notification_ids": [
+                            *result.notification_ids,
+                            *domain_notifications,
+                        ]
+                    }
+                )
         self.context.dispatcher.wake()
         return result
 

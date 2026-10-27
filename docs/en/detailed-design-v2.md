@@ -3645,9 +3645,18 @@ the same path), and no identity means UNKNOWN and no correlation. Record states:
 reading inside the window → `DETECTED`; every member's latest reading is "available" → `RECOVERED` (closes by itself as
 the signals clear); no fresh "unavailable" reading but a silent member (last reading unavailable and older than the
 window, or no reading at all) → `ESCALATED` (silence is not recovery; the operator owns the close, and an "available"
-from the silent node later still closes it `RECOVERED`). Concurrent activations for one export may not see each other;
-every later "still unavailable" sample inside the window re-checks the node's membership and joins, and identical member
-sets derive identical record ids, so duplicate creation converges on one record. No store schema change (only the
+from the silent node later still closes it `RECOVERED`). Concurrent activations for one export do not see each other:
+a shared outage hits every node in the same collector tick, the batches land seconds apart on separate replicas and
+each is ingested in its own transaction (one advisory lock per cluster/node/batch, READ COMMITTED), so the look inside
+the transaction (`observe_finding`) finds only peers that had already committed -- live on HyperPod two nodes lost one
+NFS export, both per-node incidents were minted 3.4 s apart and no record was formed. The correlation therefore looks
+twice: once inside the transaction and once more after the batch's own commit (`observe_committed`, called from the
+finish half of host ingestion), so whichever of two concurrent activations commits last sees the other; identical
+member sets derive identical record ids and the notification is deduplicated per record, so two late looks converge on
+one record and one mail. The per-batch safety net (every later "still unavailable" sample inside the window re-checks
+the node's membership and joins) stays, but it can only run when such a sample is *delivered*, and the host collector
+delivers an unchanged reading only with its health summary (300 s, jittered), never per tick -- it covers outages that
+outlive a summary period, not the shorter ones. No store schema change (only the
 existing incident and notification records); the departed-node cleanup treats it like any multi-node incident -- a
 blocker while other members are alive, handed to the operator's `incident-close`.
 
