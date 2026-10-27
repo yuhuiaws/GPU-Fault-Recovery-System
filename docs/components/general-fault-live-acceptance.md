@@ -584,9 +584,16 @@ link inactive先诊断；excess/unknown/不可读不能授权reboot。
 夹具（`scripts/e2e/regional/general_live_device_plugin.py` +
 `probes/general_live_device_plugin_probe.py`，审批 `DEVICE_PLUGIN_RESTART`）：不移除
 DaemonSet、不改 `Node.status`，而是对 plugin 容器自身进程发 SIGSTOP（仅签名匹配该
-plugin Pod UID 且基名在允许清单内的进程，deadman 用 SIGCONT 兜底），冻结后 plugin 不再
-应答 kubelet 的 `ListAndWatch`，kubelet 注销资源、allocatable 下降而 Pod 仍 Running，由
-产品自己删除并替换 Pod。`gpu_plugin`/`efa_plugin` 判 `RESTART_*_DEVICE_PLUGIN` +
+plugin Pod UID 且基名在允许清单内的进程，deadman 用 SIGCONT 兜底）。基名随 provider 不同
+（HyperPod EFA plugin 的进程基名不在静态清单内），故除静态清单外还从发现到的 Pod spec
+取该 plugin 容器自身的 command/image 基名一并下发；找不到允许进程时拒绝会记录该 Pod 内实际
+存在的进程（写入 `probe-error.json`）。探针在返回前确认任务确已进入内核停止态（`T`）——
+`os.kill` 只是投递 SIGSTOP，紧随其后的 `/proc` 读会与状态切换竞争而把真正冻结的进程记成
+`stopped:false`；无法确认停止的冻结立即判 INCONCLUSIVE 并带出原因，绝不空等。冻结后 plugin 不再
+应答 kubelet 的 `ListAndWatch`，但 allocatable 是否下降取决于 kubelet 是否因此断流——被
+SIGSTOP 但 socket 仍连通的 plugin 不会迫使断流，故确认已停止却仍在广告设备的情形判
+INCONCLUSIVE（产品自身的 allocatable 失配探测读的是同一数值，同样看不到缺额），不是产品故障；
+确有下降时由产品自己删除并替换 Pod。`gpu_plugin`/`efa_plugin` 判 `RESTART_*_DEVICE_PLUGIN` +
 `TRIGGER_HEALTH_SNAPSHOT` + `VALIDATE_{GPU,FABRIC}` 均 SUCCEEDED、`replacement_pod_uids`
 为新 Ready Pod、allocatable 回基线、incident RECOVERED、无 reboot；`one_sample` 在产品记录
 一次失配后立即 SIGCONT，验证两次确认规则不成 finding/不动作；`replacement_uid` 验证新 UID

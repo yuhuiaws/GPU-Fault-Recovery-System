@@ -201,3 +201,182 @@ def test_resume_skips_a_replaced_pid(
 def test_cleanup_rejects_unknown_kind(host: FakeRun) -> None:
     with pytest.raises(probe.ProbeError, match="unsafe cleanup kind"):
         probe.cleanup(_args(run_id=RUN, kind="reboot-node"))
+
+
+# --------------------------------------------------------------------------- #
+# stopped-state confirmation (the live stopped:false race)
+# --------------------------------------------------------------------------- #
+def test_freeze_confirms_stopped_state_after_a_scheduling_race(
+    host: FakeRun, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    monkeypatch.setattr(
+        probe,
+        "plugin_processes",
+        lambda pod_uid, binaries: [
+            {
+                "pid": 4242,
+                "start_ticks": "100",
+                "binary": "nvidia-device-plugin",
+                "argv": ["x"],
+            }
+        ],
+    )
+    # os.kill only queues SIGSTOP: the first /proc read still sees the running
+    # task, the next sees it stopped. freeze must poll, not record the race.
+    reads = iter([False, True])
+    polled = {"n": 0}
+
+    def racing_is_stopped(pid: int, ticks: str | None) -> bool:
+        polled["n"] += 1
+        return next(reads, True)
+
+    monkeypatch.setattr(probe, "process_is_stopped", racing_is_stopped)
+    monkeypatch.setattr(probe, "process_state", lambda pid, ticks: "T")
+    monkeypatch.setattr(probe.time, "sleep", lambda _s: None)
+    probe.freeze(
+        _args(
+            run_id=RUN,
+            pod_uid=POD,
+            binary=["nvidia-device-plugin"],
+            pod_command_binary=[],
+            seconds=300,
+        )
+    )
+    frozen = json.loads(capsys.readouterr().out.strip().splitlines()[-1])["frozen"]
+    assert frozen[0]["stopped"] is True
+    assert polled["n"] >= 2, "freeze must poll past the first non-stopped read"
+
+
+def test_freeze_records_stopped_false_when_the_task_never_stops(
+    host: FakeRun, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    monkeypatch.setattr(
+        probe,
+        "plugin_processes",
+        lambda pod_uid, binaries: [
+            {
+                "pid": 4242,
+                "start_ticks": "100",
+                "binary": "nvidia-device-plugin",
+                "argv": ["x"],
+            }
+        ],
+    )
+    monkeypatch.setattr(probe, "process_is_stopped", lambda pid, ticks: False)
+    monkeypatch.setattr(probe, "process_state", lambda pid, ticks: "S")
+    monkeypatch.setattr(probe.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(probe, "STOP_CONFIRM_SECONDS", 0.0)
+    probe.freeze(
+        _args(
+            run_id=RUN,
+            pod_uid=POD,
+            binary=["nvidia-device-plugin"],
+            pod_command_binary=[],
+            seconds=300,
+        )
+    )
+    frozen = json.loads(capsys.readouterr().out.strip().splitlines()[-1])["frozen"]
+    assert frozen[0]["stopped"] is False
+    assert frozen[0]["state"] == "S"
+
+
+# --------------------------------------------------------------------------- #
+# refusal recording (the live EFA "no allow-listed process" with no record)
+# --------------------------------------------------------------------------- #
+def test_freeze_refusal_names_the_pod_processes_it_found(
+    host: FakeRun, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(probe, "plugin_processes", lambda pod_uid, binaries: [])
+    monkeypatch.setattr(
+        probe,
+        "pod_cgroup_processes",
+        lambda pod_uid: [{"pid": 71, "binary": "efa-k8s-device-plugin-real"}],
+    )
+    with pytest.raises(probe.ProbeError, match="no allow-listed plugin process") as exc:
+        probe.freeze(
+            _args(
+                run_id=RUN,
+                pod_uid=POD,
+                binary=["aws-efa-k8s-device-plugin"],
+                pod_command_binary=[],
+                seconds=300,
+            )
+        )
+    assert exc.value.reason == "no_plugin_process"
+    assert exc.value.detail is not None
+    assert exc.value.detail["pod_processes"] == [
+        {"pid": 71, "binary": "efa-k8s-device-plugin-real"}
+    ]
+    assert host.kills == []  # nothing was signalled
+
+
+def test_main_emits_refusal_message_site_and_detail(
+    host: FakeRun, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    monkeypatch.setattr(probe, "plugin_processes", lambda pod_uid, binaries: [])
+    monkeypatch.setattr(
+        probe,
+        "pod_cgroup_processes",
+        lambda pod_uid: [{"pid": 71, "binary": "efa-real"}],
+    )
+    rc = probe.main(
+        [
+            "freeze",
+            "--run-id",
+            RUN,
+            "--pod-uid",
+            POD,
+            "--binary",
+            "aws-efa-k8s-device-plugin",
+            "--seconds",
+            "300",
+        ]
+    )
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["error_kind"] == "probe"
+    assert payload["error_reason"] == "no_plugin_process"
+    assert payload["error_site"].startswith("freeze:"), payload["error_site"]
+    assert "refusing to signal" in payload["error_message"]
+    assert payload["error_detail"]["pod_processes"][0]["binary"] == "efa-real"
+
+
+def test_pod_command_binary_reaches_process_discovery(
+    host: FakeRun, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, list[str]] = {}
+
+    def fake_plugin_processes(pod_uid: str, binaries: list[str]):
+        captured["binaries"] = list(binaries)
+        return [
+            {"pid": 4242, "start_ticks": "100", "binary": "efa-real", "argv": ["x"]}
+        ]
+
+    monkeypatch.setattr(probe, "plugin_processes", fake_plugin_processes)
+    monkeypatch.setattr(probe, "process_is_stopped", lambda pid, ticks: True)
+    monkeypatch.setattr(probe, "process_state", lambda pid, ticks: "T")
+    probe.freeze(
+        _args(
+            run_id=RUN,
+            pod_uid=POD,
+            binary=["aws-efa-k8s-device-plugin"],
+            pod_command_binary=["efa-real"],
+            seconds=300,
+        )
+    )
+    # The Pod-spec-derived basename is handed to discovery alongside the static
+    # allow-list, so the provider-specific plugin process can be matched.
+    assert "efa-real" in captured["binaries"]
+    assert "aws-efa-k8s-device-plugin" in captured["binaries"]
+
+
+def test_checked_pod_binaries_shape() -> None:
+    assert probe.checked_pod_binaries(
+        ["efa-real", "has space", "x" * 65, "ok_1.2"]
+    ) == ["efa-real", "ok_1.2"]

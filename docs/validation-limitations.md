@@ -2393,10 +2393,21 @@ COLLECT-017 B/C fixture excludes the DaemonSet by affinity and restores it
 never deletes a Pod); neither reaches the product's own pod-delete/re-register
 path. The injection instead SIGSTOPs the plugin container's own process -- only
 a process whose cgroup names the plugin Pod UID *and* whose argv basename is
-allow-listed, deadman-backed with SIGCONT -- so the plugin stops answering
-kubelet's `ListAndWatch`, kubelet de-registers the resource, allocatable decays
-while the Pod stays `Running`, and the product must delete and replace the Pod
-itself. `gpu_plugin`/`efa_plugin` grade the full `RESTART_*_DEVICE_PLUGIN` +
+allow-listed (the static list plus the plugin container's own command/image
+basenames read from the discovered Pod spec, since the HyperPod EFA plugin's
+process basename is none of the static names), deadman-backed with SIGCONT. The
+probe confirms the task actually reached the kernel stopped state (`T`) before
+it returns -- `os.kill` only queues SIGSTOP, so a read on the next line races
+the transition and can report `stopped:false` for a process that did freeze;
+a freeze the probe cannot confirm stopped is refused immediately with that
+reason, never waited out. A stopped plugin stops answering kubelet's
+`ListAndWatch`; whether that drops allocatable depends on kubelet breaking the
+stream, which a SIGSTOP'd-but-socket-connected plugin does not force, so a
+confirmed-stopped plugin that keeps its devices advertised is `INCONCLUSIVE`
+(the product's own allocatable-mismatch detector keys on the same reading and
+likewise sees no shortfall), not a product fault. When allocatable does drop,
+the product must delete and replace the Pod itself. `gpu_plugin`/`efa_plugin`
+grade the full `RESTART_*_DEVICE_PLUGIN` +
 `TRIGGER_HEALTH_SNAPSHOT` + `VALIDATE_{GPU,FABRIC}` chain SUCCEEDED, a new Ready
 `replacement_pod_uids` different from the deleted Pod, allocatable back to
 baseline, incident RECOVERED and no reboot; `one_sample` resumes the plugin after
@@ -2408,8 +2419,8 @@ allocatable snapshot never confirms, the step fails at `restart_timeout_seconds`
 and -- tagged `failure_escalation_action=REBOOT_NODE` by
 `orchestration/families/health._resource_escalation` -- escalates to
 `RESTART_NODE` under the separate `NODE_REBOOT` authorization (flag `X`). The
-effectiveness oracle is the raw kubelet allocatable reading: a freeze that does
-not reduce it is `INCONCLUSIVE`, not a pass. Cleanup resumes any still-frozen
+effectiveness oracle is the raw kubelet allocatable reading: a confirmed-stopped
+freeze that does not reduce it is `INCONCLUSIVE`, not a pass. Cleanup resumes any still-frozen
 process and proves allocatable back to baseline with exactly one plugin Pod on
 the node. Observed product gap: the final `RESTART_*_DEVICE_PLUGIN` step receipt
 persists only `replacement_pod_uids`; the deleted Pod's `deleted_pod_uid` lives

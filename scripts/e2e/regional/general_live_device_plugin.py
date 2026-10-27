@@ -58,6 +58,7 @@ subcommands and :class:`DevicePluginRegistrationFixture` (discover, ``freeze_pod
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -189,6 +190,7 @@ class DevicePluginRegistrationFixture:
     baseline_allocatable: int = 0
     original_pod_uid: str = ""
     original_pod_name: str = ""
+    pod_command_binaries: tuple[str, ...] = ()
     frozen_uids: set[str] = field(default_factory=set)
     _restore_pushed: bool = False
 
@@ -234,6 +236,12 @@ class DevicePluginRegistrationFixture:
             )
         self.original_pod_uid = str(pods[0]["metadata"].get("uid") or "")
         self.original_pod_name = str(pods[0]["metadata"].get("name") or "")
+        # The process basename the probe will signal is provider-specific and
+        # not guessable: the HyperPod EFA plugin's is none of the four static
+        # names, so a pure allow-list refused it live. Carry the plugin
+        # container's own command/image basenames from the discovered Pod spec
+        # and hand them to the probe (pod-UID cgroup match stays the hard gate).
+        self.pod_command_binaries = plugin_binary_candidates(pods[0])
         self.baseline_allocatable = self.allocatable()
         if self.baseline_allocatable < 1:
             raise VariantBlocked(
@@ -248,6 +256,7 @@ class DevicePluginRegistrationFixture:
             "baseline_allocatable": self.baseline_allocatable,
             "original_pod_uid": self.original_pod_uid,
             "original_pod_name": self.original_pod_name,
+            "pod_command_binaries": list(self.pod_command_binaries),
         }
         self.ctx.evidence.write("plugin-discover", evidence)
         return evidence
@@ -296,6 +305,8 @@ class DevicePluginRegistrationFixture:
         arguments = ["freeze", "--run-id", self.ctx.run_id, "--pod-uid", pod_uid]
         for binary in self.target.binaries:
             arguments += ["--binary", binary]
+        for binary in self.pod_command_binaries:
+            arguments += ["--pod-command-binary", binary]
         arguments += ["--seconds", str(int(seconds))]
         result = self._probe().execute(*arguments, timeout=180)
         if not result.get("frozen"):
@@ -304,6 +315,20 @@ class DevicePluginRegistrationFixture:
             )
         self.frozen_uids.add(pod_uid)
         self.ctx.evidence.write(f"freeze-{pod_uid}", result)
+        # The probe confirms the SIGSTOP took (the task reached the stopped
+        # state) before returning; if it did not, a running plugin keeps
+        # answering kubelet and allocatable will never drop, so refuse now with
+        # the reason rather than waiting out the whole allocatable-drop window
+        # (the live gpu_plugin run recorded stopped:false and then waited ~4 min
+        # before the misleading "allocatable did not drop" INCONCLUSIVE).
+        not_stopped = [entry for entry in result["frozen"] if not entry.get("stopped")]
+        if not_stopped:
+            raise VariantInconclusive(
+                f"the probe SIGSTOPped the {self.target.kind} plugin process in pod "
+                f"{pod_uid} but it did not enter the stopped state ({not_stopped}); "
+                "a plugin that keeps running keeps answering kubelet, so the "
+                "allocatable drop this variant depends on cannot occur"
+            )
         return result
 
     def resume_now(self) -> dict[str, Any]:
@@ -377,9 +402,12 @@ def _await_allocatable_drop(
     )
     if value is None:
         raise VariantInconclusive(
-            f"freezing the {fixture.target.kind} plugin did not reduce kubelet "
-            f"{fixture.target.resource} allocatable below "
-            f"{fixture.baseline_allocatable}"
+            f"the {fixture.target.kind} plugin process is confirmed stopped yet "
+            f"kubelet still advertises {fixture.baseline_allocatable} "
+            f"{fixture.target.resource}: a SIGSTOP'd device plugin keeps its "
+            "ListAndWatch socket open, so kubelet does not break the stream or "
+            "de-register the resource, and the product's allocatable-mismatch "
+            "detector (collectors/cloud/kubernetes) never sees a shortfall to act on"
         )
     return value
 
@@ -862,6 +890,46 @@ def _reboot_escalation(activity_doc: dict[str, Any], node: str) -> list[dict[str
 # --------------------------------------------------------------------------- #
 # shared helpers
 # --------------------------------------------------------------------------- #
+#: Launcher/shim basenames that are never the plugin itself; a ``/bin/sh -c``
+#: entrypoint must not widen the set of processes the probe may signal.
+_BINARY_NOISE = frozenset(
+    {"sh", "bash", "dash", "ash", "env", "tini", "dumb-init", "pause", "exec"}
+)
+_SAFE_BINARY = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+
+
+def plugin_binary_candidates(pod: dict[str, Any]) -> tuple[str, ...]:
+    """Process basenames the plugin container might run, from the Pod spec.
+
+    The probe's static allow-list is provider-blind; these are the discovered
+    Pod's *own* declared command and image basenames, passed as
+    ``--pod-command-binary`` so the probe matches the real plugin process (the
+    HyperPod EFA plugin's basename is none of the static names) while still
+    requiring the pod-UID cgroup match. Shim names are dropped.
+    """
+
+    candidates: list[str] = []
+
+    def add(value: Any) -> None:
+        if not isinstance(value, str) or not value:
+            return
+        base = value.rsplit("/", 1)[-1]
+        if base and base not in _BINARY_NOISE and _SAFE_BINARY.fullmatch(base):
+            if base not in candidates:
+                candidates.append(base)
+
+    spec = pod.get("spec") or {}
+    for container in spec.get("containers") or []:
+        command = container.get("command") or []
+        if command:
+            add(command[0])
+        image = container.get("image")
+        if isinstance(image, str):
+            last = image.rsplit("/", 1)[-1].split("@", 1)[0].split(":", 1)[0]
+            add(last)
+    return tuple(candidates)
+
+
 def _pod_ready(pod: dict[str, Any]) -> bool:
     conditions = (pod.get("status") or {}).get("conditions") or []
     return any(

@@ -42,6 +42,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -65,10 +66,39 @@ PLUGIN_BINARY_ALLOW_LIST = (
     "device-plugin",
 )
 RESUME_KIND = "resume-plugin"
+#: How long ``freeze`` waits for a SIGSTOP'd process to actually enter the
+#: kernel's stopped state before it records ``stopped``. ``os.kill`` only
+#: *queues* the signal; the task transitions to ``T`` when it is next
+#: scheduled, so a ``/proc/<pid>/stat`` read on the very next line races the
+#: transition and sees the old ``S``/``R`` -- the live gpu_plugin freeze
+#: recorded ``stopped: false`` for a process that was in fact frozen the whole
+#: window (its SIGCONT at cleanup resumed the same pid).
+STOP_CONFIRM_SECONDS = 5.0
+STOP_POLL_SECONDS = 0.05
 
 
 class ProbeError(RuntimeError):
-    pass
+    """A refused or failed step.
+
+    ``reason`` is one token of a closed vocabulary (``[a-z][a-z0-9_]{2,40}``)
+    the host fixture shows in its exception text (``; reason
+    no_plugin_process``); ``detail`` is a JSON object that travels with the
+    message into the case's ``probe-error.json`` -- for the "no allow-listed
+    plugin process" refusal it carries the processes the probe *did* find in
+    the plugin Pod's cgroup, so the real plugin binary name (unknown for the
+    HyperPod EFA plugin until it was seen live) is captured on the next run.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str | None = None,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.detail = detail
 
 
 def utc_now() -> str:
@@ -118,6 +148,25 @@ def checked_binaries(values: list[str]) -> list[str]:
             f"--binary must be one of {list(PLUGIN_BINARY_ALLOW_LIST)}"
         )
     return allowed
+
+
+#: The shape a Pod-spec-derived command basename must have to be signalled.
+SAFE_BINARY = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+
+
+def checked_pod_binaries(values: list[str]) -> list[str]:
+    """Plugin-container command basenames the control-plane fixture read from
+    the discovered Pod's own ``spec`` (``--pod-command-binary``).
+
+    These extend the static allow-list with the Pod's *actual* plugin binary,
+    which is not guessable across providers (the HyperPod EFA plugin's process
+    basename is not one of the four hard-coded names, so a pure allow-list
+    refused it live). Only the shape is checked here; the hard safety gate stays
+    the pod-UID cgroup match in :func:`plugin_processes`, so a signalled process
+    is always inside the one plugin Pod the fixture discovered.
+    """
+
+    return [item for item in values if SAFE_BINARY.fullmatch(item)]
 
 
 def bounded(value: int, low: int, high: int, label: str) -> int:
@@ -251,15 +300,65 @@ def process_start_ticks(pid: int) -> str | None:
     return fields[19] if len(fields) > 19 else None
 
 
-def process_is_stopped(pid: int, start_ticks: str | None) -> bool:
+def process_state(pid: int, start_ticks: str | None) -> str | None:
+    """The scheduler state letter of ``pid`` (``R``/``S``/``D``/``T``/``Z``...),
+    or ``None`` when the pid is gone or has been replaced (start ticks differ)."""
+
     try:
         text = Path(f"/proc/{pid}/stat").read_text()
     except OSError:
-        return False
+        return None
     fields = text.rsplit(")", 1)[-1].split()
+    if not fields:
+        return None
     if start_ticks is not None and (len(fields) <= 19 or fields[19] != start_ticks):
-        return False
-    return bool(fields) and fields[0] == "T"
+        return None
+    return fields[0]
+
+
+def process_is_stopped(pid: int, start_ticks: str | None) -> bool:
+    return process_state(pid, start_ticks) == "T"
+
+
+def wait_until_stopped(
+    pid: int, start_ticks: str | None, *, deadline_seconds: float = STOP_CONFIRM_SECONDS
+) -> bool:
+    """Poll until ``pid`` is in the stopped state, bounded.
+
+    ``os.kill(pid, SIGSTOP)`` only queues the signal; the task reaches ``T``
+    when it is next scheduled (and is deferred while it sits in an
+    uninterruptible ``D`` sleep). Reading the state on the next line races that
+    transition, so this polls briefly before the caller records ``stopped`` --
+    the fix for the live ``stopped: false`` on an actually-frozen plugin.
+    """
+
+    deadline = time.monotonic() + max(0.0, deadline_seconds)
+    while True:
+        if process_is_stopped(pid, start_ticks):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(STOP_POLL_SECONDS)
+
+
+def pod_cgroup_processes(pod_uid: str) -> list[dict[str, Any]]:
+    """Every process whose cgroup names ``pod_uid`` (allow-listed or not).
+
+    Used only to describe a "no allow-listed plugin process" refusal: the real
+    plugin binary basename the node runs is reported so a later run can add it,
+    without ever signalling anything off the allow-list.
+    """
+
+    found = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        command = process_cmdline(pid)
+        if not command or not process_in_pod(pid, pod_uid):
+            continue
+        found.append({"pid": pid, "binary": os.path.basename(command[0])})
+    return sorted(found, key=lambda item: item["pid"])
 
 
 def _canonical(value: str) -> str:
@@ -325,13 +424,30 @@ def freeze(arguments: argparse.Namespace) -> None:
     run_id = checked_run_id(arguments.run_id)
     pod_uid = checked_pod_uid(arguments.pod_uid)
     binaries = checked_binaries(list(arguments.binary))
+    binaries += [
+        item
+        for item in checked_pod_binaries(
+            list(getattr(arguments, "pod_command_binary", []))
+        )
+        if item not in binaries
+    ]
     seconds = bounded(
         arguments.seconds, MIN_DEADMAN_SECONDS, MAX_DEADMAN_SECONDS, "seconds"
     )
     processes = plugin_processes(pod_uid, binaries)
     if not processes:
+        # Name the processes the Pod *does* run (basenames only) so the real
+        # plugin binary -- unknown for the HyperPod EFA plugin until it was
+        # seen live -- is captured in probe-error.json for the next run,
+        # instead of only the message digest (S42's EFA-driver lesson).
         raise ProbeError(
-            f"no allow-listed plugin process found in pod {pod_uid}; refusing to signal"
+            f"no allow-listed plugin process found in pod {pod_uid}; refusing to signal",
+            reason="no_plugin_process",
+            detail={
+                "pod_uid": pod_uid,
+                "requested_binaries": sorted(set(binaries)),
+                "pod_processes": pod_cgroup_processes(pod_uid),
+            },
         )
     state = load_state(run_id)
     # Arm the resume deadman before the first SIGSTOP: a crash after this leaves
@@ -347,11 +463,16 @@ def freeze(arguments: argparse.Namespace) -> None:
         }
         save_state(run_id, state)
         os.kill(process["pid"], signal.SIGSTOP)
+        # Confirm the task actually reached the stopped state before recording
+        # it -- os.kill only queues the signal (live gpu_plugin recorded
+        # stopped:false for a process that was frozen the whole window).
+        is_stopped = wait_until_stopped(process["pid"], process["start_ticks"])
         stopped.append(
             {
                 "pid": process["pid"],
                 "binary": process["binary"],
-                "stopped": process_is_stopped(process["pid"], process["start_ticks"]),
+                "stopped": is_stopped,
+                "state": process_state(process["pid"], process["start_ticks"]),
             }
         )
     emit(
@@ -454,6 +575,7 @@ def parser() -> argparse.ArgumentParser:
     item = command("freeze", freeze)
     item.add_argument("--pod-uid", required=True)
     item.add_argument("--binary", action="append", default=[], required=True)
+    item.add_argument("--pod-command-binary", action="append", default=[])
     item.add_argument("--seconds", type=int, required=True)
     command("resume", resume)
     item = command("cleanup", cleanup)
@@ -461,17 +583,54 @@ def parser() -> argparse.ArgumentParser:
     return value
 
 
+#: Trivial frames ``exception_site`` skips so the reported site is the step
+#: that refused, not the shared validator/emitter it bubbled through.
+HELPER_FRAMES = frozenset(
+    {
+        "run",
+        "emit",
+        "utc_now",
+        "bounded",
+        "checked_run_id",
+        "checked_pod_uid",
+        "checked_binaries",
+        "checked_pod_binaries",
+        "load_state",
+        "save_state",
+    }
+)
+
+
+def exception_site(exc: BaseException) -> str | None:
+    site, frame = None, exc.__traceback__
+    while frame is not None:
+        code = frame.tb_frame.f_code
+        if code.co_filename == __file__ and code.co_name not in HELPER_FRAMES:
+            site = f"{code.co_name}:{frame.tb_lineno}"
+        frame = frame.tb_next
+    return site
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = parser().parse_args(argv)
     try:
         arguments.handler(arguments)
     except Exception as exc:  # noqa: BLE001 - reported as the probe's JSON error
+        # The host fixture keeps the message and structured detail (redacted)
+        # as the case's probe-error.json and shows only whitelisted tokens in
+        # its exception text; the device-plugin probe used to emit the class
+        # and digest alone, so the live EFA refusal left no probe-error.json
+        # and its cause had to be brute-forced from the message digest (S42).
         emit(
             {
                 "error": type(exc).__name__,
                 "error_kind": "probe",
                 "error_class": type(exc).__name__,
                 "error_code": hashlib.sha256(str(exc).encode()).hexdigest()[:16],
+                "error_site": exception_site(exc),
+                "error_reason": getattr(exc, "reason", None),
+                "error_message": str(exc)[:2000],
+                "error_detail": getattr(exc, "detail", None),
                 "command": getattr(arguments, "command", "?"),
             }
         )

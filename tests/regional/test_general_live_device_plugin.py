@@ -501,6 +501,77 @@ def test_freeze_inconclusive_when_no_process() -> None:
         spec.execute(ctx)
 
 
+@pytest.mark.parametrize(
+    "variant,target", [("gpu_plugin", mod.GPU_TARGET), ("efa_plugin", mod.efa_target())]
+)
+def test_freeze_inconclusive_immediately_when_not_stopped(
+    variant: str, target: mod.PluginTarget
+) -> None:
+    ds = _daemonset(f"{target.daemonset_token}-ds", target.daemonset_token, "ds-uid")
+    cluster = FakeCluster(
+        resource=target.resource,
+        baseline=8,
+        daemonset=ds,
+        pods=[_pod(U0, ds_uid="ds-uid")],
+        activity=lambda a: _doc(incidents=[], workflows=[]),
+    )
+    # The probe SIGSTOPped the process but it never reached the stopped state:
+    # a running plugin keeps answering kubelet, so the fixture must refuse now
+    # rather than wait out the allocatable-drop window.
+    plugin = FakeProbe(
+        {
+            "freeze": {
+                "frozen": [
+                    {
+                        "pid": 4242,
+                        "binary": target.binaries[0],
+                        "stopped": False,
+                        "state": "S",
+                    }
+                ]
+            },
+            "cleanup": {
+                "processes": [],
+                "residue": {"paused_processes": {}},
+                "clean": True,
+            },
+        }
+    )
+    spec, ctx = _context(variant, cluster, plugin)
+    with pytest.raises(VariantInconclusive, match="did not enter the stopped state"):
+        spec.execute(ctx)
+    # Immediate refusal: the only probe call was the freeze, and the fixture
+    # never advanced to the allocatable-drop poll loop.
+    assert [call[0] for call in plugin.calls] == ["freeze"], plugin.calls
+
+
+def test_plugin_binary_candidates_prefers_real_command_and_image_basenames() -> None:
+    pod = {
+        "spec": {
+            "containers": [
+                {
+                    # A shell shim entrypoint must not widen the signal set.
+                    "command": ["/bin/sh", "-c", "exec efa-k8s-device-plugin-hpd"],
+                    "image": "123.dkr.ecr.aws/x/efa-device-plugin@sha256:" + "a" * 64,
+                }
+            ]
+        }
+    }
+    got = mod.plugin_binary_candidates(pod)
+    assert "sh" not in got
+    # The image basename is captured even behind a shim entrypoint.
+    assert "efa-device-plugin" in got
+
+
+def test_plugin_binary_candidates_from_explicit_command() -> None:
+    pod = {
+        "spec": {
+            "containers": [{"command": ["/opt/aws/aws-efa-k8s-device-plugin-hyperpod"]}]
+        }
+    }
+    assert mod.plugin_binary_candidates(pod) == ("aws-efa-k8s-device-plugin-hyperpod",)
+
+
 # --------------------------------------------------------------------------- #
 # replacement_uid
 # --------------------------------------------------------------------------- #
@@ -799,7 +870,7 @@ def test_cleanup_refuses_when_probe_not_clean() -> None:
             "freeze": (
                 lambda a: (
                     setattr(cluster, "allocatable_value", 0),
-                    {"frozen": [{"pid": 1}]},
+                    {"frozen": [{"pid": 1, "stopped": True}]},
                 )[1]
             ),
             "cleanup": {"residue": {"paused_processes": {"1": {}}}, "clean": False},
