@@ -166,9 +166,10 @@ def test_registry_covers_024() -> None:
     assert "row-remap-pending" in reg.APPROVALS["GPU_RESET"], (
         "the GPU_RESET token names the replayed reading"
     )
-    assert "RESET_GPU" in spec.injection and "RECOVERED by itself" in spec.expected
-    # The plan is bounded to the one scrape that mints and the chain must end in
-    # RECOVERED, never in the RESTART_NODE escalation a held flag provoked live.
+    assert "RESET_GPU" in spec.injection and "terminal hold" in spec.expected
+    # The plan is bounded to the one scrape that mints and the chain must
+    # SUCCEED -- its incident RECOVERED, or QUARANTINED under the error GPU's
+    # terminal hold -- never in the RESTART_NODE escalation a held flag provoked.
     assert "exactly the one scrape" in spec.injection
     assert "no RESTART_NODE escalation" in spec.expected
     assert "on the records" in spec.expected
@@ -724,9 +725,7 @@ def test_wrong_scope_source_passes_when_no_composite(
     assert out["component_metrics"] == ["ecc_dbe_volatile_total", "row_remap_pending"]
     assert out["repair_incidents"] == ["inc-r"]
     assert out["_restored"] == [["inc"]], "only the error GPU's incident is restored"
-    assert any("settles RECOVERED by itself" in note for note in out["notes"]), out[
-        "notes"
-    ]
+    assert any("otherwise RECOVERED" in note for note in out["notes"]), out["notes"]
     # The fault pair is served for exactly the one scrape that mints it, in a
     # bounded step -- never held -- and nothing advances.
     assert (out["fault_reads"], out["oracle_gate"]) == (1, "journal")

@@ -16,10 +16,6 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from typing import Any
 
-from scripts.e2e.regional.general_live_gpu_generation import (
-    PENDING_FLAG_VERDICT_PROBE,
-    rejudging_answer,
-)
 from scripts.e2e.regional.general_live_gpu_store import GPU_STATE_PROBE
 from scripts.e2e.regional.general_live_store import ACTIVITY_PROBE
 from tests.regional._general_live_fakes import FakeProbe
@@ -194,34 +190,21 @@ def _flag(arguments: tuple[str, ...], name: str, default: str) -> str:
 
 
 def gpu_cpu_python(
-    *, gpu_state: Any = None, activity: Any = None, generation: Any = None
+    *, gpu_state: Any = None, activity: Any = None
 ) -> Callable[..., dict[str, Any]]:
-    """A ``cpu_python`` dispatcher for the GPU-state, activity and
-    product-generation probes.
+    """A ``cpu_python`` dispatcher for the GPU-state and activity probes.
 
-    Each of ``gpu_state`` / ``activity`` / ``generation`` is a document, a
-    callable taking the probe arguments, or a list consumed one call at a time
-    (the last repeats). ``generation`` is the control plane's answer to
-    ``general_live_gpu_generation.PENDING_FLAG_VERDICT_PROBE``; by default a
-    product whose post-reset VALIDATE_GPU re-judges the pending flag on newer
-    data (``rejudging_answer``), so the reset variants run their full oracle.
+    Each of ``gpu_state`` / ``activity`` is a document, a callable taking the
+    probe arguments, or a list consumed one call at a time (the last repeats).
     """
 
     iterators: dict[str, Any] = {}
 
     def dispatch(script: str, *arguments: str) -> dict[str, Any]:
-        name = {
-            GPU_STATE_PROBE: "gpu_state",
-            ACTIVITY_PROBE: "activity",
-            PENDING_FLAG_VERDICT_PROBE: "generation",
-        }.get(script, "?")
-        value = {
-            "gpu_state": gpu_state,
-            "activity": activity,
-            "generation": generation,
-        }.get(name)
-        if value is None and name == "generation":
-            return rejudging_answer(arguments[0] if arguments else "row_remap_pending")
+        name = {GPU_STATE_PROBE: "gpu_state", ACTIVITY_PROBE: "activity"}.get(
+            script, "?"
+        )
+        value = {"gpu_state": gpu_state, "activity": activity}.get(name)
         if value is None:
             return _empty(name)
         if callable(value):

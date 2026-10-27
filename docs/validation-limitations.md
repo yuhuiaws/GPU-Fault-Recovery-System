@@ -4543,69 +4543,63 @@ after the chain.
 024 `wrong_scope_source` FAILED a third time live (2026-10-27 14:33-14:41Z, the
 HyperPod lane's node, R13g 37db33f254a1, harness int/r13c-live28, the one-read
 plan): "repair_settled: the row_remap_pending incident ... is QUARANTINED, not
-RECOVERED by its own chain". The journal shows read 4 serving the pair
+RECOVERED by its own chain" -- the harness's oracle contradicting the product's
+design, not a product fault. The journal shows read 4 serving the pair
 (replay-served accepted 14:36:20Z, detection 14:36:26Z) and reads 5-9 the
 exporter's own scrape byte for byte with no upstream error; the repair-settled
-polls 14:36:32-14:38:17Z found the record still running, 14:38:43Z found it
-ended with the incident QUARANTINED; the close restored the collector at
-14:39:06Z with the drop-in and the audit file still present, and the validated
-restore released both incidents (node Ready, schedulable, no annotations).
-There was NO reboot this time: the preflight (14:33:02Z), the survey (14:34Z)
-and the post-restore Node object all carry boot id cc70db9b (the 14:11Z boot
-of an earlier case), and Ready 14:37:40Z is kubelet coming back after the
-quiesce had stopped it -- which is also why the `/run` objects survived. The
-bounded plan is therefore not enough by itself: the post-reset VALIDATE_GPU
-judged the pending finding the minting batch left.
-`adapters/gpu_validation._validate_active_findings` grants a WARNING-only
-finding its grace for the thermal, correctable-memory and power families
-only, and b202's past-the-grace wait for a GPU-metrics batch newer than the
-finding (gap 26, "the verdict follows the data") hangs off that same grace;
-`row_remap_pending` / `retired_pages_pending` are in none of the name sets,
-`warning_grace` stays `None` and the step fails at once with
-`active_gpu_health_findings`. The R13h candidate
-(`int/r13c-staging-r13h-cand`) answers the same for both flags (probe run
-against its `src/gpu_fault`: thermal and `ecc_sbe_volatile_total` WAIT past
-the grace with `awaiting_newer_gpu_metrics`, the pending flags fail at once).
-Whether the variant can PASS is thus a product property, and S54 decides it as
-a product generation before the deploy (`general_live_gpu_generation`, the
-rule S47 set for the 014 freeze path): `PENDING_FLAG_VERDICT_PROBE` runs the
-deployed `GpuValidationAdapter._validate_active_findings` read-only in an API
-Pod (the finding and `latest` come from the script; nothing reads or writes
-the store) for a WARNING pending-flag finding 30 s and 10 min after the
-workflow's creation, and the answer is the evidence `product-generation.json`.
-Only a product that keeps WAITING past the grace (`rejudges`) deploys the
-replay and runs the full oracle (reset, real reading, VALIDATE_GPU,
-RECOVERED); a product that judges at once (R13g, the R13h candidate) is
-INCONCLUSIVE after the survey and before anything is installed, "expected on
-this product generation: ..." with the mechanism and the generation cited, the
-node untouched; a probe the product's code shape defeats refuses the same way
-("could not be decided") -- no reset on a guess. The gate's reason is recorded
-as known product gap 30 ("VALIDATE_GPU after RESET_GPU fails a
-pending-remap/retired-pages flag on the pre-reset reading; b202's newer-batch
-wait covers only the thermal/memory/power WARNING families"), quoted in the
-INCONCLUSIVE text. The gate is on 024 `wrong_scope_source` only: 019
-`pending_supported` / `post_reset` deliver the flag for exactly the
-confirmation samples and the next scrape clears it before the product's
-validation, so they do not depend on the product re-judging a pending flag --
-on R13g both PASSED live on HyperPod (2026-10-27 08:35Z / 08:49Z) and plain EKS
-(11:36Z / 11:56Z), and a gate there would be a regression (a test pins that
-their control-plane reads are the GPU state and the node activity only); the
-other 024 variants plan no reset and have no such dependence. On a re-judging product a chain that still ends QUARANTINED
-is the FAIL it was, but the validated restore then also releases the repair
-GPU's incident (only once its chain has ended with the node still isolated; a
-chain still running is not restored over), so the node is left clean either
-way, and both incidents' full record -- workflows, step executions,
-timestamps -- is written to `repair-record.json`: the 2026-10-27 evidence held
-only the incident ids and the poll timelines, so which step failed and why the
-ladder did not reboot remain open questions for the product records. Tests:
-`tests/regional/test_general_live_gpu_generation.py` (the probe against the
-real adapter: both pending flags judged at once, the thermal family graced;
-the classifier and its texts; the R13g / R13h-shaped answers -> INCONCLUSIVE
-before the deploy with the probe having run the survey only; a re-judging
-product -> PASS with the record kept; a QUARANTINED chain -> FAIL with both
-incidents restored; the gate on 024 `wrong_scope_source` only) and
+polls 14:36:32-14:38:17Z found the record running and 14:38:43Z found every
+workflow ended with the incident QUARANTINED, no rung planned (the hardware
+stage was empty) and NO reboot (the preflight at 14:33:02Z, the survey and the
+post-restore Node object all carry boot id cc70db9b, the 14:11Z boot of an
+earlier case; Ready 14:37:40Z is kubelet back after the quiesce, which is why
+the `/run` objects -- drop-in, audit file -- were still there for the
+14:39:06Z close); the validated restore released the repair incident first, as
+the node's isolation owner, then the error GPU's, leaving the node Ready,
+schedulable and unannotated. Root cause (S54 follow-up, reproduced through the
+product's own path -- `GpuMetricsService.ingest`, `gpu_node_health_findings`,
+`NodeHealthIngestionService.ingest` -- identically on this tree and the R13h
+candidate): the error GPU's CRITICAL DBE plans FREEZE_EVIDENCE,
+MARK_UNSCHEDULABLE, QUARANTINE, whose QUARANTINE step carries
+`terminal_quarantine_node_ids` (`orchestration/families/health._enrich_step`
+for a QUARANTINE/DRAIN finding) -- a terminal hold on the node -- and the
+repair GPU's RESET_GPU plan on the same node inherits it
+(`workflow_quarantine.inherit_terminal_quarantine`, "a subsequent recovery
+cannot silently undo a node's persistent hold": a QUARANTINE inserted,
+RESTORE_SCHEDULING superseded; the product pins it in
+`test_reset_inherits_quarantine_without_reintroducing_retired_steps`), so
+`terminal_state.terminal_incident_state` settles it QUARANTINED although every
+executed step SUCCEEDED. The pending flag alone (019) has no sibling hold and
+settles RECOVERED (live PASS on both clusters). The 2026-10-26 eksb record read
+as "RECOVERED by itself" does not support that reading either: its
+validated-restore.json releases the repair incident first too. The property
+product gap 30 names (VALIDATE_GPU grants a pending flag neither the grace nor
+b202's newer-batch wait -- true on both trees, probed) is latent, not this
+FAIL's cause: the one-read plan, like 019's, lets the real reading clear the
+flag before the post-reset validation. So the generation gate of 96a1e5f7 /
+5a257ea is gone (neither 019 nor 024 is gated) and `repair_settled` judges the
+product's design: every workflow of the repair incident terminal, the latest
+SUCCEEDED having executed RESET_GPU and VALIDATE_GPU (both SUCCEEDED), and the
+incident RECOVERED -- its own RESTORE_SCHEDULING released the node -- or
+QUARANTINED under the error GPU's terminal hold: the chain's QUARANTINE carries
+the node in `terminal_quarantine_node_ids`, no RESTORE_SCHEDULING of it
+SUCCEEDED, and an error-GPU incident holds the node under its own terminal
+quarantine. A FAILED/BLOCKED chain, a QUARANTINED without the hold, a hold
+without a source or a chain that never reset stays the stage's error. The
+validated restore releases the error GPU's incident and a repair incident the
+ended chain left isolated (a running chain is not restored over), so the node
+ends clean either way, and `repair-record.json` keeps both incidents' full
+record (workflows, superseded steps, hold parameters, step executions,
+timestamps). With the findings ingested the other way round (the repair
+finding first) the product's persistent quarantine replaces the unstarted
+reset plan and the DBE finding joins the repair incident -- no reset, one
+incident -- which the scoping stage reports; both live records show the
+error-first order. Tests: `tests/regional/test_general_live_gpu_terminal_hold.py`
+(the product's ingest path pinning the inherited hold and the QUARANTINED, the
+flag alone RECOVERED; the variant over the product's own records: the live
+shape PASSES with both incidents released; a failed VALIDATE_GPU, no hold, no
+source, no reset -> FAIL; a running chain is not restored over) and
 `tests/regional/test_general_live_gpu_memory_reset.py` (019's two reset
-variants ungated, their full oracle on any generation).
+variants ungated, reading the GPU state and the node activity only).
 
 019 `pending_supported` and `post_reset` are now bounded and judged on the
 records (S36, 2026-10-26; both are X variants under `GPU_RESET` that have never

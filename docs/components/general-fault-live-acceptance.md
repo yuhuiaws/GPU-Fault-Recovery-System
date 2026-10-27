@@ -1224,42 +1224,39 @@ quiesce，所以它们的采集器不会在保持计划下停掉、不存在被�
 见 019 节）——024 本例一读即可，只因同批 DBE 计数器自身就是投递边沿。
 
 `wrong_scope_source` 2026-10-27 14:33-14:41Z（HyperPod hp 车道节点，R13g 37db33f254a1，夹具
-int/r13c-live28，一读计划）第三次 FAIL "repair_settled: the row_remap_pending incident ... is
-QUARANTINED, not RECOVERED by its own chain"。journal：第 4 读端出这一对（replay-served 14:36:20Z
-接受，detection 14:36:26Z），第 5-9 读逐字节是 exporter 自身的 scrape、无上游错误；repair-settled 轮询
-14:36:32-14:38:17Z 五次未结束、14:38:43Z 记录结束且 incident 为 QUARANTINED；close 14:39:06Z 恢复采集器，
-drop-in 与 audit 文件仍在；validated restore 释放了两个 incident，节点 Ready/可调度、无注解。本次**没有
-重启**：preflight（14:33:02Z）、survey（14:34Z）与 restore 后的 Node 对象 boot id 同为 cc70db9b（来自
-14:11Z 的上一次启动），Ready 14:37:40Z 是 quiesce 停掉的 kubelet 被 RESTORE_GPU_SERVICES 拉回，/run
-下的回放对象因此得以保留。有界计划本身不够：reset 后的 VALIDATE_GPU 判的是铸造批次留下的 pending
-finding——`adapters/gpu_validation._validate_active_findings` 只给 thermal/可纠正内存/功耗三族 WARNING
-finding 宽限，b202（gap 26，"verdict follows data"）的"等待比 finding 更新的 GPU metrics 批次"也只接在
-这一宽限之后，`row_remap_pending`/`retired_pages_pending` 不在任一名单里，`warning_grace` 为 None，步骤
-立刻以 `active_gpu_health_findings` 失败；R13h 候选（int/r13c-staging-r13h-cand）的同一函数对这两个
-标志答案相同（探针实测：thermal/ecc_sbe 过宽限后 WAITING `awaiting_newer_gpu_metrics`，pending 标志仍
-立刻失败）。该变体能否 PASS 因此是产品属性而非夹具问题，S54 把它作为**产品代际**在部署前判定
-（`general_live_gpu_generation`，沿用 S47 对 014 freeze 的规则）：`PENDING_FLAG_VERDICT_PROBE` 在 API
-Pod 内只读运行已部署的 `GpuValidationAdapter._validate_active_findings`（finding 与 latest 都由脚本自备，
-不碰 store），分别在工作流创建后 30 s 与 10 min 问一个 WARNING pending finding 的裁决；答案写入证据
-`product-generation.json`。过宽限仍 WAITING（`rejudges`）的产品才部署回放、跑完整 oracle（reset →
-真实读数 → VALIDATE_GPU → RECOVERED）；立刻失败的产品（R13g、R13h 候选）在 survey 之后、部署之前即
-INCONCLUSIVE "expected on this product generation: ..."，写明机制与代际，节点未被触碰；探针读不出
-答案同样拒跑（"could not be decided"），绝不凭猜测 reset。该门的原因记为已知产品缺口 30（"VALIDATE_GPU
-after RESET_GPU fails a pending-remap/retired-pages flag on the pre-reset reading; b202's newer-batch wait
-covers only the thermal/memory/power WARNING families"），INCONCLUSIVE 文案逐字引用。门只加在 024
-`wrong_scope_source` 上：019 `pending_supported`/`post_reset` 的计划恰好端满确认样本数、下一次 scrape
-在产品校验前就把标志清掉，不依赖产品重判，2026-10-27 R13g 上两变体在 HyperPod（08:35Z/08:49Z）与
-plain EKS（11:36Z/11:56Z）均 PASS，加门即回归，故不加（测试钉住其控制面读取只有 GPU state 与 activity
-两个探针）；024 其余变体不计划 reset，无此依赖。在会重判的产品上，
-链若仍以 QUARANTINED 结束则 FAIL 照记，但 validated restore 这时也释放修复 GPU 的 incident（仅限其链
-已结束且节点仍被隔离时；链仍在跑时不覆盖），节点两种结局都干净；两个 incident 的完整记录（工作流、
-步骤执行与时间戳）写入 `repair-record.json`——本次证据只有 incident id 与轮询时间线，哪一步失败、为何
-没有 RESTART_NODE 都无从查起，是待产品记录核对的开放问题。测试见
-`tests/regional/test_general_live_gpu_generation.py`（探针对真实适配器：两个 pending 标志立刻失败、
-thermal 族有宽限；分类器与文案；R13g/R13h 形状的记录 → 部署前 INCONCLUSIVE 且探针只跑过 survey；
-会重判的产品 → PASS 并留下 repair-record；QUARANTINED 链 → FAIL 且两个 incident 都被 restore；
-门只在 024 `wrong_scope_source`）与 `tests/regional/test_general_live_gpu_memory_reset.py`（019 两变体不加门、
-对任何代际都跑完整 oracle）。
+int/r13c-live28，一读计划）FAIL "repair_settled: the row_remap_pending incident ... is QUARANTINED, not
+RECOVERED by its own chain"——这是夹具 oracle 与产品设计相悖，不是产品缺陷。journal：第 4 读端出这一对
+（replay-served 14:36:20Z 接受，detection 14:36:26Z），第 5-9 读逐字节是 exporter 自身的 scrape、无上游错误；
+repair-settled 轮询 14:36:32-14:38:17Z 未结束、14:38:43Z 全部工作流终态且 incident 为 QUARANTINED，没有任何
+升级级（hardware stage 为空）、**没有重启**（preflight 14:33:02Z、survey 与 restore 后的 Node 对象 boot id 同为
+cc70db9b，来自 14:11Z 的上一次启动；Ready 14:37:40Z 是 quiesce 停掉的 kubelet 被 RESTORE_GPU_SERVICES 拉回，
+/run 下回放对象因此保留，close 14:39:06Z 时 drop-in 与 audit 文件仍在）；validated restore 把修复 incident 排在
+第一位释放——它是节点隔离注解的属主——随后释放错误 GPU 的 incident，节点 Ready/可调度、无注解。根因
+（S54 后续，用真实产品路径复现：`GpuMetricsService.ingest` → `gpu_node_health_findings` →
+`NodeHealthIngestionService.ingest`，本树与 R13h 候选结果一致）：错误 GPU 的 CRITICAL DBE 计划
+FREEZE_EVIDENCE/MARK_UNSCHEDULABLE/QUARANTINE，QUARANTINE 步带 `terminal_quarantine_node_ids`
+（`orchestration/families/health._enrich_step` 对 QUARANTINE/DRAIN finding），即对节点的终态隔离；同节点上
+修复 GPU 的 RESET_GPU 计划继承该隔离（`workflow_quarantine.inherit_terminal_quarantine`："a subsequent
+recovery cannot silently undo a node's persistent hold"——插入一个 QUARANTINE、RESTORE_SCHEDULING 被
+superseded，产品测试 `test_reset_inherits_quarantine_without_reintroducing_retired_steps` 钉住），于是即便
+每个已执行步骤都 SUCCEEDED，`terminal_state.terminal_incident_state` 也把它定为 QUARANTINED。单独的 pending
+标志（019）没有兄弟隔离，自行 RECOVERED（两集群现场 PASS）。eksb 2026-10-26 那次被读作"自行 RECOVERED"
+同样不成立：其 validated-restore.json 也把修复 incident 排第一位释放。b202/产品缺口 30 所说的属性
+（VALIDATE_GPU 对 pending 标志无宽限、无"等更新批次"，探针在两棵树上实测属实）是潜在属性，不是本次 FAIL
+的原因——一读计划与 019 一样在 reset 后校验之前就让真实读数清掉标志。因此去掉 96a1e5f7/5a257ea 的代际门
+（019 与 024 都不再加门），`repair_settled` 改判产品的设计：修复 incident 的所有工作流终态、最近一条
+SUCCEEDED 且执行过 RESET_GPU 与 VALIDATE_GPU（均 SUCCEEDED），incident 要么 RECOVERED（链自己的
+RESTORE_SCHEDULING 释放节点），要么在错误 GPU 的终态隔离下 QUARANTINED——修复链的 QUARANTINE 携带本节点
+的 `terminal_quarantine_node_ids`、链未执行成功的 RESTORE_SCHEDULING、且错误 GPU 的 incident 以自己的终态
+隔离持有该节点；链 FAILED/BLOCKED、无隔离的 QUARANTINED、无来源的隔离、从未 reset 都仍是该 stage 的错误。
+validated restore 释放错误 GPU 的 incident 以及链已结束而仍隔离的修复 incident（链仍在跑时不覆盖），节点两种
+结局都干净；`repair-record.json` 保留两个 incident 的完整记录（工作流、superseded 步骤、隔离参数、步骤执行
+与时间戳）。反向摄入顺序（修复 finding 在前）时产品的持久隔离会替换尚未开始的 reset 计划、DBE finding 并入
+修复 incident（不 reset、只有一个 incident），scoping stage 会报出；两次现场记录都是错误 GPU 在前。测试见
+`tests/regional/test_general_live_gpu_terminal_hold.py`（真实产品摄入路径钉住继承与 QUARANTINED、单独标志
+RECOVERED；以产品自己的记录跑变体：现场形状 PASS 且两个 incident 都被释放；VALIDATE_GPU FAILED、无隔离、
+无来源、未 reset → FAIL；链仍在跑不 restore）与 `tests/regional/test_general_live_gpu_memory_reset.py`（019 两
+变体不加门、控制面只读 GPU state 与 activity）。
 
 `independent_xid` 2026-10-26 08:07Z（eks ip-10-0-43-5，R13g）FAIL "2 CORRECTABLE_MEMORY_DEGRADATION
 incidents (expected one)"：两个复合 incident 的 batch 分别为 07:54:39.12Z（第一次回放读，WARNING）
