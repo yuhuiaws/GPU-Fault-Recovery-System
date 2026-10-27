@@ -1075,3 +1075,24 @@ def test_generation_record_describes_both_sides() -> None:
     assert record["control_plane"]["rule"] is True
     assert "carries the liveness probe" in record["description"]
     assert "grades gpu_device_plugin_unresponsive" in record["description"]
+
+
+def test_plugin_targets_request_only_allow_listed_binaries() -> None:
+    """Every basename a target asks the probe for is on the probe's static
+    allow-list (the probe signals only the intersection), and the EFA target
+    asks for the basename the HyperPod EFA plugin's container actually runs
+    (``efa-k8s-device-plugin``, live refusal record 2026-10-27), not only the
+    Pod's command/image name."""
+
+    from scripts.e2e.regional.probes import general_live_device_plugin_probe as probe
+
+    for target in (mod.GPU_TARGET, mod.efa_target()):
+        off_list = [
+            item
+            for item in target.binaries
+            if item not in probe.PLUGIN_BINARY_ALLOW_LIST
+        ]
+        assert off_list == [], (
+            f"{target.kind} requests binaries the probe drops: {off_list}"
+        )
+    assert "efa-k8s-device-plugin" in mod.efa_target().binaries

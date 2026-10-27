@@ -709,3 +709,76 @@ def test_parser_knows_the_read_only_companions() -> None:
         ]
     )
     assert frozen.resume_after_first_timeout is True and frozen.window_seconds == 40
+
+
+# --------------------------------------------------------------------------- #
+# the live HyperPod EFA plugin Pod (hp lane, 2026-10-27, run
+# gl014-efa-plugin-a6-471be317-r2): what probe-error.json recorded
+# --------------------------------------------------------------------------- #
+LIVE_EFA_POD = "a9d8615c-bc52-4379-b74e-d10a64738556"
+LIVE_EFA_POD_PROCESSES = [
+    {"pid": 51880, "binary": "pause"},
+    {"pid": 53504, "binary": "efa-k8s-device-plugin"},
+]
+#: ``requested_binaries`` of that refusal: the fixture's tuple intersected with
+#: the then-static allow-list, plus the Pod's command/image basename.
+LIVE_EFA_REQUESTED = ["aws-efa-k8s-device-plugin", "device-plugin", "k8s-device-plugin"]
+
+
+def _fake_proc(root: Path, pid: int, argv: list[str], cgroup: str) -> None:
+    directory = root / str(pid)
+    directory.mkdir(parents=True)
+    (directory / "cmdline").write_bytes(b"\0".join(a.encode() for a in argv) + b"\0")
+    (directory / "cgroup").write_text(cgroup + "\n")
+    comm = Path(argv[0]).name[:15]
+    fields = " ".join(str(i) for i in range(50))
+    (directory / "stat").write_text(f"{pid} ({comm}) S {fields}\n")
+
+
+def _pod_scope(pod_uid: str, container: str) -> str:
+    slice_uid = pod_uid.replace("-", "_")
+    return (
+        "0::/kubepods.slice/kubepods-besteffort.slice/"
+        f"kubepods-besteffort-pod{slice_uid}.slice/cri-containerd-{container}.scope"
+    )
+
+
+def test_live_hyperpod_efa_pod_processes_vector(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proc = tmp_path / "proc"
+    _fake_proc(proc, 51880, ["/pause"], _pod_scope(LIVE_EFA_POD, "aa" * 32))
+    _fake_proc(
+        proc, 53504, ["/efa-k8s-device-plugin"], _pod_scope(LIVE_EFA_POD, "bb" * 32)
+    )
+    # Noise the gates must exclude: the identical binary in ANOTHER Pod, and a
+    # host process -- neither cgroup names the discovered Pod UID.
+    other_pod = "ffffffff-0000-0000-0000-000000000000"
+    _fake_proc(proc, 60000, ["/efa-k8s-device-plugin"], _pod_scope(other_pod, "cc"))
+    _fake_proc(proc, 1, ["/usr/lib/systemd/systemd"], "0::/init.scope")
+    (proc / "self").mkdir()  # a non-numeric entry every /proc has
+    monkeypatch.setattr(probe, "PROC_ROOT", proc)
+
+    # What the refusal recorded live: both Pod processes, basenames only.
+    assert probe.pod_cgroup_processes(LIVE_EFA_POD) == LIVE_EFA_POD_PROCESSES
+    # The request made live matched nothing -- the basename the node runs was
+    # off the list -- which is exactly why the probe refused.
+    assert probe.plugin_processes(LIVE_EFA_POD, LIVE_EFA_REQUESTED) == []
+    # With the basename allow-listed, exactly the plugin process is matched:
+    # pause is not allow-listed, and the other Pod's identical binary and the
+    # host process fail the pod-UID cgroup gate.
+    wanted = probe.checked_binaries([*LIVE_EFA_REQUESTED, "efa-k8s-device-plugin"])
+    assert "efa-k8s-device-plugin" in wanted, wanted
+    matched = probe.plugin_processes(LIVE_EFA_POD, wanted)
+    assert [(item["pid"], item["binary"]) for item in matched] == [
+        (53504, "efa-k8s-device-plugin")
+    ]
+    assert matched[0]["start_ticks"] == "18"  # field 22 of /proc/<pid>/stat
+
+
+def test_allow_list_carries_the_hyperpod_efa_plugin_basename() -> None:
+    assert "efa-k8s-device-plugin" in probe.PLUGIN_BINARY_ALLOW_LIST
+    assert "pause" not in probe.PLUGIN_BINARY_ALLOW_LIST
+    assert probe.checked_binaries(["pause", "efa-k8s-device-plugin"]) == [
+        "efa-k8s-device-plugin"
+    ]

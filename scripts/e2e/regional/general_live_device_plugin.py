@@ -233,7 +233,17 @@ def efa_target() -> PluginTarget:
         kind="efa",
         resource="vpc.amazonaws.com/efa",
         daemonset_token=efa_device_plugin_name(),
-        binaries=("aws-efa-k8s-device-plugin", "k8s-device-plugin", "device-plugin"),
+        # The process basename differs by provider: the HyperPod EFA plugin's
+        # container runs ``efa-k8s-device-plugin`` although its Pod command/
+        # image basename is ``aws-efa-k8s-device-plugin`` (live refusal record,
+        # hp lane 2026-10-27); the probe signals only the intersection of this
+        # request with its own static allow-list.
+        binaries=(
+            "efa-k8s-device-plugin",
+            "aws-efa-k8s-device-plugin",
+            "k8s-device-plugin",
+            "device-plugin",
+        ),
         restart_operation="RESTART_EFA_DEVICE_PLUGIN",
         validate_operation="VALIDATE_FABRIC",
         socket_name="aws-efa-device-plugin.sock",

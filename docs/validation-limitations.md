@@ -2410,7 +2410,10 @@ path. The injection instead SIGSTOPs the plugin container's own process -- only
 a process whose cgroup names the plugin Pod UID *and* whose argv basename is
 allow-listed (the static list plus the plugin container's own command/image
 basenames read from the discovered Pod spec, since the HyperPod EFA plugin's
-process basename is none of the static names), deadman-backed with SIGCONT. The
+process basename was none of the original static names: live on the HyperPod
+lane the Pod's command/image basename is `aws-efa-k8s-device-plugin` while
+the container process is `efa-k8s-device-plugin`, which the static list now
+carries), deadman-backed with SIGCONT. The
 probe confirms the task actually reached the kernel stopped state (`T`) before
 it returns -- `os.kill` only queues SIGSTOP, so a read on the next line races
 the transition and can report `stopped:false` for a process that did freeze; a

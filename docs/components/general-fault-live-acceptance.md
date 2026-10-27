@@ -585,7 +585,9 @@ link inactive先诊断；excess/unknown/不可读不能授权reboot。
 `probes/general_live_device_plugin_probe.py`，审批 `DEVICE_PLUGIN_RESTART`）：不移除
 DaemonSet、不改 `Node.status`，而是对 plugin 容器自身进程发 SIGSTOP（仅签名匹配该
 plugin Pod UID 且基名在允许清单内的进程，deadman 用 SIGCONT 兜底）。基名随 provider 不同
-（HyperPod EFA plugin 的进程基名不在静态清单内），故除静态清单外还从发现到的 Pod spec
+（HyperPod EFA plugin 的进程基名原不在静态清单内：现场其 Pod command/image 基名为
+`aws-efa-k8s-device-plugin`，容器进程却是 `efa-k8s-device-plugin`，静态清单现已收录），
+故除静态清单外还从发现到的 Pod spec
 取该 plugin 容器自身的 command/image 基名一并下发；找不到允许进程时拒绝会记录该 Pod 内实际
 存在的进程（写入 `probe-error.json`）。探针在返回前确认任务确已进入内核停止态（`T`）——
 `os.kill` 只是投递 SIGSTOP，紧随其后的 `/proc` 读会与状态切换竞争而把真正冻结的进程记成

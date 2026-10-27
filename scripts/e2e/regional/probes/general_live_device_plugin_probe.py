@@ -71,6 +71,9 @@ SAFE_RUN_ID = re.compile(r"^[a-z0-9][a-z0-9-]{2,62}$")
 SAFE_POD_UID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
+#: The procfs root every process read goes through; a test points it at a fake
+#: tree holding exactly the processes a live Pod ran.
+PROC_ROOT = Path("/proc")
 MIN_DEADMAN_SECONDS = 60
 MAX_DEADMAN_SECONDS = 5400
 #: The only process basenames this probe will ever signal. The fixture passes
@@ -79,6 +82,14 @@ MAX_DEADMAN_SECONDS = 5400
 PLUGIN_BINARY_ALLOW_LIST = (
     "nvidia-device-plugin",
     "aws-efa-k8s-device-plugin",
+    # The HyperPod EFA plugin's container process: its Pod command/image
+    # basename is ``aws-efa-k8s-device-plugin`` but the image entrypoint runs
+    # ``efa-k8s-device-plugin`` -- the live refusal record of the HyperPod
+    # lane's test node, 2026-10-27 (probe-error.json: pod_processes = pause +
+    # efa-k8s-device-plugin, requested_binaries without it), which is why the
+    # first efa_plugin runs refused with no_plugin_process. The pod-UID
+    # cgroup match in ``plugin_processes`` stays the hard gate.
+    "efa-k8s-device-plugin",
     "k8s-device-plugin",
     "device-plugin",
 )
@@ -341,7 +352,7 @@ def disarm_deadman(run_id: str, kind: str) -> None:
 # --------------------------------------------------------------------------- #
 def process_cmdline(pid: int) -> list[str]:
     try:
-        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        raw = (PROC_ROOT / str(pid) / "cmdline").read_bytes()
     except OSError:
         return []
     return [item.decode(errors="replace") for item in raw.split(b"\0") if item]
@@ -349,7 +360,7 @@ def process_cmdline(pid: int) -> list[str]:
 
 def process_start_ticks(pid: int) -> str | None:
     try:
-        text = Path(f"/proc/{pid}/stat").read_text()
+        text = (PROC_ROOT / str(pid) / "stat").read_text()
     except OSError:
         return None
     fields = text.rsplit(")", 1)[-1].split()
@@ -361,7 +372,7 @@ def process_state(pid: int, start_ticks: str | None) -> str | None:
     or ``None`` when the pid is gone or has been replaced (start ticks differ)."""
 
     try:
-        text = Path(f"/proc/{pid}/stat").read_text()
+        text = (PROC_ROOT / str(pid) / "stat").read_text()
     except OSError:
         return None
     fields = text.rsplit(")", 1)[-1].split()
@@ -406,7 +417,7 @@ def pod_cgroup_processes(pod_uid: str) -> list[dict[str, Any]]:
     """
 
     found = []
-    for entry in Path("/proc").iterdir():
+    for entry in PROC_ROOT.iterdir():
         if not entry.name.isdigit():
             continue
         pid = int(entry.name)
@@ -442,7 +453,7 @@ def cgroup_names_pod(cgroup_text: str, pod_uid: str) -> bool:
 
 def process_in_pod(pid: int, pod_uid: str) -> bool:
     try:
-        text = Path(f"/proc/{pid}/cgroup").read_text()
+        text = (PROC_ROOT / str(pid) / "cgroup").read_text()
     except OSError:
         return False
     return cgroup_names_pod(text, pod_uid)
@@ -453,7 +464,7 @@ def plugin_processes(pod_uid: str, binaries: list[str]) -> list[dict[str, Any]]:
 
     wanted = set(binaries)
     result = []
-    for entry in Path("/proc").iterdir():
+    for entry in PROC_ROOT.iterdir():
         if not entry.name.isdigit():
             continue
         pid = int(entry.name)
