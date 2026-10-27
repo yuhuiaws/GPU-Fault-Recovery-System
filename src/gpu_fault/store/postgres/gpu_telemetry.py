@@ -5,6 +5,7 @@ from typing import Any, Callable
 
 from gpu_fault.gpu_metric_models import gpu_finding_transition
 from gpu_fault.store.postgres.hot_layout import metric_latest_table
+from gpu_fault.store.shared.finding_history import records_finding_history
 from gpu_fault.store.shared.time import (
     utc_text as _utc_text,
 )
@@ -326,7 +327,11 @@ class PostgresGpuTelemetryMixin:
                 current_by_key[storage_key] = state
                 final_states[storage_key] = state
                 activated_values.append(activated)
-                if activated:
+                if finding is not None and records_finding_history(
+                    previous.finding if previous is not None else None,
+                    finding,
+                    activated=activated,
+                ):
                     history[finding.finding_id] = finding
             with self._db.cursor() as cursor:
                 if final_states:

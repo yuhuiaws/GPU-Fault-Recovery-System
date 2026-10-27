@@ -14,6 +14,7 @@ from gpu_fault.gpu_metrics import (
     GpuInventorySnapshot,
     GpuMetricLatest,
 )
+from gpu_fault.store.shared.finding_history import records_finding_history
 from gpu_fault.store.shared.telemetry_models import (
     GpuFindingKey,
     GpuMetricKey,
@@ -149,7 +150,11 @@ class SqliteTelemetryMixin:
                 )
                 self._put("gpu_finding_state", storage_key, state)
                 activated_values.append(activated)
-                if activated and finding is not None:
+                if finding is not None and records_finding_history(
+                    previous.finding if previous is not None else None,
+                    finding,
+                    activated=activated,
+                ):
                     self._put(
                         "gpu_finding_history",
                         finding.finding_id,

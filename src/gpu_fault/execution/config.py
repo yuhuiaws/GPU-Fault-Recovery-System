@@ -147,6 +147,9 @@ def fabric_manager_step_overrides(
     return {operation: ceiling for operation in FABRIC_MANAGER_START_OPERATIONS}
 
 
+#: The default per-step waiting cap (``GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS``),
+#: shared with the adapters that name the cap in a WAITING reason.
+DEFAULT_STEP_WAITING_TIMEOUT_SECONDS = 600
 DEFAULT_NODE_INSTALL_CONTAINMENT_SECONDS = 600
 
 
@@ -290,7 +293,7 @@ class ProductionExecutorConfig:
     # quiesce, verify, reset, restore, restart -- which finish in seconds to a
     # few minutes. The handful of operations that legitimately wait far longer
     # get an override below rather than dragging this ceiling up for everything.
-    step_waiting_timeout_seconds: int = 600
+    step_waiting_timeout_seconds: int = DEFAULT_STEP_WAITING_TIMEOUT_SECONDS
     step_waiting_warning_seconds: int = 300
     # Per-operation ceilings for the steps whose adapter owns a longer window of
     # its own. A cap below the adapter's window is worse than no cap: it fails

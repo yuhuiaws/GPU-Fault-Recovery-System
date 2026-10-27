@@ -3553,6 +3553,12 @@ the TERMINAL event carries `details.diagnostic_inconclusive=true`, the incident'
 `DIAGNOSTIC_INCONCLUSIVE` notification is sent (§3.11). This solves "a WARNING diagnostic marker from two minutes of CPU at 98%
 keeps the job from restarting for an hour": the diagnostic workflow never repaired anything, yet it parked the incident in ESCALATED holding
 job recovery hostage. A `VALIDATE_HOST` acting as a gate (followed by a restart) does not count as diagnostics; its failure still escalates.
+The conclusion has to come from the data: for a WARNING-level growth GPU finding (such as `thermal_violation_total_us`), `VALIDATE_GPU`
+no longer fails at the end of the fixed grace on whatever the node's health-summary phase happened to deliver; past the grace it keeps
+`WAITING` for a GPU metrics batch newer than the finding's current state to re-judge it (`node_pending.<node>.awaiting_newer_gpu_metrics`
+and its reason text, bounded by the 600 s per-step cap), fails only if that re-judgement leaves the finding active, and succeeds once it
+is cleared (the DCGM diagnostics section of `detailed-design.md`, which also records the 2026-10-26/27 case where the same sequence passed
+on one cluster and failed on the other).
 
 The exception does not apply to the read-only NCCL/EFA hung diagnostic DAG (steps carry the `HUNG_DIAGNOSTIC` contract and it ends with
 `ESCALATE_SUPPORT`): the training may still be hung and the verdict belongs to a human. When one of its evidence/validation steps fails only the

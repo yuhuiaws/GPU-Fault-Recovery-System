@@ -140,6 +140,18 @@ class TelemetryIngestionService:
         if batch.ingested_at is None:
             batch = batch.model_copy(update={"ingested_at": datetime.now(timezone.utc)})
         batch = normalize_gpu_observation(batch)
+        # A health summary is the only batch a node delivers between edges
+        # (270-330 s apart), and for a node with an active finding it is the
+        # batch that re-judges the finding: it re-grades it, clears it, or --
+        # a counter reset -- leaves it as it was. Live (HyperPod, 2026-10-27
+        # 01:49:47Z) the summary that could not clear the thermal finding
+        # VALIDATE_GPU then failed on left no raw evidence, because a summary
+        # was only kept when it minted a finding. Read once per summary batch,
+        # before the ingest moves the state; healthy nodes' summaries stay out.
+        summary_only = set(batch.edge_filter_reasons) == {"health-summary"}
+        rejudges_active_finding = summary_only and bool(
+            self.context.gpu_metrics.findings(batch.cluster_id, batch.node_id)
+        )
         result = self.context.gpu_metrics.ingest(batch)
         self.telemetry_context._record_collector_status(
             CollectorKind.GPU_METRICS,
@@ -154,7 +166,8 @@ class TelemetryIngestionService:
             result.new_findings
             or result.updated_composite_findings
             or result.xid_events
-            or set(batch.edge_filter_reasons) != {"health-summary"}
+            or not summary_only
+            or rejudges_active_finding
         ):
             self.telemetry_context._capture_evidence(
                 record_id=f"gpu-metrics/{batch.batch_id}",

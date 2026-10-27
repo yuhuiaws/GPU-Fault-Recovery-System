@@ -807,14 +807,35 @@ A GPU metric finding stores `policy_source`, `policy_version`,
 - The first thermal violation increase goes to diagnostics; once consecutive increases reach the configured count it escalates to `DRAIN`.
 - When a finding escalates from warning to critical or its automatic action changes, a `new_finding` is emitted again so that the existing
   attempt workflow can escalate in place or create a successor.
+- A replacement finding at the same severity and action (still breaching when a newer batch re-judged it; new `finding_id`) emits no
+  `new_finding` but is written to `gpu_finding_history` (one rule for memory / SQLite / Postgres, `store/shared/finding_history.py`), so the
+  re-grades can be read back; a replay of the same state and a clear write nothing. A health-summary batch a node delivers while it has
+  an active finding (the batch re-grades it, clears it, or leaves it undecided on a counter reset) is also kept as `GPU_METRICS` raw
+  evidence, once per batch; summaries of healthy nodes are not kept, as before.
 
 The diagnostics for a GPU/HBM temperature warning are not a passive metric read. The control plane generates
 `FREEZE_EVIDENCE -> RUN_DCGM_DIAGNOSTIC -> VALIDATE_GPU`; the Node Agent runs the non-destructive
 `dcgmi diag -r 1 -j` and writes the raw JSON, stderr, SHA-256 and result status to the root-only evidence directory.
 `PASS/WARN` enters cooldown observation; while the warning still exists within
 `GPU_FAULT_TEMPERATURE_WARNING_GRACE_SECONDS` (default 120 seconds) validation
-stays `WAITING`, and succeeds once it clears. On `FAIL/INCONCLUSIVE`, or when the warning still exists after the observation period ends,
-the original workflow fails and idempotently escalates to `DRAIN`: mark unschedulable, stop the affected jobs, isolate the node, collect the full
+stays `WAITING`, and succeeds once it clears. The grace is the minimum wait, not the verdict: at its end, if no GPU metrics
+batch newer than the current state of a WARNING-level growth finding (`thermal_violation_total_us` and its power /
+correctable-memory counterparts; the state is the batch that minted or re-graded it) has re-judged it -- a re-judgement
+replaces the finding (new `finding_id`, newer `observed_at`) or clears it, while a counter reset (invalid delta) leaves it
+untouched -- `VALIDATE_GPU` keeps `WAITING` and writes to `node_pending.<node>` the `awaiting_newer_gpu_metrics` finding ids,
+`awaiting_newer_gpu_metrics_findings` (`observed_at`, and `newest_sample_observed_at` when a newer sample arrived without
+re-judging it), `grace_elapsed_at`, `step_cap_at` and the reason text `awaiting a GPU metrics batch newer than finding <id>
+(observed <ts>) to re-judge it; grace elapsed <ts>, step cap <ts>`. The bound on that wait is the executor's existing per-step
+cap (`GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS`, default 600 seconds; `step_bounds.bounded_waiting_outcome` fails the step with
+`past the 600s per-step cap`), no new knob. A finding still active after newer data re-judged it (its current state postdates
+the grace end) fails as before, naming the finding; a cleared one succeeds. The collector delivers edges only on confirmation
+and recovery and otherwise one health summary per node on its fixed phase every 270-330 s, so the fixed grace read one
+physical sequence two ways: on plain EKS (2026-10-26, workflows created 23:24:17.98Z) a summary landed between the confirmed
+and the recovered reads, the recovered edge was a zero delta and validation passed at 23:24:49Z; on HyperPod (2026-10-27,
+created 01:48:01.5Z) the recovered edge re-minted the finding at 01:48:32Z, the only newer batch -- the 01:49:47Z summary --
+carried a counter reset and could not re-judge it, and validation failed at the grace end, 01:50:01.6Z (51 of 60 summary
+phases inconclusive for the same data). On `FAIL/INCONCLUSIVE`, or when newer data re-judges the warning as still present
+after the grace, the original workflow fails and idempotently escalates to `DRAIN`: mark unschedulable, stop the affected jobs, isolate the node, collect the full
 diagnostic bundle and validate the GPU. This escalation does not include `RESTORE_SCHEDULING` or `RESTART_WORKLOAD`; recovery is only possible after
 the fault clears and an administrator has handled it.
 

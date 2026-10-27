@@ -11,6 +11,7 @@ from gpu_fault.execution import (
     WorkflowStepContext,
     WorkflowStepOutcome,
 )
+from gpu_fault.execution.config import DEFAULT_STEP_WAITING_TIMEOUT_SECONDS
 from gpu_fault.execution.hung_handoff import support_handoff_follows
 from gpu_fault.fabric_scope import (
     requires_task_scope,
@@ -22,6 +23,7 @@ from gpu_fault.gpu_fabric_manager import fabric_validation
 from gpu_fault.gpu_fabric_window import fabric_state_loss
 from gpu_fault.gpu_instance_inventory import gpu_instance_inventory
 from gpu_fault.gpu_metrics import GpuMetricSource, GpuMetricsService
+from gpu_fault.gpu_observation import metric_device_key
 from gpu_fault.gpu_temperature_policy import TLIMIT_READING
 from gpu_fault.health_evidence_validation import (
     reset_cooldown,
@@ -166,6 +168,9 @@ class GpuValidationAdapter:
         temperature_warning_grace: timedelta = timedelta(minutes=2),
         transient_warning_grace: timedelta = timedelta(minutes=2),
         restore_collector_grace: timedelta = timedelta(seconds=120),
+        step_waiting_cap: timedelta = timedelta(
+            seconds=DEFAULT_STEP_WAITING_TIMEOUT_SECONDS
+        ),
     ) -> None:
         self.metrics = metrics
         self.store = store or metrics.store
@@ -188,6 +193,14 @@ class GpuValidationAdapter:
         # DaemonSets are not running (live: the exporter evicted, 604 s of
         # silence under the 600 s cap) learns nothing from the cap.
         self.restore_collector_grace = restore_collector_grace
+        if step_waiting_cap <= timedelta(0):
+            raise ValueError("step waiting cap must be positive")
+        # The executor's per-step cap for VALIDATE_GPU
+        # (``step_bounds.bounded_waiting_outcome``), named in the WAITING
+        # reason of a wait for newer GPU metrics so the record says when the
+        # wait can end at the latest. The executor enforces it; this is the
+        # same number, not a second bound.
+        self.step_waiting_cap = step_waiting_cap
 
     def supports(self, step: WorkflowStepSpec) -> bool:
         return step.execution_owner == self.owner and step.operation in self.OPERATIONS
@@ -390,15 +403,7 @@ class GpuValidationAdapter:
         stale = pending.get("missing_or_stale_collectors")
         if not stale or not is_validated_restore_workflow(context.workflow.request_id):
             return None
-        started = next(
-            (
-                execution.started_at
-                for execution in reversed(context.workflow.step_executions)
-                if execution.step_index == context.step_index
-                and execution.operation is context.step.operation
-            ),
-            None,
-        )
+        started = step_started_at(context)
         if started is None or now - started < self.restore_collector_grace:
             return None
         waited = int((now - started).total_seconds())
@@ -915,16 +920,24 @@ class GpuValidationAdapter:
             findings, power_names
         ):
             warning_grace = self.transient_warning_grace
-        if (
-            operation is WorkflowOperation.VALIDATE_GPU
-            and warning_grace is not None
-            and now < context.workflow.created_at + warning_grace
-        ):
-            return {
-                "transient_gpu_warning_cooldown": [
-                    finding.finding_id for finding in findings
-                ]
-            }
+        if operation is WorkflowOperation.VALIDATE_GPU and warning_grace is not None:
+            grace_end = context.workflow.created_at + warning_grace
+            if now < grace_end:
+                return {
+                    "transient_gpu_warning_cooldown": [
+                        finding.finding_id for finding in findings
+                    ]
+                }
+            if all(finding_unjudged_since(item, grace_end) for item in findings):
+                return awaiting_newer_gpu_metrics(
+                    self.metrics,
+                    self.step_waiting_cap,
+                    context,
+                    node_id,
+                    findings,
+                    grace_end,
+                    now,
+                )
         failures.setdefault(node_id, []).append("active_gpu_health_findings")
         if node_findings is not None:
             node_findings[node_id] = [finding_summary(item) for item in findings]
@@ -1183,3 +1196,167 @@ def _warning_only(findings, names: set[str]) -> bool:
         and getattr(getattr(finding, "severity", None), "value", None) == "WARNING"
         for finding in findings
     )
+
+
+def step_started_at(context: WorkflowStepContext) -> datetime | None:
+    """When this step's clock started, off its live execution record.
+
+    ``record_attempt`` keeps the first attempt's ``started_at`` across WAITING
+    polls, and ``step_bounds.bounded_waiting_outcome`` measures the per-step
+    cap from it (clamped to the execution window, which can only push the cap
+    later). ``None`` on the step's very first attempt, before any record.
+    """
+
+    return next(
+        (
+            execution.started_at
+            for execution in reversed(context.workflow.step_executions)
+            if execution.step_index == context.step_index
+            and execution.operation is context.step.operation
+        ),
+        None,
+    )
+
+
+def finding_unjudged_since(finding: Any, grace_end: datetime) -> bool:
+    """Has no GPU metrics batch newer than the finding's current state re-judged it?
+
+    The ingest replaces a finding it re-grades (a newer ``observed_at``) and
+    drops one it clears, so an active finding whose ``observed_at`` is still
+    at or before the grace end is exactly the state the grace end saw: nothing
+    newer has judged it -- no later batch, or a later batch whose counter reset
+    the ingest refused to grade. A finding without a comparable ``observed_at``
+    cannot be dated and keeps the fixed-grace verdict. Duck-typed on purpose:
+    the module's ``datetime`` name is a test clock in several suites.
+    """
+
+    observed_at = getattr(finding, "observed_at", None)
+    if observed_at is None:
+        return False
+    try:
+        return bool(observed_at <= grace_end)
+    except TypeError:
+        return False
+
+
+def finding_device_key(finding: Any) -> str:
+    """The device key a finding's metric samples are kept under
+    (``gpu_observation.metric_device_key``): GPU UUID, else PCI BDF, else the
+    node."""
+
+    return str(
+        getattr(finding, "gpu_uuid", None)
+        or getattr(finding, "pci_bdf", None)
+        or "node"
+    )
+
+
+def newest_gpu_sample_times(latest: Sequence[Any]) -> dict[tuple[str, str], datetime]:
+    """``(device key, metric) -> observed_at`` of the node's latest GPU samples."""
+
+    newest: dict[tuple[str, str], datetime] = {}
+    for item in latest:
+        sample = getattr(item, "sample", None)
+        observed_at = getattr(item, "observed_at", None)
+        if sample is None or observed_at is None:
+            continue
+        key = (metric_device_key(sample), str(sample.canonical_name))
+        if key not in newest or observed_at > newest[key]:
+            newest[key] = observed_at
+    return newest
+
+
+def awaiting_newer_gpu_metrics_reason(
+    entries: Sequence[dict[str, Any]], grace_end: datetime, step_cap_at: datetime
+) -> str:
+    """The operator-facing sentence for a wait on newer GPU metrics: which
+    finding, when its current state was observed, whether a newer sample
+    already arrived without re-judging it (a counter reset), that the grace
+    has elapsed, and when the executor's per-step cap ends the wait."""
+
+    named = []
+    for entry in entries:
+        text = f"finding {entry['finding_id']} (observed {entry['observed_at']}"
+        newest = entry.get("newest_sample_observed_at")
+        if newest:
+            text += f"; the newest sample, {newest}, did not re-judge it"
+        named.append(text + ")")
+    return (
+        "awaiting a GPU metrics batch newer than "
+        + ", ".join(named)
+        + f" to re-judge it; grace elapsed {grace_end.isoformat()}, "
+        f"step cap {step_cap_at.isoformat()}"
+    )
+
+
+def awaiting_newer_gpu_metrics(
+    metrics: Any,
+    step_waiting_cap: timedelta,
+    context: WorkflowStepContext,
+    node_id: str,
+    findings: Sequence[Any],
+    grace_end: datetime,
+    now: datetime,
+) -> dict[str, Any]:
+    """The wait a WARNING-only finding earns past the grace while nothing newer
+    than its current state has re-judged it.
+
+    A growth finding (``thermal_violation_total_us`` by
+    ``thermal_duration_decision``, the power and correctable-memory
+    counterparts) describes the interval that ends at the batch that minted or
+    re-graded it. Whether the GPU is healthy *now* is decided by the next
+    GPU_METRICS batch for the node: it replaces the finding (newer
+    ``observed_at``, a new ``finding_id``) when the growth goes on, clears it
+    when the counter is flat, and leaves it untouched when the counter reset
+    (an invalid delta is not graded). The collector delivers edges only on
+    confirmation and recovery, and otherwise one health summary per node on
+    its deterministic stable phase (270-330 s apart), so until that batch
+    lands the finding's verdict is the one the grace end already saw.
+
+    The fixed grace failed here instead. Live, one physical sequence read two
+    ways: plain EKS 2026-10-26 (workflows created 23:24:17.98Z) PASSED at
+    23:24:49Z because a summary landed between the confirmed and the recovered
+    reads and the recovered edge was a zero delta; HyperPod 2026-10-27 (created
+    01:48:01.5Z) FAILED at the grace end 01:50:01.6Z with
+    ``active_gpu_health_findings[thermal_violation_total_us WARNING
+    3e+06>10000]`` on the finding re-minted by the recovered edge at 01:48:32Z
+    -- the only newer batch, the 01:49:47Z summary, carried a counter reset and
+    could not re-judge it. The verdict followed the node's summary phase
+    (b201's sweep: 51 of 60 phases inconclusive for the same data), not the
+    data. So past the grace the step keeps WAITING, names what it waits for,
+    and leaves the bound to the executor's per-step cap
+    (``step_bounds.bounded_waiting_outcome``, 600 s by default), which no wait
+    can exceed; ``step_waiting_cap`` is that configured limit, named here so
+    the record says when the wait ends at the latest. A finding whose current
+    state postdates the grace end *was* re-judged by newer data and is still
+    active: that fails as before.
+    """
+
+    newest = newest_gpu_sample_times(
+        metrics.latest(context.incident.cluster_id, node_id)
+    )
+    started = step_started_at(context)
+    step_cap_at = (started if started is not None else now) + step_waiting_cap
+    entries: list[dict[str, Any]] = []
+    for finding in findings:
+        latest = newest.get((finding_device_key(finding), finding.canonical_name))
+        entries.append(
+            {
+                "finding_id": finding.finding_id,
+                "canonical_name": finding.canonical_name,
+                "gpu_uuid": finding.gpu_uuid,
+                "observed_at": finding.observed_at.isoformat(),
+                "newest_sample_observed_at": (
+                    latest.isoformat()
+                    if latest is not None and latest > finding.observed_at
+                    else None
+                ),
+            }
+        )
+    return {
+        "awaiting_newer_gpu_metrics": [entry["finding_id"] for entry in entries],
+        "awaiting_newer_gpu_metrics_findings": entries,
+        "grace_elapsed_at": grace_end.isoformat(),
+        "step_cap_at": step_cap_at.isoformat(),
+        "reason": awaiting_newer_gpu_metrics_reason(entries, grace_end, step_cap_at),
+    }

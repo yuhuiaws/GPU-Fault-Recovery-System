@@ -141,3 +141,34 @@ def test_collector_same_timestamp_success_clears_only_after_newer_error_time(
     assert current.errors == []
     assert current.last_error_at == NOW
     assert current.last_success_at == NOW + timedelta(seconds=1)
+
+
+def test_a_same_severity_replacement_is_kept_in_the_finding_history(compat_store):
+    """A newer batch that re-grades an active finding at the same severity and
+    action replaces it under a new ``finding_id`` and activates nothing (no
+    ``new_findings``, no incident). Live (HyperPod, 2026-10-27 01:48:32Z) that
+    replacement -- ``thermal_violation_total_us`` re-minted by the
+    ``candidate-recovered`` edge -- was the state VALIDATE_GPU failed on at the
+    grace end, and the history did not show it. It does now; a replayed state
+    (same id) and a clear still write nothing."""
+
+    store = compat_store
+    key = (CLUSTER, NODE, GPU, "temperature")
+    minted = finding("mint-confirmed", at=NOW - timedelta(minutes=2))
+    replaced = finding("mint-recovered", at=NOW - timedelta(minutes=1))
+
+    assert store.update_gpu_finding(key, minted, minted.observed_at) is True
+    assert store.update_gpu_finding(key, replaced, replaced.observed_at) is False, (
+        "same severity and action: a replacement is not an activation"
+    )
+    assert store.update_gpu_finding(key, replaced, replaced.observed_at) is False, (
+        "a replay of the same state is not a re-grade"
+    )
+    assert store.update_gpu_finding(key, None, NOW) is False, "the clear"
+
+    assert store.list_gpu_findings(CLUSTER, NODE, active_only=True) == []
+    assert sorted(
+        item.finding_id
+        for item in store.list_gpu_findings(CLUSTER, NODE, active_only=False)
+    ) == ["mint-confirmed", "mint-recovered"]
+    assert store.get_gpu_finding_state(key).consecutive_breaches == 0

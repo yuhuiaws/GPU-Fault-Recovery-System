@@ -119,10 +119,13 @@ def test_gpu_finding_activation_history_and_clear_are_distinct(pg_store):
     assert pg_store.update_gpu_finding(key, None, NOW + timedelta(seconds=3)) is False
     assert pg_store.get_gpu_finding_state(key).consecutive_breaches == 0
     assert pg_store.list_gpu_findings(CLUSTER, NODE, active_only=True) == []
+    # ``repeated`` activated nothing (same severity and action) but replaced
+    # the active finding with a newer batch's grading, which the history
+    # keeps too (``store.shared.finding_history``); the clear writes no row.
     assert {
         item.finding_id
         for item in pg_store.list_gpu_findings(CLUSTER, NODE, active_only=False)
-    } == {warning.finding_id, critical.finding_id}
+    } == {warning.finding_id, repeated.finding_id, critical.finding_id}
     assert pg_store.get_gpu_finding_states(
         [(CLUSTER, NODE, "GPU-missing", "temperature")]
     ) == [None]

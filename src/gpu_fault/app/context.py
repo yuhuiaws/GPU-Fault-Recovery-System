@@ -68,6 +68,7 @@ from gpu_fault.models import (
     Environment,
     ObservedCapability,
     RuntimeProfile,
+    WorkflowOperation,
     WorkflowRequest,
     WorkflowStatus,
     WorkflowStepSpec,
@@ -280,6 +281,16 @@ class _RegisteredIdentityRegistries:
 
 
 _pod_process_owner = pod_process_owner
+
+
+def _validation_step_cap(settings: Any) -> timedelta:
+    """The executor's own VALIDATE_GPU per-step cap, handed to the validation
+    adapter so its wait for newer GPU metrics names the instant the executor
+    ends it (one number, not a second bound)."""
+
+    return timedelta(
+        seconds=settings.executor.step_waiting_limit(WorkflowOperation.VALIDATE_GPU)
+    )
 
 
 class ApplicationContext:
@@ -839,6 +850,7 @@ class ApplicationContext:
                         )
                     )
                 ),
+                step_waiting_cap=_validation_step_cap(settings),
             ),
             SupportEscalationAdapter(
                 context.store,
