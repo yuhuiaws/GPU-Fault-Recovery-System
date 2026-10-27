@@ -2205,9 +2205,25 @@ heartbeat lost), a node whose host collector is also unreachable, and the
 
 029 `worker_restart` (`CONTROL_PLANE_RESTART`) deletes the watcher Pod fenced on
 its UID/resourceVersion, with no grace, while the recovery workflow's
-RESTART_WORKLOAD reservation is open (reserved on the ledger, step WAITING on
-the replica); a claim already closed at the first read is INCONCLUSIVE, since
-the replica's start decides the window. The replacement restores its state
+RESTART_WORKLOAD reservation is open (reserved on the ledger, step not yet
+terminal). That window is one control-loop round trip, not the replica's
+start: the claim mints the data-plane command in the tick that reserved, the
+NOTIFY-woken cluster executor creates the restart copy and returns SUCCEEDED
+in the same call (`workload_operations._set_workloads` reads no Pod of the
+copy -- no wait for scheduling or Running), and the command's terminal status
+wakes the dispatcher, which records the step SUCCEEDED. Live it lasts one to a
+few seconds (HyperPod, 2026-10-27: open and closed between two records reads
+10 s apart), shorter than one records read (a `kubectl exec` probe, about
+5 s), so no poll interval and no start barrier in the job's Pod template can
+widen or deliberately hit it from the harness. The runner dates the window
+from the product's records (first CLAIM event of the recovery workflow to the
+terminal RESTART_WORKLOAD record's `updated_at`) and judges its delete against
+it: a claim already closed at the first read, or a delete whose request
+bracket the settled records place outside the window, is INCONCLUSIVE with the
+dated window in the detail (`open-claim-window.json` keeps the stages). A
+deterministic window needs the product to hold the step after the submission
+(WAITING with `restart_submitted: true` until the copy's Pods run); a start
+barrier on the restart copy would then set its length. The replacement restores its state
 from the product's own ConfigMaps and must not re-decide, re-reserve or re-send:
 the ledger keeps exactly the one reservation of the recovery workflow (not lost,
 not doubled), one RESTART_WORKLOAD succeeds, one STOP_WORKLOADS, one decision,

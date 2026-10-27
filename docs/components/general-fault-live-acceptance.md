@@ -1755,8 +1755,18 @@ heartbeat 只是"集群空闲"的陈述——产品只在一次全量扫描既�
 带本次 tag 的全部规则并停 deadman，探针回读链上无残留且 timer 未激活，否则记清理失败。
 `worker_restart`（`--approve CONTROL_PLANE_RESTART`）：受管任务 `exit:1`、预算 1；每 5 s
 读取 attempt 记录直到 claim 打开——账本已有 recovery 工作流的 reservation 且 RESTART_WORKLOAD
-尚无 SUCCEEDED/FAILED 执行（适配器已提交副本、处于 WAITING）；首次读到即已关闭记
-`INCONCLUSIVE`。随后以 `DeleteOptions.preconditions{uid,resourceVersion}`、grace 0 删除唯一的
+尚无 SUCCEEDED/FAILED 执行。claim 打开的时长由产品控制环决定而非副本启动：claim 的同一 tick
+铸出数据面命令，集群执行器被 NOTIFY 唤醒后创建重启副本并在同一次调用中返回 SUCCEEDED
+（`workload_operations._set_workloads` 不读副本的 Pod，既不等调度也不等 Running），该终态再唤醒
+dispatcher 记下 SUCCEEDED——实测 1 至数秒（2026-10-27 HyperPod：相隔 10 s 的两次读取之间打开又
+关闭），短于一次记录读取（`kubectl exec` 探针约 5 s），任何轮询间隔或任务模板里的 Pod 级启动
+栅栏都无法从 harness 侧拉宽或命中它。因此运行器按产品自己的记录给窗口定时（recovery 工作流
+首个 CLAIM 事件到 RESTART_WORKLOAD 终态记录的 `updated_at`，`claim_window`）：首次读到即已关闭记
+`INCONCLUSIVE`，detail 带该窗口与每次读取耗时；删除后记录稳定时若删除请求的往返区间落在窗口之外
+或跨其边界，同样记 `INCONCLUSIVE`（`delete_timing_errors`，各判定阶段仍写入
+`open-claim-window.json`）。要让窗口可控，产品需在提交后以 `restart_submitted: true` 的 WAITING
+持步直到副本 Pod 运行，届时重启副本上的启动栅栏才决定窗口长度。随后以
+`DeleteOptions.preconditions{uid,resourceVersion}`、grace 0 删除唯一的
 watcher Pod，等待 Deployment 重建出新 UID 且 Ready（≤ 600 s，与 startupProbe 一致），再等
 recovery 工作流终结。判定：账本 `restart_count == 1` 且唯一 reservation 属于该 recovery
 工作流（未丢失、未重复扣减）；RESTART_WORKLOAD 恰好成功一次、recovery 工作流恰好一个且

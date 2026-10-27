@@ -1,9 +1,11 @@
 """GF-GENERAL-LIVE-029 ``worker_restart``: the watcher replaced mid-claim.
 
 The claim-state reader, the open-claim wait (open, closed-first, never), the
-UID-fenced delete's exact request, the replacement wait, and the graders over
-scripted completion records; then the variant end to end over a fake job, a
-fake watcher inventory that flips on the delete, and a phase-driven store.
+product-dated claim window and the delete judged against it, the UID-fenced
+delete's exact request, the replacement wait, and the graders over scripted
+completion records; then the variant end to end over a fake job, a fake
+watcher inventory that flips on the delete, and a phase-driven store. The last
+test pins the product facts the window reasoning rests on.
 """
 
 from __future__ import annotations
@@ -15,6 +17,12 @@ from typing import Any
 
 import pytest
 
+from gpu_fault.execution.config import (
+    ProductionExecutorConfig,
+    WorkflowDispatcherConfig,
+)
+from gpu_fault.execution.dispatcher_wakeups import WAKING_REMOTE_COMMAND_STATUSES
+from gpu_fault.models import WorkflowOperation
 from scripts.e2e.regional import general_live_attempts as att
 from scripts.e2e.regional import general_live_network_isolation as iso
 from scripts.e2e.regional import general_live_watcher_restart as wr
@@ -28,19 +36,49 @@ WATCHER_NODE = "ip-10-0-40-9.us-west-2.compute.internal"
 T0 = datetime(2026, 10, 24, tzinfo=timezone.utc)
 JOB = "gl29wr-deadbeef-1"
 ATTEMPT = f"{JOB}-a001"
+#: The claim as the product dates it in the scripted records: reserved at the
+#: recovery workflow's CLAIM, closed when the terminal RESTART_WORKLOAD record
+#: was written. The fake clock of ``make_context`` starts at T0 and advances a
+#: second per reading, so the default window brackets every reading of a test.
+CLAIMED_AT = T0 - timedelta(hours=1)
+CLOSED_AT = T0 + timedelta(hours=1)
 
 
 def _workflow(
-    request_id: str, op: str, statuses: list[str], status: str = "SUCCEEDED"
+    request_id: str,
+    op: str,
+    statuses: list[str],
+    status: str = "SUCCEEDED",
+    *,
+    claimed_at: datetime | None = None,
+    updated_at: datetime | None = None,
 ) -> dict[str, Any]:
+    events = []
+    if claimed_at is not None:
+        events.append({"kind": "CLAIM", "at": claimed_at.isoformat()})
+        events.append(
+            {
+                "kind": "STEP_ATTEMPT",
+                "at": (claimed_at + timedelta(milliseconds=400)).isoformat(),
+                "operation": op,
+                "status": statuses[0] if statuses else None,
+            }
+        )
     return {
         "request_id": request_id,
         "status": status,
         "official_steps": [{"operation": op, "parameters": {}}],
         "step_executions": [
-            {"step_index": 0, "operation": op, "status": item, "details": {}}
+            {
+                "step_index": 0,
+                "operation": op,
+                "status": item,
+                "details": {},
+                **({"updated_at": updated_at.isoformat()} if updated_at else {}),
+            }
             for item in statuses
         ],
+        "events": events,
     }
 
 
@@ -51,6 +89,8 @@ def _entry(
     decision: str = "PLAN_CREATED",
     stops: int = 1,
     recoveries: int = 1,
+    claimed_at: datetime | None = None,
+    updated_at: datetime | None = None,
 ) -> dict[str, Any]:
     containment = _workflow("wf-c", "STOP_WORKLOADS", ["SUCCEEDED"] * stops)
     recovery = []
@@ -64,7 +104,12 @@ def _entry(
                         "state": "RECOVERED",
                     },
                     "workflow": _workflow(
-                        f"wf-r{index}", "RESTART_WORKLOAD", restart, recovery_status
+                        f"wf-r{index}",
+                        "RESTART_WORKLOAD",
+                        restart,
+                        recovery_status,
+                        claimed_at=claimed_at,
+                        updated_at=updated_at,
                     ),
                 }
             )
@@ -148,8 +193,14 @@ def test_wait_open_claim_returns_the_first_open_read_and_refuses_a_closed_one(
         ctx, lambda: next(sequence), ATTEMPT, timeout_seconds=600
     )
     assert wr.claim_state(opened, ATTEMPT) == wr.OPEN
-    assert (ctx.evidence.case_dir / "open-claim-timeline.json").is_file(), (
-        "the wait writes its timeline"
+    timeline = json.loads(
+        (ctx.evidence.case_dir / "open-claim-timeline.json").read_text()
+    )
+    assert [item["accepted"] for item in timeline["entries"]] == [False, True], (
+        "the wait writes its timeline: one NONE read, then the OPEN one"
+    )
+    assert not (ctx.evidence.case_dir / "open-claim-window.json").is_file(), (
+        "an open claim is not a miss; the window is dated after the records settle"
     )
 
     closed = _records(_entry(restart=["SUCCEEDED"]))
@@ -159,6 +210,118 @@ def test_wait_open_claim_returns_the_first_open_read_and_refuses_a_closed_one(
     never = _records(_entry(restart=None), count=0)
     with pytest.raises(VariantInconclusive, match="no open restart claim appeared"):
         wr.wait_open_claim(ctx, lambda: never, ATTEMPT, timeout_seconds=30)
+
+
+def test_wait_open_claim_dates_the_window_it_missed_from_the_product_records(
+    tmp_path: Path,
+) -> None:
+    """Closed at the first read: the detail says how long the claim was open and
+    how long a records read takes, and the window is written as evidence."""
+
+    ctx = _context(tmp_path, FakeRegional())
+    claimed = T0 + timedelta(seconds=30)
+    closed = _records(
+        _entry(
+            restart=["SUCCEEDED"],
+            claimed_at=claimed,
+            updated_at=claimed + timedelta(seconds=2, milliseconds=400),
+        )
+    )
+    with pytest.raises(VariantInconclusive) as raised:
+        wr.wait_open_claim(ctx, lambda: closed, ATTEMPT, timeout_seconds=600)
+    detail = str(raised.value)
+    assert "closed before the watcher could be replaced" in detail
+    assert (
+        f"date the claim open from {claimed.isoformat()} to "
+        f"{(claimed + timedelta(seconds=2, milliseconds=400)).isoformat()}, 2.4 s"
+    ) in detail, detail
+    # The fake clock moves one second per reading: a read "takes" 1 s.
+    assert f"a records read takes up to 1.0 s plus {wr.CLAIM_POLL_SECONDS} s" in detail
+    window = json.loads((ctx.evidence.case_dir / "open-claim-window.json").read_text())
+    assert window["open_seconds"] == 2.4
+    assert window["read_seconds"] == [1.0]
+    assert window["first_read_state"] == wr.CLOSED
+
+    undated = _records(_entry(restart=["SUCCEEDED"]))
+    with pytest.raises(VariantInconclusive, match="records do not date the claim"):
+        wr.wait_open_claim(ctx, lambda: undated, ATTEMPT, timeout_seconds=600)
+
+
+def test_claim_window_dates_the_claim_from_the_recovery_workflow_records() -> None:
+    claimed = T0 + timedelta(seconds=30)
+    closed = claimed + timedelta(seconds=1, milliseconds=750)
+    records = _records(
+        _entry(restart=["SUCCEEDED"], claimed_at=claimed, updated_at=closed)
+    )
+    records["restart_budget"]["updated_at"] = claimed.isoformat()
+    assert wr.claim_window(records, ATTEMPT) == {
+        "reserved_at": claimed.isoformat(),
+        "dispatched_at": (claimed + timedelta(milliseconds=400)).isoformat(),
+        "closed_at": closed.isoformat(),
+        "open_seconds": 1.75,
+        "ledger_updated_at": claimed.isoformat(),
+    }
+    # Still WAITING: the claim has not closed; a workflow without events is
+    # not dated at all; an attempt without records neither.
+    waiting = wr.claim_window(
+        _records(
+            _entry(restart=["WAITING"], recovery_status="RUNNING", claimed_at=claimed)
+        ),
+        ATTEMPT,
+    )
+    assert (waiting["reserved_at"], waiting["closed_at"], waiting["open_seconds"]) == (
+        claimed.isoformat(),
+        None,
+        None,
+    )
+    undated = wr.claim_window(_records(_entry(restart=["SUCCEEDED"])), ATTEMPT)
+    assert undated["reserved_at"] is None and undated["open_seconds"] is None
+    assert wr.claim_window({"attempts": {}}, ATTEMPT)["closed_at"] is None
+
+
+def test_delete_timing_errors_judge_the_delete_bracket_against_the_window() -> None:
+    claimed = T0 + timedelta(seconds=30)
+    window = wr.claim_window(
+        _records(
+            _entry(
+                restart=["SUCCEEDED"],
+                claimed_at=claimed,
+                updated_at=claimed + timedelta(seconds=3),
+            )
+        ),
+        ATTEMPT,
+    )
+
+    def document(before: float, after: float) -> dict[str, str]:
+        return {
+            "deleted_at": (claimed + timedelta(seconds=before)).isoformat(),
+            "deletion_returned_at": (claimed + timedelta(seconds=after)).isoformat(),
+        }
+
+    assert wr.delete_timing_errors(window, document(0.5, 1.5)) == []
+    (late,) = wr.delete_timing_errors(window, document(7.0, 8.0))
+    assert "4.0 s after the claim closed" in late and "3.0 s" in late, late
+    (early,) = wr.delete_timing_errors(window, document(-5.0, -4.0))
+    assert "4.0 s before the claim opened" in early, early
+    (straddle,) = wr.delete_timing_errors(window, document(2.5, 3.5))
+    assert "straddles the window's edge" in straddle, straddle
+    assert wr.delete_timing_errors(
+        wr.claim_window(_records(_entry(restart=["SUCCEEDED"])), ATTEMPT),
+        document(0.5, 1.5),
+    ) == [
+        "the product's records do not date the claim (no CLAIM event on the "
+        "recovery workflow or no terminal RESTART_WORKLOAD record)"
+    ]
+    assert wr.delete_timing_errors(window, {}) == [
+        "the restart document does not date the delete"
+    ]
+    # A document from before the bracket existed is judged on its one stamp.
+    assert (
+        wr.delete_timing_errors(
+            window, {"deleted_at": document(1.0, 1.0)["deleted_at"]}
+        )
+        == []
+    )
 
 
 def test_recovery_settled_needs_every_recovery_workflow_terminal() -> None:
@@ -285,6 +448,12 @@ def test_restart_watcher_waits_for_a_ready_pod_with_a_new_uid(tmp_path: Path) ->
         and document["replacement"]["uid"] == "uid-new"
     )
     assert document["replacement"]["ready"] is True
+    deleted_at = datetime.fromisoformat(document["deleted_at"])
+    returned_at = datetime.fromisoformat(document["deletion_returned_at"])
+    assert deleted_at < returned_at < datetime.fromisoformat(document["ready_at"]), (
+        "the delete request is bracketed by two clock readings before the "
+        "replacement wait"
+    )
     assert wr.replacement_errors(document) == []
     assert (ctx.evidence.case_dir / "watcher-restart.json").is_file(), (
         "the restart document is evidence"
@@ -424,6 +593,9 @@ class Store:
         self.count = 1
         self.reservations: list[str] | None = None
         self.restart_observed = 1
+        # The product-dated claim window in the settled records.
+        self.claimed_at: datetime | None = CLAIMED_AT
+        self.closed_at: datetime | None = CLOSED_AT
         self.notifications = [
             {
                 "incident_id": "inc-c",
@@ -463,7 +635,11 @@ class Store:
                         "budget": 1,
                     },
                 }
-            entry = _entry(restart=self.restart_statuses)
+            entry = _entry(
+                restart=self.restart_statuses,
+                claimed_at=self.claimed_at,
+                updated_at=self.closed_at,
+            )
             records = _records(entry, count=self.count, reservations=self.reservations)
             return {**records, "attempts": {attempt: entry}}
         if script == iso.ISOLATION_RECORDS_PROBE:
@@ -573,6 +749,18 @@ def test_worker_restart_passes_when_the_claim_survives_the_replacement(
     assert (ctx.evidence.case_dir / "open-claim-records.json").is_file(), (
         "the records at the open claim are evidence"
     )
+    assert result["claim_window"] == {
+        "reserved_at": CLAIMED_AT.isoformat(),
+        "dispatched_at": (CLAIMED_AT + timedelta(milliseconds=400)).isoformat(),
+        "closed_at": CLOSED_AT.isoformat(),
+        "open_seconds": 7200.0,
+        "ledger_updated_at": None,
+    }
+    window = json.loads((ctx.evidence.case_dir / "open-claim-window.json").read_text())
+    assert window["timing"] == [] and set(window["stages"]) == set(result["stages"])
+    assert window["deleted_at"] < window["deletion_returned_at"], (
+        "the delete bracket is on the window evidence"
+    )
 
 
 def test_worker_restart_is_inconclusive_when_the_restart_ended_before_the_delete(
@@ -580,10 +768,50 @@ def test_worker_restart_is_inconclusive_when_the_restart_ended_before_the_delete
 ) -> None:
     store, cluster = Store(), Cluster()
     store.phase = "closed"
+    store.claimed_at = T0 + timedelta(seconds=1)
+    store.closed_at = T0 + timedelta(seconds=3, milliseconds=200)
     ctx = _variant(tmp_path, monkeypatch, store, cluster)
-    with pytest.raises(VariantInconclusive, match="closed before the watcher"):
+    with pytest.raises(
+        VariantInconclusive, match="closed before the watcher"
+    ) as raised:
         ctx.spec.execute(ctx)
+    assert "2.2 s" in str(raised.value), str(raised.value)
     assert cluster.deletes == [], "no watcher Pod is deleted outside the window"
+
+
+def test_worker_restart_is_inconclusive_when_the_delete_missed_the_dated_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first read was OPEN, but the settled records date the claim closed
+    before the delete request went out: the condition was not established,
+    whatever the oracle would have said, and the stages stay as evidence."""
+
+    store, cluster = Store(), Cluster()
+    store.claimed_at = T0 + timedelta(seconds=1)
+    store.closed_at = T0 + timedelta(seconds=3)
+    ctx = _variant(tmp_path, monkeypatch, store, cluster)
+    with pytest.raises(VariantInconclusive) as raised:
+        ctx.spec.execute(ctx)
+    detail = str(raised.value)
+    assert detail.startswith("the watcher was not replaced inside the open claim: "), (
+        detail
+    )
+    assert "after the claim closed" in detail and "2.0 s" in detail, detail
+    assert store.deleted_in_phase == "open", "the delete did go out on an OPEN read"
+    assert len(cluster.deletes) == 1
+    window = json.loads((ctx.evidence.case_dir / "open-claim-window.json").read_text())
+    assert window["open_seconds"] == 2.0
+    assert window["timing"] == [detail.split(": ", 1)[1]]
+    assert set(window["stages"]) == {
+        "watcher_replaced",
+        "single_restart",
+        "attempt_once",
+        "notifications",
+        "watcher_restored",
+    }
+    assert window["stages"]["single_restart"] == [], (
+        "the oracle itself was clean; only the precondition failed"
+    )
 
 
 @pytest.mark.parametrize(
@@ -639,3 +867,33 @@ def test_worker_restart_fails_on_duplicate_notifications(
         "notification k1 was recorded 2 times",
         "2 containment notifications for incident inc-c",
     ]
+
+
+# --------------------------------------------------------------------------- #
+# the product facts the window reasoning rests on
+# --------------------------------------------------------------------------- #
+def test_open_claim_is_one_control_loop_round_trip_in_the_product() -> None:
+    """The harness dates the window instead of trying to widen it because of
+    these product facts; a change to any of them is the cue to revisit.
+
+    The data plane's RESTART_WORKLOAD returns SUCCEEDED in the call that
+    creates the restart copy, without reading a Pod of it (pinned by the
+    product's own tests/execution/test_restart_safety.py
+    ``test_terminal_pytorch_restart_creates_retry_object``: ``core_api`` is an
+    unused double). The dispatcher is woken by the command's terminal status,
+    so the step is recorded SUCCEEDED within the round trip rather than at the
+    next poll. A product-side hold after the submission would run under the
+    step's waiting cap; a start barrier the harness then puts on the restart
+    copy must stay below it with margin (``N + margin < cap``).
+    """
+
+    assert WAKING_REMOTE_COMMAND_STATUSES == frozenset({"SUCCEEDED", "FAILED"})
+    assert WorkflowDispatcherConfig(enabled=False).poll_interval_seconds == 5.0
+    cap = ProductionExecutorConfig(
+        enabled=False, executor_id="pin", allowed_operations=frozenset()
+    ).step_waiting_limit(WorkflowOperation.RESTART_WORKLOAD)
+    assert cap == 600, (
+        "the RESTART_WORKLOAD waiting cap any post-submission hold runs under"
+    )
+    assert wr.CLAIM_POLL_SECONDS == 5
+    assert wr.TERMINAL_STEPS == frozenset({"SUCCEEDED", "FAILED"})

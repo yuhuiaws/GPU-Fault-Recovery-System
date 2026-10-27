@@ -1044,7 +1044,10 @@ def worker_restart(ctx: VariantContext) -> dict[str, Any]:
     replaces it. The replacement must not re-decide, re-reserve or re-send:
     the ledger keeps exactly the one reservation of the recovery workflow,
     one RESTART_WORKLOAD succeeds, one STOP_WORKLOADS, one decision, one
-    restart attempt observed, no notification twice.
+    restart attempt observed, no notification twice. The claim is open for one
+    control-loop round trip only (``general_live_watcher_restart``), so once
+    the records settle the delete is dated against the product's own window:
+    a delete outside it is INCONCLUSIVE with the stages kept as evidence.
     """
 
     job = _job(ctx, "gl29wr-" + _suffix(ctx), "exit:1", restart_budget=1)
@@ -1076,6 +1079,22 @@ def worker_restart(ctx: VariantContext) -> dict[str, Any]:
             after, restored_at=ready_at
         ),
     }
+    window = watcher_restart.claim_window(records, job.attempt_id)
+    timing = watcher_restart.delete_timing_errors(window, restarted)
+    ctx.evidence.write(
+        "open-claim-window",
+        {
+            **window,
+            "deleted_at": restarted.get("deleted_at"),
+            "deletion_returned_at": restarted.get("deletion_returned_at"),
+            "timing": timing,
+            "stages": stages,
+        },
+    )
+    if timing:
+        raise VariantInconclusive(
+            "the watcher was not replaced inside the open claim: " + "; ".join(timing)
+        )
     return _result(
         stages,
         notes=[
@@ -1095,6 +1114,7 @@ def worker_restart(ctx: VariantContext) -> dict[str, Any]:
             "claim_state_at_delete": watcher_restart.claim_state(
                 opened, job.attempt_id
             ),
+            "claim_window": window,
             "restart_budget": records.get("restart_budget"),
         },
     )
