@@ -2817,8 +2817,9 @@ post-repair step (`RESTART_EFA_DEVICE_PLUGIN` or `VALIDATE_FABRIC`)
 independently FAILS on fresh evidence and escalates to the same reboot -- the
 independent failure receipt and the escalation the spec requires. Both grade
 only on the product's own records (the incident reasons, the step receipts, the
-EFA inventory, a changed boot id, no isolation beyond the remediation chain's
-own cordon), are scoped to one function, node-reversible (one write to
+EFA inventory, a changed boot id, no isolation beyond the chain's own cordon --
+the reboot successor's QUARANTINE included, see below), are scoped to one
+function, node-reversible (one write to
 `driver_override`, or a reboot) and deadman-restorable, and their cleanup binds
 the function back to `efa` or fails loudly. The probe's "no override" is the
 kernel's own read-back: the attribute's show callback prints the
@@ -2852,6 +2853,107 @@ own unbind before it waits for the product's bind. 032 `missing_version` stays
 `FIXTURE_NOT_READY`: the NVLink5 decoder gates on the `driver_branch` the
 *kernel collector's* own CollectorContext stamps on the XID event, and the host
 source replay is allow-listed for `gpu-fault-host-collector.service` only.
+
+Live 2026-10-27 06:55-07:06Z (HyperPod, R13g, harness int/r13c-live24)
+`bind_failure` ran end to end for the first time: the survey read 16 functions
+bound and `driver_override_sysfs` `(null)`, the hold made the product see
+DRIVER_UNBOUND, its `REMEDIATE_EFA_DRIVER` bind of the BDF failed with ENODEV
+(`bind_errors=<BDF>=OSError: [Errno 19]`), the record ended FAILED with the
+incident parked QUARANTINED, and the ladder -- the step's
+`failure_escalation_action=REBOOT_NODE` (`orchestration/families/health.py`
+`_efa_parameters`; `orchestration/escalation.py` `_classify`, stage
+`efa_recovery`) -- opened `workflow-reboot-after-<record>` 23 ms later with the
+plan every reboot/replacement successor gets: FREEZE_EVIDENCE,
+MARK_UNSCHEDULABLE, **QUARANTINE**, RESTART_NODE, VALIDATE_GPU, VALIDATE_HOST,
+VALIDATE_FABRIC, RESTORE_SCHEDULING (`escalation.py` `_escalation_operations`).
+The node rebooted (new boot id), came back Ready with 16/16 bound and was
+released, and the predecessor incident was closed RECOVERED by the successor's
+restore (`incident_closure.py` `_close_escalation_predecessors`, "node restored
+via escalation successor") -- the designed path, not a product defect. The
+variant still graded FAIL on two of the harness's own expectations:
+`not_isolated_beyond_chain` read the successor's QUARANTINE as isolation beyond
+the chain, and the cleanup's `release` went through the probe Pod the reboot had
+terminated (`HostProbeTransportError: owned host probe Pod has terminated`).
+Both variants are reboot-aware now (`general_live_efa_escalation.py`):
+`escalation_shape` asserts, on the record before and at the reboot, one
+REMEDIATE attempt, the remediation record FAILED without restoring scheduling,
+exactly one reboot-after successor planning that REBOOT_NODE chain,
+RESTART_NODE executed exactly once and SUCCEEDED, no REPLACE_NODE and no
+successor of the successor; `not_isolated_beyond_chain` counts only a QUARANTINE
+in the remediation record itself, a STOP_WORKLOADS naming no workload, or any
+isolation step of a workflow outside the chain; `recovered` requires, on the
+settled record, a new boot id, a node free of the product's isolation, the
+successor SUCCEEDED and both incidents RECOVERED (the predecessor's closure is
+given up to 180 s more). The waits follow: `efa-driver-escalation.json` is
+written once the remediation record is terminal and its successor is on the
+record (the record before/at the reboot), and a ladder that stopped on two
+consecutive polls without a RESTART_NODE returns the settled wait at once so the
+stages name the deviation instead of waiting out the reboot window. Cleanup: a
+`release` the probe answers with `HostProbeError` goes through
+`close_after_probe_loss` (the DCGM replay's close): a node back on the same
+boot gets the retry through the same Pod; a boot id changed against the one the
+fixture was armed on, with the probe still refusing, means the sysfs override,
+the `systemd-run` deadman/trap units and the `/run` state went with the boot --
+and the product's own inventory of the new boot (an
+`efa_inventory_active_count` at the expected count with `mismatch=0` observed
+after the node's Ready transition) must prove the function bound, or the
+cleanup fails as unproven; without a reboot the probe failure stays the cleanup
+error. `post_repair_failure` is aligned the same way: the trap's record is read
+every 10 s while the product repairs, before the reboot can take the probe
+(`summary` carries it as `trap_fired_at`, the JSON text the trap unit writes --
+the earlier grading read a `trap_fired` dict key that does not exist there and
+would have reported "trap did not fire" live), and a probe lost before that read
+leaves the product's own SUCCEEDED-then-post-repair-FAILED record as the witness
+(`trap_witness=product record`). `tests/regional/test_general_live_efa_driver.py`
+pins it on fake timelines in the live shape: with and without the reboot, the
+chain's own versus a foreign QUARANTINE, a blind reboot loop, REPLACE_NODE, a
+ladder that never reboots, a probe that dies with the reboot, and the cleanup
+after the reboot.
+
+The same day's `post_repair_failure` (07:08-07:51Z, the same node on its new
+boot) took the product's other designed path: REMEDIATE_EFA_DRIVER bound the
+function back at 07:10:00 (the trap unit saw the bind, re-unbound after its 5 s
+grace at 07:10:04 and recorded `fired=true`, read by the second summary at
+07:10:08), RESTART_EFA_DEVICE_PLUGIN passed as `already_healthy` on the
+plugin's unchanged allocatable of 16 (`adapters/kubernetes/node_operations.py`
+`_restart_device_plugin_node`: `allocatable >= expected` restarts nothing), and
+VALIDATE_FABRIC never got an `efa_inventory_active_count` newer than the last
+recovery step within its 600 s per-step cap (`adapters/gpu_validation.py`
+`inventory_observation_window`), failing with "stayed non-terminal for 602s,
+past the 600s per-step cap". By `validation_evidence.withheld_escalation` a
+validation a bound failed before it observed any node failure is not granted
+the REBOOT_NODE it asked for; the ladder's VALIDATION_EVIDENCE_MISSING_STAGE
+opened `workflow-support-after-<record>` (FREEZE_EVIDENCE + ESCALATE_SUPPORT)
+and the node kept the chain's own cordon for an operator -- **no reboot**. The
+earlier grading turned that into three errors of its own: `action_succeeded`
+read `commands[*].operation`, while a `RemoteActionCommand` (`regional.py`)
+names its operation only under `step.operation`, so the receipt was always
+empty ("rebound None", "already bound"); `trap_fired` read a `trap_fired` dict
+key where the probe writes `trap_fired_at` JSON text; `escalation`/`recovered`
+waited the whole 40 min for a reboot. Now the receipt is read from the step
+execution's `details.node_results[node]` or the command whose `step.operation`
+matches (`node_result`); the post-repair failure is classified by the
+product's own rule (`post_repair_verdict`: a non-validation step, or a
+validation with `node_failures`/`failed_nodes`, is `observed`; a validation
+with only `node_pending`/`step_waiting_timeout_seconds`/the deadline is
+`withheld`); on `withheld`, `escalation_shape` grades the hand-off's shape
+(exactly one support-after successor planning FREEZE_EVIDENCE +
+ESCALATE_SUPPORT, no reboot-after, no RESTART_NODE executed, no REPLACE_NODE),
+`recovered`/`escalation` no longer demand a reboot, and the one failing stage
+is `post_repair_failure_observed` -- the fresh-evidence failure the variant
+claims was not demonstrated -- with the product-side question in
+`product_gap`: TRIGGER_HEALTH_SNAPSHOT had restarted the host collector
+(`node_agent/operations/diagnostics.py` `_trigger_health_snapshot`) and the
+function was unbound again, so why did no inventory sample newer than the
+recovery steps' completion arrive within 600 s (the step's
+`details.node_pending`, which `efa-driver-settled.json` now records together
+with `inventory_evidence` and `step_waiting_timeout_seconds`). The cleanup
+gained the hand-off's exit: `hand_back` runs after the fixture's release
+(LIFO) and, when the node is still isolated and the run has incidents, hands
+it back through the product's validated restore (`restore_incidents`); on the
+reboot path the product released the node and it is skipped. The HyperPod node
+most likely still carries the chain's cordon and an ESCALATED incident after
+that live run and needs this exit.
 needs other hardware; `observe_profile` / `permitted_isolation` need a Runtime
 Profile authority the site does not configure, AUTH-015), the 017 attribution
 variants (a managed attempt with CRI Pod logs, lane N territory), and 004

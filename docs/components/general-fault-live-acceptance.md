@@ -2640,6 +2640,64 @@ bundle 保守，却判 "did not request process state capture"，是 oracle 把 
   前一次保留在 `previous` 下）；trap 单元按 systemd-run 默认 `Type=simple` 启动（`Type=oneshot`
   会让 `systemd-run` 阻塞到进程退出，且 `RuntimeMaxSec` 对其无效——systemd-run(1)、
   systemd.service(5)），并先等到夹具自身的解绑、再等产品的重绑之后才再次解绑。
+  实跑 2026-10-27 06:55-07:06Z（HyperPod，R13g，harness int/r13c-live24）`bind_failure` 第一次走完
+  全程：survey 16 个功能全绑定、`driver_override_sysfs` 读 `(null)`，hold 后产品判 DRIVER_UNBOUND，
+  `REMEDIATE_EFA_DRIVER` 对该 BDF 的 bind 以 ENODEV 失败（`bind_errors=<BDF>=OSError: [Errno 19]`），
+  记录 FAILED、incident 停在 QUARANTINED，升级器按步骤的 `failure_escalation_action=REBOOT_NODE`
+  （`orchestration/families/health.py` `_efa_parameters`；`orchestration/escalation.py` `_classify`
+  的 `efa_recovery`）在 23 ms 内开出 `workflow-reboot-after-<record>`，其计划是每个重启/替换后继的
+  固定形状 FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → **QUARANTINE** → RESTART_NODE → VALIDATE_GPU →
+  VALIDATE_HOST → VALIDATE_FABRIC → RESTORE_SCHEDULING（`escalation.py` `_escalation_operations`）；
+  节点重启（boot id 变化）、以 16/16 绑定回到 Ready 并被释放，前驱 incident 由后继的 restore 关闭
+  RECOVERED（`incident_closure.py` `_close_escalation_predecessors`："node restored via escalation
+  successor"）——这正是设计路径，不是产品缺陷。变体却 FAIL 了两条，都是 harness 自己的期望：
+  `not_isolated_beyond_chain` 把后继自带的 QUARANTINE 当成"链外隔离"；清理的 `release` 经由已随
+  重启终止的探针 Pod 执行（`HostProbeTransportError: owned host probe Pod has terminated`）。
+  两个变体现已按重启感知判定（模块 `general_live_efa_escalation.py`）：`escalation_shape` 在重启前/
+  重启时的记录上断言一次 REMEDIATE 尝试、补救记录 FAILED 且未释放、恰好一个 reboot-after 后继且计划为
+  上述 REBOOT_NODE 链、RESTART_NODE 恰执行一次且 SUCCEEDED、无 REPLACE_NODE、后继之后再无后继；
+  `not_isolated_beyond_chain` 只把补救记录自身的 QUARANTINE、未命名任何 workload 的 STOP_WORKLOADS、
+  链外工作流的任何隔离步骤算作越界；`recovered` 在稳态上要求新 boot、节点无产品隔离、后继 SUCCEEDED
+  且两个 incident 均 RECOVERED（前驱关闭最多再等 180 s）。等待也随之收敛：补救记录终结且后继出现即记
+  `efa-driver-escalation.json`（重启前/时的记录），梯子若在连续两次轮询内都已停住且没有 RESTART_NODE，
+  `efa-driver-settled` 立刻返回并由各阶段点名偏差，而不是空等整个重启窗口。清理：`release` 遇
+  `HostProbeError` 时走 `close_after_probe_loss`（同 DCGM 回放的关窗）：节点在同一 boot 上回来则经原
+  探针重试；boot id 相对夹具布设时变化且探针仍不可用，则 override（sysfs）、systemd-run 的 deadman/
+  trap 单元与 `/run` 状态都已随 boot 消失，**再以产品自己的新 boot 库存**（Ready 之后采到的
+  `efa_inventory_active_count` 等于期望值且 `mismatch=0`）证明功能已绑定，缺一不可——没有重启就保留
+  探针失败为清理失败，不以重启为由放行。`post_repair_failure` 同样对齐：trap 的记录在产品修复期间、
+  重启之前每 10 s 读一次（`summary` 的 `trap_fired_at` 是 trap 单元写入的 JSON 文本；早先的判定读的是
+  不存在的 `trap_fired` 字典键，实跑会误报"trap 未触发"），探针若先于读取随重启消失，则以产品自身
+  SUCCEEDED → post-repair FAILED 的记录作证（`trap_witness=product record`）。
+  `tests/regional/test_general_live_efa_driver.py` 以实跑形状的假时间线（有/无重启、链内/链外
+  QUARANTINE、盲目重启循环、REPLACE_NODE、梯子不重启、探针随重启消失、重启后清理）钉住。
+  同日 07:08-07:51Z 的 `post_repair_failure`（同一节点，重启后的新 boot）走的是另一条设计路径：
+  REMEDIATE_EFA_DRIVER 07:10:00 把功能绑回（trap 单元观察到绑定、按 5 s 宽限于 07:10:04 再次解绑并记录
+  `fired=true`，第二次 summary 07:10:08 读到），RESTART_EFA_DEVICE_PLUGIN 因 plugin 公告的 allocatable
+  仍为 16 而按 `already_healthy` 通过（`adapters/kubernetes/node_operations.py`
+  `_restart_device_plugin_node`：`allocatable >= expected` 即不重启 plugin），随后 VALIDATE_FABRIC 在
+  600 s 步级上限内始终没有拿到比最后一个恢复步骤更新的 `efa_inventory_active_count`
+  （`adapters/gpu_validation.py` `inventory_observation_window`），以 "stayed non-terminal for 602s,
+  past the 600s per-step cap" FAILED——按 `validation_evidence.withheld_escalation`，一个没观察到节点
+  故障就被边界判失败的验证不获授其申请的 REBOOT_NODE，升级器按 VALIDATION_EVIDENCE_MISSING_STAGE 开出
+  `workflow-support-after-<record>`（FREEZE_EVIDENCE + ESCALATE_SUPPORT），节点保留补救链自己的
+  cordon 交操作员，**没有重启**。旧判定把这记成三条 harness 自身的错：`action_succeeded` 读的是
+  `commands[*].operation`，而 `RemoteActionCommand`（`regional.py`）只在 `step.operation` 下命名操作，
+  于是回执永远为空（"rebound None"、"already bound"）；`trap_fired` 读 `trap_fired` 字典键而探针写的是
+  `trap_fired_at` JSON 文本；`escalation`/`recovered` 等了整整 40 分钟的重启。现在：回执从步骤执行的
+  `details.node_results[node]` 或 `step.operation` 匹配的命令读（`node_result`）；post-repair 失败按产品
+  自己的规则分类（`post_repair_verdict`：非验证步骤或带 `node_failures`/`failed_nodes` 的验证 = observed；
+  只有 `node_pending`/`step_waiting_timeout_seconds`/截止期的验证 = withheld），withheld 时
+  `escalation_shape` 改判交接形状（恰一个 support-after 后继、FREEZE_EVIDENCE + ESCALATE_SUPPORT、无
+  reboot-after、RESTART_NODE 未执行、无 REPLACE_NODE），`recovered`/`escalation` 不再追讨重启，
+  唯一失败的阶段是 `post_repair_failure_observed`——变体所主张的"在新鲜证据上 FAILED"未被展示；
+  `product_gap` 记下产品侧的开放问题：TRIGGER_HEALTH_SNAPSHOT 已重启主机采集器
+  （`node_agent/operations/diagnostics.py` `_trigger_health_snapshot`）且功能确已再次解绑，为什么
+  600 s 内没有一个新于恢复步骤完成时刻的 inventory 样本到达（看 `efa-driver-settled.json` 中该步骤
+  `details.node_pending`，新判定把 `node_pending`/`inventory_evidence`/`step_waiting_timeout_seconds`
+  等细节一并记录）。清理补上交接路径的出口：`hand_back` 在夹具 release 之后（LIFO）、节点仍被隔离且本轮
+  有 incident 时走产品的 validated restore（`restore_incidents`），重启路径下节点已被产品释放则跳过。
+  HyperPod 节点在该次实跑后极可能仍带补救链的 cordon 与 ESCALATED incident，需按此出口放行。
 
 计划/执行守卫键仍为 `<case>.<variant>`，确认串 `GENERALLIVE<NNN>_EXECUTE`。新 `--approve`
 令牌：`KERNEL_SOURCE_REPLAY`（kmsg 源重指，032）、`KERNEL_COLLECTOR_SOURCE_REPLAY`（内核采集器
