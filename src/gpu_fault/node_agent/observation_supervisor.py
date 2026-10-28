@@ -282,10 +282,18 @@ class ObservationSupervisor:
                     if not selector.get_map():
                         break
                 if not final or process.poll() is None:
+                    left = max(0.001, deadline - time.monotonic())
+                    # A final result and the end of the output are a worker
+                    # tree on its way out (the guard closes the pipe as it
+                    # exits): wait for it up to the deadline. The 0.1 s that
+                    # bounds every other wait here turned complete results
+                    # into PARTIAL_TIMEOUT with evidence_complete false on a
+                    # CPU-starved host, where the exiting process stayed off
+                    # the CPU longer than that between closing its stdout and
+                    # being reaped (48 busy loops on its CPU, b214).
+                    exiting = final and not selector.get_map()
                     with contextlib.suppress(subprocess.TimeoutExpired):
-                        process.wait(
-                            timeout=min(0.1, max(0.001, deadline - time.monotonic()))
-                        )
+                        process.wait(timeout=left if exiting else min(0.1, left))
                 if not final or process.poll() != 0:
                     with self._holder_lock:
                         preempted_by = record.get("preempted_by")

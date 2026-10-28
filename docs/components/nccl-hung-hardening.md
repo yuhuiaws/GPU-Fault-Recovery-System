@@ -454,7 +454,7 @@ worker 拿到槽后按"deadline 在规划时刻所剩时间减 2.5 s"规划 tria
 8 rank 两份 dump 实测约 4.5 s 配对完（`slot_wait` 0.05 s），远在 20 s 内。triage/bundle 在检查点发部分文档
 （triage：RANKS_DISCOVERED→PROCESS_SERIES_SAMPLED→FIRST_FLIGHT_DUMPS_READ，带 dump 的检查点在副本上走裁剪阶梯；
 bundle：每采完一项发 `BUNDLE_CAPTURING` 带已采/待采/`elapsed_seconds`），supervisor 的 deadline 或抢占落在最终结果前时
-交回最后检查点（`PARTIAL_TIMEOUT`/`PREEMPTED`），慢 triage/bundle 带回已采 rank/dump 与缺项而非空结果。
+交回最后检查点（`PARTIAL_TIMEOUT`/`PREEMPTED`），慢 triage/bundle 带回已采 rank/dump 与缺项而非空结果；最终结果已到、输出已结束的 worker 树，supervisor 等其退出直至 deadline（原只等 0.1 s，CPU 饥饿时完整结果会被记为 `PARTIAL_TIMEOUT`）。
 真机 `fr_second_missing`（2026-10-26 04:46Z）bundle 仅在共享节点 `hyperpod-i-08d8…`（另载一 lane 的 prewarm/训练 Pod、
 被动采样目标更多）以 `WORKER_STILL_RUNNING` 整体失败、另一节点正常；本修复令其先抢占等待，真超时交回已采清单。
 诊断子进程 stdout+stderr 上限 1 MiB，超时后 kill 等待再限 0.2 秒，

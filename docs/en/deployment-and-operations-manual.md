@@ -10563,7 +10563,10 @@ worker -- seconds on a node whose CPU a training job saturates -- shortens `tria
 the deadline. A triage that waited for the slot on a busy node and came back `PARTIAL_TIMEOUT` at `FIRST_FLIGHT_DUMPS_READ` with a
 `triage_budget_seconds` that, added to its `slot_wait_seconds` and the 2.5 s margin, fills the whole 28 s comes from an Agent older
 than this fix, which planned from the seconds left at the spawn; an upgraded Agent's `triage_budget_seconds` is that much shorter
-and its result final.
+and its result final. A `PARTIAL_TIMEOUT` node result that carries the triage's final fields (`triage_version`, `process_coverage`)
+instead of a `collection_stage`, with `worker_returncode: null`, was complete: an older Agent waited only 0.1 s for the worker tree
+to exit after its final line, and a starved CPU kept the exiting guard waiting longer; an upgraded Agent waits for that exit up to
+the deadline.
 Without eligible candidates, the bounded passive bundle need not contain
 process stacks; eligible targeted bundles attach only to verified PIDs. Hung bundles omit strace,
 DCGM diag and bug-report. Per-process `flight_recorder_series` retains two compact summaries and

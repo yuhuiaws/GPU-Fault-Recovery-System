@@ -3923,7 +3923,12 @@ result, it hands back the last checkpoint (`PARTIAL_TIMEOUT`/`PREEMPTED`, `evide
 slow triage or bundle comes back with the ranks/dumps it had read and what is missing, not empty. Live, the `fr_second_missing` run
 (HyperPod, 2026-10-26 04:46Z) had the bundle fail whole as `WORKER_STILL_RUNNING` on the shared node `hyperpod-i-08d8…` alone -- the
 node also hosting the other lane's prewarm/training Pods, with more passive-sample targets holding the slot -- while the other node
-finished; this fix makes it wait and preempt first, and a genuine timeout returns the captured manifest.
+finished; this fix makes it wait and preempt first, and a genuine timeout returns the captured manifest. Once the final result has
+arrived and the worker's output has ended (the worker tree is on its way out; the guard closes the pipe as it exits), the supervisor
+waits for the tree to exit up to the deadline instead of 0.1 s: on a CPU-starved host the exiting process stayed off the CPU for
+longer than that between closing its stdout and being reaped (measured with 48 busy loops on its CPU), and a complete result came
+back `PARTIAL_TIMEOUT` with `evidence_complete=false`; a tree still not gone at the deadline is handed back as read and marked
+incomplete, as before.
 
 The executor compares groups by name and membership, requiring at least three valid samples and a strict majority.
 A single snapshot yields at most `PLAUSIBLE` progress outliers, never confirmed root cause.
