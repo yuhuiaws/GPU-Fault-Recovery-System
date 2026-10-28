@@ -53,10 +53,15 @@ from scripts.e2e.regional.notification_evidence import (  # noqa: E402
     split_drill_tagged_live_records,
 )
 from scripts.e2e.regional.notify005_checks import (  # noqa: E402
+    LIMITATIONS,
+    LOW_UTILIZATION_CONFIG_PROBE,
     NODE_GPU_COUNT,
     low_utilization_manifest,
+    mailed_nodes,
     node_errors,
     phase_checks,
+    phase_progress,
+    phase_records,
 )
 from scripts.e2e.regional.notification_probe_cache import (  # noqa: E402
     cached_drill,
@@ -757,6 +762,7 @@ import re
 import sys
 from datetime import datetime
 from gpu_fault.app import ApplicationContext
+from gpu_fault.store import NotFoundError
 
 GPU_UUID = re.compile(
     r"GPU-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
@@ -769,6 +775,18 @@ GPU_UUID = re.compile(
 cluster_id, needle, observed_after_text, *nodes = sys.argv[1:]
 observed_after = datetime.fromisoformat(observed_after_text.replace("Z", "+00:00"))
 store = ApplicationContext.from_environment().store
+
+
+def workflow_status(incident):
+    # The inconclusive-diagnostic advisory follows the chain's terminal write.
+    if not incident.workflow_request_id:
+        return None
+    try:
+        return store.get_workflow(incident.workflow_request_id).status.value
+    except NotFoundError:
+        return "MISSING"
+
+
 records = []
 for notification in store.list_notifications():
     if notification.created_at < observed_after or notification.cluster_name != cluster_id:
@@ -804,6 +822,9 @@ for notification in store.list_notifications():
         "gpu_devices": sorted(set(GPU_UUID.findall(searchable))),
         "names_workload": needle in searchable,
         "deduplication_key": notification.deduplication_key,
+        "incident_id": incident.incident_id,
+        "incident_state": incident.state.value,
+        "workflow_status": workflow_status(incident),
         "status": result.status.value if result else None,
         "provider_message_id_present": bool(
             result is not None and result.provider_message_id
@@ -885,20 +906,6 @@ for item in store._list("health_signal_state"):
 print(json.dumps({"records": sorted(
     records, key=lambda value: (value["node_id"], value["device"])
 )}, sort_keys=True))
-"""
-
-
-LOW_UTILIZATION_CONFIG_PROBE = r"""
-import json
-import os
-print(json.dumps({
-    "duration_seconds": int(
-        os.getenv("GPU_FAULT_LOW_UTILIZATION_DURATION_SECONDS", "300")
-    ),
-    "threshold_percent": float(
-        os.getenv("GPU_FAULT_LOW_UTILIZATION_THRESHOLD_PERCENT", "10")
-    ),
-}, sort_keys=True))
 """
 
 
@@ -1096,7 +1103,8 @@ def wait_low_utilization_notifications(
     notification 356 seconds after submission in one attempt and nothing at all
     within 409 seconds in the next, so the budget decided the verdict rather
     than the behaviour. Polling to a generous deadline removes that coin flip
-    and records when each node actually reported.
+    and records when each node actually reported. A poll is judged per mail
+    kind, after the counted incidents' chains finished (``phase_progress``).
     """
 
     deadline = time.monotonic() + deadline_seconds
@@ -1110,29 +1118,25 @@ def wait_low_utilization_notifications(
             observed_after.isoformat(),
             *nodes,
         )
-        records = [item for item in query["records"] if item["low_gpu_utilization"]]
-        reported = {node for item in records for node in item["matched_nodes"]}
+        records = phase_records(query["records"])
+        progress = phase_progress(records, nodes)
         polls.append(
             {
                 "observed_at": utc_now(),
                 "notification_count": len(records),
+                "notification_kinds": progress["kinds"],
                 "low_cpu_notification_count": sum(
                     bool(item.get("low_cpu_utilization")) for item in query["records"]
                 ),
-                "reported_nodes": sorted(reported),
+                "reported_nodes": progress["reported_nodes"],
             }
         )
-        complete = set(nodes) == reported and all(
-            item.get("status") == "SENT"
-            and item.get("provider_message_id_present") is True
-            for item in records
-        )
-        if complete:
+        if progress["complete"]:
             covered_since = time.monotonic() if covered_since is None else covered_since
         else:
             covered_since = None
         if (
-            len(records) > len(nodes)
+            progress["overflow"]
             or time.monotonic() >= deadline
             or (
                 covered_since is not None
@@ -1234,7 +1238,7 @@ def run_notify005(
         datetime(1970, 1, 1, tzinfo=timezone.utc).isoformat(),
         *nodes,
     )
-    pre_existing = [item for item in baseline["records"] if item["low_gpu_utilization"]]
+    pre_existing = phase_records(baseline["records"])
     fixtures = []
     observations = []
     result: dict[str, Any] = {"verdict": "FAIL"}
@@ -1328,7 +1332,7 @@ def run_notify005(
                 "polls": polls,
                 "notifications": records,
             }
-            reported = {node for item in records for node in item["matched_nodes"]}
+            reported = mailed_nodes(records)
             if set(selected) - reported:
                 observation["silent_nodes"] = sorted(set(selected) - reported)
                 observation["attempt_observations"] = regional.cpu_python(
@@ -1366,16 +1370,7 @@ def run_notify005(
         result["cleanup_errors"] = cleanup_errors
         if cleanup_errors:
             result["verdict"] = "FAIL"
-    result["limitations"] = [
-        "The workloads reserve every GPU of each node while doing CPU work only; "
-        "they validate notification aggregation without damaging hardware.",
-        "The sustained low-utilization signal latches per GPU and attempt, and "
-        "its unscoped window resets only after the node reports no active "
-        "workload, so the case refuses nodes that already hold a GPU for an "
-        "unrelated workload and waits for each phase's nodes to be re-armed; "
-        "quiesce_polls records that wait and pre_existing_notifications records "
-        "the episodes that preceded the run.",
-    ]
+    result["limitations"] = list(LIMITATIONS)
     return result
 
 

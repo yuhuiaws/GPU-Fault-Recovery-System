@@ -13875,8 +13875,8 @@ BLOCKED, no quiesce and no reset; once the watcher recovers the heartbeat return
      one GPU and leave nothing to aggregate).
   2. Count the notifications generated within that window.
   3. Extend to 3 nodes with 24 GPUs and repeat the count.
-- Verdict: the notification count grows with the **number of nodes or jobs** (≤3),
-  **not** with the GPU count (it should not be 24).
+- Verdict: the count of each notification kind grows with the **number of nodes or jobs** (≤3 of
+  each), **not** with the GPU count (it should not be 24 of each).
 - The count in the verdict is only an **upper bound**; but an upper bound can be satisfied by "the
   detector never fired at all", so the runner additionally requires that **every selected node was
   reported in its own phase**, and asserts that **each notification points to exactly one node** and
@@ -13886,6 +13886,27 @@ BLOCKED, no quiesce and no reset; once the watcher recovers the heartbeat return
   `LOW_CPU_UTILIZATION` mail names the phase's nodes (`cpu_rule_silent`): that rule reads the CPU of the processes holding
   a compute context on a GPU (in percent of one core), and the CPU burners create no CUDA context, so there is nothing to
   grade.
+- One node's low-utilisation episode sends **two kinds** of mail, each counted per node. One is the
+  host-resource mail (`HEALTH_TREND`, deduplication key `host-resource/<digest>`), which aggregates the node's
+  GPUs. The other closes the diagnostic chain of the node's one incident (the other seven GPUs' findings are
+  absorbed into it): `RUN_DIAGNOSTICS` compiles to the read-only FREEZE_EVIDENCE → VALIDATE_GPU, whose
+  `host_diagnostic_probe` re-reads the held GPU; the fixture stays idle, so the probe fails, the workflow
+  FAILs, the incident closes `RECOVERED` "diagnostic inconclusive" and one `DIAGNOSTIC_INCONCLUSIVE` notice
+  goes out (`ADVISORY`, key `<cluster>/<incident>/diagnostic-inconclusive/<workflow>`). Its trigger reasons
+  list the absorbed per-GPU findings, so its body names `LOW_GPU_UTILIZATION` too and the case's query selects
+  it; comparing both kinds together with the node count fails a correct aggregation (two records for one
+  node). The runner tags every record with its `kind` (category + deduplication key): the bound holds **per
+  kind** (`count_at_most_node_count`, each kind ≤ the node count; without aggregation each would be eight per
+  node); "every node reported" and "several GPUs in one mail" read the host-resource mails only; every
+  diagnostic notice must belong to an incident a host-resource mail of the same phase opened
+  (`diagnostic_notices_follow_mailed_incidents`: one incident per GPU, or an earlier phase's late notice, is
+  caught), and no third kind may appear (`every_notification_kind_expected`). The notice follows the chain's
+  terminal write, so the query adds each record's `incident_id`, incident state and workflow status, and the
+  settle timer starts only once every counted incident's workflow is terminal (no longer
+  PENDING/SAFETY_PENDING/RUNNING; `every_incident_chain_finished`) -- otherwise the phase counts half of it and
+  the next phase finds the late notice. Every poll records the count per kind in `notification_kinds`. Once a
+  kind exceeds the node count the runner stops waiting (a fan-out cannot be undone); in the three-node phase
+  the first node's notice may arrive before the other nodes' mails, which is not a fan-out.
 - The signal is **latched**: it fires once per activation period of each managed attempt. Window and
   latch are both per attempt, so a job that takes over the node starts from zero and inherits neither
   its predecessor's low time nor its latch; the unscoped continuity window resets only when the node

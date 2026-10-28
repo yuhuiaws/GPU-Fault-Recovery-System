@@ -364,8 +364,14 @@ class NotificationSite:
         self.query_counts[needle] = self.query_counts.get(needle, 0) + 1
         if self.silent or self.query_counts[needle] == 1:
             return {"records": []}
+        # Per node what the product sends: the host-resource mail and the
+        # inconclusive-diagnostic advisory of the incident the mail opened.
         records = [
             {
+                "category": category,
+                "deduplication_key": key,
+                "incident_id": f"inc-{node}",
+                "workflow_status": "FAILED",
                 "matched_nodes": [node],
                 "status": "SENT",
                 "low_gpu_utilization": True,
@@ -373,6 +379,10 @@ class NotificationSite:
                 "gpu_devices": ["GPU-a", "GPU-b"],
             }
             for node in args[3:]
+            for category, key in (
+                ("HEALTH_TREND", f"host-resource/{node}"),
+                ("ADVISORY", f"unit/inc-{node}/diagnostic-inconclusive/w-{node}"),
+            )
         ]
         if self.duplicate:
             records.append(copy.deepcopy(records[0]))

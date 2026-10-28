@@ -15,6 +15,10 @@ NODES = ("node-a", "node-b", "node-c")
 
 def notification(node: str, status: str = "SENT") -> dict:
     return {
+        "category": "HEALTH_TREND",
+        "deduplication_key": f"host-resource/{node}",
+        "incident_id": f"inc-{node}",
+        "workflow_status": "FAILED",
         "matched_nodes": [node],
         "status": status,
         "low_gpu_utilization": True,
