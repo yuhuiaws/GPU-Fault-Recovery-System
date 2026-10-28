@@ -3712,7 +3712,13 @@ same export unavailable within a 600 s window (node clocks), one more cluster-sc
 member nodes, `reasons[0]` naming the export and the nodes, then one line per member with its per-node incident id;
 `effective_action=None` and no workflow (a record, never dispatched). Every member's per-node incident gets one
 `common failure domain <id>: ...` reason pointing back; the node chain itself (action, state, steps) is untouched --
-nothing is isolated, no job is stopped. A member's per-node incident is the record holding its activation, under any
+nothing is isolated, no job is stopped. The back-reference says what stays unchanged in the terms of the record it sits
+on: a node's own shared-storage chain reads `the diagnostic-only handling of this node is unchanged`, a record of another
+fault the finding was folded into or absorbed by names its effective action (`this incident's REBOOT_NODE handling of
+this node is unchanged`); the record's member line and the notification name that action for such a member too,
+`reasons[0]` no longer claims a diagnostic-only chain for every node, and the notification says `unchanged and
+diagnostic-only` only when every member is on one (b215). The back-reference used to say diagnostic-only everywhere,
+on an XID recovery's or a reboot's record as well. A member's per-node incident is the record holding its activation, under any
 node-health label the product gives it (`NODE_HEALTH`, or the group labels `NODE_HEALTH_GROUP`/`NODE_RESOURCE_GROUP`/
 `GPU_FAULT_GROUP`, `src/gpu_fault/orchestration/families/incident_labels.py`): while a managed attempt's recovery is in
 flight (an XID 13 stop-and-restart, an XID 48 GPU reset) the attempt grouping folds the node's finding into that
@@ -3722,7 +3728,16 @@ re-pointed by ingestion at the record it routed the finding to) ties the node to
 net and the member-incident lookup all follow it. Before, only `event_type=NODE_HEALTH` records whose event id names
 the metric counted: when the node that activated first had been folded into a recovery, the peer activating after it
 never saw it, and a two-node outage of one export formed no record (or the safety net named the node `none open`)
-(b213, `tests/host_health/test_grouped_node_health_incidents.py`). The whole domain mails once
+(b213, `tests/host_health/test_grouped_node_health_incidents.py`). A node the product is rebooting (RESTART_NODE
+dispatched, the RESTORE_SCHEDULING behind it not done) has every finding absorbed into the reboot's record
+(`orchestration/reboot_window.py`: the event is linked and the marker re-pointed, the label is kept) -- a lost GPU's
+reboot is a `NODE_HEALTH` record, a fault family's own record may be `XID`. The peer look took only records the
+activation minted and grouped records, so such a node counted in its own look only: when it reported first and its peer
+after it, a two-node outage of one export formed no record, and the safety net named it `none open`. Every record with a
+workflow is now judged on the markers re-pointed at it (an activation's own `NODE_HEALTH` chain and a record without a
+workflow cost no read, every other open record one indexed read), so the same record forms whichever node reports first;
+the node counts once, the reboot keeps its plan, progress and state, and the node gets no chain of its own beside it
+(b215, `tests/host_health/test_rebooting_member_failure_domain.py`). The whole domain mails once
 (`SHARED_STORAGE_FAILURE_DOMAIN`, deduplicated
 per cluster/export/record id); a node that joins later is added to `node_ids` and `reasons` without another mail. The
 export identity comes from the collector's sample label `source` (the mountinfo mount source, e.g. `10.0.0.5:/export`,

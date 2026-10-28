@@ -21,16 +21,26 @@ This module is the additive, control-plane-only correlation on top of that:
   nodes, ``policy_reference=shared-filesystem:<identity>`` and reasons naming
   the export, the nodes and every member's per-node incident. It has no
   workflow and no action (``effective_action=None``): it is a record, the
-  per-node chains stay the authority for each node and are not changed in any
-  way (diagnostic-only, no isolation, no STOP). Every member's per-node
-  incident gets one reason line pointing back at the domain record, so a
-  later per-node notification carries the reference.
+  per-node incidents stay the authority for each node and are not changed in
+  any way (nothing is isolated or stopped for the outage). Every member's
+  per-node incident gets one reason line pointing back at the domain record,
+  so a later per-node notification carries the reference; it names that
+  incident's own handling of the node -- diagnostic-only for the chain a
+  shared-storage finding mints for itself, the recovery's action
+  (``REBOOT_NODE``, ``RESET_GPU``, ``RESTART_WORKLOAD`` ...) for a member whose
+  finding sits on another fault's record, and the record's member line and
+  the notification name that action too (b215; :func:`_handling`).
 * **Member incident.** A member's per-node incident is the one holding its
   activation, under any label the product gives it: the activation's own
-  record, or the record of a managed attempt's in-flight recovery the
-  grouping folded the finding into (under the attempt's group label and the
-  identity of the fault that minted it, possibly not even naming the node),
-  which only the finding's marker ties to the node (b213; ``_activation_nodes``).
+  record, the record of a managed attempt's in-flight recovery the grouping
+  folded the finding into (under the attempt's group label and the identity
+  of the fault that minted it, possibly not even naming the node; b213), or
+  the record of a reboot the product is running on the node, which absorbs
+  every finding of the node without re-labelling it (``NODE_HEALTH`` for a
+  lost GPU's reboot, the fault family's ``XID``; ``orchestration/
+  reboot_window.py``, b215). Only the finding's marker ties the node to the
+  last two (``_activation_nodes``); the peer look, the safety net and the
+  member-incident lookup all follow it, whichever node reports first.
 * **Window.** A domain forms when at least two nodes report the same identity
   unavailable within :data:`SHARED_STORAGE_FAILURE_DOMAIN_WINDOW_SECONDS` of
   each other (node clocks); a node whose activation comes later joins the
@@ -83,11 +93,13 @@ from gpu_fault.models import (
     AdvisoryNotification,
     FaultIncident,
     IncidentState,
+    RecoveryAction,
     bounded_reasons,
 )
 from gpu_fault.orchestration.families.identity import derived_record_id
 from gpu_fault.orchestration.families.incident_labels import (
     GROUPED_INCIDENT_EVENT_TYPES,
+    NODE_HEALTH_EVENT_TYPE,
     NODE_HEALTH_INCIDENT_EVENT_TYPES,
     routed_finding_markers,
 )
@@ -115,6 +127,17 @@ SHARED_STORAGE_FAILURE_DOMAIN_WINDOW_SECONDS = 600.0
 #: The states an open domain record can be in: DETECTED while a member still
 #: reports a fresh failure, ESCALATED once only silent members are left.
 OPEN_DOMAIN_STATES = frozenset({IncidentState.DETECTED, IncidentState.ESCALATED})
+#: The effective actions of a record that only looks at its node: a
+#: shared-storage finding's own chain is ``RUN_DIAGNOSTICS`` (FREEZE_EVIDENCE,
+#: VALIDATE_HOST). Any other action is a recovery the record runs for a fault
+#: of its own (:func:`_handling`).
+_DIAGNOSTIC_ONLY_ACTIONS = frozenset(
+    {
+        RecoveryAction.RUN_DIAGNOSTICS,
+        RecoveryAction.COLLECT_EVIDENCE,
+        RecoveryAction.VALIDATE_NODE,
+    }
+)
 #: Per-node incident states that still speak for a node when its peers are
 #: discovered; RECOVERED ones have closed and say nothing about the present.
 _OPEN_NODE_INCIDENT_STATES = frozenset(set(IncidentState) - {IncidentState.RECOVERED})
@@ -299,17 +322,20 @@ class SharedStorageFailureDomainCorrelator:
         domain = self._open_domain(cluster_id, identity, member.node_id)
         if domain is not None:
             if member.node_id not in domain.node_ids:
-                domain = self._join(domain, identity, member)
+                domain = self._join(
+                    domain, identity, member, self._member_handling(member)
+                )
             self._reference_domain(domain, identity, member)
             return domain, None
         peers = self._fresh_failing_peers(cluster_id, identity, member)
         if not peers:
             return None, None
         members = [member, *peers]
-        domain = self._create(cluster_id, identity, members)
+        handlings = {item.node_id: self._member_handling(item) for item in members}
+        domain = self._create(cluster_id, identity, members, handlings)
         for item in members:
             self._reference_domain(domain, identity, item)
-        return domain, self._notify(domain, identity, members)
+        return domain, self._notify(domain, identity, members, handlings)
 
     def _open_domain(
         self, cluster_id: str, identity: str, *node_ids: str
@@ -340,10 +366,17 @@ class SharedStorageFailureDomainCorrelator:
 
         Candidates are the nodes with an open per-node incident holding an
         activation of the metric (their VALIDATE_HOST holds while the export
-        stays unavailable; :meth:`_activation_nodes`) and the members of open
-        domain records; each candidate's latest telemetry row for the identity
+        stays unavailable, or the recovery or reboot the activation joined
+        runs; :meth:`_activation_nodes`) and the members of open domain
+        records; each candidate's latest telemetry row for the identity
         decides. A node whose reading is older than the window, or reads
-        available, is not a peer.
+        available, is not a peer. A node is one candidate however many of its
+        records hold an activation, and the look costs one indexed marker read
+        per open record that is neither a domain record nor an activation's
+        own ``NODE_HEALTH`` chain and has a workflow -- bounded by the open-
+        incident read's limit, and run only for an activation no open domain
+        record holds yet, its look after the commit, and the safety net
+        inside the window.
         """
 
         candidates: dict[str, str | None] = {}
@@ -461,7 +494,11 @@ class SharedStorageFailureDomainCorrelator:
     # --------------------------------------------------------------- records
 
     def _create(
-        self, cluster_id: str, identity: str, members: Sequence[_Member]
+        self,
+        cluster_id: str,
+        identity: str,
+        members: Sequence[_Member],
+        handlings: Mapping[str, str | None],
     ) -> FaultIncident:
         nodes = sorted({member.node_id for member in members})
         incident_ids = sorted(
@@ -482,9 +519,13 @@ class SharedStorageFailureDomainCorrelator:
         reasons = [
             f"common failure domain: shared filesystem {identity} unavailable on "
             f"{len(nodes)} nodes ({', '.join(nodes)}); a shared-storage outage, "
-            "not a per-node hardware fault: every node keeps its own "
-            "diagnostic-only chain, no node is isolated or stopped for it",
-            *(self._member_line(member) for member in sorted(members, key=_node)),
+            "not a per-node hardware fault: no node is isolated or stopped for "
+            "it, every node keeps its own incident's handling (diagnostic-only "
+            "unless its member line names an action)",
+            *(
+                self._member_line(member, handlings.get(member.node_id))
+                for member in sorted(members, key=_node)
+            ),
         ]
         incident = FaultIncident(
             incident_id=incident_id,
@@ -513,7 +554,11 @@ class SharedStorageFailureDomainCorrelator:
         return incident
 
     def _join(
-        self, domain: FaultIncident, identity: str, member: _Member
+        self,
+        domain: FaultIncident,
+        identity: str,
+        member: _Member,
+        handling: str | None,
     ) -> FaultIncident:
         def update(current: FaultIncident) -> FaultIncident | None:
             if member.node_id in current.node_ids:
@@ -527,7 +572,7 @@ class SharedStorageFailureDomainCorrelator:
                             f"{member.node_id} joined: shared filesystem {identity} "
                             f"unavailable there as well at "
                             f"{member.observed_at.isoformat()}",
-                            self._member_line(member),
+                            self._member_line(member, handling),
                         ]
                     ),
                     "updated_at": datetime.now(timezone.utc),
@@ -539,7 +584,14 @@ class SharedStorageFailureDomainCorrelator:
     def _reference_domain(
         self, domain: FaultIncident, identity: str, member: _Member
     ) -> None:
-        """One reason line on the member's per-node incident, pointing back."""
+        """One reason line on the member's per-node incident, pointing back.
+
+        The line says what stays unchanged in the words of the record it sits
+        on (:func:`_handling`): a shared-storage finding's own chain is
+        diagnostic-only, a record the finding was folded into or absorbed by
+        keeps its own recovery -- an attempt's XID 13 restart, an XID 48 reset,
+        the reboot of a lost GPU (b215).
+        """
 
         if member.incident_id is None:
             return
@@ -552,6 +604,7 @@ class SharedStorageFailureDomainCorrelator:
         def update(current: FaultIncident) -> FaultIncident | None:
             if any(reason.startswith(prefix) for reason in current.reasons):
                 return None
+            unchanged = _unchanged_handling(_handling(current))
             return current.model_copy(
                 update={
                     "reasons": bounded_reasons(
@@ -559,8 +612,7 @@ class SharedStorageFailureDomainCorrelator:
                             *current.reasons,
                             f"{prefix} shared filesystem {identity} is unavailable "
                             f"on {', '.join(others) or 'other nodes'} as well "
-                            "(shared-storage outage, not a node fault); the "
-                            "diagnostic-only handling of this node is unchanged",
+                            f"(shared-storage outage, not a node fault); {unchanged}",
                         ]
                     ),
                     "updated_at": datetime.now(timezone.utc),
@@ -620,7 +672,11 @@ class SharedStorageFailureDomainCorrelator:
         return None
 
     def _notify(
-        self, domain: FaultIncident, identity: str, members: Sequence[_Member]
+        self,
+        domain: FaultIncident,
+        identity: str,
+        members: Sequence[_Member],
+        handlings: Mapping[str, str | None],
     ) -> str | None:
         nodes = sorted({member.node_id for member in members})
         scope = hashlib.sha256(
@@ -628,6 +684,28 @@ class SharedStorageFailureDomainCorrelator:
         ).hexdigest()
         incident_ids = sorted(
             {member.incident_id for member in members if member.incident_id}
+        )
+        # A member whose finding sits on another fault's record (an attempt's
+        # recovery, a reboot) is not on a diagnostic chain of its own: the
+        # mail names that record's action instead of claiming "diagnostic-only"
+        # for every node (b215).
+        recovering = any(handlings.get(node) is not None for node in nodes)
+        node_handling = (
+            "Node handling: unchanged; no node is isolated, cordoned or stopped "
+            "for this outage. A node's own shared-storage incident is "
+            "diagnostic-only (FREEZE_EVIDENCE, VALIDATE_HOST); a node listed "
+            "with an action keeps that incident's own recovery, which this "
+            "outage does not change.\n"
+            if recovering
+            else "Node handling: unchanged and diagnostic-only (FREEZE_EVIDENCE, "
+            "VALIDATE_HOST); no node is isolated, cordoned or stopped for "
+            "this.\n"
+        )
+        nodes_assessment = (
+            "the outage is not a hardware fault of the nodes (a node listed "
+            "with an action is in a recovery of its own for another fault)."
+            if recovering
+            else "the nodes are not suspected hardware faults."
         )
         candidate = AdvisoryNotification(
             deduplication_key=f"shared-storage-failure-domain/{scope}",
@@ -645,23 +723,21 @@ class SharedStorageFailureDomainCorrelator:
                 "Per-node incidents:\n"
                 + "".join(
                     f"  {member.node_id}: {member.incident_id or 'no open incident'}"
-                    f" (mount {member.device or 'n/a'})\n"
+                    f" (mount {member.device or 'n/a'}"
+                    f"{_handling_suffix(handlings.get(member.node_id))})\n"
                     for member in sorted(members, key=_node)
                 )
                 + "Assessment: the same export is unavailable on several nodes "
                 "at once -- a shared-storage outage (common failure domain), not "
                 "a fault of each node.\n"
-                "Node handling: unchanged and diagnostic-only (FREEZE_EVIDENCE, "
-                "VALIDATE_HOST); no node is isolated, cordoned or stopped for "
-                "this.\n"
-                "The record clears by itself once every member reports the "
+                + node_handling
+                + "The record clears by itself once every member reports the "
                 "export available again."
             ),
             support_case_draft=(
                 f"Shared filesystem {identity} is unavailable on {len(nodes)} "
                 f"nodes ({', '.join(nodes)}) in {domain.cluster_id}. Check the "
-                "file server / export and the network path to it; the nodes are "
-                "not suspected hardware faults."
+                "file server / export and the network path to it; " + nodes_assessment
             ),
             evidence_refs=incident_ids,
             category=SHARED_STORAGE_FAILURE_DOMAIN_NOTIFICATION_CATEGORY,
@@ -712,9 +788,12 @@ class SharedStorageFailureDomainCorrelator:
     ) -> str | None:
         """The open incident holding ``node_id``'s activation on ``device``.
 
-        Among the incidents naming the node first; then the grouped records
-        that do not: a record-only fold into an attempt's recovery leaves the
-        record's node scope alone, so only the activation's marker names it.
+        Among the incidents naming the node first -- the activation's own
+        record, a recovery it was folded into, the reboot of the node it was
+        absorbed by (the reboot's record always names the node it reboots);
+        then the grouped records that do not: a record-only fold into an
+        attempt's recovery leaves the record's node scope alone, so only the
+        activation's marker names it.
         """
 
         suffix = f"-{SHARED_FILESYSTEM_METRIC}-{event_id_component(device or 'node')}"
@@ -751,12 +830,26 @@ class SharedStorageFailureDomainCorrelator:
         and the identity of the fault that minted it, and a record-only fold
         does not even add the node: the activation's marker, which ingestion
         re-points at the record it routed the finding to, is what names the
-        node. A ``NODE_HEALTH`` record holds only its own finding.
+        node. A record of any label may hold one the product only *linked* to
+        it: a node the product is rebooting has every finding absorbed into
+        the reboot's record, which keeps its label and identity
+        (``orchestration/reboot_window.py``) -- a lost GPU's ``NODE_HEALTH``
+        reboot, an ``XID`` record -- so the marker is what names the
+        activation there too (b215). A ``NODE_HEALTH`` record an activation
+        minted holds only its own finding: its diagnostic-only chain never
+        reboots a node. Neither it, nor a record without a workflow (which
+        never owned a reboot), costs a marker read.
         """
 
-        if incident.event_type not in NODE_HEALTH_INCIDENT_EVENT_TYPES:
+        if is_shared_storage_failure_domain(incident):
             return []
-        if incident.event_type in GROUPED_INCIDENT_EVENT_TYPES:
+        minted = _names_activation(incident.event_id, suffix)
+        if minted and incident.event_type == NODE_HEALTH_EVENT_TYPE:
+            return list(incident.node_ids)
+        if (
+            incident.event_type in GROUPED_INCIDENT_EVENT_TYPES
+            or incident.workflow_request_id
+        ):
             held = {
                 node_id
                 for marker in routed_finding_markers(self.store, incident)
@@ -765,7 +858,7 @@ class SharedStorageFailureDomainCorrelator:
             }
             if held:
                 return sorted(held)
-        if _names_activation(incident.event_id, suffix):
+        if minted and incident.event_type in NODE_HEALTH_INCIDENT_EVENT_TYPES:
             return list(incident.node_ids)
         return []
 
@@ -779,13 +872,63 @@ class SharedStorageFailureDomainCorrelator:
     def _fresh(self, observed_at: datetime, reference: datetime) -> bool:
         return observed_at >= reference - self.window
 
+    def _member_handling(self, member: _Member) -> str | None:
+        """:func:`_handling` of the record holding ``member``'s activation."""
+
+        if member.incident_id is None:
+            return None
+        incident = self._incident(member.incident_id)
+        return None if incident is None else _handling(incident)
+
     @staticmethod
-    def _member_line(member: _Member) -> str:
+    def _member_line(member: _Member, handling: str | None) -> str:
+        noted = (
+            ""
+            if handling is None
+            else f"; that incident's handling: {handling or 'its own'}"
+        )
         return (
             f"member {member.node_id}: incident "
             f"{member.incident_id or 'none open'} ({SHARED_FILESYSTEM_METRIC} on "
-            f"{member.device or 'n/a'}, observed {member.observed_at.isoformat()})"
+            f"{member.device or 'n/a'}, observed {member.observed_at.isoformat()}"
+            f"{noted})"
         )
+
+
+def _handling(incident: FaultIncident) -> str | None:
+    """What ``incident`` does about its node, when that is more than a look.
+
+    ``None`` for a diagnostic-only record -- the FREEZE_EVIDENCE, VALIDATE_HOST
+    chain a shared-storage finding mints for itself (``RUN_DIAGNOSTICS``), or
+    any other record whose effective action only observes the node. Else the
+    record's effective action -- the recovery of the fault the finding was
+    folded into or absorbed by: ``RESTART_WORKLOAD`` (an attempt's XID 13),
+    ``RESET_GPU`` (XID 48), ``REBOOT_NODE`` (XID 79, a lost GPU) -- or, for a
+    record with none, its official action; ``""`` when it names neither.
+    """
+
+    action = incident.effective_action
+    if action in _DIAGNOSTIC_ONLY_ACTIONS:
+        return None
+    if action is not None and action is not RecoveryAction.NO_ACTION:
+        return action.value
+    return incident.official_action or ""
+
+
+def _unchanged_handling(handling: str | None) -> str:
+    """The back-reference's closing clause for :func:`_handling`."""
+
+    if handling is None:
+        return "the diagnostic-only handling of this node is unchanged"
+    if handling:
+        return f"this incident's {handling} handling of this node is unchanged"
+    return "this incident's handling of this node is unchanged"
+
+
+def _handling_suffix(handling: str | None) -> str:
+    """The notification's per-node note for :func:`_handling`."""
+
+    return "" if handling is None else f"; {handling or 'its own handling'}"
 
 
 def _names_activation(identifier: str, suffix: str | None) -> bool:

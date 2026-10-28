@@ -40,8 +40,10 @@ GPU_FAULT_GROUP_EVENT_TYPE = "GPU_FAULT_GROUP"
 #: A finding ingestion only links to a record without re-labelling it (a
 #: same-signal host-resource re-arm, a transient inventory finding a running
 #: chain covers, a finding of a node the product is rebooting --
-#: ``orchestration/reboot_window.py``) is that record's evidence; readers that
-#: follow folded findings look at grouped records only.
+#: ``orchestration/reboot_window.py``) is that record's evidence under the
+#: record's own label, whichever it is; a reader that must follow such a
+#: finding too reads the record's markers whatever its label (the
+#: shared-storage failure domain follows a reboot's, b215).
 GROUPED_INCIDENT_EVENT_TYPES = frozenset(
     {
         NODE_HEALTH_GROUP_EVENT_TYPE,
