@@ -10345,7 +10345,12 @@ summaries. Low memory, high page cache and
 high local disk usage do not require a training job. The event action is fixed as `RUN_DIAGNOSTICS`, and neither node nor job is restarted automatically;
 the administrator email uses the `host-resource-event-zh-v1` fixed template. Findings of several GPUs of the same node in the same HostTelemetry batch
 are aggregated into one email, deduplicated by cluster, workload, node, signal and
-cooldown window; findings and evidence are still kept per device, without mass-sending per GPU.
+cooldown window; findings and evidence are still kept per device, without mass-sending per GPU. While a managed attempt's
+recovery is in flight (an XID 13/48/79, say) or the product is rebooting the node, the finding joins that recovery's or
+reboot's incident instead of opening its own; the email still goes out once, its `Incident` is the record it joined
+(`inc-xid-13`, for example) and its `Workflow steps` are that record's (a recovery it joined has the signal's
+`FREEZE_EVIDENCE`/`VALIDATE_HOST` appended; a reboot keeps its plan). The same node's signal re-arming on that incident mails
+nothing, nor does it while the signal's own incident on the node is still unsettled, as on its own incident.
 
 Verify the Host Collector's raw reports:
 

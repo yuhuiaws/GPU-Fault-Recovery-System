@@ -3687,6 +3687,27 @@ it is counted in `gpu_fault_workflow_merge_record_only_total{reason="unsettled_h
 Different metrics and different nodes still each open their own; once the incident is `RECOVERED` (administrator has closed it) or
 `QUARANTINED`, the next finding opens a new one as usual.
 
+A finding the product routes into **an incident another fault opened** is mailed the same way (b215): while a managed
+attempt's recovery is in flight (an XID 13 stop-and-restart, an XID 48 GPU reset, an XID 79 reboot) the attempt grouping
+folds the finding into that recovery's `GPU_FAULT_GROUP` record (under the XID's event id and policy source), and the
+recovery's plan takes on the finding's own `FREEZE_EVIDENCE` + `VALIDATE_HOST` -- one more gate on the recovery; on a node
+the product is rebooting the reboot's record absorbs the finding (`orchestration/reboot_window.py`). The mail used to go
+out only when the finding minted its own incident (`app/ingest/node_health.py` took only
+`incident.event_id == finding.event_id`), so neither case mailed anything, while the XID's own mail went out before the
+fold and speaks of the XID alone: the administrator could find the signal only in the incident's reasons. The rule now:
+one mail per incident, node and signal -- a finding that mints (or re-posts) its incident is mailed as before, and one that
+lands on another incident is mailed too, its Incident/Workflow fields naming the record it joined and that record's steps
+(a recovery's with the finding's `VALIDATE_HOST`, a reboot's unchanged). The administrator counts as told, and nothing is
+mailed, when an earlier finding of the same node and signal (not of this batch) already reached that incident (a re-arm
+on it), or when the incident the signal opened on this node is still unsettled (`ACTION_PENDING`/`ESCALATED`; the reboot
+window takes a finding before the same-signal absorb does) -- as a re-arm on the signal's own incident never mailed. The
+judgement reads the finding markers ingestion re-pointed at the incident (`marker-<event id>`, which keep each finding's
+node, source and signal whatever the record's label, identity or policy source became) and the node's unsettled
+incidents; the incident the signal minted on this node is judged without a read, any other (folded or absorbed findings
+only) with two indexed reads. The GPUs of one node in one batch still share one mail, the deduplication key and cooldown
+are unchanged (cluster/node/metric/workloads/signal/cooldown bucket), and GF-REGIONAL-NOTIFY-005 still counts per node
+(`tests/host_health/test_folded_host_resource_mail.py`).
+
 ### 2.20 EFA/RDMA Traffic Anomaly and Training Hang Detection
 
 The input of this section is the EFA hardware counter; the output has three tiers: ordinary traffic anomaly (send mail, do not touch the machine),

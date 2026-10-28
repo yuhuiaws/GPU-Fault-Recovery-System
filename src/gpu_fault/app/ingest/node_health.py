@@ -1,14 +1,26 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
+from typing import Any
 
 from gpu_fault.host_health import (
     NodeHealthCategory,
     NodeHealthFinding,
     NodeHealthIngestionResult,
 )
-from gpu_fault.models import AdvisoryNotification, RecoveryAction
+from gpu_fault.models import AdvisoryNotification, FaultIncident, RecoveryAction
+from gpu_fault.orchestration.families.health import (
+    HOST_RESOURCE_POLICY_SOURCE,
+    UNSETTLED_INCIDENT_STATES,
+    host_resource_signal,
+    host_resource_signal_event,
+    incident_opened_by_host_resource_signal,
+)
+from gpu_fault.orchestration.families.incident_labels import (
+    finding_marker_id,
+    routed_finding_markers,
+)
 from gpu_fault.shared_storage_failure_domain import SHARED_FILESYSTEM_METRIC
 
 #: Findings that exist to put a human in the loop rather than to drive a
@@ -73,6 +85,81 @@ def operator_review_notification(
         evidence_refs=[finding.evidence_ref] if finding.evidence_ref else [],
         category="OPERATOR_REVIEW",
         priority=100,
+    )
+
+
+#: The sustained host-resource signals whose mail is the fixed
+#: ``host-resource-event-zh-v1`` (``preview_host_resource_event``).
+HOST_RESOURCE_MAIL_METRICS = frozenset(
+    {
+        "training_rank_cpu_percent",
+        "host_gpu_utilization_percent",
+        "memory_available_percent",
+        "page_cache_percent",
+        "local_filesystem_used_percent",
+    }
+)
+
+
+def host_resource_signal_reported(
+    store: Any,
+    incident: FaultIncident,
+    finding: NodeHealthFinding,
+    batch_markers: Collection[str],
+) -> bool:
+    """Whether the operator has heard of ``finding``'s signal on its node.
+
+    For a finding that did not mint ``incident`` (the caller mails one that
+    did). The host-resource mail is per incident, node and signal, so the
+    operator has heard of it when an earlier finding of the same node and
+    signal -- not one of this batch, ``batch_markers`` -- reached the same
+    incident: the incident that signal minted on the node (the health family
+    absorbs a re-arm into it while it is unsettled, ``families/health.py``)
+    or one an earlier finding of it was folded into and mailed for; or when
+    the incident that signal minted on the node is still unsettled
+    (ACTION_PENDING / ESCALATED, an operator owns it) -- the reboot window
+    takes a finding before that absorb does. A finding the product routed
+    into an incident another fault opened has not been heard of otherwise:
+    the attempt grouping folds it into a managed attempt's in-flight
+    recovery (whose plan takes on the finding's own FREEZE_EVIDENCE +
+    VALIDATE_HOST), the reboot window absorbs it into the reboot of its node
+    (``orchestration/reboot_window.py``) -- and that incident's own mail, if
+    any, went out before and names its own fault (b215).
+
+    The incident a signal minted on this node alone answers without a read;
+    any other is judged on the markers ingestion re-pointed at it, which
+    keep each finding's node, source and signal whatever the incident's
+    label, identity or policy source became (``incident_labels``), and on
+    the node's unsettled incidents (two indexed reads, folded findings only).
+    """
+
+    signal = host_resource_signal(finding)
+    if signal is None:
+        return False
+    metric_name, rule_id = signal
+
+    def minted_here(candidate: FaultIncident) -> bool:
+        return candidate.node_ids == [finding.node_id] and (
+            incident_opened_by_host_resource_signal(candidate, metric_name, rule_id)
+        )
+
+    if minted_here(incident):
+        return True
+    if any(
+        marker.marker_id not in batch_markers
+        and marker.event_source == HOST_RESOURCE_POLICY_SOURCE
+        and finding.node_id in marker.scope.node_ids
+        and host_resource_signal_event(marker.marker_id, metric_name, rule_id)
+        for marker in routed_finding_markers(store, incident)
+    ):
+        return True
+    return any(
+        minted_here(candidate)
+        for candidate in store.list_incidents_by_state(
+            finding.cluster_id,
+            UNSETTLED_INCIDENT_STATES,
+            node_ids={finding.node_id},
+        )
     )
 
 
@@ -141,15 +228,8 @@ class NodeHealthIngestionService:
                 self.context.advisory_notifications.send(notification.notification_id)
                 notifications.append(notification.notification_id)
             elif (
-                finding.metric_name
-                in {
-                    "training_rank_cpu_percent",
-                    "host_gpu_utilization_percent",
-                    "memory_available_percent",
-                    "page_cache_percent",
-                    "local_filesystem_used_percent",
-                }
-                and finding.policy_source == "SITE_HOST_RESOURCE_HEALTH"
+                finding.metric_name in HOST_RESOURCE_MAIL_METRICS
+                and finding.policy_source == HOST_RESOURCE_POLICY_SOURCE
             ):
                 group_key = (
                     finding.cluster_id,
@@ -157,13 +237,8 @@ class NodeHealthIngestionService:
                     finding.metric_name,
                     tuple(sorted(finding.affected_workload_ids)),
                 )
-                # ``opened``: this finding minted (or re-posted) the incident
-                # it came back with. A finding the health family absorbed into
-                # an unsettled same-signal incident comes back with that
-                # incident's event id instead.
-                opened = incident.event_id == finding.event_id
                 host_resource_notification_groups.setdefault(group_key, []).append(
-                    (incident, finding, opened)
+                    (incident, finding)
                 )
             elif (
                 finding.category is NodeHealthCategory.RDMA
@@ -176,19 +251,33 @@ class NodeHealthIngestionService:
                 )
                 self.context.advisory_notifications.send(notification.notification_id)
                 notifications.append(notification.notification_id)
+        batch_markers = {finding_marker_id(finding.event_id) for finding in findings}
         for grouped in host_resource_notification_groups.values():
-            opened_entries = [entry for entry in grouped if entry[2]]
-            if not opened_entries:
-                # Every device finding in this group was recorded on an
-                # incident that is still ESCALATED / ACTION_PENDING for the
-                # same signal: the operator was mailed when it opened and
-                # nothing new has been decided since, so a re-arm mails
-                # nothing. Notifications are per incident, not per finding
-                # (GF-REGIONAL-NOTIFY-005 counts per node, not per GPU).
+            # A finding that minted (or re-posted) its incident is what the
+            # mail is for; one routed into an incident the operator has not
+            # heard of this signal on -- another fault's recovery, the reboot
+            # of its node -- is mailed the same way, naming that incident. A
+            # re-arm on an incident the signal already reached (still
+            # ESCALATED / ACTION_PENDING for it) mails nothing: nothing new
+            # has been decided since. Notifications are per incident, node and
+            # signal, not per finding (GF-REGIONAL-NOTIFY-005 counts per node,
+            # not per GPU).
+            heard: dict[str, bool] = {}
+            mailed = []
+            for incident, finding in grouped:
+                if incident.event_id != finding.event_id:
+                    if incident.incident_id not in heard:
+                        heard[incident.incident_id] = host_resource_signal_reported(
+                            self.context.store, incident, finding, batch_markers
+                        )
+                    if heard[incident.incident_id]:
+                        continue
+                mailed.append((incident, finding))
+            if not mailed:
                 continue
-            incident, representative, _ = opened_entries[0]
+            incident, representative = mailed[0]
             devices = sorted(
-                {finding.device for _, finding, _ in grouped if finding.device}
+                {finding.device for _, finding in grouped if finding.device}
             )
             aggregate = representative.model_copy(
                 update={

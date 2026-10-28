@@ -104,18 +104,30 @@ def incident_opened_by_host_resource_signal(
     """Whether ``incident`` was minted by a sustained host-resource finding of
     ``metric_name`` + ``rule_id``, on any device.
 
-    The incident does not carry the signal; its ``event_id`` is the finding's,
-    ``<batch>-<metric_name>-<device|node>-<rule_id lower>``. Batch ids and
-    devices may themselves contain hyphens, so the match is "ends with the
-    rule" and "names the metric before it" rather than a positional split.
+    The incident does not carry the signal; its ``event_id`` is the finding's
+    (:func:`host_resource_signal_event`).
     """
 
     if incident.policy_source != HOST_RESOURCE_POLICY_SOURCE:
         return False
+    return host_resource_signal_event(incident.event_id, metric_name, rule_id)
+
+
+def host_resource_signal_event(identifier: str, metric_name: str, rule_id: str) -> bool:
+    """Whether ``identifier`` -- a finding's event id, or its marker's
+    ``marker-<event id>`` -- is a sustained host-resource finding of
+    ``metric_name`` + ``rule_id``, on any device.
+
+    The event id is ``<batch>-<metric_name>-<device|node>-<rule_id lower>``.
+    Batch ids and devices may themselves contain hyphens, so the match is
+    "ends with the rule" and "names the metric before it" rather than a
+    positional split.
+    """
+
     suffix = f"-{rule_id.lower()}"
-    if not incident.event_id.endswith(suffix):
+    if not identifier.endswith(suffix):
         return False
-    return f"-{metric_name}-" in incident.event_id[: -len(suffix)]
+    return f"-{metric_name}-" in identifier[: -len(suffix)]
 
 
 @dataclass(frozen=True)
