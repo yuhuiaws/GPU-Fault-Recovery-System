@@ -8743,7 +8743,16 @@ an empty list, missing fields, duplicate roles or incomplete Pod status cannot p
   2. To fill the queue within a controllable time, **on a separate verification control plane**
      (not the production three replicas) lower `MAX_CLUSTER_QUEUE_DEPTH` to `20`,
      keeping `MAX_QUEUE_DEPTH` at a large value.
-  3. From data plane A continuously report host telemetry events at 50 QPS for 60 seconds.
+  3. From data plane A continuously report host telemetry events for 60 seconds, starting at
+     50 QPS: after every second in which A received no 429 (and A's queue depth was never seen
+     above the cap plus slack) the runner raises the next second's rate by 1.5x (at most 400 QPS);
+     once A is rejected the rate holds. A fixed 50 QPS fills A's queue only while the single-worker
+     processor drains A more slowly than 50 QPS; a faster processor keeps A's queue about 2 deep,
+     the case could then pass only on scattered start-up 429s and failed without them. The adaptive
+     rate keeps A's offered load above what the release drains for A while staying within one
+     growth step of that knee, so B is measured against a continuously saturated A. Each second's
+     rate, request count and observed A rejections are recorded under `a_storm` in `summary.json`;
+     the total `a_requests` is what A's request accounting is checked against.
   4. Meanwhile report the same kind of events from data plane B at 1 QPS.
   5. Collect from `/metrics`
      `gpu_fault_processor_cluster_queue_depth{cluster_id=...}`
@@ -8754,6 +8763,7 @@ an empty list, missing fields, duplicate roles or incomplete Pod status cannot p
      and cannot be used to attribute A/B.
 - Verdict:
   - A starts receiving `HTTP 429` and the responses carry a `Retry-After` header;
+  - every A request has an outcome (202 or 429) and their number equals the adaptive schedule's `a_requests`;
   - B's requests **all succeed** (no 429; during the storm B's p95 latency does not exceed
     `--b-latency-factor` times B's standalone pre-storm baseline p95, default `2.0`);
   - the global `queue_depth` does not reach its limit;

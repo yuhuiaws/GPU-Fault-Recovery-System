@@ -115,6 +115,11 @@ def test_storm_case_accounts_for_both_streams_and_keeps_failed_verdict(
     value = model(failure)
     value.clock.sleep_scale = 60 if failure == "drain" else 1
     sent = []
+    # The modelled probe drains 100 A rows a second: A's storm is accepted
+    # at 50 and 75 QPS, rejected beyond the 100th request of every second at
+    # 112.5 QPS, and holds that rate for the rest of the minute.
+    per_second: Counter[int] = Counter()
+    origin: list[float] = []
 
     def send(
         _harness: Any,
@@ -125,7 +130,13 @@ def test_storm_case_accounts_for_both_streams_and_keeps_failed_verdict(
         scheduled: float,
     ) -> dict[str, Any]:
         sent.append((phase, cluster, sequence, scheduled))
-        rejected = cluster == 0 and sequence >= 1000
+        if phase == "storm" and not origin:
+            origin.append(scheduled)
+        rejected = False
+        if phase == "storm" and cluster == 0:
+            second = int(scheduled - origin[0] + 1e-9)
+            per_second[second] += 1
+            rejected = per_second[second] > 100
         return {
             "phase": phase,
             "cluster": cluster,
@@ -153,16 +164,29 @@ def test_storm_case_accounts_for_both_streams_and_keeps_failed_verdict(
         assert result["status"] == "PASS"
     summary = json.loads((tmp_path / "CAP-001/summary.json").read_text())
     assert summary["status"] == ("FAIL" if failure else "PASS")
-    assert summary["a_status_counts"] == {"202": 1000, "429": 2000}
+    held = cases.CAP001_STORM_SECONDS - 2
+    assert summary["a_requests"] == 50 + 75 + 112 * held
+    assert summary["a_status_counts"] == {"202": 50 + 75 + 100 * held, "429": 12 * held}
+    storm_record = summary["a_storm"]
+    assert [item["rate_qps"] for item in storm_record["seconds"]] == [50, 75] + [
+        112.5
+    ] * held, "A's rate grows until A is rejected and then holds"
+    assert storm_record["first_rejecting_second"] == 2
+    assert storm_record["final_qps"] == 112.5
     assert summary["b_status_counts"] == {"202": 60}
     assert summary["b_baseline_status_counts"] == {"202": 15}
     assert summary["queue_drained"] is (failure != "drain")
     assert summary["b_p95_degradation_ratio"] == (None if failure == "latency" else 1.5)
     assert Counter((phase, cluster) for phase, cluster, *_rest in sent) == {
         ("baseline", 1): 15,
-        ("storm", 0): 3000,
+        ("storm", 0): summary["a_requests"],
         ("storm", 1): 60,
     }
+    assert sorted(
+        sequence
+        for phase, cluster, sequence, _ in sent
+        if (phase, cluster) == ("storm", 0)
+    ) == list(range(summary["a_requests"])), "every A request has its own sequence"
     assert [
         sequence
         for phase, _cluster, sequence, _scheduled in sent

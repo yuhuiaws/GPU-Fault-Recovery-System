@@ -8,15 +8,18 @@ AWS call with a script and records the order in which evidence is written.
 from __future__ import annotations
 
 import json
+import math
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 
 from scripts.e2e.regional import capacity_acceptance_base as base
 from scripts.e2e.regional import capacity_acceptance_cases as cases
+from tests.regional._cov95_cap_cases import Clock, InlinePool
 
 
 # --------------------------------------------------------------------------- #
@@ -24,6 +27,7 @@ from scripts.e2e.regional import capacity_acceptance_cases as cases
 # --------------------------------------------------------------------------- #
 def _cap001_result(**overrides: Any) -> dict[str, Any]:
     result: dict[str, Any] = {
+        "a_requests": 3000,
         "a_status_counts": {202: 1000, 429: 2000},
         "a_retry_after_values": ["2"],
         "b_baseline_status_counts": {202: cases.CAP001_BASELINE_REQUESTS},
@@ -82,6 +86,102 @@ def test_cap001_queue_depth_bound_is_the_a_cap_plus_slack() -> None:
     )
     failures = cases.cap001_failures(result)
     assert any(f"bound {bound}" in item for item in failures), failures
+
+
+def _run_storm(
+    monkeypatch: pytest.MonkeyPatch,
+    capacity: Callable[[int], float],
+    *,
+    a_depth: float = 0.0,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[tuple[Any, ...]]]:
+    """``cap001_storm`` against a probe that admits ``capacity(second)`` A rows."""
+
+    clock = Clock()
+    monkeypatch.setattr(cases, "time", clock)
+    sent: list[tuple[Any, ...]] = []
+    admitted: Counter[int] = Counter()
+    wall_start = clock.perf_counter()
+
+    def send(phase: str, cluster: int, sequence: int, scheduled: float) -> Any:
+        sent.append((phase, cluster, sequence, scheduled))
+        second = int(scheduled - wall_start + 1e-9)
+        status = 202
+        if cluster == 0:
+            admitted[second] += 1
+            status = 429 if admitted[second] > capacity(second) else 202
+        return {"phase": phase, "cluster": cluster, "status": status}
+
+    responses, schedule = cases.cap001_storm(
+        send, InlinePool(), InlinePool(), wall_start, {"a_depth": a_depth}
+    )
+    return responses, schedule, sent
+
+
+def test_cap001_storm_outgrows_the_drain_rate_and_then_holds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 50 QPS no longer fills the queue of a probe that drains 100 rows a
+    # second; the storm finds the knee and stays one growth step above it.
+    responses, schedule, sent = _run_storm(monkeypatch, lambda _second: 100)
+    rates = [item["rate_qps"] for item in schedule]
+    assert rates == [50.0, 75.0] + [112.5] * 58, rates
+    assert [item["requests"] for item in schedule] == [50, 75] + [112] * 58
+    assert [item["a_rejections_seen"] for item in schedule] == [0, 0] + [12] * 58
+    a_sends = [item for item in sent if item[1] == 0]
+    assert len(responses) == len(sent) == len(a_sends) + 60
+    assert [item[2] for item in a_sends] == list(range(len(a_sends))), (
+        "every A request keeps its own sequence"
+    )
+    offset = 0
+    for second, item in enumerate(schedule):
+        count = item["requests"]
+        times = [entry[3] - a_sends[0][3] for entry in a_sends[offset : offset + count]]
+        offset += count
+        assert [round(value, 9) for value in times] == [
+            round(second + index / count, 9) for index in range(count)
+        ], f"second {second} is paced evenly inside its own second"
+    b_times = [item[3] for item in sent if item[1] == 1]
+    assert [round(b - a, 9) for a, b in zip(b_times, b_times[1:])] == [1.0] * 59, (
+        "B keeps one request a second"
+    )
+    summary = cases.cap001_storm_summary(schedule)
+    assert summary["a_requests"] == len(a_sends) == 50 + 75 + 112 * 58
+    assert summary["a_storm"]["first_rejecting_second"] == 2
+    assert summary["a_storm"]["final_qps"] == 112.5
+
+
+def test_cap001_storm_grows_again_after_a_rejection_free_second(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A stall that rejects A in the first second holds 50 QPS only until a
+    # second passes without a 429; the storm keeps A saturated afterwards.
+    _, schedule, _ = _run_storm(monkeypatch, lambda second: 40 if second == 0 else 100)
+    rates = [item["rate_qps"] for item in schedule]
+    assert rates[:4] == [50.0, 50.0, 75.0, 112.5], rates
+    assert set(rates[3:]) == {112.5}, rates
+
+
+def test_cap001_storm_rate_is_capped(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, schedule, _ = _run_storm(monkeypatch, lambda _second: math.inf)
+    rates = [item["rate_qps"] for item in schedule]
+    assert max(rates) == cases.CAP001_A_MAX_QPS == rates[-1], rates
+    assert rates[:7] == [50.0, 75.0, 112.5, 168.75, 253.125, 379.6875, 400.0]
+    summary = cases.cap001_storm_summary(schedule)
+    assert summary["a_storm"]["first_rejecting_second"] is None, (
+        "an A that is never rejected is recorded as such"
+    )
+
+
+def test_cap001_storm_stops_growing_once_a_overran_its_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A queue already seen above cap + slack means admission is not holding
+    # the cap; more load would only bury the probe, so the rate stays put.
+    bound = cases.CAP001_A_QUEUE_CAP + cases.CAP001_QUEUE_SLACK
+    _, schedule, _ = _run_storm(
+        monkeypatch, lambda _second: math.inf, a_depth=bound + 1
+    )
+    assert {item["rate_qps"] for item in schedule} == {cases.CAP001_A_START_QPS}
 
 
 # --------------------------------------------------------------------------- #

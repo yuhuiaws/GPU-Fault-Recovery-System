@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Executor, ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from functools import partial
 import math
 import threading
 import time
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import httpx
 
@@ -35,7 +35,15 @@ from scripts.e2e.regional.capacity_scrape_companion import ScrapeCompanion
 CAP001_A_QUEUE_CAP = 20
 CAP001_QUEUE_SLACK = 5
 CAP001_BASELINE_REQUESTS = 15
+CAP001_STORM_SECONDS = 60
 CAP001_STORM_B_REQUESTS = 60
+# Cluster A's storm rate (cap001_storm): the specification's 50 QPS to start
+# with, raised by half after every second in which A saw no 429, never above
+# 400 QPS. The next second's sends are queued this long before it starts.
+CAP001_A_START_QPS = 50.0
+CAP001_A_RATE_GROWTH = 1.5
+CAP001_A_MAX_QPS = 400.0
+CAP001_A_DECISION_LEAD_SECONDS = 0.05
 # The storm client keeps every connection alive for the whole minute and
 # retires idle ones itself, before the probe's uvicorn does (its keep-alive is
 # 5 s): a request racing the server's close is reset inside the Pod, and one
@@ -121,7 +129,8 @@ def cap001_failures(result: Mapping[str, Any]) -> list[str]:
         failures.append("cluster B was not accepted end to end during the storm")
     if any(type(status) is not int or status not in {202, 429} for status in a_status):
         failures.append("cluster A saw an unexpected HTTP or transport status")
-    if sum(a_status.values()) != 3000:
+    planned = result.get("a_requests")
+    if type(planned) is not int or planned <= 0 or sum(a_status.values()) != planned:
         failures.append("cluster A request accounting is incomplete")
     if baseline_p95 is None or storm_p95 is None:
         failures.append("cluster B latency percentiles are missing")
@@ -158,6 +167,89 @@ def cap001_failures(result: Mapping[str, Any]) -> list[str]:
     if result["queue_drained"] is not True:
         failures.append("the processor queue did not drain")
     return failures
+
+
+def cap001_storm(
+    send: Callable[..., dict[str, Any]],
+    a_pool: Executor,
+    b_pool: Executor,
+    wall_start: float,
+    maxima: Mapping[str, float],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Cluster A's storm and B's 1 QPS stream: (responses, A's per-second schedule).
+
+    A fixed 50 QPS only fills A's queue while the probe's single processor
+    worker drains less than that. It once drained ~5-35 rows a second and
+    rejected 900-2,700 of the 3,000 requests; later releases drain 50 QPS at
+    a sampled depth of about 2 (a claim no longer reads the whole backlog of
+    a never-analysed queue, and every probe database is fresh), so the case
+    passed on 2-5 start-up rejections and failed once there were none. A
+    therefore starts at 50 QPS and its rate grows by half after every second
+    in which no A request was rejected and A's queue was never seen above its
+    bound; once A is rejected the rate holds. A's offered load exceeds what
+    the release drains for A whatever that is, and stays within one growth
+    step of the knee, so B is measured against a saturated A rather than a
+    burst of A requests the probe's single event loop answers ahead of it.
+    Both streams get 202 receipts at admission: processing speed does not
+    enter B's latency.
+    """
+
+    lock = threading.Lock()
+    rejected = [0]
+
+    def send_a(sequence: int, scheduled: float) -> dict[str, Any]:
+        item = send("storm", 0, sequence, scheduled)
+        if item["status"] == 429:
+            with lock:
+                rejected[0] += 1
+        return item
+
+    futures = [
+        b_pool.submit(send, "storm", 1, index, wall_start + index)
+        for index in range(CAP001_STORM_B_REQUESTS)
+    ]
+    schedule: list[dict[str, Any]] = []
+    rate, seen, sequence = CAP001_A_START_QPS, 0, 0
+    bound = CAP001_A_QUEUE_CAP + CAP001_QUEUE_SLACK
+    for second in range(CAP001_STORM_SECONDS):
+        start = wall_start + second
+        if schedule:
+            pause = start - CAP001_A_DECISION_LEAD_SECONDS - time.perf_counter()
+            if pause > 0:
+                time.sleep(pause)
+            with lock:
+                total = rejected[0]
+            schedule[-1]["a_rejections_seen"] = total - seen
+            if total == seen and maxima.get("a_depth", 0.0) <= bound:
+                rate = min(rate * CAP001_A_RATE_GROWTH, CAP001_A_MAX_QPS)
+            seen = total
+        count = max(1, round(rate))
+        schedule.append({"second": second, "rate_qps": rate, "requests": count})
+        futures.extend(
+            a_pool.submit(send_a, sequence + index, start + index / count)
+            for index in range(count)
+        )
+        sequence += count
+    responses = [future.result() for future in as_completed(futures)]
+    schedule[-1]["a_rejections_seen"] = rejected[0] - seen
+    return responses, schedule
+
+
+def cap001_storm_summary(schedule: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    return {
+        "a_requests": sum(int(item["requests"]) for item in schedule),
+        "a_storm": {
+            "start_qps": CAP001_A_START_QPS,
+            "growth": CAP001_A_RATE_GROWTH,
+            "max_qps": CAP001_A_MAX_QPS,
+            "final_qps": schedule[-1]["rate_qps"] if schedule else None,
+            "first_rejecting_second": next(
+                (item["second"] for item in schedule if item["a_rejections_seen"]),
+                None,
+            ),
+            "seconds": list(schedule),
+        },
+    }
 
 
 def cap002_saturation_error(ratio: float) -> str | None:
@@ -403,20 +495,13 @@ class CapacityAcceptanceCases(CapHarnessBase):
                     )
                 )
             started = time.perf_counter()
-            wall_start = time.perf_counter()
             with (
                 ThreadPoolExecutor(max_workers=80) as a_pool,
                 ThreadPoolExecutor(max_workers=4) as b_pool,
             ):
-                futures = [
-                    a_pool.submit(send, "storm", 0, index, wall_start + index / 50.0)
-                    for index in range(3000)
-                ]
-                futures.extend(
-                    b_pool.submit(send, "storm", 1, index, wall_start + index / 1.0)
-                    for index in range(CAP001_STORM_B_REQUESTS)
+                responses, a_schedule = cap001_storm(
+                    send, a_pool, b_pool, time.perf_counter(), maxima
                 )
-                responses = [future.result() for future in as_completed(futures)]
             elapsed = time.perf_counter() - started
 
             drain_deadline = time.monotonic() + 120
@@ -452,6 +537,7 @@ class CapacityAcceptanceCases(CapHarnessBase):
         storm_p95 = percentile(storm_b_latencies, 0.95)
         result: dict[str, Any] = {
             "elapsed_seconds": round(elapsed, 3),
+            **cap001_storm_summary(a_schedule),
             "a_status_counts": dict(
                 sorted(
                     Counter(item["status"] for item in by_cluster[0]).items(),

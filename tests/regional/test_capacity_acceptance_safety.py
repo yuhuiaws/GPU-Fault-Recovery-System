@@ -17,6 +17,7 @@ from scripts.e2e.regional import capacity_acceptance_traffic as traffic
 
 def storm() -> dict[str, Any]:
     return {
+        "a_requests": 3000,
         "a_status_counts": {202: 1000, 429: 2000},
         "a_retry_after_values": ["2"],
         "b_baseline_status_counts": {202: cases.CAP001_BASELINE_REQUESTS},
@@ -34,7 +35,9 @@ def storm() -> dict[str, Any]:
     }
 
 
-@pytest.mark.parametrize("bad", ["transport", "nan", "metrics", "sampling", "count"])
+@pytest.mark.parametrize(
+    "bad", ["transport", "nan", "metrics", "sampling", "count", "unplanned"]
+)
 def test_cap001_rejects_incomplete_or_nonfinite_evidence(bad: str) -> None:
     result = storm()
     assert cases.cap001_failures(result) == [], "the complete control must pass"
@@ -46,6 +49,10 @@ def test_cap001_rejects_incomplete_or_nonfinite_evidence(bad: str) -> None:
         del result["metric_maxima"]["queue_depth"]
     elif bad == "sampling":
         result["metric_errors"] = ["ReadTimeout"]
+    elif bad == "unplanned":
+        # The storm's own schedule is the only count the responses can be
+        # held to; without it nothing proves no A request went missing.
+        del result["a_requests"]
     else:
         result["a_status_counts"] = {429: 1}
 

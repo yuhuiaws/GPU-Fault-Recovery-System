@@ -5127,7 +5127,10 @@ test_cases:
   level: live
   risk: live-non-destructive
   problem: 一个集群的事件风暴不得打垮整个区域控制面。
-  injection: 在独立验证控制面把 per-cluster 队列上限降到 20，从 A 以 50 QPS 持续上报同时 B 以 1 QPS 上报。
+  injection: >-
+    在独立验证控制面把 per-cluster 队列上限降到 20，从 A 以 50 QPS 起持续上报 60 秒，
+    某一秒 A 未收到 429 就把下一秒速率提高到 1.5 倍（最多 400 QPS），A 被拒绝后保持，
+    使 A 的提交速率高于处理器对 A 的排空速率；同时 B 以 1 QPS 上报。
   expected:
   - A 开始收到 429 且响应含 Retry-After
   - B 的请求全部成功且延迟无显著上升
@@ -5135,13 +5138,7 @@ test_cases:
   - admission_rejections_total 只在 A 的维度上增长
   - 缺失的零深度集群序列只有在完整稀疏census与显式全局深度一致时才能解释为零；缺失全局、重复、畸形数据仍失败
   evidence:
-    verdict: PASS
-    verified:
-      case_digest: 00e67b3f69eff66a6579f9c3bf0ff0ceda84b70672ad43733b898dcca57f7058
-      components:
-        control_plane: 15dfb9989e311767fe9d8fe29dbe6bcbc163752aa5b78ae1340fc74887b33b45
-        executor: ea81228c66e060bd0c68dc3f7ee64469b996937ef16ab45f7b92463f2ee6afdb
-        node_runtime: 4bcdfcfb5c1921fd1da6ed67cfc1e9d90a4c2e40ce56e222f92849d50e195f09
+    verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cap-001
 - id: GF-REGIONAL-CAP-002
