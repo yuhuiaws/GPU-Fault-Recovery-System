@@ -359,11 +359,22 @@ def test_missing_task_scope_remains_in_coverage_denominator(path):
 
 
 def test_owned_worker_returns_partial_at_deadline(tmp_path, monkeypatch):
-    root = tmp_path / "proc"
-    root.mkdir()
+    """The deadline falls while the real owned probe is blocked in its read: the
+    supervisor answers at once with a partial, and releases the admission only
+    once the probe's subtree is gone.
+
+    The deadline is the supervisor's clock moving past it the moment the probe
+    has reached its read (``DeadlineClock``), not 1.5 s of real time, in which
+    a CPU-starved host had not yet started the guard and the worker (b210).
+    """
+
     import os
     import sys
 
+    from tests.node_agent._observation_deadline import DeadlineClock
+
+    root = tmp_path / "proc"
+    root.mkdir()
     directory = process(root, 100)
     (directory / "stat").write_text(proc_stat(100, 0))
     fifo, marker = tmp_path / "blocked", tmp_path / "started"
@@ -377,9 +388,19 @@ def test_owned_worker_returns_partial_at_deadline(tmp_path, monkeypatch):
     tool.chmod(0o700)
     monkeypatch.setenv("PATH", str(tmp_path))
     use_imported_package(monkeypatch)
+    clock = DeadlineClock(REAL_WORKER_BUDGET_SECONDS, when=marker.exists)
+    clock.install(monkeypatch)
     supervisor = ObservationSupervisor()
     released = threading.Event()
-    started = time.monotonic()
+    probe_alive_at_release: list[bool] = []
+
+    def release() -> None:
+        probe = marker.read_text() if marker.exists() else None
+        probe_alive_at_release.append(
+            probe is not None and (Path("/proc") / probe).exists()
+        )
+        released.set()
+
     result = supervisor.run(
         {
             "operation": "sample",
@@ -405,13 +426,21 @@ def test_owned_worker_returns_partial_at_deadline(tmp_path, monkeypatch):
                 "targets": [],
             },
         },
-        1.5,
-        release=released.set,
+        REAL_WORKER_BUDGET_SECONDS,
+        release=release,
     )
-    assert time.monotonic() - started < 4, result
+    returned = time.monotonic()
+    assert clock.expired_at is not None, (
+        "the real owned probe must reach the blocking read",
+        result,
+    )
+    assert returned - clock.expired_at < 2.5, (returned - clock.expired_at, result)
+    assert result["status"] == "PARTIAL_TIMEOUT", result
     assert result["evidence_complete"] is False, result
-    assert marker.exists(), "the real owned probe must reach the blocking read"
-    assert released.wait(3), (
+    assert released.wait(REAL_WORKER_BUDGET_SECONDS), (
         "owned probe subtree must be reaped before releasing admission"
+    )
+    assert probe_alive_at_release == [False], (
+        "the admission is released only once the probe is gone"
     )
     assert not (Path("/proc") / marker.read_text()).exists(), result

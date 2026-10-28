@@ -46,8 +46,12 @@ from tests.node_agent._cov95_runtime_hung import process
 from tests.node_agent._cov95_runtime_support import (
     node_factory_fixture as node_factory_fixture,
 )
+from tests.node_agent._observation_deadline import DeadlineClock, WatchedSlot
 from tests.node_agent._support import command, envelope, node_action_executor
-from tests.node_agent.test_communication_monitor import use_imported_package
+from tests.node_agent.test_communication_monitor import (
+    REAL_WORKER_BUDGET_SECONDS,
+    use_imported_package,
+)
 from tests.node_agent.test_hung_triage_result_budget import (
     NODE_ID,
     DumpResponder,
@@ -143,6 +147,12 @@ def run_in_thread(supervisor: ObservationSupervisor, *args: Any, **kwargs: Any):
 # the supervisor's slot
 # --------------------------------------------------------------------------- #
 def test_a_command_preempts_the_passive_sample_and_runs(tmp_path, monkeypatch):
+    """The passive sample holds the slot, blocked in its probe, until the
+    command preempts it: its own deadline is one it never reaches
+    (``REAL_WORKER_BUDGET_SECONDS``), not 12 s of real time that a CPU-starved
+    host spent starting its worker, so only the preemption can free the slot
+    within the command's 8 s wait."""
+
     root = tmp_path / "proc"
     (root / "sys/kernel/random").mkdir(parents=True)
     directory = process(root, 100)
@@ -157,11 +167,11 @@ def test_a_command_preempts_the_passive_sample_and_runs(tmp_path, monkeypatch):
     passive, box = run_in_thread(
         supervisor,
         sample_request(root, tmp_path),
-        12,
+        REAL_WORKER_BUDGET_SECONDS,
         release=released.set,
         preemptible=True,
     )
-    wait_for(marker)
+    wait_for(marker, REAL_WORKER_BUDGET_SECONDS)
 
     # A fast tool for the command: an empty scope answers without nvidia-smi.
     fast = tmp_path / "fast"
@@ -171,21 +181,20 @@ def test_a_command_preempts_the_passive_sample_and_runs(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", str(fast))
     empty_root = tmp_path / "empty-proc"
     empty_root.mkdir()
-    started = time.monotonic()
     result = supervisor.run(
         {**sample_request(empty_root, tmp_path), "operation": "sample"}, 12, slot_wait=8
     )
-    elapsed = time.monotonic() - started
 
     assert result.get("status") not in {"WORKER_STILL_RUNNING", None}, result
     assert result.get("worker_started", True) is not False, result
-    assert 0 < result["slot_wait_seconds"] < 4, result
-    assert elapsed < 8, elapsed
-    passive.join(timeout=5)
+    assert 0 < result["slot_wait_seconds"] < 8, result
+    passive.join(timeout=REAL_WORKER_BUDGET_SECONDS)
     assert box["result"]["status"] == "PREEMPTED", box["result"]
     assert box["result"]["preempted_by"] == "sample", box["result"]
     assert box["result"]["evidence_complete"] is False, box["result"]
-    assert released.wait(3), "the preempted sample's admission is released"
+    assert released.wait(REAL_WORKER_BUDGET_SECONDS), (
+        "the preempted sample's admission is released"
+    )
     assert not (Path("/proc") / marker.read_text()).exists(), (
         "the preempted probe subtree is reaped"
     )
@@ -194,6 +203,11 @@ def test_a_command_preempts_the_passive_sample_and_runs(tmp_path, monkeypatch):
 def test_a_holder_that_cannot_be_preempted_is_waited_for_then_named(
     tmp_path, monkeypatch
 ):
+    """The holder is a command's worker (not preemptible) blocked in its probe;
+    its deadline falls only once the third caller is waiting for the slot
+    (``DeadlineClock.expire(holder)``), not after 3 s of real time, in which a
+    CPU-starved host had not yet started its worker (b210)."""
+
     root = tmp_path / "proc"
     directory = process(root, 100)
     (directory / "stat").write_text(proc_stat(100, 0))
@@ -202,13 +216,22 @@ def test_a_holder_that_cannot_be_preempted_is_waited_for_then_named(
     blocking_nvidia_smi(tmp_path / "slow", fifo, marker)
     use_imported_package(monkeypatch)
     monkeypatch.setenv("PATH", str(tmp_path / "slow"))
+    clock = DeadlineClock(REAL_WORKER_BUDGET_SECONDS).install(monkeypatch)
     supervisor = ObservationSupervisor()
     released = threading.Event()
-    # A command's worker (not preemptible) that will hit its own 3 s deadline.
+    released_at: list[float] = []
+
+    def release() -> None:
+        released_at.append(time.monotonic())
+        released.set()
+
     holder, box = run_in_thread(
-        supervisor, sample_request(root, tmp_path), 3, release=released.set
+        supervisor,
+        sample_request(root, tmp_path),
+        REAL_WORKER_BUDGET_SECONDS,
+        release=release,
     )
-    wait_for(marker)
+    wait_for(marker, REAL_WORKER_BUDGET_SECONDS)
 
     started = time.monotonic()
     refused = supervisor.run(sample_request(root, tmp_path), 12, slot_wait=0.5)
@@ -218,7 +241,10 @@ def test_a_holder_that_cannot_be_preempted_is_waited_for_then_named(
     assert refused["worker_started"] is False, refused
     assert refused["failure_stage"] == WORKER_NOT_STARTED, refused
     assert refused["failed_component"] == "observation_supervisor", refused
-    assert 0.4 <= refused["slot_wait_seconds"] <= waited < 2, (refused, waited)
+    # ``slot_wait_seconds`` is rounded to the millisecond: up to 0.5 ms over
+    # the wait this caller measured around the call, never more.
+    assert 0.4 <= refused["slot_wait_seconds"] <= waited + 0.0005, (refused, waited)
+    assert waited < 2, (refused, waited)
     assert refused["error"].startswith("observation worker slot held by sample for"), (
         refused["error"]
     )
@@ -228,7 +254,9 @@ def test_a_holder_that_cannot_be_preempted_is_waited_for_then_named(
     assert refused["slot_holder"]["held_seconds"] >= 0.4, refused
 
     # The same command asked again with a longer wait runs once the holder
-    # reaches its deadline and leaves the slot.
+    # reaches its deadline and leaves the slot: the holder's deadline falls
+    # once this caller is waiting, and the slot is this caller's only after
+    # the holder has let go of it.
     fast = tmp_path / "fast"
     fast.mkdir()
     (fast / "nvidia-smi").write_text("#!/bin/sh\nexit 0\n")
@@ -236,17 +264,37 @@ def test_a_holder_that_cannot_be_preempted_is_waited_for_then_named(
     monkeypatch.setenv("PATH", str(fast))
     empty_root = tmp_path / "empty-proc"
     empty_root.mkdir()
+    slot = WatchedSlot(supervisor.slot)
+    supervisor.slot = slot
+
+    def expire_the_holder() -> None:
+        if slot.waiting.wait(REAL_WORKER_BUDGET_SECONDS):
+            clock.expire(holder)
+
+    threading.Thread(target=expire_the_holder, daemon=True).start()
     result = supervisor.run(sample_request(empty_root, tmp_path), 12, slot_wait=8)
     assert result.get("status") != "WORKER_STILL_RUNNING", result
-    assert 0 < result["slot_wait_seconds"] < 6, result
-    holder.join(timeout=5)
+    assert 0 < result["slot_wait_seconds"] < 8, result
+    holder.join(timeout=REAL_WORKER_BUDGET_SECONDS)
     assert box["result"]["status"] == "PARTIAL_TIMEOUT", box["result"]
     assert "preempted_by" not in box["result"], box["result"]
-    assert released.wait(3), "the holder's admission is released once it exits"
+    assert released.wait(REAL_WORKER_BUDGET_SECONDS), (
+        "the holder's admission is released once it exits"
+    )
+    assert slot.acquired_at is not None and released_at[0] <= slot.acquired_at, (
+        "the waiting caller got the slot only after the holder released it",
+        released_at,
+        slot.acquired_at,
+    )
 
 
 def test_a_refusal_names_the_slot_wait_the_caller_allowed(tmp_path, monkeypatch):
-    """Without a wait (the passive sampler's own call) the refusal is immediate."""
+    """Without a wait (the passive sampler's own call) the refusal is immediate.
+
+    The holder's deadline falls once the refusal is in (``DeadlineClock``),
+    not after 2 s of real time, in which a CPU-starved host had not yet
+    started its worker (b210).
+    """
 
     root = tmp_path / "proc"
     directory = process(root, 100)
@@ -256,16 +304,20 @@ def test_a_refusal_names_the_slot_wait_the_caller_allowed(tmp_path, monkeypatch)
     blocking_nvidia_smi(tmp_path / "slow", fifo, marker)
     use_imported_package(monkeypatch)
     monkeypatch.setenv("PATH", str(tmp_path / "slow"))
+    clock = DeadlineClock(REAL_WORKER_BUDGET_SECONDS).install(monkeypatch)
     supervisor = ObservationSupervisor()
-    holder, box = run_in_thread(supervisor, sample_request(root, tmp_path), 2)
-    wait_for(marker)
+    holder, box = run_in_thread(
+        supervisor, sample_request(root, tmp_path), REAL_WORKER_BUDGET_SECONDS
+    )
+    wait_for(marker, REAL_WORKER_BUDGET_SECONDS)
     started = time.monotonic()
     refused = supervisor.run(sample_request(root, tmp_path), 12, preemptible=True)
     assert time.monotonic() - started < 0.5, "no wait was allowed"
     assert refused["status"] == "WORKER_STILL_RUNNING", refused
     assert refused["slot_wait_seconds"] == 0, refused
     assert refused["worker_started"] is False, refused
-    holder.join(timeout=5)
+    clock.expire()
+    holder.join(timeout=REAL_WORKER_BUDGET_SECONDS)
     assert box["result"]["status"] == "PARTIAL_TIMEOUT", box["result"]
 
 
@@ -573,7 +625,12 @@ def test_the_triage_publishes_its_dumps_before_the_second_interval(
 
 
 def test_the_deadline_hands_back_the_last_checkpoint(tmp_path, monkeypatch):
-    """A worker past the supervisor's deadline answers with what it had read."""
+    """A worker past the supervisor's deadline answers with what it had read.
+
+    The deadline falls once the supervisor has read the stand-in's last
+    checkpoint (``checkpointed``, ``DeadlineClock``), not after 1.5 s of real
+    time, in which a CPU-starved host had not yet started the stand-in (b210).
+    """
 
     from gpu_fault.node_agent import observation_supervisor
 
@@ -583,16 +640,23 @@ def test_the_deadline_hands_back_the_last_checkpoint(tmp_path, monkeypatch):
         "observation_guard",
         SimpleNamespace(__name__="tests.node_agent._stalled_observation_worker"),
     )
+    checkpointed = tmp_path / "checkpointed"
+    clock = DeadlineClock(REAL_WORKER_BUDGET_SECONDS, when=checkpointed.exists)
+    clock.install(monkeypatch)
     supervisor = ObservationSupervisor()
-    started = time.monotonic()
-    result = supervisor.run({"operation": "triage", "settings": {}}, 1.5)
-    assert time.monotonic() - started < 4
+    result = supervisor.run(
+        {"operation": "triage", "settings": {}, "checkpointed": str(checkpointed)},
+        REAL_WORKER_BUDGET_SECONDS,
+    )
+    returned = time.monotonic()
+    assert clock.expired_at is not None, ("the stand-in never checkpointed", result)
+    assert returned - clock.expired_at < 2.5, (returned - clock.expired_at, result)
     assert result["status"] == "PARTIAL_TIMEOUT", result
     assert result["evidence_complete"] is False, result
     assert result["collection_stage"] == "FIRST_FLIGHT_DUMPS_READ", result
     assert [row["rank"] for row in result["ranks"]] == [0, 1], result
     assert result["ranks"][0]["flight_recorder"]["status"] == "dumped", result
-    assert result["supervisor_timeout_seconds"] == 1.5, result
+    assert result["supervisor_timeout_seconds"] == REAL_WORKER_BUDGET_SECONDS, result
     assert result["worker_returncode"] is None or result["worker_returncode"] != 0, (
         result
     )

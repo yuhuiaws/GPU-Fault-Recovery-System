@@ -23,12 +23,17 @@ from typing import Any
 from gpu_fault.models import WorkflowOperation as Op
 from gpu_fault.node_agent.communication_runtime import CommunicationRuntime
 from gpu_fault.node_agent.observation_supervisor import (
+    SLOT_WAIT_MAX_SECONDS,
     ObservationSlotBusy,
     ObservationSupervisor,
 )
 from tests.node_agent._cov95_runtime_hung import process
+from tests.node_agent._observation_deadline import DeadlineClock
 from tests.node_agent._support import command
-from tests.node_agent.test_communication_monitor import use_imported_package
+from tests.node_agent.test_communication_monitor import (
+    REAL_WORKER_BUDGET_SECONDS,
+    use_imported_package,
+)
 from tests.node_agent.test_hung_triage_result_budget import NODE_ID, _Activity
 from tests.node_agent.test_observation_slot_contention import (
     blocking_nvidia_smi,
@@ -85,7 +90,13 @@ def _runtime(tmp_path: Path, monkeypatch) -> CommunicationRuntime:
 def test_a_bundle_preempts_the_passive_sample_holding_the_shared_slot(
     tmp_path, monkeypatch
 ):
-    """The live cause: the sampler holds 08d8's slot; the bundle waits and runs."""
+    """The live cause: the sampler holds 08d8's slot; the bundle waits and runs.
+
+    The sample's own deadline is one it never reaches
+    (``REAL_WORKER_BUDGET_SECONDS``), not 12 s of real time that a CPU-starved
+    host spent starting its worker: only the preemption frees the slot within
+    the bundle's 10 s wait.
+    """
 
     root = tmp_path / "proc"
     directory = process(root, 100)
@@ -99,22 +110,23 @@ def test_a_bundle_preempts_the_passive_sample_holding_the_shared_slot(
     passive, box = run_in_thread(
         runtime.supervisor,
         {**sample_request(root, tmp_path), "settings": runtime.settings},
-        12,
+        REAL_WORKER_BUDGET_SECONDS,
         preemptible=True,
     )
-    wait_for(marker)
+    wait_for(marker, REAL_WORKER_BUDGET_SECONDS)
 
     fast = tmp_path / "fast"
     fast.mkdir()
     (fast / "nvidia-smi").write_text("#!/bin/sh\nexit 0\n")
     (fast / "nvidia-smi").chmod(0o700)
     monkeypatch.setenv("PATH", str(fast))
-    started = time.monotonic()
     result = runtime.run_command("bundle", bundle_command())
-    assert time.monotonic() - started < 12, "the bundle ran once the slot was free"
     assert result["manifest_summary"]["capture_count"] >= 0, result
-    assert 0 < result["slot_wait_seconds"] < 6, result
-    passive.join(timeout=5)
+    assert 0 < result["slot_wait_seconds"] < SLOT_WAIT_MAX_SECONDS, (
+        "the bundle ran once the preempted sample left the slot",
+        result,
+    )
+    passive.join(timeout=REAL_WORKER_BUDGET_SECONDS)
     assert box["result"]["status"] == "PREEMPTED", box["result"]
     assert box["result"]["preempted_by"] == "bundle", box["result"]
 
@@ -150,7 +162,12 @@ def test_a_bundle_refused_for_the_whole_wait_is_retryable(tmp_path, monkeypatch)
 
 
 def test_the_bundle_deadline_hands_back_the_captured_manifest(tmp_path, monkeypatch):
-    """A bundle the worker ran but could not finish returns what it captured."""
+    """A bundle the worker ran but could not finish returns what it captured.
+
+    The deadline falls once the supervisor has read the stand-in's last
+    checkpoint (``checkpointed``, ``DeadlineClock``), not after 1.5 s of real
+    time, in which a CPU-starved host had not yet started the stand-in (b210).
+    """
 
     from gpu_fault.node_agent import observation_supervisor
 
@@ -160,14 +177,21 @@ def test_the_bundle_deadline_hands_back_the_captured_manifest(tmp_path, monkeypa
         "observation_guard",
         SimpleNamespace(__name__="tests.node_agent._stalled_bundle_worker"),
     )
+    checkpointed = tmp_path / "checkpointed"
+    clock = DeadlineClock(REAL_WORKER_BUDGET_SECONDS, when=checkpointed.exists)
+    clock.install(monkeypatch)
     supervisor = ObservationSupervisor()
-    started = time.monotonic()
-    result = supervisor.run({"operation": "bundle", "settings": {}}, 1.5)
-    assert time.monotonic() - started < 4, "the supervisor returned at its deadline"
+    result = supervisor.run(
+        {"operation": "bundle", "settings": {}, "checkpointed": str(checkpointed)},
+        REAL_WORKER_BUDGET_SECONDS,
+    )
+    returned = time.monotonic()
+    assert clock.expired_at is not None, ("the stand-in never checkpointed", result)
+    assert returned - clock.expired_at < 2.5, "the supervisor returned at its deadline"
     assert result["status"] == "PARTIAL_TIMEOUT", result
     assert result["evidence_complete"] is False, result
     assert result["collection_stage"] == "BUNDLE_CAPTURING", result
     assert result["captures_done"] == ["nvidia-smi.txt", "dmesg.txt"], result
     assert result["captures_pending"] == ["ps.txt"], result
     assert result["manifest"]["node_id"] == "node-a", result
-    assert result["supervisor_timeout_seconds"] == 1.5, result
+    assert result["supervisor_timeout_seconds"] == REAL_WORKER_BUDGET_SECONDS, result
