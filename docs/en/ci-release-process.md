@@ -611,10 +611,10 @@ artifact, not an automatically created GitHub Release asset, and it is not copie
 | `dist/<release-id>/gpu-fault-node-installer-*.tar.gz` | same as above | GPU node install script, unit and the exact Node Runtime wheel |
 | `dist/<release-id>/attestation.json` | `build-release-attestation.py` | Content-addressed release attestation |
 | `dist/current-attestation.json` | same as above | The attestation consumed by the deploy entry point |
-| `dist/current-attestation.bundle.json` | `cosign sign-blob` | Sigstore signature material of the release attestation |
+| `dist/current-attestation.bundle.json` | `cosign sign-blob` (via `scripts/cosign_sign_blob.py`) | Sigstore signature material of the release attestation |
 | `dist/gpu-fault-deploy-host-<platform>.tar.gz` | `build-deploy-host-bundle.py` | Deploy host offline Python environment and tool payload |
 | `.tar.gz.sha256` of the same name | same as above | SHA-256 sidecar of the deploy host offline package |
-| `dist/gpu-fault-deploy-host-<platform>.sigstore.json` | `cosign sign-blob` | Sigstore signature material of the deploy host offline package |
+| `dist/gpu-fault-deploy-host-<platform>.sigstore.json` | `cosign sign-blob` (via `scripts/cosign_sign_blob.py`) | Sigstore signature material of the deploy host offline package |
 
 Do not confuse the following three names:
 

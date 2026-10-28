@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -148,8 +149,17 @@ def test_candidate_receipt_binds_gate_and_current_tree(
         }[arguments],
     )
 
+    # The receipt is signed through the wrapper that survives Rekor's 409 for
+    # its own retried upload, never by a bare ``cosign sign-blob``.
+    signer = [
+        sys.executable,
+        str(ci_candidate_receipt.ROOT / "scripts/cosign_sign_blob.py"),
+    ]
+    signed: list[list[str]] = []
+
     def cosign(command, **_kwargs):
-        if "sign-blob" in command:
+        if command[:2] == signer:
+            signed.append(command)
             bundle = Path(command[command.index("--bundle") + 1])
             bundle.write_text("{}", encoding="utf-8")
         return subprocess.CompletedProcess(command, 0, "", "")
@@ -168,6 +178,9 @@ def test_candidate_receipt_binds_gate_and_current_tree(
         root, state, public_key=tmp_path / "cosign.pub"
     )
 
+    assert [command[2:4] for command in signed] == [
+        ["--key", str(tmp_path / "cosign.key")]
+    ]
     assert verified is not None
     assert verified["ci_gate"] == str(gate)
     assert value["source"]["git_tree"] == "b" * 40

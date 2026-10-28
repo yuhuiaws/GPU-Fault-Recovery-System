@@ -195,11 +195,14 @@ rules:
       - scripts/build-release-artifacts.py
       - scripts/build-release-attestation.py
       - scripts/verify-release-attestation.py
+      - scripts/cosign_sign_blob.py
+      - tests/test_cosign_sign_blob.py
       - src/gpu_fault/__init__.py
     pytest:
       - tests/test_release_identity.py
       - tests/test_release_image.py
       - tests/test_release_attestation.py
+      - tests/test_cosign_sign_blob.py
       - tests/test_release_gates.py
       - tests/test_artifact_consistency.py
       - tests/test_component_wheel_closures.py

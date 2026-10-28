@@ -1907,7 +1907,8 @@ when an in-process rotation scope exits, the caller's complete original environm
 The bundle also records `project_distribution=gpu-fault-deploy-host`, the project wheel SHA and
 `project_module_digest`; before activation, setup reads the installed distribution and recomputes
 `gpu_fault.module_digest()`, forbidding the Control Plane project wheel from being installed as the administrator CLI by mistake.
-`COSIGN_PASSWORD` may only enter the final `cosign sign-blob` process; the quality gates, PostgreSQL tests,
+`COSIGN_PASSWORD` may only enter the final signing step `scripts/cosign_sign_blob.py`, which hands it to `cosign sign-blob`
+and, only when it rebuilds a bundle, to `cosign public-key`; `cosign verify-blob` runs without it. The quality gates, PostgreSQL tests,
 image/artifact builds, attestation generation and deploy-host bundle build must explicitly remove that variable.
 
 ### 9.1 Build and Deploy Upgrade After an Ordinary Code Change
@@ -1998,6 +1999,20 @@ Node bundle. The Runtime Image and final artifact phases verify the source ident
 attestation, and within the same `release-build` use cosign to generate
 `dist/current-attestation.bundle.json`. PostgreSQL concurrency, lease, counter or fencing changes
 must still pass CAP-005.
+
+Every `cosign sign-blob` (the attestation of the three `release-build*` targets, `deploy-host-bundle`/`deploy-host-sign`,
+the CI candidate receipt and the successful source deploy record) runs through `scripts/cosign_sign_blob.py`. cosign v3 uploads
+to Rekor v1 through sigstore-go; when Rekor has written the first request but its response is lost (5xx or a dropped connection),
+the client re-sends it unchanged and Rekor answers the repeat with `409 createLogEntryConflict ... with UUID <id>`. sigstore-go
+before v1.3.0 (cosign up to v3.1.3) treats that as fatal and writes no bundle, although the UUID is this upload's own complete
+entry (fixed upstream by sigstore/sigstore-go#647, shipped with cosign v3.1.4). ECDSA signatures are randomized: re-signing the
+same content yields a different entry and never conflicts because of the content. The wrapper runs cosign unchanged and passes
+its result through; only for that 409 while signing with a key does it read the entry by UUID (read-only) and require a
+`hashedrekord` 0.0.1 whose canonical body has the UUID as its RFC 6962 leaf hash, whose artifact digest is the file's SHA-256 and
+whose public key is the signing key's (`cosign public-key`); it then writes the Sigstore bundle v0.3 with sigstore-go's field
+mapping and atomically replaces the target only after `cosign verify-blob --key` accepted it. Any failed condition keeps
+cosign's failure. The rebuilt bundle lacks the RFC 3161 timestamp cosign obtained before the upload; key verification uses the
+entry's signed integratedTime. Keyless signing is not recovered.
 
 The image-set descriptor schema v3 must record the control-plane/executor wheel SHAs and module digests separately,
 plus the node offline dependency inventory SHA; each image records its full image input and its SHA.

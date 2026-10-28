@@ -612,10 +612,10 @@ artifact，不是自动创建的 GitHub Release asset，也不会自动复制到
 | `dist/<release-id>/gpu-fault-node-installer-*.tar.gz` | 同上 | GPU 节点安装脚本、unit 和精确 Node Runtime wheel |
 | `dist/<release-id>/attestation.json` | `build-release-attestation.py` | 内容寻址 release attestation |
 | `dist/current-attestation.json` | 同上 | 部署入口消费的 attestation |
-| `dist/current-attestation.bundle.json` | `cosign sign-blob` | release attestation 的 Sigstore 签名材料 |
+| `dist/current-attestation.bundle.json` | `cosign sign-blob`（经`scripts/cosign_sign_blob.py`） | release attestation 的 Sigstore 签名材料 |
 | `dist/gpu-fault-deploy-host-<platform>.tar.gz` | `build-deploy-host-bundle.py` | 部署机离线 Python 环境和工具 payload |
 | 同名 `.tar.gz.sha256` | 同上 | 部署机离线包 SHA-256 sidecar |
-| `dist/gpu-fault-deploy-host-<platform>.sigstore.json` | `cosign sign-blob` | 部署机离线包的 Sigstore 签名材料 |
+| `dist/gpu-fault-deploy-host-<platform>.sigstore.json` | `cosign sign-blob`（经`scripts/cosign_sign_blob.py`） | 部署机离线包的 Sigstore 签名材料 |
 
 不要混淆以下三个名称：
 

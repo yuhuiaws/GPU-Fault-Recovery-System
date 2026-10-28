@@ -36,6 +36,12 @@ COVERAGE_POSTGRES_CONTAINER ?=
 COVERAGE_POSTGRES_IMAGE ?=
 BASE ?= origin/main
 COSIGN ?= cosign
+# Every sign-blob runs through scripts/cosign_sign_blob.py: when Rekor answers
+# 409 because it already integrated this signing's own retried upload, cosign
+# up to v3.1.3 fails without a bundle; the wrapper writes the bundle from that
+# entry and keeps it only after cosign verify-blob accepted it.
+COSIGN_SIGN_BLOB = $(PYTHON) scripts/cosign_sign_blob.py --cosign "$(COSIGN)" \
+	$(if $(COSIGN_SIGNING_KEY),--key "$(COSIGN_SIGNING_KEY)",)
 RUNTIME_IMAGE_PLATFORM ?= linux/amd64
 RELEASE_ATTESTATION := dist/current-attestation.json
 RELEASE_ATTESTATION_BUNDLE := dist/current-attestation.bundle.json
@@ -655,10 +661,9 @@ release-build:
 	env -u COSIGN_PASSWORD $(MAKE) sbom PYTHON="$(PYTHON)"
 	env -u COSIGN_PASSWORD $(PYTHON) scripts/build-release-attestation.py \
 		--sbom-dir "$(SBOM_DIR)"
-	$(COSIGN) sign-blob --yes \
-		$(if $(COSIGN_SIGNING_KEY),--key "$(COSIGN_SIGNING_KEY)",) \
+	$(COSIGN_SIGN_BLOB) \
 		--bundle "$(RELEASE_ATTESTATION_BUNDLE)" \
-		"$(RELEASE_ATTESTATION)" >/dev/null
+		"$(RELEASE_ATTESTATION)"
 
 release-build-promoted:
 	@test -n "$(RUNTIME_IMAGE_REPOSITORY)" || \
@@ -691,10 +696,9 @@ release-build-promoted:
 	env -u COSIGN_PASSWORD $(PYTHON) scripts/build-release-attestation.py \
 		--ci-gate "$(CI_GATE)" \
 		--sbom-dir "$(SBOM_DIR)"
-	$(COSIGN) sign-blob --yes \
-		$(if $(COSIGN_SIGNING_KEY),--key "$(COSIGN_SIGNING_KEY)",) \
+	$(COSIGN_SIGN_BLOB) \
 		--bundle "$(RELEASE_ATTESTATION_BUNDLE)" \
-		"$(RELEASE_ATTESTATION)" >/dev/null
+		"$(RELEASE_ATTESTATION)"
 
 release-build-staging:
 	@test -n "$(RUNTIME_IMAGE_REPOSITORY)" || \
@@ -740,10 +744,9 @@ release-build-staging:
 		--impact-base "$(BASE)" \
 		--impact-plan "$(STAGING_IMPACT_PLAN)" \
 		--sbom-dir "$(SBOM_DIR)"
-	$(COSIGN) sign-blob --yes \
-		$(if $(COSIGN_SIGNING_KEY),--key "$(COSIGN_SIGNING_KEY)",) \
+	$(COSIGN_SIGN_BLOB) \
 		--bundle "$(RELEASE_ATTESTATION_BUNDLE)" \
-		"$(RELEASE_ATTESTATION)" >/dev/null
+		"$(RELEASE_ATTESTATION)"
 
 release-deploy:
 	@if [ -n "$(CPU_CLUSTER_ARN)$(GPU_CLUSTER_ARNS)" ]; then \
@@ -796,19 +799,17 @@ deploy-host-bundle:
 	env -u COSIGN_PASSWORD $(PYTHON) scripts/build-deploy-host-bundle.py \
 		--python "$(PYTHON)" \
 		--output "$(DEPLOY_HOST_ARCHIVE)" $(if $(DEPLOY_HOST_WHEELHOUSE),--wheelhouse "$(DEPLOY_HOST_WHEELHOUSE)",) $(if $(DEPLOY_HOST_TOOLS_DIR),--tools-dir "$(DEPLOY_HOST_TOOLS_DIR)",) $(if $(filter true yes 1,$(DEPLOY_HOST_ALLOW_DIRTY)),--allow-dirty,)
-	$(COSIGN) sign-blob --yes \
-		$(if $(COSIGN_SIGNING_KEY),--key "$(COSIGN_SIGNING_KEY)",) \
+	$(COSIGN_SIGN_BLOB) \
 		--bundle "$(DEPLOY_HOST_SIGNATURE_BUNDLE)" \
-		"$(DEPLOY_HOST_ARCHIVE)" >/dev/null
+		"$(DEPLOY_HOST_ARCHIVE)"
 
 deploy-host-sign:
 	@test -f "$(DEPLOY_HOST_ARCHIVE)" || \
 		(printf 'DEPLOY_HOST_ARCHIVE does not exist: %s\n' \
 			"$(DEPLOY_HOST_ARCHIVE)" >&2; exit 2)
-	$(COSIGN) sign-blob --yes \
-		$(if $(COSIGN_SIGNING_KEY),--key "$(COSIGN_SIGNING_KEY)",) \
+	$(COSIGN_SIGN_BLOB) \
 		--bundle "$(DEPLOY_HOST_SIGNATURE_BUNDLE)" \
-		"$(DEPLOY_HOST_ARCHIVE)" >/dev/null
+		"$(DEPLOY_HOST_ARCHIVE)"
 
 deploy-host-setup:
 	@test -f "$(DEPLOY_HOST_ARCHIVE)" || \

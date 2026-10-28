@@ -524,11 +524,12 @@ def record_successful_source_deploy(
     )
     temporary_state.chmod(0o600)
     temporary_signature.unlink(missing_ok=True)
+    # The wrapper keeps cosign's behaviour and survives Rekor's 409 for this
+    # signing's own retried upload (scripts/cosign_sign_blob.py).
     _run(
         [
-            "cosign",
-            "sign-blob",
-            "--yes",
+            sys.executable,
+            str(ROOT / "scripts/cosign_sign_blob.py"),
             "--key",
             str(signing.private_key),
             "--bundle",

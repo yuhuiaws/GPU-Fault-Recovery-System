@@ -116,11 +116,12 @@ def write_receipt(
     )
     temporary_receipt.chmod(0o600)
     temporary_signature.unlink(missing_ok=True)
+    # The wrapper keeps cosign's behaviour and survives Rekor's 409 for this
+    # signing's own retried upload (scripts/cosign_sign_blob.py).
     completed = subprocess.run(
         [
-            "cosign",
-            "sign-blob",
-            "--yes",
+            sys.executable,
+            str(ROOT / "scripts/cosign_sign_blob.py"),
             "--key",
             str(signing_key),
             "--bundle",

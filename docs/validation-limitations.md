@@ -617,6 +617,17 @@ review. Stage tables describe dependency and concurrency contracts, not measured
 end-to-end speedups. Store migration verification is a separate gate and is not
 implied by administrator-command checks.
 
+## Release signing: Rekor 409 recovery
+
+`scripts/cosign_sign_blob.py`, the wrapper every `cosign sign-blob` of the release tooling runs through, is covered
+hermetically by `tests/test_cosign_sign_blob.py`: a fake `cosign` and a fake Rekor on localhost exercise the pass-through
+paths, the 409 recovery and each binding it requires (artifact digest, signing key, UUID leaf hash, entry kind, inclusion
+proof), a rebuilt bundle that `cosign verify-blob` rejects, the bounded Rekor read retries and keyless signing. The suite
+never signs, uploads or reaches the public Rekor. The bundle mapping was also checked once offline against a real conflicting
+entry of the public log: the rebuilt bundle passed `cosign verify-blob --key` and `scripts/verify-release-attestation.py`. A
+live signing that hits the 409 cannot be provoked on demand; the first such event in a release build or deploy is its live
+evidence.
+
 ## Optional HMA ingestion retirement
 
 The custom Kubernetes HMA watcher and CloudWatch/Lambda/SQS pipeline, their four
