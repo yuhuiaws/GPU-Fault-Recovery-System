@@ -82,6 +82,18 @@ pins; environment-file fingerprints; machine identity and boot ID. Secret
 contents are never returned or journaled. Unsupported or ambiguous systemd
 properties, environment layouts, identities and file types are rejected.
 
+The read-only snapshot also reports the service's claim holder: its key and
+the case, run, release, phase, restorer and deadlines its on-node journal
+records, or `unreadable`. A claimed service is refused before anything is bound
+or armed, naming the holder. A claim is removed only by its own window's
+cleanup; a new window that met it at preparation would already have written a
+journal that its own cleanup could not close past that claim. Likewise a
+controller journal that is not this controller's -- another execution under
+the same case, run and node -- is refused by name: each differing scope key
+(values for identifiers and the maintenance expiry only; digests and paths are
+named, never shown) and what the journal records (phase, last request and
+failure, bound window). Only the execution that wrote a journal can resume it.
+
 The host publishes a copied helper, one temporary target timeout drop-in, an
 independent restore service, and a separate stop service/timer. Each publication
 has a private source inode and a durable receipt before create-only linking.

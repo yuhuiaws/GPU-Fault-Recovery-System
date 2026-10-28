@@ -459,3 +459,91 @@ class Transport:
 
     def residuals(self) -> dict[str, bool]:
         return self.residual
+
+
+def abandoned_window_journal(
+    directory: Path,
+    *,
+    node: str,
+    node_uid: str,
+    run_id: str,
+    release_id: str = "37db33f254a1",
+    restore_at: int = 1793111242,
+    phase: str = "CLEANUP_REQUIRED",
+) -> tuple[Path, probe.ServiceWindow]:
+    """A controller journal its run never closed, as 030 leaves it live.
+
+    The live shape (plain EKS 2026-10-27): the kubelet window bound and
+    SCHEDULED, the undo's ``cleanup`` request failed with
+    ``HostProbeMissingResponseError`` while kubelet was down, and the host-probe
+    record beside it still open. Returns the journal's path and the window its
+    binding names (key, units, drop-in, claim) for the assertions.
+    """
+
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    record = directory / "gpu-fault-host-probe-aababed795.json"
+    probe.write_record(
+        record,
+        {
+            "schema_version": 1,
+            "scope": {"case_id": CASE, "run_id": run_id, "node": node},
+            "owner": "1" * 32,
+            "node_uid": node_uid,
+            "closed": False,
+            "script_may_exist": True,
+            "resources": {
+                kind: {
+                    "name": record.stem,
+                    "uid": f"{kind}-uid",
+                    "create_started": True,
+                }
+                for kind in ("pod", "configmap")
+            },
+        },
+    )
+    binding = {
+        "case_id": CASE,
+        "run_id": run_id,
+        "owner": "a" * 32,
+        "cluster_id": "gpu-eks-cluster",
+        "node": node,
+        "node_uid": node_uid,
+        "agent_identity": "i-00000000000000001",
+        "release_id": release_id,
+        "plan_sha256": "b" * 64,
+        "helper_sha256": "c" * 64,
+        "baseline_sha256": "d" * 64,
+        "host_sha256": "e" * 64,
+        "boot_id": "0d72ffa5-b48d-443f-a741-5b71d0d396bc",
+        "service": "kubelet.service",
+        "restore_at": restore_at,
+        "expires_at": restore_at + probe.RECOVERY_SECONDS,
+        "stop_delay_seconds": 15,
+    }
+    window = probe.ServiceWindow(binding)
+    journal = directory / "destr008-service-window-37d3574112cdc1ee0fcfa222.json"
+    probe.write_record(
+        journal,
+        {
+            "schema_version": 1,
+            "scope": {
+                "case_id": CASE,
+                "run_id": run_id,
+                "node": node,
+                "node_uid": node_uid,
+                "release_id": release_id,
+                "host_state_path": str(record),
+            },
+            "owner": "a" * 32,
+            "phase": phase,
+            "supervision_lost": False,
+            "binding": binding,
+            "host_ack": {
+                "phase": "SCHEDULED",
+                "restore_unit": window.units["restore-service"],
+            },
+            "last_request": "cleanup",
+            "last_failure": "HostProbeMissingResponseError",
+        },
+    )
+    return journal, window

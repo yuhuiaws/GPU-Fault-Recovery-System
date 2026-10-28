@@ -3991,6 +3991,40 @@ variants (`stale_metrics`, `configuration_error`, `reserved_spare`) never stop
 kubelet; GF-REGIONAL-DESTR-008 S3 always waited for the node Ready before its
 `restore()` and did not have the defect.
 
+The rerun of 030 `not_ready` on the next release was refused by the earlier
+run's custody, not by anything on the node. Live 2026-10-28 (plain EKS, release
+e78e0049b586, the same lane and attempt) it ended INCONCLUSIVE `service
+controller identity or state changed` 8 s after declaring the spare. That
+check compares the local controller journal's scope, not a systemd identity:
+the 2026-10-27 run's undo (before `restore_through_node`) had left its journal
+at CLEANUP_REQUIRED and its host-probe record open; an open record keeps its
+run id (`rerun_run_id`), so the rerun computed the same journal path, and the
+journal's scope differed in `release_id` and `maintenance_expires_at` -- values
+only the execution that wrote it holds, so it can neither resume nor reuse that
+window. On the node the rerun touched nothing: kubelet still ran the invocation
+the earlier window's restore unit had started at its `restore_at`, while that
+window's drop-in, three units, kubelet claim, window directory and host-probe
+script copy remained, with its host-probe Pod (DeadlineExceeded) and ConfigMap
+in the cluster. On HyperPod (2026-10-24/25) a window left the same way had
+already turned the next run's window on that node into a second one nobody
+could close: its `prepare` refused the claim only after writing its own
+journal, and its cleanup stopped at the same claim. Now 030 `not_ready` reads
+`spare-service/` first and is BLOCKED(FIXTURE_NOT_READY) before anything is
+declared while a journal there is open on the candidate, naming the journal,
+the window's drop-in, units, claim and directory, and its host probe; the
+controller's journal refusal names each differing scope key (values for ids and
+the expiry only) and what the journal records; the warm-spare probe's snapshot
+reports the service's claim holder and the controller refuses a claimed service
+before anything is bound, so the refused window publishes nothing and closes;
+a missing host-probe response names the probe Pod, the node, where kubectl said
+the exec channel broke (a fixed label, never kubectl's stderr) and the node's
+Ready condition; and the close over the restored channel is retried a few times
+before failing as `NodeRestoreUnconfirmed`. Retiring a window left like this is
+an operator action: on the node remove the window's drop-in, its units and the
+claim and run `systemctl daemon-reload` (the service keeps running), delete its
+host-probe Pod and ConfigMap, then move its journal and host-probe record out of
+the case's `spare-service/`.
+
 030 `stale_metrics` then failed identically on both clusters live 2026-10-27
 (HyperPod 14:47Z, plain EKS 14:51Z, release 37db33f254a1): the first step after
 the declaration -- the metrics pause -- ended `HostProbeError: host probe failed

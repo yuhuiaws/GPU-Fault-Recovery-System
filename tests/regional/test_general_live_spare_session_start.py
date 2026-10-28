@@ -39,7 +39,11 @@ from gpu_fault.admin import operator_identity, warm_spare
 from scripts.e2e.regional import general_live_spares as sp
 from scripts.e2e.regional import run_general_live as runner
 from scripts.e2e.regional import warm_spare_fixture as wsf
-from scripts.e2e.regional.general_live_fixture import GeneralLiveSettings, ProbeHandle
+from scripts.e2e.regional.general_live_fixture import (
+    GeneralLiveSettings,
+    ProbeHandle,
+    run_identity,
+)
 from scripts.e2e.regional.general_live_registry import VariantSpec
 from scripts.e2e.regional.general_live_store import PREFLIGHT_PROBE
 from scripts.e2e.regional.host_probe_fixture import HostProbeFixture
@@ -55,6 +59,7 @@ from scripts.e2e.regional.warm_spare_fixture import (
 )
 from scripts.e2e.regional.warm_spare_fixture import STORE_PROBE as WARM_STORE_PROBE
 from tests.admin.test_admin_site import site_file as write_site_file
+from tests.regional._destr008_service_window import abandoned_window_journal
 
 #: The spare candidate (the lane's --node-b) and the lane's own target node.
 NODE = "ip-10-0-43-9.us-west-2.compute.internal"
@@ -572,3 +577,35 @@ def test_not_ready_opens_the_service_window_as_the_destr008_fixture(
     assert captured.get("case_id") == sp.SERVICE_WINDOW_FIXTURE_CASE_ID, captured
     # The identity the fixture stamped is exactly the one the probe grants.
     probe.binding_key(_valid_binding(captured["case_id"]))
+
+
+def test_a_rerun_meeting_the_earlier_runs_open_window_is_blocked_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The live sequence end to end (plain EKS, 2026-10-27 -> 2026-10-28): the
+    earlier run of this lane and attempt left its window's journal at
+    CLEANUP_REQUIRED and its host-probe record open; the rerun keeps that run id
+    (an open record keeps it) and -- with the runner's own objects -- ends
+    BLOCKED naming the journal, before the spare is declared or a probe made."""
+
+    spec = SPECS["not_ready"]
+    settings, run_dir = configured(tmp_path, monkeypatch, spec)
+    cluster = SpareCluster()
+    install_fakes(monkeypatch, cluster)
+    base = run_identity(spec.case_id, spec.variant, 1, run_dir)
+    case_dir = run_dir / "cases" / spec.key
+    journal, _window = abandoned_window_journal(
+        case_dir / sp.SERVICE_STATE, node=NODE, node_uid=NODE_UID, run_id=base
+    )
+
+    result = run_variant(spec, settings, run_dir)
+
+    assert result["verdict"] == "BLOCKED" and result["reason"] == "FIXTURE_NOT_READY"
+    assert result["run_id"] == base, "the open record kept the earlier run id"
+    assert journal.name in result["detail"], result["detail"]
+    assert "Nothing was declared or stopped" in result["detail"]
+    assert cluster.node_patches == [], "the spare was never declared or cordoned"
+    assert result["cleanup"] == [] and result["cleanup_pending"] == []
+    assert json.loads(journal.read_text(encoding="utf-8"))["phase"] == (
+        "CLEANUP_REQUIRED"
+    ), "the earlier custody is left for its retirement, not rewritten"

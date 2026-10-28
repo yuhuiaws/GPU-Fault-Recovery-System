@@ -802,7 +802,12 @@ def test_baseline_refusals_name_every_failing_condition() -> None:
         "ExecMainStartTimestampMonotonic": "1000",
         "Job": "",
     }
-    good = {"service": "kubelet.service", "pins": dict(scope), "state": running}
+    good = {
+        "service": "kubelet.service",
+        "pins": dict(scope),
+        "state": running,
+        "claim": None,
+    }
     assert (
         controller.baseline_refusals(good, service="kubelet.service", scope=scope) == []
     )

@@ -2614,6 +2614,27 @@ INCONCLUSIVE——该变体的论断是"产品在 kubelet 停着时把热备判�
 `stale_metrics`/`configuration_error`/`reserved_spare` 不停 kubelet，撤销不受影响；
 GF-REGIONAL-DESTR-008 S3 一向先等节点 Ready 再 `restore()`，没有这个缺陷。
 
+同一车道、同一 attempt 在下一个 release 上的重跑被**上一轮的 custody** 拒绝，而不是被节点拒绝。
+真机 2026-10-28（plain EKS，release e78e0049b586）：声明热备 8 s 后以 `service controller
+identity or state changed` 判 INCONCLUSIVE。这一检查比较的是本地 controller journal 的 scope，
+不是任何 systemd 身份：2026-10-27 那一轮的撤销（早于 `restore_through_node`）把 journal 留在
+CLEANUP_REQUIRED、host-probe 记录未关闭；未关闭的记录保留原 run id（`rerun_run_id`），于是重跑
+算出同一 journal 路径，而 journal 的 scope 在 `release_id` 与 `maintenance_expires_at` 上不同——
+这些值只有写下它的那次执行持有，所以既不能续做也不能复用那个窗口。节点上重跑什么也没碰：kubelet
+仍是上一窗口的恢复单元在 `restore_at` 拉起的那个 invocation；上一窗口的 drop-in、三个单元、kubelet
+claim、窗口目录与 host-probe 脚本副本仍在，集群里还有它的 host-probe Pod（DeadlineExceeded）与
+ConfigMap。HyperPod 上（2026-10-24/25）同样留下的窗口已经让同一节点上下一轮的窗口变成第二个无人
+能关的窗口：它的 `prepare` 在写下自己的 journal 之后才拒绝那个 claim，它的 cleanup 又停在同一个
+claim 上。现在：030 `not_ready` 先读 `spare-service/`，候选节点上有未关闭的 journal 时在声明任何
+东西之前即判 BLOCKED(FIXTURE_NOT_READY)，点名该 journal、窗口的 drop-in/单元/claim/目录及其 host
+probe；controller 的 journal 拒绝逐项点名不同的 scope 键（只对 id 与到期时间给出取值）及 journal
+记录的状态；warm-spare probe 的 snapshot 报告该服务的 claim 持有者，controller 在绑定任何东西之前
+拒绝已被占用的服务，被拒的窗口什么也不发布并正常关闭；host probe 无响应时点名 probe Pod、节点、
+kubectl 所说的 exec 通道断点（固定标签，从不回显 kubectl 的 stderr）与节点的 Ready 条件；恢复通道上
+的关闭在判 `NodeRestoreUnconfirmed` 之前重试有限次。这样遗留的窗口由运维退役：在节点上删除该窗口的
+drop-in、单元与 claim 并 `systemctl daemon-reload`（服务保持运行），删除它的 host-probe Pod 与
+ConfigMap，再把它的 journal 与 host-probe 记录移出该 case 的 `spare-service/`。
+
 `stale_metrics` 实测（2026-10-27，HyperPod 14:47Z 与 plain EKS 14:51Z 同一形状，release
 37db33f254a1）：声明热备后的第一步——暂停 metrics 采集器——就以 `HostProbeError: host
 probe failed (exit 1; error ProbeError 6420bbc8692c83af); output withheld` 结束，

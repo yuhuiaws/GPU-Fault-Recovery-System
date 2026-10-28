@@ -36,7 +36,11 @@ Ready through the API until ``expires_at`` plus a margin, the window is closed
 over the restored channel as the proof, every Pod on the node is awaited Ready,
 and only then is the spare released and ``restored`` judged; a node that does
 not return by the deadline fails the undo naming ``restore_at``/``expires_at``
-and the last condition seen. Each block-only variant makes the declared spare
+and the last condition seen. An earlier window still open on the candidate in
+the case directory's ``spare-service`` -- custody an earlier run's undo never
+closed -- makes ``not_ready`` BLOCKED before anything is declared, naming the
+journal and what retiring it takes (``refuse_open_service_windows``). Each
+block-only variant makes the declared spare
 ineligible for allocation in exactly one way -- NotReady, stale GPU telemetry,
 a configuration error (foreign reservation or a non-AVAILABLE pool state) --
 and reads the product's own spare-health grading, the exact gate
@@ -71,6 +75,7 @@ from typing import Any
 from scripts.e2e.regional.general_live_fixture import (
     QUARANTINE_PREFIX,
     GeneralLiveSettings,
+    VariantBlocked,
     VariantContext,
     VariantInconclusive,
     VariantNotRun,
@@ -87,7 +92,8 @@ from scripts.e2e.regional.general_live_registry import (
 from scripts.e2e.regional.general_live_store import preflight_state
 from scripts.e2e.regional.general_live_verdicts import operations, verdict
 from scripts.e2e.regional.service_window_node_restore import (
-    NodeRestoreOverdue,
+    NodeRestoreError,
+    open_windows,
     restore_through_node,
     window_deadlines,
 )
@@ -136,6 +142,9 @@ METRICS_PAUSE_SECONDS = STALE_HOLD_SECONDS + 120 + 300
 #: rejects as "service window is not a DESTR008 fixture"). The acceptance
 #: evidence still records the running case; only the on-node fixture is shared.
 SERVICE_WINDOW_FIXTURE_CASE_ID = "GF-REGIONAL-DESTR-008"
+#: Where ``not_ready``'s service window keeps its controller journal and its
+#: host-probe record, under the case directory (``open_windows`` reads it).
+SERVICE_STATE = "spare-service"
 SPARE_LABEL = "gpu-fault.io/spare"
 HYPERPOD_HEALTH_LABEL = "sagemaker.amazonaws.com/node-health-status"
 RESERVATION_ANNOTATION = "gpu-fault.io/spare-reservation"
@@ -431,7 +440,7 @@ class SpareSession:
             # journals distinct from a real DESTR-008 run on the same node.
             case_id=SERVICE_WINDOW_FIXTURE_CASE_ID,
             run_id=self.ctx.run_id,
-            state_directory=self.ctx.case_dir / "spare-service",
+            state_directory=self.ctx.case_dir / SERVICE_STATE,
             node_uid=self.node_snapshot().get("uid", ""),
             plan_sha256=plan_sha256,
             release_id=self.ctx.regional.release_id(),
@@ -473,7 +482,7 @@ class SpareSession:
                     sleep=self.ctx.sleep,
                     ready_timeout_seconds=READY_WAIT_SECONDS,
                 )
-            except NodeRestoreOverdue as exc:
+            except NodeRestoreError as exc:
                 self.ctx.evidence.write("spare-kubelet-restore", exc.report)
                 raise
             self.ctx.evidence.write("spare-kubelet-restore", report)
@@ -973,7 +982,40 @@ def grading_window_errors(
 # --------------------------------------------------------------------------- #
 # variants
 # --------------------------------------------------------------------------- #
+def refuse_open_service_windows(ctx: VariantContext) -> None:
+    """BLOCKED, before anything is declared, while an earlier window is open.
+
+    The case directory's ``spare-service`` keeps every service window's
+    controller journal; one not CLOSED on the candidate is an earlier run's
+    custody its undo never closed (live 2026-10-27, plain EKS: the undo before
+    ``restore_through_node`` existed). While it is open the node keeps that
+    window's claim, drop-in and units, a new window is refused the claim, and a
+    rerun under the same run id -- an open record keeps its run id
+    (``rerun_run_id``) -- meets the journal itself: live 2026-10-28 the rerun
+    declared the spare, then refused "service controller identity or state
+    changed". The detail names each journal and what retiring it takes.
+    """
+
+    node = spare_candidate(ctx.settings)
+    directory = ctx.case_dir / SERVICE_STATE
+    held = open_windows(directory, node) if node else []
+    if held:
+        raise VariantBlocked(
+            "FIXTURE_NOT_READY",
+            f"an earlier run's service window on {node} is still open in "
+            f"{directory}: " + " | ".join(held) + ". Its undo never closed it, so "
+            "the node may still carry that window's claim, drop-in and units (a "
+            "new window is refused them) and a rerun under the same run id is "
+            "refused its journal. Retire it first: on the node remove that "
+            "window's drop-in, its three units and the claim and run systemctl "
+            "daemon-reload (the service keeps running), delete its host-probe Pod "
+            "and ConfigMap, then move its journal and host-probe record out of "
+            f"{directory}. Nothing was declared or stopped",
+        )
+
+
 def not_ready(ctx: VariantContext) -> dict[str, Any]:
+    refuse_open_service_windows(ctx)
     session = _declared(ctx)
     stopped = session.stop_kubelet()
     node = session.await_not_ready()

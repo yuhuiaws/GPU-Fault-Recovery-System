@@ -124,7 +124,73 @@ class HostProbeTransportError(HostProbeError):
 
 
 class HostProbeMissingResponseError(HostProbeError):
-    """No response arrived; neither execution nor transport outcome is known."""
+    """No response arrived; neither execution nor transport outcome is known.
+
+    The message names the probe Pod and node, where kubectl said the exec
+    channel broke (``exec_transport_failure``) and the node's Ready condition
+    as the API last showed it; ``transport`` and ``node_ready`` carry the same.
+    """
+
+    transport: str | None = None
+    node_ready: str | None = None
+
+
+#: ``exec_transport_failure``'s markers: where ``kubectl exec`` broke when it
+#: dialled the node's kubelet (``error dialing backend``), then where else.
+#: First match wins. "command terminated" leads: kubectl prints it only when
+#: the remote command ran, so the channel worked whatever the probe's own
+#: stderr said after it.
+DIAL_CAUSES: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("connection refused",), "connection refused: kubelet is not listening"),
+    (("no route to host",), "no route to the node"),
+    (("timeout", "timed out"), "timed out"),
+)
+EXEC_FAILURES: tuple[tuple[tuple[str, ...], str], ...] = (
+    (
+        ("command terminated with exit code",),
+        "the probe command ran and ended without printing a response",
+    ),
+    (("container not found",), "the node's kubelet does not know the probe container"),
+    (("unable to upgrade connection",), "the node's kubelet refused the exec stream"),
+    (("unable to connect to the server",), "kubectl could not reach the API server"),
+    (("notfound", "not found"), "the probe Pod was not found"),
+    (
+        (
+            "connection reset",
+            "broken pipe",
+            "unexpected eof",
+            "closed network connection",
+            "stream error",
+        ),
+        "the exec stream was cut",
+    ),
+    (("deadline exceeded", "timed out", "timeout"), "the exec stream timed out"),
+)
+
+
+def exec_transport_failure(stderr: str) -> str:
+    """Where ``kubectl exec`` said the channel broke, as a fixed label.
+
+    The API server hands an exec to the node's own kubelet: with kubelet
+    stopped the dial is refused and no probe output can arrive (GF-GENERAL-LIVE
+    030 ``not_ready``, plain EKS 2026-10-27, read only "host probe response is
+    missing (exit 1)", which said nothing about the node). The label is chosen
+    by marker (``DIAL_CAUSES``, ``EXEC_FAILURES``); kubectl's stderr itself is
+    never shown -- it carries the probe's own stderr as well.
+    """
+
+    text = stderr.casefold()
+    if not text.strip():
+        return "kubectl reported no error"
+    if "error dialing backend" in text:
+        for markers, cause in DIAL_CAUSES:
+            if any(marker in text for marker in markers):
+                return f"the API server could not reach the node's kubelet ({cause})"
+        return "the API server could not reach the node's kubelet"
+    for markers, label in EXEC_FAILURES:
+        if any(marker in text for marker in markers):
+            return label
+    return "an unclassified kubectl error (withheld)"
 
 
 # How long cleanup waits for a Pod delete to take effect before forcing it. A
@@ -348,6 +414,9 @@ class HostProbeFixture:
         #: as this error and raised after the deletions instead of before them.
         self._deleting = False
         self._save_error: OSError | None = None
+        #: The node object ``_node_uid`` last read (its Ready condition names
+        #: the node's side of a missing response).
+        self._last_node: dict[str, Any] | None = None
 
     def _acquire(self) -> None:
         if self._lock_fd is not None:
@@ -533,6 +602,7 @@ class HostProbeFixture:
 
     def _node_uid(self) -> str:
         value = self._read("node", self.settings.node)
+        self._last_node = value
         uid = value["metadata"].get("uid") if value else None
         if not isinstance(uid, str) or not uid:
             raise HostProbeError("host probe node identity is unavailable")
@@ -890,9 +960,12 @@ class HostProbeFixture:
             raise HostProbeError("host probe request was rejected; output withheld")
         if completed.stdout == "" and completed.returncode in {0, 1}:
             self._check_target()
-            raise HostProbeMissingResponseError(
-                f"host probe response is missing (exit {completed.returncode})"
+            missing_response = HostProbeMissingResponseError(
+                self._missing_response(completed.returncode, completed.stderr)
             )
+            missing_response.transport = exec_transport_failure(completed.stderr)
+            missing_response.node_ready = self._node_ready()
+            raise missing_response
         lines = completed.stdout.strip().splitlines()
         if not lines:
             raise HostProbeError(
@@ -926,6 +999,33 @@ class HostProbeFixture:
             raise failure
         self._check_target()
         return payload
+
+    def _node_ready(self) -> str:
+        """The node's Ready condition status as the API last showed it."""
+
+        status = (self._last_node or {}).get("status")
+        conditions = status.get("conditions") if isinstance(status, dict) else None
+        for condition in conditions if isinstance(conditions, list) else []:
+            if isinstance(condition, dict) and condition.get("type") == "Ready":
+                return str(condition.get("status"))
+        return "unreported"
+
+    def _missing_response(self, returncode: int, stderr: str) -> str:
+        """The missing-response text: the probe, the channel, the node."""
+
+        ready = self._node_ready()
+        if ready == "True":
+            hint = "the node is Ready, so the exec channel itself failed"
+        else:
+            hint = (
+                "kubectl exec is served by that node's own kubelet, which is not "
+                "posting Ready: no response can arrive until kubelet is back"
+            )
+        return (
+            f"host probe response is missing (exit {returncode}): no output came "
+            f"back over kubectl exec into {self.pod} on {self.settings.node}; "
+            f"{exec_transport_failure(stderr)}; node Ready={ready} ({hint})"
+        )
 
     def _check_target(self) -> dict[str, Any]:
         if self._record is None or self._record["closed"]:

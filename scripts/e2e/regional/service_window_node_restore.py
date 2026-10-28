@@ -31,13 +31,29 @@ running, stop and restore units quiescent, ``restore_reason`` naming who
 restored it) is the proof the service came back. A node that does not return
 by the deadline fails the undo with ``NodeRestoreOverdue``, whose message names
 ``restore_at``, ``expires_at``, the wait deadline and the last node condition
-observed, and whose ``report`` carries the observations made so far.
+observed, and whose ``report`` carries the observations made so far. The repeat
+over the restored channel is itself retried a few times while it still gets no
+answer -- kubelet serves an exec into a Pod only once its restarted pod workers
+know the container again -- and a node that is back but never answers fails the
+undo with ``NodeRestoreUnconfirmed``, naming when the node returned and each miss.
+
+``open_windows`` reads the other side of a failed undo: the controller journals
+a state directory still holds open. A journal that is not CLOSED is custody its
+run never closed (the 2026-10-27 run above, whose undo predates this module),
+and while it is open the node keeps that window's claim, drop-in and units.
+Live 2026-10-28 (plain EKS, the rerun of the same lane and attempt on the next
+release): the rerun's run id was the earlier run's -- an open record keeps its
+run id -- so its controller met that journal and refused "service controller
+identity or state changed" after the spare had been declared. 030 now reads the
+journals first and is BLOCKED, naming them, before it declares anything.
 """
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 from scripts.e2e.regional.host_probe_fixture import (
@@ -55,14 +71,29 @@ NODE_READY_MARGIN_SECONDS = 120
 #: no response came back over the exec channel kubelet itself serves.
 DEFERRABLE_ERRORS = (HostProbeMissingResponseError, HostProbeTransportError)
 POLL_SECONDS = 5.0
+#: Once the node posts Ready again, how many times the window's close is tried
+#: over the restored channel, and how far apart, while it still gets no answer.
+CONFIRM_ATTEMPTS = 4
+CONFIRM_RETRY_SECONDS = 15.0
+#: The controller journals a service window's state directory holds
+#: (``destr008_service_window.ServiceWindowController.path``).
+JOURNAL_GLOB = "destr008-service-window-*.json"
 
 
-class NodeRestoreOverdue(RegionalFixtureError):
-    """The node did not post Ready by the wait deadline; ``report`` has the trail."""
+class NodeRestoreError(RegionalFixtureError):
+    """An undo through the node that did not finish; ``report`` has the trail."""
 
     def __init__(self, message: str, report: dict[str, Any]) -> None:
         super().__init__(message)
         self.report = report
+
+
+class NodeRestoreOverdue(NodeRestoreError):
+    """The node did not post Ready by the wait deadline; ``report`` has the trail."""
+
+
+class NodeRestoreUnconfirmed(NodeRestoreError):
+    """The node is back but the window's close never got an answer over it."""
 
 
 def window_deadlines(
@@ -167,9 +198,48 @@ def restore_through_node(
     )
     if deferred:
         # The channel is back with kubelet: the window's CLOSED report over it
-        # is the proof of the restoration. A failure now is a real one.
-        report["confirmation"] = undo()
+        # is the proof of the restoration.
+        report["confirmation"] = _confirm(
+            undo, node_snapshot, clock=clock, sleep=sleep, report=report
+        )
     return report
+
+
+def _confirm(
+    undo: Callable[[], Any],
+    node_snapshot: Callable[[], Mapping[str, Any]],
+    *,
+    clock: Callable[[], datetime],
+    sleep: Callable[[float], None],
+    report: dict[str, Any],
+) -> Any:
+    """The explicit undo over the restored channel, retried while unanswered.
+
+    Only a missing answer is retried (``DEFERRABLE_ERRORS``), at most
+    ``CONFIRM_ATTEMPTS`` times ``CONFIRM_RETRY_SECONDS`` apart; a refused host
+    action is a real failure and propagates at once. Repeating is safe: the
+    controller's ``cleanup`` resumes its own request, and the host answers a
+    window it already closed with that window's CLOSED report.
+    """
+
+    misses: list[dict[str, Any]] = []
+    while True:
+        try:
+            return undo()
+        except DEFERRABLE_ERRORS as exc:
+            misses.append(
+                {
+                    "at": clock().isoformat(),
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "node_ready": _condition(node_snapshot),
+                }
+            )
+            report["confirmation_misses"] = misses
+            if len(misses) >= CONFIRM_ATTEMPTS:
+                raise NodeRestoreUnconfirmed(
+                    _unconfirmed_message(report), report
+                ) from exc
+            sleep(CONFIRM_RETRY_SECONDS)
 
 
 def _await_ready(
@@ -232,6 +302,117 @@ def _overdue_message(report: Mapping[str, Any], ready_by: datetime) -> str:
             f"while the node was Ready={attempt.get('node_ready')}"
         )
     return "; ".join(parts)
+
+
+def _unconfirmed_message(report: Mapping[str, Any]) -> str:
+    misses = report["confirmation_misses"]
+    returned = report["node_ready"]
+    last = misses[-1]
+    return (
+        f"{report['service']} on {report['node']} is back (the node posted "
+        f"Ready at {returned['observed_at']}) but the service window's close over "
+        f"the restored channel got no answer in {len(misses)} attempts "
+        f"{CONFIRM_RETRY_SECONDS:g} s apart (last at {last['at']}: "
+        f"{last['error']}; node Ready={last['node_ready']}); the window stays open "
+        f"-- its claim, drop-in and units remain on the node until its cleanup "
+        f"(restore unit {report.get('restore_unit') or '(unnamed)'})"
+    )
+
+
+def open_windows(directory: Path, node: str) -> list[str]:
+    """Each service window ``directory`` still holds open on ``node``, described.
+
+    ``directory`` is where a service window keeps its controller journal and
+    host-probe record (030's ``spare-service``). A journal that is not CLOSED is
+    custody its run never closed -- its undo failed or never ran -- and while it
+    is open the node may still carry that window's claim, drop-in and units: a
+    new window there is refused the claim (the probe's ``service_claim``), and
+    under the same run id the controller refuses the journal itself. One line
+    per such journal, naming what it records and what retiring it involves; a
+    journal that cannot be read counts as open, one for another node does not.
+    """
+
+    lines: list[str] = []
+    if not directory.is_dir():
+        return lines
+    for path in sorted(directory.glob(JOURNAL_GLOB)):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            lines.append(f"{path.name}: unreadable ({type(exc).__name__})")
+            continue
+        if not isinstance(data, dict):
+            lines.append(f"{path.name}: not a JSON object")
+            continue
+        recorded = data.get("scope")
+        scope: dict[str, Any] = recorded if isinstance(recorded, dict) else {}
+        if scope.get("node", node) != node or data.get("phase") == "CLOSED":
+            continue
+        lines.append(_describe_open(path, data, scope))
+    return lines
+
+
+def _describe_open(path: Path, data: dict[str, Any], scope: dict[str, Any]) -> str:
+    try:
+        written = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+        when = f", written {written.isoformat(timespec='seconds')}"
+    except OSError:
+        when = ""
+    head = (
+        f"{path.name} (run {scope.get('run_id')!r}, release "
+        f"{scope.get('release_id')!r}, phase {data.get('phase')!r}{when}"
+    )
+    request = data.get("last_request")
+    if isinstance(request, str):
+        failure = data.get("last_failure")
+        head += f", last request {request!r}" + (
+            f" failed with {failure}" if isinstance(failure, str) else ""
+        )
+    parts = [head + ")", _window_on_node(data.get("binding"))]
+    host = scope.get("host_state_path")
+    if isinstance(host, str) and host:
+        record = Path(host)
+        parts.append(
+            f"its host probe: Pod and ConfigMap {record.stem}, record "
+            f"{record.name} {_record_state(record)}"
+        )
+    return "; ".join(parts)
+
+
+def _window_on_node(binding: Any) -> str:
+    from scripts.e2e.regional.probes import warm_spare_node_probe as probe
+
+    if not isinstance(binding, Mapping):
+        return "no window was bound, so none of it is on the node"
+    try:
+        window = probe.ServiceWindow(dict(binding))
+    except (probe.ProbeError, KeyError, TypeError, ValueError):
+        return "its binding is unreadable"
+    deadlines = window_deadlines(binding) or {}
+    timing = ", ".join(
+        f"{key} {deadlines[key].isoformat()}"
+        for key in ("restore_at", "expires_at")
+        if key in deadlines
+    )
+    units = ", ".join(sorted(window.units.values()))
+    return (
+        f"its window {window.key[:32]} for {window.service} ({timing}) may keep on "
+        f"the node until retired: drop-in {window.dropin}, units {units}, claim "
+        f"{window.targets['claim']}, directory {window.directory}"
+    )
+
+
+def _record_state(path: Path) -> str:
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return "absent"
+    except (OSError, ValueError):
+        return "unreadable"
+    closed = record.get("closed") if isinstance(record, dict) else None
+    if closed is True:
+        return "closed"
+    return "open" if closed is False else "unreadable"
 
 
 def _condition(node_snapshot: Callable[[], Mapping[str, Any]]) -> str:

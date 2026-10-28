@@ -468,6 +468,60 @@ def definition(service: str, dropin: Path | None = None) -> dict[str, Any]:
     }
 
 
+def service_claim(service: str) -> dict[str, Any] | None:
+    """The service window that holds ``service`` on this host, or ``None``.
+
+    ``prepare`` publishes ``ROOT/<service>.claim`` (the window's key) and only
+    that window's ``cleanup`` removes it -- last, after its drop-in and units.
+    While it exists no other window may own the service: the next ``prepare``
+    refuses it as a resource without an owner receipt, but only after writing
+    its own journal, and that window's cleanup then stops at the same claim
+    (HyperPod 2026-10-24/25: a window left by a failed cleanup turned the next
+    run's window on that node into a second one nobody could close). The
+    snapshot names the holder so the controller refuses before anything is
+    armed. Read-only: nothing is created, locked or removed; a holder that
+    cannot be read is reported as ``unreadable``, never as no claim.
+    """
+
+    path = ROOT / f"{service_name(service)}.claim"
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return None
+    claim: dict[str, Any] = {"path": str(path), "key": None, "unreadable": False}
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 256:
+                raise ProbeError("service claim is not a window key")
+            key = os.read(fd, 257).decode("ascii").strip()
+        finally:
+            os.close(fd)
+        if not HEX.fullmatch(key):
+            raise ProbeError("service claim is not a window key")
+        claim["key"] = key
+        record = private_read(ROOT / key / "state.json")
+        binding = record.get("binding")
+        if not isinstance(binding, dict):
+            raise ProbeError("service claim holder has no binding")
+        claim["phase"] = record.get("phase") if record.get("phase") in PHASES else None
+        reason = record.get("restore_reason")
+        claim["restore_reason"] = (
+            reason if reason in {"controller", "cleanup", "deadline"} else None
+        )
+        for name in ("case_id", "run_id", "release_id"):
+            value = binding.get(name)
+            claim[name] = (
+                value if isinstance(value, str) and SAFE_ID.fullmatch(value) else None
+            )
+        for name in ("restore_at", "expires_at"):
+            claim[name] = binding.get(name) if type(binding.get(name)) is int else None
+    except (OSError, ValueError, ProbeError):
+        claim["unreadable"] = True
+    return claim
+
+
 def capture(service: str) -> dict[str, Any]:
     baseline = definition(service)
     state = service_snapshot(service)
@@ -480,6 +534,7 @@ def capture(service: str) -> dict[str, Any]:
         "pins": baseline["pins"],
         "baseline_sha256": digest({"definition": baseline, "state": state}),
         "state": state,
+        "claim": service_claim(service),
     }
 
 

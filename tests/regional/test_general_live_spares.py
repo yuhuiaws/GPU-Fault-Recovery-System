@@ -13,7 +13,11 @@ import pytest
 
 from scripts.e2e.regional import general_live_spares as sp
 from scripts.e2e.regional.general_live_collectors import SILENCE_THRESHOLDS
-from scripts.e2e.regional.general_live_fixture import VariantInconclusive, pause_bound
+from scripts.e2e.regional.general_live_fixture import (
+    VariantBlocked,
+    VariantInconclusive,
+    pause_bound,
+)
 from scripts.e2e.regional.general_live_registry import (
     APPROVALS,
     build_registry,
@@ -21,6 +25,7 @@ from scripts.e2e.regional.general_live_registry import (
 )
 from scripts.e2e.regional.probes import general_live_node_pause as pausep
 from scripts.e2e.regional.probes import general_live_node_probe as nodep
+from tests.regional._destr008_service_window import abandoned_window_journal
 from tests.regional._general_live_fakes import (
     FakeProbe,
     FakeRegional,
@@ -900,3 +905,103 @@ def test_context_pause_refuses_a_hold_outside_the_node_probe_bound_before_shippi
     assert pause_bound(("unit-resume", "--unit", METRICS_UNIT)) is None
     with pytest.raises(ValueError, match=r"exporter-pause of 1501 s"):
         pause_bound(("exporter-pause", "--seconds", "1501"))
+
+
+# --------------------------------------------------------------------------- #
+# an earlier run's service window still open on the candidate
+# --------------------------------------------------------------------------- #
+def test_an_open_earlier_window_blocks_not_ready_before_anything_is_declared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live 2026-10-28 (plain EKS, R13h): the rerun of the same lane and attempt
+    met the R13g run's journal, still CLEANUP_REQUIRED after its undo got no
+    response, declared the spare and only then refused "service controller
+    identity or state changed"."""
+
+    _patch(monkeypatch, _node(ready="False"), _store())
+    ctx = _ctx(SPECS["not_ready"], tmp_path)
+    directory = ctx.case_dir / sp.SERVICE_STATE
+    journal, window = abandoned_window_journal(
+        directory, node=NODE, node_uid="spare-uid", run_id=ctx.run_id
+    )
+
+    with pytest.raises(VariantBlocked) as blocked:
+        SPECS["not_ready"].execute(ctx)
+
+    assert blocked.value.reason == "FIXTURE_NOT_READY"
+    detail = blocked.value.detail
+    for needle in (
+        f"an earlier run's service window on {NODE} is still open in {directory}: ",
+        f"{journal.name} (run {ctx.run_id!r}, release '37db33f254a1', phase "
+        "'CLEANUP_REQUIRED', written ",
+        "last request 'cleanup' failed with HostProbeMissingResponseError)",
+        f"its window {window.key[:32]} for kubelet.service (restore_at "
+        "2026-10-27T14:27:22+00:00, expires_at 2026-10-27T14:30:22+00:00) may keep on "
+        "the node until retired: drop-in "
+        f"{window.dropin}, units {', '.join(sorted(window.units.values()))}, claim "
+        f"{window.targets['claim']}, directory {window.directory}",
+        "its host probe: Pod and ConfigMap gpu-fault-host-probe-aababed795, record "
+        "gpu-fault-host-probe-aababed795.json open",
+        "Retire it first",
+        "Nothing was declared or stopped",
+    ):
+        assert needle in detail, (needle, detail)
+    assert FakeSpareSession.instances == [], "no session, so nothing was declared"
+
+
+@pytest.mark.parametrize("shape", ["closed", "other-node"])
+def test_a_closed_or_foreign_journal_does_not_block_not_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shape: str
+) -> None:
+    _patch(monkeypatch, _node(ready="False"), _store())
+    ctx = _ctx(SPECS["not_ready"], tmp_path)
+    abandoned_window_journal(
+        ctx.case_dir / sp.SERVICE_STATE,
+        node=NODE if shape == "closed" else "ip-10-0-9-9.us-west-2.compute.internal",
+        node_uid="spare-uid",
+        run_id=ctx.run_id,
+        phase="CLOSED" if shape == "closed" else "CLEANUP_REQUIRED",
+    )
+
+    result = SPECS["not_ready"].execute(ctx)
+
+    assert result["verdict"] == "PASS", result["errors"]
+    assert FakeSpareSession.instances[-1].kubelet_stopped, (
+        "a journal closed or for another node does not hold this spare"
+    )
+
+
+def test_an_unreadable_journal_counts_as_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch(monkeypatch, _node(ready="False"), _store())
+    ctx = _ctx(SPECS["not_ready"], tmp_path)
+    directory = ctx.case_dir / sp.SERVICE_STATE
+    directory.mkdir(parents=True, mode=0o700)
+    (directory / "destr008-service-window-0123456789abcdef01234567.json").write_text(
+        "{half a journal", encoding="utf-8"
+    )
+
+    with pytest.raises(VariantBlocked, match="unreadable \\(JSONDecodeError\\)"):
+        SPECS["not_ready"].execute(ctx)
+    assert FakeSpareSession.instances == []
+
+
+def test_the_other_variants_never_read_the_service_window_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only ``not_ready`` stops kubelet; the block-only siblings run as before."""
+
+    _patch(monkeypatch, _node(), _store())
+    ctx = _ctx(SPECS["configuration_error"], tmp_path)
+    abandoned_window_journal(
+        ctx.case_dir / sp.SERVICE_STATE,
+        node=NODE,
+        node_uid="spare-uid",
+        run_id=ctx.run_id,
+    )
+    assert FakeSpareSession.instances == []
+    SPECS["configuration_error"].execute(ctx)
+    assert FakeSpareSession.instances[-1].declared, (
+        "the block-only siblings never stop kubelet and are not held"
+    )

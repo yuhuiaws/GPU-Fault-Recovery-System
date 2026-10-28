@@ -516,3 +516,122 @@ def test_stop_kubelet_undo_with_kubelet_up_is_explicit(
     assert entry["ok"] and entry["result"]["explicit_undo"]["outcome"] == "restored"
     assert instances[0].cleanups == ["True"] and "confirmation" not in entry["result"]
     assert clock.now == UNDO_AT, "nothing was waited for"
+
+
+# --------------------------------------------------------------------------- #
+# the close over the restored channel
+# --------------------------------------------------------------------------- #
+class LateChannel(ChannelUndo):
+    """The node is back, but the exec channel answers only from ``answers_from``."""
+
+    def __init__(self, node: VirtualNode, answers_from: int | None) -> None:
+        super().__init__(node)
+        self.answers_from = answers_from
+
+    def __call__(self) -> dict[str, Any]:
+        self.calls.append(self.node.ready())
+        if self.node.ready() != "True" or (
+            self.answers_from is None or len(self.calls) < self.answers_from
+        ):
+            raise HostProbeMissingResponseError(
+                "host probe response is missing (exit 1): no output came back"
+            )
+        return {"residuals": {"pod": False, "configmap": False}, "window": CLOSED}
+
+
+def test_a_close_unanswered_right_after_the_node_returns_is_retried() -> None:
+    """kubelet posts Ready a moment before it serves exec into the old Pod:
+    the close is repeated, the misses kept beside the proof."""
+
+    clock = Clock(UNDO_AT)
+    node = VirtualNode(clock, ready_at=RESTORE_AT + timedelta(seconds=1))
+    undo = LateChannel(node, answers_from=4)  # deferred, two misses, then CLOSED
+
+    report = _restore(clock, node, undo)
+
+    assert report["confirmation"]["window"] == CLOSED
+    misses = report["confirmation_misses"]
+    assert [miss["node_ready"] for miss in misses] == ["True", "True"], misses
+    assert all(
+        m["error"].startswith("HostProbeMissingResponseError: ") for m in misses
+    ), misses
+    first, second = (datetime.fromisoformat(m["at"]) for m in misses)
+    assert second - first == timedelta(seconds=restore.CONFIRM_RETRY_SECONDS)
+    assert undo.calls == ["Unknown", "True", "True", "True"]
+
+
+def test_a_node_back_whose_close_never_answers_fails_naming_every_miss() -> None:
+    clock = Clock(UNDO_AT)
+    node = VirtualNode(clock, ready_at=RESTORE_AT + timedelta(seconds=1))
+    undo = LateChannel(node, answers_from=None)
+
+    with pytest.raises(restore.NodeRestoreUnconfirmed) as info:
+        _restore(clock, node, undo)
+
+    message = str(info.value)
+    returned = info.value.report["node_ready"]["observed_at"]
+    for needle in (
+        f"kubelet.service on {NODE} is back (the node posted Ready at {returned})",
+        f"got no answer in {restore.CONFIRM_ATTEMPTS} attempts "
+        f"{restore.CONFIRM_RETRY_SECONDS:g} s apart",
+        "HostProbeMissingResponseError: host probe response is missing (exit 1)",
+        "node Ready=True",
+        "the window stays open -- its claim, drop-in and units remain on the node",
+        f"(restore unit {RESTORE_UNIT})",
+    ):
+        assert needle in message, (needle, message)
+    assert isinstance(info.value, restore.NodeRestoreError), (
+        "the 030 undo records the report of every NodeRestoreError"
+    )
+    assert isinstance(info.value, RegionalFixtureError), (
+        "an unconfirmed restore is a fixture error the cleanup stack records"
+    )
+    assert len(info.value.report["confirmation_misses"]) == restore.CONFIRM_ATTEMPTS
+    assert len(undo.calls) == 1 + restore.CONFIRM_ATTEMPTS, "bounded, then failed"
+
+
+def test_a_refused_close_over_the_restored_channel_is_not_retried() -> None:
+    clock = Clock(UNDO_AT)
+    node = VirtualNode(clock, ready_at=RESTORE_AT + timedelta(seconds=1))
+    calls: list[str] = []
+
+    def undo() -> dict[str, Any]:
+        calls.append(node.ready())
+        if node.ready() != "True":
+            raise HostProbeMissingResponseError("host probe response is missing")
+        raise HostProbeError("host probe failed (exit 1; error ProbeError)")
+
+    with pytest.raises(HostProbeError, match="host probe failed"):
+        _restore(clock, node, undo)
+    assert calls == ["Unknown", "True"], "a host refusal is a real failure at once"
+
+
+def test_stop_kubelet_undo_records_the_trail_of_an_unanswered_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = Clock(UNDO_AT - timedelta(minutes=2))
+    node = VirtualNode(clock, ready_at=None)
+    fake, instances = _service_fixture_fake(clock, node)
+    monkeypatch.setattr(wsf, "WarmSpareServiceFixture", fake)
+    session = _session(tmp_path, monkeypatch, clock, node)
+    session.stop_kubelet()
+
+    def silent() -> dict[str, bool]:
+        instances[0].cleanups.append(node.ready())
+        raise HostProbeMissingResponseError("host probe response is missing (exit 1)")
+
+    instances[0].cleanup = silent
+    clock.sleep(80)
+    (entry,) = session.ctx.cleanup.run()
+
+    assert entry["name"] == "spare-kubelet" and not entry["ok"]
+    assert entry["error"].startswith("NodeRestoreUnconfirmed: kubelet.service on "), (
+        entry["error"]
+    )
+    written = json.loads(
+        (session.ctx.case_dir / "spare-kubelet-restore.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert written["node_ready"]["ready"] == "True"
+    assert len(written["confirmation_misses"]) == restore.CONFIRM_ATTEMPTS

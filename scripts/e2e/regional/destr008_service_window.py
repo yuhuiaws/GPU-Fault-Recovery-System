@@ -101,7 +101,9 @@ def baseline_refusals(
     unit, the pins (cluster id, node name, the Agent's identity) and the
     systemd state fields -- none of which is a secret. The pins are compared
     against the provider-aware scope: ``agent_identity`` is the Node UID on
-    HyperPod and the EC2 instance id on ``eks-managed``.
+    HyperPod and the EC2 instance id on ``eks-managed``. A service another
+    window still claims on the host (the probe's ``claim``) is refused too,
+    naming the holder: its claim, drop-in and units stay until its own cleanup.
     """
 
     if not isinstance(snapshot, dict):
@@ -118,6 +120,10 @@ def baseline_refusals(
                 refusals.append(
                     f"pin {key} is {pins.get(key)!r}, approved target {scope[key]!r}"
                 )
+    if "claim" not in snapshot:
+        refusals.append("snapshot does not report the service's window claim")
+    elif snapshot["claim"] is not None:
+        refusals.append(claim_refusal(service, snapshot["claim"]))
     state = snapshot.get("state")
     if not isinstance(state, dict):
         refusals.append(f"snapshot has no state ({type(state).__name__})")
@@ -141,6 +147,143 @@ def baseline_refusals(
             )
         )
     return refusals
+
+
+def epoch_text(value: Any) -> str:
+    """An epoch-seconds value as UTC ISO text, or its repr when it is not one."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return repr(value)
+    try:
+        return datetime.fromtimestamp(value, timezone.utc).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return repr(value)
+
+
+def claim_refusal(service: str, claim: Any) -> str:
+    """Why another window's claim on ``service`` refuses a new window, by name.
+
+    ``claim`` is the probe's ``service_claim`` report: the holder's key and
+    what its on-node journal records (case, run, release, phase, who restored
+    the service, its deadlines). The holder is retired by its own cleanup
+    only; until then a new window would publish nothing it could close.
+    """
+
+    if not isinstance(claim, dict):
+        return f"the service claim report is {type(claim).__name__}, not a JSON object"
+    key = claim.get("key")
+    holder = (
+        f"service window {key[:32]}"
+        if isinstance(key, str) and probe.HEX.fullmatch(key)
+        else "an unidentified service window"
+    )
+    details = [
+        f"{name} {claim[name]!r}"
+        for name in ("case_id", "run_id", "release_id", "phase", "restore_reason")
+        if isinstance(claim.get(name), str)
+    ]
+    details.extend(
+        f"{name} {epoch_text(claim[name])}"
+        for name in ("restore_at", "expires_at")
+        if claim.get(name) is not None
+    )
+    if claim.get("unreadable") is not False:
+        details.append("its on-node journal could not be read")
+    return (
+        f"{service} is already claimed by {holder}"
+        + (f" ({', '.join(details)})" if details else "")
+        + f": a new window cannot own {service} until that window is closed by its"
+        f" own cleanup or retired on the node ({claim.get('path')!r})"
+    )
+
+
+#: Scope keys a journal refusal may print the values of: names and ids only --
+#: never a path, a digest or anything read from the kubeconfig.
+SHOWN_SCOPE_KEYS = frozenset(
+    {
+        "case_id",
+        "run_id",
+        "cluster_id",
+        "node",
+        "node_uid",
+        "agent_identity",
+        "release_id",
+        "namespace",
+        "context",
+    }
+)
+
+
+def journal_refusals(data: dict[str, Any], scope: dict[str, Any]) -> list[str]:
+    """Why an existing controller journal is not this controller's, by name.
+
+    The journal's scope is everything its window was approved under: the
+    transport and the sources (as digests), the cluster, Node and Agent
+    identities, the release, the plan digest and the maintenance expiry. A
+    later execution under the same run id -- a rerun of the same lane and
+    attempt while the earlier run's custody is still open -- differs at least
+    in the release or the expiry, so it can neither resume nor reuse that
+    window. Values are shown for ids only; a path or digest is named as
+    differing.
+    """
+
+    refusals: list[str] = []
+    if data.get("schema_version") != 1:
+        refusals.append(f"schema_version is {data.get('schema_version')!r}, not 1")
+    recorded = data.get("scope")
+    if not isinstance(recorded, dict):
+        refusals.append(f"the journal has no scope ({type(recorded).__name__})")
+    else:
+        for key in sorted(set(recorded) | set(scope)):
+            if key not in scope:
+                refusals.append(f"{key} is recorded but not in this run's scope")
+                continue
+            if key not in recorded:
+                refusals.append(f"{key} is missing from the journal")
+                continue
+            theirs, ours = recorded[key], scope[key]
+            if theirs == ours:
+                continue
+            if key in SHOWN_SCOPE_KEYS:
+                refusals.append(f"{key} recorded {theirs!r}, this run {ours!r}")
+            elif key == "maintenance_expires_at":
+                refusals.append(
+                    f"{key} recorded {epoch_text(theirs)}, this run {epoch_text(ours)}"
+                )
+            else:
+                refusals.append(f"{key} differs")
+    phase = data.get("phase")
+    if not isinstance(phase, str) or phase not in PHASES:
+        refusals.append(f"phase is {phase!r}")
+    owner = data.get("owner")
+    if not isinstance(owner, str) or not re.fullmatch(r"[0-9a-f]{32}", owner):
+        refusals.append("owner is not a 32-hex token")
+    if type(data.get("supervision_lost")) is not bool:
+        refusals.append(f"supervision_lost is {data.get('supervision_lost')!r}")
+    return refusals
+
+
+def journal_state(data: dict[str, Any]) -> str:
+    """What a controller journal says its window reached, for a refusal."""
+
+    parts = [f"phase {data.get('phase')!r}"]
+    request = data.get("last_request")
+    if isinstance(request, str):
+        failure = data.get("last_failure")
+        parts.append(
+            f"last request {request!r}"
+            + (f" failed with {failure}" if isinstance(failure, str) else "")
+        )
+    binding = data.get("binding")
+    if isinstance(binding, dict):
+        parts.append(
+            f"a window bound for {binding.get('service')!r} on "
+            f"{binding.get('node')!r} (restore_at {epoch_text(binding.get('restore_at'))}"
+            f", expires_at {epoch_text(binding.get('expires_at'))})"
+        )
+    else:
+        parts.append("no service window bound")
+    return ", ".join(parts)
 
 
 class ServiceWindowController:
@@ -254,8 +397,26 @@ class ServiceWindowController:
                     or not re.fullmatch(r"[0-9a-f]{32}", data["owner"])
                     or type(data.get("supervision_lost")) is not bool
                 ):
+                    # This compares the local controller journal with this
+                    # controller's scope, not any systemd identity on the node.
+                    # Live 2026-10-28 (plain EKS, 030 not_ready on R13h): the
+                    # R13g run's journal under the same run id, left at
+                    # CLEANUP_REQUIRED by its failed undo, read only as
+                    # "identity or state changed". The decision is unchanged;
+                    # ``journal_refusals`` only names what differs.
+                    refusals = journal_refusals(data, self.scope) or [
+                        "the journal differs from this controller's scope"
+                    ]
                     raise RegionalFixtureError(
-                        "service controller identity or state changed"
+                        "service controller identity or state changed: the "
+                        f"controller journal {self.path.name} ("
+                        + journal_state(data)
+                        + ") is not this controller's: "
+                        + "; ".join(refusals)
+                        + ". Only the execution that wrote it can resume it; an "
+                        "earlier run's window still open under this run id must be"
+                        " retired (its node-side window and host probe, then the "
+                        "journal) before a rerun"
                     )
                 if data["supervision_lost"]:
                     raise RegionalFixtureError(
