@@ -3737,7 +3737,22 @@ after it, a two-node outage of one export formed no record, and the safety net n
 workflow is now judged on the markers re-pointed at it (an activation's own `NODE_HEALTH` chain and a record without a
 workflow cost no read, every other open record one indexed read), so the same record forms whichever node reports first;
 the node counts once, the reboot keeps its plan, progress and state, and the node gets no chain of its own beside it
-(b215, `tests/host_health/test_rebooting_member_failure_domain.py`). The whole domain mails once
+(b215, `tests/host_health/test_rebooting_member_failure_domain.py`). A member's per-node record may also have
+closed already: a shared-storage activation's own chain does not wait for the export -- VALIDATE_HOST reads the gauge,
+finds the export still unavailable and fails, and a failed chain that never touched the node closes its record
+`RECOVERED` "diagnostic inconclusive" (`execution/terminal_state.py`), live 1-2 s after the record was created. Each
+node finds the outage on its own collector tick, so the peer's activation lands up to one tick (15 s) later, mostly
+after the first node's record has closed: plain EKS on 2026-10-28, records 2.5 s apart on the node clocks, the first
+closed 0.8 s before the second was created, no domain record; HyperPod on 2026-10-27, 3.4 s apart, closed 1.8 s
+before, no record either (the HyperPod pass that evening had its two activations 0.7 s apart, inside the first chain's
+run). The peer look took only open records, so the node that reported first was never a peer although its latest
+reading still said "unavailable" -- and its latest reading, not its record's state, is the evidence. The peer look,
+the safety net and the member-incident lookup now also take a `RECOVERED` record an activation minted that closed
+inside the window (one read of the cluster's newest 200 `RECOVERED` records, `updated_at` against the control-plane
+clock that stamped it; no marker is read for a record that is not an activation's), and the node's latest reading
+decides as for an open record; the look after the commit counts the record this very activation was linked to
+whatever its state; the back-reference is written on the closed record as on an open one (its state, action and
+chain stay as they are) (b216, `tests/host_health/test_closed_member_failure_domain.py`). The whole domain mails once
 (`SHARED_STORAGE_FAILURE_DOMAIN`, deduplicated
 per cluster/export/record id); a node that joins later is added to `node_ids` and `reasons` without another mail. The
 export identity comes from the collector's sample label `source` (the mountinfo mount source, e.g. `10.0.0.5:/export`,
@@ -3747,11 +3762,11 @@ reading inside the window → `DETECTED`; every member's latest reading is "avai
 the signals clear); no fresh "unavailable" reading but a silent member (last reading unavailable and older than the
 window, or no reading at all) → `ESCALATED` (silence is not recovery; the operator owns the close, and an "available"
 from the silent node later still closes it `RECOVERED`). Concurrent activations for one export do not see each other:
-a shared outage hits every node in the same collector tick, the batches land seconds apart on separate replicas and
-each is ingested in its own transaction (one advisory lock per cluster/node/batch, READ COMMITTED), so the look inside
-the transaction (`observe_finding`) finds only peers that had already committed -- live on HyperPod two nodes lost one
-NFS export, both per-node incidents were minted 3.4 s apart and no record was formed. The correlation therefore looks
-twice: once inside the transaction and once more after the batch's own commit (`observe_committed`, called from the
+the batches of one outage land seconds apart on separate replicas and each is ingested in its own transaction (one
+advisory lock per cluster/node/batch, READ COMMITTED), so the look inside the transaction (`observe_finding`) finds
+only peers that had already committed. (The HyperPod miss this was first written for -- per-node incidents 3.4 s
+apart, no record -- was a closed member, see above: the first record had closed before the second activation was
+ingested, the transactions never overlapped.) The correlation therefore looks twice: once inside the transaction and once more after the batch's own commit (`observe_committed`, called from the
 finish half of host ingestion), so whichever of two concurrent activations commits last sees the other; identical
 member sets derive identical record ids and the notification is deduplicated per record, so two late looks converge on
 one record and one mail. The per-batch safety net (every later "still unavailable" sample inside the window re-checks

@@ -41,27 +41,44 @@ This module is the additive, control-plane-only correlation on top of that:
   reboot_window.py``, b215). Only the finding's marker ties the node to the
   last two (``_activation_nodes``); the peer look, the safety net and the
   member-incident lookup all follow it, whichever node reports first.
+* **Closed members.** A member's own chain does not wait for the export: its
+  VALIDATE_HOST reads the gauge, finds the export still unavailable and
+  fails, and a failed chain that never touched the node closes its record
+  RECOVERED "diagnostic inconclusive" (``execution/terminal_state.py``) --
+  live 1-2 s after the record was created. Each node finds the outage on its
+  own collector tick, so a peer's activation lands up to one tick (15 s)
+  later, mostly after the first node's record has closed: plain EKS
+  2026-10-28, records 2.5 s apart (node clocks), the first closed 0.8 s
+  before the second was created; HyperPod 2026-10-27, 3.4 s apart, closed
+  1.8 s before. A record's state says nothing about the export; its node's
+  latest reading does. So the peer look, the safety net and the
+  member-incident lookup also take a RECOVERED record an activation minted
+  that closed inside the window
+  (:meth:`~SharedStorageFailureDomainCorrelator._closed_activation_records`,
+  b216), and the node's latest reading decides as for an open one. Only open
+  records counted before: two nodes formed a record only when the second
+  reported before the first's chain had ended.
 * **Window.** A domain forms when at least two nodes report the same identity
   unavailable within :data:`SHARED_STORAGE_FAILURE_DOMAIN_WINDOW_SECONDS` of
   each other (node clocks); a node whose activation comes later joins the
   open record. One notification per domain record.
-* **Two looks per activation.** A shared outage hits every node in the same
-  collector tick, so the activations arrive seconds apart and are ingested in
+* **Two looks per activation.** The activations of one outage are ingested in
   separate transactions (one per batch, on whichever replica took the POST;
   READ COMMITTED). The look inside the transaction
   (:meth:`~SharedStorageFailureDomainCorrelator.observe_finding`) sees only
   peers that had already committed, so two activations in flight at once both
-  stand alone -- live on HyperPod: two nodes, one NFS export, incidents 3.4 s
-  apart, no record. The host collector re-delivers an unchanged "unavailable"
+  stand alone. The host collector re-delivers an unchanged "unavailable"
   reading only with its health summary (300 s jittered, ``_edge_reasons``),
   never per tick, so the per-batch safety net
   (:meth:`~SharedStorageFailureDomainCorrelator.observe_batch`) cannot close
   that gap inside a shorter outage. Hence the second look
   (:meth:`~SharedStorageFailureDomainCorrelator.observe_committed`) after the
   batch's own commit: whichever of two concurrent activations commits last
-  sees the other. Identical member sets derive identical record ids and the
-  notification is deduplicated per record, so two late looks converge on one
-  record and one mail.
+  sees the other (b207). The HyperPod miss it was written for (3.4 s apart)
+  was a closed member, not two looks in flight (above, b216). Identical
+  member sets derive identical record ids and the notification is
+  deduplicated per record, so two late looks converge on one record and one
+  mail.
 * **Clearing.** The record closes (``RECOVERED``) when every member's latest
   reading of the identity is "available" -- positive evidence from each node.
   A member that stops reporting while its last reading was "unavailable" is
@@ -138,9 +155,21 @@ _DIAGNOSTIC_ONLY_ACTIONS = frozenset(
         RecoveryAction.VALIDATE_NODE,
     }
 )
-#: Per-node incident states that still speak for a node when its peers are
-#: discovered; RECOVERED ones have closed and say nothing about the present.
+#: Per-node incident states the peer look reads whatever their age. A
+#: RECOVERED record counts only when an activation minted it and it closed
+#: inside the window (``_closed_activation_records``): an activation's own
+#: chain closes RECOVERED "diagnostic inconclusive" within seconds while the
+#: export is still down (b216), so the state says nothing about the export --
+#: the node's latest reading does.
 _OPEN_NODE_INCIDENT_STATES = frozenset(set(IncidentState) - {IncidentState.RECOVERED})
+_CLOSED_NODE_INCIDENT_STATES = frozenset({IncidentState.RECOVERED})
+#: The newest RECOVERED records of a cluster one closed-member read takes
+#: (newest ``updated_at`` first; those closed before the window are dropped).
+#: It bounds a look's decode work, not its reach in practice: an outage's
+#: members close within seconds of each other and are the newest records when
+#: the next one looks, and once a record forms every later activation joins
+#: it without a peer look.
+_CLOSED_ACTIVATION_READ_LIMIT = 200
 _IDENTITY_LABELS = ("source", "mount_source")
 _WRITE_ATTEMPTS = 3
 _RECORD_FAMILY = "shared-storage-failure-domain"
@@ -289,8 +318,10 @@ class SharedStorageFailureDomainCorrelator:
         ingestion, after this batch's incident and latest row are durable, so
         the activation that commits last sees the one before it. Only the
         activations this batch minted are looked at (an incident is what a
-        member is); a node that already belongs to a record, or one whose
-        peers are still not visible, costs one indexed read. Returns the
+        member is -- open, or already closed by its own chain when a
+        dispatcher on another replica finished it before this look ran,
+        b216); a node that already belongs to a record, or one whose peers
+        are still not visible, costs one indexed read. Returns the
         notification ids sent (one per record created).
         """
 
@@ -364,19 +395,23 @@ class SharedStorageFailureDomainCorrelator:
     ) -> list[_Member]:
         """Other nodes whose latest reading of ``identity`` is a fresh failure.
 
-        Candidates are the nodes with an open per-node incident holding an
-        activation of the metric (their VALIDATE_HOST holds while the export
-        stays unavailable, or the recovery or reboot the activation joined
-        runs; :meth:`_activation_nodes`) and the members of open domain
-        records; each candidate's latest telemetry row for the identity
-        decides. A node whose reading is older than the window, or reads
-        available, is not a peer. A node is one candidate however many of its
-        records hold an activation, and the look costs one indexed marker read
-        per open record that is neither a domain record nor an activation's
-        own ``NODE_HEALTH`` chain and has a workflow -- bounded by the open-
-        incident read's limit, and run only for an activation no open domain
-        record holds yet, its look after the commit, and the safety net
-        inside the window.
+        Candidates are the nodes with a per-node incident holding an
+        activation of the metric -- an open one (the activation's own chain
+        has not ended yet, or the recovery or reboot it joined runs;
+        :meth:`_activation_nodes`), or a RECOVERED one the activation minted
+        that closed inside the window (its own chain does not wait for the
+        export: VALIDATE_HOST fails on it at once and the record closes
+        "diagnostic inconclusive"; :meth:`_closed_activation_records`, b216)
+        -- and the members of open domain records; each candidate's latest
+        telemetry row for the identity decides. A node whose reading is older
+        than the window, or reads available, is not a peer. A node is one
+        candidate however many of its records hold an activation (an open
+        record before a closed one), and the look costs one indexed marker
+        read per open record that is neither a domain record nor an
+        activation's own ``NODE_HEALTH`` chain and has a workflow, plus one
+        read of the newest closed records -- bounded by the reads' limits,
+        and run only for an activation no open domain record holds yet, its
+        look after the commit, and the safety net inside the window.
         """
 
         candidates: dict[str, str | None] = {}
@@ -391,6 +426,9 @@ class SharedStorageFailureDomainCorrelator:
                 # Newest first: the first incident seen for a node is the one
                 # its current activation opened or was folded into.
                 candidates.setdefault(node_id, incident.incident_id)
+        for incident in self._closed_activation_records(cluster_id):
+            for node_id in self._activation_nodes(incident):
+                candidates.setdefault(node_id, incident.incident_id)
         candidates.pop(member.node_id, None)
         peers: list[_Member] = []
         for node_id in sorted(candidates):
@@ -399,7 +437,7 @@ class SharedStorageFailureDomainCorrelator:
                 continue
             if not self._fresh(reading.observed_at, member.observed_at):
                 continue
-            incident_id = candidates[node_id] or self._open_node_incident_id(
+            incident_id = candidates[node_id] or self._activation_incident_id(
                 cluster_id, node_id, reading.device
             )
             peers.append(
@@ -426,7 +464,9 @@ class SharedStorageFailureDomainCorrelator:
         member = _Member(
             batch.node_id,
             sample.device,
-            self._open_node_incident_id(batch.cluster_id, batch.node_id, sample.device),
+            self._activation_incident_id(
+                batch.cluster_id, batch.node_id, sample.device
+            ),
             batch.observed_at,
         )
         _, notification_id = self._correlate(batch.cluster_id, identity, member)
@@ -772,28 +812,32 @@ class SharedStorageFailureDomainCorrelator:
 
     def _node_incident_id(self, finding: NodeHealthFinding) -> str | None:
         """The per-node incident holding ``finding``: by its event first (the
-        orchestrator may have routed it into an incident with another id),
-        else the node's open incident for the metric and device."""
+        orchestrator may have routed it into an incident with another id) in
+        any state -- the record this very activation was linked to is its
+        record even once its chain has closed it (b216) -- else the record
+        holding the node's activation on the device."""
 
         incident = self.store.get_incident_by_event(finding.event_id)
-        if incident is not None and incident.state in _OPEN_NODE_INCIDENT_STATES:
+        if incident is not None:
             incident_id: str = incident.incident_id
             return incident_id
-        return self._open_node_incident_id(
+        return self._activation_incident_id(
             finding.cluster_id, finding.node_id, finding.device
         )
 
-    def _open_node_incident_id(
+    def _activation_incident_id(
         self, cluster_id: str, node_id: str, device: str | None
     ) -> str | None:
-        """The open incident holding ``node_id``'s activation on ``device``.
+        """The incident holding ``node_id``'s activation on ``device``.
 
-        Among the incidents naming the node first -- the activation's own
-        record, a recovery it was folded into, the reboot of the node it was
-        absorbed by (the reboot's record always names the node it reboots);
-        then the grouped records that do not: a record-only fold into an
-        attempt's recovery leaves the record's node scope alone, so only the
-        activation's marker names it.
+        Among the open incidents naming the node first -- the activation's
+        own record, a recovery it was folded into, the reboot of the node it
+        was absorbed by (the reboot's record always names the node it
+        reboots); then the open grouped records that do not: a record-only
+        fold into an attempt's recovery leaves the record's node scope alone,
+        so only the activation's marker names it; last the activation's own
+        record that already closed inside the window
+        (:meth:`_closed_activation_records`, b216).
         """
 
         suffix = f"-{SHARED_FILESYSTEM_METRIC}-{event_id_component(device or 'node')}"
@@ -813,7 +857,51 @@ class SharedStorageFailureDomainCorrelator:
             ):
                 incident_id = incident.incident_id
                 return incident_id
+        for incident in self._closed_activation_records(cluster_id, node_id, suffix):
+            if node_id in self._activation_nodes(incident, suffix):
+                incident_id = incident.incident_id
+                return incident_id
         return None
+
+    def _closed_activation_records(
+        self,
+        cluster_id: str,
+        node_id: str | None = None,
+        suffix: str | None = None,
+    ) -> list[FaultIncident]:
+        """RECOVERED records an activation of the metric minted (on the device
+        ``suffix`` names, naming ``node_id``, when given) that closed inside
+        the window, newest first.
+
+        A shared-storage activation's own chain is diagnostic-only and does
+        not wait for the export: VALIDATE_HOST fails on the gauge and the
+        record closes RECOVERED "diagnostic inconclusive" within seconds,
+        while the node still reads the export unavailable -- live, before the
+        peer's activation (one collector tick later) looked (b216). Such a
+        record is still the member's incident, and the node's latest reading,
+        not the record's state, says whether the export is down. Only a record
+        whose event id names the activation counts (it minted it, under
+        whichever label grouping gave it later): a closed record of another
+        fault the activation was folded into or absorbed by is not read, and
+        no marker is read for a record that is not an activation's. One
+        bounded read (:data:`_CLOSED_ACTIVATION_READ_LIMIT`); "inside the
+        window" is the record's ``updated_at`` against the control plane's
+        clock, the clock that stamped it.
+        """
+
+        closed_after = datetime.now(timezone.utc) - self.window
+        return [
+            incident
+            for incident in self.store.list_incidents_by_state(
+                cluster_id,
+                _CLOSED_NODE_INCIDENT_STATES,
+                node_ids=None if node_id is None else {node_id},
+                limit=_CLOSED_ACTIVATION_READ_LIMIT,
+            )
+            if _utc(incident.updated_at) >= closed_after
+            and not is_shared_storage_failure_domain(incident)
+            and _names_activation(incident.event_id, suffix)
+        ]
 
     def _activation_nodes(
         self, incident: FaultIncident, suffix: str | None = None
@@ -938,6 +1026,13 @@ def _names_activation(identifier: str, suffix: str | None) -> bool:
     if suffix is not None:
         return identifier.endswith(suffix)
     return f"-{SHARED_FILESYSTEM_METRIC}-" in identifier
+
+
+def _utc(value: datetime) -> datetime:
+    """``value`` comparable with an aware UTC instant: a naive stamp is taken
+    as UTC, as ``store.shared.time.utc_text`` takes it."""
+
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
 
 
 def _failing(value: float) -> bool:
