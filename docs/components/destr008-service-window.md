@@ -165,6 +165,39 @@ Command supervision loss is journaled and forbids further remote commands,
 including fresh-process automatic cleanup. The parent retains the original case
 failure; cleanup-only closure never awards a new scenario PASS.
 
+## Retiring A Stale Window
+
+A window whose run never closed it -- its cleanup failed, for example while
+the service it stopped was still down, or never ran -- keeps its controller
+journal open and its drop-in, units, claim and directory on the node. Only the
+execution that wrote the journal can resume it, and a later node Agent release
+changes the baseline fingerprints its own cleanup compares, so such a window
+can outlive every rerun. `service_window_retire.retire_journal` retires it
+through a dedicated host probe (the probe's own source plus
+`probes/warm_spare_retire.py`, still one stdlib-only script) and acts only on
+proof; any failed proof is a named refusal and nothing changes. Local proofs:
+the journal is CLEANUP_REQUIRED or CREATING for the node, supervision was never
+lost, its binding is valid and its own, no process holds its lock, the Node
+still has the recorded UID, and the earlier transport's Pod and ConfigMap are
+proven that record's. Host proofs: the host journal is RESTORED (or published
+nothing, or is already closed); the service runs on the machine the window was
+bound on under exactly the invocation the window restored; every artifact to
+remove is named by the window's key and matches its publication receipt; its
+units are inactive with no job, process or cgroup member; the claim names this
+window; no other live window or drop-in exists for the service; a named
+transport script copy carries the transport's digest. The Node Agent runtime
+fingerprints are deliberately not compared. Actions: a retirement marker on the
+host journal, the units and drop-in removed by receipt, `systemctl
+daemon-reload` without restarting the service (verified), the claim and the
+script copy removed, the host journal closed and the window directory removed
+last; then the earlier transport's Pod and ConfigMap are deleted under UID
+preconditions, its record closed, and the controller journal marked CLOSED with
+a retirement record (operator identity, time, caller, host proofs). An
+interrupted retirement resumes from its marker. GF-GENERAL-LIVE-030 runs this
+as its `not_ready` pre-step; `scripts/e2e/regional/retire_service_window.py`
+runs it for a state directory no pending run will reach (plan-only by default;
+`--execute --confirm RETIRE_STALE_SERVICE_WINDOW` and a maintenance window).
+
 ## Assumptions And Limits
 
 - Filesystems, systemd, the interpreter and the local clock are trusted.

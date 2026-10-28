@@ -2625,15 +2625,34 @@ CLEANUP_REQUIRED、host-probe 记录未关闭；未关闭的记录保留原 run 
 claim、窗口目录与 host-probe 脚本副本仍在，集群里还有它的 host-probe Pod（DeadlineExceeded）与
 ConfigMap。HyperPod 上（2026-10-24/25）同样留下的窗口已经让同一节点上下一轮的窗口变成第二个无人
 能关的窗口：它的 `prepare` 在写下自己的 journal 之后才拒绝那个 claim，它的 cleanup 又停在同一个
-claim 上。现在：030 `not_ready` 先读 `spare-service/`，候选节点上有未关闭的 journal 时在声明任何
-东西之前即判 BLOCKED(FIXTURE_NOT_READY)，点名该 journal、窗口的 drop-in/单元/claim/目录及其 host
-probe；controller 的 journal 拒绝逐项点名不同的 scope 键（只对 id 与到期时间给出取值）及 journal
+claim 上。现在：030 `not_ready` 先读 `spare-service/`，在声明任何东西之前退役候选节点上仍未关闭的
+journal 所持窗口（见下）；无法证明其已陈旧时判 BLOCKED(FIXTURE_NOT_READY)，点名该 journal、窗口的
+drop-in/单元/claim/目录、其 host probe 以及每一条未通过的证明；controller 的 journal 拒绝逐项点名不同的 scope 键（只对 id 与到期时间给出取值）及 journal
 记录的状态；warm-spare probe 的 snapshot 报告该服务的 claim 持有者，controller 在绑定任何东西之前
 拒绝已被占用的服务，被拒的窗口什么也不发布并正常关闭；host probe 无响应时点名 probe Pod、节点、
 kubectl 所说的 exec 通道断点（固定标签，从不回显 kubectl 的 stderr）与节点的 Ready 条件；恢复通道上
-的关闭在判 `NodeRestoreUnconfirmed` 之前重试有限次。这样遗留的窗口由运维退役：在节点上删除该窗口的
-drop-in、单元与 claim 并 `systemctl daemon-reload`（服务保持运行），删除它的 host-probe Pod 与
-ConfigMap，再把它的 journal 与 host-probe 记录移出该 case 的 `spare-service/`。
+的关闭在判 `NodeRestoreUnconfirmed` 之前重试有限次。
+
+这样遗留的窗口由 harness 夹具步骤退役，和其他夹具动作一样经 harness 自己的 host probe
+（`service_window_retire.retire_journal`；即 030 `not_ready` 的前置步骤，另有
+`scripts/e2e/regional/retire_service_window.py` 处理没有待跑 030 会触及的 journal——默认只做计划，
+`--execute --confirm RETIRE_STALE_SERVICE_WINDOW` 且需维护窗口）。它只凭证明行动，任何一条证明不成立都
+是具名拒绝且不做任何改动：本地——journal 对该节点为 CLEANUP_REQUIRED 或 CREATING、从未丢失监管、
+binding 有效且属于它、没有进程持有它、Node 仍是记录的 UID、先前 host probe 的 Pod 与 ConfigMap 经
+标签/owner 注解/脚本摘要/UID/节点证明属于该记录；节点上——专用的退役 probe（warm-spare probe 自身源码
+加 `probes/warm_spare_retire.py`，单一纯标准库脚本）证明宿主 journal 为 RESTORED（或从未发布、或已
+CLOSED），服务在窗口绑定的那台机器上运行、且恰是窗口恢复的那个 invocation（其 start receipt），它要删除
+的每个工件都以窗口 key 命名并与发布回执一致——drop-in `90-gpu-fault-destr008-<key32>.conf`、三个
+`gpu-fault-destr008-<key32>-*` 单元（inactive，无 job/进程/cgroup 成员）、指名该窗口的 claim、只含
+窗口自身文件的窗口目录——该服务没有其他存活窗口或 drop-in，先前 probe 的 `/run` 脚本副本带该 probe 的
+脚本摘要。后续节点 Agent 发布改写的基线指纹（`node-agent.env`、`/opt/gpu-fault/current`）刻意不比较：
+每次发布都会改它们，而窗口自身的 cleanup 恰因此拒绝才使其陈旧。动作：宿主 journal 先标 CLOSING 并写
+退役标记，按回执删除单元与 drop-in，`systemctl daemon-reload`（不重启服务，并核验），删除 claim 与脚本
+副本，宿主 journal 标 CLOSED 后删除窗口目录（journal 最后删）；随后以 UID 前置条件删除先前 probe 的 Pod
+与 ConfigMap、关闭其归属记录、清理退役 probe，并把 controller journal 标为 CLOSED，附退役记录（谁——
+操作者身份、何时、经由什么、宿主证明）。中断的退役从标记处续做。退役之后变体以下一个空闲 run id
+（`<run id>-r2`）开自己的窗口：退役的 journal 在旧 run id 下仍是一次性的。从未发布任何东西的窗口
+（HyperPod 2026-10-25：`prepare` 在写下自己的 journal 之后才遇到 claim）同样退役，不触碰 claim 持有者。
 
 `stale_metrics` 实测（2026-10-27，HyperPod 14:47Z 与 plain EKS 14:51Z 同一形状，release
 37db33f254a1）：声明热备后的第一步——暂停 metrics 采集器——就以 `HostProbeError: host

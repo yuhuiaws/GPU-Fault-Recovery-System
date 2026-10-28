@@ -781,6 +781,13 @@ snapshots, synthetic replacement submission, incident-scoped spare release,
 Agent reactivation and validation-first fault-node restoration.
 `probes/warm_spare_node_probe.py` can stop only kubelet or the Node Agent and
 always arms a bounded host-side automatic restore timer before doing so.
+A window whose run never closed it is retired, only on proof and through the
+harness's own host probe, by `service_window_retire.py` with its host half
+`probes/warm_spare_retire.py` (appended to the warm-spare probe's source to form
+one stdlib-only retire probe); GF-GENERAL-LIVE-030 `not_ready` runs it as its
+pre-step and `retire_service_window.py` runs it for a state directory no pending
+run will reach (plan-only by default; `--execute --confirm
+RETIRE_STALE_SERVICE_WINDOW` and a maintenance window).
 
 `collector_acceptance_fixture.py` and `probes/collector_node_probe.py` own
 marker/evidence/workflow lookup plus allowlisted XID, SXID, collector cursor,

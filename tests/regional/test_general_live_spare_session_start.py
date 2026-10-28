@@ -579,14 +579,15 @@ def test_not_ready_opens_the_service_window_as_the_destr008_fixture(
     probe.binding_key(_valid_binding(captured["case_id"]))
 
 
-def test_a_rerun_meeting_the_earlier_runs_open_window_is_blocked_untouched(
+def test_a_rerun_meeting_an_unretirable_window_is_blocked_untouched(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The live sequence end to end (plain EKS, 2026-10-27 -> 2026-10-28): the
-    earlier run of this lane and attempt left its window's journal at
-    CLEANUP_REQUIRED and its host-probe record open; the rerun keeps that run id
-    (an open record keeps it) and -- with the runner's own objects -- ends
-    BLOCKED naming the journal, before the spare is declared or a probe made."""
+    """The live sequence end to end (plain EKS, 2026-10-27 -> 2026-10-28) with
+    the runner's own objects: the earlier run of this lane and attempt left its
+    window's journal open and its host-probe record open; the rerun keeps that
+    run id (an open record keeps it), its pre-step refuses to retire a journal
+    that is not a finished run's custody, and the variant ends BLOCKED naming
+    it -- before any API call of the retirement, any declaration or any probe."""
 
     spec = SPECS["not_ready"]
     settings, run_dir = configured(tmp_path, monkeypatch, spec)
@@ -595,17 +596,84 @@ def test_a_rerun_meeting_the_earlier_runs_open_window_is_blocked_untouched(
     base = run_identity(spec.case_id, spec.variant, 1, run_dir)
     case_dir = run_dir / "cases" / spec.key
     journal, _window = abandoned_window_journal(
-        case_dir / sp.SERVICE_STATE, node=NODE, node_uid=NODE_UID, run_id=base
+        case_dir / sp.SERVICE_STATE,
+        node=NODE,
+        node_uid=NODE_UID,
+        run_id=base,
+        phase="STOP_REQUESTED",
+        context=CONTEXT,
+        namespace=NAMESPACE,
     )
 
     result = run_variant(spec, settings, run_dir)
 
     assert result["verdict"] == "BLOCKED" and result["reason"] == "FIXTURE_NOT_READY"
     assert result["run_id"] == base, "the open record kept the earlier run id"
-    assert journal.name in result["detail"], result["detail"]
-    assert "Nothing was declared or stopped" in result["detail"]
+    detail = result["detail"]
+    assert journal.name in detail and "was not retired" in detail, detail
+    assert (
+        "the journal is 'STOP_REQUESTED', not a finished run's open custody" in detail
+    )
+    assert "Nothing was declared or stopped" in detail
     assert cluster.node_patches == [], "the spare was never declared or cordoned"
     assert result["cleanup"] == [] and result["cleanup_pending"] == []
     assert json.loads(journal.read_text(encoding="utf-8"))["phase"] == (
-        "CLEANUP_REQUIRED"
-    ), "the earlier custody is left for its retirement, not rewritten"
+        "STOP_REQUESTED"
+    ), "the earlier custody is left as it was"
+
+
+def test_a_retired_window_lets_the_rerun_open_its_own_under_the_next_run_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After the pre-step retired the earlier window (journal and host-probe
+    record closed), the variant declares the spare and opens its window as
+    ``<base>-r2``: the retired journal is create-once under the old run id."""
+
+    from scripts.e2e.regional import service_window_retire as sw
+
+    spec = SPECS["not_ready"]
+    settings, run_dir = configured(tmp_path, monkeypatch, spec)
+    cluster = SpareCluster()
+    install_fakes(monkeypatch, cluster)
+    base = run_identity(spec.case_id, spec.variant, 1, run_dir)
+    case_dir = run_dir / "cases" / spec.key
+    journal, _window = abandoned_window_journal(
+        case_dir / sp.SERVICE_STATE,
+        node=NODE,
+        node_uid=NODE_UID,
+        run_id=base,
+        context=CONTEXT,
+        namespace=NAMESPACE,
+    )
+    retired: list[str] = []
+
+    def retire(directory: Path, node: str, **_: Any) -> list[dict[str, Any]]:
+        retired.append(node)
+        for path in directory.glob("*.json"):
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if "binding" in data:
+                data["phase"] = "CLOSED"
+            else:
+                data["closed"] = True
+            probe.write_record(path, data)
+        return [{"journal": journal.name, "retired": True, "refusals": []}]
+
+    monkeypatch.setattr(sw, "retire_stale_windows", retire)
+    captured: dict[str, Any] = {}
+    real_cls = wsf.WarmSpareServiceFixture
+
+    def capturing(*args: Any, **kwargs: Any) -> Any:
+        captured["run_id"] = kwargs.get("run_id")
+        return real_cls(*args, **kwargs)
+
+    monkeypatch.setattr(wsf, "WarmSpareServiceFixture", capturing)
+
+    result = run_variant(spec, settings, run_dir)
+
+    assert retired == [NODE]
+    assert result["run_id"] == base, "the context keeps the plan's run id"
+    assert captured["run_id"] == f"{base}-r2", captured
+    assert cluster.node_patches, "the spare was declared once the window was retired"
+    assert "FirstMutation" in (result.get("error") or ""), (
+        "the run reached the new window's own host probe"
+    )

@@ -319,23 +319,43 @@ def _unconfirmed_message(report: Mapping[str, Any]) -> str:
     )
 
 
-def open_windows(directory: Path, node: str) -> list[str]:
-    """Each service window ``directory`` still holds open on ``node``, described.
+def stale_journals(directory: Path, node: str) -> list[Path]:
+    """The controller journals ``directory`` still holds open on ``node``.
 
     ``directory`` is where a service window keeps its controller journal and
     host-probe record (030's ``spare-service``). A journal that is not CLOSED is
     custody its run never closed -- its undo failed or never ran -- and while it
     is open the node may still carry that window's claim, drop-in and units: a
     new window there is refused the claim (the probe's ``service_claim``), and
-    under the same run id the controller refuses the journal itself. One line
-    per such journal, naming what it records and what retiring it involves; a
-    journal that cannot be read counts as open, one for another node does not.
+    under the same run id the controller refuses the journal itself. A journal
+    that cannot be read counts as open; one for another node does not.
     """
 
-    lines: list[str] = []
+    found: list[Path] = []
     if not directory.is_dir():
-        return lines
+        return found
     for path in sorted(directory.glob(JOURNAL_GLOB)):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            found.append(path)
+            continue
+        if not isinstance(data, dict):
+            found.append(path)
+            continue
+        recorded = data.get("scope")
+        scope: dict[str, Any] = recorded if isinstance(recorded, dict) else {}
+        if scope.get("node", node) == node and data.get("phase") != "CLOSED":
+            found.append(path)
+    return found
+
+
+def open_windows(directory: Path, node: str) -> list[str]:
+    """Each journal ``stale_journals`` finds, described: what it records and
+    what retiring it involves (``service_window_retire``)."""
+
+    lines: list[str] = []
+    for path in stale_journals(directory, node):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
@@ -346,8 +366,6 @@ def open_windows(directory: Path, node: str) -> list[str]:
             continue
         recorded = data.get("scope")
         scope: dict[str, Any] = recorded if isinstance(recorded, dict) else {}
-        if scope.get("node", node) != node or data.get("phase") == "CLOSED":
-            continue
         lines.append(_describe_open(path, data, scope))
     return lines
 

@@ -112,7 +112,10 @@ APPROVALS: dict[str, str] = {
     ),
     "SPARE_KUBELET_STOP": (
         "stop kubelet on the declared warm spare to drive it NotReady, with a "
-        "host-side automatic restart timer; restarted in cleanup"
+        "host-side automatic restart timer; restarted in cleanup. An earlier "
+        "run's service window still open on that spare is first retired through "
+        "the harness's host probe, only when proven stale (its own drop-in, "
+        "units and claim removed, kubelet left running)"
     ),
     # Lane K (phase 2) kernel-log source replay and EFA inventory.
     "KERNEL_SOURCE_REPLAY": (

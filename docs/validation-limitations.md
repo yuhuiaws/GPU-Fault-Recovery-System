@@ -4009,9 +4009,10 @@ in the cluster. On HyperPod (2026-10-24/25) a window left the same way had
 already turned the next run's window on that node into a second one nobody
 could close: its `prepare` refused the claim only after writing its own
 journal, and its cleanup stopped at the same claim. Now 030 `not_ready` reads
-`spare-service/` first and is BLOCKED(FIXTURE_NOT_READY) before anything is
-declared while a journal there is open on the candidate, naming the journal,
-the window's drop-in, units, claim and directory, and its host probe; the
+`spare-service/` first and, before anything is declared, retires a window a
+journal there still holds open on the candidate (below) -- or, when it cannot be
+proven stale, is BLOCKED(FIXTURE_NOT_READY) naming the journal, the window's
+drop-in, units, claim and directory, its host probe and every failed proof; the
 controller's journal refusal names each differing scope key (values for ids and
 the expiry only) and what the journal records; the warm-spare probe's snapshot
 reports the service's claim holder and the controller refuses a claimed service
@@ -4019,11 +4020,44 @@ before anything is bound, so the refused window publishes nothing and closes;
 a missing host-probe response names the probe Pod, the node, where kubectl said
 the exec channel broke (a fixed label, never kubectl's stderr) and the node's
 Ready condition; and the close over the restored channel is retried a few times
-before failing as `NodeRestoreUnconfirmed`. Retiring a window left like this is
-an operator action: on the node remove the window's drop-in, its units and the
-claim and run `systemctl daemon-reload` (the service keeps running), delete its
-host-probe Pod and ConfigMap, then move its journal and host-probe record out of
-the case's `spare-service/`.
+before failing as `NodeRestoreUnconfirmed`.
+
+Retiring a window left like this is a harness fixture step, through the
+harness's own host probe like every other fixture action
+(`service_window_retire.retire_journal`; the 030 `not_ready` pre-step, and
+`scripts/e2e/regional/retire_service_window.py` for journals no pending 030 run
+will reach -- plan-only by default, `--execute --confirm
+RETIRE_STALE_SERVICE_WINDOW` with a maintenance window). It acts only on proof,
+and any failed proof is a named refusal with nothing changed: locally the
+journal is CLEANUP_REQUIRED or CREATING for that node, supervision was never
+lost, its binding is valid and its own, no process holds it, the Node still has
+the recorded UID, and the earlier host probe's Pod and ConfigMap are proven that
+record's by labels, owner annotation, script digest, UID and node; on the node a
+dedicated retire probe (the warm-spare probe's own source plus
+`probes/warm_spare_retire.py`, one stdlib-only script) proves the host journal
+RESTORED (or never published, or already closed), the service running on the
+machine the window was bound on under exactly the invocation the window restored
+(its start receipt), every artifact it removes named by the window's key and
+matching its publication receipt -- drop-in `90-gpu-fault-destr008-<key32>.conf`,
+the three `gpu-fault-destr008-<key32>-*` units (inactive, no job, process or
+cgroup member), the claim naming that window, the window directory holding only
+the window's own files -- no other live window or drop-in for the service, and
+the earlier probe's `/run` script copy carrying that probe's script digest. The
+baseline fingerprints a later node Agent wave rewrites (`node-agent.env`,
+`/opt/gpu-fault/current`) are deliberately not compared: every release changes
+them, and the window's own cleanup refusing exactly that is what left it stale.
+The actions: mark the host journal CLOSING with a retirement marker, remove the
+units and the drop-in by receipt, `systemctl daemon-reload` (the service is not
+restarted, and that is verified), remove the claim and the script copy, mark the
+host journal CLOSED and remove the window directory with the journal last; then
+delete the earlier probe's Pod and ConfigMap under UID preconditions, close its
+ownership record, clean the retire probe, and mark the controller journal CLOSED
+with a retirement record (who -- the operator identity --, when, by what, the
+host's proofs). An interrupted retirement resumes from its marker. After it the
+variant opens its own window under the next free run id (`<run id>-r2`): the
+retired journal is create-once under the old one. A window that published
+nothing (HyperPod 2026-10-25: `prepare` met the claim after writing its own
+journal) retires the same way without touching the claim holder.
 
 030 `stale_metrics` then failed identically on both clusters live 2026-10-27
 (HyperPod 14:47Z, plain EKS 14:51Z, release 37db33f254a1): the first step after

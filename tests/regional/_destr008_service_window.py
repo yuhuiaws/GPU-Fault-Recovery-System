@@ -470,6 +470,8 @@ def abandoned_window_journal(
     release_id: str = "37db33f254a1",
     restore_at: int = 1793111242,
     phase: str = "CLEANUP_REQUIRED",
+    context: str = "ctx",
+    namespace: str = "gpu-fault-system",
 ) -> tuple[Path, probe.ServiceWindow]:
     """A controller journal its run never closed, as 030 leaves it live.
 
@@ -486,7 +488,13 @@ def abandoned_window_journal(
         record,
         {
             "schema_version": 1,
-            "scope": {"case_id": CASE, "run_id": run_id, "node": node},
+            "scope": {
+                "case_id": CASE,
+                "run_id": run_id,
+                "node": node,
+                "context": context,
+                "namespace": namespace,
+            },
             "owner": "1" * 32,
             "node_uid": node_uid,
             "closed": False,
@@ -533,6 +541,8 @@ def abandoned_window_journal(
                 "node_uid": node_uid,
                 "release_id": release_id,
                 "host_state_path": str(record),
+                "context": context,
+                "namespace": namespace,
             },
             "owner": "a" * 32,
             "phase": phase,

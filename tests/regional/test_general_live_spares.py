@@ -112,8 +112,12 @@ class FakeSpareSession:
     #: 15 s delay + 600 s timer by default; a test moves it before the grade.
     restore_in_seconds: float = 615.0
 
-    def stop_kubelet(self) -> dict[str, Any]:
+    #: The run id the variant opened its service window under.
+    window_run_id: str = ""
+
+    def stop_kubelet(self, run_id: str = "") -> dict[str, Any]:
         self.kubelet_stopped = True
+        self.window_run_id = run_id
         restore_at = self.ctx.clock() + timedelta(seconds=self.restore_in_seconds)
         return {
             "phase": "SCHEDULED",
@@ -910,15 +914,87 @@ def test_context_pause_refuses_a_hold_outside_the_node_probe_bound_before_shippi
 # --------------------------------------------------------------------------- #
 # an earlier run's service window still open on the candidate
 # --------------------------------------------------------------------------- #
-def test_an_open_earlier_window_blocks_not_ready_before_anything_is_declared(
+def _retirement(
+    monkeypatch: pytest.MonkeyPatch, *, retire: bool, reason: str = ""
+) -> list[dict[str, Any]]:
+    """``retire_stale_windows`` replaced: close each journal or name a refusal."""
+
+    from gpu_fault.admin import operator_identity
+    from scripts.e2e.regional import service_window_retire as sw
+    from scripts.e2e.regional.service_window_node_restore import stale_journals
+
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(operator_identity, "caller_identity_arn", lambda **_: None)
+
+    def fake(directory: Path, node: str, *, settings: Any, by: str, via: str) -> Any:
+        calls.append({"node": node, "by": by, "via": via, "settings": settings})
+        reports = []
+        for path in stale_journals(directory, node):
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if retire:
+                data["phase"] = "CLOSED"
+                path.write_text(json.dumps(data), encoding="utf-8")
+            reports.append(
+                {
+                    "journal": path.name,
+                    "retired": retire,
+                    "refusals": [] if retire else [reason],
+                }
+            )
+        return reports
+
+    monkeypatch.setattr(sw, "retire_stale_windows", fake)
+    return calls
+
+
+def test_an_open_earlier_window_is_retired_before_anything_is_declared(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Live 2026-10-28 (plain EKS, R13h): the rerun of the same lane and attempt
     met the R13g run's journal, still CLEANUP_REQUIRED after its undo got no
     response, declared the spare and only then refused "service controller
-    identity or state changed"."""
+    identity or state changed". Now the stale window is retired first and the
+    variant opens its own window under the next free run id."""
+
+    from scripts.e2e.regional.general_live_fixture import rerun_run_id, run_identity
 
     _patch(monkeypatch, _node(ready="False"), _store())
+    calls = _retirement(monkeypatch, retire=True)
+    ctx = _ctx(SPECS["not_ready"], tmp_path)
+    directory = ctx.case_dir / sp.SERVICE_STATE
+    abandoned_window_journal(
+        directory, node=NODE, node_uid="spare-uid", run_id=ctx.run_id
+    )
+
+    result = SPECS["not_ready"].execute(ctx)
+
+    assert result["verdict"] == "PASS", result["errors"]
+    (call,) = calls
+    assert call["node"] == NODE and call["via"].startswith(
+        "GF-GENERAL-LIVE-030.not_ready pre-step, run "
+    )
+    assert call["settings"].image == ctx.settings.host_probe_image
+    expected = rerun_run_id(
+        ctx.case_dir, run_identity(ctx.spec.case_id, ctx.spec.variant, 1, tmp_path)
+    )
+    session = FakeSpareSession.instances[-1]
+    assert session.window_run_id == expected == result["service_window_run_id"]
+    evidence = json.loads(
+        (ctx.case_dir / "spare-service-retire.json").read_text(encoding="utf-8")
+    )
+    assert evidence["node"] == NODE and evidence["journals"][0]["retired"] is True
+
+
+def test_a_window_not_proven_stale_blocks_with_every_failed_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch(monkeypatch, _node(ready="False"), _store())
+    _retirement(
+        monkeypatch,
+        retire=False,
+        reason="kubelet.service runs invocation '9...', not '2...', the one its "
+        "window restored",
+    )
     ctx = _ctx(SPECS["not_ready"], tmp_path)
     directory = ctx.case_dir / sp.SERVICE_STATE
     journal, window = abandoned_window_journal(
@@ -931,7 +1007,8 @@ def test_an_open_earlier_window_blocks_not_ready_before_anything_is_declared(
     assert blocked.value.reason == "FIXTURE_NOT_READY"
     detail = blocked.value.detail
     for needle in (
-        f"an earlier run's service window on {NODE} is still open in {directory}: ",
+        f"an earlier run's service window on {NODE} is still open in {directory} "
+        "and was not retired: ",
         f"{journal.name} (run {ctx.run_id!r}, release '37db33f254a1', phase "
         "'CLEANUP_REQUIRED', written ",
         "last request 'cleanup' failed with HostProbeMissingResponseError)",
@@ -942,7 +1019,7 @@ def test_an_open_earlier_window_blocks_not_ready_before_anything_is_declared(
         f"{window.targets['claim']}, directory {window.directory}",
         "its host probe: Pod and ConfigMap gpu-fault-host-probe-aababed795, record "
         "gpu-fault-host-probe-aababed795.json open",
-        "Retire it first",
+        f"Retirement refused: {journal.name}: kubelet.service runs invocation '9...'",
         "Nothing was declared or stopped",
     ):
         assert needle in detail, (needle, detail)
@@ -974,6 +1051,11 @@ def test_a_closed_or_foreign_journal_does_not_block_not_ready(
 def test_an_unreadable_journal_counts_as_open(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The real retirement refuses it at its first read: nothing else is done."""
+
+    from gpu_fault.admin import operator_identity
+
+    monkeypatch.setattr(operator_identity, "caller_identity_arn", lambda **_: None)
     _patch(monkeypatch, _node(ready="False"), _store())
     ctx = _ctx(SPECS["not_ready"], tmp_path)
     directory = ctx.case_dir / sp.SERVICE_STATE
@@ -982,8 +1064,11 @@ def test_an_unreadable_journal_counts_as_open(
         "{half a journal", encoding="utf-8"
     )
 
-    with pytest.raises(VariantBlocked, match="unreadable \\(JSONDecodeError\\)"):
+    with pytest.raises(
+        VariantBlocked, match="unreadable \\(JSONDecodeError\\)"
+    ) as blocked:
         SPECS["not_ready"].execute(ctx)
+    assert "the journal cannot be read" in blocked.value.detail, blocked.value.detail
     assert FakeSpareSession.instances == []
 
 

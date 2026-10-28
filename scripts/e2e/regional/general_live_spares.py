@@ -38,8 +38,10 @@ and only then is the spare released and ``restored`` judged; a node that does
 not return by the deadline fails the undo naming ``restore_at``/``expires_at``
 and the last condition seen. An earlier window still open on the candidate in
 the case directory's ``spare-service`` -- custody an earlier run's undo never
-closed -- makes ``not_ready`` BLOCKED before anything is declared, naming the
-journal and what retiring it takes (``refuse_open_service_windows``). Each
+closed -- is retired first, before anything is declared, through the harness's
+own host probe and only on proof (``reclaim_service_windows``,
+``service_window_retire``); one that cannot be proven stale keeps ``not_ready``
+BLOCKED, naming every failed proof. Each
 block-only variant makes the declared spare
 ineligible for allocation in exactly one way -- NotReady, stale GPU telemetry,
 a configuration error (foreign reservation or a non-AVAILABLE pool state) --
@@ -95,6 +97,7 @@ from scripts.e2e.regional.service_window_node_restore import (
     NodeRestoreError,
     open_windows,
     restore_through_node,
+    stale_journals,
     window_deadlines,
 )
 from scripts.e2e.regional.warm_spare_residue import spare_residue_report
@@ -407,9 +410,18 @@ class SpareSession:
         self.ctx.evidence.write("spare-grade", store)
         return store
 
-    def stop_kubelet(self) -> dict[str, Any]:
+    def stop_kubelet(self, run_id: str = "") -> dict[str, Any]:
+        """Stop kubelet through a new service window under ``run_id``.
+
+        ``run_id`` is the window's identity: the context's run id, or -- once
+        the pre-step retired an earlier window still open under it -- the next
+        free rerun identity (``reclaim_service_windows``).
+        """
+
         import hashlib
         import json
+
+        run_id = run_id or self.ctx.run_id
 
         from scripts.e2e.regional.warm_spare_fixture import WarmSpareServiceFixture
 
@@ -422,7 +434,7 @@ class SpareSession:
             json.dumps(
                 {
                     "case": self.ctx.spec.key,
-                    "run_id": self.ctx.run_id,
+                    "run_id": run_id,
                     "node": self.node,
                     "service": "kubelet.service",
                     "intent": "warm-spare-unhealthy-not-ready",
@@ -439,7 +451,7 @@ class SpareSession:
             # identity, not the running case; run_id keeps this run's window and
             # journals distinct from a real DESTR-008 run on the same node.
             case_id=SERVICE_WINDOW_FIXTURE_CASE_ID,
-            run_id=self.ctx.run_id,
+            run_id=run_id,
             state_directory=self.ctx.case_dir / SERVICE_STATE,
             node_uid=self.node_snapshot().get("uid", ""),
             plan_sha256=plan_sha256,
@@ -982,8 +994,8 @@ def grading_window_errors(
 # --------------------------------------------------------------------------- #
 # variants
 # --------------------------------------------------------------------------- #
-def refuse_open_service_windows(ctx: VariantContext) -> None:
-    """BLOCKED, before anything is declared, while an earlier window is open.
+def reclaim_service_windows(ctx: VariantContext) -> str:
+    """Retire an earlier run's provably stale window, or BLOCK naming why.
 
     The case directory's ``spare-service`` keeps every service window's
     controller journal; one not CLOSED on the candidate is an earlier run's
@@ -993,31 +1005,81 @@ def refuse_open_service_windows(ctx: VariantContext) -> None:
     rerun under the same run id -- an open record keeps its run id
     (``rerun_run_id``) -- meets the journal itself: live 2026-10-28 the rerun
     declared the spare, then refused "service controller identity or state
-    changed". The detail names each journal and what retiring it takes.
+    changed". Before anything is declared, each such journal is retired through
+    the harness's own host probe (``service_window_retire``: only on proof,
+    kubelet untouched); what cannot be retired keeps the variant
+    BLOCKED(FIXTURE_NOT_READY) with every failed proof named. Returns the run id
+    the new window uses: the context's, or after a retirement the next free
+    rerun identity (the retired journal is create-once under the old one).
     """
+
+    from scripts.e2e.regional.general_live_fixture import rerun_run_id, run_identity
+    from scripts.e2e.regional.service_window_retire import (
+        RetireSettings,
+        retire_stale_windows,
+    )
 
     node = spare_candidate(ctx.settings)
     directory = ctx.case_dir / SERVICE_STATE
-    held = open_windows(directory, node) if node else []
+    if not node or not stale_journals(directory, node):
+        return ctx.run_id
+    from gpu_fault.admin.operator_identity import (
+        local_operator_identity,
+        resolve_operator_identity,
+    )
+
+    regional = ctx.regional.settings
+    reports = retire_stale_windows(
+        directory,
+        node,
+        settings=RetireSettings(
+            kubeconfig=regional.gpu_kubeconfig,
+            context=regional.gpu_context,
+            namespace=regional.namespace,
+            image=ctx.settings.host_probe_image,
+            node_uid=lambda name: _node_uid(ctx, name),
+        ),
+        by=resolve_operator_identity(fallback=local_operator_identity()),
+        via=f"{ctx.spec.key} pre-step, run {ctx.run_id}",
+    )
+    ctx.evidence.write("spare-service-retire", {"node": node, "journals": reports})
+    held = open_windows(directory, node)
     if held:
+        reasons = [
+            f"{report['journal']}: {reason}"
+            for report in reports
+            for reason in report["refusals"]
+        ]
         raise VariantBlocked(
             "FIXTURE_NOT_READY",
             f"an earlier run's service window on {node} is still open in "
-            f"{directory}: " + " | ".join(held) + ". Its undo never closed it, so "
-            "the node may still carry that window's claim, drop-in and units (a "
-            "new window is refused them) and a rerun under the same run id is "
-            "refused its journal. Retire it first: on the node remove that "
-            "window's drop-in, its three units and the claim and run systemctl "
-            "daemon-reload (the service keeps running), delete its host-probe Pod "
-            "and ConfigMap, then move its journal and host-probe record out of "
-            f"{directory}. Nothing was declared or stopped",
+            f"{directory} and was not retired: "
+            + " | ".join(held)
+            + ". Retirement refused: "
+            + ("; ".join(reasons) or "no reason given")
+            + ". Nothing was declared or stopped",
         )
+    base = run_identity(
+        ctx.spec.case_id, ctx.spec.variant, ctx.attempt, ctx.case_dir.parent.parent
+    )
+    return rerun_run_id(ctx.case_dir, base)
+
+
+def _node_uid(ctx: VariantContext, node: str) -> str:
+    """The Node's current UID through the API; ``""`` when it is gone."""
+
+    from scripts.e2e.regional.regional_commands import RegionalFixtureError
+
+    try:
+        return str(ctx.regional.node_snapshot(node).get("uid") or "")
+    except RegionalFixtureError:
+        return ""
 
 
 def not_ready(ctx: VariantContext) -> dict[str, Any]:
-    refuse_open_service_windows(ctx)
+    window_run_id = reclaim_service_windows(ctx)
     session = _declared(ctx)
-    stopped = session.stop_kubelet()
+    stopped = session.stop_kubelet(window_run_id)
     node = session.await_not_ready()
     store = session.grade()
     # The claim is "the product graded the spare while kubelet was down": the
@@ -1044,6 +1106,7 @@ def not_ready(ctx: VariantContext) -> dict[str, Any]:
         oracle_ok=not window,
         oracle_detail="; ".join(window),
     )
+    result["service_window_run_id"] = window_run_id
     return finalize(result, session.finish())
 
 

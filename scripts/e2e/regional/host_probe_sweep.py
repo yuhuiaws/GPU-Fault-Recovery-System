@@ -162,7 +162,7 @@ def _sweep_record(
             and configmap_name
         ):
             return _skipped(name, "malformed record")
-        kubectl = _Kubectl(kubeconfig, context, namespace, run)
+        kubectl = ProbeKubectl(kubeconfig, context, namespace, run)
         pod = kubectl.read("pod", pod_name)
         phase = (pod.get("status") or {}).get("phase") if pod is not None else None
         if pod is not None and phase not in TERMINAL_PHASES:
@@ -180,7 +180,7 @@ def _sweep_record(
             if problem:
                 return _skipped(name, f"terminal Pod is not this record's: {problem}")
             kubectl.delete("pod", pod_name, uid=pod["metadata"]["uid"])
-            if not _wait_gone(kubectl, "pod", pod_name, sleep=sleep, clock=clock):
+            if not wait_gone(kubectl, "pod", pod_name, sleep=sleep, clock=clock):
                 return _skipped(name, "Pod deletion was not acknowledged")
             deleted.append(f"pod/{pod_name}")
         configmap = kubectl.read("configmap", configmap_name)
@@ -255,8 +255,8 @@ def foreign_reason(value: dict[str, Any], kind: str, record: dict[str, Any]) -> 
     return ""
 
 
-def _wait_gone(
-    kubectl: _Kubectl,
+def wait_gone(
+    kubectl: ProbeKubectl,
     kind: str,
     name: str,
     *,
@@ -271,8 +271,9 @@ def _wait_gone(
     return True
 
 
-class _Kubectl:
-    """The two API operations the sweep needs, in the fixture's own shape."""
+class ProbeKubectl:
+    """The two API operations the sweep (and a service window's retirement,
+    ``service_window_retire``) needs, in the fixture's own shape."""
 
     def __init__(
         self, kubeconfig: Path, context: str, namespace: str, run: Callable[..., Any]
@@ -330,6 +331,8 @@ __all__ = [
     "POD_GONE_WAIT_SECONDS",
     "SWEEP_EVIDENCE",
     "TERMINAL_PHASES",
+    "ProbeKubectl",
     "foreign_reason",
     "sweep_dead_host_probe_records",
+    "wait_gone",
 ]
