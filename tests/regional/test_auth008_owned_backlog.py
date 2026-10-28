@@ -6,12 +6,14 @@ import io
 import json
 import socket
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from gpu_fault import fleet_pins
 from gpu_fault.app import ApplicationContext
 from gpu_fault.regional import RemoteCommandStatus
 from gpu_fault.regional_compatibility import CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION
@@ -29,8 +31,8 @@ from tests._builders import asgi_client, build_context
 from tests.regional._cov95_identity_support import offline_guard as offline_guard
 from tests.regional._regional_support import TOKEN_A, TOKEN_B, registration
 
-# The release pins a CPU Pod exports; the AUTH-008 probe binds its receipt to
-# these because CPU Pods carry no GPU_FAULT_RELEASE_ID.
+# The release pins gpu-fault-release-metadata declares; the AUTH-008 probe binds
+# its receipt to these because CPU Pods carry no GPU_FAULT_RELEASE_ID.
 RELEASE_PINS = {
     "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256": "a" * 64,
     "GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256": "c" * 64,
@@ -41,6 +43,10 @@ RELEASE_PINS = {
 POD_ENVIRONMENT = {
     **RELEASE_PINS,
     "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST": "b" * 64,
+}
+#: ConfigMap key of each pin environment name (the product's own table).
+CONFIG_MAP_KEY = {
+    name: key for key, name in fleet_pins.CONFIG_MAP_KEY_ENVIRONMENT.items()
 }
 FIXTURE_ERROR_TEXT = (
     "cpu Pod probe failed: command failed (1): <sensitive output redacted> "
@@ -59,6 +65,27 @@ def cluster_target(cluster: str, directory: Path) -> ClusterTarget:
         control_plane_url="https://unit.invalid",
         ca_file=directory / "public-ca",
     )
+
+
+def serve_release_pins(
+    monkeypatch: pytest.MonkeyPatch, pins: Mapping[str, str]
+) -> dict[str, str]:
+    """Serve ``pins`` (by environment name) as the release ConfigMap.
+
+    The AUTH-008 CPU probe binds its receipt to the pins the control plane
+    serves: ``FleetPinRuntime`` reading ``gpu-fault-release-metadata`` through
+    the Pod's ServiceAccount, never the Pod's start-up environment. The result
+    is that ConfigMap's ``.data``; a test edits it to roll or drop a pin.
+    """
+
+    data = {CONFIG_MAP_KEY[name]: value for name, value in pins.items()}
+
+    def reader(name: str, namespace: str) -> fleet_pins.ConfigMapReader:
+        assert name == fleet_pins.DEFAULT_CONFIG_MAP, "only the release ConfigMap"
+        return lambda: (dict(data), "unit-resource-version")
+
+    monkeypatch.setattr(fleet_pins, "kubernetes_config_map_reader", reader)
+    return data
 
 
 def execute_probe(
@@ -84,6 +111,7 @@ def backlog_site(
     monkeypatch.delenv("GPU_FAULT_RELEASE_ID", raising=False)
     for name, value in POD_ENVIRONMENT.items():
         monkeypatch.setenv(name, value)
+    served_pins = serve_release_pins(monkeypatch, POD_ENVIRONMENT)
     events: list[str] = []
     receipt: dict[str, Any] = {}
     pin_reads: list[int] = []
@@ -200,7 +228,9 @@ def backlog_site(
         )
 
     monkeypatch.setattr(backlog, "auth008_claim", claim)
-    site = SimpleNamespace(regional=lambda target: Regional(target.cluster_id))
+    site = SimpleNamespace(
+        regional=lambda target: Regional(target.cluster_id), served_pins=served_pins
+    )
     return site, context, receipt, events
 
 
@@ -423,7 +453,7 @@ def test_auth008_cleanup_never_overwrites_changed_ownership(
 
 
 @pytest.mark.parametrize("name", sorted(RELEASE_PINS))
-def test_auth008_probe_refuses_a_pod_whose_release_pin_differs(
+def test_auth008_probe_refuses_a_served_release_pin_that_differs(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str
 ) -> None:
     site, context, receipt, _events = backlog_site(monkeypatch, tmp_path, "cleanup")
@@ -437,7 +467,7 @@ def test_auth008_probe_refuses_a_pod_whose_release_pin_differs(
     assert command.status is RemoteCommandStatus.LEASED, (
         "pin-drift cleanup requires a successfully leased candidate"
     )
-    monkeypatch.setenv(name, "f" * 64)
+    site.served_pins[CONFIG_MAP_KEY[name]] = "f" * 64
     with pytest.raises(RuntimeError, match=name) as refused:
         execute_probe(
             monkeypatch, auth.AUTH008_BACKLOG_PROBE, json.dumps(["cleanup", receipt])
@@ -450,7 +480,7 @@ def test_auth008_probe_refuses_a_pod_whose_release_pin_differs(
 
 
 @pytest.mark.parametrize("name", sorted(RELEASE_PINS))
-def test_auth008_probe_refuses_a_pod_that_exports_no_release_pin(
+def test_auth008_probe_refuses_a_control_plane_that_serves_no_release_pin(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str
 ) -> None:
     site, context, receipt, _events = backlog_site(monkeypatch, tmp_path, "cleanup")
@@ -460,8 +490,8 @@ def test_auth008_probe_refuses_a_pod_that_exports_no_release_pin(
         cluster_target("b", tmp_path),
         case_dir=tmp_path,
     )
-    monkeypatch.delenv(name)
-    with pytest.raises(RuntimeError, match="not exported") as refused:
+    del site.served_pins[CONFIG_MAP_KEY[name]]
+    with pytest.raises(RuntimeError, match="not served") as refused:
         execute_probe(
             monkeypatch, auth.AUTH008_BACKLOG_PROBE, json.dumps(["seed", receipt])
         )
@@ -470,6 +500,65 @@ def test_auth008_probe_refuses_a_pod_that_exports_no_release_pin(
     )
     assert name in str(refused.value)
     assert context.store.list_remote_commands()[0].status is RemoteCommandStatus.LEASED
+
+
+def test_auth008_binds_the_served_pins_not_a_stale_pod_startup_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Live 2026-10-28 (R13i, HyperPod primary): a finalize that changed only
+    # pins rolled no CPU Pod, so every api-ha Pod's start-up env still held the
+    # previous release's pins while the control plane served the new ones. The
+    # probe compared os.environ and refused both seed and cleanup ("release pin
+    # ... differs from the receipt; release changed").
+    site, context, receipt, events = backlog_site(monkeypatch, tmp_path, "none")
+    for name in POD_ENVIRONMENT:
+        monkeypatch.setenv(name, "0" * 64)
+    # The API serves the ConfigMap as well, as a hot-reloaded Pod does.
+    context.fleet_pin_runtime = fleet_pins.FleetPinRuntime.from_environment()
+    assert context.fleet_pin_runtime.refresh_once(), context.fleet_pin_runtime.status()
+    result = auth.run_auth008(
+        site,
+        cluster_target("a", tmp_path),
+        cluster_target("b", tmp_path),
+        case_dir=tmp_path,
+    )
+    assert result["verdict"] == "PASS", result
+    assert receipt["required_pins"] == RELEASE_PINS, "the receipt names the served pins"
+    assert events[0] == "seed" and events[-1] == "cleanup"
+    assert result["checks"]["owned_records_retired"] is True
+    assert context.store.list_remote_commands()[0].status is RemoteCommandStatus.FAILED
+
+
+def test_auth008_probe_refuses_when_the_served_pins_cannot_be_read(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    site, context, receipt, _events = backlog_site(monkeypatch, tmp_path, "cleanup")
+    auth.run_auth008(
+        site,
+        cluster_target("a", tmp_path),
+        cluster_target("b", tmp_path),
+        case_dir=tmp_path,
+    )
+    command = context.store.list_remote_commands()[0]
+    assert command.status is RemoteCommandStatus.LEASED, "a leased candidate to keep"
+
+    def unreadable(name: str, namespace: str) -> fleet_pins.ConfigMapReader:
+        def read() -> tuple[Mapping[str, str], str | None]:
+            raise PermissionError("configmaps is forbidden for unit-service-account")
+
+        return read
+
+    monkeypatch.setattr(fleet_pins, "kubernetes_config_map_reader", unreadable)
+    with pytest.raises(RuntimeError, match="cannot read the served") as refused:
+        execute_probe(
+            monkeypatch, auth.AUTH008_BACKLOG_PROBE, json.dumps(["cleanup", receipt])
+        )
+    assert "(PermissionError)" in str(refused.value), "the failure class is named"
+    assert "unit-service-account" not in str(refused.value), "never the API text"
+    assert (
+        context.store.get_remote_command(command.command_id).status
+        is RemoteCommandStatus.LEASED
+    ), "unproven pins must neither seed nor retire, and never fall back to env"
 
 
 @pytest.mark.parametrize(

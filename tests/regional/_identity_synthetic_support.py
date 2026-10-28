@@ -41,8 +41,8 @@ API_POD = "gpu-fault-api-ha-0"
 IMAGE = "registry.example/executor@sha256:" + "e" * 64
 ARTIFACT = "a" * 64
 COMPATIBILITY = "b" * 64
-# What the CPU Pods export and gpu-fault-release-metadata declares; the AUTH-008
-# CPU probe binds its receipt to these, never to GPU_FAULT_RELEASE_ID.
+# What gpu-fault-release-metadata declares and the control plane serves; the
+# AUTH-008 CPU probe binds its receipt to these, never to GPU_FAULT_RELEASE_ID.
 RELEASE_PINS = {
     "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256": ARTIFACT,
     "GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256": "c" * 64,

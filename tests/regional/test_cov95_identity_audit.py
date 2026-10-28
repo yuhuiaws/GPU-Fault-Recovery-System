@@ -31,6 +31,7 @@ from tests._builders import build_context
 from tests.regional._cov95_identity_support import ASGIBridge
 from tests.regional._cov95_identity_support import offline_guard as offline_guard
 from tests.regional._regional_support import TOKEN_A, TOKEN_B, registration
+from tests.regional.test_auth008_owned_backlog import serve_release_pins
 from tests.regional.test_multi_cluster_fixture_review import pod_document
 
 
@@ -210,7 +211,7 @@ def test_auth008_real_claim_protocol_owns_only_its_b_candidate(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, defect: str
 ) -> None:
     context, bridge = bound_api(monkeypatch)
-    # The CPU Pod exports the release pins, not GPU_FAULT_RELEASE_ID.
+    # CPU Pods carry no GPU_FAULT_RELEASE_ID; the release pins bind the receipt.
     monkeypatch.delenv("GPU_FAULT_RELEASE_ID", raising=False)
     pins = {
         "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256": "a" * 64,
@@ -222,6 +223,11 @@ def test_auth008_real_claim_protocol_owns_only_its_b_candidate(
     # The bound API derives its executor policy from this environment too.
     monkeypatch.setenv(
         "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST", "b" * 64
+    )
+    # The CPU probe reads the pins the control plane serves (the ConfigMap).
+    serve_release_pins(
+        monkeypatch,
+        {**pins, "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_COMPATIBILITY_DIGEST": "b" * 64},
     )
     events = []
 

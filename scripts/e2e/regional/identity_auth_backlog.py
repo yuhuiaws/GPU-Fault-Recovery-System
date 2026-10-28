@@ -77,8 +77,9 @@ def run_auth008(
         or peer.get("release_id") != deployment["release_id"]
     ):
         raise IdentityAcceptanceError("AUTH-008 A/B release identity is incomplete")
-    # The CPU probe binds to these pins, not to release_id: the CPU Pods export
-    # the pins (from gpu-fault-release-metadata) but not GPU_FAULT_RELEASE_ID.
+    # The CPU probe binds to these pins, not to release_id (CPU Pods carry no
+    # GPU_FAULT_RELEASE_ID), and compares them with the pins the control plane
+    # serves from gpu-fault-release-metadata, never with a Pod's start-up env.
     # Both fixtures read the same CPU namespace, so one read is the release.
     pins = regional_a.release_pins()
     identities = [

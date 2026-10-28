@@ -49,7 +49,7 @@ from tests.regional._identity_synthetic_support import (
     FakeSite,
 )
 from tests.regional._regional_support import TOKEN_A
-from tests.regional.test_auth008_owned_backlog import execute_probe
+from tests.regional.test_auth008_owned_backlog import execute_probe, serve_release_pins
 
 AUTH007 = "GF-REGIONAL-AUTH-007"
 AUTH008 = "GF-REGIONAL-AUTH-008"
@@ -798,10 +798,12 @@ def test_real_auth008_body_leases_only_through_the_synthetic_b(
     mirror(fake.registry)
     fake.on_publish = mirror
     monkeypatch.setattr(ApplicationContext, "from_environment", lambda: context)
-    # A CPU Pod exports the release pins, never GPU_FAULT_RELEASE_ID.
+    # A CPU Pod carries no GPU_FAULT_RELEASE_ID; the probe binds the pins the
+    # control plane serves from the release ConfigMap.
     monkeypatch.delenv("GPU_FAULT_RELEASE_ID", raising=False)
     for name, value in POD_ENVIRONMENT.items():
         monkeypatch.setenv(name, value)
+    serve_release_pins(monkeypatch, POD_ENVIRONMENT)
     fake.exec_hooks[AUTH008_BACKLOG_PROBE] = lambda _env, args: execute_probe(
         monkeypatch, AUTH008_BACKLOG_PROBE, args[0]
     )

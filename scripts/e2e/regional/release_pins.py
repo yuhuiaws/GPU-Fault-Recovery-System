@@ -1,10 +1,13 @@
 """Release-bound pins a CPU control-plane Pod exports, read from the release metadata.
 
 The CPU Deployments take ``GPU_FAULT_REQUIRED_*`` through ``configMapKeyRef``
-from ``gpu-fault-release-metadata`` at Pod start, so inside a Pod they name the
-release that Pod was rolled for. ``GPU_FAULT_RELEASE_ID`` is *not* rendered into
-the CPU role environment (``gpu_fault.app.factory`` defaults it to "local");
-Pod-side probes therefore bind their receipts to these pins and carry the
+from ``gpu-fault-release-metadata`` at Pod start, but the control plane serves
+the ConfigMap's current values (``gpu_fault.fleet_pins`` hot reload) and a
+finalize that changes only pins rolls no CPU Pod, so a Pod's start-up env can
+name the previous release. ``GPU_FAULT_RELEASE_ID`` is *not* rendered into the
+CPU role environment (``gpu_fault.app.factory`` defaults it to "local"). Pod-side
+probes therefore bind their receipts to these pins as the control plane serves
+them (``FleetPinRuntime.refresh_once``), never to ``os.environ``, and carry the
 release ID only as evidence.
 """
 

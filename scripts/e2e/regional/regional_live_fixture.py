@@ -951,9 +951,9 @@ class RegionalLiveFixture:
     def release_pins(self) -> dict[str, str]:
         """The required release pins, keyed by the env name a CPU Pod exports.
 
-        Read from ``gpu-fault-release-metadata`` exactly as the CPU Deployments
-        do; a Pod-side probe compares them with its own environment to refuse
-        work once the release rolled past the receipt it was handed.
+        Read from ``gpu-fault-release-metadata``, the pins the control plane
+        serves; a Pod-side probe re-reads them there (never its start-up env)
+        to refuse work once the release rolled past the receipt it was handed.
         """
 
         return release_pins_from_metadata(

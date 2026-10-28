@@ -5391,6 +5391,15 @@ The former `probe-clusters` mode (one enabled claim per cluster) has been remove
   An ordinary matrix export cannot replace the formal evidence of this case's audited runner.
 - Supplement: the legitimate claims of steps 1 and 2 must carry the current Executor pin; steps 3 and 4 return 403 at the
   authorization layer and do not depend on the pin.
+- Release binding: besides `release_id` (evidence only), the intent receipt records `required_pins`, i.e.
+  `required-regional-executor-artifact-sha256`, `required-agent-artifact-sha256` and `required-agent-compatibility-digest`
+  from `gpu-fault-release-metadata`; the seed/cleanup probe in the CPU Pod compares each with the pin the control plane
+  currently serves: one read of that ConfigMap through the Pod's own ServiceAccount (the same source as the
+  `gpu_fault.fleet_pins` hot reload), never the `GPU_FAULT_REQUIRED_*` environment the Pod exported at start-up. A
+  finalize that changes only pins rolls no CPU Pod, so the start-up environment can still hold the previous release's
+  pins. An unreadable, missing or differing pin is refused and the differing pin is named (CPU Pods do not export
+  `GPU_FAULT_RELEASE_ID`). When the runner catches `RegionalFixtureError`, the result and `auth008-details.json`
+  record the redacted `error` text, not only `error_type`.
 - Meaning of failure: cross-cluster action hijacking -- one cluster's credentials can execute destructive actions in another cluster.
   **Blocks go-live.**
 

@@ -68,11 +68,11 @@ print(json.dumps({"status": status, "body": safe}, sort_keys=True))
 AUTH008_BACKLOG_PROBE = r"""
 import hashlib
 import json
-import os
 import re
 import sys
 from datetime import datetime, timezone
 from gpu_fault.app import ApplicationContext
+from gpu_fault.fleet_pins import FleetPinRuntime
 from gpu_fault.models import (
     FaultIncident, IncidentState, WorkflowOperation, WorkflowRequest,
     WorkflowStatus, WorkflowStepSpec,
@@ -82,8 +82,13 @@ from gpu_fault.store import NotFoundError
 
 # CPU Pods do not export GPU_FAULT_RELEASE_ID (gpu_fault.app.factory defaults it
 # to "local"); the receipt's release_id is evidence only. The release binding is
-# the required pins the Pod took from gpu-fault-release-metadata at start-up: a
-# receipt written against another release must not seed or clean up here.
+# the required pins the control plane serves: a receipt written against another
+# release must not seed or clean up here. The control plane hot-reloads them from
+# gpu-fault-release-metadata (gpu_fault.fleet_pins) and a finalize that changes
+# only pins rolls no CPU Pod, so a Pod's start-up env can name the previous
+# release (live 2026-10-28: every api-ha Pod still held the R13h pins after the
+# R13i finalize, and seed and cleanup both refused). Read them as the server
+# does: one ConfigMap read through the Pod's ServiceAccount, never os.environ.
 RELEASE_PINS = (
     "GPU_FAULT_REQUIRED_REGIONAL_EXECUTOR_ARTIFACT_SHA256",
     "GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256",
@@ -99,10 +104,15 @@ if (
     or not all(isinstance(value, str) and value for value in pins.values())
 ):
     raise RuntimeError("AUTH008 receipt release pins are incomplete")
+served_pins = FleetPinRuntime.from_environment()
+if not served_pins.refresh_once():
+    error_class = str(served_pins.status()["error"] or "").split(":", 1)[0]
+    raise RuntimeError("AUTH008 cannot read the served release pins (" + error_class + ")")
+served = served_pins.environment()
 for name in RELEASE_PINS:
-    deployed = os.environ.get(name, "").strip()
+    deployed = served.get(name, "").strip()
     if not deployed:
-        raise RuntimeError("AUTH008 release pin " + name + " is not exported by this Pod")
+        raise RuntimeError("AUTH008 release pin " + name + " is not served by this control plane")
     if deployed != pins[name]:
         raise RuntimeError("AUTH008 release pin " + name + " differs from the receipt; release changed")
 cluster_a, cluster_b = receipt["cluster_a"], receipt["cluster_b"]
