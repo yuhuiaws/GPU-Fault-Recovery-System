@@ -5885,8 +5885,8 @@ test_cases:
   - 未分级节点：XID 45 工作流恰为 FREEZE_EVIDENCE 与 RESTART_FABRIC_MANAGER 两步、owner 为 gpu-fault-control-plane/gpu-fault-node-agent、SUCCEEDED，不出现任何隔离/quiesce/reset/reboot 操作；分级节点：工作流为 DESTR-010 的全量 reset 链且 SUCCEEDED，不出现 RESTART_FABRIC_MANAGER/RESET_GPU/QUARANTINE/reboot/replace
   - "被审计命令为未分级节点的 Fabric Manager 重启命令或分级节点链上的 RESET_ALL_GPUS_NVSWITCHES 命令；journald（SyslogIdentifier=gpu-fault-node-agent）中该 command_id 恰有 accepted、started、completed 三行，每行含 command_id/incident_id/workflow_request_id/operation/node_id/fencing_token/agent_generation/gpu_count/attempt 九个字段且值与控制面一致，completed 行 status=SUCCEEDED 且 duration_ms 为整数；不含 parameters、GPU UUID 列表、signature、secret"
   - "真实账本 PRAGMA user_version等于部署的LEDGER_SCHEMA_VERSION（当前3）、主键 (command_id, attempt)；该命令恰一行 attempt=1、state=SUCCEEDED，incident_id/workflow_request_id/fencing_token 与控制面一致，started_at 早于 completed_at，parameters_digest 与 signature_digest 为 64 位 sha256，gpu_uuids 列非空，exit_code 为空；INTERRUPTED 行数与基线相同"
-  - "命令后 /healthz counters：未分级节点为 accepted=1、completed=1、failed=0、rejected=0；分级节点等于重启后账本里链上全部 attempt（accepted=行数、completed=SUCCEEDED 行数、failed=FAILED 行数、rejected=0），且重启后账本只含链上的节点动作、QUIESCE/RESET_ALL/RESTORE 各一次"
-  - CloudTrail provider 变更动词集合为空；节点 Kubernetes 状态与基线逐字段相同
+  - "命令后 /healthz counters：未分级节点为 accepted=1、completed=1、failed=0、rejected=0；分级节点等于重启后账本里的全部 attempt（accepted=行数、completed=SUCCEEDED 行数、failed=FAILED 行数），rejected 等于重启后 Agent 记下的带九个标识字段的 node action rejected 行数；重启后账本只含链自己工作流的节点动作、QUIESCE/RESET_ALL/RESTORE 各一次，外加至多一次控制面观测刷新（产品按本集群、本节点、Agent generation 与用例期间某一小时推导出的 TRIGGER_HEALTH_SNAPSHOT，attempt=1、SUCCEEDED、不带 GPU、不在 quiesce 窗口内），每条拒绝都是窗口开着时 Agent 对该刷新的准入拒绝（点名链 incident），其他任何行或拒绝都 FAIL；没有刷新时 rejected=0"
+  - "CloudTrail provider 变更动词集合为空；节点 Kubernetes 状态与基线逐字段相同，唯一例外是 HyperPod 上 quiesce 停 kubelet 带来的 Ready 翻转：RESTORE 恢复了 kubelet 时 ready_since 只能落在链上 RESTORE attempt 的区间内"
   - 清理后：fail-safe 定时器已解除且不留任何新增 gpu-fault timer、Agent 与 Fabric Manager 均 active、探针 Pod/ConfigMap 零残留、runtime identity 与 preflight 相同（开过窗时只允许 gpu-fault-control-worker 的 generation 恰好多两次滚动，pod template 摘要回到开窗前）
   evidence:
     verdict: NOT_RUN

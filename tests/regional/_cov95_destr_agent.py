@@ -186,6 +186,11 @@ class AgentHarness:
             "commands": [{**COMMAND, "status": "SUCCEEDED"}],
         }
         self.journal = journal()
+        # The full journal since the restart (no --command-id; the graded
+        # chain's refusal audit), and the Node the cleanup reads once the XID
+        # was written; None: the same as above.
+        self.journal_since: dict[str, Any] | None = None
+        self.node_after: dict[str, Any] | None = None
         self.audit = audit()
         # The control plane's fabric grading of the node (batch 128): not
         # graded, so the XID 45 is the two-step Fabric Manager restart.
@@ -299,6 +304,8 @@ class AgentRegional:
 
     def node_snapshot(self, node: str) -> dict[str, Any]:
         self.h.call("node.snapshot", node)
+        if self.h.injected and self.h.node_after is not None:
+            return deepcopy(self.h.node_after)
         return deepcopy(self.h.node)
 
     def business_workloads(self, node: str) -> list[dict[str, Any]]:
@@ -362,6 +369,8 @@ class AgentProbe:
         if action == "write-xid45":
             self.h.injected = True
         if action == "journal":
+            if "--command-id" not in args and self.h.journal_since is not None:
+                return deepcopy(self.h.journal_since)
             return deepcopy(self.h.journal)
         if action == "ledger-audit":
             return deepcopy(self.h.chain_audit if "--since" in args else self.h.audit)

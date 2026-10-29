@@ -9,7 +9,10 @@ ledger writable with a fresh heartbeat and zeroed counters. Then one real XID
 its node action has to leave the ARCH-C3/C4/C5 trail: three structured
 journald lines with the nine identifier fields, one ledger row keyed
 ``(command_id, attempt=1)`` with every audit column, and the health counters
-moving exactly as the ledger did. On a node the product does not grade that
+moving exactly as the ledger did -- and, on a graded node, its ``rejected`` as
+the Agent's journal did: the one other command the window may meet is the
+control plane's observation refresh, refused while the window is open and run
+once after it (``observation_refresh``). On a node the product does not grade that
 action is the one Fabric Manager restart; on a graded NVSwitch node (Hopper
 SXM, HGX B200/B300) the XID 45 runs the full GPU + NVSwitch reset chain and the
 audit reads its RESET_ALL_GPUS_NVSWITCHES (``fabric_restart_shape``). Where the
@@ -380,6 +383,12 @@ class _LiveRun:
     incident_id: str = ""
     workflow_request_id: str = ""
     opt_in_opened: bool = False
+    # The restarted Agent's systemd invocation: its journal lines are the ones
+    # its counters count.
+    agent_invocation_id: str = ""
+    # The chain's RESTORE_GPU_SERVICES (start, end) when its quiesce stopped
+    # kubelet (HyperPod): the one Ready flip the final node check allows.
+    kubelet_restarted: tuple[datetime, datetime] | None = None
 
 
 def _prepare_live_run(settings: Settings, run_dir: Path, attempt: int) -> _LiveRun:
@@ -471,6 +480,9 @@ def _restart(run: _LiveRun) -> list[str]:
         timeout=180,
     )
     write_json_atomic(run.case_dir / "agent-restart.json", restart)
+    run.agent_invocation_id = str(
+        (restart.get("after") or {}).get("InvocationID") or ""
+    )
     errors = verdicts.restart_errors(
         restart, baseline_boot_id=str(run.baseline_host.get("boot_id") or "")
     )
@@ -600,19 +612,82 @@ def _audit_errors(run: _LiveRun, state: dict[str, Any]) -> list[str]:
         )
     )
     chain_audit = _chain_audit(run) if shape == shapes.FABRIC_RESET else None
+    attempts: dict[str, Any] = {}
+    window = None
     if chain_audit is not None:
-        errors.extend(verdicts.chain_ledger_errors(chain_audit))
+        attempts = verdicts.refresh_attempts(
+            chain_audit,
+            cluster_id=str(
+                run.baseline_agent.get("cluster_id") or run.settings.regional.cluster_id
+            ),
+            node=run.settings.node,
+            generation=generation,
+            start=run.started_at,
+            end=datetime.now(timezone.utc),
+        )
+        window = verdicts.chain_window(
+            chain_audit, workflow_request_id=run.workflow_request_id
+        )
+        errors.extend(
+            verdicts.chain_ledger_errors(
+                chain_audit,
+                workflow_request_id=run.workflow_request_id,
+                foreign=list(attempts),
+            )
+        )
+        errors.extend(
+            verdicts.refresh_errors(attempts, generation=generation, window=window)
+        )
+        run.kubelet_restarted = verdicts.kubelet_restart(
+            state,
+            chain_audit,
+            node=run.settings.node,
+            workflow_request_id=run.workflow_request_id,
+        )
     health = run.agent_probe.execute("agent-health", timeout=60)
     write_json_atomic(run.case_dir / "health-after-command.json", health)
+    refused = 0
+    if chain_audit is not None:
+        refused, refusal_errors = _refusals(run, attempts, window, generation)
+        errors.extend(refusal_errors)
     errors.extend(
         verdicts.health_errors(
             health,
             label="after command",
-            expect_counters=verdicts.counter_expectation(shape, chain_audit),
+            expect_counters=verdicts.counter_expectation(
+                shape, chain_audit, refused=refused
+            ),
             max_heartbeat_age_seconds=120,
         )
     )
     return errors
+
+
+def _refusals(
+    run: _LiveRun,
+    attempts: dict[str, Any],
+    window: tuple[datetime, datetime] | None,
+    generation: int,
+) -> tuple[int, list[str]]:
+    """Every rejection the restarted Agent logged since the restart, read after
+    the health it counted them in: each must be the window's refusal of the
+    observation refresh that then ran."""
+
+    if run.restarted_at is None:
+        raise RegionalFixtureError("the refusal audit follows the restart")
+    journal = run.agent_probe.execute(
+        "journal", "--since-epoch", str(run.restarted_at.timestamp()), timeout=120
+    )
+    write_json_atomic(run.case_dir / "journal-since-restart.json", journal)
+    return verdicts.refusal_count(
+        journal.get("lines") or [],
+        attempts,
+        invocation_id=run.agent_invocation_id or None,
+        chain_incident=run.incident_id,
+        window=window,
+        node=run.settings.node,
+        generation=generation,
+    )
 
 
 def _chain_audit(run: _LiveRun) -> dict[str, Any]:
@@ -788,7 +863,9 @@ def _disarm(run: _LiveRun) -> dict[str, Any]:
 def _final_node(run: _LiveRun) -> dict[str, Any]:
     snapshot = run.regional.node_snapshot(run.settings.node)
     write_json_atomic(run.case_dir / "node-final.json", snapshot)
-    errors = verdicts.node_errors(run.baseline_node, snapshot)
+    errors = verdicts.node_errors(
+        run.baseline_node, snapshot, kubelet_restarted=run.kubelet_restarted
+    )
     if run.regional.business_workloads(run.settings.node):
         errors.append("target node acquired a non-system workload")
     if errors:

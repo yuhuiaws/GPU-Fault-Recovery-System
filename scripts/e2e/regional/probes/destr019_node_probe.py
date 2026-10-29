@@ -15,7 +15,8 @@ except the one restart the case exists to perform:
   (``ledger.writable``, ``heartbeat``, ``counters``) and the HTTP status.
 * **journal** -- the Agent's ARCH-C3 structured lines from journald
   (``SyslogIdentifier=gpu-fault-node-agent``), parsed into phase plus
-  ``key=value`` fields for one ``command_id``.
+  ``key=value`` fields for one ``command_id``, or for every command since an
+  instant (each rejection with its whole ``reason``).
 * **ledger-audit** -- the ARCH-C4 audit columns of the rows one command left
   in ``/var/lib/gpu-fault/node-actions.db`` plus ``PRAGMA user_version``,
   read through a read-only URI.
@@ -85,6 +86,8 @@ LOG_LINE = re.compile(
     r"node action (?P<phase>accepted|started|completed|failed|rejected) (?P<fields>.*)$"
 )
 FIELD = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(\S*)")
+# A rejection ends in ``reason=<the refusal's message>``, spaces and all.
+REJECTION_REASON = re.compile(r"(?:^|\s)reason=(?P<reason>.*)$")
 # ARCH-C4 audit columns, as the shipped ledger declares them.
 AUDIT_COLUMNS = (
     "command_id",
@@ -473,12 +476,24 @@ def agent_health(_arguments: argparse.Namespace) -> None:
 # journald
 # --------------------------------------------------------------------------- #
 def parse_log_line(message: str) -> dict[str, Any] | None:
-    """One ARCH-C3 line -> ``{"phase": ..., "fields": {...}}``, else None."""
+    """One ARCH-C3 line -> ``{"phase": ..., "fields": {...}}``, else None.
+
+    A ``rejected`` line keeps its ``reason`` whole: the key=value reading took
+    only the refusal message's first word ("GPU" for a maintenance window
+    refusal), and the case judges every refusal by what it says.
+    """
 
     match = LOG_LINE.search(message)
     if match is None:
         return None
-    fields = dict(FIELD.findall(match.group("fields")))
+    text, reason = match.group("fields"), None
+    if match.group("phase") == "rejected":
+        found = REJECTION_REASON.search(text)
+        if found is not None:
+            text, reason = text[: found.start()], found.group("reason")
+    fields = dict(FIELD.findall(text))
+    if reason is not None:
+        fields["reason"] = reason
     return {"phase": match.group("phase"), "fields": fields}
 
 

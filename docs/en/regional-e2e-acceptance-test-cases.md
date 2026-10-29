@@ -12861,7 +12861,10 @@ the ledger migrates in place, and the next real command leaves a complete audit 
      chain's `RESET_ALL_GPUS_NVSWITCHES` command on a graded node; with
      `<idempotency_key>/<node>/agent-<generation>` as the command_id, read journald
      (`journalctl -t gpu-fault-node-agent`), the ledger audit columns and `/healthz`; on a graded node also
-     read every ledger attempt since the restart with `ledger-audit --since <restart instant>`.
+     read every ledger attempt since the restart with `ledger-audit --since <restart instant>` and, after that
+     `/healthz`, the restarted Agent's ARCH-C3 lines of every command since the restart (`journal --since-epoch
+     <restart instant>` without `--command-id`, evidence `journal-since-restart.json`; a rejection line keeps its
+     whole `reason`).
 - Verdict:
   - Restart: `MainPID` and `InvocationID` changed, `boot_id` unchanged; the control-plane Agent has
     `lifecycle_state=ACTIVE`, `generation` and `agent_incarnation_id` equal to the baseline;
@@ -12888,14 +12891,35 @@ the ledger migrates in place, and the next real command leaves a complete audit 
     `started_at < completed_at`, `parameters_digest`/`signature_digest` are 64-character
     sha256, the `gpu_uuids` column is non-empty, `exit_code` is null; the INTERRUPTED row count equals the baseline;
   - After the command `/healthz` `counters`: on a node that is not graded `accepted=1 completed=1 failed=0
-    rejected=0`; on a graded node they equal the chain's attempts in the ledger since the restart
+    rejected=0`; on a graded node they equal the attempts in the ledger since the restart
     (`accepted`=rows, `completed`=SUCCEEDED rows, `failed`=FAILED rows -- a VERIFY attempt that failed before the
-    host clients exited counts too -- `rejected=0`), and those rows hold only the chain's node actions, QUIESCE,
-    RESET_ALL and RESTORE once each;
-  - The CloudTrail set of provider mutation verbs is empty; the node's Kubernetes state is field-by-field identical to the baseline.
+    host clients exited counts too) and `rejected` equals the `node action rejected` lines with the nine
+    identifier fields that the restarted Agent (its `InvocationID`) logged; those rows hold the node actions of the
+    chain's own workflow, QUIESCE, RESET_ALL and RESTORE once each, and at most the control plane's observation
+    refresh below; with no refresh `rejected=0`;
+  - The observation refresh: the quiesce stops `gpu-fault-metrics-collector` and `gpu-fault-host-collector`, and the
+    control plane's once-a-minute collector scan may then ask for one bounded fresh snapshot of the node
+    (`observation_health.request_observation_refresh`: a `SITE_OBSERVABILITY` incident of its own, at most one per
+    node and hour, workflow `FREEZE_EVIDENCE → TRIGGER_HEALTH_SNAPSHOT → VALIDATE_HOST`). Its
+    `TRIGGER_HEALTH_SNAPSHOT` is one of the Agent's own GPU activities, so while the window is open the Agent refuses
+    it at admission (HTTP 409 `GPU_MAINTENANCE_WINDOW_OPEN`, retryable, no ledger row, one `rejected` per
+    submission) and runs it once the restore closed the window. Whether a run meets it depends on the scan's timing
+    and that hourly bound; both outcomes pass, and it is accepted in exactly this shape only
+    (`scripts/e2e/regional/observation_refresh.py`): incident, workflow and command_id are the ones the product
+    derives for this cluster, node, Agent generation and an hour of the case; one ledger attempt, `attempt=1`,
+    SUCCEEDED, no GPU, `exit_code` null, over before QUIESCE began or started after RESTORE began; every rejection
+    line names that command (attempt 0, no GPU, its incident, workflow and fencing token), carries the Agent's own
+    window refusal naming the chain's incident, and was logged between QUIESCE's start and the refresh's attempt. Any
+    other row or rejection FAILs the case;
+  - The CloudTrail set of provider mutation verbs is empty; the node's Kubernetes state is field-by-field identical to
+    the baseline, but for one difference that is the chain's own: on HyperPod the quiesce stops kubelet (the Agent
+    protects kubelet and containerd on `eks-managed` only), the node controller marks the node NotReady and Ready
+    returns when RESTORE_GPU_SERVICES starts kubelet again. Where the RESTORE result lists `kubelet` among the
+    restored services, the Ready condition's `lastTransitionTime` (`ready_since`) may move, to a moment inside the
+    chain's RESTORE attempt only (whole seconds); every other field stays identical.
 - Cleanup (`finally`): `ensure-agent-active`; `disarm-restore` and confirm no newly added
-  gpu-fault timer remains; `ensure-fabric-manager-active`; node snapshot identical to the baseline with no non-system
-  workload; zero residue from the two probe Pods/ConfigMaps; with a window, then close it (`xid45-opt-in-close.json`,
+  gpu-fault timer remains; `ensure-fabric-manager-active`; node snapshot identical to the baseline (but for that Ready
+  flip) with no non-system workload; zero residue from the two probe Pods/ConfigMaps; with a window, then close it (`xid45-opt-in-close.json`,
   a second control-worker roll); runtime identity equal to preflight -- with a window, by `DESTR-018`'s rule, only the
   `gpu-fault-control-worker` generation may move, by exactly the window's two rolls, and its pod template digest must be
   back at its pre-window value; without one, field by field identical. Any failing step makes the case FAIL. When the

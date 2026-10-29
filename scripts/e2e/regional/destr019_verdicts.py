@@ -21,6 +21,15 @@ equal the ledger rows the chain added since the restart (attempts, SUCCEEDED,
 FAILED, no rejection). Where the site's default makes that XID 45 observe-only
 (batch 131) the runner opens DESTR-010's XID 45 opt-in window for the chain.
 
+The chain's window can meet one other node action: the control plane's
+observation refresh (``observation_refresh``), a TRIGGER_HEALTH_SNAPSHOT of its
+own incident that the Agent refuses while the window is open and runs once it
+closed. Its one attempt is a ledger row the counters count, and each refusal a
+``rejected`` the restarted Agent logged; both are accepted only in that exact
+shape. On HyperPod the quiesce stops kubelet (no protected services there), so
+the Node's Ready condition flips once and is back when RESTORE_GPU_SERVICES
+started kubelet again; the final node check allows exactly that flip.
+
 What the case deliberately does *not* do is restart the Agent while a
 maintenance command is in flight. ``NodeActionLedger._interrupt_in_progress``
 marks such a row INTERRUPTED and ``step_execution._fold_result`` fails the
@@ -39,6 +48,7 @@ from typing import Any
 
 from gpu_fault.node_agent.ledger import LEDGER_SCHEMA_VERSION
 from scripts.e2e.regional import fabric_restart_shape as shapes
+from scripts.e2e.regional import observation_refresh as refresh
 from scripts.e2e.regional.acceptance_runner_common import processor_queue_backlog
 
 CASE_ID = "GF-REGIONAL-DESTR-019"
@@ -374,10 +384,11 @@ def audited_command(state: dict[str, Any], shape: str) -> dict[str, Any]:
 
 
 def counter_expectation(
-    shape: str, chain_audit: dict[str, Any] | None = None
+    shape: str, chain_audit: dict[str, Any] | None = None, *, refused: int = 0
 ) -> dict[str, int]:
     """What ``/healthz`` must count after the workflow: one Fabric Manager
-    restart, or exactly the chain's attempts the Agent's ledger holds."""
+    restart, or exactly the attempts the Agent's ledger holds since the restart
+    and the refusals its journal holds (``refusal_count``)."""
 
     if shape != shapes.FABRIC_RESET:
         return {"accepted": 1, "completed": 1, "failed": 0, "rejected": 0}
@@ -386,20 +397,129 @@ def counter_expectation(
         "accepted": len(rows),
         "completed": sum(row.get("state") == "SUCCEEDED" for row in rows),
         "failed": sum(row.get("state") == "FAILED" for row in rows),
-        "rejected": 0,
+        "rejected": refused,
     }
 
 
-def chain_ledger_errors(chain_audit: dict[str, Any]) -> list[str]:
-    """Every attempt the Agent took since the restart is a step of the chain,
-    and the window, the reset and the restore ran once each."""
+def refresh_attempts(
+    chain_audit: dict[str, Any],
+    *,
+    cluster_id: str,
+    node: str,
+    generation: int,
+    start: datetime,
+    end: datetime,
+) -> dict[str, tuple[refresh.RefreshRequest, list[dict[str, Any]]]]:
+    """The ledger rows since the restart that are the control plane's
+    observation refresh of this node in the case's hours, by command id."""
 
-    rows = chain_audit.get("rows") or []
+    requests = refresh.requests(
+        cluster_id=cluster_id, node=node, generation=generation, start=start, end=end
+    )
+    found: dict[str, tuple[refresh.RefreshRequest, list[dict[str, Any]]]] = {}
+    for row in chain_audit.get("rows") or []:
+        request = requests.get(str(row.get("command_id")))
+        if request is not None:
+            found.setdefault(request.command_id, (request, []))[1].append(row)
+    return found
+
+
+def chain_window(
+    chain_audit: dict[str, Any], *, workflow_request_id: str
+) -> tuple[datetime, datetime] | None:
+    """(QUIESCE start, RESTORE start) of the chain's one window, from its ledger."""
+
+    starts: dict[str, list[datetime | None]] = {}
+    for row in chain_audit.get("rows") or []:
+        if row.get("workflow_request_id") == workflow_request_id:
+            starts.setdefault(str(row.get("operation")), []).append(
+                parse_time(row.get("started_at"))
+            )
+    quiesce = starts.get("QUIESCE_GPU_SERVICES") or []
+    restore = starts.get("RESTORE_GPU_SERVICES") or []
+    if len(quiesce) != 1 or len(restore) != 1:
+        return None
+    opened, closing = quiesce[0], restore[0]
+    if opened is None or closing is None:
+        return None
+    return opened, closing
+
+
+def refresh_errors(
+    attempts: dict[str, tuple[refresh.RefreshRequest, list[dict[str, Any]]]],
+    *,
+    generation: int,
+    window: tuple[datetime, datetime] | None,
+) -> list[str]:
+    """Each refresh ran once, SUCCEEDED, on no GPU and outside the window."""
+
+    errors: list[str] = []
+    for request, rows in attempts.values():
+        errors.extend(
+            refresh.row_errors(rows, request, generation=generation, window=window)
+        )
+    return errors
+
+
+def refusal_count(
+    lines: list[dict[str, Any]],
+    attempts: dict[str, tuple[refresh.RefreshRequest, list[dict[str, Any]]]],
+    *,
+    invocation_id: str | None,
+    chain_incident: str,
+    window: tuple[datetime, datetime] | None,
+    node: str,
+    generation: int,
+) -> tuple[int, list[str]]:
+    """The rejections the restarted Agent logged, each the window's refusal of
+    an observation refresh that then ran (``observation_refresh``)."""
+
+    ran = {
+        command_id: rows[0] for command_id, (_request, rows) in attempts.items() if rows
+    }
+    return refresh.refusal_errors(
+        lines,
+        ran,
+        invocation_id=invocation_id,
+        window_incident=chain_incident,
+        window_opened=window[0] if window else None,
+        node=node,
+        generation=generation,
+    )
+
+
+def chain_ledger_errors(
+    chain_audit: dict[str, Any],
+    *,
+    workflow_request_id: str | None = None,
+    foreign: Sequence[str] = (),
+) -> list[str]:
+    """Every attempt the Agent took since the restart is a step of the chain --
+    of its workflow, when it is known -- or one of the ``foreign`` command ids
+    (the observation refresh, judged by ``refresh_errors``), and the window,
+    the reset and the restore ran once each."""
+
+    skipped = set(foreign)
+    rows = [
+        row
+        for row in chain_audit.get("rows") or []
+        if str(row.get("command_id")) not in skipped
+    ]
     errors: list[str] = []
     operations = sorted({str(row.get("operation")) for row in rows})
     unexpected = sorted(set(operations) - set(shapes.FABRIC_RESET_NODE_STEPS))
     if unexpected:
         errors.append(f"the Agent ran operations outside the chain: {unexpected}")
+    if workflow_request_id is not None:
+        others = sorted(
+            {
+                str(row.get("command_id"))
+                for row in rows
+                if row.get("workflow_request_id") != workflow_request_id
+            }
+        )
+        if others:
+            errors.append(f"the Agent ran node actions of another workflow: {others}")
     for operation in shapes.FABRIC_RESET_SINGLE_COMMAND_STEPS:
         attempts = [row for row in rows if row.get("operation") == operation]
         if len(attempts) != 1:
@@ -609,9 +729,67 @@ def migration_errors(report: dict[str, Any]) -> list[str]:
 # --------------------------------------------------------------------------- #
 # Node and cleanup
 # --------------------------------------------------------------------------- #
-def node_errors(baseline: dict[str, Any], final: dict[str, Any]) -> list[str]:
-    if final != baseline:
+def kubelet_restart(
+    state: dict[str, Any],
+    chain_audit: dict[str, Any] | None,
+    *,
+    node: str,
+    workflow_request_id: str,
+) -> tuple[datetime, datetime] | None:
+    """The chain's RESTORE_GPU_SERVICES attempt (start, end) when the quiesce
+    stopped kubelet on the node, which a HyperPod quiesce does: its Agent has
+    no protected quiesce services (``node_agent.config.
+    protected_quiesce_services``; plain EKS keeps kubelet and containerd)."""
+
+    restore = shapes.command_for(state.get("commands") or [], "RESTORE_GPU_SERVICES")
+    details = restore.get("result_details") or {}
+    services = (details.get("restored_services") or {}).get(node)
+    if services is None:
+        services = ((details.get("node_results") or {}).get(node) or {}).get(
+            "restored_services"
+        )
+    if not isinstance(services, list) or "kubelet" not in services:
+        return None
+    rows = [
+        row
+        for row in (chain_audit or {}).get("rows") or []
+        if row.get("operation") == "RESTORE_GPU_SERVICES"
+        and row.get("workflow_request_id") == workflow_request_id
+        and row.get("state") == "SUCCEEDED"
+    ]
+    if len(rows) != 1:
+        return None
+    started = parse_time(rows[0].get("started_at"))
+    completed = parse_time(rows[0].get("completed_at"))
+    if started is None or completed is None or completed < started:
+        return None
+    return started, completed
+
+
+def node_errors(
+    baseline: dict[str, Any],
+    final: dict[str, Any],
+    *,
+    kubelet_restarted: tuple[datetime, datetime] | None = None,
+) -> list[str]:
+    """The node as the baseline left it. One difference is the chain's own: a
+    quiesce that stopped kubelet flips Ready (the node controller marks the
+    silent node NotReady), and Ready is True again from when the restore
+    started kubelet -- ``ready_since`` inside that restore (whole seconds)."""
+
+    if final == baseline:
+        return []
+    moved = {key for key in {*baseline, *final} if baseline.get(key) != final.get(key)}
+    if moved != {"ready_since"} or kubelet_restarted is None:
         return ["target Kubernetes Node state differs from baseline"]
+    since = parse_time(final.get("ready_since"))
+    started, completed = kubelet_restarted
+    if since is None or not started.replace(microsecond=0) <= since <= completed:
+        return [
+            f"target node is Ready since {final.get('ready_since')}, not since the "
+            f"restore started kubelet again ({started.isoformat()} .. "
+            f"{completed.isoformat()})"
+        ]
     return []
 
 

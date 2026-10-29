@@ -152,6 +152,54 @@ def test_parse_log_line_extracts_the_phase_and_key_value_fields() -> None:
         "gpu_count=1 attempt=0 reason=operation RESET_GPU is not allowed"
     )
     assert rejected is not None and rejected["phase"] == "rejected", rejected
+    assert rejected["fields"]["reason"] == "operation RESET_GPU is not allowed", (
+        "a rejection keeps its whole reason, not its first word"
+    )
+    assert rejected["fields"]["attempt"] == "0", rejected
+
+
+def test_a_window_refusal_line_keeps_its_reason_and_its_identifiers() -> None:
+    reason = (
+        "GPU maintenance window is open on this node (quiesce of inc-a); "
+        "TRIGGER_HEALTH_SNAPSHOT runs after RESTORE_GPU_SERVICES closes it"
+    )
+    line = probe.parse_log_line(
+        "2026-10-29 00:32:02,600 WARNING gpu_fault.node_agent.executor node action "
+        "rejected command_id=wf/1/TRIGGER_HEALTH_SNAPSHOT/node-a/agent-4 "
+        "incident_id=inc-b workflow_request_id=wf operation=TRIGGER_HEALTH_SNAPSHOT "
+        "node_id=node-a fencing_token=1 agent_generation=4 gpu_count=0 attempt=0 "
+        f"reason={reason}"
+    )
+    pool = probe.parse_log_line(
+        "node action rejected inside the action pool "
+        "command_id=wf/1/TRIGGER_HEALTH_SNAPSHOT/node-a/agent-4 "
+        f"operation=TRIGGER_HEALTH_SNAPSHOT reason={reason}"
+    )
+
+    assert line is not None and pool is not None, (line, pool)
+    assert line["fields"] == {
+        "command_id": "wf/1/TRIGGER_HEALTH_SNAPSHOT/node-a/agent-4",
+        "incident_id": "inc-b",
+        "workflow_request_id": "wf",
+        "operation": "TRIGGER_HEALTH_SNAPSHOT",
+        "node_id": "node-a",
+        "fencing_token": "1",
+        "agent_generation": "4",
+        "gpu_count": "0",
+        "attempt": "0",
+        "reason": reason,
+    }, line
+    assert pool["fields"] == {
+        "command_id": "wf/1/TRIGGER_HEALTH_SNAPSHOT/node-a/agent-4",
+        "operation": "TRIGGER_HEALTH_SNAPSHOT",
+        "reason": reason,
+    }, "the action pool's own line names fewer identifiers"
+    completed = probe.parse_log_line(
+        "node action completed command_id=c status=SUCCEEDED duration_ms=5 reason=x y"
+    )
+    assert completed is not None and completed["fields"]["reason"] == "x", (
+        "only a rejection's reason is free text"
+    )
 
 
 # --------------------------------------------------------------------------- #
