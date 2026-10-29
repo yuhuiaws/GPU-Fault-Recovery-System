@@ -85,9 +85,10 @@ def identity_activity():
                 "request_id": "workflow",
                 "incident_id": incident["incident_id"],
                 "status": "SUCCEEDED",
+                # The read-only plan the identity finding compiles
+                # (DIAGNOSTIC_ONLY): FREEZE_EVIDENCE + VALIDATE_GPU.
                 "official_steps": [
-                    {"operation": operation}
-                    for operation in sorted(c020.DIAGNOSTIC_OPERATIONS)
+                    {"operation": operation} for operation in c020.IDENTITY_OPERATIONS
                 ],
             }
         ],
