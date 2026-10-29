@@ -1,13 +1,26 @@
 """Pure verdict functions and constants of GF-REGIONAL-COLLECT-020.
 
-The case proves ARCH-G6 (and the marker/notification halves of ARCH-I4 and
-ARCH-E7) on a real regional deployment: with ``GPU_FAULT_EXPECTED_GPU_COUNT``
-unset the inventory batch still carries the instance type's expected count;
-a GPU UUID that disappears from one inventory query becomes a CRITICAL
-``gpu_inventory_identity_changed`` finding naming the removed UUID, whose
-workflow runs a DCGM diagnostic and validation -- never a reboot -- and mails
-an operator-review notification plus the DCGM completion; once the incident
-is restored its markers carry ``retired_at`` / ``retired_reason``.
+The case proves ARCH-G6 (and the marker half of ARCH-I4) on a real regional
+deployment: with ``GPU_FAULT_EXPECTED_GPU_COUNT`` unset the inventory batch
+still carries the instance type's expected count; a GPU UUID that disappears
+from one inventory query becomes a CRITICAL ``gpu_inventory_identity_changed``
+finding naming the removed UUID, whose workflow is the read-only
+FREEZE_EVIDENCE + VALIDATE_GPU -- no stress test, no cordon, never a reset or
+reboot -- with an operator-review notification; once the incident is restored
+its markers carry ``retired_at`` / ``retired_reason``.
+
+The read-only plan is the product's contract since the general health-policy
+hardening: ``health_recovery_contract.recovery_contract`` gives the identity
+finding the ``DIAGNOSTIC_ONLY`` mode, whose GPU diagnostics plan VALIDATE_GPU
+without RUN_DCGM_DIAGNOSTIC (``orchestration/families/health.py``), and the
+detailed design (CN + EN) and
+``tests/app_services/test_gpu_inventory_identity_findings.py`` pin
+FREEZE_EVIDENCE + VALIDATE_GPU. Up to R12 the plan ran ``dcgmi diag -r 1``
+and the case also judged the DCGM completion mail (ARCH-E7) and, in DCGM host
+engine mode, the quick diagnostic's verdict; R13i ran the read-only plan on
+both clusters (2026-10-29) and those checks failed on a step the product no
+longer plans. A DCGM diagnostic, an executed one included, now fails the
+read-only check instead.
 
 The disappearance is a shadow of ``nvidia-smi`` output for exactly one
 inventory query of one collector unit. No device is touched, and the shadow
@@ -30,16 +43,16 @@ IDENTITY_METRIC = "gpu_inventory_identity_changed"
 UNKNOWN_COUNT_METRIC = "gpu_expected_count_unknown"
 MISMATCH_METRIC = "gpu_inventory_mismatch"
 OPERATOR_REVIEW_CATEGORY = "OPERATOR_REVIEW"
-DIAGNOSTIC_OPERATIONS = frozenset({"RUN_DCGM_DIAGNOSTIC", "VALIDATE_GPU"})
+#: The read-only identity plan: evidence frozen, the GPUs validated.
+IDENTITY_OPERATIONS = ("FREEZE_EVIDENCE", "VALIDATE_GPU")
 FORBIDDEN_OPERATIONS = frozenset(
     {"RESTART_NODE", "REPLACE_NODE", "RESET_GPU", "RESET_ALL_GPUS_NVSWITCHES"}
 )
-#: The quick diagnostic's "no verdict" codes: the node had no dcgmi, or dcgmi
-#: reached no host engine. A host-mode cluster must never report them.
-DCGM_UNAVAILABLE_CODES = frozenset(
-    {"DCGM_TOOL_UNAVAILABLE", "DCGM_HOSTENGINE_UNAVAILABLE"}
+#: What a read-only identity diagnosis must neither plan nor run: the DCGM
+#: stress test and every step that cordons, taints or stops work.
+NOT_READ_ONLY_OPERATIONS = frozenset(
+    {"RUN_DCGM_DIAGNOSTIC", "MARK_UNSCHEDULABLE", "QUARANTINE", "STOP_WORKLOADS"}
 )
-GRADED_OUTCOMES = frozenset({"PASS", "WARN", "FAIL"})
 DROP_CALLS = 1
 WINDOW_RESTORE_SECONDS = 900
 FINDING_TIMEOUT_SECONDS = 600
@@ -221,10 +234,20 @@ def identity_finding_errors(
         operations = {
             str(step.get("operation")) for step in workflow.get("official_steps") or []
         }
-        if not DIAGNOSTIC_OPERATIONS <= operations:
+        executed = {
+            str(step.get("operation")) for step in workflow.get("step_executions") or []
+        }
+        missing = [item for item in IDENTITY_OPERATIONS if item not in operations]
+        if missing:
             errors.append(
-                f"workflow {workflow.get('request_id')} lacks DCGM diagnostic or "
-                f"GPU validation: {sorted(operations)}"
+                f"workflow {workflow.get('request_id')} lacks {missing}: "
+                f"{sorted(operations)}"
+            )
+        not_read_only = sorted((operations | executed) & NOT_READ_ONLY_OPERATIONS)
+        if not_read_only:
+            errors.append(
+                f"workflow {workflow.get('request_id')} is not read-only: "
+                f"{not_read_only}"
             )
         forbidden = sorted(operations & FORBIDDEN_OPERATIONS)
         if forbidden:
@@ -242,88 +265,6 @@ def identity_finding_errors(
     ]
     if not review:
         errors.append(f"no {OPERATOR_REVIEW_CATEGORY} notification for the finding")
-    return errors
-
-
-def dcgm_notification_errors(activity: dict[str, Any]) -> list[str]:
-    """ARCH-E7: the regional DCGM completion mails, whether it passed or failed."""
-
-    incident_ids = {
-        str(item.get("incident_id")) for item in _identity_incidents(activity)
-    }
-    matches = [
-        item
-        for item in activity.get("notifications") or []
-        if str(item.get("incident_id")) in incident_ids
-        and (
-            "DCGM" in str(item.get("category", "")).upper()
-            or "DCGM" in str(item.get("subject", "")).upper()
-        )
-    ]
-    if not matches:
-        return ["no DCGM diagnostic completion notification was created"]
-    return []
-
-
-def exporter_dcgm_hostengine(daemonset: dict[str, Any]) -> str:
-    """The eks-managed DCGM host engine mode the exporter DaemonSet runs.
-
-    ``host`` or ``embedded`` (its ``gpu-fault.io/dcgm-hostengine`` annotation);
-    empty for the unmarked HyperPod text, which this case does not re-judge.
-    """
-
-    annotations = (daemonset.get("metadata") or {}).get("annotations") or {}
-    return str(annotations.get("gpu-fault.io/dcgm-hostengine") or "")
-
-
-def dcgm_verdict_errors(
-    activity: dict[str, Any], *, node: str, dcgm_hostengine: str
-) -> list[str]:
-    """eks-managed host mode: the identity workflow's quick DCGM diagnostic
-    graded the GPUs.
-
-    In host mode the exporter dials the node's ``nvidia-dcgm`` and the Agent
-    runs ``dcgmi diag -r 1`` against it, so the case expects a real DCGM
-    verdict for the node: a graded outcome from parsed DCGM output, never the
-    "no dcgmi" / "no host engine" configuration warning the embedded mode
-    accepts. Embedded mode and the HyperPod text are not judged here.
-    """
-
-    if dcgm_hostengine != "host":
-        return []
-    incident_ids = {
-        str(item.get("incident_id")) for item in _identity_incidents(activity)
-    }
-    results = [
-        result
-        for workflow in activity.get("workflows") or []
-        if str(workflow.get("incident_id")) in incident_ids
-        for step in workflow.get("step_executions") or []
-        if step.get("operation") == "RUN_DCGM_DIAGNOSTIC"
-        for name, result in (
-            (step.get("details") or {}).get("node_results") or {}
-        ).items()
-        if name == node and isinstance(result, dict)
-    ]
-    if not results:
-        return [f"host mode: no RUN_DCGM_DIAGNOSTIC result for {node}"]
-    errors: list[str] = []
-    for result in results:
-        codes = {
-            str(action.get("action_code"))
-            for action in result.get("recommended_actions") or []
-            if isinstance(action, dict)
-        }
-        unavailable = sorted(codes & DCGM_UNAVAILABLE_CODES)
-        if unavailable:
-            errors.append(f"host mode: the quick diagnostic reported {unavailable}")
-        if result.get("parse_error") or not result.get("status_counts"):
-            errors.append("host mode: the quick diagnostic produced no DCGM verdict")
-        if result.get("diagnostic_outcome") not in GRADED_OUTCOMES:
-            errors.append(
-                "host mode: the quick diagnostic outcome is "
-                f"{result.get('diagnostic_outcome')!r}"
-            )
     return errors
 
 

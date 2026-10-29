@@ -66,24 +66,12 @@ def _activity(**overrides: Any) -> dict[str, Any]:
                 "status": "SUCCEEDED",
                 "official_steps": [
                     {"operation": "FREEZE_EVIDENCE"},
-                    {"operation": "MARK_UNSCHEDULABLE"},
-                    {"operation": "RUN_DCGM_DIAGNOSTIC"},
                     {"operation": "VALIDATE_GPU"},
-                    {"operation": "RESTORE_SCHEDULING"},
                 ],
             }
         ],
         "notifications": [
-            {
-                "incident_id": "inc-1",
-                "category": "OPERATOR_REVIEW",
-                "subject": "review",
-            },
-            {
-                "incident_id": "inc-1",
-                "category": "DCGM_DIAGNOSTIC",
-                "subject": "DCGM diagnostic",
-            },
+            {"incident_id": "inc-1", "category": "OPERATOR_REVIEW", "subject": "review"}
         ],
         "markers": [
             {
@@ -112,7 +100,6 @@ def _activity(**overrides: Any) -> dict[str, Any]:
 def test_the_identity_finding_contract_passes_on_a_diagnostic_workflow() -> None:
     activity = _activity()
     assert verdicts.identity_finding_errors(activity, dropped_uuid=DROPPED) == []
-    assert verdicts.dcgm_notification_errors(activity) == []
     assert (
         verdicts.no_reboot_errors(activity, boot_id_before="b", boot_id_after="b") == []
     )
@@ -123,6 +110,93 @@ def test_the_identity_finding_contract_passes_on_a_diagnostic_workflow() -> None
         )
         == []
     )
+
+
+def _live_read_only_activity() -> dict[str, Any]:
+    """The identity chain as R13i ran it on both clusters (2026-10-29,
+    HyperPod workflow-261e4f3712ef6176236b21ab, plain EKS
+    workflow-96a9ac1605940fea67ebeaef): read-only FREEZE_EVIDENCE +
+    VALIDATE_GPU, both SUCCEEDED, the operator-review mail and no DCGM step."""
+
+    activity = _activity()
+    activity["workflows"][0]["official_steps"] = [
+        {"operation": "FREEZE_EVIDENCE"},
+        {"operation": "VALIDATE_GPU"},
+    ]
+    activity["workflows"][0]["step_executions"] = [
+        {"operation": "FREEZE_EVIDENCE", "status": "SUCCEEDED"},
+        {
+            "operation": "VALIDATE_GPU",
+            "status": "SUCCEEDED",
+            "details": {"validated_nodes": ["node-a"], "validation": "VALIDATE_GPU"},
+        },
+    ]
+    activity["notifications"] = [
+        {
+            "incident_id": "inc-1",
+            "category": "OPERATOR_REVIEW",
+            "subject": "[GPU fault review] node-a gpu_inventory_identity_changed",
+        }
+    ]
+    return activity
+
+
+def test_the_read_only_identity_chain_r13i_ran_passes() -> None:
+    activity = _live_read_only_activity()
+    assert verdicts.identity_finding_errors(activity, dropped_uuid=DROPPED) == [], (
+        "the product's read-only identity plan (health recovery contract "
+        "DIAGNOSTIC_ONLY) is the contract, not a missing DCGM diagnostic"
+    )
+
+
+@pytest.mark.parametrize(
+    ("change", "fragment"),
+    [
+        (
+            {"official_steps": [{"operation": "FREEZE_EVIDENCE"}]},
+            "lacks ['VALIDATE_GPU']",
+        ),
+        (
+            {
+                "official_steps": [
+                    {"operation": "FREEZE_EVIDENCE"},
+                    {"operation": "RUN_DCGM_DIAGNOSTIC"},
+                    {"operation": "VALIDATE_GPU"},
+                ]
+            },
+            "is not read-only: ['RUN_DCGM_DIAGNOSTIC']",
+        ),
+        (
+            {
+                "official_steps": [
+                    {"operation": "FREEZE_EVIDENCE"},
+                    {"operation": "MARK_UNSCHEDULABLE"},
+                    {"operation": "QUARANTINE"},
+                    {"operation": "VALIDATE_GPU"},
+                ]
+            },
+            "is not read-only: ['MARK_UNSCHEDULABLE', 'QUARANTINE']",
+        ),
+        (
+            {
+                "step_executions": [
+                    {"operation": "FREEZE_EVIDENCE", "status": "SUCCEEDED"},
+                    {"operation": "RUN_DCGM_DIAGNOSTIC", "status": "SUCCEEDED"},
+                    {"operation": "VALIDATE_GPU", "status": "SUCCEEDED"},
+                ]
+            },
+            "is not read-only: ['RUN_DCGM_DIAGNOSTIC']",
+        ),
+    ],
+    ids=["no-validation", "dcgm-planned", "isolating", "dcgm-executed"],
+)
+def test_the_identity_chain_must_stay_read_only(
+    change: dict[str, Any], fragment: str
+) -> None:
+    activity = _live_read_only_activity()
+    activity["workflows"][0].update(change)
+    errors = verdicts.identity_finding_errors(activity, dropped_uuid=DROPPED)
+    assert fragment in _text(errors), errors
 
 
 @pytest.mark.parametrize(
@@ -160,7 +234,10 @@ def test_the_identity_finding_contract_passes_on_a_diagnostic_workflow() -> None
                         "request_id": "wf-1",
                         "incident_id": "inc-1",
                         "status": "RUNNING",
-                        "official_steps": [{"operation": "RUN_DCGM_DIAGNOSTIC"}],
+                        "official_steps": [
+                            {"operation": "FREEZE_EVIDENCE"},
+                            {"operation": "VALIDATE_GPU"},
+                        ],
                     }
                 ]
             },
@@ -169,7 +246,7 @@ def test_the_identity_finding_contract_passes_on_a_diagnostic_workflow() -> None
         (
             {
                 "notifications": [
-                    {"incident_id": "inc-1", "category": "DCGM_DIAGNOSTIC"}
+                    {"incident_id": "inc-2", "category": "OPERATOR_REVIEW"}
                 ]
             },
             "no OPERATOR_REVIEW",
@@ -286,76 +363,3 @@ def test_the_case_constants_and_plan_name_the_hard_stop() -> None:
         details["rollback"]["quarantine_is_restored_only_by_validation_workflow"]
         is True
     )
-
-
-# --- the DCGM host engine mode (eks-managed) -----------------------------------
-
-
-def _dcgm_step(node: str, result: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "operation": "RUN_DCGM_DIAGNOSTIC",
-        "status": "SUCCEEDED",
-        "details": {"node_results": {node: result}},
-    }
-
-
-def _with_dcgm(*steps: dict[str, Any]) -> dict[str, Any]:
-    activity = _activity()
-    activity["workflows"][0]["step_executions"] = list(steps)
-    return activity
-
-
-GRADED = {
-    "diagnostic_outcome": "PASS",
-    "configuration_only_failures": False,
-    "status_counts": {"PASS": 12},
-    "parse_error": None,
-    "recommended_actions": [],
-    "dcgm_hostengine": "host",
-}
-
-
-def test_the_exporter_annotation_names_the_mode_the_case_judges() -> None:
-    assert (
-        verdicts.exporter_dcgm_hostengine(
-            {"metadata": {"annotations": {"gpu-fault.io/dcgm-hostengine": "host"}}}
-        )
-        == "host"
-    )
-    assert verdicts.exporter_dcgm_hostengine({"metadata": {}}) == "", (
-        "the unmarked HyperPod text is not re-judged"
-    )
-
-
-def test_host_mode_expects_a_real_dcgm_verdict_on_the_node() -> None:
-    node = "ip-10-0-33-205"
-    assert (
-        verdicts.dcgm_verdict_errors(
-            _with_dcgm(_dcgm_step(node, GRADED)), node=node, dcgm_hostengine="host"
-        )
-        == []
-    ), "a graded diagnostic of parsed DCGM output passes"
-    unreachable = {
-        **GRADED,
-        "diagnostic_outcome": "WARN",
-        "configuration_only_failures": True,
-        "status_counts": {},
-        "parse_error": "JSONDecodeError: Expecting value",
-        "recommended_actions": [{"action_code": "DCGM_HOSTENGINE_UNAVAILABLE"}],
-    }
-    errors = verdicts.dcgm_verdict_errors(
-        _with_dcgm(_dcgm_step(node, unreachable)), node=node, dcgm_hostengine="host"
-    )
-    assert "reported ['DCGM_HOSTENGINE_UNAVAILABLE']" in _text(errors), errors
-    assert "produced no DCGM verdict" in _text(errors), errors
-    assert "no RUN_DCGM_DIAGNOSTIC result" in _text(
-        verdicts.dcgm_verdict_errors(_with_dcgm(), node=node, dcgm_hostengine="host")
-    )
-    assert (
-        verdicts.dcgm_verdict_errors(
-            _with_dcgm(_dcgm_step(node, unreachable)),
-            node=node,
-            dcgm_hostengine="embedded",
-        )
-        == []
-    ), "embedded mode keeps accepting the configuration WARN"

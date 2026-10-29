@@ -2,25 +2,27 @@
 """GF-REGIONAL-COLLECT-020: a GPU vanishes from one inventory query.
 
 ARCH-G6 made a changed GPU UUID set a CRITICAL ``gpu_inventory_identity_changed``
-finding (DCGM diagnostic + validation, no reboot) instead of a raw-evidence
-row nobody reads, and gave the inventory batch an expected GPU count derived
-from the instance type when ``GPU_FAULT_EXPECTED_GPU_COUNT`` is unset. This
-case proves both on a real node, plus the notification the diagnostic mails
-(ARCH-E7) and the retirement fields on the incident's markers once it is
-restored (ARCH-I4).
+finding instead of a raw-evidence row nobody reads, and gave the inventory
+batch an expected GPU count derived from the instance type when
+``GPU_FAULT_EXPECTED_GPU_COUNT`` is unset. This case proves both on a real
+node, the finding's read-only diagnosis (FREEZE_EVIDENCE + VALIDATE_GPU and an
+operator-review mail: no DCGM stress test, no cordon, no reset or reboot --
+the ``DIAGNOSTIC_ONLY`` health recovery contract, see ``collect020_verdicts``)
+and the retirement fields on the incident's markers once it is restored
+(ARCH-I4).
 
 The disappearance is *never* a device change: a ``nvidia-smi`` shadow on the
 metrics collector's PATH drops one UUID line from exactly one inventory query
 and passes everything else through. One query is below the host collector's
 ``GPU_FAULT_INVENTORY_MISMATCH_CONSECUTIVE_SAMPLES`` (2), so the reboot path
 cannot be reached, and the runner stops on any workflow that compiles a
-reboot or reset anyway. The incident is restored through the validation-first
-restore workflow (never by deleting taints). Plan-only by default.
+reboot or reset anyway. A workflow that still owns the node afterwards is
+released through the validation-first restore workflow (never by deleting
+taints). Plan-only by default.
 """
 
 from __future__ import annotations
 
-import json
 import sys
 import time
 from datetime import datetime
@@ -86,8 +88,9 @@ def plan_details(settings: WindowSettings, preflight: dict[str, Any]) -> dict[st
         "mutation": (
             f"on {verdicts.UNIT} only: unset GPU_FAULT_EXPECTED_GPU_COUNT and shadow "
             "nvidia-smi so ONE inventory query omits one GPU UUID (drop-uuid:<uuid>:1); "
-            "the finding cordons the node for a DCGM diagnostic and validation, then "
-            "the validation-first restore workflow uncordons it"
+            "the finding's read-only diagnosis (FREEZE_EVIDENCE + VALIDATE_GPU) cordons "
+            "nothing; a workflow that still owns the node afterwards is released by "
+            "the validation-first restore workflow"
         ),
         "hard_stop": (
             "the GPU is never touched; one hidden query is below the host "
@@ -259,18 +262,6 @@ def execute(
     stages["identity_finding"] = verdicts.identity_finding_errors(
         activity, dropped_uuid=dropped_uuid
     )
-    stages["dcgm_notification"] = verdicts.dcgm_notification_errors(activity)
-    # In DCGM host engine mode the quick diagnostic must grade the GPUs.
-    dcgm_hostengine = verdicts.exporter_dcgm_hostengine(
-        json.loads(
-            fixture.regional.kubectl(
-                "gpu", "get", "daemonset", "gpu-fault-dcgm-exporter", "-o", "json"
-            )
-        )
-    )
-    stages["dcgm_verdict"] = verdicts.dcgm_verdict_errors(
-        activity, node=fixture.node, dcgm_hostengine=dcgm_hostengine
-    )
     restores = _restore(fixture, activity, profile_version=profile_version)
     write_json_atomic(case_dir / "restore.json", {"workflows": restores})
     final = fixture.node_activity(since, evidence_kind="GPU_INVENTORY")
@@ -292,7 +283,6 @@ def execute(
         "instance_type": instance_type,
         "expected_gpu_count": expected_count,
         "dropped_uuid": dropped_uuid,
-        "dcgm_hostengine": dcgm_hostengine,
         "window_open": opened,
         "activity": {key: value for key, value in final.items() if key != "evidence"},
         "inventory_evidence_record_ids": [
@@ -306,6 +296,9 @@ def execute(
             "not reachable through nvidia-smi shadowing; it keeps unit evidence only.",
             "The UUID's return is itself an identity change and may open a second "
             "finding; every incident of the case is restored and judged.",
+            "The identity plan is read-only (no RUN_DCGM_DIAGNOSTIC), so this case no "
+            "longer exercises the DCGM completion mail (ARCH-E7) or the quick "
+            "diagnostic's verdict in DCGM host engine mode.",
         ],
     }
 
@@ -316,8 +309,8 @@ def main() -> int:
         confirmation=CONFIRMATION,
         parser_description=(
             "Run the guarded COLLECT-020 acceptance: a GPU UUID missing from one "
-            "inventory query becomes a CRITICAL identity finding with a diagnostic "
-            "workflow, an instance-type expected count and retired markers."
+            "inventory query becomes a CRITICAL identity finding with a read-only "
+            "diagnosis, an instance-type expected count and retired markers."
         ),
         plan_details=plan_details,
         execute=execute,

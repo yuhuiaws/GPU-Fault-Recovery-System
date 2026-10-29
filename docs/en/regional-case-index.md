@@ -389,7 +389,7 @@ Regenerate: `python3 scripts/build-regional-case-index.py`.
 > - The formal predecessor of COLLECT-009 is COLLECT-005: COLLECT-006/007 are pytest cases and produce no cases/<id>/<id>.json evidence.
 > - COLLECT-004 drops one real GPU UUID from the isolated collector instance's listing (expected count unchanged), which triggers a real provider reboot and must run in a maintenance window.
 > - The last six cases involve a reset, EFA mutation, workload restart or reboot and must run in a maintenance window.
-> - COLLECT-018/019/020 open a bounded collector window on one idle node (synthetic API injection, nvidia-smi shadow, drop-in environment) without touching the GPUs; COLLECT-020 cordons that node for DCGM diagnostics and then restores it through validation-first restore, needs a maintenance window, and is still ordered before COLLECT-015's reboot.
+> - COLLECT-018/019/020 open a bounded collector window on one idle node (synthetic API injection, nvidia-smi shadow, drop-in environment) without touching the GPUs; COLLECT-020's read-only diagnosis (FREEZE_EVIDENCE + VALIDATE_GPU) does not cordon that node, a workflow that still owns it afterwards is released through validation-first restore, needs a maintenance window, and is still ordered before COLLECT-015's reboot.
 
 | # | Case | Title | Level | Tier | Automation | Body |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -413,7 +413,7 @@ Regenerate: `python3 scripts/build-regional-case-index.py`.
 | 188 | `COLLECT-017` | EFA layered recovery and Kubernetes accelerator allocatable | `live-node-mutation` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-017) |
 | 189 | `COLLECT-018` | Fault-tier events rejected after a 202 are counted, alerted and land in the node collector status; an unnumbered Xid line becomes an operator-review finding instead of being silently dropped | `live-kernel-log-injection` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-018) |
 | 190 | `COLLECT-019` | When nvidia-smi hangs past the timeout for several rounds, the host collector does not restart, keeps delivering error batches with the circuit-breaker reason, and the control plane reports erroring rather than silent | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-019) |
-| 191 | `COLLECT-020` | Without a configured expected GPU count it is derived from the instance type; one inventory query missing one UUID is a CRITICAL identity finding, diagnosed rather than rebooted, and the marker carries the retirement fields after restore | `live-isolation` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-020) |
+| 191 | `COLLECT-020` | Without a configured expected GPU count it is derived from the instance type; one inventory query missing one UUID is a CRITICAL identity finding, diagnosed read-only rather than rebooted, and the marker carries the retirement fields after restore | `live-isolation` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-020) |
 | 192 | `COLLECT-015` | SXID ALWAYS_FATAL real whole-node reboot through the provider | `destructive-provider-reboot` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-015) |
 
 ## Phase 18 — Full uninstall of an isolated site

@@ -101,14 +101,13 @@ def identity_activity() -> dict[str, Any]:
                 "request_id": "identity-workflow",
                 "status": "SUCCEEDED",
                 "official_steps": [
-                    {"operation": "RUN_DCGM_DIAGNOSTIC"},
+                    {"operation": "FREEZE_EVIDENCE"},
                     {"operation": "VALIDATE_GPU"},
                 ],
             }
         ],
         "notifications": [
-            {"incident_id": "identity-incident", "category": "OPERATOR_REVIEW"},
-            {"incident_id": "identity-incident", "category": "DCGM_DIAGNOSTIC"},
+            {"incident_id": "identity-incident", "category": "OPERATOR_REVIEW"}
         ],
         "markers": [
             {
@@ -121,8 +120,8 @@ def identity_activity() -> dict[str, Any]:
     }
 
 
-@pytest.mark.parametrize("missing", ["RUN_DCGM_DIAGNOSTIC", "VALIDATE_GPU"])
-def test_identity_requires_both_diagnostic_operations(missing: str) -> None:
+@pytest.mark.parametrize("missing", ["FREEZE_EVIDENCE", "VALIDATE_GPU"])
+def test_identity_requires_both_read_only_operations(missing: str) -> None:
     activity = identity_activity()
     activity["workflows"][0]["official_steps"] = [
         item
@@ -130,17 +129,20 @@ def test_identity_requires_both_diagnostic_operations(missing: str) -> None:
         if item["operation"] != missing
     ]
     errors = identity.identity_finding_errors(activity, dropped_uuid="GPU-target")
-    assert any("lacks DCGM diagnostic or GPU validation" in item for item in errors), (
-        f"missing {missing} did not fail the diagnostic contract: {errors!r}"
+    assert any(f"lacks ['{missing}']" in item for item in errors), (
+        f"missing {missing} did not fail the read-only contract: {errors!r}"
     )
 
 
-def test_identity_does_not_borrow_another_incidents_dcgm_notice() -> None:
+def test_identity_does_not_borrow_another_incidents_review_notice() -> None:
     activity = identity_activity()
-    activity["notifications"][1]["incident_id"] = "unrelated-incident"
-    assert identity.dcgm_notification_errors(activity), (
-        "an unrelated incident's DCGM notice satisfied this incident's notification proof"
-    )
+    activity["notifications"][0]["incident_id"] = "unrelated-incident"
+    assert any(
+        "no OPERATOR_REVIEW notification" in item
+        for item in identity.identity_finding_errors(
+            activity, dropped_uuid="GPU-target"
+        )
+    ), "an unrelated incident's review notice satisfied this incident's proof"
 
 
 def test_identity_requires_a_recovered_incident_with_retired_markers() -> None:

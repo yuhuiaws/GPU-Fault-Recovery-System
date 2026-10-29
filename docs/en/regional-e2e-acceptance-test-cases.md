@@ -16007,24 +16007,29 @@ control plane reports erroring rather than silent**
 ### GF-REGIONAL-COLLECT-020
 
 **With no expected GPU count configured, derive it from the instance type; one inventory
-query missing one UUID yields a CRITICAL identity finding, diagnostics rather than a
-reboot, and the marker carries retirement fields after restore**
+query missing one UUID yields a CRITICAL identity finding, a read-only diagnosis rather
+than a reboot, and the marker carries retirement fields after restore**
 
-- Level: `live-isolation`. The finding cordons an idle node for DCGM diagnostics and
-  validation, after which the validation-first restore workflow recovers it; the device
-  never leaves the bus. Must be executed in a maintenance window, still ordered before
+- Level: `live-isolation`. The finding's read-only diagnosis (FREEZE_EVIDENCE +
+  VALIDATE_GPU) cordons nothing; a workflow that still owns the node afterwards is
+  released by the validation-first restore workflow; the device never leaves the bus. Must be executed in a maintenance window, still ordered before
   `COLLECT-015`'s reboot. Confirmation string `COLLECT020_EXECUTE`:
   `scripts/e2e/regional/run_collect020_gpu_identity.py`.
 - Purpose: `expected_gpu_count_from_environment` in
   `src/gpu_fault/collectors/gpu/discovery.py` derives the count from the instance-type
   table when `GPU_FAULT_EXPECTED_GPU_COUNT` is unset;
   `src/gpu_fault/app/ingest/telemetry_context.py` turns a UUID-set change into a
-  CRITICAL `gpu_inventory_identity_changed` (`RUN_DIAGNOSTICS`:
-  `RUN_DCGM_DIAGNOSTIC`+`VALIDATE_GPU`, no reboot) and sends an `OPERATOR_REVIEW`
-  notification (ARCH-G6); `src/gpu_fault/notification_service.py` sends a DCGM
-  notification on completion of a regional `RUN_DCGM_DIAGNOSTIC` (ARCH-E7);
-  `retire_markers_for_incident` in `src/gpu_fault/markers.py` writes
-  `retired_at/retired_reason` (ARCH-I4).
+  CRITICAL `gpu_inventory_identity_changed` and sends an `OPERATOR_REVIEW` notification
+  (ARCH-G6); the finding is `RUN_DIAGNOSTICS` under the `DIAGNOSTIC_ONLY` health recovery
+  contract (`src/gpu_fault/health_recovery_contract.py`), whose GPU diagnosis
+  (`src/gpu_fault/orchestration/families/health.py`) is the read-only
+  `FREEZE_EVIDENCE`+`VALIDATE_GPU`: no `RUN_DCGM_DIAGNOSTIC` stress test, no cordon, no
+  reset or reboot; `retire_markers_for_incident` in `src/gpu_fault/markers.py` writes
+  `retired_at/retired_reason` (ARCH-I4). The identity plan used to run
+  `RUN_DCGM_DIAGNOSTIC`, and this case then also judged the DCGM completion notification
+  of a regional `RUN_DCGM_DIAGNOSTIC` (ARCH-E7, `src/gpu_fault/notification_service.py`)
+  and the host-mode quick diagnostic's verdict; the read-only plan reaches neither, so
+  both checks are retired with the step.
 - Hard stop: the shadow removes one UUID row only from the **first**
   `--query-gpu=index,uuid,pci.bus_id,name` query (`drop-uuid:<uuid>:1`) and passes
   everything else through; 1 is below the host collector's
@@ -16043,19 +16048,11 @@ reboot, and the marker carries retirement fields after restore**
   - the incident `reasons` contain `GPU inventory identity changed` and the removed UUID;
     the corresponding marker must match that incident, the structured event identity and
     the UUID simultaneously, with `severity=critical`; the workflow contains
-    `RUN_DCGM_DIAGNOSTIC`/`VALIDATE_GPU`, does not contain
-    RESTART_NODE/REPLACE_NODE/RESET_*, and reaches a terminal state;
-  - there is an `OPERATOR_REVIEW` notification and one DCGM-diagnostic-completed
-    notification;
-  - on an `eks-managed` cluster `RUN_DCGM_DIAGNOSTIC` is judged by the DCGM mode: host mode
-    (GPU node groups labelled `gpu-fault.io/dcgm-hostengine=host`, exporter annotation
-    `gpu-fault.io/dcgm-hostengine: host`) requires a real DCGM verdict -- the node's result
-    carries neither `DCGM_TOOL_UNAVAILABLE` nor `DCGM_HOSTENGINE_UNAVAILABLE` and is a graded
-    outcome of parsed DCGM output (`PASS`/`WARN`/`FAIL` with `status_counts`, no `parse_error`;
-    a `WARN` from DCGM's own CONFIG-severity findings is a real verdict too; the result carries
-    `dcgm_hostengine=host`);
-    in embedded mode (the default) those two configuration `WARN`s remain the expected
-    outcome and never drain the node; HyperPod is unchanged;
+    `FREEZE_EVIDENCE`/`VALIDATE_GPU`, is read-only -- neither plans nor executes
+    `RUN_DCGM_DIAGNOSTIC`, MARK_UNSCHEDULABLE, QUARANTINE or STOP_WORKLOADS -- does not
+    contain RESTART_NODE/REPLACE_NODE/RESET_*, and reaches a terminal state;
+  - there is an `OPERATOR_REVIEW` notification for the identity incident (another
+    incident's notification does not count);
   - confirmed by finding metric, incident event_id and marker_id -- not just by
     searching the reason -- that there is no `gpu_expected_count_unknown` and no
     `gpu_inventory_mismatch`; boot_id unchanged;

@@ -8515,33 +8515,27 @@ test_cases:
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-019
   related_pytest: tests/regional/test_collect019_nvidia_smi_hang.py::test_the_erroring_status_contract_passes_on_timeout_then_breaker
 - id: GF-REGIONAL-COLLECT-020
-  title: 未配置期望 GPU 数时按实例类型推导；一次 inventory 查询少一个 UUID 即 CRITICAL identity finding、诊断而非重启，restore 后 marker 带退役字段
+  title: 未配置期望 GPU 数时按实例类型推导；一次 inventory 查询少一个 UUID 即 CRITICAL identity finding、只读诊断而非重启，restore 后 marker 带退役字段
   category: regional-collector
   level: live
   risk: live-isolation
   problem: >-
     修复前 UUID 集合变化只是一条证据行，没人会看；expected count 缺失时报不出任何东西。
-    ARCH-G6 让它成为 CRITICAL gpu_inventory_identity_changed（RUN_DCGM_DIAGNOSTIC+VALIDATE_GPU，不重启）并按实例类型推导期望数，
-    ARCH-E7 让区域 DCGM 完成也发通知，ARCH-I4 让退役 marker 保留 retired_at/retired_reason；此前只有单元证据。
+    ARCH-G6 让它成为 CRITICAL gpu_inventory_identity_changed 并按实例类型推导期望数；DIAGNOSTIC_ONLY 健康恢复契约下其诊断是只读的
+    FREEZE_EVIDENCE+VALIDATE_GPU（不跑 RUN_DCGM_DIAGNOSTIC 压测、不 cordon、不 reset/重启），ARCH-I4 让退役 marker 保留 retired_at/retired_reason；此前只有单元证据。
   injection: >-
     只在 gpu-fault-metrics-collector.service 上：UnsetEnvironment GPU_FAULT_EXPECTED_GPU_COUNT，并在其 PATH 最前放 nvidia-smi 影子，
     仅对第一次 --query-gpu=index,uuid,pci.bus_id,name 查询去掉一个 UUID 行、其余全部透传（drop-uuid:<uuid>:1，
-    低于 host collector 的 2 次 mismatch 阈值）。设备不动。incident 用 validation-first restore 工作流恢复。
+    低于 host collector 的 2 次 mismatch 阈值）。设备不动。事后仍持有节点的工作流用 validation-first restore 工作流释放。
   expected:
   - 少一个 UUID 的 GPU_INVENTORY 证据被保留，且其 expected_gpu_count 等于实例类型表值而非 null
-  - 出现 reasons 点名被移除 UUID 的 gpu_inventory_identity_changed incident；其工作流含 RUN_DCGM_DIAGNOSTIC/VALIDATE_GPU、不含 RESTART_NODE/REPLACE_NODE/RESET_*，到达终态
+  - 出现 reasons 点名被移除 UUID 的 gpu_inventory_identity_changed incident；其工作流含 FREEZE_EVIDENCE/VALIDATE_GPU 且只读（既不计划也不执行 RUN_DCGM_DIAGNOSTIC、MARK_UNSCHEDULABLE、QUARANTINE、STOP_WORKLOADS）、不含 RESTART_NODE/REPLACE_NODE/RESET_*，到达终态
   - 对应 marker 的结构化身份绑定该 incident 和被移除 UUID，severity=critical；诊断工作流本身不能代替严重程度证明
-  - 有 OPERATOR_REVIEW 通知与一条 DCGM 诊断完成通知
+  - identity incident 有 OPERATOR_REVIEW 通知
   - 按 finding metric、incident event_id 和 marker_id 检查无 gpu_expected_count_unknown、无 gpu_inventory_mismatch，不只搜索 reason 文本；boot_id 不变
   - restore 后 RECOVERED incident 的每个 marker 带 retired_at 与 retired_reason；节点无 ownership、无 taint、可调度
   evidence:
-    verdict: PASS
-    verified:
-      case_digest: 4d1e31b308cd161accdf084a322d5eae8a6473da131f5f8c1e5bc7e927f9341e
-      components:
-        control_plane: 15dfb9989e311767fe9d8fe29dbe6bcbc163752aa5b78ae1340fc74887b33b45
-        executor: ea81228c66e060bd0c68dc3f7ee64469b996937ef16ab45f7b92463f2ee6afdb
-        node_runtime: 4bcdfcfb5c1921fd1da6ed67cfc1e9d90a4c2e40ce56e222f92849d50e195f09
+    verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-020
   related_pytest: tests/regional/test_collect020_gpu_identity.py::test_the_identity_finding_contract_passes_on_a_diagnostic_workflow

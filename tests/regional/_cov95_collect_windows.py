@@ -59,8 +59,6 @@ class WindowHost:
             store_snapshot=lambda **kwargs: {
                 "profile": {"profile_version": "profile-a"}
             },
-            # The unmarked (HyperPod) exporter DaemonSet COLLECT-020 reads.
-            kubectl=lambda *arguments, **options: "{}",
         )
         self.settings = SimpleNamespace(
             node=self.node, regional=SimpleNamespace(cluster_id="cluster-a")
@@ -237,7 +235,7 @@ class WindowHost:
             if self.pending and self.wait_name == "workflow" and self.poll == 0
             else "SUCCEEDED"
         )
-        operations = ["RUN_DCGM_DIAGNOSTIC", "VALIDATE_GPU"]
+        operations = ["FREEZE_EVIDENCE", "VALIDATE_GPU"]
         if self.problem in {"reboot", "reboot-restore"}:
             operations.append("RESET_GPU")
         return {
@@ -260,7 +258,7 @@ class WindowHost:
             ],
             "notifications": [
                 {"incident_id": "incident-a", "category": category}
-                for category in ("OPERATOR_REVIEW", "DCGM")
+                for category in ("OPERATOR_REVIEW",)
             ],
             "evidence": [
                 {
