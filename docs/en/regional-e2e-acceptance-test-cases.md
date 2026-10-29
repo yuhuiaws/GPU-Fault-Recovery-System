@@ -8737,12 +8737,19 @@ an empty list, missing fields, duplicate roles or incomplete Pod status cannot p
   (thresholds) and `src/gpu_fault/app/middleware/dispatch.py::_enqueue`
   (429 + `Retry-After`).
 - Steps:
-  1. Record the current configuration:
-     `GPU_FAULT_PROCESSOR_MAX_QUEUE_DEPTH=10000`,
-     `GPU_FAULT_PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH=1000`.
+  1. Record the current configuration: the regional manifests render
+     `GPU_FAULT_PROCESSOR_MAX_QUEUE_DEPTH=65536` (bare default 10000) and
+     `GPU_FAULT_PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH=4096` (bare default 1000), with fault reserves
+     `GPU_FAULT_PROCESSOR_FAULT_RESERVED_QUEUE_DEPTH=8192` and
+     `GPU_FAULT_PROCESSOR_FAULT_RESERVED_CLUSTER_DEPTH=512`. The production control plane exports the
+     values it enforces on `/metrics` as `gpu_fault_processor_queue_depth_limit`,
+     `gpu_fault_processor_cluster_queue_depth_limit` and the two `*_fault_reserved_depth` gauges, and the
+     queue depth alerts are ratios of the depths to these caps, so record the gauge readings, not the
+     code defaults.
   2. To fill the queue within a controllable time, **on a separate verification control plane**
      (not the production three replicas) lower `MAX_CLUSTER_QUEUE_DEPTH` to `20`,
-     keeping `MAX_QUEUE_DEPTH` at a large value.
+     keeping `MAX_QUEUE_DEPTH` at a large value (the verification control plane's other queue settings
+     are the bare application defaults, `MAX_QUEUE_DEPTH=10000`, with both fault reserves at `0`).
   3. From data plane A continuously report host telemetry events for 60 seconds, starting at
      50 QPS: after every second in which A received no 429 (and A's queue depth was never seen
      above the cap plus slack) the runner raises the next second's rate by 1.5x (at most 400 QPS);

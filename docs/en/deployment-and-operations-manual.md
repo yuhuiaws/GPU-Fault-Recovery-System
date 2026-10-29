@@ -11525,8 +11525,8 @@ export GPU_FAULT_PROCESSOR_DRAIN_MAX_WAIT_SECONDS=30
 export GPU_FAULT_PROCESSOR_EXIT_ON_DEADLINE=true
 export GPU_FAULT_PROCESSOR_EXIT_GRACE_SECONDS=5
 export GPU_FAULT_PROCESSOR_WORKERS=24
-export GPU_FAULT_PROCESSOR_MAX_QUEUE_DEPTH=10000
-export GPU_FAULT_PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH=1000
+export GPU_FAULT_PROCESSOR_MAX_QUEUE_DEPTH=65536
+export GPU_FAULT_PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH=4096
 export GPU_FAULT_PROCESSOR_RETRY_AFTER_SECONDS=2
 export GPU_FAULT_PROCESSOR_CLEANUP_INTERVAL_SECONDS=60
 export GPU_FAULT_PROCESSOR_COMPLETED_RETENTION_SECONDS=600
@@ -11607,10 +11607,10 @@ Parameter description:
 | `GPU_FAULT_FAULT_ACTION_MAX_AGE_SECONDS` | `900` | Maximum age for automatic execution of XID/SXID destructive actions; when over-age or the source boot differs from the current Agent, only evidence is frozen and the workflow is BLOCKED, and the event is still kept for audit |
 | `GPU_FAULT_PROCESSOR_EXIT_ON_DEADLINE` | `true` | After the processor exceeds the hard deadline the current process exits and Kubernetes recreates the Pod |
 | `GPU_FAULT_PROCESSOR_EXIT_GRACE_SECONDS` | `5` | Wrap-up time before the hard exit after the deadline fires; still bound by the total budget of the worker lifespan and Kubernetes termination grace |
-| `GPU_FAULT_PROCESSOR_MAX_QUEUE_DEPTH` | `10000` | Hard cap on unfinished regional processor requests; new requests return 429 once reached |
-| `GPU_FAULT_PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH` | `1000` | Hard cap on unfinished requests of a single GPU cluster, preventing one cluster from filling the regional queue |
-| `GPU_FAULT_PROCESSOR_FAULT_RESERVED_QUEUE_DEPTH` | `4000` | Capacity reserved in the global queue for priority=0 fault events; covers a fault storm produced simultaneously by 8 clusters of 2048 cards with margin |
-| `GPU_FAULT_PROCESSOR_FAULT_RESERVED_CLUSTER_DEPTH` | `400` | Capacity reserved per cluster for priority=0 fault events; covers simultaneous XIDs on a 256-node cluster with margin |
+| `GPU_FAULT_PROCESSOR_MAX_QUEUE_DEPTH` | deploy.sh `65536`; bare application default `10000` | Hard cap on unfinished regional processor requests; new requests return 429 once reached; exported on `/metrics` as `gpu_fault_processor_queue_depth_limit`, and the regional queue alerts in `deploy/observability/amp-rules.yaml` judge the depth as a ratio of it (70%/90%), with no request count written into them |
+| `GPU_FAULT_PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH` | deploy.sh `4096`; bare application default `1000` | Hard cap on unfinished requests of a single GPU cluster, preventing one cluster from filling the regional queue; exported as `gpu_fault_processor_cluster_queue_depth_limit`, and the per-cluster alerts of the same rule file fire at 70% of it and at the cap minus the fault reserve |
+| `GPU_FAULT_PROCESSOR_FAULT_RESERVED_QUEUE_DEPTH` | deploy.sh `8192`; bare application default 2/5 of the total depth | Capacity reserved in the global queue for priority=0 fault events; covers a fault storm produced simultaneously by 8 clusters of 2048 cards with margin |
+| `GPU_FAULT_PROCESSOR_FAULT_RESERVED_CLUSTER_DEPTH` | deploy.sh `512`; bare application default 2/5 of the single-cluster depth | Capacity reserved per cluster for priority=0 fault events; covers simultaneous XIDs on a 256-node cluster with margin |
 | `GPU_FAULT_PROCESSOR_RETRY_AFTER_SECONDS` | `2` | `Retry-After` seconds of 429 and 503 (store I/O / decode capacity, request deadline) responses |
 | `GPU_FAULT_PROCESSOR_MAX_REQUEST_BYTES` | `16777216` | Hard cap on the processor enqueue request body; over the cap returns 413 without writing Aurora |
 | `GPU_FAULT_PROCESSOR_ADMISSION_BATCH_SIZE` | `64` | Server-side admission micro-batch cap Ingress applies to priority=100 periodic Telemetry; Faults do not enter that batch |
