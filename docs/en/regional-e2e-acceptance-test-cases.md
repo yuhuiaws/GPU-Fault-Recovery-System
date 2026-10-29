@@ -11260,12 +11260,19 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
      `RESET_GPU` workflow of its own (PENDING for good, because node-c's workflow held the failure
      domain's remediation budget), and the case judged 28 errors that all followed from it. Earlier
      runs joined only because the stopped attempt kept reading as RUNNING through that grace. The
-     verdict reads the two stored events' own `observed_at` (`destr014_verdicts.injection_window_errors`):
-     node-c's XID 79 must precede node-b's XID 46 and the two must be less than the aggregation window
-     apart, otherwise the errors say so by name ("the two injections are ... apart, outside the ...
-     aggregation window" / "the injection order was not kept") -- the injection did not set the case
-     up, which is not a product defect; both `observed_at` values and both exec return times are
-     recorded in `injection-observed.json`.
+     verdict reads the control plane's `ingested_at` on the two stored events -- one clock for both
+     (`destr014_verdicts.injection_window_errors`): node-c's XID 79 must reach the control plane
+     before node-b's XID 46 and the two must be less than the aggregation window apart, otherwise the
+     errors say so by name ("the two injections are ... apart, outside the ... aggregation window" /
+     "... reached the control plane before ...; the injection order was not kept") -- the injection
+     did not set the case up, which is not a product defect. That is the product's own measure: the
+     event processed first opens the job incident, and the aggregation window (`not_before`) runs on
+     the control plane's current time. An event's `observed_at` is its node's kmsg monotonic stamp
+     plus that collector's boot-time estimate, which the collector keeps only within 5 s of the node's
+     own collection time, so two nodes' values are not one clock: in HyperPod attempt 12 node-c read
+     about 0.8 s late and node-b about 1.0 s early, and a pair the control plane received node-c
+     first, 1.3 s apart, was judged reversed. Both events' `ingested_at`, `observed_at` and
+     `collected_at` and both exec return times are recorded in `injection-observed.json`.
   5. Observe the control plane: both XIDs land in the same `workflow_request_id`, `dag_enabled=true`,
      the shared `STOP_WORKLOADS` has `node_ids` exactly `[node-b, node-c]`;
      the node-b branch is `MARK_UNSCHEDULABLE → QUIESCE_GPU_SERVICES →

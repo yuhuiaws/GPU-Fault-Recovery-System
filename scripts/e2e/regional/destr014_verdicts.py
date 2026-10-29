@@ -32,10 +32,7 @@ from scripts.e2e.regional.collector_reboot_evidence import (  # noqa: E402
     provider_event_source,
     reboot_event_names,
 )
-from scripts.e2e.regional.destr015_verdicts import (  # noqa: E402
-    event_observed_at,
-    spread_errors,
-)
+from scripts.e2e.regional.destr015_verdicts import spread_errors  # noqa: E402
 from scripts.e2e.regional.guardrail_audit_evidence import (  # noqa: E402
     EC2_REPLACEMENT_MUTATIONS,
 )
@@ -639,6 +636,19 @@ def injection_errors(
     return errors
 
 
+def event_ingested_at(states: dict[str, dict[str, Any]]) -> dict[str, str]:
+    """``{node: ingested_at}`` of each node's stored event: the control plane's
+    own stamp at ingest, one clock for every node. A node whose event carries
+    none is left out, and :func:`spread_errors` reports the stamps incomplete."""
+
+    result: dict[str, str] = {}
+    for node, state in states.items():
+        stamp = (state.get("event") or {}).get("ingested_at")
+        if stamp:
+            result[node] = str(stamp)
+    return result
+
+
 def injection_window_errors(
     sibling_state: dict[str, Any],
     fault_state: dict[str, Any],
@@ -647,22 +657,31 @@ def injection_window_errors(
     fault_node: str,
     aggregation_window_seconds: int,
 ) -> list[str]:
-    """Step 4, judged on the stored events' own ``observed_at``: node-c's XID
-    79 first, node-b's XID 46 inside the same aggregation window. A pair that
-    misses the window was never a candidate for the in-window merge, so the
-    join verdicts alone would read like a product defect (an eks-managed run
-    wrote the two 9 s apart and judged 28 consequences of that)."""
+    """Step 4, judged on one clock -- the control plane's ``ingested_at`` on
+    both stored events: node-c's XID 79 first, node-b's XID 46 inside the same
+    aggregation window. That is the order the product takes them in (the first
+    opens the job incident) and the clock its window runs on (``not_before``
+    is the control plane's ``now`` plus the window). A pair that misses the
+    window was never a candidate for the in-window merge, so the join verdicts
+    alone would read like a product defect (an eks-managed run wrote the two
+    9 s apart and judged 28 consequences of that).
 
-    observed = event_observed_at({sibling_node: sibling_state, fault_node: fault_state})
+    Each event's ``observed_at`` is its node's kmsg monotonic stamp plus that
+    collector's boot-time estimate, kept only within 5 s of the node's own
+    collection time, so two nodes' values are not one clock: HyperPod attempt
+    12 (round 13) read node-c 0.8 s late and node-b 1.0 s early and failed a
+    pair the control plane took node-c first, 1.3 s apart."""
+
+    ingested = event_ingested_at({sibling_node: sibling_state, fault_node: fault_state})
     errors = spread_errors(
-        observed, aggregation_window_seconds=aggregation_window_seconds
+        ingested, aggregation_window_seconds=aggregation_window_seconds
     )
     if not errors and datetime.fromisoformat(
-        observed[fault_node].replace("Z", "+00:00")
-    ) <= datetime.fromisoformat(observed[sibling_node].replace("Z", "+00:00")):
+        ingested[fault_node].replace("Z", "+00:00")
+    ) <= datetime.fromisoformat(ingested[sibling_node].replace("Z", "+00:00")):
         errors.append(
-            "node-b's XID 46 was observed before node-c's XID 79; the "
-            "injection order was not kept"
+            "node-b's XID 46 reached the control plane before node-c's XID 79; "
+            "the injection order was not kept"
         )
     return errors
 

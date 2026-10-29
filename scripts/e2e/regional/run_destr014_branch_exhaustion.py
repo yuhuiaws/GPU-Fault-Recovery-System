@@ -972,20 +972,23 @@ def _arm_and_inject(run: _LiveRun) -> tuple[dict[str, Any], dict[str, Any]]:
         hyperpod_cluster=settings.hyperpod_cluster,
         terminal=False,
     )
-    # The verdict reads the events' own clocks; the exec returns are one
-    # kubectl round trip late and only say when the runner acted.
+    # The verdict reads the control plane's ingest stamps, one clock for both
+    # events; each observed_at is its own node's clock and the exec returns
+    # are one kubectl round trip late -- kept to show what each one said.
+    events = {
+        settings.sibling_node: sibling_state.get("event") or {},
+        settings.fault_node: fault_state.get("event") or {},
+    }
     write_json_atomic(
         case_dir / "injection-observed.json",
         {
             "marker": run.marker,
             "exec_returned_at": returned,
-            "event_observed_at": {
-                settings.sibling_node: (sibling_state.get("event") or {}).get(
-                    "observed_at"
-                ),
-                settings.fault_node: (fault_state.get("event") or {}).get(
-                    "observed_at"
-                ),
+            **{
+                f"event_{stamp}": {
+                    node: event.get(stamp) for node, event in events.items()
+                }
+                for stamp in ("ingested_at", "observed_at", "collected_at")
             },
         },
     )

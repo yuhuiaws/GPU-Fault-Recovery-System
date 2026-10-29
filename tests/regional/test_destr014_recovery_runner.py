@@ -57,8 +57,11 @@ class RunnerHarness:
         self.sibling_reboots = True
         self.installer_restores = False
         self.pending_reads = 0
-        # Seconds node-b's stored XID 46 trails node-c's XID 79.
+        # Seconds node-b's stored XID 46 trails node-c's XID 79 on the control
+        # plane's ingest clock, and how far each node's own observed_at reads
+        # off it (HyperPod attempt 12: node-c +0.8 s, node-b -1.0 s).
         self.injection_spread = 1.5
+        self.node_clock_skew: dict[str, float] = {}
         self.restored_incidents: set[str] = set()
         self.live_release = "release-test"
         self.node_uids = {
@@ -254,15 +257,21 @@ class RunnerHarness:
     def make_regional(self) -> Any:
         def wait(**kwargs: Any) -> dict[str, Any]:
             self.event("workflow.wait")
-            # The stored event on its node's own clock: node-c's XID 79 first,
-            # node-b's 1.5 s later, inside the 5 s aggregation window.
-            offset = self.injection_spread if kwargs["node"] == verdicts.FAULT else 0
+            # The stored event: the control plane's ingest stamp (node-c's XID
+            # 79 first, node-b's 1.5 s later, inside the 5 s aggregation
+            # window) and the node's own observed_at, ``node_clock_skew`` off.
+            node = kwargs["node"]
+            ingested = 1000 + (self.injection_spread if node == verdicts.FAULT else 0)
+            observed = ingested + self.node_clock_skew.get(node, 0.0)
             return {
                 **self.snapshot(),
                 "event": {
-                    "node_id": kwargs["node"],
+                    "node_id": node,
+                    "ingested_at": datetime.fromtimestamp(
+                        ingested, timezone.utc
+                    ).isoformat(),
                     "observed_at": datetime.fromtimestamp(
-                        1000 + offset, timezone.utc
+                        observed, timezone.utc
                     ).isoformat(),
                 },
             }
@@ -491,7 +500,39 @@ def test_a_pair_outside_the_window_names_the_injection_not_the_product(
     observed = json.loads((runner.case_dir / "injection-observed.json").read_text())
     nodes = {verdicts.FAULT, verdicts.SIBLING}
     assert (
-        set(observed["event_observed_at"]) == set(observed["exec_returned_at"]) == nodes
+        set(observed["event_ingested_at"])
+        == set(observed["event_observed_at"])
+        == set(observed["exec_returned_at"])
+        == nodes
+    )
+
+
+def test_node_clocks_that_read_the_pair_reversed_leave_the_designed_hold(
+    runner: RunnerHarness,
+) -> None:
+    """HyperPod attempt 12 (round 13) failed on node clocks alone: the control
+    plane took node-c's XID 79 1.3 s before node-b's XID 46, but node-c's
+    observed_at read 0.8 s late and node-b's 1.0 s early."""
+
+    from tests.regional.test_acceptance_reboot_hold_alignment import unknown_reboot
+
+    runner.workflow = unknown_reboot()
+    runner.injection_spread = 1.3
+    runner.node_clock_skew = {verdicts.SIBLING: 0.8, verdicts.FAULT: -1.0}
+    code, report = runner.execute()
+    assert code == 1 and report["verdict"] == "BLOCKED", report
+    assert report["scenario_verdict"] == "PASS" and report["errors"] == []
+    observed = json.loads((runner.case_dir / "injection-observed.json").read_text())
+
+    def stamp(kind: str, node: str) -> datetime:
+        return datetime.fromisoformat(observed[kind][node])
+
+    # Both clocks are kept: the verdict's, and the nodes' that read reversed.
+    assert stamp("event_ingested_at", verdicts.SIBLING) < stamp(
+        "event_ingested_at", verdicts.FAULT
+    )
+    assert stamp("event_observed_at", verdicts.FAULT) < stamp(
+        "event_observed_at", verdicts.SIBLING
     )
 
 
