@@ -330,9 +330,17 @@ re-reads the cluster and the Agent: a cluster no longer registered ACTIVE, or an
 gets none, so a purge that commits after the scan read the Agents (remove-cluster, a perf suite's teardown) is no longer followed
 by notifications with their delivery/result records and dedup links.
 Notifications are deduplicated by cluster, node, channel and the `GPU_FAULT_COLLECTOR_SILENT_ALERT_SECONDS` time bucket,
-with a default bucket width of 3600s. This path only generates and delivers an `AdvisoryNotification`; it does not create a recovery workflow,
-nor does it write a unified `UNKNOWN` node state. Agent heartbeat loss and the health decisions of the Executor and Watcher
-are not part of this collector silence scan.
+with a default bucket width of 3600s. Every round also writes the unified observation state `collector_observation_valid` for each
+required channel (`HEALTHY`/`UNKNOWN` with a reason, judged by `observation_health.observation_reason`: no success, a stale success,
+a success in the future, a current collection error). Only a **silent** channel -- no batch delivered within its threshold, a clean
+batch or one carrying collection errors alike -- requests the bounded snapshot refresh: at most one `collector_observation_unknown`
+finding per node and wall-clock hour (`RUN_DIAGNOSTICS`, OBSERVABILITY contract) whose workflow is FREEZE_EVIDENCE ->
+TRIGGER_HEALTH_SNAPSHOT (the Node Agent restarts the metrics and host collectors) -> VALIDATE_HOST, waiting for a new success of
+those silent channels only. A collector that still posts on time but whose batches carry collection errors (the host collector's
+timeout and breaker batches while `nvidia-smi` hangs) is recorded `UNKNOWN`/`COLLECTION_ERROR` and requests no refresh: a restart
+cannot clear an error the source keeps raising, and it resets the collector's own degradation (the nvidia-smi breaker) and
+interrupts the healthy metrics collector beside it (GF-REGIONAL-COLLECT-019). Agent heartbeat loss and the health decisions of the
+Executor and Watcher are not part of this collector silence scan.
 
 The cleanup task has a double upper bound: `GPU_FAULT_PROCESSOR_CLEANUP_BATCH_SIZE=1000` and
 `GPU_FAULT_PROCESSOR_CLEANUP_BUDGET_SECONDS=20`. The design is "clean one batch per round, never fill the whole period",
@@ -742,9 +750,9 @@ A partition is not one behaviour; it splits into three by direction:
 | Data-plane executor → control plane unreachable | Cannot claim/renew/report | Already-leased remote commands are re-dispatched after the lease expires (`GPU_FAULT_CLUSTER_EXECUTOR_LEASE_SECONDS=120`); executor readiness turns fail and the Pod is removed. On the control-plane side, if `GPU_FAULT_REMOTE_COMMAND_CLAIM_DEADLINE_SECONDS=900` passes with no one claiming, the step fails |
 | Control plane → Aurora unreachable | Both enqueue and consumption fail | On the ingress side admission returns 503 (`StoreIoCapacityExceeded`) or 429; no state is accumulated in memory. **There is no local degraded mode**, deliberately: the control plane is stateless, state lives only in Aurora |
 
-Missing monitoring cannot serve as evidence of health. Unknown here is a design semantic; it does not mean that
-`collector-silence` writes a unified `UNKNOWN` node state. That task only checks collector success-report records within the scope described in §2.3.1,
-generates an `AdvisoryNotification` and goes through the existing notification channel;
+Missing monitoring cannot serve as evidence of health. `collector-silence` checks the collectors' report records in the Store within the
+scope described in §2.3.1, writes `collector_observation_valid` (HEALTHY/UNKNOWN) for each required channel, requests the bounded snapshot
+refresh for silent channels only, and generates an `AdvisoryNotification` through the existing notification channel;
 therefore **collector silence notifications do not depend on AMP**. Nodes whose Agent heartbeat lease has expired are outside the scope of this scan;
 look at Fleet readiness and the stale-agent metrics instead, and do not infer their health from the absence of such notifications.
 

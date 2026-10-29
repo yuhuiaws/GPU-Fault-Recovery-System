@@ -10,7 +10,11 @@ from gpu_fault.collector_requirements import (
     required_collectors_for_agent,
 )
 from gpu_fault.models import AdvisoryNotification
-from gpu_fault.observation_health import record_observation, request_observation_refresh
+from gpu_fault.observation_health import (
+    record_observation,
+    reported_since,
+    request_observation_refresh,
+)
 from gpu_fault.store import NotFoundError
 from gpu_fault.telemetry import CollectorKind, collector_producer
 
@@ -91,7 +95,19 @@ def notify_silent_collectors(
                     observed_at,
                     thresholds[collector],
                 )
-                if reason:
+                # Only a silent channel asks for the refresh. A collector that
+                # still delivers batches, clean or naming its collection
+                # errors, is up and says why it cannot observe: the refresh's
+                # TRIGGER_HEALTH_SNAPSHOT restarts the metrics and host
+                # collectors, which cannot clear an error the source keeps
+                # raising and resets the collector's own degradation (the
+                # nvidia-smi breaker). Live 2026-10-29, GF-REGIONAL-COLLECT-019
+                # on both clusters: a hung nvidia-smi had both collectors
+                # restarted 94-108 s into the hang. The UNKNOWN is recorded
+                # either way.
+                if reason and not reported_since(
+                    status, observed_at, thresholds[collector]
+                ):
                     unknown.append(collector)
                 last_success = status.last_success_at if status is not None else None
                 if (
