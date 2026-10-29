@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -185,6 +186,286 @@ def test_repository_rules_pass_promtool_when_it_is_available() -> None:
         "missing native checks are not successful evidence"
     )
     assert report["rules"] >= 60
+
+
+# The processor queue depth rules are ratios of the caps admission enforces,
+# which /metrics exports next to the depths. They compared with 7000 / 9000 /
+# 700 -- 70 / 90 / 70 percent of the code defaults -- while the regional
+# manifests render 65536 / 4096, so they fired at 11-17 percent of the real
+# caps and "exceeds 70 percent" was false. Every case below puts the depth on
+# one side of a boundary, under the rendered caps or under caps that move it.
+QUEUE_ALERTS = (
+    "GpuFaultProcessorQueueDepthHigh",
+    "GpuFaultProcessorQueueDepthCritical",
+    "GpuFaultProcessorClusterBacklogHigh",
+    "GpuFaultProcessorClusterBacklogCritical",
+)
+QUEUE_SITE = {"control_plane_cluster": "control-a", "region": "test-region"}
+HIGH, CRITICAL = QUEUE_ALERTS[0], QUEUE_ALERTS[1]
+CLUSTER_HIGH, CLUSTER_CRITICAL = QUEUE_ALERTS[2], QUEUE_ALERTS[3]
+
+
+def _queue_rules(relative: str) -> dict[str, dict]:
+    [(_, document)] = MODULE.rule_documents([ROOT / relative])
+    return {
+        rule["alert"]: rule
+        for group in document["groups"]
+        for rule in group["rules"]
+        if rule.get("alert") in QUEUE_ALERTS
+    }
+
+
+def _queue_series(
+    pod: str,
+    *,
+    depth: int | str,
+    clusters: dict[str, int | str],
+    limit: int | str = 65536,
+    reserve: int | str = 8192,
+    cluster_limit: int | str = 4096,
+    cluster_reserve: int | str = 512,
+) -> list[dict[str, str]]:
+    """One replica's queue view and caps, labelled the way ADOT labels them.
+
+    The defaults are the caps the regional manifests render.
+    """
+
+    target = {
+        **QUEUE_SITE,
+        "job": "gpu-fault-control-plane",
+        "namespace": "gpu-fault-system",
+        "pod": pod,
+        "instance": f"{pod}:8000",
+        "service_role": "gpu-fault-control-worker",
+    }
+
+    def one(metric: str, values: int | str, **labels: str) -> dict[str, str]:
+        tags = {**target, **labels}
+        rendered = ",".join(f'{key}="{value}"' for key, value in tags.items())
+        return {
+            "series": f"{metric}{{{rendered}}}",
+            "values": values if isinstance(values, str) else f"{values}+0x30",
+        }
+
+    return [
+        one("gpu_fault_processor_queue_depth", depth),
+        one("gpu_fault_processor_queue_depth_limit", limit),
+        one("gpu_fault_processor_queue_fault_reserved_depth", reserve),
+        one("gpu_fault_processor_cluster_queue_depth_limit", cluster_limit),
+        one("gpu_fault_processor_cluster_queue_fault_reserved_depth", cluster_reserve),
+        *(
+            one("gpu_fault_processor_cluster_queue_depth", value, cluster_id=cluster)
+            for cluster, value in clusters.items()
+        ),
+    ]
+
+
+def _two_replicas(**values) -> list[dict[str, str]]:
+    """A worker and an ingress replica publishing the same Store-derived depths."""
+
+    return [
+        *_queue_series("gpu-fault-control-worker-0", **values),
+        *_queue_series("gpu-fault-api-ha-0", **values),
+    ]
+
+
+def _queue_alert(rule: dict, value: float, cluster: str | None) -> dict:
+    labels = {**QUEUE_SITE, "severity": rule["labels"]["severity"]}
+    rendered = {
+        "{{ $value | humanizePercentage }}": f"{value * 100:.4g}%",
+        '{{ $value | printf "%.0f" }}': f"{value:.0f}",
+    }
+    if cluster is not None:
+        labels["cluster_id"] = cluster
+        rendered["{{ $labels.cluster_id }}"] = cluster
+    annotations = {}
+    for key, text in rule["annotations"].items():
+        for template, value_text in rendered.items():
+            text = str(text).replace(template, value_text)
+        annotations[key] = text
+    return {"exp_labels": labels, "exp_annotations": annotations}
+
+
+QUEUE_CASES = [
+    pytest.param(
+        _two_replicas(depth=9001, clusters={"a": 701}),
+        [("10m", {})],
+        id="the-old-9000-and-700-thresholds-are-13-and-17-percent-of-the-caps",
+    ),
+    pytest.param(
+        _two_replicas(depth=45875, clusters={"a": 2867}),
+        [("10m", {})],
+        id="just-below-70-percent-nothing-fires",
+    ),
+    pytest.param(
+        _two_replicas(depth=45876, clusters={}),
+        [("10m", {HIGH: [(45876 / 65536, None)]})],
+        id="regional-just-above-70-percent-warns",
+    ),
+    pytest.param(
+        _two_replicas(depth=58982, clusters={}),
+        [("10m", {HIGH: [(58982 / 65536, None)]})],
+        id="regional-just-below-90-percent-only-warns",
+    ),
+    pytest.param(
+        _two_replicas(depth=58983, clusters={}),
+        [("10m", {HIGH: [(58983 / 65536, None)], CRITICAL: [(58983 / 65536, None)]})],
+        id="regional-just-above-90-percent-pages",
+    ),
+    pytest.param(
+        _two_replicas(depth=9001, limit=10000, reserve=4000, clusters={}),
+        [("10m", {HIGH: [(0.9001, None)], CRITICAL: [(0.9001, None)]})],
+        id="the-code-default-cap-moves-the-regional-boundaries-down",
+    ),
+    pytest.param(
+        _two_replicas(depth=50000, limit=131072, reserve=16384, clusters={}),
+        [("10m", {})],
+        id="a-larger-regional-cap-moves-the-boundary-up",
+    ),
+    pytest.param(
+        [
+            *_queue_series("gpu-fault-control-worker-0", depth=50000, clusters={}),
+            *_queue_series(
+                "gpu-fault-control-worker-1",
+                depth=50000,
+                limit=131072,
+                reserve=16384,
+                clusters={},
+            ),
+        ],
+        [("10m", {HIGH: [(50000 / 65536, None)]})],
+        id="mid-roll-the-tightest-cap-still-enforced-is-the-one-read",
+    ),
+    pytest.param(
+        _two_replicas(
+            depth=50000,
+            limit="65536+0x10 131072+0x20",
+            reserve="8192+0x10 16384+0x20",
+            clusters={},
+        ),
+        [("10m", {HIGH: [(50000 / 65536, None)]}), ("20m", {})],
+        id="raising-the-regional-cap-resolves-the-warning",
+    ),
+    pytest.param(
+        _two_replicas(depth=3000, clusters={"a": 2868, "b": 100}),
+        [("10m", {CLUSTER_HIGH: [(2868 / 4096, "a")]})],
+        id="cluster-just-above-70-percent-warns-for-that-cluster-only",
+    ),
+    pytest.param(
+        _two_replicas(depth=3600, clusters={"a": 3583}),
+        [("10m", {CLUSTER_HIGH: [(3583 / 4096, "a")]})],
+        id="one-request-below-the-cluster-fault-reserve-only-warns",
+    ),
+    pytest.param(
+        _two_replicas(depth=3600, clusters={"a": 3584}),
+        [
+            (
+                "10m",
+                {CLUSTER_HIGH: [(3584 / 4096, "a")], CLUSTER_CRITICAL: [(3584, "a")]},
+            )
+        ],
+        id="at-the-cluster-fault-reserve-boundary-pages",
+    ),
+    pytest.param(
+        _two_replicas(depth=3100, cluster_reserve=1024, clusters={"a": 3072}),
+        [
+            (
+                "10m",
+                {CLUSTER_HIGH: [(3072 / 4096, "a")], CLUSTER_CRITICAL: [(3072, "a")]},
+            )
+        ],
+        id="a-reserve-sized-for-a-larger-cluster-moves-the-page-down",
+    ),
+    pytest.param(
+        _two_replicas(
+            depth=3600, cluster_limit=8192, cluster_reserve=1024, clusters={"a": 3584}
+        ),
+        [("10m", {})],
+        id="a-larger-cluster-cap-moves-both-cluster-boundaries-up",
+    ),
+    pytest.param(
+        _two_replicas(depth=3600, clusters={"a": "0+0x9 3584+0x21"}),
+        [("11m", {}), ("12m", {CLUSTER_CRITICAL: [(3584, "a")]})],
+        id="the-cluster-page-waits-two-minutes-at-the-boundary",
+    ),
+]
+
+
+def test_queue_depth_rules_are_the_same_in_both_rule_files() -> None:
+    amp = _queue_rules("deploy/observability/amp-rules.yaml")
+    operator = _queue_rules("deploy/control-plane/regional/processor-alerts.yaml")
+
+    assert sorted(amp) == sorted(QUEUE_ALERTS), sorted(amp)
+    assert operator == amp, "the PrometheusRule copies drifted from the AMP rules"
+
+
+def test_queue_depth_rules_compare_shares_of_the_exported_caps() -> None:
+    for name, rule in _queue_rules("deploy/observability/amp-rules.yaml").items():
+        expression = " ".join(str(rule["expr"]).split())
+        numbers = re.findall(r"(?<![\w.])\d+(?:\.\d+)?(?![\w.])", expression)
+        assert [float(number) for number in numbers if float(number) > 1] == [], (
+            f"{name} compares with a request count instead of a share: {expression}"
+        )
+        assert "_queue_depth_limit" in expression, (
+            f"{name} does not read the cap admission enforces: {expression}"
+        )
+
+
+@pytest.mark.parametrize(("inputs", "checks"), QUEUE_CASES)
+def test_queue_depth_alerts_fire_at_the_configured_boundaries(
+    tmp_path: Path, inputs: list[dict[str, str]], checks: list
+) -> None:
+    promtool = shutil.which(os.environ.get("PROMTOOL", "promtool"))
+    assert promtool is not None, "set PROMTOOL to the pinned local promtool"
+    rules = _queue_rules("deploy/observability/amp-rules.yaml")
+    rule_file = tmp_path / "rules.yaml"
+    rule_file.write_text(
+        yaml.safe_dump(
+            {"groups": [{"name": "queue", "rules": [rules[n] for n in QUEUE_ALERTS]}]},
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    alert_tests = [
+        {
+            "alertname": alert,
+            "eval_time": when,
+            "exp_alerts": [
+                _queue_alert(rules[alert], value, cluster)
+                for value, cluster in firing.get(alert, [])
+            ],
+        }
+        for when, firing in checks
+        for alert in QUEUE_ALERTS
+    ]
+    test_file = tmp_path / "cases.yaml"
+    test_file.write_text(
+        yaml.safe_dump(
+            {
+                "rule_files": [str(rule_file)],
+                "evaluation_interval": "1m",
+                "tests": [
+                    {
+                        "interval": "1m",
+                        "input_series": inputs,
+                        "alert_rule_test": alert_tests,
+                    }
+                ],
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [promtool, "test", "rules", str(test_file)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.parametrize(

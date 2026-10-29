@@ -63,6 +63,108 @@ def _increase(metric: str, window: str, by: str, *selectors: str) -> str:
     return f"sum by ({by}) (increase({series(metric, *selectors)}[{window}]))"
 
 
+# The catalog's "Processor queue" row. The depth alerts are ratios of the caps
+# admission enforces (the exported *_limit / *_fault_reserved_depth gauges), so
+# their threshold lines sit on the share panels and hold for any configured
+# cap; the panels in requests plot the same families in another unit and bind
+# only the alert whose boundary they draw. Caps are read with ``min`` over
+# replicas, like the rules read them.
+CLUSTER_SELECTOR = 'cluster_id=~"$cluster_id"'
+_DEPTH = series("gpu_fault_processor_queue_depth")
+_LIMIT = series("gpu_fault_processor_queue_depth_limit")
+_RESERVE = series("gpu_fault_processor_queue_fault_reserved_depth")
+_CLUSTER_DEPTH = series("gpu_fault_processor_cluster_queue_depth", CLUSTER_SELECTOR)
+_CLUSTER_LIMIT = series("gpu_fault_processor_cluster_queue_depth_limit")
+_CLUSTER_RESERVE = series("gpu_fault_processor_cluster_queue_fault_reserved_depth")
+_SITE = "{{control_plane_cluster}} {{region}}"
+
+
+def _reserve_boundary(limit: str, reserve: str, *, share: bool) -> tuple[str, str]:
+    """Where admission starts refusing evidence and routine requests."""
+    value = f"1 - {reserve} / {limit}" if share else f"{limit} - {reserve}"
+    return f"min {BY_CONTROL_PLANE} ({value})", f"{_SITE} fault reserve boundary"
+
+
+QUEUE_DEPTH_PANELS = (
+    _panel(
+        "Processor queue use",
+        (
+            (
+                f"max {BY_CONTROL_PLANE} ({_DEPTH}) / min {BY_CONTROL_PLANE} ({_LIMIT})",
+                f"{_SITE} depth / limit",
+            ),
+            _reserve_boundary(_LIMIT, _RESERVE, share=True),
+        ),
+        "Incomplete processor requests across the region as a share of the "
+        "limit admission enforces.",
+        unit="percentunit",
+    ),
+    _panel(
+        "Processor queue depth",
+        (
+            (f"max {BY_CONTROL_PLANE} ({_DEPTH})", f"{_SITE} depth"),
+            (f"min {BY_CONTROL_PLANE} ({_LIMIT})", f"{_SITE} limit"),
+            _reserve_boundary(_LIMIT, _RESERVE, share=False),
+        ),
+        "Incomplete processor requests across the region.",
+        alert_names=(),
+    ),
+    _panel(
+        "Oldest processor request age",
+        (
+            (
+                f"max({series('gpu_fault_processor_queue_oldest_age_seconds')})",
+                "oldest",
+            ),
+        ),
+        "",
+        unit="s",
+    ),
+    _panel(
+        "Processor queue use by cluster",
+        (
+            (
+                "max by (control_plane_cluster, region, cluster_id) "
+                f"({_CLUSTER_DEPTH}) / on (control_plane_cluster, region) "
+                f"group_left min {BY_CONTROL_PLANE} ({_CLUSTER_LIMIT})",
+                "{{cluster_id}}",
+            ),
+            _reserve_boundary(_CLUSTER_LIMIT, _CLUSTER_RESERVE, share=True),
+        ),
+        "Each cluster's incomplete processor requests as a share of the "
+        "per-cluster limit.",
+        unit="percentunit",
+    ),
+    _panel(
+        "Processor queue depth by cluster",
+        (
+            (f"max by (cluster_id) ({_CLUSTER_DEPTH})", "{{cluster_id}}"),
+            (f"min {BY_CONTROL_PLANE} ({_CLUSTER_LIMIT})", f"{_SITE} limit"),
+            _reserve_boundary(_CLUSTER_LIMIT, _CLUSTER_RESERVE, share=False),
+        ),
+        "",
+        alert_names=("GpuFaultProcessorClusterBacklogCritical",),
+    ),
+    _panel(
+        "Oldest request age by cluster",
+        (
+            (
+                "max by (cluster_id) ("
+                + series(
+                    "gpu_fault_processor_cluster_queue_oldest_age_seconds",
+                    CLUSTER_SELECTOR,
+                )
+                + ")",
+                "{{cluster_id}}",
+            ),
+        ),
+        "The claim window is FIFO across the region, so a storm in one "
+        "cluster delays every other cluster; this is who is paying.",
+        unit="s",
+    ),
+)
+
+
 def _counter_scan_known() -> str:
     stamp = series("gpu_fault_processor_counter_drift_scan_timestamp_seconds")
     maximum_age = series("gpu_fault_processor_counter_drift_scan_max_age_seconds")

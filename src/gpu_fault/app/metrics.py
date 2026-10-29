@@ -44,7 +44,7 @@ from gpu_fault.app.metrics_sections import (
     render_spool_metrics_two,
 )
 from gpu_fault.app.process_health import render_process_health_metrics
-from gpu_fault.app.runtime import AppRuntime
+from gpu_fault.app.runtime import AppRuntime, ProcessorQueueLimits
 from gpu_fault.departed_node_cleanup import departed_node_cleanup_metric_lines
 from gpu_fault.store.contracts import ProcessorQueueStats
 
@@ -100,6 +100,54 @@ def _processor_cluster_queue_lines(queue: ProcessorQueueStats) -> list[str]:
             f'{{cluster_id="{_escape_label(cluster_id)}"}} {age:.6f}'
         )
     return lines
+
+
+def _processor_queue_limit_lines(limits: ProcessorQueueLimits | None) -> list[str]:
+    """The caps admission enforces against the two depths above.
+
+    The depth alerts divide by these instead of comparing with a number: a
+    fixed threshold written as 70 percent of the code defaults (10000 / 1000)
+    read 11-17 percent of the caps the regional manifests render (65536 /
+    4096) as "70 percent". The reserves say where requests outside the fault
+    tier start being refused. One value for every request and cluster, so no
+    labels; the per-cluster rules join it with ``group_left``.
+    """
+
+    if limits is None:
+        return []
+    return [
+        "# HELP gpu_fault_processor_queue_depth_limit Regional processor queue "
+        "depth at which admission refuses every request.",
+        "# TYPE gpu_fault_processor_queue_depth_limit gauge",
+        f"gpu_fault_processor_queue_depth_limit {limits.max_depth}",
+        "# HELP gpu_fault_processor_queue_fault_reserved_depth Part of the "
+        "regional limit held for fault-tier requests; any other request is "
+        "refused from the limit minus this reserve.",
+        "# TYPE gpu_fault_processor_queue_fault_reserved_depth gauge",
+        f"gpu_fault_processor_queue_fault_reserved_depth {limits.fault_reserved_depth}",
+        "# HELP gpu_fault_processor_cluster_queue_depth_limit Per-cluster "
+        "processor queue depth at which admission refuses every request of "
+        "that cluster.",
+        "# TYPE gpu_fault_processor_cluster_queue_depth_limit gauge",
+        f"gpu_fault_processor_cluster_queue_depth_limit {limits.max_cluster_depth}",
+        "# HELP gpu_fault_processor_cluster_queue_fault_reserved_depth Part of "
+        "each cluster's limit held for its fault-tier requests; its other "
+        "requests are refused from the limit minus this reserve.",
+        "# TYPE gpu_fault_processor_cluster_queue_fault_reserved_depth gauge",
+        "gpu_fault_processor_cluster_queue_fault_reserved_depth "
+        f"{limits.fault_reserved_cluster_depth}",
+    ]
+
+
+def _processor_queue_view_lines(
+    queue: ProcessorQueueStats, limits: ProcessorQueueLimits | None
+) -> list[str]:
+    """The per-cluster queue families, then the caps both depths are held to."""
+
+    return [
+        *_processor_cluster_queue_lines(queue),
+        *_processor_queue_limit_lines(limits),
+    ]
 
 
 def _event_loop_lag_lines(
@@ -189,7 +237,7 @@ def render_prometheus_metrics(app_runtime: AppRuntime) -> list[str]:
         "gpu_fault_processor_queue_oldest_age_seconds "
         f"{queue['oldest_age_seconds']:.6f}",
     ]
-    lines.extend(_processor_cluster_queue_lines(queue))
+    lines.extend(_processor_queue_view_lines(queue, app_runtime.processor_queue_limits))
     runtime = (
         processor.metrics_snapshot()
         if processor is not None

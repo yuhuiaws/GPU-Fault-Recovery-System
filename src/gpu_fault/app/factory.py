@@ -685,6 +685,7 @@ def _install_core_routes(
         metric_scan_cache=MetricScanCache(ctx.store),
         decode_rejections=admission.decode_rejections,
         event_loop_lag_histogram=event_loop_lag.histogram,
+        processor_queue_limits=admission.queue_limits(),
     )
     app.dependency_overrides[get_app_runtime] = lambda: app_runtime
     app.include_router(metrics_router)

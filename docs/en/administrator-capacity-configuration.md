@@ -517,7 +517,13 @@ must write `managedNodeCount` as 2048 and raise `minAcu` to at least 20.5 at the
 (`GPU_FAULT_CAPACITY_LARGEST_CLUSTER_NODE_COUNT`,
 `GPU_FAULT_CAPACITY_MANAGED_NODE_COUNT`); the runtime refuses at startup an environment whose reservation is smaller than the largest cluster node count,
 and `/metrics` exports the two gauges `gpu_fault_capacity_largest_cluster_node_count` and
-`gpu_fault_capacity_managed_node_count`. When rollback captures the online AdminConfig, it
+`gpu_fault_capacity_managed_node_count`. The queue caps and fault reserves admission actually enforces are exported the
+same way, as `gpu_fault_processor_queue_depth_limit`, `gpu_fault_processor_queue_fault_reserved_depth`,
+`gpu_fault_processor_cluster_queue_depth_limit` and `gpu_fault_processor_cluster_queue_fault_reserved_depth` (the
+values the runtime parsed, not the code defaults); the queue depth alerts are ratios of these caps (70% warnings
+regional and per cluster, 90% regional, and critical once a cluster reaches its limit minus its reserve), so changing
+`maxQueueDepth` / `maxClusterQueueDepth` moves the alert boundaries with them and no alert rule needs editing
+(Administrator Operations §8). When rollback captures the online AdminConfig, it
 reads only the node counts actually present in the ConfigMap; when production declares none, it infers from the captured depth per the legacy record rule above,
 without filling in the release default.
 

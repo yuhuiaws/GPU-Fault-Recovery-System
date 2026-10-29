@@ -7,20 +7,53 @@ spec:
   groups:
     - name: gpu-fault-processor-capacity
       rules:
+        # The queue depth rules are ratios of the caps admission enforces and
+        # exact copies of the ones in deploy/observability/amp-rules.yaml.
         - alert: GpuFaultProcessorQueueDepthHigh
-          expr: max(gpu_fault_processor_queue_depth) > 7000
+          expr: >-
+            max by (control_plane_cluster, region) (gpu_fault_processor_queue_depth)
+            / min by (control_plane_cluster, region)
+            (gpu_fault_processor_queue_depth_limit) > 0.7
           for: 5m
           labels:
             severity: warning
           annotations:
-            summary: Regional GPU fault processor queue exceeds 70 percent
+            summary: Regional GPU fault processor queue exceeds 70 percent of its configured limit
+            runbook_url: docs/en/administrator-operations.md#gpufaultprocessorqueuedepthhigh
+            description: >-
+              The regional queue holds {{ $value | humanizePercentage }} of
+              gpu_fault_processor_queue_depth_limit, the cap admission enforces
+              (spec.processor.maxQueueDepth). Evidence and routine requests are
+              refused only from that limit minus
+              gpu_fault_processor_queue_fault_reserved_depth (87.5 percent with
+              the eighth the release reserves), so nothing is rejected yet, but
+              queueing delay is already growing. Check control-worker replicas
+              and lane occupancy, Aurora latency, and whether the backlog is one
+              cluster's fault storm rather than global load. Scale through
+              `gpu-fault-admin config`; do not lower the ratio or enable a queue
+              bypass.
         - alert: GpuFaultProcessorQueueDepthCritical
-          expr: max(gpu_fault_processor_queue_depth) > 9000
+          expr: >-
+            max by (control_plane_cluster, region) (gpu_fault_processor_queue_depth)
+            / min by (control_plane_cluster, region)
+            (gpu_fault_processor_queue_depth_limit) > 0.9
           for: 2m
           labels:
             severity: critical
           annotations:
-            summary: Regional GPU fault processor queue exceeds 90 percent
+            summary: Regional GPU fault processor queue exceeds 90 percent of its configured limit
+            runbook_url: docs/en/administrator-operations.md#gpufaultprocessorqueuedepthcritical
+            description: >-
+              The regional queue holds {{ $value | humanizePercentage }} of
+              gpu_fault_processor_queue_depth_limit. Past the limit minus
+              gpu_fault_processor_queue_fault_reserved_depth only fault-tier
+              requests (device events, control-plane actions) are admitted, so
+              the queue is one step away from refusing fault events too, which
+              then depend on client redelivery. Check the same signals as
+              GpuFaultProcessorQueueDepthHigh plus whether workers are blocking
+              each other on a lane (gpu_fault_processor_lane_wait_seconds_max).
+              Adding worker replicas outside a maintenance window is permitted
+              here, still with a change record and a rollback plan.
         - alert: GpuFaultProcessorOldestRequestDelayed
           expr: max(gpu_fault_processor_queue_oldest_age_seconds) > 30
           for: 5m
@@ -29,12 +62,59 @@ spec:
           annotations:
             summary: Oldest GPU fault processor request is delayed
         - alert: GpuFaultProcessorClusterBacklogHigh
-          expr: max by (cluster_id) (gpu_fault_processor_cluster_queue_depth) > 700
+          expr: >-
+            max by (control_plane_cluster, region, cluster_id)
+            (gpu_fault_processor_cluster_queue_depth)
+            / on (control_plane_cluster, region) group_left
+            min by (control_plane_cluster, region)
+            (gpu_fault_processor_cluster_queue_depth_limit) > 0.7
           for: 5m
           labels:
             severity: warning
           annotations:
-            summary: A GPU cluster processor backlog exceeds 70 percent
+            summary: A GPU cluster processor backlog exceeds 70 percent of its per-cluster limit
+            runbook_url: docs/en/administrator-operations.md#gpufaultprocessorclusterbackloghigh
+            description: >-
+              Cluster {{ $labels.cluster_id }} holds {{ $value | humanizePercentage }}
+              of gpu_fault_processor_cluster_queue_depth_limit, its own quota
+              (spec.processor.maxClusterQueueDepth), so the backlog is
+              concentrated in one cluster rather than global overload. Check
+              whether that cluster's collectors are replaying, whether its
+              executor is claiming, and whether a node-level fault storm is in
+              progress. From the limit minus
+              gpu_fault_processor_cluster_queue_fault_reserved_depth its evidence
+              and routine requests are refused
+              (GpuFaultProcessorClusterBacklogCritical). The per-cluster quota is
+              an isolation mechanism: do not widen it to clear this alert,
+              because that spends other clusters' capacity.
+        - alert: GpuFaultProcessorClusterBacklogCritical
+          expr: >-
+            max by (control_plane_cluster, region, cluster_id)
+            (gpu_fault_processor_cluster_queue_depth)
+            >= on (control_plane_cluster, region) group_left
+            min by (control_plane_cluster, region) (
+              gpu_fault_processor_cluster_queue_depth_limit
+              - gpu_fault_processor_cluster_queue_fault_reserved_depth
+            )
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: A GPU cluster processor backlog reached its fault reserve
+            runbook_url: docs/en/administrator-operations.md#gpufaultprocessorclusterbacklogcritical
+            description: >-
+              Cluster {{ $labels.cluster_id }} holds {{ $value | printf "%.0f" }}
+              incomplete processor requests, at or past
+              gpu_fault_processor_cluster_queue_depth_limit minus
+              gpu_fault_processor_cluster_queue_fault_reserved_depth. Admission
+              now refuses that cluster's evidence and routine requests
+              (gpu_fault_processor_admission_rejections_by_cluster_total,
+              scope cluster_reserved), which depend on client redelivery, and
+              only its fault-tier requests still enter, into the reserve; at the
+              limit those are refused too. Find what floods the cluster
+              (collector replay, an executor that stopped claiming, a node-level
+              fault storm) and drain it. The per-cluster quota is an isolation
+              limit: widening it spends other clusters' capacity.
         - alert: GpuFaultProcessorAdmissionRejected
           expr: sum(rate(gpu_fault_processor_admission_rejections_total[5m])) > 0
           for: 1m

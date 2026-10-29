@@ -954,7 +954,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Incomplete processor requests across the region.\n\nAlert GpuFaultProcessorQueueDepthHigh (warning, for 5m, > 7000): docs/en/administrator-operations.md#gpufaultprocessorqueuedepthhigh\n\nAlert GpuFaultProcessorQueueDepthCritical (critical, for 2m, > 9000): docs/en/administrator-operations.md#gpufaultprocessorqueuedepthcritical",
+      "description": "Incomplete processor requests across the region as a share of the limit admission enforces.\n\nAlert GpuFaultProcessorQueueDepthHigh (warning, for 5m, > 0.7): docs/en/administrator-operations.md#gpufaultprocessorqueuedepthhigh\n\nAlert GpuFaultProcessorQueueDepthCritical (critical, for 2m, > 0.9): docs/en/administrator-operations.md#gpufaultprocessorqueuedepthcritical",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -978,21 +978,21 @@
               },
               {
                 "color": "orange",
-                "value": 7000.0
+                "value": 0.7
               },
               {
                 "color": "red",
-                "value": 9000.0
+                "value": 0.9
               }
             ]
           },
-          "unit": "short"
+          "unit": "percentunit"
         },
         "overrides": []
       },
       "gridPos": {
         "h": 8,
-        "w": 6,
+        "w": 8,
         "x": 0,
         "y": 36
       },
@@ -1014,11 +1014,112 @@
             "type": "prometheus",
             "uid": "gpu-fault-amp"
           },
-          "expr": "max(gpu_fault_processor_queue_depth{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "expr": "max by (control_plane_cluster, region) (gpu_fault_processor_queue_depth{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"}) / min by (control_plane_cluster, region) (gpu_fault_processor_queue_depth_limit{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
           "instant": false,
-          "legendFormat": "depth",
+          "legendFormat": "{{control_plane_cluster}} {{region}} depth / limit",
           "range": true,
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "min by (control_plane_cluster, region) (1 - gpu_fault_processor_queue_fault_reserved_depth{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} / gpu_fault_processor_queue_depth_limit{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "{{control_plane_cluster}} {{region}} fault reserve boundary",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Processor queue use",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-fault-amp"
+      },
+      "description": "Incomplete processor requests across the region.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 36
+      },
+      "id": 18,
+      "links": [],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "max by (control_plane_cluster, region) (gpu_fault_processor_queue_depth{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "{{control_plane_cluster}} {{region}} depth",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "min by (control_plane_cluster, region) (gpu_fault_processor_queue_depth_limit{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "{{control_plane_cluster}} {{region}} limit",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "min by (control_plane_cluster, region) (gpu_fault_processor_queue_depth_limit{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} - gpu_fault_processor_queue_fault_reserved_depth{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "{{control_plane_cluster}} {{region}} fault reserve boundary",
+          "range": true,
+          "refId": "C"
         }
       ],
       "title": "Processor queue depth",
@@ -1063,11 +1164,11 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 6,
-        "x": 6,
+        "w": 8,
+        "x": 16,
         "y": 36
       },
-      "id": 18,
+      "id": 19,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1100,7 +1201,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Alert GpuFaultProcessorClusterBacklogHigh (warning, for 5m, > 700): docs/en/administrator-operations.md#gpufaultprocessorclusterbackloghigh",
+      "description": "Each cluster's incomplete processor requests as a share of the per-cluster limit.\n\nAlert GpuFaultProcessorClusterBacklogHigh (warning, for 5m, > 0.7): docs/en/administrator-operations.md#gpufaultprocessorclusterbackloghigh\n\nAlert GpuFaultProcessorClusterBacklogCritical (critical, for 2m): docs/en/administrator-operations.md#gpufaultprocessorclusterbacklogcritical",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1124,7 +1225,85 @@
               },
               {
                 "color": "orange",
-                "value": 700.0
+                "value": 0.7
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 44
+      },
+      "id": 20,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "max by (control_plane_cluster, region, cluster_id) (gpu_fault_processor_cluster_queue_depth{cluster_id=~\"$cluster_id\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"}) / on (control_plane_cluster, region) group_left min by (control_plane_cluster, region) (gpu_fault_processor_cluster_queue_depth_limit{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "{{cluster_id}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "min by (control_plane_cluster, region) (1 - gpu_fault_processor_cluster_queue_fault_reserved_depth{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} / gpu_fault_processor_cluster_queue_depth_limit{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "{{control_plane_cluster}} {{region}} fault reserve boundary",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Processor queue use by cluster",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-fault-amp"
+      },
+      "description": "Alert GpuFaultProcessorClusterBacklogCritical (critical, for 2m): docs/en/administrator-operations.md#gpufaultprocessorclusterbacklogcritical",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
               }
             ]
           },
@@ -1134,11 +1313,18 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 6,
-        "x": 12,
-        "y": 36
+        "w": 8,
+        "x": 8,
+        "y": 44
       },
-      "id": 19,
+      "id": 21,
+      "links": [
+        {
+          "targetBlank": true,
+          "title": "GpuFaultProcessorClusterBacklogCritical",
+          "url": "docs/en/administrator-operations.md#gpufaultprocessorclusterbacklogcritical"
+        }
+      ],
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1161,6 +1347,28 @@
           "legendFormat": "{{cluster_id}}",
           "range": true,
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "min by (control_plane_cluster, region) (gpu_fault_processor_cluster_queue_depth_limit{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "{{control_plane_cluster}} {{region}} limit",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "min by (control_plane_cluster, region) (gpu_fault_processor_cluster_queue_depth_limit{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"} - gpu_fault_processor_cluster_queue_fault_reserved_depth{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "{{control_plane_cluster}} {{region}} fault reserve boundary",
+          "range": true,
+          "refId": "C"
         }
       ],
       "title": "Processor queue depth by cluster",
@@ -1201,11 +1409,11 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 6,
-        "x": 18,
-        "y": 36
+        "w": 8,
+        "x": 16,
+        "y": 44
       },
-      "id": 20,
+      "id": 22,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1239,9 +1447,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 44
+        "y": 52
       },
-      "id": 21,
+      "id": 23,
       "panels": [],
       "title": "Metric scan truncation",
       "type": "row"
@@ -1283,9 +1491,9 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 45
+        "y": 53
       },
-      "id": 22,
+      "id": 24,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1350,9 +1558,9 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 45
+        "y": 53
       },
-      "id": 23,
+      "id": 25,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1386,9 +1594,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 53
+        "y": 61
       },
-      "id": 24,
+      "id": 26,
       "panels": [],
       "title": "Admission and Store I/O",
       "type": "row"
@@ -1434,9 +1642,9 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 54
+        "y": 62
       },
-      "id": 25,
+      "id": 27,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1505,9 +1713,9 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 54
+        "y": 62
       },
-      "id": 26,
+      "id": 28,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1580,9 +1788,9 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 54
+        "y": 62
       },
-      "id": 27,
+      "id": 29,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1616,9 +1824,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 62
+        "y": 70
       },
-      "id": 28,
+      "id": 30,
       "panels": [],
       "title": "Latency, leases and counters",
       "type": "row"
@@ -1664,9 +1872,9 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 63
+        "y": 71
       },
-      "id": 29,
+      "id": 31,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1735,9 +1943,9 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 63
+        "y": 71
       },
-      "id": 30,
+      "id": 32,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1806,9 +2014,9 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 63
+        "y": 71
       },
-      "id": 31,
+      "id": 33,
       "links": [
         {
           "targetBlank": true,
@@ -1891,9 +2099,9 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 63
+        "y": 71
       },
-      "id": 32,
+      "id": 34,
       "links": [
         {
           "targetBlank": true,
@@ -1934,9 +2142,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 71
+        "y": 79
       },
-      "id": 33,
+      "id": 35,
       "panels": [],
       "title": "Telemetry spool",
       "type": "row"
@@ -1969,9 +2177,9 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 72
+        "y": 80
       },
-      "id": 34,
+      "id": 36,
       "options": {
         "colorMode": "none",
         "graphMode": "none",
@@ -2043,9 +2251,9 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 72
+        "y": 80
       },
-      "id": 35,
+      "id": 37,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2114,9 +2322,9 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 72
+        "y": 80
       },
-      "id": 36,
+      "id": 38,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2185,9 +2393,9 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 80
+        "y": 88
       },
-      "id": 37,
+      "id": 39,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2256,9 +2464,9 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 80
+        "y": 88
       },
-      "id": 38,
+      "id": 40,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2292,9 +2500,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 88
+        "y": 96
       },
-      "id": 39,
+      "id": 41,
       "panels": [],
       "title": "Loop liveness",
       "type": "row"
@@ -2340,9 +2548,9 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 89
+        "y": 97
       },
-      "id": 40,
+      "id": 42,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2411,9 +2619,9 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 89
+        "y": 97
       },
-      "id": 41,
+      "id": 43,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2478,9 +2686,9 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 89
+        "y": 97
       },
-      "id": 42,
+      "id": 44,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2545,9 +2753,9 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 97
+        "y": 105
       },
-      "id": 43,
+      "id": 45,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2612,9 +2820,9 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 97
+        "y": 105
       },
-      "id": 44,
+      "id": 46,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2659,9 +2867,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 105
+        "y": 113
       },
-      "id": 45,
+      "id": 47,
       "panels": [],
       "title": "Processor and periodic errors",
       "type": "row"
@@ -2707,9 +2915,9 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 106
+        "y": 114
       },
-      "id": 46,
+      "id": 48,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2789,9 +2997,9 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 106
+        "y": 114
       },
-      "id": 47,
+      "id": 49,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2860,9 +3068,9 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 106
+        "y": 114
       },
-      "id": 48,
+      "id": 50,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2938,9 +3146,9 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 106
+        "y": 114
       },
-      "id": 49,
+      "id": 51,
       "links": [
         {
           "targetBlank": true,

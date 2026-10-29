@@ -73,6 +73,14 @@ _ANY = (
     "gpu_fault_departed_node_cleanup_enabled",
     "gpu_fault_capacity_largest_cluster_node_count",
     "gpu_fault_capacity_managed_node_count",
+    # The processor queue caps and fault reserves admission enforces: every
+    # process holds the whole cap against the same Store-wide count, so they
+    # are not shares that add up the way the per-process flush limits do, and
+    # a SUM would report four caps for a Pod of four processes.
+    "gpu_fault_processor_queue_depth_limit",
+    "gpu_fault_processor_queue_fault_reserved_depth",
+    "gpu_fault_processor_cluster_queue_depth_limit",
+    "gpu_fault_processor_cluster_queue_fault_reserved_depth",
     "gpu_fault_processor_notification_shard_count",
     "gpu_fault_processor_queue_bypass_enabled",
     "gpu_fault_telemetry_spool_enabled",

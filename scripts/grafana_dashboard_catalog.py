@@ -34,6 +34,7 @@ from grafana_dashboard_review_panels import (
     METRIC_COVERAGE_PANEL,
     NOTIFICATION_FAILURE_PANEL,
     POOL_AND_CREDENTIAL_PANELS,
+    QUEUE_DEPTH_PANELS,
     REVIEW_COUNTER_PANELS,
 )
 
@@ -99,54 +100,6 @@ def _seconds_since(metric: str) -> str:
     processes remains meaningful when individual counter reset domains restart.
     """
     return f"time() - max {BY_CONTROL_PLANE} ({series(metric)})"
-
-
-def _queue_depth_panels() -> tuple[Panel, ...]:
-    return (
-        Panel(
-            "Processor queue depth",
-            (Target(f"max({series('gpu_fault_processor_queue_depth')})", "depth"),),
-            description="Incomplete processor requests across the region.",
-        ),
-        Panel(
-            "Oldest processor request age",
-            (
-                Target(
-                    f"max({series('gpu_fault_processor_queue_oldest_age_seconds')})",
-                    "oldest",
-                ),
-            ),
-            unit="s",
-        ),
-        Panel(
-            "Processor queue depth by cluster",
-            (
-                Target(
-                    "max by (cluster_id) "
-                    f"({cluster_series('gpu_fault_processor_cluster_queue_depth')})",
-                    "{{cluster_id}}",
-                ),
-            ),
-        ),
-        Panel(
-            "Oldest request age by cluster",
-            (
-                Target(
-                    "max by (cluster_id) ("
-                    + cluster_series(
-                        "gpu_fault_processor_cluster_queue_oldest_age_seconds"
-                    )
-                    + ")",
-                    "{{cluster_id}}",
-                ),
-            ),
-            unit="s",
-            description=(
-                "The claim window is FIFO across the region, so a storm in one "
-                "cluster delays every other cluster; this is who is paying."
-            ),
-        ),
-    )
 
 
 def _remediation_budget_panels() -> tuple[Panel, ...]:
@@ -275,7 +228,7 @@ OVERVIEW = Dashboard(
                 ),
             ),
         ),
-        Row("Processor queue", _queue_depth_panels()),
+        Row("Processor queue", QUEUE_DEPTH_PANELS),
         Row("Remediation budget", _remediation_budget_panels()),
         Row("Store I/O", (_store_io_panel(),)),
         Row(
@@ -538,7 +491,7 @@ CONTROL_PLANE_CAPACITY = Dashboard(
         ),
         Row("PostgreSQL pool and credentials", POOL_AND_CREDENTIAL_PANELS),
         Row("Control-loop review counters", REVIEW_COUNTER_PANELS),
-        Row("Processor queue", _queue_depth_panels()),
+        Row("Processor queue", QUEUE_DEPTH_PANELS),
         Row(
             "Metric scan truncation",
             (

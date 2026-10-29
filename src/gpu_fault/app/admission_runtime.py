@@ -15,7 +15,7 @@ from gpu_fault.app.admission import (
     _ProcessorAdmissionBatcher,
     _StripedAdmissionScope,
 )
-from gpu_fault.app.runtime import ProcessorDispatchState
+from gpu_fault.app.runtime import ProcessorDispatchState, ProcessorQueueLimits
 from gpu_fault.async_store import (
     AsyncStoreExecutor,
     RequestDeadlineExceeded,
@@ -199,6 +199,16 @@ class AdmissionRuntime:
     spool_batcher: _ProcessorAdmissionBatcher
     decode_json_body: object
     bounded_io_endpoint: object
+
+    def queue_limits(self) -> ProcessorQueueLimits:
+        """The caps the batchers and the dispatch path enforce, for /metrics."""
+
+        return ProcessorQueueLimits(
+            max_depth=self.max_queue_depth,
+            max_cluster_depth=self.max_cluster_queue_depth,
+            fault_reserved_depth=self.fault_reserved_depth,
+            fault_reserved_cluster_depth=self.fault_reserved_cluster_depth,
+        )
 
 
 class AdmissionRuntimeFactory:

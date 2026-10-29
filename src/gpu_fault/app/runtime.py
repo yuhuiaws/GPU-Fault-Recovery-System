@@ -69,6 +69,23 @@ class ProcessorDispatchState:
     telemetry_spool_coalesced: int = 0
 
 
+@dataclass(frozen=True)
+class ProcessorQueueLimits:
+    """The processor queue caps admission enforces, as /metrics exports them.
+
+    A depth at ``max_depth`` (region) or ``max_cluster_depth`` (one cluster)
+    refuses every request; a request outside the fault tier is refused from
+    ``max_depth - fault_reserved_depth`` and from
+    ``max_cluster_depth - fault_reserved_cluster_depth``. The depth alerts are
+    ratios of these, so they follow the configured caps, not the code defaults.
+    """
+
+    max_depth: int
+    max_cluster_depth: int
+    fault_reserved_depth: int
+    fault_reserved_cluster_depth: int
+
+
 @dataclass
 class AppRuntime:
     context: Any
@@ -107,3 +124,7 @@ class AppRuntime:
     # ``EventLoopLag.histogram``; optional so a runtime built without it (a
     # plugin test, an older assembly) still renders the summary fields.
     event_loop_lag_histogram: Callable[[], list[tuple[float, int]]] | None = None
+    # ``AdmissionRuntime.queue_limits()``; optional for the same reason. Without
+    # it the limit gauges are not rendered rather than invented, so the ratio
+    # alerts have no value instead of a wrong one.
+    processor_queue_limits: ProcessorQueueLimits | None = None
