@@ -813,7 +813,9 @@ def final_record(
     raw = witness.snapshot()
     executable = Path(start["executable_path"])
     refusal: str | None = None
+    refused_argv: str | None = None
     persistence: dict[str, int] = {}
+    observation: dict[str, int] = {}
     try:
         actions, calibration = reset_events(
             raw,
@@ -821,14 +823,16 @@ def final_record(
             gpu_uuid=scope.gpu_uuid,
             pci_bus_id=pci_bus_id,
             persistence=persistence,
+            observation=observation,
         )
     except BoundaryDenied as exc:
         actions, calibration, refusal = [], 0, str(exc)
+        refused_argv = getattr(exc, "argv_sha256", None)
     if (
         hashlib.sha256(executable.read_bytes()).hexdigest()
         != start["executable_sha256"]
     ):
-        refusal = "physical reset executable changed"
+        refusal, refused_argv = "physical reset executable changed", None
     stamp = clock.sample()
     witness.close()
     return {
@@ -849,9 +853,13 @@ def final_record(
         "actions": actions,
         # The quiesce's persistence reads and its target release, by count.
         "persistence_execs": persistence,
+        # The passive monitor's GPU sample reads, by count.
+        "observation_execs": observation,
         "wall_minus_monotonic_min_ns": clock.minimum,
         "wall_minus_monotonic_max_ns": clock.maximum,
         "refusal": refusal,
+        # An unknown invocation is named by its argv digest, never its argv.
+        "refusal_argv_sha256": refused_argv,
         "ledger_reset_rows": [
             row for row in reset_ledger_rows() if row["command_id"] not in baseline_ids
         ],
@@ -878,9 +886,11 @@ def failure_record(
         "calibration_execs": 0,
         "actions": [],
         "persistence_execs": {},
+        "observation_execs": {},
         "wall_minus_monotonic_min_ns": None,
         "wall_minus_monotonic_max_ns": None,
         "refusal": refusal,
+        "refusal_argv_sha256": None,
         "ledger_reset_rows": [],
     }
 

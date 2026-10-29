@@ -44,6 +44,18 @@ PERSISTENCE_QUERY_ARGS = (
 )
 #: The quiesce's target-scoped persistence release, ``-i <bus id> -pm 0``.
 PERSISTENCE_RELEASE_FLAGS = ("-pm", "0")
+#: The Node Agent's passive GPU sample (``gpu_sample`` of
+#: ``gpu_fault.node_agent.operations.hung_summary``): utilization and the
+#: compute clients, read once per 30-s epoch by the read-only observation
+#: worker of the passive communication monitor while a control-plane lease
+#: names a running managed job on the node. Read-only.
+OBSERVATION_QUERY_ARGS = (
+    (
+        "--query-gpu=uuid,utilization.gpu,utilization.memory",
+        "--format=csv,noheader,nounits",
+    ),
+    ("--query-compute-apps=pid,gpu_uuid", "--format=csv,noheader,nounits"),
+)
 
 
 class ClockEnvelope:
@@ -108,6 +120,36 @@ def quiesce_persistence_execs(
     return tuple(remaining), releases, queries
 
 
+def passive_observation_execs(
+    events: tuple[ExecEvent, ...], *, executable: Path
+) -> tuple[tuple[ExecEvent, ...], list[ExecEvent]]:
+    """Split the Agent's passive GPU samples off its exec trace.
+
+    The Node Agent's passive communication monitor samples a running managed
+    job -- this case's own PyTorchJob before the injection and again after
+    RESTART_WORKLOAD -- and each sample reads ``OBSERVATION_QUERY_ARGS`` (live,
+    GF-REGIONAL-DESTR-015 on HyperPod and plain EKS once the monitor shipped:
+    both nodes of each cluster refused the witness as an unknown NVIDIA
+    invocation). Only those exact spellings of the pinned executable are taken
+    out; another field list, format or any extra argument stays in the trace
+    and ``physical_actions`` refuses it. The Agent's GPU-activity gate keeps a
+    sample out of an open quiesce window, so ``reset_events`` refuses one that
+    overlaps a reset.
+    """
+
+    remaining: list[ExecEvent] = []
+    samples: list[ExecEvent] = []
+    for event in events:
+        if (
+            event.executable == str(executable)
+            and event.argv[1:] in OBSERVATION_QUERY_ARGS
+        ):
+            samples.append(event)
+        else:
+            remaining.append(event)
+    return tuple(remaining), samples
+
+
 def reset_events(
     raw: bytes,
     *,
@@ -115,19 +157,24 @@ def reset_events(
     gpu_uuid: str,
     pci_bus_id: str | None = None,
     persistence: dict[str, int] | None = None,
+    observation: dict[str, int] | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """The reset invocations of the trace and its completed calibrations.
 
     ``pci_bus_id`` is the target's bus id, for the quiesce's persistence release
     (``quiesce_persistence_execs``); ``persistence`` receives how many of the
-    quiesce's persistence queries and releases the trace held.
+    quiesce's persistence queries and releases the trace held, ``observation``
+    how many passive GPU sample queries (``passive_observation_execs``).
     """
 
     events, releases, queries = quiesce_persistence_execs(
         parse_exec_trace(raw), executable=executable, pci_bus_id=pci_bus_id
     )
+    events, samples = passive_observation_execs(events, executable=executable)
     if persistence is not None:
         persistence.update(queries=queries, releases=len(releases))
+    if observation is not None:
+        observation.update(queries=len(samples))
     physical_actions(
         events,
         nvidia_smi=executable,
@@ -165,6 +212,12 @@ def reset_events(
         # The release belongs to the quiesce that precedes the reset; one that
         # overlaps or follows it is not that quiesce's.
         raise BoundaryDenied("persistence release is outside the quiesce before reset")
+    if any(
+        sample.started_ns < reset["ended_ns"] and reset["started_ns"] < sample.ended_ns
+        for sample in samples
+        for reset in resets
+    ):
+        raise BoundaryDenied("passive GPU sample overlapped a physical reset")
     return resets, len(calibration_ends)
 
 

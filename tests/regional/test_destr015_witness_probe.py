@@ -29,8 +29,12 @@ from scripts.e2e.regional.destr015_physical_evidence import (
     evidence_digest,
 )
 from scripts.e2e.regional.late_ownership_barrier import BoundaryDenied
+from scripts.e2e.regional.late_ownership_trace import argv_digest
 from scripts.e2e.regional.probes import destr015_witness_probe as probe
-from scripts.e2e.regional.probes.destr015_physical_probe import QUERY_ARGS
+from scripts.e2e.regional.probes.destr015_physical_probe import (
+    OBSERVATION_QUERY_ARGS,
+    QUERY_ARGS,
+)
 from tests.regional.test_acceptance_physical_interval_alignment import (
     interval_fixture,
     trace_process,
@@ -799,6 +803,8 @@ def test_run_witness_records_armed_then_final_on_a_finish_request(
     assert final["trace_complete"] is True and final["closed"] is True
     assert final["lost_events"] == 0 and final["trace_bytes"] == len(FakeTracer.raw)
     assert final["calibration_execs"] == 1 and len(final["actions"]) == 1
+    assert final["observation_execs"] == {"queries": 0}
+    assert final["refusal_argv_sha256"] is None
     action = final["actions"][0]
     assert action["gpu_uuid"] == GPU and action["operation"] == "RESET_GPU"
     assert "argv" not in action, "raw argv never enters a record"
@@ -811,10 +817,13 @@ def test_run_witness_records_armed_then_final_on_a_finish_request(
         assert (unit.directory / name).stat().st_mode & 0o777 == 0o600, name
 
 
-def _quiesce_window_trace(executable: str, gpu_uuid: str, bus: str) -> bytes:
+def _quiesce_window_trace(
+    executable: str, gpu_uuid: str, bus: str, *, samples: bool = False
+) -> bytes:
     """The Agent's nvidia-smi spawns of one live DESTR-015 node, in order: the
     quiesce's persistence reads around the target's release, the verification,
-    the busy reset and its retry, and the restore's read-back."""
+    the busy reset and its retry, and the restore's read-back -- with
+    ``samples``, between a passive GPU sample before and one after them."""
 
     query = (
         "nvidia-smi",
@@ -832,6 +841,9 @@ def _quiesce_window_trace(executable: str, gpu_uuid: str, bus: str) -> bytes:
         (reset, 0),
         (query, 0),
     ]
+    if samples:
+        sample = [(("nvidia-smi", *args), 0) for args in OBSERVATION_QUERY_ARGS]
+        steps = [*sample, *steps, *sample]
     return b"".join(
         trace_process(
             200 + index, 2 * index + 1, 2 * index + 2, argv, code, executable=executable
@@ -856,6 +868,24 @@ def test_run_witness_classifies_the_quiesce_persistence_calls(
     assert final["persistence_execs"] == {"queries": 3, "releases": 1}
 
 
+def test_run_witness_classifies_the_passive_gpu_samples(unit: SimpleNamespace) -> None:
+    """Live (GF-REGIONAL-DESTR-015 round 13, HyperPod and plain EKS): every
+    witness refused "unknown NVIDIA invocation cannot prove no action" on the
+    Agent's passive communication monitor reading the case's own job's GPUs
+    before the injection and after the restart."""
+
+    FakeTracer.raw = _quiesce_window_trace(
+        str(unit.host.executable), GPU, BUS, samples=True
+    )
+    (unit.directory / "finish.request").write_text("{}", encoding="utf-8")
+    assert probe.run_witness(RUN_ID, state_root=unit.root) == 0
+    final = json.loads((unit.directory / "final.json").read_text())
+    assert final["refusal"] is None, final["refusal"]
+    assert [item["returncode"] for item in final["actions"]] == [255, 0]
+    assert final["persistence_execs"] == {"queries": 3, "releases": 1}
+    assert final["observation_execs"] == {"queries": 4}
+
+
 def test_run_witness_without_the_target_bus_id_refuses_the_release(
     unit: SimpleNamespace,
 ) -> None:
@@ -868,6 +898,11 @@ def test_run_witness_without_the_target_bus_id_refuses_the_release(
     final = json.loads((unit.directory / "final.json").read_text())
     assert final["refusal"] == "unknown NVIDIA invocation cannot prove no action"
     assert final["actions"] == []
+    # The refused invocation is named by its argv digest, never its argv.
+    assert final["refusal_argv_sha256"] == argv_digest(
+        ("nvidia-smi", "-i", BUS, "-pm", "0")
+    )
+    assert BUS not in json.dumps(final)
 
 
 def test_run_witness_stops_itself_at_its_deadline(unit: SimpleNamespace) -> None:
@@ -903,6 +938,7 @@ def test_run_witness_records_a_failure_and_never_a_proof(
     assert final["record"] == "final" and final["reason"] == "failure"
     assert final["refusal"] == expected
     assert final["trace_complete"] is False and final["actions"] == []
+    assert final["observation_execs"] == {} and final["refusal_argv_sha256"] is None
     assert (unit.directory / "armed.json").exists() is armed_written
     if defect in {"start", "check"}:
         assert FakeTracer.calls[-1] == "close", "a failed unit still detaches"

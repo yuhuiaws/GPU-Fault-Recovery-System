@@ -63,6 +63,26 @@ _DETACHED = " <detached ...>"
 # The process died inside the syscall; strace closes the line with ``= ?``.
 _DIED_IN_SYSCALL = " <unfinished ...>) = ?"
 TRACER_CHILD = Path(__file__).with_name("probes") / "late_ownership_tracer_child.py"
+UNKNOWN_INVOCATION = "unknown NVIDIA invocation cannot prove no action"
+
+
+def argv_digest(argv: tuple[str, ...]) -> str:
+    """The SHA-256 of an exec's argv JSON, the only argv identity a record keeps."""
+    return hashlib.sha256(json.dumps(argv).encode("ascii")).hexdigest()
+
+
+class UnknownInvocation(BoundaryDenied):
+    """An exec of the pinned executable that no rule here can read.
+
+    It names the invocation by ``argv_digest`` alone -- the digest a
+    ``PhysicalAction`` carries -- so a witness can record what it refused and a
+    reader can test a suspected spelling against it, while no record ever holds
+    raw argv.
+    """
+
+    def __init__(self, argv_sha256: str) -> None:
+        super().__init__(UNKNOWN_INVOCATION)
+        self.argv_sha256 = argv_sha256
 
 
 @dataclass(frozen=True)
@@ -215,13 +235,11 @@ def physical_actions(
         elif len(args) == 3 and args[:2] == ("--gpu-reset", "-i") and args[2]:
             operation = "RESET_GPU"
         else:
-            raise BoundaryDenied("unknown NVIDIA invocation cannot prove no action")
+            raise UnknownInvocation(argv_digest(event.argv))
         actions.append(
             PhysicalAction(
                 operation=operation,
-                argv_sha256=hashlib.sha256(
-                    json.dumps(event.argv).encode("ascii")
-                ).hexdigest(),
+                argv_sha256=argv_digest(event.argv),
                 pid=event.pid,
                 started_ns=event.started_ns,
                 ended_ns=event.ended_ns,

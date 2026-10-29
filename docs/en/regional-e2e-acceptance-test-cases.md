@@ -11751,10 +11751,20 @@ when `env | grep` finds nothing, that must not be judged FAIL outright.
      after the release and the restore's read-back) and `-i <bus id> -pm 0`, the latter only for the
      target GPU's bus id the witness reads on the host when it is armed (`target_pci_bus_id` in its
      state) and only when it ends before the first reset starts; the final record counts them in
-     `persistence_execs`. A `-pm 0` of another GPU or of the whole node, a `-pm 1`, extra arguments or
-     any other spelling stays "unknown NVIDIA invocation cannot prove no action" (plain EKS attempt 2
-     refused both nodes on those quiesce calls; judged by
-     `tests/regional/test_destr015_quiesce_persistence_witness.py`).
+     `persistence_execs`. It also knows the GPU sample of the Agent's passive communication monitor,
+     which reads a running managed job's GPUs once per 30-s epoch -- here the case's own job before the
+     injection and again after the restart, both inside the trace: the read-only
+     `--query-gpu=uuid,utilization.gpu,utilization.memory` and `--query-compute-apps=pid,gpu_uuid`,
+     each with exactly `--format=csv,noheader,nounits`, counted in `observation_execs`; a sample
+     whose process interval overlaps a reset is refused ("passive GPU sample overlapped a physical
+     reset"), since the Agent's GPU-activity gate keeps samples out of an open quiesce window.
+     A `-pm 0` of another GPU or of the whole node, a `-pm 1`, extra arguments or any other spelling
+     stays "unknown NVIDIA invocation cannot prove no action", and the final record names that
+     invocation only by the SHA-256 of its argv JSON (`refusal_argv_sha256`), never by its argv
+     (plain EKS attempt 2 refused both nodes on those quiesce calls, and later both clusters refused
+     both nodes on the passive samples; judged by
+     `tests/regional/test_destr015_quiesce_persistence_witness.py` and
+     `tests/regional/test_destr015_passive_observation_witness.py`).
 - Steps:
   1. Record the full baseline of both nodes: Kubernetes UID, `boot_id`, labels/taints/
      `unschedulable`, Node Agent ledger row count, quiesce state, gpu-fault timers, list of active
