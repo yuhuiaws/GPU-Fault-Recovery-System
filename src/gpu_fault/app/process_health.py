@@ -66,10 +66,15 @@ class GcTimer:
     that builds many apps does not stack callbacks. The callback runs in the
     thread that triggered the collection, under the GIL, so the bookkeeping
     needs no lock beyond the one that guards the snapshot.
+
+    That lock is re-entrant. A collection can start between any two bytecodes,
+    ``snapshot``'s own while it holds the lock included, and its "stop"
+    callback then takes the lock on the same thread: with a plain ``Lock`` it
+    waited for itself forever, and the /metrics render with it.
     """
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._started = 0.0
         self.collections = [0, 0, 0]
         self.seconds = [0.0, 0.0, 0.0]

@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import gc
 import socket
+import subprocess
+import sys
 
 import pytest
 
@@ -36,6 +38,41 @@ def test_the_gc_timer_counts_and_times_collections_once_installed() -> None:
     finally:
         timer.uninstall()
     assert not timer.installed, "uninstall removes the callback"
+
+
+def test_a_collection_inside_the_snapshot_does_not_wait_for_itself() -> None:
+    """The collection's callback runs on the thread that holds the lock.
+
+    A collection can start between any two bytecodes, inside ``snapshot``
+    while it holds the lock too, and its "stop" callback then takes the same
+    lock on the same thread. With a plain ``Lock`` that waited for itself
+    forever, and the /metrics render with it: a focused run hung in
+    ``render_process_health_metrics``. The child collects on every
+    allocation, so a regression times out there instead of hanging here.
+    """
+
+    script = (
+        "import gc\n"
+        "from gpu_fault.app.process_health import GcTimer\n"
+        "timer = GcTimer()\n"
+        "timer.install()\n"
+        "gc.set_threshold(1)\n"
+        "for _ in range(200):\n"
+        "    timer.snapshot()\n"
+        "gc.set_threshold(700)\n"
+        "print(sum(timer.snapshot()['collections']))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert int(completed.stdout) > 0, "collections ran inside the snapshots"
 
 
 def test_the_module_timer_is_one_per_process() -> None:
