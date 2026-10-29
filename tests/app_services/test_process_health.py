@@ -10,14 +10,21 @@ CPython's default because raising it lengthened every pause.
 from __future__ import annotations
 
 import gc
+import os
 import socket
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
 from gpu_fault.app import process_health
 from gpu_fault.app.process_health import GcPolicy, GcTimer
+
+# The child below must import the package under test, not whatever ``gpu_fault``
+# its interpreter carries: the release gate runs this suite with the deployer
+# venv, whose ``gpu_fault`` is the deploy-host distribution without ``app``.
+SOURCE_ROOT = Path(process_health.__file__).resolve().parents[2]
 
 
 def test_the_gc_timer_counts_and_times_collections_once_installed() -> None:
@@ -63,12 +70,19 @@ def test_a_collection_inside_the_snapshot_does_not_wait_for_itself() -> None:
         "print(sum(timer.snapshot()['collections']))\n"
     )
 
+    inherited = os.environ.get("PYTHONPATH")
     completed = subprocess.run(
         [sys.executable, "-c", script],
         capture_output=True,
         text=True,
         timeout=30,
         check=False,
+        env={
+            **os.environ,
+            "PYTHONPATH": os.pathsep.join(
+                [str(SOURCE_ROOT)] + ([inherited] if inherited else [])
+            ),
+        },
     )
 
     assert completed.returncode == 0, completed.stderr
