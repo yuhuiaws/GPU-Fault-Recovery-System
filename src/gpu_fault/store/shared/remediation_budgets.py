@@ -226,6 +226,34 @@ def budget_full_reason(scope: str, active: int, limit: int) -> str:
     )
 
 
+def leased_claim(
+    workflow: WorkflowRequest,
+    executor_id: str,
+    *,
+    claimed_at: datetime,
+    lease_duration: timedelta,
+    lease_active: bool,
+    budgeted: bool,
+) -> WorkflowRequest:
+    """The claimed row every store writes: this executor's lease, a new epoch
+    unless it renews its own live lease, and RUNNING once a budget claim
+    (``budgeted``) was admitted."""
+
+    new_epoch = workflow.execution_owner_id != executor_id or not lease_active
+    return workflow.model_copy(
+        update={
+            "execution_owner_id": executor_id,
+            "execution_epoch": (
+                workflow.execution_epoch + 1
+                if new_epoch
+                else max(workflow.execution_epoch, 1)
+            ),
+            "execution_lease_expires_at": claimed_at + lease_duration,
+            **({"status": WorkflowStatus.RUNNING} if budgeted else {}),
+        }
+    )
+
+
 def apply_remediation_budget(
     workflow: WorkflowRequest,
     active_workflows: Iterable[WorkflowRequest],

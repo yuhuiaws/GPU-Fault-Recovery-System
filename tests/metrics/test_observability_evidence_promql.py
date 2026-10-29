@@ -650,3 +650,99 @@ def test_the_budget_long_wait_alert_reads_node_job_and_domain_waits_past_an_hour
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+STORM_ALERT = "GpuFaultRemediationStormBreakerOpen"
+STORM_OPEN = "gpu_fault_remediation_budget_storm_breaker_open"
+
+
+@pytest.mark.parametrize(
+    ("inputs", "eval_time", "cluster"),
+    [
+        pytest.param(
+            [series(STORM_OPEN, "0x3 1+0x20", cluster_id="gpu-a")],
+            "10m",
+            "gpu-a",
+            id="an-open-breaker-pages-after-a-minute",
+        ),
+        pytest.param(
+            [series(STORM_OPEN, "0+0x20", cluster_id="gpu-a")],
+            "10m",
+            None,
+            id="a-closed-breaker-is-quiet",
+        ),
+        pytest.param(
+            [
+                series(STORM_OPEN, "1+0x20", cluster_id="gpu-a"),
+                series(STORM_OPEN, "0+0x20", cluster_id="gpu-b"),
+            ],
+            "10m",
+            "gpu-a",
+            id="only-the-open-cluster-fires",
+        ),
+    ],
+)
+def test_the_storm_breaker_alert_pages_per_cluster(
+    tmp_path: Path, inputs, eval_time: str, cluster: str | None
+) -> None:
+    """Critical: nothing resumes without an operator."""
+
+    promtool = shutil.which(os.environ.get("PROMTOOL", "promtool"))
+    assert promtool is not None, "set PROMTOOL to the pinned local promtool"
+    rule = rule_map("deploy/observability/amp-rules.yaml")[STORM_ALERT]
+    assert rule["labels"] == {"severity": "critical"}
+    rule_file = tmp_path / "rules.yaml"
+    rule_file.write_text(
+        yaml.safe_dump({"groups": [{"name": "storm", "rules": [rule]}]})
+    )
+    annotations = {
+        key: str(text).replace("{{ $labels.cluster_id }}", str(cluster))
+        for key, text in rule["annotations"].items()
+    }
+    expected = (
+        []
+        if cluster is None
+        else [
+            {
+                "exp_labels": {
+                    "control_plane_cluster": BASE["control_plane_cluster"],
+                    "region": BASE["region"],
+                    "cluster_id": cluster,
+                    "severity": "critical",
+                },
+                "exp_annotations": annotations,
+            }
+        ]
+    )
+    test_file = tmp_path / "cases.yaml"
+    test_file.write_text(
+        yaml.safe_dump(
+            {
+                "rule_files": [str(rule_file)],
+                "evaluation_interval": "1m",
+                "tests": [
+                    {
+                        "interval": "1m",
+                        "input_series": inputs,
+                        "alert_rule_test": [
+                            {
+                                "alertname": STORM_ALERT,
+                                "eval_time": eval_time,
+                                "exp_alerts": expected,
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+    )
+
+    result = subprocess.run(
+        [promtool, "test", "rules", str(test_file)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr

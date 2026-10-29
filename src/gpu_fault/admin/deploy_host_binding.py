@@ -151,7 +151,7 @@ def is_readonly_command(
                 arguments, "release", False
             )
         return action is None and getattr(arguments, "dry_run", False) is True
-    if command == "workflow-reconcile":
+    if command in {"workflow-reconcile", "remediation-storm"}:
         return getattr(arguments, "dry_run", False) is True
     if command == "submit-remediation":
         return getattr(arguments, "plan", False) is True

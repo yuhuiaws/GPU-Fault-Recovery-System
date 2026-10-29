@@ -826,6 +826,10 @@ class WorkflowEventCode(StrEnum):
     # A remediation budget refusal began a wait: one per wait, at its start
     # (``store.shared.remediation_budgets.blocked_by_remediation_budget``).
     REMEDIATION_BUDGET_WAIT = "REMEDIATION_BUDGET_WAIT"
+    # The cluster's remediation storm breaker (``gpu_fault.remediation_storm``):
+    # tripped by this claim; released or aborted by an operator.
+    REMEDIATION_STORM_TRIPPED = "REMEDIATION_STORM_TRIPPED"
+    REMEDIATION_STORM_ABORTED = "REMEDIATION_STORM_ABORTED"
     # Placement hold (orchestrator opens, dispatcher dissolves)
     PLACEMENT_HOLD_OPENED = "PLACEMENT_HOLD_OPENED"
     PLACEMENT_HOLD_DISSOLVED = "PLACEMENT_HOLD_DISSOLVED"

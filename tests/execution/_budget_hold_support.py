@@ -13,7 +13,9 @@ from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Any, Iterable, Sequence
 
-from gpu_fault.execution import WorkflowStepOutcome
+import pytest
+
+from gpu_fault.execution import WorkflowStepOutcome, storm_admission
 from gpu_fault.execution.config import WorkflowDispatcherConfig
 from gpu_fault.execution.dispatcher import WorkflowDispatcher
 from gpu_fault.execution.node_action_confirmation import confirmed_execution
@@ -233,3 +235,14 @@ def holders_by_cluster(workflows: Iterable[WorkflowRequest]) -> Counter[str]:
 
 def all_workflows(store: Any) -> list[WorkflowRequest]:
     return list(store.list_workflows(None, limit=100_000))
+
+
+@pytest.fixture
+def large_fleet(monkeypatch: pytest.MonkeyPatch) -> None:
+    """For the cases that load one cluster's fixed budget limits, not its storm
+    breaker: a fleet of 1000 GPU nodes puts the breaker's threshold (200 nodes
+    in 600 s) out of their reach."""
+
+    monkeypatch.setattr(
+        storm_admission, "cluster_gpu_nodes", lambda _store, _cluster: 1000
+    )

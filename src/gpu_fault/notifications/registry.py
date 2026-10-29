@@ -38,6 +38,7 @@ from gpu_fault.notifications.nvlink74_mechanical import (
 from gpu_fault.notifications.nvlink74_support import (
     Nvlink74SupportEmailBuilder,
 )
+from gpu_fault.notifications.remediation_storm import RemediationStormEmailBuilder
 from gpu_fault.notifications.restart_guard import RestartGuardEmailBuilder
 from gpu_fault.notifications.sxid_event import SxidEventEmailBuilder
 from gpu_fault.notifications.warm_spare import (
@@ -71,6 +72,7 @@ class NotificationKind(StrEnum):
     NVLINK74_SUPPORT = "NVLINK74_SUPPORT"
     NVLINK74_MECHANICAL = "NVLINK74_MECHANICAL"
     WARM_SPARE_REPLACEMENT = "WARM_SPARE_REPLACEMENT"
+    REMEDIATION_STORM_TRIPPED = "REMEDIATION_STORM_TRIPPED"
 
 
 @dataclass(frozen=True)
@@ -146,6 +148,9 @@ NOTIFICATION_REGISTRY = {
     ),
     NotificationKind.WARM_SPARE_REPLACEMENT: NotificationDefinition(
         WarmSpareReplacementEmailBuilder
+    ),
+    NotificationKind.REMEDIATION_STORM_TRIPPED: NotificationDefinition(
+        RemediationStormEmailBuilder
     ),
 }
 

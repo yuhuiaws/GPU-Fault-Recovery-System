@@ -35,6 +35,8 @@ from grafana_dashboard_review_panels import (
     NOTIFICATION_FAILURE_PANEL,
     POOL_AND_CREDENTIAL_PANELS,
     QUEUE_DEPTH_PANELS,
+    REMEDIATION_LONGEST_WAIT_PANEL,
+    REMEDIATION_STORM_PANEL,
     REVIEW_COUNTER_PANELS,
 )
 
@@ -1243,25 +1245,8 @@ RECOVERY_OUTCOME = Dashboard(
                         "claims sit at the configured limit."
                     ),
                 ),
-                Panel(
-                    "Longest remediation budget wait",
-                    (
-                        Target(
-                            "max by (scope_type) ("
-                            + series(
-                                "gpu_fault_remediation_budget_longest_wait_seconds"
-                            )
-                            + ")",
-                            "{{scope_type}}",
-                        ),
-                    ),
-                    unit="s",
-                    description=(
-                        "How long the oldest current wait has lasted, by the type "
-                        "of the scope that last refused it, from the refusal that "
-                        "began the wait."
-                    ),
-                ),
+                REMEDIATION_STORM_PANEL,
+                REMEDIATION_LONGEST_WAIT_PANEL,
                 Panel(
                     "Budget scopes above their limit",
                     (

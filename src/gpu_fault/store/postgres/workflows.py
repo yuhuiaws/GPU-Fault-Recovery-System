@@ -12,6 +12,7 @@ from gpu_fault.models import (
     WorkflowStatus,
     datetime_json_text,
 )
+from gpu_fault.remediation_storm import StormCandidate
 from gpu_fault.store.contracts import ACTIVE_WORKFLOW_INCIDENTS_LIMIT
 from gpu_fault.store.postgres.core import take_advisory_xact_locks
 from gpu_fault.store.postgres.remediation_budget_holders import (
@@ -32,8 +33,12 @@ from gpu_fault.store.shared.errors import (
 )
 from gpu_fault.store.shared.remediation_budgets import (
     admit_against_occupancy,
-    blocked_by_remediation_budget,
     extend_against_occupancy,
+    leased_claim,
+)
+from gpu_fault.store.shared.remediation_storm_records import (
+    refused_claim,
+    storm_lock_key,
 )
 from gpu_fault.store.shared.time import utc_text as _utc_text
 from gpu_fault.store.shared.transactional_workflows import (
@@ -52,6 +57,7 @@ class PostgresWorkflowMixin:
     _db: Any
     _decode: Callable[..., Any]
     _get_for_update: Callable[..., Any]
+    _judge_storm: Callable[[StormCandidate, datetime], None]
     _link: Callable[..., Any]
     _put: Callable[..., Any]
 
@@ -624,18 +630,22 @@ class PostgresWorkflowMixin:
         lease_duration: timedelta = timedelta(minutes=3),
         remediation_budget_claims: dict[str, int] | None = None,
         remediation_budget_hold: bool = False,
+        remediation_storm: StormCandidate | None = None,
     ) -> WorkflowRequest:
         budget_error: RemediationBudgetError | None = None
         scopes = sorted(remediation_budget_claims or {})
+        storm = None if remediation_budget_hold else remediation_storm
         with self._db.transaction():
             if scopes:
                 # Lock order rule (F-B2): advisory locks first, sorted, then
                 # row locks. The merge paths take a group advisory lock and
                 # then the workflow row; taking the row first here made the
-                # two families a deadlock pair.
+                # two families a deadlock pair. The breaker's lock sorts last.
                 with self._db.cursor() as cursor:
                     take_advisory_xact_locks(
-                        cursor, (f"remediation_budget/{scope}" for scope in scopes)
+                        cursor,
+                        [f"remediation_budget/{scope}" for scope in scopes]
+                        + ([storm_lock_key(storm.cluster_id)] if storm else []),
                     )
             workflow = self._get_for_update("workflow", request_id)
             if workflow.fencing_token != fencing_token:
@@ -660,6 +670,7 @@ class PostgresWorkflowMixin:
                         occupancy = claim_occupancy(
                             cursor, request_id, scopes, self._decode
                         )
+                before = workflow
                 try:
                     workflow = admit_against_occupancy(
                         workflow,
@@ -667,36 +678,23 @@ class PostgresWorkflowMixin:
                         remediation_budget_claims,
                         hold=remediation_budget_hold,
                     )
+                    if storm is not None and scopes:
+                        self._judge_storm(storm, claimed_at)
                 except RemediationBudgetError as exc:
                     # The refusing scope is recorded too, so the per-cluster
                     # saturation gauge never has to parse the message (S1).
-                    workflow = blocked_by_remediation_budget(
-                        workflow, str(exc), scope=exc.scope, now=claimed_at
-                    )
+                    workflow = refused_claim(before, exc, now=claimed_at)
                     budget_error = exc
-            if budget_error is not None:
-                self._put("workflow", request_id, workflow)
-            else:
-                new_epoch = (
-                    workflow.execution_owner_id != executor_id or not lease_active
+            if budget_error is None:
+                workflow = leased_claim(
+                    workflow,
+                    executor_id,
+                    claimed_at=claimed_at,
+                    lease_duration=lease_duration,
+                    lease_active=lease_active,
+                    budgeted=remediation_budget_claims is not None,
                 )
-                workflow = workflow.model_copy(
-                    update={
-                        "execution_owner_id": executor_id,
-                        "execution_epoch": (
-                            workflow.execution_epoch + 1
-                            if new_epoch
-                            else max(workflow.execution_epoch, 1)
-                        ),
-                        "execution_lease_expires_at": (claimed_at + lease_duration),
-                        **(
-                            {"status": WorkflowStatus.RUNNING}
-                            if remediation_budget_claims is not None
-                            else {}
-                        ),
-                    }
-                )
-                self._put("workflow", request_id, workflow)
+            self._put("workflow", request_id, workflow)
         if budget_error is not None:
             raise budget_error
         return workflow

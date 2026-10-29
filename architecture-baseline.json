@@ -15,7 +15,7 @@
     "src/gpu_fault/processor/coordinator.py:ProcessorCoordinator": 1701,
     "src/gpu_fault/store/memory/workflows.py:MemoryWorkflowMixin": 911,
     "src/gpu_fault/store/postgres/control_records.py:PostgresControlRecordMixin": 987,
-    "src/gpu_fault/store/postgres/workflows.py:PostgresWorkflowMixin": 830
+    "src/gpu_fault/store/postgres/workflows.py:PostgresWorkflowMixin": 823
   },
   "cycles": [
     [

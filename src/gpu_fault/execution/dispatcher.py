@@ -1267,14 +1267,14 @@ class WorkflowDispatcher:
 
     def sweep_stuck_records(self, now: datetime) -> set[str]:
         """Close what nothing else will by Store predicate (abandoned/retired
-        generations, compile-time BLOCKED no-ops, receipt-settled records, orphaned
-        commands), free lapsed parked holds; return retired generations withheld."""
-
+        generations, compile BLOCKED no-ops, receipt-settled rows, orphaned commands),
+        free parked holds, send storm trip notices; return the withheld generations."""
         self._supersede_abandoned_generations(now)
         retired = self._revoke_retired_generations(now)
         close_compile_blocked_workflows(self.store, now=now)
         resume_receipt_settled_workflows(self.store, now=now)
         budget_guard.release_lapsed_parked_holds(self.store, self.budget_watch, now=now)
+        budget_guard.notify_storm_trips(self.store, self.executor, now=now)
         cancel_orphaned_commands(self.store, now=now)
         return retired
 

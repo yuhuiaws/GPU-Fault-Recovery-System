@@ -32,10 +32,12 @@ from gpu_fault.store.shared.record_guards import (
 )
 from gpu_fault.store.shared.remediation_budgets import (
     apply_remediation_budget,
-    blocked_by_remediation_budget,
     budget_occupancy,
     extend_remediation_budget,
+    leased_claim,
 )
+from gpu_fault.store.memory.remediation_storm import admit_storm_in
+from gpu_fault.store.shared.remediation_storm_records import refused_claim
 from gpu_fault.store.shared.transactional_workflows import (
     incident_pointer_moved,
     lease_extension_due,
@@ -55,6 +57,7 @@ from gpu_fault.workflow_resolution import (
 
 if TYPE_CHECKING:
     from gpu_fault.regional import RemoteActionCommand
+    from gpu_fault.remediation_storm import RemediationStormBreaker, StormCandidate
 
 LOGGER = logging.getLogger(__name__)
 
@@ -78,6 +81,7 @@ class MemoryWorkflowMixin:
     _incident_by_event: Any
     _incidents: Any
     _plans: dict[str, RecoveryPlan]
+    _remediation_storm_breakers: dict[str, RemediationStormBreaker]
     _workflows: Any
 
     get_plan: Callable[[str], RecoveryPlan]
@@ -832,6 +836,7 @@ class MemoryWorkflowMixin:
         lease_duration: timedelta = timedelta(minutes=3),
         remediation_budget_claims: dict[str, int] | None = None,
         remediation_budget_hold: bool = False,
+        remediation_storm: StormCandidate | None = None,
     ) -> WorkflowRequest:
         with self._lock:
             workflow = self.get_workflow(request_id)
@@ -849,6 +854,7 @@ class MemoryWorkflowMixin:
             ):
                 raise WorkflowLeaseError("workflow is leased by another executor")
             if remediation_budget_claims is not None:
+                before = workflow
                 try:
                     workflow = apply_remediation_budget(
                         workflow,
@@ -856,27 +862,24 @@ class MemoryWorkflowMixin:
                         remediation_budget_claims,
                         hold=remediation_budget_hold,
                     )
+                    if remediation_storm is not None and not remediation_budget_hold:
+                        admit_storm_in(
+                            self._remediation_storm_breakers,
+                            remediation_storm,
+                            claimed_at,
+                        )
                 except RemediationBudgetError as exc:
-                    self._workflows[request_id] = blocked_by_remediation_budget(
-                        workflow, str(exc), scope=exc.scope, now=claimed_at
+                    self._workflows[request_id] = refused_claim(
+                        before, exc, now=claimed_at
                     )
                     raise
-            new_epoch = workflow.execution_owner_id != executor_id or not lease_active
-            workflow = workflow.model_copy(
-                update={
-                    "execution_owner_id": executor_id,
-                    "execution_epoch": (
-                        workflow.execution_epoch + 1
-                        if new_epoch
-                        else max(workflow.execution_epoch, 1)
-                    ),
-                    "execution_lease_expires_at": (claimed_at + lease_duration),
-                    **(
-                        {"status": WorkflowStatus.RUNNING}
-                        if remediation_budget_claims is not None
-                        else {}
-                    ),
-                }
+            workflow = leased_claim(
+                workflow,
+                executor_id,
+                claimed_at=claimed_at,
+                lease_duration=lease_duration,
+                lease_active=lease_active,
+                budgeted=remediation_budget_claims is not None,
             )
             self._workflows[request_id] = workflow
             return workflow

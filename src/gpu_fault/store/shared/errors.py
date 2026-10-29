@@ -43,6 +43,19 @@ class RemediationBudgetError(WorkflowLeaseError):
         self.scope = scope
 
 
+class RemediationStormHold(RemediationBudgetError):
+    """A first admission the cluster's remediation storm breaker holds.
+
+    ``record`` is the breaker as the claim wrote it; ``tripped`` says this
+    admission is the one that tripped it (``gpu_fault.remediation_storm``).
+    """
+
+    def __init__(self, message: str, *, scope: str, record: object, tripped: bool):
+        super().__init__(message, scope=scope)
+        self.record = record
+        self.tripped = tripped
+
+
 class TransactionRequiredError(RuntimeError):
     """A row-locking read was attempted outside a transaction (F-J4).
 

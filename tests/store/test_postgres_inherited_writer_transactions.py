@@ -86,6 +86,9 @@ REVIEWED_INHERITED_WRITERS = frozenset(
         "publish_regional_registry_revision",
         "reconcile_restored_workflow",
         "reconcile_retired_generation_workflow",
+        # Two round-trips (_get_optional + _put) under _state_transaction on the
+        # breaker's lock key, which a claim's admission also takes.
+        "replace_remediation_storm_breaker",
         # Two round-trips (_get_optional + _put), both under _state_transaction:
         # two executors reporting at once must not lose each other's absences.
         "record_kubernetes_node_inventory",

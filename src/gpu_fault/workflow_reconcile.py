@@ -18,12 +18,19 @@ from gpu_fault.models import (
     FaultIncident,
     IncidentState,
     RecoveryPlan,
+    WorkflowEventCode,
     WorkflowEventKind,
     WorkflowRequest,
     WorkflowStatus,
     WorkflowStepStatus,
     bounded_reasons,
     build_operator_event,
+)
+from gpu_fault.remediation_storm import (
+    RemediationStormBreaker,
+    aborted_breaker,
+    released_breaker,
+    storm_scope,
 )
 from gpu_fault.remote_command_models import RemoteCommandStatus
 from gpu_fault.retired_generation import (
@@ -963,3 +970,170 @@ def apply_workflow_reconcile_plan(
         "archive_eligible_incident_ids": sorted(incident_ids),
         "records_deleted": 0,
     }
+
+
+# ---------------------------------------------------------------------------
+# The remediation storm breaker's operator exits (``remediation_storm``): the
+# administrator's ``remediation-storm release|abort`` runs this in the Pod.
+# ---------------------------------------------------------------------------
+
+STORM_ACTIONS = ("release", "abort")
+_STORM_HELD_STATUSES = frozenset(
+    {WorkflowStatus.PENDING, WorkflowStatus.SAFETY_PENDING}
+)
+
+
+def storm_held_workflows(
+    store: ControlPlaneStore, cluster_id: str
+) -> list[WorkflowRequest]:
+    """The cluster's waiters whose last refusal was its storm breaker."""
+
+    scope = storm_scope(cluster_id)
+    return [
+        workflow
+        for workflow in store.list_workflows(set(_STORM_HELD_STATUSES), limit=10_000)
+        if workflow.remediation_budget_last_blocked_scope == scope
+    ]
+
+
+def remediation_storm_action(
+    store: ControlPlaneStore,
+    cluster_id: str,
+    action: str,
+    *,
+    actor: str | None,
+    reason: str,
+    reference: str,
+    now: datetime,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Release or abort the cluster's open storm breaker; idempotent.
+
+    ``release`` closes and re-arms it: the held workflows are admitted on
+    their next claim without counting again. ``abort`` keeps it open and
+    hands every held workflow to the operator -- SUPERSEDED with a
+    ``REMEDIATION_STORM_ABORTED`` operator event, its incident ESCALATED --
+    as ``workflow-reconcile`` hands over a never-dispatched one. Nothing ran
+    on their nodes: they were held at their first admission. Raises
+    ``ValueError`` for a refusal.
+    """
+
+    if action not in STORM_ACTIONS:
+        raise ValueError(f"unknown remediation storm action {action!r}")
+    record = store.get_remediation_storm_breaker(cluster_id)
+    held = storm_held_workflows(store, cluster_id)
+    report: dict[str, Any] = {
+        "cluster_id": cluster_id,
+        "action": action,
+        "state": record.state.value if record is not None else "CLOSED",
+        "trip_id": record.trip_id if record is not None else None,
+        "held_workflows": [item.request_id for item in held],
+        "dry_run": dry_run,
+    }
+    if record is None or not record.open:
+        if action == "abort":
+            raise ValueError(
+                f"remediation storm breaker of {cluster_id} is not open: nothing "
+                "is held to hand over"
+            )
+        return {**report, "status": "already-closed"}
+    if dry_run:
+        return {**report, "status": "plan"}
+    if action == "release":
+        store.replace_remediation_storm_breaker(
+            released_breaker(
+                record,
+                operator=actor or "unknown",
+                reason=reason,
+                reference=reference,
+                now=now,
+            ),
+            expected=record,
+        )
+        return {**report, "status": "released", "state": "CLOSED"}
+    aborted = aborted_breaker(
+        record, operator=actor or "unknown", reason=reason, reference=reference, now=now
+    )
+    if aborted != record:
+        store.replace_remediation_storm_breaker(aborted, expected=record)
+    closed: list[str] = []
+    errors: list[str] = []
+    for workflow in held:
+        try:
+            _hand_over_storm_held(
+                store,
+                workflow,
+                record,
+                actor=actor,
+                reason=reason,
+                reference=reference,
+                now=now,
+            )
+            closed.append(workflow.request_id)
+        except Exception as exc:  # noqa: BLE001 - each held workflow on its own
+            errors.append(f"{workflow.request_id}: {type(exc).__name__}: {exc}")
+    return {
+        **report,
+        "status": "aborted" if not errors else "partial",
+        "state": "ABORTED",
+        "closed_workflows": closed,
+        "errors": errors,
+    }
+
+
+def _hand_over_storm_held(
+    store: ControlPlaneStore,
+    workflow: WorkflowRequest,
+    record: RemediationStormBreaker,
+    *,
+    actor: str | None,
+    reason: str,
+    reference: str,
+    now: datetime,
+) -> None:
+    current = store.get_workflow(workflow.request_id)
+    if (
+        current.status not in _STORM_HELD_STATUSES
+        or current.remediation_budget_last_blocked_scope
+        != storm_scope(record.cluster_id)
+        or current.fencing_token != workflow.fencing_token
+        or current.execution_epoch != workflow.execution_epoch
+    ):
+        raise ValueError("the workflow moved since it was listed as held")
+    incident = store.get_incident(current.incident_id)
+    audit = (
+        f"remediation storm breaker of {record.cluster_id} aborted by an operator "
+        f"({reference}: {reason}): {current.request_id} was held at its first "
+        "admission and never ran on its nodes; handed to the operator"
+    )
+    superseded = current.model_copy(update={"status": WorkflowStatus.SUPERSEDED})
+    event = build_operator_event(
+        superseded,
+        WorkflowEventKind.OPERATOR_RECONCILED,
+        actor=actor,
+        reference=reference,
+        previous_status=current.status,
+        at=now,
+        details={
+            "terminalization": "remediation-storm-abort",
+            "trip_id": record.trip_id,
+        },
+    ).model_copy(update={"code": WorkflowEventCode.REMEDIATION_STORM_ABORTED.value})
+    amended = store.amend_workflow(
+        current.request_id,
+        {
+            "status": WorkflowStatus.SUPERSEDED,
+            "preempted_by_workflow_id": None,
+            "preemption_reason": audit,
+            "superseded_at": now,
+        },
+        event=event,
+    )
+    updates: dict[str, Any] = {
+        "reasons": bounded_reasons([*incident.reasons, audit]),
+        "updated_at": now,
+    }
+    if incident.state in _NEVER_DISPATCHED_HANDED_STATES:
+        updates["state"] = IncidentState.ESCALATED
+    store.save_incident(incident.model_copy(update=updates), expected=incident)
+    release_unattempted_restart_reservations(store, amended)

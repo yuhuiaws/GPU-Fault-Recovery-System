@@ -12,6 +12,7 @@ from gpu_fault.app.metric_scan_cache import MetricScanCache, metric_scan_cache
 from gpu_fault.app.remediation_budget_metrics import (
     budget_tally,
     remediation_budget_lines,
+    remediation_storm_lines,
 )
 from gpu_fault.app.runtime import AppRuntime
 from gpu_fault.app.store_bloat_metrics import store_bloat_metric_lines
@@ -1262,11 +1263,14 @@ def closed_loop_metric_lines(runtime: AppRuntime) -> list[str]:
             scan, retention=None if archiver is None else archiver.retention
         )
     )
+    budget = budget_tally(workflows, now)
     lines.extend(
         remediation_budget_lines(
-            budget_tally(workflows, now),
-            config=runtime.context.production_executor_config,
+            budget, config=runtime.context.production_executor_config
         )
+    )
+    lines.extend(
+        remediation_storm_lines(store.list_remediation_storm_breakers(), budget)
     )
 
     lines.extend(_notification_lines(store, cache))

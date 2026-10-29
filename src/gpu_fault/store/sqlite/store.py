@@ -9,6 +9,7 @@ from gpu_fault.store.memory.telemetry_spool import MemoryTelemetrySpoolMixin
 from gpu_fault.store.shared.compositions import SharedCompositionMixin
 from gpu_fault.store.shared.control_records import SharedControlRecordMixin
 from gpu_fault.store.shared.departed_nodes import SharedDepartedNodeMixin
+from gpu_fault.store.shared.remediation_storm_records import SharedRemediationStormMixin
 from gpu_fault.store.shared.efa import (
     SharedEfaTrafficMixin,
     SharedEfaTrafficRulesMixin,
@@ -68,6 +69,7 @@ class SqliteStore(
     SharedRecordAccessMixin,
     SharedControlRecordMixin,
     SharedDepartedNodeMixin,
+    SharedRemediationStormMixin,
     SharedEfaTrafficMixin,
     SharedFleetMixin,
     SharedNotificationMixin,

@@ -3264,8 +3264,9 @@ are still deployed normally, but the alerts have no final receiver. The rules co
 over 30 seconds, single cluster at 70% of its limit and at its fault-reserve boundary, admission rejections occurring, Store I/O over 90% or rejections occurring,
 processing duration p95 over 5 seconds, plus remote commands unclaimed for over 600 seconds, executor
 internal errors, a remediation budget scope held over its limit for 10 minutes (a warning, not a page:
-`GpuFaultRemediationBudgetOverLimit`) and one workflow waiting over an hour on its own node's or job's slot (a
-warning, not a page: `GpuFaultRemediationBudgetLongWait`). The queue thresholds are ratios of the caps admission enforces: the control plane
+`GpuFaultRemediationBudgetOverLimit`), one workflow waiting over an hour on its own node's or job's slot (a
+warning, not a page: `GpuFaultRemediationBudgetLongWait`) and a GPU cluster's remediation storm breaker open (a page:
+`GpuFaultRemediationStormBreakerOpen`). The queue thresholds are ratios of the caps admission enforces: the control plane
 exports `gpu_fault_processor_queue_depth_limit`, `gpu_fault_processor_cluster_queue_depth_limit` and the two fault
 reserves on `/metrics`, so changing `maxQueueDepth` / `maxClusterQueueDepth` through `gpu-fault-admin config` moves the
 alert boundaries with them, without editing `deploy/observability/amp-rules.yaml`.
@@ -8640,7 +8641,11 @@ containment prefix and the record stops `BLOCKED/SAFETY_SETTLED` (incident `QUAR
 `contained-operator-handoff-zh-v1`, category `OPERATOR_REVIEW`, subject `[GPU FAULT][contained, operator action
 required] <cluster>: <nodes>`, deduplication key `<cluster>/<incident>/contained-operator-handoff/<workflow>`: the body
 names the cordoned + quarantined nodes, the steps run and not run, the capability without an owner, the `blocked_reasons`
-and the two exits (`submit-remediation --disposition restore`; a close on the departure proof once the node is replaced). The regional executor only executes actions and writes the
+and the two exits (`submit-remediation --disposition restore`; a close on the departure proof once the node is replaced). When a GPU
+cluster's remediation storm breaker trips, the dispatcher sends one `remediation-storm-tripped-zh-v1` per trip, category
+`OPERATOR_REVIEW`, priority 0 (ahead of the per-node mail a storm queues), subject `[GPU FAULT][remediation storm, operator action
+required] <cluster>: <N> nodes in 600s`, deduplication key `<cluster>/remediation-storm-tripped/<trip>`: the body names the numbers it
+tripped on, the nodes, the held work and the two exits (`gpu-fault-admin remediation-storm release` / `abort`). The regional executor only executes actions and writes the
 notification ID/action result back to Aurora; notifications are always sent by the regional control-plane dispatcher, and the GPU
 cluster executor needs no SNS or SES permission.
 

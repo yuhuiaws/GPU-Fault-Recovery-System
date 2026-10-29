@@ -1268,6 +1268,7 @@ def test_wait_for_email_confirmation_travels_to_the_source_preparer(
         ("join-cluster", ("--gpu-cluster-arn",)),
         ("remove-cluster", ("--gpu-cluster-arn", "--confirm")),
         ("uninstall", ("--cpu-cluster", "--confirm")),
+        ("remediation-storm", ("--cluster-id", "--reference", "--dry-run")),
     ),
 )
 def test_managed_admin_help_uses_state_dir_not_site_file(

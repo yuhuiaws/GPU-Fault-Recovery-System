@@ -32,8 +32,12 @@ from tests.execution._budget_hold_support import (
     ScriptedAdapter,
     all_workflows,
     budget_dispatcher,
+    large_fleet,
     seed,
 )
+
+# These cases load the fixed budget limits of one cluster, not its breaker.
+pytestmark = pytest.mark.usefixtures(large_fleet.__name__)
 
 REGION = "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION"
 BATCH = "GPU_FAULT_WORKFLOW_BATCH_SIZE"

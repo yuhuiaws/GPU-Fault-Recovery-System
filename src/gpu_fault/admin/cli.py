@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from gpu_fault.admin import aurora_failback, eks_nodegroup_prepare, operator_identity
-from gpu_fault.admin import hyperpod_scheduled_update
+from gpu_fault.admin import hyperpod_scheduled_update, remediation_storm
 from gpu_fault.admin.deploy_host_binding import (
     DEPLOY_HOST_STATE_BINDING as DEPLOY_HOST_STATE_BINDING,
     enforce_deploy_host_state_dir,
@@ -550,6 +550,7 @@ def parser() -> argparse.ArgumentParser:
     add_submit_remediation_command(commands, _add_managed_site_arguments)
     add_collector_outbox_command(commands, _add_managed_site_arguments)
     add_store_maintenance_command(commands, _add_managed_site_arguments)
+    remediation_storm.add_command(commands, _add_managed_site_arguments)
     aurora_failback.add_command(commands, _add_managed_site_arguments)
     add_replace_resource_command(commands, _add_managed_site_arguments)
     join = commands.add_parser(
@@ -1357,14 +1358,14 @@ def run(arguments: argparse.Namespace) -> int:
         return _run_workflow_reconcile(arguments)
     if arguments.command == "failure-domain-map":
         return _run_failure_domain_map(arguments)
-    # The verbs of their own modules that take the managed site, looked up per
-    # call so a test can patch one.
+    # Verbs of their own modules taking the managed site; looked up per call.
     site_verbs = {
         "rotate-token": run_rotate_token_command,
         "submit-remediation": run_submit_remediation_command,
         "collector-outbox": run_collector_outbox_command,
         "store-maintenance": run_store_maintenance_command,
         "replace-resource": run_replace_resource_command,
+        remediation_storm.VERB: remediation_storm.run_command,
     }
     if arguments.command in site_verbs:
         site_file = cast(Path, _managed_site_file(arguments, command=arguments.command))

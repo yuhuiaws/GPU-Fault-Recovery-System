@@ -27,6 +27,7 @@ from gpu_fault_release.regional_admin_checks import (
 from gpu_fault_release.regional_admin_checks_coverage import (
     dcgm_hostengine_lines,
     departed_node_lines,
+    remediation_storm_lines,
 )
 from gpu_fault_release.regional_release_aurora_refresh import (
     validate_aurora_refresh_snapshot,
@@ -1188,7 +1189,11 @@ def _control_api_findings(health: object) -> list[str]:
     for check in checks if isinstance(checks, list) else []:
         details = check.get("details") if isinstance(check, dict) else None
         if check.get("name") == "control_api" and isinstance(details, dict):
-            return [*departed_node_lines(details), *dcgm_hostengine_lines(details)]
+            return [
+                *remediation_storm_lines(details),
+                *departed_node_lines(details),
+                *dcgm_hostengine_lines(details),
+            ]
     return []
 
 

@@ -65,6 +65,7 @@ def record_models() -> dict[str, type[BaseModel]]:
         ProcessorLeadership,
         ProcessorRequest,
     )
+    from gpu_fault.remediation_storm import RemediationStormBreaker
     from gpu_fault.regional import (
         RegionalClusterRegistration,
         RegionalRegistryHead,
@@ -134,4 +135,5 @@ def record_models() -> dict[str, type[BaseModel]]:
         "xid_policy_decision": FaultPolicyDecision,
         "xid_correlation": XidCorrelationRecord,
         "xid74_occurrence_state": Nvlink74BitOccurrenceState,
+        "remediation_storm_breaker": RemediationStormBreaker,
     }

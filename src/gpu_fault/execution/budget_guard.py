@@ -28,6 +28,12 @@ as long as an older holder kept it, although no workflow this release admits
 claims it any more. Such a row is judged afresh, as a never-refused one is.
 The other kinds keep their meaning across releases and are not re-derived.
 
+A cluster's open remediation storm breaker (``gpu_fault.remediation_storm``)
+holds the same way: a row recorded on ``storm:<cluster>`` is passed over
+while that breaker is open, and a never-refused row of that cluster with
+budgeted work is recorded on it, from one read of the breakers a tick. Only
+an operator closes a breaker; its waiters are candidates again at once.
+
 Deliberately no per-tick quota ("k free slots let k waiters through"): the
 first waiter of a scope may still not claim -- a destructive workflow the
 fleet-rollout fence holds returns without claiming -- and a quota spent on it
@@ -64,6 +70,7 @@ import logging
 import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from gpu_fault.execution.config import ProductionExecutorConfig
 from gpu_fault.execution.remediation_budget import (
@@ -73,6 +80,14 @@ from gpu_fault.execution.remediation_budget import (
     scope_limit,
 )
 from gpu_fault.execution.transient_errors import transient_store_error
+from gpu_fault.notifications.remediation_storm import RemediationStormEmailBuilder
+from gpu_fault.remediation_storm import (
+    STORM_SCOPE_PREFIX,
+    STORM_WINDOW_SECONDS,
+    RemediationStormBreaker,
+    held_reason,
+    storm_scope,
+)
 from gpu_fault.models import (
     EXECUTABLE_WORKFLOW_STATUSES,
     WorkflowRequest,
@@ -174,6 +189,7 @@ class BudgetGuard:
         self._watch = watch if watch is not None else BudgetWatch()
         self._occupancy: dict[str, int] | None = None
         self._any_full: bool | None = None
+        self._open_breakers: dict[str, RemediationStormBreaker] | None = None
         self._calls = 0
 
     @property
@@ -187,6 +203,17 @@ class BudgetGuard:
         if self._occupancy is None:
             self._occupancy = self._store.remediation_budget_occupancy()
         return self._occupancy
+
+    def open_breakers(self) -> dict[str, RemediationStormBreaker]:
+        """The tick's one read of the storm breakers: cluster -> open breaker."""
+
+        if self._open_breakers is None:
+            listed = getattr(self._store, "list_remediation_storm_breakers", None)
+            records = listed() if listed is not None else []
+            self._open_breakers = {
+                record.cluster_id: record for record in records if record.open
+            }
+        return self._open_breakers
 
     def passes_over(self, workflow: WorkflowRequest) -> bool:
         """Whether the dispatch scan should skip ``workflow`` this tick."""
@@ -203,6 +230,8 @@ class BudgetGuard:
         scope = workflow.remediation_budget_last_blocked_scope
         if not scope:
             return self._fresh_waiter(workflow, steps)
+        if scope.startswith(STORM_SCOPE_PREFIX):
+            return scope.removeprefix(STORM_SCOPE_PREFIX) in self.open_breakers()
         limit = scope_limit(self._policy, scope)
         if limit is None or self.occupancy().get(scope, 0) < limit:
             return False
@@ -226,7 +255,8 @@ class BudgetGuard:
     def _fresh_waiter(
         self, workflow: WorkflowRequest, steps: list[WorkflowStepSpec]
     ) -> bool:
-        """Pass a never-refused row over when a scope it asks for is full."""
+        """Pass a never-refused row over when a scope it asks for is full, or
+        its cluster's storm breaker is open."""
 
         occupancy = self.occupancy()
         if self._any_full is None:
@@ -235,7 +265,10 @@ class BudgetGuard:
                 for scope, holders in occupancy.items()
                 if (limit := scope_limit(self._policy, scope)) is not None
             )
-        if workflow.execution_owner_id is not None or not self._any_full:
+        open_breakers = self.open_breakers()
+        if workflow.execution_owner_id is not None or not (
+            self._any_full or open_breakers
+        ):
             return False
         cluster = self._cluster_of(workflow.incident_id)
         if cluster is None:
@@ -246,11 +279,15 @@ class BudgetGuard:
             for scope in sorted(claims)
             if occupancy.get(scope, 0) >= claims[scope]
         ]
-        if not full or self._calls >= FRESH_WAITER_STORE_CALLS:
+        breaker = open_breakers.get(cluster) if claims else None
+        if not (full or breaker) or self._calls >= FRESH_WAITER_STORE_CALLS:
             return False
-        refusing = full[0]
         self._calls += 1
-        reason = budget_full_reason(refusing, occupancy[refusing], claims[refusing])
+        if breaker is None:
+            refusing = full[0]
+            reason = budget_full_reason(refusing, occupancy[refusing], claims[refusing])
+        else:
+            refusing, reason = storm_scope(cluster), held_reason(breaker)
         try:
             self._store.save_workflow(
                 blocked_by_remediation_budget(
@@ -371,3 +408,56 @@ def release_lapsed_parked_holds(
             details["released_budget_claims"],
         )
     return released
+
+
+def notify_storm_trips(
+    store: ControlPlaneStore, executor: Any, *, now: datetime
+) -> int:
+    """Send the trip notice of each open storm breaker once (§9.5); returns
+    how many were sent. The notice is deduplicated by its trip, and the
+    breaker records the trip it was sent for by compare-and-set, so a lost
+    write sends nothing twice."""
+
+    sent = 0
+    for record in store.list_remediation_storm_breakers():
+        if (
+            not record.open
+            or not record.trip_id
+            or record.notified_trip_id == (record.trip_id)
+        ):
+            continue
+        try:
+            candidate = RemediationStormEmailBuilder().build(record=record)
+            saved = store.save_notification_if_absent(candidate)
+            sender = getattr(executor, "notification_sender", None)
+            if saved.notification_id == candidate.notification_id:
+                sent += 1
+                if sender is not None:
+                    sender(saved.notification_id)
+            store.replace_remediation_storm_breaker(
+                record.model_copy(update={"notified_trip_id": record.trip_id}),
+                expected=record,
+            )
+        except StaleWriteError:
+            continue  # the breaker moved since the read: the next tick looks
+        except Exception as exc:  # noqa: BLE001 - one cluster, not the tick (D-4)
+            if transient_store_error(exc):
+                raise
+            LOGGER.exception(
+                "remediation storm trip notice of %s could not be sent; the "
+                "next tick retries",
+                record.cluster_id,
+            )
+            continue
+        LOGGER.warning(
+            "remediation storm breaker of %s tripped at %s: %d nodes in %ss "
+            "across %d domains (threshold %d); new destructive work is held "
+            "until an operator releases or aborts it",
+            record.cluster_id,
+            record.tripped_at.isoformat() if record.tripped_at else None,
+            len(record.trip_node_ids),
+            STORM_WINDOW_SECONDS,
+            record.trip_domains,
+            record.trip_threshold,
+        )
+    return sent

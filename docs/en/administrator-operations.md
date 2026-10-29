@@ -37,6 +37,7 @@ rationale and special recovery steps are kept in the [Deployment and Operations 
 | Data migration | `gpu-fault-store-migrate` plus the stop-write state machine | §10 |
 | Archive and delete expired incidents/workflows | **Enabled** by default (30 days, bucket created automatically by deploy); disabled only when `site.yaml` explicitly declares `spec.retention.controlRecordRetentionDays: 0` | §10 |
 | The residue a node leaves after a spot reclaim, a scale-in or a provider replacement (Agent record still ACTIVE, workflows that never changed the node, ESCALATED incidents) | No command: the control plane's departed-node cleanup ends it once the node is proven gone (switch `spec.workflow.departedNodeCleanup`, on by default); the `departed nodes:` lines of `gpu-fault-admin status` list the nodes cleaned, pending and left to the operator, with the exact commands | [§10.1.1](#1011-what-a-departed-gpu-node-leaves-behind-spot-reclaim-scale-in-provider-replacement) |
+| A GPU cluster's remediation storm breaker is open (alert `GpuFaultRemediationStormBreakerOpen`, a `remediation storm breaker` line in status): once the common cause is understood, resume automatic remediation, or hand the held workflows to people | `gpu-fault-admin remediation-storm release --state-dir ... --cluster-id <c> --reason ... --reference ...`; `abort` hands them over; both take `--dry-run` first | §8 `GpuFaultRemediationStormBreakerOpen` |
 | Converge historical workflows that recovered but stay BLOCKED, never-dispatched PENDING workflows whose node left with a spot replacement (the manual fallback when the departed-node cleanup is off or refuses), and parked records whose node action the operator confirmed | `gpu-fault-admin workflow-reconcile --state-dir ... --dry-run` to see the plan, then drop `--dry-run` and add `--reference` to execute once | §10.2 |
 | Retire the fleet Agent record, still ACTIVE, of a node a spot reclaim removed (the release verification reports `Agent coverage drift` and rolls back; the manual fallback when the departed-node cleanup is off or refuses) | `gpu-fault-admin workflow-reconcile --state-dir ... --retire-departed-agents [--node <node>] --dry-run` to see the plan and evidence, then drop `--dry-run` and add `--reference` to execute once; for a node whose provider identity is unknown (no instance id in the node name, no EC2 instance id on the record; ledger reason `provider_identity_unknown`) add `--node <node> --accept-unknown-provider-identity --reason <why>` | §10.2 |
 | List and close ESCALATED incidents (node repaired but the record still only logs) | `GET /v1/incidents?state=ESCALATED` or `gpu-fault-admin workflow-reconcile --state-dir ... --close-escalated --dry-run` to list the queue; `--close-incident <id>` / `--close-escalated` with `--reason` `--reference` to close | §9.1 |
@@ -3471,7 +3472,7 @@ and the names are the card names below.
 | GPU Fault · Remote command (`gpu-fault-remote-command`) | `gpu-fault-remote-command` | Claim latency -> `GpuFaultRemoteCommandUnclaimed`, `GpuFaultRemoteCommandExecutorInternalError`; Command census -> `GpuFaultRemoteCommandUnclaimedExpired` (the per-state/per-cluster command count panels are trend readings) |
 | GPU Fault · Policy coverage (`gpu-fault-policy-coverage`) | `gpu-fault-policy-coverage` | Catalog coverage -> `GpuFaultUnknownProductFamily` (CRITICAL findings without an incident is a trend reading) |
 | GPU Fault · Orchestration invariants (`gpu-fault-orchestration-invariants`) | `gpu-fault-orchestration-invariants` | Node ownership -> `GpuFaultExclusiveNodeOwnershipInvariantViolation`, `GpuFaultStaleAttemptObservation`; Fleet rollout fence -> `GpuFaultFleetRolloutFenceStuck`; Pointers, agents and registry -> `GpuFaultIncidentDanglingWorkflowPointers`, `GpuFaultStaleAgents`, `GpuFaultFleetPinAheadOfFleet`, `GpuFaultRegionalRegistrySecretDrift` |
-| GPU Fault · Recovery outcome (`gpu-fault-recovery-outcome`) | `gpu-fault-recovery-outcome` | Workflows -> `GpuFaultRecoveryBlockedBacklog`, `GpuFaultWorkflowPendingAge`, `GpuFaultWorkflowDeadlineNotEnforced`; Step waiting -> `GpuFaultWorkflowStepStalled`; Counters (30m increase) -> `GpuFaultWorkflowLifetimeExceeded`, `GpuFaultJobWorkflowNodeBusyTimeout`, `GpuFaultProcessorRetryHorizonFailures`, `GpuFaultBranchEscalationBudgetRefused`; Closed loop and notifications -> `GpuFaultClosedLoopSlow`, `GpuFaultClosedLoopWindowIncomplete`, `GpuFaultNotificationDeliveryFailing`; Remediation budget -> `GpuFaultRemediationBudgetStarved`, `GpuFaultRemediationBudgetClusterSaturated`, `GpuFaultRemediationBudgetLongWait`; Completion and incidents -> `GpuFaultCompletionEventsWithoutDecision`, `GpuFaultIncidentsAwaitingOperator`, `GpuFaultDepartedNodeCleanupStuck`; Dispatcher errors and notification outbox -> `GpuFaultWorkflowDispatchInternalErrors`, `GpuFaultWorkflowFailureHandlingAbandoned`, `GpuFaultNotificationUndeliveredTooLong`, `GpuFaultNotificationOutboxNotDraining`, `GpuFaultNotificationExpiredUnsent` |
+| GPU Fault · Recovery outcome (`gpu-fault-recovery-outcome`) | `gpu-fault-recovery-outcome` | Workflows -> `GpuFaultRecoveryBlockedBacklog`, `GpuFaultWorkflowPendingAge`, `GpuFaultWorkflowDeadlineNotEnforced`; Step waiting -> `GpuFaultWorkflowStepStalled`; Counters (30m increase) -> `GpuFaultWorkflowLifetimeExceeded`, `GpuFaultJobWorkflowNodeBusyTimeout`, `GpuFaultProcessorRetryHorizonFailures`, `GpuFaultBranchEscalationBudgetRefused`; Closed loop and notifications -> `GpuFaultClosedLoopSlow`, `GpuFaultClosedLoopWindowIncomplete`, `GpuFaultNotificationDeliveryFailing`; Remediation budget -> `GpuFaultRemediationBudgetStarved`, `GpuFaultRemediationBudgetClusterSaturated`, `GpuFaultRemediationBudgetLongWait`, `GpuFaultRemediationStormBreakerOpen`; Completion and incidents -> `GpuFaultCompletionEventsWithoutDecision`, `GpuFaultIncidentsAwaitingOperator`, `GpuFaultDepartedNodeCleanupStuck`; Dispatcher errors and notification outbox -> `GpuFaultWorkflowDispatchInternalErrors`, `GpuFaultWorkflowFailureHandlingAbandoned`, `GpuFaultNotificationUndeliveredTooLong`, `GpuFaultNotificationOutboxNotDraining`, `GpuFaultNotificationExpiredUnsent` |
 
 The last row of the overview, "Declared topology", is `gpu_fault_capacity_largest_cluster_node_count` /
 `gpu_fault_capacity_managed_node_count`: the topology declared by the release, from which the fault reservation and the Aurora capacity floor are derived;
@@ -4239,6 +4240,29 @@ modifying Store JSON or repeating `send`; an isolated notifier result in accepta
 - **Boundary**: do not edit claims in the Store, and do not raise the per-node or per-failure-domain limit -- both are safety
   constants of 1, and a second concurrent workflow on one node, or stopping or restarting one job, is exactly what they prevent. Resolve the holder
   (acknowledge, confirm, reconcile) and the waiter is admitted on its next claim.
+
+### GpuFaultRemediationStormBreakerOpen
+
+- **Meaning**: the remediation storm breaker of the GPU cluster `cluster_id` is open (critical). In a sliding 600-s window at
+  least max(3, ceil(20% of the cluster's GPU nodes)) nodes newly entered destructive remediation, and they belong to at least two
+  workload domains (a training job, or an incident without a job, is one domain): more than one fault explains (detailed design
+  v2 §9.5). Since the trip every first admission of destructive work in that cluster -- job stops and restarts, GPU resets,
+  quiesce, reboots, replacements, quarantines, driver/firmware, device-plugin restarts -- is held: the workflow stays `PENDING`
+  with `remediation_budget_last_blocked_scope` = `storm:<cluster>`. Work already admitted goes on. The breaker never closes by
+  itself; one operator notice (`REMEDIATION_STORM_TRIPPED`, OPERATOR_REVIEW) was sent at the trip.
+- **First check**: `gpu-fault-admin status` names the breaker, the trip time and numbers;
+  `gpu_fault_remediation_budget_storm_breaker_window_nodes{cluster_id}` against `..._threshold_nodes`,
+  `..._held_workflows` for the queue, and the tripping workflow's `REMEDIATION_STORM_TRIPPED` hold event for the node list. Look
+  for the common cause: a driver, image, firmware or policy rollout, a fabric or power event, a detector reporting healthy
+  nodes. A real correlated hardware fault on many independent nodes also trips it -- that is the case it exists for.
+- **Exit**: once the cause is understood and stopped, `gpu-fault-admin remediation-storm release --state-dir "$STATE_DIR"
+  --cluster-id <cluster> --reason ... --reference ...` closes and re-arms the breaker: the held workflows are admitted (without
+  counting again) and new faults are counted from zero. To hand the held work to people instead,
+  `gpu-fault-admin remediation-storm abort ...` closes the held workflows (`SUPERSEDED`, event `REMEDIATION_STORM_ABORTED`) and
+  escalates their incidents; the breaker stays open (new work keeps being held) until a later `release`. Both are audited with
+  the operator identity, take `--dry-run`, and are idempotent.
+- **Boundary**: do not edit the breaker record or the held workflows in the Store, and do not restart control-plane Pods to
+  clear it: the breaker is persisted and survives restarts on purpose.
 
 ### GpuFaultCompletionEventsWithoutDecision
 
@@ -5876,6 +5900,7 @@ store-maintenance    reclaim PostgreSQL hot-table bloat: without --confirm print
 aurora-failback      fail the Aurora writer back to the control plane's zone: without --confirm prints the plan, --confirm AURORA_FAILBACK executes (§4.9)
 replace-resource     move an installation registry key whose physical resource really was replaced: without --confirm prints the plan and proofs, --confirm REPLACE_RESOURCE executes (§4 installation registry sync)
 failure-domain-map   read-only debug: prints the failure-domain mapping the product would render
+remediation-storm    the exits of an open remediation storm breaker: release resumes the cluster's automatic remediation, abort keeps it open and hands the held workflows to the operator (--dry-run reads only)
 ```
 
 The following verbs once listed as "roadmap" **will not** appear, each for its own reason:

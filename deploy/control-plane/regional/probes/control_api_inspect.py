@@ -96,6 +96,21 @@ def departed_node_cleanup(store: Any, cluster_id: str) -> list[Any] | None:
     ]
 
 
+def remediation_storm(store: Any, cluster_id: str) -> dict[str, Any] | None:
+    reader = getattr(store, "get_remediation_storm_breaker", None)
+    record = reader(cluster_id) if reader is not None else None
+    if record is None:
+        # No breaker (closed and never judged), or a control plane before it.
+        return None
+    return {
+        "state": record.state.value,
+        "tripped_at": record.tripped_at.isoformat() if record.tripped_at else None,
+        "trip_nodes": len(record.trip_node_ids),
+        "trip_domains": record.trip_domains,
+        "trip_threshold": record.trip_threshold,
+    }
+
+
 def departed_node_cleanup_enabled() -> bool | None:
     try:
         from gpu_fault.departed_node_cleanup import cleanup_enabled
@@ -136,6 +151,7 @@ def main() -> None:
             ),
             "collector_readiness": get("/v1/collector-readiness/" + cluster_id),
             "departed_node_cleanup": departed_node_cleanup(store, cluster_id),
+            "remediation_storm": remediation_storm(store, cluster_id),
         }
     print(json.dumps(result, separators=(",", ":")))
 

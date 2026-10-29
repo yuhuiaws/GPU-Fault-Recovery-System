@@ -538,3 +538,38 @@ REVIEW_COUNTER_PANELS = (
         "refusal, by exception type (F-8).",
     ),
 )
+
+
+# The remediation budget row's per-workflow wait and the storm breaker
+# (detailed design v2 §9.5).
+_STORM = "gpu_fault_remediation_budget_storm_breaker"
+_CLUSTER = 'cluster_id=~"$cluster_id"'
+REMEDIATION_STORM_PANEL = _panel(
+    "Remediation storm breaker",
+    (
+        (
+            f"max by (cluster_id) ({series(_STORM + '_open', _CLUSTER)})",
+            "{{cluster_id}} open",
+        ),
+        (
+            f"max by (cluster_id) ({series(_STORM + '_held_workflows', _CLUSTER)})",
+            "{{cluster_id}} held",
+        ),
+    ),
+    "1 while a cluster's storm breaker holds its new destructive remediation, "
+    "and the workflows it holds.",
+)
+REMEDIATION_LONGEST_WAIT_PANEL = _panel(
+    "Longest remediation budget wait",
+    (
+        (
+            "max by (scope_type) ("
+            + series("gpu_fault_remediation_budget_longest_wait_seconds")
+            + ")",
+            "{{scope_type}}",
+        ),
+    ),
+    "How long the oldest current wait has lasted, by the type of the scope that "
+    "last refused it, from the refusal that began the wait.",
+    unit="s",
+)

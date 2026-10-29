@@ -13,17 +13,23 @@ age, and an admission ends the wait. Waiting counts never said that: churn
 keeps a count above zero for hours without one workflow waiting long, and one
 workflow stuck behind its own node's or job's holder looks like any other
 waiter. Only scope types with a waiter are rendered.
+
+The storm breaker families (``gpu_fault.remediation_storm``) are one series per
+cluster that has a breaker record: whether it is open, the nodes its window
+holds (frozen at the trip while open) against the threshold it last judged,
+when it tripped, and how many workflows it holds.
 """
 
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 
 from gpu_fault.execution import ProductionExecutorConfig
 from gpu_fault.models import WorkflowRequest, WorkflowStatus
+from gpu_fault.remediation_storm import STORM_SCOPE_PREFIX, RemediationStormBreaker
 from gpu_fault.store.shared.remediation_budgets import (
     budget_holds,
     budget_wait_started_at,
@@ -47,6 +53,7 @@ class BudgetTally:
     waiting_by_scope_type: Counter[str] = field(default_factory=Counter)
     waiting_by_cluster: Counter[str] = field(default_factory=Counter)
     longest_wait_by_scope_type: dict[str, float] = field(default_factory=dict)
+    storm_held_by_cluster: Counter[str] = field(default_factory=Counter)
     wait_total: int = 0
     waiting: int = 0
 
@@ -75,6 +82,9 @@ def budget_tally(workflows: Iterable[WorkflowRequest], now: datetime) -> BudgetT
         tally.waiting_by_scope_type[scope_type] += 1
         if blocked_scope.startswith("cluster:"):
             tally.waiting_by_cluster[blocked_scope.removeprefix("cluster:")] += 1
+        if blocked_scope.startswith(STORM_SCOPE_PREFIX):
+            cluster_id = blocked_scope.removeprefix(STORM_SCOPE_PREFIX)
+            tally.storm_held_by_cluster[cluster_id] += 1
         started = budget_wait_started_at(workflow)
         if started is not None:
             waited = max(0.0, (now - started).total_seconds())
@@ -189,5 +199,64 @@ def remediation_budget_lines(
         lines.append(
             "gpu_fault_remediation_budget_cluster_waiting_workflows"
             f'{{cluster_id="{_escape_label(cluster_id)}"}} {count}'
+        )
+    return lines
+
+
+def remediation_storm_lines(
+    breakers: Iterable[RemediationStormBreaker], tally: BudgetTally
+) -> list[str]:
+    """The storm breaker families, one series per cluster with a breaker."""
+
+    records = sorted(breakers, key=lambda record: record.cluster_id)
+    families: tuple[tuple[str, str, Callable[[RemediationStormBreaker], float]], ...]
+    families = (
+        (
+            "open",
+            "1 while the cluster's remediation storm breaker is open (tripped, or "
+            "aborted by an operator): its new destructive remediation is held "
+            "until an operator releases it.",
+            lambda record: int(record.open),
+        ),
+        (
+            "window_nodes",
+            "Distinct GPU nodes that entered destructive remediation in the "
+            "breaker's 600-s window (frozen at the trip while open).",
+            lambda record: (
+                len(record.trip_node_ids)
+                if record.open
+                else len({entry.node_id for entry in record.window})
+            ),
+        ),
+        (
+            "threshold_nodes",
+            "Nodes the breaker trips at: max(3, ceil(20% of the cluster's GPU "
+            "nodes)), as last judged.",
+            lambda record: record.trip_threshold if record.open else record.threshold,
+        ),
+        (
+            "tripped_timestamp_seconds",
+            "Unix time the open breaker tripped; 0 while closed.",
+            lambda record: (
+                record.tripped_at.timestamp()
+                if record.open and record.tripped_at
+                else 0
+            ),
+        ),
+        (
+            "held_workflows",
+            "Workflows waiting because the cluster's storm breaker refused their "
+            "first admission.",
+            lambda record: tally.storm_held_by_cluster.get(record.cluster_id, 0),
+        ),
+    )
+    lines: list[str] = []
+    for name, help_text, value in families:
+        metric = f"gpu_fault_remediation_budget_storm_breaker_{name}"
+        lines.extend([f"# HELP {metric} {help_text}", f"# TYPE {metric} gauge"])
+        lines.extend(
+            f'{metric}{{cluster_id="{_escape_label(record.cluster_id)}"}} '
+            f"{value(record):g}"
+            for record in records
         )
     return lines

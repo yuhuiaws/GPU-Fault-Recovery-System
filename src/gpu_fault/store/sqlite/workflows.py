@@ -10,6 +10,7 @@ from gpu_fault.models import (
     WorkflowRequest,
     WorkflowStatus,
 )
+from gpu_fault.remediation_storm import StormCandidate
 from gpu_fault.store.contracts import ACTIVE_WORKFLOW_INCIDENTS_LIMIT
 from gpu_fault.store.shared.errors import (
     RemediationBudgetError,
@@ -23,10 +24,11 @@ from gpu_fault.store.shared.record_guards import (
 )
 from gpu_fault.store.shared.remediation_budgets import (
     apply_remediation_budget,
-    blocked_by_remediation_budget,
     budget_occupancy,
     extend_remediation_budget,
+    leased_claim,
 )
+from gpu_fault.store.shared.remediation_storm_records import refused_claim
 from gpu_fault.store.shared.time import utc_text as _utc_text
 from gpu_fault.store.shared.transactional_workflows import (
     incident_pointer_moved,
@@ -49,6 +51,7 @@ class SqliteWorkflowMixin:
     _db: Any
     _get: Callable[..., Any]
     _get_optional: Callable[..., Any]
+    _judge_storm: Callable[[StormCandidate, datetime], None]
     _link: Callable[..., Any]
     _list: Callable[..., Any]
     _lock: Any
@@ -541,6 +544,7 @@ class SqliteWorkflowMixin:
         lease_duration: timedelta = timedelta(minutes=3),
         remediation_budget_claims: dict[str, int] | None = None,
         remediation_budget_hold: bool = False,
+        remediation_storm: StormCandidate | None = None,
     ) -> WorkflowRequest:
         with self._lock:
             # A budget refusal is a committed write (the workflow goes BLOCKED)
@@ -563,6 +567,7 @@ class SqliteWorkflowMixin:
                 ):
                     raise WorkflowLeaseError("workflow is leased by another executor")
                 if remediation_budget_claims is not None:
+                    before = workflow
                     try:
                         workflow = apply_remediation_budget(
                             workflow,
@@ -570,34 +575,23 @@ class SqliteWorkflowMixin:
                             remediation_budget_claims,
                             hold=remediation_budget_hold,
                         )
+                        if (
+                            remediation_storm is not None
+                            and not remediation_budget_hold
+                        ):
+                            self._judge_storm(remediation_storm, claimed_at)
                     except RemediationBudgetError as exc:
-                        workflow = blocked_by_remediation_budget(
-                            workflow,
-                            str(exc),
-                            scope=exc.scope,
-                            now=claimed_at,
-                        )
+                        workflow = refused_claim(before, exc, now=claimed_at)
                         self._put("workflow", request_id, workflow)
                         budget_error = exc
                 if budget_error is None:
-                    new_epoch = (
-                        workflow.execution_owner_id != executor_id or not lease_active
-                    )
-                    workflow = workflow.model_copy(
-                        update={
-                            "execution_owner_id": executor_id,
-                            "execution_epoch": (
-                                workflow.execution_epoch + 1
-                                if new_epoch
-                                else max(workflow.execution_epoch, 1)
-                            ),
-                            "execution_lease_expires_at": (claimed_at + lease_duration),
-                            **(
-                                {"status": WorkflowStatus.RUNNING}
-                                if remediation_budget_claims is not None
-                                else {}
-                            ),
-                        }
+                    workflow = leased_claim(
+                        workflow,
+                        executor_id,
+                        claimed_at=claimed_at,
+                        lease_duration=lease_duration,
+                        lease_active=lease_active,
+                        budgeted=remediation_budget_claims is not None,
                     )
                     self._put("workflow", request_id, workflow)
             if budget_error is not None:

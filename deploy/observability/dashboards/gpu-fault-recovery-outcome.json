@@ -1113,7 +1113,7 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 6,
+        "w": 8,
         "x": 0,
         "y": 45
       },
@@ -1180,8 +1180,8 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 6,
-        "x": 6,
+        "w": 8,
+        "x": 8,
         "y": 45
       },
       "id": 21,
@@ -1239,6 +1239,84 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
+      "description": "1 while a cluster's storm breaker holds its new destructive remediation, and the workflows it holds.\n\nAlert GpuFaultRemediationStormBreakerOpen (critical, for 1m): docs/en/administrator-operations.md#gpufaultremediationstormbreakeropen",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 45
+      },
+      "id": 22,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "max by (cluster_id) (gpu_fault_remediation_budget_storm_breaker_open{cluster_id=~\"$cluster_id\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "{{cluster_id}} open",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "max by (cluster_id) (gpu_fault_remediation_budget_storm_breaker_held_workflows{cluster_id=~\"$cluster_id\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "{{cluster_id}} held",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Remediation storm breaker",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-fault-amp"
+      },
       "description": "How long the oldest current wait has lasted, by the type of the scope that last refused it, from the refusal that began the wait.\n\nAlert GpuFaultRemediationBudgetLongWait (warning, for 5m, > 3600): docs/en/administrator-operations.md#gpufaultremediationbudgetlongwait",
       "fieldConfig": {
         "defaults": {
@@ -1273,11 +1351,11 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 6,
-        "x": 12,
-        "y": 45
+        "w": 12,
+        "x": 0,
+        "y": 53
       },
-      "id": 22,
+      "id": 23,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1344,11 +1422,11 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 6,
-        "x": 18,
-        "y": 45
+        "w": 12,
+        "x": 12,
+        "y": 53
       },
-      "id": 23,
+      "id": 24,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1382,9 +1460,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 53
+        "y": 61
       },
-      "id": 24,
+      "id": 25,
       "panels": [],
       "title": "Completion and incidents",
       "type": "row"
@@ -1426,9 +1504,9 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 54
+        "y": 62
       },
-      "id": 25,
+      "id": 26,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1497,9 +1575,9 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 54
+        "y": 62
       },
-      "id": 26,
+      "id": 27,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1568,9 +1646,9 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 54
+        "y": 62
       },
-      "id": 27,
+      "id": 28,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1639,9 +1717,9 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 54
+        "y": 62
       },
-      "id": 28,
+      "id": 29,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1675,9 +1753,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 62
+        "y": 70
       },
-      "id": 29,
+      "id": 30,
       "panels": [],
       "title": "Dispatcher errors and notification outbox",
       "type": "row"
@@ -1723,9 +1801,9 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 63
+        "y": 71
       },
-      "id": 30,
+      "id": 31,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1794,9 +1872,9 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 63
+        "y": 71
       },
-      "id": 31,
+      "id": 32,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1865,9 +1943,9 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 63
+        "y": 71
       },
-      "id": 32,
+      "id": 33,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1936,9 +2014,9 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 71
+        "y": 79
       },
-      "id": 33,
+      "id": 34,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2018,9 +2096,9 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 71
+        "y": 79
       },
-      "id": 34,
+      "id": 35,
       "options": {
         "legend": {
           "displayMode": "list",

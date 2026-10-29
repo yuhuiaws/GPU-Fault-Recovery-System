@@ -19,6 +19,8 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from gpu_fault.execution.remediation_budget import RemediationBudgetPolicy
 from gpu_fault.models import WorkflowStatus
 from gpu_fault.store.shared.remediation_budgets import NODE_ACTION_LONGEST_LIFE_SECONDS
@@ -32,8 +34,12 @@ from tests.execution._budget_hold_support import (
     all_workflows,
     budget_dispatcher,
     holders,
+    large_fleet,
     seed,
 )
+
+# These cases load the fixed budget limits of one cluster, not its breaker.
+pytestmark = pytest.mark.usefixtures(large_fleet.__name__)
 
 NOW = datetime(2026, 7, 20, 10, 0, tzinfo=timezone.utc)
 CLUSTER = "cluster:cluster-a"

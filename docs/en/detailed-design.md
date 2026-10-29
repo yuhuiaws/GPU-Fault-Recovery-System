@@ -4436,7 +4436,7 @@ single transaction in `tests/app_services/test_installation_registry_conflicts.p
 
 `gpu-fault-admin` is the site's only change entry point (public verbs `status`, `deploy`, `config`, `workflow-reconcile`,
 `failure-domain-map`, `rotate-token`, `submit-remediation`, `collector-outbox`, `store-maintenance`, `replace-resource`,
-`join-cluster`, `remove-cluster`, `uninstall`; `preflight`/`verify` are only internal pass-throughs of the release driver and do not appear in `--help`).
+`remediation-storm`, `join-cluster`, `remove-cluster`, `uninstall`; `preflight`/`verify` are only internal pass-throughs of the release driver and do not appear in `--help`).
 It drives the site lifecycle and takes no part in fault decisions, but shares the Store model, the authentication boundary
 (the execution-token routes of §4) and the installation resource registry of §2.22 with the control plane. The administrator
 implementation belongs to a separate deploy-host distribution and does not enter the

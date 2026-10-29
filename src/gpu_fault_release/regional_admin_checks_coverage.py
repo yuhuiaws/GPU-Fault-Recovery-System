@@ -142,6 +142,32 @@ def departed_node_lines(report: Mapping[str, Any]) -> list[str]:
     return lines
 
 
+def remediation_storm_lines(report: Mapping[str, Any]) -> list[str]:
+    """The ``status`` finding of each open remediation storm breaker: the
+    cluster's new destructive remediation is held until an operator acts."""
+
+    clusters = report.get("clusters")
+    lines: list[str] = []
+    for cluster_id, cluster in sorted(
+        (clusters if isinstance(clusters, dict) else {}).items()
+    ):
+        storm = cluster.get("remediation_storm") if isinstance(cluster, dict) else None
+        if not isinstance(storm, dict) or storm.get("state") not in {
+            "TRIPPED",
+            "ABORTED",
+        }:
+            continue
+        lines.append(
+            f"remediation storm breaker {cluster_id}: {storm['state']} since "
+            f"{storm.get('tripped_at')} ({storm.get('trip_nodes')} nodes, threshold "
+            f"{storm.get('trip_threshold')}, in 600 s across {storm.get('trip_domains')} "
+            "domains); new destructive remediation is held; resume: gpu-fault-admin "
+            f"remediation-storm release --state-dir <state-dir> --cluster-id {cluster_id} "
+            "--reason ... --reference ... (or abort)"
+        )
+    return lines
+
+
 def selected_node_items(nodes: dict[str, Any], selector: str) -> dict[str, Any]:
     """``nodes`` with only the items that satisfy ``selector``.
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from threading import RLock
 
 from gpu_fault.installation_resources import InstallationResource
+from gpu_fault.remediation_storm import RemediationStormBreaker
 from gpu_fault.models import (
     AdvisoryNotification,
     CompletionDecision,
@@ -28,6 +29,7 @@ from gpu_fault.store.memory.fleet import MemoryFleetMixin
 from gpu_fault.store.memory.notifications import MemoryNotificationMixin
 from gpu_fault.store.memory.processor_leases import MemoryProcessorLeaseMixin
 from gpu_fault.store.memory.processor_queue import MemoryProcessorQueueMixin
+from gpu_fault.store.memory.remediation_storm import MemoryRemediationStormMixin
 from gpu_fault.store.memory.remote_commands import MemoryRemoteCommandMixin
 from gpu_fault.store.memory.signal_retention import MemorySignalRetentionMixin
 from gpu_fault.store.memory.telemetry import MemoryTelemetryMixin
@@ -70,6 +72,7 @@ class InMemoryStore(
     MemoryProcessorLeaseMixin,
     MemoryFleetMixin,
     MemorySignalRetentionMixin,
+    MemoryRemediationStormMixin,
     # Pure rules and public-contract compositions every store shares.
     SharedSignalRetentionMixin,
     SharedEfaTrafficRulesMixin,
@@ -145,6 +148,7 @@ class InMemoryStore(
         self._processor_requests = {}
         self._telemetry_spool: dict[str, dict] = {}
         self._restart_budgets: dict[tuple[str, str], RestartBudgetState] = {}
+        self._remediation_storm_breakers: dict[str, RemediationStormBreaker] = {}
         self._replacement_fault_groups: dict[str, str] = {}
         self._sxid_fault_groups: dict[str, str] = {}
         self._xid_correlation_events = {}

@@ -2078,6 +2078,37 @@ groups:
             it or NODE_ACTION_LONGEST_LIFE_SECONDS (5520 s) passes. Do not hand
             edit claims or raise the per-node or per-failure-domain limit (a
             safety constant of 1) to clear this alert.
+      # The remediation storm breaker of a GPU cluster tripped: at least
+      # max(3, ceil(20% of its GPU nodes)) nodes entered destructive
+      # remediation within 600 s across two or more workload domains -- more
+      # than one fault explains. The cluster's new destructive work is held
+      # (work in flight goes on) and nothing resumes without an operator, so
+      # this pages. The gauge is Store-derived: every process renders it.
+      - alert: GpuFaultRemediationStormBreakerOpen
+        expr: >-
+          max by (control_plane_cluster, region, cluster_id)
+          (gpu_fault_remediation_budget_storm_breaker_open) == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: A GPU cluster's remediation storm breaker is open; its new destructive remediation is held
+          runbook_url: docs/en/administrator-operations.md#gpufaultremediationstormbreakeropen
+          description: >-
+            The remediation storm breaker of GPU cluster {{ $labels.cluster_id }}
+            is open: more GPU nodes entered destructive remediation within 600 s,
+            across more than one job or incident, than its threshold
+            (gpu_fault_remediation_budget_storm_breaker_window_nodes against
+            gpu_fault_remediation_budget_storm_breaker_threshold_nodes). New destructive
+            work there -- job stops and restarts, GPU resets, reboots,
+            replacements, quarantines -- is held PENDING
+            (gpu_fault_remediation_budget_storm_breaker_held_workflows); work in flight
+            goes on. Find the common cause (a rollout, a fabric or power event,
+            a bad detector) and stop it, then resume with gpu-fault-admin
+            remediation-storm release --cluster-id {{ $labels.cluster_id }}, or
+            hand the held workflows to people with gpu-fault-admin
+            remediation-storm abort. Nothing resumes by itself. Do not edit the
+            breaker or the held workflows in the Store.
       # A completion event with no decision row at all. Every persisted event
       # is meant to be decided in the same transaction; one without a decision
       # was recorded and then never judged, and nothing downstream will ever

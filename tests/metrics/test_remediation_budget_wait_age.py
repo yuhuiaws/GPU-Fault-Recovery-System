@@ -168,3 +168,38 @@ def test_no_waiter_renders_no_longest_wait_series() -> None:
         for line in lines
         if line.startswith("gpu_fault_remediation_budget_longest_wait_seconds{")
     ], "a scope type without a waiter renders no series"
+
+
+def test_the_storm_breaker_gauges_are_one_series_per_cluster() -> None:
+    from gpu_fault.app.remediation_budget_metrics import remediation_storm_lines
+    from gpu_fault.remediation_storm import (
+        StormCandidate,
+        closed_breaker,
+        storm_admission,
+    )
+
+    record = closed_breaker("cluster-a", NOW)
+    for index in range(3):
+        record, _ = storm_admission(
+            record,
+            StormCandidate(
+                cluster_id="cluster-a",
+                workflow_id=f"w-{index}",
+                node_ids=frozenset({f"node-{index}"}),
+                domain=f"incident:{index}",
+            ),
+            now=NOW,
+            cluster_nodes=None,
+        )
+    closed = closed_breaker("cluster-b", NOW)
+    held = _waiter("held", "storm:cluster-a", timedelta(seconds=30))
+
+    lines = remediation_storm_lines([closed, record], budget_tally([held], NOW))
+
+    prefix = "gpu_fault_remediation_budget_storm_breaker"
+    assert f'{prefix}_open{{cluster_id="cluster-a"}} 1' in lines
+    assert f'{prefix}_open{{cluster_id="cluster-b"}} 0' in lines
+    assert f'{prefix}_window_nodes{{cluster_id="cluster-a"}} 3' in lines
+    assert f'{prefix}_threshold_nodes{{cluster_id="cluster-a"}} 3' in lines
+    assert f'{prefix}_held_workflows{{cluster_id="cluster-a"}} 1' in lines
+    assert f'{prefix}_tripped_timestamp_seconds{{cluster_id="cluster-b"}} 0' in lines

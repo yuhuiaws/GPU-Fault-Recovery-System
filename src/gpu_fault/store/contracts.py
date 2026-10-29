@@ -57,6 +57,7 @@ if TYPE_CHECKING:
         WorkflowRequest,
         WorkflowStatus,
     )
+    from gpu_fault.remediation_storm import RemediationStormBreaker, StormCandidate
     from gpu_fault.processor.models import (
         PeriodicTaskLease,
         ProcessorRequest,
@@ -252,6 +253,31 @@ class FleetStore(Protocol):
     def get_barrier(self, barrier_id: str) -> MultiNodeBarrier: ...
 
     def list_barriers(self) -> list[MultiNodeBarrier]: ...
+
+
+@runtime_checkable
+class RemediationStormStore(Protocol):
+    """The remediation storm breaker of each GPU cluster (``remediation_storm``).
+
+    ``claim_workflow`` reads and writes a breaker inside an admission; the
+    operator's release and abort replace it by compare-and-set.
+    """
+
+    def get_remediation_storm_breaker(
+        self, cluster_id: str
+    ) -> RemediationStormBreaker | None: ...
+
+    def list_remediation_storm_breakers(self) -> list[RemediationStormBreaker]: ...
+
+    def replace_remediation_storm_breaker(
+        self,
+        record: RemediationStormBreaker,
+        *,
+        expected: RemediationStormBreaker | None,
+    ) -> RemediationStormBreaker:
+        """Write ``record`` if the stored one still equals ``expected``
+        (``None``: none stored); else ``StaleWriteError``."""
+        ...
 
 
 @runtime_checkable
@@ -656,6 +682,7 @@ class WorkflowStore(Protocol):
         lease_duration: timedelta = timedelta(minutes=3),
         remediation_budget_claims: dict[str, int] | None = None,
         remediation_budget_hold: bool = False,
+        remediation_storm: StormCandidate | None = None,
     ) -> WorkflowRequest:
         """Lease the workflow; with budget claims also take its budget.
 
@@ -664,7 +691,9 @@ class WorkflowStore(Protocol):
         ``RemediationBudgetError``. With ``remediation_budget_hold`` it is the
         claim of a workflow whose budgeted work has begun: the scopes it holds
         are kept, ``remediation_budget_claims`` is added, and it is never
-        refused (``gpu_fault.store.shared.remediation_budgets``).
+        refused (``gpu_fault.store.shared.remediation_budgets``). An admission
+        with ``remediation_storm`` is also judged by its cluster's storm
+        breaker, in the same transaction (``RemediationStormHold``).
         """
         ...
 
@@ -1261,6 +1290,7 @@ class ControlPlaneStore(
     ProcessorStore,
     FleetStore,
     DepartedNodeStore,
+    RemediationStormStore,
     InstallationResourceStore,
     WorkflowStore,
     CompletionStore,

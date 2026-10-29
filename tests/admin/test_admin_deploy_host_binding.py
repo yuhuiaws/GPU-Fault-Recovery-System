@@ -81,6 +81,16 @@ def enforce(arguments: argparse.Namespace) -> None:
             "--confirm",
             "REPLACE_RESOURCE",
         ],
+        [
+            "remediation-storm",
+            "release",
+            "--cluster-id",
+            "cluster-a",
+            "--reason",
+            "rollout reverted",
+            "--reference",
+            "CHG-fixture",
+        ],
     ],
     ids=[
         "join",
@@ -98,6 +108,7 @@ def enforce(arguments: argparse.Namespace) -> None:
         "rollback-consent",
         "prepared-deploy",
         "replace-resource",
+        "storm-release",
     ],
 )
 def test_unbound_mutations_name_the_site_cli(tmp_path: Path, argv: list[str]) -> None:
@@ -163,6 +174,17 @@ def test_outbox_reads_still_require_the_bound_cli(tmp_path: Path, action: str) -
             "--reference",
             "CHG-fixture",
         ],
+        [
+            "remediation-storm",
+            "release",
+            "--cluster-id",
+            "cluster-a",
+            "--reason",
+            "rollout reverted",
+            "--reference",
+            "CHG-fixture",
+            "--dry-run",
+        ],
     ],
     ids=[
         "status",
@@ -176,6 +198,7 @@ def test_outbox_reads_still_require_the_bound_cli(tmp_path: Path, action: str) -
         "map",
         "failback-plan",
         "replace-resource-plan",
+        "storm-plan",
     ],
 )
 def test_readonly_forms_remain_available_and_rotate_as_readonly(

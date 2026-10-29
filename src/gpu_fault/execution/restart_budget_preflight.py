@@ -15,6 +15,7 @@ from gpu_fault.execution.remediation_budget import (
     budget_work_begun,
     remediation_budget_claims,
 )
+from gpu_fault.execution.storm_admission import storm_candidate
 from gpu_fault.models import (
     FaultIncident,
     IncidentState,
@@ -440,18 +441,20 @@ def prepare_claimed_workflow(
     """Claim a workflow and finish every no-mutation preflight gate."""
 
     steps = workflow.safety_steps if is_safety else workflow.official_steps
+    claims = remediation_budget_claims(
+        executor.config.remediation_budget, workflow, incident, steps
+    )
+    hold = budget_work_begun(workflow, steps)
     workflow = executor.store.claim_workflow(
         request_id,
         executor.config.executor_id,
         request.expected_fencing_token,
         lease_duration=executor._lease_duration,
-        remediation_budget_claims=remediation_budget_claims(
-            executor.config.remediation_budget,
-            workflow,
-            incident,
-            steps,
+        remediation_budget_claims=claims,
+        remediation_budget_hold=hold,
+        remediation_storm=storm_candidate(
+            executor.store, workflow, incident, claims, hold=hold
         ),
-        remediation_budget_hold=budget_work_begun(workflow, steps),
     )
     deadlines = claim_deadlines(
         workflow,

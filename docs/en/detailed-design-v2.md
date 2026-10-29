@@ -2288,7 +2288,7 @@ PagerDuty, Slack or webhook integration (§11).
 **② Inputs and outputs**: in: notification records produced by orchestration and periodic tasks. Out: SNS publishes or SES emails; the database keeps the notification
 records and their delivery status.
 
-**③ Internal components**: `src/gpu_fault/notifications/registry.py` registers **22** notification template kinds
+**③ Internal components**: `src/gpu_fault/notifications/registry.py` registers **23** notification template kinds
 (XID investigation, SXID events, DCGM diagnostics, EFA/RDMA, NVLink7.4 mechanical parts and support, hardware upgrade and inventory,
 host resources, HyperPod advisory, warm spare, reboot guard, not-applicable notes, and so on, plus `DIAGNOSTIC_INCONCLUSIVE`, added by the control-plane review of 2026-09-08:
 template `diagnostic-inconclusive-zh-v1`, category `ADVISORY`,
@@ -4890,6 +4890,36 @@ row an older release refused on a node-group domain is judged afresh by the disp
 the recorded `domain:` scope is not among the scopes the row would ask for now, so it does not wait behind the old string
 (`budget_guard`).
 
+Remediation storm breaker (`gpu_fault/remediation_storm.py`). No fixed number decides how many workflows one cluster repairs
+at once; the protection across failure domains is one breaker per GPU cluster. It counts **nodes that newly enter destructive
+remediation** -- a workflow's first admission of its budgeted steps (a hold, a `RUNNING` row that already holds its claims and a
+preempting successor taking over its predecessor's reserved slot are work in flight, never counted and never held) -- and trips
+when, in a sliding 600-s window, they reach max(3, ceil(20% of the cluster's GPU nodes)) and belong to at least two workload
+domains (the nodes of one job, or of one incident without a job, are one domain). One big job failing on many nodes is one
+fault and never trips it; many unrelated nodes failing together look like a bad driver, image or policy. The node count is the
+cluster's `ACTIVE`/`DRAINING` fleet Agents (one per GPU node; a departed node counts until the departed-node cleanup retires its
+Agent, so the threshold errs high, not low), read at most once a minute per process and cluster
+(`execution/storm_admission.py`); unreadable, the floor of 3 applies. 20 %, 600 s and 3 are product constants with no
+environment variables. The judgement runs in the admission's own store transaction: the breaker is the store's
+`remediation_storm_breaker` record (a generic object kind, no schema migration) keyed by cluster id, read and written after the
+budget scopes admitted the claim, under the `remediation_storm/<cluster>` lock (PostgreSQL takes it last in the batch of budget
+advisory locks), so control-plane restarts and replicas see one breaker; an admission a budget scope refused does not count.
+Tripped, every first admission in that cluster is held, not failed: the store records the scope `storm:<cluster>` and a reason
+naming the numbers and the exits, the row stays `PENDING`, the dispatcher's guard passes it over while the breaker is open and
+records never-refused rows of the cluster on the same scope, and the admission that tripped it also carries one `HOLD` /
+`REMEDIATION_STORM_TRIPPED` event (nodes, domains, threshold, cluster nodes). Work already admitted goes on uninterrupted. The
+breaker never closes by itself: the dispatcher sends one operator notice per trip each tick it finds one unsent
+(`REMEDIATION_STORM_TRIPPED`, category `OPERATOR_REVIEW`, priority 0, deduplicated by the trip; the breaker records the trip
+notified), `gpu-fault-admin status` names it, and the alert `GpuFaultRemediationStormBreakerOpen` (critical) keeps firing. The
+exits are `gpu-fault-admin remediation-storm release|abort` (written in the Pod by `workflow_reconcile.remediation_storm_action`
+by compare-and-set, with the operator identity, `--reason` and `--reference`, idempotent, `--dry-run` read-only): `release`
+closes and re-arms it (the window empties; rows held through the trip are admitted on their next claim without counting again,
+faults after it count from zero); `abort` keeps it open and hands every held workflow to the operator -- `SUPERSEDED` with a
+`REMEDIATION_STORM_ABORTED` operator event, the incident `ESCALATED` -- until a later `release`. A held workflow stays `PENDING`
+whole, as a budget refusal leaves it: its `FREEZE_EVIDENCE` / `MARK_UNSCHEDULABLE` prefix does not run first (containment while
+waiting is b220's design proposal, not implemented), so the nodes an `abort` hands over were not cordoned by that workflow.
+Processes still on an older release during a roll do not update the window; their admissions go uncounted.
+
 Once admitted, the claim is held until the workflow is terminal (`SUCCEEDED`, `FAILED`, `SUPERSEDED`, or a `BLOCKED` with
 nothing left in flight, below): WAITING steps, long commands, the re-dispatch of every tick, lease renewal and an executor hand-over release nothing. Occupancy counts
 `RUNNING` status, not the lease: a lease is execution ownership, and a dispatcher hand-over, a row past the batch cut or an
@@ -4993,7 +5023,9 @@ refused it; a row an older release refused carries no such event and counts from
 those slots belong to one node, one job (the token a step that stops or restarts it takes) or one fabric partition, so another
 workflow of the same node or job holds it and has not ended within an hour -- past a progressing holder's own deadline (1800 s for a node
 workflow, 3600 s for a job workflow); cluster, region and class waits drain by design during a correlated fault and are not
-read.
+read. The storm breaker is `gpu_fault_remediation_budget_storm_breaker_open{cluster_id}` (1 while open), `..._window_nodes`
+against `..._threshold_nodes`, `..._tripped_timestamp_seconds` and `..._held_workflows`; `GpuFaultRemediationStormBreakerOpen`
+(critical, 1 minute) fires for as long as it is open.
 
 `GPU_FAULT_PROCESSOR_COMPLETION_CLUSTER_CONCURRENCY` is not a counterexample: it only controls
 the number of commit threads for different cluster transactions within a PostgreSQL completion batch; it does not limit how many nodes
