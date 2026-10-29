@@ -208,7 +208,17 @@ class HyperPodSpareHealthController:
                     if reason is None:
                         active_reservations += 1
                         continue
-                    self.coordinator.release([node_name], reservation)
+                    if not self.coordinator.release([node_name], reservation):
+                        # Released since the read (the owner, or a scan that
+                        # took the task lease over), or reserved again: the
+                        # CAS patched nothing, so this is no reclaim.
+                        LOGGER.info(
+                            "stale spare reservation already released: "
+                            "node=%s incident=%s",
+                            node_name,
+                            reservation,
+                        )
+                        continue
                     self._reclaimed_reservations += 1
                     results.append(
                         {

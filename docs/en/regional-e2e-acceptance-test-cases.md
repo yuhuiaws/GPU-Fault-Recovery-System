@@ -13282,10 +13282,11 @@ taken over, `RESTORE_SCHEDULING` still converges under concurrent 409s, isolatio
     `spec.unschedulable` is still true;
   - The executor log has exactly one line `reclaimed stale spare reservation: node=<spare>
     incident=acceptance-stale-<run>`, no reclaim line for another node/another incident appears,
-    and neither does `spare reservation sweep failed`;
+    and neither does `spare reservation sweep failed`; a replica that finds after its read that a peer replica already released the
+    reservation only logs INFO `stale spare reservation already released: …`, which is not a reclaim line;
   - `counters.spare_reservations_reclaimed_total` of every executor replica does not regress;
     the replicas whose `last_successful_claim_at` is later than the reclaim instant sum to exactly +1 (the two replicas sweep independently, release
-    is idempotent, only one can win); the replica set is unchanged;
+    is a patch conditional on resourceVersion, only one can win, and the counter counts only releases actually applied); the replica set is unchanged;
   - The synthetic incident queries NotFound both before and after, no workflow/incident record of any kind is produced;
   - After cleanup the spare's three annotations and cordon state are item-by-item equal to the declared baseline, spare labels and taints unchanged;
     the scheduling state of the other GPU nodes equals the baseline; provider verb set empty; runtime identity equal to

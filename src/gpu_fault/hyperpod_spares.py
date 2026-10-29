@@ -107,6 +107,30 @@ def _spare_health_subjects(provider: ClusterProvider) -> tuple[str, str]:
     return "EKS node group topology", "node status"
 
 
+def _patch_applied(
+    core: Any,
+    node_name: str,
+    build_body: Callable[[Any], dict[str, Any] | None],
+) -> bool:
+    """``patch_node_with_retry``, and whether it applied a patch.
+
+    It returns normally only after the patch built from its last read was
+    applied or that read needed none, so the last body decides. The patch
+    carries the read's resourceVersion: of two replicas releasing at once, the
+    later one gets a 409, re-reads, and finds nothing left to patch.
+    """
+    applied = False
+
+    def body(node: Any) -> dict[str, Any] | None:
+        nonlocal applied
+        patch = build_body(node)
+        applied = patch is not None
+        return patch
+
+    patch_node_with_retry(core, node_name, body)
+    return applied
+
+
 class HyperPodSpareCoordinator:
     """Atomically activates healthy, topology-compatible warm spares."""
 
@@ -436,8 +460,9 @@ class HyperPodSpareCoordinator:
                 names.add(name)
         return names
 
-    def release(self, node_ids: list[str], incident_id: str) -> None:
-        self._rollback(node_ids, incident_id)
+    def release(self, node_ids: list[str], incident_id: str) -> list[str]:
+        """Release ``incident_id``'s reservations; returns the nodes patched."""
+        return self._rollback(node_ids, incident_id)
 
     def reserve(
         self,
@@ -731,22 +756,29 @@ class HyperPodSpareCoordinator:
             "spec": {"unschedulable": True},
         }
 
-    def _rollback(self, node_ids: list[str], incident_id: str) -> None:
+    def _rollback(self, node_ids: list[str], incident_id: str) -> list[str]:
         """Release every reservation ``incident_id`` holds on ``node_ids``.
 
         One node's failure must not strand the others: a release that
         stopped at the first error left the rest reserved forever, and no
         later path ever came back for them. The first error is re-raised
         after the loop.
+
+        Returns the nodes whose release patch applied, in ``node_ids`` order:
+        not a node that is gone or whose fresh read no longer names
+        ``incident_id`` (a peer replica or the owner released it first, or
+        another incident reserved it since). Count reclaims only by these.
         """
         first_error: Exception | None = None
+        released: list[str] = []
         for node_name in reversed(node_ids):
             try:
-                patch_node_with_retry(
+                if _patch_applied(
                     self.core,
                     node_name,
                     lambda node: self._release_body(node, incident_id),
-                )
+                ):
+                    released.append(node_name)
             except Exception as exc:
                 if getattr(exc, "status", None) == 404:
                     continue
@@ -759,6 +791,7 @@ class HyperPodSpareCoordinator:
                     first_error = exc
         if first_error is not None:
             raise first_error
+        return released[::-1]
 
     def _alert(
         self,

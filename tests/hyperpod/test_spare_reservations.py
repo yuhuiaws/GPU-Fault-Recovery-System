@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import copy
+import logging
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from typing import Callable
 
 import pytest
 
@@ -72,6 +75,55 @@ class FakeCore:
 
     def list_pod_for_all_namespaces(self, field_selector=None):
         return {"items": []}
+
+
+class ApiServerCore(FakeCore):
+    """``FakeCore`` with the two apiserver guarantees replicas rely on.
+
+    A read is a private snapshot, so what a replica read earlier stays stale,
+    and a patch naming ``metadata.resourceVersion`` is refused with 409 unless
+    that is still the node's current one: the CAS ``patch_node_with_retry``
+    builds on. ``before_patch`` runs once, ahead of the next patch -- the
+    moment a peer can slip in between a release's read and its patch.
+    """
+
+    def __init__(self, nodes):
+        super().__init__(nodes)
+        self.before_patch: Callable[[], object] | None = None
+
+    def read_node(self, node_id):
+        if node_id not in self.nodes:
+            error = RuntimeError(f"node {node_id} not found")
+            error.status = 404  # type: ignore[attr-defined]
+            raise error
+        return copy.deepcopy(super().read_node(node_id))
+
+    def patch_node(self, node_id, body):
+        hook, self.before_patch = self.before_patch, None
+        if hook is not None:
+            hook()
+        expected = body["metadata"].get("resourceVersion")
+        if expected and expected != self.nodes[node_id]["metadata"]["resourceVersion"]:
+            error = RuntimeError("the object has been modified")
+            error.status = 409  # type: ignore[attr-defined]
+            raise error
+        super().patch_node(node_id, body)
+
+
+class ReplicaCoordinator(HyperPodSpareCoordinator):
+    """One replica's coordinator; ``before_release`` runs once, first.
+
+    That is the window between a replica judging a reservation stale and its
+    release, in which a peer replica (or the owner) may release it first.
+    """
+
+    before_release: Callable[[], object] | None = None
+
+    def release(self, node_ids, incident_id):
+        hook, self.before_release = self.before_release, None
+        if hook is not None:
+            hook()
+        return super().release(node_ids, incident_id)
 
 
 def spare(instance_id: str) -> HyperPodNode:
@@ -171,6 +223,33 @@ def test_rollback_retries_a_resource_version_conflict() -> None:
     coordinator.release(["hyperpod-i-1"], "incident-a")
 
     assert _released(core_nodes["hyperpod-i-1"]), "conflict was not retried"
+
+
+def test_release_returns_only_the_nodes_whose_release_it_applied() -> None:
+    """A node another incident holds, one already released and one that is
+    gone need no patch; a caller that counts reclaims must not count them."""
+    core = ApiServerCore(
+        {
+            "hyperpod-i-1": reserved_node("incident-a"),
+            "hyperpod-i-2": reserved_node("incident-b"),
+        }
+    )
+    coordinator = HyperPodSpareCoordinator(FakeLifecycle([]), build_store(), core)
+
+    released = coordinator.release(
+        ["hyperpod-i-1", "hyperpod-i-2", "hyperpod-i-gone"], "incident-a"
+    )
+    again = coordinator.release(["hyperpod-i-1"], "incident-a")
+
+    assert released == ["hyperpod-i-1"], f"applied releases differ: {released}"
+    assert again == [], f"a release with nothing left to patch applied: {again}"
+    assert [name for name, _ in core.patches] == ["hyperpod-i-1"], core.patches
+    assert (
+        core.nodes["hyperpod-i-2"]["metadata"]["annotations"][
+            SPARE_RESERVATION_ANNOTATION
+        ]
+        == "incident-b"
+    ), "another incident's reservation was released"
 
 
 def test_reservation_writes_its_timestamp() -> None:
@@ -294,6 +373,51 @@ def test_scan_publishes_a_reservation_gauge() -> None:
     assert snapshot["spare_reservations_active"] == 1
     assert snapshot["spare_reservations_reclaimed_total"] == 1
     assert snapshot["spare_reservations_observed_at"] == NOW.isoformat()
+
+
+def test_scan_counts_no_reclaim_when_a_peer_released_the_reservation_first(
+    caplog,
+) -> None:
+    """Two scans judge one orphaned reservation (a periodic-task lease handed
+    over mid-scan, or the owner releasing it at the same time). The release is
+    a resourceVersion CAS, so one of them applies it; only that is a reclaim."""
+    store = build_store()
+    _incident_with_workflow(store, "incident-failed", WorkflowStatus.FAILED)
+    core = ApiServerCore({"hyperpod-i-1": reserved_node("incident-failed")})
+
+    def controller() -> HyperPodSpareHealthController:
+        coordinator = ReplicaCoordinator(
+            FakeLifecycle([spare("i-1")]), store, core, now=lambda: NOW
+        )
+        return HyperPodSpareHealthController(
+            coordinator,
+            SimpleNamespace(ingest_node_health=None),
+            store,
+            now=lambda: NOW,
+        )
+
+    late, peer = controller(), controller()
+    late.coordinator.before_release = peer.scan
+
+    with caplog.at_level(logging.INFO, logger="gpu_fault.spare_health"):
+        results = late.scan()
+
+    assert results == [], f"a release that applied nothing was reported: {results}"
+    assert late.metrics_snapshot()["spare_reservations_reclaimed_total"] == 0
+    assert peer.metrics_snapshot()["spare_reservations_reclaimed_total"] == 1
+    assert len(core.patches) == 1, core.patches
+    assert _released(core.nodes["hyperpod-i-1"]), "the reservation was kept"
+    infos = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "gpu_fault.spare_health"
+        and record.levelno == logging.INFO
+        and "already released" in record.getMessage()
+    ]
+    assert infos == [
+        "stale spare reservation already released: node=hyperpod-i-1 "
+        "incident=incident-failed"
+    ], infos
 
 
 # --- executor-side hook ---------------------------------------------------

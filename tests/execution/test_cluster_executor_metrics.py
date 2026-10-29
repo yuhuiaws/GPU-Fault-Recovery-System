@@ -79,8 +79,10 @@ from tests.execution.test_cluster_executor_lease_and_report import (
 from tests.execution.test_cluster_executor_report_retry import FlakyReportClient
 from tests.hyperpod.test_spare_reservations import (
     NOW,
+    ApiServerCore,
     FakeCore,
     FakeLifecycle,
+    ReplicaCoordinator,
     reserved_node,
     spare,
 )
@@ -514,6 +516,50 @@ def test_a_sweep_that_reclaims_a_spare_moves_the_reclaimed_series(tmp_path) -> N
     assert sweep.reclaimed_total == 1, "the fixture must reclaim exactly one spare"
     assert values["spare_reservations_reclaimed_total"] == 1, values
     assert executor.metrics_snapshot()["spare_reservations_reclaimed_total"] == 1
+
+
+def test_only_the_replica_whose_release_applied_moves_the_reclaimed_series(
+    tmp_path,
+) -> None:
+    """Live DESTR-022 (two executor replicas): both sweeps judged one stale
+    reservation before either released it. One release applied, the other
+    found nothing left to patch -- and both series moved by one."""
+    core = ApiServerCore(
+        {
+            "hyperpod-i-1": reserved_node(
+                "incident-old", reserved_at=NOW - timedelta(hours=2)
+            )
+        }
+    )
+
+    def replica(name: str) -> tuple[ClusterActionExecutor, ReplicaCoordinator]:
+        coordinator = ReplicaCoordinator(
+            FakeLifecycle([spare("i-1")]), None, core, now=lambda: NOW
+        )
+        sweep = SpareReservationSweep(
+            coordinator, ttl_seconds=3600.0, interval_seconds=300.0, now=lambda: NOW
+        )
+        executor = build_executor(
+            FakeExecutorClient(),
+            [],
+            tmp_path,
+            liveness_state_path=str(tmp_path / f"{name}-loop-alive"),
+            spare_reservation_sweep=sweep,
+        )
+        return executor, coordinator
+
+    late, late_coordinator = replica("late")
+    peer, _ = replica("peer")
+    late_coordinator.before_release = peer.sweep_spare_reservations
+
+    late.sweep_spare_reservations()
+
+    assert executor_samples(peer)["spare_reservations_reclaimed_total"] == 1
+    assert executor_samples(late)["spare_reservations_reclaimed_total"] == 0, (
+        "a release the peer replica already applied moved the late series"
+    )
+    assert late.metrics_snapshot()["spare_reservations_reclaimed_total"] == 0
+    assert len(core.patches) == 1, core.patches
 
 
 def test_a_lost_lease_and_an_abandoned_hold_are_exported(tmp_path) -> None:

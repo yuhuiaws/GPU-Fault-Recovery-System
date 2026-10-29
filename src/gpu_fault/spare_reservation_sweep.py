@@ -65,7 +65,11 @@ class SpareReservationSweep:
         return self._next_due is None or self.clock() >= self._next_due
 
     def run(self) -> list[str]:
-        """Sweep every spare-labelled node once; returns the nodes released."""
+        """Sweep every spare-labelled node once; returns the nodes released.
+
+        Only a release this replica applied is a reclaim: it alone moves
+        ``reclaimed_total`` and logs the WARNING.
+        """
 
         self._next_due = self.clock() + self.interval_seconds
         released: list[str] = []
@@ -95,7 +99,18 @@ class SpareReservationSweep:
             reason = self.reclaimer.reason(node_name, kubernetes_node, reservation)
             if reason is None:
                 continue
-            self.coordinator.release([node_name], reservation)
+            if not self.coordinator.release([node_name], reservation):
+                # Every replica sweeps the same nodes. A peer (or the owner)
+                # released it after this replica's read, or another incident
+                # has reserved the spare since: the CAS patched nothing, so
+                # nothing was reclaimed here (live DESTR-022, two replicas,
+                # each counted and logged the one release).
+                LOGGER.info(
+                    "stale spare reservation already released: node=%s incident=%s",
+                    node_name,
+                    reservation,
+                )
+                continue
             self.reclaimed_total += 1
             released.append(node_name)
             LOGGER.warning(
