@@ -556,6 +556,29 @@ rules:
       - GF-REGIONAL-DESTR-026
     counts_as_domain: false
 
+  - id: workload-failure-domains
+    description: >-
+      Two idle GPU nodes of one node group recover in parallel
+      (GF-REGIONAL-DESTR-027): the per-node and per-job remediation budget
+      scopes b220 left, the storm breaker's first-admission count, and the
+      case's runner and shared read-only oracle.
+    paths:
+      - src/gpu_fault/execution/remediation_budget.py
+      - src/gpu_fault/execution/storm_admission.py
+      - src/gpu_fault/remediation_storm.py
+      - scripts/e2e/regional/run_destr027_two_idle_node_parallel_reset.py
+      - scripts/e2e/regional/workload_domain_oracle.py
+      - tests/regional/test_destr027_two_idle_node_parallel_reset.py
+      - tests/regional/test_workload_domain_oracle.py
+    pytest:
+      - tests/regional/test_workload_domain_oracle.py
+      - tests/regional/test_destr027_two_idle_node_parallel_reset.py
+      - tests/execution/test_remediation_budget.py
+      - tests/execution/test_remediation_storm_admission.py
+    regional_cases:
+      - GF-REGIONAL-DESTR-027
+    counts_as_domain: false
+
   - id: gpu-environment-live-acceptance
     description: >-
       The GF-ENV-LIVE live acceptance runner and its reviewed replay plans:

@@ -211,7 +211,14 @@ phases:
         predecessor: GF-REGIONAL-DESTR-002
       - case: GF-REGIONAL-DESTR-026
         predecessor: GF-REGIONAL-DESTR-015
+      - case: GF-REGIONAL-DESTR-027
+        predecessor: GF-REGIONAL-DESTR-001
     notes:
+      - DESTR-027 以 DESTR-001 PASS 为证据前置，需要同一节点组至少 2 台 GPU 节点（live 计数，不足即 NOT_RUN(CAPABILITY_ABSENT)），
+        从该组按名称序取两台合格的空闲节点，同时各写一条 XID 46，证明两条各自的 RESET_GPU 工作流只按 node 作用域互斥、
+        不被节点组 domain 串行、预算步骤在持久化时间戳上重叠、storm breaker 保持 CLOSED。它独占该集群执行：两台节点都被
+        quiesce/reset，期间不得在同一集群上运行其他破坏性用例；同一集群的下一条破坏性用例在结果的 window_clear_at（首次准入
+        加 600 s）之后开始，否则两条用例的节点在 breaker 窗口里一起计数。
       - DESTR-026 以 DESTR-015 PASS 为证据前置（两节点作业的真实 reset 与单次 join 已成立），在两节点训练作业
         Master 所在节点上同时为两张 GPU 各写入一条 XID 46，证明同节点同级的两个故障在首步之前合并为一个 incident、
         一条工作流、一个同时覆盖两张 GPU 的 quiesce/reset 窗口，作业只停一次、只重启一次；作业的第二台节点只随作业

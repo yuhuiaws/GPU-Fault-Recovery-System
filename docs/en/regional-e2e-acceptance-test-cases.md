@@ -13767,6 +13767,113 @@ BLOCKED, no quiesce and no reset; once the watcher recovers the heartbeat return
     device node (`nvidia-persistenced`, for one), and a batched dispatch would reset the second card only in the record; the second card
     takes the successor shape above instead (judged by GF-REGIONAL-PREEMPT-021).
 
+### GF-REGIONAL-DESTR-027
+
+> The precondition is a live node count, not a cluster name: at least 2 GPU nodes in one node group
+> (`eks.amazonaws.com/nodegroup` or `sagemaker.amazonaws.com/instance-group-name`); short of it the whole case is
+> `NOT_RUN(CAPABILITY_ABSENT)`, naming the requirement and the count found. Plain EKS and HyperPod are judged identically; on
+> HyperPod `QUIESCE_GPU_SERVICES` stops kubelet, on `eks-managed` it applies the `gpu-fault.io/quiesce` taint, and between the
+> injection and the two workflows' terminal states the runner reads the store only.
+
+**Two idle GPU nodes of one node group fault in the same window: each recovers through its own RESET_GPU workflow, in parallel, no longer serialized by the node-group domain**
+
+- Level: `destructive`. On two idle nodes of one node group it really executes DESTR-001's `QUIESCE_GPU_SERVICES` and single-GPU
+  `RESET_GPU` once each, at the same time. **No reboot, no replace, no warm spare is declared, no training job is submitted, no
+  control-plane, executor or storm-breaker setting is changed.** Both nodes are quiesced and reset at once, so the case runs alone on
+  its cluster.
+- The reusable formal entry point is `scripts/e2e/regional/run_destr027_two_idle_node_parallel_reset.py` (the verdicts on the store
+  records are in the shared read-only oracle `scripts/e2e/regional/workload_domain_oracle.py`, unit tests in
+  `tests/regional/test_workload_domain_oracle.py` and `tests/regional/test_destr027_two_idle_node_parallel_reset.py`; each node's reset
+  contract and host assertions are reused unchanged from `scripts/e2e/regional/run_destr001_gpu_reset.py`). By default it only
+  generates the plan; before execute it must read `DESTR-001=PASS` on the same release. The runner chooses the node group and the two
+  target nodes from the live cluster: the node group with the most GPU nodes (or the one `--node-group` names), and its first two
+  eligible idle nodes in name order; the runner takes no node argument, so no site-profile node key binds to it:
+
+  ```bash
+  python3 scripts/e2e/regional/run_destr027_two_idle_node_parallel_reset.py \
+    --run-dir "${RUN_DIR}" --attempt 1 --plan \
+    --site-profile "${SITE_PROFILE}"
+
+  python3 scripts/e2e/regional/run_destr027_two_idle_node_parallel_reset.py \
+    --run-dir "${RUN_DIR}" --attempt 1 --execute \
+    --confirm DESTR027_EXECUTE \
+    --maintenance-window-end "${MAINTENANCE_WINDOW_END}" \
+    --site-profile "${SITE_PROFILE}"
+  ```
+
+- Purpose: before b220 the remediation budget gave every failure domain read from node labels (instance group, EKS node group) one
+  `domain:<cluster>:<group>` slot, beside the fixed `region`, `cluster:<cluster>` and `class:<cluster>:<resource class>` limits, so
+  unrelated faults on two nodes of one node group could only be repaired one after the other: the second workflow waited `PENDING`
+  behind a remediation_budget hold (`REMEDIATION_BUDGET_WAIT`) on that `domain:` scope. Since b220
+  (`src/gpu_fault/execution/remediation_budget.py`) a GPU node without a training job is one merged workflow of its own, workflows
+  exclude each other only through `node:<cluster>:<node>` (limit 1), and the one `domain:` left is the node-local NVSwitch
+  `fabric_partition` an SXID writes into its steps; the region, per-cluster and per-resource-class limits are retired, and a correlated
+  fault is bounded by the cluster's storm breaker (`src/gpu_fault/remediation_storm.py`): when at least max(3, ceil(0.2 × the
+  cluster's GPU nodes)) distinct nodes first enter destructive remediation within 600 s across at least 2 workload domains (a job,
+  else the incident), new destructive work is held. Two nodes are below the floor of 3 on any cluster, so the case cannot trip the
+  breaker on its own. Until now there was unit evidence only.
+- Preconditions:
+  1. `DESTR-001` PASS (same `release_id`/`cluster_id`); the deployed control plane has the storm breaker
+     (`get_remediation_storm_breaker`).
+  2. At least 2 GPU nodes in one node group, counted live (short of it `NOT_RUN(CAPABILITY_ABSENT)`, e.g.
+     `needs >=2 GPU nodes in one node group; cluster <c> group <g> (<label>) has 1`).
+  3. The two target nodes: Ready, schedulable, no `gpu-fault.io/` taint or ownership annotation, not a declared warm spare, no
+     business Pod and no GPU Pod, no arbiter Pod (`gpu-fault-cluster-executor`, `gpu-fault-completion-watcher`,
+     `gpu-fault-node-installer-reconciler`), no XID in the last 10 minutes, Node Agent `ACTIVE` with `QUIESCE_GPU_SERVICES`,
+     `VERIFY_NO_GPU_CLIENTS`, `RESET_GPU` and `RESTORE_GPU_SERVICES` in `allowed_operations`, `workload_state` `IDLE` as the control
+     plane resolves it, a stored GPU inventory identity that names one product and comes from the current boot; together they do not
+     hold every kube-dns endpoint; no open workflow or incident on either.
+  4. `gpuReset` is `OWN` by the Node Agent in the Runtime Profile and the profile has no warnings; the processor queue and this
+     cluster's remote command queue are empty.
+  5. The storm breaker is `CLOSED`, holds no workflow, and the nodes it still counts (first admitted in the last 600 s) together with
+     the two targets stay below its threshold; otherwise run after the time the preflight names.
+- Steps:
+  1. The plan binds the node group, both targets' UID, boot id and Node Agent generation, the Runtime Profile version, the release
+     and the runtime identity; execute recomputes them and refuses on drift.
+  2. One DESTR-001 host probe per target records the host baseline (GPU inventory, no compute client, no quiesce state, `/dev/kmsg`
+     writable); the runtime identity is rechecked; DESTR-001's detached reset sampler (`start-reset-sampler`) is armed on both.
+  3. The two probes each run `write-xid46` concurrently (their own marker, drill id and first GPU's PCI address, with the
+     maintenance-window deadline).
+  4. Store reads only until both workflows are terminal (1500 s in total at most).
+  5. The shared oracle reads, read-only in an api-ha Pod, both workflows and incidents, the cluster's storm-breaker record, the waiters
+     the breaker holds, open workflows and incidents on the two nodes, and the ACTIVE/DRAINING Node Agent count the breaker's
+     threshold is taken from, and computes its verdict.
+  6. Each node's workflow and host are judged by DESTR-001's contract (the sampler is stopped after the snapshot); node state,
+     CloudTrail and the CPU side are read.
+- Verdict (PASS only when all hold; `INCONCLUSIVE` when the records read cannot settle it, never PASS):
+  - one workflow per node: two distinct `workflow_request_id`s and two incidents whose `node_ids` name only their node and carry no
+    `job_id`; each meets DESTR-001's eight-step `RESET_GPU` contract (a kmsg XID 46, the `RESET_GPU` decision, the remote WAITING
+    delegation, every remote step `SUCCEEDED`), workflow `SUCCEEDED`, incident `RECOVERED`, no branch escalation, no reboot;
+  - budget claims: each workflow's `remediation_budget_claims` hold only `node:<cluster>:<its node>` (limit 1), plus a `domain:` only
+    for a `fabric_partition` one of its own steps names; no `region`, `cluster:`, `class:` or `job:`, and no node-group
+    `domain:<cluster>:<group>`;
+  - never held: `remediation_budget_wait_count` is 0, the events carry no `REMEDIATION_BUDGET_WAIT` (HOLD) and no
+    `REMEDIATION_STORM_TRIPPED`, and `remediation_budget_last_blocked_scope` is empty;
+  - parallel: the two workflows' budgeted steps (`QUIESCE_GPU_SERVICES` to `RESET_GPU`, i.e. `QUARANTINE` and every node-mutating
+    operation but `RESTORE_GPU_SERVICES`), from their first `started_at` to their last terminal `updated_at`, overlap in wall-clock
+    time, proven from the durable step-execution timestamps, not from logs;
+  - the storm breaker stays `CLOSED` throughout: no trip, release or abort during the case, no workflow held by it; its window counts
+    one node for each of the two workflows, each in its own `incident:<id>` workload domain, 2 in total, below the threshold;
+  - each host meets DESTR-001's physical assertions: the sampler sees the target GPU leave and return, the Node Agent ledger adds
+    exactly one successful `RESET_GPU` with `attempt=1`, services and timers return to baseline, no quiesce state remains;
+  - both nodes Ready, schedulable, no gpu-fault taint or ownership annotation; no open workflow or incident the case left on either;
+  - no provider mutation in CloudTrail; the control-plane EKS state equals the baseline;
+  - the failure shapes are recorded apart: a claim of, or a hold on, the node-group `domain:` or another retired scope is
+    `SERIALIZED` (the pre-b220 shape), a breaker hold or trip is `BREAKER_TRIPPED`, budgeted steps that do not overlap are
+    `NOT_PARALLEL`, anything else `CONTRACT`; none of them may read as the parallel PASS.
+- Cleanup (`finally`): the product workflow owns service restoration and compensation, the runner never calls the host restore; on
+  each node the sampler is stopped and the probe resources are deleted, then the nodes and the runtime identity are rechecked. A
+  workflow that failed leaves its node isolated for the operator and the case FAILs -- **never remove a taint by hand**. The result
+  records `window_clear_at` (the two first admissions plus 600 s): the next destructive case on the same cluster starts after it, or
+  the two cases' nodes count together in the breaker window.
+- Known limitations:
+  - The case covers two idle-node domains only. A job domain (the `job:<cluster>:<workload_id>` and `job:<cluster>:job-id/<job_id>`
+    scopes `STOP_WORKLOADS`/`RESTART_WORKLOAD` add) is not part of it; under the current rule the breaker counts every `node:` scope
+    of a first admission, and a multi-node job's `STOP_WORKLOADS`/`RESTART_WORKLOAD` cover its whole allocation, so the job's
+    healthy peer nodes count too.
+  - Whether the budgeted steps overlap depends on each injection's processing latency; the runner injects concurrently so that the
+    two workflows advance essentially in step.
+
 ## 13. NOTIFY: Mail notifications
 
 ### GF-REGIONAL-NOTIFY-001
@@ -16744,7 +16851,7 @@ conclusions of the layers above are not trustworthy:
 | 10 Capacity | `CAP-001` → ... → `CAP-005` | no | |
 | 11 Network outage and late submission | `NET-001` → ... → `NET-008` | recommended | `NET-007` uses the reviewed runner; network recovery and the independent watchdog must be verified; `NET-008` stops the kernel collector for a few seconds |
 | 12 Non-destructive HA | `HA-001` → `HA-002` → `HA-005` → `HA-006` → ... → `HA-011` | recommended | `005` covers rolling, `009` covers zero-rollout credential rotation; `010` has `001` as predecessor, `011` has `010` as predecessor |
-| 13 Destructive capability acceptance (incl. non-destructive fail-closed negative cases) | `DESTR-005` → `006` → `007` → `010` → `001` → `BLAST-001` → `DESTR-002` → `009` → `012(B→A→D→C)` → `015` → `016` → `017` → `018` → `019` → `020` → `021` → `023` → `024` → `025` → `026` | **yes** | BLAST-001 read-only reuses DESTR-001; DESTR-002 still has DESTR-001 as evidence predecessor; DESTR-026 has DESTR-015 as evidence predecessor; the remaining exact dependencies are in the YAML |
+| 13 Destructive capability acceptance (incl. non-destructive fail-closed negative cases) | `DESTR-005` → `006` → `007` → `010` → `001` → `BLAST-001` → `DESTR-002` → `009` → `012(B→A→D→C)` → `015` → `016` → `017` → `018` → `019` → `020` → `021` → `023` → `024` → `025` → `026` → `027` | **yes** | BLAST-001 read-only reuses DESTR-001; DESTR-002 still has DESTR-001 as evidence predecessor; DESTR-026 has DESTR-015 as evidence predecessor; DESTR-027 has DESTR-001 as evidence predecessor and runs alone on its cluster; the remaining exact dependencies are in the YAML |
 | 14 Warm spare | `DESTR-003` → `DESTR-008` → `DESTR-022` → `DESTR-014` | **yes** | `DESTR-022` uses the spare still declared by `003/008`, with `008` as evidence predecessor; `DESTR-014` declares no spare and must precede `DESTR-013` |
 | 15 Failover and constraint disproof | `HA-003` → `HA-004` → `DESTR-013` | graded | `DESTR-013` must be last |
 | 16 Multiple physical clusters | `ISO-006` → `E2E-002` → `ISO-007` | yes | needs a second physical cluster; includes network outage and real job restart, BLOCKED when preconditions are insufficient |

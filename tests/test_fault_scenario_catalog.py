@@ -443,6 +443,7 @@ def test_promoted_live_drivers_remain_manual_until_revalidated() -> None:
         "GF-REGIONAL-DESTR-021": "run_destr021_adversarial_node_metadata.py",
         "GF-REGIONAL-DESTR-022": "run_destr022_spare_reservation_reclaim.py",
         "GF-REGIONAL-DESTR-026": "run_destr026_same_node_two_gpu_reset.py",
+        "GF-REGIONAL-DESTR-027": "run_destr027_two_idle_node_parallel_reset.py",
         "GF-REGIONAL-HA-010": "run_ha010_aurora_blackout_liveness.py",
         "GF-REGIONAL-BOOT-023": "run_boot023_release_history.py",
         "GF-REGIONAL-BOOT-036": "run_boot036_eks_nodegroup_plan.py",
@@ -888,7 +889,7 @@ def test_regional_cases_have_machine_readable_verdicts() -> None:
         case for case in load_catalog(CATALOG) if case["id"].startswith("GF-REGIONAL-")
     ]
 
-    assert len(regional) == 204
+    assert len(regional) == 205
     assert all((case.get("evidence") or {}).get("verdict") for case in regional), (
         "every regional case must record a verdict"
     )

@@ -6137,6 +6137,42 @@ test_cases:
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-026
   related_pytest: tests/regional/test_destr026_same_node_two_gpu_reset.py::test_the_single_window_two_gpu_reset_is_the_pass_shape
+- id: GF-REGIONAL-DESTR-027
+  title: 同一节点组两台空闲 GPU 节点同窗故障：各自一条 RESET_GPU 工作流并行恢复，不再被节点组 domain 串行
+  category: regional-destructive-acceptance
+  level: staging
+  risk: destructive
+  problem: >-
+    b220 之前，修复预算按节点组/实例组（节点标签读出的 failure domain）给每个组一个 domain:<cluster>:<group> 名额，
+    另有 region、cluster:<cluster>、class:<cluster>:<资源类> 固定限额，同一节点组两台节点上互不相关的故障只能一条接一条修复：
+    第二条工作流带着该 domain 作用域的 remediation_budget hold（REMEDIATION_BUDGET_WAIT）停在 PENDING。b220 起，
+    一台没有训练作业的 GPU 节点自成一条合并工作流，工作流之间只按节点互斥（node:<cluster>:<node>，limit 1，另加
+    SXID 写入步骤的节点本地 NVSwitch fabric_partition），固定的 region/每集群/每资源类限额退役，相关性故障由每集群的
+    storm breaker 兜底：600 s 内 ≥ max(3, ceil(0.2 × 该集群 GPU 节点数)) 台不同节点、跨 ≥2 个工作负载域首次进入破坏性修复时，
+    暂停新的破坏性工作。这些只有单元证据，没有任何区域用例证明同组两台空闲节点真的被并行修复。
+  injection: >-
+    从 live 集群读出 GPU 节点组（eks.amazonaws.com/nodegroup 或 sagemaker.amazonaws.com/instance-group-name），取 GPU
+    节点最多的组（或 --node-group 指定的组），按名称序取前两台合格的空闲节点，不从 site profile 的节点列表取；组内 GPU
+    节点不足 2 台时整条用例记 NOT_RUN(CAPABILITY_ABSENT)。两台各起一个 DESTR-001 的宿主探针、武装 detached reset
+    采样器，再并发各写一条 XID 46（write-xid46，各自的 marker、drill id 与第一张 GPU 的 PCI 地址），复用 DESTR-001 的注入。
+    不改任何控制面、executor 或 storm breaker 设置，不声明 warm spare，不触发 provider 动作。
+  expected:
+  - 预置门禁：同一节点组 live 计数 ≥2 台 GPU 节点，否则 NOT_RUN(CAPABILITY_ABSENT) 并写明要求与实际台数（例如 needs >=2 GPU nodes in one node group; cluster X group Y has 1）；同一 release 上 DESTR-001 PASS
+  - 两台目标节点 Ready、可调度、无 gpu-fault taint 与 ownership 注解、不是声明的 warm spare、无业务 Pod 与 GPU Pod、不承载 arbiter Pod、近 10 分钟无 XID、Node Agent ACTIVE 且允许 quiesce/verify/reset/restore、控制面判其 workload_state 为 IDLE、GPU inventory 身份带单一产品；两台不独占全部 kube-dns endpoint；gpuReset 由 Node Agent OWN；processor 与本集群远端命令队列为空
+  - storm breaker 前提：控制面已有 storm breaker，状态 CLOSED、没有被它 hold 的工作流，且其窗口内仍在计数的节点加上两台目标低于阈值
+  - 每台节点各一条工作流：两个不同的 workflow_request_id 与 incident，incident.node_ids 只有本节点、没有 job_id；各自满足 DESTR-001 的八步 RESET_GPU 契约（kmsg XID 46、RESET_GPU 决策、远端 WAITING 委托）并 SUCCEEDED，incident RECOVERED
+  - 预算声明：每条工作流的 remediation_budget_claims 只有 node:<cluster>:<本节点>（limit 1），只有当它自己的某一步参数命名了 fabric_partition 时才另有该 domain:；没有 region、cluster:、class:、job:，也没有节点组 domain:<cluster>:<group>
+  - 从未被 hold：remediation_budget_wait_count 为 0，没有 REMEDIATION_BUDGET_WAIT 或 REMEDIATION_STORM_TRIPPED 事件，remediation_budget_last_blocked_scope 为空
+  - 并行由持久化时间戳证明：两条工作流的预算步骤（QUIESCE_GPU_SERVICES 到 RESET_GPU，取 step_executions 的 started_at 与终态 updated_at）在墙钟上重叠，不读日志
+  - storm breaker 全程 CLOSED（本用例期间没有 trip、release 或 abort），它为这两条工作流各计一台节点、各在自己的 incident 工作负载域，共 2 台，低于阈值
+  - 两台节点宿主侧满足 DESTR-001 的物理断言（采样器看到目标 GPU 离开并回来、ledger 恰一条 RESET_GPU、服务与 timer 回到基线）；无 provider 变更；控制面 EKS 状态不变
+  - 两台节点 Ready、可调度、无 gpu-fault taint 与 ownership 注解；两节点上没有本用例留下的未关闭工作流或 incident；采样器停止，探针资源无残留
+  - 结果记录 window_clear_at（两条首次准入加 600 s）：同一集群的下一条破坏性用例在其后开始，否则两条用例的节点会在 breaker 窗口里一起计数
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-027
+  related_pytest: tests/regional/test_workload_domain_oracle.py::test_two_idle_nodes_in_parallel_are_the_pass_shape
 - id: GF-REGIONAL-DESTR-013
   title: 硬约束否证 NodeRecovery 恒为 None 且全程不存在 BatchReplaceClusterNodes
   category: regional-destructive-acceptance

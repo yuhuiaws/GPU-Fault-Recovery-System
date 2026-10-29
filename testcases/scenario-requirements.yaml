@@ -1166,6 +1166,27 @@ requirements:
       - nodeid: tests/node_agent/test_reset_two_gpus_one_window.py::test_one_command_resets_both_gpus_one_after_another
       - nodeid: tests/regional/test_destr026_same_node_two_gpu_reset.py::test_the_single_window_two_gpu_reset_is_the_pass_shape
     critical: true
+  - id: GF-REQ-RECOVERY-WORKLOAD-DOMAINS
+    family: recovery
+    title: Two idle GPU nodes of one node group are repaired by two workflows in parallel, kept apart per node only
+    source: [src/gpu_fault/execution/remediation_budget.py, src/gpu_fault/execution/storm_admission.py, src/gpu_fault/remediation_storm.py]
+    covers: [recovery:workload-failure-domains]
+    conditions: [normal, safety]
+    assertions:
+      - An idle node's workflow claims only its node scope (and a node-local fabric partition its own step names), no node-group domain and no retired region, cluster or resource-class scope.
+      - Two idle nodes of one node group are admitted together, are never held on a domain scope, and their budgeted steps overlap in wall-clock time.
+      - The storm breaker counts the node scopes of a first admission, so two idle nodes stay below its floor of three while a two-node job's healthy peer counts with its faulted node.
+    cases: [GF-REGIONAL-DESTR-027]
+    runners: [scripts/e2e/regional/run_destr027_two_idle_node_parallel_reset.py]
+    checks:
+      - nodeid: tests/execution/test_remediation_budget.py::test_two_idle_nodes_are_repaired_together
+        expected: 2
+      - nodeid: tests/execution/test_remediation_storm_admission.py::test_two_nodes_never_trip_it
+      - nodeid: tests/regional/test_workload_domain_oracle.py::test_two_idle_nodes_through_the_b220_claim_path_are_the_pass_shape
+      - nodeid: tests/regional/test_workload_domain_oracle.py::test_the_pre_b220_node_group_serialization_fails_as_serialized
+      - nodeid: tests/regional/test_workload_domain_oracle.py::test_a_two_node_jobs_healthy_peer_counts_so_the_floor_trips
+        expected: 2
+    critical: true
   - id: GF-REQ-RECOVERY-REBOOT-SAFEGUARD
     family: recovery
     title: Reboot-surviving safeguard and explicit unknown-outcome protection
