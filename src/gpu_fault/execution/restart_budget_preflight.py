@@ -453,7 +453,7 @@ def prepare_claimed_workflow(
         remediation_budget_claims=claims,
         remediation_budget_hold=hold,
         remediation_storm=storm_candidate(
-            executor.store, workflow, incident, claims, hold=hold
+            executor.store, workflow, incident, claims, steps, hold=hold
         ),
     )
     deadlines = claim_deadlines(

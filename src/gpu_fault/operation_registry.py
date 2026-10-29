@@ -636,6 +636,31 @@ CONTAINMENT_ONLY_OPERATIONS = frozenset(
     if semantics.destructive and not _node_mutating(semantics)
 )
 NODE_MUTATING_OPERATIONS = DESTRUCTIVE_OPERATIONS - CONTAINMENT_ONLY_OPERATIONS
+# Workload mutations: STOP_WORKLOADS / RESTART_WORKLOAD stop or restart a
+# training job's ranks (its workload objects). They are destructive to the
+# workload but touch no node hardware or node scheduling state, and the job
+# family compiles them for the job's whole allocation
+# (remediation_budget.WHOLE_JOB_OPERATIONS), so one of them may name a node no
+# fault was raised on.
+WORKLOAD_MUTATION_OPERATIONS = frozenset(
+    operation
+    for operation, semantics in OPERATION_REGISTRY.items()
+    if semantics.destructive and semantics.scope is OperationScope.WORKLOAD
+)
+# The node-hardware-mutating remediations: the node-mutating operations that
+# act on the node's own hardware or lifecycle -- reset, reboot, replace,
+# driver/firmware, fabric-manager, device-plugin and quiesce -- as opposed to
+# stopping or restarting a workload on it. Derived as NODE_MUTATING_OPERATIONS
+# minus the workload mutations. The remediation storm breaker counts a node for
+# its window only when a claim gives it one of these (or an isolation,
+# QUARANTINE -- containment, not node-mutating, but its first admission counts
+# too so a false-positive cascade is bounded, F-C5, as remediation_budget
+# ._budgeted keeps it budgeted); a node whose only budgeted step is a workload
+# stop/restart of a job it belongs to is not entering destructive NODE
+# remediation and is not counted (gpu_fault.remediation_storm, design §9.5).
+NODE_HARDWARE_MUTATING_OPERATIONS = (
+    NODE_MUTATING_OPERATIONS - WORKLOAD_MUTATION_OPERATIONS
+)
 # Device-plugin restarts delete the plugin Pod so kubelet re-registers the
 # node's devices; the containers already holding devices keep them. They stay
 # node-mutating for merge, budget and busy-node rules, but the STOP-ownership

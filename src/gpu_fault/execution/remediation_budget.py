@@ -10,7 +10,10 @@ from gpu_fault.models import (
     WorkflowStepSpec,
     resolved_step_indexes,
 )
-from gpu_fault.operation_registry import NODE_MUTATING_OPERATIONS
+from gpu_fault.operation_registry import (
+    NODE_MUTATING_OPERATIONS,
+    WORKLOAD_MUTATION_OPERATIONS,
+)
 
 
 @dataclass(frozen=True)
@@ -102,20 +105,60 @@ def claims_in_cluster(
     """``remediation_budget_claims`` for a workflow of ``cluster_id``: what the
     dispatcher's guard asks of a row whose incident it knows only by cluster."""
 
+    budgeted = _claimed_budgeted_steps(workflow, steps)
+    if not budgeted:
+        return {}
+    return _scopes_for_steps(policy, cluster_id, budgeted)
+
+
+def _claimed_budgeted_steps(
+    workflow: WorkflowRequest, steps: Sequence[WorkflowStepSpec]
+) -> list[WorkflowStepSpec]:
+    """The budgeted steps this claim carries -- the single selection that both
+    ``claims_in_cluster`` turns into scopes and ``storm_counted_node_ids``
+    tallies nodes from. Once the workflow's budgeted work has begun: all but
+    the superseded and inherited; before then: those still to run."""
+
     if budget_work_begun(workflow, steps):
         skipped = set(workflow.superseded_step_indexes) | set(
             workflow.inherited_step_indexes
         )
     else:
         skipped = set(resolved_step_indexes(workflow))
-    budgeted = [
+    return [
         step
         for index, step in enumerate(steps)
         if index not in skipped and _budgeted(step.operation)
     ]
-    if not budgeted:
-        return {}
-    return _scopes_for_steps(policy, cluster_id, budgeted)
+
+
+def storm_counted_node_ids(
+    workflow: WorkflowRequest, steps: Sequence[WorkflowStepSpec]
+) -> frozenset[str]:
+    """The nodes a claim brings into destructive NODE remediation, which the
+    remediation storm breaker counts (design §9.5, ``gpu_fault.remediation_storm``).
+
+    A node is counted when one of this claim's budgeted steps gives it a
+    node-hardware mutation (``NODE_HARDWARE_MUTATING_OPERATIONS`` -- reset,
+    reboot, replace, driver/firmware, fabric-manager, device-plugin, quiesce)
+    or an isolation (``QUARANTINE``, a containment op the breaker counts too so
+    a false-positive cascade is bounded, F-C5). It is NOT counted when its only
+    budgeted steps on it are ``STOP_WORKLOADS`` / ``RESTART_WORKLOAD``: those
+    stop or restart the ranks of a job the node belongs to, and the job family
+    widens them across the job's whole allocation (``WHOLE_JOB_OPERATIONS``), so
+    counting them would count a faulted node's healthy job peers -- serializing
+    two small jobs on one cluster and false-tripping at scale (b223). The
+    per-node budget exclusion still claims ``node:`` for every such node
+    (``claims_in_cluster``); this governs only the storm tally.
+    """
+
+    return frozenset(
+        node_id
+        for step in _claimed_budgeted_steps(workflow, steps)
+        if step.operation not in WORKLOAD_MUTATION_OPERATIONS
+        for node_id in step.node_ids
+        if node_id
+    )
 
 
 def scope_limit(policy: RemediationBudgetPolicy, scope: str) -> int | None:

@@ -1175,7 +1175,7 @@ requirements:
     assertions:
       - An idle node's workflow claims only its node scope (and a node-local fabric partition its own step names), no node-group domain and no retired region, cluster or resource-class scope.
       - Two idle nodes of one node group are admitted together, are never held on a domain scope, and their budgeted steps overlap in wall-clock time.
-      - The storm breaker counts the node scopes of a first admission, so two idle nodes stay below its floor of three while a two-node job's healthy peer counts with its faulted node.
+      - The storm breaker counts only a node entering node-hardware remediation, so two idle nodes stay below its floor of three and a two-node job's healthy workload-stop peer is not counted (its faulted node alone is, b223).
     cases: [GF-REGIONAL-DESTR-027]
     runners: [scripts/e2e/regional/run_destr027_two_idle_node_parallel_reset.py]
     checks:
@@ -1184,7 +1184,7 @@ requirements:
       - nodeid: tests/execution/test_remediation_storm_admission.py::test_two_nodes_never_trip_it
       - nodeid: tests/regional/test_workload_domain_oracle.py::test_two_idle_nodes_through_the_b220_claim_path_are_the_pass_shape
       - nodeid: tests/regional/test_workload_domain_oracle.py::test_the_pre_b220_node_group_serialization_fails_as_serialized
-      - nodeid: tests/regional/test_workload_domain_oracle.py::test_a_two_node_jobs_healthy_peer_counts_so_the_floor_trips
+      - nodeid: tests/regional/test_workload_domain_oracle.py::test_a_two_node_jobs_peer_is_not_counted_so_the_floor_holds
         expected: 2
     critical: true
   - id: GF-REQ-RECOVERY-REBOOT-SAFEGUARD

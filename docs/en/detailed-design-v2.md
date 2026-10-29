@@ -4898,11 +4898,18 @@ the recorded `domain:` scope is not among the scopes the row would ask for now, 
 
 Remediation storm breaker (`gpu_fault/remediation_storm.py`). No fixed number decides how many workflows one cluster repairs
 at once; the protection across failure domains is one breaker per GPU cluster. It counts **nodes that newly enter destructive
-remediation** -- a workflow's first admission of its budgeted steps (a hold, a `RUNNING` row that already holds its claims and a
-preempting successor taking over its predecessor's reserved slot are work in flight, never counted and never held) -- and trips
-when, in a sliding 600-s window, they reach max(3, ceil(20% of the cluster's GPU nodes)) and belong to at least two workload
-domains (the nodes of one job, or of one incident without a job, are one domain). One big job failing on many nodes is one
-fault and never trips it; many unrelated nodes failing together look like a bad driver, image or policy. The node count is the
+remediation** -- within a workflow's first admission of its budgeted steps (a hold, a `RUNNING` row that already holds its claims
+and a preempting successor taking over its predecessor's reserved slot are work in flight, never counted and never held), the
+nodes that receive a **node-hardware mutation** (reset/reboot/replace, driver/firmware, fabric-manager, device-plugin, quiesce --
+`operation_registry.NODE_HARDWARE_MUTATING_OPERATIONS`) or an **isolation** (`QUARANTINE`, counted to bound a false-positive
+cascade, F-C5). A healthy node named only because its job is stopped or restarted as a whole is **not** counted:
+`STOP_WORKLOADS` / `RESTART_WORKLOAD` act on the job's workload objects and the job family widens them to every node of the
+attempt (§3.7), which still claim each node's `node:` exclusion but are not node-hardware repair, so a two-node job with one bad
+node counts only its rebooted node (`remediation_budget.storm_counted_node_ids`; b223 -- counting the healthy peer serialized two
+independent small jobs and false-tripped at scale, e.g. two 64-node jobs with one bad node each counted 128 against a threshold
+of 100). It trips when, in a sliding 600-s window, those nodes reach max(3, ceil(20% of the cluster's GPU nodes)) and belong to
+at least two workload domains (the nodes of one job, or of one incident without a job, are one domain). One big job failing on
+many nodes is one fault and never trips it; many unrelated nodes failing together look like a bad driver, image or policy. The node count is the
 cluster's `ACTIVE`/`DRAINING` fleet Agents (one per GPU node; a departed node counts until the departed-node cleanup retires its
 Agent, so the threshold errs high, not low), read at most once a minute per process and cluster
 (`execution/storm_admission.py`); unreadable, the floor of 3 applies. 20 %, 600 s and 3 are product constants with no

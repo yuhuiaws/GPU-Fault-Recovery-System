@@ -13,10 +13,11 @@ the second workflow held on the node group's ``domain:`` slot, its steps after
 the first one's -- is FAIL; a record that cannot be read is INCONCLUSIVE; and
 faults that tripped the storm breaker are a FAIL of their own shape, never the
 parallel PASS. Then the records the b220 claim path itself writes: two idle
-nodes end PASS, while a two-node job's healthy peer is counted with its
-faulted node, so the two job layouts trip the floor of 3 on a small cluster
-and only single-node jobs stay at two counted nodes. Last, the node-group
-precondition and the breaker premise.
+nodes end PASS, and a two-node job's healthy workload-stop peer is NOT counted
+(b223) -- only its rebooted node is -- so a two-node job counts exactly as a
+single-node one, two such domains stay at two counted nodes below the floor of
+3, and both run in parallel. Last, the node-group precondition and the breaker
+premise.
 """
 
 from __future__ import annotations
@@ -222,15 +223,17 @@ def part(
         created_at=at(-2),
     )
     domain = f"job:{job}" if job else f"incident:{incident_id}"
+    # b223: the breaker counts the faulted node only. A job's healthy peer,
+    # whose claim is a workload stop/restart widened across the allocation, is
+    # not entering destructive NODE remediation; an idle domain is its node.
     window = (
         [
             StormEntry(
-                node_id=item,
+                node_id=node,
                 domain=domain,
                 workflow_id=request_id,
                 admitted_at=at(start - 1),
             )
-            for item in allocation
         ]
         if ran and not pre_b220
         else []
@@ -493,9 +496,10 @@ def test_residue_the_case_left_fails_and_older_records_are_not_its_residue() -> 
     )
 
 
-def test_a_pruned_window_entry_is_counted_from_its_claims() -> None:
+def test_a_pruned_window_entry_is_counted_from_the_workflow_steps() -> None:
     """A later admission elsewhere pruned one domain's entry and kept the
-    other's: the claims of the pruned one are what the breaker counted."""
+    other's: the pruned one's budgeted non-workload steps are what the breaker
+    counted (b223)."""
 
     first, second = two_idle()
     first.window = []
@@ -504,7 +508,7 @@ def test_a_pruned_window_entry_is_counted_from_its_claims() -> None:
 
     assert verdict.verdict == oracle.PASS, verdict.errors
     assert verdict.facts["breaker"]["counted_source"] == {
-        "node-a": "claims",
+        "node-a": "workflow steps",
         "node-b": "breaker window",
     }
 
@@ -555,17 +559,16 @@ def test_an_unreadable_store_is_inconclusive_and_one_domain_is_refused() -> None
 # --------------------------------------------------------------------------- #
 # Two two-node jobs, a reboot-class fault on one node of each
 # --------------------------------------------------------------------------- #
-def test_two_jobs_in_parallel_carry_the_job_scopes_on_a_large_cluster() -> None:
-    """The PASS shape; at four counted nodes (each job's peer counts) it needs
-    a threshold above four -- a cluster of 21 GPU nodes or more."""
+def test_two_jobs_in_parallel_carry_the_job_scopes() -> None:
+    """The PASS shape. Each job claims both its nodes (``node:`` keeps a second
+    workflow off either) and its job tokens, but only its one rebooted node is
+    counted, so two jobs stay at two counted nodes -- below the floor of 3 on
+    the four-node group (b223)."""
 
     parts = two_jobs()
 
     verdict = judge(
-        snapshot(*parts, threshold=5, agents=25),
-        parts,
-        overlap=oracle.OVERLAP_REMEDIATION,
-        counted=4,
+        snapshot(*parts), parts, overlap=oracle.OVERLAP_REMEDIATION, counted=2
     )
 
     assert (verdict.verdict, verdict.outcome) == (oracle.PASS, oracle.PARALLEL), (
@@ -577,6 +580,7 @@ def test_two_jobs_in_parallel_carry_the_job_scopes_on_a_large_cluster() -> None:
         "node:gpu-cluster:node-a",
         "node:gpu-cluster:node-b",
     ]
+    assert verdict.facts["breaker"]["counted_total"] == 2
     assert verdict.facts["spans"]["overlap_seconds"]["job-a|job-b"] > 0
 
 
@@ -622,10 +626,10 @@ def test_two_jobs_serialized_on_the_node_group_slot_fail_as_serialized() -> None
 
 def test_two_jobs_with_a_missing_record_are_inconclusive() -> None:
     parts = two_jobs()
-    value = snapshot(*parts, threshold=5)
+    value = snapshot(*parts)
     del value["workflows"]["workflow-job-a"]
 
-    verdict = judge(value, parts, overlap=oracle.OVERLAP_REMEDIATION, counted=4)
+    verdict = judge(value, parts, overlap=oracle.OVERLAP_REMEDIATION, counted=2)
 
     assert (verdict.verdict, verdict.outcome) == (
         oracle.INCONCLUSIVE,
@@ -633,19 +637,15 @@ def test_two_jobs_with_a_missing_record_are_inconclusive() -> None:
     )
 
 
-def test_two_jobs_that_tripped_the_breaker_get_their_own_verdict() -> None:
-    """Near-simultaneous faults on a four-node group: the second job's first
-    admission brings its two nodes to the two already counted, the breaker
-    trips and holds it. One workflow ran; this is never the parallel PASS."""
+def test_two_jobs_held_by_a_tripped_breaker_get_their_own_verdict() -> None:
+    """A correlated storm from other faults on the cluster has tripped the
+    breaker, which holds the second job's first admission. One workflow ran;
+    whatever tripped it, this is never the parallel PASS."""
 
     first, second = two_jobs(ran=False, held_on=STORM)
-    value = tripped(
-        (first, second), second, nodes=["node-a", "node-b", "node-c", "node-d"]
-    )
+    value = tripped((first, second), second, nodes=["node-a", "node-c", "node-x"])
 
-    verdict = judge(
-        value, (first, second), overlap=oracle.OVERLAP_REMEDIATION, counted=4
-    )
+    verdict = judge(value, (first, second), overlap=oracle.OVERLAP_REMEDIATION)
 
     assert verdict.verdict == oracle.FAIL
     assert verdict.outcome == oracle.BREAKER_TRIPPED
@@ -661,12 +661,13 @@ def test_two_jobs_that_tripped_the_breaker_get_their_own_verdict() -> None:
 # --------------------------------------------------------------------------- #
 def test_a_job_and_an_idle_node_in_parallel_are_the_pass_shape() -> None:
     """Different domain types: the job workflow carries its job tokens, the
-    idle one its node scope only. Three nodes count (the job's peer with its
-    faulted node), so the threshold must exceed three."""
+    idle one its node scope only. Two nodes count -- the job's rebooted node
+    and the idle node, not the job's workload-stop peer -- below the floor of
+    three (b223)."""
 
     parts = job_and_idle()
 
-    verdict = judge(snapshot(*parts, threshold=4, agents=16), parts, counted=3)
+    verdict = judge(snapshot(*parts), parts, counted=2)
 
     assert (verdict.verdict, verdict.outcome) == (oracle.PASS, oracle.PARALLEL), (
         verdict.errors
@@ -694,10 +695,10 @@ def test_an_idle_workflow_held_behind_the_job_on_the_group_slot_is_serialized() 
 
 def test_a_job_and_an_idle_node_with_a_missing_record_are_inconclusive() -> None:
     parts = job_and_idle()
-    value = snapshot(*parts, threshold=4)
+    value = snapshot(*parts)
     del value["incidents"]["incident-idle"]
 
-    verdict = judge(value, parts, counted=3)
+    verdict = judge(value, parts, counted=2)
 
     assert (verdict.verdict, verdict.outcome) == (
         oracle.INCONCLUSIVE,
@@ -705,11 +706,11 @@ def test_a_job_and_an_idle_node_with_a_missing_record_are_inconclusive() -> None
     )
 
 
-def test_a_job_and_an_idle_node_trip_the_floor_of_three() -> None:
+def test_a_job_and_an_idle_node_held_by_a_tripped_breaker_are_not_the_pass() -> None:
     job, idle = job_and_idle(ran=False, held_on=STORM)
-    value = tripped((job, idle), idle, nodes=["node-a", "node-b", "node-c"])
+    value = tripped((job, idle), idle, nodes=["node-a", "node-c", "node-x"])
 
-    verdict = judge(value, (job, idle), counted=3)
+    verdict = judge(value, (job, idle))
 
     assert (verdict.verdict, verdict.outcome) == (oracle.FAIL, oracle.BREAKER_TRIPPED)
 
@@ -897,33 +898,29 @@ def _dispatch_layout(
 @pytest.mark.parametrize(
     ("layout", "counted"),
     [
-        ({"job-a": ("a1", "a2"), "job-b": ("b1", "b2")}, ["a1", "a2", "b1", "b2"]),
-        ({"job-a": ("a1", "a2"), "idle-1": None}, ["a1", "a2", "idle-1"]),
+        ({"job-a": ("a1", "a2"), "job-b": ("b1", "b2")}, ["a1", "b1"]),
+        ({"job-a": ("a1", "a2"), "idle-1": None}, ["a1", "idle-1"]),
     ],
     ids=["two-two-node-jobs", "two-node-job-and-idle-node"],
 )
-def test_a_two_node_jobs_healthy_peer_counts_so_the_floor_trips(
+def test_a_two_node_jobs_peer_is_not_counted_so_the_floor_holds(
     layout: dict[str, tuple[str, ...] | None], counted: list[str]
 ) -> None:
-    """The breaker counts the ``node:`` scopes of a first admission; a job's
-    STOP_WORKLOADS / RESTART_WORKLOAD name its whole allocation, so a fault on
-    one node of a two-node job counts two nodes. With one more domain the
-    count reaches the floor of 3 and the second admission is held."""
+    """b223: a job's STOP_WORKLOADS / RESTART_WORKLOAD name its whole
+    allocation, but they are workload mutations -- only the rebooted node
+    enters destructive NODE remediation and is counted. A two-node job counts
+    exactly as a single-node one, so two such domains stay at two counted
+    nodes, below the floor of 3, and both run in parallel. Before b223 the
+    healthy peers counted too (3-4 nodes) and the second admission was held."""
 
     store, domains = _dispatch_layout(layout)
     breaker = store.get_remediation_storm_breaker(STORE_CLUSTER)
+    rows = [store.get_workflow(item.workflow_id) for item in domains]
 
-    verdict = oracle.judge_parallel_domains(
-        _store_snapshot(store, [item.workflow_id for item in domains]),
-        cluster_id=STORE_CLUSTER,
-        domains=domains,
-        started_at=datetime.now(timezone.utc) - timedelta(minutes=5),
-    )
-
-    assert breaker is not None and breaker.state is StormBreakerState.TRIPPED, breaker
-    assert (breaker.trip_node_ids, breaker.trip_threshold) == (counted, 3)
-    assert breaker.trip_workflow_id == domains[1].workflow_id
-    assert (verdict.verdict, verdict.outcome) == (oracle.FAIL, oracle.BREAKER_TRIPPED)
+    assert breaker is not None and breaker.state is StormBreakerState.CLOSED, breaker
+    assert sorted(entry.node_id for entry in breaker.window) == counted
+    assert [row.status for row in rows] == [WorkflowStatus.RUNNING] * 2
+    assert [row.remediation_budget_last_blocked_scope for row in rows] == [None, None]
 
 
 @pytest.mark.parametrize(

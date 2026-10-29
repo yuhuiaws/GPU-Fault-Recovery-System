@@ -5,8 +5,10 @@ a workflow's first admission of budgeted work and nothing else: a hold
 (budgeted work begun), a RUNNING row that already holds its claims, and a
 preempting successor taking over the hold its predecessor reserved for it all
 continue work in flight and are never held. The nodes are those the claim
-takes (``node:<cluster>:<node>``), the workload domain the incident's job or,
-without one, the incident (``storm_domain``).
+brings into destructive NODE remediation (``storm_counted_node_ids`` -- a
+node-hardware mutation or an isolation, never a workload stop/restart of a
+job the node belongs to), the workload domain the incident's job or, without
+one, the incident (``storm_domain``).
 
 The cluster's GPU nodes are its fleet agents that are ACTIVE or DRAINING (one
 per GPU node; a departed node's agent stays ACTIVE until the departed-node
@@ -20,12 +22,18 @@ from __future__ import annotations
 import logging
 import time
 import weakref
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from threading import Lock
 from typing import Any
 
+from gpu_fault.execution.remediation_budget import storm_counted_node_ids
 from gpu_fault.fleet import AgentLifecycleState
-from gpu_fault.models import FaultIncident, WorkflowRequest, WorkflowStatus
+from gpu_fault.models import (
+    FaultIncident,
+    WorkflowRequest,
+    WorkflowStatus,
+    WorkflowStepSpec,
+)
 from gpu_fault.remediation_storm import StormCandidate, storm_domain, storm_scope
 from gpu_fault.store.shared.remediation_budgets import budget_wait_started_at
 
@@ -75,17 +83,28 @@ def storm_candidate(
     workflow: WorkflowRequest,
     incident: FaultIncident,
     claims: Mapping[str, int],
+    steps: Sequence[WorkflowStepSpec],
     *,
     hold: bool,
 ) -> StormCandidate | None:
-    """The breaker's view of this claim, or ``None`` when it does not judge it."""
+    """The breaker's view of this claim, or ``None`` when it does not judge it.
+
+    The nodes it counts are those the claim brings into destructive NODE
+    remediation (``storm_counted_node_ids``): a node whose only budgeted step is
+    a workload stop/restart of a job it belongs to is not one of them, so a
+    reboot or reset of one node of a multi-node job never counts the job's
+    healthy peers toward the breaker (b223). A claim that mutates no node's
+    hardware and isolates none is not judged at all.
+    """
 
     if hold or not claims or workflow.preempt_predecessor:
         return None
     if workflow.status is WorkflowStatus.RUNNING and workflow.remediation_budget_claims:
         return None
+    node_ids = storm_counted_node_ids(workflow, steps)
+    if not node_ids:
+        return None
     cluster_id = incident.cluster_id
-    prefix = f"node:{cluster_id}:"
     held_since = (
         budget_wait_started_at(workflow)
         if workflow.remediation_budget_last_blocked_scope == storm_scope(cluster_id)
@@ -94,9 +113,7 @@ def storm_candidate(
     return StormCandidate(
         cluster_id=cluster_id,
         workflow_id=workflow.request_id,
-        node_ids=frozenset(
-            scope[len(prefix) :] for scope in claims if scope.startswith(prefix)
-        ),
+        node_ids=node_ids,
         domain=storm_domain(incident),
         held_since=held_since,
         cluster_nodes=cluster_gpu_nodes(store, cluster_id),

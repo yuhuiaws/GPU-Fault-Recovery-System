@@ -21,11 +21,15 @@ hold on that ``domain:`` scope. Since b220:
   two workload domains (a job, else the incident).
 
 What the breaker counts. ``execution/storm_admission.storm_candidate`` judges a
-workflow's FIRST admission of budgeted work and counts every node of its
-``node:`` claims -- every node any budgeted step still to run names. For a
-running multi-node attempt the job-wide STOP_WORKLOADS and RESTART_WORKLOAD
-name every node of the allocation (``orchestration/families/grouped_faults``
-widens them), so a job's healthy peer is counted with its faulted node.
+workflow's FIRST admission of budgeted work and counts only the nodes it brings
+into destructive NODE remediation (``remediation_budget.storm_counted_node_ids``
+= ``STORM_COUNTED_OPERATIONS`` below): a node-hardware mutation (reset, reboot,
+replace, driver/firmware, fabric-manager, device-plugin, quiesce) or an
+isolation (QUARANTINE). The job-wide STOP_WORKLOADS and RESTART_WORKLOAD name
+every node of a job's allocation (``orchestration/families/grouped_faults``
+widens them), but they are workload mutations, so a job's healthy peer -- one a
+fault was never raised on, whose only budgeted step is that stop/restart -- is
+NOT counted; a fault on one node of a two-node job counts one node (b223).
 
 What the oracle judges, on durable control-plane records only (never logs),
 for a case that faults each of N failure domains once (``DomainExpectation``):
@@ -123,6 +127,12 @@ JOB_TOKEN_OPERATIONS = frozenset(operation.value for operation in WHOLE_JOB_OPER
 JOB_WIDE_OPERATIONS = JOB_TOKEN_OPERATIONS | {
     WorkflowOperation.CHECKPOINT_WORKLOADS.value
 }
+#: The budgeted operations the storm breaker counts a node for (b223):
+#: ``remediation_budget.storm_counted_node_ids`` spelt with the public sets --
+#: the budgeted operations minus the workload mutations (STOP/RESTART), i.e. a
+#: node-hardware mutation or an isolation (QUARANTINE). A node whose only
+#: budgeted step is a workload stop/restart of its job is not counted.
+STORM_COUNTED_OPERATIONS = BUDGETED_OPERATIONS - JOB_TOKEN_OPERATIONS
 #: Scope kinds b220 retired; a claim or a refusal on one is the pre-b220 shape.
 RETIRED_SCOPE_KINDS = frozenset({"region", "cluster", "class"})
 WAIT_CODE = "REMEDIATION_BUDGET_WAIT"
@@ -1047,8 +1057,9 @@ def _judge_breaker(
     # The breaker's own entries are what it counted. A later admission
     # elsewhere prunes entries older than the window from the record, and
     # may prune one domain's and keep another's; for a domain the record no
-    # longer lists, its claims are what was counted, since storm_candidate
-    # counts the ``node:`` scopes of a first admission.
+    # longer lists, the nodes its budgeted non-workload steps name are what
+    # was counted (``_counted_nodes``) -- a job's workload-stop peer is not
+    # among them (b223).
     for entry in window:
         domain = ours[str(entry["workflow_id"])]
         counted.setdefault(domain.label, []).append(str(entry.get("node_id")))
@@ -1065,8 +1076,8 @@ def _judge_breaker(
     for domain in domains:
         workflow = present.get(domain.label)
         if workflow is not None and domain.label not in counted:
-            counted[domain.label] = _claimed_nodes(workflow, cluster_id)
-            sources[domain.label] = "claims"
+            counted[domain.label] = _counted_nodes(workflow, cluster_id)
+            sources[domain.label] = "workflow steps"
     for domain in domains:
         nodes = set(counted.get(domain.label) or [])
         if (
@@ -1116,13 +1127,24 @@ def _judge_breaker(
     }
 
 
-def _claimed_nodes(workflow: Mapping[str, Any], cluster_id: str) -> list[str]:
+def _counted_nodes(workflow: Mapping[str, Any], cluster_id: str) -> list[str]:
+    """The nodes a first admission brought into destructive NODE remediation --
+    those ``storm_candidate`` counts (``STORM_COUNTED_OPERATIONS``): a node with
+    a budgeted step that is not a workload stop/restart. Used only when the
+    breaker pruned a domain's window entry (the window itself is read first); a
+    job's healthy workload-stop peer is not among them (b223)."""
+
     prefix = f"node:{cluster_id}:"
-    return sorted(
+    claimed = {
         str(scope)[len(prefix) :]
         for scope in workflow.get("remediation_budget_claims") or []
         if str(scope).startswith(prefix)
-    )
+    }
+    counted: set[str] = set()
+    for step in workflow.get("official_steps") or []:
+        if str(step.get("operation")) in STORM_COUNTED_OPERATIONS:
+            counted.update(str(node) for node in step.get("node_ids") or [] if node)
+    return sorted(counted & claimed)
 
 
 def _judge_residue(

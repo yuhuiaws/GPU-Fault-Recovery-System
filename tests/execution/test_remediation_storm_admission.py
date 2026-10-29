@@ -16,7 +16,12 @@ import pytest
 
 from gpu_fault.execution import storm_admission
 from gpu_fault.execution.remediation_budget import RemediationBudgetPolicy
-from gpu_fault.models import WorkflowEventCode, WorkflowOperation, WorkflowStatus
+from gpu_fault.models import (
+    IncidentState,
+    WorkflowEventCode,
+    WorkflowOperation,
+    WorkflowStatus,
+)
 from gpu_fault.remediation_storm import StormBreakerState, released_breaker, storm_scope
 from gpu_fault.store import InMemoryStore, SqliteStore
 from tests._builders import copy_model, fault_incident, workflow_request, workflow_step
@@ -252,7 +257,8 @@ def test_an_open_breaker_survives_a_restart(tmp_path) -> None:
 def test_only_a_first_admission_is_judged() -> None:
     incident = fault_incident("incident-x", "event-x", job_id="job-7")
     claims = {"node:cluster-a:node-a": 1, "domain:cluster-a:partition-1": 1}
-    fresh = workflow_request("workflow-x", "incident-x")
+    steps = [workflow_step(WorkflowOperation.RESET_GPU, node_ids=["node-a"])]
+    fresh = workflow_request("workflow-x", "incident-x", official_steps=steps)
     running = copy_model(
         fresh, status=WorkflowStatus.RUNNING, remediation_budget_claims=sorted(claims)
     )
@@ -260,7 +266,7 @@ def test_only_a_first_admission_is_judged() -> None:
     store = InMemoryStore()
 
     candidate = storm_admission.storm_candidate(
-        store, fresh, incident, claims, hold=False
+        store, fresh, incident, claims, steps, hold=False
     )
     assert candidate is not None
     assert candidate.node_ids == frozenset({"node-a"})
@@ -268,10 +274,209 @@ def test_only_a_first_admission_is_judged() -> None:
     for workflow, hold in ((fresh, True), (running, False), (successor, False)):
         assert (
             storm_admission.storm_candidate(
-                store, workflow, incident, claims, hold=hold
+                store, workflow, incident, claims, steps, hold=hold
             )
             is None
         ), (workflow.status, workflow.preempt_predecessor, hold)
     assert (
-        storm_admission.storm_candidate(store, fresh, incident, {}, hold=False) is None
+        storm_admission.storm_candidate(store, fresh, incident, {}, steps, hold=False)
+        is None
     )
+    # A claim whose only budgeted step is a workload stop/restart brings no node
+    # into destructive NODE remediation, so the breaker does not judge it (b223).
+    stop_only = [
+        workflow_step(WorkflowOperation.STOP_WORKLOADS, node_ids=["node-a", "node-b"])
+    ]
+    stop_workflow = workflow_request(
+        "workflow-stop", "incident-x", official_steps=stop_only
+    )
+    assert (
+        storm_admission.storm_candidate(
+            store, stop_workflow, incident, claims, stop_only, hold=False
+        )
+        is None
+    )
+
+
+# --------------------------------------------------------------------------- #
+# A job's workload-stop/restart peers are not counted (b223)
+# --------------------------------------------------------------------------- #
+def _seed_job(
+    store,
+    suffix: str,
+    nodes: list[str],
+    *,
+    created_at: datetime,
+    faulted: str | None = None,
+):
+    """A job workflow as the job family compiles it for a reboot-class fault on
+    one node: STOP_WORKLOADS / RESTART_WORKLOAD across the whole allocation, a
+    RESTART_NODE (reboot) on the faulted node only."""
+
+    faulted = faulted or nodes[0]
+    workload = f"default/pytorchjob/{suffix}"
+    incident = fault_incident(
+        f"incident-{suffix}",
+        f"event-{suffix}",
+        cluster_id="cluster-a",
+        node_ids=[faulted],
+        job_id=f"job-{suffix}",
+        attempt_id=f"{suffix}-a1",
+        official_action="RESTART_BM",
+        state=IncidentState.ACTION_PENDING,
+        fencing_token=3,
+        created_at=created_at,
+        updated_at=created_at,
+    )
+    workflow = workflow_request(
+        f"workflow-{suffix}",
+        incident.incident_id,
+        runtime_profile_version="active-v1",
+        official_action="RESTART_BM",
+        official_steps=[
+            workflow_step(
+                WorkflowOperation.STOP_WORKLOADS,
+                node_ids=list(nodes),
+                workload_ids=[workload],
+            ),
+            workflow_step(WorkflowOperation.RESTART_NODE, node_ids=[faulted]),
+            workflow_step(
+                WorkflowOperation.RESTART_WORKLOAD,
+                node_ids=list(nodes),
+                workload_ids=[workload],
+                parameters={
+                    "cluster_id": "cluster-a",
+                    "job_id": f"job-{suffix}",
+                    "source_attempt_id": f"{suffix}-a1",
+                    "source_gpu_count": 8 * len(nodes),
+                    "restart_budget": 1,
+                },
+            ),
+        ],
+        created_at=created_at,
+        updated_at=created_at,
+    )
+    store.save_incident_and_workflow(
+        incident.model_copy(update={"workflow_request_id": workflow.request_id}),
+        workflow,
+    )
+    return workflow
+
+
+def _window_nodes(store) -> list[str]:
+    breaker = store.get_remediation_storm_breaker("cluster-a")
+    assert breaker is not None
+    return sorted(entry.node_id for entry in breaker.window)
+
+
+def test_a_two_node_job_counts_only_its_faulted_node() -> None:
+    store = InMemoryStore()
+    _seed_job(store, "j", ["node-0", "node-1"], faulted="node-0", created_at=_now())
+
+    budget_dispatcher(store, ScriptedAdapter(REBOOT_PLAN), POLICY).run_once()
+
+    breaker = store.get_remediation_storm_breaker("cluster-a")
+    assert breaker is not None and breaker.state is StormBreakerState.CLOSED
+    # node-1 gets STOP_WORKLOADS/RESTART_WORKLOAD only (the job is stopped as a
+    # whole), so it is not counted; only the rebooted node-0 is.
+    assert _window_nodes(store) == ["node-0"]
+    assert store.get_workflow("workflow-j").status is WorkflowStatus.RUNNING
+
+
+def test_two_two_node_jobs_stay_below_the_floor() -> None:
+    store = InMemoryStore()
+    start = _now() - timedelta(seconds=30)
+    _seed_job(store, "a", ["a0", "a1"], faulted="a0", created_at=start)
+    _seed_job(
+        store, "b", ["b0", "b1"], faulted="b0", created_at=start + timedelta(seconds=1)
+    )
+
+    budget_dispatcher(
+        store, ScriptedAdapter(REBOOT_PLAN), POLICY, max_workers=1
+    ).run_once()
+
+    breaker = store.get_remediation_storm_breaker("cluster-a")
+    assert breaker is not None and breaker.state is StormBreakerState.CLOSED
+    # Two faulted nodes across two job domains: 2 < the floor of 3, so both run
+    # in parallel. Before b223 each job's healthy peer counted too (4 >= 3) and
+    # the second job was held.
+    assert _window_nodes(store) == ["a0", "b0"]
+    assert [
+        store.get_workflow(item).status for item in ("workflow-a", "workflow-b")
+    ] == [WorkflowStatus.RUNNING, WorkflowStatus.RUNNING]
+
+
+def test_two_sixty_four_node_jobs_do_not_trip_at_the_scale_threshold(
+    monkeypatch,
+) -> None:
+    # A ~500 GPU-node cluster: threshold = ceil(0.2 * 500) = 100.
+    monkeypatch.setattr(storm_admission, "cluster_gpu_nodes", lambda _s, _c: 500)
+    store = InMemoryStore()
+    start = _now() - timedelta(seconds=30)
+    _seed_job(store, "a", [f"a{i}" for i in range(64)], faulted="a0", created_at=start)
+    _seed_job(
+        store,
+        "b",
+        [f"b{i}" for i in range(64)],
+        faulted="b0",
+        created_at=start + timedelta(seconds=1),
+    )
+
+    budget_dispatcher(
+        store, ScriptedAdapter(REBOOT_PLAN), POLICY, max_workers=1
+    ).run_once()
+
+    breaker = store.get_remediation_storm_breaker("cluster-a")
+    assert breaker is not None and breaker.state is StormBreakerState.CLOSED
+    # One bad node per 64-node job: 2 counted, far below 100. Before b223 the
+    # two whole allocations counted 128 >= 100 and false-tripped the breaker.
+    assert _window_nodes(store) == ["a0", "b0"]
+    assert breaker.threshold == 100
+
+
+def test_three_one_faulted_node_jobs_still_trip_the_floor() -> None:
+    store = InMemoryStore()
+    start = _now() - timedelta(seconds=30)
+    for index, suffix in enumerate("abc"):
+        _seed_job(
+            store,
+            suffix,
+            [f"{suffix}-n0", f"{suffix}-n1"],
+            faulted=f"{suffix}-n0",
+            created_at=start + timedelta(seconds=index),
+        )
+
+    budget_dispatcher(
+        store, ScriptedAdapter(REBOOT_PLAN), POLICY, max_workers=1
+    ).run_once()
+
+    breaker = store.get_remediation_storm_breaker("cluster-a")
+    assert breaker is not None and breaker.state is StormBreakerState.TRIPPED
+    # One rebooted node per job, three job domains: a genuine correlated storm
+    # (bad image/policy) still reaches the floor of 3 and holds the third.
+    assert (breaker.trip_node_ids, breaker.trip_domains) == (
+        ["a-n0", "b-n0", "c-n0"],
+        3,
+    )
+    assert breaker.trip_threshold == 3
+    assert store.get_workflow("workflow-c").status is WorkflowStatus.PENDING
+
+
+def test_a_quarantine_still_counts_toward_the_breaker() -> None:
+    # F-C5: a false-positive isolation cascade must still be bounded. QUARANTINE
+    # is containment, not a node-hardware mutation, but the breaker counts its
+    # first admission (remediation_budget._budgeted); b223 does not change that.
+    incident = fault_incident("incident-q", "event-q", node_ids=["node-q"])
+    steps = [workflow_step(WorkflowOperation.QUARANTINE, node_ids=["node-q"])]
+    workflow = workflow_request("workflow-q", "incident-q", official_steps=steps)
+
+    candidate = storm_admission.storm_candidate(
+        InMemoryStore(),
+        workflow,
+        incident,
+        {"node:cluster-a:node-q": 1},
+        steps,
+        hold=False,
+    )
+
+    assert candidate is not None and candidate.node_ids == frozenset({"node-q"})
