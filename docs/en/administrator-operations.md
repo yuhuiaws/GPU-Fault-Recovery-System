@@ -3471,7 +3471,7 @@ and the names are the card names below.
 | GPU Fault · Remote command (`gpu-fault-remote-command`) | `gpu-fault-remote-command` | Claim latency -> `GpuFaultRemoteCommandUnclaimed`, `GpuFaultRemoteCommandExecutorInternalError`; Command census -> `GpuFaultRemoteCommandUnclaimedExpired` (the per-state/per-cluster command count panels are trend readings) |
 | GPU Fault · Policy coverage (`gpu-fault-policy-coverage`) | `gpu-fault-policy-coverage` | Catalog coverage -> `GpuFaultUnknownProductFamily` (CRITICAL findings without an incident is a trend reading) |
 | GPU Fault · Orchestration invariants (`gpu-fault-orchestration-invariants`) | `gpu-fault-orchestration-invariants` | Node ownership -> `GpuFaultExclusiveNodeOwnershipInvariantViolation`, `GpuFaultStaleAttemptObservation`; Fleet rollout fence -> `GpuFaultFleetRolloutFenceStuck`; Pointers, agents and registry -> `GpuFaultIncidentDanglingWorkflowPointers`, `GpuFaultStaleAgents`, `GpuFaultFleetPinAheadOfFleet`, `GpuFaultRegionalRegistrySecretDrift` |
-| GPU Fault · Recovery outcome (`gpu-fault-recovery-outcome`) | `gpu-fault-recovery-outcome` | Workflows -> `GpuFaultRecoveryBlockedBacklog`, `GpuFaultWorkflowPendingAge`, `GpuFaultWorkflowDeadlineNotEnforced`; Step waiting -> `GpuFaultWorkflowStepStalled`; Counters (30m increase) -> `GpuFaultWorkflowLifetimeExceeded`, `GpuFaultJobWorkflowNodeBusyTimeout`, `GpuFaultProcessorRetryHorizonFailures`, `GpuFaultBranchEscalationBudgetRefused`; Closed loop and notifications -> `GpuFaultClosedLoopSlow`, `GpuFaultClosedLoopWindowIncomplete`, `GpuFaultNotificationDeliveryFailing`; Remediation budget -> `GpuFaultRemediationBudgetStarved`, `GpuFaultRemediationBudgetClusterSaturated`; Completion and incidents -> `GpuFaultCompletionEventsWithoutDecision`, `GpuFaultIncidentsAwaitingOperator`, `GpuFaultDepartedNodeCleanupStuck`; Dispatcher errors and notification outbox -> `GpuFaultWorkflowDispatchInternalErrors`, `GpuFaultWorkflowFailureHandlingAbandoned`, `GpuFaultNotificationUndeliveredTooLong`, `GpuFaultNotificationOutboxNotDraining`, `GpuFaultNotificationExpiredUnsent` |
+| GPU Fault · Recovery outcome (`gpu-fault-recovery-outcome`) | `gpu-fault-recovery-outcome` | Workflows -> `GpuFaultRecoveryBlockedBacklog`, `GpuFaultWorkflowPendingAge`, `GpuFaultWorkflowDeadlineNotEnforced`; Step waiting -> `GpuFaultWorkflowStepStalled`; Counters (30m increase) -> `GpuFaultWorkflowLifetimeExceeded`, `GpuFaultJobWorkflowNodeBusyTimeout`, `GpuFaultProcessorRetryHorizonFailures`, `GpuFaultBranchEscalationBudgetRefused`; Closed loop and notifications -> `GpuFaultClosedLoopSlow`, `GpuFaultClosedLoopWindowIncomplete`, `GpuFaultNotificationDeliveryFailing`; Remediation budget -> `GpuFaultRemediationBudgetStarved`, `GpuFaultRemediationBudgetClusterSaturated`, `GpuFaultRemediationBudgetLongWait`; Completion and incidents -> `GpuFaultCompletionEventsWithoutDecision`, `GpuFaultIncidentsAwaitingOperator`, `GpuFaultDepartedNodeCleanupStuck`; Dispatcher errors and notification outbox -> `GpuFaultWorkflowDispatchInternalErrors`, `GpuFaultWorkflowFailureHandlingAbandoned`, `GpuFaultNotificationUndeliveredTooLong`, `GpuFaultNotificationOutboxNotDraining`, `GpuFaultNotificationExpiredUnsent` |
 
 The last row of the overview, "Declared topology", is `gpu_fault_capacity_largest_cluster_node_count` /
 `gpu_fault_capacity_managed_node_count`: the topology declared by the release, from which the fault reservation and the Aurora capacity floor are derived;
@@ -4216,6 +4216,29 @@ modifying Store JSON or repeating `send`; an isolated notifier result in accepta
   deadlines and, for parked records, by the longest a node action can live.
 - **Boundary**: do not raise the limit to clear the alert and do not edit Store claims. A scope still over its limit long after
   the roll ended means holders that no longer progress: handle as `GpuFaultRemediationBudgetStarved`.
+
+### GpuFaultRemediationBudgetLongWait
+
+- **Meaning**: one workflow has waited more than an hour (for 5 minutes) on a remediation budget slot of its own node, of its
+  own job (the token a step that stops or restarts the job takes) or of its NVSwitch fabric partition (detailed design v2 §9.5).
+  Those slots have a limit of 1, so another workflow of the same node or job holds it: typically a second workflow on a node
+  whose first workflow is still running (the job's later attempt, a node-level workflow behind the job workflow on that node),
+  or a second workflow stopping or restarting the same job. The age is per workflow, from the refusal that began its wait (`gpu_fault_remediation_budget_longest_wait_seconds{scope_type}`,
+  the workflow's `REMEDIATION_BUDGET_WAIT` hold event), which the waiting count behind `GpuFaultRemediationBudgetStarved`
+  cannot say. Cluster, region and resource-class waits are not read: they drain by design during a correlated fault
+  (`GpuFaultRemediationBudgetClusterSaturated`).
+- **First check**: find the waiting workflow (`gpu_fault_workflow_pending_age_seconds_max` names the oldest PENDING one, or
+  `GET /v1/workflows?status=PENDING`) and read its `remediation_budget_last_blocked_scope`, for example
+  `node:<cluster>:<node>` or `job:<cluster>:<workload_id>`; then find the workflow holding that scope (`RUNNING`, or a
+  parked `BLOCKED` record with an unresolved node action) and confirm it still progresses. A holder is bounded by its own
+  deadline -- 30 minutes from the first claim for a node workflow, the 1-hour lifetime for a job workflow -- and failed by the
+  deadline watchdog at it (a holder still `RUNNING` past it is `GpuFaultWorkflowDeadlineNotEnforced`); a plan with an operator
+  acknowledgement (`CHECK_MECHANICALS`) together with budgeted steps holds until it is acknowledged (up to 24 hours), and a
+  parked record holds until `submit-remediation --disposition confirm-node-action` answers it or the dispatcher releases it
+  after 5520 s (`PARKED_BUDGET_RELEASED`).
+- **Boundary**: do not edit claims in the Store, and do not raise the per-node or per-failure-domain limit -- both are safety
+  constants of 1, and a second concurrent workflow on one node, or stopping or restarting one job, is exactly what they prevent. Resolve the holder
+  (acknowledge, confirm, reconcile) and the waiter is admitted on its next claim.
 
 ### GpuFaultCompletionEventsWithoutDecision
 

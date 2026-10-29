@@ -3263,8 +3263,9 @@ The email subscription must be confirmed by the recipient clicking the confirmat
 are still deployed normally, but the alerts have no final receiver. The rules cover missing metrics, regional queue at 70%/90% of its limit, oldest request
 over 30 seconds, single cluster at 70% of its limit and at its fault-reserve boundary, admission rejections occurring, Store I/O over 90% or rejections occurring,
 processing duration p95 over 5 seconds, plus remote commands unclaimed for over 600 seconds, executor
-internal errors and a remediation budget scope held over its limit for 10 minutes (a warning, not a page:
-`GpuFaultRemediationBudgetOverLimit`). The queue thresholds are ratios of the caps admission enforces: the control plane
+internal errors, a remediation budget scope held over its limit for 10 minutes (a warning, not a page:
+`GpuFaultRemediationBudgetOverLimit`) and one workflow waiting over an hour on its own node's or job's slot (a
+warning, not a page: `GpuFaultRemediationBudgetLongWait`). The queue thresholds are ratios of the caps admission enforces: the control plane
 exports `gpu_fault_processor_queue_depth_limit`, `gpu_fault_processor_cluster_queue_depth_limit` and the two fault
 reserves on `/metrics`, so changing `maxQueueDepth` / `maxClusterQueueDepth` through `gpu-fault-admin config` moves the
 alert boundaries with them, without editing `deploy/observability/amp-rules.yaml`.

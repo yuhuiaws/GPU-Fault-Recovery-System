@@ -525,3 +525,128 @@ def test_the_budget_over_limit_alert_waits_ten_minutes_and_counts_scopes(
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+LONG_WAIT = "GpuFaultRemediationBudgetLongWait"
+LONGEST_WAIT = "gpu_fault_remediation_budget_longest_wait_seconds"
+
+
+@pytest.mark.parametrize(
+    ("inputs", "eval_time", "scope_type"),
+    [
+        pytest.param(
+            [series(LONGEST_WAIT, "3000+60x30", scope_type="domain")],
+            "25m",
+            "domain",
+            id="a-job-domain-wait-past-an-hour-for-five-minutes",
+        ),
+        pytest.param(
+            [series(LONGEST_WAIT, "3000+60x30", scope_type="node")],
+            "25m",
+            "node",
+            id="a-node-wait-past-an-hour",
+        ),
+        pytest.param(
+            [series(LONGEST_WAIT, "3000+60x30", scope_type="job")],
+            "25m",
+            "job",
+            id="a-wait-on-the-job-token-past-an-hour",
+        ),
+        pytest.param(
+            [series(LONGEST_WAIT, "3000+60x30", scope_type="domain")],
+            "14m",
+            None,
+            id="past-the-hour-for-less-than-five-minutes-stays-pending",
+        ),
+        pytest.param(
+            [series(LONGEST_WAIT, "3000+0x30", scope_type="domain")],
+            "25m",
+            None,
+            id="under-an-hour",
+        ),
+        pytest.param(
+            [series(LONGEST_WAIT, "9000+60x30", scope_type="cluster")],
+            "25m",
+            None,
+            id="a-cluster-wait-drains-by-design-and-is-not-read",
+        ),
+        pytest.param(
+            [
+                series(LONGEST_WAIT, "3000+60x30", scope_type="domain"),
+                series(LONGEST_WAIT, "100+60x30", pod="worker-b", scope_type="domain"),
+            ],
+            "25m",
+            "domain",
+            id="every-process-renders-the-store-and-the-max-is-read",
+        ),
+    ],
+)
+def test_the_budget_long_wait_alert_reads_node_job_and_domain_waits_past_an_hour(
+    tmp_path: Path, inputs, eval_time: str, scope_type: str | None
+) -> None:
+    """A warning on one workflow's own node, job or fabric slot: an hour is
+    past a progressing holder's deadline (1800 s node, 3600 s job workflow)."""
+
+    promtool = shutil.which(os.environ.get("PROMTOOL", "promtool"))
+    assert promtool is not None, "set PROMTOOL to the pinned local promtool"
+    rule = rule_map("deploy/observability/amp-rules.yaml")[LONG_WAIT]
+    assert rule["labels"] == {"severity": "warning"}, "the alert must not page"
+    assert rule["for"] == "5m"
+    rule_file = tmp_path / "rules.yaml"
+    rule_file.write_text(
+        yaml.safe_dump({"groups": [{"name": "budget", "rules": [rule]}]})
+    )
+    # Every firing case reads 3000 + 60 x 25 = 4500 s at 25m.
+    annotations = {
+        key: str(text)
+        .replace("{{ $labels.scope_type }}", str(scope_type))
+        .replace("{{ $value | humanizeDuration }}", "1h 15m 0s")
+        for key, text in rule["annotations"].items()
+    }
+    expected = (
+        []
+        if scope_type is None
+        else [
+            {
+                "exp_labels": {
+                    "control_plane_cluster": BASE["control_plane_cluster"],
+                    "region": BASE["region"],
+                    "scope_type": scope_type,
+                    "severity": "warning",
+                },
+                "exp_annotations": annotations,
+            }
+        ]
+    )
+    test_file = tmp_path / "cases.yaml"
+    test_file.write_text(
+        yaml.safe_dump(
+            {
+                "rule_files": [str(rule_file)],
+                "evaluation_interval": "1m",
+                "tests": [
+                    {
+                        "interval": "1m",
+                        "input_series": inputs,
+                        "alert_rule_test": [
+                            {
+                                "alertname": LONG_WAIT,
+                                "eval_time": eval_time,
+                                "exp_alerts": expected,
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+    )
+
+    result = subprocess.run(
+        [promtool, "test", "rules", str(test_file)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr

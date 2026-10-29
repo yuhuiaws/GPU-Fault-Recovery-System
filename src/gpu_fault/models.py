@@ -823,6 +823,9 @@ class WorkflowEventCode(StrEnum):
     NODE_UNDER_REMEDIATION = "NODE_UNDER_REMEDIATION"
     NODE_REMEDIATION_TIMEOUT = "NODE_REMEDIATION_TIMEOUT"
     WORKLOAD_WITHDRAWN = "WORKLOAD_WITHDRAWN"
+    # A remediation budget refusal began a wait: one per wait, at its start
+    # (``store.shared.remediation_budgets.blocked_by_remediation_budget``).
+    REMEDIATION_BUDGET_WAIT = "REMEDIATION_BUDGET_WAIT"
     # Placement hold (orchestrator opens, dispatcher dissolves)
     PLACEMENT_HOLD_OPENED = "PLACEMENT_HOLD_OPENED"
     PLACEMENT_HOLD_DISSOLVED = "PLACEMENT_HOLD_DISSOLVED"

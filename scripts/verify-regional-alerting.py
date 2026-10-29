@@ -45,6 +45,7 @@ STORE_DERIVED_CONTRIBUTORS = (
     "src/gpu_fault/app/builtin_metric_contributors.py",
     "src/gpu_fault/app/closed_loop_metrics.py",
     "src/gpu_fault/app/collector_metrics.py",
+    "src/gpu_fault/app/remediation_budget_metrics.py",
 )
 # Adjacent string literals are how the long HELP lines are written, and some
 # split inside a metric name. Collapsing the joint recovers the whole name.

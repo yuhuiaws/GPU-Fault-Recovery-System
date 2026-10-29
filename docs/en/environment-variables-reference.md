@@ -567,11 +567,11 @@ validates them (integers/numbers must parse, booleans must be `0/1/true/false/ye
 | `GPU_FAULT_RELEASE_ID` | Core/Other | text | `'', 'local'` | `gpu_fault.app.factory`<br>`gpu_fault.node_agent.app` |
 | `GPU_FAULT_RELEASE_SUPERSEDE_FAILED_TRANSACTION` | Core/Other | text | `<implicit>` | `gpu_fault.admin.release_consent` |
 | `GPU_FAULT_REMEDIATION_FAILURE_DOMAIN_MAP` | Core/Other | text | `<implicit>` | `gpu_fault.admin.failure_domain_map`<br>`gpu_fault.failure_domains` |
-| `GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER` | Core/Other | integer | `'5'` | `gpu_fault.app.builtin_metric_contributors`<br>`gpu_fault.execution.remediation_budget` |
+| `GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER` | Core/Other | integer | `'5'` | `gpu_fault.app.remediation_budget_metrics`<br>`gpu_fault.execution.remediation_budget` |
 | `GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN` | Core/Other | integer | `'1'` | `gpu_fault.execution.remediation_budget` |
 | `GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE` | Core/Other | integer | `'1'` | `gpu_fault.execution.remediation_budget` |
 | `GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS` | Core/Other | integer | `'2'` | `gpu_fault.execution.remediation_budget` |
-| `GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION` | Core/Other | integer | `'20'` | `gpu_fault.app.builtin_metric_contributors`<br>`gpu_fault.execution.config`<br>`gpu_fault.execution.remediation_budget` |
+| `GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION` | Core/Other | integer | `'20'` | `gpu_fault.app.remediation_budget_metrics`<br>`gpu_fault.execution.config`<br>`gpu_fault.execution.remediation_budget` |
 | `GPU_FAULT_REMOTE_COMMAND_CLAIM_DEADLINE_SECONDS` | Core/Other | text | `'900'` | `gpu_fault.app.builtin_metric_contributors`<br>`gpu_fault.app.periodic_services` |
 | `GPU_FAULT_REMOTE_COMMAND_RETENTION_SECONDS` | Core/Other | text | `'86400'` | `gpu_fault.app.periodic_services` |
 | `GPU_FAULT_REMOTE_COMMAND_STALE_FENCE_GRACE_SECONDS` | Core/Other | number | `'600'` | `gpu_fault.app.periodic_services` |

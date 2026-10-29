@@ -146,6 +146,7 @@ _ANY = (
     "gpu_fault_remediation_budget_wait_total",
     "gpu_fault_remediation_budget_waiting_workflows",
     "gpu_fault_remediation_budget_waiting_workflows_by_scope",
+    "gpu_fault_remediation_budget_longest_wait_seconds",
     "gpu_fault_ambiguous_attempt_ownership_current",
     "gpu_fault_attempt_observation_scan_limit",
     "gpu_fault_attempt_observation_scan_size",

@@ -51,6 +51,7 @@ from gpu_fault.models import (
     workflow_is_open,
 )
 from gpu_fault.store.shared.errors import RemediationBudgetError
+from gpu_fault.store.shared.workflow_scan import dispatch_eligible_at
 
 _SUCCESSOR_WAITING = frozenset({WorkflowStatus.PENDING, WorkflowStatus.SAFETY_PENDING})
 # The longest a node action can live, and so how long a parked record's hold
@@ -67,6 +68,8 @@ _SUCCESSOR_WAITING = frozenset({WorkflowStatus.PENDING, WorkflowStatus.SAFETY_PE
 # before its verdict lands or the lease lapses.
 NODE_ACTION_SETTLE_SECONDS = 1800 + 120
 NODE_ACTION_LONGEST_LIFE_SECONDS = 3600 + NODE_ACTION_SETTLE_SECONDS
+# Who appends the event that opens a budget wait (store and dispatcher alike).
+BUDGET_WAIT_ACTOR = "remediation-budget"
 
 
 def reserved_for(
@@ -340,8 +343,12 @@ def blocked_by_remediation_budget(
 
     ``scope`` is the refusing budget scope (``RemediationBudgetError.scope``);
     an empty string means the caller did not know it and is stored as None.
+    The refusal that begins a wait -- the row was admitted since its last one,
+    or never refused -- also appends one ``HOLD`` event
+    (``REMEDIATION_BUDGET_WAIT``) at ``now``: ``budget_wait_started_at``
+    reads the wait's age from it, however often the claim is refused again.
     """
-    return workflow.model_copy(
+    blocked = workflow.model_copy(
         update={
             "execution_owner_id": None,
             "execution_lease_expires_at": None,
@@ -353,3 +360,30 @@ def blocked_by_remediation_budget(
             "updated_at": now,
         }
     )
+    if workflow.remediation_budget_last_blocked_reason is not None:
+        return blocked
+    code = WorkflowEventCode.REMEDIATION_BUDGET_WAIT.value
+    return record_workflow_event(
+        blocked,
+        WorkflowEventKind.HOLD,
+        code=code,
+        reason=reason,
+        actor=BUDGET_WAIT_ACTOR,
+        status=workflow.status.value,
+        details={"reason": code, "remediation_workflow_id": None, "scope": scope},
+        at=now,
+    )
+
+
+def budget_wait_started_at(workflow: WorkflowRequest) -> datetime | None:
+    """When the workflow's current remediation budget wait began; ``None``
+    when it is not waiting. A row an older release refused carries no wait
+    event and counts from when it became dispatchable."""
+
+    if workflow.remediation_budget_last_blocked_reason is None:
+        return None
+    code = WorkflowEventCode.REMEDIATION_BUDGET_WAIT.value
+    for event in reversed(workflow.events):
+        if event.kind is WorkflowEventKind.HOLD and event.code == code:
+            return event.at
+    return dispatch_eligible_at(workflow)

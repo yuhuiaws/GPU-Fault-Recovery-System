@@ -1113,7 +1113,7 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 8,
+        "w": 6,
         "x": 0,
         "y": 45
       },
@@ -1180,8 +1180,8 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 8,
-        "x": 8,
+        "w": 6,
+        "x": 6,
         "y": 45
       },
       "id": 21,
@@ -1239,6 +1239,77 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
+      "description": "How long the oldest current wait has lasted, by the type of the scope that last refused it, from the refusal that began the wait.\n\nAlert GpuFaultRemediationBudgetLongWait (warning, for 5m, > 3600): docs/en/administrator-operations.md#gpufaultremediationbudgetlongwait",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 3600.0
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 45
+      },
+      "id": 22,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "max by (scope_type) (gpu_fault_remediation_budget_longest_wait_seconds{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "{{scope_type}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Longest remediation budget wait",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-fault-amp"
+      },
       "description": "Scopes holding more workflows than their configured limit, by scope type; nothing new is admitted into them until they drain below it.\n\nAlert GpuFaultRemediationBudgetOverLimit (warning, for 10m, > 0): docs/en/administrator-operations.md#gpufaultremediationbudgetoverlimit",
       "fieldConfig": {
         "defaults": {
@@ -1273,11 +1344,11 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 8,
-        "x": 16,
+        "w": 6,
+        "x": 18,
         "y": 45
       },
-      "id": 22,
+      "id": 23,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1313,7 +1384,7 @@
         "x": 0,
         "y": 53
       },
-      "id": 23,
+      "id": 24,
       "panels": [],
       "title": "Completion and incidents",
       "type": "row"
@@ -1357,7 +1428,7 @@
         "x": 0,
         "y": 54
       },
-      "id": 24,
+      "id": 25,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1428,7 +1499,7 @@
         "x": 6,
         "y": 54
       },
-      "id": 25,
+      "id": 26,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1499,7 +1570,7 @@
         "x": 12,
         "y": 54
       },
-      "id": 26,
+      "id": 27,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1570,7 +1641,7 @@
         "x": 18,
         "y": 54
       },
-      "id": 27,
+      "id": 28,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1606,7 +1677,7 @@
         "x": 0,
         "y": 62
       },
-      "id": 28,
+      "id": 29,
       "panels": [],
       "title": "Dispatcher errors and notification outbox",
       "type": "row"
@@ -1654,7 +1725,7 @@
         "x": 0,
         "y": 63
       },
-      "id": 29,
+      "id": 30,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1725,7 +1796,7 @@
         "x": 8,
         "y": 63
       },
-      "id": 30,
+      "id": 31,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1796,7 +1867,7 @@
         "x": 16,
         "y": 63
       },
-      "id": 31,
+      "id": 32,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1867,7 +1938,7 @@
         "x": 0,
         "y": 71
       },
-      "id": 32,
+      "id": 33,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1949,7 +2020,7 @@
         "x": 12,
         "y": 71
       },
-      "id": 33,
+      "id": 34,
       "options": {
         "legend": {
           "displayMode": "list",

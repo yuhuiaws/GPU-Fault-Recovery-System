@@ -9,6 +9,10 @@ from gpu_fault.app.closed_loop_metrics import (
     closed_loop_window_metric_lines,
 )
 from gpu_fault.app.metric_scan_cache import MetricScanCache, metric_scan_cache
+from gpu_fault.app.remediation_budget_metrics import (
+    budget_tally,
+    remediation_budget_lines,
+)
 from gpu_fault.app.runtime import AppRuntime
 from gpu_fault.app.store_bloat_metrics import store_bloat_metric_lines
 from gpu_fault.collector_requirements import agent_is_current
@@ -26,7 +30,6 @@ from gpu_fault.models import (
     WorkflowStepStatus,
 )
 from gpu_fault.store.contracts import ControlPlaneStore
-from gpu_fault.store.shared.remediation_budgets import budget_holds
 
 # Upper bound on the rows either orphan inspection decodes per scrape; the
 # gauges saturate there rather than let a pathological table grow the render.
@@ -1073,109 +1076,6 @@ def workflow_stall_metric_lines(
     return lines
 
 
-def _remediation_budget_lines(
-    *,
-    active_by_scope_type: Counter[str],
-    active_by_cluster: Counter[str],
-    waiting_by_scope_type: Counter[str],
-    waiting_by_cluster: Counter[str],
-    wait_total: int,
-    waiting: int,
-    config: ProductionExecutorConfig | None,
-) -> list[str]:
-    """Render the remediation budget families from the workflow scan tallies.
-
-    The per-cluster families exist because the scope-type split cannot say
-    *which* cluster is saturated (S1): a correlated whole-cluster fault drains
-    at ``cluster_limit`` concurrent remediations, and an operator needs the
-    active/limit pair and the waiting count for that cluster to estimate the
-    drain time. Labels are the cluster id only -- never a node -- so the
-    cardinality is bounded by the fleet, not by the fault.
-
-    The limit gauge is omitted, not zeroed, when there is no executor policy
-    to read: a fabricated zero would make the saturation alert's ``limit > 0``
-    guard read as "never saturated".
-    """
-
-    lines = [
-        "# HELP gpu_fault_remediation_budget_active_claims Active durable "
-        "remediation claims by scope type.",
-        "# TYPE gpu_fault_remediation_budget_active_claims gauge",
-    ]
-    for scope_type, count in sorted(active_by_scope_type.items()):
-        lines.append(
-            "gpu_fault_remediation_budget_active_claims"
-            f'{{scope_type="{_escape_label(scope_type)}"}} {count}'
-        )
-    lines.extend(
-        [
-            "# HELP gpu_fault_remediation_budget_cluster_active_claims Workflows "
-            "holding this cluster's remediation budget claim: RUNNING (any lease) "
-            "or reserved for a preempting successor that has not claimed yet.",
-            "# TYPE gpu_fault_remediation_budget_cluster_active_claims gauge",
-        ]
-    )
-    for cluster_id, count in sorted(active_by_cluster.items()):
-        lines.append(
-            "gpu_fault_remediation_budget_cluster_active_claims"
-            f'{{cluster_id="{_escape_label(cluster_id)}"}} {count}'
-        )
-    if config is not None:
-        lines.extend(
-            [
-                "# HELP gpu_fault_remediation_budget_cluster_limit Configured "
-                "per-cluster remediation concurrency limit "
-                "(GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER); a safety "
-                "limit, the same for every cluster.",
-                "# TYPE gpu_fault_remediation_budget_cluster_limit gauge",
-                "gpu_fault_remediation_budget_cluster_limit "
-                f"{config.remediation_budget.cluster_limit}",
-                "# HELP gpu_fault_remediation_budget_region_limit Configured "
-                "region-wide remediation concurrency limit "
-                "(GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION); compare with "
-                'gpu_fault_remediation_budget_active_claims{scope_type="region"}.',
-                "# TYPE gpu_fault_remediation_budget_region_limit gauge",
-                "gpu_fault_remediation_budget_region_limit "
-                f"{config.remediation_budget.region_limit}",
-            ]
-        )
-    lines.extend(
-        [
-            "# HELP gpu_fault_remediation_budget_wait_total Workflow claim "
-            "attempts held by a remediation budget.",
-            "# TYPE gpu_fault_remediation_budget_wait_total gauge",
-            f"gpu_fault_remediation_budget_wait_total {wait_total}",
-            "# HELP gpu_fault_remediation_budget_waiting_workflows Workflows "
-            "currently waiting for remediation capacity.",
-            "# TYPE gpu_fault_remediation_budget_waiting_workflows gauge",
-            f"gpu_fault_remediation_budget_waiting_workflows {waiting}",
-            "# HELP gpu_fault_remediation_budget_waiting_workflows_by_scope "
-            "Waiting workflows by the scope type of the budget that last "
-            "refused them.",
-            "# TYPE gpu_fault_remediation_budget_waiting_workflows_by_scope gauge",
-        ]
-    )
-    for scope_type, count in sorted(waiting_by_scope_type.items()):
-        lines.append(
-            "gpu_fault_remediation_budget_waiting_workflows_by_scope"
-            f'{{scope_type="{_escape_label(scope_type)}"}} {count}'
-        )
-    lines.extend(
-        [
-            "# HELP gpu_fault_remediation_budget_cluster_waiting_workflows "
-            "Workflows waiting because this cluster's remediation budget was "
-            "full when they last tried to claim.",
-            "# TYPE gpu_fault_remediation_budget_cluster_waiting_workflows gauge",
-        ]
-    )
-    for cluster_id, count in sorted(waiting_by_cluster.items()):
-        lines.append(
-            "gpu_fault_remediation_budget_cluster_waiting_workflows"
-            f'{{cluster_id="{_escape_label(cluster_id)}"}} {count}'
-        )
-    return lines
-
-
 def _orphan_inspection_counts(
     runtime: AppRuntime, cache: MetricScanCache
 ) -> tuple[int, int]:
@@ -1232,23 +1132,12 @@ def closed_loop_metric_lines(runtime: AppRuntime) -> list[str]:
     step_statuses: Counter[tuple[str, str]] = Counter()
     terminal_durations: dict[str, list[float]] = defaultdict(list)
     milestone_durations: dict[str, list[float]] = defaultdict(list)
-    budget_scope_types: Counter[str] = Counter()
-    budget_cluster_active: Counter[str] = Counter()
-    budget_cluster_waiting: Counter[str] = Counter()
-    budget_waiting_scope_types: Counter[str] = Counter()
-    budget_wait_total = budget_waiting = 0
-    holding = {holder.request_id for holder, _ in budget_holds(workflows)}
     now = datetime.now(timezone.utc)
     terminal = {
         WorkflowStatus.SUCCEEDED,
         WorkflowStatus.FAILED,
         WorkflowStatus.BLOCKED,
         WorkflowStatus.SUPERSEDED,
-    }
-    budget_waiting_statuses = {
-        WorkflowStatus.PENDING,
-        WorkflowStatus.RUNNING,
-        WorkflowStatus.SAFETY_PENDING,
     }
     for workflow in workflows:
         if workflow.status in terminal:
@@ -1275,22 +1164,6 @@ def closed_loop_metric_lines(runtime: AppRuntime) -> list[str]:
                     (execution.updated_at - workflow.created_at).total_seconds(),
                 )
             )
-        if workflow.request_id in holding:
-            for scope in workflow.remediation_budget_claims:
-                budget_scope_types[scope.split(":", 1)[0]] += 1
-                if scope.startswith("cluster:"):
-                    budget_cluster_active[scope.removeprefix("cluster:")] += 1
-        budget_wait_total += workflow.remediation_budget_wait_count
-        if (
-            workflow.remediation_budget_last_blocked_reason is not None
-            and workflow.status in budget_waiting_statuses
-        ):
-            budget_waiting += 1
-            blocked_scope = workflow.remediation_budget_last_blocked_scope or ""
-            if blocked_scope:
-                budget_waiting_scope_types[blocked_scope.split(":", 1)[0]] += 1
-            if blocked_scope.startswith("cluster:"):
-                budget_cluster_waiting[blocked_scope.removeprefix("cluster:")] += 1
 
     lines = [
         "# HELP gpu_fault_workflow_total Persisted recovery workflows by status.",
@@ -1390,13 +1263,8 @@ def closed_loop_metric_lines(runtime: AppRuntime) -> list[str]:
         )
     )
     lines.extend(
-        _remediation_budget_lines(
-            active_by_scope_type=budget_scope_types,
-            active_by_cluster=budget_cluster_active,
-            waiting_by_scope_type=budget_waiting_scope_types,
-            waiting_by_cluster=budget_cluster_waiting,
-            wait_total=budget_wait_total,
-            waiting=budget_waiting,
+        remediation_budget_lines(
+            budget_tally(workflows, now),
             config=runtime.context.production_executor_config,
         )
     )

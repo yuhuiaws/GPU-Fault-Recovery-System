@@ -4984,7 +4984,16 @@ in `gpu_fault_workflow_pending_age_seconds_max`. The alerts `GpuFaultRemediation
 with waiters for 30 minutes), `GpuFaultRemediationBudgetStarved` (waiters for 30 minutes) and `GpuFaultWorkflowPendingAge` (the
 oldest `PENDING` workflow older than 30 minutes) fire as expected during a large correlated fault; the handling is in the matching
 entries of administrator operations §8: confirm the holders still progress, estimate the drain time from the drain rate, and do
-not raise a limit to clear an alert.
+not raise a limit to clear an alert. A waiting count cannot say how long one workflow has waited: the refusal that begins a wait
+(the row was not waiting -- admitted since, or never refused) makes `blocked_by_remediation_budget` append one `HOLD` /
+`REMEDIATION_BUDGET_WAIT` event to the row, later refusals append none, and an admission ends the wait;
+`gpu_fault_remediation_budget_longest_wait_seconds{scope_type}` is the longest current wait (by the type of the scope that last
+refused it; a row an older release refused carries no such event and counts from when it became dispatchable).
+`GpuFaultRemediationBudgetLongWait` (warning) fires when a wait on a node, job or domain scope passes 3600 s for 5 minutes:
+those slots belong to one node, one job (the token a step that stops or restarts it takes) or one fabric partition, so another
+workflow of the same node or job holds it and has not ended within an hour -- past a progressing holder's own deadline (1800 s for a node
+workflow, 3600 s for a job workflow); cluster, region and class waits drain by design during a correlated fault and are not
+read.
 
 `GPU_FAULT_PROCESSOR_COMPLETION_CLUSTER_CONCURRENCY` is not a counterexample: it only controls
 the number of commit threads for different cluster transactions within a PostgreSQL completion batch; it does not limit how many nodes

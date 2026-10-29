@@ -1244,6 +1244,25 @@ RECOVERY_OUTCOME = Dashboard(
                     ),
                 ),
                 Panel(
+                    "Longest remediation budget wait",
+                    (
+                        Target(
+                            "max by (scope_type) ("
+                            + series(
+                                "gpu_fault_remediation_budget_longest_wait_seconds"
+                            )
+                            + ")",
+                            "{{scope_type}}",
+                        ),
+                    ),
+                    unit="s",
+                    description=(
+                        "How long the oldest current wait has lasted, by the type "
+                        "of the scope that last refused it, from the refusal that "
+                        "began the wait."
+                    ),
+                ),
+                Panel(
                     "Budget scopes above their limit",
                     (
                         Target(

@@ -2039,6 +2039,45 @@ groups:
             limit long after the roll ended means holders that no longer
             progress: GpuFaultRemediationBudgetStarved. Do not raise the limit
             to clear this alert.
+      # One workflow has waited over an hour on a slot of its own node, of its
+      # own job (the token a step that stops or restarts the job takes) or of
+      # its NVSwitch fabric partition: another workflow of the same node or job
+      # holds it and has not ended. A holder is bounded by its own deadline --
+      # 1800 s for a node workflow, the 3600 s job workflow lifetime -- so an
+      # hour is past what a progressing holder takes; the exceptions are an
+      # operator-acknowledgement plan and a parked record. The age is per
+      # workflow, from the refusal that began its wait, which the waiting
+      # count alone (GpuFaultRemediationBudgetStarved) cannot say. Cluster,
+      # region and resource-class waits drain by design during a correlated
+      # fault (GpuFaultRemediationBudgetClusterSaturated) and are not read here.
+      - alert: GpuFaultRemediationBudgetLongWait
+        expr: >-
+          max by (control_plane_cluster, region, scope_type)
+          (gpu_fault_remediation_budget_longest_wait_seconds{scope_type=~"node|job|domain"}) > 3600
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: A recovery workflow has waited over an hour for its own node's or job's remediation slot
+          runbook_url: docs/en/administrator-operations.md#gpufaultremediationbudgetlongwait
+          description: >-
+            The longest current wait on a {{ $labels.scope_type }} remediation
+            budget scope is {{ $value | humanizeDuration }}. That slot belongs
+            to one node, one job (taken by a step that stops or restarts it) or
+            one NVSwitch fabric partition, so another workflow of the same node
+            or job holds it: a second workflow on a node whose first one is still
+            running (the job's later attempt, a node workflow behind the job
+            workflow on that node), or a second workflow stopping or restarting
+            the same job. Read the waiting workflow's
+            remediation_budget_last_blocked_reason for the scope, find the
+            RUNNING (or parked BLOCKED) workflow holding it and check that it
+            still progresses: a holder is bounded by its own deadline (1800 s
+            for a node workflow, 3600 s job workflow lifetime), an
+            operator-acknowledgement plan (CHECK_MECHANICALS) holds until it is
+            acknowledged, and a parked record until confirm-node-action answers
+            it or NODE_ACTION_LONGEST_LIFE_SECONDS (5520 s) passes. Do not hand
+            edit claims or raise the per-node or per-failure-domain limit (a
+            safety constant of 1) to clear this alert.
       # A completion event with no decision row at all. Every persisted event
       # is meant to be decided in the same transaction; one without a decision
       # was recorded and then never judged, and nothing downstream will ever
