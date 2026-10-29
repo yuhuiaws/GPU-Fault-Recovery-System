@@ -23,7 +23,10 @@ import math
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from scripts.e2e.regional.acceptance_runner_common import processor_queue_backlog
+from scripts.e2e.regional.acceptance_runner_common import (
+    processor_queue_backlog,
+    remote_command_queue_errors,
+)
 
 CASE_ID = "GF-REGIONAL-DESTR-021"
 PREDECESSOR_CASE_ID = "GF-REGIONAL-DESTR-020"
@@ -150,6 +153,7 @@ def preflight_errors(
     predecessor_valid: bool,
     tests_passed: bool,
     site_file_exists: bool,
+    cluster_id: str,
 ) -> list[str]:
     errors: list[str] = []
     if node.get("ready") != "True":
@@ -177,8 +181,7 @@ def preflight_errors(
         errors.append("target node has no bound EFA function to unbind")
     if processor_queue_backlog(queue):
         errors.append("processor queue is not empty")
-    if remote_commands.get("open_by_cluster"):
-        errors.append("remote command queue is not empty")
+    errors.extend(remote_command_queue_errors(remote_commands, cluster_id))
     if not predecessor_valid:
         errors.append(f"{PREDECESSOR_CASE_ID} predecessor evidence is not PASS")
     if not tests_passed:

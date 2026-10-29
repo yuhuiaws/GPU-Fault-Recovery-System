@@ -33,7 +33,7 @@ from scripts.e2e.regional.regional_commands import (  # noqa: E402
     run_fixture_command,
 )
 from scripts.e2e.regional.regional_pod_exec import exec_pod_script  # noqa: E402
-from scripts.e2e.regional import regional_pod_inventory  # noqa: E402
+from scripts.e2e.regional import provider_cluster_scope, regional_pod_inventory  # noqa: E402
 from scripts.e2e.regional import release_phase_gate  # noqa: E402
 from scripts.e2e.regional.release_pins import (  # noqa: E402
     RELEASE_METADATA_CONFIGMAP,
@@ -1406,7 +1406,7 @@ class RegionalLiveFixture:
             if item.get("EventName") not in PROVIDER_MUTATIONS:
                 continue
             result.append(dict(normalize_provider_event(item)))
-        return result
+        return provider_cluster_scope.own_cluster_events(self, result, event_source)
 
     def wait_provider_events(
         self,

@@ -283,7 +283,7 @@ class FenceRegional:
                     ],
                 },
                 "queue": {"depth": 0, "fault_backlog_depth": 0},
-                "remote_commands": {},
+                "remote_commands": {"open_by_cluster": {}},
             }
         if not self.h.rebooted:
             return self.h.waiting_state()

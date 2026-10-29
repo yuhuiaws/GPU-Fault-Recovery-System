@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -179,3 +180,37 @@ def test_metadata_plan_rejects_node_uid_drift(
     with pytest.raises(RegionalFixtureError, match="plan drifted"):
         h.execute(tmp_path)
     assert not h.injection_attempted, h.calls
+
+
+@pytest.mark.parametrize(
+    ("commands", "refused"),
+    [
+        ({"open_by_cluster": {"cluster-b": 2}}, False),
+        ({"open_by_cluster": {"cluster-a": 1}}, True),
+        ({"by_status": {}}, True),
+    ],
+)
+def test_the_injection_gate_is_this_clusters_drained_reading(
+    commands: dict[str, Any],
+    refused: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Right before the unbind: the other cluster's open commands do not stop
+    the injection, this cluster's (or an unreadable reading) do, and the read
+    is a gate's drained one, not a single sample."""
+
+    h = MetadataHarness(tmp_path, monkeypatch)
+    h.plan(tmp_path)
+    h.quiet_commands = commands
+    reads: list[dict[str, Any]] = []
+    original = h.regional.store_snapshot
+
+    def store_snapshot(**kwargs: Any) -> dict[str, Any]:
+        reads.append(dict(kwargs))
+        return original(**kwargs)
+
+    monkeypatch.setattr(h.regional, "store_snapshot", store_snapshot)
+    code, report = h.execute(tmp_path)
+    assert (code == 1 and not h.injection_attempted) is refused, report
+    assert any(item.get("queue_attempts") == 20 for item in reads), reads

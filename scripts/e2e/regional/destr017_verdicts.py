@@ -30,6 +30,7 @@ from typing import Any
 from scripts.e2e.regional.acceptance_runner_common import (
     open_incident_errors,
     processor_queue_backlog,
+    remote_command_queue_errors,
 )
 
 # The official steps a single idle node's RESET_GPU workflow compiles to.
@@ -890,6 +891,7 @@ def preflight_errors(
     host_snapshot: dict[str, Any],
     reboot_status: dict[str, Any],
     expected_gpu_count: int,
+    cluster_id: str,
 ) -> list[str]:
     """Read-only gates. An idle, healthy, unfenced node or no case at all."""
 
@@ -942,10 +944,9 @@ def preflight_errors(
         errors.append(f"{node} runtime profile carries warnings: {profile['warnings']}")
     if processor_queue_backlog(queue):
         errors.append(f"processor queue is not empty: {queue}")
-    for key in ("pending", "leased", "in_progress"):
-        if int(remote_commands.get(key) or 0):
-            errors.append(f"remote commands are not idle: {remote_commands}")
-            break
+    # ``remote_command_stats()`` has no pending/leased/in_progress keys, so the
+    # old per-key read never fired; this cluster's open commands are the gate.
+    errors.extend(remote_command_queue_errors(remote_commands, cluster_id))
     if recent_events:
         errors.append(
             f"{node} already has a recent XID event: "

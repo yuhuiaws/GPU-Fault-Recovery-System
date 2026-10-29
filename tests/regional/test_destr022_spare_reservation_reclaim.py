@@ -150,6 +150,7 @@ def _preflight(**overrides: Any) -> list[str]:
         "incident_lookup": {"found": False, "workflows": []},
         "predecessor_valid": True,
         "tests_passed": True,
+        "cluster_id": "c",
     }
     arguments.update(overrides)
     return verdicts.preflight_errors(**arguments)
@@ -719,3 +720,16 @@ def test_the_spare_gate_reads_the_hyperpod_health_label_on_hyperpod_only() -> No
     assert not any(
         "HyperPod" in item for item in verdicts.spare_refusals(eks_spare, "eks-managed")
     ), "the HyperPod label is never asked of an eks-managed spare"
+
+
+def test_the_preflight_ignores_only_another_clusters_open_commands() -> None:
+    def remote_errors(reading: Any) -> list[str]:
+        return [
+            item
+            for item in _preflight(remote_commands=reading)
+            if "remote command" in item
+        ]
+
+    assert remote_errors({"open_by_cluster": {"other": 1}}) == []
+    assert remote_errors({"open_by_cluster": {"c": 1}}), "own refuses"
+    assert remote_errors({}), "a reading without open_by_cluster refuses"

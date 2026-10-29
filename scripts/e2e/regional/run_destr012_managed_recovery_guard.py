@@ -22,6 +22,7 @@ from scripts.e2e.regional import (  # noqa: E402
 from scripts.e2e.regional import training_topology  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     processor_queue_backlog,
+    remote_command_queue_errors,
     write_json_atomic,
 )
 from scripts.e2e.regional.drill_incident_cleanup import (  # noqa: E402
@@ -420,8 +421,11 @@ def read_only_preflight(
         errors.append("runtime profile has warnings")
     if processor_queue_backlog(state.get("queue") or {}):
         errors.append("processor queue is not empty")
-    if (state.get("remote_commands") or {}).get("open_by_cluster"):
-        errors.append("remote command queue is not empty")
+    errors.extend(
+        remote_command_queue_errors(
+            state.get("remote_commands"), identity["cluster_id"]
+        )
+    )
     if not tests["passed"]:
         errors.append("focused regression tests failed")
     for manifest in (settings.a_manifest, settings.d_manifest):

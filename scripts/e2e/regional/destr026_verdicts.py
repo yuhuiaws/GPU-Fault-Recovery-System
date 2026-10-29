@@ -26,7 +26,10 @@ from datetime import datetime, timezone
 from typing import Any
 
 from scripts.e2e.regional import run_destr009_workload_restart as workload_case
-from scripts.e2e.regional.acceptance_runner_common import processor_queue_backlog
+from scripts.e2e.regional.acceptance_runner_common import (
+    processor_queue_backlog,
+    remote_command_queue_errors,
+)
 from scripts.e2e.regional.destr015_verdicts import (
     AGENT_OPERATIONS,
     FORBIDDEN_OPERATIONS,
@@ -139,6 +142,7 @@ def preflight_errors(
     profile: Mapping[str, Any] | None,
     queue: Mapping[str, Any],
     remote_commands: Mapping[str, Any],
+    cluster_id: str,
     gpu_workloads: Sequence[Mapping[str, Any]],
     business_workloads: Mapping[str, Sequence[Any]],
     recent_event: Mapping[str, Any] | None,
@@ -213,8 +217,7 @@ def preflight_errors(
         errors.append("runtime profile has warnings")
     if processor_queue_backlog(dict(queue)):
         errors.append("processor queue is not empty")
-    if remote_commands.get("open_by_cluster"):
-        errors.append("remote command queue is not empty")
+    errors.extend(remote_command_queue_errors(remote_commands, cluster_id))
     if gpu_workloads:
         errors.append(f"GPU cluster already has a GPU workload: {list(gpu_workloads)}")
     window = int(control_env.get("aggregation_window_seconds") or 0)

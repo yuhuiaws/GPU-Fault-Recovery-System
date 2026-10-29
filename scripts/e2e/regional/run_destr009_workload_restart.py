@@ -19,6 +19,7 @@ if str(ROOT) not in sys.path:
 
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     processor_queue_backlog,
+    remote_command_queue_errors,
     write_json_atomic,
 )
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
@@ -279,8 +280,13 @@ def read_only_preflight(
         errors.append("runtime profile has warnings")
     if processor_queue_backlog(state.get("queue") or {}):
         errors.append("processor queue is not empty")
-    if (state.get("remote_commands") or {}).get("open_by_cluster"):
-        errors.append("remote command queue is not empty")
+    # Only this cluster's executor claims its commands (another cluster's case
+    # is no backlog here); the fault backlog stays region-wide: one processor.
+    errors.extend(
+        remote_command_queue_errors(
+            state.get("remote_commands"), identity["cluster_id"]
+        )
+    )
     if not tests["passed"]:
         errors.append("focused regression tests failed")
     manifest_text = settings.manifest.read_text(encoding="utf-8")

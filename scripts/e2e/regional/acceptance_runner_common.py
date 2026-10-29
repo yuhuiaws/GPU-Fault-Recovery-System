@@ -216,6 +216,54 @@ def processor_queue_backlog(queue: dict[str, Any] | None) -> int:
     return value
 
 
+#: ``open_by_cluster`` keys that name no cluster. No executor can tell whose such
+#: a command is, so it counts against every cluster's gate.
+UNATTRIBUTED_CLUSTER_KEYS = frozenset({"", "None", "null", "__unscoped__"})
+
+
+def own_open_remote_commands(remote_commands: object, cluster_id: str) -> int:
+    """The open (PENDING/WAITING/LEASED) remote commands of ``cluster_id``.
+
+    ``remote_command_stats()`` reports ``open_by_cluster`` for the whole region,
+    but an executor claims only its own cluster's commands: another cluster's
+    in-flight case is no backlog this cluster's case can trip over or be
+    disrupted by. Fail closed: a reading without a well-formed
+    ``open_by_cluster`` raises ValueError instead of reading as an idle queue,
+    and a command no cluster can be attributed counts here as well.
+    """
+
+    if not isinstance(cluster_id, str) or not cluster_id:
+        raise ValueError("the case's own cluster ID is required")
+    counts = (
+        remote_commands.get("open_by_cluster")
+        if isinstance(remote_commands, Mapping)
+        else None
+    )
+    if not isinstance(counts, Mapping):
+        raise ValueError("remote command open_by_cluster is missing or malformed")
+    total = 0
+    for key, value in counts.items():
+        if isinstance(value, str) and re.fullmatch(r"[0-9]+", value):
+            value = int(value)
+        if not isinstance(key, str) or type(value) is not int or value < 0:
+            raise ValueError("remote command open_by_cluster is missing or malformed")
+        if key == cluster_id or key in UNATTRIBUTED_CLUSTER_KEYS:
+            total += value
+    return total
+
+
+def remote_command_queue_errors(remote_commands: object, cluster_id: str) -> list[str]:
+    """``own_open_remote_commands`` as a preflight's error list."""
+
+    try:
+        count = own_open_remote_commands(remote_commands, cluster_id)
+    except ValueError as exc:
+        return [f"remote command queue state is unknown: {exc}"]
+    if count:
+        return [f"remote command queue is not empty ({count} open on {cluster_id})"]
+    return []
+
+
 # What ``kubectl exec`` prints when its target stopped being a running replica
 # between a ``ready_pods`` listing and the exec: a deleted Pod (NotFound), a
 # Pod whose process already exited 0 on SIGTERM (phase Succeeded), or the

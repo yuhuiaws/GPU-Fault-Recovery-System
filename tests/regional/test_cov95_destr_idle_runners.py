@@ -587,3 +587,22 @@ def test_post_case_isolation_names_the_incident_still_holding_the_node(
     assert report["final_node"]["ownership_annotations"][
         "gpu-fault.io/incident-id"
     ] == (incident), report
+
+
+@pytest.mark.parametrize(
+    ("module", "scoped"),
+    [(watcher_case, True), (idle_case, False), (reset_case, False)],
+)
+def test_only_the_watcher_case_scopes_its_remote_command_gate(
+    module: Any, scoped: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DESTR-024 gates on its own cluster's open commands (it runs beside the
+    other cluster's cases); DESTR-001/023 keep the site-wide reading."""
+
+    h = IdleHarness(module, tmp_path, monkeypatch)
+    h.state["remote_commands"] = {"open_by_cluster": {"cluster-b": 1}}
+    foreign = [item for item in h.plan(tmp_path)["errors"] if "remote command" in item]
+    assert (foreign == []) is scoped, foreign
+    h.state["remote_commands"] = {"open_by_cluster": {"cluster-a": 1}}
+    own = [item for item in h.plan(tmp_path)["errors"] if "remote command" in item]
+    assert own, "this cluster's open command refuses every reset case"

@@ -479,6 +479,7 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
         host_snapshot=host_snapshot,
         reboot_status=reboot_state,
         expected_gpu_count=EXPECTED_GPU_COUNT,
+        cluster_id=settings.regional.cluster_id,
     )
     errors.extend(runtime_identity_errors(runtime_identity))
     errors.extend(

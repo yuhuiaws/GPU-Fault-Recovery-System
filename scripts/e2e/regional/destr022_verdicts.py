@@ -24,7 +24,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from scripts.e2e.regional import warm_spare_provider
-from scripts.e2e.regional.acceptance_runner_common import processor_queue_backlog
+from scripts.e2e.regional.acceptance_runner_common import (
+    processor_queue_backlog,
+    remote_command_queue_errors,
+)
 
 CASE_ID = "GF-REGIONAL-DESTR-022"
 PREDECESSOR_CASE_ID = "GF-REGIONAL-DESTR-008"
@@ -155,6 +158,7 @@ def preflight_errors(
     incident_lookup: dict[str, Any],
     predecessor_valid: bool,
     tests_passed: bool,
+    cluster_id: str,
     provider: str | None = None,
 ) -> list[str]:
     errors = spare_refusals(spare, provider)
@@ -191,8 +195,7 @@ def preflight_errors(
             )
     if processor_queue_backlog(queue):
         errors.append("processor queue is not empty")
-    if remote_commands.get("open_by_cluster"):
-        errors.append("remote command queue is not empty")
+    errors.extend(remote_command_queue_errors(remote_commands, cluster_id))
     if incident_lookup.get("found") is not False:
         errors.append("the synthetic incident id already exists in the store")
     if not predecessor_valid:

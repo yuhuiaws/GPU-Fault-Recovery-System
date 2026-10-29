@@ -239,6 +239,7 @@ def read_only_preflight(
         incident_lookup=lookup,
         predecessor_valid=bool(predecessor["valid"]),
         tests_passed=tests["passed"],
+        cluster_id=settings.regional.cluster_id,
         provider=warm.provider,
     )
     errors.extend(runtime_identity_errors(runtime_identity))

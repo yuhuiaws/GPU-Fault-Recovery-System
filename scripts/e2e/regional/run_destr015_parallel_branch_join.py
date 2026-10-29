@@ -50,6 +50,7 @@ from scripts.e2e.regional import (  # noqa: E402
 )
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     processor_queue_backlog,
+    remote_command_queue_errors,
     write_json_atomic,
 )
 from scripts.e2e.regional.control_plane_env_window import (  # noqa: E402
@@ -156,6 +157,7 @@ def preflight_errors(
     profile: dict[str, Any] | None,
     queue: dict[str, Any],
     remote_commands: dict[str, Any],
+    cluster_id: str,
     gpu_workloads: list[dict[str, Any]],
     business_workloads: dict[str, list[dict[str, Any]]],
     predecessor: dict[str, Any],
@@ -228,8 +230,8 @@ def preflight_errors(
         errors.append("runtime profile has warnings")
     if processor_queue_backlog(queue):
         errors.append("processor queue is not empty")
-    if remote_commands.get("open_by_cluster"):
-        errors.append("remote command queue is not empty")
+    # This cluster's commands only: no other cluster's executor claims them.
+    errors.extend(remote_command_queue_errors(remote_commands, cluster_id))
     if gpu_workloads:
         errors.append(f"GPU cluster already has a GPU workload: {gpu_workloads}")
     window = int(control_env.get("aggregation_window_seconds") or 0)
@@ -667,6 +669,7 @@ def read_only_preflight(
         profile=state.get("profile"),
         queue=state.get("queue") or {},
         remote_commands=state.get("remote_commands") or {},
+        cluster_id=regional.settings.cluster_id,
         gpu_workloads=regional.gpu_workloads(),
         business_workloads={
             node: regional.business_workloads(node) for node in settings.nodes

@@ -5,9 +5,16 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime, timezone
-from typing import Any, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 from gpu_fault.cluster_scope import PROVIDER_NODE_REBOOT_OWNERS
+from scripts.e2e.regional.provider_cluster_scope import (
+    FOREIGN,
+    SAGEMAKER_EVENT_SOURCE,
+    ProviderClusterScope,
+    attribution,
+    request_identities,
+)
 from scripts.e2e.regional.regional_pod_inventory import ready_pod_records
 
 
@@ -213,10 +220,22 @@ class ProviderCallInventory(TypedDict):
 
     mutations: list[dict[str, Any]]
     refused_calls: list[dict[str, Any]]
+    # With a cluster scope: SageMaker calls whose request names another cluster.
+    other_cluster_calls: NotRequired[list[dict[str, Any]]]
 
 
 def _object(value: object) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _request_cluster(item: dict[str, Any]) -> list[str] | None:
+    """The cluster identities a raw row's request names; None if unreadable."""
+
+    try:
+        detail = _object(json.loads(item["CloudTrailEvent"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+    return request_identities(detail.get("requestParameters"))
 
 
 def _refusal(item: dict[str, Any]) -> dict[str, Any] | None:
@@ -253,11 +272,20 @@ def provider_call_inventory(
     region: str,
     command: Any,
     hyperpod_mutations: frozenset[str],
+    cluster_scope: ProviderClusterScope | None = None,
 ) -> ProviderCallInventory:
     """Provider calls in the window, read from CloudTrail per event source and
-    split into accepted mutations and refused calls (``_refusal``)."""
+    split into accepted mutations and refused calls (``_refusal``).
+
+    With ``cluster_scope`` a SageMaker call whose request names only other
+    clusters is kept apart in ``other_cluster_calls`` (``provider_cluster_scope``:
+    another cluster's reboot is not this cluster's mutation); a row whose
+    binding cannot be read stays with this cluster's calls (fail closed).
+    """
 
     inventory: ProviderCallInventory = {"mutations": [], "refused_calls": []}
+    if cluster_scope is not None:
+        inventory["other_cluster_calls"] = []
     for source, names in provider_event_sources(provider, hyperpod_mutations):
         value = json.loads(
             command(
@@ -290,6 +318,12 @@ def provider_call_inventory(
                 "event_time": str(item.get("EventTime")),
                 "event_source": source,
             }
+            if cluster_scope is not None and source == SAGEMAKER_EVENT_SOURCE:
+                bound = _request_cluster(item)
+                if attribution(bound, cluster_scope) == FOREIGN:
+                    other = {**record, "request_cluster": bound}
+                    inventory["other_cluster_calls"].append(other)
+                    continue
             refusal = _refusal(item)
             if refusal is None:
                 inventory["mutations"].append(record)

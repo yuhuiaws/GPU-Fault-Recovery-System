@@ -1442,3 +1442,40 @@ def test_a_failed_provider_command_names_its_class_and_error_code(
         == "aws sagemaker describe-cluster failed (exit 254) [ResourceNotFound]"
     )
     assert SENSITIVE not in json.dumps(result) + capsys.readouterr().out
+
+
+def test_another_clusters_reboot_is_not_this_clusters_positive_control(
+    local_audit: LocalAudit,
+) -> None:
+    """Both GPU clusters run destructive cases at once. The other HyperPod
+    cluster's reboot -- by its own executor role -- is set aside by the same
+    request binding the cases scope their CloudTrail claims by
+    (``provider_cluster_scope``); it neither counts nor fails the role check."""
+
+    local_audit.events[audit.POSITIVE_CONTROL_EVENT].append(
+        local_audit.event(
+            audit.POSITIVE_CONTROL_EVENT,
+            requestParameters={"clusterName": "another"},
+            userIdentity={"sessionContext": {"sessionIssuer": {"arn": ROLE + "-b"}}},
+        )
+    )
+    code, result = local_audit.run()
+    assert code == 0 and result["verdict"] == "PASS", result
+    assert len(result["cloudtrail_events"][audit.POSITIVE_CONTROL_EVENT]) == 1, result
+
+
+def test_another_clusters_replacement_still_fails_the_window(
+    local_audit: LocalAudit,
+) -> None:
+    """The forbidden verbs stay region-wide and actor-independent (spec): no
+    case of either cluster makes one, so parallel cases cannot trip it."""
+
+    local_audit.events["BatchReplaceClusterNodes"] = [
+        local_audit.event(
+            "BatchReplaceClusterNodes", requestParameters={"clusterName": "another"}
+        )
+    ]
+    code, result = local_audit.run()
+    assert (
+        code == 1 and "CloudTrail contains provider replacement" in (result["errors"])
+    ), result

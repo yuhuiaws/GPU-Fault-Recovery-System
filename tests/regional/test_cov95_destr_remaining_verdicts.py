@@ -170,12 +170,13 @@ def test_fence_preflight_requires_idle_owned_unwarned_target(
         },
         "business_workloads": [],
         "queue": {"depth": 0, "fault_backlog_depth": 0},
-        "remote_commands": {},
+        "remote_commands": {"open_by_cluster": {}},
         "recent_events": [],
         "open_incidents": [],
         "host_snapshot": host,
         "reboot_status": {"armed": False},
         "expected_gpu_count": len(host["gpu_inventory"]),
+        "cluster_id": "cluster-a",
     }
     assert v17.preflight_errors(**frame) == [], frame
     change(frame, path, value)

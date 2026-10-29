@@ -137,6 +137,7 @@ def _preflight(**overrides: Any) -> list[str]:
         "predecessor_valid": True,
         "tests_passed": True,
         "site_file_exists": True,
+        "cluster_id": "c",
     }
     arguments.update(overrides)
     return verdicts.preflight_errors(**arguments)
@@ -820,3 +821,13 @@ def test_the_stale_started_at_uses_the_adapter_timeout_plus_margin() -> None:
     assert T0 - value == timedelta(
         seconds=verdicts.RESTART_TIMEOUT_SECONDS + verdicts.STALE_MARGIN_SECONDS
     ), value
+
+
+def test_the_preflight_ignores_only_another_clusters_open_commands() -> None:
+    def remote_errors(reading: Any) -> list[str]:
+        errors = _preflight(remote_commands=reading)
+        return [item for item in errors if "remote command" in item]
+
+    assert remote_errors({"open_by_cluster": {"other": 1}}) == []
+    assert remote_errors({"open_by_cluster": {"c": 1}}), "own refuses"
+    assert remote_errors({"open_by_cluster": None}), "malformed refuses"

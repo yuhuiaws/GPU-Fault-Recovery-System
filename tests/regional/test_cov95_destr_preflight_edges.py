@@ -279,3 +279,20 @@ def test_preflight_missing_local_inputs_never_attempts_a_transport(
     with pytest.raises(RegionalFixtureError, match="does not exist"):
         module.read_only_preflight(h.config, tmp_path)
     assert h.calls == [], h.calls
+
+
+@pytest.mark.parametrize("module", [workload, managed])
+def test_workload_preflight_ignores_another_clusters_open_commands(
+    module: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DESTR-009/012 run beside the other cluster's destructive cases: its
+    executor's open commands are no backlog of this cluster (``cluster-a``)."""
+
+    h = Preflight(module, tmp_path, monkeypatch)
+    change(h.frame, ("state", "remote_commands", "open_by_cluster"), {"cluster-b": 4})
+    assert module.read_only_preflight(h.config, tmp_path)["errors"] == []
+    change(h.frame, ("state", "remote_commands"), {})
+    errors = module.read_only_preflight(h.config, tmp_path)["errors"]
+    assert any("remote command queue state is unknown" in item for item in errors), (
+        errors
+    )

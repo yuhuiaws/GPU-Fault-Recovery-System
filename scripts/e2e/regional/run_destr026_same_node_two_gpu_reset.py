@@ -359,6 +359,7 @@ def read_only_preflight(
         profile=state.get("profile"),
         queue=state.get("queue") or {},
         remote_commands=state.get("remote_commands") or {},
+        cluster_id=regional.settings.cluster_id,
         gpu_workloads=regional.gpu_workloads(),
         business_workloads=workloads,
         recent_event=state.get("event"),

@@ -361,7 +361,9 @@ def read_only_preflight(
         settings.predecessor_path, PREDECESSOR_CASE_ID, **identity
     )
     errors = [
-        *reset_case.preflight_errors(state, node, workloads, tests),
+        *reset_case.preflight_errors(
+            state, node, workloads, tests, cluster_id=identity["cluster_id"]
+        ),
         *coverage_supported_errors(coverage),
         # The watcher must be alive and covering the cluster when the case
         # starts, otherwise "UNKNOWN after the scale-down" proves nothing.

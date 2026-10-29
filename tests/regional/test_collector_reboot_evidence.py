@@ -1282,12 +1282,27 @@ def test_provider_fixture_retains_strict_metadata_through_the_waiter(
         )
     )
     calls: list[list[str]] = []
+    # The reboot names its cluster, so the lookup attributes it once: the GPU
+    # Nodes' HyperPod label, then that cluster's ARN (provider_cluster_scope).
+    answers = {
+        "kubectl": {
+            "items": [
+                {
+                    "metadata": {
+                        "name": NODE,
+                        "labels": {"sagemaker.amazonaws.com/cluster-name": HP},
+                    }
+                }
+            ]
+        },
+        "sagemaker": {"ClusterName": HP, "ClusterArn": HP_ARN},
+        "cloudtrail": {"Events": [cloudtrail_item()]},
+    }
 
     def run(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
         calls.append(command)
-        return subprocess.CompletedProcess(
-            command, 0, json.dumps({"Events": [cloudtrail_item()]}), ""
-        )
+        key = command[0] if command[0] == "kubectl" else command[1]
+        return subprocess.CompletedProcess(command, 0, json.dumps(answers[key]), "")
 
     monkeypatch.setattr(fixture, "run", run)
     events = fixture.wait_provider_events(
@@ -1300,7 +1315,11 @@ def test_provider_fixture_retains_strict_metadata_through_the_waiter(
     value = inputs()
     value["events"] = events
     assert evidence.reboot_evidence_errors(**value) == []
-    assert len(calls) == 1 and events[0]["session_issuer_arn"] == ROLE
+    assert [command[1] for command in calls if command[0] == "aws"] == [
+        "cloudtrail",
+        "sagemaker",
+    ], calls
+    assert events[0]["session_issuer_arn"] == ROLE, events
 
 
 @pytest.mark.parametrize("events", [None, {}, [None], [{"EventName": None}]])

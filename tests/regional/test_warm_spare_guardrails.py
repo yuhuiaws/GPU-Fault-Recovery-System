@@ -103,7 +103,7 @@ def _patch_healthy(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         warm_spare,
         "provider_calls",
-        lambda _start, _end: {"mutations": [], "refused_calls": []},
+        lambda _start, _end, _gpu=None: {"mutations": [], "refused_calls": []},
     )
     monkeypatch.setattr(
         warm_spare, "deployed_managed_owner_probe", lambda: MANAGED_GUARD

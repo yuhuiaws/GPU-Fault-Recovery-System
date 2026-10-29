@@ -1199,12 +1199,13 @@ def _preflight(**overrides: Any) -> dict[str, Any]:
         },
         "business_workloads": [],
         "queue": {"depth": 0},
-        "remote_commands": {"pending": 0, "leased": 0, "in_progress": 0},
+        "remote_commands": {"open_by_cluster": {}},
         "recent_events": [],
         "open_incidents": [],
         "host_snapshot": host_before(),
         "reboot_status": {"armed": False},
         "expected_gpu_count": 8,
+        "cluster_id": "cluster-a",
     }
     arguments.update(overrides)
     return arguments
@@ -1298,7 +1299,7 @@ def test_the_preflight_refuses_a_busy_control_plane_or_a_recent_event() -> None:
     errors = verdicts.preflight_errors(
         **_preflight(
             queue={"depth": 3},
-            remote_commands={"pending": 1, "leased": 0, "in_progress": 0},
+            remote_commands={"open_by_cluster": {"cluster-a": 1}},
             recent_events=[{"event_id": "evt-1"}],
         )
     )
@@ -1482,3 +1483,16 @@ def test_evidence_components_carry_digests_only() -> None:
     ).hexdigest()
     assert components["preflight_identity"] == expected
     assert len(destr017.case_digest(components)) == 64
+
+
+def test_the_remote_command_gate_reads_this_clusters_open_commands() -> None:
+    """The old per-key read (pending/leased/in_progress, keys the stats never
+    return) never fired; the gate is this cluster's ``open_by_cluster`` entry."""
+
+    def remote_errors(reading: Any) -> list[str]:
+        errors = verdicts.preflight_errors(**_preflight(remote_commands=reading))
+        return [item for item in errors if "remote command" in item]
+
+    assert remote_errors({"open_by_cluster": {"cluster-b": 3}}) == []
+    assert remote_errors({"open_by_cluster": {"cluster-a": 1}}), "own refuses"
+    assert remote_errors({"pending": 0, "leased": 0}), "the old shape is unknown"

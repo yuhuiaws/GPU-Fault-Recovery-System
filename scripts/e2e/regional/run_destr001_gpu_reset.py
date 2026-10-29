@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
 
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     processor_queue_backlog,
+    remote_command_queue_errors,
     write_json_atomic,
 )
 from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
@@ -178,7 +179,13 @@ def preflight_errors(
     node: dict[str, Any],
     workloads: list[dict[str, str]],
     tests: dict[str, Any],
+    *,
+    cluster_id: str | None = None,
 ) -> list[str]:
+    """``cluster_id`` gates on that cluster's own open remote commands only
+    (DESTR-024 runs beside the other cluster's cases); without it any
+    cluster's open command refuses."""
+
     errors = []
     if node["ready"] != "True":
         errors.append("target node is not Ready")
@@ -207,7 +214,11 @@ def preflight_errors(
         errors.append("runtime profile has warnings")
     if processor_queue_backlog(state.get("queue") or {}):
         errors.append("processor queue is not empty")
-    if (state.get("remote_commands") or {}).get("open_by_cluster"):
+    if cluster_id is not None:
+        errors.extend(
+            remote_command_queue_errors(state.get("remote_commands"), cluster_id)
+        )
+    elif (state.get("remote_commands") or {}).get("open_by_cluster"):
         errors.append("remote command queue is not empty")
     if state.get("event") is not None:
         errors.append("target node has a recent XID event")

@@ -719,7 +719,8 @@ def preflight(**overrides: Any) -> list[str]:
             ]
         },
         "queue": {"depth": 0},
-        "remote_commands": {},
+        "remote_commands": {"open_by_cluster": {}},
+        "cluster_id": "cluster-a",
         "gpu_workloads": [],
         "business_workloads": {},
         "recent_event": None,
@@ -979,3 +980,16 @@ def test_plan_details_name_the_mutation_and_the_stop_conditions() -> None:
     assert details["preflight_identity_digest"] == destr026.join_case.identity_digest(
         details["preflight_identity"]
     ), "the plan pins the identity digest it re-checks before execute"
+
+
+def test_the_preflight_ignores_only_another_clusters_open_commands() -> None:
+    def remote_errors(reading: Any) -> list[str]:
+        return [
+            item
+            for item in preflight(remote_commands=reading)
+            if "remote command" in item
+        ]
+
+    assert remote_errors({"open_by_cluster": {"cluster-b": 1}}) == []
+    assert remote_errors({"open_by_cluster": {"cluster-a": 1}}), "own refuses"
+    assert remote_errors({"by_status": {}}), "a reading without open_by_cluster refuses"

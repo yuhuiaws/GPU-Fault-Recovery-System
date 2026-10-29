@@ -41,6 +41,7 @@ from scripts.e2e.regional import run_collect017_efa_plugin as c017  # noqa: E402
 from scripts.e2e.regional import run_collector_destructive as base  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     processor_queue_backlog,
+    remote_command_queue_errors,
     write_json_atomic,
 )
 from scripts.e2e.regional.collector_acceptance_fixture import (  # noqa: E402
@@ -226,6 +227,7 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
         predecessor_valid=bool(predecessor["valid"]),
         tests_passed=tests["passed"],
         site_file_exists=settings.site_file.is_file(),
+        cluster_id=settings.regional.cluster_id,
     )
     errors.extend(runtime_identity_errors(runtime_identity))
     if any(residual.values()):
@@ -409,13 +411,13 @@ def _preseed(run: _LiveRun) -> None:
 
 
 def _quiet_control_plane(run: _LiveRun) -> None:
-    state = run.regional.store_snapshot(node=run.settings.node, queue_attempts=1)
+    # A gate's drained read (~10 s at most), not one sample: the region-wide
+    # fault backlog may hold the other cluster's sub-second rows. The command
+    # gate is this cluster's own; a malformed reading refuses too.
+    state = run.regional.store_snapshot(node=run.settings.node, queue_attempts=20)
     write_json_atomic(run.case_dir / "store-before-injection.json", state)
-    commands = state.get("remote_commands")
-    if (
-        not isinstance(commands, dict)
-        or "open_by_cluster" not in commands
-        or commands["open_by_cluster"]
+    if remote_command_queue_errors(
+        state.get("remote_commands"), run.settings.regional.cluster_id
     ):
         raise RegionalFixtureError("remote commands are open; refusing to inject")
     if processor_queue_backlog(state.get("queue") or {}):

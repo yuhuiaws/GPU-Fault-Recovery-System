@@ -9418,6 +9418,24 @@ the control plane must not keep treating the last `RUNNING` record as the curren
    how to return the warm-spare node to `AVAILABLE`.
 5. Every case must check the provider API call records in CloudTrail;
    this is the only credible evidence of "called / not called".
+6. Two GPU clusters share one control plane, so the shared reads are scoped to the target cluster wherever the
+   cluster is the unit of ownership:
+   - **Remote commands**: the gate counts only the target cluster's open (PENDING/WAITING/LEASED) commands
+     (`acceptance_runner_common.own_open_remote_commands`). An executor claims only its own cluster's commands, so
+     another cluster's in-flight case is no backlog of this one. A reading without a well-formed `open_by_cluster`, or a
+     command attributed to no cluster, still refuses.
+   - **Processor fault backlog**: stays region-wide. One processor serves both clusters and claims fault-tier rows
+     ahead of all other work, so another cluster's backlog delays this case's event too. The gate's drained read waits
+     up to about 10 s and outlasts the other cluster's sub-second rows.
+   - **CloudTrail**: a provider call counts for the case only when its request names the target cluster
+     (`provider_cluster_scope`). On HyperPod that is the cluster's name or ARN, read from its Nodes'
+     `sagemaker.amazonaws.com/cluster-name` label and `DescribeCluster`. A plain EKS cluster has no SageMaker cluster,
+     so every bound SageMaker call belongs to another cluster.
+     - A call whose binding cannot be read, or that names this cluster and another one, still counts.
+     - Calls set aside are written to the case log; the guardrail audit records them as `other_cluster_provider_calls`.
+     - `DESTR-013`'s forbidden verbs stay region-wide.
+   - Cases that change or hold shared control-plane state still run alone: control-worker environment windows, the
+     XID45 opt-in, the synthetic replacement route, Aurora, releases and token rotation.
 
 CloudTrail check command (run once before and once after each case):
 
@@ -9667,7 +9685,9 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   `sagemaker` mutations nor EC2 `Terminate/Stop/Run/StartInstances` (`replace_events` queries both event sources).
   Calls AWS refused (`errorCode` set -- Karpenter's `RunInstances` dry-runs answer `Client.DryRunOperation`) ran
   nothing and are not mutations: `provider_calls` keeps them apart and the evidence records them as
-  `refused_provider_calls`.
+  `refused_provider_calls`. A SageMaker call whose request names only another cluster is not this cluster's
+  mutation (§12 group precondition 6); the evidence records it as `other_cluster_provider_calls`. On `eks-managed`
+  that is every bound SageMaker call; a call whose binding cannot be read still counts.
   DESTR-003/005/008/022 on `eks-managed` presuppose a declared warm spare (`gpu-fault-admin config spare --declare`; no
   HyperPod health label, topology = node group + instance type) and take `--hyperpod-cluster` as the cluster's `cluster_id`
   (= the EKS cluster name): the cluster fact is `aws eks describe-cluster` (`ACTIVE`, `node_recovery=not-applicable`), the
@@ -11382,7 +11402,7 @@ replacement should ever be attempted.
     submitted, the failsafe timer re-`enable`s the Agent at expiry and the round is recorded
     `INCOMPLETE`.
   - The one-accepted-provider-reboot-per-node assertion assumes no other case runs in parallel within
-    this window; running `COLLECT-004` / `COLLECT-015` in the same window pollutes the count.
+    this window on the same cluster; running `COLLECT-004` / `COLLECT-015` there in the same window pollutes the count.
 
 ### GF-REGIONAL-DESTR-013
 
@@ -11437,7 +11457,10 @@ replacement should ever be attempted.
   `--expect-no-reboots` declares that no reboot case ran in this round (declaring it and then finding
   reboot events is likewise FAIL).
   The forbidden verbs are still checked conservatively across the SageMaker events in the region and
-  are not ignored because the actor differs. Duplicate/incomplete pagination and missing or illegal
+  are not ignored because the actor differs. No case on either cluster calls them, so destructive cases running on
+  both clusters at once cannot trip this check. The positive control's cluster binding is the one the cases scope
+  their own CloudTrail claims by (§12 group precondition 6): a reboot naming another HyperPod cluster is neither
+  counted nor role-checked here. Duplicate/incomplete pagination and missing or illegal
   event identities all fail, and the evidence does not save the raw CloudTrail credential context.
 - Target binding: the CLI's HyperPod name and Region must map uniquely to the CPU durable registry;
   its EKS ARN must simultaneously match the HyperPod orchestrator, the HTTPS endpoint/CA of the
@@ -11901,8 +11924,8 @@ not the GPU chip's internal execution time; the raw argv does not enter ordinary
     described as an exact overlap of the silicon action.
     Actual configuration such as `max_concurrent_commands=1` must not be masked by the overlap of
     the branches' total intervals.
-  - Running `COLLECT-004` / `COLLECT-015` in the same window pollutes the CloudTrail empty-set
-    assertion.
+  - Running `COLLECT-004` / `COLLECT-015` on the same cluster in the same window pollutes the CloudTrail
+    empty-set assertion. The other cluster's provider calls are set aside (§12 group precondition 6).
 
 
 #### Supplementary acceptance of physical ownership after STOP

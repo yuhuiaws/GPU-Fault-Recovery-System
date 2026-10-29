@@ -38,6 +38,11 @@ from scripts.e2e.regional.guardrail_audit_evidence import (  # noqa: E402
     registration_identity,
     validate_provider_record,
 )
+from scripts.e2e.regional.provider_cluster_scope import (  # noqa: E402
+    EKS_MANAGED,
+    HYPERPOD,
+    ProviderClusterScope,
+)
 from scripts.e2e.regional.regional_case_contract import predecessor_path  # noqa: E402
 from scripts.e2e.regional.regional_commands import run_fixture_command  # noqa: E402
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
@@ -226,6 +231,7 @@ def cluster_recovery(name: str, provider: str = "hyperpod") -> dict[str, Any]:
     )
     return {
         "cluster_name": value.get("ClusterName"),
+        "cluster_arn": value.get("ClusterArn"),
         "status": value.get("ClusterStatus"),
         "node_recovery": value.get("NodeRecovery"),
     }
@@ -461,10 +467,26 @@ def node_state_drift(
     return errors
 
 
-def provider_calls(started_at: datetime, ended_at: datetime) -> ProviderCallInventory:
+def managed_cluster_scope(gpu: dict[str, Any] | None) -> ProviderClusterScope | None:
+    """The managed cluster as a SageMaker request names it: a plain EKS cluster
+    has none; a HyperPod one by its name and the ARN ``cluster_recovery`` read.
+    None -- nothing is set aside -- while that ARN is unknown."""
+
+    if MANAGED_PROVIDER == "eks-managed":
+        return ProviderClusterScope(EKS_MANAGED)
+    arn = (gpu or {}).get("cluster_arn")
+    if (gpu or {}).get("cluster_name") != MANAGED_GPU_CLUSTER or not arn:
+        return None
+    return ProviderClusterScope(HYPERPOD, MANAGED_GPU_CLUSTER, str(arn))
+
+
+def provider_calls(
+    started_at: datetime, ended_at: datetime, gpu: dict[str, Any] | None = None
+) -> ProviderCallInventory:
     """Provider calls in the window: HyperPod's for a HyperPod cluster, and for
     a plain-EKS cluster the EC2 replacement calls as well; the mutations AWS
-    accepted and the calls it refused are kept apart."""
+    accepted and the calls it refused are kept apart, and so are the SageMaker
+    calls of other clusters (``managed_cluster_scope``)."""
 
     return provider_call_inventory(
         started_at,
@@ -473,6 +495,7 @@ def provider_calls(started_at: datetime, ended_at: datetime) -> ProviderCallInve
         region=AWS_REGION,
         command=command,
         hyperpod_mutations=PROVIDER_MUTATIONS,
+        cluster_scope=managed_cluster_scope(gpu),
     )
 
 
@@ -1286,7 +1309,7 @@ def run_audit(
 
     ended_at = datetime.now(timezone.utc)
     calls: ProviderCallInventory | None = probes.guarded(
-        lambda: provider_calls(started_at, ended_at)
+        lambda: provider_calls(started_at, ended_at, gpu)
     )
     events = None if calls is None else calls["mutations"]
     provisional = cloudtrail_provisional(ended_at)
@@ -1369,6 +1392,7 @@ def run_audit(
             # delivering; DESTR-013 re-reads the whole run's window later.
             "replace_events": events if events is not None else [],
             "refused_provider_calls": [] if calls is None else calls["refused_calls"],
+            "other_cluster_provider_calls": (calls or {}).get("other_cluster_calls"),
             "replace_events_provisional": provisional,
             "node_baseline": baseline,
             "node_postflight": postflight,

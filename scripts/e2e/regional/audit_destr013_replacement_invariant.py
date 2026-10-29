@@ -60,6 +60,15 @@ from scripts.e2e.regional.destr013_eks_audit import (  # noqa: E402,F401
     eks_iam_errors,
     eks_inventory_errors,
 )
+from scripts.e2e.regional.provider_cluster_scope import (  # noqa: E402
+    CONFLICTING,
+    FOREIGN,
+    HYPERPOD,
+    UNBOUND,
+    ProviderClusterScope,
+    attribution,
+    request_identities,
+)
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     PROVIDER_EVENT_VISIBILITY_SECONDS,
     RegionalFixtureAbort,
@@ -588,30 +597,21 @@ def cloudtrail_events(
                         "CloudTrail event identity/time differs from the target window"
                     )
                 if event_name == POSITIVE_CONTROL_EVENT:
-                    parameters = detail.get("requestParameters")
-                    if not isinstance(parameters, dict):
+                    # The cases' own scoping (provider_cluster_scope): another
+                    # cluster's reboot is not this cluster's control.
+                    binding = attribution(
+                        request_identities(detail.get("requestParameters")),
+                        ProviderClusterScope(HYPERPOD, cluster_name, cluster_arn),
+                    )
+                    if binding == UNBOUND:
                         raise AuditError(
                             "CloudTrail reboot control has no cluster binding"
                         )
-                    targets = [
-                        parameters[key]
-                        for key in ("clusterName", "clusterArn")
-                        if key in parameters
-                    ]
-                    if not targets or any(
-                        not isinstance(target, str) or not target for target in targets
-                    ):
-                        raise AuditError(
-                            "CloudTrail reboot control has no cluster binding"
-                        )
-                    matches = [
-                        target in {cluster_name, cluster_arn} for target in targets
-                    ]
-                    if any(matches) and not all(matches):
+                    if binding == CONFLICTING:
                         raise AuditError(
                             "CloudTrail reboot control has conflicting cluster identities"
                         )
-                    if not any(matches):
+                    if binding == FOREIGN:
                         continue
                     identity = detail.get("userIdentity") or {}
                     issuer = (identity.get("sessionContext") or {}).get(

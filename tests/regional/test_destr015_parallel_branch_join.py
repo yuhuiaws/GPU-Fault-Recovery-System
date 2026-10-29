@@ -799,6 +799,7 @@ def _preflight_arguments(**overrides: Any) -> dict[str, Any]:
         "profile": profile,
         "queue": {"depth": 0},
         "remote_commands": {"open_by_cluster": {}},
+        "cluster_id": "c",
         "gpu_workloads": [],
         "business_workloads": {NODE_A: [], NODE_B: []},
         "predecessor": {"valid": True},
@@ -1128,3 +1129,19 @@ def test_execute_reuses_the_plans_focused_tests_only_for_the_same_source(
     plan_path.write_text(json.dumps({"details": details}), encoding="utf-8")
     with pytest.raises(AssertionError, match="must not run"):
         destr015.focused_tests(tmp_path, reuse=True)
+
+
+def test_preflight_refuses_only_this_clusters_open_remote_commands() -> None:
+    """The other cluster's destructive case may hold its commands open: only
+    its own executor claims them. This cluster's, and a malformed reading,
+    still refuse."""
+
+    def remote_errors(reading: Any) -> list[str]:
+        errors = destr015.preflight_errors(
+            nodes=NODES, **_preflight_arguments(remote_commands=reading)
+        )
+        return [item for item in errors if "remote command" in item]
+
+    assert remote_errors({"open_by_cluster": {"other": 2}}) == []
+    assert remote_errors({"open_by_cluster": {"c": 1, "other": 2}}), "own refuses"
+    assert remote_errors({}), "a reading without open_by_cluster refuses"
