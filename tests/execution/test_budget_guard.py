@@ -160,6 +160,44 @@ def test_a_row_never_refused_is_passed_over_and_recorded_while_its_scope_is_full
     assert later_store.incident_reads == []
 
 
+LEGACY_DOMAIN = "domain:cluster-a:gpu-group"
+NODE = "node:cluster-a:node-a"
+FABRIC = "domain:cluster-a:partition-1"
+
+
+def test_a_refusal_on_a_domain_the_row_no_longer_asks_for_is_judged_afresh():
+    """Upgrade: an older release refused the row on its node group's label
+    domain. That string stays full while an older holder keeps it, but no
+    claim of this release asks for it, so it holds nobody back."""
+
+    guard, store = _guard({LEGACY_DOMAIN: 1, CLUSTER: 1})
+    assert guard.passes_over(_waiter("stale", scope=LEGACY_DOMAIN)) is False
+    assert store.saved == [], "nothing of its own is full: the store decides"
+
+    # Its own node is taken: recorded on that scope instead.
+    guard, store = _guard({LEGACY_DOMAIN: 1, NODE: 1})
+    assert guard.passes_over(_waiter("stale", scope=LEGACY_DOMAIN)) is True
+    (recorded,) = store.saved
+    assert recorded.remediation_budget_last_blocked_scope == NODE
+    assert recorded.remediation_budget_wait_count == 1
+
+
+def test_a_waiter_on_a_fabric_partition_it_still_asks_for_stays_passed_over():
+    guard, store = _guard({FABRIC: 1})
+    waiter = _waiter("fabric", scope=FABRIC).model_copy(
+        update={
+            "official_steps": [
+                workflow_step(STOP),
+                workflow_step(REBOOT, parameters={"fabric_partition": "partition-1"}),
+            ]
+        }
+    )
+
+    assert guard.passes_over(waiter) is True
+    assert store.saved == []
+    assert store.incident_reads == ["incident-fabric"]
+
+
 def test_a_fresh_row_the_guard_cannot_judge_is_left_to_the_store():
     guard, store = _guard({CLUSTER: 3})
 

@@ -40,7 +40,7 @@ rationale and special recovery steps are kept in the [Deployment and Operations 
 | Converge historical workflows that recovered but stay BLOCKED, never-dispatched PENDING workflows whose node left with a spot replacement (the manual fallback when the departed-node cleanup is off or refuses), and parked records whose node action the operator confirmed | `gpu-fault-admin workflow-reconcile --state-dir ... --dry-run` to see the plan, then drop `--dry-run` and add `--reference` to execute once | §10.2 |
 | Retire the fleet Agent record, still ACTIVE, of a node a spot reclaim removed (the release verification reports `Agent coverage drift` and rolls back; the manual fallback when the departed-node cleanup is off or refuses) | `gpu-fault-admin workflow-reconcile --state-dir ... --retire-departed-agents [--node <node>] --dry-run` to see the plan and evidence, then drop `--dry-run` and add `--reference` to execute once; for a node whose provider identity is unknown (no instance id in the node name, no EC2 instance id on the record; ledger reason `provider_identity_unknown`) add `--node <node> --accept-unknown-provider-identity --reason <why>` | §10.2 |
 | List and close ESCALATED incidents (node repaired but the record still only logs) | `GET /v1/incidents?state=ESCALATED` or `gpu-fault-admin workflow-reconcile --state-dir ... --close-escalated --dry-run` to list the queue; `--close-incident <id>` / `--close-escalated` with `--reason` `--reference` to close | §9.1 |
-| Node failure-domain (rack/instance group) mapping for remediation budget throttling | Automatic: `deploy`/`join-cluster`/`remove-cluster` render and apply it; read-only view with `gpu-fault-admin failure-domain-map --state-dir ... [--output ...]` | §5.1 |
+| Node failure-domain (rack/instance group) mapping: a read-only topology view; the remediation budget's failure domains are workloads and do not read it | Automatic: `deploy`/`join-cluster`/`remove-cluster` render and apply it; read-only view with `gpu-fault-admin failure-domain-map --state-dir ... [--output ...]` | §5.1 |
 | Handle one AMP alert | Enter the triage card by alert name | §8 |
 
 Ordinary deployment and operations entry points restore the internal site through `state-dir` and require no site, artifact or release JSON path.
@@ -2958,15 +2958,19 @@ No runtime role is granted any of them.
 
 ### 5.1 Node Failure-Domain Mapping (Automatic)
 
-The remediation concurrency budget `GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN` (fixed at 1 in production)
-takes effect only for failure domains the Executor knows. One GPU cluster is one AZ, so the zone label cannot distinguish any two nodes in the same
-cluster; the meaningful failure domain is the HyperPod instance group, rack/PDU or network leaf.
-The control plane itself has no node topology; the mapping ConfigMap `gpu-fault-failure-domain-map` is rendered, validated, applied and rolled by the product from the node labels of each GPU
+Remediation is organized by workload: a training job or a GPU node without a job is one merged workflow, workflows are kept
+apart per node, and the failure-domain limit (`GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN`, fixed at 1 in production)
+applies to an SXID's NVSwitch fabric partition only (detailed design v2 §9.5). **The remediation budget does not read the node
+mapping of this section**: divided by node labels, every node of an instance group or
+EKS node group shared one slot and different jobs and different idle nodes were repaired one at a time. The mapping is a
+read-only topology view of the fleet's node labels: one GPU cluster is one AZ, so the zone label cannot distinguish any two nodes
+in the same cluster, and the meaningful label domain is the HyperPod instance group, rack/PDU or network leaf. The ConfigMap
+`gpu-fault-failure-domain-map` is rendered, validated, applied and rolled by the product from the node labels of each GPU
 cluster, and **administrators need to run no command**:
 
 - `deploy` (upgrade and bootstrap) reads the nodes of every managed cluster inside the control-plane apply step
-  (sharing the same `get nodes` as the rolling upgrade), renders the mapping, first validates it with the same loader the worker uses at startup
-  (an invalid mapping is refused before apply and never reaches the worker), then applies the ConfigMap and writes the content digest
+  (sharing the same `get nodes` as the rolling upgrade), renders the mapping, first validates it with the mapping's own loader
+  (an invalid mapping is refused before apply), then applies the ConfigMap and writes the content digest
   into the control-worker Pod template annotation `gpu-fault.io/failure-domain-map-sha256`: the worker rolls only when the mapping
   changed, stays put when not, with no extra `rollout restart`.
 - `join-cluster` / `remove-cluster` likewise re-render and apply after the membership is settled; after nodes are added or removed
@@ -2987,13 +2991,14 @@ cluster, and **administrators need to run no command**:
   ```
 
   The field is persisted with the site and read on every render; the per-failure-domain cap of the rolling upgrade (`upgradeMaxUnavailable`
-  related) reads the same field and the same function, so the two definitions of "failure domain" cannot diverge.
-- Nodes without any of the selected labels do not enter the mapping: they occupy no `domain:` quota, are bound only by the node/cluster/region
-  quotas, and do not block remediation. The rolling-upgrade side records the same batch of nodes as `UNKNOWN` topology and tightens each wave to 1 node.
+  related) reads the same field with the same function from the node labels directly, not from this mapping; the remediation
+  budget reads neither.
+- Nodes without any of the selected labels do not enter the mapping; the rolling-upgrade side records the same batch of nodes as
+  `UNKNOWN` topology and tightens each wave to 1 node.
 - The control-worker's `GPU_FAULT_REMEDIATION_FAILURE_DOMAIN_MAP` takes its value from the ConfigMap's `map-path`
-  key and is mounted `optional`: a site without labels gets an empty mapping, with the same effect as no ConfigMap
-  (no per-failure-domain throttling); a mapping with invalid content is never applied. The role-split verifier at the end of deploy
-  resolves this item with kubelet's `optional` semantics.
+  key and is mounted `optional`, but no runtime code reads it: a missing ConfigMap, an empty mapping or a full one leave the
+  remediation concurrency unchanged; a mapping with invalid content is never applied. The role-split verifier at the end of deploy
+  resolves this item with kubelet's `optional` semantics. The debug command's summary says so under `remediation_budget`.
 - To see what the product would render, use the read-only debug command
   `gpu-fault-admin failure-domain-map --state-dir "$STATE_DIR" [--output PATH]`:
   it prints each cluster's mapping summary and `unmapped` (nodes without any selected label); with `--output` it also writes out

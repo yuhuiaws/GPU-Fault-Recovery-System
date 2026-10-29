@@ -24,14 +24,12 @@ from gpu_fault.admin import cluster_removal as admin_cluster_removal
 from gpu_fault.admin import failure_domain_map as module
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.site import SiteConfigError, SiteSpec
-from gpu_fault.execution.remediation_budget import (
-    FAILURE_DOMAIN_MAP_ENV,
-    load_failure_domain_map,
-)
 from gpu_fault.failure_domains import (
     FAILURE_DOMAIN_LABELS,
     FAILURE_DOMAIN_MAP_ANNOTATION,
+    FAILURE_DOMAIN_MAP_ENV,
     failure_domain_map_sha256,
+    load_failure_domain_map,
 )
 
 GROUP = "sagemaker.amazonaws.com/instance-group-name"
@@ -594,6 +592,9 @@ def test_cli_is_a_read_only_debugging_aid(
     assert summary["environment"] == {
         FAILURE_DOMAIN_MAP_ENV: module.FAILURE_DOMAIN_MAP_PATH
     }
+    # The published map is a topology view: the debug aid says the remediation
+    # budget does not read it (its failure domains are workloads).
+    assert summary["remediation_budget"].startswith("not read: "), summary
 
 
 def test_cli_no_longer_takes_label_or_cluster_flags(capsys) -> None:

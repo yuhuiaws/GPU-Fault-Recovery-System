@@ -1,11 +1,9 @@
-"""The node failure-domain map the remediation budget enforces, product-managed.
+"""The node failure-domain map, product-managed: the fleet's labels as published.
 
-The executor reads ``GPU_FAULT_REMEDIATION_FAILURE_DOMAIN_MAP`` (a JSON file,
-``{cluster_id: {node_id: domain}}``) and takes one ``domain:`` budget slot per
-failure domain a step touches. The control plane cannot derive that map on its
-own -- an incident carries node ids, an agent heartbeat carries versions -- so
-the product renders it from the GPU clusters' node labels and ships it as the
-ConfigMap ``gpu-fault-failure-domain-map`` the control-worker mounts:
+The product renders ``{cluster_id: {node_id: domain}}`` from the GPU clusters'
+node labels and ships it as the ConfigMap ``gpu-fault-failure-domain-map`` the
+control-worker mounts (``GPU_FAULT_REMEDIATION_FAILURE_DOMAIN_MAP`` names the
+file there):
 
 * every ``deploy`` (upgrade and bootstrap) renders it inside the control-plane
   apply step and stamps its digest on the control-worker pod template, so the
@@ -15,11 +13,20 @@ ConfigMap ``gpu-fault-failure-domain-map`` the control-worker mounts:
   batch join publishes the merged verified PENDING set before activation, then
   rechecks its convergence receipt at each commit.
 
+No runtime code reads the published map. The remediation budget keeps one
+workflow per training job or per GPU node without a job (faults merge into
+it, its nodes and GPUs are repaired in parallel), serializes workflows by the
+per-node scope and a job token (for steps that stop or restart a whole job)
+and knows one ``domain:`` -- an SXID's NVSwitch fabric partition; a label domain put every node of an instance group or EKS node
+group in one slot. The fleet rollout reads the same label priority for its
+per-domain wave cap from the nodes themselves
+(``failure_domains.node_failure_domain``), not from this map.
+
 The administrator configures nothing but, optionally, ``failureDomainLabels``
 in ``site.yaml`` when the fleet carries topology labels the default priority
-does not know. ``gpu-fault-admin failure-domain-map`` survives only as a
-read-only debugging aid that writes what the product would render and lists
-the ``unmapped`` nodes.
+does not know (the fleet rollout's waves read them). ``gpu-fault-admin
+failure-domain-map`` survives only as a read-only debugging aid that writes
+what the product would render and lists the ``unmapped`` nodes.
 """
 
 from __future__ import annotations
@@ -36,13 +43,13 @@ from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.diagnostics import diagnostic_text
 from gpu_fault.admin.execution import run_command
 from gpu_fault.admin.site import RenderedSite
-from gpu_fault.execution.remediation_budget import FAILURE_DOMAIN_MAP_ENV
 from gpu_fault.cluster_scope import node_selector, selector_matches
 from gpu_fault.failure_domains import (
     FAILURE_DOMAIN_CONFIGMAP,
     FAILURE_DOMAIN_FILE,
     FAILURE_DOMAIN_LABELS,
     FAILURE_DOMAIN_MAP_ANNOTATION,
+    FAILURE_DOMAIN_MAP_ENV,
     FAILURE_DOMAIN_MAP_PATH,
     FAILURE_DOMAIN_MOUNT_DIR,
     failure_domain_configmap,
@@ -79,6 +86,12 @@ CONTROL_WORKER_ROLLOUT_TIMEOUT_SECONDS = 600
 # (``regional_release_gpu_rollout.gpu_node_command``); the admin-side render
 # selects on it too so both produce one document, one digest, for one fleet.
 HYPERPOD_CLUSTER_LABEL = "sagemaker.amazonaws.com/cluster-name"
+# What the debug summary says about the remediation budget (module docstring).
+REMEDIATION_BUDGET_NOTE = (
+    "not read: one workflow per training job or per GPU node without a job, "
+    "per-node scopes and job tokens between workflows, an SXID's NVSwitch "
+    "fabric partition"
+)
 
 NodeLister = Callable[[RenderedSite, str], Mapping[str, Mapping[str, Any]]]
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
@@ -121,6 +134,7 @@ class FailureDomainMapResult:
             "unmapped": self.unmapped,
             "label_keys": list(self.label_keys),
             "environment": {FAILURE_DOMAIN_MAP_ENV: FAILURE_DOMAIN_MAP_PATH},
+            "remediation_budget": REMEDIATION_BUDGET_NOTE,
         }
 
 

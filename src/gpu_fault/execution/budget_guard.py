@@ -20,6 +20,14 @@ compare-and-set write, once per row), so the waiting gauges count it. At most
 ``FRESH_WAITER_STORE_CALLS`` incident reads and writes a tick; a row past
 that is left to the store.
 
+A recorded ``domain:`` refusal the row would no longer ask for is not a wait.
+Failure domains were node-label groups (instance group, EKS node group, zone)
+until they were left to merging and the per-node scope: a row an older
+release refused on its node group's domain would sit behind that string for
+as long as an older holder kept it, although no workflow this release admits
+claims it any more. Such a row is judged afresh, as a never-refused one is.
+The other kinds keep their meaning across releases and are not re-derived.
+
 Deliberately no per-tick quota ("k free slots let k waiters through"): the
 first waiter of a scope may still not claim -- a destructive workflow the
 fleet-rollout fence holds returns without claiming -- and a quota spent on it
@@ -92,7 +100,7 @@ FRESH_WAITER_STORE_CALLS = 1000
 # past this many incidents rather than kept in age order.
 CLUSTER_CACHE_LIMIT = 50_000
 # Every scope kind ``scope_limit`` knows, exported at zero when not over.
-SCOPE_TYPES = ("class", "cluster", "domain", "node", "region")
+SCOPE_TYPES = ("class", "cluster", "domain", "job", "node", "region")
 # The parked-hold sweep: the bound it applies is over an hour, so a minute
 # between looks costs nothing; the newest BLOCKED rows, as the sibling
 # BLOCKED sweeps read them.
@@ -196,7 +204,13 @@ class BudgetGuard:
         if not scope:
             return self._fresh_waiter(workflow, steps)
         limit = scope_limit(self._policy, scope)
-        return limit is not None and self.occupancy().get(scope, 0) >= limit
+        if limit is None or self.occupancy().get(scope, 0) < limit:
+            return False
+        if scope.startswith("domain:") and not self._still_claims(
+            workflow, steps, scope
+        ):
+            return self._fresh_waiter(workflow, steps)  # module docstring
+        return True
 
     def observe(self) -> None:
         """Hand the scopes above their limit to the watch; reads the
@@ -255,6 +269,17 @@ class BudgetGuard:
             )
             return False
         return True
+
+    def _still_claims(
+        self, workflow: WorkflowRequest, steps: list[WorkflowStepSpec], scope: str
+    ) -> bool:
+        """Whether the row would still ask for ``scope``; yes when its incident
+        cannot be read this tick, so the recorded refusal stands."""
+
+        cluster = self._cluster_of(workflow.incident_id)
+        return cluster is None or scope in claims_in_cluster(
+            self._policy, workflow, cluster, steps
+        )
 
     def _cluster_of(self, incident_id: str) -> str | None:
         clusters = self._watch.clusters

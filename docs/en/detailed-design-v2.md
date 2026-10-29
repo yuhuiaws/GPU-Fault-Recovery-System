@@ -4851,6 +4851,45 @@ workflow's budgeted steps (node/workload changes) begin, every claim asks for th
 resource class scopes of its budgeted steps still to run; if any scope is full, the workflow stays retryable (with the refusing
 scope recorded) and does not call the adapter.
 
+Failure domains are workloads, and they are not a budget slot: merging and the per-node exclusion deliver them. One training
+job is one workflow: the faults of one job attempt merge into it by `[cluster, job_id, attempt_id]`, and its nodes and GPUs are
+repaired in parallel by its per-node DAG branches (reboots, GPU resets, replacements). A GPU node that runs no job is one workflow
+too: the faults of one node merge by `["node-scope", cluster, node]`, and the GPUs of the node are reset in parallel. Workflows are
+kept apart by `node:<cluster>:<node>` (a safety constant, limit 1): a second workflow on a node -- the job's later attempt, a
+preempting successor, a validated restore -- waits for the first. Nodes alone do not keep two workflows of one job apart:
+`STOP_WORKLOADS` / `RESTART_WORKLOAD` act on the job's workload objects (`workload_ids`, one per job, such as
+`<ns>/pytorchjob/<name>`), not on `node_ids`, and several paths compile them for the faulted node only (an event no grouping
+attached, an aggregation window of 0, an unattributed health finding, an escalation successor, a marker plan, the nodes of ranks
+that already exited), so two such workflows would each stop or restart the whole job. Those two operations therefore also claim
+the job's token: one `job:<cluster>:<workload_id>` per workload, plus `job:<cluster>:job-id/<job_id>` for a RESTART (the `job_id`
+its restart authorization is reserved under), limit 1. Repairs on a node (resets, reboots, replacements) claim none, so the nodes
+of a job workflow still run in parallel and different jobs and different idle nodes never wait for one another. The premise is
+the product's existing one: a GPU node is never occupied by two training jobs at the same time.
+
+The other kind of failure domain is unchanged: the NVSwitch fabric partition the SXID planner writes into the step
+(`fabric_partition`). On every fabric the product grades -- HGX NVSwitch baseboards (H100/H200/H800/H20, HGX B200/B300,
+`gpu_fabric_manager.py`), whose NVSwitches sit inside the node -- the partition defaults to `<cluster>/<node>/local-nvswitch`
+(`workflow_builder.py` and the SXID ingest in `app/ingest/faults.py`), so it nests inside the node and never couples
+two nodes or two jobs (the live DESTR-010 workflow held exactly
+`domain:gpu-eks-cluster:gpu-eks-cluster/ip-10-0-43-5…/local-nvswitch`). Rack-scale NVLink (GB200/GB300 NVL72, GH200, whose switch
+trays are shared by many nodes) is deliberately not graded today; supporting NVL72 would need either a rack / NVLink-partition
+failure domain for switch-tray actions or the rule "one NVLink partition never hosts two jobs".
+
+Node labels no longer divide remediation failure domains. `domain:` used to come from the node map (HyperPod instance group ->
+EKS node group -> zone); on the site every GPU node of a cluster fell into one domain, so one cluster ran one workflow with
+budgeted steps at a time and different jobs and different idle nodes were serialized. The ConfigMap
+`gpu-fault-failure-domain-map` is still rendered, published and mounted into the control-worker by deploy/join/remove
+(`GPU_FAULT_REMEDIATION_FAILURE_DOMAIN_MAP` still names the mounted file), but no runtime code reads it: it is a read-only
+topology view of the fleet's labels, not a limit. The fleet rollout's per-domain wave cap reads the node labels directly
+(`failure_domains.node_failure_domain`), not this map.
+
+Upgrade window: `RUNNING` rows an older release wrote still hold strings such as `domain:<cluster>:<node group>`. No claim of
+this release asks for them, so they block no admission and leave the count when their rows end; when this release dispatches
+such a row, its hold is claimed as usual and never refused (the same mechanism as "Over-limit scopes" below). A `PENDING`
+row an older release refused on a node-group domain is judged afresh by the dispatcher's guard, as a never-refused row is, once
+the recorded `domain:` scope is not among the scopes the row would ask for now, so it does not wait behind the old string
+(`budget_guard`).
+
 Once admitted, the claim is held until the workflow is terminal (`SUCCEEDED`, `FAILED`, `SUPERSEDED`, or a `BLOCKED` with
 nothing left in flight, below): WAITING steps, long commands, the re-dispatch of every tick, lease renewal and an executor hand-over release nothing. Occupancy counts
 `RUNNING` status, not the lease: a lease is execution ownership, and a dispatcher hand-over, a row past the batch cut or an
@@ -4955,7 +4994,7 @@ are in repair workflows at the same time, nor does it change the executor's acti
 |---|---|---|
 | Region remediation budget | `GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION=20` | Concurrently active remediation workflows in the region |
 | Per-cluster remediation budget | `GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER=5` | Active remediation workflows in a single GPU cluster |
-| Node / failure domain / resource class budget | `...PER_NODE=1`, `...PER_FAILURE_DOMAIN=1`, `...PER_RESOURCE_CLASS=2` | Prevents excessive simultaneous changes to the same node, fabric/AZ, or physical resource class |
+| Node / failure domain / resource class budget | `...PER_NODE=1`, `...PER_FAILURE_DOMAIN=1`, `...PER_RESOURCE_CLASS=2` | Prevents excessive simultaneous changes to the same node, the same NVSwitch fabric partition or the same physical resource class; a job or a node without a job is one merged workflow, workflows are kept apart per node, and steps that stop or restart a job also per job token (`job:`, limit 1) |
 | In-flight commands per executor | `GPU_FAULT_CLUSTER_EXECUTOR_MAX_CONCURRENT_COMMANDS=5` | Command concurrency of a single data-plane process, sitting behind the persistent budget |
 | Multi-node barrier | `barrier` object | Fabric-class faults require all targets to be in place before advancing to destructive steps |
 | Batch waves | `POST /v1/fleet/deployments/{id}/next-wave` | Node-side upgrades/changes advance wave by wave; a human releases the next wave |

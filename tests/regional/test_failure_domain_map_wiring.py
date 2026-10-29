@@ -1,11 +1,13 @@
-"""The failure-domain map reaches the executor by exactly the path the product renders.
+"""The published failure-domain map, and the fleet rollout reading the same labels.
 
 The release engine writes one ConfigMap during the control-plane apply; the
 control-worker mounts it and points `GPU_FAULT_REMEDIATION_FAILURE_DOMAIN_MAP`
-at the file. If either side drifts the domain budget tier goes silently inert
-again, which is the defect this wiring exists to close. The fleet rollout reads
-the same node labels for its per-domain wave cap, so the two readings are pinned
-against each other here too.
+at the file. The remediation budget no longer reads it -- a job or an idle node
+is one merged workflow, the per-node scope keeps workflows apart and the only
+domain left is an SXID's NVSwitch fabric partition -- so it is a read-only
+topology view; the mount stays optional so a missing ConfigMap never keeps a
+worker from starting. The fleet rollout reads the same node labels for its
+per-domain wave cap, so the two readings are pinned against each other here.
 """
 
 from __future__ import annotations
@@ -15,10 +17,10 @@ from types import SimpleNamespace
 
 import yaml
 
-from gpu_fault.execution.remediation_budget import FAILURE_DOMAIN_MAP_ENV
 from gpu_fault.failure_domains import (
     FAILURE_DOMAIN_CONFIGMAP,
     FAILURE_DOMAIN_LABELS,
+    FAILURE_DOMAIN_MAP_ENV,
     FAILURE_DOMAIN_MOUNT_DIR,
     UNKNOWN_FAILURE_DOMAIN,
     failure_domain_map,
@@ -72,12 +74,11 @@ def _release(items: list[dict], label_keys=FAILURE_DOMAIN_LABELS) -> SimpleNames
 
 
 def test_fleet_rollout_and_remediation_map_read_one_failure_domain_per_node() -> None:
-    """Two readers of "what is a failure domain" must not be able to disagree.
+    """The published map and the fleet rollout read one domain per node.
 
-    The remediation map omits unlabelled nodes (they consume node, cluster and
-    region quota only); the fleet rollout must name a domain for every node it
-    rolls, so it substitutes the UNKNOWN sentinel for exactly the same nodes.
-    Every labelled node carries the identical domain in both shapes.
+    The map omits unlabelled nodes; the fleet rollout must name a domain for
+    every node it rolls, so it substitutes the UNKNOWN sentinel for exactly the
+    same nodes. Every labelled node carries the identical domain in both shapes.
     """
 
     items = [

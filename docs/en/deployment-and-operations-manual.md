@@ -2716,10 +2716,11 @@ and spool-worker `0` when spool is disabled by default; the role verifier at the
 mechanically checks these conditions as well as each role's ports, connection pool and processor worker boundaries.
 When the verifier resolves the container environment it follows kubelet's `optional: true` semantics: when the ConfigMap
 `gpu-fault-failure-domain-map` does not exist, `GPU_FAULT_REMEDIATION_FAILURE_DOMAIN_MAP`
-is treated as unset rather than as a verification failure; control-worker runs as usual, just without per-failure-domain remediation throttling.
+is treated as unset rather than as a verification failure; control-worker runs as usual, and no runtime code reads the mapping anyway
+(remediation is organized by workload and workflows are kept apart per node, see detailed design v2 §9.5).
 That ConfigMap is rendered automatically by the apply step: the release engine generates the mapping from the node labels of every managed GPU cluster
 (`spec.failureDomainLabels` in `site.yaml`, default instance group -> zone),
-validates it with the worker's loader before applying, and writes the content digest into the control-worker Pod template annotation
+validates it with the mapping's loader before applying, and writes the content digest into the control-worker Pod template annotation
 `gpu-fault.io/failure-domain-map-sha256` (`GPU_FAULT_FAILURE_DOMAIN_MAP_SHA256`
 passed to the apply script); the worker rolls only when the mapping changes; `join-cluster`/`remove-cluster` likewise
 re-render it. Administrators need no manual action; see Administrator Operations §5.1 for details.

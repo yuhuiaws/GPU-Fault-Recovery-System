@@ -566,7 +566,7 @@ validates them (integers/numbers must parse, booleans must be `0/1/true/false/ye
 | `GPU_FAULT_RELEASE_HISTORY_DIR` | Core/Other | text | `<implicit>` | `gpu_fault.admin.cli` |
 | `GPU_FAULT_RELEASE_ID` | Core/Other | text | `'', 'local'` | `gpu_fault.app.factory`<br>`gpu_fault.node_agent.app` |
 | `GPU_FAULT_RELEASE_SUPERSEDE_FAILED_TRANSACTION` | Core/Other | text | `<implicit>` | `gpu_fault.admin.release_consent` |
-| `GPU_FAULT_REMEDIATION_FAILURE_DOMAIN_MAP` | Core/Other | text | `''` | `gpu_fault.admin.failure_domain_map`<br>`gpu_fault.execution.remediation_budget` |
+| `GPU_FAULT_REMEDIATION_FAILURE_DOMAIN_MAP` | Core/Other | text | `<implicit>` | `gpu_fault.admin.failure_domain_map`<br>`gpu_fault.failure_domains` |
 | `GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER` | Core/Other | integer | `'5'` | `gpu_fault.app.builtin_metric_contributors`<br>`gpu_fault.execution.remediation_budget` |
 | `GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN` | Core/Other | integer | `'1'` | `gpu_fault.execution.remediation_budget` |
 | `GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE` | Core/Other | integer | `'1'` | `gpu_fault.execution.remediation_budget` |

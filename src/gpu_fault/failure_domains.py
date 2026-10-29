@@ -5,23 +5,28 @@ label that ordinary Kubernetes topology tooling treats as *the* failure domain
 cannot separate any two nodes of the same cluster. The domains that do matter
 at 500 nodes in one zone are smaller: a HyperPod instance group (the unit
 capacity is bought and rolled in), a rack or PDU, a network leaf. The label
-priority below is the single place that ordering lives; the remediation
-budget's ``domain:`` scope and the fleet rollout's per-domain cap both read it
-so they cannot disagree about what a "domain" is.
+priority below is the single place that ordering lives; the fleet rollout's
+per-domain wave cap reads it (``node_failure_domain``).
 
-Two consumers, two shapes of the same reading. The remediation map
-(``failure_domain_map``) *omits* nodes that carry none of the labels: an
-unlabelled node consumes node, cluster and region quota only, never a
-``domain:`` slot, because one shared bucket would make every unlabelled node
-contend for a single slot and look like a stuck budget. The fleet rollout's
-request model needs a value for every node it rolls, so that path substitutes
-``UNKNOWN_FAILURE_DOMAIN`` for the same nodes, and its wave policy reads the
-sentinel as "no known blast radius, one node per wave". The labelled nodes are
-identical in both shapes; the unlabelled set is the same set.
+The remediation budget does not. A training job, or a GPU node that runs
+none, is one workflow -- its faults merge into it and its nodes and GPUs are
+repaired in parallel inside it -- and the per-node scope (with a job token for
+the steps that stop or restart a whole job) serializes a second workflow; the
+only ``domain:`` scope left is an SXID's NVSwitch fabric partition. Read from these labels, every GPU node of an
+instance group or EKS node group shared one slot, so two jobs, or two idle
+nodes, of one group were repaired one at a time.
 
-The ConfigMap that ships the remediation map to the control-worker is also
-rendered here so the release engine and the administrator tooling produce one
-byte-identical document and one digest for it.
+The node map (``failure_domain_map``) is still rendered and published as the
+ConfigMap ``gpu-fault-failure-domain-map`` -- by every ``deploy`` and by
+``join-cluster``/``remove-cluster``, which the release engine and the
+administrator tooling produce as one byte-identical document with one digest
+-- and the control-worker still mounts it, but nothing at runtime reads it:
+it is the published label reading of the fleet, a read-only topology view, not
+a limit. It *omits* nodes that carry none of the labels, while the fleet
+rollout's request model needs a value for every node it rolls and substitutes
+``UNKNOWN_FAILURE_DOMAIN``, which its wave policy reads as "no known blast
+radius, one node per wave". The labelled nodes are identical in both shapes;
+the unlabelled set is the same set.
 """
 
 from __future__ import annotations
@@ -41,6 +46,9 @@ FAILURE_DOMAIN_FILE = "failure-domains.json"
 FAILURE_DOMAIN_MOUNT_DIR = "/etc/gpu-fault/failure-domains"
 FAILURE_DOMAIN_MAP_PATH = f"{FAILURE_DOMAIN_MOUNT_DIR}/{FAILURE_DOMAIN_FILE}"
 FAILURE_DOMAIN_MAP_ANNOTATION = "gpu-fault.io/failure-domain-map-sha256"
+# The control-worker manifest points this variable at the mounted map (the
+# ConfigMap's ``map-path``); no runtime code reads it (module docstring).
+FAILURE_DOMAIN_MAP_ENV = "GPU_FAULT_REMEDIATION_FAILURE_DOMAIN_MAP"
 
 # Finest known domain first. Operators whose fleet carries EC2 instance
 # topology labels (``topology.k8s.aws/network-node-layer-N``) can pass those
@@ -98,7 +106,7 @@ def failure_domain_map(
 
 
 def failure_domain_document(mapping: Mapping[str, Mapping[str, str]]) -> str:
-    """The JSON file the executor loads, in one canonical byte order."""
+    """The JSON file the ConfigMap ships, in one canonical byte order."""
 
     return (
         json.dumps(
@@ -118,7 +126,7 @@ def failure_domain_configmap(
     *,
     namespace: str = "gpu-fault-system",
 ) -> dict[str, Any]:
-    """The ConfigMap the control-worker mounts; ``map-path`` feeds the env var."""
+    """The ConfigMap the control-worker mounts; ``map-path`` sets the env var."""
 
     return {
         "apiVersion": "v1",
@@ -145,18 +153,44 @@ def failure_domain_map_sha256(manifest: Mapping[str, Any]) -> str:
     ).hexdigest()
 
 
-def validate_failure_domain_manifest(manifest: Mapping[str, Any]) -> None:
-    """Run the rendered document through the executor's own loader.
+def load_failure_domain_map(path: str | Path) -> dict[str, dict[str, str]]:
+    """Read ``{cluster_id: {node_id: failure_domain}}`` or raise ``ValueError``.
 
-    The control-worker refuses to start on a malformed map, so the render
-    refuses to ship one: whatever ``load_failure_domain_map`` would reject at
-    worker start-up is rejected here, before ``kubectl apply``, with the same
-    message. Raises ``ValueError``.
+    Malformed input is refused rather than skipped: a map that quietly drops
+    half its nodes is not a reading of the fleet.
     """
 
-    # Imported here so this module stays free of the execution layer for its
-    # other readers (the fleet rollout imports it for the label priority only).
-    from gpu_fault.execution.remediation_budget import load_failure_domain_map
+    try:
+        document = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"failure domain map {path} is unreadable: {exc}") from exc
+    if not isinstance(document, dict):
+        raise ValueError(f"failure domain map {path} must be a JSON object")
+    mapping: dict[str, dict[str, str]] = {}
+    for cluster_id, nodes in document.items():
+        if not isinstance(nodes, dict):
+            raise ValueError(
+                f"failure domain map {path}: cluster {cluster_id!r} must map "
+                "node ids to failure domains"
+            )
+        for node_id, domain in nodes.items():
+            if not isinstance(domain, str) or not domain:
+                raise ValueError(
+                    f"failure domain map {path}: {cluster_id}/{node_id} must "
+                    "name a non-empty failure domain"
+                )
+        mapping[str(cluster_id)] = {
+            str(node_id): domain for node_id, domain in nodes.items()
+        }
+    return mapping
+
+
+def validate_failure_domain_manifest(manifest: Mapping[str, Any]) -> None:
+    """Run the rendered document through ``load_failure_domain_map``.
+
+    The render refuses to ship a map its own reader rejects: the check runs
+    before ``kubectl apply``, with the reader's message. Raises ``ValueError``.
+    """
 
     document = str((manifest.get("data") or {}).get(FAILURE_DOMAIN_FILE) or "")
     with tempfile.TemporaryDirectory(prefix="gpu-fault-failure-domains-") as directory:

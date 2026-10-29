@@ -51,7 +51,11 @@ Administrators can currently configure:
 The formal template contains 22 administrator-configurable leaf fields in total. The node and failure-domain remediation budgets
 are safety constants fixed at 1 at runtime and do not appear in the template; if an old file still has
 `maxActivePerNode: 1` or `maxActivePerFailureDomain: 1` it is accepted and ignored, and any other value
-is refused.
+is refused. A training job, or a GPU node without a job, is one merged workflow (its nodes and GPUs are repaired in parallel
+inside it), workflows are kept apart per node (a second workflow on a node queues), and steps that stop or restart a job are
+also kept apart per job token; the failure-domain limit (fixed at 1) applies to that job token and to an SXID's NVSwitch fabric
+partition. Node labels (instance group, EKS node group, zone) no longer divide remediation failure
+domains, and there is no label mapping to configure (detailed design v2 §9.5).
 
 Credentials, Region, cluster identity, Runtime Profile, operation allowlist, release pins,
 destructive capability switches and safety invariants are not general administrator configuration. Only the fields declared by the formal template may be changed;

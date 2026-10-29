@@ -138,7 +138,8 @@ def budget_headroom(
 ) -> dict[str, Any]:
     """What the control plane's remediation budget has left for the two
     branches this case opens. Read on the control-worker, whose environment
-    carries the limits and the failure-domain map the executor enforces;
+    carries the limits the executor enforces (the probe passes no job, so its
+    failure domains are the two nodes'; the case's own job domain is new);
     an unreadable budget is reported as such and fails the preflight closed."""
 
     try:

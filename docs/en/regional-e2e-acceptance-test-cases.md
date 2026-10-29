@@ -11257,8 +11257,9 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
      node-b's XID 46 arrived after the shared `STOP_WORKLOADS` of node-c's branch had stopped the job,
      the completion watcher recorded the product's own stop at once (no longer after the 300 s
      missing-Pod grace), so the event no longer belonged to the job and opened a node-level
-     `RESET_GPU` workflow of its own (PENDING for good, because node-c's workflow held the failure
-     domain's remediation budget), and the case judged 28 errors that all followed from it. Earlier
+     `RESET_GPU` workflow of its own (PENDING for good: node-c's workflow held the remediation budget
+     it needed -- the node group's failure domain then, node-b's node scope held by the job's shared STOP
+     now), and the case judged 28 errors that all followed from it. Earlier
      runs joined only because the stopped attempt kept reading as RUNNING through that grace. The
      verdict reads the control plane's `ingested_at` on the two stored events -- one clock for both
      (`destr014_verdicts.injection_window_errors`): node-c's XID 79 must reach the control plane
