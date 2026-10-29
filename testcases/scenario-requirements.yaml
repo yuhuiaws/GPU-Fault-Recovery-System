@@ -1168,24 +1168,32 @@ requirements:
     critical: true
   - id: GF-REQ-RECOVERY-WORKLOAD-DOMAINS
     family: recovery
-    title: Two idle GPU nodes of one node group are repaired by two workflows in parallel, kept apart per node only
-    source: [src/gpu_fault/execution/remediation_budget.py, src/gpu_fault/execution/storm_admission.py, src/gpu_fault/remediation_storm.py]
+    title: Independent workload failure domains of one node group are repaired by separate workflows in parallel, kept apart per node only
+    source: [src/gpu_fault/operation_registry.py, src/gpu_fault/execution/remediation_budget.py, src/gpu_fault/execution/storm_admission.py, src/gpu_fault/remediation_storm.py]
     covers: [recovery:workload-failure-domains]
     conditions: [normal, safety]
     assertions:
-      - An idle node's workflow claims only its node scope (and a node-local fabric partition its own step names), no node-group domain and no retired region, cluster or resource-class scope.
-      - Two idle nodes of one node group are admitted together, are never held on a domain scope, and their budgeted steps overlap in wall-clock time.
-      - The storm breaker counts only a node entering node-hardware remediation, so two idle nodes stay below its floor of three and a two-node job's healthy workload-stop peer is not counted (its faulted node alone is, b223).
-    cases: [GF-REGIONAL-DESTR-027]
-    runners: [scripts/e2e/regional/run_destr027_two_idle_node_parallel_reset.py]
+      - An idle node's workflow claims only its node scope (and a node-local fabric partition its own step names), no node-group domain and no retired region, cluster or resource-class scope; a job's workflow claims its nodes and its job tokens.
+      - Two idle nodes, two two-node jobs, or a two-node job beside an idle node, of one node group, are admitted together, are never held on a node-group domain scope, and their remediation steps overlap in wall-clock time.
+      - The storm breaker counts only a node entering node-hardware remediation, so two such domains stay at two counted nodes below its floor of three; a two-node job's healthy workload-stop peer is not counted (its faulted node alone is, b223).
+    cases: [GF-REGIONAL-DESTR-027, GF-REGIONAL-DESTR-028, GF-REGIONAL-DESTR-029]
+    runners:
+      - scripts/e2e/regional/run_destr027_two_idle_node_parallel_reset.py
+      - scripts/e2e/regional/run_destr028_two_job_parallel_reboot.py
+      - scripts/e2e/regional/run_destr029_job_and_idle_parallel.py
     checks:
       - nodeid: tests/execution/test_remediation_budget.py::test_two_idle_nodes_are_repaired_together
         expected: 2
       - nodeid: tests/execution/test_remediation_storm_admission.py::test_two_nodes_never_trip_it
+      - nodeid: tests/execution/test_remediation_storm_admission.py::test_two_two_node_jobs_stay_below_the_floor
       - nodeid: tests/regional/test_workload_domain_oracle.py::test_two_idle_nodes_through_the_b220_claim_path_are_the_pass_shape
       - nodeid: tests/regional/test_workload_domain_oracle.py::test_the_pre_b220_node_group_serialization_fails_as_serialized
       - nodeid: tests/regional/test_workload_domain_oracle.py::test_a_two_node_jobs_peer_is_not_counted_so_the_floor_holds
         expected: 2
+      - nodeid: tests/regional/test_workload_domain_oracle.py::test_two_jobs_in_parallel_carry_the_job_scopes
+      - nodeid: tests/regional/test_workload_domain_oracle.py::test_a_job_and_an_idle_node_in_parallel_are_the_pass_shape
+      - nodeid: tests/regional/test_destr028_two_job_parallel_reboot.py::test_the_oracle_sees_two_job_domains_each_faulted_on_one_node
+      - nodeid: tests/regional/test_destr029_job_and_idle_parallel.py::test_the_oracle_sees_a_job_domain_and_an_idle_domain
     critical: true
   - id: GF-REQ-RECOVERY-REBOOT-SAFEGUARD
     family: recovery

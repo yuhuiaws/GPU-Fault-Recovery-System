@@ -69,6 +69,8 @@ STANDARD_RUNNERS = (
     "run_destr018_lifetime_deadline",
     "run_destr026_same_node_two_gpu_reset",
     "run_destr027_two_idle_node_parallel_reset",
+    "run_destr028_two_job_parallel_reboot",
+    "run_destr029_job_and_idle_parallel",
     "run_e2e002_multicluster_fault",
     "run_ha003_aurora_failover_reset",
     "run_ha004_waiting_reclaim_reset",

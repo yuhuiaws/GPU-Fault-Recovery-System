@@ -558,25 +558,37 @@ rules:
 
   - id: workload-failure-domains
     description: >-
-      Two idle GPU nodes of one node group recover in parallel
-      (GF-REGIONAL-DESTR-027): the per-node and per-job remediation budget
-      scopes b220 left, the storm breaker's first-admission count, and the
-      case's runner and shared read-only oracle.
+      Two idle GPU nodes (GF-REGIONAL-DESTR-027), two two-node jobs
+      (GF-REGIONAL-DESTR-028) and a two-node job beside an idle node
+      (GF-REGIONAL-DESTR-029) of one node group recover in parallel: the
+      per-node and per-job remediation budget scopes b220 left, the storm
+      breaker's first-admission count (b223: node-hardware-mutating nodes only,
+      not a stopped job's healthy peer), and the cases' runners and shared
+      read-only oracle.
     paths:
+      - src/gpu_fault/operation_registry.py
       - src/gpu_fault/execution/remediation_budget.py
       - src/gpu_fault/execution/storm_admission.py
       - src/gpu_fault/remediation_storm.py
       - scripts/e2e/regional/run_destr027_two_idle_node_parallel_reset.py
+      - scripts/e2e/regional/run_destr028_two_job_parallel_reboot.py
+      - scripts/e2e/regional/run_destr029_job_and_idle_parallel.py
       - scripts/e2e/regional/workload_domain_oracle.py
       - tests/regional/test_destr027_two_idle_node_parallel_reset.py
+      - tests/regional/test_destr028_two_job_parallel_reboot.py
+      - tests/regional/test_destr029_job_and_idle_parallel.py
       - tests/regional/test_workload_domain_oracle.py
     pytest:
       - tests/regional/test_workload_domain_oracle.py
       - tests/regional/test_destr027_two_idle_node_parallel_reset.py
+      - tests/regional/test_destr028_two_job_parallel_reboot.py
+      - tests/regional/test_destr029_job_and_idle_parallel.py
       - tests/execution/test_remediation_budget.py
       - tests/execution/test_remediation_storm_admission.py
     regional_cases:
       - GF-REGIONAL-DESTR-027
+      - GF-REGIONAL-DESTR-028
+      - GF-REGIONAL-DESTR-029
     counts_as_domain: false
 
   - id: gpu-environment-live-acceptance
