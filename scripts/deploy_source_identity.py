@@ -48,6 +48,9 @@ DEPLOY_HOST_ORCHESTRATION_INPUTS = (
     "scripts/ci_coverage_gate.py",
     "scripts/ci_pytest_evidence.py",
     "scripts/ci_unit_gate.py",
+    # Every cosign sign-blob of ci_candidate_receipt.py, staging_deploy.py and
+    # the Makefile's release/deploy-host recipes runs through this wrapper.
+    "scripts/cosign_sign_blob.py",
     "scripts/deploy_source_identity.py",
     "scripts/release_attestation.py",
     "scripts/release_deploy.py",
