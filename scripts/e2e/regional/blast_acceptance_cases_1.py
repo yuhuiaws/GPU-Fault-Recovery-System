@@ -298,7 +298,8 @@ class BlastCasesOne(BlastRunnerBase):
         # A producer that started before the baseline snapshot cannot be judged
         # against it (its CPU writes may predate the snapshot): it is outside
         # the audited window -- listed, not counted. The required operations
-        # must be proven by producers inside the window.
+        # must be proven by producers inside the window. E2E-001 itself starts
+        # at the window its card opened, so its STOP/RESTART count.
         before_baseline = sorted(
             case_id
             for case_id, item in producers.items()
@@ -391,7 +392,10 @@ class BlastCasesOne(BlastRunnerBase):
             "whose SUCCEEDED records prove STOP_WORKLOADS/RESTART_WORKLOAD and "
             "MARK_UNSCHEDULABLE and that started after the baseline snapshot; "
             "producers that started earlier are listed as producers_before_baseline "
-            "and not counted. This audit does not trigger a reset or workload restart.",
+            "and not counted. E2E-001 starts at its card's window; a record stamped "
+            "before its producer started (a store snapshot read by a plan or "
+            "preflight) proves nothing for it. This audit does not trigger a "
+            "reset or workload restart.",
             "Current managedFields and retained Jobs/events cannot prove the "
             "absence of transient changes already removed from API history.",
         ]

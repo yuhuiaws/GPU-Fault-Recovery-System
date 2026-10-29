@@ -1096,7 +1096,9 @@ def parse_optional_time(value: Any) -> datetime | None:
     return parsed if parsed.tzinfo is not None else None
 
 
-def succeeded_operations(document: Any) -> dict[str, set[str]]:
+def succeeded_operations(
+    document: Any, *, since: datetime | None = None
+) -> dict[str, set[str]]:
     """Operations proven by SUCCEEDED records anywhere in ``document``.
 
     Two shapes count, both as the runners write them: a workflow record whose
@@ -1105,10 +1107,27 @@ def succeeded_operations(document: Any) -> dict[str, set[str]]:
     ``step.operation``. Declared steps, ``completed_operations`` lists, WAITING
     or FAILED executions and non-terminal workflows prove nothing here -- the
     spec forbids taking a step name or an arbitrary terminal status as success.
+    With ``since``, a record stamped before it proves nothing either: a plan or
+    preflight reads the store's latest incident on its node, and that snapshot
+    of an earlier case's workflow is not the reader's own (live: DESTR-010 on
+    E2E-001's node carried E2E-001's STOP/RESTART). A step execution is stamped
+    by its ``started_at``, else its workflow's ``created_at``; a command by its
+    ``created_at``. The store stamps every record it writes; one without any
+    stamp is not dropped by ``since``.
     Returns ``{operation: {workflow ids}}``.
     """
 
     found: dict[str, set[str]] = {}
+
+    def earlier(*stamps: Any) -> bool:
+        if since is None:
+            return False
+        # The first readable stamp decides.
+        for stamp in stamps:
+            parsed = parse_optional_time(stamp)
+            if parsed is not None:
+                return parsed < since
+        return False
 
     def visit(value: Any) -> None:
         if isinstance(value, dict):
@@ -1123,6 +1142,9 @@ def succeeded_operations(document: Any) -> dict[str, set[str]]:
                             isinstance(step, dict)
                             and str(step.get("status") or "").endswith("SUCCEEDED")
                             and step.get("operation")
+                            and not earlier(
+                                step.get("started_at"), value.get("created_at")
+                            )
                         ):
                             found.setdefault(
                                 _operation_name(step["operation"]), set()
@@ -1132,6 +1154,7 @@ def succeeded_operations(document: Any) -> dict[str, set[str]]:
                     isinstance(step, dict)
                     and step.get("operation")
                     and value.get("command_id")
+                    and not earlier(value.get("created_at"))
                 ):
                     found.setdefault(_operation_name(step["operation"]), set()).add(
                         identity
@@ -1146,6 +1169,45 @@ def succeeded_operations(document: Any) -> dict[str, set[str]]:
     return found
 
 
+def _producer_start(
+    case_dir: Path, verdict: dict[str, Any], documents: list[Path]
+) -> datetime:
+    """Where a producer's contribution starts.
+
+    A run's own start stamp, else the window its card opened, else the earliest
+    JSON it wrote. E2E-001 hands over the baseline itself, and the verdict file
+    its runner writes stamps ``started_at`` before the cpu-nodes-before.json
+    snapshot the case then takes -- read first, it put the producer the spec
+    names for STOP_WORKLOADS/RESTART_WORKLOAD before its own baseline. Its
+    contribution opens where its execution card's window does (the injection),
+    provided the card agrees with the verdict on case, verdict, release and
+    cluster; otherwise the general order applies.
+    """
+
+    if case_dir.name == E2E001_CASE_ID:
+        card = _read_json_document(case_dir / E2E001_EXECUTION_CARD)
+        if isinstance(card, dict) and all(
+            card.get(key) == verdict.get(key)
+            for key in ("case_id", "verdict", "release_id", "cluster_id")
+        ):
+            opened = card.get("maintenance_window")
+            start = parse_optional_time(
+                opened.get("start") if isinstance(opened, dict) else None
+            )
+            if start is not None:
+                return start
+    window = verdict.get("maintenance_window")
+    return (
+        parse_optional_time(verdict.get("started_at"))
+        or parse_optional_time(
+            window.get("start") if isinstance(window, dict) else None
+        )
+        or datetime.fromtimestamp(
+            min(path.stat().st_mtime for path in documents), tz=timezone.utc
+        )
+    )
+
+
 def release_bound_producers(
     root_run_dir: Path, *, release_id: str, cluster_ids: set[str]
 ) -> dict[str, dict[str, Any]]:
@@ -1153,9 +1215,10 @@ def release_bound_producers(
 
     A case counts when its verdict file says PASS for ``release_id`` and one of
     ``cluster_ids`` with no recorded errors; every JSON file in its directory is
-    then read for SUCCEEDED records (``succeeded_operations``). The window a
-    producer contributes runs from its ``started_at`` (or the earliest JSON it
-    wrote) to its latest recorded end (or the verdict file's write time).
+    then read for SUCCEEDED records (``succeeded_operations``) stamped no
+    earlier than the producer's start. The window a producer contributes runs
+    from that start (``_producer_start``) to its latest recorded end (or the
+    verdict file's write time).
     """
 
     producers: dict[str, dict[str, Any]] = {}
@@ -1181,28 +1244,20 @@ def release_bound_producers(
             continue
         operations: dict[str, set[str]] = {}
         files: list[str] = []
+        # Never empty: the verdict just read is one of them.
         documents = sorted(case_dir.glob("*.json"))
+        started = _producer_start(case_dir, verdict, documents)
         for path in documents:
             document = _read_json_document(path)
             if document is None:
                 continue
-            for operation, identities in succeeded_operations(document).items():
+            for operation, identities in succeeded_operations(
+                document, since=started
+            ).items():
                 operations.setdefault(operation, set()).update(identities)
             files.append(path.name)
         if not operations:
             continue
-        # A run's own start stamp, else the window its card opened (E2E-001's
-        # card carries no started_at), else the earliest JSON it wrote.
-        window = verdict.get("maintenance_window")
-        started = (
-            parse_optional_time(verdict.get("started_at"))
-            or parse_optional_time(
-                window.get("start") if isinstance(window, dict) else None
-            )
-            or datetime.fromtimestamp(
-                min(path.stat().st_mtime for path in documents), tz=timezone.utc
-            )
-        )
         ends = [
             parse_optional_time(verdict.get(key))
             for key in ("ended_at", "executed_at", "completed_at")

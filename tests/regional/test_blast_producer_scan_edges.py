@@ -4,12 +4,15 @@ A BLAST-001 case directory that exists but lacks one evidence file, a site that
 does not resolve a GPU kubeconfig or lists no GPU clusters, the containment
 command binding when the only candidate command covers a different node, and
 the release-bound producer scan skipping stray files, unreadable or oversized
-documents and cases that prove no SUCCEEDED operation.
+documents and cases that prove no SUCCEEDED operation, and placing E2E-001 at
+its card's window while leaving out store snapshots a later case's plan read.
 """
 
 from __future__ import annotations
 
 import json
+import os
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -217,3 +220,100 @@ def test_producer_scan_skips_stray_files_unreadable_or_oversized_documents(
         "workflow.json",
     ]
     assert producers["GF-REGIONAL-HA-002"]["started_at"] == "2026-01-01T00:00:00+00:00"
+
+
+def test_producer_scan_places_e2e001_at_its_card_and_leaves_plan_snapshots_out(
+    tmp_path: Path,
+) -> None:
+    """Live round 12: DESTR-010 ran on E2E-001's node, so the store read in its
+    plan carried E2E-001's SUCCEEDED STOP/RESTART and BLAST-001 credited them
+    to DESTR-010, while E2E-001 -- its verdict's started_at precedes the
+    baseline it takes -- sat before its own baseline. The workload proof is
+    E2E-001's, from its card's window on; DESTR-010 keeps what it ran."""
+
+    cases = tmp_path / "cases"
+    e2e = cases / base.E2E001_CASE_ID
+    e2e.mkdir(parents=True)
+    restart = {
+        "request_id": "wf-restart",
+        "status": "SUCCEEDED",
+        "created_at": "2026-01-01T10:01:05Z",
+        "step_executions": [
+            {
+                "operation": operation,
+                "status": "SUCCEEDED",
+                "started_at": f"2026-01-01T10:01:{second}Z",
+            }
+            for operation, second in (("STOP_WORKLOADS", 10), ("RESTART_WORKLOAD", 20))
+        ],
+    }
+    (e2e / f"{base.E2E001_CASE_ID}.json").write_text(
+        json.dumps(
+            verdict(
+                base.E2E001_CASE_ID,
+                started_at="2026-01-01T10:00:00+00:00",
+                executed_at="2026-01-01T10:03:00+00:00",
+                state={"workflow": restart},
+            )
+        )
+    )
+    (e2e / base.E2E001_EXECUTION_CARD).write_text(
+        json.dumps(
+            {
+                **verdict(base.E2E001_CASE_ID),
+                "maintenance_window": {
+                    "start": "2026-01-01T10:01:00+00:00",
+                    "end": "2026-01-01T10:03:00+00:00",
+                },
+            }
+        )
+    )
+    reset = cases / "GF-REGIONAL-DESTR-010"
+    reset.mkdir()
+    (reset / "plan.json").write_text(
+        json.dumps({"details": {"preflight": {"store": {"workflow": restart}}}})
+    )
+    (reset / "workflow-state.json").write_text(
+        json.dumps(
+            {
+                "workflow": {
+                    "request_id": "wf-reset",
+                    "status": "SUCCEEDED",
+                    "created_at": "2026-01-01T11:05:05Z",
+                    "step_executions": [
+                        {
+                            "operation": "MARK_UNSCHEDULABLE",
+                            "status": "SUCCEEDED",
+                            "started_at": "2026-01-01T11:05:10Z",
+                        }
+                    ],
+                }
+            }
+        )
+    )
+    (reset / "GF-REGIONAL-DESTR-010.json").write_text(
+        json.dumps(verdict("GF-REGIONAL-DESTR-010"))
+    )
+    # DESTR-010's verdict has no start stamp: its earliest file, the plan, is it.
+    for name, minute in (
+        ("plan.json", 0),
+        ("workflow-state.json", 20),
+        ("GF-REGIONAL-DESTR-010.json", 25),
+    ):
+        stamp = datetime(2026, 1, 1, 11, minute, tzinfo=timezone.utc).timestamp()
+        os.utime(reset / name, (stamp, stamp))
+
+    producers = base.release_bound_producers(
+        tmp_path, release_id=RELEASE, cluster_ids={CLUSTER}
+    )
+    assert producers[base.E2E001_CASE_ID]["started_at"] == "2026-01-01T10:01:00+00:00"
+    assert producers[base.E2E001_CASE_ID]["operations"] == {
+        "RESTART_WORKLOAD": ["wf-restart"],
+        "STOP_WORKLOADS": ["wf-restart"],
+    }
+    assert producers["GF-REGIONAL-DESTR-010"]["started_at"] == (
+        "2026-01-01T11:00:00+00:00"
+    )
+    assert producers["GF-REGIONAL-DESTR-010"]["operations"] == {
+        "MARK_UNSCHEDULABLE": ["wf-reset"]
+    }, "the plan's snapshot of E2E-001's workflow is not DESTR-010's proof"

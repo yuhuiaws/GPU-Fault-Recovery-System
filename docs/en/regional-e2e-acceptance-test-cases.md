@@ -9017,8 +9017,13 @@ The lock name may in future be subdivided by explicit endpoint scope; for now th
   2. Enumerate the PASS cases in the run directory that are bound to the current
      release/cluster, keep only those that started after the baseline, and take
      `STOP_WORKLOADS`/`RESTART_WORKLOAD` and `MARK_UNSCHEDULABLE` from their `SUCCEEDED`
-     records. This case does not inject another fault, does not perform another reset, and
-     does not treat an arbitrary terminal state or step name as evidence of success.
+     records. E2E-001 starts at its execution card's window start (the injection): its result
+     file's `started_at` precedes the baseline snapshot it takes itself and does not make it a
+     case that started before the baseline. A `SUCCEEDED` record in a case directory stamped
+     before that case started (a snapshot of an earlier workflow on the node, read by its
+     plan/preflight) is not that case's evidence. This case does not inject another fault,
+     does not perform another reset, and does not treat an arbitrary terminal state or step
+     name as evidence of success.
   3. Re-collect the CPU node state and compare it field by field:
 
      ```bash

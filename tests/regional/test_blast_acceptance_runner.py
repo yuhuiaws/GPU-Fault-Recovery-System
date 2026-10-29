@@ -608,6 +608,147 @@ def test_succeeded_operations_read_only_succeeded_records() -> None:
     )
 
 
+def test_succeeded_operations_since_leaves_out_records_stamped_earlier() -> None:
+    since = datetime(2026, 9, 7, 10, 0, tzinfo=timezone.utc)
+    document = {
+        # A preflight's store read: an earlier case's workflow on the node.
+        "store": {
+            "workflow": {
+                "request_id": "wf-earlier",
+                "status": "SUCCEEDED",
+                "created_at": "2026-09-07T09:00:00Z",
+                "step_executions": [
+                    {
+                        "operation": "STOP_WORKLOADS",
+                        "status": "SUCCEEDED",
+                        "started_at": "2026-09-07T09:00:05Z",
+                    }
+                ],
+            },
+            "commands": [
+                {
+                    "command_id": "cmd-earlier",
+                    "workflow_request_id": "wf-earlier",
+                    "status": "SUCCEEDED",
+                    "created_at": "2026-09-07T09:00:05Z",
+                    "step": {"operation": "RESTART_WORKLOAD"},
+                }
+            ],
+        },
+        # The case's own: created just before ``since``, its step ran after; a
+        # step without a stamp of its own falls back to the workflow's.
+        "workflow": {
+            "request_id": "wf-own",
+            "status": "SUCCEEDED",
+            "created_at": "2026-09-07T09:59:59Z",
+            "step_executions": [
+                {
+                    "operation": "MARK_UNSCHEDULABLE",
+                    "status": "SUCCEEDED",
+                    "started_at": "2026-09-07T10:00:01Z",
+                },
+                {"operation": "RESET_GPU", "status": "SUCCEEDED"},
+            ],
+        },
+        "commands": [
+            {
+                "command_id": "cmd-unstamped",
+                "workflow_request_id": "wf-own",
+                "status": "SUCCEEDED",
+                "step": {"operation": "RESTORE_SCHEDULING"},
+            }
+        ],
+    }
+    assert base.succeeded_operations(document, since=since) == {
+        "MARK_UNSCHEDULABLE": {"wf-own"},
+        "RESTORE_SCHEDULING": {"wf-own"},
+    }
+    assert set(base.succeeded_operations(document)) == {
+        "MARK_UNSCHEDULABLE",
+        "RESET_GPU",
+        "RESTART_WORKLOAD",
+        "RESTORE_SCHEDULING",
+        "STOP_WORKLOADS",
+    }, "without since every SUCCEEDED record counts, as before"
+
+
+def test_blast001_does_not_take_a_store_snapshot_for_a_producers_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An in-window producer's preflight may hold the store's latest workflow
+    on its node -- an earlier case's, here from before the baseline (live: one
+    from the previous release). It is not that producer's proof, so the only
+    MARK_UNSCHEDULABLE left is missing and the audit refuses."""
+
+    runner = _runner(tmp_path, case_id="GF-REGIONAL-BLAST-001", cls=BlastCasesOne)
+    nodes = {"items": [_node("cpu-1", [])]}
+    _e2e001_handoff(runner.e2e_dir, nodes)
+    case_dir = runner.root_run_dir / "cases" / "GF-REGIONAL-DESTR-010"
+    case_dir.mkdir(parents=True)
+    base.write_json(
+        case_dir / "GF-REGIONAL-DESTR-010.json",
+        {
+            "case_id": "GF-REGIONAL-DESTR-010",
+            "verdict": "PASS",
+            "release_id": "release-1",
+            "cluster_id": "cluster-a",
+            "errors": [],
+            "started_at": "2026-09-07T10:30:00+00:00",
+        },
+    )
+    base.write_json(
+        case_dir / "preflight.json",
+        {
+            "store": {
+                "workflow": {
+                    "request_id": "earlier-workflow",
+                    "status": "SUCCEEDED",
+                    "created_at": "2026-09-07T09:00:00Z",
+                    "step_executions": [
+                        {
+                            "operation": "MARK_UNSCHEDULABLE",
+                            "status": "SUCCEEDED",
+                            "started_at": "2026-09-07T09:00:05Z",
+                        }
+                    ],
+                }
+            }
+        },
+    )
+    base.write_json(
+        case_dir / "workflow-state.json",
+        {
+            "workflow": {
+                "request_id": "own-workflow",
+                "status": "SUCCEEDED",
+                "created_at": "2026-09-07T10:35:00Z",
+                "step_executions": [
+                    {
+                        "operation": "RESET_ALL_GPUS_NVSWITCHES",
+                        "status": "SUCCEEDED",
+                        "started_at": "2026-09-07T10:35:05Z",
+                    }
+                ],
+            }
+        },
+    )
+    runner.cpu_json = lambda *args: nodes if "nodes" in args else {"items": []}
+    with pytest.raises(
+        base.CheckError,
+        match=(
+            "inside the audited window proves MARK_UNSCHEDULABLE on release "
+            r"release-1;.*before the baseline: none\)"
+        ),
+    ):
+        runner.blast_001()
+    producers = base.release_bound_producers(
+        runner.root_run_dir, release_id="release-1", cluster_ids={"cluster-a"}
+    )
+    assert producers["GF-REGIONAL-DESTR-010"]["operations"] == {
+        "RESET_ALL_GPUS_NVSWITCHES": ["own-workflow"]
+    }
+
+
 # -- mixed-provider site: a plain EKS cluster has no HyperPod to describe ----------
 
 EKS_ARN = "arn:aws:eks:us-west-2:000000000000:cluster/gpu-eks"
