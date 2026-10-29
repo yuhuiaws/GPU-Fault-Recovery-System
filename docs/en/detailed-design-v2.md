@@ -1746,10 +1746,12 @@ keeps the same-action aggregation optimization, and does not let a new event's a
 
 **④ Thread/coroutine model**: 1 scan thread + 2 wakeup listener threads +
 `GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS=8` execution threads, each scan taking a batch of
-`GPU_FAULT_WORKFLOW_BATCH_SIZE` rows: unset, max(100, Region budget + 50), at most 400 (100 under the default budget of 20), so
-the oldest-rows selection never caps the Region budget, and a tick -- about 1 s + 0.15 s per workflow over the workers, 8.5 s at
-400 on 8 -- stays under the 15-s dispatch lease; startup refuses a Region budget above the batch and warns when a tick cannot
-finish inside the lease. Every control-worker process starts a dispatcher (6 replicas × 4 processes by default),
+`GPU_FAULT_WORKFLOW_BATCH_SIZE` rows: unset, the rows the execution threads work in half the dispatch lease -- a tick takes about
+1 s + 0.15 s per workflow over the workers (8.5 s at 400 on 8, batch 88's measured model), so (lease x 0.5 - 1 s) x workers /
+0.15 s, within 100..400 (346 for the shipped 8 workers and 15-s lease); the other half of the lease is margin for a slow Store
+and the model's error. No remediation limit enters the batch: no fixed number caps how many remediations run at once, each GPU
+cluster's remediation storm breaker bounds a correlated fault (§9.5). An explicit batch is kept, and startup warns when a tick
+cannot finish inside the lease. Every control-worker process starts a dispatcher (6 replicas × 4 processes by default),
 but only one process dispatches at a time: each `run_once` first takes the fleet-wide periodic lease `workflow-dispatch`
 (`GPU_FAULT_WORKFLOW_DISPATCH_LEASE_SECONDS`, default `max(15, 3 × poll interval)` = 15 seconds, renewed by its holder every tick;
 the lease owner is the per-process executor id) and returns `lease_held_by_other` without scanning when another process holds it (F-A1). The
@@ -1815,8 +1817,9 @@ Cancellation: the `remote_command_id` in every covered step's WAITING record is 
 compound command fails the whole command, a LEASED one gets `cancellation_requested_at`, and the executor checks the
 lease guard between steps and stops before the next step (see §3.9 ⑧).
 Multi-node actions have a barrier; fleet-level actions advance by wave.
-Region, cluster, node, failure domain and resource class all now have persistent
-remediation budget claims; the claim and the workflow lease are acquired in the same transaction. Per executor
+Nodes, job tokens and NVSwitch fabric partitions all now have persistent remediation budget claims, and every GPU cluster has
+a remediation storm breaker; claim, breaker judgement and workflow lease share one transaction (the fixed Region, cluster and
+resource class limits are retired, §9.5). Per executor
 `GPU_FAULT_CLUSTER_EXECUTOR_MAX_CONCURRENT_COMMANDS=5`,
 multi-node barrier, fleet wave and restart budget (§9.5, §11).
 
@@ -4148,7 +4151,7 @@ sequenceDiagram
     D->>Ex: MARK_UNSCHEDULABLE node by node (advancing by wave)
     D->>Ex: RESET_ALL_GPUS_NVSWITCHES (higher on the ladder than single-card RESET_GPU)
     D->>Ex: VALIDATE_FABRIC
-    Note over D,Ex: Region/cluster/node/failure-domain/resource-class budget<br/>claimed in the same transaction as the workflow lease; restore compensation is not blocked by budget, but cannot bypass unconfirmed physical actions
+    Note over D,Ex: node/job/fabric-partition budget and the remediation storm breaker<br/>judged in the same transaction as the workflow lease; restore compensation is not blocked by budget, but cannot bypass unconfirmed physical actions
 ```
 
 Figure 7-8 An interconnect fault widens scope by `FABRIC_PARTITION`, pacing with barrier and wave rather than a concurrency cap
@@ -4847,9 +4850,12 @@ The four hard rules of `RESTORE_SCHEDULING`:
 ### 9.5 Concurrency and Blast Radius
 
 The implementation uses a persistent remediation budget claim, taken in the same transaction as the workflow lease. Until the
-workflow's budgeted steps (node/workload changes) begin, every claim asks for the Region, cluster, node, failure domain and
-resource class scopes of its budgeted steps still to run; if any scope is full, the workflow stays retryable (with the refusing
-scope recorded) and does not call the adapter.
+workflow's budgeted steps (node/workload changes) begin, every claim asks for the node scopes of its budgeted steps still to
+run, the job tokens of the steps among them that stop or restart a job, and the failure-domain scope of a step's fabric
+partition; if any scope is full, the workflow stays retryable (with the refusing scope recorded) and does not call the adapter.
+There is no Region, cluster or resource class scope: no fixed number decides how many workflows a cluster or the region repairs
+at once, the remediation storm breaker below bounds a correlated fault. The fixed limits it replaced (Region 20, 5 per cluster,
+2 per resource class) drained a whole-cluster correlated fault five nodes at a time and queued unrelated jobs behind each other.
 
 Failure domains are workloads, and they are not a budget slot: merging and the per-node exclusion deliver them. One training
 job is one workflow: the faults of one job attempt merge into it by `[cluster, job_id, attempt_id]`, and its nodes and GPUs are
@@ -4957,8 +4963,9 @@ stays `BLOCKED` for the operator. The bound assumes the shipped executor cap: a 
 `GPU_FAULT_CLUSTER_EXECUTOR_MAX_EXECUTION_SECONDS` runs commands longer than the control plane can see.
 PostgreSQL applies the rule in two parts: it counts the `RUNNING` holders of the requested scopes in SQL and decodes only the
 node-occupying `BLOCKED` rows and the preemption handoffs the rule has to judge. Decoding every holder for every admission made
-a burst of N admissions N²/2 decodes under the Region scope's lock (measured: 18.8 s for 350 admissions in one tick, over the
-dispatch lease; 6.8 s counted in SQL).
+a burst of N admissions N²/2 decodes under the lock of the Region scope every admission then claimed (measured: 18.8 s for 350
+admissions in one tick, over the dispatch lease; 6.8 s counted in SQL). Since the Region scope's retirement, unrelated admissions
+share no lock at all.
 
 Preemption handoff: when a predecessor gives way to a stronger successor at a step boundary and becomes `SUPERSEDED`, its claim
 is reserved for that successor until the successor claims or ends -- no other workflow takes the slot, the successor is not refused
@@ -4966,7 +4973,8 @@ for it (its own reservation is left out of its count), and exactly one hold exis
 inherited is not its own work; it is admitted for its budgeted steps still to run.
 
 Starvation guard: a refused workflow stays `PENDING` among the oldest `GPU_FAULT_WORKFLOW_BATCH_SIZE` rows the dispatcher selects
-each tick (unset: max(100, Region budget + 50), at most 400). The dispatcher reads one occupancy aggregate per tick and passes
+each tick (unset: the rows the execution threads work in half the dispatch lease, within 100..400, 346 as shipped, see §3.7 ④).
+The dispatcher reads one occupancy aggregate per tick and passes
 over `PENDING` / `SAFETY_PENDING` rows whose recorded refusing scope is still full
 (`gpu_fault_workflow_dispatch_filtered_total{reason="remediation_budget"}`); once the scope has room its waiters are candidates
 again in their queue order -- the guard only skips and never reorders, so FIFO within a scope is unchanged. A row never refused
@@ -4975,8 +4983,9 @@ read once and cached), passes it over when one of them is full and records that 
 compare-and-set write; at most 1000 incident reads and writes a tick, a row past that is left to the store), so a storm of N fresh
 rows no longer takes about N / batch size ticks of the selection before another cluster's first try, and the waiting gauges count
 every waiter. There is no quota of free slots: the first waiter may still not claim (a fleet-rollout fence holds it, for one),
-and a quota spent on it would starve the waiters behind it. A fault storm in one cluster therefore cannot starve the others.
-`RUNNING` rows are never passed over.
+and a quota spent on it would starve the waiters behind it. A cluster whose breaker is open is handled alike: rows recorded on
+`storm:<cluster>` are passed over while it is open, and that cluster's never-refused rows are recorded on that scope. A fault
+storm in one cluster therefore cannot starve the others. `RUNNING` rows are never passed over.
 
 Hold time and long waits: a claim is held until the workflow ends, so the long waits of one remediation -- the node coming
 back after a reboot, a replacement, validation telemetry, a workload restart -- keep the slot the whole time. The bound is the
@@ -4989,6 +4998,14 @@ its slot until the acknowledgement or that floor; the `CHECK_MECHANICALS` workfl
 [`COLLECT_DIAGNOSTIC_BUNDLE`] -> `CHECK_MECHANICALS`) do not cordon, stop workloads or contain a budgeted step, claim no budget,
 and the wait for an operator's acknowledgement occupies no slot; a reset/reboot disposition submitted afterwards is a separate
 workflow admitted as usual.
+
+The upgrade window of the retired fixed limits: `RUNNING` rows an older release admitted still list `region`,
+`cluster:<cluster>` and `class:<cluster>:<resource class>`. No claim of this release asks for those kinds and `scope_limit` does
+not know them, so they block no admission and are never over a limit; they leave the count when their rows end (until then
+`gpu_fault_remediation_budget_active_claims{scope_type}` counts them by type), and such a row this release dispatches claims as a
+hold as usual. A `PENDING` row an older release refused on one of them carries a scope the dispatcher's guard does not know, so it
+simply claims again. The work those limits held back is therefore released at once by the upgrade -- the point of retiring them
+-- which also means that a correlated fault queued at the moment of the upgrade meets the breaker's judgement all at once.
 
 Over-limit scopes and the upgrade window: a hold is never refused, so a scope can hold more than its limit. Workflows an older
 release left `RUNNING` without their claims (it dropped them after the first budgeted step) re-take them as holds when this
@@ -5004,17 +5021,18 @@ dispatch by this release (a parked `BLOCKED` one never claims again); the excess
 bounded by their deadlines. A record the receipt-settled sweep re-opens holds nothing until it claims its compensation, so one
 other workflow admitted in that window shows the scope one over for as long as the compensation runs.
 
-Observability: occupancy against the limits is `gpu_fault_remediation_budget_active_claims{scope_type}` (region, cluster, node,
-domain, class, counted by the admission rule), `gpu_fault_remediation_budget_cluster_active_claims{cluster_id}` against
-`gpu_fault_remediation_budget_cluster_limit`, and `active_claims{scope_type="region"}` against
-`gpu_fault_remediation_budget_region_limit`; waiting is `gpu_fault_remediation_budget_waiting_workflows` (by refusing scope type in
-`_by_scope`, per cluster in `gpu_fault_remediation_budget_cluster_waiting_workflows{cluster_id}`), the rows the starvation guard
-passes over each tick in `gpu_fault_workflow_dispatch_filtered_total{reason="remediation_budget"}`, and the oldest waiter's age
-in `gpu_fault_workflow_pending_age_seconds_max`. The alerts `GpuFaultRemediationBudgetClusterSaturated` (a cluster at its limit
-with waiters for 30 minutes), `GpuFaultRemediationBudgetStarved` (waiters for 30 minutes) and `GpuFaultWorkflowPendingAge` (the
-oldest `PENDING` workflow older than 30 minutes) fire as expected during a large correlated fault; the handling is in the matching
-entries of administrator operations §8: confirm the holders still progress, estimate the drain time from the drain rate, and do
-not raise a limit to clear an alert. A waiting count cannot say how long one workflow has waited: the refusal that begins a wait
+Observability: occupancy is `gpu_fault_remediation_budget_active_claims{scope_type}` (node, job, domain, counted by the
+admission rule; an older release's rows add region, cluster and class by type until they end); waiting is
+`gpu_fault_remediation_budget_waiting_workflows` (by refusing scope type in `_by_scope`, `storm` for the breaker's), the rows the
+starvation guard passes over each tick in `gpu_fault_workflow_dispatch_filtered_total{reason="remediation_budget"}`, and the oldest
+waiter's age in `gpu_fault_workflow_pending_age_seconds_max`. No family is per cluster and none is a limit: there is no fixed
+number left to compare with; which cluster a correlated fault hits, and how close it came to holding, is the breaker's families
+below. `gpu_fault_remediation_budget_cluster_active_claims`, `..._cluster_limit`, `..._region_limit`,
+`..._cluster_waiting_workflows` and the alert `GpuFaultRemediationBudgetClusterSaturated` (a cluster at its limit with waiters for
+30 minutes) went with the per-cluster limit. The alerts `GpuFaultRemediationBudgetStarved` (waiters for 30 minutes) and
+`GpuFaultWorkflowPendingAge` (the oldest `PENDING` workflow older than 30 minutes) stay; the handling is in the matching entries
+of administrator operations §8: confirm the holders still progress, and do not raise a limit to clear an alert. A waiting count
+cannot say how long one workflow has waited: the refusal that begins a wait
 (the row was not waiting -- admitted since, or never refused) makes `blocked_by_remediation_budget` append one `HOLD` /
 `REMEDIATION_BUDGET_WAIT` event to the row, later refusals append none, and an admission ends the wait;
 `gpu_fault_remediation_budget_longest_wait_seconds{scope_type}` is the longest current wait (by the type of the scope that last
@@ -5022,8 +5040,7 @@ refused it; a row an older release refused carries no such event and counts from
 `GpuFaultRemediationBudgetLongWait` (warning) fires when a wait on a node, job or domain scope passes 3600 s for 5 minutes:
 those slots belong to one node, one job (the token a step that stops or restarts it takes) or one fabric partition, so another
 workflow of the same node or job holds it and has not ended within an hour -- past a progressing holder's own deadline (1800 s for a node
-workflow, 3600 s for a job workflow); cluster, region and class waits drain by design during a correlated fault and are not
-read. The storm breaker is `gpu_fault_remediation_budget_storm_breaker_open{cluster_id}` (1 while open), `..._window_nodes`
+workflow, 3600 s for a job workflow); a wait the storm breaker holds is `GpuFaultRemediationStormBreakerOpen`'s and is not read. The storm breaker is `gpu_fault_remediation_budget_storm_breaker_open{cluster_id}` (1 while open), `..._window_nodes`
 against `..._threshold_nodes`, `..._tripped_timestamp_seconds` and `..._held_workflows`; `GpuFaultRemediationStormBreakerOpen`
 (critical, 1 minute) fires for as long as it is open.
 
@@ -5033,16 +5050,16 @@ are in repair workflows at the same time, nor does it change the executor's acti
 
 | Mechanism | Parameter | What it constrains |
 |---|---|---|
-| Region remediation budget | `GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION=20` | Concurrently active remediation workflows in the region |
-| Per-cluster remediation budget | `GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER=5` | Active remediation workflows in a single GPU cluster |
-| Node / failure domain / resource class budget | `...PER_NODE=1`, `...PER_FAILURE_DOMAIN=1`, `...PER_RESOURCE_CLASS=2` | Prevents excessive simultaneous changes to the same node, the same NVSwitch fabric partition or the same physical resource class; a job or a node without a job is one merged workflow, workflows are kept apart per node, and steps that stop or restart a job also per job token (`job:`, limit 1) |
+| Node / failure domain budget | `GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE=1`, `...PER_FAILURE_DOMAIN=1` (safety constants) | A job or a node without a job is one merged workflow, repaired in parallel inside; workflows are kept apart per node, steps that stop or restart a job also per job token (`job:`, limit 1), and one NVSwitch fabric partition has one workflow at a time |
+| Remediation storm breaker | Product constants: 600-s window, max(3, ceil(20% x the cluster's GPU nodes)) nodes, >= 2 workload domains (no environment variable) | A correlated fault in one GPU cluster: tripped, it holds the cluster's new destructive remediation (work in flight goes on) until an operator runs `remediation-storm release` / `abort`; replaces the retired Region (20), per-cluster (5) and per-resource-class (2) limits |
 | In-flight commands per executor | `GPU_FAULT_CLUSTER_EXECUTOR_MAX_CONCURRENT_COMMANDS=5` | Command concurrency of a single data-plane process, sitting behind the persistent budget |
 | Multi-node barrier | `barrier` object | Fabric-class faults require all targets to be in place before advancing to destructive steps |
 | Batch waves | `POST /v1/fleet/deployments/{id}/next-wave` | Node-side upgrades/changes advance wave by wave; a human releases the next wave |
 | Restart budget | Step parameter `restart_budget`, state `RestartBudgetState(budget, restart_count, reservation_ids)`, **counted per job** | Total number of restarts of the same training job; on exhaustion a `BUDGET_EXHAUSTED` notification is sent and only `RESTART_WORKLOAD` is withheld, the remaining node repair continues, and the workflow finishes as `FAILED` (§3.7) |
 | Queue admission | `GPU_FAULT_PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH=4096` / `GPU_FAULT_PROCESSOR_FAULT_RESERVED_CLUSTER_DEPTH=512` (bare defaults 1000 / 400) | How many requests a single cluster can have queued at once (this is backpressure, not remediation concurrency) |
 
-The budget controls the total; barrier + wave continue to control fabric coordination and release waves; the two have different responsibilities.
+The budget keeps workflows apart and the breaker bounds a correlated fault; barrier + wave continue to control fabric
+coordination and release waves; the three have different responsibilities.
 
 The three checks of `RestartBudgetState` deserve a separate note: `restart_count` must equal
 `len(reservation_ids)`, must not exceed `budget`, and `reservation_ids` must be unique. This makes the budget deduction
@@ -5050,7 +5067,8 @@ itself idempotent: reserving the same `reservation_id` again does not deduct mor
 
 ### 9.6 Circuit Breaking
 
-There is no standalone circuit-breaker component; circuit-breaking behavior is distributed across four places:
+The remediation storm breaker (§9.5) is the one standalone circuit-breaker component: it holds, per cluster, the new
+destructive remediation of a correlated fault. The other circuit-breaking behavior is distributed across four places:
 
 1. **Escalation ladder reaching the top**: after a repair failure escalates to `ESCALATE_SUPPORT`, no further automatic attempts are made; the incident moves to
    `ESCALATED` and keeps the existing isolation. `CHECK_MECHANICALS` is a separate manual-confirmation workflow;

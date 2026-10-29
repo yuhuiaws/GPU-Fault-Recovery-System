@@ -18,6 +18,18 @@ LOGGER = logging.getLogger(__name__)
 PREFIX = "GPU_FAULT_"
 POLICY_ENV = "GPU_FAULT_UNKNOWN_ENV_POLICY"
 TRAINING_HEALTH_MONITOR_ENV = "GPU_FAULT_ENABLE_TRAINING_HEALTH_MONITOR"
+# Variables a release retired, and what replaced each. A role ConfigMap an
+# older release rendered, the one a rollback restores, or a site override may
+# still set them, and an unknown name refuses to start by default -- so they
+# stay known (``scripts/generate-env-reference.py`` lists them as retired),
+# no reader reads them, and a process that receives one names it once at
+# start-up.
+_STORM_BREAKER = "each GPU cluster's remediation storm breaker (design 9.5)"
+RETIRED_ENVIRONMENT = {
+    "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION": _STORM_BREAKER,
+    "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER": _STORM_BREAKER,
+    "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS": _STORM_BREAKER,
+}
 
 
 def training_health_monitor_enabled(
@@ -197,6 +209,21 @@ def validate_gpu_fault_environment(
     environment = os.environ if values is None else values
     _validate_names(environment, process_name=process_name)
     _validate_values(environment, process_name=process_name)
+    _report_retired(environment, process_name=process_name)
+
+
+def _report_retired(environment: Mapping[str, str], *, process_name: str) -> None:
+    """Name the retired variables a process received; never refuse them."""
+
+    retired = sorted(name for name in environment if name in RETIRED_ENVIRONMENT)
+    if retired:
+        LOGGER.warning(
+            "%s received retired GPU_FAULT_* environment variable(s), ignored: %s",
+            process_name,
+            "; ".join(
+                f"{name} (replaced by {RETIRED_ENVIRONMENT[name]})" for name in retired
+            ),
+        )
 
 
 def _validate_values(

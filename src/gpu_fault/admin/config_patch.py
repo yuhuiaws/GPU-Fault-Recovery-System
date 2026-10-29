@@ -60,11 +60,7 @@ def preset_admin_config(name: str) -> AdminConfig:
     capacity = CapacityConfig(
         control_worker_replicas=DEFAULT_CONTROL_WORKER_REPLICAS,
         telemetry_spool=spool,
-        remediation=RemediationCapacity(
-            max_active_region=clusters * 4,
-            max_active_per_cluster=4,
-            max_active_per_resource_class=4,
-        ),
+        remediation=RemediationCapacity(),
         largest_cluster_node_count=PRESET_NODES_PER_CLUSTER,
         managed_node_count=managed_nodes,
     )
@@ -126,7 +122,9 @@ def apply_patch(base: AdminConfig, value: object, *, path: str = "spec") -> Admi
         preset = preset_admin_config(raw_preset)
         base = replace(
             base,
-            capacity=preset.capacity,
+            # The retired remediation values a record still carries are a
+            # fact of that record, not part of any topology.
+            capacity=replace(preset.capacity, remediation=base.capacity.remediation),
             aurora=_preset_aurora(base.aurora, preset),
         )
         data = {

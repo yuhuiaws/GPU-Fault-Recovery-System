@@ -117,17 +117,32 @@ for workflow in store.list_workflows(limit=500):
     for scope in workflow.remediation_budget_claims:
         if scope in active:
             active[scope] += 1
+# The cluster's remediation storm breaker, on a release that has one: open, it
+# holds the case's first destructive admission until an operator releases it.
+read_breaker = getattr(store, "get_remediation_storm_breaker", None)
+breaker = read_breaker(cluster_id) if read_breaker is not None else None
 print(json.dumps({
     "readable": True,
     "scopes": {
         scope: {"limit": limit, "active": active[scope]} for scope, limit in limits.items()
     },
+    "storm_breaker": None if breaker is None else {
+        "open": breaker.open,
+        "state": str(breaker.state),
+        "trip_id": breaker.trip_id,
+    },
+    # The deployed release's limits, whichever it has: the region, cluster
+    # and resource-class limits were retired for the storm breaker.
     "policy": {
-        "region_limit": policy.region_limit,
-        "cluster_limit": policy.cluster_limit,
-        "node_limit": policy.node_limit,
-        "failure_domain_limit": policy.failure_domain_limit,
-        "resource_class_limit": policy.resource_class_limit,
+        name: getattr(policy, name)
+        for name in (
+            "region_limit",
+            "cluster_limit",
+            "node_limit",
+            "failure_domain_limit",
+            "resource_class_limit",
+        )
+        if hasattr(policy, name)
     },
 }, sort_keys=True))
 """

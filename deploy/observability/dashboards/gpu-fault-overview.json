@@ -896,7 +896,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "",
+      "description": "Distinct GPU nodes that entered destructive remediation in each cluster's 600-s window (frozen at the trip while open), against the max(3, ceil(20% of its GPU nodes)) it trips at; no fixed number caps a cluster's remediations.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -948,9 +948,9 @@
             "type": "prometheus",
             "uid": "gpu-fault-amp"
           },
-          "expr": "max by (cluster_id) (gpu_fault_remediation_budget_cluster_active_claims{cluster_id=~\"$cluster_id\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "expr": "max by (cluster_id) (gpu_fault_remediation_budget_storm_breaker_window_nodes{cluster_id=~\"$cluster_id\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
           "instant": false,
-          "legendFormat": "{{cluster_id}}",
+          "legendFormat": "{{cluster_id}} nodes",
           "range": true,
           "refId": "A"
         },
@@ -959,14 +959,14 @@
             "type": "prometheus",
             "uid": "gpu-fault-amp"
           },
-          "expr": "max(gpu_fault_remediation_budget_cluster_limit{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "expr": "max by (cluster_id) (gpu_fault_remediation_budget_storm_breaker_threshold_nodes{cluster_id=~\"$cluster_id\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
           "instant": false,
-          "legendFormat": "limit",
+          "legendFormat": "{{cluster_id}} threshold",
           "range": true,
           "refId": "B"
         }
       ],
-      "title": "Remediation budget: active claims vs limit",
+      "title": "Remediation storm breaker: nodes entering remediation vs threshold",
       "type": "timeseries"
     },
     {
@@ -974,7 +974,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "",
+      "description": "1 while a cluster's storm breaker holds its new destructive remediation, and the workflows it holds.\n\nAlert GpuFaultRemediationStormBreakerOpen (critical, for 1m): docs/en/administrator-operations.md#gpufaultremediationstormbreakeropen",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1026,14 +1026,25 @@
             "type": "prometheus",
             "uid": "gpu-fault-amp"
           },
-          "expr": "max by (cluster_id) (gpu_fault_remediation_budget_cluster_waiting_workflows{cluster_id=~\"$cluster_id\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "expr": "max by (cluster_id) (gpu_fault_remediation_budget_storm_breaker_open{cluster_id=~\"$cluster_id\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
           "instant": false,
-          "legendFormat": "{{cluster_id}}",
+          "legendFormat": "{{cluster_id}} open",
           "range": true,
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "max by (cluster_id) (gpu_fault_remediation_budget_storm_breaker_held_workflows{cluster_id=~\"$cluster_id\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "{{cluster_id}} held",
+          "range": true,
+          "refId": "B"
         }
       ],
-      "title": "Workflows waiting for cluster budget",
+      "title": "Remediation storm breaker",
       "type": "timeseries"
     },
     {

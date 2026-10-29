@@ -6,6 +6,10 @@
 * A fresh storm: rows never refused had no recorded scope, so each was tried
   once -- 95 a tick at batch size 100 -- and another cluster waited about
   N / 95 ticks (six for N = 500) before its first try.
+
+Batch 89 filled a per-cluster limit (5, since retired for the storm breaker);
+these cases fill the slot every workflow of theirs shares instead -- their
+node's -- which the guard and the store treat exactly alike.
 * An upgrade window: workflows an older release left RUNNING without their
   claims re-take them as holds, never refused, so a scope can sit above its
   limit; an older dispatcher still alternating with this one during the roll
@@ -18,8 +22,6 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-
-import pytest
 
 from gpu_fault.execution.remediation_budget import RemediationBudgetPolicy
 from gpu_fault.models import WorkflowStatus
@@ -34,19 +36,20 @@ from tests.execution._budget_hold_support import (
     all_workflows,
     budget_dispatcher,
     holders,
-    large_fleet,
-    seed,
 )
-
-# These cases load the fixed budget limits of one cluster, not its breaker.
-pytestmark = pytest.mark.usefixtures(large_fleet.__name__)
+from tests.execution._budget_hold_support import seed as _seed
 
 NOW = datetime(2026, 7, 20, 10, 0, tzinfo=timezone.utc)
-CLUSTER = "cluster:cluster-a"
-ONE_PER_CLUSTER = RemediationBudgetPolicy(region_limit=20, cluster_limit=1)
-# The class limit sits above the cluster limit so the cluster scope is the one
-# that fills.
-FIVE_PER_CLUSTER = RemediationBudgetPolicy(cluster_limit=5, resource_class_limit=10)
+NODE = "node-shared"
+SCOPE = f"node:cluster-a:{NODE}"
+POLICY = RemediationBudgetPolicy()
+
+
+def seed(store, suffix: str, **values):
+    """Every workflow of these cases on one node: its slot serializes them
+    (one node never reaches the storm breaker's three)."""
+
+    return _seed(store, suffix, node_id=NODE, **values)
 
 
 class _WiringBugOnReboot(ScriptedAdapter):
@@ -70,7 +73,7 @@ def test_an_internal_error_after_a_budgeted_step_keeps_the_hold_through_the_back
     a = seed(store, "a", created_at=NOW)
     b = seed(store, "b", created_at=NOW + timedelta(seconds=1))
     adapter = _WiringBugOnReboot()
-    dispatcher = budget_dispatcher(store, adapter, ONE_PER_CLUSTER, max_workers=1)
+    dispatcher = budget_dispatcher(store, adapter, POLICY, max_workers=1)
 
     report = dispatcher.run_once()
 
@@ -81,7 +84,7 @@ def test_an_internal_error_after_a_budgeted_step_keeps_the_hold_through_the_back
     assert released.status is WorkflowStatus.RUNNING, (
         "a row that began its budgeted work went back to PENDING and dropped its hold"
     )
-    assert store.remediation_budget_occupancy().get(CLUSTER) == 1
+    assert store.remediation_budget_occupancy().get(SCOPE) == 1
 
     dispatcher.run_once()
     assert store.get_workflow(b.request_id).status is WorkflowStatus.PENDING
@@ -105,14 +108,14 @@ def test_an_internal_error_before_any_budgeted_work_still_hands_the_row_back():
     store = build_store()
     a = seed(store, "a", created_at=NOW, operations=(REBOOT,))
     adapter = _WiringBugOnReboot()
-    dispatcher = budget_dispatcher(store, adapter, ONE_PER_CLUSTER, max_workers=1)
+    dispatcher = budget_dispatcher(store, adapter, POLICY, max_workers=1)
 
     assert dispatcher.run_once().internal_errors == 1
 
     released = store.get_workflow(a.request_id)
     assert released.status is WorkflowStatus.PENDING
     assert released.step_executions == [] and released.not_before is not None
-    assert store.remediation_budget_occupancy().get(CLUSTER, 0) == 0
+    assert store.remediation_budget_occupancy().get(SCOPE, 0) == 0
 
 
 def _storm(store, size: int) -> list[str]:
@@ -125,10 +128,11 @@ def _storm(store, size: int) -> list[str]:
 
 
 def test_a_fresh_storm_does_not_hold_another_cluster_for_n_over_the_batch_ticks():
-    """500 rows of cluster-a (limit 5) arrive at once, then one of cluster-b.
+    """500 rows waiting on one slot of cluster-a arrive at once, then one of
+    cluster-b.
 
-    The first tick admits five and the store records 95 refusals. From the
-    second the tick's occupancy shows cluster-a full, so the guard works out
+    The first tick admits one and the store records 99 refusals. From the
+    second the tick's occupancy shows the slot full, so the guard works out
     the scopes of the rows never refused and passes them over as well,
     recording the refusing scope on each the way the store does: cluster-b
     starts on tick 2 (it took six), and every waiter is counted.
@@ -140,7 +144,7 @@ def test_a_fresh_storm_does_not_hold_another_cluster_for_n_over_the_batch_ticks(
         store, "late", cluster_id="cluster-b", created_at=NOW + timedelta(hours=1)
     )
     adapter = ScriptedAdapter(REBOOT_PLAN)
-    dispatcher = budget_dispatcher(store, adapter, FIVE_PER_CLUSTER)
+    dispatcher = budget_dispatcher(store, adapter, POLICY)
 
     dispatcher.run_once()
     report = dispatcher.run_once()
@@ -153,11 +157,11 @@ def test_a_fresh_storm_does_not_hold_another_cluster_for_n_over_the_batch_ticks(
         for workflow in all_workflows(store)
         if workflow.request_id in storm and workflow.status is WorkflowStatus.PENDING
     ]
-    assert len(waiting) == 495
-    assert {item.remediation_budget_last_blocked_scope for item in waiting} == {CLUSTER}
+    assert len(waiting) == 499
+    assert {item.remediation_budget_last_blocked_scope for item in waiting} == {SCOPE}
     assert {item.remediation_budget_wait_count for item in waiting} == {1}
     assert sum(1 for item in waiting if item.request_id in adapter.started()) == 0
-    assert len(holders(all_workflows(store), CLUSTER)) == 5
+    assert len(holders(all_workflows(store), SCOPE)) == 1
 
     dispatcher.run_once()
     assert {
@@ -197,31 +201,31 @@ def _over_limit_warnings(caplog) -> list[str]:
 
 def test_holds_re_taken_over_the_limit_are_reported_and_drain_before_new_work(caplog):
     store = build_store()
-    legacy = _legacy_running(store, 7)
+    legacy = _legacy_running(store, 3)
     waiter = seed(store, "waiter", created_at=NOW + timedelta(minutes=1))
     other = seed(
         store, "other", cluster_id="cluster-b", created_at=NOW + timedelta(minutes=2)
     )
     adapter = ScriptedAdapter(REBOOT_PLAN)
-    dispatcher = budget_dispatcher(store, adapter, FIVE_PER_CLUSTER, max_workers=1)
+    dispatcher = budget_dispatcher(store, adapter, POLICY, max_workers=1)
 
-    dispatcher.run_once()  # the seven re-take their holds, never refused
-    assert len(holders(all_workflows(store), CLUSTER)) == 7
+    dispatcher.run_once()  # the three re-take their holds, never refused
+    assert len(holders(all_workflows(store), SCOPE)) == 3
     assert store.get_workflow(other.request_id).status is WorkflowStatus.RUNNING
     with caplog.at_level(logging.INFO, logger="gpu_fault.execution.budget_guard"):
         dispatcher.run_once()
         dispatcher.run_once()
 
     watch = dispatcher.budget_watch
-    assert watch.over_limit == {CLUSTER: (7, 5)}
-    assert watch.over_limit_by_scope_type() == {"cluster": 1}
+    assert watch.over_limit == {SCOPE: (3, 1)}
+    assert watch.over_limit_by_scope_type() == {"node": 1}
     assert watch.over_limit_last_seen_timestamp_seconds > 0
     warnings = _over_limit_warnings(caplog)
     assert len(warnings) == 1, "one warning per change, not one per tick"
-    assert "cluster:cluster-a" in warnings[0] and "holders=7 limit=5" in warnings[0]
+    assert SCOPE in warnings[0] and "holders=3 limit=1" in warnings[0]
     assert store.get_workflow(waiter.request_id).status is WorkflowStatus.PENDING
 
-    # Two reboots end: five holders, at the limit -- no longer over it, still full.
+    # Two reboots end: one holder, at the limit -- no longer over it, still full.
     adapter.released.update(legacy[:2])
     dispatcher.run_once()
     dispatcher.run_once()
@@ -252,8 +256,8 @@ def _old_dispatcher_tick(store, admitted: list[str]) -> None:
             copy_model(
                 store.get_workflow(request_id),
                 status=WorkflowStatus.RUNNING,
-                remediation_budget_claims=[CLUSTER, "region"],
-                remediation_budget_limits={CLUSTER: 5, "region": 20},
+                remediation_budget_claims=[SCOPE],
+                remediation_budget_limits={SCOPE: 1},
                 remediation_budget_last_blocked_reason=None,
                 remediation_budget_last_blocked_scope=None,
             )
@@ -274,7 +278,7 @@ def test_an_older_dispatcher_in_the_roll_window_cannot_make_this_one_admit():
         for index in range(1, 5)
     ]
     adapter = ScriptedAdapter(REBOOT_PLAN)
-    dispatcher = budget_dispatcher(store, adapter, FIVE_PER_CLUSTER, max_workers=1)
+    dispatcher = budget_dispatcher(store, adapter, POLICY, max_workers=1)
 
     for old_admits in (queued[:2], []):
         dispatcher.run_once()
@@ -282,7 +286,7 @@ def test_an_older_dispatcher_in_the_roll_window_cannot_make_this_one_admit():
     dispatcher.run_once()
     dispatcher.run_once()
 
-    assert dispatcher.budget_watch.over_limit == {CLUSTER: (7, 5)}
+    assert dispatcher.budget_watch.over_limit == {SCOPE: (7, 1)}
     for request_id in queued[2:]:
         assert store.get_workflow(request_id).status is WorkflowStatus.PENDING
         assert request_id not in adapter.started(), adapter.calls
@@ -290,14 +294,14 @@ def test_an_older_dispatcher_in_the_roll_window_cannot_make_this_one_admit():
 
 def test_the_dispatcher_releases_a_lapsed_parked_hold_in_the_tick_that_admits():
     """A parked record whose reboot can no longer be running stops holding the
-    cluster's only slot on the dispatcher's own sweep; the waiter behind it is
+    node's only slot on the dispatcher's own sweep; the waiter behind it is
     admitted in that very tick and the record stays BLOCKED for the operator."""
 
     store = build_store()
     a = seed(store, "a", created_at=NOW)
     b = seed(store, "b", created_at=NOW + timedelta(seconds=1))
     adapter = UnknownOutcomeAdapter(REBOOT_PLAN, {a.request_id})
-    dispatcher = budget_dispatcher(store, adapter, ONE_PER_CLUSTER, max_workers=1)
+    dispatcher = budget_dispatcher(store, adapter, POLICY, max_workers=1)
 
     dispatcher.run_once()
     assert store.get_workflow(a.request_id).status is WorkflowStatus.BLOCKED

@@ -101,23 +101,24 @@ def test_budget_scopes_over_their_limit_reach_the_metrics_endpoint(monkeypatch) 
     context = _context(monkeypatch, "e")
     app = create_app(context)
     before = _scrape(app)
-    for scope_type in ("class", "cluster", "domain", "node", "region"):
+    for scope_type in ("domain", "job", "node"):
         assert_sample(
             before,
             "gpu_fault_remediation_budget_over_limit_scopes",
             0,
             scope_type=scope_type,
         )
+    assert 'scope_type="cluster"' not in before, "a retired kind has no limit"
     assert_sample(
         before, "gpu_fault_remediation_budget_over_limit_last_seen_timestamp_seconds", 0
     )
 
     context.dispatcher.budget_watch.observe(
-        {"cluster:cluster-a": (7, 5), "node:cluster-a:n1": (2, 1)}
+        {"job:cluster-a:default/pytorchjob/job-7": (2, 1), "node:cluster-a:n1": (2, 1)}
     )
     after = _scrape(app)
 
-    for scope_type in ("cluster", "node"):
+    for scope_type in ("job", "node"):
         assert_sample(
             after,
             "gpu_fault_remediation_budget_over_limit_scopes",
@@ -125,7 +126,7 @@ def test_budget_scopes_over_their_limit_reach_the_metrics_endpoint(monkeypatch) 
             scope_type=scope_type,
         )
     assert_sample(
-        after, "gpu_fault_remediation_budget_over_limit_scopes", 0, scope_type="region"
+        after, "gpu_fault_remediation_budget_over_limit_scopes", 0, scope_type="domain"
     )
     seen = context.dispatcher.budget_watch.over_limit_last_seen_timestamp_seconds
     assert seen > 0

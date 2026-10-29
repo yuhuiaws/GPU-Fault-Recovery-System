@@ -944,9 +944,10 @@ class WorkflowRequest(StrictModel):
     remediation_budget_limits: dict[str, int] = Field(default_factory=dict)
     remediation_budget_wait_count: int = Field(default=0, ge=0)
     remediation_budget_last_blocked_reason: str | None = None
-    # The budget scope that last refused this workflow's claim (``cluster:<id>`` and
-    # friends; the store's refusal, or the dispatcher's for a never-refused waiter), so
-    # the per-cluster saturation gauge reads it structurally. None on older rows.
+    # The budget scope that last refused this workflow's claim (``node:<cluster>:<node>``
+    # and friends, or a storm breaker's ``storm:<cluster>``; the store's refusal, or the
+    # dispatcher's for a never-refused waiter), so the waiting gauges read it
+    # structurally. None on older rows.
     remediation_budget_last_blocked_scope: str | None = None
     not_before: datetime | None = None
     aggregation_max_deadline: datetime | None = None

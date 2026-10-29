@@ -221,6 +221,14 @@ def budget_tier(
     to make progress (floor 1); the budget waits are the measurement. Live
     2026-09-22: under 20/5/2 every executor completed its 40 commands but
     exited on the raw-tier floor of 8, failing a run that had behaved.
+
+    Unbounded: none of the three is set -- the shipped state since they were
+    retired. No fixed number caps the model; each GPU cluster's remediation
+    storm breaker does, and it trips once max(3, ceil(20% of the cluster's
+    registered GPU nodes)) nodes of two or more workflows enter destructive
+    remediation within 600 s. This suite registers only the model's nodes, so
+    any model of two or more workflows per cluster trips it and the held
+    workflows wait for an operator (perf acceptance plan).
     """
 
     region = budget.get("GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION")

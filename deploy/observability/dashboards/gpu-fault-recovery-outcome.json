@@ -1150,7 +1150,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Saturated when a cluster has waiters while its active claims sit at the configured limit.\n\nAlert GpuFaultRemediationBudgetClusterSaturated (warning, for 30m): docs/en/administrator-operations.md#gpufaultremediationbudgetclustersaturated",
+      "description": "Distinct GPU nodes that entered destructive remediation in each cluster's 600-s window (frozen at the trip while open), against the max(3, ceil(20% of its GPU nodes)) it trips at; no fixed number caps a cluster's remediations.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1202,9 +1202,9 @@
             "type": "prometheus",
             "uid": "gpu-fault-amp"
           },
-          "expr": "max by (cluster_id) (gpu_fault_remediation_budget_cluster_waiting_workflows{cluster_id=~\"$cluster_id\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "expr": "max by (cluster_id) (gpu_fault_remediation_budget_storm_breaker_window_nodes{cluster_id=~\"$cluster_id\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
           "instant": false,
-          "legendFormat": "{{cluster_id}} waiting",
+          "legendFormat": "{{cluster_id}} nodes",
           "range": true,
           "refId": "A"
         },
@@ -1213,25 +1213,14 @@
             "type": "prometheus",
             "uid": "gpu-fault-amp"
           },
-          "expr": "max by (cluster_id) (gpu_fault_remediation_budget_cluster_active_claims{cluster_id=~\"$cluster_id\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "expr": "max by (cluster_id) (gpu_fault_remediation_budget_storm_breaker_threshold_nodes{cluster_id=~\"$cluster_id\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
           "instant": false,
-          "legendFormat": "{{cluster_id}} active",
+          "legendFormat": "{{cluster_id}} threshold",
           "range": true,
           "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "gpu-fault-amp"
-          },
-          "expr": "max(gpu_fault_remediation_budget_cluster_limit{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
-          "instant": false,
-          "legendFormat": "limit",
-          "range": true,
-          "refId": "C"
         }
       ],
-      "title": "Cluster budget saturation",
+      "title": "Remediation storm breaker: nodes entering remediation vs threshold",
       "type": "timeseries"
     },
     {

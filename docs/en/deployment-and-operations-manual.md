@@ -225,8 +225,10 @@ Normal application deployment uses `/secure/gpu-fault/site.yaml` as the source o
 `regional-env.sh`. The latter is only used for CPU-1 to 9, the REG manual steps, cloud resource cleanup and break-glass
 sessions; runtime image overrides remain audited environment inputs of the release process.
 
-control-worker replicas, the telemetry spool and the remediation budget use
-`state-dir/admin-config/desired.json` as the source of truth for the administrator's desired values. A first site build can import it via
+control-worker replicas and the telemetry spool use
+`state-dir/admin-config/desired.json` as the source of truth for the administrator's desired values (the remediation budget has
+no administrator field left: the per-node and per-failure-domain limits are safety constants, and the Region, per-cluster and
+per-resource-class limits are replaced by the remediation storm breaker). A first site build can import it via
 `gpu-fault-admin deploy --config <AdminConfig.yaml>`; an existing site must run
 `gpu-fault-admin config --state-dir ... --reference ...`. The internal configuration plan the CLI generates within the same command binds the site identity, the current/target configuration SHA and the affected roles, reuses the current signed image and wheel, rolls only the relevant
 CPU roles, and does not execute an Aurora registry revision. The complete commands and fields are in
@@ -5934,7 +5936,8 @@ concurrency, which is why `BATCH_SIZE × worst-case duration of one command < LE
 production loop is no longer bound by it; it only still applies to the single-cycle `run_once()` that tests and acceptance
 probes drive (claim one batch, wait until all of it has reported; with `BATCH_SIZE > MAX_CONCURRENT_COMMANDS` the surplus
 queues locally, which CAP-004's queued-lease proof exercises on purpose). Both settings only bound one executor's commands
-in flight; cluster-level remediation concurrency is still decided by the persistent remediation budgets.
+in flight; workflows are kept apart per node, job and fabric partition by the persistent remediation budgets, and a cluster's
+correlated fault is bounded by its remediation storm breaker.
 
 While long commands hold every slot nothing is claimed, but readiness does not drop for it: a successful lease renewal counts as
 progress (`last_successful_renewal_at` in the breadcrumb, the series `gpu_fault_cluster_executor_last_lease_renewal_timestamp`),
@@ -7346,7 +7349,7 @@ sudo /opt/gpu-fault/uninstall
 | `GPU_FAULT_ENABLE_WORKFLOW_DISPATCHER` | true | Effective in active |
 | `GPU_FAULT_ENABLE_WORKFLOW_PREEMPTION` | true | Allows a higher-tier workflow on the same node with the same attempt, or with neither side having a job, to set the lower-tier predecessor to `SUPERSEDED` at a safe step boundary; on by default, can be explicitly disabled during emergency troubleshooting |
 | `GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS` | 5 | Fallback scan interval of persistent workflows; remote completion, GPU metrics and host telemetry actively wake this Pod's dispatcher after being stored |
-| `GPU_FAULT_WORKFLOW_BATCH_SIZE` | max(100, Region budget + 50), at most 400 | Oldest workflow rows selected per tick; unset, derived from the Region budget (100 by default); startup refuses a Region budget above it |
+| `GPU_FAULT_WORKFLOW_BATCH_SIZE` | (dispatch lease x 0.5 - 1 s) x workers / 0.15 s, within 100..400 | Oldest workflow rows selected per tick; unset, derived from the dispatcher workers and the dispatch lease (346 as shipped), and startup warns when a tick cannot finish inside the lease; no longer derived from a remediation limit |
 | `GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS` | 8 | Number of dispatcher threads executing different incidents in parallel; at most one workflow per incident per round |
 | `GPU_FAULT_XID_CORRELATION_POLL_SECONDS` | 1 | Period for scanning expired XID 45 |
 | `GPU_FAULT_XID_CORRELATION_LEASE_SECONDS` | 30 | HA final-processing lease; minimum 5 seconds |

@@ -1379,19 +1379,10 @@
     "GPU_FAULT_REGISTRY_STALE_SECONDS": {
       "kind": "number"
     },
-    "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER": {
-      "kind": "integer"
-    },
     "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN": {
       "kind": "integer"
     },
     "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE": {
-      "kind": "integer"
-    },
-    "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS": {
-      "kind": "integer"
-    },
-    "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION": {
       "kind": "integer"
     },
     "GPU_FAULT_REMOTE_COMMAND_STALE_FENCE_GRACE_SECONDS": {

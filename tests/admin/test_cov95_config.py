@@ -17,17 +17,6 @@ from tests.admin.test_admin_config import (
 @pytest.mark.parametrize(
     "section",
     [
-        config.RemediationCapacity(max_active_region=0),
-        config.RemediationCapacity(
-            max_active_region=1,
-            max_active_per_cluster=2,
-            max_active_per_resource_class=1,
-        ),
-        config.RemediationCapacity(
-            max_active_region=1,
-            max_active_per_cluster=1,
-            max_active_per_resource_class=2,
-        ),
         config.TelemetrySpoolCapacity(replicas=-1),
         config.TelemetrySpoolCapacity(enabled=True, replicas=0),
         config.CapacityConfig(control_worker_replicas=0),

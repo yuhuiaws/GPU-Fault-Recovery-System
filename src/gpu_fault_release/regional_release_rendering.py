@@ -388,18 +388,14 @@ def admin_config_renderer_environment(
         "GPU_FAULT_TELEMETRY_SPOOL": str(spool.enabled).lower(),
         "GPU_FAULT_TELEMETRY_SPOOL_REPLICAS": str(spool.replicas),
         "GPU_FAULT_TELEMETRY_SPOOL_MAX_CLUSTER_DEPTH": str(spool.max_cluster_depth),
-        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION": str(remediation.max_active_region),
-        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER": str(
-            remediation.max_active_per_cluster
-        ),
+        # The two remediation limits left are constants; the region,
+        # per-cluster and per-resource-class limits are retired and never
+        # rendered (the storm breaker replaced them).
         "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE": str(
             remediation.max_active_per_node
         ),
         "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN": str(
             remediation.max_active_per_failure_domain
-        ),
-        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS": str(
-            remediation.max_active_per_resource_class
         ),
         "GPU_FAULT_PROCESSOR_MAX_QUEUE_DEPTH": str(processor.max_queue_depth),
         "GPU_FAULT_PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH": str(

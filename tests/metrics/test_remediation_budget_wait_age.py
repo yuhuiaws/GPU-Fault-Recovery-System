@@ -29,8 +29,8 @@ from gpu_fault.store.shared.remediation_budgets import (
 from tests._builders import fault_incident, workflow_request, workflow_step
 
 NOW = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
-JOB_DOMAIN = "domain:cluster-a:job:job-7"
-CLAIMS = {JOB_DOMAIN: 1, "node:cluster-a:node-a": 1}
+JOB_SCOPE = "job:cluster-a:default/pytorchjob/job-7"
+CLAIMS = {JOB_SCOPE: 1, "node:cluster-a:node-a": 1}
 
 
 def _seed(store: InMemoryStore, name: str):
@@ -81,7 +81,7 @@ def test_the_refusal_that_begins_a_wait_records_its_start_once() -> None:
 
     (event,) = _wait_events(waiting)
     assert event.at == NOW
-    assert event.details["scope"] == JOB_DOMAIN
+    assert event.details["scope"] == JOB_SCOPE
     assert waiting.remediation_budget_wait_count == 3
     assert budget_wait_started_at(waiting) == NOW
 
@@ -103,7 +103,7 @@ def test_the_refusal_that_begins_a_wait_records_its_start_once() -> None:
 
     # A later refusal of the same row begins a new wait.
     again = blocked_by_remediation_budget(
-        admitted, "full", scope=JOB_DOMAIN, now=NOW + timedelta(hours=1)
+        admitted, "full", scope=JOB_SCOPE, now=NOW + timedelta(hours=1)
     )
     assert [item.at for item in _wait_events(again)] == [NOW, NOW + timedelta(hours=1)]
     assert budget_wait_started_at(again) == NOW + timedelta(hours=1)
@@ -134,21 +134,22 @@ def _waiter(name: str, scope: str, waited: timedelta, **values):
 
 def test_the_longest_wait_is_rendered_per_refusing_scope_type() -> None:
     rows = [
-        _waiter("a", JOB_DOMAIN, timedelta(seconds=100)),
-        _waiter("b", "domain:cluster-a:node:node-b", timedelta(seconds=4000)),
+        _waiter("a", JOB_SCOPE, timedelta(seconds=100)),
+        _waiter("b", "domain:cluster-a:partition-1", timedelta(seconds=4000)),
         _waiter("c", "node:cluster-a:node-c", timedelta(seconds=70)),
-        _waiter("d", "cluster:cluster-a", timedelta(seconds=5000)),
+        _waiter("d", "storm:cluster-a", timedelta(seconds=5000)),
         # Ended: refused once, then SUCCEEDED -- no longer a waiter.
-        _waiter("e", JOB_DOMAIN, timedelta(hours=9), status=WorkflowStatus.SUCCEEDED),
+        _waiter("e", JOB_SCOPE, timedelta(hours=9), status=WorkflowStatus.SUCCEEDED),
     ]
 
     tally = budget_tally(rows, NOW)
-    lines = remediation_budget_lines(tally, config=None)
+    lines = remediation_budget_lines(tally)
 
     assert tally.longest_wait_by_scope_type == {
+        "job": 100.0,
         "domain": 4000.0,
         "node": 70.0,
-        "cluster": 5000.0,
+        "storm": 5000.0,
     }
     assert (
         'gpu_fault_remediation_budget_longest_wait_seconds{scope_type="domain"} 4000'
@@ -160,7 +161,7 @@ def test_the_longest_wait_is_rendered_per_refusing_scope_type() -> None:
 
 
 def test_no_waiter_renders_no_longest_wait_series() -> None:
-    lines = remediation_budget_lines(budget_tally([], NOW), config=None)
+    lines = remediation_budget_lines(budget_tally([], NOW))
 
     assert "# TYPE gpu_fault_remediation_budget_longest_wait_seconds gauge" in lines
     assert not [

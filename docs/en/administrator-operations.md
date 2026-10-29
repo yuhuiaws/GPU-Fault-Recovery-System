@@ -3472,7 +3472,7 @@ and the names are the card names below.
 | GPU Fault · Remote command (`gpu-fault-remote-command`) | `gpu-fault-remote-command` | Claim latency -> `GpuFaultRemoteCommandUnclaimed`, `GpuFaultRemoteCommandExecutorInternalError`; Command census -> `GpuFaultRemoteCommandUnclaimedExpired` (the per-state/per-cluster command count panels are trend readings) |
 | GPU Fault · Policy coverage (`gpu-fault-policy-coverage`) | `gpu-fault-policy-coverage` | Catalog coverage -> `GpuFaultUnknownProductFamily` (CRITICAL findings without an incident is a trend reading) |
 | GPU Fault · Orchestration invariants (`gpu-fault-orchestration-invariants`) | `gpu-fault-orchestration-invariants` | Node ownership -> `GpuFaultExclusiveNodeOwnershipInvariantViolation`, `GpuFaultStaleAttemptObservation`; Fleet rollout fence -> `GpuFaultFleetRolloutFenceStuck`; Pointers, agents and registry -> `GpuFaultIncidentDanglingWorkflowPointers`, `GpuFaultStaleAgents`, `GpuFaultFleetPinAheadOfFleet`, `GpuFaultRegionalRegistrySecretDrift` |
-| GPU Fault · Recovery outcome (`gpu-fault-recovery-outcome`) | `gpu-fault-recovery-outcome` | Workflows -> `GpuFaultRecoveryBlockedBacklog`, `GpuFaultWorkflowPendingAge`, `GpuFaultWorkflowDeadlineNotEnforced`; Step waiting -> `GpuFaultWorkflowStepStalled`; Counters (30m increase) -> `GpuFaultWorkflowLifetimeExceeded`, `GpuFaultJobWorkflowNodeBusyTimeout`, `GpuFaultProcessorRetryHorizonFailures`, `GpuFaultBranchEscalationBudgetRefused`; Closed loop and notifications -> `GpuFaultClosedLoopSlow`, `GpuFaultClosedLoopWindowIncomplete`, `GpuFaultNotificationDeliveryFailing`; Remediation budget -> `GpuFaultRemediationBudgetStarved`, `GpuFaultRemediationBudgetClusterSaturated`, `GpuFaultRemediationBudgetLongWait`, `GpuFaultRemediationStormBreakerOpen`; Completion and incidents -> `GpuFaultCompletionEventsWithoutDecision`, `GpuFaultIncidentsAwaitingOperator`, `GpuFaultDepartedNodeCleanupStuck`; Dispatcher errors and notification outbox -> `GpuFaultWorkflowDispatchInternalErrors`, `GpuFaultWorkflowFailureHandlingAbandoned`, `GpuFaultNotificationUndeliveredTooLong`, `GpuFaultNotificationOutboxNotDraining`, `GpuFaultNotificationExpiredUnsent` |
+| GPU Fault · Recovery outcome (`gpu-fault-recovery-outcome`) | `gpu-fault-recovery-outcome` | Workflows -> `GpuFaultRecoveryBlockedBacklog`, `GpuFaultWorkflowPendingAge`, `GpuFaultWorkflowDeadlineNotEnforced`; Step waiting -> `GpuFaultWorkflowStepStalled`; Counters (30m increase) -> `GpuFaultWorkflowLifetimeExceeded`, `GpuFaultJobWorkflowNodeBusyTimeout`, `GpuFaultProcessorRetryHorizonFailures`, `GpuFaultBranchEscalationBudgetRefused`; Closed loop and notifications -> `GpuFaultClosedLoopSlow`, `GpuFaultClosedLoopWindowIncomplete`, `GpuFaultNotificationDeliveryFailing`; Remediation budget -> `GpuFaultRemediationBudgetStarved`, `GpuFaultRemediationBudgetLongWait`, `GpuFaultRemediationStormBreakerOpen`; Completion and incidents -> `GpuFaultCompletionEventsWithoutDecision`, `GpuFaultIncidentsAwaitingOperator`, `GpuFaultDepartedNodeCleanupStuck`; Dispatcher errors and notification outbox -> `GpuFaultWorkflowDispatchInternalErrors`, `GpuFaultWorkflowFailureHandlingAbandoned`, `GpuFaultNotificationUndeliveredTooLong`, `GpuFaultNotificationOutboxNotDraining`, `GpuFaultNotificationExpiredUnsent` |
 
 The last row of the overview, "Declared topology", is `gpu_fault_capacity_largest_cluster_node_count` /
 `gpu_fault_capacity_managed_node_count`: the topology declared by the release, from which the fault reservation and the Aurora capacity floor are derived;
@@ -4091,16 +4091,18 @@ modifying Store JSON or repeating `send`; an isolated notifier result in accepta
 ### GpuFaultBranchEscalationBudgetRefused
 
 - **Meaning**: in a multi-node job repair, some node branch wanted to escalate in place to the next rung (reset -> reboot -> warm-spare replacement),
-  but the concurrency budget of that action's resource class (such as `NODE_LIFECYCLE_MUTATION`) in this cluster was full, and the control plane chose to hand the branch
-  to a human (branch exhausted, workflow finally FAILED / ESCALATED) rather than exceed the concurrency cap.
+  but a budget scope the rung needs and the workflow did not hold yet (for example the NVSwitch fabric partition of the rung's
+  action, or a node outside its plan) is held by another workflow, and the control plane chose to hand the branch to a human
+  (branch exhausted, workflow finally FAILED / ESCALATED) rather than break the exclusion. The resource-class concurrency cap is
+  retired and no longer a reason for a refusal.
 - **Which metric it reads**: `gpu_fault_workflow_branch_escalation_budget_refusals_total` (executor counter).
 - **First check**: the incident_id comes from the escalation notification email (`status` does not list incidents; the count is in
   `gpu_fault_incidents_by_state{state="ESCALATED"}`), `GET /v1/workflows/{workflow_id}`
   reads the workflow's `exhausted_branch_ids`
-  and the "remediation budget cannot take the next rung" in the last failure record; check
-  `GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS` (default 2) against the reboots/replacements in flight at the time.
-- **Handling**: after the in-flight reboots/replacements close out, a human decides whether that node is rebooted, replaced or sent for repair; if it occurs frequently and
-  hardware capacity is confirmed to allow it, then evaluate raising the concurrency cap of that resource class.
+  and the "remediation budget cannot take the next rung" in the last failure record (it names the refused scope), then find the
+  workflow holding that scope.
+- **Handling**: after the workflow holding the scope closes out, a human decides whether that node is rebooted, replaced or sent
+  for repair. The per-node and per-failure-domain limits are safety constants of 1; there is no quota to adjust.
 
 ### GpuFaultWorkflowStepStalled
 
@@ -4153,11 +4155,15 @@ modifying Store JSON or repeating `send`; an isolated notifier result in accepta
 
 ### GpuFaultRemediationBudgetStarved
 
-- **Meaning**: a workflow has waited for remediation budget for more than 30 minutes. The budget limits the number of nodes changed simultaneously;
-  a short wait is correct overload protection, a long wait means quota is not being released.
-- **First check**: `gpu_fault_remediation_budget_active_claims` by scope type against the configured cap
-  (`gpu_fault_remediation_budget_region_limit` for the Region cap); confirm whether the workflows holding claims are still
-  progressing. A claim is held until its workflow ends and a lapsed lease does not release it (a reset or reboot on the node
+- **Meaning**: a workflow has waited for remediation budget for more than 30 minutes. The budget keeps the workflows of one
+  node, one job and one NVSwitch fabric partition apart, and the remediation storm breaker holds the new destructive remediation
+  of a correlated fault; no fixed number caps how many a cluster repairs at once (the Region, per-cluster and per-resource-class
+  limits are retired, and `GpuFaultRemediationBudgetClusterSaturated` went with them). A short wait is correct exclusion; a long
+  one means a slot is not being released, or a breaker is still open.
+- **First check**: read `gpu_fault_remediation_budget_waiting_workflows_by_scope` first: `storm` is an open breaker (handle as
+  `GpuFaultRemediationStormBreakerOpen`; only an operator's `remediation-storm release` lets it through); `node`, `job` or
+  `domain` is another workflow of the same node, job or fabric partition holding the slot (`GpuFaultRemediationBudgetLongWait`
+  names the oldest) -- confirm whether the workflows holding claims are still progressing. A claim is held until its workflow ends and a lapsed lease does not release it (a reset or reboot on the node
   does not stop with its executor's lease); a `RUNNING` holder that stopped progressing is failed by the deadline watchdog at
   its execution deadline. A holder keeps its slot through long waits -- the node coming back after a reboot, a replacement,
   validation, a workload restart -- up to its execution deadline (detailed design v2 §9.5: 30 minutes from the first claim for
@@ -4171,34 +4177,13 @@ modifying Store JSON or repeating `send`; an isolated notifier result in accepta
   and still needs the operator. A rising `gpu_fault_workflow_dispatch_filtered_total{reason="remediation_budget"}` is the
   starvation guard passing over the waiters of a full scope -- throttling, not a stall; a holder still `RUNNING` past its
   execution deadline is handled as `GpuFaultWorkflowDeadlineNotEnforced`. `gpu_fault_remediation_budget_over_limit_scopes`
-  above 0 means a scope holds more than its limit (holds re-taken after an upgrade, an older dispatcher still in the roll, or
-  a lowered limit; the dispatcher log names the scope); nothing new enters it until it drains below the limit, and 10 minutes
-  over it raise `GpuFaultRemediationBudgetOverLimit`.
-- **Boundary**: do not raise the budget directly to clear the alert; first confirm there is no "claim holder no longer
-  progressing but still `RUNNING`" or "parked record waiting for its confirmation" situation. Quota adjustment goes through [Administrator Capacity Configuration](administrator-capacity-configuration.md).
-
-### GpuFaultRemediationBudgetClusterSaturated
-
-- **Meaning**: the remediation budget of one GPU cluster (`cluster_id` label) has been full for 30 minutes:
-  its active claims equal the single-cluster cap (`GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER`, factory 5),
-  while workflows are also waiting because refused on this cluster's scope. Under a cluster-wide correlated fault (one AZ, 500+ nodes)
-  this is **expected**: the cluster repairs one by one at the concurrency cap, and the drain time is roughly "waiting count ÷ cap × single repair
-  duration", tens of hours for a few hundred nodes. The value of this alert is saying which cluster and how long to wait, not that the system is wrong.
-- **First check**: `gpu_fault_remediation_budget_cluster_active_claims{cluster_id}` against
-  `gpu_fault_remediation_budget_cluster_limit`, confirming it really sits at the cap;
-  `gpu_fault_remediation_budget_cluster_waiting_workflows{cluster_id}` for the cluster's waiting count,
-  `gpu_fault_remediation_budget_waiting_workflows_by_scope` for whether the refusal was cluster or
-  region/node/domain scope; estimate the drain time with the mean of `gpu_fault_workflow_duration_seconds`;
-  `gpu_fault_workflow_pending_age_seconds_max` finds the oldest waiting workflow; read its
-  `remediation_budget_last_blocked_reason` / `remediation_budget_last_blocked_scope`.
-  If a claim-holding workflow no longer progresses, or a parked `NEEDS_OPERATOR` record with an unresolved node action holds
-  a slot, handle as `GpuFaultRemediationBudgetStarved` instead.
-  A rising `gpu_fault_workflow_dispatch_filtered_total{reason="remediation_budget"}` while other clusters' workflows still
-  start shows the starvation guard keeping the storm queued in this cluster alone; when the oldest waiter of the same storm
-  passes 30 minutes, `GpuFaultWorkflowPendingAge` fires as well and is handled here.
-- **Boundary**: the single-cluster cap is the safety cap on nodes changed simultaneously; do not raise it to clear the alert; when the waiting count falls
-  at the expected rate, just wait and tell the business side the drain time. Quota adjustment goes through [Administrator Capacity Configuration](administrator-capacity-configuration.md) and needs
-  a change record and a rollback plan.
+  above 0 means a scope holds more than its limit (holds re-taken after an upgrade, an older dispatcher still in the roll; the
+  dispatcher log names the scope); nothing new enters it until it drains below the limit, and 10 minutes over it raise
+  `GpuFaultRemediationBudgetOverLimit`. The `region`, `cluster:` and `class:` scopes an older release's rows still list have no
+  limit any more, block no admission and disappear as those rows end.
+- **Boundary**: the per-node and per-failure-domain limits are safety constants of 1; there is no quota to adjust. First confirm
+  there is no "claim holder no longer progressing but still `RUNNING`" or "parked record waiting for its confirmation"
+  situation.
 
 ### GpuFaultRemediationBudgetOverLimit
 
@@ -4207,13 +4192,13 @@ modifying Store JSON or repeating `send`; an isolated notifier result in accepta
   A hold is never refused -- refusing would strand a reset or a reboot in flight -- so a scope can only go over its limit in
   the documented windows (detailed design §9.5): during a control-plane roll from a release that dropped claims after the
   first budgeted step, its RUNNING workflows re-take their claims here and an older dispatcher still alternating with this one
-  admits on its own count; a limit was lowered under its existing holders; or a receipt-settled record re-took its hold for the
-  compensation it owes. Nothing new is admitted into such a scope until it drains below the limit, so the excess cannot grow
+  admits on its own count; or a receipt-settled record re-took its hold for the compensation it owes. The scopes are per node,
+  per job and per fabric partition, each with a limit of 1; the `region`, `cluster:` and `class:` scopes an older release left
+  have no limit and are not counted. Nothing new is admitted into such a scope until it drains below the limit, so the excess cannot grow
   from this release.
 - **First check**: whether a control-plane roll is still running or any control-plane Pod still runs the older release; the
-  control-worker log warning `remediation budget scope(s) above their limit` names each scope with its holders and limit;
-  compare `gpu_fault_remediation_budget_active_claims` / `gpu_fault_remediation_budget_cluster_active_claims` with the limits
-  and confirm the holders are still progressing. The excess drains as the remediations in flight end, bounded by their
+  control-worker log warning `remediation budget scope(s) above their limit` names each scope with its holders and limit, from
+  which confirm the holders are still progressing. The excess drains as the remediations in flight end, bounded by their
   deadlines and, for parked records, by the longest a node action can live.
 - **Boundary**: do not raise the limit to clear the alert and do not edit Store claims. A scope still over its limit long after
   the roll ended means holders that no longer progress: handle as `GpuFaultRemediationBudgetStarved`.
@@ -4226,8 +4211,8 @@ modifying Store JSON or repeating `send`; an isolated notifier result in accepta
   whose first workflow is still running (the job's later attempt, a node-level workflow behind the job workflow on that node),
   or a second workflow stopping or restarting the same job. The age is per workflow, from the refusal that began its wait (`gpu_fault_remediation_budget_longest_wait_seconds{scope_type}`,
   the workflow's `REMEDIATION_BUDGET_WAIT` hold event), which the waiting count behind `GpuFaultRemediationBudgetStarved`
-  cannot say. Cluster, region and resource-class waits are not read: they drain by design during a correlated fault
-  (`GpuFaultRemediationBudgetClusterSaturated`).
+  cannot say. A wait the storm breaker holds (`storm:<cluster>`) is not read here; it is
+  `GpuFaultRemediationStormBreakerOpen`'s.
 - **First check**: find the waiting workflow (`gpu_fault_workflow_pending_age_seconds_max` names the oldest PENDING one, or
   `GET /v1/workflows?status=PENDING`) and read its `remediation_budget_last_blocked_scope`, for example
   `node:<cluster>:<node>` or `job:<cluster>:<workload_id>`; then find the workflow holding that scope (`RUNNING`, or a
@@ -4249,7 +4234,9 @@ modifying Store JSON or repeating `send`; an isolated notifier result in accepta
   v2 §9.5). Since the trip every first admission of destructive work in that cluster -- job stops and restarts, GPU resets,
   quiesce, reboots, replacements, quarantines, driver/firmware, device-plugin restarts -- is held: the workflow stays `PENDING`
   with `remediation_budget_last_blocked_scope` = `storm:<cluster>`. Work already admitted goes on. The breaker never closes by
-  itself; one operator notice (`REMEDIATION_STORM_TRIPPED`, OPERATOR_REVIEW) was sent at the trip.
+  itself; one operator notice (`REMEDIATION_STORM_TRIPPED`, OPERATOR_REVIEW) was sent at the trip. On a small cluster the
+  floor decides: up to 15 GPU nodes it trips at 3 distinct nodes (a 4-node cluster with three unrelated faulted nodes in ten
+  minutes trips it), and a cluster of 1 or 2 GPU nodes never does.
 - **First check**: `gpu-fault-admin status` names the breaker, the trip time and numbers;
   `gpu_fault_remediation_budget_storm_breaker_window_nodes{cluster_id}` against `..._threshold_nodes`,
   `..._held_workflows` for the queue, and the tripping workflow's `REMEDIATION_STORM_TRIPPED` hold event for the node list. Look
@@ -4388,7 +4375,7 @@ modifying Store JSON or repeating `send`; an isolated notifier result in accepta
   (`gpu_fault_workflow_pending_age_warnings_total`); this rule is the AMP version of the same fact.
   The exception is budget queueing: claims are held until a workflow ends, so in a large correlated fault a `PENDING`
   workflow waiting for remediation budget also passes 30 minutes. When the oldest `PENDING` workflow records
-  `remediation_budget_last_blocked_scope` and `GpuFaultRemediationBudgetClusterSaturated` or
+  `remediation_budget_last_blocked_scope` and `GpuFaultRemediationStormBreakerOpen` (scope `storm:<cluster>`) or
   `GpuFaultRemediationBudgetStarved` fires for that scope, handle it per those entries; the first checks below are for a
   workflow no budget refused.
 - **Which metric it reads**: `gpu_fault_workflow_pending_age_seconds_max`; alongside

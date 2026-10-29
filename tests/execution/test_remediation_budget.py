@@ -21,6 +21,7 @@ from gpu_fault.store import InMemoryStore, RemediationBudgetError, SqliteStore
 from tests._builders import fault_incident, workflow_request, workflow_step
 
 NOW = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+JOB = "default/pytorchjob/job-7"
 
 
 def _workflow(
@@ -68,7 +69,9 @@ def test_remediation_budget_is_durable_and_released_when_the_holder_ends(
     store = SqliteStore(str(tmp_path / "budget.db")) if durable else InMemoryStore()
     _, first = _workflow(store, "first", node_id="node-a")
     _, second = _workflow(store, "second", node_id="node-b")
-    claims = {"region": 1, "cluster:cluster-a": 1}
+    # Two workflows stopping one job on disjoint nodes share its token.
+    scope = f"job:cluster-a:{JOB}"
+    claims = {scope: 1}
 
     holder = store.claim_workflow(
         first.request_id,
@@ -78,9 +81,7 @@ def test_remediation_budget_is_durable_and_released_when_the_holder_ends(
         lease_duration=timedelta(seconds=30),
         remediation_budget_claims=claims,
     )
-    with pytest.raises(
-        RemediationBudgetError, match="scope=cluster:cluster-a"
-    ) as raised:
+    with pytest.raises(RemediationBudgetError, match=f"scope={scope}") as raised:
         store.claim_workflow(
             second.request_id,
             "executor-b",
@@ -91,14 +92,14 @@ def test_remediation_budget_is_durable_and_released_when_the_holder_ends(
         )
 
     # The scope travels structurally, not by parsing the message: the
-    # per-cluster saturation gauge reads it back off the workflow (S1).
-    assert raised.value.scope == "cluster:cluster-a"
+    # waiting gauges read it back off the workflow (S1).
+    assert raised.value.scope == scope
     blocked = store.get_workflow(second.request_id)
     assert blocked.remediation_budget_wait_count == 1
-    assert "cluster:cluster-a" in (blocked.remediation_budget_last_blocked_reason or "")
-    assert blocked.remediation_budget_last_blocked_scope == "cluster:cluster-a"
+    assert scope in (blocked.remediation_budget_last_blocked_reason or "")
+    assert blocked.remediation_budget_last_blocked_scope == scope
 
-    with pytest.raises(RemediationBudgetError, match="scope=cluster:cluster-a"):
+    with pytest.raises(RemediationBudgetError, match=f"scope={scope}"):
         store.claim_workflow(
             second.request_id,
             "executor-b",
@@ -165,31 +166,15 @@ def test_remediation_budget_claims_cover_all_required_scopes() -> None:
         }
     )
     workflow = workflow.model_copy(update={"official_steps": [step]})
-    policy = RemediationBudgetPolicy(
-        region_limit=10,
-        cluster_limit=4,
-        node_limit=1,
-        failure_domain_limit=1,
-        resource_class_limit=2,
-    )
 
     claims = remediation_budget_claims(
-        policy, workflow, incident, workflow.official_steps
+        RemediationBudgetPolicy(), workflow, incident, workflow.official_steps
     )
 
-    assert claims["region"] == 10
-    assert claims["cluster:cluster-a"] == 4
-    assert claims["node:cluster-a:node-a"] == 1
-    assert claims["domain:cluster-a:fabric-a"] == 1
-    assert "domain:cluster-a:us-west-2a" not in claims
-    # The fabric partition is the only domain: no label group, no workload slot.
-    assert [scope for scope in claims if scope.startswith("domain:")] == [
-        "domain:cluster-a:fabric-a"
-    ]
-    assert claims["class:cluster-a:NODE_LIFECYCLE_MUTATION"] == 2
-
-
-JOB = "default/pytorchjob/job-7"
+    # The node, and the fabric partition as the one domain: no label group, no
+    # workload slot, and no region, cluster or resource-class count -- the
+    # cluster's storm breaker bounds a correlated fault, not a fixed number.
+    assert claims == {"node:cluster-a:node-a": 1, "domain:cluster-a:fabric-a": 1}
 
 
 def _job_step(operation, nodes, **values):
@@ -293,7 +278,9 @@ def test_two_jobs_on_two_nodes_of_one_node_group_are_repaired_together(
     ]
 
     assert [item.status for item in admitted] == [WorkflowStatus.RUNNING] * 2
-    assert store.remediation_budget_occupancy()["cluster:cluster-a"] == 2
+    occupancy = store.remediation_budget_occupancy()
+    assert occupancy["node:cluster-a:node-a"] == occupancy["node:cluster-a:node-b"] == 1
+    assert not [scope for scope in occupancy if scope.startswith("cluster:")], occupancy
 
 
 @pytest.mark.parametrize("durable", [False, True])
@@ -466,6 +453,47 @@ def test_a_label_domain_an_older_release_holds_blocks_nobody_and_drains(
     occupancy = store.remediation_budget_occupancy()
     assert occupancy["domain:cluster-a:gpu-group"] == 1
     assert occupancy["node:cluster-a:node-b"] == 1
+
+
+@pytest.mark.parametrize("durable", [False, True])
+def test_the_fixed_limits_an_older_release_holds_block_nobody(
+    tmp_path, durable: bool
+) -> None:
+    """Upgrade: six RUNNING rows an older release admitted each list
+    ``region``, ``cluster:`` and ``class:`` -- over that release's 5 per
+    cluster and 2 per resource class. No claim of this release asks for those
+    scopes, so a seventh node's reboot is admitted; the strings stay on the
+    rows until they end."""
+
+    store = _store(tmp_path, durable)
+    legacy = ["class:cluster-a:NODE_LIFECYCLE_MUTATION", "cluster:cluster-a", "region"]
+    for index in range(6):
+        _, old = _workflow(store, f"old-{index}", node_id=f"node-{index}")
+        store.save_workflow(
+            old.model_copy(
+                update={
+                    "status": WorkflowStatus.RUNNING,
+                    "remediation_budget_claims": [
+                        *legacy,
+                        f"node:cluster-a:node-{index}",
+                    ],
+                    "remediation_budget_limits": {
+                        "class:cluster-a:NODE_LIFECYCLE_MUTATION": 2,
+                        "cluster:cluster-a": 5,
+                        "region": 20,
+                        f"node:cluster-a:node-{index}": 1,
+                    },
+                }
+            )
+        )
+    incident, fresh = _workflow(store, "fresh", node_id="node-9")
+
+    admitted = _admit(store, fresh, incident, "executor-b")
+
+    assert admitted.status is WorkflowStatus.RUNNING
+    assert admitted.remediation_budget_claims == ["node:cluster-a:node-9"]
+    occupancy = store.remediation_budget_occupancy()
+    assert occupancy["cluster:cluster-a"] == occupancy["region"] == 6
 
 
 def test_restore_compensation_never_waits_for_a_remediation_budget() -> None:

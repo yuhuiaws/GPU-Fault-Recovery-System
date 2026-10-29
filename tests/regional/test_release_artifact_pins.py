@@ -345,7 +345,8 @@ def test_rollback_uses_previous_executor_and_node_pins(
     assert all(
         item["env"]["GPU_FAULT_TELEMETRY_SPOOL"] == "true"
         and item["env"]["GPU_FAULT_TELEMETRY_SPOOL_REPLICAS"] == "3"
-        and item["env"]["GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION"] == "128"
+        and item["env"]["GPU_FAULT_CAPACITY_MANAGED_NODE_COUNT"] == "8192"
+        and "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION" not in item["env"]
         for item in cpu_renders
     ), "rollback CPU stages did not render the previous administrator config"
     core_patches = [

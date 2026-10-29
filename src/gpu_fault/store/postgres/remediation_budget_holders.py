@@ -6,8 +6,9 @@ still occupies its node with a node action that may still be running, plus a SUP
 predecessor whose preempting successor has not claimed yet (its hold is
 reserved for that successor). Both reads apply it in two parts: the RUNNING
 holders are counted in SQL -- decoding every holder for every admission made a
-burst of N admissions cost N^2 / 2 decodes under the region scope's lock
-(18.8 s for 350 in one tick, over the 15-s dispatch lease) -- and the
+burst of N admissions cost N^2 / 2 decodes under the lock of the region scope
+every admission then claimed (18.8 s for 350 in one tick, over the 15-s
+dispatch lease) -- and the
 node-occupying BLOCKED rows and the handoff pairs, an operator queue and a
 moment of a preemption rather than fleet-sized sets, are decoded for the
 shared rule. ``claim_occupancy`` is one claim's view (its requested scopes,

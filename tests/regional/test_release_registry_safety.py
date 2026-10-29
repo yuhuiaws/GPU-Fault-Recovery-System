@@ -502,7 +502,28 @@ def test_previous_state_captures_the_live_administrator_config() -> None:
     assert config.capacity.control_worker_replicas == 6
     assert config.capacity.telemetry_spool.enabled is True
     assert config.capacity.telemetry_spool.replicas == 3
+    # Retired remediation limits: an older release's ConfigMap still renders
+    # them, and the capture keeps them so it digests like the record it came from.
     assert config.capacity.remediation.max_active_region == 128
+    assert config.capacity.remediation.max_active_per_resource_class == 4
+
+    # This release renders none: the record the previous release wrote decides,
+    # and without one they are absent -- never a parser default.
+    core = snapshots["gpu-fault-control-worker-config-core"]
+    for name in (
+        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION",
+        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER",
+        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS",
+    ):
+        core.pop(name)
+    recorded = config.as_dict()
+    from_record = STATE_MODULE.captured_admin_config(
+        SnapshotRelease(), snapshots, recorded=recorded
+    )
+    assert from_record.capacity.remediation == config.capacity.remediation
+    fresh = STATE_MODULE.captured_admin_config(SnapshotRelease(), snapshots)
+    assert fresh.capacity.remediation.max_active_region is None
+    assert "max_active_region" not in fresh.as_dict()["capacity"]["remediation"]
 
 
 def test_previous_state_captures_node_counts_only_from_the_live_environment() -> None:

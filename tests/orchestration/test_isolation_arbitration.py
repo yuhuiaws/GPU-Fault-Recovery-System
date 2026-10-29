@@ -211,7 +211,11 @@ def test_a_support_escalation_is_terminal_for_its_node():
     )
 
 
-def test_quarantine_claims_the_isolation_budget():
+def test_quarantine_claims_the_node_like_any_mutation():
+    """Isolation is budgeted (F-C5): it takes the node's slot, so its first
+    admission also counts towards the cluster's storm breaker; there is no
+    per-resource-class isolation limit any more."""
+
     policy = RemediationBudgetPolicy()
     incident = fault_incident("inc-q", "event-q", cluster_id="cluster-a")
     steps = [
@@ -222,8 +226,7 @@ def test_quarantine_claims_the_isolation_budget():
 
     claims = remediation_budget_claims(policy, workflow, incident, steps)
 
-    assert claims["node:cluster-a:node-a"] == policy.node_limit
-    assert claims["class:cluster-a:NODE_ISOLATION"] == policy.resource_class_limit
+    assert claims == {"node:cluster-a:node-a": policy.node_limit}
     # Plain containment (cordon alone) is still free.
     cordon_only = [
         workflow_step(WorkflowOperation.MARK_UNSCHEDULABLE, node_ids=["node-a"])

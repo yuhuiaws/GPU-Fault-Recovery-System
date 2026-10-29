@@ -21,13 +21,6 @@ Administrators can currently configure:
   Per the complete model of a 1000-node single cluster in Performance Acceptance Plan §13.4: at 1024, 1150 of 3000 routine telemetry requests got 429;
   at 4096 all 6500 requests got 202 with P0 and evidence unchanged. 4096 is recommended when a single cluster has >= 512 nodes;
   the default 1024 corresponds to the preset 256-node cluster model);
-- The Region, cluster and resource class caps of the remediation budget (Region 1..400: the dispatcher selects the oldest
-  max(100, Region cap + 50) open workflows a tick, at most 400, and refuses to start under a Region cap above its batch). A site
-  that needs a Region cap above 400 makes a deliberate product change, not a configuration one: an explicit
-  `GPU_FAULT_WORKFLOW_BATCH_SIZE` of at least the cap for the control-plane roles (not an administrator field, so a reviewed
-  release-template change) and this bound raised in the same release, after checking that one tick still fits the 15-s
-  dispatch lease (about 1 s + 0.15 s per workflow over the dispatcher workers; more `dispatcherWorkers`, or a
-  `GPU_FAULT_WORKFLOW_DISPATCH_CYCLE_SECONDS` below the lease, keep it inside);
 - Aurora Serverless v2 Min/Max ACU;
 - Processor total queue, single-cluster queue, client backoff, persistent retry, completed record retention and the
   ingress's routine admission batch delay (`admissionBatchDelaySeconds`, 0..0.5 s, default 0.002; the default is
@@ -42,16 +35,28 @@ Administrators can currently configure:
   0..0.5 s, default 0.05); the defaults of all seven are likewise omitted from records and YAML, see §4.6;
 - Workflow scan period and dispatcher thread count;
 - The departed-node cleanup switch `workflow.departedNodeCleanup` (default `true`; its default is likewise omitted from
-  records and YAML, the live digests do not move, so it is not one of the 22 template fields): with `false` the control
+  records and YAML, the live digests do not move, so it is not one of the 19 template fields): with `false` the control
   plane no longer retires a departed node's Agent or closes its never-changed workflows and ESCALATED incidents by
   itself, and those records are left to `workflow-reconcile` (Administrator Operations §10.1.1);
 - Notification batch size and maximum attempts;
 - Raw evidence retention hours and per-node record cap.
 
-The formal template contains 22 administrator-configurable leaf fields in total. The node and failure-domain remediation budgets
-are safety constants fixed at 1 at runtime and do not appear in the template; if an old file still has
-`maxActivePerNode: 1` or `maxActivePerFailureDomain: 1` it is accepted and ignored, and any other value
-is refused. A training job, or a GPU node without a job, is one merged workflow (its nodes and GPUs are repaired in parallel
+The formal template contains 19 administrator-configurable leaf fields in total; the remediation section has none. The node and
+failure-domain remediation budgets are safety constants fixed at 1 at runtime and do not appear in the template; if an old file
+still has `maxActivePerNode: 1` or `maxActivePerFailureDomain: 1` it is accepted and ignored, and any other value is refused.
+`maxActiveRegion`, `maxActivePerCluster` and `maxActivePerResourceClass` are retired: no fixed number caps how many workflows a
+cluster or the region repairs at once; each GPU cluster's remediation storm breaker bounds a correlated fault (it trips once at
+least max(3, ceil(20% x the cluster's GPU nodes)) nodes of two or more workload domains enter destructive remediation within
+600 seconds, and holds the cluster's new destructive remediation until an operator runs `gpu-fault-admin remediation-storm
+release|abort`; detailed design v2 §9.5, Administrator Operations `GpuFaultRemediationStormBreakerOpen`). An older file that
+still spells the three keeps loading: no value is refused and none takes effect, and `gpu-fault-admin config` prints one
+retirement warning on stderr -- remove them from the file. A persisted `desired.json` that records them keeps the values in the
+record (every digest still verifies and a rollback restores them), but nothing renders or reads them, and
+`<state-dir>/admin-config.yaml` no longer writes them out. Their variables `GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION` /
+`..._PER_CLUSTER` / `..._PER_RESOURCE_CLASS` are no longer rendered into the role ConfigMaps; a process that still receives
+one starts, ignores it and logs a warning (administrator environment variables, "Retired"). The dispatch batch is no longer
+derived from the Region cap either, but from the dispatcher workers and the 15-s dispatch lease (346 rows as shipped).
+A training job, or a GPU node without a job, is one merged workflow (its nodes and GPUs are repaired in parallel
 inside it), workflows are kept apart per node (a second workflow on a node queues), and steps that stop or restart a job are
 also kept apart per job token; the failure-domain limit (fixed at 1) applies to that job token and to an SXID's NVSwitch fabric
 partition. Node labels (instance group, EKS node group, zone) no longer divide remediation failure
@@ -129,7 +134,7 @@ gpu-fault-admin config --state-dir /secure/gpu-fault
   reference; administrators need not and cannot fill in the identity by hand.
 
 Fields absent from the file inherit the currently persisted values. The CLI refuses unknown fields, wrong types, a spool switch inconsistent with its replicas,
-cluster/resource-class greater than Region, `managedNodeCount` less than
+`managedNodeCount` less than
 `largestClusterNodeCount`, combinations exceeding the accepted PostgreSQL fleet connection budget, and combinations violating the §5
 topology derivation rules (for example raising the managed node count to 2048 without raising `aurora.minAcu` to at least 20.5).
 The error message gives the exact next command to run.
@@ -177,7 +182,7 @@ and, in order:
    (three polls were measured at about 38 seconds, one takes about 6); a stale sample still keeps the step waiting. The
    ramp itself already happened in step 4, so this step normally ends after one read.
 7. Writes `history/<...>/after.json` and `result.json` (`APPLIED`), deletes `pending.json`,
-   and writes the normalised complete 22 items back to `<state-dir>/admin-config.yaml`.
+   and writes the normalised complete 19 items back to `<state-dir>/admin-config.yaml`.
 
 The log prints `admin-phase-begin <time> command=config phase=<step>` and
 `admin-phase-end ... status=ok|failed elapsed=<seconds>s` per step: steps 1-3 are `release-identity`,
@@ -279,13 +284,16 @@ the floor of `50-*` is exactly `128/128`. `preset: default` explicitly restores 
 
 Supported presets (multi-cluster topologies count 256 nodes per cluster, see Performance Acceptance Plan §2):
 
-| preset | worker replicas | Region budget | per cluster | per resource class | spool | max cluster / managed nodes | Aurora floor |
-|---|---:|---:|---:|---:|---|---:|---:|
-| `default` | 6 | 20 | 5 | 2 | disabled, 0 replicas | 512 / 512 | 8/32 (template value) |
-| `32-disabled` | 6 | 128 | 4 | 4 | disabled, 0 replicas | 256 / 8192 | 82/128 |
-| `32-enabled` | 5 | 128 | 4 | 4 | enabled, 3 replicas | 256 / 8192 | 82/128 |
-| `50-disabled` | 6 | 200 | 4 | 4 | disabled, 0 replicas | 256 / 12800 | 128/128 |
-| `50-enabled` | 5 | 200 | 4 | 4 | enabled, 3 replicas | 256 / 12800 | 128/128 |
+| preset | worker replicas | spool | max cluster / managed nodes | Aurora floor |
+|---|---:|---|---:|---:|
+| `default` | 6 | disabled, 0 replicas | 512 / 512 | 8/32 (template value) |
+| `32-disabled` | 6 | disabled, 0 replicas | 256 / 8192 | 82/128 |
+| `32-enabled` | 5 | enabled, 3 replicas | 256 / 8192 | 82/128 |
+| `50-disabled` | 6 | disabled, 0 replicas | 256 / 12800 | 128/128 |
+| `50-enabled` | 5 | enabled, 3 replicas | 256 / 12800 | 128/128 |
+
+A preset no longer sets remediation caps (it set Region 128/200, 4 per cluster and 4 per resource class, retired with the fixed
+limits); choosing one keeps the retired values an older record carries as they are.
 
 Node sizing: `32-enabled`/`50-enabled` settle at 3 api-ha x 4 cores + 5 control-worker x 3 cores + 3 spool-worker x
 1 core = 30 cores (plus about 3 cores of system Pods, the HyperPod operator and kueue), which 3 x `ml.c5.4xlarge`
@@ -466,10 +474,6 @@ spec:
       enabled: false
       replicas: 0
       maxClusterDepth: 1024
-    remediation:
-      maxActiveRegion: 20
-      maxActivePerCluster: 5
-      maxActivePerResourceClass: 2
   aurora:
     minAcu: 8
     maxAcu: 32
@@ -546,7 +550,7 @@ and `envFrom`, unknown fields or out-of-range combinations all fail before appli
 
 A first deployment has no historical `desired.json`, and omitted fields in the configuration file use the AdminConfig defaults. On an existing site
 omitted fields inherit the current `desired.json` values, suited to changing only a few fields with a partial `--file`. After a successful application
-`<state-dir>/admin-config.yaml` always writes out the complete 22 items; to restore defaults, fill in the template defaults explicitly,
+`<state-dir>/admin-config.yaml` always writes out the complete 19 items; to restore defaults, fill in the template defaults explicitly,
 or write `preset: default` for the capacity as a whole.
 
 ## 7. Taking Effect and Rollback
@@ -560,7 +564,7 @@ The configuration digest is independent of the code release ID, image digest and
   instances' actual ACU landed;
 - Runs no schema, GPU data-plane, Node Runtime or Runtime Profile phase;
 - Publishes no cluster registry revision;
-- A remediation budget or worker replica change rolls only the control-worker; a node count change changes the fault reserved depth shared by the three roles,
+- A worker replica change rolls only the control-worker (the remediation section has no field left to change); a node count change changes the fault reserved depth shared by the three roles,
   and therefore rolls all three CPU roles; the `workflow` section (`departedNodeCleanup` included) is in every role's digest, so
   changing it rolls all three CPU roles as well;
 - The roles roll one at a time, each waiting for its own rollout, in the order ingress -> control-worker ->

@@ -164,6 +164,54 @@ def _captured_processor(
     }
 
 
+# RemediationCapacity's retired fields -> the literal a release before their
+# retirement rendered into the worker core ConfigMap.
+RETIRED_REMEDIATION_LITERALS = {
+    "max_active_region": "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION",
+    "max_active_per_cluster": "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER",
+    "max_active_per_resource_class": (
+        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS"
+    ),
+}
+
+
+def _captured_remediation(
+    worker_core: Mapping[str, str], remediation: Any, recorded: Any
+) -> dict[str, object]:
+    """The remediation section: its two constants as the worker ConfigMap
+    carries them, and the retired values the site's record still holds.
+
+    Nothing renders or reads a retired value, so no ConfigMap of this release
+    holds one. They come from the release state the previous release recorded,
+    else from the ConfigMap an older release rendered, else they are absent --
+    so the captured config digests exactly like the desired config the live
+    roles were rendered from.
+    """
+
+    section: dict[str, object] = {
+        "max_active_per_node": int(
+            worker_core.get(
+                "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE",
+                remediation.max_active_per_node,
+            )
+        ),
+        "max_active_per_failure_domain": int(
+            worker_core.get(
+                "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN",
+                remediation.max_active_per_failure_domain,
+            )
+        ),
+    }
+    capacity = recorded.get("capacity") if isinstance(recorded, Mapping) else None
+    kept = capacity.get("remediation") if isinstance(capacity, Mapping) else None
+    for field, literal in RETIRED_REMEDIATION_LITERALS.items():
+        if isinstance(kept, Mapping) and kept.get(field) is not None:
+            section[field] = int(kept[field])
+        elif worker_core.get(literal) not in (None, ""):
+            section[field] = int(worker_core[literal])
+    return section
+
+
 def _captured_switch(data: Mapping[str, Any], name: str, default: bool) -> bool:
     """A boolean admin knob as a role ConfigMap carries it; absent is the
     default (a release from before the knob rendered none)."""
@@ -254,38 +302,9 @@ def captured_admin_config(
                         replicas=spool_replicas,
                         ingress_telemetry=ingress_telemetry,
                     ),
-                    "remediation": {
-                        "max_active_region": int(
-                            worker_core.get(
-                                "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION",
-                                remediation.max_active_region,
-                            )
-                        ),
-                        "max_active_per_cluster": int(
-                            worker_core.get(
-                                "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER",
-                                remediation.max_active_per_cluster,
-                            )
-                        ),
-                        "max_active_per_node": int(
-                            worker_core.get(
-                                "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE",
-                                remediation.max_active_per_node,
-                            )
-                        ),
-                        "max_active_per_failure_domain": int(
-                            worker_core.get(
-                                ("GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN"),
-                                remediation.max_active_per_failure_domain,
-                            )
-                        ),
-                        "max_active_per_resource_class": int(
-                            worker_core.get(
-                                ("GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS"),
-                                remediation.max_active_per_resource_class,
-                            )
-                        ),
-                    },
+                    "remediation": _captured_remediation(
+                        worker_core, remediation, recorded
+                    ),
                     **_captured_node_counts(worker_core),
                 },
                 "processor": _captured_processor(ingress_processor, processor),

@@ -3,8 +3,9 @@
 ``terminal_state`` parks a workflow BLOCKED / NEEDS_OPERATOR when a node
 action's outcome is unknown as it ends -- a reboot whose result never came back:
 nothing automatic may treat the node as free. Batch 89 released the budget hold
-at every BLOCKED, so with ``cluster_limit=1`` a second workflow started in the
-cluster while the first one's reboot might still be running. The hold now lasts
+at every BLOCKED, so a second workflow started (batch 89: in the cluster, under
+a per-cluster limit of 1 since retired; here: on the node) while the first
+one's reboot might still be running. The hold now lasts
 while the record still occupies its node with an unresolved node action, until
 an operator answers it (``confirm-node-action``), a reconcile ends the record,
 or its receipts settle it; every other BLOCKED kind releases at once.
@@ -47,12 +48,21 @@ from tests.execution._budget_hold_support import (
     budget_executor,
     holders,
     operator_confirmed,
-    seed,
 )
+from tests.execution._budget_hold_support import seed as _seed
 
 NOW = datetime(2026, 7, 20, 10, 0, tzinfo=timezone.utc)
-CLUSTER = "cluster:cluster-a"
-ONE_PER_CLUSTER = RemediationBudgetPolicy(region_limit=20, cluster_limit=1)
+NODE = "node-shared"
+SCOPE = f"node:cluster-a:{NODE}"
+# A token every synthetic row lists, as workflows stopping one job do.
+JOB_SCOPE = "job:cluster-a:default/pytorchjob/job-7"
+POLICY = RemediationBudgetPolicy()
+
+
+def seed(store, suffix: str, **values):
+    """Every workflow of these cases on one node: its slot serializes them."""
+
+    return _seed(store, suffix, node_id=NODE, **values)
 
 
 @pytest.fixture(params=["memory", "sqlite"])
@@ -73,25 +83,23 @@ def _park_a(store):
     a = seed(store, "a", created_at=NOW)
     b = seed(store, "b", created_at=NOW + timedelta(seconds=1))
     adapter = UnknownOutcomeAdapter(REBOOT_PLAN, {a.request_id})
-    executor = budget_executor(store, adapter, ONE_PER_CLUSTER)
+    executor = budget_executor(store, adapter, POLICY)
     assert execute_workflow(executor, a.request_id).status is WorkflowStatus.BLOCKED
     parked = store.get_workflow(a.request_id)
     assert parked.blocked_kind is BlockedKind.NEEDS_OPERATOR
-    assert CLUSTER in parked.remediation_budget_claims
+    assert SCOPE in parked.remediation_budget_claims
     return a, b, adapter, executor
 
 
-def test_a_reboot_of_unknown_outcome_holds_the_cluster_until_an_operator_confirms(
-    store,
-):
+def test_a_reboot_of_unknown_outcome_holds_the_node_until_an_operator_confirms(store):
     a, b, adapter, executor = _park_a(store)
 
-    assert store.remediation_budget_occupancy().get(CLUSTER) == 1, (
+    assert store.remediation_budget_occupancy().get(SCOPE) == 1, (
         "a parked record whose reboot may still be running released its budget"
     )
     with pytest.raises(RemediationBudgetError) as refused:
         execute_workflow(executor, b.request_id)
-    assert refused.value.scope == CLUSTER
+    assert refused.value.scope == SCOPE
     assert b.request_id not in adapter.started(), adapter.calls
 
     # confirm-node-action answers the question on the step it parked on; the
@@ -99,13 +107,13 @@ def test_a_reboot_of_unknown_outcome_holds_the_cluster_until_an_operator_confirm
     # its node is no longer mid-action, so the hold ends here.
     parked = store.get_workflow(a.request_id)
     store.save_workflow(
-        operator_confirmed(parked, now=NOW, node_id="node-a"), expected=parked
+        operator_confirmed(parked, now=NOW, node_id=NODE), expected=parked
     )
     assert store.get_workflow(a.request_id).status is WorkflowStatus.BLOCKED
-    assert store.remediation_budget_occupancy().get(CLUSTER, 0) == 0
+    assert store.remediation_budget_occupancy().get(SCOPE, 0) == 0
 
     assert execute_workflow(executor, b.request_id).status is WorkflowStatus.RUNNING
-    assert holders([store.get_workflow(b.request_id)], CLUSTER) == [b.request_id]
+    assert holders([store.get_workflow(b.request_id)], SCOPE) == [b.request_id]
 
 
 def test_a_reconcile_that_ends_the_parked_record_releases_its_budget(store):
@@ -123,7 +131,7 @@ def test_a_reconcile_that_ends_the_parked_record_releases_its_budget(store):
         expected=parked,
     )
 
-    assert store.remediation_budget_occupancy().get(CLUSTER, 0) == 0
+    assert store.remediation_budget_occupancy().get(SCOPE, 0) == 0
     assert execute_workflow(executor, b.request_id).status is WorkflowStatus.RUNNING
 
 
@@ -133,8 +141,14 @@ PROVIDER_WAITING = {"submitted_nodes": ["node"], "activated_spare_nodes": []}
 
 
 def _blocked(
-    name: str, kind: BlockedKind | None, *, unresolved: bool, waiting: bool = False
+    name: str,
+    kind: BlockedKind | None,
+    *,
+    unresolved: bool,
+    waiting: bool = False,
+    node: str | None = None,
 ):
+    node = node or f"node-{name}"
     reboot = workflow_step_execution(
         1,
         REBOOT,
@@ -154,12 +168,12 @@ def _blocked(
         status=WorkflowStatus.BLOCKED,
         blocked_kind=kind,
         official_steps=[
-            workflow_step(STOP, node_ids=[f"node-{name}"]),
-            workflow_step(REBOOT, node_ids=[f"node-{name}"]),
+            workflow_step(STOP, node_ids=[node]),
+            workflow_step(REBOOT, node_ids=[node]),
         ],
         completed_step_indexes=[0],
         step_executions=[workflow_step_execution(0, STOP), reboot],
-        remediation_budget_claims=[CLUSTER, "region", f"node:cluster-a:node-{name}"],
+        remediation_budget_claims=[JOB_SCOPE, f"node:cluster-a:{node}"],
     )
 
 
@@ -200,13 +214,12 @@ def test_each_blocked_kind_holds_only_while_its_node_may_still_be_mid_action():
     ]
 
     assert budget_occupancy(rows) == {
-        CLUSTER: 3,
-        "region": 3,
+        JOB_SCOPE: 3,
         "node:cluster-a:node-parked": 1,
         "node:cluster-a:node-internal-unknown": 1,
         "node:cluster-a:node-internal-waiting": 1,
     }
-    assert budget_occupancy(rows, claimant=parked.request_id)[CLUSTER] == 2
+    assert budget_occupancy(rows, claimant=parked.request_id)[JOB_SCOPE] == 2
 
 
 # ------------------------------------------------- the longest an action lives
@@ -255,7 +268,7 @@ def test_a_lapsed_parked_hold_is_released_once_and_the_record_stays_blocked(
         release_lapsed_parked_holds(store, watch, now=expires - timedelta(seconds=1))
         == []
     )
-    assert store.remediation_budget_occupancy().get(CLUSTER) == 1, (
+    assert store.remediation_budget_occupancy().get(SCOPE) == 1, (
         "a hold released before its action can have ended"
     )
 
@@ -276,7 +289,7 @@ def test_a_lapsed_parked_hold_is_released_once_and_the_record_stays_blocked(
     assert event.details["action_age_seconds"] >= NODE_ACTION_LONGEST_LIFE_SECONDS
     assert watch.parked_holds_released_total == 1
     assert watch.parked_hold_release_last_seen_timestamp_seconds > 0
-    assert store.remediation_budget_occupancy().get(CLUSTER, 0) == 0
+    assert store.remediation_budget_occupancy().get(SCOPE, 0) == 0
     assert execute_workflow(executor, b.request_id).status is WorkflowStatus.RUNNING
 
     # Logged and audited once: the record holds nothing for a later look.
@@ -298,19 +311,19 @@ def test_an_internal_error_record_with_a_waiting_provider_reboot_holds_until_the
     the reboot can no longer be running."""
 
     holder = copy_model(
-        _blocked("a", BlockedKind.INTERNAL_ERROR, unresolved=False, waiting=True),
+        _blocked(
+            "a", BlockedKind.INTERNAL_ERROR, unresolved=False, waiting=True, node=NODE
+        ),
         incident_id="incident-a",
         execution_epoch=1,
     )
     store.save_workflow(holder)
     waiter = seed(store, "b", created_at=NOW + timedelta(seconds=1))
-    executor = budget_executor(
-        store, UnknownOutcomeAdapter(REBOOT_PLAN, set()), ONE_PER_CLUSTER
-    )
+    executor = budget_executor(store, UnknownOutcomeAdapter(REBOOT_PLAN, set()), POLICY)
 
     with pytest.raises(RemediationBudgetError) as refused:
         execute_workflow(executor, waiter.request_id)
-    assert refused.value.scope == CLUSTER
+    assert refused.value.scope == SCOPE
 
     expires = parked_hold_expires_at(store.get_workflow(holder.request_id))
     assert expires == NOW + timedelta(seconds=NODE_ACTION_LONGEST_LIFE_SECONDS)

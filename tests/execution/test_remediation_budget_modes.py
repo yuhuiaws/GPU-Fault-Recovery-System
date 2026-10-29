@@ -1,5 +1,9 @@
 """Which claim a workflow makes: admission for its pending budgeted steps, or a
-hold of what it already holds once its own budgeted work has begun."""
+hold of what it already holds once its own budgeted work has begun.
+
+Each step of the plan acts on its own node (and STOP on the job), so the
+scopes say which steps a claim covers.
+"""
 
 from __future__ import annotations
 
@@ -17,6 +21,12 @@ from tests._builders import (
 )
 from tests.execution._budget_hold_support import REBOOT, RESET, RESTORE_GPU, STOP
 
+JOB = "default/pytorchjob/job-x"
+STOP_SCOPES = {f"job:cluster-a:{JOB}", "node:cluster-a:node-x"}
+RESET_SCOPE = "node:cluster-a:node-r"
+REBOOT_SCOPE = "node:cluster-a:node-b"
+WHOLE_PLAN = sorted({*STOP_SCOPES, RESET_SCOPE, REBOOT_SCOPE})
+
 
 def _incident():
     return fault_incident("incident-x", "event-x", node_ids=["node-x"])
@@ -27,9 +37,9 @@ def _plan(**values):
         "workflow-x",
         "incident-x",
         official_steps=[
-            workflow_step(STOP, node_ids=["node-x"]),
-            workflow_step(RESET, node_ids=["node-x"]),
-            workflow_step(REBOOT, node_ids=["node-x"]),
+            workflow_step(STOP, node_ids=["node-x"], workload_ids=[JOB]),
+            workflow_step(RESET, node_ids=["node-r"]),
+            workflow_step(REBOOT, node_ids=["node-b"]),
         ],
         **values,
     )
@@ -42,14 +52,7 @@ def test_a_fresh_workflow_is_admitted_for_its_pending_budgeted_steps():
     )
 
     assert budget_work_begun(workflow, workflow.official_steps) is False
-    assert sorted(claims) == [
-        "class:cluster-a:GPU_RUNTIME_MUTATION",
-        "class:cluster-a:NODE_LIFECYCLE_MUTATION",
-        "class:cluster-a:WORKLOAD_MUTATION",
-        "cluster:cluster-a",
-        "node:cluster-a:node-x",
-        "region",
-    ]
+    assert sorted(claims) == WHOLE_PLAN
 
 
 def test_a_started_workflow_holds_what_it_holds_plus_its_own_plan():
@@ -64,10 +67,9 @@ def test_a_started_workflow_holds_what_it_holds_plus_its_own_plan():
     )
 
     assert budget_work_begun(workflow, workflow.official_steps) is True
-    # Completed STOP keeps its class: the hold is the whole plan's, until the end.
-    assert "class:cluster-a:WORKLOAD_MUTATION" in claims
-    assert "class:cluster-a:NODE_LIFECYCLE_MUTATION" in claims
-    assert claims["cluster:cluster-a"] == 5
+    # Completed STOP keeps its scopes: the hold is the whole plan's, until the
+    # end. The fixed limits an older release held stay the store's to keep.
+    assert sorted(claims) == WHOLE_PLAN
 
 
 def test_inherited_containment_does_not_make_a_successor_started():
@@ -83,8 +85,7 @@ def test_inherited_containment_does_not_make_a_successor_started():
     )
 
     assert budget_work_begun(workflow, workflow.official_steps) is False
-    assert "class:cluster-a:WORKLOAD_MUTATION" not in claims
-    assert "class:cluster-a:NODE_LIFECYCLE_MUTATION" in claims
+    assert sorted(claims) == [REBOOT_SCOPE, RESET_SCOPE]
 
 
 def test_superseded_budgeted_steps_claim_nothing():
@@ -93,9 +94,7 @@ def test_superseded_budgeted_steps_claim_nothing():
         RemediationBudgetPolicy(), workflow, _incident(), workflow.official_steps
     )
 
-    assert "class:cluster-a:GPU_RUNTIME_MUTATION" not in claims
-    assert "class:cluster-a:NODE_LIFECYCLE_MUTATION" not in claims
-    assert "class:cluster-a:WORKLOAD_MUTATION" in claims
+    assert set(claims) == STOP_SCOPES
 
 
 def test_owed_compensation_is_started_work_even_without_a_budgeted_step():
@@ -136,11 +135,4 @@ def test_a_record_without_claims_heals_to_its_whole_plan_once_started():
         RemediationBudgetPolicy(), workflow, _incident(), workflow.official_steps
     )
 
-    assert sorted(claims) == [
-        "class:cluster-a:GPU_RUNTIME_MUTATION",
-        "class:cluster-a:NODE_LIFECYCLE_MUTATION",
-        "class:cluster-a:WORKLOAD_MUTATION",
-        "cluster:cluster-a",
-        "node:cluster-a:node-x",
-        "region",
-    ]
+    assert sorted(claims) == WHOLE_PLAN

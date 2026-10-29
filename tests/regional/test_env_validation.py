@@ -50,6 +50,28 @@ def test_unknown_environment_can_warn(caplog: pytest.LogCaptureFixture) -> None:
     assert "GPU_FAULT_UNKNOWN_SETTING" in caplog.text
 
 
+def test_a_retired_variable_starts_the_process_and_is_named_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An older release's ConfigMap, the one a rollback restores, or a site
+    override may still carry the retired remediation limits: never refuse
+    them, whatever their value, and say they are ignored."""
+
+    retired = dict.fromkeys(env_validation.RETIRED_ENVIRONMENT, "not-a-number")
+
+    assert unknown_gpu_fault_environment(retired) == []
+    assert invalid_gpu_fault_environment_values(retired) == []
+    with caplog.at_level(logging.WARNING, logger="gpu_fault.env_validation"):
+        validate_gpu_fault_environment(retired, process_name="test-process")
+
+    (record,) = caplog.records
+    assert "retired GPU_FAULT_* environment variable(s), ignored" in record.getMessage()
+    for name in env_validation.RETIRED_ENVIRONMENT:
+        assert name in record.getMessage()
+        assert name not in environment_value_kinds(), "a retired name is never typed"
+    assert "remediation storm breaker" in record.getMessage()
+
+
 def test_pytest_only_environment_is_scoped_to_pytest() -> None:
     values = {
         "PYTEST_CURRENT_TEST": "tests/test_example.py::test_case",
@@ -94,6 +116,9 @@ def test_deploy_manifests_only_use_known_environment() -> None:
             and not any(name.startswith(prefix) for prefix in prefixes)
         )
         == []
+    )
+    assert not names & set(env_validation.RETIRED_ENVIRONMENT), (
+        "a checked-in manifest still renders a retired variable"
     )
 
 

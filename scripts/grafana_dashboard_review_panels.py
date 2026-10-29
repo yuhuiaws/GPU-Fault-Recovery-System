@@ -559,6 +559,23 @@ REMEDIATION_STORM_PANEL = _panel(
     "1 while a cluster's storm breaker holds its new destructive remediation, "
     "and the workflows it holds.",
 )
+REMEDIATION_STORM_WINDOW_PANEL = _panel(
+    "Remediation storm breaker: nodes entering remediation vs threshold",
+    (
+        (
+            f"max by (cluster_id) ({series(_STORM + '_window_nodes', _CLUSTER)})",
+            "{{cluster_id}} nodes",
+        ),
+        (
+            f"max by (cluster_id) ({series(_STORM + '_threshold_nodes', _CLUSTER)})",
+            "{{cluster_id}} threshold",
+        ),
+    ),
+    "Distinct GPU nodes that entered destructive remediation in each cluster's "
+    "600-s window (frozen at the trip while open), against the max(3, ceil(20% "
+    "of its GPU nodes)) it trips at; no fixed number caps a cluster's "
+    "remediations.",
+)
 REMEDIATION_LONGEST_WAIT_PANEL = _panel(
     "Longest remediation budget wait",
     (

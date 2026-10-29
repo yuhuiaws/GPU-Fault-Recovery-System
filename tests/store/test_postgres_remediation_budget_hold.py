@@ -4,7 +4,8 @@ The rule (``gpu_fault.store.shared.remediation_budgets``) is decided on the
 rows ``remediation_budget_holders.budget_candidates`` reads under the scope
 advisory locks; ``remediation_budget_occupancy`` is the same rule as one
 aggregate for the dispatcher. Both have to see a legacy row, a dual row and a
-dedicated row alike.
+dedicated row alike. Every workflow of these cases is on one node, whose slot
+serializes them (they once filled a per-cluster limit, since retired).
 """
 
 from __future__ import annotations
@@ -51,8 +52,8 @@ from tests.execution._budget_hold_support import (
     budget_dispatcher,
     budget_executor,
     operator_confirmed,
-    seed,
 )
+from tests.execution._budget_hold_support import seed as _seed
 from tests.store import test_postgres_state_tables as state_tables
 from tests.store.test_postgres_workflow_state_tables import select_mode
 
@@ -63,9 +64,17 @@ pytestmark = pytest.mark.skipif(
     not POSTGRES_URL, reason="GPU_FAULT_TEST_POSTGRES_URL is not configured"
 )
 NOW = datetime(2026, 7, 20, 10, 0, tzinfo=UTC)
-CLUSTER = "cluster:cluster-a"
-TWO_PER_CLUSTER = RemediationBudgetPolicy(cluster_limit=2, resource_class_limit=10)
-ONE_PER_CLUSTER = RemediationBudgetPolicy(cluster_limit=1, resource_class_limit=10)
+NODE = "node-shared"
+SCOPE = f"node:cluster-a:{NODE}"
+# A node slot of two (a test policy; production is 1) leaves one slot to race for.
+TWO_PER_NODE = RemediationBudgetPolicy(node_limit=2)
+ONE_PER_NODE = RemediationBudgetPolicy()
+
+
+def seed(store, suffix: str, **values):
+    """Every workflow of these cases on one node: its slot serializes them."""
+
+    return _seed(store, suffix, node_id=NODE, **values)
 
 
 @pytest.fixture(params=["legacy", "dual", "dedicated"])
@@ -99,15 +108,13 @@ def test_two_dispatch_attempts_race_for_the_last_slot(store):
     left = seed(store, "left", created_at=NOW + timedelta(seconds=1))
     right = seed(store, "right", created_at=NOW + timedelta(seconds=2))
     adapter = ScriptedAdapter(REBOOT_PLAN)
-    execute_workflow(
-        budget_executor(store, adapter, TWO_PER_CLUSTER), holder.request_id
-    )
+    execute_workflow(budget_executor(store, adapter, TWO_PER_NODE), holder.request_id)
     assert POSTGRES_URL is not None, "a second replica needs the database"
     replica = PostgresStore(POSTGRES_URL, initialize_schema=False)
     executors = {
-        left.request_id: budget_executor(store, adapter, TWO_PER_CLUSTER),
+        left.request_id: budget_executor(store, adapter, TWO_PER_NODE),
         right.request_id: budget_executor(
-            replica, adapter, TWO_PER_CLUSTER, executor_id="executor-b"
+            replica, adapter, TWO_PER_NODE, executor_id="executor-b"
         ),
     }
     ready = Barrier(2)
@@ -134,7 +141,7 @@ def test_two_dispatch_attempts_race_for_the_last_slot(store):
     assert sorted(results.values()) == ["admitted", "refused"], results
     winner = next(key for key, value in results.items() if value == "admitted")
     loser = next(key for key, value in results.items() if value == "refused")
-    assert store.remediation_budget_occupancy().get(CLUSTER) == 2
+    assert store.remediation_budget_occupancy().get(SCOPE) == 2
     assert store.get_workflow(loser).status is WorkflowStatus.PENDING
     assert adapter.started() == {holder.request_id, winner}, adapter.calls
 
@@ -144,7 +151,7 @@ def test_a_lapsed_lease_still_holds_the_scope(store):
     waiter = seed(store, "waiter", created_at=NOW + timedelta(seconds=1))
     past = datetime.now(UTC) - timedelta(minutes=10)
     claims = remediation_budget_claims(
-        ONE_PER_CLUSTER,
+        ONE_PER_NODE,
         holder,
         store.get_incident(holder.incident_id),
         holder.official_steps,
@@ -167,8 +174,8 @@ def test_a_lapsed_lease_still_holds_the_scope(store):
             waiter.fencing_token,
             remediation_budget_claims=claims,
         )
-    assert refused.value.scope == CLUSTER
-    assert store.remediation_budget_occupancy().get(CLUSTER) == 1
+    assert refused.value.scope == SCOPE
+    assert store.remediation_budget_occupancy().get(SCOPE) == 1
 
 
 def test_a_parked_record_of_unknown_outcome_holds_until_an_operator_confirms(store):
@@ -178,7 +185,7 @@ def test_a_parked_record_of_unknown_outcome_holds_until_an_operator_confirms(sto
     parked = seed(store, "a", created_at=NOW)
     waiter = seed(store, "b", created_at=NOW + timedelta(seconds=1))
     adapter = UnknownOutcomeAdapter(REBOOT_PLAN, {parked.request_id})
-    executor = budget_executor(store, adapter, ONE_PER_CLUSTER)
+    executor = budget_executor(store, adapter, ONE_PER_NODE)
     assert execute_workflow(executor, parked.request_id).status is (
         WorkflowStatus.BLOCKED
     )
@@ -186,16 +193,14 @@ def test_a_parked_record_of_unknown_outcome_holds_until_an_operator_confirms(sto
         BlockedKind.NEEDS_OPERATOR
     )
 
-    assert store.remediation_budget_occupancy().get(CLUSTER) == 1
+    assert store.remediation_budget_occupancy().get(SCOPE) == 1
     with pytest.raises(RemediationBudgetError) as refused:
         execute_workflow(executor, waiter.request_id)
-    assert refused.value.scope == CLUSTER
+    assert refused.value.scope == SCOPE
 
     row = store.get_workflow(parked.request_id)
-    store.save_workflow(
-        operator_confirmed(row, now=NOW, node_id="node-a"), expected=row
-    )
-    assert store.remediation_budget_occupancy().get(CLUSTER, 0) == 0
+    store.save_workflow(operator_confirmed(row, now=NOW, node_id=NODE), expected=row)
+    assert store.remediation_budget_occupancy().get(SCOPE, 0) == 0
     assert execute_workflow(executor, waiter.request_id).status is (
         WorkflowStatus.RUNNING
     )
@@ -205,7 +210,7 @@ def test_a_parked_record_of_unknown_outcome_holds_until_an_operator_confirms(sto
 def test_the_handoff_reservation_keeps_exactly_one_hold(store):
     predecessor = seed(store, "a", created_at=NOW)
     adapter = ScriptedAdapter(REBOOT_PLAN)
-    executor = budget_executor(store, adapter, ONE_PER_CLUSTER)
+    executor = budget_executor(store, adapter, ONE_PER_NODE)
     execute_workflow(executor, predecessor.request_id)
     held = store.get_workflow(predecessor.request_id)
     successor = workflow_request(
@@ -236,12 +241,9 @@ def test_the_handoff_reservation_keeps_exactly_one_hold(store):
         held.execution_epoch,
     )
 
-    assert store.remediation_budget_occupancy().get(CLUSTER) == 1
+    assert store.remediation_budget_occupancy().get(SCOPE) == 1
     other_claims = remediation_budget_claims(
-        ONE_PER_CLUSTER,
-        other,
-        store.get_incident(other.incident_id),
-        other.official_steps,
+        ONE_PER_NODE, other, store.get_incident(other.incident_id), other.official_steps
     )
     with pytest.raises(RemediationBudgetError):
         store.claim_workflow(
@@ -256,14 +258,14 @@ def test_the_handoff_reservation_keeps_exactly_one_hold(store):
         "executor-a",
         successor.fencing_token,
         remediation_budget_claims=remediation_budget_claims(
-            ONE_PER_CLUSTER,
+            ONE_PER_NODE,
             successor,
             store.get_incident(successor.incident_id),
             successor.official_steps,
         ),
     )
     assert claimed.status is WorkflowStatus.RUNNING
-    assert store.remediation_budget_occupancy().get(CLUSTER) == 1, (
+    assert store.remediation_budget_occupancy().get(SCOPE) == 1, (
         "the handoff counted the predecessor and the successor at once"
     )
     with pytest.raises(RemediationBudgetError):
@@ -274,14 +276,14 @@ def test_the_handoff_reservation_keeps_exactly_one_hold(store):
             remediation_budget_claims=other_claims,
         )
     _end(store, successor.request_id)
-    assert store.remediation_budget_occupancy().get(CLUSTER, 0) == 0
+    assert store.remediation_budget_occupancy().get(SCOPE, 0) == 0
     admitted = store.claim_workflow(
         other.request_id,
         "executor-b",
         other.fencing_token,
         remediation_budget_claims=other_claims,
     )
-    assert CLUSTER in admitted.remediation_budget_claims
+    assert SCOPE in admitted.remediation_budget_claims
 
 
 def _blocked_shape(
@@ -331,7 +333,8 @@ def _seed_every_holder_shape(store) -> None:
         store.save_workflow(
             copy_model(
                 workflow,
-                remediation_budget_claims=[CLUSTER, "region", f"node:{name}"],
+                # "region" as an older release left it: counted, never limited.
+                remediation_budget_claims=[SCOPE, "region", f"node:{name}"],
                 **values,
             )
         )
@@ -341,7 +344,7 @@ def _seed_every_holder_shape(store) -> None:
             predecessor,
             status=WorkflowStatus.SUPERSEDED,
             preempted_by_workflow_id="workflow-succ",
-            remediation_budget_claims=[CLUSTER, "node:pred"],
+            remediation_budget_claims=[SCOPE, "node:pred"],
         )
     )
     store.save_workflow(
@@ -364,7 +367,7 @@ def test_occupancy_matches_the_shared_rule_on_every_row_shape(store):
 
     assert occupancy == dict(budget_occupancy(store.list_workflows(None, limit=1000)))
     assert occupancy == {
-        CLUSTER: 5,
+        SCOPE: 5,
         "region": 4,
         "node:running": 1,
         "node:lapsed": 1,
@@ -402,7 +405,7 @@ def test_a_hold_is_never_refused_and_keeps_what_it_holds(store):
     holder = seed(store, "holder", created_at=NOW)
     started = seed(store, "started", created_at=NOW + timedelta(seconds=1))
     execute_workflow(
-        budget_executor(store, ScriptedAdapter(REBOOT_PLAN), ONE_PER_CLUSTER),
+        budget_executor(store, ScriptedAdapter(REBOOT_PLAN), ONE_PER_NODE),
         holder.request_id,
     )
     store.save_workflow(
@@ -420,21 +423,13 @@ def test_a_hold_is_never_refused_and_keeps_what_it_holds(store):
         started.request_id,
         "executor-a",
         started.fencing_token,
-        remediation_budget_claims={CLUSTER: 1, "region": 20},
+        remediation_budget_claims={SCOPE: 1},
         remediation_budget_hold=True,
     )
 
-    assert claimed.remediation_budget_claims == [
-        CLUSTER,
-        "domain:cluster-a:rack-1",
-        "region",
-    ]
-    assert claimed.remediation_budget_limits == {
-        CLUSTER: 1,
-        "domain:cluster-a:rack-1": 1,
-        "region": 20,
-    }
-    assert store.remediation_budget_occupancy().get(CLUSTER) == 2
+    assert claimed.remediation_budget_claims == ["domain:cluster-a:rack-1", SCOPE]
+    assert claimed.remediation_budget_limits == {SCOPE: 1, "domain:cluster-a:rack-1": 1}
+    assert store.remediation_budget_occupancy().get(SCOPE) == 2
 
 
 def test_a_full_scope_storm_does_not_starve_another_cluster(store):
@@ -445,7 +440,7 @@ def test_a_full_scope_storm_does_not_starve_another_cluster(store):
         for index in range(8)
     ]
     adapter = ScriptedAdapter(REBOOT_PLAN)
-    dispatcher = budget_dispatcher(store, adapter, TWO_PER_CLUSTER, batch_size=4)
+    dispatcher = budget_dispatcher(store, adapter, TWO_PER_NODE, batch_size=4)
     for _ in range(3):
         dispatcher.run_once()
     waiting = [store.get_workflow(item.request_id) for item in storm]
@@ -454,7 +449,7 @@ def test_a_full_scope_storm_does_not_starve_another_cluster(store):
         item.remediation_budget_last_blocked_scope
         for item in waiting
         if item.status is WorkflowStatus.PENDING
-    } == {CLUSTER}
+    } == {SCOPE}
 
     late = seed(
         store, "late", cluster_id="cluster-b", created_at=NOW + timedelta(hours=1)
@@ -478,7 +473,7 @@ def test_never_refused_waiters_are_recorded_by_compare_and_set_in_every_mode(sto
         store, "late", cluster_id="cluster-b", created_at=NOW + timedelta(hours=1)
     )
     adapter = ScriptedAdapter(REBOOT_PLAN)
-    dispatcher = budget_dispatcher(store, adapter, TWO_PER_CLUSTER, batch_size=4)
+    dispatcher = budget_dispatcher(store, adapter, TWO_PER_NODE, batch_size=4)
 
     dispatcher.run_once()
     report = dispatcher.run_once()
@@ -492,7 +487,7 @@ def test_never_refused_waiters_are_recorded_by_compare_and_set_in_every_mode(sto
         if store.get_workflow(item.request_id).status is WorkflowStatus.PENDING
     ]
     assert len(waiting) == 10
-    assert {item.remediation_budget_last_blocked_scope for item in waiting} == {CLUSTER}
+    assert {item.remediation_budget_last_blocked_scope for item in waiting} == {SCOPE}
     assert {item.remediation_budget_wait_count for item in waiting} == {1}
     assert sum(item.request_id in adapter.started() for item in waiting) == 0
 
@@ -504,11 +499,11 @@ def test_a_lapsed_parked_hold_is_released_by_compare_and_set_in_every_mode(store
     parked = seed(store, "a", created_at=NOW)
     waiter = seed(store, "b", created_at=NOW + timedelta(seconds=1))
     adapter = UnknownOutcomeAdapter(REBOOT_PLAN, {parked.request_id})
-    executor = budget_executor(store, adapter, ONE_PER_CLUSTER)
+    executor = budget_executor(store, adapter, ONE_PER_NODE)
     execute_workflow(executor, parked.request_id)
     expires = parked_hold_expires_at(store.get_workflow(parked.request_id))
     assert expires is not None
-    assert store.remediation_budget_occupancy().get(CLUSTER) == 1
+    assert store.remediation_budget_occupancy().get(SCOPE) == 1
 
     released = release_lapsed_parked_holds(
         store, BudgetWatch(), now=expires + timedelta(minutes=1)
@@ -518,7 +513,7 @@ def test_a_lapsed_parked_hold_is_released_by_compare_and_set_in_every_mode(store
     row = store.get_workflow(parked.request_id)
     assert row.status is WorkflowStatus.BLOCKED and row.remediation_budget_claims == []
     assert [event.code for event in row.events][-1] == "PARKED_BUDGET_RELEASED"
-    assert store.remediation_budget_occupancy().get(CLUSTER, 0) == 0
+    assert store.remediation_budget_occupancy().get(SCOPE, 0) == 0
     assert execute_workflow(executor, waiter.request_id).status is (
         WorkflowStatus.RUNNING
     )
@@ -529,7 +524,7 @@ def test_a_waiting_provider_reboot_holds_an_internal_error_record_in_every_mode(
     store.save_workflow(
         copy_model(
             holder,
-            remediation_budget_claims=[CLUSTER, "region", "node:cluster-a:node-a"],
+            remediation_budget_claims=[SCOPE],
             **_blocked_shape(
                 BlockedKind.INTERNAL_ERROR, PROVIDER_WAITING, WorkflowStepStatus.WAITING
             ),
@@ -537,10 +532,10 @@ def test_a_waiting_provider_reboot_holds_an_internal_error_record_in_every_mode(
     )
     waiter = seed(store, "b", created_at=NOW + timedelta(seconds=1))
     executor = budget_executor(
-        store, UnknownOutcomeAdapter(REBOOT_PLAN, set()), ONE_PER_CLUSTER
+        store, UnknownOutcomeAdapter(REBOOT_PLAN, set()), ONE_PER_NODE
     )
 
-    assert store.remediation_budget_occupancy().get(CLUSTER) == 1
+    assert store.remediation_budget_occupancy().get(SCOPE) == 1
     with pytest.raises(RemediationBudgetError) as refused:
         execute_workflow(executor, waiter.request_id)
-    assert refused.value.scope == CLUSTER
+    assert refused.value.scope == SCOPE

@@ -16,6 +16,11 @@ from gpu_fault.app import ApplicationContext, create_app
 from tests._builders import asgi_client, build_context, build_store
 
 ROOT = Path(__file__).resolve().parents[2]
+RETIRED_REMEDIATION_LIMITS = (
+    "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION",
+    "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER",
+    "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS",
+)
 # The admission flush ranges (ceiling and floor per tier) are site-wide and
 # divided among the ingress processes (3 replicas x 4 workers); no per-process
 # group literal remains. 192 is the pre-cap 16 per process that schema v22 made
@@ -284,9 +289,10 @@ def test_role_split_renders_ingress_and_scalable_workers() -> None:
     assert worker_env["GPU_FAULT_PROCESSOR_RETRY_BACKOFF_SECONDS"] == "1"
     assert worker_env["GPU_FAULT_PROCESSOR_RETRY_BACKOFF_MAX_SECONDS"] == "30"
     assert worker_env["GPU_FAULT_PROCESSOR_ROUTINE_STARVATION_SECONDS"] == "30"
-    assert worker_env["GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION"] == "20"
-    assert worker_env["GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER"] == "5"
-    assert worker_env["GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS"] == "2"
+    assert worker_env["GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE"] == "1"
+    assert worker_env["GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN"] == "1"
+    for retired in RETIRED_REMEDIATION_LIMITS:
+        assert retired not in worker_env, f"{retired} is retired, never rendered"
     assert worker_env["GPU_FAULT_PROCESSOR_FAULT_PRESSURE_EVIDENCE_WORKERS"] == "1"
     assert worker_env["GPU_FAULT_PROCESSOR_THREAD_DUMP_SIGNAL"] == "SIGUSR2"
     assert spool_env["GPU_FAULT_POSTGRES_STATEMENT_TIMEOUT_SECONDS"] == "20"
@@ -354,9 +360,10 @@ def test_role_split_accepts_formal_capacity_overrides() -> None:
     assert ingress_env["GPU_FAULT_STORE_IO_WORKERS"] == "24"
     assert ingress_env["GPU_FAULT_POSTGRES_FLEET_CONNECTION_BUDGET"] == "1240"
     assert items["gpu-fault-telemetry-spool-worker"]["spec"]["replicas"] == 3
-    assert worker_env["GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION"] == "128"
-    assert worker_env["GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER"] == "4"
-    assert worker_env["GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS"] == "4"
+    # An older release's apply environment still carries the retired limits:
+    # the renderer ignores them and renders the two constants only.
+    for retired in RETIRED_REMEDIATION_LIMITS:
+        assert retired not in worker_env, f"{retired} is retired, never rendered"
     assert worker_env["GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE"] == "1"
     assert worker_env["GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN"] == "1"
 

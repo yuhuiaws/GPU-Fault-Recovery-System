@@ -8,6 +8,7 @@ so this module only knows the document envelope and the file permissions.
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 from pathlib import Path
 
@@ -25,7 +26,7 @@ from gpu_fault.admin.config import (
     load_desired_admin_config,
     persist_desired_admin_config,
 )
-from gpu_fault.admin.config_parser import mapping_field
+from gpu_fault.admin.config_parser import mapping_field, retired_spec_fields
 from gpu_fault.admin.config_patch import apply_patch
 
 ADMIN_CONFIG_EDITABLE = Path("admin-config.yaml")
@@ -59,7 +60,20 @@ def load_admin_config_file(
         )
     if data.get("kind") != ADMIN_CONFIG_KIND:
         raise AdminConfigError(f"admin config kind must be {ADMIN_CONFIG_KIND}")
-    return apply_patch(base or default_admin_config(), data.get("spec") or {})
+    base = base or default_admin_config()
+    spec = data.get("spec") or {}
+    retired = retired_spec_fields(base, spec, path="spec")
+    if retired:
+        # Accepted, never refused: an existing site's file must keep loading.
+        print(
+            f"warning: admin config {source}: {', '.join(retired)} "
+            f"{'is' if len(retired) == 1 else 'are'} retired and ignored. No "
+            "fixed number caps how many remediations run at once any more; each "
+            "GPU cluster's remediation storm breaker bounds a correlated fault "
+            "(detailed design 9.5). Remove the field(s) from the file.",
+            file=sys.stderr,
+        )
+    return apply_patch(base, spec)
 
 
 def admin_config_file_path(state_dir: Path) -> Path:

@@ -563,18 +563,6 @@ def renderer_admin_config() -> AdminConfig:
                 ),
             },
             "remediation": {
-                "max_active_region": int(
-                    os.getenv(
-                        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION",
-                        str(remediation.max_active_region),
-                    )
-                ),
-                "max_active_per_cluster": int(
-                    os.getenv(
-                        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER",
-                        str(remediation.max_active_per_cluster),
-                    )
-                ),
                 "max_active_per_node": int(
                     os.getenv(
                         "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE",
@@ -585,12 +573,6 @@ def renderer_admin_config() -> AdminConfig:
                     os.getenv(
                         ("GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN"),
                         str(remediation.max_active_per_failure_domain),
-                    )
-                ),
-                "max_active_per_resource_class": int(
-                    os.getenv(
-                        ("GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS"),
-                        str(remediation.max_active_per_resource_class),
                     )
                 ),
             },
@@ -765,17 +747,12 @@ def configure_request_budgets(container: dict) -> None:
 def configure_worker_capacity(container: dict, config: AdminConfig) -> None:
     set_env(container, "GPU_FAULT_PROCESSOR_WORKERS", "24")
     remediation = config.capacity.remediation
+    # The region, per-cluster and per-resource-class limits are retired: the
+    # cluster's remediation storm breaker bounds a correlated fault.
     values = {
-        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION": (remediation.max_active_region),
-        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER": (
-            remediation.max_active_per_cluster
-        ),
         "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE": (remediation.max_active_per_node),
         "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN": (
             remediation.max_active_per_failure_domain
-        ),
-        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS": (
-            remediation.max_active_per_resource_class
         ),
     }
     for name, value in values.items():

@@ -13,12 +13,12 @@ spec:
     telemetrySpool:
       enabled: false
       replicas: 0
-    remediation:
-      maxActiveRegion: 20
-      maxActivePerCluster: 5
-      maxActivePerResourceClass: 2
-      # maxActivePerNode and maxActivePerFailureDomain are safety constants
-      # fixed at 1; they are not configurable and are omitted here on purpose.
+    # No remediation field is an administrator input. One workflow per node
+    # and per failure domain are safety constants fixed at 1, and
+    # remediation.maxActiveRegion, maxActivePerCluster and
+    # maxActivePerResourceClass are retired: each GPU cluster's remediation
+    # storm breaker bounds a correlated fault. An older file that still
+    # spells them keeps loading; they are ignored with a warning.
   aurora:
     minAcu: 8
     maxAcu: 32

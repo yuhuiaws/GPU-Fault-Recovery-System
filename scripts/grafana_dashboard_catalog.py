@@ -37,6 +37,7 @@ from grafana_dashboard_review_panels import (
     QUEUE_DEPTH_PANELS,
     REMEDIATION_LONGEST_WAIT_PANEL,
     REMEDIATION_STORM_PANEL,
+    REMEDIATION_STORM_WINDOW_PANEL,
     REVIEW_COUNTER_PANELS,
 )
 
@@ -106,36 +107,8 @@ def _seconds_since(metric: str) -> str:
 
 def _remediation_budget_panels() -> tuple[Panel, ...]:
     return (
-        Panel(
-            "Remediation budget: active claims vs limit",
-            (
-                Target(
-                    "max by (cluster_id) ("
-                    + cluster_series(
-                        "gpu_fault_remediation_budget_cluster_active_claims"
-                    )
-                    + ")",
-                    "{{cluster_id}}",
-                ),
-                Target(
-                    f"max({series('gpu_fault_remediation_budget_cluster_limit')})",
-                    "limit",
-                ),
-            ),
-        ),
-        Panel(
-            "Workflows waiting for cluster budget",
-            (
-                Target(
-                    "max by (cluster_id) ("
-                    + cluster_series(
-                        "gpu_fault_remediation_budget_cluster_waiting_workflows"
-                    )
-                    + ")",
-                    "{{cluster_id}}",
-                ),
-            ),
-        ),
+        REMEDIATION_STORM_WINDOW_PANEL,
+        REMEDIATION_STORM_PANEL,
     )
 
 
@@ -1216,35 +1189,7 @@ RECOVERY_OUTCOME = Dashboard(
                         ),
                     ),
                 ),
-                Panel(
-                    "Cluster budget saturation",
-                    (
-                        Target(
-                            "max by (cluster_id) ("
-                            + cluster_series(
-                                "gpu_fault_remediation_budget_cluster_waiting_workflows"
-                            )
-                            + ")",
-                            "{{cluster_id}} waiting",
-                        ),
-                        Target(
-                            "max by (cluster_id) ("
-                            + cluster_series(
-                                "gpu_fault_remediation_budget_cluster_active_claims"
-                            )
-                            + ")",
-                            "{{cluster_id}} active",
-                        ),
-                        Target(
-                            f"max({series('gpu_fault_remediation_budget_cluster_limit')})",
-                            "limit",
-                        ),
-                    ),
-                    description=(
-                        "Saturated when a cluster has waiters while its active "
-                        "claims sit at the configured limit."
-                    ),
-                ),
+                REMEDIATION_STORM_WINDOW_PANEL,
                 REMEDIATION_STORM_PANEL,
                 REMEDIATION_LONGEST_WAIT_PANEL,
                 Panel(

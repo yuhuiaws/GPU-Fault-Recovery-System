@@ -195,7 +195,7 @@ def test_config_dry_run_is_local_and_prints_the_change_plan(
         tmp_path / "capacity.yaml",
         {
             "aurora": {"minAcu": 82, "maxAcu": 128},
-            "capacity": {"remediation": {"maxActiveRegion": 200}},
+            "capacity": {"controlWorkerReplicas": 5},
         },
     )
 
@@ -209,7 +209,7 @@ def test_config_dry_run_is_local_and_prints_the_change_plan(
     assert {change["field"] for change in output["changes"]} == {
         "aurora.max_acu",
         "aurora.min_acu",
-        "capacity.remediation.max_active_region",
+        "capacity.control_worker_replicas",
     }
     assert output["before_config_sha256"] == legacy.sha256()
     assert desired_path.read_bytes() == persisted, "dry-run migrated desired.json"
@@ -439,9 +439,7 @@ def test_config_holds_the_site_lock_across_the_whole_apply(
         return 0
 
     monkeypatch.setattr(admin_cli, "_run_automatic_release", release)
-    config = _yaml(
-        tmp_path / "c.yaml", {"capacity": {"remediation": {"maxActiveRegion": 40}}}
-    )
+    config = _yaml(tmp_path / "c.yaml", {"capacity": {"controlWorkerReplicas": 5}})
 
     assert admin_cli.run(_arguments(tmp_path, "--file", str(config))) == 0
 
@@ -574,14 +572,7 @@ def test_config_reads_live_release_state_from_the_cpu_configmap(
 
     monkeypatch.setattr(release_state, "run_command", run)
     Stubs(monkeypatch)
-    config = _yaml(
-        tmp_path / "c.yaml",
-        {
-            "capacity": {
-                "remediation": {"maxActiveRegion": 128, "maxActivePerCluster": 4}
-            }
-        },
-    )
+    config = _yaml(tmp_path / "c.yaml", {"capacity": {"controlWorkerReplicas": 5}})
 
     assert admin_cli.run(_arguments(tmp_path, "--file", str(config))) == 0
 
@@ -649,7 +640,7 @@ def test_first_deploy_can_import_private_admin_config(
 
     assert admin_cli.run(arguments) == 0
     desired = load_desired_admin_config(tmp_path / "state")
-    assert desired.capacity.remediation.max_active_region == 128
+    assert desired.capacity.managed_node_count == 32 * 256
     canonical = admin_config_file_path(tmp_path / "state")
     assert load_desired_admin_config(tmp_path / "state") == (
         admin_cli.load_admin_config_file(canonical)
@@ -712,9 +703,7 @@ def test_config_hands_its_site_lock_to_release_deploy(
         return 0
 
     monkeypatch.setattr(admin_cli, "_run_automatic_release", release)
-    config = _yaml(
-        tmp_path / "c.yaml", {"capacity": {"remediation": {"maxActiveRegion": 40}}}
-    )
+    config = _yaml(tmp_path / "c.yaml", {"capacity": {"controlWorkerReplicas": 5}})
 
     assert admin_cli.run(_arguments(tmp_path, "--file", str(config))) == 0
 

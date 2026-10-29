@@ -43,10 +43,10 @@ from gpu_fault.admin.config_parser import (
     AdminConfigParseError,
     boolean_field,
     camel_case,
+    retired_spec_fields,
 )
 from gpu_fault.admin.config_patch import apply_patch, preset_admin_config
 from gpu_fault.admin.site import SiteConfigError
-from gpu_fault.execution.config import DISPATCH_BATCH_CEILING
 
 ROOT = Path(__file__).resolve().parents[2]
 SITE_IDENTITY = {
@@ -100,9 +100,9 @@ def _begin(tmp_path: Path, desired: AdminConfig, **overrides):
 
 
 def test_default_as_dict_is_the_persisted_digest_contract() -> None:
-    """Every live desired.json digests exactly this tree; a key change here
-    would refuse every site on its next read. The two safety constants stay
-    in the record although they are no longer fields."""
+    """A new desired.json digests exactly this tree. The two safety constants
+    stay in the record although they are no longer fields; the three retired
+    remediation fields are absent from a new record."""
 
     expected = {
         "schema_version": 1,
@@ -112,9 +112,6 @@ def test_default_as_dict_is_the_persisted_digest_contract() -> None:
             "managed_node_count": 512,
             "telemetry_spool": {"enabled": False, "replicas": 0},
             "remediation": {
-                "max_active_region": 20,
-                "max_active_per_cluster": 5,
-                "max_active_per_resource_class": 2,
                 "max_active_per_node": 1,
                 "max_active_per_failure_domain": 1,
             },
@@ -140,14 +137,110 @@ def test_default_as_dict_is_the_persisted_digest_contract() -> None:
     assert AdminConfig.from_mapping(expected) == config
 
 
-def test_the_region_budget_stops_at_the_dispatch_batch_ceiling() -> None:
-    """The dispatcher's batch is derived from the Region budget and capped at
-    400; the control plane refuses to start under a larger budget, so the
-    configuration refuses it first."""
+# A record written while the region, per-cluster and per-resource-class limits
+# were administrator inputs (every live site before their retirement).
+RETIRED_VALUES = {
+    "max_active_region": 20,
+    "max_active_per_cluster": 5,
+    "max_active_per_resource_class": 2,
+}
 
-    RemediationCapacity(max_active_region=DISPATCH_BATCH_CEILING).validate()
-    with pytest.raises(AdminConfigError, match="maxActiveRegion must be within 1..400"):
-        RemediationCapacity(max_active_region=DISPATCH_BATCH_CEILING + 1).validate()
+
+def _record_with_retired_values() -> dict:
+    record = default_admin_config().as_dict()
+    record["capacity"]["remediation"].update(RETIRED_VALUES)
+    return record
+
+
+def test_a_record_with_the_retired_limits_reads_back_with_its_own_digests() -> None:
+    """Every live desired.json, release state and rollback snapshot carries the
+    three; the values stay recorded, so each digest over them still verifies
+    and an unrelated change rolls no extra role."""
+
+    record = _record_with_retired_values()
+
+    config = AdminConfig.from_mapping(record)
+
+    assert config.as_dict() == record
+    assert config.sha256() == canonical_sha256(record)
+    assert config.capacity.remediation.max_active_region == 20
+    assert config != default_admin_config()
+    # The worker role digests the remediation section as the release that
+    # wrote the record did: all five values.
+    assert config.role_payload("worker")["remediation"] == {
+        **RETIRED_VALUES,
+        "max_active_per_node": 1,
+        "max_active_per_failure_domain": 1,
+    }
+    # Nothing validates or renders them: any recorded value reads back.
+    record["capacity"]["remediation"]["max_active_region"] = 900
+    AdminConfig.from_mapping(record).validate()
+    changed = apply_patch(config, {"capacity": {"controlWorkerReplicas": 5}})
+    assert changed.capacity.remediation == config.capacity.remediation
+    assert changed.role_sha256()["ingress"] == config.role_sha256()["ingress"]
+
+
+def test_a_desired_json_with_the_retired_limits_is_verified_not_refused(
+    tmp_path: Path,
+) -> None:
+    record = _record_with_retired_values()
+    config = AdminConfig.from_mapping(record)
+    path = admin_config_desired_path(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "config": record,
+                "config_sha256": canonical_sha256(record),
+                "role_sha256": {
+                    role: canonical_sha256(config.role_payload(role))
+                    for role in ("ingress", "worker", "spool")
+                },
+                "source": "file:/secure/admin-config.yaml",
+                "updated_at": "2026-10-21T22:27:26+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    before = path.read_bytes()
+
+    assert load_desired_admin_config(tmp_path, migrate_legacy=True) == config
+    assert path.read_bytes() == before, "a current record is not rewritten"
+
+
+def test_a_spec_that_still_spells_the_retired_limits_loads_with_a_warning(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Never refuse an existing site: accepted whatever the value, ignored --
+    the recorded value stays -- and named once on stderr."""
+
+    base = AdminConfig.from_mapping(_record_with_retired_values())
+    spec = {
+        "capacity": {
+            "remediation": {
+                "maxActiveRegion": 900,
+                "maxActivePerCluster": "five",
+                "maxActivePerResourceClass": 2,
+                "maxActivePerNode": 1,
+            }
+        }
+    }
+
+    assert apply_patch(base, spec) == base
+    assert apply_patch(default_admin_config(), spec) == default_admin_config()
+    assert retired_spec_fields(base, spec, path="spec") == [
+        "spec.capacity.remediation.maxActiveRegion",
+        "spec.capacity.remediation.maxActivePerCluster",
+        "spec.capacity.remediation.maxActivePerResourceClass",
+    ]
+    path = _config_file(tmp_path, spec["capacity"])
+    assert load_admin_config_file(path, base=base) == base
+    warning = capsys.readouterr().err
+    assert "maxActiveRegion, spec.capacity.remediation.maxActivePerCluster" in warning
+    assert "are retired and ignored" in warning and "storm breaker" in warning
+    # The YAML form never shows them, not even for a record that has them.
+    assert "remediation" not in admin_config_spec(base)["capacity"]
 
 
 def test_constant_budgets_are_readable_but_not_fields() -> None:
@@ -200,7 +293,7 @@ def test_yaml_spec_is_the_record_in_camel_case_without_constants() -> None:
         "capacity.remediation.maxActivePerFailureDomain",
     }
     assert leaves(spec) == camel_record - constants
-    assert len(leaves(spec)) == 22
+    assert len(leaves(spec)) == 19
     assert camel_case("notification_delivery") == "notificationDelivery"
     assert camel_case("min_acu") == "minAcu"
     # Round trip: the spec read back on top of the defaults is the config.
@@ -211,10 +304,11 @@ def test_capacity_presets_are_coherent_and_bounded() -> None:
     disabled = preset_admin_config("32-disabled")
     enabled = preset_admin_config("50-enabled")
 
-    assert disabled.capacity.remediation.max_active_region == 128
+    # A preset names a topology, not a remediation limit: none is left to set.
+    assert disabled.capacity.remediation == RemediationCapacity()
     assert disabled.capacity.telemetry_spool.enabled is False
     assert disabled.capacity.telemetry_spool.replicas == 0
-    assert enabled.capacity.remediation.max_active_region == 200
+    assert enabled.capacity.remediation == RemediationCapacity()
     assert enabled.capacity.telemetry_spool.enabled is True
     assert enabled.capacity.telemetry_spool.replicas == 3
     assert disabled.role_sha256()["worker"] != enabled.role_sha256()["worker"]
@@ -438,7 +532,7 @@ def test_patch_accepts_node_counts_and_a_preset_adopts_its_aurora_floor(
         {"capacity": {"preset": "32-disabled", "controlWorkerReplicas": 5}},
     )
     assert tuned.capacity.control_worker_replicas == 5
-    assert tuned.capacity.remediation.max_active_region == 128
+    assert tuned.capacity.largest_cluster_node_count == 256
     with pytest.raises(AdminConfigError, match="unknown capacity preset"):
         apply_patch(default_admin_config(), {"capacity": {"preset": "64-enabled"}})
 
@@ -1002,7 +1096,7 @@ def test_default_admin_config_is_stable() -> None:
     config = default_admin_config()
 
     assert config.capacity.control_worker_replicas == 6
-    assert config.capacity.remediation.max_active_region == 20
+    assert config.capacity.remediation == RemediationCapacity()
     assert config.capacity.telemetry_spool.enabled is False
     # The product requirement is N clusters of 500+ nodes; one 512-node
     # cluster is the smallest topology that satisfies it.
@@ -1026,7 +1120,7 @@ def test_release_admin_config_template_matches_defaults() -> None:
     assert config == default_admin_config()
 
 
-def test_release_template_contains_exactly_twenty_two_admin_fields() -> None:
+def test_release_template_contains_exactly_nineteen_admin_fields() -> None:
     document = yaml.safe_load(
         (ROOT / "config/admin-config.example.yaml").read_text(encoding="utf-8")
     )
@@ -1036,14 +1130,13 @@ def test_release_template_contains_exactly_twenty_two_admin_fields() -> None:
             return 1
         return sum(leaves(item) for item in value.values())
 
-    assert leaves(document["spec"]) == 22
+    assert leaves(document["spec"]) == 19
     assert document["spec"]["aurora"] == {"minAcu": 8, "maxAcu": 32}
     assert document["spec"]["capacity"]["largestClusterNodeCount"] == 512
     assert document["spec"]["capacity"]["managedNodeCount"] == 512
     assert document["spec"]["processor"]["maxClusterQueueDepth"] == 4096
-    remediation = document["spec"]["capacity"]["remediation"]
-    assert "maxActivePerNode" not in remediation
-    assert "maxActivePerFailureDomain" not in remediation
+    # No remediation field is an input: constants, or retired.
+    assert "remediation" not in document["spec"]["capacity"]
 
 
 def test_admin_config_file_updates_aurora_without_changing_capacity(

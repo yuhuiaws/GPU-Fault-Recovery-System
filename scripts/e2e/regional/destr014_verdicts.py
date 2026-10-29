@@ -789,4 +789,12 @@ def budget_headroom_errors(budget: dict[str, Any]) -> list[str]:
     for name, scope in scopes.items():
         if int(scope.get("active") or 0) >= int(scope.get("limit") or 0):
             errors.append(f"remediation budget scope is full: {name}")
+    breaker = budget.get("storm_breaker") or {}
+    if breaker.get("open"):
+        errors.append(
+            "remediation storm breaker of the cluster is open "
+            f"({breaker.get('state')}, trip {breaker.get('trip_id')}): the case's "
+            "destructive workflows would be held; release it first with "
+            "gpu-fault-admin remediation-storm release"
+        )
     return errors

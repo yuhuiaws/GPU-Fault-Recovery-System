@@ -417,31 +417,28 @@ VALUE_TEMPLATE = '{{ $value | printf "%.0f" }}'
     ("inputs", "eval_time", "value"),
     [
         pytest.param(
-            [series(OVER_LIMIT_SCOPES, "0+0x30", scope_type="cluster")],
+            [series(OVER_LIMIT_SCOPES, "0+0x30", scope_type="job")],
             "20m",
             None,
             id="no-scope-over-its-limit",
         ),
         pytest.param(
-            [series(OVER_LIMIT_SCOPES, "0x5 1+0x25", scope_type="cluster")],
+            [series(OVER_LIMIT_SCOPES, "0x5 1+0x25", scope_type="job")],
             "20m",
             1,
             id="over-its-limit-for-ten-minutes",
         ),
         pytest.param(
-            [series(OVER_LIMIT_SCOPES, "0x5 1+0x8 0+0x16", scope_type="cluster")],
+            [series(OVER_LIMIT_SCOPES, "0x5 1+0x8 0+0x16", scope_type="job")],
             "15m",
             None,
             id="a-nine-minute-roll-window-stays-pending",
         ),
         pytest.param(
             [
-                series(OVER_LIMIT_SCOPES, "0x5 1+0x10 0+0x14", scope_type="cluster"),
+                series(OVER_LIMIT_SCOPES, "0x5 1+0x10 0+0x14", scope_type="job"),
                 series(
-                    OVER_LIMIT_SCOPES,
-                    "0x15 1+0x15",
-                    pod="worker-b",
-                    scope_type="cluster",
+                    OVER_LIMIT_SCOPES, "0x15 1+0x15", pod="worker-b", scope_type="job"
                 ),
                 series(OVER_LIMIT_SCOPES, "0+0x30", pod="worker-b", scope_type="node"),
             ],
@@ -451,7 +448,7 @@ VALUE_TEMPLATE = '{{ $value | printf "%.0f" }}'
         ),
         pytest.param(
             [
-                series(OVER_LIMIT_SCOPES, "0x5 1+0x25", scope_type="cluster"),
+                series(OVER_LIMIT_SCOPES, "0x5 1+0x25", scope_type="job"),
                 series(OVER_LIMIT_SCOPES, "0x5 2+0x25", scope_type="node"),
             ],
             "20m",

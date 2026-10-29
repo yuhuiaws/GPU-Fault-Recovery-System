@@ -48,7 +48,6 @@ from gpu_fault.admin.config_parser import (
 )
 from gpu_fault.admin.operation_lock import SiteOperationBusy, site_operation_lock
 from gpu_fault.digests import SHA256_PATTERN
-from gpu_fault.execution.config import DISPATCH_BATCH_CEILING
 from gpu_fault.postgres_capacity import PostgresPoolCapacity, flush_slots_per_process
 
 __all__ = ["AdminConfigError", "aurora_min_acu_floor"]
@@ -90,9 +89,25 @@ class _Section:
 
 @dataclass(frozen=True)
 class RemediationCapacity(_Section):
-    max_active_region: int = 20
-    max_active_per_cluster: int = 5
-    max_active_per_resource_class: int = 2
+    """The remediation budget: one workflow per node and per failure domain.
+
+    Both are safety constants (``_CONSTANT_FIELDS``), so nothing here is an
+    administrator input any more. ``maxActiveRegion``, ``maxActivePerCluster``
+    and ``maxActivePerResourceClass`` are retired: a cluster's remediation
+    storm breaker, not a fixed count, bounds a correlated fault (detailed
+    design §9.5). A record written while they were inputs keeps its values --
+    every digest over it still verifies, and a rollback restores them -- but
+    nothing renders or reads them, and a YAML ``spec`` that still spells them
+    is accepted with a deprecation warning and otherwise ignored.
+    """
+
+    max_active_region: int | None = None
+    max_active_per_cluster: int | None = None
+    max_active_per_resource_class: int | None = None
+    RETIRED_FIELDS = frozenset(
+        {"max_active_region", "max_active_per_cluster", "max_active_per_resource_class"}
+    )
+    OMIT_WHEN_DEFAULT = RETIRED_FIELDS
 
     @property
     def max_active_per_node(self) -> int:
@@ -103,31 +118,7 @@ class RemediationCapacity(_Section):
         return MAX_ACTIVE_PER_FAILURE_DOMAIN
 
     def validate(self) -> None:
-        bounds = {
-            # The dispatch batch is derived from the Region budget and stops at
-            # DISPATCH_BATCH_CEILING; a larger budget would refuse to start.
-            "maxActiveRegion": (self.max_active_region, 1, DISPATCH_BATCH_CEILING),
-            "maxActivePerCluster": (self.max_active_per_cluster, 1, 128),
-            "maxActivePerResourceClass": (
-                self.max_active_per_resource_class,
-                1,
-                128,
-            ),
-        }
-        for name, (value, minimum, maximum) in bounds.items():
-            if not minimum <= value <= maximum:
-                raise AdminConfigError(
-                    f"spec.capacity.remediation.{name} must be within "
-                    f"{minimum}..{maximum}"
-                )
-        if self.max_active_per_cluster > self.max_active_region:
-            raise AdminConfigError(
-                "maxActivePerCluster must not exceed maxActiveRegion"
-            )
-        if self.max_active_per_resource_class > self.max_active_region:
-            raise AdminConfigError(
-                "maxActivePerResourceClass must not exceed maxActiveRegion"
-            )
+        """Nothing to judge: the limits left are constants, the rest retired."""
 
 
 @dataclass(frozen=True)

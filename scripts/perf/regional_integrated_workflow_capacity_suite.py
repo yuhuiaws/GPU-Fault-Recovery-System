@@ -416,10 +416,12 @@ def ensure_aurora_capacity(
 
 
 def remediation_budget_preflight(clusters: int) -> dict:
+    """Per node and failure domain 1, no retired fixed limit (perf plan §4.3)."""
+    del clusters  # no budget per cluster count is left to select
     expected = {
-        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION": str(128 if clusters == 32 else 200),
-        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER": "4",
-        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS": "4",
+        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION": None,
+        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER": None,
+        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS": None,
         "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE": "1",
         "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN": "1",
     }

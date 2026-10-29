@@ -49,8 +49,9 @@ Every formal load-test round must record:
 - Aurora min/max ACU, instance status, connection limit and deadlock counts before and after the test;
 - spool enabled/disabled, worker count, batch size and in-flight byte limit;
 - processor completion cluster concurrency, retry backoff and lane policy distribution;
-- the five remediation budget tiers: Region, cluster, node, failure domain and resource class;
-  when the release lacks this capability record `unsupported` explicitly, never fabricate defaults;
+- the five remediation budget tiers: Region, cluster, node, failure domain and resource class (a release after the
+  fixed limits' retirement has two, node and failure domain, and records the remediation storm breaker's state, see
+  §4.3); when the release lacks this capability record `unsupported` explicitly, never fabricate defaults;
 - GPU cluster count, node count, request mix, duration and concurrency;
 - load generator CPU/memory limits, actual usage and the dedicated node it runs on;
 - start/end UTC times and cleanup result.
@@ -304,6 +305,30 @@ mutation. Every workflow contains at least:
 - remote command claim/result;
 - DAG dependency, lease and fencing.
 
+**After the fixed limits' retirement (the remediation storm breaker, detailed design v2 §9.5).** This section, the
+"production-budget / raw-capacity tiers" of §8.2 and the budget matrix of §13.5 apply only to a release that still has the
+Region, per-cluster and per-resource-class limits. On a later release:
+
+- the control workers carry no `GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION` / `..._PER_CLUSTER` / `..._PER_RESOURCE_CLASS` (a
+  process that receives one ignores it). The action runner's budget tier reads `unbounded` and its occupancy verdict keeps
+  only the node / job / domain scopes of limit 1 (evidence); the integrated runner's `remediation-budget-preflight.json`
+  requires the three absent and per node and per failure domain at 1; the dispatch batch is derived from the dispatcher
+  workers and the dispatch lease (346 rows as shipped), no longer from a Region budget.
+- both request models trip the remediation storm breaker: once at least max(3, ceil(20% x the cluster's registered GPU
+  nodes)) nodes of two or more workload domains (one per incident or job) enter destructive remediation within 600 seconds,
+  the cluster's remaining workflows are held until an operator runs `gpu-fault-admin remediation-storm release`. The
+  runners register Agents only for the model's own nodes (action: workflows x nodes-per-workflow per cluster; integrated:
+  4 per cluster), so the threshold is its floor of 3: the action default model (two 4-node workflows) trips on each
+  cluster's second workflow, the integrated one (four single-node workflows) on the third; the rest stay `PENDING` and the
+  run fails at `--timeout-seconds`.
+- before running, choose one and write it into this plan: (a) register additional healthy ACTIVE Agents per perf cluster
+  so the registered nodes are at least 5 x the model's nodes + 1 (the integrated formal model already is 256 nodes per
+  cluster, threshold 52), keeping the model under the threshold so the run still measures throughput; or (b) define the
+  round as a breaker acceptance: one trip per cluster, one `REMEDIATION_STORM_TRIPPED` notice and
+  `GpuFaultRemediationStormBreakerOpen` firing expected, a drain after the release, judged on convergence and no double
+  counting. Until a choice is made and the runners are changed, do not start the action / integrated suites on that
+  release.
+
 A release that includes the durable remediation budget must split the Action load test into
 two tiers:
 
@@ -343,7 +368,8 @@ production-budget figures are the throttle's result: the verdict stays §6.3 (co
 no starvation, final convergence), not a regression threshold.
 
 The dispatcher selects the oldest max(100, Region budget + 50) open workflows a tick, at most 400
-(detailed design §9.5). The production-budget tier (Region 20) keeps 100; the integrated runner's
+(detailed design §9.5; after the fixed limits' retirement, the rows the execution threads work in half the dispatch
+lease, 346 as shipped). The production-budget tier (Region 20) keeps 100; the integrated runner's
 Region budgets of 128 and 200 give 178 and 250, so every workflow of a 32- or 50-cluster round is
 inside one tick's selection, where the fixed 100 rows made the second 100 workflows of the
 50-cluster round wait for the first (the scheduling model, with per-command completion and
@@ -715,7 +741,8 @@ scripts/perf/regional_action_capacity_suite.py \
 ```
 
 A release with a remediation budget must run the production-budget tier and the raw-capacity
-tier separately with the same request model. The raw-capacity tier must satisfy at least:
+tier separately with the same request model (only a release before the fixed limits' retirement; on a later one see the
+note in §4.3: both tiers read `unbounded` and the request model trips the remediation storm breaker). The raw-capacity tier must satisfy at least:
 
 ```text
 Region limit >= clusters * workflows_per_cluster
@@ -1026,7 +1053,8 @@ The runner
 then hard-verifies that both `db.serverless` instances are `available` and that the actual
 CloudWatch capacity of each is not below 124 ACU; at the same time it reads
 `GPU_FAULT_REMEDIATION_MAX_ACTIVE_*` from every control-worker Pod one by one and requires them
-to match the 32/50-cluster budgets of the table below exactly. The results are written to
+to match the 32/50-cluster budgets of the table below exactly (a release after the fixed limits' retirement: Region,
+per cluster and per resource class absent, per node and per failure domain at 1). The results are written to
 `aurora-preflight.json` and `remediation-budget-preflight.json` respectively.
 Before registration the runner also mirrors the connection Secret from the data-plane identity
 namespace (`GPU_FAULT_PERF_IDENTITY_NAMESPACE`) into the perf namespace (the perf namespace is
@@ -1382,7 +1410,9 @@ connection pool and dedicated spool-worker configuration of §13.1. The load gen
 workers, 60 seconds, cold connections; the request matrix used the fixed 32/50-cluster model of
 §4.1.
 
-All four rounds loaded and held the following remediation budget:
+All four rounds loaded and held the following remediation budget (a release before the fixed limits' retirement; a
+later one has only per node and per failure domain, both 1, and its request model trips the remediation storm breaker,
+see §4.3):
 
 | Clusters | Region | Per cluster | Per resource class | Per node | Per failure domain |
 |---:|---:|---:|---:|---:|---:|

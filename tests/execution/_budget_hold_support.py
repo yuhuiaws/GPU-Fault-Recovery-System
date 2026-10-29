@@ -8,7 +8,6 @@ that one workflow.
 
 from __future__ import annotations
 
-from collections import Counter
 from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Any, Iterable, Sequence
@@ -222,24 +221,13 @@ def holders(workflows: Iterable[WorkflowRequest], scope: str) -> list[str]:
     )
 
 
-def holders_by_cluster(workflows: Iterable[WorkflowRequest]) -> Counter[str]:
-    counts: Counter[str] = Counter()
-    for workflow in workflows:
-        if workflow.status is not WorkflowStatus.RUNNING:
-            continue
-        for scope in workflow.remediation_budget_claims:
-            if scope.startswith("cluster:"):
-                counts[scope.removeprefix("cluster:")] += 1
-    return counts
-
-
 def all_workflows(store: Any) -> list[WorkflowRequest]:
     return list(store.list_workflows(None, limit=100_000))
 
 
 @pytest.fixture
 def large_fleet(monkeypatch: pytest.MonkeyPatch) -> None:
-    """For the cases that load one cluster's fixed budget limits, not its storm
+    """For the cases that load many nodes of one cluster, not its storm
     breaker: a fleet of 1000 GPU nodes puts the breaker's threshold (200 nodes
     in 600 s) out of their reach."""
 

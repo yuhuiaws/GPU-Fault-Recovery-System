@@ -14,10 +14,15 @@ keeps a count above zero for hours without one workflow waiting long, and one
 workflow stuck behind its own node's or job's holder looks like any other
 waiter. Only scope types with a waiter are rendered.
 
-The storm breaker families (``gpu_fault.remediation_storm``) are one series per
-cluster that has a breaker record: whether it is open, the nodes its window
-holds (frozen at the trip while open) against the threshold it last judged,
-when it tripped, and how many workflows it holds.
+No family is per cluster or carries a limit: no fixed number caps a cluster's
+or the region's remediations any more. Which cluster a correlated fault hits,
+and how close it came to holding, is the storm breaker's: its families
+(``gpu_fault.remediation_storm``) are one series per cluster that has a
+breaker record -- whether it is open, the nodes its window holds (frozen at
+the trip while open) against the threshold it last judged, when it tripped,
+and how many workflows it holds. A ``region``, ``cluster`` or ``class`` scope
+type an older release's RUNNING row still lists is counted in
+``gpu_fault_remediation_budget_active_claims`` until that row ends.
 """
 
 from __future__ import annotations
@@ -27,7 +32,6 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from gpu_fault.execution import ProductionExecutorConfig
 from gpu_fault.models import WorkflowRequest, WorkflowStatus
 from gpu_fault.remediation_storm import STORM_SCOPE_PREFIX, RemediationStormBreaker
 from gpu_fault.store.shared.remediation_budgets import (
@@ -49,9 +53,7 @@ class BudgetTally:
     """What one workflow scan says about the remediation budget."""
 
     active_by_scope_type: Counter[str] = field(default_factory=Counter)
-    active_by_cluster: Counter[str] = field(default_factory=Counter)
     waiting_by_scope_type: Counter[str] = field(default_factory=Counter)
-    waiting_by_cluster: Counter[str] = field(default_factory=Counter)
     longest_wait_by_scope_type: dict[str, float] = field(default_factory=dict)
     storm_held_by_cluster: Counter[str] = field(default_factory=Counter)
     wait_total: int = 0
@@ -66,8 +68,6 @@ def budget_tally(workflows: Iterable[WorkflowRequest], now: datetime) -> BudgetT
         if workflow.request_id in holding:
             for scope in workflow.remediation_budget_claims:
                 tally.active_by_scope_type[scope.split(":", 1)[0]] += 1
-                if scope.startswith("cluster:"):
-                    tally.active_by_cluster[scope.removeprefix("cluster:")] += 1
         tally.wait_total += workflow.remediation_budget_wait_count
         if (
             workflow.remediation_budget_last_blocked_reason is None
@@ -80,8 +80,6 @@ def budget_tally(workflows: Iterable[WorkflowRequest], now: datetime) -> BudgetT
             continue
         scope_type = blocked_scope.split(":", 1)[0]
         tally.waiting_by_scope_type[scope_type] += 1
-        if blocked_scope.startswith("cluster:"):
-            tally.waiting_by_cluster[blocked_scope.removeprefix("cluster:")] += 1
         if blocked_scope.startswith(STORM_SCOPE_PREFIX):
             cluster_id = blocked_scope.removeprefix(STORM_SCOPE_PREFIX)
             tally.storm_held_by_cluster[cluster_id] += 1
@@ -93,22 +91,8 @@ def budget_tally(workflows: Iterable[WorkflowRequest], now: datetime) -> BudgetT
     return tally
 
 
-def remediation_budget_lines(
-    tally: BudgetTally, *, config: ProductionExecutorConfig | None
-) -> list[str]:
-    """Render the remediation budget families from the scan tally.
-
-    The per-cluster families exist because the scope-type split cannot say
-    *which* cluster is saturated (S1): a correlated whole-cluster fault drains
-    at ``cluster_limit`` concurrent remediations, and an operator needs the
-    active/limit pair and the waiting count for that cluster to estimate the
-    drain time. Labels are the cluster id only -- never a node -- so the
-    cardinality is bounded by the fleet, not by the fault.
-
-    The limit gauge is omitted, not zeroed, when there is no executor policy
-    to read: a fabricated zero would make the saturation alert's ``limit > 0``
-    guard read as "never saturated".
-    """
+def remediation_budget_lines(tally: BudgetTally) -> list[str]:
+    """Render the remediation budget families from the scan tally."""
 
     lines = [
         "# HELP gpu_fault_remediation_budget_active_claims Active durable "
@@ -119,38 +103,6 @@ def remediation_budget_lines(
         lines.append(
             "gpu_fault_remediation_budget_active_claims"
             f'{{scope_type="{_escape_label(scope_type)}"}} {count}'
-        )
-    lines.extend(
-        [
-            "# HELP gpu_fault_remediation_budget_cluster_active_claims Workflows "
-            "holding this cluster's remediation budget claim: RUNNING (any lease) "
-            "or reserved for a preempting successor that has not claimed yet.",
-            "# TYPE gpu_fault_remediation_budget_cluster_active_claims gauge",
-        ]
-    )
-    for cluster_id, count in sorted(tally.active_by_cluster.items()):
-        lines.append(
-            "gpu_fault_remediation_budget_cluster_active_claims"
-            f'{{cluster_id="{_escape_label(cluster_id)}"}} {count}'
-        )
-    if config is not None:
-        lines.extend(
-            [
-                "# HELP gpu_fault_remediation_budget_cluster_limit Configured "
-                "per-cluster remediation concurrency limit "
-                "(GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER); a safety "
-                "limit, the same for every cluster.",
-                "# TYPE gpu_fault_remediation_budget_cluster_limit gauge",
-                "gpu_fault_remediation_budget_cluster_limit "
-                f"{config.remediation_budget.cluster_limit}",
-                "# HELP gpu_fault_remediation_budget_region_limit Configured "
-                "region-wide remediation concurrency limit "
-                "(GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION); compare with "
-                'gpu_fault_remediation_budget_active_claims{scope_type="region"}.',
-                "# TYPE gpu_fault_remediation_budget_region_limit gauge",
-                "gpu_fault_remediation_budget_region_limit "
-                f"{config.remediation_budget.region_limit}",
-            ]
         )
     lines.extend(
         [
@@ -186,19 +138,6 @@ def remediation_budget_lines(
         lines.append(
             "gpu_fault_remediation_budget_longest_wait_seconds"
             f'{{scope_type="{_escape_label(scope_type)}"}} {seconds:.0f}'
-        )
-    lines.extend(
-        [
-            "# HELP gpu_fault_remediation_budget_cluster_waiting_workflows "
-            "Workflows waiting because this cluster's remediation budget was "
-            "full when they last tried to claim.",
-            "# TYPE gpu_fault_remediation_budget_cluster_waiting_workflows gauge",
-        ]
-    )
-    for cluster_id, count in sorted(tally.waiting_by_cluster.items()):
-        lines.append(
-            "gpu_fault_remediation_budget_cluster_waiting_workflows"
-            f'{{cluster_id="{_escape_label(cluster_id)}"}} {count}'
         )
     return lines
 

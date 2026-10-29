@@ -1910,10 +1910,14 @@ groups:
             (execution_owner_id with a lease in the future) and read the
             control-worker log for the deadline and watchdog lines. Do not edit
             execution_deadline or delete the record to clear this.
-      # The remediation budget caps how many nodes the system mutates at once.
-      # Workflows waiting on it are correct behaviour under load. A claim is
-      # held until its workflow is terminal -- a lapsed lease does not release
-      # it -- and the holder's execution deadline bounds that hold: at that
+      # The remediation budget keeps workflows apart: one at a time per node,
+      # per job (a step that stops or restarts it) and per NVSwitch fabric
+      # partition; a cluster's storm breaker holds its new destructive work
+      # after a correlated fault. A workflow waits only behind another one of
+      # its own node or job, or behind an open breaker
+      # (GpuFaultRemediationStormBreakerOpen). A claim is held until its
+      # workflow is terminal -- a lapsed lease does not release it -- and the
+      # holder's execution deadline bounds that hold: at that
       # deadline the watchdog fails the holder, and a holder still RUNNING past
       # it is GpuFaultWorkflowDeadlineNotEnforced. The exception is a parked
       # record whose node action may still be running -- BLOCKED /
@@ -1934,13 +1938,17 @@ groups:
           summary: Recovery workflows have waited 30 minutes for remediation capacity
           runbook_url: docs/en/administrator-operations.md#gpufaultremediationbudgetstarved
           description: >-
-            {{ $value | printf "%.0f" }} workflows are held by a remediation budget. Compare
-            gpu_fault_remediation_budget_active_claims against the configured
-            scope limits and check whether an active claim belongs to a
-            workflow that is no longer making progress. A claim is held until
-            its workflow is terminal and at most until the holder's execution
-            deadline, at which the deadline watchdog fails it; a holder still
-            RUNNING past its deadline is GpuFaultWorkflowDeadlineNotEnforced.
+            {{ $value | printf "%.0f" }} workflows are held by a remediation budget. Read
+            gpu_fault_remediation_budget_waiting_workflows_by_scope: a storm
+            scope is an open storm breaker (GpuFaultRemediationStormBreakerOpen,
+            which only an operator releases); a node, job or domain scope is a
+            workflow waiting behind another one of its own node, job or fabric
+            partition -- check whether that holder is still making progress
+            (GpuFaultRemediationBudgetLongWait names the oldest). A claim is
+            held until its workflow is terminal and at most until the holder's
+            execution deadline, at which the deadline watchdog fails it; a
+            holder still RUNNING past its deadline is
+            GpuFaultWorkflowDeadlineNotEnforced.
             The exception is a parked record whose node action may still be
             running (BLOCKED / NEEDS_OPERATOR with an unresolved node action,
             or INTERNAL_ERROR with a provider reboot still WAITING): it keeps
@@ -1952,62 +1960,16 @@ groups:
             gpu_fault_remediation_budget_parked_holds_released_total); the
             record stays BLOCKED for the operator. A scope holding more than
             its limit is GpuFaultRemediationBudgetOverLimit.
-      # S1: the per-cluster remediation budget is a safety limit (five
-      # concurrent remediations per cluster as shipped). A correlated
-      # whole-cluster fault -- one AZ, 500+ nodes -- therefore drains five at a
-      # time and is EXPECTED to hold this alert for hours; what it adds over
-      # GpuFaultRemediationBudgetStarved is which cluster is saturated, so the
-      # operator can estimate the drain time instead of guessing at it. Both
-      # sides are Store-derived, so both are `max by` with the grouping labels;
-      # the limit gauge carries no cluster_id and is joined with `group_left`.
-      - alert: GpuFaultRemediationBudgetClusterSaturated
-        expr: >-
-          max by (control_plane_cluster, region, cluster_id)
-          (gpu_fault_remediation_budget_cluster_waiting_workflows) > 0
-          and on (control_plane_cluster, region, cluster_id)
-          (
-            max by (control_plane_cluster, region, cluster_id)
-            (gpu_fault_remediation_budget_cluster_active_claims)
-            >= on (control_plane_cluster, region) group_left
-            max by (control_plane_cluster, region)
-            (gpu_fault_remediation_budget_cluster_limit)
-          )
-        for: 30m
-        labels:
-          severity: warning
-        annotations:
-          summary: One GPU cluster's remediation budget has been saturated for 30 minutes
-          runbook_url: docs/en/administrator-operations.md#gpufaultremediationbudgetclustersaturated
-          description: >-
-            Cluster {{ $labels.cluster_id }} has {{ $value | printf "%.0f" }} recovery workflows
-            waiting on its remediation budget while its active claims sit at
-            the per-cluster limit. This is EXPECTED during a correlated
-            whole-cluster fault: the cluster drains at
-            gpu_fault_remediation_budget_cluster_limit remediations at a time,
-            so the drain time is roughly waiting / limit times the
-            per-remediation duration (see
-            gpu_fault_workflow_duration_seconds), which for hundreds of nodes
-            is tens of hours. The per-cluster limit is a safety limit on how
-            many nodes the system mutates at once and must not be widened just
-            to clear this alert. Check
-            gpu_fault_remediation_budget_cluster_active_claims against the
-            limit for this cluster, confirm the active claims belong to
-            workflows that are still progressing (a claim is held until its
-            workflow is terminal, bounded by the holder's execution deadline;
-            a holder that stopped progressing, or a parked record whose node
-            action may still be running, is GpuFaultRemediationBudgetStarved
-            territory), and read the oldest waiting workflow via
-            gpu_fault_workflow_pending_age_seconds_max and its
-            remediation_budget_last_blocked_reason.
       # A budget scope holding more workflows than its configured limit. Holds
       # are never refused (a refusal would strand a reset or a reboot), so this
       # is reachable only in documented windows (detailed design 9.5): rows an
       # older release left RUNNING without their claims re-take them during a
       # control-plane roll while an older dispatcher still alternating admits on
-      # its own count, a limit lowered under its holders, or a receipt-settled
-      # compensation re-taking its hold. Nothing new enters such a scope until it
-      # drains, so the excess cannot grow from this release: a warning, not a
-      # page. The gauge is read by the dispatch-lease holder only (the other
+      # its own count, or a receipt-settled compensation re-taking its hold. The
+      # region, cluster and resource-class scopes an older release claimed have
+      # no limit any more and are never counted here. Nothing new enters such a
+      # scope until it drains, so the excess cannot grow from this release: a
+      # warning, not a page. The gauge is read by the dispatch-lease holder only (the other
       # processes report zero), so the inner max is per scope type.
       - alert: GpuFaultRemediationBudgetOverLimit
         expr: >-
@@ -2027,13 +1989,13 @@ groups:
             this happens only in documented windows: workflows an older release
             left RUNNING without their claims re-take them during a
             control-plane roll (an older dispatcher still in the roll admits on
-            its own count), a limit was lowered under its holders, or a
-            receipt-settled compensation re-took its hold. Nothing new is
-            admitted into such a scope until it drains below the limit. Check
-            that the control-plane roll has finished, read the control-worker
-            log warning that names each scope with its holders and limit, and
-            compare gpu_fault_remediation_budget_active_claims with the limits;
-            the excess drains as the remediations in flight end, bounded by
+            its own count), or a receipt-settled compensation re-took its hold.
+            The scopes are per node, per job and per fabric partition, each
+            with a limit of 1. Nothing new is admitted into such a scope until
+            it drains below the limit. Check that the control-plane roll has
+            finished and read the control-worker log warning that names each
+            scope with its holders and limit; the excess drains as the
+            remediations in flight end, bounded by
             their deadlines and, for parked records, by
             NODE_ACTION_LONGEST_LIFE_SECONDS (5520 s). A scope still over its
             limit long after the roll ended means holders that no longer
@@ -2047,9 +2009,9 @@ groups:
       # hour is past what a progressing holder takes; the exceptions are an
       # operator-acknowledgement plan and a parked record. The age is per
       # workflow, from the refusal that began its wait, which the waiting
-      # count alone (GpuFaultRemediationBudgetStarved) cannot say. Cluster,
-      # region and resource-class waits drain by design during a correlated
-      # fault (GpuFaultRemediationBudgetClusterSaturated) and are not read here.
+      # count alone (GpuFaultRemediationBudgetStarved) cannot say. A wait on an
+      # open storm breaker is GpuFaultRemediationStormBreakerOpen's and is not
+      # read here.
       - alert: GpuFaultRemediationBudgetLongWait
         expr: >-
           max by (control_plane_cluster, region, scope_type)

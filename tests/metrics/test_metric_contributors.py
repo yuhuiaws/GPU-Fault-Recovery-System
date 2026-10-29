@@ -226,16 +226,15 @@ def test_closed_loop_metrics_cover_outcomes_budgets_and_notifications() -> None:
                 updated_at=NOW + timedelta(seconds=20),
             ),
         ],
-        remediation_budget_claims=["region", "cluster:cluster-a"],
+        remediation_budget_claims=["node:cluster-a:node-a"],
         remediation_budget_wait_count=2,
         created_at=NOW,
         updated_at=NOW + timedelta(seconds=30),
     )
     incident = incident.model_copy(update={"workflow_request_id": workflow.request_id})
     store.save_incident_and_workflow(incident, workflow)
-    # One RUNNING workflow with a live lease holds cluster-a's budget, and one
-    # PENDING workflow was last refused by that same cluster scope: the
-    # per-cluster families have to name cluster-a, and only cluster-a, for both.
+    # One RUNNING workflow with a live lease holds node-a's slot and its job's
+    # token, and one PENDING workflow was last refused by that same node scope.
     holder_incident = fault_incident(
         "incident-holder", "event-holder", state=IncidentState.ACTION_PENDING
     )
@@ -246,10 +245,8 @@ def test_closed_loop_metrics_cover_outcomes_budgets_and_notifications() -> None:
         execution_owner_id="executor-a",
         execution_lease_expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
         remediation_budget_claims=[
-            "class:cluster-a:NODE_LIFECYCLE_MUTATION",
-            "cluster:cluster-a",
+            "job:cluster-a:default/pytorchjob/job-a",
             "node:cluster-a:node-a",
-            "region",
         ],
     )
     store.save_incident_and_workflow(
@@ -266,9 +263,9 @@ def test_closed_loop_metrics_cover_outcomes_budgets_and_notifications() -> None:
         remediation_budget_wait_count=3,
         remediation_budget_last_blocked_reason=(
             "remediation concurrency budget is full: "
-            "scope=cluster:cluster-a active=5 limit=5"
+            "scope=node:cluster-a:node-a active=1 limit=1"
         ),
-        remediation_budget_last_blocked_scope="cluster:cluster-a",
+        remediation_budget_last_blocked_scope="node:cluster-a:node-a",
     )
     store.save_incident_and_workflow(
         waiter_incident.model_copy(update={"workflow_request_id": waiter.request_id}),
@@ -312,33 +309,25 @@ def test_closed_loop_metrics_cover_outcomes_budgets_and_notifications() -> None:
     ) in lines
     assert "gpu_fault_remediation_budget_wait_total 5" in lines
     assert "gpu_fault_remediation_budget_waiting_workflows 1" in lines
-    assert 'gpu_fault_remediation_budget_active_claims{scope_type="cluster"} 1' in lines
-    # S1: the saturation has to be visible per cluster. The SUCCEEDED workflow
-    # also names cluster:cluster-a in its claims and must not count.
+    # The SUCCEEDED workflow also names node-a in its claims and must not count.
+    assert 'gpu_fault_remediation_budget_active_claims{scope_type="node"} 1' in lines
+    assert 'gpu_fault_remediation_budget_active_claims{scope_type="job"} 1' in lines
     assert (
-        'gpu_fault_remediation_budget_cluster_active_claims{cluster_id="cluster-a"} 1'
+        'gpu_fault_remediation_budget_waiting_workflows_by_scope{scope_type="node"} 1'
     ) in lines
-    assert "gpu_fault_remediation_budget_cluster_limit 5" in lines
-    assert "gpu_fault_remediation_budget_region_limit 20" in lines
-    assert (
-        "gpu_fault_remediation_budget_cluster_waiting_workflows"
-        '{cluster_id="cluster-a"} 1'
-    ) in lines
-    assert (
-        'gpu_fault_remediation_budget_waiting_workflows_by_scope{scope_type="cluster"} 1'
-    ) in lines
+    # No fixed number caps a cluster any more: no per-cluster family, no limit.
     assert not [
         line
         for line in lines
-        if "remediation_budget_cluster" in line and "node" in line
-    ], "per-cluster budget families must never carry a node label"
+        if line.startswith("gpu_fault_remediation_budget_cluster_")
+        or line.startswith("gpu_fault_remediation_budget_region_")
+    ], "the retired per-cluster and region families are gone"
     assert 'gpu_fault_notification_total{status="SENT"} 1' in lines
 
 
-def test_remediation_budget_cluster_limit_is_omitted_without_executor_config() -> None:
-    """The limit gauge reports the executor policy; with no policy there is no
-    number to report, and a fabricated zero would make the saturation alert's
-    ``limit > 0`` guard read as "never saturated"."""
+def test_no_remediation_budget_family_needs_the_executor_config() -> None:
+    """No family reports a limit any more, so a process without the executor
+    policy renders exactly what one with it renders."""
 
     store = build_store()
     context = ApplicationContext(store=store)
@@ -349,12 +338,7 @@ def test_remediation_budget_cluster_limit_is_omitted_without_executor_config() -
     assert not [
         line
         for line in lines
-        if line.startswith(
-            (
-                "gpu_fault_remediation_budget_cluster_limit ",
-                "gpu_fault_remediation_budget_region_limit ",
-            )
-        )
+        if line.startswith("gpu_fault_remediation_budget_") and "_limit " in line
     ]
     assert "gpu_fault_remediation_budget_waiting_workflows 0" in lines
 
@@ -371,14 +355,20 @@ def test_budget_occupancy_gauges_count_a_holder_whose_lease_lapsed() -> None:
         WorkflowStatus.RUNNING,
         execution_owner_id="executor-gone",
         execution_lease_expires_at=datetime.now(timezone.utc) - timedelta(hours=1),
-        remediation_budget_claims=["cluster:cluster-a", "region"],
+        # An older release's row: its fixed-limit scopes count by type until
+        # it ends, though nothing claims or limits them any more.
+        remediation_budget_claims=[
+            "cluster:cluster-a",
+            "node:cluster-a:node-a",
+            "region",
+        ],
     )
     predecessor = workflow_request(
         "workflow-predecessor",
         "incident-handoff",
         WorkflowStatus.SUPERSEDED,
         preempted_by_workflow_id="workflow-successor",
-        remediation_budget_claims=["cluster:cluster-b", "region"],
+        remediation_budget_claims=["node:cluster-b:node-b"],
     )
     successor = workflow_request(
         "workflow-successor",
@@ -394,12 +384,8 @@ def test_budget_occupancy_gauges_count_a_holder_whose_lease_lapsed() -> None:
         SimpleNamespace(context=ApplicationContext(store=store))
     )
 
-    assert 'gpu_fault_remediation_budget_active_claims{scope_type="region"} 2' in lines
-    for cluster_id in ("cluster-a", "cluster-b"):
-        assert (
-            "gpu_fault_remediation_budget_cluster_active_claims"
-            f'{{cluster_id="{cluster_id}"}} 1'
-        ) in lines, cluster_id
+    assert 'gpu_fault_remediation_budget_active_claims{scope_type="node"} 2' in lines
+    assert 'gpu_fault_remediation_budget_active_claims{scope_type="region"} 1' in lines
 
 
 def test_budget_occupancy_gauges_count_a_parked_record_whose_reboot_may_run() -> None:
@@ -421,14 +407,14 @@ def test_budget_occupancy_gauges_count_a_parked_record_whose_reboot_may_run() ->
                 details={"outcome_unknown": True, "manual_confirmation_required": True},
             )
         ],
-        remediation_budget_claims=["cluster:cluster-a", "region"],
+        remediation_budget_claims=["node:cluster-a:node-a"],
     )
     settled = parked.model_copy(
         update={
             "request_id": "workflow-settled",
             "incident_id": "incident-settled",
             "blocked_kind": BlockedKind.SAFETY_SETTLED,
-            "remediation_budget_claims": ["cluster:cluster-b", "region"],
+            "remediation_budget_claims": ["job:cluster-b:default/pytorchjob/job-b"],
         }
     )
     for workflow in (parked, settled):
@@ -438,11 +424,12 @@ def test_budget_occupancy_gauges_count_a_parked_record_whose_reboot_may_run() ->
         SimpleNamespace(context=ApplicationContext(store=store))
     )
 
-    assert 'gpu_fault_remediation_budget_active_claims{scope_type="region"} 1' in lines
-    assert (
-        'gpu_fault_remediation_budget_cluster_active_claims{cluster_id="cluster-a"} 1'
-    ) in lines
-    assert not [line for line in lines if 'cluster_id="cluster-b"' in line], lines
+    assert 'gpu_fault_remediation_budget_active_claims{scope_type="node"} 1' in lines
+    assert not [
+        line
+        for line in lines
+        if 'gpu_fault_remediation_budget_active_claims{scope_type="job"}' in line
+    ], "a settled record holds nothing"
 
 
 def test_closed_loop_metrics_use_aggregate_notification_counts(monkeypatch) -> None:

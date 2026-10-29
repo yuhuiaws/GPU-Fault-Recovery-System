@@ -28,8 +28,8 @@ from tests.execution._budget_hold_support import (
     seed,
 )
 
-# No fixed limit in the way: the breaker is what these cases load.
-POLICY = RemediationBudgetPolicy(cluster_limit=20, resource_class_limit=20)
+# The shipped policy: no fixed count caps a cluster, the breaker bounds it.
+POLICY = RemediationBudgetPolicy()
 SCOPE = storm_scope("cluster-a")
 
 
@@ -251,7 +251,7 @@ def test_an_open_breaker_survives_a_restart(tmp_path) -> None:
 
 def test_only_a_first_admission_is_judged() -> None:
     incident = fault_incident("incident-x", "event-x", job_id="job-7")
-    claims = {"node:cluster-a:node-a": 1, "region": 20}
+    claims = {"node:cluster-a:node-a": 1, "domain:cluster-a:partition-1": 1}
     fresh = workflow_request("workflow-x", "incident-x")
     running = copy_model(
         fresh, status=WorkflowStatus.RUNNING, remediation_budget_claims=sorted(claims)

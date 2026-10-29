@@ -232,25 +232,33 @@ def test_aurora_fixture_keeps_a_window_at_or_above_the_formal_floor(
 def test_remediation_budget_preflight_reads_every_live_worker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The two slot constants, and none of the retired fixed limits: a worker
+    that still carries one runs an older release or a leftover override."""
+
     expected = {
-        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION": "128",
-        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER": "4",
-        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS": "4",
+        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION": None,
+        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER": None,
+        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS": None,
         "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE": "1",
         "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN": "1",
     }
+    live = {"worker-a": expected, "worker-b": expected}
 
     def fake_control(*arguments: str, **_kwargs):
         if arguments[0] == "get":
-            return "worker-a worker-b"
-        return json.dumps(expected)
+            return " ".join(live)
+        return json.dumps(live[arguments[1]])
 
     monkeypatch.setattr(suite, "control", fake_control)
 
     result = suite.remediation_budget_preflight(32)
 
     assert result["expected"] == expected
-    assert result["pods"] == {"worker-a": expected, "worker-b": expected}
+    assert result["pods"] == live
+
+    live["worker-b"] = {**expected, "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION": "128"}
+    with pytest.raises(RuntimeError, match="does not match formal matrix"):
+        suite.remediation_budget_preflight(32)
 
 
 @pytest.mark.parametrize(

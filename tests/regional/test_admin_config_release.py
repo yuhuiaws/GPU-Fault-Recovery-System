@@ -85,6 +85,10 @@ def test_admin_config_renders_and_targets_only_changed_cpu_role(
     assert "render-control-plane-role-split.sh" in render_call[0][1]
     assert "apply-control-plane-role-split.sh" in apply_call[0][1]
     assert apply_call[1]["env"]["GPU_FAULT_CONTROL_PLANE_ROLE_TARGETS"] == "worker"
-    assert render_call[1]["env"]["GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION"] == "128"
+    assert render_call[1]["env"]["GPU_FAULT_CAPACITY_MANAGED_NODE_COUNT"] == "8192"
+    assert render_call[1]["env"]["GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE"] == "1"
+    assert "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION" not in render_call[1]["env"], (
+        "a retired limit is never rendered"
+    )
     assert render_call[1]["env"]["GPU_FAULT_TELEMETRY_SPOOL"] == "false"
     assert apply_call[1]["env"]["GPU_FAULT_ROLE_SPLIT_GENERATED_DIR"]

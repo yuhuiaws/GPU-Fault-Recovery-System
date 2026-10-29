@@ -70,6 +70,31 @@ DYNAMIC_VARIABLES = tuple(
 )
 
 
+# Retired variables stay in the inventory so a process that still receives
+# one starts (gpu_fault.env_validation.RETIRED_ENVIRONMENT); the reference
+# says they are retired instead of offering a default.
+RETIRED_SOURCE = SOURCE / "env_validation.py"
+RETIRED_DEFAULT = "<retired: ignored>"
+
+
+def retired_variables() -> frozenset[str]:
+    """The keys of ``RETIRED_ENVIRONMENT`` in ``gpu_fault.env_validation``."""
+
+    tree = ast.parse(RETIRED_SOURCE.read_text(encoding="utf-8"))
+    for node in tree.body:
+        targets = node.targets if isinstance(node, ast.Assign) else []
+        if any(
+            isinstance(target, ast.Name) and target.id == "RETIRED_ENVIRONMENT"
+            for target in targets
+        ) and isinstance(node.value, ast.Dict):
+            return frozenset(
+                key.value
+                for key in node.value.keys
+                if isinstance(key, ast.Constant) and isinstance(key.value, str)
+            )
+    return frozenset()
+
+
 def concrete_name(name: str) -> bool:
     return (
         bool(NAME_PATTERN.fullmatch(name))
@@ -717,6 +742,8 @@ def extract() -> tuple[
     for name in DYNAMIC_VARIABLES:
         modules[name].add("gpu_fault.app.admission_runtime")
         defaults[name].add("<dynamic>")
+    for name in retired_variables():
+        defaults[name] = {RETIRED_DEFAULT}
     for path in sorted(DEPLOY_ENV_SOURCES):
         if not path.is_file():
             continue
@@ -815,6 +842,8 @@ def render() -> str:
         f"其中 **{len(kinds)}** 项的取值类型可以从代码里的转换方式唯一推断出来，进程启动时",
         "会校验（整数/数值必须可解析，布尔必须是 `0/1/true/false/yes/no/on/off`）；",
         "`文本` 表示没有唯一可推断的类型，只校验变量名是否已知。",
+        f"默认值为 `{RETIRED_DEFAULT}` 的变量已退役：仍在 allowlist 中，进程照常启动并记一条",
+        "warning，但没有代码读取它。",
         "",
         "| 环境变量 | 领域 | 类型 | 默认值/要求 | 使用模块 |",
         "|---|---|---|---|---|",
@@ -955,7 +984,8 @@ def render_admin() -> str:
         "  `—` 表示该变量不由控制面角色 ConfigMap/Secret 直接注入，通常来自",
         "  `site.yaml`、节点安装器、数据面 Secret 或管理员命令。",
         "- **应用默认/要求**来自当前 Python 实现；`<required>` 表示缺失即失败，",
-        "  `<implicit>` 表示通过上层配置、动态名称或校验器间接决定。",
+        "  `<implicit>` 表示通过上层配置、动态名称或校验器间接决定，",
+        f"  `{RETIRED_DEFAULT}` 表示已退役：进程仍接受该变量（启动时记一条 warning），但不读取它。",
         "- 取值类型能从代码里唯一推断出来的变量（见[环境变量参考](环境变量参考.md)的",
         "  `类型` 列），进程启动时会校验；写错类型的值不会带着一个看起来健康的进程上线。",
         "  开关类变量只认 `0/1/true/false/yes/no/on/off`，且必须使用该开关自身识别的",

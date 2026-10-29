@@ -706,6 +706,19 @@ def test_budget_headroom_fails_closed() -> None:
     assert destr014.budget_headroom_errors({"readable": True, "scopes": {}}), (
         "no scopes at all means the probe did not compute the claims"
     )
+    node = {"node:c:node-a": {"limit": 1, "active": 0}}
+    closed = {"open": False, "state": "CLOSED", "trip_id": None}
+    tripped = {"open": True, "state": "TRIPPED", "trip_id": "c@t"}
+    assert (
+        destr014.budget_headroom_errors(
+            {"readable": True, "scopes": node, "storm_breaker": closed}
+        )
+        == []
+    )
+    (held,) = destr014.budget_headroom_errors(
+        {"readable": True, "scopes": node, "storm_breaker": tripped}
+    )
+    assert "remediation storm breaker of the cluster is open" in held, held
 
 
 def _node_snapshot(name: str) -> dict[str, Any]:

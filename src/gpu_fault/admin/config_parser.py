@@ -9,6 +9,12 @@ once and the two spellings cannot drift apart.
 
 ``boolean_field`` is also the site-config reader's rule for a YAML switch, so
 the text a site-config reader raises is the text an admin-config reader raises.
+
+A field a release retired stays a field of its section, listed in the class's
+``RETIRED_FIELDS`` (and ``OMIT_WHEN_DEFAULT`` with a ``None`` default): a
+persisted record keeps the value it was written with, so every digest over it
+still verifies, while the YAML ``spec`` never shows it and a ``spec`` that
+still spells it is accepted, ignored and reported (``retired_spec_fields``).
 """
 
 from __future__ import annotations
@@ -30,7 +36,7 @@ _SectionT = TypeVar("_SectionT")
 
 
 def camel_case(name: str) -> str:
-    """``max_active_region`` -> ``maxActiveRegion``: the YAML spelling of a field."""
+    """``managed_node_count`` -> ``managedNodeCount``: the YAML spelling of a field."""
 
     head, *rest = name.split("_")
     return head + "".join(part.capitalize() for part in rest)
@@ -121,17 +127,49 @@ def lifted_default(section: object, name: str, value: object) -> bool:
     return value == default
 
 
+def retired_fields(section: object) -> frozenset[str]:
+    """The fields of ``section`` a release retired (see the module docstring)."""
+
+    return getattr(type(section), "RETIRED_FIELDS", frozenset())
+
+
+def retired_spec_fields(section: object, value: object, *, path: str) -> list[str]:
+    """The retired fields a camelCase ``spec`` laid over ``section`` still spells.
+
+    ``read_section`` ignores them; the caller says so to the administrator.
+    """
+
+    if not isinstance(value, Mapping):
+        return []
+    found: list[str] = []
+    retired = retired_fields(section)
+    for field in fields(cast(Any, section)):
+        key = camel_case(field.name)
+        if key not in value:
+            continue
+        current = getattr(section, field.name)
+        if field.name in retired:
+            found.append(f"{path}.{key}")
+        elif is_dataclass(current):
+            found.extend(retired_spec_fields(current, value[key], path=f"{path}.{key}"))
+    return found
+
+
 def camel_section(section: object) -> dict[str, object]:
-    """The editable YAML form of a section: its fields in camelCase, no constants."""
+    """The editable YAML form of a section: its fields in camelCase, no
+    constants, no retired fields and no section left without a field."""
 
     result: dict[str, object] = {}
     for field in fields(cast(Any, section)):
+        if field.name in retired_fields(section):
+            continue
         if lifted_default(section, field.name, getattr(section, field.name)):
             continue
         value = getattr(section, field.name)
-        result[camel_case(field.name)] = (
-            camel_section(value) if is_dataclass(value) else value
-        )
+        if not is_dataclass(value):
+            result[camel_case(field.name)] = value
+        elif nested := camel_section(value):
+            result[camel_case(field.name)] = nested
     return result
 
 
@@ -148,7 +186,9 @@ def read_section(
     ``camel`` selects the YAML spelling, the persisted record is snake_case.
     The field type comes from the base value, so a section, a switch, a number
     and an integer each get the one reader the whole admin config uses. A
-    constant of the class may be spelled at its fixed value only.
+    constant of the class may be spelled at its fixed value only. A retired
+    field is read from a record as recorded and ignored in a ``spec``: the base
+    value stays.
     """
 
     section: Any = base
@@ -165,11 +205,18 @@ def read_section(
         if raw is not None and (isinstance(raw, bool) or raw != constant):
             raise AdminConfigError(f"{path}.{spell(name)} is fixed at {constant}")
     values: dict[str, object] = {}
+    retired = retired_fields(section)
     for key, name in names.items():
         current = getattr(section, name)
         raw = data.get(key)
         field_path = f"{path}.{key}"
-        if is_dataclass(current):
+        if name in retired:
+            values[name] = (
+                current
+                if camel or raw is None
+                else integer_field(raw, field_path, default=current)
+            )
+        elif is_dataclass(current):
             values[name] = read_section(
                 current, raw, camel=camel, path=field_path, constants=constants
             )

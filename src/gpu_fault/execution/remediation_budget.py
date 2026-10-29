@@ -10,31 +10,28 @@ from gpu_fault.models import (
     WorkflowStepSpec,
     resolved_step_indexes,
 )
-from gpu_fault.operation_registry import (
-    NODE_MUTATING_OPERATIONS,
-    OPERATION_REGISTRY,
-    OPERATION_RESOURCE_CLAIMS,
-    OperationScope,
-)
+from gpu_fault.operation_registry import NODE_MUTATING_OPERATIONS
 
 
 @dataclass(frozen=True)
 class RemediationBudgetPolicy:
-    region_limit: int = 20
-    cluster_limit: int = 5
+    """The two slot limits a claim carries, both 1 as shipped (design §9.5).
+
+    No fixed number caps how many remediations a cluster or the region runs at
+    once: a correlated fault is what the cluster's remediation storm breaker
+    (``gpu_fault.remediation_storm``) bounds. The region, per-cluster and
+    per-resource-class limits a release before it read are retired: their
+    variables are ignored (``env_validation.RETIRED_ENVIRONMENT``) and a scope
+    of those kinds an older release left on a RUNNING row is no kind this
+    policy knows (``scope_limit``), so it neither admits nor refuses anything.
+    """
+
     node_limit: int = 1
     failure_domain_limit: int = 1
-    resource_class_limit: int = 2
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, str]) -> RemediationBudgetPolicy:
         policy = cls(
-            region_limit=int(
-                values.get("GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION", "20")
-            ),
-            cluster_limit=int(
-                values.get("GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER", "5")
-            ),
             node_limit=int(
                 values.get("GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE", "1")
             ),
@@ -44,23 +41,8 @@ class RemediationBudgetPolicy:
                     "1",
                 )
             ),
-            resource_class_limit=int(
-                values.get(
-                    "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS",
-                    "2",
-                )
-            ),
         )
-        if (
-            min(
-                policy.region_limit,
-                policy.cluster_limit,
-                policy.node_limit,
-                policy.failure_domain_limit,
-                policy.resource_class_limit,
-            )
-            < 1
-        ):
+        if min(policy.node_limit, policy.failure_domain_limit) < 1:
             raise ValueError("remediation concurrency limits must be positive")
         return policy
 
@@ -137,16 +119,15 @@ def claims_in_cluster(
 
 
 def scope_limit(policy: RemediationBudgetPolicy, scope: str) -> int | None:
-    """The configured limit of one claimed scope, ``None`` for an unknown kind."""
+    """The configured limit of one claimed scope, ``None`` for an unknown kind
+    -- among them ``region``, ``cluster:`` and ``class:``, which an older
+    release claimed and a RUNNING row it left may still list."""
 
     kind = scope.split(":", 1)[0]
     return {
-        "region": policy.region_limit,
-        "cluster": policy.cluster_limit,
         "node": policy.node_limit,
         "job": policy.failure_domain_limit,
         "domain": policy.failure_domain_limit,
-        "class": policy.resource_class_limit,
     }.get(kind)
 
 
@@ -160,9 +141,9 @@ def escalation_budget_claims(
 
     The workflow claimed its concurrency budget for the plan it was born
     with. A rung appended later (RESET_GPU -> RESTART_NODE -> REPLACE_NODE)
-    may start a resource class or touch a failure domain that budget never
-    counted; those scopes -- and only those -- have to be taken before the
-    rung runs (F-N1 per-branch settlement).
+    may touch a node, a job or a fabric partition that budget never counted;
+    those scopes -- and only those -- have to be taken before the rung runs
+    (F-N1 per-branch settlement).
     """
 
     mutating = [step for step in steps if _budgeted(step.operation)]
@@ -178,10 +159,6 @@ def escalation_budget_claims(
     }
 
 
-# Isolation is budgeted like a mutation: it is containment-only for the
-# scheduler, but a false-positive cascade must not quarantine nodes without
-# limit (F-C5). Cordon and release alone stay free.
-_ISOLATION_RESOURCE_CLASS = "NODE_ISOLATION"
 # The operations that act on the whole job -- its workload objects
 # (``workload_ids``, one per job: ``<ns>/pytorchjob/<name>``), or the restart
 # authorization's ``job_id`` -- whatever ``node_ids`` they were compiled with.
@@ -191,6 +168,10 @@ WHOLE_JOB_OPERATIONS = frozenset(
 
 
 def _budgeted(operation: WorkflowOperation) -> bool:
+    # Isolation is budgeted like a mutation: it is containment-only for the
+    # scheduler, but a false-positive cascade must not quarantine nodes without
+    # limit (F-C5) -- it takes the node's slot, and its first admission counts
+    # towards the cluster's storm breaker. Cordon and release alone stay free.
     if operation is WorkflowOperation.QUARANTINE:
         return True
     return (
@@ -204,10 +185,7 @@ def _scopes_for_steps(
     cluster_id: str,
     pending: Sequence[WorkflowStepSpec],
 ) -> dict[str, int]:
-    claims = {
-        "region": policy.region_limit,
-        f"cluster:{cluster_id}": policy.cluster_limit,
-    }
+    claims: dict[str, int] = {}
     for node_id in sorted(
         {node_id for step in pending for node_id in step.node_ids if node_id}
     ):
@@ -231,28 +209,17 @@ def _scopes_for_steps(
     # `failure_domain` and `availability_zone` once were, while nothing wrote
     # them.
     failure_domains: set[str] = set()
-    resource_classes: set[str] = set()
     for step in pending:
         raw = step.parameters.get("fabric_partition")
         values = raw if isinstance(raw, list) else [raw]
         failure_domains.update(str(value) for value in values if value)
-        if step.operation is WorkflowOperation.QUARANTINE:
-            resource_classes.add(_ISOLATION_RESOURCE_CLASS)
-            continue
-        resource_classes.update(OPERATION_RESOURCE_CLAIMS[step.operation])
-        if not OPERATION_RESOURCE_CLAIMS[step.operation]:
-            scope = OPERATION_REGISTRY[step.operation].scope
-            if scope is OperationScope.WORKLOAD:
-                resource_classes.add("WORKLOAD_MUTATION")
-            elif scope is OperationScope.SUPPORT:
-                resource_classes.add("SUPPORT_ACTION")
-            else:
-                resource_classes.add(f"{scope.value}_MUTATION")
-
     for domain in sorted(failure_domains):
         claims[f"domain:{cluster_id}:{domain}"] = policy.failure_domain_limit
-    for resource_class in sorted(resource_classes):
-        claims[f"class:{cluster_id}:{resource_class}"] = policy.resource_class_limit
+    # No region, cluster or resource-class scope: how many nodes a correlated
+    # fault may take into destructive remediation at once is the cluster's
+    # storm breaker's call (``gpu_fault.remediation_storm``), judged in the
+    # claim's own transaction, not a fixed count that drained a whole-cluster
+    # fault five nodes at a time.
     return claims
 
 

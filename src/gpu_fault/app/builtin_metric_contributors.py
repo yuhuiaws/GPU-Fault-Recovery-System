@@ -1264,11 +1264,7 @@ def closed_loop_metric_lines(runtime: AppRuntime) -> list[str]:
         )
     )
     budget = budget_tally(workflows, now)
-    lines.extend(
-        remediation_budget_lines(
-            budget, config=runtime.context.production_executor_config
-        )
-    )
+    lines.extend(remediation_budget_lines(budget))
     lines.extend(
         remediation_storm_lines(store.list_remediation_storm_breakers(), budget)
     )

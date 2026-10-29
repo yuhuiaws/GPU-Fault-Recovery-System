@@ -26,7 +26,10 @@ until they were left to merging and the per-node scope: a row an older
 release refused on its node group's domain would sit behind that string for
 as long as an older holder kept it, although no workflow this release admits
 claims it any more. Such a row is judged afresh, as a never-refused one is.
-The other kinds keep their meaning across releases and are not re-derived.
+A refusal on a ``region``, ``cluster:`` or ``class:`` scope -- the fixed
+limits the storm breaker replaced -- is of a kind the policy no longer knows,
+so the row is simply tried again. The other kinds keep their meaning across
+releases and are not re-derived.
 
 A cluster's open remediation storm breaker (``gpu_fault.remediation_storm``)
 holds the same way: a row recorded on ``storm:<cluster>`` is passed over
@@ -50,7 +53,9 @@ Over-limit scopes. A hold is never refused, so a scope can hold more than its
 limit: workflows an older release left RUNNING without their claims re-take
 them when this release dispatches them, an older dispatcher alternating with
 this one during a roll drops them again and admits on its own count, and a
-lowered limit leaves the earlier holders in place. The occupancy is read once
+lowered limit leaves the earlier holders in place. A retired kind an older
+release's RUNNING row still lists is never over anything: it has no limit.
+The occupancy is read once
 per tick; ``BudgetWatch`` keeps the scopes above their limit for /metrics and
 logs every change. Nothing new is admitted into a full or over-limit scope --
 the store refuses it, the guard passes it over -- until it drains below its
@@ -115,7 +120,7 @@ FRESH_WAITER_STORE_CALLS = 1000
 # past this many incidents rather than kept in age order.
 CLUSTER_CACHE_LIMIT = 50_000
 # Every scope kind ``scope_limit`` knows, exported at zero when not over.
-SCOPE_TYPES = ("class", "cluster", "domain", "job", "node", "region")
+SCOPE_TYPES = ("domain", "job", "node")
 # The parked-hold sweep: the bound it applies is over an hour, so a minute
 # between looks costs nothing; the newest BLOCKED rows, as the sibling
 # BLOCKED sweeps read them.
