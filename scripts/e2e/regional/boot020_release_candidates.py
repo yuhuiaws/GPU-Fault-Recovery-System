@@ -406,7 +406,11 @@ def chain_configs(
     keeps the old digest can never converge (live 2026-09-07: the first FULL
     wave installed fine and then waited 15 minutes for a digest that no agent
     would ever report). The CLI derives it with the same function
-    gpu-fault-admin uses; tests may pass any string.
+    gpu-fault-admin uses, and with the same inputs: the site's node-side
+    declarations (``spec.diagnosticS3Uri`` -> ``GPU_FAULT_DIAGNOSTIC_S3_URI`` in
+    every node's Agent environment) enter the digest too (live 2026-10-29: the
+    pin computed without the destination never matched the EKS Agent's report,
+    and the FULL wave ended in partial-convergence). Tests may pass any string.
     """
 
     noop = with_manifest(base, live_manifest)
@@ -502,12 +506,15 @@ def write_configs(arguments: argparse.Namespace) -> None:
         CommandRunner,
         compute_agent_config_digest,
     )
+    from gpu_fault.admin.site_s3 import node_agent_environment
 
     full_version = str(base["runtime_profile"]["version"]) + arguments.profile_suffix
+    # As scripts/release_deploy.py pins it: with what the nodes run with.
     full_agent_config_digest = compute_agent_config_digest(
         CommandRunner(),
         repository_root=Path(candidates["D"]["manifest"]).parent.parent,
         runtime_profile_version=full_version,
+        node_agent_environment=node_agent_environment(base.get("diagnostic_s3_uri")),
     )
     configs = chain_configs(
         base,
