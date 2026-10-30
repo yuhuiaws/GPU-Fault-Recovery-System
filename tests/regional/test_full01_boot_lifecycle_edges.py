@@ -936,9 +936,10 @@ def test_unapplied_config_failure_does_not_issue_a_restore_or_erase_pending_evid
         "unapplied failure attempted an automatic restore"
     )
     assert load_desired_admin_config(config_io.root) == config_io.before
-    assert (
-        load_admin_config_file(config_io.root / "admin-config.yaml")
-        == config_io.desired
+    # Nothing was applied, so the drill's own edit goes back to the committed
+    # config; only a pending apply keeps its target in the file to resume from.
+    assert load_admin_config_file(config_io.root / "admin-config.yaml") == (
+        config_io.desired if damage == "pending" else config_io.before
     )
     assert (config_io.root / "admin-config/pending.json").exists() == (
         damage == "pending"

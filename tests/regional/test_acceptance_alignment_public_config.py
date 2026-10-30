@@ -3,13 +3,14 @@ from __future__ import annotations
 import io
 import json
 import subprocess
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 
 import pytest
 
 from gpu_fault.admin import cli, operator_identity
+from gpu_fault.admin.command_log import report_failure
 from gpu_fault.admin.config import load_desired_admin_config
-from gpu_fault.admin.config_file import write_admin_config_file
+from gpu_fault.admin.config_file import load_admin_config_file, write_admin_config_file
 from gpu_fault.admin.operation_lock import SITE_OPERATION_LOCK_FD_ENV
 from scripts.e2e.regional import boot020_admin_config as runner
 from tests.admin import test_admin_config_recovery as config_support
@@ -98,6 +99,86 @@ def test_boot020_uses_actual_public_config_plan_apply_noop_and_restore(
     assert load_desired_admin_config(scenario.root) == before
     assert not (scenario.root / "admin-config/pending.json").exists(), (
         "the completed config roundtrip must not leave a pending administrator edit"
+    )
+
+
+def test_boot020_refused_apply_carries_the_cli_refusal_and_restores_the_edit(
+    scenario, monkeypatch
+):
+    """Live 2026-10-29 (attempt 24): the site was still on an interrupted drill
+    candidate, the real CLI refused the apply in its live-release phase, and the
+    drill reported neither the reason nor the log and kept its edit in the file."""
+
+    before = scenario.before
+    desired = before.patched(
+        {
+            "capacity": {
+                "controlWorkerReplicas": before.capacity.control_worker_replicas - 1
+            }
+        }
+    )
+    editable = scenario.root / "admin-config.yaml"
+    write_admin_config_file(editable, before, overwrite=True)
+    scenario.live = release_document(
+        before,
+        release_id="candidate-d",
+        phase="data-plane-progress",
+        transaction_committed=False,
+    )
+    log = scenario.root / "logs" / "mutating" / "config-unit.log"
+    calls = []
+
+    def public_driver(arguments, **options):
+        # The CLI process: its own report_failure line, then main()'s log line.
+        calls.append(arguments[3:])
+        output, errors = io.StringIO(), io.StringIO()
+        with (
+            monkeypatch.context() as environment,
+            redirect_stdout(output),
+            redirect_stderr(errors),
+        ):
+            environment.setenv(
+                SITE_OPERATION_LOCK_FD_ENV, options["env"][SITE_OPERATION_LOCK_FD_ENV]
+            )
+            try:
+                code = cli.run(cli.parser().parse_args(arguments[3:]))
+            except Exception as exc:  # the CLI's process boundary
+                code = report_failure("gpu-fault-admin", exc)
+        if code:
+            errors.write(f"gpu-fault-admin: full output in {log}\n")
+        return subprocess.CompletedProcess(
+            arguments, code, output.getvalue(), errors.getvalue()
+        )
+
+    monkeypatch.setattr(runner, "run_driver", public_driver)
+    monkeypatch.setattr(
+        operator_identity,
+        "caller_identity_arn",
+        lambda **_kw: "arn:aws:sts::123456789012:assumed-role/unit/operator",
+    )
+    monkeypatch.setattr(runner, "cpu_observation", lambda _site: {})
+    monkeypatch.setattr(runner, "deployment_generations", lambda _path: {"gpu": {}})
+
+    with pytest.raises(runner.PublicConfigCommandError) as failure:
+        runner.public_config_roundtrip(
+            scenario.root, desired=desired, reference="CHG-ALIGNMENT"
+        )
+
+    message = str(failure.value)
+    assert "current signed release differs from the live regional release" in (
+        message
+    ), message
+    assert f"full output in {log}" in message, message
+    assert "no pending apply was recorded" in message, message
+    assert "preserve its pending state" not in message, message
+    assert ["--dry-run" in item for item in calls] == [True, False], calls
+    assert scenario.driver_calls == 0, "the refusal came before any release"
+    assert not (scenario.root / "admin-config/pending.json").exists(), (
+        "a refusal in the live-release phase records no pending apply"
+    )
+    assert load_desired_admin_config(scenario.root) == before
+    assert load_admin_config_file(editable, base=before) == before, (
+        "the refused drill left its own edit for the next run to trip over"
     )
 
 
