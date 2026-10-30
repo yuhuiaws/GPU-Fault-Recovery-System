@@ -5,7 +5,8 @@ synthetic store records built from the product models (dumped the way the
 oracle's store read dumps them):
 
 * two idle nodes (GF-REGIONAL-DESTR-027);
-* two two-node jobs, a reboot-class fault on one node of each;
+* two jobs, a reboot-class fault on one node of each (GF-REGIONAL-DESTR-028):
+  two two-node jobs, or a two-node and a single-node job;
 * one two-node job (reboot-class fault) beside one idle node (reset).
 
 For each: the b220 parallel outcome is PASS; a pre-b220 serialized outcome --
@@ -352,6 +353,12 @@ def two_jobs(**second: Any) -> tuple[Part, Part]:
     )
 
 
+def two_node_and_single_node_jobs(**second: Any) -> tuple[Part, Part]:
+    return part("job-a", "node-a", start=0, job="job-a", peers=("node-b",)), part(
+        "job-b", "node-c", **{"start": 5, "job": "job-b", **second}
+    )
+
+
 def job_and_idle(**idle: Any) -> tuple[Part, Part]:
     return part("job", "node-a", start=0, job="job-a", peers=("node-b",)), part(
         "idle", "node-c", **{"start": 6, **idle}
@@ -657,6 +664,83 @@ def test_two_jobs_held_by_a_tripped_breaker_get_their_own_verdict() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# A two-node job and a single-node job (DESTR-028's 2+1 layout)
+# --------------------------------------------------------------------------- #
+def test_a_two_node_and_a_single_node_job_in_parallel_are_the_pass_shape() -> None:
+    """Three nodes, two job domains: the two-node job claims both its nodes,
+    the single-node job its one, each its own tokens; the two rebooted nodes
+    are counted, the two-node job's peer is not (b223)."""
+
+    parts = two_node_and_single_node_jobs()
+
+    verdict = judge(
+        snapshot(*parts), parts, overlap=oracle.OVERLAP_REMEDIATION, counted=2
+    )
+
+    assert (verdict.verdict, verdict.outcome) == (oracle.PASS, oracle.PARALLEL), (
+        verdict.errors
+    )
+    assert verdict.facts["domains"]["job-b"]["claims"] == [
+        "job:gpu-cluster:default/pytorchjob/job-b",
+        "job:gpu-cluster:job-id/job-b",
+        "node:gpu-cluster:node-c",
+    ]
+    assert verdict.facts["breaker"]["counted_nodes"] == {
+        "job-a": ["node-a"],
+        "job-b": ["node-c"],
+    }
+
+
+def test_a_counted_healthy_peer_fails_even_below_a_higher_threshold() -> None:
+    """The pre-b223 count of the 2+1 layout is three nodes. On the four-node
+    group that is the floor and trips the breaker; on a cluster whose
+    threshold is higher it would not trip, and the exact count still fails."""
+
+    first, second = two_node_and_single_node_jobs()
+    first.window.append(
+        StormEntry(
+            node_id="node-b",
+            domain="job:job-a",
+            workflow_id=first.expectation.workflow_id,
+            admitted_at=at(-1),
+        )
+    )
+
+    verdict = judge(
+        snapshot(first, second, threshold=4, agents=20),
+        (first, second),
+        overlap=oracle.OVERLAP_REMEDIATION,
+        counted=2,
+    )
+
+    assert (verdict.verdict, verdict.outcome) == (oracle.FAIL, oracle.CONTRACT)
+    assert verdict.errors == (
+        "the breaker counted 3 nodes ['node-a', 'node-b', 'node-c'] for the case, "
+        "expected 2",
+    )
+
+
+def test_the_pre_b223_count_trips_the_floor_and_holds_the_single_node_job() -> None:
+    first, second = two_node_and_single_node_jobs(ran=False, held_on=STORM)
+    first.window.append(
+        StormEntry(
+            node_id="node-b",
+            domain="job:job-a",
+            workflow_id=first.expectation.workflow_id,
+            admitted_at=at(-1),
+        )
+    )
+    value = tripped((first, second), second, nodes=["node-a", "node-b", "node-c"])
+
+    verdict = judge(
+        value, (first, second), overlap=oracle.OVERLAP_REMEDIATION, counted=2
+    )
+
+    assert (verdict.verdict, verdict.outcome) == (oracle.FAIL, oracle.BREAKER_TRIPPED)
+    assert f"job-b: waited on the storm breaker ({STORM})" in "\n".join(verdict.errors)
+
+
+# --------------------------------------------------------------------------- #
 # One two-node job beside one idle node
 # --------------------------------------------------------------------------- #
 def test_a_job_and_an_idle_node_in_parallel_are_the_pass_shape() -> None:
@@ -899,9 +983,14 @@ def _dispatch_layout(
     ("layout", "counted"),
     [
         ({"job-a": ("a1", "a2"), "job-b": ("b1", "b2")}, ["a1", "b1"]),
+        ({"job-a": ("a1", "a2"), "job-b": ("b1",)}, ["a1", "b1"]),
         ({"job-a": ("a1", "a2"), "idle-1": None}, ["a1", "idle-1"]),
     ],
-    ids=["two-two-node-jobs", "two-node-job-and-idle-node"],
+    ids=[
+        "two-two-node-jobs",
+        "two-node-and-single-node-job",
+        "two-node-job-and-idle-node",
+    ],
 )
 def test_a_two_node_jobs_peer_is_not_counted_so_the_floor_holds(
     layout: dict[str, tuple[str, ...] | None], counted: list[str]

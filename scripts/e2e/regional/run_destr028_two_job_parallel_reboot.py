@@ -1,45 +1,55 @@
 #!/usr/bin/env python3
 """GF-REGIONAL-DESTR-028 live acceptance runner.
 
-Two distributed training jobs, each on two GPU nodes of ONE node group, recover
-in parallel when a reboot-class fault hits ONE node of each (b220 + b223).
+Two distributed training jobs on GPU nodes of ONE node group recover in
+parallel when a reboot-class fault hits ONE node of each (b220 + b223). Job a
+is always a two-node job; job b is a second two-node job when the group offers
+four eligible idle nodes ("2+2"), else a single-node job on the third ("2+1":
+a four-node group whose fourth node hosts the arbiters, HyperPod today).
 
 Each job is its own merged workflow: a fault on one of its nodes merges into
 it, STOP_WORKLOADS / RESTART_WORKLOAD take the job's tokens, and the faulted
-node's RESTART_NODE reboots it while the healthy peer is only stopped and
+node's RESTART_NODE reboots it while a healthy peer is only stopped and
 restarted with the job. Two such jobs are kept apart only by their
 ``node:<cluster>:<node>`` scopes -- never by a node-group ``domain:`` slot
 (retired in b220) -- so they run at once. The storm breaker counts only the two
 rebooted nodes (b223: a job's workload-stop peer is not entering destructive
 NODE remediation), two nodes across two job domains, below its floor of 3, so
-it stays CLOSED. Before b223 each job's healthy peer counted too (four nodes),
-which tripped the floor and serialized the two jobs.
+it stays CLOSED. Before b223 the healthy peers counted too -- four nodes in
+2+2, three in 2+1, either way at the floor -- which tripped it and held the
+second job; on a cluster whose threshold is higher the oracle still fails any
+count other than the two rebooted nodes.
 
-The jobs are the GPU-active two-node PyTorchJob the managed fixtures use
-(``manifests/training/two-node-replace-pytorchjob.yaml`` + b141's GPU-load
-snippet), submitted by ``ManagedWorkloadFixture`` and pinned to the chosen
-nodes. The fault is the node-reboot case's, unchanged: one synthetic XID 79
-written to the faulted node's ``/dev/kmsg`` by the destructive host probe
-(``write-xid79``), which the policy resolves to a node reboot. Each faulted
-node then runs a STOP_WORKLOADS -> RESTART_NODE recovery, judged with
-DESTR-002's reboot proof, and the parallel admission is judged by the shared
-read-only oracle (``workload_domain_oracle``) on the durable store records: two
-job workflows, each claiming its two node scopes and its job tokens, neither
-ever held on a node-group ``domain:`` or a retired scope, their reboot steps
-overlapping in wall-clock time, the storm breaker CLOSED with exactly the two
-rebooted nodes counted, both incidents RECOVERED and nothing left open.
+The jobs are the GPU-active PyTorchJobs the managed fixtures use
+(``manifests/training/two-node-replace-pytorchjob.yaml`` and, for 2+1's job b,
+``single-node-warm-spare-pytorchjob.yaml``, both with b141's GPU-load snippet),
+pinned to their nodes, renamed after their job ids (the product's job token
+names the submitted object) and submitted by ``ManagedWorkloadFixture``. The
+fault is the node-reboot case's, unchanged: one synthetic XID 79 written to the
+faulted node's ``/dev/kmsg`` by the destructive host probe (``write-xid79``),
+which the policy resolves to a node reboot. Each faulted node then runs its
+job's STOP_WORKLOADS -> RESTART_NODE -> validations -> RESTORE_SCHEDULING ->
+RESTART_WORKLOAD recovery, judged with DESTR-002's reboot proof minus its
+provider half (``job_reboot_contract``), and the parallel admission is judged
+by the shared read-only oracle (``workload_domain_oracle``) on the durable
+store records: two job workflows, each claiming its node scopes and its job
+tokens, neither ever held on a node-group ``domain:`` or a retired scope, their
+reboot steps overlapping in wall-clock time, the storm breaker CLOSED with
+exactly the two rebooted nodes counted, both incidents RECOVERED and nothing
+left open.
 
-Precondition, read live: at least ``MIN_GROUP_NODES`` GPU nodes in one node
-group; short of it the case is ``NOT_RUN(CAPABILITY_ABSENT)`` -- the plan says
-so and ``--execute`` records it without touching anything. The group and its
-four target nodes are chosen from the live cluster (the largest GPU node group,
-or ``--node-group``; the first four eligible idle nodes in name order), never
-from a site-profile node list.
+Precondition, read live: at least ``MIN_GROUP_NODES`` (3) GPU nodes in one
+node group; short of it the case is ``NOT_RUN(CAPABILITY_ABSENT)`` -- the plan
+says so and ``--execute`` records it without touching anything. The group and
+its target nodes are chosen from the live cluster (the largest GPU node group,
+or ``--node-group``; the first four, else three, eligible idle nodes in name
+order), never from a site-profile node list. The plan and the result record
+the layout.
 
-Four nodes, two counted (the two rebooted), are below the storm breaker's floor
-(3), so the case cannot trip it alone; the preflight refuses while the breaker
-still counts other nodes from the last 600 s that would make the case's second
-admission the trip, and the result records ``window_clear_at``.
+Two counted nodes are below the storm breaker's floor (3), so the case cannot
+trip it alone; the preflight refuses while the breaker still counts other nodes
+from the last 600 s that would make the case's second admission the trip, and
+the result records ``window_clear_at``.
 
 Defaults to ``--plan``; ``--execute`` needs ``--confirm DESTR028_EXECUTE``.
 """
@@ -75,6 +85,7 @@ from scripts.e2e.regional import (  # noqa: E402
 from scripts.e2e.regional import (  # noqa: E402
     run_destr027_two_idle_node_parallel_reset as idle_case,
 )
+from scripts.e2e.regional import job_reboot_contract  # noqa: E402
 from scripts.e2e.regional import workload_domain_oracle as oracle  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     processor_queue_backlog,
@@ -96,6 +107,8 @@ from scripts.e2e.regional.managed_workload_fixture import (  # noqa: E402
     ImagePrewarmFixture,
     ManagedWorkloadFixture,
     ManagedWorkloadSettings,
+    managed_workload_name,
+    render_node_pinned_manifest,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalFixtureError,
@@ -110,7 +123,6 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
 from scripts.e2e.regional.reset_escalation_evidence import (  # noqa: E402
     product_escalation,
     product_reboot,
-    reboot_proof_error,
 )
 
 PROBE_SCRIPT = Path(__file__).with_name("probes") / "destructive_node_probe.py"
@@ -119,18 +131,33 @@ TRAINING_MANIFEST = (
     / "training"
     / "two-node-replace-pytorchjob.yaml"
 )
+#: The 2+1 layout's job b: the GPU-active single-node 8-GPU PyTorchJob.
+SINGLE_NODE_TRAINING_MANIFEST = (
+    Path(__file__).with_name("manifests")
+    / "training"
+    / "single-node-warm-spare-pytorchjob.yaml"
+)
+#: The fixed names the two manifests ship with, by a job's node count; each job
+#: is submitted renamed after its job id (``name_managed_workload``).
+WORKLOAD_BASES = {
+    2: "gpu-fault-two-node-replace",
+    1: "gpu-fault-single-node-warm-spare",
+}
 CASE_ID = "GF-REGIONAL-DESTR-028"
 PREDECESSOR_CASE_ID = "GF-REGIONAL-DESTR-002"
 CONFIRMATION = "DESTR028_EXECUTE"
-#: Two two-node jobs need a node group of at least four GPU nodes.
-MIN_GROUP_NODES = 4
-#: Two jobs, labelled a and b; each is a (master, worker) pair, faulted on the
-#: master. The targets order as a-master, a-worker, b-master, b-worker.
+#: Two jobs, labelled a and b, each faulted on its master (its first node).
 JOB_LABELS = ("a", "b")
-NODES_PER_JOB = 2
+#: Nodes per job by the number of eligible targets, most first: two two-node
+#: jobs on four nodes ("2+2"); a two-node and a single-node job on three
+#: ("2+1"). The targets order as a-master, a-worker, b-master[, b-worker].
+LAYOUTS: dict[int, tuple[int, ...]] = {4: (2, 2), 3: (2, 1)}
+#: The smallest layout's node count: a node group with fewer GPU nodes cannot
+#: carry the case.
+MIN_GROUP_NODES = min(LAYOUTS)
 GPUS_PER_NODE = 8
-EXPECTED_GPU_COUNT = GPUS_PER_NODE * NODES_PER_JOB
-#: The breaker counts one node per job: the two rebooted masters.
+#: The breaker counts one node per job, in either layout: the two rebooted
+#: masters (before b223: 4 in 2+2, 3 in 2+1).
 CASE_COUNTED_NODES = len(JOB_LABELS)
 #: Two parallel jobs each run a node reboot; DESTR-002 allows one node ~1500 s.
 WORKFLOW_BUDGET_SECONDS = 1800
@@ -144,6 +171,7 @@ FOCUSED_TESTS = (
     "tests/execution/test_remediation_storm_admission.py::"
     "test_a_two_node_job_counts_only_its_faulted_node",
     "tests/regional/test_workload_domain_oracle.py",
+    "tests/regional/test_job_reboot_contract.py",
     "tests/regional/test_destr028_two_job_parallel_reboot.py",
 )
 
@@ -160,6 +188,8 @@ class Settings:
     predecessor_path: Path
     #: The node group to use; empty takes the cluster's largest GPU group.
     node_group: str
+    #: The 2+1 layout's single-node job b.
+    single_node_manifest: Path = SINGLE_NODE_TRAINING_MANIFEST
 
     def environment(self) -> dict[str, str]:
         return {
@@ -167,8 +197,17 @@ class Settings:
             "GPU_FAULT_HOST_PROBE_IMAGE": self.host_probe_image,
             "GPU_FAULT_SITE_FILE": str(self.site_file),
             "GPU_FAULT_TRAINING_MANIFEST": str(self.manifest),
+            "GPU_FAULT_SINGLE_NODE_TRAINING_MANIFEST": str(self.single_node_manifest),
             "GPU_FAULT_PREDECESSOR_EVIDENCE": str(self.predecessor_path),
             "GPU_FAULT_NODE_GROUP": self.node_group,
+        }
+
+    def workload_bases(self) -> dict[int, str]:
+        """The fixed manifest name each job size is renamed from."""
+
+        return {
+            2: job_reboot_contract.manifest_workload_name(self.manifest),
+            1: job_reboot_contract.manifest_workload_name(self.single_node_manifest),
         }
 
 
@@ -188,6 +227,11 @@ def configure(arguments: argparse.Namespace) -> Settings:
         if arguments.manifest
         else TRAINING_MANIFEST
     )
+    single_node_manifest = (
+        Path(arguments.single_node_manifest).expanduser().resolve()
+        if arguments.single_node_manifest
+        else SINGLE_NODE_TRAINING_MANIFEST
+    )
     return Settings(
         regional=settings_from_arguments(arguments),
         host_probe_image=required(
@@ -205,6 +249,7 @@ def configure(arguments: argparse.Namespace) -> Settings:
         manifest=manifest,
         predecessor_path=predecessor,
         node_group=str(arguments.node_group or "").strip(),
+        single_node_manifest=single_node_manifest,
     )
 
 
@@ -241,48 +286,141 @@ def choose_targets(
     return chosen
 
 
+def choose_layout_targets(
+    candidates: dict[str, list[str]], *, dns_nodes: list[str]
+) -> tuple[str, ...] | None:
+    """The largest layout's targets the eligible nodes allow: four (2+2), else
+    three (2+1); ``None`` when not even three are eligible."""
+
+    for count in sorted(LAYOUTS, reverse=True):
+        chosen = choose_targets(candidates, count=count, dns_nodes=dns_nodes)
+        if chosen is not None:
+            return chosen
+    return None
+
+
+def layout_sizes(targets: tuple[str, ...] | list[str]) -> tuple[int, ...]:
+    """The nodes per job of the layout ``targets`` carry."""
+
+    sizes = LAYOUTS.get(len(targets))
+    if sizes is None:
+        raise ValueError(
+            f"need {' or '.join(str(count) for count in sorted(LAYOUTS))} targets, "
+            f"got {len(targets)}"
+        )
+    return sizes
+
+
+def layout_name(targets: tuple[str, ...] | list[str]) -> str:
+    """``2+2`` or ``2+1``: the layout ``targets`` carry."""
+
+    return "+".join(str(size) for size in layout_sizes(targets))
+
+
 @dataclass(frozen=True)
 class JobSpec:
     """One job domain the case creates: its label, nodes and faulted master."""
 
     label: str
     job_id: str
-    master: str
-    worker: str
+    #: Master first; a single-node job is its master alone.
+    nodes: tuple[str, ...]
+    #: The PyTorchJob's Kubernetes name: its manifest's fixed name renamed after
+    #: the job id, which is the object the product's job token names.
+    workload_name: str
 
     @property
-    def nodes(self) -> tuple[str, str]:
-        return (self.master, self.worker)
+    def master(self) -> str:
+        return self.nodes[0]
+
+    @property
+    def workers(self) -> tuple[str, ...]:
+        return self.nodes[1:]
 
     @property
     def faulted_node(self) -> str:
         return self.master
 
     @property
+    def gpu_count(self) -> int:
+        return GPUS_PER_NODE * len(self.nodes)
+
+    @property
     def workload_id(self) -> str:
-        return f"gpu-fault-system/pytorchjob/{self.job_id}"
+        return f"gpu-fault-system/pytorchjob/{self.workload_name}"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "label": self.label,
+            "job_id": self.job_id,
+            "nodes": list(self.nodes),
+            "master": self.master,
+            "workers": list(self.workers),
+            "faulted_node": self.faulted_node,
+            "workload_name": self.workload_name,
+            "gpu_count": self.gpu_count,
+        }
 
 
-def job_layout(targets: tuple[str, ...], run_id: str) -> list[JobSpec]:
-    """Assign the chosen nodes to the two jobs in order: a=(t0,t1), b=(t2,t3).
+def job_layout(
+    targets: tuple[str, ...],
+    run_id: str,
+    *,
+    workload_bases: dict[int, str] | None = None,
+) -> list[JobSpec]:
+    """Assign the chosen nodes to the two jobs in order: a=(t0,t1) and
+    b=(t2,t3) on four targets, b=(t2,) on three.
 
-    The master (first node of each pair) is the one the reboot-class XID hits;
-    the worker is only stopped and restarted with the job."""
+    The master (first node of each job) is the one the reboot-class XID hits; a
+    worker is only stopped and restarted with its job. ``workload_bases`` maps
+    a job's node count to the fixed manifest name it is renamed from."""
 
-    if len(targets) != MIN_GROUP_NODES:
-        raise ValueError(f"need {MIN_GROUP_NODES} targets, got {len(targets)}")
+    sizes = layout_sizes(targets)
+    bases = workload_bases or WORKLOAD_BASES
     specs: list[JobSpec] = []
-    for index, label in enumerate(JOB_LABELS):
-        master, worker = targets[index * NODES_PER_JOB : index * NODES_PER_JOB + 2]
+    start = 0
+    for label, size in zip(JOB_LABELS, sizes, strict=True):
+        job_id = f"{run_id}-{label}"
         specs.append(
             JobSpec(
                 label=label,
-                job_id=f"{run_id}-{label}",
-                master=master,
-                worker=worker,
+                job_id=job_id,
+                nodes=tuple(targets[start : start + size]),
+                workload_name=managed_workload_name(bases[size], job_id),
             )
         )
+        start += size
     return specs
+
+
+def render_job_manifest(settings: Settings, spec: JobSpec, directory: Path) -> Path:
+    """The job's manifest pinned to its nodes and renamed after its job id.
+
+    A two-node job is the two-node manifest with its master and worker pinned;
+    a single-node job is the single-node manifest pinned to its master. The
+    manifests' fixed names would make two jobs of one manifest collide and the
+    product's job token name an object the oracle cannot expect."""
+
+    destination = directory / "job.yaml"
+    if len(spec.nodes) == 2:
+        join_case.render_two_node_manifest(
+            settings.manifest,
+            destination,
+            master_node=spec.master,
+            worker_node=spec.workers[0],
+        )
+    elif len(spec.nodes) == 1:
+        render_node_pinned_manifest(
+            settings.single_node_manifest, destination, node=spec.master
+        )
+    else:
+        raise ValueError(f"{spec.job_id}: no manifest for {len(spec.nodes)} nodes")
+    named = job_reboot_contract.name_rendered_job(destination, spec.job_id)
+    if named != spec.workload_name:
+        raise RegionalFixtureError(
+            f"rendered job is named {named}, the plan expects {spec.workload_name}"
+        )
+    return destination
 
 
 def profile_errors(profile: dict[str, Any] | None) -> list[str]:
@@ -365,7 +503,7 @@ def read_only_preflight(
         )
         for node in group.nodes
     }
-    targets = choose_targets(candidates, count=MIN_GROUP_NODES, dns_nodes=dns_nodes)
+    targets = choose_layout_targets(candidates, dns_nodes=dns_nodes)
     errors: list[str] = []
     if targets is None:
         errors.append(
@@ -385,7 +523,11 @@ def read_only_preflight(
         errors.append("processor queue is not empty")
     errors.extend(remote_command_queue_errors(first.get("remote_commands"), cluster_id))
     storm = oracle.read_oracle_snapshot(regional, workflow_ids=(), node_ids=group.nodes)
-    jobs = job_layout(targets, "destr028-plan") if targets else []
+    jobs = (
+        job_layout(targets, "destr028-plan", workload_bases=settings.workload_bases())
+        if targets
+        else []
+    )
     if targets is not None:
         counted = [job.faulted_node for job in jobs]
         errors.extend(
@@ -409,15 +551,8 @@ def read_only_preflight(
         {
             "node_group": group.as_dict(),
             "targets": list(targets) if targets else [],
-            "jobs": [
-                {
-                    "label": job.label,
-                    "master": job.master,
-                    "worker": job.worker,
-                    "faulted_node": job.faulted_node,
-                }
-                for job in jobs
-            ],
+            "layout": layout_name(targets) if targets else None,
+            "jobs": [job.as_dict() for job in jobs],
             "candidates": candidates,
             "workload_views": views,
             "nodes": snapshots,
@@ -479,15 +614,19 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         "node_group": preflight.get("node_group"),
         "node_group_gate": preflight.get("node_group_gate"),
         "targets": preflight.get("targets"),
+        "layout": preflight.get("layout"),
         "jobs": preflight.get("jobs"),
         "manifest": str(settings.manifest),
+        "single_node_manifest": str(settings.single_node_manifest),
         "mutation": (
-            "submit two two-node 16-GPU PyTorchJobs on four idle GPU nodes of "
-            "one node group; write one synthetic XID 79 to /dev/kmsg on one "
-            "node of each job at the same moment (the node-reboot case's host "
-            "probe and reboot sampler), so each job stops and reboots its "
-            "faulted node and restarts once, both jobs at the same time. No "
-            "replacement, no provider call beyond the two reboots."
+            "submit two PyTorchJobs on idle GPU nodes of one node group -- two "
+            "two-node 16-GPU jobs on four nodes (2+2), or a two-node 16-GPU and "
+            "a single-node 8-GPU job on three (2+1); write one synthetic XID 79 "
+            "to /dev/kmsg on the master node of each job at the same moment "
+            "(the node-reboot case's host probe and reboot sampler), so each "
+            "job stops and reboots its faulted node and restarts once, both "
+            "jobs at the same time. No replacement, no provider call beyond "
+            "the two reboots."
         ),
         "storm_premise": {
             "threshold": oracle.storm_threshold(storm.get("cluster_gpu_agents")),
@@ -501,9 +640,10 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             f"fewer than {MIN_GROUP_NODES} GPU nodes in one node group "
             "(NOT_RUN(CAPABILITY_ABSENT))",
             "DESTR-002 has not passed on this release",
-            f"no {MIN_GROUP_NODES} eligible idle nodes: not Ready, cordoned, "
-            "tainted, owned, a declared spare, running Pods, hosting arbiters, "
-            "a recent XID, an inactive Agent or a product-less GPU inventory",
+            f"not even {MIN_GROUP_NODES} eligible idle nodes: not Ready, "
+            "cordoned, tainted, owned, a declared spare, running Pods, hosting "
+            "arbiters, a recent XID, an inactive Agent or a product-less GPU "
+            "inventory",
             "the targets hold every kube-dns endpoint",
             "workload stop/restart or node reboot is not owned by the adapters",
             "the storm breaker is open, holds workflows, or still counts nodes "
@@ -534,9 +674,10 @@ def parser() -> argparse.ArgumentParser:
     # No abbreviations: a typed ``--node`` must not become ``--node-group``.
     value = argparse.ArgumentParser(
         description=(
-            "Run the guarded DESTR-028 acceptance: two two-node training jobs "
-            "of one node group recover in parallel from a reboot-class fault on "
-            "one node of each (b220 + b223)."
+            "Run the guarded DESTR-028 acceptance: two training jobs of one "
+            "node group (two-node + two-node, or two-node + single-node) "
+            "recover in parallel from a reboot-class fault on one node of each "
+            "(b220 + b223)."
         ),
         allow_abbrev=False,
     )
@@ -550,6 +691,11 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--host-probe-image", default="")
     value.add_argument("--site-file", default="")
     value.add_argument("--manifest", default="")
+    value.add_argument(
+        "--single-node-manifest",
+        default="",
+        help="the single-node job of the 2+1 layout; default: the shipped one",
+    )
     value.add_argument("--predecessor-evidence", default="")
     value.add_argument(
         "--node-group",
@@ -568,9 +714,10 @@ def parser() -> argparse.ArgumentParser:
 def oracle_domains(
     jobs: list[JobSpec], workflow_ids: dict[str, str]
 ) -> list[oracle.DomainExpectation]:
-    """One job-domain expectation per job, carrying its job tokens and its
-    two-node allocation (``workflow_ids`` maps a job label to the live
-    workflow its fault produced)."""
+    """One job-domain expectation per job, carrying its job tokens (named by
+    its renamed workload) and its allocation -- two nodes, or the single-node
+    job's one (``workflow_ids`` maps a job label to the live workflow its fault
+    produced)."""
 
     return [
         oracle.DomainExpectation(
@@ -591,7 +738,7 @@ def oracle_domains(
 # proof it calls are)
 # --------------------------------------------------------------------------- #
 @dataclass
-class _JobRun:
+class JobRun:
     """One job's fixture, faulted-node probe and records."""
 
     spec: JobSpec
@@ -631,7 +778,7 @@ class _LiveRun:
     preflight: dict[str, Any]
     regional: RegionalLiveFixture
     prewarm: ImagePrewarmFixture
-    jobs: dict[str, _JobRun]
+    jobs: dict[str, JobRun]
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def window_open(self, stage: str) -> None:
@@ -649,30 +796,26 @@ def _prepare(
     case_dir = run_dir / "cases" / CASE_ID
     run_id = run_identity(run_dir, attempt)
     regional = RegionalLiveFixture(settings.regional)
-    specs = job_layout(tuple(preflight["targets"]), run_id)
-    jobs: dict[str, _JobRun] = {}
+    specs = job_layout(
+        tuple(preflight["targets"]), run_id, workload_bases=settings.workload_bases()
+    )
+    jobs: dict[str, JobRun] = {}
     for spec in specs:
         directory = case_dir / f"job-{spec.label}"
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        manifest = join_case.render_two_node_manifest(
-            settings.manifest,
-            directory / "job.yaml",
-            master_node=spec.master,
-            worker_node=spec.worker,
-        )
         fixture = ManagedWorkloadFixture(
             regional,
             ManagedWorkloadSettings(
-                manifest=manifest,
+                manifest=render_job_manifest(settings, spec, directory),
                 site_file=settings.site_file,
                 job_id=spec.job_id,
                 attempt_id=f"{spec.job_id}-a001",
                 restart_budget=1,
-                expected_pods=NODES_PER_JOB,
-                expected_gpu_count=EXPECTED_GPU_COUNT,
+                expected_pods=len(spec.nodes),
+                expected_gpu_count=spec.gpu_count,
             ),
         )
-        jobs[spec.label] = _JobRun(
+        jobs[spec.label] = JobRun(
             spec=spec,
             fixture=fixture,
             run_id=f"{run_id}-{spec.label}",
@@ -723,10 +866,13 @@ def _launch_jobs(run: _LiveRun) -> None:
 def _baselines_and_samplers(run: _LiveRun) -> None:
     for item in run.jobs.values():
         run.window_open(f"the host baseline of {item.spec.master}")
+        # The master runs its job's ranks by design: their compute clients are
+        # not a pre-existing fault (the idle-reset rule is not this case's).
         baseline, _count, bdf = reset_case.prepare_host_baseline(
             item.probe,
             {"node": run.preflight["nodes"][item.spec.master]},
             item.directory,
+            require_idle=False,
         )
         item.baseline, item.target_bdf = baseline, bdf
     run.regional.verify_runtime_identity(
@@ -757,7 +903,7 @@ def _inject_both(run: _LiveRun) -> None:
         item.marker = f"{base}-{item.spec.label}"
     run.started_at = datetime.now(timezone.utc)
 
-    def write(item: _JobRun) -> dict[str, Any]:
+    def write(item: JobRun) -> dict[str, Any]:
         item.injection_attempted = True
         payload = item.probe.execute(
             "write-xid79",
@@ -815,7 +961,9 @@ def _judge_records(run: _LiveRun) -> oracle.OracleVerdict:
         snapshot = oracle.read_oracle_snapshot(
             run.regional,
             workflow_ids=[domain.workflow_id for domain in domains],
-            node_ids=[item.spec.master for item in run.jobs.values()],
+            # Every node of both jobs: a healthy worker is stopped and
+            # restarted too, so residue the case left could sit on it.
+            node_ids=[node for item in run.jobs.values() for node in item.spec.nodes],
         )
     except RegionalFixtureError as exc:
         return oracle.unreadable_verdict(f"the store could not be read: {exc}")
@@ -836,25 +984,34 @@ def _judge_records(run: _LiveRun) -> oracle.OracleVerdict:
     )
 
 
-def _job_contract(run: _LiveRun, item: _JobRun) -> list[str]:
-    """The faulted node rebooted exactly once, and the job's workflow ran its
-    stop/reboot/restart (DESTR-002's reboot proof plus the workflow shape)."""
+def job_node_contract(run: _LiveRun, item: JobRun) -> list[str]:
+    """The job's faulted master: rebooted by its job workflow, which stopped
+    and restarted the job; a healthy worker only stopped and restarted with it
+    (``job_reboot_contract``: DESTR-002's reboot proof without its provider
+    half). A single-node job has no worker to judge."""
 
-    errors: list[str] = [
-        f"{item.spec.job_id}: {error}"
-        for error in workload_case.workflow_errors(item.state)
-    ]
-    escalation = product_escalation(item.state)
-    before = run.preflight["nodes"][item.spec.master]
-    after = run.regional.node_snapshot(item.spec.master)
-    rebooted = product_reboot(escalation, before, after)
-    if not rebooted:
-        errors.append(
-            f"{item.spec.master}: the faulted node did not reboot as the fault required"
-        )
-    else:
+    master = item.spec.master
+    before = run.preflight["nodes"][master]
+    after = run.regional.node_snapshot(master)
+    write_json_atomic(item.directory / "node-after.json", after)
+    if product_reboot(product_escalation(item.state), before, after):
         item.sampler_stopped = True  # the boot ended the sampler's transient unit
-        errors.append(f"{item.spec.master}: {reboot_proof_error(escalation, rebooted)}")
+    errors = [
+        f"{item.spec.job_id}: {master}: {error}"
+        for error in job_reboot_contract.faulted_node_errors(
+            item.state,
+            node_before=before,
+            node_after=after,
+            store_before=(run.preflight.get("stores") or {}).get(master),
+        )
+    ]
+    errors.extend(
+        f"{item.spec.job_id}: {error}"
+        for error in job_reboot_contract.healthy_peer_errors(
+            {node: run.preflight["nodes"][node] for node in item.spec.workers},
+            {node: run.regional.node_snapshot(node) for node in item.spec.workers},
+        )
+    )
     return errors
 
 
@@ -928,7 +1085,8 @@ def execute_case(
         **preflight["evidence_identity"],
         "node_group": preflight["node_group"],
         "targets": preflight["targets"],
-        "jobs": preflight["jobs"],
+        "layout": preflight["layout"],
+        "jobs": [item.spec.as_dict() for item in run.jobs.values()],
         "maintenance_window_end": maintenance_window_end.isoformat(),
     }
     try:
@@ -939,7 +1097,7 @@ def execute_case(
         verdict = _judge_records(run)
         errors = list(verdict.errors)
         for item in run.jobs.values():
-            errors.extend(_job_contract(run, item))
+            errors.extend(job_node_contract(run, item))
         cpu_after = run.regional.cpu_blast_snapshot()
         write_json_atomic(case_dir / "cpu-blast-after.json", cpu_after)
         if cpu_after != preflight["cpu_blast"]:

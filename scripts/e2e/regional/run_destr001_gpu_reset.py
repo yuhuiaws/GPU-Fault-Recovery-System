@@ -645,9 +645,9 @@ def prepare_host_baseline(
 ) -> tuple[dict[str, Any], int, str]:
     # ``require_idle`` is the GPU-reset target's rule: no active NVIDIA compute
     # client may hold a GPU we are about to reset. A caller that baselines a node
-    # deliberately running a workload -- DESTR-029's job master, which takes a
-    # node reboot, not a GPU reset -- passes ``require_idle=False`` so the running
-    # job's compute clients do not read as a pre-existing fault.
+    # deliberately running a workload -- a DESTR-028/029 job master, which takes
+    # a node reboot, not a GPU reset -- passes ``require_idle=False`` so the
+    # running job's compute clients do not read as a pre-existing fault.
     host.create()
     baseline_host = host.execute("snapshot")
     write_json_atomic(case_dir / "host-baseline.json", baseline_host)

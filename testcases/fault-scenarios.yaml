@@ -6174,7 +6174,7 @@ test_cases:
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-027
   related_pytest: tests/regional/test_workload_domain_oracle.py::test_two_idle_nodes_in_parallel_are_the_pass_shape
 - id: GF-REGIONAL-DESTR-028
-  title: 同一节点组两个两节点训练作业，各坏一台节点的 reboot 故障：两条作业工作流并行恢复，storm breaker 只数两台被 reboot 的节点
+  title: 同一节点组两个训练作业（2+2 或 2+1 节点），各坏一台节点的 reboot 故障：两条作业工作流并行恢复，storm breaker 只数两台被 reboot 的节点
   category: regional-destructive-acceptance
   level: staging
   risk: destructive
@@ -6184,24 +6184,27 @@ test_cases:
     两个作业之间只按 node:<cluster>:<node>（limit 1）互斥，固定的 region/每集群/每资源类限额与节点组 domain 已退役，相关性故障由
     每集群的 storm breaker 兜底。b223 修正了 breaker 的计数：它只数一次首次准入里收到节点硬件变更步骤（这里是 RESTART_NODE）
     或隔离的节点，不再把仅因作业被整体停止而被 STOP/RESTART 点名的健康 peer 也数进去（此前两个各坏一台的两节点作业会数成四台、
-    越过 floor 3 而串行并熔断）。只有单元证据证明 b223 的计数，没有区域用例证明同组两个作业真的被并行修复且 breaker 保持 CLOSED。
+    一个两节点作业加一个单节点作业会数成三台，都达到 floor 3 而熔断并串行）。只有单元证据证明 b223 的计数，没有区域用例证明同组
+    两个作业真的被并行修复且 breaker 保持 CLOSED。
   injection: >-
-    从 live 集群读出 GPU 节点组，取 GPU 节点最多的组（或 --node-group 指定的组），按名称序取前四台合格的空闲节点，不从 site
-    profile 的节点列表取；组内 GPU 节点不足 4 台时整条用例记 NOT_RUN(CAPABILITY_ABSENT)。在前两台与后两台各提交一个两节点
-    16-GPU PyTorchJob（复用 b141 的 GPU-active 两节点作业清单 manifests/training/two-node-replace-pytorchjob.yaml 与 GPU 负载片段），
-    待各 rank 健康后在每个作业的 master 节点各写一条 XID 79（复用 DESTR-002 的 write-xid79 宿主探针与 reboot 采样器，各自的 marker、
-    drill id 与第一张 GPU 的 PCI 地址），两条同时写入。不改任何控制面、executor 或 storm breaker 设置，不声明 warm spare。
+    从 live 集群读出 GPU 节点组，取 GPU 节点最多的组（或 --node-group 指定的组），按名称序取前四台合格的空闲节点，不足四台时取
+    前三台，不从 site profile 的节点列表取；组内 GPU 节点不足 3 台时整条用例记 NOT_RUN(CAPABILITY_ABSENT)。四台时为 2+2 布局：
+    前两台与后两台各提交一个两节点 16-GPU PyTorchJob；三台时为 2+1 布局（例如四台的组里一台承载 arbiter）：前两台提交一个两节点
+    16-GPU PyTorchJob，第三台提交一个单节点 8-GPU PyTorchJob。作业复用 b141 的 GPU-active 作业清单
+    manifests/training/two-node-replace-pytorchjob.yaml 与 single-node-warm-spare-pytorchjob.yaml 及 GPU 负载片段，各按其 job id
+    重命名后提交。待各 rank 健康后在每个作业的 master 节点各写一条 XID 79（复用 DESTR-002 的 write-xid79 宿主探针与 reboot 采样器，
+    各自的 marker、drill id 与第一张 GPU 的 PCI 地址），两条同时写入。不改任何控制面、executor 或 storm breaker 设置，不声明 warm spare。
   expected:
-  - 预置门禁：同一节点组 live 计数 ≥4 台 GPU 节点，否则 NOT_RUN(CAPABILITY_ABSENT) 并写明要求与实际台数（例如 needs >=4 GPU nodes in one node group; cluster X group Y has 3）；同一 release 上 DESTR-002 PASS
-  - 四台目标节点 Ready、可调度、无 gpu-fault taint 与 ownership 注解、不是声明的 warm spare、无业务 Pod 与 GPU Pod、不承载 arbiter Pod、近 10 分钟无 XID、Node Agent ACTIVE、控制面判其 workload_state 为 IDLE、GPU inventory 身份带单一产品；STOP_WORKLOADS/RESTART_WORKLOAD 由 Kubernetes 适配器 OWN、nodeReboot 可用；processor 与本集群远端命令队列为空
+  - 预置门禁：同一节点组 live 计数 ≥3 台 GPU 节点，否则 NOT_RUN(CAPABILITY_ABSENT) 并写明要求与实际台数（例如 needs >=3 GPU nodes in one node group; cluster X group Y has 2）；同一 release 上 DESTR-002 PASS；plan 与结果记录所用布局（2+2 或 2+1）
+  - 目标节点（2+2 四台、2+1 三台）Ready、可调度、无 gpu-fault taint 与 ownership 注解、不是声明的 warm spare、无业务 Pod 与 GPU Pod、不承载 arbiter Pod、近 10 分钟无 XID、Node Agent ACTIVE、控制面判其 workload_state 为 IDLE、GPU inventory 身份带单一产品；STOP_WORKLOADS/RESTART_WORKLOAD 由 Kubernetes 适配器 OWN、nodeReboot 可用；processor 与本集群远端命令队列为空
   - storm breaker 前提：控制面已有 storm breaker，状态 CLOSED、没有被它 hold 的工作流，且其窗口内仍在计数的节点加上两台将被 reboot 的 master 低于阈值
   - 每个作业各一条工作流：两个不同的 workflow_request_id 与 incident，各自 incident.node_ids 只含本作业的故障节点、带本作业的 job_id；各自把 STOP_WORKLOADS→RESTART_NODE→(验证)→RESTORE_SCHEDULING→RESTART_WORKLOAD 跑完并 SUCCEEDED，incident RECOVERED
-  - 预算声明：每条工作流的 remediation_budget_claims 含本作业两台节点的 node:<cluster>:<node>（limit 1）与作业令牌 job:<cluster>:<workload_id>、job:<cluster>:job-id/<job_id>；没有 region、cluster:、class:，也没有节点组 domain:<cluster>:<group>
+  - 预算声明：每条工作流的 remediation_budget_claims 含本作业每台节点的 node:<cluster>:<node>（limit 1；两节点作业两台、单节点作业一台）与作业令牌 job:<cluster>:<workload_id>、job:<cluster>:job-id/<job_id>，workload_id 指向实际提交的、按 job id 重命名的 PyTorchJob；没有 region、cluster:、class:，也没有节点组 domain:<cluster>:<group>
   - 从未被 hold：两条工作流的 remediation_budget_wait_count 为 0，没有 REMEDIATION_BUDGET_WAIT 或 REMEDIATION_STORM_TRIPPED 事件，remediation_budget_last_blocked_scope 为空
   - 并行由持久化时间戳证明：两条工作流的 RESTART_NODE 步骤（step_executions 的 started_at 与终态 updated_at）在墙钟上重叠，不读日志
-  - storm breaker 全程 CLOSED（本用例期间没有 trip、release 或 abort），它只为这两条工作流各计一台被 reboot 的 master 节点、各在自己的作业工作负载域，共 2 台，低于阈值；健康 peer 不计入
-  - 两台被 reboot 的 master 满足 DESTR-002 的 reboot 证明（节点确实重启、boot_id 变化）；两个作业各只停一次、只重启一次；无 provider 变更超出两次 reboot；控制面 EKS 状态不变
-  - 四台节点 Ready、可调度、无 gpu-fault taint 与 ownership 注解；两个测试作业被删除、采集器停止、探针与 prewarm 资源无残留；结果记录 window_clear_at（两条首次准入加 600 s），同一集群的下一条破坏性用例在其后开始
+  - storm breaker 全程 CLOSED（本用例期间没有 trip、release 或 abort），它只为这两条工作流各计一台被 reboot 的 master 节点、各在自己的作业工作负载域，两种布局都共 2 台，低于阈值；健康 peer 不计入，计入即与期望的 2 台不符而判 FAIL（即使阈值更高、不会熔断）
+  - 两台被 reboot 的 master 满足 DESTR-002 的 reboot 证明（事件为 XID 79、裁决 REBOOT_NODE、工作流步骤按序各恰一次且成功、无物理 GPU 操作、Node Agent 以新 boot 回到 ACTIVE 且制品不变、节点 boot_id 变化而 UID 与 GPU 容量不变；provider 提交记录是 DESTR-002 自己的判定对象，本用例不读）；两节点作业的健康 worker 未被重启（boot_id 不变）且 Ready；两个作业各只停一次、只重启一次；无 provider 变更超出两次 reboot；控制面 EKS 状态不变
+  - 全部目标节点 Ready、可调度、无 gpu-fault taint 与 ownership 注解；两个测试作业被删除、采集器停止、探针与 prewarm 资源无残留；结果记录 window_clear_at（两条首次准入加 600 s），同一集群的下一条破坏性用例在其后开始
   evidence:
     verdict: NOT_RUN
   automation: manual

@@ -219,14 +219,14 @@ phases:
         predecessor: GF-REGIONAL-DESTR-002
     notes:
       - DESTR-028 与 DESTR-029 以 DESTR-002 PASS（节点 reboot 恢复已成立）为证据前置，验证 b220 的工作负载失败域配合 b223
-        的 storm breaker 计数修正：DESTR-028 需要同一节点组至少 4 台 GPU 节点，起两个两节点作业、各在一台节点写 reboot 类
-        XID 79，证明两条作业工作流并行恢复、各带作业令牌与本作业节点作用域、都不被节点组 domain 串行、reboot 步骤在持久化
+        的 storm breaker 计数修正：DESTR-028 需要同一节点组至少 3 台 GPU 节点，起两个作业（4 台合格节点时为两个两节点作业，
+        3 台时为一个两节点作业加一个单节点作业）、各在一台节点写 reboot 类 XID 79，证明两条作业工作流并行恢复、各带作业令牌与本作业节点作用域、都不被节点组 domain 串行、reboot 步骤在持久化
         时间戳上重叠、breaker 保持 CLOSED 且只数两台被 reboot 的节点（健康 peer 不计）。DESTR-029 需要至少 3 台 GPU 节点，
         起一个两节点作业加一台空闲节点，作业一台写 XID 79（reboot）、空闲节点写 XID 46（reset），证明作业域与空闲节点域两种
         不同域类型并行恢复、breaker 数 2 台保持 CLOSED。两者均破坏性、独占该集群执行（期间不得在同一集群上运行其他破坏性
         用例），同一集群的下一条破坏性用例在结果的 window_clear_at（首次准入加 600 s）之后开始，否则各用例的节点在 breaker
-        窗口里一起计数；live 计数不足即 NOT_RUN(CAPABILITY_ABSENT) 并写明要求与实际台数，今天只有 HyperPod（4 台）两者皆可、
-        EKS（2 台）两者皆按台数跳过。
+        窗口里一起计数；live 计数不足即 NOT_RUN(CAPABILITY_ABSENT) 并写明要求与实际台数，只有 2 台 GPU 节点的组（例如两节点的
+        plain EKS 组）两者皆按台数跳过。
       - DESTR-027 以 DESTR-001 PASS 为证据前置，需要同一节点组至少 2 台 GPU 节点（live 计数，不足即 NOT_RUN(CAPABILITY_ABSENT)），
         从该组按名称序取两台合格的空闲节点，同时各写一条 XID 46，证明两条各自的 RESET_GPU 工作流只按 node 作用域互斥、
         不被节点组 domain 串行、预算步骤在持久化时间戳上重叠、storm breaker 保持 CLOSED。它独占该集群执行：两台节点都被
