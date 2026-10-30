@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import signal
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -991,21 +992,20 @@ def test_integrated_heartbeat_refresher_is_throttled(
 def test_integrated_cleanup_signal_guard_ignores_and_restores_signals(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    guarded = tuple(
-        getattr(suite.signal, name) for name in ("SIGINT", "SIGTERM", "SIGHUP")
-    )
+    """The guard lives in regional_capacity_recovery now (the storm breaker
+    step's cleanup shares it); the integrated runner still uses it."""
+
+    guarded = tuple(getattr(signal, name) for name in ("SIGINT", "SIGTERM", "SIGHUP"))
     original = {value: object() for value in guarded}
     active = dict(original)
 
-    monkeypatch.setattr(suite.signal, "getsignal", lambda value: active[value])
+    monkeypatch.setattr(signal, "getsignal", lambda value: active[value])
     monkeypatch.setattr(
-        suite.signal,
-        "signal",
-        lambda value, handler: active.__setitem__(value, handler),
+        signal, "signal", lambda value, handler: active.__setitem__(value, handler)
     )
 
     with suite.cleanup_signal_guard():
-        assert all(active[value] is suite.signal.SIG_IGN for value in guarded), (
+        assert all(active[value] is signal.SIG_IGN for value in guarded), (
             "cleanup did not ignore termination signals"
         )
 

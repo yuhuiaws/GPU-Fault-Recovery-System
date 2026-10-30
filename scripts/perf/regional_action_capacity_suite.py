@@ -60,7 +60,18 @@ if TYPE_CHECKING or __package__:
         executor_scripts,
         retry_fields,
     )
-    from .regional_remediation_budget import write_remediation_budget
+    from .regional_remediation_budget import (
+        BUDGET_LIMIT_EXCEEDED,
+        budget_occupancy_check,
+        budget_tier,
+        write_remediation_budget,
+    )
+    from .regional_synthetic_fleet import (
+        add_fleet_argument,
+        fleet_plan,
+        synthetic_fleet,
+        verify_fleet_cleanup,
+    )
 else:
     from regional_capacity_placement import (
         optional_placement_section,
@@ -108,7 +119,18 @@ else:
         executor_scripts,
         retry_fields,
     )
-    from regional_remediation_budget import write_remediation_budget
+    from regional_remediation_budget import (
+        BUDGET_LIMIT_EXCEEDED,
+        budget_occupancy_check,
+        budget_tier,
+        write_remediation_budget,
+    )
+    from regional_synthetic_fleet import (
+        add_fleet_argument,
+        fleet_plan,
+        synthetic_fleet,
+        verify_fleet_cleanup,
+    )
 
 
 LOAD_SERVICE_ACCOUNT = "gpu-fault-completion-watcher"
@@ -202,113 +224,6 @@ def live_remediation_budget() -> dict[str, int | None]:
     return {
         name: (int(values[name]) if values.get(name) not in (None, "") else None)
         for name in REMEDIATION_BUDGET_ENV
-    }
-
-
-def budget_tier(
-    budget: dict[str, int | None],
-    *,
-    clusters: int,
-    workflows_per_cluster: int,
-    executor_workers: int,
-) -> dict:
-    """Classify the live budget against the fixed request model (§8.2).
-
-    Raw capacity tier: region >= clusters x workflows, cluster and resource
-    class >= workflows per cluster -- every workflow may run at once, so each
-    executor must reach one in-flight command per workflow. Production budget tier:
-    a lower limit throttles the workflows on purpose, so an executor only has
-    to make progress (floor 1); the budget waits are the measurement. Live
-    2026-09-22: under 20/5/2 every executor completed its 40 commands but
-    exited on the raw-tier floor of 8, failing a run that had behaved.
-
-    Unbounded: none of the three is set -- the shipped state since they were
-    retired. No fixed number caps the model; each GPU cluster's remediation
-    storm breaker does, and it trips once max(3, ceil(20% of the cluster's
-    registered GPU nodes)) nodes of two or more workflows enter destructive
-    remediation within 600 s. This suite registers only the model's nodes, so
-    any model of two or more workflows per cluster trips it and the held
-    workflows wait for an operator (perf acceptance plan).
-    """
-
-    region = budget.get("GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION")
-    per_cluster = budget.get("GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER")
-    per_class = budget.get("GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS")
-    limits = [
-        (region, clusters * workflows_per_cluster),
-        (per_cluster, workflows_per_cluster),
-        (per_class, workflows_per_cluster),
-    ]
-    if all(limit is None for limit, _ in limits):
-        tier = "unbounded"
-    elif all(limit is None or limit >= needed for limit, needed in limits):
-        tier = "raw-capacity"
-    else:
-        tier = "production-budget"
-    return {
-        "tier": tier,
-        "limits": dict(budget),
-        "required_for_raw_capacity": {
-            "region": clusters * workflows_per_cluster,
-            "per_cluster": workflows_per_cluster,
-            "per_resource_class": workflows_per_cluster,
-        },
-        # The executor's concurrency floor is progress-only in every tier: the
-        # per-node and per-failure-domain limits serialize a cluster's workflows
-        # on purpose, so peak concurrency is evidence (max_concurrent_commands
-        # per executor), not a pass criterion. Live 2026-09-22: floors of 8 and
-        # then 4 each failed a run whose 128 workflows had all SUCCEEDED.
-        "min_concurrent_commands": 1,
-    }
-
-
-# The scope kinds the occupancy verdict bounds, and the limit each one reads
-# from ``run.json.remediation_budget.limits``. Node and failure-domain peaks are
-# recorded as evidence only.
-BUDGET_OCCUPANCY_LIMITS = {
-    "region": "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION",
-    "cluster": "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER",
-    "class": "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS",
-}
-# ``execute_capacity_run``'s result when the workflows completed but a sample
-# held more RUNNING workflows on one scope than its limit.
-BUDGET_LIMIT_EXCEEDED = 3
-
-
-def budget_occupancy_check(history: list[dict], remediation_budget: dict) -> dict:
-    """RUNNING-with-claims against the run's recorded limits (性能压测验收方案 §8.2).
-
-    A claim is held until its workflow ends (详细设计-v2 §9.5), so every
-    ``history.json`` sample must stay within the limits, not only the
-    admissions: per sample, ``budget_holders_max`` is the number of RUNNING
-    workflows listing the busiest scope of each kind -- the region, the busiest
-    cluster, the busiest (cluster, resource class). A limit that is unset is
-    not checked; a history without any such sample fails, since it proves
-    nothing.
-    """
-
-    limits = remediation_budget.get("limits") or {}
-    peaks: dict[str, int] = {}
-    samples = [
-        item["budget_holders_max"] for item in history if "budget_holders_max" in item
-    ]
-    for holders in samples:
-        for kind, count in holders.items():
-            peaks[kind] = max(peaks.get(kind, 0), int(count))
-    bounded = {kind: limits.get(name) for kind, name in BUDGET_OCCUPANCY_LIMITS.items()}
-    violations = [
-        f"{kind} scope held by {peaks[kind]} RUNNING workflows, limit {limit}"
-        for kind, limit in bounded.items()
-        if limit is not None and peaks.get(kind, 0) > int(limit)
-    ]
-    if not samples:
-        violations.append("history.json has no remediation budget occupancy sample")
-    return {
-        "passed": not violations,
-        "samples": len(samples),
-        "peak_holders": peaks,
-        "limits": bounded,
-        "violations": violations,
     }
 
 
@@ -1311,15 +1226,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--allow-live-registry", action="store_true")
     parser.add_argument("--confirm-live-registry")
     parser.add_argument("--synthetic-ttl-seconds", type=int, default=3600)
+    add_fleet_argument(parser)
     args = parser.parse_args(argv)
     if args.synthetic_ttl_seconds < 300:
         parser.error("--synthetic-ttl-seconds must be at least 300")
+    if args.synthetic_ttl_seconds < args.timeout_seconds + 600:
+        # The registration and the fleet's heartbeat both end at the TTL (§8.5).
+        parser.error("--synthetic-ttl-seconds must exceed --timeout-seconds by 600")
     try:
         registry_scope = validate_registry_target(
             allow_live_registry=args.allow_live_registry,
             confirmation=args.confirm_live_registry,
         )
-    except RuntimeError as exc:
+        fleet = fleet_plan(
+            clusters=args.clusters,
+            model_nodes_per_cluster=args.workflows_per_cluster
+            * args.nodes_per_workflow,
+            nodes_per_cluster=args.fleet_nodes_per_cluster,
+        )
+    except (RuntimeError, ValueError) as exc:
         parser.error(str(exc))
     run_id = args.suite_id or datetime.now(timezone.utc).strftime("act%Y%m%dT%H%M%S")
     label = args.label or f"actions-{args.clusters}c"
@@ -1358,6 +1283,7 @@ def main(argv: list[str] | None = None) -> int:
                 "delay_scale": args.delay_scale,
                 "lease_seconds": args.lease_seconds,
                 "inject_renew_failure_once": args.inject_renew_failure_once,
+                "synthetic_fleet": fleet,
                 "suite_id": run_id,
                 "registry_scope": registry_scope,
                 "control_namespace": CONTROL_NAMESPACE,
@@ -1397,19 +1323,30 @@ def main(argv: list[str] | None = None) -> int:
         registration_pending = False
         validate_registered_resources(artifacts, run_id, args.clusters)
         run_validated = True
-        result = execute_capacity_run(
-            args,
+        # The healthy fleet before any workflow (§8.5): the breaker judges the
+        # first admissions against the cluster's registered GPU nodes.
+        with synthetic_fleet(
+            artifacts,
             run_id=run_id,
-            artifacts=artifacts,
-            expected_workflows=expected_workflows,
-            expected_commands_per_cluster=expected_commands_per_cluster,
-            started=started,
-            registry_scope=registry_scope,
-            resources=resources,
-            min_concurrent_commands=tier["min_concurrent_commands"],
-            placement=placement,
-            remediation_budget=tier,
-        )
+            plan=fleet,
+            agent_identity=(
+                release_agent_identity() if registry_scope == "isolated" else None
+            ),
+            deadline_seconds=args.synthetic_ttl_seconds,
+        ):
+            result = execute_capacity_run(
+                args,
+                run_id=run_id,
+                artifacts=artifacts,
+                expected_workflows=expected_workflows,
+                expected_commands_per_cluster=expected_commands_per_cluster,
+                started=started,
+                registry_scope=registry_scope,
+                resources=resources,
+                min_concurrent_commands=tier["min_concurrent_commands"],
+                placement=placement,
+                remediation_budget=tier,
+            )
     except BaseException as exc:
         failure = exc
     finally:
@@ -1428,6 +1365,7 @@ def main(argv: list[str] | None = None) -> int:
                     artifacts=artifacts,
                     run_id=run_id,
                 )
+                verify_fleet_cleanup(artifacts, run_id=run_id, clusters=args.clusters)
             except Exception as exc:
                 cleanup_error = exc
                 if failure is not None:

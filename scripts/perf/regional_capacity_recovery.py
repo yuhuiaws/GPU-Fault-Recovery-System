@@ -12,9 +12,11 @@ run's ``run.json`` still matches ``resume_identity``.
 from __future__ import annotations
 
 import shlex
+import signal
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 if __package__:
@@ -145,3 +147,29 @@ def write_aborted_status(
         reason=f"{type(failure).__name__}: {failure}",
         **fields,
     )
+
+
+@contextmanager
+def cleanup_signal_guard() -> Iterator[None]:
+    """Ignore SIGINT, SIGTERM and SIGHUP while a run's bounded cleanup runs, and
+    restore the handlers after it (the integrated and storm breaker runners)."""
+
+    guarded = tuple(
+        value
+        for name in ("SIGINT", "SIGTERM", "SIGHUP")
+        if (value := getattr(signal, name, None)) is not None
+    )
+    previous: dict[signal.Signals, object] = {}
+    try:
+        for value in guarded:
+            previous[value] = signal.getsignal(value)
+            signal.signal(value, signal.SIG_IGN)
+    except (OSError, ValueError):
+        for value, handler in previous.items():
+            signal.signal(value, handler)
+        previous.clear()
+    try:
+        yield
+    finally:
+        for value, handler in previous.items():
+            signal.signal(value, handler)

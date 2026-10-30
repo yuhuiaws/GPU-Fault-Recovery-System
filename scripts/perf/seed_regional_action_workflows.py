@@ -87,6 +87,14 @@ VALIDATION_WATCH_MODE = "integrated-validation-watch"
 #: The correlated suite's event-driven node return (§8.3): the same watch over
 #: the run's ``corr-node-*`` Agents and their node-return package.
 NODE_RETURN_WATCH_MODE = "node-return-validation-watch"
+#: The run's synthetic healthy fleet (``regional_synthetic_fleet``, §8.5): the
+#: GPU nodes a perf cluster registers beside the model's own, so the
+#: remediation storm breaker's threshold -- 20% of the cluster's ACTIVE and
+#: DRAINING Agents -- is a production cluster's, not its floor of 3. They are
+#: never a workflow's node; the model's refreshes and telemetry skip them and
+#: ``synthetic_fleet_pod.py`` keeps their own heartbeats.
+FLEET_AGENTS_MODE = "fleet-agents"
+FLEET_NODE_PREFIX = "fleet-node-"
 #: Completing any of these is a telemetry barrier: post-action validation
 #: accepts only samples observed after the latest one
 #: (``telemetry_readiness_operations`` in ``adapters/gpu_validation.py``).
@@ -420,6 +428,43 @@ def integrated_node_id(run_id: str, cluster_index: int, workflow_index: int) -> 
     return f"integrated-node-{run_id}-c{cluster_index:03d}-w{workflow_index:02d}"
 
 
+def fleet_node_id(run_id: str, cluster_index: int, index: int) -> str:
+    return f"{FLEET_NODE_PREFIX}{run_id}-c{cluster_index:03d}-n{index:04d}"
+
+
+def seed_fleet_agents(
+    context: ApplicationContext,
+    *,
+    run_id: str,
+    clusters: int,
+    per_cluster: int,
+    template: AgentRecord | None,
+    identity: Mapping[str, object] | None,
+    now: datetime,
+) -> int:
+    """Register ``per_cluster`` healthy fleet Agents in every perf cluster.
+
+    The identity is the model's own (the release-bound one, or the live
+    template), so the fleet is as compatible as the nodes the run repairs;
+    the lease is ``ACTION_AGENT_LEASE_SECONDS``, the heartbeat session's.
+    """
+
+    created = 0
+    for cluster_index in range(clusters):
+        for index in range(per_cluster):
+            save_synthetic_agent(
+                context,
+                template=template,
+                identity=identity,
+                cluster_id=f"perf-cap-{cluster_index:03d}",
+                node_id=fleet_node_id(run_id, cluster_index, index),
+                run_id=run_id,
+                now=now,
+            )
+            created += 1
+    return created
+
+
 def refresh_run_agent_heartbeats(
     context: ApplicationContext,
     *,
@@ -481,13 +526,16 @@ def run_agents(
     context: ApplicationContext, *, run_id: str, clusters: int
 ) -> list[tuple[str, AgentRecord]]:
     """``(cluster id, Agent)`` of the run's ACTIVE synthetic Agents, matched by
-    the run id inside their node id."""
+    the run id inside their node id; the healthy fleet is not among them (its
+    own session heartbeats it, and it publishes no telemetry)."""
 
     agents = []
     for cluster_index in range(clusters):
         cluster_id = f"perf-cap-{cluster_index:03d}"
         for record in context.store.list_agents(cluster_id):
             if run_id not in record.node_id:
+                continue
+            if record.node_id.startswith(FLEET_NODE_PREFIX):
                 continue
             if record.lifecycle_state is not AgentLifecycleState.ACTIVE:
                 continue
@@ -1002,6 +1050,66 @@ def workflow_steps(
     ]
 
 
+def action_scope(run_id: str, cluster_index: int, workflow_index: int) -> str:
+    """The id stem of one seeded action workflow, its incident and its nodes."""
+
+    return f"actionperf-{run_id}-c{cluster_index:03d}-w{workflow_index:03d}"
+
+
+def action_nodes(scope: str, nodes_per_workflow: int) -> list[str]:
+    return [f"{scope}-node-{index:02d}" for index in range(nodes_per_workflow)]
+
+
+def save_action_workflow(
+    context: ApplicationContext,
+    *,
+    cluster_id: str,
+    scope: str,
+    nodes: list[str],
+    run_id: str,
+    runtime_profile_version: str,
+    now: datetime,
+) -> None:
+    """One seeded action workflow and its incident: no job, so the incident is
+    the workload domain the storm breaker counts."""
+
+    incident_id = f"incident-{scope}"
+    request_id = f"workflow-{scope}"
+    workflow = WorkflowRequest(
+        request_id=request_id,
+        incident_id=incident_id,
+        runtime_profile_version=runtime_profile_version,
+        status=WorkflowStatus.PENDING,
+        official_action="ACTION_CAPACITY_TEST",
+        fencing_token=1,
+        dag_enabled=True,
+        dag_revision=1,
+        official_steps=workflow_steps(
+            nodes=nodes,
+            workload_id=f"training/PyTorchJob/{scope}",
+            run_id=run_id,
+        ),
+        created_at=now,
+        updated_at=now,
+    )
+    incident = FaultIncident(
+        incident_id=incident_id,
+        event_id=f"event-{scope}",
+        event_type="ACTION_CAPACITY_TEST",
+        cluster_id=cluster_id,
+        node_ids=nodes,
+        policy_version="action-capacity-v1",
+        policy_source="CONTROLLED_DRILL",
+        official_action="ACTION_CAPACITY_TEST",
+        state=IncidentState.ACTION_PENDING,
+        workflow_request_id=request_id,
+        drill_id=run_id,
+        created_at=now,
+        updated_at=now,
+    )
+    context.store.save_incident_and_workflow(incident, workflow)
+
+
 def refresh_document(
     context: ApplicationContext,
     seed_mode: str,
@@ -1143,67 +1251,75 @@ def main() -> None:
                 )
             )
             return
+        if seed_mode == FLEET_AGENTS_MODE:
+            per_cluster = int(os.environ["ACTION_FLEET_AGENTS_PER_CLUSTER"])
+            agents_created = seed_fleet_agents(
+                context,
+                run_id=run_id,
+                clusters=clusters,
+                per_cluster=per_cluster,
+                template=agent_template,
+                identity=identity,
+                now=now,
+            )
+            print(
+                json.dumps(
+                    {
+                        "run_id": run_id,
+                        "clusters": clusters,
+                        "fleet_agents_per_cluster": per_cluster,
+                        "agents_created": agents_created,
+                        "node_id_prefix": f"{FLEET_NODE_PREFIX}{run_id}-",
+                        "lease_seconds": int(
+                            os.getenv("ACTION_AGENT_LEASE_SECONDS", "1800")
+                        ),
+                        "agent_identity_source": identity_source,
+                        "runtime_profile_version": runtime_profile_version,
+                        **provider_facts,
+                    },
+                    sort_keys=True,
+                )
+            )
+            return
         if seed_mode != "workflows":
             raise RuntimeError(f"unsupported action seed mode: {seed_mode}")
         workflows_per_cluster = int(os.environ["ACTION_WORKFLOWS_PER_CLUSTER"])
         nodes_per_workflow = int(os.environ["ACTION_NODES_PER_WORKFLOW"])
-        for cluster_index in range(clusters):
-            cluster_id = f"perf-cap-{cluster_index:03d}"
-            for workflow_index in range(workflows_per_cluster):
-                scope = (
-                    f"actionperf-{run_id}-c{cluster_index:03d}-w{workflow_index:03d}"
-                )
-                incident_id = f"incident-{scope}"
-                request_id = f"workflow-{scope}"
-                nodes = [
-                    f"{scope}-node-{index:02d}" for index in range(nodes_per_workflow)
-                ]
-                for node_id in nodes:
-                    save_synthetic_agent(
-                        context,
-                        template=agent_template,
-                        identity=identity,
-                        cluster_id=cluster_id,
-                        node_id=node_id,
-                        run_id=run_id,
-                        now=now,
-                    )
-                    agents_created += 1
-                workload_id = f"training/PyTorchJob/{scope}"
-                workflow = WorkflowRequest(
-                    request_id=request_id,
-                    incident_id=incident_id,
-                    runtime_profile_version=runtime_profile_version,
-                    status=WorkflowStatus.PENDING,
-                    official_action="ACTION_CAPACITY_TEST",
-                    fencing_token=1,
-                    dag_enabled=True,
-                    dag_revision=1,
-                    official_steps=workflow_steps(
-                        nodes=nodes,
-                        workload_id=workload_id,
-                        run_id=run_id,
-                    ),
-                    created_at=now,
-                    updated_at=now,
-                )
-                incident = FaultIncident(
-                    incident_id=incident_id,
-                    event_id=f"event-{scope}",
-                    event_type="ACTION_CAPACITY_TEST",
+        scopes = [
+            (
+                f"perf-cap-{cluster_index:03d}",
+                action_scope(run_id, cluster_index, index),
+            )
+            for cluster_index in range(clusters)
+            for index in range(workflows_per_cluster)
+        ]
+        # Every Agent before any workflow: the storm breaker counts a cluster's
+        # GPU nodes at a first admission there (and caches the count for a
+        # minute), so a workflow claimed while the Agents of the workflows
+        # after it were still being saved was judged against a smaller cluster.
+        for cluster_id, scope in scopes:
+            for node_id in action_nodes(scope, nodes_per_workflow):
+                save_synthetic_agent(
+                    context,
+                    template=agent_template,
+                    identity=identity,
                     cluster_id=cluster_id,
-                    node_ids=nodes,
-                    policy_version="action-capacity-v1",
-                    policy_source="CONTROLLED_DRILL",
-                    official_action="ACTION_CAPACITY_TEST",
-                    state=IncidentState.ACTION_PENDING,
-                    workflow_request_id=request_id,
-                    drill_id=run_id,
-                    created_at=now,
-                    updated_at=now,
+                    node_id=node_id,
+                    run_id=run_id,
+                    now=now,
                 )
-                context.store.save_incident_and_workflow(incident, workflow)
-                created += 1
+                agents_created += 1
+        for cluster_id, scope in scopes:
+            save_action_workflow(
+                context,
+                cluster_id=cluster_id,
+                scope=scope,
+                nodes=action_nodes(scope, nodes_per_workflow),
+                run_id=run_id,
+                runtime_profile_version=runtime_profile_version,
+                now=now,
+            )
+            created += 1
     finally:
         # A local session's in-memory store (tests) has nothing to close.
         close = getattr(context.store, "close", None)

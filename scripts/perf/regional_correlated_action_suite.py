@@ -48,6 +48,12 @@ if __package__:
         upsert_configmap,
     )
     from .regional_executor_support import executor_scripts
+    from .regional_synthetic_fleet import (
+        add_fleet_argument,
+        fleet_plan,
+        synthetic_fleet,
+        verify_fleet_cleanup,
+    )
     from .regional_validation_telemetry import (
         NODE_RETURN_WATCH_MODE,
         start_validation_telemetry,
@@ -90,6 +96,12 @@ else:
         upsert_configmap,
     )
     from regional_executor_support import executor_scripts
+    from regional_synthetic_fleet import (
+        add_fleet_argument,
+        fleet_plan,
+        synthetic_fleet,
+        verify_fleet_cleanup,
+    )
     from regional_validation_telemetry import (
         NODE_RETURN_WATCH_MODE,
         start_validation_telemetry,
@@ -103,6 +115,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 PERF_DIR = REPO_ROOT / "scripts/perf"
 TERMINAL_WORKFLOWS = {"SUCCEEDED", "FAILED", "BLOCKED", "SUPERSEDED"}
 TERMINAL_COMMANDS = {"SUCCEEDED", "FAILED", "CANCELLED"}
+#: The scenario's nodes a cluster: the preemption lane's and the reset lane's.
+SCENARIO_NODES_PER_CLUSTER = 2
 
 
 def scenario_job(
@@ -891,6 +905,8 @@ def write_run_record(
     run_id: str,
     scope: str,
     identity: dict[str, str],
+    *,
+    fleet: dict | None = None,
 ) -> None:
     """``run.json``: the scenario and the resume fields that let the logged
     recovery command finish this run's teardown from its receipts."""
@@ -904,6 +920,7 @@ def write_run_record(
                 "terminal_drain_seconds": args.terminal_drain_seconds,
                 # How the node-return telemetry is published (性能压测验收方案 §8.3).
                 "validation_telemetry": "event-driven+periodic-30s",
+                "synthetic_fleet": fleet,
                 "started_at": datetime.now(timezone.utc).isoformat(),
                 **resume_identity(suite_id=run_id, scope=scope, identity=identity),
             },
@@ -929,6 +946,7 @@ def scenario_teardown(
                 artifacts=artifacts,
                 run_id=run_id,
             )
+            verify_fleet_cleanup(artifacts, run_id=run_id, clusters=args.clusters)
     except Exception as exc:
         return exc
     return None
@@ -997,6 +1015,7 @@ def main() -> int:
     parser.add_argument("--allow-live-registry", action="store_true")
     parser.add_argument("--confirm-live-registry")
     parser.add_argument("--synthetic-ttl-seconds", type=int, default=3600)
+    add_fleet_argument(parser)
     args = parser.parse_args()
     if args.synthetic_ttl_seconds < 300:
         parser.error("--synthetic-ttl-seconds must be at least 300")
@@ -1010,12 +1029,23 @@ def main() -> int:
             "--timeout-seconds must leave at least 60 seconds beyond "
             "--scenario-max-seconds"
         )
+    if args.synthetic_ttl_seconds < timeout_seconds + args.terminal_drain_seconds + 600:
+        # The registration and the fleet's heartbeat both end at the TTL (§8.5).
+        parser.error(
+            "--synthetic-ttl-seconds must exceed the scenario timeout and the "
+            "terminal drain by 600"
+        )
     try:
         registry_scope = validate_registry_target(
             allow_live_registry=args.allow_live_registry,
             confirmation=args.confirm_live_registry,
         )
-    except RuntimeError as exc:
+        fleet = fleet_plan(
+            clusters=args.clusters,
+            model_nodes_per_cluster=SCENARIO_NODES_PER_CLUSTER,
+            nodes_per_cluster=args.fleet_nodes_per_cluster,
+        )
+    except (RuntimeError, ValueError) as exc:
         parser.error(str(exc))
     run_id = args.suite_id or datetime.now(timezone.utc).strftime(
         "corract%Y%m%dT%H%M%S"
@@ -1027,7 +1057,7 @@ def main() -> int:
         label,
         identity["release_id"] or "unknown-release",
     )
-    write_run_record(artifacts, args, run_id, registry_scope, identity)
+    write_run_record(artifacts, args, run_id, registry_scope, identity, fleet=fleet)
     write_status(artifacts, status="running")
     failure: BaseException | None = None
     result = 1
@@ -1052,81 +1082,95 @@ def main() -> int:
                 release_agent_identity() if registry_scope == "isolated" else None
             ),
         )
-        upsert_configmap(
-            SCRIPT_CONFIGMAP,
-            text=executor_scripts("benchmark_correlated_action_scenario.py"),
-            resources=resources,
-        )
-        identity = executor_identity(
-            require_dataplane_deployment=registry_scope == "live",
-        )
-        manifest = scenario_job(
-            clusters=args.clusters,
+        # The healthy fleet before the scenario's first event (§8.5): two
+        # nodes a cluster never reach even the breaker's floor, and the fleet
+        # keeps its threshold a production cluster's.
+        with synthetic_fleet(
+            artifacts,
             run_id=run_id,
-            scenario_max_seconds=args.scenario_max_seconds,
-            active_deadline_seconds=timeout_seconds,
-            runtime_profile_version=str(seeded["runtime_profile_version"]),
-            **identity,
-        )
-        # The scenario Pods run as the load ServiceAccount; a run creates it when
-        # the perf namespace has none (live 2026-09-22: the previous run tore its
-        # own account down and the Job could not create Pods).
-        ensure_load_service_account(
-            resources, name=LOAD_SERVICE_ACCOUNT, namespace=NAMESPACE
-        )
-        manifest = run_manifest(manifest, run_id)
-        (artifacts / "job.json").write_text(
-            json.dumps(manifest, indent=2, sort_keys=True) + "\n"
-        )
-        window_start = time.time()
-        resources.create(manifest)
-        # The returned nodes' telemetry follows each recorded reboot (§8.3); the
-        # session ends with the drain, before the teardown purges the run.
-        with start_validation_telemetry(
-            run_id=run_id,
-            clusters=args.clusters,
-            mode=NODE_RETURN_WATCH_MODE,
-            deadline_seconds=timeout_seconds + args.terminal_drain_seconds + 300,
-        ) as validation:
-            wait, job, job_status = wait_for_scenario_job(
-                run_id=run_id, clusters=args.clusters, timeout_seconds=timeout_seconds
+            plan=fleet,
+            agent_identity=(
+                release_agent_identity() if registry_scope == "isolated" else None
+            ),
+            deadline_seconds=args.synthetic_ttl_seconds,
+        ):
+            upsert_configmap(
+                SCRIPT_CONFIGMAP,
+                text=executor_scripts("benchmark_correlated_action_scenario.py"),
+                resources=resources,
             )
-            pod_results = collect_logs(artifacts / "pods")
-            if job_status == "Complete":
-                audit, drain_history = wait_for_terminal_drain(
-                    run_id,
-                    timeout_seconds=args.terminal_drain_seconds,
+            identity = executor_identity(
+                require_dataplane_deployment=registry_scope == "live",
+            )
+            manifest = scenario_job(
+                clusters=args.clusters,
+                run_id=run_id,
+                scenario_max_seconds=args.scenario_max_seconds,
+                active_deadline_seconds=timeout_seconds,
+                runtime_profile_version=str(seeded["runtime_profile_version"]),
+                **identity,
+            )
+            # The scenario Pods run as the load ServiceAccount; a run creates it when
+            # the perf namespace has none (live 2026-09-22: the previous run tore its
+            # own account down and the Job could not create Pods).
+            ensure_load_service_account(
+                resources, name=LOAD_SERVICE_ACCOUNT, namespace=NAMESPACE
+            )
+            manifest = run_manifest(manifest, run_id)
+            (artifacts / "job.json").write_text(
+                json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+            )
+            window_start = time.time()
+            resources.create(manifest)
+            # The returned nodes' telemetry follows each recorded reboot (§8.3); the
+            # session ends with the drain, before the teardown purges the run.
+            with start_validation_telemetry(
+                run_id=run_id,
+                clusters=args.clusters,
+                mode=NODE_RETURN_WATCH_MODE,
+                deadline_seconds=timeout_seconds + args.terminal_drain_seconds + 300,
+            ) as validation:
+                wait, job, job_status = wait_for_scenario_job(
+                    run_id=run_id,
+                    clusters=args.clusters,
+                    timeout_seconds=timeout_seconds,
                 )
-            else:
-                audit = database_audit(run_id)
-                drain_history = []
-        (artifacts / "terminal-drain.json").write_text(
-            json.dumps(drain_history, indent=2, sort_keys=True) + "\n"
-        )
-        summary = {
-            "run_id": run_id,
-            "clusters": args.clusters,
-            "registry_scope": registry_scope,
-            "seeded": seeded,
-            "job_wait_output": wait,
-            "job_status": job_status,
-            "job_succeeded": int(job.get("status", {}).get("succeeded", 0)),
-            "job_failed": int(job.get("status", {}).get("failed", 0)),
-            "scenario_max_seconds": args.scenario_max_seconds,
-            "terminal_drain_seconds": args.terminal_drain_seconds,
-            "pod_results": pod_results,
-            "audit": audit,
-            "validation_telemetry": validation.summary,
-            "placement": optional_placement_section(placement),
-            **optional_aurora_step(placement, window_start, time.time()),
-        }
-        status, errors = verdict(summary, args.clusters)
-        summary["status"] = status
-        summary["errors"] = errors
-        (artifacts / "summary.json").write_text(
-            json.dumps(summary, indent=2, sort_keys=True) + "\n"
-        )
-        result = measured_exit(int(status != "PASS"), summary)
+                pod_results = collect_logs(artifacts / "pods")
+                if job_status == "Complete":
+                    audit, drain_history = wait_for_terminal_drain(
+                        run_id,
+                        timeout_seconds=args.terminal_drain_seconds,
+                    )
+                else:
+                    audit = database_audit(run_id)
+                    drain_history = []
+            (artifacts / "terminal-drain.json").write_text(
+                json.dumps(drain_history, indent=2, sort_keys=True) + "\n"
+            )
+            summary = {
+                "run_id": run_id,
+                "clusters": args.clusters,
+                "registry_scope": registry_scope,
+                "seeded": seeded,
+                "job_wait_output": wait,
+                "job_status": job_status,
+                "job_succeeded": int(job.get("status", {}).get("succeeded", 0)),
+                "job_failed": int(job.get("status", {}).get("failed", 0)),
+                "scenario_max_seconds": args.scenario_max_seconds,
+                "terminal_drain_seconds": args.terminal_drain_seconds,
+                "pod_results": pod_results,
+                "audit": audit,
+                "validation_telemetry": validation.summary,
+                "placement": optional_placement_section(placement),
+                **optional_aurora_step(placement, window_start, time.time()),
+            }
+            status, errors = verdict(summary, args.clusters)
+            summary["status"] = status
+            summary["errors"] = errors
+            (artifacts / "summary.json").write_text(
+                json.dumps(summary, indent=2, sort_keys=True) + "\n"
+            )
+            result = measured_exit(int(status != "PASS"), summary)
     except BaseException as exc:
         failure = exc
     finally:

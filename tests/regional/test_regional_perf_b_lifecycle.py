@@ -4,8 +4,8 @@ import argparse
 import copy
 import json
 import shlex
-from collections.abc import Callable
-from contextlib import nullcontext
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
@@ -152,7 +152,12 @@ class CallerHarness:
             aurora_cluster_id="test-aurora",
             aurora_preflight_timeout_seconds=1,
             configure_aurora_capacity=True,
+            fleet_nodes_per_cluster=256,
         )
+        # The healthy fleet is its own module's contract
+        # (test_perf_synthetic_fleet); here only where the runners put it.
+        self.fleet_events: list[str] = []
+        self.fleet_plans: list[dict[str, Any]] = []
         self.purge: Callable[..., None] = (
             integrated.purge_integrated_rows
             if module is integrated
@@ -248,6 +253,21 @@ class CallerHarness:
             raise self.data_error
         return json.dumps(self.data_result)
 
+    @contextmanager
+    def synthetic_fleet(self, artifacts: Path, **kwargs: Any) -> Iterator[dict]:
+        assert artifacts == self.artifacts, "the fleet keeps the run's receipts"
+        self.fleet_plans.append(kwargs["plan"])
+        self.fleet_events.append(f"register-after:{self.events[-1]}")
+        try:
+            yield {"plan": kwargs["plan"]}
+        finally:
+            self.fleet_events.append(f"exit-before-teardown:{self.teardowns == []}")
+
+    def verify_fleet_cleanup(self, artifacts: Path, **kwargs: Any) -> dict:
+        assert artifacts == self.artifacts, "the cleanup proof reads the run's receipts"
+        self.fleet_events.append(f"cleanup-after-teardown:{bool(self.teardowns)}")
+        return {}
+
     def teardown(self, **kwargs: Any) -> None:
         self.teardowns.append(kwargs)
         self.events.append("teardown")
@@ -315,6 +335,8 @@ def caller(
     )
     monkeypatch.setattr(module, "verdict", lambda *_args, **_kwargs: ("PASS", []))
     monkeypatch.setattr(module, "collect_logs", lambda *_args: [])
+    monkeypatch.setattr(module, "synthetic_fleet", harness.synthetic_fleet)
+    monkeypatch.setattr(module, "verify_fleet_cleanup", harness.verify_fleet_cleanup)
     if module is correlated:
         monkeypatch.setattr(
             module.argparse.ArgumentParser, "parse_args", lambda *_args: harness.args
@@ -835,3 +857,25 @@ def test_correlated_run_publishes_node_return_telemetry_after_recorded_reboots(
     assert summary["validation_telemetry"] == {"mode": "event-driven", "publishes": 3}
     run = caller.report("run.json")
     assert run["validation_telemetry"] == "event-driven+periodic-30s"
+
+
+def test_callers_register_the_fleet_before_the_load_and_prove_it_gone_after(
+    caller: CallerHarness,
+) -> None:
+    """Perf plan §8.5: the healthy fleet is registered right after the run's
+    clusters and model Agents, before any load or scenario resource, is closed
+    before the teardown, and its cleanup is proved after it."""
+
+    assert caller.run() == 0
+
+    assert caller.fleet_events == [
+        "register-after:register",
+        "exit-before-teardown:True",
+        "cleanup-after-teardown:True",
+    ]
+    (plan,) = caller.fleet_plans
+    model_nodes = 4 if caller.module is integrated else 2
+    assert plan["model_nodes_per_cluster"] == model_nodes
+    assert plan["fleet_agents_per_cluster"] == 256 - model_nodes
+    assert plan["threshold_nodes"] == 52
+    assert caller.report("run.json")["synthetic_fleet"] == plan

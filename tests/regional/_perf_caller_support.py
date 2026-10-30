@@ -4,6 +4,8 @@ import base64
 import copy
 import json
 import subprocess
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -203,6 +205,14 @@ class CapacityWire:
         )
         monkeypatch.setattr(action, "release_agent_identity", lambda: {})
         monkeypatch.setattr(action, "seed", self.seed)
+        # The run's healthy fleet is its own module's contract
+        # (tests/regional/test_perf_synthetic_fleet.py); here only its place in
+        # the run: registered before the workflows, closed before the teardown,
+        # its cleanup proved after it.
+        self.fleets: list[dict[str, Any]] = []
+        self.fleet_cleanups: list[dict[str, Any]] = []
+        monkeypatch.setattr(action, "synthetic_fleet", self.synthetic_fleet)
+        monkeypatch.setattr(action, "verify_fleet_cleanup", self.verify_fleet_cleanup)
         monkeypatch.setattr(
             action,
             "database_snapshot",
@@ -408,6 +418,27 @@ class CapacityWire:
         assert kwargs["run_id"] == "run-a", "seed must use the registered run identity"
         self.events.append("seed")
         return {"workflows_created": 1}
+
+    @contextmanager
+    def synthetic_fleet(
+        self, artifacts: Path, **kwargs: Any
+    ) -> Iterator[dict[str, Any]]:
+        assert artifacts == self.artifacts, "the fleet keeps the run's receipts"
+        assert self.registered(), "the fleet registers into the run's own clusters"
+        self.fleets.append(kwargs)
+        self.events.append("fleet-register")
+        try:
+            yield {"plan": kwargs["plan"]}
+        finally:
+            self.events.append("fleet-exit")
+
+    def verify_fleet_cleanup(self, artifacts: Path, **kwargs: Any) -> dict[str, Any]:
+        assert artifacts == self.artifacts, "the cleanup proof reads the run's receipts"
+        assert self.events[-1] == "teardown", (
+            "the fleet is proved gone after the teardown"
+        )
+        self.fleet_cleanups.append(kwargs)
+        return {}
 
     def wait_for_job(self, *_args: Any) -> str:
         if self.fail_wait:

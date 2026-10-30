@@ -3,11 +3,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import signal
 import sys
 import time
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -27,7 +25,11 @@ if __package__:
         executor_job,
     )
     from .regional_capacity_data import invoke
-    from .regional_capacity_recovery import resume_identity, write_aborted_status
+    from .regional_capacity_recovery import (
+        cleanup_signal_guard,
+        resume_identity,
+        write_aborted_status,
+    )
     from .regional_capacity_registry import (
         AWS_REGION,
         CONNECTION_SECRET,
@@ -78,6 +80,13 @@ if __package__:
         wait_for_load_pods,
     )
     from .regional_executor_support import executor_job_failure, executor_scripts
+    from .regional_remediation_budget import live_budget_preflight
+    from .regional_synthetic_fleet import (
+        add_fleet_argument,
+        fleet_plan,
+        synthetic_fleet,
+        verify_fleet_cleanup,
+    )
     from .regional_validation_telemetry import start_validation_telemetry
 else:
     from regional_action_capacity_suite import (
@@ -87,7 +96,11 @@ else:
         executor_job,
     )
     from regional_capacity_data import invoke
-    from regional_capacity_recovery import resume_identity, write_aborted_status
+    from regional_capacity_recovery import (
+        cleanup_signal_guard,
+        resume_identity,
+        write_aborted_status,
+    )
     from regional_capacity_registry import (
         AWS_REGION,
         CONNECTION_SECRET,
@@ -138,6 +151,13 @@ else:
         wait_for_load_pods,
     )
     from regional_executor_support import executor_job_failure, executor_scripts
+    from regional_remediation_budget import live_budget_preflight
+    from regional_synthetic_fleet import (
+        add_fleet_argument,
+        fleet_plan,
+        synthetic_fleet,
+        verify_fleet_cleanup,
+    )
     from regional_validation_telemetry import start_validation_telemetry
 
 
@@ -185,29 +205,6 @@ def fixed_matrix(clusters: int) -> dict:
         "p0": model["xid"] + model["sxid"],
         "p50": model["gpu_evidence"] + model["host_evidence"],
     }
-
-
-@contextmanager
-def cleanup_signal_guard() -> Iterator[None]:
-    guarded = tuple(
-        value
-        for name in ("SIGINT", "SIGTERM", "SIGHUP")
-        if (value := getattr(signal, name, None)) is not None
-    )
-    previous: dict[signal.Signals, object] = {}
-    try:
-        for value in guarded:
-            previous[value] = signal.getsignal(value)
-            signal.signal(value, signal.SIG_IGN)
-    except (OSError, ValueError):
-        for value, handler in previous.items():
-            signal.signal(value, handler)
-        previous.clear()
-    try:
-        yield
-    finally:
-        for value, handler in previous.items():
-            signal.signal(value, handler)
 
 
 def integrated_workload_residuals() -> dict[str, list[str]]:
@@ -418,47 +415,7 @@ def ensure_aurora_capacity(
 def remediation_budget_preflight(clusters: int) -> dict:
     """Per node and failure domain 1, no retired fixed limit (perf plan §4.3)."""
     del clusters  # no budget per cluster count is left to select
-    expected = {
-        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION": None,
-        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER": None,
-        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS": None,
-        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE": "1",
-        "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN": "1",
-    }
-    pods = control(
-        "get",
-        "pod",
-        "-l",
-        "app=gpu-fault-control-worker",
-        "--field-selector=status.phase=Running",
-        "-o",
-        "jsonpath={.items[*].metadata.name}",
-    ).split()
-    if not pods:
-        raise RuntimeError("no Running control-worker Pods for budget check")
-    actual = {}
-    names = sorted(expected)
-    for pod in pods:
-        values = control(
-            "exec",
-            pod,
-            "--",
-            "python3",
-            "-c",
-            (
-                "import json,os; print(json.dumps({"
-                + ",".join(f"{name!r}:os.environ.get({name!r})" for name in names)
-                + "},sort_keys=True))"
-            ),
-        )
-        actual[pod] = json.loads(values.splitlines()[-1])
-    mismatched = {pod: values for pod, values in actual.items() if values != expected}
-    if mismatched:
-        raise RuntimeError(
-            "live remediation budget does not match formal matrix: "
-            + json.dumps(mismatched, sort_keys=True)
-        )
-    return {"expected": expected, "pods": actual}
+    return live_budget_preflight(control)
 
 
 def log(message: str) -> None:
@@ -1255,27 +1212,18 @@ def execute_integrated_jobs(
     return measured_exit(int(status != "PASS"), summary)
 
 
-def run(args: argparse.Namespace) -> int:
-    if args.clusters not in FORMAL_MODELS:
-        raise ValueError("formal integrated run requires 32 or 50 clusters")
-    if args.workflows_per_cluster != FORMAL_WORKFLOWS_PER_CLUSTER:
-        raise ValueError("formal integrated run requires 4 workflows per cluster")
-    registry_scope = validate_registry_target(
-        allow_live_registry=args.allow_live_registry,
-        confirmation=args.confirm_live_registry,
-    )
-    if registry_scope != "live":
-        raise ValueError("integrated workflow capacity must target the live registry")
-    spool = control_spool_mode(args.spool_mode)
-    run_id = args.suite_id or datetime.now(timezone.utc).strftime(
-        "integrated%Y%m%dT%H%M%S"
-    )
-    identity = release_identity()
-    artifacts = artifact_dir(
-        args.artifact_root,
-        args.label or f"integrated-workflow-{args.clusters}c-{args.spool_mode}",
-        identity["release_id"] or "unknown-release",
-    )
+def write_run_record(
+    artifacts: Path,
+    args: argparse.Namespace,
+    *,
+    run_id: str,
+    spool: dict,
+    fleet: dict,
+    resume: dict[str, str],
+) -> None:
+    """``run.json``: the formal model, how it is measured, and the resume fields
+    that let the logged recovery command finish this run's teardown."""
+
     (artifacts / "run.json").write_text(
         json.dumps(
             {
@@ -1297,22 +1245,59 @@ def run(args: argparse.Namespace) -> int:
                 # How the workflow latencies are measured (性能压测验收方案 §8.4).
                 "simulated_command_completion": "per-command",
                 "validation_telemetry": "event-driven+periodic-30s",
+                # The registered healthy fleet that sets each cluster's storm
+                # breaker threshold (§8.5).
+                "synthetic_fleet": fleet,
                 "timeout_seconds": args.timeout_seconds,
                 "executor_idle_seconds": args.executor_idle_seconds,
                 "aurora_cluster_id": args.aurora_cluster_id,
                 "required_aurora_min_acu": FORMAL_AURORA_MIN_ACU,
                 "required_aurora_max_acu": FORMAL_AURORA_MAX_ACU,
                 "started_at": datetime.now(timezone.utc).isoformat(),
-                # The resume fields let the logged recovery command finish this
-                # run's teardown from its receipts.
-                **resume_identity(
-                    suite_id=run_id, scope=registry_scope, identity=identity
-                ),
+                **resume,
             },
             indent=2,
             sort_keys=True,
         )
         + "\n"
+    )
+
+
+def run(args: argparse.Namespace) -> int:
+    if args.clusters not in FORMAL_MODELS:
+        raise ValueError("formal integrated run requires 32 or 50 clusters")
+    if args.workflows_per_cluster != FORMAL_WORKFLOWS_PER_CLUSTER:
+        raise ValueError("formal integrated run requires 4 workflows per cluster")
+    registry_scope = validate_registry_target(
+        allow_live_registry=args.allow_live_registry,
+        confirmation=args.confirm_live_registry,
+    )
+    if registry_scope != "live":
+        raise ValueError("integrated workflow capacity must target the live registry")
+    fleet = fleet_plan(
+        clusters=args.clusters,
+        model_nodes_per_cluster=args.workflows_per_cluster,
+        nodes_per_cluster=args.fleet_nodes_per_cluster,
+    )
+    spool = control_spool_mode(args.spool_mode)
+    run_id = args.suite_id or datetime.now(timezone.utc).strftime(
+        "integrated%Y%m%dT%H%M%S"
+    )
+    identity = release_identity()
+    artifacts = artifact_dir(
+        args.artifact_root,
+        args.label or f"integrated-workflow-{args.clusters}c-{args.spool_mode}",
+        identity["release_id"] or "unknown-release",
+    )
+    write_run_record(
+        artifacts,
+        args,
+        run_id=run_id,
+        spool=spool,
+        fleet=fleet,
+        resume=resume_identity(
+            suite_id=run_id, scope=registry_scope, identity=identity
+        ),
     )
     write_status(artifacts, status="running")
     expected_workflows = args.clusters * args.workflows_per_cluster
@@ -1376,17 +1361,25 @@ def run(args: argparse.Namespace) -> int:
             workflows_per_cluster=args.workflows_per_cluster,
             lease_seconds=args.timeout_seconds + 900,
         )
-        result = execute_integrated_jobs(
-            args,
+        # The healthy fleet before the load's first event (§8.5).
+        with synthetic_fleet(
+            artifacts,
             run_id=run_id,
-            artifacts=artifacts,
-            registry_scope=registry_scope,
-            spool=spool,
-            seeded=seeded,
-            expected_workflows=expected_workflows,
-            aurora_preflight=aurora_preflight,
-            heartbeat_refresh=heartbeat_refresh,
-        )
+            plan=fleet,
+            agent_identity=None,
+            deadline_seconds=args.synthetic_ttl_seconds,
+        ):
+            result = execute_integrated_jobs(
+                args,
+                run_id=run_id,
+                artifacts=artifacts,
+                registry_scope=registry_scope,
+                spool=spool,
+                seeded=seeded,
+                expected_workflows=expected_workflows,
+                aurora_preflight=aurora_preflight,
+                heartbeat_refresh=heartbeat_refresh,
+            )
     except BaseException as exc:
         failure = exc
     finally:
@@ -1400,6 +1393,9 @@ def run(args: argparse.Namespace) -> int:
                         live_registry_confirmation=args.confirm_live_registry,
                         artifacts=artifacts,
                         run_id=run_id,
+                    )
+                    verify_fleet_cleanup(
+                        artifacts, run_id=run_id, clusters=args.clusters
                     )
                     workload_residuals = wait_for_integrated_workload_cleanup()
                     (artifacts / "cleanup-workloads.json").write_text(
@@ -1470,6 +1466,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--timeout-seconds", type=int, default=1800)
     value.add_argument("--executor-idle-seconds", type=int, default=300)
     value.add_argument("--synthetic-ttl-seconds", type=int, default=3600)
+    add_fleet_argument(value)
     value.add_argument("--aurora-cluster-id", required=True)
     value.add_argument("--aurora-preflight-timeout-seconds", type=int, default=1800)
     value.add_argument(

@@ -75,7 +75,15 @@ def delay_summary(values: list[float]) -> dict[str, float | int]:
 
 
 class ValidationTelemetryWatcher:
-    """The runner's handle on the in-Pod watch session (start, then stop)."""
+    """The runner's handle on the in-Pod watch session (start, then stop).
+
+    ``script`` is the program the session runs and ``final_endings`` the
+    endings after which it is done rather than lost; a subclass with another
+    in-Pod program (the synthetic fleet's heartbeat session) sets both.
+    """
+
+    script: Path = SEED_SCRIPT
+    final_endings: frozenset[str] = FINAL_ENDINGS
 
     def __init__(
         self,
@@ -170,7 +178,7 @@ class ValidationTelemetryWatcher:
             self.sessions.append(session)
             if (
                 self._stopping.is_set()
-                or session.get("ended_by") in FINAL_ENDINGS
+                or session.get("ended_by") in self.final_endings
                 or len(self.sessions) > self.max_restarts
             ):
                 return
@@ -236,7 +244,7 @@ class ValidationTelemetryWatcher:
         )
         reader.start()
         try:
-            process.stdin.write(session_input(SEED_SCRIPT.read_bytes()))
+            process.stdin.write(session_input(self.script.read_bytes()))
             process.stdin.flush()
         except (OSError, ValueError):
             # The session died at once, or stop() closed its stdin first: the

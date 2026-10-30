@@ -103,6 +103,34 @@ Supported entry points:
   same-rank aggregation, preemption and failure-escalation chains, including
   budget-wave-aware scenario timeouts, a separate terminal-drain phase, exact
   workflow relationships and complete workflow/command terminal-state audit.
+- `regional_storm_breaker_suite.py`: the remediation storm breaker step
+  (performance acceptance plan §8.5). One synthetic cluster registers
+  `--fleet-nodes-per-cluster` GPU nodes (default 256, threshold 52) and gets
+  exactly enough job-less workflows that one first admission trips its
+  breaker; bounded phases then judge the trip, the held work, the work in
+  flight, the operator notice, the breaker gauges and the AMP state of
+  `GpuFaultRemediationStormBreakerOpen`, release it through the
+  `gpu-fault-admin remediation-storm` Pod program (the verb itself accepts
+  only managed clusters) and time the held work's completion from the release.
+  Its cleanup never leaves the breaker open: an open one is handed over
+  (`abort`) and released, then read `CLOSED`, before the teardown.
+
+On a release after the fixed remediation limits' retirement every action,
+correlated and integrated run, and the storm breaker step, registers a healthy
+fleet in each synthetic cluster before its first workflow
+(`regional_synthetic_fleet.py`): `--fleet-nodes-per-cluster` registered GPU
+nodes per cluster in all, never fewer than 5 x the model's nodes + 1, so the
+model stays below the breaker's max(3, ceil(20%)) threshold. Fleet node ids are
+`fleet-node-<run>-c<NNN>-n<NNNN>`; one in-Pod session
+(`synthetic_fleet_pod.py`) renews them by compare-and-set for the whole run and
+stops before the teardown, and the model's own refreshes and telemetry skip
+them. `fleet.json` records the plan, the heartbeat and the census the run ends
+with (the breaker's own node count and threshold per cluster); the run fails
+when a breaker tripped in an ordinary step or judged a threshold no higher than
+the model's nodes.
+`fleet-cleanup.json` is the census after the teardown: no Agent and no breaker
+record of the run's clusters may be left. The burst entry points create no
+workflow and register no fleet.
 - `seed_regional_action_workflows.py` and
   `benchmark_regional_action_executor.py`: action-side data and load drivers.
 - `benchmark_transport_retry.py`: the product executor's transport retries,
@@ -112,6 +140,11 @@ Supported entry points:
 - `regional_executor_support.py`: what the action, integrated and correlated
   runners share around their executor Jobs -- the script ConfigMap, the Job
   failure read that ends a workflow wait early, and the retry tallies.
+- `regional_synthetic_fleet.py` and `synthetic_fleet_pod.py`: the healthy fleet
+  (runner side, and its in-Pod heartbeat session and census).
+- `regional_storm_breaker.py` and `storm_breaker_pod.py`: the breaker step's
+  plan, status reads, gauges, AMP alert reads and operator exits (runner side,
+  and the in-Pod status program).
 - `capture_processor_inflight.py`: optional in-flight sampling attached to a
   suite artifact directory.
 - `control_plane_capacity_probe.py`: control-plane capacity probe helper.

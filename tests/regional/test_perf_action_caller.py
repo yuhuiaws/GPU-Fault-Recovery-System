@@ -465,3 +465,69 @@ def test_action_main_fails_a_run_whose_running_claims_exceed_a_limit(
     assert [item["budget_holders_max"].get("class") for item in history] == [5, None], (
         "history.json keeps every occupancy sample"
     )
+
+
+def test_action_fleet_registers_before_the_workflows_and_is_proved_gone_after(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Perf plan §8.5: each synthetic cluster registers 256 GPU nodes by default,
+    so the remediation storm breaker judges the model against 52, not its floor
+    of 3; the fleet exists before the first workflow and is gone after the
+    teardown."""
+
+    wire = CapacityWire(tmp_path, monkeypatch)
+
+    assert action.main(action_args(tmp_path)) == 0, "the fake run completes"
+
+    order = [
+        wire.events.index(name) for name in ("fleet-register", "seed", "fleet-exit")
+    ]
+    assert order == sorted(order), wire.events
+    assert wire.events.index("fleet-exit") < wire.events.index("data-cleanup"), (
+        "the fleet heartbeat stops before the purge"
+    )
+    assert len(wire.fleet_cleanups) == 1, "the teardown is followed by the fleet proof"
+    (fleet,) = wire.fleets
+    assert fleet["plan"]["nodes_per_cluster"] == 256
+    assert fleet["plan"]["model_nodes_per_cluster"] == 1
+    assert fleet["plan"]["threshold_nodes"] == 52
+    assert fleet["deadline_seconds"] == 3600, "the heartbeat lasts the registration"
+    run = json.loads((tmp_path / "run.json").read_text())
+    assert run["synthetic_fleet"] == fleet["plan"], "run.json records the fleet"
+
+
+def test_action_refuses_a_fleet_the_model_could_trip_before_registering(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    wire = CapacityWire(tmp_path, monkeypatch)
+
+    with pytest.raises(SystemExit):
+        action.main(
+            action_args(
+                tmp_path,
+                "--workflows-per-cluster",
+                "4",
+                "--nodes-per-workflow",
+                "4",
+                "--fleet-nodes-per-cluster",
+                "80",
+            )
+        )
+
+    assert "below 81 = 5 x 16 model nodes + 1" in capsys.readouterr().err
+    assert wire.events == [] and wire.fleets == [], "nothing is registered"
+
+
+def test_action_refuses_a_registration_that_ends_before_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The registration and the fleet's heartbeat end at the TTL (§8.5): a run
+    allowed to outlast it would see its fleet lapse mid-run."""
+
+    wire = CapacityWire(tmp_path, monkeypatch)
+
+    with pytest.raises(SystemExit):
+        action.main(action_args(tmp_path, "--timeout-seconds", "3600"))
+
+    assert "must exceed --timeout-seconds by 600" in capsys.readouterr().err
+    assert wire.events == [], "nothing is registered"

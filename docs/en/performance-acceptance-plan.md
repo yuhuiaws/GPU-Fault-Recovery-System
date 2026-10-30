@@ -314,20 +314,17 @@ Region, per-cluster and per-resource-class limits. On a later release:
   only the node / job / domain scopes of limit 1 (evidence); the integrated runner's `remediation-budget-preflight.json`
   requires the three absent and per node and per failure domain at 1; the dispatch batch is derived from the dispatcher
   workers and the dispatch lease (346 rows as shipped), no longer from a Region budget.
-- both request models trip the remediation storm breaker: once at least max(3, ceil(20% x the cluster's registered GPU
-  nodes)) nodes of two or more workload domains (one per incident or job) enter destructive remediation within 600 seconds,
-  the cluster's remaining workflows are held until an operator runs `gpu-fault-admin remediation-storm release`. The
-  runners register Agents only for the model's own nodes (action: workflows x nodes-per-workflow per cluster; integrated:
-  4 per cluster), so the threshold is its floor of 3: the action default model (two 4-node workflows) trips on each
-  cluster's second workflow, the integrated one (four single-node workflows) on the third; the rest stay `PENDING` and the
-  run fails at `--timeout-seconds`.
-- before running, choose one and write it into this plan: (a) register additional healthy ACTIVE Agents per perf cluster
-  so the registered nodes are at least 5 x the model's nodes + 1 (the integrated formal model already is 256 nodes per
-  cluster, threshold 52), keeping the model under the threshold so the run still measures throughput; or (b) define the
-  round as a breaker acceptance: one trip per cluster, one `REMEDIATION_STORM_TRIPPED` notice and
-  `GpuFaultRemediationStormBreakerOpen` firing expected, a drain after the release, judged on convergence and no double
-  counting. Until a choice is made and the runners are changed, do not start the action / integrated suites on that
-  release.
+- a cluster's remediation storm breaker holds its remaining new destructive work once at least max(3, ceil(20% x the
+  cluster's registered GPU nodes)) nodes of two or more workload domains (one per incident or job) enter destructive
+  remediation within 600 seconds, until an operator runs `gpu-fault-admin remediation-storm release`. Registering Agents
+  only for the model's own nodes (action: workflows x nodes-per-workflow per cluster; integrated: 4 per cluster) puts the
+  threshold at its floor of 3: the action default model (two 4-node workflows) trips on each cluster's second workflow,
+  the integrated one (four single-node workflows) on the third.
+- the plan therefore does both (§8.5): every action-bearing runner registers a healthy fleet in each synthetic cluster so
+  the cluster has `--fleet-nodes-per-cluster` registered GPU nodes (default 256, threshold 52; never fewer than 5 x the
+  model's nodes + 1), which keeps every ordinary step below the threshold and measuring throughput at the production
+  constants; and one separate step (`regional_storm_breaker_suite.py`) crosses the threshold on one cluster on purpose
+  and judges the trip, the held work, the work in flight, the critical alert, the release and the drain after it.
 
 A release that includes the durable remediation budget must split the Action load test into
 two tiers:
@@ -429,6 +426,14 @@ Administrator Capacity Configuration §6):
 5. **Completion side**: all 512 fault incidents enter workflows, P0 completion p99 is compared
    with the §13.4 complete model and recorded, and the remediation budget executes in waves
    without starvation (§6.3).
+
+After the fixed limits' retirement this scenario trips the remediation storm breaker by construction unless all 512
+nodes belong to one job (one workload domain never trips it): a 512-node cluster (512 ACTIVE Agents) has the threshold
+max(3, ceil(20% x 512)) = 103, and with the nodes idle (one incident, one domain each) or spread over several jobs the
+first admission that brings the 103rd node trips it and the rest are held until an operator releases it. On such a release criterion 5's "executes in waves without starvation" becomes the judgement of the §8.5 storm
+breaker step: where it trips, no remote command on the held work, the work in flight goes on,
+`GpuFaultRemediationStormBreakerOpen` fires, after the release the held work drains without counting again, and the time
+from the release to the drain is recorded; the runner that first executes this scenario must implement it so.
 
 The execution entry point, artifact format and redaction requirements follow §8.4 and §11; the
 results are added as a new subsection of §13 after the first execution, and this section
@@ -742,7 +747,8 @@ scripts/perf/regional_action_capacity_suite.py \
 
 A release with a remediation budget must run the production-budget tier and the raw-capacity
 tier separately with the same request model (only a release before the fixed limits' retirement; on a later one see the
-note in §4.3: both tiers read `unbounded` and the request model trips the remediation storm breaker). The raw-capacity tier must satisfy at least:
+note in §4.3: both tiers read `unbounded`, and the healthy fleet of §8.5 keeps the request model below the remediation
+storm breaker's threshold). The raw-capacity tier must satisfy at least:
 
 ```text
 Region limit >= clusters * workflows_per_cluster
@@ -801,6 +807,12 @@ by an aborted run have no executor that could complete them and would otherwise 
 later round's registration. During the run the runner refreshes this round's synthetic Agent
 heartbeats and leases every 30 seconds (the seeding script's `run-heartbeats` mode); otherwise
 the fleet compatibility preflight withholds destructive steps once the heartbeats expire.
+
+On a release after the fixed limits' retirement the runner registers a healthy fleet in each synthetic cluster before it
+seeds a workflow (§8.5): `--fleet-nodes-per-cluster` registered GPU nodes per cluster in all (default 256, i.e. the 32x4x4
+model's 16 nodes and 240 fleet Agents, threshold 52), and the seeding script saves all of its Agents before its first
+workflow. `run.json.synthetic_fleet` and `fleet.json` record it, and after the teardown `fleet-cleanup.json` proves
+nothing is left.
 
 ### 8.3 Live correlated-action
 
@@ -863,6 +875,10 @@ budget cannot accommodate a new rung the control plane fails closed: the branch 
 by the whole-record escalation `workflow-reboot-after-<id>`; the audit accepts that shape, but
 every exhausted branch must be a budget denial and its reboot must be validated.
 
+Each cluster has only the scenario's two nodes (two jobs), which never reach even the breaker's floor of 3; the runner
+still registers the healthy fleet of §8.5 before the scenario Job (by default 256 registered GPU nodes per cluster,
+threshold 52), so every synthetic cluster's breaker judges at a production cluster's threshold.
+
 ### 8.4 Live Mixed Traffic and Causal Action Integrated Acceptance
 
 The formal CPU control-plane capacity conclusion uses one and the same runner round and no
@@ -905,6 +921,10 @@ its cleanup is incomplete:
 | 2 | `32-enabled` | 32 | enabled | 1000 | 1000 | 24576 | 26576 | 128 | 960 |
 | 3 | `50-disabled` | 50 | disabled | 1562 | 1562 | 38400 | 41524 | 200 | 1500 |
 | 4 | `50-enabled` | 50 | enabled | 1562 | 1562 | 38400 | 41524 | 200 | 1500 |
+
+Before the load, each of a round's 32/50 synthetic clusters registers 256 GPU nodes (the 4 model nodes and 252 healthy
+fleet Agents, §8.5): remediation storm breaker threshold 52. The formal command keeps `--fleet-nodes-per-cluster` at its
+default. The fleet's node ids never meet the burst part's `burst-node-*`, so no burst event lands on a fleet node.
 
 Each round first converges the control plane through the formal configuration entry point,
 for example:
@@ -1143,6 +1163,139 @@ pre-change configuration), follow its hint: first `gpu-fault-admin deploy --stat
 back to the `desired.json` window, or write the live window explicitly into admin-config.yaml to bring it under
 review, then rerun.
 
+### 8.5 The Remediation Storm Breaker: the Healthy Fleet and the Breaker Step
+
+A release after the fixed limits' retirement bounds a correlated fault with each GPU cluster's remediation storm breaker
+(detailed design v2 §9.5). In a sliding 600-second window, once the distinct nodes that newly enter destructive
+remediation (a workflow's first admission of budgeted work) reach `max(3, ceil(20% x the cluster's GPU nodes))` and span
+at least two workload domains (the job, else the incident), the cluster's new destructive work is held (the whole
+workflow stays `PENDING`, its last refusal naming `storm:<cluster>`), work in flight goes on, the critical
+`GpuFaultRemediationStormBreakerOpen` fires, and nothing resumes until an operator releases or aborts it. The cluster's
+GPU nodes are its fleet Agents that are `ACTIVE` or `DRAINING`, whatever their lease, counted at the cluster's first
+admissions and at most once a minute per control-plane process (`storm_admission.cluster_gpu_nodes`); an unreadable fleet
+is the floor of 3. 20%, 600 s and 3 are product constants, and the load tests keep them as shipped.
+
+**The healthy fleet.** The §8.2 action, §8.3 correlated and §8.4 integrated runners and the breaker step below register,
+in every synthetic cluster and beside the model's own nodes, a healthy fleet so that each cluster registers
+`--fleet-nodes-per-cluster` GPU nodes in all (`scripts/perf/regional_synthetic_fleet.py`; default 256, the formal model's
+cluster size, threshold 52). A value below 5 x the model's nodes + 1 is refused before anything is registered: it would
+let the model reach the threshold. The fleet
+
+- is registered after the synthetic clusters and before any workflow of the run can be claimed (the seeding script's
+  `fleet-agents` mode), with the identity the model's own Agents carry; the action seed in turn saves all of its Agents
+  before its first workflow, so no first admission is judged against a partial cluster;
+- belongs to the run: node ids `fleet-node-<run>-c<NNN>-n<NNNN>` in the run's own registered `perf-cap-*` clusters, which
+  the teardown's record walk takes whole;
+- heartbeats for the whole run: one `kubectl exec -i` session in an api-ha Pod (`scripts/perf/synthetic_fleet_pod.py`,
+  the arrangement of the §8.4 validation-telemetry session: the program length-prefixed on stdin, the rest of stdin its
+  stop channel) renews every fleet Agent's `last_seen_at` and lease by compare-and-set, one pass every 300 s against a
+  900-s lease, paced cluster by cluster; an Agent the teardown purged, or one the product moved, is never written back,
+  and the session stops before the teardown;
+- is never a workflow node and publishes no telemetry: the model's heartbeat refreshes, telemetry publishes and watches
+  skip it. Its collectors read silent on the `perf-cap-*` clusters, whose alerts the drill sink of §3.1 keeps (the
+  collector-silence scan, the identity refresh and the departed-node cleanup skip synthetic registrations).
+
+When the run ends the runner stops the heartbeat, takes a census (per cluster the breaker's own node count and threshold
+through the product's `cluster_gpu_nodes` and `storm_threshold`, the fleet's size and currency, the breaker record) and
+writes `fleet.json`. The fleet verdict fails the run (`status.json` aborted, `synthetic fleet: ...`) when the breaker
+judged a cluster against a threshold no higher than the model's nodes (the fleet was not counted), when a cluster's
+breaker tripped during an ordinary step, when the fleet shrank, or when its heartbeat lapsed or ended before the run; a
+threshold merely other than planned (a model Agent the product retired) is recorded in `fleet.json.notes`. A breaker still open at the end is handed over
+(`abort`) and released before the teardown, so no run leaves one open. After the teardown `fleet-cleanup.json` is a
+second census: any Agent or breaker record left in the run's clusters fails the cleanup.
+
+The fleet gives the store the Agent population of a production region of the same size, and with it that region's
+per-Agent cost. Each registered Agent adds two zero-valued per-node series
+(`gpu_fault_ambiguous_attempt_ownership_current`, `gpu_fault_stale_attempt_observations`) to every control-plane
+process's render, which every process publishes every 5 s and every scrape merges across the Pod's processes. Measured
+locally on the deploy host (not on the site): with 32 x 256 Agents plus the integrated burst's attempt nodes (about 18,400
+such series) one process's publish takes about 0.46 s of CPU and one scrape's 4-process merge about 0.71 s, against 0.05 s
+and 0.06 s with the model's Agents alone; 50 x 256 takes about 0.65 s and 1.2 s. A round with the fleet is therefore not
+comparable with one without it unless the record says so.
+
+How each step stands against the breaker (default fleet):
+
+| Step | Model nodes per cluster (domains) | Registered nodes per cluster | Threshold | Below it by |
+|---|---|---:|---:|---|
+| integrated 32/50 (§8.4) | 4 (4 jobs) | 256 | 52 | 48 nodes |
+| action 32 x 4 x 4 (§8.2) | 16 (4 incidents) | 256 | 52 | 36 nodes |
+| correlated-32 (§8.3) | 2 (2 jobs) | 256 | 52 | 50 nodes (two nodes never reach even the floor of 3) |
+| burst 32/50, single 1000 (§8.1) | none: the burst creates no workflow, so the breaker never judges these clusters | no fleet | - | - |
+| storm breaker step (below) | 64 (16 incidents) | 256 | 52 | crosses it on purpose: 12 admitted, the 13th trips it, 4 held |
+| whole-cluster correlated fault (§4.4, planned) | 512 (idle, or several jobs) | 512 | 103 | trips by construction |
+
+**The breaker step.**
+
+```bash
+scripts/perf/regional_storm_breaker_suite.py \
+  --fleet-nodes-per-cluster 256 \
+  --nodes-per-workflow 4 \
+  --held-workflows 4 \
+  --executor-workers 16 \
+  --allow-live-registry \
+  --confirm-live-registry ALLOW_PERF_CAPACITY_LIVE_REGISTRY \
+  --label storm-breaker \
+  --artifact-root artifacts/perf
+```
+
+One synthetic cluster `perf-cap-000` registers 256 GPU nodes: the step's 64 workflow nodes and 192 fleet Agents
+(threshold 52). Sixteen job-less workflows of 4 nodes each -- the §8.2 model's 10 steps and simulated executor, one
+incident and therefore one workload domain each -- are seeded at once, no sooner than 65 s after the fleet is complete (a
+count a control-plane process cached for the cluster id lives a minute). The first `ceil(52 / 4) - 1 = 12` are admitted;
+the 13th brings 52 nodes across 13 domains and trips the breaker; it and the remaining 3 are held. The phases, each
+bounded:
+
+1. `trip` (`--trip-timeout-seconds`, 300): the breaker record is `TRIPPED`; its `trip_cluster_nodes` is 256 and its
+   `trip_threshold` 52 (the fleet was counted), `trip_node_ids` holds 52 nodes and `trip_domains` 13, and the workflow that
+   tripped it is held;
+2. `hold` (`--hold-timeout-seconds`, 900): the product's own held list (`workflow_reconcile.storm_held_workflows`, what the
+   operator exit acts on) has the 4, each `PENDING` on `storm:perf-cap-000` with no remote command and never `RUNNING`
+   while the breaker is open; the 12 admitted workflows run to `SUCCEEDED` while it stays open; the breaker records the
+   operator notice (`notified_trip_id` equals `trip_id`; a `perf-cap-*` notice is a drill and is not delivered); the
+   `gpu_fault_remediation_budget_storm_breaker_{open,threshold_nodes,window_nodes,held_workflows}` gauges of an api-ha
+   Pod's `/metrics` read 1/52/52/4; and AMP's `/api/v1/alerts` reports `GpuFaultRemediationStormBreakerOpen` `firing`
+   with `cluster_id="perf-cap-000"`;
+3. release: the operator exit releases the breaker (below) and the step records when;
+4. `drain` (`--drain-timeout-seconds`, 900): every held workflow runs to `SUCCEEDED` and the breaker stays `CLOSED` with an
+   empty window -- the held work is admitted without counting again;
+5. `resolve` (`--alert-timeout-seconds`, 600): the alert leaves AMP and the `open` gauge reads 0.
+
+The headline number is `summary.json.measurements.release_to_held_completion_seconds`, from the release to the last held
+workflow's terminal state, beside the release-to-first and -last held command, the execution time of a held and of an
+admitted workflow once it runs (`workflow_execution_seconds`), seed-to-trip and trip-to-firing. Under the simulated
+durations one workflow takes about 140 s (the 120-s reboot dominates), so the release-to-completion time is that plus the
+dispatcher's pickup of the held rows.
+
+A phase that times out fails the step; the release still runs after a `hold` timeout, so a missing alert never strands
+the held work. Whatever ends the step -- `PASS`, `FAIL`, an exception or a signal -- its cleanup reads the breaker and,
+when it is still open, hands the held work over (`abort`) and releases it, then reads it `CLOSED`
+(`storm-breaker-exit.json`); the fleet's exit checks once more; the teardown then purges and deregisters the cluster and
+`fleet-cleanup.json` proves no Agent and no breaker record is left. `summary.json.checks` lists each criterion
+(`fleet_counted`, `tripped_at_planned_admission`, `held_while_open`, `in_flight_completed_while_open`, `operator_notice`,
+`gauges_read_the_trip`, `alert_firing`, `released`, `held_completed_after_release`, `no_recount_after_release`,
+`alert_resolved`, `executor_clean`), every one read from the product's own state -- the breaker record, the workflow and
+command rows, the gauges and AMP's alert state -- never from log text.
+
+Constraints:
+
+- AMP must carry the alert rule (the step refuses before it registers anything otherwise), and the §3.1 drill sink must
+  route `cluster_id=~"perf-cap-.*"` (the registration checks it): the critical alert fires for `perf-cap-000` and must
+  reach nobody;
+- `--trip-timeout-seconds` plus `--hold-timeout-seconds` must stay within 1500 s: a storm hold is a budget wait, and the
+  site-wide `GpuFaultRemediationBudgetStarved` (30 min) and `GpuFaultWorkflowPendingAge` (a `PENDING` workflow older than
+  30 min) carry no `cluster_id`, so the drill sink does not keep them;
+- `gpu-fault-admin remediation-storm release|abort` accepts only the managed site's clusters
+  (`workflow_reconcile.cluster_target`), not a synthetic `perf-cap-*` one. The step therefore runs the verb's own Pod
+  program (`gpu_fault.admin.remediation_storm.SCRIPT`, which calls `workflow_reconcile.remediation_storm_action`) through
+  the same exec channel, with the operator identity, the `--reason` and a `--reference` (`PERF-STORM-<run>`) the verb would
+  record. What it leaves out is the deploy host's part: the site operation lock and the evidence file under
+  `<state-dir>/remediation-storm/`; the step's evidence is `summary.json.release` and `storm-breaker-exit.json`.
+
+The step runs once in a formal suite, after `gpu-fault-admin status` and before the capacity rounds: with its setup and
+teardown it takes about half an hour, it proves on the release under test that the fleet is counted -- which every later
+step relies on -- and its alert has resolved before the next step starts. Do not go on to the capacity rounds after a
+`FAIL` of this step.
+
 ## 9. spool A/B Method
 
 spool enabled/disabled must use:
@@ -1178,7 +1331,9 @@ throughput. Capacity may never be declared passed in the following situations:
 - results of a historical release used in place of the current release.
 - a release that supports the remediation budget ran only the production-budget tier or only the raw-capacity tier;
 - the five budget tiers not recorded, or budget active/wait metrics missing;
-- a claim to have verified the failure-domain budget while the synthetic workflows have no domain field.
+- a claim to have verified the failure-domain budget while the synthetic workflows have no domain field;
+- on a release after the fixed limits' retirement, an action, correlated or integrated step without `fleet.json` or with
+  its `verdict` `FAIL` (§8.5), or a remediation storm breaker step with any `summary.json.checks` entry false.
 
 ## 11. Evidence and Retention
 
@@ -1278,6 +1433,12 @@ design v2 §9.5), `lease_expiry_releases` is `not-applicable`. When an old relea
 records lack a field, that field is `unsupported` explicitly; an all-zero file must not be
 substituted.
 
+On a release after the fixed limits' retirement the action, correlated and integrated runners also keep `fleet.json` (§8.5:
+the plan, the registration, the heartbeat sessions, the census the run ends with and the fleet verdict) and
+`fleet-cleanup.json` (the census after the teardown). The remediation storm breaker step keeps `run.json`, `fleet.json`,
+`summary.json` (with `checks` and `measurements`), `storm-breaker-history.json` (every poll), `storm-breaker-exit.json`,
+`fleet-cleanup.json`, `capacity-data-cleanup.json` and `executors/`.
+
 Raw logs and site identifiers are kept only in CI artifacts or private object storage. The
 public repository may publish reviewed summary conclusions but must remove account numbers,
 ARNs, cluster names, node IDs, IPs, tokens, Secrets and internal DNS.
@@ -1288,6 +1449,8 @@ ARNs, cluster names, node IDs, IPs, tokens, Secrets and internal DNS.
 - API composite load tests use a separate audit cluster and deterministic event IDs.
 - No real reset, reboot or replace is executed in capacity tests.
 - After the test, unconditionally delete Jobs, ConfigMaps, Secrets, temporary registry and database records.
+- The synthetic clusters' fleet Agents and remediation storm breaker records go with the clusters' data, and
+  `fleet-cleanup.json` proves none is left; a breaker still open is handed over and released before the teardown (§8.5).
 - When cleanup fails, `status.json` must be marked `aborted`; an incomplete directory must not be used as formal evidence.
 
 ## 13. Redacted Reference Baselines
@@ -1411,8 +1574,8 @@ workers, 60 seconds, cold connections; the request matrix used the fixed 32/50-c
 §4.1.
 
 All four rounds loaded and held the following remediation budget (a release before the fixed limits' retirement; a
-later one has only per node and per failure domain, both 1, and its request model trips the remediation storm breaker,
-see §4.3):
+later one has only per node and per failure domain, both 1, and the healthy fleet of §8.5 keeps its request model below
+the remediation storm breaker's threshold, see §4.3):
 
 | Clusters | Region | Per cluster | Per resource class | Per node | Per failure domain |
 |---:|---:|---:|---:|---:|---:|
