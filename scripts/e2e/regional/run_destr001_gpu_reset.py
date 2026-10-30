@@ -640,14 +640,21 @@ def prepare_host_baseline(
     host: HostProbeFixture,
     preflight: dict[str, Any],
     case_dir: Path,
+    *,
+    require_idle: bool = True,
 ) -> tuple[dict[str, Any], int, str]:
+    # ``require_idle`` is the GPU-reset target's rule: no active NVIDIA compute
+    # client may hold a GPU we are about to reset. A caller that baselines a node
+    # deliberately running a workload -- DESTR-029's job master, which takes a
+    # node reboot, not a GPU reset -- passes ``require_idle=False`` so the running
+    # job's compute clients do not read as a pre-existing fault.
     host.create()
     baseline_host = host.execute("snapshot")
     write_json_atomic(case_dir / "host-baseline.json", baseline_host)
     expected_gpu_count = int(preflight["node"]["gpu_allocatable"])
     if len(baseline_host["gpu_inventory"]) != expected_gpu_count:
         raise RegionalFixtureError("host GPU inventory differs from Node allocatable")
-    if baseline_host["compute_clients"]:
+    if require_idle and baseline_host["compute_clients"]:
         raise RegionalFixtureError("target node has active NVIDIA compute clients")
     if baseline_host["quiesce_states"]:
         raise RegionalFixtureError("target node has a pre-existing quiesce state")

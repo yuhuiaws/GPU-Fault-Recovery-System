@@ -708,10 +708,16 @@ def _launch_job(run: _LiveRun) -> None:
 
 
 def _baselines_and_samplers(run: _LiveRun) -> None:
-    for item in run.targets.values():
+    for key, item in run.targets.items():
         run.window_open(f"the host baseline of {item.node}")
+        # The job master runs the two-node training workload by design, so its
+        # GPUs hold compute clients at baseline; only the idle node is the
+        # GPU-reset target that reset_case requires to be client-free.
         baseline, count, bdf = reset_case.prepare_host_baseline(
-            item.probe, {"node": run.preflight["nodes"][item.node]}, item.directory
+            item.probe,
+            {"node": run.preflight["nodes"][item.node]},
+            item.directory,
+            require_idle=key == "idle",
         )
         item.baseline, item.expected_gpu_count, item.target_bdf = baseline, count, bdf
     run.regional.verify_runtime_identity(
