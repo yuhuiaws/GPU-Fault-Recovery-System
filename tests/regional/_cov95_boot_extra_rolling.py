@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
+from scripts.e2e.regional import boot020_interrupted_release as interrupted
 from scripts.e2e.regional import run_boot020_release_rolling as rolling
 
 
@@ -199,6 +200,22 @@ class RollingEntry:
             "CHG-ENTRY",
         ]
         monkeypatch.setattr(rolling, "validate_admin_target", lambda *_a: None)
+        # What the fresh-run precondition reads live; the site's own release,
+        # committed, unless a test opens a transaction on it.
+        self.live_release = {
+            "phase": "complete",
+            "release_id": "unit-release",
+            "transaction_committed": True,
+        }
+        self.live_reads: list = []
+
+        def read_live_release_state(state_dir):
+            self.live_reads.append(state_dir)
+            return dict(self.live_release)
+
+        monkeypatch.setattr(
+            interrupted, "read_live_release_state", read_live_release_state
+        )
         monkeypatch.setattr(
             rolling, "public_config_roundtrip", lambda *_a, **_kw: {"restored": True}
         )

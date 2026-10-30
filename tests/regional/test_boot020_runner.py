@@ -59,6 +59,11 @@ class FakeReleaseRollingBackend:
         # 08:02Z: the HyperPod software update rebooted every CPU node during the
         # control_plane stage; the engine left phase rollback-failed).
         self.rollback_pending = False
+        # An interrupted forward roll a killed attempt left open (live
+        # 2026-10-29, R13j attempt 23: candidate D at data-plane-progress), and
+        # the phase ``resume_upgrade`` ends it in; None = nothing open.
+        self.open_transaction: dict | None = None
+        self.resume_ends_in = "complete"
         # Blockers the engine's own pre-node-mutation gate would raise on
         # (live 2026-09-20 08:33Z: the warm spare carried a quarantine taint from
         # an inconclusive DCGM diagnosis and the executor stage failed after
@@ -165,6 +170,42 @@ class FakeReleaseRollingBackend:
             "phase": "rolled-back",
         }
 
+    def release_state(self) -> dict:
+        if self.open_transaction is not None:
+            return dict(self.open_transaction)
+        return {
+            "phase": "complete",
+            "release_id": "unit",
+            "transaction_committed": True,
+        }
+
+    def candidate_releases(self) -> dict:
+        # noop and control_plane name the site's own release; only their
+        # AdminConfig (one control worker less) tells them apart.
+        releases = {
+            name: {"release_id": f"release-{name}", "admin_config_sha256": "a" * 64}
+            for name in ("noop", "executor", "agent", "full")
+        }
+        releases["control_plane"] = {
+            "release_id": "release-noop",
+            "admin_config_sha256": "c" * 64,
+        }
+        return releases
+
+    def resume_upgrade(self, scenario: str) -> dict:
+        # The convergence deploy that follows takes the site back to the
+        # precondition, so what classifies NOOP (``completed``) is unchanged.
+        self.calls.append(("resume_upgrade", scenario))
+        before = dict(self.open_transaction or {})
+        self.open_transaction = None
+        return {
+            "scenario": scenario,
+            "release_id": before.get("release_id"),
+            "phase_before": before.get("phase"),
+            "phase": self.resume_ends_in,
+            "error": None if self.resume_ends_in == "complete" else "unit failure",
+        }
+
     def deploy(
         self,
         scenario: str,
@@ -179,6 +220,8 @@ class FakeReleaseRollingBackend:
             self.commits.append(scenario)
         if self.rollback_pending:
             raise RuntimeError("a rollback is in progress and must finish first")
+        if (self.open_transaction or {}).get("phase", "complete") != "complete":
+            raise RuntimeError("a forward transaction is in flight; resume it first")
         self.calls.append((scenario, fault_phase, resume, auto_rollback, diff["kind"]))
         plans = {
             "control_plane": {

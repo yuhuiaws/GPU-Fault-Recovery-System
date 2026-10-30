@@ -22,6 +22,7 @@ from gpu_fault_release import regional_release_diff  # noqa: E402
 from gpu_fault_release import rollout as rollout_regional_release  # noqa: E402
 from gpu_fault.admin.atomic_json import write_json_atomic  # noqa: E402
 from gpu_fault.admin.config import AdminConfig  # noqa: E402
+from scripts.e2e.regional import boot020_interrupted_release as interrupted  # noqa: E402
 from scripts.e2e.regional import boot020_live_capture as captures  # noqa: E402
 from scripts.e2e.regional import boot020_restore_stage as restore_stage  # noqa: E402
 from scripts.e2e.regional import boot020_release_prerequisites as prerequisites  # noqa: E402
@@ -119,6 +120,9 @@ class ReleaseRollingBackend(Protocol):
     def classify(self, scenario: str) -> dict[str, Any]: ...
     def resume_rollback(self, scenario: str) -> dict[str, Any]: ...
     def node_safety(self, scenario: str) -> dict[str, Any]: ...
+    def release_state(self) -> dict[str, Any]: ...
+    def candidate_releases(self) -> dict[str, dict[str, str]]: ...
+    def resume_upgrade(self, scenario: str) -> dict[str, Any]: ...
 
     def snapshot(self, scenario: str, *, live: bool = True) -> dict[str, Any]: ...
     def cpu_env_alignment(self, scenario: str) -> dict[str, Any]: ...
@@ -920,61 +924,6 @@ def _discard_incomplete(recorder: EvidenceRecorder, index: int) -> list[str]:
     return recorder.drop_stages(doomed)
 
 
-def _converge_to_precondition(
-    backend: ReleaseRollingBackend,
-    recorder: EvidenceRecorder,
-    index: int,
-) -> dict[str, Any]:
-    """Bring the live release back to the resume stage's precondition.
-
-    The resume stage begins by classifying its config against the state the
-    previous stage left, and asserting the classification. A failed stage's
-    auto-rollback left the live state at that precondition already, but pinned
-    at ``rolled-back``; classifying and deploying the previous stage's config is
-    a NOOP that clears the phase to ``complete`` without touching artifacts. In
-    the rarer case where the stage failed after applying its own config, the
-    same deploy really rolls the artifacts back to the precondition. Either way
-    the resume then runs exactly as a first pass would. This folds the
-    hand-written convergence step into the driver.
-    """
-
-    scenario = STAGES[index - 1]
-    # A failed stage may have left the engine's transaction mid-rollback
-    # (live 2026-09-20 08:02Z: a HyperPod software update rebooted every CPU
-    # node during the control_plane stage; the injected upgrade failed for real
-    # and the automatic rollback died on an unavailable webhook, phase
-    # rollback-failed). The engine refuses a new transaction over a pending
-    # rollback, so finish the rollback first; a clean state is a no-op here.
-    rollback_resume = backend.resume_rollback(scenario)
-    if rollback_resume.get("resumed") and rollback_resume.get("phase") not in {
-        "rolled-back",
-        "complete",
-    }:
-        raise RuntimeError(
-            "BOOT-020 could not finish the pending rollback before resuming: "
-            f"{rollback_resume}"
-        )
-    diff = backend.classify(scenario)
-    applied = backend.deploy(scenario, diff=diff)
-    if applied.get("phase") != "complete":
-        raise RuntimeError(
-            f"BOOT-020 could not converge the live state to the {scenario} "
-            f"precondition before resuming: {applied}"
-        )
-    history = list(recorder.document.get("convergence", []))
-    history.append(
-        {
-            "converged_to": scenario,
-            "rollback_resume": rollback_resume,
-            "classification": diff,
-            "phase": applied.get("phase"),
-            "at": utc_now(),
-        }
-    )
-    recorder.note("convergence", history)
-    return applied
-
-
 def resume_release_rolling(
     backend: ReleaseRollingBackend,
     recorder: EvidenceRecorder,
@@ -1001,11 +950,18 @@ def resume_release_rolling(
         raise
     _discard_incomplete(recorder, index)
     if index:
-        _converge_to_precondition(backend, recorder, index)
+        # boot020_interrupted_release: finish an interrupted forward roll of a
+        # drill config, then a pending rollback, then deploy the precondition.
+        interrupted.converge_to_precondition(backend, recorder, STAGES[index - 1])
     return run_release_rolling(backend, recorder, start_stage=stage)
 
 
 class LiveReleaseRollingBackend:
+    # The open-transaction reads and resume of boot020_interrupted_release.
+    release_state = interrupted.live_release_state
+    candidate_releases = interrupted.live_candidate_releases
+    resume_upgrade = interrupted.live_resume_upgrade
+
     def __init__(self, configs: dict[str, Path]) -> None:
         self.configs = configs
         self.rollout = rollout_regional_release
@@ -1369,6 +1325,17 @@ def main() -> int:
         if pending
         else prerequisites.candidate_identity(state_dir, configs, candidates)
     )
+    case_path = case_evidence_path(arguments.run_dir, CASE_ID)
+    # Read-only: a run from its beginning needs the site on its own committed
+    # release, not on an interrupted drill transaction (R13j attempts 23/24).
+    refusal = interrupted.fresh_run_refusal(
+        arguments,
+        state_dir=state_dir,
+        candidates=candidates,
+        identity=identity,
+        case_path=case_path,
+    )
+    passed = predecessor.get("valid") is True and refusal is None
     environment = {
         "GPU_FAULT_BOOT020_CONFIGS": json.dumps(
             {name: str(path) for name, path in configs.items()}, sort_keys=True
@@ -1409,16 +1376,18 @@ def main() -> int:
     if not arguments.execute:
         document = build_plan(
             arguments=arguments,
-            preflight_passed=predecessor.get("valid") is True,
+            preflight_passed=passed,
             run_dir=arguments.run_dir,
             case_id=CASE_ID,
             attempt=arguments.attempt,
             confirmation=CONFIRMATION,
             environment=environment,
-            details=plan,
+            details=plan
+            if refusal is None
+            else {**plan, "preflight_errors": [refusal]},
         )
         print(json.dumps(document, indent=2, sort_keys=True))
-        return 0 if predecessor.get("valid") is True else 1
+        return 0 if passed else 1
     authorize_release_rolling(
         arguments,
         case_id=CASE_ID,
@@ -1429,12 +1398,13 @@ def main() -> int:
     )
     if predecessor.get("valid") is not True:
         raise AcceptanceCheckError("formal predecessor evidence is not PASS")
+    if refusal is not None:
+        raise AcceptanceCheckError(refusal)
     if pending:
         # Only an authorized execute run signs and pushes candidate images.
         candidates = prerequisites.ensure_for_execute(arguments, candidates)
         validate_admin_target(state_dir, configs["noop"])
     gpu_kubeconfig = configure_gpu_kubeconfig(arguments.gpu_kubeconfig)
-    case_path = case_evidence_path(arguments.run_dir, CASE_ID)
     case_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     # The same function on every attempt, built or reused: the identity of the
     # run, so a later --resume finds inputs equal to the first attempt's.

@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from scripts.e2e.regional import boot020_interrupted_release as interrupted
 from scripts.e2e.regional import live_driver_guard
 from scripts.e2e.regional import run_boot019_admin_lifecycle as boot019
 from scripts.e2e.regional import run_boot020_release_rolling as boot020
@@ -51,6 +52,16 @@ def entrypoint(
         monkeypatch.setattr(runner, "validate_admin_target", lambda *_a: None)
         monkeypatch.setattr(
             runner, "public_config_roundtrip", lambda *_a, **_k: {"restored": True}
+        )
+        # The fresh-run precondition's live read: the site's own release.
+        monkeypatch.setattr(
+            interrupted,
+            "read_live_release_state",
+            lambda _state_dir: {
+                "phase": "complete",
+                "release_id": "unit-release",
+                "transaction_committed": True,
+            },
         )
         for flag in (
             "--noop-config",
