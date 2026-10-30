@@ -171,6 +171,95 @@ def test_every_pod_runs_one_sampler_session_until_the_run_stops_it(
     }
 
 
+class KeptStream:
+    """The runner's end of a stop channel, as the keepalive writes it."""
+
+    def __init__(self, *, broken: bool = False) -> None:
+        self.data = b""
+        self.attempts = 0
+        self.closed = threading.Event()
+        self.broken = broken
+
+    def write(self, data: bytes) -> int:
+        self.attempts += 1
+        if self.broken:
+            raise BrokenPipeError("the session is gone with its pipe")
+        if self.closed.is_set():
+            raise ValueError("write to closed file")
+        self.data += data
+        return len(data)
+
+    def flush(self) -> None:
+        return None
+
+    def close(self) -> None:
+        self.closed.set()
+
+
+def test_the_keepalive_writes_newlines_until_the_stop_channel_closes() -> None:
+    """kubectl's stdin close inherits the 60-s write deadline of the last
+    stdin write; a newline every interval keeps that deadline fresh."""
+
+    assert 2 * timeseries.STDIN_KEEPALIVE_SECONDS < 60, (
+        "the stop channel must be written well inside kubectl's 60-s deadline"
+    )
+    stream = KeptStream()
+    keepalive = timeseries.StdinKeepalive(stream, interval_seconds=0.01).start()
+    deadline = time.monotonic() + 10
+    while keepalive.writes < 3 and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    keepalive.close()
+    written = keepalive.writes
+    time.sleep(0.05)
+
+    assert written >= 3, "the keepalive wrote nothing while the session ran"
+    assert stream.closed.is_set(), "close() closes the stop channel"
+    assert stream.data == b"\n" * written, "only newlines, and none after the close"
+    assert keepalive.writes == written == stream.attempts
+
+
+def test_a_keepalive_on_a_dead_pipe_stops_writing() -> None:
+    stream = KeptStream(broken=True)
+    keepalive = timeseries.StdinKeepalive(stream, interval_seconds=0.01).start()
+    deadline = time.monotonic() + 10
+    while not stream.attempts and time.monotonic() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.1)
+
+    keepalive.close()
+    keepalive.close()
+
+    assert stream.attempts == 1, "a dead pipe ends the keepalive, it does not retry"
+    assert keepalive.writes == 0 and stream.closed.is_set()
+
+
+def test_a_disabled_keepalive_only_closes() -> None:
+    stream = KeptStream()
+    keepalive = timeseries.StdinKeepalive(stream, interval_seconds=0).start()
+    time.sleep(0.05)
+    keepalive.close()
+
+    assert stream.data == b"" and stream.closed.is_set(), stream.data
+
+
+def test_a_sampler_session_closes_its_stop_channel_through_its_keepalive() -> None:
+    session = FakeSession([sample(1.0, gpu_fault_processor_workers=8)])
+
+    opened = timeseries.open_session(
+        "gpu-fault-api-ha-a",
+        ["kubectl"],
+        "program",
+        limit=5,
+        popen=lambda *a, **k: session,
+    )
+    timeseries.stop_sessions([opened], timeout_seconds=10)
+
+    assert isinstance(opened.keepalive, timeseries.StdinKeepalive), opened.keepalive
+    assert session.closed.is_set() and opened.error is None, opened.error
+    assert session.written == timeseries.session_input("program")
+
+
 class MetricsHandler(http.server.BaseHTTPRequestHandler):
     BODY = "\n".join(
         [

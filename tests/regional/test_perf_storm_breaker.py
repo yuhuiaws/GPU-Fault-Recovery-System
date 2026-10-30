@@ -25,6 +25,7 @@ from typing import Any
 import pytest
 
 from gpu_fault.app import ApplicationContext
+from gpu_fault.app.metrics import METRIC_CONTRIBUTORS
 from gpu_fault.app.remediation_budget_metrics import (
     budget_tally,
     remediation_storm_lines,
@@ -284,6 +285,40 @@ def test_the_step_judges_the_products_own_breaker_cycle() -> None:
     }
     status, checks = suite.verdict(summary)
     assert status == "PASS", checks
+
+
+def test_the_gauges_are_read_on_the_tier_that_renders_them() -> None:
+    """The breaker gauges are a fleet-level contributor's ("closed-loop"); the
+    ingress tier (api-ha, no background services) skips those, so the b223
+    perf run read no gauge on api-ha for its whole hold and resolve phases."""
+
+    assert "closed-loop" in METRIC_CONTRIBUTORS.fleet_level_names, (
+        "the breaker gauges moved off the fleet-level contributors"
+    )
+    body = "\n".join(
+        [
+            f'{storm.GAUGE_PREFIX}open{{cluster_id="{CLUSTER}"}} 1',
+            f'{storm.GAUGE_PREFIX}held_workflows{{cluster_id="{CLUSTER}"}} 4',
+            f'{storm.GAUGE_PREFIX}open{{cluster_id="other"}} 0',
+        ]
+    )
+    calls: list[tuple[str, ...]] = []
+
+    def control(*args: str, **_options: Any) -> str:
+        calls.append(args)
+        if args[0] == "get":
+            return "gpu-fault-control-worker-7d9-x2"
+        return body
+
+    values = storm.storm_gauges(CLUSTER, control_fn=control)
+
+    assert values == {"open": 1.0, "held_workflows": 4.0}
+    selector, read = calls
+    assert "app=gpu-fault-control-worker" in selector, selector
+    assert read[1] == "gpu-fault-control-worker-7d9-x2", read
+    assert "http://127.0.0.1:8081/metrics" in read[-1], read
+    with pytest.raises(RuntimeError, match="no Running gpu-fault-control-worker"):
+        storm.storm_gauges(CLUSTER, control_fn=lambda *args, **options: "")
 
 
 def command_status(created: str, updated: str) -> dict[str, Any]:

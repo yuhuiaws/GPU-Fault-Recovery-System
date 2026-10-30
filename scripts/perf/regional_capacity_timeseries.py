@@ -9,8 +9,8 @@ prints the sampled families as one JSON line (``SAMPLED_FAMILIES``; the Pod's
 render already merges its processes -- in-flight and workers are Pod sums,
 consumer cycles stay per process). The session's program arrives
 length-prefixed on stdin and the rest of stdin is the stop channel, as for the
-validation-telemetry watch; a session spawns one Python process per Pod
-instead of one per sample. ``processor-timeseries.json`` keeps at most
+validation-telemetry watch (kept closable by :class:`StdinKeepalive`); a
+session spawns one Python process per Pod instead of one per sample. ``processor-timeseries.json`` keeps at most
 ``SAMPLE_LIMIT`` samples per Pod, and :func:`series_summary` reduces them to
 the mean in-flight against the Pod's worker capacity while the backlog lasted.
 
@@ -49,6 +49,8 @@ SAMPLE_INTERVAL_SECONDS = 1.0
 #: One hour at one sample per second: a bound on the artifact, not a window.
 SAMPLE_LIMIT = 3600
 STOP_TIMEOUT_SECONDS = 30.0
+#: Well under the 60-s write deadline a stdin close inherits (``StdinKeepalive``).
+STDIN_KEEPALIVE_SECONDS = 15.0
 BOOTSTRAP = (
     "import sys;stream=sys.stdin.buffer;size=int(stream.readline());"
     "source=stream.read(size).decode();"
@@ -106,6 +108,68 @@ def session_input(program: str) -> bytes:
     return str(len(encoded)).encode() + b"\n" + encoded
 
 
+class StdinKeepalive:
+    """Keeps a ``kubectl exec -i`` stop channel closable for a whole session.
+
+    kubectl's WebSocket transport (client-go ``tools/remotecommand``) gives
+    every stdin data write a 60-s write deadline, but the stream close that
+    carries the EOF sets none: it writes under the deadline the last data
+    write left. A stop channel closed more than 60 s after its last write
+    therefore fails at once with an i/o timeout the TLS connection keeps --
+    every heartbeat ping after it fails the same way ("Websocket Ping failed:
+    write tcp ...: i/o timeout"), the program never sees its EOF and kubectl
+    gives up 61 s later on its pong read deadline, so the session ends without
+    its last lines. The b223 perf storm-breaker step lost its fleet heartbeat
+    session like that, and every sampler stopped after a minute "did not
+    stop". Measured from the runner host (kubectl v1.35.1, 2026-10-30): one
+    write at the start, then a close after 30 s ends the program cleanly, a
+    close after 75 s never reaches it; the same 75 s with a newline every 15 s
+    does.
+
+    One newline every ``interval_seconds`` keeps the deadline fresh (the
+    in-Pod programs read the rest of stdin only for its end); ``close`` ends
+    the keepalive and closes the channel. ``interval_seconds <= 0`` writes
+    nothing.
+    """
+
+    def __init__(
+        self, stream: Any, *, interval_seconds: float = STDIN_KEEPALIVE_SECONDS
+    ) -> None:
+        self.stream = stream
+        self.interval_seconds = interval_seconds
+        self.writes = 0
+        self._closed = threading.Event()
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(
+            target=self._run, name="exec-stdin-keepalive", daemon=True
+        )
+
+    def start(self) -> StdinKeepalive:
+        if self.interval_seconds > 0:
+            self._thread.start()
+        return self
+
+    def _run(self) -> None:
+        while not self._closed.wait(self.interval_seconds):
+            with self._lock:
+                if self._closed.is_set():
+                    return
+                try:
+                    self.stream.write(b"\n")
+                    self.stream.flush()
+                except (OSError, ValueError):
+                    return  # the session is gone with its pipe
+                self.writes += 1
+
+    def close(self) -> None:
+        self._closed.set()
+        with self._lock:
+            try:
+                self.stream.close()
+            except (OSError, ValueError):
+                pass
+
+
 class PodSession:
     """One long-lived in-Pod program: its process and the samples it printed."""
 
@@ -116,9 +180,19 @@ class PodSession:
         self.samples: list[dict[str, Any]] = []
         self.truncated = False
         self.error: str | None = None
+        self.keepalive: StdinKeepalive | None = None
         self.reader = threading.Thread(
             target=self._read, name=f"timeseries-{pod}", daemon=True
         )
+
+    def close_stdin(self) -> None:
+        if self.keepalive is not None:
+            self.keepalive.close()
+            return
+        try:
+            self.process.stdin.close()
+        except (OSError, ValueError):
+            pass
 
     def _read(self) -> None:
         for raw in self.process.stdout or ():
@@ -152,6 +226,7 @@ def open_session(
     process.stdin.write(session_input(program))
     process.stdin.flush()
     session = PodSession(pod, process, limit)
+    session.keepalive = StdinKeepalive(process.stdin).start()
     session.reader.start()
     return session
 
@@ -163,10 +238,7 @@ def stop_sessions(
 
     sessions = list(sessions)
     for session in sessions:
-        try:
-            session.process.stdin.close()
-        except (OSError, ValueError):
-            pass
+        session.close_stdin()
     deadline = time.monotonic() + timeout_seconds
     for session in sessions:
         session.reader.join(timeout=max(0.0, deadline - time.monotonic()))

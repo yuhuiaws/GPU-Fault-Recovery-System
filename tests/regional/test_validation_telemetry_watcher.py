@@ -192,6 +192,30 @@ def test_session_runs_the_seed_watch_mode_and_stops_when_stdin_closes(
     )
 
 
+def test_a_long_session_keeps_its_stop_channel_deliverable() -> None:
+    """kubectl drops a stdin close made more than 60 s after the last stdin
+    write (``StdinKeepalive``): the watcher writes newlines while the session
+    runs, and its stop closes the channel through the keepalive."""
+
+    session = FakeSession(session_summary([0.5]), exits_early=False)
+    launcher = Launcher([session])
+    running = watcher(launcher, keepalive_seconds=0.01)
+    running.start()
+    program = telemetry.session_input(SEED.read_bytes())
+    deadline = time.monotonic() + 10
+    while len(session.stdin.data) < len(program) + 3 and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    summary = running.stop()
+
+    data = session.stdin.data
+    assert data.startswith(program), "the program arrives first, length-prefixed"
+    assert len(data) >= len(program) + 3, "no keepalive while the session ran"
+    assert set(data[len(program) :]) == {ord("\n")}, "then only newlines"
+    assert session.closed.is_set(), "stop() closes the stop channel"
+    assert summary["sessions"][0]["ended_by"] == "stopped"
+
+
 def test_a_lost_session_is_restarted_and_its_failure_recorded() -> None:
     lost = FakeSession(None, exits_early=True)
     replacement = FakeSession(session_summary([0.3]), exits_early=False)

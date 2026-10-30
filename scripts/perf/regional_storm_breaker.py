@@ -121,19 +121,34 @@ def plan_line(plan: dict[str, Any]) -> str:
     )
 
 
-def api_pod(control_fn: Control) -> str:
+def running_pod(control_fn: Control, app: str) -> str:
     pod = control_fn(
         "get",
         "pod",
         "-l",
-        "app=gpu-fault-api-ha",
+        f"app={app}",
         "--field-selector=status.phase=Running",
         "-o",
         "jsonpath={.items[0].metadata.name}",
     ).strip()
     if not pod:
-        raise RuntimeError("no Running gpu-fault-api-ha Pod")
+        raise RuntimeError(f"no Running {app} Pod")
     return pod
+
+
+def api_pod(control_fn: Control) -> str:
+    return running_pod(control_fn, "gpu-fault-api-ha")
+
+
+def fleet_metrics_pod(control_fn: Control) -> str:
+    """A Pod whose ``/metrics`` carries the fleet-level families.
+
+    The breaker gauges come from a ``fleet_level`` contributor, which only the
+    roles with background services render (``MetricContributorRegistry``, A-6):
+    the ingress tier (api-ha) skips them, the worker tier publishes them.
+    """
+
+    return running_pod(control_fn, "gpu-fault-control-worker")
 
 
 def last_json(output: str) -> dict[str, Any]:
@@ -253,10 +268,10 @@ def parse_storm_gauges(body: str, cluster_id: str) -> dict[str, float]:
 def storm_gauges(
     cluster_id: str, *, control_fn: Control | None = None
 ) -> dict[str, float]:
-    """The cluster's breaker gauges on one api-ha Pod's Pod-coherent /metrics."""
+    """The cluster's breaker gauges on one control-worker Pod's /metrics."""
 
     kube = registry.control if control_fn is None else control_fn
-    pod = api_pod(kube)
+    pod = fleet_metrics_pod(kube)
     body = kube(
         "exec",
         pod,

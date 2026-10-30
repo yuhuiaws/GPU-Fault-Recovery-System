@@ -15,7 +15,8 @@ watches its seeded nodes (``integrated-validation-watch``); the correlated suite
 
 The session's program arrives length-prefixed on stdin and the rest of stdin is
 its stop channel: closing it ends the session (``stop``), and so does a runner
-that dies, because the pipe closes with it. A session also ends on its own once
+that dies, because the pipe closes with it; a newline every 15 s keeps that
+close deliverable (``StdinKeepalive``). A session also ends on its own once
 every run workflow is terminal, and at its deadline. A session that is lost
 early (the exec stream dropped) is relaunched a bounded number of times.
 """
@@ -33,8 +34,10 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING or __package__:
     from . import regional_capacity_registry as registry
+    from .regional_capacity_timeseries import STDIN_KEEPALIVE_SECONDS, StdinKeepalive
 else:
     import regional_capacity_registry as registry
+    from regional_capacity_timeseries import STDIN_KEEPALIVE_SECONDS, StdinKeepalive
 
 SEED_SCRIPT = Path(__file__).resolve().parent / "seed_regional_action_workflows.py"
 WATCH_MODE = "integrated-validation-watch"
@@ -96,6 +99,7 @@ class ValidationTelemetryWatcher:
         poll_seconds: float = 1.0,
         max_restarts: int = 3,
         restart_pause_seconds: float = 2.0,
+        keepalive_seconds: float = STDIN_KEEPALIVE_SECONDS,
         popen: Callable[..., Any] = subprocess.Popen,
         control_fn: Callable[..., str] | None = None,
     ) -> None:
@@ -107,6 +111,7 @@ class ValidationTelemetryWatcher:
         self.poll_seconds = poll_seconds
         self.max_restarts = max_restarts
         self.restart_pause_seconds = restart_pause_seconds
+        self.keepalive_seconds = keepalive_seconds
         self.popen = popen
         self.control = registry.control if control_fn is None else control_fn
         self.sessions: list[dict[str, Any]] = []
@@ -114,6 +119,7 @@ class ValidationTelemetryWatcher:
         self._stopping = threading.Event()
         self._lock = threading.Lock()
         self._process: Any = None
+        self._keepalive: StdinKeepalive | None = None
         self._thread: threading.Thread | None = None
         self.summary: dict[str, Any] = {}
 
@@ -163,7 +169,10 @@ class ValidationTelemetryWatcher:
 
     def _close_stdin(self) -> None:
         with self._lock:
-            process = self._process
+            process, keepalive = self._process, self._keepalive
+        if keepalive is not None:
+            keepalive.close()
+            return
         if process is None or process.stdin is None:
             return
         try:
@@ -250,6 +259,11 @@ class ValidationTelemetryWatcher:
             # The session died at once, or stop() closed its stdin first: the
             # remote bootstrap then reads no program and exits.
             pass
+        keepalive = StdinKeepalive(
+            process.stdin, interval_seconds=self.keepalive_seconds
+        ).start()
+        with self._lock:
+            self._keepalive = keepalive
         if self._stopping.is_set():
             self._close_stdin()
         result: dict[str, Any] = {}
@@ -261,6 +275,8 @@ class ValidationTelemetryWatcher:
         reader.join(timeout=5)
         with self._lock:
             self._process = None
+            self._keepalive = None
+        keepalive.close()
         session = {
             **result,
             "pod": pod,
