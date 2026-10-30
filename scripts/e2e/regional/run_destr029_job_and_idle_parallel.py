@@ -68,6 +68,7 @@ from scripts.e2e.regional import (  # noqa: E402
 from scripts.e2e.regional import (  # noqa: E402
     run_destr027_two_idle_node_parallel_reset as idle_case,
 )
+from scripts.e2e.regional import job_reboot_contract  # noqa: E402
 from scripts.e2e.regional import workload_domain_oracle as oracle  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     processor_queue_backlog,
@@ -89,6 +90,7 @@ from scripts.e2e.regional.managed_workload_fixture import (  # noqa: E402
     ImagePrewarmFixture,
     ManagedWorkloadFixture,
     ManagedWorkloadSettings,
+    managed_workload_name,
 )
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalFixtureError,
@@ -101,6 +103,7 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     settings_from_arguments,
 )
 from scripts.e2e.regional.reset_escalation_evidence import (  # noqa: E402
+    escalation_errors,
     product_escalation,
     product_reboot,
     reboot_proof_error,
@@ -112,6 +115,9 @@ TRAINING_MANIFEST = (
     / "training"
     / "two-node-replace-pytorchjob.yaml"
 )
+#: The fixed name the training manifest ships with; the case submits it renamed
+#: after its job id (``name_managed_workload``).
+TRAINING_WORKLOAD_NAME = "gpu-fault-two-node-replace"
 CASE_ID = "GF-REGIONAL-DESTR-029"
 PREDECESSOR_CASE_ID = "GF-REGIONAL-DESTR-002"
 CONFIRMATION = "DESTR029_EXECUTE"
@@ -228,6 +234,9 @@ class Layout:
     master: str
     worker: str
     idle: str
+    #: The PyTorchJob's Kubernetes name: the manifest's fixed name renamed after
+    #: the job id, which is the object the product's job token names.
+    workload_name: str
 
     @property
     def job_nodes(self) -> tuple[str, str]:
@@ -235,21 +244,28 @@ class Layout:
 
     @property
     def workload_id(self) -> str:
-        return f"gpu-fault-system/pytorchjob/{self.job_id}"
+        return f"gpu-fault-system/pytorchjob/{self.workload_name}"
 
 
-def layout(targets: tuple[str, ...], run_id: str) -> Layout:
+def layout(
+    targets: tuple[str, ...],
+    run_id: str,
+    *,
+    workload_base: str = TRAINING_WORKLOAD_NAME,
+) -> Layout:
     """Assign the chosen nodes: job master=t0, job worker=t1, idle node=t2.
 
     The master takes the reboot-class XID; the idle node takes the reset."""
 
     if len(targets) != MIN_GROUP_NODES:
         raise ValueError(f"need {MIN_GROUP_NODES} targets, got {len(targets)}")
+    job_id = f"{run_id}-job"
     return Layout(
-        job_id=f"{run_id}-job",
+        job_id=job_id,
         master=targets[0],
         worker=targets[1],
         idle=targets[2],
+        workload_name=managed_workload_name(workload_base, job_id),
     )
 
 
@@ -340,7 +356,15 @@ def read_only_preflight(
             "nodes now: "
             + "; ".join(reason for reasons in candidates.values() for reason in reasons)
         )
-    plan = layout(targets, "destr029-plan") if targets else None
+    plan = (
+        layout(
+            targets,
+            "destr029-plan",
+            workload_base=job_reboot_contract.manifest_workload_name(settings.manifest),
+        )
+        if targets
+        else None
+    )
     probe_node = targets[0] if targets else group.nodes[0]
     first = stores[probe_node]
     runtime_identity = regional.runtime_identity()
@@ -563,7 +587,7 @@ def oracle_domains(
 # and the reset contract it calls are)
 # --------------------------------------------------------------------------- #
 @dataclass
-class _Target:
+class FaultTarget:
     """A faulted node: the job master (reboot) or the idle node (reset)."""
 
     label: str
@@ -582,10 +606,20 @@ class _Target:
     sampler_started: bool = False
     sampler_stopped: bool = False
     injection_attempted: bool = False
+    #: What the post-reset host read recorded (``reset_case.post_reset_host``).
+    result: dict[str, Any] = field(default_factory=dict)
 
     @property
     def workflow(self) -> dict[str, Any]:
         return dict(self.state.get("workflow") or {})
+
+    def stop_sampler(self) -> dict[str, Any]:
+        stopped = self.probe.execute(
+            "stop-reset-sampler", "--run-id", self.run_id, timeout=60
+        )
+        self.sampler_stopped = True
+        write_json_atomic(self.directory / "sampler-final.json", stopped)
+        return stopped
 
     @property
     def workflow_id(self) -> str:
@@ -607,7 +641,7 @@ class _LiveRun:
     plan: Layout
     prewarm: ImagePrewarmFixture
     workload: ManagedWorkloadFixture
-    targets: dict[str, _Target]
+    targets: dict[str, FaultTarget]
     job_submitted: bool = False
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -618,11 +652,11 @@ class _LiveRun:
 
 def _target(
     settings: Settings, case_dir: Path, run_id: str, *, label: str, node: str, kind: str
-) -> _Target:
+) -> FaultTarget:
     directory = case_dir / label
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     node_run_id = f"{run_id}-{label}"
-    return _Target(
+    return FaultTarget(
         label=label,
         node=node,
         kind=kind,
@@ -654,13 +688,25 @@ def _prepare(
     case_dir = run_dir / "cases" / CASE_ID
     run_id = run_identity(run_dir, attempt)
     regional = RegionalLiveFixture(settings.regional)
-    plan = layout(tuple(preflight["targets"]), run_id)
+    plan = layout(
+        tuple(preflight["targets"]),
+        run_id,
+        workload_base=job_reboot_contract.manifest_workload_name(settings.manifest),
+    )
     job_manifest = join_case.render_two_node_manifest(
         settings.manifest,
         case_dir / "job" / "job.yaml",
         master_node=plan.master,
         worker_node=plan.worker,
     )
+    # The manifest's fixed name would make the product's job token name a
+    # workload the oracle cannot expect: submit it under the job's own name.
+    submitted_name = job_reboot_contract.name_rendered_job(job_manifest, plan.job_id)
+    if submitted_name != plan.workload_name:
+        raise RegionalFixtureError(
+            f"rendered job is named {submitted_name}, the plan expects "
+            f"{plan.workload_name}"
+        )
     workload = ManagedWorkloadFixture(
         regional,
         ManagedWorkloadSettings(
@@ -748,7 +794,7 @@ def _inject_both(run: _LiveRun) -> None:
         item.marker = f"{base}-{item.label}"
     run.started_at = datetime.now(timezone.utc)
 
-    def write(item: _Target) -> dict[str, Any]:
+    def write(item: FaultTarget) -> dict[str, Any]:
         item.injection_attempted = True
         command = "write-xid79" if item.kind == "reboot" else "write-xid46"
         payload = item.probe.execute(
@@ -833,41 +879,89 @@ def _judge_records(run: _LiveRun) -> oracle.OracleVerdict:
     )
 
 
-def _reboot_contract(run: _LiveRun, item: _Target) -> list[str]:
-    errors: list[str] = [
-        f"{item.node}: {error}" for error in workload_case.workflow_errors(item.state)
-    ]
-    escalation = product_escalation(item.state)
+def job_node_contract(run: _LiveRun, item: FaultTarget) -> list[str]:
+    """The job's faulted node: rebooted by its job workflow, which stopped and
+    restarted the job; the healthy worker only stopped and restarted with it
+    (``job_reboot_contract``: DESTR-002's reboot proof without its provider
+    half). The reboot is the expected outcome here, not a lost reset proof."""
+
     before = run.preflight["nodes"][item.node]
     after = run.regional.node_snapshot(item.node)
-    rebooted = product_reboot(escalation, before, after)
-    if not rebooted:
-        errors.append(f"{item.node}: the job's faulted node did not reboot")
-    else:
-        item.sampler_stopped = True
-        errors.append(f"{item.node}: {reboot_proof_error(escalation, rebooted)}")
+    write_json_atomic(item.directory / "node-after.json", after)
+    if product_reboot(product_escalation(item.state), before, after):
+        item.sampler_stopped = True  # the boot ended the sampler's transient unit
+    errors = [
+        f"{item.node}: {error}"
+        for error in job_reboot_contract.faulted_node_errors(
+            item.state,
+            node_before=before,
+            node_after=after,
+            store_before=(run.preflight.get("stores") or {}).get(item.node),
+        )
+    ]
+    worker = run.plan.worker
+    errors.extend(
+        job_reboot_contract.healthy_peer_errors(
+            {worker: run.preflight["nodes"][worker]},
+            {worker: run.regional.node_snapshot(worker)},
+        )
+    )
     return errors
 
 
-def _reset_contract(run: _LiveRun, item: _Target) -> list[str]:
+def idle_node_contract(run: _LiveRun, item: FaultTarget) -> list[str]:
+    """The idle node: DESTR-001's reset contract and host proof, read the way
+    DESTR-027 reads it -- the post-reset host snapshot and the sampler's final
+    series first (``post_reset_host``), then the comparison with the baseline;
+    a reboot that escalated the reset loses that proof and says so."""
+
+    escalation = product_escalation(item.state)
     errors = [
-        f"{item.node}: {error}" for error in reset_case.workflow_errors(item.state)
+        f"{item.node}: {error}"
+        for error in (
+            *escalation_errors(escalation),
+            *reset_case.workflow_errors(item.state),
+        )
     ]
-    restored, _node_after = reset_case.node_restored_errors(
+    restored, node_after = reset_case.node_restored_errors(
         run.regional, item.node, item.directory
     )
-    errors.extend(f"{item.node}: {error}" for error in restored)
-    errors.extend(
-        f"{item.node}: {error}"
-        for error in reset_case.host_errors(
-            item.baseline,
-            item.after,
-            expected_gpu_count=item.expected_gpu_count,
-            target_bdf=item.target_bdf,
-            incident_id=item.incident_id,
-            workflow_request_id=item.workflow_id,
-        )
+    before = run.preflight["nodes"][item.node]
+    rebooted = reset_case.post_reset_host(
+        item.probe,
+        item.directory,
+        item.result,
+        item.after,
+        arguments=(
+            "--since-epoch",
+            str(run.started_at.timestamp()),
+            "--pci-bdf",
+            item.target_bdf,
+            "--run-id",
+            item.run_id,
+        ),
+        stop_sampler=item.stop_sampler,
+        reboot=product_reboot(escalation, before, node_after),
+        recheck=lambda: product_reboot(
+            escalation, before, run.regional.node_snapshot(item.node)
+        ),
     )
+    if rebooted:
+        item.sampler_stopped = True  # the boot ended the sampler's transient unit
+        errors.append(f"{item.node}: {reboot_proof_error(escalation, rebooted)}")
+    else:
+        errors.extend(
+            f"{item.node}: {error}"
+            for error in reset_case.host_errors(
+                item.baseline,
+                item.after,
+                expected_gpu_count=item.expected_gpu_count,
+                target_bdf=item.target_bdf,
+                incident_id=item.incident_id,
+                workflow_request_id=item.workflow_id,
+            )
+        )
+    errors.extend(f"{item.node}: {error}" for error in restored)
     return errors
 
 
@@ -951,8 +1045,8 @@ def execute_case(
         _wait_terminal(run)
         verdict = _judge_records(run)
         errors = list(verdict.errors)
-        errors.extend(_reboot_contract(run, run.targets["job"]))
-        errors.extend(_reset_contract(run, run.targets["idle"]))
+        errors.extend(job_node_contract(run, run.targets["job"]))
+        errors.extend(idle_node_contract(run, run.targets["idle"]))
         cpu_after = run.regional.cpu_blast_snapshot()
         write_json_atomic(case_dir / "cpu-blast-after.json", cpu_after)
         if cpu_after != preflight["cpu_blast"]:

@@ -25,6 +25,7 @@ from gpu_fault.cluster_scope import EKS_NODEGROUP_LABEL, HYPERPOD_INSTANCE_GROUP
 from scripts.e2e.regional import run_destr029_job_and_idle_parallel as destr029
 from scripts.e2e.regional import workload_domain_oracle as oracle
 from scripts.e2e.regional.live_driver_guard import CaseRunner
+from scripts.e2e.regional.managed_workload_fixture import managed_workload_name
 from scripts.e2e.regional.regional_case_contract import (
     case_metadata,
     formal_predecessor,
@@ -260,7 +261,12 @@ def test_the_oracle_sees_a_job_domain_and_an_idle_domain() -> None:
     assert [domain.is_job for domain in domains] == [True, False]
     job, idle = domains
     assert (job.faulted_node, job.allocation) == ("n0", ("n0", "n1"))
-    assert job.workload_ids == ("gpu-fault-system/pytorchjob/destr029-run-job",)
+    # The product's job token names the submitted PyTorchJob object: the
+    # manifest's fixed name renamed after the job id, not the bare job id.
+    assert job.workload_ids == (
+        "gpu-fault-system/pytorchjob/"
+        + managed_workload_name("gpu-fault-two-node-replace", "destr029-run-job"),
+    )
     assert (idle.faulted_node, idle.allocation, idle.job_id) == ("n2", (), "")
     assert destr029.CASE_COUNTED_NODES == 2
 
@@ -299,3 +305,164 @@ def test_the_node_group_override_is_a_selection_flag(tmp_path: Path) -> None:
 
     assert isinstance(arguments, argparse.Namespace), arguments
     assert arguments.node_group == "p5en"
+
+
+# --------------------------------------------------------------------------- #
+# The live contracts (attempt 39 on HyperPod: the product recovered both nodes,
+# the old contracts failed it anyway)
+# --------------------------------------------------------------------------- #
+LIVE_JOB_STEPS = (
+    "FREEZE_EVIDENCE",
+    "MARK_UNSCHEDULABLE",
+    "STOP_WORKLOADS",
+    "RESTART_NODE",
+    "VALIDATE_GPU",
+    "VALIDATE_HOST",
+    "VALIDATE_FABRIC",
+    "RESTORE_SCHEDULING",
+    "RESTART_WORKLOAD",
+)
+
+
+def _node(boot: str) -> dict[str, Any]:
+    return {
+        "boot_id": boot,
+        "uid": "uid-1",
+        "gpu_allocatable": "8",
+        "ready": "True",
+        "unschedulable": False,
+        "ownership_annotations": {},
+    }
+
+
+class _Nodes:
+    def __init__(self, nodes: dict[str, dict[str, Any]]) -> None:
+        self.nodes = nodes
+
+    def node_snapshot(self, node: str) -> dict[str, Any]:
+        return dict(self.nodes[node])
+
+
+def _target(tmp_path: Path, label: str, node: str, state: dict[str, Any]) -> Any:
+    directory = tmp_path / label
+    directory.mkdir()
+    return destr029.FaultTarget(
+        label=label,
+        node=node,
+        kind="reboot" if label == "job" else "reset",
+        probe=None,  # type: ignore[arg-type]
+        run_id=f"run-{label}",
+        directory=directory,
+        state=state,
+    )
+
+
+def test_the_job_node_reboot_the_product_ran_live_passes(tmp_path: Path) -> None:
+    """Attempt 39: the job workflow stopped the job, rebooted its master,
+    validated, restored scheduling and restarted the job; the old contract
+    judged it with DESTR-009's XID 11 checks and a lost-reset-proof line."""
+
+    state = {
+        "event": {"xid": 79},
+        "decision": {"action": "REBOOT_NODE"},
+        "workflow": {
+            "status": "SUCCEEDED",
+            "official_steps": [{"operation": step} for step in LIVE_JOB_STEPS],
+            "step_executions": [
+                {"operation": step, "status": "SUCCEEDED"} for step in LIVE_JOB_STEPS
+            ],
+            "completed_operations": ["RESTART_NODE"],
+        },
+        "agent": {
+            "lifecycle_state": "ACTIVE",
+            "boot_id": "agent-new",
+            "artifact_sha256": "a1",
+        },
+    }
+    run = argparse.Namespace(
+        preflight={
+            "nodes": {"n0": _node("boot-old"), "n1": _node("peer-boot")},
+            "stores": {
+                "n0": {"agent": {"boot_id": "agent-old", "artifact_sha256": "a1"}}
+            },
+        },
+        regional=_Nodes({"n0": _node("boot-new"), "n1": _node("peer-boot")}),
+        plan=argparse.Namespace(worker="n1"),
+    )
+    item = _target(tmp_path, "job", "n0", state)
+
+    errors = destr029.job_node_contract(run, item)
+
+    assert errors == []
+    assert item.sampler_stopped, "the boot ended the sampler's transient unit"
+    assert (
+        json.loads((item.directory / "node-after.json").read_text())["boot_id"]
+        == "boot-new"
+    )
+
+
+def test_a_rebooted_healthy_worker_fails_the_job_contract(tmp_path: Path) -> None:
+    state = {
+        "event": {"xid": 79},
+        "decision": {"action": "REBOOT_NODE"},
+        "workflow": {
+            "status": "SUCCEEDED",
+            "official_steps": [{"operation": step} for step in LIVE_JOB_STEPS],
+            "step_executions": [
+                {"operation": step, "status": "SUCCEEDED"} for step in LIVE_JOB_STEPS
+            ],
+        },
+        "agent": {"lifecycle_state": "ACTIVE", "boot_id": "agent-new"},
+    }
+    run = argparse.Namespace(
+        preflight={
+            "nodes": {"n0": _node("boot-old"), "n1": _node("peer-boot")},
+            "stores": {"n0": {"agent": {"boot_id": "agent-old"}}},
+        },
+        regional=_Nodes({"n0": _node("boot-new"), "n1": _node("peer-boot-2")}),
+        plan=argparse.Namespace(worker="n1"),
+    )
+
+    errors = destr029.job_node_contract(run, _target(tmp_path, "job", "n0", state))
+
+    assert len(errors) == 1 and "n1: the job's healthy peer rebooted" in errors[0]
+
+
+def test_the_idle_reset_is_judged_on_the_post_reset_host_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Attempt 39 compared the idle node's baseline with an ``after`` nobody
+    filled, so every service, GPU and ledger check failed on an empty dict."""
+
+    calls: list[str] = []
+    seen: dict[str, Any] = {}
+
+    def post_reset_host(host, case_dir, result, after, **kwargs):  # noqa: ANN001, ANN003
+        calls.append("post_reset_host")
+        after.update({"read": "after the reset"})
+        assert kwargs["reboot"] is None
+        return None
+
+    def host_errors(baseline, after, **kwargs):  # noqa: ANN001, ANN003
+        calls.append("host_errors")
+        seen["after"] = dict(after)
+        return []
+
+    monkeypatch.setattr(destr029.reset_case, "workflow_errors", lambda state: [])
+    monkeypatch.setattr(
+        destr029.reset_case,
+        "node_restored_errors",
+        lambda regional, node, directory: ([], _node("idle-boot")),
+    )
+    monkeypatch.setattr(destr029.reset_case, "post_reset_host", post_reset_host)
+    monkeypatch.setattr(destr029.reset_case, "host_errors", host_errors)
+    run = argparse.Namespace(
+        preflight={"nodes": {"n2": _node("idle-boot")}},
+        regional=_Nodes({"n2": _node("idle-boot")}),
+        started_at=datetime(2026, 10, 30, 9, 13, tzinfo=timezone.utc),
+    )
+    item = _target(tmp_path, "idle", "n2", {"workflow": {"request_id": "wi"}})
+
+    assert destr029.idle_node_contract(run, item) == []
+    assert calls == ["post_reset_host", "host_errors"]
+    assert seen["after"] == {"read": "after the reset"}
