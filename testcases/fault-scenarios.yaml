@@ -5138,7 +5138,13 @@ test_cases:
   - admission_rejections_total 只在 A 的维度上增长
   - 缺失的零深度集群序列只有在完整稀疏census与显式全局深度一致时才能解释为零；缺失全局、重复、畸形数据仍失败
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 293b4d531f4cd1346544a41c0c4496bdfb1bbe56f50b2ad13275d9696fbbe98f
+      components:
+        control_plane: e627785658b2c8610ada2443d49de2e148fcde887d12ab5e7c17a4cbcbf931b9
+        executor: 26f64062eee832fe73b65e75e55c5126bb502a823082d3424a3ac68215fa078f
+        node_runtime: 3d3ee9f4b4c4d888733a8a1f0ea907ed54fa93299c175856ba2404c985a14abb
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-cap-001
 - id: GF-REGIONAL-CAP-002
@@ -5231,9 +5237,9 @@ test_cases:
     verified:
       case_digest: 515d1b8f8ef9a765a63a435b9a2a1799ab90856a92f4199676062a0b68e5bb9d
       components:
-        control_plane: 15dfb9989e311767fe9d8fe29dbe6bcbc163752aa5b78ae1340fc74887b33b45
-        executor: ea81228c66e060bd0c68dc3f7ee64469b996937ef16ab45f7b92463f2ee6afdb
-        node_runtime: 4bcdfcfb5c1921fd1da6ed67cfc1e9d90a4c2e40ce56e222f92849d50e195f09
+        control_plane: ce6c118585972f0e39e31e4c3bc28e5ffa8354cfa7d3dff9790e7067263db51a
+        executor: 52d6405905947d23dbb65aada6963c3510ae1ee73f7c9d3ee8b30a9f2df12a02
+        node_runtime: 1588fd1d608692fc4077ebdcdb9eac0c3f6fe337ac5437d33d5b0962ef866e9c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-blast-001
 - id: GF-REGIONAL-BLAST-002
@@ -5328,9 +5334,9 @@ test_cases:
     verified:
       case_digest: 64810a8685612b1dff602e3db4740e1098e51303518777c49e94122461aa49d7
       components:
-        control_plane: 15dfb9989e311767fe9d8fe29dbe6bcbc163752aa5b78ae1340fc74887b33b45
-        executor: ea81228c66e060bd0c68dc3f7ee64469b996937ef16ab45f7b92463f2ee6afdb
-        node_runtime: 4bcdfcfb5c1921fd1da6ed67cfc1e9d90a4c2e40ce56e222f92849d50e195f09
+        control_plane: ce6c118585972f0e39e31e4c3bc28e5ffa8354cfa7d3dff9790e7067263db51a
+        executor: 52d6405905947d23dbb65aada6963c3510ae1ee73f7c9d3ee8b30a9f2df12a02
+        node_runtime: 1588fd1d608692fc4077ebdcdb9eac0c3f6fe337ac5437d33d5b0962ef866e9c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-001
   related_pytest: tests/regional/test_destructive_acceptance_fixtures.py::test_destr001_requires_the_exact_reset_contract
@@ -5534,9 +5540,9 @@ test_cases:
     verified:
       case_digest: 9af18ec35c8b7aadc974d22613a905fd49be6a3e63d499f825f5dcfe0c02e974
       components:
-        control_plane: 15dfb9989e311767fe9d8fe29dbe6bcbc163752aa5b78ae1340fc74887b33b45
-        executor: ea81228c66e060bd0c68dc3f7ee64469b996937ef16ab45f7b92463f2ee6afdb
-        node_runtime: 4bcdfcfb5c1921fd1da6ed67cfc1e9d90a4c2e40ce56e222f92849d50e195f09
+        control_plane: ce6c118585972f0e39e31e4c3bc28e5ffa8354cfa7d3dff9790e7067263db51a
+        executor: 52d6405905947d23dbb65aada6963c3510ae1ee73f7c9d3ee8b30a9f2df12a02
+        node_runtime: 1588fd1d608692fc4077ebdcdb9eac0c3f6fe337ac5437d33d5b0962ef866e9c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-008
   related_pytest: tests/regional/test_destr008_main_safety.py::test_main_bounded_case_requires_real_safety_before_fixture_and_post
@@ -5603,7 +5609,13 @@ test_cases:
   - CloudTrail provider 变更动词集合为空
   - 分级节点 NVLS 可用性不在自动判定内：维护窗口内在该节点以 NCCL_NVLS_ENABLE=1 跑一次 8 GPU NCCL all-reduce，人工确认 NVLS 初始化成功
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 6480783338d56c1643ec70c34a2293723eb02bb3e35341a8e6c86db26b669d71
+      components:
+        control_plane: ce6c118585972f0e39e31e4c3bc28e5ffa8354cfa7d3dff9790e7067263db51a
+        executor: 52d6405905947d23dbb65aada6963c3510ae1ee73f7c9d3ee8b30a9f2df12a02
+        node_runtime: 1588fd1d608692fc4077ebdcdb9eac0c3f6fe337ac5437d33d5b0962ef866e9c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-010
 
@@ -5699,9 +5711,9 @@ test_cases:
     verified:
       case_digest: e3b55ce113a474bebff0366ff73c092655d80bc6b5ccc09042d2c8607a1970bd
       components:
-        control_plane: 15dfb9989e311767fe9d8fe29dbe6bcbc163752aa5b78ae1340fc74887b33b45
-        executor: ea81228c66e060bd0c68dc3f7ee64469b996937ef16ab45f7b92463f2ee6afdb
-        node_runtime: 4bcdfcfb5c1921fd1da6ed67cfc1e9d90a4c2e40ce56e222f92849d50e195f09
+        control_plane: ce6c118585972f0e39e31e4c3bc28e5ffa8354cfa7d3dff9790e7067263db51a
+        executor: 52d6405905947d23dbb65aada6963c3510ae1ee73f7c9d3ee8b30a9f2df12a02
+        node_runtime: 1588fd1d608692fc4077ebdcdb9eac0c3f6fe337ac5437d33d5b0962ef866e9c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-015
   related_pytest: tests/regional/test_destr015_parallel_branch_join.py::test_destr015_workflow_contract_requires_one_join_after_parallel_branches
@@ -5889,7 +5901,13 @@ test_cases:
   - "CloudTrail provider 变更动词集合为空；节点 Kubernetes 状态与基线逐字段相同，唯一例外是 HyperPod 上 quiesce 停 kubelet 带来的 Ready 翻转：RESTORE 恢复了 kubelet 时 ready_since 只能落在链上 RESTORE attempt 的区间内"
   - 清理后：fail-safe 定时器已解除且不留任何新增 gpu-fault timer、Agent 与 Fabric Manager 均 active、探针 Pod/ConfigMap 零残留、runtime identity 与 preflight 相同（开过窗时只允许 gpu-fault-control-worker 的 generation 恰好多两次滚动，pod template 摘要回到开窗前）
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 3672bd48a8f940559f60122d2a0b5c082bfd3f117a32d2290859135c755967ef
+      components:
+        control_plane: e627785658b2c8610ada2443d49de2e148fcde887d12ab5e7c17a4cbcbf931b9
+        executor: 26f64062eee832fe73b65e75e55c5126bb502a823082d3424a3ac68215fa078f
+        node_runtime: 3d3ee9f4b4c4d888733a8a1f0ea907ed54fa93299c175856ba2404c985a14abb
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-019
   related_pytest: tests/regional/test_destr019_node_probe.py::test_the_migration_drill_report_satisfies_the_case_verdict
@@ -5987,9 +6005,9 @@ test_cases:
     verified:
       case_digest: 3a83007748ea571fdd9497f3ac2d8a33ce6cbaab7f166abc6cd1efbd99764e2f
       components:
-        control_plane: 15dfb9989e311767fe9d8fe29dbe6bcbc163752aa5b78ae1340fc74887b33b45
-        executor: ea81228c66e060bd0c68dc3f7ee64469b996937ef16ab45f7b92463f2ee6afdb
-        node_runtime: 4bcdfcfb5c1921fd1da6ed67cfc1e9d90a4c2e40ce56e222f92849d50e195f09
+        control_plane: ce6c118585972f0e39e31e4c3bc28e5ffa8354cfa7d3dff9790e7067263db51a
+        executor: 52d6405905947d23dbb65aada6963c3510ae1ee73f7c9d3ee8b30a9f2df12a02
+        node_runtime: 1588fd1d608692fc4077ebdcdb9eac0c3f6fe337ac5437d33d5b0962ef866e9c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-022
   related_pytest: tests/regional/test_destr022_spare_reservation_reclaim.py::test_the_counter_verdict_requires_the_increment_only_on_a_rewritten_breadcrumb
@@ -6093,9 +6111,9 @@ test_cases:
     verified:
       case_digest: e036983dae60397849527897dbb712fcd06e0b9ce5a00b0fc975650cd925f0ff
       components:
-        control_plane: 8b3eb946d3086ee192cd1b0ae3fd5aa6da3792b12143e8a14a88b02c6d0f66b8
-        executor: 5a641f18601cc619b210037d96cc3d79f7dcede11f903b9d1f5b6e995eab9d5b
-        node_runtime: e16d06e8916c82cfe9e686b9678f535b143bc7b469ac54d613a1953c59782eca
+        control_plane: ce6c118585972f0e39e31e4c3bc28e5ffa8354cfa7d3dff9790e7067263db51a
+        executor: 52d6405905947d23dbb65aada6963c3510ae1ee73f7c9d3ee8b30a9f2df12a02
+        node_runtime: 1588fd1d608692fc4077ebdcdb9eac0c3f6fe337ac5437d33d5b0962ef866e9c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-025
   related_pytest: tests/regional/test_destr025_verdicts.py::test_in_record_reboot_without_successor_is_the_pass_shape
@@ -6133,7 +6151,13 @@ test_cases:
   - reset 已执行之后才到达的第二个故障不由本用例驱动：作业 join 未开始时产品追加节点后继分支（BRANCH_SUCCESSOR_QUEUED，已下发的 RESET_GPU 不改写，join 依赖两条分支的 RESTORE_SCHEDULING，作业仍只重启一次）；join 已开始时另开后继工作流并再停止、再重启作业一次；两种形状由单元测试固定
   - 清理后：测试作业已删除且远端命令静默；采样器已停止，探针 Pod/ConfigMap 与预热 Pod 无残留；故障节点重新应答之前不被 exec；若节点仍隔离，只允许经 validated restore 工作流解除
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 95e77985231f9feaa9c4c9f43c96617698cbda3c6e3aac648afaf3f9b4cd3fa1
+      components:
+        control_plane: ce6c118585972f0e39e31e4c3bc28e5ffa8354cfa7d3dff9790e7067263db51a
+        executor: 52d6405905947d23dbb65aada6963c3510ae1ee73f7c9d3ee8b30a9f2df12a02
+        node_runtime: 1588fd1d608692fc4077ebdcdb9eac0c3f6fe337ac5437d33d5b0962ef866e9c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-026
   related_pytest: tests/regional/test_destr026_same_node_two_gpu_reset.py::test_the_single_window_two_gpu_reset_is_the_pass_shape
@@ -6169,7 +6193,13 @@ test_cases:
   - 两台节点 Ready、可调度、无 gpu-fault taint 与 ownership 注解；两节点上没有本用例留下的未关闭工作流或 incident；采样器停止，探针资源无残留
   - 结果记录 window_clear_at（两条首次准入加 600 s）：同一集群的下一条破坏性用例在其后开始，否则两条用例的节点会在 breaker 窗口里一起计数
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 98e7eeda8da16dfeb9aeb0e9fcf0f03e028c1b02e109ca377af33396d6d570b2
+      components:
+        control_plane: ce6c118585972f0e39e31e4c3bc28e5ffa8354cfa7d3dff9790e7067263db51a
+        executor: 52d6405905947d23dbb65aada6963c3510ae1ee73f7c9d3ee8b30a9f2df12a02
+        node_runtime: 1588fd1d608692fc4077ebdcdb9eac0c3f6fe337ac5437d33d5b0962ef866e9c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-027
   related_pytest: tests/regional/test_workload_domain_oracle.py::test_two_idle_nodes_in_parallel_are_the_pass_shape
@@ -6206,7 +6236,13 @@ test_cases:
   - 两台被 reboot 的 master 满足 DESTR-002 的 reboot 证明（事件为 XID 79、裁决 REBOOT_NODE、工作流步骤按序各恰一次且成功、无物理 GPU 操作、Node Agent 以新 boot 回到 ACTIVE 且制品不变、节点 boot_id 变化而 UID 与 GPU 容量不变；provider 提交记录是 DESTR-002 自己的判定对象，本用例不读）；两节点作业的健康 worker 未被重启（boot_id 不变）且 Ready；两个作业各只停一次、只重启一次；无 provider 变更超出两次 reboot；控制面 EKS 状态不变
   - 全部目标节点 Ready、可调度、无 gpu-fault taint 与 ownership 注解；两个测试作业被删除、采集器停止、探针与 prewarm 资源无残留；结果记录 window_clear_at（两条首次准入加 600 s），同一集群的下一条破坏性用例在其后开始
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 8ebc5243fc7a3c9c4a6ef3ed8ef3d2911fdd9528cd524c73388a9aff2c9ebd55
+      components:
+        control_plane: ce6c118585972f0e39e31e4c3bc28e5ffa8354cfa7d3dff9790e7067263db51a
+        executor: 52d6405905947d23dbb65aada6963c3510ae1ee73f7c9d3ee8b30a9f2df12a02
+        node_runtime: 1588fd1d608692fc4077ebdcdb9eac0c3f6fe337ac5437d33d5b0962ef866e9c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-028
   related_pytest: tests/regional/test_workload_domain_oracle.py::test_two_jobs_in_parallel_carry_the_job_scopes
@@ -6239,7 +6275,13 @@ test_cases:
   - 作业 master 满足 DESTR-002 的 reboot 证明，空闲节点满足 DESTR-001 的物理断言（采样器看到目标 GPU 离开并回来、ledger 恰一条 RESET_GPU）；无 provider 变更超出一次 reboot；控制面 EKS 状态不变
   - 三台节点 Ready、可调度、无 gpu-fault taint 与 ownership 注解；测试作业被删除、采集器停止、探针与 prewarm 资源无残留；结果记录 window_clear_at
   evidence:
-    verdict: NOT_RUN
+    verdict: PASS
+    verified:
+      case_digest: 7ae5db8df3955b5cc4633867cf7dcf4c6ba8c2804d78a0c95b10b6d8dc13c800
+      components:
+        control_plane: ce6c118585972f0e39e31e4c3bc28e5ffa8354cfa7d3dff9790e7067263db51a
+        executor: 52d6405905947d23dbb65aada6963c3510ae1ee73f7c9d3ee8b30a9f2df12a02
+        node_runtime: 1588fd1d608692fc4077ebdcdb9eac0c3f6fe337ac5437d33d5b0962ef866e9c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-029
   related_pytest: tests/regional/test_workload_domain_oracle.py::test_a_job_and_an_idle_node_in_parallel_are_the_pass_shape
@@ -6444,9 +6486,9 @@ test_cases:
     verified:
       case_digest: 0bb9ebcd573682e3abfd8463c8212e27e609abe2668fa938a14b5a453fa20a2f
       components:
-        control_plane: 15dfb9989e311767fe9d8fe29dbe6bcbc163752aa5b78ae1340fc74887b33b45
-        executor: ea81228c66e060bd0c68dc3f7ee64469b996937ef16ab45f7b92463f2ee6afdb
-        node_runtime: 4bcdfcfb5c1921fd1da6ed67cfc1e9d90a4c2e40ce56e222f92849d50e195f09
+        control_plane: ce6c118585972f0e39e31e4c3bc28e5ffa8354cfa7d3dff9790e7067263db51a
+        executor: 52d6405905947d23dbb65aada6963c3510ae1ee73f7c9d3ee8b30a9f2df12a02
+        node_runtime: 1588fd1d608692fc4077ebdcdb9eac0c3f6fe337ac5437d33d5b0962ef866e9c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-e2e-001
 - id: GF-REGIONAL-E2E-002
@@ -6540,9 +6582,9 @@ test_cases:
     verified:
       case_digest: 7da62a60e7db84c367999e01e62de832c49605d9455517bd5608a0bc24a1fe15
       components:
-        control_plane: 6894b8daa89b847694661b48ac593ee94bf08a97aac8b2b97a4ef8b7a53050b3
-        executor: ea81228c66e060bd0c68dc3f7ee64469b996937ef16ab45f7b92463f2ee6afdb
-        node_runtime: 4bcdfcfb5c1921fd1da6ed67cfc1e9d90a4c2e40ce56e222f92849d50e195f09
+        control_plane: ce6c118585972f0e39e31e4c3bc28e5ffa8354cfa7d3dff9790e7067263db51a
+        executor: 52d6405905947d23dbb65aada6963c3510ae1ee73f7c9d3ee8b30a9f2df12a02
+        node_runtime: 1588fd1d608692fc4077ebdcdb9eac0c3f6fe337ac5437d33d5b0962ef866e9c
   # Prior binding preserved in docs/evidence/fault/bindings/superseded-acceptance-bindings-20260915.json.
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-020
@@ -6636,9 +6678,9 @@ test_cases:
     verified:
       case_digest: 6c327510b0dc73446869d85032f571cfa7be2f5895bc394c97be73f86d86b5bf
       components:
-        control_plane: 6894b8daa89b847694661b48ac593ee94bf08a97aac8b2b97a4ef8b7a53050b3
-        executor: ea81228c66e060bd0c68dc3f7ee64469b996937ef16ab45f7b92463f2ee6afdb
-        node_runtime: 4bcdfcfb5c1921fd1da6ed67cfc1e9d90a4c2e40ce56e222f92849d50e195f09
+        control_plane: ce6c118585972f0e39e31e4c3bc28e5ffa8354cfa7d3dff9790e7067263db51a
+        executor: 52d6405905947d23dbb65aada6963c3510ae1ee73f7c9d3ee8b30a9f2df12a02
+        node_runtime: 1588fd1d608692fc4077ebdcdb9eac0c3f6fe337ac5437d33d5b0962ef866e9c
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-023
   related_pytest: tests/regional/test_boot023_release_history.py::test_the_real_parser_refuses_the_flag_and_the_verdict_accepts_its_message
