@@ -157,6 +157,10 @@ def test_record_bound_scales_with_the_run_and_bulk_batches_skip_cas_kinds() -> N
     assert data.record_bound([f"perf-cap-{i:03d}" for i in range(50)]) == 200_000, (
         "50 clusters get 4000 records each"
     )
+    thirty_two = [f"perf-cap-{i:03d}" for i in range(32)]
+    assert data.record_bound(thirty_two, agents=8192) >= 271_140, (
+        "the b223 r1 run: 32 clusters of 256 registered GPU nodes each"
+    )
     records = {
         ("workflow", "w-1"): {},
         ("remote_command", "c-1"): {},
@@ -175,6 +179,61 @@ def test_record_bound_scales_with_the_run_and_bulk_batches_skip_cas_kinds() -> N
         len(keys) for kind, keys in batches if kind == "telemetry_metric_latest"
     ] == [5000, 1], "hot-state keys are deleted in bounded batches"
     assert ("collector_status", ["s-1"]) in batches, "every other kind is bulk-deleted"
+
+
+def test_the_walk_bound_counts_the_runs_agents() -> None:
+    """A fleet's Agents and their latest telemetry are the run's own records:
+    with them in scope the walk takes what one cluster alone would refuse."""
+
+    owned = {"cluster_id": "perf-cap-000"}
+    agents = [("agent", f"fleet-node-run-c000-n{i:04d}", owned) for i in range(3200)]
+    telemetry = [("telemetry_metric_latest", f"t-{i}", owned) for i in range(100_000)]
+
+    records = data.scope_records(Cursor(agents + telemetry, incidents={}), CLUSTERS)
+
+    assert len(records) == 103_200, "every Agent and latest row of the run"
+    one_more = [("telemetry_metric_latest", "t-extra", owned)]
+    with pytest.raises(RuntimeError, match="record bound exceeded"):
+        data.scope_records(Cursor(telemetry + one_more, incidents={}), CLUSTERS)
+
+
+def test_the_reference_lookup_leaves_out_hot_state_keys_and_links_keep_them() -> None:
+    """Nothing references an Agent, latest-telemetry, status or inventory key,
+    so the walk does not send them; the link lookup still matches every key."""
+
+    owned = {"cluster_id": "perf-cap-000"}
+    records = {
+        ("agent", "fleet-node-run-c000-n0000"): owned,
+        ("telemetry_metric_latest", "t-1"): owned,
+        ("collector_status", "s-1"): owned,
+        ("gpu_inventory_snapshot", "g-1"): owned,
+        ("incident", "i-1"): owned,
+        ("raw_evidence", "e-1"): {**owned, "event_id": "event-1"},
+    }
+
+    referenced = data.record_identifiers(records, referenced_only=True)
+
+    assert referenced == ["e-1", "event-1", "i-1"], referenced
+    assert len(data.record_identifiers(records)) == 7, "links match every key"
+
+    class Recording(Cursor):
+        def __init__(self, *args: Any) -> None:
+            super().__init__(*args)
+            self.sent: list[list[str]] = []
+
+        def execute(self, query: Any, params: Any = None) -> None:
+            text = query if isinstance(query, str) else query.as_string(None)
+            if "'event_id'" in text:
+                self.sent.append(list(params[0]))
+            super().execute(query, params)
+
+    cursor = Recording(
+        [(kind, key, payload) for (kind, key), payload in records.items()], {}
+    )
+    walked = data.scope_records(cursor, CLUSTERS)
+
+    assert set(walked) == set(records), "the walk keeps every scoped record"
+    assert cursor.sent == [referenced], cursor.sent
 
 
 def test_open_synthetic_records_are_listed_for_the_forced_teardown() -> None:
