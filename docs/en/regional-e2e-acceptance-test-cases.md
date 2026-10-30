@@ -3284,7 +3284,8 @@ state is not a successful cleanup either.
   to delete the symlinks that `configs` left under `dist/<release_id>/`, returning the worktree to its pre-run state. The expected classifications of `check` against live are, in order,
   `NOOP` / `CONTROL_PLANE_ONLY` / `DATA_PLANE_COMPATIBLE` (executor only) /
   `DATA_PLANE_COMPATIBLE` (+node runtime and bundle) / `FULL`; the FULL config's
-  `agent_config_digest` must be recomputed for the suffixed Profile version (the tool does this built-in), otherwise
+  `agent_config_digest` must be recomputed for the suffixed Profile version and with the site's node-side declarations
+  (`spec.diagnosticS3Uri`, which every node's Agent hashes as well; the tool does this built-in), otherwise
   the first Agent wave never sees a matching config digest.
   `--replicas-delta` cannot be taken mechanically as `+1`: the connection budget includes the listener, and growing the default workers from 6 to 7
   may exceed the existing budget; pick a change the current site can absorb, for example a valid `6 -> 5`; the budget must not be raised nor
@@ -3322,7 +3323,11 @@ state is not a successful cleanup either.
   AdminConfig transaction or overwrite unpublished administrator edits. The runner first goes through the real
   `gpu-fault-admin config` to perform the dry-run, approve the apply, repeat the NOOP and restore, checking the site lock,
   pending/audit and the exact CPU role scope; this is recorded separately from the later low-level release-engine fault injection,
-  and engine calls are not passed off as a public CLI closed loop.
+  and engine calls are not passed off as a public CLI closed loop. When the CLI refuses a step, the error carries the CLI's
+  own last `gpu-fault-admin:` line and its log path (`full output in ...`), and asks to keep pending state and audit only when
+  `admin-config/pending.json` exists; when the apply never happened and nothing is pending, the runner puts the committed
+  config back into the `admin-config.yaml` it wrote the drill value into (left alone once someone else changed the file or
+  the desired config moved).
   The runner checks the classifications mechanically; before and after NOOP it compares the generation of every CPU/GPU Deployment;
   CONTROL_PLANE_ONLY, Executor-only and Agent-only each inject an automatic rollback and check the
   component-level compensation scope and `T_safe/T_full`; Executor-only additionally injects an interruption after `cpu-staged`,
@@ -3384,6 +3389,20 @@ state is not a successful cleanup either.
     according to the rollback record. At the end of the case the site is back on its own committed release; subsequent cases need no additional deploy.
   - Output `boot023-noop.json` under this case's directory (i.e. the site config used for the restore); its digest is written to
     `final_noop_handoff`; the subsequent BOOT-023 uses this config to judge the restored live as `NOOP`.
+  - A run from the beginning (no `--resume` and starting at `noop`, or a `--resume` whose evidence holds no public
+    AdminConfig roundtrip yet) requires live to be the site's own committed release: phase `complete`,
+    `transaction_committed` true, and the release id of the snapshot the candidates derive from (with explicit configs,
+    the live release of `source-deploy-success.json`). Otherwise `--plan` records `preflight_passed=false` with
+    `details.preflight_errors` naming the phase, release id, commit flag and the way out -- `--resume` on the interrupted
+    run's directory; `--execute` reads the live state again before it builds candidates or touches the site and refuses
+    the same way.
+  - When `--resume` converges and live still holds an open forward transaction of one of the drill's own configs
+    (release id and AdminConfig digest both match, in a phase the engine resumes, e.g. candidate D interrupted in
+    `data-plane-progress`), it first finishes it the way `gpu-fault-admin deploy` does (`run_resume`, automatic rollback
+    on) and records that in the `convergence` history, then handles a pending rollback and deploys the previous stage's
+    config; if the forward transaction is still open afterwards the convergence stops. A release transaction that does not
+    belong to the drill is never resumed. The `complete` but uncommitted candidate every stage leaves is not an open
+    transaction.
   - `--resume` and `--start-stage` likewise cover the `restore` stage: when its pass marker
     `restore_passed` exists it is not replayed; when missing, live is first converged to the preconditions of `full` and then rerun.
 
