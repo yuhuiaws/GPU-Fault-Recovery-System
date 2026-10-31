@@ -4,7 +4,9 @@ The two scripts ``general_live_progress`` runs through ``cpu_python`` in an
 API Pod, kept apart from the fixture module (the architecture gate's
 1500-line file cap). Both are read-only against the product's own records;
 the scan trigger exercises the product's execution-token route and nothing
-else.
+else. ``HEARTBEAT_POST`` runs in the test job's own reporter sidecar instead
+and sends one heartbeat through the product's ingest route, as the reporter
+does (027 ``old_attempt``'s foreign attempt).
 """
 
 from __future__ import annotations
@@ -28,6 +30,11 @@ from __future__ import annotations
 #: observation (phase, containers with rank, node, Pod UID and container name)
 #: and the control plane's clock at the read are kept so a binding, phase or
 #: clock cause is visible in ``training-records.json`` next time.
+#:
+#: ``argv[6]`` (optional) names further attempt ids, comma-separated, whose
+#: stored progress states are listed as ``other_progress_states``: 027
+#: ``old_attempt`` proves that the heartbeat it posted for an attempt the
+#: product does not run left no state behind.
 TRAINING_PROBE = r"""
 import json
 import sys
@@ -39,6 +46,7 @@ from gpu_fault.store import NotFoundError
 
 cluster_id, node_list, job_id, attempt_id, since_text = sys.argv[1:6]
 node_ids = {item for item in node_list.split(",") if item}
+others = [item for item in (sys.argv[6] if len(sys.argv) > 6 else "").split(",") if item]
 since = datetime.fromisoformat(since_text.replace("Z", "+00:00"))
 store = ApplicationContext.from_environment().store
 
@@ -130,8 +138,21 @@ for notification in store.list_notifications(limit=500, newest_first=True):
         "status": result.status.value if result else None,
     })
 
+other_progress = {
+    other: [
+        {
+            "rank": state.heartbeat.rank,
+            "node_id": state.heartbeat.node_id,
+            "observed_at": state.heartbeat.observed_at.isoformat(),
+        }
+        for state in store.list_training_progress_states(cluster_id, other)
+    ]
+    for other in others
+}
+
 print(json.dumps({
     "progress_states": progress,
+    "other_progress_states": other_progress,
     "observation": observation,
     "incidents": incidents,
     "workflows": workflows,
@@ -139,6 +160,54 @@ print(json.dumps({
     "notifications": notifications,
     "probed_at": datetime.now(timezone.utc).isoformat(),
 }, sort_keys=True, default=str))
+"""
+
+#: Run in a reporter sidecar (``kubectl exec -c progress-reporter-<rank>``,
+#: the GPU runtime image's interpreter): POST one heartbeat for ``argv[1]``
+#: (an attempt id), rank ``argv[2]``, progress fields ``argv[3]`` (JSON) --
+#: built with the product's own heartbeat model and sent with the product's
+#: own collector client exactly as the reporter sends its own: the sidecar's
+#: control-plane URL, cluster token and CA (``SSL_CERT_FILE``), and the Pod
+#: identity the reporter reports (``NODE_NAME``, ``POD_UID``,
+#: ``CONTAINER_NAME``). One live attempt, no outbox and no retry
+#: (``HttpEventSink.deliver_once``), so the product's answer comes back to the
+#: runner instead of being buffered for a replay. Prints one JSON object: the
+#: heartbeat sent, and either the product's answer (``delivered`` true,
+#: ``body`` = ``TrainingHealthResult``) or the client's error and HTTP status.
+#: Never prints the token.
+HEARTBEAT_POST = r"""
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+from gpu_fault.channel_registry import TRAINING_PROGRESS_PATH
+from gpu_fault.collectors.sinks import CollectorError, HttpEventSink
+from gpu_fault.training_models import TrainingProgressHeartbeat
+
+attempt_id, rank, fields = sys.argv[1], int(sys.argv[2]), json.loads(sys.argv[3])
+heartbeat = TrainingProgressHeartbeat(
+    cluster_id=os.environ["GPU_FAULT_CLUSTER_ID"],
+    attempt_id=attempt_id,
+    rank=rank,
+    observed_at=datetime.now(timezone.utc),
+    node_id=os.environ.get("NODE_NAME") or None,
+    pod_uid=os.environ.get("POD_UID") or None,
+    container_name=os.environ.get("CONTAINER_NAME") or None,
+    **fields,
+)
+payload = heartbeat.model_dump(mode="json")
+sink = HttpEventSink(
+    os.environ["GPU_FAULT_CONTROL_PLANE_URL"],
+    bearer_token=os.environ.get("GPU_FAULT_CONTROL_PLANE_TOKEN"),
+    timeout_seconds=30,
+)
+answer = {"heartbeat": payload}
+try:
+    answer.update(delivered=True, body=sink.deliver_once(TRAINING_PROGRESS_PATH, payload))
+except CollectorError as exc:
+    answer.update(delivered=False, status=exc.status_code, error=str(exc)[:500])
+print(json.dumps(answer, sort_keys=True, default=str))
 """
 
 #: Trigger one cluster scan through the product route (execution token); the

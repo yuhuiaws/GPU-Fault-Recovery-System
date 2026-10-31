@@ -55,8 +55,18 @@ from scripts.e2e.regional.general_live_fixture import (
     utc_now,
 )
 from scripts.e2e.regional.general_live_progress_probes import (
+    HEARTBEAT_POST,
     SCAN_POST,
     TRAINING_PROBE,
+)
+from scripts.e2e.regional.general_live_progress_verdicts import (
+    RESUMED_STEP,
+    STALLED_STEP,
+    foreign_refusal,
+    foreign_state_errors,
+    live_kept_errors,
+    rank_states,
+    validated_by_progress,
 )
 from scripts.e2e.regional.general_live_registry import (
     HARDWARE_OPERATIONS,
@@ -185,6 +195,13 @@ STOP_REPORTER = (
     "done\n"
     'printf \'%s\\n%s\\n\' "$pid" "$state"\n'
 )
+#: ``old_attempt``: the attempt id its heartbeat claims -- the job's own id
+#: with an attempt number the product never ran (the live one is ``-a001``), so
+#: the product holds no RUNNING/PENDING allocation for it -- and how long the
+#: live attempt is watched after the post (three reporter intervals: its own
+#: next heartbeats must still be accepted).
+FOREIGN_ATTEMPT_SUFFIX = "-a000"
+FOREIGN_SETTLE_SECONDS = 45
 #: Operations a training-progress chain must never contain: no hardware action,
 #: no node isolation, no automatic workload restart. STOP_WORKLOADS is allowed
 #: for the NaN/checkpoint branch only (and is asserted there explicitly).
@@ -466,6 +483,42 @@ class ManagedProgressJob:
             input_text=payload,
         )
 
+    def post_heartbeat(
+        self, rank: int, attempt_id: str, **fields: Any
+    ) -> dict[str, Any]:
+        """POST one heartbeat claiming ``attempt_id`` from rank ``rank``'s
+        reporter sidecar (``HEARTBEAT_POST``: the product's own model and
+        client, the sidecar's connection and Pod identity, one attempt) and
+        return what the script printed: the heartbeat and the product's answer,
+        or the client's error. Output that is not that object is an answer of
+        its own (``delivered`` false), never an exception."""
+
+        output = self.ctx.regional.kubectl(
+            "gpu",
+            "exec",
+            self.pod_for(rank),
+            "-c",
+            f"progress-reporter-{rank}",
+            "--",
+            component_python("gpu"),
+            "-c",
+            HEARTBEAT_POST,
+            attempt_id,
+            str(rank),
+            json.dumps(
+                {key: value for key, value in fields.items() if value is not None}
+            ),
+            timeout=120,
+        )
+        lines = [line for line in str(output).splitlines() if line.strip()]
+        try:
+            answer = json.loads(lines[-1])
+        except (IndexError, ValueError):
+            answer = None
+        if not isinstance(answer, dict):
+            return {"delivered": False, "error": f"unparseable: {str(output)[-300:]}"}
+        return answer
+
     def stop_reporter(self, rank: int) -> dict[str, Any]:
         pod = self.pod_for(rank)
         return self.ctx.regional.kubectl(
@@ -679,16 +732,24 @@ def _job_nodes(ctx: VariantContext, job: Any) -> str:
 
 
 def _records(
-    ctx: VariantContext, job: ManagedProgressJob, since: Any
+    ctx: VariantContext,
+    job: ManagedProgressJob,
+    since: Any,
+    *,
+    others: tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    document = ctx.regional.cpu_python(
-        TRAINING_PROBE,
+    """The job's training records (``TRAINING_PROBE``); ``others`` adds the
+    stored progress states of further attempt ids."""
+
+    arguments = [
         ctx.settings.regional.cluster_id,
         _job_nodes(ctx, job),
         job.name,
         job.attempt_id,
         since.isoformat(),
-    )
+        *([",".join(others)] if others else []),
+    ]
+    document = ctx.regional.cpu_python(TRAINING_PROBE, *arguments)
     ctx.evidence.write("training-records", document)
     return document
 
@@ -1172,32 +1233,62 @@ def bounded_phase(ctx: VariantContext) -> dict[str, Any]:
 
 
 def old_attempt(ctx: VariantContext) -> dict[str, Any]:
+    """A heartbeat claiming an attempt the product does not run controls nothing.
+
+    The live attempt's own heartbeat is in the store first (the positive
+    control: the ingest accepts this job's reporter). Then rank 0's reporter
+    sidecar POSTs one heartbeat claiming ``<job>-a000`` -- the job's id with an
+    attempt number the product never ran, the live Pod's identity, and a NaN,
+    the payload that stops an attempt once accepted -- through the product's
+    ingest route. The product must answer ``accepted=false``, keep no progress
+    for that attempt, raise no training finding, STOP or restart, and keep
+    accepting the live attempt's own heartbeats. An answer that is not the
+    ingest's grading (a transport or HTTP error) refused nothing: INCONCLUSIVE.
+    """
+
     run_survey(ctx)
     job = _job(ctx, "old")
     started = utc_now()
     job.write_progress(0, step=10, loss=1.0)
     ctx.hold(20, name="old-run")
-    # A heartbeat for a foreign/old attempt id must be refused at ingest and
-    # must not stop or restart the live attempt.
-    foreign = job.write_progress(0, step=10, loss=1.0)
-    ctx.evidence.write("old-attempt-foreign", {"exec": str(foreign)[:200]})
-    records = _records(ctx, job, started)
+    before = _records(ctx, job, started)
+    if not rank_states(before, 0):
+        raise VariantInconclusive(
+            "the live attempt's own heartbeat never reached the store, so a "
+            "refused foreign one would prove nothing: progress states "
+            f"{before.get('progress_states')}"
+        )
+    foreign = f"{job.name}{FOREIGN_ATTEMPT_SUFFIX}"
+    answer = job.post_heartbeat(0, foreign, step=10, loss=1.0, numerical_error=True)
+    ctx.evidence.write("old-attempt-foreign", answer)
+    refused = foreign_refusal(answer, foreign)
+    ctx.hold(FOREIGN_SETTLE_SECONDS, name="old-settle")
+    records = _records(ctx, job, started, others=(foreign,))
     stages = {
+        "refused": refused,
+        "not_recorded": foreign_state_errors(records, foreign),
         "no_stop": []
         if not any(
             "STOP_WORKLOADS" in operations(_workflow(records, item))
             for item in records.get("incidents") or []
         )
-        else ["an old/foreign attempt stopped the live attempt"],
+        else ["a heartbeat of an attempt the product does not run stopped work"],
         "no_finding": []
         if not records.get("incidents")
-        else ["a training incident was raised for a healthy live attempt"],
+        else [
+            "training incidents were raised beside the healthy live attempt: "
+            + ", ".join(str(item.get("event_id")) for item in records["incidents"])
+        ],
+        "no_restart": _no_restart_errors(records),
+        "live_attempt_kept": live_kept_errors(records, answer),
     }
     return _result(
         stages,
         notes=[
-            "a stale/foreign attempt heartbeat is accepted=False and controls nothing"
+            "a heartbeat for an attempt the product does not run is accepted=false "
+            "and controls nothing, even when it carries a NaN"
         ],
+        extra={"foreign_attempt": foreign, "foreign_answer": answer.get("body")},
     )
 
 
@@ -1205,11 +1296,11 @@ def resumed_progress(ctx: VariantContext) -> dict[str, Any]:
     run_survey(ctx)
     job = _job(ctx, "resume")
     started = utc_now()
-    job.write_progress(0, step=10, loss=1.0)
+    job.write_progress(0, step=STALLED_STEP, loss=1.0)
     ctx.hold(
         HEARTBEAT_TIMEOUT + 30,
         name="resume-stall",
-        check=lambda: job.write_progress(0, step=10, loss=1.0),
+        check=lambda: job.write_progress(0, step=STALLED_STEP, loss=1.0),
     )
     records, incident = _wait_incident(
         ctx, job, "hang", started, name="resume", scan=True
@@ -1220,14 +1311,16 @@ def resumed_progress(ctx: VariantContext) -> dict[str, Any]:
     # flight (its VALIDATE_FABRIC waits for evidence newer than itself); only
     # that clears the stall. RECOVERED is the chain's terminal write: judge the
     # record once it has settled, from a read after the new progress.
-    job.write_progress(0, step=11, loss=1.0)
+    job.write_progress(0, step=RESUMED_STEP, loss=1.0)
     records, recovered, settle = _settle(ctx, job, "hang", started, None, name="resume")
     state = (recovered or {}).get("state")
     stages = {
         "recovered": []
         if state == "RECOVERED"
         else [f"the stall incident is {state}, not RECOVERED"],
-        "validated_by_progress": _validated_by_progress(records, recovered or {}, job),
+        "validated_by_progress": validated_by_progress(
+            records, recovered or {}, job.attempt_id
+        ),
     }
     return _result(
         stages,
@@ -1287,25 +1380,6 @@ def _straggler_scope(
         and reference_node in (item.get("node_ids") or [])
     ]
     return ["the reference rank was flagged as its own straggler"] if offenders else []
-
-
-def _validated_by_progress(
-    records: dict[str, Any], recovered: dict[str, Any], job: ManagedProgressJob
-) -> list[str]:
-    workflow = (records.get("workflows") or {}).get(
-        str(recovered.get("workflow_request_id"))
-    ) or {}
-    for step in workflow.get("step_executions") or []:
-        if (
-            step.get("operation") == "VALIDATE_FABRIC"
-            and step.get("status") == "SUCCEEDED"
-        ):
-            details = step.get("details") or {}
-            if details.get("validated_attempt") in (None, job.attempt_id):
-                return []
-    # The recovery may have validated before this read; absence is not a hard
-    # failure once the incident is RECOVERED.
-    return []
 
 
 def _result(
@@ -1395,8 +1469,12 @@ VARIANTS = [
     ),
     _spec(
         "old_attempt",
-        "post a heartbeat with a stale/foreign attempt identity",
-        "the heartbeat is accepted=False and never stops or restarts the live attempt",
+        "rank 0's reporter sidecar POSTs one heartbeat claiming the job's never-run "
+        "attempt id <job>-a000 (the live Pod's identity, numerical_error=true) "
+        "through the product's ingest, after the live attempt's own heartbeat is stored",
+        "the ingest answers accepted=false and stores no progress for that attempt; "
+        "no training finding, STOP or restart; the live attempt stays RUNNING and "
+        "its own heartbeats are still accepted",
         old_attempt,
         risk="L",
     ),

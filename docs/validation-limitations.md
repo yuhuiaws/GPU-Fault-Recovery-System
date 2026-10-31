@@ -3724,6 +3724,33 @@ then the settled one), and a scripted workflow record now carries a terminal
 `status` and its step executions, as live records do; a record without them
 would never settle.
 
+027 `old_attempt` never posted its stimulus: its "foreign" heartbeat was one
+more write of the live attempt's own progress file, so the live reporter
+posted a heartbeat of the LIVE attempt and "nothing was stopped, no finding"
+held by construction. The variant now first requires the live attempt's own
+heartbeat in the store (otherwise INCONCLUSIVE: a refusal would prove
+nothing), then rank 0's reporter sidecar sends one heartbeat claiming
+`<job>-a000` -- the job's id with an attempt number the product never ran,
+the live Pod's identity, `numerical_error=true` (the payload that stops an
+attempt once accepted) -- through the product's ingest route with the
+product's own heartbeat model and collector client (`HEARTBEAT_POST`: the
+sidecar's connection, CA and Pod identity, one delivery, no outbox, no
+retry). It passes only when the ingest answers `accepted=false`, the store
+keeps no progress for that attempt (the records probe's new
+`other_progress_states`), no training finding, STOP or restart follows, and
+the live attempt stays RUNNING with its own heartbeats still accepted after
+the foreign one; an answer that is not the ingest's grading (a transport or
+HTTP error, unreadable output) is INCONCLUSIVE. A module test runs the
+script against the product's `TrainingHealthService.ingest` and the real
+records probe over an in-memory store: refused for the never-run attempt,
+accepted for the live one with the same identity. `resumed_progress`'s
+progress check returned nothing in every case; a RECOVERED stall now needs a
+SUCCEEDED VALIDATE_FABRIC whose recorded `validated_attempt` (the job's
+attempt), `validated_rank` (0) and `validated_step` (past the stalled step)
+come from the product's training validation (`validate_training`), or the
+variant FAILs: the stall was not cleared by the original rank's newer
+progress.
+
 The same pass failed 027 `straggler_group` (2026-10-26 09:54-10:06Z, plain EKS)
 with "no training_straggler finding reached an incident", and the records show
 why no product rule could have fired: the attempt's `progress_states` held rank

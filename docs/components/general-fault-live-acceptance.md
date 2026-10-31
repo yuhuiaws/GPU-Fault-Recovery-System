@@ -1495,6 +1495,18 @@ incident 的 `node_ids`、attempt 的观测（phase、容器 rank/节点/Pod UID
 只有 finding 文本、不含 rank）。记录读取不因任务对象的形状抛错：未声明 `rank_nodes`（或某 rank 无
 节点）的任务按车道节点读取；027 测试模块的任务替身带真实任务的 `ranks`/`rank_nodes` 面（live20 预门禁的
 `reporter_silent` 回放用无此面的 `StoppedReporterJob`，曾在 `_job_nodes` 崩溃），并断言其记录读取只带车道节点。
+`old_attempt` 真正投递外来/旧 attempt 的心跳：先确认活跃 attempt 自己的心跳已入库（正向对照，
+否则 INCONCLUSIVE），再由 rank 0 的 reporter sidecar 用产品自己的心跳模型与采集器客户端
+（`HEARTBEAT_POST`：sidecar 的连接、CA 与 Pod 身份，单次投递，无 outbox、无重试）向 ingest 路由投递
+一条声称 `<job>-a000`（该任务从未运行的 attempt 编号）的心跳，并带 `numerical_error=true`——一旦被
+接受就会停止 attempt 的负载。PASS 要求：ingest 应答 `accepted=false`（应答不是 ingest 的判定，如传输或
+HTTP 错误，记 INCONCLUSIVE）；存储中没有该 attempt 的进度（记录探针的 `other_progress_states`）；无训练
+finding、无 STOP、无重启；活跃 attempt 仍为 RUNNING，且外来心跳之后仍有自己的心跳被接受。此前该变体
+只是再写一次活跃 attempt 自己的进度文件（reporter 随后上报的仍是活跃 attempt 的心跳），从未出现外来身份，
+"无 STOP/无 finding" 只能空过。`resumed_progress` 的 `validated_by_progress` 此前恒为空；现在 RECOVERED
+的记录必须有 SUCCEEDED 的 VALIDATE_FABRIC，记下产品训练验证（`validate_training`）的 `validated_attempt`
+（本 attempt）、`validated_rank`（0）与大于停滞步数的 `validated_step`，否则 FAIL（恢复并非由原 rank 的
+新进度证明）。
 
 ### GF-GENERAL-LIVE-028
 

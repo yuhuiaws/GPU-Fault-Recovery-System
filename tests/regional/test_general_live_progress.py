@@ -41,6 +41,8 @@ class FakeProgressJob:
     created: list["FakeProgressJob"] = []
     #: What ``reporter_logs`` answers (the straggler diagnostic).
     logs: dict[str, str] = {}
+    #: What ``post_heartbeat`` answers (``HEARTBEAT_POST``'s printed object).
+    answer: dict[str, Any] = {}
 
     def __init__(
         self, ctx: Any, *, name: str, ranks: tuple[int, ...] = (0,), gpu_count: int = 8
@@ -54,6 +56,7 @@ class FakeProgressJob:
             for rank in ranks
         }
         self.writes: list[tuple[int, dict[str, Any]]] = []
+        self.posts: list[tuple[int, str, dict[str, Any]]] = []
         self.stopped: list[int] = []
         self.log_reads = 0
         FakeProgressJob.created.append(self)
@@ -73,6 +76,10 @@ class FakeProgressJob:
         self.writes.append((rank, fields))
         return {}
 
+    def post_heartbeat(self, rank: int, attempt_id: str, **fields: Any) -> dict:
+        self.posts.append((rank, attempt_id, fields))
+        return copy.deepcopy(FakeProgressJob.answer)
+
     def stop_reporter(self, rank: int) -> str:
         self.stopped.append(rank)
         return "4242\n\tT (stopped)\n"  # STOP_REPORTER's print: PID, State
@@ -89,6 +96,7 @@ class FakeProgressJob:
 def _patch_job(monkeypatch: pytest.MonkeyPatch) -> None:
     FakeProgressJob.created = []
     FakeProgressJob.logs = {}
+    FakeProgressJob.answer = {}
     monkeypatch.setattr(pr, "ManagedProgressJob", FakeProgressJob)
 
 
@@ -102,7 +110,9 @@ class RecordingStore:
     """A ``cpu_python`` double that serves the training-records documents in
     order (the last one repeats), answers the scan POST, and counts the reads --
     so a test can say how many store reads a verdict took -- keeping the node
-    list each records read was scoped to (``TRAINING_PROBE``'s ``argv[2]``)."""
+    list each records read was scoped to (``TRAINING_PROBE``'s ``argv[2]``).
+    ``{attempt}``/``{job}`` in a document are the attempt and job ids the read
+    asked for (``argv[4]``/``argv[3]``): both are derived inside ``execute``."""
 
     def __init__(self, *documents: dict[str, Any]) -> None:
         self.documents = list(documents)
@@ -118,7 +128,8 @@ class RecordingStore:
         self.node_arguments.append(arguments[1])
         document = self.documents[min(self.reads, len(self.documents) - 1)]
         self.reads += 1
-        return copy.deepcopy(document)
+        text = json.dumps(document).replace("{attempt}", arguments[3])
+        return json.loads(text.replace("{job}", arguments[2]))
 
 
 def _ctx(spec: Any, tmp_path: Path, doc: Any):
@@ -147,10 +158,17 @@ def _incident(kind: str, state: str = "ESCALATED", reasons=(), **fields: Any):
     }
 
 
-def _workflow(ops, *, status: str = "SUCCEEDED", executed: Any = None):
+def _workflow(
+    ops,
+    *,
+    status: str = "SUCCEEDED",
+    executed: Any = None,
+    details: dict[str, dict[str, Any]] | None = None,
+):
     """A scripted workflow record. As live, a record carries its ``status`` and
     one execution per step that ran; ``executed`` is the ``(operation, status)``
-    list of those, every planned step SUCCEEDED when omitted."""
+    list of those, every planned step SUCCEEDED when omitted; ``details`` are
+    the recorded details of an operation's execution."""
 
     if executed is None:
         executed = [(op, "SUCCEEDED") for op in ops]
@@ -159,7 +177,12 @@ def _workflow(ops, *, status: str = "SUCCEEDED", executed: Any = None):
             "status": status,
             "official_steps": [{"operation": op, "parameters": {}} for op in ops],
             "step_executions": [
-                {"operation": op, "status": state, "step_index": index}
+                {
+                    "operation": op,
+                    "status": state,
+                    "step_index": index,
+                    "details": dict((details or {}).get(op) or {}),
+                }
                 for index, (op, state) in enumerate(executed)
             ],
         }
@@ -343,16 +366,126 @@ def test_reporter_silent_fails_if_graded_as_hang(tmp_path: Path) -> None:
     assert any("hang" in item for item in result["errors"]), result["errors"]
 
 
-def test_old_attempt_passes_when_nothing_is_stopped(tmp_path: Path) -> None:
-    doc = {
+#: The foreign heartbeat as ``HEARTBEAT_POST`` stamped it, and the live
+#: attempt's own heartbeats before and after it (the same Pod clock).
+FOREIGN_SENT = "2026-10-24T00:01:00+00:00"
+LIVE_BEFORE = "2026-10-24T00:00:45+00:00"
+LIVE_AFTER = "2026-10-24T00:01:15+00:00"
+
+
+def _live_state(observed_at: str) -> dict[str, Any]:
+    return {"rank": 0, "step": 10, "loss": 1.0, "observed_at": observed_at}
+
+
+def _old_attempt_docs(
+    *, after: str = LIVE_AFTER, foreign_states: Any = (), incidents: Any = ()
+) -> RecordingStore:
+    """The records before the post (the live heartbeat stored) and after it."""
+
+    base = {
+        "workflows": {},
+        "decision": None,
+        "notifications": [],
+        "observation": {"workload_phase": "RUNNING"},
+    }
+    before = {**base, "progress_states": [_live_state(LIVE_BEFORE)], "incidents": []}
+    after_doc = {
+        **base,
+        "progress_states": [_live_state(after)],
+        "incidents": list(incidents),
+        "other_progress_states": {
+            "{job}" + pr.FOREIGN_ATTEMPT_SUFFIX: list(foreign_states)
+        },
+    }
+    return RecordingStore(before, after_doc)
+
+
+def _refused(accepted: bool = False) -> dict[str, Any]:
+    return {
+        "delivered": True,
+        "heartbeat": {"observed_at": FOREIGN_SENT},
+        "body": {"heartbeat_id": "hb-1", "accepted": accepted, "findings": []},
+    }
+
+
+def _run_old_attempt(
+    tmp_path: Path, store: RecordingStore, answer: dict[str, Any]
+) -> dict[str, Any]:
+    FakeProgressJob.answer = answer
+    return SPECS["old_attempt"].execute(_ctx(SPECS["old_attempt"], tmp_path, store))
+
+
+def test_old_attempt_without_a_stored_live_heartbeat_is_inconclusive(
+    tmp_path: Path,
+) -> None:
+    # The old fixture's shape: nothing in the store, nothing posted for any
+    # other attempt -- it used to PASS on "nothing was stopped".
+    empty = {
         "progress_states": [],
         "incidents": [],
         "workflows": {},
         "decision": None,
         "notifications": [],
     }
-    result = SPECS["old_attempt"].execute(_ctx(SPECS["old_attempt"], tmp_path, doc))
+    with pytest.raises(VariantInconclusive, match="live attempt's own heartbeat"):
+        SPECS["old_attempt"].execute(_ctx(SPECS["old_attempt"], tmp_path, empty))
+    assert FakeProgressJob.created[-1].posts == [], "nothing is posted without it"
+
+
+def test_old_attempt_posts_a_nan_for_the_never_run_attempt_and_passes_on_refusal(
+    tmp_path: Path,
+) -> None:
+    store = _old_attempt_docs()
+    result = _run_old_attempt(tmp_path, store, _refused())
     assert result["verdict"] == "PASS", result["errors"]
+    job = FakeProgressJob.created[-1]
+    foreign = job.name + pr.FOREIGN_ATTEMPT_SUFFIX
+    assert job.posts == [
+        (0, foreign, {"step": 10, "loss": 1.0, "numerical_error": True})
+    ], job.posts
+    assert foreign != job.attempt_id, "the claimed attempt is not the live one"
+    assert result["foreign_attempt"] == foreign
+    assert store.reads == 2, "one read before the post, one after the settle"
+
+
+def test_old_attempt_fails_when_the_ingest_accepts_the_foreign_heartbeat(
+    tmp_path: Path,
+) -> None:
+    stopped = _incident("nonfinite-loss", state="ESCALATED")
+    store = _old_attempt_docs(
+        foreign_states=[{"rank": 0, "observed_at": FOREIGN_SENT}], incidents=[stopped]
+    )
+    store.documents[1]["workflows"] = _workflow(("FREEZE_EVIDENCE", "STOP_WORKLOADS"))
+    result = _run_old_attempt(tmp_path, store, _refused(accepted=True))
+    assert result["verdict"] == "FAIL", result
+    failed = {stage for stage, errors in result["stages"].items() if errors}
+    assert failed == {"refused", "not_recorded", "no_stop", "no_finding"}, result
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"delivered": False, "status": 401, "error": "collector event rejected"},
+        {"delivered": False, "error": "unparseable: Traceback"},
+        {"delivered": True, "body": {}},
+    ],
+    ids=["http-error", "no-json", "no-grading"],
+)
+def test_old_attempt_is_inconclusive_when_the_ingest_never_graded_the_post(
+    tmp_path: Path, answer: dict[str, Any]
+) -> None:
+    with pytest.raises(VariantInconclusive, match="not graded by the product"):
+        _run_old_attempt(tmp_path, _old_attempt_docs(), answer)
+
+
+def test_old_attempt_fails_when_the_live_attempt_is_no_longer_heard(
+    tmp_path: Path,
+) -> None:
+    store = _old_attempt_docs(after=LIVE_BEFORE)
+    store.documents[1]["observation"] = {"workload_phase": "FAILED"}
+    result = _run_old_attempt(tmp_path, store, _refused())
+    assert result["verdict"] == "FAIL", result
+    assert len(result["stages"]["live_attempt_kept"]) == 2, result["stages"]
 
 
 # --------------------------------------------------------------------------- #
@@ -495,12 +628,27 @@ def test_nan_without_a_finding_settles_nothing(tmp_path: Path) -> None:
     }
 
 
-def _hang_doc(*, state: str, status: str, executed: Any) -> dict[str, Any]:
+#: What the product's training validation records on the VALIDATE_FABRIC that
+#: cleared the stall (``health_evidence_validation.validate_training``): the
+#: finding's own attempt and rank, at the step past the stalled one.
+VALIDATED = {
+    "validated_attempt": "{attempt}",
+    "validated_rank": 0,
+    "validated_step": 11,
+}
+
+
+def _hang_doc(
+    *, state: str, status: str, executed: Any, validated: Any = None
+) -> dict[str, Any]:
     return {
         "progress_states": [],
         "incidents": [_incident("hang", state=state)],
         "workflows": _workflow(
-            ("FREEZE_EVIDENCE", "VALIDATE_FABRIC"), status=status, executed=executed
+            ("FREEZE_EVIDENCE", "VALIDATE_FABRIC"),
+            status=status,
+            executed=executed,
+            details={"VALIDATE_FABRIC": validated or {}},
         ),
         "decision": None,
         "notifications": [],
@@ -512,7 +660,9 @@ HANG_IN_FLIGHT = _hang_doc(
     status="RUNNING",
     executed=[("FREEZE_EVIDENCE", "SUCCEEDED"), ("VALIDATE_FABRIC", "WAITING")],
 )
-HANG_RECOVERED = _hang_doc(state="RECOVERED", status="SUCCEEDED", executed=None)
+HANG_RECOVERED = _hang_doc(
+    state="RECOVERED", status="SUCCEEDED", executed=None, validated=VALIDATED
+)
 
 
 def test_resumed_progress_reads_after_the_new_progress_and_waits_for_the_settled_record(
@@ -529,6 +679,36 @@ def test_resumed_progress_reads_after_the_new_progress_and_waits_for_the_settled
     assert result["settled"]["polls"] == 2
     assert result["settled"]["state"] == "RECOVERED"
     assert store.scans >= 1, "the stall is minted by the scan"
+
+
+@pytest.mark.parametrize(
+    "validated",
+    [
+        {},
+        {**VALIDATED, "validated_step": 10},
+        {**VALIDATED, "validated_attempt": "another-attempt-a001"},
+        {**VALIDATED, "validated_rank": 1},
+    ],
+    ids=["no-progress-recorded", "stalled-step", "other-attempt", "other-rank"],
+)
+def test_resumed_progress_fails_when_recovered_without_the_ranks_newer_progress(
+    tmp_path: Path, validated: dict[str, Any]
+) -> None:
+    # The old check returned [] whatever the VALIDATE_FABRIC recorded: a
+    # RECOVERED stall passed with no proof the original rank moved on.
+    recovered = _hang_doc(
+        state="RECOVERED", status="SUCCEEDED", executed=None, validated=validated
+    )
+    store = RecordingStore(HANG_IN_FLIGHT, HANG_IN_FLIGHT, recovered)
+    result = SPECS["resumed_progress"].execute(
+        _ctx(SPECS["resumed_progress"], tmp_path, store)
+    )
+    assert result["verdict"] == "FAIL", result
+    (error,) = result["stages"]["validated_by_progress"]
+    assert error.startswith("no VALIDATE_FABRIC of the stall's workflow validated"), (
+        error
+    )
+    assert not result["stages"]["recovered"], result["stages"]
 
 
 def test_resumed_progress_fails_when_the_stall_settled_elsewhere(
