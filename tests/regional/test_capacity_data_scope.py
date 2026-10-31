@@ -158,8 +158,8 @@ def test_record_bound_scales_with_the_run_and_bulk_batches_skip_cas_kinds() -> N
         "50 clusters get 4000 records each"
     )
     thirty_two = [f"perf-cap-{i:03d}" for i in range(32)]
-    assert data.record_bound(thirty_two, agents=8192) >= 271_140, (
-        "the b223 r1 run: 32 clusters of 256 registered GPU nodes each"
+    assert data.record_bound(thirty_two, nodes=8192) >= 274_460, (
+        "the b223 runs: 32 clusters of 256 nodes, 27 latest rows a node"
     )
     records = {
         ("workflow", "w-1"): {},
@@ -181,20 +181,40 @@ def test_record_bound_scales_with_the_run_and_bulk_batches_skip_cas_kinds() -> N
     assert ("collector_status", ["s-1"]) in batches, "every other kind is bulk-deleted"
 
 
-def test_the_walk_bound_counts_the_runs_agents() -> None:
-    """A fleet's Agents and their latest telemetry are the run's own records:
-    with them in scope the walk takes what one cluster alone would refuse."""
+def test_the_walk_bound_counts_the_runs_nodes() -> None:
+    """Per-node hot state is the run's own: with 3,200 nodes in scope the walk
+    takes what the cluster floor alone would refuse. Node ids repeat across
+    clusters, so a node is a (cluster, node) pair."""
 
-    owned = {"cluster_id": "perf-cap-000"}
-    agents = [("agent", f"fleet-node-run-c000-n{i:04d}", owned) for i in range(3200)]
-    telemetry = [("telemetry_metric_latest", f"t-{i}", owned) for i in range(100_000)]
+    rows = [
+        (
+            "telemetry_metric_latest",
+            f"t-{node}-{metric}",
+            {"cluster_id": "perf-cap-000", "node_id": f"node-{node:04d}"},
+        )
+        for node in range(3200)
+        for metric in range(32)
+    ]
 
-    records = data.scope_records(Cursor(agents + telemetry, incidents={}), CLUSTERS)
+    records = data.scope_records(Cursor(rows, incidents={}), CLUSTERS)
 
-    assert len(records) == 103_200, "every Agent and latest row of the run"
-    one_more = [("telemetry_metric_latest", "t-extra", owned)]
+    assert len(records) == 102_400, "every latest row of the run's nodes"
+    assert (
+        data.scoped_nodes(
+            {
+                ("agent", "a"): {"cluster_id": "perf-cap-000", "node_id": "n"},
+                ("agent", "b"): {"cluster_id": "perf-cap-001", "node_id": "n"},
+                ("incident", "i"): {"cluster_id": "perf-cap-000"},
+            }
+        )
+        == 2
+    ), "one node id in two clusters is two nodes"
+    nodeless = [
+        ("telemetry_metric_latest", f"t-{i}", {"cluster_id": "perf-cap-000"})
+        for i in range(100_001)
+    ]
     with pytest.raises(RuntimeError, match="record bound exceeded"):
-        data.scope_records(Cursor(telemetry + one_more, incidents={}), CLUSTERS)
+        data.scope_records(Cursor(nodeless, incidents={}), CLUSTERS)
 
 
 def test_the_reference_lookup_leaves_out_hot_state_keys_and_links_keep_them() -> None:

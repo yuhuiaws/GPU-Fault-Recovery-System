@@ -42,20 +42,23 @@ REFERENCE_FIELDS = (
     "source_workflow_id",
 )
 MAX_RECORDS = 100_000
-# A 50-cluster run leaves ~2.5k hot-state rows per synthetic cluster (latest
-# telemetry, collector status and inventory snapshots per node); the walk's
-# bound scales with the run instead of refusing legitimate 50-cluster data.
+# The walk's bound scales with the run instead of refusing legitimate
+# 50-cluster data: a floor per cluster for what is not per node (incidents,
+# notifications, events) ...
 RECORDS_PER_CLUSTER = 4000
-# Every Agent registered in the run's clusters adds rows of its own on top: the
-# b220 healthy fleet (252 Agents a cluster beside the model's 4) took a
-# 32-cluster integrated run from 86,140 records to 271,140 (+8,064 Agents,
-# +180,224 latest-telemetry rows; about 23 an Agent) against a 128,000 bound,
-# and the teardown refused the whole run (b223 perf r1).
-RECORDS_PER_AGENT = 32
+# ... and an allowance per node. Per-node hot state grows with the nodes: a synthetic
+# node now leaves 27 latest-telemetry rows (13 per-disk IO, 3+3 filesystems, 2
+# await, 6 host gauges; it was 5), so 32 clusters of 256 nodes held 260,452
+# records (burst-32) and 274,460 with the b220 fleet's Agents (integrated-32)
+# against a 128,000 bound, and both teardowns refused their runs (b223 perf).
+# Every (cluster, node) the walk's first read names allows RECORDS_PER_NODE
+# more: about 32 observed (latest telemetry, collector status, inventory,
+# Agent), half again for headroom.
+RECORDS_PER_NODE = 48
 # Per-node hot state nothing points at: REFERENCE_FIELDS carry event, incident,
 # notification and workflow ids, never these kinds' keys, so the walk's
 # reference lookup leaves them out (the link lookup keeps every key). With a
-# fleet run's 270k Agent, latest-telemetry, status and inventory keys in it the
+# run's 270k Agent, latest-telemetry, status and inventory keys in it the
 # lookup took 158 s, past the cleanup transaction's 120-s statement timeout;
 # without them 16 s for the same 274,460 records (b223 perf r1 residue,
 # compared read-only).
@@ -72,10 +75,22 @@ BULK_DELETE_BATCH = 5000
 REGISTRY_LOOKBACK = 20
 
 
-def record_bound(cluster_ids: list[str], agents: int = 0) -> int:
+def record_bound(cluster_ids: list[str], nodes: int = 0) -> int:
     return max(
         MAX_RECORDS,
-        RECORDS_PER_CLUSTER * len(cluster_ids) + RECORDS_PER_AGENT * agents,
+        RECORDS_PER_CLUSTER * len(cluster_ids) + RECORDS_PER_NODE * nodes,
+    )
+
+
+def scoped_nodes(records: dict[tuple[str, str], dict[str, Any]]) -> int:
+    """The (cluster, node) pairs the records name: node ids repeat per cluster."""
+
+    return len(
+        {
+            (payload.get("cluster_id"), node)
+            for payload in records.values()
+            if isinstance(node := payload.get("node_id"), str) and node
+        }
     )
 
 
@@ -123,9 +138,7 @@ def scope_records(
         (cluster_ids, cluster_ids),
     )
     records = {(kind, key): payload for kind, key, payload in cursor.fetchall()}
-    bound = record_bound(
-        cluster_ids, agents=sum(1 for kind, _ in records if kind == "agent")
-    )
+    bound = record_bound(cluster_ids, nodes=scoped_nodes(records))
     while records:
         if len(records) > bound:
             raise RuntimeError("capacity cleanup record bound exceeded")
@@ -652,8 +665,9 @@ def invoke(
             }
         ),
         stdin=Path(__file__).read_bytes(),
-        # A fleet run's inspect walks ~3x the pre-fleet records: ~40 s for 32
-        # clusters on the b223 r1 residue (scope 5 s, walk 16 s, links 18 s).
+        # An inspect now walks ~3x the round-11 records (27 latest rows a node,
+        # was 5): ~40 s for 32 clusters on the b223 r1 residue (scope 5 s, walk
+        # 16 s, links 18 s).
         timeout=900 if cleanup else 300,
     )
     result = json.loads(output.splitlines()[-1])
