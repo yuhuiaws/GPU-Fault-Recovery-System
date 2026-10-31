@@ -5402,9 +5402,8 @@ After the 2026-09-08 control-plane review the way `/metrics` is rendered also ch
   timestamped in the future or identity mismatch all mark coverage unknown and trigger `GpuFaultMetricsAggregationIncomplete`.
   After dead-process files are pruned, the reset domains of the other processes' counters stay independent; SUM-then-rate must not fabricate phantom events.
   When `POD_UID` is unset or aggregation is off, process-level families still carry `process="0"` with the two aggregation gauges attached;
-  `GPU_FAULT_PROCESS_METRICS_DIR` can still override the directory or disable with `off`. The publish thread renders fully every 5 seconds
-  (it skips a tick when the render this process published for a scrape is younger than 5 seconds, so the newest publication is at most
-  about 10 seconds old, well inside the 60-second freshness bound), of which the only store read that
+  `GPU_FAULT_PROCESS_METRICS_DIR` can still override the directory or disable with `off`. The publish thread renders fully every 5 seconds,
+  of which the only store read that
   bypasses the 60-second cache is `processor_queue_stats` (the count table); all other whole-table aggregations are inside `metric_scan_cache`,
   once per process per TTL.
 

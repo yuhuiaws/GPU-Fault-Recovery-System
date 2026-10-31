@@ -13,9 +13,7 @@ by luck.
 Every process publishes its *complete* rendered sample set to
 ``<dir>/<pid>.json`` -- on every render it answers and, from a small
 background thread, every :data:`PUBLISH_INTERVAL_SECONDS` -- so the process
-that counted does not have to be the one that answers the scrape. The thread
-skips a tick when the render this process published for a scrape is younger
-than the interval: rendering again would publish nearly the same samples. The
+that counted does not have to be the one that answers the scrape. The
 answering process merges its own fresh render with every other live process's
 file and aggregates each family by the strategy registered for it in
 :mod:`gpu_fault.app.metric_aggregation` (SUM, MAX, MIN, ANY or PER_PROCESS).
@@ -520,37 +518,6 @@ class SlotRegistry:
 SLOTS = SlotRegistry()
 
 
-class PublicationLedger:
-    """When this process last completed a publication of its own render.
-
-    Both the scrape path and the background publisher record here; the
-    publisher reads it to skip a tick the scrape path made redundant.
-    """
-
-    def __init__(self, monotonic: Callable[[], float] = time.monotonic) -> None:
-        self._monotonic = monotonic
-        self._lock = Lock()
-        self._last: tuple[int, Path, float] | None = None
-
-    def record(self, directory: Path) -> None:
-        stamp = (os.getpid(), directory, self._monotonic())
-        with self._lock:
-            self._last = stamp
-
-    def age(self, directory: Path) -> float | None:
-        """Seconds since this process published into ``directory``, if it has."""
-
-        with self._lock:
-            last = self._last
-        # A forked child inherits the parent's ledger, not its publication.
-        if last is None or last[0] != os.getpid() or last[1] != directory:
-            return None
-        return max(0.0, self._monotonic() - last[2])
-
-
-PUBLICATIONS = PublicationLedger()
-
-
 def publish(
     directory: Path,
     rendered: Rendered,
@@ -593,8 +560,6 @@ def publish(
     except BaseException:
         Path(temporary).unlink(missing_ok=True)
         raise
-    if own == os.getpid():
-        PUBLICATIONS.record(directory)
 
 
 def _read_families(rendered: Rendered, families: object) -> None:
@@ -895,12 +860,6 @@ def publish_forever(
     Without this, a process publishes only when it answers a scrape, and the
     process that counted may never be asked. Runs in every worker process; it
     returns at once when sharing is off.
-
-    A tick that finds a publication of this process younger than
-    ``interval`` -- the render the scrape path published when it answered --
-    skips its own render: it would publish nearly the same samples again.
-    The newest publication is then less than two intervals plus one render
-    old, well inside :data:`MAX_PUBLISH_AGE_SECONDS`.
     """
 
     target = metrics_directory() if directory is None else directory
@@ -911,12 +870,10 @@ def publish_forever(
             slot = SLOTS.slot(target)
             if slot is None:
                 raise OSError("no free process metric slot")
-            age = PUBLICATIONS.age(target)
-            if age is None or age >= interval:
-                rendered = parse_lines(render())
-                rendered.slot = slot
-                rendered.pid = os.getpid()
-                publish(target, rendered, slot=rendered.slot)
+            rendered = parse_lines(render())
+            rendered.slot = slot
+            rendered.pid = os.getpid()
+            publish(target, rendered, slot=rendered.slot)
         except Exception:  # noqa: BLE001 - a publisher must not die on one write
             LOGGER.exception("process metrics could not be published to %s", target)
         if stop.wait(interval):

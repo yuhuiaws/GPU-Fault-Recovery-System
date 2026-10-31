@@ -172,7 +172,6 @@ def pod(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pod]:
     monkeypatch.setattr(new.os, "kill", kill)
     monkeypatch.setattr(old, "SLOTS", old.SlotRegistry())
     monkeypatch.setattr(new, "SLOTS", new.SlotRegistry())
-    monkeypatch.setattr(new, "PUBLICATIONS", new.PublicationLedger())
     yield Pod(tmp_path, dead)
     old.SLOTS.release()
     new.SLOTS.release()
@@ -688,7 +687,6 @@ def test_published_bytes_are_unchanged(
     """json.dumps (C encoder) writes what json.dump (pure Python) wrote."""
 
     monkeypatch.setattr(new.time, "time", lambda: CLOCK + 0.123456789)
-    monkeypatch.setattr(new, "PUBLICATIONS", new.PublicationLedger())
     rng = random.Random(seed)
     lines = _render(rng, _pool(rng))
     old.publish(tmp_path / "old", old.parse_lines(lines), pid=4242, slot=seed % 3)
