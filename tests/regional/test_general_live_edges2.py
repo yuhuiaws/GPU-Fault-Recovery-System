@@ -10,7 +10,9 @@ import pytest
 from scripts.e2e.regional import general_live_attempts as att
 from scripts.e2e.regional import general_live_common as common
 from scripts.e2e.regional import general_live_network as net
+from scripts.e2e.regional import general_live_restart_outcomes as outcomes
 from scripts.e2e.regional import general_live_storage as storage
+from scripts.e2e.regional.general_live_fixture import VariantInconclusive
 from tests.regional._general_live_fakes import (
     FakeProbe,
     FakeRegional,
@@ -38,80 +40,70 @@ EMPTY = {
 # --------------------------------------------------------------------------- #
 # attempts helpers (direct)
 # --------------------------------------------------------------------------- #
+def _restart_record(status: str, details: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "recovery": [
+            {
+                "workflow": workflow(
+                    "w",
+                    "i",
+                    ["RESTART_WORKLOAD"],
+                    executions=[
+                        {
+                            "operation": "RESTART_WORKLOAD",
+                            "status": status,
+                            "details": details,
+                        }
+                    ],
+                )
+            }
+        ],
+        "containment_workflows": [
+            workflow(
+                "c",
+                "i",
+                ["FREEZE_EVIDENCE", "STOP_WORKLOADS"],
+                executions=[{"operation": "STOP_WORKLOADS", "status": "SUCCEEDED"}],
+            )
+        ],
+    }
+
+
 def test_attempts_withheld_and_budget_helpers() -> None:
-    succeeded = {
-        "recovery": [
-            {
-                "workflow": workflow(
-                    "w",
-                    "i",
-                    ["RESTART_WORKLOAD"],
-                    executions=[
-                        {
-                            "operation": "RESTART_WORKLOAD",
-                            "status": "SUCCEEDED",
-                            "details": {},
-                        }
-                    ],
-                )
-            }
-        ]
-    }
-    assert att._withheld_errors(succeeded) == [
-        "RESTART_WORKLOAD succeeded despite an exhausted budget"
-    ]
-    bad_reason = {
-        "recovery": [
-            {
-                "workflow": workflow(
-                    "w",
-                    "i",
-                    ["RESTART_WORKLOAD"],
-                    executions=[
-                        {
-                            "operation": "RESTART_WORKLOAD",
-                            "status": "FAILED",
-                            "details": {"reason": "other"},
-                        }
-                    ],
-                )
-            }
-        ]
-    }
-    assert att._withheld_errors(bad_reason), "att._withheld_errors(bad_reason)"
-    waiting = {
-        "recovery": [
-            {
-                "workflow": workflow(
-                    "w",
-                    "i",
-                    ["RESTART_WORKLOAD"],
-                    executions=[
-                        {
-                            "operation": "RESTART_WORKLOAD",
-                            "status": "WAITING",
-                            "details": {},
-                        }
-                    ],
-                )
-            }
-        ]
-    }
-    assert att._withheld_errors(waiting) == []
-    assert att._withheld_errors({"recovery": []}) == []
-    assert att._budget_errors({"restart_budget": None}, consumed=1), (
-        "att._budget_errors({'restart_budget': None}, consumed=1)"
+    # The shapes the old lenient helpers passed are refused now
+    # (general_live_restart_outcomes): a WAITING restart is not withheld, no
+    # restart at all never reached the budget gate, a count of 0 is not one.
+    withheld = outcomes.withheld_errors
+    assert "RESTART_WORKLOAD succeeded despite the exhausted budget" in withheld(
+        _restart_record("SUCCEEDED", {}), budget=0
     )
-    assert att._budget_errors({"restart_budget": None}, consumed=0) == []
-    assert att._budget_errors(
+    assert withheld(_restart_record("FAILED", {"reason": "other"}), budget=0), (
+        "a restart FAILED for another reason is not the budget's withholding"
+    )
+    assert withheld(_restart_record("WAITING", {}), budget=0), (
+        "a WAITING restart is neither run nor withheld"
+    )
+    with pytest.raises(VariantInconclusive, match="never reached"):
+        withheld({"recovery": []}, budget=0)
+    exhausted = {
+        "reason": "RESTART_BUDGET_EXHAUSTED",
+        "restart_count": 0,
+        "restart_budget": 0,
+    }
+    assert withheld(_restart_record("FAILED", exhausted), budget=0) == []
+    budget = outcomes.budget_errors
+    assert budget({"restart_budget": None}, consumed=1), (
+        "budget({'restart_budget': None}, consumed=1)"
+    )
+    assert budget({"restart_budget": None}, consumed=0) == []
+    assert budget(
         {"restart_budget": {"restart_count": 2, "reservation_ids": ["a"]}}, consumed=1
-    ), "att._budget_errors( {'restart_budget': {'restart_count': 2, 'reservati"
-    assert att._budget_errors(
-        {"restart_budget": {"restart_count": 3, "reservation_ids": ["a", "b", "c"]}},
-        consumed=1,
-    ), "att._budget_errors( {'restart_budget': {'restart_count': 3, 'reservati"
+    ), "budget( {'restart_budget': {'restart_count': 2, 'reservation_ids': ['a']}}"
+    assert budget(
+        {"restart_budget": {"restart_count": 0, "reservation_ids": []}}, consumed=1
+    ), "a count of 0 is not one consumed restart"
     assert (
-        att._budget_errors(
+        budget(
             {"restart_budget": {"restart_count": 1, "reservation_ids": ["a"]}},
             consumed=1,
         )
@@ -141,22 +133,23 @@ def test_attempts_created_job_and_escalated() -> None:
     ), "not att._escalated( {'containment_incident': {'state': 'ACTION_PENDING"
 
 
-def test_attempts_stop_then_restart_errors() -> None:
-    missing_stop = {
-        "containment_workflows": [workflow("w", "i", ["FREEZE_EVIDENCE"])],
-        "recovery": [],
-    }
-    assert "no STOP_WORKLOADS" in att._stop_then_restart_errors(missing_stop)[0]
-    recovery_no_restart = {
-        "containment_workflows": [
-            workflow("w", "i", ["FREEZE_EVIDENCE", "STOP_WORKLOADS"])
-        ],
-        "recovery": [{"workflow": workflow("r", "i", ["VALIDATE_GPU"])}],
-    }
+def test_attempts_restart_once_errors() -> None:
+    record = _restart_record("SUCCEEDED", {"restart_attempt_id": "job-r-1"})
+    record["decision"] = {"status": "PLAN_CREATED"}
+    ledger = {"restart_budget": {"restart_count": 1, "reservation_ids": ["w/0/RW"]}}
+    assert outcomes.restart_once_errors(record, ledger) == [
+        "recovery workflow w ended RUNNING"
+    ], "the fake workflow is RUNNING: a restart is graded on the settled record"
+    missing_stop = {**record, "containment_workflows": []}
     assert any(
-        "did not plan RESTART_WORKLOAD" in e
-        for e in att._stop_then_restart_errors(recovery_no_restart)
-    ), "any( 'did not plan RESTART_WORKLOAD' in e for e in att._stop_then_rest"
+        "STOP_WORKLOADS never succeeded" in item
+        for item in outcomes.restart_once_errors(missing_stop, ledger)
+    ), "outcomes.restart_once_errors(missing_stop, ledger)"
+    no_restart = {**record, "recovery": []}
+    assert any(
+        "RESTART_WORKLOAD succeeded 0 times" in item
+        for item in outcomes.restart_once_errors(no_restart, ledger)
+    ), "outcomes.restart_once_errors(no_restart, ledger)"
 
 
 # --------------------------------------------------------------------------- #

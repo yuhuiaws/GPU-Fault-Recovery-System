@@ -1531,6 +1531,16 @@ allocation 来自每个已终止关键容器的 `spec.nodeName`（`completion_po
 到的终态必带 allocation；只有手造 TerminalEvent POST 到 `/v1/attempts/terminal` 才可能缺它，而规格与
 本 lane 规则都禁止手造终态；产品路径（`service._decide` → `planner.from_missing_allocation`）由软件测试
 覆盖。
+`nonzero_exit`/`one_restart`（与 029 `budget_consumed`）不再在第一次读到决策时判定：产品在容器失败后很快记下
+决策（PLAN_CREATED），而恢复工作流要等 containment 结束才被调度、在认领时才预留预算
+（`restart_budget_preflight.reserve_restart_budgets`），旧判据因此把 `restart_count` 0（预留尚未发生或未尝试即释放）
+当成"扣减一次"、把空的恢复历史当成"先停后重启"，"重启"从未被看到。现在先等结果沉淀——该 attempt 的每个恢复工作流
+到达终态，预算取产品自身步骤上限（单个 WAITING 的 STOP_WORKLOADS 与 RESTART_WORKLOAD 各 600 s、每次认领一次调度轮询、
+watcher 轮询与余量，即 `settle_bound` 去掉 watcher 重建，共 1335 s），预算内未沉淀记 INCONCLUSIVE——再读产品记录：
+恰一个恢复工作流 SUCCEEDED、其 RESTART_WORKLOAD 恰一次 SUCCEEDED 且记下副本的 `restart_attempt_id`、containment 的
+STOP_WORKLOADS 成功一次、账本 `restart_count` 恰为 1 且等于该恢复工作流自己的那一个预留（`<workflow>/<index>/RESTART_WORKLOAD`）。
+`one_restart` 的注入改为 `exit_once`（"一次非零退出"：重启副本持续运行），并要求 watcher 观察到副本 RUNNING、一个 watcher
+周期后仍只有一次重启与一次扣减、副本没有自己的 terminal/decision/containment。决策缺失或不是有预算的重启时不等待，直接判 FAIL。
 
 ### GF-GENERAL-LIVE-029
 
@@ -1551,6 +1561,15 @@ attempt 失败，待产品决策、RESTART_WORKLOAD 记下 `restart_attempt_id` 
 的决策行不变（未被改写成 duplicate）、恰一个 RESTART_WORKLOAD 工作流、预算账本 `restart_count` 1 且
 reservation id 不变、该 attempt 事件（containment + recovery）的通知无新增——一次决策、一次扣减、一次
 通知；重启副本无自己的 terminal/decision/containment。无决策、无重启副本或无已记录终态记 INCONCLUSIVE。
+`restart_withheld`/`single_notification`（预算 0）同样先等恢复结果沉淀再判：产品的预检对已耗尽的预算只扣住重启
+（`withhold_exhausted_restart`）——写下一条 FAILED 的 RESTART_WORKLOAD，details 带 `reason=RESTART_BUDGET_EXHAUSTED`、
+`restart_count`、`restart_budget` 与唯一一条预算耗尽通知的 `notification_id`（去重键
+`<cluster>/<job>/restart-budget-exhausted/<budget>`），不取预留，恢复工作流以 FAILED 结束。PASS 要求：决策为 PLAN_CREATED；恰一条
+因 RESTART_BUDGET_EXHAUSTED 失败的 RESTART_WORKLOAD，读到的预算为 0/0；没有成功的重启、没有重启 attempt、没有预留；
+containment 的 STOP_WORKLOADS 仍已成功；没有新建训练任务。`single_notification` 另外读该 attempt 事件的通知：恰一条本任务的
+预算耗尽通知且就是被扣住的重启所指的那一条，一个 watcher 周期后仍只有它，最终 ESCALATED/QUARANTINED。此前 WAITING 的重启或
+根本没有重启都算"已扣住"，通知数量从未读取。恢复计划里没有 RESTART_WORKLOAD（不能重启的 profile 改为升级）记 INCONCLUSIVE：
+预算闸门从未到达。
 
 ### GF-GENERAL-LIVE-030
 

@@ -52,10 +52,9 @@ every action happening exactly once.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from scripts.e2e.regional import general_live_network_isolation as isolation
 from scripts.e2e.regional import general_live_watcher_restart as watcher_restart
@@ -70,12 +69,31 @@ from scripts.e2e.regional.general_live_registry import (
     VariantSpec,
     deferred_variant,
 )
+
+# The job fixture's names stay importable from here (tests patch
+# ``ManagedFailJob`` on this module).
+from scripts.e2e.regional.general_live_fail_job import (
+    ATTEMPT_ID_ENV as ATTEMPT_ID_ENV,
+    ATTEMPT_ID_LABEL as ATTEMPT_ID_LABEL,
+    COPY_RUN_SECONDS_ENV as COPY_RUN_SECONDS_ENV,
+    EXIT_TRIGGER_PATH,
+    MODE_COMMANDS as MODE_COMMANDS,
+    ManagedFailJob,
+)
 from scripts.e2e.regional.general_live_restart_budget import (
     CLAIMERS,
     SeededRestartBudget,
     cleanup_errors,
     concurrent_claim_errors,
     missing_context_errors,
+)
+from scripts.e2e.regional.general_live_restart_outcomes import (
+    budget_errors,
+    budget_notice_errors,
+    budget_notices,
+    restart_once_errors,
+    wait_restart_outcome,
+    withheld_errors,
 )
 from scripts.e2e.regional.general_live_store import attempt_records
 from scripts.e2e.regional.general_live_terminal_replay import (
@@ -90,266 +108,9 @@ from scripts.e2e.regional.general_live_terminal_replay import (
 from scripts.e2e.regional.general_live_verdicts import operations, verdict
 from scripts.e2e.regional.regional_commands import RegionalFixtureError
 
-if TYPE_CHECKING:
-    from scripts.e2e.regional.managed_workload_fixture import ManagedWorkloadFixture
-
 CASE_028 = "GF-GENERAL-LIVE-028"
 CASE_029 = "GF-GENERAL-LIVE-029"
 ATTEMPT_BUDGET = 900
-SINGLE_NODE_MANIFEST = "single-node-warm-spare-pytorchjob.yaml"
-
-
-class ManagedFailJob:
-    """A managed single-node job whose critical container(s) can be made to
-    exit, stop, or hang; a thin wrapper over ManagedWorkloadFixture.
-
-    ``mode`` is baked into the rendered command: ``exit:<code>`` exits the code
-    after a short run, ``stop`` waits for a delete/suspend, ``hang`` ignores the
-    terminal signal so the cleanup window times out. One mode applies to every
-    replica; a mapping gives each replica role its own (``{"Master": "exit:1",
-    "Worker": "hang"}``). ``ranks`` 2 adds a Worker replica cloned from the
-    manifest's Master, both pinned to the node, and ``gpu_count`` is then per
-    Pod (two 4-GPU Pods fill one p5en node); the product infers the critical
-    rank count from the replicas (``training_submit_cli._pytorch_templates``).
-    The verdict tests monkeypatch this class;
-    test_general_live_managed_job_start.py runs its start with the real
-    fixtures.
-    """
-
-    def __init__(
-        self,
-        ctx: VariantContext,
-        *,
-        name: str,
-        mode: str | Mapping[str, str],
-        restart_budget: int = 1,
-        gpu_count: int = 8,
-        ranks: int = 1,
-        copy_run_seconds: int | None = None,
-    ) -> None:
-        from pathlib import Path
-
-        from scripts.e2e.regional.managed_workload_fixture import (
-            ImagePrewarmFixture,
-            ManagedWorkloadFixture,
-            ManagedWorkloadSettings,
-            name_managed_workload,
-            render_node_pinned_manifest,
-        )
-        from scripts.e2e.regional.training_topology import fit_gpu_count
-
-        yaml = __import__("yaml")
-        if ctx.settings.site_file is None:
-            raise VariantNotRun("FIXTURE_NOT_READY", "a managed job needs --site-file")
-        source = (
-            Path(__file__).with_name("manifests") / "training" / SINGLE_NODE_MANIFEST
-        )
-        rendered = render_node_pinned_manifest(
-            source, ctx.case_dir / f"{name}.source.yaml", node=ctx.settings.node
-        )
-        document = yaml.safe_load(rendered.read_text(encoding="utf-8"))
-        name_managed_workload(document, name)
-        _add_worker_ranks(document, ranks)
-        fit_gpu_count(document, gpu_count)
-        _apply_mode(document, mode, copy_run_seconds=copy_run_seconds)
-        document.setdefault("metadata", {}).setdefault("labels", {}).update(
-            {"gpu-fault.io/job-id": name, "gpu-fault.io/attempt-id": f"{name}-a001"}
-        )
-        rendered.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
-        self.name = name
-        self.node = ctx.settings.node
-        self.attempt_id = f"{name}-a001"
-        self.restart_budget = restart_budget
-        self.prewarm = ImagePrewarmFixture(
-            ctx.regional,
-            case_id=ctx.spec.key,
-            run_id=f"{ctx.run_id}-{name}",
-            state_path=ctx.case_dir / f"{name}.prewarm.json",
-        )
-        self.fixture = ManagedWorkloadFixture(
-            ctx.regional,
-            ManagedWorkloadSettings(
-                manifest=rendered,
-                site_file=ctx.settings.site_file,
-                job_id=name,
-                attempt_id=self.attempt_id,
-                restart_budget=restart_budget,
-                expected_pods=ranks,
-                expected_gpu_count=gpu_count,
-            ),
-            state_path=ctx.case_dir / f"{name}.ownership.json",
-        )
-
-    def start(self) -> dict[str, Any]:
-        # The node the manifest is pinned to, never the cluster id: a prewarm
-        # Pod bound to a node that does not exist never runs.
-        self.prewarm.create([self.node])
-        return self.fixture.submit()
-
-    def suspend(self) -> None:
-        """The job controller's stop: suspend the workload, as Kueue would."""
-
-        suspend_workload(self.fixture)
-
-    def delete(self) -> dict[str, Any]:
-        from scripts.e2e.regional.managed_workload_fixture import remove_managed_job
-
-        return remove_managed_job(self.fixture, self.prewarm)
-
-
-def suspend_workload(fixture: ManagedWorkloadFixture) -> None:
-    """Suspend a managed workload fixture's own workload as its job controller would.
-
-    ``spec.runPolicy.suspend`` (PyTorchJob) or ``spec.suspend`` (Job,
-    JobSet): the toggle a scheduler such as Kueue applies, which the
-    training operator answers by deleting the replica Pods. The product
-    reads it as a stop by someone else (completion_observation: a suspend
-    without its own initiator annotation), never as a failure. Fenced on
-    the UID and resourceVersion the fixture just adopted, like
-    ``ManagedWorkloadFixture.annotate_auto_resume``. Lives here, with its only
-    caller (028 ``controller_stop``), rather than on the fixture class.
-    """
-
-    current = fixture.workload()
-    fixture.adopt(current)
-    spec = current.get("spec") or {}
-    if fixture.resource == "pytorchjob":
-        operation: dict[str, Any] = (
-            {"op": "add", "path": "/spec/runPolicy/suspend", "value": True}
-            if isinstance(spec.get("runPolicy"), dict)
-            else {
-                "op": "add",
-                "path": "/spec/runPolicy",
-                "value": {"suspend": True},
-            }
-        )
-    else:
-        operation = {"op": "add", "path": "/spec/suspend", "value": True}
-    fixture.regional.kubectl(
-        "gpu",
-        "patch",
-        fixture.resource,
-        fixture.name,
-        "--type=json",
-        "--patch-file=/dev/stdin",
-        input_text=json.dumps(
-            [
-                {
-                    "op": "test",
-                    "path": "/metadata/uid",
-                    "value": current["metadata"]["uid"],
-                },
-                {
-                    "op": "test",
-                    "path": "/metadata/resourceVersion",
-                    "value": current["metadata"]["resourceVersion"],
-                },
-                operation,
-            ]
-        ),
-    )
-
-
-#: The Pod's own attempt id, from its ``gpu-fault.io/attempt-id`` label through
-#: the downward API: the product's restart copy relabels the template with the
-#: ``-r-`` id it derives (``adapters/kubernetes/restart_operations.py``), so a
-#: container can tell the first attempt from a restart.
-ATTEMPT_ID_ENV = "GFRS_ATTEMPT_ID"
-ATTEMPT_ID_LABEL = "gpu-fault.io/attempt-id"
-#: ``exit_once``: the restart copy's run before it exits 0 (``copy_run_seconds``).
-COPY_RUN_SECONDS_ENV = "GFRS_COPY_RUN_SECONDS"
-#: ``trigger:<code>`` exits the code once the runner creates this file in the
-#: container (028 api_unreachable: the exit must happen under the block).
-EXIT_TRIGGER_PATH = "/tmp/gfrs-live-exit"
-MODE_COMMANDS = {
-    "exit": "sleep 30; exit ${CODE:-1}",
-    "stop": "trap 'exit 143' TERM; sleep 3600",
-    "hang": "trap '' TERM; sleep 3600",
-    # The first attempt exits CODE; the restart copy runs until stopped (028
-    # old_terminal) or, with COPY_RUN_SECONDS_ENV set, that long and exits 0
-    # (029 worker_restart: the replacement watcher observes it, then its end).
-    "exit_once": (
-        f"case \"${{{ATTEMPT_ID_ENV}:-}}\" in *-r-*) trap 'exit 143' TERM; "
-        f"sleep ${{{COPY_RUN_SECONDS_ENV}:-3600}}; exit 0;; "
-        "*) sleep 30; exit ${CODE:-1};; esac"
-    ),
-    "trigger": f"while [ ! -e {EXIT_TRIGGER_PATH} ]; do sleep 1; done; exit ${{CODE:-1}}",
-}
-#: Modes whose ``:<code>`` suffix is the exit code.
-EXIT_MODES = frozenset({"exit", "exit_once"})
-
-
-def _add_worker_ranks(document: dict[str, Any], ranks: int) -> None:
-    """Give the single-node manifest ``ranks`` critical ranks: its Master and,
-    for a second rank, a Worker replica cloned from it (same node, image,
-    devices); the product counts the ranks from the replicas."""
-
-    import copy
-
-    if ranks not in (1, 2):
-        raise ValueError(f"a managed fail job runs one or two ranks, not {ranks}")
-    replicas = (document.get("spec") or {}).get("pytorchReplicaSpecs") or {}
-    if list(replicas) != ["Master"]:
-        raise ValueError("the single-node manifest renders one Master replica")
-    if ranks == 2:
-        worker = copy.deepcopy(replicas["Master"])
-        worker["replicas"] = 1
-        replicas["Worker"] = worker
-
-
-def _apply_mode(
-    document: dict[str, Any],
-    mode: str | Mapping[str, str],
-    *,
-    copy_run_seconds: int | None = None,
-) -> None:
-    replicas = document.get("spec", {}).get("pytorchReplicaSpecs") or {}
-    modes: Mapping[str, str] = (
-        mode if isinstance(mode, Mapping) else dict.fromkeys(replicas, mode)
-    )
-    unknown = sorted(set(modes) - set(replicas))
-    if unknown:
-        raise ValueError(f"no replica to apply a mode to: {', '.join(unknown)}")
-    missing = sorted(set(replicas) - set(modes))
-    if missing:
-        raise ValueError(f"no mode for replica: {', '.join(missing)}")
-    for role, replica in replicas.items():
-        role_mode = modes[role]
-        kind = role_mode.split(":", 1)[0]
-        script = MODE_COMMANDS.get(kind, MODE_COMMANDS["exit"])
-        code = (
-            role_mode.split(":", 1)[1]
-            if ":" in role_mode and (kind in EXIT_MODES or kind == "trigger")
-            else "1"
-        )
-        identity = (
-            [
-                {
-                    "name": ATTEMPT_ID_ENV,
-                    "valueFrom": {
-                        "fieldRef": {
-                            "fieldPath": f"metadata.labels['{ATTEMPT_ID_LABEL}']"
-                        }
-                    },
-                },
-                *(
-                    [{"name": COPY_RUN_SECONDS_ENV, "value": str(copy_run_seconds)}]
-                    if copy_run_seconds is not None
-                    else []
-                ),
-            ]
-            if kind == "exit_once"
-            else []
-        )
-        for container in ((replica.get("template") or {}).get("spec") or {}).get(
-            "containers"
-        ) or []:
-            container["command"] = ["/bin/bash", "-c", script]
-            container["env"] = [
-                {"name": "CODE", "value": code},
-                *identity,
-                *(container.get("env") or []),
-            ]
 
 
 def _job(
@@ -410,6 +171,21 @@ def _containment_ops(entry: dict[str, Any]) -> list[str]:
     return [op for workflow in workflows for op in operations(workflow)]
 
 
+def _restart_outcome(
+    ctx: VariantContext, job: ManagedFailJob, records: dict[str, Any], *, name: str
+) -> dict[str, Any]:
+    """The records once the decided restart's recovery settled
+    (``general_live_restart_outcomes``): run, or withheld for the budget. A
+    missing decision, or one that planned no restart, is graded as it is."""
+
+    decision = _attempt(records, job.attempt_id).get("decision") or {}
+    if decision.get("status") != "PLAN_CREATED":
+        return records
+    return wait_restart_outcome(
+        ctx, lambda: _records(ctx, job), job.attempt_id, name=f"{name}-outcome"
+    )
+
+
 def nonzero_exit(ctx: VariantContext) -> dict[str, Any]:
     job = _job(
         ctx,
@@ -419,6 +195,7 @@ def nonzero_exit(ctx: VariantContext) -> dict[str, Any]:
         "exit:1",
     )
     records = _wait_decision(ctx, job, name="nonzero")
+    records = _restart_outcome(ctx, job, records, name="nonzero")
     entry = _attempt(records, job.attempt_id)
     decision = entry.get("decision") or {}
     event = entry.get("event") or {}
@@ -429,13 +206,13 @@ def nonzero_exit(ctx: VariantContext) -> dict[str, Any]:
             and entry.get("containment_incident")
         )
         else ["no passive containment incident for the failed attempt"],
-        "stop_then_restart": _stop_then_restart_errors(entry),
         "decision": []
         if decision.get("status") in {"PLAN_CREATED"}
         else [
             f"terminal decision was {decision.get('status')}, expected a budgeted restart"
         ],
-        "budget": _budget_errors(records, consumed=1),
+        "restart_once": restart_once_errors(entry, records),
+        "budget": budget_errors(records, consumed=1),
     }
     return _result(
         stages, extra={"attempt": job.attempt_id, "decision": decision.get("status")}
@@ -443,18 +220,74 @@ def nonzero_exit(ctx: VariantContext) -> dict[str, Any]:
 
 
 def one_restart(ctx: VariantContext) -> dict[str, Any]:
-    job = _job(ctx, "gl28one-" + _suffix(ctx), "exit:1", restart_budget=1)
+    """A single non-zero exit within budget 1 is restarted exactly once.
+
+    ``exit_once``: the first attempt exits 1, the product's restart copy keeps
+    running. The verdict waits for the recovery's outcome and reads the
+    product's records: one RESTART_WORKLOAD SUCCEEDED with the copy's attempt
+    id and the ledger at that workflow's one reservation; the watcher observes
+    the copy RUNNING, and one watcher pass later there is still one restart and
+    one deduction.
+    """
+
+    job = _job(ctx, "gl28one-" + _suffix(ctx), "exit_once:1", restart_budget=1)
     records = _wait_decision(ctx, job, name="one-restart")
+    records = _restart_outcome(ctx, job, records, name="one-restart")
+    entry = _attempt(records, job.attempt_id)
+    new_attempt = restart_attempt_of(entry)
     stages = {
-        "budget": _budget_errors(records, consumed=1),
-        "stop_then_restart": _stop_then_restart_errors(
-            _attempt(records, job.attempt_id)
-        ),
+        "restart_once": restart_once_errors(entry, records),
+        "budget": budget_errors(records, consumed=1),
     }
+    if new_attempt is not None:
+        stages["copy_running"] = _copy_running_errors(ctx, job, new_attempt)
+        ctx.hold(WATCHER_PASS_SECONDS, name="one-restart-later")
+        later = attempt_records(
+            ctx.regional,
+            ctx.settings.regional.cluster_id,
+            job.name,
+            [job.attempt_id, new_attempt],
+        )
+        stages["still_once"] = [
+            *restart_once_errors(_attempt(later, job.attempt_id), later),
+            *budget_errors(later, consumed=1),
+            *untouched_errors(_attempt(later, new_attempt), new_attempt),
+        ]
     return _result(
         stages,
-        notes=["a new Pod UID and valid progress are verified on the restart attempt"],
+        notes=[
+            "the restart copy is a new attempt the watcher observed RUNNING; the "
+            "ledger holds the recovery workflow's one reservation"
+        ],
+        extra={
+            "attempt": job.attempt_id,
+            "restart_attempt": new_attempt,
+            "restart_budget": records.get("restart_budget"),
+        },
     )
+
+
+def _copy_running_errors(
+    ctx: VariantContext, job: ManagedFailJob, new_attempt: str
+) -> list[str]:
+    """The watcher's RUNNING observation of the restart copy, within the
+    managed job's own start budget."""
+
+    cluster_id = ctx.settings.regional.cluster_id
+
+    def accept() -> dict[str, Any] | None:
+        records = isolation.isolation_records(ctx.regional, cluster_id, job_id=job.name)
+        return isolation.observed_running(records, new_attempt)
+
+    observed = ctx.wait_until(
+        accept,
+        timeout_seconds=RUNNING_WAIT_SECONDS,
+        poll_seconds=20,
+        name="restart-copy-running",
+    )
+    if observed is None:
+        return [f"the watcher never observed the restart attempt {new_attempt} RUNNING"]
+    return []
 
 
 def cleanup_timeout(ctx: VariantContext) -> dict[str, Any]:
@@ -622,7 +455,7 @@ def old_terminal(ctx: VariantContext) -> dict[str, Any]:
             f"{len(restart_workflows(old_entry))} restart workflows for the old "
             "attempt after the replay, expected exactly one"
         ],
-        "budget": _budget_errors(after, consumed=1),
+        "budget": budget_errors(after, consumed=1),
         "new_attempt_untouched": untouched_errors(
             _attempt(after, new_attempt), new_attempt
         ),
@@ -898,27 +731,58 @@ def _wait_watcher_restored(
 def budget_consumed(ctx: VariantContext) -> dict[str, Any]:
     job = _job(ctx, "gl29bc-" + _suffix(ctx), "exit:1", restart_budget=1)
     records = _wait_decision(ctx, job, name="budget-consumed")
-    stages = {"budget": _budget_errors(records, consumed=1, non_negative=True)}
+    records = _restart_outcome(ctx, job, records, name="budget-consumed")
+    stages = {
+        "budget": budget_errors(records, consumed=1),
+        "restart_once": restart_once_errors(_attempt(records, job.attempt_id), records),
+    }
     return _result(stages, extra={"restart_budget": records.get("restart_budget")})
+
+
+def _withheld_outcome(
+    ctx: VariantContext, job: ManagedFailJob, *, name: str
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, list[str]]]:
+    """Budget 0: the decided restart's outcome, and the stages every withheld
+    restart shares -- the budgeted-restart decision, the withholding itself, no
+    new job and an untouched ledger."""
+
+    records = _restart_outcome(ctx, job, _wait_decision(ctx, job, name=name), name=name)
+    entry = _attempt(records, job.attempt_id)
+    decision = (entry.get("decision") or {}).get("status")
+    if decision != "PLAN_CREATED":
+        return (
+            records,
+            entry,
+            {
+                "decision": [
+                    f"terminal decision was {decision}, expected a budgeted restart"
+                ]
+            },
+        )
+    return (
+        records,
+        entry,
+        {
+            "withheld": withheld_errors(entry, budget=0),
+            "no_new_job": []
+            if not _created_new_training_job(records, job)
+            else ["a new training job was created despite the exhausted budget"],
+            "budget": budget_errors(records, consumed=0),
+        },
+    )
 
 
 def restart_withheld(ctx: VariantContext) -> dict[str, Any]:
     # A job with no budget: the one failure withholds RESTART_WORKLOAD only.
     job = _job(ctx, "gl29rw-" + _suffix(ctx), "exit:1", restart_budget=0)
-    records = _wait_decision(ctx, job, name="restart-withheld")
-    entry = _attempt(records, job.attempt_id)
-    stages = {
-        "withheld": _withheld_errors(entry),
-        "no_new_job": []
-        if not _created_new_training_job(records, job)
-        else ["a new training job was created despite the exhausted budget"],
-        "budget": _budget_errors(records, consumed=0, non_negative=True),
-    }
+    records, entry, stages = _withheld_outcome(ctx, job, name="restart-withheld")
     return _result(
         stages,
         notes=[
-            "an exhausted budget withholds only RESTART_WORKLOAD; established STOP/validation still run"
+            "an exhausted budget withholds only RESTART_WORKLOAD; the containment's "
+            "STOP still ran"
         ],
+        extra={"restart_budget": records.get("restart_budget")},
     )
 
 
@@ -958,7 +822,7 @@ def duplicate_event(ctx: VariantContext) -> dict[str, Any]:
             f"{len(restart_workflows(entry))} restart workflows for the attempt "
             "after the redelivery, expected exactly one"
         ],
-        "budget": _budget_errors(after, consumed=1, non_negative=True),
+        "budget": budget_errors(after, consumed=1),
         "unchanged": unchanged_errors(before, after, job.attempt_id),
         "new_attempt_untouched": untouched_errors(
             _attempt(after, new_attempt), new_attempt
@@ -985,20 +849,45 @@ def duplicate_event(ctx: VariantContext) -> dict[str, Any]:
 
 
 def single_notification(ctx: VariantContext) -> dict[str, Any]:
+    """The exhausted budget sends exactly one budget-failure notice.
+
+    Read on the settled outcome: one BUDGET_EXHAUSTED notice of the job
+    (``<cluster>/<job>/restart-budget-exhausted/0``) among the attempt's
+    incidents' notifications, the one the withheld RESTART_WORKLOAD names, and
+    still only that one a watcher pass later; the incident ends
+    ESCALATED/QUARANTINED.
+    """
+
     job = _job(ctx, "gl29sn-" + _suffix(ctx), "exit:1", restart_budget=0)
-    records = _wait_decision(ctx, job, name="single-notification")
-    entry = _attempt(records, job.attempt_id)
-    stages = {
-        "withheld": _withheld_errors(entry),
-        "escalated": []
+    records, entry, stages = _withheld_outcome(ctx, job, name="single-notification")
+    if "decision" in stages:
+        return _result(stages)
+    stages["notification"] = budget_notice_errors(
+        entry, cluster_id=ctx.settings.regional.cluster_id, job_id=job.name, budget=0
+    )
+    stages["escalated"] = (
+        []
         if _escalated(entry)
-        else ["the exhausted-budget incident did not reach ESCALATED/QUARANTINED"],
-    }
+        else ["the exhausted-budget incident did not reach ESCALATED/QUARANTINED"]
+    )
+    ctx.hold(WATCHER_PASS_SECONDS, name="single-notification-later")
+    before = sorted(str(item.get("notification_id")) for item in budget_notices(entry))
+    later = sorted(
+        str(item.get("notification_id"))
+        for item in budget_notices(_attempt(_records(ctx, job), job.attempt_id))
+    )
+    stages["no_second_notice"] = (
+        []
+        if later == before
+        else [f"the budget notices changed one watcher pass later: {before} -> {later}"]
+    )
     return _result(
         stages,
         notes=[
-            "exactly one budget-failure notification; final ESCALATED/QUARANTINED is consistent with isolation"
+            "exactly one budget-failure notification, named by the withheld restart; "
+            "final ESCALATED/QUARANTINED"
         ],
+        extra={"budget_notices": budget_notices(entry)},
     )
 
 
@@ -1159,56 +1048,6 @@ def _suffix(ctx: VariantContext) -> str:
     return hashlib.sha256(ctx.run_id.encode()).hexdigest()[:8] + f"-{ctx.attempt}"
 
 
-def _stop_then_restart_errors(entry: dict[str, Any]) -> list[str]:
-    ops = _containment_ops(entry)
-    errors = []
-    if "STOP_WORKLOADS" not in ops:
-        errors.append("no STOP_WORKLOADS in the passive containment workflow")
-    recovery = entry.get("recovery") or []
-    restart_ops = [
-        op for item in recovery for op in operations(item.get("workflow") or {})
-    ]
-    if recovery and "RESTART_WORKLOAD" not in restart_ops:
-        errors.append("the recovery workflow did not plan RESTART_WORKLOAD")
-    return errors
-
-
-def _withheld_errors(entry: dict[str, Any]) -> list[str]:
-    for item in entry.get("recovery") or []:
-        workflow = item.get("workflow") or {}
-        for execution in workflow.get("step_executions") or []:
-            if execution.get("operation") == "RESTART_WORKLOAD":
-                reason = str((execution.get("details") or {}).get("reason") or "")
-                status = execution.get("status")
-                if status == "SUCCEEDED":
-                    return ["RESTART_WORKLOAD succeeded despite an exhausted budget"]
-                if "BUDGET" not in reason.upper() and status != "WAITING":
-                    return [
-                        f"RESTART_WORKLOAD withheld without a budget reason: {status} {reason}"
-                    ]
-                return []
-    # No restart step compiled at all is also acceptable for a zero budget.
-    return []
-
-
-def _budget_errors(
-    records: dict[str, Any], *, consumed: int, non_negative: bool = True
-) -> list[str]:
-    budget = records.get("restart_budget")
-    if budget is None:
-        return [] if consumed == 0 else ["no restart-budget ledger row for the job"]
-    errors = []
-    count = int(budget.get("restart_count", 0))
-    reservations = budget.get("reservation_ids") or []
-    if non_negative and count < 0:
-        errors.append("restart_count went negative")
-    if count != len(reservations):
-        errors.append("restart_count does not match the reservation ids")
-    if count > consumed + 0:
-        errors.append(f"restart_count {count} exceeds the expected {consumed}")
-    return errors
-
-
 def _created_new_training_job(records: dict[str, Any], job: ManagedFailJob) -> bool:
     # A withheld restart must not create a *new* training job; the recovery
     # history is about the same job/attempt only.
@@ -1281,8 +1120,11 @@ VARIANTS = [
         CASE_028,
         "nonzero_exit",
         "a managed job's critical container exits non-zero",
-        "FailureDetectedEvent -> FREEZE_EVIDENCE/STOP_WORKLOADS -> one budgeted restart; new Pod UID, budget consumed once",
+        "FailureDetectedEvent -> FREEZE_EVIDENCE/STOP_WORKLOADS -> one budgeted restart, "
+        "read once the recovery settled: RESTART_WORKLOAD SUCCEEDED with the copy's "
+        "attempt id, the budget consumed exactly once",
         nonzero_exit,
+        max_minutes=40,
     ),
     _spec(
         CASE_028,
@@ -1294,9 +1136,14 @@ VARIANTS = [
     _spec(
         CASE_028,
         "one_restart",
-        "a single non-zero exit with restart budget 1",
-        "exactly one restart; the budget is consumed once",
+        "a single non-zero exit with restart budget 1 (exit_once: the product's "
+        "restart copy keeps running)",
+        "exactly one restart, shown once the recovery settled: one RESTART_WORKLOAD "
+        "SUCCEEDED with the copy's attempt id, which the watcher observes RUNNING; the "
+        "ledger holds exactly that recovery workflow's one reservation, still one "
+        "watcher pass later",
         one_restart,
+        max_minutes=55,
     ),
     _spec(
         CASE_028,
@@ -1381,8 +1228,10 @@ VARIANTS = [
         CASE_029,
         "budget_consumed",
         "legitimately consume the job's restart budget through a failure and recovery",
-        "the durable ledger records the consumption; restart_count matches the reservations",
+        "once the recovery settled, the durable ledger records exactly the one "
+        "consumption: restart_count 1 == the recovery workflow's one reservation",
         budget_consumed,
+        max_minutes=40,
     ),
     # 029 hardware_chain_continues lives in general_live_attempt_hardware.py
     # (a reviewed kernel XID beside an exhausted budget, under GPU_RESET).
@@ -1390,8 +1239,11 @@ VARIANTS = [
         CASE_029,
         "restart_withheld",
         "a non-zero exit with the budget already exhausted (budget 0)",
-        "RESTART_WORKLOAD is withheld (BUDGET_EXHAUSTED_REASON); no new training job created",
+        "once the recovery settled: one RESTART_WORKLOAD FAILED for "
+        "RESTART_BUDGET_EXHAUSTED at 0 of 0, the containment's STOP_WORKLOADS "
+        "SUCCEEDED; no restart attempt, no reservation, no new training job",
         restart_withheld,
+        max_minutes=40,
     ),
     VariantSpec(
         case_id=CASE_029,
@@ -1491,8 +1343,11 @@ VARIANTS = [
     _spec(
         CASE_029,
         "single_notification",
-        "exhaust the budget and read the escalation",
-        "exactly one budget-failure notification; final ESCALATED/QUARANTINED is consistent",
+        "exhaust the budget (budget 0) and read the escalation and its notifications",
+        "exactly one budget-failure notification (<cluster>/<job>/restart-budget-"
+        "exhausted/0), named by the withheld RESTART_WORKLOAD and still the only one a "
+        "watcher pass later; final ESCALATED/QUARANTINED is consistent",
         single_notification,
+        max_minutes=40,
     ),
 ]

@@ -3965,6 +3965,42 @@ attempt's containment and recovery incidents, read-only); the restart copy
 untouched -- one decision, one deduction, one notification. Before this the
 variant passed without any redelivery.
 
+028 `nonzero_exit`/`one_restart` and 029 `budget_consumed`, `restart_withheld`
+and `single_notification` graded the first read that showed a completion
+decision. The product records the decision (PLAN_CREATED) soon after the
+failure, but dispatches the recovery workflow only once the containment ended
+and reserves the budget at that workflow's claim
+(`restart_budget_preflight.reserve_restart_budgets`), so the ledger helper
+accepted `restart_count` 0 (a reservation not yet taken, or released
+unattempted) as "consumed once", an empty recovery history as "stop then
+restart", a WAITING or absent RESTART_WORKLOAD as "withheld", and nothing read
+the notifications. The variants now wait for the outcome -- every recovery
+workflow of the attempt terminal, within the product's own caps (one WAITING
+STOP_WORKLOADS and RESTART_WORKLOAD of 600 s each, a dispatcher poll per
+claim, the watcher poll and the margin: `settle_bound` without the watcher
+replacement, 1335 s), INCONCLUSIVE when it does not settle -- and read what
+the product recorded (`general_live_restart_outcomes.py`). Within budget:
+one recovery workflow SUCCEEDED with one RESTART_WORKLOAD SUCCEEDED naming the
+copy's `restart_attempt_id`, the containment's STOP_WORKLOADS succeeded once,
+and the ledger holds exactly that workflow's one reservation (`restart_count`
+1); `one_restart` now injects a single non-zero exit (`exit_once`, the copy
+keeps running), requires the watcher's RUNNING observation of the copy and
+re-reads one watcher pass later (still one restart, one deduction, the copy
+without a terminal, decision or containment of its own). With budget 0 the
+preflight withholds the restart (`withhold_exhausted_restart`): the variants
+need one RESTART_WORKLOAD FAILED for `RESTART_BUDGET_EXHAUSTED` at 0 of 0, no
+restart, restart attempt or reservation, the containment's STOP still
+succeeded and no new training job; a recovery that planned no
+RESTART_WORKLOAD never reached the budget gate (INCONCLUSIVE).
+`single_notification` also needs exactly one budget-exhausted notice of the
+job (`<cluster>/<job>/restart-budget-exhausted/0`) among the attempt's
+incidents' notifications, the one the withheld restart names
+(`details.notification_id`), still the only one a watcher pass later. A
+missing decision, or one that planned no restart, is graded at once (FAIL),
+with no wait. The managed failing job's fixture moved to
+`general_live_fail_job.py` (the 1500-line cap); its names stay importable
+from `general_live_attempts`.
+
 GF-GENERAL-LIVE-030 (warm spare unhealthy) is the same story on the HyperPod
 lane: its `SpareSession` keeps the spare node *name* in `self.node` and also
 defined a `node()` accessor, so the instance attribute shadowed the method and

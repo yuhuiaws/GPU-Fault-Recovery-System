@@ -10,6 +10,7 @@ import pytest
 
 from gpu_fault.store import NotFoundError
 from scripts.e2e.regional import general_live_attempts as att
+from scripts.e2e.regional import general_live_network_isolation as isolation
 from scripts.e2e.regional import general_live_terminal_replay as replay
 from scripts.e2e.regional.general_live_fixture import VariantInconclusive
 from scripts.e2e.regional.general_live_restart_budget import BUDGET_PROBE
@@ -95,14 +96,17 @@ def attempt_doc(
     incident_state: str = "ACTION_PENDING",
     duplicate: bool = False,
     restart_attempt_id: str | None = None,
+    restart_details: dict[str, Any] | None = None,
     restarts: int = 1,
     extra_attempts: dict[str, dict[str, Any]] | None = None,
     notifications: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """One attempt's records. ``restart_attempt_id`` is what the product's
-    RESTART_WORKLOAD execution recorded; ``restarts`` recovery workflows carry
-    it; ``extra_attempts`` are further attempt entries (a restart copy's);
-    ``notifications`` the attempt's incidents' notifications (one by default)."""
+    RESTART_WORKLOAD execution recorded and ``restart_details`` the rest of its
+    details; ``restarts`` recovery workflows carry it; ``extra_attempts`` are
+    further attempt entries (a restart copy's); ``notifications`` the attempt's
+    incidents' notifications (one by default). The containment's
+    STOP_WORKLOADS executed SUCCEEDED, as the product records it."""
 
     reservations = (
         reservations
@@ -110,11 +114,19 @@ def attempt_doc(
         else [f"res-{i}" for i in range(restart_count)]
     )
     containment_wf = workflow(
-        "wf-c", "inc-c", list(containment_ops), status="SUCCEEDED"
+        "wf-c",
+        "inc-c",
+        list(containment_ops),
+        status="SUCCEEDED",
+        executions=[
+            {"operation": op, "status": "SUCCEEDED"}
+            for op in containment_ops
+            if op == "STOP_WORKLOADS"
+        ],
     )
     recovery = []
     if recovery_ops:
-        details: dict[str, Any] = {"reason": restart_reason}
+        details: dict[str, Any] = {"reason": restart_reason, **(restart_details or {})}
         if restart_attempt_id:
             details["restart_attempt_id"] = restart_attempt_id
         executions = (
@@ -209,11 +221,23 @@ def test_nonzero_exit_passes(tmp_path: Path) -> None:
     def responder(script: str, *a: str) -> dict[str, Any]:
         nonlocal attempt_id
         attempt_id = a[2]
-        return attempt_doc(attempt_id)
+        return restarted_doc(attempt_id)
 
     ctx.regional.cpu_python_responder = responder
     result = spec.execute(ctx)
     assert result["verdict"] == "PASS", result["errors"]
+
+
+def restarted_doc(attempt_id: str, **values: Any) -> dict[str, Any]:
+    """Restarted once within budget, as the product records it: the recovery
+    workflow's own reservation and the copy's attempt id."""
+
+    return attempt_doc(
+        attempt_id,
+        reservations=["wf-r0/0/RESTART_WORKLOAD"],
+        restart_attempt_id=f"{attempt_id}-r-1",
+        **values,
+    )
 
 
 def _run(spec_name: str, tmp_path: Path, build) -> dict[str, Any]:
@@ -221,6 +245,14 @@ def _run(spec_name: str, tmp_path: Path, build) -> dict[str, Any]:
     captured: dict[str, Any] = {}
 
     def responder(script: str, *a: str) -> dict[str, Any]:
+        if script is isolation.ISOLATION_RECORDS_PROBE:
+            # The watcher's observation of the restart copy (028 one_restart).
+            copy = f"{captured['attempt_id']}-r-1"
+            return {
+                "observations": [
+                    {"attempt_id": copy, "job_id": a[1], "workload_phase": "RUNNING"}
+                ]
+            }
         captured["attempt_id"] = a[2]
         return build(a[2])
 
@@ -236,18 +268,10 @@ def _run(spec_name: str, tmp_path: Path, build) -> dict[str, Any]:
 
 
 def test_one_restart_and_budget_consumed(tmp_path: Path) -> None:
-    assert (
-        _run("one_restart", tmp_path, lambda aid: attempt_doc(aid, restart_count=1))[
-            "verdict"
-        ]
-        == "PASS"
-    )
-    assert (
-        _run(
-            "budget_consumed", tmp_path, lambda aid: attempt_doc(aid, restart_count=1)
-        )["verdict"]
-        == "PASS"
-    )
+    result = _run("one_restart", tmp_path, restarted_doc)
+    assert result["verdict"] == "PASS", result["errors"]
+    result = _run("budget_consumed", tmp_path, restarted_doc)
+    assert result["verdict"] == "PASS", result["errors"]
 
 
 def test_one_restart_fails_on_double_deduction(tmp_path: Path) -> None:
@@ -468,7 +492,7 @@ def test_old_terminal_replays_the_recorded_terminal_against_a_running_copy(
         ({"duplicate": False}, "replay_duplicate", "decided anew"),
         ({"plan": "plan-2"}, "replay_duplicate", "recovery_plan_id"),
         ({"restarts": 2}, "single_restart", "2 restart workflows"),
-        ({"restart_count": 2}, "budget", "exceeds"),
+        ({"restart_count": 2}, "budget", "expected exactly 1"),
         (
             {
                 "new_attempt_records": {
@@ -607,20 +631,38 @@ def test_terminal_replay_probe_redelivers_the_stored_event_and_refuses_strangers
     assert len(handled) == 1, "a refused replay redelivers nothing"
 
 
-def test_restart_withheld_passes(tmp_path: Path) -> None:
-    result = _run(
-        "restart_withheld",
-        tmp_path,
-        lambda aid: attempt_doc(
-            aid,
-            restart_count=0,
-            reservations=[],
-            recovery_ops=("RESTART_WORKLOAD",),
-            restart_status="WAITING",
-            restart_reason="RESTART_BUDGET_EXHAUSTED",
-            incident_state="ESCALATED",
-        ),
+def withheld_doc(attempt_id: str) -> dict[str, Any]:
+    """Budget 0, as the product records the withheld restart: one FAILED
+    RESTART_WORKLOAD for the exhausted budget naming the one notice."""
+
+    job = attempt_id.rsplit("-", 1)[0]
+    return attempt_doc(
+        attempt_id,
+        restart_count=0,
+        reservations=[],
+        recovery_ops=("RESTART_WORKLOAD",),
+        restart_status="FAILED",
+        restart_reason="RESTART_BUDGET_EXHAUSTED",
+        restart_details={
+            "restart_count": 0,
+            "restart_budget": 0,
+            "notification_id": "n-budget",
+        },
+        incident_state="ESCALATED",
+        notifications=[
+            {
+                **notification("n-budget", "inc-r0"),
+                "category": "GENERAL",
+                "deduplication_key": (
+                    f"gpu-eks-cluster/{job}/restart-budget-exhausted/0"
+                ),
+            }
+        ],
     )
+
+
+def test_restart_withheld_passes(tmp_path: Path) -> None:
+    result = _run("restart_withheld", tmp_path, withheld_doc)
     assert result["verdict"] == "PASS", result["errors"]
 
 
@@ -727,7 +769,7 @@ def test_duplicate_event_redelivers_the_same_terminal_and_nothing_changes(
     [
         ({"duplicate": False}, "replay_duplicate", "decided anew"),
         ({"plan": "plan-2"}, "replay_duplicate", "recovery_plan_id"),
-        ({"after": {"restart_count": 2}}, "budget", "exceeds"),
+        ({"after": {"restart_count": 2}}, "budget", "expected exactly 1"),
         ({"after": {"restart_count": 2}}, "unchanged", "restart_count changed"),
         (
             {"after": {"reservations": ["res-9"]}},
@@ -777,19 +819,7 @@ def test_unchanged_errors_reads_only_the_attempts_own_records() -> None:
 
 
 def test_single_notification(tmp_path: Path) -> None:
-    result = _run(
-        "single_notification",
-        tmp_path,
-        lambda aid: attempt_doc(
-            aid,
-            restart_count=0,
-            reservations=[],
-            recovery_ops=("RESTART_WORKLOAD",),
-            restart_status="WAITING",
-            restart_reason="RESTART_BUDGET_EXHAUSTED",
-            incident_state="ESCALATED",
-        ),
-    )
+    result = _run("single_notification", tmp_path, withheld_doc)
     assert result["verdict"] == "PASS", result["errors"]
 
 

@@ -87,6 +87,47 @@ TWO_NODE = "gpu-fault-two-node-replace"
 #: The product's restart suffix of the live leftover's attempt id.
 RESTART = "-r-8856497f"
 RESTART_OPERATION = "workflow-restart/0/RESTART_WORKLOAD"
+
+
+def restarted_entry(job_id: str) -> dict[str, Any]:
+    """The product's settled records of a failed attempt it stopped and
+    restarted once: the containment's STOP_WORKLOADS and the recovery's
+    RESTART_WORKLOAD both SUCCEEDED, the latter naming the copy's attempt id,
+    the recovery workflow owning the ledger's reservation (RESTART_OPERATION)."""
+
+    return {
+        "decision": {"status": "PLAN_CREATED"},
+        "event": {"terminal_status": "FAILED"},
+        "containment_incident": {"incident_id": f"incident-{job_id}"},
+        "containment_workflows": [
+            {
+                "official_steps": [{"operation": "STOP_WORKLOADS"}],
+                "step_executions": [
+                    {"operation": "STOP_WORKLOADS", "status": "SUCCEEDED"}
+                ],
+            }
+        ],
+        "recovery": [
+            {
+                "workflow": {
+                    "request_id": RESTART_OPERATION.split("/", 1)[0],
+                    "status": "SUCCEEDED",
+                    "official_steps": [{"operation": "RESTART_WORKLOAD"}],
+                    "step_executions": [
+                        {
+                            "operation": "RESTART_WORKLOAD",
+                            "status": "SUCCEEDED",
+                            "details": {
+                                "restart_attempt_id": f"{job_id}-a001{RESTART}"
+                            },
+                        }
+                    ],
+                }
+            }
+        ],
+    }
+
+
 JOB_LABEL = "gpu-fault.io/job-id"
 ATTEMPT_LABEL = "gpu-fault.io/attempt-id"
 #: What one p5en-class GPU node allocates (the manifests' resource profile).
@@ -941,19 +982,11 @@ def test_cleanup_removes_the_job_the_product_restarted_in_place(
             restarted.update(copy.deepcopy(job))
             children.update(cluster.children())
         (attempt,) = attempt_ids
-        entry = {
-            "decision": {"status": "PLAN_CREATED"},
-            "event": {"terminal_status": "FAILED"},
-            "containment_incident": {"incident_id": "incident-1"},
-            "containment_workflows": [
-                {"official_steps": [{"operation": "STOP_WORKLOADS"}]}
-            ],
-            "recovery": [
-                {"workflow": {"official_steps": [{"operation": "RESTART_WORKLOAD"}]}}
-            ],
-        }
         budget = {"restart_count": 1, "reservation_ids": [RESTART_OPERATION]}
-        return {"attempts": {attempt: entry}, "restart_budget": budget}
+        return {
+            "attempts": {attempt: restarted_entry(job_id)},
+            "restart_budget": budget,
+        }
 
     monkeypatch.setattr(attempts, "attempt_records", product_records)
 

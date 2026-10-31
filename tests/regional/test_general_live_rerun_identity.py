@@ -76,6 +76,7 @@ from tests.regional.test_general_live_managed_job_cleanup import (
     execute,
     install,
     journal,
+    restarted_entry,
     variant_context,
 )
 from tests.regional.test_general_live_managed_job_start import (
@@ -269,22 +270,12 @@ def test_plan_and_execute_compute_the_same_identity(
 def budgeted_restart(
     regional: Any, cluster_id: str, job_id: str, attempt_ids: list[str]
 ) -> dict[str, Any]:
-    """The product's records of a failed attempt it stopped and restarted."""
+    """The product's settled records of a failed attempt it stopped and
+    restarted once (028 grades the restart's outcome, not its plan)."""
 
     (attempt,) = attempt_ids
-    entry = {
-        "decision": {"status": "PLAN_CREATED"},
-        "event": {"terminal_status": "FAILED"},
-        "containment_incident": {"incident_id": f"incident-{job_id}"},
-        "containment_workflows": [
-            {"official_steps": [{"operation": "STOP_WORKLOADS"}]}
-        ],
-        "recovery": [
-            {"workflow": {"official_steps": [{"operation": "RESTART_WORKLOAD"}]}}
-        ],
-    }
     budget = {"restart_count": 1, "reservation_ids": [RESTART_OPERATION]}
-    return {"attempts": {attempt: entry}, "restart_budget": budget}
+    return {"attempts": {attempt: restarted_entry(job_id)}, "restart_budget": budget}
 
 
 def test_a_rerun_of_a_managed_job_variant_runs_under_the_next_identity(
