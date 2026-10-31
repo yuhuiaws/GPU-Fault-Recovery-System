@@ -40,6 +40,13 @@ from gpu_fault_release.regional_release_config import (
 from gpu_fault_release.regional_release_departed_nodes import (
     departed_workflow_exclusions,
 )
+from gpu_fault_release.regional_release_departure_absorption import (
+    WaveDepartures,
+    barrier_failure_details,
+    settle_departed_barrier_nodes,
+    without_recorded_departures,
+)
+from gpu_fault_release.regional_release_errors import WaveAgentSafetyError
 from gpu_fault_release.regional_release_gpu_rollout import gpu_node_items
 from gpu_fault_release.regional_release_images import NodeDependencyTarget
 from gpu_fault_release.regional_release_interfaces import AgentNodeSet
@@ -124,6 +131,8 @@ class FleetWaveContext:
     template_content_sha256: str | None = None
     #: The DCGM host engine mode a forward wave waits for (eks-managed only).
     dcgm_hostengine: str | None = None
+    #: A forward rollout's departure handling (``WaveDepartures``); None: none.
+    departures: Any = None
 
     @property
     def node_dependency_target(self) -> NodeDependencyTarget:
@@ -537,44 +546,48 @@ def wait_candidate_cpu_agent_heartbeats(
         for cluster_id, node_ids in expected_by_cluster.items()
         if node_ids
     }
+    # A node this release already proved departed is not waited for again.
+    expected_by_cluster = without_recorded_departures(release, expected_by_cluster)
     if not expected_by_cluster:
         return
-    raw = exec_cpu_ingress_probe(
-        release,
-        script=probe_source("agent_heartbeat_barrier"),
-        failure="release safety checks",
-        input_text=json.dumps(
-            {
-                "expected_by_cluster": expected_by_cluster,
-                "timeout_seconds": timeout_seconds,
-                "poll_seconds": poll_seconds,
-                "minimum_lease_remaining_seconds": (minimum_lease_remaining_seconds),
-                "required_identity": required_identity,
-                # Per-cluster pins win over the site pin for the clusters named.
-                "required_identities": required_identities,
-            }
-        ),
-        timeout_seconds=max(30, int(timeout_seconds) + 30),
-        # The in-Pod barrier already spends the full window; never pay it twice.
-        retries=0,
-    )
-    try:
-        result = json.loads(raw)
-    except (TypeError, json.JSONDecodeError) as exc:
-        raise ReleaseError(
-            "candidate CPU Agent heartbeat barrier returned invalid evidence"
-        ) from exc
-    if not isinstance(result, dict):
-        raise ReleaseError(
-            "candidate CPU Agent heartbeat barrier returned invalid evidence"
+
+    def barrier(expected: dict[str, list[str]]) -> dict[str, Any]:
+        raw = exec_cpu_ingress_probe(
+            release,
+            script=probe_source("agent_heartbeat_barrier"),
+            failure="release safety checks",
+            input_text=json.dumps(
+                {
+                    "expected_by_cluster": expected,
+                    "timeout_seconds": timeout_seconds,
+                    "poll_seconds": poll_seconds,
+                    "minimum_lease_remaining_seconds": minimum_lease_remaining_seconds,
+                    "required_identity": required_identity,
+                    # Per-cluster pins win over the site pin for the clusters named.
+                    "required_identities": required_identities,
+                }
+            ),
+            timeout_seconds=max(30, int(timeout_seconds) + 30),
+            # The in-Pod barrier already spends the full window; never pay it twice.
+            retries=0,
         )
+        try:
+            result = json.loads(raw)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ReleaseError(
+                "candidate CPU Agent heartbeat barrier returned invalid evidence"
+            ) from exc
+        if not isinstance(result, dict):
+            raise ReleaseError(
+                "candidate CPU Agent heartbeat barrier returned invalid evidence"
+            )
+        return result
+
+    # A node the provider reclaimed since the capture is set aside on the
+    # shared departure proof; an absence it cannot prove still fails here.
+    result = settle_departed_barrier_nodes(release, expected_by_cluster, barrier)
     if result.get("status") != "PASSED":
-        diagnostics = {
-            "expected_count": result.get("expected_count"),
-            "refreshed_count": result.get("refreshed_count"),
-            "blocker_count": result.get("blocker_count"),
-            "blockers": result.get("blockers"),
-        }
+        diagnostics = barrier_failure_details(result)
         prefix = (
             "fleet has not reached the candidate Agent pin, so the compatibility "
             "window stays open: "
@@ -767,7 +780,7 @@ def ensure_rollout_wave_safe(
         if not blocker_count:
             return snapshot
         if time.monotonic() >= deadline:
-            raise ClusterLocalReleaseError(
+            raise WaveAgentSafetyError(
                 f"{target.cluster_id} fleet wave Agent safety did not converge: "
                 + json.dumps(
                     {
@@ -778,7 +791,9 @@ def ensure_rollout_wave_safe(
                         ),
                     },
                     sort_keys=True,
-                )
+                ),
+                blockers=blockers[:100],
+                blocker_count=blocker_count,
             )
         time.sleep(max(0.0, poll_seconds))
 
@@ -966,6 +981,7 @@ def run_fleet_waves(
     deployment: dict[str, Any],
 ) -> None:
     safety_node_names = set(context.node_names)
+    departures = context.departures or WaveDepartures(release, target, enabled=False)
     while deployment.get("status") != "SUCCEEDED":
         if deployment.get("status") == "FAILED":
             raise ReleaseError(f"{target.cluster_id} fleet deployment failed")
@@ -1001,11 +1017,11 @@ def run_fleet_waves(
             # in a rollback -- a control-plane write. This one measures how much
             # the lease evidence has aged, which starts at the probe.
             probe_started = time.monotonic()
-            safety = ensure_rollout_wave_safe(
-                release,
-                target,
+            # A node outside the wave that provably left leaves the safety set.
+            safety = departures.wave_safety(
+                ensure_rollout_wave_safe,
                 wave=expected_wave,
-                node_names=tuple(sorted(safety_node_names)),
+                safety_node_names=safety_node_names,
             )
             lease = release._fleet_command(
                 "next-wave",
@@ -1090,8 +1106,10 @@ def run_fleet_waves(
                 legacy_identity=context.allow_legacy_identity,
                 agent_identity=context.agent_identity,
                 dcgm_hostengine=context.dcgm_hostengine,
+                **departures.wait_options(),
             )
             safety_node_names.update(wave)
+            safety_node_names.difference_update(departures.departed_ids)
             install_seconds = time.monotonic() - install_started
             if context.phase == "rollback":
                 record_rollback_wave_event(
@@ -1100,9 +1118,9 @@ def run_fleet_waves(
                     wave=wave,
                     event="agents_converged",
                 )
-            deployment = release._fleet_command(
-                "get",
-                {"deployment_id": context.deployment_id},
+            deployment = departures.reconcile_record(
+                release._fleet_command("get", {"deployment_id": context.deployment_id}),
+                context.deployment_id,
             )
             # Split three ways because the three are fixed by different things:
             # `safety` by the Agent leases and open commands, `handoff` by the

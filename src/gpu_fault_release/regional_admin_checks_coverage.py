@@ -54,6 +54,7 @@ from gpu_fault.dcgm_versions import (
     dcgm_version_relation,
     hostengine_version,
 )
+from gpu_fault_release.regional_admin_checks_churn import churn_excused
 from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_release_dcgm import (
     check_dcgm_hostengine_agreement,
@@ -450,10 +451,17 @@ def check_agent_coverage(
     """Refuse a cluster whose counted Agents do not match its Ready Nodes.
 
     Returns the counted Agents for the checks that follow (Runtime Profile,
-    readiness), so a retired record is judged by none of them.
+    readiness), so a retired record is judged by none of them. A verify's
+    report also names what the release's own node churn excuses
+    (``regional_admin_checks_churn``): those nodes' Agents are not counted.
     """
 
-    agents = counted_agents(cluster)
+    excused = churn_excused(cluster)
+    agents = [
+        item
+        for item in counted_agents(cluster)
+        if str(item.get("node_id")) not in excused
+    ]
     if not agents:
         raise ReleaseError(f"{cluster_id} has no registered Node Agents")
     expected_nodes = {str(item) for item in cluster.get("expected_node_ids") or []}

@@ -337,17 +337,9 @@ def departure_proof(
     return DepartureProof(tuple(departed), tuple(unproven))
 
 
-def record_departed_nodes(
-    release: Any,
-    target: ClusterTarget,
-    departed: Sequence[Mapping[str, Any]],
-    *,
-    phase: str,
+def _narrate_departed(
+    target: ClusterTarget, departed: Sequence[Mapping[str, Any]], *, phase: str
 ) -> None:
-    """Keep the proof in the state the next checkpoint writes, and say so."""
-
-    if not departed:
-        return
     narrate_step(
         "departed-node-excluded",
         cluster=target.cluster_id,
@@ -362,6 +354,25 @@ def record_departed_nodes(
         )
         or "-",
     )
+
+
+def record_departed_nodes(
+    release: Any,
+    target: ClusterTarget,
+    departed: Sequence[Mapping[str, Any]],
+    *,
+    phase: str,
+    narrate: bool = True,
+) -> None:
+    """Keep the proof in the state the next checkpoint writes, and say so.
+
+    ``narrate=False`` amends rows already narrated (the forward path adds the
+    fleet deployment a departed node was taken out of)."""
+
+    if not departed:
+        return
+    if narrate:
+        _narrate_departed(target, departed, phase=phase)
     state = getattr(release, "state", None)
     if not isinstance(state, dict):
         return

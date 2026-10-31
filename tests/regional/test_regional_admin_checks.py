@@ -649,7 +649,7 @@ def healthy_control_api_report() -> dict:
 
 def control_api_check(monkeypatch, report: dict):
     module = CHECKS
-    monkeypatch.setattr(module, "_control_api_report", lambda _release: report)
+    monkeypatch.setattr(module, "_control_api_report", lambda _release, **_: report)
     return module, module._check_control_api
 
 

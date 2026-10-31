@@ -402,7 +402,9 @@ def control_api_finding(
             CHECKS, name, lambda *_args, name=name, **_kwargs: CHECKS.CheckValue(name)
         )
     monkeypatch.setattr(
-        CHECKS, "_control_api_report", lambda _release: control_api_report(stale())
+        CHECKS,
+        "_control_api_report",
+        lambda _release, **_options: control_api_report(stale()),
     )
     clock = Clock()
     fetch = Fetcher(answers)

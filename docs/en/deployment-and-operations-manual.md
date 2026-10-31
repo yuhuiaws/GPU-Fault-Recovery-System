@@ -1009,7 +1009,13 @@ server certificate for that stable hostname:
   `rollout_wave_safety` lists never-dispatched PENDING destructive records separately as `never_dispatched_destructive_workflows`
   (with the incident's cluster and nodes, still counted in `destructive_workflow_count`) and the engine sets one aside only on
   that proof. The proof is written to the release state as `departed_nodes` and logged as `departed-node-excluded`; anything
-  short of it fails closed, naming the node and the reason (Administrator Operations §10.2, "a spot reclaim mid-release").
+  short of it fails closed, naming the node and the reason (Administrator Operations §10.2, "a spot reclaim mid-release"). The
+  forward path's candidate CPU heartbeat barrier, wave gate and wave convergence wait absorb a departed node on the same proof
+  (the probe `fleet_deployment_command`'s `exclude-departed` takes it out of the fleet deployment, which ends `SUCCEEDED` over
+  the remaining nodes; a proof that does not hold yet is re-read every 30 s for at most 10 minutes); a node that joins during
+  the release is in no wave, the steady-state Reconciler installs it, and one not installed within a 300 s grace is recorded
+  `pending` in `live_release.joined_nodes` without failing the release (Administrator Operations §5.0, "a node that leaves or
+  joins while a release runs").
 - The certificate SAN must cover the full stable private hostname; a short CN alone is not enough.
 - Import the server certificate and private key into ACM and terminate TLS at the NLB 443 listener.
 - The NLB Security Group only allows TCP 443 from the NAT EIPs of each GPU cluster.

@@ -34,6 +34,7 @@ import time
 from typing import Any, Callable
 
 from gpu_fault.admin.deadlines import DeploymentDeadlineExceeded, remaining_timeout
+from gpu_fault_release.regional_admin_checks_churn import churn_departed
 from gpu_fault_release.regional_release_config import CheckFailure, ReleaseError
 from gpu_fault_release.regional_release_probes import probe_source
 from gpu_fault_release.regional_release_runtime_identity import (
@@ -111,13 +112,20 @@ def judge_collector_readiness(
         cluster_id: (cluster or {}).get("collector_readiness")
         for cluster_id, cluster in clusters.items()
     }
+    # A verify does not wait for the collectors of a node the release proved
+    # departed: nothing will refresh them until the cleanup retires the Agent.
+    excused = {
+        cluster_id: churn_departed(cluster)
+        for cluster_id, cluster in clusters.items()
+        if isinstance(cluster, dict) and churn_departed(cluster)
+    }
     thresholds = _thresholds(report)
     budget = _capped_grace(grace_seconds)
     started = monotonic()
     remaining = budget
     polls = 0
     probe_errors: list[str] = []
-    pending = _not_ready(snapshots)
+    pending = _not_ready(snapshots, excused)
     while pending and remaining > 0:
         pause = min(poll_seconds, remaining)
         sleep(pause)
@@ -138,7 +146,7 @@ def judge_collector_readiness(
                 if cluster_id in fresh["clusters"]:
                     snapshots[cluster_id] = fresh["clusters"][cluster_id]
             thresholds = _thresholds(fresh) or thresholds
-            pending = _not_ready(snapshots)
+            pending = _not_ready(snapshots, excused)
         # The probe's own duration counts against the grace as well.
         remaining = min(remaining, budget - (monotonic() - started))
     evidence = {
@@ -159,6 +167,10 @@ def judge_collector_readiness(
             for cluster_id, snapshot in snapshots.items()
         },
     }
+    if excused:
+        evidence["departed_not_awaited"] = {
+            cluster_id: sorted(nodes) for cluster_id, nodes in excused.items()
+        }
     if pending:
         raise CheckFailure(_failure_message(pending, evidence), evidence)
     return evidence
@@ -175,12 +187,34 @@ def _capped_grace(grace: float) -> float:
         return 0.0
 
 
-def _not_ready(snapshots: dict[str, Any]) -> list[str]:
+def _not_ready(
+    snapshots: dict[str, Any], excused: dict[str, frozenset[str]] | None = None
+) -> list[str]:
     return [
         cluster_id
         for cluster_id, snapshot in snapshots.items()
-        if not (isinstance(snapshot, dict) and snapshot.get("ready") is True)
+        if not _ready(snapshot, (excused or {}).get(cluster_id, frozenset()))
     ]
+
+
+def _ready(snapshot: Any, excused: frozenset[str]) -> bool:
+    """Ready as the control plane said, or held back by excused nodes alone."""
+
+    if not isinstance(snapshot, dict):
+        return False
+    if snapshot.get("ready") is True:
+        return True
+    nodes = snapshot.get("nodes")
+    if not excused or not isinstance(nodes, list):
+        return False
+    counted = [
+        node
+        for node in nodes
+        if not (isinstance(node, dict) and str(node.get("node_id")) in excused)
+    ]
+    return bool(counted) and all(
+        isinstance(node, dict) and node.get("ready") is True for node in counted
+    )
 
 
 def _thresholds(document: dict[str, Any]) -> dict[str, float]:

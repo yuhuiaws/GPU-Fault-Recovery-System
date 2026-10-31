@@ -19,6 +19,21 @@ class ClusterLocalReleaseError(ReleaseError):
     pass
 
 
+class WaveAgentSafetyError(ClusterLocalReleaseError):
+    """A fleet wave's safety gate timed out on unhealthy Agents outside the wave.
+
+    Carries the probe's blockers so the forward path can tell an Agent whose
+    node left (``regional_release_departure_absorption``) from one that is down.
+    """
+
+    def __init__(
+        self, message: str, *, blockers: list[Any], blocker_count: int
+    ) -> None:
+        super().__init__(message)
+        self.blockers = list(blockers)
+        self.blocker_count = blocker_count
+
+
 class PartialClusterRolloutError(ReleaseError):
     pass
 

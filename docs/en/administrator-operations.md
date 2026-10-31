@@ -1904,6 +1904,42 @@ launched, so the group runs that node short from the termination until the repla
   to fail with `node action secret is unavailable for <node>` in the very second the installer Job completed, and a
   destructive action failing that way would have quarantined a healthy node. Outside the grace it still fails closed.
 
+**A node that leaves or joins while a release runs (both providers).** When `deploy` starts, the snapshot records each
+cluster's Agent node set (`agent_identities[<cluster>].node_ids`), and when each cluster's roll starts the fleet deployment
+fixes its own node list. A change of node group / instance group capacity after that no longer fails or rolls back a
+healthy release:
+- **A node leaves** (spot reclaim, scale-in, provider replacement): when the candidate CPU heartbeat barrier, a later wave's
+  safety gate or the convergence wait inside a wave meets an Agent that stopped heartbeating, it reads the same three-way
+  proof of departure the rollback verification uses (§10.2, "a spot reclaim mid-release"). A node the proof holds for is
+  excluded: recorded under `departed_nodes` in the release state (the row's `excluded_at` is `cpu-heartbeat-barrier` or
+  `fleet-wave`) and logged as `departed-node-excluded`; a node not yet on the new version is taken out of the fleet
+  deployment's nodes and waves by the `exclude-departed` operation of the control-plane probe `fleet_deployment_command` (the
+  row gains `fleet_deployment`, the log `fleet-deployment-node-excluded`), so the record ends `SUCCEEDED` over the nodes that
+  remain instead of `FAILED`; a node that left after it converged stays `READY`; if the excluded node was the canary, the next
+  node goes alone first. Right after a reclaim the proof usually does not hold yet (the Node still NotReady, EC2 still
+  `shutting-down`, HyperPod still listing the instance, the Agent lease still live): the engine re-reads it every 30 s for at
+  most 10 minutes (the product's departure guard) and then fails closed, naming the node and the reason (`… names nodes missing
+  from Kubernetes that are not provably departed: <node>: <reason>`). An Agent that still heartbeats (a pin not aligned, say)
+  or a silent Agent on a Node that is still Ready is no departure and fails at once, as before.
+- **A node joins**: a node outside the snapshot's set is a newcomer. A newcomer not yet installed when the cluster's roll starts
+  is in no wave and not in the pre-mutation gate (log `joined-nodes cluster=… phase=node-rollout
+  deferred=<node>:<installer-state>`). When the roll ends and the steady-state Reconciler is handed `*`, every planned node must
+  still converge as before; newcomers get a 300 s grace from that moment: one installed inside it is recorded `installed`, the
+  rest `pending` (log `joined-nodes … pending=<node>:<state>`), and the release carries on while the steady-state Reconciler
+  finishes them. A newcomer that joins carrying the previous version's installation gets no grace: like a planned node, the
+  release waits for the Reconciler to re-install it, and `agents did not converge` if it does not.
+- The driver's `verify` does not fail a release on its own churn: a newcomer still being installed is left out of the
+  installer check, the Agent coverage and the fleet readiness question, and named in a WARN of `gpu_cluster:<cluster>` and
+  `control_api` (`joined_nodes_installing`, `release_churn`); the Agent record of a node this release proved departed and that
+  has no Kubernetes Node any more (ACTIVE with a lapsed lease until the departed-node cleanup retires it) is not counted as
+  coverage, Runtime Profile or a collector to wait for. The stability window lists the DaemonSet Pods of newcomers under
+  `joined_node_pods` without judging them. An installed newcomer is judged like every node -- installed with any artifact
+  but the release's it is `artifact drift` -- and `status` exempts nothing: a newcomer still reads `installer is not
+  Succeeded` until it is installed.
+- Where to look: `live_release.departed_nodes` and `live_release.joined_nodes` (each newcomer's `outcome`, `installer_state`,
+  `joined_at`) in `gpu-fault-admin status --state-dir <dir>`. A paused release resumed after a node joined is still refused
+  with `resume node set drifted`; the waves of a rollback, a join and a bootstrap do none of the above.
+
 The join's commit path pays only for the new cluster, and the `evidence` in `state.json` shows the scope of every step:
 
 - `COLLECTORS_READY`: waits only for the "fast" collectors (configured unconditional reporting period <= 60 s, currently
@@ -5751,7 +5787,9 @@ provider, instance id, the Kubernetes and provider readings with their times, th
 `departed-node-excluded cluster=… phase=… nodes=… agents=… retire=…`. Anything short of it -- the instance still listed, the
 EC2 instance running or stopped, a failed AWS call, a node name without an instance id, an Agent with a live lease -- keeps
 failing closed, and the refusal names the node and the reason (`<cluster> rollback Agent node set names nodes missing from
-Kubernetes that are not provably departed: <node>: …`). The operator's exit, with no hand edit:
+Kubernetes that are not provably departed: <node>: …`). The forward path (the candidate CPU heartbeat barrier, the fleet wave
+gate and the wave convergence wait) absorbs a node that leaves mid-release on the same proof, see §5.0, "a node that leaves or
+joins while a release runs". The operator's exit, with no hand edit:
 
 ```bash
 # 1. Rerun the same deploy unchanged with a build carrying this fix: the engine resumes the rollback, the verification

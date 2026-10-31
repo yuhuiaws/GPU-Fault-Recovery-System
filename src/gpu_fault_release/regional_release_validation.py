@@ -22,6 +22,7 @@ from gpu_fault_release.regional_release_departed_nodes import (
     departed_node_ids,
     kubernetes_node_names,
 )
+from gpu_fault_release.regional_release_joined_nodes import captured_node_ids
 from gpu_fault_release.regional_release_diff import (
     ReleaseChangeKind,
     ReleaseComponent,
@@ -651,9 +652,20 @@ def wait_for_stability_baseline(
 
 
 def stability_snapshot(release: Any) -> dict[str, Any]:
+    joined: list[str] = []
+
     def collect(plane: str, kubectl: list[str]) -> tuple[dict[str, int], list[str]]:
         restarts: dict[str, int] = {}
         not_ready: list[str] = []
+        # A GPU node outside the node set the release captured joined while it
+        # ran: its DaemonSet Pods start with it (the DCGM exporter waits for
+        # the host engine its installer has not put there yet), which says
+        # nothing about the release. They are reported, not judged.
+        captured = (
+            None
+            if plane == "cpu"
+            else captured_node_ids(getattr(release, "state", None), plane)
+        )
         value = release._get_json(
             kubectl
             + [
@@ -673,6 +685,15 @@ def stability_snapshot(release: Any) -> dict[str, Any]:
             ):
                 continue
             name = str(metadata.get("name") or "")
+            node = str((pod.get("spec") or {}).get("nodeName") or "")
+            if (
+                captured is not None
+                and node
+                and node not in captured
+                and any(owner.get("kind") == "DaemonSet" for owner in owners)
+            ):
+                joined.append(f"{plane}/{name}@{node}")
+                continue
             status = pod.get("status", {})
             ready = any(
                 condition.get("type") == "Ready" and condition.get("status") == "True"
@@ -722,6 +743,7 @@ def stability_snapshot(release: Any) -> dict[str, Any]:
         "queue": store.get("queue") or {},
         "remote_commands": store.get("remote_commands") or {},
         "critical_alerts": critical_alerts,
+        **({"joined_node_pods": sorted(joined)} if joined else {}),
     }
 
 

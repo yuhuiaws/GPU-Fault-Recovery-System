@@ -15,7 +15,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, cast
 from urllib.parse import urlsplit
 
+from gpu_fault_release import regional_admin_checks_churn as release_churn
 from gpu_fault_release import regional_admin_checks_coverage as agent_coverage
+from gpu_fault_release.regional_admin_checks_nlb_rules import (
+    nlb_https_rule_violation as nlb_https_rule_violation,
+    permission_reaches_https as permission_reaches_https,
+)
 from gpu_fault_release.regional_admin_checks_coverage import node_scope_report
 from gpu_fault_release.regional_admin_checks_coverage import selected_nodes
 from gpu_fault_release import regional_admin_checks_readiness as readiness
@@ -496,75 +501,6 @@ def _subnet_has_igw_default_route(
         for table in tables
         for route in table.get("Routes", [])
     )
-
-
-def _is_exact_https_tcp(permission: dict[str, Any]) -> bool:
-    """True only for a rule scoped to exactly tcp/443-443."""
-
-    return (
-        str(permission.get("IpProtocol")) == "tcp"
-        and permission.get("FromPort") == 443
-        and permission.get("ToPort") == 443
-    )
-
-
-def permission_reaches_https(permission: dict[str, Any]) -> bool:
-    """True if the rule admits TCP traffic to port 443.
-
-    A `FromPort`-only check misses a wide range (443-65535), the all-traffic
-    protocol ("-1"), or a range that starts below 443 and spans past it. Any of
-    those admits the HTTPS port and must be inspected, not skipped.
-    """
-
-    protocol = str(permission.get("IpProtocol"))
-    if protocol == "-1":
-        return True
-    if protocol != "tcp":
-        return False
-    from_port = permission.get("FromPort")
-    to_port = permission.get("ToPort")
-    if from_port is None or to_port is None:
-        # A tcp rule with no port range covers every tcp port, 443 included.
-        return True
-    try:
-        return int(from_port) <= 443 <= int(to_port)
-    except (TypeError, ValueError):
-        return True
-
-
-def nlb_https_rule_violation(permission: dict[str, Any]) -> str | None:
-    """Return why an ingress rule that reaches TCP 443 is unacceptable, or None.
-
-    Only a rule scoped to exactly tcp/443-443 counts as the intended HTTPS
-    ingress. A wider port range (e.g. 443-65535), the all-traffic protocol
-    ("-1"), or any other shape that still admits 443 opens more than the NLB
-    listener and is rejected outright -- otherwise it would bypass the
-    0.0.0.0/0 exposure check below by not matching an exact-port comparison.
-    """
-
-    if not permission_reaches_https(permission):
-        return None
-    exposed_v4 = any(
-        item.get("CidrIp") == "0.0.0.0/0" for item in permission.get("IpRanges", [])
-    )
-    exposed_v6 = any(
-        item.get("CidrIpv6") == "::/0" for item in permission.get("Ipv6Ranges", [])
-    )
-    if not _is_exact_https_tcp(permission):
-        if exposed_v4 or exposed_v6:
-            return (
-                "NLB Security Group admits TCP 443 through an overly broad rule "
-                "exposed to the internet"
-            )
-        return (
-            "NLB Security Group admits TCP 443 through an overly broad rule "
-            "(expected exactly tcp/443-443)"
-        )
-    if exposed_v4:
-        return "NLB Security Group exposes TCP 443 to 0.0.0.0/0"
-    if exposed_v6:
-        return "NLB Security Group exposes TCP 443 to ::/0"
-    return None
 
 
 def _check_nlb_inputs(release: Any) -> CheckValue:
@@ -1172,16 +1108,24 @@ def run_read_only_verifiers(
     )
 
 
-def _control_api_report(release: Any) -> dict[str, Any]:
+def _control_api_report(release: Any, *, verify: bool = False) -> dict[str, Any]:
     expected_nodes = {}
     kubernetes_nodes = {}
+    # A verify leaves out the newcomers the steady-state Reconciler is installing.
+    joining = {}
     for target in release.config.clusters:
         _selector, nodes = selected_nodes(release, target)
         kubernetes_nodes[target.cluster_id] = sorted(
             item["metadata"]["name"] for item in nodes.get("items", [])
         )
+        ready = _ready_nodes(nodes)
+        joining[target.cluster_id] = release_churn.verify_joining(
+            release, target.cluster_id, ready, verify=verify
+        )
         expected_nodes[target.cluster_id] = sorted(
-            item["metadata"]["name"] for item in _ready_nodes(nodes)
+            name
+            for item in ready
+            if (name := item["metadata"]["name"]) not in joining[target.cluster_id]
         )
     result = json.loads(
         exec_cpu_ingress(
@@ -1208,6 +1152,8 @@ def _control_api_report(release: Any) -> dict[str, Any]:
         raise ReleaseError("control API report returned non-object evidence")
     agent_coverage.annotate_kubernetes_nodes(result, kubernetes_nodes)
     agent_coverage.annotate_dcgm_hostengine_live(result, release)
+    if verify:
+        release_churn.annotate_release_churn(result, release, joining)
     return result
 
 
@@ -1221,11 +1167,18 @@ def _control_api_pass(release: Any, report: dict[str, Any], verify: bool) -> Che
     report["collector_readiness"] = readiness.judge_collector_readiness(
         release, report, grace_seconds=readiness.grace_seconds(verify)
     )
-    return CheckValue("control-plane API, fleet and collectors are healthy", report)
+    return release_churn.with_churn(
+        CheckValue("control-plane API, fleet and collectors are healthy", report),
+        report,
+    )
 
 
 def _check_control_api(release: Any, *, verify: bool = False) -> CheckValue:
-    report = _control_api_report(release)
+    report = (
+        _control_api_report(release, verify=True)
+        if verify
+        else _control_api_report(release)
+    )
     if report.get("healthz", {}).get("status") != "ok":
         raise ReleaseError("control-plane /healthz is not ok")
     version = report.get("version") or {}
@@ -1361,7 +1314,9 @@ def _check_control_api(release: Any, *, verify: bool = False) -> CheckValue:
     return _control_api_pass(release, report, verify)
 
 
-def _check_gpu_cluster(release: Any, target: Any) -> CheckValue:
+def _check_gpu_cluster(
+    release: Any, target: Any, *, mode: str = "status"
+) -> CheckValue:
     details: dict[str, Any] = {"deployments": {}}
     for deployment in (*inventory.DEPLOYMENTS, inventory.GPU_RECONCILER_DEPLOYMENT):
         item = release._get_json(
@@ -1380,7 +1335,12 @@ def _check_gpu_cluster(release: Any, target: Any) -> CheckValue:
     expected_nodes = _ready_nodes(nodes)
     if not expected_nodes:
         raise ReleaseError(f"{target.cluster_id} has no Ready HyperPod nodes")
+    joining = release_churn.verify_joining(
+        release, target.cluster_id, expected_nodes, verify=mode == "verify"
+    )
     for item in expected_nodes:
+        if item["metadata"]["name"] in joining:
+            continue
         annotations = item.get("metadata", {}).get("annotations", {})
         if annotations.get("gpu-fault.io/installer-state") != "Succeeded":
             raise ReleaseError(
@@ -1427,7 +1387,8 @@ def _check_gpu_cluster(release: Any, target: Any) -> CheckValue:
     details["nodes"] = sorted(item["metadata"]["name"] for item in expected_nodes)
     details["executor_readiness"] = readiness
     details["tls"] = tls
-    return CheckValue(f"{target.cluster_id} data plane is healthy", details)
+    value = CheckValue(f"{target.cluster_id} data plane is healthy", details)
+    return release_churn.with_joining(value, target.cluster_id, joining)
 
 
 def _check_runtime_component_identity(release: Any) -> CheckValue:
@@ -1602,7 +1563,7 @@ def build_health_report(release: Any, *, mode: str) -> dict[str, Any]:
     specifications.extend(
         (
             f"gpu_cluster:{target.cluster_id}",
-            partial(_check_gpu_cluster, release, target),
+            partial(_check_gpu_cluster, release, target, mode=mode),
         )
         for target in release.config.clusters
     )

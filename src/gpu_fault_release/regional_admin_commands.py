@@ -58,6 +58,7 @@ from gpu_fault_release.regional_release_prerequisite_repair import (
 from gpu_fault_release.regional_release_departed_nodes import (
     departed_nodes_summary,
 )
+from gpu_fault_release.regional_release_joined_nodes import joined_nodes_summary
 from gpu_fault_release.regional_release_product_isolation import (
     PRODUCT_ISOLATED_NODES_STATE_KEY,
     operator_recovery_commands,
@@ -1013,6 +1014,7 @@ def build_release_summary(
             "schema_change_acceptance": state.get("schema_change_acceptance"),
             **product_isolation_summary(state),
             **departed_nodes_summary(state),
+            **joined_nodes_summary(state),
         }
         result["next_deploy"] = next_deploy(release, state)
     except Exception as exc:

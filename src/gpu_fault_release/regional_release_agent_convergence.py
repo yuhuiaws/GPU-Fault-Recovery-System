@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from typing import Any
 
 from gpu_fault.cluster_scope import selector_matches
@@ -143,12 +144,19 @@ def wait_agents(
     legacy_identity: bool = False,
     agent_identity: dict[str, Any] | None = None,
     dcgm_hostengine: str | None = None,
+    departed: Callable[[frozenset[str]], frozenset[str]] | None = None,
 ) -> None:
     """Wait until the Reconciler installed this identity on every selected
     node and the Agents' heartbeats report it; ``dcgm_hostengine`` (a forward
     rollout of an eks-managed cluster) also waits for the Agents installed in
     the cluster's DCGM host engine mode, so a mode flip is not waited out by
-    the identity alone."""
+    the identity alone.
+
+    ``departed`` (a forward rollout's departure watch) is asked about the named
+    nodes Kubernetes no longer lists and answers with the ones that provably
+    left: those stop being waited for, the rest hold the wait (the watch
+    refuses one it cannot prove in time). Without it a named node that is
+    gone is simply not counted, as before."""
 
     expected_bundle = None
     expected_template = None
@@ -187,6 +195,16 @@ def wait_agents(
     narrated_at = started
     while time.monotonic() < deadline:
         nodes = wave_node_items(release, target, expected_nodes)
+        undecided: frozenset[str] = frozenset()
+        if departed is not None and expected_nodes:
+            absent = expected_nodes - {
+                str((item.get("metadata") or {}).get("name") or "") for item in nodes
+            }
+            gone = departed(frozenset(absent)) if absent else frozenset()
+            expected_nodes = expected_nodes - gone
+            if not expected_nodes:
+                return
+            undecided = frozenset(absent - gone)
         selected_nodes = [
             item
             for item in nodes
@@ -226,21 +244,25 @@ def wait_agents(
             node_names=expected_nodes,
             dcgm_hostengine=dcgm_hostengine,
         )
-        if installers_aligned and release._agent_heartbeats_converged(
-            target,
-            node_count=len(selected_nodes),
-            node_names=tuple(
-                sorted(
-                    str(item.get("metadata", {}).get("name") or "")
-                    for item in selected_nodes
-                )
-            ),
-            artifact_sha=artifact_sha,
-            config_digest=expected_config,
-            runtime_profile_version=expected_profile,
-            bundle_sha=expected_bundle,
-            template_sha=expected_template,
-            agent_identity=agent_identity,
+        if (
+            not undecided
+            and installers_aligned
+            and release._agent_heartbeats_converged(
+                target,
+                node_count=len(selected_nodes),
+                node_names=tuple(
+                    sorted(
+                        str(item.get("metadata", {}).get("name") or "")
+                        for item in selected_nodes
+                    )
+                ),
+                artifact_sha=artifact_sha,
+                config_digest=expected_config,
+                runtime_profile_version=expected_profile,
+                bundle_sha=expected_bundle,
+                template_sha=expected_template,
+                agent_identity=agent_identity,
+            )
         ):
             return
         if release.runner.dry_run:
@@ -258,6 +280,7 @@ def wait_agents(
             node_names=expected_nodes,
             dcgm_hostengine=dcgm_hostengine,
         )
+        pending.update(dict.fromkeys(undecided, "<gone>"))
         now = time.monotonic()
         changed = pending != narrated
         if changed or now - narrated_at >= WAIT_AGENTS_NARRATION_SECONDS:

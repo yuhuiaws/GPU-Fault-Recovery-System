@@ -5,6 +5,7 @@ from typing import Any
 
 from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
 from gpu_fault_release.regional_release_dcgm import forward_dcgm_hostengine
+from gpu_fault_release.regional_release_departure_absorption import WaveDepartures
 from gpu_fault_release.regional_release_fleet_rollout import (
     FleetWaveContext,
     NodeRolloutPolicy,
@@ -16,7 +17,15 @@ from gpu_fault_release.regional_release_fleet_rollout import (
     run_fleet_waves,
     target_node_failure_domains,
 )
-from gpu_fault_release.regional_release_gpu_rollout import node_inventory_scope
+from gpu_fault_release.regional_release_gpu_rollout import (
+    agents_converged,
+    node_inventory_scope,
+)
+from gpu_fault_release.regional_release_joined_nodes import (
+    defer_uninstalled_newcomers,
+    finalize_newcomers,
+    node_name,
+)
 from gpu_fault_release.regional_release_legacy import apply_fleet_request_identity
 from gpu_fault_release.regional_release_narration import narrate_step
 from gpu_fault_release.regional_release_node_preflight import (
@@ -174,8 +183,35 @@ def _finalize_node_runtime(
     steady_template_config_map: str | None,
     allow_legacy_identity: bool,
     agent_identity: dict[str, Any] | None,
+    departures: WaveDepartures | None = None,
 ) -> tuple[str, str]:
     desired_bundle, desired_template = paused_identity
+    dcgm = forward_dcgm_hostengine(target, candidate.phase)
+    identity_bundle = None if allow_legacy_identity else desired_bundle
+    identity_template = None if allow_legacy_identity else desired_template
+
+    def candidate_installed(item: dict[str, Any]) -> bool:
+        return agents_converged(
+            [item],
+            target,
+            candidate.artifact_sha,
+            bundle_sha=identity_bundle,
+            template_sha=identity_template,
+            config_digest=candidate.config_digest,
+            require_node_uid=True,
+            node_names=frozenset({node_name(item)}),
+            dcgm_hostengine=dcgm,
+        )
+
+    # Nodes that joined after the release captured its node set and are in no
+    # wave: read before the steady-state Reconciler is handed ``*``.
+    joined = finalize_newcomers(
+        release,
+        target,
+        phase=candidate.phase,
+        node_names=candidate.node_names,
+        identity_matches=candidate_installed,
+    )
     final_identity = release._deploy_reconciler(
         target,
         wheel_cm=candidate.wheel_cm,
@@ -209,18 +245,40 @@ def _finalize_node_runtime(
         raise ReleaseError(
             f"{target.cluster_id} steady-state installer identity changed"
         )
-    release._wait_agents(
-        target,
-        candidate.artifact_sha,
-        bundle_sha=desired_bundle,
-        template_sha=desired_template,
+    departed = departures.departed_ids if departures is not None else frozenset()
+    # Only a partial wave or a newcomer narrows the wait to the planned nodes
+    # (and a newcomer on another identity, which the Reconciler re-installs);
+    # otherwise the call is unchanged.
+    narrowed = bool(candidate.excluded_nodes) or joined.active
+    wait_names = (
+        joined.wait_node_names(candidate.node_names, departed)
+        if joined.active or departed
+        else candidate.node_names
+    )
+    if not narrowed or wait_names:
+        release._wait_agents(
+            target,
+            candidate.artifact_sha,
+            bundle_sha=desired_bundle,
+            template_sha=desired_template,
+            config_digest=candidate.config_digest,
+            runtime_profile_version=candidate.runtime_profile_version,
+            **({"node_names": wait_names} if narrowed else {}),
+            legacy_identity=allow_legacy_identity,
+            agent_identity=agent_identity,
+            dcgm_hostengine=dcgm,
+            **(departures.wait_options() if narrowed and departures else {}),
+        )
+    # The newcomers get the rest of the grace; whatever is left is reported,
+    # and the steady-state Reconciler finishes it after the release.
+    joined.settle(
+        artifact_sha=candidate.artifact_sha,
+        bundle_sha=identity_bundle,
+        template_sha=identity_template,
         config_digest=candidate.config_digest,
         runtime_profile_version=candidate.runtime_profile_version,
-        # Only a partial wave narrows the wait; otherwise the call is unchanged.
-        **({"node_names": candidate.node_names} if candidate.excluded_nodes else {}),
-        legacy_identity=allow_legacy_identity,
         agent_identity=agent_identity,
-        dcgm_hostengine=forward_dcgm_hostengine(target, candidate.phase),
+        dcgm_hostengine=dcgm,
     )
     return final_identity
 
@@ -306,6 +364,12 @@ def _node_runtime_candidate(
                 # Nothing left to roll: the cluster pauses with every node
                 # named, the same PARTIAL exit as a wave that rolled the rest.
                 raise ProductIsolatedNodesError(target.cluster_id, excluded)
+        # A node that joined after the release captured its node set and that
+        # no installer has finished on is in no wave and no gate: the
+        # steady-state Reconciler installs it (``_finalize_node_runtime``).
+        node_names = defer_uninstalled_newcomers(
+            release, target, node_names, phase=phase
+        )
         failure_domains = (
             {}
             if release.runner.dry_run
@@ -469,6 +533,8 @@ def roll_node_runtime(
             )
     if mutation_started is not None:
         mutation_started()
+    # A node that provably leaves during the waves is set aside on the proof.
+    departures = WaveDepartures.for_phase(release, target, phase)
     paused_identity = release._deploy_reconciler(
         target,
         wheel_cm=wheel_cm,
@@ -549,6 +615,7 @@ def roll_node_runtime(
             agent_identity=agent_identity,
             template_content_sha256=template_content_sha256,
             dcgm_hostengine=forward_dcgm_hostengine(target, phase),
+            departures=departures,
         ),
         deployment,
     )
@@ -561,6 +628,7 @@ def roll_node_runtime(
         steady_template_config_map=steady_template_config_map,
         allow_legacy_identity=allow_legacy_identity,
         agent_identity=agent_identity,
+        departures=departures,
     )
     if candidate.excluded_nodes:
         # Every other node converged; the cluster still ends PARTIAL so the

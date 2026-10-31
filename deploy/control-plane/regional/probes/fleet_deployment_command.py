@@ -2,6 +2,20 @@
 
 Request: ``{"operation": "<name>", ...}`` on stdin.
 Response: one JSON object on stdout.
+
+``exclude-departed`` (``{"deployment_id": ..., "node_ids": [...]}``) takes nodes
+the engine proved departed (``regional_release_departure_absorption``) out of
+a non-terminal rollout record -- out of its ``nodes`` and its ``waves`` -- so the
+record ends ``SUCCEEDED`` over the nodes that remain instead of holding the
+cluster's destructive-workflow fence open on a node that can never report. Only
+a ``PENDING`` or ``INSTALLING`` node is taken out; a ``READY`` one converged
+before it left and stays. The Agent's lease is re-read on the registry's clock
+at write time, and a node whose Agent holds a live lease is refused: the engine's
+proof is older than this write. When the record has no ``READY`` node yet -- the
+departed node was the canary -- the first remaining wave that has not started is
+split so a single node still goes first. The record keeps the shape every
+deployed control plane parses (no new status value, no new field), so a
+rollback's older control plane still reads it.
 """
 
 import json
@@ -15,6 +29,7 @@ from gpu_fault.policy import load_xid_policy
 from gpu_fault.store import NotFoundError
 
 TERMINAL_STATUSES = frozenset({"SUCCEEDED", "FAILED"})
+EXCLUDABLE_NODE_STATUSES = frozenset({"PENDING", "INSTALLING"})
 
 
 def stranded_release_rollouts(store: Any, release_id: str) -> list[str]:
@@ -67,6 +82,90 @@ def active_cluster_rollouts(store: Any, cluster_id: str) -> list[str]:
     )
 
 
+def _status(value: Any) -> str:
+    return str(getattr(value, "value", value))
+
+
+def _keep_canary(waves: list[list[str]], statuses: dict[str, str]) -> list[list[str]]:
+    """``waves`` with a one-node first wave again while nothing has converged."""
+
+    if not waves or "READY" in statuses.values() or len(waves[0]) < 2:
+        return waves
+    if any(statuses.get(node_id) != "PENDING" for node_id in waves[0]):
+        return waves
+    first = sorted(waves[0])
+    return [first[:1], first[1:], *waves[1:]]
+
+
+def exclude_departed_nodes(registry: Any, store: Any, payload: Any) -> dict[str, Any]:
+    """Take ``payload["node_ids"]`` out of the rollout record; see the module."""
+
+    from gpu_fault.fleet_deployment import deployment_status
+
+    deployment_id = str(payload["deployment_id"])
+    wanted = sorted({str(node_id) for node_id in payload["node_ids"]})
+    for _ in range(5):
+        deployment = store.get_fleet_deployment(deployment_id)
+        if _status(deployment.status) in TERMINAL_STATUSES:
+            raise ValueError(f"deployment {deployment_id} is already terminal")
+        by_node = {item.node_id: item for item in deployment.nodes}
+        absent = [node_id for node_id in wanted if node_id not in by_node]
+        drop = [
+            node_id
+            for node_id in wanted
+            if node_id in by_node
+            and _status(by_node[node_id].status) in EXCLUDABLE_NODE_STATUSES
+        ]
+        kept = [
+            node_id for node_id in wanted if node_id in by_node and node_id not in drop
+        ]
+        now = registry.now()
+        live = sorted(
+            agent.node_id
+            for agent in store.list_agents(deployment.cluster_id)
+            if agent.node_id in drop
+            and agent.lease_expires_at is not None
+            and agent.lease_expires_at > now
+            and _status(agent.lifecycle_state) != "REVOKED"
+        )
+        if live:
+            raise ValueError(
+                "nodes still hold a live Agent lease and are not departed: "
+                + ",".join(live)
+            )
+        if not drop:
+            replacement = deployment
+        else:
+            nodes = [item for item in deployment.nodes if item.node_id not in drop]
+            if not nodes:
+                raise ValueError(f"every node of deployment {deployment_id} departed")
+            waves = [
+                [node_id for node_id in wave if node_id not in drop]
+                for wave in deployment.waves
+            ]
+            waves = _keep_canary(
+                [wave for wave in waves if wave],
+                {item.node_id: _status(item.status) for item in nodes},
+            )
+            replacement = deployment.model_copy(
+                update={
+                    "nodes": nodes,
+                    "waves": waves,
+                    "status": deployment_status(nodes),
+                    "updated_at": now,
+                }
+            )
+            if not store.replace_fleet_deployment_if_matches(replacement, deployment):
+                continue
+        return {
+            "deployment": json.loads(replacement.model_dump_json()),
+            "excluded": drop,
+            "absent": absent,
+            "kept": kept,
+        }
+    raise ValueError("fleet deployment conflicted with concurrent updates")
+
+
 def main() -> int:
     payload = json.load(sys.stdin)
     context = ApplicationContext.from_environment()
@@ -90,6 +189,14 @@ def main() -> int:
         result = registry.start_next_wave(payload["deployment_id"])
     elif operation == "retry-failed":
         result = registry.retry_failed_deployment(payload["deployment_id"])
+    elif operation == "exclude-departed":
+        print(
+            json.dumps(
+                exclude_departed_nodes(registry, context.store, payload),
+                sort_keys=True,
+            )
+        )
+        return 0
     elif operation == "normalize-records":
         deployments = context.store.list_fleet_deployments()
         for deployment in deployments:
