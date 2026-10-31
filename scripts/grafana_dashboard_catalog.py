@@ -31,6 +31,7 @@ from grafana_dashboard_review_panels import (
     CONTRIBUTOR_FAILURES_PANEL,
     COUNTER_DRIFT_PANEL,
     COUNTER_SCAN_PANEL,
+    FLEET_TOPOLOGY_PANELS,
     METRIC_COVERAGE_PANEL,
     NOTIFICATION_FAILURE_PANEL,
     POOL_AND_CREDENTIAL_PANELS,
@@ -231,6 +232,7 @@ OVERVIEW = Dashboard(
                         "cluster. 0 means the release did not declare them."
                     ),
                 ),
+                *FLEET_TOPOLOGY_PANELS,
             ),
         ),
     ),
@@ -467,6 +469,7 @@ CONTROL_PLANE_CAPACITY = Dashboard(
         Row("PostgreSQL pool and credentials", POOL_AND_CREDENTIAL_PANELS),
         Row("Control-loop review counters", REVIEW_COUNTER_PANELS),
         Row("Processor queue", QUEUE_DEPTH_PANELS),
+        Row("Fleet vs declared topology", FLEET_TOPOLOGY_PANELS),
         Row(
             "Metric scan truncation",
             (

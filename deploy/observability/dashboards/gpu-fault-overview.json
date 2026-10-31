@@ -1170,7 +1170,7 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 24,
+        "w": 8,
         "x": 0,
         "y": 54
       },
@@ -1215,6 +1215,162 @@
       ],
       "title": "Declared GPU node counts",
       "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-fault-amp"
+      },
+      "description": "Each managed cluster's registered GPU nodes (fleet Agents ACTIVE or DRAINING, synthetic capacity-drill clusters left out) against the declared largest cluster the per-cluster fault reserve and queue floor derive from. A departed node counts until the departed-node cleanup retires its Agent.\n\nAlert GpuFaultClusterNodesExceedDeclaredTopology (warning, for 30m): docs/en/administrator-operations.md#gpufaultclusternodesexceeddeclaredtopology",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 54
+      },
+      "id": 22,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "max by (cluster_id) (gpu_fault_capacity_registered_cluster_node_count{cluster_id=~\"$cluster_id\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "{{cluster_id}} registered",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "min(gpu_fault_capacity_largest_cluster_node_count{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "declared largestClusterNodeCount",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Registered GPU nodes per cluster vs declared largest cluster",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-fault-amp"
+      },
+      "description": "Registered GPU nodes across every managed cluster against the declared managed fleet the Aurora Min ACU floor and the ingress normal-tier concurrency derive from.\n\nAlert GpuFaultManagedNodesExceedDeclaredTopology (warning, for 30m): docs/en/administrator-operations.md#gpufaultmanagednodesexceeddeclaredtopology",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 54
+      },
+      "id": 23,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "max(gpu_fault_capacity_registered_managed_node_count{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "registered",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "min(gpu_fault_capacity_managed_node_count{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "declared managedNodeCount",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Registered GPU nodes vs declared managed fleet",
+      "type": "timeseries"
     }
   ],
   "refresh": "1m",

@@ -639,6 +639,244 @@ def test_node_ownership_alerts_fire_and_resolve_on_sparse_per_node_series(
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+# The registered GPU fleet against the declared topology (b229). The
+# registered counts are rendered by the control-worker Pods only, one series
+# per cluster plus the site total; the declared counts by every replica from
+# its environment. Each case puts a count on one side of the boundary or of the
+# 30-minute window: exceeded, equal, a spike shorter than the window, a
+# declaration that is missing or 0, a roll that raises the declaration.
+CLUSTER_TOPOLOGY, MANAGED_TOPOLOGY = TOPOLOGY_ALERTS = (
+    "GpuFaultClusterNodesExceedDeclaredTopology",
+    "GpuFaultManagedNodesExceedDeclaredTopology",
+)
+TOPOLOGY_ROLES = {
+    "gpu-fault-control-worker-0": "gpu-fault-control-worker",
+    "gpu-fault-control-worker-1": "gpu-fault-control-worker",
+    "gpu-fault-api-ha-0": "gpu-fault-api-ha",
+    "gpu-fault-telemetry-spool-worker-0": "gpu-fault-telemetry-spool-worker",
+}
+WORKERS = ("gpu-fault-control-worker-0", "gpu-fault-control-worker-1")
+
+
+def _topology_rules() -> dict[str, dict]:
+    [(_, document)] = MODULE.rule_documents(
+        [ROOT / "deploy/observability/amp-rules.yaml"]
+    )
+    return {
+        rule["alert"]: rule
+        for group in document["groups"]
+        for rule in group["rules"]
+        if rule.get("alert") in TOPOLOGY_ALERTS
+    }
+
+
+def _topology_series(pod: str, metric: str, values: str, **labels: str) -> dict:
+    """One replica's sample stream, labelled the way ADOT labels it."""
+
+    tags = {
+        **QUEUE_SITE,
+        "job": "gpu-fault-control-plane",
+        "pod": pod,
+        "instance": f"{pod}:8000",
+        "service_role": TOPOLOGY_ROLES[pod],
+        **labels,
+    }
+    rendered = ",".join(f'{key}="{value}"' for key, value in tags.items())
+    return {"series": f"{metric}{{{rendered}}}", "values": values}
+
+
+def _declared(
+    largest: str = "512x60",
+    managed: str = "2048x60",
+    *,
+    rolled: dict[str, str] | None = None,
+) -> list[dict]:
+    """Every replica's declared counts (rendered from its environment);
+    ``rolled`` gives some replicas another largest-cluster declaration."""
+
+    return [
+        series
+        for pod in TOPOLOGY_ROLES
+        for series in (
+            _topology_series(
+                pod,
+                "gpu_fault_capacity_largest_cluster_node_count",
+                (rolled or {}).get(pod, largest),
+            ),
+            _topology_series(pod, "gpu_fault_capacity_managed_node_count", managed),
+        )
+    ]
+
+
+def _registered(clusters: dict[str, str], managed: str) -> list[dict]:
+    """The control-worker Pods' registered counts, identical on each Pod."""
+
+    return [
+        series
+        for pod in WORKERS
+        for series in (
+            *(
+                _topology_series(
+                    pod,
+                    "gpu_fault_capacity_registered_cluster_node_count",
+                    values,
+                    cluster_id=cluster,
+                )
+                for cluster, values in clusters.items()
+            ),
+            _topology_series(
+                pod, "gpu_fault_capacity_registered_managed_node_count", managed
+            ),
+        )
+    ]
+
+
+def _topology_alert(rule: dict, value: int, cluster: str | None) -> dict:
+    rendered = {'{{ $value | printf "%.0f" }}': str(value)}
+    labels = {**QUEUE_SITE, "severity": rule["labels"]["severity"]}
+    if cluster is not None:
+        rendered["{{ $labels.cluster_id }}"] = cluster
+        labels["cluster_id"] = cluster
+    annotations = {}
+    for key, text in rule["annotations"].items():
+        for template, value_text in rendered.items():
+            text = str(text).replace(template, value_text)
+        annotations[key] = text
+    return {"exp_labels": labels, "exp_annotations": annotations}
+
+
+TOPOLOGY_CASES = [
+    pytest.param(
+        [*_declared(), *_registered({"a": "513x60", "b": "100x60"}, "613x60")],
+        [("29m", {}), ("31m", {CLUSTER_TOPOLOGY: [(513, "a")]})],
+        id="a-cluster-above-the-declared-largest-warns-for-that-cluster-after-30m",
+    ),
+    pytest.param(
+        [*_declared(), *_registered({"a": "512x60"}, "2048x60")],
+        [("45m", {})],
+        id="exactly-the-declared-counts-stay-quiet",
+    ),
+    pytest.param(
+        [*_declared(), *_registered({"a": "600x19 512x40"}, "2100x19 2048x40")],
+        [("19m", {}), ("45m", {})],
+        id="a-spot-replacement-spike-shorter-than-the-window-stays-quiet",
+    ),
+    pytest.param(
+        _registered({"a": "4000x60"}, "9000x60"),
+        [("45m", {})],
+        id="no-declared-gauge-means-no-comparison",
+    ),
+    pytest.param(
+        [*_declared("0x60", "0x60"), *_registered({"a": "600x60"}, "600x60")],
+        [("45m", {})],
+        id="a-release-that-declared-no-topology-renders-0-and-stays-quiet",
+    ),
+    pytest.param(
+        [*_declared(), *_registered({"a": "300x60", "b": "300x60"}, "2049x60")],
+        [("29m", {}), ("31m", {MANAGED_TOPOLOGY: [(2049, None)]})],
+        id="the-managed-total-above-the-declared-fleet-warns-once-per-site",
+    ),
+    pytest.param(
+        [
+            *_declared(rolled={"gpu-fault-control-worker-1": "1024x60"}),
+            *_registered({"a": "700x60"}, "700x60"),
+        ],
+        [("31m", {CLUSTER_TOPOLOGY: [(700, "a")]})],
+        id="mid-roll-the-smaller-declaration-still-enforced-is-read",
+    ),
+    pytest.param(
+        [*_declared(largest="512x34 1024x25"), *_registered({"a": "700x60"}, "700x60")],
+        [("31m", {CLUSTER_TOPOLOGY: [(700, "a")]}), ("40m", {})],
+        id="raising-the-declared-count-resolves-the-warning",
+    ),
+]
+
+
+def test_topology_rules_read_registered_max_and_declared_min_with_grouping() -> None:
+    rules = _topology_rules()
+
+    assert sorted(rules) == sorted(TOPOLOGY_ALERTS), sorted(rules)
+    for name, rule in rules.items():
+        expression = " ".join(str(rule["expr"]).split())
+        assert rule["labels"] == {"severity": "warning"}, f"{name} must not page"
+        assert rule["for"] == "30m", f"{name} must ride out a spot replacement"
+        assert "max by (control_plane_cluster, region" in expression, expression
+        assert "min by (control_plane_cluster, region)" in expression, expression
+        assert "_node_count > 0)" in expression, (
+            f"{name} must leave out a release that declared no topology"
+        )
+        assert "gpu-fault-admin config" in rule["annotations"]["description"], (
+            f"{name} must name the command that raises the declared counts"
+        )
+    assert "ceil(managedNodeCount / 100, 0.5 ACU)" in " ".join(
+        rules[MANAGED_TOPOLOGY]["annotations"]["description"].split()
+    ), "the managed alert must name the coupled Aurora floor"
+
+
+@pytest.mark.parametrize(("inputs", "checks"), TOPOLOGY_CASES)
+def test_topology_alerts_fire_only_on_a_sustained_excess(
+    tmp_path: Path, inputs: list[dict[str, str]], checks: list
+) -> None:
+    promtool = shutil.which(os.environ.get("PROMTOOL", "promtool"))
+    assert promtool is not None, "set PROMTOOL to the pinned local promtool"
+    rules = _topology_rules()
+    rule_file = tmp_path / "rules.yaml"
+    rule_file.write_text(
+        yaml.safe_dump(
+            {
+                "groups": [
+                    {
+                        "name": "topology",
+                        "rules": [rules[name] for name in TOPOLOGY_ALERTS],
+                    }
+                ]
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    alert_tests = [
+        {
+            "alertname": alert,
+            "eval_time": when,
+            "exp_alerts": [
+                _topology_alert(rules[alert], value, cluster)
+                for value, cluster in firing.get(alert, [])
+            ],
+        }
+        for when, firing in checks
+        for alert in TOPOLOGY_ALERTS
+    ]
+    test_file = tmp_path / "cases.yaml"
+    test_file.write_text(
+        yaml.safe_dump(
+            {
+                "rule_files": [str(rule_file)],
+                "evaluation_interval": "1m",
+                "tests": [
+                    {
+                        "interval": "1m",
+                        "input_series": inputs,
+                        "alert_rule_test": alert_tests,
+                    }
+                ],
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [promtool, "test", "rules", str(test_file)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @pytest.mark.parametrize(
     "defect",
     [

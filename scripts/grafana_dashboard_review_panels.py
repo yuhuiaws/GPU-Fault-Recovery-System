@@ -590,3 +590,52 @@ REMEDIATION_LONGEST_WAIT_PANEL = _panel(
     "last refused it, from the refusal that began the wait.",
     unit="s",
 )
+
+
+# The registered GPU fleet beside the declared topology (b229): one line per
+# cluster against the declared largest cluster, and the site's total against
+# the declared managed fleet. The registered counts are read with ``max`` over
+# the control-worker Pods that render them, the declared ones with ``min`` over
+# every replica, exactly as the two topology alerts read them.
+FLEET_TOPOLOGY_PANELS = (
+    _panel(
+        "Registered GPU nodes per cluster vs declared largest cluster",
+        (
+            (
+                "max by (cluster_id) ("
+                + series(
+                    "gpu_fault_capacity_registered_cluster_node_count", CLUSTER_SELECTOR
+                )
+                + ")",
+                "{{cluster_id}} registered",
+            ),
+            (
+                "min(" + series("gpu_fault_capacity_largest_cluster_node_count") + ")",
+                "declared largestClusterNodeCount",
+            ),
+        ),
+        "Each managed cluster's registered GPU nodes (fleet Agents ACTIVE or "
+        "DRAINING, synthetic capacity-drill clusters left out) against the "
+        "declared largest cluster the per-cluster fault reserve and queue floor "
+        "derive from. A departed node counts until the departed-node cleanup "
+        "retires its Agent.",
+    ),
+    _panel(
+        "Registered GPU nodes vs declared managed fleet",
+        (
+            (
+                "max("
+                + series("gpu_fault_capacity_registered_managed_node_count")
+                + ")",
+                "registered",
+            ),
+            (
+                "min(" + series("gpu_fault_capacity_managed_node_count") + ")",
+                "declared managedNodeCount",
+            ),
+        ),
+        "Registered GPU nodes across every managed cluster against the declared "
+        "managed fleet the Aurora Min ACU floor and the ingress normal-tier "
+        "concurrency derive from.",
+    ),
+)

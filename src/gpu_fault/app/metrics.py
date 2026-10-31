@@ -26,6 +26,7 @@ from gpu_fault.app.builtin_metric_contributors import (
     remote_command_metric_lines,
     spare_reservation_metric_lines,
 )
+from gpu_fault.app.capacity_metrics import registered_node_metric_lines
 from gpu_fault.app.metric_contributors import (
     MetricContributorRegistry,
 )
@@ -418,6 +419,11 @@ def capacity_metric_lines(_runtime: AppRuntime) -> list[str]:
 METRIC_CONTRIBUTORS = MetricContributorRegistry()
 METRIC_CONTRIBUTORS.register("core", render_prometheus_metrics)
 METRIC_CONTRIBUTORS.register("capacity", capacity_metric_lines)
+# The registered GPU fleet beside the declared topology: the worker tier's
+# shared agent scan, one series per cluster (gpu_fault.app.capacity_metrics).
+METRIC_CONTRIBUTORS.register(
+    "capacity-registered-nodes", registered_node_metric_lines, fleet_level=True
+)
 METRIC_CONTRIBUTORS.register(
     "remote-command",
     remote_command_metric_lines,

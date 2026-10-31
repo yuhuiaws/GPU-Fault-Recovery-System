@@ -525,7 +525,9 @@ must write `managedNodeCount` as 2048 and raise `minAcu` to at least 20.5 at the
 (`GPU_FAULT_CAPACITY_LARGEST_CLUSTER_NODE_COUNT`,
 `GPU_FAULT_CAPACITY_MANAGED_NODE_COUNT`); the runtime refuses at startup an environment whose reservation is smaller than the largest cluster node count,
 and `/metrics` exports the two gauges `gpu_fault_capacity_largest_cluster_node_count` and
-`gpu_fault_capacity_managed_node_count`. The queue caps and fault reserves admission actually enforces are exported the
+`gpu_fault_capacity_managed_node_count` (every role renders them from its own environment); the GPU nodes actually
+registered are exported separately by the control-worker as `gpu_fault_capacity_registered_cluster_node_count{cluster_id}`
+and `gpu_fault_capacity_registered_managed_node_count`, compared with the declaration in §5.1. The queue caps and fault reserves admission actually enforces are exported the
 same way, as `gpu_fault_processor_queue_depth_limit`, `gpu_fault_processor_queue_fault_reserved_depth`,
 `gpu_fault_processor_cluster_queue_depth_limit` and `gpu_fault_processor_cluster_queue_fault_reserved_depth` (the
 values the runtime parsed, not the code defaults); the queue depth alerts are ratios of these caps (70% warnings
@@ -534,6 +536,75 @@ regional and per cluster, 90% regional, and critical once a cluster reaches its 
 (Administrator Operations §8). When rollback captures the online AdminConfig, it
 reads only the node counts actually present in the ConfigMap; when production declares none, it infers from the captured depth per the legacy record rule above,
 without filling in the release default.
+
+### 5.1 Declared Topology Against the Registered GPU Fleet
+
+`largestClusterNodeCount` and `managedNodeCount` are the topology the administrator declares, and the control plane never
+rewrites them by itself; how many GPU nodes the fleet really has is counted separately by the control plane and exported
+as two gauges:
+
+- `gpu_fault_capacity_registered_cluster_node_count{cluster_id}`: one managed GPU cluster's registered GPU nodes, that is
+  its fleet Agents in lifecycle `ACTIVE` or `DRAINING` (one Agent per GPU node, the same count the remediation storm
+  breaker judges with). One series per cluster with at least one registered node, never one per node.
+- `gpu_fault_capacity_registered_managed_node_count`: the sum over every managed cluster (0 for an empty fleet).
+
+Only the control-worker processes render the two (a fleet-level `/metrics` contributor; ingress and spool-worker do not),
+merged ANY over a Pod's processes: every uvicorn process tallies the same Agent table, and a process whose read failed
+renders neither family, so the Pod's merge answers with a sibling's recent publication, never with 0. They cost no Store
+read of their own: they reuse the control-worker's shared Agent-table scan (scan cache TTL 60 s), tallied once per TTL,
+and which clusters are synthetic comes from the in-memory registry snapshot. Capacity-drill registrations (the
+performance runner's `perf-cap-*` clusters, `synthetic: true` in the registry) are not managed GPU clusters and count in
+neither: a drill declares its own topology with a capacity preset (§4.6). A departed node keeps counting until the
+departed-node cleanup retires its Agent (never before the 10-minute departure guard, Administrator Operations §10.1.1),
+so after a spot replacement the count errs high for some minutes. The control-plane ADOT keep regex already has
+`gpu_fault_capacity_.+`, so both reach AMP without an ADOT change.
+
+**When to raise the declaration.** A node group or instance group that grows, more node groups or instance groups
+labelled for ownership, another GPU cluster joined -- any change that takes a cluster's GPU nodes past
+`largestClusterNodeCount` or the site's past `managedNodeCount`. Declare the size the groups can reach (an EKS node
+group's `maxSize`, the ceiling of a HyperPod instance group's `TargetCount`, the groups about to be labelled), not only
+today's count: spot replacements and scale-ups do not ask the administrator. Every guarantee the §5 rule table derives
+from the node counts is computed from the declaration -- the per-cluster fault reserve
+`max(maxClusterQueueDepth / 8, largestClusterNodeCount)` must hold one fault-priority request per node of a whole-cluster
+correlated fault, the per-cluster queue floor is `maxClusterQueueDepth >= 4 x largestClusterNodeCount`, the Aurora floor
+`minAcu >= ceil(managedNodeCount / 100, 0.5 ACU)` and the ingress normal-tier concurrency
+`clamp(ceil(managedNodeCount / 5), 1000, 3584)` -- so a fleet larger than the declaration silently loses them. A count is
+raised together with its rules (config refuses a combination that breaks one of them):
+
+- raising `spec.capacity.largestClusterNodeCount`: `spec.processor.maxClusterQueueDepth` at least 4 x it, and
+  `spec.capacity.managedNodeCount` at least it;
+- raising `spec.capacity.managedNodeCount`: in the same file `spec.aurora.minAcu >= ceil(managedNodeCount / 100, 0.5 ACU)`
+  (2048 nodes -> 20.5, for example).
+
+Then run `gpu-fault-admin config --state-dir <state-dir>`: the node counts feed the fault reserve the three roles share,
+so it rolls the three CPU roles (§7); raising Min ACU waits for the RDS ramp (8 -> 124 ACU in about 13 minutes, §4.2
+step 4).
+
+**Two alerts** (AMP rule group `gpu-fault-control-plane-capacity`, warning, `for: 30m`; triage cards in
+[Administrator Operations](administrator-operations.md) §8):
+
+| Alert | Fires when | Value | Remedy |
+|---|---|---|---|
+| `GpuFaultClusterNodesExceedDeclaredTopology` | a cluster's `gpu_fault_capacity_registered_cluster_node_count` (`max` over the control-worker Pods, carrying `cluster_id`) is above the declared `gpu_fault_capacity_largest_cluster_node_count` | the cluster's registered GPU nodes | raise `largestClusterNodeCount` to at least the value, with `maxClusterQueueDepth` and `managedNodeCount` |
+| `GpuFaultManagedNodesExceedDeclaredTopology` | `gpu_fault_capacity_registered_managed_node_count` (`max`) is above the declared `gpu_fault_capacity_managed_node_count` | the managed fleet's registered GPU nodes | raise `managedNodeCount` to at least the value, with `minAcu` |
+
+The declaration is read with `min` over every replica: mid-roll, the smallest declaration a replica still enforces is
+what counts, and a roll that raises the count resolves the alert once the old Pods are gone. `> 0` leaves out a release
+that declared none (gauge 0); with no declared gauge at all there is no comparison and so no alert; equal is not
+exceeded; a spike shorter than 30 minutes does not fire, so the minutes of a spot replacement that count the old and
+the new node are ridden out by `for`. The per-cluster alert carries `cluster_id`, so the existing Alertmanager drill
+route (`cluster_id=~"perf-cap-.*"` -> sink, Performance Acceptance Plan §3.1) applies to it, and the drill clusters are
+not in the families anyway. When one fires, first read `gpu-fault-admin status`: an Agent the departed-node cleanup has
+not retired yet still counts (the `departed nodes:` lines; with `spec.workflow.departedNodeCleanup: false` they stay
+until `workflow-reconcile --retire-departed-agents`); if the fleet really is that large, raise the declaration by the
+rules above. Never silence either alert by lowering anything.
+
+**Dashboards.** The overview's (`gpu-fault-overview`) "Declared topology" row keeps its stat panel "Declared GPU node
+counts" and gains two timeseries panels beside it: "Registered GPU nodes per cluster vs declared largest cluster" (the
+registered nodes per `cluster_id`, `max`, against the declared `largestClusterNodeCount`, `min`) and "Registered GPU
+nodes vs declared managed fleet" (the registered total, `max`, against the declared `managedNodeCount`, `min`); the two
+alerts land on these panels. The Control-plane capacity dashboard (`gpu-fault-control-plane-capacity`) gains the row
+"Fleet vs declared topology" with the same two panels.
 
 ## 6. Precedence and Omitted Fields
 

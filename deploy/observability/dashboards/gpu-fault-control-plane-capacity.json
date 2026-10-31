@@ -1451,6 +1451,175 @@
       },
       "id": 23,
       "panels": [],
+      "title": "Fleet vs declared topology",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-fault-amp"
+      },
+      "description": "Each managed cluster's registered GPU nodes (fleet Agents ACTIVE or DRAINING, synthetic capacity-drill clusters left out) against the declared largest cluster the per-cluster fault reserve and queue floor derive from. A departed node counts until the departed-node cleanup retires its Agent.\n\nAlert GpuFaultClusterNodesExceedDeclaredTopology (warning, for 30m): docs/en/administrator-operations.md#gpufaultclusternodesexceeddeclaredtopology",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 53
+      },
+      "id": 24,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "max by (cluster_id) (gpu_fault_capacity_registered_cluster_node_count{cluster_id=~\"$cluster_id\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "{{cluster_id}} registered",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "min(gpu_fault_capacity_largest_cluster_node_count{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "declared largestClusterNodeCount",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Registered GPU nodes per cluster vs declared largest cluster",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-fault-amp"
+      },
+      "description": "Registered GPU nodes across every managed cluster against the declared managed fleet the Aurora Min ACU floor and the ingress normal-tier concurrency derive from.\n\nAlert GpuFaultManagedNodesExceedDeclaredTopology (warning, for 30m): docs/en/administrator-operations.md#gpufaultmanagednodesexceeddeclaredtopology",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 53
+      },
+      "id": 25,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "max(gpu_fault_capacity_registered_managed_node_count{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "registered",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "min(gpu_fault_capacity_managed_node_count{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "declared managedNodeCount",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Registered GPU nodes vs declared managed fleet",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 61
+      },
+      "id": 26,
+      "panels": [],
       "title": "Metric scan truncation",
       "type": "row"
     },
@@ -1491,9 +1660,9 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 53
+        "y": 62
       },
-      "id": 24,
+      "id": 27,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1558,9 +1727,9 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 53
+        "y": 62
       },
-      "id": 25,
+      "id": 28,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1594,9 +1763,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 61
+        "y": 70
       },
-      "id": 26,
+      "id": 29,
       "panels": [],
       "title": "Admission and Store I/O",
       "type": "row"
@@ -1642,9 +1811,9 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 62
+        "y": 71
       },
-      "id": 27,
+      "id": 30,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1713,9 +1882,9 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 62
+        "y": 71
       },
-      "id": 28,
+      "id": 31,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1788,9 +1957,9 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 62
+        "y": 71
       },
-      "id": 29,
+      "id": 32,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1824,9 +1993,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 70
+        "y": 79
       },
-      "id": 30,
+      "id": 33,
       "panels": [],
       "title": "Latency, leases and counters",
       "type": "row"
@@ -1872,9 +2041,9 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 71
+        "y": 80
       },
-      "id": 31,
+      "id": 34,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1943,9 +2112,9 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 71
+        "y": 80
       },
-      "id": 32,
+      "id": 35,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2014,9 +2183,9 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 71
+        "y": 80
       },
-      "id": 33,
+      "id": 36,
       "links": [
         {
           "targetBlank": true,
@@ -2099,9 +2268,9 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 71
+        "y": 80
       },
-      "id": 34,
+      "id": 37,
       "links": [
         {
           "targetBlank": true,
@@ -2142,9 +2311,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 79
+        "y": 88
       },
-      "id": 35,
+      "id": 38,
       "panels": [],
       "title": "Telemetry spool",
       "type": "row"
@@ -2177,9 +2346,9 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 80
+        "y": 89
       },
-      "id": 36,
+      "id": 39,
       "options": {
         "colorMode": "none",
         "graphMode": "none",
@@ -2251,9 +2420,9 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 80
+        "y": 89
       },
-      "id": 37,
+      "id": 40,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2322,9 +2491,9 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 80
+        "y": 89
       },
-      "id": 38,
+      "id": 41,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2393,9 +2562,9 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 88
+        "y": 97
       },
-      "id": 39,
+      "id": 42,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2464,9 +2633,9 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 88
+        "y": 97
       },
-      "id": 40,
+      "id": 43,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2500,9 +2669,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 96
+        "y": 105
       },
-      "id": 41,
+      "id": 44,
       "panels": [],
       "title": "Loop liveness",
       "type": "row"
@@ -2548,9 +2717,9 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 97
+        "y": 106
       },
-      "id": 42,
+      "id": 45,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2619,9 +2788,9 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 97
+        "y": 106
       },
-      "id": 43,
+      "id": 46,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2686,9 +2855,9 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 97
+        "y": 106
       },
-      "id": 44,
+      "id": 47,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2753,9 +2922,9 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 105
+        "y": 114
       },
-      "id": 45,
+      "id": 48,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2820,9 +2989,9 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 105
+        "y": 114
       },
-      "id": 46,
+      "id": 49,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2867,9 +3036,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 113
+        "y": 122
       },
-      "id": 47,
+      "id": 50,
       "panels": [],
       "title": "Processor and periodic errors",
       "type": "row"
@@ -2915,9 +3084,9 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 114
+        "y": 123
       },
-      "id": 48,
+      "id": 51,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -2997,9 +3166,9 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 114
+        "y": 123
       },
-      "id": 49,
+      "id": 52,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -3068,9 +3237,9 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 114
+        "y": 123
       },
-      "id": 50,
+      "id": 53,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -3146,9 +3315,9 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 114
+        "y": 123
       },
-      "id": 51,
+      "id": 54,
       "links": [
         {
           "targetBlank": true,

@@ -3452,7 +3452,7 @@ from the panel table in `scripts/grafana_dashboard_catalog.py`, and `make grafan
 guarantees the checked-in JSON is byte-for-byte identical to the generated result. The generator reads `amp-rules.yaml`: whenever an alert expression ends in
 `> N` / `>= N` / `< N`, the panel drawing that metric gets a threshold line of the same value (critical red, warning
 orange); each panel's description lists the alert names it covers, their `for` durations and the anchors of the cards in this section, so it is one step from a panel to
-a triage card. Each of the 87 alerts lands on at least one panel (`tests/test_grafana_dashboards.py`
+a triage card. Each of the 89 alerts lands on at least one panel (`tests/test_grafana_dashboards.py`
 iterates over all rules asserting this, and asserts the thresholds too); a threshold changed in the rules without regenerating turns the gate red.
 
 Import path: the Grafana provisioning step of `gpu-fault-admin deploy` imports them automatically at deployment into
@@ -3495,7 +3495,7 @@ Role choice: on-call dashboard viewing uses `VIEWER`; give `EDITOR` / `ADMIN` on
 `gpu-fault-admin deploy` re-import -- a lasting change must be made in
 `scripts/grafana_dashboard_catalog.py` and regenerated. To revoke, replace `"action":"ADD"` with `"REVOKE"`.
 After authorisation log in via the Identity Center portal or by opening the address above directly; `Alerting -> Alert rules` with the AMP data source
-shows the live state of the 87 rules (7 groups), corresponding one-to-one to the cards below.
+shows the live state of the 89 rules (7 groups), corresponding one-to-one to the cards below.
 
 Reading the dashboards is consistent with the cards: only staying above the threshold line (or below it for `< N`-type panels) for longer than the `for` duration
 is an alert; the overview's "Alerts firing" panel reads AMP's `ALERTS{alertstate="firing"}` directly,
@@ -3503,18 +3503,22 @@ and the names are the card names below.
 
 | Dashboard (uid) | Alert group | Panel row -> card |
 | --- | --- | --- |
-| GPU Fault · Overview (`gpu-fault-overview`) | Cross-group closed-loop essentials | Alerts -> all firing cards; Closed loop -> `GpuFaultIncidentsAwaitingOperator`, `GpuFaultOrphanWorkflows`; Processor queue -> `GpuFaultProcessorQueueDepthHigh`, `GpuFaultProcessorQueueDepthCritical`, `GpuFaultProcessorOldestRequestDelayed`, `GpuFaultProcessorClusterBacklogHigh`, `GpuFaultProcessorClusterBacklogCritical`; Store I/O -> `GpuFaultStoreIoSaturated`; the Remediation budget, Declared topology and workflow/notification outbox panels have no dedicated card and are trend readings |
+| GPU Fault · Overview (`gpu-fault-overview`) | Cross-group closed-loop essentials | Alerts -> all firing cards; Closed loop -> `GpuFaultIncidentsAwaitingOperator`, `GpuFaultOrphanWorkflows`; Processor queue -> `GpuFaultProcessorQueueDepthHigh`, `GpuFaultProcessorQueueDepthCritical`, `GpuFaultProcessorOldestRequestDelayed`, `GpuFaultProcessorClusterBacklogHigh`, `GpuFaultProcessorClusterBacklogCritical`; Store I/O -> `GpuFaultStoreIoSaturated`; Declared topology -> `GpuFaultClusterNodesExceedDeclaredTopology`, `GpuFaultManagedNodesExceedDeclaredTopology` (the "Declared GPU node counts" stat panel is a reading); the Remediation budget and workflow/notification outbox panels have no dedicated card and are trend readings |
 | GPU Fault · Collector health (`gpu-fault-collector-health`) | `gpu-fault-collector-health` | Collector delivery -> `GpuFaultCollectorSilent`, `GpuFaultCollectorCollectionErrors`; Freshness -> `GpuFaultCollectorMetricsSnapshotStale` |
 | GPU Fault · Telemetry pipeline (`gpu-fault-telemetry-pipeline`) | `gpu-fault-telemetry-pipeline` | Remote write -> `GpuFaultTelemetryRemoteWriteFailing`, `GpuFaultTelemetryRemoteWriteQueueSaturated`, `GpuFaultAdotMemoryHigh`; Scrape liveness -> `GpuFaultAdotSelfMetricsMissing`, `GpuFaultDataplaneCollectorMissing`; Completion Watcher -> `GpuFaultCompletionActiveStateUnavailable`, `GpuFaultCompletionOutboxAppendFailures` |
-| GPU Fault · Control-plane capacity (`gpu-fault-control-plane-capacity`) | `gpu-fault-control-plane-capacity` | Scrape liveness -> `GpuFaultControlPlaneMetricsMissing`, `GpuFaultControlPlaneReplicaScrapeFailing`, `GpuFaultMetricsContributorFailing`, `GpuFaultProcessorConsumerStalled`; PostgreSQL pool and credentials -> `GpuFaultPostgresPoolCheckoutQueueing`, `GpuFaultPostgresPoolConnectionErrors`, `GpuFaultAuroraCredentialRefreshStale`, `GpuFaultAuroraCredentialRefreshFailing`, `GpuFaultAuroraCredentialRefreshStatusUnknown` (the oversubscription ratio and the per-consumer demand breakdown are readings without a card); Control-loop review counters -> `GpuFaultRemoteCommandStaleFenceSwept`, `GpuFaultNotificationDeliveryErrors`, `GpuFaultControlRecordArchiveErrors`; Processor queue -> `GpuFaultProcessorQueueDepthHigh`, `GpuFaultProcessorQueueDepthCritical`, `GpuFaultProcessorOldestRequestDelayed`, `GpuFaultProcessorClusterBacklogHigh`, `GpuFaultProcessorClusterBacklogCritical`; Metric scan truncation -> `GpuFaultWorkflowMetricScanTruncated`, `GpuFaultAttemptObservationMetricScanTruncated`; Admission and Store I/O -> `GpuFaultProcessorAdmissionRejected`, `GpuFaultStoreIoSaturated`, `GpuFaultStoreIoRejected`, `GpuFaultStoreIoBackendUnavailable`; Latency, leases and counters -> `GpuFaultProcessorP95Slow`, `GpuFaultProcessorExpiredLeasesReclaimed`, `GpuFaultProcessorCounterDrift`, `GpuFaultProcessorCounterDriftScanUnavailable`; Telemetry spool -> `GpuFaultTelemetrySpoolListenerDown`, `GpuFaultTelemetrySpoolDataLoss`, `GpuFaultTelemetrySpoolAdmissionRejected`, `GpuFaultTelemetrySpoolReplayError`, `GpuFaultTelemetrySpoolDrainDelayed`; Loop liveness -> `GpuFaultWorkflowDispatcherStalled`, `GpuFaultPeriodicRunnerStalled`, `GpuFaultProcessorUnhealthy`, `GpuFaultProcessorNoActiveConsumer`, `GpuFaultTelemetrySpoolConsumerStalled`, `GpuFaultTelemetrySpoolConsumerStopped`; Processor and periodic errors -> `GpuFaultProcessorLeaseRenewalFailing`, `GpuFaultProcessorFaultEventsRejected`, `GpuFaultPeriodicServiceErrors`, `GpuFaultMetricsAggregationIncomplete` |
+| GPU Fault · Control-plane capacity (`gpu-fault-control-plane-capacity`) | `gpu-fault-control-plane-capacity` | Scrape liveness -> `GpuFaultControlPlaneMetricsMissing`, `GpuFaultControlPlaneReplicaScrapeFailing`, `GpuFaultMetricsContributorFailing`, `GpuFaultProcessorConsumerStalled`; PostgreSQL pool and credentials -> `GpuFaultPostgresPoolCheckoutQueueing`, `GpuFaultPostgresPoolConnectionErrors`, `GpuFaultAuroraCredentialRefreshStale`, `GpuFaultAuroraCredentialRefreshFailing`, `GpuFaultAuroraCredentialRefreshStatusUnknown` (the oversubscription ratio and the per-consumer demand breakdown are readings without a card); Control-loop review counters -> `GpuFaultRemoteCommandStaleFenceSwept`, `GpuFaultNotificationDeliveryErrors`, `GpuFaultControlRecordArchiveErrors`; Processor queue -> `GpuFaultProcessorQueueDepthHigh`, `GpuFaultProcessorQueueDepthCritical`, `GpuFaultProcessorOldestRequestDelayed`, `GpuFaultProcessorClusterBacklogHigh`, `GpuFaultProcessorClusterBacklogCritical`; Fleet vs declared topology -> `GpuFaultClusterNodesExceedDeclaredTopology`, `GpuFaultManagedNodesExceedDeclaredTopology`; Metric scan truncation -> `GpuFaultWorkflowMetricScanTruncated`, `GpuFaultAttemptObservationMetricScanTruncated`; Admission and Store I/O -> `GpuFaultProcessorAdmissionRejected`, `GpuFaultStoreIoSaturated`, `GpuFaultStoreIoRejected`, `GpuFaultStoreIoBackendUnavailable`; Latency, leases and counters -> `GpuFaultProcessorP95Slow`, `GpuFaultProcessorExpiredLeasesReclaimed`, `GpuFaultProcessorCounterDrift`, `GpuFaultProcessorCounterDriftScanUnavailable`; Telemetry spool -> `GpuFaultTelemetrySpoolListenerDown`, `GpuFaultTelemetrySpoolDataLoss`, `GpuFaultTelemetrySpoolAdmissionRejected`, `GpuFaultTelemetrySpoolReplayError`, `GpuFaultTelemetrySpoolDrainDelayed`; Loop liveness -> `GpuFaultWorkflowDispatcherStalled`, `GpuFaultPeriodicRunnerStalled`, `GpuFaultProcessorUnhealthy`, `GpuFaultProcessorNoActiveConsumer`, `GpuFaultTelemetrySpoolConsumerStalled`, `GpuFaultTelemetrySpoolConsumerStopped`; Processor and periodic errors -> `GpuFaultProcessorLeaseRenewalFailing`, `GpuFaultProcessorFaultEventsRejected`, `GpuFaultPeriodicServiceErrors`, `GpuFaultMetricsAggregationIncomplete` |
 | GPU Fault · Remote command (`gpu-fault-remote-command`) | `gpu-fault-remote-command` | Claim latency -> `GpuFaultRemoteCommandUnclaimed`, `GpuFaultRemoteCommandExecutorInternalError`; Command census -> `GpuFaultRemoteCommandUnclaimedExpired` (the per-state/per-cluster command count panels are trend readings) |
 | GPU Fault · Policy coverage (`gpu-fault-policy-coverage`) | `gpu-fault-policy-coverage` | Catalog coverage -> `GpuFaultUnknownProductFamily` (CRITICAL findings without an incident is a trend reading) |
 | GPU Fault · Orchestration invariants (`gpu-fault-orchestration-invariants`) | `gpu-fault-orchestration-invariants` | Node ownership -> `GpuFaultExclusiveNodeOwnershipInvariantViolation`, `GpuFaultStaleAttemptObservation` (the Ownership scan coverage panel is a trend reading); Fleet rollout fence -> `GpuFaultFleetRolloutFenceStuck`; Pointers, agents and registry -> `GpuFaultIncidentDanglingWorkflowPointers`, `GpuFaultStaleAgents`, `GpuFaultFleetPinAheadOfFleet`, `GpuFaultRegionalRegistrySecretDrift` |
 | GPU Fault · Recovery outcome (`gpu-fault-recovery-outcome`) | `gpu-fault-recovery-outcome` | Workflows -> `GpuFaultRecoveryBlockedBacklog`, `GpuFaultWorkflowPendingAge`, `GpuFaultWorkflowDeadlineNotEnforced`; Step waiting -> `GpuFaultWorkflowStepStalled`; Counters (30m increase) -> `GpuFaultWorkflowLifetimeExceeded`, `GpuFaultJobWorkflowNodeBusyTimeout`, `GpuFaultProcessorRetryHorizonFailures`, `GpuFaultBranchEscalationBudgetRefused`; Closed loop and notifications -> `GpuFaultClosedLoopSlow`, `GpuFaultClosedLoopWindowIncomplete`, `GpuFaultNotificationDeliveryFailing`; Remediation budget -> `GpuFaultRemediationBudgetStarved`, `GpuFaultRemediationBudgetLongWait`, `GpuFaultRemediationStormBreakerOpen`; Completion and incidents -> `GpuFaultCompletionEventsWithoutDecision`, `GpuFaultIncidentsAwaitingOperator`, `GpuFaultDepartedNodeCleanupStuck`; Dispatcher errors and notification outbox -> `GpuFaultWorkflowDispatchInternalErrors`, `GpuFaultWorkflowFailureHandlingAbandoned`, `GpuFaultNotificationUndeliveredTooLong`, `GpuFaultNotificationOutboxNotDraining`, `GpuFaultNotificationExpiredUnsent` |
 
-The last row of the overview, "Declared topology", is `gpu_fault_capacity_largest_cluster_node_count` /
+The stat panel "Declared GPU node counts" in the last row of the overview, "Declared topology", is `gpu_fault_capacity_largest_cluster_node_count` /
 `gpu_fault_capacity_managed_node_count`: the topology declared by the release, from which the fault reservation and the Aurora capacity floor are derived;
-a reading of 0 means that release declared none. The "Processor queue" row draws the regional and per-cluster depth
+a reading of 0 means that release declared none. The two timeseries panels beside it compare the registered GPU nodes (the
+control-worker's `gpu_fault_capacity_registered_cluster_node_count{cluster_id}` and
+`gpu_fault_capacity_registered_managed_node_count`, the fleet Agents in `ACTIVE`/`DRAINING`) with those two declarations
+and carry `GpuFaultClusterNodesExceedDeclaredTopology` / `GpuFaultManagedNodesExceedDeclaredTopology`
+([Administrator Capacity Configuration](administrator-capacity-configuration.md) §5.1). The "Processor queue" row draws the regional and per-cluster depth
 as a share of the caps admission enforces (`gpu_fault_processor_queue_depth_limit`,
 `gpu_fault_processor_cluster_queue_depth_limit`, exported by every control-plane Pod from its own admission
 runtime, i.e. `spec.processor.maxQueueDepth` / `maxClusterQueueDepth`), so the 70% / 90% threshold lines hold for whatever
@@ -3756,6 +3760,46 @@ evidence and routine requests are refused. The two "depth" panels plot the same 
 - **Boundary**: critical. Drain the cause; the reserve exists so the cluster's fault events still enter while its other
   traffic is refused. Do not widen the per-cluster quota to clear the alert, and a fixed 90% is not the boundary: a
   non-fault flood parks the depth exactly at the reserve boundary and never goes past it.
+
+### GpuFaultClusterNodesExceedDeclaredTopology
+
+- **Meaning**: for 30 minutes a managed GPU cluster's registered GPU nodes
+  (`gpu_fault_capacity_registered_cluster_node_count{cluster_id}`: its fleet Agents in lifecycle `ACTIVE`/`DRAINING`,
+  `max` over the control-worker Pods) have been above the `largestClusterNodeCount` the release declares
+  (`gpu_fault_capacity_largest_cluster_node_count`, `min` over every replica; 0 means none declared and nothing is
+  compared). The alert value is the cluster's registered GPU nodes. The per-cluster fault reserve derived from that
+  declaration, `max(maxClusterQueueDepth / 8, largestClusterNodeCount)` (one fault-priority request per node of a
+  whole-cluster correlated fault), and the per-cluster queue floor `maxClusterQueueDepth >= 4 x largestClusterNodeCount`
+  are sized for a smaller cluster: a whole-cluster fault on this one may not fit the reserve.
+- **First check**: `gpu-fault-admin status`: an Agent the departed-node cleanup has not retired yet still counts (the
+  `departed nodes:` lines; with `spec.workflow.departedNodeCleanup: false` they stay until
+  `workflow-reconcile --retire-departed-agents`, §10.2). If the cluster really is that large, edit
+  `<state-dir>/admin-config.yaml`: raise `spec.capacity.largestClusterNodeCount` to at least the alert value, with
+  `spec.processor.maxClusterQueueDepth` at least 4 x it and `spec.capacity.managedNodeCount` at least it, then run
+  `gpu-fault-admin config --state-dir <state-dir>` (it rolls the three CPU roles;
+  [Administrator Capacity Configuration](administrator-capacity-configuration.md) §5.1).
+- **Boundary**: warning. Never silence it by lowering anything, and never raise only the count without its coupled
+  rules (config refuses that anyway). Declare the size the groups can reach (an EKS node group's `maxSize`, the
+  ceiling of a HyperPod instance group's `TargetCount`, the groups about to be labelled for ownership), not only
+  today's count: spot replacements and scale-ups do not ask the administrator. `for: 30m` rides out the minutes of a
+  spot replacement that count the old and the new node; the `perf-cap-*` drill clusters do not count.
+
+### GpuFaultManagedNodesExceedDeclaredTopology
+
+- **Meaning**: for 30 minutes the managed fleet's registered GPU nodes
+  (`gpu_fault_capacity_registered_managed_node_count`, `max`) have been above the `managedNodeCount` the release
+  declares (`gpu_fault_capacity_managed_node_count`, `min` over every replica; 0 means none declared and nothing is
+  compared). The alert value is the managed fleet's registered GPU nodes. The Aurora floor derived from that declaration,
+  `minAcu >= ceil(managedNodeCount / 100, 0.5 ACU)`, and the ingress normal-tier concurrency
+  `clamp(ceil(managedNodeCount / 5), 1000, 3584)` are sized for a smaller fleet.
+- **First check**: `gpu-fault-admin status`, as for the previous card: a departed Agent not retired yet still counts. If
+  the fleet really is that large, raise `spec.capacity.managedNodeCount` in `<state-dir>/admin-config.yaml` to at least the
+  alert value, and in the same file `spec.aurora.minAcu >= ceil(managedNodeCount / 100, 0.5 ACU)` (2048 nodes -> 20.5,
+  for example), then run `gpu-fault-admin config --state-dir <state-dir>`: it rolls the three CPU roles, and raising
+  Min ACU waits for the RDS ramp (8 -> 124 ACU in about 13 minutes,
+  [Administrator Capacity Configuration](administrator-capacity-configuration.md) §4.2).
+- **Boundary**: warning; as for the previous card: never silence it by lowering anything, never raise only the count
+  without `minAcu`; declare the size the fleet can reach, not only today's count.
 
 ### GpuFaultWorkflowMetricScanTruncated
 

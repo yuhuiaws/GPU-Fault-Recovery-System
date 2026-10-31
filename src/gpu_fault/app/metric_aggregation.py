@@ -73,6 +73,12 @@ _ANY = (
     "gpu_fault_departed_node_cleanup_enabled",
     "gpu_fault_capacity_largest_cluster_node_count",
     "gpu_fault_capacity_managed_node_count",
+    # The registered fleet beside them (capacity_metrics.py): every
+    # control-worker process tallies the same agent table, so the local
+    # render wins; a process whose read failed renders neither family and the
+    # merge falls through to a sibling's publication, never to a zero.
+    "gpu_fault_capacity_registered_cluster_node_count",
+    "gpu_fault_capacity_registered_managed_node_count",
     # The processor queue caps and fault reserves admission enforces: every
     # process holds the whole cap against the same Store-wide count, so they
     # are not shares that add up the way the per-process flush limits do, and

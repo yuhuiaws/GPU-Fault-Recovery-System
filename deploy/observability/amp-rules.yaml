@@ -494,6 +494,79 @@ groups:
             (collector replay, an executor that stopped claiming, a node-level
             fault storm) and drain it. The per-cluster quota is an isolation
             limit: widening it spends other clusters' capacity.
+      # The registered fleet against the declared topology. Node groups and
+      # instance groups grow without an administrator (spot replacements, a
+      # raised desiredSize or TargetCount, one more labelled group) while the
+      # reserves above stay sized for the declaration. The registered counts
+      # are rendered by the control-worker processes from the shared agent
+      # table (one series per cluster) and read with `max`; the declared counts
+      # come from every replica's environment and are read with `min`, the
+      # smallest declaration a replica still enforces mid-roll; `> 0` leaves out
+      # a release that declared none. A departed node counts until the
+      # departed-node cleanup retires its Agent (10 minutes at the earliest),
+      # so the 30-minute `for` rides out a spot replacement's double count.
+      - alert: GpuFaultClusterNodesExceedDeclaredTopology
+        expr: >-
+          max by (control_plane_cluster, region, cluster_id)
+          (gpu_fault_capacity_registered_cluster_node_count)
+          > on (control_plane_cluster, region) group_left
+          min by (control_plane_cluster, region)
+          (gpu_fault_capacity_largest_cluster_node_count > 0)
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: A GPU cluster has more registered GPU nodes than the declared largestClusterNodeCount
+          runbook_url: docs/en/administrator-operations.md#gpufaultclusternodesexceeddeclaredtopology
+          description: >-
+            Cluster {{ $labels.cluster_id }} has had more registered GPU nodes
+            (fleet Agents ACTIVE or DRAINING, now
+            {{ $value | printf "%.0f" }}) than spec.capacity.largestClusterNodeCount
+            (gpu_fault_capacity_largest_cluster_node_count) for 30 minutes. The
+            limits derived from that count were sized for a smaller cluster:
+            the per-cluster fault reserve, max(maxClusterQueueDepth / 8,
+            largestClusterNodeCount), may no longer hold one fault-priority
+            request per node of a whole-cluster correlated fault, and the
+            queue floor of 4 x largestClusterNodeCount was validated for fewer
+            nodes. First read gpu-fault-admin status: an Agent the departed-node
+            cleanup has not retired yet still counts. If the cluster really is
+            this large, raise spec.capacity.largestClusterNodeCount in
+            <state-dir>/admin-config.yaml to at least
+            {{ $value | printf "%.0f" }} (spec.processor.maxClusterQueueDepth at
+            least 4 x it, spec.capacity.managedNodeCount at least it) and run
+            gpu-fault-admin config --state-dir <state-dir>, which rolls the
+            three CPU roles.
+      - alert: GpuFaultManagedNodesExceedDeclaredTopology
+        expr: >-
+          max by (control_plane_cluster, region)
+          (gpu_fault_capacity_registered_managed_node_count)
+          > on (control_plane_cluster, region)
+          min by (control_plane_cluster, region)
+          (gpu_fault_capacity_managed_node_count > 0)
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: The managed GPU fleet has more registered GPU nodes than the declared managedNodeCount
+          runbook_url: docs/en/administrator-operations.md#gpufaultmanagednodesexceeddeclaredtopology
+          description: >-
+            The site's managed GPU clusters have had more registered GPU nodes
+            together (now {{ $value | printf "%.0f" }}) than
+            spec.capacity.managedNodeCount
+            (gpu_fault_capacity_managed_node_count) for 30 minutes. The Aurora
+            Min ACU floor (managedNodeCount / 100, rounded up to 0.5 ACU; about
+            12,800 nodes returned 3076 HTTP 503 until Min ACU was
+            pre-provisioned at about 128) and the ingress normal-tier
+            concurrency (ceil(managedNodeCount / 5) within 1000..3584) were
+            sized for a smaller fleet. First read gpu-fault-admin status: an
+            Agent the departed-node cleanup has not retired yet still counts.
+            Then raise spec.capacity.managedNodeCount in
+            <state-dir>/admin-config.yaml to at least
+            {{ $value | printf "%.0f" }} together with spec.aurora.minAcu >=
+            ceil(managedNodeCount / 100, 0.5 ACU) in the same file, and run
+            gpu-fault-admin config --state-dir <state-dir>; it refuses the
+            count without that Aurora floor, and raising Min ACU waits for the
+            RDS ramp.
       # More workflows are open or were updated inside the /metrics scan window
       # than the scan budget, so the step, duration and milestone families now
       # describe only part of that set. Terminal rows older than the window are
