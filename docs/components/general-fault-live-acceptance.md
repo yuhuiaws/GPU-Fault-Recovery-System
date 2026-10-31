@@ -1628,6 +1628,21 @@ GPU_METRICS/GPU_INVENTORY 仍为 600 秒；探针 survey 现把
 采集器在恢复后确有可能上报新成功（摘要时隙恰落在干净轮询上，约每两个时隙一次），但不保证；
 两集群重跑前应知道这是 b190 的已知缺口，R13h 之前每次重跑都可能以该文字 FAIL。
 
+`disabled_unit`、`expired_agent` 与 `new_success` 此前无法失败：`disabled_unit` 拿单元名去匹配通知去重键，而键里写的是
+通道名（`collector-silent/<cluster>/<node>/<channel>/<bucket>`）；`expired_agent` 在零长度窗口里读通知，且只要求 Agent 记录存在；
+`new_success` 丢弃了 UNKNOWN 等待的结果。现在 `disabled_unit`（只读）先要求节点上确有被 disable/mask 的采集单元（否则
+`NOT_RUN(CAPABILITY_ABSENT)`），且 Agent 自己的记录也把它报为 disabled/masked（产品排除的输入，按产品的
+`CollectorServiceState` 规则与 `collector_kinds` 单元表映射到通道；否则 INCONCLUSIVE），跨两次静默扫描后要求：该节点其他通道的
+观测在窗口内被重新记录（正向对照：扫描确实运行，否则 INCONCLUSIVE），被排除通道没有窗口内的观测记录、没有 collector-silent
+通知。`expired_agent`（只读）读本集群全部 Agent 记录与产品的 `agent_is_current` 判定（新探针 `AGENT_CURRENCY_PROBE`），取一条
+非当前的 Agent（随已离开节点过期的 lease 或已退役的 Agent），跨两次扫描后要求：车道节点当前 Agent 的通道被重新记录（正向对照），
+该节点没有窗口内的观测记录、没有 collector-silent 通知，且它在窗口结束时仍非当前（否则 INCONCLUSIVE）；集群里没有这样的
+Agent 时记 `NOT_RUN(FIXTURE_NOT_READY)`——让一个在用 Agent 的 lease 过期需要切断 Node Agent 心跳，而可暂停单元有意不含
+Node Agent（其他用例都依赖它的 lease），过期 lease 还会触发 `gpu_fault_stale_agents`，本夹具不做。`new_success` 现在先判静默：
+暂停的通道须在阈值加扫描余量内读到静默自己的 `STALE_OBSERVATION` UNKNOWN（stage `unknown`，否则 FAIL），再判恢复需要新的成功时间。
+模块测试在内存存储上运行产品自己的静默扫描（`notify_silent_collectors`），用 harness 的真实探针读取并由变体的判据判定：被
+disable 的单元与过期 Agent 被排除；同一判据对未排除它们的扫描记录判 FAIL。
+
 ### GF-GENERAL-LIVE-032
 
 必测：`unknown_xid`、`unknown_product`、`missing_topology`、`missing_version`、

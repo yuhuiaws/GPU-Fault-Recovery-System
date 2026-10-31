@@ -971,6 +971,9 @@ def test_journal_refusals_read_the_live_status() -> None:
 
 
 def test_disabled_unit_and_expired_agent_and_new_success(tmp_path: Path) -> None:
+    # These scripted records passed all three before (S59b): an empty window,
+    # an Agent record that merely existed, a recovery without the silence. The
+    # product-backed oracles are in test_general_live_collector_scope.py.
     spec = SPECS["disabled_unit"]
     doc = {
         "incidents": [],
@@ -983,14 +986,14 @@ def test_disabled_unit_and_expired_agent_and_new_success(tmp_path: Path) -> None
         "notifications": [],
         "collector_statuses": [],
     }
-    ctx = context(spec, tmp_path, doc)
-    result = spec.execute(ctx)
-    assert result["verdict"] == "PASS", result["errors"]
+    with pytest.raises(col.VariantInconclusive, match="does not report"):
+        spec.execute(context(spec, tmp_path, doc))
 
     spec = SPECS["expired_agent"]
     ctx = context(spec, tmp_path, {**doc, "agent": {"lifecycle_state": "EXPIRED"}})
-    result = spec.execute(ctx)
-    assert result["verdict"] == "PASS", result["errors"]
+    with pytest.raises(VariantNotRun) as raised:
+        spec.execute(ctx)
+    assert raised.value.reason == "FIXTURE_NOT_READY", raised.value
 
     spec = SPECS["new_success"]
     docs = [
@@ -1011,6 +1014,33 @@ def test_disabled_unit_and_expired_agent_and_new_success(tmp_path: Path) -> None
     ctx = context(spec, tmp_path, docs)
     result = spec.execute(ctx)
     assert result["verdict"] == "PASS", result["errors"]
+
+
+def test_new_success_fails_when_the_paused_channel_never_read_unknown(
+    tmp_path: Path,
+) -> None:
+    """The old variant discarded its UNKNOWN wait and passed on the recovery
+    alone: a channel that stayed HEALTHY under the pause passed "leaves UNKNOWN
+    only with a new success" without ever being UNKNOWN."""
+
+    spec = SPECS["new_success"]
+    still_healthy = {
+        **fresh_success_doc("HOST_TELEMETRY"),
+        "collector_statuses": [
+            {
+                "collector": "HOST_TELEMETRY",
+                "last_success_at": "2026-10-24T00:00:00+00:00",
+                "last_error_at": None,
+                "errors": [],
+            }
+        ],
+    }
+    ctx = context(spec, tmp_path, [still_healthy, fresh_success_doc("HOST_TELEMETRY")])
+    result = spec.execute(ctx)
+    assert result["verdict"] == "FAIL", result
+    assert result["stages"]["recovery"] == [], result["stages"]
+    (error,) = result["stages"]["unknown"]
+    assert "expected UNKNOWN" in error, error
 
 
 def test_capability_and_replay_variants_are_deferred() -> None:

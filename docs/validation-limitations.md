@@ -1121,6 +1121,37 @@ FAIL: on R13g a resumed node log collector reports a fresh success only when a
 summary slot happens to land on a clean poll, so reruns of `logs_silent` on
 either cluster may fail with that text until R13h is live.
 
+031 `disabled_unit`, `expired_agent` and `new_success` could not fail.
+`disabled_unit` matched unit names against advisory keys, which name channels
+(`collector-silent/<cluster>/<node>/<channel>/<bucket>`); `expired_agent` read
+notifications over a window of zero length and required only that an Agent
+record existed; `new_success` discarded its UNKNOWN wait and passed on the
+recovery alone. `disabled_unit` (read-only) now needs a gpu-fault collector
+unit disabled or masked on the node (otherwise NOT_RUN(CAPABILITY_ABSENT)) that
+the Agent's own record also reports intentionally disabled -- the product's
+input, judged with the product's `CollectorServiceState` rule and mapped to
+channels through `collector_kinds` (otherwise INCONCLUSIVE) -- and across two
+silence scans: the node's other channels re-recorded during the window (the
+scan ran; otherwise INCONCLUSIVE), no observation recorded and no
+collector-silent advisory for the excluded channels. `expired_agent`
+(read-only) lists the cluster's Agent records with the product's
+`agent_is_current` verdict (new read-only `AGENT_CURRENCY_PROBE`), takes one
+that is not current -- a lease that expired with a departed node, or a
+retired Agent -- and across two scans needs the lane node's current Agent
+re-recorded (positive control), no observation and no advisory for the
+non-current node, and that node still non-current at the end (otherwise
+INCONCLUSIVE). A cluster with no such Agent is NOT_RUN(FIXTURE_NOT_READY):
+expiring a live Agent's lease needs a Node Agent heartbeat cut, the pausable
+units deliberately exclude the Node Agent (every other case relies on its
+lease) and an expired lease trips `gpu_fault_stale_agents`; no fixture does
+that. `new_success` now grades the silence first: the paused channel must read
+the silence's own `STALE_OBSERVATION` UNKNOWN within its threshold plus the
+scan margin (stage `unknown`), then leaving it needs a new success time. The
+module tests run the product's own silence scan (`notify_silent_collectors`)
+over an in-memory store and read it with the harness's real probes: the
+disabled unit and the expired Agent are excluded, and the same graders FAIL
+the records of a scan that did not exclude them.
+
 The 006 disk-I/O variants use the same probe for a loop + device-mapper test
 device (`dm-N`, the name `/proc/diskstats` and the product report) and a
 `systemd-run` O_DIRECT writer, but mount visibility was not their blocker. On

@@ -610,9 +610,52 @@ def logs_silent(ctx: VariantContext) -> dict[str, Any]:
     return _silence_variant(ctx, "logs_silent")
 
 
+#: Read-only: every Agent record of a cluster and whether the product holds it
+#: current now (``agent_is_current``, the silence scan's own test). Never writes.
+AGENT_CURRENCY_PROBE = r"""
+import json
+import sys
+from datetime import datetime, timezone
+
+from gpu_fault.app import ApplicationContext
+from gpu_fault.collector_requirements import agent_is_current
+
+cluster_id = sys.argv[1]
+store = ApplicationContext.from_environment().store
+now = datetime.now(timezone.utc)
+agents = [
+    {
+        "node_id": agent.node_id,
+        "lifecycle_state": agent.lifecycle_state.value,
+        "last_seen_at": agent.last_seen_at.isoformat(),
+        "lease_expires_at": (
+            agent.lease_expires_at.isoformat() if agent.lease_expires_at else None
+        ),
+        "current": agent_is_current(agent, observed_at=now),
+    }
+    for agent in store.list_agents(cluster_id)
+]
+print(json.dumps({"checked_at": now.isoformat(), "agents": agents}, sort_keys=True))
+"""
+#: The silence scan's per-channel observation (``observation_health``).
+OBSERVATION = "collector_observation_valid"
+
+
 def disabled_unit(ctx: VariantContext) -> dict[str, Any]:
-    """A disabled/masked collector is excluded from the silence scan: observing
-    it should raise no UNKNOWN and no advisory."""
+    """A collector unit disabled/masked on the node is left out of the silence scan.
+
+    The scan (``app/collector_silence.notify_silent_collectors``) records
+    ``collector_observation_valid`` for every required channel of every current
+    Agent on each pass and sends a silent channel's advisory; a unit the Agent
+    reports intentionally disabled is not required
+    (``collector_requirements.required_collectors_for_agent``). Read-only. The
+    positive controls: the Agent's own record reports the unit disabled or
+    masked (the product's input, not the survey's), and the scan re-recorded
+    another channel of this node during the window (it ran). The negatives: no
+    observation of the excluded channels recorded during the window, no
+    collector-silent advisory for them. The old check matched unit names
+    against advisory keys, which name channels: it could never fail.
+    """
 
     survey = run_survey(ctx)
     units = survey.get("units") or {}
@@ -623,43 +666,91 @@ def disabled_unit(ctx: VariantContext) -> dict[str, Any]:
         and name.startswith("gpu-fault-")
         and name.endswith("-collector.service")
     )
-    started = utc_now()
+    if not disabled:
+        raise VariantNotRun(
+            "CAPABILITY_ABSENT",
+            "no gpu-fault collector unit is disabled or masked on this node: the "
+            "silence scan has nothing to exclude",
+        )
+    started = ctx.clock()
+    agent = activity(ctx, started, metrics={OBSERVATION}, kinds=()).get("agent") or {}
+    excluded = excluded_channels(agent, disabled)
+    if not excluded:
+        raise VariantInconclusive(
+            f"the Agent record does not report {disabled} disabled or masked "
+            f"({_reported_units(agent, disabled)}): the product's exclusion was "
+            "not exercised"
+        )
     ctx.hold(SILENCE_SCAN_MARGIN + ctx.host_interval * 3, name="disabled-hold")
-    observed = activity(ctx, started, metrics={"collector_observation_valid"}, kinds=())
-    unexpected = [
-        note
-        for note in _silent_advisories(observed)
-        if any(unit.split(".")[0] in note for unit in disabled)
-    ]
-    stages = {
-        "excluded": unexpected
-        and [f"a disabled collector produced a silent advisory: {unexpected}"]
-        or [],
-        "found_disabled": []
-        if disabled
-        else ["no gpu-fault collector unit is disabled/masked on this node"],
-    }
+    observed = activity(ctx, started, metrics={OBSERVATION}, kinds=())
+    channels = sorted({channel for items in excluded.values() for channel in items})
+    if not observations_since(observed, started, exclude=channels):
+        raise VariantInconclusive(
+            "the silence scan recorded no observation of this node's other channels "
+            "during the window: whether it excluded the disabled unit is unknown"
+        )
     return _result(
-        stages,
+        exclusion_errors(observed, started, channels),
         notes=["disabled/masked collectors are excluded, not reported silent"],
-        extra={"disabled": disabled},
+        extra={"disabled": disabled, "excluded_channels": excluded},
     )
 
 
 def expired_agent(ctx: VariantContext) -> dict[str, Any]:
-    """An expired Agent lease is handled apart from channel silence: no silent
-    advisory is raised for a node whose Agent is not current."""
+    """A node whose Agent is not current is left to the Agent-expiry path.
 
-    survey = run_survey(ctx)
-    started = utc_now()
-    state = activity(ctx, started, metrics={"collector_observation_valid"}, kinds=())
-    agent = state.get("agent") or {}
+    The silence scan skips an Agent that is not current
+    (``collector_requirements.agent_is_current``: not ACTIVE, or its lease
+    expired) before any channel: no observation is recorded for its channels
+    and no collector-silent advisory is sent for it. Read-only: the variant
+    observes such an Agent record of this cluster -- a lease that expired with
+    a departed node, or a retired Agent -- across two scans, with the lane
+    node's current Agent as the positive control (its channels re-recorded).
+    Expiring a live Agent's lease needs a Node Agent heartbeat cut no fixture
+    provides (the pausable units exclude the Agent, whose lease every other
+    case relies on, and an expired lease trips ``gpu_fault_stale_agents``), so
+    a cluster with no non-current Agent is NOT_RUN(FIXTURE_NOT_READY). The old
+    check read an empty window and an Agent record that exists: it could never
+    fail.
+    """
+
+    run_survey(ctx)
+    cluster_id = ctx.settings.regional.cluster_id
+    started = ctx.clock()
+    target = stale_agent(ctx.regional.cpu_python(AGENT_CURRENCY_PROBE, cluster_id))
+    if target is None:
+        raise VariantNotRun(
+            "FIXTURE_NOT_READY",
+            "no Agent record of this cluster is expired or retired, and no fixture "
+            "expires a live Agent's lease (a Node Agent heartbeat cut is not built)",
+        )
+    ctx.hold(SILENCE_SCAN_MARGIN + ctx.host_interval * 3, name="expired-hold")
+    lane = activity(ctx, started, metrics={OBSERVATION}, kinds=())
+    if not observations_since(lane, started):
+        raise VariantInconclusive(
+            "the silence scan recorded no observation of the lane node's current "
+            "Agent during the window: whether it skipped the expired one is unknown"
+        )
+    from scripts.e2e.regional.general_live_store import node_activity
+
+    node = str(target["node_id"])
+    observed = node_activity(
+        ctx.regional, cluster_id, node, started, metrics={OBSERVATION}, kinds=()
+    )
+    after = stale_agent(ctx.regional.cpu_python(AGENT_CURRENCY_PROBE, cluster_id))
+    if after is None or after.get("node_id") != node:
+        raise VariantInconclusive(
+            f"the Agent of {node} did not stay non-current through the window"
+        )
     stages = {
-        "agent_present": [] if agent else ["no Agent record for the target node"],
-        "no_channel_silence": []
-        if not _silent_advisories(state)
-        else [
-            "a silent-channel advisory was raised while the Agent lease decides currency"
+        "not_observed": [
+            f"an observation of {item.get('device')} on {node} was recorded during "
+            f"the window ({item.get('labels')}) although its Agent is not current"
+            for item in observations_since(observed, started)
+        ],
+        "no_advisory": [
+            f"a collector-silent advisory was sent for {node}: {key}"
+            for key in _silent_advisories(observed)
         ],
     }
     return _result(
@@ -667,16 +758,19 @@ def expired_agent(ctx: VariantContext) -> dict[str, Any]:
         notes=[
             "Agent expiry is a separate path (agent_is_current); not manufactured as channel silence"
         ],
-        extra={
-            "agent_lifecycle": agent.get("lifecycle_state"),
-            "survey_units": bool(survey.get("units")),
-        },
+        extra={"expired_agent": target},
     )
 
 
 def new_success(ctx: VariantContext) -> dict[str, Any]:
     """After a silence, the channel must report a new success time -- not just a
-    running process -- before the node leaves UNKNOWN."""
+    running process -- before the node leaves UNKNOWN.
+
+    The silence itself is graded first: the paused channel must read UNKNOWN
+    for the silence's own STALE_OBSERVATION within its threshold and the scan
+    margin (the old variant discarded that wait and passed on the recovery
+    alone, whether or not the node had ever been UNKNOWN).
+    """
 
     channel, unit, threshold = SILENCE_THRESHOLDS["host_silent"]
     run_survey(ctx)
@@ -686,7 +780,7 @@ def new_success(ctx: VariantContext) -> dict[str, Any]:
     ctx.cleanup.push("pause", lambda: ctx.node("unit-resume", "--unit", unit))
     if not paused.get("stopped"):
         raise VariantInconclusive(f"{unit} did not stop")
-    _wait_observation_unknown(
+    silent = _wait_observation_unknown(
         ctx,
         started,
         channel,
@@ -696,11 +790,107 @@ def new_success(ctx: VariantContext) -> dict[str, Any]:
     ctx.node("unit-resume", "--unit", unit)
     ctx.cleanup.discard("pause")
     recovered = _await_fresh_success(ctx, channel, after=before)
-    stages = {"recovery": recovered["errors"]}
+    stages = {
+        "unknown": _observation_unknown(silent, channel, reasons=SILENCE_REASONS),
+        "recovery": recovered["errors"],
+    }
     return _result(
         stages,
         extra={"channel": channel, "success_before": before, "recovery": recovered},
     )
+
+
+def stale_agent(document: dict[str, Any]) -> dict[str, Any] | None:
+    """The cluster's most recently seen Agent that is not current, if any."""
+
+    stale = [
+        item for item in document.get("agents") or [] if item.get("current") is False
+    ]
+    return (
+        max(stale, key=lambda item: str(item.get("last_seen_at") or ""))
+        if stale
+        else None
+    )
+
+
+def _reported_units(agent: dict[str, Any], units: list[str]) -> dict[str, Any]:
+    services = agent.get("collector_services") or {}
+    return {unit: services.get(unit.removesuffix(".service")) for unit in units}
+
+
+def excluded_channels(agent: dict[str, Any], units: list[str]) -> dict[str, list[str]]:
+    """The channels of ``units`` the Agent record reports intentionally disabled:
+    the product's own exclusion rule (``CollectorServiceState``) over its
+    heartbeat's unit states, mapped through its unit table
+    (``collector_kinds.COLLECTOR_SYSTEMD_UNITS``)."""
+
+    from pydantic import ValidationError
+
+    from gpu_fault.collector_kinds import COLLECTOR_SYSTEMD_UNITS
+    from gpu_fault.collector_requirements import CollectorServiceState
+
+    result: dict[str, list[str]] = {}
+    for unit, state in _reported_units(agent, units).items():
+        try:
+            disabled = CollectorServiceState.model_validate(
+                state
+            ).intentionally_disabled
+        except ValidationError:
+            disabled = False
+        channels = sorted(
+            kind.value
+            for kind, name in COLLECTOR_SYSTEMD_UNITS.items()
+            if name == unit.removesuffix(".service")
+        )
+        if disabled and channels:
+            result[unit] = channels
+    return result
+
+
+def observations_since(
+    document: dict[str, Any],
+    since: datetime,
+    *,
+    exclude: list[str] | tuple[str, ...] = (),
+) -> list[dict[str, Any]]:
+    """The scan's observations of the node recorded at or after ``since``
+    (its channels but ``exclude``)."""
+
+    result = []
+    for item in document.get("metric_latest") or []:
+        moment = parse_time(item.get("observed_at"))
+        if (
+            item.get("name") == OBSERVATION
+            and item.get("device") not in exclude
+            and moment is not None
+            and moment >= since
+        ):
+            result.append(item)
+    return result
+
+
+def exclusion_errors(
+    document: dict[str, Any], since: datetime, channels: list[str]
+) -> dict[str, list[str]]:
+    """No observation recorded and no advisory sent for ``channels`` since ``since``."""
+
+    recorded = [
+        item
+        for item in observations_since(document, since)
+        if item.get("device") in channels
+    ]
+    return {
+        "not_observed": [
+            f"{item.get('device')} was observed during the window ({item.get('labels')}) "
+            "although its unit is disabled"
+            for item in recorded
+        ],
+        "no_advisory": [
+            f"a disabled collector produced a silent advisory: {key}"
+            for channel in channels
+            for key in _silent_advisories(document, channel)
+        ],
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -1145,8 +1335,11 @@ VARIANTS = [
     _spec(
         CASE_031,
         "disabled_unit",
-        "observe a disabled/masked collector unit",
-        "a disabled/masked unit is excluded from the silence scan: no UNKNOWN, no advisory",
+        "read-only: a collector unit disabled/masked on the node, which the Agent's "
+        "own record reports so, across two silence scans",
+        "the scan records no observation of its channels and sends no advisory for "
+        "them while it re-records the node's other channels; no disabled unit on the "
+        "node is NOT_RUN(CAPABILITY_ABSENT)",
         disabled_unit,
         risk="L",
         max_minutes=8,
@@ -1154,8 +1347,11 @@ VARIANTS = [
     _spec(
         CASE_031,
         "expired_agent",
-        "observe a node whose Agent lease decides currency",
-        "Agent expiry is a separate path; no channel-silence advisory is manufactured for it",
+        "read-only: an Agent record of this cluster that is not current (expired "
+        "lease or retired), across two silence scans",
+        "no observation recorded and no collector-silent advisory for that node while "
+        "the lane node's current Agent is re-recorded; a cluster without such an "
+        "Agent is NOT_RUN(FIXTURE_NOT_READY)",
         expired_agent,
         risk="L",
         max_minutes=8,
@@ -1189,8 +1385,9 @@ VARIANTS = [
     _spec(
         CASE_031,
         "new_success",
-        "resume a paused channel and require a new success time to leave UNKNOWN",
-        "recovery needs a fresh success timestamp, not merely a running process",
+        "pause the host collector past its threshold, then resume it",
+        "the channel reads UNKNOWN (STALE_OBSERVATION) under the pause; leaving it "
+        "needs a fresh success timestamp, not merely a running process",
         new_success,
         risk="L",
         max_minutes=16,
