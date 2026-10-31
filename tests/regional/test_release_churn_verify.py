@@ -21,10 +21,10 @@ from typing import Any
 import pytest
 
 from gpu_fault_release import regional_admin_checks as CHECKS
-from gpu_fault_release import regional_admin_checks_churn as CHURN
+from gpu_fault_release import regional_release_verify_churn as CHURN
 from gpu_fault_release import regional_admin_commands as COMMANDS
 from gpu_fault_release import regional_release_validation as VALIDATION
-from gpu_fault_release.regional_admin_checks_churn import RELEASE_CHURN_KEY
+from gpu_fault_release.regional_release_verify_churn import RELEASE_CHURN_KEY
 from gpu_fault_release.regional_release_departed_nodes import DepartureProof
 from tests.regional.test_regional_admin_checks import (
     control_api_release,

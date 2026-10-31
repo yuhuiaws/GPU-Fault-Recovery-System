@@ -15,9 +15,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, cast
 from urllib.parse import urlsplit
 
-from gpu_fault_release import regional_admin_checks_churn as release_churn
+from gpu_fault_release import regional_release_verify_churn as release_churn
 from gpu_fault_release import regional_admin_checks_coverage as agent_coverage
-from gpu_fault_release.regional_admin_checks_nlb_rules import (
+from gpu_fault_release.regional_release_nlb_rules import (
     nlb_https_rule_violation as nlb_https_rule_violation,
     permission_reaches_https as permission_reaches_https,
 )

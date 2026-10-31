@@ -54,7 +54,7 @@ from gpu_fault.dcgm_versions import (
     dcgm_version_relation,
     hostengine_version,
 )
-from gpu_fault_release.regional_admin_checks_churn import churn_excused
+from gpu_fault_release.regional_release_verify_churn import churn_excused
 from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_release_dcgm import (
     check_dcgm_hostengine_agreement,
@@ -453,7 +453,7 @@ def check_agent_coverage(
     Returns the counted Agents for the checks that follow (Runtime Profile,
     readiness), so a retired record is judged by none of them. A verify's
     report also names what the release's own node churn excuses
-    (``regional_admin_checks_churn``): those nodes' Agents are not counted.
+    (``regional_release_verify_churn``): those nodes' Agents are not counted.
     """
 
     excused = churn_excused(cluster)

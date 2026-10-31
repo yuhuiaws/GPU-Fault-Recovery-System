@@ -34,7 +34,7 @@ import time
 from typing import Any, Callable
 
 from gpu_fault.admin.deadlines import DeploymentDeadlineExceeded, remaining_timeout
-from gpu_fault_release.regional_admin_checks_churn import churn_departed
+from gpu_fault_release.regional_release_verify_churn import churn_departed
 from gpu_fault_release.regional_release_config import CheckFailure, ReleaseError
 from gpu_fault_release.regional_release_probes import probe_source
 from gpu_fault_release.regional_release_runtime_identity import (
