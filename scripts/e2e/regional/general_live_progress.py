@@ -195,11 +195,9 @@ STOP_REPORTER = (
     "done\n"
     'printf \'%s\\n%s\\n\' "$pid" "$state"\n'
 )
-#: ``old_attempt``: the attempt id its heartbeat claims -- the job's own id
-#: with an attempt number the product never ran (the live one is ``-a001``), so
-#: the product holds no RUNNING/PENDING allocation for it -- and how long the
-#: live attempt is watched after the post (three reporter intervals: its own
-#: next heartbeats must still be accepted).
+#: ``old_attempt``: the claimed attempt -- the job's id with a number the product
+#: never ran (no RUNNING/PENDING allocation) -- and the watch after the post
+#: (three reporter intervals: the live attempt's next heartbeats still accepted).
 FOREIGN_ATTEMPT_SUFFIX = "-a000"
 FOREIGN_SETTLE_SECONDS = 45
 #: Operations a training-progress chain must never contain: no hardware action,
@@ -487,11 +485,9 @@ class ManagedProgressJob:
         self, rank: int, attempt_id: str, **fields: Any
     ) -> dict[str, Any]:
         """POST one heartbeat claiming ``attempt_id`` from rank ``rank``'s
-        reporter sidecar (``HEARTBEAT_POST``: the product's own model and
-        client, the sidecar's connection and Pod identity, one attempt) and
-        return what the script printed: the heartbeat and the product's answer,
-        or the client's error. Output that is not that object is an answer of
-        its own (``delivered`` false), never an exception."""
+        reporter sidecar (``HEARTBEAT_POST``) and return what it printed: the
+        heartbeat and the product's answer, or the client's error; other
+        output is an undelivered answer, never an exception."""
 
         output = self.ctx.regional.kubectl(
             "gpu",
@@ -1250,13 +1246,22 @@ def old_attempt(ctx: VariantContext) -> dict[str, Any]:
     job = _job(ctx, "old")
     started = utc_now()
     job.write_progress(0, step=10, loss=1.0)
-    ctx.hold(20, name="old-run")
-    before = _records(ctx, job, started)
-    if not rank_states(before, 0):
+    before: dict[str, Any] = {}
+
+    def heard() -> dict[str, Any] | None:
+        nonlocal before
+        before = _records(ctx, job, started)
+        return before if rank_states(before, 0) else None
+
+    if (
+        ctx.wait_until(
+            heard, timeout_seconds=HEARTBEAT_TIMEOUT, poll_seconds=15, name="old-live"
+        )
+        is None
+    ):
         raise VariantInconclusive(
             "the live attempt's own heartbeat never reached the store, so a "
-            "refused foreign one would prove nothing: progress states "
-            f"{before.get('progress_states')}"
+            f"refused foreign one would prove nothing: {before.get('progress_states')}"
         )
     foreign = f"{job.name}{FOREIGN_ATTEMPT_SUFFIX}"
     answer = job.post_heartbeat(0, foreign, step=10, loss=1.0, numerical_error=True)

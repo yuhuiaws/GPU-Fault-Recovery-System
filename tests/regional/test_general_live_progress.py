@@ -448,6 +448,19 @@ def test_old_attempt_posts_a_nan_for_the_never_run_attempt_and_passes_on_refusal
     assert store.reads == 2, "one read before the post, one after the settle"
 
 
+def test_old_attempt_waits_for_the_live_heartbeat_before_posting(
+    tmp_path: Path,
+) -> None:
+    # The reporter's first heartbeat may come before the watcher's observation
+    # of the attempt (refused then): the variant polls until one is stored.
+    store = _old_attempt_docs()
+    store.documents.insert(0, {**store.documents[0], "progress_states": []})
+    result = _run_old_attempt(tmp_path, store, _refused())
+    assert result["verdict"] == "PASS", result["errors"]
+    assert store.reads == 3, "two reads for the live heartbeat, one after the post"
+    assert len(FakeProgressJob.created[-1].posts) == 1, "posted once, when heard"
+
+
 def test_old_attempt_fails_when_the_ingest_accepts_the_foreign_heartbeat(
     tmp_path: Path,
 ) -> None:
