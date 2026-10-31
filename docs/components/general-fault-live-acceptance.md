@@ -489,6 +489,10 @@ latency门槛且跨越默认120秒，另测短flush。用同一设备/同一时�
 `--scan-open`失败、设备查询失败、损坏JSON、工具缺失必须与passed=false分开；
 能力不支持单独报告，不得当成功健康扫描。现有scan退出码处理缺口应明确FAIL。
 保存扫描/逐设备输出、exit status、设备身份及Kubernetes回执；移除夹具并验证原工具。
+`healthy` 是只读基线，但必须读到真实判定：`smartctl` 按节点现状使用，缺失时只有给了 `TEMP_TEST_PACKAGE_INSTALL`
+才为本次运行安装 `smartmontools`（与六个回放变体共用的临时包步骤，最后 LIFO 清理卸载），否则
+`NOT_RUN(CAPABILITY_ABSENT)`；产品没有任何盘的判定同样 `NOT_RUN(CAPABILITY_ABSENT)`。PASS 要求产品在一个健康摘要周期内
+重新判定每个已判定的盘、读数全为 0 且没有存储 finding；没有读数不再算通过。
 
 ### GF-GENERAL-LIVE-008
 
@@ -1742,7 +1746,7 @@ watcher Pod，由 Deployment 重建）、
 plan 与 execute 必须给出同一组令牌）：`TEMP_TEST_PACKAGE_INSTALL`（临时测试包，共享步骤
 `general_live_deps.ensure_dependencies` 经 `general_live_deps_probe.py` 的审查允许表：009 `tcp_only`
 节点缺 `tc` 时为本次运行用 dnf 安装 `iproute-tc`，`sch_netem` 无法为运行内核加载时安装
-`kernel-modules-extra-$(uname -r)`；007 六个 SMART 回放变体缺 `smartctl` 时安装 `smartmontools`
+`kernel-modules-extra-$(uname -r)`；007 六个 SMART 回放变体与 `healthy` 缺 `smartctl` 时安装 `smartmontools`
 及其经审查的依赖闭包 `smartmontools-selinux`（探针的 `PACKAGE_CLOSURES`：smartmontools 的 rpm 声明富依赖
 `(smartmontools-selinux if selinux-policy-targeted)`，AL2023 节点装有 selinux-policy-targeted，dnf 必然
 一并拉入；该子包是同一源码构建的 noarch SELinux 策略模块包，脚本只以 200 优先级加载 `smartmon` 策略模块、
@@ -2198,7 +2202,11 @@ expected FAIL 变体却 PASS），这种底线之下的读数以及无样本可�
   `KERNEL_MODULE_LOAD`；七个变体均预期 PASS（`mount_disappears`/`io_only_failure` 由批次 176、
   `shared_failure_domain` 由批次 177 关闭缺口），详见 GF-GENERAL-LIVE-005 节。
 - 007 `healthy`（observation：只读确认真实 SMART 判定健康且不产生存储 finding，
-  作为失败变体的对照基线）。
+  作为失败变体的对照基线）。它同样需要真实判定：节点有 `smartctl`（或在可选令牌
+  `TEMP_TEST_PACKAGE_INSTALL` 下为本次运行安装 `smartmontools`，否则 `NOT_RUN(CAPABILITY_ABSENT)` 并写明令牌），
+  产品至少对一个盘给出判定（否则 `NOT_RUN(CAPABILITY_ABSENT)`），且在一个健康摘要周期内对每个这样的盘重新给出
+  `smart_health_failed`（窗口内的批次样本或最新记录：正向对照，缺失即 FAIL），读数全为 0、没有存储 finding。
+  此前两集群都没有 `smartctl`，没有任何读数，该变体平凡通过。
 - 007 SMART 的回放变体 `health_failed`/`query_failed`/`scan_failed`/`malformed_json`/
   `tool_missing`/`unsupported_device`（live-replay，模块 `general_live_smart`，两条车道，需
   `HOST_SOURCE_REPLAY`）：在共享回放器的命令包装模式下只改写产品真实 `smartctl` 调用的一个

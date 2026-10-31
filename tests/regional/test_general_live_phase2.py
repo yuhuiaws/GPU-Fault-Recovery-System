@@ -191,7 +191,9 @@ def _devices_context(
     probe = FakeProbe(
         {
             "survey": {
-                "tools": {},
+                # The node has smartctl: without it 007 healthy is
+                # NOT_RUN(CAPABILITY_ABSENT) (test_general_live_smart.py).
+                "tools": {"smartctl": True},
                 "modules": {},
                 "backing": [],
                 "residue": {"units": [], "paused_units": {}, "paused_processes": {}},
@@ -209,6 +211,9 @@ def test_smart_healthy_passes_when_no_finding(tmp_path: Path) -> None:
     )
     result = spec.execute(ctx)
     assert result["verdict"] == "PASS", result["errors"]
+    assert result["readings"] == {"/dev/nvme0": [0.0, 0.0]}, (
+        "the drive the product grades, re-graded in the window"
+    )
 
 
 def test_smart_healthy_fails_when_a_smart_finding_exists(tmp_path: Path) -> None:

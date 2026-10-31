@@ -23,11 +23,14 @@ the database and the QUARANTINE / validated-restore chain stay real; the
 wrapper's journal (``replay.audit``) is the oracle that the product asked, and a
 variant whose rule was never served is INCONCLUSIVE, not PASS. Every variant
 closes its window and proves the real tool answers again before it ends;
-``healthy`` is the read-only baseline. ``proof_scope`` is ``live-replay``.
+``healthy`` is the read-only baseline, and it too needs a real verdict: every
+drive the product grades re-graded healthy within one health summary.
+``proof_scope`` is ``live-replay``.
 
 A node without ``smartctl`` (the AL2023 EKS GPU AMI) keeps the six replay
-variants NOT_RUN(CAPABILITY_ABSENT) unless ``TEMP_TEST_PACKAGE_INSTALL`` is
-given; then the shared temporary-package step (``general_live_deps``) installs
+variants and ``healthy`` NOT_RUN(CAPABILITY_ABSENT) unless
+``TEMP_TEST_PACKAGE_INSTALL`` is given; then the shared temporary-package step
+(``general_live_deps``) installs
 exactly ``smartmontools`` and its reviewed dependency ``smartmontools-selinux``
 (the same build's SELinux policy module, which AL2023's
 ``selinux-policy-targeted`` makes dnf pull) for this run before anything else
@@ -87,6 +90,7 @@ from scripts.e2e.regional.general_live_verdicts import (
     finding_incidents,
     hardware_errors,
     node_isolated,
+    parse_time,
     samples,
     verdict,
 )
@@ -551,40 +555,72 @@ def _other_drives_kept(
 def smart_healthy(ctx: VariantContext) -> dict[str, Any]:
     """The node's real ``smartctl`` grades the drives healthy -> no finding.
 
-    No injection and no replay: the host collector already runs ``smartctl``
-    every cycle, so this reads the product's own records across a window and
-    checks that ``smart_health_failed`` minted no storage finding and that any
-    latest ``smart_health_failed`` value is 0. It is the negative baseline the
-    failing SMART variants are judged against.
+    No injection and no replay: the host collector runs ``smartctl`` every
+    tick. The tool must be there -- as found, or installed for this run behind
+    ``TEMP_TEST_PACKAGE_INSTALL`` (``ensure_smartctl``; without the token a
+    node lacking it is NOT_RUN(CAPABILITY_ABSENT) naming the token) -- and the
+    product must grade at least one drive (``smart_devices``, otherwise
+    NOT_RUN(CAPABILITY_ABSENT)). Across one health summary the product must
+    re-grade every such drive (a ``smart_health_failed`` reading of the drive
+    observed in the window: the positive control), every reading 0, no
+    storage finding. The old variant read the window without the tool: no
+    reading at all was a trivial PASS. It is the negative baseline the failing
+    SMART variants are judged against.
     """
 
-    run_survey(ctx)
-    started_at = utc_now()
+    survey = run_survey(ctx)
+    dependencies = ensure_smartctl(ctx, survey)
+    devices = smart_devices(ctx, fresh=dependencies["changed"])
+    started_at = ctx.clock()
     ctx.hold(ctx.host_summary + ctx.host_interval * 3, name="smart-healthy-hold")
     observed = activity(ctx, started_at, metrics={HEALTH})
-    smart_samples = samples(observed, HEALTH)
+    readings = window_readings(observed, started_at)
+    stages = {
+        "graded": [
+            f"the product did not re-grade {device} within the window"
+            for device in devices
+            if device not in readings
+        ],
+        "no_finding": chain_errors(
+            observed, ChainExpectation(metric=HEALTH, present=False)
+        ),
+        "hardware": hardware_errors(observed),
+        "healthy_values": [
+            f"smart_health_failed={value} on {device} on a healthy node"
+            for device, values in sorted(readings.items())
+            for value in values
+            if value != 0
+        ],
+    }
+    return _result(
+        stages,
+        notes=["read-only baseline for the failing SMART variants"],
+        extra={
+            "devices": devices,
+            "readings": readings,
+            "dependencies": dependency_summary(dependencies),
+        },
+    )
+
+
+def window_readings(observed: Mapping[str, Any], since: Any) -> dict[str, list[Any]]:
+    """Every ``smart_health_failed`` value per drive observed at or after
+    ``since``: the accepted batches' samples and the product's latest records
+    (a healthy verdict rides the health summary into the latest record)."""
+
+    readings: dict[str, list[Any]] = {}
     latest = [
         item
         for item in observed.get("metric_latest") or []
         if item.get("name") == HEALTH
     ]
-    stages = {
-        "no_finding": chain_errors(
-            observed, ChainExpectation(metric=HEALTH, present=False)
-        ),
-        "hardware": hardware_errors(observed),
-        "healthy_values": []
-        if all(
-            not isinstance(item.get("value"), (int, float)) or item["value"] == 0
-            for item in [*smart_samples, *latest]
-        )
-        else ["a smart_health_failed reading was non-zero on a healthy node"],
-    }
-    return _result(
-        stages,
-        notes=["read-only baseline for the failing SMART variants"],
-        extra={"smart_latest": latest},
-    )
+    for item in [*samples(dict(observed), HEALTH), *latest]:
+        moment = parse_time(item.get("observed_at"))
+        device = item.get("device")
+        if moment is None or moment < since or not isinstance(device, str):
+            continue
+        readings.setdefault(device, []).append(item.get("value"))
+    return readings
 
 
 def health_failed(ctx: VariantContext) -> dict[str, Any]:
@@ -982,10 +1018,21 @@ VARIANTS = [
         lanes=("eks", "hp"),
         risk="L",
         flags="S",
-        injection="none (read-only): observe the node's real SMART grading",
-        expected="a healthy smartctl mints no storage finding and no smart_health_failed > 0",
-        cleanup="none",
-        max_minutes=10,
+        injection=(
+            "none (read-only): observe the node's real SMART grading; smartctl as "
+            "found, or smartmontools installed for this run behind "
+            "TEMP_TEST_PACKAGE_INSTALL"
+        ),
+        expected=(
+            "every drive the product grades is re-graded within one health summary "
+            "with smart_health_failed=0 and no storage finding; no smartctl or no "
+            "graded drive is NOT_RUN(CAPABILITY_ABSENT)"
+        ),
+        cleanup="remove smartmontools if this run installed it",
+        max_minutes=16,
+        # Only unlocks the temporary smartmontools install on a node without
+        # smartctl, as for the replay variants.
+        optional_approvals=(PACKAGE_APPROVAL,),
         execute=smart_healthy,
     ),
 ]
@@ -1009,4 +1056,5 @@ __all__ = [
     "smart_devices",
     "smart_errors",
     "unsupported_device_rules",
+    "window_readings",
 ]

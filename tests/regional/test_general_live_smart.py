@@ -303,6 +303,7 @@ def test_every_007_variant_is_registered_on_both_lanes() -> None:
         assert spec.implemented, spec.key
         if spec.variant == "healthy":
             assert spec.proof_mode == OBSERVATION and spec.approvals == ()
+            assert spec.optional_approvals == (PACKAGE_APPROVAL,), spec.key
         else:
             assert spec.proof_mode == LIVE_REPLAY, spec.key
             assert spec.approvals == (HOST_SOURCE_REPLAY,), spec.key
@@ -790,3 +791,72 @@ def test_served_calls_filters_query_device_and_applied_rules() -> None:
     assert smart.smart_errors(
         {"batches": [{"collection_errors": ["_smart: x", "_bmc: y"]}]}
     ) == ["_smart: x"]
+
+
+# --------------------------------------------------------------------------- #
+# healthy: a real verdict, re-graded in the window
+# --------------------------------------------------------------------------- #
+def test_healthy_without_smartctl_is_not_run_naming_the_token(tmp_path: Path) -> None:
+    # The live nodes' shape: no smartctl, no SMART reading at all. The old
+    # variant read that window and passed it as "no finding, no failed drive".
+    nothing = doc(metric_latest=[])
+    with pytest.raises(VariantNotRun) as raised:
+        run("healthy", Scenario(nothing), tmp_path, smartctl=False, approvals=())
+    assert raised.value.reason == "CAPABILITY_ABSENT", raised.value
+    assert PACKAGE_APPROVAL in raised.value.detail, raised.value.detail
+
+
+def test_healthy_without_a_graded_drive_is_not_run(tmp_path: Path) -> None:
+    unsupported = doc(
+        metric_latest=[
+            {
+                "name": smart.UNSUPPORTED,
+                "device": None,
+                "value": 1.0,
+                "labels": {"reason": "NO_DEVICES"},
+            }
+        ]
+    )
+    with pytest.raises(VariantNotRun) as raised:
+        run("healthy", Scenario(unsupported), tmp_path)
+    assert raised.value.reason == "CAPABILITY_ABSENT", raised.value
+
+
+def test_healthy_installs_smartmontools_with_the_token_and_reads_a_real_verdict(
+    tmp_path: Path,
+) -> None:
+    scenario = Scenario(healthy(), warmup=[doc(metric_latest=[])])
+    ctx, _source, _node, deps = build(
+        "healthy", scenario, tmp_path, smartctl=False, approvals=(PACKAGE_APPROVAL,)
+    )
+    result = ctx.spec.execute(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    assert result["dependencies"]["changed"] is True, result["dependencies"]
+    assert result["dependencies"]["installed"] == SMART_INSTALLED
+    ensure = next(call for call in deps.calls if call[0] == "ensure")
+    assert "--allow-install" in ensure, ensure
+    assert result["readings"] == {DEV0: [0.0, 0.0], DEV1: [0.0, 0.0]}, result
+
+
+def test_healthy_fails_when_a_graded_drive_is_not_regraded_in_the_window(
+    tmp_path: Path,
+) -> None:
+    # DEV1 is graded (its latest record) but no reading of it arrives in the
+    # window: the product stopped grading it.
+    only_dev0 = doc(batch(T1, sample(smart.HEALTH, 0.0, DEV0)))
+    result, _source, _node = run("healthy", Scenario(only_dev0), tmp_path)
+    assert result["verdict"] == "FAIL", result
+    assert result["stages"]["graded"] == [
+        f"the product did not re-grade {DEV1} within the window"
+    ], result["stages"]
+
+
+def test_healthy_fails_on_a_non_zero_reading_in_the_window(tmp_path: Path) -> None:
+    failed = doc(
+        batch(T1, sample(smart.HEALTH, 0.0, DEV0), sample(smart.HEALTH, 1.0, DEV1))
+    )
+    result, _source, _node = run("healthy", Scenario(failed), tmp_path)
+    assert result["verdict"] == "FAIL", result
+    assert result["stages"]["healthy_values"] == [
+        f"smart_health_failed=1.0 on {DEV1} on a healthy node"
+    ], result["stages"]

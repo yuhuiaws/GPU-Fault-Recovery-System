@@ -1483,7 +1483,7 @@ if it is not loaded (`KERNEL_MODULE_LOAD`). Its limits are deliberate:
 
 The same step is shared -- `general_live_deps.ensure_dependencies`, one helper
 over the same probe, never a copy per category -- by the six 007 SMART replay
-variants (`smartctl` -> `smartmontools`) and 004 `probe_error` (`mkfs.vfat` ->
+variants and 007 `healthy` (`smartctl` -> `smartmontools`) and 004 `probe_error` (`mkfs.vfat` ->
 `dosfstools`), the two other tools the AL2023 EKS GPU AMI lacks (pass 5 recorded
 all of them NOT_RUN(CAPABILITY_ABSENT)). Without the optional token the NOT_RUN
 stays and its detail names the token and the package(s); with it exactly that
@@ -1530,7 +1530,7 @@ times across the rule's sustain plus one health summary, and `memory-status`
 reads systemd's `Result=oom-kill` on the uncollected unit as the proof the OOM
 stayed inside the cgroup, also behind `HOST_MEMORY_PRESSURE`), plus 007
 `healthy` (a read-only observation that the real SMART reading mints no
-finding). `cgroup_only` proves only that the product does not grade a
+finding; it needs a real reading, see below). `cgroup_only` proves only that the product does not grade a
 cgroup-local OOM as host pressure (no `memory_used_percent` /
 `memory_available_percent` finding, no STOP, isolation or hardware step while
 the host collector keeps delivering normal samples); it is a transient systemd
@@ -1578,7 +1578,15 @@ runner waits up to one health summary plus six ticks for the product's first
 tick, no restart -- and names that drive, the window then restarts the unit on
 open and close as always, and the packages are removed as the last LIFO cleanup
 after the window closed, `smartmontools` first, so the product reports
-`smart_status_unsupported` TOOL_MISSING again. A replay proves the processing chain only -- no drive fails and no BMC exists, so
+`smart_status_unsupported` TOOL_MISSING again. 007 `healthy` used to read its
+window on nodes without `smartctl` -- no SMART reading at all -- and pass it as
+"no finding, no failed drive" on both clusters. It now takes the same
+optional token and path: without `smartctl` and without the token it is
+NOT_RUN(CAPABILITY_ABSENT) naming the token, a node whose product grades no
+drive is NOT_RUN(CAPABILITY_ABSENT), and a PASS needs every drive the product
+grades re-graded within one health summary (a `smart_health_failed` reading in
+the window, from a batch sample or the latest record: the positive control),
+every reading 0 and no storage finding. A replay proves the processing chain only -- no drive fails and no BMC exists, so
 `proof_scope` is `live-replay`; the OPEN_FAILED drive and a hung `-H` query stay
 software-tested; 015 `unavailable_sensor` uses one `na` row among healthy ones
 (a table of only `na` rows is UNKNOWN in the product -- a `_bmc` collection
