@@ -4920,8 +4920,12 @@ at least two workload domains (the nodes of one job, or of one incident without 
 many nodes is one fault and never trips it; many unrelated nodes failing together look like a bad driver, image or policy. The node count is the
 cluster's `ACTIVE`/`DRAINING` fleet Agents (one per GPU node; a departed node counts until the departed-node cleanup retires its
 Agent, so the threshold errs high, not low), read at most once a minute per process and cluster
-(`execution/storm_admission.py`); unreadable, the floor of 3 applies. 20 %, 600 s and 3 are product constants with no
-environment variables. The judgement runs in the admission's own store transaction: the breaker is the store's
+(`execution/storm_admission.py`). A failed read is never kept: the last good count judges for up to 300 s (a count changes
+only through joins, departures and retirements, and a departed node is retired no sooner than the 10-minute departure guard,
+so a count five minutes old misses at most five minutes of retirements), with no count that young the floor of 3 applies, the
+store is not read again for 5 s (one dispatcher tick), and every failed read is logged and counted in
+`gpu_fault_remediation_budget_storm_breaker_node_count_read_failures_total{fallback}`. 20 %, 600 s and 3 are product
+constants with no environment variables. The judgement runs in the admission's own store transaction: the breaker is the store's
 `remediation_storm_breaker` record (a generic object kind, no schema migration) keyed by cluster id, read and written after the
 budget scopes admitted the claim, under the `remediation_storm/<cluster>` lock (PostgreSQL takes it last in the batch of budget
 advisory locks), so control-plane restarts and replicas see one breaker; an admission a budget scope refused does not count.
@@ -5057,7 +5061,9 @@ those slots belong to one node, one job (the token a step that stops or restarts
 workflow of the same node or job holds it and has not ended within an hour -- past a progressing holder's own deadline (1800 s for a node
 workflow, 3600 s for a job workflow); a wait the storm breaker holds is `GpuFaultRemediationStormBreakerOpen`'s and is not read. The storm breaker is `gpu_fault_remediation_budget_storm_breaker_open{cluster_id}` (1 while open), `..._window_nodes`
 against `..._threshold_nodes`, `..._tripped_timestamp_seconds` and `..._held_workflows`; `GpuFaultRemediationStormBreakerOpen`
-(critical, 1 minute) fires for as long as it is open.
+(critical, 1 minute) fires for as long as it is open. Failed node-count reads are the per-process counter
+`..._node_count_read_failures_total{fallback}` (rendered on the worker role, control-worker, which makes the claims;
+`last_good`: judged with the last good count, `floor`: judged at the floor of 3).
 
 `GPU_FAULT_PROCESSOR_COMPLETION_CLUSTER_CONCURRENCY` is not a counterexample: it only controls
 the number of commit threads for different cluster transactions within a PostgreSQL completion batch; it does not limit how many nodes

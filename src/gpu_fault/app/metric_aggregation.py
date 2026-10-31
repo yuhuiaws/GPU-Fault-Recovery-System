@@ -398,6 +398,8 @@ _PER_PROCESS = (
     "gpu_fault_processor_stale_superseded_total",
     "gpu_fault_processor_telemetry_coalesced_total",
     "gpu_fault_remediation_budget_parked_holds_released_total",
+    # Counted by the claim path of each process, not read from the store.
+    "gpu_fault_remediation_budget_storm_breaker_node_count_read_failures_total",
     "gpu_fault_remote_command_batched_commands_total",
     "gpu_fault_remote_command_batched_steps_total",
     "gpu_fault_remote_command_open_sibling_holds_total",

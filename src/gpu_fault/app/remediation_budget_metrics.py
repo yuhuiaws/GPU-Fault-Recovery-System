@@ -23,6 +23,11 @@ the trip while open) against the threshold it last judged, when it tripped,
 and how many workflows it holds. A ``region``, ``cluster`` or ``class`` scope
 type an older release's RUNNING row still lists is counted in
 ``gpu_fault_remediation_budget_active_claims`` until that row ends.
+
+One breaker family is not Store-derived: the reads of a cluster's GPU-node
+count that failed in this process (``storm_admission.cluster_gpu_nodes``), a
+counter per process by what judged the claim instead -- the last good count or
+the floor (``storm_node_count_metric_lines``).
 """
 
 from __future__ import annotations
@@ -32,8 +37,18 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from gpu_fault.execution.storm_admission import (
+    FALLBACK_FLOOR,
+    FALLBACK_LAST_GOOD,
+    NODE_COUNT_LAST_GOOD_SECONDS,
+    node_count_read_failures,
+)
 from gpu_fault.models import WorkflowRequest, WorkflowStatus
-from gpu_fault.remediation_storm import STORM_SCOPE_PREFIX, RemediationStormBreaker
+from gpu_fault.remediation_storm import (
+    STORM_MIN_NODES,
+    STORM_SCOPE_PREFIX,
+    RemediationStormBreaker,
+)
 from gpu_fault.store.shared.remediation_budgets import (
     budget_holds,
     budget_wait_started_at,
@@ -41,6 +56,9 @@ from gpu_fault.store.shared.remediation_budgets import (
 
 WAITING_STATUSES = frozenset(
     {WorkflowStatus.PENDING, WorkflowStatus.RUNNING, WorkflowStatus.SAFETY_PENDING}
+)
+STORM_NODE_COUNT_READ_FAILURES = (
+    "gpu_fault_remediation_budget_storm_breaker_node_count_read_failures_total"
 )
 
 
@@ -198,4 +216,25 @@ def remediation_storm_lines(
             f"{value(record):g}"
             for record in records
         )
+    return lines
+
+
+def storm_node_count_metric_lines(_runtime: object) -> list[str]:
+    """This process's failed reads of a cluster's GPU-node count, by what
+    judged instead; both series always, so a rate sees the first failure."""
+
+    failures = node_count_read_failures()
+    metric = STORM_NODE_COUNT_READ_FAILURES
+    lines = [
+        f"# HELP {metric} Reads of a cluster's GPU-node count by the remediation "
+        "storm breaker that failed in this process, by what judged the claim "
+        "instead: the last good count (younger than "
+        f"{NODE_COUNT_LAST_GOOD_SECONDS:.0f} s) or the floor of "
+        f"{STORM_MIN_NODES} nodes.",
+        f"# TYPE {metric} counter",
+    ]
+    lines.extend(
+        f'{metric}{{fallback="{fallback}"}} {failures[fallback]}'
+        for fallback in (FALLBACK_LAST_GOOD, FALLBACK_FLOOR)
+    )
     return lines

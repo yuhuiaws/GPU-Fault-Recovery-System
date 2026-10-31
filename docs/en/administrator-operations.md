@@ -4259,7 +4259,11 @@ modifying Store JSON or repeating `send`; an isolated notifier result in accepta
   `gpu_fault_remediation_budget_storm_breaker_window_nodes{cluster_id}` against `..._threshold_nodes`,
   `..._held_workflows` for the queue, and the tripping workflow's `REMEDIATION_STORM_TRIPPED` hold event for the node list. Look
   for the common cause: a driver, image, firmware or policy rollout, a fabric or power event, a detector reporting healthy
-  nodes. A real correlated hardware fault on many independent nodes also trips it -- that is the case it exists for.
+  nodes. A real correlated hardware fault on many independent nodes also trips it -- that is the case it exists for. A
+  large cluster tripped at threshold 3 with an empty `cluster_nodes` in the hold event was judged without a node count:
+  `gpu_fault_remediation_budget_storm_breaker_node_count_read_failures_total{fallback="floor"}` rising and
+  `cannot count the GPU nodes` in the control-worker log mean the fleet read failed with no good count younger than
+  300 s; release once the store answers again and no common cause is found.
 - **Exit**: once the cause is understood and stopped, `gpu-fault-admin remediation-storm release --state-dir "$STATE_DIR"
   --cluster-id <cluster> --reason ... --reference ...` closes and re-arms the breaker: the held workflows are admitted (without
   counting again) and new faults are counted from zero. To hand the held work to people instead,

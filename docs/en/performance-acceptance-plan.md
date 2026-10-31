@@ -1172,8 +1172,9 @@ at least two workload domains (the job, else the incident), the cluster's new de
 workflow stays `PENDING`, its last refusal naming `storm:<cluster>`), work in flight goes on, the critical
 `GpuFaultRemediationStormBreakerOpen` fires, and nothing resumes until an operator releases or aborts it. The cluster's
 GPU nodes are its fleet Agents that are `ACTIVE` or `DRAINING`, whatever their lease, counted at the cluster's first
-admissions and at most once a minute per control-plane process (`storm_admission.cluster_gpu_nodes`); an unreadable fleet
-is the floor of 3. 20%, 600 s and 3 are product constants, and the load tests keep them as shipped.
+admissions and at most once a minute per control-plane process (`storm_admission.cluster_gpu_nodes`); a failed read keeps
+the last good count for up to 300 s, and only without one is it the floor of 3. 20%, 600 s and 3 are product constants,
+and the load tests keep them as shipped.
 
 **The healthy fleet.** The §8.2 action, §8.3 correlated and §8.4 integrated runners and the breaker step below register,
 in every synthetic cluster and beside the model's own nodes, a healthy fleet so that each cluster registers

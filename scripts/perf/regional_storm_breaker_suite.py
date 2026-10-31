@@ -141,7 +141,9 @@ CLUSTER = storm.STORM_CLUSTER
 #: The breaker counts a cluster's nodes at most once a minute per process
 #: (``storm_admission.NODE_COUNT_TTL_SECONDS``); the step seeds its workflows
 #: no sooner than this after its fleet was complete, so no count a process
-#: cached for the cluster's id before the fleet existed can judge them.
+#: cached for the cluster's id before the fleet existed can judge them (unless
+#: a re-read fails: that process then judges with the older count, never above
+#: the fleet's, for up to ``storm_admission.NODE_COUNT_LAST_GOOD_SECONDS``).
 COUNT_SETTLE_SECONDS = 65.0
 VERDICT_FAILED = "storm breaker step verdict failed"
 #: The longest the held workflows may wait for the release. Two warnings with

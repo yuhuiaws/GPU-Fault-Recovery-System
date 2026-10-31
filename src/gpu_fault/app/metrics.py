@@ -44,6 +44,7 @@ from gpu_fault.app.metrics_sections import (
     render_spool_metrics_two,
 )
 from gpu_fault.app.process_health import render_process_health_metrics
+from gpu_fault.app.remediation_budget_metrics import storm_node_count_metric_lines
 from gpu_fault.app.runtime import AppRuntime, ProcessorQueueLimits
 from gpu_fault.departed_node_cleanup import departed_node_cleanup_metric_lines
 from gpu_fault.store.contracts import ProcessorQueueStats
@@ -448,6 +449,12 @@ METRIC_CONTRIBUTORS.register(
 METRIC_CONTRIBUTORS.register(
     "collector-silence",
     collector_silence_lines,
+)
+# The storm breaker counts a cluster's GPU nodes on the claim path, which runs
+# where the dispatcher does; its failed reads are this process's own counter,
+# so the roles without background services have none to render.
+METRIC_CONTRIBUTORS.register(
+    "remediation-storm-node-count", storm_node_count_metric_lines, fleet_level=True
 )
 
 
