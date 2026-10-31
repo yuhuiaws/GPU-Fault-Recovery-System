@@ -19,6 +19,12 @@ MODULE = lazy_script_module(
 NAMESPACE = "gpu-fault-system"
 CONTEXT = "gpu:gpu-a"
 HOST_SCRIPT = base64.b64encode(b"set -eu\nexit 0\n").decode()
+# What kubectl prints when a JSON patch's ``test`` operation fails: the API
+# server answers 422 (Invalid) and drops the patch library's own message.
+JSON_PATCH_TEST_FAILED = (
+    "The request is invalid: the server rejected our request due to an error "
+    "in our request"
+)
 
 
 def resource(
@@ -134,13 +140,20 @@ class Client:
                 key = parts[-1]
                 if operation["op"] == "test":
                     if parent[key] != operation["value"]:
-                        raise MODULE.CleanupStateError("node patch precondition failed")
+                        # kubectl exits 1; CleanupClient raises this for it.
+                        raise MODULE.CleanupCommandError(
+                            arguments, 1, JSON_PATCH_TEST_FAILED
+                        )
                 elif operation["op"] == "remove":
                     del parent[key]
                 elif operation["op"] == "replace":
                     parent[key] = operation["value"]
                 else:
                     raise AssertionError("unexpected node patch operation")
+            # An applied patch is a write: the API server moves the version.
+            candidate["metadata"]["resourceVersion"] = str(
+                int(candidate["metadata"]["resourceVersion"]) + 1
+            )
             node.clear()
             node.update(candidate)
         if "api-resources" in arguments:
@@ -286,16 +299,25 @@ def test_spare_cleanup_refuses_a_new_quarantine() -> None:
 def test_spare_cleanup_cas_refuses_a_late_node_change(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A Node that changes before every patch is never patched from a stale read.
+
+    Each refused patch is followed by a fresh read and a patch bound to that
+    read; when another writer moves the Node before every attempt, the cleanup
+    gives up after the bounded attempts instead of overwriting anything.
+    """
+
     client, state = _parked_spare("false")
     original = client.run
+    monkeypatch.setattr(MODULE.time, "sleep", lambda _seconds: None)
 
     def race(*arguments: str, **kwargs: Any) -> str:
         if arguments[:2] == ("patch", "node"):
-            client.nodes[0]["metadata"]["resourceVersion"] = "2"
+            metadata = client.nodes[0]["metadata"]
+            metadata["resourceVersion"] = str(int(metadata["resourceVersion"]) + 1)
         return original(*arguments, **kwargs)
 
     monkeypatch.setattr(client, "run", race)
-    with pytest.raises(MODULE.CleanupStateError, match="precondition failed"):
+    with pytest.raises(MODULE.CleanupStateError, match="did not settle"):
         MODULE.clear_node_metadata(client, state, CONTEXT, "gpu-a")
     node = client.nodes[0]
     assert node["spec"]["unschedulable"] is True, "stale cleanup removed the cordon"

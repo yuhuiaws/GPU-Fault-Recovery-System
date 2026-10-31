@@ -318,6 +318,30 @@ Parked spares restore their original scheduling state only per this run's owned 
 Node UID and resourceVersion must both protect the write and read-back. An original value of true stays cordoned, and an unknown baseline
 blocks the cleanup outright rather than defaulting to uncordon. This change adds no Kubernetes resources.
 
+In `NAMESPACES_DELETED` the cleanup patches the nodes one by one to remove this solution's labels and annotations (including an orphaned
+node's installer annotations) and to restore a parked spare's scheduling from its baseline; every patch carries Node UID and resourceVersion
+preconditions. The phases before it have just removed the node DaemonSets and components, so the kubelet posts Node status and controllers
+write Nodes at that moment; such a concurrent update between the cleanup's read and its patch makes the resourceVersion precondition refuse
+the patch (kubectl prints `The request is invalid`). The cleanup then re-reads that Node: a Node that is gone or has a different UID still
+fails at once; an unchanged resourceVersion means no concurrent update explains the failure, which is raised as it is; a newer
+resourceVersion re-evaluates every precondition on the fresh object (spare baseline, quarantine label, whether an orphan still carries only
+unfinished installer annotations, which inventory keys remain; nothing left to remove counts as done) and resends the patch bound to the new
+resourceVersion, at most 4 attempts per node with 0.5/1/2 s waits, inside that cleanup command's deadline. A node that is overtaken every
+time fails with `node metadata cleanup of <node> did not settle: ...` and the last failure's reason.
+
+When a cleanup command fails, the error (the last line of the cleanup tool's output in the log) and the message of the phase's `FAILED`
+entry in `kubernetes-cleanup.json` both name the reason, for example:
+
+`cleanup command exited 1: clear-node-metadata gpu:<context>: Kubernetes cleanup command failed (exit 1, reason: forbidden): kubectl patch node <node>: stderr: Error from server (Forbidden): ...`
+
+`reason` is one of a fixed set: `conflict`, `not found`, `forbidden`, `unauthorized`, `invalid` (including a failed resourceVersion
+precondition), `timeout`, `unreachable`, `throttled`, `server error`, `unclassified`. After `stderr:` comes kubectl's last meaningful stderr line,
+redacted by the rule the admin CLI applies to sensitive command output (credential assignments, Bearer/Basic values, URL userinfo, private
+keys and AWS access key IDs replaced, every run of 32 or more token characters masked, at most 200 characters); stdout, which can hold object
+contents, is never included. Fix the cause (for example the cleanup identity's RBAC for `forbidden`, its credentials for `unauthorized`, API
+reachability for `unreachable`/`timeout`) and rerun `gpu-fault-admin uninstall` with exactly the same parameters: the resume continues from
+the failed phase of the original journal, and nodes already cleaned are not patched again.
+
 When the old online version explicitly lacks `/v1/installation-resources`, the CLI can rebuild the inventory from the same-site bootstrap state,
 the live NLB and AWS tags, and backfill through the currently mounted DSN of a running CPU Pod. Only the controlled script's
 exact old-API/temporarily-unavailable protocol is accepted; ordinary 404/503 error text, authentication or TLS failures are not treated as compatibility signals.

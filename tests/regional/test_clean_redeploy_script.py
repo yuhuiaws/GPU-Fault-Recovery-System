@@ -686,6 +686,19 @@ if "delete" in args:
 if "patch" in args and "node" in args:
     name = args[args.index("node") + 1]
     item = api["objects"][key("node", name)]
+    races = api.get("node_status_races", {})
+    if races.get(name):
+        # The kubelet posts this Node's status just before the patch arrives.
+        races[name] -= 1
+        item.setdefault("status", {})["conditions"] = [
+            {"type": "Ready", "status": "True"}
+        ]
+        version = item["metadata"]["resourceVersion"]
+        item["metadata"]["resourceVersion"] = str(int(version) + 1)
+        save()
+    if api.get("node_patch_refusal"):
+        print(api["node_patch_refusal"], file=sys.stderr)
+        raise SystemExit(1)
     for operation in entry["patch"]:
         parts = [
             part.replace("~1", "/").replace("~0", "~")
@@ -697,13 +710,21 @@ if "patch" in args and "node" in args:
         field = parts[-1]
         if operation["op"] == "test":
             if parent[field] != operation["value"]:
-                raise SystemExit("node patch precondition failed")
+                print(
+                    "The request is invalid: the server rejected our request due"
+                    " to an error in our request",
+                    file=sys.stderr,
+                )
+                raise SystemExit(1)
         elif operation["op"] == "remove":
             del parent[field]
         elif operation["op"] == "replace":
             parent[field] = operation["value"]
         else:
             raise SystemExit("unexpected node patch operation")
+    item["metadata"]["resourceVersion"] = str(
+        int(item["metadata"]["resourceVersion"]) + 1
+    )
     save()
     raise SystemExit(0)
 raise SystemExit("unexpected fake Kubernetes command")
@@ -1217,6 +1238,102 @@ def test_node_cleanup_uncordons_declared_spares_before_stripping_their_label(
     assert node["metadata"]["labels"] == {"customer.example/retained": "yes"}
     assert customer["spec"]["unschedulable"] is True, (
         "cleanup removed an unrelated node's cordon"
+    )
+
+
+NODE_PATCH_REFUSAL = (
+    'Error from server (Forbidden): nodes "node-a" is forbidden: User '
+    '"system:serviceaccount:ops:cleanup" cannot patch resource "nodes" in API '
+    'group "" at the cluster scope'
+)
+
+
+def _node_patches(harness: CleanupHarness) -> list[dict[str, Any]]:
+    return [
+        call
+        for call in harness.calls()
+        if "patch" in call["args"] and "node" in call["args"]
+    ]
+
+
+def test_a_node_status_update_inside_the_reset_is_retried_and_the_journal_completes(
+    tmp_path: Path,
+) -> None:
+    """Live BOOT-029 stage 4: the kubelet wrote a Node between list and patch."""
+
+    harness = _reset_harness(tmp_path)
+    api = json.loads(harness.api.read_text())
+    api["interrupt_node"] = False
+    api["node_status_races"] = {"node-a": 1}
+    harness.api.write_text(json.dumps(api))
+
+    result = harness.run()
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    document = json.loads(harness.state.read_text())
+    assert (document["phase"], document["status"]) == (
+        "CLEANUP_COMPLETED",
+        "COMPLETED",
+    ), document["history"]
+    assert [
+        entry for entry in document["history"] if entry["status"] == "FAILED"
+    ] == [], "a concurrent Node update failed the reset"
+    patches = _node_patches(harness)
+    assert [call["patch"][1]["value"] for call in patches] == ["1", "2"], (
+        "the retried patch must be bound to the Node's fresh resourceVersion"
+    )
+    assert {call["phase"] for call in patches} == {"NAMESPACES_DELETED"}, (
+        "both attempts belong to the same phase run"
+    )
+    node = json.loads(harness.api.read_text())["objects"][
+        json.dumps(["gpu-a-context", "", "node", "node-a"])
+    ]
+    assert node["spec"]["unschedulable"] is False, "the spare baseline was restored"
+    assert node["metadata"]["labels"] == {"customer.example/retained": "yes"}, (
+        "our spare label is gone, the customer's label kept"
+    )
+
+
+def test_a_refused_node_patch_names_its_reason_and_a_rerun_resumes_the_reset(
+    tmp_path: Path,
+) -> None:
+    harness = _reset_harness(tmp_path)
+    api = json.loads(harness.api.read_text())
+    api["interrupt_node"] = False
+    api["node_patch_refusal"] = NODE_PATCH_REFUSAL
+    harness.api.write_text(json.dumps(api))
+
+    first = harness.run()
+
+    assert first.returncode != 0, "a refused node patch passed the reset"
+    reason = (
+        "Kubernetes cleanup command failed (exit 1, reason: forbidden): kubectl "
+        f"patch node node-a: stderr: {NODE_PATCH_REFUSAL}"
+    )
+    assert reason in first.stderr, first.stderr
+    failed = json.loads(harness.state.read_text())
+    assert (failed["phase"], failed["status"]) == ("NAMESPACES_DELETED", "FAILED")
+    assert failed["history"][-1]["message"] == (
+        f"cleanup command exited 1: clear-node-metadata gpu:gpu-a-context: {reason}"
+    ), "the journal's FAILED entry must carry the reason"
+    assert len(_node_patches(harness)) == 1, (
+        "a refusal of an unchanged Node is not retried"
+    )
+
+    api = json.loads(harness.api.read_text())
+    api.pop("node_patch_refusal")
+    harness.api.write_text(json.dumps(api))
+    resumed = harness.run()
+
+    assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+    completed = json.loads(harness.state.read_text())
+    assert (completed["phase"], completed["status"]) == (
+        "CLEANUP_COMPLETED",
+        "COMPLETED",
+    ), completed["history"]
+    assert completed["run_id"] == failed["run_id"], "the rerun resumed the journal"
+    assert completed["history"][: len(failed["history"])] == failed["history"], (
+        "the rerun kept the failed attempt's journal prefix"
     )
 
 

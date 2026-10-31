@@ -175,6 +175,10 @@ command -v python3 >/dev/null 2>&1 || die "python3 is required"
 EFFECTIVE_INVENTORY="${RESOURCE_INVENTORY}"
 RUNTIME_INVENTORY_FILE=
 FLEET_INVENTORY_FILE=
+# cleanup_kubernetes.py empties this file on start and leaves
+# "<action> <context>: <reason>" in it when it fails (cleanup_failure.py), so
+# the FAILED journal entry says why, not only the exit status.
+CLEANUP_FAILURE_NOTE=
 STATE_INITIALIZED=false
 STATE_COMPLETE=false
 CURRENT_PHASE=PREFLIGHT
@@ -188,19 +192,32 @@ cleanup_runtime_inventory() {
     if [[ -n "${FLEET_INVENTORY_FILE}" ]]; then
         rm -f "${FLEET_INVENTORY_FILE}"
     fi
+    if [[ -n "${CLEANUP_FAILURE_NOTE}" ]]; then
+        rm -f "${CLEANUP_FAILURE_NOTE}"
+    fi
 }
 cleanup_on_exit() {
     local status=$?
+    local message
+    local note=
     trap - EXIT
     if [[ "${status}" -ne 0 &&
         "${STATE_INITIALIZED}" == true &&
         "${STATE_COMPLETE}" != true ]]; then
+        message="cleanup command exited ${status}"
+        if [[ -n "${CLEANUP_FAILURE_NOTE}" && -s "${CLEANUP_FAILURE_NOTE}" ]]; then
+            note="$(head -c 1024 -- "${CLEANUP_FAILURE_NOTE}" 2>/dev/null |
+                tr -d '\000-\037\177' || true)"
+        fi
+        if [[ -n "${note}" ]]; then
+            message="${message}: ${note}"
+        fi
         PYTHONDONTWRITEBYTECODE=1 python3 \
             "${CLEANUP_STATE_TOOL}" transition \
             --path "${STATE_FILE}" \
             --phase "${CURRENT_PHASE}" \
             --status FAILED \
-            --message "cleanup command exited ${status}" \
+            --message "${message}" \
             >/dev/null 2>&1 || true
     fi
     cleanup_runtime_inventory
@@ -209,6 +226,8 @@ cleanup_on_exit() {
 trap cleanup_on_exit EXIT
 if [[ "${OFFLINE_PLAN}" != true ]]; then
     command -v kubectl >/dev/null 2>&1 || die "kubectl is required"
+    CLEANUP_FAILURE_NOTE="$(mktemp)"
+    export GPU_FAULT_CLEANUP_FAILURE_NOTE="${CLEANUP_FAILURE_NOTE}"
     RUNTIME_INVENTORY_FILE="$(mktemp)"
     if [[ "${EXECUTE}" == true && -e "${STATE_FILE}" ]]; then
         resume_arguments=(

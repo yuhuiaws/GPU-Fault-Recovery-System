@@ -1775,6 +1775,19 @@ checkpoint, re-initialize the original identity or fabricate a drain completion 
 fabricating new phases or re-initializing the same path to continue is not allowed. The `previous-unschedulable` of a parked spare must come from
 an explicit baseline owned by this cleanup; when missing or of unknown ownership, uncordon may not be the default.
 
+The node metadata cleanup `deploy/control-plane/tools/cleanup_kubernetes.py::clear_node_metadata` first plans every node's patch from one
+node list (every refusal precedes the first mutation), then sends them one by one through
+`deploy/control-plane/tools/cleanup_node_patch.py::apply_node_patch`. A failed patch is followed by a bounded back-off (0.5/1/2 s, within
+the command deadline) and a fresh read of that Node: gone or a different UID fails; an unchanged resourceVersion fails with the original
+error; a newer one is re-planned by `target_node_patch`/`orphan_node_patch` on the fresh object, which re-judge the spare baseline,
+quarantine and the orphan shape (nothing left to remove is done), and resent bound to the new resourceVersion, at most
+`NODE_PATCH_ATTEMPTS` attempts per node. The patch's own UID/resourceVersion `test` stays. Every kubectl failure raises
+`deploy/control-plane/tools/cleanup_failure.py::CleanupCommandError`: a fixed reason class (matched on the raw stderr) plus the stderr's last
+line as reduced by `sensitive_error_lines`, never stdout; the command is summarised by verb/kind/name, never the values of `-p`, `-f` and the
+like. `prepare-clean-redeploy.sh` creates a private temporary file and passes it to every call as `GPU_FAULT_CLEANUP_FAILURE_NOTE`; the tool
+empties it on start and writes `<action> <context>: <reason>` on failure (`failure_note`), and the exit trap appends it to the journal's
+`FAILED` message.
+
 A resume with consumers not yet stopped re-proves DRAINING and the already completed queue drain; an old completion marker cannot serve as a
 continuing admission barrier. A resume after the consumers stopped uses only the original fleet/UID proof and no longer reads the database. Pure registry
 drain uses a context that consumes no images; normal `RegionalRelease` construction and direct calls still check the schema-v3/v4

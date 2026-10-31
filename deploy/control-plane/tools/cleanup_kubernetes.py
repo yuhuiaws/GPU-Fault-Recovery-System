@@ -5,13 +5,27 @@ from __future__ import annotations
 import argparse
 import base64
 import copy
+import functools
 import hashlib
 import json
 import os
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, cast
 
+from cleanup_failure import CleanupCommandError, failure_note
+from cleanup_node_patch import (
+    INSTALLER_ANNOTATION_PREFIX,
+    NodeConverged,
+    NodePatch,
+    NodePlan,
+    clear_node,
+    orphan_converged,
+    orphan_node_patch,
+    target_converged,
+    target_node_patch,
+)
 from cleanup_state import (
     PHASE_INDEX,
     CleanupStateError,
@@ -49,15 +63,18 @@ class CleanupClient:
             self.prefix += ["--context", context.removeprefix("gpu:")]
 
     def run(self, *arguments: str, payload: dict[str, Any] | None = None) -> str:
-        result = run_command(
-            [*self.prefix, *arguments],
-            input_text=json.dumps(payload) if payload is not None else None,
-            timeout_seconds=remaining_timeout(45),
-        )
-        if result.returncode:
-            raise CleanupStateError(
-                f"Kubernetes cleanup command failed (exit {result.returncode})"
+        """kubectl's stdout; a failure says why (``cleanup_failure``), never stdout."""
+
+        try:
+            result = run_command(
+                [*self.prefix, *arguments],
+                input_text=json.dumps(payload) if payload is not None else None,
+                timeout_seconds=remaining_timeout(45),
             )
+        except subprocess.TimeoutExpired:
+            raise CleanupCommandError(arguments, None) from None
+        if result.returncode:
+            raise CleanupCommandError(arguments, result.returncode, result.stderr)
         return result.stdout.strip()
 
     def get(self, kind: str, name: str, namespace: str = "") -> dict[str, Any] | None:
@@ -603,10 +620,8 @@ def delete_workload_rbac(
 # HyperPod names every EKS node ``hyperpod-<instance-id>``; the fleet agent
 # record carries the same instance id (``gpu_fault.hyperpod`` aliases).
 HYPERPOD_NODE_PREFIX = "hyperpod-"
-# Node annotations the node-installer-reconciler writes while (or after) it
-# tries to install a node; ``gpu-fault.io/node-key-*`` ownership annotations
-# are deliberately not in this family.
-INSTALLER_ANNOTATION_PREFIX = "gpu-fault.io/installer-"
+# One of the node-installer-reconciler's annotations, which all share
+# ``INSTALLER_ANNOTATION_PREFIX`` (``cleanup_node_patch``).
 INSTALLER_STATE_ANNOTATION = "gpu-fault.io/installer-state"
 # Installer states that prove the node never received a runtime from us. A
 # spot replacement without a node key sits in one of these with no fleet agent
@@ -855,27 +870,6 @@ def nothing_installed(
     return True
 
 
-def installer_annotation_patch(node: dict[str, Any], uid: str) -> list[dict[str, Any]]:
-    """Remove every installer annotation from an orphaned node, UID/RV bound."""
-
-    metadata = node["metadata"]
-    operations: list[dict[str, Any]] = [
-        {"op": "test", "path": "/metadata/uid", "value": uid},
-        {
-            "op": "test",
-            "path": "/metadata/resourceVersion",
-            "value": metadata["resourceVersion"],
-        },
-    ]
-    for key in sorted(metadata.get("annotations") or {}):
-        if key.startswith(INSTALLER_ANNOTATION_PREFIX):
-            escaped = key.replace("~", "~0").replace("/", "~1")
-            operations.append(
-                {"op": "remove", "path": f"/metadata/annotations/{escaped}"}
-            )
-    return operations
-
-
 def clear_node_metadata(
     client: CleanupClient,
     document: dict[str, Any],
@@ -884,6 +878,14 @@ def clear_node_metadata(
     *,
     config: dict[str, Any] | None = None,
 ) -> None:
+    """Strip our metadata from the fleet's and the orphaned installer nodes.
+
+    Every node's patch is planned from one list first, so any refusal comes
+    before the first mutation; ``cleanup_node_patch.clear_node`` then patches the
+    nodes one by one and, when another writer moved a Node in between (the
+    kubelet posting status), re-plans that node from a fresh read and retries.
+    """
+
     verify_cluster(client, document, context)
     verify_namespace(client, document, context, allow_absent=True)
     nodes = client.items("get", "nodes")
@@ -892,90 +894,35 @@ def clear_node_metadata(
     )
     orphaned = dict(document.get("orphaned_installer_nodes", {}).get(context, {}))
     inventory = document["inventory_snapshot"]["gpu"]
-    patches: list[tuple[str, list[dict[str, Any]], bool]] = []
+    agents = document.get("fleet_snapshot")
+
+    def still_orphaned(node: dict[str, Any]) -> bool:
+        return orphaned_installer_node(node, agents, cluster_id)
+
+    planned: list[
+        tuple[str, str, dict[str, Any], NodePatch, NodePlan, NodeConverged]
+    ] = []
     for node in nodes:
-        metadata = node["metadata"]
-        name = metadata["name"]
+        name = node["metadata"]["name"]
+        plan: NodePlan
+        converged: NodeConverged
         if name in orphaned:
-            if metadata.get("uid") != orphaned[name]:
-                raise CleanupStateError("orphaned installer node changed UID")
-            patches.append(
-                (name, installer_annotation_patch(node, orphaned[name]), False)
+            uid = orphaned[name]
+            plan = functools.partial(
+                orphan_node_patch, uid=uid, still_orphaned=still_orphaned
             )
+            converged = orphan_converged
+        elif name in targets:
+            uid = targets[name]
+            plan = functools.partial(target_node_patch, uid=uid, inventory=inventory)
+            converged = functools.partial(target_converged, inventory=inventory)
+        else:
             continue
-        if name not in targets:
-            continue
-        if metadata.get("uid") != targets[name]:
-            raise CleanupStateError("node metadata cleanup target changed UID")
-        labels = metadata.get("labels") or {}
-        annotations = metadata.get("annotations") or {}
-        restore_scheduling = False
-        if labels.get("gpu-fault.io/spare") == "true":
-            previous = annotations.get("gpu-fault.io/previous-unschedulable")
-            if not isinstance(previous, str) or previous not in {"true", "false"}:
-                raise CleanupStateError(
-                    "declared warm spare has no scheduling baseline on the node; "
-                    "release it with gpu-fault-admin (config spare --release; "
-                    "uninstall does it) before node cleanup"
-                )
-            if labels.get("gpu-fault.io/quarantined") not in {None, "false"}:
-                raise CleanupStateError("quarantined spare cannot be released")
-            unschedulable = (node.get("spec") or {}).get("unschedulable", False)
-            if type(unschedulable) is not bool:
-                raise CleanupStateError("spare cleanup has unknown scheduling state")
-            restore_scheduling = previous == "false" and unschedulable
-        operations: list[dict[str, Any]] = [
-            {"op": "test", "path": "/metadata/uid", "value": targets[name]},
-            {
-                "op": "test",
-                "path": "/metadata/resourceVersion",
-                "value": metadata["resourceVersion"],
-            },
-        ]
-        if restore_scheduling:
-            operations.extend(
-                [
-                    {"op": "test", "path": "/spec/unschedulable", "value": True},
-                    {"op": "replace", "path": "/spec/unschedulable", "value": False},
-                ]
-            )
-        for field, keys in (
-            ("annotations", inventory["node_annotations"]),
-            ("labels", inventory["node_labels"]),
-        ):
-            for key in keys:
-                if key in (metadata.get(field) or {}):
-                    escaped = key.replace("~", "~0").replace("/", "~1")
-                    operations.append(
-                        {"op": "remove", "path": f"/metadata/{field}/{escaped}"}
-                    )
-        if len(operations) > 2:
-            patches.append((name, operations, restore_scheduling))
-    for name, operations, restored in patches:
-        client.run("patch", "node", name, "--type=json", "-p", json.dumps(operations))
-        current = client.get("node", name)
-        expected_uid = orphaned[name] if name in orphaned else targets[name]
-        if current is None or object_identity(current)[3] != expected_uid:
-            raise CleanupStateError("node changed during metadata cleanup")
-        metadata = current["metadata"]
-        if name in orphaned:
-            if any(
-                key.startswith("gpu-fault.io/")
-                for key in metadata.get("annotations") or {}
-            ):
-                raise CleanupStateError("node metadata cleanup did not converge")
-            continue
-        if any(
-            key in (metadata.get(field) or {})
-            for field, keys in (
-                ("annotations", inventory["node_annotations"]),
-                ("labels", inventory["node_labels"]),
-            )
-            for key in keys
-        ) or (
-            restored and (current.get("spec") or {}).get("unschedulable") is not False
-        ):
-            raise CleanupStateError("node metadata cleanup did not converge")
+        patch = plan(node)
+        if patch is not None:
+            planned.append((name, uid, node, patch, plan, converged))
+    for name, uid, node, patch, plan, converged in planned:
+        clear_node(client, name, node, patch, plan, uid=uid, converged=converged)
 
 
 def node_manifest(
@@ -1300,6 +1247,13 @@ def main() -> int:
     parser.add_argument("--skip-cpu", action="store_true")
     parser.add_argument("arguments", nargs=argparse.REMAINDER)
     arguments = parser.parse_args()
+    # The cleanup script's exit trap appends this invocation's failure to the
+    # journal's FAILED entry (``cleanup_failure.failure_note``).
+    with failure_note(f"{arguments.action} {arguments.context}"):
+        return run_action(arguments)
+
+
+def run_action(arguments: argparse.Namespace) -> int:
     config = json.loads(arguments.config.read_text(encoding="utf-8"))
     with deployment_deadline(
         "Kubernetes cleanup", arguments.timeout_seconds, recovery_seconds=120
@@ -1309,13 +1263,15 @@ def main() -> int:
             command = arguments.arguments
             if command[:1] == ["--"]:
                 command = command[1:]
-            result = run_command(
-                [*client.prefix, *command], timeout_seconds=arguments.timeout_seconds
-            )
-            if result.returncode:
-                raise CleanupStateError(
-                    f"Kubernetes cleanup command failed (exit {result.returncode})"
+            try:
+                result = run_command(
+                    [*client.prefix, *command],
+                    timeout_seconds=arguments.timeout_seconds,
                 )
+            except subprocess.TimeoutExpired:
+                raise CleanupCommandError(command, None) from None
+            if result.returncode:
+                raise CleanupCommandError(command, result.returncode, result.stderr)
             print(result.stdout, end="")
             return 0
         if arguments.state_file is None:
