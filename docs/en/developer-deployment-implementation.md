@@ -1691,6 +1691,14 @@ Node UIDs and resourceVersions, submits JSON Patches with at most 8 `metadata_cl
 each patch again testing UID/resourceVersion; when the initial set or identity does not match, no patch is submitted.
 A later conflict stops unstarted tasks and waits for started tasks to finish. These 8 lanes are metadata API concurrency, unrelated to Host preflight,
 Fleet waves and the node unavailability budget, and do not authorize stopping or reinstalling 8 nodes at the same time.
+A refused patch goes to `src/gpu_fault/admin/node_patch_retry.py::NodePatchRetry` (shared with the reset cleanup tool
+`deploy/control-plane/tools/cleanup_node_patch.py`): after the back-off it reads that one Node (`get node --ignore-not-found`, re-checking
+kind, name, selector and the annotations' shape); a vanished Node or a changed UID fails; an unchanged resourceVersion raises
+`NodePatchCommandFailed` (with the reason class and redacted stderr of `src/gpu_fault/admin/kubectl_failure.py::KubectlFailure`); a newer one
+recomputes the annotations still present on the fresh object and resends, at most `NODE_PATCH_ATTEMPTS` attempts per node. The retry runs
+inside each worker and widens no concurrency. The shared code lives in `src/gpu_fault/admin`, not in `deploy/`: the deploy tools run from the
+source snapshot and can import `gpu_fault`, whereas the deploy host's `gpu-fault-admin` ships only the packages under `src` and cannot import
+`deploy/`.
 
 Route53 associations are handled by `Region + VPC ID`, not owned by whichever cluster key registered them first.
 A VPC still used by the CPU or another GPU cluster and a shared NAT EIP may not be revoked; exclusive EIPs are revoked one by one with residue checks,

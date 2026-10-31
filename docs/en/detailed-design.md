@@ -2613,7 +2613,7 @@ Kubernetes-side cleanup writes a separate `kubernetes-cleanup.json`, whose phase
 before entering `KUBERNETES_VERIFIED`; a cleanup record from a previous round that did not reach that phase is the original journal of this transaction, and a resumed run continues
 advancing on top of it rather than reusing it as completed; when `uninstall/` contains only working files but no `state.json`, a new uninstall refuses with
 `uninstall transaction files lack their original journal` instead of archiving automatically and continuing.
-The node metadata cleanup's patches carry Node UID and resourceVersion preconditions; when the kubelet or a controller updates a Node
+The node metadata cleanup's patches (the uninstall's, and the installer annotation cleanup of `remove-cluster` and the join rollback) carry Node UID and resourceVersion preconditions; when the kubelet or a controller updates a Node
 between the read and the patch, the cleanup re-reads it, re-evaluates every precondition on the fresh object and retries a bounded number of
 times (a changed UID or an unchanged resourceVersion still fails); a failed cleanup command names its reason class and kubectl's redacted
 last stderr line in the error and in the journal's `FAILED` entry.

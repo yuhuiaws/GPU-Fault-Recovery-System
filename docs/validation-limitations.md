@@ -517,6 +517,11 @@ Namespace deletion carries the saved UID as an API precondition, and a recreated
 UID blocks its waiter. Node metadata cleanup verifies the complete saved Node UID
 set before issuing UID/resource-version guarded patches, with at most eight
 metadata workers. This is API concurrency, not a node-unavailability allowance.
+A patch refused because the kubelet or a controller moved the Node between the
+list and the patch is re-read and retried on the fresh object a bounded number
+of times; the regressions drive that race, a replacement, a vanished Node, a lost
+acknowledgement and a refusal of an unchanged Node against a scripted API server
+for both the uninstall and the removal/join-rollback cleanup.
 Uninstall tests preserve immutable registry identity while applying the authorized
 effective cleanup policy, retain Kubernetes evidence across late retries, and keep
 Aurora behind the non-database cleanup barrier. The known legacy LBC attachment

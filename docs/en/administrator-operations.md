@@ -2062,6 +2062,19 @@ and these dependencies must not be revoked early to reduce waiting.
 Namespace deletion carries the original UID as a precondition; a same-named rebuild during deletion, a read failure or an invalid response all stop.
 Node Installer annotation cleanup first reads and checks the complete Node UID set once, then protects every patch with UID/resourceVersion.
 The at most 8-way metadata cleanup only optimises API waits and does not widen the node simultaneous-unavailability or reinstall budget.
+`remove-cluster` runs this step right after it deleted the node DaemonSets (the join rollback, undoing the installer annotations its attempt
+wrote, uses the same function), the moment the kubelet posts Node status. When a Node is updated concurrently between the list and its patch,
+the resourceVersion precondition refuses the patch and the command applies the retry of the uninstall's node metadata cleanup (§3): it
+re-reads that Node; a Node that is gone or has a different UID fails at once; an unchanged resourceVersion fails with the original error; a
+newer one recomputes the installer annotations still present on the fresh object and resends the patch bound to the new resourceVersion (no
+annotation left to remove is done), at most 4 attempts per node with 0.5/1/2 s waits. The failure names its reason, for example:
+
+`node annotation cleanup failed its guarded patch (exit 1, reason: forbidden): kubectl patch node <node>: stderr: ...`
+
+When every attempt was overtaken it reads `node annotation cleanup of <node> did not settle: ...`, and when the fresh read fails
+`cannot re-read node <node> for annotation cleanup (...)`; the reason classes and the stderr redaction are those of §3. Fix the cause and rerun
+`remove-cluster` with exactly the same parameters, which resumes from the phase its journal stopped in; a join rollback left in
+`ROLLBACK_FAILED` is completed the same way by rerunning `join-cluster` with its original parameters.
 
 | Removal phase | Why it is needed | Parallel or resumable scope |
 |---|---|---|

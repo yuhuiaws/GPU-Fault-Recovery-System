@@ -19,7 +19,9 @@ phase). Resuming re-ran the phase and passed, but an uninstall must not depend
 on that luck.
 
 A failed patch is therefore followed by a fresh read of the Node
-(:func:`apply_node_patch`):
+(:func:`apply_node_patch`, through ``gpu_fault.admin.node_patch_retry``, the
+retry the admin's ``remove-cluster`` and join-rollback annotation cleanup use
+too):
 
 * gone, or a different UID (the node was replaced): the hard error it always
   was;
@@ -31,16 +33,15 @@ A failed patch is therefore followed by a fresh read of the Node
   quarantine, an orphan's installer-only shape, and which of our keys are still
   there (none left: done) -- and sent again, bound to the new resourceVersion.
 
-At most :data:`NODE_PATCH_ATTEMPTS` patches per node, with a short back-off
-(:data:`NODE_PATCH_BACKOFF_SECONDS`) inside the command's deadline. A patch that
-was applied although kubectl reported a failure (a lost acknowledgement) reads
-back as a newer Node with nothing left to remove, and the node is done.
+At most ``NODE_PATCH_ATTEMPTS`` patches per node, with a short back-off inside
+the command's deadline. A patch that was applied although kubectl reported a
+failure (a lost acknowledgement) reads back as a newer Node with nothing left to
+remove, and the node is done.
 """
 
 from __future__ import annotations
 
 import json
-import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -48,13 +49,13 @@ from typing import Any, Protocol
 from cleanup_failure import CleanupCommandError
 from cleanup_state import CleanupStateError
 
-from gpu_fault.admin.execution import remaining_timeout
+from gpu_fault.admin.node_patch_retry import NodePatchRetry, guarded, pointer
 
-NODE_PATCH_ATTEMPTS = 4
-# Slept before the fresh read that precedes attempt 2, 3 and 4. A short wait
-# lets a burst of status updates settle; the read comes after it, so the retried
-# patch is bound to the newest resourceVersion, not one the wait made stale.
-NODE_PATCH_BACKOFF_SECONDS = (0.5, 1.0, 2.0)
+NODE_METADATA_RETRY = NodePatchRetry(
+    subject="node metadata cleanup",
+    failure=CleanupCommandError,
+    refuse=CleanupStateError,
+)
 OWNED_PREFIX = "gpu-fault.io/"
 # Node annotations the node-installer-reconciler writes while (or after) it
 # tries to install a node; ``gpu-fault.io/node-key-*`` ownership annotations
@@ -85,25 +86,6 @@ class NodePatch:
 
 NodePlan = Callable[[dict[str, Any]], NodePatch | None]
 NodeConverged = Callable[[dict[str, Any], NodePatch], bool]
-
-
-def pointer(key: str) -> str:
-    """``key`` as one JSON-pointer reference token (RFC 6901)."""
-
-    return key.replace("~", "~0").replace("/", "~1")
-
-
-def guarded(node: dict[str, Any], uid: str) -> list[dict[str, Any]]:
-    """The two preconditions every node patch opens with."""
-
-    return [
-        {"op": "test", "path": "/metadata/uid", "value": uid},
-        {
-            "op": "test",
-            "path": "/metadata/resourceVersion",
-            "value": node["metadata"]["resourceVersion"],
-        },
-    ]
 
 
 def owned_keys(inventory: dict[str, Any]) -> tuple[tuple[str, list[str]], ...]:
@@ -232,15 +214,6 @@ def orphan_converged(node: dict[str, Any], _patch: NodePatch) -> bool:
     )
 
 
-def back_off(attempt: int) -> None:
-    """Wait before the fresh read that precedes attempt ``attempt + 1``."""
-
-    delay = NODE_PATCH_BACKOFF_SECONDS[
-        min(attempt, len(NODE_PATCH_BACKOFF_SECONDS)) - 1
-    ]
-    time.sleep(min(delay, remaining_timeout(delay)))
-
-
 def apply_node_patch(
     client: NodeClient,
     name: str,
@@ -253,52 +226,23 @@ def apply_node_patch(
     """Send ``patch`` (planned from ``node``); after a failure, re-read and retry.
 
     Returns the patch the API server accepted, or ``None`` when a fresh read
-    showed nothing left to remove. Raises the patch's own failure when the
-    Node's resourceVersion did not move, and a refusal naming the node when it
-    moved before every one of :data:`NODE_PATCH_ATTEMPTS` attempts.
+    showed nothing left to remove (``NodePatchRetry.apply``).
     """
 
-    attempt = 1
-    while True:
-        try:
-            client.run(
-                "patch", "node", name, "--type=json", "-p", json.dumps(patch.operations)
-            )
-        except CleanupCommandError as failure:
-            last = attempt == NODE_PATCH_ATTEMPTS
-            if not last:
-                back_off(attempt)
-            fresh = client.get("node", name)
-            if fresh is None:
-                raise CleanupStateError(
-                    f"node metadata cleanup target disappeared: {name}"
-                ) from failure
-            if fresh["metadata"].get("uid") != uid:
-                raise CleanupStateError(
-                    f"node metadata cleanup target changed UID: {name} was replaced"
-                ) from failure
-            planned = node["metadata"]["resourceVersion"]
-            if fresh["metadata"].get("resourceVersion") == planned:
-                failure.add_note(
-                    f"node {name}: its resourceVersion did not move, so no "
-                    "concurrent update explains the failure; not retried"
-                )
-                raise
-            if last:
-                raise CleanupStateError(
-                    f"node metadata cleanup of {name} did not settle: the Node's "
-                    f"resourceVersion moved before each of {NODE_PATCH_ATTEMPTS} "
-                    "patch attempts (concurrent kubelet or controller updates); "
-                    f"last failure: {failure}"
-                ) from failure
-            node = fresh
-            replanned = plan(node)
-            if replanned is None:
-                return None
-            patch = replanned
-            attempt += 1
-        else:
-            return patch
+    def send(current: NodePatch) -> None:
+        client.run(
+            "patch", "node", name, "--type=json", "-p", json.dumps(current.operations)
+        )
+
+    return NODE_METADATA_RETRY.apply(
+        name,
+        node,
+        patch,
+        uid=uid,
+        send=send,
+        read=lambda: client.get("node", name),
+        plan=plan,
+    )
 
 
 def clear_node(

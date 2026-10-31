@@ -21,6 +21,8 @@ from typing import Any
 
 import pytest
 
+from gpu_fault.admin import kubectl_failure as KUBECTL_FAILURE
+from gpu_fault.admin import node_patch_retry as RETRY
 from tests._script_loader import lazy_script_module
 from tests.deploy.test_cov95_tools_cleanup_kubernetes import cli_state
 from tests.regional.test_cleanup_kubernetes import (
@@ -34,7 +36,6 @@ from tests.regional.test_cleanup_kubernetes import (
 TOOLS = Path(__file__).resolve().parents[2] / "deploy/control-plane/tools"
 KUBE = lazy_script_module(TOOLS / "cleanup_kubernetes.py")
 FAILURE = lazy_script_module(TOOLS / "cleanup_failure.py")
-PATCH = lazy_script_module(TOOLS / "cleanup_node_patch.py")
 FORBIDDEN = (
     'Error from server (Forbidden): nodes "managed-node" is forbidden: User '
     '"system:serviceaccount:ops:cleanup" cannot patch resource "nodes" in API '
@@ -95,7 +96,7 @@ class RacingClient(Client):
 @pytest.fixture
 def sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     recorded: list[float] = []
-    monkeypatch.setattr(PATCH.time, "sleep", recorded.append)
+    monkeypatch.setattr(RETRY.time, "sleep", recorded.append)
     return recorded
 
 
@@ -146,7 +147,7 @@ def test_a_kubelet_status_update_between_list_and_patch_is_retried_on_the_fresh_
     assert node["status"]["conditions"] == [{"type": "Ready", "status": "True"}], (
         "the kubelet's own write is untouched"
     )
-    assert sleeps == [PATCH.NODE_PATCH_BACKOFF_SECONDS[0]], (
+    assert sleeps == [RETRY.NODE_PATCH_BACKOFF_SECONDS[0]], (
         "one short back-off before the fresh read"
     )
 
@@ -175,7 +176,7 @@ def test_the_next_node_is_still_cleaned_after_the_first_one_raced(
         assert node["metadata"]["labels"] == {"customer.example/kept": "yes"}, (
             f"{node['metadata']['name']} kept our label"
         )
-    assert sleeps == [PATCH.NODE_PATCH_BACKOFF_SECONDS[0]], "only the raced node waited"
+    assert sleeps == [RETRY.NODE_PATCH_BACKOFF_SECONDS[0]], "only the raced node waited"
 
 
 def test_a_node_replaced_during_the_race_stays_a_hard_error(
@@ -231,7 +232,7 @@ def test_a_node_that_keeps_changing_fails_after_bounded_attempts_naming_node_and
 ) -> None:
     client, state = RacingClient(), document()
     node = managed(client)
-    client.writers["managed-node"] = [kubelet_status] * PATCH.NODE_PATCH_ATTEMPTS
+    client.writers["managed-node"] = [kubelet_status] * RETRY.NODE_PATCH_ATTEMPTS
 
     with pytest.raises(KUBE.CleanupStateError) as raised:
         clear(client, state)
@@ -239,7 +240,7 @@ def test_a_node_that_keeps_changing_fails_after_bounded_attempts_naming_node_and
     message = str(raised.value)
     assert message.startswith(
         "node metadata cleanup of managed-node did not settle: the Node's "
-        f"resourceVersion moved before each of {PATCH.NODE_PATCH_ATTEMPTS} patch "
+        f"resourceVersion moved before each of {RETRY.NODE_PATCH_ATTEMPTS} patch "
         "attempts"
     ), message
     assert "reason: invalid): kubectl patch node managed-node: stderr: " in message, (
@@ -252,7 +253,7 @@ def test_a_node_that_keeps_changing_fails_after_bounded_attempts_naming_node_and
     assert versions(client.patches()) == ["1", "2", "3", "4"], (
         "every attempt is bound to the version its own fresh read returned"
     )
-    assert sleeps == list(PATCH.NODE_PATCH_BACKOFF_SECONDS), (
+    assert sleeps == list(RETRY.NODE_PATCH_BACKOFF_SECONDS), (
         "the back-off is short, bounded, and none follows the last attempt"
     )
     assert node["metadata"]["labels"]["gpu-fault.io/managed"] == "true", (
@@ -589,7 +590,9 @@ def test_a_kubectl_call_that_runs_out_of_time_is_a_timeout_without_exit_status(
 def test_a_failed_command_is_named_by_verb_kind_and_name_only(
     arguments: tuple[str, ...], summary: str
 ) -> None:
-    assert FAILURE.command_summary(arguments) == summary, "unexpected command summary"
+    assert KUBECTL_FAILURE.command_summary(arguments) == summary, (
+        "unexpected command summary"
+    )
 
 
 # --- the reason reaches the journal --------------------------------------------

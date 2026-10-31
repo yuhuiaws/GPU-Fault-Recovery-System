@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import subprocess
 import time
@@ -16,9 +17,32 @@ from gpu_fault.admin.deploy_limits import DEPLOY_CONCURRENCY
 from gpu_fault.cluster_scope import node_selector as scope_selector
 from gpu_fault.cluster_scope import selector_matches
 from gpu_fault.admin.execution import deadline_scope
+from gpu_fault.admin.kubectl_failure import KubectlFailure
+from gpu_fault.admin.node_patch_retry import NodePatchRetry, guarded, pointer
 from gpu_fault.admin.process_supervisor import ensure_supervision_safe
 
 Command = Callable[..., subprocess.CompletedProcess[str]]
+
+
+class NodePatchCommandFailed(BootstrapError):
+    """A guarded installer annotation patch failed at kubectl.
+
+    ``failure`` names the call, kubectl's exit status (none when the call ran
+    out of time), a reason class and kubectl's redacted last stderr line
+    (``gpu_fault.admin.kubectl_failure``). The annotation cleanup's retry
+    (``NODE_ANNOTATION_RETRY``) answers this type with a fresh read of the Node.
+    """
+
+    def __init__(self, failure: KubectlFailure) -> None:
+        self.failure = failure
+        super().__init__(f"node annotation cleanup failed its guarded patch {failure}")
+
+
+NODE_ANNOTATION_RETRY = NodePatchRetry(
+    subject="node annotation cleanup",
+    failure=NodePatchCommandFailed,
+    refuse=BootstrapError,
+)
 
 
 def namespace_document(
@@ -135,6 +159,64 @@ def wait_namespace_absent(
         ) from None
 
 
+def _target_node(item: Any, selector: str) -> bool:
+    """A well-formed Node document of this cluster's node selector."""
+
+    metadata = item["metadata"]
+    name = metadata["name"]
+    return bool(
+        item.get("kind") == "Node"
+        and isinstance(name, str)
+        and name
+        and isinstance(metadata.get("resourceVersion"), str)
+        and metadata["resourceVersion"]
+        and selector_matches(metadata.get("labels") or {}, selector)
+        and (
+            metadata.get("annotations") is None
+            or isinstance(metadata["annotations"], dict)
+        )
+    )
+
+
+def _annotation_patch(
+    item: dict[str, Any], *, uid: str, annotations: Sequence[str]
+) -> list[dict[str, Any]] | None:
+    """The UID/resourceVersion-bound removal of the annotations ``item`` still has."""
+
+    present = item["metadata"].get("annotations") or {}
+    removals = [
+        {"op": "remove", "path": "/metadata/annotations/" + pointer(annotation)}
+        for annotation in annotations
+        if annotation in present
+    ]
+    return [*guarded(item, uid), *removals] if removals else None
+
+
+def _read_target_node(
+    runner: Command, kubectl: Sequence[str], name: str, selector: str
+) -> dict[str, Any] | None:
+    """A fresh read of one target Node after its guarded patch failed."""
+
+    arguments = ["get", "node", name, "--ignore-not-found", "-o", "json"]
+    result = runner([*kubectl, *arguments], timeout_seconds=30)
+    if result.returncode:
+        raise BootstrapError(
+            f"cannot re-read node {name} for annotation cleanup "
+            f"{KubectlFailure.of(arguments, result.returncode, result.stderr)}"
+        )
+    if not result.stdout.strip():
+        return None
+    try:
+        item = json.loads(result.stdout)
+        if not _target_node(item, selector) or item["metadata"]["name"] != name:
+            raise ValueError
+    except (AttributeError, KeyError, TypeError, ValueError):
+        raise BootstrapError(
+            f"node identity drifted during annotation cleanup: {name}"
+        ) from None
+    return cast(dict[str, Any], item)
+
+
 def clear_installer_annotations(
     runner: Command,
     kubectl: Sequence[str],
@@ -149,6 +231,15 @@ def clear_installer_annotations(
     ``node_selector`` is the cluster's GPU node selector
     (``gpu_fault.cluster_scope.node_selector``); ``hyperpod_name`` alone still
     works for HyperPod callers and derives the same label text.
+
+    One list proves every node's identity before any patch; each patch is then
+    bound to the UID and resourceVersion that list returned. ``remove-cluster``
+    runs this right after its node DaemonSets are deleted, when the kubelet
+    posts Node status: a patch refused because the Node moved is re-read and
+    rebuilt from the fresh Node (``NODE_ANNOTATION_RETRY``, the retry of the
+    reset's node metadata cleanup): a new UID or a vanished Node is a hard
+    error, an unchanged resourceVersion is the patch's own failure, raised with
+    kubectl's classified reason (:class:`NodePatchCommandFailed`).
     """
 
     if not node_uids:
@@ -185,64 +276,47 @@ def clear_installer_annotations(
             metadata = item["metadata"]
             name = metadata["name"]
             if (
-                item.get("kind") != "Node"
-                or not isinstance(name, str)
+                not _target_node(item, selector)
                 or name not in node_uids
                 or name in live
                 or metadata.get("uid") != node_uids[name]
-                or not isinstance(metadata.get("resourceVersion"), str)
-                or not metadata["resourceVersion"]
-                or not selector_matches(metadata.get("labels") or {}, selector)
-                or metadata.get("annotations") is not None
-                and not isinstance(metadata["annotations"], dict)
             ):
                 raise ValueError
-            live[name] = metadata
+            live[name] = item
         if set(live) != set(node_uids):
             raise ValueError
     except (AttributeError, KeyError, TypeError, ValueError):
         raise BootstrapError(
             "node identity drifted before annotation cleanup"
         ) from None
-    patches: list[tuple[str, list[dict[str, str]]]] = []
-    for name, metadata in live.items():
-        present = metadata.get("annotations") or {}
-        removals = [
-            {
-                "op": "remove",
-                "path": "/metadata/annotations/"
-                + annotation.replace("~", "~0").replace("/", "~1"),
-            }
-            for annotation in annotations
-            if annotation in present
-        ]
-        if removals:
-            patches.append(
-                (
-                    name,
-                    [
-                        {
-                            "op": "test",
-                            "path": "/metadata/uid",
-                            "value": node_uids[name],
-                        },
-                        {
-                            "op": "test",
-                            "path": "/metadata/resourceVersion",
-                            "value": metadata["resourceVersion"],
-                        },
-                        *removals,
-                    ],
-                )
+    patches: list[tuple[str, list[dict[str, Any]]]] = []
+    for name, item in live.items():
+        patch = _annotation_patch(item, uid=node_uids[name], annotations=annotations)
+        if patch is not None:
+            patches.append((name, patch))
+
+    def send(name: str, patch: list[dict[str, Any]]) -> None:
+        arguments = ["patch", "node", name, "--type=json", "-p", json.dumps(patch)]
+        try:
+            completed = runner([*kubectl, *arguments], timeout_seconds=30)
+        except subprocess.TimeoutExpired:
+            raise NodePatchCommandFailed(KubectlFailure.of(arguments, None)) from None
+        if completed.returncode:
+            raise NodePatchCommandFailed(
+                KubectlFailure.of(arguments, completed.returncode, completed.stderr)
             )
 
-    def apply_patch(name: str, patch: list[dict[str, str]]) -> None:
-        completed = runner(
-            [*kubectl, "patch", "node", name, "--type=json", "-p", json.dumps(patch)],
-            timeout_seconds=30,
+    def apply_patch(name: str, patch: list[dict[str, Any]]) -> None:
+        uid = node_uids[name]
+        NODE_ANNOTATION_RETRY.apply(
+            name,
+            live[name],
+            patch,
+            uid=uid,
+            send=functools.partial(send, name),
+            read=functools.partial(_read_target_node, runner, kubectl, name, selector),
+            plan=functools.partial(_annotation_patch, uid=uid, annotations=annotations),
         )
-        if completed.returncode:
-            raise BootstrapError("node annotation cleanup failed its guarded patch")
 
     if not patches:
         return

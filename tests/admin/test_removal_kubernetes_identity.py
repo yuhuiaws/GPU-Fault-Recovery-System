@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from gpu_fault.admin import node_patch_retry
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.cluster_removal_kubernetes import (
     clear_installer_annotations,
@@ -163,6 +164,11 @@ class NodeApi:
         self, arguments: list[str], **_kwargs: Any
     ) -> subprocess.CompletedProcess[str]:
         self.calls.append(arguments)
+        if arguments[len(KUBECTL) :][:2] == ["get", "node"]:
+            node = self.nodes.get(arguments[len(KUBECTL) + 2])
+            return subprocess.CompletedProcess(
+                arguments, 0, json.dumps(node) if node is not None else "", ""
+            )
         if "get" in arguments:
             return subprocess.CompletedProcess(
                 arguments, 0, json.dumps({"items": list(self.nodes.values())}), ""
@@ -179,7 +185,14 @@ class NodeApi:
             if operation["op"] == "test":
                 key = operation["path"].split("/")[-1]
                 if metadata[key] != operation["value"]:
-                    return subprocess.CompletedProcess(arguments, 1, "", "conflict")
+                    # What kubectl prints when a JSON patch's test fails (422).
+                    return subprocess.CompletedProcess(
+                        arguments,
+                        1,
+                        "",
+                        "The request is invalid: the server rejected our request "
+                        "due to an error in our request",
+                    )
         for operation in patch:
             if operation["op"] == "remove":
                 key = (
@@ -216,16 +229,40 @@ def test_node_cleanup_preserves_unowned_annotations() -> None:
     ]
 
 
-@pytest.mark.parametrize("mutation", ["uid", "resourceVersion"])
-def test_node_recreation_or_concurrent_change_cannot_be_cleared(mutation: str) -> None:
+@pytest.fixture
+def no_back_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(node_patch_retry.time, "sleep", lambda _seconds: None)
+
+
+def test_node_recreation_cannot_be_cleared(no_back_off: None) -> None:
     api = NodeApi()
-    if mutation == "uid":
-        api.before_patch_uid = "replacement-node"
-    else:
-        api.before_patch_version = "version-b"
-    with pytest.raises(BootstrapError, match="guarded patch"):
+    api.before_patch_uid = "replacement-node"
+    with pytest.raises(BootstrapError, match="changed UID: node-a was replaced"):
         clear(api)
     assert api.nodes["node-a"]["metadata"]["annotations"][ANNOTATION] == "installed"
+
+
+def test_a_concurrent_node_change_is_retried_on_the_fresh_version(
+    no_back_off: None,
+) -> None:
+    """A write that moved the Node between list and patch is not a failure.
+
+    The refused patch is followed by a fresh read; the patch is rebuilt from it
+    and bound to the version that read returned.
+    """
+
+    api = NodeApi()
+    api.before_patch_version = "version-b"
+    clear(api)
+    patches = [
+        json.loads(call[call.index("-p") + 1]) for call in api.calls if "patch" in call
+    ]
+    assert [patch[1]["value"] for patch in patches] == ["version-a", "version-b"], (
+        "the retried patch must be bound to the fresh resourceVersion"
+    )
+    assert api.nodes["node-a"]["metadata"]["annotations"] == {
+        "customer.example/keep": "unchanged"
+    }, "only the installer annotation is removed"
 
 
 @pytest.mark.parametrize("change", ["missing", "uid", "label", "extra"])
