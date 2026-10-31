@@ -1510,9 +1510,21 @@ incident 的 `node_ids`、attempt 的观测（phase、容器 rank/节点/Pod UID
 否则 INCONCLUSIVE），再由 rank 0 的 reporter sidecar 用产品自己的心跳模型与采集器客户端
 （`HEARTBEAT_POST`：sidecar 的连接、CA 与 Pod 身份，单次投递，无 outbox、无重试）向 ingest 路由投递
 一条声称 `<job>-a000`（该任务从未运行的 attempt 编号）的心跳，并带 `numerical_error=true`——一旦被
-接受就会停止 attempt 的负载。PASS 要求：ingest 应答 `accepted=false`（应答不是 ingest 的判定，如传输或
-HTTP 错误，记 INCONCLUSIVE）；存储中没有该 attempt 的进度（记录探针的 `other_progress_states`）；无训练
-finding、无 STOP、无重启；活跃 attempt 仍为 RUNNING，且外来心跳之后仍有自己的心跳被接受。此前该变体
+接受就会停止 attempt 的负载。区域路径上 POST 的应答不是 ingest 的判定：`/v1/training-progress` 是
+`receipt=True` 通道（`channel_registry`），有 processor 时入口只把 POST 排入 processor 队列并立即回 202
+`{"accepted": true, "processor_request_id", "status_url", "coalesced"}`（`app/middleware/dispatch.py`），这里的
+`accepted` 只表示"已入队"；processor 之后经路由处理函数重放该行并把处理函数自己的 HTTP 状态与正文写回该行，
+`GET status_url` 在 COMPLETED 之前回 202 `{"status": PENDING|LEASED}`，之后返回该答复并带
+`X-GPU-Fault-Processor-Status: COMPLETED`（`app/routes/processor.py`）。`HEARTBEAT_POST` 因此按产品自己的
+receipt 客户端的方式（同一认证与集群头，202 与可重试状态加倍间隔重读、最长 2 秒）跟随 `status_url` 至多
+240 秒，判定读的是 COMPLETED 的答复（`ingest_decision`）。PASS 要求：该答复是 200 的 `TrainingHealthResult`、
+`accepted=false`、且就是所投递心跳的 `heartbeat_id`；跟随期内未到终态、状态路由拒绝读取、进入 telemetry spool
+（无完成记录）、完成为非 200（如重试期满后的 5xx、409）、`STALE_SUPERSEDED` 处置、或答复属于另一条心跳，
+都记 INCONCLUSIVE（未观察到 ingest 的判定），传输或 HTTP 错误同样 INCONCLUSIVE；COMPLETED 的 `accepted=true`
+才判 FAIL。另外要求存储中没有该 attempt 的进度（记录探针的 `other_progress_states`）；无训练
+finding、无 STOP、无重启；活跃 attempt 仍为 RUNNING，且外来心跳之后仍有自己的心跳被接受。拒绝不留下其他
+记录或通知：处理函数对未分配的 attempt 不写进度状态，processor 只对故障层或采集通道的 4xx 记"数据被拒"状态，
+200 的拒绝只体现在该请求行的答复里。此前该变体
 只是再写一次活跃 attempt 自己的进度文件（reporter 随后上报的仍是活跃 attempt 的心跳），从未出现外来身份，
 "无 STOP/无 finding" 只能空过。`resumed_progress` 的 `validated_by_progress` 此前恒为空；现在 RECOVERED
 的记录必须有 SUCCEEDED 的 VALIDATE_FABRIC，记下产品训练验证（`validate_training`）的 `validated_attempt`

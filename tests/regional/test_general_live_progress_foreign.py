@@ -36,6 +36,7 @@ from scripts.e2e.regional import general_live_progress as progress
 from scripts.e2e.regional.general_live_fixture import VariantInconclusive
 from scripts.e2e.regional.general_live_progress_probes import (
     HEARTBEAT_POST,
+    RECEIPT_FOLLOW_SECONDS,
     TRAINING_PROBE,
 )
 from scripts.e2e.regional.general_live_progress_verdicts import (
@@ -249,8 +250,12 @@ def test_post_heartbeat_runs_the_script_in_the_ranks_reporter_sidecar() -> None:
         FOREIGN,
         "0",
         json.dumps({"step": 10, "loss": 1.0, "numerical_error": True}),
+        str(RECEIPT_FOLLOW_SECONDS),
     ), arguments
     assert "input_text" not in options, "the script is an argument, not stdin"
+    assert options["timeout"] >= RECEIPT_FOLLOW_SECONDS + 30 + 30 + 30, (
+        "the exec outlives the POST, the follow bound and one last read"
+    )
 
 
 def test_post_heartbeat_output_that_is_no_answer_is_an_undelivered_answer() -> None:

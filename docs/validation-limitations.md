@@ -3790,15 +3790,41 @@ the live Pod's identity, `numerical_error=true` (the payload that stops an
 attempt once accepted) -- through the product's ingest route with the
 product's own heartbeat model and collector client (`HEARTBEAT_POST`: the
 sidecar's connection, CA and Pod identity, one delivery, no outbox, no
-retry). It passes only when the ingest answers `accepted=false`, the store
-keeps no progress for that attempt (the records probe's new
-`other_progress_states`), no training finding, STOP or restart follows, and
-the live attempt stays RUNNING with its own heartbeats still accepted after
-the foreign one; an answer that is not the ingest's grading (a transport or
-HTTP error, unreadable output) is INCONCLUSIVE. A module test runs the
+retry). On the regional path that POST's answer is not the ingest's
+decision: `/v1/training-progress` is a `receipt=True` channel
+(`channel_registry`), so with a processor the ingress admits the POST to the
+processor queue and answers 202 `{"accepted": true, "processor_request_id",
+"status_url", "coalesced"}` at once (`app/middleware/dispatch.py`) --
+`accepted` there means "queued". The processor later replays the row through
+the route handler and commits the handler's own HTTP status and body to it;
+`GET status_url` answers 202 `{"status": PENDING|LEASED}` until then and the
+stored answer with `X-GPU-Fault-Processor-Status: COMPLETED` after
+(`app/routes/processor.py`). A first live run read the admission's
+`accepted: true` as the ingest accepting the heartbeat and FAILed while every
+record showed it refused. `HEARTBEAT_POST` now follows `status_url` for up to
+240 s as the product's own receipt client does (the same authentication and
+cluster header; 202 and retryable statuses asked again with a doubling delay
+up to 2 s), and the variant judges the COMPLETED answer (`ingest_decision`):
+it passes only on a 200 `TrainingHealthResult` with `accepted=false` for the
+posted `heartbeat_id`, and FAILs on a COMPLETED `accepted=true`. No terminal
+state within the follow bound, a refused status read, a telemetry-spool
+admission (no completion record), a non-200 completion (a 5xx past the retry
+horizon, a 409), a `STALE_SUPERSEDED` disposition the handler never saw, or a
+decision about another heartbeat is INCONCLUSIVE -- the decision was not
+observed -- as is a transport or HTTP error. The refusal leaves no other
+record or advisory: the handler writes no progress state for an attempt with
+no allocation, and the processor books "data rejected" collector statuses
+only for 4xx on fault-layer or collector channels, so a 200 refusal shows only
+in the request row's answer. The store must also keep no progress for that
+attempt (the records probe's new `other_progress_states`), no training
+finding, STOP or restart may follow, and the live attempt stays RUNNING with
+its own heartbeats still accepted after the foreign one. A module test runs the
 script against the product's `TrainingHealthService.ingest` and the real
 records probe over an in-memory store: refused for the never-run attempt,
-accepted for the live one with the same identity. `resumed_progress`'s
+accepted for the live one with the same identity; another runs it through an
+emulated queue admission, the product's own route replayed as the processor
+replays it, and the product's own receipt route: one PENDING read, then the
+completed refusal. `resumed_progress`'s
 progress check returned nothing in every case; a RECOVERED stall now needs a
 SUCCEEDED VALIDATE_FABRIC whose recorded `validated_attempt` (the job's
 attempt), `validated_rank` (0) and `validated_step` (past the stalled step)

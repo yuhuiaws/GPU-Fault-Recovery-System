@@ -162,6 +162,14 @@ print(json.dumps({
 }, sort_keys=True, default=str))
 """
 
+#: How long ``HEARTBEAT_POST`` follows a processor receipt to its completion.
+#: The product's own receipt client allows 120 s (``HttpEventSink``
+#: ``processor_receipt_timeout_seconds``); a routine-tier row behind a busy
+#: queue gets twice that before the variant calls it unobserved. The exec that
+#: runs the script allows 120 s more: the POST's own 30-s timeout, one last
+#: 30-s read past the bound and the interpreter's start-up.
+RECEIPT_FOLLOW_SECONDS = 240
+
 #: Run in a reporter sidecar (``kubectl exec -c progress-reporter-<rank>``,
 #: the GPU runtime image's interpreter): POST one heartbeat for ``argv[1]``
 #: (an attempt id), rank ``argv[2]``, progress fields ``argv[3]`` (JSON) --
@@ -170,24 +178,48 @@ print(json.dumps({
 #: control-plane URL, cluster token and CA (``SSL_CERT_FILE``), and the Pod
 #: identity the reporter reports (``NODE_NAME``, ``POD_UID``,
 #: ``CONTAINER_NAME``). One live attempt, no outbox and no retry
-#: (``HttpEventSink.deliver_once``), so the product's answer comes back to the
-#: runner instead of being buffered for a replay. Prints one JSON object: the
-#: heartbeat sent, and either the product's answer (``delivered`` true,
-#: ``body`` = ``TrainingHealthResult``) or the client's error and HTTP status.
-#: Never prints the token.
+#: (``HttpEventSink.deliver_once``).
+#:
+#: On the regional path that answer is not the ingest's: the channel is
+#: ``receipt=True`` (``channel_registry``), so the ingress admits the POST to
+#: the processor queue and answers 202 ``{"accepted": true,
+#: "processor_request_id", "status_url", "coalesced"}``
+#: (``app/middleware/dispatch.py``) -- an admission, not a decision. The
+#: processor later replays the POST through the route handler and commits the
+#: handler's answer to the request row, which ``GET status_url`` returns once
+#: COMPLETED (``X-GPU-Fault-Processor-Status: COMPLETED``, the handler's own
+#: HTTP status and body) and answers 202 ``{"status": PENDING|LEASED}`` until
+#: then (``app/routes/processor.py``). The script follows such a receipt for up
+#: to ``argv[4]`` seconds as the product's own receipt client does (same
+#: authentication and cluster header, 202 and retryable statuses asked again
+#: with a doubling delay up to 2 s) and keeps the last read as ``receipt``.
+#: Prints one JSON object: the heartbeat sent, the POST's answer (``body``) or
+#: the client's error and HTTP status, and the receipt's outcome. Never prints
+#: the token.
 HEARTBEAT_POST = r"""
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 from gpu_fault.channel_registry import TRAINING_PROGRESS_PATH
-from gpu_fault.collectors.sinks import CollectorError, HttpEventSink
+from gpu_fault.collectors.sinks import (
+    CollectorError,
+    HttpEventSink,
+    is_retryable_collector_status,
+)
 from gpu_fault.training_models import TrainingProgressHeartbeat
 
 attempt_id, rank, fields = sys.argv[1], int(sys.argv[2]), json.loads(sys.argv[3])
+follow_seconds = float(sys.argv[4]) if len(sys.argv) > 4 else 0.0
+cluster_id = os.environ["GPU_FAULT_CLUSTER_ID"]
+base_url = os.environ["GPU_FAULT_CONTROL_PLANE_URL"].rstrip("/")
+token = os.environ.get("GPU_FAULT_CONTROL_PLANE_TOKEN")
 heartbeat = TrainingProgressHeartbeat(
-    cluster_id=os.environ["GPU_FAULT_CLUSTER_ID"],
+    cluster_id=cluster_id,
     attempt_id=attempt_id,
     rank=rank,
     observed_at=datetime.now(timezone.utc),
@@ -197,16 +229,68 @@ heartbeat = TrainingProgressHeartbeat(
     **fields,
 )
 payload = heartbeat.model_dump(mode="json")
-sink = HttpEventSink(
-    os.environ["GPU_FAULT_CONTROL_PLANE_URL"],
-    bearer_token=os.environ.get("GPU_FAULT_CONTROL_PLANE_TOKEN"),
-    timeout_seconds=30,
-)
+sink = HttpEventSink(base_url, bearer_token=token, timeout_seconds=30)
+
+
+def read(status_url):
+    headers = {"X-GPU-Fault-Cluster-ID": cluster_id, "User-Agent": "gfrs-general-live"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    try:
+        request = Request(base_url + status_url, headers=headers, method="GET")
+        with urlopen(request, timeout=30) as response:
+            code, received, text = int(response.status), response.headers, response.read()
+    except HTTPError as exc:
+        code, received, text = exc.code, exc.headers, exc.read()
+    except OSError as exc:
+        return None, None, str(exc)[:300]
+    try:
+        body = json.loads(text) if text else None
+    except ValueError:
+        body = text.decode("utf-8", "replace")[:300]
+    status = received.get("X-GPU-Fault-Processor-Status") if received else None
+    return code, status, body
+
+
+def follow(status_url):
+    started = time.monotonic()
+    delay, polls = 0.25, 0
+    while True:
+        polls += 1
+        code, processor_status, body = read(status_url)
+        if processor_status is None and code == 202 and isinstance(body, dict):
+            processor_status = body.get("status")
+        outcome = {
+            "status_url": status_url,
+            "http_status": code,
+            "processor_status": processor_status,
+            "body": body,
+            "polls": polls,
+            "waited_seconds": round(time.monotonic() - started, 3),
+            "bound_seconds": follow_seconds,
+        }
+        if processor_status == "COMPLETED":
+            return {**outcome, "terminal": True}
+        if code is not None and code != 202 and not is_retryable_collector_status(code):
+            return {**outcome, "terminal": False, "refused_read": True}
+        if time.monotonic() - started + delay > follow_seconds:
+            return {**outcome, "terminal": False}
+        time.sleep(delay)
+        delay = min(delay * 2, 2.0)
+
+
 answer = {"heartbeat": payload}
 try:
-    answer.update(delivered=True, body=sink.deliver_once(TRAINING_PROGRESS_PATH, payload))
+    body = sink.deliver_once(TRAINING_PROGRESS_PATH, payload)
 except CollectorError as exc:
     answer.update(delivered=False, status=exc.status_code, error=str(exc)[:500])
+else:
+    answer.update(delivered=True, body=body)
+    if isinstance(body, dict) and body.get("processor_request_id"):
+        status_url = body.get("status_url")
+        if not isinstance(status_url, str) or not status_url.startswith("/"):
+            status_url = "/v1/processor/requests/" + str(body["processor_request_id"])
+        answer["receipt"] = follow(status_url)
 print(json.dumps(answer, sort_keys=True, default=str))
 """
 

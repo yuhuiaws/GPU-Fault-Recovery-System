@@ -491,6 +491,117 @@ def test_old_attempt_is_inconclusive_when_the_ingest_never_graded_the_post(
         _run_old_attempt(tmp_path, _old_attempt_docs(), answer)
 
 
+#: The regional path (``receipt=True`` channel): the POST answers the
+#: ingress's queue admission; ``HEARTBEAT_POST`` follows ``status_url`` to the
+#: processor's COMPLETED answer -- the ingest's own decision.
+ADMISSION = {
+    "accepted": True,
+    "coalesced": False,
+    "processor_request_id": "processor-idem-3b6d",
+    "status_url": "/v1/processor/requests/processor-idem-3b6d",
+}
+
+
+def _admitted(receipt: dict[str, Any] | None) -> dict[str, Any]:
+    answer = {
+        "delivered": True,
+        "heartbeat": {"heartbeat_id": "hb-1", "observed_at": FOREIGN_SENT},
+        "body": dict(ADMISSION),
+    }
+    if receipt is not None:
+        answer["receipt"] = receipt
+    return answer
+
+
+def _completed(
+    http_status: int = 200, body: Any = None, *, terminal: bool = True
+) -> dict[str, Any]:
+    if body is None:
+        body = {"heartbeat_id": "hb-1", "accepted": False, "findings": []}
+    return {
+        "status_url": ADMISSION["status_url"],
+        "http_status": http_status,
+        "processor_status": "COMPLETED" if terminal else "LEASED",
+        "body": body,
+        "polls": 3,
+        "waited_seconds": 1.75,
+        "bound_seconds": 240.0,
+        "terminal": terminal,
+    }
+
+
+def test_old_attempt_with_the_live_admission_receipt_alone_is_inconclusive(
+    tmp_path: Path,
+) -> None:
+    # Live (HyperPod lane) the admission's "accepted": true was read as the
+    # ingest accepting the heartbeat: a FAIL while every record showed it
+    # refused. An admission is not a decision.
+    with pytest.raises(VariantInconclusive, match="did not reach a terminal state"):
+        _run_old_attempt(tmp_path, _old_attempt_docs(), _admitted(None))
+
+
+def test_old_attempt_passes_on_the_completed_refusal_behind_the_receipt(
+    tmp_path: Path,
+) -> None:
+    result = _run_old_attempt(tmp_path, _old_attempt_docs(), _admitted(_completed()))
+    assert result["verdict"] == "PASS", result["errors"]
+
+
+def test_old_attempt_fails_when_the_completed_decision_accepts(tmp_path: Path) -> None:
+    accepted = {"heartbeat_id": "hb-1", "accepted": True, "findings": []}
+    result = _run_old_attempt(
+        tmp_path, _old_attempt_docs(), _admitted(_completed(body=accepted))
+    )
+    assert result["verdict"] == "FAIL", result
+    assert [name for name, errors in result["stages"].items() if errors] == [
+        "refused"
+    ], result["stages"]
+
+
+@pytest.mark.parametrize(
+    ("answer", "match"),
+    [
+        (_admitted(_completed(terminal=False)), "did not reach a terminal state"),
+        (
+            _admitted({**_completed(403, {"detail": "x"}), "terminal": False}),
+            "did not reach a terminal state",
+        ),
+        (_admitted(_completed(409, {"detail": "identity"})), "completed .* HTTP 409"),
+        (_admitted(_completed(503, {"detail": "busy"})), "completed .* HTTP 503"),
+        (
+            _admitted(_completed(body={"status": "STALE_SUPERSEDED"})),
+            "not graded by the product's ingest",
+        ),
+        (
+            _admitted(_completed(body={"heartbeat_id": "hb-2", "accepted": False})),
+            "about heartbeat hb-2, not the posted hb-1",
+        ),
+        (
+            {
+                "delivered": True,
+                "heartbeat": {"heartbeat_id": "hb-1"},
+                "body": {"accepted": True, "spooled": True, "coalesced": False},
+            },
+            "telemetry spool",
+        ),
+    ],
+    ids=[
+        "pending-at-bound",
+        "read-refused",
+        "completed-409",
+        "completed-503",
+        "stale-superseded",
+        "other-heartbeat",
+        "spooled",
+    ],
+)
+def test_foreign_refusal_without_the_ingests_own_decision_is_inconclusive(
+    answer: dict[str, Any], match: str
+) -> None:
+    with pytest.raises(VariantInconclusive, match=match):
+        pr.foreign_refusal(answer, "gl27-old-a1-deadbeef-a000")
+
+
 def test_old_attempt_fails_when_the_live_attempt_is_no_longer_heard(
     tmp_path: Path,
 ) -> None:

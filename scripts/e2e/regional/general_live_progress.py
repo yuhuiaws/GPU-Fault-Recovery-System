@@ -56,6 +56,7 @@ from scripts.e2e.regional.general_live_fixture import (
 )
 from scripts.e2e.regional.general_live_progress_probes import (
     HEARTBEAT_POST,
+    RECEIPT_FOLLOW_SECONDS,
     SCAN_POST,
     TRAINING_PROBE,
 )
@@ -485,9 +486,9 @@ class ManagedProgressJob:
         self, rank: int, attempt_id: str, **fields: Any
     ) -> dict[str, Any]:
         """POST one heartbeat claiming ``attempt_id`` from rank ``rank``'s
-        reporter sidecar (``HEARTBEAT_POST``) and return what it printed: the
-        heartbeat and the product's answer, or the client's error; other
-        output is an undelivered answer, never an exception."""
+        reporter sidecar (``HEARTBEAT_POST``, a queue receipt followed for up to
+        ``RECEIPT_FOLLOW_SECONDS``) and return what it printed; other output is
+        an undelivered answer, never an exception."""
 
         output = self.ctx.regional.kubectl(
             "gpu",
@@ -504,7 +505,8 @@ class ManagedProgressJob:
             json.dumps(
                 {key: value for key, value in fields.items() if value is not None}
             ),
-            timeout=120,
+            str(RECEIPT_FOLLOW_SECONDS),
+            timeout=RECEIPT_FOLLOW_SECONDS + 120,
         )
         lines = [line for line in str(output).splitlines() if line.strip()]
         try:
@@ -1231,15 +1233,15 @@ def bounded_phase(ctx: VariantContext) -> dict[str, Any]:
 def old_attempt(ctx: VariantContext) -> dict[str, Any]:
     """A heartbeat claiming an attempt the product does not run controls nothing.
 
-    The live attempt's own heartbeat is in the store first (the positive
-    control: the ingest accepts this job's reporter). Then rank 0's reporter
-    sidecar POSTs one heartbeat claiming ``<job>-a000`` -- the job's id with an
-    attempt number the product never ran, the live Pod's identity, and a NaN,
-    the payload that stops an attempt once accepted -- through the product's
-    ingest route. The product must answer ``accepted=false``, keep no progress
-    for that attempt, raise no training finding, STOP or restart, and keep
-    accepting the live attempt's own heartbeats. An answer that is not the
-    ingest's grading (a transport or HTTP error) refused nothing: INCONCLUSIVE.
+    The live attempt's own heartbeat is stored first (the positive control).
+    Then rank 0's reporter sidecar POSTs one heartbeat claiming ``<job>-a000``
+    (a number the product never ran, the live Pod's identity, a NaN: what stops
+    an attempt once accepted) and follows the regional ingress's queue receipt
+    to the processor's COMPLETED answer. The ingest's decision must be
+    ``accepted=false`` (``ingest_decision``), with no progress kept for that
+    attempt, no training finding, STOP or restart, and the live attempt still
+    heard; a decision not observed (no terminal state within the follow bound,
+    a transport or HTTP error) refused nothing: INCONCLUSIVE.
     """
 
     run_survey(ctx)
@@ -1477,9 +1479,9 @@ VARIANTS = [
         "rank 0's reporter sidecar POSTs one heartbeat claiming the job's never-run "
         "attempt id <job>-a000 (the live Pod's identity, numerical_error=true) "
         "through the product's ingest, after the live attempt's own heartbeat is stored",
-        "the ingest answers accepted=false and stores no progress for that attempt; "
-        "no training finding, STOP or restart; the live attempt stays RUNNING and "
-        "its own heartbeats are still accepted",
+        "the ingest's decision -- the processor's COMPLETED answer its queue receipt "
+        "names -- is accepted=false; no progress stored for that attempt, no training "
+        "finding, STOP or restart; the live attempt stays RUNNING and still heard",
         old_attempt,
         risk="L",
     ),
