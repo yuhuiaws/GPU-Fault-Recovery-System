@@ -442,3 +442,186 @@ def test_sample_lines_round_trip_through_the_parser(line, name, labels, value) -
     (sample,) = parsed.samples[name]
     assert (sample.name, sample.labels, sample.value) == (name, labels, value)
     assert sample.line() == line
+
+
+def test_a_declared_any_family_without_local_samples_wins_over_a_sibling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pinned for families that drop their zero-valued series: a render that
+    declares an ANY family (HELP/TYPE) and has no sample of it is the Pod's
+    answer, so a sibling's older non-empty publication of it never leaks into
+    the scrape. ``parse_lines`` gives a declared family an empty sample list,
+    and ANY reads only the first source that has the family."""
+
+    registry = process_metrics.SlotRegistry()
+    monkeypatch.setattr(process_metrics, "SLOTS", registry)
+    monkeypatch.setattr(process_metrics.os, "kill", lambda pid, signal: None)
+    sibling = os.getpid() + 100000
+    _publish_as(
+        tmp_path,
+        sibling,
+        1,
+        [f"# TYPE {ANY_FAMILY} gauge", f'{ANY_FAMILY}{{cluster_id="a"}} 9'],
+    )
+    declared = [f"# HELP {ANY_FAMILY} Rows queued.", f"# TYPE {ANY_FAMILY} gauge"]
+    try:
+        lines = process_metrics.pod_coherent_lines(declared, directory=tmp_path)
+        undeclared = process_metrics.pod_coherent_lines(
+            [f"# TYPE {SUM_FAMILY} counter", f"{SUM_FAMILY} 1"], directory=tmp_path
+        )
+    finally:
+        registry.release()
+
+    assert [line for line in lines if line.startswith(ANY_FAMILY)] == []
+    assert lines[:2] == declared, "the declared family keeps its HELP/TYPE"
+    assert f"{PROCESSES_METRIC} 2" in lines, "the sibling is merged, not dropped"
+    assert f"{DEGRADED_METRIC} 0" in lines, "an unread family is not a defect"
+    # Not declared by the answering process: the sibling's samples answer.
+    assert f'{ANY_FAMILY}{{cluster_id="a"}} 9' in undeclared
+
+
+def test_the_lowest_slot_that_declares_an_any_family_wins_even_when_empty() -> None:
+    local = process_metrics.parse_lines([f"# TYPE {SUM_FAMILY} counter"])
+    low = process_metrics.parse_lines([f"# TYPE {ANY_FAMILY} gauge"])
+    high = process_metrics.parse_lines(
+        [f"# TYPE {ANY_FAMILY} gauge", f"{ANY_FAMILY} 9"]
+    )
+    local.slot, low.slot, high.slot = 0, 1, 2
+
+    lines = process_metrics.aggregate(local, [high, low])
+
+    assert lines == [f"# TYPE {SUM_FAMILY} counter", f"# TYPE {ANY_FAMILY} gauge"]
+
+
+class _Clock:
+    def __init__(self, now: float) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class _AdvancingStop:
+    """A stop event whose waits move a fake monotonic clock; set after
+    ``passes`` publisher passes."""
+
+    def __init__(self, clock: _Clock, passes: int) -> None:
+        self.clock = clock
+        self.remaining = passes
+        self.waits: list[float] = []
+
+    def wait(self, seconds: float) -> bool:
+        self.waits.append(seconds)
+        self.clock.now += seconds
+        self.remaining -= 1
+        return self.remaining <= 0
+
+
+@pytest.fixture
+def publisher(monkeypatch: pytest.MonkeyPatch):
+    clock = _Clock(100.0)
+    registry = process_metrics.SlotRegistry()
+    monkeypatch.setattr(process_metrics, "SLOTS", registry)
+    monkeypatch.setattr(
+        process_metrics, "PUBLICATIONS", process_metrics.PublicationLedger(clock)
+    )
+    renders: list[float] = []
+
+    def render() -> list[str]:
+        renders.append(clock.now)
+        return [f"# TYPE {SUM_FAMILY} counter", f"{SUM_FAMILY} {len(renders)}"]
+
+    yield clock, render, renders
+    registry.release()
+
+
+def test_the_publisher_skips_a_tick_a_scrape_publication_made_redundant(
+    tmp_path: Path, publisher
+) -> None:
+    """The scrape at 100 s published the render it answered with, so the
+    pass at 102 s renders nothing; the cadence stays 5 s and the pass at
+    107 s renders again (the newest publication was then 7 s old, well inside
+    the 60-s freshness bound)."""
+
+    clock, render, renders = publisher
+    process_metrics.pod_coherent_lines(
+        [f"# TYPE {SUM_FAMILY} counter", f"{SUM_FAMILY} 0"], directory=tmp_path
+    )
+    clock.now = 102.0
+    stop = _AdvancingStop(clock, passes=3)
+
+    process_metrics.publish_forever(render, stop, directory=tmp_path, interval=5.0)
+
+    assert renders == [107.0, 112.0], "the 102-s pass renders nothing"
+    assert stop.waits == [5.0, 5.0, 5.0], "the cadence does not change"
+    published = json.loads((tmp_path / f"{os.getpid()}.json").read_text())
+    assert published["samples"] == [[SUM_FAMILY, [], "2"]]
+
+
+def test_the_publisher_keeps_its_cadence_without_scrapes(
+    tmp_path: Path, publisher
+) -> None:
+    clock, render, renders = publisher
+    stop = _AdvancingStop(clock, passes=3)
+
+    process_metrics.publish_forever(render, stop, directory=tmp_path, interval=5.0)
+
+    assert renders == [100.0, 105.0, 110.0], "its own publication never skips"
+    assert stop.waits == [5.0, 5.0, 5.0]
+
+
+@pytest.mark.parametrize(("age", "renders_at"), [(4.5, []), (5.0, [105.0])])
+def test_a_scrape_publication_one_interval_old_no_longer_skips(
+    tmp_path: Path, publisher, age: float, renders_at: list[float]
+) -> None:
+    clock, render, renders = publisher
+    process_metrics.pod_coherent_lines(
+        [f"# TYPE {SUM_FAMILY} counter", f"{SUM_FAMILY} 0"], directory=tmp_path
+    )
+    clock.now = 100.0 + age
+    stop = _AdvancingStop(clock, passes=1)
+
+    process_metrics.publish_forever(render, stop, directory=tmp_path, interval=5.0)
+
+    assert renders == renders_at, f"a {age}-s-old publication"
+
+
+@pytest.mark.parametrize("other", ["sibling-file", "other-directory", "failed-write"])
+def test_only_a_completed_publication_of_this_process_skips_a_tick(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, publisher, other: str
+) -> None:
+    clock, render, renders = publisher
+    lines = [f"# TYPE {SUM_FAMILY} counter", f"{SUM_FAMILY} 0"]
+    if other == "sibling-file":
+        _publish_as(tmp_path, os.getpid() + 100000, 1, lines)
+    elif other == "other-directory":
+        process_metrics.pod_coherent_lines(lines, directory=tmp_path / "elsewhere")
+    else:
+
+        def failed(*args: object) -> None:
+            raise OSError("synthetic replace failure")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(process_metrics.os, "replace", failed)
+            degraded = process_metrics.pod_coherent_lines(lines, directory=tmp_path)
+        assert f"{DEGRADED_METRIC} 1" in degraded, "the failed write degrades"
+
+    process_metrics.publish_forever(
+        render, _AdvancingStop(clock, passes=1), directory=tmp_path, interval=5.0
+    )
+
+    assert renders == [100.0], f"a {other} publication must not skip the tick"
+
+
+def test_a_forked_child_does_not_inherit_its_parent_s_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ledger = process_metrics.PublicationLedger(_Clock(100.0))
+    assert ledger.age(tmp_path) is None, "nothing published yet"
+    ledger.record(tmp_path)
+    assert ledger.age(tmp_path) == 0.0
+    assert ledger.age(tmp_path / "other") is None, "another directory"
+    parent = os.getpid()
+    with monkeypatch.context() as patch:
+        patch.setattr(process_metrics.os, "getpid", lambda: parent + 1)
+        assert ledger.age(tmp_path) is None, "the child has not published"

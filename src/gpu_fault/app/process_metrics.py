@@ -13,10 +13,16 @@ by luck.
 Every process publishes its *complete* rendered sample set to
 ``<dir>/<pid>.json`` -- on every render it answers and, from a small
 background thread, every :data:`PUBLISH_INTERVAL_SECONDS` -- so the process
-that counted does not have to be the one that answers the scrape. The
+that counted does not have to be the one that answers the scrape. The thread
+skips a tick when the render this process published for a scrape is younger
+than the interval: rendering again would publish nearly the same samples. The
 answering process merges its own fresh render with every other live process's
 file and aggregates each family by the strategy registered for it in
 :mod:`gpu_fault.app.metric_aggregation` (SUM, MAX, MIN, ANY or PER_PROCESS).
+A sibling's samples are built only for the families the merge reads (ANY
+reads the first source that has the family, never the later ones); every
+entry of the file is still checked, so a malformed one anywhere degrades
+coverage exactly as if every sample had been built.
 Counters retain a bounded process-slot label: their reset domains must survive
 until Prometheus applies rate/increase. Dead PID files are removed; stale,
 malformed or missing live publications mark coverage degraded. The directory
@@ -46,8 +52,11 @@ import math
 import os
 import tempfile
 import time
+from collections import deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from itertools import chain
+from operator import itemgetter
 from pathlib import Path
 from threading import Event, Lock
 from typing import Any
@@ -103,12 +112,32 @@ class Rendered:
     pid: int | None = None
     published_at: float | None = None
     degraded: bool = False
+    # A publication read from disk keeps its (already checked) entries here,
+    # per family, until a merge reads that family through ``family_samples``.
+    # ``samples`` holds every family's key from the start, so "does this
+    # source have the family" reads the same before and after.
+    pending: dict[str, list[list[Any]]] = field(default_factory=dict, repr=False)
 
     def family_type(self, family: str) -> str | None:
         type_line = self.families.get(family, (None, None))[1]
         if type_line is None:
             return None
         return type_line.split()[-1]
+
+    def family_samples(self, family: str) -> Sequence[Sample]:
+        """The family's samples, built from the publication on first read."""
+
+        entries = self.pending.pop(family, None)
+        if entries is not None:
+            self.samples[family] = _entry_samples(entries)
+        return self.samples.get(family, ())
+
+    def materialise(self) -> Rendered:
+        """Build every family still pending; ``samples`` is then complete."""
+
+        for family in list(self.pending):
+            self.family_samples(family)
+        return self
 
 
 # --------------------------------------------------------------------------
@@ -307,7 +336,7 @@ def _grouped(
 ) -> dict[tuple[str, Labels], list[str]]:
     groups: dict[tuple[str, Labels], list[str]] = {}
     for source in sources:
-        for sample in source.samples.get(family, ()):
+        for sample in source.family_samples(family):
             groups.setdefault((sample.name, sample.labels), []).append(sample.value)
     return groups
 
@@ -319,18 +348,22 @@ def _aggregate_family(
 ) -> list[Sample]:
     """``sources`` are ordered: the local render first, then the other live
     processes by slot. Sample order follows the first source that has each
-    series, so a single-source render is emitted unchanged."""
+    series, so a single-source render is emitted unchanged.
+
+    ANY reads only the first source that has the family -- one that declares
+    it with no samples included, so a declared empty local family wins -- and
+    the later sources' samples of it are never built."""
 
     if strategy is Strategy.ANY:
         for source in sources:
             if family in source.samples:
-                return list(source.samples[family])
+                return list(source.family_samples(family))
         return []
     if strategy is Strategy.PER_PROCESS:
         out: list[Sample] = []
         for source in sources:
             slot = "0" if source.slot is None else str(source.slot)
-            for sample in source.samples.get(family, ()):
+            for sample in source.family_samples(family):
                 labels = tuple(
                     (key, value) for key, value in sample.labels if key != PROCESS_LABEL
                 ) + ((PROCESS_LABEL, slot),)
@@ -487,6 +520,37 @@ class SlotRegistry:
 SLOTS = SlotRegistry()
 
 
+class PublicationLedger:
+    """When this process last completed a publication of its own render.
+
+    Both the scrape path and the background publisher record here; the
+    publisher reads it to skip a tick the scrape path made redundant.
+    """
+
+    def __init__(self, monotonic: Callable[[], float] = time.monotonic) -> None:
+        self._monotonic = monotonic
+        self._lock = Lock()
+        self._last: tuple[int, Path, float] | None = None
+
+    def record(self, directory: Path) -> None:
+        stamp = (os.getpid(), directory, self._monotonic())
+        with self._lock:
+            self._last = stamp
+
+    def age(self, directory: Path) -> float | None:
+        """Seconds since this process published into ``directory``, if it has."""
+
+        with self._lock:
+            last = self._last
+        # A forked child inherits the parent's ledger, not its publication.
+        if last is None or last[0] != os.getpid() or last[1] != directory:
+            return None
+        return max(0.0, self._monotonic() - last[2])
+
+
+PUBLICATIONS = PublicationLedger()
+
+
 def publish(
     directory: Path,
     rendered: Rendered,
@@ -498,34 +562,176 @@ def publish(
 
     directory.mkdir(parents=True, exist_ok=True)
     own = os.getpid() if pid is None else pid
-    payload = {
-        "format": FILE_FORMAT,
-        "pid": own,
-        "slot": slot,
-        "published_at": time.time(),
-        "families": {
-            name: [help_line, type_line]
-            for name, (help_line, type_line) in rendered.families.items()
+    # json.dumps, not json.dump: dump(obj, fp) streams through the pure-Python
+    # encoder, dumps runs the C one, and the bytes are the same. Label pairs
+    # stay tuples; the encoder writes a tuple as the array a list would be.
+    document = json.dumps(
+        {
+            "format": FILE_FORMAT,
+            "pid": own,
+            "slot": slot,
+            "published_at": time.time(),
+            "families": {
+                name: [help_line, type_line]
+                for name, (help_line, type_line) in rendered.families.items()
+            },
+            "samples": [
+                [sample.name, sample.labels, sample.value]
+                for family in list(rendered.samples)
+                for sample in rendered.family_samples(family)
+            ],
         },
-        "samples": [
-            [sample.name, [list(pair) for pair in sample.labels], sample.value]
-            for samples in rendered.samples.values()
-            for sample in samples
-        ],
-    }
+        separators=(",", ":"),
+    )
     handle, temporary = tempfile.mkstemp(
         prefix=f".{own}-", suffix=".tmp", dir=directory
     )
     try:
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
-            json.dump(payload, stream, separators=(",", ":"))
+            stream.write(document)
         os.replace(temporary, directory / f"{own}.json")
     except BaseException:
         Path(temporary).unlink(missing_ok=True)
         raise
+    if own == os.getpid():
+        PUBLICATIONS.record(directory)
+
+
+def _read_families(rendered: Rendered, families: object) -> None:
+    if not isinstance(families, dict):
+        rendered.degraded = True
+        return
+    for name, declared in families.items():
+        if (
+            isinstance(name, str)
+            and isinstance(declared, list)
+            and len(declared) == 2
+            and all(value is None or isinstance(value, str) for value in declared)
+        ):
+            rendered.families[name] = (declared[0], declared[1])
+            rendered.samples.setdefault(name, [])
+        else:
+            rendered.degraded = True
+
+
+def _read_entries(rendered: Rendered, entries: list[Any]) -> None:
+    """Read a publication's entries one by one: a malformed entry is skipped
+    and marks the publication degraded, the well-formed ones still count."""
+
+    for item in entries:
+        if not (isinstance(item, list) and len(item) == 3):
+            rendered.degraded = True
+            continue
+        name, labels, value = item
+        if not isinstance(labels, list) or any(
+            not isinstance(pair, list)
+            or len(pair) != 2
+            or not all(isinstance(part, str) for part in pair)
+            for pair in labels
+        ):
+            rendered.degraded = True
+            continue
+        try:
+            _number(str(value))
+        except ValueError:
+            rendered.degraded = True
+            continue
+        pairs = tuple((str(k), str(v)) for k, v in labels)
+        if not isinstance(name, str) or len({key for key, _ in pairs}) != len(pairs):
+            rendered.degraded = True
+            continue
+        family = _family_of(str(name), rendered.families)
+        rendered.families.setdefault(family, (None, None))
+        rendered.samples.setdefault(family, []).append(
+            Sample(str(name), pairs, str(value))
+        )
+
+
+def _well_formed(entries: list[Any]) -> bool:
+    """Whether :func:`_read_entries` would accept every entry.
+
+    One pass of C-level maps over the whole list, instead of a Python loop
+    per entry. Stricter, never looser: every value must already be a string
+    (what :func:`publish` writes), so a True answer means no entry would be
+    skipped; anything else is left to the entry-by-entry reading.
+    """
+
+    if not entries:
+        return True
+    if set(map(type, entries)) != {list} or set(map(len, entries)) != {3}:
+        return False
+    names, label_lists, values = zip(*entries)
+    if (
+        set(map(type, names)) != {str}
+        or set(map(type, values)) != {str}
+        or set(map(type, label_lists)) != {list}
+    ):
+        return False
+    try:
+        # float() accepting a string implies _number() accepts it.
+        deque(map(float, values), maxlen=0)
+    except ValueError:
+        return False
+    pairs = list(chain.from_iterable(label_lists))
+    if pairs and (
+        set(map(type, pairs)) != {list}
+        or set(map(len, pairs)) != {2}
+        or set(map(type, chain.from_iterable(pairs))) != {str}
+    ):
+        return False
+    # A repeated label name: dict() keeps one pair per name.
+    return list(map(len, label_lists)) == list(map(len, map(dict, label_lists)))
+
+
+def _deferred(
+    declared: Mapping[str, object], entries: list[Any]
+) -> tuple[list[str], dict[str, list[list[Any]]]] | None:
+    """Group well-formed entries by family without building their samples.
+
+    Returns the undeclared families the entries open (in the order the
+    entry-by-entry reading opens them) and the entries per family, or None:
+    an entry is malformed, or a family would depend on entry order.
+    """
+
+    if not _well_formed(entries):
+        return None
+    names = list(map(itemgetter(0), entries))
+    known = dict.fromkeys(declared)
+    opened: list[str] = []
+    family_of: dict[str, str] = {}
+    for name in dict.fromkeys(names):
+        family = _family_of(name, known)
+        if family not in known:
+            known[family] = None
+            opened.append(family)
+        family_of[name] = family
+    # The entry-by-entry reading resolves each entry against the families
+    # opened before it; resolving each name once at its first entry is the
+    # same reading unless a name that went to its summary/histogram base is
+    # opened as a family of its own later on.
+    if any(family != name and name in known for name, family in family_of.items()):
+        return None
+    pending: dict[str, list[list[Any]]] = {}
+    for name, entry in zip(names, entries):
+        family = family_of[name]
+        bucket = pending.get(family)
+        if bucket is None:
+            pending[family] = bucket = []
+        bucket.append(entry)
+    return opened, pending
+
+
+def _entry_samples(entries: list[list[Any]]) -> list[Sample]:
+    # Entries ``_deferred`` grouped are well formed: strings throughout.
+    return [
+        Sample(name, tuple((key, text) for key, text in labels), value)
+        for name, labels, value in entries
+    ]
 
 
 def _load(path: Path) -> Rendered | None:
+    """Read a sibling's publication; its samples stay pending until read."""
+
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -542,54 +748,21 @@ def _load(path: Path) -> Rendered | None:
         slot=payload.get("slot"),
         published_at=payload.get("published_at"),
     )
-    families = payload.get("families")
-    if isinstance(families, dict):
-        for name, declared in families.items():
-            if (
-                isinstance(name, str)
-                and isinstance(declared, list)
-                and len(declared) == 2
-                and all(value is None or isinstance(value, str) for value in declared)
-            ):
-                rendered.families[name] = (declared[0], declared[1])
-                rendered.samples.setdefault(name, [])
-            else:
-                rendered.degraded = True
-    else:
+    _read_families(rendered, payload.get("families"))
+    entries = payload.get("samples")
+    if not isinstance(entries, list):
         rendered.degraded = True
-    samples = payload.get("samples")
-    if isinstance(samples, list):
-        for item in samples:
-            if not (isinstance(item, list) and len(item) == 3):
-                rendered.degraded = True
-                continue
-            name, labels, value = item
-            if not isinstance(labels, list) or any(
-                not isinstance(pair, list)
-                or len(pair) != 2
-                or not all(isinstance(part, str) for part in pair)
-                for pair in labels
-            ):
-                rendered.degraded = True
-                continue
-            try:
-                _number(str(value))
-            except ValueError:
-                rendered.degraded = True
-                continue
-            pairs = tuple((str(k), str(v)) for k, v in labels)
-            if not isinstance(name, str) or len({key for key, _ in pairs}) != len(
-                pairs
-            ):
-                rendered.degraded = True
-                continue
-            family = _family_of(str(name), rendered.families)
-            rendered.families.setdefault(family, (None, None))
-            rendered.samples.setdefault(family, []).append(
-                Sample(str(name), pairs, str(value))
-            )
-    else:
-        rendered.degraded = True
+        return rendered
+    deferred = _deferred(rendered.families, entries)
+    if deferred is None:
+        _read_entries(rendered, entries)
+        return rendered
+    # Every entry is well formed: the families open now, in the order the
+    # entry-by-entry reading opens them; their samples are built when read.
+    opened, rendered.pending = deferred
+    for family in opened:
+        rendered.families[family] = (None, None)
+        rendered.samples[family] = []
     return rendered
 
 
@@ -615,6 +788,17 @@ def live_siblings(
     directory: Path, *, pid: int | None = None, local_slot: int | None = None
 ) -> list[Rendered]:
     """Fresh live publications, plus explicit unknown-coverage sentinels."""
+
+    return [
+        publication.materialise()
+        for publication in _live_publications(directory, pid=pid, local_slot=local_slot)
+    ]
+
+
+def _live_publications(
+    directory: Path, *, pid: int | None = None, local_slot: int | None = None
+) -> list[Rendered]:
+    """:func:`live_siblings` with every family's samples still pending."""
 
     own = os.getpid() if pid is None else pid
     others: list[Rendered] = []
@@ -686,7 +870,7 @@ def pod_coherent_lines(
             raise OSError("no free process metric slot")
         local.pid = os.getpid()
         publish(target, local, slot=local.slot)
-        others = live_siblings(target, local_slot=local.slot)
+        others = _live_publications(target, local_slot=local.slot)
     except OSError as error:
         LOGGER.warning(
             "process metrics could not be shared through %s: %s", target, error
@@ -711,6 +895,12 @@ def publish_forever(
     Without this, a process publishes only when it answers a scrape, and the
     process that counted may never be asked. Runs in every worker process; it
     returns at once when sharing is off.
+
+    A tick that finds a publication of this process younger than
+    ``interval`` -- the render the scrape path published when it answered --
+    skips its own render: it would publish nearly the same samples again.
+    The newest publication is then less than two intervals plus one render
+    old, well inside :data:`MAX_PUBLISH_AGE_SECONDS`.
     """
 
     target = metrics_directory() if directory is None else directory
@@ -721,10 +911,12 @@ def publish_forever(
             slot = SLOTS.slot(target)
             if slot is None:
                 raise OSError("no free process metric slot")
-            rendered = parse_lines(render())
-            rendered.slot = slot
-            rendered.pid = os.getpid()
-            publish(target, rendered, slot=rendered.slot)
+            age = PUBLICATIONS.age(target)
+            if age is None or age >= interval:
+                rendered = parse_lines(render())
+                rendered.slot = slot
+                rendered.pid = os.getpid()
+                publish(target, rendered, slot=rendered.slot)
         except Exception:  # noqa: BLE001 - a publisher must not die on one write
             LOGGER.exception("process metrics could not be published to %s", target)
         if stop.wait(interval):
