@@ -5240,6 +5240,25 @@ naming theirs) and runs every affected variant over the old shape -- the
 incident with VALIDATE_GPU WAITING on every read, which passed -- now
 INCONCLUSIVE.
 
+**020 `recovered` / 022 `recovery_evidence`: the detection counts.** Both
+held a counter fault, discarded the detection read and passed when
+`recover_counter`'s last read had any accepted batch and no active finding of
+any kind -- true of a product that never detected the fault. Now no incident on
+the held counter is INCONCLUSIVE (there was no fault to recover from), the
+detection is judged as the sibling diagnostic variant's (`crc`, `replay`,
+`over_rate_limit`: the read-only chain whose VALIDATE_GPU failed on the held
+reading; a wrong one is a FAIL), and the recovery needs a new normal reading
+(`renewal_errors`): when the replay ends, the first batch at the device's own
+reading is a `counter-reset` edge whose invalid delta keeps the finding active,
+and only a later normal batch clears it, so the finding must be inactive and at
+least two readings below the replayed peak accepted after it. "Real
+communication" is read as the device's own readings accepted after the replay;
+no traffic is driven. `tests/regional/test_general_live_gpu_recovery.py` pins the
+drop and the clearing batch through the real DCGM collector, control-plane API,
+store and `GPU_STATE_PROBE`, and runs both variants over the old shape (no
+incident -> INCONCLUSIVE), a wrong detection, a validation passed while held, a
+recovery on the drop alone and a finding that never cleared.
+
 **019 recovery.** The diagnostic variants' `recovery` stage was
 `[] if ... else []`, and `recover_counter` returns its last read when its wait
 runs out, so "cleared by a fresh batch" was never checked. The stage

@@ -677,6 +677,50 @@ def history_findings(
     ]
 
 
+def renewal_errors(
+    state: dict[str, Any], canonical: str, gpu: str, *, need: str
+) -> list[str]:
+    """A held counter's finding recovered on a new normal reading, not the drop.
+
+    When a replayed counter fault ends, the device's own reading -- below the
+    replayed peak -- comes back. The first batch that carries it is a decrease,
+    a ``counter-reset`` edge whose invalid delta keeps the finding active; only
+    a later normal reading over a real window clears it
+    (``gpu_metrics.ingest``; pinned through the real collector and ingest by
+    ``tests/regional/test_general_live_gpu_recovery.py``). So, on the last read
+    of ``recover_counter``: no active ``canonical`` finding on ``gpu``, and at
+    least two accepted readings below the peak after it -- the drop and the
+    normal one that recovered. ``need`` is the variant's expectation.
+    """
+
+    errors = [
+        f"the {canonical} finding on {gpu} is still active after the replay "
+        f"ended ({finding_text(item)}): {need}"
+        for item in active_findings(state, canonical, gpu=gpu)
+    ]
+    samples = [
+        item
+        for item in accepted_samples(state, canonical, gpu)
+        if isinstance(item.get("value"), (int, float))
+    ]
+    if not samples:
+        return [*errors, f"the product accepted no {canonical} reading of {gpu}"]
+    peak = max(range(len(samples)), key=lambda index: samples[index]["value"])
+    top = samples[peak]["value"]
+    after = [item for item in samples[peak + 1 :] if item["value"] < top]
+    if len(after) < 2:
+        shown = ", ".join(
+            f"{item['value']:g} at {item['observed_at']}" for item in after
+        )
+        errors.append(
+            f"after the replayed peak {top:g} the product accepted "
+            f"{len(after)} {canonical} reading(s) of {gpu} below it "
+            f"({shown or 'none'}): the drop alone is a counter zeroing, not the new "
+            f"normal reading recovery needs -- {need}"
+        )
+    return errors
+
+
 def collection_errors(state: dict[str, Any]) -> list[str]:
     return [
         str(error)
@@ -860,6 +904,7 @@ __all__ = [
     "operation_count",
     "planned_operations",
     "read_only_errors",
+    "renewal_errors",
     "replay_effective",
     "served_values",
     "settled",

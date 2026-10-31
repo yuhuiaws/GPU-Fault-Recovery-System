@@ -990,6 +990,10 @@ WARNING 的前提，判定不受此影响。
 
 `crc`、`replay`、`recovery_counter` 与 `independent_fatal_event` 的计数器链按 019 诊断类变体的规则判“必须失败”：
 VALIDATE_GPU 以点名被保持计数器的 FAILED 收尾才算，等待到有终态为止，WAITING 到期为 `INCONCLUSIVE`。
+`recovered` 的检测结果不再丢弃：保持的计数器故障没有 incident 即 `INCONCLUSIVE`（无故障可恢复），检测按同族诊断
+变体判定（错误的检测为 `FAIL`）；恢复要求新的正常读数：回放结束后第一个回到设备真实读数的批次是
+`counter-reset` 边沿，invalid delta 保留 finding，之后的正常批次才清除，故要求 finding 不再活动且峰值之后至少
+接受两个低于峰值的读数（`renewal_errors`）。
 
 ### GF-GENERAL-LIVE-021
 
@@ -1178,6 +1182,8 @@ hostengine 重启会清掉它）；计划在
 需在两集群重跑。
 
 `over_rate_limit` 的 VALIDATE_GPU 同样必须以点名 `pcie_replay_total` 的 FAILED 收尾（规则同 019 诊断类变体）。
+`recovery_evidence` 与 020 `recovered` 同规则：没有检测为 `INCONCLUSIVE`，错误的检测为 `FAIL`，恢复要求回放结束、
+`counter-reset` 之后的正常批次清除 finding；“真实通信”按回放后产品接受的设备自身读数理解，不额外驱动流量。
 
 ### GF-GENERAL-LIVE-024
 

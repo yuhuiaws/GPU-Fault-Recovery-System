@@ -102,6 +102,7 @@ from scripts.e2e.regional.general_live_gpu_verdicts import (
     latest_value,
     metric_incidents,
     read_only_errors,
+    renewal_errors,
     served_values,
     validation_judgeable,
 )
@@ -606,34 +607,77 @@ def independent_fatal_event(ctx: VariantContext) -> dict[str, Any]:
     )
 
 
+def _recover_from_fault(
+    ctx: VariantContext,
+    survey: Any,
+    operation: dict[str, Any],
+    *,
+    canonical: str,
+    gpu: str,
+    need: str,
+    notes: list[str],
+    extra: dict[str, Any],
+) -> dict[str, Any]:
+    """Hold a counter fault until its diagnosis has a verdict, end the replay
+    and judge the recovery the device's own reading brings.
+
+    The detection used to be thrown away and the recovery stage held for any
+    accepted batch with no active finding of any kind: a product that never
+    detected the fault passed. No incident on the held counter is INCONCLUSIVE
+    (no fault to recover from); the detection is judged as the sibling
+    diagnostic variant's (``_diag_chain``), so a wrong one is a FAIL; the
+    recovery needs the finding cleared by a normal reading after the drop
+    (``renewal_errors``).
+    """
+
+    since = utc_now()
+    profile = "pcie" if canonical == "pcie_replay_total" else "nvlink"
+    repl = DcgmReplay(
+        ctx, plan(profile, baseline(), step(40, operation, hold=True)), _hold(ctx)
+    )
+    arm_and_confirm(repl, f"{gpu}/{canonical}")
+    budget = survey.health_summary + 240
+    detection = _wait_diagnosed(ctx, since, canonical, gpu, timeout=budget)
+    incidents = metric_incidents(detection, canonical, gpu=gpu)
+    stages = {"hardware": no_hardware(detection)}
+    if not incidents:
+        recover_counter(ctx, repl, since, names=[canonical])
+        missed = [
+            f"no {canonical} finding on {gpu} reached an incident within {budget} s: "
+            "there was no fault to recover from"
+        ]
+        return result(
+            stages,
+            notes=notes,
+            inconclusive=inconclusive_unless_failed(stages, missed),
+            extra=extra,
+        )
+    judgement = _diagnosed(detection, canonical, gpu)
+    stages["detection"] = judgement.errors
+    stages["read_only"] = read_only_errors(detection, incidents, canonical)
+    state = recover_counter(ctx, repl, since, names=[canonical])
+    stages["recovery"] = renewal_errors(state, canonical, gpu, need=need)
+    return result(
+        stages,
+        notes=[*notes, *judgement.unfinished],
+        inconclusive=inconclusive_unless_failed(stages, judgement.unfinished),
+        extra=extra,
+    )
+
+
 def recovered(ctx: VariantContext) -> dict[str, Any]:
     survey = run_gpu_survey(ctx)
     counter = survey.nvlink_counter(NVLINK["replay"])
-    canonical = counter.canonical
-    gpu = survey.target(canonical)
-    since = utc_now()
-    repl = DcgmReplay(
+    gpu = survey.target(counter.canonical)
+    return _recover_from_fault(
         ctx,
-        plan("nvlink", baseline(), step(40, add(canonical, [gpu]), hold=True)),
-        _hold(ctx),
-    )
-    arm_and_confirm(repl, f"{gpu}/{canonical}")
-    wait_gpu_incident(
-        ctx,
-        since,
-        lambda doc: metric_incidents(doc, canonical, gpu=gpu),
-        metrics=(canonical,),
-        timeout_seconds=survey.health_summary + 240,
-        name="detection",
-    )
-    recovered_state = recover_counter(ctx, repl, since, names=[canonical])
-    stages = {
-        "recovery": []
-        if recovered_state.get("batches") and not recovered_state.get("active_findings")
-        else ["recovery needs a new normal increment, not a counter zeroing"],
-    }
-    return result(
-        stages, notes=[counter.note()], extra={"gpu_uuid": gpu, **counter.evidence()}
+        survey,
+        add(counter.canonical, [gpu]),
+        canonical=counter.canonical,
+        gpu=gpu,
+        need="recovery needs a new normal increment, not a counter zeroing",
+        notes=[counter.note()],
+        extra={"gpu_uuid": gpu, **counter.evidence()},
     )
 
 
@@ -1260,39 +1304,18 @@ def expired_xid(ctx: VariantContext) -> dict[str, Any]:
 
 def recovery_evidence(ctx: VariantContext) -> dict[str, Any]:
     survey = run_gpu_survey(ctx)
-    gpu = survey.target("pcie_replay_total")
-    since = utc_now()
-    repl = DcgmReplay(
+    gpu = survey.target(PCIE)
+    return _recover_from_fault(
         ctx,
-        plan(
-            "pcie",
-            baseline(),
-            step(
-                40,
-                add("pcie_replay_total", [gpu], over_limit_increment(survey.interval)),
-                hold=True,
-            ),
-        ),
-        _hold(ctx),
+        survey,
+        add(PCIE, [gpu], over_limit_increment(survey.interval)),
+        canonical=PCIE,
+        gpu=gpu,
+        need="recovery needs a new normal rate and real communication, not a "
+        "cleared counter",
+        notes=[],
+        extra={"gpu_uuid": gpu},
     )
-    arm_and_confirm(repl, f"{gpu}/pcie_replay_total")
-    wait_gpu_incident(
-        ctx,
-        since,
-        lambda doc: metric_incidents(doc, "pcie_replay_total", gpu=gpu),
-        metrics=("pcie_replay_total",),
-        timeout_seconds=survey.health_summary + 240,
-        name="detection",
-    )
-    recovered_state = recover_counter(ctx, repl, since, names=["pcie_replay_total"])
-    stages = {
-        "recovery": []
-        if recovered_state.get("batches") and not recovered_state.get("active_findings")
-        else [
-            "recovery needs a new normal rate and real communication, not a cleared counter"
-        ],
-    }
-    return result(stages, extra={"gpu_uuid": gpu})
 
 
 VARIANTS = [
@@ -1367,7 +1390,8 @@ VARIANTS = [
         CASE_020,
         "recovered",
         "recover after an NVLink counter fault",
-        "recovery needs a new normal increment, not a counter zeroing",
+        "the held fault is detected as the read-only diagnosis; recovery needs a "
+        "new normal increment, not a counter zeroing",
         recovered,
         max_minutes=20,
     ),
@@ -1441,7 +1465,8 @@ VARIANTS = [
         CASE_022,
         "recovery_evidence",
         "recover after a PCIe rate fault",
-        "recovery needs a new normal rate and real communication, not a cleared counter",
+        "the held fault is detected as the read-only diagnosis; recovery needs a "
+        "new normal rate and real communication, not a cleared counter",
         recovery_evidence,
         max_minutes=20,
     ),

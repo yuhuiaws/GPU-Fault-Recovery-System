@@ -20,6 +20,7 @@ from scripts.e2e.regional.general_live_gpu_replay import plan as replay_plan
 from tests.regional._general_live_fakes import FakeRegional, make_context, make_settings
 from tests.regional._general_live_gpu_fakes import (
     audit_records,
+    cleared_state,
     dcgm_probe,
     gpu_cpu_python,
     gpu_incident,
@@ -554,7 +555,13 @@ def _pass_records(
     served = audit_records({f"{G1}/{canonical}": 1.0})
     if variant in {"crc", "replay", "recovery_counter", "recovered"}:
         inc = gpu_incident("inc", f"b-{G1}-{canonical}", state="RECOVERED")
-        return _activity([inc], [diagnostic]), clean_state, served
+        # recovered: the replayed rise, the drop and the normal reading after it.
+        state = (
+            cleared_state(canonical, G1, values=(1.0, 2.0, 3.0, 0.0, 0.0))
+            if variant == "recovered"
+            else clean_state
+        )
+        return _activity([inc], [diagnostic]), state, served
     if variant == "multiple_gpus":
         comp = gpu_incident(
             "inc-c",
