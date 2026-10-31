@@ -185,9 +185,15 @@ data:
                 # GpuFaultDepartedNodeCleanupStuck reads; labels are bounded
                 # (action, reason, status take fixed values, cluster_id is a
                 # registered cluster).
+                # gpu_fault_stale_attempt_observation_nodes is the per-cluster
+                # count beside gpu_fault_stale_attempt_observations, which now
+                # carries only the nodes that keep a stale observation; the
+                # other per-cluster ownership counts match
+                # gpu_fault_ambiguous_attempt_ownership_.+ and
+                # gpu_fault_attempt_observation_scan_.+ (label cluster_id only).
                 - action: keep
                   source_labels: [__name__]
-                  regex: up|gpu_fault_processor_.+|gpu_fault_telemetry_spool_.+|gpu_fault_store_io_.+|gpu_fault_store_hot_table_.+|gpu_fault_store_compaction_.+|gpu_fault_store_bloat_scan_timestamp_seconds|gpu_fault_remote_command_.+|gpu_fault_collector_.+|gpu_fault_policy_.+|gpu_fault_ambiguous_attempt_ownership_.+|gpu_fault_stale_attempt_observations|gpu_fault_attempt_observation_scan_.+|gpu_fault_workflow_.+|gpu_fault_closed_loop_.+|gpu_fault_notification_.+|gpu_fault_remediation_budget_.+|gpu_fault_fleet_rollout_.+|gpu_fault_fleet_pin_drift_.+|gpu_fault_stale_agents|gpu_fault_spare_reservations_.+|gpu_fault_regional_registry_.+|gpu_fault_postgres_.+|gpu_fault_periodic_.+|gpu_fault_health_signal_.+|gpu_fault_ingest_.+|gpu_fault_control_record_.+|gpu_fault_orphan_.+|gpu_fault_incident_.+|gpu_fault_incidents_.+|gpu_fault_completion_.+|gpu_fault_gpu_findings_.+|gpu_fault_capacity_.+|gpu_fault_metrics_.+|gpu_fault_aurora_.+|gpu_fault_ingress_.+|gpu_fault_departed_node_cleanup_.+
+                  regex: up|gpu_fault_processor_.+|gpu_fault_telemetry_spool_.+|gpu_fault_store_io_.+|gpu_fault_store_hot_table_.+|gpu_fault_store_compaction_.+|gpu_fault_store_bloat_scan_timestamp_seconds|gpu_fault_remote_command_.+|gpu_fault_collector_.+|gpu_fault_policy_.+|gpu_fault_ambiguous_attempt_ownership_.+|gpu_fault_stale_attempt_observations|gpu_fault_stale_attempt_observation_nodes|gpu_fault_attempt_observation_scan_.+|gpu_fault_workflow_.+|gpu_fault_closed_loop_.+|gpu_fault_notification_.+|gpu_fault_remediation_budget_.+|gpu_fault_fleet_rollout_.+|gpu_fault_fleet_pin_drift_.+|gpu_fault_stale_agents|gpu_fault_spare_reservations_.+|gpu_fault_regional_registry_.+|gpu_fault_postgres_.+|gpu_fault_periodic_.+|gpu_fault_health_signal_.+|gpu_fault_ingest_.+|gpu_fault_control_record_.+|gpu_fault_orphan_.+|gpu_fault_incident_.+|gpu_fault_incidents_.+|gpu_fault_completion_.+|gpu_fault_gpu_findings_.+|gpu_fault_capacity_.+|gpu_fault_metrics_.+|gpu_fault_aurora_.+|gpu_fault_ingress_.+|gpu_fault_departed_node_cleanup_.+
                 # Dropped because they describe the collector, not the fleet.
                 # The receiver stamps every metric with the instrumentation
                 # scope it arrived under, and those labels then take part in

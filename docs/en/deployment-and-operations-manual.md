@@ -8116,6 +8116,9 @@ but there is no attempt memory after a restart.
 `GpuFaultStaleAttemptObservation` means the CPU side still has an active-phase
 Observation not refreshed for more than 120 seconds; that record has been excluded from ownership. The alert fires only after persisting for 2 minutes; troubleshooting should check the corresponding training Pod,
 Watcher logs/Ready and outbox, and must not delete database rows directly.
+The `gpu_fault_stale_attempt_observations` it reads is rendered only for a node that keeps a stale observation, so no
+series means no stale observation; the per-cluster `gpu_fault_stale_attempt_observation_nodes` is the healthy baseline
+(0), and the ADOT keep allow-list admits it and the per-node family by exact name.
 After a terminal event is saved, the Store monotonically turns the Observation terminal in the same attempt transaction and refuses
 later `PENDING/RUNNING`; the periodic hot-state cleanup automatically repairs historical terminal/active contradictions.
 Therefore the cleanup gate must see both the terminal workflow/event and the terminal Observation, and cannot rely on only one of them.

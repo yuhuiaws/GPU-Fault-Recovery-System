@@ -28,7 +28,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "More than one fresh attempt owning a node.\n\nAlert GpuFaultExclusiveNodeOwnershipInvariantViolation (critical, > 1): docs/en/administrator-operations.md#gpufaultexclusivenodeownershipinvariantviolation",
+      "description": "More than one fresh attempt owning a node. A node has a series only while that holds; the per-cluster count of such nodes reads 0 on a healthy fleet.\n\nAlert GpuFaultExclusiveNodeOwnershipInvariantViolation (critical, > 1): docs/en/administrator-operations.md#gpufaultexclusivenodeownershipinvariantviolation",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -62,7 +62,7 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
+        "w": 8,
         "x": 0,
         "y": 1
       },
@@ -89,6 +89,17 @@
           "legendFormat": "{{cluster_id}} {{gpu_node}}",
           "range": true,
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "max by (cluster_id) (gpu_fault_ambiguous_attempt_ownership_nodes{cluster_id=~\"$cluster_id\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "{{cluster_id}} nodes with more than one",
+          "range": true,
+          "refId": "B"
         }
       ],
       "title": "Active attempts per GPU node",
@@ -99,7 +110,7 @@
         "type": "prometheus",
         "uid": "gpu-fault-amp"
       },
-      "description": "Alert GpuFaultStaleAttemptObservation (warning, for 2m, > 0): docs/en/administrator-operations.md#gpufaultstaleattemptobservation",
+      "description": "A node has a series only while it keeps a stale active observation; the per-cluster count reads 0 when none does.\n\nAlert GpuFaultStaleAttemptObservation (warning, for 2m, > 0): docs/en/administrator-operations.md#gpufaultstaleattemptobservation",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -133,8 +144,8 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
-        "x": 12,
+        "w": 8,
+        "x": 8,
         "y": 1
       },
       "id": 3,
@@ -160,9 +171,98 @@
           "legendFormat": "{{cluster_id}} {{gpu_node}}",
           "range": true,
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "max by (cluster_id) (gpu_fault_stale_attempt_observation_nodes{cluster_id=~\"$cluster_id\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "{{cluster_id}} nodes with stale observations",
+          "range": true,
+          "refId": "B"
         }
       ],
       "title": "Stale attempt observations",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-fault-amp"
+      },
+      "description": "GPU nodes the ownership families evaluated (every registered Agent's node and every node an active observation names) and those a fresh attempt owns. A registered cluster missing here means the families were not rendered: read gpu_fault_metrics_contributor_errors_total{contributor=\"orchestration\"}. While the attempt observation scan is truncated the counts describe its newest slice.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 1
+      },
+      "id": 4,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "max by (cluster_id) (gpu_fault_attempt_observation_scan_nodes{cluster_id=~\"$cluster_id\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "{{cluster_id}} evaluated",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "max by (cluster_id) (gpu_fault_attempt_observation_scan_owned_nodes{cluster_id=~\"$cluster_id\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "{{cluster_id}} owned by a fresh attempt",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Ownership scan coverage",
       "type": "timeseries"
     },
     {
@@ -173,7 +273,7 @@
         "x": 0,
         "y": 9
       },
-      "id": 4,
+      "id": 5,
       "panels": [],
       "title": "Fleet rollout fence",
       "type": "row"
@@ -221,7 +321,7 @@
         "x": 0,
         "y": 10
       },
-      "id": 5,
+      "id": 6,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -288,7 +388,7 @@
         "x": 12,
         "y": 10
       },
-      "id": 6,
+      "id": 7,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -324,7 +424,7 @@
         "x": 0,
         "y": 18
       },
-      "id": 7,
+      "id": 8,
       "panels": [],
       "title": "Pointers, agents and registry",
       "type": "row"
@@ -372,7 +472,7 @@
         "x": 0,
         "y": 19
       },
-      "id": 8,
+      "id": 9,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -443,7 +543,7 @@
         "x": 6,
         "y": 19
       },
-      "id": 9,
+      "id": 10,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -514,7 +614,7 @@
         "x": 12,
         "y": 19
       },
-      "id": 10,
+      "id": 11,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -581,7 +681,7 @@
         "x": 18,
         "y": 19
       },
-      "id": 11,
+      "id": 12,
       "options": {
         "legend": {
           "displayMode": "list",

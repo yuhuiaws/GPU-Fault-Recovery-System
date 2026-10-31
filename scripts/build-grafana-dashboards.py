@@ -44,6 +44,7 @@ EXPORTER_SOURCES = (
     "src/gpu_fault/app/builtin_metric_contributors.py",
     "src/gpu_fault/app/closed_loop_metrics.py",
     "src/gpu_fault/app/remediation_budget_metrics.py",
+    "src/gpu_fault/app/ownership_metrics.py",
     "src/gpu_fault/app/aurora_refresh_metrics.py",
     "src/gpu_fault/app/collector_metrics.py",
     "src/gpu_fault/app/metric_aggregation.py",

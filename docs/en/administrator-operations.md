@@ -3471,7 +3471,7 @@ and the names are the card names below.
 | GPU Fault · Control-plane capacity (`gpu-fault-control-plane-capacity`) | `gpu-fault-control-plane-capacity` | Scrape liveness -> `GpuFaultControlPlaneMetricsMissing`, `GpuFaultControlPlaneReplicaScrapeFailing`, `GpuFaultMetricsContributorFailing`, `GpuFaultProcessorConsumerStalled`; PostgreSQL pool and credentials -> `GpuFaultPostgresPoolCheckoutQueueing`, `GpuFaultPostgresPoolConnectionErrors`, `GpuFaultAuroraCredentialRefreshStale`, `GpuFaultAuroraCredentialRefreshFailing`, `GpuFaultAuroraCredentialRefreshStatusUnknown` (the oversubscription ratio and the per-consumer demand breakdown are readings without a card); Control-loop review counters -> `GpuFaultRemoteCommandStaleFenceSwept`, `GpuFaultNotificationDeliveryErrors`, `GpuFaultControlRecordArchiveErrors`; Processor queue -> `GpuFaultProcessorQueueDepthHigh`, `GpuFaultProcessorQueueDepthCritical`, `GpuFaultProcessorOldestRequestDelayed`, `GpuFaultProcessorClusterBacklogHigh`, `GpuFaultProcessorClusterBacklogCritical`; Metric scan truncation -> `GpuFaultWorkflowMetricScanTruncated`, `GpuFaultAttemptObservationMetricScanTruncated`; Admission and Store I/O -> `GpuFaultProcessorAdmissionRejected`, `GpuFaultStoreIoSaturated`, `GpuFaultStoreIoRejected`, `GpuFaultStoreIoBackendUnavailable`; Latency, leases and counters -> `GpuFaultProcessorP95Slow`, `GpuFaultProcessorExpiredLeasesReclaimed`, `GpuFaultProcessorCounterDrift`, `GpuFaultProcessorCounterDriftScanUnavailable`; Telemetry spool -> `GpuFaultTelemetrySpoolListenerDown`, `GpuFaultTelemetrySpoolDataLoss`, `GpuFaultTelemetrySpoolAdmissionRejected`, `GpuFaultTelemetrySpoolReplayError`, `GpuFaultTelemetrySpoolDrainDelayed`; Loop liveness -> `GpuFaultWorkflowDispatcherStalled`, `GpuFaultPeriodicRunnerStalled`, `GpuFaultProcessorUnhealthy`, `GpuFaultProcessorNoActiveConsumer`, `GpuFaultTelemetrySpoolConsumerStalled`, `GpuFaultTelemetrySpoolConsumerStopped`; Processor and periodic errors -> `GpuFaultProcessorLeaseRenewalFailing`, `GpuFaultProcessorFaultEventsRejected`, `GpuFaultPeriodicServiceErrors`, `GpuFaultMetricsAggregationIncomplete` |
 | GPU Fault · Remote command (`gpu-fault-remote-command`) | `gpu-fault-remote-command` | Claim latency -> `GpuFaultRemoteCommandUnclaimed`, `GpuFaultRemoteCommandExecutorInternalError`; Command census -> `GpuFaultRemoteCommandUnclaimedExpired` (the per-state/per-cluster command count panels are trend readings) |
 | GPU Fault · Policy coverage (`gpu-fault-policy-coverage`) | `gpu-fault-policy-coverage` | Catalog coverage -> `GpuFaultUnknownProductFamily` (CRITICAL findings without an incident is a trend reading) |
-| GPU Fault · Orchestration invariants (`gpu-fault-orchestration-invariants`) | `gpu-fault-orchestration-invariants` | Node ownership -> `GpuFaultExclusiveNodeOwnershipInvariantViolation`, `GpuFaultStaleAttemptObservation`; Fleet rollout fence -> `GpuFaultFleetRolloutFenceStuck`; Pointers, agents and registry -> `GpuFaultIncidentDanglingWorkflowPointers`, `GpuFaultStaleAgents`, `GpuFaultFleetPinAheadOfFleet`, `GpuFaultRegionalRegistrySecretDrift` |
+| GPU Fault · Orchestration invariants (`gpu-fault-orchestration-invariants`) | `gpu-fault-orchestration-invariants` | Node ownership -> `GpuFaultExclusiveNodeOwnershipInvariantViolation`, `GpuFaultStaleAttemptObservation` (the Ownership scan coverage panel is a trend reading); Fleet rollout fence -> `GpuFaultFleetRolloutFenceStuck`; Pointers, agents and registry -> `GpuFaultIncidentDanglingWorkflowPointers`, `GpuFaultStaleAgents`, `GpuFaultFleetPinAheadOfFleet`, `GpuFaultRegionalRegistrySecretDrift` |
 | GPU Fault · Recovery outcome (`gpu-fault-recovery-outcome`) | `gpu-fault-recovery-outcome` | Workflows -> `GpuFaultRecoveryBlockedBacklog`, `GpuFaultWorkflowPendingAge`, `GpuFaultWorkflowDeadlineNotEnforced`; Step waiting -> `GpuFaultWorkflowStepStalled`; Counters (30m increase) -> `GpuFaultWorkflowLifetimeExceeded`, `GpuFaultJobWorkflowNodeBusyTimeout`, `GpuFaultProcessorRetryHorizonFailures`, `GpuFaultBranchEscalationBudgetRefused`; Closed loop and notifications -> `GpuFaultClosedLoopSlow`, `GpuFaultClosedLoopWindowIncomplete`, `GpuFaultNotificationDeliveryFailing`; Remediation budget -> `GpuFaultRemediationBudgetStarved`, `GpuFaultRemediationBudgetLongWait`, `GpuFaultRemediationStormBreakerOpen`; Completion and incidents -> `GpuFaultCompletionEventsWithoutDecision`, `GpuFaultIncidentsAwaitingOperator`, `GpuFaultDepartedNodeCleanupStuck`; Dispatcher errors and notification outbox -> `GpuFaultWorkflowDispatchInternalErrors`, `GpuFaultWorkflowFailureHandlingAbandoned`, `GpuFaultNotificationUndeliveredTooLong`, `GpuFaultNotificationOutboxNotDraining`, `GpuFaultNotificationExpiredUnsent` |
 
 The last row of the overview, "Declared topology", is `gpu_fault_capacity_largest_cluster_node_count` /
@@ -3743,7 +3743,7 @@ evidence and routine requests are refused. The two "depth" panels plot the same 
 
 - **Meaning**: the attempt observation table has exceeded the scan budget of `/metrics`, and
   `gpu_fault_ambiguous_attempt_ownership_current` and
-  `gpu_fault_stale_attempt_observations` cover only the latest segment. The exclusive-ownership invariant is then
+  `gpu_fault_stale_attempt_observations` (and their per-cluster counts) cover only the latest segment. The exclusive-ownership invariant is then
   evaluated on the slice, ownership conflicts among older observations are not reported, and
   `GpuFaultExclusiveNodeOwnershipInvariantViolation` may therefore be silent.
 - **First check**: the gap between `gpu_fault_attempt_observation_scan_size` and
@@ -3919,6 +3919,18 @@ evidence and routine requests are refused. The two "depth" panels plot the same 
   the training Pods of these attempts all really exist, whether Completion Watcher delivery is duplicated. A job the user or
   Kueue suspended keeps the 300-second grace (an un-suspend brings it back), so another job landing on the same node within
   that grace fires it as well.
+- **Which metric it reads**: `gpu_fault_ambiguous_attempt_ownership_current{cluster_id,gpu_node}` is the number of fresh
+  attempts claiming the node, rendered only for a node more than one fresh attempt claims; a node with one owner or none
+  has no such series. When the condition clears the series leaves the scrape (Prometheus staleness) and the alert resolves
+  at the next evaluation. The healthy baseline is the counts the same contributor always renders for every cluster with an
+  evaluated node: `gpu_fault_ambiguous_attempt_ownership_nodes{cluster_id}` (such nodes, 0 when healthy),
+  `gpu_fault_attempt_observation_scan_nodes{cluster_id}` (the nodes evaluated: every registered Agent's node and every
+  node an active observation in the scanned slice names) and `gpu_fault_attempt_observation_scan_owned_nodes{cluster_id}`
+  (nodes at least one fresh attempt claims, ambiguous ones included). A registered cluster without these counts means the
+  family was not rendered: read `gpu_fault_metrics_contributor_errors_total{contributor="orchestration"}`; while
+  `gpu_fault_attempt_observation_scan_truncated` is 1 the counts describe only the newest slice. A manual check such as
+  `max(gpu_fault_ambiguous_attempt_ownership_current) <= 1` returning an empty result is healthy (no node has more than
+  one owner), not "no data"; read the per-cluster counts for coverage.
 - **Boundary**: critical. Do not hand-craft or delete attempts/allocations to resolve the ambiguity; handling must reference
   real workload observations. See §9.
 
@@ -3926,6 +3938,11 @@ evidence and routine requests are refused. The two "depth" panels plot the same 
 
 - **Meaning**: the node has `PENDING/RUNNING` attempt observations not refreshed for more than 120 seconds. The value is the number of attempts,
   not the number of alert instances merged into the email.
+- **Which metric it reads**: `gpu_fault_stale_attempt_observations{cluster_id,gpu_node}` is rendered only for a node that
+  keeps a stale observation; once the observation is refreshed or made terminal the series disappears (Prometheus
+  staleness) and the alert resolves at the next evaluation. The per-cluster
+  `gpu_fault_stale_attempt_observation_nodes{cluster_id}` counts such nodes, 0 when healthy; it comes from the same
+  contributor as the previous card's per-cluster counts, and its absence means the same.
 - **First check**: whether the training Pods still exist, the Completion Watcher's Ready and logs, the contents of
   `gpu-fault-completion-watcher-outbox` (WAL) and `-outbox-active` (restart memory), and the watcher's
   `gpu_fault_completion_active_state_unavailable` on 9109 `/metrics` (scraped by the data-plane ADOT `gpu-fault-adot-dataplane`, series carrying

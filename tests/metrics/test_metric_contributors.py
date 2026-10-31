@@ -193,6 +193,13 @@ def test_ambiguous_attempt_metric_is_exported(monkeypatch) -> None:
         "gpu_fault_stale_attempt_observations"
         '{cluster_id="cluster-a",gpu_node="node-a"} 1'
     ) in lines
+    for family, count in (
+        ("gpu_fault_attempt_observation_scan_nodes", 1),
+        ("gpu_fault_attempt_observation_scan_owned_nodes", 1),
+        ("gpu_fault_ambiguous_attempt_ownership_nodes", 1),
+        ("gpu_fault_stale_attempt_observation_nodes", 1),
+    ):
+        assert f'{family}{{cluster_id="cluster-a"}} {count}' in lines, family
 
 
 def test_closed_loop_metrics_cover_outcomes_budgets_and_notifications() -> None:

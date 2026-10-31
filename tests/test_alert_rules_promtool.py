@@ -468,6 +468,177 @@ def test_queue_depth_alerts_fire_at_the_configured_boundaries(
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+# The node-ownership families are sparse (gpu_fault.app.ownership_metrics): a
+# per-node series exists only while its node meets the alert condition, and it
+# ends with a staleness marker when the condition clears. The rules keep their
+# thresholds: a replica of the previous release still publishes every node
+# (0 idle, 1 for a single owner) until the roll replaces it, and must not fire.
+OWNERSHIP, STALE_OBSERVATION = OWNERSHIP_ALERTS = (
+    "GpuFaultExclusiveNodeOwnershipInvariantViolation",
+    "GpuFaultStaleAttemptObservation",
+)
+OWNERSHIP_CURRENT = "gpu_fault_ambiguous_attempt_ownership_current"
+STALE_OBSERVATIONS = "gpu_fault_stale_attempt_observations"
+
+
+def _ownership_rules() -> dict[str, dict]:
+    [(_, document)] = MODULE.rule_documents(
+        [ROOT / "deploy/observability/amp-rules.yaml"]
+    )
+    return {
+        rule["alert"]: rule
+        for group in document["groups"]
+        for rule in group["rules"]
+        if rule.get("alert") in OWNERSHIP_ALERTS
+    }
+
+
+def _node_series(pod: str, metric: str, node: str, values: str) -> dict[str, str]:
+    """One replica's per-node series, labelled the way ADOT labels it."""
+
+    labels = {
+        **QUEUE_SITE,
+        "job": "gpu-fault-control-plane",
+        "pod": pod,
+        "instance": f"{pod}:8000",
+        "cluster_id": "a",
+        "gpu_node": node,
+    }
+    rendered = ",".join(f'{key}="{value}"' for key, value in labels.items())
+    return {"series": f"{metric}{{{rendered}}}", "values": values}
+
+
+def _ownership_alert(rule: dict, value: int, node: str) -> dict:
+    rendered = {
+        "{{ $labels.cluster_id }}": "a",
+        "{{ $labels.gpu_node }}": node,
+        '{{ $value | printf "%.0f" }}': str(value),
+    }
+    annotations = {}
+    for key, text in rule["annotations"].items():
+        for template, value_text in rendered.items():
+            text = str(text).replace(template, value_text)
+        annotations[key] = text
+    labels = {**QUEUE_SITE, "cluster_id": "a", "gpu_node": node}
+    return {
+        "exp_labels": {**labels, "severity": rule["labels"]["severity"]},
+        "exp_annotations": annotations,
+    }
+
+
+OWNERSHIP_CASES = [
+    pytest.param(
+        [
+            _node_series(pod, OWNERSHIP_CURRENT, "n1", "_ 2 2 stale")
+            for pod in ("gpu-fault-control-worker-0", "gpu-fault-api-ha-0")
+        ],
+        [
+            ("0m", {}),
+            ("1m", {OWNERSHIP: [(2, "n1")]}),
+            ("2m", {OWNERSHIP: [(2, "n1")]}),
+            ("3m", {}),
+        ],
+        id="a-double-owner-pages-once-at-once-and-resolves-when-its-series-ends",
+    ),
+    pytest.param(
+        [
+            _node_series(
+                "gpu-fault-control-worker-old", OWNERSHIP_CURRENT, "n1", "1x10"
+            ),
+            _node_series(
+                "gpu-fault-control-worker-old", OWNERSHIP_CURRENT, "n2", "0x10"
+            ),
+            _node_series(
+                "gpu-fault-control-worker-old", STALE_OBSERVATIONS, "n1", "0x10"
+            ),
+        ],
+        [("10m", {})],
+        id="a-previous-release-replica-publishing-every-node-stays-quiet",
+    ),
+    pytest.param(
+        [
+            _node_series(
+                "gpu-fault-control-worker-0",
+                STALE_OBSERVATIONS,
+                "n1",
+                "_ 1 1 1 1 stale",
+            )
+        ],
+        [
+            ("2m", {}),
+            ("3m", {STALE_OBSERVATION: [(1, "n1")]}),
+            ("4m", {STALE_OBSERVATION: [(1, "n1")]}),
+            ("5m", {}),
+        ],
+        id="a-stale-observation-warns-after-two-minutes-and-resolves-when-its-series-ends",
+    ),
+]
+
+
+@pytest.mark.parametrize(("inputs", "checks"), OWNERSHIP_CASES)
+def test_node_ownership_alerts_fire_and_resolve_on_sparse_per_node_series(
+    tmp_path: Path, inputs: list[dict[str, str]], checks: list
+) -> None:
+    promtool = shutil.which(os.environ.get("PROMTOOL", "promtool"))
+    assert promtool is not None, "set PROMTOOL to the pinned local promtool"
+    rules = _ownership_rules()
+    rule_file = tmp_path / "rules.yaml"
+    rule_file.write_text(
+        yaml.safe_dump(
+            {
+                "groups": [
+                    {
+                        "name": "ownership",
+                        "rules": [rules[name] for name in OWNERSHIP_ALERTS],
+                    }
+                ]
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    alert_tests = [
+        {
+            "alertname": alert,
+            "eval_time": when,
+            "exp_alerts": [
+                _ownership_alert(rules[alert], value, node)
+                for value, node in firing.get(alert, [])
+            ],
+        }
+        for when, firing in checks
+        for alert in OWNERSHIP_ALERTS
+    ]
+    test_file = tmp_path / "cases.yaml"
+    test_file.write_text(
+        yaml.safe_dump(
+            {
+                "rule_files": [str(rule_file)],
+                "evaluation_interval": "1m",
+                "tests": [
+                    {
+                        "interval": "1m",
+                        "input_series": inputs,
+                        "alert_rule_test": alert_tests,
+                    }
+                ],
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [promtool, "test", "rules", str(test_file)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @pytest.mark.parametrize(
     "defect",
     [

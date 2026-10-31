@@ -1205,13 +1205,18 @@ threshold merely other than planned (a model Agent the product retired) is recor
 second census: any Agent or breaker record left in the run's clusters fails the cleanup.
 
 The fleet gives the store the Agent population of a production region of the same size, and with it that region's
-per-Agent cost. Each registered Agent adds two zero-valued per-node series
-(`gpu_fault_ambiguous_attempt_ownership_current`, `gpu_fault_stale_attempt_observations`) to every control-plane
-process's render, which every process publishes every 5 s and every scrape merges across the Pod's processes. Measured
-locally on the deploy host (not on the site): with 32 x 256 Agents plus the integrated burst's attempt nodes (about 18,400
-such series) one process's publish takes about 0.46 s of CPU and one scrape's 4-process merge about 0.71 s, against 0.05 s
-and 0.06 s with the model's Agents alone; 50 x 256 takes about 0.65 s and 1.2 s. A round with the fleet is therefore not
-comparable with one without it unless the record says so.
+per-Agent cost. The two ownership families (`gpu_fault_ambiguous_attempt_ownership_current`,
+`gpu_fault_stale_attempt_observations`) render a per-node series only for a node that meets the alert condition (more
+than one fresh attempt; at least one stale observation), next to four per-cluster counts that are always present, so
+neither the publication every control-plane process makes every 5 s nor the in-Pod merge of every scrape grows with a
+healthy fleet's Agents. Measured locally on the deploy host (not on the site; one process's CPU): at 50 x 256 = 12,800
+Agents this contributor renders 224 lines, about 20 KB (the same with every node idle or running one attempt), its
+render, parse and JSON encode take about 0.02 s (idle) and 0.06 s (one attempt per node), and a scrape merges three
+sibling publications in about 0.003 s. Before, every registered Agent added two per-node series (0 when idle, 1 for a
+single owner): 25,616 lines and 3.5 MB at the same size, 0.42 s and 0.45 s, and 0.77 s and 0.79 s to merge; the
+records of earlier fleet rounds contain that cost. The remaining per-Agent cost (the ownership snapshot's one pass over
+the Agent table and the observation slice, the Agent reads and the heartbeat writes) stays, so a round with the fleet is
+still not comparable with one without it unless the record says so.
 
 How each step stands against the breaker (default fleet):
 

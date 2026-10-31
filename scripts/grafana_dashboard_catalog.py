@@ -928,8 +928,20 @@ ORCHESTRATION_INVARIANTS = Dashboard(
                             + ")",
                             "{{cluster_id}} {{gpu_node}}",
                         ),
+                        Target(
+                            "max by (cluster_id) ("
+                            + cluster_series(
+                                "gpu_fault_ambiguous_attempt_ownership_nodes"
+                            )
+                            + ")",
+                            "{{cluster_id}} nodes with more than one",
+                        ),
                     ),
-                    description="More than one fresh attempt owning a node.",
+                    description=(
+                        "More than one fresh attempt owning a node. A node has a "
+                        "series only while that holds; the per-cluster count of "
+                        "such nodes reads 0 on a healthy fleet."
+                    ),
                 ),
                 Panel(
                     "Stale attempt observations",
@@ -940,6 +952,47 @@ ORCHESTRATION_INVARIANTS = Dashboard(
                             + ")",
                             "{{cluster_id}} {{gpu_node}}",
                         ),
+                        Target(
+                            "max by (cluster_id) ("
+                            + cluster_series(
+                                "gpu_fault_stale_attempt_observation_nodes"
+                            )
+                            + ")",
+                            "{{cluster_id}} nodes with stale observations",
+                        ),
+                    ),
+                    description=(
+                        "A node has a series only while it keeps a stale active "
+                        "observation; the per-cluster count reads 0 when none does."
+                    ),
+                ),
+                Panel(
+                    "Ownership scan coverage",
+                    (
+                        Target(
+                            "max by (cluster_id) ("
+                            + cluster_series("gpu_fault_attempt_observation_scan_nodes")
+                            + ")",
+                            "{{cluster_id}} evaluated",
+                        ),
+                        Target(
+                            "max by (cluster_id) ("
+                            + cluster_series(
+                                "gpu_fault_attempt_observation_scan_owned_nodes"
+                            )
+                            + ")",
+                            "{{cluster_id}} owned by a fresh attempt",
+                        ),
+                    ),
+                    description=(
+                        "GPU nodes the ownership families evaluated (every "
+                        "registered Agent's node and every node an active "
+                        "observation names) and those a fresh attempt owns. A "
+                        "registered cluster missing here means the families were "
+                        "not rendered: read gpu_fault_metrics_contributor_errors_total"
+                        '{contributor="orchestration"}. While the attempt '
+                        "observation scan is truncated the counts describe its "
+                        "newest slice."
                     ),
                 ),
             ),

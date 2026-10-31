@@ -1149,6 +1149,14 @@ groups:
       # expression turns one ambiguous node into one alert per replica and grows
       # the notification with the replica count. `by` keeps the labels the
       # description reads and the ones amp-alertmanager.yaml groups on.
+      #
+      # Both per-node series are sparse: a node is rendered only while it meets
+      # the condition below, and its series ends when that clears, which
+      # resolves the alert at the next evaluation. The thresholds stay: a
+      # replica of an older release publishes every node (0, or 1 for a single
+      # owner) until the roll replaces it. The always-present per-cluster
+      # counts are gpu_fault_ambiguous_attempt_ownership_nodes and
+      # gpu_fault_stale_attempt_observation_nodes (0 when healthy).
       - alert: GpuFaultExclusiveNodeOwnershipInvariantViolation
         expr: >-
           max by (control_plane_cluster, region, cluster_id, gpu_node)

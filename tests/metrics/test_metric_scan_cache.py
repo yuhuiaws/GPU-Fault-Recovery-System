@@ -487,14 +487,19 @@ def test_ownership_family_reads_the_observation_table_once_and_bounded() -> None
     assert "gpu_fault_attempt_observation_scan_size 2" in lines
     assert "gpu_fault_attempt_observation_scan_truncated 1" in lines
     # The newest two observations are attempt-3 and attempt-4, on node-3/node-4,
-    # so only those nodes carry an ownership series.
+    # so only those nodes are evaluated and owned. A single owner is no
+    # per-node series: the per-cluster counts carry it.
+    assert 'gpu_fault_attempt_observation_scan_nodes{cluster_id="cluster-a"} 2' in lines
     assert (
-        'gpu_fault_ambiguous_attempt_ownership_current{cluster_id="cluster-a",'
-        'gpu_node="node-4"} 1'
-    ) in lines
-    assert not any('gpu_node="node-0"' in line for line in lines), (
-        "the oldest observation fell outside the scan budget, so its node must "
-        f"carry no ownership series: {lines}"
+        'gpu_fault_attempt_observation_scan_owned_nodes{cluster_id="cluster-a"} 2'
+        in lines
+    )
+    assert (
+        'gpu_fault_ambiguous_attempt_ownership_nodes{cluster_id="cluster-a"} 0' in lines
+    )
+    assert not any("gpu_node=" in line for line in lines), (
+        "no node has more than one fresh owner or a stale observation, so no "
+        f"node may carry a per-node series: {lines}"
     )
 
 

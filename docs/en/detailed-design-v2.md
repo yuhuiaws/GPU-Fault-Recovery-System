@@ -5235,10 +5235,11 @@ the regional-mode worker only, §7.10) are not in the count; a production worker
 | `gpu_fault_remediation_budget_*` | 7 | Active budget claims, cluster cap/active/waiting, number of waiting workflows (by scope) |
 | `gpu_fault_ingress_*` | 6 | Backpressure rejections, decode rejections, lane in-flight/waiting/rejected/worker counts |
 | `gpu_fault_closed_loop_*` | 5 | Milestone summary and the four gauges mean/count/complete/window-end for the six-hour window (see later in §10.2) |
+| `gpu_fault_attempt_observation_*` | 5 | Observation scan budget/rows read/truncation; per-cluster evaluated and owned nodes (see later in §10.2) |
 | `gpu_fault_request_decode_*` | 4 | Decode concurrency and rejections |
 | `gpu_fault_store_io_*` | 4 | store I/O concurrency, waiting, rejections |
-| `gpu_fault_attempt_observation_*` / `gpu_fault_control_record_archive_*` / `gpu_fault_fleet_*` / `gpu_fault_incident_*` / `gpu_fault_metrics_*` | 3 each | Observation scan window; archive success/errors/withheld; pin drift and rollout fence; incident automatic/manual closure and dangling pointers; aggregation process count/degraded/contributor errors |
-| `gpu_fault_ambiguous_attempt_ownership_*` / `gpu_fault_capacity_*` / `gpu_fault_completion_*` / `gpu_fault_hardware_escalation_*` / `gpu_fault_ingest_*` / `gpu_fault_regional_registry_*` / `gpu_fault_stale_*` | 2 each | Ownership ambiguity; managed-node capacity; completion decisions/no-decision events; hardware escalation chain terminations/isolation refusals; unresolved fault signals/stale link repairs; registry refresh errors/Secret drift; stale Agents/observations |
+| `gpu_fault_ambiguous_attempt_ownership_*` / `gpu_fault_control_record_archive_*` / `gpu_fault_fleet_*` / `gpu_fault_incident_*` / `gpu_fault_metrics_*` / `gpu_fault_stale_*` | 3 each | Ownership ambiguity (counter, per-node family of ambiguous nodes only, per-cluster count of ambiguous nodes); archive success/errors/withheld; pin drift and rollout fence; incident automatic/manual closure and dangling pointers; aggregation process count/degraded/contributor errors; stale Agents, per-node observation family of stale nodes only and per-cluster count of stale nodes |
+| `gpu_fault_capacity_*` / `gpu_fault_completion_*` / `gpu_fault_hardware_escalation_*` / `gpu_fault_ingest_*` / `gpu_fault_regional_registry_*` | 2 each | Managed-node capacity; completion decisions/no-decision events; hardware escalation chain terminations/isolation refusals; unresolved fault signals/stale link repairs; registry refresh errors/Secret drift |
 | Singletons | 7 | `gpu_fault_event_loop_lag_seconds`, `gpu_fault_gpu_findings_without_incident_total`, `gpu_fault_health_signal_clock_regressions_total`, `gpu_fault_incidents_by_state`, `gpu_fault_orphan_workflows`, `gpu_fault_policy_unknown_product_total`, `gpu_fault_postgres_pool_checkout_wait_seconds` |
 
 Families added after the architecture review (those within the scope of the table above are already counted; families marked as conditionally emitted -- such as the
@@ -5311,6 +5312,15 @@ hangs a shared scan cache on `AppRuntime`:
 - The closed-loop and attempt-ownership families both need the entire Agent table; the cache lets one scrape
   read it only once instead of once per family. `EvidenceOperationService.ownership_metric_snapshot`
   therefore accepts `agents=` injection.
+  The snapshot answers for every evaluated node; the render (`gpu_fault.app.ownership_metrics`) emits only the nodes
+  that meet an alert condition: `gpu_fault_ambiguous_attempt_ownership_current` holds only nodes more than one fresh
+  attempt claims, `gpu_fault_stale_attempt_observations` only nodes that keep a stale observation; and for every
+  cluster with an evaluated node it always emits `gpu_fault_attempt_observation_scan_nodes`,
+  `gpu_fault_attempt_observation_scan_owned_nodes`, `gpu_fault_ambiguous_attempt_ownership_nodes` and
+  `gpu_fault_stale_attempt_observation_nodes` (label `cluster_id` only; the last two are 0 when healthy). Every
+  registered Agent used to be two lines in every publication (0 idle, 1 for a single owner): 25,600 lines at 12,800
+  Agents. Both families keep their HELP/TYPE lines without samples: the Pod's ANY merge takes the first process that
+  declares a family, so an empty family is this process's answer and a sibling's older publication cannot replace it.
 - Workflow detail reads go through `ControlPlaneStore.list_recent_workflows()`: non-terminal
   workflows are read in full regardless of age, terminal ones are read only when `updated_at` is within
   `GPU_FAULT_METRICS_WORKFLOW_SCAN_WINDOW_SECONDS` (default 7 days, 0 disables the window),

@@ -148,10 +148,17 @@ _ANY = (
     "gpu_fault_remediation_budget_storm_breaker_threshold_nodes",
     "gpu_fault_remediation_budget_storm_breaker_tripped_timestamp_seconds",
     "gpu_fault_remediation_budget_storm_breaker_held_workflows",
+    # Node ownership (ownership_metrics.py): per node only where an alert
+    # condition holds, per cluster always. A family declared without samples
+    # is the local answer; ANY never falls through to a sibling's older one.
     "gpu_fault_ambiguous_attempt_ownership_current",
+    "gpu_fault_ambiguous_attempt_ownership_nodes",
     "gpu_fault_attempt_observation_scan_limit",
+    "gpu_fault_attempt_observation_scan_nodes",
+    "gpu_fault_attempt_observation_scan_owned_nodes",
     "gpu_fault_attempt_observation_scan_size",
     "gpu_fault_attempt_observation_scan_truncated",
+    "gpu_fault_stale_attempt_observation_nodes",
     "gpu_fault_stale_attempt_observations",
     "gpu_fault_stale_agents",
     "gpu_fault_notification_total",

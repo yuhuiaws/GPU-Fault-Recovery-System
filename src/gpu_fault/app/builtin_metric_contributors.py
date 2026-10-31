@@ -9,6 +9,7 @@ from gpu_fault.app.closed_loop_metrics import (
     closed_loop_window_metric_lines,
 )
 from gpu_fault.app.metric_scan_cache import MetricScanCache, metric_scan_cache
+from gpu_fault.app.ownership_metrics import ownership_metric_lines
 from gpu_fault.app.remediation_budget_metrics import (
     budget_tally,
     remediation_budget_lines,
@@ -944,55 +945,32 @@ def orchestration_metric_lines(
         agents=cache.agents(),
         observation_states=scan.states,
     )
-    lines = [
+    # Per node only where an alert condition holds, per cluster always
+    # (gpu_fault.app.ownership_metrics): every evaluated node was two lines
+    # per registered Agent in every publication.
+    return [
         "# HELP gpu_fault_ambiguous_attempt_ownership_total "
         "Events rejected because more than one active attempt owned "
         "the target node.",
         "# TYPE gpu_fault_ambiguous_attempt_ownership_total counter",
         "gpu_fault_ambiguous_attempt_ownership_total "
         f"{evidence.ambiguous_attempt_ownership_total()}",
-        "# HELP gpu_fault_ambiguous_attempt_ownership_current "
-        "Fresh active attempts currently claiming one GPU node.",
-        "# TYPE gpu_fault_ambiguous_attempt_ownership_current gauge",
+        *ownership_metric_lines(snapshot),
+        "# HELP gpu_fault_attempt_observation_scan_limit Attempt "
+        "observations the ownership family is allowed to read per scrape.",
+        "# TYPE gpu_fault_attempt_observation_scan_limit gauge",
+        f"gpu_fault_attempt_observation_scan_limit {scan.limit}",
+        "# HELP gpu_fault_attempt_observation_scan_size Attempt "
+        "observations actually read for the ownership family.",
+        "# TYPE gpu_fault_attempt_observation_scan_size gauge",
+        f"gpu_fault_attempt_observation_scan_size {len(scan.states)}",
+        "# HELP gpu_fault_attempt_observation_scan_truncated Set when the "
+        "attempt observation table is larger than the scan budget, so the "
+        "ownership and staleness families, per node and per cluster, describe "
+        "only its newest slice.",
+        "# TYPE gpu_fault_attempt_observation_scan_truncated gauge",
+        f"gpu_fault_attempt_observation_scan_truncated {int(scan.truncated)}",
     ]
-    for (cluster_id, node_id), count in snapshot["current"].items():
-        lines.append(
-            "gpu_fault_ambiguous_attempt_ownership_current"
-            f'{{cluster_id="{_escape_label(cluster_id)}",'
-            f'gpu_node="{_escape_label(node_id)}"}} {count}'
-        )
-    lines.extend(
-        [
-            "# HELP gpu_fault_stale_attempt_observations "
-            "Latest active attempt observations older than the ownership "
-            "freshness window for one GPU node.",
-            "# TYPE gpu_fault_stale_attempt_observations gauge",
-        ]
-    )
-    for (cluster_id, node_id), count in snapshot["stale"].items():
-        lines.append(
-            "gpu_fault_stale_attempt_observations"
-            f'{{cluster_id="{_escape_label(cluster_id)}",'
-            f'gpu_node="{_escape_label(node_id)}"}} {count}'
-        )
-    lines.extend(
-        [
-            "# HELP gpu_fault_attempt_observation_scan_limit Attempt "
-            "observations the ownership family is allowed to read per scrape.",
-            "# TYPE gpu_fault_attempt_observation_scan_limit gauge",
-            f"gpu_fault_attempt_observation_scan_limit {scan.limit}",
-            "# HELP gpu_fault_attempt_observation_scan_size Attempt "
-            "observations actually read for the ownership family.",
-            "# TYPE gpu_fault_attempt_observation_scan_size gauge",
-            f"gpu_fault_attempt_observation_scan_size {len(scan.states)}",
-            "# HELP gpu_fault_attempt_observation_scan_truncated Set when the "
-            "attempt observation table is larger than the scan budget, so the "
-            "ownership and staleness families describe only its newest slice.",
-            "# TYPE gpu_fault_attempt_observation_scan_truncated gauge",
-            f"gpu_fault_attempt_observation_scan_truncated {int(scan.truncated)}",
-        ]
-    )
-    return lines
 
 
 def workflow_stall_metric_lines(

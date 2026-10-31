@@ -139,9 +139,12 @@ class EvidenceOperationService:
                 target.setdefault(key, set()).add(
                     (observation.job_id, observation.attempt_id)
                 )
+        # One sort for both answers, and no empty set per unclaimed node: the
+        # /metrics render calls this on every publication, one key per Agent.
+        ordered = sorted(keys)
         return {
-            "current": {key: len(fresh.get(key, set())) for key in sorted(keys)},
-            "stale": {key: len(stale.get(key, set())) for key in sorted(keys)},
+            "current": {key: len(fresh[key]) if key in fresh else 0 for key in ordered},
+            "stale": {key: len(stale[key]) if key in stale else 0 for key in ordered},
         }
 
     @staticmethod
