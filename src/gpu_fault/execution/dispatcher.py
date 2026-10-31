@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from threading import Event
 from typing import Callable, Literal, TypeVar
@@ -13,7 +13,7 @@ from pydantic import ValidationError
 from gpu_fault.compile_blocked import close_compile_blocked_workflows
 from gpu_fault.execution.receipt_settled_resume import resume_receipt_settled_workflows
 from gpu_fault.execution import dispatcher_wakeups, restart_budget_preflight
-from gpu_fault.execution import budget_guard
+from gpu_fault.execution import budget_guard, dispatch_lease
 from gpu_fault.execution.config import WorkflowDispatcherConfig
 from gpu_fault.execution.executor import (
     DISPATCHER_ACTOR,
@@ -125,6 +125,11 @@ class WorkflowDispatcher:
         self.executor = executor
         self.config = config
         self.failure_handler = failure_handler
+        # The fleet-wide dispatch lease as this process holds it (F-A1): taken
+        # at the start of a tick, renewed at the tick's checkpoints (b226).
+        self.lease = dispatch_lease.DispatchLease(
+            self.DISPATCH_LEASE_KEY, config.dispatch_lease_seconds
+        )
         # D-7: a WAITING row used to keep the executor's full lease (180 s), so
         # after a dispatch-lease handover every in-flight row was pinned to
         # the old holder until it lapsed. The executor stamps this instead.
@@ -206,21 +211,39 @@ class WorkflowDispatcher:
         # Stamped first: a cycle that finds the lease held elsewhere, or fails
         # inside the store, is still a live thread.
         self.last_cycle_timestamp_seconds = time.time()
-        if self.config.dispatch_lease_seconds > 0 and not self._holds_dispatch_lease():
+        started = self.lease.clock()
+        if self.lease.enabled and not self.lease.acquire(
+            self.store, self.executor.config.executor_id
+        ):
             self.budget_watch.idle()
-            return WorkflowDispatchReport(
-                scanned=0,
-                executed=0,
-                waiting=0,
-                completed=0,
-                failed=0,
-                lease_held_by_other=True,
-            )
+            return self._lease_elsewhere_report()
+        with self.lease.holding_tick(started):
+            try:
+                return self._run_tick()
+            except dispatch_lease.DispatchLeaseLost:
+                # Another process took the lease mid-tick and runs the sweeps
+                # and the scan itself; nothing more is started here (b226).
+                self.budget_watch.idle()
+                return self._lease_elsewhere_report()
+
+    @staticmethod
+    def _lease_elsewhere_report() -> WorkflowDispatchReport:
+        return WorkflowDispatchReport(
+            scanned=0,
+            executed=0,
+            waiting=0,
+            completed=0,
+            failed=0,
+            lease_held_by_other=True,
+        )
+
+    def _run_tick(self) -> WorkflowDispatchReport:
         self._reconcile_failed_workflows()
         now = datetime.now(timezone.utc)
         retired = self.sweep_stuck_records(now)
         timed_out = self._expire_stuck_workflows(now)
         workflows, filtered, horizon_exhausted = self._scan_dispatchable(now, retired)
+        self.lease.checkpoint()
         executed = 0
         waiting = 0
         completed = 0
@@ -237,34 +260,20 @@ class WorkflowDispatcher:
             self._worker_pool.submit(self._dispatch_workflow, workflow): workflow
             for workflow in workflows
         }
-        deadline = (
-            time.monotonic() + self.config.cycle_deadline_seconds
-            if self.config.cycle_deadline_seconds > 0
-            else None
+        # Past the cycle deadline, or once the lease is found taken, rows still
+        # queued stay PENDING for the next scan; rows running finish (F-C7).
+        drained = dispatch_lease.drain_batch(
+            set(futures),
+            deadline=(
+                time.monotonic() + self.config.cycle_deadline_seconds
+                if self.config.cycle_deadline_seconds > 0
+                else None
+            ),
+            lease=self.lease,
         )
-        deferred = 0
-        pending: set[
-            Future[tuple[tuple[int, int, int, int], WorkflowDispatchFailure | None]]
-        ] = set(futures)
-        completed_futures: list[
-            Future[tuple[tuple[int, int, int, int], WorkflowDispatchFailure | None]]
-        ] = []
-        while pending:
-            timeout = (
-                None if deadline is None else max(0.0, deadline - time.monotonic())
-            )
-            done, pending = wait(pending, timeout=timeout, return_when=FIRST_COMPLETED)
-            completed_futures.extend(done)
-            if deadline is not None and pending and time.monotonic() >= deadline:
-                # Past the cycle deadline: rows still queued stay PENDING for
-                # the next scan; rows already running finish (F-C7).
-                for future in list(pending):
-                    if future.cancel():
-                        pending.discard(future)
-                        deferred += 1
-                deadline = None
+        deferred = drained.deferred
         self.deferred_total += deferred
-        for future in completed_futures:
+        for future in drained.completed:
             workflow = futures[future]
             try:
                 outcome, failure = future.result()
@@ -339,6 +348,7 @@ class WorkflowDispatcher:
             failures=failures,
             filtered=dict(filtered),
             horizon_exhausted=horizon_exhausted,
+            lease_held_by_other=drained.lease_lost,
             deferred=deferred,
             internal_errors=internal_errors,
         )
@@ -353,22 +363,6 @@ class WorkflowDispatcher:
             path,
             workflow.request_id,
         )
-
-    def _holds_dispatch_lease(self) -> bool:
-        """Whether this process is the fleet's dispatcher for this tick (F-A1).
-
-        Every process used to run a full scan and race the same rows; the lease
-        makes the scan single-instance while ``claim_workflow`` keeps
-        guaranteeing correctness if a lease ever overlaps.
-        """
-
-        lease = self.store.acquire_periodic_task_lease(
-            self.DISPATCH_LEASE_KEY,
-            self.executor.config.executor_id,
-            now=datetime.now(timezone.utc),
-            lease_duration=timedelta(seconds=self.config.dispatch_lease_seconds),
-        )
-        return lease.owner_id == self.executor.config.executor_id
 
     def _scan_dispatchable(
         self, now: datetime, retired: set[str]
@@ -507,6 +501,7 @@ class WorkflowDispatcher:
 
         candidates: list[WorkflowRequest] = []
         for workflow in rows:
+            self.lease.checkpoint()
             if workflow.request_id in retired:
                 held("retired")
                 continue
@@ -1039,6 +1034,7 @@ class WorkflowDispatcher:
             {WorkflowStatus.RUNNING},
             limit=1000,
         ):
+            self.lease.checkpoint()
             if workflow.execution_deadline is None or workflow.execution_deadline > now:
                 continue
             try:
@@ -1298,6 +1294,7 @@ class WorkflowDispatcher:
             {WorkflowStatus.PENDING},
             limit=1000,
         ):
+            self.lease.checkpoint()
             try:
                 successor = abandoned_generation_successor(
                     self.store, workflow, now=now
@@ -1444,6 +1441,7 @@ class WorkflowDispatcher:
             RETIRED_GENERATION_STATUSES,
             limit=1000,
         ):
+            self.lease.checkpoint()
             try:
                 verdict = self._revoke_retired_generation(workflow, now)
             except Exception:  # noqa: BLE001 - keep dispatching, do not revoke
@@ -1546,6 +1544,7 @@ class WorkflowDispatcher:
         if self.failure_handler is None:
             return
         for workflow in self.store.list_unhandled_failed_workflows(limit=1000):
+            self.lease.checkpoint()
             try:
                 self._handle_failed_workflow(workflow)
             except Exception:

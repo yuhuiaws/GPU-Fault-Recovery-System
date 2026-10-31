@@ -8,6 +8,7 @@ from gpu_fault.app.closed_loop_metrics import (
     MILESTONE_OPERATIONS,
     closed_loop_window_metric_lines,
 )
+from gpu_fault.app.dispatch_lease_metrics import dispatch_lease_metric_lines
 from gpu_fault.app.metric_scan_cache import MetricScanCache, metric_scan_cache
 from gpu_fault.app.ownership_metrics import ownership_metric_lines
 from gpu_fault.app.remediation_budget_metrics import (
@@ -675,7 +676,11 @@ def _dispatch_pending_state_lines(ctx: object, dispatcher: object) -> list[str]:
             "gpu_fault_workflow_dispatch_filtered_total"
             f'{{reason="{_escape_label(reason)}"}} {count}'
         )
-    return lines + _budget_watch_lines(getattr(dispatcher, "budget_watch", None))
+    return (
+        lines
+        + dispatch_lease_metric_lines(dispatcher)
+        + _budget_watch_lines(getattr(dispatcher, "budget_watch", None))
+    )
 
 
 def _budget_watch_lines(watch: BudgetWatch | None) -> list[str]:

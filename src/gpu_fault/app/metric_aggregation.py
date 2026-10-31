@@ -433,10 +433,15 @@ _PER_PROCESS = (
     "gpu_fault_workflow_dispatch_failure_handling_abandoned_total",
     "gpu_fault_workflow_dispatch_filtered_total",
     "gpu_fault_workflow_dispatch_internal_errors_total",
+    # The dispatch lease as each process held it, and the ticks its holder ran
+    # (b226): only the holder observes ticks, every process counts its own.
+    "gpu_fault_workflow_dispatch_lease_acquisitions_total",
+    "gpu_fault_workflow_dispatch_lease_losses_total",
     "gpu_fault_workflow_dispatch_node_busy_timeouts_total",
     "gpu_fault_workflow_dispatch_plan_sync_misses_total",
     "gpu_fault_workflow_dispatch_preemption_pending_seen_total",
     "gpu_fault_workflow_dispatch_sweep_errors_total",
+    "gpu_fault_workflow_dispatch_tick_seconds",
     "gpu_fault_workflow_dispatch_wakeups_total",
     "gpu_fault_workflow_lifetime_exceeded_total",
     "gpu_fault_workflow_merge_record_only_total",
@@ -481,6 +486,9 @@ _SUM = (
     "gpu_fault_telemetry_spool_admission_pending",
     "gpu_fault_telemetry_spool_in_flight_bytes",
     "gpu_fault_telemetry_spool_in_flight_bytes_limit",
+    # 1 on the process holding the workflow-dispatch lease: a Pod's number of
+    # holders, so a sum across the region reads 1, and 2 is an overlap (b226).
+    "gpu_fault_workflow_dispatch_lease_held",
 )
 
 
