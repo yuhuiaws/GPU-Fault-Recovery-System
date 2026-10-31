@@ -14,11 +14,15 @@ verdict helpers run over realistic records. These sit beside the shared
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from types import SimpleNamespace
 from typing import Any
 
+from gpu_fault.adapters.gpu_validation import finding_summary, node_failure_text
 from scripts.e2e.regional.general_live_gpu_store import GPU_STATE_PROBE
 from scripts.e2e.regional.general_live_store import ACTIVITY_PROBE
 from tests.regional._general_live_fakes import FakeProbe
+
+GPU_NODE = "ip-10-0-43-5.us-west-2.compute.internal"
 
 
 def survey(
@@ -285,4 +289,80 @@ def gpu_workflow(
         "created_at": "2026-10-24T00:03:00+00:00",
         "official_steps": [{"operation": op, "parameters": {}} for op in operations],
         "step_executions": list(executions),
+    }
+
+
+def held_failure(
+    canonical: str, gpu: str, *, node: str = GPU_NODE, value: float = 3.0
+) -> dict[str, Any]:
+    """VALIDATE_GPU FAILED on the held counter's active finding, in the
+    adapter's words (``adapters/gpu_validation``: ``node_failures``, the
+    ``finding_summary`` of each active finding in ``node_findings``, the
+    ``node_failure_text`` error) -- what a must-fail chain is satisfied by.
+    ``tests/regional/test_general_live_gpu_must_fail.py`` pins the shape to the
+    adapter's own output."""
+
+    summary = finding_summary(
+        SimpleNamespace(
+            finding_id=f"b-{gpu}-{canonical}",
+            canonical_name=canonical,
+            severity=SimpleNamespace(value="WARNING"),
+            value=value,
+            threshold_value=0.0,
+            gpu_uuid=gpu,
+            pci_bdf=None,
+        )
+    )
+    findings = {node: [summary]}
+    return {
+        "operation": "VALIDATE_GPU",
+        "status": "FAILED",
+        "updated_at": "2026-10-24T00:05:00+00:00",
+        "error": "validation failed on nodes: "
+        + node_failure_text(node, ["active_gpu_health_findings"], findings),
+        "details": {
+            "failed_nodes": [node],
+            "node_failures": {node: ["active_gpu_health_findings"]},
+            "validation": "VALIDATE_GPU",
+            "host_diagnostic_failure": True,
+            "node_findings": findings,
+        },
+    }
+
+
+def waiting_validation(*, node: str = GPU_NODE) -> dict[str, Any]:
+    """VALIDATE_GPU still WAITING on its transient-warning cooldown -- what the
+    first read that shows a WARNING memory finding's incident holds."""
+
+    return {
+        "operation": "VALIDATE_GPU",
+        "status": "WAITING",
+        "updated_at": "2026-10-24T00:03:05+00:00",
+        "details": {
+            "pending_nodes": [node],
+            "node_pending": {node: {"transient_gpu_warning_cooldown": ["finding-1"]}},
+            "host_diagnostic_failure": True,
+        },
+    }
+
+
+def cleared_state(
+    canonical: str, gpu: str, *, values: Sequence[float] = (1.0, 2.0, 3.0, 0.0)
+) -> dict[str, Any]:
+    """``recover_counter``'s last read once the replay ended: the counter's
+    accepted readings (replayed rise, then the device's own) and no active
+    finding left."""
+
+    return {
+        "active_findings": [],
+        "findings": [],
+        "batches": [
+            {
+                "batch_id": f"b{index}",
+                "observed_at": f"2026-10-24T00:{index:02d}:00+00:00",
+                "edge_filter_reasons": [],
+                "samples": [{"gpu": gpu, "name": canonical, "value": value}],
+            }
+            for index, value in enumerate(values)
+        ],
     }

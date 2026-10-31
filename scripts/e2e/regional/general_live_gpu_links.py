@@ -87,6 +87,7 @@ from scripts.e2e.regional.general_live_gpu_replay import (
     wait_gpu_incident,
 )
 from scripts.e2e.regional.general_live_gpu_verdicts import (
+    ChainJudgement,
     GpuChain,
     accepted_samples,
     active_findings,
@@ -96,10 +97,13 @@ from scripts.e2e.regional.general_live_gpu_verdicts import (
     finding_text,
     history_findings,
     incident_finding,
+    inconclusive_unless_failed,
+    judge_chain,
     latest_value,
     metric_incidents,
     read_only_errors,
     served_values,
+    validation_judgeable,
 )
 from scripts.e2e.regional.general_live_kernel_xid import (
     independence_errors,
@@ -134,18 +138,50 @@ def _hold(ctx: VariantContext) -> int:
     return min(ctx.spec.max_minutes * 60, 20 * 60)
 
 
-def _diag_chain(doc: dict[str, Any], canonical: str, gpu: str) -> list[str]:
-    return chain_errors(
-        doc,
-        metric_incidents(doc, canonical, gpu=gpu),
-        GpuChain(
-            label=f"{canonical} on {gpu}",
-            operations=("FREEZE_EVIDENCE", "VALIDATE_GPU"),
-            validation="VALIDATE_GPU",
-            validation_must_fail=True,
-            forbidden=RESET,
-            incident_states=frozenset({"ACTION_PENDING", "ESCALATED", "RECOVERED"}),
-        ),
+def _diag_chain(canonical: str, gpu: str) -> GpuChain:
+    """WARNING RUN_DIAGNOSTICS: FREEZE_EVIDENCE -> VALIDATE_GPU, which must fail
+    on the held counter's active finding; nothing reset."""
+
+    return GpuChain(
+        label=f"{canonical} on {gpu}",
+        operations=("FREEZE_EVIDENCE", "VALIDATE_GPU"),
+        validation="VALIDATE_GPU",
+        validation_must_fail=True,
+        held_metric=canonical,
+        held_gpu=gpu,
+        forbidden=RESET,
+        incident_states=frozenset({"ACTION_PENDING", "ESCALATED", "RECOVERED"}),
+    )
+
+
+def _diagnosed(doc: dict[str, Any], canonical: str, gpu: str) -> ChainJudgement:
+    """The held counter's diagnostic chain, judged (``judge_chain``)."""
+
+    return judge_chain(
+        doc, metric_incidents(doc, canonical, gpu=gpu), _diag_chain(canonical, gpu)
+    )
+
+
+def _wait_diagnosed(
+    ctx: VariantContext, since: Any, canonical: str, gpu: str, *, timeout: int
+) -> dict[str, Any]:
+    """Detection that waits until the chain's VALIDATE_GPU has a verdict on the
+    held reading (or the record ended): a WAITING step read off the first
+    snapshot with the incident used to satisfy "must fail" silently."""
+
+    chain = _diag_chain(canonical, gpu)
+
+    def judgeable(doc: dict[str, Any]) -> list[dict[str, Any]]:
+        found = metric_incidents(doc, canonical, gpu=gpu)
+        return found if found and validation_judgeable(doc, found, chain) else []
+
+    return wait_gpu_incident(
+        ctx,
+        since,
+        judgeable,
+        metrics=(canonical,),
+        timeout_seconds=timeout,
+        name="detection",
     )
 
 
@@ -164,16 +200,12 @@ def _nvlink_single(ctx: VariantContext, family: str) -> dict[str, Any]:
         _hold(ctx),
     )
     arm_and_confirm(replay, f"{gpu}/{canonical}")
-    detection = wait_gpu_incident(
-        ctx,
-        since,
-        lambda doc: metric_incidents(doc, canonical, gpu=gpu),
-        metrics=(canonical,),
-        timeout_seconds=survey.health_summary + 240,
-        name="detection",
+    detection = _wait_diagnosed(
+        ctx, since, canonical, gpu, timeout=survey.health_summary + 240
     )
+    judgement = _diagnosed(detection, canonical, gpu)
     stages = {
-        "chain": _diag_chain(detection, canonical, gpu),
+        "chain": judgement.errors,
         "read_only": read_only_errors(
             detection, metric_incidents(detection, canonical, gpu=gpu), canonical
         ),
@@ -181,7 +213,10 @@ def _nvlink_single(ctx: VariantContext, family: str) -> dict[str, Any]:
     }
     recover_counter(ctx, replay, since, names=[canonical])
     return result(
-        stages, notes=[counter.note()], extra={"gpu_uuid": gpu, **counter.evidence()}
+        stages,
+        notes=[counter.note(), *judgement.unfinished],
+        inconclusive=inconclusive_unless_failed(stages, judgement.unfinished),
+        extra={"gpu_uuid": gpu, **counter.evidence()},
     )
 
 
@@ -514,13 +549,8 @@ def independent_fatal_event(ctx: VariantContext) -> dict[str, Any]:
         _hold(ctx),
     )
     arm_and_confirm(repl, f"{gpu}/{canonical}")
-    detection = wait_gpu_incident(
-        ctx,
-        since,
-        lambda doc: metric_incidents(doc, canonical, gpu=gpu),
-        metrics=(canonical,),
-        timeout_seconds=survey.health_summary + 240,
-        name="detection",
+    detection = _wait_diagnosed(
+        ctx, since, canonical, gpu, timeout=survey.health_summary + 240
     )
     if not metric_incidents(detection, canonical, gpu=gpu):
         stages = {"counter": [f"no {canonical} finding on {gpu} reached an incident"]}
@@ -539,8 +569,9 @@ def independent_fatal_event(ctx: VariantContext) -> dict[str, Any]:
     injection.close()
     final = activity_now(ctx, since, metrics=(canonical,))
     counter_incidents = metric_incidents(final, canonical, gpu=gpu)
+    judgement = _diagnosed(final, canonical, gpu)
     stages = {
-        "counter_chain": _diag_chain(final, canonical, gpu),
+        "counter_chain": judgement.errors,
         "counter_read_only": read_only_errors(final, counter_incidents, canonical),
         "independent": independence_errors(
             decisions,
@@ -561,7 +592,9 @@ def independent_fatal_event(ctx: VariantContext) -> dict[str, Any]:
             f"{entry.catalog_version}: {entry.immediate_action} -> MONITOR_ONLY; the "
             "fatal-grade dispatch beside a counter diagnosis is not driven live here",
             counter.note(),
+            *judgement.unfinished,
         ],
+        inconclusive=inconclusive_unless_failed(stages, judgement.unfinished),
         extra={
             "gpu_uuid": gpu,
             "xid": INDEPENDENT_XID,
@@ -666,16 +699,12 @@ def over_rate_limit(ctx: VariantContext) -> dict[str, Any]:
         _hold(ctx),
     )
     arm_and_confirm(repl, f"{gpu}/pcie_replay_total")
-    detection = wait_gpu_incident(
-        ctx,
-        since,
-        lambda doc: metric_incidents(doc, "pcie_replay_total", gpu=gpu),
-        metrics=("pcie_replay_total",),
-        timeout_seconds=survey.health_summary + 240,
-        name="detection",
+    detection = _wait_diagnosed(
+        ctx, since, "pcie_replay_total", gpu, timeout=survey.health_summary + 240
     )
+    judgement = _diagnosed(detection, "pcie_replay_total", gpu)
     stages = {
-        "chain": _diag_chain(detection, "pcie_replay_total", gpu),
+        "chain": judgement.errors,
         "read_only": read_only_errors(
             detection,
             metric_incidents(detection, "pcie_replay_total", gpu=gpu),
@@ -684,7 +713,12 @@ def over_rate_limit(ctx: VariantContext) -> dict[str, Any]:
         "hardware": no_hardware(detection),
     }
     recover_counter(ctx, repl, since, names=["pcie_replay_total"])
-    return result(stages, extra={"gpu_uuid": gpu})
+    return result(
+        stages,
+        notes=list(judgement.unfinished),
+        inconclusive=inconclusive_unless_failed(stages, judgement.unfinished),
+        extra={"gpu_uuid": gpu},
+    )
 
 
 PCIE = "pcie_replay_total"

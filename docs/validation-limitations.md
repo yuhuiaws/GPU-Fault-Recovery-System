@@ -5201,6 +5201,99 @@ judged) and `hardware`. `stale_sample`, `recovered` and
 `tests/regional/test_general_live_gpu_links_reset.py`. The variant is rerun
 with the runner alone; no product release is needed.
 
+## GF-GENERAL-LIVE verdict strength: must-fail validations, negative windows and positive controls
+
+A stale-PASS audit of the board found oracles in the current runner that a
+rerun would pass the same way whatever the product did. Each one below was
+confirmed in the runner's code and is fixed in the harness; the product is
+unchanged.
+
+**019/020/022 diagnostic chains: "must fail" needs a verdict.**
+`general_live_gpu_verdicts.chain_errors` accepted any VALIDATE_GPU status but
+SUCCEEDED when the chain said the validation must fail, and 019
+`corrected_ecc`/`aggregate_dbe`/`retired_delta`, 020
+`crc`/`replay`/`recovery_counter`, the counter chain of 020
+`independent_fatal_event` and 022 `over_rate_limit` judged the first read that
+showed the incident. The product records VALIDATE_GPU WAITING until evidence
+newer than the step exists (`adapters/gpu_validation`; a WARNING memory finding
+first waits its 120 s transient-warning grace, then the next batch that
+re-judges it), so a step that had judged nothing satisfied "must fail". The
+general verdict path had been fixed the same way before; the GPU path had not.
+Now the detection wait polls until the judged workflow has a finished
+VALIDATE_GPU or has itself ended (`validation_judgeable`), within its budget
+(019's diagnostic budget adds the 120 s grace, `VALIDATION_GRACE_SECONDS`, and
+the counter rises for as long). A FAILED step satisfies "must fail" only when it
+names the held reading -- `active_gpu_health_findings` in
+`details.node_failures` and the held counter's canonical name on the held GPU in
+`details.node_findings` (`held_reading_named`); a failure on another reading is
+a FAIL. A step still WAITING when the wait ends, or one the executor's per-step
+cap ended (`step_waiting_timeout_seconds`), never judged the reading: the
+variant is INCONCLUSIVE with that reason (`ChainJudgement.unfinished`,
+`inconclusive_unless_failed`) unless another stage holds a definite error,
+which is a FAIL; `chain_errors`, for callers that take no INCONCLUSIVE, reads it
+as an error. `tests/regional/test_general_live_gpu_must_fail.py` pins the
+product side through the real DCGM collector delivery, `GpuMetricsService.ingest`
+and `GpuValidationAdapter.execute` (corrected ECC WAITING on its first attempt
+with `transient_gpu_warning_cooldown`, FAILED naming the held finding once a
+newer batch re-judged it; the aggregate DBE, NVLink and PCIe counters FAILED
+naming theirs) and runs every affected variant over the old shape -- the
+incident with VALIDATE_GPU WAITING on every read, which passed -- now
+INCONCLUSIVE.
+
+**019 recovery.** The diagnostic variants' `recovery` stage was
+`[] if ... else []`, and `recover_counter` returns its last read when its wait
+runs out, so "cleared by a fresh batch" was never checked. The stage
+(`cleared_errors`) now requires that no finding of the counter is active on the
+GPU and that the product accepted a reading of it below the replayed peak after
+the peak.
+
+**016 `user_text` / `old_boot`: the negative is proved on what the product
+received.** The only stimulus witness was the journal wrapper's emission count,
+and `no_finding` counted QUARANTINE incidents only. Both variants now read the
+control plane's own stored NODE_LOGS batches (`NODE_LOG_ENTRY_PROBE`,
+read-only): the reviewed record must be there under this run's replay cursor
+with the trait the gate refuses -- a `journal` origin whose transport is not
+kernel; a `dmesg` line stamped with the reviewed prior boot, not the
+collector's -- or the variant is INCONCLUSIVE. A finding of any grade the
+record produced (a marker naming its entry) fails the variant, as do a
+QUARANTINE node-log incident in the window and an isolated node.
+`tests/regional/test_general_live_kernel_negatives.py` runs both through the
+real journalctl wrapper, `NodeLogCollector`, control-plane API and in-memory
+store: the product stores the batch and grades it into nothing and the variant
+passes; a batch that never reached the control plane (the old PASS) is
+INCONCLUSIVE; a gate that let the line through as a diagnostic finding (the old
+PASS again) fails.
+
+**025 `sustained_unknown`.** The detection read was thrown away
+(`_ = detection`), so a product that minted nothing passed on the UNKNOWN
+observation alone. The variant now waits until the bounded chain has reached
+its validation, as `exporter_timeout` does, and, with the exporter still
+paused, requires the completeness incident, the planned TRIGGER_HEALTH_SNAPSHOT
+then VALIDATE_HOST with nothing hardware, and a VALIDATE_HOST that ran and has
+not passed; what the validation recorded at detection and after the sustain is
+kept in the result (`validation`).
+`tests/regional/test_general_live_sustained_unknown.py`.
+
+**003 `ambiguous_ownership`: the negative window.** It read the node once,
+LOW_DURATION plus three intervals (345 s) after the two jobs ran.
+LOW_GPU_UTILIZATION is sustained (`GPU_FAULT_LOW_UTILIZATION_DURATION_SECONDS`,
+300 s) on samples an idle node delivers only with its host health summaries
+(270-330 s apart): the first sample graded for an attempt can come one summary
+after the jobs ran, and the control plane mints on the first later sample at
+least 300 s after it (`store/shared/xid.py` `_next_health_signal_state`) -- up
+to 300 s plus two summaries, which the positive `gpu_idle` budget already
+allowed. A wrongly attributed finding minted after 345 s passed. The variant now
+watches `low_finding_window` (300 s + two summaries + one interval + 180 s
+margin, 1095 s at the defaults), ends at the first such incident (FAIL), and
+requires the product to have graded a low (at most 5 %)
+`host_gpu_utilization_percent` sample on the jobs' GPUs at least 300 s into the
+window (the latest-wins record); without one it is INCONCLUSIVE. Its
+`max_minutes` is 35. `tests/regional/test_general_live_ambiguous_ownership.py`.
+
+The DCGM replay, 003 and 016 result builders now record an INCONCLUSIVE's
+reasons (`inconclusive`, `detail` and `inconclusive: ...` errors). The variants
+above are re-run live on both clusters.
+
 ## GF-GENERAL-LIVE host-probe handle ownership and the dead-record sweep
 
 Read-only on both clusters on 2026-10-26 (22:4xZ): seven host-probe Pods in

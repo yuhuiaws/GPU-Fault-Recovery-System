@@ -54,6 +54,7 @@ follows each record through its own finding's marker.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from scripts.e2e.regional.general_live_common import activity
@@ -90,6 +91,52 @@ ENABLE = "ENABLE_NODE_LOG_COLLECTOR"
 DETECTION_BUDGET = 420
 SETTLE_BUDGET = 420
 ISOLATION_OPERATIONS = ("MARK_UNSCHEDULABLE", "QUARANTINE")
+#: The boot id ``old_boot``'s reviewed record carries: never a node's own.
+OLD_BOOT_ID = "00000000-0000-0000-0000-0000deadbeef"
+
+#: The reviewed entries the control plane itself received: every NODE_LOGS batch
+#: the product stored for the node since a moment -- ``app/ingest/telemetry.py``
+#: keeps each batch with entries, the one ``host_health.evaluate_logs`` graded in
+#: the same transaction -- reduced to the entries whose entry id (the replay
+#: cursor, ``replay_entry_prefix``) starts with a prefix. Read-only.
+NODE_LOG_ENTRY_PROBE = r"""
+import json
+import sys
+from datetime import datetime
+
+from gpu_fault.app import ApplicationContext
+from gpu_fault.telemetry import EvidenceKind
+
+cluster_id, node_id, since_text, prefix = sys.argv[1:5]
+since = datetime.fromisoformat(since_text.replace("Z", "+00:00"))
+store = ApplicationContext.from_environment().store
+entries = []
+for item in store.list_raw_evidence(
+    cluster_id, node_id=node_id, kind=EvidenceKind.NODE_LOGS, limit=2000
+):
+    if item.observed_at < since:
+        continue
+    payload = item.payload if isinstance(item.payload, dict) else {}
+    for entry in payload.get("entries") or []:
+        if not isinstance(entry, dict):
+            continue
+        if not str(entry.get("entry_id") or "").startswith(prefix):
+            continue
+        fields = entry.get("fields") or {}
+        entries.append({
+            "record_id": item.record_id,
+            "batch_id": payload.get("batch_id"),
+            "collected_at": item.observed_at.isoformat(),
+            "entry_id": entry.get("entry_id"),
+            "source": entry.get("source"),
+            "transport": fields.get("_TRANSPORT"),
+            "boot_id": fields.get("_BOOT_ID"),
+            "collector_boot_id": fields.get("_COLLECTOR_BOOT_ID"),
+            "message": str(entry.get("message") or "")[:200],
+        })
+entries.sort(key=lambda item: item["collected_at"])
+print(json.dumps({"entries": entries}, sort_keys=True, default=str))
+"""
 
 
 # --------------------------------------------------------------------------- #
@@ -303,28 +350,143 @@ def corrected_mce(ctx: VariantContext) -> dict[str, Any]:
     )
 
 
+def received_entries(
+    ctx: VariantContext, since: Any, prefix: str
+) -> list[dict[str, Any]]:
+    """The control plane's own copy of the reviewed record since ``since``
+    (``NODE_LOG_ENTRY_PROBE``): the batches it stored and graded that carry
+    an entry id starting with ``prefix``."""
+
+    value = ctx.regional.cpu_python(
+        NODE_LOG_ENTRY_PROBE,
+        ctx.settings.regional.cluster_id,
+        ctx.settings.node,
+        since.isoformat(),
+        prefix,
+        timeout=120,
+    )
+    return [item for item in value.get("entries") or [] if isinstance(item, dict)]
+
+
+def replay_findings(activity_document: dict[str, Any], prefix: str) -> list[str]:
+    """Every finding the product made of the reviewed record, whatever its grade.
+
+    Each finding writes its marker before ingestion picks the incident, and the
+    marker names the entry it was read from (``raw_evidence_ref`` =
+    ``<origin>://<node>/<entry id>``): the record's own incident and one it
+    joined both show. The preflight leaves the node no open incident, so any
+    incident such a finding could reach was minted inside the read.
+    """
+
+    errors = []
+    for marker in activity_document.get("markers") or []:
+        entry_id = str(marker.get("raw_evidence_ref") or "").rpartition("/")[2]
+        if entry_id.startswith(prefix):
+            errors.append(
+                f"the reviewed record {entry_id} produced a finding: marker "
+                f"{marker.get('marker_id')} on incident "
+                f"{marker.get('incident_id') or '(none)'}"
+            )
+    return errors
+
+
+#: What a received copy of a negative's record must show (None) or why not.
+Expectation = Callable[[dict[str, Any]], str | None]
+
+
+def unread_reasons(
+    received: list[dict[str, Any]],
+    findings: list[str],
+    expect: Expectation,
+) -> list[str]:
+    """Why the negative is unproven: the product never received the reviewed
+    record (and nothing it graded names it), or received it without the trait
+    the gate must refuse (``expect`` names the mismatch, None when it holds)."""
+
+    if not received:
+        if findings:
+            return []
+        return [
+            "the control plane stored no NODE_LOGS batch carrying the reviewed "
+            "record: the collector never delivered it, so 'no finding' proves "
+            "nothing about the gate"
+        ]
+    return sorted({reason for item in received if (reason := expect(item))})
+
+
 def _negative_variant(
-    ctx: VariantContext, records: list[dict[str, Any]], note: str
+    ctx: VariantContext,
+    records: list[dict[str, Any]],
+    note: str,
+    *,
+    expect: Expectation,
 ) -> dict[str, Any]:
-    """A reviewed record that the trust/boot gate must drop: no isolation."""
+    """A reviewed record that the trust/boot gate must drop: no finding at all.
+
+    The negative is proved on the product's records: the control plane received
+    the record with the trait the gate refuses (``received_entries`` -- else the
+    variant is INCONCLUSIVE), and no marker or incident came of it, whatever its
+    grade, within a full detection budget. The wrapper's emission count only
+    says the record left the node's journal wrapper.
+    """
 
     started, _ = _drive(ctx, records, restore_seconds=ctx.spec.max_minutes * 60)
+    prefix = replay_entry_prefix(ctx.run_id, 0)
     # Hold a full detection budget; the correct behaviour is that nothing fires.
     ctx.hold(min(DETECTION_BUDGET, ctx.spec.max_minutes * 60 - 120), name="negative")
     observed = activity(ctx, started, kinds=("NODE_LOGS",))
-    incidents = _log_incidents(observed)
+    received = received_entries(ctx, started, prefix)
+    ctx.evidence.write("negative-received", {"prefix": prefix, "entries": received})
+    findings = replay_findings(observed, prefix)
     stages = {
         "no_finding": [
-            f"an untrusted/old-boot kernel line produced an incident: {item['incident_id']}"
-            for item in incidents
-            if item.get("effective_action") == "QUARANTINE"
+            *findings,
+            *(
+                "a severe node-log incident was minted in the window: "
+                f"{item['incident_id']}"
+                for item in _log_incidents(observed)
+                if item.get("effective_action") == "QUARANTINE"
+            ),
         ],
         "not_isolated": ["node isolated by an untrusted/old-boot kernel line"]
         if node_isolated(ctx.regional.node_snapshot(ctx.settings.node))
         else [],
         "hardware": hardware_errors(observed),
     }
-    return _result(ctx, stages, notes=[note])
+    return _result(
+        ctx,
+        stages,
+        notes=[note],
+        extra={"received": received[:8]},
+        inconclusive=unread_reasons(received, findings, expect),
+    )
+
+
+def _user_space(entry: dict[str, Any]) -> str | None:
+    if entry.get("source") == "journal" and entry.get("transport") != "kernel":
+        return None
+    return (
+        f"the control plane received the reviewed record as {entry.get('source')} "
+        f"(transport {entry.get('transport')}), not the user-space journal origin "
+        "the gate must refuse"
+    )
+
+
+def _prior_boot(entry: dict[str, Any]) -> str | None:
+    def plain(value: Any) -> str:
+        return str(value or "").replace("-", "").lower()
+
+    if (
+        entry.get("source") == "dmesg"
+        and plain(entry.get("boot_id")) == plain(OLD_BOOT_ID)
+        and plain(entry.get("boot_id")) != plain(entry.get("collector_boot_id"))
+    ):
+        return None
+    return (
+        f"the control plane received the reviewed record as {entry.get('source')} "
+        f"with boot id {entry.get('boot_id')} (collector boot "
+        f"{entry.get('collector_boot_id')}), not a prior boot's kernel line"
+    )
 
 
 def user_text(ctx: VariantContext) -> dict[str, Any]:
@@ -333,18 +495,17 @@ def user_text(ctx: VariantContext) -> dict[str, Any]:
         ctx,
         records,
         "a user-space (journal, non-kernel transport) line is never trusted",
+        expect=_user_space,
     )
 
 
 def old_boot(ctx: VariantContext) -> dict[str, Any]:
-    records = _severe(
-        SEVERE_MESSAGES["uncorrectable_mce"],
-        boot_id="00000000-0000-0000-0000-0000deadbeef",
-    )
+    records = _severe(SEVERE_MESSAGES["uncorrectable_mce"], boot_id=OLD_BOOT_ID)
     return _negative_variant(
         ctx,
         records,
         "a kernel line from a prior boot must not isolate the current boot",
+        expect=_prior_boot,
     )
 
 
@@ -519,15 +680,21 @@ def _result(
     *,
     notes: list[str] | None = None,
     extra: dict[str, Any] | None = None,
+    inconclusive: list[str] | None = None,
 ) -> dict[str, Any]:
+    # An INCONCLUSIVE carries its reason: ``detail`` for the runner, the errors
+    # list for the board (as ``general_live_spares``).
+    reasons = list(inconclusive or [])
     return {
-        "verdict": verdict(stages),
+        "verdict": verdict(stages, inconclusive=reasons),
         "stages": stages,
         "errors": [
             f"{stage}: {error}" for stage, items in stages.items() for error in items
-        ],
+        ]
+        + [f"inconclusive: {item}" for item in reasons],
         "notes": notes or [],
         "proof_scope": "live-replay",
+        **({"inconclusive": reasons, "detail": "; ".join(reasons)} if reasons else {}),
         **(extra or {}),
     }
 

@@ -19,6 +19,7 @@ import pytest
 from gpu_fault.host_health import NodeHealthPolicy, NodeLogBatch, NodeLogEntry
 from gpu_fault.models import RecoveryAction, Severity
 from scripts.e2e.regional import general_live_kernel as mod
+from scripts.e2e.regional.general_live_kernel_replay import replay_entry_prefix
 from scripts.e2e.regional.general_live_registry import coverage_rows
 from tests._builders import build_store
 from tests.regional._general_live_fakes import (
@@ -300,13 +301,108 @@ def test_corrected_mce_is_diagnostic_not_isolation(tmp_path: Path) -> None:
     assert result["verdict"] == "PASS", result["errors"]
 
 
+BOOT = "7679ce8a-3ab8-484a-8d34-4ca9eab39fe5"
+
+
+def _received(variant: str, **entry: object) -> list[dict[str, object]]:
+    """``NODE_LOG_ENTRY_PROBE``'s answer: the control plane stored the reviewed
+    record under this run's replay cursor (``_ctx`` names the run)."""
+
+    run = f"gl-{variant.replace('_', '-')}-a1-deadbeef"
+    return [
+        {
+            "record_id": "node-logs/logs-1",
+            "batch_id": "logs-1",
+            "collected_at": "2026-10-24T00:01:00+00:00",
+            "entry_id": replay_entry_prefix(run, 0) + BOOT,
+            "source": "journal",
+            "transport": "syslog",
+            "boot_id": BOOT,
+            "collector_boot_id": BOOT,
+            "message": mod.SEVERE_MESSAGES["uncorrectable_mce"],
+            **entry,
+        }
+    ]
+
+
+def _negative_store(
+    activity: dict[str, object], received: list[dict[str, object]]
+) -> object:
+    store = store_script({"activity": activity})
+
+    def dispatch(script: str, *arguments: str) -> dict[str, object]:
+        if script == mod.NODE_LOG_ENTRY_PROBE:
+            return {"entries": received}
+        return store(script, *arguments)
+
+    return dispatch
+
+
 def test_user_text_produces_no_finding(tmp_path: Path) -> None:
     regional = FakeRegional(
-        cpu_python=store_script({"activity": _activity(incidents=[], workflows=[])}),
+        cpu_python=_negative_store(
+            _activity(incidents=[], workflows=[]), _received("user_text")
+        ),
         node_snapshot=_isolated_node(False),
     )
     ctx, _ = _ctx("user_text", regional=regional, tmp_path=tmp_path)
     result = mod.user_text(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    assert result["received"][0]["source"] == "journal", result["received"]
+
+
+def test_user_text_is_inconclusive_when_the_product_never_received_it(
+    tmp_path: Path,
+) -> None:
+    """The old pass: the wrapper's emission count and an empty activity read.
+    Nothing says the control plane ever graded the line."""
+
+    regional = FakeRegional(
+        cpu_python=_negative_store(_activity(incidents=[], workflows=[]), []),
+        node_snapshot=_isolated_node(False),
+    )
+    ctx, _ = _ctx("user_text", regional=regional, tmp_path=tmp_path)
+    result = mod.user_text(ctx)
+    assert result["verdict"] == "INCONCLUSIVE", result
+    assert "stored no NODE_LOGS batch carrying the reviewed record" in result["detail"]
+
+
+@pytest.mark.parametrize(
+    "variant,entry,wanted",
+    [
+        ("user_text", {"source": "dmesg", "transport": "kernel"}, "user-space"),
+        ("old_boot", {"source": "dmesg", "transport": "kernel"}, "prior boot"),
+    ],
+)
+def test_a_record_received_without_the_refused_trait_is_inconclusive(
+    tmp_path: Path, variant: str, entry: dict[str, object], wanted: str
+) -> None:
+    """The gate's refusal is only proved on the trait it refuses: a user_text
+    line that arrived as a kernel line, an old_boot line stamped with the
+    current boot."""
+
+    regional = FakeRegional(
+        cpu_python=_negative_store(
+            _activity(incidents=[], workflows=[]), _received(variant, **entry)
+        ),
+        node_snapshot=_isolated_node(False),
+    )
+    ctx, _ = _ctx(variant, regional=regional, tmp_path=tmp_path)
+    result = getattr(mod, variant)(ctx)
+    assert result["verdict"] == "INCONCLUSIVE", result
+    assert wanted in result["detail"], result["detail"]
+
+
+def test_old_boot_passes_on_a_prior_boot_kernel_line(tmp_path: Path) -> None:
+    received = _received(
+        "old_boot", source="dmesg", transport="kernel", boot_id=mod.OLD_BOOT_ID
+    )
+    regional = FakeRegional(
+        cpu_python=_negative_store(_activity(incidents=[], workflows=[]), received),
+        node_snapshot=_isolated_node(False),
+    )
+    ctx, _ = _ctx("old_boot", regional=regional, tmp_path=tmp_path)
+    result = mod.old_boot(ctx)
     assert result["verdict"] == "PASS", result["errors"]
 
 
@@ -316,12 +412,49 @@ def test_user_text_fails_if_it_isolates(tmp_path: Path) -> None:
         workflows=[_log_workflow(["FREEZE_EVIDENCE", "QUARANTINE"])],
     )
     regional = FakeRegional(
-        cpu_python=store_script({"activity": activity}),
+        cpu_python=_negative_store(activity, _received("user_text")),
         node_snapshot=_isolated_node(True),
     )
     ctx, _ = _ctx("user_text", regional=regional, tmp_path=tmp_path)
     result = mod.user_text(ctx)
     assert result["verdict"] == "FAIL", result
+
+
+def test_any_finding_of_the_reviewed_record_fails_a_negative(tmp_path: Path) -> None:
+    """Not only a QUARANTINE: a diagnostic finding the record produced is a
+    finding the gate should never have let through (the old stage counted
+    QUARANTINE incidents only). Its marker names the replay cursor."""
+
+    [entry] = _received("user_text")
+    incident = _log_incident(
+        policy_source="SITE_APPLICATION_LOG",
+        action="RUN_DIAGNOSTICS",
+        state="ACTION_PENDING",
+    )
+    marker = {
+        "marker_id": "marker-log-1",
+        "incident_id": incident["incident_id"],
+        "raw_evidence_ref": f"journal://{NODE}/{entry['entry_id']}",
+    }
+    activity = _activity(
+        incidents=[incident],
+        workflows=[_log_workflow(["FREEZE_EVIDENCE", "VALIDATE_HOST"])],
+        markers=[marker],
+    )
+    for received in ([entry], []):
+        regional = FakeRegional(
+            cpu_python=_negative_store(activity, received),
+            node_snapshot=_isolated_node(False),
+        )
+        ctx, _ = _ctx(
+            "user_text", regional=regional, tmp_path=tmp_path / str(len(received))
+        )
+        result = mod.user_text(ctx)
+        assert result["verdict"] == "FAIL", (received, result)
+        assert result["stages"]["no_finding"] == [
+            f"the reviewed record {entry['entry_id']} produced a finding: marker "
+            f"marker-log-1 on incident {incident['incident_id']}"
+        ], result["stages"]
 
 
 def test_unknown_attempt_isolates_without_stop(tmp_path: Path) -> None:

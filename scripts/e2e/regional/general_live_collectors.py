@@ -405,11 +405,37 @@ def exporter_timeout(ctx: VariantContext) -> dict[str, Any]:
     )
 
 
+def _held_validation_errors(document: dict[str, Any]) -> list[str]:
+    """The observation validation ran while the exporter was still paused:
+    the chain's VALIDATE_HOST has a record (WAITING by design until fresh
+    GPU_METRICS evidence exists -- ``_paused_errors`` fails a SUCCEEDED one)."""
+
+    workflow = _completion_workflow(document)
+    if workflow is None:
+        return []  # no chain at all: ``_paused_errors`` names it
+    if _validation_execution(document) is not None:
+        return []
+    executed = [item.get("operation") for item in workflow.get("step_executions") or []]
+    return [
+        f"the bounded chain never ran its {VALIDATION} while the exporter was "
+        f"paused (workflow {workflow.get('status')}, executed {executed})"
+    ]
+
+
 def sustained_unknown(ctx: VariantContext) -> dict[str, Any]:
+    """Pause the exporter past the sustain window: the completeness incident,
+    its bounded chain (TRIGGER_HEALTH_SNAPSHOT then the observation
+    VALIDATE_HOST, nothing hardware), a validation that ran and has not passed
+    while paused, the observation UNKNOWN throughout, and a fresh success after
+    the resume. The detection read used to be thrown away (``_ = detection``):
+    a run in which the product minted nothing passed on UNKNOWN alone."""
+
     started = utc_now()
     hold = DCGM_BUDGET + 120
     _pause_exporter(ctx, hold + 120)
-    detection = _wait_completion_error(ctx, started, name="dcgm-unknown")
+    detection = _wait_completion_error(
+        ctx, started, name="dcgm-unknown", until=_validation_reached
+    )
     # Keep it paused past the sustain window; the observation stays UNKNOWN and
     # the chain is the bounded snapshot + validation, not a hardware step.
     ctx.hold(
@@ -418,7 +444,10 @@ def sustained_unknown(ctx: VariantContext) -> dict[str, Any]:
     final = activity(
         ctx, started, metrics={"collector_observation_valid"}, kinds=("GPU_METRICS",)
     )
+    execution = _validation_execution(final)
     stages = {
+        "detection": _paused_errors(final, execution),
+        "validation": _held_validation_errors(final),
         "unknown": _observation_unknown(final, "GPU_METRICS"),
         "hardware": hardware_errors(final),
         "bounded": _snapshot_only(final),
@@ -427,8 +456,28 @@ def sustained_unknown(ctx: VariantContext) -> dict[str, Any]:
     ctx.cleanup.discard("exporter")
     recovered = _await_fresh_success(ctx, "GPU_METRICS")
     stages["recovery"] = recovered["errors"]
-    _ = detection
-    return _result(stages)
+    return _result(
+        stages,
+        extra={
+            "validation": {
+                "at_detection": _paused_view(_validation_execution(detection)),
+                "after_sustain": _paused_view(execution),
+            }
+        },
+    )
+
+
+def _paused_view(execution: dict[str, Any] | None) -> dict[str, Any] | None:
+    """What a VALIDATE_HOST record said while the exporter was paused."""
+
+    if execution is None:
+        return None
+    details = execution.get("details") or {}
+    return {
+        "status": execution.get("status"),
+        "pending": pending_summary(execution),
+        **{key: details[key] for key in WAITING_DETAIL_KEYS if key in details},
+    }
 
 
 def post_refresh_success(ctx: VariantContext) -> dict[str, Any]:

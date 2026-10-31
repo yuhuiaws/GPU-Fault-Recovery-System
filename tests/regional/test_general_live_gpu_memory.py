@@ -18,15 +18,18 @@ from tests.regional._general_live_fakes import (
 )
 from tests.regional._general_live_gpu_fakes import (
     audit_records,
+    cleared_state,
     dcgm_probe,
     gpu_cpu_python,
     gpu_incident,
     gpu_workflow,
+    held_failure,
     survey,
 )
 
 SPECS = {spec.variant: spec for spec in mem.VARIANTS}
 GPU = "GPU-11111111-1111-4111-8111-111111111111"
+SBE = "ecc_sbe_volatile_total"
 
 
 def _ctx(tmp_path: Path, variant: str, *, probe: Any, cpu: Any, settings: Any = None):
@@ -51,32 +54,21 @@ def test_registry_covers_every_019_variant() -> None:
 
 
 def test_corrected_ecc_is_a_clean_diagnostic_chain(tmp_path: Path) -> None:
-    incident = gpu_incident(
-        "inc-ecc", f"b-{GPU}-ecc_sbe_volatile_total", state="RECOVERED"
-    )
+    incident = gpu_incident("inc-ecc", f"b-{GPU}-{SBE}", state="RECOVERED")
     workflow = gpu_workflow(
         "wf-1",
         "inc-ecc",
         ["FREEZE_EVIDENCE", "VALIDATE_GPU"],
         status="FAILED",
-        executions=[
-            {
-                "operation": "VALIDATE_GPU",
-                "status": "FAILED",
-                "details": {"host_diagnostic_failure": True},
-            }
-        ],
+        executions=[held_failure(SBE, GPU)],
     )
     activity = {**_activity([incident], [workflow]), "batches": [{"observed_at": "t"}]}
-    probe = dcgm_probe(audit=audit_records({f"{GPU}/ecc_sbe_volatile_total": 1.0}))
+    probe = dcgm_probe(audit=audit_records({f"{GPU}/{SBE}": 1.0}))
     ctx = _ctx(
         tmp_path,
         "corrected_ecc",
         probe=probe,
-        cpu=gpu_cpu_python(
-            activity=activity,
-            gpu_state={"active_findings": [], "batches": [{"observed_at": "t"}]},
-        ),
+        cpu=gpu_cpu_python(activity=activity, gpu_state=cleared_state(SBE, GPU)),
     )
     out = mem.corrected_ecc(ctx)
     assert out["verdict"] == "PASS", out["errors"]
@@ -215,33 +207,23 @@ def test_no_019_plan_holds_a_step(
     needs it; nothing waits for the runner to advance or close it."""
 
     plans: dict[str, dict[str, Any]] = {}
-    # corrected_ecc: the detection wait (health summary 300 + 240) at 15 s.
-    incident = gpu_incident(
-        "inc-ecc", f"b-{GPU}-ecc_sbe_volatile_total", state="RECOVERED"
-    )
+    # corrected_ecc: the detection wait (health summary 300 + 240) and the
+    # validation's grace (120) at 15 s.
+    incident = gpu_incident("inc-ecc", f"b-{GPU}-{SBE}", state="RECOVERED")
     workflow = gpu_workflow(
         "wf-1",
         "inc-ecc",
         ["FREEZE_EVIDENCE", "VALIDATE_GPU"],
         status="FAILED",
-        executions=[
-            {
-                "operation": "VALIDATE_GPU",
-                "status": "FAILED",
-                "details": {"host_diagnostic_failure": True},
-            }
-        ],
+        executions=[held_failure(SBE, GPU)],
     )
     activity = {**_activity([incident], [workflow]), "batches": [{"observed_at": "t"}]}
-    probe = dcgm_probe(audit=audit_records({f"{GPU}/ecc_sbe_volatile_total": 1.0}))
+    probe = dcgm_probe(audit=audit_records({f"{GPU}/{SBE}": 1.0}))
     ctx = _ctx(
         tmp_path / "ecc",
         "corrected_ecc",
         probe=probe,
-        cpu=gpu_cpu_python(
-            activity=activity,
-            gpu_state={"active_findings": [], "batches": [{"observed_at": "t"}]},
-        ),
+        cpu=gpu_cpu_python(activity=activity, gpu_state=cleared_state(SBE, GPU)),
     )
     assert mem.corrected_ecc(ctx)["verdict"] == "PASS"
     plans["corrected_ecc"] = _installed_plan(probe)
@@ -275,7 +257,7 @@ def test_no_019_plan_holds_a_step(
     assert mem.remap_failure(ctx)["verdict"] == "PASS"
     plans["remap_failure"] = _installed_plan(ctx.probes[f"dcgm@{NODE}"])
 
-    expected_reads = {"corrected_ecc": 38, "volatile_dbe": 50, "remap_failure": 50}
+    expected_reads = {"corrected_ecc": 46, "volatile_dbe": 50, "remap_failure": 50}
     for variant, document in plans.items():
         assert "until_advance" not in json.dumps(document), variant
         baseline, fault = document["steps"]

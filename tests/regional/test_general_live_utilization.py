@@ -589,10 +589,22 @@ def test_scratch_full_inconclusive_below_90(tmp_path: Path) -> None:
 
 
 def test_idle_node_and_ambiguous_ownership_pass(tmp_path: Path) -> None:
+    def graded(arguments: tuple[str, ...]) -> dict[str, Any]:
+        # ambiguous_ownership's positive control: the jobs' GPU graded idle on
+        # a summary past the sustain (``test_general_live_ambiguous_ownership``).
+        at = datetime.fromisoformat(arguments[2]) + timedelta(seconds=400)
+        sample = {
+            "name": "host_gpu_utilization_percent",
+            "device": "GPU-1",
+            "value": 0.0,
+            "observed_at": at.isoformat(),
+        }
+        return {**empty(), "since": arguments[2], "metric_latest": [sample]}
+
     for variant in ("idle_node", "ambiguous_ownership"):
         spec = SPECS[variant]
         settings = _settings(spec, tmp_path)
-        regional = FakeRegional(cpu_python=store_script({"activity": empty()}))
+        regional = FakeRegional(cpu_python=store_script({"activity": graded}))
         ctx = make_context(
             spec,
             tmp_path=tmp_path,

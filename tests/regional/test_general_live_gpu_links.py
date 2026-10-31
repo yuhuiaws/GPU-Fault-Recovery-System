@@ -24,6 +24,7 @@ from tests.regional._general_live_gpu_fakes import (
     gpu_cpu_python,
     gpu_incident,
     gpu_workflow,
+    held_failure,
     survey,
 )
 from tools import gpu_dcgm_field_replay as tool
@@ -92,13 +93,7 @@ def test_crc_is_a_clean_nvlink_diagnostic(tmp_path: Path) -> None:
         "inc",
         ["FREEZE_EVIDENCE", "VALIDATE_GPU"],
         status="FAILED",
-        executions=[
-            {
-                "operation": "VALIDATE_GPU",
-                "status": "FAILED",
-                "details": {"host_diagnostic_failure": True},
-            }
-        ],
+        executions=[held_failure(canonical, G1)],
     )
     cpu = gpu_cpu_python(
         activity=_activity([inc], [wf]),
@@ -276,13 +271,7 @@ def _independent_ctx(
         "inc-0",
         ["FREEZE_EVIDENCE", "VALIDATE_GPU"],
         status="FAILED",
-        executions=[
-            {
-                "operation": "VALIDATE_GPU",
-                "status": "FAILED",
-                "details": {"host_diagnostic_failure": True},
-            }
-        ],
+        executions=[held_failure(canonical, G1)],
     )
     records = gpu_cpu_python(
         activity=_activity(incidents, [wf]),
@@ -560,13 +549,7 @@ def _pass_records(
         "inc",
         ["FREEZE_EVIDENCE", "VALIDATE_GPU"],
         status="FAILED",
-        executions=[
-            {
-                "operation": "VALIDATE_GPU",
-                "status": "FAILED",
-                "details": {"host_diagnostic_failure": True},
-            }
-        ],
+        executions=[held_failure(canonical, G1)],
     )
     served = audit_records({f"{G1}/{canonical}": 1.0})
     if variant in {"crc", "replay", "recovery_counter", "recovered"}:

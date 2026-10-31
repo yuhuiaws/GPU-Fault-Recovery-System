@@ -1421,18 +1421,22 @@ def result(
     """Assemble a variant result from its per-stage error lists.
 
     ``proof_scope`` is always ``live-replay``: this lane only proves the
-    processing chain, never the physical fault.
+    processing chain, never the physical fault. An INCONCLUSIVE carries its
+    reasons (``inconclusive``, ``detail``, and the errors the board shows).
     """
 
+    reasons = list(inconclusive or [])
     return {
-        "verdict": verdict(stages, inconclusive=inconclusive),
+        "verdict": verdict(stages, inconclusive=reasons),
         "proof_scope": "live-replay",
         "physical_fault_injected": False,
         "stages": stages,
         "errors": [
             f"{stage}: {error}" for stage, items in stages.items() for error in items
-        ],
+        ]
+        + [f"inconclusive: {item}" for item in reasons],
         "notes": notes or [],
+        **({"inconclusive": reasons, "detail": "; ".join(reasons)} if reasons else {}),
         **(extra or {}),
     }
 

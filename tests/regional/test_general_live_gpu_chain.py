@@ -10,7 +10,11 @@ from scripts.e2e.regional.general_live_gpu_verdicts import (
     chain_executed,
     never_executed_errors,
 )
-from tests.regional._general_live_gpu_fakes import gpu_incident, gpu_workflow
+from tests.regional._general_live_gpu_fakes import (
+    gpu_incident,
+    gpu_workflow,
+    held_failure,
+)
 
 GPU = "GPU-11111111-1111-4111-8111-111111111111"
 DRAIN_STEPS = [
@@ -188,7 +192,7 @@ def test_diagnostic_only_chains_are_unchanged() -> None:
         "inc-ecc",
         ["FREEZE_EVIDENCE", "VALIDATE_GPU"],
         status="FAILED",
-        executions=[{"operation": "VALIDATE_GPU", "status": "FAILED"}],
+        executions=[held_failure("ecc_sbe_volatile_total", GPU)],
     )
     assert chain_errors(_activity(inc, wf), [inc], DIAGNOSTIC) == [], (
         "no isolating step: only the validation's execution is judged, as before"

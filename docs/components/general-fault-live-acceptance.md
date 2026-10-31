@@ -188,6 +188,13 @@ RUN_DCGM_DIAGNOSTIC/硬件步骤，incident 带 attempt id。验证步骤在更�
 WAITING，所有判定验证的等待都等到该步骤终态（或 workflow 终态）再判，判定所用的
 incident/workflow 记录存为 `<wait>-chain.json`。
 
+`ambiguous_ownership` 的否定窗口按产品节奏取：LOW_GPU_UTILIZATION 是持续型规则（300 秒），空闲节点的
+GPU 读数只随主机健康摘要投递（270–330 秒一次），产品为 attempt 判到的第一个样本可能在任务就绪后一个摘要才到，
+铸造要等其后至少 300 秒的下一个样本——最多 300 秒加两个摘要。原先只在 345 秒读一次，错误归属在此之后铸造的
+finding 读不到。现在在 `low_finding_window`（300 秒 + 2×摘要 + 采集间隔 + 180 秒余量，默认 1095 秒）内持续
+观察，一出现即 `FAIL`；并以产品在窗口开始 300 秒后、任务 GPU 上判过的一个 ≤5% 的
+`host_gpu_utilization_percent` 样本（latest-wins 记录）作正向对照，没有则 `INCONCLUSIVE`。
+
 ### GF-GENERAL-LIVE-004
 
 必测：`capacity_full`、`below_threshold`、`inode_full`、`read_only`、
@@ -741,6 +748,12 @@ marker，`raw_evidence_ref` 指明读取的条目（`dmesg://<节点>/<回放 cu
 `tests/regional/test_general_live_kernel_burst.py` 把变体自己的记录经探针 wrapper、真实采集器、控制面
 API 与 activity 探针跑通，判定对照的是产品真实写出的记录而不是手写文档。
 
+`user_text`/`old_boot` 的否定以产品收到的记录为证：只读探针 `NODE_LOG_ENTRY_PROBE` 读控制面自己存下并已判定的
+NODE_LOGS 批次，本次运行回放 cursor 下的受检记录必须在其中，且带有闸门应拒绝的特征（`user_text`：来源 journal、
+transport 非 kernel；`old_boot`：dmesg 行，boot id 是受检的旧 boot 而非采集器当前 boot），否则 `INCONCLUSIVE`
+（原先只看 wrapper 的发射计数）。该记录产生的任何级别的 finding（marker 指向其 entry）、窗口内的 QUARANTINE
+节点日志 incident 或节点被隔离都判 `FAIL`（原先只数 QUARANTINE incident）。
+
 ### GF-GENERAL-LIVE-017
 
 必测：`cgroup_oom`、`nccl_error`、`distributed_error`、`live_pid`、`exited_pid`、
@@ -934,6 +947,14 @@ barrier、`next_rung`、工具服务端对失效上游不消耗读）、
 health summary 会提前铸造，而 arm 避让把该窗口移到相位之后）与
 `tests/regional/test_general_live_gpu_memory.py`（019 无任何 hold 步骤）。
 
+诊断类变体（`corrected_ecc`、`aggregate_dbe`、`retired_delta`）的 VALIDATE_GPU 必须真正失败：检测等待到该步骤
+有终态（或 workflow 终态）为止，预算在检测之上加 120 秒瞬时告警宽限（`VALIDATION_GRACE_SECONDS`，计数器在整个
+等待中持续上升）；FAILED 必须在 `node_failures` 写明 `active_gpu_health_findings`，且 `node_findings` 点名被保持
+的计数器与 GPU，否则 `FAIL`；等待结束仍为 WAITING、或被执行器单步上限结束，则 `INCONCLUSIVE`（另有确定错误时
+`FAIL`）。原先首次读到 incident 时 VALIDATE_GPU 仍是 WAITING（SBE 先等 120 秒宽限），却满足了“必须失败”。
+`recovery` 阶段原先恒为空，现在要求回放结束后该计数器在该 GPU 上的 finding 不再活动，且产品接受了峰值之后
+低于峰值的读数（新批次清除）。
+
 ### GF-GENERAL-LIVE-020
 
 必测：`crc`、`replay`、`recovery_counter`、`multiple_gpus`、
@@ -966,6 +987,9 @@ WARNING 的前提，判定不受此影响。
 独立致命Xid/SXid必须由对应原始源进入并按其catalog处置，不能被counter诊断吸收丢失。
 记录链路、组件/复合finding和各自执行回执；恢复要求新正常增量与通信验证，
 不要求累计值归零。自然链路坏损的物理验证另列，不拔链路当通用注入方法。
+
+`crc`、`replay`、`recovery_counter` 与 `independent_fatal_event` 的计数器链按 019 诊断类变体的规则判“必须失败”：
+VALIDATE_GPU 以点名被保持计数器的 FAILED 收尾才算，等待到有终态为止，WAITING 到期为 `INCONCLUSIVE`。
 
 ### GF-GENERAL-LIVE-021
 
@@ -1152,6 +1176,8 @@ hostengine 重启会清掉它）；计划在
 消失不改变判定——唯一痕迹是产品的 gauge 基线留在 32，下一计划的 0 会重置它
 （`tests/test_gpu_dcgm_field_replay.py`、`tests/regional/test_general_live_gpu_links.py`）。三个变体
 需在两集群重跑。
+
+`over_rate_limit` 的 VALIDATE_GPU 同样必须以点名 `pcie_replay_total` 的 FAILED 收尾（规则同 019 诊断类变体）。
 
 ### GF-GENERAL-LIVE-024
 
@@ -1368,6 +1394,10 @@ GPU observation` 且一个都不保留，`GpuMetricsService.ingest` 只为被接
 latest 行移动、门控窗口、重复槽位与缺字段的同类用例）、`tests/collectors/test_dcgm_per_gpu_completeness.py`
 （served 文本 → 采集器 → 控制面 ingest → store 的产品钉：两个样本都转发、候选确认时投递、整槽丢弃、保留早先
 读数及其时间、不开 finding、单名抓取即恢复边沿）。两集群仅用运行器重跑，不需要产品发布。
+
+`sustained_unknown` 不再丢弃检测结果：等待到有界链到达其验证，仍在暂停时要求 completeness incident、计划中的
+TRIGGER_HEALTH_SNAPSHOT→VALIDATE_HOST（无硬件步骤）、VALIDATE_HOST 已运行且未通过；原先产品什么都不铸造也只凭
+UNKNOWN 判 `PASS`。
 
 ### GF-GENERAL-LIVE-026
 

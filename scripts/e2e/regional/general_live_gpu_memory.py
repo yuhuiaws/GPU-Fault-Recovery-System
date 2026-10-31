@@ -92,13 +92,19 @@ from scripts.e2e.regional.general_live_gpu_replay import (
 from scripts.e2e.regional.general_live_gpu_replay_close import wait_served_or_records
 from scripts.e2e.regional.general_live_gpu_verdicts import (
     GpuChain,
+    accepted_samples,
+    active_findings,
     chain_errors,
     chain_executed,
     executions_of,
+    finding_text,
+    inconclusive_unless_failed,
+    judge_chain,
     metric_incidents,
     planned_operations,
     read_only_errors,
     settled,
+    validation_judgeable,
 )
 from scripts.e2e.regional.general_live_registry import deferred_variant
 from scripts.e2e.regional.general_live_verdicts import (
@@ -115,6 +121,14 @@ RESET = frozenset(
 #: The detection wait of every variant: the product's health summary plus a
 #: margin for the collector's delivery and the processor's grading.
 DETECTION_MARGIN_SECONDS = 240
+#: What a diagnostic-only chain's VALIDATE_GPU needs on top of the detection
+#: before it can fail on the held counter: a WARNING memory finding first waits
+#: the adapter's transient-warning grace (``adapters/gpu_validation``
+#: ``transient_warning_grace``, 120 s from the workflow's creation), then for the
+#: first GPU metrics batch newer than the grace end to re-judge it -- the node's
+#: next health summary while the counter only keeps rising, which the detection
+#: budget's summary term covers.
+VALIDATION_GRACE_SECONDS = 120
 #: Reads a bounded fault step carries beyond the wait it must outlast: one
 #: skipped or late scrape, and one for the scrape in flight when the wait ends.
 FAULT_SLACK_READS = 2
@@ -148,6 +162,14 @@ def _detection_seconds(survey: GpuSurvey) -> int:
     return survey.health_summary + DETECTION_MARGIN_SECONDS
 
 
+def _validation_seconds(survey: GpuSurvey) -> int:
+    """The diagnostic variants' wait: detection, then the validation's verdict
+    on the held reading (``VALIDATION_GRACE_SECONDS``); the counter rises for as
+    long (``fault_reads``) and no longer."""
+
+    return _detection_seconds(survey) + VALIDATION_GRACE_SECONDS
+
+
 def _replay(
     ctx: VariantContext, survey: GpuSurvey, *steps: dict[str, Any]
 ) -> DcgmReplay:
@@ -166,62 +188,104 @@ def _replay(
 # --------------------------------------------------------------------------- #
 # diagnostic-only counter variants
 # --------------------------------------------------------------------------- #
+def _diagnostic_chain(canonical: str, gpu: str) -> GpuChain:
+    """WARNING RUN_DIAGNOSTICS: FREEZE_EVIDENCE -> VALIDATE_GPU, which must fail
+    on the held counter's active finding; nothing reset."""
+
+    return GpuChain(
+        label=f"{canonical} on {gpu}",
+        operations=("FREEZE_EVIDENCE", "VALIDATE_GPU"),
+        validation="VALIDATE_GPU",
+        validation_must_fail=True,
+        held_metric=canonical,
+        held_gpu=gpu,
+        forbidden=RESET,
+        incident_states=frozenset({"ACTION_PENDING", "ESCALATED", "RECOVERED"}),
+    )
+
+
 def _diagnostic(ctx: VariantContext, canonical: str) -> dict[str, Any]:
     survey = run_gpu_survey(ctx)
     gpu = survey.target(canonical)
     since = utc_now()
-    # The counter rises by one on every read until the detection wait has had
-    # its budget; the chain's VALIDATE_GPU runs seconds after the mint, while
-    # the finding is active, and ``recover_counter`` ends the replay after it.
+    chain = _diagnostic_chain(canonical, gpu)
+    budget = _validation_seconds(survey)
+    # The counter rises by one on every read for the whole wait: the chain is
+    # judged once its VALIDATE_GPU has a verdict on the held reading (a
+    # WAITING step satisfied "must fail" before), and ``recover_counter`` ends
+    # the replay after it.
     replay = _replay(
         ctx,
         survey,
-        step(
-            fault_reads(survey.interval, _detection_seconds(survey)),
-            add(canonical, [gpu]),
-        ),
+        step(fault_reads(survey.interval, budget), add(canonical, [gpu])),
     )
     arm_and_confirm(replay, f"{gpu}/{canonical}")
+
+    def judgeable(doc: dict[str, Any]) -> list[dict[str, Any]]:
+        found = metric_incidents(doc, canonical, gpu=gpu)
+        return found if found and validation_judgeable(doc, found, chain) else []
+
     detection = wait_gpu_incident(
         ctx,
         since,
-        lambda doc: metric_incidents(doc, canonical, gpu=gpu),
+        judgeable,
         metrics=(canonical,),
-        timeout_seconds=_detection_seconds(survey),
+        timeout_seconds=budget,
         name="detection",
     )
-    chain = chain_errors(
-        detection,
-        metric_incidents(detection, canonical, gpu=gpu),
-        GpuChain(
-            label=f"{canonical} on {gpu}",
-            operations=("FREEZE_EVIDENCE", "VALIDATE_GPU"),
-            validation="VALIDATE_GPU",
-            validation_must_fail=True,
-            forbidden=RESET,
-            incident_states=frozenset({"ACTION_PENDING", "ESCALATED", "RECOVERED"}),
-        ),
-    )
+    incidents = metric_incidents(detection, canonical, gpu=gpu)
+    judgement = judge_chain(detection, incidents, chain)
     stages = {
-        "chain": chain,
-        "read_only": read_only_errors(
-            detection, metric_incidents(detection, canonical, gpu=gpu), canonical
-        ),
+        "chain": judgement.errors,
+        "read_only": read_only_errors(detection, incidents, canonical),
         "hardware": no_hardware(detection),
     }
     recovered = recover_counter(ctx, replay, since, names=[canonical])
-    stages["recovery"] = (
-        []
-        if not state_now(ctx, since, names=[canonical]).get("active_findings")
-        else []
-    )
+    stages["recovery"] = cleared_errors(recovered, canonical, gpu)
     return result(
         stages,
+        notes=list(judgement.unfinished),
+        inconclusive=inconclusive_unless_failed(stages, judgement.unfinished),
         extra={
             "gpu_uuid": gpu,
             "recovered_batches": len(recovered.get("batches") or []),
         },
     )
+
+
+def cleared_errors(state: dict[str, Any], canonical: str, gpu: str) -> list[str]:
+    """Whether a fresh batch cleared the held counter's finding, read on
+    ``recover_counter``'s last read (the expectation's "cleared by a fresh batch").
+
+    A counter finding is cleared only by a later accepted sample whose delta is
+    below threshold; the replay ended by itself or was closed, and the device's
+    real reading -- below the replayed peak -- came back. Cleared means both: no
+    active ``canonical`` finding on ``gpu`` any more, and an accepted reading of
+    it below the peak after the peak (the batch that brought the real value).
+    ``recover_counter`` returns its last read when its wait runs out, so a
+    finding that never cleared used to leave this stage empty as well.
+    """
+
+    errors = [
+        f"the {canonical} finding on {gpu} is still active after the replay "
+        f"ended: no fresh batch cleared it ({finding_text(item)})"
+        for item in active_findings(state, canonical, gpu=gpu)
+    ]
+    samples = [
+        item
+        for item in accepted_samples(state, canonical, gpu)
+        if isinstance(item.get("value"), (int, float))
+    ]
+    if not samples:
+        return [*errors, f"the product accepted no {canonical} reading of {gpu}"]
+    peak = max(range(len(samples)), key=lambda index: samples[index]["value"])
+    if not any(item["value"] < samples[peak]["value"] for item in samples[peak + 1 :]):
+        errors.append(
+            f"the product accepted no {canonical} reading of {gpu} below the "
+            f"replayed peak {samples[peak]['value']:g} after it: the batch that "
+            "brought the device's own reading back was never seen"
+        )
+    return errors
 
 
 def corrected_ecc(ctx: VariantContext) -> dict[str, Any]:

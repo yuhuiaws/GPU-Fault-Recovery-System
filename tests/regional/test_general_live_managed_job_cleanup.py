@@ -777,9 +777,31 @@ class Clock:
 
 
 def no_activity(regional: Any, script: str, *arguments: str, **options: Any) -> Any:
-    """The store read of a node on which the product opened no incident."""
+    """The store read of an idle node on which the product opened no incident:
+    its GPUs graded idle on a host health summary past the low-utilisation
+    sustain (the latest-wins record ``ambiguous_ownership`` reads as the
+    positive control of its no-finding verdict)."""
 
-    return {"incidents": [], "workflows": [], "signals": [], "samples": []}
+    graded = datetime.fromisoformat(arguments[2]) + timedelta(
+        seconds=utilization.LOW_DURATION + 60
+    )
+    return {
+        "since": arguments[2],
+        "incidents": [],
+        "workflows": [],
+        "signals": [],
+        "samples": [],
+        "metric_latest": [
+            {
+                "name": "host_gpu_utilization_percent",
+                "device": f"GPU-{index}",
+                "value": 0.0,
+                "observed_at": graded.isoformat(),
+                "labels": {},
+            }
+            for index in range(8)
+        ],
+    }
 
 
 def install_clock(monkeypatch: pytest.MonkeyPatch) -> Clock:
@@ -885,7 +907,10 @@ def test_ambiguous_ownership_runs_two_four_gpu_jobs_on_one_node(
     assert cluster.stopped == [], "no attempt failed"
     assert cluster.peak == {GPU_RESOURCE: 8, EFA_RESOURCE: 16}, cluster.peak
     assert cluster.kinds() == {"deployment"}, cluster.objects
-    assert clock.elapsed < 1000.0 + 900, "neither start wait ran out"
+    # The clock also runs through the variant's no-finding watch.
+    assert clock.elapsed < 1000.0 + 900 + result["watch_seconds"], (
+        "neither start wait ran out"
+    )
     assert [item["ok"] for item in result["cleanup"]] == [True, True], result["cleanup"]
 
 

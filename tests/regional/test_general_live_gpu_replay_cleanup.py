@@ -31,10 +31,12 @@ from scripts.e2e.regional.host_probe_fixture import HostProbeError
 from tests.regional._general_live_fakes import FakeRegional, make_context, make_settings
 from tests.regional._general_live_gpu_fakes import (
     audit_records,
+    cleared_state,
     dcgm_probe,
     gpu_cpu_python,
     gpu_incident,
     gpu_workflow,
+    held_failure,
     survey,
 )
 
@@ -95,13 +97,7 @@ def _passing_activity() -> dict[str, Any]:
         "inc-ecc",
         ["FREEZE_EVIDENCE", "VALIDATE_GPU"],
         status="FAILED",
-        executions=[
-            {
-                "operation": "VALIDATE_GPU",
-                "status": "FAILED",
-                "details": {"host_diagnostic_failure": True},
-            }
-        ],
+        executions=[held_failure("ecc_sbe_volatile_total", GPU)],
     )
     return {
         "incidents": [incident],
@@ -119,7 +115,7 @@ def _passing_activity() -> dict[str, Any]:
 def _passing_cpu() -> Any:
     return gpu_cpu_python(
         activity=_passing_activity(),
-        gpu_state={"active_findings": [], "batches": [{"observed_at": "t"}]},
+        gpu_state=cleared_state("ecc_sbe_volatile_total", GPU),
     )
 
 

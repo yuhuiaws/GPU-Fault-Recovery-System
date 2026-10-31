@@ -13,6 +13,7 @@ and drives a diagnostic VALIDATE_GPU/VALIDATE_HOST, never a reset.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from typing import Any
 
 from scripts.e2e.regional.general_live_common import (
@@ -39,7 +40,9 @@ from scripts.e2e.regional.general_live_verdicts import (
     chain_errors,
     finding_incidents,
     hardware_errors,
+    latest_samples,
     oracle_values,
+    parse_time,
     samples,
     sustained,
     verdict,
@@ -67,6 +70,12 @@ HIGH_PAGE_CACHE = SUSTAINED_RULES["page_cache_percent"]
 HIGH_LOCAL_FS = SUSTAINED_RULES["local_filesystem_used_percent"]
 LOW_DURATION = 300
 LOW_BUDGET = LOW_DURATION + 300 + 120
+#: ``GPU_FAULT_LOW_UTILIZATION_THRESHOLD_PERCENT``'s default (``host_health.py``):
+#: a host_gpu_utilization_percent sample at or below it is a low one.
+LOW_UTILIZATION_PERCENT = 5.0
+#: Ingest, dispatch and the summary jitter on top of the cadence terms of a
+#: negative low-utilisation window (``low_finding_window``).
+LOW_CHAIN_MARGIN = 180
 MEMORY_DURATION = 60
 PAGE_CACHE_DURATION = 300
 #: HIGH_PAGE_CACHE's condition (``host_health.py``): ``page_cache_percent`` --
@@ -645,13 +654,73 @@ def attempt_change(ctx: VariantContext) -> dict[str, Any]:
     return _result(stages, extra={"attempt_a": identity_a, "attempt_b": identity_b})
 
 
+def low_finding_window(ctx: VariantContext) -> int:
+    """How long after an idle attempt is in place a LOW_* finding can take, on
+    the product's cadence -- the window a negative must watch.
+
+    An idle GPU is no edge of its own once the node is idle, so the host
+    collector delivers its reading on the health summaries
+    (``GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS``, 270-330 s apart): the first
+    sample graded for the attempt comes up to one summary after the window
+    opens, and the control plane mints on the first later sample at least the
+    rule's duration after it (``store/shared/xid.py``
+    ``_next_health_signal_state``: ``GPU_FAULT_LOW_UTILIZATION_DURATION_SECONDS``,
+    300 s) -- up to one more summary. Margin as ``page_cache_hold``. The read
+    after ``LOW_DURATION`` plus three intervals (345 s) ended before a wrongly
+    resolved attempt's finding could exist.
+    """
+
+    return LOW_DURATION + 2 * ctx.host_summary + ctx.host_interval + LOW_CHAIN_MARGIN
+
+
+def graded_low_errors(
+    observed: dict[str, Any], started: datetime, gpus: list[str]
+) -> list[str]:
+    """The positive control of a no-finding verdict: the product graded a low
+    ``host_gpu_utilization_percent`` sample on an attempt's GPU (any GPU when
+    the jobs name none) at least ``LOW_DURATION`` into the window -- the
+    sample a sustained LOW_GPU_UTILIZATION could have been minted on. Read on
+    the latest-wins record every accepted host batch moves
+    (``latest_samples``)."""
+
+    since = started + timedelta(seconds=LOW_DURATION)
+    graded = [
+        item
+        for item in latest_samples(observed, "host_gpu_utilization_percent")
+        if (not gpus or item.get("device") in gpus)
+        and isinstance(item.get("value"), (int, float))
+        and item["value"] <= LOW_UTILIZATION_PERCENT
+        and (moment := parse_time(item.get("observed_at"))) is not None
+        and moment >= since
+    ]
+    if graded:
+        return []
+    return [
+        "the product graded no host_gpu_utilization_percent sample at or below "
+        f"{LOW_UTILIZATION_PERCENT:g} % on the jobs' GPUs {LOW_DURATION} s or more "
+        "into the window: no sustained low reading existed, so 'no finding' "
+        "proves nothing about the attribution"
+    ]
+
+
 def ambiguous_ownership(ctx: VariantContext) -> dict[str, Any]:
     run_survey(ctx)
     job_a = _managed_job(ctx, f"gl3-ambA-{ctx.attempt}", gpu_count=4)
     job_b = _managed_job(ctx, f"gl3-ambB-{ctx.attempt}", gpu_count=4)
+    jobs = [job_a.identity(), job_b.identity()]
     started = utc_now()
-    ctx.hold(LOW_DURATION + ctx.host_interval * 3, name="ambiguous-hold")
-    observed = activity(ctx, started, metrics={"host_gpu_utilization_percent"})
+    window = low_finding_window(ctx)
+    # Watched for the whole window the product needs to mint a sustained low
+    # finding; a wrongly attributed one ends the watch at once.
+    observed = wait_for_incident(
+        ctx,
+        started,
+        "host_gpu_utilization_percent",
+        rule_id=LOW_GPU,
+        timeout_seconds=window,
+        metrics={"host_gpu_utilization_percent"},
+        name="ambiguous-watch",
+    )
     # Two attempts on one node: resolve_managed_attempt resolves none, so no
     # finding (the product refuses to guess ownership).
     stages = {
@@ -664,12 +733,16 @@ def ambiguous_ownership(ctx: VariantContext) -> dict[str, Any]:
             ),
         ),
     }
+    gpus = sorted({uuid for job in jobs for uuid in job.get("gpu_uuids") or []})
+    unproven = graded_low_errors(observed, started, gpus)
     return _result(
         stages,
         notes=[
-            "two managed attempts on one node resolve to none (MIG is a separate capability gap)"
+            "two managed attempts on one node resolve to none (MIG is a separate capability gap)",
+            f"watched {window} s for a LOW_GPU_UTILIZATION finding",
         ],
-        extra={"jobs": [job_a.identity(), job_b.identity()]},
+        extra={"jobs": jobs, "watch_seconds": window},
+        inconclusive=[] if any(stages.values()) else unproven,
     )
 
 
@@ -745,14 +818,19 @@ def _result(
     *,
     notes: list[str] | None = None,
     extra: dict[str, Any] | None = None,
+    inconclusive: list[str] | None = None,
 ) -> dict[str, Any]:
+    # An INCONCLUSIVE carries its reason (``detail``; the errors the board shows).
+    reasons = list(inconclusive or [])
     return {
-        "verdict": verdict(stages),
+        "verdict": verdict(stages, inconclusive=reasons),
         "stages": stages,
         "errors": [
             f"{stage}: {error}" for stage, items in stages.items() for error in items
-        ],
+        ]
+        + [f"inconclusive: {item}" for item in reasons],
         "notes": notes or [],
+        **({"inconclusive": reasons, "detail": "; ".join(reasons)} if reasons else {}),
         **(extra or {}),
     }
 
@@ -840,8 +918,12 @@ VARIANTS = [
     ),
     _spec(
         "ambiguous_ownership",
-        "two 4-GPU managed jobs on one node, both idle",
-        "resolve_managed_attempt resolves none, so no finding (MIG recorded as a capability gap)",
+        "two 4-GPU managed jobs on one node, both idle, watched for the sustain "
+        "plus two host health summaries",
+        "resolve_managed_attempt resolves none, so no finding in the whole window, "
+        "on a low GPU sample graded past the sustain (MIG recorded as a capability gap)",
         ambiguous_ownership,
+        # Two job starts, the ~18-minute watch (low_finding_window) and cleanup.
+        max_minutes=35,
     ),
 ]

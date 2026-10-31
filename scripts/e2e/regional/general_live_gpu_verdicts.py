@@ -24,7 +24,7 @@ the replay's audit receipts.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -33,12 +33,20 @@ from scripts.e2e.regional.general_live_verdicts import (
     NODE_HEALTH_EVENT_TYPES,
     TERMINAL_WORKFLOWS,
     final_execution,
+    pending_summary,
     subsequence,
     workflows_of,
 )
 
 FABRIC_FINDING = "fabric_manager_status"
 COMPLETENESS_FINDING = "dcgm_field_completeness"
+#: The step statuses that are a verdict (``models.WorkflowStepStatus``); the
+#: third, WAITING, is a step still waiting for evidence newer than itself.
+FINISHED_EXECUTIONS = frozenset({"SUCCEEDED", "FAILED"})
+#: What VALIDATE_GPU records when it failed on the GPU's active findings
+#: (``adapters/gpu_validation._validate_active_findings``): this reason in
+#: ``details.node_failures`` and every such finding in ``details.node_findings``.
+ACTIVE_FINDINGS_FAILURE = "active_gpu_health_findings"
 #: What a read-only GPU diagnostic chain may contain; anything isolating or
 #: mutating is outside it.
 ISOLATING_OPERATIONS = frozenset(
@@ -129,6 +137,11 @@ class GpuChain:
     #: A validation step that must have run, and whether it must have failed.
     validation: str | None = None
     validation_must_fail: bool = False
+    #: The replayed reading a must-fail validation has to fail on: the canonical
+    #: metric whose active finding -- on ``held_gpu``, any GPU when None -- the
+    #: FAILED step must name (``held_reading_named``).
+    held_metric: str | None = None
+    held_gpu: str | None = None
     incident_states: frozenset[str] = frozenset()
     #: Operations no workflow of these incidents may plan.
     forbidden: frozenset[str] = HARDWARE_OPERATIONS
@@ -242,23 +255,40 @@ def chain_executed(
     )
 
 
-def chain_errors(
+@dataclass(frozen=True)
+class ChainJudgement:
+    """What one GPU chain read says: ``errors`` are verdicts on the product;
+    ``unfinished`` names a validation that had not judged the held reading
+    when it was read -- still WAITING, or ended by the executor's per-step cap
+    -- which is no verdict either way (``inconclusive_unless_failed``)."""
+
+    errors: list[str]
+    unfinished: list[str]
+
+
+def judge_chain(
     activity: dict[str, Any], incidents: Sequence[dict[str, Any]], chain: GpuChain
-) -> list[str]:
+) -> ChainJudgement:
     """finding -> incident -> workflow -> step trace of one GPU expectation.
 
     Planned steps, forbidden steps, the validation's execution, the incident
     state -- and, for a chain with isolating steps, that the first workflow
-    executed them (``never_executed_errors``).
+    executed them (``never_executed_errors``). A must-fail validation is
+    satisfied only by a FAILED step that names the held reading
+    (``validation_judgement``); a WAITING one used to satisfy it silently.
     """
 
     label = chain.label
     if not chain.present:
-        return [
-            f"unexpected {label} incident {item['incident_id']}" for item in incidents
-        ]
+        return ChainJudgement(
+            [
+                f"unexpected {label} incident {item['incident_id']}"
+                for item in incidents
+            ],
+            [],
+        )
     if not incidents:
-        return [f"no {label} finding reached an incident"]
+        return ChainJudgement([f"no {label} finding reached an incident"], [])
     errors = []
     if chain.single and len(incidents) > 1:
         errors.append(
@@ -277,9 +307,11 @@ def chain_errors(
         for workflow in workflows_of(activity, str(item["incident_id"]))
     ]
     if not workflows:
-        return [*errors, f"{label} incident {incident['incident_id']} has no workflow"]
-    first = workflows_of(activity, str(incident["incident_id"]))
-    workflow = first[0] if first else workflows[0]
+        return ChainJudgement(
+            [*errors, f"{label} incident {incident['incident_id']} has no workflow"],
+            [],
+        )
+    workflow = judged_workflow(activity, incidents) or workflows[0]
     steps = planned_operations(workflow)
     if chain.operations and not subsequence(chain.operations, steps):
         errors.append(f"{label} workflow steps {steps} lack {list(chain.operations)}")
@@ -295,26 +327,141 @@ def chain_errors(
                     f"{label} workflow {item.get('request_id')} executed {operation} "
                     f"({execution.get('status')}); it must not run on this site"
                 )
+    unfinished: list[str] = []
     if chain.validation is not None:
-        execution = final_execution(workflow, chain.validation)
-        if execution is None:
-            errors.append(f"{label} workflow never executed {chain.validation}")
-        elif chain.validation_must_fail:
-            if execution.get("status") == "SUCCEEDED":
-                errors.append(
-                    f"{chain.validation} succeeded while the replayed reading was held"
-                )
-        elif execution.get("status") != "SUCCEEDED":
-            errors.append(
-                f"{chain.validation} ended {execution.get('status')}: "
-                f"{str(execution.get('error') or '')[:200]}"
-            )
+        found, pending = validation_judgement(workflow, chain)
+        errors.extend(found)
+        unfinished.extend(pending)
     if chain.incident_states and incident.get("state") not in chain.incident_states:
         errors.append(
             f"{label} incident is {incident.get('state')}, expected one of "
             f"{sorted(chain.incident_states)}"
         )
-    return errors
+    return ChainJudgement(errors, unfinished)
+
+
+def chain_errors(
+    activity: dict[str, Any], incidents: Sequence[dict[str, Any]], chain: GpuChain
+) -> list[str]:
+    """``judge_chain`` as one error list: for a caller that takes no
+    INCONCLUSIVE, a validation that has not judged the held reading is an
+    error, never a pass."""
+
+    judgement = judge_chain(activity, incidents, chain)
+    return [*judgement.errors, *judgement.unfinished]
+
+
+def judged_workflow(
+    activity: dict[str, Any], incidents: Sequence[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """The workflow a chain is judged on: the first incident's first one."""
+
+    if not incidents:
+        return None
+    first = workflows_of(activity, str(incidents[0]["incident_id"]))
+    return first[0] if first else None
+
+
+def validation_judgement(
+    workflow: dict[str, Any], chain: GpuChain
+) -> tuple[list[str], list[str]]:
+    """(errors, unfinished) of the chain's validation step on ``workflow``.
+
+    A validation waits for evidence newer than itself and is recorded WAITING
+    meanwhile (``adapters/gpu_validation``: fresh GPU metrics; for a WARNING
+    memory finding the transient grace, then the next batch that re-judges the
+    finding). A WAITING step is no verdict: it is ``unfinished``. So is a FAILED
+    step the executor's per-step cap ended (``execution/step_bounds.
+    bounded_waiting_outcome``: ``step_waiting_timeout_seconds``) -- it says the
+    step never judged the reading. Must fail: SUCCEEDED is an error, and so is
+    a FAILED step that does not name the held reading (``held_reading_named``).
+    Must pass: anything but SUCCEEDED is an error, as before.
+    """
+
+    validation = str(chain.validation)
+    execution = final_execution(workflow, validation)
+    if execution is None:
+        return [f"{chain.label} workflow never executed {validation}"], []
+    status = str(execution.get("status"))
+    error = str(execution.get("error") or "")[:200]
+    if status not in FINISHED_EXECUTIONS:
+        return [], [
+            f"{validation} did not finish: still {status} "
+            f"({pending_summary(execution)})"
+        ]
+    if not chain.validation_must_fail:
+        if status == "SUCCEEDED":
+            return [], []
+        return [f"{validation} ended {status}: {error}"], []
+    if status == "SUCCEEDED":
+        return [f"{validation} succeeded while the replayed reading was held"], []
+    details = execution.get("details") or {}
+    if "step_waiting_timeout_seconds" in details:
+        return [], [
+            f"{validation} ended on the executor's "
+            f"{details['step_waiting_timeout_seconds']} s per-step cap, not on the "
+            f"held reading: {error}"
+        ]
+    if not held_reading_named(details, chain):
+        held = chain.held_metric or "the held reading"
+        where = f" on {chain.held_gpu}" if chain.held_gpu else ""
+        return [f"{validation} failed without naming {held}{where}: {error}"], []
+    return [], []
+
+
+def held_reading_named(details: Mapping[str, Any], chain: GpuChain) -> bool:
+    """A FAILED VALIDATE_GPU judged the held reading, not something else.
+
+    The adapter fails a GPU that still has active findings with
+    ``active_gpu_health_findings`` in ``node_failures`` and lists each finding
+    -- canonical name, GPU -- in ``node_findings`` (``finding_summary``); the
+    held one must be among them.
+    """
+
+    failures = details.get("node_failures") or {}
+    if not any(
+        isinstance(reasons, list) and ACTIVE_FINDINGS_FAILURE in reasons
+        for reasons in failures.values()
+    ):
+        return False
+    if chain.held_metric is None:
+        return True
+    return any(
+        isinstance(item, dict)
+        and item.get("canonical_name") == chain.held_metric
+        and (chain.held_gpu is None or item.get("gpu_uuid") == chain.held_gpu)
+        for items in (details.get("node_findings") or {}).values()
+        if isinstance(items, list)
+        for item in items
+    )
+
+
+def validation_judgeable(
+    activity: dict[str, Any], incidents: Sequence[dict[str, Any]], chain: GpuChain
+) -> bool:
+    """Whether the chain's validation can be judged from ``activity``: the
+    judged workflow has a finished execution of it or has itself ended (a
+    record that ended before it is a verdict, not a wait). A wait before a
+    validation judgment gates on this, within its budget (cf.
+    ``general_live_verdicts.chain_judgeable``)."""
+
+    workflow = judged_workflow(activity, incidents)
+    if workflow is None:
+        return False
+    if str(workflow.get("status")) in TERMINAL_WORKFLOWS:
+        return True
+    execution = final_execution(workflow, str(chain.validation))
+    return execution is not None and execution.get("status") in FINISHED_EXECUTIONS
+
+
+def inconclusive_unless_failed(
+    stages: Mapping[str, Sequence[str]], unfinished: Sequence[str]
+) -> list[str]:
+    """The INCONCLUSIVE reasons of a result whose validation never judged the
+    held reading: none when a stage holds a definite error -- that is a FAIL
+    whatever the validation's state -- else the unfinished validation."""
+
+    return [] if any(stages.values()) else list(unfinished)
 
 
 def read_only_errors(
@@ -674,9 +821,12 @@ def component_dedup_errors(
 
 
 __all__ = [
+    "ACTIVE_FINDINGS_FAILURE",
     "COMPILE_TIME_BLOCKED",
     "COMPLETENESS_FINDING",
     "FABRIC_FINDING",
+    "FINISHED_EXECUTIONS",
+    "ChainJudgement",
     "GpuChain",
     "ISOLATING_OPERATIONS",
     "RESET_OPERATIONS",
@@ -695,10 +845,14 @@ __all__ = [
     "executions_of",
     "fabric_incidents",
     "finding_text",
+    "held_reading_named",
     "history_findings",
     "incident_finding",
+    "inconclusive_unless_failed",
     "inventory_incidents",
     "isolating_steps",
+    "judge_chain",
+    "judged_workflow",
     "latest_value",
     "metric_incidents",
     "never_executed_errors",
@@ -710,4 +864,6 @@ __all__ = [
     "served_values",
     "settled",
     "step_started",
+    "validation_judgeable",
+    "validation_judgement",
 ]
