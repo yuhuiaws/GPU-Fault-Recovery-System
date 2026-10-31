@@ -509,6 +509,28 @@ def test_the_wave_probe_lists_only_records_no_adapter_ever_held(
     assert report["never_dispatched_destructive_workflows"] == []
 
 
+@pytest.mark.parametrize("condition", ["young", "dispatched-young"])
+def test_the_wave_probe_lists_a_young_never_dispatched_record_apart(
+    monkeypatch, capsys, condition
+) -> None:
+    """Inside the dispatch guard the record is not set aside yet; the forward
+    path waits for one that names only departed nodes to age past it."""
+
+    workflow, incident = _never_dispatched_pair(
+        age=timedelta(minutes=1), dispatched=condition == "dispatched-young"
+    )
+
+    report = wave_report(monkeypatch, capsys, workflow, incident)
+
+    assert report["never_dispatched_destructive_workflows"] == []
+    young = report["never_dispatched_young_destructive_workflows"]
+    if condition == "young":
+        assert [item["request_id"] for item in young] == ["workflow-nd"]
+        assert young[0]["node_ids"] == [DEPARTED_NODE]
+    else:
+        assert young == [], "a record an adapter held is never set aside"
+
+
 def test_the_probe_and_the_product_agree_on_what_was_never_dispatched() -> None:
     now = datetime.now(timezone.utc)
     listed, incident = _never_dispatched_pair()

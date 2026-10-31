@@ -46,7 +46,10 @@ from gpu_fault_release.regional_release_departure_absorption import (
     settle_departed_barrier_nodes,
     without_recorded_departures,
 )
-from gpu_fault_release.regional_release_errors import WaveAgentSafetyError
+from gpu_fault_release.regional_release_errors import (
+    WaveAgentSafetyError,
+    WaveWorkflowSafetyError,
+)
 from gpu_fault_release.regional_release_gpu_rollout import gpu_node_items
 from gpu_fault_release.regional_release_images import NodeDependencyTarget
 from gpu_fault_release.regional_release_interfaces import AgentNodeSet
@@ -771,9 +774,12 @@ def ensure_rollout_wave_safe(
                     blocked["departed_node_workflows"] = sorted(excluded)
                 if notes:
                     blocked["departure_unproven"] = list(notes)
-                raise ReleaseError(
+                raise WaveWorkflowSafetyError(
                     "fleet wave safety blocked by active destructive workflows: "
-                    + json.dumps(blocked, sort_keys=True)
+                    + json.dumps(blocked, sort_keys=True),
+                    snapshot=snapshot,
+                    remaining=blocked["request_ids"],
+                    remaining_count=remaining,
                 )
         blockers = list(snapshot.get("agent_blockers") or [])
         blocker_count = int(snapshot.get("agent_blocker_count") or len(blockers))

@@ -5537,3 +5537,47 @@ clean after it with the stale digest passed to the install step, a foreign
 copy still rejected, and the out-of-disk cleanup that deletes, fails and is
 closed by the next sweep. The seven leaked Pods and ConfigMaps were deleted by
 hand before this change; no product release is needed.
+
+## Release forward path over GPU nodes that leave or join mid-release
+
+A spot reclaim or a scale-out cannot be timed into a release on demand, so no
+live case exercises it. The forward path is proven with fakes only:
+`tests/regional/test_release_node_churn.py` drives the real wave loop, wave
+safety gate, convergence wait and departure proof of `roll_node_runtime` over a
+simulated HyperPod cluster (`tests/regional/_node_churn_site.py`: a real
+`FleetRegistry` on the in-memory store decides READY from signed heartbeats, a
+real `NodeInstallerReconciler` installs what the release hands its script, the
+shipped `fleet_deployment_command` program runs `exclude-departed`, and one
+fake clock drives the waits and every Agent's heartbeats, so a reclaimed node's
+lease lapses as the release waits). It covers a node reclaimed inside a wave,
+a reclaimed canary (the next node still goes alone), a rolled node reclaimed
+before a later wave's gate, a node already NotReady when the roll starts
+(proven gone, or Ready again), a young never-dispatched destructive record of
+the departed node holding the gate until it passes the dispatch guard (and one
+of a live node refusing at once), an absence HyperPod contradicts (refused after
+the 600 s decision window), newcomers installed inside and outside the 300 s
+grace, deferred at the roll start, joining during the final wait or in a
+partial roll, a newcomer on the previous installation (re-installed, or caught
+by the convergence wait), a newcomer that leaves again, and a planned node
+leaving during the final wait. `tests/regional/test_release_departure_barrier.py`
+covers the candidate CPU heartbeat barrier against a scripted in-Pod barrier
+(the proof deciding late, three unprovable shapes, live and silent-on-Ready
+Agents failing as before) and the decision window itself (a node back in
+between gets a new window, a proof that cannot be read decides nothing).
+`tests/regional/test_release_fleet_exclude_departed.py` runs the probe
+operation against a real registry; `tests/regional/test_release_churn_verify.py`
+the verify, `status` and stability-window exemptions. Before the change the
+same harness reproduced each failure (the 900 s wave and finalize timeouts,
+the 60 s gate timeout, `installer-active` and the barrier's plain
+`ReleaseError`). Not exercised, and not changed: the read-only probes the
+harness answers from the registry (`agent_lifecycle_facts`,
+`agent_convergence`, `rollout_wave_safety`), the real AWS and Kubernetes timing
+of a reclaim (Node deletion, EC2 `terminated`, HyperPod delisting), a node
+leaving during the stability window or a DCGM exporter DaemonSet rollout, the
+resume of a paused release over a node that joined meanwhile (still
+`resume node set drifted`) or over a fleet record a departure was taken out of
+(`create` compares the recomputed waves with the edited record), and node
+churn during a rollback, a join or a bootstrap. The verify's newcomer exemption
+follows the release's captured node set, so a later standalone `verify` of the
+same release still names a node that joined afterwards and never installed in
+a WARN; `status` reports it as failing.

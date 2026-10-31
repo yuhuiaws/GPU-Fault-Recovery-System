@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -359,3 +360,128 @@ def test_a_recorded_departure_whose_name_is_back_is_expected_again(
     wait(site)
 
     assert site.barriers[0]["expected_by_cluster"] == {"gpu-a": sorted([*LIVE, GONE])}
+
+
+# -- the decision window itself -------------------------------------------------
+
+
+def watch_release(
+    monkeypatch: pytest.MonkeyPatch, proof: Any
+) -> tuple[ABSORPTION.DepartureWatch, ResourceRelease, Clock]:
+    release = ResourceRelease(("gpu-a",))
+    clock = Clock()
+    monkeypatch.setattr(ABSORPTION, "departure_proof", proof)
+    watch = ABSORPTION.DepartureWatch(
+        release, release.config.clusters[0], "fleet-wave", monotonic=clock.monotonic
+    )
+    return watch, release, clock
+
+
+def set_nodes(release: ResourceRelease, ready: dict[str, bool]) -> None:
+    release.documents[("gpu-a", "nodes", "")] = {
+        "items": [
+            {
+                "metadata": {"name": name},
+                "status": {
+                    "conditions": [
+                        {"type": "Ready", "status": "True" if up else "False"}
+                    ]
+                },
+            }
+            for name, up in ready.items()
+        ]
+    }
+
+
+def unproven(*_args: Any, **_kwargs: Any) -> DEPARTED.DepartureProof:
+    return DEPARTED.DepartureProof((), (f"{GONE}: EC2 instance i-x is shutting-down",))
+
+
+def test_a_node_that_was_back_in_between_gets_a_new_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NotReady once (a reboot), Ready again, reclaimed much later: the second
+    absence is judged from its own start, not refused on the first one's."""
+
+    watch, release, clock = watch_release(monkeypatch, unproven)
+    set_nodes(release, {GONE: False})
+    assert watch.decide([GONE]).pending == (GONE,)
+    clock.sleep(60)
+    set_nodes(release, {GONE: True})
+    assert watch.decide([GONE]).alive == (GONE,)
+    clock.sleep(900)
+    set_nodes(release, {})
+
+    verdict = watch.decide([GONE])
+
+    assert (verdict.pending, dict(verdict.refused)) == ((GONE,), {})
+
+
+def test_a_long_silence_between_two_looks_also_restarts_the_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wait hook only asks about absent nodes: a node it stopped asking
+    about was present again in between."""
+
+    watch, release, clock = watch_release(monkeypatch, unproven)
+    set_nodes(release, {})
+    watch.decide([GONE])
+    clock.sleep(ABSORPTION.DEPARTURE_CONTINUITY_SECONDS + 1)
+
+    assert watch.decide([GONE]).pending == (GONE,)
+    clock.sleep(ABSORPTION.DEPARTURE_DECISION_SECONDS - 1)
+    assert watch.decide([GONE]).pending == (GONE,), "still inside its own window"
+
+
+def test_one_continuous_absence_is_refused_when_its_window_ends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    watch, release, clock = watch_release(monkeypatch, unproven)
+    set_nodes(release, {})
+    for _ in range(20):
+        verdict = watch.decide([GONE])
+        clock.sleep(ABSORPTION.DEPARTURE_RECHECK_SECONDS)
+
+    verdict = watch.decide([GONE])
+
+    assert dict(verdict.refused) == {GONE: "EC2 instance i-x is shutting-down"}
+
+
+def test_a_proof_that_cannot_be_read_decides_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Before: the read's ReleaseError escaped the wave as a global failure."""
+
+    def broken(*_args: Any, **_kwargs: Any) -> Any:
+        raise ReleaseError("Agent lifecycle facts are invalid")
+
+    watch, release, clock = watch_release(monkeypatch, broken)
+    set_nodes(release, {})
+
+    assert watch.decide([GONE]).pending == (GONE,)
+    for _ in range(20):
+        clock.sleep(ABSORPTION.DEPARTURE_RECHECK_SECONDS)
+        verdict = watch.decide([GONE])
+    refused = dict(verdict.refused)
+
+    assert refused == {
+        GONE: "departure proof unavailable: Agent lifecycle facts are invalid"
+    }
+
+
+def test_a_record_the_probe_cannot_rewrite_pauses_the_cluster_only() -> None:
+    target = SimpleNamespace(cluster_id="gpu-a")
+
+    def refuse(_operation: str, _payload: dict[str, Any]) -> Any:
+        raise ReleaseError("fleet rollout failed: nodes still hold a live Agent lease")
+
+    departures = ABSORPTION.WaveDepartures(
+        SimpleNamespace(_fleet_command=refuse), target, enabled=True
+    )
+    assert departures.watch is not None, "enabled"
+    departures.watch.departed[GONE] = {"node_id": GONE}
+
+    with pytest.raises(ABSORPTION.ClusterLocalReleaseError, match="live Agent lease"):
+        departures.reconcile_record(
+            {"nodes": [{"node_id": GONE, "status": "INSTALLING"}]}, "deployment-1"
+        )

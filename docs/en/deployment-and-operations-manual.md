@@ -1012,7 +1012,9 @@ server certificate for that stable hostname:
   short of it fails closed, naming the node and the reason (Administrator Operations §10.2, "a spot reclaim mid-release"). The
   forward path's candidate CPU heartbeat barrier, wave gate and wave convergence wait absorb a departed node on the same proof
   (the probe `fleet_deployment_command`'s `exclude-departed` takes it out of the fleet deployment, which ends `SUCCEEDED` over
-  the remaining nodes; a proof that does not hold yet is re-read every 30 s for at most 10 minutes); a node that joins during
+  the remaining nodes; a proof that does not hold yet is re-read every 30 s for at most 10 minutes; the wave probe lists such
+  records still inside the ten-minute dispatch guard separately as `never_dispatched_young_destructive_workflows`, and one
+  that names only departed nodes holds the gate until it passes the guard and is set aside); a node that joins during
   the release is in no wave, the steady-state Reconciler installs it, and one not installed within a 300 s grace is recorded
   `pending` in `live_release.joined_nodes` without failing the release (Administrator Operations §5.0, "a node that leaves or
   joins while a release runs").

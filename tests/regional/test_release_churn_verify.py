@@ -21,9 +21,11 @@ from typing import Any
 import pytest
 
 from gpu_fault_release import regional_admin_checks as CHECKS
+from gpu_fault_release import regional_admin_checks_churn as CHURN
 from gpu_fault_release import regional_admin_commands as COMMANDS
 from gpu_fault_release import regional_release_validation as VALIDATION
 from gpu_fault_release.regional_admin_checks_churn import RELEASE_CHURN_KEY
+from gpu_fault_release.regional_release_departed_nodes import DepartureProof
 from tests.regional.test_regional_admin_checks import (
     control_api_release,
     healthy_control_api_report,
@@ -289,7 +291,11 @@ def test_a_verify_does_not_ask_about_a_newcomer_nor_count_a_departed_agent(
         f"gpu-a joined, still installing: {NEWCOMER}"
     )
     churn = record["details"]["clusters"]["gpu-a"][RELEASE_CHURN_KEY]
-    assert churn == {"departed": [GONE], "joined_installing": {NEWCOMER: "Installing"}}
+    assert churn == {
+        "departed": [GONE],
+        "proven_by_verify": [],
+        "joined_installing": {NEWCOMER: "Installing"},
+    }
     readiness = record["details"]["collector_readiness"]
     assert readiness["departed_not_awaited"] == {"gpu-a": [GONE]}
 
@@ -309,9 +315,25 @@ def test_status_still_reports_the_coverage_drift(
     assert record["summary"].startswith("gpu-a Agent coverage drift"), record
 
 
-def test_a_departed_agent_this_release_did_not_prove_still_fails(
+def proof_of(monkeypatch: pytest.MonkeyPatch, *, departed: bool) -> list[list[str]]:
+    """The verify's own departure proof, answered; returns what it was asked."""
+
+    asked: list[list[str]] = []
+
+    def proof(_release: Any, _target: Any, nodes: list[str], **_kw: Any) -> Any:
+        asked.append(list(nodes))
+        if departed:
+            return DepartureProof(({"node_id": GONE},), ())
+        return DepartureProof((), (f"{GONE}: HyperPod cluster hp-a still lists it",))
+
+    monkeypatch.setattr(CHURN, "departure_proof", proof)
+    return asked
+
+
+def test_a_departed_agent_no_proof_covers_still_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    asked = proof_of(monkeypatch, departed=False)
     plane = ControlPlane(agents=[PLANNED, GONE])
     release = control_release([PLANNED, GONE])
     release.state["departed_nodes"] = {}
@@ -320,8 +342,29 @@ def test_a_departed_agent_this_release_did_not_prove_still_fails(
         monkeypatch, release, plane, mode="verify", items=[node(PLANNED)]
     )
 
+    assert asked == [[GONE]], "the Agent without a Node is put to the proof"
     assert record["status"] == "FAIL"
     assert "Agent coverage drift" in record["summary"], record
+
+
+def test_a_departure_the_verify_proves_itself_is_not_counted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The node left after its cluster's last wave (or before it rolled): no
+    gate of the release judged it, the same read-only proof does now."""
+
+    proof_of(monkeypatch, departed=True)
+    plane = ControlPlane(agents=[PLANNED, GONE])
+    release = control_release([PLANNED, GONE])
+    release.state["departed_nodes"] = {}
+
+    record = control_api(
+        monkeypatch, release, plane, mode="verify", items=[node(PLANNED)]
+    )
+
+    assert record["status"] == "WARN", record
+    churn = record["details"]["clusters"]["gpu-a"][RELEASE_CHURN_KEY]
+    assert (churn["departed"], churn["proven_by_verify"]) == ([GONE], [GONE])
 
 
 # -- status and the stability window --------------------------------------------

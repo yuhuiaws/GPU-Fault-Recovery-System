@@ -12,7 +12,9 @@ broken release:
 * an Agent of a node this release proved departed (``departed_nodes`` in the
   release state) that has no Kubernetes Node any more is not coverage, not a
   Runtime Profile to compare and not a collector to wait for, until the
-  departed-node cleanup retires its record.
+  departed-node cleanup retires its record; so is the Agent of a node the
+  release never got to judge (it left before its cluster rolled, or after the
+  last wave) once the same read-only departure proof holds for it now.
 
 ``status`` judges the fleet as it is and gets none of this: a node still
 installing is a real ``installer is not Succeeded`` there, as before. And a
@@ -27,7 +29,11 @@ from dataclasses import replace
 from typing import Any
 
 from gpu_fault_release.regional_check_value import CheckValue
-from gpu_fault_release.regional_release_departed_nodes import recorded_departed_nodes
+from gpu_fault_release.regional_release_config import ReleaseError
+from gpu_fault_release.regional_release_departed_nodes import (
+    departure_proof,
+    recorded_departed_nodes,
+)
 from gpu_fault_release.regional_release_joined_nodes import installing_newcomers
 
 #: Per-cluster key of the control API report, written in ``verify`` only.
@@ -55,24 +61,60 @@ def annotate_release_churn(
 
     clusters = report.get("clusters")
     state = getattr(release, "state", None)
+    targets = {target.cluster_id: target for target in release.config.clusters}
     for cluster_id, cluster in clusters.items() if isinstance(clusters, dict) else ():
         if not isinstance(cluster, dict):
             continue
         kubernetes = {str(item) for item in cluster.get("kubernetes_node_ids") or []}
-        departed = sorted(
-            set(
-                recorded_departed_nodes(
-                    state if isinstance(state, Mapping) else None, cluster_id
-                )
+        recorded = set(
+            recorded_departed_nodes(
+                state if isinstance(state, Mapping) else None, cluster_id
             )
-            - kubernetes
         )
+        proven = _proven_now(
+            release,
+            targets.get(cluster_id),
+            cluster,
+            kubernetes=kubernetes,
+            recorded=recorded,
+        )
+        departed = sorted(((recorded - kubernetes) | proven))
         joining = dict(sorted((joining_by_cluster.get(cluster_id) or {}).items()))
         if departed or joining:
             cluster[RELEASE_CHURN_KEY] = {
                 "departed": departed,
+                "proven_by_verify": sorted(proven),
                 "joined_installing": joining,
             }
+
+
+def _proven_now(
+    release: Any,
+    target: Any,
+    cluster: Mapping[str, Any],
+    *,
+    kubernetes: set[str],
+    recorded: set[str],
+) -> set[str]:
+    """Counted Agents without a Node that the departure proof shows gone now."""
+
+    extra = sorted(
+        {
+            str(item.get("node_id"))
+            for item in cluster.get("agents") or []
+            if isinstance(item, dict) and item.get("lifecycle_state") != "REVOKED"
+        }
+        - kubernetes
+        - recorded
+    )
+    if not extra or target is None:
+        return set()
+    try:
+        proof = departure_proof(release, target, extra, present_node_names=kubernetes)
+    except ReleaseError:
+        # Not observable is not proof: the coverage check judges them as before.
+        return set()
+    return set(proof.departed_node_ids)
 
 
 def churn_departed(cluster: Mapping[str, Any]) -> frozenset[str]:

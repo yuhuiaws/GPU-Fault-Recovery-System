@@ -461,3 +461,191 @@ def test_departures_are_inert_outside_the_forward_upgrade() -> None:
         assert departures.reconcile_record(deployment, "d") is deployment
         with pytest.raises(ABSORPTION.WaveAgentSafetyError):
             departures.wave_safety(gate, wave=(), safety_node_names={"n"})
+
+
+def test_a_reclaim_and_a_join_in_one_rollout(churn: Any) -> None:
+    gone = NODES[2]
+    wave_two = ",".join(sorted(NODES[1:]))
+    churn.site.hooks.append((f"deploy:{wave_two}", lambda: churn.site.reclaim(gone)))
+    churn.site.hooks.append(
+        (f"deploy:{NODES[0]}", lambda: churn.site.join(NEWCOMER, installed=None))
+    )
+
+    roll(churn)
+
+    assert churn.site.deployment().status.value == "SUCCEEDED"
+    assert gone not in deployed_node_ids(churn)
+    assert NEWCOMER not in deployed_node_ids(churn)
+    assert departed_row(churn, gone)["fleet_deployment"]["status_before"] == (
+        "INSTALLING"
+    )
+    assert joined_rows(churn)[NEWCOMER]["outcome"] == "installed"
+
+
+def test_a_planned_node_reclaimed_during_the_newcomer_wait_is_proven_too(
+    churn: Any,
+) -> None:
+    """With a newcomer present the end of the roll waits for the planned nodes
+    by name; one of them leaving then is judged like a wave node."""
+
+    def join_slow() -> None:
+        churn.site.join(NEWCOMER, installed=None)
+        churn.site.stuck.add(NEWCOMER)
+
+    churn.site.hooks.append((f"deploy:{NODES[0]}", join_slow))
+    churn.site.hooks.append(("deploy:*", lambda: churn.site.reclaim(NODES[3])))
+
+    roll(churn)
+
+    row = departed_row(churn, NODES[3])
+    assert row["excluded_at"] == "fleet-wave"
+    assert "fleet_deployment" not in row, "the record had already SUCCEEDED"
+    assert joined_rows(churn)[NEWCOMER]["outcome"] == "pending"
+
+
+# -- the review's shapes: tails, roll start, product records, partial rolls ----
+
+
+def test_a_node_leaving_when_the_roll_starts_is_judged_before_the_plan(
+    churn: Any,
+) -> None:
+    """NotReady and silent when the cluster's roll reads it, gone two minutes on.
+
+    Before: ``pre-node-mutation node state is unsafe: not-ready`` -- a plain
+    ReleaseError, answered by the automatic rollback.
+    """
+
+    leaving = NODES[3]
+    churn.site.not_ready(leaving)
+
+    def gone() -> None:
+        churn.site.reclaim(leaving)
+
+    churn.site.timeline.append((120.0, gone))
+
+    roll(churn)
+
+    assert leaving not in deployed_node_ids(churn), "planned without it"
+    assert churn.site.deployment().status.value == "SUCCEEDED"
+    assert departed_row(churn, leaving)["excluded_at"] == "fleet-wave"
+
+
+def test_a_node_leaving_at_roll_start_that_recovers_is_rolled(churn: Any) -> None:
+    leaving = NODES[3]
+    churn.site.not_ready(leaving)
+
+    def back() -> None:
+        churn.site.nodes.items[leaving]["status"]["conditions"] = [
+            {"type": "Ready", "status": "True"}
+        ]
+        churn.site.silent.discard(leaving)
+
+    churn.site.timeline.append((60.0, back))
+
+    roll(churn)
+
+    assert leaving in deployed_node_ids(churn)
+    assert "departed_nodes" not in churn.release.state
+
+
+def test_a_young_product_record_of_the_departed_node_holds_the_gate(
+    churn: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The product opened a destructive workflow for the node it lost; it was
+    never dispatched, but younger than the dispatch guard the gate sets such
+    records aside after.
+
+    Without the hold the gate refuses at once with a plain ReleaseError --
+    the automatic rollback.
+    """
+
+    gone = NODES[0]
+
+    def reclaim_with_record() -> None:
+        churn.site.reclaim(gone)
+        churn.site.workflows.append(
+            {
+                "request_id": "workflow-gone",
+                "cluster_id": "gpu-a",
+                "node_ids": [gone],
+                "created_at": churn.site.clock,
+            }
+        )
+        churn.clock.sleep(55)
+
+    churn.site.hooks.append(("get#1", reclaim_with_record))
+
+    roll(churn)
+
+    assert churn.site.deployment().status.value == "SUCCEEDED"
+    assert 545 <= churn.clock.elapsed < 700, churn.clock.elapsed
+    log = capsys.readouterr().err
+    assert "departed-node-workflows-held" in log, log
+    assert "workflows=workflow-gone" in log
+
+
+def test_a_young_record_of_a_live_node_still_refuses_at_once(churn: Any) -> None:
+    churn.site.workflows.append(
+        {
+            "request_id": "workflow-live",
+            "cluster_id": "gpu-a",
+            "node_ids": [NODES[1]],
+            "created_at": churn.site.clock,
+        }
+    )
+
+    with pytest.raises(ReleaseError, match="active destructive workflows") as failure:
+        roll(churn)
+
+    assert not isinstance(failure.value, ABSORPTION.ClusterLocalReleaseError), (
+        "a destructive workflow on a live node is the gate's global refusal"
+    )
+    assert churn.clock.elapsed < 60
+
+
+def test_a_node_that_joins_during_the_final_wait_is_a_newcomer(churn: Any) -> None:
+    def join_slow() -> None:
+        churn.site.join(NEWCOMER, installed=None)
+        churn.site.stuck.add(NEWCOMER)
+
+    churn.site.hooks.append(("deploy:*", join_slow))
+
+    roll(churn)
+
+    assert joined_rows(churn)[NEWCOMER]["outcome"] == "pending"
+    assert churn.clock.elapsed < 400, "the planned wait does not wait for it"
+
+
+def test_a_planned_node_leaving_during_the_final_wait_is_recorded(churn: Any) -> None:
+    gone = NODES[3]
+    churn.site.hooks.append(("deploy:*", lambda: churn.site.reclaim(gone)))
+
+    roll(churn)
+
+    row = departed_row(churn, gone)
+    assert (row["excluded_at"], "fleet_deployment" in row) == ("fleet-wave", False)
+
+
+def test_a_partial_roll_still_installs_its_newcomers(
+    churn: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    isolated = NODES[3]
+    monkeypatch.setattr(
+        RUNTIME,
+        "product_isolated_nodes",
+        lambda _release, _target, names: (
+            [{"node_id": isolated, "incident_id": "incident-x", "reasons": ["cordon"]}]
+            if isolated in names
+            else []
+        ),
+    )
+    churn.site.hooks.append(
+        (f"deploy:{NODES[0]}", lambda: churn.site.join(NEWCOMER, installed=None))
+    )
+
+    with pytest.raises(ReleaseError, match=isolated):
+        roll(churn)
+
+    steady = wave_waits(churn)[-1].split(",")
+    assert NEWCOMER in steady and isolated not in steady, steady
+    assert joined_rows(churn)[NEWCOMER]["outcome"] == "installed"

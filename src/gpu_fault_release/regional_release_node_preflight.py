@@ -70,6 +70,9 @@ class NodeMutationPreflight:
     #: only): kept out of ``node_names``, the wave, the steady-state Reconciler
     #: and the convergence wait; the cluster ends PARTIAL when they exist.
     excluded_nodes: tuple[dict[str, Any], ...] = ()
+    #: Nodes of ``node_names`` already on their way out (NotReady or being
+    #: deleted) when the forward roll read them; judged for departure first.
+    leaving_nodes: tuple[str, ...] = ()
 
     @property
     def node_dependency_target(self) -> NodeDependencyTarget:

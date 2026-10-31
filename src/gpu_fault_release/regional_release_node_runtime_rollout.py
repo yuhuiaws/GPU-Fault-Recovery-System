@@ -5,7 +5,10 @@ from typing import Any
 
 from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
 from gpu_fault_release.regional_release_dcgm import forward_dcgm_hostengine
-from gpu_fault_release.regional_release_departure_absorption import WaveDepartures
+from gpu_fault_release.regional_release_departure_absorption import (
+    WaveDepartures,
+    leaving_node_names,
+)
 from gpu_fault_release.regional_release_fleet_rollout import (
     FleetWaveContext,
     NodeRolloutPolicy,
@@ -235,7 +238,12 @@ def _finalize_node_runtime(
         # A partial wave keeps the steady-state Reconciler off the excluded
         # nodes until the resume: an installer Job on a quarantined node would
         # only cycle Pending -> Failed and stamp installer-state=Failed on it.
-        allowed_node_names=(candidate.node_names if candidate.excluded_nodes else None),
+        # The newcomers it found are installed either way.
+        allowed_node_names=(
+            tuple(sorted(set(candidate.node_names) | joined.nodes))
+            if candidate.excluded_nodes
+            else None
+        ),
         max_unavailable=candidate.max_unavailable,
         runtime_image=steady_runtime_image or candidate.runtime_image,
         node_installer_image=candidate.node_installer_image,
@@ -246,13 +254,15 @@ def _finalize_node_runtime(
             f"{target.cluster_id} steady-state installer identity changed"
         )
     departed = departures.departed_ids if departures is not None else frozenset()
-    # Only a partial wave or a newcomer narrows the wait to the planned nodes
-    # (and a newcomer on another identity, which the Reconciler re-installs);
-    # otherwise the call is unchanged.
-    narrowed = bool(candidate.excluded_nodes) or joined.active
+    # A partial wave, and the forward roll of a release that captured its node
+    # set, wait for the planned nodes by name (and a newcomer on another
+    # identity, which the Reconciler re-installs): a node that joins during the
+    # wait is a newcomer, one that leaves is judged like a wave node. Otherwise
+    # the call is unchanged.
+    narrowed = bool(candidate.excluded_nodes) or joined.applicable
     wait_names = (
         joined.wait_node_names(candidate.node_names, departed)
-        if joined.active or departed
+        if joined.applicable
         else candidate.node_names
     )
     if not narrowed or wait_names:
@@ -370,6 +380,11 @@ def _node_runtime_candidate(
         node_names = defer_uninstalled_newcomers(
             release, target, node_names, phase=phase
         )
+        leaving = (
+            leaving_node_names(release, target, node_names)
+            if phase == "upgrade" and node_names
+            else ()
+        )
         failure_domains = (
             {}
             if release.runner.dry_run
@@ -407,6 +422,7 @@ def _node_runtime_candidate(
             node_installer_image=node_installer_image,
             template_content_sha256=template_content_sha256,
             excluded_nodes=tuple(excluded),
+            leaving_nodes=leaving,
         ),
         policy,
         failure_domains,
@@ -478,24 +494,34 @@ def roll_node_runtime(
     candidate_preflight_completed: bool = False,
     template_content_sha256: str | None = None,
 ) -> tuple[str, str]:
-    candidate, policy, failure_domains = _node_runtime_candidate(
-        release,
-        target,
-        phase=phase,
-        wheel_cm=wheel_cm,
-        bundle_cm=bundle_cm,
-        artifact_sha=artifact_sha,
-        config_digest=config_digest,
-        runtime_profile_version=runtime_profile_version,
-        executor_wheel_filename=executor_wheel_filename,
-        node_compatibility_digest=node_compatibility_digest,
-        bundle_sha256=bundle_sha256,
-        template_sha256=template_sha256,
-        template_config_map=template_config_map,
-        runtime_image=runtime_image,
-        node_installer_image=node_installer_image,
-        template_content_sha256=template_content_sha256,
-    )
+    def plan() -> tuple[NodeMutationPreflight, NodeRolloutPolicy, dict[str, str]]:
+        return _node_runtime_candidate(
+            release,
+            target,
+            phase=phase,
+            wheel_cm=wheel_cm,
+            bundle_cm=bundle_cm,
+            artifact_sha=artifact_sha,
+            config_digest=config_digest,
+            runtime_profile_version=runtime_profile_version,
+            executor_wheel_filename=executor_wheel_filename,
+            node_compatibility_digest=node_compatibility_digest,
+            bundle_sha256=bundle_sha256,
+            template_sha256=template_sha256,
+            template_config_map=template_config_map,
+            runtime_image=runtime_image,
+            node_installer_image=node_installer_image,
+            template_content_sha256=template_content_sha256,
+        )
+
+    candidate, policy, failure_domains = plan()
+    # A node that provably leaves during the roll is set aside on the proof; one
+    # already on its way out when the roll read the cluster is judged first.
+    departures = WaveDepartures.for_phase(release, target, phase)
+    if not release.runner.dry_run and departures.settle_leaving(
+        candidate.leaving_nodes
+    ):
+        candidate, policy, failure_domains = plan()
     expected_profile = candidate.runtime_profile_version
     expected_compatibility = candidate.node_compatibility_digest
     node_names = candidate.node_names
@@ -533,8 +559,6 @@ def roll_node_runtime(
             )
     if mutation_started is not None:
         mutation_started()
-    # A node that provably leaves during the waves is set aside on the proof.
-    departures = WaveDepartures.for_phase(release, target, phase)
     paused_identity = release._deploy_reconciler(
         target,
         wheel_cm=wheel_cm,

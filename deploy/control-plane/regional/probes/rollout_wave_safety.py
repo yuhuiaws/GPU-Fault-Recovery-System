@@ -35,7 +35,10 @@ Whether those nodes are gone is the engine's question: it reads Kubernetes and
 the provider from the deploy host and sets the record aside only on that proof
 (``regional_release_departed_nodes``). Live 2026-10-06: a HyperPod spot node
 reclaimed between two waves left such a record, and it blocked wave 2 and the
-automatic rollback alike.
+automatic rollback alike. A record of the same shape still inside the guard is
+listed under ``never_dispatched_young_destructive_workflows``: the forward path
+waits for one that names only nodes it proved departed to age past the guard
+(``regional_release_departure_absorption``) instead of refusing the wave at once.
 
 The report also carries ``minimum_lease_remaining_seconds``: the smallest lease
 remaining across those outside nodes, in the same units as the request's
@@ -129,9 +132,17 @@ def operator_confirmed_parked(store: Any, workflow: Any, now: datetime) -> bool:
     )
 
 
-def never_dispatched_record(store: Any, workflow: Any, now: datetime) -> Any:
-    """The departed-node shape minus its proof, or None: PENDING, never dispatched."""
+def never_dispatched_record(
+    store: Any, workflow: Any, now: datetime, *, young: bool = False
+) -> Any:
+    """The departed-node shape minus its proof, or None: PENDING, never dispatched.
 
+    ``young`` asks for such a record still inside the dispatch guard instead.
+    """
+
+    inside_guard = workflow.created_at > now - NEVER_DISPATCHED_GUARD
+    if inside_guard != young:
+        return None
     if (
         workflow.status is not WorkflowStatus.PENDING
         or workflow.step_executions
@@ -144,7 +155,6 @@ def never_dispatched_record(store: Any, workflow: Any, now: datetime) -> Any:
             and workflow.execution_lease_expires_at > now
         )
         or workflow.remediation_budget_claims
-        or workflow.created_at > now - NEVER_DISPATCHED_GUARD
     ):
         return None
     try:
@@ -182,6 +192,7 @@ def main() -> None:
     resolved_destructive: list[str] = []
     confirmed_destructive: list[str] = []
     never_dispatched: list[dict[str, Any]] = []
+    young_never_dispatched: list[dict[str, Any]] = []
     for item in context.store.list_workflows(statuses=NONTERMINAL, limit=1001):
         if not any(
             step.operation in DESTRUCTIVE_OPERATIONS for step in item.official_steps
@@ -196,6 +207,9 @@ def main() -> None:
             record = never_dispatched_record(context.store, item, now)
             if record is not None:
                 never_dispatched.append(record)
+            young = never_dispatched_record(context.store, item, now, young=True)
+            if young is not None:
+                young_never_dispatched.append(young)
     excluded = set(expected["wave"])
     required = set(expected["nodes"]) - excluded
     agents = {
@@ -254,6 +268,7 @@ def main() -> None:
         "operator_confirmed_destructive_workflows": confirmed_destructive[:20],
         "never_dispatched_destructive_workflow_count": len(never_dispatched),
         "never_dispatched_destructive_workflows": never_dispatched[:20],
+        "never_dispatched_young_destructive_workflows": young_never_dispatched[:20],
         "agent_blocker_count": agent_blocker_count,
         "agent_blockers": agent_blockers,
         "minimum_lease_remaining_seconds": (

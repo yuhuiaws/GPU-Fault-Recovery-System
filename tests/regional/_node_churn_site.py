@@ -169,6 +169,12 @@ class ChurnSite:
         #: ``(event, callback)``: run once when ``event`` first happens.
         self.hooks: list[tuple[str, Any]] = []
         self.events: dict[str, int] = {}
+        #: ``(seconds, callback)``: run once when the site clock passes it.
+        self.timeline: list[tuple[float, Any]] = []
+        self.elapsed = 0.0
+        #: Destructive workflows the product opened: ``request_id``,
+        #: ``cluster_id``, ``node_ids``, ``created_at`` (never dispatched).
+        self.workflows: list[dict[str, Any]] = []
         for index, name in enumerate(names):
             self.join(name, zone=f"zone-{'ab'[index % 2]}", installed=template)
 
@@ -218,6 +224,14 @@ class ChurnSite:
         self.agents[name] = template
         self.beat(name)
 
+    def not_ready(self, name: str) -> None:
+        """The instance is going: the Node turns NotReady, the Agent falls silent."""
+
+        self.nodes.items[name]["status"]["conditions"] = [
+            {"type": "Ready", "status": "False"}
+        ]
+        self.silent.add(name)
+
     def reclaim(self, name: str) -> None:
         """The provider takes the instance back: Node, listing and Agent go."""
 
@@ -255,6 +269,11 @@ class ChurnSite:
         """Time passes: the reconciler takes a pass, live Agents heartbeat."""
 
         self.clock += timedelta(seconds=seconds)
+        self.elapsed += seconds
+        for index, (moment, callback) in enumerate(list(self.timeline)):
+            if callback is not None and self.elapsed >= moment:
+                self.timeline[index] = (moment, None)
+                callback()
         self.fire("tick")
         if self.reconciler is not None:
             self.reconcile_pass()
@@ -488,12 +507,23 @@ class ChurnSite:
                         "lease_remaining_seconds": lease,
                     }
                 )
+        guard = timedelta(minutes=10)
+        never, young = [], []
+        for item in self.workflows:
+            record = {
+                **{key: item[key] for key in ("request_id", "cluster_id", "node_ids")},
+                "created_at": item["created_at"].isoformat(),
+            }
+            (young if item["created_at"] > self.clock - guard else never).append(record)
         return json.dumps(
             {
                 "open_remote": {},
-                "destructive_workflow_count": 0,
-                "destructive_workflows": [],
-                "never_dispatched_destructive_workflows": [],
+                "destructive_workflow_count": len(self.workflows),
+                "destructive_workflows": [
+                    item["request_id"] for item in self.workflows
+                ],
+                "never_dispatched_destructive_workflows": never,
+                "never_dispatched_young_destructive_workflows": young,
                 "agent_blocker_count": len(blockers),
                 "agent_blockers": blockers,
                 "minimum_lease_remaining_seconds": min(remaining)

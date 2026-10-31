@@ -239,6 +239,9 @@ class FinalizeNewcomers:
     #: Newcomers carrying another identity's installation: held to the wait.
     drift: set[str] = field(default_factory=set)
     started: float = 0.0
+    #: The forward ``upgrade`` of a release that captured a node set: the end
+    #: of the roll waits for the planned nodes by name and looks for newcomers.
+    applicable: bool = False
 
     @property
     def active(self) -> bool:
@@ -262,14 +265,20 @@ class FinalizeNewcomers:
         agent_identity: dict[str, Any] | None,
         dcgm_hostengine: str | None,
     ) -> list[dict[str, Any]]:
-        """Give the newcomers the rest of the grace; record and narrate them."""
+        """Give the newcomers the rest of the grace; record and narrate them.
 
-        if not self.nodes:
+        Looked for once more first: a node that joined while the planned nodes
+        converged is a newcomer too.
+        """
+
+        if not self.applicable:
             return []
         deadline = self.started + NEWCOMER_GRACE_SECONDS
         while True:
             items = _selected(self.release, self.target, fresh=True)
             self.nodes.update(node for node in items if node not in self.planned)
+            if not self.nodes:
+                return []
             rows = []
             for node in sorted(self.nodes):
                 item = items.get(node)
@@ -327,6 +336,7 @@ def finalize_newcomers(
     joined = FinalizeNewcomers(release, target, planned, started=time.monotonic())
     if phase != "upgrade" or captured is None or release.runner.dry_run:
         return joined
+    joined.applicable = True
     items = _selected(release, target, fresh=True)
     joined.nodes = {node for node in items if node not in planned}
     joined.drift = {

@@ -40,6 +40,14 @@ of the record's nodes and waves while ``PENDING`` or ``INSTALLING``, so the
 record ends ``SUCCEEDED`` over the nodes that remain, never ``FAILED`` for a
 node that left; a node that converged before it left stays ``READY``. The
 evidence row names the deployment it was taken out of.
+
+Two more shapes of the same departure are absorbed by the waves: a node already
+on its way out (NotReady or being deleted) when the cluster's roll starts is
+waited for the same way and the roll is planned without it once it is proven
+gone, and a destructive workflow the product opened for the departed node --
+never dispatched, so harmless on an Agent a wave restarts, but younger than the
+product's ten-minute dispatch guard the gate sets such records aside after --
+holds the wave until it is old enough, instead of refusing it outright.
 """
 
 from __future__ import annotations
@@ -53,14 +61,21 @@ from typing import Any
 from gpu_fault_release.regional_release_config import (
     ClusterLocalReleaseError,
     ClusterTarget,
+    ReleaseError,
 )
 from gpu_fault_release.regional_release_departed_nodes import (
     departure_proof,
     record_departed_nodes,
     recorded_departed_nodes,
 )
-from gpu_fault_release.regional_release_errors import WaveAgentSafetyError
-from gpu_fault_release.regional_release_gpu_rollout import gpu_node_items
+from gpu_fault_release.regional_release_errors import (
+    WaveAgentSafetyError,
+    WaveWorkflowSafetyError,
+)
+from gpu_fault_release.regional_release_gpu_rollout import (
+    NODE_INVENTORY,
+    gpu_node_items,
+)
 from gpu_fault_release.regional_release_narration import narrate_step
 
 #: How long a node that looks gone may stay undecided: the product's
@@ -68,6 +83,16 @@ from gpu_fault_release.regional_release_narration import narrate_step
 DEPARTURE_DECISION_SECONDS = 600.0
 #: The proof reads AWS and execs into the control plane: at most this often.
 DEPARTURE_RECHECK_SECONDS = 30.0
+#: Two looks at a node this far apart did not see one absence: it was back in
+#: between (nothing asked about it), so its decision window starts again. Longer
+#: than any gap between two looks of one absence (a gate or barrier window plus
+#: a re-check).
+DEPARTURE_CONTINUITY_SECONDS = 180.0
+#: The wave probe's never-dispatched destructive records still inside the guard.
+YOUNG_NEVER_DISPATCHED_KEY = "never_dispatched_young_destructive_workflows"
+#: The probe's ``NEVER_DISPATCHED_GUARD`` (the product's dispatch guard): a
+#: never-dispatched record this old is set aside on the departure proof.
+NEVER_DISPATCHED_GUARD_SECONDS = 600.0
 BARRIER_PHASE = "cpu-heartbeat-barrier"
 WAVE_PHASE = "fleet-wave"
 #: The fleet probe operation that takes departed nodes out of a rollout record.
@@ -101,6 +126,33 @@ def node_leaving_state(item: Mapping[str, Any]) -> str | None:
         for condition in (item.get("status") or {}).get("conditions") or []
     )
     return None if ready else "NotReady"
+
+
+def leaving_node_names(
+    release: Any, target: ClusterTarget, node_names: Collection[str]
+) -> tuple[str, ...]:
+    """The nodes of ``node_names`` on their way out, from the roll's own read.
+
+    Only the Nodes the roll's inventory scope already holds are looked at: this
+    never adds a read, and a caller that listed names without the scope's
+    Nodes gets nothing to judge.
+    """
+
+    scope = NODE_INVENTORY.get()
+    items = (
+        scope[1].get(target.cluster_id)
+        if scope is not None and scope[0] is release
+        else None
+    )
+    wanted = set(node_names)
+    return tuple(
+        sorted(
+            name
+            for item in items or ()
+            if (name := str((item.get("metadata") or {}).get("name") or "")) in wanted
+            and node_leaving_state(item) is not None
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -142,6 +194,7 @@ class DepartureWatch:
     #: The clock the windows are measured on; ``time.monotonic`` when None.
     monotonic: Callable[[], float] | None = None
     first_seen: dict[str, float] = field(default_factory=dict)
+    last_gone: dict[str, float] = field(default_factory=dict)
     checked_at: dict[str, float] = field(default_factory=dict)
     departed: dict[str, dict[str, Any]] = field(default_factory=dict)
     unproven: dict[str, str] = field(default_factory=dict)
@@ -173,8 +226,13 @@ class DepartureWatch:
                 alive.append(node)
             else:
                 lingering[node] = state
+        for node in alive:
+            self._forget(node)
         for node in [*absent, *lingering]:
+            if now - self.last_gone.get(node, now) > DEPARTURE_CONTINUITY_SECONDS:
+                self._forget(node)
             self.first_seen.setdefault(node, now)
+            self.last_gone[node] = now
         for node, state in lingering.items():
             self.unproven[node] = PRESENT_REASON.format(state=state)
         due = [
@@ -200,10 +258,21 @@ class DepartureWatch:
             refused=refused,
         )
 
+    def _forget(self, node: str) -> None:
+        for book in (self.first_seen, self.last_gone, self.checked_at, self.unproven):
+            book.pop(node, None)
+
     def _prove(self, nodes: list[str], *, present: frozenset[str]) -> None:
-        proof = departure_proof(
-            self.release, self.target, nodes, present_node_names=present
-        )
+        try:
+            proof = departure_proof(
+                self.release, self.target, nodes, present_node_names=present
+            )
+        except ReleaseError as error:
+            # A read that failed decides nothing: the nodes stay undecided and
+            # are refused with this reason once the window has passed.
+            for node in nodes:
+                self.unproven[node] = f"departure proof unavailable: {error}"
+            return
         rows = [{**row, "excluded_at": self.phase} for row in proof.departed]
         record_departed_nodes(self.release, self.target, rows, phase=self.phase)
         for row in rows:
@@ -428,9 +497,12 @@ class WaveDepartures:
         """The wave's safety gate; a blocker that provably left leaves the set.
 
         The gate's own window is the wait: a node still undecided after it
-        sends the gate round again until the decision window runs out.
+        sends the gate round again until the decision window runs out. A young
+        never-dispatched destructive record of departed nodes holds the gate the
+        same bounded way (``_hold_for_departed_workflows``).
         """
 
+        held_since: list[float] = []
         while True:
             try:
                 return gate(
@@ -439,6 +511,10 @@ class WaveDepartures:
                     wave=wave,
                     node_names=tuple(sorted(safety_node_names)),
                 )
+            except WaveWorkflowSafetyError as error:
+                if self.watch is None:
+                    raise
+                self._hold_for_departed_workflows(error, held_since)
             except WaveAgentSafetyError as error:
                 if self.watch is None:
                     raise
@@ -463,6 +539,93 @@ class WaveDepartures:
                     ) from error
                 safety_node_names.difference_update(verdict.departed)
 
+    def _hold_for_departed_workflows(
+        self, error: WaveWorkflowSafetyError, held_since: list[float]
+    ) -> None:
+        """Return to re-run the gate, or raise: young records of departed nodes.
+
+        The product opens an incident -- and a destructive workflow no Agent was
+        ever handed -- for a node that left; the gate sets such a record aside
+        on the departure proof once it is past the product's ten-minute dispatch
+        guard (``departed_workflow_exclusions``). A wave that absorbed the node
+        reaches the next gate sooner than that. Every record the gate kept must
+        be one of those, of this cluster, naming only nodes the watch proves (or
+        is still proving) departed; then the gate is asked again, for at most
+        the decision window. Anything else is the gate's own refusal, as before.
+        """
+
+        assert self.watch is not None, "held only when enabled"
+        young = {
+            str(item.get("request_id") or ""): item
+            for item in error.snapshot.get(YOUNG_NEVER_DISPATCHED_KEY) or []
+            if isinstance(item, dict)
+        }
+        remaining = [str(request_id) for request_id in error.remaining]
+        records = [young.get(request_id) for request_id in remaining]
+        nodes = sorted(
+            {
+                str(node)
+                for record in records
+                if record is not None
+                for node in record.get("node_ids") or []
+                if str(node)
+            }
+        )
+        if (
+            not remaining
+            or error.remaining_count != len(remaining)
+            or any(
+                record is None
+                or str(record.get("cluster_id") or "") != self.target.cluster_id
+                or not record.get("node_ids")
+                for record in records
+            )
+        ):
+            raise error
+        verdict = self.watch.decide(nodes)
+        if verdict.alive:
+            raise error
+        if verdict.refused:
+            raise ClusterLocalReleaseError(
+                f"{error}; "
+                + verdict.refusal(self.target.cluster_id, "fleet wave gate")
+            ) from error
+        now = time.monotonic()
+        if not held_since:
+            held_since.append(now)
+            narrate_step(
+                "departed-node-workflows-held",
+                cluster=self.target.cluster_id,
+                workflows=",".join(remaining),
+                nodes=",".join(nodes),
+            )
+        if (
+            now - held_since[0]
+            > NEVER_DISPATCHED_GUARD_SECONDS + DEPARTURE_RECHECK_SECONDS
+        ):
+            raise ClusterLocalReleaseError(
+                f"{error}; the never-dispatched records of the departed nodes "
+                f"{','.join(nodes)} did not pass the product's dispatch guard within "
+                f"{NEVER_DISPATCHED_GUARD_SECONDS:.0f}s"
+            ) from error
+        time.sleep(DEPARTURE_RECHECK_SECONDS)
+
+    def settle_leaving(self, leaving: Collection[str]) -> frozenset[str]:
+        """Nodes on their way out when the cluster's roll starts: which left.
+
+        Each is judged until it is proven departed, is Ready again, or its
+        decision window runs out; the caller plans the roll without the
+        departed ones, and the pre-mutation gate judges the rest as before.
+        """
+
+        if self.watch is None or not leaving:
+            return frozenset()
+        while True:
+            verdict = self.watch.decide(leaving)
+            if verdict.refused or not verdict.pending:
+                return verdict.departed
+            time.sleep(DEPARTURE_RECHECK_SECONDS)
+
     def reconcile_record(
         self, deployment: dict[str, Any], deployment_id: str
     ) -> dict[str, Any]:
@@ -482,10 +645,18 @@ class WaveDepartures:
         )
         if not drop:
             return deployment
-        result = self.release._fleet_command(
-            EXCLUDE_DEPARTED_OPERATION,
-            {"deployment_id": deployment_id, "node_ids": drop},
-        )
+        try:
+            result = self.release._fleet_command(
+                EXCLUDE_DEPARTED_OPERATION,
+                {"deployment_id": deployment_id, "node_ids": drop},
+            )
+        except ReleaseError as error:
+            # The record stays as it was; the cluster pauses like a wave that
+            # did not converge, never a rollback of every converged cluster.
+            raise ClusterLocalReleaseError(
+                f"{self.target.cluster_id} fleet deployment {deployment_id} did not "
+                f"exclude the departed nodes {drop}: {error}"
+            ) from error
         updated = result.get("deployment") if isinstance(result, dict) else None
         accounted = {
             str(node)

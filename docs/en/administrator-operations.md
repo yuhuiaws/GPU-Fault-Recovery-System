@@ -1920,11 +1920,17 @@ healthy release:
   `shutting-down`, HyperPod still listing the instance, the Agent lease still live): the engine re-reads it every 30 s for at
   most 10 minutes (the product's departure guard) and then fails closed, naming the node and the reason (`… names nodes missing
   from Kubernetes that are not provably departed: <node>: <reason>`). An Agent that still heartbeats (a pin not aligned, say)
-  or a silent Agent on a Node that is still Ready is no departure and fails at once, as before.
+  or a silent Agent on a Node that is still Ready is no departure and fails at once, as before. A node already NotReady or
+  being deleted when the cluster's roll starts is judged the same way first: proven gone, it is left out of the roll's plan;
+  Ready again, it is rolled as usual. A never-dispatched destructive workflow the product opened for the departed node holds
+  the wave gate while it is inside the product's ten-minute dispatch guard: the engine waits for it to pass the guard and then
+  sets it aside on the departure proof (log `departed-node-workflows-held`) instead of refusing at once; a record that names a
+  node still alive is refused as before.
 - **A node joins**: a node outside the snapshot's set is a newcomer. A newcomer not yet installed when the cluster's roll starts
   is in no wave and not in the pre-mutation gate (log `joined-nodes cluster=… phase=node-rollout
-  deferred=<node>:<installer-state>`). When the roll ends and the steady-state Reconciler is handed `*`, every planned node must
-  still converge as before; newcomers get a 300 s grace from that moment: one installed inside it is recorded `installed`, the
+  deferred=<node>:<installer-state>`). When the roll ends and the steady-state Reconciler is handed `*`, the planned nodes are
+  waited for by name and must all converge (a node that joins during that wait is a newcomer too); newcomers get a 300 s
+  grace from that moment: one installed inside it is recorded `installed`, the
   rest `pending` (log `joined-nodes … pending=<node>:<state>`), and the release carries on while the steady-state Reconciler
   finishes them. A newcomer that joins carrying the previous version's installation gets no grace: like a planned node, the
   release waits for the Reconciler to re-install it, and `agents did not converge` if it does not.
@@ -1932,7 +1938,9 @@ healthy release:
   installer check, the Agent coverage and the fleet readiness question, and named in a WARN of `gpu_cluster:<cluster>` and
   `control_api` (`joined_nodes_installing`, `release_churn`); the Agent record of a node this release proved departed and that
   has no Kubernetes Node any more (ACTIVE with a lapsed lease until the departed-node cleanup retires it) is not counted as
-  coverage, Runtime Profile or a collector to wait for. The stability window lists the DaemonSet Pods of newcomers under
+  coverage, Runtime Profile or a collector to wait for; one the release never got to judge (it left before its cluster rolled,
+  or after the last wave) is put to the same read-only proof by the verify itself (`release_churn.proven_by_verify`) and
+  still fails it when the proof does not hold. The stability window lists the DaemonSet Pods of newcomers under
   `joined_node_pods` without judging them. An installed newcomer is judged like every node -- installed with any artifact
   but the release's it is `artifact drift` -- and `status` exempts nothing: a newcomer still reads `installer is not
   Succeeded` until it is installed.
