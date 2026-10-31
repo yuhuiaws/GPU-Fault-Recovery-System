@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from gpu_fault.admin import aurora_failback, eks_nodegroup_prepare, operator_identity
+from gpu_fault.admin import capacity_fleet
 from gpu_fault.admin import hyperpod_scheduled_update, remediation_storm
 from gpu_fault.admin.deploy_host_binding import (
     DEPLOY_HOST_STATE_BINDING as DEPLOY_HOST_STATE_BINDING,
@@ -76,6 +77,7 @@ from gpu_fault.admin.config_file import (
     load_admin_config_file,
     write_admin_config_file,
 )
+from gpu_fault.admin.config_command import add_admin_config_command
 from gpu_fault.admin.config_aurora import (
     aurora_drift_remedy,
     await_site_aurora,
@@ -172,7 +174,7 @@ from gpu_fault.admin.submit_remediation import (
     run_submit_remediation_command,
 )
 from gpu_fault.admin.uninstall import UninstallRequest, uninstall
-from gpu_fault.admin import warm_spare, workflow_reconcile_departed_agents
+from gpu_fault.admin import workflow_reconcile_departed_agents
 from gpu_fault.admin import warm_spare_departed
 from gpu_fault.admin.workflow_reconcile import run_workflow_reconcile
 from gpu_fault_release.regional_release_config import ReleaseError
@@ -293,47 +295,6 @@ def _add_managed_site_arguments(command: argparse.ArgumentParser) -> None:
         type=Path,
         help=argparse.SUPPRESS,
     )
-
-
-def _add_admin_config_command(commands: Any) -> None:
-    config = commands.add_parser(
-        "config",
-        usage=(
-            "gpu-fault-admin config --state-dir STATE_DIR "
-            "[--file ADMIN_CONFIG] [--dry-run] [--reference REFERENCE]"
-        ),
-        help=(
-            "apply the edited <state-dir>/admin-config.yaml to the live site "
-            "(Aurora window and the affected control-plane roles)"
-        ),
-    )
-    # Not ``required``: the ``config spare`` sub-action carries its own
-    # ``--state-dir``; ``_managed_site_file`` refuses a bare ``config`` without it.
-    config.add_argument("--state-dir", type=Path, metavar="STATE_DIR")
-    config.add_argument(
-        "--file",
-        dest="admin_config_file",
-        type=Path,
-        metavar="ADMIN_CONFIG",
-        help=("private AdminConfig YAML; defaults to <state-dir>/admin-config.yaml"),
-    )
-    config.add_argument(
-        "--reference",
-        metavar="REFERENCE",
-        help=(
-            "change or maintenance-window reference for the audit record; "
-            "defaults to the approver identity and the start time"
-        ),
-    )
-    config.add_argument(
-        "--dry-run",
-        action="store_true",
-        help=(
-            "print the change plan (affected roles, changed fields, Aurora "
-            "change) from local state only; nothing is verified or written"
-        ),
-    )
-    warm_spare.add_config_spare_command(config)
 
 
 def _add_workflow_reconcile_command(commands: Any) -> None:
@@ -543,7 +504,7 @@ def parser() -> argparse.ArgumentParser:
     eks_nodegroup_prepare.add_command(commands)
     add_node_scope_command(commands, _add_managed_site_arguments)
     hyperpod_scheduled_update.add_command(commands)
-    _add_admin_config_command(commands)
+    add_admin_config_command(commands)
     _add_workflow_reconcile_command(commands)
     add_failure_domain_map_command(commands, _add_managed_site_arguments)
     add_rotate_token_command(commands, _add_managed_site_arguments)
@@ -1219,6 +1180,12 @@ def _apply_admin_config(
             uncommitted_target_sha256=(
                 str(pending["desired_config_sha256"]) if pending is not None else None
             ),
+        )
+        capacity_fleet.refuse_lowered_node_counts(
+            site,
+            current,
+            desired,
+            accepted=bool(getattr(arguments, "accept_below_registered_fleet", False)),
         )
     with admin_phase("config", "apply-record"):
         apply = begin_admin_config_apply(

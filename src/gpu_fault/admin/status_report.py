@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from gpu_fault.admin.aurora_placement import placement_findings
+from gpu_fault.admin.capacity_fleet import capacity_findings, capacity_topology_field
 from gpu_fault.admin.command_log import ADMIN_LOG_ENVIRONMENT
 from gpu_fault.admin.dcgm_declaration import (
     READ_ERRORS,
@@ -121,7 +122,10 @@ def print_status_report(
     publishes against that copy, the Aurora instances' CA in both). A full
     report adds one advisory per selected plain EKS GPU node group whose
     ``updateStrategy`` is not MINIMAL, read from its ``regional_contexts`` check
-    (``eks_nodegroup_update_strategy``).
+    (``eks_nodegroup_update_strategy``). Every report with a ``control_api``
+    check also gets the declared capacity topology against the registered GPU
+    nodes (``capacity_fleet``): one ``capacity:`` finding, a ``WARN capacity:``
+    finding per count the fleet exceeds, and the ``capacity_topology`` field.
 
     With ``site_file`` -- the managed site, whose directory holds the deploy
     host's records -- the installation registry sync record is added as the
@@ -143,7 +147,13 @@ def print_status_report(
             *rds_ca_bundle_findings(site),
         ]
     report = status_document(stdout or "")
-    findings = [*findings, *update_strategy_findings(report)]
+    findings = [
+        *findings,
+        *update_strategy_findings(report),
+        *capacity_findings(
+            report, state_dir=site_file.parent if site_file is not None else None
+        ),
+    ]
     if site_file is not None:
         fields, declaration_findings = dcgm_declaration_fields(report, site_file)
         view = status_view(site_file.parent, release_id=_running_release_id(report))
@@ -152,7 +162,9 @@ def print_status_report(
             *declaration_findings,
             *([view["finding"]] if view["finding"] else []),
         ]
-        stdout = _with_deploy_host_fields(stdout, {**fields, FIELD: view})
+        stdout = _with_deploy_host_fields(
+            stdout, {**fields, FIELD: view, **capacity_topology_field(report)}
+        )
     log_path = os.environ.get(ADMIN_LOG_ENVIRONMENT, "").strip()
     destination = "stdout" + (f" (also in {log_path})" if log_path else "")
     lines = (

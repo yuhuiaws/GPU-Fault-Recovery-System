@@ -130,7 +130,12 @@ untouched (the error names the missing cores and every node's headroom; the evid
 surge-first roll is steered by the deletion order the preflight chose (`controller.kubernetes.io/pod-deletion-cost`
 annotations, the old Pod sharing the surge node last) and an expired rollout wait prints the stall diagnosis first (the
 pending new Pod's scheduler verdict and every node's headroom). After an
-interruption, rerunning the same command resumes, and roles already matching the target roll no more. Complete fields,
+interruption, rerunning the same command resumes, and roles already matching the target roll no more. A target that
+lowers `largestClusterNodeCount` or `managedNodeCount` below the registered GPU nodes is read through the control plane
+and refused before anything is written (a fleet that cannot be read is refused too; `--dry-run` reads no cluster and
+cannot judge this); while the fleet is being shrunk, or its count errs high because of an Agent the departed-node
+cleanup has not retired yet, `--accept-below-registered-fleet` applies anyway and prints the finding on stderr
+(Administrator Capacity Configuration §5.1). Complete fields,
 templates, first deployment and rollback semantics are in
 [Administrator Capacity Configuration](administrator-capacity-configuration.md).
 
@@ -463,6 +468,26 @@ a manual verify/probe without that environment variable always reruns.
 `status` first prints five human-readable summary lines on stderr (healthy or not, online release id and phase,
 the next deployment classification, failed check names, where the JSON went), then outputs the complete JSON unchanged to stdout; scripts parse
 stdout as before.
+
+After the header, the `finding:` lines also compare the declared topology with the registered GPU fleet, computed from
+the engine's status JSON with no new probe and no new read: the declared counts come from
+`configured_release.admin_config.capacity`, the registered nodes from the `control_api` check's per-cluster Agent list
+(`ACTIVE` or `DRAINING`). When both are known there is always one line
+`capacity: registered GPU nodes <total> of the declared managedNodeCount <M>; per cluster against the declared largestClusterNodeCount <L>: <cluster> <n>, ...`
+(largest cluster first, at most 5 named, then `, and <k> more in capacity_topology`); a cluster above its declaration
+gets one line
+`WARN capacity: cluster <id> has <n> registered GPU nodes, above the declared largestClusterNodeCount <L>; raise ...`
+(at most 5, then one summary line), and a site above its declaration one line
+`WARN capacity: <total> registered GPU nodes, above the declared managedNodeCount <M>; raise ...`, each naming the fields
+to raise and the `gpu-fault-admin config` command; the JSON document gains the deploy-host field `capacity_topology`
+(`declared`, `registered`, `clusters_above_declared`, `managed_above_declared`). The lines are advisory: `healthy`, the
+checks and the exit code are unchanged; while the `control_api` check fails, its own message is the finding and no
+capacity line is printed. A status read is a snapshot: right after a spot replacement a departed node not yet retired
+still counts (the alert waits 30 minutes; status does not). The deploy preflight does not judge this: spot capacity
+growing must never fail a deploy, and the preflight has no control-plane fleet read; the alerts and status report it.
+The complete lines, fields and remedies are in [Administrator Capacity Configuration](administrator-capacity-configuration.md)
+§5.1 and the §8 cards `GpuFaultClusterNodesExceedDeclaredTopology` / `GpuFaultManagedNodesExceedDeclaredTopology`.
+
 Synchronisation of the installation resource registry is also no longer on the critical path of `deploy`'s return code:
 it is performed by the release driver after the release commit, and a failure is recorded only as
 `installation_registry.status=UNAVAILABLE` in `state.json` and one `completion_warnings` entry; the release itself is still
@@ -3771,9 +3796,11 @@ evidence and routine requests are refused. The two "depth" panels plot the same 
   declaration, `max(maxClusterQueueDepth / 8, largestClusterNodeCount)` (one fault-priority request per node of a
   whole-cluster correlated fault), and the per-cluster queue floor `maxClusterQueueDepth >= 4 x largestClusterNodeCount`
   are sized for a smaller cluster: a whole-cluster fault on this one may not fit the reserve.
-- **First check**: `gpu-fault-admin status`: an Agent the departed-node cleanup has not retired yet still counts (the
-  `departed nodes:` lines; with `spec.workflow.departedNodeCleanup: false` they stay until
-  `workflow-reconcile --retire-departed-agents`, §10.2). If the cluster really is that large, edit
+- **First check**: `gpu-fault-admin status`: its header line
+  `WARN capacity: cluster <id> has <n> registered GPU nodes, ...` names the cluster, its registered nodes and the fields
+  to raise; an Agent the departed-node cleanup has not retired yet still counts (the `departed nodes:` lines; with
+  `spec.workflow.departedNodeCleanup: false` they stay until `workflow-reconcile --retire-departed-agents`, §10.2). If
+  the cluster really is that large, edit
   `<state-dir>/admin-config.yaml`: raise `spec.capacity.largestClusterNodeCount` to at least the alert value, with
   `spec.processor.maxClusterQueueDepth` at least 4 x it and `spec.capacity.managedNodeCount` at least it, then run
   `gpu-fault-admin config --state-dir <state-dir>` (it rolls the three CPU roles;
@@ -3792,7 +3819,8 @@ evidence and routine requests are refused. The two "depth" panels plot the same 
   compared). The alert value is the managed fleet's registered GPU nodes. The Aurora floor derived from that declaration,
   `minAcu >= ceil(managedNodeCount / 100, 0.5 ACU)`, and the ingress normal-tier concurrency
   `clamp(ceil(managedNodeCount / 5), 1000, 3584)` are sized for a smaller fleet.
-- **First check**: `gpu-fault-admin status`, as for the previous card: a departed Agent not retired yet still counts. If
+- **First check**: `gpu-fault-admin status`: its header line `WARN capacity: <total> registered GPU nodes, ...` gives
+  the registered total and the `minAcu` floor; as for the previous card, a departed Agent not retired yet still counts. If
   the fleet really is that large, raise `spec.capacity.managedNodeCount` in `<state-dir>/admin-config.yaml` to at least the
   alert value, and in the same file `spec.aurora.minAcu >= ceil(managedNodeCount / 100, 0.5 ACU)` (2048 nodes -> 20.5,
   for example), then run `gpu-fault-admin config --state-dir <state-dir>`: it rolls the three CPU roles, and raising

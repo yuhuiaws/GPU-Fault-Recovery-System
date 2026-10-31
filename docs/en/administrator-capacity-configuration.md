@@ -111,7 +111,7 @@ A first deployment does not need `config` to run first. Without `--config` the r
 ### 4.1 Command
 
 ```text
-gpu-fault-admin config --state-dir STATE_DIR [--file ADMIN_CONFIG] [--dry-run] [--reference REFERENCE]
+gpu-fault-admin config --state-dir STATE_DIR [--file ADMIN_CONFIG] [--dry-run] [--reference REFERENCE] [--accept-below-registered-fleet]
 ```
 
 Under the same verb there is also a sub-action `gpu-fault-admin config spare --state-dir STATE_DIR --node NODE [--declare|--release ...]` for declaring or releasing warm-spare GPU nodes; it does not involve the capacity configuration of this document, see the task table of [Administrator Operations](administrator-operations.md).
@@ -127,11 +127,19 @@ gpu-fault-admin config --state-dir /secure/gpu-fault
 - `--dry-run`: reads only the local `desired.json` and YAML, prints the change plan (affected roles, before/after values per field,
   whether Aurora changes) and exits. No Cosign signature verification, no cluster reads, no executor identity resolution, no state file written,
   and no migration of a legacy `desired.json`. A missing input file is refused outright without creating the template or changing
-  directory permissions; the ordinary non-dry-run command can still initialise a missing default template.
+  directory permissions; the ordinary non-dry-run command can still initialise a missing default template. Reading no
+  cluster, it cannot judge whether a lowered node count falls below the registered GPU fleet (§4.2 step 2): it prints the
+  plan as before, and the real apply judges.
 - `--reference`: optional change ticket or maintenance window number, 3 to 128 letters, digits or `. _ : / -`.
   When absent it is recorded as `<executor identity>:<start time>`. The executor identity is always taken automatically from
   the caller ARN of `aws sts get-caller-identity` (degrading to `user@host` when unobtainable) and enters the audit record together with the
   reference; administrators need not and cannot fill in the identity by hand.
+- `--accept-below-registered-fleet`: when the target lowers `spec.capacity.largestClusterNodeCount` or `managedNodeCount`
+  below the registered GPU nodes, or the registered nodes cannot be read, the apply refuses by default (§4.2 step 2,
+  §5.1); with this flag the refusal's finding becomes one stderr line,
+  `gpu-fault-admin config: --accept-below-registered-fleet: <finding>; applying anyway`, and the apply continues as
+  usual. Use it only while the fleet is being shrunk or its count errs high because of an Agent the departed-node cleanup
+  has not retired yet.
 
 Fields absent from the file inherit the currently persisted values. The CLI refuses unknown fields, wrong types, a spool switch inconsistent with its replicas,
 `managedNodeCount` less than
@@ -148,6 +156,15 @@ and, in order:
    fully; with no change it prints `NOOP` and exits without writing any file.
 2. Checks the content-addressed Manifest against the Cosign attestation and reads the live release
    state in the CPU cluster: it must be the current signed release and already committed, otherwise fail closed (except the resume exception of §4.3).
+   When the target lowers `spec.capacity.largestClusterNodeCount` or `managedNodeCount` below the current `desired.json`
+   value, it then (still before anything is written) reads the registered GPU nodes through the control plane: one
+   exec into a Running api-ha Pod, the channel every administrator command uses, counting per cluster the Agents in
+   `ACTIVE` or `DRAINING`, synthetic drill clusters left out. A count below them is refused -- `largestClusterNodeCount`
+   against the largest registered cluster, `managedNodeCount` against the registered total; a fleet that cannot be read
+   (no Running api-ha Pod, an exec failure) is refused as well: a lowering that cannot be judged is refused.
+   Raising or keeping a count reads nothing and judges nothing, and lowering it to a value still at or above the
+   registered nodes passes. The refusal and its reasons are in §5.1; `--accept-below-registered-fleet` (§4.1) turns the
+   finding into one stderr line and the apply continues.
 3. Writes the audit: `history/<start time>-<target configuration digest>/before.json` (the
    `desired.json` before the change), `pending.json` (configuration before and after, site identity, signed release identity,
    executor, reference, start time), then changes `desired.json` to the target configuration.
@@ -594,10 +611,11 @@ that declared none (gauge 0); with no declared gauge at all there is no comparis
 exceeded; a spike shorter than 30 minutes does not fire, so the minutes of a spot replacement that count the old and
 the new node are ridden out by `for`. The per-cluster alert carries `cluster_id`, so the existing Alertmanager drill
 route (`cluster_id=~"perf-cap-.*"` -> sink, Performance Acceptance Plan §3.1) applies to it, and the drill clusters are
-not in the families anyway. When one fires, first read `gpu-fault-admin status`: an Agent the departed-node cleanup has
-not retired yet still counts (the `departed nodes:` lines; with `spec.workflow.departedNodeCleanup: false` they stay
-until `workflow-reconcile --retire-departed-agents`); if the fleet really is that large, raise the declaration by the
-rules above. Never silence either alert by lowering anything.
+not in the families anyway. When one fires, first read `gpu-fault-admin status` (its `capacity:` / `WARN capacity:`
+lines are described below): an Agent the departed-node cleanup has not retired yet still counts (the `departed nodes:`
+lines; with `spec.workflow.departedNodeCleanup: false` they stay until `workflow-reconcile --retire-departed-agents`);
+if the fleet really is that large, raise the declaration by the rules above. Never silence either alert by lowering
+anything.
 
 **Dashboards.** The overview's (`gpu-fault-overview`) "Declared topology" row keeps its stat panel "Declared GPU node
 counts" and gains two timeseries panels beside it: "Registered GPU nodes per cluster vs declared largest cluster" (the
@@ -605,6 +623,45 @@ registered nodes per `cluster_id`, `max`, against the declared `largestClusterNo
 nodes vs declared managed fleet" (the registered total, `max`, against the declared `managedNodeCount`, `min`); the two
 alerts land on these panels. The Control-plane capacity dashboard (`gpu-fault-control-plane-capacity`) gains the row
 "Fleet vs declared topology" with the same two panels.
+
+**What `gpu-fault-admin status` reports.** On the deploy host, `status` computes this comparison from the engine's
+status JSON, with no new probe and no new read: the declared counts come from the report's
+`configured_release.admin_config.capacity` (the site's desired config), and each configured cluster's registered nodes
+from the `control_api` check's per-cluster Agent list (`ACTIVE` or `DRAINING`). They are printed as `finding:` lines
+after the header:
+
+```text
+gpu-fault-admin status: finding: capacity: registered GPU nodes <total> of the declared managedNodeCount <M>; per cluster against the declared largestClusterNodeCount <L>: <cluster> <n>, <cluster> <n>
+gpu-fault-admin status: finding: WARN capacity: cluster <id> has <n> registered GPU nodes, above the declared largestClusterNodeCount <L>; raise spec.capacity.largestClusterNodeCount to at least <n> (spec.processor.maxClusterQueueDepth at least <4n>) and run gpu-fault-admin config --state-dir <state-dir>
+gpu-fault-admin status: finding: WARN capacity: <total> registered GPU nodes, above the declared managedNodeCount <M>; raise spec.capacity.managedNodeCount to at least <total> with spec.aurora.minAcu at least <floor> (ceil(managedNodeCount / 100, 0.5 ACU)) and run gpu-fault-admin config --state-dir <state-dir>
+```
+
+The first line is always printed when both sides are known, the clusters largest first, at most 5 named and the rest
+as `, and <k> more in capacity_topology`; each cluster above its declaration gets one `WARN capacity: cluster ...` line
+(at most 5, then one summary line); a site above its declaration gets one `WARN capacity: <total> registered GPU nodes
+...` line. The JSON document gains the deploy-host field `capacity_topology`:
+`{"declared": {"largest_cluster_node_count", "managed_node_count"}, "registered": {"clusters": {<id>: n}, "managed": total}, "clusters_above_declared": [...], "managed_above_declared": bool}`.
+The lines are advisory: `healthy`, the checks and the exit code are unchanged. While the `control_api` check fails, its
+own message is the finding and no capacity line is printed. A status read is a snapshot: right after a spot
+replacement a departed node not yet retired still counts (the alert waits 30 minutes; status does not). The deploy
+preflight does not judge this: spot capacity growing must never fail a deploy, and the preflight has no control-plane
+fleet read; the alerts and status report it.
+
+**Lowering the declaration: config refuses a count below the registered fleet.** When the target lowers
+`largestClusterNodeCount` or `managedNodeCount`, the apply reads the registered GPU nodes before anything is written
+(§4.2 step 2) and refuses a count below them, one clause per field below its registered nodes:
+
+```text
+refusing to lower the declared topology below the registered GPU fleet: spec.capacity.largestClusterNodeCount <new> is below the <n> registered GPU nodes of cluster <id>[; spec.capacity.managedNodeCount <new> is below the <total> registered GPU nodes of the managed fleet]. The limits derived from these counts (the per-cluster fault reserve and queue floor, the Aurora Min ACU floor, the ingress normal-tier slots) would be sized for a smaller fleet than the one running; keep each count at least the registered nodes, or rerun with --accept-below-registered-fleet while the fleet is being shrunk or its count errs high (an Agent the departed-node cleanup has not retired yet still counts)
+```
+
+When the fleet cannot be read the message is `cannot read the registered GPU nodes to judge the lowered spec.capacity.<field>: <error>; rerun when the control plane answers, or rerun with --accept-below-registered-fleet`.
+The refusal rests on the evidence: the empirical floors of §5 are validated against the declared counts, so a count
+below the live fleet lets `maxClusterQueueDepth` and `minAcu` fall under what the measurements (Performance Acceptance
+Plan §13.3/§13.4) require for the fleet that is really running, and the per-cluster fault reserve can drop below one
+whole-cluster wave. While the fleet is being shrunk, or its count errs high because of an Agent the departed-node
+cleanup has not retired yet, apply with `--accept-below-registered-fleet` (§4.1), which prints the finding on stderr;
+`--dry-run` reads no cluster and cannot judge this.
 
 ## 6. Precedence and Omitted Fields
 
