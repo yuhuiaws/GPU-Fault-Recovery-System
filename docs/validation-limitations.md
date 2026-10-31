@@ -3521,8 +3521,9 @@ interval + margin, 615 / 555 / 495 s here, bounded and recorded in the
 result -- so the recovered edge and at least one summary after it have been
 seen before the negative verdict is read. 005 `capacity_full` waits for
 VALIDATE_HOST to be terminal (one summary) before grading its chain. The
-variant windows grew with the budgets: 001 cpu_busy, recovery and
-checkpoint_phase 35 min, load_average 45, short_burst and invalid_delta 16;
+variant windows grew with the budgets: 001 cpu_busy and recovery 35 min,
+checkpoint_phase 50 (it starts a managed job first), load_average 45,
+short_burst and invalid_delta 16;
 002 memory_pressure 55, recovery 50, swap_pressure 25 (the allocator's hold
 is 2355 s, under the node probe's 3600-s unit cap); 009 sustained_drops 30,
 wrong_interface and recovery 25, short_drops 16; the required-interface
@@ -3540,6 +3541,21 @@ from the fill for the 60-s local filesystem rule plus the validation) and
 unusable-filesystem diagnostics (420 s for a no-sustain rule plus the
 validation's summary, 90 s of slack). Their pass-5 FAIL or INCONCLUSIVE
 verdicts may be these budgets rather than the product.
+
+001 `checkpoint_phase` never declared a checkpoint phase: it ran the
+`cpu_busy` load and chain with no managed attempt on the node. It now starts
+027's managed progress job on the lane node (rank 0, the product's own
+training-progress reporter; it needs `--site-file`, otherwise
+NOT_RUN(FIXTURE_NOT_READY)), writes `labels.phase=CHECKPOINT_SAVE` into its
+progress file and starts the load only once the product's training-progress
+state shows that phase (otherwise INCONCLUSIVE within 120 s, no load
+started). It passes when the cpu finding stays the diagnostic chain --
+FREEZE_EVIDENCE then a VALIDATE_HOST that fails while loaded on the
+`cpu_usage_percent` probe, the incident in a diagnostic state -- with no
+hardware step and no STOP, restart or isolation planned for the
+checkpointing attempt, and the attempt, read after the finding, still
+RUNNING, still declaring the phase, its latest heartbeat no older than the
+finding. The absent phase correlation stays a note, not a FAIL.
 
 The same review of every diagnostic-only verdict found one more incident
 the matcher could not see: 025 `exporter_timeout`, `sustained_unknown` and

@@ -12,8 +12,10 @@ import pytest
 
 from gpu_fault.host_health import NodeHealthPolicy
 from scripts.e2e.regional import general_live_host as host
+from scripts.e2e.regional import general_live_progress as progress
 from scripts.e2e.regional.general_live_common import STORE_POLL_SECONDS
-from scripts.e2e.regional.general_live_fixture import VariantInconclusive
+from scripts.e2e.regional.general_live_fixture import VariantInconclusive, VariantNotRun
+from scripts.e2e.regional.general_live_progress_probes import TRAINING_PROBE
 from tests.regional._general_live_fakes import (
     FakeProbe,
     FakeRegional,
@@ -236,11 +238,85 @@ def test_short_burst_fails_when_a_finding_appears(tmp_path: Path) -> None:
     assert result["verdict"] == "FAIL"
 
 
-def test_recovery_and_checkpoint_phase_pass(tmp_path: Path) -> None:
+class FakePhaseJob:
+    """The managed progress job double: what the runner wrote, no cluster."""
+
+    created: list["FakePhaseJob"] = []
+
+    def __init__(self, ctx: Any, *, name: str, **_: Any) -> None:
+        self.name = name
+        self.attempt_id = f"{name}-a001"
+        self.writes: list[tuple[int, dict[str, Any]]] = []
+        self.deleted = False
+        FakePhaseJob.created.append(self)
+
+    def start(self) -> dict[str, Any]:
+        return {}
+
+    def identity(self) -> dict[str, Any]:
+        return {"job_id": self.name, "attempt_id": self.attempt_id}
+
+    def write_progress(self, rank: int, **fields: Any) -> dict[str, Any]:
+        self.writes.append((rank, fields))
+        return {}
+
+    def delete(self) -> None:
+        self.deleted = True
+
+
+@pytest.fixture
+def phase_job(monkeypatch: pytest.MonkeyPatch) -> type[FakePhaseJob]:
+    FakePhaseJob.created = []
+    monkeypatch.setattr(progress, "ManagedProgressJob", FakePhaseJob)
+    return FakePhaseJob
+
+
+#: The attempt's training records once the reporter posted the declared phase.
+CHECKPOINTING = {
+    "progress_states": [
+        {
+            "rank": 0,
+            "step": 100,
+            "labels": {"phase": "CHECKPOINT_SAVE"},
+            "observed_at": "2026-10-24T00:20:00+00:00",
+        }
+    ],
+    "observation": {"workload_phase": "RUNNING"},
+    "incidents": [],
+    "workflows": {},
+    "decision": None,
+    "notifications": [],
+}
+
+
+def with_training(
+    activity: Any, training: Any = CHECKPOINTING
+) -> Any:  # a cpu_python double
+    """``activity`` answers the node-activity reads, ``training`` (a document,
+    or a list consumed per read) the attempt's TRAINING_PROBE reads."""
+
+    reads = {"training": 0}
+
+    def respond(script: str, *arguments: str, **options: Any) -> dict[str, Any]:
+        if script is TRAINING_PROBE:
+            documents = training if isinstance(training, list) else [training]
+            index = min(reads["training"], len(documents) - 1)
+            reads["training"] += 1
+            return dict(documents[index])
+        return activity(script, *arguments, **options)
+
+    return respond
+
+
+def test_recovery_and_checkpoint_phase_pass(
+    tmp_path: Path, phase_job: type[FakePhaseJob]
+) -> None:
     for variant in ("recovery", "checkpoint_phase"):
         spec = SPECS[variant]
         regional = FakeRegional(
-            cpu_python=store_script({"activity": chain_activity("cpu_usage_percent")})
+            cpu_python=with_training(
+                store_script({"activity": chain_activity("cpu_usage_percent")})
+            )
         )
         ctx = make_context(
             spec,
@@ -253,6 +329,99 @@ def test_recovery_and_checkpoint_phase_pass(tmp_path: Path) -> None:
     assert any("phase correlation" in note for note in result["notes"]), (
         "any('phase correlation' in note for note in result['notes'])"
     )
+    (job,) = phase_job.created
+    assert job.writes == [
+        (0, {"step": 100, "loss": 1.0, "labels": {"phase": "CHECKPOINT_SAVE"}})
+    ], "the attempt declares the checkpoint phase before the load"
+
+
+def checkpoint_ctx(tmp_path: Path, training: Any, activity: Any = None) -> Any:
+    spec = SPECS["checkpoint_phase"]
+    activity = activity or store_script(
+        {"activity": chain_activity("cpu_usage_percent")}
+    )
+    return make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=FakeRegional(cpu_python=with_training(activity, training)),
+        probes={f"node@{NODE}": busy_node_probe()},
+    )
+
+
+def test_checkpoint_phase_never_declared_is_inconclusive_before_any_load(
+    tmp_path: Path, phase_job: type[FakePhaseJob]
+) -> None:
+    # The product never shows the phase: the stimulus did not reach it (the
+    # old variant declared nothing at all and passed on the cpu chain).
+    undeclared = {**CHECKPOINTING, "progress_states": []}
+    ctx = checkpoint_ctx(tmp_path, undeclared)
+    with pytest.raises(VariantInconclusive, match="never recorded"):
+        SPECS["checkpoint_phase"].execute(ctx)
+    calls = [call[0] for call in ctx.probes[f"node@{NODE}"].calls]
+    assert "cpu-start" not in calls, calls
+
+
+@pytest.mark.parametrize(
+    ("after", "error"),
+    [
+        (
+            {**CHECKPOINTING, "observation": {"workload_phase": "STOPPED"}},
+            "the checkpointing attempt is STOPPED, not RUNNING",
+        ),
+        (
+            {
+                **CHECKPOINTING,
+                "progress_states": [
+                    {**CHECKPOINTING["progress_states"][0], "labels": {}}
+                ],
+            },
+            "the attempt no longer declares CHECKPOINT_SAVE",
+        ),
+        (
+            {
+                **CHECKPOINTING,
+                "progress_states": [
+                    {
+                        **CHECKPOINTING["progress_states"][0],
+                        "observed_at": "2026-10-24T00:01:00+00:00",
+                    }
+                ],
+            },
+            "the attempt's last CHECKPOINT_SAVE heartbeat predates the cpu finding",
+        ),
+    ],
+    ids=["stopped", "phase-dropped", "stale"],
+)
+def test_checkpoint_phase_fails_when_the_phase_was_not_held_through_the_finding(
+    tmp_path: Path, phase_job: type[FakePhaseJob], after: Any, error: str
+) -> None:
+    ctx = checkpoint_ctx(tmp_path, [CHECKPOINTING, after])
+    result = SPECS["checkpoint_phase"].execute(ctx)
+    assert result["verdict"] == "FAIL", result
+    assert result["stages"]["phase_held"] == [error], result["stages"]
+
+
+def test_checkpoint_phase_fails_when_the_cpu_chain_stops_the_attempt(
+    tmp_path: Path, phase_job: type[FakePhaseJob]
+) -> None:
+    stopped = chain_activity("cpu_usage_percent")
+    stopped["workflows"][0]["official_steps"].insert(
+        1, {"operation": "STOP_WORKLOADS", "parameters": {}}
+    )
+    ctx = checkpoint_ctx(tmp_path, CHECKPOINTING, store_script({"activity": stopped}))
+    result = SPECS["checkpoint_phase"].execute(ctx)
+    assert result["verdict"] == "FAIL", result
+    assert any("STOP_WORKLOADS" in item for item in result["stages"]["chain"]), result[
+        "stages"
+    ]
+
+
+def test_checkpoint_phase_without_a_site_file_is_not_run(tmp_path: Path) -> None:
+    # The real job: a managed progress job needs the site file (the recipe
+    # must pass --site-file); nothing is created before the refusal.
+    ctx = checkpoint_ctx(tmp_path, CHECKPOINTING)
+    with pytest.raises(VariantNotRun, match="--site-file"):
+        SPECS["checkpoint_phase"].execute(ctx)
 
 
 def test_invalid_delta_is_an_implemented_live_replay_variant() -> None:
@@ -404,7 +573,7 @@ def ramp_run(
     ctx = make_context(
         spec,
         tmp_path=tmp_path,
-        regional=FakeRegional(cpu_python=product),
+        regional=FakeRegional(cpu_python=with_training(product)),
         probes={f"node@{NODE}": probe},
     )
     result = spec.execute(store_poll_clock(ctx))
@@ -412,6 +581,7 @@ def ramp_run(
 
 
 @pytest.mark.parametrize("variant", ["cpu_busy", "recovery", "checkpoint_phase"])
+@pytest.mark.usefixtures("phase_job")
 def test_cpu_variants_time_detection_from_the_oracles_crossing(
     tmp_path: Path, variant: str
 ) -> None:
@@ -514,10 +684,16 @@ def test_host_budgets_follow_the_products_rule_and_fit_the_variant_windows() -> 
     assert budget == host.SUSTAIN_SECONDS + 2 * 300 + 15 + 180 == 915
     assert budget > 120 + 300 + 90, "the fixed budget that ran out live"
     recovery = 2 * SITE.host_summary + 6 * SITE.host_interval
+    # checkpoint_phase first starts its managed job (the 900-s start wait)
+    # and waits for the declared phase.
     for variant, ramp, tail in (
         ("cpu_busy", host.CPU_RAMP_BUDGET, 240),
         ("recovery", host.CPU_RAMP_BUDGET, 60),
-        ("checkpoint_phase", host.CPU_RAMP_BUDGET, 120),
+        (
+            "checkpoint_phase",
+            host.CPU_RAMP_BUDGET,
+            120 + 900 + host.PHASE_DECLARE_BUDGET,
+        ),
         ("load_average", host.LOAD_RAMP_BUDGET, 240),
     ):
         assert SPECS[variant].max_minutes * 60 >= ramp + budget + recovery + tail, (

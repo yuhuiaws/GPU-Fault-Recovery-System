@@ -25,13 +25,17 @@ from scripts.e2e.regional.general_live_common import (
     wait_for_incident,
     wait_settled,
 )
+from scripts.e2e.regional import general_live_progress as progress
 from scripts.e2e.regional.general_live_fixture import (
     VariantContext,
     VariantInconclusive,
     require_tools,
+    run_identity,
     utc_now,
 )
+from scripts.e2e.regional.general_live_progress_probes import TRAINING_PROBE
 from scripts.e2e.regional.general_live_registry import (
+    HARDWARE_OPERATIONS,
     LIVE_REPLAY,
     NATIVE,
     VariantSpec,
@@ -44,6 +48,7 @@ from scripts.e2e.regional.general_live_verdicts import (
     finding_incidents,
     hardware_errors,
     oracle_values,
+    parse_time,
     samples,
     sustained,
     verdict,
@@ -63,6 +68,18 @@ CPU_RAMP_BUDGET = 120
 #: 2.0 per CPU after about 60 x ln(21) = 183 s; the budget leaves room for the
 #: threads to be scheduled and for a busy node's slower convergence.
 LOAD_RAMP_BUDGET = 600
+#: checkpoint_phase: the phase the managed attempt declares (a label of its
+#: progress file the product's reporter posts, ``training_phase.phase``), how
+#: long the product may take to show it (reporter interval 15 s), and what a
+#: host-diagnostic chain must never plan for the attempt beside it.
+CHECKPOINT_PHASE = "CHECKPOINT_SAVE"
+PHASE_DECLARE_BUDGET = 120
+CHECKPOINT_FORBIDDEN = HARDWARE_OPERATIONS | {
+    "STOP_WORKLOADS",
+    "RESTART_WORKLOAD",
+    "MARK_UNSCHEDULABLE",
+    "QUARANTINE",
+}
 
 
 def detection_budget(ctx: VariantContext) -> int:
@@ -390,16 +407,28 @@ def recovery(ctx: VariantContext) -> dict[str, Any]:
 
 
 def checkpoint_phase(ctx: VariantContext) -> dict[str, Any]:
-    """cpu_busy while a managed attempt reports CHECKPOINT_SAVE.
+    """cpu_busy while a managed attempt declares CHECKPOINT_SAVE.
 
-    The product does not correlate the application phase with the host finding
-    (audit gap), so the finding stays the diagnostic cpu chain -- that is the
-    documented behaviour, recorded as a note, not a FAIL.
+    A managed progress job (027's ``ManagedProgressJob``: rank 0 on the lane
+    node, the product's own training-progress reporter) writes
+    ``labels.phase=CHECKPOINT_SAVE`` into its progress file before the load
+    starts, and the load begins only once the product's training-progress
+    state shows that phase -- the stimulus reached the product; otherwise
+    INCONCLUSIVE. The old variant never started a job, so no phase was ever
+    declared. The product does not correlate the application phase with the
+    host finding (audit gap), so the finding must stay the diagnostic cpu
+    chain -- FREEZE_EVIDENCE then a VALIDATE_HOST that fails while loaded, no
+    hardware step and no STOP, restart or isolation of the attempt in its
+    checkpoint -- and, read after the finding, the attempt is still RUNNING
+    and still declares the phase.
     """
 
     survey = ctx_survey(ctx)
     require_tools(survey, "systemd-run")
     cpus = int(survey.get("cpu_count") or 0)
+    job = _phase_job(ctx)
+    declared_at = utc_now()
+    _await_declared_phase(ctx, job, declared_at)
     started_at = utc_now()
     budget = detection_budget(ctx)
     hold = CPU_RAMP_BUDGET + budget + 120
@@ -417,10 +446,12 @@ def checkpoint_phase(ctx: VariantContext) -> dict[str, Any]:
         name="checkpoint-detection",
     )
     _oracle_busy_each_tick(oracle, minimum=SUSTAIN_SECONDS // 5)
+    during = _phase_records(ctx, job, declared_at)
     stopped_at = utc_now()
     ctx.node("cpu-stop")
     ctx.cleanup.discard("cpu-load")
     recovered = _await_recovery(ctx, "cpu_usage_percent", oracle, since=stopped_at)
+    incidents = finding_incidents(detection, "cpu_usage_percent")
     stages = {
         "chain": chain_errors(
             detection,
@@ -429,16 +460,111 @@ def checkpoint_phase(ctx: VariantContext) -> dict[str, Any]:
                 operations=("FREEZE_EVIDENCE", "VALIDATE_HOST"),
                 validation="VALIDATE_HOST",
                 validation_must_fail=True,
+                probe_metric="cpu_usage_percent",
+                incident_states=DIAGNOSTIC_ONLY_STATES,
+                forbidden=CHECKPOINT_FORBIDDEN,
             ),
         ),
         "hardware": hardware_errors(detection),
+        "phase_held": _phase_held_errors(during, incidents),
         "recovery": recovered["errors"],
     }
     return _result(
         stages,
         notes=["application phase correlation is absent in the product (audit gap)"],
-        extra={"recovery": recovered},
+        extra={"recovery": recovered, "attempt": job.identity()},
     )
+
+
+def _phase_job(ctx: VariantContext) -> Any:
+    """The managed progress job, started, its removal on the cleanup stack."""
+
+    name = ctx.identity(run_identity(CASE, "ckpt", ctx.attempt, ctx.case_dir))
+    job = progress.ManagedProgressJob(ctx, name=name)
+    ctx.cleanup.push(f"job-{name}", job.delete)
+    job.start()
+    return job
+
+
+def _phase_records(ctx: VariantContext, job: Any, since: Any) -> dict[str, Any]:
+    """The attempt's training records (027's read-only ``TRAINING_PROBE``)."""
+
+    document = ctx.regional.cpu_python(
+        TRAINING_PROBE,
+        ctx.settings.regional.cluster_id,
+        ctx.settings.node,
+        job.name,
+        job.attempt_id,
+        since.isoformat(),
+    )
+    ctx.evidence.write("checkpoint-records", document)
+    return document
+
+
+def _declared(records: dict[str, Any]) -> list[dict[str, Any]]:
+    """Rank 0's stored progress states that declare CHECKPOINT_PHASE."""
+
+    return [
+        item
+        for item in records.get("progress_states") or []
+        if item.get("rank") == 0
+        and (item.get("labels") or {}).get("phase") == CHECKPOINT_PHASE
+    ]
+
+
+def _await_declared_phase(ctx: VariantContext, job: Any, since: Any) -> None:
+    """Declare the phase and wait for the product to hold it (INCONCLUSIVE if
+    it never does: no phase reached the product, nothing would be judged)."""
+
+    job.write_progress(0, step=100, loss=1.0, labels={"phase": CHECKPOINT_PHASE})
+    last: dict[str, Any] = {}
+
+    def accept() -> dict[str, Any] | None:
+        nonlocal last
+        last = _phase_records(ctx, job, since)
+        return last if _declared(last) else None
+
+    if (
+        ctx.wait_until(
+            accept,
+            timeout_seconds=PHASE_DECLARE_BUDGET,
+            poll_seconds=15,
+            name="checkpoint-declared",
+        )
+        is None
+    ):
+        raise VariantInconclusive(
+            f"the product never recorded the attempt's declared {CHECKPOINT_PHASE} "
+            f"within {PHASE_DECLARE_BUDGET} s: progress states "
+            f"{last.get('progress_states')}"
+        )
+
+
+def _phase_held_errors(
+    records: dict[str, Any], incidents: list[dict[str, Any]]
+) -> list[str]:
+    """The attempt still RUNNING and still declaring the phase, with a
+    heartbeat no older than the cpu finding (the phase was declared while the
+    finding was raised)."""
+
+    errors = []
+    phase = (records.get("observation") or {}).get("workload_phase")
+    if phase != "RUNNING":
+        errors.append(f"the checkpointing attempt is {phase}, not RUNNING")
+    declared = _declared(records)
+    if not declared:
+        errors.append(f"the attempt no longer declares {CHECKPOINT_PHASE}")
+    created = parse_time((incidents[0] if incidents else {}).get("created_at"))
+    if created is not None and declared:
+        latest = max(
+            parse_time(item.get("observed_at")) or created for item in declared
+        )
+        if latest < created:
+            errors.append(
+                f"the attempt's last {CHECKPOINT_PHASE} heartbeat predates the cpu "
+                "finding"
+            )
+    return errors
 
 
 # --------------------------------------------------------------------------- #
@@ -672,10 +798,18 @@ VARIANTS = [
         lanes=("eks", "hp"),
         risk="L",
         flags="S",
-        injection="cpu_busy while a managed attempt declares phase=CHECKPOINT_SAVE",
-        expected="the finding stays the diagnostic cpu chain; phase correlation is absent (noted, not a FAIL)",
+        injection=(
+            "a managed progress job on the node declares phase=CHECKPOINT_SAVE "
+            "(proven in the product's training-progress state), then cpu_busy"
+        ),
+        expected=(
+            "the finding stays the diagnostic cpu chain (VALIDATE_HOST fails while "
+            "loaded; no hardware step, no STOP/restart/isolation of the "
+            "checkpointing attempt, which stays RUNNING); phase correlation is "
+            "absent (noted, not a FAIL)"
+        ),
         cleanup="stop the job and the load",
-        max_minutes=35,
+        max_minutes=50,
         execute=checkpoint_phase,
     ),
 ]

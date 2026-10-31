@@ -137,8 +137,15 @@ GF-REGIONAL 用例已在本站真机 PASS，且其注入与断言正是该变体
 915 秒（本站），负载保持 ramp + 预算 + 判定余量；`cpu_busy`/`load_average`/
 `checkpoint_phase` 一次等待同时等到 finding 与 VALIDATE_HOST 终态，`recovery`
 只等 finding。`short_burst` 的反向窗口为突发结束后 615 秒，`invalid_delta` 同样
-观察 615 秒。变体窗口：cpu_busy/recovery/checkpoint_phase 35 分、load_average
+观察 615 秒。变体窗口：cpu_busy/recovery 35 分、checkpoint_phase 50 分（先起受管任务）、load_average
 45 分、short_burst/invalid_delta 16 分。
+`checkpoint_phase` 现在真的声明 checkpoint 阶段：先在车道节点上起 027 的受管进度任务（rank 0，产品自己的
+training-progress reporter，需 `--site-file`，否则 `NOT_RUN(FIXTURE_NOT_READY)`），把 `labels.phase=CHECKPOINT_SAVE`
+写进进度文件，等产品的训练进度状态显示该阶段（120 秒内未显示记 INCONCLUSIVE，不起负载）后才开始 CPU 负载。PASS
+要求：cpu finding 仍是诊断链（FREEZE_EVIDENCE 后 VALIDATE_HOST 在负载下失败、带 `cpu_usage_percent` 探针、incident
+停在诊断态），没有硬件步骤，也没有对处于 checkpoint 的 attempt 计划 STOP/重启/隔离；finding 之后读到该 attempt 仍为
+RUNNING、仍声明该阶段，且其最新心跳不早于 cpu finding（阶段在 finding 产生时确已声明）。此前该变体从不起任务，没有任何阶段
+被声明，只是 cpu_busy 的翻版。产品不把应用阶段与主机 finding 关联（审计缺口）仍记 note，不判 FAIL。
 
 ### GF-GENERAL-LIVE-002
 

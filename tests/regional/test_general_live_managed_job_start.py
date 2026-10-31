@@ -73,6 +73,9 @@ MANAGED_JOB_CASES = (
     "GF-GENERAL-LIVE-029",  # general_live_attempts: ManagedFailJob
     "GF-GENERAL-LIVE-017",  # general_live_applogs / _applog_job: ManagedApplogJob
 )
+#: A variant of another case that starts a managed job: 001 checkpoint_phase
+#: runs 027's progress job beside its CPU load.
+EXTRA_MANAGED_JOB_VARIANTS = frozenset({"GF-GENERAL-LIVE-001.checkpoint_phase"})
 #: The 017 variants that replay the journal source, not a managed job's CRI log.
 JOURNAL_VARIANTS = frozenset(
     f"GF-GENERAL-LIVE-017.{variant}"
@@ -104,12 +107,15 @@ STORE_VARIANTS = frozenset(
 )
 REGISTRY = runner.load_registry()
 MANAGED_JOB_VARIANTS = sorted(
-    key
-    for key, spec in REGISTRY.items()
-    if spec.case_id in MANAGED_JOB_CASES
-    and spec.implemented
-    and key not in HOST_VARIANTS | STORE_VARIANTS
-    and key not in JOURNAL_VARIANTS
+    {
+        key
+        for key, spec in REGISTRY.items()
+        if spec.case_id in MANAGED_JOB_CASES
+        and spec.implemented
+        and key not in HOST_VARIANTS | STORE_VARIANTS
+        and key not in JOURNAL_VARIANTS
+    }
+    | EXTRA_MANAGED_JOB_VARIANTS
 )
 #: One variant per case, the live failure first.
 ONE_PER_CASE = (
@@ -142,6 +148,15 @@ MUTATING_VERBS = frozenset(
     }
 )
 SURVEY = {"residue": {}, "tools": {}, "collector_env": {}}
+#: 001 checkpoint_phase checks the node can run its CPU load (``systemd-run``)
+#: before it starts its job, so its survey names the tool.
+SURVEYS = {
+    "GF-GENERAL-LIVE-001.checkpoint_phase": {
+        **SURVEY,
+        "cpu_count": 8,
+        "tools": {"systemd-run": True},
+    }
+}
 #: The GPU cluster's executor runs the release's runtime image; 027's progress
 #: reporter sidecars run the same image (``gpu-fault-collector`` is in it).
 RUNTIME_IMAGE = "111122223333.dkr.ecr.us-west-2.amazonaws.com/gpu-fault@sha256:" + (
@@ -254,7 +269,7 @@ def probe_execute(
     handle: ProbeHandle, *arguments: str, timeout: int = 180
 ) -> dict[str, Any]:
     if handle.script.name == "general_live_node_probe.py" and arguments[0] == "survey":
-        return dict(SURVEY)
+        return dict(SURVEYS.get(handle.fixture.settings.case_id, SURVEY))
     if (
         handle.script.name == "general_live_applog_probe.py"
         and arguments[0] == "preflight"
