@@ -57,15 +57,34 @@ DEFAULTS = {
     "DCGM_FI_DEV_MEM_CLOCK": 2400,
     "DCGM_FI_DEV_CLOCK_THROTTLE_REASONS": 0,
     "DCGM_FI_DEV_XID_ERRORS": 0,
+    # ECC on, as every live H200 reports it: a 0 in field 300/301 is graded
+    # "ECC disabled, memory rules blind" (batch 233).
+    "DCGM_FI_DEV_ECC_CURRENT": 1,
+    "DCGM_FI_DEV_ECC_PENDING": 1,
 }
+
+
+def _aliases() -> dict[str, str]:
+    """Each further exporter name ``DCGM_METRICS`` reads a field under, mapped
+    to the first one -- the name the counters CSV gives that field."""
+
+    first: dict[str, str] = {}
+    aliases: dict[str, str] = {}
+    for name, (canonical, _unit) in DCGM_METRICS.items():
+        if canonical in first:
+            aliases[name] = first[canonical]
+        else:
+            first[canonical] = name
+    return aliases
+
 
 # Old and new exporter names of one DCGM field. A real exporter reports both
 # from the same field, so they carry the same value and the collector keeps one
-# sample; differing values are a conflict that stays UNKNOWN.
-ALIASES = {
-    "DCGM_FI_DEV_CLOCKS_EVENT_REASONS": "DCGM_FI_DEV_CLOCK_THROTTLE_REASONS",
-    "DCGM_FI_DEV_GPU_TEMP_MARGIN_CELSIUS": "DCGM_FI_DEV_GPU_TEMP_LIMIT",
-}
+# sample; differing values are a conflict that stays UNKNOWN. Derived, not
+# listed: batches 232-235 added twenty such pairs (DCGM 4.6 renamed the fields)
+# beside the clock-reason and T.Limit ones, and a pair served under two
+# unrelated values is two conflicting samples the control plane drops.
+ALIASES = _aliases()
 
 COUNTERS = {
     name

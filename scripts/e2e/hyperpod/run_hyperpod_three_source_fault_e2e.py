@@ -77,6 +77,9 @@ def metric_text(replay: float) -> str:
         "memory_temperature_c": 50,
         "power_limit_w": 700,
         "pcie_replay_total": replay,
+        # ECC on, as every live H200 reports it (0 grades "ECC disabled").
+        "ecc_mode_current": 1,
+        "ecc_mode_pending": 1,
     }
     return "".join(
         f'{name}{{gpu="0",UUID="{GPU_UUID}",pci_bus_id="{GPU_BDF}"}} '

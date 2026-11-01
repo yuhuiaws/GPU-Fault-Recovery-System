@@ -11,12 +11,13 @@ that ran and has not passed while the only GPU_METRICS source is paused.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from gpu_fault.app.ingest.gpu_findings import gpu_node_health_findings
 from gpu_fault.gpu_collection_errors import collection_error_finding
+from gpu_fault.gpu_metric_models import GpuFindingState
 from gpu_fault.gpu_metrics import GpuMetricBatch, GpuMetricSource, GpuMetricsThresholds
 from scripts.e2e.regional import general_live_collectors as col
 from tests.regional._general_live_fakes import (
@@ -49,7 +50,10 @@ WAITING = {
 
 def completeness_event() -> str:
     """The event id the product mints for a failed scrape's completeness
-    finding (``collection_error_finding`` -> ``gpu_node_health_findings``)."""
+    finding (``collection_error_finding`` -> ``gpu_node_health_findings``):
+    the streak's booked finding is NO_ACTION (evidence only, no incident); an
+    error batch past the sustain window asks for RUN_DIAGNOSTICS under the
+    streak's first finding id, and that one opens the incident."""
 
     batch = GpuMetricBatch(
         batch_id=f"dcgm-{NODE}-1761363470000000",
@@ -60,9 +64,20 @@ def completeness_event() -> str:
         samples=[],
         collection_errors=["DCGM exporter scrape failed: timed out"],
     )
-    booked = collection_error_finding(batch, None, GpuMetricsThresholds())
+    thresholds = GpuMetricsThresholds()
+    booked = collection_error_finding(batch, None, thresholds)
     assert booked is not None, "a scrape with collection errors books a finding"
-    return gpu_node_health_findings(None, [booked[1]])[0].event_id
+    later = batch.model_copy(
+        update={
+            "batch_id": f"{batch.batch_id}-sustained",
+            "observed_at": batch.observed_at
+            + timedelta(seconds=thresholds.collection_error_sustain_seconds),
+        }
+    )
+    streak = GpuFindingState(observed_at=batch.observed_at, finding=booked[1])
+    sustained = collection_error_finding(later, streak, thresholds)
+    assert sustained is not None and sustained[2], "the streak outlasts its window"
+    return gpu_node_health_findings(None, [sustained[1]])[0].event_id
 
 
 def paused_doc(
