@@ -4,8 +4,8 @@
 Plan-only by default. ``--plan`` reads the target node and its live device
 limits read-only, decides which per-device variants can run on this hardware
 (``env_live_plans``: a p5en H200 publishes only the T.Limit scale, so the
-absolute-core and absolute-shutdown variants are NOT_RUN there), builds the
-reviewed replay plans and writes ``plan.json``. ``--execute`` additionally needs
+absolute-core variant is NOT_RUN there), builds the reviewed replay plans and
+writes ``plan.json``. ``--execute`` additionally needs
 ``--confirm ENVLIVE<NNN>_EXECUTE`` and, for the branches that isolate or stop a
 workload, ``--confirm-isolate``/``--confirm-stop`` tokens; it ships the audited
 replay tool to the node, repoints the single metrics collector at the loopback
@@ -35,8 +35,10 @@ runs the 004 chain on one GPU of the target node while an independent control
 task runs on the control node (``--node-b``; ``env_live_scope``); without a
 control node it is NOT_RUN. Both run on plain EKS and HyperPod: a host-mode
 node without an exporter Pod has its device limits read by a transient host
-probe. GF-ENV-LIVE-011 (absolute shutdown) runs only where the device reports
-an absolute ``gpu_shutdown_temperature_c``; GF-ENV-LIVE-012 (real physical /
+probe. GF-ENV-LIVE-011 (absolute shutdown) runs only where the product's
+device limits carry an absolute ``gpu_shutdown_temperature_c`` from any device
+source -- the XML, or on a T.Limit GPU the DCGM field 159 limit the collector
+published, read from the product's records; GF-ENV-LIVE-012 (real physical /
 vendor-lab fault) is always NOT_RUN here. The user runs ``--execute`` live later.
 """
 
@@ -349,7 +351,9 @@ def plan_details(
             "device_limits": (
                 "nvidia-smi -q -x through the product parser: in the node's "
                 "exporter Pod where the exporter is a DaemonSet, else (host-mode "
-                "exporter, plain EKS) by a transient host probe that is deleted again"
+                "exporter, plain EKS) by a transient host probe that is deleted "
+                "again; 011 adds the absolute shutdown limit the product accepted "
+                "in the GPU's newest batch (DCGM field 159 on a T.Limit GPU)"
             ),
             "max_window_seconds": window,
             "preflight_leftovers": (
@@ -608,7 +612,8 @@ def execute_case(
             not_run_variants=replay.get("not_run", {}),
             not_run_reason=(
                 "this device reports no scale the case grades on; every variant "
-                "is NOT_RUN here (e.g. no absolute shutdown threshold on H200)"
+                "is NOT_RUN here (e.g. no absolute shutdown limit from any device "
+                "source)"
             ),
         )
     if settings.case_id in ISOLATING_CASES and (

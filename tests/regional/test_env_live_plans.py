@@ -78,6 +78,40 @@ def test_h200_runs_tlimit_and_memory_not_absolute_core_or_shutdown() -> None:
         plans.shutdown_plan(device.limits)
 
 
+#: The same H200 once the product publishes the absolute shutdown limit DCGM
+#: field 159 reports (95 C live, = (28 + 59) - (-8); batch 232).
+H200_PUBLISHED = {**H200_LIMITS, "gpu_shutdown_temperature_c": 95.0}
+
+
+def test_h200_runs_the_shutdown_case_on_the_limit_the_product_published() -> None:
+    device = plans.build_device_plan(
+        gpu_uuid="GPU-aaaa",
+        gpu_index="0",
+        product="NVIDIA H200",
+        raw_limits=H200_PUBLISHED,
+    )
+
+    assert device.runnable_variants() == [plans.CORE_TLIMIT, plans.MEMORY_ABSOLUTE], (
+        "the T.Limit rules stay authoritative: no absolute-core variant appears"
+    )
+    tlimit = device.decisions[plans.CORE_TLIMIT]
+    assert (tlimit.critical_value, tlimit.warning_value) == (-2.0, 3.0)
+    plan = plans.shutdown_plan(device.limits)
+    validate_plan(plan)
+    assert plan == {"steps": [{"reads": 1, "values": {"gpu_temperature_c": 96.0}}]}, (
+        "one read of DCGM_FI_DEV_GPU_TEMP, the reading graded against the limit"
+    )
+    without_reading = plans.normalize_device_limits(
+        {k: v for k, v in H200_PUBLISHED.items() if k != "gpu_tlimit_c"}
+    )
+    core = plans.core_absolute_decision(GpuMetricsThresholds(), without_reading)
+    assert core.runnable is False, (
+        "the field-159 limit is never a shutdown-minus-margin core boundary"
+    )
+    with pytest.raises(plans.EnvLivePlanError, match="never substitutes"):
+        plans.shutdown_plan(_h200().limits)
+
+
 def test_absolute_device_runs_core_and_shutdown() -> None:
     device = _absolute()
     assert plans.CORE_ABSOLUTE in device.runnable_variants()

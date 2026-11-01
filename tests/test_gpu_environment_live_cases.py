@@ -62,3 +62,31 @@ def test_live_mutation_cases_are_not_labeled_as_read_only():
             "live-service-action",
             "destructive",
         }, number
+
+
+def test_case_011_runs_on_any_device_source_of_the_shutdown_limit():
+    """Batch 232: the precondition is the product's published absolute limit.
+
+    A T.Limit GPU (H200, driver 580) carries it from DCGM field 159, so the case
+    reads it from the product and cites NVIDIA for that source; the offset of
+    the T.Limit scale still never substitutes and nothing is physically heated.
+    """
+
+    procedure = " ".join(
+        (ROOT / "docs/components/gpu-environment-live-acceptance.md")
+        .read_text(encoding="utf-8")
+        .split()
+    )
+    section = procedure.split("### GF-ENV-LIVE-011", 1)[1].split("###", 1)[0]
+    for required in (
+        "任一设备来源",
+        "DCGM_FI_DEV_SHUTDOWN_TEMP",
+        "DCGM_FI_DEV_GPU_TEMP",
+        "dcgm-api-field-ids.html#c.DCGM_FI_DEV_GPU_TEMP_SHUTDOWN_CELSIUS",
+        "Shutdown temperature for the device.",
+        "group__nvmlDeviceQueries.html",
+        "is no longer the preferred interface",
+        "不能替代本例",
+        "绝对禁止物理加热",
+    ):
+        assert required in section, f"GF-ENV-LIVE-011 lacks {required!r}"

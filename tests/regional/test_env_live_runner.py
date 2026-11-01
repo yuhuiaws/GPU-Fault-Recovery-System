@@ -233,6 +233,49 @@ def test_execute_011_is_not_run_without_an_absolute_shutdown(tmp_path: Path) -> 
     assert RecordingController.instances == []
 
 
+def test_execute_011_runs_on_h200_once_the_product_publishes_its_limit(
+    tmp_path: Path, world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Batch 232: the H200's DCGM field 159 limit makes 011 runnable there.
+
+    The preflight carries the limit the product published (95 C); the plan
+    replays one DCGM_FI_DEV_GPU_TEMP read at 96 C, and one accepted sample takes
+    the review chain -- no T.Limit offset, no physical heat.
+    """
+
+    target = {
+        **H200_TARGET,
+        "limits": {**H200_LIMITS, "gpu_shutdown_temperature_c": 95.0},
+        "limit_sources": {
+            "gpu_shutdown_temperature_c": "product:DCGM_FI_DEV_SHUTDOWN_TEMP"
+        },
+    }
+    monkeypatch.setattr(
+        runner, "read_only_preflight", lambda settings, case_dir: _preflight(target)
+    )
+    details = runner.plan_details(_settings("GF-ENV-LIVE-011"), _preflight(target))
+    assert details["replay_plans"] == {
+        "shutdown": {"steps": [{"reads": 1, "values": {"gpu_temperature_c": 96.0}}]}
+    }
+    review_chain(
+        world,
+        name="gpu_temperature_c",
+        severe=96.0,
+        healthy=30.0,
+        samples=1,
+        source="NVIDIA_DEVICE_LIMIT",
+    )
+
+    code = runner.execute_case(_settings("GF-ENV-LIVE-011"), tmp_path, 1, _window())
+
+    result = _read_case(tmp_path, "GF-ENV-LIVE-011")
+    assert code == 0 and result["verdict"] == "PASS", (
+        result["stages"],
+        result["inconclusive"],
+    )
+    assert RecordingController.instances[0].calls[-1] == "cleanup"
+
+
 def test_execute_002_blocks_and_delegates_to_collect_002(tmp_path: Path) -> None:
     code = runner.execute_case(_settings("GF-ENV-LIVE-002"), tmp_path, 1, _window())
     assert code == 0

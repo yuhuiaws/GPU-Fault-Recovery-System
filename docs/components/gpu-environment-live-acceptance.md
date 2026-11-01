@@ -248,11 +248,26 @@ STOP 必须是受影响分布式训练任务的已归属范围，不能错误要
 
 ### GF-ENV-LIVE-011
 
-**绝对关机温度例外。** 只在真实 XML 报告绝对 `gpu_shutdown_temperature_c`
-且已完成001的节点上，通过代理把核心当前温度改为该限值+1。
+**绝对关机温度例外。** 前提：产品的设备限值带有来自任一设备来源的绝对
+`gpu_shutdown_temperature_c`，且节点已完成001。来源可以是没有 T.Limit 传感器的 GPU 的
+XML，也可以是 T.Limit GPU（H200，driver 580）的 DCGM 字段 159 `DCGM_FI_DEV_SHUTDOWN_TEMP`：
+collector 在它与同一 nvidia-smi 快照的 T.Limit 算术相差 ≤1 ℃ 时才发布
+（`collectors/gpu/shutdown_limit.py`，详见[详细设计](../详细设计.md) §2.4.1）。运行器从产品
+自己的记录读取该限值：目标 GPU 最新一批已接受样本里的 `gpu_shutdown_temperature_c`
+（同批的 `gpu_temperature_c` 为最新；`gpu_metric_latest` 会保留已不再发布的旧值），并记下
+它的 `limit_source`。通过代理把产品分级的那个读数——exporter 的 `DCGM_FI_DEV_GPU_TEMP`
+（`gpu_temperature_c`）——改为该限值+1；限值本身是硬件元数据，回放工具拒绝改动，原样透传。
 一个已接受样本即可触发保护，不等待三次；实际环境动作按004验收。
-T.Limit 的 shutdown offset 不是同一证据，只有该 offset 的设备不能替代本例。
-绝对禁止物理加热到关机温度；本例是立即保护逻辑的真机链路回放，不是关机实验。
+T.Limit 的 shutdown offset 不是同一证据，只有该 offset、没有发布绝对限值的设备不能替代本例
+（NOT_RUN）。绝对禁止物理加热到关机温度；本例是立即保护逻辑的真机链路回放，不是关机实验。
+
+依据：DCGM 字段说明
+<https://docs.nvidia.com/datacenter/dcgm/latest/dcgm-api/dcgm-api-field-ids.html#c.DCGM_FI_DEV_GPU_TEMP_SHUTDOWN_CELSIUS>
+（「Field Identifiers」，文档 "Version: 4.6 (Latest)"）："Shutdown temperature for the device."；
+DCGM 用 NVML `nvmlDeviceGetTemperatureThreshold`
+（<https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlDeviceQueries.html>，「Device Queries」，
+v615 文档）读取该字段，该页注明 "This API is no longer the preferred interface for retrieving the following
+temperature thresholds on Ada and later architectures"；为何仍然采用、以及核对规则见上面的详细设计一节。
 
 ### GF-ENV-LIVE-012
 
@@ -315,8 +330,9 @@ GF-ENV-LIVE-001..011（012 始终 NOT_RUN）。默认只计划，不动集群。
   的同刻度限值（`scripts/e2e/regional/env_live_plans.py`），据此判定每个严重温度
   变体 RUN/NOT_RUN，并由真实限值（而非 `tlimit-example.json`）生成回放计划。
   p5en H200 现场只报 T.Limit 刻度（shutdown −8、slowdown −2、max-operating 0），
-  因此绝对核心温度变体与 011（绝对关机温度）在该站 NOT_RUN，T.Limit 变体与
-  按配置 fallback 的显存变体运行。
+  因此绝对核心温度变体在该站 NOT_RUN，T.Limit 变体与按配置 fallback 的显存变体运行；
+  011 另读产品记录里该 GPU 已发布的绝对关机温度（H200 为 DCGM 字段 159，现场 95 ℃），
+  有则运行、没有则 NOT_RUN。
 - **代理接线**：`scripts/e2e/regional/probes/env_replay_proxy.py` 作为特权 host
   探针，把 `tools/gpu_environment_replay.py` 原样投到节点（base64 + sha256 校验，
   `-I` 运行）用 `systemd-run` 瞬态单元 `--serve`，再**只**对
@@ -413,8 +429,8 @@ GF-ENV-LIVE-001..011（012 始终 NOT_RUN）。默认只计划，不动集群。
   删除对照任务（`remove_managed_job`）。两节点运行在 plain EKS 上占用两条 EKS lane 的
   节点（campaign 列表标 X）。
 - **特殊用例**：002 复用 `GF-REGIONAL-COLLECT-002` 的受控功率与 dcgmproftester
-  负载及其 deadman 还原（本运行器对 002 记 BLOCKED 并指向该运行器）；011 只在设备
-  报告绝对 `gpu_shutdown_temperature_c` 时运行（H200 为 NOT_RUN）；012 为真实物理/
+  负载及其 deadman 还原（本运行器对 002 记 BLOCKED 并指向该运行器）；011 只在产品的
+  设备限值带有绝对 `gpu_shutdown_temperature_c`（XML 或 DCGM 字段 159）时运行；012 为真实物理/
   厂商实验室故障，始终 NOT_RUN。
 
 ### arm 之后的观察与判据

@@ -45,7 +45,7 @@ cluster_id, node_id, since_text, names_text = sys.argv[1:5]
 since = datetime.fromisoformat(since_text.replace("Z", "+00:00"))
 names = {item for item in names_text.split(",") if item}
 store = ApplicationContext.from_environment().store
-LABELS = ("source_boot_id", "boot_id", "modelName")
+LABELS = ("source_boot_id", "boot_id", "modelName", "limit_source")
 
 
 def wanted(name):

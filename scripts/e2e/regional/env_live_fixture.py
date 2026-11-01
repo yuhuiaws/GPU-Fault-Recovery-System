@@ -547,6 +547,75 @@ def _current_tlimit_readings(xml: str) -> dict[str, float]:
     return readings
 
 
+#: GF-ENV-LIVE-011 grades the product's absolute shutdown limit. A T.Limit GPU
+#: (H200, driver 580) prints none in its XML; the collector publishes DCGM field
+#: 159 instead once the GPU's own T.Limit arithmetic agrees
+#: (``collectors/gpu/shutdown_limit.py``). So the case's precondition -- the
+#: product's device limits carry an absolute ``gpu_shutdown_temperature_c`` from
+#: any device source -- is read from the product's records, not from the node.
+SHUTDOWN_CASE_ID = "GF-ENV-LIVE-011"
+SHUTDOWN_LIMIT = "gpu_shutdown_temperature_c"
+
+
+def published_shutdown_limits(
+    regional: RegionalLiveFixture, node: str
+) -> dict[str, dict[str, Any]]:
+    """``{gpu: {value, observed_at, source}}``: the absolute shutdown limit the
+    product accepted in each GPU's newest batch (read-only).
+
+    ``gpu_metric_latest`` keeps a field's last accepted value after the batches
+    stop carrying it (a limit the collector now withholds), so a limit counts
+    only when it was accepted with the GPU's newest ``gpu_temperature_c``, in
+    the same batch. ``source`` is its ``limit_source`` label (the DCGM field),
+    else the XML.
+    """
+
+    doc = gpu_records(regional, node, utc_now(), (SHUTDOWN_LIMIT, "gpu_temperature_c"))
+    rows = {
+        (str(item.get("gpu")), str(item.get("name"))): item
+        for item in doc.get("latest") or []
+        if isinstance(item, dict)
+    }
+    published: dict[str, dict[str, Any]] = {}
+    for (gpu, name), item in rows.items():
+        reading = rows.get((gpu, "gpu_temperature_c"))
+        if name != SHUTDOWN_LIMIT or reading is None:
+            continue
+        if item.get("observed_at") != reading.get("observed_at"):
+            continue
+        published[gpu] = {
+            "value": item.get("value"),
+            "observed_at": item.get("observed_at"),
+            "source": (item.get("labels") or {}).get("limit_source")
+            or "nvidia-smi-xml",
+        }
+    return published
+
+
+def merge_published_shutdown(
+    devices: list[dict[str, Any]], published: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """The devices with the product's published shutdown limit added where the
+    node's XML read has none, and its source under ``limit_sources``."""
+
+    merged = []
+    for device in devices:
+        entry = dict(device)
+        limits = dict(entry.get("limits") or {})
+        record = published.get(str(entry.get("gpu_uuid"))) or {}
+        value = record.get("value")
+        if (
+            SHUTDOWN_LIMIT not in limits
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+        ):
+            limits[SHUTDOWN_LIMIT] = float(value)
+            entry["limit_sources"] = {SHUTDOWN_LIMIT: f"product:{record['source']}"}
+        entry["limits"] = limits
+        merged.append(entry)
+    return merged
+
+
 def select_target_gpu(
     devices: list[dict[str, Any]], requested_uuid: str
 ) -> dict[str, Any]:
@@ -626,6 +695,11 @@ def read_only_preflight(settings: EnvLiveSettings, case_dir: Path) -> dict[str, 
             settings.node,
             host_read=host_limit_reader(settings, case_dir),
         )
+        if settings.case_id == SHUTDOWN_CASE_ID:
+            devices = merge_published_shutdown(
+                devices, published_shutdown_limits(regional, settings.node)
+            )
+            limits_source = f"{limits_source}+product-records"
         built = build_device_plans(
             devices, thresholds=thresholds, confirmation_samples=3
         )

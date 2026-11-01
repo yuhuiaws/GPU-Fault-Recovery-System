@@ -311,3 +311,80 @@ def test_upstream_redirect_cannot_reach_another_host(monkeypatch):
         server.shutdown()
         server.server_close()
         thread.join(5)
+
+
+#: The live H200 exporter's temperature fields (driver 580, DCGM 4.7.0): the
+#: reading, the T.Limit margin and field 159, the absolute shutdown limit.
+H200_EXPORTER = (
+    "# TYPE DCGM_FI_DEV_GPU_TEMP gauge\n"
+    'DCGM_FI_DEV_GPU_TEMP{gpu="0",UUID="GPU-a"} 28\n'
+    "# TYPE DCGM_FI_DEV_GPU_TEMP_LIMIT gauge\n"
+    'DCGM_FI_DEV_GPU_TEMP_LIMIT{gpu="0",UUID="GPU-a"} 59\n'
+    "# TYPE DCGM_FI_DEV_SHUTDOWN_TEMP gauge\n"
+    'DCGM_FI_DEV_SHUTDOWN_TEMP{gpu="0",UUID="GPU-a"} 95\n'
+)
+H200_XML = (
+    "<nvidia_smi_log><gpu><uuid>GPU-a</uuid><minor_number>0</minor_number>"
+    "<temperature><gpu_temp>28 C</gpu_temp><gpu_temp_tlimit>59 C</gpu_temp_tlimit>"
+    "<gpu_temp_max_tlimit_threshold>-8 C</gpu_temp_max_tlimit_threshold>"
+    "<gpu_temp_slow_tlimit_threshold>-2 C</gpu_temp_slow_tlimit_threshold>"
+    "</temperature></gpu></nvidia_smi_log>"
+)
+
+
+def test_the_shutdown_replay_raises_the_graded_reading_and_never_the_limit():
+    """GF-ENV-LIVE-011 on a T.Limit H200 (batch 232).
+
+    The plan raises DCGM_FI_DEV_GPU_TEMP, the reading the product grades
+    against the DCGM field 159 limit; the limit is hardware metadata the tool
+    refuses to change and passes through, so the collector publishes the
+    device's own 95 C and the one replayed read is the emergency.
+    """
+
+    import subprocess
+    from datetime import datetime, timezone
+
+    from gpu_fault.collectors.gpu.dcgm import DcgmMetricsCollector, parse_dcgm_samples
+    from gpu_fault.collectors.gpu.discovery import query_nvidia_temperature_limits
+    from gpu_fault.collectors.gpu.shutdown_limit import DCGM_SHUTDOWN_CANDIDATE
+    from gpu_fault.collectors.models import CollectorContext
+    from gpu_fault.gpu_metrics import GpuMetricBatch, GpuMetricsService
+
+    output = replay_tool.transform(H200_EXPORTER, "GPU-a", {"gpu_temperature_c": 96.0})
+    seen = {
+        item.canonical_name: item.value for item in parse_dcgm_samples(output.decode())
+    }
+    assert seen == {
+        "gpu_temperature_c": 96.0,
+        "gpu_tlimit_c": 59.0,
+        DCGM_SHUTDOWN_CANDIDATE: 95.0,
+    }, "only the graded reading moves; the T.Limit offset never substitutes"
+    for limit in (DCGM_SHUTDOWN_CANDIDATE, "gpu_shutdown_temperature_c"):
+        with pytest.raises(ValueError, match="hardware limit metadata"):
+            replay_tool.validate_plan(
+                {"steps": [{"reads": 1, "values": {limit: 80.0}}]}
+            )
+
+    service = GpuMetricsService()
+    findings = []
+
+    class Sink:
+        def post(self, path, payload):
+            result = service.ingest(GpuMetricBatch.model_validate(payload))
+            findings.extend(result.new_findings)
+            return result.model_dump(mode="json")
+
+    def xml_runner(argv, **_kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout=H200_XML, stderr="")
+
+    DcgmMetricsCollector(
+        Sink(), CollectorContext(cluster_id="c"), node_id="node-a"
+    ).collect_text(
+        output.decode(),
+        observed_at=datetime.now(timezone.utc),
+        extra_samples=query_nvidia_temperature_limits(xml_runner),
+    )
+    assert [
+        (item.canonical_name, item.severity, item.confirmation_count)
+        for item in findings
+    ] == [("gpu_temperature_c", "CRITICAL", 1)], findings

@@ -10,9 +10,12 @@ Two temperature scales, never mixed (``gpu_temperature_policy``): the absolute
 Celsius thresholds a GPU without the T.Limit sensor prints, and the signed
 T.Limit margins (count down to 0) a GPU with it prints. A p5en H200 publishes
 only the T.Limit scale (live 2026-10-24: shutdown ``-8``, slowdown ``-2``, GPU
-and memory max operating ``0``), so the absolute-core and absolute-shutdown
-variants are NOT_RUN there and the T.Limit variant runs. This module decides
-that per GPU and names the reason; it never fabricates the missing scale.
+and memory max operating ``0``), so the absolute-core variant is NOT_RUN there
+and the T.Limit variant runs. Its one absolute limit, the shutdown temperature,
+reaches the product from DCGM field 159 (``collectors/gpu/shutdown_limit.py``),
+and the runner merges what the product published into the device's limits:
+the absolute-shutdown case runs once that value is there. This module decides
+per GPU and names the reason; it never fabricates the missing scale.
 
 Everything here is pure: the device limits come in as a mapping, the plan goes
 out as the ``{"steps": [...]}`` object the tool validates. No network, no
@@ -29,6 +32,7 @@ from gpu_fault.gpu_temperature_policy import (
     ABSOLUTE_TEMPERATURE_LIMITS,
     TLIMIT_GPU_THRESHOLDS,
     plausible_tlimit,
+    shutdown_from_device_field,
     tlimit_grades_gpu,
 )
 
@@ -189,7 +193,13 @@ def core_absolute_decision(
             scale="tlimit",
         )
     slowdown = limits.get("gpu_slowdown_temperature_c")
-    shutdown = limits.get("gpu_shutdown_temperature_c")
+    # A T.Limit GPU's field-159 shutdown limit serves the emergency only (011),
+    # never a "shutdown minus margin" boundary: the product does not grade so.
+    shutdown = (
+        None
+        if shutdown_from_device_field(limits)
+        else limits.get("gpu_shutdown_temperature_c")
+    )
     maximum = limits.get("gpu_max_operating_temperature_c")
     critical = slowdown or (
         shutdown - thresholds.gpu_temperature_shutdown_margin_c
@@ -345,17 +355,26 @@ def warning_plan(
 def shutdown_plan(limits: dict[str, float]) -> dict[str, Any]:
     """GF-ENV-LIVE-011: one read at absolute shutdown + 1 C.
 
-    Requires the device to publish an absolute ``gpu_shutdown_temperature_c``;
-    one accepted sample triggers protection without waiting for three. The
-    T.Limit shutdown offset is a different scale and is not a substitute, so a
-    device without the absolute threshold is NOT_RUN for this case.
+    Requires the product's device limits to carry an absolute
+    ``gpu_shutdown_temperature_c`` from any device source: the XML of a GPU
+    without the T.Limit sensor, or DCGM field 159 of a T.Limit GPU, which the
+    collector publishes once the GPU's own T.Limit arithmetic agrees and the
+    runner reads from the product's records (``env_live_fixture``). One accepted
+    sample triggers protection without waiting for three. The read raises
+    ``gpu_temperature_c`` -- DCGM_FI_DEV_GPU_TEMP through the proxy, the reading
+    the product grades against that limit; the limit is hardware metadata the
+    replay tool never changes, and nothing is physically heated. The T.Limit
+    shutdown offset is a different scale and never substitutes, so a device
+    without an absolute limit is NOT_RUN for this case.
     """
 
     shutdown = limits.get("gpu_shutdown_temperature_c")
     if shutdown is None:
         raise EnvLivePlanError(
-            "device publishes no absolute gpu_shutdown_temperature_c; "
-            "GF-ENV-LIVE-011 is NOT_RUN (the T.Limit offset is a different scale)"
+            "the product's device limits carry no absolute "
+            "gpu_shutdown_temperature_c from any device source (nvidia-smi XML "
+            "or DCGM field 159); GF-ENV-LIVE-011 is NOT_RUN (the T.Limit offset "
+            "is a different scale and never substitutes)"
         )
     return {"steps": [_reads(1, {"gpu_temperature_c": shutdown + 1.0})]}
 

@@ -876,8 +876,9 @@ def review_chain(
 
     step = world.interval
     for index in range(samples):
+        # The graded field last: 011 grades gpu_temperature_c itself.
         world.accept(
-            first_severe + index * step, {name: severe, "gpu_temperature_c": 30.0}
+            first_severe + index * step, {"gpu_temperature_c": 30.0, name: severe}
         )
     confirmed = first_severe + (samples - 1) * step
     if samples > 1:
@@ -913,7 +914,7 @@ def review_chain(
     )
     world.accept(
         confirmed + step,
-        {name: healthy, "gpu_temperature_c": 30.0},
+        {"gpu_temperature_c": 30.0, name: healthy},
         reasons=("candidate-recovered",),
     )
     world.clear(confirmed + step, "f-crit")

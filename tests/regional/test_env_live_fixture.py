@@ -866,3 +866,167 @@ def test_controller_pause_verbs_and_cleanup_resume_first(
     )
     assert verbs.index("restore-collector") < verbs.index("stop-proxy")
     assert "resume" in receipts and "resume_hold" in receipts and "restore" in receipts
+
+
+# --------------------------------------------------------------------------- #
+# GF-ENV-LIVE-011: the absolute shutdown limit is the one the product published
+# --------------------------------------------------------------------------- #
+#: The newest batch of the target GPU, as the GPU-state probe lists it: the H200
+#: shutdown limit DCGM field 159 reported, published by the collector.
+NEWEST = "2026-11-01T09:43:00+00:00"
+
+
+def _product_latest(shutdown_at: str = NEWEST) -> dict[str, Any]:
+    return {
+        "latest": [
+            {
+                "gpu": "GPU-aaaa",
+                "name": "gpu_temperature_c",
+                "value": 28.0,
+                "observed_at": NEWEST,
+                "labels": {},
+            },
+            {
+                "gpu": "GPU-aaaa",
+                "name": "gpu_shutdown_temperature_c",
+                "value": 95.0,
+                "observed_at": shutdown_at,
+                "labels": {"limit_source": "DCGM_FI_DEV_SHUTDOWN_TEMP"},
+            },
+        ]
+    }
+
+
+class ProductRegional(FakeRegional):
+    """The exporter Pod's XML plus the product's own GPU-state records."""
+
+    def __init__(self, *, state: Any, **options: Any) -> None:
+        super().__init__(**options)
+        self.state = state
+        self.scripts: list[str] = []
+
+    def cpu_python(self, script: str, *arguments: str, **_: Any) -> Any:
+        self.scripts.append(script)
+        return self.state(*arguments) if callable(self.state) else self.state
+
+
+def _shutdown_settings() -> fixture.EnvLiveSettings:
+    return dataclasses.replace(
+        _settings(), case_id="GF-ENV-LIVE-011", confirmation="ENVLIVE011_EXECUTE"
+    )
+
+
+def test_the_shutdown_case_runs_on_the_limit_the_product_published(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.e2e.regional import run_env_live as runner
+
+    regional = ProductRegional(device_xml=H200_XML, state=_product_latest())
+    monkeypatch.setattr(fixture, "RegionalLiveFixture", lambda s: regional)
+
+    result = fixture.read_only_preflight(_shutdown_settings(), tmp_path)
+
+    assert result["errors"] == [], result["errors"]
+    target = result["target_gpu"]
+    assert target["limits"]["gpu_shutdown_temperature_c"] == 95.0
+    assert target["limit_sources"] == {
+        "gpu_shutdown_temperature_c": "product:DCGM_FI_DEV_SHUTDOWN_TEMP"
+    }, "the precondition names the device source the product used"
+    assert result["device_limits_source"] == "exporter-pod+product-records"
+    assert regional.scripts == [fixture.GPU_STATE_PROBE], "one read-only store read"
+    assert runner.replay_plans_for_case("GF-ENV-LIVE-011", result) == {
+        "plans": {
+            "shutdown": {"steps": [{"reads": 1, "values": {"gpu_temperature_c": 96.0}}]}
+        },
+        "not_run": {},
+    }, "H200 is runnable: one DCGM_FI_DEV_GPU_TEMP read at 95 C + 1"
+
+
+def test_a_limit_the_newest_batch_no_longer_carries_does_not_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.e2e.regional import run_env_live as runner
+
+    regional = ProductRegional(
+        device_xml=H200_XML, state=_product_latest("2026-11-01T09:30:00+00:00")
+    )
+    monkeypatch.setattr(fixture, "RegionalLiveFixture", lambda s: regional)
+
+    result = fixture.read_only_preflight(_shutdown_settings(), tmp_path)
+
+    assert "gpu_shutdown_temperature_c" not in result["target_gpu"]["limits"], (
+        "gpu_metric_latest keeps a withheld limit's old value: it is not published"
+    )
+    replay = runner.replay_plans_for_case("GF-ENV-LIVE-011", result)
+    assert replay["plans"] == {}
+    assert "any device source" in replay["not_run"]["shutdown_absolute"], replay
+    other = ProductRegional(device_xml=H200_XML, state=_product_latest())
+    monkeypatch.setattr(fixture, "RegionalLiveFixture", lambda s: other)
+    fixture.read_only_preflight(_settings(), tmp_path)
+    assert other.scripts == [], "only 011 reads the product's published limits"
+
+
+def test_the_published_limit_and_its_source_survive_the_product_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Collector -> ingestion -> store -> the real GPU-state probe -> the plan."""
+
+    import contextlib
+    import io
+    import subprocess
+    import sys
+    import types
+    from datetime import datetime, timezone
+    from unittest import mock
+
+    from gpu_fault.app import ApplicationContext
+    from gpu_fault.collectors.gpu.dcgm import DcgmMetricsCollector
+    from gpu_fault.collectors.gpu.discovery import query_nvidia_temperature_limits
+    from gpu_fault.collectors.models import CollectorContext
+    from gpu_fault.gpu_metrics import GpuMetricBatch, GpuMetricsService
+    from gpu_fault.store import InMemoryStore
+
+    store = InMemoryStore()
+    service = GpuMetricsService(store=store)
+
+    class Sink:
+        def post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+            return service.ingest(GpuMetricBatch.model_validate(payload)).model_dump(
+                mode="json"
+            )
+
+    def xml_runner(argv: Any, **_: Any) -> Any:
+        return subprocess.CompletedProcess(argv, 0, stdout=H200_XML, stderr="")
+
+    labels = 'gpu="0",UUID="GPU-aaaa",pci_bus_id="00000000:59:00.0"'
+    DcgmMetricsCollector(
+        Sink(), CollectorContext(cluster_id="c"), node_id="node-a"
+    ).collect_text(
+        f"DCGM_FI_DEV_GPU_TEMP{{{labels}}} 28\n"
+        f"DCGM_FI_DEV_GPU_TEMP_LIMIT{{{labels}}} 59\n"
+        f"DCGM_FI_DEV_SHUTDOWN_TEMP{{{labels}}} 95\n",
+        observed_at=datetime.now(timezone.utc),
+        extra_samples=query_nvidia_temperature_limits(xml_runner),
+    )
+
+    def probe(*arguments: str) -> Any:
+        output = io.StringIO()
+        with (
+            mock.patch.object(
+                ApplicationContext,
+                "from_environment",
+                lambda: types.SimpleNamespace(store=store),
+            ),
+            mock.patch.object(sys, "argv", ["gpu-state-probe", *arguments]),
+            contextlib.redirect_stdout(output),
+        ):
+            exec(compile(fixture.GPU_STATE_PROBE, "<probe>", "exec"), {})
+        return json.loads(output.getvalue())
+
+    regional = ProductRegional(device_xml=H200_XML, state=probe)
+
+    published = fixture.published_shutdown_limits(regional, "node-a")
+
+    assert {
+        gpu: (item["value"], item["source"]) for gpu, item in published.items()
+    } == {"GPU-aaaa": (95.0, "DCGM_FI_DEV_SHUTDOWN_TEMP")}, published

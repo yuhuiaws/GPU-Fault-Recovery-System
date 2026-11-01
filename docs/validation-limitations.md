@@ -77,7 +77,9 @@ GF-ENV-LIVE case stays manual/NOT_RUN until run live; a passing unit test is
 supporting logic coverage, not a LIVE PASS. The runner decides per device which
 severe-temperature variant can run on the real same-scale limits and leaves the
 others NOT_RUN rather than fabricating a scale: on a T.Limit-only p5en H200 the
-absolute-core and absolute-shutdown (GF-ENV-LIVE-011) variants are NOT_RUN,
+absolute-core variant is NOT_RUN, and the absolute-shutdown case (GF-ENV-LIVE-011)
+runs only on the shutdown limit the product published from DCGM field 159 (read
+from the product's records; without it NOT_RUN, never the T.Limit offset),
 GF-ENV-LIVE-002 reuses GF-REGIONAL-COLLECT-002's controlled power path.
 GF-ENV-LIVE-010 runs only with a control node (`--node-b`), `--site-file` and a
 multi-GPU target node: an independent control task (the node-pinned single-node
