@@ -7691,9 +7691,10 @@ not exactly three fields (no comma in a help text), an unknown field name (go-dc
 the legacy one), a type other than counter/gauge/untyped/label, or one of the retired PCIe throughput fields 200/201, which it now
 refuses outright. `DCGM_FI_DEV_FABRIC_HEALTH_MASK` (174), `DCGM_FI_DEV_FABRIC_HEALTH_SUMMARY` (175) and
 `DCGM_FI_DEV_FABRIC_MANAGER_ERROR` are no longer unknown names to this exporter and no longer stop it at start-up; but adding any
-field (these three included) first means updating the verified field table from that release's go-dcgm (`PINNED_FIELD_IDS` in
-`tests/regional/test_dataplane_dcgm_counters.py`, which fails while the CSV and the table disagree), and 174/175 carry values only
-from a host engine that serves them; the solution does not grade them yet.
+field first means updating the verified field table from that release's go-dcgm (`PINNED_FIELD_IDS` in
+`tests/regional/test_dataplane_dcgm_counters.py`, which fails while the CSV and the table disagree), as batch 235 did when it
+added 174/175. Those two carry values only from a host engine that serves them; the solution grades them since batch 235, and a
+reading of 0 (NOT_SUPPORTED, as on the live H200 nodes) grades nothing ("Blackwell fields" below).
 
 T.Limit field: the CSV also exports `DCGM_FI_DEV_GPU_TEMP_LIMIT` (153, gauge), the current reading `gpu_tlimit_c` that
 the T.Limit thresholds above grade. DCGM 4.1.0 introduced it (release notes: "Add a field to track the TLIMIT"; field
