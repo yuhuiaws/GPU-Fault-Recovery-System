@@ -10825,10 +10825,45 @@ when the coordinator's `processor_consumer_running` has exited, or the age of th
 and makes no Aurora round trip;
 readiness continues to use `/healthz` (including registry freshness, `GPU_FAULT_REGISTRY_STALE_SECONDS`
 production value 90 s, covering one Aurora writer failover). So during a failover the Pod is briefly NotReady,
-but is not restarted into a process that again needs Aurora to start; at startup the registry bootstrap also retries with exponential backoff within the
-`GPU_FAULT_STARTUP_STORE_RETRY_SECONDS` (default 120 s) budget.
+but is not restarted into a process that again needs Aurora to start; a process that is still starting waits for Aurora as well instead of crashing (next two paragraphs).
 Although the synchronous Store calls of business endpoints have been isolated from the event loop,
 Store I/O saturation or downstream timeouts should not cause several NLB targets to be killed by liveness at the same time.
+
+The start-up Store wait (`src/gpu_fault/app/startup_store_wait.py`): every Store round trip a control-plane process makes
+before it can serve -- opening the pool and validating the schema (`PostgresStore`), syncing the regional cluster registry
+from the Secret and reading the registered clusters back (agent registry and managed-recovery observers), loading the durable
+registry head and writing the member heartbeat (registry bootstrap) -- shares **one** `GPU_FAULT_STARTUP_STORE_RETRY_SECONDS`
+(default 120 s, 0 turns the wait off) budget: one deadline for the whole start-up path, not one per step, and a later step only
+gets what the earlier ones left. Each step retries with exponential backoff from 0.5 s, doubling to a 10 s cap, never past the
+deadline. Only transient failures are waited for: the writer is unavailable (`psycopg_pool.PoolTimeout`; a lost or refused
+connection, i.e. an `OperationalError` without SQLSTATE, class 08, 57P01-57P03, a session that landed on a read-only replica;
+class 53 resource exhaustion), a timeout (`ConnectionTimeout`, 57014, 55P03) and a race (40001, 40P01). Refused credentials
+(28000/28P01 or libpq's FATAL text) count as transient too: during a credential rotation every new connection is refused from
+the moment RDS changes the password until the refresher has written the `gpu-fault-aurora` Secret and kubelet has synced the
+projected volume; the pool re-reads the mounted file on every connect, and behind the pool that refusal surfaces as the same
+`PoolTimeout` anyway. Waiting lets a Pod started inside that window come up on the new password; a password that is simply
+wrong costs one budget before the same clear exit, and every retry line names `authentication refused`, so it is not read as a
+failover (the rotation itself is covered by GF-REGIONAL-HA-009). Everything else fails at once: a schema that is not
+initialized or has the wrong version, drifted triggers or indexes, a registry head that disagrees with its revision, invalid
+configuration -- a restart would meet the same state. Every retry logs one WARNING line
+`start-up store wait: <step> attempt <N> failed (<kind>, <error class>: <redacted message>); retrying in <s>s with <s>s of the
+<budget>s GPU_FAULT_STARTUP_STORE_RETRY_SECONDS budget left` (the steps are `control-plane store connection and schema check`,
+`control-plane context` and `regional registry bootstrap`; the message is redacted and carries no DSN). A spent budget ends in
+one `StartupStoreUnavailable: start-up gave up waiting for the store after ...`: the worker exits with uvicorn's
+`STARTUP_FAILURE` (3), the supervisor stops the parent, the container exits non-zero and Kubernetes restarts it with backoff.
+
+Probes during the wait: every `gpu_fault.app.serve` worker binds the service port first (a port conflict still fails before the
+application is built) but only calls `listen()` when uvicorn starts serving, i.e. after the application factory (including the
+wait above) and the lifespan start-up. Until then the kernel hashes no connection to that worker, and while no worker serves
+the service port refuses connections, so the TCP `startupProbe` (service port, `periodSeconds: 5` x `failureThreshold: 120` =
+600 s) keeps failing and the kubelet runs neither liveness nor readiness before it succeeds: a waiting process is not killed
+by liveness and does not report Ready; the supervisor's health-check pipe answers "not started" rather than nothing, so it does
+not replace it either. 600 s exceeds the budget plus the last attempt's pool checkout timeout plus a start margin (pinned by
+`tests/deploy/test_control_plane_liveness_probe.py`); raise the window together with the budget. The cold-connect protections
+are unchanged: every worker still owns its `SO_REUSEPORT` service socket with `--backlog`, and liveness/readiness stay on the
+dedicated `livez` port. When a waiting Pod is deleted, uvicorn only records the SIGTERM and exits once the start-up wait ends
+(success or a spent budget), at the latest by the SIGKILL after `terminationGracePeriodSeconds`; it has accepted no request and
+holds no lease at that point.
 
 Liveness is not probed on the service port (ingress 8080 / control-worker 8081 / spool-worker 8082) but on each
 role's dedicated `livez` container port (service port + 10: 8090 / 8091 / 8092). Every uvicorn worker process binds

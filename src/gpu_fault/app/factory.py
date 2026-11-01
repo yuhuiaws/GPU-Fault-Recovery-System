@@ -157,6 +157,10 @@ from gpu_fault.app.runtime import (
     AppRuntime,
     EventLoopLag,
 )
+from gpu_fault.app.startup_store_wait import (
+    REGISTRY_BOOTSTRAP_STEP,
+    StartupStoreWait,
+)
 from gpu_fault.capabilities import ProfileValidationError
 from gpu_fault.channel_registry import (
     COLLECTOR_EVENT_PREFIX,
@@ -243,6 +247,49 @@ def _configure_fleet_pin_runtime(ctx: ApplicationContext) -> FleetPinRuntime:
     return runtime
 
 
+def _startup_store_wait(ctx: Any) -> StartupStoreWait:
+    """The start-up store budget ``ctx`` was built under, or a fresh one.
+
+    ``ApplicationContext.from_environment`` opens the store and builds the
+    context inside one start-up store budget (``startup_store_wait``); the
+    registry bootstrap is the last start-up step that needs Aurora and gets
+    what is left of it. A context injected by a caller (tests, tools) carries
+    none, so its bootstrap starts a budget of its own.
+    """
+
+    wait = getattr(ctx, "startup_wait", None)
+    if isinstance(wait, StartupStoreWait):
+        return wait
+    return StartupStoreWait.from_environment()
+
+
+def _bootstrap_regional_registry(
+    ctx: Any, service_role: str
+) -> RegionalRegistryRuntime:
+    """Load the durable registry head inside the start-up store budget.
+
+    The bootstrap is the last start-up step that needs Aurora. It runs in what
+    is left of the budget the context's store steps started, so a Pod started
+    during an Aurora writer failover waits once for its whole start-up -- and
+    only for an outage, by the one classification of
+    ``gpu_fault.app.startup_store_wait``. The runtime's own retry budget stays
+    at its default of zero, so there is one loop, not two nested ones.
+    """
+
+    return _startup_store_wait(ctx).run(
+        REGISTRY_BOOTSTRAP_STEP,
+        lambda: RegionalRegistryRuntime.bootstrap(
+            ctx.store,
+            member_id=(_pod_process_owner() or f"local:{service_role}:{os.getpid()}"),
+            service_role=service_role,
+            release_id=os.getenv("GPU_FAULT_RELEASE_ID", "local"),
+            poll_seconds=float(os.getenv("GPU_FAULT_REGISTRY_POLL_SECONDS", "1")),
+            stale_seconds=float(os.getenv("GPU_FAULT_REGISTRY_STALE_SECONDS", "10")),
+            secret_config_sha256=ctx.regional_registry_secret_sha256,
+        ),
+    )
+
+
 def _configure_service_runtime(
     ctx,
     processor,
@@ -271,22 +318,7 @@ def _configure_service_runtime(
             "GPU_FAULT_SERVICE_ROLE must be all, ingress, worker, or spool-worker"
         )
     regional_auth_registry = (
-        RegionalRegistryRuntime.bootstrap(
-            ctx.store,
-            member_id=(_pod_process_owner() or f"local:{service_role}:{os.getpid()}"),
-            service_role=service_role,
-            release_id=os.getenv("GPU_FAULT_RELEASE_ID", "local"),
-            poll_seconds=float(os.getenv("GPU_FAULT_REGISTRY_POLL_SECONDS", "1")),
-            stale_seconds=float(os.getenv("GPU_FAULT_REGISTRY_STALE_SECONDS", "10")),
-            # A Pod that starts during an Aurora writer failover must wait it
-            # out, not crash into a restart loop that needs Aurora again.
-            retry_budget_seconds=float(
-                os.getenv("GPU_FAULT_STARTUP_STORE_RETRY_SECONDS", "120")
-            ),
-            secret_config_sha256=ctx.regional_registry_secret_sha256,
-        )
-        if ctx.regional_mode
-        else None
+        _bootstrap_regional_registry(ctx, service_role) if ctx.regional_mode else None
     )
     ctx.bind_regional_registry_runtime(regional_auth_registry)
     ctx.regional_registry_runtime = regional_auth_registry

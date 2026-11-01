@@ -8,7 +8,9 @@ cold-connect burst timed it out three times in a row on all three api-ha Pods
 within 2.3 s (every load request answered 2xx), the load balancer controller
 deregistered every NLB target, and executor claims opened while the
 re-registered targets waited for the NLB health check were closed without a
-response. Startup keeps the service port.
+response. Startup keeps the service port: the launcher listens there only once
+a worker has built its application, so the TCP startup probe holds liveness
+and readiness off for the whole start-up store wait (GF-REGIONAL-HA-010).
 
 Numbers (scripts/perf/ingress_event_loop_burst.py, 50 clusters x 85 cold-
 connect workers against four uvicorn processes): the service socket's accept
@@ -24,6 +26,8 @@ from pathlib import Path
 
 import yaml
 
+from gpu_fault.app.startup_store_wait import startup_store_budget_seconds
+
 ROOT = Path(__file__).resolve().parents[2]
 PATCH = ROOT / "deploy/control-plane/regional/regional-control-plane-patch.yaml"
 BASE = ROOT / "deploy/control-plane/base/control-plane-deployment.yaml"
@@ -33,6 +37,10 @@ ROLES = {
     "gpu-fault-control-worker.yaml": ("control-worker", 8081, 8091),
     "gpu-fault-telemetry-spool-worker.yaml": ("telemetry-spool-worker", 8082, 8092),
 }
+# Importing the package, building the application after the wait and the
+# lifespan start-up, plus one startup-probe period: what a start-up costs on top
+# of the store wait itself.
+START_MARGIN_SECONDS = 60
 LIVENESS_TIMING = {
     "initialDelaySeconds": 10,
     "periodSeconds": 10,
@@ -118,3 +126,52 @@ def test_every_generated_role_launches_one_reuseport_socket_per_worker():
         "set -- /opt/gpu-fault/control-plane/bin/python -m gpu_fault.app.serve" in base
     )
     assert "set -- python3 -m gpu_fault.app.serve" in base
+
+
+def _role_environment(container: dict) -> dict[str, str]:
+    """The role's env as its process sees it: config maps, then ``env``."""
+
+    values: dict[str, str] = {}
+    for source in container.get("envFrom", []):
+        name = source["configMapRef"]["name"]
+        document = yaml.safe_load(
+            (GENERATED / f"{name}.yaml").read_text(encoding="utf-8")
+        )
+        values.update(document["data"])
+    for item in container.get("env", []):
+        if "value" in item:
+            values[item["name"]] = item["value"]
+    return values
+
+
+def test_every_role_survives_its_start_up_store_wait_unprobed():
+    """A process waiting out an Aurora writer failover in its start-up is
+    neither killed by liveness nor reported ready (GF-REGIONAL-HA-010).
+
+    The TCP startup probe on the service port fails until a worker serves
+    (``gpu_fault.app.serve`` listens only then), and the kubelet runs no
+    liveness or readiness probe before it succeeds. So its window must outlast
+    the start-up store budget, the last attempt's pool checkout and the rest of
+    a start-up; liveness and readiness stay on the probe listener, which opens
+    at the end of the lifespan start-up.
+    """
+
+    for filename, (_, service_port, liveness_port) in ROLES.items():
+        container = _api_container(GENERATED / filename)
+        startup = container["startupProbe"]
+        assert startup["tcpSocket"] == {"port": service_port}, filename
+        window = startup["periodSeconds"] * startup["failureThreshold"]
+        environment = _role_environment(container)
+        budget = startup_store_budget_seconds(environment)
+        checkout = float(environment["GPU_FAULT_POSTGRES_POOL_TIMEOUT_SECONDS"])
+        assert window >= budget + checkout + START_MARGIN_SECONDS, (
+            f"{filename}: startup window {window}s cannot hold a "
+            f"{budget:g}s start-up store wait"
+        )
+        assert container["livenessProbe"]["httpGet"]["port"] == liveness_port
+        assert container["readinessProbe"]["httpGet"]["port"] == liveness_port
+    base = _api_container(BASE)["startupProbe"]
+    assert (
+        base["periodSeconds"] * base["failureThreshold"]
+        >= startup_store_budget_seconds({}) + START_MARGIN_SECONDS
+    ), "the base Deployment's startup window holds the default budget"

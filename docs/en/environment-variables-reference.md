@@ -611,7 +611,7 @@ logs one warning, but no code reads it.
 | `GPU_FAULT_SPARE_HEALTH_SCAN_SECONDS` | Core/Other | number | `'30'` | `gpu_fault.app.lifespan_workers`<br>`gpu_fault.app.periodic_services` |
 | `GPU_FAULT_SPARE_UNAVAILABLE_ALERT_SECONDS` | Core/Other | number | `'86400'` | `gpu_fault.app.context` |
 | `GPU_FAULT_SPARE_UNAVAILABLE_RECHECK_SECONDS` | Core/Other | number | `'3600'` | `gpu_fault.app.context` |
-| `GPU_FAULT_STARTUP_STORE_RETRY_SECONDS` | Core/Other | number | `'120'` | `gpu_fault.app.factory` |
+| `GPU_FAULT_STARTUP_STORE_RETRY_SECONDS` | Core/Other | number | `'120'` | `gpu_fault.app.startup_store_wait` |
 | `GPU_FAULT_STORE_IO_ADMISSION_TIMEOUT_SECONDS` | PostgreSQL | number | `'2'` | `gpu_fault.app.admission_runtime` |
 | `GPU_FAULT_STORE_IO_MAX_IN_FLIGHT` | PostgreSQL | integer | `<implicit>` | `gpu_fault.app.admission_runtime` |
 | `GPU_FAULT_STORE_IO_WORKERS` | PostgreSQL | integer | `'8'` | `gpu_fault.app.admission_runtime` |

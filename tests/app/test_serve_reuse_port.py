@@ -213,6 +213,102 @@ def test_a_worker_that_never_serves_stops_the_parent_with_startup_failure(
     assert not _listening_inodes(port), "no worker socket may outlive the parent"
 
 
+def test_a_worker_still_building_its_application_takes_no_connection(
+    launched, tmp_path, monkeypatch
+) -> None:
+    """A worker waiting out an Aurora failover in the factory (GF-REGIONAL-HA-010).
+
+    Its socket is bound but not listening: the kernel hashes no client to it,
+    and the service port refuses connections, so the Deployment's TCP startup
+    probe keeps failing and the kubelet runs neither liveness nor readiness
+    yet. The supervisor keeps it past its health-check timeout, because the
+    health pipe answers "not started", not nothing. Released, it serves.
+    """
+
+    entered = tmp_path / "entered"
+    entered.mkdir()
+    release = tmp_path / "release"
+    monkeypatch.setenv("REUSEPORT_APP_ENTERED_DIR", str(entered))
+    monkeypatch.setenv("REUSEPORT_APP_RELEASE_FILE", str(release))
+    port = _free_port()
+    process = launched(
+        port,
+        "--workers",
+        "2",
+        "--timeout-worker-healthcheck",
+        "1",
+        "--factory",
+        app="tests.app._reuseport_app:waiting",
+    )
+    _wait_for(lambda: len(list(entered.iterdir())) == 2, 30, "both workers waiting")
+    waited_until = time.monotonic() + 3
+    while time.monotonic() < waited_until:
+        assert process.poll() is None, "a waiting worker must not stop the parent"
+        assert not _listening_inodes(port), "no socket may listen while starting"
+        with pytest.raises(ConnectionRefusedError):
+            socket.create_connection(("127.0.0.1", port), timeout=1).close()
+        time.sleep(0.2)
+    waiting_pids = {int(item.name) for item in entered.iterdir()}
+    release.write_text("go", encoding="utf-8")
+    _wait_for(lambda: len(_listening_inodes(port)) == 2, 30, "two LISTEN sockets")
+    served = {_get(port, "/pid")[1]["pid"] for _ in range(40)}
+    assert served == waiting_pids, "the workers that waited are the ones serving"
+    output = _stop(process)
+    assert "died" not in output and "failed to start" not in output, output
+
+
+def test_a_worker_that_spends_its_start_up_store_budget_stops_the_parent(
+    launched,
+) -> None:
+    port = _free_port()
+    process = launched(
+        port, "--workers", "2", "--factory", app="tests.app._reuseport_app:gave_up"
+    )
+    assert process.wait(timeout=60) == serve.STARTUP_FAILURE, (
+        "a spent budget exits non-zero so the Pod restarts, not one child"
+    )
+    output = _stop(process)
+    assert (
+        "start-up store wait: control-plane store connection and schema check "
+        "attempt 1 failed (writer unavailable, PoolTimeout"
+    ) in output
+    assert "start-up gave up waiting for the store after" in output
+    assert "failed to start; stopping the parent" in output
+    assert not _listening_inodes(port), "no worker socket may outlive the parent"
+
+
+def test_a_bound_socket_that_does_not_listen_takes_no_connection() -> None:
+    """The kernel half of the late ``listen()``: a bound socket refuses
+    connections and is not in the port's SO_REUSEPORT group, so a listening
+    sibling gets every one; it accepts once it listens."""
+
+    waiting = serve.bind_service_socket("127.0.0.1", 0, 16, listen=False)
+    port = int(waiting.getsockname()[1])
+    try:
+        with pytest.raises(ConnectionRefusedError):
+            socket.create_connection(("127.0.0.1", port), timeout=1).close()
+        serving = serve.bind_service_socket("127.0.0.1", port, 512)
+        try:
+            for _ in range(100):
+                socket.create_connection(("127.0.0.1", port), timeout=1).close()
+            serving.settimeout(1)
+            accepted = 0
+            while True:
+                try:
+                    connection, _ = serving.accept()
+                except TimeoutError:
+                    break
+                connection.close()
+                accepted += 1
+            assert accepted == 100, "every connection went to the listening socket"
+        finally:
+            serving.close()
+        waiting.listen(16)
+        socket.create_connection(("127.0.0.1", port), timeout=1).close()
+    finally:
+        waiting.close()
+
+
 def test_the_command_line_is_uvicorns_subset_and_is_validated() -> None:
     settings = serve.parse_args(
         [

@@ -3071,8 +3071,10 @@ otherwise rewritten every `stale/3` seconds (production manifest `GPU_FAULT_REGI
 window about 1.2 writes/second site-wide). `is_ready()` requires at the same time that the snapshot is aligned with the head and that the most recent successful refresh and the most recent successful
 persistent heartbeat are both within the stale window; future timestamps are invalid; a single transient connection closure no longer counts as not ready, and continued successful database reads
 cannot extend an expired write proof. Concurrent refreshes use a sequence number and a heartbeat lock to stop old results from overwriting a newer snapshot. While not ready, cluster-token
-requests get 503 + `Retry-After`. At startup it waits for the Store with a budget of `GPU_FAULT_STARTUP_STORE_RETRY_SECONDS` (default 120),
-so that a new Pod does not fall into a restart loop that needs Aurora to come up during an Aurora writer failover. A heartbeat row not updated for more than
+requests get 503 + `Retry-After`. At startup the whole Store path (pool and schema check, registry sync and registered-cluster reads, registry
+bootstrap) waits for the Store within one `GPU_FAULT_STARTUP_STORE_RETRY_SECONDS` (default 120) budget, for transient failures only,
+so that a new Pod does not fall into a restart loop that needs Aurora to come up during an Aurora writer failover (`app/startup_store_wait.py`; the
+classification and the probe interplay are in the deployment and operations manual). A heartbeat row not updated for more than
 `GPU_FAULT_REGISTRY_MEMBER_RETENTION_SECONDS` (default 86400) is deleted by periodic cleanup.
 
 Online changes go through four `execution-token` routes (`src/gpu_fault/app/routes/regional_registry.py`):

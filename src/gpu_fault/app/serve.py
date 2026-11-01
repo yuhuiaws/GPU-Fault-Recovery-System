@@ -45,6 +45,25 @@ The command line is uvicorn's own subset that the manifests use::
         --timeout-graceful-shutdown 60 --timeout-worker-healthcheck 20 \\
         --no-access-log --limit-concurrency 4096
 
+A worker binds its socket before it builds the application, so a port
+conflict still fails before the factory runs, but it does not listen until
+uvicorn starts serving: ``loop.create_server(sock=...)`` calls
+``listen(backlog)`` (asyncio and uvloop alike, with ``--backlog``) after the
+application factory and the lifespan start-up. Until then the kernel queues no
+connection for that worker - a socket that is only bound is not in the port's
+``SO_REUSEPORT`` group, so none of its siblings' connections are hashed to it
+either - and while no worker serves, the service port refuses connections,
+which is what the Deployment's TCP ``startupProbe`` on that port waits for
+(``periodSeconds: 5`` x ``failureThreshold: 120``). A worker that waits out an
+Aurora writer failover inside the factory (``gpu_fault.app.startup_store_wait``,
+for up to its start-up store budget) therefore takes no traffic, keeps
+the startup probe failing so the kubelet runs neither liveness nor readiness
+yet, and still answers the supervisor's health pings (``server.started`` is
+false) so it is not replaced. Binding and listening in one step let the
+startup probe pass the instant a worker bound the port; liveness then probed a
+``livez`` listener that only opens at the end of the lifespan start-up, and
+three misses (10 s apart) would have killed a process still waiting.
+
 Everything after the socket is uvicorn: each worker runs ``uvicorn.Server``
 on its socket with the configured protocol, loop, keep-alive, graceful
 shutdown and concurrency limit, and the application is unchanged. The
@@ -187,9 +206,19 @@ def parse_args(argv: Sequence[str] | None = None) -> ServerSettings:
 
 
 def bind_service_socket(
-    host: str, port: int, backlog: int, *, reuse_port: bool = True
+    host: str,
+    port: int,
+    backlog: int,
+    *,
+    reuse_port: bool = True,
+    listen: bool = True,
 ) -> socket.socket:
-    """A listening socket this process owns; ``SO_REUSEPORT`` lets siblings share the port."""
+    """A socket this process owns; ``SO_REUSEPORT`` lets siblings share the port.
+
+    ``listen=False`` only binds it: the port is claimed (a conflict fails now)
+    but the kernel queues no connection for it, and none of its siblings'
+    connections either, until something calls ``listen()``.
+    """
 
     family = socket.AF_INET6 if ":" in host else socket.AF_INET
     sock = socket.socket(family, socket.SOCK_STREAM)
@@ -198,7 +227,8 @@ def bind_service_socket(
         if reuse_port:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         sock.bind((host, port))
-        sock.listen(backlog)
+        if listen:
+            sock.listen(backlog)
     except OSError:
         sock.close()
         raise
@@ -246,7 +276,12 @@ def serve_worker(
             daemon=True,
         ).start()
     try:
-        sock = bind_service_socket(settings.host, settings.port, settings.backlog)
+        # Bound now, listening only once uvicorn serves it: ``create_server``
+        # calls ``listen(backlog)`` after the factory and the lifespan start-up
+        # (module docstring), so a worker still starting holds no connection.
+        sock = bind_service_socket(
+            settings.host, settings.port, settings.backlog, listen=False
+        )
     except OSError as exc:
         LOGGER.error(
             "worker %s cannot bind %s:%s: %s",
@@ -284,7 +319,8 @@ def serve_worker(
 
     config.load = load_and_count  # type: ignore[method-assign]
     LOGGER.info(
-        "worker %s pid %s serves %s:%s on its own SO_REUSEPORT socket (backlog %s)",
+        "worker %s pid %s bound %s:%s on its own SO_REUSEPORT socket (backlog %s); "
+        "it listens once the application has started",
         worker_index,
         os.getpid(),
         settings.host,

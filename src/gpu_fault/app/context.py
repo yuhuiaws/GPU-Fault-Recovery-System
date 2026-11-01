@@ -17,6 +17,11 @@ from gpu_fault.adapters import (
     SupportEscalationAdapter,
 )
 from gpu_fault.app.identity import pod_process_owner
+from gpu_fault.app.startup_store_wait import (
+    CONTEXT_STEP,
+    STORE_STEP,
+    StartupStoreWait,
+)
 from gpu_fault.capabilities import compile_runtime_profile
 from gpu_fault.control_record_archive import ControlRecordArchiver
 from gpu_fault.departed_node_cleanup import (
@@ -90,7 +95,7 @@ from gpu_fault.regional_registry import (
     sync_regional_cluster_registry,
 )
 from gpu_fault.service import CompletionService
-from gpu_fault.settings import ControlPlaneSettings
+from gpu_fault.settings import ControlPlaneSettings, StoreSettings
 from gpu_fault.spare_health import HyperPodSpareHealthController
 from gpu_fault.store import (
     InMemoryStore,
@@ -293,7 +298,76 @@ def _validation_step_cap(settings: Any) -> timedelta:
     )
 
 
+def open_control_plane_store(store_settings: StoreSettings) -> ControlPlaneStore:
+    """The configured store, its pool open and its schema validated.
+
+    ``PostgresStore`` closes its own pool when the schema check fails, so a
+    retried attempt leaves nothing behind.
+    """
+
+    store: ControlPlaneStore
+    if store_settings.kind == "sqlite":
+        store = SqliteStore(store_settings.sqlite_path)
+    else:
+        store = PostgresStore(
+            store_settings.url,
+            pool_min_size=store_settings.postgres_pool_min_size,
+            pool_max_size=store_settings.postgres_pool_max_size,
+            pool_timeout_seconds=store_settings.postgres_pool_timeout_seconds,
+            initialize_schema=store_settings.postgres_auto_schema_init,
+        )
+    return store
+
+
+def _close_store_quietly(store: object) -> None:
+    close = getattr(store, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except Exception:
+        LOGGER.exception("closing the store after a failed start-up failed")
+
+
+def _active_context_from_environment(
+    context_class: type[ApplicationContext],
+    settings: ControlPlaneSettings,
+    startup_wait: StartupStoreWait | None,
+) -> ApplicationContext:
+    """Open the store and build an active context, waiting out an outage.
+
+    Every store round trip a context makes before its process serves -- the
+    pool and schema check, the regional registry sync, the registered-cluster
+    reads of the agent registry and the managed-recovery observers -- runs
+    inside one start-up budget (GF-REGIONAL-HA-010): a Pod started during an
+    Aurora writer failover waits for the writer instead of crashing into a
+    restart that needs Aurora again. The store is opened once; the context
+    around it is rebuilt whole when one of its reads or writes meets the
+    outage. The factory's registry bootstrap spends what is left of the same
+    budget (``ApplicationContext.startup_wait``).
+    """
+
+    assert settings.store is not None
+    store_settings = settings.store
+    wait = startup_wait or StartupStoreWait.from_environment()
+    store = wait.run(STORE_STEP, lambda: open_control_plane_store(store_settings))
+    try:
+        context = wait.run(
+            CONTEXT_STEP,
+            lambda: context_class._assemble(settings, settings.executor, store),
+        )
+    except BaseException:
+        _close_store_quietly(store)
+        raise
+    context.startup_wait = wait
+    return context
+
+
 class ApplicationContext:
+    #: The start-up store budget an active context was built under; the
+    #: factory's registry bootstrap spends what is left of it.
+    startup_wait: StartupStoreWait | None = None
+
     def __init__(
         self,
         notification_notifier=None,
@@ -581,13 +655,23 @@ class ApplicationContext:
         return runtime.step_batching_policy()
 
     @classmethod
-    def from_environment(cls) -> ApplicationContext:
+    def from_environment(
+        cls, *, startup_wait: StartupStoreWait | None = None
+    ) -> ApplicationContext:
         validate_gpu_fault_environment(process_name="gpu-fault-api")
         settings = ControlPlaneSettings.from_mapping(os.environ)
         config = settings.executor
         if not config.enabled:
             return cls(production_executor_config=config)
-        context = cls._base_context(settings, config)
+        return _active_context_from_environment(cls, settings, startup_wait)
+
+    @classmethod
+    def _assemble(
+        cls, settings: ControlPlaneSettings, config: Any, store: ControlPlaneStore
+    ) -> ApplicationContext:
+        """The active context around an open store; one start-up attempt."""
+
+        context = cls._base_context(settings, config, store)
         cls._configure_agent_registry(context, settings)
         (
             adapters,
@@ -648,24 +732,10 @@ class ApplicationContext:
         return context
 
     @classmethod
-    def _base_context(cls, settings, config):
-        store_settings = settings.store
-        assert store_settings is not None
-        store_url = store_settings.url
-        store_kind = store_settings.kind
+    def _base_context(cls, settings, config, store):
+        store_url = settings.store.url
         execution_token = settings.execution_token
         assert execution_token is not None
-        store = (
-            SqliteStore(store_settings.sqlite_path)
-            if store_kind == "sqlite"
-            else PostgresStore(
-                store_url,
-                pool_min_size=(store_settings.postgres_pool_min_size),
-                pool_max_size=(store_settings.postgres_pool_max_size),
-                pool_timeout_seconds=(store_settings.postgres_pool_timeout_seconds),
-                initialize_schema=(store_settings.postgres_auto_schema_init),
-            )
-        )
         context = cls(
             store=store,
             production_executor_config=config,
