@@ -311,7 +311,9 @@ def test_contexts_record_every_site_eks_cluster_and_the_header_names_the_due_one
         ("hp-gpu-eks", "1.33", "2027-07-29"),
         ("gpu-eks-cluster", "1.31", "2026-11-26"),
     ], "the CPU EKS cluster, the HyperPod orchestrator and the plain EKS cluster"
-    assert HP_EKS_ARN.endswith(block["clusters"][1]["eks_cluster"])
+    assert HP_EKS_ARN.endswith(block["clusters"][1]["eks_cluster"]), (
+        "the HyperPod GPU cluster is read through the EKS cluster it is orchestrated by"
+    )
     describes = [
         call
         for call in runner.calls

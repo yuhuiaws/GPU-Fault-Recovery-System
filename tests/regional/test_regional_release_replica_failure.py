@@ -153,7 +153,7 @@ def test_the_message_is_redacted_capped_and_on_one_line() -> None:
     text = record["message"]
     assert "x" * 40 not in text and "abcdefghijklmnop" not in text, text
     assert "\n" not in text and len(text) == failure.MESSAGE_LIMIT
-    assert text.endswith("...")
+    assert text.endswith("..."), "a capped message says it was cut"
     assert record["webhook"] is None and "evidence" not in record, (
         "no webhook named: no Kueue pointer"
     )
@@ -236,7 +236,7 @@ def test_cpu_workloads_fails_naming_both_short_deployments_and_the_webhook(
     result = finding(checks.build_quick_health_report(release), "cpu_workloads")
 
     assert result["status"] == "FAIL"
-    assert result["summary"].startswith("gpu-fault-api-ha has 1/")
+    assert result["summary"].startswith("gpu-fault-api-ha has 1/"), result["summary"]
     assert (
         f"; {WORKER} has 1/3 Ready (ReplicaFailure FailedCreate: "
         in (result["summary"])
@@ -272,7 +272,9 @@ def test_a_gpu_cluster_check_names_a_data_plane_deployment_the_same_way(
     )
 
     assert result["status"] == "FAIL"
-    assert result["summary"].startswith(f"{name} has 0/1 Ready (ReplicaFailure ")
+    assert result["summary"].startswith(f"{name} has 0/1 Ready (ReplicaFailure "), (
+        result["summary"]
+    )
     assert result["details"]["deployments"][name]["replica_failure"]["webhook"] == (
         "mpod.kb.io"
     )
@@ -320,7 +322,9 @@ def test_the_header_line_also_follows_a_passing_check(release: CheckedRelease) -
 
     (line,) = replica_failure_lines(_status(check)["health"])
 
-    assert line.startswith(f"replica failure: {WORKER} (3/3 Ready) FailedCreate: ")
+    assert line.startswith(f"replica failure: {WORKER} (3/3 Ready) FailedCreate: "), (
+        line
+    )
 
 
 @pytest.mark.parametrize(

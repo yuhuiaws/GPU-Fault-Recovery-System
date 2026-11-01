@@ -35,7 +35,7 @@ from tests.regional.test_regional_release_automatic_updates import (
     _report,
 )
 
-CPU_GROUP = "control-plane-GPU-fault-solution-CPU-instance"
+CPU_GROUP = "cpu-control-plane-c5"
 CPU_SCHEDULE = "cron(0 8 ? * SUN *)"
 CPU_ASG = "eks-cpu-system-00ff"
 

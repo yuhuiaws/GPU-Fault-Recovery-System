@@ -481,8 +481,8 @@ def test_the_verb_is_read_only_and_dispatched_by_the_cli(
 # cron(0 8 ? * SUN *) and no DeploymentConfig -- observed on 2026-11-01 to
 # re-image all three control-plane nodes at once.
 
-CPU_NAME = "control-plane-GPU-fault-solution"
-CPU_GROUP = "control-plane-GPU-fault-solution-CPU-instance"
+CPU_NAME = "cpu-control-plane"
+CPU_GROUP = "cpu-control-plane-c5"
 CPU_HP_ARN = f"arn:aws:sagemaker:{REGION}:{ACCOUNT}:cluster/cpu0live01"
 CPU_EKS_ARN = f"arn:aws:eks:{REGION}:{ACCOUNT}:cluster/cpu-eks"
 CPU_SCHEDULE = "cron(0 8 ? * SUN *)"

@@ -812,8 +812,8 @@ def test_advisory_lines_skip_a_malformed_block_instead_of_failing() -> None:
 
 CPU_REGION = "us-west-2"
 CPU_ACCOUNT = "123456789012"
-CPU_NAME = "control-plane-GPU-fault-solution"
-CPU_GROUP = "control-plane-GPU-fault-solution-CPU-instance"
+CPU_NAME = "cpu-control-plane"
+CPU_GROUP = "cpu-control-plane-c5"
 CPU_HP_ARN = f"arn:aws:sagemaker:{CPU_REGION}:{CPU_ACCOUNT}:cluster/cpu0live01"
 CPU_EKS_ARN = f"arn:aws:eks:{CPU_REGION}:{CPU_ACCOUNT}:cluster/cpu-eks"
 CPU_SCHEDULE = "cron(0 8 ? * SUN *)"
@@ -1281,7 +1281,7 @@ def test_the_helper_verb_plans_the_cpu_group_it_is_pointed_at(capsys) -> None:
     assert "update-cluster" in document["update_cluster"]["command"]
     assert document["manual_update"][CPU_GROUP].startswith(
         "aws sagemaker update-cluster-software"
-    )
+    ), "the manual update names the CPU group"
 
 
 def test_the_helper_verb_without_the_group_selects_nothing_on_the_cpu_cluster(
