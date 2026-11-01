@@ -23,6 +23,17 @@ provider documents the product already reads, plus two small reads:
   ignores disruption budgets) and the disruption budgets, which drift and
   consolidation honour.
 
+The site's CPU control-plane cluster is covered too (``control_plane_updates``):
+every instance group of its HyperPod cluster -- the control-plane Pods carry
+no node selector, so any CPU node hosts them -- and, read where the
+``regional_contexts`` check runs, the Auto Scaling groups of the managed node
+groups its EKS cluster may also have. A schedule that re-images every
+control-plane instance in one window takes the whole control plane down for
+minutes (live 2026-11-01: the CPU group's ``cron(0 8 ? * SUN *)`` took all
+three nodes NotReady at once, the api-ha and control-worker Pods with them,
+and the Pods could not come back until Kueue's Pod webhook answered again);
+the advisory line says so in those words.
+
 Nothing here changes a check verdict, ``healthy``, a refusal or an exit code:
 the facts sit next to the ones they extend (the ``regional_contexts`` check of
 ``status --full`` and deploy preflight, ``node-scope``) and the advisory lines
@@ -43,12 +54,17 @@ from gpu_fault.cluster_scope import OWNERSHIP_LABEL
 
 __all__ = [
     "ASG_QUERY",
+    "CONTROL_PLANE",
     "FIELD",
     "HELPER_VERB",
+    "HYPERPOD_UPDATE_EVIDENCE",
     "KARPENTER_NODEPOOLS",
     "UNKNOWN",
     "advisory_lines",
     "announce",
+    "announce_control_plane",
+    "control_plane_lines",
+    "control_plane_updates",
     "eks_node_group_updates",
     "guarded",
     "hyperpod_group_updates",
@@ -61,10 +77,35 @@ __all__ = [
 
 #: The key the advisory block sits under, beside the facts it extends.
 FIELD = "automatic_node_updates"
+#: The ``regional_contexts`` facts key of the CPU control-plane cluster.
+CONTROL_PLANE = "control_plane"
 UNKNOWN = "unknown"
 #: The read-only verb that prints the command disabling a HyperPod schedule.
 HELPER_VERB = "hyperpod-scheduled-update"
 SECTION = "administrator-operations §5.0.5"
+#: What an update of the HyperPod platform software does to the nodes it
+#: updates -- a ``ScheduledUpdateConfig`` applies the same update on its cron:
+#: AWS, "Updating the SageMaker HyperPod platform software", the Important box.
+#: That a schedule without a ``DeploymentConfig`` updates every instance of the
+#: group at once is observed (2026-11-01), not documented.
+HYPERPOD_UPDATE_EVIDENCE: dict[str, Any] = {
+    "vendor": "AWS",
+    "url": (
+        "https://docs.aws.amazon.com/sagemaker/latest/dg/"
+        "sagemaker-hyperpod-eks-operate-cli-command-update-cluster-software.html"
+    ),
+    "page": "Updating the SageMaker HyperPod platform software",
+    "section": "Important",
+    "quotes": (
+        "When this API is called, SageMaker HyperPod doesn\u2019t drain or "
+        "redistribute the jobs (Pods) running on the nodes.",
+        "The patching process replaces the root volume with the updated AMI, which "
+        "means that your previous data stored in the instance root volume will be "
+        "lost.",
+        "All cluster nodes experience downtime (nodes appear as `<NotReady>` in the "
+        "output of `kubectl get node`) while the patching is in progress.",
+    ),
+}
 KARPENTER_NODEPOOLS = "nodepools.karpenter.sh"
 KARPENTER_DEFAULT_EXPIRE_AFTER = "720h"
 KARPENTER_NEVER = "Never"
@@ -304,6 +345,82 @@ def karpenter_updates(read: NodePoolReader, *, site_id: str) -> dict[str, Any]:
     return {"state": "read", "nodepools": nodepool_updates(document, site_id=site_id)}
 
 
+# --- the CPU control-plane cluster ---------------------------------------------------
+
+
+def rolling_batch(schedule: object) -> dict[str, Any] | None:
+    """``{"type", "value", "wait_seconds"}`` of a ``ScheduledUpdateConfig``'s
+    ``DeploymentConfig``: ``RollingUpdatePolicy.MaximumBatchSize`` and
+    ``WaitIntervalInSeconds`` (``None`` when unset). ``None`` without a batch --
+    the service was then observed to re-image every instance of the group at
+    once (2026-11-01: all three control-plane nodes NotReady together); no AWS
+    document states that default."""
+
+    deployment = _mapping(_mapping(schedule).get("DeploymentConfig"))
+    policy = _mapping(deployment.get("RollingUpdatePolicy"))
+    size = _mapping(policy.get("MaximumBatchSize"))
+    kind, value = size.get("Type"), size.get("Value")
+    if not isinstance(kind, str) or type(value) is not int:
+        return None
+    wait = deployment.get("WaitIntervalInSeconds")
+    return {
+        "type": kind,
+        "value": value,
+        "wait_seconds": wait if type(wait) is int else None,
+    }
+
+
+def control_plane_updates(
+    groups: Iterable[Any], *, hyperpod_cluster_name: str, cpu_eks_arn: str
+) -> dict[str, Any]:
+    """The advisory block of the site's CPU control-plane HyperPod cluster.
+
+    Every instance group, not a selection: the control-plane Pods carry no
+    node selector, so any CPU node hosts them. Per group the HyperPod facts
+    (``hyperpod_group_updates``) plus ``instances`` (``CurrentCount``, ``None``
+    when absent) and ``rolling_batch``. ``cpu_eks_arn`` is what the advisory
+    line hands to the helper verb, which accepts the EKS ARN of any HyperPod
+    cluster.
+    """
+
+    instance_groups = []
+    for group in groups:
+        if not isinstance(group, Mapping):
+            continue
+        count = group.get("CurrentCount")
+        instance_groups.append(
+            {
+                **hyperpod_group_updates(group),
+                "instances": count if type(count) is int else None,
+                "rolling_batch": rolling_batch(group.get("ScheduledUpdateConfig")),
+            }
+        )
+    return {
+        "hyperpod_cluster_name": hyperpod_cluster_name,
+        "cpu_eks_arn": cpu_eks_arn,
+        "instance_groups": instance_groups,
+    }
+
+
+def announce_control_plane(
+    hyperpod: Mapping[str, Any], *, prefix: str = "gpu-fault-admin"
+) -> None:
+    """Discovery's advisory for the CPU control-plane cluster, from the
+    ``describe-cluster`` document discovery already read; never raises."""
+
+    try:
+        eks = _mapping(_mapping(hyperpod.get("Orchestrator")).get("Eks"))
+        block = control_plane_updates(
+            hyperpod.get("InstanceGroups") or (),
+            hyperpod_cluster_name=str(hyperpod.get("ClusterName") or ""),
+            cpu_eks_arn=str(eks.get("ClusterArn") or ""),
+        )
+        for line in control_plane_lines(block):
+            print(f"{prefix}: {line}", file=sys.stderr, flush=True)
+    except Exception:  # noqa: BLE001 - an advisory never fails discovery
+        return
+
+
 # --- advisory lines -----------------------------------------------------------------
 
 
@@ -384,6 +501,124 @@ def advisory_lines(where: str, block: object) -> list[str]:
     if not isinstance(block, Mapping):
         return []
     return [*_hyperpod_lines(where, block), *_eks_lines(where, block)]
+
+
+def _all_at_once(group: Mapping[str, Any]) -> bool:
+    """Whether a scheduled update re-images every instance of ``group`` together."""
+
+    batch = _mapping(group.get("rolling_batch"))
+    value, instances = batch.get("value"), group.get("instances")
+    if not batch or type(value) is not int:
+        return True
+    if batch.get("type") == "CAPACITY_PERCENTAGE":
+        return value >= 100
+    return type(instances) is int and value >= instances
+
+
+def _control_plane_window(group: Mapping[str, Any], *, whole: bool) -> tuple[str, bool]:
+    """``(what one scheduled update window does to the control plane on
+    ``group``, whether that is the safe form)``.
+
+    The safe form is a rolling batch smaller than the group: the control plane
+    keeps serving, with a residual named. No batch, or one that covers every
+    instance, takes the control plane on the group down at once -- the whole of
+    it when the group holds every CPU node.
+    """
+
+    batch = _mapping(group.get("rolling_batch"))
+    count = group.get("instances")
+    instances = f"all {count} instances" if type(count) is int else "every instance"
+    percentage = batch.get("type") == "CAPACITY_PERCENTAGE"
+    if not _all_at_once(group):
+        size = (
+            f"{batch.get('value')}%"
+            if percentage
+            else f"{batch.get('value')} instance(s)"
+        )
+        wait = batch.get("wait_seconds")
+        return (
+            f"rolling {size} at a time"
+            + (f" {wait} s apart" if type(wait) is int else "")
+            + ": the safe form -- the control plane keeps serving from the other "
+            "nodes; residual: the control-plane Pods on each batch go down with "
+            "it, and the single-replica ADOT and Kueue (when present) are down "
+            "while their node is re-imaged, so a Pod created meanwhile waits for "
+            "Kueue's webhook",
+            True,
+        )
+    covered = (
+        "with no rolling DeploymentConfig: observed (2026-11-01) to re-image "
+        f"{instances} of the group at once"
+        if not batch
+        else f"with a rolling batch of {batch.get('value')}"
+        + ("%" if percentage else " instance(s)")
+        + f", which covers {instances} of the group: the service re-images them "
+        "at once"
+    )
+    return (
+        covered
+        + (
+            " -- every node the control plane runs on, so the whole control "
+            "plane (api-ha, control-worker) is down for minutes each time"
+            if whole
+            else ", so the control-plane Pods on them (api-ha, control-worker) "
+            "are down for minutes each time"
+        ),
+        False,
+    )
+
+
+def control_plane_lines(block: object) -> list[str]:
+    """The advisory lines of the CPU control-plane cluster's block
+    (``control_plane_updates``): a scheduled or auto-patched instance group --
+    with what one window does to the control plane -- and a managed node
+    group's Auto Scaling group with a set ``MaxInstanceLifetime``. ``unknown``
+    is recorded, never announced."""
+
+    if not isinstance(block, Mapping):
+        return []
+    name = block.get("hyperpod_cluster_name") or "<CPU HyperPod cluster>"
+    where = f"the CPU control-plane cluster {name}"
+    arn = str(block.get("cpu_eks_arn") or "<CPU EKS ARN>")
+    groups = _mappings(block.get("instance_groups"))
+    node_groups = _mappings(_mapping(block.get("eks_node_groups")).get("node_groups"))
+    # The group is every control-plane node when no other group or managed node
+    # group has instances to host the Pods.
+    hosts = [group for group in groups if group.get("instances") != 0]
+    lines = []
+    for group in groups:
+        group_name = group.get("name")
+        command = (
+            f"gpu-fault-admin {HELPER_VERB} --state-dir <state dir> --gpu-cluster-arn "
+            f"{arn} --instance-group {group_name}"
+        )
+        helper = f"{command} prints the update-cluster command that removes it"
+        if group.get("scheduled_update"):
+            window, safe = _control_plane_window(
+                group, whole=hosts == [group] and not node_groups
+            )
+            lines.append(
+                f"advisory: HyperPod instance group {group_name} of {where} has "
+                f"ScheduledUpdateConfig {group['scheduled_update']} {window}"
+                + (
+                    ""
+                    if safe
+                    else f"; {command} --rolling prints the update-cluster command "
+                    "that makes it roll one instance at a time (without --rolling, "
+                    "the one that removes it: then update the group by hand in a "
+                    "maintenance window, one instance at a time)"
+                )
+                + f" ({SECTION})"
+            )
+        if group.get("auto_patch"):
+            lines.append(
+                f"advisory: HyperPod instance group {group_name} of {where} has "
+                f"AutoPatchConfig (PatchingStrategy {group['auto_patch']}): the "
+                "service cordons and re-images its instances on the patch "
+                "schedule, and the control-plane Pods on them go down with them; "
+                f"{helper} ({SECTION})"
+            )
+    return [*lines, *_eks_lines(where, {"node_groups": node_groups})]
 
 
 def announce(where: str, block: object, *, prefix: str = "gpu-fault-admin") -> None:

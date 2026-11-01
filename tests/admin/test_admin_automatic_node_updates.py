@@ -8,6 +8,10 @@ Auto Scaling group has Capacity Rebalance on (EKS sets it) and, in some tests,
 a ``MaxInstanceLifetime``, next to Karpenter NodePools with the default 720h
 expiry. Every advisory is a recorded fact and a stderr/header line: discovery
 returns the same scope, ``node-scope`` the same convergence and exit code.
+
+The site's CPU control-plane cluster is covered the same way (the second half
+of this file): every instance group of its HyperPod cluster, with what one
+scheduled update window does to the control plane.
 """
 
 from __future__ import annotations
@@ -21,8 +25,10 @@ import pytest
 import yaml
 
 from gpu_fault.admin import automatic_node_updates as updates
+from gpu_fault.admin import bootstrap as admin_bootstrap
 from gpu_fault.admin import bootstrap_discovery, bootstrap_ownership
 from gpu_fault.admin import cli as admin_cli
+from gpu_fault.admin import hyperpod_scheduled_update as helper
 from gpu_fault.admin import node_scope_command as node_scope
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.bootstrap_ownership import RecordedNodeScope
@@ -793,3 +799,516 @@ def test_advisory_lines_skip_a_malformed_block_instead_of_failing() -> None:
 
     assert updates.advisory_lines("gpu-b", block) == [], "a status header never fails"
     assert updates.advisory_lines("gpu-b", {"state": "unknown", "error": "x"}) == []
+
+
+# --- the CPU control-plane cluster ---------------------------------------------------
+#
+# The live CPU HyperPod cluster, sanitised: its only instance group (3 x
+# ml.c5.4xlarge) carries ScheduledUpdateConfig cron(0 8 ? * SUN *) without a
+# DeploymentConfig; on 2026-11-01 that schedule re-imaged all three nodes at
+# once and took the whole control plane down for about five minutes. The
+# advisory covers every instance group of the cluster (the control-plane Pods
+# carry no node selector) and discovery still returns the same identity.
+
+CPU_REGION = "us-west-2"
+CPU_ACCOUNT = "123456789012"
+CPU_NAME = "control-plane-GPU-fault-solution"
+CPU_GROUP = "control-plane-GPU-fault-solution-CPU-instance"
+CPU_HP_ARN = f"arn:aws:sagemaker:{CPU_REGION}:{CPU_ACCOUNT}:cluster/cpu0live01"
+CPU_EKS_ARN = f"arn:aws:eks:{CPU_REGION}:{CPU_ACCOUNT}:cluster/cpu-eks"
+CPU_SCHEDULE = "cron(0 8 ? * SUN *)"
+CPU_SECTION = "(administrator-operations §5.0.5)"
+CPU_COMMAND = (
+    "gpu-fault-admin hyperpod-scheduled-update --state-dir <state dir> "
+    f"--gpu-cluster-arn {CPU_EKS_ARN} --instance-group {{group}}"
+)
+CPU_HELPER = CPU_COMMAND + " prints the update-cluster command that removes it"
+CPU_ROLLING = (
+    CPU_COMMAND + " --rolling prints the update-cluster command that makes it roll "
+    "one instance at a time (without --rolling, the one that removes it: then "
+    "update the group by hand in a maintenance window, one instance at a time)"
+)
+CPU_WHERE = f"the CPU control-plane cluster {CPU_NAME}"
+
+
+def _cpu_group(
+    name: str = CPU_GROUP,
+    *,
+    count: int | None = 3,
+    schedule: str | None = CPU_SCHEDULE,
+    batch: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """One ``describe-cluster`` instance group shaped like the live CPU one."""
+
+    group: dict[str, Any] = {
+        "ActiveOperations": {},
+        "CurrentImageId": "default",
+        "CurrentImageReleaseVersion": "2.0.4",
+        "ExecutionRole": f"arn:aws:iam::{CPU_ACCOUNT}:role/hyperpod-cpu-execution",
+        "InstanceGroupName": name,
+        "InstanceType": "ml.c5.4xlarge",
+        "LifeCycleConfig": {"OnCreate": "on_create.sh", "SourceS3Uri": "s3://lc/"},
+        "Status": "InService",
+        "ThreadsPerCore": 1,
+    }
+    if count is not None:
+        group["CurrentCount"] = group["TargetCount"] = count
+    if schedule:
+        group["ScheduledUpdateConfig"] = {"ScheduleExpression": schedule}
+        if batch is not None:
+            group["ScheduledUpdateConfig"]["DeploymentConfig"] = {
+                "RollingUpdatePolicy": {"MaximumBatchSize": batch},
+                "WaitIntervalInSeconds": 300,
+            }
+    return group
+
+
+def _cpu_hyperpod(*groups: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ClusterArn": CPU_HP_ARN,
+        "ClusterName": CPU_NAME,
+        "ClusterStatus": "InService",
+        "NodeRecovery": "Automatic",
+        "InstanceGroups": list(groups) if groups else [_cpu_group()],
+        "Orchestrator": {"Eks": {"ClusterArn": CPU_EKS_ARN}},
+        "VpcConfig": {"SecurityGroupIds": ["sg-cpu"], "Subnets": ["subnet-cpu"]},
+    }
+
+
+def _cpu_block(*groups: dict[str, Any]) -> dict[str, Any]:
+    return updates.control_plane_updates(
+        _cpu_hyperpod(*groups)["InstanceGroups"],
+        hyperpod_cluster_name=CPU_NAME,
+        cpu_eks_arn=CPU_EKS_ARN,
+    )
+
+
+# --- the CPU control-plane cluster: the facts -----------------------------------------
+
+
+def test_the_block_records_every_cpu_group_with_its_count_and_rolling_batch() -> None:
+    quiet = _cpu_group("cpu-spare", count=0, schedule=None)
+    batched = _cpu_group(
+        "cpu-batched", count=2, batch={"Type": "INSTANCE_COUNT", "Value": 1}
+    )
+    patched = _cpu_group("cpu-patched", count=None, schedule=None)
+    patched["AutoPatchConfig"] = {"PatchingStrategy": "WhenIdle"}
+
+    block = _cpu_block(_cpu_group(), quiet, batched, patched, "not-a-group")  # type: ignore[arg-type]
+
+    assert block == {
+        "hyperpod_cluster_name": CPU_NAME,
+        "cpu_eks_arn": CPU_EKS_ARN,
+        "instance_groups": [
+            {
+                "name": CPU_GROUP,
+                "scheduled_update": CPU_SCHEDULE,
+                "auto_patch": None,
+                "instances": 3,
+                "rolling_batch": None,
+            },
+            {
+                "name": "cpu-spare",
+                "scheduled_update": None,
+                "auto_patch": None,
+                "instances": 0,
+                "rolling_batch": None,
+            },
+            {
+                "name": "cpu-batched",
+                "scheduled_update": CPU_SCHEDULE,
+                "auto_patch": None,
+                "instances": 2,
+                "rolling_batch": {
+                    "type": "INSTANCE_COUNT",
+                    "value": 1,
+                    "wait_seconds": 300,
+                },
+            },
+            {
+                "name": "cpu-patched",
+                "scheduled_update": None,
+                "auto_patch": "WhenIdle",
+                "instances": None,
+                "rolling_batch": None,
+            },
+        ],
+    }, "every group, no selector: any CPU node hosts control-plane Pods"
+
+
+@pytest.mark.parametrize(
+    "schedule,expected",
+    [
+        (None, None),
+        ("not-a-mapping", None),
+        ({"ScheduleExpression": CPU_SCHEDULE}, None),
+        ({"DeploymentConfig": {"WaitIntervalInSeconds": 60}}, None),
+        (
+            {
+                "DeploymentConfig": {
+                    "RollingUpdatePolicy": {
+                        "MaximumBatchSize": {"Type": "CAPACITY_PERCENTAGE", "Value": 50}
+                    }
+                }
+            },
+            {"type": "CAPACITY_PERCENTAGE", "value": 50, "wait_seconds": None},
+        ),
+        (
+            {
+                "DeploymentConfig": {
+                    "RollingUpdatePolicy": {"MaximumBatchSize": {"Type": "x"}}
+                }
+            },
+            None,
+        ),
+    ],
+)
+def test_the_rolling_batch_is_read_or_none(schedule: object, expected: object) -> None:
+    assert updates.rolling_batch(schedule) == expected
+
+
+# --- the CPU control-plane cluster: the advisory lines --------------------------------
+
+
+def test_the_live_schedule_says_the_whole_control_plane_goes_down() -> None:
+    assert updates.control_plane_lines(_cpu_block()) == [
+        f"advisory: HyperPod instance group {CPU_GROUP} of {CPU_WHERE} has "
+        f"ScheduledUpdateConfig {CPU_SCHEDULE} with no rolling DeploymentConfig: "
+        "observed (2026-11-01) to re-image all 3 instances of the group at once -- "
+        "every node the control plane runs on, so the whole control plane "
+        "(api-ha, control-worker) is down for minutes each time; "
+        + CPU_ROLLING.format(group=CPU_GROUP)
+        + f" {CPU_SECTION}"
+    ], "observed, not documented: no AWS sentence states the default"
+
+
+def test_a_group_beside_other_cpu_nodes_names_the_pods_on_it_only() -> None:
+    lines = updates.control_plane_lines(
+        _cpu_block(_cpu_group(), _cpu_group("cpu-b", count=2, schedule=None))
+    )
+
+    (line,) = lines
+    assert (
+        "observed (2026-11-01) to re-image all 3 instances of the group at once, "
+        "so the control-plane Pods on them (api-ha, control-worker) are down for "
+        "minutes each time"
+    ) in line, "another group holds CPU nodes too: not the whole control plane"
+    assert "whole control plane" not in line
+
+
+SAFE_RESIDUAL = (
+    ": the safe form -- the control plane keeps serving from the other nodes; "
+    "residual: the control-plane Pods on each batch go down with it, and the "
+    "single-replica ADOT and Kueue (when present) are down while their node is "
+    "re-imaged, so a Pod created meanwhile waits for Kueue's webhook " + CPU_SECTION
+)
+WHOLE = (
+    " -- every node the control plane runs on, so the whole control plane (api-ha, "
+    "control-worker) is down for minutes each time; "
+)
+
+
+@pytest.mark.parametrize(
+    "batch,instances,expected",
+    [
+        (
+            {"Type": "INSTANCE_COUNT", "Value": 1},
+            3,
+            "rolling 1 instance(s) at a time 300 s apart" + SAFE_RESIDUAL,
+        ),
+        (
+            {"Type": "CAPACITY_PERCENTAGE", "Value": 34},
+            3,
+            "rolling 34% at a time 300 s apart" + SAFE_RESIDUAL,
+        ),
+        (
+            {"Type": "INSTANCE_COUNT", "Value": 3},
+            3,
+            "with a rolling batch of 3 instance(s), which covers all 3 instances of "
+            "the group: the service re-images them at once" + WHOLE,
+        ),
+        (
+            {"Type": "CAPACITY_PERCENTAGE", "Value": 100},
+            3,
+            "with a rolling batch of 100%, which covers all 3 instances of the "
+            "group: the service re-images them at once" + WHOLE,
+        ),
+        (
+            {"Type": "INSTANCE_COUNT", "Value": 1},
+            None,
+            "rolling 1 instance(s) at a time 300 s apart" + SAFE_RESIDUAL,
+        ),
+    ],
+    ids=["one-at-a-time", "percentage", "count-covers-all", "all-percent", "no-count"],
+)
+def test_a_rolling_batch_is_graded_by_what_one_window_does(
+    batch: dict[str, Any], instances: int | None, expected: str
+) -> None:
+    (line,) = updates.control_plane_lines(
+        _cpu_block(_cpu_group(count=instances, batch=batch))
+    )
+
+    assert f"has ScheduledUpdateConfig {CPU_SCHEDULE} {expected}" in line, line
+    assert ("--rolling prints" in line) is (" -- every node" in expected), (
+        "the remedy is offered for the unsafe forms only"
+    )
+
+
+def test_an_unknown_count_and_auto_patching_are_announced_too() -> None:
+    patched = _cpu_group(count=None)
+    patched["AutoPatchConfig"] = {"PatchingStrategy": "WhenIdle"}
+
+    scheduled, auto_patch = updates.control_plane_lines(_cpu_block(patched))
+
+    assert "observed (2026-11-01) to re-image every instance of the group" in scheduled
+    assert auto_patch == (
+        f"advisory: HyperPod instance group {CPU_GROUP} of {CPU_WHERE} has "
+        "AutoPatchConfig (PatchingStrategy WhenIdle): the service cordons and "
+        "re-images its instances on the patch schedule, and the control-plane "
+        f"Pods on them go down with them; {CPU_HELPER.format(group=CPU_GROUP)} {CPU_SECTION}"
+    )
+
+
+def test_a_cpu_managed_node_group_lifetime_is_announced_and_unknown_is_not() -> None:
+    block = _cpu_block()
+    block["eks_node_groups"] = {
+        "state": "read",
+        "node_groups": [
+            {
+                "name": "cpu-system",
+                "auto_scaling_groups": [
+                    {
+                        "name": "eks-cpu-system-00ff",
+                        "max_instance_lifetime": 604800,
+                        "capacity_rebalance": False,
+                    },
+                    {
+                        "name": "eks-cpu-system-11ee",
+                        "max_instance_lifetime": "unknown",
+                        "capacity_rebalance": "unknown",
+                    },
+                ],
+            }
+        ],
+    }
+
+    lines = updates.control_plane_lines(block)
+
+    assert len(lines) == 2
+    assert "whole control plane" not in lines[0], (
+        "a managed node group can host control-plane Pods too"
+    )
+    assert lines[1] == (
+        "advisory: Auto Scaling group eks-cpu-system-00ff of EKS node group "
+        f"cpu-system ({CPU_WHERE}) sets MaxInstanceLifetime 604800 s: EC2 Auto Scaling "
+        "replaces every instance at that age; clear it with aws autoscaling "
+        "update-auto-scaling-group --auto-scaling-group-name eks-cpu-system-00ff "
+        f"--max-instance-lifetime 0 {CPU_SECTION}"
+    )
+    unknown = {"state": "unknown", "error": "AccessDenied"}
+    assert updates.control_plane_lines({**block, "eks_node_groups": unknown})[1:] == []
+
+
+def test_a_quiet_or_malformed_block_announces_nothing() -> None:
+    assert updates.control_plane_lines(_cpu_block(_cpu_group(schedule=None))) == []
+    assert updates.control_plane_lines(None) == []
+    assert updates.control_plane_lines({"state": "unknown", "error": "x"}) == []
+    assert (
+        updates.control_plane_lines(
+            {"instance_groups": ["x", None], "eks_node_groups": {"node_groups": 7}}
+        )
+        == []
+    ), "a status header never fails"
+
+
+# --- the CPU control-plane cluster: discovery -----------------------------------------
+
+
+class CpuRegion:
+    """The reads ``discover_cluster`` makes for the CPU cluster; any write fails."""
+
+    def __init__(self, hyperpod: dict[str, Any]) -> None:
+        self.hyperpod = hyperpod
+        self.calls: list[tuple[str, str]] = []
+
+    def aws_json(self, region, service, operation, *arguments, **options):
+        self.calls.append((service, operation))
+        assert region == CPU_REGION and not options.get("mutate"), "a read-only read"
+        if (service, operation) == ("sagemaker", "list-clusters"):
+            return {"ClusterSummaries": [{"ClusterName": CPU_NAME}]}
+        if (service, operation) == ("sagemaker", "describe-cluster"):
+            assert arguments[arguments.index("--cluster-name") + 1] in {
+                CPU_NAME,
+                CPU_HP_ARN,
+            }
+            return copy.deepcopy(self.hyperpod)
+        if (service, operation) == ("eks", "describe-cluster"):
+            return {
+                "cluster": {
+                    "status": "ACTIVE",
+                    "resourcesVpcConfig": {
+                        "vpcId": "vpc-cpu",
+                        "subnetIds": ["subnet-cpu"],
+                    },
+                }
+            }
+        raise AssertionError(f"unexpected call {service} {operation}")
+
+
+@pytest.fixture
+def cpu_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        admin_bootstrap, "discover_subnet_cidrs", lambda *_a, **_k: ("10.1.0.0/16",)
+    )
+    admin_bootstrap.hyperpod_inventory.cache_clear()
+
+
+@pytest.mark.parametrize("arn", [CPU_EKS_ARN, CPU_HP_ARN], ids=["eks-arn", "hp-arn"])
+def test_cpu_discovery_announces_the_schedule_and_keeps_its_identity(
+    arn: str, capsys, cpu_discovery: None
+) -> None:
+    region = CpuRegion(_cpu_hyperpod())
+
+    identity = admin_bootstrap.discover_cluster(
+        region,  # type: ignore[arg-type]
+        cluster_arn=arn,
+        role="cpu",
+        context="gpu-fault-cpu-0",
+    )
+
+    assert (identity.role, identity.hyperpod_name, identity.eks_arn) == (
+        "cpu",
+        CPU_NAME,
+        CPU_EKS_ARN,
+    )
+    assert identity.node_recovery == "Automatic", "the CPU cluster is not gated"
+    assert {service for service, _operation in region.calls} == {"sagemaker", "eks"}
+    assert ("autoscaling", "describe-auto-scaling-groups") not in region.calls, (
+        "discovery reads nothing new: the describe it made carries the groups"
+    )
+    assert capsys.readouterr().err.splitlines() == [
+        f"gpu-fault-admin: {line}" for line in updates.control_plane_lines(_cpu_block())
+    ]
+
+
+def test_cpu_discovery_without_a_schedule_is_silent(
+    capsys, cpu_discovery: None
+) -> None:
+    region = CpuRegion(_cpu_hyperpod(_cpu_group(schedule=None)))
+
+    admin_bootstrap.discover_cluster(
+        region,  # type: ignore[arg-type]
+        cluster_arn=CPU_EKS_ARN,
+        role="cpu",
+        context="gpu-fault-cpu-0",
+    )
+
+    assert "advisory" not in capsys.readouterr().err
+
+
+def test_a_broken_cpu_advisory_never_fails_discovery(
+    capsys, monkeypatch: pytest.MonkeyPatch, cpu_discovery: None
+) -> None:
+    def broken(_block: object) -> list[str]:
+        raise RuntimeError("advisory defect")
+
+    monkeypatch.setattr(updates, "control_plane_lines", broken)
+    region = CpuRegion(_cpu_hyperpod())
+
+    identity = admin_bootstrap.discover_cluster(
+        region,  # type: ignore[arg-type]
+        cluster_arn=CPU_EKS_ARN,
+        role="cpu",
+        context="gpu-fault-cpu-0",
+    )
+
+    assert identity.hyperpod_name == CPU_NAME
+    assert capsys.readouterr().err == ""
+    updates.announce_control_plane({"Orchestrator": "bad", "InstanceGroups": 7})
+    assert capsys.readouterr().err == "", "a malformed document announces nothing"
+
+
+def test_gpu_discovery_never_announces_the_control_plane_block(
+    capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    announced: list[object] = []
+    monkeypatch.setattr(
+        admin_bootstrap, "announce_control_plane", lambda doc: announced.append(doc)
+    )
+    gpu = _cpu_hyperpod()
+    gpu["NodeRecovery"] = "None"
+    monkeypatch.setattr(
+        admin_bootstrap, "discover_subnet_cidrs", lambda *_a, **_k: ("10.2.0.0/16",)
+    )
+    admin_bootstrap.hyperpod_inventory.cache_clear()
+
+    admin_bootstrap.discover_cluster(
+        CpuRegion(gpu),  # type: ignore[arg-type]
+        cluster_arn=CPU_HP_ARN,
+        role="gpu",
+        context="gpu-fault-gpu-1",
+        resolve_node_scope=False,
+    )
+
+    assert announced == [], "the control-plane advisory is the CPU role's only"
+
+
+# --- the CPU control-plane cluster: the helper verb the line points to ----------------
+
+
+def test_the_helper_verb_plans_the_cpu_group_it_is_pointed_at(capsys) -> None:
+    region = CpuRegion(_cpu_hyperpod())
+    arguments = admin_cli.parser().parse_args(
+        [
+            "hyperpod-scheduled-update",
+            "--gpu-cluster-arn",
+            CPU_EKS_ARN,
+            "--instance-group",
+            CPU_GROUP,
+        ]
+    )
+    admin_bootstrap.hyperpod_inventory.cache_clear()
+
+    code = helper.run_command(arguments, runner=region)  # type: ignore[arg-type]
+
+    captured = capsys.readouterr()
+    document = json.loads(captured.out)
+    assert code == 0, captured.err
+    assert document["cluster"]["hyperpod_name"] == CPU_NAME
+    (record,) = document["instance_groups"]
+    assert (record["name"], record["outcome"]) == (CPU_GROUP, "disable"), record
+    assert record["removes"] == ["ScheduledUpdateConfig"]
+    assert "update-cluster" in document["update_cluster"]["command"]
+    assert document["manual_update"][CPU_GROUP].startswith(
+        "aws sagemaker update-cluster-software"
+    )
+
+
+def test_the_helper_verb_without_the_group_selects_nothing_on_the_cpu_cluster(
+    capsys,
+) -> None:
+    region = CpuRegion(_cpu_hyperpod())
+    arguments = admin_cli.parser().parse_args(
+        ["hyperpod-scheduled-update", "--gpu-cluster-arn", CPU_EKS_ARN]
+    )
+    admin_bootstrap.hyperpod_inventory.cache_clear()
+
+    code = helper.run_command(arguments, runner=region)  # type: ignore[arg-type]
+
+    captured = capsys.readouterr()
+    assert code == 0
+    assert json.loads(captured.out)["instance_groups"] == [], (
+        "the CPU group carries no ownership label: the advisory names it with "
+        "--instance-group"
+    )
+    assert "name one with --instance-group" in captured.err
+
+
+def test_a_cpu_describe_without_an_orchestrator_is_refused_by_the_verb() -> None:
+    region = CpuRegion({**_cpu_hyperpod(), "Orchestrator": {}})
+    arguments = admin_cli.parser().parse_args(
+        ["hyperpod-scheduled-update", "--gpu-cluster-arn", CPU_HP_ARN]
+    )
+
+    with pytest.raises(BootstrapError, match="does not expose an EKS orchestrator"):
+        helper.run_command(arguments, runner=region)  # type: ignore[arg-type]

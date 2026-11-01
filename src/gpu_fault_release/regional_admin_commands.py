@@ -6,7 +6,11 @@ import os
 from typing import Any
 
 from gpu_fault.admin.automatic_node_updates import FIELD as AUTOMATIC_NODE_UPDATES
-from gpu_fault.admin.automatic_node_updates import advisory_lines
+from gpu_fault.admin.automatic_node_updates import (
+    CONTROL_PLANE,
+    advisory_lines,
+    control_plane_lines,
+)
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import repository_root
 from gpu_fault_release.regional_admin_checks import (
@@ -1202,7 +1206,9 @@ def _control_api_findings(health: object) -> list[str]:
 def automatic_update_lines(health: object) -> list[str]:
     """The advisory lines of the ``regional_contexts`` check's
     ``automatic_node_updates`` blocks (``status --full``, which runs the check):
-    a scheduled or auto-patched HyperPod instance group, a set
+    first the CPU control-plane cluster's (a scheduled or auto-patched instance
+    group, with what one window does to the control plane), then per GPU
+    cluster a scheduled or auto-patched HyperPod instance group, a set
     ``MaxInstanceLifetime``, a site NodePool that expires or has no zero
     budget. Lines only -- the check's status and ``healthy`` are untouched."""
 
@@ -1212,15 +1218,23 @@ def automatic_update_lines(health: object) -> list[str]:
         if check.get("name") != "regional_contexts" or not isinstance(details, dict):
             continue
         providers = details.get("providers")
+        control_plane = details.get(CONTROL_PLANE)
         return [
-            line
-            for cluster_id, entry in sorted(
-                (providers if isinstance(providers, dict) else {}).items()
-            )
-            if isinstance(entry, dict)
-            for line in advisory_lines(
-                str(cluster_id), entry.get(AUTOMATIC_NODE_UPDATES)
-            )
+            *control_plane_lines(
+                control_plane.get(AUTOMATIC_NODE_UPDATES)
+                if isinstance(control_plane, dict)
+                else None
+            ),
+            *(
+                line
+                for cluster_id, entry in sorted(
+                    (providers if isinstance(providers, dict) else {}).items()
+                )
+                if isinstance(entry, dict)
+                for line in advisory_lines(
+                    str(cluster_id), entry.get(AUTOMATIC_NODE_UPDATES)
+                )
+            ),
         ]
     return []
 

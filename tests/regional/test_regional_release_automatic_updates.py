@@ -106,7 +106,9 @@ def _live_instance_groups() -> list[dict[str, Any]]:
     ]
 
 
-def _describe_cluster(name: str) -> dict[str, Any]:
+def _describe_cluster(
+    name: str, cpu_groups: list[dict[str, Any]] | None = None
+) -> dict[str, Any]:
     """The full ``describe-cluster`` answer; the runner applies the query."""
 
     return {
@@ -116,7 +118,9 @@ def _describe_cluster(name: str) -> dict[str, Any]:
         "Orchestrator": {
             "Eks": {"ClusterArn": HP_EKS_ARN if name == "hp-gpu" else CPU_EKS_ARN}
         },
-        "InstanceGroups": _live_instance_groups() if name == "hp-gpu" else [],
+        "InstanceGroups": (
+            _live_instance_groups() if name == "hp-gpu" else list(cpu_groups or [])
+        ),
         "VpcConfig": {"Subnets": ["subnet-a"]},
     }
 
@@ -132,11 +136,17 @@ class ContextsRunner:
         deny_asg: bool = False,
         nodepools: list[dict[str, Any]] | None = None,
         nodepool_error: str | None = None,
+        cpu_groups: list[dict[str, Any]] | None = None,
+        cpu_nodegroups: tuple[str, ...] = (),
     ) -> None:
         self.asgs = asgs if asgs is not None else []
         self.deny_asg = deny_asg
         self.nodepools = nodepools
         self.nodepool_error = nodepool_error
+        # The CPU HyperPod cluster's groups and the CPU EKS cluster's managed
+        # node groups (none by default, as live).
+        self.cpu_groups = cpu_groups
+        self.cpu_nodegroups = cpu_nodegroups
         self.calls: list[list[str]] = []
 
     @staticmethod
@@ -174,11 +184,31 @@ class ContextsRunner:
                 )
         if args[:3] == ["aws", "sagemaker", "describe-cluster"]:
             name = args[args.index("--cluster-name") + 1]
-            return self._answer(args, _describe_cluster(name))
+            return self._answer(args, _describe_cluster(name, self.cpu_groups))
         if args[:3] == ["aws", "eks", "describe-cluster"]:
             return self._answer(args, {"cluster": {"arn": EKS_ARN, "status": "ACTIVE"}})
+        cpu = (
+            "--cluster-name" in args and args[args.index("--cluster-name") + 1] == "cpu"
+        )
         if args[:3] == ["aws", "eks", "list-nodegroups"]:
+            if cpu:
+                return json.dumps({"nodegroups": list(self.cpu_nodegroups)})
             return json.dumps({"nodegroups": ["cpu-ng", "gpu-ng"]})
+        if args[:3] == ["aws", "eks", "describe-nodegroup"] and cpu:
+            name = args[args.index("--nodegroup-name") + 1]
+            return self._answer(
+                args,
+                {
+                    "nodegroup": {
+                        "nodegroupName": name,
+                        "status": "ACTIVE",
+                        "instanceTypes": ["m7i.xlarge"],
+                        "resources": {
+                            "autoScalingGroups": [{"name": f"eks-{name}-00ff"}]
+                        },
+                    }
+                },
+            )
         if args[:3] == ["aws", "eks", "describe-nodegroup"]:
             name = args[args.index("--nodegroup-name") + 1]
             gpu = name == "gpu-ng"
@@ -279,7 +309,9 @@ def _nodepool(name: str, *, expire: str, budgets: list[dict[str, Any]] | None) -
 def _contexts(runner: ContextsRunner) -> dict[str, Any]:
     release = ContextsRelease(runner, (HYPERPOD, EKS))
     facts = preflight.ensure_region_contexts(release)  # type: ignore[arg-type]
-    assert release.iam == ["gpu-hp", "gpu-eks"], "every gate still ran"
+    # The clusters validate in parallel (and beside the control plane's
+    # advisory reads): the gates' order is not the configuration's.
+    assert sorted(release.iam) == ["gpu-eks", "gpu-hp"], "every gate still ran"
     return facts
 
 
@@ -297,6 +329,7 @@ def test_the_widened_hyperpod_query_still_binds_and_carries_the_group_fields() -
         {
             "InstanceGroupName",
             "InstanceType",
+            "CurrentCount",
             "KubernetesConfig",
             "ScheduledUpdateConfig",
             "AutoPatchConfig",

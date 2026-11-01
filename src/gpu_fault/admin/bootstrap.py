@@ -20,6 +20,7 @@ from gpu_fault.admin.aurora_capacity import (
     AuroraClusterSpec,
     create_db_cluster_arguments,
 )
+from gpu_fault.admin.automatic_node_updates import announce_control_plane
 from gpu_fault.admin.bootstrap_access import (
     ClusterAccessPlan,
     create_cluster_access_plan,
@@ -41,9 +42,7 @@ from gpu_fault.admin.bootstrap_aurora import (
     reconcile_writer_zone,
     writer_first_zones,
 )
-from gpu_fault.admin.bootstrap_checkpoint import (
-    HYPERPOD_HINTS as HYPERPOD_HINTS,
-)
+from gpu_fault.admin.bootstrap_checkpoint import HYPERPOD_HINTS as HYPERPOD_HINTS
 from gpu_fault.admin.bootstrap_checkpoint import (
     bind_bootstrap_inputs,
     load_hyperpod_hints,
@@ -203,13 +202,12 @@ def discover_cluster(
 ) -> ClusterIdentity:
     """The identity behind a cluster ARN.
 
-    A HyperPod ARN, or an EKS ARN orchestrated by exactly one HyperPod cluster,
-    is a ``hyperpod`` identity as before; an EKS ARN no HyperPod cluster
-    orchestrates is plain EKS (``eks-managed``, see ``bootstrap_discovery``).
-    A GPU cluster's node scope comes from the ownership label
-    (``bootstrap_ownership``) unless one of ``existing_clusters`` (site
-    entries, either spelling) records it already; ``resolve_node_scope=False``
-    is for identity-only callers (remove-cluster, rotate-token).
+    A HyperPod ARN, or an EKS ARN one HyperPod cluster orchestrates, is a ``hyperpod``
+    identity; an EKS ARN none orchestrates is plain EKS (``eks-managed``). A GPU
+    cluster's node scope comes from the ownership label unless an ``existing_clusters``
+    entry records it; ``resolve_node_scope=False`` is for identity-only callers
+    (remove-cluster, rotate-token). The CPU cluster's own automatic updates are
+    announced from its describe (``automatic_node_updates``; advisory, never raised).
     """
 
     arn = Arn.parse(cluster_arn)
@@ -287,6 +285,8 @@ def discover_cluster(
                 existing_clusters, eks_arn=eks_arn, hyperpod_name=hyperpod_name
             ),
         )
+    elif role == "cpu":
+        announce_control_plane(hyperpod)
     return ClusterIdentity(
         input_arn=cluster_arn,
         role=role,

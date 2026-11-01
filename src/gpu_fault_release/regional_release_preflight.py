@@ -11,8 +11,10 @@ if TYPE_CHECKING:
 
 from gpu_fault.admin.automatic_node_updates import (
     ASG_QUERY,
+    CONTROL_PLANE,
     FIELD as AUTOMATIC_NODE_UPDATES,
     KARPENTER_NODEPOOLS,
+    control_plane_updates,
     eks_node_group_updates,
     guarded,
     hyperpod_updates,
@@ -370,12 +372,14 @@ def _validate_hyperpod_cluster(
 
 
 #: The context describe of a HyperPod cluster: its binding, and per instance
-#: group what the automatic-update advisory needs (one read serves both).
+#: group what the automatic-update advisory needs (one read serves both; the
+#: CPU cluster's advisory also counts the instances one window re-images).
 HYPERPOD_CONTEXT_QUERY = (
     "{EksClusterArn:Orchestrator.Eks.ClusterArn,NodeRecovery:NodeRecovery,"
     "InstanceGroups:InstanceGroups[].{InstanceGroupName:InstanceGroupName,"
-    "InstanceType:InstanceType,KubernetesConfig:KubernetesConfig,"
-    "ScheduledUpdateConfig:ScheduledUpdateConfig,AutoPatchConfig:AutoPatchConfig}}"
+    "InstanceType:InstanceType,CurrentCount:CurrentCount,"
+    "KubernetesConfig:KubernetesConfig,ScheduledUpdateConfig:ScheduledUpdateConfig,"
+    "AutoPatchConfig:AutoPatchConfig}}"
 )
 
 
@@ -449,6 +453,70 @@ def eks_automatic_updates(
     }
 
 
+def control_plane_automatic_updates(
+    release: RegionalRelease, groups: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """The advisory block of the CPU control-plane cluster (``automatic_node_updates``).
+
+    Every instance group of its HyperPod cluster, from the context describe
+    already made, and ``eks_node_groups``: the managed node groups its EKS
+    cluster may also have -- any CPU node hosts control-plane Pods -- with
+    their Auto Scaling groups, read the way the GPU path reads them (one
+    ``list-nodegroups``, a describe per group, one Auto Scaling read). Those
+    reads are advisory: a failure records ``state: unknown``.
+    """
+
+    config = release.config
+    block = control_plane_updates(
+        groups,
+        hyperpod_cluster_name=config.cpu_hyperpod_cluster_name,
+        cpu_eks_arn=config.cpu_eks_arn,
+    )
+    eks_name = config.cpu_eks_arn.rsplit("/", 1)[-1]
+
+    def node_groups() -> dict[str, Any]:
+        names = aws_json(
+            release, ["eks", "list-nodegroups", "--cluster-name", eks_name]
+        ).get("nodegroups")
+        described = {
+            str(name): aws_json(
+                release,
+                [
+                    "eks",
+                    "describe-nodegroup",
+                    "--cluster-name",
+                    eks_name,
+                    "--nodegroup-name",
+                    str(name),
+                    "--query",
+                    "nodegroup",
+                ],
+            )
+            for name in sorted(str(item) for item in names or () if item)
+        }
+        return {
+            "state": "read",
+            "node_groups": eks_node_group_updates(
+                described,
+                selected=described,
+                read_asgs=lambda asgs: aws_json(
+                    release,
+                    [
+                        "autoscaling",
+                        "describe-auto-scaling-groups",
+                        "--auto-scaling-group-names",
+                        *asgs,
+                        "--query",
+                        ASG_QUERY,
+                    ],
+                ),
+            ),
+        }
+
+    block["eks_node_groups"] = guarded(node_groups)
+    return block
+
+
 def _validate_agent_endpoint_cidrs(
     runner: Runner,
     kubectl: list[str],
@@ -499,7 +567,8 @@ def _validate_agent_endpoint_cidrs(
 def ensure_region_contexts(release: RegionalRelease) -> dict[str, Any]:
     """Validate every context; return what the ``regional_contexts`` check records
     (the cluster ids and, per eks-managed cluster, its node groups' facts; per
-    GPU cluster the ``automatic_node_updates`` advisory block)."""
+    GPU cluster and for the CPU control-plane cluster, ``control_plane``, the
+    ``automatic_node_updates`` advisory block)."""
 
     config = release.config
     runner = release.runner
@@ -511,7 +580,7 @@ def ensure_region_contexts(release: RegionalRelease) -> dict[str, Any]:
         raise ReleaseError(
             "CPU kubeconfig EKS ARN does not match configured cpu_eks_arn"
         )
-    _validate_hyperpod_cluster(
+    cpu_groups = _validate_hyperpod_cluster(
         runner,
         region=config.aws_region,
         cluster_name=config.cpu_hyperpod_cluster_name,
@@ -519,6 +588,16 @@ def ensure_region_contexts(release: RegionalRelease) -> dict[str, Any]:
         require_node_recovery_none=False,
     )
     runner.run(cpu_command("get", "--raw=/readyz"), capture=True)
+    control_plane: dict[str, Any] = {
+        "provider": "hyperpod",
+        "hyperpod_cluster_name": config.cpu_hyperpod_cluster_name,
+    }
+
+    def control_plane_advisory() -> None:
+        # Advisory only, after the CPU gates above; never a failure of the check.
+        control_plane[AUTOMATIC_NODE_UPDATES] = guarded(
+            lambda: control_plane_automatic_updates(release, cpu_groups)
+        )
 
     def validate_cluster(target: ClusterTarget) -> None:
         gpu_eks_arn = _context_eks_arn(
@@ -574,19 +653,25 @@ def ensure_region_contexts(release: RegionalRelease) -> dict[str, Any]:
             )
         )
 
-    facts = {"clusters": [item.cluster_id for item in config.clusters]}
+    facts = {
+        "clusters": [item.cluster_id for item in config.clusters],
+        CONTROL_PLANE: control_plane,
+    }
     if not config.clusters:
+        control_plane_advisory()
         return facts
     # The CPU checks above gate everything, so they stay ahead of this; the
     # clusters themselves are independent, and each one is a handful of reads
     # against a different API server plus a whole IAM role expansion. Every
     # future is resolved in configuration order, so a fleet where two clusters
     # are both wrong reports the same one every time instead of whichever
-    # thread lost the race.
-    with ThreadPoolExecutor(max_workers=min(8, len(config.clusters))) as executor:
+    # thread lost the race. The control plane's advisory reads run beside them.
+    with ThreadPoolExecutor(max_workers=min(8, len(config.clusters) + 1)) as executor:
+        advisory = executor.submit(control_plane_advisory)
         futures = [
             executor.submit(validate_cluster, target) for target in config.clusters
         ]
     for future in futures:
         future.result()
+    advisory.result()
     return {**facts, "providers": providers}
