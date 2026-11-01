@@ -514,6 +514,25 @@ def test_the_startup_retry_line_is_recognised_but_informational() -> None:
     assert relevant == [lines[1]], relevant
 
 
+def test_a_retry_line_of_any_start_up_store_step_counts() -> None:
+    """The schema check is the step a failover meets first; its wait line has
+    no registry wording and still counts, and a spent budget is evidence."""
+
+    schema = (
+        "WARNING gpu_fault.app.startup_store_wait start-up store wait: control-plane "
+        "store connection and schema check attempt 1 failed (writer unavailable, "
+        "PoolTimeout: couldn't get a connection after 10.00 sec); retrying in 0.5s "
+        "with 107s of the 120s GPU_FAULT_STARTUP_STORE_RETRY_SECONDS budget left"
+    )
+    gave_up = (
+        "gpu_fault.app.startup_store_wait.StartupStoreUnavailable: start-up gave up "
+        "waiting for the store after 128s: control-plane context failed 9 time(s)"
+    )
+    assert verdicts.startup_retry_observed([schema]) is True, "schema-check wait"
+    relevant = verdicts.relevant_log_lines("\n".join(["INFO ready", schema, gave_up]))
+    assert relevant == [schema, gave_up], relevant
+
+
 def test_the_plan_promises_the_writer_restore() -> None:
     details = ha010.plan_details(
         argparse.Namespace(rds_cluster_id="c", observe_seconds=420),  # type: ignore[arg-type]

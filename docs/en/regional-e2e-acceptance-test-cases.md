@@ -7401,9 +7401,11 @@ execution lease; otherwise orphan cleanup could cancel the commands used for the
   ```
 
 - Purpose: ARCH-H1 changed the kubelet liveness probe from the Aurora-dependent `/healthz` to the process-local
-  `/livez` (`app/routes/admin.py`), `GPU_FAULT_REGISTRY_STALE_SECONDS` 10→90 s, and the
-  `bootstrap` in `regional_registry_runtime.py` now applies exponential backoff capped at 0.5→10 s on store
-  exceptions; ARCH-H3 made the `regional_registry` payload of `/healthz` expose `secret_drift`. The significance of these changes
+  `/livez` (`app/routes/admin.py`), `GPU_FAULT_REGISTRY_STALE_SECONDS` 10→90 s, and the whole start-up Store path
+  (`app/startup_store_wait.py`: pool and schema check, registry sync and registered-cluster reads, registry bootstrap) shares
+  one `GPU_FAULT_STARTUP_STORE_RETRY_SECONDS` budget with exponential backoff capped at 0.5→10 s on transient failures only,
+  while the launcher does not `listen()` on the service port before the application is up, so the TCP startupProbe holds
+  liveness and readiness off for the whole wait; ARCH-H3 made the `regional_registry` payload of `/healthz` expose `secret_drift`. The significance of these changes
   can only be seen in a real writer failover: the Pod should go NotReady and **not be killed by the
   kubelet and restarted into a start-up that equally needs Aurora**. `HA-003` also performs a failover, but its
   subject is an in-flight destructive step; it does not look at Pod restarts or probe semantics, and it needs a maintenance window and a GPU node.
@@ -7444,7 +7446,8 @@ execution lease; otherwise orphan cleanup could cancel the commands used for the
   - the UIDs of all pre-existing Pods of the three Deployments are unchanged, the `restartCount` delta is 0, and the Pod count is unchanged;
   - the replacement Pod for the deleted replica is Ready within the startup budget + 180 s with `restartCount=0`, and no container state
     ever shows `CrashLoopBackOff`; whether the logs contain
-    `regional registry bootstrap attempt ... retrying` is recorded as `startup_retry_observed`
+    `start-up store wait: <step> attempt ... retrying` (any start-up step; earlier releases logged only
+    `regional registry bootstrap attempt ... retrying`, and both count) is recorded as `startup_retry_observed`
     (supplementary evidence: whether the failover happened to cover its start-up window is not controlled by the case);
   - before and after, every Pod's `/healthz` has `secret_drift=false` and a non-empty `secret_config_sha256`;
   - the first sample of the sampling timeline precedes the failover request and the last sample follows the readiness-recovery deadline;
@@ -7464,7 +7467,10 @@ execution lease; otherwise orphan cleanup could cancel the commands used for the
     whether the CPU EKS has a policy engine enabled is not declared by this system, and a deny policy without a deadman
     would be a control-plane-wide NotReady incident the moment the runner dies. A failover is the same blackout, with a built-in upper bound.
   - The replacement Pod's start-up backoff is visible only when the failover happens to cover its start-up; otherwise there is only unit evidence
-    (`tests/regional/test_liveness_probe.py`).
+    (`tests/app/test_startup_store_wait.py` covers every start-up Store call of the three roles,
+    `tests/app/test_serve_reuse_port.py` that a waiting worker does not listen and is not replaced by the supervisor,
+    `tests/deploy/test_control_plane_liveness_probe.py` that the startup window exceeds the budget,
+    `tests/regional/test_liveness_probe.py`).
 
 
 ### GF-REGIONAL-HA-011

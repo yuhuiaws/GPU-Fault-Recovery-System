@@ -43,7 +43,15 @@ DEFAULT_STARTUP_RETRY_SECONDS = 120.0
 # the writer by exactly the threshold the manifest sets, plus one refresh.
 READINESS_RECOVERY_MARGIN_SECONDS = 30.0
 REPLACEMENT_READY_MARGIN_SECONDS = 180.0
+# The bounded start-up wait (``gpu_fault.app.startup_store_wait``) logs
+# "start-up store wait: <step> attempt N failed ...; retrying ..." for every
+# start-up store step; earlier releases retried, and logged, only the registry
+# bootstrap's "regional registry bootstrap attempt N failed ...", which the
+# registry step's new line still contains. Either counts.
 STARTUP_RETRY_LOG_MARKER = "regional registry bootstrap attempt"
+STARTUP_WAIT_LOG_MARKER = "start-up store wait:"
+STARTUP_RETRY_LOG_MARKERS = (STARTUP_WAIT_LOG_MARKER, STARTUP_RETRY_LOG_MARKER)
+STARTUP_GAVE_UP_LOG_MARKER = "start-up gave up waiting for the store"
 CRASH_LOOP_REASON = "CrashLoopBackOff"
 OBSERVE_SECONDS_DEFAULT = 420
 OBSERVE_SECONDS_BOUNDS = (120, 900)
@@ -361,12 +369,15 @@ def replacement_errors(
 def startup_retry_observed(log_lines: list[str]) -> bool:
     """Whether the replacement logged the ARCH-H1 bounded start-up retry."""
 
-    return any(STARTUP_RETRY_LOG_MARKER in line for line in log_lines)
+    return any(
+        marker in line for line in log_lines for marker in STARTUP_RETRY_LOG_MARKERS
+    )
 
 
 def relevant_log_lines(text: str, *, limit: int = 50) -> list[str]:
     tokens = (
-        STARTUP_RETRY_LOG_MARKER,
+        *STARTUP_RETRY_LOG_MARKERS,
+        STARTUP_GAVE_UP_LOG_MARKER,
         "operationalerror",
         "connection",
         "traceback",

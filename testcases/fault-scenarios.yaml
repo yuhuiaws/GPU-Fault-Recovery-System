@@ -6816,7 +6816,7 @@ test_cases:
   - /healthz 只允许 503（readiness），不得出现 500 等其它 5xx，也不得在 /livez 应答时不可达
   - RDS 报告 available 后 GPU_FAULT_REGISTRY_STALE_SECONDS（读自 Pod 实际环境，默认 90 s）+30 s 内每个 Pod 的 /healthz 回到 200 且 regional_registry.ready=true
   - 三个 CPU Deployment（gpu-fault-api-ha / gpu-fault-control-worker / gpu-fault-telemetry-spool-worker）所有既有 Pod 的 UID 不变、restartCount 增量为 0，Pod 数量不变
-  - 故障转移请求后立即删除的一个 gpu-fault-api-ha 副本在 GPU_FAULT_STARTUP_STORE_RETRY_SECONDS（默认 120 s）+180 s 内 Ready、restartCount=0，任一容器状态从未出现 CrashLoopBackOff；是否记录到 regional registry bootstrap attempt 退避日志作补充证据
+  - 故障转移请求后立即删除的一个 gpu-fault-api-ha 副本在 GPU_FAULT_STARTUP_STORE_RETRY_SECONDS（默认 120 s）+180 s 内 Ready、restartCount=0，任一容器状态从未出现 CrashLoopBackOff；是否记录到 start-up store wait（或更早版本的 regional registry bootstrap attempt）退避日志作补充证据
   - 故障转移前后每个 Pod /healthz 的 regional_registry.secret_drift=false、secret_config_sha256 非空、ready=true
   - 采样时间线覆盖整个窗口：首个样本早于 failover 请求，末个样本晚于 readiness 恢复截止时刻；每 Pod 的 readiness 中断总秒数记入证据
   - 全程无任何 remote command 在飞、processor 队列为空；三个 Deployment 回到期望副本数，runtime identity 与 preflight 相同
