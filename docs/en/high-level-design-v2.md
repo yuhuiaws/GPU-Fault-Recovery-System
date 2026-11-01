@@ -220,8 +220,9 @@ The table above gives only the starting point of each family. The thresholds and
 NVIDIA official recommendations for the 172 XID codes and all SXID codes, this scheme's decisions and the compiled step chains are listed item by item in
 [Fault Categories and Remediation Actions](fault-categories-and-actions.md).
 
-PCIe is covered only up to the `pcie_replay_total` / `DCGM_FI_DEV_PCIE_REPLAY_COUNTER`
-counters and the `pci_bdfs` evidence field; **there is no AER / PCIe link fault decision path** (§11).
+PCIe is covered by the `pcie_replay_total` / `DCGM_FI_DEV_PCIE_REPLAY_COUNTER` counters (graded against DCGM's expected
+rate of the current link), from batch 233 the load-gated link downtrain (DCGM 235-238) and the correctable-error rate
+(DCGM 1501), and the `pci_bdfs` evidence field; **there is still no AER decoding or link-loss decision path** (§11).
 
 ### 2.2 Severity Levels and the Action Ladder
 
@@ -962,7 +963,7 @@ Sorted by "whether it affects closing the loop". The first 6 items change the sy
 | 3 | Dry-run | `/simulate` **writes to the state store** and pushes the workflow to a terminal state; no production-usable rehearsal | Mistaking it for a rehearsal causes state pollution | Either explicitly disable `/simulate` in production, or add a truly read-only plan-preview |
 | 4 | GPU-level device disabling (Device Plugin / scheduler) | Can only restart the whole device plugin DaemonSet Pod | The actual isolation granularity of a single-card fault is the **whole node**; capacity loss is amplified 8× | Evaluate integrating single-card unhealthy injection into the device plugin |
 | 5 | False-isolation rate, event loss rate, end-to-end detection latency | workflow/notification/readmission metrics have been added; these three still lack a unified denominator or a signal→finding timeline | Detection quality still cannot be fully quantified | Add denominator definitions and signal/finding milestones |
-| 6 | PCIe (AER / link) fault decision | Only the `pcie_replay_total` count and the `pci_bdfs` evidence field | No decision path for PCIe link degradation/link loss | If real cases exist, add a family following the "temperature/throttling" threshold + debounce pattern |
+| 6 | PCIe (AER / link) fault decision | The `pcie_replay_total` count, from batch 233 the load-gated link downtrain (235-238) and the correctable-error rate (1501), and the `pci_bdfs` evidence field | Still no decision path for PCIe link loss or AER uncorrectable errors | If real cases exist, add a family following the "temperature/throttling" threshold + debounce pattern |
 | 7 | Write NodeCondition | NodeCondition is **read-only** | External systems cannot see this design's decisions; the scheduler cannot act on them | Writing NodeCondition would introduce a second writer, conflicting with the single-writer principle; recommend staying read-only and exposing a query API instead |
 | 8 | CRDs (FaultEvent / RemediationPolicy / RemediationRun) | **No CRDs**, REST + Aurora | Cannot view faults with `kubectl get` | Deliberate choice: the state store is shared across clusters, CRDs live only within a single cluster. If CRDs are wanted, they can only be a read-only projection |
 | 9 | Control-plane Leader Election | **No leader**, lane leases + fencing + active-active | None (this is the stronger design: no single-leader throughput bottleneck and no leader flapping) | Keep as is, but the documentation must state explicitly "there is no leader", otherwise troubleshooting will go looking for a leader that does not exist |

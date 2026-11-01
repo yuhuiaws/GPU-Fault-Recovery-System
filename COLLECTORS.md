@@ -357,6 +357,12 @@ exporter，还会等待 `/v1/gpu-metrics/.../latest` 出现该节点的实际样
 - power/thermal violation duration。
 - `DCGM_FI_DEV_XID_ERRORS`。
 - NVLink fabric 注册状态 `DCGM_FI_DEV_FABRIC_MANAGER_STATUS` 与 `DCGM_FI_DEV_FABRIC_MANAGER_ERROR_CODE`。
+- batch 233：GPU 恢复动作 `DCGM_FI_DEV_GET_GPU_RECOVERY_ACTION`（1523）、SRAM 阈值 `DCGM_FI_DEV_THRESHOLD_SRM`（346）、
+  bank 重映射余量 388/389、ECC 模式 300/301（状态边沿）；PCIe 最大/当前链路代际与宽度 235-238（负载下的降速由 collector
+  连续计数，发布 `pcie_link_downtrain`）与 correctable 错误 1501（只在速率高于 R 时投递）；HW thermal / power brake
+  slowdown 时间 1423/1424（ns 换算为 µs，按占空比分级）；InfoROM 校验由 DCGM collector 按 inventory 周期执行
+  `nvidia-smi --query-gpu=index,pci.bus_id,uuid,inforom.checksum_validation`（不读每次 watch 都读 flash 的字段 84）。
+  分级规则与 NVIDIA 依据见详细设计 §2.4.1。
 
 DCGM Exporter 必须配置 `deploy/dataplane/dcgm-counters.csv` 中的字段，两条启动路径
 （`deploy/dataplane/hyperpod-dcgm-exporter.yaml` 与 `deploy/systemd/gpu-fault-dcgm-exporter.service`）
@@ -395,6 +401,8 @@ sha256 注解 `gpu-fault.io/dcgm-counters-sha256`（同样由 `render_dcgm_expor
 - `DCGM_FI_DEV_FABRIC_MANAGER_STATUS` 是状态 gauge（`dcgmFabricManagerStatus_t`），不是计数器；
   `DCGM_FI_DEV_FABRIC_MANAGER_ERROR_CODE` 在注册完成之前为空，exporter 不输出样本。两者都不是必需字段，exporter
   缺少它们时只是没有 fabric 检测。
+- batch 233 的字段在 CSV 中保留 DCGM 4.5.3 的名字（钉定 exporter 的 go-dcgm `v1.4611.2` 作为弃用别名解析），collector
+  同时识别 DCGM 4.6 的新名，同值的一对只算一次；全部非必需，exporter 不提供时只是缺少那条规则。
 
 `NvidiaSmiMetricsCollector` 的实现作为后续验证能力保留。只有显式传入
 `--enable-nvidia-smi-metrics-collector` 才允许使用；它采集核心、ECC、retired-page

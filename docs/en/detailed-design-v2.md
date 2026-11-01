@@ -92,7 +92,7 @@ The following are not "not yet tested"; they are **deliberately not done by desi
 | Writing Kubernetes Events / custom CRDs | Not written. NodeCondition is read-only | §3.8, §11 |
 | A real dry-run | `/simulate` writes to the database and drives the workflow and incident to a terminal state; it is not a read-only rehearsal | §8.5, §11 |
 | External ticketing systems (Jira/PagerDuty/Slack/webhook) | None. The "ticket number" is a locally synthesised `vendor-ticket-<incident_id>` string that appears in the SNS/SES notification body | §3.10, §11 |
-| PCIe AER decoding | None. On the PCIe side there are only `pcie_replay_total` / `DCGM_FI_DEV_PCIE_REPLAY_COUNTER` and `pci_bdfs` | §11 |
+| PCIe AER decoding | None. On the PCIe side there are `pcie_replay_total` / `DCGM_FI_DEV_PCIE_REPLAY_COUNTER`, from batch 233 the link generation/width (235-238) and the correctable-error count (1501), and `pci_bdfs`; AER is not decoded | §11 |
 
 ---
 ## 2. Deployment and Process Design
@@ -1411,7 +1411,7 @@ When the driver's own `/proc/driver/nvidia/gpus` cannot be read either, nothing 
 
 **⑫ Unit test scope**: decoding and action mapping for every rule in the XID catalog; NVLink5 sub-codes take
 the v1/v2 bit patterns on either side of `driverBoundary`; SXID classification into official/investigatory actions;
-the 37 `DCGM_FI_*` field mappings in `dcgm-counters.csv` and the threshold boundaries of the 7 composite rules (including "N consecutive samples" and "low-utilization suppression");
+the 50 `DCGM_FI_*` field mappings in `dcgm-counters.csv` and the threshold boundaries of the 7 composite rules (including "N consecutive samples" and "low-utilization suppression");
 `collection_errors` raises the EDGE_FILTERED priority; outbox write failures and replay order.
 
 ### 3.3 Event Normalization and Channel Admission
@@ -5632,7 +5632,7 @@ This chapter is an **acceptance checklist**: every item mentioned in the recomme
 |---|---|---|
 | NVIDIA / AMD / Intel adapters, all three vendors | **NVIDIA only**. No ROCm, XGMI or Intel related code | Add on demand; the adapter boundary is already in place (§3.2) |
 | MIG as a first-class citizen | Appears only as the MIG prefix of `gpu_uuid`; no MIG-instance-level remediation | Gap; priority depends on whether the site uses MIG |
-| PCIe AER faults | Only `pcie_replay_total` / `DCGM_FI_DEV_PCIE_REPLAY_COUNTER` + `pci_bdfs`; **AER is not read** | Gap |
+| PCIe AER faults | `pcie_replay_total` / `DCGM_FI_DEV_PCIE_REPLAY_COUNTER`, from batch 233 the link downtrain (235-238) and the correctable-error rate (1501), + `pci_bdfs`; **AER is not decoded** | Gap |
 | Driver/firmware compatibility matrix | No matrix. The catalog is pinned at 610; the NVLink5 rule uses `driverBoundary: 575` | Gap; cross-generation upgrades need manual confirmation |
 | Dry run | The `/simulate` family **writes to the database**; it is not a dry run | Misleading name, watch out during integration testing; renaming touches the API |
 
