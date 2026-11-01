@@ -292,12 +292,21 @@ def execution_decision(
 def bind_marker_incident(
     decision: FaultPolicyDecision, incident_id: str
 ) -> FaultPolicyDecision:
-    """Bind execution ownership without discarding the evidence association."""
+    """Bind execution ownership without discarding the evidence association.
+
+    The reason names the incident the marker was associated with. A marker
+    still on the event's own ``inc-<event_id>`` was never associated -- the
+    store merged the event into a group incident -- and that id is never
+    written, so nothing is named (batch 237; it used to be).
+    """
     if decision.marker.incident_id == incident_id:
         return decision
+    marker = decision.marker.model_copy(update={"incident_id": incident_id})
+    if decision.marker.incident_id == f"inc-{decision.event_id}":
+        return decision.model_copy(update={"marker": marker})
     return decision.model_copy(
         update={
-            "marker": decision.marker.model_copy(update={"incident_id": incident_id}),
+            "marker": marker,
             "reasons": bounded_reasons(
                 [
                     *decision.reasons,
