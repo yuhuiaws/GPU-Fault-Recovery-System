@@ -5808,3 +5808,20 @@ read from the Kubernetes v1.33.13 source, and the live annotation that ended the
 2026-11-01 wait agrees; no other Kubernetes version was checked.
 `describe-cluster-versions --include-all` for a version past its extended support
 and the exact moment AWS upgrades a cluster after its date were not exercised.
+
+## Provider-event PCI identity (batch 236)
+
+The association of the kernel NVRM line and the DCGM field 230 report of one
+real H200 XID is proven by in-memory replays only: the kernel and GPU-metrics
+routes in `tests/app_services/test_kernel_gauge_pci_spellings.py` and the
+correlation rules in `tests/orchestration/test_provider_event_pci_identity.py`.
+No live case exercises it, and none can on demand: a live drill writes a
+synthetic NVRM line that DCGM field 230 never reflects, and a real XID cannot
+be raised at will. The previous-boot overwrite
+(`tests/orchestration/test_stale_boot_marker_association.py`), the XID
+companion match (`tests/policy/test_xid_companion_pci_identity.py`) and the
+field-1523 and NVLink5 ownership of a kernel line without a GPU UUID
+(`tests/metrics/test_xid_owner_pci_identity.py`) are replay-only as well. The
+spellings are those the product's own parsers read (the kernel `PCI:` token,
+the exporter `pci_bus_id` label, nvidia-smi `pci.bus_id`); how a Fabric
+Manager log line spells an XID or SXID address was not sampled live.

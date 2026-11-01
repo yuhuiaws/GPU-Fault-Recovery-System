@@ -448,7 +448,7 @@ The SXID Catalog action mapping is as follows:
   stays blocked.
 - `20012`: mechanical connection check; `10004/10005`: cooling or thermal status check.
 
-A repeated request with the same `event_id` returns the existing decision. Cross-source correlation among Fabric Manager, kernel and DCGM requires the same node and error code, and requires an intersection when both sides carry GPU UUIDs or PCI BDFs.
+A repeated request with the same `event_id` returns the existing decision. Cross-source correlation among Fabric Manager, kernel and DCGM requires the same node and error code, and requires an intersection when both sides carry GPU UUIDs or PCI BDFs. PCI BDFs compare as devices, not strings (`src/gpu_fault/pci_identity.py`, batch 236): the kernel NVRM line's `0000:b9:00`, the dcgm-exporter `pci_bus_id` and nvidia-smi's `00000000:B9:00.0` and the inventory collectors' lower-cased form are one device -- domain width and case do not matter, an absent domain or function matches any value; a spelling that is no address intersects only an identical string. The raw-string intersection used before never associated the kernel line and the DCGM field 230 report of one H200 XID.
 
 At load time the NVLink catalog verifies that every pattern is 32 characters of `0/1/-` and that errorStatus is a
 hexadecimal list; a malformed catalog prevents the process from starting.
@@ -537,7 +537,7 @@ XID 45 is not decided as solo immediately in the request thread. The control pla
 `PENDING_CORRELATION` decision to the shared Store and waits for the Catalog's fixed 30-second
 companion window to close. All replicas can observe the pending record, but only the replica that acquires the PostgreSQL
 advisory-lock lease can finalize it. Correlation requires the cluster, node and GPU identity to agree:
-GPU UUID is compared first, PCI BDF when it is missing; when both are missing it fails closed and does not correlate. When both sides have a
+GPU UUID is compared first, PCI BDF as a device (any spelling, `pci_identity`) when it is missing; when both are missing it fails closed and does not correlate. When both sides have a
 boot ID it must also agree. If a companion is found after the window closes, XID 45 reuses the primary XID's incident
 and workflow; only when none is found is `RESTART_FM` generated -- on a graded NVSwitch node (Hopper SXM, HGX B200/B300)
 that solo decision is rewritten to observe-only by default (`MONITOR_ONLY` / `NO_ACTION`, §2.4.1). The event, the pending
@@ -1009,7 +1009,7 @@ one cordons first (FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → ESCALATE_SUPPORT).
   (`xid154_outcome` is `_dynamic_recovery_resolution`'s mapping, and a test runs the engine on the kernel line of every value),
   so 3 compiles the XID 154 drain-P2P chain (FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → [STOP_WORKLOADS] → QUIESCE_GPU_SERVICES →
   VERIFY_NO_GPU_CLIENTS → RECOVER_DRAIN_P2P → RESTORE_GPU_SERVICES → VALIDATE_GPU → VALIDATE_FABRIC → RESTORE_SCHEDULING →
-  [RESTART_WORKLOAD]). While an XID 154 owns the GPU's recovery -- a kernel XID 154 event for it within 120 s of the batch, or
+  [RESTART_WORKLOAD]). While an XID 154 owns the GPU's recovery -- a kernel XID 154 event for it (GPU UUID, else the PCI address compared as a device) within 120 s of the batch, or
   an open incident the XID 154 path decided -- the value is evidence only: no second workflow. After this workflow's
   RESET_GPU, RESET_ALL_GPUS_NVSWITCHES, RECOVER_DRAIN_P2P, RESTART_NODE or REPLACE_NODE, `VALIDATE_GPU` requires every target
   GPU's value read after that step to be 0: a value still set fails (`gpu_recovery_action_not_none(<gpu>=<label>; read after
@@ -1272,7 +1272,7 @@ nodes should run the DCGM host engine 4.7.0 or later ([deployment manual](deploy
   recently updated incidents. A reboot also never forms a delta (`metric_counter_delta` refuses a boot change). A RUNNING
   node-exclusive chain that owns Fabric Manager (`FABRIC_MANAGER_OWNED_OPERATIONS`) with its VALIDATE_GPU ahead also absorbs an
   NVLink5 or fabric-health finding its window raises (`TRANSIENT_INVENTORY_FINDINGS`). While an XID 144-150 or 155 owns the GPU
-  -- an XID event for it within 120 s of the batch, or an open incident whose XID decision is one of them -- the finding is
+  -- an XID event for it (GPU UUID, else the PCI address compared as a device) within 120 s of the batch, or an open incident whose XID decision is one of them -- the finding is
   evidence only (`NO_ACTION`, `NVLINK5_XID_OWNS_GPU`): the kernel line carries the decode and its incident owns the recovery.
 - **The NVLink composites.** NVLink5 findings are components of `NVLINK_LINK_DEGRADATION` and `MULTI_GPU_NVLINK_FABRIC_FAILURE`
   (`gpu_nvlink5_policy.nvlink_component`); the link-recovery trio counts as one error class (`nvlink_class`: one recovery
@@ -2352,7 +2352,7 @@ log XID/SXID events on that node are signals that this reboot itself explains (X
 comes back, an empty host inventory); `orchestration/reboot_window.py` absorbs them into the incident that owns the node
 as evidence (the event is linked to that incident, and no new incident/workflow is opened); a kernel log event that carries
 a boot id the node has already left (the Agent has already heartbeated with the new boot, and the event's kernel time is earlier than that heartbeat) is only recorded as a `RECOVERED`
-incident and no action is planned. When ownership cannot be decided, the original behavior is kept.
+incident and no action is planned. That incident is the event's own (`inc-<event_id>`): when the provider-event correlation has just associated the event with a live marker, the association becomes a reason and the marker's incident is never overwritten (before batch 236 it was: the live incident turned `RECOVERED`, its event link moved to the previous boot's line and its workflow pointer was lost). When ownership cannot be decided, the original behavior is kept.
 
 A record-only absorption (`ABSORB_RECORD_ONLY`: after the aggregation window closed, a read-only finding falls inside a
 RUNNING workflow's mutating scope -- a node-mutating step or a pending `RESTART_WORKLOAD` naming the node) only links
@@ -2841,8 +2841,10 @@ correlation_keys[]
 ```
 
 Fault domains such as GPU memory, GPU fabric, GPU inventory, GPU thermal and EFA/RDMA network fabric each have their own class; keys use
-normalized GPU UUID, PCI BDF, fabric partition, NVLink link, switch/port or device identity. Cross-source events reuse an incident only when
-the nodes intersect, the fault class is the same, the device identities intersect and the event falls within a 5-minute window.
+normalized GPU UUID, PCI BDF, fabric partition, NVLink link, switch/port or device identity. Cross-source events are associated with an existing incident
+(the decision is marked `duplicate`) only when the nodes intersect, the fault class is the same, the device identities intersect (PCI BDFs
+compare as devices, see 2.3) and the event falls within a 5-minute window; whether they share an execution is decided by
+workflow arbitration, and association alone never merges two executions.
 Same-source kernel events can still use the monotonic timestamp within the same boot, unaffected by wall-clock skew.
 Different fault domains such as EFA and NVSwitch/SXID are never merged even when the PCI or node is the same.
 
@@ -3385,7 +3387,7 @@ the corresponding four `/v1/provider-events/hyperpod-hma/*` routes are no longer
 Kernel and Fabric Manager share `gpu_fault.nvidia_logs.NvidiaLogNormalizer`;
 event IDs, fields, `provider_signals`, and the source/monotonic/collected/ingested time semantics are unchanged.
 monotonic is compared only when the boot ID is the same; cross-source correlation uses a bounded wall-clock window and requires
-node, error code and the available GPU UUID/PCI BDF to match; a trusted topology must not be guessed from raw text.
+node, error code and the available GPU UUID/PCI BDF (compared as a device) to match; a trusted topology must not be guessed from raw text.
 
 The two HMA values of `CollectorKind`, `EvidenceKind.HMA`, the old signal source and the unresolved
 reason are kept only for historical data compatibility. The registry marks the old kinds as retired and refuses new producer registrations.
