@@ -37,6 +37,7 @@ from gpu_fault.orchestration.families.identity import derived_record_id
 from gpu_fault.orchestration.families.incident_labels import NODE_HEALTH_EVENT_TYPE
 from gpu_fault.orchestration.reboot_window import RebootOwner, absorb_finding
 from gpu_fault.orchestration.workflow_builder import containment_handoff_reason
+from gpu_fault.policy.models import DynamicRecoveryAction
 from gpu_fault.regional_compatibility import ACTIVATION_INHIBITION_VERSION
 from gpu_fault.store import NotFoundError
 from gpu_fault.workflow_quarantine import (
@@ -66,6 +67,7 @@ FULL_FABRIC_RESET_ACTION = "RESET_ALL_GPUS_AND_NVSWITCHES"
 UNSETTLED_INCIDENT_STATES = frozenset(
     {IncidentState.ACTION_PENDING, IncidentState.ESCALATED}
 )
+DRAIN_P2P_ACTION = DynamicRecoveryAction.DRAIN_P2P.value
 
 
 def host_resource_signal(finding: NodeHealthFinding) -> tuple[str, str] | None:
@@ -440,6 +442,11 @@ class NodeHealthPlanBuilder:
             ]
             if restart:
                 operations += [WorkflowOperation.RESTART_WORKLOAD]
+        elif (
+            action is RecoveryAction.STOP_WORKLOAD
+            and finding.official_action == DRAIN_P2P_ACTION
+        ):
+            operations += self._drain_p2p_operations(active, restart)
         elif action is RecoveryAction.STOP_WORKLOAD:
             if active:
                 operations += [WorkflowOperation.STOP_WORKLOADS]
@@ -477,6 +484,7 @@ class NodeHealthPlanBuilder:
                 in {
                     "ecc_dbe_volatile_total",
                     "row_remap_failure",
+                    "sram_threshold_exceeded",
                     "composite:GPU_MEMORY_DEGRADATION",
                 }
             ):
@@ -515,6 +523,36 @@ class NodeHealthPlanBuilder:
             )
         elif action is RecoveryAction.REBOOT_NODE:
             operations += self._reboot_operations(active, restart)
+        elif action is RecoveryAction.ESCALATE_OPERATOR:
+            # b233, a human's to act on: ECC disabled, an invalid InfoROM, a
+            # downtrain a reset did not fix (WARNING), a recovery no step does
+            # (CRITICAL, cordoned first): evidence, then the fixed-template
+            # support mail; the incident ends ESCALATED for the operator.
+            if finding.severity.value == "critical":
+                operations += [WorkflowOperation.MARK_UNSCHEDULABLE]
+            operations += [WorkflowOperation.ESCALATE_SUPPORT]
+        return operations
+
+    @staticmethod
+    def _drain_p2p_operations(active: bool, restart: bool) -> list[WorkflowOperation]:
+        """The XID 154 path's DRAIN_P2P chain
+        (``WorkflowBuilder.catalog_operations``), for the driver's recovery
+        action read from DCGM field 1523 (``gpu_recovery_action_policy``)."""
+
+        operations = [WorkflowOperation.MARK_UNSCHEDULABLE]
+        if active:
+            operations.append(WorkflowOperation.STOP_WORKLOADS)
+        operations += [
+            WorkflowOperation.QUIESCE_GPU_SERVICES,
+            WorkflowOperation.VERIFY_NO_GPU_CLIENTS,
+            WorkflowOperation.RECOVER_DRAIN_P2P,
+            WorkflowOperation.RESTORE_GPU_SERVICES,
+            WorkflowOperation.VALIDATE_GPU,
+            WorkflowOperation.VALIDATE_FABRIC,
+            WorkflowOperation.RESTORE_SCHEDULING,
+        ]
+        if restart:
+            operations.append(WorkflowOperation.RESTART_WORKLOAD)
         return operations
 
     @staticmethod

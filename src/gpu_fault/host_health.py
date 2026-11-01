@@ -20,6 +20,7 @@ from gpu_fault.device_plugin_liveness import kubernetes_device_plugin_rules
 from gpu_fault.efa_traffic_state import traffic_observation
 from gpu_fault.env import env_bool
 from gpu_fault.efa_stall_episode import episode_parameters
+from gpu_fault.gpu_field_rules import GPU_FIELD_FAULT_CLASSES
 from gpu_fault.gpu_instance_inventory import gpu_instance_inventory
 from gpu_fault.host_capability_markers import CAPABILITY_MARKERS
 from gpu_fault.host_device_signals import (
@@ -191,6 +192,7 @@ _GPU_METRIC_FAULT_CLASSES = {
     "host_gpu_utilization_percent": "GPU",
     "gpu_utilization_percent": "GPU",
     "pcie_replay_total": "GPU",
+    **GPU_FIELD_FAULT_CLASSES,
 }
 _GPU_COMPOSITE_FAULT_CLASSES = {
     "THERMAL_STRESS": "GPU_THERMAL",

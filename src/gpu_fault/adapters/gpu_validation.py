@@ -26,9 +26,15 @@ from gpu_fault.fabric_scope import (
 )
 from gpu_fault.gpu_fabric_manager import fabric_validation
 from gpu_fault.gpu_fabric_window import fabric_state_loss
+from gpu_fault.gpu_field_rules import (
+    HW_POWER_BRAKE_SLOWDOWN,
+    HW_THERMAL_SLOWDOWN,
+    blocks_validation,
+)
 from gpu_fault.gpu_instance_inventory import gpu_instance_inventory
 from gpu_fault.gpu_metrics import GpuMetricSource, GpuMetricsService
 from gpu_fault.gpu_observation import metric_device_key
+from gpu_fault.gpu_recovery_action_policy import recovery_action_validation
 from gpu_fault.gpu_temperature_policy import TLIMIT_READING
 from gpu_fault.health_evidence_validation import (
     reset_cooldown,
@@ -121,6 +127,7 @@ THERMAL_WARNING_NAMES = frozenset(
         TLIMIT_READING,
         "memory_temperature_c",
         "thermal_violation_total_us",
+        HW_THERMAL_SLOWDOWN,
         "clock_throttle_reasons",
         "composite:THERMAL_STRESS",
     }
@@ -135,7 +142,11 @@ MEMORY_WARNING_NAMES = frozenset(
     }
 )
 POWER_WARNING_NAMES = frozenset(
-    {"power_violation_total_us", "composite:POWER_LIMIT_THROTTLING"}
+    {
+        "power_violation_total_us",
+        HW_POWER_BRAKE_SLOWDOWN,
+        "composite:POWER_LIMIT_THROTTLING",
+    }
 )
 
 
@@ -373,7 +384,7 @@ class GpuValidationAdapter:
             if operation is WorkflowOperation.VALIDATE_GPU:
                 nvlink_pending = self._validate_nvlink_fabric(
                     context, node_id, now, readiness_after, failures
-                )
+                ) or self._validate_recovery_action(context, node_id, failures)
                 if nvlink_pending is not None:
                     pending[node_id] = nvlink_pending
                     continue
@@ -870,6 +881,18 @@ class GpuValidationAdapter:
             failures.setdefault(node_id, []).append(f"fabric_manager_unit_{unit}")
         return pending or None
 
+    def _validate_recovery_action(
+        self,
+        context: WorkflowStepContext,
+        node_id: str,
+        failures: dict[str, list[str]],
+    ) -> dict[str, Any] | None:
+        """After a reset or reboot, field 1523 must read None again (b233)."""
+
+        latest = self.metrics.latest(context.incident.cluster_id, node_id)
+        targets = self._node_gpu_targets(context, node_id, latest)
+        return recovery_action_validation(context, node_id, latest, targets, failures)
+
     def _fabric_manager_unit(
         self, context: WorkflowStepContext, node_id: str, now: datetime
     ) -> str | None:
@@ -929,6 +952,9 @@ class GpuValidationAdapter:
                 for finding in findings
                 if finding.gpu_uuid is None or finding.gpu_uuid in targets
             ]
+        # Evidence-only and load-gated/persistent advisory findings (b233,
+        # ``gpu_field_rules.blocks_validation``) cannot be re-judged here.
+        findings = [finding for finding in findings if blocks_validation(finding)]
         if not findings:
             return None
         contract = context.step.parameters.get(HEALTH_CONTRACT, {})

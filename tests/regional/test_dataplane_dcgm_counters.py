@@ -123,9 +123,32 @@ PINNED_FIELD_IDS = {
     "DCGM_FI_DEV_NVLINK_ERROR_DL_REPLAY": 499,
     "DCGM_FI_DEV_POWER_VIOLATION": 240,
     "DCGM_FI_DEV_THERMAL_VIOLATION": 241,
+    # Batch 233 (the 2026-11-01 field audit). Legacy names: const_fields.go
+    # lines 2743/2745 (388/389), 2776 (300), 2782 (1523), 3025 (1501) and 3052
+    # (346) of v1.4611.2; the others are in its current map (235-238 lines
+    # 2170-2173, 301 line 2191, 1423/1424 lines 2685/2686).
+    "DCGM_FI_DEV_GET_GPU_RECOVERY_ACTION": 1523,
+    "DCGM_FI_DEV_ECC_CURRENT": 300,
+    "DCGM_FI_DEV_ECC_PENDING": 301,
+    "DCGM_FI_DEV_THRESHOLD_SRM": 346,
+    "DCGM_FI_DEV_BANKS_REMAP_ROWS_AVAIL_LOW": 388,
+    "DCGM_FI_DEV_BANKS_REMAP_ROWS_AVAIL_NONE": 389,
+    "DCGM_FI_DEV_PCIE_COUNT_CORRECTABLE_ERRORS": 1501,
+    "DCGM_FI_DEV_PCIE_MAX_LINK_GEN": 235,
+    "DCGM_FI_DEV_PCIE_MAX_LINK_WIDTH": 236,
+    "DCGM_FI_DEV_PCIE_LINK_GEN": 237,
+    "DCGM_FI_DEV_PCIE_LINK_WIDTH": 238,
+    "DCGM_FI_DEV_CLOCKS_EVENT_REASON_HW_THERM_SLOWDOWN_NS": 1423,
+    "DCGM_FI_DEV_CLOCKS_EVENT_REASON_HW_POWER_BRAKE_SLOWDOWN_NS": 1424,
 }
 LEGACY_NAMES = frozenset(
     {
+        "DCGM_FI_DEV_BANKS_REMAP_ROWS_AVAIL_LOW",
+        "DCGM_FI_DEV_BANKS_REMAP_ROWS_AVAIL_NONE",
+        "DCGM_FI_DEV_ECC_CURRENT",
+        "DCGM_FI_DEV_GET_GPU_RECOVERY_ACTION",
+        "DCGM_FI_DEV_PCIE_COUNT_CORRECTABLE_ERRORS",
+        "DCGM_FI_DEV_THRESHOLD_SRM",
         "DCGM_FI_DEV_CLOCK_THROTTLE_REASONS",
         "DCGM_FI_DEV_CORRECTABLE_REMAPPED_ROWS",
         "DCGM_FI_DEV_FABRIC_MANAGER_ERROR_CODE",
@@ -574,6 +597,85 @@ def test_the_shutdown_temperature_is_exported_as_a_gauge_and_never_required() ->
         DCGM_METRICS["DCGM_FI_DEV_SHUTDOWN_TEMP"][0]
         not in DCGM_FIELDS.DCGM_CORE_CANONICAL_FIELDS
     ), "a scrape without the shutdown temperature reports no missing field"
+
+
+#: Batch 233's fields: the Prometheus type each must be exported as, and the
+#: DCGM 4.6 name the collector also reads (``None``: not renamed).
+GAP_FIELDS = {
+    "DCGM_FI_DEV_GET_GPU_RECOVERY_ACTION": ("gauge", "DCGM_FI_DEV_GPU_RECOVERY_ACTION"),
+    "DCGM_FI_DEV_ECC_CURRENT": ("gauge", "DCGM_FI_DEV_ECC_MODE"),
+    "DCGM_FI_DEV_ECC_PENDING": ("gauge", None),
+    "DCGM_FI_DEV_THRESHOLD_SRM": ("gauge", "DCGM_FI_DEV_SRAM_EXCEEDED"),
+    "DCGM_FI_DEV_BANKS_REMAP_ROWS_AVAIL_LOW": (
+        "gauge",
+        "DCGM_FI_DEV_BANK_REMAP_AVAIL_LOW",
+    ),
+    "DCGM_FI_DEV_BANKS_REMAP_ROWS_AVAIL_NONE": (
+        "gauge",
+        "DCGM_FI_DEV_BANK_REMAP_AVAIL_NONE",
+    ),
+    "DCGM_FI_DEV_PCIE_COUNT_CORRECTABLE_ERRORS": (
+        "counter",
+        "DCGM_FI_DEV_PCIE_CORRECTABLE_ERROR_TOTAL",
+    ),
+    "DCGM_FI_DEV_PCIE_MAX_LINK_GEN": ("gauge", None),
+    "DCGM_FI_DEV_PCIE_MAX_LINK_WIDTH": ("gauge", None),
+    "DCGM_FI_DEV_PCIE_LINK_GEN": ("gauge", None),
+    "DCGM_FI_DEV_PCIE_LINK_WIDTH": ("gauge", None),
+    "DCGM_FI_DEV_CLOCKS_EVENT_REASON_HW_THERM_SLOWDOWN_NS": ("counter", None),
+    "DCGM_FI_DEV_CLOCKS_EVENT_REASON_HW_POWER_BRAKE_SLOWDOWN_NS": ("counter", None),
+}
+#: Names the pinned go-dcgm does not know, from its id table's end (1612) on:
+#: one of them in the CSV stops the exporter at start-up on every GPU node.
+UNKNOWN_TO_THE_PINNED_GO_DCGM = frozenset(
+    {"DCGM_FI_DEV_DIAG_CPU_SDC_RESULT", "DCGM_FI_DEV_GPU_UTIL_RATIO"}
+)
+
+
+def test_the_batch_233_fields_are_exported_typed_mapped_and_never_required() -> None:
+    """The field audit's additions (1523, 235-238, 346, 388/389, 1423/1424,
+    300/301, 1501): exported under the 4.5.3 name the pinned go-dcgm resolves,
+    read under that and the 4.6 name, never a required field. The fabric
+    health fields 174/175 read NOT_SUPPORTED on H200 + driver 580 and the
+    per-link NVLink state 1508 waits for an exporter staging check: neither is
+    exported (docs/validation-limitations.md)."""
+
+    kinds = {
+        fields[0]: fields[1]
+        for _number, fields in _exporter_records(COUNTERS.read_text(encoding="utf-8"))
+    }
+    required = {
+        name for group in DCGM_FIELDS.DCGM_EXPORTER_FIELD_GROUPS for name in group
+    }
+    for name, (kind, renamed) in GAP_FIELDS.items():
+        assert kinds.get(name) == kind, (
+            f"{name} must be exported as a {kind}: {kinds.get(name)!r}"
+        )
+        assert name in PINNED_FIELD_IDS, f"{name}: read its id from const_fields.go"
+        assert name not in required, f"{name} became a required exporter field"
+        canonical = DCGM_METRICS[name][0]
+        assert canonical not in DCGM_FIELDS.DCGM_CORE_CANONICAL_FIELDS, (
+            f"a scrape without {name} must not report a missing required field"
+        )
+        if renamed is not None:
+            assert DCGM_METRICS[renamed] == DCGM_METRICS[name], (
+                f"{renamed} is the DCGM 4.6 name of {name}: both are read"
+            )
+            assert renamed not in kinds, "the CSV lists one name per field"
+    exported = set(kinds)
+    for absent in (
+        "DCGM_FI_DEV_FABRIC_HEALTH_MASK",
+        "DCGM_FI_DEV_FABRIC_HEALTH_SUMMARY",
+        "DCGM_FI_DEV_NVLINK_GET_STATE",
+        "DCGM_FI_DEV_NVLINK_LINK_STATUS",
+        "DCGM_FI_DEV_INFOROM_CONFIG_VALID",
+        "DCGM_FI_DEV_INFOROM_VALID",
+        *UNKNOWN_TO_THE_PINNED_GO_DCGM,
+    ):
+        assert absent not in exported, (
+            f"{absent} must stay out of the counters CSV (skipped, deferred, read "
+            "elsewhere or unknown to the pinned go-dcgm)"
+        )
 
 
 def test_the_field_table_was_read_for_the_pinned_exporter() -> None:

@@ -35,6 +35,9 @@ def text(temperatures: dict[str, dict[str, float]]) -> str:
         "gpu_temperature_c": 40,
         "memory_temperature_c": 45,
         "power_limit_w": 700,
+        # ECC enabled: a healthy GPU (ECC disabled is graded since batch 233).
+        "ecc_mode_current": 1,
+        "ecc_mode_pending": 1,
     }
     return "".join(
         f'{name}{{UUID="{device}"}} '

@@ -180,7 +180,7 @@ GB300 属于 GB200 列。
   `DRAIN_AND_RESET`。
 - XID 94/95：分别保存 application/all-applications containment；XID 95 在 reset
   前要求停止受影响工作负载。
-- XID 154：驱动报告动作优先。Catalog 的 `Xid 154 linkage` 描述联动上报版本，不是原始 Xid 的最低支持版本；旧驱动或缺少版本信息不因此阻止 Xid 48/63/79/94/95 等原始规则。NVLink5 的 R575 位格式边界和必需解码证据仍保留。
+- XID 154：驱动报告动作优先。Catalog 的 `Xid 154 linkage` 描述联动上报版本，不是原始 Xid 的最低支持版本；旧驱动或缺少版本信息不因此阻止 Xid 48/63/79/94/95 等原始规则。NVLink5 的 R575 位格式边界和必需解码证据仍保留。DCGM 字段 1523 以状态的形式持有同一个值（batch 233）：取值 1-4 按同标签的 XID 154 判定，XID 154 负责该 GPU 的恢复时只作证据（见下文「依据（Evidence）：DCGM 字段审计补入的规则」）。
 - `DRAIN_P2P`：禁止调度、停止关联任务、quiesce、确认无 GPU 客户端后，由独立 `RECOVER_DRAIN_P2P` operation 检查目标 GPU 的 persistence 已关闭并重读 GPU Recovery Action。`None` 不 reset；`Reset`、`Drain and Reset`、仍为 `Drain P2P` 时复用既有受保护的 GPU reset；任一目标要求 `Reboot` 时不先 reset 其他目标，转节点重启。未知动作、缺失/重复 GPU、persistence 未释放等不授权 reset/reboot，交人工处理。独立 operation 让旧 Agent 拒绝不认识的请求，不能静默退化为 `STOP_WORKLOADS` 或无条件 reset。
 - XID 159 `CHECK_UVM`：显式确认使用 UVM/vGPU 时 reset，否则 ignore；缺少证据阻塞。
 - XID 144-150：按驱动 R575 边界选择 V1/V2 `IntrInfo` pattern，同时匹配
@@ -251,6 +251,62 @@ incident 的 `policy_reference` 就是上面排障指南的 URL；站点需要 c
 `REPLACE_NODE` 不计为应用修复。实现 `src/gpu_fault/adapters/pending_repair_rejudge.py`，引文由
 `tests/execution/test_validation_pending_repair_after_reset.py` 钉住；该缺口为读代码发现的潜在缺口，
 未在真机出现（详见 [详细设计](../详细设计.md) DCGM 诊断一节）。
+
+### 依据（Evidence）：DCGM 字段审计补入的规则（batch 233）
+
+下列页面均于 2026-11-01 重新抓取核对；NVML 与 NVIDIA GPU Memory Error Management 为 docs version 615（页面 "Last updated on Sep
+09, 2026"），DCGM 页面为 "Version: 4.6 (Latest)"，DCGM 源码为 v4.7.0 标签。完整引文与决定见详细设计 §2.4.1「DCGM 字段审计补入的
+字段」；每条引文由 `tests/test_dcgm_gap_field_evidence.py` 钉住。
+
+- GPU 恢复动作（1523）：GPU Memory Error Management，"Error Recovery and Response Flags"
+  `https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/error-recovery-and-response-flags.html#error-recovery-and-response-flags`
+  "Recovery action flag will be triggered for uncorrectable errors."；NVML API Reference，"vGPU Structs"，
+  `nvmlDeviceGpuRecoveryAction_t`
+  `https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlVgpuStructs.html#_CPPv429nvmlDeviceGpuRecoveryAction_t`
+  "NVML_GPU_RECOVERY_ACTION_RECOVER_IMEX_DOMAIN Recover IMEX Domain."、"NVML_GPU_RECOVERY_ACTION_BUS_RESET Reset the GPU’s PCIe
+  bus."、"NVML_GPU_RECOVERY_ACTION_SYSTEM_REBOOT Reboot the system."；DCGM Release Notes 4.7.0
+  `https://docs.nvidia.com/datacenter/dcgm/latest/release-notes/changelog.html` "Added DCGM_FR_GPU_RECOVERY_IMEX_DOMAIN for the
+  separate case in which driver recovery requires restoring an IMEX domain."；NVML API Reference 变更记录
+  `https://docs.nvidia.com/deploy/nvml-api/latest/change-log.html`，"Changes between NVML v610 and v615"："Added
+  NVML_GPU_RECOVERY_ACTION_BUS_RESET and NVML_GPU_RECOVERY_ACTION_SYSTEM_REBOOT to nvmlDeviceGpuRecoveryAction_t."；nvidia-smi 文档
+  `https://docs.nvidia.com/deploy/nvidia-smi/index.html`，"-r, --gpu-reset"："Reset triggered without extra arguments, will be a
+  default Function Level Reset (FLR). To issue a Bus Reset, use -r bus."
+- PCIe 链路（235-238）：nvidia-smi 文档，GPU ATTRIBUTES › PCI › GPU Link information："The current link generation and width.
+  These may be reduced when the GPU is not in use."、"The maximum link generation and width possible with this GPU and system
+  configuration."；NVIDIA DGX B300 User Guide
+  `https://docs.nvidia.com/dgx/dgxb300-user-guide/introduction-to-dgxb300.html#key-enhancements-over-previous-dgx-systems`
+  "ConnectX-8 networking connects directly to GPUs via PCIe Gen6."
+- PCIe replay（202）与 correctable 错误（1501）：DCGM Feature Overview，"Background Health Checks" › "Failure Conditions"
+  `https://docs.nvidia.com/datacenter/dcgm/latest/user-guide/feature-overview.html#background-health-checks` "There were more
+  than 8 PCIe replays in the last minute."；DCGM v4.7.0 `modules/health/DcgmHealthWatch.cpp`
+  `https://github.com/NVIDIA/DCGM/blob/v4.7.0/modules/health/DcgmHealthWatch.cpp` "Expected replay rate = Replay rate per lane *
+  Num of pcie Lanes. Note that value is ceiled."；DCGM v4.7.0 `nvvs/plugin_src/pcie/Pcie.cpp`
+  `https://github.com/NVIDIA/DCGM/blob/v4.7.0/nvvs/plugin_src/pcie/Pcie.cpp` "/* Default is hopper, but fall back for other
+  devices */"；NVML API Reference，"Field Value Enums"
+  `https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlFieldValueEnums.html#c.NVML_FI_DEV_PCIE_COUNT_CORRECTABLE_ERRORS`
+  "PCIe Correctable Errors Counter."（没有健康阈值）。
+- SRAM 阈值（346）、无备用行（389）、不可纠正重映射（393）：GPU Memory Error Management，"RMA Policy"
+  `https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/rma-policy-thresholds-for-row-remapping.html#gpu-l2-memory-rma-policy`
+  "Any of the following events will trigger the SRAM Threshold Exceeded flag:"；同一页面 "GPU DRAM Memory RMA Policy"
+  `https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/rma-policy-thresholds-for-row-remapping.html#gpu-dram-memory-rma-policy`："For Blackwell GPUs, a third remapping attempt for an uncorrectable memory error on a bank
+  invokes HBM channel repair if there is a spare channel available."；DCGM Release Notes 4.6.0 "Health monitoring now warns when
+  total uncorrectable row remaps reach 512 on Ampere and newer GPUs, allowing administrators to run field diagnostics before GPU
+  memory health degrades further."
+- HW slowdown 时间（1423/1424）与时钟事件位：NVML API Reference，"Field Value Enums"
+  `https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlFieldValueEnums.html` "Field values for Clock Throttle Reason
+  Counters All counters are in nanoseconds."；NVML API Reference，"Clocks Event Reasons"
+  `https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlClocksEventReasons.html`，`nvmlClocksThrottleReasonHwSlowdown`：
+  "May be also reported during PState or clock change This behavior may be removed in a later release."
+- ECC 模式（300/301）与 InfoROM：NVML API Reference，"Device Queries"
+  `https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlDeviceQueries.html` "Requires ECC Mode to be enabled."；
+  Dynamic Page Retirement，"Implementation"
+  `https://docs.nvidia.com/deploy/dynamic-page-retirement/implementation.html#implementation` "These addresses are stored in the
+  InfoROM."
+
+结论：字段 1523 的取值 1-4 按同标签的 XID 154 判定；RECOVER_IMEX_DOMAIN 交运维；BUS_RESET、SYSTEM_REBOOT 与未记载的值 fail
+closed（NVIDIA 对 6 和 7 只记载一行枚举含义，且产品的 GPU 复位是 FLR，不是 bus reset）。PCIe replay 阈值按 DCGM health 对当前链路
+的公式（只有没有链路读数时为 8/min）；correctable 错误上限取该公式与 DCGM PCIe 诊断上限中较低者。Blackwell（B200/B300）的行为依据
+NVIDIA 文档做了单元测试，未经现网验证（没有 B 系列硬件）。
 
 ## SXID
 

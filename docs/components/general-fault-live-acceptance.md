@@ -986,7 +986,7 @@ DCGM `*_ERROR_COUNT_TOTAL`）；Hopper/NVLink4 及更新的卡只上报 DL 聚�
 单卡和多卡counter相关都应实际只读诊断，无DRAIN/reset；回退/旧样本不算新故障或修复。
 `counter_reset` 判的是回退这一拍而非抬升：NVLink 错误计数的规则是 `delta >= nvlink_error_delta_critical`
 （默认 1，`gpu_metrics._link_decision`），任何增量都是 WARNING，没有"低于阈值的抬升"（与 022 的
-8/min 速率规则不同）。2026-10-26 HyperPod 首次 live 运行（H200 DL 聚合计数）FAIL 的根因在用例：
+速率规则不同）。2026-10-26 HyperPod 首次 live 运行（H200 DL 聚合计数）FAIL 的根因在用例：
 每拍 +5 的抬升合法铸出一条 WARNING，oracle 把它记成"回退铸造"，又要求回退后无活动 finding——而产品
 契约正相反：回退是 invalid delta，finding 保留、不清除也不重铸，只有之后一个零增量的正常批次才算恢复
 （`recovered` 变体所证）。现在抬升每拍 +1（最小的真实增量）再 clear，判定只读首次出现回退拍的产品记录
@@ -1101,7 +1101,8 @@ exporter Pod 立刻重建，恢复后的采集器第一次 scrape 撞上 FM 训�
 
 必测：`at_rate_limit`、`over_rate_limit`、`counter_reset`、`source_boot_change`、
 `same_gpu_xid`、`wrong_gpu_xid`、`expired_xid`、`recovery_evidence`。
-受检PCIe counter源以有效时间区间形成8/min及超过8/min，两者分别不触发/只读诊断。
+受检PCIe counter源以有效时间区间形成恰为规则速率及超过规则速率（batch 233 起规则速率为该卡当前链路的 DCGM 预期速率：
+`scripts/e2e/regional/general_live_pcie_rate.py::pcie_replay_rate`，Gen5 x16 为 31/min，exporter 不提供链路时为 8/min），两者分别不触发/只读诊断。
 对比PCIe链路与AER证据，禁止拔PCIe卡或制造电气错误。
 同卡可信Xid32/79窗口内联合才能更强处置，异卡/过期不联合；独立Xid本身的恢复仍要
 单独记录，不能误把它的reboot算作PCIe计数器授权。涉及硬件分支须另行批准。
@@ -1111,13 +1112,13 @@ exporter Pod 立刻重建，恢复后的采集器第一次 scrape 撞上 FM 训�
 每拍 +5——20/min，即 `over_rate_limit` 的步长。产品对这两段合法风暴各铸一条 WARNING，oracle 却把它
 记在重置/换代头上；产品记录里重置拍按 `counter-reset` 边沿投递、delta 未知、无 finding，换代边界
 (0, 真实 boot)→(0, 回放 boot) 也无速率，`tests/metrics/test_pcie_counter_boundaries.py` 以真实采集器
-投递过滤与 ingest 钉住）。现在：`counter_reset` 的抬升取 `under_limit_increment`（8/min 预算的一半、
-至少 1，15 s 采集即每拍 1、4/min），再 clear；判定只读产品记录——接受过抬升读数（`raise`）、随后有低于
+投递过滤与 ingest 钉住）。现在：`counter_reset` 的抬升取 `under_limit_increment`（规则速率预算的一半、
+至少 1；8/min 时 15 s 采集即每拍 1、4/min，Gen5 x16 的 31/min 时每拍 3、12/min），再 clear；判定只读产品记录——接受过抬升读数（`raise`）、随后有低于
 前值的读数且其批次带 `counter-reset` 理由、最新读数即重置值（基线从重置值重新起算，`reset`）、该卡
 自 arm 起无任何 `pcie_replay_total` finding/incident/活动 finding（有则按时间点名"抬升期间铸造"或
 "重置铸造"，`no_fault`）、无硬件步骤；证据 `reset-readings`。`source_boot_change` 先 `serve`+`arm`
 再 `repoint`（`arm_before_repoint`），让重启到回放 boot id 下的采集器第一拍就读到计划首读的跳变
-`cross_boot_jump`（对真实 boot 的任何旧读数——最多一个健康摘要 + 一拍 + 重启之前——都超过 8/min 的
+`cross_boot_jump`（对真实 boot 的任何旧读数——最多一个健康摘要 + 一拍 + 重启之前——都超过规则速率的
 一次性抬升，之后保持）；判定：无 `pcie_replay_total` finding/incident（`no_cross_boot_rate`）、产品
 接受过回放 boot 下的读数且最新读数就是新 boot 的首读（换代从新基线起算，`new_baseline`）、无硬件
 步骤；新 boot 首个被接受的读数不是该跳变时记 INCONCLUSIVE（边界以真实值越过、未被检验）；证据

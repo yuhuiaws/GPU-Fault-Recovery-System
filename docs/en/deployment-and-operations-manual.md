@@ -7519,7 +7519,17 @@ Rule sources and default handling are as follows:
 
 | Signal | Default behaviour | Source |
 |---|---|---|
-| PCIe replay rate `>8/min` | Warning, run GPU diagnostics | NVIDIA DCGM Health `DCGM_FR_PCI_REPLAY_RATE` |
+| PCIe replay rate above DCGM's expected rate of the GPU's current link (fields 237/238: 31/min at Gen5 x16, 62/min at Gen6 x16; `>8/min` when the exporter serves no link; a configured `GPU_FAULT_PCIE_REPLAY_RATE_WARNING_PER_MINUTE` other than 8 wins) | Warning, run GPU diagnostics | NVIDIA DCGM Health `DCGM_FR_PCI_REPLAY_RATE` (`GetExpectedPcieReplayRate`) |
+| PCIe link downtrain (DCGM 235-238): current generation or width below the device and system maximum under load (utilization ≥ 50 %) for 3 consecutive valid samples | Warning, run diagnostics; still downtrained after a GPU reset or reboot → hand to an operator (reconnect or replace the link) | Site rule on NVIDIA's link semantics (nvidia-smi, NVML) |
+| PCIe correctable errors (DCGM 1501) above R in 2 consecutive windows, R the lower of the current link's expected rate and DCGM's PCIe diagnostic corrected-error limit (31/min at Gen5 x16, 16/min at Gen6 x16) | Warning, run diagnostics | Site rule; NVIDIA documents no health threshold; DCGM diagnostic `GetAERThresholdRate` |
+| GPU recovery action (DCGM 1523) not None | Reset / Reboot / Drain P2P / Drain and Reset follow the XID 154 action of the same label; RECOVER_IMEX_DOMAIN → cordon and hand to an operator; BUS_RESET, SYSTEM_REBOOT (NVIDIA documents only a one-line enum meaning; the product's reset is a Function Level Reset, not a bus reset) or an undocumented value → quarantine for an operator; evidence only while an XID 154 owns the GPU; after a reset or reboot VALIDATE_GPU requires the value back at 0 | NVIDIA GPU Memory Error Management "Error Recovery and Response Flags"; NVML v615 change log |
+| SRAM threshold exceeded (DCGM 346 = 1) | Critical, as a row-remap failure: stop jobs and isolate, RMA only after the NVIDIA Field Diagnostic | NVIDIA GPU Memory Error Management "GPU L2 Memory RMA Policy" |
+| Memory banks without spare rows (DCGM 389 > 0) | Warning, run diagnostics, operator notice; no automatic hardware action | Site rule on NVIDIA's bank remap histogram |
+| Uncorrectable row remaps (DCGM 393) ≥ 512 | Warning, run diagnostics (the field diagnostic is recommended) | NVIDIA DCGM Health (4.6.0) `DCGM_LIMIT_MAX_ROW_REMAP_UNCORRECTABLE` |
+| HW power brake slowdown time (DCGM 1424) | Duty > 0: Warning, run diagnostics; ≥ 1 % in two consecutive samples or beside clock-event bit 0x80: Critical `DRAIN` (power delivery) | NVML clock event reason counters; site duty rule |
+| HW thermal slowdown time (DCGM 1423) | Graded as the thermal violation time | NVML clock event reason counters |
+| ECC disabled (DCGM 300 = 0) or an ECC mode change pending (301 ≠ 300) | Warning, hand to an operator (without ECC the memory rules are blind) | NVML `nvmlDeviceGetMemoryErrorCounter` / `nvmlDeviceGetEccMode` |
+| InfoROM checksum invalid (nvidia-smi `inforom.checksum_validation`, inventory cadence) | Warning, hand to an operator (flash the InfoROM); the GPU's memory-repair evidence is untrusted | NVIDIA Dynamic Page Retirement; DCGM `DCGM_FR_CORRUPT_INFOROM` |
 | NVLink error counter delta `>=1` | Critical, stop affected jobs, isolate and analyse the GPU | NVIDIA DCGM Health `DCGM_FR_NVLINK_ERROR_CRITICAL` |
 | Untrained NVLink fabric (`fabric_manager_status`): the Fabric Manager state of a GPU on a graded NVSwitch node (Hopper SXM, HGX B200/B300) held NotStarted/InProgress/Failure for >=300 s | Critical, cordon, [stop jobs], reset every GPU and NVSwitch inside the quiesce window (the restore starts a Fabric Manager that is not running) and validate that every GPU's fabric state is Success; failure escalates to reboot, then warm-spare replacement | NVIDIA Fabric Manager User Guide (`NVIDIA_FABRIC_MANAGER_STATE`); the 300 s window is a site constant, not configurable |
 | Volatile DBE non-zero or increased | Critical, stop affected jobs, isolate and analyse the GPU | NVIDIA DCGM Health `DCGM_FR_VOLATILE_DBE_DETECTED` |
@@ -7703,6 +7713,20 @@ that protection, and the GPU stays graded on its T.Limit thresholds. The source 
 detailed design §2.4.1. Changing the CSV changes the counters digest of the exporter pod template, so a release rolls the
 exporter node by node.
 
+Fault evidence fields (batch 233): the CSV also exports `DCGM_FI_DEV_GET_GPU_RECOVERY_ACTION` (1523), `DCGM_FI_DEV_ECC_CURRENT`
+(300), `DCGM_FI_DEV_ECC_PENDING` (301), `DCGM_FI_DEV_THRESHOLD_SRM` (346), `DCGM_FI_DEV_BANKS_REMAP_ROWS_AVAIL_LOW` (388),
+`DCGM_FI_DEV_BANKS_REMAP_ROWS_AVAIL_NONE` (389), `DCGM_FI_DEV_PCIE_MAX_LINK_GEN` (235), `DCGM_FI_DEV_PCIE_MAX_LINK_WIDTH` (236),
+`DCGM_FI_DEV_PCIE_LINK_GEN` (237), `DCGM_FI_DEV_PCIE_LINK_WIDTH` (238) as gauges and `DCGM_FI_DEV_PCIE_COUNT_CORRECTABLE_ERRORS`
+(1501), `DCGM_FI_DEV_CLOCKS_EVENT_REASON_HW_THERM_SLOWDOWN_NS` (1423), `DCGM_FI_DEV_CLOCKS_EVENT_REASON_HW_POWER_BRAKE_SLOWDOWN_NS`
+(1424) as counters. Six of them carry their DCGM 4.5.3 names, which go-dcgm `v1.4611.2` keeps as deprecated aliases (DCGM 4.6.0
+renamed them, e.g. `DCGM_FI_DEV_GPU_RECOVERY_ACTION`); the collector reads both names. Every one is exported and never required:
+an exporter without it only lacks that rule. The InfoROM checksum is not a DCGM field here (field 84 reads the flash on every
+watch): the DCGM collector asks `nvidia-smi --query-gpu=index,pci.bus_id,uuid,inforom.checksum_validation` once per inventory
+interval. What each field grades, the decisions on the PCIe replay threshold (now link-aware) and on clock-event bit 0x08, and
+NVIDIA's text are in the detailed design §2.4.1 ("The DCGM field audit's fields"); the operator-facing rules are in the table
+above. Blackwell (B200/B300): every one of these rules is unit-tested from NVIDIA documentation, not live-verified (no B-series hardware). Changing the CSV changes the counters digest of the
+exporter pod template, so the release rolls the exporter node by node.
+
 The exporter reads the CSV only at process start and the DaemonSet mounts the ConfigMap with subPath, which a running Pod never sees
 refreshed, so a counters-only release used to update the ConfigMap and restart no Pod. The pod template of
 `deploy/dataplane/hyperpod-dcgm-exporter.yaml` now carries the annotation `gpu-fault.io/dcgm-counters-sha256` (the sha256 of the CSV
@@ -7809,7 +7833,7 @@ still caught by the DCGM collection checks (missing fields, failed scrapes).
   (`DCGM_REMOTE_HOSTENGINE_INFO`); the `host:port` form is unchanged, the URI forms need DCGM ≥ 4.5.
 - CSV format unchanged: Go `encoding/csv`, `#` comments, exactly 3 fields, types counter/gauge/untyped/label; an unknown field name
   still fails the start-up; the retired PCIe throughput fields 200/201 are now refused (not in the solution's CSV).
-- All 37 fields of the solution's CSV resolve in go-dcgm `v1.4611.2`, 24 of them as deprecated aliases kept in its legacy map (e.g.
+- All 50 fields of the solution's CSV resolve in go-dcgm `v1.4611.2`, 30 of them as deprecated aliases kept in its legacy map (e.g.
   `DCGM_FI_DEV_GPU_TEMP`, whose current name is `DCGM_FI_DEV_GPU_TEMP_CELSIUS`); the exporter renders each under the CSV's name, so
   metric names and the collector mapping are unchanged.
 - The label `Hostname` is renamed `hostname` (4.8.3, #655); with a loopback remote host engine the label is the local hostname

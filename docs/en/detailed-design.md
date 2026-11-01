@@ -678,7 +678,7 @@ The temperature policy prefers the device limits that the collector reads via `n
 | GPU fallback warning/critical | 85/90 C |
 | HBM fallback warning/critical | 90/95 C |
 | Thermal violation consecutive escalation | 2 increasing samples |
-| PCIe replay rate warning | `>8/min` |
+| PCIe replay rate warning | `>` DCGM's expected rate of the current link (31/min at Gen5 x16); `>8/min` without the link (batch 233, below) |
 | NVLink error delta critical | `>=1` |
 
 **The two scales of a temperature limit.** NVIDIA reports device temperature limits on two scales and the product never
@@ -972,6 +972,226 @@ returned by the Node Agent, together with the control-plane action, are written 
 store both the evidence URI and the fixed guidance. Each diagnostic also generates one idempotent
 `dcgm-diagnostic-zh-v2` mail whose fields come entirely from the structured result and the rule table above.
 
+**The DCGM field audit's fields (batch 233; `src/gpu_fault/gpu_field_rules.py`).** The 2026-11-01 DCGM field audit compared what
+DCGM 4.7.0 serves on the live H200 nodes (driver 580.178.04, both clusters) with the bundled counters and found fault evidence
+nothing exported. The fields below are now in `deploy/dataplane/dcgm-counters.csv` and `DCGM_METRICS`, each exported and never
+required: an exporter that does not serve one leaves its rule silent and raises no completeness error. The CSV keeps the DCGM
+4.5.3 names; the collector also reads the DCGM 4.6 names and collapses an identical pair into one observation
+(`DCGM_ENVIRONMENT_ALIASES`). Every CSV name resolves in the pinned exporter's go-dcgm `v1.4611.2` (`pkg/dcgm/const_fields.go`,
+current or legacy map); an unknown name crash-loops the exporter, and `tests/regional/test_dataplane_dcgm_counters.py` fails on
+one. No rule decides on a blank or N/A reading, in either direction: a field the H200 leaves N/A and a Blackwell part fills is
+graded by the same rule, and a rule whose input is missing decides nothing. Part gating uses architecture families (the memory
+policy's Ampere-and-later set, which names B100/B200/B300/GB200/GB300), never an exact model, and a threshold that depends on
+the PCIe link comes from the link fields, never from a fleet constant such as Gen5 x16. **Blackwell (B200/B300): every rule in
+this subsection is unit-tested from NVIDIA documentation, not live-verified (no B-series hardware).**
+
+| DCGM field (CSV name) | Canonical | Delivery | Decision |
+|---|---|---|---|
+| 1523 `DCGM_FI_DEV_GET_GPU_RECOVERY_ACTION` | `gpu_recovery_action` | state edge `gpu-recovery-action-changed` | 0 nothing; 1 Reset → CRITICAL `RESET_GPU`; 2 Reboot → CRITICAL `REBOOT_NODE` (official `RESTART_BM`); 3 Drain P2P → CRITICAL `STOP_WORKLOAD`, official `DRAIN_P2P`; 4 Drain and Reset → CRITICAL `RESET_GPU`, official `DRAIN_AND_RESET`; 5 RECOVER_IMEX_DOMAIN → CRITICAL `ESCALATE_OPERATOR`; 6 BUS_RESET, 7 SYSTEM_REBOOT and any other value → CRITICAL `QUARANTINE` (fail closed); evidence only (`NO_ACTION`) while an XID 154 owns the GPU |
+| 235/236 `DCGM_FI_DEV_PCIE_MAX_LINK_GEN`/`_WIDTH`, 237/238 `DCGM_FI_DEV_PCIE_LINK_GEN`/`_WIDTH` | `pcie_link_gen_max`, `pcie_link_width_max`, `pcie_link_gen_current`, `pcie_link_width_current`; the collector's verdict `pcie_link_downtrain` | the gauges are no edges (an idle GPU may downshift); the verdict is a breached state | downtrain under load → WARNING `RUN_DIAGNOSTICS` (`SITE_PCIE_LINK_DOWNTRAIN`); still downtrained after a GPU reset or reboot → WARNING `ESCALATE_OPERATOR`; a `PCIE_XID_LINK_FAILURE` component |
+| 346 `DCGM_FI_DEV_THRESHOLD_SRM` | `sram_threshold_exceeded` | state edge `sram-threshold-changed` | 1 → CRITICAL `DRAIN`, official `RUN_FIELD_DIAGNOSTIC_FOR_RMA` (Ampere and later; another part `QUARANTINE`, `REVIEW_GPU_ARCHITECTURE`), the `row_remap_failure` path including its `memoryDiagnostics: OBSERVE` containment prefix |
+| 388/389 `DCGM_FI_DEV_BANKS_REMAP_ROWS_AVAIL_LOW`/`_NONE` | `row_remap_banks_low`, `row_remap_banks_none` | state edge `row-remap-headroom-changed` | 389 > 0 → WARNING `RUN_DIAGNOSTICS` plus an operator notice, no automatic hardware action; 388 is context |
+| 393 (exported before) | `row_remap_uncorrectable_total` | counter | ≥ 512 without a new increment → WARNING `RUN_DIAGNOSTICS` (`NVIDIA_DCGM_ROW_REMAP_LIMIT`); a new increment keeps its delta verdict |
+| 1423 `DCGM_FI_DEV_CLOCKS_EVENT_REASON_HW_THERM_SLOWDOWN_NS` | `hw_thermal_slowdown_violation_total_us` | duty-cycle counter (ns → µs) | graded as field 241's thermal limiting time; a `THERMAL_STRESS` signal |
+| 1424 `DCGM_FI_DEV_CLOCKS_EVENT_REASON_HW_POWER_BRAKE_SLOWDOWN_NS` | `hw_power_brake_violation_total_us` | delivered every tick while brake time accrues | duty > 0 → WARNING `RUN_DIAGNOSTICS`; ≥ 1 % in two consecutive samples, or beside clock-event bit 0x80 → the brake's CRITICAL `DRAIN` (`NVIDIA_HW_POWER_BRAKE`, official `CONTACT_SUPPORT`) |
+| 300/301 `DCGM_FI_DEV_ECC_CURRENT`/`_PENDING` | `ecc_mode_current`, `ecc_mode_pending` | state edge `ecc-mode-changed` | current 0 → WARNING `ESCALATE_OPERATOR` (the memory rules are blind), official `ENABLE_ECC_AND_REBOOT`; pending ≠ current → WARNING `ESCALATE_OPERATOR`, official `REVIEW_ECC_MODE_CHANGE` |
+| 1501 `DCGM_FI_DEV_PCIE_COUNT_CORRECTABLE_ERRORS` | `pcie_correctable_error_total` | delivered only while its rate is above R (`PCIE_CORRECTABLE_RATE`) | rate > R in two consecutive windows → WARNING `RUN_DIAGNOSTICS`; the first window is evidence |
+| — (nvidia-smi `inforom.checksum_validation`) | `inforom_checksum_valid` | state edge `inforom-validity-changed` | `invalid` → WARNING `ESCALATE_OPERATOR`, official `FLASH_INFOROM`; the finding marks the GPU's memory-repair evidence untrusted |
+
+ECC mode, InfoROM, remap headroom, the downtrain and the 393 level are persistent: no validation can re-judge them, so
+`VALIDATE_GPU` does not fail on them (`gpu_field_rules.blocks_validation`), and an evidence-only finding (`NO_ACTION`) neither
+opens an incident nor fails a validation. A WARNING `ESCALATE_OPERATOR` plan is FREEZE_EVIDENCE → ESCALATE_SUPPORT; a CRITICAL
+one cordons first (FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → ESCALATE_SUPPORT).
+
+- **Recovery action (1523, `src/gpu_fault/gpu_recovery_action_policy.py`).** The XID 154 line reports a change of the driver's
+  recovery action; field 1523 holds the same NVML value as a state -- the backstop for a lost line, for a GPU already pending
+  when the collector started, and the proof of the return to None. Values 1-4 take exactly the XID 154 path's decision
+  (`xid154_outcome` is `_dynamic_recovery_resolution`'s mapping, and a test runs the engine on the kernel line of every value),
+  so 3 compiles the XID 154 drain-P2P chain (FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → [STOP_WORKLOADS] → QUIESCE_GPU_SERVICES →
+  VERIFY_NO_GPU_CLIENTS → RECOVER_DRAIN_P2P → RESTORE_GPU_SERVICES → VALIDATE_GPU → VALIDATE_FABRIC → RESTORE_SCHEDULING →
+  [RESTART_WORKLOAD]). While an XID 154 owns the GPU's recovery -- a kernel XID 154 event for it within 120 s of the batch, or
+  an open incident the XID 154 path decided -- the value is evidence only: no second workflow. After this workflow's
+  RESET_GPU, RESET_ALL_GPUS_NVSWITCHES, RECOVER_DRAIN_P2P, RESTART_NODE or REPLACE_NODE, `VALIDATE_GPU` requires every target
+  GPU's value read after that step to be 0: a value still set fails (`gpu_recovery_action_not_none(<gpu>=<label>; read after
+  step <i> <operation>)`), a target without a post-step reading waits (`awaiting_gpu_recovery_action`, bounded by the 600 s
+  step cap), and an exporter that never served the field is not judged. Evidence: DCGM Field Identifiers (docs "Version: 4.6
+  (Latest)") <https://docs.nvidia.com/datacenter/dcgm/latest/dcgm-api/dcgm-api-field-ids.html#c.DCGM_FI_DEV_GPU_RECOVERY_ACTION>:
+  "GPU Recovery Action (see nvmlDeviceGpuRecoveryAction_t for return values)"; NVIDIA GPU Memory Error Management (docs
+  version 615), "Error Recovery and Response Flags" › "Recovery action flag"
+  <https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/error-recovery-and-response-flags.html#error-recovery-and-response-flags>:
+  "Recovery action flag will be triggered for uncorrectable errors.", one entry per value, e.g. Drain P2P: "Once all
+  peer-to-peer traffic are drained, query NVML_FI_DEV_GET_GPU_RECOVERY_ACTION again, which will return one of the other
+  actions." and Drain and Reset: "After all existing work have drained, reset the GPU to regain its full capacity."; the
+  nvidia-smi documentation (v610-era page), "GPU Recovery Action": "Possible values: None, Reset, Reboot, Drain P2P, Drain and
+  Reset". Value 5: NVML API Reference change log <https://docs.nvidia.com/deploy/nvml-api/latest/change-log.html>, "Changes
+  between NVML v590 and v595": "Added new NVML_GPU_RECOVERY_ACTION_RECOVER_IMEX_DOMAIN enum to nvmlDeviceGpuRecoveryAction_s.";
+  DCGM Release Notes 4.7.0 <https://docs.nvidia.com/datacenter/dcgm/latest/release-notes/changelog.html>, "Background health
+  checks (dcgmi health)": "Added DCGM_FR_GPU_RECOVERY_IMEX_DOMAIN for the separate case in which driver recovery requires
+  restoring an IMEX domain."; DCGM v4.7.0 `dcgmlib/dcgm_errors.h` `DCGM_FR_GPU_RECOVERY_IMEX_DOMAIN_NEXT`: "Recover or
+  re-establish the IMEX domain." -- no product operation restores an IMEX domain, hence the operator. Values 6 and 7: "Changes
+  between NVML v610 and v615": "Added NVML_GPU_RECOVERY_ACTION_BUS_RESET and NVML_GPU_RECOVERY_ACTION_SYSTEM_REBOOT to
+  nvmlDeviceGpuRecoveryAction_t." (the numbers from NVIDIA's `nvidia-ml-py` 13.615.71). NVIDIA documents only the one-line
+  enum meanings, NVML API Reference (docs v615, "Last updated on Sep 09, 2026"), page "vGPU Structs", enum
+  `nvmlDeviceGpuRecoveryAction_t`
+  <https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlVgpuStructs.html#_CPPv429nvmlDeviceGpuRecoveryAction_t>:
+  "NVML_GPU_RECOVERY_ACTION_RECOVER_IMEX_DOMAIN Recover IMEX Domain.", "NVML_GPU_RECOVERY_ACTION_BUS_RESET Reset the GPU’s
+  PCIe bus.", "NVML_GPU_RECOVERY_ACTION_SYSTEM_REBOOT Reboot the system." -- no procedure and no nvidia-smi label, so 6 and 7
+  fail closed like a value NVIDIA does not document. 6 is not the product's RESET_GPU: the node action runs `nvidia-smi
+  --gpu-reset -i <uuid>` with no reset type, a Function Level Reset (nvidia-smi documentation, "-r, --gpu-reset": "Reset
+  triggered without extra arguments, will be a default Function Level Reset (FLR). To issue a Bus Reset, use -r bus. For
+  certain platforms only Function Level Reset is possible."; pinned by `tests/node_agent/test_reset_is_function_level.py`).
+  7 is not the node reboot of value 2, which nvidia-smi qualifies as "OS warm reboot is sufficient (no need for AC/DC
+  cycle)". DCGM's own health check is no backstop for either: DCGM v4.7.0 `modules/health/DcgmHealthWatch.cpp` logs a value
+  above RECOVER_IMEX_DOMAIN as "Invalid GPU recovery action value" and ignores it.
+- **PCIe link downtrain (235-238, `src/gpu_fault/gpu_pcie_link_policy.py`, `src/gpu_fault/collectors/gpu/pcie_link.py`).** The
+  edge filter delivers only edges and summaries, so the collector counts: a sample is valid when all four link values are
+  positive, current ≤ maximum and the GPU's utilization in the same scrape is ≥ 50 %; three consecutive valid samples below the
+  maximum in this collector process (it never outlives a boot, and a quiesce or reset window stops it) publish
+  `pcie_link_downtrain` = 1, a valid sample at the maximum publishes 0, an idle or incomplete sample carries the verdict. The
+  maximum is the device and system one, never a fleet constant: a platform that offers Gen4 to a Gen5 GPU is no downtrain, and
+  a Gen6 link (DGX B300) is full only at Gen6. P-state is not a load signal: the live H200s report P0 at 0 % utilization. A
+  downtrain already active that outlived a completed RESET_GPU naming the GPU, a full GPU + NVSwitch reset or a reboot since it
+  was last judged → `ESCALATE_OPERATOR`, official `RECONNECT_PCIE_AND_RUN_FIELD_DIAGNOSTIC` (DCGM v4.7.0
+  `DCGM_FR_PCI_REPLAY_RATE_NEXT`: "Reconnect PCIe card. Run system side PCIE diagnostic utilities to verify hops off the GPU
+  board. If issue is on the board, run the field diagnostic."). A confirmed downtrain joins a trusted same-GPU XID 32/79 into
+  `PCIE_XID_LINK_FAILURE` like the replay rate does. Evidence: nvidia-smi documentation
+  <https://docs.nvidia.com/deploy/nvidia-smi/index.html> (the v610-era page), GPU ATTRIBUTES › PCI › GPU Link information,
+  Current: "The current link generation and width. These may be reduced when the GPU is not in use."; Max: "The maximum link
+  generation and width possible with this GPU and system configuration."; NVML API Reference (v615)
+  `nvmlDeviceGetMaxPcieLinkGeneration` <https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlDeviceQueries.html>:
+  "Retrieves the maximum PCIe link generation possible with this device and system."; NVIDIA DGX B300 User Guide,
+  "Introduction to NVIDIA DGX B300" › "Key Enhancements Over Previous DGX Systems"
+  <https://docs.nvidia.com/dgx/dgxb300-user-guide/introduction-to-dgxb300.html#key-enhancements-over-previous-dgx-systems>:
+  "ConnectX-8 networking connects directly to GPUs via PCIe Gen6."
+- **PCIe replay threshold (202, decision 3a).** NVIDIA's documentation states one figure, from the Gen3 era: DCGM Feature
+  Overview (docs 4.6), "Background Health Checks" › "Failure Conditions"
+  <https://docs.nvidia.com/datacenter/dcgm/latest/user-guide/feature-overview.html#background-health-checks>: "There were more
+  than 8 PCIe replays in the last minute."; DCGM Diagnostics (docs 4.6), PCIe plugin parameter `max_pcie_replays`
+  <https://docs.nvidia.com/datacenter/dcgm/latest/user-guide/dcgm-diagnostics.html#pcie-gpu-bandwidth-plugin>: "This is based
+  on an expected replay rate less than per minute for PCIe Gen 3.0, assuming this plugin will run for less than a minute and
+  allowing 10x as many replays before failure." (the number is missing in NVIDIA's text; the default 80 is 10 × 8). The DCGM
+  health check itself scales the rate with the current link: DCGM v4.7.0 `modules/health/DcgmHealthWatch.cpp`
+  <https://github.com/NVIDIA/DCGM/blob/v4.7.0/modules/health/DcgmHealthWatch.cpp> `GetExpectedPcieReplayRate` reads
+  `DCGM_FI_DEV_PCIE_LINK_GEN`/`_WIDTH` (237/238) and returns ceil(per-lane rate × lanes) ("Expected replay rate = Replay
+  rate per lane * Num of pcie Lanes. Note that value is ceiled.") with the per-lane rates 0.15, 0.3,
+  0.48, 0.96, 1.92 and 3.84 errors/min for Gen1-Gen6 ("(1x10^-12) * (<line rate>x10^9) * 60"; a newer generation is capped:
+  "Cap the version at the max we know about."), and `MonitorPcie` warns "Detected more than %u PCIe replays per minute"
+  (`DCGM_FR_PCI_REPLAY_RATE_MSG`). Gen3 x16 gives exactly the documented 8. The product uses that formula
+  (`gpu_pcie_link_policy.expected_pcie_error_rate`): with the current link in the scrape the threshold is DCGM's rate for it
+  (`NVIDIA_DCGM_REPLAY_RATE_FOR_LINK`: 31/min at Gen5 x16 -- the live H200 -- 62/min at Gen6 x16, 16/min at Gen4 x16), without
+  it the documented 8/min (`NVIDIA_DCGM_DOCUMENTED_REPLAY_RATE`; DCGM itself then decides nothing), and a configured
+  `GPU_FAULT_PCIE_REPLAY_RATE_WARNING_PER_MINUTE` other than 8 still wins (`SITE_CONFIGURED_REPLAY_RATE`). The finding records
+  the threshold in `threshold_value`/`threshold_source`; the reason text is unchanged. Live consequence: on the H200 sites
+  (Gen5 x16) a replay rate between 8 and 31/min no longer warns.
+- **PCIe correctable errors (1501).** Graded by rate only, never on any change: occasional correctable errors are normal and the
+  counter restarts with a GPU reset. NVIDIA documents no health threshold for it (NVML
+  <https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlFieldValueEnums.html#c.NVML_FI_DEV_PCIE_COUNT_CORRECTABLE_ERRORS>:
+  "PCIe Correctable Errors Counter."). R is the lower of two NVIDIA figures
+  (`gpu_pcie_link_policy.correctable_rate_bound`): the expected error rate of the current link (the replay formula above, one
+  bit error per 10^12 bits; `threshold_source` `NVIDIA_DCGM_ERROR_RATE_FOR_LINK`) and the corrected-error rate DCGM's PCIe
+  diagnostic tolerates for this very field (`NVIDIA_DCGM_DIAG_AER_RATE`): DCGM v4.7.0 `nvvs/plugin_src/pcie/Pcie.cpp`
+  <https://github.com/NVIDIA/DCGM/blob/v4.7.0/nvvs/plugin_src/pcie/Pcie.cpp> `BusGrind::GetAERThresholdRate` fails the test
+  above 32 corrected errors per minute at a Gen5 x16 maximum link (fields 235/236; also its default when it cannot read the
+  maximum, "default value for H100 systems"; `aer_threshold` 480 "32/minute * 15 minutes") and above 16 at any other ("/*
+  Default is hopper, but fall back for other devices */"). The two agree only at Gen5 x16 (31 against 32) and Gen4 x16 (16
+  against 16); at Gen6 x16 (DGX B300) the formula gives 62 and the diagnostic 16, four times tighter, so R is 16 there
+  ([validation limitations](../validation-limitations.md)). Without the current link the rule decides nothing. Besides the
+  baseline and the health summaries the collector delivers the field only while its rate between consecutive readings is above
+  R; the control plane grades a rate above R in two consecutive windows WARNING `RUN_DIAGNOSTICS` (`SITE_PCIE_CORRECTABLE_RATE`),
+  the first window evidence only. A confirmed
+  rate is a `PCIE_XID_LINK_FAILURE` component. Live: 0 on every H200, and the guest has no sysfs AER file for the GPU, so DCGM
+  is the only source.
+- **SRAM threshold (346).** NVIDIA GPU Memory Error Management (docs version 615), "RMA Policy" › "GPU L2 Memory RMA Policy"
+  <https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/rma-policy-thresholds-for-row-remapping.html#gpu-l2-memory-rma-policy>:
+  "The NVIDIA Field Diagnostic tool will determine whether a GPU qualifies for RMA. Regarding SRAM uncorrectable errors, the RMA
+  criteria is met for events outlined below. Any of the following events will trigger the SRAM Threshold Exceeded flag:" --
+  an RMA criterion the field diagnostic decides, so the flag takes `row_remap_failure`'s path in `memory_decision`: CRITICAL
+  `DRAIN`, official `RUN_FIELD_DIAGNOSTIC_FOR_RMA` on the Ampere-and-later set, `QUARANTINE` with `REVIEW_GPU_ARCHITECTURE` on
+  any other part; under `memoryDiagnostics: OBSERVE` the containment prefix (FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → QUARANTINE
+  → COLLECT_DIAGNOSTIC_BUNDLE) runs before the block (b192).
+- **Remap headroom (388/389) and the 393 limit.** nvidia-smi documentation, "Row Remapper" › "Bank Remap Availability
+  Histogram": "Maximum availability means that all reserved rows are available for remapping while None means that no reserved
+  rows are available."; DCGM Field Identifiers (docs 4.6), `DCGM_FI_DEV_BANK_REMAP_AVAIL_NONE 389`: "Historical marker of
+  memory banks with no available spare memory rows." What the next uncorrectable error on such a bank does depends on the
+  family, NVIDIA GPU Memory Error Management (docs version 615), "RMA Policy" › "GPU DRAM Memory RMA Policy"
+  <https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/rma-policy-thresholds-for-row-remapping.html#gpu-dram-memory-rma-policy>:
+  "For Blackwell GPUs, a third remapping attempt for an uncorrectable memory error on a bank invokes HBM channel repair if
+  there is a spare channel available. If the channel repair is successful, the hardware will be recovered and ready to use.
+  Otherwise, the GPU will continue remapping until Row-Remap Failure flag is set."; otherwise the attempt sets the
+  row-remapping failure flag ("A remapping attempt for an uncorrectable memory error on a bank that already has eight
+  uncorrectable error rows remapped."). 389 > 0 is WARNING `RUN_DIAGNOSTICS` (`NVIDIA_ROW_REMAP_HEADROOM_NONE`) with an
+  operator-review notice and no automatic hardware action, and the reason says which: channel repair on the Blackwell family
+  (B100/B200/B300/GB200/GB300), "cannot be remapped ... plan the replacement" on the other Ampere-and-later parts, "not
+  recognised" elsewhere; 388 (low) is exported as context. The same page lists "After 512 total remappings for an
+  uncorrectable memory error have occurred." among the row-remapping failure triggers. Field 393: DCGM Release Notes 4.6.0,
+  "Background health checks (dcgmi health)"
+  <https://docs.nvidia.com/datacenter/dcgm/latest/release-notes/changelog.html>: "Health monitoring now warns when total
+  uncorrectable row remaps reach 512 on Ampere and newer GPUs, allowing administrators to run field diagnostics before GPU
+  memory health degrades further."; DCGM v4.7.0 `common/DcgmGPUHardwareLimits.h`: `#define
+  DCGM_LIMIT_MAX_ROW_REMAP_UNCORRECTABLE 512` ("This number of uncorrectable row remaps indicates GPU is in a bad state"),
+  compared with `>=`. At or above 512 without a new increment the level is WARNING `RUN_DIAGNOSTICS`
+  (`NVIDIA_DCGM_ROW_REMAP_LIMIT`, official `RUN_FIELD_DIAGNOSTIC_FOR_RMA`); a new uncorrectable remap keeps its existing delta
+  verdict.
+- **HW slowdown times (1423/1424).** Cumulative nanosecond counters graded as duty cycles, never on any change: NVML API
+  Reference (v615), Field Value Enums <https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlFieldValueEnums.html>:
+  "Field values for Clock Throttle Reason Counters All counters are in nanoseconds."; DCGM Field Identifiers (docs 4.6), 1423:
+  "Throttling due to temperature being too high (reducing core clocks by a factor of 2 or more) in ns."; NVML clock event
+  reasons <https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlClocksEventReasons.html>,
+  `nvmlClocksThrottleReasonHwPowerBrakeSlowdown`: "HW Power Brake Slowdown (reducing the core clocks by a factor of 2 or more) is
+  engaged. This is an indicator of: External Power Brake Assertion being triggered (e.g. by the system power supply)". DCGM
+  v4.7.0 `sdk/nvidia/nvml/dcgm_nvml.h` reads them as NVML fields 270/271, the numbering of NVML v580 ("Changes between v575 and
+  v580": "Adjusted NVML_FI_DEV_CLOCKS_EVENT_REASON_* and NVML_FI_DEV_POWER_SYNC_BALANCING_* field value numbering to resolve
+  overlap with NVML_FI_PWR_SMOOTHING_* field values."), so a driver 580 host reads the right counter. That the counters are
+  cumulative is NVIDIA's wording, not a live observation (0 on every idle H200); the grading fails safe: a decrease is a counter
+  reset and grades nothing, a duty above 105 % is no duration and grades nothing. 1423 is graded as the thermal violation time
+  (241) is (`thermal_duration_decision`) and feeds `THERMAL_STRESS`; 1424 brake time > 0 is WARNING `RUN_DIAGNOSTICS`
+  (`NVIDIA_HW_POWER_BRAKE_DURATION`), ≥ 1 % of two consecutive samples (≤ 60 s apart) or any brake time beside bit 0x80 in the
+  same scrape is the existing brake verdict, CRITICAL `DRAIN`, `NVIDIA_HW_POWER_BRAKE`, official `CONTACT_SUPPORT`. VALIDATE_GPU
+  treats both like the existing thermal and power WARNING families (grace and newer-batch wait).
+- **ECC mode (300/301).** NVML API Reference (v615), Device Queries
+  <https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlDeviceQueries.html>, `nvmlDeviceGetMemoryErrorCounter`:
+  "Requires ECC Mode to be enabled." -- with ECC off every memory rule is blind, so current = 0 is WARNING `ESCALATE_OPERATOR`
+  (`NVIDIA_ECC_MODE_DISABLED`); `nvmlDeviceGetEccMode`: "Changing ECC modes requires a reboot. The “pending” ECC mode refers to
+  the target mode following the next reboot." -- pending ≠ current is WARNING `ESCALATE_OPERATOR` (`NVIDIA_ECC_MODE_PENDING`):
+  the mode changes at the next reboot. Live: 1/1 on every H200.
+- **InfoROM validity.** DCGM field 84 (`DCGM_FI_DEV_INFOROM_CONFIG_VALID`) "Reads the infoROM from the flash and verifies the
+  checksums." on every watch, so it stays out of the per-tick counters; the collector reads the same check once per inventory
+  interval (60 s by default) with `nvidia-smi --query-gpu=index,pci.bus_id,uuid,inforom.checksum_validation
+  --format=csv,noheader` (`src/gpu_fault/collectors/gpu/inforom.py`; nvidia-smi documentation: "Inforom checksum validation
+  ("valid", "invalid", "N/A") Only available via --query-gpu inforom.checksum_validation", added in nvidia-smi v575) and
+  publishes `inforom_checksum_valid` beside every scrape (1 valid, 0 invalid, N/A nothing; a failed query keeps nothing).
+  `invalid` is WARNING `ESCALATE_OPERATOR`, official `FLASH_INFOROM` (DCGM v4.7.0 `DCGM_FR_CORRUPT_INFOROM_NEXT`: "Flash the
+  InfoROM to clear this corruption."), and the finding says the GPU's memory-repair evidence is untrusted: Dynamic Page
+  Retirement (docs 615), "Implementation"
+  <https://docs.nvidia.com/deploy/dynamic-page-retirement/implementation.html#implementation>: "These addresses are stored in
+  the InfoROM." Like every batch-233 field it is read in the DCGM exporter mode only; the nvidia-smi metrics mode carries none
+  of them.
+- **Clock-event bit 0x08 alone (decision 3c): not graded.** nvidia-smi documentation, "Clocks Event Reasons" › "HW Slowdown":
+  "This option will be removed a future CUDA release. HW Slowdown is engaged, reducing the core clocks by a factor of 2 or more.
+  It is active if either HW Thermal Slowdown or HW Power Brake are active." -- 0x08 is the OR of 0x40 (graded with 0x20 as
+  thermal limiting, now also by field 1423's duration) and 0x80 (the brake DRAIN, now also by field 1424's duration). NVML
+  `nvmlClocksThrottleReasonHwSlowdown` (same clock-event page): "HW Slowdown (reducing the core clocks by a factor of 2 or more)
+  is engaged. This is an indicator of: temperature being too high External Power Brake Assertion is triggered (e.g. by the
+  system power supply) Power draw is too high and Fast Trigger protection is reducing the clocks May be also reported during
+  PState or clock change This behavior may be removed in a later release." -- the only further causes are a power-draw
+  protection and a P-state or clock-change artefact, and NVIDIA marks the bit for removal, so a finding on 0x08 without
+  0x40/0x80 would rest on a bit with no stable meaning (`gpu_environment_policy.HW_SLOWDOWN_MASK`, pinned by a test). The
+  bits NVML v615 adds grade nothing either (`NVML_UNGRADED_CLOCK_EVENT_BITS`, pinned): `nvmlClocksEventReasonBoardLimit`
+  "The board limit (operating) policy is currently limiting the GPU clocks." and `nvmlClocksEventReasonReliability` "The
+  reliability policy is currently limiting the GPU clocks." (values 0x200 and 0x400 from `nvidia-ml-py` 13.615.71); an unknown
+  bit neither grades nor hides the bits the product names.
+- **Not added.** 174/175 (NVLink fabric health) are NOT_SUPPORTED on H200 with driver 580 (live 0/0, XML N/A); 1508 (per-link
+  NVLink state) is served live (18/18 ACTIVE) but the exporter's link-entity emission and the parser keys need a staging check
+  and it costs 144 series per node, so it is deferred; 158 is the T.Limit critical boundary again (live 87 − (−2) = 89, b232);
+  profiling fields stay out ("collection of profiling metrics with DCGM will conflict with usage of other developer tools from
+  NVIDIA such as Nsight Systems or Nsight Compute", DCGM Feature Overview, docs 4.6); NVSwitch-entity fields stay out because
+  the SXID lines carry the same faults in more detail. Blackwell-only fields (NVLink5 counters 1200-1219/1404-1419, NVLink ECC
+  1220, 174/175 on NVLink5 systems, unrepairable memory 1507) are classified separately; adding one is a CSV row, a
+  `DCGM_METRICS` entry, a branch of `gpu_field_rules.field_rule_decision` (or the policy module it names) and a pin row.
+  Tests: `tests/metrics/test_dcgm_gap_field_rules.py`, `tests/collectors/test_dcgm_gap_field_edges.py`,
+  `tests/orchestration/test_dcgm_gap_field_plans.py`, `tests/execution/test_validation_gpu_recovery_action.py`,
+  `tests/regional/test_dataplane_dcgm_counters.py`, and the evidence pins in `tests/test_dcgm_gap_field_evidence.py`.
+
 **NVLink fabric registration state (`src/gpu_fault/gpu_fabric_manager.py`).** On a graded NVSwitch node -- a Hopper SXM
 part on third-generation NVSwitch baseboards (H100/H200/H800/H20) or an HGX B200/B300 on fourth-generation NVSwitches (NVL5;
 the driver names the parts `NVIDIA B200` and `NVIDIA B300 SXM6 AC`) -- every GPU registers with the NVLink fabric that Fabric
@@ -1172,7 +1392,7 @@ from it (`app/ingest/gpu_findings`: event id `gpu-<finding id>` → `inc-gpu-<fi
 | `THERMAL_STRESS` | GPU/HBM temperature finding + thermal violation or thermal throttle bit | Diagnostics first; `DRAIN` after 2 consecutive hits by default |
 | `POWER_LIMIT_THROTTLING` | power violation + power usage reaching the configured ratio of the limit + high utilization + no temperature finding | Power-limit context, diagnostics; does not directly rule hardware damage |
 | `GPU_MEMORY_DEGRADATION` | DBE/uncorrectable remap + pending/failed repair or pending retired page | `DRAIN`, Field Diagnostic/RMA evidence |
-| `PCIE_XID_LINK_FAILURE` | PCIe replay rate finding + XID 32/79 on the same GPU inside the window (a trusted kernel event, or a change of the DCGM last-XID gauge inside the window; an expired gauge does not join) | `DRAIN` and retain the combined PCIe/XID evidence |
+| `PCIE_XID_LINK_FAILURE` | PCIe replay rate finding (from batch 233 also a confirmed `pcie_link_downtrain` or `pcie_correctable_error_total` rate finding) + XID 32/79 on the same GPU inside the window (a trusted kernel event, or a change of the DCGM last-XID gauge inside the window; an expired gauge does not join) | `DRAIN` and retain the combined PCIe/XID evidence |
 | `NVLINK_LINK_DEGRADATION` | at least two kinds of NVLink error finding on the same GPU | `DRAIN` and run link/fabric diagnostics |
 | `MULTI_GPU_NVLINK_FABRIC_FAILURE` | at least two GPUs on the same node with NVLink error findings | Generate one node-level composite and `DRAIN` |
 | `CORRECTABLE_MEMORY_DEGRADATION` | at least two of SBE, retired SBE page and correctable row-remap increasing at the same time | WARNING/diagnostics first; after 3 consecutive hits by default the same composite is re-graded CRITICAL (action still diagnostics, the same incident updated) and the running VALIDATE_GPU fails on the CRITICAL finding and `DRAIN`s through the existing ladder |

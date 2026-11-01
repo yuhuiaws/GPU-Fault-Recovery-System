@@ -47,7 +47,14 @@ START = next_stable_phase(
     interval_seconds=SUMMARY_SECONDS,
 ) + timedelta(seconds=1)
 GPUS = {"GPU-a": ("0", "00000000:97:00.0"), "GPU-b": ("1", "00000000:A8:00.0")}
-VALUES = {"DCGM_FI_DEV_GPU_TEMP": 40, "DCGM_FI_DEV_POWER_MGMT_LIMIT": 700}
+VALUES = {
+    "DCGM_FI_DEV_GPU_TEMP": 40,
+    "DCGM_FI_DEV_POWER_MGMT_LIMIT": 700,
+    # ECC enabled: a healthy GPU (ECC disabled is graded since batch 233).
+    "DCGM_FI_DEV_ECC_CURRENT": 1,
+    "DCGM_FI_DEV_ECC_MODE": 1,
+    "DCGM_FI_DEV_ECC_PENDING": 1,
+}
 PCIE = "DCGM_FI_DEV_PCIE_REPLAY_COUNTER"
 ROW_REMAP_FAILURE = "DCGM_FI_DEV_ROW_REMAP_FAILURE"
 INVALID = "invalid or ambiguous GPU observation"

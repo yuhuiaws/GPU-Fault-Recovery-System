@@ -636,6 +636,11 @@ def test_dcgm_inventory_delivery_is_independent_of_edge_filter(
             return subprocess.CompletedProcess(
                 command, 0, stdout="<nvidia_smi_log></nvidia_smi_log>", stderr=""
             )
+        if "inforom.checksum_validation" in command[1]:
+            # The InfoROM probe (batch 233) shares the inventory cadence.
+            return subprocess.CompletedProcess(
+                command, 0, stdout="0, 00000000:B9:00.0, GPU-a, valid\n", stderr=""
+            )
         assert "--query-gpu=index,uuid,pci.bus_id,name" in command
         return subprocess.CompletedProcess(
             command, 0, stdout=("0, GPU-a, 00000000:B9:00.0, NVIDIA H100\n"), stderr=""

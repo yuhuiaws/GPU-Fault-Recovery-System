@@ -187,7 +187,9 @@ GB300 belongs to the GB200 column.
   `DRAIN_AND_RESET`.
 - XID 94/95: application/all-applications containment are stored separately; XID 95 requires the affected workload to be stopped before
   the reset.
-- XID 154: the driver-reported action takes precedence and is mapped as-is.
+- XID 154: the driver-reported action takes precedence and is mapped as-is. DCGM field 1523 holds the same value as a
+  state (batch 233): values 1-4 take the XID 154 decision of the same label, and the value is evidence only while an XID
+  154 owns the GPU's recovery (see "Evidence: the DCGM field audit rules" below).
 - XID 159 `CHECK_UVM`: reset when UVM/vGPU use is explicitly confirmed, otherwise ignore; blocked when evidence is missing.
 - XID 144-150: selects the V1/V2 `IntrInfo` pattern by the driver R575 boundary, matching
   Error Status and Action 2 at the same time. The primary action and Action 2 may use different bit patterns and are matched separately;
@@ -258,6 +260,66 @@ cap. `RECOVER_DRAIN_P2P` (it can succeed with `reset_skipped`), `REMEDIATE_DRIVE
 `REPLACE_NODE` do not count as applying the repair. Implementation `src/gpu_fault/adapters/pending_repair_rejudge.py`; the
 quotes are pinned by `tests/execution/test_validation_pending_repair_after_reset.py`. The gap was latent, found by code
 reading and never seen live (see the DCGM diagnostics section of [Detailed Design](../detailed-design.md)).
+
+### Evidence: the DCGM field audit rules (batch 233)
+
+Every page below was re-fetched on 2026-11-01; NVML and NVIDIA GPU Memory Error Management are docs version 615 (pages
+"Last updated on Sep 09, 2026"), the DCGM pages "Version: 4.6 (Latest)", the DCGM source tag v4.7.0. The full quotes and the
+decisions are in the detailed design §2.4.1, "The DCGM field audit's fields"; each quote is pinned by
+`tests/test_dcgm_gap_field_evidence.py`.
+
+- GPU recovery action (1523): GPU Memory Error Management, "Error Recovery and Response Flags"
+  `https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/error-recovery-and-response-flags.html#error-recovery-and-response-flags`
+  "Recovery action flag will be triggered for uncorrectable errors."; NVML API Reference, "vGPU Structs",
+  `nvmlDeviceGpuRecoveryAction_t`
+  `https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlVgpuStructs.html#_CPPv429nvmlDeviceGpuRecoveryAction_t`
+  "NVML_GPU_RECOVERY_ACTION_RECOVER_IMEX_DOMAIN Recover IMEX Domain.", "NVML_GPU_RECOVERY_ACTION_BUS_RESET Reset the GPU’s
+  PCIe bus.", "NVML_GPU_RECOVERY_ACTION_SYSTEM_REBOOT Reboot the system."; DCGM Release Notes 4.7.0
+  `https://docs.nvidia.com/datacenter/dcgm/latest/release-notes/changelog.html` "Added DCGM_FR_GPU_RECOVERY_IMEX_DOMAIN for
+  the separate case in which driver recovery requires restoring an IMEX domain."; NVML API Reference change log
+  `https://docs.nvidia.com/deploy/nvml-api/latest/change-log.html`, "Changes between NVML v610 and v615": "Added
+  NVML_GPU_RECOVERY_ACTION_BUS_RESET and NVML_GPU_RECOVERY_ACTION_SYSTEM_REBOOT to nvmlDeviceGpuRecoveryAction_t."; nvidia-smi
+  documentation
+  `https://docs.nvidia.com/deploy/nvidia-smi/index.html`, "-r, --gpu-reset": "Reset triggered without extra arguments, will
+  be a default Function Level Reset (FLR). To issue a Bus Reset, use -r bus."
+- PCIe link (235-238): nvidia-smi documentation, GPU ATTRIBUTES › PCI › GPU Link information: "The current link generation
+  and width. These may be reduced when the GPU is not in use.", "The maximum link generation and width possible with this
+  GPU and system configuration."; NVIDIA DGX B300 User Guide
+  `https://docs.nvidia.com/dgx/dgxb300-user-guide/introduction-to-dgxb300.html#key-enhancements-over-previous-dgx-systems`
+  "ConnectX-8 networking connects directly to GPUs via PCIe Gen6."
+- PCIe replay (202) and correctable errors (1501): DCGM Feature Overview, "Background Health Checks" › "Failure Conditions"
+  `https://docs.nvidia.com/datacenter/dcgm/latest/user-guide/feature-overview.html#background-health-checks` "There were
+  more than 8 PCIe replays in the last minute."; DCGM v4.7.0 `modules/health/DcgmHealthWatch.cpp`
+  `https://github.com/NVIDIA/DCGM/blob/v4.7.0/modules/health/DcgmHealthWatch.cpp` "Expected replay rate = Replay rate per
+  lane * Num of pcie Lanes. Note that value is ceiled."; DCGM v4.7.0 `nvvs/plugin_src/pcie/Pcie.cpp`
+  `https://github.com/NVIDIA/DCGM/blob/v4.7.0/nvvs/plugin_src/pcie/Pcie.cpp` "/* Default is hopper, but fall back for other
+  devices */"; NVML API Reference, "Field Value Enums"
+  `https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlFieldValueEnums.html#c.NVML_FI_DEV_PCIE_COUNT_CORRECTABLE_ERRORS`
+  "PCIe Correctable Errors Counter." (no health threshold).
+- SRAM threshold (346), no spare rows (389), uncorrectable remaps (393): GPU Memory Error Management, "RMA Policy"
+  `https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/rma-policy-thresholds-for-row-remapping.html#gpu-l2-memory-rma-policy`
+  "Any of the following events will trigger the SRAM Threshold Exceeded flag:"; the same page, "GPU DRAM Memory RMA Policy"
+  `https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/rma-policy-thresholds-for-row-remapping.html#gpu-dram-memory-rma-policy`: "For Blackwell GPUs, a third remapping attempt for an uncorrectable memory error on a bank
+  invokes HBM channel repair if there is a spare channel available."; DCGM Release Notes 4.6.0 "Health monitoring now warns
+  when total uncorrectable row remaps reach 512 on Ampere and newer GPUs, allowing administrators to run field diagnostics
+  before GPU memory health degrades further."
+- HW slowdown times (1423/1424) and clock-event bits: NVML API Reference, "Field Value Enums"
+  `https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlFieldValueEnums.html` "Field values for Clock Throttle
+  Reason Counters All counters are in nanoseconds."; NVML API Reference, "Clocks Event Reasons"
+  `https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlClocksEventReasons.html`, `nvmlClocksThrottleReasonHwSlowdown`:
+  "May be also reported during PState or clock change This behavior may be removed in a later release."
+- ECC mode (300/301) and InfoROM: NVML API Reference, "Device Queries"
+  `https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlDeviceQueries.html` "Requires ECC Mode to be enabled.";
+  Dynamic Page Retirement, "Implementation"
+  `https://docs.nvidia.com/deploy/dynamic-page-retirement/implementation.html#implementation` "These addresses are stored in
+  the InfoROM."
+
+Conclusion: values 1-4 of field 1523 take the XID 154 decision of the same label; RECOVER_IMEX_DOMAIN goes to an operator;
+BUS_RESET, SYSTEM_REBOOT and undocumented values fail closed (NVIDIA documents only one-line enum meanings for 6 and 7, and
+the product's GPU reset is an FLR, not a bus reset). The PCIe replay threshold follows DCGM's health formula for the current
+link (8/min only without a link reading); the correctable-error limit is the lower of that formula and DCGM's PCIe
+diagnostic limit. Blackwell (B200/B300) behaviour is unit-tested from NVIDIA documentation, not live-verified (no B-series
+hardware).
 
 ## SXID
 

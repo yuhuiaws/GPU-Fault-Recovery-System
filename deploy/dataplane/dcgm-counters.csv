@@ -15,6 +15,9 @@ DCGM_FI_DEV_CLOCK_THROTTLE_REASONS, gauge, Active clock throttle reason bitmask
 DCGM_FI_DEV_XID_ERRORS, gauge, Last XID error code
 DCGM_FI_DEV_FABRIC_MANAGER_STATUS, gauge, NVLink fabric registration state (dcgmFabricManagerStatus_t: 0 not supported / 1 not started / 2 in progress / 3 success / 4 failure)
 DCGM_FI_DEV_FABRIC_MANAGER_ERROR_CODE, gauge, DCGM return code of a completed NVLink fabric registration (0 = OK; no sample until registration completes)
+DCGM_FI_DEV_GET_GPU_RECOVERY_ACTION, gauge, Driver GPU recovery action (nvmlDeviceGpuRecoveryAction_t: 0 none / 1 reset / 2 reboot / 3 drain P2P / 4 drain and reset / 5 recover IMEX domain / 6 bus reset / 7 system reboot)
+DCGM_FI_DEV_ECC_CURRENT, gauge, Current ECC mode (1 enabled / 0 disabled)
+DCGM_FI_DEV_ECC_PENDING, gauge, ECC mode after the next reboot (1 enabled / 0 disabled)
 DCGM_FI_DEV_ECC_SBE_VOL_TOTAL, counter, Volatile corrected ECC errors
 DCGM_FI_DEV_ECC_DBE_VOL_TOTAL, counter, Volatile uncorrected ECC errors
 DCGM_FI_DEV_ECC_SBE_AGG_TOTAL, counter, Aggregate corrected ECC errors
@@ -24,9 +27,17 @@ DCGM_FI_DEV_RETIRED_DBE, counter, Pages retired for uncorrected ECC errors
 DCGM_FI_DEV_RETIRED_PENDING, gauge, Pages pending retirement
 DCGM_FI_DEV_ROW_REMAP_FAILURE, gauge, Row remap failure status
 DCGM_FI_DEV_ROW_REMAP_PENDING, gauge, Row remap pending status
+DCGM_FI_DEV_THRESHOLD_SRM, gauge, SRAM threshold exceeded (1 = an RMA criterion is met)
 DCGM_FI_DEV_CORRECTABLE_REMAPPED_ROWS, counter, Correctable remapped rows
 DCGM_FI_DEV_UNCORRECTABLE_REMAPPED_ROWS, counter, Uncorrectable remapped rows
+DCGM_FI_DEV_BANKS_REMAP_ROWS_AVAIL_LOW, gauge, Memory banks with low spare-row availability for remapping
+DCGM_FI_DEV_BANKS_REMAP_ROWS_AVAIL_NONE, gauge, Memory banks with no spare row left for remapping
 DCGM_FI_DEV_PCIE_REPLAY_COUNTER, counter, PCIe replay counter
+DCGM_FI_DEV_PCIE_COUNT_CORRECTABLE_ERRORS, counter, PCIe correctable errors
+DCGM_FI_DEV_PCIE_MAX_LINK_GEN, gauge, PCIe maximum link generation of this GPU and system
+DCGM_FI_DEV_PCIE_MAX_LINK_WIDTH, gauge, PCIe maximum link width in lanes of this GPU and system
+DCGM_FI_DEV_PCIE_LINK_GEN, gauge, PCIe current link generation (may drop while the GPU is idle)
+DCGM_FI_DEV_PCIE_LINK_WIDTH, gauge, PCIe current link width in lanes (may drop while the GPU is idle)
 DCGM_FI_DEV_NVLINK_CRC_FLIT_ERROR_COUNT_TOTAL, counter, NVLink CRC flit errors
 DCGM_FI_DEV_NVLINK_CRC_DATA_ERROR_COUNT_TOTAL, counter, NVLink CRC data errors
 DCGM_FI_DEV_NVLINK_REPLAY_ERROR_COUNT_TOTAL, counter, NVLink replay errors
@@ -36,3 +47,5 @@ DCGM_FI_DEV_NVLINK_ERROR_DL_RECOVERY, counter, Aggregate NVLink recovery errors
 DCGM_FI_DEV_NVLINK_ERROR_DL_REPLAY, counter, Aggregate NVLink replay errors
 DCGM_FI_DEV_POWER_VIOLATION, counter, Power violation duration in nanoseconds
 DCGM_FI_DEV_THERMAL_VIOLATION, counter, Thermal violation duration in nanoseconds
+DCGM_FI_DEV_CLOCKS_EVENT_REASON_HW_THERM_SLOWDOWN_NS, counter, Time spent in HW thermal slowdown in nanoseconds
+DCGM_FI_DEV_CLOCKS_EVENT_REASON_HW_POWER_BRAKE_SLOWDOWN_NS, counter, Time spent in HW power brake slowdown in nanoseconds

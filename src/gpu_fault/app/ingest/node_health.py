@@ -44,6 +44,9 @@ OPERATOR_REVIEW_METRICS = frozenset(
         # (GF-GENERAL-LIVE-012 expectation_wrong) -- a configuration error
         # for a human, graded WARNING / evidence only, never a reboot.
         "gpu_expected_count_contradicted",
+        # b233, DCGM field 389: banks with no spare row left. RUN_DIAGNOSTICS
+        # and an operator notice; no automatic hardware action.
+        "row_remap_banks_none",
     }
 )
 

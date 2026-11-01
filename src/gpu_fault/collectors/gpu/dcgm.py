@@ -34,14 +34,39 @@ from gpu_fault.collectors.gpu.completeness import (
     CollectionErrorEdges,
     completeness_errors,
 )
+from gpu_fault.collectors.gpu.field_edges import (
+    RATE_GRADED_COUNTERS,
+    CorrectableRateGate,
+    power_brake_candidate,
+    state_breached,
+)
+from gpu_fault.collectors.gpu.inforom import InforomValidityProbe
+from gpu_fault.collectors.gpu.pcie_link import PcieLinkDowntrainTracker
 from gpu_fault.env import env_bool
 from gpu_fault.gpu_fabric_manager import (
     FABRIC_MANAGER_ERROR_CODE,
-    FABRIC_MANAGER_HELD_SECONDS,
     FABRIC_MANAGER_STATUS,
-    FABRIC_MANAGER_UNSETTLED_WINDOW_SECONDS,
     held_samples,
 )
+from gpu_fault.gpu_field_rules import (
+    ECC_MODE_CURRENT,
+    ECC_MODE_PENDING,
+    HW_POWER_BRAKE_SLOWDOWN,
+    INFOROM_CHECKSUM_VALID,
+    HW_THERMAL_SLOWDOWN,
+    ROW_REMAP_BANKS_LOW,
+    ROW_REMAP_BANKS_NONE,
+    SRAM_THRESHOLD_EXCEEDED,
+)
+from gpu_fault.gpu_pcie_link_policy import (
+    PCIE_CORRECTABLE_ERRORS,
+    PCIE_LINK_GEN_CURRENT,
+    PCIE_LINK_GEN_MAX,
+    PCIE_LINK_WIDTH_CURRENT,
+    PCIE_LINK_WIDTH_MAX,
+    correctable_rate_limit,
+)
+from gpu_fault.gpu_recovery_action_policy import GPU_RECOVERY_ACTION
 from gpu_fault.gpu_metrics import (
     GpuMetricBatch,
     GpuMetricSample,
@@ -50,6 +75,7 @@ from gpu_fault.gpu_metrics import (
 )
 from gpu_fault.gpu_temperature_policy import TLIMIT_READING, temperature_decision
 from gpu_fault.gpu_environment_policy import (
+    PCIE_CORRECTABLE_RATE_SEMANTICS,
     clock_reason_decision,
     deduplicate_dcgm_aliases,
     environmental_semantics,
@@ -88,12 +114,23 @@ DUTY_CYCLE_STALE_CARRY_OVER_INTERVALS = 8
 DCGM_NANOSECOND_DURATION_FIELDS = {
     "power_violation_total_us",
     "thermal_violation_total_us",
+    HW_THERMAL_SLOWDOWN,
+    HW_POWER_BRAKE_SLOWDOWN,
 }
-#: State gauges whose every change is a delivery edge: the last XID, and a
-#: GPU's NVLink fabric state (VALIDATE_GPU waits on the change to SUCCESS).
+#: State gauges whose every change is a delivery edge: the last XID, a GPU's
+#: NVLink fabric state (VALIDATE_GPU waits on the change to SUCCESS), and from
+#: batch 233 the driver's recovery action, the SRAM RMA flag, the banks with no
+#: spare row left, the ECC mode and the InfoROM answer. The PCIe link gauges
+#: are not: an idle GPU may downshift.
 STATE_CHANGE_REASONS = {
     "xid_last_error": "xid-changed",
     FABRIC_MANAGER_STATUS: "fabric-manager-status-changed",
+    GPU_RECOVERY_ACTION: "gpu-recovery-action-changed",
+    SRAM_THRESHOLD_EXCEEDED: "sram-threshold-changed",
+    ROW_REMAP_BANKS_NONE: "row-remap-headroom-changed",
+    ECC_MODE_CURRENT: "ecc-mode-changed",
+    ECC_MODE_PENDING: "ecc-mode-changed",
+    INFOROM_CHECKSUM_VALID: "inforom-validity-changed",
 }
 
 DCGM_METRICS: dict[str, tuple[str, str | None]] = {
@@ -228,6 +265,37 @@ DCGM_METRICS: dict[str, tuple[str, str | None]] = {
         "thermal_violation_total_us",
         "microseconds",
     ),
+    # Batch 233 (the 2026-11-01 field audit), exported by the bundled counters
+    # CSV under the DCGM 4.5.3 names the pinned exporter's go-dcgm v1.4611.2
+    # resolves (its legacy map, where DCGM 4.6 renamed them), read under both
+    # names, never required: 1523 recovery action, 235-238 PCIe link, 346 SRAM
+    # threshold, 388/389 remap headroom, 1423/1424 HW slowdown time (ns, read
+    # as us), 300/301 ECC mode, 1501 PCIe correctable errors.
+    "DCGM_FI_DEV_GET_GPU_RECOVERY_ACTION": (GPU_RECOVERY_ACTION, None),
+    "DCGM_FI_DEV_GPU_RECOVERY_ACTION": (GPU_RECOVERY_ACTION, None),
+    "DCGM_FI_DEV_PCIE_MAX_LINK_GEN": (PCIE_LINK_GEN_MAX, None),
+    "DCGM_FI_DEV_PCIE_MAX_LINK_WIDTH": (PCIE_LINK_WIDTH_MAX, "lanes"),
+    "DCGM_FI_DEV_PCIE_LINK_GEN": (PCIE_LINK_GEN_CURRENT, None),
+    "DCGM_FI_DEV_PCIE_LINK_WIDTH": (PCIE_LINK_WIDTH_CURRENT, "lanes"),
+    "DCGM_FI_DEV_THRESHOLD_SRM": (SRAM_THRESHOLD_EXCEEDED, None),
+    "DCGM_FI_DEV_SRAM_EXCEEDED": (SRAM_THRESHOLD_EXCEEDED, None),
+    "DCGM_FI_DEV_BANKS_REMAP_ROWS_AVAIL_LOW": (ROW_REMAP_BANKS_LOW, "banks"),
+    "DCGM_FI_DEV_BANK_REMAP_AVAIL_LOW": (ROW_REMAP_BANKS_LOW, "banks"),
+    "DCGM_FI_DEV_BANKS_REMAP_ROWS_AVAIL_NONE": (ROW_REMAP_BANKS_NONE, "banks"),
+    "DCGM_FI_DEV_BANK_REMAP_AVAIL_NONE": (ROW_REMAP_BANKS_NONE, "banks"),
+    "DCGM_FI_DEV_CLOCKS_EVENT_REASON_HW_THERM_SLOWDOWN_NS": (
+        HW_THERMAL_SLOWDOWN,
+        "microseconds",
+    ),
+    "DCGM_FI_DEV_CLOCKS_EVENT_REASON_HW_POWER_BRAKE_SLOWDOWN_NS": (
+        HW_POWER_BRAKE_SLOWDOWN,
+        "microseconds",
+    ),
+    "DCGM_FI_DEV_ECC_CURRENT": (ECC_MODE_CURRENT, None),
+    "DCGM_FI_DEV_ECC_MODE": (ECC_MODE_CURRENT, None),
+    "DCGM_FI_DEV_ECC_PENDING": (ECC_MODE_PENDING, None),
+    "DCGM_FI_DEV_PCIE_COUNT_CORRECTABLE_ERRORS": (PCIE_CORRECTABLE_ERRORS, "errors"),
+    "DCGM_FI_DEV_PCIE_CORRECTABLE_ERROR_TOTAL": (PCIE_CORRECTABLE_ERRORS, "errors"),
 }
 
 
@@ -547,6 +615,14 @@ class DcgmMetricsCollector:
             retry_interval_seconds=self.inventory_interval_seconds, logger=LOGGER
         )
         self._shutdown_limits = ShutdownLimitResolver(LOGGER)
+        self._pcie_links = PcieLinkDowntrainTracker(self.state_max_keys)
+        self._inforom = InforomValidityProbe(
+            interval_seconds=self.inventory_interval_seconds, logger=LOGGER
+        )
+        self._correctable_rates = CorrectableRateGate(
+            stale_seconds=interval_seconds * DUTY_CYCLE_STALE_CARRY_OVER_INTERVALS,
+            max_keys=self.state_max_keys,
+        )
         self._previous_devices: set[str] | None = None
         self._consecutive_failures = 0
         self._collection_errors = CollectionErrorEdges(
@@ -568,7 +644,7 @@ class DcgmMetricsCollector:
         missing_fields = completeness_errors(samples) if samples else []
         timestamp = observed_at or self.now()
         samples.extend(held_samples(samples, self._value_first_seen, timestamp))
-        samples.extend(extra_samples or [])
+        samples.extend([*self._pcie_links.observe(samples), *(extra_samples or [])])
         samples = self._shutdown_limits.resolve(samples)
         samples = [
             sample.model_copy(
@@ -687,7 +763,9 @@ class DcgmMetricsCollector:
 
     @classmethod
     def _is_counter(cls, sample: GpuMetricSample) -> bool:
-        if cls._is_duty_cycle_counter(sample):
+        if cls._is_duty_cycle_counter(sample) or (
+            sample.canonical_name in RATE_GRADED_COUNTERS
+        ):
             return False
         name = sample.canonical_name
         return name.endswith("_total") or name.endswith("_total_us")
@@ -819,41 +897,36 @@ class DcgmMetricsCollector:
             )
         for sample in batch.samples:
             device = sample.gpu_uuid or sample.pci_bdf or sample.gpu_index or "node"
-            name = sample.canonical_name
-            temperature = temperature_decision(
-                self.thresholds, sample, values_by_device[device]
-            )
-            breached = (
-                name
-                in {
-                    "retired_pages_pending",
-                    "row_remap_failure",
-                    "row_remap_pending",
-                }
-                and sample.value > 0
-            ) or (name == "xid_last_error" and sample.value > 0)
-            # A fabric state held past the window is delivered once confirmed,
-            # not at the next health summary.
-            breached = breached or (
-                name == FABRIC_MANAGER_HELD_SECONDS
-                and sample.value >= FABRIC_MANAGER_UNSETTLED_WINDOW_SECONDS
-            )
-            clock = clock_reason_decision(sample)
+            key, peers = self._sample_key(sample), values_by_device[device]
+            temperature = temperature_decision(self.thresholds, sample, peers)
+            # A bad state as read (field_edges.state_breached) is delivered once
+            # confirmed, not at the next health summary.
+            breached = state_breached(sample.canonical_name, sample.value, peers)
             duty_cycle, no_new_value = self._grade_duty_cycle(sample, batch.observed_at)
-            if no_new_value:
-                carried_over.add(self._sample_key(sample))
+            clock = clock_reason_decision(sample) or power_brake_candidate(
+                sample, duty_cycle
+            )
+            rate, no_new_rate = self._correctable_rates.rate(
+                key, sample, batch.observed_at
+            )
+            if no_new_value or no_new_rate:
+                carried_over.add(key)
             elif duty_cycle is not None and self._duty_cycle_breached(
                 sample, duty_cycle, batch.observed_at
             ):
                 breached = True
             if temperature is not None:
-                candidates[self._sample_key(sample)] = (
+                candidates[key] = (
                     f"{temperature['severity']}:{temperature['automatic_action']}"
                 )
             elif clock is not None:
-                candidates[self._sample_key(sample)] = str(clock["threshold_source"])
+                candidates[key] = str(clock["threshold_source"])
+            elif rate is not None and rate > (
+                correctable_rate_limit(peers) or math.inf
+            ):
+                candidates[key] = PCIE_CORRECTABLE_RATE_SEMANTICS
             elif breached:
-                candidates[self._sample_key(sample)] = "breached"
+                candidates[key] = "breached"
         for device, values in values_by_device.items():
             power = values.get("power_usage_w")
             limit = values.get("power_limit_w")
@@ -1039,6 +1112,7 @@ class DcgmMetricsCollector:
                 f"cannot scrape DCGM exporter: {self.metrics_url}"
             ) from exc
         limits = self._temperature_limits.refresh(observed_at, self.runner)
+        limits = [*limits, *self._inforom.refresh(observed_at, self.runner)]
         return self.collect_text(text, observed_at=observed_at, extra_samples=limits)
 
     def _report_collection_error(self, exc: BaseException) -> None:

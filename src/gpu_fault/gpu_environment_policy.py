@@ -11,6 +11,41 @@ from gpu_fault.models import RecoveryAction
 NVML_CLOCK_REFERENCE = "https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlClocksEventReasons.html"
 HW_POWER_BRAKE_MASK = 0x80
 THERMAL_REASON_MASK = 0x60
+#: Bit 0x08, HW Slowdown, is deliberately not graded on its own (batch 233,
+#: decision 3c). nvidia-smi(1) (v610-era page), "Clocks Event Reasons":
+#: :data:`NVIDIA_SMI_HW_SLOWDOWN_QUOTE` -- it is the OR of 0x40 (graded with
+#: 0x20 as thermal limiting, plus field 1423's duration) and 0x80 (the brake
+#: DRAIN, plus field 1424's duration). NVML API Reference (v615),
+#: ``nvmlClocksThrottleReasonHwSlowdown``: :data:`NVML_HW_SLOWDOWN_QUOTE` -- the
+#: only causes beyond those two are a power-draw protection and a P-state or
+#: clock change artefact, and NVIDIA marks the bit for removal, so a WARNING on
+#: 0x08 without 0x40/0x80 would rest on a bit with no stable meaning.
+HW_SLOWDOWN_MASK = 0x08
+NVIDIA_SMI_HW_SLOWDOWN_QUOTE = (
+    "This option will be removed a future CUDA release. HW Slowdown is engaged, "
+    "reducing the core clocks by a factor of 2 or more. It is active if either "
+    "HW Thermal Slowdown or HW Power Brake are active."
+)
+NVML_HW_SLOWDOWN_QUOTE = (
+    "HW Slowdown (reducing the core clocks by a factor of 2 or more) is engaged. "
+    "This is an indicator of: temperature being too high External Power Brake "
+    "Assertion is triggered (e.g. by the system power supply) Power draw is too "
+    "high and Fast Trigger protection is reducing the clocks May be also "
+    "reported during PState or clock change This behavior may be removed in a "
+    "later release."
+)
+#: Clock-event bits NVML v615 adds that the product does not grade: NVML API
+#: Reference (v615), "Clocks Event Reasons" (:data:`NVML_CLOCK_REFERENCE`) --
+#: :data:`NVML_BOARD_LIMIT_QUOTE`, :data:`NVML_RELIABILITY_QUOTE`; the values
+#: from NVIDIA's ``nvidia-ml-py`` 13.615.71 (``nvmlClocksThrottleReasonBoardLimit
+#: = 0x0000000000000200``, ``nvmlClocksThrottleReasonReliability =
+#: 0x0000000000000400``). A policy limiting the clocks is no fault, and any bit
+#: :func:`clock_reason_decision` does not name grades nothing.
+NVML_UNGRADED_CLOCK_EVENT_BITS = {0x200: "BoardLimit", 0x400: "Reliability"}
+NVML_BOARD_LIMIT_QUOTE = (
+    "The board limit (operating) policy is currently limiting the GPU clocks."
+)
+NVML_RELIABILITY_QUOTE = "The reliability policy is currently limiting the GPU clocks."
 CONFIRMATION_SAMPLES = 3
 CONFIRMATION_MAX_GAP_SECONDS = 60
 DCGM_ENVIRONMENT_ALIASES = (
@@ -20,11 +55,45 @@ DCGM_ENVIRONMENT_ALIASES = (
     frozenset({"DCGM_FI_DEV_GPU_TEMP_LIMIT", "DCGM_FI_DEV_GPU_TEMP_MARGIN_CELSIUS"}),
     # Field 159, the name before and since DCGM 4.6 (collectors/gpu/shutdown_limit).
     frozenset({"DCGM_FI_DEV_SHUTDOWN_TEMP", "DCGM_FI_DEV_GPU_TEMP_SHUTDOWN_CELSIUS"}),
+    # Batch 233: the 4.5.3 names the counters CSV exports and their DCGM 4.6
+    # names (DCGM 4.6.0 release notes: "Existing names remain available as
+    # deprecated aliases").
+    frozenset(
+        {"DCGM_FI_DEV_GET_GPU_RECOVERY_ACTION", "DCGM_FI_DEV_GPU_RECOVERY_ACTION"}
+    ),
+    frozenset({"DCGM_FI_DEV_THRESHOLD_SRM", "DCGM_FI_DEV_SRAM_EXCEEDED"}),
+    frozenset(
+        {"DCGM_FI_DEV_BANKS_REMAP_ROWS_AVAIL_LOW", "DCGM_FI_DEV_BANK_REMAP_AVAIL_LOW"}
+    ),
+    frozenset(
+        {"DCGM_FI_DEV_BANKS_REMAP_ROWS_AVAIL_NONE", "DCGM_FI_DEV_BANK_REMAP_AVAIL_NONE"}
+    ),
+    frozenset({"DCGM_FI_DEV_ECC_CURRENT", "DCGM_FI_DEV_ECC_MODE"}),
+    frozenset(
+        {
+            "DCGM_FI_DEV_PCIE_COUNT_CORRECTABLE_ERRORS",
+            "DCGM_FI_DEV_PCIE_CORRECTABLE_ERROR_TOTAL",
+        }
+    ),
 )
+#: Field 1423 grades like 241 (batch 233): both are thermal limiting time, 1423
+#: only the HW slowdown share of it ("Throttling due to temperature being too
+#: high (reducing core clocks by a factor of 2 or more) in ns.").
+THERMAL_DURATION_NAMES = frozenset(
+    {"thermal_violation_total_us", "hw_thermal_slowdown_violation_total_us"}
+)
+#: Candidate semantics the DCGM edge filter delivers on every tick while they
+#: hold, so the control plane sees consecutive samples: the confirmed
+#: environmental CRITICALs, the power brake, and a PCIe correctable-error rate
+#: above its limit (two consecutive windows grade it, ``gpu_pcie_link_policy``).
+PCIE_CORRECTABLE_RATE_SEMANTICS = "PCIE_CORRECTABLE_RATE"
 
 
 def environmental_semantics(value: str) -> bool:
-    return value.startswith("CRITICAL:") or value == "NVIDIA_HW_POWER_BRAKE"
+    return value.startswith("CRITICAL:") or value in {
+        "NVIDIA_HW_POWER_BRAKE",
+        PCIE_CORRECTABLE_RATE_SEMANTICS,
+    }
 
 
 def deduplicate_dcgm_aliases(samples: list[Any]) -> list[Any]:
@@ -144,7 +213,7 @@ def thermal_duration_decision(
     thresholds: Any, sample: Any, delta: Any, rate: Any
 ) -> dict[str, Any] | None:
     if (
-        sample.canonical_name != "thermal_violation_total_us"
+        sample.canonical_name not in THERMAL_DURATION_NAMES
         or delta is None
         or delta < thresholds.thermal_violation_delta_warning_us
         or rate is None

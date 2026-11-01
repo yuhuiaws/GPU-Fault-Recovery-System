@@ -168,7 +168,7 @@
   "src/gpu_fault/gpu_metrics.py:arg-type": 1,
   "src/gpu_fault/gpu_metrics.py:no-any-return": 2,
   "src/gpu_fault/gpu_metrics.py:no-untyped-call": 1,
-  "src/gpu_fault/gpu_metrics.py:no-untyped-def": 11,
+  "src/gpu_fault/gpu_metrics.py:no-untyped-def": 10,
   "src/gpu_fault/gpu_metrics.py:var-annotated": 1,
   "src/gpu_fault/gpu_power_policy.py:type-arg": 1,
   "src/gpu_fault/host_health.py:no-untyped-def": 4,

@@ -12,6 +12,7 @@ from gpu_fault.gpu_metric_models import (
     GpuHealthFinding,
     GpuHealthSeverity,
 )
+from gpu_fault.gpu_pcie_link_policy import PCIE_CORRECTABLE_ERRORS, PCIE_LINK_DOWNTRAIN
 from gpu_fault.gpu_power_policy import NVIDIA_DCGM_HEALTH_REFERENCE
 from gpu_fault.models import RecoveryAction
 from gpu_fault.policy import ActionDisposition, FaultPolicyDecision, XidEvent
@@ -33,6 +34,22 @@ SITE_CORRELATION_POLICY_VERSION = "site-dcgm-correlation/v3"
 #: ``GpuMetricsService._xid_event`` makes of a change of the last-XID gauge.
 DCGM_XID_GAUGE_SOURCE = "DCGM_EXPORTER"
 _LINK_XIDS = frozenset({32, 79})
+#: The PCIe evidence a same-GPU XID 32/79 joins into the CRITICAL DRAIN
+#: composite, in the order one is picked: the replay rate above its threshold,
+#: and from batch 233 a confirmed link downtrain or correctable-error rate
+#: (``gpu_pcie_link_policy``; their evidence-only first windows do not join).
+PCIE_LINK_COMPONENT_NAMES = (
+    "pcie_replay_total",
+    PCIE_LINK_DOWNTRAIN,
+    PCIE_CORRECTABLE_ERRORS,
+)
+#: A batch carrying one of these evaluates its GPU's PCIe composite.
+PCIE_COMPOSITE_TRIGGER_NAMES = frozenset({*PCIE_LINK_COMPONENT_NAMES, "xid_last_error"})
+_PCIE_COMPONENT_TEXT = {
+    "pcie_replay_total": "PCIe replay threshold",
+    PCIE_LINK_DOWNTRAIN: "PCIe link downtrain",
+    PCIE_CORRECTABLE_ERRORS: "PCIe correctable-error rate",
+}
 _PCI_BDF = re.compile(
     r"(?:(?P<domain>[0-9a-f]{4}|[0-9a-f]{8}):)?"
     r"(?P<bus>[0-9a-f]{2}):(?P<device>[0-9a-f]{2})(?:\.(?P<function>[0-7]))?"
@@ -247,9 +264,15 @@ def is_dcgm_link_xid(event: XidEvent) -> bool:
 
 
 def _pcie_threshold(finding: GpuHealthFinding, threshold: float) -> bool:
+    """Whether ``finding`` is PCIe evidence a link XID joins: the replay rate
+    above ``threshold``, or a confirmed downtrain or correctable-error rate."""
+
+    if finding.finding_kind != "METRIC":
+        return False
+    if finding.canonical_name in {PCIE_LINK_DOWNTRAIN, PCIE_CORRECTABLE_ERRORS}:
+        return finding.automatic_action != RecoveryAction.NO_ACTION.value
     return (
-        finding.finding_kind == "METRIC"
-        and finding.canonical_name == "pcie_replay_total"
+        finding.canonical_name == "pcie_replay_total"
         and finding.rate_per_minute is not None
         and math.isfinite(finding.rate_per_minute)
         and finding.rate_per_minute > threshold
@@ -460,8 +483,16 @@ def pcie_xid_link_failure(
     trusted kernel event joins by its policy decision; failing one, the
     last-XID gauge joins only through its change event (:func:`_gauge_change`).
     """
-    pcie = components.get("pcie_replay_total")
-    metric = metrics.get("pcie_replay_total")
+    threshold = service.thresholds.pcie_replay_rate_warning_per_minute
+    pcie = next(
+        (
+            components[name]
+            for name in PCIE_LINK_COMPONENT_NAMES
+            if name in components and _pcie_threshold(components[name], threshold)
+        ),
+        None,
+    )
+    metric = metrics.get(pcie.canonical_name) if pcie is not None else None
     window = timedelta(seconds=service.thresholds.correlation_window_seconds)
     if (
         pcie is None
@@ -471,9 +502,6 @@ def pcie_xid_link_failure(
         or metric.cluster_id != trigger.cluster_id
         or metric.node_id != trigger.node_id
         or metric.observed_at != pcie.observed_at
-        or not _pcie_threshold(
-            pcie, service.thresholds.pcie_replay_rate_warning_per_minute
-        )
         or abs(pcie.observed_at - trigger.observed_at) > window
     ):
         return None
@@ -542,13 +570,14 @@ def pcie_xid_link_failure(
         rule_id=PCIE_XID_RULE,
         components=[pcie],
         component_metrics=[
-            "pcie_replay_total",
+            pcie.canonical_name,
             "kernel_xid" if kernel is not None else "xid_last_error",
         ],
         severity=GpuHealthSeverity.CRITICAL,
         action=RecoveryAction.DRAIN,
         reason=(
-            f"PCIe replay threshold was correlated with XID {joined.xid}"
+            f"{_PCIE_COMPONENT_TEXT[pcie.canonical_name]} was correlated with XID "
+            f"{joined.xid}"
             + (
                 f" from kernel event {joined.event_id}"
                 if kernel is not None
@@ -740,7 +769,7 @@ def correlate_kernel_xid(
             service,
             stored,
             gpu_key,
-            {"pcie_replay_total": pcie},
+            {pcie.canonical_name: pcie},
             metrics_by_gpu.get(gpu_key, {}),
             previous,
             [stored],

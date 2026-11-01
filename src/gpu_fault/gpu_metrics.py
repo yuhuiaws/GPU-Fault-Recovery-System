@@ -15,6 +15,7 @@ from gpu_fault.gpu_collection_errors import (
     collection_error_key,
 )
 from gpu_fault.gpu_composites import (
+    PCIE_COMPOSITE_TRIGGER_NAMES,
     PCIE_XID_RULE,
     composite_finding,
     correlate_kernel_xid,
@@ -28,6 +29,13 @@ from gpu_fault.gpu_composites import (
     SITE_CORRELATION_POLICY_VERSION as SITE_CORRELATION_POLICY_VERSION,
 )
 from gpu_fault.gpu_fabric_manager import track_fabric_manager_state
+from gpu_fault.gpu_field_rules import (
+    FIELD_RULE_NAMES,
+    GPU_FIELD_COUNTERS,
+    field_rule_decision,
+)
+from gpu_fault.gpu_field_rules import HW_THERMAL_SLOWDOWN as HW_SLOWDOWN
+from gpu_fault.gpu_pcie_link_policy import PCIE_LINK_CONTEXT, replay_decision
 from gpu_fault.gpu_metric_models import (
     SITE_METRIC_POLICY_VERSION,
     GpuHealthSeverity,
@@ -342,8 +350,8 @@ class GpuMetricsService:
         "thermal_violation_total_us",
         "row_remap_correctable_total",
         "row_remap_uncorrectable_total",
-    }
-    _TEMPERATURE_LIMITS = TEMPERATURE_LIMIT_CONTEXT
+    } | GPU_FIELD_COUNTERS
+    _TEMPERATURE_LIMITS = TEMPERATURE_LIMIT_CONTEXT | PCIE_LINK_CONTEXT
     _COMPOSITE_RULE_IDS = {
         "THERMAL_STRESS",
         "POWER_LIMIT_THROTTLING",
@@ -628,7 +636,7 @@ class GpuMetricsService:
         pcie_gpu_keys = touched_gpu_keys.intersection(
             sample.gpu_uuid or sample.pci_bdf or sample.gpu_index or "node"
             for sample in batch.samples
-            if sample.canonical_name in {"pcie_replay_total", "xid_last_error"}
+            if sample.canonical_name in PCIE_COMPOSITE_TRIGGER_NAMES
         )
         composite_scopes = sorted({*touched_gpu_keys, "node"})
         composite_keys = [
@@ -850,7 +858,9 @@ class GpuMetricsService:
         ):
             thermal_throttle = None
         thermal_signals = [
-            signal for signal in [thermal, thermal_throttle] if signal is not None
+            signal
+            for signal in (thermal, thermal_throttle, components.get(HW_SLOWDOWN))
+            if signal is not None
         ]
         if temperature is not None and thermal_signals:
             previous = previous_composite_states.get(
@@ -1156,11 +1166,7 @@ class GpuMetricsService:
         result = self.store.list_gpu_findings(
             cluster_id, node_id, active_only=active_only
         )
-        return sorted(
-            result,
-            key=lambda item: item.observed_at,
-            reverse=True,
-        )
+        return sorted(result, key=lambda item: item.observed_at, reverse=True)
 
     def _evaluate(
         self,
@@ -1176,10 +1182,15 @@ class GpuMetricsService:
     ) -> GpuHealthFinding | None:
         decision = power_violation_decision(
             self.thresholds, batch, sample, delta, gpu_key, rate_per_minute
+        ) or field_rule_decision(
+            self, batch, sample, delta, rate_per_minute, previous_finding_state
         )
         if sample.canonical_name in MEMORY_METRICS:
             decision = memory_decision(self.thresholds, sample, delta, batch.product)
-        elif sample.canonical_name != "power_violation_total_us":
+        elif sample.canonical_name not in {
+            "power_violation_total_us",
+            *FIELD_RULE_NAMES,
+        }:
             for resolver in (
                 self._temperature_decision,
                 self._link_decision,
@@ -1238,32 +1249,12 @@ class GpuMetricsService:
     def _temperature_decision(self, sample, _delta, _rate, limits, _previous):
         return temperature_decision(self.thresholds, sample, limits)
 
-    def _memory_decision(self, sample, delta, _rate, _limits, _previous):
-        return memory_decision(self.thresholds, sample, delta, None)
-
-    def _link_decision(self, sample, delta, rate, _limits, _previous):
+    def _link_decision(self, sample, delta, rate, limits, _previous):
         name = sample.canonical_name
-        if (
-            name == "pcie_replay_total"
-            and rate is not None
-            and rate > self.thresholds.pcie_replay_rate_warning_per_minute
-        ):
-            source = (
-                "NVIDIA_DCGM_HEALTH"
-                if self.thresholds.pcie_replay_rate_warning_per_minute == 8
-                else "SITE_OVERRIDE_NVIDIA_DCGM_HEALTH"
-            )
-            return {
-                "severity": GpuHealthSeverity.WARNING,
-                "reason": "PCIe replay rate exceeded DCGM health threshold",
-                "automatic_action": RecoveryAction.RUN_DIAGNOSTICS.value,
-                "policy_source": source,
-                "policy_version": NVIDIA_DCGM_POLICY_VERSION
-                if source == "NVIDIA_DCGM_HEALTH"
-                else SITE_METRIC_POLICY_VERSION,
-                "policy_reference": NVIDIA_DCGM_HEALTH_REFERENCE,
-                "official_action": "EXAMINE_GPU_HEALTH",
-            }
+        # The replay threshold follows the current link (gpu_pcie_link_policy).
+        replay = replay_decision(self.thresholds, sample, rate, limits)
+        if replay is not None:
+            return replay
         if (
             name.startswith("nvlink_")
             and name.endswith("_error_total")

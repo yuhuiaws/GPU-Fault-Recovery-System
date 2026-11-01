@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from gpu_fault.gpu_field_rules import evidence_only
 from gpu_fault.gpu_metric_models import GpuHealthFinding
 from gpu_fault.host_health import NodeHealthCategory, NodeHealthFinding
 from gpu_fault.models import RecoveryAction, Severity
@@ -10,9 +11,17 @@ from gpu_fault.models import RecoveryAction, Severity
 def gpu_node_health_findings(
     context: Any, findings: list[GpuHealthFinding]
 ) -> list[NodeHealthFinding]:
-    """Use the same node-health ingestion for scrape and kernel composites."""
+    """Use the same node-health ingestion for scrape and kernel composites.
+
+    A finding whose automatic action is ``NO_ACTION`` is evidence only
+    (``gpu_field_rules.evidence_only``: a driver recovery action an XID 154
+    already owns, the first window of a rate rule): it stays in the GPU
+    finding store and the batch evidence and opens no incident.
+    """
     result = []
     for finding in findings:
+        if evidence_only(finding):
+            continue
         severity = (
             Severity.CRITICAL
             if finding.severity.value == "CRITICAL"

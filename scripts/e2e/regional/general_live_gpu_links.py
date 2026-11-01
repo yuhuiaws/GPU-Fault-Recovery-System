@@ -20,8 +20,10 @@ a family alike; the chosen canonical name and its exporter metric go into the
 variant's notes and ``canonical_name`` / ``exporter_metrics`` evidence.
 
 022 drives the PCIe replay counter (``pcie``/``pcie_xid`` profiles). The rate
-is graded against the previous accepted sample, so ``at_rate_limit`` stays at
-or below 8/min (no finding) and ``over_rate_limit`` clears it (WARNING
+is graded against the previous accepted sample and, since batch 233, against
+DCGM's expected rate of the GPU's current link (``general_live_pcie_rate``:
+31/min at Gen5 x16, 8/min without a link), so ``at_rate_limit`` stays at or
+below it (no finding) and ``over_rate_limit`` clears it (WARNING
 RUN_DIAGNOSTICS). ``counter_reset`` and ``source_boot_change`` grade a
 *boundary*, so the plan around it must not be a storm of its own: the raise
 before the drop stays under the rule (``under_limit_increment``) and the drop
@@ -114,6 +116,7 @@ from scripts.e2e.regional.general_live_kernel_xid import (
     restore_if_isolated,
     wait_xid_decisions,
 )
+from scripts.e2e.regional.general_live_pcie_rate import pcie_replay_rate
 
 CASE_020 = "GF-GENERAL-LIVE-020"
 CASE_022 = "GF-GENERAL-LIVE-022"
@@ -687,17 +690,15 @@ def recovered(ctx: VariantContext) -> dict[str, Any]:
 def at_rate_limit(ctx: VariantContext) -> dict[str, Any]:
     survey = run_gpu_survey(ctx)
     gpu = survey.target("pcie_replay_total")
+    rate = pcie_replay_rate(survey, gpu)
+    increment = at_limit_increment(survey.interval, rate)
     since = utc_now()
     repl = DcgmReplay(
         ctx,
         plan(
             "pcie",
             baseline(),
-            step(
-                30,
-                add("pcie_replay_total", [gpu], at_limit_increment(survey.interval)),
-                hold=True,
-            ),
+            step(30, add("pcie_replay_total", [gpu], increment), hold=True),
         ),
         _hold(ctx),
     )
@@ -720,7 +721,7 @@ def at_rate_limit(ctx: VariantContext) -> dict[str, Any]:
     recover_counter(ctx, repl, since, names=["pcie_replay_total"])
     return result(
         stages,
-        notes=["a PCIe rate at exactly 8/min does not breach (> is the test)"],
+        notes=[f"a PCIe rate at exactly {rate:g}/min does not breach (> is the test)"],
         extra={"gpu_uuid": gpu},
     )
 
@@ -728,6 +729,7 @@ def at_rate_limit(ctx: VariantContext) -> dict[str, Any]:
 def over_rate_limit(ctx: VariantContext) -> dict[str, Any]:
     survey = run_gpu_survey(ctx)
     gpu = survey.target("pcie_replay_total")
+    limit = (survey.interval, pcie_replay_rate(survey, gpu))
     since = utc_now()
     repl = DcgmReplay(
         ctx,
@@ -736,7 +738,7 @@ def over_rate_limit(ctx: VariantContext) -> dict[str, Any]:
             baseline(),
             step(
                 40,
-                add("pcie_replay_total", [gpu], over_limit_increment(survey.interval)),
+                add("pcie_replay_total", [gpu], over_limit_increment(*limit)),
                 hold=True,
             ),
         ),
@@ -879,7 +881,7 @@ def pcie_counter_reset_stages(
         if reset_at is not None and when is not None and when < reset_at:
             return (
                 "the raise before the reset minted a finding (the plan's increment "
-                "must stay under 8/min)"
+                "must stay under the rule rate)"
             )
         return "a PCIe counter reset minted a finding"
 
@@ -903,8 +905,9 @@ def pcie_counter_reset_stages(
 def pcie_counter_reset(ctx: VariantContext) -> dict[str, Any]:
     """A PCIe replay counter that falls below its previous reading is no fault.
 
-    The raise before the drop stays clearly under the 8/min rule
-    (``under_limit_increment``: one per read on a 15-s collector, 4/min), so
+    The raise before the drop stays clearly under the rule rate
+    (``under_limit_increment``: half the at-limit budget, one per read on a
+    15-s collector at 8/min), so
     the only reading that could mint a finding is the reset itself. Live
     2026-10-26 the plan raised by 50 per read (200/min) and the WARNING that
     legitimate storm minted was read as "a PCIe counter reset minted a
@@ -915,7 +918,8 @@ def pcie_counter_reset(ctx: VariantContext) -> dict[str, Any]:
 
     survey = run_gpu_survey(ctx)
     gpu = survey.target(PCIE)
-    increment = under_limit_increment(survey.interval)
+    rate = pcie_replay_rate(survey, gpu)
+    increment = under_limit_increment(survey.interval, rate)
     since = utc_now()
     repl = DcgmReplay(
         ctx,
@@ -947,7 +951,8 @@ def pcie_counter_reset(ctx: VariantContext) -> dict[str, Any]:
         stages,
         notes=[
             f"raised by {increment} per read ({increment * 60 / repl.interval:g}/min, "
-            "under the 8/min rule) then dropped: the drop is a counter-reset edge, "
+            f"under the {rate:g}/min rule) then dropped: the drop is a counter-reset "
+            "edge, "
             "graded unknown, and the new baseline -- never a fault or a recovery"
         ],
         extra={"gpu_uuid": gpu, "increment": increment},
@@ -1036,7 +1041,7 @@ def source_boot_change(ctx: VariantContext) -> dict[str, Any]:
     """A source/boot change forms no cross-generation PCIe rate and starts a
     new baseline.
 
-    The plan's first read is a jump over the 8/min rule against any reading
+    The plan's first read is a jump over the rule rate against any reading
     of the real boot (``cross_boot_jump``), held afterwards; the proxy is
     armed *before* the collector is repointed (``arm_before_repoint``), so the
     repointed collector's first scrape -- the product's first reading under
@@ -1053,7 +1058,8 @@ def source_boot_change(ctx: VariantContext) -> dict[str, Any]:
     survey = run_gpu_survey(ctx)
     gpu = survey.target(PCIE)
     boot, origin = replay_boot_id(survey, ctx.run_id)
-    jump = cross_boot_jump(survey.interval, survey.health_summary)
+    rate = pcie_replay_rate(survey, gpu)
+    jump = cross_boot_jump(survey.interval, survey.health_summary, rate)
     since = utc_now()
     repl = DcgmReplay(
         ctx,
@@ -1084,7 +1090,8 @@ def source_boot_change(ctx: VariantContext) -> dict[str, Any]:
         stages,
         notes=[
             f"replayed boot id from {origin}; the new boot's first reading is a jump "
-            f"of {jump} (over 8/min against any reading of the real boot), served "
+            f"of {jump} (over {rate:g}/min against any reading of the real boot), "
+            "served "
             "before the repointed collector's first scrape; a boot change starts a "
             "new baseline and forms no cross-generation rate"
         ],
@@ -1121,7 +1128,7 @@ def expired_gap_reads(interval: int) -> int:
 
 
 def _xid_join_steps(
-    interval: int, gpu: str, xid_gpu: str, *, gap_reads: int = 0
+    interval: int, gpu: str, xid_gpu: str, *, gap_reads: int = 0, rate: float = 8.0
 ) -> list[dict[str, Any]]:
     """The XID-join plan: pass-through baseline; the gauge at 0 (the product's
     "no XID" reading) with an under-limit PCIe step; optionally the gauge at 32
@@ -1137,7 +1144,7 @@ def _xid_join_steps(
         step(
             GAUGE_BASELINE_READS,
             put("xid_last_error", [xid_gpu], 0),
-            add("pcie_replay_total", [gpu], under_limit_increment(interval)),
+            add("pcie_replay_total", [gpu], under_limit_increment(interval, rate)),
         ),
     ]
     if gap_reads:
@@ -1146,7 +1153,7 @@ def _xid_join_steps(
         step(
             40,
             put("xid_last_error", [xid_gpu], 32),
-            add("pcie_replay_total", [gpu], over_limit_increment(interval)),
+            add("pcie_replay_total", [gpu], over_limit_increment(interval, rate)),
             hold=True,
         )
     )
@@ -1184,7 +1191,9 @@ def _pcie_xid(ctx: VariantContext, *, same_gpu: bool) -> dict[str, Any]:
         ctx,
         plan(
             "pcie_xid",
-            *_xid_join_steps(survey.interval, gpu, xid_gpu),
+            *_xid_join_steps(
+                survey.interval, gpu, xid_gpu, rate=pcie_replay_rate(survey, gpu)
+            ),
             absent_when_healthy=[pair.companion],
         ),
         _hold(ctx),
@@ -1267,6 +1276,7 @@ def expired_xid(ctx: VariantContext) -> dict[str, Any]:
                 gpu,
                 gpu,
                 gap_reads=expired_gap_reads(survey.interval),
+                rate=pcie_replay_rate(survey, gpu),
             ),
             absent_when_healthy=[pair.companion],
         ),
@@ -1305,10 +1315,11 @@ def expired_xid(ctx: VariantContext) -> dict[str, Any]:
 def recovery_evidence(ctx: VariantContext) -> dict[str, Any]:
     survey = run_gpu_survey(ctx)
     gpu = survey.target(PCIE)
+    rate = pcie_replay_rate(survey, gpu)
     return _recover_from_fault(
         ctx,
         survey,
-        add(PCIE, [gpu], over_limit_increment(survey.interval)),
+        add(PCIE, [gpu], over_limit_increment(survey.interval, rate)),
         canonical=PCIE,
         gpu=gpu,
         need="recovery needs a new normal rate and real communication, not a "
@@ -1398,15 +1409,16 @@ VARIANTS = [
     gpu_spec(
         CASE_022,
         "at_rate_limit",
-        "drive the PCIe replay rate to exactly 8/min",
-        "no finding: the threshold is strictly greater than 8/min",
+        "drive the PCIe replay rate to exactly the rule rate (DCGM's expected "
+        "rate of the GPU's current link, 8/min without one)",
+        "no finding: the threshold is strictly greater than the rule rate",
         at_rate_limit,
         max_minutes=18,
     ),
     gpu_spec(
         CASE_022,
         "over_rate_limit",
-        "drive the PCIe replay rate over 8/min",
+        "drive the PCIe replay rate over the rule rate",
         "WARNING RUN_DIAGNOSTICS; read-only, no reset",
         over_rate_limit,
         max_minutes=20,
@@ -1414,7 +1426,7 @@ VARIANTS = [
     gpu_spec(
         CASE_022,
         "counter_reset",
-        "raise the PCIe replay counter under 8/min, then drop it",
+        "raise the PCIe replay counter under the rule rate, then drop it",
         "a counter reset is no new fault: the drop is the product's counter-reset "
         "edge, graded unknown, and its new baseline",
         pcie_counter_reset,
@@ -1423,7 +1435,7 @@ VARIANTS = [
     gpu_spec(
         CASE_022,
         "source_boot_change",
-        "a PCIe replay jump over 8/min as the first reading under a replayed "
+        "a PCIe replay jump over the rule rate as the first reading under a replayed "
         "source boot id (armed before the repoint)",
         "a source/boot change forms no cross-generation rate; the new boot's first "
         "reading is the new baseline",

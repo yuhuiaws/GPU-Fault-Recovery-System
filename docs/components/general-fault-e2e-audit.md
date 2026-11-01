@@ -291,8 +291,8 @@ Fabric 未训练。受支持 Hopper SXM/HGX Blackwell 节点回放状态 1/2/4 �
 
 ### GF-GENERAL-E2E-022
 
-PCIe replay。counter 在可比较时间内分别形成 8/min 与 >8/min，
-前者不越界、后者诊断。再与同一 GPU/BDF、可信时间窗的 Xid 32/79 组合，验证
+PCIe replay。counter 在可比较时间内分别形成恰为规则速率与超过规则速率（batch 233 起规则速率为该卡当前链路的
+DCGM 预期速率，Gen5 x16 为 31/min；exporter 不提供链路时为 8/min），前者不越界、后者诊断。再与同一 GPU/BDF、可信时间窗的 Xid 32/79 组合，验证
 联合 DRAIN；另一 GPU、过期 Xid、缺 identity 不得误关联。
 实际执行诊断/隔离，记录 PCIe link speed/width、AER 和拓扑证据。
 整改已拒绝 reset、身份/boot/来源变化形成 delta；流量/链路条件和硬件噪声水平

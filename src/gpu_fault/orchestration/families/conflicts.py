@@ -89,6 +89,11 @@ TRANSIENT_INVENTORY_FINDINGS = {
     ),
     "dcgm_field_completeness": DCGM_TELEMETRY_UNAVAILABLE_OPERATIONS,
     "fabric_manager_status": FABRIC_MANAGER_OWNED_OPERATIONS,
+    # b233: a reset or quiesce window retrains the PCIe link and moves the
+    # driver's recovery action; what it raises is the window's to judge (its
+    # VALIDATE_GPU requires the recovery action back at None after the reset).
+    "pcie_link_downtrain": DCGM_TELEMETRY_UNAVAILABLE_OPERATIONS,
+    "gpu_recovery_action": DCGM_TELEMETRY_UNAVAILABLE_OPERATIONS,
 }
 #: The validation step of the incumbent that must still be ahead for the finding
 #: to be absorbed: a GPU finding is judged by VALIDATE_GPU; an EFA one by
@@ -109,6 +114,8 @@ INVENTORY_FINDING_VALIDATIONS = {
     "efa_device_plugin_unresponsive": _EFA_VALIDATIONS,
     "dcgm_field_completeness": _GPU_VALIDATIONS,
     "fabric_manager_status": _GPU_VALIDATIONS,
+    "pcie_link_downtrain": _GPU_VALIDATIONS,
+    "gpu_recovery_action": _GPU_VALIDATIONS,
 }
 
 

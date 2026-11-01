@@ -1034,6 +1034,101 @@ https://docs.nvidia.com/deploy/xid-errors/analyzing-xid-catalog.html -- code
 "Solo: RESTART_FM / Not Solo: IGNORE (follow other Xid)"; the pinned catalog
 data is unchanged, and A100 keeps RESTART_FM.
 
+## DCGM field audit fields (batch 233)
+
+What ran live is only the read-only audit: on one HyperPod and one plain EKS
+H200 node (driver 580.178.04, DCGM 4.7.0, idle) `dcgmi` served every field
+batch 233 grades with healthy values -- 1523 = 0, 235-238 = Gen5 x16 at the
+maximum and current even at 0 % utilization in P0, 346 = 0, 388/389 = 0 (385 =
+3072), 300/301 = 1/1, 1501 = 0, 202 = 0, 1420-1424 = 0, field 84 = 1 -- and
+`nvidia-smi --query-gpu=index,pci.bus_id,inforom.checksum_validation` answered
+`valid` for every GPU; the guest has no sysfs AER file for the GPUs. The
+extended counters CSV itself has not run on a live exporter: it ships with the
+next release, which rolls the exporter node by node. No fault was injected for
+any of the new rules; every non-zero grade, every plan and the VALIDATE_GPU
+checks are unit-tested on fakes through the real ingest, plan compiler and
+validation adapter, from NVIDIA's documentation.
+
+Blackwell (B200/B300): every batch-233 rule is unit-tested from NVIDIA
+documentation, not live-verified (no B-series hardware). That covers the
+recovery-action mapping of values 0-7, a Gen6 PCIe link (documented for DGX
+B300 only: NVIDIA DGX B300 User Guide, "Key Enhancements Over Previous DGX
+Systems": "ConnectX-8 networking connects directly to GPUs via PCIe Gen6."; no
+generation is documented for B200), the 1501 limit of 16/min there, the SRAM
+flag and the 393 limit on the Ampere-and-later family, the family-aware
+no-spare-rows reason (NVIDIA GPU Memory Error Management, docs version 615,
+"GPU DRAM Memory RMA Policy": "For Blackwell GPUs, a third remapping attempt
+for an uncorrectable memory error on a bank invokes HBM channel repair if there
+is a spare channel available."), the HW slowdown durations, ECC mode and
+InfoROM. Where NVIDIA documents no value, the tests use labelled synthetic
+values and assert only fail-closed or no-op behaviour. On Grace platforms with
+NVLink-C2C (GB200/GB300) nvidia-smi warns that "PCIe metrics here may not be
+representative of the primary data path bandwidth"; the downtrain and
+correctable-error rules grade the PCIe link as reported there, unverified.
+The Blackwell-only fields (NVLink5 counters 1200-1219/1404-1419, NVLink ECC
+1220, fabric health 174/175 on NVLink5 systems, unrepairable memory 1507) are
+not part of batch 233.
+
+Recovery action 1523: values 6 (BUS_RESET) and 7 (SYSTEM_REBOOT) come from NVML
+v615 (numbers from `nvidia-ml-py` 13.615.71). NVIDIA documents only their
+one-line enum meanings (NVML API Reference, docs v615, "vGPU Structs",
+`nvmlDeviceGpuRecoveryAction_t`: "Reset the GPU’s PCIe bus.", "Reboot the
+system."): no procedure, no nvidia-smi label, no XID 154 text. Both fail closed
+(CRITICAL QUARANTINE, an operator decides); 6 is deliberately not the product's
+RESET_GPU, a Function Level Reset (nvidia-smi: "To issue a Bus Reset, use -r
+bus."). DCGM 4.7.0's own health check ignores values above 5 ("Invalid GPU
+recovery action value"). RECOVER_IMEX_DOMAIN (5) cordons and hands to an
+operator: the product has no IMEX operation. The XID 154 dedup holds in the
+usual order -- the kernel line is stored before the exporter's next refresh
+shows the value -- and while an XID 154 incident for the GPU is open; if the
+DCGM value is graded first (a kernel log path slower than the exporter refresh
+plus the scrape, not seen live) the later XID 154 line opens its own incident
+beside the DCGM one, and the usual arbitration of two workflows on one node
+applies.
+
+PCIe link downtrain: the load gate is utilization ≥ 50 % in the same scrape
+(P-state is unused: the live H200s report P0 at 0 %); a GPU that never runs
+that hot is never judged. The three-sample streak lives in the collector
+process, so a collector restart (every quiesce/restore, an Agent restart)
+starts the count again, and until the first verdict after a restart the
+control plane keeps what it knew. The escalation after a reset reads the
+node's 50 newest incidents for a completed RESET_GPU (naming the GPU), full
+GPU + NVSwitch reset or reboot. No live downtrain or idle downshift was seen.
+
+PCIe replay 202: the threshold is now DCGM's expected rate of the current link
+(DCGM v4.7.0 `GetExpectedPcieReplayRate`): 31/min on the H200 sites (Gen5 x16)
+instead of the documented Gen3-era 8/min, which stays the fallback when a
+scrape has no current link (DCGM itself decides nothing then). A replay rate
+between 8 and 31/min no longer warns on those sites. GF-GENERAL-LIVE-022's
+variants derive their increments from the same rate
+(`scripts/e2e/regional/general_live_pcie_rate.py::pcie_replay_rate`; `over_limit_increment` now floors the
+two-interval budget once, which the old per-interval floor broke at 31/min);
+they need the new release to read 237/238 and are re-run with it.
+
+PCIe correctable errors 1501: NVIDIA documents no health threshold. R is the
+lower of the current link's expected error rate (the replay formula) and DCGM's
+PCIe diagnostic limit for this field (DCGM v4.7.0 `BusGrind::GetAERThresholdRate`:
+32/min at a Gen5 x16 maximum link, 16/min at any other); the two agree at Gen5
+x16 and Gen4 x16 only, and on Gen6 x16 R is the diagnostic's 16/min, four times
+tighter than the formula's 62. Neither figure was ever observed against real
+error traffic. The first window that crosses R is diluted when it spans back
+to an older delivered reading, so the warning can need one window more.
+
+HW slowdown durations 1423/1424: NVML documents the clock-event reason counters
+as nanoseconds; that they are cumulative is NVIDIA's wording (DCGM reads two
+of the five through the cumulative perf-policy fields), not a live observation
+(0 on every idle H200). The grading fails safe on a per-interval reading: a
+decrease grades nothing, a duty above 105 % grades nothing.
+
+Not added: 174/175 (NOT_SUPPORTED on H200 with driver 580, live 0/0, XML N/A);
+1508 (per-link NVLink state, served live 18/18 ACTIVE) is deferred until a
+staging check of the exporter's link-entity emission and the parser keys, and
+costs 144 series per node; 158 repeats the T.Limit critical boundary; profiling
+fields conflict with Nsight Systems/Compute (DCGM Feature Overview, docs 4.6);
+NVSwitch-entity fields are covered in more detail by the SXID lines. Every
+batch-233 field is read in the DCGM exporter mode only; the nvidia-smi metrics
+mode carries none of them.
+
 ## GF-GENERAL-LIVE live acceptance runner (phase 1)
 
 The generic `scripts/e2e/regional/run_general_live.py` runner and its
@@ -5297,7 +5392,10 @@ the replayed boot and the latest reading being that first reading; a first
 new-boot reading that is not the jump is INCONCLUSIVE (the boundary was
 crossed at the real value and not exercised) (evidence `boot-readings`;
 `tests/regional/test_general_live_pcie_boundaries.py`). Both variants are
-rerun with the runner alone; no product release is needed.
+rerun with the runner alone; no product release is needed. From batch 233 the
+rule rate is DCGM's expected rate of the GPU's current link (31/min at Gen5
+x16, 8/min without the link) and every 022 increment derives from it
+(`scripts/e2e/regional/general_live_pcie_rate.py::pcie_replay_rate`; see "DCGM field audit fields (batch 233)").
 
 022 `source_boot_change` then ran its new order live for the first time on
 2026-10-26 (14:12Z HyperPod, the same minute on plain EKS; release R13g,

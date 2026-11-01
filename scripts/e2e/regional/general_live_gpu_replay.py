@@ -719,11 +719,11 @@ def at_limit_increment(interval: int, rate_per_minute: float = 8.0) -> int:
 def over_limit_increment(interval: int, rate_per_minute: float = 8.0) -> int:
     """A per-read PCIe increment whose rate clears the warning threshold.
 
-    Doubles the per-interval budget and adds one, so even one skipped scrape
-    (two intervals) still rates above the threshold.
+    The two-interval budget plus one (floored once: at 31/min a doubled
+    per-interval floor gave 30/min), so even one skipped scrape still rates over.
     """
 
-    return int(rate_per_minute * interval // 60) * 2 + 1
+    return int(rate_per_minute * 2 * interval // 60) + 1
 
 
 def under_limit_increment(interval: int, rate_per_minute: float = 8.0) -> int:
@@ -731,7 +731,7 @@ def under_limit_increment(interval: int, rate_per_minute: float = 8.0) -> int:
 
     Half the at-limit budget, at least one: a raise that must never be the
     finding -- ``counter_reset`` grades the drop that follows it -- cannot sit
-    on the 8/min edge, where two scrapes a little closer than one interval
+    on the rate's edge, where two scrapes a little closer than one interval
     already rate above the threshold. One per read on a 15-s collector (4/min).
     """
 

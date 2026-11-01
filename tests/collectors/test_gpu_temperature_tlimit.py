@@ -315,6 +315,9 @@ def exporter_text(values: dict[str, float]) -> str:
         "memory_temperature_c": 45,
         "power_limit_w": 700,
         "gpu_tlimit_c": 47,
+        # ECC enabled: a healthy GPU (ECC disabled is graded since batch 233).
+        "ecc_mode_current": 1,
+        "ecc_mode_pending": 1,
     }
     return "".join(
         f'{name}{{gpu="0",UUID="GPU-0"}} '

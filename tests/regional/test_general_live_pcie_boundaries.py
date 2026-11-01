@@ -28,11 +28,13 @@ import pytest
 from scripts.e2e.regional import general_live_gpu_links as links
 from scripts.e2e.regional.general_live_fixture import VariantInconclusive
 from scripts.e2e.regional.general_live_gpu_replay import (
+    GpuSurvey,
     at_limit_increment,
     cross_boot_jump,
     over_limit_increment,
     under_limit_increment,
 )
+from scripts.e2e.regional.general_live_pcie_rate import pcie_replay_rate
 from tests.regional._general_live_fakes import FakeRegional, make_context, make_settings
 from tests.regional._general_live_gpu_fakes import (
     audit_records,
@@ -273,7 +275,7 @@ def test_counter_reset_tells_a_finding_of_the_raise_from_one_of_the_reset(
     assert out["verdict"] == "FAIL"
     assert out["stages"]["no_fault"] == [
         "the raise before the reset minted a finding (the plan's increment must stay "
-        "under 8/min): value=50 delta=50 rate=200/min at "
+        "under the rule rate): value=50 delta=50 rate=200/min at "
         f"{_at(8, 30)}; incident inc-storm",
         "a counter reset left an active finding: value=50 delta=50 rate=200/min at "
         f"{_at(8, 30)}",
@@ -518,6 +520,35 @@ def test_source_boot_change_is_inconclusive_when_the_first_new_boot_reading_is_n
 
 def test_the_registry_text_names_the_boundary_each_variant_drives() -> None:
     reset, boot = SPECS["counter_reset"], SPECS["source_boot_change"]
-    assert "under 8/min" in reset.injection and "counter-reset" in reset.expected
+    assert "under the rule rate" in reset.injection, reset.injection
+    assert "counter-reset" in reset.expected, reset.expected
     assert "first reading" in boot.injection and "new baseline" in boot.expected
     assert reset.expected_outcome == boot.expected_outcome == "PASS"
+
+
+@pytest.mark.parametrize(
+    ("link", "rate"),
+    [
+        ({}, 8.0),
+        ({"pcie_link_gen_current": 5, "pcie_link_width_current": 16}, 31.0),
+        ({"pcie_link_gen_current": 6, "pcie_link_width_current": 16}, 62.0),
+        ({"pcie_link_gen_current": 0, "pcie_link_width_current": 16}, 8.0),
+    ],
+    ids=["no-link", "gen5-x16", "gen6-x16", "blank-gen"],
+)
+def test_the_022_rates_follow_the_products_link_aware_replay_rule(
+    link: dict[str, float], rate: float
+) -> None:
+    """Batch 233: the product grades field 202 against DCGM's expected rate of
+    the GPU's current link (fields 237/238), the documented 8/min without one;
+    the variants' increments derive from the same rate."""
+
+    raw = survey()
+    raw["exporter"]["gpus"][G1]["values"].update(link)
+    measured = pcie_replay_rate(GpuSurvey(raw), G1)
+
+    assert measured == rate, link
+    assert at_limit_increment(15, measured) * 60 / 15 <= rate, "at the limit, not over"
+    assert over_limit_increment(15, measured) * 60 / 30 > rate, (
+        "over the limit even across one skipped scrape"
+    )
