@@ -26,6 +26,7 @@ API (all through the one host-probe Pod, ``probes/general_live_kernel_source_pro
     replay.install(records)      # reviewed list[dict]; sha256+base64 to the node
     replay.open(approved=True)   # drop-in + deadman; journal mode needs approval
     replay.arm()                 # start emitting the reviewed records
+    replay.arm(index=1)          # kmsg mode: emit reviewed record 1 alone, now
     ingested = replay.read_back()  # the runner's oracle of what was injected
     ...                          # the caller reads the product's own records
     replay.cleanup()             # remove the wrapper/drop-in, restore, verify
@@ -225,9 +226,19 @@ class KernelLogReplay:
         self._opened = True
         return receipt
 
-    def arm(self) -> dict[str, Any]:
+    def arm(self, *, index: int | None = None) -> dict[str, Any]:
+        """Start emitting the reviewed records -- all of them, or (kmsg mode)
+        only record ``index``, so two lines of one run can be placed apart in
+        time. The receipt's ``written_at`` is the node's wall clock when the
+        first copy was appended."""
+
         require_action_time(60)
-        receipt = self.host.execute("arm", "--run-id", self.run_id, timeout=120)
+        arguments = ["arm", "--run-id", self.run_id]
+        if index is not None:
+            if self.mode != "kmsg":
+                raise ValueError("only a kmsg replay arms one record at a time")
+            arguments += ["--index", str(int(index))]
+        receipt = self.host.execute(*arguments, timeout=120)
         self._armed = True
         return receipt
 

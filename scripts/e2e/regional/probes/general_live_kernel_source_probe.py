@@ -655,6 +655,10 @@ def arm(arguments: argparse.Namespace) -> None:
         raise ProbeError("no kernel replay window is open for this run")
     records = json.loads(records_path(run_id).read_text(encoding="utf-8"))
     if state["mode"] == "journal":
+        if getattr(arguments, "index", None) is not None:
+            raise ProbeError(
+                "--index places kmsg records; the journal wrapper has none"
+            )
         armed_path(run_id).write_text(utc_now(), encoding="utf-8")
         emit(
             {
@@ -673,17 +677,43 @@ def arm(arguments: argparse.Namespace) -> None:
     # copies it reads, and distinct from every other run's (``kmsg_sequence``).
     # Whether the collector read them is not assumed here: ``status`` reads it
     # back from the collector's own descriptor and journal.
+    #
+    # ``--index N`` appends reviewed record N alone (its own sequence number,
+    # its own emissions): a variant that must place two lines of one run apart
+    # in time -- GF-GENERAL-LIVE-024 xid_twin's repeat outside the twin window
+    # -- arms each when it is due. ``written_at`` is this host's wall clock
+    # when the first copy was appended (``time.time()``), the moment the
+    # kernel line exists on the node.
     fixture = kmsg_fixture_path(run_id)
-    passes = max(int(record.get("emissions", 4)) for record in records)
+    selected = getattr(arguments, "index", None)
+    if selected is None:
+        chosen = list(enumerate(records))
+    else:
+        if not 0 <= int(selected) < len(records):
+            raise ProbeError(
+                f"reviewed record {selected} is not installed for this run "
+                f"({len(records)} installed)"
+            )
+        chosen = [(int(selected), records[int(selected)])]
+    passes = max(int(record.get("emissions", 4)) for _index, record in chosen)
     written = 0
-    for _attempt in range(passes):
+    first_written: float | None = None
+    last_written: float | None = None
+    for attempt in range(passes):
+        stamp = time.time()
         with fixture.open("a", encoding="utf-8") as handle:
-            for index, record in enumerate(records):
+            for index, record in chosen:
+                if attempt >= int(record.get("emissions", 4)) and selected is not None:
+                    continue
                 handle.write(_kmsg_line(index, record, run_id))
                 written += 1
             handle.flush()
             os.fsync(handle.fileno())
-        time.sleep(1.0)
+        if first_written is None:
+            first_written = stamp
+        last_written = stamp
+        if attempt + 1 < passes:
+            time.sleep(1.0)
     armed_path(run_id).write_text(utc_now(), encoding="utf-8")
     emit(
         {
@@ -691,7 +721,10 @@ def arm(arguments: argparse.Namespace) -> None:
             "mode": "kmsg",
             "armed": True,
             "records": len(records),
+            "indexes": [index for index, _record in chosen],
             "lines_written": written,
+            "written_at": first_written,
+            "last_written_at": last_written,
             "fixture": str(fixture),
             "proof_scope": "live-replay",
         }
@@ -913,6 +946,7 @@ def parser() -> argparse.ArgumentParser:
 
     item = commands.add_parser("arm")
     item.add_argument("--run-id", required=True)
+    item.add_argument("--index", type=int, default=None)
     item.set_defaults(handler=arm)
 
     item = commands.add_parser("status")

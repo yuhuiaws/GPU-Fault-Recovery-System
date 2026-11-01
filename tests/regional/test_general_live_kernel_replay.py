@@ -643,3 +643,111 @@ def test_kmsg_follow_error_judges_only_a_reported_consumed_false() -> None:
     assert "541 time(s)" in message, message
     assert "fixture open in the collector=False" in message, message
     assert "read offset None of 440 bytes" in message, message
+
+
+# --------------------------------------------------------------------------- #
+# one record at a time (GF-GENERAL-LIVE-024 xid_twin's repeat outside the window)
+# --------------------------------------------------------------------------- #
+def _two_record_window(monkeypatch, tmp_path: Path) -> Path:
+    monkeypatch.setattr(probe, "STATE_ROOT", tmp_path / "state")
+    monkeypatch.setattr(probe, "PROC_ROOT", tmp_path / "proc")
+    monkeypatch.setattr(probe.time, "sleep", lambda _seconds: None)
+    probe.save_state(
+        RUN_ID,
+        {
+            "run_id": RUN_ID,
+            "mode": "kmsg",
+            "unit": probe.KERNEL_UNIT,
+            "after": {"InvocationID": "c" * 32, "MainPID": "4242"},
+        },
+    )
+    probe.records_path(RUN_ID).write_text(
+        json.dumps(
+            probe.validate_records(
+                [
+                    {"message": "NVRM: Xid (PCI:0000:53:00): 92, twin", "emissions": 2},
+                    {
+                        "message": "NVRM: Xid (PCI:0000:53:00): 92, again",
+                        "emissions": 3,
+                    },
+                ]
+            )
+        ),
+        encoding="utf-8",
+    )
+    fixture = probe.kmsg_fixture_path(RUN_ID)
+    fixture.write_text("", encoding="utf-8")
+    return fixture
+
+
+def test_arm_index_appends_one_record_with_its_own_sequence_and_write_time(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    fixture = _two_record_window(monkeypatch, tmp_path)
+    clock = iter([1_000.0, 1_001.0, 2_000.0, 2_001.0, 2_002.0])
+    monkeypatch.setattr(probe.time, "time", lambda: next(clock))
+
+    probe.arm(argparse.Namespace(run_id=RUN_ID, index=0))
+    first = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    lines = fixture.read_text(encoding="utf-8").splitlines()
+    assert first["indexes"] == [0] and first["lines_written"] == 2, first
+    assert (first["written_at"], first["last_written_at"]) == (1_000.0, 1_001.0)
+    assert [line.split(";", 1)[1] for line in lines] == [
+        "NVRM: Xid (PCI:0000:53:00): 92, twin"
+    ] * 2, lines
+    assert {line.split(",")[1] for line in lines} == {
+        str(probe.kmsg_sequence(RUN_ID, 0))
+    }, "record 0's copies share record 0's sequence"
+
+    probe.arm(argparse.Namespace(run_id=RUN_ID, index=1))
+    second = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    later = fixture.read_text(encoding="utf-8").splitlines()[2:]
+    assert second["indexes"] == [1] and second["lines_written"] == 3, second
+    assert second["written_at"] == 2_000.0, "the repeat exists from its own write"
+    assert {line.split(",")[1] for line in later} == {
+        str(probe.kmsg_sequence(RUN_ID, 1))
+    }, "the repeat is a distinct kernel record, not a copy of the first"
+    assert all(line.endswith("92, again") for line in later), later
+
+
+def test_arm_without_an_index_still_writes_every_record(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    fixture = _two_record_window(monkeypatch, tmp_path)
+    probe.arm(argparse.Namespace(run_id=RUN_ID))
+    receipt = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert receipt["indexes"] == [0, 1] and receipt["lines_written"] == 6, receipt
+    assert len(fixture.read_text(encoding="utf-8").splitlines()) == 6
+
+
+def test_arm_index_is_refused_out_of_range_and_in_journal_mode(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _two_record_window(monkeypatch, tmp_path)
+    with pytest.raises(probe.ProbeError, match="not installed"):
+        probe.arm(argparse.Namespace(run_id=RUN_ID, index=2))
+    state = probe.load_state(RUN_ID)
+    probe.save_state(RUN_ID, {**state, "mode": "journal", "unit": probe.LOG_UNIT})
+    with pytest.raises(probe.ProbeError, match="kmsg records"):
+        probe.arm(argparse.Namespace(run_id=RUN_ID, index=0))
+    assert (
+        probe.parser().parse_args(["arm", "--run-id", RUN_ID, "--index", "1"]).index
+        == 1
+    ), "the parser carries the index"
+
+
+def test_controller_arms_one_kmsg_record_and_refuses_it_in_journal_mode(
+    tmp_path: Path,
+) -> None:
+    controller, fake = _controller(
+        tmp_path, {"arm": {"armed": True, "written_at": 5.0}}, mode="kmsg"
+    )
+    assert controller.arm(index=1)["written_at"] == 5.0
+    assert fake.calls[-1] == ("arm", "--run-id", controller.run_id, "--index", "1")
+    controller.arm()
+    assert fake.calls[-1] == ("arm", "--run-id", controller.run_id), (
+        "without an index every record is armed, as before"
+    )
+    journal, _ = _controller(tmp_path, {"arm": {"armed": True}})
+    with pytest.raises(ValueError, match="kmsg"):
+        journal.arm(index=0)

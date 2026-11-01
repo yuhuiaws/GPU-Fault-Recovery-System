@@ -38,6 +38,19 @@ lines 23-24, ``maxKeepAge = 600.0`` / ``maxKeepSamples = 0``; whether DCGM
 drops the lone event sample at that age was not verified; a hostengine restart
 clears it). Every other field keeps the refusal.
 
+The gauge's values are allow-listed per profile. ``pcie_xid`` (022) may set
+only 0 and XID 32; ``xid_twin`` (GF-GENERAL-LIVE-024 ``xid_twin_*``, batch 237)
+replays the gauge as the field-230 *twin* of a reviewed kernel line that names
+the same XID on the same GPU -- 0 (the product's "no XID" baseline), 92, 48 or
+154, the XIDs those variants pair -- and nothing else: no counter, no label,
+no other field. A twin value alone would be a second fault to a product
+without batch 237, which is why its variants refuse to deploy before they have
+asked the control plane which generation it runs.
+
+Every journal record carries ``at``, this host's wall clock (``time.time()``)
+when the read was served or the event taken: the runner places a kernel line
+and the gauge's change on the collector's own scrape schedule from it.
+
 No GPU, Kubernetes or collector configuration is changed by this tool. Do not
 point a production collector at this test endpoint. A replay proves the
 processing chain, never the physical fault: every receipt says
@@ -54,6 +67,7 @@ import math
 import re
 import time
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -117,6 +131,15 @@ PCIE_FIELDS = frozenset({"pcie_replay_total"})
 #: breaches only ``> 0``): a plan serves it first so the later 32 is a *dated
 #: change*, not a first-seen value the product baselines silently.
 XID_FIELDS = frozenset({"xid_last_error"})
+#: The gauge values of the ``xid_twin`` profile: 0 (the product's "no XID"
+#: baseline) and the three XIDs GF-GENERAL-LIVE-024's ``xid_twin_*`` variants
+#: pair with a reviewed kernel line of the same code on the same GPU -- 92
+#: (EXCESSIVE_SBE_INTERRUPTS, catalog IGNORE: MONITOR_ONLY), 48
+#: (ROBUST_CHANNEL_GPU_ECC_DBE, WORKFLOW_XID_48: solo RESET_GPU) and 154
+#: (GPU_RECOVERY_ACTION_CHANGED, XID_154: the kernel line's recovery-action
+#: label decides; field 230 carries none). 79 and 32 stay out of it: no twin
+#: variant pairs them.
+XID_TWIN_VALUES = frozenset({0, 48, 92, 154})
 
 
 @dataclass(frozen=True)
@@ -153,7 +176,12 @@ class AbsentGauge:
 #:   value"). The same ``toMetric`` (lines 950-958) adds ``err_code`` /
 #:   ``err_msg`` labels to the XID sample from ``xid_errors.go`` (line 21
 #:   ``0: "No Error"``, line 53 ``32: "Invalid or corrupted push buffer
-#:   stream"``), rendered as labels by ``rendermetrics/render_metrics.go``
+#:   stream"``; for the ``xid_twin`` values line 69 ``48:  "Double Bit ECC
+#:   Error"``, line 113 ``92:  "High single-bit ECC error rate"`` and line 175
+#:   ``154: "GPU Recovery Action Changed"`` -- the file at tag 4.8.4,
+#:   https://github.com/NVIDIA/dcgm-exporter/blob/4.8.4/internal/pkg/collector/xid_errors.go,
+#:   194 lines, sha256 fa5b8d85325e3eab6318b4a5e5b1cdf6f54595c28c584a0fc7215be9f7ba9d4c,
+#:   fetched 2026-11-01), rendered as labels by ``rendermetrics/render_metrics.go``
 #:   line 486 (``builder.addMap(metric.Attributes)``).
 #: * DCGM v4.6.1 (https://github.com/NVIDIA/DCGM, tag v4.6.1)
 #:   ``dcgmlib/src/DcgmCacheManager.cpp``: the polled-field switch, lines
@@ -202,6 +230,9 @@ ABSENT_WHEN_HEALTHY: dict[str, AbsentGauge] = {
                 "err_code": "32",
                 "err_msg": "Invalid or corrupted push buffer stream",
             },
+            48: {"err_code": "48", "err_msg": "Double Bit ECC Error"},
+            92: {"err_code": "92", "err_msg": "High single-bit ECC error rate"},
+            154: {"err_code": "154", "err_msg": "GPU Recovery Action Changed"},
         },
     ),
 }
@@ -263,11 +294,19 @@ OPERATION_KEYS: dict[str, frozenset[str]] = {
 
 @dataclass(frozen=True)
 class Profile:
-    """What one category's plans may do: fields, operations, labels."""
+    """What one category's plans may do: fields, operations, labels, and the
+    values a ``set`` may write where they are narrower or other than the
+    field's ``SET_VALUES``."""
 
     fields: frozenset[str]
     operations: frozenset[str]
     labels: frozenset[str] = frozenset()
+    values: Mapping[str, frozenset[int]] = field(default_factory=dict)
+
+    def set_values(self, name: str) -> frozenset[int] | None:
+        """The values a ``set`` of ``name`` may write in this profile."""
+
+        return self.values.get(name, SET_VALUES.get(name))
 
 
 PROFILES: dict[str, Profile] = {
@@ -287,6 +326,13 @@ PROFILES: dict[str, Profile] = {
     ),
     # GF-GENERAL-LIVE-022 expired XID join: the PCIe counter and the gauge.
     "pcie_xid": Profile(PCIE_FIELDS | XID_FIELDS, frozenset({"add", "set"})),
+    # GF-GENERAL-LIVE-024 xid_twin_*: the gauge alone, as the field-230 twin of
+    # a reviewed kernel line of the same XID on the same GPU (batch 237).
+    "xid_twin": Profile(
+        XID_FIELDS,
+        frozenset({"set"}),
+        values={"xid_last_error": XID_TWIN_VALUES},
+    ),
     # GF-GENERAL-LIVE-024 non-environment DCGM components of the composites.
     "composite": Profile(MEMORY_FIELDS | NVLINK_FIELDS, frozenset({"add", "set"})),
     # GF-GENERAL-LIVE-025 field / alias / NaN / duplicate structure.
@@ -364,7 +410,7 @@ def validate_operation(operation: Any, profile: Profile) -> dict[str, Any]:
         if type(value) is not int or not 1 <= value <= MAX_ADD:
             raise ValueError(f"add needs an integer increment in 1..{MAX_ADD}")
     elif kind == "set":
-        allowed = SET_VALUES.get(name)
+        allowed = profile.set_values(name)
         if allowed is None:
             raise ValueError(f"{name} is a counter; use add, not set")
         if type(operation["value"]) is not int or operation["value"] not in allowed:
@@ -657,6 +703,7 @@ class Replay:
         current = self.active()
         receipt: dict[str, Any] = {
             "read": self.reads + 1,
+            "at": time.time(),
             "profile": self.plan["profile"],
             "proof_scope": PROOF_SCOPE,
             "physical_fault_injected": False,
@@ -878,7 +925,14 @@ def make_server(upstream: str, port: int, replay: Replay, audit: Any) -> HTTPSer
                 output, receipt = replay.render(original)
             except (OSError, ValueError, UnicodeError) as error:
                 audit.write(
-                    json.dumps({"error": str(error), "read": replay.reads + 1}) + "\n"
+                    json.dumps(
+                        {
+                            "error": str(error),
+                            "read": replay.reads + 1,
+                            "at": time.time(),
+                        }
+                    )
+                    + "\n"
                 )
                 audit.flush()
                 self.respond(
@@ -906,7 +960,14 @@ def make_server(upstream: str, port: int, replay: Replay, audit: Any) -> HTTPSer
                     self.respond(409, str(error).encode())
                     return
                 audit.write(
-                    json.dumps({"event": "ADVANCE", "read": replay.reads, "step": step})
+                    json.dumps(
+                        {
+                            "event": "ADVANCE",
+                            "read": replay.reads,
+                            "step": step,
+                            "at": time.time(),
+                        }
+                    )
                     + "\n"
                 )
                 audit.flush()
@@ -915,7 +976,10 @@ def make_server(upstream: str, port: int, replay: Replay, audit: Any) -> HTTPSer
             if self.path == "/disarm":
                 replay.disarm()
                 audit.write(
-                    json.dumps({"event": "DISARM", "read": replay.reads}) + "\n"
+                    json.dumps(
+                        {"event": "DISARM", "read": replay.reads, "at": time.time()}
+                    )
+                    + "\n"
                 )
                 audit.flush()
                 self.respond(200, b"disarmed\n")
@@ -926,7 +990,14 @@ def make_server(upstream: str, port: int, replay: Replay, audit: Any) -> HTTPSer
                 self.respond(409, str(error).encode())
                 return
             audit.write(
-                json.dumps({"event": "ARM", "start_read": replay.start_read}) + "\n"
+                json.dumps(
+                    {
+                        "event": "ARM",
+                        "start_read": replay.start_read,
+                        "at": time.time(),
+                    }
+                )
+                + "\n"
             )
             audit.flush()
             self.respond(200, b"armed\n")

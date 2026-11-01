@@ -1181,3 +1181,123 @@ def test_the_synthesised_gauge_follows_the_exporter_configuration_and_vendor_lab
     assert tool.SET_VALUES["xid_last_error"] == {0, 32}, "0 baselines, 32 joins"
     with pytest.raises(ValueError, match="only be set"):
         plan("pcie_xid", (1, [xid(A, 79)]))
+
+
+# --------------------------------------------------------------------------- #
+# xid_twin: the gauge as the field-230 twin of a reviewed kernel line
+# (GF-GENERAL-LIVE-024 xid_twin_*, batch 237)
+# --------------------------------------------------------------------------- #
+def test_the_twin_profile_sets_only_the_paired_xids_and_only_the_gauge():
+    for value in (0, 48, 92, 154):
+        declared_plan((1, [xid(B, value)]), profile="xid_twin")
+    for value in (32, 79, 13, 63, 1):
+        with pytest.raises(ValueError, match="only be set"):
+            declared_plan((1, [xid(B, value)]), profile="xid_twin")
+    with pytest.raises(ValueError, match="not allowed by this profile"):
+        declared_plan(
+            (1, [{"op": "add", "field": "xid_last_error", "gpus": [B], "value": 1}]),
+            profile="xid_twin",
+        )
+    with pytest.raises(ValueError, match="allow-list"):
+        declared_plan(
+            (1, [{"op": "set", "field": "row_remap_pending", "gpus": [B], "value": 1}]),
+            profile="xid_twin",
+        )
+    assert tool.PROFILES["xid_twin"].set_values("xid_last_error") == {0, 48, 92, 154}
+    assert tool.SET_VALUES["xid_last_error"] == {0, 32}, "the global values stand"
+    # pcie_xid keeps 0 and 32 only.
+    with pytest.raises(ValueError, match="only be set"):
+        declared_plan((1, [xid(B, 48)]))
+    assert tool.PROFILES["memory"].set_values("row_remap_pending") == {0, 1}
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        (48, "Double Bit ECC Error"),
+        (92, "High single-bit ECC error rate"),
+        (154, "GPU Recovery Action Changed"),
+    ],
+)
+def test_the_twin_gauge_is_synthesised_with_the_exporter_labels_of_its_xid(
+    value: int, message: str
+):
+    # dcgm-exporter 4.8.4 internal/pkg/collector/xid_errors.go lines 69, 113
+    # and 175 (the err_msg the exporter attaches to the value).
+    replay = tool.Replay(
+        declared_plan((1, [xid(B, 0)]), (2, [xid(B, value)]), profile="xid_twin"), 600
+    )
+    replay.arm()
+    body = live_exporter()
+    output, receipt = serve_once(replay, body)
+    assert product_view(output)[(B, "xid_last_error")] == [0.0], output
+    assert receipt["profile"] == "xid_twin" and receipt["aborted"] is None, receipt
+    output, receipt = serve_once(replay, body)
+    assert product_view(output)[(B, "xid_last_error")] == [float(value)], output
+    assert (A, "xid_last_error") not in product_view(output), "one GPU only"
+    template = labels_of(body, "pcie_replay_total")[B]
+    assert labels_of(output, "xid_last_error")[B] == {
+        **template,
+        "err_code": str(value),
+        "err_msg": message,
+    }
+    assert tool.ABSENT_WHEN_HEALTHY["xid_last_error"].labels(value) == {
+        "err_code": str(value),
+        "err_msg": message,
+    }
+
+
+def test_every_journal_record_carries_the_hosts_wall_clock(monkeypatch):
+    """The runner places a kernel line on the collector's scrape schedule from
+    ``at``: every read, ARM, ADVANCE and DISARM carries it."""
+
+    clock = iter(float(second) for second in range(1_000, 1_100))
+    monkeypatch.setattr(tool.time, "time", lambda: next(clock))
+    monkeypatch.setattr(
+        tool, "open_upstream", lambda *_a, **_k: io.BytesIO(live_exporter())
+    )
+    replay = tool.Replay(
+        tool.validate_plan(
+            {
+                "profile": "xid_twin",
+                "steps": [
+                    {"reads": 5, "ops": [xid(B, 0)], "until_advance": True},
+                    {"reads": 5, "ops": [xid(B, 92)], "until_advance": True},
+                ],
+                "fields": XID_DECLARED,
+            }
+        ),
+        600,
+    )
+    audit = io.StringIO()
+    server = tool.make_server("http://127.0.0.1:9400/metrics", 0, replay, audit)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    acknowledged = {"X-GFRS-Replay-Ack": tool.ACKNOWLEDGEMENT}
+    try:
+        for path in ("/arm", "/metrics", "/advance", "/metrics", "/disarm"):
+            if path == "/metrics":
+                with urlopen(base + path, timeout=5) as response:
+                    response.read()
+            else:
+                with urlopen(
+                    Request(base + path, method="POST", headers=acknowledged), timeout=5
+                ):
+                    pass
+        records = [json.loads(line) for line in audit.getvalue().splitlines()]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(5)
+    shapes = [item.get("event") or item.get("read") for item in records]
+    assert shapes == ["ARM", 1, "ADVANCE", 2, "DISARM"], records
+    stamps = [item["at"] for item in records]
+    assert all(isinstance(item, float) for item in stamps), stamps
+    assert stamps == sorted(stamps), "one clock, in journal order"
+    served = [
+        item["served"].get(f"{B}/xid_last_error")
+        for item in records
+        if "served" in item
+    ]
+    assert served == [0.0, 92.0], records
