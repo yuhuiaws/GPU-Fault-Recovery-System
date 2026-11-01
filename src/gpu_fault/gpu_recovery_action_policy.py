@@ -82,6 +82,7 @@ from gpu_fault.models import (
     WorkflowOperation,
     WorkflowStepStatus,
 )
+from gpu_fault.pci_identity import same_pci_device
 from gpu_fault.policy.models import DIRECT_ACTION_MAP, DynamicRecoveryAction
 
 GPU_RECOVERY_ACTION = "gpu_recovery_action"
@@ -226,12 +227,14 @@ def xid154_outcome(action: DynamicRecoveryAction) -> tuple[RecoveryAction, str]:
 
 def _same_gpu(gpu_uuid: Any, pci_bdf: Any, sample: Any) -> bool:
     """Whether an XID event's GPU is the sample's; an event naming no GPU is
-    node-wide and owns every GPU (fail toward evidence, not a second plan)."""
+    node-wide and owns every GPU (fail toward evidence, not a second plan).
+    A PCI address names a device in any spelling (batch 236): the kernel
+    line's ``0000:59:00`` is the exporter's ``00000000:59:00.0``."""
 
     if gpu_uuid and sample.gpu_uuid:
         return bool(gpu_uuid == sample.gpu_uuid)
     if pci_bdf and sample.pci_bdf:
-        return str(pci_bdf).lower() == str(sample.pci_bdf).lower()
+        return same_pci_device(str(pci_bdf).lower(), str(sample.pci_bdf).lower())
     return not gpu_uuid and not pci_bdf
 
 

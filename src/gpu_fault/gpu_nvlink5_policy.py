@@ -85,6 +85,7 @@ from gpu_fault.gpu_power_policy import (
 from gpu_fault.gpu_product_windows import describe_window, product_link_window
 from gpu_fault.gpu_recovery_action_policy import OPEN_INCIDENT_STATES
 from gpu_fault.models import RecoveryAction
+from gpu_fault.pci_identity import same_pci_device
 
 LOGGER = logging.getLogger(__name__)
 NVLINK5_RECOVERY_SUCCESSFUL, NVLINK5_RECOVERY_FAILED, NVLINK5_RECOVERY_EVENTS = (
@@ -318,12 +319,13 @@ def recovery_decision(
 
 def _names_gpu(gpu_uuid: Any, pci_bdf: Any, sample: Any) -> bool:
     """Whether an XID record names the sample's GPU; one naming no GPU is
-    node-wide and owns every GPU (fail toward evidence, not a second plan)."""
+    node-wide and owns every GPU (fail toward evidence, not a second plan).
+    A PCI address names a device in any spelling (``pci_identity``, b236)."""
 
     if gpu_uuid and sample.gpu_uuid:
         return bool(gpu_uuid == sample.gpu_uuid)
     if pci_bdf and sample.pci_bdf:
-        return str(pci_bdf).lower() == str(sample.pci_bdf).lower()
+        return same_pci_device(str(pci_bdf).lower(), str(sample.pci_bdf).lower())
     return not gpu_uuid and not pci_bdf
 
 

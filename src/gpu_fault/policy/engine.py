@@ -13,6 +13,7 @@ from gpu_fault.models import (
     Severity,
     WorkloadState,
 )
+from gpu_fault.pci_identity import same_pci_device
 from gpu_fault.policy.catalog import (
     load_sxid_policy,
     load_xid_policy,
@@ -1241,7 +1242,7 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
         if left.gpu_uuid and right.gpu_uuid:
             return left.gpu_uuid == right.gpu_uuid
         if left.pci_bdf and right.pci_bdf:
-            return left.pci_bdf.lower() == right.pci_bdf.lower()
+            return same_pci_device(left.pci_bdf.lower(), right.pci_bdf.lower())
         return False
 
     def _decision(
