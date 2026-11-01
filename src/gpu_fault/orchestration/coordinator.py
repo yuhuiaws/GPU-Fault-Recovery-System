@@ -831,17 +831,23 @@ class IncidentOrchestrator:
         event: XidEvent | SxidEvent,
         decision: FaultPolicyDecision,
     ) -> FaultIncident | None:
-        """F-B8: fence a stale event even when no recovery workflow exists.
+        """F-B8: fence a stale recovery even when no recovery workflow exists.
 
-        ``_generation_fence`` compares a stale candidate against the ranked
-        recovery workflow of the running attempt and admits only escalations.
-        When there is no such workflow the attempt restart itself is the
-        recovery that already answered the fault, so the comparison baseline
-        is RESTART_WORKLOAD's rank. A candidate that does not out-rank it is
-        recorded as an ignored incident with no workflow; the families never
-        see it, so nothing acts on a fault the restart has already left behind.
+        ``_generation_fence`` admits a stale candidate over the ranked recovery
+        workflow of the running attempt only as an escalation. Without such a
+        workflow the attempt restart is the recovery that already answered the
+        fault, so the baseline is RESTART_WORKLOAD's rank: a candidate that does
+        not out-rank it is recorded as an ignored incident with no workflow. Only
+        a recovery or an observation (EXECUTABLE, MONITOR_ONLY) is fenced: a
+        containment or operator decision (NOT_APPLICABLE, SITE_SAFETY, BLOCKED_*)
+        runs safety steps, not the official ones ranked here, and no restart
+        answers it (b238: such a quarantine was recorded RECOVERED with a live
+        marker, and the NOT_APPLICABLE notice then refused the event with a 409).
         """
 
+        fenced = (ActionDisposition.EXECUTABLE, ActionDisposition.MONITOR_ONLY)
+        if decision.disposition not in fenced:
+            return None
         observation = self._evidence_operations.attempt_observation(
             event, record_ambiguity=False
         )
@@ -856,32 +862,26 @@ class IncidentOrchestrator:
             return None
         candidate_workflow = self._candidate_recovery_workflow(event, decision)
         candidate_rank = self._arbiter.workflow_recovery_rank(candidate_workflow)
-        restart_rank = self._arbiter.RECOVERY_OPERATION_RANK[
-            WorkflowOperation.RESTART_WORKLOAD
-        ]
+        restart_rank = RECOVERY_OPERATION_RANK[WorkflowOperation.RESTART_WORKLOAD]
         if candidate_rank > restart_rank:
             return None
         event_name = (
             f"XID {event.xid}" if isinstance(event, XidEvent) else f"SXID {event.sxid}"
         )
         reason = (
-            f"Ignored stale {event_name} action for previous attempt "
-            f"generation: event_time={event_time.isoformat()}, "
-            f"current_attempt={observation.attempt_id}, "
-            "current_attempt_started_at="
-            f"{attempt_started_at.isoformat()}, "
-            f"candidate_rank={candidate_rank}, "
+            f"Ignored stale {event_name} action for previous attempt generation: "
+            f"event_time={event_time.isoformat()}, current_attempt="
+            f"{observation.attempt_id}, current_attempt_started_at="
+            f"{attempt_started_at.isoformat()}, candidate_rank={candidate_rank}, "
             f"current_recovery_rank={restart_rank} (the attempt restart is the "
-            "baseline; no recovery workflow to compare); "
-            "action is not an escalation"
+            "baseline; no recovery workflow to compare); action is not an escalation"
         )
         incident = self._independent_incident(
             event, decision, extra_reasons=[reason]
         ).model_copy(update={"state": IncidentState.RECOVERED})
-        # ``incident.event_id`` is this event's id and ``save_incident`` links
-        # it inside the same transaction on all three backends; the separate
-        # ``link_event_to_incident`` was a second autocommit for nothing, and a
-        # crash between the two left the fenced incident unlinked (C-09).
+        # ``save_incident`` links ``incident.event_id`` (this event) in the same
+        # transaction on all three backends; a separate ``link_event_to_incident``
+        # was a second autocommit, and a crash between them left it unlinked (C-09).
         self.store.save_incident(incident)
         return incident
 

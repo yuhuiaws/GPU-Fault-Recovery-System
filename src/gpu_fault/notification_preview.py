@@ -55,11 +55,21 @@ class NotificationPreviewService:
             )
         with self.callbacks.incident_lock(incident_id):
             incident = self.store.get_incident(incident_id)
-            if not incident.workflow_request_id:
-                raise AdvisoryNotApplicableError(
-                    "NOT_APPLICABLE incident has no safety workflow"
-                )
-            workflow = self.store.get_workflow(incident.workflow_request_id)
+            # A recorded incident -- a line from a boot the node has left
+            # (``reboot_window.cover_fault``) -- plans nothing and has no
+            # workflow. The notice says so, with the incident's own reason,
+            # instead of refusing the event: the kernel route answered that
+            # refusal with a 409, and the decision was never finalized (b238).
+            workflow = (
+                self.store.get_workflow(incident.workflow_request_id)
+                if incident.workflow_request_id
+                else None
+            )
+            reasons = (
+                decision.reasons
+                if workflow is not None
+                else list(dict.fromkeys([*decision.reasons, *incident.reasons]))
+            )
             evidence_refs = self.callbacks.evidence_refs_for_incident(
                 incident_id,
                 event.evidence_ref,
@@ -81,16 +91,26 @@ class NotificationPreviewService:
                 investigatory_action=decision.investigatory_action,
                 policy_source=decision.source.value,
                 policy_version=decision.policy_version,
-                reasons=decision.reasons,
+                reasons=reasons,
                 safety_action=(
-                    decision.safety_action.value if decision.safety_action else None
+                    decision.safety_action.value
+                    if decision.safety_action and workflow is not None
+                    else None
                 ),
-                workflow_id=workflow.request_id,
-                workflow_status=workflow.status.value,
-                safety_steps=[item.operation.value for item in workflow.safety_steps],
-                official_steps=[
-                    item.operation.value for item in workflow.official_steps
-                ],
+                workflow_id=workflow.request_id if workflow is not None else "NONE",
+                workflow_status=(
+                    workflow.status.value if workflow is not None else "NONE"
+                ),
+                safety_steps=(
+                    [item.operation.value for item in workflow.safety_steps]
+                    if workflow is not None
+                    else []
+                ),
+                official_steps=(
+                    [item.operation.value for item in workflow.official_steps]
+                    if workflow is not None
+                    else []
+                ),
                 evidence_refs=evidence_refs,
             )
             return self.store.save_notification_if_absent(notification)

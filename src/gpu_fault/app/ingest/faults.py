@@ -16,6 +16,7 @@ from gpu_fault.host_health import (
 )
 from gpu_fault.markers import retire_markers_for_incident
 from gpu_fault.models import (
+    FaultIncident,
     IncidentState,
     NodeMarker,
     RecoveryAction,
@@ -53,6 +54,8 @@ from gpu_fault.telemetry import WorkloadContext
 LOGGER = logging.getLogger(__name__)
 #: Who retires the marker of a report that joined an already recovered incident.
 JOINED_RECOVERED_INCIDENT_ACTOR = "xid-ingest:joined-recovered-incident"
+#: Who retires the marker of an incident ingest recorded RECOVERED (b238).
+RECORDED_INCIDENT_ACTOR = "fault-ingest:recorded-incident"
 
 #: Every kind ``unresolved_reason_kind`` can return. A provider signal that
 #: carries no unresolved reason clears the episode of each one, so a kind that
@@ -574,6 +577,42 @@ class FaultIngestionService:
             self.context.store.get_xid_policy_decision,
         )
 
+    def _retire_recovered_markers(
+        self,
+        event: XidEvent | SxidEvent,
+        decision: FaultPolicyDecision,
+        incident: FaultIncident,
+    ) -> None:
+        """A RECOVERED incident keeps no live marker (ARCH-I4).
+
+        Two ingest answers end RECOVERED with no workflow that would retire the
+        marker later: the other source's report of an XID whose incident had
+        already recovered (``xid_cross_source``, batch 237), and an incident
+        recorded at ingest -- a stale recovery the attempt restart answered
+        (F-B8), a line from a boot the node has left (``cover_fault``). A live
+        marker of the second kind kept matching the node's terminal events and,
+        as a QUARANTINE, kept the node out of warm-spare reuse until its TTL
+        (b238).
+        """
+
+        if incident.state is not IncidentState.RECOVERED or not decision.marker.active:
+            return
+        joined = incident.event_id != event.event_id
+        retire_markers_for_incident(
+            self.context.store,
+            incident.incident_id,
+            reason=(
+                f"event {event.event_id} joined incident {incident.incident_id} "
+                "after it recovered"
+                if joined
+                else f"event {event.event_id}: incident {incident.incident_id} "
+                "was recorded RECOVERED, nothing planned"
+            ),
+            retired_by=(
+                JOINED_RECOVERED_INCIDENT_ACTOR if joined else RECORDED_INCIDENT_ACTOR
+            ),
+        )
+
     def finalize_xid(
         self, event: XidEvent, decision: FaultPolicyDecision
     ) -> FaultPolicyDecision:
@@ -626,23 +665,7 @@ class FaultIngestionService:
         decision = bind_marker_incident(decision, incident.incident_id)
         report_processor_replay_phase("xid_marker")
         self._record_event_marker(decision.marker, repeated=repeated)
-        if (
-            incident.state is IncidentState.RECOVERED
-            and incident.event_id != event.event_id
-            and decision.marker.active
-        ):
-            # The other source's report of an XID whose incident already
-            # recovered (``xid_cross_source``) joins it as evidence; a
-            # RECOVERED incident keeps no live marker (ARCH-I4).
-            retire_markers_for_incident(
-                self.context.store,
-                incident.incident_id,
-                reason=(
-                    f"event {event.event_id} joined incident "
-                    f"{incident.incident_id} after it recovered"
-                ),
-                retired_by=JOINED_RECOVERED_INCIDENT_ACTOR,
-            )
+        self._retire_recovered_markers(event, decision, incident)
         report_processor_replay_phase("xid_notification")
         if decision.disposition is ActionDisposition.NOT_APPLICABLE:
             notification = self.context.advisory_notifications.preview_not_applicable(
@@ -740,6 +763,7 @@ class FaultIngestionService:
         # The SXID duplicate flag comes from a process-local cache, so any
         # replica may be serving a repeat: every SXID checks.
         self._record_event_marker(decision.marker, repeated=True)
+        self._retire_recovered_markers(event, decision, incident)
         report_processor_replay_phase("sxid_notification")
         notification = self.context.advisory_notifications.try_preview(
             incident.incident_id
