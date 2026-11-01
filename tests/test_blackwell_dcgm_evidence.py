@@ -27,7 +27,7 @@ from gpu_fault import (
     gpu_nvlink5_policy,
     gpu_product_windows,
 )
-from gpu_fault.policy import nvlink5_gauge
+from gpu_fault.policy import xid_cross_source
 
 ROOT = Path(__file__).resolve().parents[1]
 DESIGNS = ("docs/详细设计.md", "docs/en/detailed-design.md")
@@ -278,7 +278,7 @@ def test_the_modules_name_their_windows_and_twins():
     """The window and the twin rules carry their reasons in the code."""
 
     assert "Fabric Manager" in (gpu_product_windows.__doc__ or "")
-    assert "kernel twin" in (nvlink5_gauge.__doc__ or "")
+    assert "kernel twin" in (xid_cross_source.__doc__ or "")
     assert dcgm_fields.NVLINK5_LINK_RECOVERY_CANONICAL == (
         "nvlink_link_recovery_successful_total",
         "nvlink_link_recovery_failed_total",

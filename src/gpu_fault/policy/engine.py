@@ -4,7 +4,7 @@ import re
 from collections import OrderedDict
 from datetime import timedelta
 from threading import RLock
-from typing import Callable, NamedTuple
+from typing import Any, Callable, NamedTuple
 
 from gpu_fault.models import (
     MarkerScope,
@@ -13,7 +13,6 @@ from gpu_fault.models import (
     Severity,
     WorkloadState,
 )
-from gpu_fault.pci_identity import same_pci_device
 from gpu_fault.policy.catalog import (
     load_sxid_policy,
     load_xid_policy,
@@ -41,12 +40,12 @@ from gpu_fault.policy.models import (
     XidPolicy,
     _Resolution,
 )
-from gpu_fault.policy.nvlink5_gauge import workflow_nvlink5
 from gpu_fault.policy.nvlink74 import resolve_nvlink74
 from gpu_fault.policy.product_families import (
     ProductFamilyPolicyMixin,
     ProductFamilyResolver,
 )
+from gpu_fault.policy.xid_cross_source import follow_report_twin, same_gpu
 
 # The catalog's Immediate Action token for XID 154. It is a workflow like any
 # other NVIDIA workflow -- it is dispatched from _XID_WORKFLOW_RESOLVERS rather
@@ -81,6 +80,11 @@ class _XidCorrelation(NamedTuple):
     companion_events: list[XidEvent]
     xid45_window_closed: bool
     xid154_window_closed: bool
+    #: Kernel lines / field-230 changes already paired with another report;
+    #: ``None`` when the pairing is ambiguous and no twin is taken
+    #: (``xid_cross_source``).
+    paired_report_ids: frozenset[str] | None = frozenset()
+    report_twin_window_closed: bool = True
 
 
 class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
@@ -139,6 +143,7 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
         companion_events: list[XidEvent] | None = None,
         xid45_window_closed: bool = True,
         xid154_window_closed: bool = True,
+        **twin_options: Any,
     ) -> FaultPolicyDecision:
         with self._lock:
             duplicate = self._cached(event.event_id)
@@ -150,6 +155,7 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
                 companion_events=companion_events,
                 xid45_window_closed=xid45_window_closed,
                 xid154_window_closed=xid154_window_closed,
+                **twin_options,
             )
             decision = self._decision(
                 event=event,
@@ -182,21 +188,27 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
         companion_events: list[XidEvent] | None = None,
         xid45_window_closed: bool = True,
         xid154_window_closed: bool = True,
+        follow_twin: bool = True,
+        **twin_options: Any,
     ) -> _Resolution:
         """Resolve one XID into exactly one NVIDIA-sourced outcome.
 
-        The guards run before any workflow and in a fixed order: an XID outside
-        the pinned catalog and one that does not apply to this product can
-        never reach a recovery action. XID 154 linkage describes reporting
-        support, not the minimum version of the original fault. Workflow
-        decoders still require the version evidence their encoding needs.
+        A DCGM field-230 change with a kernel twin takes the twin's decode
+        (``xid_cross_source``). Then the guards run before any workflow and in
+        a fixed order: an XID outside the pinned catalog and one that does not
+        apply to this product can never reach a recovery action. XID 154
+        linkage describes reporting support, not the minimum version of the
+        original fault; decoders still require the evidence they need.
         """
 
         correlation = _XidCorrelation(
-            companion_events=companion_events or [],
-            xid45_window_closed=xid45_window_closed,
-            xid154_window_closed=xid154_window_closed,
+            companion_events or [],
+            xid45_window_closed,
+            xid154_window_closed,
+            **twin_options,
         )
+        if follow_twin and (twin := follow_report_twin(self, event, correlation)):
+            return twin
         rule = self._rules.get(event.xid)
         if rule is None:
             return _Resolution(
@@ -1228,7 +1240,7 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
             and item.event_id != event.event_id
             and item.cluster_id == event.cluster_id
             and item.node_id == event.node_id
-            and self._same_gpu(event, item)
+            and same_gpu(event, item)
             and (
                 not event.source_boot_id
                 or not item.source_boot_id
@@ -1236,14 +1248,6 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
             )
             and abs(item.observed_at - event.observed_at) <= window
         ]
-
-    @staticmethod
-    def _same_gpu(left: XidEvent, right: XidEvent) -> bool:
-        if left.gpu_uuid and right.gpu_uuid:
-            return left.gpu_uuid == right.gpu_uuid
-        if left.pci_bdf and right.pci_bdf:
-            return same_pci_device(left.pci_bdf.lower(), right.pci_bdf.lower())
-        return False
 
     def _decision(
         self,
@@ -1460,8 +1464,7 @@ _XID_WORKFLOW_RESOLVERS: dict[str, _XidWorkflowResolver] = {
     "WORKFLOW_XID_45": GpuFaultPolicyEngine._workflow_xid_45,
     "WORKFLOW_XID_48": GpuFaultPolicyEngine._workflow_xid_48,
     "WORKFLOW_NVLINK_ERR": GpuFaultPolicyEngine._workflow_nvlink74,
-    # A DCGM field-230 gauge change follows its kernel twin (nvlink5_gauge).
-    "WORKFLOW_NVLINK5_ERR": workflow_nvlink5,
+    "WORKFLOW_NVLINK5_ERR": GpuFaultPolicyEngine._workflow_nvlink5,
     "CHECK_UVM": GpuFaultPolicyEngine._workflow_check_uvm,
     "CONTACT_SUPPORT": GpuFaultPolicyEngine._workflow_operator_review,
     "CHECK_MECHANICALS": GpuFaultPolicyEngine._workflow_operator_review,

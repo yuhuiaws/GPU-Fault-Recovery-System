@@ -16,7 +16,11 @@ from gpu_fault.policy import (
     XidEvent,
     parse_xid154_action,
 )
-from gpu_fault.policy.nvlink5_gauge import candidate_window
+from gpu_fault.policy.xid_cross_source import (
+    candidate_window,
+    paired_reports,
+    report_wait_window,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -72,11 +76,14 @@ class XidCorrelationCoordinator:
             return existing.model_copy(update={"duplicate": True})
 
         candidates = self._candidates(event)
+        paired = paired_reports(event, candidates, self.store.get_xid_policy_decision)
         decision = self.policy.evaluate_xid(
             event,
             companion_events=candidates,
             xid45_window_closed=False,
             xid154_window_closed=False,
+            paired_report_ids=paired,
+            report_twin_window_closed=False,
         )
         if decision.disposition is not ActionDisposition.PENDING_CORRELATION:
             self.store.save_xid_policy_decision(decision)
@@ -85,12 +92,11 @@ class XidCorrelationCoordinator:
         try:
             correlation = self.store.get_xid_correlation(event.event_id)
         except KeyError:
+            # A DCGM field-230 change waiting for its kernel line keeps its
+            # window open for the twin window (``xid_cross_source``).
             correlation = XidCorrelationRecord(
                 event_id=event.event_id,
-                deadline=(
-                    self.now()
-                    + timedelta(seconds=(self.policy.policy.companion_window_seconds))
-                ),
+                deadline=self.now() + report_wait_window(self.policy, event),
             )
             self.store.save_xid_correlation_if_absent(correlation)
             correlation = self.store.get_xid_correlation(event.event_id)
@@ -215,11 +221,16 @@ class XidCorrelationCoordinator:
                     <= item.observed_at
                     <= event.observed_at + reach
                 ]
+                paired = paired_reports(
+                    event, candidates, self.store.get_xid_policy_decision
+                )
                 decision = self.policy.evaluate_xid(
                     event,
                     companion_events=candidates,
                     xid45_window_closed=True,
                     xid154_window_closed=True,
+                    paired_report_ids=paired,
+                    report_twin_window_closed=True,
                 )
                 if decision.disposition is ActionDisposition.PENDING_CORRELATION:
                     LOGGER.error(

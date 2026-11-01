@@ -1279,7 +1279,7 @@ nodes should run the DCGM host engine 4.7.0 or later ([deployment manual](deploy
   increments 1211 or 1212 *and* 1213), an evidence-only finding is no component, and a CRITICAL `DRAIN` component (1212) makes
   the composite CRITICAL `DRAIN` (`nvlink_composite_grade`) -- a composite suppresses its components' own incidents, so a WARNING
   one must never swallow a failed link recovery. With Hopper components the composites are graded exactly as before.
-- **DCGM field 230 and the kernel line (`src/gpu_fault/policy/nvlink5_gauge.py`).** The last-XID gauge carries no registers, so an
+- **DCGM field 230 and the kernel line (`src/gpu_fault/policy/xid_cross_source.py`).** The last-XID gauge carries no registers, so an
   XID 144-150 read from it alone is `BLOCKED_MISSING_EVIDENCE`, and before batch 235 it opened a second, BLOCKED incident beside
   the kernel-sourced one of the same fault (marker association alone never merges two executions). A gauge change whose kernel
   twin -- the same XID on the same GPU (UUID, else the PCI device in either spelling), read from the kernel log within 120 s --

@@ -14,7 +14,14 @@ from gpu_fault.host_health import (
     NodeHealthFinding,
     NodeHealthIngestionResult,
 )
-from gpu_fault.models import NodeMarker, RecoveryAction, Severity, WorkloadState
+from gpu_fault.markers import retire_markers_for_incident
+from gpu_fault.models import (
+    IncidentState,
+    NodeMarker,
+    RecoveryAction,
+    Severity,
+    WorkloadState,
+)
 from gpu_fault.nvidia_logs import (
     UNCLASSIFIED_SXID_REASON,
     UNPARSED_SXID_REASON,
@@ -32,12 +39,20 @@ from gpu_fault.policy import (
     SxidEvent,
     XidEvent,
 )
+from gpu_fault.policy.xid_cross_source import (
+    KERNEL_XID_SOURCE,
+    candidate_window,
+    join_gauge_twin,
+    paired_reports,
+)
 from gpu_fault.processor_diagnostics import report_processor_replay_phase
 from gpu_fault.store import NotFoundError
 from gpu_fault.store.shared.health_signals import finding_health_signal_key
 from gpu_fault.telemetry import WorkloadContext
 
 LOGGER = logging.getLogger(__name__)
+#: Who retires the marker of a report that joined an already recovered incident.
+JOINED_RECOVERED_INCIDENT_ACTOR = "xid-ingest:joined-recovered-incident"
 
 #: Every kind ``unresolved_reason_kind`` can return. A provider signal that
 #: carries no unresolved reason clears the episode of each one, so a kind that
@@ -529,6 +544,36 @@ class FaultIngestionService:
             return
         self.context.completion.add_marker(marker)
 
+    def _join_gauge_twin(
+        self, event: XidEvent, decision: FaultPolicyDecision
+    ) -> FaultPolicyDecision:
+        """A kernel line whose DCGM field-230 change was decided first, the same
+        way, joins that change's incident (``policy/xid_cross_source``).
+
+        Compared once the decision is final -- after the generation fence and
+        the site's XID 45 policy -- so the two reports meet as the incident sees
+        them; anything else keeps the line's own decision.
+        """
+
+        if event.event_source != KERNEL_XID_SOURCE or decision.correlated_event_id:
+            return decision
+        reach = candidate_window(event, timedelta(0))
+        candidates = self.context.store.list_xid_events(
+            event.cluster_id,
+            event.node_id,
+            observed_after=event.observed_at - reach,
+            observed_before=event.observed_at + reach,
+        )
+        return join_gauge_twin(
+            event,
+            decision,
+            candidates,
+            paired_reports(
+                event, candidates, self.context.store.get_xid_policy_decision
+            ),
+            self.context.store.get_xid_policy_decision,
+        )
+
     def finalize_xid(
         self, event: XidEvent, decision: FaultPolicyDecision
     ) -> FaultPolicyDecision:
@@ -539,6 +584,8 @@ class FaultIngestionService:
         decision = self.context.orchestrator.apply_fault_action_generation_fence(
             event, decision
         )
+        if not repeated:
+            decision = self._join_gauge_twin(event, decision)
         if decision.correlated_event_id:
             report_processor_replay_phase("xid_companion_lookup")
             companion_incident = self.context.store.get_incident_by_event(
@@ -579,6 +626,23 @@ class FaultIngestionService:
         decision = bind_marker_incident(decision, incident.incident_id)
         report_processor_replay_phase("xid_marker")
         self._record_event_marker(decision.marker, repeated=repeated)
+        if (
+            incident.state is IncidentState.RECOVERED
+            and incident.event_id != event.event_id
+            and decision.marker.active
+        ):
+            # The other source's report of an XID whose incident already
+            # recovered (``xid_cross_source``) joins it as evidence; a
+            # RECOVERED incident keeps no live marker (ARCH-I4).
+            retire_markers_for_incident(
+                self.context.store,
+                incident.incident_id,
+                reason=(
+                    f"event {event.event_id} joined incident "
+                    f"{incident.incident_id} after it recovered"
+                ),
+                retired_by=JOINED_RECOVERED_INCIDENT_ACTOR,
+            )
         report_processor_replay_phase("xid_notification")
         if decision.disposition is ActionDisposition.NOT_APPLICABLE:
             notification = self.context.advisory_notifications.preview_not_applicable(

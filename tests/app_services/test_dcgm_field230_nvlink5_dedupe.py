@@ -9,6 +9,9 @@ event can never decode: on its own it is BLOCKED_MISSING_EVIDENCE. The kernel
 line of the same fault reaches the control plane first (the exporter refreshes
 on its own 15 s schedule); the gauge change must join that incident -- the
 Blackwell audit's untested §5.2 assertion -- and open no second, BLOCKED one.
+Batch 237 generalised the twin to every XID (``policy/xid_cross_source``,
+``tests/orchestration/test_xid_cross_source_dedupe.py``); these cases keep the
+NVLink5 shapes.
 
 Synthetic fixtures derived from NVIDIA documentation: the product strings are
 the driver's B-series names, the kernel line has the 2-register GSP form of
@@ -28,7 +31,7 @@ from gpu_fault.channel_registry import GPU_METRICS_PATH, NVIDIA_KERNEL_PATH
 from gpu_fault.gpu_metrics import GpuMetricBatch, GpuMetricSample, GpuMetricSource
 from gpu_fault.models import IncidentState
 from gpu_fault.policy import XidEvent
-from gpu_fault.policy.nvlink5_gauge import candidate_window, nvlink5_gauge_twin
+from gpu_fault.policy.xid_cross_source import candidate_window, report_twin
 from gpu_fault.store import InMemoryStore
 from tests._builders import asgi_client, build_context
 
@@ -202,8 +205,17 @@ def _gauge_incident(context, xid: int):
     return context.store.get_xid_policy_decision(gauge.event_id)
 
 
+def _close_twin_windows(context) -> None:
+    """Run the correlation loop past every open window."""
+
+    coordinator = context.xid_correlation
+    coordinator.now = lambda: datetime.now(timezone.utc) + timedelta(minutes=5)
+    coordinator.run_once()
+
+
 def test_a_gauge_change_without_its_kernel_line_stays_fail_closed() -> None:
-    """A lost kernel line leaves the gauge the only evidence: BLOCKED as before."""
+    """A lost kernel line leaves the gauge the only evidence: BLOCKED as before,
+    once the gauge has waited out the twin window for the line (batch 237)."""
 
     context = _replay_steps(
         (
@@ -211,6 +223,9 @@ def test_a_gauge_change_without_its_kernel_line_stays_fail_closed() -> None:
             (GPU_METRICS_PATH, _batch("gauge", 30, 149).model_dump(mode="json")),
         )
     )
+    assert _gauge_incident(context, 149).disposition.value == "PENDING_CORRELATION"
+
+    _close_twin_windows(context)
     decision = _gauge_incident(context, 149)
 
     assert decision.disposition.value == "BLOCKED_MISSING_EVIDENCE"
@@ -226,8 +241,11 @@ def test_a_kernel_line_older_than_the_twin_window_is_not_joined() -> None:
             (GPU_METRICS_PATH, _batch("gauge", 10 + 121, 149).model_dump(mode="json")),
         )
     )
+    _close_twin_windows(context)
 
-    assert _gauge_incident(context, 149).correlated_event_id is None
+    decision = _gauge_incident(context, 149)
+    assert decision.correlated_event_id is None
+    assert decision.disposition.value == "BLOCKED_MISSING_EVIDENCE"
 
 
 def test_only_the_same_xid_on_the_same_gpu_is_a_twin() -> None:
@@ -250,22 +268,25 @@ def test_only_the_same_xid_on_the_same_gpu_is_a_twin() -> None:
         }
     )
 
-    assert nvlink5_gauge_twin(gauge, [kernel]) == kernel
-    assert nvlink5_gauge_twin(gauge, [kernel.model_copy(update={"xid": 145})]) is None
+    assert report_twin(gauge, [kernel]) == kernel
+    assert report_twin(gauge, [kernel.model_copy(update={"xid": 145})]) is None
     assert (
-        nvlink5_gauge_twin(gauge, [kernel.model_copy(update={"gpu_uuid": "GPU-other"})])
+        report_twin(gauge, [kernel.model_copy(update={"gpu_uuid": "GPU-other"})])
         is None
     )
-    assert nvlink5_gauge_twin(
+    assert report_twin(
         gauge, [kernel.model_copy(update={"gpu_uuid": None})]
     ) == kernel.model_copy(update={"gpu_uuid": None}), (
         "a kernel line without a UUID still names the device by its PCI address"
     )
-    assert nvlink5_gauge_twin(kernel, [gauge]) is None, "only a gauge has a twin"
-    assert nvlink5_gauge_twin(gauge.model_copy(update={"xid": 79}), [kernel]) is None
+    assert report_twin(kernel, [gauge]) == gauge, (
+        "the twin relation is symmetric: the kernel line finds its gauge change "
+        "(batch 237)"
+    )
+    assert report_twin(gauge, [kernel.model_copy(update={"xid": 79})]) is None
 
 
-def test_the_candidate_window_widens_only_for_an_nvlink5_gauge() -> None:
+def test_the_candidate_window_covers_a_twin_and_its_pair() -> None:
     companion = timedelta(seconds=30)
     gauge = XidEvent(
         event_id="gauge",
@@ -276,11 +297,17 @@ def test_the_candidate_window_widens_only_for_an_nvlink5_gauge() -> None:
         xid=149,
     )
 
-    assert candidate_window(gauge, companion) == timedelta(seconds=120)
-    for other in (
+    for report in (
+        gauge,
         gauge.model_copy(update={"xid": 79}),
         gauge.model_copy(update={"event_source": "KERNEL_LOG"}),
     ):
-        assert candidate_window(other, companion) == companion, (
-            "every other event keeps the companion window"
+        assert candidate_window(report, companion) == timedelta(seconds=240), (
+            "a kernel line or a field-230 change reads two twin windows"
         )
+    assert (
+        candidate_window(
+            gauge.model_copy(update={"event_source": "FABRIC_MANAGER_LOG"}), companion
+        )
+        == companion
+    ), "every other source keeps the companion window"

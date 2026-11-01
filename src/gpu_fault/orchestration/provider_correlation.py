@@ -18,6 +18,7 @@ from gpu_fault.orchestration.workflow_merge import (
     workflow_is_mutable,
 )
 from gpu_fault.policy import FaultPolicyDecision, SxidEvent, XidEvent
+from gpu_fault.policy.xid_cross_source import report_twins
 from gpu_fault.store.shared.errors import NotFoundError
 from gpu_fault.watcher import AttemptObservation
 
@@ -38,7 +39,10 @@ def covered_correlated_workflow(
         [XidEvent | SxidEvent, FaultPolicyDecision], WorkflowRequest
     ],
     merger: WorkflowMergeService,
-) -> tuple[FaultIncident, WorkflowRequest] | None:
+) -> tuple[FaultIncident, WorkflowRequest | None] | None:
+    twin = report_twin_incident(store, event, decision, linked_workflow)
+    if twin is not None:
+        return twin
     if decision.correlated_event_id:
         incident = store.get_incident_by_event(decision.correlated_event_id)
     elif decision.duplicate and isinstance(event, XidEvent):
@@ -117,6 +121,40 @@ def covered_correlated_workflow(
             incident, expected=incident, extra_event_ids=[event.event_id]
         )
         return incident, workflow
+
+
+def report_twin_incident(
+    store: InMemoryStore | SqliteStore | PostgresStore,
+    event: XidEvent | SxidEvent,
+    decision: FaultPolicyDecision,
+    linked_workflow: Callable[
+        [FaultIncident, str], tuple[WorkflowRequest | None] | None
+    ],
+) -> tuple[FaultIncident, WorkflowRequest | None] | None:
+    """The incident of the other source's report of this XID occurrence.
+
+    A kernel line and the DCGM field-230 change of one XID are one occurrence
+    (``policy/xid_cross_source``): the second report is linked to the first
+    one's incident as a duplicate observation and plans nothing, whatever that
+    incident's workflow is doing -- pending, running, blocked or finished.
+    Planning it again ran a second GPU reset or a second job stop and restart
+    wherever the store's merge groups did not catch it (batch 237).
+    """
+
+    if not isinstance(event, XidEvent) or not decision.correlated_event_id:
+        return None
+    try:
+        twin = store.get_xid_event(decision.correlated_event_id)
+    except NotFoundError:
+        return None
+    if not report_twins(event, twin):
+        return None
+    incident = store.get_incident_by_event(twin.event_id)
+    if incident is None or incident.cluster_id != event.cluster_id:
+        return None
+    store.link_event_to_incident(event.event_id, incident.incident_id)
+    linked = linked_workflow(incident, event.event_id)
+    return incident, linked[0] if linked is not None else None
 
 
 def equivalent_xid_observation(
