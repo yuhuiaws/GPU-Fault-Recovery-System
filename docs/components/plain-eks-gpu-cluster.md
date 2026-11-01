@@ -174,7 +174,8 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
    EKS Auto Mode 节点池、ASG `MaxInstanceLifetime` 和按计划调用 `UpdateNodegroupVersion` 的自动化都会替换 GPU 节点：
    NodePool 设 `expireAfter: Never` 并加 `nodes: "0"` 预算，`MaxInstanceLifetime` 保持未设置，自动化移到维护窗口；Spot 节点组的
    Capacity Rebalance 由 EKS 开启，按替换节点的接入窗口处理。`status --full`/`node-scope` 记录并提示（不拒绝），操作者身份需
-   `autoscaling:DescribeAutoScalingGroups`（管理员日常运维 §5.0.5）。
+   `autoscaling:DescribeAutoScalingGroups`（管理员日常运维 §5.0.5）。CPU 控制面集群仍是 HyperPod 集群，其实例组的
+   `ScheduledUpdateConfig` 同样提示（一个窗口同时重镜像全部 CPU 节点、整个控制面停摆数分钟），同见 §5.0.5。
 
 ## 4. 限制
 

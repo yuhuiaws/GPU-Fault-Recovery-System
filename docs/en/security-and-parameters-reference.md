@@ -75,7 +75,11 @@ OIDC provider on its double proof (`remove-cluster`, and `uninstall` for a provi
 the reads the proof fails, the provider is kept and a finding is printed. The `autoscaling:DescribeAutoScalingGroups`
 read of the GPU node groups' Auto Scaling groups behind the automatic-node-update advisory (Administrator Operations
 §5.0.5) belongs to the operator identity as well (`join-cluster`/`deploy`/`status --full`/`node-scope`); denied, it
-records `unknown` and the command completes.
+records `unknown` and the command completes. The same advisory for the CPU control-plane cluster also reads
+`eks:ListNodegroups`/`eks:DescribeNodegroup` on the CPU EKS cluster (`status --full` and deploy preflight), again the
+operator identity's alone and recorded `unknown` when denied. The EKS end-of-support advisory (same section) reads
+`eks:DescribeCluster` on every site EKS cluster and `eks:DescribeClusterVersions`, the operator identity's alone as well;
+denied, the header says `could not read` and the check verdict is unchanged.
 
 ### 2.1 Regional Acceptance Fixture Boundaries
 

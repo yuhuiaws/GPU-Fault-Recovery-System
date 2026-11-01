@@ -958,6 +958,14 @@ temporarily relaxed during a maintenance window:
    `describe-nodegroup` and refuse it. The other automatic replacement/re-image mechanisms (an instance group's
    `ScheduledUpdateConfig`/`AutoPatchConfig`, Karpenter expiry, an ASG `MaxInstanceLifetime`) are announced, not
    refused: switch them off and update by hand in a maintenance window, see Administrator Operations §5.0.5.
+   The same holds for the CPU control-plane cluster's instance groups: a `ScheduledUpdateConfig` without a rolling batch
+   re-images every CPU node in one window and takes the whole control plane down for minutes (announced by `status --full`
+   and deploy discovery); with HyperPod task governance on the cluster, Kueue's Pod webhook (`failurePolicy: Fail`) covers
+   the product namespace, so no control-plane Pod can be created while Kueue is not serving (`status` reports
+   `replica failure: ...`), also §5.0.5; `gpu-fault-admin hyperpod-scheduled-update --state-dir ... --gpu-cluster-arn
+   <CPU ARN> --rolling` prints the command that makes the CPU group's schedule roll one instance at a time. After the
+   end of its Kubernetes version's support AWS upgrades each site EKS cluster's control plane by itself (without notice,
+   no rollback); `status --full` announces it 90 days ahead, also §5.0.5.
 2. Under no circumstances may this solution's code or execution roles call
    `BatchReplaceClusterNodes`. `GPU_FAULT_ALLOW_HYPERPOD_REPLACE` is always
    `false`, and the Executor IAM must not grant that API either. Production recovery uses only managed warm spares;

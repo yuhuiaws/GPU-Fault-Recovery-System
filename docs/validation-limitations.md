@@ -5581,3 +5581,51 @@ churn during a rollback, a join or a bootstrap. The verify's newcomer exemption
 follows the release's captured node set, so a later standalone `verify` of the
 same release still names a node that joined afterwards and never installed in
 a WARN; `status` reports it as failing.
+
+## The control-plane cluster's own automatic node updates and Pod-creation failures
+
+The facts the change rests on were read live and read-only on the site's CPU
+cluster: `aws sagemaker describe-cluster` of the CPU HyperPod cluster (one
+instance group, 3 x ml.c5.4xlarge, `ScheduledUpdateConfig`
+`cron(0 8 ? * SUN *)` without a `DeploymentConfig`), the Kueue webhook
+configurations (`mpod.kb.io`, `vpod.kb.io` and the Deployment, StatefulSet and
+Job webhooks: `failurePolicy: Fail`, timeout 10 s, namespace selector
+`NotIn [kube-system, kueue-system]`), the Kueue manager ConfigMap
+(`managedJobsNamespaceSelector` the same, the `pod`, `deployment` and
+`statefulset` integrations on, image `mirror-kueue:v0.18.0`, chart label
+`kueue-1.5.0`, one `kueue-controller-manager` replica), and the ReplicaSet
+`FailedCreate` events of the 2026-11-01 outage. The task governance add-on's
+empty configuration schema (`aws eks describe-addon-configuration`) and the
+live EKS versions and support dates come from the coordinating session's
+read-only checks of the same day. `hyperpod-scheduled-update --rolling` was run
+read-only against the live CPU cluster (a private copy of `site.yaml` as
+`--state-dir`): PLAN, every CPU group selected from one `describe-cluster`, and
+the printed `UpdateCluster` request passes botocore's `ParamValidator`; it was
+not executed.
+
+The code is proven with fakes only: `tests/admin/test_admin_automatic_node_updates.py`
+(the control-plane block, its graded lines for an all-at-once, a batched and an
+auto-patched group, CPU discovery announcing from the describe it already made),
+`tests/admin/test_admin_hyperpod_scheduled_update.py` (`--rolling`, the CPU
+cluster's selection, the wait bounds against the installed service model),
+`tests/regional/test_regional_release_control_plane_updates.py` (the
+`regional_contexts` facts, the CPU managed node group read and its `unknown`, the
+header order), `tests/regional/test_regional_release_replica_failure.py` (the
+record, redaction and cap, the retry target, `cpu_workloads` and the GPU
+cluster check, the header line) and `tests/regional/test_regional_release_eks_support.py`
+(versions, policies, dates in Pacific time, the 90-day notice, denied reads).
+
+Not verified: the all-at-once update of a schedule without a `DeploymentConfig`
+is observed (2026-11-01), not documented by AWS; a batched schedule's behaviour
+follows the API reference, no batched schedule was run; that the printed
+`update-cluster` (removal or `--rolling`) leaves the group as the verify read
+expects; a supported way to keep the product namespace out of the add-on's Kueue
+webhooks (none found: the add-on accepts no configuration, and AWS documents that
+changes to its resources may be overwritten); whether the add-on's renderer
+derives the webhook selector from `managedJobsNamespaceSelector` as Kueue's Helm
+chart does. Karpenter NodePools on the CPU cluster are not read. The retry hint's
+backoff (5 ms doubling to 1000 s) and immediate sync on any ReplicaSet update are
+read from the Kubernetes v1.33.13 source, and the live annotation that ended the
+2026-11-01 wait agrees; no other Kubernetes version was checked.
+`describe-cluster-versions --include-all` for a version past its extended support
+and the exact moment AWS upgrades a cluster after its date were not exercised.

@@ -233,7 +233,9 @@ closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace`
    `nodes: "0"` budget, keep `MaxInstanceLifetime` unset and move the automation into the maintenance window; the
    Capacity Rebalance EKS enables on Spot node groups is handled by the replacement-node join window. `status
    --full`/`node-scope` record and announce them (never refuse); the operator identity needs
-   `autoscaling:DescribeAutoScalingGroups` (administrator-operations §5.0.5).
+   `autoscaling:DescribeAutoScalingGroups` (administrator-operations §5.0.5). The CPU control-plane cluster is still a
+   HyperPod cluster, and its instance groups' `ScheduledUpdateConfig` is announced the same way (one window re-images
+   every CPU node at once and takes the whole control plane down for minutes), also §5.0.5.
 
 ## 4. Limitations
 

@@ -22,7 +22,9 @@ rationale and special recovery steps are kept in the [Deployment and Operations 
 | Release across schema versions | `deploy --state-dir ... --accept-schema-change` (takes an Aurora snapshot first; `--accept-schema-change-without-snapshot` skips the snapshot) | §4.7 |
 | Join a GPU cluster | `deploy --state-dir ... --gpu-cluster-arn <all managed ARNs> --gpu-cluster-arn <new ARN>` (the given set must be the managed set or a superset of it; the extra ARNs are the joins; giving fewer is refused with `site manages GPU clusters the command omits ... use remove-cluster`; when there are code changes release first, then join), or the join-only `gpu-fault-admin join-cluster --state-dir ... --gpu-cluster-arn <new ARN>` (does not trigger a site release; already managed ARNs return `ALREADY_MANAGED`) | REG-8.1.5, §5 |
 | Remove a GPU cluster | `gpu-fault-admin remove-cluster --state-dir ... --gpu-cluster-arn <ARN> --confirm REMOVE_GPU_CLUSTER` | REG-8.1.6, REG-12, §5 |
-| Switch a HyperPod instance group's automatic updates off (`ScheduledUpdateConfig`/`AutoPatchConfig`; `status --full` reports `advisory: HyperPod instance group ...`) | `gpu-fault-admin hyperpod-scheduled-update --state-dir ... --gpu-cluster-arn <ARN>` is read-only and prints the `aws sagemaker update-cluster` to run in a maintenance window; manual updates use `update-cluster-software`; the plain-EKS equivalents (Karpenter expiry, an ASG `MaxInstanceLifetime`) are in the same section | §5.0.5 |
+| Switch a HyperPod instance group's automatic updates off (`ScheduledUpdateConfig`/`AutoPatchConfig`; `status --full` reports `advisory: HyperPod instance group ...`, for the CPU control-plane cluster's groups too, where one window takes the whole control plane down for minutes) | `gpu-fault-admin hyperpod-scheduled-update --state-dir ... --gpu-cluster-arn <ARN>` is read-only (the CPU control-plane cluster's ARN selects every group of it; `--rolling` keeps the schedule and makes it roll one instance at a time) and prints the `aws sagemaker update-cluster` to run in a maintenance window; manual updates use `update-cluster-software`; the plain-EKS equivalents (Karpenter expiry, an ASG `MaxInstanceLifetime`) are in the same section | §5.0.5 |
+| A control-plane Deployment cannot create its Pods (`status` reports `replica failure: <Deployment> ... FailedCreate: ...`, for example while Kueue's `mpod.kb.io` webhook is not serving) | once the cause is gone, run the `kubectl -n gpu-fault-system annotate replicaset ... --overwrite` the line prints: a metadata-only update, so the ReplicaSet controller retries at once instead of waiting out its backoff of up to ~16 min | §5.0.5 |
+| An EKS cluster's version near or past the end of its support (`status --full` reports `advisory: EKS cluster ... whose support ends ...`) | before the date, in a maintenance window, upgrade it yourself: the control plane first (`aws eks update-cluster-version`), then nodes and add-ons (HyperPod nodes with `update-cluster-software`); after the date AWS upgrades the control plane without notice, and that upgrade cannot be rolled back | §5.0.5 |
 | Reinstall while keeping the CPU/GPU EKS | `gpu-fault-admin uninstall --state-dir ... --cpu-cluster keep --confirm UNINSTALL_GPU_FAULT` followed by a fresh `deploy`; keep preserves Aurora by default (historical incidents/workflows are not lost), and only an explicit `--reset-database` wipes the database | §3 |
 | Permanently decommission and delete the CPU cluster | `gpu-fault-admin uninstall --state-dir ... --cpu-cluster delete --confirm DELETE_CPU_CONTROL_PLANE` (`--aurora-final-snapshot retain|skip` decides the final snapshot) | REG-13, §3 |
 | Troubleshoot PENDING/LEASED commands, Pods not Ready, certificate/Agent version drift | `gpu-fault-admin status --full` (the former `doctor` idea has been folded into status), then follow the symptom table | §7, REG-14.2/14.3 |
@@ -467,7 +469,9 @@ a manual verify/probe without that environment variable always reruns.
 
 `status` first prints five human-readable summary lines on stderr (healthy or not, online release id and phase,
 the next deployment classification, failed check names, where the JSON went), then outputs the complete JSON unchanged to stdout; scripts parse
-stdout as before.
+stdout as before. A control-plane Deployment with `ReplicaFailure=True` (its ReplicaSet cannot create Pods) adds one
+`replica failure: ...` line after `failing checks:`: the reason, the redacted and capped message and the command that
+retries at once (§5.0.5, "Kueue's (HyperPod task governance) Pod webhook"); a passing check prints it too.
 
 After the header, the `finding:` lines also compare the declared topology with the registered GPU fleet, computed from
 the engine's status JSON with no new probe and no new read: the declared counts come from
@@ -1446,8 +1450,11 @@ Semantics and boundaries of `eks-managed`:
   `iam:GetOpenIDConnectProvider`, `iam:ListOpenIDConnectProviderTags`, `iam:ListRoles` and
   `iam:DeleteOpenIDConnectProvider` to delete a solution-created Executor OIDC provider on its double proof (§5); the
   operator identity running `join-cluster`/`deploy`/`status --full`/`node-scope` also reads
-  `autoscaling:DescribeAutoScalingGroups` (the automatic-node-update advisory of §5.0.5; denied, it records `unknown`) --
-  none of these is granted to the Executor or control-plane roles.
+  `autoscaling:DescribeAutoScalingGroups` (the automatic-node-update advisory of §5.0.5; denied, it records `unknown`),
+  and `status --full`/deploy preflight also read `eks:ListNodegroups`/`eks:DescribeNodegroup` on the CPU EKS cluster (the
+  CPU control-plane cluster's managed node groups, advisory as well) and `eks:DescribeCluster`/`eks:DescribeClusterVersions`
+  for every site EKS cluster (the EKS end-of-support advisory of §5.0.5) -- none of these is granted to the Executor or
+  control-plane roles.
 - The Runtime Profile applies per cluster: the site profile (`spec.runtimeProfile`) is every GPU cluster's default
   pin; `hyperpod-v1` names the HyperPod adapter as nodeReboot owner, `eks-v1` the EKS adapter. A cluster whose
   provider the site profile cannot reboot gets **its own** profile (`spec.clusters[].runtimeProfile`:
@@ -2951,15 +2958,16 @@ judgement). The batch additionally refuses two members that share a VPC (known l
 #### 5.0.5 Automatic node updates: off, manual instead
 
 The GPU nodes the site manages must not be replaced or re-imaged by automatic provider schedules: administrators
-update node groups by hand in a maintenance window, and never while `gpu-fault-admin config`/`deploy` runs. EKS node
-auto repair stays a hard refusal (§5.0.1); the product records and announces (advisory) every other automatic
+update node groups by hand in a maintenance window, and never while `gpu-fault-admin config`/`deploy` runs. The same
+holds for the nodes of the CPU control-plane cluster, which carry the whole control plane (see "The CPU control-plane
+cluster's own automatic updates" below). EKS node auto repair stays a hard refusal (§5.0.1); the product records and announces (advisory) every other automatic
 mechanism below -- it changes no check verdict, no `healthy` and no exit code, and blocks neither `deploy` nor
 `join-cluster`:
 
 | Where | Recorded and announced |
 |---|---|
-| `join-cluster`/`deploy` discovery | once the node scope is resolved, one `gpu-fault-admin: advisory: ...` stderr line per finding: the `ScheduledUpdateConfig`/`AutoPatchConfig` of the selected HyperPod instance groups (read off the `describe-cluster` discovery already makes); a `MaxInstanceLifetime` on the Auto Scaling group of a selected eks-managed node group (one read-only `autoscaling describe-auto-scaling-groups`). There is no kube context yet, so Karpenter NodePools are read by the two below |
-| the `regional_contexts` check of `status --full` and deploy preflight | `details.providers.<cluster_id>.automatic_node_updates`: HyperPod `instance_groups[]` for the groups the cluster's recorded selector covers (`name`, `scheduled_update` = the cron expression or `null`, `auto_patch` = the patching strategy or `null`, `gpu_cluster_arn`), with no new read; eks-managed `node_groups[].auto_scaling_groups[]` for the node groups hosting GPU nodes (`name`, `max_instance_lifetime` in seconds or `null`, `capacity_rebalance`) and `karpenter` (`state` `read`/`absent` (no Karpenter CRD)/`unknown`; `nodepools[]`: `expire_after`, `budgets`, `zero_budget` of the NodePools whose template labels carry this site's ownership label). The `status --full` header gains one `advisory: ...` line per finding; the check still passes |
+| `join-cluster`/`deploy` discovery | once the node scope is resolved, one `gpu-fault-admin: advisory: ...` stderr line per finding: the `ScheduledUpdateConfig`/`AutoPatchConfig` of the selected HyperPod instance groups (read off the `describe-cluster` discovery already makes); a `MaxInstanceLifetime` on the Auto Scaling group of a selected eks-managed node group (one read-only `autoscaling describe-auto-scaling-groups`). There is no kube context yet, so Karpenter NodePools are read by the two below. When `deploy` (and `site-id`, `prepare-eks-nodegroup`) discovers the CPU cluster, it prints the same advisory for every instance group of the CPU control-plane HyperPod cluster, read off the `describe-cluster` discovery already makes -- no new read |
+| the `regional_contexts` check of `status --full` and deploy preflight | `details.providers.<cluster_id>.automatic_node_updates`: HyperPod `instance_groups[]` for the groups the cluster's recorded selector covers (`name`, `scheduled_update` = the cron expression or `null`, `auto_patch` = the patching strategy or `null`, `gpu_cluster_arn`), with no new read; eks-managed `node_groups[].auto_scaling_groups[]` for the node groups hosting GPU nodes (`name`, `max_instance_lifetime` in seconds or `null`, `capacity_rebalance`) and `karpenter` (`state` `read`/`absent` (no Karpenter CRD)/`unknown`; `nodepools[]`: `expire_after`, `budgets`, `zero_budget` of the NodePools whose template labels carry this site's ownership label). The CPU control-plane cluster is recorded under `details.control_plane.automatic_node_updates`: every instance group of its HyperPod cluster as `instance_groups[]` (plus `instances` = `CurrentCount` and `rolling_batch` = the scheduled update's rolling batch or `null`; `cpu_eks_arn`), read off the same `describe-cluster` that binds the CPU cluster; and `eks_node_groups`: the CPU EKS cluster's managed node groups with their Auto Scaling groups (`state` `read`/`unknown`). The `status --full` header gains one `advisory: ...` line per finding, the control plane's first; the check still passes |
 | `gpu-fault-admin node-scope` | the same `automatic_node_updates` block in each cluster's report and one `advisory:` stderr line per finding after the summary; `convergence` and the exit code are unchanged |
 
 A failed read -- most often an operator identity without `autoscaling:DescribeAutoScalingGroups`, or a refused NodePool
@@ -3057,9 +3065,172 @@ kubectl --context <GPU context> patch nodepool <NodePool> --type merge \
   -p '{"spec":{"template":{"spec":{"expireAfter":"Never"}},"disruption":{"budgets":[{"nodes":"0"}]}}}'
 ```
 
+**The CPU control-plane cluster's own automatic updates.** The control plane (api-ha, control-worker,
+telemetry-spool-worker, ADOT) runs on the nodes of the CPU control-plane cluster; its Pods carry no node selector, so any CPU
+node may host them. When an instance group of this cluster carries a `ScheduledUpdateConfig`/`AutoPatchConfig`, the service
+updates the platform software of the group's instances on that schedule: the root volume is replaced, the node is `NotReady`
+meanwhile, and HyperPod does not drain the Pods on it first. Without a rolling `DeploymentConfig`, every instance of the group
+was observed to be updated at once (no AWS document states that default) -- one window takes the whole control plane down
+for minutes, and the cron repeats it every week. Live: the CPU instance group (3 x ml.c5.4xlarge) carried
+`cron(0 8 ? * SUN *)` and no `DeploymentConfig`; on 2026-11-01 at about 08:00Z all three nodes went `NotReady` together and
+rebooted 08:02-08:03Z, the api-ha and control-worker Pods were lost or unreachable, acceptance cases' `kubectl exec` hit
+`RequestTimeout` (`no Ready cpu Pod`), and the whole control plane was down for about five minutes; while Kueue restarted with
+the nodes no Pod that had to be created could be, and the control-worker stayed at 4/6 for minutes more (Kueue, below).
+Evidence: AWS documentation, Updating the SageMaker HyperPod platform software, Important
+(https://docs.aws.amazon.com/sagemaker/latest/dg/sagemaker-hyperpod-eks-operate-cli-command-update-cluster-software.html; a
+schedule applies the same platform software update on its cron): "When this API is called, SageMaker HyperPod doesn’t drain
+or redistribute the jobs (Pods) running on the nodes.", "The patching process replaces the root volume with the updated AMI,
+which means that your previous data stored in the instance root volume will be lost." and "All cluster nodes experience
+downtime (nodes appear as `<NotReady>` in the output of `kubectl get node`) while the patching is in progress."
+
+The product announces, it changes no check verdict, and it grades what one window does to the control plane:
+
+- No rolling `DeploymentConfig`, or a batch that covers every instance of the group (`INSTANCE_COUNT` at least the instance
+  count, `CAPACITY_PERCENTAGE` 100): the whole control plane goes down. For example `deploy`'s discovery of the CPU cluster
+  prints `gpu-fault-admin: advisory: HyperPod instance group <group> of the CPU control-plane cluster <name> has
+  ScheduledUpdateConfig cron(0 8 ? * SUN *) with no rolling DeploymentConfig: observed (2026-11-01) to re-image all 3
+  instances of the group at once -- every node the control plane runs on, so the whole control plane (api-ha,
+  control-worker) is down for minutes each time; gpu-fault-admin hyperpod-scheduled-update --state-dir <state dir>
+  --gpu-cluster-arn <CPU EKS ARN> --instance-group <group> --rolling prints the update-cluster command that makes it roll one
+  instance at a time (without --rolling, the one that removes it: then update the group by hand in a maintenance window, one
+  instance at a time) (administrator-operations §5.0.5)`; when another instance group or managed node group holds CPU nodes
+  too, the line names only the control-plane Pods on that group.
+- A batch smaller than the group: the safe form (`rolling 1 instance(s) at a time 600 s apart: the safe form ...`), still
+  announced with its residual -- the control-plane Pods on each batch go down with it, and the single-replica ADOT and Kueue
+  (when present) are down while their node is updated, so a Pod created meanwhile waits for Kueue's webhook (the
+  `replica failure:` line, below).
+- `AutoPatchConfig` is announced as well (with the command that removes it).
+- Reads: `deploy` (and `site-id`, `prepare-eks-nodegroup`) prints the lines from the `describe-cluster` its discovery of the
+  CPU cluster already made, with no new read; the `regional_contexts` check of `status --full` and deploy preflight records
+  `details.control_plane.automatic_node_updates` (the table above), and the `status --full` header puts these lines ahead of
+  every GPU cluster's. Managed node groups the CPU EKS cluster may also have are read the way the GPU path reads them (one
+  `list-nodegroups`, a `describe-nodegroup` per group, one `describe-auto-scaling-groups`); a set `MaxInstanceLifetime` is
+  announced, a failed read records `state: unknown`. Karpenter NodePools on the CPU cluster are not read.
+
+Remedy (in a maintenance window, never while `config`/`deploy` runs): preferably keep the weekly schedule and make it roll one
+instance at a time:
+
+```bash
+gpu-fault-admin hyperpod-scheduled-update --state-dir /secure/gpu-fault \
+  --gpu-cluster-arn <CPU EKS ARN or CPU HyperPod ARN> --rolling [--wait-interval-seconds 600]
+```
+
+With `--state-dir`, `spec.cpu` of `site.yaml` (`eksArn` or `hyperpodClusterName`) recognises the CPU cluster and selects
+**every** instance group of it (no CPU group carries the ownership label, and the control-plane Pods carry no node selector),
+described directly by `spec.cpu.hyperpodClusterName` without a region inventory; without `--state-dir`, name the group with
+`--instance-group`, or nothing is selected (stderr: `name one with --instance-group`). The verb accepts the ARN of any HyperPod
+cluster (the flag is named `--gpu-cluster-arn`). `--rolling` keeps each group's `ScheduleExpression` and writes a
+`DeploymentConfig` with `RollingUpdatePolicy.MaximumBatchSize` `INSTANCE_COUNT` 1 and `WaitIntervalInSeconds`
+(`--wait-interval-seconds`, default 600; the service model and `aws sagemaker update-cluster help` allow 0-3600); the other
+`DeploymentConfig` members (a rollback batch size, rollback alarms) stay as they are; a group that already rolls this way, or
+has no schedule, is `none`. The printed `aws sagemaker update-cluster` is built and refused exactly as for a GPU group (above);
+afterwards the printed `verify` must show the group's `ScheduledUpdateConfig` with the new `DeploymentConfig`. Without
+`--rolling` the verb prints the command that removes the schedule; then update by hand with the `update-cluster-software`
+above, `--instance-groups InstanceGroupName=<CPU instance group>` and
+`RollingUpdatePolicy={MaximumBatchSize={Type=INSTANCE_COUNT,Value=1}}`. One node at a time, api-ha (3 replicas, with a PDB)
+and the control-worker keep serving from the others, while the control-plane Pods of the updated node are killed and
+re-created elsewhere.
+
+**Kueue's (HyperPod task governance) Pod webhook.** Live (read-only checks): the CPU cluster runs HyperPod task governance
+-- the EKS add-on `amazon-sagemaker-hyperpod-taskgovernance` v1.5.0-eksbuild.1, which installs Kueue v0.18.0 (one
+`kueue-controller-manager` replica; the webhook configurations are labelled `app.kubernetes.io/managed-by=Helm` and
+`helm.sh/chart=kueue-1.5.0`, managed by the add-on). Kueue's webhooks `mpod.kb.io` (mutating, Pod CREATE) and `vpod.kb.io`
+(validating, Pod CREATE/UPDATE) carry `failurePolicy: Fail`, a 10 s timeout and a namespace selector that excludes only
+`kube-system` and `kueue-system` -- the product namespace `gpu-fault-system` is covered; so are the Deployment, StatefulSet
+and Job webhooks (`mdeployment.kb.io`/`vdeployment.kb.io`, `mstatefulset.kb.io`, `vjob.kb.io`). While the Kueue controller is
+not serving (its node is rebooted or re-imaged), every Pod create in that namespace fails: Pods restarted in place after the
+reboot are unaffected, only Pods that must be created wait (on 2026-11-01, the two deleted control-worker Pods); Deployment
+and Job creates and updates are refused too, so a `deploy` that changes a Deployment or creates a Job fails then as well.
+ReplicaSet events read `FailedCreate ... failed calling webhook "mpod.kb.io": failed to call webhook: Post
+"https://kueue-webhook-service.kueue-system.svc:443/mutate--v1-pod?timeout=10s": no endpoints available for service
+"kueue-webhook-service"`, and the Deployment condition is `ReplicaFailure=True`. After Kueue is back the ReplicaSet controller
+still retries on its exponential backoff (the delay doubles per failure, up to 1000 s, about 16 min), so a Deployment may stay
+short for minutes after Kueue answers again; any metadata update of the ReplicaSet makes it retry at once.
+
+What the product shows: the `cpu_workloads` check of `status` (quick and `--full`) keeps `replica_failure` beside each
+Deployment's readiness (`reason`, the redacted `message` capped at 300 characters, `since`, `webhook`, `retry`, and `evidence`
+for Kueue's webhook); a failing check's summary names every Deployment short of its replicas with its ReplicaFailure, for
+example `gpu-fault-control-worker has 4/6 Ready (ReplicaFailure FailedCreate: ...)`; the header prints one line per
+control-plane Deployment with the condition, after `failing checks:`:
+
+```text
+gpu-fault-admin status: replica failure: gpu-fault-control-worker (4/6 Ready) FailedCreate: Internal error occurred: failed calling webhook "mpod.kb.io": ...; the ReplicaSet controller retries a failed Pod create with exponential backoff (up to ~16 min); once the cause is gone, any metadata update of the ReplicaSet makes it retry at once: kubectl -n gpu-fault-system annotate replicaset gpu-fault-control-worker-<hash> gpu-fault.io/replica-retry-requested-at="$(date -u +%Y%m%dT%H%M%SZ)" --overwrite; mpod.kb.io is Kueue's Pod webhook (HyperPod task governance), whose namespace selector covers this namespace: administrator-operations §5.0.5
+```
+
+The condition is recorded, it is no verdict: readiness still decides whether the check passes (at full readiness with a surge
+Pod that cannot be created the check passes and the header still has the line); each GPU cluster's `gpu_cluster:<id>` check
+records the same for its Deployments. Remedy: first confirm the webhook is back (`kubectl -n kueue-system get endpoints
+kueue-webhook-service` has addresses, `kueue-controller-manager` is Ready), then run the `kubectl annotate` the line prints: a
+metadata-only update, no rollout; the ReplicaSet is the one the Deployment's `Progressing` condition names, else every
+ReplicaSet of the Deployment's selector (`-l app=...`). Evidence: the Kubernetes v1.33.13 source (the live control plane's
+version) `pkg/controller/replicaset/replica_set.go`
+(https://github.com/kubernetes/kubernetes/blob/v1.33.13/pkg/controller/replicaset/replica_set.go: `NewBaseController` builds the
+queue with `workqueue.DefaultTypedControllerRateLimiter[string]()`, a failed sync is re-queued with
+`rsc.queue.AddRateLimited(key)`, and `updateRS` enqueues on every update event: "it is safer to sync any time this function is
+triggered") and `staging/src/k8s.io/client-go/util/workqueue/default_rate_limiters.go`
+(https://github.com/kubernetes/kubernetes/blob/v1.33.13/staging/src/k8s.io/client-go/util/workqueue/default_rate_limiters.go:
+"NewTypedItemExponentialFailureRateLimiter[T](5*time.Millisecond, 1000*time.Second)").
+
+Why the namespace is covered, and why it cannot be excluded here: Kueue's own documentation says that with the pod
+integration on, the webhook is called for every Pod create its namespace selector covers (whether or not Kueue manages that
+Pod), and that with a Helm install the webhooks' namespace selector takes the value of `managedJobsNamespaceSelector`.
+Evidence: Kueue v0.18.0 documentation, Run Plain Pods > Before you begin, item 3
+(https://kueue.sigs.k8s.io/docs/tasks/run/plain_pods/#before-you-begin; the source at the v0.18.0 tag,
+https://github.com/kubernetes-sigs/kueue/blob/v0.18.0/site/content/en/docs/tasks/run/plain_pods.md): "Kueue will run webhooks for
+all created pods if the pod integration is enabled. The webhook namespaceSelector could be used to filter the pods to
+reconcile." and "When you install Kueue via Helm, the webhook namespace selector will match the `managedJobsNamespaceSelector`
+in the `values.yaml`."; the v0.18.0 Helm chart (`charts/kueue/templates/webhook/manifests.yaml`) does exactly that: the
+`namespaceSelector` of `mpod.kb.io` is `managedJobsNamespaceSelector`, and with the `pod` integration on its `failurePolicy`
+is `Fail`. The task governance add-on, however, offers no supported way to change that value: the configuration schema of the
+add-on version (`aws eks describe-addon-configuration --addon-name amazon-sagemaker-hyperpod-taskgovernance --addon-version
+v1.5.0-eksbuild.1`) declares no properties (`additionalProperties: false`), and AWS documents the Kueue configuration the
+add-on uses (its `managedJobsNamespaceSelector` excludes only `kube-system` and `kueue-system`) and says "While Kubernetes
+administrators have the flexibility to modify the state of these resources, it is possible that any changes made to a
+SageMaker AI-managed resource may be updated and overwritten by the service." (Task governance setup > Kueue Settings,
+https://docs.aws.amazon.com/sagemaker/latest/dg/sagemaker-hyperpod-eks-operate-console-ui-governance-setup-task-governance.html#hp-eks-task-governance-kueue-settings).
+A hand patch of the webhook configurations or of the Kueue ConfigMap is reverted by add-on updates, and it changes a
+component of the customer's cluster -- **do not patch it**; the product never does. Mitigation: the rolling update above
+(Kueue and the control plane no longer go down together), the `replica failure:` signal, and the printed annotate once Kueue
+is back.
+
+**EKS control-plane upgrades at the end of a version's support.** Every EKS cluster of the site (the CPU control-plane
+cluster, the EKS cluster a HyperPod GPU cluster is orchestrated by, a plain EKS GPU cluster) runs a Kubernetes version whose
+support ends on a date: the end of extended support under the `EXTENDED` upgrade policy (AWS's default), the end of standard
+support under `STANDARD`. After that date AWS upgrades the cluster's control plane to the next version at any time and
+without notice; only the control plane is upgraded, the nodes stay on the old version; a cluster upgraded that way cannot be
+rolled back. Evidence: AWS documentation, Understand the Kubernetes version lifecycle on EKS
+(https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions.html), Amazon EKS extended support FAQs: "Automatic
+updates can happen at any time after the end of extended support date. You won’t receive any notification before the
+update.", "The auto-upgrade includes only the Kubernetes control plane." and "Note: If you disable extended support, your
+cluster will be auto upgraded at the end of standard support."; Version rollback: "Clusters that were automatically upgraded
+at the end of extended support cannot be rolled back." Live (2026-11-01): the plain EKS GPU cluster `gpu-eks-cluster` runs
+1.31 under `EXTENDED`, whose extended support ends 2026-11-26; the other two EKS clusters run 1.33 (2027-07-29).
+
+The product announces only: the `regional_contexts` check of `status --full` and deploy preflight reads `eks
+describe-cluster` once per site EKS cluster (`version`, `upgradePolicy.supportType`) and `eks describe-cluster-versions
+--cluster-versions <versions...> --include-all` once per region, and records `details.eks_support` (per cluster `version`,
+`support_type`, `end_of_support` = the UTC date, `days_left`); a cluster within 90 days of its date, or past it, adds one line
+to the `status --full` header, for example `advisory: EKS cluster gpu-eks-cluster (GPU cluster <id>) runs Kubernetes 1.31 under
+the EXTENDED upgrade policy, whose support ends 2026-11-26 (in 24 day(s)): after that date AWS upgrades its control plane to
+the next version by itself, at any time and without notice -- only the control plane: its nodes stay on 1.31 -- and a cluster
+upgraded that way cannot be rolled back; upgrade it yourself before then, in a maintenance window (control plane first, then
+its nodes and add-ons) (administrator-operations §5.0.5)`. A denied `eks:DescribeClusterVersions` turns into one line
+`advisory: could not read the EKS support dates in <region> (...): the end-of-support check of <n> EKS cluster(s) did not run;
+the operator identity needs eks:DescribeClusterVersions ...`; a cluster whose version or dates cannot be read has a line as
+well. The check verdict is unchanged; deploy discovery does not read the dates. Remedy: before the date, in a maintenance
+window, upgrade yourself -- the control plane first (`aws eks update-cluster-version`), then nodes and add-ons; the nodes of a
+HyperPod cluster do not follow the EKS version, update them with `update-cluster-software` afterwards (AWS: "The Kubernetes
+version of SageMaker HyperPod cluster nodes does not automatically update when you update your Amazon EKS cluster version.
+After updating the Kubernetes version for your Amazon EKS cluster, you must use the `UpdateClusterSoftware` API to update your
+SageMaker HyperPod cluster nodes to the same Kubernetes version.", Updating the SageMaker HyperPod platform software, as
+above).
+
 **Permissions.** The reads use the identity of the operator running the command: `sagemaker:DescribeCluster` (plus
 `sagemaker:ListClusters` for the helper given an EKS ARN the site does not record), `eks:DescribeNodegroup`,
-`autoscaling:DescribeAutoScalingGroups`, and list on `nodepools.karpenter.sh` in the GPU cluster. Running the printed
+`autoscaling:DescribeAutoScalingGroups`, and list on `nodepools.karpenter.sh` in the GPU cluster; the CPU control-plane
+cluster's managed node groups also need `eks:ListNodegroups` and `eks:DescribeNodegroup` on the CPU EKS cluster (denied:
+`unknown`), and the EKS end-of-support advisory `eks:DescribeCluster` on every site EKS cluster and
+`eks:DescribeClusterVersions` (denied: a `could not read` line). Running the printed
 commands also needs `sagemaker:UpdateCluster`, `sagemaker:UpdateClusterSoftware` or `autoscaling:UpdateAutoScalingGroup`.
 No runtime role is granted any of them.
 
@@ -3440,6 +3611,7 @@ check that `sha256sum <file>` equals the `expected` value of the error, and reru
 | Symptom | First check | Detailed reference |
 |---|---|---|
 | CPU Pod CrashLoopBackOff | registry, Aurora DSN, startup guard, duplicate configuration | REG-14.1 |
+| Control-plane Pods missing in whole or part, `kubectl exec` hits `RequestTimeout` or `no Ready cpu Pod`, `status` reports `replica failure: ... failed calling webhook "mpod.kb.io"` | whether the CPU nodes were just rebooted or re-imaged (`kubectl get events -A --field-selector reason=Rebooted`; the CPU instance group's `ScheduledUpdateConfig`, see the control-plane advisory in the `status --full` header); whether Kueue is back (`kubectl -n kueue-system get endpoints kueue-webhook-service`); then run the `kubectl annotate replicaset ...` the `replica failure:` line prints to retry at once | §5.0.5 |
 | remote commands stay PENDING | Executor claim, token, CA, cluster ID, owner, protocol | REG-14.2 |
 | command LEASED for a long time | Executor Pod, lease renewal, result reporting | REG-14.3 |
 | Workflows advance slowly between steps while control-worker CPU is high, Aurora `xact_rollback` climbs or the control-worker logs show `workflow dispatch lease lost` | Whether the dispatch lease changes hands and whether ticks approach the lease: `sum(increase(gpu_fault_workflow_dispatch_lease_acquisitions_total[15m]))` is 0 under a steady holder (1 after a roll), staying above 0 is lease thrash; in `sum by (when) (increase(gpu_fault_workflow_dispatch_lease_losses_total[15m]))`, `mid_tick` is a holder taken over inside its tick (it stops at once and leaves its queued rows to the new holder) and `tick_start` a holder away longer than the lease (a stuck or starved process); `histogram_quantile(0.99, sum by (le) (rate(gpu_fault_workflow_dispatch_tick_seconds_bucket[15m])))` near `GPU_FAULT_WORKFLOW_DISPATCH_LEASE_SECONDS` (15 s as shipped) is slow ticks: check the CPU and `gpu_fault_event_loop_lag_seconds` of the Pod whose `gpu_fault_workflow_dispatch_lease_held` is 1; `sum(gpu_fault_workflow_dispatch_lease_held)` should be 1 (0: no process dispatches, 2: an overlap). Do not lengthen the lease for this | `detailed-design-v2.md` §3.7 ④, §10.2 |

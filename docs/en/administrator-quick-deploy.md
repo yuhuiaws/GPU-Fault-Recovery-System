@@ -95,7 +95,10 @@ The current version still references the token, CA and fleet master through cont
 
 ## 4. First-Deployment Gates
 
-1. An existing 3-node CPU EKS/HyperPod cluster.
+1. An existing 3-node CPU EKS/HyperPod cluster whose instance groups' scheduled updates (`ScheduledUpdateConfig`) roll one
+   instance at a time or are switched off: without a rolling batch one window re-images every CPU node at once and takes
+   the whole control plane down for minutes (announced only, see [Administrator Operations](administrator-operations.md)
+   §5.0.5).
 2. At least one existing GPU EKS/HyperPod cluster with `NodeRecovery=None`; the managed instance groups' / node groups'
    automatic updates (HyperPod `ScheduledUpdateConfig` and the like) switched off and done by hand in a maintenance
    window (announced only, see [Administrator Operations](administrator-operations.md) §5.0.5).
