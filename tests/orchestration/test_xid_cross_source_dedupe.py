@@ -26,6 +26,7 @@ from gpu_fault.channel_registry import GPU_METRICS_PATH, NVIDIA_KERNEL_PATH
 from gpu_fault.execution.dispatcher import WorkflowDispatcher
 from gpu_fault.models import IncidentState, WorkflowOperation
 from gpu_fault.policy import ActionDisposition
+from gpu_fault.store import SqliteStore
 from tests.orchestration._xid_report_twins_support import (
     CASES,
     GAUGE,
@@ -107,6 +108,32 @@ def test_one_xid_reported_twice_is_one_incident_and_one_remediation(
     replay = replay_both(CASES[name], order=order, state=state, timing=timing)
 
     assert_one_occurrence(replay, f"{name}/{order}/{state}/{timing}")
+
+
+@pytest.mark.parametrize("timing", ["in-flight", "after-completion"])
+@pytest.mark.parametrize("order", ORDERS)
+@pytest.mark.parametrize(
+    ("name", "state"),
+    [
+        ("48-reset-gpu", "active-unbound"),
+        ("13-restart-app", "idle"),
+        ("154-drain-p2p", "idle"),
+        ("79-restart-bm", "active"),
+    ],
+)
+def test_a_sql_store_links_the_second_report_the_same_way(
+    tmp_path, name: str, state: str, order: str, timing: str
+) -> None:
+    """The join is the store's own event link: SQLite answers as memory does."""
+
+    store = SqliteStore(str(tmp_path / "control.db"))
+    try:
+        replay = replay_both(
+            CASES[name], order=order, state=state, timing=timing, store=store
+        )
+        assert_one_occurrence(replay, f"sqlite {name}/{state}/{order}/{timing}")
+    finally:
+        store.close()
 
 
 @pytest.mark.parametrize("state", ["idle", "active-unbound"])

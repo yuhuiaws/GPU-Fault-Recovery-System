@@ -5828,24 +5828,28 @@ Manager log line spells an XID or SXID address was not sampled live.
 
 ## One XID, two reports: kernel line and DCGM field 230 (batch 237)
 
-"One XID occurrence -> one incident, one remediation" is proven by in-memory
-replays only. `tests/orchestration/test_xid_cross_source_dedupe.py` drives the
-kernel and GPU-metrics routes, the policy decision, the incident and its
-workflow, and then the production dispatcher and executor (remediation budget,
-storm breaker, node-exclusive predecessors, the rule-A busy-node hold) over a
+"One XID occurrence -> one incident, one remediation" is proven by replays
+only. `tests/orchestration/test_xid_cross_source_dedupe.py` drives the kernel
+and GPU-metrics routes, the policy decision, the incident and its workflow,
+and then the production dispatcher and executor (remediation budget, storm
+breaker, node-exclusive predecessors, the rule-A busy-node hold) over a
 recording adapter, for every XID class that compiles a workflow, both arrival
 orders, idle / uncovered / bound-attempt / unbound-attempt nodes, the second
 report arriving before any claim, in flight or after the first remediation
 finished; `tests/policy/test_xid_cross_source.py` pins the twin rule itself.
-The same replay on the batch-236 head is the reproduction: 131 of its 152
-cases fail there. No live case has exercised this path: live acceptance cannot
-move field 230 with a synthetic kernel line (the drills' synthetic NVRM lines
-never reached DCGM), and a real XID cannot be raised on demand. A live proof
-needs both reports synthesised on one node -- the kernel line through the
-GF-GENERAL-LIVE kmsg replay (`general_live_kernel_replay`) and the field-230
-line through its DCGM field replay (`tools/gpu_dcgm_field_replay.py`, which
-already serves `DCGM_FI_DEV_XID_ERRORS` to the PCIe composite variants); no
-such case exists yet.
+The same replay on the batch-236 head is the reproduction: 145 of its 168
+cases fail there. It runs on the in-memory store and, for a subset, on SQLite;
+the Postgres store was not exercised (its event link and decision reads are
+the ones the other ingest paths already use).
+
+No live case has exercised this path: live acceptance cannot move field 230
+with a synthetic kernel line (the drills' synthetic NVRM lines never reached
+DCGM), and a real XID cannot be raised on demand. A live proof needs both
+reports synthesised on one node -- the kernel line through the GF-GENERAL-LIVE
+kmsg replay (`general_live_kernel_replay`) and the field-230 line through its
+DCGM field replay (`tools/gpu_dcgm_field_replay.py`, which already serves
+`DCGM_FI_DEV_XID_ERRORS` to the PCIe composite variants); no such case exists
+yet.
 
 Not verified live, and stated from NVIDIA documentation or the code:
 

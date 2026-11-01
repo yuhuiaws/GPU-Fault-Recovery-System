@@ -234,8 +234,10 @@ class Replay:
         return self.store.list_workflows(set(WorkflowStatus), limit=200)
 
 
-def new_replay(state: str, case: XidCase, *, graded: bool = False) -> Replay:
-    store = InMemoryStore()
+def new_replay(
+    state: str, case: XidCase, *, graded: bool = False, store=None
+) -> Replay:
+    store = store if store is not None else InMemoryStore()
     adapter = RecordingAdapter()
     context = ApplicationContext(
         store=store,
@@ -393,11 +395,18 @@ def kernel_line(
 
 
 def replay_both(
-    case: XidCase, *, order: str, state: str, timing: str, graded: bool = False
+    case: XidCase,
+    *,
+    order: str,
+    state: str,
+    timing: str,
+    graded: bool = False,
+    store=None,
 ) -> Replay:
-    """The kernel line and the field-230 change of one XID, 20 s apart."""
+    """The kernel line and the field-230 change of one XID, 20 s apart, on
+    ``store`` (an in-memory one by default)."""
 
-    replay = new_replay(state, case, graded=graded)
+    replay = new_replay(state, case, graded=graded, store=store)
     first_at, second_at = (
         replay.base + timedelta(seconds=10),
         replay.base + timedelta(seconds=30),
