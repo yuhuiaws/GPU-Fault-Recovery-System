@@ -14,6 +14,7 @@ import argparse
 import importlib
 import json
 import os
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -107,6 +108,17 @@ RUN_TIMESTAMP_KEYS = (
     "window_start",
     "window_end",
 )
+#: The verdict a destructive case records for itself when it ran nothing here.
+NOT_RUN = "NOT_RUN"
+#: The structured NOT_RUN reasons a recorded not-run may carry: the node-group
+#: gate's only. DESTR-027/028/029 record NOT_RUN(CAPABILITY_ABSENT) when the
+#: cluster's GPU node group is smaller than the case needs
+#: (``workload_domain_oracle.capability_absent``) -- the one reason they write,
+#: and the one NOT_RUN the campaign runner takes as the case's terminal verdict
+#: ("NOT_RUN(CAPABILITY_ABSENT) recorded from its evidence"). A NOT_RUN for any
+#: other reason the runner runs again, so it settles nothing here either.
+RECORDED_NOT_RUN_REASONS = ("CAPABILITY_ABSENT",)
+STRUCTURED_REASON = re.compile(r"[A-Z][A-Z0-9_]*")
 
 
 def required(value: str, label: str) -> str:
@@ -344,7 +356,8 @@ def not_applicable_reason(case_dir: Path) -> str | None:
     ``preflight.json`` only, no execute evidence and no run timestamp. That is
     a case the campaign records N/A, not missing evidence. A plan-only
     directory refused for any other reason, or one whose plan says a mutation
-    was performed, is still missing evidence.
+    was performed, is still missing evidence. (A case that recorded its own
+    NOT_RUN is ``not_run_record``'s.)
     """
 
     plan = _json_object(case_dir / "plan.json", f"{case_dir.name}/plan.json")
@@ -371,22 +384,137 @@ def not_applicable_reason(case_dir: Path) -> str | None:
     )
 
 
-def not_applicable_cases(run_dir: Path) -> list[dict[str, str]]:
-    """The destructive cases whose plan-only evidence says they do not apply."""
+def _not_run_fields(value: Any) -> tuple[Any, Any, Any] | None:
+    """``(verdict, reason, detail)`` of a ``not_run`` block, or None."""
 
-    found: list[dict[str, str]] = []
+    if not isinstance(value, dict):
+        return None
+    return value.get("verdict"), value.get("reason"), value.get("detail")
+
+
+def _not_run_evidence(case_dir: Path) -> tuple[dict[str, Any] | None, str]:
+    """``(entry, "")`` for a recorded not-run, ``(None, why)`` for a directory
+    that claims NOT_RUN (its record or its preflight) without being one, and
+    ``(None, "")`` for any other directory."""
+
+    name = case_dir.name
+    record_name = f"{name}.json"
+    if case_dir.is_symlink() or not case_dir.is_dir():
+        return None, ""
+    record = _json_object(case_dir / record_name, f"{name}/{record_name}")
+    preflight = _json_object(case_dir / "preflight.json", f"{name}/preflight.json")
+    plan = _json_object(case_dir / "plan.json", f"{name}/plan.json")
+    claimed = (record or {}).get("verdict") == NOT_RUN
+    if not claimed and (preflight or {}).get("not_run") is None:
+        return None, ""
+    if record is None:
+        return None, f"{record_name}, the case's own record, is missing"
+    if record.get("case_id") != name:
+        return None, f"{record_name} names another case"
+    block = (record.get("verdict"), record.get("reason"), record.get("detail"))
+    verdict, reason, detail = block
+    if verdict != NOT_RUN:
+        return None, f"the case recorded {verdict!r}, not {NOT_RUN}"
+    if not isinstance(reason, str) or not STRUCTURED_REASON.fullmatch(reason):
+        return None, f"the NOT_RUN carries no structured reason ({reason!r})"
+    if reason not in RECORDED_NOT_RUN_REASONS:
+        return None, (
+            f"NOT_RUN({reason}) is not a reason the audit accepts "
+            f"({', '.join(RECORDED_NOT_RUN_REASONS)} only)"
+        )
+    if not isinstance(detail, str) or not detail.strip():
+        return None, "the NOT_RUN carries no detail"
+    if record.get("mutation_performed") is not False:
+        return None, f"{record_name} does not say mutation_performed false"
+    if preflight is None:
+        return None, "preflight.json is missing"
+    if _not_run_fields(preflight.get("not_run")) != block:
+        return None, "preflight.json does not carry the same not_run"
+    if preflight.get("errors") != []:
+        return None, "preflight.json also carries errors"
+    if plan is None:
+        return None, "plan.json is missing"
+    attempt = record.get("attempt")
+    if (
+        plan.get("case_id") != name
+        or type(attempt) is not int
+        or type(plan.get("attempt")) is not int
+        or plan.get("attempt") != attempt
+    ):
+        return None, "plan.json is not the plan of this record's case and attempt"
+    if plan.get("preflight_passed") is not True:
+        return None, "plan.json does not say its preflight passed"
+    if plan.get("mutation_performed") is not False:
+        return None, "plan.json does not say mutation_performed false"
+    details = plan.get("details")
+    planned = details.get("not_run") if isinstance(details, dict) else None
+    if _not_run_fields(planned) != block:
+        return None, "plan.json does not plan the same not_run"
+    try:
+        held = set(os.listdir(case_dir))
+    except OSError:
+        raise AuditError("destructive evidence directory cannot be read") from None
+    extra = sorted(held - {record_name, "plan.json", "preflight.json"})
+    if extra:
+        return None, "the directory also holds " + ", ".join(extra)
+    return {"case_id": name, "reason": reason, "detail": detail, "attempt": attempt}, ""
+
+
+def not_run_record(case_dir: Path) -> dict[str, Any] | None:
+    """The NOT_RUN a destructive case recorded for itself here, or None.
+
+    DESTR-027/028/029 need several GPU nodes in one node group. On a cluster
+    whose group is smaller (plain EKS: two) their preflight records the gate's
+    ``not_run`` (verdict NOT_RUN, reason CAPABILITY_ABSENT, detail) and no
+    error, so ``plan.json`` says ``preflight_passed`` true and plans that
+    ``not_run``; ``--execute`` writes it as the case's own record,
+    ``mutation_performed`` false, and touches nothing. The directory then
+    holds exactly ``plan.json``, ``preflight.json`` and ``<case>.json`` -- no
+    execute evidence, no run timestamp -- and the campaign marks the case
+    NOT_RUN(CAPABILITY_ABSENT) from that record: recorded, not missing
+    evidence. Short of every part of that it is still missing evidence: a
+    mutation on the plan or the record, a missing record, records that
+    disagree (verdict/reason/detail, case, attempt), a NOT_RUN without a
+    structured reason or for a reason not in ``RECORDED_NOT_RUN_REASONS``, a
+    refusal beside it, or any other file in the directory.
+    """
+
+    return _not_run_evidence(case_dir)[0]
+
+
+def _destructive_case_dirs(run_dir: Path) -> list[Path]:
     try:
         cases = sorted((run_dir / "cases").iterdir())
     except OSError:
         raise AuditError(
             "--run-dir destructive evidence inventory cannot be read"
         ) from None
-    for case_dir in cases:
-        if not case_dir.name.startswith("GF-REGIONAL-DESTR-") or not case_dir.is_dir():
-            continue
+    return [
+        case_dir
+        for case_dir in cases
+        if case_dir.name.startswith("GF-REGIONAL-DESTR-") and case_dir.is_dir()
+    ]
+
+
+def not_applicable_cases(run_dir: Path) -> list[dict[str, str]]:
+    """The destructive cases whose plan-only evidence says they do not apply."""
+
+    found: list[dict[str, str]] = []
+    for case_dir in _destructive_case_dirs(run_dir):
         reason = not_applicable_reason(case_dir)
         if reason is not None:
             found.append({"case_id": case_dir.name, "reason": reason})
+    return found
+
+
+def not_run_cases(run_dir: Path) -> list[dict[str, Any]]:
+    """The destructive cases whose own evidence records that they ran nothing."""
+
+    found: list[dict[str, Any]] = []
+    for case_dir in _destructive_case_dirs(run_dir):
+        entry = not_run_record(case_dir)
+        if entry is not None:
+            found.append(entry)
     return found
 
 
@@ -396,7 +524,9 @@ def run_timestamps(run_dir: Path) -> list[dict[str, Any]]:
     Top-level keys of each JSON document, plus the ``observed_at`` of timeline
     and step-transition entries (``timeline_entries`` decides which lists those
     are). Nothing deeper: a store snapshot embeds records (agents, profiles)
-    whose own timestamps predate the run.
+    whose own timestamps predate the run. A case with none is missing
+    evidence unless its directory is a provider-N/A refusal
+    (``not_applicable_reason``) or a recorded not-run (``not_run_record``).
     """
 
     def unreadable(_error: OSError) -> None:
@@ -453,9 +583,12 @@ def run_timestamps(run_dir: Path) -> list[dict[str, Any]]:
                 parsed = parse_time(raw, f"destructive evidence {label} {key}")
                 found.append({"path": label, "key": key, "at": parsed.isoformat()})
         if len(found) == case_count and not_applicable_reason(case_dir) is None:
-            raise AuditError(
-                f"destructive case has no run timestamp evidence: {case_dir.name}"
-            )
+            entry, refusal = _not_run_evidence(case_dir)
+            if entry is None:
+                raise AuditError(
+                    f"destructive case has no run timestamp evidence: {case_dir.name}"
+                    + (f" (not a recorded NOT_RUN: {refusal})" if refusal else "")
+                )
     return found
 
 
@@ -463,13 +596,15 @@ def run_evidence_fields(
     run_dir: Path, timestamps: list[dict[str, Any]]
 ) -> dict[str, Any]:
     """The run-dir evidence the audit records: every run timestamp it checked
-    the window against, and the destructive cases planned on this cluster that
-    their own preflight refused as not applicable to its provider (recorded,
-    not missing evidence)."""
+    the window against; the destructive cases planned on this cluster that
+    their own preflight refused as not applicable to its provider; and those
+    that recorded their own NOT_RUN(CAPABILITY_ABSENT) without touching
+    anything (both recorded, not missing evidence)."""
 
     return {
         "run_evidence_timestamps": timestamps,
         "not_applicable_cases": not_applicable_cases(run_dir),
+        "not_run_cases": not_run_cases(run_dir),
     }
 
 

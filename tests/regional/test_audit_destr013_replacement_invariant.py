@@ -11,13 +11,24 @@ from __future__ import annotations
 
 import json
 import subprocess
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from gpu_fault.cluster_scope import EKS_NODEGROUP_LABEL
 from scripts.e2e.regional import audit_destr013_replacement_invariant as destr013
+from scripts.e2e.regional import run_destr027_two_idle_node_parallel_reset as destr027
+from scripts.e2e.regional import run_destr028_two_job_parallel_reboot as destr028
+from scripts.e2e.regional import run_destr029_job_and_idle_parallel as destr029
+from scripts.e2e.regional import workload_domain_oracle as oracle
+from tests.regional._destr013_not_run_records import (
+    DETAIL,
+    not_run_block,
+    write_not_run_case,
+)
 
 NOW = datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc)
 
@@ -484,6 +495,266 @@ def test_a_plan_only_case_refused_for_any_other_reason_is_still_missing_evidence
     with pytest.raises(destr013.AuditError, match="no run timestamp evidence"):
         destr013.run_timestamps(tmp_path)
     assert destr013.not_applicable_cases(tmp_path) == []
+
+
+NOT_RUN_CASE = "GF-REGIONAL-DESTR-028"
+NOT_RUN_RECORD = f"{NOT_RUN_CASE}.json"
+
+
+def test_a_case_that_recorded_its_own_not_run_is_not_missing_evidence(
+    tmp_path: Path,
+) -> None:
+    """Live round 14 (plain EKS run dir, two GPU nodes in its one node group):
+    DESTR-028/029 need three, so each recorded its own NOT_RUN(CAPABILITY_ABSENT)
+    -- the preflight's not_run and no error, the plan passed, nothing mutated --
+    and the audit failed with "destructive case has no run timestamp evidence:
+    GF-REGIONAL-DESTR-028"."""
+
+    _write(
+        tmp_path / "cases" / "GF-REGIONAL-DESTR-003" / "GF-REGIONAL-DESTR-003.json",
+        {"started_at": "2026-09-07T09:00:00Z"},
+    )
+    _plan_only_case(tmp_path, "GF-REGIONAL-DESTR-016", [NOT_APPLICABLE_REASON])
+    not_run = ["GF-REGIONAL-DESTR-028", "GF-REGIONAL-DESTR-029"]
+    for case_id in not_run:
+        write_not_run_case(tmp_path, case_id)
+
+    found = destr013.run_timestamps(tmp_path)
+
+    assert [item["path"] for item in found] == [
+        "cases/GF-REGIONAL-DESTR-003/GF-REGIONAL-DESTR-003.json"
+    ], "the executed case is the window's evidence; the not-run ones add none"
+    assert destr013.run_evidence_fields(tmp_path, found) == {
+        "run_evidence_timestamps": found,
+        "not_applicable_cases": [
+            {"case_id": "GF-REGIONAL-DESTR-016", "reason": NOT_APPLICABLE_REASON}
+        ],
+        "not_run_cases": [
+            {
+                "case_id": case_id,
+                "reason": "CAPABILITY_ABSENT",
+                "detail": DETAIL,
+                "attempt": 7,
+            }
+            for case_id in not_run
+        ],
+    }, "each not-run case is recorded beside the provider-N/A ones, in its own words"
+
+
+def _edit(case: Path, name: str, **changes: Any) -> None:
+    """Rewrite one document of a case directory; a ``None`` value drops the key."""
+
+    path = case / name
+    document = json.loads(path.read_text(encoding="utf-8"))
+    for key, value in changes.items():
+        if value is None:
+            document.pop(key, None)
+        else:
+            document[key] = value
+    _write(path, document)
+
+
+def _restated(**block: str) -> Callable[[Path], object]:
+    """The whole shape again, all three documents carrying another not_run."""
+
+    return lambda case: write_not_run_case(
+        case.parents[1], case.name, not_run=not_run_block(**block)
+    )
+
+
+@pytest.mark.parametrize(
+    ("defect", "problem"),
+    [
+        pytest.param(
+            lambda case: _edit(case, NOT_RUN_RECORD, mutation_performed=True),
+            f"{NOT_RUN_RECORD} does not say mutation_performed false",
+            id="record-says-mutated",
+        ),
+        pytest.param(
+            lambda case: _edit(case, NOT_RUN_RECORD, mutation_performed=None),
+            f"{NOT_RUN_RECORD} does not say mutation_performed false",
+            id="record-without-mutation-flag",
+        ),
+        pytest.param(
+            lambda case: _edit(case, "plan.json", mutation_performed=True),
+            "plan.json does not say mutation_performed false",
+            id="plan-says-mutated",
+        ),
+        pytest.param(
+            lambda case: (case / NOT_RUN_RECORD).unlink(),
+            f"{NOT_RUN_RECORD}, the case's own record, is missing",
+            id="record-missing",
+        ),
+        pytest.param(
+            lambda case: (case / "preflight.json").unlink(),
+            "preflight.json is missing",
+            id="preflight-missing",
+        ),
+        pytest.param(
+            lambda case: (case / "plan.json").unlink(),
+            "plan.json is missing",
+            id="plan-missing",
+        ),
+        pytest.param(
+            lambda case: _edit(case, NOT_RUN_RECORD, case_id="GF-REGIONAL-DESTR-029"),
+            f"{NOT_RUN_RECORD} names another case",
+            id="record-of-another-case",
+        ),
+        pytest.param(
+            lambda case: _edit(case, "preflight.json", not_run=None),
+            "preflight.json does not carry the same not_run",
+            id="preflight-without-not-run",
+        ),
+        pytest.param(
+            lambda case: _edit(
+                case, "preflight.json", not_run=not_run_block("FIXTURE_NOT_READY")
+            ),
+            "preflight.json does not carry the same not_run",
+            id="preflight-other-reason",
+        ),
+        pytest.param(
+            lambda case: _edit(
+                case, "preflight.json", not_run=not_run_block(detail="has 1")
+            ),
+            "preflight.json does not carry the same not_run",
+            id="preflight-other-detail",
+        ),
+        pytest.param(
+            lambda case: _edit(case, "plan.json", details={"risk": "destructive"}),
+            "plan.json does not plan the same not_run",
+            id="plan-without-not-run",
+        ),
+        pytest.param(
+            lambda case: _edit(case, "plan.json", attempt=6),
+            "plan.json is not the plan of this record's case and attempt",
+            id="plan-of-another-attempt",
+        ),
+        pytest.param(
+            lambda case: _edit(case, NOT_RUN_RECORD, reason=None),
+            "the NOT_RUN carries no structured reason (None)",
+            id="reason-missing",
+        ),
+        pytest.param(
+            lambda case: _edit(case, NOT_RUN_RECORD, reason="the group is too small"),
+            "the NOT_RUN carries no structured reason ('the group is too small')",
+            id="reason-free-text",
+        ),
+        pytest.param(
+            _restated(reason="NOT_AUTHORIZED"),
+            "NOT_RUN(NOT_AUTHORIZED) is not a reason the audit accepts "
+            "(CAPABILITY_ABSENT only)",
+            id="reason-the-runner-does-not-take-as-terminal",
+        ),
+        pytest.param(
+            _restated(verdict="BLOCKED"),
+            "the case recorded 'BLOCKED', not NOT_RUN",
+            id="verdict-other-than-not-run",
+        ),
+        pytest.param(
+            _restated(detail=""), "the NOT_RUN carries no detail", id="detail-empty"
+        ),
+        pytest.param(
+            lambda case: _edit(
+                case, "preflight.json", errors=["target node is already unschedulable"]
+            ),
+            "preflight.json also carries errors",
+            id="refusal-beside-the-not-run",
+        ),
+        pytest.param(
+            lambda case: _edit(case, "plan.json", preflight_passed=False),
+            "plan.json does not say its preflight passed",
+            id="plan-refused",
+        ),
+        pytest.param(
+            lambda case: _write(case / "prewarm.json", {"nodes": []}),
+            "the directory also holds prewarm.json",
+            id="execute-evidence-file",
+        ),
+        pytest.param(
+            lambda case: _write(case / "job-a" / "submission.json", {"name": "a"}),
+            "the directory also holds job-a",
+            id="execute-evidence-directory",
+        ),
+        pytest.param(
+            lambda case: (case / "focused-tests.log").write_text(
+                "3 passed\n", encoding="utf-8"
+            ),
+            "the directory also holds focused-tests.log",
+            id="a-plan-that-passed-its-preflight",
+        ),
+    ],
+)
+def test_a_not_run_short_of_the_recorded_shape_is_still_missing_evidence(
+    tmp_path: Path, defect: Callable[[Path], object], problem: str
+) -> None:
+    """Mutation performed, a missing or contradicting record, a NOT_RUN without
+    a structured reason or with one the runner does not take as terminal, a
+    refusal mixed in, or anything beyond the three documents keep the
+    fail-closed rule -- and the error names which."""
+
+    case = write_not_run_case(tmp_path, NOT_RUN_CASE)
+    defect(case)
+
+    assert destr013.not_run_record(case) is None, problem
+    with pytest.raises(destr013.AuditError) as refused:
+        destr013.run_timestamps(tmp_path)
+    assert str(refused.value) == (
+        f"destructive case has no run timestamp evidence: {NOT_RUN_CASE} "
+        f"(not a recorded NOT_RUN: {problem})"
+    )
+    assert destr013.not_run_cases(tmp_path) == [], "a refused not-run is not listed"
+
+
+def test_a_not_run_record_beside_execute_evidence_is_judged_by_that_evidence(
+    tmp_path: Path,
+) -> None:
+    """A directory holding more than the plan, the preflight and the NOT_RUN
+    record ran something: its timestamps are the window's evidence and the
+    case is not listed as not run."""
+
+    case = write_not_run_case(tmp_path, NOT_RUN_CASE)
+    _write(case / "prewarm.json", {"started_at": "2026-09-07T09:10:00Z"})
+
+    found = destr013.run_timestamps(tmp_path)
+
+    assert [(item["path"], item["at"]) for item in found] == [
+        (f"cases/{NOT_RUN_CASE}/prewarm.json", "2026-09-07T09:10:00+00:00")
+    ], found
+    assert destr013.not_run_cases(tmp_path) == [], "execute evidence is not a not-run"
+
+
+@pytest.mark.parametrize(
+    "runner", [destr027, destr028, destr029], ids=["027", "028", "029"]
+)
+def test_the_not_run_each_node_group_runner_records_is_accepted(
+    tmp_path: Path, runner: Any
+) -> None:
+    """The record DESTR-027/028/029 write for a node group short of their
+    minimum -- their own ``not_run_result`` over the oracle's gate -- is the
+    shape the audit accepts."""
+
+    gate = oracle.node_group_gate(
+        [{"name": "ip-10-0-32-162", "labels": {EKS_NODEGROUP_LABEL: "gpu"}}],
+        minimum=runner.MIN_GROUP_NODES,
+        cluster_id="gpu-eks-cluster",
+    )
+    assert gate.not_run is not None, gate
+    record = runner.not_run_result(
+        4,
+        {"release_id": "release-a", "cluster_id": "gpu-eks-cluster"},
+        {**gate.not_run, "node_group_gate": gate.as_dict()},
+    )
+    case = write_not_run_case(
+        tmp_path, runner.CASE_ID, attempt=4, not_run=gate.not_run, record=record
+    )
+
+    assert destr013.not_run_record(case) == {
+        "case_id": runner.CASE_ID,
+        "reason": "CAPABILITY_ABSENT",
+        "detail": gate.not_run["detail"],
+        "attempt": 4,
+    }, record
+    assert destr013.run_timestamps(tmp_path) == [], "a NOT_RUN adds no run timestamp"
 
 
 def test_the_audit_cannot_supply_its_own_window_evidence(tmp_path: Path) -> None:

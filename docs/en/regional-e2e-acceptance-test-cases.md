@@ -11473,14 +11473,27 @@ replacement should ever be attempted.
   `--window-start/--window-end`, otherwise the window is rejected. Unreadable JSON, illegal or
   timezone-less time fields that are present, or an existing case with no time evidence at all can
   never be silently skipped; this audit's own older output does not count as proof of predecessor
-  coverage. One exception is named, not silent: a destructive case planned on this cluster and refused
-  by its own preflight as not applicable to its provider -- an earlier release's HyperPod-only
+  coverage. Two exceptions are named, not silent. First, a destructive case planned on this cluster and
+  refused by its own preflight as not applicable to its provider -- an earlier release's HyperPod-only
   DESTR-002/016/025 on a plain EKS cluster (the three now run on both providers), whose
   `preflight.json` errors carry `does not apply to an eks-managed cluster` and
   whose `plan.json` says `preflight_passed: false`, `mutation_performed: false` -- holds no run timestamp
   and is recorded in the audit evidence as `not_applicable_cases` (case id and the preflight's own
   words) instead of failing the audit; a plan-only directory refused for any other reason is still
-  missing evidence.
+  missing evidence. Second, a case that recorded its own `NOT_RUN(CAPABILITY_ABSENT)`: DESTR-027/028/029
+  need several GPU nodes in one node group, and on a smaller group (for example a plain EKS node group of
+  two GPU nodes) their preflight records the node-group gate's `not_run` (`verdict: NOT_RUN`,
+  `reason: CAPABILITY_ABSENT`, `detail`) and no error, `plan.json` says `preflight_passed: true`,
+  `mutation_performed: false` and plans the same `not_run` in its details, and `--execute` only writes that
+  verdict as the case's own record (`mutation_performed: false`), touching nothing. When the directory holds
+  exactly `plan.json`, `preflight.json` and `<case>.json`, the three agree on verdict/reason/detail, and the
+  plan and the record are the same case and attempt, it is recorded in the audit evidence as
+  `not_run_cases` (case id, reason, detail, attempt) instead of failing the audit. Only `CAPABILITY_ABSENT`
+  is accepted: it is the one reason these runners write and the one NOT_RUN the campaign runner takes as
+  terminal (it reruns a NOT_RUN for any other reason). A mutation on the plan or the record, a missing
+  record or records that disagree, a NOT_RUN without a structured reason or for another reason, a preflight
+  refusal beside it, or any other file in the directory (execute evidence) is still missing evidence, and
+  the error names which.
   When the window end is less than 15 minutes from now (CloudTrail delivery lag) it refuses by
   default; passing `--accept-recent-window` continues the collection but records only
   `INCOMPLETE/FAIL`, `cloudtrail_provisional: true` and `formal_sequence_satisfied: false`, exits

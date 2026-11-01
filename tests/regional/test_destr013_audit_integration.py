@@ -22,6 +22,7 @@ from scripts.e2e.regional import destr013_audit_evidence as binding
 from scripts.e2e.regional import regional_commands
 from scripts.e2e.regional.regional_live_fixture import RegionalFixtureAbort
 from tests.regional._cov95_focused_mock_receipts import write_focused_receipt
+from tests.regional._destr013_not_run_records import write_not_run_case
 
 NOW = datetime(2026, 9, 7, 12, tzinfo=timezone.utc)
 REGION = "us-west-2"
@@ -1479,3 +1480,18 @@ def test_another_clusters_replacement_still_fails_the_window(
     assert (
         code == 1 and "CloudTrail contains provider replacement" in (result["errors"])
     ), result
+
+
+def test_recorded_not_run_cases_are_listed_and_the_audit_passes(
+    local_audit: LocalAudit,
+) -> None:
+    """Live round 14 (plain EKS, two GPU nodes in its group): DESTR-028/029
+    recorded their own NOT_RUN(CAPABILITY_ABSENT) and the audit failed."""
+
+    cases = ["GF-REGIONAL-DESTR-028", "GF-REGIONAL-DESTR-029"]
+    for case_id in cases:
+        write_not_run_case(local_audit.run_dir, case_id)
+    code, result = local_audit.run()
+    assert code == 0 and result["verdict"] == "PASS", result
+    listed = [item["case_id"] for item in result["not_run_cases"]]
+    assert listed == cases and result["not_applicable_cases"] == [], result
