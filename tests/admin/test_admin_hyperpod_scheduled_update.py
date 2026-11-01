@@ -473,3 +473,262 @@ def test_the_verb_is_read_only_and_dispatched_by_the_cli(
     )
     with pytest.raises(SystemExit):
         admin_cli.parser().parse_args(["hyperpod-scheduled-update"])
+
+
+# --- --rolling: keep the schedule, re-image one instance at a time --------------------
+#
+# The live CPU control-plane group, sanitised: 3 x ml.c5.4xlarge with
+# cron(0 8 ? * SUN *) and no DeploymentConfig -- observed on 2026-11-01 to
+# re-image all three control-plane nodes at once.
+
+CPU_NAME = "control-plane-GPU-fault-solution"
+CPU_GROUP = "control-plane-GPU-fault-solution-CPU-instance"
+CPU_HP_ARN = f"arn:aws:sagemaker:{REGION}:{ACCOUNT}:cluster/cpu0live01"
+CPU_EKS_ARN = f"arn:aws:eks:{REGION}:{ACCOUNT}:cluster/cpu-eks"
+CPU_SCHEDULE = "cron(0 8 ? * SUN *)"
+
+
+def _rolling(expression: str, wait: int = 600, **deployment: Any) -> dict[str, Any]:
+    return {
+        "ScheduleExpression": expression,
+        "DeploymentConfig": {
+            "RollingUpdatePolicy": {
+                "MaximumBatchSize": {"Type": "INSTANCE_COUNT", "Value": 1},
+                **deployment.pop("policy", {}),
+            },
+            "WaitIntervalInSeconds": wait,
+            **deployment,
+        },
+    }
+
+
+def _validated(spec: dict[str, Any], cluster: str) -> None:
+    report = ParamValidator().validate(
+        {"ClusterName": cluster, "InstanceGroups": [spec]},
+        botocore.session.get_session()
+        .get_service_model("sagemaker")
+        .operation_model("UpdateCluster")
+        .input_shape,
+    )
+    assert not report.has_errors(), report.generate_report()
+
+
+def test_rolling_keeps_the_schedule_and_rolls_one_instance_at_a_time(capsys) -> None:
+    code, document, err = _run(DescribeRunner(), capsys, "--rolling")
+
+    assert code == 0, err
+    assert (document["mode"], document["status"]) == ("rolling", "PLAN")
+    (record,) = document["instance_groups"]
+    expected = _rolling("cron(0 12 ? * SUN *)")
+    assert (record["outcome"], record["rolling_schedule"]) == ("rolling", expected)
+    assert "removes" not in record
+    (spec,) = document["update_cluster"]["instance_groups"]
+    details = _described()["InstanceGroups"][1]
+    built = release.hyperpod_instance_group_specification(
+        details, labels=dict(SITE_LABELS)
+    )
+    assert spec == {**built, "ScheduledUpdateConfig": expected}, (
+        "the ownership release's full definition, the schedule made to roll"
+    )
+    _validated(spec, "hp-gpu")
+    assert "keeps each group's ScheduleExpression" in document["removal"]
+    assert (
+        f"hp-gpu/{SITE_GROUP}: rolling (keeps ScheduledUpdateConfig cron(0 12 ? * SUN "
+        "*), re-imaging one instance at a time 600 s apart)"
+    ) in err
+    assert (
+        f"run in a maintenance window: {document['update_cluster']['command']}" in err
+    )
+
+
+def test_rolling_keeps_auto_patching_and_the_other_deployment_members(capsys) -> None:
+    described = _described()
+    group = described["InstanceGroups"][1]
+    group["ScheduledUpdateConfig"]["DeploymentConfig"] = {
+        "RollingUpdatePolicy": {
+            "MaximumBatchSize": {"Type": "CAPACITY_PERCENTAGE", "Value": 50},
+            "RollbackMaximumBatchSize": {"Type": "INSTANCE_COUNT", "Value": 2},
+        },
+        "WaitIntervalInSeconds": 60,
+        "AutoRollbackConfiguration": [{"AlarmName": "hp-gpu-reimage"}],
+    }
+    group["AutoPatchConfig"] = {
+        "PatchingStrategy": "WhenIdle",
+        "CurrentPatchSchedule": {"NextPatchDate": "2025-01-05T00:00:00Z"},
+        "DesiredPatchSchedule": {"NextPatchDate": "2025-01-05T00:00:00Z"},
+    }
+
+    code, document, err = _run(
+        DescribeRunner(described), capsys, "--rolling", "--wait-interval-seconds", "900"
+    )
+
+    assert code == 0, err
+    (spec,) = document["update_cluster"]["instance_groups"]
+    assert spec["ScheduledUpdateConfig"] == _rolling(
+        "cron(0 12 ? * SUN *)",
+        900,
+        policy={"RollbackMaximumBatchSize": {"Type": "INSTANCE_COUNT", "Value": 2}},
+        AutoRollbackConfiguration=[{"AlarmName": "hp-gpu-reimage"}],
+    ), "only the batch and the wait change"
+    assert "AutoPatchConfig" in spec, "--rolling touches the schedule only"
+    _validated(spec, "hp-gpu")
+
+
+def test_a_group_that_rolls_this_way_already_or_has_no_schedule_needs_nothing(
+    capsys,
+) -> None:
+    rolling = _described()
+    rolling["InstanceGroups"][1]["ScheduledUpdateConfig"] = _rolling(
+        "cron(0 12 ? * SUN *)"
+    )
+    unscheduled = _described()
+    del unscheduled["InstanceGroups"][1]["ScheduledUpdateConfig"]
+    unscheduled["InstanceGroups"][1]["AutoPatchConfig"] = {
+        "PatchingStrategy": "WhenIdle"
+    }
+
+    for described in (rolling, unscheduled):
+        code, document, err = _run(DescribeRunner(described), capsys, "--rolling")
+
+        assert code == 0
+        assert document["status"] == "NOOP" and "update_cluster" not in document
+        assert document["instance_groups"][0]["outcome"] == "none"
+        assert "no ScheduledUpdateConfig to roll, or it rolls this way already" in err
+    _code, document, _err = _run(
+        DescribeRunner(rolling), capsys, "--rolling", "--wait-interval-seconds", "300"
+    )
+    assert document["instance_groups"][0]["outcome"] == "rolling", (
+        "another wait is a change"
+    )
+
+
+def test_the_refusals_hold_for_rolling_too(capsys) -> None:
+    code, document, err = _run(
+        DescribeRunner(_with(ActiveOperations={"Scaling": 1})), capsys, "--rolling"
+    )
+
+    assert code == helper.EXIT_REFUSED
+    assert document["status"] == "REFUSED" and "update_cluster" not in document
+    assert "run in a maintenance window" not in err
+
+
+@pytest.mark.parametrize("wait", ["-1", "3601"])
+def test_the_wait_is_bounded_by_the_service_model(wait: str, capsys) -> None:
+    member = _shape("DeploymentConfiguration").members["WaitIntervalInSeconds"]
+
+    assert (member.metadata["min"], member.metadata["max"]) == (
+        0,
+        helper.MAX_WAIT_SECONDS,
+    ), "the installed service model's range"
+    with pytest.raises(BootstrapError, match="--wait-interval-seconds must be 0-3600"):
+        _run(DescribeRunner(), capsys, "--rolling", "--wait-interval-seconds", wait)
+
+
+def test_rolling_schedule_keeps_the_expression_and_accepts_no_wait() -> None:
+    assert helper.rolling_schedule({"ScheduleExpression": CPU_SCHEDULE}, 0) == _rolling(
+        CPU_SCHEDULE, 0
+    )
+
+
+def _cpu_described() -> dict[str, Any]:
+    return {
+        "ClusterArn": CPU_HP_ARN,
+        "ClusterName": CPU_NAME,
+        "ClusterStatus": "InService",
+        "CreationTime": "2025-01-01T00:00:00.000000+00:00",
+        "InstanceGroups": [_group(CPU_GROUP, "ml.c5.4xlarge", 3, CPU_SCHEDULE)],
+        "NodeProvisioningMode": "Continuous",
+        "NodeRecovery": "Automatic",
+        "Orchestrator": {"Eks": {"ClusterArn": CPU_EKS_ARN}},
+        "VpcConfig": copy.deepcopy(VPC),
+    }
+
+
+class CpuDescribeRunner(DescribeRunner):
+    """The CPU control-plane cluster's ``describe-cluster``."""
+
+    def aws_json(self, region, service, operation, *arguments, **options):
+        if (service, operation) == ("sagemaker", "describe-cluster"):
+            self.calls.append((service, operation, tuple(arguments)))
+            assert not options.get("mutate"), "the verb writes nothing"
+            selected = arguments[arguments.index("--cluster-name") + 1]
+            assert selected in {CPU_HP_ARN, CPU_NAME}, selected
+            return copy.deepcopy(self.described)
+        return super().aws_json(region, service, operation, *arguments, **options)
+
+
+def _cpu_state_dir(tmp_path: Path) -> Path:
+    (tmp_path / "site.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "apiVersion": "gpu-fault.io/v1",
+                "kind": "RegionalSite",
+                "metadata": {"name": SITE_ID},
+                "spec": {
+                    "cpu": {
+                        "kubeconfig": "cpu.kubeconfig",
+                        "eksArn": CPU_EKS_ARN,
+                        "hyperpodClusterName": CPU_NAME,
+                    },
+                    "clusters": [
+                        {
+                            "clusterId": "hp-gpu",
+                            "eksClusterArn": EKS_ARN,
+                            "hyperpodClusterName": "hp-gpu",
+                        }
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+@pytest.mark.parametrize("arn", [CPU_EKS_ARN, CPU_HP_ARN], ids=["eks-arn", "hp-arn"])
+def test_the_sites_cpu_cluster_rolls_every_group_from_one_describe(
+    arn: str, tmp_path: Path, capsys
+) -> None:
+    runner = CpuDescribeRunner(_cpu_described())
+
+    code, document, err = _run(
+        runner,
+        capsys,
+        "--state-dir",
+        str(_cpu_state_dir(tmp_path)),
+        "--rolling",
+        arn=arn,
+    )
+
+    assert code == 0, err
+    assert document["selection"] == (
+        "every instance group of the site's CPU control-plane cluster"
+    ), "no ownership label on a CPU group: every group is the control plane's"
+    assert [call[:2] for call in runner.calls] == [("sagemaker", "describe-cluster")], (
+        "site.yaml names the CPU HyperPod cluster: one describe, no inventory"
+    )
+    (record,) = document["instance_groups"]
+    assert (record["name"], record["outcome"]) == (CPU_GROUP, "rolling")
+    (spec,) = document["update_cluster"]["instance_groups"]
+    assert spec["ScheduledUpdateConfig"] == _rolling(CPU_SCHEDULE)
+    assert spec["InstanceCount"] == 3 and spec["InstanceType"] == "ml.c5.4xlarge"
+    _validated(spec, CPU_NAME)
+    words = shlex.split(document["update_cluster"]["command"])
+    assert words[words.index("--cluster-name") + 1] == CPU_NAME
+
+
+def test_the_sites_cpu_cluster_can_drop_its_schedule_as_well(
+    tmp_path: Path, capsys
+) -> None:
+    code, document, _err = _run(
+        CpuDescribeRunner(_cpu_described()),
+        capsys,
+        "--state-dir",
+        str(_cpu_state_dir(tmp_path)),
+        arn=CPU_HP_ARN,
+    )
+
+    assert code == 0
+    assert document["mode"] == "disable"
+    (record,) = document["instance_groups"]
+    assert record["removes"] == ["ScheduledUpdateConfig"]

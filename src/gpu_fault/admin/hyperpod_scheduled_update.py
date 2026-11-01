@@ -33,6 +33,17 @@ the service reads an omitted member of an instance group definition as
 ``KubernetesConfig`` labels are the declared state and an omitted
 ``ImageReleaseVersion`` means the latest release, not the running one), so the
 output also carries the ``describe-cluster`` read that shows the outcome.
+
+The site's CPU control-plane cluster is covered too: with ``--state-dir`` its
+ARN (``spec.cpu``) selects every instance group -- the control-plane Pods carry
+no node selector and its groups no ownership label. ``--rolling`` keeps each
+selected group's ``ScheduleExpression`` and makes the update roll instead
+(``DeploymentConfig.RollingUpdatePolicy.MaximumBatchSize`` ``INSTANCE_COUNT`` 1,
+``WaitIntervalInSeconds`` from ``--wait-interval-seconds``, default 600 s; other
+``DeploymentConfig`` members are kept): without a rolling policy the CPU group's
+weekly schedule was observed (2026-11-01) to re-image all three control-plane
+nodes at once. Same builder, same refusals, same verify read; the operator
+runs the printed command.
 """
 
 from __future__ import annotations
@@ -69,8 +80,16 @@ VERB = HELPER_VERB
 #: The members the printed definition leaves out.
 REMOVED_FIELDS = ("ScheduledUpdateConfig", "AutoPatchConfig")
 DISABLE = "disable"
+#: ``--rolling``: the schedule stays and rolls one instance at a time.
+ROLLING = "rolling"
 NONE = "none"
 REFUSED = "refused"
+#: The batch ``--rolling`` writes: one instance at a time.
+ROLLING_BATCH = {"Type": "INSTANCE_COUNT", "Value": 1}
+DEFAULT_WAIT_SECONDS = 600
+#: ``DeploymentConfiguration.WaitIntervalInSeconds`` bounds (service model and
+#: ``aws sagemaker update-cluster help``: min 0, max 3600).
+MAX_WAIT_SECONDS = 3600
 #: Exit status when a selected group's automatic update cannot be removed yet.
 EXIT_REFUSED = 2
 SECTION = "管理员日常运维 / administrator-operations §5.0.5"
@@ -81,21 +100,26 @@ def add_command(commands: Any) -> None:
         VERB,
         usage=(
             f"gpu-fault-admin {VERB} --gpu-cluster-arn GPU_ARN "
-            "[--instance-group NAME ...] [--state-dir STATE_DIR]"
+            "[--instance-group NAME ...] [--state-dir STATE_DIR] "
+            "[--rolling [--wait-interval-seconds SECONDS]]"
         ),
         help=(
             "print the aws sagemaker update-cluster command that removes the "
             "ScheduledUpdateConfig/AutoPatchConfig of the HyperPod instance groups "
-            "the site manages (read-only; the operator runs it)"
+            "the site manages, or with --rolling makes the schedule roll one "
+            "instance at a time (read-only; the operator runs it)"
         ),
         description=(
             "Read-only: describes the HyperPod cluster and prints, as JSON, each "
             "selected instance group's automatic updates and one update-cluster "
             "command whose full definitions (built like the ownership release's) "
-            "leave ScheduledUpdateConfig and AutoPatchConfig out; refused while an "
-            "update is in flight or pending. Selected: --instance-group, else the "
-            "groups the managed site selects (--state-dir), else every group "
-            f"carrying {OWNERSHIP_LABEL}."
+            "leave ScheduledUpdateConfig and AutoPatchConfig out -- or, with "
+            "--rolling, keep the ScheduleExpression and add a DeploymentConfig "
+            "that re-images one instance at a time; refused while an update is in "
+            "flight or pending. Selected: --instance-group, else the groups the "
+            "managed site selects (--state-dir; every group of its CPU "
+            "control-plane cluster), else every group carrying "
+            f"{OWNERSHIP_LABEL}."
         ),
     )
     parser.add_argument(
@@ -117,7 +141,27 @@ def add_command(commands: Any) -> None:
         metavar="STATE_DIR",
         help=(
             "a managed site's private state directory: select the groups its "
-            "recorded node selector covers (also what a bound deploy host requires)"
+            "recorded node selector covers -- every group of its CPU control-plane "
+            "cluster (also what a bound deploy host requires)"
+        ),
+    )
+    parser.add_argument(
+        "--rolling",
+        action="store_true",
+        help=(
+            "keep each selected group's ScheduledUpdateConfig and make it roll one "
+            "instance at a time (DeploymentConfig RollingUpdatePolicy "
+            "MaximumBatchSize INSTANCE_COUNT 1) instead of removing it"
+        ),
+    )
+    parser.add_argument(
+        "--wait-interval-seconds",
+        type=int,
+        default=DEFAULT_WAIT_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "with --rolling: the WaitIntervalInSeconds between batches (0-"
+            f"{MAX_WAIT_SECONDS}, default {DEFAULT_WAIT_SECONDS})"
         ),
     )
 
@@ -131,6 +175,16 @@ def _site_clusters(site: Mapping[str, Any] | None) -> list[Mapping[str, Any]]:
     return [item for item in clusters or () if isinstance(item, Mapping)]
 
 
+def _site_cpu(site: Mapping[str, Any] | None) -> tuple[str, str]:
+    """``(eksArn, hyperpodClusterName)`` of the site's CPU control-plane cluster."""
+
+    spec = (site or {}).get("spec")
+    cpu = spec.get("cpu") if isinstance(spec, Mapping) else None
+    if not isinstance(cpu, Mapping):
+        return "", ""
+    return str(cpu.get("eksArn") or ""), str(cpu.get("hyperpodClusterName") or "")
+
+
 def _describe(
     runner: CommandRunner, *, arn: str, site: Mapping[str, Any] | None
 ) -> dict[str, Any]:
@@ -142,13 +196,14 @@ def _describe(
             parsed.region, "sagemaker", "describe-cluster", "--cluster-name", arn
         )
     elif parsed.service == "eks":
+        cpu_eks_arn, cpu_hyperpod = _site_cpu(site)
         hint = next(
             (
                 str(item.get("hyperpodClusterName") or "")
                 for item in _site_clusters(site)
                 if item.get("eksClusterArn") == arn
             ),
-            "",
+            cpu_hyperpod if cpu_eks_arn == arn else "",
         )
         found = find_hyperpod_for_eks(
             runner, eks_arn=arn, region=parsed.region, hint=hint or None
@@ -193,6 +248,14 @@ def _selected(
                 f"{', '.join(unknown)}; its groups are {', '.join(names) or 'none'}"
             )
         return [item for item in names if item in set(requested)], "--instance-group"
+    cpu_eks_arn, cpu_hyperpod = _site_cpu(site)
+    if site is not None and (
+        (cpu_hyperpod and name == cpu_hyperpod)
+        or (cpu_eks_arn and orchestrator_eks_arn(described) == cpu_eks_arn)
+    ):
+        # Any CPU node hosts control-plane Pods, and no CPU group carries the
+        # ownership label: every group is the control plane's.
+        return names, "every instance group of the site's CPU control-plane cluster"
     if site is not None:
         recorded = recorded_node_scope(
             _site_clusters(site),
@@ -228,10 +291,29 @@ def _selected(
 # --- the plan ---------------------------------------------------------------------
 
 
+def rolling_schedule(schedule: Mapping[str, Any], wait_seconds: int) -> dict[str, Any]:
+    """``schedule`` with its expression kept and a one-instance rolling policy:
+    ``RollingUpdatePolicy.MaximumBatchSize`` ``ROLLING_BATCH`` and
+    ``WaitIntervalInSeconds`` ``wait_seconds``; every other member (a rollback
+    batch size, the rollback alarms) stays as it is."""
+
+    deployment = dict(schedule.get("DeploymentConfig") or {})
+    policy = dict(deployment.get("RollingUpdatePolicy") or {})
+    policy["MaximumBatchSize"] = dict(ROLLING_BATCH)
+    deployment["RollingUpdatePolicy"] = policy
+    deployment["WaitIntervalInSeconds"] = wait_seconds
+    return {**schedule, "DeploymentConfig": deployment}
+
+
 def _group_plan(
-    details: Mapping[str, Any], *, cluster_status: str
+    details: Mapping[str, Any],
+    *,
+    cluster_status: str,
+    rolling: int | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    """One group's record and, when it needs and allows one, its definition."""
+    """One group's record and, when it needs and allows one, its definition:
+    without ``rolling`` the definition minus ``REMOVED_FIELDS``; with it (the
+    wait in seconds) the schedule kept and made to roll (``rolling_schedule``)."""
 
     facts = hyperpod_group_updates(details)
     record: dict[str, Any] = {
@@ -239,6 +321,14 @@ def _group_plan(
         "ownership_label": hyperpod_current_labels(details).get(OWNERSHIP_LABEL),
         **{field: details.get(field) for field in REMOVED_FIELDS},
     }
+    schedule = details.get("ScheduledUpdateConfig")
+    target: dict[str, Any] | None = None
+    if rolling is not None:
+        if isinstance(schedule, Mapping) and schedule.get("ScheduleExpression"):
+            target = rolling_schedule(schedule, rolling)
+        if target is None or target == schedule:
+            record["outcome"] = NONE
+            return record, None
     removes = [field for field in REMOVED_FIELDS if details.get(field) is not None]
     if not removes:
         record["outcome"] = NONE
@@ -255,6 +345,10 @@ def _group_plan(
     if specification is None:
         record.update(outcome=REFUSED, refusal=reason)
         return record, None
+    if target is not None:
+        specification["ScheduledUpdateConfig"] = target
+        record.update(outcome=ROLLING, rolling_schedule=target)
+        return record, specification
     for field in REMOVED_FIELDS:
         specification.pop(field, None)
     record.update(outcome=DISABLE, removes=removes)
@@ -267,8 +361,10 @@ def plan_document(
     region: str,
     selected: Sequence[str],
     selection: str,
+    rolling: int | None = None,
 ) -> dict[str, Any]:
-    """The JSON the verb prints for ``described`` and the ``selected`` groups."""
+    """The JSON the verb prints for ``described`` and the ``selected`` groups;
+    ``rolling`` (the wait in seconds) is ``--rolling``."""
 
     name = str(described.get("ClusterName") or "")
     status = str(described.get("ClusterStatus") or "")
@@ -279,7 +375,9 @@ def plan_document(
     }
     records, specifications = [], []
     for group in selected:
-        record, specification = _group_plan(by_name[group], cluster_status=status)
+        record, specification = _group_plan(
+            by_name[group], cluster_status=status, rolling=rolling
+        )
         records.append(record)
         if specification is not None:
             specifications.append(specification)
@@ -293,6 +391,7 @@ def plan_document(
             "status": status,
         },
         "selection": selection,
+        "mode": DISABLE if rolling is None else ROLLING,
         "instance_groups": records,
         "status": ("REFUSED" if refused else "PLAN" if specifications else "NOOP"),
         "removal": (
@@ -301,6 +400,13 @@ def plan_document(
             "so the definition leaves the member out; the model does not say "
             "whether the service reads the omission as remove or unchanged -- "
             "run verify afterwards"
+        )
+        if rolling is None
+        else (
+            "the definition keeps each group's ScheduleExpression and sets its "
+            "DeploymentConfig RollingUpdatePolicy MaximumBatchSize INSTANCE_COUNT 1 "
+            f"and WaitIntervalInSeconds {rolling}: the service then re-images one "
+            "instance at a time on that schedule -- run verify afterwards"
         ),
         "manual_update": {
             item["name"]: (
@@ -346,6 +452,13 @@ def run_command(
 
     active = runner or CommandRunner()
     arn = str(arguments.gpu_cluster_arn).strip()
+    wait = getattr(arguments, "wait_interval_seconds", DEFAULT_WAIT_SECONDS)
+    rolling = wait if getattr(arguments, "rolling", False) else None
+    if not 0 <= wait <= MAX_WAIT_SECONDS:
+        raise BootstrapError(
+            f"--wait-interval-seconds must be 0-{MAX_WAIT_SECONDS} (the service's "
+            "WaitIntervalInSeconds range)"
+        )
     state_dir = getattr(arguments, "state_dir", None)
     site = (
         load_existing_site(Path(state_dir).expanduser().resolve())
@@ -357,7 +470,11 @@ def run_command(
         described, requested=tuple(arguments.instance_group or ()), site=site
     )
     document = plan_document(
-        described, region=Arn.parse(arn).region, selected=selected, selection=selection
+        described,
+        region=Arn.parse(arn).region,
+        selected=selected,
+        selection=selection,
+        rolling=rolling,
     )
     print(json.dumps(document, indent=2, sort_keys=True))
     cluster = document["cluster"]["hyperpod_name"]
@@ -365,9 +482,17 @@ def run_command(
         detail = (
             f"removes {', '.join(item['removes'])}"
             if item["outcome"] == DISABLE
+            else (
+                "keeps ScheduledUpdateConfig "
+                f"{item['rolling_schedule'].get('ScheduleExpression')}, re-imaging "
+                f"one instance at a time {rolling} s apart"
+            )
+            if item["outcome"] == ROLLING
             else item.get("refusal")
             if item["outcome"] == REFUSED
             else "no automatic update"
+            if rolling is None
+            else "no ScheduledUpdateConfig to roll, or it rolls this way already"
         )
         print(
             f"gpu-fault-admin {VERB}: {cluster}/{item['name']}: {item['outcome']} "
