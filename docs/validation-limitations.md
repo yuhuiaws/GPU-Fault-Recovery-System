@@ -4861,9 +4861,32 @@ are catalog Immediate Action `IGNORE`, which the engine resolves to
 `NO_ACTION` / `MONITOR_ONLY` whatever the workload state, and the helper
 refuses any other grade before touching the node. What they prove is the
 independence of the trusted-source path under a concurrent diagnosis: the
-XID's own catalog decision, its own `RECOVERED` incident, no workflow, no
-correlation, no merge into the counter/composite incident, no XID component
-inside the composite, the counter chain undisturbed. What they do **not**
+XID's own catalog decision, its own `RECOVERED` `inc-<event_id>` incident, no
+workflow, no companion correlation (`correlated_event_id`), no merge into the
+counter/composite incident or any other, no XID component inside the
+composite, the counter chain undisturbed. Independence is execution and
+incident identity, not correlation bookkeeping. Since batch 236
+provider-event correlation compares PCI devices instead of spellings, so on
+R16 024's kernel XID 92 (`0000:a5:00`) is associated with the memory
+composite's marker of the same GPU (`00000000:A5:00.0`, the same GPU_MEMORY
+class) and its decision reads `duplicate=true` with the association as a
+reason; nothing that executes changes. The oracle used to fail any duplicate
+and would have failed that run: reproduced in memory with the variant's own
+code over the product's ingest routes and store probes, R15 (87a99fb9) PASS,
+R16 (d7fad70 onwards) and the b237 head FAIL on the `independent` stage alone.
+It now accepts a duplicate the product explains as a marker association while
+the decision stays on the XID's own `RECOVERED` `inc-<event_id>` with no
+workflow and no `correlated_event_id`, and reports the association
+(`marker_associations`); a duplicate on its own incident that is neither an
+association nor a companion correlation (a repeat), a companion merge, a
+decision on the composite's or any other incident, a missing or
+non-`RECOVERED` own incident and a workflow still fail
+(`tests/regional/test_general_live_kernel_xid.py`;
+`tests/regional/test_general_live_independent_xid_product.py` runs the variant
+over the product's own records: PASS with and without the association, FAIL
+when the association takes the XID's incident). 020's XID 137 (class
+`GPU_XID_137`) is never associated with the NVLink counter (`GPU_FABRIC`).
+What they do **not**
 prove is the spec's fatal wording -- that a RESET/QUARANTINE-grade dispatch
 survives the concurrent diagnostic workflow (node-scoped merge, exclusive
 operations). That branch needs the reset approvals and belongs to the

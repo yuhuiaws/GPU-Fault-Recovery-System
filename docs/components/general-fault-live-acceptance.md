@@ -3240,11 +3240,27 @@ COLLECT_DIAGNOSTIC_BUNDLE 实际执行（节点 cordon + taint、不停作业）
 `EXCESSIVE_SBE_INTERRUPTS`（与弱复合同属 GPU_MEMORY 类）。引擎把 `IGNORE` 解析为
 `NO_ACTION`/`MONITOR_ONLY`（与 workload 状态无关），协调器不会把非 EXECUTABLE 决策并入
 其它 incident，其 incident 创建即 `RECOVERED`、无 workflow，因此真机不隔离、不 reset。
-判定读产品自己的 `FaultPolicyDecision`：恰一条非 duplicate 决策、disposition
+判定读产品自己的 `FaultPolicyDecision`：恰一条属于本事件的决策，disposition
 `MONITOR_ONLY`、official_action 等于 catalog、无 action/safety_action/operator/
-correlated_event/workflow、incident 为自己的且 `RECOVERED`、不是计数/复合 incident、
-GPU 解析到目标卡；复合的 `component_metrics`/`component_finding_ids` 不含 XID；计数链
-仍是单条只读诊断。它证明可信源路径独立、未被吸收；**不**证明致命级（RESET/QUARANTINE）
+correlated_event/workflow，incident 是事件自己的 `inc-<event_id>`（不是计数/复合或任何
+其它 incident）且在 store 里为 `RECOVERED`，GPU 解析到目标卡；复合的
+`component_metrics`/`component_finding_ids` 不含 XID；计数链仍是单条只读诊断。
+“独立”指执行与 incident 身份，不指关联簿记，`duplicate=true` 本身不判失败：b236 起
+provider-event 关联（`correlate_provider_event`）按 PCI 设备而非拼写比较，内核行的
+`0000:a5:00` 与 exporter 的 `00000000:A5:00.0` 是同一张卡，024 的 XID 92 因此与同卡、同为
+GPU_MEMORY 类的复合 marker 关联，决策记 `duplicate=true`，reason 写明
+`Provider marker association with incident <复合 incident>`。该关联只是证据（产品：duplicate
+不证明执行覆盖；`execution_decision` 仍给事件自己的 `inc-<event_id>`），产品自己的回放
+（`tests/regional/test_general_live_independent_xid_product.py`：变体代码驱动真实摄入路由，
+store 探针在进程内读真实 store）表明它不改变任何执行：变体 PASS，并在结果的
+`marker_associations` 与 notes 里记下关联对象；R15 的比较（精确字符串）下无关联，同样 PASS。
+020 的 XID 137 类别为 `GPU_XID_137`，与计数 finding 的 `GPU_FABRIC` 不同，不会被关联。
+仍判失败（fail closed）：无决策；duplicate 既无关联 reason 也无 `correlated_event_id` 且在
+自己的 incident 上（同一事件的重放，夹具复用了 event id）；带 `correlated_event_id`
+（companion 合并）；决策落在复合或其它 incident 上，或自己的 incident 不存在/非
+`RECOVERED`（关联若把 XID 绑到所遇 marker 的 incident，会覆盖复合 incident，判
+"not its own"）；有 workflow；catalog 决策被改。
+它证明可信源路径独立、未被吸收；**不**证明致命级（RESET/QUARANTINE）
 处置在并发诊断 workflow 下存活——该分支需 reset 授权，由 kmsg 致命 XID 的危险车道执行。
 
 **复用 GF-ENV-LIVE 环境回放**（024 `thermal_warning`、`power_performance`，
