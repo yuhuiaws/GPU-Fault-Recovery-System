@@ -997,6 +997,10 @@ rules:
       - tests/regional/test_notify005_behavior.py
       - tests/regional/test_notify005_owned_gpus.py
       - tests/regional/test_notification_acceptance_runner.py
+      # The NOT_APPLICABLE notice of a recorded incident and the one
+      # FAULT_DETECTED notice of an XID reported twice (batch 238).
+      - tests/orchestration/test_stale_containment_xid.py
+      - tests/orchestration/test_xid_twin_notification.py
     regional_cases:
       - GF-REGIONAL-NOTIFY-001
       - GF-REGIONAL-NOTIFY-003..007
@@ -1151,6 +1155,12 @@ rules:
       - tests/regional/test_app_structure.py
       - tests/regional/test_plugins.py
       - tests/app/test_route_tenancy_security.py
+      # The XID finalize path of app/ingest/faults.py through the collector
+      # routes: the kernel-line / field-230 replay (batch 237), a recorded
+      # incident's answer and the twin's single notice (batch 238).
+      - tests/orchestration/test_xid_cross_source_dedupe.py
+      - tests/orchestration/test_stale_containment_xid.py
+      - tests/orchestration/test_xid_twin_notification.py
     regional_cases:
       - GF-REGIONAL-BOOT-001..005
       - GF-REGIONAL-BOOT-007..015

@@ -140,6 +140,37 @@ def test_pci_identity_selects_the_gpu_composites_domain_not_full() -> None:
     assert plan.approval_cases == composites.approval_cases, plan.approval_cases
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "src/gpu_fault/app/ingest/faults.py",
+        "src/gpu_fault/notification_preview.py",
+        "src/gpu_fault/notifications/xid_investigatory.py",
+        "src/gpu_fault/orchestration/coordinator.py",
+    ],
+)
+def test_the_xid_finalize_path_selects_its_route_replays(path: str) -> None:
+    """The XID finalize path -- the fence, the incident, the notice -- is
+    replayed through the collector routes by tests under tests/orchestration;
+    a change to app/ingest/faults.py or to the notice builders selected none of
+    them (batch 238)."""
+
+    plan = MODULE.build_plan([path], settings())
+
+    assert plan.full is False, plan.reasons
+    for target in (
+        "tests/orchestration/test_stale_containment_xid.py",
+        "tests/orchestration/test_xid_twin_notification.py",
+    ):
+        assert target in plan.pytest_targets or "tests/orchestration" in (
+            plan.pytest_targets
+        ), (path, target)
+    if path == "src/gpu_fault/app/ingest/faults.py":
+        assert (
+            "tests/orchestration/test_xid_cross_source_dedupe.py" in plan.pytest_targets
+        ), plan.pytest_targets
+
+
 def test_unmatched_file_escalates_to_full_acceptance() -> None:
     plan = MODULE.build_plan(["unknown/new-surface.xyz"], settings())
     ordered, do_not_run = MODULE.ordered_regional_cases()
