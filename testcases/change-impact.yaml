@@ -822,6 +822,9 @@ rules:
       - src/gpu_fault/xid_*.py
       - src/gpu_fault/dcgm_*.py
       - src/gpu_fault/gpu_*.py
+      # One GPU's PCI address in any source's spelling (batch 236): read by the
+      # policy engine, the coordinator, the XID ingest and gpu_composites.
+      - src/gpu_fault/pci_identity.py
       - src/gpu_fault/host_health.py
       # Low CPU/GPU utilisation windows timed per managed attempt (batch 140),
       # graded only on the GPUs that attempt holds (batch 142).
@@ -893,6 +896,12 @@ rules:
       # The grading also decides the observe-only solo XID 45 (batch 131).
       - tests/orchestration/test_xid45_observe_only.py
       - tests/regional/test_xid45_opt_in_window.py
+      # The device comparison of a PCI address across spellings (batch 236)
+      # and the kernel-line / field-230 twin of one XID (batch 237).
+      - tests/orchestration/test_provider_event_pci_identity.py
+      - tests/app_services/test_kernel_gauge_pci_spellings.py
+      - tests/metrics/test_xid_owner_pci_identity.py
+      - tests/orchestration/test_xid_cross_source_dedupe.py
     regional_cases:
       - GF-REGIONAL-COLLECT-001..020
     checks:

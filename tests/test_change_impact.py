@@ -114,6 +114,32 @@ def test_departed_node_cleanup_selects_its_own_domain_not_full() -> None:
         assert plan.approval_cases == (), (path, plan.approval_cases)
 
 
+def test_pci_identity_selects_the_gpu_composites_domain_not_full() -> None:
+    """``pci_identity`` (batch 236) is read by the policy engine, the
+    coordinator, the XID ingest and ``gpu_composites``; unmapped, it fell to
+    the fail-closed fallback and a one-line change scheduled the whole
+    acceptance run. It selects what ``gpu_composites`` does, and its own
+    device-comparison tests."""
+
+    composites = MODULE.build_plan(["src/gpu_fault/gpu_composites.py"], settings())
+    plan = MODULE.build_plan(["src/gpu_fault/pci_identity.py"], settings())
+
+    assert plan.full is False, plan.reasons
+    assert plan.domains == composites.domains == ("collectors-policy",), (
+        plan.domains,
+        composites.domains,
+    )
+    for target in (
+        "tests/policy",
+        "tests/orchestration/test_provider_event_pci_identity.py",
+        "tests/app_services/test_kernel_gauge_pci_spellings.py",
+        "tests/metrics/test_xid_owner_pci_identity.py",
+    ):
+        assert target in plan.pytest_targets, target
+    assert plan.safe_cases == composites.safe_cases, plan.safe_cases
+    assert plan.approval_cases == composites.approval_cases, plan.approval_cases
+
+
 def test_unmatched_file_escalates_to_full_acceptance() -> None:
     plan = MODULE.build_plan(["unknown/new-surface.xyz"], settings())
     ordered, do_not_run = MODULE.ordered_regional_cases()
