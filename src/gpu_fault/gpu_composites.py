@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import re
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Mapping, Sequence
 
@@ -15,6 +14,7 @@ from gpu_fault.gpu_metric_models import (
 from gpu_fault.gpu_pcie_link_policy import PCIE_CORRECTABLE_ERRORS, PCIE_LINK_DOWNTRAIN
 from gpu_fault.gpu_power_policy import NVIDIA_DCGM_HEALTH_REFERENCE
 from gpu_fault.models import RecoveryAction
+from gpu_fault.pci_identity import pci_bdf_matches
 from gpu_fault.policy import ActionDisposition, FaultPolicyDecision, XidEvent
 from gpu_fault.store.shared.errors import NotFoundError
 
@@ -50,10 +50,6 @@ _PCIE_COMPONENT_TEXT = {
     PCIE_LINK_DOWNTRAIN: "PCIe link downtrain",
     PCIE_CORRECTABLE_ERRORS: "PCIe correctable-error rate",
 }
-_PCI_BDF = re.compile(
-    r"(?:(?P<domain>[0-9a-f]{4}|[0-9a-f]{8}):)?"
-    r"(?P<bus>[0-9a-f]{2}):(?P<device>[0-9a-f]{2})(?:\.(?P<function>[0-7]))?"
-)
 
 
 def composite_finding(
@@ -231,18 +227,6 @@ def metric_counter_delta(
     ):
         return None
     return sample.value - previous.sample.value
-
-
-def pci_bdf_matches(left: str, right: str) -> bool:
-    first = _PCI_BDF.fullmatch(left.strip().lower())
-    second = _PCI_BDF.fullmatch(right.strip().lower())
-    if first is None or second is None:
-        return False
-    for name in ("domain", "bus", "device", "function"):
-        a, b = first.group(name), second.group(name)
-        if a is not None and b is not None and int(a, 16) != int(b, 16):
-            return False
-    return True
 
 
 def is_pcie_kernel_xid(event: XidEvent) -> bool:

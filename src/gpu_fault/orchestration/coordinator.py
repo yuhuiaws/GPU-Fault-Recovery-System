@@ -95,6 +95,7 @@ from gpu_fault.orchestration.workflow_merge import (
     WorkflowMergeService,
 )
 from gpu_fault.orchestration.xid45_policy import observe_only_reference
+from gpu_fault.pci_identity import pci_identity_overlaps
 from gpu_fault.policy import (
     ActionDisposition,
     DistributedXidBatch,
@@ -606,20 +607,19 @@ class IncidentOrchestrator:
                 and not candidate_gpus.intersection(marker_gpus)
             ):
                 continue
+            # One device, not one spelling: the kernel line's 0000:b9:00 is the
+            # exporter's 00000000:B9:00.0 (b236, ``pci_identity``).
             candidate_pci = set(candidate.scope.pci_bdfs)
             marker_pci = set(marker.scope.pci_bdfs)
-            if (
-                candidate_pci
-                and marker_pci
-                and not candidate_pci.intersection(marker_pci)
-            ):
+            same_pci = pci_identity_overlaps(candidate_pci, marker_pci)
+            if candidate_pci and marker_pci and not same_pci:
                 continue
             same_source = candidate.event_source == marker.event_source
             candidate_keys = set(candidate.correlation_keys)
             marker_keys = set(marker.correlation_keys)
             scope_identity_matches = bool(
                 (candidate_gpus & marker_gpus)
-                or (candidate_pci & marker_pci)
+                or same_pci
                 or (
                     set(candidate.scope.fabric_partitions)
                     & set(marker.scope.fabric_partitions)

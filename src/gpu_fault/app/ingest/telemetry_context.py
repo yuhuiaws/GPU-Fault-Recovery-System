@@ -6,7 +6,6 @@ from typing import Literal
 
 from gpu_fault.app.ingest.node_health import NodeHealthIngestionService
 from gpu_fault.fleet import AgentLifecycleState
-from gpu_fault.gpu_composites import pci_bdf_matches
 from gpu_fault.gpu_metrics import GpuInventorySnapshot
 from gpu_fault.host_health import (
     NodeHealthCategory,
@@ -14,6 +13,7 @@ from gpu_fault.host_health import (
     NodeHealthIngestionResult,
 )
 from gpu_fault.models import RecoveryAction, Severity, WorkloadState
+from gpu_fault.pci_identity import pci_bdf_matches
 from gpu_fault.store.shared.errors import NotFoundError
 from gpu_fault.store.shared.health_signals import finding_health_signal_key
 from gpu_fault.telemetry import (

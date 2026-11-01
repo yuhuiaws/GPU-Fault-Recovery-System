@@ -7,11 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 from gpu_fault.app.ingest.gpu_findings import gpu_node_health_findings
 from gpu_fault.app.ingest.node_health import NodeHealthIngestionService
-from gpu_fault.gpu_composites import (
-    GPU_COMPOSITE_TRANSACTION,
-    is_pcie_kernel_xid,
-    pci_bdf_matches,
-)
+from gpu_fault.gpu_composites import GPU_COMPOSITE_TRANSACTION, is_pcie_kernel_xid
 from gpu_fault.gpu_metrics import GpuInventorySnapshot
 from gpu_fault.host_health import (
     NodeHealthCategory,
@@ -29,6 +25,7 @@ from gpu_fault.nvidia_logs import (
     unresolved_reason_kind,
 )
 from gpu_fault.orchestration.provider_correlation import bind_marker_incident
+from gpu_fault.pci_identity import pci_bdf_matches
 from gpu_fault.policy import (
     ActionDisposition,
     FaultPolicyDecision,
