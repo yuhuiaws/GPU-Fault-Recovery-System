@@ -49,6 +49,10 @@ from gpu_fault_release.regional_release_diff import (
 from gpu_fault_release.regional_release_preflight import monitoring_repair_preflight
 from gpu_fault_release.regional_release_probes import probe_source
 from gpu_fault_release.regional_release_profile_model import runtime_profile_version_for
+from gpu_fault_release.regional_release_replica_failure import (
+    deployment_readiness,
+    require_ready,
+)
 from gpu_fault_release.regional_release_s3_destinations import (
     check_control_record_archive_bucket,
     check_diagnostic_evidence_destination,
@@ -988,14 +992,6 @@ def build_preflight_report(
     return _report("preflight", release, checks)
 
 
-def _deployment_readiness(item: dict[str, Any], name: str) -> dict[str, Any]:
-    replicas = int(item.get("spec", {}).get("replicas", 0) or 0)
-    ready = int(item.get("status", {}).get("readyReplicas", 0) or 0)
-    if ready != replicas:
-        raise ReleaseError(f"{name} has {ready}/{replicas} Ready")
-    return {"replicas": replicas, "ready": ready}
-
-
 def _check_cpu_workloads(release: Any) -> CheckValue:
     names = (
         "gpu-fault-api-ha",
@@ -1004,15 +1000,10 @@ def _check_cpu_workloads(release: Any) -> CheckValue:
         "gpu-fault-adot",
     )
     details = {}
+    namespace = release.config.namespace
     for name in names:
         item = release._get_json(
-            release._cpu(
-                "-n",
-                release.config.namespace,
-                "get",
-                "deployment",
-                name,
-            )
+            release._cpu("-n", namespace, "get", "deployment", name)
         )
         direct = {
             env.get("name")
@@ -1033,7 +1024,9 @@ def _check_cpu_workloads(release: Any) -> CheckValue:
                 f"{name} overrides notification ConfigMap values directly: "
                 + ", ".join(sorted(legacy))
             )
-        details[name] = _deployment_readiness(item, name)
+        details[name] = deployment_readiness(item, namespace=namespace, name=name)
+    # Every short Deployment is named, each with its ReplicaFailure.
+    require_ready(details)
     from gpu_fault.admin.capacity_defaults import INGRESS_REPLICAS
 
     if details["gpu-fault-api-ha"]["replicas"] != INGRESS_REPLICAS:
@@ -1329,7 +1322,10 @@ def _check_gpu_cluster(
                 deployment,
             )
         )
-        details["deployments"][deployment] = _deployment_readiness(item, deployment)
+        details["deployments"][deployment] = deployment_readiness(
+            item, namespace=release.config.namespace, name=deployment
+        )
+    require_ready(details["deployments"], details=details)
     selector, nodes = selected_nodes(release, target)
     details["node_scope"] = node_scope_report(release, target, selector, nodes)
     expected_nodes = _ready_nodes(nodes)

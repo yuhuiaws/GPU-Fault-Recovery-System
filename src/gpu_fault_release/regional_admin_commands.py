@@ -73,6 +73,7 @@ from gpu_fault_release.regional_release_progress import (
 from gpu_fault_release.regional_release_progress import (
     build_rollback_compensation_plan,
 )
+from gpu_fault_release.regional_release_replica_failure import replica_failure_line
 from gpu_fault_release.regional_release_reporting import build_release_status
 from gpu_fault_release.regional_release_transaction import commit_live_release
 from gpu_fault_release.regional_release_workflow_safety import (
@@ -1181,10 +1182,30 @@ def status_header_lines(report: dict[str, Any], *, json_destination: str) -> lis
         f"next deploy: {next_kind}",
         *partial,
         "failing checks: " + (", ".join(failing) if failing else "none"),
+        *replica_failure_lines(health),
         *_control_api_findings(health),
         *automatic_update_lines(health),
         f"full JSON report: {json_destination}",
     ]
+
+
+def replica_failure_lines(health: object) -> list[str]:
+    """One line per control-plane Deployment whose ``ReplicaFailure`` is True,
+    from the ``cpu_workloads`` check (quick and full ``status``), whether the
+    check passed or not: the reason, the redacted message and the retry hint
+    (``regional_release_replica_failure``)."""
+
+    checks = health.get("checks") if isinstance(health, dict) else None
+    for check in checks if isinstance(checks, list) else []:
+        details = check.get("details") if isinstance(check, dict) else None
+        if check.get("name") == "cpu_workloads" and isinstance(details, dict):
+            return [
+                replica_failure_line(str(name), record)
+                for name, record in sorted(details.items())
+                if isinstance(record, dict)
+                and isinstance(record.get("replica_failure"), dict)
+            ]
+    return []
 
 
 def _control_api_findings(health: object) -> list[str]:
