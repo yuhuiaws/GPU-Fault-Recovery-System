@@ -308,6 +308,53 @@ closed（NVIDIA 对 6 和 7 只记载一行枚举含义，且产品的 GPU 复�
 的公式（只有没有链路读数时为 8/min）；correctable 错误上限取该公式与 DCGM PCIe 诊断上限中较低者。Blackwell（B200/B300）的行为依据
 NVIDIA 文档做了单元测试，未经现网验证（没有 B 系列硬件）。
 
+### 依据（Evidence）：HGX B200/B300 的 DCGM 规则（batch 235）
+
+下列页面均为 batch 235 重新抓取核对：NVML API Reference 与 NVIDIA GPU Memory Error Management 为 docs version 615，DCGM
+页面为 "Version: 4.6 (Latest)"，DCGM 源码为 v4.7.0 标签，Fabric Manager User Guide 为 "Last updated on Oct 07, 2026"，
+nvidia-smi 文档为 v610 时期页面，fabric-health 的位值取自 NVIDIA 的 `nvidia-ml-py` 13.615.71。完整引文与决定见详细设计
+§2.4.1「HGX B200/B300 DCGM 字段」；每条引文由 `tests/test_blackwell_dcgm_evidence.py` 钉住。
+Blackwell（B200/B300）的行为依据 NVIDIA 文档做了单元测试，未经现网验证（没有 B 系列硬件）。
+
+- NVLink 完整性（1211-1213 作为数据链路 counter 497-499 的备选项）：NVML API Reference，"Field Value Enums"，
+  `NVML_FI_DEV_NVLINK_ERROR_DL_CRC`
+  `https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlFieldValueEnums.html#c.NVML_FI_DEV_NVLINK_ERROR_DL_CRC`
+  "This is unsupported for Blackwell+ Please use NVML_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_*"。
+- NVLink5 counter（1204-1209、1211-1214、1219、1220）：DCGM Field Identifiers
+  `https://docs.nvidia.com/datacenter/dcgm/latest/dcgm-api/dcgm-api-field-ids.html` "Returns aggregate value across all
+  links. Not supported on NVLink4 and earlier."；DCGM Feature Overview，"Background Health Checks" › "Failure Conditions"
+  `https://docs.nvidia.com/datacenter/dcgm/latest/user-guide/feature-overview.html#background-health-checks` "An NVLink
+  reported 1 or more errors. This includes datalink CRC, recovery, and replay errors (pre-Blackwell GPUs) and link recovery
+  events (Blackwell+ GPUs)."；DCGM v4.7.0 `modules/health/DcgmHealthWatch.cpp`
+  `https://github.com/NVIDIA/DCGM/blob/v4.7.0/modules/health/DcgmHealthWatch.cpp`：1212 大于 0 记 FAIL，1211 大于 0 记
+  WARN，NVLink5 错误 counter 一分钟内有任何变化记 FAIL，下一步 "Run a field diagnostic on the GPU."；DCGM Release Notes
+  4.7.0 `https://docs.nvidia.com/datacenter/dcgm/latest/release-notes/changelog.html` "Removed NVLink bit-error-rate
+  thresholds that caused false health and diagnostic failures on healthy GB200 systems."（BER 不分级）。
+- Fabric health（174/175）：NVML API Reference，"Fabric Definitions"
+  `https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlFabricDefs.html` "Fabric Health Mask: Route is
+  unhealthy."、"Fabric Health Mask: Bandwidth degraded."、"Fabric Health Summary: Unhealthy."、"Fabric Health Summary:
+  Limited Capacity."；DCGM Field Identifiers
+  `https://docs.nvidia.com/datacenter/dcgm/latest/dcgm-api/dcgm-api-field-ids.html#c.DCGM_FI_DEV_FABRIC_HEALTH_MASK` "Use
+  DCGM_GPU_FABRIC_HEALTH_TEST macro to check the different health statuses."；DCGM v4.7.0 `MonitorFabricFields` 下一步
+  "Check DCGM and system logs for errors. Reset GPU. Restart DCGM. Rerun diagnostics."；nvidia-smi 文档
+  `https://docs.nvidia.com/deploy/nvidia-smi/index.html`，"Fabric" › "Health"："Summary - Summary of Fabric Health
+  <Healthy, Unhealthy, Limited Capacity>"。
+- 内存修复：GPU Memory Error Management，"RAS Repair" › "GPU Memory Repair"
+  `https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/hbm-channel-repair.html#gpu-memory-repair` "The process of channel
+  repair requires a reboot to take effect."；nvidia-smi 文档，"ECC Errors"："If one of the repair flags is pending, check the
+  GPU Recovery action and take the appropriate steps."；DCGM Field Identifiers
+  `https://docs.nvidia.com/datacenter/dcgm/latest/dcgm-api/dcgm-api-field-ids.html#c.DCGM_FI_DEV_MEMORY_UNREPAIRABLE`
+  "Unrepairable memory flag indicating if memory has unrepairable errors 1=yes, 0=no"；NVML API Reference 变更记录
+  `https://docs.nvidia.com/deploy/nvml-api/latest/change-log.html`，"Changes between v580 and v590"："Added
+  nvmlDeviceGetUnrepairableMemoryFlag_v1() to report whether or not there is unrepairable memory."
+
+结论：在 HGX B200/B300 上，NVLink5 link-recovery counter 顶替 NVML 不再报告的 NVLink 字段；链路恢复失败（1212）即 drain，
+其他 NVLink5 counter 按 NVLink 家族规则判 WARNING，跨产品窗口的增量不判，XID 144-150/155 负责该 GPU 期间的增量只作证据；
+从 DCGM 字段 230 读到的 XID 144-150 并入内核来源的 incident。已确认的不健康 fabric 执行 NVIDIA 的完整 GPU + NVSwitch reset，
+降级的 fabric 运行诊断并通告运维，NOT_SUPPORTED 不判。pending 的内存修复交运维 reboot，除非 GPU 恢复动作另有判定；
+unrepairable memory 走 row-remap failure 的 RMA drain。逐链路字段、NVSDM 交换芯片字段与 ConnectX bridge 字段延后
+（[验证局限](../validation-limitations.md)）。
+
 ## SXID
 
 SXID 恢复依据 Fabric Manager User Guide：
