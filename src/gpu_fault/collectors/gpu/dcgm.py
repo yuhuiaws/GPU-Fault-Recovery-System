@@ -16,6 +16,10 @@ from gpu_fault.collectors.gpu.inventory_cadence import (
     GpuInventoryCadence,
     TemperatureLimitProbe,
 )
+from gpu_fault.collectors.gpu.shutdown_limit import (
+    DCGM_SHUTDOWN_CANDIDATE,
+    ShutdownLimitResolver,
+)
 from gpu_fault.collectors.identity_refresh import GpuIdentityRefresher
 from gpu_fault.collectors.models import CollectorContext
 from gpu_fault.collectors.process import BoundedProcessRunner
@@ -105,6 +109,13 @@ DCGM_METRICS: dict[str, tuple[str, str | None]] = {
     # Exported, never required.
     "DCGM_FI_DEV_GPU_TEMP_LIMIT": (TLIMIT_READING, "celsius"),
     "DCGM_FI_DEV_GPU_TEMP_MARGIN_CELSIUS": (TLIMIT_READING, "celsius"),
+    # Field 159, the absolute shutdown temperature ("Shutdown temperature for
+    # the device."; DCGM 4.6 name DCGM_FI_DEV_GPU_TEMP_SHUTDOWN_CELSIUS): never
+    # graded as read, published as gpu_shutdown_temperature_c only where the
+    # XML has no absolute one and the T.Limit arithmetic agrees
+    # (collectors/gpu/shutdown_limit.py). Exported, never required.
+    "DCGM_FI_DEV_SHUTDOWN_TEMP": (DCGM_SHUTDOWN_CANDIDATE, "celsius"),
+    "DCGM_FI_DEV_GPU_TEMP_SHUTDOWN_CELSIUS": (DCGM_SHUTDOWN_CANDIDATE, "celsius"),
     "DCGM_FI_DEV_MEMORY_TEMP": (
         "memory_temperature_c",
         "celsius",
@@ -535,6 +546,7 @@ class DcgmMetricsCollector:
         self._temperature_limits = TemperatureLimitProbe(
             retry_interval_seconds=self.inventory_interval_seconds, logger=LOGGER
         )
+        self._shutdown_limits = ShutdownLimitResolver(LOGGER)
         self._previous_devices: set[str] | None = None
         self._consecutive_failures = 0
         self._collection_errors = CollectionErrorEdges(
@@ -557,6 +569,7 @@ class DcgmMetricsCollector:
         timestamp = observed_at or self.now()
         samples.extend(held_samples(samples, self._value_first_seen, timestamp))
         samples.extend(extra_samples or [])
+        samples = self._shutdown_limits.resolve(samples)
         samples = [
             sample.model_copy(
                 update={"labels": {**sample.labels, "source_boot_id": self._boot_id}}

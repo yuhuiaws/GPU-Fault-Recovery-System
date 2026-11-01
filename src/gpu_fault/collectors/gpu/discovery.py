@@ -121,6 +121,15 @@ NVIDIA_TEMPERATURE_TLIMIT_TAGS = {
     "gpu_max_operating_tlimit_c": ("gpu_temp_max_gpu_tlimit_threshold",),
     "memory_max_operating_tlimit_c": ("gpu_temp_max_mem_tlimit_threshold",),
 }
+#: The current ``gpu_temp`` and ``gpu_temp_tlimit`` of the same ``<temperature>``
+#: element -- one nvidia-smi snapshot -- carried as labels on the shutdown
+#: T.Limit sample only. Their sum is the GPU's absolute max operating
+#: temperature (nvidia-smi: "GPU Current T.Limit Temp: Current margin in degrees
+#: Celsius from the maximum GPU operating temperature."), the arithmetic the
+#: DCGM shutdown limit is checked against before it is published
+#: (collectors/gpu/shutdown_limit.py). Nothing grades these labels.
+SNAPSHOT_GPU_TEMP_LABEL = "snapshot_gpu_temp_c"
+SNAPSHOT_TLIMIT_LABEL = "snapshot_gpu_tlimit_c"
 
 
 def _xml_celsius(temperature: ET.Element, tags: tuple[str, ...]) -> float | None:
@@ -138,6 +147,19 @@ def _xml_celsius(temperature: ET.Element, tags: tuple[str, ...]) -> float | None
         return None
     value = float(match.group())
     return value if math.isfinite(value) else None
+
+
+def _snapshot_labels(temperature: ET.Element) -> dict[str, str]:
+    """The snapshot's current reading and T.Limit, or nothing when either is N/A."""
+
+    reading = _xml_celsius(temperature, ("gpu_temp",))
+    margin = plausible_tlimit(_xml_celsius(temperature, ("gpu_temp_tlimit",)))
+    if reading is None or margin is None:
+        return {}
+    return {
+        SNAPSHOT_GPU_TEMP_LABEL: f"{reading:g}",
+        SNAPSHOT_TLIMIT_LABEL: f"{margin:g}",
+    }
 
 
 GPU_PRODUCT_PATTERN = re.compile(
@@ -231,7 +253,11 @@ def query_nvidia_temperature_limits(
                     gpu_index=gpu_index,
                     gpu_uuid=gpu_uuid,
                     pci_bdf=pci_bdf,
-                    labels=labels,
+                    labels=(
+                        {**labels, **_snapshot_labels(temperature)}
+                        if canonical_name == "gpu_shutdown_tlimit_c"
+                        else labels
+                    ),
                 )
             )
     return samples

@@ -7566,7 +7566,9 @@ device limit minus the configured margin. On reaching the device operating limit
 scheduling, isolates and validates the GPU. While a T.Limit judgement exists `gpu_temperature_c` is no longer graded on
 the 85/90 fallback; the memory reading `memory_temperature_c` is absolute only and keeps the 90/95 fallback when there
 is no absolute limit. Only when the command fails, an XML field is missing, the target GPU does not support the field,
-or there are T.Limit thresholds while the exporter does not export field 153 does it use the fixed fallback values.
+or there are T.Limit thresholds while the exporter does not export field 153 does it use the fixed fallback values. A
+T.Limit GPU's absolute shutdown temperature comes from DCGM field 159, not from the XML (see "Shutdown temperature
+field" below), and serves the one-sample shutdown protection only.
 Device limits are used only to derive site actions, and the incident's `policy_source` is recorded as
 `SITE_NVIDIA_DEVICE_LIMIT_DERIVED` (`threshold_source` `NVIDIA_DEVICE_TLIMIT` or `NVIDIA_DEVICE_LIMIT`), not
 masquerading as an NVIDIA-mandated automatic recovery action.
@@ -7687,6 +7689,20 @@ as a deprecated alias and renders the field under the CSV's name, which is the n
 grading of its absolute reading. In host mode the host engine must be DCGM 4.1.0 or later (live: 4.7.0 for the HyperPod
 AMI's engine and the plain EKS node group's, as the Agent heartbeats report; 4.6.1 once the node group is prepared again).
 
+Shutdown temperature field: the CSV also exports `DCGM_FI_DEV_SHUTDOWN_TEMP` (159, gauge), the GPU's absolute shutdown
+temperature (field description: "Shutdown temperature for the device."). A GPU that prints T.Limit thresholds (the
+H200 on driver 580) has no absolute shutdown temperature in its XML any more, so this is the one device source of the
+one-sample shutdown protection: the collector publishes it as `gpu_shutdown_temperature_c` (labels
+`threshold_source=NVIDIA_DEVICE_LIMIT`, `limit_source`, `dcgm_field_id=159`) only where the XML has no absolute shutdown
+and the value is within 1 °C of the T.Limit arithmetic of one nvidia-smi snapshot (reading + margin − shutdown T.Limit
+threshold), and only that protection reads it; otherwise the raw `dcgm_shutdown_temperature_c` sample stays in the batch
+with `shutdown_limit_state=withheld:...` and the collector warns once. DCGM 4.6.0 renamed it
+`DCGM_FI_DEV_GPU_TEMP_SHUTDOWN_CELSIUS`; the pinned exporter's go-dcgm (`v1.4611.2`) resolves the old name to 159 as a
+deprecated alias, so the CSV keeps the old name here too. Exported, never required: an exporter without it only lacks
+that protection, and the GPU stays graded on its T.Limit thresholds. The source decision and NVIDIA's text are in the
+detailed design §2.4.1. Changing the CSV changes the counters digest of the exporter pod template, so a release rolls the
+exporter node by node.
+
 The exporter reads the CSV only at process start and the DaemonSet mounts the ConfigMap with subPath, which a running Pod never sees
 refreshed, so a counters-only release used to update the ConfigMap and restart no Pod. The pod template of
 `deploy/dataplane/hyperpod-dcgm-exporter.yaml` now carries the annotation `gpu-fault.io/dcgm-counters-sha256` (the sha256 of the CSV
@@ -7793,7 +7809,7 @@ still caught by the DCGM collection checks (missing fields, failed scrapes).
   (`DCGM_REMOTE_HOSTENGINE_INFO`); the `host:port` form is unchanged, the URI forms need DCGM ≥ 4.5.
 - CSV format unchanged: Go `encoding/csv`, `#` comments, exactly 3 fields, types counter/gauge/untyped/label; an unknown field name
   still fails the start-up; the retired PCIe throughput fields 200/201 are now refused (not in the solution's CSV).
-- All 36 fields of the solution's CSV resolve in go-dcgm `v1.4611.2`, 23 of them as deprecated aliases kept in its legacy map (e.g.
+- All 37 fields of the solution's CSV resolve in go-dcgm `v1.4611.2`, 24 of them as deprecated aliases kept in its legacy map (e.g.
   `DCGM_FI_DEV_GPU_TEMP`, whose current name is `DCGM_FI_DEV_GPU_TEMP_CELSIUS`); the exporter renders each under the CSV's name, so
   metric names and the collector mapping are unchanged.
 - The label `Hostname` is renamed `hostname` (4.8.3, #655); with a loopback remote host engine the label is the local hostname

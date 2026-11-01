@@ -689,6 +689,7 @@ converts one into the other (`gpu_temperature_policy.py`; collector side `collec
 | Absolute (°C, positive) | `gpu_temp_slow_threshold`, `gpu_temp_max_threshold`, `gpu_temp_max_gpu_threshold`, `gpu_temp_max_mem_threshold` | `gpu_slowdown_temperature_c`, `gpu_shutdown_temperature_c`, `gpu_max_operating_temperature_c`, `memory_max_operating_temperature_c` | `gpu_temperature_c`, `memory_temperature_c` (DCGM 150/140), reading ≥ threshold | slowdown, else max-operating, else shutdown − 3 °C; HBM: memory max-operating | min(critical − 5 °C, max-operating); HBM: critical − 5 °C | `NVIDIA_DEVICE_LIMIT` |
 | T.Limit (signed margin, counts down) | `gpu_temp_slow_tlimit_threshold`, `gpu_temp_max_tlimit_threshold`, `gpu_temp_max_gpu_tlimit_threshold`, `gpu_temp_max_mem_tlimit_threshold` | `gpu_slowdown_tlimit_c`, `gpu_shutdown_tlimit_c`, `gpu_max_operating_tlimit_c`, `memory_max_operating_tlimit_c` | `gpu_tlimit_c`: DCGM field 153 `DCGM_FI_DEV_GPU_TEMP_LIMIT` (exported by the bundled counters), `temperature.gpu.tlimit` in nvidia-smi metrics mode; reading ≤ threshold | slowdown T.Limit, else max-operating T.Limit, else shutdown T.Limit + 3 °C | max(critical + 5 °C, GPU max-operating T.Limit, memory max-operating T.Limit) | `NVIDIA_DEVICE_TLIMIT` |
 | Site fallback | — | — | `gpu_temperature_c`, `memory_temperature_c`, reading ≥ threshold | 90 °C / 95 °C | 85 °C / 90 °C | `CONFIGURED_FALLBACK` |
+| Absolute shutdown of a T.Limit GPU | none (the XML prints T.Limit thresholds only); DCGM field 159 `DCGM_FI_DEV_SHUTDOWN_TEMP` (exported by the bundled counters) | `gpu_shutdown_temperature_c` (published after the collector's check; raw value `dcgm_shutdown_temperature_c`) | `gpu_temperature_c` (DCGM 150), reading ≥ threshold | the one-sample shutdown protection only; no shutdown − 3 °C boundary | — | `NVIDIA_DEVICE_LIMIT` |
 
 NVIDIA's words and where they are (verbatim):
 
@@ -741,6 +742,24 @@ NVIDIA's words and where they are (verbatim):
   <https://docs.nvidia.com/datacenter/dcgm/latest/dcgm-api/dcgm-api-field-ids.html>: "Thermal margin temperature
   (distance to nearest slowdown threshold) for this GPU."; the DCGM 4.4.1 source `dcgmlib/src/DcgmCacheManager.cpp`
   reads field 153 with `nvmlDeviceGetMarginTemperature`.
+- Absolute shutdown temperature (the one absolute limit source of a T.Limit GPU, see below): DCGM field identifiers
+  <https://docs.nvidia.com/datacenter/dcgm/latest/dcgm-api/dcgm-api-field-ids.html#c.DCGM_FI_DEV_GPU_TEMP_SHUTDOWN_CELSIUS>
+  ("Field Identifiers", docs "Version: 4.6 (Latest)"): `DCGM_FI_DEV_GPU_TEMP_SHUTDOWN_CELSIUS 159` "Shutdown temperature
+  for the device.", `DCGM_FI_DEV_GPU_TEMP_SLOWDOWN_CELSIUS 158` "Slowdown temperature for the device."; DCGM release notes
+  4.6.0 "Improvements": "Existing names remain available as deprecated aliases, so current integrations continue to work
+  while new integrations can move to the clearer names.", among them "DCGM_FI_DEV_SHUTDOWN_TEMP to
+  DCGM_FI_DEV_GPU_TEMP_SHUTDOWN_CELSIUS.". The DCGM 4.7.0 source `dcgmlib/src/DcgmCacheManager.cpp`
+  (<https://github.com/NVIDIA/DCGM/blob/v4.7.0/dcgmlib/src/DcgmCacheManager.cpp>) reads field 159 with
+  `NvmlDeviceGetTemperatureThreshold(..., NVML_TEMPERATURE_THRESHOLD_SHUTDOWN, ...)`; the pinned exporter's go-dcgm
+  `v1.4611.2` (`legacyDCGMFields` in `pkg/dcgm/const_fields.go`) resolves the CSV name `DCGM_FI_DEV_SHUTDOWN_TEMP` to 159.
+  NVML API Reference (v615 docs) `nvmlDeviceGetTemperatureThreshold`
+  (<https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlDeviceQueries.html#_CPPv433nvmlDeviceGetTemperatureThreshold12nvmlDevice_t27nvmlTemperatureThresholds_tPj>,
+  "Device Queries"): "Retrieves the temperature threshold for the GPU with the specified threshold type in degrees C.",
+  and after the note above: "Support for reading these temperature thresholds for Ada and later architectures would be
+  removed from this API in future releases. Please use nvmlDeviceGetFieldValues with NVML_FI_DEV_TEMPERATURE_* fields to
+  retrieve temperature thresholds on these architectures."; `nvmlTemperatureThresholds_t`
+  (<https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlDeviceEnums.html#_CPPv4N27nvmlTemperatureThresholds_t35NVML_TEMPERATURE_THRESHOLD_SHUTDOWNE>,
+  "Device Enums"): `NVML_TEMPERATURE_THRESHOLD_SHUTDOWN` "Temperature at which the GPU will shut down for HW protection.".
 - Driver release notes: <https://docs.nvidia.com/datacenter/tesla/tesla-release-notes-535-129-03/index.html>
   "1.2. Fixed Issues": "4165142 – Fixed an issue arising from a race condition between internal GPU microcontrollers in
   fetching GPU memory temperature which causes the current HBM temperature to return an invalid value which is above
@@ -755,7 +774,9 @@ NVIDIA's words and where they are (verbatim):
 thresholds are "reported relative to T.Limit ... instead of absolute measurements", and the shutdown/slowdown entries
 say the current T.Limit can be more negative than the threshold without the trigger firing (the triggers look at "the
 maximum GPU temperature"). NVIDIA gives no conversion formula, so the product never derives an absolute threshold from
-something like `gpu_temp + T.Limit`; it grades on the T.Limit scale, where a breach is "at or below". The live H200
+something like `gpu_temp + T.Limit`; it grades on the T.Limit scale, where a breach is "at or below" (the absolute
+shutdown temperature of a T.Limit GPU below is a value the device reports; that arithmetic only checks it, it never
+produces it). The live H200
 (driver 580.178.04: shutdown −8, slowdown −2, GPU and memory max-operating 0) warns at `gpu_tlimit_c` ≤ 3
 (max(−2 + 5, 0, 0)) and is critical at ≤ −2.
 
@@ -777,6 +798,52 @@ an absolute limit is NVML `nvmlDeviceGetTemperatureThreshold` (the old `nvml-api
 is a 404); the VALIDATE_GPU failure text writes a T.Limit breach as `value<=threshold`. A T.Limit finding is
 `GPU_THERMAL` like a temperature finding, is the temperature component of `THERMAL_STRESS`, and rules out the power
 correlation.
+
+**The absolute shutdown temperature of a T.Limit GPU (`collectors/gpu/shutdown_limit.py`).** The XML prints every
+threshold either absolute or on the T.Limit scale (the DTD), so a GPU printing T.Limit thresholds never had a
+`gpu_shutdown_temperature_c`, and the one-sample absolute shutdown protection (the shutdown check of
+`temperature_decision` and the emergency of `confirm_environment_decision`) could fire on no H200. Live (HyperPod,
+4 × ml.p5en.48xlarge, 32 × H200, driver 580.178.04, NVML 13.580.178.04, DCGM 4.7.0 host engine, every GPU alike): the
+XML has only `gpu_temp_max_tlimit_threshold` −8 C; NVML `nvmlDeviceGetTemperatureThreshold` SHUTDOWN/SLOWDOWN/GPU_MAX/
+MEM_MAX answer 95/89/87/95; NVML fields 193/194/196/195 answer −8/−2/0/0; DCGM fields 159/158 answer 95/89; and
+`gpu_temp + gpu_temp_tlimit` is 87 (= the absolute GPU max-operating) on all 32 GPUs, so 87 − (−8) = 95: the three
+sources agree.
+
+- **Source: DCGM field 159** (`DCGM_FI_DEV_SHUTDOWN_TEMP`, 4.6 name `DCGM_FI_DEV_GPU_TEMP_SHUTDOWN_CELSIUS`; both names
+  are read and an identical alias pair is deduplicated), exported by the bundled `deploy/dataplane/dcgm-counters.csv`
+  and read by the collector every tick. Not NVML: no node collector binds NVML (they read the exporter and nvidia-smi),
+  and a ctypes NVML binding would be a new native dependency and one more call that can hang in the driver. DCGM reads
+  field 159 with that legacy NVML call itself, so NVML's note binds it too ("This API is no longer the preferred
+  interface ... on Ada and later architectures", support may be removed for Ada and later). It is acceptable anyway:
+  the preferred `NVML_FI_DEV_TEMPERATURE_SHUTDOWN_TLIMIT` reports the T.Limit offset only (the product already grades
+  it, and NVIDIA documents no conversion); the driver the fleet runs still answers with the absolute value; the value
+  feeds one rule, the one-sample shutdown protection, never the T.Limit grading; it is published only after the
+  device's own T.Limit arithmetic confirms it; and a driver that stops answering makes DCGM serve a blank sentinel the
+  parser drops: nothing is published, the GPU is graded on the T.Limit scale alone, and no wrong limit appears.
+- **Validation** (per tick and GPU): an absolute shutdown the XML reports always wins and field 159 is not published
+  beside it (`xml-authoritative`); finite and 0 < v ≤ 150 °C, else `withheld:implausible`; within 1 °C of the T.Limit
+  arithmetic: `gpu_temp` + `gpu_temp_tlimit` of one nvidia-smi snapshot is the absolute max-operating temperature
+  ("Current margin in degrees Celsius from the maximum GPU operating temperature."), and max-operating − the shutdown
+  T.Limit threshold is the shutdown temperature ("The T.Limit temperature below which a GPU may shutdown."). The
+  snapshot's reading and margin ride as `snapshot_gpu_temp_c`/`snapshot_gpu_tlimit_c` labels on the
+  `gpu_shutdown_tlimit_c` sample (87 on all 32 live GPUs); the tick's DCGM fields 150/153 are not used, because they
+  are sampled one by one (their `dcgmi dmon` sum was 88 on 2 of the 32) and a fast ramp (or a replayed temperature) would fail the check exactly when protection matters, while the limit does
+  not change between ticks. A missing input (no shutdown T.Limit threshold, a snapshot reading N/A) or a mismatch
+  withholds (`withheld:tlimit-input-missing` / `withheld:tlimit-mismatch`), and two names of the field disagreeing on
+  one GPU are `withheld:ambiguous`: a wrong limit would `DRAIN` a healthy node on one sample, a withheld one keeps
+  today's grading. Withheld is visible: the raw `dcgm_shutdown_temperature_c` sample stays in the batch with a
+  `shutdown_limit_state` label naming why, and the collector warns once per GPU and state.
+- **Published and used**: `gpu_shutdown_temperature_c` keeps the DCGM sample's identity and labels plus
+  `threshold_source=NVIDIA_DEVICE_LIMIT`, `limit_source` (the field name the exporter served), `dcgm_field_id=159` and
+  `tlimit_implied_shutdown_c`. Only the shutdown protection reads it (`shutdown_from_device_field`: an absolute shutdown
+  beside a T.Limit shutdown is field 159): below it the T.Limit rules grade as before; a tick without the T.Limit reading
+  grades the absolute reading on the 85/90 fallback as before, never on a shutdown − 3 °C boundary; no absolute
+  slowdown or max-operating is published (it would add a second decision). One sample at or above it is CRITICAL
+  `DRAIN` (`confirmation_count` 1) with the reason "device limit DCGM_FI_DEV_SHUTDOWN_TEMP, DCGM field 159, checked
+  against the GPU's T.Limit thresholds" and the DCGM field link above as `policy_reference`; the XML-sourced protection
+  is unchanged (NVML link). The live H200 is protected by one sample at ≥ 95 °C; at 94 °C its T.Limit rules grade it
+  (≤ −2 after three confirmations). An exporter without field 159, or nvidia-smi metrics mode, has no such protection:
+  the field is exported, never required.
 
 **Probe and logging (`TemperatureLimitProbe` in `collectors/gpu/inventory_cadence.py`).** Thresholds on either scale
 are a success, cached for the process's lifetime; after 3 consecutive failures the retry drops to the inventory

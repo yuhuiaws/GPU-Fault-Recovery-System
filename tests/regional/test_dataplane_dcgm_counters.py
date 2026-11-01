@@ -87,6 +87,9 @@ PINNED_FIELD_IDS = {
     "DCGM_FI_DEV_GPU_TEMP": 150,
     "DCGM_FI_DEV_MEMORY_TEMP": 140,
     "DCGM_FI_DEV_GPU_TEMP_LIMIT": 153,
+    # legacyDCGMFields "DCGM_FI_DEV_SHUTDOWN_TEMP": 159 (const_fields.go line
+    # 3046 of v1.4611.2); dcgmFields knows it as ..._GPU_TEMP_SHUTDOWN_CELSIUS.
+    "DCGM_FI_DEV_SHUTDOWN_TEMP": 159,
     "DCGM_FI_DEV_POWER_USAGE": 155,
     "DCGM_FI_DEV_POWER_MGMT_LIMIT": 160,
     "DCGM_FI_DEV_GPU_UTIL": 203,
@@ -144,6 +147,7 @@ LEGACY_NAMES = frozenset(
         "DCGM_FI_DEV_RETIRED_PENDING",
         "DCGM_FI_DEV_RETIRED_SBE",
         "DCGM_FI_DEV_ROW_REMAP_FAILURE",
+        "DCGM_FI_DEV_SHUTDOWN_TEMP",
         "DCGM_FI_DEV_UNCORRECTABLE_REMAPPED_ROWS",
         "DCGM_FI_DEV_XID_ERRORS",
     }
@@ -536,6 +540,40 @@ def test_the_tlimit_margin_is_exported_as_a_gauge_and_never_required() -> None:
     assert "gpu_tlimit_c" not in DCGM_FIELDS.DCGM_CORE_CANONICAL_FIELDS, (
         "a scrape without the margin must not report a missing required field"
     )
+
+
+def test_the_shutdown_temperature_is_exported_as_a_gauge_and_never_required() -> None:
+    """Field 159 is a T.Limit GPU's absolute shutdown limit (batch 232).
+
+    Driver 580 prints only T.Limit thresholds in the XML, so this is the one
+    device source of the absolute shutdown temperature the one-sample
+    protection compares with (collectors/gpu/shutdown_limit.py). The CSV keeps
+    the pre-4.6 name the pinned go-dcgm resolves through its legacy map, as for
+    field 153. An exporter without it only loses that protection: the GPU stays
+    graded on its T.Limit thresholds, and nothing reports a missing field.
+    """
+
+    kinds = {
+        fields[0]: fields[1]
+        for _number, fields in _exporter_records(COUNTERS.read_text(encoding="utf-8"))
+    }
+    assert kinds.get("DCGM_FI_DEV_SHUTDOWN_TEMP") == "gauge", (
+        "the shutdown temperature is a device limit, not a count"
+    )
+    assert (
+        DCGM_METRICS["DCGM_FI_DEV_SHUTDOWN_TEMP"]
+        == DCGM_METRICS["DCGM_FI_DEV_GPU_TEMP_SHUTDOWN_CELSIUS"]
+    ), "both names of field 159 are read, like 112 and 153"
+    required = {
+        name for group in DCGM_FIELDS.DCGM_EXPORTER_FIELD_GROUPS for name in group
+    }
+    assert "DCGM_FI_DEV_SHUTDOWN_TEMP" not in required, (
+        "an exporter without field 159 must not fail the metrics probe"
+    )
+    assert (
+        DCGM_METRICS["DCGM_FI_DEV_SHUTDOWN_TEMP"][0]
+        not in DCGM_FIELDS.DCGM_CORE_CANONICAL_FIELDS
+    ), "a scrape without the shutdown temperature reports no missing field"
 
 
 def test_the_field_table_was_read_for_the_pinned_exporter() -> None:

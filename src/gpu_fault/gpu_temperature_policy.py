@@ -67,6 +67,20 @@ device limits; otherwise the configured fallback. ``memory_temperature_c``
 keeps the absolute memory limit or the configured fallback: NVIDIA reports the
 memory temperature absolute only, and the T.Limit's memory share rests on a
 bug-fix note, not on a definition, so the memory safety net stays.
+
+The one absolute limit a T.Limit GPU keeps is its shutdown temperature. Its XML
+prints no absolute threshold at all, so the one-sample shutdown protection
+below had nothing to compare with on every H200 of driver 580. The DCGM
+collector reads the value the device reports through DCGM field 159
+(``DCGM_FI_DEV_SHUTDOWN_TEMP``: "Shutdown temperature for the device.") and
+publishes it as ``gpu_shutdown_temperature_c`` only where the XML reports no
+absolute shutdown and the value agrees within 1 C with the GPU's own T.Limit
+arithmetic; ``collectors/gpu/shutdown_limit.py`` holds the source decision and
+the NVIDIA text. Nothing here converts a T.Limit value: the published number is
+the device's. Such a limit sits beside the T.Limit shutdown threshold (the XML
+never prints both) and serves the shutdown emergency only: below it the
+T.Limit rules grade the GPU exactly as before, and it never becomes a
+"shutdown minus margin" critical boundary of the absolute reading.
 """
 
 from __future__ import annotations
@@ -88,6 +102,21 @@ NVIDIA_NVML_TEMPERATURE_REFERENCE = (
 )
 #: nvidia-smi(1), GPU ATTRIBUTES > Temperature: the T.Limit scale.
 NVIDIA_SMI_TLIMIT_REFERENCE = "https://docs.nvidia.com/deploy/nvidia-smi/index.html"
+#: DCGM field identifiers, field 159 (DCGM 4.6 name
+#: ``DCGM_FI_DEV_GPU_TEMP_SHUTDOWN_CELSIUS``): the absolute shutdown limit of a
+#: GPU whose XML prints only T.Limit thresholds.
+NVIDIA_DCGM_SHUTDOWN_FIELD_REFERENCE = (
+    "https://docs.nvidia.com/datacenter/dcgm/latest/dcgm-api/dcgm-api-field-ids.html"
+    "#c.DCGM_FI_DEV_GPU_TEMP_SHUTDOWN_CELSIUS"
+)
+#: The device source of that limit, named in its sample labels and findings.
+DEVICE_SHUTDOWN_SOURCE = "DCGM_FI_DEV_SHUTDOWN_TEMP"
+DEVICE_SHUTDOWN_FIELD_ID = 159
+DEVICE_SHUTDOWN_REASON = (
+    "GPU reached its absolute shutdown temperature (device limit "
+    f"{DEVICE_SHUTDOWN_SOURCE}, DCGM field {DEVICE_SHUTDOWN_FIELD_ID}, checked "
+    "against the GPU's T.Limit thresholds)"
+)
 
 ABSOLUTE_TEMPERATURE_LIMITS = frozenset(
     {
@@ -136,6 +165,32 @@ def plausible_tlimit(value: float | None) -> float | None:
     return value if abs(value) <= TLIMIT_PLAUSIBLE_MAGNITUDE_C else None
 
 
+def plausible_absolute_limit(value: float | None) -> float | None:
+    """An absolute limit usable for grading: finite and 0 < value <= 150 C.
+
+    Input validation, not an NVIDIA value: 0, a sentinel or a wrapped integer is
+    no temperature limit and is ignored like "N/A".
+    """
+
+    if value is None or not math.isfinite(value):
+        return None
+    return value if 0 < value <= TLIMIT_PLAUSIBLE_MAGNITUDE_C else None
+
+
+def shutdown_from_device_field(limits: Mapping[str, float]) -> bool:
+    """Whether the absolute shutdown limit is a T.Limit GPU's DCGM field 159.
+
+    The XML prints each threshold absolute or on the T.Limit scale, never both,
+    and the collector publishes field 159 only beside the T.Limit shutdown
+    threshold it checked the value against.
+    """
+
+    return (
+        plausible_absolute_limit(limits.get("gpu_shutdown_temperature_c")) is not None
+        and plausible_tlimit(limits.get("gpu_shutdown_tlimit_c")) is not None
+    )
+
+
 def tlimit_grades_gpu(limits: Mapping[str, float]) -> bool:
     """Whether the GPU core is judged on the T.Limit scale for this sample."""
 
@@ -180,6 +235,7 @@ def _decision(
     reason: str,
     threshold_value: float,
     source: str,
+    reference: str | None = None,
 ) -> TemperatureDecision:
     result: TemperatureDecision = {
         "severity": severity,
@@ -194,7 +250,7 @@ def _decision(
     }
     if source != "CONFIGURED_FALLBACK":
         result["policy_source"] = "SITE_NVIDIA_DEVICE_LIMIT_DERIVED"
-        result["policy_reference"] = (
+        result["policy_reference"] = reference or (
             NVIDIA_SMI_TLIMIT_REFERENCE
             if source == "NVIDIA_DEVICE_TLIMIT"
             else NVIDIA_NVML_TEMPERATURE_REFERENCE
@@ -238,25 +294,34 @@ def temperature_decision(
         key: value
         for key, value in limits.items()
         if key not in ABSOLUTE_TEMPERATURE_LIMITS
-        or math.isfinite(value)
-        and 0 < value <= TLIMIT_PLAUSIBLE_MAGNITUDE_C
+        or plausible_absolute_limit(value) is not None
     }
     if name == TLIMIT_READING:
         return _tlimit_decision(thresholds, sample, limits)
     if name == "gpu_temperature_c":
         shutdown = limits.get("gpu_shutdown_temperature_c")
+        device_field = shutdown_from_device_field(limits)
         if shutdown is not None and sample.value >= shutdown:
             return _decision(
                 GpuHealthSeverity.CRITICAL,
-                "GPU reached its absolute shutdown temperature",
+                DEVICE_SHUTDOWN_REASON
+                if device_field
+                else "GPU reached its absolute shutdown temperature",
                 shutdown,
                 "NVIDIA_DEVICE_LIMIT",
+                NVIDIA_DCGM_SHUTDOWN_FIELD_REFERENCE if device_field else None,
             )
         if tlimit_grades_gpu(limits):
             # Judged on its own T.Limit sample; grading the absolute reading
             # against the configured fallback too would report one condition
             # twice, on a boundary that is not the GPU's.
             return None
+        if device_field:
+            # A T.Limit GPU whose T.Limit reading is missing from this sample:
+            # its field-159 limit serves the emergency above only, so the
+            # absolute reading keeps the fallback it had before the limit was
+            # published, never a "shutdown minus margin" boundary.
+            shutdown = None
         slowdown = limits.get("gpu_slowdown_temperature_c")
         maximum = limits.get("gpu_max_operating_temperature_c")
         critical = slowdown or (

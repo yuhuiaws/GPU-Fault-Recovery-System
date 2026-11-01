@@ -18,6 +18,8 @@ DCGM_ENVIRONMENT_ALIASES = (
         {"DCGM_FI_DEV_CLOCK_THROTTLE_REASONS", "DCGM_FI_DEV_CLOCKS_EVENT_REASONS"}
     ),
     frozenset({"DCGM_FI_DEV_GPU_TEMP_LIMIT", "DCGM_FI_DEV_GPU_TEMP_MARGIN_CELSIUS"}),
+    # Field 159, the name before and since DCGM 4.6 (collectors/gpu/shutdown_limit).
+    frozenset({"DCGM_FI_DEV_SHUTDOWN_TEMP", "DCGM_FI_DEV_GPU_TEMP_SHUTDOWN_CELSIUS"}),
 )
 
 
