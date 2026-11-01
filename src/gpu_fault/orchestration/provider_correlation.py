@@ -157,6 +157,33 @@ def report_twin_incident(
     return incident, linked[0] if linked is not None else None
 
 
+def report_twin_occurrence(
+    store: InMemoryStore | SqliteStore | PostgresStore,
+    event: XidEvent | SxidEvent,
+    decision: FaultPolicyDecision,
+    incident_id: str,
+) -> str | None:
+    """The first report of ``event``'s XID occurrence, when ``event`` is the other
+    source's report and joined that report's incident (:func:`report_twin_incident`).
+
+    ``None`` for anything else -- a companion of another XID, a repeat after the
+    twin window, a report that kept its own incident. The FAULT_DETECTED notice
+    of one occurrence is the first report's: the second report folds into it
+    instead of mailing the same fault again (batch 238).
+    """
+
+    if not isinstance(event, XidEvent) or not decision.correlated_event_id:
+        return None
+    joined = store.get_incident_by_event(decision.correlated_event_id)
+    if joined is None or joined.incident_id != incident_id:
+        return None
+    try:
+        twin = store.get_xid_event(decision.correlated_event_id)
+    except NotFoundError:
+        return None
+    return twin.event_id if report_twins(event, twin) else None
+
+
 def equivalent_xid_observation(
     previous: XidEvent | None,
     event: XidEvent,

@@ -30,7 +30,14 @@ class XidInvestigatoryEmailBuilder:
         policy_version: str,
         reasons: list[str],
         evidence_refs: list[str],
+        occurrence_event_id: str | None = None,
     ) -> AdvisoryNotification:
+        """``occurrence_event_id`` names the first report of this XID occurrence
+        when ``event_id`` is its other source's report (the kernel line and the
+        DCGM field-230 change, ``policy/xid_cross_source``): the two share one
+        deduplication key, so the second report finds the first one's notice
+        instead of mailing the same fault again (batch 238)."""
+
         body = XID_INVESTIGATORY_EMAIL_TEMPLATE.format(
             cluster_id=cluster_id,
             node_id=node_id,
@@ -54,7 +61,8 @@ class XidInvestigatoryEmailBuilder:
         )
         return AdvisoryNotification(
             deduplication_key=(
-                f"{event_id}/xid-investigatory/{XID_INVESTIGATORY_TEMPLATE_VERSION}"
+                f"{occurrence_event_id or event_id}/xid-investigatory/"
+                f"{XID_INVESTIGATORY_TEMPLATE_VERSION}"
             ),
             cluster_name=cluster_id,
             incident_id=incident_id,

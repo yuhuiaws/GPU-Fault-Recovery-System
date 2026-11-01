@@ -12,6 +12,7 @@ from gpu_fault.notifications.registry import (
     NotificationKind,
 )
 from gpu_fault.orchestration import OPERATION_CAPABILITY
+from gpu_fault.orchestration.provider_correlation import report_twin_occurrence
 from gpu_fault.policy import ActionDisposition, FaultPolicyDecision, SxidEvent, XidEvent
 
 MANAGED_HYPERPOD_OWNER_PREFIX = "hyperpod-managed-"
@@ -151,6 +152,11 @@ class NotificationPreviewService:
                 policy_version=decision.policy_version,
                 reasons=decision.reasons,
                 evidence_refs=evidence_refs,
+                # The other source's report of an XID occurrence finds the
+                # first report's notice: one mail per fault (batch 238).
+                occurrence_event_id=report_twin_occurrence(
+                    self.store, event, decision, incident.incident_id
+                ),
             )
             notification = notification.model_copy(
                 update={
