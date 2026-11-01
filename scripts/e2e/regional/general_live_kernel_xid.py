@@ -25,9 +25,14 @@ isolates nothing and resets nothing. The entries the two variants use:
   the weak CORRECTABLE_MEMORY_DEGRADATION composite.
 
 What this proves: the trusted-source path is independent (own decision with
-the catalog's action, own incident, not duplicate, not correlated, not merged
-into the counter/composite incident, not a component of the composite) and
-the concurrent diagnosis is undisturbed. What it does not prove: that a
+the catalog's action, own ``inc-<event_id>`` incident, no companion
+correlation, not merged into the counter/composite incident, not a component
+of the composite) and the concurrent diagnosis is undisturbed. Independence is
+execution and incident identity, not correlation bookkeeping: a decision the
+product flags ``duplicate`` only because provider-event correlation associated
+its marker with the concurrent fault's (``marker_associations``; batch 236
+compares PCI devices, so 024's XID 92 meets the memory composite of its GPU)
+is still the XID's own handling. What it does not prove: that a
 *fatal-grade* dispatch (RESET/QUARANTINE) survives the concurrent diagnostic
 workflow -- that branch needs the reset approvals and is run by the dangerous
 kmsg-XID lanes, never here. The one such lane in this runner is 029
@@ -87,6 +92,17 @@ _PCI_BDF = re.compile(
     r"^(?:(?P<domain>[0-9a-fA-F]{4}|[0-9a-fA-F]{8}):)?"
     r"(?P<bus>[0-9a-fA-F]{2}):(?P<device>[0-9a-fA-F]{2})(?:\.(?P<function>[0-7]))?$"
 )
+#: The reason provider-event correlation leaves on a decision whose marker it
+#: associated with another incident's (``orchestration/provider_correlation.
+#: bind_marker_incident``). It is evidence bookkeeping: ``correlate_provider_
+#: event`` sets ``duplicate`` ("duplicate does not prove execution coverage")
+#: and ``execution_decision`` still binds the event to its own
+#: ``inc-<event_id>`` unless the store's arbitration groups it -- which the
+#: incident the decision names shows, not the flag. Since batch 236 the
+#: comparison reads PCI devices, so a kernel line (``0000:a5:00``) meets the
+#: exporter-spelled finding marker (``00000000:A5:00.0``) of the same GPU and
+#: fault class: 024's XID 92 beside the CORRECTABLE_MEMORY_DEGRADATION composite.
+MARKER_ASSOCIATION = re.compile(r"^Provider marker association with incident (\S+);")
 
 #: The product's own XID decisions for one node since a moment: the event as
 #: ingested (GPU identity, product, source) and the ``FaultPolicyDecision`` the
@@ -433,6 +449,39 @@ def wait_xid_decisions(
 # --------------------------------------------------------------------------- #
 # Grading: the XID kept its own catalog handling
 # --------------------------------------------------------------------------- #
+def marker_associations(decision: dict[str, Any]) -> list[str]:
+    """The incidents provider-event correlation associated the decision's
+    marker with, as its reasons record them (``MARKER_ASSOCIATION``)."""
+
+    found = []
+    for reason in decision.get("reasons") or []:
+        match = MARKER_ASSOCIATION.match(str(reason))
+        if match is not None:
+            found.append(match.group(1))
+    return found
+
+
+def own_incident_id(decision: dict[str, Any]) -> str:
+    """The incident of an event no store group took: ``inc-<event_id>`` (the
+    engine's marker default, and ``execution_decision`` for an associated one)."""
+
+    return f"inc-{decision.get('event_id')}"
+
+
+def repeated_event(decision: dict[str, Any]) -> bool:
+    """A duplicate on the event's own incident that the product explains
+    neither as a marker association nor as a companion correlation: a repeat
+    of an event it had decided before. A duplicate on any other incident is
+    no repeat -- the incident checks judge it (absorbed, not its own)."""
+
+    return (
+        bool(decision.get("duplicate"))
+        and not decision.get("correlated_event_id")
+        and not marker_associations(decision)
+        and decision.get("incident_id") == own_incident_id(decision)
+    )
+
+
 def independence_errors(
     decisions: list[dict[str, Any]],
     *,
@@ -442,11 +491,17 @@ def independence_errors(
 ) -> list[str]:
     """Why the reviewed XID was not handled independently (empty: it was).
 
-    The product's own records must show one fresh decision that carries the
-    catalog's action for the code, monitor-only with no action, no safety
-    action and no operator, bound to its own RECOVERED incident -- not the
-    incident of the concurrent counter or composite fault -- with no workflow,
-    no correlation and the target GPU's identity.
+    The product's own records must show one decision of this event that
+    carries the catalog's action for the code, monitor-only with no action, no
+    safety action and no operator, bound to its own RECOVERED ``inc-<event_id>``
+    -- not the incident of the concurrent counter or composite fault, nor any
+    other -- with no workflow, no companion correlation and the target GPU's
+    identity. ``duplicate`` alone does not fail it: a marker association
+    (``marker_associations``) is bookkeeping, and every check of execution
+    and incident identity below still applies to that decision. A duplicate
+    on its own incident that the product explains neither as an association
+    nor as a companion correlation is a repeat and fails, as before
+    (``repeated_event``); one on any other incident fails on that incident.
     """
 
     xid = entry.xid
@@ -455,16 +510,17 @@ def independence_errors(
     graded = [item for item in decisions if item.get("decision")]
     if not graded:
         return [f"XID {xid} was ingested but has no FaultPolicyDecision"]
-    fresh = [item for item in graded if not item.get("duplicate")]
+    fresh = [item for item in graded if not repeated_event(item)]
     if not fresh:
         return [
-            f"every decision for XID {xid} is a duplicate of an earlier event "
-            "(the reviewed line re-used an event id; re-run on the same boot?)"
+            f"every decision for XID {xid} is a duplicate of an earlier event, "
+            "neither a marker association nor a companion correlation (the "
+            "reviewed line re-used an event id; re-run on the same boot?)"
         ]
     errors: list[str] = []
     if len(fresh) > 1:
         errors.append(
-            f"{len(fresh)} non-duplicate decisions for XID {xid}; the reviewed "
+            f"{len(fresh)} decisions of their own for XID {xid}; the reviewed "
             "record's copies did not dedup to one event"
         )
     item = fresh[0]
@@ -500,10 +556,16 @@ def independence_errors(
         errors.append(
             f"XID {xid} was absorbed into the concurrent fault's incident {incident_id}"
         )
-    elif item.get("incident_state") not in (None, RECOVERED):
+    elif incident_id != own_incident_id(item):
         errors.append(
-            f"XID {xid} incident {incident_id} is {item.get('incident_state')}; a "
-            "monitor-only decision closes RECOVERED on creation"
+            f"XID {xid} decision is bound to incident {incident_id}, not its own "
+            f"{own_incident_id(item)}: another record took its handling"
+        )
+    elif item.get("incident_state") != RECOVERED:
+        errors.append(
+            f"XID {xid} incident {incident_id} is "
+            f"{item.get('incident_state') or 'not in the store'}; a monitor-only "
+            "decision closes its own incident RECOVERED on creation"
         )
     if item.get("workflow_request_id"):
         errors.append(
@@ -566,6 +628,7 @@ __all__ = [
     "DETECTION_BUDGET_SECONDS",
     "EMISSIONS",
     "LINK_XIDS",
+    "MARKER_ASSOCIATION",
     "MONITOR_GRADE_ACTIONS",
     "SITE_FAMILY",
     "WORKFLOW_XIDS",
@@ -578,8 +641,11 @@ __all__ = [
     "inject_reviewed_kernel_line",
     "isolating_decisions",
     "kmsg_pci_bdf",
+    "marker_associations",
     "monitor_grade_errors",
+    "own_incident_id",
     "product_family",
+    "repeated_event",
     "require_monitor_grade",
     "restore_if_isolated",
     "wait_xid_decisions",

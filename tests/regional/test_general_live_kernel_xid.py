@@ -173,9 +173,23 @@ def test_independence_holds_for_a_monitor_only_own_incident() -> None:
         ([_decision(workflow_request_id="wf-9")], "workflow"),
         ([_decision(gpu_uuid=G0)], "resolved to GPU"),
         ([_decision(incident_state="ACTION_PENDING")], "RECOVERED"),
+        ([_decision(incident_state=None)], "not in the store"),
+        ([_decision(incident_id="inc-other")], "not its own"),
         ([_decision(event_source="DCGM_XID_GAUGE")], "KERNEL_LOG"),
         ([_decision(incident_id=None)], "no incident"),
         ([_decision(), _decision(event_id="e-2")], "did not dedup"),
+        # A companion merge, or a flagged decision on another incident, is
+        # named as such, not hidden behind its duplicate flag.
+        (
+            [
+                _decision(
+                    duplicate=True, correlated_event_id="e-2", incident_id="inc-counter"
+                )
+            ],
+            "correlated",
+        ),
+        ([_decision(duplicate=True, incident_id="inc-counter")], "absorbed"),
+        ([_decision(duplicate=True, incident_id="inc-other")], "not its own"),
     ],
 )
 def test_independence_errors_name_each_defect(
@@ -185,6 +199,127 @@ def test_independence_errors_name_each_defect(
         decisions, entry=ENTRY, gpu_uuid=G1, foreign_incident_ids={"inc-counter"}
     )
     assert any(fragment in error for error in errors), errors
+
+
+# --------------------------------------------------------------------------- #
+# a marker association is bookkeeping, not absorption (batch 236)
+# --------------------------------------------------------------------------- #
+def _association_reasons(associated_with: str) -> list[str]:
+    """The reasons the product stores for this XID once provider-event
+    correlation associated its marker with ``associated_with``: the engine's
+    own decision, flagged duplicate the way ``correlate_provider_event`` does,
+    then bound to the event's own incident by ``execution_decision`` -- the
+    product's code writes the wording, so the oracle's reading of it is pinned
+    to the release under test."""
+
+    from gpu_fault.models import WorkloadState
+    from gpu_fault.orchestration.provider_correlation import execution_decision
+    from gpu_fault.policy import XidEvent
+    from tests._builders import build_context
+
+    event = XidEvent(
+        event_id=_decision()["event_id"],
+        cluster_id="gpu-eks-cluster",
+        node_id=NODE,
+        observed_at=datetime(2026, 10, 25, tzinfo=timezone.utc),
+        event_source="KERNEL_LOG",
+        xid=137,
+        gpu_uuid=G1,
+        pci_bdf="0000:1b:00",
+        product="NVIDIA H200",
+        driver_branch=580,
+        cuda_version="13.0",
+        runtime_profile_version="simulated-v1",
+        workload_state=WorkloadState.IDLE,
+    )
+    decision = build_context().policy.evaluate_xid(event)
+    associated = decision.model_copy(
+        update={
+            "marker": decision.marker.model_copy(
+                update={"incident_id": associated_with}
+            ),
+            "duplicate": True,
+        }
+    )
+    bound = execution_decision(event, associated, None)
+    assert bound.marker.incident_id == _decision()["incident_id"], (
+        "the association leaves the event its own incident"
+    )
+    return list(bound.reasons)
+
+
+def _associated(**overrides: Any) -> dict[str, Any]:
+    """The live R16 shape on 024: duplicate, the association named, nothing else."""
+
+    return _decision(
+        duplicate=True, reasons=_association_reasons("inc-counter"), **overrides
+    )
+
+
+def test_the_association_is_read_from_the_products_own_reason() -> None:
+    assert kx.marker_associations(_associated()) == ["inc-counter"]
+    assert kx.marker_associations(_decision()) == [], (
+        "the catalog's reason is no association"
+    )
+    assert kx.own_incident_id(_decision()) == _decision()["incident_id"]
+
+
+def test_a_marker_association_alone_is_bookkeeping() -> None:
+    associated = _associated()
+    assert not kx.repeated_event(associated), "an association is no repeat"
+    errors = kx.independence_errors(
+        [associated], entry=ENTRY, gpu_uuid=G1, foreign_incident_ids={"inc-counter"}
+    )
+    assert errors == [], errors
+
+
+@pytest.mark.parametrize(
+    ("overrides", "fragment"),
+    [
+        ({"incident_id": "inc-counter"}, "absorbed"),
+        ({"incident_id": "inc-other"}, "not its own"),
+        ({"workflow_request_id": "wf-9"}, "workflow"),
+        ({"correlated_event_id": "e-2"}, "correlated"),
+        ({"incident_state": "ACTION_PENDING"}, "RECOVERED"),
+        ({"incident_state": None}, "not in the store"),
+        ({"disposition": "EXECUTABLE", "action": "RESET_GPU"}, "recovery action"),
+        ({"official_action": "RESET_GPU"}, "official action"),
+        ({"requires_operator": True}, "operator"),
+        ({"gpu_uuid": G0}, "resolved to GPU"),
+    ],
+)
+def test_an_associated_decision_still_fails_when_its_handling_was_taken(
+    overrides: dict[str, Any], fragment: str
+) -> None:
+    errors = kx.independence_errors(
+        [_associated(**overrides)],
+        entry=ENTRY,
+        gpu_uuid=G1,
+        foreign_incident_ids={"inc-counter"},
+    )
+    assert any(fragment in error for error in errors), errors
+
+
+def test_a_duplicate_the_product_does_not_explain_is_a_repeat() -> None:
+    repeat = _decision(duplicate=True)
+    assert kx.repeated_event(repeat), "no association, no companion: a repeat"
+    assert not kx.repeated_event(_decision()), "a fresh decision is no repeat"
+    assert not kx.repeated_event(
+        _decision(duplicate=True, correlated_event_id="e-2")
+    ), "a companion merge is judged as a correlation, not as a repeat"
+    errors = kx.independence_errors(
+        [repeat], entry=ENTRY, gpu_uuid=G1, foreign_incident_ids={"inc-counter"}
+    )
+    assert len(errors) == 1 and "neither a marker association" in errors[0], errors
+    assert (
+        kx.independence_errors(
+            [repeat, _associated(event_id="e-2", incident_id="inc-e-2")],
+            entry=ENTRY,
+            gpu_uuid=G1,
+            foreign_incident_ids={"inc-counter"},
+        )
+        == []
+    ), "the association-only decision is the event's own; the repeat is ignored"
 
 
 def test_isolating_decisions_pick_actions_safety_and_workflows() -> None:

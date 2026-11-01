@@ -236,7 +236,7 @@ def _xid_decision(**overrides: Any) -> dict[str, Any]:
         "action": "NO_ACTION",
         "safety_action": None,
         "requires_operator": False,
-        "incident_id": "inc-xid-137",
+        "incident_id": "inc-kernel-log-kmsg-boot-900000064-xid-137-cluster-abc",
         "incident_state": "RECOVERED",
         "workflow_request_id": None,
         "duplicate": False,

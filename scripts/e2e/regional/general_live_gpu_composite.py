@@ -32,7 +32,10 @@ product's real correlation and de-duplication, not just a rule name:
 * ``independent_xid`` -- a trusted kernel XID on the GPU of a weak composite
   keeps its own catalog decision and incident; the composite never covers it
   (``general_live_kernel_xid``: XID 92 EXCESSIVE_SBE_INTERRUPTS, catalog
-  IGNORE -> MONITOR_ONLY, beside CORRECTABLE_MEMORY_DEGRADATION).
+  IGNORE -> MONITOR_ONLY, beside CORRECTABLE_MEMORY_DEGRADATION). Since batch
+  236 the product associates the XID's marker with the composite's (one GPU,
+  one memory class) and flags the decision ``duplicate``: bookkeeping, judged
+  on the XID's own incident, never a failure by itself.
 
 The memory composites replay two readings of one GPU, and the exporter decides
 which second reading exists (``GpuSurvey.component_pair``): beside the volatile
@@ -95,6 +98,7 @@ from scripts.e2e.regional.general_live_kernel_xid import (
     independence_errors,
     inject_kernel_xid,
     kmsg_pci_bdf,
+    marker_associations,
     require_monitor_grade,
     restore_if_isolated,
     wait_xid_decisions,
@@ -887,6 +891,17 @@ def independent_xid(ctx: VariantContext) -> dict[str, Any]:
     catalog row (MONITOR_ONLY, own RECOVERED incident, no workflow), never merge
     it into the composite's incident or list it among the composite's
     components, and the composite must stay the read-only diagnostic it was.
+
+    Independence is execution and incident identity. Since batch 236
+    provider-event correlation compares PCI devices, so the kernel line's
+    ``0000:a5:00`` meets the composite marker's exporter-spelled
+    ``00000000:A5:00.0`` and the XID's decision is flagged ``duplicate`` with
+    the association as a reason (``marker_associations``): bookkeeping, which
+    the product's own replay of this variant shows changes nothing that runs
+    (``tests/regional/test_general_live_independent_xid_product.py``). The
+    association is reported in ``marker_associations``; absorption -- the
+    XID's decision on another incident, a workflow, a companion correlation, a
+    changed catalog decision -- still fails (``independence_errors``).
     """
 
     entry = require_monitor_grade(INDEPENDENT_XID)
@@ -951,6 +966,9 @@ def independent_xid(ctx: VariantContext) -> dict[str, Any]:
     }
     stages["isolation"] = restore_if_isolated(ctx, decisions)
     recover_counter(ctx, repl, since, names=list(pair.components))
+    associations = sorted(
+        {incident for item in decisions for incident in marker_associations(item)}
+    )
     return result(
         stages,
         notes=[
@@ -958,12 +976,23 @@ def independent_xid(ctx: VariantContext) -> dict[str, Any]:
             f"{entry.catalog_version}: {entry.immediate_action} -> MONITOR_ONLY; the "
             "fatal-grade dispatch beside a weak composite is not driven live here",
             pair.note(),
+            *(
+                [
+                    "the product associated the XID's marker with "
+                    f"{', '.join(associations)} (provider-event correlation, one GPU "
+                    "and fault class; duplicate=true): bookkeeping, the XID judged "
+                    "on its own incident"
+                ]
+                if associations
+                else []
+            ),
         ],
         extra={
             **pair.evidence(),
             "xid": INDEPENDENT_XID,
             "pci_bdf": pci_bdf,
             "decisions": decisions,
+            "marker_associations": associations,
             "kernel_replay": injection.evidence(),
         },
     )
@@ -1070,7 +1099,9 @@ VARIANTS = [
         "that GPU through the kmsg source",
         "the XID keeps its own catalog decision (MONITOR_ONLY, own RECOVERED incident, "
         "no workflow) and is neither merged into the weak composite's incident nor "
-        "listed among its components; the composite stays diagnostic. The fatal-grade "
+        "listed among its components; the composite stays diagnostic. A marker "
+        "association with the composite (duplicate=true) is bookkeeping and accepted "
+        "while the XID keeps that handling. The fatal-grade "
         "dispatch (RESET/QUARANTINE) is deliberately not driven live",
         independent_xid,
         risk="M",

@@ -562,7 +562,7 @@ def test_independent_fatal_event_judges_the_counter_chain_on_a_verdict(
         "action": "NO_ACTION",
         "safety_action": None,
         "requires_operator": False,
-        "incident_id": "inc-xid-137",
+        "incident_id": "inc-kernel-log-kmsg-boot-900000064-xid-137-cluster-abc",
         "incident_state": "RECOVERED",
         "workflow_request_id": None,
         "duplicate": False,

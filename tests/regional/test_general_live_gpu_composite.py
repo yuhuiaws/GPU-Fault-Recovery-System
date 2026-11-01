@@ -191,7 +191,7 @@ def _xid_decision(**overrides: Any) -> dict[str, Any]:
         "action": "NO_ACTION",
         "safety_action": None,
         "requires_operator": False,
-        "incident_id": "inc-xid-92",
+        "incident_id": "inc-kernel-log-kmsg-boot-900000064-xid-92-cluster-abc",
         "incident_state": "RECOVERED",
         "workflow_request_id": None,
         "duplicate": False,
@@ -303,6 +303,40 @@ def test_independent_xid_fails_when_absorbed_into_the_composite_incident(
     out = comp.independent_xid(ctx)
     assert out["verdict"] == "FAIL"
     assert any("absorbed" in error for error in out["errors"]), out["errors"]
+
+
+#: The association reason the product writes (batch 236), naming the composite.
+ASSOCIATED = (
+    "Provider marker association with incident inc-c; execution coverage is "
+    "decided by workflow arbitration"
+)
+
+
+def test_independent_xid_accepts_the_marker_association_with_the_composite(
+    tmp_path: Path,
+) -> None:
+    """R16: the kernel line and the composite name one GPU in two PCI spellings,
+    so the XID's marker is associated with the composite's and its decision is
+    flagged duplicate -- bookkeeping; reported, never failed by itself."""
+
+    decision = _xid_decision(duplicate=True, reasons=["catalog", ASSOCIATED])
+    out = comp.independent_xid(_independent_ctx(tmp_path, [decision]))
+    assert out["verdict"] == "PASS", out["errors"]
+    assert out["marker_associations"] == ["inc-c"]
+    assert any("bookkeeping" in note for note in out["notes"]), out["notes"]
+
+
+def test_independent_xid_fails_when_the_association_took_the_xid(
+    tmp_path: Path,
+) -> None:
+    absorbed = _xid_decision(duplicate=True, reasons=[ASSOCIATED], incident_id="inc-c")
+    out = comp.independent_xid(_independent_ctx(tmp_path, [absorbed]))
+    assert out["verdict"] == "FAIL"
+    assert any("absorbed" in error for error in out["errors"]), out["errors"]
+    repeat = _xid_decision(duplicate=True, reasons=["catalog"])
+    out = comp.independent_xid(_independent_ctx(tmp_path / "repeat", [repeat]))
+    assert out["verdict"] == "FAIL"
+    assert any("re-used an event id" in error for error in out["errors"]), out["errors"]
 
 
 def test_independent_xid_fails_when_the_xid_is_dropped(tmp_path: Path) -> None:
