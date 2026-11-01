@@ -97,7 +97,7 @@ rows:
   - number: 24
     cases: [GF-GENERAL-LIVE-024]
     proof_modes: [live-replay]
-    variants: [thermal_warning, power_performance, corrected_memory, memory_failure, nvlink_multiple_gpus, fresh_components, reused_components, wrong_scope_source, independent_xid]
+    variants: [thermal_warning, power_performance, corrected_memory, memory_failure, nvlink_multiple_gpus, fresh_components, reused_components, wrong_scope_source, independent_xid, xid_twin_kernel_first, xid_twin_gauge_first, xid_twin_reset_gpu, xid_twin_unbound_job, xid_twin_drain_p2p]
   - number: 25
     cases: [GF-GENERAL-LIVE-025]
     proof_modes: [native, live-replay]

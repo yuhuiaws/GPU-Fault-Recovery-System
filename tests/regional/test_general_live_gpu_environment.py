@@ -12,6 +12,7 @@ from gpu_fault.gpu_metrics import GpuMetricsThresholds
 from scripts.e2e.regional import general_live_gpu_composite as comp
 from scripts.e2e.regional import general_live_gpu_environment as envc
 from scripts.e2e.regional import general_live_registry as reg
+from scripts.e2e.regional import general_live_xid_twins as twins
 from scripts.e2e.regional.general_live_env_replay import PROBE_KEY
 from scripts.e2e.regional.general_live_fixture import VariantInconclusive, VariantNotRun
 from scripts.e2e.regional.general_live_gpu_replay import GpuSurvey
@@ -216,8 +217,8 @@ def _plan(ctx: Any) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # registry
 # --------------------------------------------------------------------------- #
-def test_024_is_fully_implemented_across_the_two_modules() -> None:
-    specs = {s.variant: s for s in [*comp.VARIANTS, *envc.VARIANTS]}
+def test_024_is_fully_implemented_across_the_three_modules() -> None:
+    specs = {s.variant: s for s in [*comp.VARIANTS, *envc.VARIANTS, *twins.VARIANTS]}
     assert set(specs) == set(reg.coverage_rows()["GF-GENERAL-LIVE-024"])
     assert [s.variant for s in specs.values() if s.deferred] == []
     for variant in ("thermal_warning", "power_performance"):

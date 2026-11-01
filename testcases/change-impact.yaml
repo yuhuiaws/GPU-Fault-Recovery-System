@@ -696,6 +696,7 @@ rules:
       - tools/nvidia_smi_inventory_replay.py
       - tests/regional/_general_live_fakes.py
       - tests/regional/_general_live_gpu_fakes.py
+      - tests/regional/_xid_twin_node.py
       - tests/regional/test_general_live_*.py
       - tests/test_gpu_dcgm_field_replay.py
       - tests/test_nvidia_smi_inventory_replay.py
@@ -740,6 +741,10 @@ rules:
       - tests/regional/test_general_live_gpu_fields.py
       - tests/regional/test_general_live_gpu_identity.py
       - tests/regional/test_general_live_gpu_probe.py
+      # 024 xid_twin_*: one XID reported twice, the kmsg line and the field-230
+      # change, over the product's own records (batch 237).
+      - tests/regional/test_general_live_xid_twins.py
+      - tests/regional/test_general_live_xid_twins_product.py
       - tests/test_gpu_dcgm_field_replay.py
       - tests/test_nvidia_smi_inventory_replay.py
       - tests/test_general_fault_live_coverage.py
@@ -907,6 +912,9 @@ rules:
       - tests/orchestration/test_xid_cross_source_dedupe.py
       # A marker association is bookkeeping, not absorption (S61).
       - tests/regional/test_general_live_independent_xid_product.py
+
+      # The live 024 xid_twin_* oracles over the product's own twin records.
+      - tests/regional/test_general_live_xid_twins_product.py
     regional_cases:
       - GF-REGIONAL-COLLECT-001..020
     checks:

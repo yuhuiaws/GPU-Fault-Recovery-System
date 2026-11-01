@@ -151,10 +151,14 @@ def _correctable_cpu() -> Any:
 def test_registry_covers_024() -> None:
     from scripts.e2e.regional import general_live_gpu_environment as envc
     from scripts.e2e.regional import general_live_registry as reg
+    from scripts.e2e.regional import general_live_xid_twins as twins
 
     environment = {spec.variant for spec in envc.VARIANTS}
     assert environment == {"thermal_warning", "power_performance"}
-    assert set(SPECS) | environment == set(reg.coverage_rows()["GF-GENERAL-LIVE-024"])
+    twin_reports = {spec.variant for spec in twins.VARIANTS}
+    assert set(SPECS) | environment | twin_reports == set(
+        reg.coverage_rows()["GF-GENERAL-LIVE-024"]
+    )
     assert [variant for variant, spec in SPECS.items() if spec.deferred] == []
     assert SPECS["independent_xid"].approvals == ("KERNEL_SOURCE_REPLAY",)
     assert SPECS["independent_xid"].risk == "M"

@@ -137,7 +137,11 @@ APPROVALS: dict[str, str] = {
         "validate) run on the idle test node for a replayed row-remap-pending "
         "reading, or -- 029 hardware_chain_continues -- on the test node running "
         "the managed test job for a reviewed kernel XID 46 (the product cordons "
-        "and stops that job first; its restart budget is already exhausted)"
+        "and stops that job first; its restart budget is already exhausted), or "
+        "-- 024 xid_twin_reset_gpu / xid_twin_unbound_job -- once for a reviewed "
+        "kernel XID 48 and its DCGM field-230 twin, on the idle test node or on "
+        "the node of a managed test job holding other GPUs (the product stops "
+        "that job, resets the GPU and restarts the job)"
     ),
     "GPU_FULL_FABRIC_RESET": (
         "let the product's RESET_ALL_GPUS_NVSWITCHES chain (quiesce incl. Fabric "
@@ -159,6 +163,23 @@ APPROVALS: dict[str, str] = {
         "replay the DCGM last-XID gauge (DCGM_FI_DEV_XID_ERRORS) as XID 32 "
         "(catalog RESTART_APP, monitor-only on an idle node) on one test GPU; "
         "the product turns it into a trusted XID event"
+    ),
+    # GF-GENERAL-LIVE-024 xid_twin_* (batch 237): one XID, two reports.
+    "DCGM_XID_TWIN": (
+        "replay the DCGM last-XID gauge (DCGM_FI_DEV_XID_ERRORS, field 230) of one "
+        "test GPU as 0 and then the XID a reviewed kernel line names for that GPU "
+        "(92, 48 or 154): the field-230 twin of the line, which a product with "
+        "batch 237 joins to the line's occurrence; the variant refuses before "
+        "anything is deployed on a product without it, where the twin would be a "
+        "fault of its own"
+    ),
+    "GPU_DRAIN_P2P": (
+        "let the product's XID 154 DRAIN_P2P chain (cordon, quiesce GPU services, "
+        "verify no GPU clients, release the target GPU's persistence and read the "
+        "driver's GPU Recovery Action back -- a GPU reset only where the driver "
+        "asks for one, none on a healthy GPU -- restore GPU services, validate "
+        "GPU and fabric, uncordon) run once on the idle test node for a reviewed "
+        "kernel XID 154 Drain P2P line and its DCGM field-230 twin"
     ),
     # The shared host-collector source replay (general_live_source_replay.py):
     # phase-2 host/device variants 002/007/010/011/012/013/015/032.
@@ -371,6 +392,7 @@ CATEGORY_MODULES = (
     "scripts.e2e.regional.general_live_gpu_fabric",
     "scripts.e2e.regional.general_live_gpu_composite",
     "scripts.e2e.regional.general_live_gpu_environment",
+    "scripts.e2e.regional.general_live_xid_twins",
     "scripts.e2e.regional.general_live_gpu_fields",
     "scripts.e2e.regional.general_live_gpu_identity",
     "scripts.e2e.regional.general_live_attempt_hardware",

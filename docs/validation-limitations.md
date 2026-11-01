@@ -5865,14 +5865,59 @@ cases fail there. It runs on the in-memory store and, for a subset, on SQLite;
 the Postgres store was not exercised (its event link and decision reads are
 the ones the other ingest paths already use).
 
-No live case has exercised this path: live acceptance cannot move field 230
-with a synthetic kernel line (the drills' synthetic NVRM lines never reached
-DCGM), and a real XID cannot be raised on demand. A live proof needs both
-reports synthesised on one node -- the kernel line through the GF-GENERAL-LIVE
-kmsg replay (`general_live_kernel_replay`) and the field-230 line through its
-DCGM field replay (`tools/gpu_dcgm_field_replay.py`, which already serves
-`DCGM_FI_DEV_XID_ERRORS` to the PCIe composite variants); no such case exists
-yet.
+Live acceptance cannot move field 230 with a synthetic kernel line (the
+drills' synthetic NVRM lines never reached DCGM), and a real XID cannot be
+raised on demand, so the live variants GF-GENERAL-LIVE-024 `xid_twin_*`
+synthesise both reports on one node and GPU: the kernel line through the kmsg
+replay (`general_live_kernel_replay`, read by the real `KernelLogCollector`),
+the field-230 line through the DCGM field replay's `xid_twin` profile
+(`tools/gpu_dcgm_field_replay.py`: the gauge alone, `set` only, values 0, 92,
+48 and 154; synthesised from the GPU's own label set because the exporter
+omits it on a healthy GPU, 0 first so the product holds a baseline the change
+can be minted against). `xid_twin_kernel_first` / `xid_twin_gauge_first` (S,
+XID 92, catalog IGNORE) place the change on the collector's first scrape 15-30
+s after the line, or the line 30 s after the change, and then repeat the line
+150 s after the change with the gauge unchanged as the negative control (a new
+occurrence); `xid_twin_reset_gpu`, `xid_twin_unbound_job` (XID 48, idle node /
+a job on four other GPUs) and `xid_twin_drain_p2p` (XID 154 Drain P2P) are X
+and count, from the product's step executions, exactly one RESET_GPU, one
+STOP_WORKLOADS + RESET_GPU + RESTART_WORKLOAD, and one RECOVER_DRAIN_P2P with
+no QUARANTINE planned. Before anything is deployed a code-only probe asks the
+API Pod's own engine whether it has the twin rule; a product without batch 237
+ends INCONCLUSIVE ("expected on this product generation"), never with a twin
+injected. The variants are implemented and tested over the product's own
+records in memory (`tests/regional/test_general_live_xid_twins_product.py`:
+PASS on this tree, FAIL with the twin rule taken out) but have not run on the
+live site yet. What they cannot prove live:
+
+- Both reports are replays (`live-replay`); no physical XID is raised, and the
+  field-230 change the product reads is the field tool's, not a DCGM host
+  engine's. The incidents, workflows and node actions of the X variants are the
+  product's own.
+- An actionable XID in the kernel-first order is not driven live. A RESET_GPU
+  or DRAIN_P2P chain quiesces the metrics collector and the exporter (kubelet
+  too on HyperPod) about 10 s after its decision, before a change trailing its
+  line by the production 15-30 s is scraped; the field tool would then serve it
+  to the first scrape after RESTORE_GPU_SERVICES, outside the twin window. The X
+  variants therefore deliver the change first and the line once the product
+  has recorded it; the kernel-first order of an actionable XID stays the
+  in-memory replay's. In production the same race means the change of a
+  RESET-class XID is usually never scraped (one remediation either way); whether
+  a DCGM host engine or exporter restarted by RESTORE_GPU_SERVICES republishes
+  the XID in field 230 afterwards (DCGM v4.6.1 `RecordXidForGpu` is fed by its
+  kmsg parser as well as the NVML event thread -- the field-230 citation under
+  "GF-GENERAL-LIVE DCGM / GPU-inventory replay (phase 2)") was not observed -- a
+  change arriving that late would be outside the 120 s window and planned as a
+  new occurrence.
+- The DRAIN_P2P chain's read-back of the driver's GPU Recovery Action on a
+  healthy H200 (expected None, no reset) has not been seen live; the UVM
+  persistence gap (`GF-E2E-DRAIN-P2P-UVM`) is outside the variant.
+- The generation gate reads the code of the API Pod it runs in; a control plane
+  whose replicas run two generations mid-rollout is not detected.
+- `xid_twin_unbound_job` needs the job's GPUs from both its container's
+  nvidia-smi and the product's watcher mapping; where they disagree, or the job
+  does not hold exactly four, the variant is INCONCLUSIVE rather than placing
+  the XID on a guess.
 
 Not verified live, and stated from NVIDIA documentation or the code:
 

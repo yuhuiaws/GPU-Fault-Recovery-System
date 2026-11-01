@@ -1205,7 +1205,8 @@ hostengine 重启会清掉它）；计划在
 
 必测：`thermal_warning`、`power_performance`、`corrected_memory`、`memory_failure`、
 `nvlink_multiple_gpus`、`fresh_components`、`reused_components`、
-`wrong_scope_source`、`independent_xid`。
+`wrong_scope_source`、`independent_xid`、`xid_twin_kernel_first`、`xid_twin_gauge_first`、
+`xid_twin_reset_gpu`、`xid_twin_unbound_job`、`xid_twin_drain_p2p`。
 使用按GPU/来源审查的原始metric/Xid夹具，不直接提交复合finding。热/功耗部分复用
 ENV流程，其余字段不在环境代理allowlist内。覆盖45秒窗口内外、异卡、异来源、未来/
 重复组件，检查实际工作流去重而非只比较规则名。
@@ -1344,6 +1345,81 @@ incident（`gpu_composites.composite_episode_identity`），第 3 个样本的 C
 钉住每个事件期只激活一次；`independent_xid` 与 `reused_components` 待 R13h 在两个集群重跑。同次运行的
 XID 92 在 420 s 内无任何决策记录，夹具侧（每运行独立 kmsg 序号带、当前单调时间戳、窗口开启/
 写入回执）未见异常，重跑前需查产品 store 的 XID 事件与内核采集器日志。
+
+**同一 XID 的两路上报（`xid_twin_*`，b237）。** 每个真实 XID 都到达控制面两次：内核采集器立即上报
+NVRM 行（`KERNEL_LOG`），DCGM 字段 230（`DCGM_FI_DEV_XID_ERRORS`）在 exporter 下一次刷新、约晚
+15-30 s 后变化，由 `GpuMetricsService._xid_event` 铸成第二个 `XidEvent`（`DCGM_EXPORTER`）。b237
+（`policy/xid_cross_source`）把两者定为同一次发生：一个 incident、一次处置，两种到达顺序皆然；此前
+第二路可能再执行一次处置、隔离已修好的节点或让两个作业工作流互相卡住。演练写入的合成内核行不会改变
+字段 230，所以此前没有真机用例覆盖。五个变体在同一节点同一 GPU 上合成两路：内核行走 kmsg 回放
+（`general_live_kernel_replay`，经审查的 `NVRM: Xid` 行由真实 `KernelLogCollector` 读取），字段 230
+走 DCGM 字段回放的 `xid_twin` profile（`tools/gpu_dcgm_field_replay.py`：只允许 `xid_last_error`、
+只允许 `set`、值只能是 0/92/48/154；健康 GPU 上 exporter 不发布该 gauge，按 absent_when_healthy 用该
+GPU 自己的标签合成，err_code/err_msg 取 dcgm-exporter 4.8.4 `xid_errors.go` 第 69/113/175 行），计划
+从重指后采集器的第一次抓取起先服务 0——该次是 initial-baseline 投递，产品据此记下基线（
+`observe_xid_metric` 只对已存基线之后的变化铸事件，首次见到的值静默入基线）——变体在 gpu_state 里确认
+产品已记下 0 之后才放置孪生；之后改为同一 XID 并保持。回放日志每条记录带节点墙钟 `at`，kmsg 探针的
+`arm --index N` 只追加第 N 条记录并回报写入时刻 `written_at`（节点墙钟），两路因此都在节点自己的时钟上
+定位。`xid_twin_kernel_first`（S）：空闲节点、XID 92（`EXCESSIVE_SBE_INTERRUPTS`，catalog IGNORE →
+MONITOR_ONLY），先写内核行，再在其后第一个落在 15-30 s 内的抓取上改变 gauge（runner 在
+`内核行 + 15 s - 采集间隔` 之后的第一次抓取之后立刻 advance，下一次抓取即在 [+15, +15+间隔) 内；
+间隔大于 15 s 时可能落在窗口外，记前提失败）。`xid_twin_gauge_first`（S）：先改 gauge，产品记下该
+变化后 30 s 再写内核行（在 120 s 孪生窗口内）。两个安全变体都做反向对照：变化之后 150 s（窗口 120 s
++ 30 s 余量）再写同一 XID 同一 GPU 的内核行（独立的 kmsg 记录与序号，gauge 不变——重复的同一 XID
+不会改变字段 230），它必须是新的一次发生：自己的 `inc-<event_id>` 且 RECOVERED、无
+`correlated_event_id`、无 workflow，仅因 marker 关联而 duplicate 记为簿记；产品时钟上仍在窗口内则
+INCONCLUSIVE。三个 X 变体：`xid_twin_reset_gpu`（XID 48 `ROBUST_CHANNEL_GPU_ECC_DBE`，
+WORKFLOW_XID_48 单独出现即 RESET_GPU，空闲节点）、`xid_twin_unbound_job`（XID 48，落在一个占用节点四张
+GPU 的受管测试作业不使用的 GPU 上；作业的 GPU 由容器内 nvidia-smi 与产品 watcher 的映射共同确定，二者
+不一致或不是四张则 INCONCLUSIVE；作业 restart budget 2，第二次重启会出现在账本里而不是被扣住）、
+`xid_twin_drain_p2p`（XID 154，内核行带 pinned catalog 示例格式的 "Drain P2P" 标签）。X 变体都先改
+gauge：复位或 Drain P2P 链在决策约 10 s 后执行 QUIESCE_GPU_SERVICES，两种 provider 上都会停掉
+`gpu-fault-metrics-collector` 与 exporter 容器（HyperPod 上还停 kubelet），一个按生产时延晚于内核行
+15-30 s 的变化多半遇到已停的采集器，字段工具会把它留给 RESTORE_GPU_SERVICES 之后的第一次抓取——那时
+已在窗口之外，任何产品代际都不会配对——所以 X 变体在产品记下变化之后才写内核行：XID 48 立即（赶在
+HyperPod 的 quiesce 停掉 kubelet、探针失去通道之前），XID 154 30 s 后（变化在等待自己的内核行时
+`PENDING_CORRELATION`，链尚未开始）。动作级 XID 的 kernel-first 顺序由内存回放
+（`tests/orchestration/test_xid_cross_source_dedupe.py`）覆盖，其"变化跟随内核行"的路径与安全
+kernel-first 变体在真机上驱动的是同一函数。
+
+产品代际门：部署任何东西之前，`general_live_xid_twin_records.require_twin_generation` 在 API Pod 里运行
+只读代码探针 `XID_TWIN_GENERATION_PROBE`——只导入产品模块，用产品自己的策略引擎在内存里评估该变体 XID
+的两路上报（内核拼写 `0000:b9:00` 与 exporter 拼写 `00000000:B9:00.0`，相隔 20 s），不读写 store——
+没有 `gpu_fault.policy.xid_cross_source`、孪生窗口不是 120 s、变化不跟随内核行、缺少内核侧合并或
+incident 链接、XID 154 的单独变化不等待内核行，任何一条都判 INCONCLUSIVE，原因写
+"expected on this product generation: ..."（并写明该产品会怎样处理这一路孪生：第二个 incident、第二次
+RESET_GPU、或隔离被 DRAIN_P2P 修好的节点），证据 `product-generation.json`，节点未被触碰；引擎对该
+XID 的决定与变体预期不同（catalog 变化）同样 INCONCLUSIVE。X 变体随后读取节点 Agent 的
+allowed_operations 与 Runtime Profile 的 gpuReset，缺少链所需操作或 gpuReset 为 OBSERVE/DISABLED 记
+`NOT_RUN(CAPABILITY_ABSENT)`；之前 240 s（产品配对的读取范围：两个孪生窗口）内同一 GPU 上若已有同一 XID
+的报告，先等它过去，否则上一次运行未配对的内核行会被当作本次变化的孪生。
+
+判定只读持久记录：该 XID 自 since 起的两路事件、各自保存的 `FaultPolicyDecision`、store 的事件→incident
+链接（`get_incident_by_event`），以及节点自 since 起所有 workflow 的 step executions 与 remote command
+回执。PASS：第二路（kernel-first 为变化，gauge-first 为内核行；XID 154 永远是变化）`duplicate=true`、
+`correlated_event_id` 为第一路事件、决策与第一路一致（disposition/official_action/action），store 把两路
+都链到同一 incident，且没有为任一路另开 incident；安全变体无任何 workflow、incident RECOVERED；X 变体
+恰一个 workflow，链（reset：FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → QUIESCE_GPU_SERVICES →
+VERIFY_NO_GPU_CLIENTS → RESET_GPU → RESTORE_GPU_SERVICES → VALIDATE_GPU → RESTORE_SCHEDULING；
+unbound_job 另有 STOP_WORKLOADS 与 RESTART_WORKLOAD；drain 为 RECOVER_DRAIN_P2P 并含 VALIDATE_FABRIC）
+全部 SUCCEEDED、incident RECOVERED，节点上 SUCCEEDED 执行计数恰为：reset——QUIESCE_GPU_SERVICES 1、
+RESET_GPU 1，STOP_WORKLOADS/RESTART_WORKLOAD/RECOVER_DRAIN_P2P/QUARANTINE 0；unbound_job——STOP_WORKLOADS
+1、QUIESCE_GPU_SERVICES 1、RESET_GPU 1、RESTART_WORKLOAD 1（作业的 attempt 以 STOPPED 结束、完成决策
+NO_ACTION、无被动 containment、RESTART_WORKLOAD 记下 restart_attempt_id、账本 restart_count 1、重启副本
+运行）；drain——QUIESCE_GPU_SERVICES 1、RECOVER_DRAIN_P2P 1，节点上任何 workflow 都不计划 QUARANTINE；
+remote command 回执不得多于 step executions。前提失败记 INCONCLUSIVE 而不判产品：两路未都到达或不在
+目标 GPU、产品时钟上相距超过 120 s、kernel-first 的实际延迟不在 15-30 s、gauge-first 的内核行不在窗口内、
+产品未记下 0 基线、回放 abort。清理：kmsg 窗口（X 变体在内核行被决定后立即关闭；探针被产品的 quiesce
+拿走时等节点回来再关，重启后按 boot id 判清；deadman 兜底）、DCGM 回放（链结束后关闭，绝不在链中途）、
+测试作业（含重启副本与 prewarm Pod）、节点若被留在隔离状态则 validated restore。产品的 XID gauge 基线
+停在该 XID，下一次计划先服务 0。证明范围是 live-replay（两路上报为回放，incident、workflow 与节点动作
+是产品自己的）；不证明物理 XID，也不证明 DCGM 4.6.1 是否真的在字段 230 报告 XID 154。测试：
+`tests/regional/test_general_live_xid_twins_product.py`（变体代码驱动内存产品的真实摄入路由、生产
+dispatcher 与 executor：本树五个变体 PASS；去掉孪生规则并绕过代际门时，安全变体以"两个 incident"
+FAIL，链结束后才到的内核行使 RESET_GPU 执行两次而 FAIL，XID 154 的变化单独 BLOCKED 并计划 QUARANTINE
+而 FAIL）、`tests/regional/test_general_live_xid_twins.py`（登记、代际探针对本树/去掉
+`xid_cross_source` 的本树/改动的代码形状、前提、时序、kmsg 延后关闭）、`tests/test_gpu_dcgm_field_replay.py`
+（`xid_twin` profile）、`tests/regional/test_general_live_kernel_replay.py`（`arm --index`）。
 
 ### GF-GENERAL-LIVE-025
 
@@ -3218,7 +3294,9 @@ reset 需 `--approve GPU_RESET`（024 `wrong_scope_source` 的修复 GPU 自己�
 同一条单卡 reset 链，同需 `GPU_RESET`、`X` 标志、risk H）；021 任一 finding 都驱动全 GPU+NVSwitch reset，故
 该类变体需 `--approve GPU_FULL_FABRIC_RESET`（`recovery_failure` 另需
 `NODE_REBOOT`）并在两集群各车道的独占节点跑（X 标志持全部锁）；022 的 XID 联合变体只把 DCGM last-XID
-gauge 回放为 XID 32（`--approve DCGM_XID_GAUGE`）；019 `remap_failure` 的 RMA 现场
+gauge 回放为 XID 32（`--approve DCGM_XID_GAUGE`）；024 的 `xid_twin_*` 把它回放为一条经审查内核行的
+字段 230 孪生（profile `xid_twin`，值仅 0/92/48/154，`--approve DCGM_XID_TWIN` 与
+`KERNEL_SOURCE_REPLAY`；X 变体另需 `GPU_RESET`（XID 48）或 `GPU_DRAIN_P2P`（XID 154））；019 `remap_failure` 的 RMA 现场
 诊断需 `GPU_FIELD_DIAGNOSTIC`。现网两套 profile 都把 `memoryDiagnostics` 声明为 OBSERVE：2026-10-26 06:25Z plain EKS 上该变体
 整条计划在编译期 BLOCKED（`no executable owner for memoryDiagnostics`）、节点保持可调度、清扫按「从未改动节点」
 关闭、incident 只显示 ESCALATED；产品修复（R13h）后预期为：FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → QUARANTINE →
