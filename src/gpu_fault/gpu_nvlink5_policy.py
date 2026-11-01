@@ -60,7 +60,7 @@ interval overlaps a product quiesce, reset, reboot or Fabric Manager/NVLSM
 window (``gpu_product_windows``) grades nothing -- the links retrain there and
 the window's VALIDATE_GPU judges the GPU afterwards; while an XID 144-150 or
 155 event or open incident owns the GPU (the kernel line carries the decode,
-``policy/nvlink5_gauge``), the finding is evidence only (``NO_ACTION``). Both
+``policy/xid_cross_source``), the finding is evidence only (``NO_ACTION``). Both
 NVLink composites take NVLink5 findings as components
 (:func:`nvlink_component`); the link-recovery trio counts as one error class
 (:func:`nvlink_class`: one recovery increments 1211 or 1212 *and* 1213), an
