@@ -274,3 +274,8 @@ Preliminary gates: GPU is of the B100/GB200 family → NOT_APPLICABLE + QUARANTI
   `RESTORE_SCHEDULING` has not yet completed), kmsg XID/SXID and node-health markers on that node no longer open a new incident
   but are linked as evidence to the incident that owns the reboot; kmsg events carrying the old boot_id (the agent already heartbeats with the new boot) are treated as
   pre-reboot residue, land as RECOVERED and produce no workflow. The rules are in `orchestration/reboot_window.py`.
+- The kernel NVRM line and the DCGM field 230 (`DCGM_FI_DEV_XID_ERRORS`) change of one XID are one occurrence (batch 237,
+  `policy/xid_cross_source.py`): the second report -- a change within 120 s of its kernel line on the same GPU, or a line that
+  meets a change already decided the same way -- is linked to the first one's incident as evidence and executes nothing, so
+  every row's actual execution happens once per occurrence, not once per report. A change of XID 154, 74 or 144-150, whose
+  decode reads the kernel line, waits up to 120 s for it and stays BLOCKED + `QUARANTINE` only when the line never comes.

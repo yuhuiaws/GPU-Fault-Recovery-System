@@ -5825,3 +5825,48 @@ field-1523 and NVLink5 ownership of a kernel line without a GPU UUID
 spellings are those the product's own parsers read (the kernel `PCI:` token,
 the exporter `pci_bus_id` label, nvidia-smi `pci.bus_id`); how a Fabric
 Manager log line spells an XID or SXID address was not sampled live.
+
+## One XID, two reports: kernel line and DCGM field 230 (batch 237)
+
+"One XID occurrence -> one incident, one remediation" is proven by in-memory
+replays only. `tests/orchestration/test_xid_cross_source_dedupe.py` drives the
+kernel and GPU-metrics routes, the policy decision, the incident and its
+workflow, and then the production dispatcher and executor (remediation budget,
+storm breaker, node-exclusive predecessors, the rule-A busy-node hold) over a
+recording adapter, for every XID class that compiles a workflow, both arrival
+orders, idle / uncovered / bound-attempt / unbound-attempt nodes, the second
+report arriving before any claim, in flight or after the first remediation
+finished; `tests/policy/test_xid_cross_source.py` pins the twin rule itself.
+The same replay on the batch-236 head is the reproduction: 131 of its 152
+cases fail there. No live case has exercised this path: live acceptance cannot
+move field 230 with a synthetic kernel line (the drills' synthetic NVRM lines
+never reached DCGM), and a real XID cannot be raised on demand. A live proof
+needs both reports synthesised on one node -- the kernel line through the
+GF-GENERAL-LIVE kmsg replay (`general_live_kernel_replay`) and the field-230
+line through its DCGM field replay (`tools/gpu_dcgm_field_replay.py`, which
+already serves `DCGM_FI_DEV_XID_ERRORS` to the PCIe composite variants); no
+such case exists yet.
+
+Not verified live, and stated from NVIDIA documentation or the code:
+
+- The semantics of field 230 are NVIDIA's documented ones -- DCGM Field
+  Identifiers, DCGM documentation "Version: 4.6 (Latest)",
+  <https://docs.nvidia.com/datacenter/dcgm/latest/dcgm-api/dcgm-api-field-ids.html#c.DCGM_FI_DEV_XID_ERROR>:
+  "XID errors." "The value is the specific XID error"; NVIDIA dcgm-exporter
+  4.8.4 default counters: "Value of the last XID error encountered." Whether the
+  pinned DCGM 4.6.1 host engine reports XID 154 -- and, on HGX B200/B300,
+  XIDs 144-150 -- in field 230 at all was not observed; the rule holds either
+  way (a change that never comes leaves the kernel line alone).
+- The 15-30 s lag of the change behind the kernel line is the exporter's 15 s
+  refresh plus the collector's 15 s scrape; the 120 s twin window carries the
+  rest. A kernel line delivered later than 120 s after its change (a collector
+  outage or backlog) meets a change of XID 154, 74 or 144-150 that has already
+  failed closed: the line keeps its own decision and the quarantine stands for
+  an operator (the documented residual, pinned by
+  `test_a_kernel_line_later_than_the_gauge_window_keeps_both_decisions`).
+- Two control-plane replicas deciding the two reports of one XID in the same
+  instant may each miss the other's incident and keep their own decisions, as
+  before batch 237; the replay runs one process.
+- The pairing reads the stored decisions of the same-XID reports around an
+  event; more than 16 such reports on one GPU (a storm) pair nothing, and each
+  report then plans as before batch 237.

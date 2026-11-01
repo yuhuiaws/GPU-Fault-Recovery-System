@@ -450,6 +450,8 @@ The SXID Catalog action mapping is as follows:
 
 A repeated request with the same `event_id` returns the existing decision. Cross-source correlation among Fabric Manager, kernel and DCGM requires the same node and error code, and requires an intersection when both sides carry GPU UUIDs or PCI BDFs. PCI BDFs compare as devices, not strings (`src/gpu_fault/pci_identity.py`, batch 236): the kernel NVRM line's `0000:b9:00`, the dcgm-exporter `pci_bus_id` and nvidia-smi's `00000000:B9:00.0` and the inventory collectors' lower-cased form are one device -- domain width and case do not matter, an absent domain or function matches any value; a spelling that is no address intersects only an identical string. The raw-string intersection used before never associated the kernel line and the DCGM field 230 report of one H200 XID.
 
+**One XID, two reports (`src/gpu_fault/policy/xid_cross_source.py`, batch 237).** The kernel NVRM line and the DCGM field 230 change of one XID are one occurrence, not two faults. Evidence: DCGM Field Identifiers, DCGM documentation "Version: 4.6 (Latest)", <https://docs.nvidia.com/datacenter/dcgm/latest/dcgm-api/dcgm-api-field-ids.html#c.DCGM_FI_DEV_XID_ERROR>, entry `DCGM_FI_DEV_XID_ERROR` 230 (the counters CSV writes the older name `DCGM_FI_DEV_XID_ERRORS`): "XID errors." "The value is the specific XID error"; NVIDIA dcgm-exporter 4.8.4 default counters <https://github.com/NVIDIA/dcgm-exporter/blob/4.8.4/etc/default-counters.csv>: "Value of the last XID error encountered." A change therefore reports one XID on one GPU and nothing more -- no time of its own beyond the sample, no count, no message. The kernel line and the change are twins when they carry the same XID on the same GPU (UUID, else the PCI device as above), from a compatible boot, within 120 s of each other. A twin pairs once: one change with one line and one line with one change (a report whose stored decision names its twin is taken), and more than 16 reports of one XID on one GPU around an event -- a storm -- pair nothing. A change with a free kernel twin takes the line's decode and joins its incident through `correlated_event_id`; a kernel line whose change was decided first and the same way (disposition, action, safety action, official action and pre-actions, compared after the generation fence and the site's XID 45 policy) joins the change's incident. Either way the second report is linked to the first one's incident as a duplicate observation and plans nothing, whatever that incident's workflow is doing -- pending, running, blocked or finished; a report joining a `RECOVERED` incident has its marker retired. Where the decode reads the kernel line (catalog actions `XID_154`, `WORKFLOW_NVLINK_ERR` and `WORKFLOW_NVLINK5_ERR`: the recovery-action label, the XID 74 and the XID 144-150 registers) a change without a twin waits up to 120 s for its line (`PENDING_CORRELATION`); a line lost for good leaves the change's fail-closed `BLOCKED_MISSING_EVIDENCE` once that window closes, and a line arriving after it keeps its own decision beside the quarantine. A repeated identical XID leaves the gauge unchanged and arrives as kernel lines only: a line beyond the window or past an already paired change is a new occurrence with its own recovery. Before batch 237 only an XID 144-150 change followed its kernel line (batch 235) and nothing else joined the pair; outside the store's merge groups (the node group of an idle node's `RESET_GPU`/`REBOOT_NODE`, the attempt group of a job bound to the faulted GPU) the second report ran its own remediation: on a node whose job the GPU could not be bound to, a second STOP_WORKLOADS + RESET_GPU or RESTART_NODE + RESTART_WORKLOAD behind the first, or both job workflows held against each other until the busy-node timeout stopped the job with no reset; once the first remediation had finished, any second report re-ran it; an XID 154 or 74 change quarantined the node the line's own decode had just repaired. Live acceptance cannot move field 230 with a synthetic kernel line, so this path is unit-tested only ([validation limitations](../validation-limitations.md)).
+
 At load time the NVLink catalog verifies that every pattern is 32 characters of `0/1/-` and that errorStatus is a
 hexadecimal list; a malformed catalog prevents the process from starting.
 
@@ -557,6 +559,7 @@ When XID 144-150 decodes to `XID_154_EVAL`, it waits for the window to close: if
 only if none exists is the Catalog fallback `RESTART_APP` executed. When the primary event arrives before XID 154,
 no wrong workflow is created early either; when the window closes, the primary is finalized first, then XID 154 is linked to the same
 incident, avoiding a double reset/reboot.
+DCGM field 230 reports an XID 154 without its label: the change waits for the kernel line and joins its incident (2.3), and only a line still missing when the change's 120 s window closes leaves it `BLOCKED_MISSING_EVIDENCE`.
 
 The production normalizer for XID 144-150 parses along the kernel message boundaries defined by the NVIDIA Catalog:
 it inspects only the parenthesized payload after the current XID number and before the next XID, and requires the parentheses to contain at least two
@@ -1283,9 +1286,9 @@ nodes should run the DCGM host engine 4.7.0 or later ([deployment manual](deploy
   XID 144-150 read from it alone is `BLOCKED_MISSING_EVIDENCE`, and before batch 235 it opened a second, BLOCKED incident beside
   the kernel-sourced one of the same fault (marker association alone never merges two executions). A gauge change whose kernel
   twin -- the same XID on the same GPU (UUID, else the PCI device in either spelling), read from the kernel log within 120 s --
-  is among the correlation candidates (`candidate_window` widens the read for such a gauge only) now takes the twin's decode
-  and joins its incident through `correlated_event_id`; without a twin it stays fail-closed BLOCKED. Every other XID and every
-  kernel-sourced event resolves as before.
+  is among the correlation candidates takes the twin's decode and joins its incident through `correlated_event_id`. Batch 237
+  made this the rule of every XID in both arrival orders (2.3): a change that arrives first waits up to 120 s for its line,
+  and without one it stays fail-closed BLOCKED.
 - **Fabric health (174/175, `gpu_fabric_health`).** The decode is NVML's layout, NVML API Reference (docs version 615), "Fabric
   Definitions" <https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlFabricDefs.html> ("Fabric Health Mask: Route is
   unhealthy.", "Fabric Health Mask: Bandwidth degraded.", "Fabric Health Summary: Unhealthy.", "Fabric Health Summary: Limited
@@ -2845,6 +2848,8 @@ normalized GPU UUID, PCI BDF, fabric partition, NVLink link, switch/port or devi
 (the decision is marked `duplicate`) only when the nodes intersect, the fault class is the same, the device identities intersect (PCI BDFs
 compare as devices, see 2.3) and the event falls within a 5-minute window; whether they share an execution is decided by
 workflow arbitration, and association alone never merges two executions.
+The one exception is the kernel line and the DCGM field 230 change of one XID (2.3, `policy/xid_cross_source`): they are one occurrence, so the second
+is linked to the first one's incident as a duplicate observation and plans nothing (batch 237).
 Same-source kernel events can still use the monotonic timestamp within the same boot, unaffected by wall-clock skew.
 Different fault domains such as EFA and NVSwitch/SXID are never merged even when the PCI or node is the same.
 
