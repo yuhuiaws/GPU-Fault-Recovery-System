@@ -87,7 +87,13 @@ def test_entire_suite_collects_without_optional_postgres_drivers(tmp_path):
         "the whole-tree probe must never execute tests or native fixtures"
     )
     # This existing module parameterizes real psycopg exception classes at import.
-    optional_skips = {"tests/store/test_store_error_classification.py"}
+    optional_skips = {
+        "tests/store/test_store_error_classification.py",
+        # Both build or patch the real driver objects (psycopg_pool.PoolTimeout, psycopg.connect): batch 234
+        # start-up store wait and batch 237 cross-source correlation audit.
+        "tests/app/test_startup_store_wait.py",
+        "tests/regional/test_audit_cross_source_correlation_harness.py",
+    }
     assert set(blocked["skips"]) - set(available["skips"]) <= optional_skips, (
         "a new module-level skip must not hide an optional import regression"
     )

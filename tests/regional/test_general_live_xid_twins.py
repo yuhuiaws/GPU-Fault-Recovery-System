@@ -17,6 +17,7 @@ defers.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -143,6 +144,9 @@ sys.meta_path.insert(0, _Before237())
 """
 
 
+TREE = Path(__file__).resolve().parents[2]
+
+
 def _answer(xid: int, tail: str, *, prefix: str = "", script: str = "") -> Any:
     out = subprocess.run(
         [
@@ -156,6 +160,19 @@ def _answer(xid: int, tail: str, *, prefix: str = "", script: str = "") -> Any:
         text=True,
         timeout=240,
         check=True,
+        cwd=TREE,
+        # The child imports this tree's gpu_fault, never the interpreter's installed one (the release gate runs the
+        # suite with the deployer venv, whose installed product is the previous release).
+        env={
+            **os.environ,
+            "PYTHONPATH": os.pathsep.join(
+                [
+                    str(TREE / "src"),
+                    str(TREE),
+                    *filter(None, [os.environ.get("PYTHONPATH")]),
+                ]
+            ),
+        },
     )
     return json.loads(out.stdout.strip().splitlines()[-1])
 

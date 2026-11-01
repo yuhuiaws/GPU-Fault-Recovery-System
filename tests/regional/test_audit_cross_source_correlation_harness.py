@@ -16,8 +16,11 @@ from contextlib import contextmanager
 
 import pytest
 
-from gpu_fault.store import InMemoryStore
-from scripts.e2e.regional import audit_cross_source_correlation_postgres as audit
+# The audit script imports the optional Postgres driver at module level, and this test patches its connect.
+pytest.importorskip("psycopg")
+
+from gpu_fault.store import InMemoryStore  # noqa: E402
+from scripts.e2e.regional import audit_cross_source_correlation_postgres as audit  # noqa: E402
 
 
 class _ClosableStore(InMemoryStore):
