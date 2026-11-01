@@ -720,12 +720,12 @@ class IncidentOrchestrator:
             )
             if companion is not None:
                 return companion
-            covered = cover_fault(
-                self.store, event, decision, self._independent_incident
-            )
+            # A stale-boot record is the event's own incident, never the one its
+            # marker was associated with (b236); the association is a reason.
+            own = execution_decision(event, decision, None)
+            covered = cover_fault(self.store, event, own, self._independent_incident)
             if covered is not None:
                 return covered
-
             # Marker association is evidence; store groups arbitrate atomically.
             decision = execution_decision(event, decision, existing)
 
