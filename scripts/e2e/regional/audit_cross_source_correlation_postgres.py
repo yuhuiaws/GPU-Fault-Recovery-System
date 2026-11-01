@@ -140,7 +140,9 @@ def main() -> None:
             driver_branch=575,
             cuda_version="12.9",
         )
-        correlated = orchestrator.correlate_provider_event(policy.evaluate_xid(xid))
+        correlated = orchestrator.correlate_provider_event(
+            policy.evaluate_xid(xid), cluster_id=xid.cluster_id
+        )
         assert correlated.duplicate
         assert correlated.marker.incident_id == memory.marker().incident_id
 
@@ -181,7 +183,7 @@ def main() -> None:
             participating_gpu_uuids=["GPU-audit-a"],
         )
         not_correlated = orchestrator.correlate_provider_event(
-            policy.evaluate_sxid(sxid)
+            policy.evaluate_sxid(sxid), cluster_id=sxid.cluster_id
         )
         assert not not_correlated.duplicate
         assert not_correlated.marker.incident_id != efa.marker().incident_id
