@@ -273,9 +273,14 @@ Preliminary gates: GPU is of the B100/GB200 family → NOT_APPLICABLE + QUARANTI
 - While a node is inside a reboot window initiated by the product itself (a `RESTART_NODE`/`REPLACE_NODE` step has been dispatched and the subsequent
   `RESTORE_SCHEDULING` has not yet completed), kmsg XID/SXID and node-health markers on that node no longer open a new incident
   but are linked as evidence to the incident that owns the reboot; kmsg events carrying the old boot_id (the agent already heartbeats with the new boot) are treated as
-  pre-reboot residue, land as RECOVERED and produce no workflow. The rules are in `orchestration/reboot_window.py`.
+  pre-reboot residue, land as RECOVERED and produce no workflow (a `NOT_APPLICABLE` one still gets its notice, which says
+  nothing is planned, batch 238). The rules are in `orchestration/reboot_window.py`.
+- An event older than the attempt now running on the node, with no recovery workflow for that attempt (batch 238): only a
+  recovery decision (`EXECUTABLE`, not above `RESTART_WORKLOAD`) is recorded as an ignored RECOVERED incident, the attempt
+  restart having answered it; the NOT_APPLICABLE, SITE_SAFETY and BLOCKED rows keep their quarantine or evidence freeze,
+  exactly as for the same event inside the current attempt.
 - The kernel NVRM line and the DCGM field 230 (`DCGM_FI_DEV_XID_ERRORS`) change of one XID are one occurrence (batch 237,
   `policy/xid_cross_source.py`): the second report -- a change within 120 s of its kernel line on the same GPU, or a line that
   meets a change already decided the same way -- is linked to the first one's incident as evidence and executes nothing, so
-  every row's actual execution happens once per occurrence, not once per report. A change of XID 154, 74 or 144-150, whose
+  every row's actual execution happens once per occurrence, not once per report, and so does its FAULT_DETECTED notice (batch 238). A change of XID 154, 74 or 144-150, whose
   decode reads the kernel line, waits up to 120 s for it and stays BLOCKED + `QUARANTINE` only when the line never comes.

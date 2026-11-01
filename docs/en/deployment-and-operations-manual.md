@@ -8689,7 +8689,8 @@ no adapter is called, and the details of the corresponding step carry `notificat
 the workflow goes straight to `FAILED`, the incident to `ESCALATED`, surfacing only via the workflow ESCALATED alert
 (`GpuFaultIncidentsAwaitingOperator`). `NOT_APPLICABLE` notifications use the fixed
 `xid-not-applicable-zh-v2` template, filling only the XID event, policy decision, isolation workflow and evidence fields,
-without generating administrator advice. Event ingestion only writes idempotently into the Aurora notification outbox; the standalone
+without generating administrator advice; a recorded incident without a workflow (for example a kernel line of a boot the
+node has left) gets the same notice with Workflow, Workflow status and Safety action `NONE` and the incident's own reason. Event ingestion only writes idempotently into the Aurora notification outbox; the standalone
 dispatcher calls SNS (or SES) after claiming with owner, epoch and lease. Send failures are retried with exponential backoff
 and do not change the result of event handling, GPU reset or workload restart. A notification result of `FAILED` is a terminal
 semantic: written only when `GPU_FAULT_NOTIFICATION_MAX_ATTEMPTS` is exhausted or an inline send fails; deliveries under retry
@@ -8702,7 +8703,12 @@ product, Immediate Action, Effective Action, NVIDIA Investigatory Action, workfl
 and evidence fields; the system does not execute the Investigatory Action automatically, and the administrator decides whether to investigate.
 When the Catalog defines no Investigatory Action the field is `NONE`. Events in the companion correlation
 window are sent after the decision completes. The deduplication key is composed of the Event ID and the template version, so a re-submission of the same event does not send
-twice. `NOT_APPLICABLE` includes the field in its original notification without sending a second investigation email; a HyperPod
+twice. The second report of one XID occurrence -- the kernel NVRM line and the DCGM field 230 change of the same XID on the
+same GPU within 120 s (`policy/xid_cross_source`) -- uses the first report's Event ID in that key, so it folds into the
+first report's notification: one FAULT_DETECTED mail per occurrence, and the second report's
+`investigatory_notification_id` names that notification. A companion of another XID, a repeat of the same XID after the
+120 s window and a later escalation each notify on their own. The mail names the first report only; the second source is
+recorded on the incident (its event link and its marker's evidence reference). `NOT_APPLICABLE` includes the field in its original notification without sending a second investigation email; a HyperPod
 managed advisory and the per-XID investigation notification serve different purposes and may each produce one email.
 
 Every SXID that completes a policy decision generates and queues the fixed

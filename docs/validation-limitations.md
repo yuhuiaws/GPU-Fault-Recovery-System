@@ -5897,3 +5897,52 @@ Not verified live, and stated from NVIDIA documentation or the code:
 - The pairing reads the stored decisions of the same-XID reports around an
   event; more than 16 such reports on one GPU (a storm) pair nothing, and each
   report then plans as before batch 237.
+
+## Stale containment XIDs and the twin's single notice (batch 238)
+
+Both changes are proven by in-process replays through the collector routes
+only.
+
+- `tests/orchestration/test_stale_containment_xid.py` posts a kernel line 20 s
+  older than the attempt now running on its GPU (no recovery workflow for that
+  attempt) through the kernel-event route, and the same decision reported by
+  DCGM field 230 through the GPU-metrics route on a SQLite store. Each
+  containment or operator decision -- NOT_APPLICABLE (H200 XID 159),
+  SITE_SAFETY (an XID outside the catalog), BLOCKED_WORKFLOW (XID 151),
+  BLOCKED_MISSING_EVIDENCE (XID 74 without registers, XID 154 without a label)
+  -- must get the plan the same line gets inside the attempt, and the
+  dispatcher must run the quarantine once; a stale RESTART_APP (XID 13) stays
+  recorded as ignored with no live marker; a NOT_APPLICABLE line of a boot the
+  node has left, and its redelivery, are answered 200 with a notice that says
+  nothing is planned. 9 of the file's 12 tests fail on the batch-237 head (the
+  409, the dropped quarantines, the live marker).
+- `tests/orchestration/test_xid_twin_notification.py` replays both reports of
+  one XID (XID 48, 79, 13 and the XID 154 change that waits for its line, both
+  arrival orders, in flight and after the first remediation): one
+  FAULT_DETECTED notice per occurrence; a companion XID, a later escalation and
+  a repeat after the twin window each keep their own. 13 of its 16 tests fail on
+  the batch-237 head.
+
+Not verified live:
+
+- No acceptance case writes a kernel line older than the attempt running on its
+  GPU, or replays a previous boot's outbox record after a reboot, so neither
+  path has run on the site. A live proof needs the GF-GENERAL-LIVE kmsg replay
+  to write an XID line whose kernel time precedes the start of a managed
+  attempt on that GPU, or a buffered record carried across a reboot.
+- Field 230 cannot be moved by a synthetic kernel line (batch 237), so the
+  single notice of a twin pair is unit-tested only.
+- How the old 409 reached the node was read from the collector and processor
+  code and replayed against a loopback server (a real `KernelLogCollector` and
+  `HttpEventSink`) and the processor's replay booking, not observed on the
+  site: in direct mode the record is dead-lettered in the collector outbox
+  (`replayable=false`, never replayed, the next record goes out at once) and
+  `delivery-failures:N` stays in every later health summary until the collector
+  restarts; in active-active mode the node sees the 202 and the processor
+  completes the row with the 409, counts
+  `gpu_fault_processor_fault_rejections_total` and books a `rejected-event:`
+  kernel collector status.
+- On H200 the product gate answers NOT_APPLICABLE for 94 of the 172 catalog XIDs
+  (the legacy XIDs that list no product, and the B100/GB200-only ones such as
+  159), and for every XID of a record without a GPU product and without a fresh
+  inventory to stand in; which of them a live H200 node emits was not observed.
