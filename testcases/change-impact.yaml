@@ -495,6 +495,9 @@ rules:
       - tests/regional/test_destr010_fabric_reset_shape.py
       - tests/regional/test_destr019_fabric_reset_shape.py
       - tests/regional/test_xid45_opt_in_window.py
+      # GL-024.independent_xid judged on the product's own records (S61): a
+      # correlation change must keep the XID's own incident and execution.
+      - tests/regional/test_general_live_independent_xid_product.py
       # A dispatched QUIESCE commits its window (orchestration/reset_window.py):
       # the compound command minted with it and the Agent's window per GPU set
       # are what the merge rule protects (batch 136).
@@ -902,6 +905,8 @@ rules:
       - tests/app_services/test_kernel_gauge_pci_spellings.py
       - tests/metrics/test_xid_owner_pci_identity.py
       - tests/orchestration/test_xid_cross_source_dedupe.py
+      # A marker association is bookkeeping, not absorption (S61).
+      - tests/regional/test_general_live_independent_xid_product.py
     regional_cases:
       - GF-REGIONAL-COLLECT-001..020
     checks:
