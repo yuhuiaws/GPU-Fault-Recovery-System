@@ -73,6 +73,8 @@ from gpu_fault_release.regional_release_progress import (
 from gpu_fault_release.regional_release_progress import (
     build_rollback_compensation_plan,
 )
+from gpu_fault_release.regional_release_eks_support import FIELD as EKS_SUPPORT
+from gpu_fault_release.regional_release_eks_support import eks_support_lines
 from gpu_fault_release.regional_release_replica_failure import replica_failure_line
 from gpu_fault_release.regional_release_reporting import build_release_status
 from gpu_fault_release.regional_release_transaction import commit_live_release
@@ -1231,7 +1233,10 @@ def automatic_update_lines(health: object) -> list[str]:
     group, with what one window does to the control plane), then per GPU
     cluster a scheduled or auto-patched HyperPod instance group, a set
     ``MaxInstanceLifetime``, a site NodePool that expires or has no zero
-    budget. Lines only -- the check's status and ``healthy`` are untouched."""
+    budget; last every site EKS cluster within 90 days of the end of its
+    version's support, when AWS upgrades its control plane by itself
+    (``eks_support``). Lines only -- the check's status and ``healthy`` are
+    untouched."""
 
     checks = health.get("checks") if isinstance(health, dict) else None
     for check in checks if isinstance(checks, list) else []:
@@ -1256,6 +1261,7 @@ def automatic_update_lines(health: object) -> list[str]:
                     str(cluster_id), entry.get(AUTOMATIC_NODE_UPDATES)
                 )
             ),
+            *eks_support_lines(details.get(EKS_SUPPORT)),
         ]
     return []
 

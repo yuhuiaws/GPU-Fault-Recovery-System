@@ -43,6 +43,10 @@ from gpu_fault_release.regional_release_config import (
     ClusterTarget,
     ReleaseError,
 )
+from gpu_fault_release.regional_release_eks_support import (
+    FIELD as EKS_SUPPORT,
+    read_eks_support,
+)
 from gpu_fault_release.regional_release_state import aws_json
 
 
@@ -568,7 +572,8 @@ def ensure_region_contexts(release: RegionalRelease) -> dict[str, Any]:
     """Validate every context; return what the ``regional_contexts`` check records
     (the cluster ids and, per eks-managed cluster, its node groups' facts; per
     GPU cluster and for the CPU control-plane cluster, ``control_plane``, the
-    ``automatic_node_updates`` advisory block)."""
+    ``automatic_node_updates`` advisory block; ``eks_support``, every site EKS
+    cluster's version and its support end date)."""
 
     config = release.config
     runner = release.runner
@@ -593,11 +598,18 @@ def ensure_region_contexts(release: RegionalRelease) -> dict[str, Any]:
         "hyperpod_cluster_name": config.cpu_hyperpod_cluster_name,
     }
 
+    eks_support: dict[str, Any] = {}
+
     def control_plane_advisory() -> None:
         # Advisory only, after the CPU gates above; never a failure of the check.
         control_plane[AUTOMATIC_NODE_UPDATES] = guarded(
             lambda: control_plane_automatic_updates(release, cpu_groups)
         )
+
+    def eks_support_advisory() -> None:
+        # Advisory only (regional_release_eks_support): AWS upgrades a control
+        # plane by itself once its version's support ends.
+        eks_support.update(guarded(lambda: read_eks_support(release)))
 
     def validate_cluster(target: ClusterTarget) -> None:
         gpu_eks_arn = _context_eks_arn(
@@ -656,22 +668,28 @@ def ensure_region_contexts(release: RegionalRelease) -> dict[str, Any]:
     facts = {
         "clusters": [item.cluster_id for item in config.clusters],
         CONTROL_PLANE: control_plane,
+        EKS_SUPPORT: eks_support,
     }
     if not config.clusters:
         control_plane_advisory()
+        eks_support_advisory()
         return facts
     # The CPU checks above gate everything, so they stay ahead of this; the
     # clusters themselves are independent, and each one is a handful of reads
     # against a different API server plus a whole IAM role expansion. Every
     # future is resolved in configuration order, so a fleet where two clusters
     # are both wrong reports the same one every time instead of whichever
-    # thread lost the race. The control plane's advisory reads run beside them.
-    with ThreadPoolExecutor(max_workers=min(8, len(config.clusters) + 1)) as executor:
-        advisory = executor.submit(control_plane_advisory)
+    # thread lost the race. The advisory reads run beside them.
+    with ThreadPoolExecutor(max_workers=min(8, len(config.clusters) + 2)) as executor:
+        advisories = [
+            executor.submit(control_plane_advisory),
+            executor.submit(eks_support_advisory),
+        ]
         futures = [
             executor.submit(validate_cluster, target) for target in config.clusters
         ]
     for future in futures:
         future.result()
-    advisory.result()
+    for advisory in advisories:
+        advisory.result()
     return {**facts, "providers": providers}

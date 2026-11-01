@@ -223,7 +223,7 @@ def test_a_site_without_gpu_clusters_still_records_the_control_plane() -> None:
 
     facts = _facts(runner, clusters=())
 
-    assert sorted(facts) == ["clusters", CONTROL_PLANE]
+    assert sorted(facts) == ["clusters", CONTROL_PLANE, "eks_support"]
     assert facts[CONTROL_PLANE][FIELD]["instance_groups"][0]["name"] == CPU_GROUP
 
 

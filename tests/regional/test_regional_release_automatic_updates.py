@@ -35,6 +35,18 @@ EKS_ARN = f"arn:aws:eks:{REGION}:{ACCOUNT}:cluster/gpu-eks-cluster"
 SPOT_ASG = "eks-gpu-p5en-efa-spot-node-group-0011aabb"
 SCHEDULE = "cron(0 12 ? * SUN *)"
 NOT_SERVED = 'error: the server doesn\'t have a resource type "nodepools"'
+#: describe-cluster-versions' dates as the CLI prints them (AWS publishes them
+#: in Pacific time): 1.31's extended support ends 2026-11-26 UTC.
+EKS_SUPPORT_DATES = {
+    "1.31": {
+        "endOfStandardSupportDate": "2025-11-25T16:00:00-08:00",
+        "endOfExtendedSupportDate": "2026-11-25T16:00:00-08:00",
+    },
+    "1.33": {
+        "endOfStandardSupportDate": "2026-07-28T17:00:00-07:00",
+        "endOfExtendedSupportDate": "2027-07-28T17:00:00-07:00",
+    },
+}
 
 
 def _target(cluster_id: str, **fields: Any) -> ClusterTarget:
@@ -138,6 +150,8 @@ class ContextsRunner:
         nodepool_error: str | None = None,
         cpu_groups: list[dict[str, Any]] | None = None,
         cpu_nodegroups: tuple[str, ...] = (),
+        eks_versions: dict[str, str] | None = None,
+        deny_versions: bool = False,
     ) -> None:
         self.asgs = asgs if asgs is not None else []
         self.deny_asg = deny_asg
@@ -147,6 +161,10 @@ class ContextsRunner:
         # node groups (none by default, as live).
         self.cpu_groups = cpu_groups
         self.cpu_nodegroups = cpu_nodegroups
+        # Every site EKS cluster's Kubernetes version (1.33 unless named) and
+        # whether describe-cluster-versions is denied.
+        self.eks_versions = eks_versions or {}
+        self.deny_versions = deny_versions
         self.calls: list[list[str]] = []
 
     @staticmethod
@@ -186,7 +204,35 @@ class ContextsRunner:
             name = args[args.index("--cluster-name") + 1]
             return self._answer(args, _describe_cluster(name, self.cpu_groups))
         if args[:3] == ["aws", "eks", "describe-cluster"]:
-            return self._answer(args, {"cluster": {"arn": EKS_ARN, "status": "ACTIVE"}})
+            name = args[args.index("--name") + 1]
+            return self._answer(
+                args,
+                {
+                    "cluster": {
+                        "arn": EKS_ARN,
+                        "status": "ACTIVE",
+                        "version": self.eks_versions.get(name, "1.33"),
+                        "upgradePolicy": {"supportType": "EXTENDED"},
+                    }
+                },
+            )
+        if args[:3] == ["aws", "eks", "describe-cluster-versions"]:
+            if self.deny_versions:
+                raise ReleaseError(
+                    "aws eks describe-cluster-versions exited 254: AccessDeniedException: "
+                    "not authorized to perform: eks:DescribeClusterVersions"
+                )
+            wanted = args[args.index("--cluster-versions") + 1 :]
+            wanted = wanted[: wanted.index("--include-all")]
+            return self._answer(
+                args,
+                {
+                    "clusterVersions": [
+                        {"clusterVersion": version, **EKS_SUPPORT_DATES[version]}
+                        for version in wanted
+                    ]
+                },
+            )
         cpu = (
             "--cluster-name" in args and args[args.index("--cluster-name") + 1] == "cpu"
         )
