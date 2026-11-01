@@ -24,7 +24,7 @@ from gpu_fault.fabric_scope import (
     validate_task_fabric,
     validation_evidence,
 )
-from gpu_fault.gpu_fabric_manager import fabric_validation
+from gpu_fault.gpu_fabric_health import fabric_validation
 from gpu_fault.gpu_fabric_window import fabric_state_loss
 from gpu_fault.gpu_field_rules import (
     HW_POWER_BRAKE_SLOWDOWN,

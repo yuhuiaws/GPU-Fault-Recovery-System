@@ -1065,9 +1065,8 @@ values and assert only fail-closed or no-op behaviour. On Grace platforms with
 NVLink-C2C (GB200/GB300) nvidia-smi warns that "PCIe metrics here may not be
 representative of the primary data path bandwidth"; the downtrain and
 correctable-error rules grade the PCIe link as reported there, unverified.
-The Blackwell-only fields (NVLink5 counters 1200-1219/1404-1419, NVLink ECC
-1220, fabric health 174/175 on NVLink5 systems, unrepairable memory 1507) are
-not part of batch 233.
+The Blackwell fields (the NVLink5 counters, NVLink ECC 1220, fabric health
+174/175, unrepairable memory 1507) are batch 235's (next section).
 
 Recovery action 1523: values 6 (BUS_RESET) and 7 (SYSTEM_REBOOT) come from NVML
 v615 (numbers from `nvidia-ml-py` 13.615.71). NVIDIA documents only their
@@ -1120,7 +1119,8 @@ of the five through the cumulative perf-policy fields), not a live observation
 (0 on every idle H200). The grading fails safe on a per-interval reading: a
 decrease grades nothing, a duty above 105 % grades nothing.
 
-Not added: 174/175 (NOT_SUPPORTED on H200 with driver 580, live 0/0, XML N/A);
+Not added in batch 233: 174/175 (NOT_SUPPORTED on H200 with driver 580, live
+0/0, XML N/A; graded since batch 235 for the parts that report them);
 1508 (per-link NVLink state, served live 18/18 ACTIVE) is deferred until a
 staging check of the exporter's link-entity emission and the parser keys, and
 costs 144 series per node; 158 repeats the T.Limit critical boundary; profiling
@@ -1128,6 +1128,85 @@ fields conflict with Nsight Systems/Compute (DCGM Feature Overview, docs 4.6);
 NVSwitch-entity fields are covered in more detail by the SXID lines. Every
 batch-233 field is read in the DCGM exporter mode only; the nvidia-smi metrics
 mode carries none of them.
+
+## Blackwell (HGX B200/B300) DCGM fields (batch 235)
+
+Everything in this section is unit-tested from NVIDIA documentation, not
+live-verified (no B-series hardware): the site has no p6-b200.48xlarge or
+p6-b300.48xlarge node, and the product has never observed a B200 or B300 GPU,
+an NVLink5 counter, the NVSDM backend or a supported fabric-health mask.
+
+NVML does not report the NVLink data-link counters the product requires on
+Hopper (DCGM fields 497-499) on Blackwell: NVML API Reference, docs version
+615, "Field Value Enums", NVML_FI_DEV_NVLINK_ERROR_DL_CRC: "This is
+unsupported for Blackwell+ Please use NVML_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_*".
+A B-series GPU therefore satisfies the NVLink completeness groups with an
+NVLink5 link-recovery counter (fields 1211-1213) instead. That substitution,
+the grading of the NVLink5 counters (1204-1209, 1211-1214, 1219, 1220), the
+fabric health mask and summary (174/175), the unrepairable-memory flag (1507,
+driver R590 or later, and the nvidia-smi `<unrepairable_memory>` tag), the
+repair-pending flags read from nvidia-smi, the join of an XID 144-150 read
+from DCGM field 230 into the kernel-sourced incident, and the Blackwell
+handling of fields 1523, 235-238, 346, 388/389 and 1501 run in unit tests on
+values taken from the NVML API Reference (615), DCGM Field Identifiers (4.6),
+the DCGM v4.7.0 source, the NVIDIA GPU Memory Error Management guide (615) and
+the NVIDIA Fabric Manager User Guide.
+
+Where NVIDIA documents no value, the tests use labelled synthetic values and
+assert only fail-closed or no-op behaviour. This covers: the XID 154 label and
+the nvidia-smi text for recovery actions 5-7; the values the repair-pending and
+fabric-health XML tags take on a B-series part (the tag names are the live H200
+R580 output, where every repair flag reads `No` and every fabric-health
+sub-tag `N/A`); the healthy-link baseline of every NVLink5 counter (NVIDIA's
+"(should be 0)"; should a healthy B-series node show these counters moving,
+the rules must move to rates); whether HGX B200/B300 report the fabric health
+mask and field 1220 at all; the GPU PCIe generation and width on p6-b200 and
+p6-b300 (Gen6 on B300 is documented only for DGX B300 and on the AWS P6 page);
+whether NVLink5 counters restart after a GPU reset; how long an NVL5 Fabric
+Manager takes to settle the fabric health after a restart; and which recovery
+action accompanies a channel repair.
+
+What landed, and its limits:
+
+- NVLink5 counters grade on the increment between two accepted samples, never
+  on the reading: a counter that already carries a count when the collector
+  starts is a baseline, and a decrease (a link that left the active set lowers
+  the aggregate) re-baselines it. An increment whose interval overlaps a
+  product quiesce, reset, reboot or Fabric Manager/NVLSM window grades
+  nothing; the window is read from the node's workflows (step start to end plus
+  60 s), so a window run by hand outside the product is not seen. While an XID
+  144-150/155 event (within 120 s) or open incident owns the GPU the finding is
+  evidence only. 1212 drains; the field diagnostic it names stays the
+  operator's.
+- The field-230 join needs the kernel line within 120 s of the gauge change
+  and the same GPU (UUID, else the PCI device). A gauge change whose kernel
+  line was lost keeps its own BLOCKED_MISSING_EVIDENCE incident (fail closed).
+- Fabric health is confirmed by the collector's clock (held 60 s, recovery
+  300 s), which restarts with the collector; the control plane also refuses a
+  confirmation whose period a product window touched. Graded only on the
+  NVSwitch parts the Fabric Manager state is graded on. The XML sub-tags are
+  evidence and VALIDATE_GPU text only; when DCGM serves no 175 the validation
+  does not judge the summary.
+- Memory repair: the flags are read once per inventory interval (60 s) in the
+  DCGM exporter mode only (the nvidia-smi metrics mode reads none), so a flag
+  can lag by one interval; the advisory clears only with the reboot that
+  applies the repair. An XID 160/161 is named as evidence from the node's 50
+  newest incidents.
+
+Not covered on B200/B300: NVSwitch errors. NVIDIA reports no SXIDs there
+(Fabric Manager User Guide: "The NVSwitch Driver SXid fatal and non-fatal based
+error reporting does not apply on DGX B200/B300 and NVIDIA HGX B200/B300
+systems."), and DCGM reads the switches only through the NVSDM library, which
+the node images do not install and the product does not scrape (784/785/864/870/858 are
+deferred; 864, reset required, comes first when NVSDM lands). Per-link NVLink
+fields (1508, the per-link NVLink5 counters, the PRM counters 580-592 from
+driver R595) are not collected: the exporter's link entities would break the
+parser's device keys and the per-GPU completeness check, they cost 144 series
+per field per node, and live per-link values need DCGM 4.7.0 (the plain EKS
+pin is 4.6.1). The ConnectX bridge fields (1300/1307/1309) are deferred: they
+need NVSDM and the exporter's ConnectX entities. BER (1215-1218) and the FEC
+history (1404-1419) are not graded (DCGM 4.7.0 removed its BER thresholds). B-series
+nodes should run the DCGM host engine 4.7.0 or later (deployment manual).
 
 ## GF-GENERAL-LIVE live acceptance runner (phase 1)
 

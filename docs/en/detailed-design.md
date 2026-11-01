@@ -1180,17 +1180,185 @@ one cordons first (FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → ESCALATE_SUPPORT).
   "The board limit (operating) policy is currently limiting the GPU clocks." and `nvmlClocksEventReasonReliability` "The
   reliability policy is currently limiting the GPU clocks." (values 0x200 and 0x400 from `nvidia-ml-py` 13.615.71); an unknown
   bit neither grades nor hides the bits the product names.
-- **Not added.** 174/175 (NVLink fabric health) are NOT_SUPPORTED on H200 with driver 580 (live 0/0, XML N/A); 1508 (per-link
+- **Not added.** 174/175 (NVLink fabric health) are NOT_SUPPORTED on H200 with driver 580 (live 0/0, XML N/A) and graded since
+  batch 235 for the NVL5 parts that report them (below); 1508 (per-link
   NVLink state) is served live (18/18 ACTIVE) but the exporter's link-entity emission and the parser keys need a staging check
   and it costs 144 series per node, so it is deferred; 158 is the T.Limit critical boundary again (live 87 − (−2) = 89, b232);
   profiling fields stay out ("collection of profiling metrics with DCGM will conflict with usage of other developer tools from
   NVIDIA such as Nsight Systems or Nsight Compute", DCGM Feature Overview, docs 4.6); NVSwitch-entity fields stay out because
-  the SXID lines carry the same faults in more detail. Blackwell-only fields (NVLink5 counters 1200-1219/1404-1419, NVLink ECC
-  1220, 174/175 on NVLink5 systems, unrepairable memory 1507) are classified separately; adding one is a CSV row, a
+  the SXID lines carry the same faults in more detail. The Blackwell fields (the NVLink5 counters, NVLink ECC 1220, 174/175,
+  unrepairable memory 1507) are batch 235's (below); adding a field is a CSV row, a
   `DCGM_METRICS` entry, a branch of `gpu_field_rules.field_rule_decision` (or the policy module it names) and a pin row.
   Tests: `tests/metrics/test_dcgm_gap_field_rules.py`, `tests/collectors/test_dcgm_gap_field_edges.py`,
   `tests/orchestration/test_dcgm_gap_field_plans.py`, `tests/execution/test_validation_gpu_recovery_action.py`,
   `tests/regional/test_dataplane_dcgm_counters.py`, and the evidence pins in `tests/test_dcgm_gap_field_evidence.py`.
+
+**HGX B200/B300 DCGM fields (batch 235; `src/gpu_fault/gpu_nvlink5_policy.py`, `src/gpu_fault/gpu_fabric_health.py`,
+`src/gpu_fault/gpu_memory_repair_policy.py`).** The 2026-11-01 Blackwell field audit re-judged every DCGM field for HGX
+B200/B300 (`p6-b200.48xlarge`, `p6-b300.48xlarge`; driver R580, DCGM 4.7.0) and found a blocker: NVML does not report the
+NVLink data-link counters on Blackwell, so a B-series node could never satisfy the required NVLink fields -- a permanent
+`dcgm_field_completeness` finding, `RUN_DIAGNOSTICS` after 180 s, every VALIDATE_GPU refused on `active_gpu_health_findings`,
+VALIDATE_FABRIC waiting for `missing_fabric_metric_groups` until its cap, and the legacy deploy's endpoint probe calling the
+exporter incompatible. The fields below are now in `deploy/dataplane/dcgm-counters.csv` (the DCGM 4.5.3 names that go-dcgm
+`v1.4611.2` resolves through its legacy map; field 175 has only its DCGM 4.6 name) and in `DCGM_METRICS` under both names;
+each is exported and never required. A Hopper part reports none of the NVLink5 fields, and the live H200 reads 0/0
+(NOT_SUPPORTED) for 174/175 and `No` for the repair flags, so an H200 node grades exactly as before. **Blackwell (B200/B300):
+every rule in this subsection is unit-tested from NVIDIA documentation, not live-verified (no B-series hardware).** B-series
+nodes should run the DCGM host engine 4.7.0 or later ([deployment manual](deployment-and-operations-manual.md)).
+
+| DCGM field (CSV name) | Canonical | Delivery | Decision |
+|---|---|---|---|
+| 1211/1212/1213 `DCGM_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_SUCCESSFUL_EVENTS`/`_FAILED_EVENTS`/`DCGM_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_EVENTS` | `nvlink_link_recovery_successful_total`, `nvlink_link_recovery_failed_total`, `nvlink_link_recovery_total` | counters | each is an alternative of every NVLink completeness group (`nvlink_crc`, `nvlink_recovery`, `nvlink_replay`) and of every NVLink group of the deploy probe's expression; 1212 increment ≥ 1 → CRITICAL `DRAIN`, official `RUN_FIELD_DIAGNOSTIC` (`NVIDIA_DCGM_HEALTH`); 1211/1213 → the NVLink family rule (WARNING `RUN_DIAGNOSTICS`) |
+| 1204-1209, 1214, 1219, 1220 (`DCGM_FI_DEV_NVLINK_COUNT_RX_MALFORMED_PACKET_ERRORS` ... `DCGM_FI_DEV_NVLINK_COUNT_EFFECTIVE_ERRORS`, `DCGM_FI_DEV_NVLINK_ECC_DATA_ERROR_COUNT_TOTAL`) | `nvlink_rx_malformed_packet_error_total`, `nvlink_rx_buffer_overrun_error_total`, `nvlink_rx_packet_error_total`, `nvlink_rx_remote_error_total`, `nvlink_rx_general_error_total`, `nvlink_local_link_integrity_error_total`, `nvlink_rx_symbol_error_total`, `nvlink_effective_error_total`, `nvlink_ecc_data_error_total` | counters | the NVLink family rule (`GpuMetricsService._link_decision`): increment ≥ `nvlink_error_delta_critical` (default 1) → WARNING `RUN_DIAGNOSTICS` |
+| 174 `DCGM_FI_DEV_FABRIC_HEALTH_MASK`, 175 `DCGM_FI_DEV_FABRIC_HEALTH_SUMMARY` | `fabric_health_mask`, `fabric_health_summary`; the collector's `fabric_health_held_seconds`; node finding `fabric_health` | state edge `fabric-health-changed`; a fault state held long enough to grade CRITICAL is a breached state | NOT_SUPPORTED → nothing; UNHEALTHY held ≥ 60 s outside product fabric windows → CRITICAL `RESET_GPU`, official `RESET_ALL_GPUS_AND_NVSWITCHES`; recovery in progress → evidence, CRITICAL once held 300 s; degraded bandwidth or LIMITED_CAPACITY → WARNING `RUN_DIAGNOSTICS` plus an operator notice |
+| — (nvidia-smi XML `<fabric><health>` sub-tags) | `fabric_health_xml` | state edge `fabric-health-changed` | evidence in the `fabric_health` reason and in VALIDATE_GPU's failure text; never a grade |
+| — (nvidia-smi XML `<channel_repair_pending>`, `<tpc_repair_pending>`) | `memory_channel_repair_pending`, `memory_tpc_repair_pending` | state edge `memory-repair-changed` | 1 with field 1523 None or not reported → WARNING `ESCALATE_OPERATOR`, official `REBOOT_IN_SERVICE_WINDOW`, a persistent advisory; 1 with 1523 not None → evidence only, the 1523 rule decides |
+| 1507 `DCGM_FI_DEV_MEMORY_UNREPAIRABLE_FLAG`; nvidia-smi XML `<unrepairable_memory>` | `memory_unrepairable` (one sample per GPU, the higher of the two readings) | state edge `memory-repair-changed`; a breached state | 1 → CRITICAL `DRAIN`, official `RUN_FIELD_DIAGNOSTIC_FOR_RMA` (the row-remap failure path, including the `memoryDiagnostics: OBSERVE` containment prefix); a part outside the Ampere-and-later set `QUARANTINE`, `REVIEW_GPU_ARCHITECTURE` |
+
+- **The completeness blocker (1211-1213, `src/gpu_fault/dcgm_fields.py`).** NVML API Reference (docs version 615), "Field Value
+  Enums", `NVML_FI_DEV_NVLINK_ERROR_DL_CRC`
+  <https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlFieldValueEnums.html#c.NVML_FI_DEV_NVLINK_ERROR_DL_CRC>: "This is
+  unsupported for Blackwell+ Please use NVML_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_*" (`_DL_RECOVERY` and `_DL_REPLAY` say the
+  same). The three link-recovery counters (`NVLINK5_LINK_RECOVERY_CANONICAL`) are therefore an alternative of each required
+  NVLink group; the group names, their order and the error text are unchanged, so a Hopper scrape is judged as before and a
+  B-series scrape without them still reads "DCGM exporter is missing required fields: nvlink_crc,nvlink_recovery,nvlink_replay".
+  `DCGM_EXPORTER_FIELD_GROUPS` adds their CSV names and their DCGM 4.6 names (`NVLINK5_LINK_RECOVERY_EXPORTER_NAMES`) to every
+  NVLink group; `deploy/hyperpod/deploy.sh` validates the expression with its existing regular expression, which accepts the new
+  names unchanged (a test runs that line on the expression). VALIDATE_FABRIC uses the same groups. DCGM's own health check makes
+  the same switch: DCGM v4.7.0 `modules/health/DcgmHealthWatch.cpp`
+  <https://github.com/NVIDIA/DCGM/blob/v4.7.0/modules/health/DcgmHealthWatch.cpp> `SetNVLink` watches 1211/1212 under "// New
+  NVLink recovery fields (Blackwell+ only)" and 497-499 under "// Old NVLink error fields (Pre-Blackwell only, deprecated on
+  Blackwell+)". GF-GENERAL-LIVE-020's NVLink families take the link-recovery total (1213) as their B-series member
+  (`scripts/e2e/regional/general_live_gpu_replay.py` `NVLINK_FAMILY_MEMBERS`), never 1211 (1213 counts every recovery 1211
+  counts) or 1212 (a failed recovery drains).
+- **NVLink5 counter rules (`gpu_nvlink5_policy`).** The fields, NVML API Reference (docs version 615), "Field Value Enums":
+  1204 "Number of packets Rx on a link where packets are malformed.", 1205 "Number of packets that were discarded on Rx due to
+  buffer overrun.", 1206 "Total number of packets with errors Rx on a link.", 1207 "Total number of packets Rx - stomp/EBP
+  marker.", 1208 "Total number of packets Rx with header mismatch.", 1209 "Total number of times that the count of local errors
+  exceeded a threshold.", 1211 "Number of times link went from Up to recovery, succeeded and link came back up.", 1212 "Number of
+  times link went from Up to recovery, failed and link was declared down.", 1213 "Number of times link went from Up to recovery,
+  irrespective of the result.", 1214 "Number of errors in rx symbols.", 1219 "Sum of the number of errors in each Nvlink
+  packet.", 1220 "NVLink data ECC Error Counter total for all Links."; DCGM Field Identifiers (docs "Version: 4.6 (Latest)")
+  <https://docs.nvidia.com/datacenter/dcgm/latest/dcgm-api/dcgm-api-field-ids.html>, each entry: "Note: NVLink5+ only. Returns
+  aggregate value across all links. Not supported on NVLink4 and earlier." (1220 carries no such note; its Blackwell support is
+  unknown and it grades only where it reports). DCGM grades them: `MonitorNVLinkErrorFields`, Blackwell branch, 1211 above 0
+  WARN ("link recovery successful events counter") and 1212 above 0 FAIL ("link recovery failed events counter");
+  `MonitorNVLink5Fields` FAILs on a change ≥ 1 within a minute of 1214, 1204-1209, 1213, 1219 and 1220
+  (`common/DcgmGPUHardwareLimits.h` `#define DCGM_LIMIT_MAX_NVLINK_ERROR 1`); both raise `DCGM_FR_NVLINK_ERROR_CRITICAL`
+  (`dcgmlib/dcgm_errors.h`: "Detected %ld %s NvLink errors on GPU %u's NVLink (should be 0)"; next step "Run a field diagnostic on
+  the GPU."), which DCGM Feature Overview (docs 4.6), "Background Health Checks" › "Failure Conditions"
+  <https://docs.nvidia.com/datacenter/dcgm/latest/user-guide/feature-overview.html#background-health-checks> describes as "An
+  NVLink reported 1 or more errors. This includes datalink CRC, recovery, and replay errors (pre-Blackwell GPUs) and link recovery
+  events (Blackwell+ GPUs).". The product grades the increment between two accepted samples, never the reading (a counter that
+  already carries a count when the collector starts is a baseline), as for the Hopper counters: 1212 ≥ 1 → CRITICAL `DRAIN`,
+  official `RUN_FIELD_DIAGNOSTIC` (the DRAIN chain FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → [STOP_WORKLOADS] → QUARANTINE →
+  COLLECT_DIAGNOSTIC_BUNDLE → VALIDATE_GPU → ESCALATE_SUPPORT; the field diagnostic stays the operator's); 1211, 1213 and every
+  `nvlink_<x>_error_total` NVLink5 counter → the NVLink family rule (`gpu_nvlink5_policy.nvlink_family_decision`, the rule the
+  Hopper counters take; WARNING `RUN_DIAGNOSTICS`, `SITE_NVLINK_COUNTER_EVIDENCE`, official `EXAMINE_GPU_HEALTH`), the finding's
+  `policy_reference` the field's DCGM entry. A decrease grades nothing and re-baselines the counter, unlike DCGM's absolute
+  difference: the aggregate sums the active ports, DCGM Feature Overview (docs 4.6), "NVLink COUNT Fields"
+  <https://docs.nvidia.com/datacenter/dcgm/latest/user-guide/feature-overview.html#nvlink-count-fields>: "Aggregate (GPU entity) —
+  returns the sum across all active NVLink ports on a GPU.", so a link that left the active set lowers it. The healthy-link
+  baseline is NVIDIA's "(should be 0)", not a live observation; should a healthy B-series node show these counters moving, the
+  rule must move to rates. Not graded and not exported: the BER readings 1215-1218 -- DCGM Release Notes 4.7.0, "Bug Fixes" ›
+  "Active health checks (dcgmi diag)" <https://docs.nvidia.com/datacenter/dcgm/latest/release-notes/changelog.html>: "Removed
+  NVLink bit-error-rate thresholds that caused false health and diagnostic failures on healthy GB200 systems." -- and the FEC
+  history 1404-1419 (corrected symbols).
+- **Product windows and the XID evidence (`src/gpu_fault/gpu_product_windows.py`).** An NVLink5 increment whose interval -- from
+  the previous accepted sample to this batch -- overlaps a product quiesce, a GPU reset (`RESET_GPU`, the full GPU + NVSwitch
+  reset, the drain-P2P recovery), the restore, a Fabric Manager restart (on NVL5 the same unit runs NVLSM), a reboot or a
+  replacement grades nothing: a step execution of one of those operations on the node, from its start to its end plus 60 s (the
+  exporter's 15 s refresh and the collector's 15 s scrape, twice), or still waiting, read from the node's active workflows and
+  recently updated incidents. A reboot also never forms a delta (`metric_counter_delta` refuses a boot change). A RUNNING
+  node-exclusive chain that owns Fabric Manager (`FABRIC_MANAGER_OWNED_OPERATIONS`) with its VALIDATE_GPU ahead also absorbs an
+  NVLink5 or fabric-health finding its window raises (`TRANSIENT_INVENTORY_FINDINGS`). While an XID 144-150 or 155 owns the GPU
+  -- an XID event for it within 120 s of the batch, or an open incident whose XID decision is one of them -- the finding is
+  evidence only (`NO_ACTION`, `NVLINK5_XID_OWNS_GPU`): the kernel line carries the decode and its incident owns the recovery.
+- **The NVLink composites.** NVLink5 findings are components of `NVLINK_LINK_DEGRADATION` and `MULTI_GPU_NVLINK_FABRIC_FAILURE`
+  (`gpu_nvlink5_policy.nvlink_component`); the link-recovery trio counts as one error class (`nvlink_class`: one recovery
+  increments 1211 or 1212 *and* 1213), an evidence-only finding is no component, and a CRITICAL `DRAIN` component (1212) makes
+  the composite CRITICAL `DRAIN` (`nvlink_composite_grade`) -- a composite suppresses its components' own incidents, so a WARNING
+  one must never swallow a failed link recovery. With Hopper components the composites are graded exactly as before.
+- **DCGM field 230 and the kernel line (`src/gpu_fault/policy/nvlink5_gauge.py`).** The last-XID gauge carries no registers, so an
+  XID 144-150 read from it alone is `BLOCKED_MISSING_EVIDENCE`, and before batch 235 it opened a second, BLOCKED incident beside
+  the kernel-sourced one of the same fault (marker association alone never merges two executions). A gauge change whose kernel
+  twin -- the same XID on the same GPU (UUID, else the PCI device in either spelling), read from the kernel log within 120 s --
+  is among the correlation candidates (`candidate_window` widens the read for such a gauge only) now takes the twin's decode
+  and joins its incident through `correlated_event_id`; without a twin it stays fail-closed BLOCKED. Every other XID and every
+  kernel-sourced event resolves as before.
+- **Fabric health (174/175, `gpu_fabric_health`).** The decode is NVML's layout, NVML API Reference (docs version 615), "Fabric
+  Definitions" <https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlFabricDefs.html> ("Fabric Health Mask: Route is
+  unhealthy.", "Fabric Health Mask: Bandwidth degraded.", "Fabric Health Summary: Unhealthy.", "Fabric Health Summary: Limited
+  Capacity."), with the values of NVIDIA's `nvidia-ml-py` 13.615.71 (`pynvml.py`): two-bit slots degraded bandwidth (shift 0),
+  route recovery (2), route unhealthy (4) and access-timeout recovery (6), each 0 NOT_SUPPORTED / 1 TRUE / 2 FALSE; incorrect
+  configuration at shift 8 in four bits (0 NOT_SUPPORTED, 1 NONE, 2-8 the incorrect configurations); partition assigned (12)
+  and the global Fabric Manager state (14), which serve multi-node NVLink systems and grade nothing; summary 0 NOT_SUPPORTED,
+  1 HEALTHY, 2 UNHEALTHY, 3 LIMITED_CAPACITY; bits NVML may add later are ignored. DCGM Field Identifiers (docs 4.6)
+  <https://docs.nvidia.com/datacenter/dcgm/latest/dcgm-api/dcgm-api-field-ids.html#c.DCGM_FI_DEV_FABRIC_HEALTH_MASK>: "Use
+  DCGM_GPU_FABRIC_HEALTH_TEST macro to check the different health statuses."; DCGM v4.7.0 `DcgmHealthWatch::MonitorFabricFields`
+  FAILs on route unhealthy, degraded bandwidth, route recovery, access-timeout recovery and an incorrect configuration other than
+  NOT_SUPPORTED/NONE (`DCGM_FR_FIELD_VIOLATION`, next step "Check DCGM and system logs for errors. Reset GPU. Restart DCGM. Rerun
+  diagnostics."). The product grades one node finding `fabric_health` over the GPUs of the graded NVSwitch parts
+  (`nvswitch_fabric_product`, as for the Fabric Manager state): UNHEALTHY (summary 2, route unhealthy, or an incorrect
+  configuration) held ≥ 60 s -- two samples a minute apart -- with no product window touching that minute → CRITICAL `RESET_GPU`,
+  official `RESET_ALL_GPUS_AND_NVSWITCHES`, the shape of `fabric_manager_finding` (its GPUs are the node's whole fabric, which the
+  full GPU + NVSwitch reset names); route or access-timeout recovery → evidence, CRITICAL the same way once held 300 s;
+  LIMITED_CAPACITY or degraded bandwidth → WARNING `RUN_DIAGNOSTICS` with an operator-review notice -- Fabric Manager User Guide ("Last
+  updated on Oct 07, 2026"), "Supported High Availability Modes"
+  <https://docs.nvidia.com/datacenter/tesla/fabric-manager-user-guide/index.html#supported-high-availability-modes>: "These high
+  availability modes and their corresponding dynamic reconfiguration of the NVSwitch-based system are applied in response to
+  errors that are detected during FM initialization.", a degraded mode no reset by this product undoes; before the confirmation
+  or inside a window the finding is evidence only. "Held" is the collector's clock (`fabric_health_held_seconds`, from its first
+  observation of the current mask and summary): it restarts with the collector -- after every quiesce, restore and reboot -- and
+  the control plane refuses to confirm across a window (a Fabric Manager restart keeps the collector running). Both fields are
+  state edges, and the held fault state is a breached state once it could grade CRITICAL, so the confirmation is delivered.
+  VALIDATE_GPU (`fabric_validation`) requires every graded GPU's summary to be HEALTHY or NOT_SUPPORTED:
+  `nvlink_fabric_health_not_healthy(<gpu>=<summary> [nvidia-smi ...])`, reported with a Fabric Manager failure when both apply.
+  The second source is the nvidia-smi XML `<fabric><health>` sub-tags (`summary`, `bandwidth`, `route_recovery_in_progress`,
+  `route_unhealthy`, `access_timeout_recovery`, `incorrect_configuration`, `partition_assigned`; live H200 R580 XML lines 298-312,
+  all `N/A`), read at the inventory cadence and published as `fabric_health_xml` (nothing while every tag is `N/A`) -- evidence
+  in the reason and the validation text, never a grade; nvidia-smi documentation (the v610-era page), "Fabric" › "Health"
+  <https://docs.nvidia.com/deploy/nvidia-smi/index.html>: "Summary - Summary of Fabric Health <Healthy, Unhealthy, Limited
+  Capacity>" and "Route Unhealthy - is NVLink route recovery failed or aborted <True/False>".
+- **Memory repair (`gpu_memory_repair_policy`, `src/gpu_fault/collectors/gpu/smi_health.py`).** NVIDIA GPU Memory Error
+  Management (docs version 615), "RAS Repair" › "GPU Memory Repair"
+  <https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/hbm-channel-repair.html#gpu-memory-repair>: "GPU memory repair is
+  another resiliency feature available on select Blackwell products. GPU memory repair consists of swapping spare DRAM channels
+  or L2 cache slices." and "XID 160 will be printed if a DRAM channel or L2 slice is successfully marked for repair. The process
+  of channel repair requires a reboot to take effect."; nvidia-smi documentation, "ECC Errors": "If one of the repair flags is
+  pending, check the GPU Recovery action and take the appropriate steps." with "Indicates if a Channel repair is pending",
+  "Indicates if a TPC repair is pending" and "Indicates if there is unrepairable memory"; its change log, "Changes between
+  nvidia-smi v580 Update and v575": "Added Channel/TPC repair pending flags to ECC field: 'nvidia-smi -q -d ECC'". The DCGM
+  collector reads `<channel_repair_pending>`, `<tpc_repair_pending>` and `<unrepairable_memory>` from `nvidia-smi -q -x` once
+  per inventory interval (the tag names are the live H200 R580 output, XML lines 194-196 of the per-GPU memory section, all `No`;
+  the parser finds them by name): `Yes` 1, `No` 0, `N/A` or a missing tag nothing; a failed query keeps nothing. A pending
+  channel or TPC repair with field 1523 None (or not reported) is WARNING `ESCALATE_OPERATOR`, official
+  `REBOOT_IN_SERVICE_WINDOW` (FREEZE_EVIDENCE → ESCALATE_SUPPORT), a persistent advisory that VALIDATE_GPU does not fail on;
+  with 1523 not None it is evidence only and batch 233's 1523 rule decides (e.g. 2 → the `REBOOT_NODE` path). The unrepairable
+  flag has a second source, DCGM field 1507 (DCGM Field Identifiers, docs 4.6
+  <https://docs.nvidia.com/datacenter/dcgm/latest/dcgm-api/dcgm-api-field-ids.html#c.DCGM_FI_DEV_MEMORY_UNREPAIRABLE>:
+  "Unrepairable memory flag indicating if memory has unrepairable errors 1=yes, 0=no"), which needs NVML v590 (NVML API Reference
+  change log <https://docs.nvidia.com/deploy/nvml-api/latest/change-log.html>, "Changes between v580 and v590": "Added
+  nvmlDeviceGetUnrepairableMemoryFlag_v1() to report whether or not there is unrepairable memory.") and reads N/A on R580 --
+  while the R580 nvidia-smi already prints the tag (live; nvidia-smi's change log lists it under v590). A GPU that reports both
+  is published once, at the higher reading; DCGM v4.7.0 `MonitorMemUnrepairableFlag` FAILs on any non-zero value
+  (`DCGM_FR_FAULTY_MEMORY`, "Run a field diagnostic on the GPU."), and the product takes the row-remap failure path in
+  `memory_decision`: CRITICAL `DRAIN`, official `RUN_FIELD_DIAGNOSTIC_FOR_RMA`, the containment prefix under `memoryDiagnostics:
+  OBSERVE`. XID 160 (`CHANNEL_RETIREMENT_EVENT`) and 161 (`CHANNEL_RETIREMENT_FAILURE`) keep their catalog action (IGNORE on the
+  B100/GB200 family); an XID 160/161 of the GPU in the node's incident history is named in these findings as evidence. Which
+  recovery action accompanies a channel repair NVIDIA does not document.
+- **Deferred, with reasons.** Per-link fields (1508 with its SLEEP and ACTIVE_TRAFFIC_DISABLED states, the per-link NVLink5
+  counters, the PRM counters 580-592): the exporter's link entities carry an `nvlink` label beside their parent GPU's labels, which
+  the parser's device keys and the per-GPU completeness check would read as extra GPUs; they cost 144 series per field per node;
+  live per-link values need DCGM 4.7.0 (the plain EKS pin is 4.6.1) and the PRM counters NVML v595. NVSwitch fields through NVSDM
+  (784/785/864/870/858): DCGM reads the switches only through the NVSDM library, which the node images do not install, and on
+  HGX the switch ports are GPU access links, so 784/785 repeat 1211-1213 (864, reset required, is the only distinct one, first
+  when NVSDM lands). ConnectX bridge fields (1300/1307/1309): they need NVSDM and the exporter's ConnectX entities, and AWS's
+  exposure of the CX7 bridge is unconfirmed. Tests: `tests/metrics/test_blackwell_nvlink5_fields.py`,
+  `tests/metrics/test_blackwell_fabric_health.py`, `tests/metrics/test_blackwell_memory_repair.py`,
+  `tests/orchestration/test_blackwell_dcgm_plans.py`, `tests/app_services/test_dcgm_field230_nvlink5_dedupe.py`,
+  `tests/regional/test_dataplane_dcgm_counters.py`, `tests/regional/test_general_live_gpu_links.py`, and the evidence pins in
+  `tests/test_blackwell_dcgm_evidence.py`.
 
 **NVLink fabric registration state (`src/gpu_fault/gpu_fabric_manager.py`).** On a graded NVSwitch node -- a Hopper SXM
 part on third-generation NVSwitch baseboards (H100/H200/H800/H20) or an HGX B200/B300 on fourth-generation NVSwitches (NVL5;
@@ -1393,8 +1561,8 @@ from it (`app/ingest/gpu_findings`: event id `gpu-<finding id>` → `inc-gpu-<fi
 | `POWER_LIMIT_THROTTLING` | power violation + power usage reaching the configured ratio of the limit + high utilization + no temperature finding | Power-limit context, diagnostics; does not directly rule hardware damage |
 | `GPU_MEMORY_DEGRADATION` | DBE/uncorrectable remap + pending/failed repair or pending retired page | `DRAIN`, Field Diagnostic/RMA evidence |
 | `PCIE_XID_LINK_FAILURE` | PCIe replay rate finding (from batch 233 also a confirmed `pcie_link_downtrain` or `pcie_correctable_error_total` rate finding) + XID 32/79 on the same GPU inside the window (a trusted kernel event, or a change of the DCGM last-XID gauge inside the window; an expired gauge does not join) | `DRAIN` and retain the combined PCIe/XID evidence |
-| `NVLINK_LINK_DEGRADATION` | at least two kinds of NVLink error finding on the same GPU | `DRAIN` and run link/fabric diagnostics |
-| `MULTI_GPU_NVLINK_FABRIC_FAILURE` | at least two GPUs on the same node with NVLink error findings | Generate one node-level composite and `DRAIN` |
+| `NVLINK_LINK_DEGRADATION` | at least two kinds of NVLink error finding on the same GPU (from batch 235 the NVLink5 counters too; the link-recovery counters 1211-1213 are one kind, an evidence-only finding is none) | `DRAIN` and run link/fabric diagnostics; with a failed NVLink5 link recovery (1212) among the components the composite is CRITICAL `DRAIN` |
+| `MULTI_GPU_NVLINK_FABRIC_FAILURE` | at least two GPUs on the same node with NVLink error findings (from batch 235 the NVLink5 counters too) | Generate one node-level composite and `DRAIN`; with a failed NVLink5 link recovery (1212) among the components the composite is CRITICAL `DRAIN` |
 | `CORRECTABLE_MEMORY_DEGRADATION` | at least two of SBE, retired SBE page and correctable row-remap increasing at the same time | WARNING/diagnostics first; after 3 consecutive hits by default the same composite is re-graded CRITICAL (action still diagnostics, the same incident updated) and the running VALIDATE_GPU fails on the CRITICAL finding and `DRAIN`s through the existing ladder |
 
 Thermal slowdown uses the software/hardware thermal slowdown bits `0x20/0x40` of

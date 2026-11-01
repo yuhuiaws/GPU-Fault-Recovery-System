@@ -485,6 +485,7 @@ class NodeHealthPlanBuilder:
                     "ecc_dbe_volatile_total",
                     "row_remap_failure",
                     "sram_threshold_exceeded",
+                    "memory_unrepairable",
                     "composite:GPU_MEMORY_DEGRADATION",
                 }
             ):

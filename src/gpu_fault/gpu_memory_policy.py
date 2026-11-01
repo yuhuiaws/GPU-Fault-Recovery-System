@@ -23,6 +23,9 @@ MEMORY_METRICS = frozenset(
         "retired_pages_pending",
         "sram_threshold_exceeded",
         "row_remap_banks_none",
+        # b235: the unrepairable-memory flag (nvidia-smi XML, DCGM field 1507;
+        # gpu_memory_repair_policy) takes the row-remap failure's RMA drain.
+        "memory_unrepairable",
     }
 )
 NVIDIA_GPU_MEMORY_POLICY_VERSION = "nvidia-gpu-memory-error-management/2026-07-26"
@@ -83,6 +86,12 @@ DCGM_ROW_REMAP_UNCORRECTABLE_LIMIT = 512
 DCGM_ROW_REMAP_LIMIT_SOURCE = "NVIDIA_DCGM_ROW_REMAP_LIMIT"
 DCGM_ROW_REMAP_LIMIT_REFERENCE = (
     "https://docs.nvidia.com/datacenter/dcgm/latest/release-notes/changelog.html"
+)
+#: DCGM Field Identifiers (docs 4.6), ``DCGM_FI_DEV_MEMORY_UNREPAIRABLE 1507``
+#: (``gpu_memory_repair_policy`` carries the evidence).
+DCGM_UNREPAIRABLE_REFERENCE = (
+    "https://docs.nvidia.com/datacenter/dcgm/latest/dcgm-api/dcgm-api-field-ids.html"
+    "#c.DCGM_FI_DEV_MEMORY_UNREPAIRABLE"
 )
 DCGM_ROW_REMAP_LIMIT_QUOTE = (
     "Health monitoring now warns when total uncorrectable row remaps reach 512 on "
@@ -215,7 +224,7 @@ def memory_decision(
             "policy_source": "SITE_GPU_MEMORY_EVIDENCE",
             "policy_reference": NVIDIA_DRAM_RMA_REFERENCE,
         }
-    if name in {"row_remap_failure", "sram_threshold_exceeded"}:
+    if name in {"row_remap_failure", "sram_threshold_exceeded", "memory_unrepairable"}:
         sram = name == "sram_threshold_exceeded"
         return {
             "severity": GpuHealthSeverity.CRITICAL,
@@ -223,6 +232,10 @@ def memory_decision(
                 "SRAM threshold exceeded (DCGM field 346, an RMA criterion); field "
                 "diagnosis required before any RMA conclusion"
                 if sram
+                else "unrepairable memory reported (nvidia-smi unrepairable_memory "
+                "or DCGM field 1507); field diagnosis required before any RMA "
+                "conclusion"
+                if name == "memory_unrepairable"
                 else "row remap failure; field diagnosis required before any RMA "
                 "conclusion"
             ),
@@ -232,7 +245,11 @@ def memory_decision(
             "policy_source": "NVIDIA_GPU_MEMORY_ERROR_MANAGEMENT",
             "policy_version": NVIDIA_GPU_MEMORY_POLICY_VERSION,
             "policy_reference": (
-                NVIDIA_SRAM_RMA_REFERENCE if sram else NVIDIA_ROW_REMAP_RMA_REFERENCE
+                NVIDIA_SRAM_RMA_REFERENCE
+                if sram
+                else DCGM_UNREPAIRABLE_REFERENCE
+                if name == "memory_unrepairable"
+                else NVIDIA_ROW_REMAP_RMA_REFERENCE
             ),
             "official_action": (
                 "RUN_FIELD_DIAGNOSTIC_FOR_RMA" if modern else "REVIEW_GPU_ARCHITECTURE"

@@ -977,7 +977,11 @@ recovery）选取节点真正上报的成员（`GpuSurvey.nvlink_counter`，读 
 DCGM `*_ERROR_COUNT_TOTAL`）；Hopper/NVLink4 及更新的卡只上报 DL 聚合计数
 （`nvlink_*_aggregate_error_total`，`DCGM_FI_DEV_NVLINK_ERROR_DL_CRC/REPLAY/RECOVERY`；
 2026-10-26 本站 p5en H200 实测，原先硬编码的 flit 名使 8 个变体全部
-`NOT_RUN(CAPABILITY_ABSENT)`）。两代同时上报时取按类计数，`multiple_gpus`
+`NOT_RUN(CAPABILITY_ABSENT)`）；HGX B200/B300（NVLink5，batch 235）没有 DL 聚合计数（NVML 在 Blackwell
+上不再报告 497-499），三个族的 B 系列成员都是链路恢复总数 `nvlink_link_recovery_total`
+（`DCGM_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_EVENTS`，字段 1213，产品按 NVLink 族规则判 WARNING）——从不驱动
+1211（1213 已计入其每次恢复）或 1212（恢复失败按 CRITICAL DRAIN 处置）；B 系列变体在有 p6-b200/p6-b300
+节点之前只能 `NOT_RUN(CAPABILITY_ABSENT)`。两代同时上报时取按类计数，`multiple_gpus`
 取多数 GPU 上报的成员；整族缺失才记 CAPABILITY_ABSENT 并列出全部成员名。计划文本只
 承诺"NVLink CRC counter（NVLink3 flit total，NVLink4+ DL aggregate）"，结果的
 `canonical_name`/`exporter_metrics` 字段与 notes 记录实际驱动的计数器与 exporter

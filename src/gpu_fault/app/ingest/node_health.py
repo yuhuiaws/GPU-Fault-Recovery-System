@@ -47,6 +47,10 @@ OPERATOR_REVIEW_METRICS = frozenset(
         # b233, DCGM field 389: banks with no spare row left. RUN_DIAGNOSTICS
         # and an operator notice; no automatic hardware action.
         "row_remap_banks_none",
+        # b235, DCGM fields 174/175: degraded fabric capacity (RUN_DIAGNOSTICS),
+        # and a confirmed unhealthy fabric before its full reset, are a human's
+        # to know of (gpu_fault.gpu_fabric_health).
+        "fabric_health",
     }
 )
 

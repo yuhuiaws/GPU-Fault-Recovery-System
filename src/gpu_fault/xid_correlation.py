@@ -16,6 +16,7 @@ from gpu_fault.policy import (
     XidEvent,
     parse_xid154_action,
 )
+from gpu_fault.policy.nvlink5_gauge import candidate_window
 
 LOGGER = logging.getLogger(__name__)
 
@@ -136,7 +137,9 @@ class XidCorrelationCoordinator:
         return event.observed_at - window * self.retained_windows
 
     def _candidates(self, event: XidEvent) -> list[XidEvent]:
-        window = timedelta(seconds=self.policy.policy.companion_window_seconds)
+        window = candidate_window(
+            event, timedelta(seconds=self.policy.policy.companion_window_seconds)
+        )
         return self.store.list_xid_events(
             event.cluster_id,
             event.node_id,
@@ -160,8 +163,8 @@ class XidCorrelationCoordinator:
             (
                 event.cluster_id,
                 event.node_id,
-                event.observed_at - window,
-                event.observed_at + window,
+                event.observed_at - candidate_window(event, window),
+                event.observed_at + candidate_window(event, window),
             )
             for event in events
         ]
@@ -204,12 +207,13 @@ class XidCorrelationCoordinator:
         )
         for correlation, event in claimed_events:
             try:
+                reach = candidate_window(event, window)
                 candidates = [
                     item
                     for item in prefetched.get((event.cluster_id, event.node_id), ())
-                    if event.observed_at - window
+                    if event.observed_at - reach
                     <= item.observed_at
-                    <= event.observed_at + window
+                    <= event.observed_at + reach
                 ]
                 decision = self.policy.evaluate_xid(
                     event,

@@ -398,6 +398,16 @@ HOPPER = {
         "DCGM_FI_DEV_NVLINK_ERROR_DL_RECOVERY_total",
     ),
 }
+#: Batch 235: an HGX B200/B300 (NVLink5) has no per-class or DL counter; every
+#: family's member is the link-recovery total (DCGM field 1213), exported under
+#: its 4.5.3 name (synthetic survey shape, derived from the counters CSV).
+BLACKWELL = {
+    family: (
+        "nvlink_link_recovery_total",
+        "DCGM_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_EVENTS_total",
+    )
+    for family in ("nvlink_crc", "nvlink_replay", "nvlink_recovery")
+}
 OTHER_FIELDS = (
     "ecc_sbe_volatile_total",
     "ecc_dbe_volatile_total",
@@ -475,14 +485,24 @@ def _plan_targets(plan: dict[str, Any]) -> set[tuple[str, str]]:
 def test_nvlink_family_members_are_the_product_groups() -> None:
     from gpu_fault.dcgm_fields import DCGM_FABRIC_CANONICAL_GROUPS
 
+    # 020 never drives the NVLink5 counters 1211 (1213 counts every recovery
+    # 1211 counts) and 1212 (a failed recovery grades CRITICAL DRAIN).
+    never_driven = {
+        "nvlink_link_recovery_successful_total",
+        "nvlink_link_recovery_failed_total",
+    }
     assert {
         family: set(members) for family, members in NVLINK_FAMILY_MEMBERS.items()
-    } == dict(DCGM_FABRIC_CANONICAL_GROUPS)
+    } == {
+        family: set(members) - never_driven
+        for family, members in DCGM_FABRIC_CANONICAL_GROUPS.items()
+    }
     assert set(links.NVLINK.values()) == set(NVLINK_FAMILY_MEMBERS)
     assert set(SPECS_020) == set(FAMILY_OF)
     for family, members in NVLINK_FAMILY_MEMBERS.items():
         assert members[0] == LEGACY[family][0], "the legacy per-class counter first"
         assert members[1] == HOPPER[family][0], "then the DL aggregate"
+        assert members[-1] == BLACKWELL[family][0], "the NVLink5 member last"
 
 
 def test_nvlink_counter_follows_the_members_the_node_reports() -> None:
@@ -641,7 +661,12 @@ def _run_variant(
 
 @pytest.mark.parametrize("variant", sorted(FAMILY_OF))
 @pytest.mark.parametrize(
-    "generation", [pytest.param(LEGACY, id="legacy"), pytest.param(HOPPER, id="hopper")]
+    "generation",
+    [
+        pytest.param(LEGACY, id="legacy"),
+        pytest.param(HOPPER, id="hopper"),
+        pytest.param(BLACKWELL, id="blackwell"),
+    ],
 )
 def test_020_variants_target_the_counter_the_node_reports(
     tmp_path: Path, variant: str, generation: dict[str, tuple[str, str]]

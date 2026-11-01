@@ -2,24 +2,54 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Set
 
+#: The NVLink5 link-recovery counters, DCGM fields 1211-1213 (batch 235). NVML
+#: does not report the data-link counters 497-499 on Blackwell -- NVML API
+#: Reference (docs version 615), "Field Value Enums",
+#: ``NVML_FI_DEV_NVLINK_ERROR_DL_CRC``: "This is unsupported for Blackwell+
+#: Please use NVML_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_*" (``_DL_RECOVERY`` and
+#: ``_DL_REPLAY`` say the same) -- so on a B200/B300 these are the counters
+#: that answer for the GPU's NVLink. Each is an alternative of every NVLink
+#: group below; Hopper and earlier parts never report them ("Note: NVLink5+
+#: only. ... Not supported on NVLink4 and earlier.", DCGM Field Identifiers,
+#: docs 4.6), so what a Hopper scrape needs is unchanged.
+NVLINK5_LINK_RECOVERY_CANONICAL = (
+    "nvlink_link_recovery_successful_total",
+    "nvlink_link_recovery_failed_total",
+    "nvlink_link_recovery_total",
+)
+#: Their exporter names as the bundled counters CSV exports them: the DCGM
+#: 4.5.3 names the pinned exporter's go-dcgm v1.4611.2 resolves through its
+#: legacy map, then the DCGM 4.6 names an exporter of the customer's may use.
+NVLINK5_LINK_RECOVERY_EXPORTER_NAMES = (
+    "DCGM_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_SUCCESSFUL_EVENTS",
+    "DCGM_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_FAILED_EVENTS",
+    "DCGM_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_EVENTS",
+    "DCGM_FI_DEV_NVLINK_RECOVERY_SUCCESSFUL_TOTAL",
+    "DCGM_FI_DEV_NVLINK_RECOVERY_FAILED_TOTAL",
+    "DCGM_FI_DEV_NVLINK_RECOVERY_EVENT_TOTAL",
+)
+
 DCGM_FABRIC_CANONICAL_GROUPS = {
     "nvlink_crc": frozenset(
         {
             "nvlink_crc_aggregate_error_total",
             "nvlink_crc_flit_error_total",
             "nvlink_crc_data_error_total",
+            *NVLINK5_LINK_RECOVERY_CANONICAL,
         }
     ),
     "nvlink_recovery": frozenset(
         {
             "nvlink_recovery_aggregate_error_total",
             "nvlink_recovery_error_total",
+            *NVLINK5_LINK_RECOVERY_CANONICAL,
         }
     ),
     "nvlink_replay": frozenset(
         {
             "nvlink_replay_aggregate_error_total",
             "nvlink_replay_error_total",
+            *NVLINK5_LINK_RECOVERY_CANONICAL,
         }
     ),
 }
@@ -43,14 +73,17 @@ DCGM_EXPORTER_FIELD_GROUPS = (
     (
         "DCGM_FI_DEV_NVLINK_CRC_FLIT_ERROR_COUNT_TOTAL",
         "DCGM_FI_DEV_NVLINK_ERROR_DL_CRC",
+        *NVLINK5_LINK_RECOVERY_EXPORTER_NAMES,
     ),
     (
         "DCGM_FI_DEV_NVLINK_RECOVERY_ERROR_COUNT_TOTAL",
         "DCGM_FI_DEV_NVLINK_ERROR_DL_RECOVERY",
+        *NVLINK5_LINK_RECOVERY_EXPORTER_NAMES,
     ),
     (
         "DCGM_FI_DEV_NVLINK_REPLAY_ERROR_COUNT_TOTAL",
         "DCGM_FI_DEV_NVLINK_ERROR_DL_REPLAY",
+        *NVLINK5_LINK_RECOVERY_EXPORTER_NAMES,
     ),
     ("DCGM_FI_DEV_CLOCK_THROTTLE_REASONS", "DCGM_FI_DEV_CLOCKS_EVENT_REASONS"),
     ("DCGM_FI_DEV_POWER_MGMT_LIMIT",),

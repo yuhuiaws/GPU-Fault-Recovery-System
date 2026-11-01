@@ -142,6 +142,22 @@ def test_one_gpu_missing_fails_when_the_omission_stays_hidden(tmp_path: Path) ->
 
 LEGACY_ALIAS = "DCGM_FI_DEV_CLOCK_THROTTLE_REASONS"
 CURRENT_ALIAS = "DCGM_FI_DEV_CLOCKS_EVENT_REASONS"
+#: Batch 235: the NVLink5 link-recovery counters are NVLink completeness members
+#: read under two names (DCGM 4.6, then 4.5.3); a Hopper survey shows neither.
+BLACKWELL_ALIAS_FAMILIES = {
+    "nvlink_link_recovery_failed_total": (
+        "DCGM_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_FAILED_EVENTS",
+        "DCGM_FI_DEV_NVLINK_RECOVERY_FAILED_TOTAL",
+    ),
+    "nvlink_link_recovery_successful_total": (
+        "DCGM_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_SUCCESSFUL_EVENTS",
+        "DCGM_FI_DEV_NVLINK_RECOVERY_SUCCESSFUL_TOTAL",
+    ),
+    "nvlink_link_recovery_total": (
+        "DCGM_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_EVENTS",
+        "DCGM_FI_DEV_NVLINK_RECOVERY_EVENT_TOTAL",
+    ),
+}
 
 
 def alias_survey(*published: str) -> dict[str, Any]:
@@ -173,7 +189,8 @@ def test_alias_families_are_the_products_pairs_the_profile_allows() -> None:
     thermal-safety reading the profile excludes."""
 
     assert fields.alias_families() == {
-        "clock_throttle_reasons": (CURRENT_ALIAS, LEGACY_ALIAS)
+        "clock_throttle_reasons": (CURRENT_ALIAS, LEGACY_ALIAS),
+        **BLACKWELL_ALIAS_FAMILIES,
     }, fields.alias_families()
 
 
@@ -247,6 +264,10 @@ def test_conflicting_alias_without_a_distinct_pair_is_not_run_before_arming(
         "no canonical field has two distinct exporter aliases on this node: "
         f"clock_throttle_reasons ({CURRENT_ALIAS}|{LEGACY_ALIAS}; published: "
         f"{CURRENT_ALIAS}, {LEGACY_ALIAS})"
+        + "".join(
+            f"; {field} ({'|'.join(members)}; published: none)"
+            for field, members in sorted(BLACKWELL_ALIAS_FAMILIES.items())
+        )
     ), caught.value.args
     assert [call[0] for call in probe.calls] == ["survey"], probe.calls
 

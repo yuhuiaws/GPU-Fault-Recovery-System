@@ -49,3 +49,18 @@ DCGM_FI_DEV_POWER_VIOLATION, counter, Power violation duration in nanoseconds
 DCGM_FI_DEV_THERMAL_VIOLATION, counter, Thermal violation duration in nanoseconds
 DCGM_FI_DEV_CLOCKS_EVENT_REASON_HW_THERM_SLOWDOWN_NS, counter, Time spent in HW thermal slowdown in nanoseconds
 DCGM_FI_DEV_CLOCKS_EVENT_REASON_HW_POWER_BRAKE_SLOWDOWN_NS, counter, Time spent in HW power brake slowdown in nanoseconds
+DCGM_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_SUCCESSFUL_EVENTS, counter, NVLink5 link recoveries that succeeded (aggregate of all active links; Blackwell and newer)
+DCGM_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_FAILED_EVENTS, counter, NVLink5 link recoveries that failed and declared the link down (aggregate; Blackwell and newer)
+DCGM_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_EVENTS, counter, NVLink5 link recoveries irrespective of the result (aggregate; Blackwell and newer)
+DCGM_FI_DEV_NVLINK_COUNT_RX_SYMBOL_ERRORS, counter, NVLink5 errors in rx symbols (aggregate; Blackwell and newer)
+DCGM_FI_DEV_NVLINK_COUNT_RX_MALFORMED_PACKET_ERRORS, counter, NVLink5 malformed packets received (aggregate; Blackwell and newer)
+DCGM_FI_DEV_NVLINK_COUNT_RX_BUFFER_OVERRUN_ERRORS, counter, NVLink5 packets discarded on rx for buffer overrun (aggregate; Blackwell and newer)
+DCGM_FI_DEV_NVLINK_COUNT_RX_ERRORS, counter, NVLink5 packets received with errors (aggregate; Blackwell and newer)
+DCGM_FI_DEV_NVLINK_COUNT_RX_REMOTE_ERRORS, counter, NVLink5 packets received with a stomp/EBP marker (aggregate; Blackwell and newer)
+DCGM_FI_DEV_NVLINK_COUNT_RX_GENERAL_ERRORS, counter, NVLink5 packets received with a header mismatch (aggregate; Blackwell and newer)
+DCGM_FI_DEV_NVLINK_COUNT_LOCAL_LINK_INTEGRITY_ERRORS, counter, NVLink5 times the local error count exceeded its threshold (aggregate; Blackwell and newer)
+DCGM_FI_DEV_NVLINK_COUNT_EFFECTIVE_ERRORS, counter, NVLink5 sum of the errors in each packet (aggregate; Blackwell and newer)
+DCGM_FI_DEV_NVLINK_ECC_DATA_ERROR_COUNT_TOTAL, counter, NVLink data ECC errors of all links (graded only where it reports)
+DCGM_FI_DEV_FABRIC_HEALTH_MASK, gauge, NVLink fabric health mask (NVML fabric health bit layout; 0 = every slot not supported)
+DCGM_FI_DEV_FABRIC_HEALTH_SUMMARY, gauge, NVLink fabric health summary (0 not supported / 1 healthy / 2 unhealthy / 3 limited capacity)
+DCGM_FI_DEV_MEMORY_UNREPAIRABLE_FLAG, gauge, Unrepairable memory flag (1 = yes / 0 = no; needs driver R590 or later)

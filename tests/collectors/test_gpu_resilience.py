@@ -372,6 +372,18 @@ def test_dcgm_metrics_survive_inventory_validation_error(
     )
 
 
+def _without_the_smi_health_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests count the temperature-limit probe's ``nvidia-smi -q -x``
+    calls; the repair/fabric-health probe (batch 235) runs the same command at
+    the inventory cadence and has its own backoff test
+    (``tests/metrics/test_blackwell_memory_repair.py``)."""
+
+    monkeypatch.setattr(
+        "gpu_fault.collectors.gpu.dcgm.SmiHealthProbe.refresh",
+        lambda _probe, _observed_at, _runner: [],
+    )
+
+
 def test_dcgm_temperature_limit_query_stops_probing_when_no_thresholds_exist(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
@@ -388,6 +400,7 @@ def test_dcgm_temperature_limit_query_stops_probing_when_no_thresholds_exist(
         "gpu_fault.collectors.gpu.dcgm.urlopen",
         lambda *_args, **_kwargs: _DcgmExporterResponse(_DCGM_SCRAPE),
     )
+    _without_the_smi_health_probe(monkeypatch)
     probes: list[list[str]] = []
 
     def runner(command, **_kwargs) -> subprocess.CompletedProcess[str]:
@@ -445,6 +458,7 @@ def test_dcgm_temperature_limit_query_backs_off_after_repeated_failures(
         "gpu_fault.collectors.gpu.dcgm.urlopen",
         lambda *_args, **_kwargs: _DcgmExporterResponse(_DCGM_SCRAPE),
     )
+    _without_the_smi_health_probe(monkeypatch)
     probes: list[list[str]] = []
 
     def runner(command, **_kwargs) -> subprocess.CompletedProcess[str]:

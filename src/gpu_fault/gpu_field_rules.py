@@ -41,8 +41,18 @@ by the bundled counters CSV and never required.
   untrusted: Dynamic Page Retirement (docs 615), "Implementation":
   :data:`NVIDIA_INFOROM_RETIREMENT_QUOTE`.
 
+Batch 235 (the 2026-11-01 Blackwell field audit) adds, through the same entry
+points: the NVLink5 link-recovery counters 1211-1213 (``gpu_nvlink5_policy``;
+the NVLink5 error counters are ``nvlink_<x>_error_total`` and keep the NVLink
+family rule), the channel/TPC repair-pending flags of the nvidia-smi XML
+(``gpu_memory_repair_policy``), and :func:`field_rule_gate`, which every
+decision passes: an NVLink5 increment inside a product window grades nothing
+and one an XID 144-150/155 owns is evidence; a memory-repair finding names the
+GPU's XID 160/161.
+
 Persistent advisory findings (ECC mode, InfoROM, remap headroom, the load-gated
-downtrain, field 393 at DCGM's 512 limit) cannot be re-judged by a validation
+downtrain, field 393 at DCGM's 512 limit, a pending memory repair) cannot be
+re-judged by a validation
 and would fail every later VALIDATE_GPU on the GPU:
 :data:`ADVISORY_GPU_FINDING_NAMES` and :data:`ADVISORY_THRESHOLD_SOURCES` list
 them, and a
@@ -56,7 +66,19 @@ from typing import Any
 
 from gpu_fault.gpu_environment_policy import HW_POWER_BRAKE_MASK, valid_clock_mask
 from gpu_fault.gpu_memory_policy import DCGM_ROW_REMAP_LIMIT_SOURCE
+from gpu_fault.gpu_memory_repair_policy import (
+    MEMORY_UNREPAIRABLE,
+    REPAIR_PENDING_NAMES,
+    repair_pending_decision,
+    with_repair_xid_evidence,
+)
 from gpu_fault.gpu_metric_models import GpuHealthSeverity
+from gpu_fault.gpu_nvlink5_policy import (
+    NVLINK5_COUNTERS,
+    NVLINK5_LINK_RECOVERY,
+    nvlink5_gate,
+    recovery_decision,
+)
 from gpu_fault.gpu_pcie_link_policy import (
     PCIE_CORRECTABLE_ERRORS,
     PCIE_LINK_DOWNTRAIN,
@@ -117,11 +139,14 @@ FIELD_RULE_NAMES = frozenset(
         ECC_MODE_CURRENT,
         ECC_MODE_PENDING,
         INFOROM_CHECKSUM_VALID,
+        *NVLINK5_LINK_RECOVERY,
+        *REPAIR_PENDING_NAMES,
     }
 )
 #: The counters among the new fields: the control plane's delta and rate.
 GPU_FIELD_COUNTERS = frozenset(
     {HW_THERMAL_SLOWDOWN, HW_POWER_BRAKE_SLOWDOWN, PCIE_CORRECTABLE_ERRORS}
+    | NVLINK5_COUNTERS
 )
 #: Persistent WARNINGs a validation cannot re-judge (see the module docstring).
 ADVISORY_GPU_FINDING_NAMES = frozenset(
@@ -131,6 +156,7 @@ ADVISORY_GPU_FINDING_NAMES = frozenset(
         ECC_MODE_PENDING,
         INFOROM_CHECKSUM_VALID,
         ROW_REMAP_BANKS_NONE,
+        *REPAIR_PENDING_NAMES,
     }
 )
 #: Persistent WARNING levels of older fields, by ``threshold_source``: field
@@ -148,6 +174,8 @@ GPU_FIELD_FAULT_CLASSES = {
     INFOROM_CHECKSUM_VALID: "GPU_MEMORY",
     SRAM_THRESHOLD_EXCEEDED: "GPU_MEMORY",
     ROW_REMAP_BANKS_NONE: "GPU_MEMORY",
+    **{name: "GPU_FABRIC" for name in NVLINK5_COUNTERS},
+    **{name: "GPU_MEMORY" for name in (*REPAIR_PENDING_NAMES, MEMORY_UNREPAIRABLE)},
 }
 
 
@@ -320,4 +348,23 @@ def field_rule_decision(
         )
     if name == INFOROM_CHECKSUM_VALID:
         return inforom_decision(sample)
+    if name in NVLINK5_LINK_RECOVERY:
+        return recovery_decision(sample, delta, service.thresholds)
+    if name in REPAIR_PENDING_NAMES:
+        return repair_pending_decision(batch, sample)
     return ecc_mode_decision(batch, sample)
+
+
+def field_rule_gate(
+    service: Any,
+    batch: Any,
+    sample: Any,
+    decision: dict[str, Any] | None,
+    previous_latest: Any,
+) -> dict[str, Any] | None:
+    """What every decision of ``GpuMetricsService._evaluate`` passes (b235):
+    the NVLink5 window suppression and XID evidence, the memory-repair XID
+    160/161 evidence. Any other decision is returned unchanged."""
+
+    decision = nvlink5_gate(service.store, batch, sample, decision, previous_latest)
+    return with_repair_xid_evidence(service.store, batch, sample, decision)

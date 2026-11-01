@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 
+from gpu_fault.gpu_fabric_health import FABRIC_HEALTH
+from gpu_fault.gpu_nvlink5_policy import NVLINK5_COUNTERS
 from gpu_fault.host_health import NodeHealthFinding
 from gpu_fault.models import (
     FaultIncident,
@@ -94,6 +96,10 @@ TRANSIENT_INVENTORY_FINDINGS = {
     # VALIDATE_GPU requires the recovery action back at None after the reset).
     "pcie_link_downtrain": DCGM_TELEMETRY_UNAVAILABLE_OPERATIONS,
     "gpu_recovery_action": DCGM_TELEMETRY_UNAVAILABLE_OPERATIONS,
+    # b235: the NVLink5 counters and the fabric health move while the window
+    # retrains the links or re-registers the fabric (gpu_product_windows).
+    FABRIC_HEALTH: FABRIC_MANAGER_OWNED_OPERATIONS,
+    **{name: FABRIC_MANAGER_OWNED_OPERATIONS for name in NVLINK5_COUNTERS},
 }
 #: The validation step of the incumbent that must still be ahead for the finding
 #: to be absorbed: a GPU finding is judged by VALIDATE_GPU; an EFA one by
@@ -116,6 +122,8 @@ INVENTORY_FINDING_VALIDATIONS = {
     "fabric_manager_status": _GPU_VALIDATIONS,
     "pcie_link_downtrain": _GPU_VALIDATIONS,
     "gpu_recovery_action": _GPU_VALIDATIONS,
+    FABRIC_HEALTH: _GPU_VALIDATIONS,
+    **{name: _GPU_VALIDATIONS for name in NVLINK5_COUNTERS},
 }
 
 

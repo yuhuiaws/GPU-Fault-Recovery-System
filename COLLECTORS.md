@@ -363,6 +363,13 @@ exporter，还会等待 `/v1/gpu-metrics/.../latest` 出现该节点的实际样
   slowdown 时间 1423/1424（ns 换算为 µs，按占空比分级）；InfoROM 校验由 DCGM collector 按 inventory 周期执行
   `nvidia-smi --query-gpu=index,pci.bus_id,uuid,inforom.checksum_validation`（不读每次 watch 都读 flash 的字段 84）。
   分级规则与 NVIDIA 依据见详细设计 §2.4.1。
+- batch 235（HGX B200/B300）：NVLink5 计数 1204-1209、1211-1214、1219、1220（计数器；1211-1213 链路恢复计数同时是
+  Blackwell 上 NVLink 必需字段组的替代项，因为 NVML 在 Blackwell 上不再报告数据链路计数 497-499）、fabric health
+  掩码与摘要 174/175（状态边沿，故障状态的保持时长由 collector 发布为 `fabric_health_held_seconds`）、不可修复内存
+  1507；DCGM collector 还按 inventory 周期执行 `nvidia-smi -q -x`，读取 `<channel_repair_pending>`、
+  `<tpc_repair_pending>`、`<unrepairable_memory>` 与 `<fabric><health>` 子标签（`N/A` 或缺失不发布，连续失败后退避）。
+  H200 上这些 NVLink5 字段都不存在、174/175 为 0（NOT_SUPPORTED）、修复标志为 `No`，判定与之前完全相同。分级规则与
+  NVIDIA 依据见详细设计 §2.4.1（"HGX B200/B300 DCGM 字段"）。
 
 DCGM Exporter 必须配置 `deploy/dataplane/dcgm-counters.csv` 中的字段，两条启动路径
 （`deploy/dataplane/hyperpod-dcgm-exporter.yaml` 与 `deploy/systemd/gpu-fault-dcgm-exporter.service`）
@@ -403,6 +410,8 @@ sha256 注解 `gpu-fault.io/dcgm-counters-sha256`（同样由 `render_dcgm_expor
   缺少它们时只是没有 fabric 检测。
 - batch 233 的字段在 CSV 中保留 DCGM 4.5.3 的名字（钉定 exporter 的 go-dcgm `v1.4611.2` 作为弃用别名解析），collector
   同时识别 DCGM 4.6 的新名，同值的一对只算一次；全部非必需，exporter 不提供时只是缺少那条规则。
+- batch 235 的字段同样保留 DCGM 4.5.3 的名字（175 只有 DCGM 4.6 的名字）；除 1211-1213 作为 NVLink 必需字段组的替代
+  项外全部非必需。BER 1215-1218、FEC 历史 1404-1419、逐链路字段（1508 等）、NVSDM 交换机字段与 ConnectX 桥字段不导出。
 
 `NvidiaSmiMetricsCollector` 的实现作为后续验证能力保留。只有显式传入
 `--enable-nvidia-smi-metrics-collector` 才允许使用；它采集核心、ECC、retired-page

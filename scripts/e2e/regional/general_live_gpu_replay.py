@@ -109,28 +109,29 @@ DEFAULT_INTERVAL_SECONDS = 15
 SERVE_SLACK_READS = 2
 SERVE_GRACE_SECONDS = 90
 SERVE_POLL_SECONDS = 10
-#: The NVLink error-counter families the product grades alike
-#: (``gpu_fault.dcgm_fields.DCGM_FABRIC_CANONICAL_GROUPS``; every member is a
-#: ``nvlink_*_error_total`` counter to ``gpu_metrics._link_decision`` and the
-#: NVLink composites), each member in the order a plan prefers it: the legacy
-#: per-class counter (``DCGM_FI_DEV_NVLINK_*_ERROR_COUNT_TOTAL``, NVLink3 and
-#: earlier parts) before the DL aggregate (``DCGM_FI_DEV_NVLINK_ERROR_DL_*``,
-#: the only NVLink error counters a Hopper/NVLink4 exporter publishes: live
-#: 2026-10-26, p5en H200, DCGM 4.6/4.7, every 020 variant NOT_RUN "no GPU on
-#: the node reports nvlink_crc_flit_error_total").
+#: The NVLink error-counter families (``gpu_fault.dcgm_fields.
+#: DCGM_FABRIC_CANONICAL_GROUPS``) the NVLink family rule grades alike, each
+#: member in the order a plan prefers it: the legacy per-class counter (NVLink3
+#: and earlier), the DL aggregate (``DCGM_FI_DEV_NVLINK_ERROR_DL_*``, all a
+#: Hopper/NVLink4 exporter publishes: live 2026-10-26, p5en H200), then the
+#: NVLink5 link-recovery total (field 1213; Blackwell has no DL counters). 020
+#: never drives 1211 (1213 counts it too) or 1212 (a failed recovery drains).
 NVLINK_FAMILY_MEMBERS: dict[str, tuple[str, ...]] = {
     "nvlink_crc": (
         "nvlink_crc_flit_error_total",
         "nvlink_crc_aggregate_error_total",
         "nvlink_crc_data_error_total",
+        "nvlink_link_recovery_total",
     ),
     "nvlink_replay": (
         "nvlink_replay_error_total",
         "nvlink_replay_aggregate_error_total",
+        "nvlink_link_recovery_total",
     ),
     "nvlink_recovery": (
         "nvlink_recovery_error_total",
         "nvlink_recovery_aggregate_error_total",
+        "nvlink_link_recovery_total",
     ),
 }
 
@@ -155,6 +156,8 @@ class NvlinkCounter:
 
     @property
     def generation(self) -> str:
+        if self.canonical == "nvlink_link_recovery_total":
+            return "NVLink5 link-recovery total, Blackwell"
         if "_aggregate_" in self.canonical:
             return "DL aggregate, NVLink4 and later"
         return "legacy per-class counter, NVLink3 and earlier"

@@ -321,6 +321,55 @@ link (8/min only without a link reading); the correctable-error limit is the low
 diagnostic limit. Blackwell (B200/B300) behaviour is unit-tested from NVIDIA documentation, not live-verified (no B-series
 hardware).
 
+### Evidence: the HGX B200/B300 DCGM rules (batch 235)
+
+The pages below were re-fetched for batch 235: NVML API Reference and NVIDIA GPU Memory Error Management docs version 615,
+the DCGM pages "Version: 4.6 (Latest)", the DCGM source tag v4.7.0, the Fabric Manager User Guide "Last updated on Oct 07,
+2026", the nvidia-smi documentation of the v610 era, and NVIDIA's `nvidia-ml-py` 13.615.71 for the fabric-health bit
+values. The full quotes and the decisions are in the detailed design §2.4.1, "HGX B200/B300 DCGM fields"; each quote is
+pinned by `tests/test_blackwell_dcgm_evidence.py`. Blackwell (B200/B300) behaviour is unit-tested from NVIDIA
+documentation, not live-verified (no B-series hardware).
+
+- NVLink completeness (1211-1213 as alternatives of the data-link counters 497-499): NVML API Reference, "Field Value
+  Enums", `NVML_FI_DEV_NVLINK_ERROR_DL_CRC`
+  `https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlFieldValueEnums.html#c.NVML_FI_DEV_NVLINK_ERROR_DL_CRC`
+  "This is unsupported for Blackwell+ Please use NVML_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_*".
+- NVLink5 counters (1204-1209, 1211-1214, 1219, 1220): DCGM Field Identifiers
+  `https://docs.nvidia.com/datacenter/dcgm/latest/dcgm-api/dcgm-api-field-ids.html` "Returns aggregate value across all
+  links. Not supported on NVLink4 and earlier."; DCGM Feature Overview, "Background Health Checks" › "Failure Conditions"
+  `https://docs.nvidia.com/datacenter/dcgm/latest/user-guide/feature-overview.html#background-health-checks` "An NVLink
+  reported 1 or more errors. This includes datalink CRC, recovery, and replay errors (pre-Blackwell GPUs) and link recovery
+  events (Blackwell+ GPUs)."; DCGM v4.7.0 `modules/health/DcgmHealthWatch.cpp`
+  `https://github.com/NVIDIA/DCGM/blob/v4.7.0/modules/health/DcgmHealthWatch.cpp`: 1212 above 0 FAIL, 1211 above 0 WARN,
+  any change within a minute of the NVLink5 error counters FAIL, next step "Run a field diagnostic on the GPU."; DCGM Release
+  Notes 4.7.0 `https://docs.nvidia.com/datacenter/dcgm/latest/release-notes/changelog.html` "Removed NVLink bit-error-rate
+  thresholds that caused false health and diagnostic failures on healthy GB200 systems." (BER is not graded).
+- Fabric health (174/175): NVML API Reference, "Fabric Definitions"
+  `https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlFabricDefs.html` "Fabric Health Mask: Route is
+  unhealthy.", "Fabric Health Mask: Bandwidth degraded.", "Fabric Health Summary: Unhealthy.", "Fabric Health Summary:
+  Limited Capacity."; DCGM Field Identifiers
+  `https://docs.nvidia.com/datacenter/dcgm/latest/dcgm-api/dcgm-api-field-ids.html#c.DCGM_FI_DEV_FABRIC_HEALTH_MASK` "Use
+  DCGM_GPU_FABRIC_HEALTH_TEST macro to check the different health statuses."; DCGM v4.7.0 `MonitorFabricFields` next step
+  "Check DCGM and system logs for errors. Reset GPU. Restart DCGM. Rerun diagnostics."; nvidia-smi documentation
+  `https://docs.nvidia.com/deploy/nvidia-smi/index.html`, "Fabric" › "Health": "Summary - Summary of Fabric Health
+  <Healthy, Unhealthy, Limited Capacity>".
+- Memory repair: GPU Memory Error Management, "RAS Repair" › "GPU Memory Repair"
+  `https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/hbm-channel-repair.html#gpu-memory-repair` "The process of channel
+  repair requires a reboot to take effect."; nvidia-smi documentation, "ECC Errors": "If one of the repair flags is pending,
+  check the GPU Recovery action and take the appropriate steps."; DCGM Field Identifiers
+  `https://docs.nvidia.com/datacenter/dcgm/latest/dcgm-api/dcgm-api-field-ids.html#c.DCGM_FI_DEV_MEMORY_UNREPAIRABLE`
+  "Unrepairable memory flag indicating if memory has unrepairable errors 1=yes, 0=no"; NVML API Reference change log
+  `https://docs.nvidia.com/deploy/nvml-api/latest/change-log.html`, "Changes between v580 and v590": "Added
+  nvmlDeviceGetUnrepairableMemoryFlag_v1() to report whether or not there is unrepairable memory."
+
+Conclusion: on HGX B200/B300 the NVLink5 link-recovery counters answer for the NVLink fields NVML no longer reports; a
+failed link recovery (1212) drains, the other NVLink5 counters take the NVLink family's WARNING, an increment across a
+product window grades nothing and one an XID 144-150/155 owns is evidence; an XID 144-150 read from DCGM field 230 joins the
+kernel-sourced incident. A confirmed unhealthy fabric takes NVIDIA's full GPU + NVSwitch reset, a degraded one a diagnostic
+and an operator notice, NOT_SUPPORTED nothing. A pending memory repair is an operator's reboot unless the GPU recovery action
+decides; unrepairable memory takes the row-remap failure's RMA drain. Per-link fields, the NVSDM switch fields and the
+ConnectX bridge fields are deferred ([validation limitations](../../validation-limitations.md)).
+
 ## SXID
 
 SXID recovery follows the Fabric Manager User Guide:

@@ -5,7 +5,9 @@ candidates; the confirmation streaks, carry-over and recovery stay there.
 
 * :func:`state_breached`: a state that is bad as read -- a pending repair, a
   row-remap failure, a last XID, a fabric state held past its window, and from
-  batch 233 a confirmed PCIe downtrain. Delivered once confirmed, not at the
+  batch 233 a confirmed PCIe downtrain, from batch 235 unrepairable memory and
+  a fabric health fault held long enough to grade CRITICAL
+  (``gpu_fabric_health.held_breached``). Delivered once confirmed, not at the
   next summary. The slow states of batch 233 -- the ECC mode (it changes only
   across a reboot, whose first scrape is always delivered) and the InfoROM
   answer -- are state-change edges instead (``dcgm.STATE_CHANGE_REASONS``).
@@ -26,11 +28,13 @@ from collections import OrderedDict
 from datetime import datetime
 from typing import Any
 
+from gpu_fault.gpu_fabric_health import FABRIC_HEALTH_HELD_SECONDS, held_breached
 from gpu_fault.gpu_fabric_manager import (
     FABRIC_MANAGER_HELD_SECONDS,
     FABRIC_MANAGER_UNSETTLED_WINDOW_SECONDS,
 )
 from gpu_fault.gpu_field_rules import DUTY_MAX_PLAUSIBLE, HW_POWER_BRAKE_SLOWDOWN
+from gpu_fault.gpu_memory_repair_policy import MEMORY_UNREPAIRABLE
 from gpu_fault.gpu_pcie_link_policy import PCIE_CORRECTABLE_ERRORS, PCIE_LINK_DOWNTRAIN
 
 #: States graded bad whenever they are above zero.
@@ -41,6 +45,7 @@ POSITIVE_STATES = frozenset(
         "row_remap_pending",
         "xid_last_error",
         PCIE_LINK_DOWNTRAIN,
+        MEMORY_UNREPAIRABLE,
     }
 )
 #: Counters graded by rate in the edge filter, never on any change.
@@ -55,6 +60,8 @@ def state_breached(name: str, value: float, peers: dict[str, float]) -> bool:
         return value > 0
     if name == FABRIC_MANAGER_HELD_SECONDS:
         return value >= FABRIC_MANAGER_UNSETTLED_WINDOW_SECONDS
+    if name == FABRIC_HEALTH_HELD_SECONDS:
+        return held_breached(value, peers)
     return False
 
 

@@ -27,6 +27,7 @@ from gpu_fault.collectors.gpu.completeness import completeness_errors
 from gpu_fault.collectors.gpu.dcgm import DCGM_METRICS, DcgmMetricsCollector
 from gpu_fault.collectors.models import CollectorContext
 from gpu_fault.collectors.scheduling import next_stable_phase
+from gpu_fault.dcgm_fields import NVLINK5_LINK_RECOVERY_EXPORTER_NAMES
 from gpu_fault.gpu_metrics import GpuMetricBatch, GpuMetricSample
 from gpu_fault.gpu_temperature_policy import TLIMIT_READING
 from gpu_fault.models import RecoveryAction, WorkflowOperation
@@ -58,10 +59,13 @@ VALUES = {
 PCIE = "DCGM_FI_DEV_PCIE_REPLAY_COUNTER"
 ROW_REMAP_FAILURE = "DCGM_FI_DEV_ROW_REMAP_FAILURE"
 INVALID = "invalid or ambiguous GPU observation"
+#: Every exporter name that answers for the CRC group: the per-class counters,
+#: the DL aggregate and (batch 235) the NVLink5 link-recovery counters.
 NVLINK_CRC = (
     "DCGM_FI_DEV_NVLINK_CRC_FLIT_ERROR_COUNT_TOTAL",
     "DCGM_FI_DEV_NVLINK_CRC_DATA_ERROR_COUNT_TOTAL",
     "DCGM_FI_DEV_NVLINK_ERROR_DL_CRC",
+    *NVLINK5_LINK_RECOVERY_EXPORTER_NAMES,
 )
 MISSING = "DCGM exporter is missing required fields"
 COMPLETENESS_KEY = (CLUSTER, NODE, "node", "dcgm_field_completeness")

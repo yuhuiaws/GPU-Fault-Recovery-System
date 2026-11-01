@@ -41,6 +41,7 @@ from gpu_fault import dcgm_fields as DCGM_FIELDS
 from gpu_fault.admin import dcgm_exporter_release as EXPORTER_RELEASE
 from gpu_fault.collectors.gpu.dcgm import DCGM_METRICS
 from gpu_fault.dcgm_versions import exporter_tag_versions
+from gpu_fault.gpu_nvlink5_policy import NVLINK5_FIELDS
 from gpu_fault_release import regional_gpu_bootstrap as BOOTSTRAP
 from gpu_fault_release import regional_release_rendering as RENDERING
 from gpu_fault_release.regional_release_config import ReleaseError
@@ -74,6 +75,24 @@ VARIANTS = (
 #: The Prometheus types the collector reads. The exporter also accepts
 #: untyped and label; no DCGM field of this file is one of them.
 COUNTER_TYPES = frozenset({"gauge", "counter"})
+#: Batch 235's counters fields as go-dcgm v1.4611.2 resolves them.
+BLACKWELL_FIELD_IDS = {
+    "DCGM_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_SUCCESSFUL_EVENTS": 1211,
+    "DCGM_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_FAILED_EVENTS": 1212,
+    "DCGM_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_EVENTS": 1213,
+    "DCGM_FI_DEV_NVLINK_COUNT_RX_SYMBOL_ERRORS": 1214,
+    "DCGM_FI_DEV_NVLINK_COUNT_RX_MALFORMED_PACKET_ERRORS": 1204,
+    "DCGM_FI_DEV_NVLINK_COUNT_RX_BUFFER_OVERRUN_ERRORS": 1205,
+    "DCGM_FI_DEV_NVLINK_COUNT_RX_ERRORS": 1206,
+    "DCGM_FI_DEV_NVLINK_COUNT_RX_REMOTE_ERRORS": 1207,
+    "DCGM_FI_DEV_NVLINK_COUNT_RX_GENERAL_ERRORS": 1208,
+    "DCGM_FI_DEV_NVLINK_COUNT_LOCAL_LINK_INTEGRITY_ERRORS": 1209,
+    "DCGM_FI_DEV_NVLINK_COUNT_EFFECTIVE_ERRORS": 1219,
+    "DCGM_FI_DEV_NVLINK_ECC_DATA_ERROR_COUNT_TOTAL": 1220,
+    "DCGM_FI_DEV_FABRIC_HEALTH_MASK": 174,
+    "DCGM_FI_DEV_FABRIC_HEALTH_SUMMARY": 175,
+    "DCGM_FI_DEV_MEMORY_UNREPAIRABLE_FLAG": 1507,
+}
 #: The exporter release the field table below was read for, and its go-dcgm.
 PINNED_EXPORTER = ("4.6.1", "4.8.4")
 PINNED_GO_DCGM = "v1.4611.2"
@@ -140,9 +159,15 @@ PINNED_FIELD_IDS = {
     "DCGM_FI_DEV_PCIE_LINK_WIDTH": 238,
     "DCGM_FI_DEV_CLOCKS_EVENT_REASON_HW_THERM_SLOWDOWN_NS": 1423,
     "DCGM_FI_DEV_CLOCKS_EVENT_REASON_HW_POWER_BRAKE_SLOWDOWN_NS": 1424,
+    # Batch 235 (the Blackwell field audit). Legacy names: const_fields.go
+    # lines 2839-2850 (1204-1209, 1211-1214), 2822 (1219), 2894 (1220) and 2792
+    # (1507) of v1.4611.2; 174/175 are in its current map (lines 2157/2158; 175
+    # has no other name).
+    **BLACKWELL_FIELD_IDS,
 }
 LEGACY_NAMES = frozenset(
     {
+        *(name for name in BLACKWELL_FIELD_IDS if "FABRIC_HEALTH" not in name),
         "DCGM_FI_DEV_BANKS_REMAP_ROWS_AVAIL_LOW",
         "DCGM_FI_DEV_BANKS_REMAP_ROWS_AVAIL_NONE",
         "DCGM_FI_DEV_ECC_CURRENT",
@@ -635,10 +660,10 @@ UNKNOWN_TO_THE_PINNED_GO_DCGM = frozenset(
 def test_the_batch_233_fields_are_exported_typed_mapped_and_never_required() -> None:
     """The field audit's additions (1523, 235-238, 346, 388/389, 1423/1424,
     300/301, 1501): exported under the 4.5.3 name the pinned go-dcgm resolves,
-    read under that and the 4.6 name, never a required field. The fabric
-    health fields 174/175 read NOT_SUPPORTED on H200 + driver 580 and the
-    per-link NVLink state 1508 waits for an exporter staging check: neither is
-    exported (docs/validation-limitations.md)."""
+    read under that and the 4.6 name, never a required field. The per-link
+    NVLink state 1508 waits for an exporter staging check and is not exported
+    (docs/validation-limitations.md); the fabric health fields 174/175 are
+    exported since batch 235 (below)."""
 
     kinds = {
         fields[0]: fields[1]
@@ -664,8 +689,6 @@ def test_the_batch_233_fields_are_exported_typed_mapped_and_never_required() -> 
             assert renamed not in kinds, "the CSV lists one name per field"
     exported = set(kinds)
     for absent in (
-        "DCGM_FI_DEV_FABRIC_HEALTH_MASK",
-        "DCGM_FI_DEV_FABRIC_HEALTH_SUMMARY",
         "DCGM_FI_DEV_NVLINK_GET_STATE",
         "DCGM_FI_DEV_NVLINK_LINK_STATUS",
         "DCGM_FI_DEV_INFOROM_CONFIG_VALID",
@@ -676,6 +699,77 @@ def test_the_batch_233_fields_are_exported_typed_mapped_and_never_required() -> 
             f"{absent} must stay out of the counters CSV (skipped, deferred, read "
             "elsewhere or unknown to the pinned go-dcgm)"
         )
+
+
+#: The NVLink5 counters' CSV names -> their DCGM 4.6 names.
+DCGM_FIELDS_46_NAMES = {
+    legacy: current for _field, legacy, current in NVLINK5_FIELDS.values()
+}
+#: Batch 235's fields: the Prometheus type each is exported as and the DCGM 4.6
+#: name the collector also reads (``None``: one name only).
+BLACKWELL_FIELDS = {
+    **{
+        name: ("counter", DCGM_FIELDS_46_NAMES[name])
+        for name in BLACKWELL_FIELD_IDS
+        if name in DCGM_FIELDS_46_NAMES
+    },
+    "DCGM_FI_DEV_FABRIC_HEALTH_MASK": ("gauge", None),
+    "DCGM_FI_DEV_FABRIC_HEALTH_SUMMARY": ("gauge", None),
+    "DCGM_FI_DEV_MEMORY_UNREPAIRABLE_FLAG": (
+        "gauge",
+        "DCGM_FI_DEV_MEMORY_UNREPAIRABLE",
+    ),
+}
+#: Fields batch 235 leaves out on purpose: BER 1215-1218 (DCGM 4.7.0 removed
+#: their thresholds), the FEC history 1404-1419, the per-link state 1508, the
+#: NVSDM switch fields 784/785/864/870/858 and the ConnectX bridge fields
+#: 1300/1307/1309 (docs/validation-limitations.md).
+BLACKWELL_LEFT_OUT = (
+    "DCGM_FI_DEV_NVLINK_COUNT_SYMBOL_BER",
+    "DCGM_FI_DEV_NVLINK_COUNT_SYMBOL_BER_FLOAT",
+    "DCGM_FI_DEV_NVLINK_COUNT_EFFECTIVE_BER",
+    "DCGM_FI_DEV_NVLINK_COUNT_EFFECTIVE_BER_FLOAT",
+    *(f"DCGM_FI_DEV_NVLINK_COUNT_FEC_HISTORY_{index}" for index in range(16)),
+    "DCGM_FI_DEV_NVLINK_GET_STATE",
+    "DCGM_FI_DEV_NVSWITCH_LINK_REPLAY_ERRORS",
+    "DCGM_FI_DEV_NVSWITCH_LINK_RECOVERY_ERRORS",
+    "DCGM_FI_DEV_NVSWITCH_RESET_REQUIRED",
+    "DCGM_FI_DEV_NVSWITCH_LINK_STATUS",
+    "DCGM_FI_DEV_NVSWITCH_TEMPERATURE_CURRENT",
+    "DCGM_FI_DEV_CONNECTX_HEALTH",
+    "DCGM_FI_DEV_CONNECTX_UNCORRECTABLE_ERR_STATUS",
+    "DCGM_FI_DEV_CONNECTX_UNCORRECTABLE_ERR_SEVERITY",
+)
+
+
+def test_the_batch_235_fields_are_exported_typed_mapped_and_never_required() -> None:
+    """The Blackwell audit's additions (1204-1209, 1211-1214, 1219, 1220,
+    174/175, 1507): exported, every name one the pinned go-dcgm knows (no id
+    past its table's end, 1612), read under both names, never required -- the
+    link-recovery trio only *answers* for the NVLink groups."""
+
+    kinds = {
+        fields[0]: fields[1]
+        for _number, fields in _exporter_records(COUNTERS.read_text(encoding="utf-8"))
+    }
+    required = {
+        name for group in DCGM_FIELDS.DCGM_EXPORTER_FIELD_GROUPS for name in group
+    }
+    recovery = set(DCGM_FIELDS.NVLINK5_LINK_RECOVERY_EXPORTER_NAMES)
+    for name, (kind, renamed) in BLACKWELL_FIELDS.items():
+        assert kinds.get(name) == kind, f"{name}: {kinds.get(name)!r}"
+        assert PINNED_FIELD_IDS[name] <= 1612, name
+        assert (name in required) is (name in recovery), (
+            f"{name}: only the link-recovery counters are NVLink-group alternatives"
+        )
+        canonical = DCGM_METRICS[name][0]
+        assert canonical not in DCGM_FIELDS.DCGM_CORE_CANONICAL_FIELDS, name
+        if renamed is not None:
+            assert DCGM_METRICS[renamed] == DCGM_METRICS[name], name
+            assert renamed not in kinds, "the CSV lists one name per field"
+    assert set(BLACKWELL_FIELDS) == set(BLACKWELL_FIELD_IDS)
+    for absent in BLACKWELL_LEFT_OUT:
+        assert absent not in kinds and absent not in DCGM_METRICS, absent
 
 
 def test_the_field_table_was_read_for_the_pinned_exporter() -> None:

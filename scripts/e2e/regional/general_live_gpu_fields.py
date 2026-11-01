@@ -100,10 +100,13 @@ def alias_families() -> dict[str, tuple[str, ...]]:
     (``collectors/gpu/dcgm.DCGM_METRICS``) that the completeness profile may
     serve (``tools/gpu_dcgm_field_replay.PROFILES``).
 
-    On the shipped product that is ``clock_throttle_reasons`` alone: DCGM 4
+    On the shipped product that is ``clock_throttle_reasons``: DCGM 4
     renamed ``DCGM_FI_DEV_CLOCK_THROTTLE_REASONS`` to
     ``DCGM_FI_DEV_CLOCKS_EVENT_REASONS`` and an exporter publishes one of the
     two; the T.Limit pair is a thermal-safety reading the profile excludes.
+    From batch 235 the NVLink5 link-recovery counters (fields 1211-1213, NVLink
+    completeness members on Blackwell) follow it, read under their DCGM 4.5.3
+    and 4.6 names; a Hopper node publishes none of them.
     """
 
     names: dict[str, set[str]] = {}

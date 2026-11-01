@@ -6,6 +6,7 @@ import math
 from typing import Any
 
 from gpu_fault.gpu_metric_models import GpuHealthSeverity
+from gpu_fault.gpu_nvlink5_policy import NVLINK5_DCGM_ALIASES
 from gpu_fault.models import RecoveryAction
 
 NVML_CLOCK_REFERENCE = "https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlClocksEventReasons.html"
@@ -74,6 +75,11 @@ DCGM_ENVIRONMENT_ALIASES = (
             "DCGM_FI_DEV_PCIE_COUNT_CORRECTABLE_ERRORS",
             "DCGM_FI_DEV_PCIE_CORRECTABLE_ERROR_TOTAL",
         }
+    ),
+    # Batch 235: the NVLink5 counters and field 1507 (175 has one name only).
+    *NVLINK5_DCGM_ALIASES,
+    frozenset(
+        {"DCGM_FI_DEV_MEMORY_UNREPAIRABLE_FLAG", "DCGM_FI_DEV_MEMORY_UNREPAIRABLE"}
     ),
 )
 #: Field 1423 grades like 241 (batch 233): both are thermal limiting time, 1423

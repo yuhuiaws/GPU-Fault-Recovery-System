@@ -42,7 +42,14 @@ from gpu_fault.collectors.gpu.field_edges import (
 )
 from gpu_fault.collectors.gpu.inforom import InforomValidityProbe
 from gpu_fault.collectors.gpu.pcie_link import PcieLinkDowntrainTracker
+from gpu_fault.collectors.gpu.smi_health import SmiHealthProbe, merge_unrepairable
 from gpu_fault.env import env_bool
+from gpu_fault.gpu_fabric_health import (
+    FABRIC_HEALTH_MASK,
+    FABRIC_HEALTH_SUMMARY,
+    FABRIC_HEALTH_XML,
+)
+from gpu_fault.gpu_fabric_health import held_samples as fabric_health_held
 from gpu_fault.gpu_fabric_manager import (
     FABRIC_MANAGER_ERROR_CODE,
     FABRIC_MANAGER_STATUS,
@@ -66,6 +73,12 @@ from gpu_fault.gpu_pcie_link_policy import (
     PCIE_LINK_WIDTH_MAX,
     correctable_rate_limit,
 )
+from gpu_fault.gpu_memory_repair_policy import (
+    MEMORY_CHANNEL_REPAIR_PENDING,
+    MEMORY_TPC_REPAIR_PENDING,
+    MEMORY_UNREPAIRABLE,
+)
+from gpu_fault.gpu_nvlink5_policy import NVLINK5_DCGM_METRICS
 from gpu_fault.gpu_recovery_action_policy import GPU_RECOVERY_ACTION
 from gpu_fault.gpu_metrics import (
     GpuMetricBatch,
@@ -120,8 +133,9 @@ DCGM_NANOSECOND_DURATION_FIELDS = {
 #: State gauges whose every change is a delivery edge: the last XID, a GPU's
 #: NVLink fabric state (VALIDATE_GPU waits on the change to SUCCESS), and from
 #: batch 233 the driver's recovery action, the SRAM RMA flag, the banks with no
-#: spare row left, the ECC mode and the InfoROM answer. The PCIe link gauges
-#: are not: an idle GPU may downshift.
+#: spare row left, the ECC mode and the InfoROM answer; from batch 235 the
+#: fabric health (174/175 and the XML reading) and the memory-repair flags. The
+#: PCIe link gauges are not: an idle GPU may downshift.
 STATE_CHANGE_REASONS = {
     "xid_last_error": "xid-changed",
     FABRIC_MANAGER_STATUS: "fabric-manager-status-changed",
@@ -131,6 +145,12 @@ STATE_CHANGE_REASONS = {
     ECC_MODE_CURRENT: "ecc-mode-changed",
     ECC_MODE_PENDING: "ecc-mode-changed",
     INFOROM_CHECKSUM_VALID: "inforom-validity-changed",
+    FABRIC_HEALTH_MASK: "fabric-health-changed",
+    FABRIC_HEALTH_SUMMARY: "fabric-health-changed",
+    FABRIC_HEALTH_XML: "fabric-health-changed",
+    MEMORY_CHANNEL_REPAIR_PENDING: "memory-repair-changed",
+    MEMORY_TPC_REPAIR_PENDING: "memory-repair-changed",
+    MEMORY_UNREPAIRABLE: "memory-repair-changed",
 }
 
 DCGM_METRICS: dict[str, tuple[str, str | None]] = {
@@ -296,6 +316,17 @@ DCGM_METRICS: dict[str, tuple[str, str | None]] = {
     "DCGM_FI_DEV_ECC_PENDING": (ECC_MODE_PENDING, None),
     "DCGM_FI_DEV_PCIE_COUNT_CORRECTABLE_ERRORS": (PCIE_CORRECTABLE_ERRORS, "errors"),
     "DCGM_FI_DEV_PCIE_CORRECTABLE_ERROR_TOTAL": (PCIE_CORRECTABLE_ERRORS, "errors"),
+    # Batch 235 (the Blackwell field audit), exported and never required, read
+    # under the 4.5.3 name the CSV exports and the DCGM 4.6 name: the NVLink5
+    # counters 1204-1209, 1211-1214, 1219, 1220 (gpu_nvlink5_policy; 1211-1213
+    # also answer for the NVLink completeness groups), the fabric health mask
+    # and summary 174/175 (gpu_fabric_health; 175 has only its 4.6 name) and
+    # the unrepairable-memory flag 1507 (gpu_memory_repair_policy).
+    **NVLINK5_DCGM_METRICS,
+    "DCGM_FI_DEV_FABRIC_HEALTH_MASK": (FABRIC_HEALTH_MASK, "bitmask"),
+    "DCGM_FI_DEV_FABRIC_HEALTH_SUMMARY": (FABRIC_HEALTH_SUMMARY, None),
+    "DCGM_FI_DEV_MEMORY_UNREPAIRABLE_FLAG": (MEMORY_UNREPAIRABLE, None),
+    "DCGM_FI_DEV_MEMORY_UNREPAIRABLE": (MEMORY_UNREPAIRABLE, None),
 }
 
 
@@ -619,6 +650,9 @@ class DcgmMetricsCollector:
         self._inforom = InforomValidityProbe(
             interval_seconds=self.inventory_interval_seconds, logger=LOGGER
         )
+        self._smi_health = SmiHealthProbe(
+            interval_seconds=self.inventory_interval_seconds, logger=LOGGER
+        )
         self._correctable_rates = CorrectableRateGate(
             stale_seconds=interval_seconds * DUTY_CYCLE_STALE_CARRY_OVER_INTERVALS,
             max_keys=self.state_max_keys,
@@ -644,7 +678,9 @@ class DcgmMetricsCollector:
         missing_fields = completeness_errors(samples) if samples else []
         timestamp = observed_at or self.now()
         samples.extend(held_samples(samples, self._value_first_seen, timestamp))
-        samples.extend([*self._pcie_links.observe(samples), *(extra_samples or [])])
+        samples.extend(fabric_health_held(samples, self._value_first_seen, timestamp))
+        extra = merge_unrepairable(samples, extra_samples or [])
+        samples.extend([*self._pcie_links.observe(samples), *extra])
         samples = self._shutdown_limits.resolve(samples)
         samples = [
             sample.model_copy(
@@ -1112,7 +1148,11 @@ class DcgmMetricsCollector:
                 f"cannot scrape DCGM exporter: {self.metrics_url}"
             ) from exc
         limits = self._temperature_limits.refresh(observed_at, self.runner)
-        limits = [*limits, *self._inforom.refresh(observed_at, self.runner)]
+        limits = [
+            *limits,
+            *self._inforom.refresh(observed_at, self.runner),
+            *self._smi_health.refresh(observed_at, self.runner),
+        ]
         return self.collect_text(text, observed_at=observed_at, extra_samples=limits)
 
     def _report_collection_error(self, exc: BaseException) -> None:

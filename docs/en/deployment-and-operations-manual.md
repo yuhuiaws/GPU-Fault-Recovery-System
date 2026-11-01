@@ -7530,6 +7530,11 @@ Rule sources and default handling are as follows:
 | HW thermal slowdown time (DCGM 1423) | Graded as the thermal violation time | NVML clock event reason counters |
 | ECC disabled (DCGM 300 = 0) or an ECC mode change pending (301 ≠ 300) | Warning, hand to an operator (without ECC the memory rules are blind) | NVML `nvmlDeviceGetMemoryErrorCounter` / `nvmlDeviceGetEccMode` |
 | InfoROM checksum invalid (nvidia-smi `inforom.checksum_validation`, inventory cadence) | Warning, hand to an operator (flash the InfoROM); the GPU's memory-repair evidence is untrusted | NVIDIA Dynamic Page Retirement; DCGM `DCGM_FR_CORRUPT_INFOROM` |
+| NVLink5 link recovery failed (DCGM 1212, HGX B200/B300) increment `>=1` | Critical, drain: cordon, [stop jobs], isolate, collect the diagnostic bundle, hand to support (the NVIDIA field diagnostic); evidence only while an XID 144-150/155 owns the GPU; nothing across a product quiesce, reset, reboot or Fabric Manager window | NVIDIA DCGM Health `DCGM_FR_NVLINK_ERROR_CRITICAL` (DCGM 4.7.0 FAIL) |
+| Other NVLink5 counters (DCGM 1204-1209, 1211, 1213, 1214, 1219, 1220) increment `>=1` | Warning, run diagnostics (the NVLink family rule); the same window and XID exceptions; a decrease re-baselines the aggregate | NVIDIA DCGM Health `MonitorNVLink5Fields` |
+| NVLink fabric health (DCGM 174/175) | UNHEALTHY (summary, route unhealthy, incorrect configuration) held 60 s, or a route recovery held 300 s, outside product fabric windows: Critical, the full GPU + NVSwitch reset of an untrained fabric; degraded bandwidth or LIMITED_CAPACITY: Warning, run diagnostics, operator notice; NOT_SUPPORTED (the H200 reading): nothing | NVIDIA DCGM Health `MonitorFabricFields`; NVML fabric health definitions |
+| GPU memory repair pending (nvidia-smi `<channel_repair_pending>` / `<tpc_repair_pending>`, inventory cadence) | GPU recovery action (1523) None: Warning, hand to an operator (reboot in a service window: the repair takes effect at the next reboot); otherwise the recovery action decides | NVIDIA GPU Memory Error Management "RAS Repair"; nvidia-smi "ECC Errors" |
+| Unrepairable memory (nvidia-smi `<unrepairable_memory>` or DCGM 1507 = 1) | Critical, as a row-remap failure: stop jobs and isolate, RMA only after the NVIDIA Field Diagnostic | NVIDIA DCGM Health `DCGM_FR_FAULTY_MEMORY` |
 | NVLink error counter delta `>=1` | Critical, stop affected jobs, isolate and analyse the GPU | NVIDIA DCGM Health `DCGM_FR_NVLINK_ERROR_CRITICAL` |
 | Untrained NVLink fabric (`fabric_manager_status`): the Fabric Manager state of a GPU on a graded NVSwitch node (Hopper SXM, HGX B200/B300) held NotStarted/InProgress/Failure for >=300 s | Critical, cordon, [stop jobs], reset every GPU and NVSwitch inside the quiesce window (the restore starts a Fabric Manager that is not running) and validate that every GPU's fabric state is Success; failure escalates to reboot, then warm-spare replacement | NVIDIA Fabric Manager User Guide (`NVIDIA_FABRIC_MANAGER_STATE`); the 300 s window is a site constant, not configurable |
 | Volatile DBE non-zero or increased | Critical, stop affected jobs, isolate and analyse the GPU | NVIDIA DCGM Health `DCGM_FR_VOLATILE_DBE_DETECTED` |
@@ -7727,6 +7732,33 @@ NVIDIA's text are in the detailed design §2.4.1 ("The DCGM field audit's fields
 above. Blackwell (B200/B300): every one of these rules is unit-tested from NVIDIA documentation, not live-verified (no B-series hardware). Changing the CSV changes the counters digest of the
 exporter pod template, so the release rolls the exporter node by node.
 
+Blackwell fields (batch 235): the CSV also exports the NVLink5 counters of HGX B200/B300 --
+`DCGM_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_SUCCESSFUL_EVENTS` (1211), `DCGM_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_FAILED_EVENTS` (1212),
+`DCGM_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_EVENTS` (1213), `DCGM_FI_DEV_NVLINK_COUNT_RX_SYMBOL_ERRORS` (1214),
+`DCGM_FI_DEV_NVLINK_COUNT_RX_MALFORMED_PACKET_ERRORS` (1204), `DCGM_FI_DEV_NVLINK_COUNT_RX_BUFFER_OVERRUN_ERRORS` (1205),
+`DCGM_FI_DEV_NVLINK_COUNT_RX_ERRORS` (1206), `DCGM_FI_DEV_NVLINK_COUNT_RX_REMOTE_ERRORS` (1207),
+`DCGM_FI_DEV_NVLINK_COUNT_RX_GENERAL_ERRORS` (1208), `DCGM_FI_DEV_NVLINK_COUNT_LOCAL_LINK_INTEGRITY_ERRORS` (1209),
+`DCGM_FI_DEV_NVLINK_COUNT_EFFECTIVE_ERRORS` (1219), `DCGM_FI_DEV_NVLINK_ECC_DATA_ERROR_COUNT_TOTAL` (1220) as counters -- and
+`DCGM_FI_DEV_FABRIC_HEALTH_MASK` (174), `DCGM_FI_DEV_FABRIC_HEALTH_SUMMARY` (175) and `DCGM_FI_DEV_MEMORY_UNREPAIRABLE_FLAG`
+(1507) as gauges. All but 174/175 carry their DCGM 4.5.3 names (deprecated aliases in go-dcgm `v1.4611.2`'s legacy map; 175 has
+only its DCGM 4.6 name); the collector reads both names. Every one is exported and never required, except that 1211-1213 now also
+*answer* for the required NVLink fields: NVML does not report the data-link counters (497-499) on Blackwell, so
+`GPU_FAULT_DCGM_REQUIRED_METRICS`' default lists the link-recovery names as alternatives of each NVLink group, and a B-series
+exporter that serves them is complete. A Hopper node reports none of the NVLink5 fields and reads 174/175 as 0 (NOT_SUPPORTED):
+it grades exactly as before. The DCGM collector also reads the nvidia-smi XML (`nvidia-smi -q -x`) once per inventory interval for
+the memory-repair flags and the `<fabric><health>` sub-tags (live H200 R580: every repair flag `No`, every sub-tag `N/A`); a failed
+query backs off like the temperature-limit probe. What each field grades and NVIDIA's text are in the detailed design §2.4.1
+("HGX B200/B300 DCGM fields"). Blackwell (B200/B300): every one of these rules is unit-tested from NVIDIA documentation, not
+live-verified (no B-series hardware).
+
+**B-series nodes and the DCGM host engine.** Run the DCGM host engine 4.7.0 or later on HGX B200/B300 (`p6-b200.48xlarge`,
+`p6-b300.48xlarge`) nodes: DCGM 4.7.0 removed the NVLink bit-error-rate thresholds that failed healthy GB200 systems in `dcgmi
+diag` (DCGM Release Notes 4.7.0: "Removed NVLink bit-error-rate thresholds that caused false health and diagnostic failures on
+healthy GB200 systems.") -- `RUN_DIAGNOSTICS` runs `dcgmi diag` -- and per-link NVLink5 values are live only from 4.7.0. For a
+plain EKS node group in host mode that means `prepare-eks-nodegroup --dcgm-hostengine host` with a 4.7.x `--dcgm-version` for
+the B-series node group (the 4.6.1-1 pin stays for the H200 node groups); until an exporter release with a DCGM 4.7.0 or newer
+client exists, such a node is the `host-newer` pairing the advisories below name.
+
 The exporter reads the CSV only at process start and the DaemonSet mounts the ConfigMap with subPath, which a running Pod never sees
 refreshed, so a counters-only release used to update the ConfigMap and restart no Pod. The pod template of
 `deploy/dataplane/hyperpod-dcgm-exporter.yaml` now carries the annotation `gpu-fault.io/dcgm-counters-sha256` (the sha256 of the CSV
@@ -7833,7 +7865,7 @@ still caught by the DCGM collection checks (missing fields, failed scrapes).
   (`DCGM_REMOTE_HOSTENGINE_INFO`); the `host:port` form is unchanged, the URI forms need DCGM ≥ 4.5.
 - CSV format unchanged: Go `encoding/csv`, `#` comments, exactly 3 fields, types counter/gauge/untyped/label; an unknown field name
   still fails the start-up; the retired PCIe throughput fields 200/201 are now refused (not in the solution's CSV).
-- All 50 fields of the solution's CSV resolve in go-dcgm `v1.4611.2`, 30 of them as deprecated aliases kept in its legacy map (e.g.
+- All 65 fields of the solution's CSV resolve in go-dcgm `v1.4611.2`, 43 of them as deprecated aliases kept in its legacy map (e.g.
   `DCGM_FI_DEV_GPU_TEMP`, whose current name is `DCGM_FI_DEV_GPU_TEMP_CELSIUS`); the exporter renders each under the CSV's name, so
   metric names and the collector mapping are unchanged.
 - The label `Hostname` is renamed `hostname` (4.8.3, #655); with a loopback remote host engine the label is the local hostname
@@ -11851,9 +11883,13 @@ DCGM_FI_DEV_ECC_DBE_VOL_TOTAL
 DCGM_FI_DEV_PCIE_REPLAY_COUNTER
 DCGM_FI_DEV_NVLINK_CRC_FLIT_ERROR_COUNT_TOTAL
   or DCGM_FI_DEV_NVLINK_ERROR_DL_CRC
+  or (HGX B200/B300, batch 235) DCGM_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_SUCCESSFUL_EVENTS,
+     DCGM_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_FAILED_EVENTS, DCGM_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_EVENTS
+     or their DCGM 4.6 names
 ```
 
-This can be overridden via `GPU_FAULT_DCGM_REQUIRED_METRICS`, but validating only HTTP 200 or arbitrary
+Each of the three NVLink groups (CRC, recovery, replay) takes the NVLink5 link-recovery counters as alternatives: NVML does not
+report the data-link counters on Blackwell. This can be overridden via `GPU_FAULT_DCGM_REQUIRED_METRICS`, but validating only HTTP 200 or arbitrary
 `DCGM_FI_DEV_*` fields is not acceptable. Fresh XID events are obtained by the KernelLogCollector from `/dev/kmsg`;
 `DCGM_FI_DEV_XID_ERRORS` is an optional persistent-state supplement and is therefore not listed as a default hard requirement of the exporter.
 

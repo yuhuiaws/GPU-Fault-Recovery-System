@@ -28,11 +28,12 @@ from gpu_fault.gpu_composites import (
 from gpu_fault.gpu_composites import (
     SITE_CORRELATION_POLICY_VERSION as SITE_CORRELATION_POLICY_VERSION,
 )
-from gpu_fault.gpu_fabric_manager import track_fabric_manager_state
+from gpu_fault.gpu_fabric_health import track_fabric_findings
 from gpu_fault.gpu_field_rules import (
     FIELD_RULE_NAMES,
     GPU_FIELD_COUNTERS,
     field_rule_decision,
+    field_rule_gate,
 )
 from gpu_fault.gpu_field_rules import HW_THERMAL_SLOWDOWN as HW_SLOWDOWN
 from gpu_fault.gpu_pcie_link_policy import PCIE_LINK_CONTEXT, replay_decision
@@ -41,6 +42,12 @@ from gpu_fault.gpu_metric_models import (
     GpuHealthSeverity,
 )
 from gpu_fault.gpu_memory_policy import MEMORY_METRICS, memory_decision
+from gpu_fault.gpu_nvlink5_policy import (
+    nvlink_class,
+    nvlink_component,
+    nvlink_composite_grade,
+    nvlink_family_decision,
+)
 from gpu_fault.gpu_observation import metric_device_key, normalize_gpu_observation
 from gpu_fault.gpu_metric_models import (
     GpuFindingState as GpuFindingState,
@@ -48,11 +55,7 @@ from gpu_fault.gpu_metric_models import (
 from gpu_fault.gpu_metric_models import (
     GpuHealthFinding as GpuHealthFinding,
 )
-from gpu_fault.gpu_power_policy import (
-    NVIDIA_DCGM_HEALTH_REFERENCE,
-    NVIDIA_DCGM_POLICY_VERSION,
-    power_violation_decision,
-)
+from gpu_fault.gpu_power_policy import power_violation_decision
 from gpu_fault.gpu_environment_policy import (
     clock_reason_decision,
     confirm_environment_decision,
@@ -550,9 +553,9 @@ class GpuMetricsService:
                 xid = self._xid_event(batch, sample, gpu_key)
                 if xid is not None:
                     xid_events.append(xid)
-            # The NVLink fabric state (DCGM field 170) is one finding per node,
-            # graded over every GPU's state rather than per sample.
-            track_fabric_manager_state(
+            # The NVLink fabric state (DCGM field 170) and health (174/175) are
+            # one finding each per node, graded over every GPU, not per sample.
+            track_fabric_findings(
                 self.store, batch, findings, finding_updates, findings_by_update
             )
             activated_values = self.store.update_gpu_findings(finding_updates)
@@ -729,9 +732,7 @@ class GpuMetricsService:
         node_nvlink_components = [
             finding
             for finding in active_components
-            if finding.canonical_name.startswith("nvlink_")
-            and finding.canonical_name.endswith("_error_total")
-            and finding.gpu_uuid
+            if nvlink_component(finding) and finding.gpu_uuid
         ]
         nvlink_gpu_uuids = sorted(
             {finding.gpu_uuid for finding in node_nvlink_components if finding.gpu_uuid}
@@ -745,11 +746,10 @@ class GpuMetricsService:
                 component_metrics=sorted(
                     {finding.canonical_name for finding in node_nvlink_components}
                 ),
-                severity=GpuHealthSeverity.WARNING,
-                action=RecoveryAction.RUN_DIAGNOSTICS,
-                reason=(
-                    "correlated NVLink errors affected multiple GPUs; "
-                    "inspect fabric topology; counters alone do not prove a fatal failure"
+                **nvlink_composite_grade(
+                    node_nvlink_components,
+                    "correlated NVLink errors affected multiple GPUs; inspect fabric "
+                    "topology; counters alone do not prove a fatal failure",
                 ),
                 affected_gpu_uuids=nvlink_gpu_uuids,
                 confidence="MEDIUM",
@@ -1116,12 +1116,10 @@ class GpuMetricsService:
         candidates,
     ) -> None:
         nvlink = [
-            finding
-            for name, finding in components.items()
-            if name.startswith("nvlink_") and name.endswith("_error_total")
+            finding for finding in components.values() if nvlink_component(finding)
         ]
         if (
-            len({item.canonical_name for item in nvlink}) >= 2
+            len({nvlink_class(item.canonical_name) for item in nvlink}) >= 2
             and len(nvlink_gpu_uuids) < 2
         ):
             candidates[(gpu_key, "NVLINK_LINK_DEGRADATION")] = composite_finding(
@@ -1132,9 +1130,9 @@ class GpuMetricsService:
                 component_metrics=sorted(
                     {finding.canonical_name for finding in nvlink}
                 ),
-                severity=GpuHealthSeverity.WARNING,
-                action=RecoveryAction.RUN_DIAGNOSTICS,
-                reason=("multiple NVLink error classes increased on the same GPU"),
+                **nvlink_composite_grade(
+                    nvlink, "multiple NVLink error classes increased on the same GPU"
+                ),
                 confidence="MEDIUM",
             )
 
@@ -1205,6 +1203,8 @@ class GpuMetricsService:
                 )
                 if decision is not None:
                     break
+        # b235: NVLink5 product windows / XID evidence, XID 160/161 evidence.
+        decision = field_rule_gate(self, batch, sample, decision, previous_latest)
         if decision is None:
             return None
         if sample.canonical_name in TEMPERATURE_FINDING_NAMES | {
@@ -1255,28 +1255,9 @@ class GpuMetricsService:
         replay = replay_decision(self.thresholds, sample, rate, limits)
         if replay is not None:
             return replay
-        if (
-            name.startswith("nvlink_")
-            and name.endswith("_error_total")
-            and delta is not None
-            and delta >= self.thresholds.nvlink_error_delta_critical
-        ):
-            source = (
-                "NVIDIA_DCGM_HEALTH"
-                if self.thresholds.nvlink_error_delta_critical == 1
-                else "SITE_OVERRIDE_NVIDIA_DCGM_HEALTH"
-            )
-            return {
-                "severity": GpuHealthSeverity.WARNING,
-                "reason": "NVLink error counter increased; diagnose link errors and rate",
-                "automatic_action": RecoveryAction.RUN_DIAGNOSTICS.value,
-                "policy_source": "SITE_NVLINK_COUNTER_EVIDENCE",
-                "policy_version": NVIDIA_DCGM_POLICY_VERSION
-                if source == "NVIDIA_DCGM_HEALTH"
-                else SITE_METRIC_POLICY_VERSION,
-                "policy_reference": NVIDIA_DCGM_HEALTH_REFERENCE,
-                "official_action": "EXAMINE_GPU_HEALTH",
-            }
+        if name.startswith("nvlink_") and name.endswith("_error_total"):
+            # The family rule, the NVLink5 error counters included (b235).
+            return nvlink_family_decision(self.thresholds, delta)
         return None
 
     def _throttle_decision(self, sample, delta, rate, _limits, previous):

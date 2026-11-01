@@ -40,6 +40,7 @@ from gpu_fault.policy.models import (
     XidPolicy,
     _Resolution,
 )
+from gpu_fault.policy.nvlink5_gauge import workflow_nvlink5
 from gpu_fault.policy.nvlink74 import resolve_nvlink74
 from gpu_fault.policy.product_families import (
     ProductFamilyPolicyMixin,
@@ -1458,7 +1459,8 @@ _XID_WORKFLOW_RESOLVERS: dict[str, _XidWorkflowResolver] = {
     "WORKFLOW_XID_45": GpuFaultPolicyEngine._workflow_xid_45,
     "WORKFLOW_XID_48": GpuFaultPolicyEngine._workflow_xid_48,
     "WORKFLOW_NVLINK_ERR": GpuFaultPolicyEngine._workflow_nvlink74,
-    "WORKFLOW_NVLINK5_ERR": GpuFaultPolicyEngine._workflow_nvlink5,
+    # A DCGM field-230 gauge change follows its kernel twin (nvlink5_gauge).
+    "WORKFLOW_NVLINK5_ERR": workflow_nvlink5,
     "CHECK_UVM": GpuFaultPolicyEngine._workflow_check_uvm,
     "CONTACT_SUPPORT": GpuFaultPolicyEngine._workflow_operator_review,
     "CHECK_MECHANICALS": GpuFaultPolicyEngine._workflow_operator_review,

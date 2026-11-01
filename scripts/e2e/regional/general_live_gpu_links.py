@@ -12,10 +12,12 @@ survey picks the member this node's exporter really publishes
 (``GpuSurvey.nvlink_counter``): the legacy per-class counter on NVLink3 and
 earlier parts (``nvlink_crc_flit_error_total`` from
 ``DCGM_FI_DEV_NVLINK_CRC_FLIT_ERROR_COUNT_TOTAL``), the DL aggregate on
-Hopper/NVLink4 and later (``nvlink_crc_aggregate_error_total`` from
+Hopper/NVLink4 (``nvlink_crc_aggregate_error_total`` from
 ``DCGM_FI_DEV_NVLINK_ERROR_DL_CRC``) -- live 2026-10-26 the p5en H200 nodes
 report only the aggregates and the flit name hard-coded here before left all
-eight variants NOT_RUN(CAPABILITY_ABSENT). The product grades every member of
+eight variants NOT_RUN(CAPABILITY_ABSENT) -- and on B200/B300 (NVLink5, no DL
+counters: batch 235) the link-recovery total ``nvlink_link_recovery_total``
+from ``DCGM_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_EVENTS`` (field 1213). The product grades every member of
 a family alike; the chosen canonical name and its exporter metric go into the
 variant's notes and ``canonical_name`` / ``exporter_metrics`` evidence.
 
@@ -128,7 +130,10 @@ NVLINK = {
     "recovery_counter": "nvlink_recovery",
 }
 #: The plan text of the CRC counter: never a promise of the flit counter alone.
-CRC_COUNTER = "the NVLink CRC counter (flit total on NVLink3, DL aggregate on NVLink4+)"
+CRC_COUNTER = (
+    "the NVLink CRC counter (flit total on NVLink3, DL aggregate on NVLink4+, "
+    "link-recovery total on NVLink5)"
+)
 RESET = frozenset(
     {"RESET_GPU", "RESET_ALL_GPUS_NVSWITCHES", "RESTART_NODE", "REPLACE_NODE"}
 )
