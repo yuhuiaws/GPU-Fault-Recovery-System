@@ -12,15 +12,18 @@ policy decision and the marker correlation are the product's own.
 
 from __future__ import annotations
 
+import importlib
 from contextlib import contextmanager
 
 import pytest
 
+from gpu_fault.store import InMemoryStore
+
 # The audit script imports the optional Postgres driver at module level, and this test patches its connect.
 pytest.importorskip("psycopg")
-
-from gpu_fault.store import InMemoryStore  # noqa: E402
-from scripts.e2e.regional import audit_cross_source_correlation_postgres as audit  # noqa: E402
+audit = importlib.import_module(
+    "scripts.e2e.regional.audit_cross_source_correlation_postgres"
+)
 
 
 class _ClosableStore(InMemoryStore):
