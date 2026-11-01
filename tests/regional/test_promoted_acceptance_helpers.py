@@ -264,6 +264,15 @@ def test_ha009_default_invocation_is_plan_only(
     assert plan["mutation_performed"] is False
     assert plan["confirmation"] == "HA009_ROTATE_AURORA_CREDENTIALS"
     assert plan["details"]["rds_cluster_id"] == "aurora-test"
+    # The refresher-window wait is a phase of its own, counted in the total.
+    assert plan["details"]["phase_budgets_seconds"] == ha009.PHASE_BUDGETS
+    assert plan["details"]["phase_budgets_seconds"]["refresh_cronjob_window"] == (
+        ha009.REFRESH_CRITICAL_WINDOW_SECONDS + 300
+    )
+    assert plan["details"]["total_budget_seconds"] == ha009.total_budget_seconds()
+    assert plan["details"]["refresh_cronjob_window_terms"] == (
+        ha009.REFRESH_WINDOW_TERMS
+    )
     assert plan["details"]["chain"]["identity"]["release_id"] == "unit-release"
     assert plan_path.stat().st_mode & 0o777 == 0o600
     assert calls.count("release-state") == 1

@@ -466,7 +466,12 @@ Current classification:
   (`MAINTENANCE_WINDOW_MINIMUM_SECONDS`): ten minutes of outage, replay wait,
   a reconnect drill and the firewall/Pod cleanup never fit in fifteen.
 - HA-009 credential rotation has a reusable manual live driver with the same
-  plan/execute guard and roll-forward recovery contract.
+  plan/execute guard and roll-forward recovery contract. Before it rotates it
+  reads (never suspends) the product's hourly refresher CronJob and waits until
+  no tick can fire inside its critical window (`ha009_refresh_window.py`,
+  evidence `refresh-cronjob-window.json`; only the shipped `M * * * *` form is
+  supported). A refresher run inside [rotation requested, end of the first
+  refresh] makes the failure it explains INCONCLUSIVE, not a product FAIL.
 - DESTR-011 has a reusable read-only/isolated guard audit.
 - DESTR-010 has a reusable manual live driver. It is plan-only by default,
   pins one idle GPU node, writes its XID 45s through a temporary host probe,

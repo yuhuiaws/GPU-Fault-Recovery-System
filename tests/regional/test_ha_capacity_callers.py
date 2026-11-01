@@ -17,8 +17,13 @@ import pytest
 from scripts.e2e.regional import run_ha005_rollout_continuity as ha005
 from scripts.e2e.regional import run_ha006_executor_takeover as ha006
 from scripts.e2e.regional import run_ha009_aurora_credential_rotation as ha009
+from scripts.e2e.regional.aurora_binding import (
+    SECRET_CHANGED_DURING_PROOF,
+    BindingError,
+)
 from scripts.perf.regional_capacity_registry import RUN_LABEL
 from tests.regional._aurora_binding_support import FakeAurora
+from tests.regional._ha009_refresh_support import cronjob, quiet_cronjob
 
 registry = importlib.import_module("regional_capacity_registry")
 capacity = importlib.import_module("regional_capacity_suite")
@@ -481,6 +486,8 @@ class CallerEnvironment:
         monkeypatch.setattr(
             ha009, "secret_versions", lambda _: {"stages": {"AWSCURRENT": "v1"}}
         )
+        # The product's hourly refresher, read-only: no tick near the rotation.
+        monkeypatch.setattr(ha009, "refresh_cronjob", quiet_cronjob)
         monkeypatch.setattr(
             ha009, "wait_rotated_secret", lambda *a: {"stages": {"AWSCURRENT": "v2"}}
         )
@@ -532,6 +539,61 @@ def run_entry(module: Any, run_dir: Path, attempt: int = 1) -> tuple[int, dict]:
         (run_dir / "cases" / module.CASE_ID / f"{module.CASE_ID}.json").read_text()
     )
     return status, report
+
+
+@pytest.mark.parametrize("tick_inside", [True, False])
+def test_a_refresher_run_inside_the_rotation_window_makes_the_first_proof_inconclusive(
+    tick_inside: bool, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Live 2026-11-01 09:17Z the product's refresher published the rotation while
+    the first refresh's binding proof ran ("CPU Secret changed during proof").
+    With that run inside [rotation requested, end of the first refresh] the case
+    is INCONCLUSIVE; without one the BindingError keeps its FAIL. Either way the
+    emergency refresh and the owned cleanup run as before."""
+
+    environment = CallerEnvironment(ha009, "")
+    environment.install(monkeypatch)
+    proof = {"identity": {"database": {"master_secret_arn": "unit-resource"}}}
+
+    def refresh_job(name: str, expected: dict) -> dict:
+        if name.endswith("-1"):
+            raise BindingError("Aurora binding: " + SECRET_CHANGED_DURING_PROOF)
+        return json.loads(
+            environment.control("create", "job", name, "--dry-run=client")
+        )
+
+    monkeypatch.setattr(
+        ha009,
+        "aurora_guard",
+        lambda: SimpleNamespace(
+            read=lambda expected=None: proof, refresh_job=refresh_job
+        ),
+    )
+    reads: list[str] = []
+
+    def refresh_cronjob() -> dict:
+        reads.append("cronjob")
+        if len(reads) == 1 or not tick_inside:
+            return quiet_cronjob()
+        ran = datetime.now(timezone.utc)
+        return cronjob(last_schedule=ran, last_success=ran)
+
+    monkeypatch.setattr(ha009, "refresh_cronjob", refresh_cronjob)
+    status, report = run_entry(ha009, tmp_path / "acceptance-unit")
+    assert status == 1, report
+    assert report["error"] == (
+        "BindingError: Aurora binding: " + SECRET_CHANGED_DURING_PROOF
+    )
+    if tick_inside:
+        assert report["verdict"] == "INCONCLUSIVE", report
+        assert "ran inside HA-009's window" in report["inconclusive_reason"]
+    else:
+        assert report["verdict"] == "FAIL", report
+        assert "inconclusive_reason" not in report
+    assert reads == ["cronjob", "cronjob"], "the wait and the self-check read it"
+    assert report["emergency_refresh"]["succeeded"] is True, report
+    assert environment.items == {}, "owned Jobs, probes and the token are cleaned"
+    assert len(environment.registrations) == 1, "the registration is revoked"
 
 
 def test_rotation_binding_drift_after_watchdog_arm_disarms_without_rotating(

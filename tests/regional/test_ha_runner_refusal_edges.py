@@ -22,6 +22,7 @@ from scripts.e2e.regional import ha009_refresh
 from scripts.e2e.regional import run_ha005_rollout_continuity as ha005
 from scripts.e2e.regional import run_ha006_executor_takeover as ha006
 from scripts.e2e.regional import run_ha009_aurora_credential_rotation as ha009
+from tests.regional._ha009_refresh_support import cronjob, quiet_cronjob
 
 DEADLINE = datetime(2099, 1, 1, tzinfo=timezone.utc)
 PAST = datetime(2000, 1, 1, tzinfo=timezone.utc)
@@ -220,6 +221,7 @@ def test_ha009_unsteady_cpu_baseline_stops_before_rotation_and_keeps_the_probe_l
         ha009, "secret_versions", lambda arn: {"stages": {"AWSCURRENT": "v-before"}}
     )
     monkeypatch.setattr(ha009, "kubernetes_secret_digest", lambda: "digest-before")
+    monkeypatch.setattr(ha009, "refresh_cronjob", quiet_cronjob)
     monkeypatch.setattr(ha009.BASE, "register", lambda *a, **k: None)
     monkeypatch.setattr(
         ha009.BASE, "executor_identity", lambda **k: {"service_account": "executor"}
@@ -262,6 +264,61 @@ def test_ha009_unsteady_cpu_baseline_stops_before_rotation_and_keeps_the_probe_l
     )
     assert dataplane_calls.count("exec") == 1, "the probe is asked to stop once"
     assert resources.deleted[0] == ("Pod", ha009.BASE.POD)
+    capsys.readouterr()
+
+
+def test_ha009_refresh_window_refusal_requests_no_rotation_and_keeps_its_evidence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An edited refresher schedule cannot be kept out of the rotation window:
+    the case refuses before the baseline snapshot, the seed, the watchdog and
+    the rotation, and the window evidence says why."""
+
+    ha009_residuals(monkeypatch)
+    resources = FakeResources()
+    arm_ha009_until_secret_versions(monkeypatch, resources)
+    monkeypatch.setattr(
+        ha009, "secret_versions", lambda arn: {"stages": {"AWSCURRENT": "v-before"}}
+    )
+    monkeypatch.setattr(ha009, "kubernetes_secret_digest", lambda: "digest-before")
+    monkeypatch.setattr(ha009, "refresh_cronjob", lambda: cronjob("*/15 * * * *"))
+    monkeypatch.setattr(ha009.BASE, "register", lambda *a, **k: None)
+    monkeypatch.setattr(
+        ha009.BASE, "executor_identity", lambda **k: {"service_account": "executor"}
+    )
+    deployment = {
+        "spec": {"template": {"spec": {"containers": [{"image": "img@sha256:ab"}]}}}
+    }
+    monkeypatch.setattr(
+        ha009.BASE,
+        "dataplane",
+        lambda *a, **k: json.dumps(deployment) if a[0] == "get" else "probe log",
+    )
+    monkeypatch.setattr(ha009, "create_probe", lambda *a: None)
+    ledger = SimpleNamespace(start=lambda: None, stop=lambda: None)
+    monkeypatch.setattr(ha009.BASE, "ReceiptLedger", lambda *a, **k: ledger)
+    monkeypatch.setattr(ha009.BASE, "wait_probe_samples", lambda **k: {"samples": 4})
+    mutations: list[str] = []
+    for name in ("seed_runtime_records", "start_refresh_watchdog", "request_rotation"):
+        monkeypatch.setattr(
+            ha009, name, lambda *a, name=name, **k: mutations.append(name)
+        )
+
+    assert ha009.run_case(tmp_path, 1, DEADLINE) == 1
+    report = read_report(tmp_path, ha009.CASE_ID)
+    assert report["verdict"] == "FAIL"
+    assert report["error"].startswith(
+        "RefreshWindowError: refresh CronJob schedule '*/15 * * * *' is not"
+    ), report
+    assert mutations == [], "no seed, watchdog or rotation after a refusal"
+    case_dir = tmp_path / "cases" / ha009.CASE_ID
+    assert not (case_dir / "baseline.json").exists(), (
+        "the baseline snapshot is taken only once the window is clear"
+    )
+    record = json.loads((case_dir / "refresh-cronjob-window.json").read_text())
+    assert "not the product's hourly" in record["refused"]
+    assert record["cronjob_state"]["schedule"] == "*/15 * * * *"
+    assert resources.deleted[0] == ("Pod", ha009.BASE.POD), "the probe is removed"
     capsys.readouterr()
 
 

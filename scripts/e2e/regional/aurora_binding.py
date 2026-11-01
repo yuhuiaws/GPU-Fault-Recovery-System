@@ -29,6 +29,11 @@ from scripts.e2e.regional.regional_live_fixture import component_python
 DSN_FILE = "/etc/gpu-fault/aurora/postgres-url"
 MASTER_FILE = "/etc/gpu-fault/aurora/master-secret-arn"
 REFRESH_POLICY = "ReadAuroraManagedMasterSecret"
+# The two proof failures the product's hourly refresher can cause by itself:
+# its Job patching the Secret between the proof's two reads, or still running
+# when the proof reads the CronJob (ha009_refresh_window's self-check).
+SECRET_CHANGED_DURING_PROOF = "CPU Secret changed during proof"
+REFRESHER_NOT_IDLE = "refresher is suspended, active or permits concurrent Jobs"
 
 
 def live_pod_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -532,7 +537,7 @@ class AuroraBinding:
                 current_secret.get("data", {}).get(key) == data.get(key)
                 for key in ("postgres-url", "master-secret-arn")
             ),
-            "CPU Secret changed during proof",
+            SECRET_CHANGED_DURING_PROOF,
         )
         require(
             release_identity(
@@ -583,7 +588,7 @@ class AuroraBinding:
             spec.get("suspend", False) is False
             and spec.get("concurrencyPolicy") == "Forbid"
             and not cronjob.get("status", {}).get("active"),
-            "refresher is suspended, active or permits concurrent Jobs",
+            REFRESHER_NOT_IDLE,
         )
         pod = spec["jobTemplate"]["spec"]["template"]["spec"]
         containers = pod.get("containers") or []

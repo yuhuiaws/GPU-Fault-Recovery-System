@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.e2e.regional.aurora_binding import AuroraBinding  # noqa: E402
+from scripts.e2e.regional import ha009_refresh_window as window  # noqa: E402
 
 if __package__:
     from . import ha009_refresh as refresh
@@ -31,6 +32,7 @@ if __package__:
     )
     from .ha009_verdicts import (
         DEPLOYMENTS,
+        FIRST_REFRESH_NOT_ROTATED,
         deployments_rolled as deployments_rolled,
         deployments_steady,
         enabled_pods,
@@ -67,6 +69,7 @@ else:
     )
     from ha009_verdicts import (
         DEPLOYMENTS,
+        FIRST_REFRESH_NOT_ROTATED,
         deployments_rolled as deployments_rolled,
         deployments_steady,
         enabled_pods,
@@ -119,6 +122,24 @@ PHASE_BUDGETS = {
     "processor_receipts": 180,
     "second_refresh_job": 700,
 }
+# The product's hourly refresher (CRONJOB, "17 * * * *") must not tick inside
+# the rotation's critical window (live 2026-11-01 09:17Z: "CPU Secret changed
+# during proof"). Before the rotation the case waits until no tick can fire in:
+REFRESH_WINDOW_TERMS = {
+    # RDS rotates the master secret: a tick publishes AWSCURRENT first.
+    "managed_rotation": PHASE_BUDGETS["managed_rotation"],
+    # proof and Job: a tick changes the Secret mid-proof or publishes first.
+    "first_refresh_job": PHASE_BUDGETS["first_refresh_job"],
+    # the first refresh's evidence is read here (later ticks are no-ops).
+    "secret_propagation": PHASE_BUDGETS["secret_propagation"],
+    # snapshot, seed, watchdog and rotation-request proofs before the rotation
+    # (134 s live), the first refresh's proof (~60 s), clock skew.
+    "margin": 300,
+}
+REFRESH_CRITICAL_WINDOW_SECONDS = sum(REFRESH_WINDOW_TERMS.values())
+# The wait's own budget: a tick at the far end of the window, then 300 s for
+# its Job to complete (5 s live: created :17:00, completed :17:05).
+PHASE_BUDGETS["refresh_cronjob_window"] = REFRESH_CRITICAL_WINDOW_SECONDS + 300
 # GPU_FAULT_POSTGRES_POOL_MAX_IDLE_SECONDS as the base manifest ships it; the
 # live value is read from the control-worker's -config-postgres ConfigMap.
 DEFAULT_POOL_MAX_IDLE_SECONDS = 300
@@ -147,6 +168,12 @@ def total_budget_seconds(
     margin_seconds: int = BUDGET_MARGIN_SECONDS,
 ) -> int:
     return sum(int(value) for value in budgets.values()) + int(margin_seconds)
+
+
+def rotation_budget_seconds() -> int:
+    """Every phase from the rotation request on: the window wait is spent."""
+
+    return sum(PHASE_BUDGETS.values()) - PHASE_BUDGETS["refresh_cronjob_window"]
 
 
 def configure(arguments: argparse.Namespace) -> None:
@@ -784,13 +811,41 @@ def create_probe(
     BASE.wait_file("/state/stats.json", 60)
 
 
+def refresh_cronjob() -> dict:
+    return window.read_cronjob(BASE.control, CRONJOB)
+
+
+def await_refresh_window(
+    case_dir: Path, state: dict, secret_arn: str, current_before: str
+) -> None:
+    """Hold the rotation until the refresher cannot tick inside its window (read
+    only; never suspended). A managed rotation during the wait voids the baseline."""
+
+    BASE.require_window(
+        state["maintenance_window_end"], required_seconds=sum(PHASE_BUDGETS.values())
+    )
+    state["refresh_window"] = window.await_clear_window(
+        case_dir,
+        refresh_cronjob,
+        critical_seconds=REFRESH_CRITICAL_WINDOW_SECONDS,
+        budget_seconds=PHASE_BUDGETS["refresh_cronjob_window"],
+        terms=REFRESH_WINDOW_TERMS,
+        log=log,
+    )
+    if secret_versions(secret_arn)["stages"].get("AWSCURRENT") != current_before:
+        raise CaseError(
+            "the managed secret's AWSCURRENT changed while HA-009 waited for a "
+            "clear refresher window: the baseline taken before it no longer holds"
+        )
+
+
 def request_rotation(state: dict) -> dict:
     aurora_guard().read(state["aurora_binding"])
     BASE.require_window(
-        state["maintenance_window_end"],
-        required_seconds=total_budget_seconds() - BUDGET_MARGIN_SECONDS,
+        state["maintenance_window_end"], required_seconds=rotation_budget_seconds()
     )
     state["rotation_started"] = True
+    state["rotation_requested_at"] = datetime.now(timezone.utc)
     return aws(
         "rds",
         "modify-db-cluster",
@@ -798,6 +853,33 @@ def request_rotation(state: dict) -> dict:
         RDS_CLUSTER_ID,
         "--rotate-master-user-password",
         "--apply-immediately",
+    )
+
+
+def first_refresh(case_dir: Path, run_id: str, state: dict) -> dict:
+    """The rotation's first refresh Job, then the refresher self-check: a
+    BindingError that a refresher run inside [rotation requested, end of this
+    refresh] explains ends the case INCONCLUSIVE (ha009_refresh_window)."""
+
+    job_one = f"gpu-fault-{run_id}-1"
+    state["jobs"].append(job_one)
+    log(f"running credential refresh Job {job_one}")
+    BASE.require_window(
+        state["maintenance_window_end"],
+        required_seconds=PHASE_BUDGETS["first_refresh_job"],
+    )
+    return window.checked_first_refresh(
+        case_dir,
+        state.setdefault("refresh_window", {}),
+        refresh_cronjob,
+        lambda: run_refresh_job(
+            case_dir,
+            job_one,
+            state["job_resources"],
+            run_id=run_id,
+            binding=state["aurora_binding"],
+        ),
+        requested_at=state.get("rotation_requested_at"),
     )
 
 
@@ -873,6 +955,7 @@ def _run_rotation_case(
         minimum_claims=BASELINE_CLAIM_SAMPLES,
     )
     write_json_atomic(case_dir / "probe-baseline.json", probe_baseline)
+    await_refresh_window(case_dir, state, secret_arn, current_before)
     # One snapshot, taken right before the rotation, is the baseline every
     # later comparison uses.
     deployments_before = deployment_snapshot()
@@ -915,20 +998,7 @@ def _run_rotation_case(
     versions_after = wait_rotated_secret(current_before, secret_arn)
     write_json_atomic(case_dir / "secret-versions-after.json", versions_after)
 
-    job_one = f"gpu-fault-{run_id}-1"
-    state["jobs"].append(job_one)
-    log(f"running credential refresh Job {job_one}")
-    BASE.require_window(
-        state["maintenance_window_end"],
-        required_seconds=PHASE_BUDGETS["first_refresh_job"],
-    )
-    first_job = run_refresh_job(
-        case_dir,
-        job_one,
-        state["job_resources"],
-        run_id=run_id,
-        binding=state["aurora_binding"],
-    )
+    first_job = first_refresh(case_dir, run_id, state)
     state["refresh_succeeded"] = True
     state["watchdog_result"] = stop_refresh_watchdog(state["watchdog"])
     if state["watchdog_result"].get("stop_error") or state["watchdog_result"].get(
@@ -1000,6 +1070,11 @@ def _run_rotation_case(
         tail["after_noop"],
     )
     result["refresh_watchdog"] = state.get("watchdog_result")
+    window.explain_by_refresher(
+        result,
+        state.get("refresh_window", {}).get("self_check"),
+        frozenset({FIRST_REFRESH_NOT_ROTATED}),
+    )
     return result
 
 
@@ -1303,6 +1378,11 @@ def run_case(
         result = _run_rotation_case(case_dir, run_id, attempt, state)
     except ProcessSupervisionLost:
         record_supervision_loss(result)
+    except window.RefreshTickInterference as exc:
+        # Not a product verdict; a cleanup failure below still makes it FAIL.
+        result.update(
+            error=exc.error, verdict="INCONCLUSIVE", inconclusive_reason=exc.reason
+        )
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
@@ -1380,6 +1460,8 @@ def main() -> int:
                 ),
                 "phase_budgets_seconds": PHASE_BUDGETS,
                 "total_budget_seconds": total_budget_seconds(),
+                # read-only: no tick of CRONJOB inside this window ("M * * * *")
+                "refresh_cronjob_window_terms": REFRESH_WINDOW_TERMS,
                 "rollback": [
                     "candidate DSN is verified before Kubernetes Secret patch",
                     "emergency refresh Job rolls forward to AWSCURRENT",

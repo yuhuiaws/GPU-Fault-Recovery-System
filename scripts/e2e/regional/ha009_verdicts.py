@@ -17,6 +17,10 @@ DEPLOYMENTS = (
     "gpu-fault-control-worker",
     "gpu-fault-telemetry-spool-worker",
 )
+# The one error a refresher tick inside the rotation window causes by itself:
+# the product's CronJob published AWSCURRENT before the case's first Job read
+# the Secret (ha009_refresh_window.explain_by_refresher).
+FIRST_REFRESH_NOT_ROTATED = "first refresh Job did not report a rotation"
 
 
 def role_status(deployments: dict[str, Any]) -> dict[str, str]:
@@ -92,7 +96,7 @@ def rotation_errors(
         errors.append("Kubernetes Aurora Secret digest did not change")
     first_logs = "\n".join(first_job["logs"])
     if "rotated=True" not in first_logs:
-        errors.append("first refresh Job did not report a rotation")
+        errors.append(FIRST_REFRESH_NOT_ROTATED)
     if "restarted=False" not in first_logs:
         errors.append(
             "first refresh Job did not report restarted=False: path A must not roll"
