@@ -32,7 +32,10 @@ control-plane instance in one window takes the whole control plane down for
 minutes (live 2026-11-01: the CPU group's ``cron(0 8 ? * SUN *)`` took all
 three nodes NotReady at once, the api-ha and control-worker Pods with them,
 and the Pods could not come back until Kueue's Pod webhook answered again);
-the advisory line says so in those words.
+the advisory line says so in those words. A rolling schedule's line names its
+rollback batch and alarms, and where ``status --full`` read them, an alarm
+that cannot roll an update back (missing, no data, the wrong load balancer)
+gets a line of its own (``hyperpod_rollback``).
 
 Nothing here changes a check verdict, ``healthy``, a refusal or an exit code:
 the facts sit next to the ones they extend (the ``regional_contexts`` check of
@@ -50,6 +53,7 @@ import sys
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from typing import Any
 
+from gpu_fault.admin.hyperpod_rollback import rollback_alarm_names
 from gpu_fault.cluster_scope import OWNERSHIP_LABEL
 
 __all__ = [
@@ -348,25 +352,34 @@ def karpenter_updates(read: NodePoolReader, *, site_id: str) -> dict[str, Any]:
 # --- the CPU control-plane cluster ---------------------------------------------------
 
 
+def _batch(size: object) -> dict[str, Any] | None:
+    kind, value = _mapping(size).get("Type"), _mapping(size).get("Value")
+    if not isinstance(kind, str) or type(value) is not int:
+        return None
+    return {"type": kind, "value": value}
+
+
 def rolling_batch(schedule: object) -> dict[str, Any] | None:
-    """``{"type", "value", "wait_seconds"}`` of a ``ScheduledUpdateConfig``'s
-    ``DeploymentConfig``: ``RollingUpdatePolicy.MaximumBatchSize`` and
-    ``WaitIntervalInSeconds`` (``None`` when unset). ``None`` without a batch --
-    the service was then observed to re-image every instance of the group at
-    once (2026-11-01: all three control-plane nodes NotReady together); no AWS
-    document states that default."""
+    """``{"type", "value", "wait_seconds", "rollback_batch", "rollback_alarms"}``
+    of a ``ScheduledUpdateConfig``'s ``DeploymentConfig``:
+    ``RollingUpdatePolicy.MaximumBatchSize``, ``WaitIntervalInSeconds``
+    (``None`` when unset), ``RollbackMaximumBatchSize`` (``{"type", "value"}``
+    or ``None``) and the ``AutoRollbackConfiguration`` alarm names. ``None``
+    without a batch -- the service was then observed to re-image every instance
+    of the group at once (2026-11-01: all three control-plane nodes NotReady
+    together); no AWS document states that default."""
 
     deployment = _mapping(_mapping(schedule).get("DeploymentConfig"))
     policy = _mapping(deployment.get("RollingUpdatePolicy"))
-    size = _mapping(policy.get("MaximumBatchSize"))
-    kind, value = size.get("Type"), size.get("Value")
-    if not isinstance(kind, str) or type(value) is not int:
+    batch = _batch(policy.get("MaximumBatchSize"))
+    if batch is None:
         return None
     wait = deployment.get("WaitIntervalInSeconds")
     return {
-        "type": kind,
-        "value": value,
+        **batch,
         "wait_seconds": wait if type(wait) is int else None,
+        "rollback_batch": _batch(policy.get("RollbackMaximumBatchSize")),
+        "rollback_alarms": rollback_alarm_names(schedule),
     }
 
 
@@ -515,6 +528,35 @@ def _all_at_once(group: Mapping[str, Any]) -> bool:
     return type(instances) is int and value >= instances
 
 
+def _size(batch: Mapping[str, Any]) -> str:
+    value = batch.get("value")
+    return (
+        f"{value}%"
+        if batch.get("type") == "CAPACITY_PERCENTAGE"
+        else f"{value} instance(s)"
+    )
+
+
+def _rollback(batch: Mapping[str, Any]) -> str:
+    """How a rolling batch is rolled back: its ``RollbackMaximumBatchSize`` and
+    the ``AutoRollbackConfiguration`` alarms (the service requires both on a
+    rolling schedule written through UpdateCluster, ``hyperpod_rollback``)."""
+
+    alarms = [str(item) for item in batch.get("rollback_alarms") or ()]
+    if not alarms:
+        return (
+            ", with no rollback alarm (AutoRollbackConfiguration): nothing rolls it "
+            "back when the control plane loses capacity"
+        )
+    back = _mapping(batch.get("rollback_batch"))
+    how = (
+        f" {_size(back)} at a time"
+        if back
+        else " (no RollbackMaximumBatchSize: in the service's default batches)"
+    )
+    return f", rolled back{how} on alarm {' or '.join(alarms)}"
+
+
 def _control_plane_window(group: Mapping[str, Any], *, whole: bool) -> tuple[str, bool]:
     """``(what one scheduled update window does to the control plane on
     ``group``, whether that is the safe form)``.
@@ -530,15 +572,11 @@ def _control_plane_window(group: Mapping[str, Any], *, whole: bool) -> tuple[str
     instances = f"all {count} instances" if type(count) is int else "every instance"
     percentage = batch.get("type") == "CAPACITY_PERCENTAGE"
     if not _all_at_once(group):
-        size = (
-            f"{batch.get('value')}%"
-            if percentage
-            else f"{batch.get('value')} instance(s)"
-        )
         wait = batch.get("wait_seconds")
         return (
-            f"rolling {size} at a time"
+            f"rolling {_size(batch)} at a time"
             + (f" {wait} s apart" if type(wait) is int else "")
+            + _rollback(batch)
             + ": the safe form -- the control plane keeps serving from the other "
             "nodes; residual: the control-plane Pods on each batch go down with "
             "it, and the single-replica ADOT and Kueue (when present) are down "
@@ -568,12 +606,64 @@ def _control_plane_window(group: Mapping[str, Any], *, whole: bool) -> tuple[str
     )
 
 
+def _alarm_lines(
+    block: Mapping[str, Any], group: Mapping[str, Any], *, where: str, command: str
+) -> list[str]:
+    """The lines of ``group``'s rollback alarms that cannot roll an update
+    back, from the read ``status --full``/preflight recorded under
+    ``rollback_alarms`` (``hyperpod_rollback.read_rollback_alarms``); discovery
+    reads none and prints none. A failed read is announced: protection that
+    is silently off is the finding."""
+
+    batch = _mapping(group.get("rolling_batch"))
+    names = [str(item) for item in batch.get("rollback_alarms") or ()]
+    facts = block.get("rollback_alarms")
+    if not names or not isinstance(facts, Mapping):
+        return []
+    owner = f"of HyperPod instance group {group.get('name')} of {where}"
+    if facts.get("state") == UNKNOWN:
+        return [
+            f"advisory: could not read rollback alarm(s) {', '.join(names)} {owner} "
+            f"({facts.get('error')}): whether they can roll a scheduled update back "
+            f"is unknown; the operator identity needs cloudwatch:DescribeAlarms "
+            f"({SECTION})"
+        ]
+    lines = []
+    nlb = _mapping(facts.get("api_nlb"))
+    if nlb.get("state") == UNKNOWN:
+        lines.append(
+            f"advisory: could not read the API NLB ({nlb.get('error')}): the "
+            f"dimensions of rollback alarm(s) {', '.join(names)} {owner} were not "
+            f"checked ({SECTION})"
+        )
+    records = {str(item.get("name")): item for item in _mappings(facts.get("alarms"))}
+    wait = batch.get("wait_seconds")
+    remedy = (
+        f"{command} --rolling"
+        + (f" --wait-interval-seconds {wait}" if type(wait) is int else "")
+        + "".join(f" --rollback-alarm {item}" for item in names)
+        + " prints the aws cloudwatch put-metric-alarm commands that point the "
+        "same alarm names at the current API NLB (the schedule then needs no "
+        "change)"
+    )
+    for alarm in names:
+        problems = [str(item) for item in records.get(alarm, {}).get("problems") or ()]
+        if problems:
+            lines.append(
+                f"advisory: rollback alarm {alarm} {owner} "
+                + "; and it ".join(problems)
+                + f"; {remedy} ({SECTION})"
+            )
+    return lines
+
+
 def control_plane_lines(block: object) -> list[str]:
     """The advisory lines of the CPU control-plane cluster's block
     (``control_plane_updates``): a scheduled or auto-patched instance group --
-    with what one window does to the control plane -- and a managed node
-    group's Auto Scaling group with a set ``MaxInstanceLifetime``. ``unknown``
-    is recorded, never announced."""
+    with what one window does to the control plane, and its rollback alarms
+    when they cannot trip -- and a managed node group's Auto Scaling group with
+    a set ``MaxInstanceLifetime``. ``unknown`` is recorded, never announced,
+    except for the rollback alarms (``_alarm_lines``)."""
 
     if not isinstance(block, Mapping):
         return []
@@ -603,13 +693,16 @@ def control_plane_lines(block: object) -> list[str]:
                 + (
                     ""
                     if safe
-                    else f"; {command} --rolling prints the update-cluster command "
-                    "that makes it roll one instance at a time (without --rolling, "
-                    "the one that removes it: then update the group by hand in a "
-                    "maintenance window, one instance at a time)"
+                    else f"; {command} --rolling --rollback-alarm <alarm> prints the "
+                    "update-cluster commands (delete the schedule, then create it "
+                    "again) that make it roll one instance at a time, rolled back "
+                    "on that alarm (without --rolling, the one that removes it: "
+                    "then update the group by hand in a maintenance window, one "
+                    "instance at a time)"
                 )
                 + f" ({SECTION})"
             )
+            lines.extend(_alarm_lines(block, group, where=where, command=command))
         if group.get("auto_patch"):
             lines.append(
                 f"advisory: HyperPod instance group {group_name} of {where} has "

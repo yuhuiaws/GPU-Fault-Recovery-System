@@ -21,6 +21,7 @@ from typing import Any
 import pytest
 
 from gpu_fault.admin.automatic_node_updates import CONTROL_PLANE, FIELD
+from gpu_fault.admin.hyperpod_rollback import SUGGESTED_ALARM_NAMES
 from gpu_fault_release import regional_release_preflight as preflight
 from gpu_fault_release.regional_admin_commands import status_header_lines
 from gpu_fault_release.regional_release_config import ReleaseError
@@ -257,10 +258,11 @@ def test_status_full_header_names_the_control_plane_schedule_first() -> None:
         "control plane (api-ha, control-worker) is down for minutes each time; "
         "gpu-fault-admin hyperpod-scheduled-update --state-dir <state dir> "
         f"--gpu-cluster-arn {CPU_EKS_ARN} --instance-group {CPU_GROUP} --rolling "
-        "prints the update-cluster command that makes it roll one instance at a "
-        "time (without --rolling, the one that removes it: then update the group "
-        "by hand in a maintenance window, one instance at a time) "
-        "(administrator-operations §5.0.5)"
+        "--rollback-alarm <alarm> prints the update-cluster commands (delete the "
+        "schedule, then create it again) that make it roll one instance at a time, "
+        "rolled back on that alarm (without --rolling, the one that removes it: "
+        "then update the group by hand in a maintenance window, one instance at a "
+        "time) (administrator-operations §5.0.5)"
     ), "the control plane's own schedule leads"
     assert [line.split(":", 2)[1].strip()[:40] for line in advisories[1:]] == [
         f"Auto Scaling group {SPOT_ASG}"[:40],
@@ -284,3 +286,191 @@ def test_a_malformed_control_plane_entry_drops_only_its_own_lines() -> None:
         lines = status_header_lines(report, json_destination="x")
         advisories = [line for line in lines if line.startswith("advisory: ")]
         assert advisories == expected, broken
+
+
+# --- the rollback alarms of a rolling CPU schedule (batch 239) -----------------------
+#
+# The live group since 2026-11-02: one instance at a time, 1800 s apart, rolled
+# back one at a time on the API NLB HealthyHostCount pair. The check reads the
+# alarms (describe-alarms) and the NLB they should watch (the configured name,
+# as the NLB check reads it); an alarm that cannot trip is announced.
+
+NLB_NAME = "gpu-fault-api-site"
+LB = f"net/{NLB_NAME}/0123456789abcdef"
+TG = "targetgroup/k8s-gpufault-gpufaulta-0a1b2c3d4e/fedcba9876543210"
+OLD_LB = f"net/{NLB_NAME}/00112233aabbccdd"
+OLD_TG = "targetgroup/k8s-gpufault-gpufaulta-99aa88bb77/0011223344556677"
+LB_ARN = f"arn:aws:elasticloadbalancing:us-west-2:123456789012:loadbalancer/{LB}"
+TG_ARN = f"arn:aws:elasticloadbalancing:us-west-2:123456789012:{TG}"
+CAPACITY, NOT_RESTORED = SUGGESTED_ALARM_NAMES
+ONE = {"Type": "INSTANCE_COUNT", "Value": 1}
+ROLLING = {
+    "ScheduleExpression": CPU_SCHEDULE,
+    "DeploymentConfig": {
+        "RollingUpdatePolicy": {
+            "MaximumBatchSize": dict(ONE),
+            "RollbackMaximumBatchSize": dict(ONE),
+        },
+        "WaitIntervalInSeconds": 1800,
+        "AutoRollbackConfiguration": [
+            {"AlarmName": CAPACITY},
+            {"AlarmName": NOT_RESTORED},
+        ],
+    },
+}
+
+
+def _alarms(**options: Any) -> dict[str, dict[str, Any]]:
+    def alarm(name: str, threshold: int, minutes: int) -> dict[str, Any]:
+        return {
+            "AlarmName": name,
+            "StateValue": options.get("state", "OK"),
+            "Namespace": "AWS/NetworkELB",
+            "MetricName": "HealthyHostCount",
+            "Statistic": "Maximum",
+            "Dimensions": [
+                {"Name": "TargetGroup", "Value": options.get("tg", TG)},
+                {"Name": "LoadBalancer", "Value": options.get("lb", LB)},
+            ],
+            "Period": 60,
+            "EvaluationPeriods": minutes,
+            "DatapointsToAlarm": minutes,
+            "Threshold": float(threshold),
+            "ComparisonOperator": "LessThanThreshold",
+            "TreatMissingData": "missing",
+        }
+
+    return {CAPACITY: alarm(CAPACITY, 2, 5), NOT_RESTORED: alarm(NOT_RESTORED, 3, 25)}
+
+
+class AlarmRunner(ContextsRunner):
+    """The CPU group's rollback alarms and the API NLB, as the AWS CLI answers."""
+
+    def __init__(
+        self, *, alarms: dict[str, dict[str, Any]], deny: bool = False, **options: Any
+    ) -> None:
+        super().__init__(**options)
+        self.alarms = alarms
+        self.deny = deny
+
+    def run(self, args: list[str], **options: Any) -> str:
+        if args[:3] == ["aws", "cloudwatch", "describe-alarms"]:
+            self.calls.append(list(args))
+            if self.deny:
+                raise ReleaseError(
+                    "aws cloudwatch describe-alarms exited 254: AccessDenied: not "
+                    "authorized to perform: cloudwatch:DescribeAlarms"
+                )
+            names = args[args.index("--alarm-names") + 1 : args.index("--alarm-types")]
+            found = [self.alarms[name] for name in names if name in self.alarms]
+            return json.dumps({"MetricAlarms": found, "CompositeAlarms": []})
+        if args[:3] == ["aws", "elbv2", "describe-load-balancers"]:
+            self.calls.append(list(args))
+            assert args[args.index("--names") + 1] == NLB_NAME, args
+            return json.dumps({"LoadBalancers": [{"LoadBalancerArn": LB_ARN}]})
+        if args[:3] == ["aws", "elbv2", "describe-target-groups"]:
+            self.calls.append(list(args))
+            assert args[args.index("--load-balancer-arn") + 1] == LB_ARN, args
+            return json.dumps({"TargetGroups": [{"TargetGroupArn": TG_ARN}]})
+        return super().run(args, **options)
+
+
+def _rolling_facts(runner: AlarmRunner) -> dict[str, Any]:
+    release = ContextsRelease(runner, (HYPERPOD, EKS))
+    release.config.nlb = {"name": NLB_NAME}
+    return preflight.ensure_region_contexts(release)  # type: ignore[arg-type]
+
+
+def _advisories(facts: dict[str, Any]) -> list[str]:
+    lines = status_header_lines(_report(facts), json_destination="stdout")
+    assert lines[0] == "healthy: yes (full health, 1 checks)", "the verdict stays"
+    return [line for line in lines if line.startswith("advisory: ")]
+
+
+def test_contexts_read_the_rolling_groups_alarms_against_the_api_nlb() -> None:
+    runner = AlarmRunner(
+        cpu_groups=[_cpu_group(ScheduledUpdateConfig=ROLLING)], alarms=_alarms()
+    )
+
+    facts = _rolling_facts(runner)
+
+    block = facts[CONTROL_PLANE][FIELD]
+    assert block["instance_groups"][0]["rolling_batch"] == {
+        "type": "INSTANCE_COUNT",
+        "value": 1,
+        "wait_seconds": 1800,
+        "rollback_batch": {"type": "INSTANCE_COUNT", "value": 1},
+        "rollback_alarms": [CAPACITY, NOT_RESTORED],
+    }
+    read = block["rollback_alarms"]
+    assert read["state"] == "read"
+    assert read["api_nlb"] == {
+        "name": NLB_NAME,
+        "load_balancer": LB,
+        "target_groups": [TG],
+    }
+    assert [item["problems"] for item in read["alarms"]] == [[], []]
+    (alarm_read,) = _calls(runner, "aws", "cloudwatch", "describe-alarms")
+    assert alarm_read[3:9] == [
+        "--alarm-names",
+        CAPACITY,
+        NOT_RESTORED,
+        "--alarm-types",
+        "MetricAlarm",
+        "CompositeAlarm",
+    ], "one read for every named alarm, metric and composite"
+    advisories = _advisories(facts)
+    assert advisories[0].startswith(
+        f"advisory: HyperPod instance group {CPU_GROUP} of the CPU control-plane "
+        f"cluster hp-cpu has ScheduledUpdateConfig {CPU_SCHEDULE} rolling 1 "
+        "instance(s) at a time 1800 s apart, rolled back 1 instance(s) at a time on "
+        f"alarm {CAPACITY} or {NOT_RESTORED}: the safe form -- "
+    ), advisories[0]
+    assert not any("rollback alarm" in line for line in advisories), "alarms that trip"
+
+
+def test_an_alarm_on_the_previous_nlb_is_announced_and_the_check_passes() -> None:
+    stale = _alarms(state="INSUFFICIENT_DATA", lb=OLD_LB, tg=OLD_TG)
+    runner = AlarmRunner(
+        cpu_groups=[_cpu_group(ScheduledUpdateConfig=ROLLING)], alarms=stale
+    )
+
+    advisories = _advisories(_rolling_facts(runner))
+
+    (capacity,) = [line for line in advisories if f"rollback alarm {CAPACITY} " in line]
+    assert capacity.startswith(
+        f"advisory: rollback alarm {CAPACITY} of HyperPod instance group {CPU_GROUP} "
+        "of the CPU control-plane cluster hp-cpu is INSUFFICIENT_DATA: "
+    ), capacity
+    assert f"not the current API NLB {LB} (target group {TG})" in capacity
+    assert "--rolling --wait-interval-seconds 1800 --rollback-alarm " in capacity
+
+
+def test_a_denied_alarm_read_is_unknown_announced_and_the_check_passes() -> None:
+    runner = AlarmRunner(
+        cpu_groups=[_cpu_group(ScheduledUpdateConfig=ROLLING)],
+        alarms=_alarms(),
+        deny=True,
+    )
+
+    facts = _rolling_facts(runner)
+
+    read = facts[CONTROL_PLANE][FIELD]["rollback_alarms"]
+    assert read["state"] == "unknown" and "cloudwatch:DescribeAlarms" in read["error"]
+    assert any(
+        line.startswith(
+            f"advisory: could not read rollback alarm(s) {CAPACITY}, {NOT_RESTORED} "
+        )
+        for line in _advisories(facts)
+    ), "a denied read is announced: protection may be off"
+
+
+def test_a_schedule_without_rollback_alarms_reads_none() -> None:
+    runner = AlarmRunner(cpu_groups=[_cpu_group()], alarms=_alarms())
+
+    facts = _rolling_facts(runner)
+
+    assert "rollback_alarms" not in facts[CONTROL_PLANE][FIELD]
+    assert not _calls(runner, "aws", "cloudwatch") and not _calls(
+        runner, "aws", "elbv2"
+    )

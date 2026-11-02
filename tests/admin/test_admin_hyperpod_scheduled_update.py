@@ -99,18 +99,53 @@ def _described() -> dict[str, Any]:
     }
 
 
-class DescribeRunner:
-    """``describe-cluster`` (and the region inventory) only; any write fails."""
+#: The alarm the --rolling tests name; ``describe-alarms`` finds it, OK.
+ALARM = "hp-gpu-reimage"
 
-    def __init__(self, described: dict[str, Any] | None = None, *, hyperpods=None):
+
+def _alarm(name: str, state: str = "OK") -> dict[str, Any]:
+    return {
+        "AlarmName": name,
+        "StateValue": state,
+        "Namespace": "AWS/NetworkELB",
+        "MetricName": "HealthyHostCount",
+        "Statistic": "Maximum",
+        "Dimensions": [],
+        "Period": 60,
+        "EvaluationPeriods": 5,
+        "DatapointsToAlarm": 5,
+        "Threshold": 2.0,
+        "ComparisonOperator": "LessThanThreshold",
+        "TreatMissingData": "missing",
+    }
+
+
+class DescribeRunner:
+    """``describe-cluster`` (and the region inventory) and ``describe-alarms``
+    only; any write fails."""
+
+    def __init__(
+        self,
+        described: dict[str, Any] | None = None,
+        *,
+        hyperpods=None,
+        alarms: dict[str, dict[str, Any]] | None = None,
+    ):
         self.described = described if described is not None else _described()
         self.hyperpods = hyperpods
+        self.alarms = alarms if alarms is not None else {ALARM: _alarm(ALARM)}
         self.calls: list[tuple[str, str, tuple[str, ...]]] = []
 
     def aws_json(self, region, service, operation, *arguments, **options):
         self.calls.append((service, operation, tuple(arguments)))
         assert not options.get("mutate"), "the verb writes nothing"
         assert region == REGION
+        if (service, operation) == ("cloudwatch", "describe-alarms"):
+            names = arguments[1 : arguments.index("--alarm-types")]
+            return {
+                "MetricAlarms": [self.alarms[n] for n in names if n in self.alarms],
+                "CompositeAlarms": [],
+            }
         if (service, operation) == ("sagemaker", "describe-cluster"):
             selected = arguments[arguments.index("--cluster-name") + 1]
             assert selected in {HP_ARN, "hp-gpu"}, selected
@@ -208,6 +243,21 @@ def test_the_definition_is_the_ownership_release_one_minus_the_schedule(capsys) 
         "ScheduledUpdateConfig:ScheduledUpdateConfig"
         in document["update_cluster"]["verify"]
     )
+    assert document["update_cluster"]["expect"] == {
+        "ClusterStatus": "InService",
+        "InstanceGroups": [
+            {
+                "InstanceGroupName": SITE_GROUP,
+                "Status": "InService",
+                "ScheduledUpdateConfig": None,
+                "AutoPatchConfig": None,
+            }
+        ],
+    }, "the verify read answers exactly this once the removal applied"
+    assert [step["action"] for step in document["update_cluster"]["steps"]] == [
+        "remove",
+        "verify",
+    ], "one UpdateCluster removes a schedule (accepted live 2026-11-02)"
     assert (
         "never while gpu-fault-admin config or deploy runs"
         in (document["update_cluster"]["run_when"])
@@ -216,10 +266,13 @@ def test_the_definition_is_the_ownership_release_one_minus_the_schedule(capsys) 
         SITE_GROUP: (
             f"aws sagemaker update-cluster-software --region {REGION} --cluster-name "
             f"hp-gpu --instance-groups InstanceGroupName={SITE_GROUP} "
-            "--deployment-config 'RollingUpdatePolicy={MaximumBatchSize="
-            "{Type=INSTANCE_COUNT,Value=1}},WaitIntervalInSeconds=<seconds>'"
+            '--deployment-config \'{"RollingUpdatePolicy":{"MaximumBatchSize":'
+            '{"Type":"INSTANCE_COUNT","Value":1},"RollbackMaximumBatchSize":'
+            '{"Type":"INSTANCE_COUNT","Value":1}},"WaitIntervalInSeconds":<seconds>,'
+            '"AutoRollbackConfiguration":[{"AlarmName":<rollback alarm>}]}\''
         )
-    }
+    }, "one instance at a time and rolled back so; the placeholders keep it invalid"
+    assert "rollback_alarms" not in document, "removal names no alarm"
     assert (
         f"run in a maintenance window: {document['update_cluster']['command']}" in err
     )
@@ -228,8 +281,9 @@ def test_the_definition_is_the_ownership_release_one_minus_the_schedule(capsys) 
 def test_omitting_the_member_is_the_only_request_that_can_mean_no_schedule() -> None:
     """What the installed service model settles offline: only CreateCluster and
     UpdateCluster carry the member, and an empty value is not a valid request.
-    Whether the service reads the omission as remove or as unchanged it does
-    not say -- hence the verify read the verb prints."""
+    How the service reads the omission the model does not say; on the live CPU
+    group (2026-11-02) it removed the schedule -- the verify read the verb
+    prints shows it."""
 
     model = botocore.session.get_session().get_service_model("sagemaker")
 
@@ -479,7 +533,12 @@ def test_the_verb_is_read_only_and_dispatched_by_the_cli(
 #
 # The live CPU control-plane group, sanitised: 3 x ml.c5.4xlarge with
 # cron(0 8 ? * SUN *) and no DeploymentConfig -- observed on 2026-11-01 to
-# re-image all three control-plane nodes at once.
+# re-image all three control-plane nodes at once. The service then refused a
+# rolling schedule without RollbackMaximumBatchSize, without rollback alarms,
+# and as an in-place change (2026-11-02): the plan rolls back one instance at a
+# time on the named alarms, and deletes the old schedule before creating the
+# new one (tests/admin/test_admin_hyperpod_rollback.py runs it against a fake
+# service that refuses exactly those).
 
 CPU_NAME = "cpu-control-plane"
 CPU_GROUP = "cpu-control-plane-c5"
@@ -488,16 +547,18 @@ CPU_EKS_ARN = f"arn:aws:eks:{REGION}:{ACCOUNT}:cluster/cpu-eks"
 CPU_SCHEDULE = "cron(0 8 ? * SUN *)"
 
 
-def _rolling(expression: str, wait: int = 600, **deployment: Any) -> dict[str, Any]:
+def _rolling(
+    expression: str, wait: int = 600, alarms: tuple[str, ...] = (ALARM,)
+) -> dict[str, Any]:
     return {
         "ScheduleExpression": expression,
         "DeploymentConfig": {
             "RollingUpdatePolicy": {
                 "MaximumBatchSize": {"Type": "INSTANCE_COUNT", "Value": 1},
-                **deployment.pop("policy", {}),
+                "RollbackMaximumBatchSize": {"Type": "INSTANCE_COUNT", "Value": 1},
             },
             "WaitIntervalInSeconds": wait,
-            **deployment,
+            "AutoRollbackConfiguration": [{"AlarmName": name} for name in alarms],
         },
     }
 
@@ -514,13 +575,16 @@ def _validated(spec: dict[str, Any], cluster: str) -> None:
 
 
 def test_rolling_keeps_the_schedule_and_rolls_one_instance_at_a_time(capsys) -> None:
-    code, document, err = _run(DescribeRunner(), capsys, "--rolling")
+    code, document, err = _run(
+        DescribeRunner(), capsys, "--rolling", "--rollback-alarm", ALARM
+    )
 
     assert code == 0, err
     assert (document["mode"], document["status"]) == ("rolling", "PLAN")
     (record,) = document["instance_groups"]
     expected = _rolling("cron(0 12 ? * SUN *)")
     assert (record["outcome"], record["rolling_schedule"]) == ("rolling", expected)
+    assert record["replaces"] == {"ScheduleExpression": "cron(0 12 ? * SUN *)"}
     assert "removes" not in record
     (spec,) = document["update_cluster"]["instance_groups"]
     details = _described()["InstanceGroups"][1]
@@ -531,17 +595,23 @@ def test_rolling_keeps_the_schedule_and_rolls_one_instance_at_a_time(capsys) -> 
         "the ownership release's full definition, the schedule made to roll"
     )
     _validated(spec, "hp-gpu")
-    assert "keeps each group's ScheduleExpression" in document["removal"]
+    assert (
+        "creates the rolling one: the ScheduleExpression kept" in (document["removal"])
+    )
     assert (
         f"hp-gpu/{SITE_GROUP}: rolling (keeps ScheduledUpdateConfig cron(0 12 ? * SUN "
-        "*), re-imaging one instance at a time 600 s apart)"
+        "*), re-imaging one instance at a time 600 s apart, rolled back one instance "
+        f"at a time on alarm {ALARM}; the current ScheduledUpdateConfig is deleted "
+        "first: the service does not modify one in place)"
     ) in err
-    assert (
-        f"run in a maintenance window: {document['update_cluster']['command']}" in err
+    steps = document["update_cluster"]["steps"]
+    assert f"step 3 create: {steps[2]['command']}" in err
+    assert steps[2]["command"] == document["update_cluster"]["command"], (
+        "update_cluster.command stays the final definition's command"
     )
 
 
-def test_rolling_keeps_auto_patching_and_the_other_deployment_members(capsys) -> None:
+def test_rolling_keeps_auto_patching_and_sets_the_rollback_members(capsys) -> None:
     described = _described()
     group = described["InstanceGroups"][1]
     group["ScheduledUpdateConfig"]["DeploymentConfig"] = {
@@ -550,7 +620,7 @@ def test_rolling_keeps_auto_patching_and_the_other_deployment_members(capsys) ->
             "RollbackMaximumBatchSize": {"Type": "INSTANCE_COUNT", "Value": 2},
         },
         "WaitIntervalInSeconds": 60,
-        "AutoRollbackConfiguration": [{"AlarmName": "hp-gpu-reimage"}],
+        "AutoRollbackConfiguration": [{"AlarmName": "an-older-alarm"}],
     }
     group["AutoPatchConfig"] = {
         "PatchingStrategy": "WhenIdle",
@@ -559,19 +629,26 @@ def test_rolling_keeps_auto_patching_and_the_other_deployment_members(capsys) ->
     }
 
     code, document, err = _run(
-        DescribeRunner(described), capsys, "--rolling", "--wait-interval-seconds", "900"
+        DescribeRunner(described),
+        capsys,
+        "--rolling",
+        "--wait-interval-seconds",
+        "900",
+        "--rollback-alarm",
+        ALARM,
     )
 
     assert code == 0, err
     (spec,) = document["update_cluster"]["instance_groups"]
-    assert spec["ScheduledUpdateConfig"] == _rolling(
-        "cron(0 12 ? * SUN *)",
-        900,
-        policy={"RollbackMaximumBatchSize": {"Type": "INSTANCE_COUNT", "Value": 2}},
-        AutoRollbackConfiguration=[{"AlarmName": "hp-gpu-reimage"}],
-    ), "only the batch and the wait change"
+    assert spec["ScheduledUpdateConfig"] == _rolling("cron(0 12 ? * SUN *)", 900), (
+        "batch, rollback batch, wait and alarms are what --rolling says"
+    )
     assert "AutoPatchConfig" in spec, "--rolling touches the schedule only"
+    (delete,) = document["update_cluster"]["steps"][0]["instance_groups"]
+    assert delete == {k: v for k, v in spec.items() if k != "ScheduledUpdateConfig"}
+    assert "AutoPatchConfig" in delete, "the delete step keeps automatic patching"
     _validated(spec, "hp-gpu")
+    _validated(delete, "hp-gpu")
 
 
 def test_a_group_that_rolls_this_way_already_or_has_no_schedule_needs_nothing(
@@ -587,24 +664,37 @@ def test_a_group_that_rolls_this_way_already_or_has_no_schedule_needs_nothing(
         "PatchingStrategy": "WhenIdle"
     }
 
-    for described in (rolling, unscheduled):
-        code, document, err = _run(DescribeRunner(described), capsys, "--rolling")
+    for described, why in (
+        (rolling, "rolls this way already"),
+        (unscheduled, "no ScheduledUpdateConfig to roll"),
+    ):
+        code, document, err = _run(
+            DescribeRunner(described), capsys, "--rolling", "--rollback-alarm", ALARM
+        )
 
         assert code == 0
         assert document["status"] == "NOOP" and "update_cluster" not in document
         assert document["instance_groups"][0]["outcome"] == "none"
-        assert "no ScheduledUpdateConfig to roll, or it rolls this way already" in err
-    _code, document, _err = _run(
-        DescribeRunner(rolling), capsys, "--rolling", "--wait-interval-seconds", "300"
-    )
-    assert document["instance_groups"][0]["outcome"] == "rolling", (
-        "another wait is a change"
-    )
+        assert f"{SITE_GROUP}: none ({why}" in err
+    for change in (["--wait-interval-seconds", "300"], ["--rollback-alarm", "other"]):
+        runner = DescribeRunner(
+            rolling, alarms={n: _alarm(n) for n in (ALARM, "other")}
+        )
+        _code, document, _err = _run(
+            runner, capsys, "--rolling", "--rollback-alarm", ALARM, *change
+        )
+        assert document["instance_groups"][0]["outcome"] == "rolling", (
+            f"{change} is a change: deleted and created again"
+        )
 
 
 def test_the_refusals_hold_for_rolling_too(capsys) -> None:
     code, document, err = _run(
-        DescribeRunner(_with(ActiveOperations={"Scaling": 1})), capsys, "--rolling"
+        DescribeRunner(_with(ActiveOperations={"Scaling": 1})),
+        capsys,
+        "--rolling",
+        "--rollback-alarm",
+        ALARM,
     )
 
     assert code == helper.EXIT_REFUSED
@@ -625,9 +715,11 @@ def test_the_wait_is_bounded_by_the_service_model(wait: str, capsys) -> None:
 
 
 def test_rolling_schedule_keeps_the_expression_and_accepts_no_wait() -> None:
-    assert helper.rolling_schedule({"ScheduleExpression": CPU_SCHEDULE}, 0) == _rolling(
-        CPU_SCHEDULE, 0
-    )
+    assert helper.rolling_schedule(
+        {"ScheduleExpression": CPU_SCHEDULE}, 0, alarms=[ALARM]
+    ) == _rolling(CPU_SCHEDULE, 0)
+    with pytest.raises(ValueError, match="at least one alarm"):
+        helper.rolling_schedule({"ScheduleExpression": CPU_SCHEDULE}, 0, alarms=[])
 
 
 def _cpu_described() -> dict[str, Any]:
@@ -697,6 +789,8 @@ def test_the_sites_cpu_cluster_rolls_every_group_from_one_describe(
         "--state-dir",
         str(_cpu_state_dir(tmp_path)),
         "--rolling",
+        "--rollback-alarm",
+        ALARM,
         arn=arn,
     )
 
@@ -704,9 +798,10 @@ def test_the_sites_cpu_cluster_rolls_every_group_from_one_describe(
     assert document["selection"] == (
         "every instance group of the site's CPU control-plane cluster"
     ), "no ownership label on a CPU group: every group is the control plane's"
-    assert [call[:2] for call in runner.calls] == [("sagemaker", "describe-cluster")], (
-        "site.yaml names the CPU HyperPod cluster: one describe, no inventory"
-    )
+    assert [call[:2] for call in runner.calls] == [
+        ("sagemaker", "describe-cluster"),
+        ("cloudwatch", "describe-alarms"),
+    ], "site.yaml names the CPU HyperPod cluster: one describe, no inventory"
     (record,) = document["instance_groups"]
     assert (record["name"], record["outcome"]) == (CPU_GROUP, "rolling")
     (spec,) = document["update_cluster"]["instance_groups"]
@@ -715,6 +810,10 @@ def test_the_sites_cpu_cluster_rolls_every_group_from_one_describe(
     _validated(spec, CPU_NAME)
     words = shlex.split(document["update_cluster"]["command"])
     assert words[words.index("--cluster-name") + 1] == CPU_NAME
+    assert document["rollback_alarms"]["warnings"] == [
+        "the site names no API NLB (spec.nlb.name; pass --state-dir): the alarms' "
+        "dimensions were not checked"
+    ], "this site.yaml has no spec.nlb: nothing to check the dimensions against"
 
 
 def test_the_sites_cpu_cluster_can_drop_its_schedule_as_well(

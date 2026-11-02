@@ -824,9 +824,11 @@ CPU_COMMAND = (
 )
 CPU_HELPER = CPU_COMMAND + " prints the update-cluster command that removes it"
 CPU_ROLLING = (
-    CPU_COMMAND + " --rolling prints the update-cluster command that makes it roll "
-    "one instance at a time (without --rolling, the one that removes it: then "
-    "update the group by hand in a maintenance window, one instance at a time)"
+    CPU_COMMAND + " --rolling --rollback-alarm <alarm> prints the update-cluster "
+    "commands (delete the schedule, then create it again) that make it roll one "
+    "instance at a time, rolled back on that alarm (without --rolling, the one "
+    "that removes it: then update the group by hand in a maintenance window, one "
+    "instance at a time)"
 )
 CPU_WHERE = f"the CPU control-plane cluster {CPU_NAME}"
 
@@ -923,6 +925,8 @@ def test_the_block_records_every_cpu_group_with_its_count_and_rolling_batch() ->
                     "type": "INSTANCE_COUNT",
                     "value": 1,
                     "wait_seconds": 300,
+                    "rollback_batch": None,
+                    "rollback_alarms": [],
                 },
             },
             {
@@ -951,7 +955,13 @@ def test_the_block_records_every_cpu_group_with_its_count_and_rolling_batch() ->
                     }
                 }
             },
-            {"type": "CAPACITY_PERCENTAGE", "value": 50, "wait_seconds": None},
+            {
+                "type": "CAPACITY_PERCENTAGE",
+                "value": 50,
+                "wait_seconds": None,
+                "rollback_batch": None,
+                "rollback_alarms": [],
+            },
         ),
         (
             {
@@ -996,6 +1006,11 @@ def test_a_group_beside_other_cpu_nodes_names_the_pods_on_it_only() -> None:
     assert "whole control plane" not in line
 
 
+#: ``_cpu_group`` writes a batch with no rollback batch and no alarm.
+NO_ROLLBACK = (
+    ", with no rollback alarm (AutoRollbackConfiguration): nothing rolls it back "
+    "when the control plane loses capacity"
+)
 SAFE_RESIDUAL = (
     ": the safe form -- the control plane keeps serving from the other nodes; "
     "residual: the control-plane Pods on each batch go down with it, and the "
@@ -1014,12 +1029,12 @@ WHOLE = (
         (
             {"Type": "INSTANCE_COUNT", "Value": 1},
             3,
-            "rolling 1 instance(s) at a time 300 s apart" + SAFE_RESIDUAL,
+            "rolling 1 instance(s) at a time 300 s apart" + NO_ROLLBACK + SAFE_RESIDUAL,
         ),
         (
             {"Type": "CAPACITY_PERCENTAGE", "Value": 34},
             3,
-            "rolling 34% at a time 300 s apart" + SAFE_RESIDUAL,
+            "rolling 34% at a time 300 s apart" + NO_ROLLBACK + SAFE_RESIDUAL,
         ),
         (
             {"Type": "INSTANCE_COUNT", "Value": 3},
@@ -1036,7 +1051,7 @@ WHOLE = (
         (
             {"Type": "INSTANCE_COUNT", "Value": 1},
             None,
-            "rolling 1 instance(s) at a time 300 s apart" + SAFE_RESIDUAL,
+            "rolling 1 instance(s) at a time 300 s apart" + NO_ROLLBACK + SAFE_RESIDUAL,
         ),
     ],
     ids=["one-at-a-time", "percentage", "count-covers-all", "all-percent", "no-count"],
@@ -1049,9 +1064,9 @@ def test_a_rolling_batch_is_graded_by_what_one_window_does(
     )
 
     assert f"has ScheduledUpdateConfig {CPU_SCHEDULE} {expected}" in line, line
-    assert ("--rolling prints" in line) is (" -- every node" in expected), (
-        "the remedy is offered for the unsafe forms only"
-    )
+    assert ("--rolling --rollback-alarm <alarm> prints" in line) is (
+        " -- every node" in expected
+    ), "the remedy is offered for the unsafe forms only"
 
 
 def test_an_unknown_count_and_auto_patching_are_announced_too() -> None:
