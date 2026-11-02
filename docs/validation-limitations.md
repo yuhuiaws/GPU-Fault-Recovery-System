@@ -5909,6 +5909,33 @@ live site when they landed. What they cannot prove live:
   "GF-GENERAL-LIVE DCGM / GPU-inventory replay (phase 2)") was not observed -- a
   change arriving that late would be outside the 120 s window and planned as a
   new occurrence.
+- On HyperPod the XID 48 chain's QUIESCE_GPU_SERVICES stops kubelet -- the
+  node's exec channel, through which every probe step of the runner goes --
+  seconds after the change's decision: live 2026-11-02 (R16) the quiesce was
+  claimed 6 s (`xid_twin_reset_gpu`) and 15 s (`xid_twin_unbound_job`, its
+  job's STOP first) after the scrape that served the change, kubelet was back
+  about 74 s and 83 s after it, and both runs ended INCONCLUSIVE "harness
+  fixture failed: HostProbeMissingResponseError" (the journal read of the
+  served change, and the kernel line's arm) while the Node still read Ready
+  (the node-monitor grace period); the product's chain on the change ran to
+  its end with no kernel line written (its workflow SUCCEEDED and the incident
+  RECOVERED by the control plane's log, the node released). On a HyperPod node
+  the immediate line
+  now waits for the product's record of the change only (its `observed_at`
+  is the served moment; the journal is read at the close), a journal read the
+  node cannot answer falls back the same way on either provider, and a line
+  the node cannot take is retried while the Node reads Ready until the twin
+  window with margin (90 s after the change) closes -- a lost call that did
+  write the line is taken from the product's records, and one kmsg sequence
+  number makes a line written twice one event; past the window the run is
+  INCONCLUSIVE with that reason (`twin-arm-retry`, `twin-change-deferred`
+  evidence). The kernel collector is no quiesced service, so a line written
+  after kubelet returns reaches the product at once and pairs within the
+  120 s window; whether the line then lands before the quiesce or after
+  kubelet's return depends on the product's timing, and the post-return
+  margin measured live is a few seconds (`xid_twin_unbound_job`: kubelet back
+  83 s after the change, the window with margin ends at 90 s). The plain-EKS
+  path is unchanged (its quiesce keeps kubelet). Not yet seen live.
 - The DRAIN_P2P chain's read-back of the driver's GPU Recovery Action on a
   healthy H200 (expected None, no reset) has not been seen live; the UVM
   persistence gap (`GF-E2E-DRAIN-P2P-UVM`) is outside the variant.

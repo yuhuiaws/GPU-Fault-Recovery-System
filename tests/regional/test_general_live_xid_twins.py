@@ -643,3 +643,193 @@ def test_a_kmsg_close_the_quiesce_refuses_is_retried_when_the_node_is_back(
 
     assert attempts["close"] == 2, "closed again once the node answered"
     assert receipt["close"]["clean"] is True, receipt
+
+
+# --------------------------------------------------------------------------- #
+# The kernel line through a quiesce that took the node's exec channel
+# --------------------------------------------------------------------------- #
+STOPPED_KUBELET = (
+    "host probe response is missing (exit 1): no output came back over kubectl "
+    "exec into gpu-fault-host-probe-test; an unclassified kubectl error "
+    "(withheld); node Ready=True (the node is Ready, so the exec channel itself "
+    "failed)"
+)
+
+
+class QuiescedKernel:
+    """The kmsg probe of a node whose kubelet is away until ``back`` (epoch)."""
+
+    def __init__(self, ctx: Any, *, back: float, refuse: bool = False) -> None:
+        self.ctx = ctx
+        self.back = back
+        self.refuse = refuse
+        self.calls: list[tuple[float, int]] = []
+
+    def arm(self, *, index: int | None = None, timeout: int = 120) -> dict[str, Any]:
+        at = self.ctx.clock().timestamp()
+        self.calls.append((at, timeout))
+        if self.refuse:
+            raise placement.HostProbeError(
+                "host probe failed (exit 1); output withheld"
+            )
+        if at < self.back:
+            raise HostProbeMissingResponseError(STOPPED_KUBELET)
+        return {"armed": True, "written_at": at, "indexes": [int(index or 0)]}
+
+
+def _quiesced(
+    tmp_path: Path, *, lines: list[dict[str, Any]] | None = None
+) -> tuple[Any, dict[str, Any], datetime]:
+    records = {"events": list(lines or [])}
+    ctx, now = _clocked(tmp_path, "xid_twin_reset_gpu")
+    ctx.regional.cpu_python_responder = lambda script, *arguments: records
+    return ctx, records, now["value"]
+
+
+def test_a_line_the_quiesce_refused_is_written_once_the_node_answers(
+    tmp_path: Path,
+) -> None:
+    ctx, _records, start = _quiesced(tmp_path)
+    kernel = QuiescedKernel(ctx, back=start.timestamp() + 70)
+
+    receipt = placement.arm_kernel_line(
+        ctx,
+        kernel,  # type: ignore[arg-type]
+        since=start,
+        gpu=G1,
+        xid=48,
+        deadline=start.timestamp() + 90,
+    )
+
+    assert receipt["written_from"] == "probe-retry", receipt
+    assert (
+        70
+        <= receipt["written_at"] - start.timestamp()
+        <= 70 + (placement.ARM_RETRY_SECONDS)
+    ), receipt
+    assert kernel.calls[0][1] == 120 and {
+        timeout for _at, timeout in kernel.calls[1:]
+    } == {placement.ARM_RETRY_TIMEOUT_SECONDS}, kernel.calls
+    retry = json.loads((ctx.case_dir / "twin-arm-retry.json").read_text())
+    assert retry["first_error"].startswith("HostProbeMissingResponseError"), retry
+    assert retry["outcome"] == "probe-retry" and retry["attempts"][-1]["arm"] == "ok"
+
+
+def test_a_line_a_lost_call_wrote_is_taken_from_the_products_record(
+    tmp_path: Path,
+) -> None:
+    """The exec the stop cut had written the line: the product holds it, and it
+    is not written again."""
+
+    ctx, records, start = _quiesced(tmp_path)
+    kernel = QuiescedKernel(ctx, back=start.timestamp() + 70)
+    line = _event("k", "KERNEL_LOG", 1, incident_id="inc-g", correlated_event_id="g")
+    line["gpu_uuid"] = G1
+    records["events"].append(line)
+
+    receipt = placement.arm_kernel_line(
+        ctx,
+        kernel,  # type: ignore[arg-type]
+        since=start,
+        gpu=G1,
+        xid=48,
+        deadline=start.timestamp() + 90,
+    )
+
+    assert receipt["written_from"] == "product record", receipt
+    assert receipt["written_at"] == start.timestamp() + 1, receipt
+    assert len(kernel.calls) == 1, "no second write of a line the product holds"
+
+
+def test_a_node_that_stays_away_past_the_window_is_inconclusive(tmp_path: Path) -> None:
+    ctx, _records, start = _quiesced(tmp_path)
+    kernel = QuiescedKernel(ctx, back=start.timestamp() + 200)
+
+    with pytest.raises(VariantInconclusive, match="inside the twin window"):
+        placement.arm_kernel_line(
+            ctx,
+            kernel,  # type: ignore[arg-type]
+            since=start,
+            gpu=G1,
+            xid=48,
+            deadline=start.timestamp() + 90,
+        )
+    assert max(at for at, _timeout in kernel.calls) < start.timestamp() + 90, (
+        "nothing is written past the window"
+    )
+
+
+def test_a_refused_line_is_not_retried(tmp_path: Path) -> None:
+    """A probe that ran and refused is the fixture's failure, not the quiesce."""
+
+    ctx, _records, start = _quiesced(tmp_path)
+    kernel = QuiescedKernel(ctx, back=0.0, refuse=True)
+
+    with pytest.raises(placement.HostProbeError, match="output withheld"):
+        placement.arm_kernel_line(
+            ctx,
+            kernel,  # type: ignore[arg-type]
+            since=start,
+            gpu=G1,
+            xid=48,
+            deadline=start.timestamp() + 90,
+        )
+    assert len(kernel.calls) == 1, kernel.calls
+
+
+def test_no_line_is_tried_while_the_node_reads_not_ready(tmp_path: Path) -> None:
+    ctx, _records, start = _quiesced(tmp_path)
+    ctx.regional.node_snapshot_value = {
+        **ctx.regional.node_snapshot_value,
+        "ready": "Unknown",
+    }
+    kernel = QuiescedKernel(ctx, back=start.timestamp() + 1)
+
+    with pytest.raises(VariantInconclusive):
+        placement.arm_kernel_line(
+            ctx,
+            kernel,  # type: ignore[arg-type]
+            since=start,
+            gpu=G1,
+            xid=48,
+            deadline=start.timestamp() + 30,
+        )
+    assert len(kernel.calls) == 1, "only the first call; none while kubelet is away"
+
+
+def test_a_journal_the_node_cannot_read_leaves_the_moment_to_the_products_record(
+    tmp_path: Path,
+) -> None:
+    """Plain EKS reads the journal first; when that read cannot reach the node,
+    the product's record of the change gives the served moment."""
+
+    ctx, records, start = _quiesced(tmp_path)
+    change = _event("g", "DCGM_EXPORTER", 12, incident_id="inc-g")
+    change["gpu_uuid"] = G1
+    records["events"].append(change)
+
+    class LostJournal:
+        interval = 15
+
+        def advance(self) -> dict[str, Any]:
+            return {"advanced": True}
+
+        def audit(self) -> list[dict[str, Any]]:
+            raise HostProbeMissingResponseError(f"dcgm audit-read: {STOPPED_KUBELET}")
+
+    kernel = QuiescedKernel(ctx, back=0.0)
+    delivery = placement.deliver_gauge_first(
+        ctx,
+        LostJournal(),  # type: ignore[arg-type]
+        kernel,  # type: ignore[arg-type]
+        since=start,
+        gpu=G1,
+        xid=48,
+        delay_seconds=0,
+    )
+
+    assert (delivery.served_from, delivery.written_from) == ("product record", "probe")
+    assert delivery.gauge_served_at == start.timestamp() + 12, delivery.record()
+    deferred = json.loads((ctx.case_dir / "twin-change-deferred.json").read_text())
+    assert deferred["reason"].startswith("HostProbeMissingResponseError"), deferred
+    assert deferred["event_id"] == "g", deferred

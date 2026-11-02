@@ -226,7 +226,7 @@ class KernelLogReplay:
         self._opened = True
         return receipt
 
-    def arm(self, *, index: int | None = None) -> dict[str, Any]:
+    def arm(self, *, index: int | None = None, timeout: int = 120) -> dict[str, Any]:
         """Start emitting the reviewed records -- all of them, or (kmsg mode)
         only record ``index``, so two lines of one run can be placed apart in
         time. The receipt's ``written_at`` is the node's wall clock when the
@@ -238,7 +238,7 @@ class KernelLogReplay:
             if self.mode != "kmsg":
                 raise ValueError("only a kmsg replay arms one record at a time")
             arguments += ["--index", str(int(index))]
-        receipt = self.host.execute(*arguments, timeout=120)
+        receipt = self.host.execute(*arguments, timeout=timeout)
         self._armed = True
         return receipt
 

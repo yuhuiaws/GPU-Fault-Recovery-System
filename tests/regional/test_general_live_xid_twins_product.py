@@ -17,14 +17,20 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
-from datetime import timedelta
+import json
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from scripts.e2e.regional import general_live_xid_twin_delivery as delivery_module
 from scripts.e2e.regional import general_live_xid_twin_records as records_module
 from scripts.e2e.regional import general_live_xid_twins as twins
+from scripts.e2e.regional.general_live_fixture import (
+    EKS_NODEGROUP_LABEL,
+    HYPERPOD_LABEL,
+)
 from scripts.e2e.regional.general_live_gpu_store import GPU_STATE_PROBE
 from scripts.e2e.regional.workload_restart_custody import (
     UNBOUND_IDENTITY_SOURCE,
@@ -58,6 +64,8 @@ class Run:
         interval: int = 15,
         phase: float = 4.0,
         gpus: tuple[str, ...] | None = None,
+        provider: str = "eks",
+        exec_away: tuple[float, float] | None = None,
     ) -> None:
         self.spec = next(item for item in twins.VARIANTS if item.variant == variant)
         self.case = twins.CASES[variant]
@@ -70,9 +78,18 @@ class Run:
             self.clock,
             interval=interval,
             phase=phase,
+            exec_away=exec_away,
             **({"gpus": gpus} if gpus else {}),
         )
-        regional = FakeRegional(cpu_python=self.product.probe)
+        labels = (
+            {HYPERPOD_LABEL: "hyperpod"}
+            if provider == "hp"
+            else {EKS_NODEGROUP_LABEL: "gpu-p5en-efa-spot-node-group"}
+        )
+        regional = FakeRegional(
+            cpu_python=self.product.probe,
+            node_metadata={"name": NODE, "labels": labels},
+        )
         settings = make_settings(self.spec, node=NODE)
         self.ctx = make_context(
             self.spec,
@@ -270,6 +287,118 @@ def test_reset_gpu_twin_fails_on_a_product_without_the_twin_rule(
         "stages"
     ]
     assert out["stages"]["executions"] == [], "the merge kept one reset in flight"
+
+
+# --------------------------------------------------------------------------- #
+# HyperPod: the quiesce stops kubelet, the probes' exec channel
+# --------------------------------------------------------------------------- #
+#: Live 2026-11-02 (R16, HyperPod): QUIESCE_GPU_SERVICES claimed 6 s after the
+#: scrape that served the change, kubelet back about 74 s after it.
+HP_KUBELET_AWAY = (6.0, 68.0)
+
+
+def _refused_before_the_line(run: Run) -> list[str]:
+    line = run.node.kernel_posts[0]["observed_at"]
+    return [
+        name
+        for name, at in run.node.refused
+        if at < datetime.fromisoformat(line).timestamp()
+    ]
+
+
+def test_reset_gpu_twin_on_hyperpod_places_the_line_before_the_quiesce(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On HyperPod the XID 48 line follows the product's record of the change at
+    once -- no journal read first -- and lands before kubelet stops."""
+
+    run = Run(
+        tmp_path,
+        monkeypatch,
+        "xid_twin_reset_gpu",
+        provider="hp",
+        exec_away=HP_KUBELET_AWAY,
+    )
+    out = run.run()
+
+    assert out["verdict"] == "PASS", out["errors"]
+    delivery = out["delivery"]
+    assert (delivery["served_from"], delivery["written_from"]) == (
+        "product record",
+        "probe",
+    ), delivery
+    assert 0 <= -delivery["gauge_minus_kernel_seconds"] < HP_KUBELET_AWAY[0], delivery
+    assert _refused_before_the_line(run) == [], run.node.refused
+    assert _executed(run.product) == {"QUIESCE_GPU_SERVICES": 1, "RESET_GPU": 1}
+
+
+def test_reset_gpu_twin_on_hyperpod_writes_the_line_once_kubelet_is_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live 2026-11-02 the journal read and the line's exec came back empty
+    while kubelet was stopped, and the run ended INCONCLUSIVE "harness fixture
+    failed". Kubelet stopped as the change was recorded: the line is retried
+    and written once the node answers, inside the twin window, and the product
+    still runs one reset."""
+
+    run = Run(
+        tmp_path,
+        monkeypatch,
+        "xid_twin_reset_gpu",
+        provider="hp",
+        exec_away=(0.0, 68.0),
+    )
+    out = run.run()
+
+    assert out["verdict"] == "PASS", out["errors"]
+    delivery = out["delivery"]
+    assert delivery["written_from"] == "probe-retry", delivery
+    lag = -delivery["gauge_minus_kernel_seconds"]
+    assert (
+        68 <= lag <= twins.TWIN_WINDOW_SECONDS - delivery_module.REPEAT_MARGIN_SECONDS
+    )
+    assert run.node.refused[0][0] == "arm", run.node.refused
+    assert _executed(run.product) == {"QUIESCE_GPU_SERVICES": 1, "RESET_GPU": 1}
+    retry = json.loads((run.ctx.case_dir / "twin-arm-retry.json").read_text())
+    assert retry["outcome"] == "probe-retry", retry
+    assert retry["attempts"][-1]["arm"] == "ok", retry
+
+
+def test_reset_gpu_twin_is_inconclusive_when_kubelet_outlasts_the_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A quiesce longer than the twin window with margin: no line is written
+    late, nothing is graded, the reason is named."""
+
+    run = Run(
+        tmp_path,
+        monkeypatch,
+        "xid_twin_reset_gpu",
+        provider="hp",
+        exec_away=(0.0, 150.0),
+    )
+    with pytest.raises(twins.VariantInconclusive) as raised:
+        run.run()
+
+    assert "could not be written inside the twin window" in str(raised.value)
+    assert "QUIESCE_GPU_SERVICES stops it" in str(raised.value)
+    assert run.node.kernel_posts == [], "no line outside the window"
+
+
+def test_the_eks_twin_still_reads_the_journal_before_the_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plain EKS keeps kubelet through the quiesce: the served moment is the
+    journal's read, as before."""
+
+    run = Run(tmp_path, monkeypatch, "xid_twin_reset_gpu")
+    out = run.run()
+
+    assert out["verdict"] == "PASS", out["errors"]
+    assert (out["delivery"]["served_from"], out["delivery"]["written_from"]) == (
+        "journal",
+        "probe",
+    ), out["delivery"]
 
 
 @pytest.mark.parametrize("before_rule", [False, True])

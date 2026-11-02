@@ -46,6 +46,7 @@ from gpu_fault.gpu_metrics import GpuMetricBatch, GpuMetricSample, GpuMetricSour
 from gpu_fault.models import WorkflowOperation, WorkflowStatus
 from gpu_fault.store import InMemoryStore
 from gpu_fault.telemetry import WorkloadCoverageHeartbeat
+from scripts.e2e.regional.host_probe_fixture import HostProbeMissingResponseError
 from tests._builders import asgi_client, attempt_observation, container_observation
 from tests.orchestration._xid_report_twins_support import RecordingAdapter
 from tests.regional._general_live_fakes import FakeProbe
@@ -225,11 +226,17 @@ class TwinNode:
         interval: int = 15,
         phase: float = 4.0,
         gpus: tuple[str, ...] = (G0, G1),
+        exec_away: tuple[float, float] | None = None,
     ) -> None:
         self.product = product
         self.clock = clock
         self.interval = interval
         self.phase = phase
+        #: HyperPod's quiesce: ``(after, seconds)`` from the delivery of the
+        #: XID change, every probe exec comes back empty (kubelet stopped).
+        self.exec_away = exec_away
+        self.changed_at: datetime | None = None
+        self.refused: list[tuple[str, float]] = []
         self.survey = survey(gpus=gpus)
         self.plan: dict[str, Any] | None = None
         self.armed = False
@@ -295,6 +302,8 @@ class TwinNode:
             self.deliver(
                 at, served, reason="initial-baseline" if first else "xid-changed"
             )
+            if changed and self.changed_at is None:
+                self.changed_at = at
         self.delivered = dict(served) if served else {"none": 0.0}
 
     def deliver(self, at: datetime, served: dict[str, float], *, reason: str) -> None:
@@ -344,6 +353,38 @@ class TwinNode:
             edge_filter_reasons=[reason],
         )
         self.product.post(GPU_METRICS_PATH, batch.model_dump(mode="json"))
+
+    def away(self) -> bool:
+        """Whether kubelet is stopped now (``exec_away``)."""
+
+        if self.exec_away is None or self.changed_at is None:
+            return False
+        after, seconds = self.exec_away
+        elapsed = (self.clock.now - self.changed_at).total_seconds()
+        return after <= elapsed < after + seconds
+
+    def guarded(self, script: dict[str, Any]) -> FakeProbe:
+        """``script`` as a probe whose every call fails while kubelet is away,
+        the way the live exec did (no output, the Node still Ready)."""
+
+        node = self
+
+        def guard(name: str, value: Any) -> Any:
+            def call(arguments: tuple[str, ...]) -> dict[str, Any]:
+                if node.away():
+                    node.refused.append((name, node.clock.epoch()))
+                    raise HostProbeMissingResponseError(
+                        "host probe response is missing (exit 1): no output came "
+                        f"back over kubectl exec into gpu-fault-host-probe-test on "
+                        f"{NODE}; an unclassified kubectl error (withheld); node "
+                        "Ready=True (the node is Ready, so the exec channel itself "
+                        "failed)"
+                    )
+                return value(arguments) if callable(value) else dict(value)
+
+            return call
+
+        return FakeProbe({name: guard(name, value) for name, value in script.items()})
 
     def dcgm(self, **extra: Any) -> FakeProbe:
         node = self
@@ -416,7 +457,7 @@ class TwinNode:
             "close-run": close,
         }
         script.update(extra)
-        return FakeProbe(script)
+        return self.guarded(script)
 
     # -- the kernel collector and the kmsg fixture ----------------------- #
     def kernel(self) -> FakeProbe:
@@ -451,7 +492,7 @@ class TwinNode:
                 "lines_written": int(record.get("emissions", 1)),
             }
 
-        return FakeProbe(
+        return self.guarded(
             {
                 "install-records": install,
                 "open-window": {"after": {"ActiveState": "active"}},

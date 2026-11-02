@@ -34,6 +34,7 @@ from scripts.e2e.regional.collector_action_guard import require_action_time
 from scripts.e2e.regional.general_live_fixture import (
     VariantContext,
     VariantInconclusive,
+    node_provider,
 )
 from scripts.e2e.regional.general_live_gpu_replay import (
     DcgmReplay,
@@ -44,6 +45,7 @@ from scripts.e2e.regional.general_live_gpu_replay import (
 )
 from scripts.e2e.regional.general_live_gpu_replay_close import (
     close_after_probe_loss,
+    node_facts,
     unreachable_detail,
 )
 from scripts.e2e.regional.general_live_gpu_store import gpu_state
@@ -59,12 +61,17 @@ from scripts.e2e.regional.general_live_verdicts import parse_time
 from scripts.e2e.regional.general_live_xid_twin_records import (
     GAUGE,
     GAUGE_SOURCE,
+    KERNEL_SOURCE,
     TWIN_WINDOW_SECONDS,
     reports,
     seconds_between,
     twin_records,
 )
-from scripts.e2e.regional.host_probe_fixture import HostProbeError
+from scripts.e2e.regional.host_probe_fixture import (
+    HostProbeError,
+    HostProbeMissingResponseError,
+    HostProbeTransportError,
+)
 
 TWIN_PROFILE = "xid_twin"
 #: The production lag of a field-230 change behind its kernel line: the
@@ -101,6 +108,28 @@ QUIET_SECONDS = 2 * TWIN_WINDOW_SECONDS
 #: the product's tests replay; ``policy.models.parse_xid154_action`` reads only
 #: the parenthesised label after "to".
 DRAIN_P2P_TEXT = "GPU recovery action changed from 0x0 (None) to 0x3 (Drain P2P)"
+#: A HyperPod node's exec channel through the product's chain. Every node-side
+#: step of the runner is one ``kubectl exec`` into a probe Pod, served by the
+#: node's own kubelet, and ``QUIESCE_GPU_SERVICES`` stops kubelet on a HyperPod
+#: node until ``RESTORE_GPU_SERVICES`` (``general_live_gpu_replay_close``); the
+#: kernel collector is no quiesced service, so a line written once kubelet is
+#: back reaches the product at once. Live 2026-11-02 (R16, HyperPod), the XID
+#: 48 chain claimed QUIESCE_GPU_SERVICES 6 s (``xid_twin_reset_gpu``) and 15 s
+#: (``xid_twin_unbound_job``, its job's STOP first) after the scrape that served
+#: the change, and kubelet was back about 74 s and 83 s after it; the journal
+#: read and the kernel line's exec in between came back empty while the Node
+#: still read Ready (the node-monitor grace period), and both runs ended
+#: INCONCLUSIVE "harness fixture failed" with nothing graded. While the node
+#: cannot answer, the line is retried this often, each try bounded (a refused
+#: dial fails at once; a stream the stop cuts can hang), until the twin window
+#: with margin closes.
+ARM_RETRY_SECONDS = 2
+ARM_RETRY_TIMEOUT_SECONDS = 30
+#: How long a lost call's line may take to reach the product's records.
+LOST_LINE_SECONDS = 5
+#: The product's record of the change, polled this often where the quiesce
+#: follows the change within seconds (HyperPod, an immediate line).
+FAST_RECORDS_POLL_SECONDS = 1
 
 
 @dataclass
@@ -113,6 +142,14 @@ class Delivery:
     advanced_at_read: int | None = None
     repeat_written_at: float | None = None
     problems: list[str] = field(default_factory=list)
+    #: Where ``gauge_served_at`` comes from: the replay journal's read, or --
+    #: when the node could not answer the journal read -- the product's own
+    #: record of the change (its ``observed_at``, the scrape's moment).
+    served_from: str = "journal"
+    #: Where ``kernel_written_at`` comes from: the probe's receipt (``probe``),
+    #: a retry's once the node answered again (``probe-retry``), or the
+    #: product's record of a line a lost call did write (``product record``).
+    written_from: str = "probe"
 
     def record(self) -> dict[str, Any]:
         lag = (
@@ -134,6 +171,8 @@ class Delivery:
                 else None
             ),
             "problems": list(self.problems),
+            "served_from": self.served_from,
+            "written_from": self.written_from,
         }
 
 
@@ -391,6 +430,7 @@ def wait_records(
     *,
     timeout_seconds: float,
     name: str,
+    poll_seconds: float = RECORDS_POLL_SECONDS,
 ) -> dict[str, Any]:
     """Poll the twin records until ``need`` holds (the last read otherwise)."""
 
@@ -404,10 +444,115 @@ def wait_records(
     value = ctx.wait_until(
         accept,
         timeout_seconds=timeout_seconds,
-        poll_seconds=RECORDS_POLL_SECONDS,
+        poll_seconds=poll_seconds,
         name=name,
     )
     return value if value is not None else last
+
+
+def quiesce_stops_exec(ctx: VariantContext) -> bool:
+    """Whether the product's quiesce takes the node's exec channel: kubelet
+    stops on a HyperPod node, an eks-managed one keeps it."""
+
+    labels = ctx.regional.node_metadata(ctx.settings.node).get("labels") or {}
+    return node_provider(labels) == "hp"
+
+
+def unreachable(error: BaseException) -> bool:
+    """The node never answered the probe (its transport), not a refused host
+    action -- the shape a stopped kubelet leaves."""
+
+    return isinstance(error, (HostProbeTransportError, HostProbeMissingResponseError))
+
+
+def recorded_epoch(event: dict[str, Any], what: str) -> float:
+    """A report's ``observed_at`` as an epoch (the node's clock: the scrape's
+    moment, or the kernel line's own timestamp)."""
+
+    moment = parse_time(event.get("observed_at"))
+    if moment is None:
+        raise VariantInconclusive(f"the product's record of {what} has no observed_at")
+    return moment.timestamp()
+
+
+def arm_kernel_line(
+    ctx: VariantContext,
+    kernel: KernelLogReplay,
+    *,
+    since: datetime,
+    gpu: str,
+    xid: int,
+    deadline: float,
+) -> dict[str, Any]:
+    """Write the twin's kernel line (record 0), through a quiesce that took the
+    node's exec channel.
+
+    A call the node never answered (``unreachable``) may still have written
+    the line: the product's records are read first, and a line they hold is
+    taken from them (its ``observed_at`` as the written moment). Else the line
+    is retried every ``ARM_RETRY_SECONDS`` while the Node reads Ready, until
+    ``deadline`` (the node's clock: the twin window with margin). The record
+    keeps one kmsg sequence number, so a line written twice is one event. A
+    refused host action is raised; a deadline that passes is INCONCLUSIVE,
+    named, with every attempt in ``twin-arm-retry``.
+    """
+
+    try:
+        return kernel.arm(index=0)
+    except HostProbeError as error:
+        if not unreachable(error):
+            raise
+        first = f"{type(error).__name__}: {error}"
+    attempts: list[dict[str, Any]] = []
+    document = {"first_error": first, "deadline": deadline, "attempts": attempts}
+
+    def written_by_lost_call() -> dict[str, Any] | None:
+        lines = reports(twin_records(ctx, since, xid), gpu=gpu, source=KERNEL_SOURCE)
+        if not lines:
+            return None
+        return {
+            "written_at": recorded_epoch(lines[0], "the kernel line"),
+            "written_from": "product record",
+            "event_id": lines[0].get("event_id"),
+        }
+
+    ctx.sleep(LOST_LINE_SECONDS)
+    found = written_by_lost_call()
+    while found is None and ctx.clock().timestamp() < deadline:
+        facts = node_facts(ctx)
+        entry: dict[str, Any] = {
+            "observed_at": ctx.clock().isoformat(),
+            "ready": facts.ready,
+            "ready_since": facts.ready_since,
+        }
+        attempts.append(entry)
+        if facts.ready == "True":
+            try:
+                receipt = kernel.arm(index=0, timeout=ARM_RETRY_TIMEOUT_SECONDS)
+            except HostProbeError as error:
+                if not unreachable(error):
+                    raise
+                entry["arm"] = f"{type(error).__name__}: {error}"
+            else:
+                entry["arm"] = "ok"
+                found = {**receipt, "written_from": "probe-retry"}
+                break
+        ctx.evidence.write("twin-arm-retry", document)
+        ctx.sleep(ARM_RETRY_SECONDS)
+    if found is None:
+        found = written_by_lost_call()
+    document["outcome"] = found.get("written_from") if found else "window closed"
+    ctx.evidence.write("twin-arm-retry", document)
+    if found is None:
+        raise VariantInconclusive(
+            "the twin's kernel line could not be written inside the twin window "
+            f"with margin: the node did not answer its probe ({first}; "
+            f"{len(attempts)} retries while kubelet was away -- HyperPod's "
+            "QUIESCE_GPU_SERVICES stops it until RESTORE_GPU_SERVICES) and the "
+            "product holds no line of a lost call; the change alone cannot show "
+            "two reports of one XID as one occurrence"
+        )
+    return found
 
 
 def kernel_written_at(receipt: dict[str, Any]) -> float:
@@ -502,22 +647,42 @@ def deliver_gauge_first(
     delay_seconds: int,
 ) -> Delivery:
     """The change, recorded by the product, then the line ``delay_seconds``
-    after it was served -- inside the twin window by construction."""
+    after it was served -- inside the twin window by construction.
+
+    The served moment is the replay journal's read of the change. On a
+    HyperPod node an immediate line (``delay_seconds`` 0: XID 48, whose chain
+    quiesces the node within seconds of the change's decision) does not wait
+    for that read: the product's own record of the change -- what the line
+    must follow anyway -- gives the moment (its ``observed_at``, the scrape's),
+    and the journal is read at the close. A journal read the node cannot
+    answer falls back the same way, and the line goes through
+    ``arm_kernel_line``. The plain-EKS path is unchanged: its quiesce keeps
+    kubelet.
+    """
 
     delivery = Delivery(order="gauge-first")
     interval = max(1, int(replay.interval))
     key = gauge_key(gpu)
+    immediate = delay_seconds == 0 and quiesce_stops_exec(ctx)
     replay.advance()
-    change = wait_read(
-        ctx,
-        replay,
-        lambda record: served(record, key) == float(xid),
-        timeout_seconds=2 * interval + 30,
-        name="twin-change",
-        what=f"the change of {key} to {xid}",
-    )
-    delivery.advanced_at_read = int(change.get("read") or 0)
-    delivery.gauge_served_at = served_at = float(change.get("at") or 0.0)
+    lost = ""
+    if not immediate:
+        try:
+            change = wait_read(
+                ctx,
+                replay,
+                lambda record: served(record, key) == float(xid),
+                timeout_seconds=2 * interval + 30,
+                name="twin-change",
+                what=f"the change of {key} to {xid}",
+            )
+        except HostProbeError as error:
+            if not unreachable(error):
+                raise
+            lost = f"{type(error).__name__}: {error}"
+        else:
+            delivery.advanced_at_read = int(change.get("read") or 0)
+            delivery.gauge_served_at = float(change.get("at") or 0.0)
     # The line must arrive after the product holds the change: the journal
     # entry precedes the collector's own delivery of that scrape.
     seen = wait_records(
@@ -527,15 +692,41 @@ def deliver_gauge_first(
         lambda records: bool(reports(records, gpu=gpu, source=GAUGE_SOURCE)),
         timeout_seconds=2 * interval + 60,
         name="twin-gauge-recorded",
+        poll_seconds=FAST_RECORDS_POLL_SECONDS if immediate else RECORDS_POLL_SECONDS,
     )
-    if not reports(seen, gpu=gpu, source=GAUGE_SOURCE):
+    gauges = reports(seen, gpu=gpu, source=GAUGE_SOURCE)
+    if not gauges:
         raise VariantInconclusive(
             f"the product recorded no field-230 change of XID {xid} on {gpu} after "
             "the replay served it"
+            + (f" (the replay journal could not be read: {lost})" if lost else "")
         )
+    if delivery.gauge_served_at is None:
+        delivery.gauge_served_at = recorded_epoch(gauges[0], "the change")
+        delivery.served_from = "product record"
+        ctx.evidence.write(
+            "twin-change-deferred",
+            {
+                "reason": lost
+                or "an immediate line on a node whose quiesce stops "
+                "kubelet does not wait for the journal read",
+                "event_id": gauges[0].get("event_id"),
+                "observed_at": gauges[0].get("observed_at"),
+                "journal": "read at the close",
+            },
+        )
+    served_at = delivery.gauge_served_at
     wait_until_epoch(ctx, served_at + delay_seconds, name="twin-delay")
-    receipt = kernel.arm(index=0)
+    receipt = arm_kernel_line(
+        ctx,
+        kernel,
+        since=since,
+        gpu=gpu,
+        xid=xid,
+        deadline=served_at + TWIN_WINDOW_SECONDS - REPEAT_MARGIN_SECONDS,
+    )
     ctx.evidence.write("kernel-twin-arm", receipt)
+    delivery.written_from = str(receipt.get("written_from") or "probe")
     delivery.kernel_written_at = written = kernel_written_at(receipt)
     gap = written - served_at
     if not 0 <= gap <= TWIN_WINDOW_SECONDS - REPEAT_MARGIN_SECONDS:

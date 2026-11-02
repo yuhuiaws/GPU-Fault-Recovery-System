@@ -1378,7 +1378,15 @@ gauge：复位或 Drain P2P 链在决策约 10 s 后执行 QUIESCE_GPU_SERVICES�
 15-30 s 的变化多半遇到已停的采集器，字段工具会把它留给 RESTORE_GPU_SERVICES 之后的第一次抓取——那时
 已在窗口之外，任何产品代际都不会配对——所以 X 变体在产品记下变化之后才写内核行：XID 48 立即（赶在
 HyperPod 的 quiesce 停掉 kubelet、探针失去通道之前），XID 154 30 s 后（变化在等待自己的内核行时
-`PENDING_CORRELATION`，链尚未开始）。动作级 XID 的 kernel-first 顺序由内存回放
+`PENDING_CORRELATION`，链尚未开始）。HyperPod 上 XID 48 链的 QUIESCE_GPU_SERVICES 在变化被决定后数秒
+就停掉 kubelet（2026-11-02 R16 真机：抓到变化后 6 s / 15 s 认领 quiesce，约 74 s / 83 s 后 kubelet
+回来，两次运行都因日志读与内核行的 exec 无输出而 INCONCLUSIVE "harness fixture failed"），所以在
+HyperPod 节点上立即写的内核行只等产品对变化的记录（其 `observed_at` 即投放时刻，回放日志在收尾时读），
+任一 provider 上节点答不了的日志读同样改用产品记录；节点接不了的内核行在 Node 仍为 Ready 时重试，直到
+孪生窗口减余量（变化后 90 s）——丢失的调用若已写下该行，以产品记录为准，同一 kmsg 序号使重写的行仍是
+一个事件；超出窗口则以该原因记 INCONCLUSIVE（证据 `twin-arm-retry`、`twin-change-deferred`）。内核
+采集器不在 quiesce 之列，kubelet 回来后写的行立即到达产品并在 120 s 窗口内配对。plain EKS 路径不变
+（其 quiesce 保留 kubelet）。动作级 XID 的 kernel-first 顺序由内存回放
 （`tests/orchestration/test_xid_cross_source_dedupe.py`）覆盖，其"变化跟随内核行"的路径与安全
 kernel-first 变体在真机上驱动的是同一函数。
 

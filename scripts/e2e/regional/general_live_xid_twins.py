@@ -53,7 +53,12 @@ line and outside the twin window, which no product generation pairs. So the X
 variants deliver the change first and the kernel line after the product has
 recorded it -- at once for XID 48 (before HyperPod's quiesce takes kubelet,
 the probe's path), 30 s later for XID 154 (no chain runs while the change
-waits for its line). The kernel-first order of an actionable XID is the
+waits for its line). On HyperPod the XID 48 line waits for the product's record
+of the change only, not for the journal read too, and a line the quiesce
+beat is written once the node answers again, inside the window with margin
+(``general_live_xid_twin_delivery.arm_kernel_line``; live 2026-11-02 both X
+variants ended INCONCLUSIVE "harness fixture failed" on an exec kubelet's stop
+cut). The kernel-first order of an actionable XID is the
 in-memory replay's (``tests/orchestration/test_xid_cross_source_dedupe.py``);
 the gauge-follows-line path it exercises is the same function the safe
 kernel-first variant drives live.
