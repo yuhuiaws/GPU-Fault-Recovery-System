@@ -22,7 +22,7 @@ rationale and special recovery steps are kept in the [Deployment and Operations 
 | Release across schema versions | `deploy --state-dir ... --accept-schema-change` (takes an Aurora snapshot first; `--accept-schema-change-without-snapshot` skips the snapshot) | §4.7 |
 | Join a GPU cluster | `deploy --state-dir ... --gpu-cluster-arn <all managed ARNs> --gpu-cluster-arn <new ARN>` (the given set must be the managed set or a superset of it; the extra ARNs are the joins; giving fewer is refused with `site manages GPU clusters the command omits ... use remove-cluster`; when there are code changes release first, then join), or the join-only `gpu-fault-admin join-cluster --state-dir ... --gpu-cluster-arn <new ARN>` (does not trigger a site release; already managed ARNs return `ALREADY_MANAGED`) | REG-8.1.5, §5 |
 | Remove a GPU cluster | `gpu-fault-admin remove-cluster --state-dir ... --gpu-cluster-arn <ARN> --confirm REMOVE_GPU_CLUSTER` | REG-8.1.6, REG-12, §5 |
-| Switch a HyperPod instance group's automatic updates off (`ScheduledUpdateConfig`/`AutoPatchConfig`; `status --full` reports `advisory: HyperPod instance group ...`, for the CPU control-plane cluster's groups too, where one window takes the whole control plane down for minutes) | `gpu-fault-admin hyperpod-scheduled-update --state-dir ... --gpu-cluster-arn <ARN>` is read-only (the CPU control-plane cluster's ARN selects every group of it; `--rolling` keeps the schedule and makes it roll one instance at a time) and prints the `aws sagemaker update-cluster` to run in a maintenance window; manual updates use `update-cluster-software`; the plain-EKS equivalents (Karpenter expiry, an ASG `MaxInstanceLifetime`) are in the same section | §5.0.5 |
+| Switch a HyperPod instance group's automatic updates off (`ScheduledUpdateConfig`/`AutoPatchConfig`; `status --full` reports `advisory: HyperPod instance group ...`, for the CPU control-plane cluster's groups too, where one window takes the whole control plane down for minutes) | `gpu-fault-admin hyperpod-scheduled-update --state-dir ... --gpu-cluster-arn <ARN>` is read-only (the CPU control-plane cluster's ARN selects every group of it; `--rolling --rollback-alarm <alarm>` keeps the schedule and makes it roll one instance at a time, rolled back on CloudWatch alarms -- printed as ordered steps, because the service deletes and re-creates a schedule rather than changing it) and prints the `aws sagemaker update-cluster` to run in a maintenance window; manual updates use `update-cluster-software`; the plain-EKS equivalents (Karpenter expiry, an ASG `MaxInstanceLifetime`) are in the same section | §5.0.5 |
 | A control-plane Deployment cannot create its Pods (`status` reports `replica failure: <Deployment> ... FailedCreate: ...`, for example while Kueue's `mpod.kb.io` webhook is not serving) | once the cause is gone, run the `kubectl -n gpu-fault-system annotate replicaset ... --overwrite` the line prints: a metadata-only update, so the ReplicaSet controller retries at once instead of waiting out its backoff of up to ~16 min | §5.0.5 |
 | An EKS cluster's version near or past the end of its support (`status --full` reports `advisory: EKS cluster ... whose support ends ...`) | before the date, in a maintenance window, upgrade it yourself: the control plane first (`aws eks update-cluster-version`), then nodes and add-ons (HyperPod nodes with `update-cluster-software`); after the date AWS upgrades the control plane without notice, and that upgrade cannot be rolled back | §5.0.5 |
 | Reinstall while keeping the CPU/GPU EKS | `gpu-fault-admin uninstall --state-dir ... --cpu-cluster keep --confirm UNINSTALL_GPU_FAULT` followed by a fresh `deploy`; keep preserves Aurora by default (historical incidents/workflows are not lost), and only an explicit `--reset-database` wipes the database | §3 |
@@ -1453,8 +1453,10 @@ Semantics and boundaries of `eks-managed`:
   `autoscaling:DescribeAutoScalingGroups` (the automatic-node-update advisory of §5.0.5; denied, it records `unknown`),
   and `status --full`/deploy preflight also read `eks:ListNodegroups`/`eks:DescribeNodegroup` on the CPU EKS cluster (the
   CPU control-plane cluster's managed node groups, advisory as well) and `eks:DescribeCluster`/`eks:DescribeClusterVersions`
-  for every site EKS cluster (the EKS end-of-support advisory of §5.0.5) -- none of these is granted to the Executor or
-  control-plane roles.
+  for every site EKS cluster (the EKS end-of-support advisory of §5.0.5), and `cloudwatch:DescribeAlarms` with
+  `elasticloadbalancing:DescribeLoadBalancers`/`elasticloadbalancing:DescribeTargetGroups` (whether the rollback alarms
+  of a rolling CPU schedule can trip, §5.0.5; `hyperpod-scheduled-update --rolling` reads them as well) -- none of these
+  is granted to the Executor or control-plane roles.
 - The Runtime Profile applies per cluster: the site profile (`spec.runtimeProfile`) is every GPU cluster's default
   pin; `hyperpod-v1` names the HyperPod adapter as nodeReboot owner, `eks-v1` the EKS adapter. A cluster whose
   provider the site profile cannot reboot gets **its own** profile (`spec.clusters[].runtimeProfile`:
@@ -2967,7 +2969,7 @@ mechanism below -- it changes no check verdict, no `healthy` and no exit code, a
 | Where | Recorded and announced |
 |---|---|
 | `join-cluster`/`deploy` discovery | once the node scope is resolved, one `gpu-fault-admin: advisory: ...` stderr line per finding: the `ScheduledUpdateConfig`/`AutoPatchConfig` of the selected HyperPod instance groups (read off the `describe-cluster` discovery already makes); a `MaxInstanceLifetime` on the Auto Scaling group of a selected eks-managed node group (one read-only `autoscaling describe-auto-scaling-groups`). There is no kube context yet, so Karpenter NodePools are read by the two below. When `deploy` (and `site-id`, `prepare-eks-nodegroup`) discovers the CPU cluster, it prints the same advisory for every instance group of the CPU control-plane HyperPod cluster, read off the `describe-cluster` discovery already makes -- no new read |
-| the `regional_contexts` check of `status --full` and deploy preflight | `details.providers.<cluster_id>.automatic_node_updates`: HyperPod `instance_groups[]` for the groups the cluster's recorded selector covers (`name`, `scheduled_update` = the cron expression or `null`, `auto_patch` = the patching strategy or `null`, `gpu_cluster_arn`), with no new read; eks-managed `node_groups[].auto_scaling_groups[]` for the node groups hosting GPU nodes (`name`, `max_instance_lifetime` in seconds or `null`, `capacity_rebalance`) and `karpenter` (`state` `read`/`absent` (no Karpenter CRD)/`unknown`; `nodepools[]`: `expire_after`, `budgets`, `zero_budget` of the NodePools whose template labels carry this site's ownership label). The CPU control-plane cluster is recorded under `details.control_plane.automatic_node_updates`: every instance group of its HyperPod cluster as `instance_groups[]` (plus `instances` = `CurrentCount` and `rolling_batch` = the scheduled update's rolling batch or `null`; `cpu_eks_arn`), read off the same `describe-cluster` that binds the CPU cluster; and `eks_node_groups`: the CPU EKS cluster's managed node groups with their Auto Scaling groups (`state` `read`/`unknown`). The `status --full` header gains one `advisory: ...` line per finding, the control plane's first; the check still passes |
+| the `regional_contexts` check of `status --full` and deploy preflight | `details.providers.<cluster_id>.automatic_node_updates`: HyperPod `instance_groups[]` for the groups the cluster's recorded selector covers (`name`, `scheduled_update` = the cron expression or `null`, `auto_patch` = the patching strategy or `null`, `gpu_cluster_arn`), with no new read; eks-managed `node_groups[].auto_scaling_groups[]` for the node groups hosting GPU nodes (`name`, `max_instance_lifetime` in seconds or `null`, `capacity_rebalance`) and `karpenter` (`state` `read`/`absent` (no Karpenter CRD)/`unknown`; `nodepools[]`: `expire_after`, `budgets`, `zero_budget` of the NodePools whose template labels carry this site's ownership label). The CPU control-plane cluster is recorded under `details.control_plane.automatic_node_updates`: every instance group of its HyperPod cluster as `instance_groups[]` (plus `instances` = `CurrentCount` and `rolling_batch` = the scheduled update's rolling batch -- `type`, `value`, `wait_seconds`, `rollback_batch`, `rollback_alarms` -- or `null`; `cpu_eks_arn`), read off the same `describe-cluster` that binds the CPU cluster; `eks_node_groups`: the CPU EKS cluster's managed node groups with their Auto Scaling groups (`state` `read`/`unknown`); and, when a group's schedule names rollback alarms, `rollback_alarms`: each alarm as `cloudwatch describe-alarms` reads it (`found`, `kind`, `state`, what it watches, `problems`) and `api_nlb`, the API NLB it should watch (`state` `read`/`unknown`). The `status --full` header gains one `advisory: ...` line per finding, the control plane's first; the check still passes |
 | `gpu-fault-admin node-scope` | the same `automatic_node_updates` block in each cluster's report and one `advisory:` stderr line per finding after the summary; `convergence` and the exit code are unchanged |
 
 A failed read -- most often an operator identity without `autoscaling:DescribeAutoScalingGroups`, or a refused NodePool
@@ -2992,7 +2994,9 @@ gpu-fault-admin hyperpod-scheduled-update --state-dir /secure/gpu-fault \
   the ownership label. A plain EKS ARN is refused (managed node groups have no `ScheduledUpdateConfig`, see below).
 - Output: the stdout JSON gives each selected instance group's `outcome` (`disable` with `removes`, `none`, or
   `refused` with `refusal`), `update_cluster.command` -- one `aws sagemaker update-cluster --instance-groups '<full
-  definition>'` --, `update_cluster.verify` (the `describe-cluster` read to run afterwards) and each group's
+  definition>'` --, `update_cluster.verify` (the `describe-cluster` read to run afterwards), `update_cluster.expect` (what that read
+  answers once the removal applied: the cluster `InService`, each group `InService` with `ScheduledUpdateConfig` and
+  `AutoPatchConfig` `null`), `update_cluster.steps` (the ordered commands: the removal, then the verify) and each group's
   `manual_update`; stderr has one line per group and repeats the command to run.
 - The full definition comes from the builder the ownership release uses (§5.0.0, the "release" row: the
   `ClusterInstanceGroupSpecification` fields taken from the current details, `ImageId`/`ImageReleaseVersion` from
@@ -3007,18 +3011,25 @@ gpu-fault-admin hyperpod-scheduled-update --state-dir /secure/gpu-fault \
   inputs carry the two fields; `ScheduleExpression` is required with a minimum length of 1 (as is `AutoPatchConfig`'s
   `PatchingStrategy`), so neither an empty structure nor an empty expression is a valid request, and the full
   definition without the field is the only request that can say "no schedule". The model does not say whether the
-  service reads an omitted field as "remove" or as "unchanged": after running the command, run the printed `verify` and
-  confirm the group's `ScheduledUpdateConfig` is `null` (a rerun of the verb shows the group `none`); if it is still
-  there, do not write it again and again -- the advisory keeps reporting it -- and confirm with AWS Support.
+  service reads an omitted field as "remove" or as "unchanged"; on the live CPU group (2026-11-02) it removed the
+  schedule: accepted, and about 30 s later `describe-cluster` showed no `ScheduledUpdateConfig`, the cluster and the
+  group `InService`. After running the command, run the printed `verify` and compare it with `expect` (a rerun of the
+  verb shows the group `none`); if the schedule is still there, do not write it again and again -- the advisory keeps
+  reporting it -- and confirm with AWS Support.
 
 Manual updates run in a maintenance window, one instance group at a time and one instance at a time:
 
 ```bash
 aws sagemaker update-cluster-software --cluster-name <HyperPod name> \
   --instance-groups InstanceGroupName=<instance group> \
-  --deployment-config 'RollingUpdatePolicy={MaximumBatchSize={Type=INSTANCE_COUNT,Value=1}},WaitIntervalInSeconds=<seconds>'
-# optional: append ,AutoRollbackConfiguration=[{AlarmName=<CloudWatch alarm>}] to --deployment-config to roll back on an alarm
+  --deployment-config '{"RollingUpdatePolicy":{"MaximumBatchSize":{"Type":"INSTANCE_COUNT","Value":1},"RollbackMaximumBatchSize":{"Type":"INSTANCE_COUNT","Value":1}},"WaitIntervalInSeconds":<seconds>,"AutoRollbackConfiguration":[{"AlarmName":<rollback alarm>}]}'
 ```
+
+`--deployment-config` is the same `DeploymentConfiguration` a rolling schedule carries (API reference, `UpdateClusterSoftware`),
+so it names the rollback batch and the rollback alarms the service required of a rolling schedule on `UpdateCluster` (below;
+not tried live with `update-cluster-software`). The verb prints it per group as `manual_update`: with `--rolling`, with the
+wait and the alarms filled in; without, `<seconds>` and `<rollback alarm>` stay placeholders that keep the JSON invalid until
+they are replaced (a number; a quoted alarm name, for example `"gpu-fault-cpu-roll-api-capacity"`).
 
 Always pass `--instance-groups`: without it the service patches every instance group. Never run it while
 `config`/`deploy` runs, and never on top of another `update-cluster`. What the product does during the in-place
@@ -3091,15 +3102,31 @@ The product announces, it changes no check verdict, and it grades what one windo
   ScheduledUpdateConfig cron(0 8 ? * SUN *) with no rolling DeploymentConfig: observed (2026-11-01) to re-image all 3
   instances of the group at once -- every node the control plane runs on, so the whole control plane (api-ha,
   control-worker) is down for minutes each time; gpu-fault-admin hyperpod-scheduled-update --state-dir <state dir>
-  --gpu-cluster-arn <CPU EKS ARN> --instance-group <group> --rolling prints the update-cluster command that makes it roll one
-  instance at a time (without --rolling, the one that removes it: then update the group by hand in a maintenance window, one
-  instance at a time) (administrator-operations §5.0.5)`; when another instance group or managed node group holds CPU nodes
-  too, the line names only the control-plane Pods on that group.
-- A batch smaller than the group: the safe form (`rolling 1 instance(s) at a time 600 s apart: the safe form ...`), still
-  announced with its residual -- the control-plane Pods on each batch go down with it, and the single-replica ADOT and Kueue
+  --gpu-cluster-arn <CPU EKS ARN> --instance-group <group> --rolling --rollback-alarm <alarm> prints the update-cluster
+  commands (delete the schedule, then create it again) that make it roll one instance at a time, rolled back on that alarm
+  (without --rolling, the one that removes it: then update the group by hand in a maintenance window, one instance at a
+  time) (administrator-operations §5.0.5)`; when another instance group or managed node group holds CPU nodes too, the line
+  names only the control-plane Pods on that group.
+- A batch smaller than the group: the safe form (live since 2026-11-02: `rolling 1 instance(s) at a time 1800 s apart,
+  rolled back 1 instance(s) at a time on alarm gpu-fault-cpu-roll-api-capacity or gpu-fault-cpu-roll-api-not-restored: the
+  safe form ...`; without rollback alarms: `with no rollback alarm (AutoRollbackConfiguration): nothing rolls it back when
+  the control plane loses capacity`), still announced with its residual -- the control-plane Pods on each batch go down
+  with it, and the single-replica ADOT and Kueue
   (when present) are down while their node is updated, so a Pod created meanwhile waits for Kueue's webhook (the
   `replica failure:` line, below).
 - `AutoPatchConfig` is announced as well (with the command that removes it).
+- A rolling schedule's rollback alarms (`status --full` and deploy preflight read them; discovery prints only their names):
+  an alarm that does not exist, is `INSUFFICIENT_DATA`, is in `ALARM`, or watches anything but the current API NLB's target
+  group gets a line of its own, for example `advisory: rollback alarm gpu-fault-cpu-roll-api-capacity of HyperPod instance
+  group <group> of the CPU control-plane cluster <name> is INSUFFICIENT_DATA: with no data it cannot go to ALARM, so it
+  rolls nothing back (...); and it watches AWS/NetworkELB HealthyHostCount (TargetGroup=<old target group>,
+  LoadBalancer=<old NLB>), not the current API NLB <NLB> (target group <target group>): after a fresh install the NLB is
+  new and an alarm on the old one has no data -- rollback protection is off; gpu-fault-admin hyperpod-scheduled-update
+  --state-dir <state dir> --gpu-cluster-arn <CPU EKS ARN> --instance-group <group> --rolling --wait-interval-seconds 1800
+  --rollback-alarm ... prints the aws cloudwatch put-metric-alarm commands that point the same alarm names at the current
+  API NLB (the schedule then needs no change) (administrator-operations §5.0.5)`; a read that fails is announced too
+  (`could not read rollback alarm(s) ...`, `could not read the API NLB ...`): protection that is silently off is the
+  finding. The check verdict is unchanged.
 - Reads: `deploy` (and `site-id`, `prepare-eks-nodegroup`) prints the lines from the `describe-cluster` its discovery of the
   CPU cluster already made, with no new read; the `regional_contexts` check of `status --full` and deploy preflight records
   `details.control_plane.automatic_node_updates` (the table above), and the `status --full` header puts these lines ahead of
@@ -3112,7 +3139,8 @@ instance at a time:
 
 ```bash
 gpu-fault-admin hyperpod-scheduled-update --state-dir /secure/gpu-fault \
-  --gpu-cluster-arn <CPU EKS ARN or CPU HyperPod ARN> --rolling [--wait-interval-seconds 600]
+  --gpu-cluster-arn <CPU EKS ARN or CPU HyperPod ARN> --rolling --wait-interval-seconds 1800 \
+  --rollback-alarm gpu-fault-cpu-roll-api-capacity --rollback-alarm gpu-fault-cpu-roll-api-not-restored
 ```
 
 With `--state-dir`, `spec.cpu` of `site.yaml` (`eksArn` or `hyperpodClusterName`) recognises the CPU cluster and selects
@@ -3120,16 +3148,132 @@ With `--state-dir`, `spec.cpu` of `site.yaml` (`eksArn` or `hyperpodClusterName`
 described directly by `spec.cpu.hyperpodClusterName` without a region inventory; without `--state-dir`, name the group with
 `--instance-group`, or nothing is selected (stderr: `name one with --instance-group`). The verb accepts the ARN of any HyperPod
 cluster (the flag is named `--gpu-cluster-arn`). `--rolling` keeps each group's `ScheduleExpression` and writes a
-`DeploymentConfig` with `RollingUpdatePolicy.MaximumBatchSize` `INSTANCE_COUNT` 1 and `WaitIntervalInSeconds`
-(`--wait-interval-seconds`, default 600; the service model and `aws sagemaker update-cluster help` allow 0-3600); the other
-`DeploymentConfig` members (a rollback batch size, rollback alarms) stay as they are; a group that already rolls this way, or
-has no schedule, is `none`. The printed `aws sagemaker update-cluster` is built and refused exactly as for a GPU group (above);
-afterwards the printed `verify` must show the group's `ScheduledUpdateConfig` with the new `DeploymentConfig`. Without
-`--rolling` the verb prints the command that removes the schedule; then update by hand with the `update-cluster-software`
-above, `--instance-groups InstanceGroupName=<CPU instance group>` and
-`RollingUpdatePolicy={MaximumBatchSize={Type=INSTANCE_COUNT,Value=1}}`. One node at a time, api-ha (3 replicas, with a PDB)
-and the control-worker keep serving from the others, while the control-plane Pods of the updated node are killed and
-re-created elsewhere.
+`DeploymentConfig` with `RollingUpdatePolicy.MaximumBatchSize` and `RollingUpdatePolicy.RollbackMaximumBatchSize` both
+`INSTANCE_COUNT` 1 (one instance at a time, back as forward), `WaitIntervalInSeconds` (`--wait-interval-seconds`, default
+600; the service model and `aws sagemaker update-cluster help` allow 0-3600) and an `AutoRollbackConfiguration` of the
+`--rollback-alarm` alarms (repeatable, 1 to 10, in the order given). `--rolling` without `--rollback-alarm` is refused before
+any read, with the AWS requirement in the message; the verb never invents an alarm. A group that already rolls this way with
+the same alarms (in any order), or has no schedule, is `none`: no command (the live CPU group since 2026-11-02 reports
+`none (rolls this way already: one instance at a time 1800 s apart, rolled back one instance at a time on alarm
+gpu-fault-cpu-roll-api-capacity or gpu-fault-cpu-roll-api-not-restored)`). The definitions are built and refused exactly as
+for a GPU group (above).
+
+What the service accepts differs from the API reference. The reference marks `RollbackMaximumBatchSize` and
+`AutoRollbackConfiguration` "Required: No" (so does the service model, which is why botocore's `ParamValidator` passed), yet
+`UpdateCluster` refused the rolling schedule on the live CPU group three times (ValidationException; the third names the
+group, `<instance group>` here):
+
+- 2026-11-02T00:16:46Z "RollingUpdatePolicy is missing the RollbackMaximumBatchSize parameter."
+- 2026-11-02T00:19:01Z "AutoRollbackConfiguration is required. Add a list of alarms and try again."
+- 2026-11-02T00:30:16Z "You can't modify the existing ScheduledUpdateConfig for an instance group. To update the
+  configuration, first delete the existing configuration for the <instance group> instance group, and then create a new
+  configuration."
+
+Then the definition without `ScheduledUpdateConfig` (accepted; about 30 s later no schedule, the cluster and the group
+`InService`) followed by the rolling definition with the rollback batch and two alarms (accepted; about 30 s later
+`describe-cluster` showed exactly that schedule) worked, and no node was re-imaged (same node names and creation times,
+image 2.0.4 `UpToDate`, count 3). So a group that has a schedule -- any schedule other than the target, other alarms or
+another wait included -- gets four ordered steps in `update_cluster.steps`, and stderr prints them in order:
+
+1. `delete`: `aws sagemaker update-cluster` with the definition without `ScheduledUpdateConfig` (the disable definition; an
+   `AutoPatchConfig` stays, `--rolling` touches the schedule only).
+2. `verify-deleted`: a `describe-cluster` read whose `expect` is the cluster and the group `InService` with
+   `ScheduledUpdateConfig` `null`; re-run it until it answers that (about 30 s live), then go on.
+3. `create`: `aws sagemaker update-cluster` with the rolling definition (`update_cluster.command`; `update_cluster.instance_groups`
+   is this final definition).
+4. `verify`: the read that shows `ScheduleExpression`, `MaximumBatchSize`, `RollbackMaximumBatchSize`, `WaitIntervalInSeconds`
+   and the rollback alarm names (`update_cluster.verify`), with its `expect`.
+
+Between step 1 and step 3 the group has no automatic updates at all, which is safe. If step 3 fails, the group stays without
+a schedule -- still safe, but run step 3 again from the saved plan (stdout; with `--state-dir` also the read-only command log
+under `logs/readonly/`): a rerun of the verb reports the group `none`, because there is no `ScheduleExpression` left to keep.
+`update_cluster.execution_role` prints, never runs, an `aws iam simulate-principal-policy` check of the group's execution
+role (expect `allowed`): AWS requires `cloudwatch:DescribeAlarms` on it for automatic rollbacks.
+
+The rollback alarms are read, never written. The verb reads every named alarm (`aws cloudwatch describe-alarms --alarm-names
+... --alarm-types MetricAlarm CompositeAlarm`: without the types the read returns metric alarms only) and shows each one's
+metric, statistic, threshold, window, dimensions and state (`rollback_alarms.alarms`, one stderr line each). A named alarm
+that does not exist, or an alarm read that fails, refuses the plan (exit 2, `rollback_alarms.refusal`): an
+`AutoRollbackConfiguration` on a missing alarm protects nothing. With `--state-dir` on the CPU cluster the verb also reads
+the API NLB the way the `nlb_runtime` check does (`spec.nlb.name`, `describe-load-balancers`, `describe-target-groups`) and
+warns when an alarm is `INSUFFICIENT_DATA`, is in `ALARM`, or does not watch that NLB's target group -- rollback protection
+is then off -- and prints `rollback_alarms.suggested`: the `aws cloudwatch put-metric-alarm` commands of the recommended pair
+on the current NLB (on stderr when a warning needs them). It never runs them.
+
+**Which alarm.** The alarm must go to `ALARM` when the CPU control plane loses capacity during the roll. Recommended, and live
+since 2026-11-02: two alarms on the API NLB target group's `AWS/NetworkELB` `HealthyHostCount` (dimensions `TargetGroup` and
+`LoadBalancer`), statistic `Maximum` (`--statistic Maximum` in the printed commands), period 60 s, no alarm actions, `TreatMissingData` `missing`, with N the api-ha replica
+count (3, which the product pins):
+
+- `gpu-fault-cpu-roll-api-capacity`: Maximum < N-1 for 5 of 5 minutes -- more capacity lost than the one-instance batch;
+- `gpu-fault-cpu-roll-api-not-restored`: Maximum < N for 25 of 25 minutes -- the patched node's replica is not back before
+  the next batch (the wait minus 5 minutes; the verb derives it from `--wait-interval-seconds` and suggests none for a wait
+  under 15 minutes, which leaves less than twice the 5 minutes a normal batch is short).
+
+Why these: a normal one-instance batch reads N-1 healthy targets for about 5 minutes (api-ha's topology spread, maxSkew 1
+`DoNotSchedule` per hostname, keeps the evicted replica Pending until its node returns), so neither alarm trips on a healthy
+roll. "Maximum < X for k of k minutes" means fewer than X healthy targets for the whole of every one of those minutes, as
+every load balancer node saw them; Minimum would also count a minute with any momentary dip of one node's distributed health
+checks: over the 14 days to 2026-11-02 01:06Z Minimum was below 3 in 19 minutes and Maximum in 5, and the 2026-11-01 dips at
+08:12-08:15Z and 08:20-08:21Z were sub-minute (Maximum stayed 3 except at 08:14). The healthy targets are also the one
+control-plane signal that saw the 2026-11-01 08:00Z all-at-once re-image: Minimum 0 for 08:01-08:04Z (Maximum 0 for
+08:02-08:03), back to 3 at 08:05, while Container Insights' `cluster_node_count` stayed 3 and `cluster_failed_node_count`
+0, with no data points for 08:01-08:03 -- node counts do not see a re-image, so an alarm on them cannot roll one back. A
+full outage shorter than 5 minutes does not trip the capacity alarm (on 2026-11-01 the Maximum was 0 for 2 minutes): it is
+for a lasting loss during a roll, and the batch of 1 is what keeps a window from taking every node at once.
+`HealthyHostCount` is reported only while targets are registered; with `TreatMissingData` `missing` a minute without
+registered targets does not count as breaching. The product creates no CloudWatch alarm: the operator runs the printed
+`put-metric-alarm` commands. After a fresh install the API NLB is new and alarms on the old one have no data
+(`INSUFFICIENT_DATA`) -- `status --full` and the verb say so; re-run the printed commands: the same names on the new NLB,
+so the schedule needs no change.
+
+Evidence (read 2026-11-02; the API reference pages print no date, so their HTTP Last-Modified is given):
+
+- AWS, Amazon SageMaker API Reference, API version 2017-07-24, RollingDeploymentPolicy, Contents
+  (https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_RollingDeploymentPolicy.html, Last-Modified 2026-10-30):
+  `MaximumBatchSize` "The maximum amount of instances in the cluster that SageMaker can update at a time.";
+  `RollbackMaximumBatchSize` "The maximum amount of instances in the cluster that SageMaker can roll back at a time. Type:
+  CapacitySizeConfig object Required: No".
+- AWS, Amazon SageMaker API Reference, API version 2017-07-24, DeploymentConfiguration, Contents
+  (https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_DeploymentConfiguration.html, Last-Modified 2026-10-30):
+  `AutoRollbackConfiguration` "An array that contains the alarms that SageMaker monitors to know whether to roll back the AMI
+  update. Type: Array of AlarmDetails objects Array Members: Minimum number of 1 item. Maximum number of 10 items. Required:
+  No"; `WaitIntervalInSeconds` "The duration in seconds that SageMaker waits before updating more instances in the
+  cluster.".
+- AWS, Amazon SageMaker API Reference, API version 2017-07-24, AlarmDetails, Contents
+  (https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_AlarmDetails.html, Last-Modified 2026-10-30): "The details
+  of the alarm to monitor during the AMI update."; `AlarmName` "The name of the alarm. Type: String Length Constraints:
+  Minimum length of 1. Maximum length of 255.".
+- AWS, Amazon SageMaker Developer Guide, Update your AMI version in your SageMaker HyperPod cluster, introduction
+  (https://docs.aws.amazon.com/sagemaker/latest/dg/sagemaker-hyperpod-release-ami-update.html, Last-Modified 2026-10-31): "If
+  you choose to update in batches, you can also include a list of alarms and metrics. During the wait interval, SageMaker AI
+  observes these metrics and if any exceed their threshold, the corresponding alarm goes into the ALARM state, and SageMaker
+  AI rolls back the AMI update." and "To utilize automatic rollbacks, your IAM execution role must have the permission
+  `cloudwatch:DescribeAlarms`."
+- AWS, CloudWatch metrics for your Network Load Balancer, Network Load Balancer metrics, Metric dimensions for Network Load
+  Balancers and Statistics for Network Load Balancer metrics
+  (https://docs.aws.amazon.com/elasticloadbalancing/latest/network/load-balancer-cloudwatch-metrics.html, Last-Modified
+  2026-10-31): "If there are requests flowing through the load balancer, Elastic Load Balancing measures and sends its
+  metrics in 60-second intervals."; `HealthyHostCount` "The number of targets that are considered healthy.", "Reporting
+  criteria: Reported if there are registered targets." and "Statistics: The most useful statistics are `Maximum` and
+  `Minimum`."; the dimensions "net/load-balancer-name/1234567890123456 (the final portion of the load balancer ARN)." and
+  "targetgroup/target-group-name/1234567890123456 (the final portion of the target group ARN)."; and "The `Minimum` and
+  `Maximum` statistics reflect the minimum and maximum values of the data points reported by the individual load balancer
+  nodes in each sampling window. Increases in the maximum of `HealthyHostCount` correspond to decreases in the minimum of
+  `UnHealthyHostCount`. It's recommended to monitor maximum `HealthyHostCount`, invoking the alarm when the maximum
+  `HealthyHostCount` falls below your required minimum, or being `0`."
+- AWS, Health checks for Network Load Balancer target groups, Health check settings
+  (https://docs.aws.amazon.com/elasticloadbalancing/latest/network/target-group-health-checks.html, Last-Modified
+  2026-10-31): "Health checks for a Network Load Balancer are distributed and use a consensus mechanism to determine target
+  health. Therefore, targets receive more than the configured number of health checks."
+- AWS, Amazon CloudWatch API Reference, DescribeAlarms, Request Parameters, AlarmTypes
+  (https://docs.aws.amazon.com/AmazonCloudWatch/latest/APIReference/API_DescribeAlarms.html, Last-Modified 2026-10-30): "If
+  you omit this parameter, only metric alarms are returned, even if composite alarms or log alarms exist in the account."
+
+Without `--rolling` the verb prints the command that removes the schedule; then update by hand with the
+`update-cluster-software` above (`--instance-groups InstanceGroupName=<CPU instance group>`, the `--deployment-config` JSON
+with the rollback batch and alarms). One node at a time, api-ha (3 replicas, with a PDB) and the control-worker keep serving
+from the others, while the control-plane Pods of the updated node are killed and re-created elsewhere.
 
 **Kueue's (HyperPod task governance) Pod webhook.** Live (read-only checks): the CPU cluster runs HyperPod task governance
 -- the EKS add-on `amazon-sagemaker-hyperpod-taskgovernance` v1.5.0-eksbuild.1, which installs Kueue v0.18.0 (one
@@ -3230,9 +3374,13 @@ above).
 `autoscaling:DescribeAutoScalingGroups`, and list on `nodepools.karpenter.sh` in the GPU cluster; the CPU control-plane
 cluster's managed node groups also need `eks:ListNodegroups` and `eks:DescribeNodegroup` on the CPU EKS cluster (denied:
 `unknown`), and the EKS end-of-support advisory `eks:DescribeCluster` on every site EKS cluster and
-`eks:DescribeClusterVersions` (denied: a `could not read` line). Running the printed
-commands also needs `sagemaker:UpdateCluster`, `sagemaker:UpdateClusterSoftware` or `autoscaling:UpdateAutoScalingGroup`.
-No runtime role is granted any of them.
+`eks:DescribeClusterVersions` (denied: a `could not read` line); the rollback alarms of a rolling CPU schedule
+`cloudwatch:DescribeAlarms` with `elasticloadbalancing:DescribeLoadBalancers` and `elasticloadbalancing:DescribeTargetGroups`
+(denied: a `could not read` line in `status`; for `hyperpod-scheduled-update --rolling` an unreadable alarm refuses the plan).
+Running the printed commands also needs `sagemaker:UpdateCluster`, `sagemaker:UpdateClusterSoftware`,
+`cloudwatch:PutMetricAlarm` (the suggested alarms), `iam:SimulatePrincipalPolicy` (the execution-role check) or
+`autoscaling:UpdateAutoScalingGroup`. No runtime role is granted any of them. The HyperPod instance group's own execution
+role needs `cloudwatch:DescribeAlarms` for automatic rollbacks (AWS, Evidence above).
 
 ### 5.1 Node Failure-Domain Mapping (Automatic)
 

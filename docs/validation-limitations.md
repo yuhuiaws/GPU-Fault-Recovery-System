@@ -5819,9 +5819,9 @@ cluster check, the header line) and `tests/regional/test_regional_release_eks_su
 
 Not verified: the all-at-once update of a schedule without a `DeploymentConfig`
 is observed (2026-11-01), not documented by AWS; a batched schedule's behaviour
-follows the API reference, no batched schedule was run; that the printed
-`update-cluster` (removal or `--rolling`) leaves the group as the verify read
-expects; a supported way to keep the product namespace out of the add-on's Kueue
+follows the API reference, no batched schedule was run (the removal and, in
+two steps, the rolling schedule were applied on the live CPU group on
+2026-11-02, see the batch 239 section); a supported way to keep the product namespace out of the add-on's Kueue
 webhooks (none found: the add-on accepts no configuration, and AWS documents that
 changes to its resources may be overwritten); whether the add-on's renderer
 derives the webhook selector from `managedJobsNamespaceSelector` as Kueue's Helm
@@ -5831,6 +5831,52 @@ read from the Kubernetes v1.33.13 source, and the live annotation that ended the
 2026-11-01 wait agrees; no other Kubernetes version was checked.
 `describe-cluster-versions --include-all` for a version past its extended support
 and the exact moment AWS upgrades a cluster after its date were not exercised.
+
+## Rolling schedules and their rollback alarms (batch 239)
+
+The facts come from the coordinating session on the live CPU control-plane
+group, 2026-11-02 (this lane made no AWS call). `UpdateCluster` refused batch
+231's rolling plan at 00:16:46Z ("RollingUpdatePolicy is missing the
+RollbackMaximumBatchSize parameter."), with the rollback batch added at
+00:19:01Z ("AutoRollbackConfiguration is required. Add a list of alarms and
+try again.") and with both at 00:30:16Z ("You can't modify the existing
+ScheduledUpdateConfig for an instance group. ..."), although the API reference
+(API version 2017-07-24) and the installed botocore model mark both members
+optional. At 00:33-00:34Z the definition without `ScheduledUpdateConfig` and
+then the rolling definition (rollback batch `INSTANCE_COUNT` 1, two alarms)
+were accepted; `describe-cluster` showed the expected state about 30 s after
+each, and no node was re-imaged (same node names and creation times, image
+2.0.4 `UpToDate`, count 3). The two `HealthyHostCount` alarms on the API NLB's
+target group were created by that session (no actions, `TreatMissingData`
+missing) and redefined at 01:08Z with the statistic Maximum (same names,
+thresholds and windows); the metric readings (2026-11-01 08:00Z; the 14 days
+to 2026-11-02 01:06Z) are that session's read-only reads.
+
+The code is proven with fakes only: `tests/admin/test_admin_hyperpod_rollback.py`
+(the plan against a fake service that refuses exactly the three live requests
+and accepts the delete, then the create; the live shape needs no command; the
+alarm reads, refusals and warnings; the suggested pair against botocore's
+`PutMetricAlarm` model and the live alarms),
+`tests/admin/test_admin_hyperpod_scheduled_update.py` (`--rolling` against the
+ownership release's builder), `tests/admin/test_admin_automatic_node_updates.py`
+and `tests/regional/test_regional_release_control_plane_updates.py` (the
+advisory lines, the `status`/preflight alarm read, unreadable alarms and NLB)
+and `tests/regional/test_regional_release_vendor_citations.py` (the citations
+in both manuals).
+
+Not verified: a rollback triggered by an alarm (no rolling window has run yet;
+the first is due 2026-11-08 08:00Z); whether the instance group's execution
+role has `cloudwatch:DescribeAlarms` (the helper prints the check, it was not
+run); `update-cluster-software` with the same `DeploymentConfig`; whether the
+service accepts a `RollbackMaximumBatchSize` other than the `MaximumBatchSize`;
+how SageMaker treats an alarm already in ALARM, or `INSUFFICIENT_DATA`, when a
+window starts; whether the wait counts from a batch's start or its end (the
+not-restored alarm's 25 minutes assume either fits inside 1800 s); composite
+alarms as rollback triggers; the delete step on a group that also carries an
+`AutoPatchConfig` (the live group has none). The capacity alarm (Maximum below
+N-1 for 5 of 5 minutes) does not trip on a full outage shorter than 5 minutes
+(2026-11-01: Maximum 0 for 2 minutes); the batch of one instance is the
+protection against that.
 
 ## Provider-event PCI identity (batch 236)
 

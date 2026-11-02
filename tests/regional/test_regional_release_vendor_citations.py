@@ -14,7 +14,13 @@ apostrophes are the vendors' own.
 - Kubernetes v1.33.13: the ReplicaSet controller's backoff and its sync on
   every update (``REPLICASET_BACKOFF_EVIDENCE``);
 - EKS: the control-plane upgrade at the end of a version's support
-  (``regional_release_eks_support.EKS_SUPPORT_EVIDENCE``).
+  (``regional_release_eks_support.EKS_SUPPORT_EVIDENCE``);
+- batch 239, a rolling HyperPod schedule and its rollback alarms
+  (``hyperpod_rollback.ROLLBACK_EVIDENCE``): the SageMaker API reference
+  (API version and page date given: the pages print no date), the HyperPod AMI
+  update page, the NLB metrics and health-check pages and CloudWatch's
+  DescribeAlarms -- and the service's own ValidationException texts of
+  2026-11-02, which contradict the reference's "Required: No".
 """
 
 from __future__ import annotations
@@ -26,6 +32,17 @@ from typing import Any
 import pytest
 
 from gpu_fault.admin.automatic_node_updates import HYPERPOD_UPDATE_EVIDENCE
+from gpu_fault.admin.hyperpod_rollback import (
+    ALARM_DETAILS_EVIDENCE,
+    AMI_UPDATE_EVIDENCE,
+    DEPLOYMENT_CONFIGURATION_EVIDENCE,
+    DESCRIBE_ALARMS_EVIDENCE,
+    NLB_HEALTH_CHECKS_EVIDENCE,
+    NLB_HEALTHY_HOSTS_EVIDENCE,
+    ROLLBACK_EVIDENCE,
+    ROLLING_POLICY_EVIDENCE,
+    SERVICE_REFUSALS,
+)
 from gpu_fault_release.regional_release_eks_support import EKS_SUPPORT_EVIDENCE
 from gpu_fault_release.regional_release_replica_failure import (
     KUEUE_POD_WEBHOOK_EVIDENCE,
@@ -48,6 +65,10 @@ def _needles(evidence: dict[str, Any]) -> list[str]:
         values.extend(value if isinstance(value, tuple) else [value] if value else [])
     if evidence.get("version") and evidence.get("vendor") == "Kueue":
         values.append(f"Kueue {evidence['version']}")
+    if evidence.get("vendor") == "AWS":
+        values.extend(
+            str(evidence[key]) for key in ("version", "docs_date") if key in evidence
+        )
     return values
 
 
@@ -80,8 +101,21 @@ def test_the_hyperpod_update_evidence_is_the_aws_page_verbatim() -> None:
         KUEUE_POD_WEBHOOK_EVIDENCE,
         REPLICASET_BACKOFF_EVIDENCE,
         EKS_SUPPORT_EVIDENCE,
+        *ROLLBACK_EVIDENCE,
     ],
-    ids=["hyperpod-update", "kueue-pod-webhook", "replicaset-backoff", "eks-support"],
+    ids=[
+        "hyperpod-update",
+        "kueue-pod-webhook",
+        "replicaset-backoff",
+        "eks-support",
+        "rolling-policy",
+        "deployment-configuration",
+        "alarm-details",
+        "ami-update",
+        "nlb-healthy-hosts",
+        "nlb-health-checks",
+        "describe-alarms",
+    ],
 )
 def test_each_manual_carries_each_citation_verbatim(
     manual: str, evidence: dict[str, Any]
@@ -102,5 +136,72 @@ def test_each_manual_names_the_remedies_the_product_prints(manual: str) -> None:
         "--rolling",
         "eks:DescribeClusterVersions",
         "additionalProperties: false",
+        "--rollback-alarm gpu-fault-cpu-roll-api-capacity",
+        "RollbackMaximumBatchSize",
+        "cloudwatch:DescribeAlarms",
+        "elasticloadbalancing:DescribeTargetGroups",
+        "--statistic Maximum",
     ):
         assert needle in text, f"{manual} lacks {needle!r}"
+
+
+def test_the_rolling_schedule_evidence_is_the_aws_pages_verbatim() -> None:
+    """The quotes that decide batch 239's request, read 2026-11-02."""
+
+    assert ROLLBACK_EVIDENCE == (
+        ROLLING_POLICY_EVIDENCE,
+        DEPLOYMENT_CONFIGURATION_EVIDENCE,
+        ALARM_DETAILS_EVIDENCE,
+        AMI_UPDATE_EVIDENCE,
+        NLB_HEALTHY_HOSTS_EVIDENCE,
+        NLB_HEALTH_CHECKS_EVIDENCE,
+        DESCRIBE_ALARMS_EVIDENCE,
+    )
+    api = "https://docs.aws.amazon.com/sagemaker/latest/APIReference/"
+    for evidence, page in (
+        (ROLLING_POLICY_EVIDENCE, "RollingDeploymentPolicy"),
+        (DEPLOYMENT_CONFIGURATION_EVIDENCE, "DeploymentConfiguration"),
+        (ALARM_DETAILS_EVIDENCE, "AlarmDetails"),
+    ):
+        assert (evidence["url"], evidence["page"], evidence["section"]) == (
+            f"{api}API_{page}.html",
+            page,
+            "Contents",
+        )
+        assert (evidence["version"], evidence["docs_date"]) == (
+            "API version 2017-07-24",
+            "Last-Modified 2026-10-30",
+        )
+    assert ROLLING_POLICY_EVIDENCE["quotes"][1] == (
+        "The maximum amount of instances in the cluster that SageMaker can roll back "
+        "at a time. Type: CapacitySizeConfig object Required: No"
+    )
+    assert DEPLOYMENT_CONFIGURATION_EVIDENCE["quotes"][0] == (
+        "An array that contains the alarms that SageMaker monitors to know whether to "
+        "roll back the AMI update. Type: Array of AlarmDetails objects Array Members: "
+        "Minimum number of 1 item. Maximum number of 10 items. Required: No"
+    )
+    assert AMI_UPDATE_EVIDENCE["quotes"][1] == (
+        "To utilize automatic rollbacks, your IAM execution role must have the "
+        "permission `cloudwatch:DescribeAlarms`."
+    )
+    assert NLB_HEALTHY_HOSTS_EVIDENCE["quotes"][-1].endswith(
+        "It's recommended to monitor maximum `HealthyHostCount`, invoking the alarm "
+        "when the maximum `HealthyHostCount` falls below your required minimum, or "
+        "being `0`."
+    ), "the reason the recommended pair reads the Maximum"
+
+
+@pytest.mark.parametrize("manual", MANUALS)
+def test_each_manual_records_the_live_refusals_with_their_times(manual: str) -> None:
+    text = _flat((ROOT / manual).read_text(encoding="utf-8"))
+
+    assert [item["member"] for item in SERVICE_REFUSALS] == [
+        "RollbackMaximumBatchSize",
+        "AutoRollbackConfiguration",
+        "ScheduledUpdateConfig",
+    ]
+    for refusal in SERVICE_REFUSALS:
+        assert f'{refusal["at"]} "{_flat(refusal["text"])}"' in text, (
+            f"{manual} lacks the {refusal['at']} refusal verbatim"
+        )

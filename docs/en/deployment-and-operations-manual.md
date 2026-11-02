@@ -963,7 +963,9 @@ temporarily relaxed during a maintenance window:
    and deploy discovery); with HyperPod task governance on the cluster, Kueue's Pod webhook (`failurePolicy: Fail`) covers
    the product namespace, so no control-plane Pod can be created while Kueue is not serving (`status` reports
    `replica failure: ...`), also §5.0.5; `gpu-fault-admin hyperpod-scheduled-update --state-dir ... --gpu-cluster-arn
-   <CPU ARN> --rolling` prints the command that makes the CPU group's schedule roll one instance at a time. After the
+   <CPU ARN> --rolling --rollback-alarm <alarm> ...` prints the commands that make the CPU group's schedule roll one
+   instance at a time, rolled back on the named CloudWatch alarms (the service needs both and does not change a schedule
+   in place: delete, verify, create, verify; the recommended alarms watch the API NLB's healthy targets). After the
    end of its Kubernetes version's support AWS upgrades each site EKS cluster's control plane by itself (without notice,
    no rollback); `status --full` announces it 90 days ahead, also §5.0.5.
 2. Under no circumstances may this solution's code or execution roles call

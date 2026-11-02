@@ -79,7 +79,13 @@ records `unknown` and the command completes. The same advisory for the CPU contr
 `eks:ListNodegroups`/`eks:DescribeNodegroup` on the CPU EKS cluster (`status --full` and deploy preflight), again the
 operator identity's alone and recorded `unknown` when denied. The EKS end-of-support advisory (same section) reads
 `eks:DescribeCluster` on every site EKS cluster and `eks:DescribeClusterVersions`, the operator identity's alone as well;
-denied, the header says `could not read` and the check verdict is unchanged.
+denied, the header says `could not read` and the check verdict is unchanged. The rollback alarms of a rolling CPU
+control-plane schedule (same section) are read with `cloudwatch:DescribeAlarms`, and the API NLB they should watch with
+`elasticloadbalancing:DescribeLoadBalancers`/`elasticloadbalancing:DescribeTargetGroups` (`status --full`, deploy preflight
+and `hyperpod-scheduled-update --rolling`), the operator identity's alone; denied, the header says `could not read` and the
+helper refuses its plan. The HyperPod instance group's execution role -- the customer's, not a product role -- needs
+`cloudwatch:DescribeAlarms` for SageMaker's automatic rollback; the helper prints the read-only
+`iam simulate-principal-policy` that checks it.
 
 ### 2.1 Regional Acceptance Fixture Boundaries
 
