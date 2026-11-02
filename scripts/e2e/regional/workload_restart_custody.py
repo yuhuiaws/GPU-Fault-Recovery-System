@@ -54,6 +54,46 @@ def incident_binds_job(
     )
 
 
+def require_stopped_source(
+    executions: list[dict[str, Any]],
+    source: tuple[str, str, str],
+    *,
+    workflow_id: str,
+    incident_id: str,
+    unbound: bool,
+) -> None:
+    """Every STOP receipt naming the source controller (workload id, UID,
+    attempt) agrees with it; ``unbound``, the incident cannot tie the restart
+    to the job, so this workflow's own contained STOP_WORKLOADS receipt of the
+    source must, beside everything a bound restart proves."""
+
+    workload_id, uid, attempt_id = source
+    contained = False
+    for item in executions:
+        receipt = (item.get("details") or {}).get("stop_ownership_receipt_v1")
+        if not isinstance(receipt, dict):
+            continue
+        for stopped in records(receipt.get("workloads"), "stopped workloads"):
+            if stopped.get("workload_id") != workload_id:
+                continue
+            require(
+                stopped.get("uid") == uid and stopped.get("attempt_id") == attempt_id,
+                "STOP receipt names another source controller",
+            )
+            contained = contained or (
+                item.get("operation") == "STOP_WORKLOADS"
+                and item.get("status") == "SUCCEEDED"
+                and receipt.get("contained") is True
+                and receipt.get("workflow_id") == workflow_id
+                and receipt.get("incident_id") == incident_id
+            )
+    require(
+        contained or not unbound,
+        "no contained STOP receipt of this workflow names the unbound job's "
+        "source controller",
+    )
+
+
 @dataclass(frozen=True)
 class RestartCustody:
     cluster_id: str
@@ -95,15 +135,8 @@ class RestartCustody:
         restart_budget: int,
         unbound: bool = False,
     ) -> RestartCustody:
-        """The completed product restart ``state`` records for this workload.
-
-        ``unbound``: the workflow's incident names no job (``incident_binds_job``)
-        -- its XID was on a GPU the workload does not hold -- so the incident
-        cannot tie the restart to the job; the workflow's own contained
-        STOP_WORKLOADS receipt of the source controller (its UID and attempt)
-        must, in addition to everything a bound restart proves.
-        """
-
+        # ``unbound`` (the incident names no job): ``incident_binds_job`` and
+        # ``require_stopped_source``.
         require(bool(source_uid), "original controller UID is unproven")
         workflow = mapping(state.get("workflow"), "workflow")
         incident = mapping(state.get("incident"), "incident")
@@ -260,30 +293,12 @@ class RestartCustody:
             and details.get("suspended") is False,
             "remote restart completion differs from the workflow result",
         )
-        # A stop receipt, when present, must agree with the fixture's original UID.
-        contained = False
-        for item in executions:
-            receipt = (item.get("details") or {}).get("stop_ownership_receipt_v1")
-            if not isinstance(receipt, dict):
-                continue
-            for source in records(receipt.get("workloads"), "stopped workloads"):
-                if source.get("workload_id") == source_workload_id:
-                    require(
-                        source.get("uid") == source_uid
-                        and source.get("attempt_id") == source_attempt_id,
-                        "STOP receipt names another source controller",
-                    )
-                    contained = contained or (
-                        item.get("operation") == "STOP_WORKLOADS"
-                        and item.get("status") == "SUCCEEDED"
-                        and receipt.get("contained") is True
-                        and receipt.get("workflow_id") == workflow_id
-                        and receipt.get("incident_id") == incident_id
-                    )
-        require(
-            contained or not unbound,
-            "no contained STOP receipt of this workflow names the unbound job's "
-            "source controller",
+        require_stopped_source(
+            executions,
+            (source_workload_id, source_uid, source_attempt_id),
+            workflow_id=cast(str, workflow_id),
+            incident_id=cast(str, incident_id),
+            unbound=unbound,
         )
         return cls(
             cluster_id=cluster_id,

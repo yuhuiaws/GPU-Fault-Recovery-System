@@ -684,20 +684,13 @@ class ManagedWorkloadFixture:
     ) -> None:
         """Accept replacements only after the matching product restart completed.
 
-        ``unbound`` is ``RestartCustody.from_state``'s: the restart's incident
-        names no job. A journaled fixture binds a restart in the process that
-        submitted its workload, and journals what it then adopts
-        (``FixtureOwnership.observe_restart``); a journal a later process
-        reopened stays cleanup-only. Before, a journaled fixture bound no
-        restart at all, so a variant that waited for the product's in-place
-        restart of its job refused the restarted Pod -- live 2026-11-02 (plain
-        EKS, GF-GENERAL-LIVE-024 ``xid_twin_unbound_job``): "managed workload
-        ownership or UID changed" after a correct STOP, reset and restart.
+        ``unbound``: ``RestartCustody.from_state``'s. A journaled fixture binds
+        one in the process that submitted it (``observe_restart``); a reopened
+        journal stays cleanup-only (GF-GENERAL-LIVE-024 ``xid_twin_unbound_job``).
         """
 
-        if not self.submission_started or (
-            self.ownership is not None and self.ownership.resuming
-        ):
+        resuming = self.ownership is not None and self.ownership.resuming
+        if not self.submission_started or resuming:
             raise WorkloadOwnershipError(
                 "restart custody requires a submitted, non-resuming workload fixture"
             )
@@ -982,17 +975,13 @@ class ManagedWorkloadFixture:
                 self.retired_pod_uids.add(previous_uid)
             self.owned_uids[(root_kind, root_name)] = root_uid
             restarted = True
-        if self.ownership is not None:
-            if restarted:
-                # The product's restart keeps no declared intent (a derived
-                # attempt id on the same UID, or a copy, and new Pods); the
-                # custody bound it, the journal holds its UID for the cleanup.
-                self.ownership.observe_restart(document)
-            else:
-                self.ownership.observe(
-                    document,
-                    lambda kind, name: read_resource(self.regional, kind, name),
-                )
+        if self.ownership is not None and restarted:
+            # The custody bound it; a restart keeps no declared intent.
+            self.ownership.observe_restart(document)
+        elif self.ownership is not None:
+            self.ownership.observe(
+                document, lambda kind, name: read_resource(self.regional, kind, name)
+            )
         self.owned_uids[(kind, name)] = uid
 
     def adopt_for_cleanup(self, document: dict[str, Any]) -> None:
