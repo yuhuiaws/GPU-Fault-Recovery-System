@@ -13,6 +13,7 @@ one advisory line per finding.
 from __future__ import annotations
 
 import copy
+import itertools
 import json
 from types import SimpleNamespace
 from typing import Any
@@ -21,6 +22,7 @@ import jmespath
 import pytest
 
 from gpu_fault.admin.automatic_node_updates import ASG_QUERY, FIELD
+from gpu_fault.admin.command_log import child_failure
 from gpu_fault.cluster_scope import OWNERSHIP_LABEL
 from gpu_fault_release import regional_release_preflight as preflight
 from gpu_fault_release.regional_admin_commands import status_header_lines
@@ -35,8 +37,11 @@ EKS_ARN = f"arn:aws:eks:{REGION}:{ACCOUNT}:cluster/gpu-eks-cluster"
 SPOT_ASG = "eks-gpu-p5en-efa-spot-node-group-0011aabb"
 SCHEDULE = "cron(0 12 ? * SUN *)"
 NOT_SERVED = 'error: the server doesn\'t have a resource type "nodepools"'
-#: describe-cluster-versions' dates as the CLI prints them (AWS publishes them
-#: in Pacific time): 1.31's extended support ends 2026-11-26 UTC.
+#: describe-cluster-versions' dates as a CLI in Pacific time prints them: the
+#: CLI renders the service's instant in the host's zone (live 2026-11-02: the
+#: UTC deploy host printed 1.31's 2026-11-26T00:00:00+00:00, the same CLI under
+#: TZ=America/Los_Angeles 2026-11-25T16:00:00-08:00). 1.31's extended support
+#: ends 2026-11-26 UTC either way.
 EKS_SUPPORT_DATES = {
     "1.31": {
         "endOfStandardSupportDate": "2025-11-25T16:00:00-08:00",
@@ -47,6 +52,24 @@ EKS_SUPPORT_DATES = {
         "endOfExtendedSupportDate": "2027-07-28T17:00:00-07:00",
     },
 }
+#: describe-cluster-versions' selectors: the service accepts one per request and
+#: refuses more with ``VERSIONS_REFUSAL`` (live 2026-11-02: --cluster-versions
+#: beside each of the others, --include-all beside --status). The text names
+#: four; --version-status is refused beside --cluster-versions all the same.
+VERSIONS_SELECTORS = (
+    "--default-only",
+    "--cluster-versions",
+    "--include-all",
+    "--status",
+    "--version-status",
+)
+#: The CLI's stderr for that refusal (exit 254), verbatim.
+VERSIONS_REFUSAL = (
+    "aws: [ERROR]: An error occurred (InvalidParameterException) when calling the "
+    "DescribeClusterVersions operation: Only one of the defaultOnly, "
+    "clusterVersions, includeAll or status request parameters is accepted at a "
+    "time."
+)
 
 
 def _target(cluster_id: str, **fields: Any) -> ClusterTarget:
@@ -222,8 +245,14 @@ class ContextsRunner:
                     "aws eks describe-cluster-versions exited 254: AccessDeniedException: "
                     "not authorized to perform: eks:DescribeClusterVersions"
                 )
-            wanted = args[args.index("--cluster-versions") + 1 :]
-            wanted = wanted[: wanted.index("--include-all")]
+            selectors = [item for item in args if item in VERSIONS_SELECTORS]
+            if len(selectors) > 1:
+                # What the service answers, raised as the release runner does.
+                raise child_failure(ReleaseError, args, 254, detail=VERSIONS_REFUSAL)
+            if selectors != ["--cluster-versions"]:
+                raise AssertionError(f"unexpected versions read: {args}")
+            values = args[args.index("--cluster-versions") + 1 :]
+            wanted = list(itertools.takewhile(lambda v: not v.startswith("--"), values))
             return self._answer(
                 args,
                 {

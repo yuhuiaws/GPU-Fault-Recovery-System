@@ -10,10 +10,17 @@ and the upgrade cannot be rolled back. The ``regional_contexts`` check records
 every site EKS cluster's version and date; the status header names a cluster
 within 90 days of its date; a read that fails is recorded and announced as
 "could not read" while the check passes as before.
+
+The versions read carries one selector, ``--cluster-versions``: the service
+refuses two in one request, as it refused batch 231's ``--include-all`` beside
+it on every site, and the fake refuses them the same way. Only an
+authorization failure names the missing permission.
 """
 
 from __future__ import annotations
 
+import itertools
+import json
 from datetime import datetime, timezone
 from typing import Any
 
@@ -29,6 +36,8 @@ from tests.regional.test_regional_release_automatic_updates import (
     EKS_SUPPORT_DATES,
     HP_EKS_ARN,
     HYPERPOD,
+    VERSIONS_REFUSAL,
+    VERSIONS_SELECTORS,
     ContextsRelease,
     ContextsRunner,
     _report,
@@ -182,6 +191,126 @@ def test_a_failed_read_is_unknown_with_its_reason_and_nothing_raises() -> None:
     assert {item["state"] for item in block["clusters"]} == {"unknown"}
 
 
+# --- the request -------------------------------------------------------------------
+
+
+def _versions_requests(runner: ContextsRunner) -> list[list[str]]:
+    return [
+        call
+        for call in runner.calls
+        if call[:3] == ["aws", "eks", "describe-cluster-versions"]
+    ]
+
+
+def test_the_versions_read_names_the_versions_in_use_and_no_other_selector() -> None:
+    runner = ContextsRunner(eks_versions={"gpu-eks-cluster": "1.31"})
+
+    block = support.read_eks_support(ContextsRelease(runner, (HYPERPOD, EKS)), now=NOW)
+
+    assert "versions_error" not in block, block.get("versions_error")
+    assert [
+        (item["eks_cluster"], item["state"], item.get("end_of_support"))
+        for item in block["clusters"]
+    ] == [
+        ("cpu", "read", "2027-07-29"),
+        ("hp-gpu-eks", "read", "2027-07-29"),
+        ("gpu-eks-cluster", "read", "2026-11-26"),
+    ], "the service answers the request the check sends: every date is read"
+    assert _versions_requests(runner) == [
+        [
+            "aws",
+            "eks",
+            "describe-cluster-versions",
+            "--region",
+            REGION,
+            "--cluster-versions",
+            "1.31",
+            "1.33",
+            "--query",
+            support.VERSIONS_QUERY,
+            "--output",
+            "json",
+        ]
+    ], "one request per region, with one selector: the versions in use"
+
+
+def _selector(option: str) -> list[str]:
+    if option == "--cluster-versions":
+        return [option, "1.31"]
+    if option == "--status":
+        return [option, "extended-support"]
+    if option == "--version-status":
+        return [option, "EXTENDED_SUPPORT"]
+    return [option]
+
+
+@pytest.mark.parametrize(
+    "pair",
+    list(itertools.combinations(VERSIONS_SELECTORS, 2)),
+    ids=lambda pair: "+".join(option.lstrip("-") for option in pair),
+)
+def test_the_fake_refuses_two_selectors_in_the_services_words(
+    pair: tuple[str, str],
+) -> None:
+    arguments = ["aws", "eks", "describe-cluster-versions", "--region", REGION]
+    for option in pair:
+        arguments += _selector(option)
+
+    with pytest.raises(ReleaseError) as raised:
+        ContextsRunner().run([*arguments, "--output", "json"], capture=True)
+
+    message = str(raised.value)
+    assert message.startswith(
+        f"command failed (254): aws eks describe-cluster-versions --region {REGION} "
+    ), message
+    assert message.endswith(f": {VERSIONS_REFUSAL}"), message
+
+
+def test_batch_231s_request_is_refused_and_its_line_blames_no_permission() -> None:
+    """The live 2026-11-02 advisory, its reason cut where the live one was, now
+    with a remedy that does not claim a missing permission."""
+
+    runner = ContextsRunner()
+
+    def batch_231_request(region: str, versions: Any) -> dict[str, Any]:
+        return json.loads(
+            runner.run(
+                [
+                    "aws",
+                    "eks",
+                    "describe-cluster-versions",
+                    "--region",
+                    region,
+                    "--cluster-versions",
+                    *versions,
+                    "--include-all",
+                    "--query",
+                    support.VERSIONS_QUERY,
+                    "--output",
+                    "json",
+                ],
+                capture=True,
+            )
+        )
+
+    block = _block(
+        _clusters(cpu={"Version": "1.33"}, **{"gpu-eks-cluster": {"Version": "1.31"}}),
+        read_versions=batch_231_request,
+    )
+
+    assert support.eks_support_lines(block) == [
+        f"advisory: could not read the EKS support dates in {REGION} (command failed "
+        f"(254): aws eks describe-cluster-versions --region {REGION} "
+        "--cluster-versions ...: aws: [ERROR]: An error occurred "
+        "(InvalidParameterException) when calling the DescribeClusterVersions "
+        "operation: Only one of the defaultOnly, clusterVersions, includeAll or "
+        "status request parameters ...): the end-of-support check of 2 EKS "
+        "cluster(s) did not run; it is not an authorization failure: read the "
+        f"dates with aws eks describe-cluster-versions --region {REGION} "
+        f"--cluster-versions 1.31 1.33 and run status --full again {SECTION}"
+    ]
+
+
 # --- the lines ---------------------------------------------------------------------
 
 
@@ -268,6 +397,80 @@ def test_what_could_not_be_read_is_a_visible_line() -> None:
         "(GPU cluster gpu-eks), Kubernetes 1.29 (eks describe-cluster-versions "
         "returned no end of extended support date for Kubernetes 1.29): its "
         f"end-of-support check did not run {SECTION}",
+    ]
+
+
+def _versions_failure_line(error: str) -> str:
+    def failing(_region: str, _versions: Any) -> dict[str, Any]:
+        raise ReleaseError(error)
+
+    block = _block(
+        _clusters(cpu={"Version": "1.33"}, **{"gpu-eks-cluster": {"Version": "1.31"}}),
+        read_versions=failing,
+    )
+    (line,) = support.eks_support_lines(block)
+    return line
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "aws: [ERROR]: An error occurred (AccessDeniedException) when calling the "
+        "DescribeClusterVersions operation: User: "
+        "arn:aws:sts::123456789012:assumed-role/operator/session is not authorized "
+        "to perform: eks:DescribeClusterVersions",
+        "aws: [ERROR]: An error occurred (UnauthorizedOperation) when calling the "
+        "DescribeClusterVersions operation",
+        "User: arn:aws:sts::123456789012:assumed-role/operator/session is not "
+        "authorized to perform: eks:DescribeClusterVersions",
+    ],
+    ids=["access-denied", "unauthorized-operation", "not-authorized"],
+)
+def test_an_authorization_failure_names_the_permission(error: str) -> None:
+    assert _versions_failure_line(error) == (
+        f"advisory: could not read the EKS support dates in {REGION} ({error}): the "
+        "end-of-support check of 2 EKS cluster(s) did not run; the operator identity "
+        f"needs eks:DescribeClusterVersions {SECTION}"
+    )
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "aws: [ERROR]: An error occurred (InvalidParameterException) when calling "
+        "the DescribeClusterVersions operation: Only one of the defaultOnly, "
+        "clusterVersions, includeAll or status request parameters is accepted at "
+        "a time.",
+        "aws: [ERROR]: An error occurred (ExpiredTokenException) when calling the "
+        "DescribeClusterVersions operation: The security token included in the "
+        "request is expired",
+        "command exceeded its deployment time budget: aws eks "
+        "describe-cluster-versions --region us-west-2 --cluster-versions ...",
+    ],
+    ids=["invalid-parameter", "expired-token", "time-budget"],
+)
+def test_any_other_failure_states_the_error_and_claims_no_permission(
+    error: str,
+) -> None:
+    line = _versions_failure_line(error)
+
+    assert line == (
+        f"advisory: could not read the EKS support dates in {REGION} ({error}): the "
+        "end-of-support check of 2 EKS cluster(s) did not run; it is not an "
+        "authorization failure: read the dates with aws eks describe-cluster-versions "
+        f"--region {REGION} --cluster-versions 1.31 1.33 and run status --full "
+        f"again {SECTION}"
+    )
+    assert "eks:DescribeClusterVersions" not in line and "needs" not in line, line
+
+
+def test_a_versions_error_read_back_without_its_clusters_is_still_one_line() -> None:
+    assert support.eks_support_lines({"versions_error": {REGION: "boom"}}) == [
+        f"advisory: could not read the EKS support dates in {REGION} (boom): the "
+        "end-of-support check of 0 EKS cluster(s) did not run; it is not an "
+        "authorization failure: read the dates with aws eks describe-cluster-versions "
+        f"--region {REGION} --cluster-versions <version> and run status --full again "
+        f"{SECTION}"
     ]
 
 
@@ -382,3 +585,40 @@ def test_the_advisory_cites_the_aws_version_lifecycle_page() -> None:
         ),
     }
     assert support.NOTICE_DAYS == 90
+
+
+def test_the_versions_request_cites_the_api_reference_and_the_live_refusal() -> None:
+    """Fetched and probed 2026-11-02: the EKS API reference's texts of the two
+    selectors -- the page states no rule for sending both -- and the service's
+    refusal of both in one request, which the fake answers with."""
+
+    assert support.DESCRIBE_CLUSTER_VERSIONS_EVIDENCE == {
+        "vendor": "AWS",
+        "url": (
+            "https://docs.aws.amazon.com/eks/latest/APIReference/"
+            "API_DescribeClusterVersions.html"
+        ),
+        "page": "DescribeClusterVersions",
+        "section": "URI Request Parameters",
+        "version": "API version 2017-11-01",
+        "docs_date": "Last-Modified 2026-11-02",
+        "fetched": "2026-11-02",
+        "quotes": (
+            "List of specific cluster versions to describe.",
+            "Include all available versions in the response.",
+        ),
+    }
+    refusal = support.VERSIONS_SERVICE_REFUSAL
+    assert refusal == {
+        "at": "2026-11-02T14:21:23Z",
+        "request": "--cluster-versions 1.31 --include-all",
+        "error": "InvalidParameterException",
+        "text": (
+            "Only one of the defaultOnly, clusterVersions, includeAll or status "
+            "request parameters is accepted at a time."
+        ),
+    }
+    assert VERSIONS_REFUSAL.endswith(
+        f"({refusal['error']}) when calling the DescribeClusterVersions "
+        f"operation: {refusal['text']}"
+    ), "the fake refuses in the service's words"
