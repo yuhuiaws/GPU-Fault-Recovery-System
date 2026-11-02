@@ -502,6 +502,23 @@ def test_unchanged_restores_what_the_step_changed_and_leaves_the_rest(
     assert again["schedule"] == [] and not _updates(world), "left as found from now on"
 
 
+def test_a_schedule_already_back_to_its_record_is_settled_without_a_write(
+    tmp_path: Path,
+) -> None:
+    world = World(_described(LIVE_BEFORE))
+    _finish(world, tmp_path)
+    group = world.hyperpod.described["InstanceGroups"][0]
+    group["ScheduledUpdateConfig"] = dict(LIVE_BEFORE)  # put back by hand
+    world.writes.clear()
+
+    first = _finish(world, tmp_path, rollingUpdate={"mode": "unchanged"})
+    second = _finish(world, tmp_path, rollingUpdate={"mode": "unchanged"})
+
+    assert [item["outcome"] for item in first["schedule"]] == ["unchanged"], first
+    assert second["schedule"] == [], "settled: not looked at again"
+    assert not _updates(world), "nothing to write"
+
+
 def test_unchanged_never_touches_a_schedule_the_step_did_not_change(
     tmp_path: Path,
 ) -> None:

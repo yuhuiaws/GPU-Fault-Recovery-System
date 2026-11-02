@@ -436,6 +436,8 @@ def wait_for_full_capacity(
 
     def full_minute() -> datetime | None:
         now = clock.now()
+        if now < _minute(since) + timedelta(minutes=1):
+            return None  # no whole minute since the targets turned healthy yet
         statistics = runner.aws_json(
             target.region,
             "cloudwatch",
@@ -959,7 +961,14 @@ def restore_schedule(
             results.append({"group": name, "outcome": "group-gone"})
             continue
         current = group.get("ScheduledUpdateConfig")
+        entry = journal["groups"].setdefault(name, {})
         if _matches(current, wanted):
+            entry.update(
+                phase="restored",
+                reason="",
+                updated_at=_stamp(clock),
+                **{AWAITING_CREATE: False},
+            )
             results.append({"group": name, "outcome": "unchanged"})
             continue
         reason = update_in_progress(described, group) or hyperpod_write_refusal(
@@ -971,7 +980,6 @@ def restore_schedule(
                 f"group {name}: {reason}; nothing was written -- rerun once the "
                 "update has finished"
             )
-        entry = journal["groups"].setdefault(name, {})
         entry.update(
             phase="restoring",
             updated_at=_stamp(clock),
