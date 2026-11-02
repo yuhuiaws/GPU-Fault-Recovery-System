@@ -10,7 +10,9 @@ is a healthy target and ``HealthyHostCount`` Maximum has been N for one whole
 minute (``wait_for_full_capacity``): a new alarm starts ``INSUFFICIENT_DATA``
 and is then evaluated on data that is already OK, and an update keeps its
 state (``PUT_METRIC_ALARM_EVIDENCE``). An alarm that already matches is not
-put again. A missing alarm is created with the site tag; an existing one is
+put again, and when neither needs a put the step does not wait for that
+minute (``alarms_to_put``). A missing alarm is created with the site tag; an
+existing one is
 the site's when it carries the site tag, is adopted (tagged) when untagged and
 on this site's NLB, and refused when another site's tag names it -- two sites
 in one account and Region set ``spec.cpuControlPlane.rollbackAlarms``.
@@ -82,6 +84,7 @@ __all__ = [
     "UNCHANGED",
     "Clock",
     "Target",
+    "alarms_to_put",
     "apply_schedule",
     "ensure_alarms",
     "finish_deploy",
@@ -527,6 +530,41 @@ def _owned(
             "(name the pair in spec.cpuControlPlane.rollbackAlarms)"
         )
     return arn, ours
+
+
+def alarms_to_put(
+    runner: CommandRunner,
+    target: Target,
+    nlb: Mapping[str, Any],
+    *,
+    wait_seconds: int | None,
+) -> list[str]:
+    """The alarms of the pair that are missing or differ from their definition
+    (what ``ensure_alarms`` would put); a composite alarm of that name counts,
+    so ``ensure_alarms`` gets to refuse it."""
+
+    pair = rollback.alarm_definitions(
+        nlb=nlb,
+        replicas=target.replicas,
+        wait_seconds=wait_seconds,
+        names=target.alarm_names,
+    )
+    document = runner.aws_json(
+        target.region, *rollback.describe_alarms_arguments(list(target.alarm_names))
+    )
+    metric = {
+        str(item["AlarmName"]): item
+        for item in document.get("MetricAlarms") or ()
+        if isinstance(item, Mapping) and item.get("AlarmName")
+    }
+    return [
+        str(definition["AlarmName"])
+        for definition in pair["definitions"]
+        if str(definition["AlarmName"]) not in metric
+        or not rollback.definition_matches(
+            metric[str(definition["AlarmName"])], definition
+        )
+    ]
 
 
 def ensure_alarms(
@@ -1141,12 +1179,19 @@ def _finish(
 ) -> dict[str, Any]:
     try:
         nlb = read_api_nlb(active, target)
-        record["capacity"] = wait_for_full_capacity(active, target, nlb, clock=clock)
         wait = (
             target.wait_seconds
             if target.mode == ROLLING
             else _current_wait(_describe(active, target))
         )
+        # The wait guards a put; a pair that already matches is not put, so a
+        # NOOP deploy does not sit out a minute for nothing.
+        if alarms_to_put(active, target, nlb, wait_seconds=wait):
+            record["capacity"] = wait_for_full_capacity(
+                active, target, nlb, clock=clock
+            )
+        else:
+            record["capacity"] = {"skipped": "both alarms match: nothing is put"}
         alarms = ensure_alarms(active, target, nlb, wait_seconds=wait)
         record["alarms"] = alarms
         warnings.extend(alarms["errors"])

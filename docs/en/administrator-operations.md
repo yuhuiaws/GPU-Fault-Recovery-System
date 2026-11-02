@@ -3176,7 +3176,8 @@ The deploy applies the setting in its last step. That step is the engine mode `c
      and needs exactly one target group.
    - It waits, at most 600 s, until every api-ha replica (N = 3) is a `healthy` target (`describe-target-health`).
      Then it waits for one whole minute in which `HealthyHostCount` Maximum is N (`cloudwatch get-metric-statistics`,
-     60 s period). So the alarms start on data that is already OK (PutMetricAlarm, below).
+     60 s period). So the alarms start on data that is already OK (PutMetricAlarm, below). When both alarms already
+     match their definitions nothing is put, and the step skips this wait.
    - Then it handles each alarm of the pair, read with `describe-alarms` (metric and composite alarms):
      - A missing alarm is created with the tag `gpu-fault:site-id=<site id>`.
      - An alarm that differs from its definition is re-pointed or redefined with `put-metric-alarm`; the update keeps

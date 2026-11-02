@@ -177,6 +177,7 @@ def test_an_identical_pair_is_not_put_again(tmp_path: Path) -> None:
     world = World(_described(LIVE_ROLLING))
     _finish(world, tmp_path)
     world.writes.clear()
+    world.calls.clear()
 
     record = _finish(world, tmp_path)
 
@@ -185,6 +186,10 @@ def test_an_identical_pair_is_not_put_again(tmp_path: Path) -> None:
         "unchanged",
     ]
     assert not _puts(world) and not world.writes, "nothing written at all"
+    assert record["capacity"] == {"skipped": "both alarms match: nothing is put"}
+    assert ("elbv2", "describe-target-health") not in {
+        call[:2] for call in world.calls
+    }, "a NOOP deploy does not sit out the full-capacity minute"
 
 
 def test_the_live_hand_made_pair_is_adopted_and_tagged(tmp_path: Path) -> None:
