@@ -745,6 +745,9 @@ rules:
       # change, over the product's own records (batch 237).
       - tests/regional/test_general_live_xid_twins.py
       - tests/regional/test_general_live_xid_twins_product.py
+      # xid_twin_unbound_job: the job's in-place restart adopted under the
+      # restart custody by its journaled fixture (S64).
+      - tests/regional/test_general_live_xid_twin_job_restart.py
       - tests/test_gpu_dcgm_field_replay.py
       - tests/test_nvidia_smi_inventory_replay.py
       - tests/test_general_fault_live_coverage.py

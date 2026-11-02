@@ -9,8 +9,19 @@ from scripts.e2e.regional.managed_workload_fixture import ManagedWorkloadFixture
 
 
 def restart_state(
-    fixture: ManagedWorkloadFixture, *, retry_parent_name: str | None = None
+    fixture: ManagedWorkloadFixture,
+    *,
+    retry_parent_name: str | None = None,
+    unbound: bool = False,
 ) -> dict[str, Any]:
+    """The product's records of one completed restart of ``fixture``'s job.
+
+    ``unbound``: the incident is an XID's on a GPU the job does not hold -- it
+    names no job (``NO_ACTIVE_MANAGED_ATTEMPT``) -- as live 2026-11-02 for
+    GF-GENERAL-LIVE-024 ``xid_twin_unbound_job``. The STOP receipt has the
+    live shape either way: contained, of this workflow and incident.
+    """
+
     source_id = (
         f"{fixture.regional.settings.namespace}/{fixture.resource}/{fixture.name}"
     )
@@ -45,12 +56,19 @@ def restart_state(
         details["restarted_workload_ids"] = [
             f"{fixture.regional.settings.namespace}/{fixture.resource}/{retry_parent_name}"
         ]
+    incident: dict[str, Any] = {
+        "incident_id": "incident-restart",
+        "cluster_id": parameters["cluster_id"],
+        "job_id": fixture.settings.job_id,
+    }
+    if unbound:
+        incident.update(
+            job_id=None,
+            attempt_id=None,
+            workload_identity_source="NO_ACTIVE_MANAGED_ATTEMPT",
+        )
     return {
-        "incident": {
-            "incident_id": "incident-restart",
-            "cluster_id": parameters["cluster_id"],
-            "job_id": fixture.settings.job_id,
-        },
+        "incident": incident,
         "workflow": {
             "request_id": "workflow-restart",
             "incident_id": "incident-restart",
@@ -71,6 +89,9 @@ def restart_state(
                     "status": "SUCCEEDED",
                     "details": {
                         "stop_ownership_receipt_v1": {
+                            "contained": True,
+                            "workflow_id": "workflow-restart",
+                            "incident_id": "incident-restart",
                             "workloads": [
                                 {
                                     "workload_id": source_id,
@@ -79,7 +100,7 @@ def restart_state(
                                     ],
                                     "attempt_id": fixture.settings.attempt_id,
                                 }
-                            ]
+                            ],
                         }
                     },
                 },

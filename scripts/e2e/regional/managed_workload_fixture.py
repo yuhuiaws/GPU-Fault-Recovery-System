@@ -679,10 +679,25 @@ class ManagedWorkloadFixture:
                 for key, uid in self.ownership.record.observed.items()
             }
 
-    def authorize_restart(self, state: dict[str, Any]) -> None:
-        """Accept replacements only after the matching product restart completed."""
+    def authorize_restart(
+        self, state: dict[str, Any], *, unbound: bool = False
+    ) -> None:
+        """Accept replacements only after the matching product restart completed.
 
-        if not self.submission_started or self.ownership is not None:
+        ``unbound`` is ``RestartCustody.from_state``'s: the restart's incident
+        names no job. A journaled fixture binds a restart in the process that
+        submitted its workload, and journals what it then adopts
+        (``FixtureOwnership.observe_restart``); a journal a later process
+        reopened stays cleanup-only. Before, a journaled fixture bound no
+        restart at all, so a variant that waited for the product's in-place
+        restart of its job refused the restarted Pod -- live 2026-11-02 (plain
+        EKS, GF-GENERAL-LIVE-024 ``xid_twin_unbound_job``): "managed workload
+        ownership or UID changed" after a correct STOP, reset and restart.
+        """
+
+        if not self.submission_started or (
+            self.ownership is not None and self.ownership.resuming
+        ):
             raise WorkloadOwnershipError(
                 "restart custody requires a submitted, non-resuming workload fixture"
             )
@@ -696,6 +711,7 @@ class ManagedWorkloadFixture:
             source_uid=self.owned_uids.get((self.resource, self.name), ""),
             gpu_count=self.settings.expected_gpu_count,
             restart_budget=self.settings.restart_budget,
+            unbound=unbound,
         )
         if self.restart_custody is not None and self.restart_custody != custody:
             raise WorkloadOwnershipError(
@@ -938,6 +954,7 @@ class ManagedWorkloadFixture:
             raise WorkloadOwnershipError(
                 "a retired managed workload Pod UID reappeared"
             )
+        restarted = False
         if self.restart_custody is None:
             if (
                 previous_uid not in (None, uid)
@@ -964,10 +981,18 @@ class ManagedWorkloadFixture:
                     )
                 self.retired_pod_uids.add(previous_uid)
             self.owned_uids[(root_kind, root_name)] = root_uid
+            restarted = True
         if self.ownership is not None:
-            self.ownership.observe(
-                document, lambda kind, name: read_resource(self.regional, kind, name)
-            )
+            if restarted:
+                # The product's restart keeps no declared intent (a derived
+                # attempt id on the same UID, or a copy, and new Pods); the
+                # custody bound it, the journal holds its UID for the cleanup.
+                self.ownership.observe_restart(document)
+            else:
+                self.ownership.observe(
+                    document,
+                    lambda kind, name: read_resource(self.regional, kind, name),
+                )
         self.owned_uids[(kind, name)] = uid
 
     def adopt_for_cleanup(self, document: dict[str, Any]) -> None:
@@ -975,9 +1000,9 @@ class ManagedWorkloadFixture:
 
         A case that failed before ``authorize_restart`` still has to remove the
         copy the product's RESTART_WORKLOAD made of its workload; the lineage
-        rule is ``unbound_restart_root``. A journaled fixture can bind no
-        restart at all, so it takes the same rule and journals each such object
-        (``observe_for_cleanup``): live 2026-10-25 the product restarted
+        rule is ``unbound_restart_root``. A journaled fixture whose case bound
+        no restart takes the same rule and journals each such object
+        (``observe_restart``): live 2026-10-25 the product restarted
         028.nonzero_exit's PyTorchJob in place (same UID, attempt
         ``<source>-r-8856497f``) and ``delete`` refused it ("managed workload
         ownership or UID changed") before deleting anything, so it stayed. A
@@ -1004,7 +1029,7 @@ class ManagedWorkloadFixture:
             except WorkloadOwnershipError as refused:
                 raise WorkloadOwnershipError(f"{strict}; {refused}") from refused
             if self.ownership is not None:
-                self.ownership.observe_for_cleanup(document)
+                self.ownership.observe_restart(document)
             previous = self.owned_uids.get((kind, name))
             if kind == "pod" and previous not in (None, uid):
                 self.retired_pod_uids.add(str(previous))

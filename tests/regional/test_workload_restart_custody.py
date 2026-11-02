@@ -462,3 +462,99 @@ def test_cleanup_still_refuses_what_is_not_this_fixtures_restart(
     assert api.deletes == [], "nothing is deleted before the whole set is proven"
     assert fixture.owned_uids == before
     assert fixture.unbound_restart_resources == set()
+
+
+def test_an_unbound_jobs_restart_is_bound_by_its_workflows_own_stop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Live 2026-11-02 (plain EKS, GF-GENERAL-LIVE-024 ``xid_twin_unbound_job``):
+    the XID was on a GPU the job does not hold, so its incident names no job
+    (``NO_ACTIVE_MANAGED_ATTEMPT``) while its workflow stopped the job, reset
+    the GPU and restarted the job in place. The bound rule refuses that
+    incident; ``unbound`` takes the workflow's contained STOP receipt of the
+    source controller instead and adopts the restart like any other."""
+
+    fixture, api, rendered = harness(tmp_path, monkeypatch)
+    fixture.submit_rendered(rendered)
+    parent = api.objects[(fixture.resource, fixture.name)]
+    api.add(pod(parent, uid="old-pod"))
+    fixture.pods()
+    state = restart_state(fixture, unbound=True)
+    with pytest.raises(WorkloadOwnershipError, match="incident identity differs"):
+        fixture.authorize_restart(state)
+    assert fixture.restart_custody is None
+    fixture.authorize_restart(state, unbound=True)
+    assert fixture.restart_custody is not None
+    assert fixture.restart_custody.incident_id == "incident-restart"
+    # The product's in-place restart: the same UID, the derived attempt, new Pod.
+    apply_restart_metadata(parent, state)
+    api.objects.pop(("pod", "training"))
+    api.add(pod(parent, uid="new-pod"))
+    monkeypatch.setattr(
+        fixture,
+        "heartbeat_logs",
+        lambda pods: {item["name"]: "HEARTBEAT all_reduce=1.0" for item in pods},
+    )
+    result = fixture.wait_restarted({"old-pod"}, timeout_seconds=5)
+    assert [item["uid"] for item in result["pods"]] == ["new-pod"]
+    assert result["workload"]["uid"] == parent["metadata"]["uid"]
+    assert result["workload"]["labels"]["gpu-fault.io/attempt-id"] == (
+        fixture.restart_custody.target_attempt_id
+    )
+    fixture.delete()
+    assert api.objects == {}
+    assert fixture.unbound_restart_resources == set(), (
+        "adopted under the custody, not as an unbound residue"
+    )
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "incident-names-the-job",
+        "incident-names-another-job",
+        "incident-names-an-attempt",
+        "ambiguous-attempts",
+        "no-stop-receipt",
+        "stop-not-contained",
+        "stop-of-another-workflow",
+        "stop-of-another-incident",
+        "stop-failed",
+        "stop-of-another-controller",
+    ],
+)
+def test_an_unbound_restart_needs_a_jobless_incident_and_its_workflows_own_stop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, defect: str
+) -> None:
+    fixture, api, rendered = harness(tmp_path, monkeypatch)
+    fixture.submit_rendered(rendered)
+    state = restart_state(fixture, unbound=True)
+    incident = state["incident"]
+    stop = state["workflow"]["step_executions"][1]
+    receipt = stop["details"]["stop_ownership_receipt_v1"]
+    if defect == "incident-names-the-job":
+        incident["job_id"] = fixture.settings.job_id
+    elif defect == "incident-names-another-job":
+        incident["job_id"] = "another-job"
+    elif defect == "incident-names-an-attempt":
+        incident["attempt_id"] = fixture.settings.attempt_id
+    elif defect == "ambiguous-attempts":
+        incident["workload_identity_source"] = "AMBIGUOUS_ACTIVE_ATTEMPTS"
+    elif defect == "no-stop-receipt":
+        stop["details"].pop("stop_ownership_receipt_v1")
+    elif defect == "stop-not-contained":
+        receipt["contained"] = False
+    elif defect == "stop-of-another-workflow":
+        receipt["workflow_id"] = "another-workflow"
+    elif defect == "stop-of-another-incident":
+        receipt["incident_id"] = "another-incident"
+    elif defect == "stop-failed":
+        stop["status"] = "FAILED"
+    else:
+        receipt["workloads"][0]["workload_id"] = "gpu-fault-system/job/another"
+    before = deepcopy(fixture.owned_uids)
+    with pytest.raises(WorkloadOwnershipError):
+        fixture.authorize_restart(state, unbound=True)
+    assert fixture.restart_custody is None
+    assert fixture.owned_uids == before
+    assert api.deletes == []

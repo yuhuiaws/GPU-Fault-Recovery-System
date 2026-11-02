@@ -1406,7 +1406,12 @@ unbound_job 另有 STOP_WORKLOADS 与 RESTART_WORKLOAD；drain 为 RECOVER_DRAIN
 RESET_GPU 1，STOP_WORKLOADS/RESTART_WORKLOAD/RECOVER_DRAIN_P2P/QUARANTINE 0；unbound_job——STOP_WORKLOADS
 1、QUIESCE_GPU_SERVICES 1、RESET_GPU 1、RESTART_WORKLOAD 1（作业的 attempt 以 STOPPED 结束、完成决策
 NO_ACTION、无被动 containment、RESTART_WORKLOAD 记下 restart_attempt_id、账本 restart_count 1、重启副本
-运行）；drain——QUIESCE_GPU_SERVICES 1、RECOVER_DRAIN_P2P 1，节点上任何 workflow 都不计划 QUARANTINE；
+运行：产品原地恢复作业——同一 PyTorchJob UID、它与 Pod 模板上的派生 attempt `<源 attempt 前 52 字符>-r-<hash>`、
+新 Pod——夹具只在 restart custody 把本 workflow 已完成的 RESTART_WORKLOAD 绑定到该作业之后才认领它
+（`authorize_restart(..., unbound=True)`）；XID 的 incident 不指向任何作业（`workload_identity_source`
+为 `NO_ACTIVE_MANAGED_ATTEMPT`，该 GPU 上没有受管 attempt），改由本 workflow 自己已 contained 的
+STOP_WORKLOADS 回执中源控制器的 UID 与 attempt 绑定，其余与绑定的重启相同；新 Pod Running 并按 world size
+4 心跳。带日志夹具的作业只在提交它的进程内绑定重启，并把认领的对象记入日志；后续进程重新打开的日志只做清理）；drain——QUIESCE_GPU_SERVICES 1、RECOVER_DRAIN_P2P 1，节点上任何 workflow 都不计划 QUARANTINE；
 remote command 回执不得多于 step executions。前提失败记 INCONCLUSIVE 而不判产品：两路未都到达或不在
 目标 GPU、产品时钟上相距超过 120 s、kernel-first 的实际延迟不在 15-30 s、gauge-first 的内核行不在窗口内、
 产品未记下 0 基线、回放 abort。清理：kmsg 窗口（X 变体在内核行被决定后立即关闭；探针被产品的 quiesce
@@ -1417,7 +1422,9 @@ remote command 回执不得多于 step executions。前提失败记 INCONCLUSIVE
 `tests/regional/test_general_live_xid_twins_product.py`（变体代码驱动内存产品的真实摄入路由、生产
 dispatcher 与 executor：本树五个变体 PASS；去掉孪生规则并绕过代际门时，安全变体以"两个 incident"
 FAIL，链结束后才到的内核行使 RESET_GPU 执行两次而 FAIL，XID 154 的变化单独 BLOCKED 并计划 QUARANTINE
-而 FAIL）、`tests/regional/test_general_live_xid_twins.py`（登记、代际探针对本树/去掉
+而 FAIL）、`tests/regional/test_general_live_xid_twin_job_restart.py`（unbound_job 的真实带日志夹具与
+`judge_job` 跑在内存 kubectl 上：原地重启经 custody 认领并清理；不绑定即复现真机的 "managed workload
+ownership or UID changed"）、`tests/regional/test_general_live_xid_twins.py`（登记、代际探针对本树/去掉
 `xid_cross_source` 的本树/改动的代码形状、前提、时序、kmsg 延后关闭）、`tests/test_gpu_dcgm_field_replay.py`
 （`xid_twin` profile）、`tests/regional/test_general_live_kernel_replay.py`（`arm --index`）。
 

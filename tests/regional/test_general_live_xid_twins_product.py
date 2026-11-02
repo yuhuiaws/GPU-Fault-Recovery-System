@@ -26,6 +26,10 @@ import pytest
 from scripts.e2e.regional import general_live_xid_twin_records as records_module
 from scripts.e2e.regional import general_live_xid_twins as twins
 from scripts.e2e.regional.general_live_gpu_store import GPU_STATE_PROBE
+from scripts.e2e.regional.workload_restart_custody import (
+    UNBOUND_IDENTITY_SOURCE,
+    WorkloadOwnershipError,
+)
 from tests.regional._general_live_fakes import FakeRegional, make_context, make_settings
 from tests.regional._xid_twin_node import (
     EIGHT_GPUS,
@@ -342,13 +346,26 @@ JOB_GPUS = list(EIGHT_GPUS[:4])
 
 
 class FakeFixture:
+    """The job's workload fixture: like ``ManagedWorkloadFixture`` it refuses
+    the restarted Pods until the case bound the restart (``authorize_restart``;
+    the real custody over live-shaped records is
+    ``test_general_live_xid_twin_job_restart``)."""
+
+    def __init__(self) -> None:
+        self.authorized: list[tuple[dict[str, Any], bool]] = []
+
     def pods(self) -> list[dict[str, Any]]:
         return [{"name": "gl24tw-pod", "uid": "uid-original"}]
+
+    def authorize_restart(self, state: dict[str, Any], *, unbound: bool) -> None:
+        self.authorized.append((state, unbound))
 
     def wait_restarted(
         self, old_uids: set[str], *, timeout_seconds: int
     ) -> dict[str, Any]:
         assert old_uids == {"uid-original"}, old_uids
+        if not self.authorized:
+            raise WorkloadOwnershipError("managed workload ownership or UID changed")
         return {"pods": [{"name": "gl24tw-pod-r", "uid": "uid-restarted"}]}
 
 
@@ -421,6 +438,53 @@ def test_unbound_job_twin_stops_resets_and_restarts_once(
     }, _executed(run.product)
     assert out["restart_attempt_id"] == "train-a001-r-1", out
     assert out["job"]["watcher_gpus"] == sorted(JOB_GPUS), out["job"]
+    # The restarted Pods were adopted only under the occurrence's restart: its
+    # workflow and incident -- which, the XID's GPU holding no managed attempt,
+    # names no job (the product's own ingest here) -- bound as unbound.
+    [(state, unbound)] = job.fixture.authorized
+    assert unbound is True
+    assert state["workflow"]["request_id"] == out["workflow_request_id"], state
+    assert state["incident"]["incident_id"] == out["incident_id"], state
+    assert state["incident"]["job_id"] is None, state["incident"]
+    assert state["incident"]["workload_identity_source"] == UNBOUND_IDENTITY_SOURCE, (
+        state["incident"]
+    )
+    assert all(
+        item.get("workflow_request_id") == out["workflow_request_id"]
+        for item in state["commands"]
+    ), state["commands"]
+
+
+def test_unbound_job_twin_fails_when_the_restart_is_not_bound_to_the_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The custody refuses (here: records that do not bind the restart): the
+    job stage fails by name and the restarted Pods are never adopted."""
+
+    run, job = _job_run(tmp_path, monkeypatch)
+    waited: list[set[str]] = []
+
+    def refuse(state: dict[str, Any], *, unbound: bool) -> None:
+        raise WorkloadOwnershipError(
+            "managed workload restart custody: restart execution is missing or "
+            "ambiguous"
+        )
+
+    monkeypatch.setattr(job.fixture, "authorize_restart", refuse)
+    monkeypatch.setattr(
+        job.fixture,
+        "wait_restarted",
+        lambda old, **_kw: waited.append(old) or {"pods": []},
+    )
+    out = run.run()
+
+    assert out["verdict"] == "FAIL", out
+    assert out["stages"]["job"] == [
+        "the product's restart is not bound to the job: WorkloadOwnershipError: "
+        "managed workload restart custody: restart execution is missing or "
+        "ambiguous"
+    ], out["stages"]
+    assert waited == [], "nothing is adopted before the restart is bound"
 
 
 def test_unbound_job_twin_fails_on_a_second_restart_in_the_ledger(

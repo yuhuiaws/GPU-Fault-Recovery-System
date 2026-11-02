@@ -4100,8 +4100,8 @@ jobs at once, could never have submitted its second. The leftover was the
 Suspended PyTorchJob of an earlier 028 `nonzero_exit`. The product had
 restarted that job in place (same UID, attempt id `<source>-r-<8 hex>`), and
 the case's cleanup refused it ("managed workload ownership or UID changed")
-before deleting anything: a journaled fixture can bind no restart, and its
-cleanup kept the strict adoption rule. A managed workload is now named
+before deleting anything: a journaled fixture could bind no restart then, and
+its cleanup kept the strict adoption rule. A managed workload is now named
 `<manifest name>-<sha256(job id), 10 hex>`, at most 43 characters so the
 product's `-r-<8 hex>` restart copy and the training operator's `-master-0`
 replica names stay DNS-1035 labels, and every lookup (status reads, the job-id
@@ -5887,8 +5887,8 @@ API Pod's own engine whether it has the twin rule; a product without batch 237
 ends INCONCLUSIVE ("expected on this product generation"), never with a twin
 injected. The variants are implemented and tested over the product's own
 records in memory (`tests/regional/test_general_live_xid_twins_product.py`:
-PASS on this tree, FAIL with the twin rule taken out) but have not run on the
-live site yet. What they cannot prove live:
+PASS on this tree, FAIL with the twin rule taken out) but had not run on the
+live site when they landed. What they cannot prove live:
 
 - Both reports are replays (`live-replay`); no physical XID is raised, and the
   field-230 change the product reads is the field tool's, not a DCGM host
@@ -5918,6 +5918,26 @@ live site yet. What they cannot prove live:
   nvidia-smi and the product's watcher mapping; where they disagree, or the job
   does not hold exactly four, the variant is INCONCLUSIVE rather than placing
   the XID on a guess.
+- `xid_twin_unbound_job` adopts the restarted job only once the occurrence's
+  completed RESTART_WORKLOAD is bound to it (restart custody,
+  `ManagedWorkloadFixture.authorize_restart(..., unbound=True)`). The product
+  resumes the stopped job in place -- the same PyTorchJob UID, the derived
+  attempt id `<source[:52]>-r-<hash>` on it and its Pod template, a new Pod --
+  and the XID's incident names no job (`workload_identity_source`
+  `NO_ACTIVE_MANAGED_ATTEMPT`: its GPU held no managed attempt), so the
+  workflow's own contained STOP_WORKLOADS receipt of the job's controller (its
+  UID and attempt) binds the restart in place of the incident's job id; all a
+  bound restart proves still holds (one SUCCEEDED RESTART_WORKLOAD of the
+  workflow naming the job, its remote command, restart authorization and
+  target attempt, and that restart's annotations on the controller). The
+  first live run (2026-11-02, plain EKS, R16) waited for the restarted Pod
+  without the binding and failed "managed workload ownership or UID changed"
+  after a correct chain -- one STOP_WORKLOADS, QUIESCE_GPU_SERVICES, RESET_GPU
+  and RESTART_WORKLOAD, ledger 1, the attempt STOPPED by the incident; a
+  journaled fixture could not bind a restart then. It now binds one in the
+  process that submitted the job and journals what it adopts
+  (`FixtureOwnership.observe_restart`); a journal a later process reopened
+  stays cleanup-only. The bound run has not been seen live yet.
 
 Not verified live, and stated from NVIDIA documentation or the code:
 

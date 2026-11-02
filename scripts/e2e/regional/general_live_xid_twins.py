@@ -832,7 +832,19 @@ def judge_job(
     gpu: str,
 ) -> list[str]:
     """The XID was on a GPU the job does not use; the job stopped once and
-    came back once."""
+    came back once.
+
+    RESTART_WORKLOAD resumes the stopped PyTorchJob in place -- the same UID,
+    the derived attempt id ``<source[:52]>-r-<hash>`` on it and its Pod
+    template, new Pods (``adapters/kubernetes/workload_operations``). The
+    fixture adopts that restart only once this workflow's completed
+    RESTART_WORKLOAD is bound to the job (``authorize_restart``); the XID's
+    incident names no job -- its GPU held no managed attempt -- so the
+    workflow's own contained STOP receipt of the job's controller binds it
+    (``unbound``). Waited for without that binding, the restarted Pod was
+    refused as "managed workload ownership or UID changed" (live 2026-11-02,
+    plain EKS).
+    """
 
     errors = []
     if gpu in set(held.get("container_gpus") or []) | set(
@@ -862,6 +874,14 @@ def judge_job(
         )
     )
     old = {str(item) for item in held.get("pod_uids") or []}
+    facts["restart_attempt_id"] = restart_attempt
+    try:
+        job.fixture.authorize_restart(restart_state(document, workflow), unbound=True)
+    except Exception as exc:  # noqa: BLE001 - the binding is the stage's
+        errors.append(
+            f"the product's restart is not bound to the job: {type(exc).__name__}: {exc}"
+        )
+        return errors
     try:
         restarted = job.fixture.wait_restarted(
             old, timeout_seconds=RESTART_RUNNING_BUDGET_SECONDS
@@ -870,8 +890,30 @@ def judge_job(
         errors.append(f"the restarted job did not run: {type(exc).__name__}: {exc}")
     else:
         ctx.evidence.write("job-restarted", restarted)
-    facts["restart_attempt_id"] = restart_attempt
     return errors
+
+
+def restart_state(document: dict[str, Any], workflow: dict[str, Any]) -> dict[str, Any]:
+    """What the restart custody reads (``RestartCustody.from_state``), from the
+    node's activity: the occurrence's workflow, its incident and the remote
+    commands of that workflow."""
+
+    return {
+        "workflow": workflow,
+        "incident": next(
+            (
+                item
+                for item in document.get("incidents") or []
+                if item.get("incident_id") == workflow.get("incident_id")
+            ),
+            {},
+        ),
+        "commands": [
+            item
+            for item in document.get("commands") or []
+            if item.get("workflow_request_id") == workflow.get("request_id")
+        ],
+    }
 
 
 def restore_if_left_isolated(

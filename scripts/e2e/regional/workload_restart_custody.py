@@ -31,6 +31,29 @@ def records(value: Any, name: str) -> list[dict[str, Any]]:
     return cast(list[dict[str, Any]], value)
 
 
+#: The product's mark on an XID whose GPU no managed attempt holds
+#: (``app/ingest/faults._enrich_fault_identity``): the incident names no job and
+#: no attempt. A job on the node's other GPUs is still stopped and restarted by
+#: that incident's workflow (GF-GENERAL-LIVE-024 ``xid_twin_unbound_job``, live
+#: 2026-11-02 on plain EKS: STOP_WORKLOADS, RESET_GPU, RESTART_WORKLOAD of the
+#: job); it is the incident's bystander, not its owner.
+UNBOUND_IDENTITY_SOURCE = "NO_ACTIVE_MANAGED_ATTEMPT"
+
+
+def incident_binds_job(
+    incident: Mapping[str, Any], job_id: str, *, unbound: bool
+) -> bool:
+    """The incident is the job's own or, ``unbound``, names no job at all."""
+
+    if not unbound:
+        return incident.get("job_id") == job_id
+    return (
+        incident.get("job_id") is None
+        and incident.get("attempt_id") is None
+        and incident.get("workload_identity_source") == UNBOUND_IDENTITY_SOURCE
+    )
+
+
 @dataclass(frozen=True)
 class RestartCustody:
     cluster_id: str
@@ -70,7 +93,17 @@ class RestartCustody:
         source_uid: str,
         gpu_count: int,
         restart_budget: int,
+        unbound: bool = False,
     ) -> RestartCustody:
+        """The completed product restart ``state`` records for this workload.
+
+        ``unbound``: the workflow's incident names no job (``incident_binds_job``)
+        -- its XID was on a GPU the workload does not hold -- so the incident
+        cannot tie the restart to the job; the workflow's own contained
+        STOP_WORKLOADS receipt of the source controller (its UID and attempt)
+        must, in addition to everything a bound restart proves.
+        """
+
         require(bool(source_uid), "original controller UID is unproven")
         workflow = mapping(state.get("workflow"), "workflow")
         incident = mapping(state.get("incident"), "incident")
@@ -86,7 +119,7 @@ class RestartCustody:
             and workflow.get("status") == "SUCCEEDED"
             and workflow.get("incident_id") == incident_id
             and incident.get("cluster_id") == cluster_id
-            and incident.get("job_id") == job_id,
+            and incident_binds_job(incident, job_id, unbound=unbound),
             "successful workflow or incident identity differs",
         )
         executions = records(workflow.get("step_executions"), "step executions")
@@ -228,6 +261,7 @@ class RestartCustody:
             "remote restart completion differs from the workflow result",
         )
         # A stop receipt, when present, must agree with the fixture's original UID.
+        contained = False
         for item in executions:
             receipt = (item.get("details") or {}).get("stop_ownership_receipt_v1")
             if not isinstance(receipt, dict):
@@ -239,6 +273,18 @@ class RestartCustody:
                         and source.get("attempt_id") == source_attempt_id,
                         "STOP receipt names another source controller",
                     )
+                    contained = contained or (
+                        item.get("operation") == "STOP_WORKLOADS"
+                        and item.get("status") == "SUCCEEDED"
+                        and receipt.get("contained") is True
+                        and receipt.get("workflow_id") == workflow_id
+                        and receipt.get("incident_id") == incident_id
+                    )
+        require(
+            contained or not unbound,
+            "no contained STOP receipt of this workflow names the unbound job's "
+            "source controller",
+        )
         return cls(
             cluster_id=cluster_id,
             namespace=namespace,

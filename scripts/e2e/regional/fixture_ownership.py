@@ -463,18 +463,19 @@ class FixtureOwnership:
             self.record.cleanup_custody[key] = capture_cleanup_custody(document)
             self._save()
 
-    def observe_for_cleanup(self, document: dict[str, Any]) -> None:
-        """Journal a product restart of this fixture's workload, for cleanup only.
+    def observe_restart(self, document: dict[str, Any]) -> None:
+        """Journal a product restart of this fixture's workload.
 
         ``observe`` adopts only what keeps its declared intent. The product's
         RESTART_WORKLOAD relabels the creation in place (a new attempt id on
         the same UID) or copies it, and the controller makes new Pods; none
         keeps the intent, all are this fixture's to delete. The caller proved
-        the lineage (``unbound_restart_root``); the observed UID lets
-        ``retain_for_cleanup`` hold the object across the orphan delete. A
-        controller keeps its UID under its name; a Pod that replaced an
-        observed one of the same name supersedes it. A reopened journal
-        records nothing new.
+        the lineage: the restart custody of a case that read the completed
+        restart (``RestartCustody.validate``), or -- for deletion only --
+        ``unbound_restart_root``; the observed UID lets ``retain_for_cleanup``
+        hold the object across the orphan delete. A controller keeps its UID
+        under its name; a Pod that replaced an observed one of the same name
+        supersedes it. A reopened journal records nothing new.
         """
 
         with self.operation():
