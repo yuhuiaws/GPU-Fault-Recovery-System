@@ -258,6 +258,43 @@ def test_a_failure_is_recorded_never_raised(tmp_path: Path) -> None:
     )
 
 
+def test_a_refused_put_names_the_aws_error_and_touches_no_schedule(
+    tmp_path: Path,
+) -> None:
+    world = World(_described(LIVE_BEFORE))
+    world.refused_writes["put-metric-alarm"] = (
+        "An error occurred (AccessDenied) when calling the PutMetricAlarm operation: "
+        "not authorized to perform: cloudwatch:TagResource"
+    )
+
+    record = _finish(world, tmp_path)
+
+    assert record["status"] == "FAILED", record
+    assert [item["action"] for item in record["alarms"]["alarms"]] == [
+        "failed",
+        "failed",
+    ]
+    assert any("cloudwatch:TagResource" in item for item in record["warnings"]), (
+        "the AWS reason reaches the warning"
+    )
+    assert not _updates(world), "no alarm, no schedule change"
+    assert step.load_journal(tmp_path)["alarms"] == {}, "nothing was created"
+
+
+def test_an_own_alarm_whose_update_fails_stays_in_the_ledger(tmp_path: Path) -> None:
+    alarms = old_nlb_alarms()
+    tags = {item["AlarmArn"]: [dict(SITE_TAG)] for item in alarms.values()}
+    world = World(_described(LIVE_ROLLING), alarms=alarms, tags=tags)
+    world.refused_writes["put-metric-alarm"] = "Throttling: Rate exceeded"
+
+    record = _finish(world, tmp_path)
+
+    assert record["status"] == "FAILED", record
+    assert sorted(step.load_journal(tmp_path)["alarms"]) == [CAPACITY, NOT_RESTORED], (
+        "the site's alarms are still recorded, so uninstall deletes them"
+    )
+
+
 def test_a_control_plane_that_never_fills_puts_no_alarm(tmp_path: Path) -> None:
     world = World(_described(LIVE_BEFORE), healthy=2)
 

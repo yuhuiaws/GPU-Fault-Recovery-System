@@ -144,6 +144,8 @@ class World:
         self.fail_creates = 0
         #: How many describes after a write still answer ``Updating``.
         self.updating_reads = 1
+        #: CloudWatch writes AWS refuses: operation -> error text.
+        self.refused_writes: dict[str, str] = {}
         self._updating = 0
 
     # --- CommandRunner ---------------------------------------------------------
@@ -166,6 +168,11 @@ class World:
         self.calls.append(tuple(words[1:3]))
         assert options.get("mutate"), f"a write without mutate=True: {words[:3]}"
         self.writes.append(tuple(words[1:3]))
+        if words[2] in self.refused_writes:
+            raise BootstrapError(
+                f"command failed (254): aws cloudwatch {words[2]}: "
+                + self.refused_writes[words[2]]
+            )
         if words[2] == "put-metric-alarm":
             alarm = _alarm_from_put(words[3:])
             name = alarm["AlarmName"]

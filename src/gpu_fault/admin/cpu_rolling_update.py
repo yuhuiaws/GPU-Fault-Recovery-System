@@ -538,7 +538,9 @@ def ensure_alarms(
 
     ``action`` per alarm: ``created``, ``updated`` (re-pointed or redefined),
     ``unchanged`` (identical: not put), ``refused`` (another site's, or a
-    foreign untagged one); ``tagged`` when the site tag was added."""
+    foreign untagged one), ``failed`` (a write AWS refused; the error is in
+    ``errors``); ``tagged`` when the site tag was added. An alarm carries its
+    ``arn`` only when it is the site's, which is what the journal records."""
 
     pair = rollback.alarm_definitions(
         nlb=nlb,
@@ -578,7 +580,13 @@ def ensure_alarms(
             results.append({"name": name, "action": "refused"})
             continue
         if existing is None:
-            runner.run([*put, "--tags", site_tag], mutate=True, capture=False)
+            # Captured, so a refusal carries the AWS message into the warning.
+            try:
+                runner.run([*put, "--tags", site_tag], mutate=True)
+            except BootstrapError as exc:
+                errors.append(f"{name}: {exc}")
+                results.append({"name": name, "action": "failed"})
+                continue
             results.append(
                 {"name": name, "arn": target.alarm_arn(name), "action": "created"}
             )
@@ -590,27 +598,36 @@ def ensure_alarms(
             results.append({"name": name, "action": "refused"})
             continue
         result: dict[str, Any] = {"name": name, "arn": arn, "action": "unchanged"}
-        if not rollback.definition_matches(existing, definition):
-            runner.run(put, mutate=True, capture=False)
-            result["action"] = "updated"
-        if not ours:
-            # PutMetricAlarm ignores --tags on an existing alarm.
-            runner.run(
-                [
-                    "aws",
-                    "cloudwatch",
-                    "tag-resource",
-                    "--region",
-                    target.region,
-                    "--resource-arn",
-                    arn,
-                    "--tags",
-                    site_tag,
-                ],
-                mutate=True,
-                capture=False,
+        try:
+            if not rollback.definition_matches(existing, definition):
+                runner.run(put, mutate=True)
+                result["action"] = "updated"
+            if not ours:
+                # PutMetricAlarm ignores --tags on an existing alarm.
+                runner.run(
+                    [
+                        "aws",
+                        "cloudwatch",
+                        "tag-resource",
+                        "--region",
+                        target.region,
+                        "--resource-arn",
+                        arn,
+                        "--tags",
+                        site_tag,
+                    ],
+                    mutate=True,
+                )
+                result["tagged"] = True
+        except BootstrapError as exc:
+            errors.append(f"{name}: {exc}")
+            # Still the site's when it carried the tag: the ledger keeps it.
+            results.append(
+                {**result, "action": "failed"}
+                if ours
+                else {"name": name, "action": "failed"}
             )
-            result["tagged"] = True
+            continue
         results.append(result)
     return {"alarms": results, "errors": errors}
 
@@ -637,7 +654,7 @@ def _record_alarms(
     for name, entry in journal["alarms"].items():
         entry["configured"] = name in configured
     for item in results:
-        if item["action"] != "refused":
+        if item.get("arn"):
             journal["alarms"][str(item["name"])] = {
                 "name": str(item["name"]),
                 "arn": str(item["arn"]),
@@ -1128,6 +1145,8 @@ def _finish(
         _record_alarms(state_dir, alarms["alarms"], clock=clock)
         if any(item["action"] == "refused" for item in alarms["alarms"]):
             raise BootstrapError("an alarm of the pair is not this site's")
+        if any(item["action"] == "failed" for item in alarms["alarms"]):
+            raise BootstrapError("AWS refused a write of the rollback alarms")
         if not alarms["alarms"]:
             raise BootstrapError("no rollback alarm could be defined")
         record["alarm_states"] = _alarms_ok(
