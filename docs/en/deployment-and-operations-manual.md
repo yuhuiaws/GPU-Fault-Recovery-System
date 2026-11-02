@@ -962,10 +962,17 @@ temporarily relaxed during a maintenance window:
    re-images every CPU node in one window and takes the whole control plane down for minutes (announced by `status --full`
    and deploy discovery); with HyperPod task governance on the cluster, Kueue's Pod webhook (`failurePolicy: Fail`) covers
    the product namespace, so no control-plane Pod can be created while Kueue is not serving (`status` reports
-   `replica failure: ...`), also §5.0.5; `gpu-fault-admin hyperpod-scheduled-update --state-dir ... --gpu-cluster-arn
-   <CPU ARN> --rolling --rollback-alarm <alarm> ...` prints the commands that make the CPU group's schedule roll one
-   instance at a time, rolled back on the named CloudWatch alarms (the service needs both and does not change a schedule
-   in place: delete, verify, create, verify; the recommended alarms watch the API NLB's healthy targets). After the
+   `replica failure: ...`), also §5.0.5. The deploy itself keeps the CPU group rolling. Where it is decided:
+   `spec.cpuControlPlane.rollingUpdate` in `admin-config.yaml`, `mode: rolling` by default (`unchanged` leaves the group
+   as found). The first `deploy` imports it with `--config`, and later changes go through `gpu-fault-admin config`.
+   Where it is executed: the deploy's last step, once every api-ha replica is a healthy target. The step creates or
+   re-points the two `HealthyHostCount` rollback alarms on the API NLB and waits until both are `OK`. Then it makes the
+   group's own schedule roll one instance at a time, rolled back on those alarms: delete, verify, create, verify,
+   because the service does not change a schedule in place. The step never adds a schedule to a group without one, and
+   it is deferred during an AMI update or within 3 hours of the next window. It never fails the release: the
+   `cpu_rolling_update` check of `status --full` names what is left, and `gpu-fault-admin cpu-rolling-update` runs the
+   step again. `gpu-fault-admin hyperpod-scheduled-update --state-dir ... --gpu-cluster-arn <CPU ARN> --rolling
+   --rollback-alarm <alarm> ...` prints the same requests for a manual change. After the
    end of its Kubernetes version's support AWS upgrades each site EKS cluster's control plane by itself (without notice,
    no rollback); `status --full` announces it 90 days ahead, also §5.0.5.
 2. Under no circumstances may this solution's code or execution roles call

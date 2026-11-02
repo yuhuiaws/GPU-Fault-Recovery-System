@@ -5860,9 +5860,10 @@ alarm reads, refusals and warnings; the suggested pair against botocore's
 `tests/admin/test_admin_hyperpod_scheduled_update.py` (`--rolling` against the
 ownership release's builder), `tests/admin/test_admin_automatic_node_updates.py`
 and `tests/regional/test_regional_release_control_plane_updates.py` (the
-advisory lines, the `status`/preflight alarm read, unreadable alarms and NLB)
-and `tests/regional/test_regional_release_vendor_citations.py` (the citations
-in both manuals).
+advisory lines; batch 240 moved the `status` alarm read into the
+`cpu_rolling_update` check, below) and
+`tests/regional/test_regional_release_vendor_citations.py` (the citations in
+both manuals).
 
 Not verified: a rollback triggered by an alarm (no rolling window has run yet;
 the first is due 2026-11-08 08:00Z); whether the instance group's execution
@@ -5877,6 +5878,59 @@ alarms as rollback triggers; the delete step on a group that also carries an
 N-1 for 5 of 5 minutes) does not trip on a full outage shorter than 5 minutes
 (2026-11-01: Maximum 0 for 2 minutes); the batch of one instance is the
 protection against that.
+
+## The deploy keeps the CPU rolling update (batch 240)
+
+The deploy's last step creates or re-points the two rollback alarms and
+applies `spec.cpuControlPlane.rollingUpdate` to the CPU HyperPod group's
+schedule. This lane made no AWS call. The facts it builds on are the batch 239
+live readings above: the hand-made pair with the statistic Maximum, and the
+group rolling on it since 2026-11-02 00:34Z.
+
+The code is proven with fakes only:
+
+- `tests/admin/test_admin_cpu_rolling_update.py` runs the step against a fake
+  CPU cluster, API NLB and CloudWatch (`tests/admin/_cpu_rolling_world.py`).
+  The fake HyperPod refuses exactly the three live requests. A new alarm
+  starts `INSUFFICIENT_DATA`, and an update keeps the state and ignores
+  `--tags`. The tests cover the alarms put only after full capacity, the
+  thresholds from the replica count, the second window below the wait, NOOP
+  when identical, adoption and refusal, delete then create, each deferral, the
+  retried create and its loud failure, the resume from the journal, the
+  `unchanged` restore and its deferral, the verb, the admin-config section, and
+  api-ha's surge-first rollout.
+- `tests/admin/test_admin_cpu_rolling_ledger.py` covers the ledger rows, the
+  alarm cleanup with the tag proof, and the uninstall restore.
+- `tests/regional/test_regional_cpu_rolling_update.py` covers the
+  `cpu_rolling_update` check, `cpu_update_window` and the engine mode.
+- `tests/admin/test_admin_hyperpod_schedule_window.py` covers the cron windows.
+- `tests/admin/test_release_deploy.py` checks that the step is the release's
+  last, on the NOOP fast path too.
+- `tests/admin/test_admin_site_config.py` covers a `config` change of the
+  section.
+
+Not verified:
+
+- The step against the live site. Expected: the hand-made alarms are adopted
+  and tagged, and the schedule is a `noop`.
+- A rollback triggered by the alarms; the first rolling window is due
+  2026-11-08 08:00Z.
+- The window estimate of about `instances x (10 min + wait)`. A
+  one-at-a-time roll has never been observed; the 2026-11-01 all-at-once
+  re-image had the nodes back in about 5 minutes.
+- Which way HyperPod reads a numeric day-of-week. The guide's examples count
+  from Monday and its `#` text from Sunday, so the product reads both and
+  places a window no later than either reading.
+- What a scheduled window does when an alarm named in
+  `AutoRollbackConfiguration` does not exist. This happens between an
+  uninstall that deletes the alarms of a schedule it did not change and the
+  next deploy (the live site's case: the deploy finds the group rolling and
+  records nothing, so uninstall leaves the schedule and prints the helper
+  command). AWS documents neither a refusal nor a skip.
+- `WarmUpConfiguration`. It is not used: the deploy host's `aws` CLI version is
+  not pinned, although botocore 1.43.83 and 1.43.123 accept it.
+- The restore after a real deploy changed a schedule; it was run only against
+  the fake.
 
 ## Provider-event PCI identity (batch 236)
 

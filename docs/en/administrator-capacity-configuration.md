@@ -35,13 +35,24 @@ Administrators can currently configure:
   0..0.5 s, default 0.05); the defaults of all seven are likewise omitted from records and YAML, see §4.6;
 - Workflow scan period and dispatcher thread count;
 - The departed-node cleanup switch `workflow.departedNodeCleanup` (default `true`; its default is likewise omitted from
-  records and YAML, the live digests do not move, so it is not one of the 19 template fields): with `false` the control
+  records and YAML, the live digests do not move, so it is not one of the 23 template fields): with `false` the control
   plane no longer retires a departed node's Agent or closes its never-changed workflows and ESCALATED incidents by
   itself, and those records are left to `workflow-reconcile` (Administrator Operations §10.1.1);
 - Notification batch size and maximum attempts;
-- Raw evidence retention hours and per-node record cap.
+- Raw evidence retention hours and per-node record cap;
+- The CPU control plane's scheduled update, `cpuControlPlane` (batch 240). `rollingUpdate.mode` is `rolling` (the
+  default) or `unchanged`, and `rollingUpdate.waitIntervalSeconds` is 900..3600, default 1800.
+  `rollbackAlarms.capacity`/`rollbackAlarms.notRestored` name the two CloudWatch alarms; the defaults are
+  `gpu-fault-cpu-roll-api-capacity`/`gpu-fault-cpu-roll-api-not-restored`, and two sites in one account and Region
+  need names of their own.
+  - The deploy's last step applies the section: it keeps the alarms on the API NLB and makes the CPU HyperPod group's
+    own schedule roll one instance at a time, or with `unchanged` leaves the group as found (Administrator Operations
+    §5.0.5).
+  - Only the deploy host reads it: no role payload carries it, so a change rolls no Pod and `config` reports
+    `affected_resources: ["cpu_control_plane"]`.
+  - At its defaults it is omitted from records and YAML, so the live digests do not move.
 
-The formal template contains 19 administrator-configurable leaf fields in total; the remediation section has none. The node and
+The formal template contains 23 administrator-configurable leaf fields in total; the remediation section has none. The node and
 failure-domain remediation budgets are safety constants fixed at 1 at runtime and do not appear in the template; if an old file
 still has `maxActivePerNode: 1` or `maxActivePerFailureDomain: 1` it is accepted and ignored, and any other value is refused.
 `maxActiveRegion`, `maxActivePerCluster` and `maxActivePerResourceClass` are retired: no fixed number caps how many workflows a
@@ -518,6 +529,13 @@ spec:
   evidence:
     retentionHours: 24
     maxRecordsPerNode: 10000
+  cpuControlPlane:
+    rollingUpdate:
+      mode: rolling
+      waitIntervalSeconds: 1800
+    rollbackAlarms:
+      capacity: gpu-fault-cpu-roll-api-capacity
+      notRestored: gpu-fault-cpu-roll-api-not-restored
 ```
 
 The field names in the YAML are the camelCase spelling of the snake_case field names in `desired.json`; both derive from the same

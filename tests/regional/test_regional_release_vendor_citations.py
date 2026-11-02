@@ -20,7 +20,12 @@ apostrophes are the vendors' own.
   (API version and page date given: the pages print no date), the HyperPod AMI
   update page, the NLB metrics and health-check pages and CloudWatch's
   DescribeAlarms -- and the service's own ValidationException texts of
-  2026-11-02, which contradict the reference's "Required: No".
+  2026-11-02, which contradict the reference's "Required: No";
+- batch 240, the deploy keeping the alarms and the schedule
+  (``cpu_rolling_update.EVIDENCE``): PutMetricAlarm (a new alarm starts
+  INSUFFICIENT_DATA, an update keeps the state and ignores tags), the
+  instance group's update statuses, the HyperPod cron rules, DescribeAlarms'
+  permission scope and DeleteAlarms' read-back.
 """
 
 from __future__ import annotations
@@ -31,6 +36,7 @@ from typing import Any
 
 import pytest
 
+from gpu_fault.admin import cpu_rolling_update
 from gpu_fault.admin.automatic_node_updates import HYPERPOD_UPDATE_EVIDENCE
 from gpu_fault.admin.hyperpod_rollback import (
     ALARM_DETAILS_EVIDENCE,
@@ -43,6 +49,7 @@ from gpu_fault.admin.hyperpod_rollback import (
     ROLLING_POLICY_EVIDENCE,
     SERVICE_REFUSALS,
 )
+from gpu_fault.admin.hyperpod_schedule_window import SCHEDULE_EVIDENCE
 from gpu_fault_release.regional_release_eks_support import EKS_SUPPORT_EVIDENCE
 from gpu_fault_release.regional_release_replica_failure import (
     KUEUE_POD_WEBHOOK_EVIDENCE,
@@ -102,6 +109,7 @@ def test_the_hyperpod_update_evidence_is_the_aws_page_verbatim() -> None:
         REPLICASET_BACKOFF_EVIDENCE,
         EKS_SUPPORT_EVIDENCE,
         *ROLLBACK_EVIDENCE,
+        *cpu_rolling_update.EVIDENCE,
     ],
     ids=[
         "hyperpod-update",
@@ -115,6 +123,11 @@ def test_the_hyperpod_update_evidence_is_the_aws_page_verbatim() -> None:
         "nlb-healthy-hosts",
         "nlb-health-checks",
         "describe-alarms",
+        "put-metric-alarm",
+        "software-update-status",
+        "cron-expressions",
+        "describe-alarms-scope",
+        "delete-alarms",
     ],
 )
 def test_each_manual_carries_each_citation_verbatim(
@@ -141,6 +154,16 @@ def test_each_manual_names_the_remedies_the_product_prints(manual: str) -> None:
         "cloudwatch:DescribeAlarms",
         "elasticloadbalancing:DescribeTargetGroups",
         "--statistic Maximum",
+        "gpu-fault-admin cpu-rolling-update --state-dir",
+        "spec.cpuControlPlane",
+        "cpu_rolling_update",
+        "cpu_update_window",
+        "cpu_rolling_update_restore",
+        "cloudwatch:PutMetricAlarm",
+        "cloudwatch:TagResource",
+        "cloudwatch:DeleteAlarms",
+        "elasticloadbalancing:DescribeTargetHealth",
+        "sagemaker:UpdateCluster",
     ):
         assert needle in text, f"{manual} lacks {needle!r}"
 
@@ -205,3 +228,36 @@ def test_each_manual_records_the_live_refusals_with_their_times(manual: str) -> 
         assert f'{refusal["at"]} "{_flat(refusal["text"])}"' in text, (
             f"{manual} lacks the {refusal['at']} refusal verbatim"
         )
+
+
+def test_the_deploy_step_evidence_is_the_aws_pages_verbatim() -> None:
+    """The quotes batch 240's step is built on, read 2026-11-02."""
+
+    assert cpu_rolling_update.EVIDENCE == (
+        cpu_rolling_update.PUT_METRIC_ALARM_EVIDENCE,
+        cpu_rolling_update.SOFTWARE_UPDATE_EVIDENCE,
+        SCHEDULE_EVIDENCE,
+        cpu_rolling_update.DESCRIBE_ALARMS_SCOPE_EVIDENCE,
+        cpu_rolling_update.DELETE_ALARMS_EVIDENCE,
+    )
+    put = cpu_rolling_update.PUT_METRIC_ALARM_EVIDENCE
+    assert put["quotes"][0].startswith(
+        "When this operation creates an alarm, the alarm state is immediately set to "
+        "`INSUFFICIENT_DATA`."
+    ), "why the alarms are put only once the control plane is full"
+    assert "any tags you specify in this parameter are ignored" in put["quotes"][2], (
+        "why an adopted alarm is tagged with TagResource"
+    )
+    assert SCHEDULE_EVIDENCE["quotes"][1].endswith("`cron(00 12 ? * 1 *)`"), (
+        "the guide's Monday example"
+    )
+    assert "3 refers to Tuesday" in SCHEDULE_EVIDENCE["quotes"][2], (
+        "the guide's two numberings of the day of the week"
+    )
+    assert (
+        cpu_rolling_update.SOFTWARE_UPDATE_EVIDENCE["version"],
+        cpu_rolling_update.SOFTWARE_UPDATE_EVIDENCE["docs_date"],
+    ) == ("API version 2017-07-24", "Last-Modified 2026-10-30")
+    assert cpu_rolling_update.DELETE_ALARMS_EVIDENCE["quotes"][0].endswith(
+        "you can use the DescribeAlarms operation after using DeleteAlarms."
+    ), "why uninstall reads a deleted alarm back"

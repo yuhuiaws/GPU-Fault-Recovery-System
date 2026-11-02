@@ -23,6 +23,7 @@ rationale and special recovery steps are kept in the [Deployment and Operations 
 | Join a GPU cluster | `deploy --state-dir ... --gpu-cluster-arn <all managed ARNs> --gpu-cluster-arn <new ARN>` (the given set must be the managed set or a superset of it; the extra ARNs are the joins; giving fewer is refused with `site manages GPU clusters the command omits ... use remove-cluster`; when there are code changes release first, then join), or the join-only `gpu-fault-admin join-cluster --state-dir ... --gpu-cluster-arn <new ARN>` (does not trigger a site release; already managed ARNs return `ALREADY_MANAGED`) | REG-8.1.5, §5 |
 | Remove a GPU cluster | `gpu-fault-admin remove-cluster --state-dir ... --gpu-cluster-arn <ARN> --confirm REMOVE_GPU_CLUSTER` | REG-8.1.6, REG-12, §5 |
 | Switch a HyperPod instance group's automatic updates off (`ScheduledUpdateConfig`/`AutoPatchConfig`; `status --full` reports `advisory: HyperPod instance group ...`, for the CPU control-plane cluster's groups too, where one window takes the whole control plane down for minutes) | `gpu-fault-admin hyperpod-scheduled-update --state-dir ... --gpu-cluster-arn <ARN>` is read-only (the CPU control-plane cluster's ARN selects every group of it; `--rolling --rollback-alarm <alarm>` keeps the schedule and makes it roll one instance at a time, rolled back on CloudWatch alarms -- printed as ordered steps, because the service deletes and re-creates a schedule rather than changing it) and prints the `aws sagemaker update-cluster` to run in a maintenance window; manual updates use `update-cluster-software`; the plain-EKS equivalents (Karpenter expiry, an ASG `MaxInstanceLifetime`) are in the same section | §5.0.5 |
+| The CPU control plane's rolling update did not apply (`status --full` fails `cpu_rolling_update`, or the deploy prints `release-deploy: warning: CPU rolling update: ...`) | once the cause is gone (an AMI update finished, the window passed), `gpu-fault-admin cpu-rolling-update --state-dir ...` runs the deploy's last step again; `spec.cpuControlPlane` in `admin-config.yaml` (`mode: rolling`, the default, or `unchanged`) is changed with `gpu-fault-admin config` | §5.0.5 |
 | A control-plane Deployment cannot create its Pods (`status` reports `replica failure: <Deployment> ... FailedCreate: ...`, for example while Kueue's `mpod.kb.io` webhook is not serving) | once the cause is gone, run the `kubectl -n gpu-fault-system annotate replicaset ... --overwrite` the line prints: a metadata-only update, so the ReplicaSet controller retries at once instead of waiting out its backoff of up to ~16 min | §5.0.5 |
 | An EKS cluster's version near or past the end of its support (`status --full` reports `advisory: EKS cluster ... whose support ends ...`) | before the date, in a maintenance window, upgrade it yourself: the control plane first (`aws eks update-cluster-version`), then nodes and add-ons (HyperPod nodes with `update-cluster-software`); after the date AWS upgrades the control plane without notice, and that upgrade cannot be rolled back | §5.0.5 |
 | Reinstall while keeping the CPU/GPU EKS | `gpu-fault-admin uninstall --state-dir ... --cpu-cluster keep --confirm UNINSTALL_GPU_FAULT` followed by a fresh `deploy`; keep preserves Aurora by default (historical incidents/workflows are not lost), and only an explicit `--reset-database` wipes the database | §3 |
@@ -203,6 +204,18 @@ nor does it change `NodeRecovery=None` or the provider replace prohibition.
   (`<state-dir>/warm-spares/`): the spare label is removed, the pre-declaration scheduling state is restored, and it is recorded in the uninstall journal's
   `released_warm_spares`; a spare reserved by an incident, ALLOCATED or under isolation makes the uninstall fail closed; a spare
   the cluster no longer has is released record-only once proven departed (as `config spare --release`), and fails closed otherwise.
+- The CPU control plane's rolling update (§5.0.5) is undone first, before the Kubernetes cleanup.
+  - A `ScheduledUpdateConfig` that the deploy changed on a CPU instance group goes back to its recorded pre-install state,
+    journaled as `cpu_rolling_update_restore`. The restore is refused while an AMI update is in flight: the uninstall
+    then stops before it deletes anything, so rerun it after the update. With `--cpu-cluster delete` the restore is
+    skipped.
+  - The two rollback alarms are deleted later with the other AWS resources: `cloudwatch_alarm` registry rows, ownership
+    proven by the site tag, and the residue gate reads them back gone.
+  - A CPU group that still names those alarms is left alone; this happens when the deploy found the group rolling and
+    recorded nothing. Uninstall prints one `gpu-fault-admin uninstall: the CPU instance group ... still names the
+    rollback alarms ...` line with the `hyperpod-scheduled-update` command that removes that schedule.
+  - AWS does not document what a scheduled update does when a listed alarm does not exist. A reinstall re-creates the
+    alarms under the same names; what a window does between the uninstall and the reinstall is unverified.
 - `--cpu-cluster keep` is a **reinstall**: it keeps the CPU EKS/HyperPod and also keeps the solution-specific Aurora
   (the site's incident/workflow/registry records; the isolation taints on GPU nodes are keyed by the incident ids
   inside it). The next `deploy` takes over this existing Aurora (CPU-2), and records are not lost. Only an explicit
@@ -1453,10 +1466,14 @@ Semantics and boundaries of `eks-managed`:
   `autoscaling:DescribeAutoScalingGroups` (the automatic-node-update advisory of §5.0.5; denied, it records `unknown`),
   and `status --full`/deploy preflight also read `eks:ListNodegroups`/`eks:DescribeNodegroup` on the CPU EKS cluster (the
   CPU control-plane cluster's managed node groups, advisory as well) and `eks:DescribeCluster`/`eks:DescribeClusterVersions`
-  for every site EKS cluster (the EKS end-of-support advisory of §5.0.5), and `cloudwatch:DescribeAlarms` with
-  `elasticloadbalancing:DescribeLoadBalancers`/`elasticloadbalancing:DescribeTargetGroups` (whether the rollback alarms
-  of a rolling CPU schedule can trip, §5.0.5; `hyperpod-scheduled-update --rolling` reads them as well) -- none of these
-  is granted to the Executor or control-plane roles.
+  for every site EKS cluster (the EKS end-of-support advisory of §5.0.5), and `cloudwatch:DescribeAlarms` (on `*`: the
+  read asks for composite alarms too) with `elasticloadbalancing:DescribeLoadBalancers`/`elasticloadbalancing:DescribeTargetGroups`
+  (the `cpu_rolling_update` check of §5.0.5; `hyperpod-scheduled-update --rolling` reads them as well). The identity
+  running `deploy`/`config`/`cpu-rolling-update` also writes the CPU rollback alarms and the CPU schedule
+  (`cloudwatch:PutMetricAlarm`, `cloudwatch:TagResource`, `cloudwatch:ListTagsForResource`,
+  `cloudwatch:GetMetricStatistics`, `elasticloadbalancing:DescribeTargetHealth`, and `sagemaker:DescribeCluster` and
+  `sagemaker:UpdateCluster` on the CPU HyperPod cluster ARN, §5.0.5), and `uninstall` deletes the alarms
+  (`cloudwatch:DeleteAlarms`). None of these is granted to the Executor or control-plane roles.
 - The Runtime Profile applies per cluster: the site profile (`spec.runtimeProfile`) is every GPU cluster's default
   pin; `hyperpod-v1` names the HyperPod adapter as nodeReboot owner, `eks-v1` the EKS adapter. A cluster whose
   provider the site profile cannot reboot gets **its own** profile (`spec.clusters[].runtimeProfile`:
@@ -2969,7 +2986,7 @@ mechanism below -- it changes no check verdict, no `healthy` and no exit code, a
 | Where | Recorded and announced |
 |---|---|
 | `join-cluster`/`deploy` discovery | once the node scope is resolved, one `gpu-fault-admin: advisory: ...` stderr line per finding: the `ScheduledUpdateConfig`/`AutoPatchConfig` of the selected HyperPod instance groups (read off the `describe-cluster` discovery already makes); a `MaxInstanceLifetime` on the Auto Scaling group of a selected eks-managed node group (one read-only `autoscaling describe-auto-scaling-groups`). There is no kube context yet, so Karpenter NodePools are read by the two below. When `deploy` (and `site-id`, `prepare-eks-nodegroup`) discovers the CPU cluster, it prints the same advisory for every instance group of the CPU control-plane HyperPod cluster, read off the `describe-cluster` discovery already makes -- no new read |
-| the `regional_contexts` check of `status --full` and deploy preflight | `details.providers.<cluster_id>.automatic_node_updates`: HyperPod `instance_groups[]` for the groups the cluster's recorded selector covers (`name`, `scheduled_update` = the cron expression or `null`, `auto_patch` = the patching strategy or `null`, `gpu_cluster_arn`), with no new read; eks-managed `node_groups[].auto_scaling_groups[]` for the node groups hosting GPU nodes (`name`, `max_instance_lifetime` in seconds or `null`, `capacity_rebalance`) and `karpenter` (`state` `read`/`absent` (no Karpenter CRD)/`unknown`; `nodepools[]`: `expire_after`, `budgets`, `zero_budget` of the NodePools whose template labels carry this site's ownership label). The CPU control-plane cluster is recorded under `details.control_plane.automatic_node_updates`: every instance group of its HyperPod cluster as `instance_groups[]` (plus `instances` = `CurrentCount` and `rolling_batch` = the scheduled update's rolling batch -- `type`, `value`, `wait_seconds`, `rollback_batch`, `rollback_alarms` -- or `null`; `cpu_eks_arn`), read off the same `describe-cluster` that binds the CPU cluster; `eks_node_groups`: the CPU EKS cluster's managed node groups with their Auto Scaling groups (`state` `read`/`unknown`); and, when a group's schedule names rollback alarms, `rollback_alarms`: each alarm as `cloudwatch describe-alarms` reads it (`found`, `kind`, `state`, what it watches, `problems`) and `api_nlb`, the API NLB it should watch (`state` `read`/`unknown`). The `status --full` header gains one `advisory: ...` line per finding, the control plane's first; the check still passes |
+| the `regional_contexts` check of `status --full` and deploy preflight | `details.providers.<cluster_id>.automatic_node_updates`: HyperPod `instance_groups[]` for the groups the cluster's recorded selector covers (`name`, `scheduled_update` = the cron expression or `null`, `auto_patch` = the patching strategy or `null`, `gpu_cluster_arn`), with no new read; eks-managed `node_groups[].auto_scaling_groups[]` for the node groups hosting GPU nodes (`name`, `max_instance_lifetime` in seconds or `null`, `capacity_rebalance`) and `karpenter` (`state` `read`/`absent` (no Karpenter CRD)/`unknown`; `nodepools[]`: `expire_after`, `budgets`, `zero_budget` of the NodePools whose template labels carry this site's ownership label). The CPU control-plane cluster is recorded under `details.control_plane.automatic_node_updates`: every instance group of its HyperPod cluster as `instance_groups[]` (plus `instances` = `CurrentCount` and `rolling_batch` = the scheduled update's rolling batch -- `type`, `value`, `wait_seconds`, `rollback_batch`, `rollback_alarms` -- or `null`; `cpu_eks_arn`), read off the same `describe-cluster` that binds the CPU cluster; `eks_node_groups`: the CPU EKS cluster's managed node groups with their Auto Scaling groups (`state` `read`/`unknown`). Whether a rolling group's rollback alarms can trip is not this block's: the `cpu_rolling_update` check of `status --full` judges it (below). The `status --full` header gains one `advisory: ...` line per finding, the control plane's first; the check still passes |
 | `gpu-fault-admin node-scope` | the same `automatic_node_updates` block in each cluster's report and one `advisory:` stderr line per finding after the summary; `convergence` and the exit code are unchanged |
 
 A failed read -- most often an operator identity without `autoscaling:DescribeAutoScalingGroups`, or a refused NodePool
@@ -3101,9 +3118,12 @@ The product announces, it changes no check verdict, and it grades what one windo
   prints `gpu-fault-admin: advisory: HyperPod instance group <group> of the CPU control-plane cluster <name> has
   ScheduledUpdateConfig cron(0 8 ? * SUN *) with no rolling DeploymentConfig: observed (2026-11-01) to re-image all 3
   instances of the group at once -- every node the control plane runs on, so the whole control plane (api-ha,
-  control-worker) is down for minutes each time; gpu-fault-admin hyperpod-scheduled-update --state-dir <state dir>
-  --gpu-cluster-arn <CPU EKS ARN> --instance-group <group> --rolling --rollback-alarm <alarm> prints the update-cluster
-  commands (delete the schedule, then create it again) that make it roll one instance at a time, rolled back on that alarm
+  control-worker) is down for minutes each time; with spec.cpuControlPlane.rollingUpdate mode rolling (the default) the
+  deploy's last step makes it roll one instance at a time, rolled back on the product's two alarms, and gpu-fault-admin
+  cpu-rolling-update --state-dir <state dir> runs that step now; by hand, gpu-fault-admin hyperpod-scheduled-update
+  --state-dir <state dir> --gpu-cluster-arn <CPU EKS ARN> --instance-group <group> --rolling --rollback-alarm <alarm>
+  prints the update-cluster commands (delete the schedule, then create it again) that make it roll one instance at a
+  time, rolled back on that alarm
   (without --rolling, the one that removes it: then update the group by hand in a maintenance window, one instance at a
   time) (administrator-operations §5.0.5)`; when another instance group or managed node group holds CPU nodes too, the line
   names only the control-plane Pods on that group.
@@ -3115,18 +3135,9 @@ The product announces, it changes no check verdict, and it grades what one windo
   (when present) are down while their node is updated, so a Pod created meanwhile waits for Kueue's webhook (the
   `replica failure:` line, below).
 - `AutoPatchConfig` is announced as well (with the command that removes it).
-- A rolling schedule's rollback alarms (`status --full` and deploy preflight read them; discovery prints only their names):
-  an alarm that does not exist, is `INSUFFICIENT_DATA`, is in `ALARM`, or watches anything but the current API NLB's target
-  group gets a line of its own, for example `advisory: rollback alarm gpu-fault-cpu-roll-api-capacity of HyperPod instance
-  group <group> of the CPU control-plane cluster <name> is INSUFFICIENT_DATA: with no data it cannot go to ALARM, so it
-  rolls nothing back (...); and it watches AWS/NetworkELB HealthyHostCount (TargetGroup=<old target group>,
-  LoadBalancer=<old NLB>), not the current API NLB <NLB> (target group <target group>): after a fresh install the NLB is
-  new and an alarm on the old one has no data -- rollback protection is off; gpu-fault-admin hyperpod-scheduled-update
-  --state-dir <state dir> --gpu-cluster-arn <CPU EKS ARN> --instance-group <group> --rolling --wait-interval-seconds 1800
-  --rollback-alarm ... prints the aws cloudwatch put-metric-alarm commands that point the same alarm names at the current
-  API NLB (the schedule then needs no change) (administrator-operations §5.0.5)`; a read that fails is announced too
-  (`could not read rollback alarm(s) ...`, `could not read the API NLB ...`): protection that is silently off is the
-  finding. The check verdict is unchanged.
+- A rolling schedule's rollback alarms: the advisory line names them. Whether they can roll an update back -- they
+  exist, are `OK` and watch the current API NLB's target group -- is judged by the `cpu_rolling_update` check of
+  `status --full` (below), which fails with the finding and the remedy.
 - Reads: `deploy` (and `site-id`, `prepare-eks-nodegroup`) prints the lines from the `describe-cluster` its discovery of the
   CPU cluster already made, with no new read; the `regional_contexts` check of `status --full` and deploy preflight records
   `details.control_plane.automatic_node_updates` (the table above), and the `status --full` header puts these lines ahead of
@@ -3134,8 +3145,187 @@ The product announces, it changes no check verdict, and it grades what one windo
   `list-nodegroups`, a `describe-nodegroup` per group, one `describe-auto-scaling-groups`); a set `MaxInstanceLifetime` is
   announced, a failed read records `state: unknown`. Karpenter NodePools on the CPU cluster are not read.
 
-Remedy (in a maintenance window, never while `config`/`deploy` runs): preferably keep the weekly schedule and make it roll one
-instance at a time:
+**The deploy keeps the CPU control plane rolling (`spec.cpuControlPlane`).** The decision is part of `admin-config.yaml`.
+The first `deploy` imports it (`--config`; without one, the release defaults). Change it later with `gpu-fault-admin config
+--state-dir <state dir> --file <admin-config.yaml>`, as you change the Aurora window:
+
+```yaml
+spec:
+  cpuControlPlane:
+    rollingUpdate:
+      mode: rolling              # rolling (the default) | unchanged
+      waitIntervalSeconds: 1800  # 900..3600
+    rollbackAlarms:              # the defaults; two sites in one account and Region need names of their own
+      capacity: gpu-fault-cpu-roll-api-capacity
+      notRestored: gpu-fault-cpu-roll-api-not-restored
+```
+
+- The section belongs to the deploy host: no role payload carries it, so a change rolls no Pod. For such a change
+  `config` prints `affected_roles: []`, `affected_resources: ["cpu_control_plane"]` and, under `cpu_rolling_update`,
+  what the step did.
+- At its defaults the section is left out of `desired.json`, so an existing site's config digest does not change and
+  the site runs `rolling`.
+- `waitIntervalSeconds` below 900 is refused: the not-restored alarm needs 10 minutes inside the wait and 5 more before
+  the next batch. UpdateCluster itself takes 0-3600.
+
+The deploy applies the setting in its last step. That step is the engine mode `cpu-rolling-update`. It runs after
+`commit` and before the installation registry is recorded, on every release, a verified NOOP included:
+
+1. The alarms.
+   - The step reads the API NLB (`elbv2 describe-load-balancers --names <spec.nlb.name>`, `describe-target-groups`)
+     and needs exactly one target group.
+   - It waits, at most 600 s, until every api-ha replica (N = 3) is a `healthy` target (`describe-target-health`).
+     Then it waits for one whole minute in which `HealthyHostCount` Maximum is N (`cloudwatch get-metric-statistics`,
+     60 s period). So the alarms start on data that is already OK (PutMetricAlarm, below).
+   - Then it handles each alarm of the pair, read with `describe-alarms` (metric and composite alarms):
+     - A missing alarm is created with the tag `gpu-fault:site-id=<site id>`.
+     - An alarm that differs from its definition is re-pointed or redefined with `put-metric-alarm`; the update keeps
+       its state.
+     - An alarm that already matches is not put again.
+   - An existing alarm of that name is this site's when it carries the site tag. Untagged, but watching this site's
+     NLB (the hand-made live pair), it is adopted with `tag-resource`, because `put-metric-alarm` ignores tags on an
+     update.
+   - The step refuses an alarm with another site's tag, an untagged alarm on another load balancer, and a composite
+     alarm of that name. Then it touches neither the pair nor the schedule, and the warning names
+     `spec.cpuControlPlane.rollbackAlarms`.
+   - The definitions are the pair under "Which alarm" (below). N is the rendered api-ha replica count; fewer than 2
+     replicas defines no alarm.
+     - Capacity: Maximum < N-1 for 5 of 5 minutes.
+     - Not restored: Maximum < N for 25 of 25 minutes: the wait minus 5 minutes, at most 25.
+   - Last, it waits, at most 600 s, until both alarms are `OK`.
+2. The schedule, with `mode: rolling`. The step handles every instance group of the CPU HyperPod cluster and keeps
+   the group's own `ScheduleExpression`: the product changes how the nodes update, never when.
+   - A group without `ScheduledUpdateConfig` is left alone (`no-schedule`): the product never adds a schedule.
+   - A group that already rolls this way is `noop`: one instance at a time, back as forward, `WaitIntervalInSeconds`
+     equal to `waitIntervalSeconds`, and the two alarms as its `AutoRollbackConfiguration`.
+   - Otherwise the step is `deferred`, with nothing written, in any of these cases:
+     - an AMI update is in flight (`SoftwareUpdateStatus` `Pending`/`InProgress`/`RollbackInProgress`, or the group
+       or the cluster `Updating`/`SystemUpdating`);
+     - a write would be refused (the ownership-release refusals of §5.0.0);
+     - the next window starts within 3 hours, or the cron cannot be placed in time.
+   - Otherwise the step records the group's current `ScheduledUpdateConfig` as the pre-install state, in its journal
+     and in the installation ledger. Then it runs the four steps proven live on 2026-11-02 (below), each read-back
+     waiting at most 900 s:
+     1. delete;
+     2. read back until the group is `InService` without a schedule;
+     3. create the rolling definition;
+     4. read back until the group carries exactly that definition.
+   - A create that fails after the delete is retried once. If it fails again, the outcome is `failed` and the warning
+     reads `the CPU instance group <group> of <cluster> now has NO ScheduledUpdateConfig -- no automatic patching. That
+     is safe, but it must be fixed: the create failed twice (<error>). Run, in a maintenance window: aws sagemaker
+     update-cluster ... -- or re-run the deploy, which creates it from the journal`.
+   - The journal marks a group whose schedule the step removed until the create is read back. The next run creates
+     the schedule again from the record. A schedule removed by somebody else is left alone.
+3. With `mode: unchanged`, a group the step changed goes back to its recorded pre-install `ScheduledUpdateConfig`.
+   - The restore uses the same delete, read back, create and read back, and is refused the same way while an AMI update
+     is in flight.
+   - Switching `rolling` to `unchanged` with `gpu-fault-admin config` runs this restore.
+   - Any other group is left as found.
+   - The step keeps the alarms in both modes, because a schedule of the customer's may name them.
+
+The step never fails the release. Its output and records:
+
+- one summary line: `release-deploy: CPU rolling update (<mode>): <group> <outcome>. Change it with
+  spec.cpuControlPlane.rollingUpdate (mode rolling | unchanged, waitIntervalSeconds) in admin-config.yaml and
+  gpu-fault-admin config --state-dir <state dir> (administrator-operations §5.0.5)`;
+- one `release-deploy: warning: CPU rolling update: ...` line per problem;
+- `status` (`DONE`, `DEFERRED` or `FAILED`), recorded as `cpu_rolling_update` in the deploy's completion record;
+- its journal, `<state dir>/cpu-rolling-update/state.json`, with `last-run.json` beside it.
+
+To run a deferred or failed step again without a whole deploy:
+
+```bash
+gpu-fault-admin cpu-rolling-update --state-dir /secure/gpu-fault
+```
+
+The verb runs the same step under the site operation lock, and exits 0 when the step is `DONE` and 1 otherwise.
+
+The live site's group has rolled this way on the hand-made pair since 2026-11-02. The first deploy with this release
+adopts and tags the two alarms and re-points them only where they differ. The schedule is a `noop`, so no pre-install
+state is recorded.
+
+`status --full` judges all this in the `cpu_rolling_update` check:
+
+- With `mode: rolling` the check passes only when all of these hold:
+  - every scheduled CPU group rolls (a batch smaller than the group);
+  - its `AutoRollbackConfiguration` names both alarms;
+  - both alarms exist, are `OK` and watch the current API NLB and its target group;
+  - the journal holds no `deferred` or `failed` step, and no step that stopped between its delete and its create.
+- With `mode: unchanged` the check judges only the alarms that a schedule still names.
+- Anything else fails with the finding and the remedy: `re-run gpu-fault-admin deploy, or gpu-fault-admin
+  cpu-rolling-update --state-dir <state dir> (the deploy's same last step); gpu-fault-admin hyperpod-scheduled-update
+  --rolling --rollback-alarm ... prints the same requests for a manual change (administrator-operations §5.0.5)`.
+- An alarm in `INSUFFICIENT_DATA` or `ALARM` whose configuration changed within the last 10 minutes is reported as
+  `PENDING: ...` (a WARN), not as a failure.
+- The check is not part of the deploy's own `verify` gate, which runs before the step.
+
+The deploy preflight's `cpu_update_window` check guards the deploy itself:
+
+- It refuses to start a deploy while a CPU instance group has an AMI update in flight: `the deploy refuses to start
+  while the control plane is being re-imaged -- rerun once SoftwareUpdateStatus is Succeeded or RollbackComplete and
+  the group is InService`.
+- It warns, with the times, when the deploy may overlap the group's next scheduled window. It counts a deploy as up
+  to 120 minutes and a window as about `instances x (10 min re-image + wait)`; for the live group that is
+  `2026-11-08T08:00:00+00:00 - about 2026-11-08T10:00:00+00:00`.
+- It reads the cron in UTC with the rules of the HyperPod guide. The guide's numeric day-of-week counts from Monday in
+  its examples and from Sunday in its `#` text, so the check reads it both ways: a window is never placed later than
+  the real one.
+
+Uninstall (§3) handles both before it deletes anything else:
+
+- It restores each recorded pre-install `ScheduledUpdateConfig` (the ledger's `cpu_hyperpod` row, else the journal)
+  with the same delete, read back, create and read back. The restore is journaled as `cpu_rolling_update_restore` in
+  the uninstall state.
+- The restore is refused while an AMI update is in flight, and the uninstall then stops before any deletion. It is
+  skipped when the CPU cluster is deleted with the site.
+- Then uninstall deletes the alarms it recorded (`cloudwatch_alarm` ledger rows). The site tag proves ownership, then
+  `delete-alarms`; the residue gate reads `describe-alarms` until they are gone (DeleteAlarms, below).
+- When a CPU group still names the alarms, uninstall leaves the schedule alone and prints `gpu-fault-admin uninstall:
+  the CPU instance group <group> still names the rollback alarms ... AWS does not document what a scheduled update
+  does when a listed alarm does not exist; a reinstall re-creates the alarms under the same names. To remove the
+  schedule: gpu-fault-admin hyperpod-scheduled-update --state-dir <state dir> --gpu-cluster-arn <CPU EKS ARN>
+  --instance-group <group> ...`. On the live site this applies, because the deploy found the group rolling and
+  recorded nothing.
+- Between such an uninstall and the next deploy, the schedule names alarms that do not exist. What a window does then
+  is unverified (validation-limitations, batch 240).
+
+The permissions are in the security reference, §2.0. Evidence (read 2026-11-02):
+
+- AWS, Amazon CloudWatch API Reference, PutMetricAlarm, the operation description; Request Parameters, Tags
+  (https://docs.aws.amazon.com/AmazonCloudWatch/latest/APIReference/API_PutMetricAlarm.html, Last-Modified 2026-10-30):
+  "When this operation creates an alarm, the alarm state is immediately set to `INSUFFICIENT_DATA`. For PromQL alarms,
+  the alarm state is instead immediately set to `OK`. The alarm is then evaluated and its state is set appropriately.
+  Any actions associated with the new state are then executed.", "When you update an existing alarm, its state is left
+  unchanged, but the update completely overwrites the previous configuration of the alarm.", "If you are using this
+  operation to update an existing alarm, any tags you specify in this parameter are ignored. To change the tags of an
+  existing alarm, use TagResource or UntagResource." and "To use this field to set tags for an alarm when you create
+  it, you must be signed on with both the cloudwatch:PutMetricAlarm and cloudwatch:TagResource permissions."
+- AWS, Amazon SageMaker API Reference, API version 2017-07-24, ClusterInstanceGroupDetails, Contents, SoftwareUpdateStatus
+  and Status (https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_ClusterInstanceGroupDetails.html,
+  Last-Modified 2026-10-30): "Status of the last software udpate request. Status transitions follow these possible
+  sequences: Pending -> InProgress -> Succeeded Pending -> InProgress -> RollbackInProgress -> RollbackComplete Pending ->
+  InProgress -> RollbackInProgress -> Failed" (the typo is AWS's) and "Valid Values: `InService | Creating | Updating |
+  Failed | Degraded | SystemUpdating | Deleting`".
+- AWS, Amazon SageMaker Developer Guide, Update your AMI version in your SageMaker HyperPod cluster, Cron expressions
+  (https://docs.aws.amazon.com/sagemaker/latest/dg/sagemaker-hyperpod-release-ami-update.html, Last-Modified 2026-10-31):
+  "Cron expressions support six fields and are separated by white space. All six fields are required.", "The following
+  example creates a schedule that runs at 12:00pm on every Monday regardless of day-of-month. `cron(00 12 ? * 1 *)`",
+  "For example, 3#2 would be the second Tuesday of the month: the 3 refers to Tuesday because it is the third day of
+  each week, and the 2 refers to the second day of that type within the month." and "For example, 5L means the last
+  Friday of the month."
+- AWS, Amazon CloudWatch API Reference, DescribeAlarms, the operation description
+  (https://docs.aws.amazon.com/AmazonCloudWatch/latest/APIReference/API_DescribeAlarms.html, Last-Modified 2026-10-30):
+  "To use this operation and return information about composite alarms, you must be signed on with the
+  cloudwatch:DescribeAlarms permission that is scoped to *. You can't return information about composite alarms if your
+  cloudwatch:DescribeAlarms permission has a narrower scope."
+- AWS, Amazon CloudWatch API Reference, DeleteAlarms, the operation description
+  (https://docs.aws.amazon.com/AmazonCloudWatch/latest/APIReference/API_DeleteAlarms.html, Last-Modified 2026-10-30): "If
+  you specify any incorrect alarm names, the alarms you specify with correct names are still deleted. Other syntax
+  errors might result in no alarms being deleted. To confirm that alarms were deleted successfully, you can use the
+  DescribeAlarms operation after using DeleteAlarms."
+
+By hand -- with `mode: unchanged`, or with alarms of your own -- keep the weekly schedule and make it roll one instance at a
+time, in a maintenance window and never while `config`/`deploy` runs:
 
 ```bash
 gpu-fault-admin hyperpod-scheduled-update --state-dir /secure/gpu-fault \
@@ -3190,7 +3380,8 @@ under `logs/readonly/`): a rerun of the verb reports the group `none`, because t
 `update_cluster.execution_role` prints, never runs, an `aws iam simulate-principal-policy` check of the group's execution
 role (expect `allowed`): AWS requires `cloudwatch:DescribeAlarms` on it for automatic rollbacks.
 
-The rollback alarms are read, never written. The verb reads every named alarm (`aws cloudwatch describe-alarms --alarm-names
+The verb reads the rollback alarms and never writes them (the deploy's last step keeps the product's pair, above). It reads
+every named alarm (`aws cloudwatch describe-alarms --alarm-names
 ... --alarm-types MetricAlarm CompositeAlarm`: without the types the read returns metric alarms only) and shows each one's
 metric, statistic, threshold, window, dimensions and state (`rollback_alarms.alarms`, one stderr line each). A named alarm
 that does not exist, or an alarm read that fails, refuses the plan (exit 2, `rollback_alarms.refusal`): an
@@ -3222,10 +3413,10 @@ control-plane signal that saw the 2026-11-01 08:00Z all-at-once re-image: Minimu
 full outage shorter than 5 minutes does not trip the capacity alarm (on 2026-11-01 the Maximum was 0 for 2 minutes): it is
 for a lasting loss during a roll, and the batch of 1 is what keeps a window from taking every node at once.
 `HealthyHostCount` is reported only while targets are registered; with `TreatMissingData` `missing` a minute without
-registered targets does not count as breaching. The product creates no CloudWatch alarm: the operator runs the printed
-`put-metric-alarm` commands. After a fresh install the API NLB is new and alarms on the old one have no data
-(`INSUFFICIENT_DATA`) -- `status --full` and the verb say so; re-run the printed commands: the same names on the new NLB,
-so the schedule needs no change.
+registered targets does not count as breaching. The deploy creates and keeps this pair itself (above). After a fresh
+install the API NLB is new, and alarms on the old one have no data (`INSUFFICIENT_DATA`). The deploy's last step re-points
+the same names at the new NLB, so the schedule needs no change. The verb's printed `put-metric-alarm` commands are the same
+requests, for a manual change.
 
 Evidence (read 2026-11-02; the API reference pages print no date, so their HTTP Last-Modified is given):
 
@@ -3374,9 +3565,17 @@ above).
 `autoscaling:DescribeAutoScalingGroups`, and list on `nodepools.karpenter.sh` in the GPU cluster; the CPU control-plane
 cluster's managed node groups also need `eks:ListNodegroups` and `eks:DescribeNodegroup` on the CPU EKS cluster (denied:
 `unknown`), and the EKS end-of-support advisory `eks:DescribeCluster` on every site EKS cluster and
-`eks:DescribeClusterVersions` (denied: a `could not read` line); the rollback alarms of a rolling CPU schedule
-`cloudwatch:DescribeAlarms` with `elasticloadbalancing:DescribeLoadBalancers` and `elasticloadbalancing:DescribeTargetGroups`
-(denied: a `could not read` line in `status`; for `hyperpod-scheduled-update --rolling` an unreadable alarm refuses the plan).
+`eks:DescribeClusterVersions` (denied: a `could not read` line). The rollback alarms of a rolling CPU schedule need
+`cloudwatch:DescribeAlarms` (on `*`, DescribeAlarms above) with `elasticloadbalancing:DescribeLoadBalancers` and
+`elasticloadbalancing:DescribeTargetGroups`. Denied, the `cpu_rolling_update` check of `status --full` fails with the AWS
+message, and for `hyperpod-scheduled-update --rolling` an unreadable alarm refuses the plan.
+
+The deploy's last step (and `config`, `cpu-rolling-update`) also writes them and the CPU schedule. For that it needs
+`cloudwatch:PutMetricAlarm`, `cloudwatch:TagResource`, `cloudwatch:ListTagsForResource`, `cloudwatch:GetMetricStatistics`,
+`elasticloadbalancing:DescribeTargetHealth`, and `sagemaker:DescribeCluster` and `sagemaker:UpdateCluster` on the CPU
+HyperPod cluster ARN; `uninstall` needs `cloudwatch:DeleteAlarms`. Denied, the step records `FAILED`/`DEFERRED` and the
+release stands.
+
 Running the printed commands also needs `sagemaker:UpdateCluster`, `sagemaker:UpdateClusterSoftware`,
 `cloudwatch:PutMetricAlarm` (the suggested alarms), `iam:SimulatePrincipalPolicy` (the execution-role check) or
 `autoscaling:UpdateAutoScalingGroup`. No runtime role is granted any of them. The HyperPod instance group's own execution

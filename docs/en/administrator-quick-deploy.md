@@ -54,7 +54,10 @@ The release provides `config/admin-config.example.yaml`; in the deploy-host venv
 `deploy --config <0600-admin-config.yaml>`; when not passed, the release defaults are persisted and `<state-dir>/admin-config.yaml` generated.
 On an existing site edit that file and run
 `gpu-fault-admin config --state-dir ... --reference ...`; the complete commands are in
-[Administrator Capacity Configuration](administrator-capacity-configuration.md).
+[Administrator Capacity Configuration](administrator-capacity-configuration.md). The same file decides how the CPU control
+plane's HyperPod group is updated: `spec.cpuControlPlane`, `mode: rolling` by default. The deploy's last step applies it
+once every api-ha replica is healthy: it creates the two rollback alarms, waits until they are `OK`, then makes the group's
+own schedule roll one instance at a time (Administrator Operations §5.0.5).
 
 | Internal phase | Meaning |
 |---|---|

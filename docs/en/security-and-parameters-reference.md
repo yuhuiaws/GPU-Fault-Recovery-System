@@ -79,13 +79,29 @@ records `unknown` and the command completes. The same advisory for the CPU contr
 `eks:ListNodegroups`/`eks:DescribeNodegroup` on the CPU EKS cluster (`status --full` and deploy preflight), again the
 operator identity's alone and recorded `unknown` when denied. The EKS end-of-support advisory (same section) reads
 `eks:DescribeCluster` on every site EKS cluster and `eks:DescribeClusterVersions`, the operator identity's alone as well;
-denied, the header says `could not read` and the check verdict is unchanged. The rollback alarms of a rolling CPU
-control-plane schedule (same section) are read with `cloudwatch:DescribeAlarms`, and the API NLB they should watch with
-`elasticloadbalancing:DescribeLoadBalancers`/`elasticloadbalancing:DescribeTargetGroups` (`status --full`, deploy preflight
-and `hyperpod-scheduled-update --rolling`), the operator identity's alone; denied, the header says `could not read` and the
-helper refuses its plan. The HyperPod instance group's execution role -- the customer's, not a product role -- needs
-`cloudwatch:DescribeAlarms` for SageMaker's automatic rollback; the helper prints the read-only
-`iam simulate-principal-policy` that checks it.
+denied, the header says `could not read` and the check verdict is unchanged.
+
+The rollback alarms of a rolling CPU control-plane schedule (same section):
+
+- Reading them takes `cloudwatch:DescribeAlarms`, scoped to `*` because the read asks for composite alarms too.
+  Reading the API NLB they should watch takes `elasticloadbalancing:DescribeLoadBalancers` and
+  `elasticloadbalancing:DescribeTargetGroups`. These reads serve the `cpu_rolling_update` check of `status --full` and
+  `hyperpod-scheduled-update --rolling`. Denied, the check fails with the AWS message and the helper refuses its plan.
+- The deploy's last step, `gpu-fault-admin config` and `gpu-fault-admin cpu-rolling-update` keep the alarms and the CPU
+  group's schedule (batch 240) with these permissions:
+  - `cloudwatch:PutMetricAlarm` and `cloudwatch:TagResource`: PutMetricAlarm tags an alarm on create only with both;
+  - `cloudwatch:ListTagsForResource`, the site-tag ownership proof;
+  - `cloudwatch:GetMetricStatistics` and `elasticloadbalancing:DescribeTargetHealth`, the full-capacity wait;
+  - `sagemaker:DescribeCluster` and `sagemaker:UpdateCluster` on the CPU HyperPod cluster ARN
+    (`arn:aws:sagemaker:<region>:<account>:cluster/<cluster id>`).
+- The ownership-label release (above) needs `sagemaker:UpdateCluster` on the GPU HyperPod clusters. This step needs it
+  on the CPU HyperPod cluster as well; a policy scoped to the GPU clusters must add the CPU cluster's ARN.
+- Uninstall's restore of the pre-install schedule uses the same SageMaker pair, and `cloudwatch:DeleteAlarms` deletes
+  the alarms.
+- All of these are the operator identity's alone, never an Executor or control-plane role's. Denied, the step records
+  `FAILED` or `DEFERRED` with the AWS message, the release stands, and the `cpu_rolling_update` check names the remedy.
+- The HyperPod instance group's execution role is the customer's, not a product role. It needs `cloudwatch:DescribeAlarms`
+  for SageMaker's automatic rollback; the helper prints the read-only `iam simulate-principal-policy` that checks it.
 
 ### 2.1 Regional Acceptance Fixture Boundaries
 
