@@ -33,9 +33,9 @@ minutes (live 2026-11-01: the CPU group's ``cron(0 8 ? * SUN *)`` took all
 three nodes NotReady at once, the api-ha and control-worker Pods with them,
 and the Pods could not come back until Kueue's Pod webhook answered again);
 the advisory line says so in those words. A rolling schedule's line names its
-rollback batch and alarms, and where ``status --full`` read them, an alarm
-that cannot roll an update back (missing, no data, the wrong load balancer)
-gets a line of its own (``hyperpod_rollback``).
+rollback batch and alarms; whether they can roll an update back (present, OK,
+on the current API NLB) is the ``cpu_rolling_update`` check of ``status
+--full`` (``gpu_fault_release.regional_cpu_rolling_update``).
 
 Nothing here changes a check verdict, ``healthy``, a refusal or an exit code:
 the facts sit next to the ones they extend (the ``regional_contexts`` check of
@@ -60,6 +60,7 @@ __all__ = [
     "ASG_QUERY",
     "CONTROL_PLANE",
     "FIELD",
+    "DEPLOY_STEP",
     "HELPER_VERB",
     "HYPERPOD_UPDATE_EVIDENCE",
     "KARPENTER_NODEPOOLS",
@@ -87,6 +88,13 @@ UNKNOWN = "unknown"
 #: The read-only verb that prints the command disabling a HyperPod schedule.
 HELPER_VERB = "hyperpod-scheduled-update"
 SECTION = "administrator-operations §5.0.5"
+#: What fixes an all-at-once CPU schedule without a hand-made request (batch 240).
+DEPLOY_STEP = (
+    "with spec.cpuControlPlane.rollingUpdate mode rolling (the default) the "
+    "deploy's last step makes it roll one instance at a time, rolled back on the "
+    "product's two alarms, and gpu-fault-admin cpu-rolling-update --state-dir "
+    "<state dir> runs that step now"
+)
 #: What an update of the HyperPod platform software does to the nodes it
 #: updates -- a ``ScheduledUpdateConfig`` applies the same update on its cron:
 #: AWS, "Updating the SageMaker HyperPod platform software", the Important box.
@@ -606,64 +614,14 @@ def _control_plane_window(group: Mapping[str, Any], *, whole: bool) -> tuple[str
     )
 
 
-def _alarm_lines(
-    block: Mapping[str, Any], group: Mapping[str, Any], *, where: str, command: str
-) -> list[str]:
-    """The lines of ``group``'s rollback alarms that cannot roll an update
-    back, from the read ``status --full``/preflight recorded under
-    ``rollback_alarms`` (``hyperpod_rollback.read_rollback_alarms``); discovery
-    reads none and prints none. A failed read is announced: protection that
-    is silently off is the finding."""
-
-    batch = _mapping(group.get("rolling_batch"))
-    names = [str(item) for item in batch.get("rollback_alarms") or ()]
-    facts = block.get("rollback_alarms")
-    if not names or not isinstance(facts, Mapping):
-        return []
-    owner = f"of HyperPod instance group {group.get('name')} of {where}"
-    if facts.get("state") == UNKNOWN:
-        return [
-            f"advisory: could not read rollback alarm(s) {', '.join(names)} {owner} "
-            f"({facts.get('error')}): whether they can roll a scheduled update back "
-            f"is unknown; the operator identity needs cloudwatch:DescribeAlarms "
-            f"({SECTION})"
-        ]
-    lines = []
-    nlb = _mapping(facts.get("api_nlb"))
-    if nlb.get("state") == UNKNOWN:
-        lines.append(
-            f"advisory: could not read the API NLB ({nlb.get('error')}): the "
-            f"dimensions of rollback alarm(s) {', '.join(names)} {owner} were not "
-            f"checked ({SECTION})"
-        )
-    records = {str(item.get("name")): item for item in _mappings(facts.get("alarms"))}
-    wait = batch.get("wait_seconds")
-    remedy = (
-        f"{command} --rolling"
-        + (f" --wait-interval-seconds {wait}" if type(wait) is int else "")
-        + "".join(f" --rollback-alarm {item}" for item in names)
-        + " prints the aws cloudwatch put-metric-alarm commands that point the "
-        "same alarm names at the current API NLB (the schedule then needs no "
-        "change)"
-    )
-    for alarm in names:
-        problems = [str(item) for item in records.get(alarm, {}).get("problems") or ()]
-        if problems:
-            lines.append(
-                f"advisory: rollback alarm {alarm} {owner} "
-                + "; and it ".join(problems)
-                + f"; {remedy} ({SECTION})"
-            )
-    return lines
-
-
 def control_plane_lines(block: object) -> list[str]:
     """The advisory lines of the CPU control-plane cluster's block
     (``control_plane_updates``): a scheduled or auto-patched instance group --
-    with what one window does to the control plane, and its rollback alarms
-    when they cannot trip -- and a managed node group's Auto Scaling group with
-    a set ``MaxInstanceLifetime``. ``unknown`` is recorded, never announced,
-    except for the rollback alarms (``_alarm_lines``)."""
+    with what one window does to the control plane, naming a rolling
+    schedule's rollback batch and alarms -- and a managed node group's Auto
+    Scaling group with a set ``MaxInstanceLifetime``. ``unknown`` is recorded,
+    never announced. Whether the alarms can trip is the ``cpu_rolling_update``
+    check's (``status --full``)."""
 
     if not isinstance(block, Mapping):
         return []
@@ -693,16 +651,15 @@ def control_plane_lines(block: object) -> list[str]:
                 + (
                     ""
                     if safe
-                    else f"; {command} --rolling --rollback-alarm <alarm> prints the "
-                    "update-cluster commands (delete the schedule, then create it "
-                    "again) that make it roll one instance at a time, rolled back "
-                    "on that alarm (without --rolling, the one that removes it: "
-                    "then update the group by hand in a maintenance window, one "
-                    "instance at a time)"
+                    else f"; {DEPLOY_STEP}; by hand, {command} --rolling "
+                    "--rollback-alarm <alarm> prints the update-cluster commands "
+                    "(delete the schedule, then create it again) that make it roll "
+                    "one instance at a time, rolled back on that alarm (without "
+                    "--rolling, the one that removes it: then update the group by "
+                    "hand in a maintenance window, one instance at a time)"
                 )
                 + f" ({SECTION})"
             )
-            lines.extend(_alarm_lines(block, group, where=where, command=command))
         if group.get("auto_patch"):
             lines.append(
                 f"advisory: HyperPod instance group {group_name} of {where} has "

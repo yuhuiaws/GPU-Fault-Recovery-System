@@ -22,12 +22,6 @@ from gpu_fault.admin.automatic_node_updates import (
 )
 from gpu_fault.admin.bootstrap_ownership import hyperpod_groups_for_selector
 from gpu_fault.admin.eks_nodegroup_update_strategy import update_strategy
-from gpu_fault.admin.hyperpod_rollback import (
-    api_nlb,
-    describe_alarms_arguments,
-    load_balancer_arn,
-    read_rollback_alarms,
-)
 from gpu_fault.cluster_scope import is_eks_managed, node_selector
 from gpu_fault.eks_node_repair import (
     hosts_gpu_instance_types,
@@ -472,10 +466,10 @@ def control_plane_automatic_updates(
     already made, and ``eks_node_groups``: the managed node groups its EKS
     cluster may also have -- any CPU node hosts control-plane Pods -- with
     their Auto Scaling groups, read the way the GPU path reads them (one
-    ``list-nodegroups``, a describe per group, one Auto Scaling read); and
-    ``rollback_alarms`` when a group's schedule names rollback alarms
-    (``control_plane_rollback_alarms``). Those reads are advisory: a failure
-    records ``state: unknown``.
+    ``list-nodegroups``, a describe per group, one Auto Scaling read). Those
+    reads are advisory: a failure records ``state: unknown``. A rolling
+    group's rollback alarms are judged by the ``cpu_rolling_update`` check
+    (``regional_cpu_rolling_update``).
     """
 
     config = release.config
@@ -526,55 +520,7 @@ def control_plane_automatic_updates(
         }
 
     block["eks_node_groups"] = guarded(node_groups)
-    alarms = sorted(
-        {
-            str(name)
-            for group in block["instance_groups"]
-            for name in (group.get("rolling_batch") or {}).get("rollback_alarms") or ()
-        }
-    )
-    if alarms:
-        block["rollback_alarms"] = guarded(
-            lambda: control_plane_rollback_alarms(release, alarms)
-        )
     return block
-
-
-def control_plane_rollback_alarms(
-    release: RegionalRelease, names: list[str]
-) -> dict[str, Any]:
-    """The CPU groups' rollback alarms (``cloudwatch describe-alarms``) against
-    the API NLB they should watch -- the configured ``nlb.name``, read with
-    ``describe-load-balancers``/``describe-target-groups`` as the NLB check
-    reads it (``hyperpod_rollback.read_rollback_alarms``). Advisory: a failure
-    records ``state: unknown``, which the header announces."""
-
-    config = release.config
-    nlb = dict(getattr(config, "nlb", None) or {})
-    nlb_name = (
-        str(nlb.get("name") or f"gpu-fault-regional-{config.aws_region}") if nlb else ""
-    )
-
-    def read_nlb() -> dict[str, Any]:
-        balancers = aws_json(
-            release, ["elbv2", "describe-load-balancers", "--names", nlb_name]
-        )
-        groups = aws_json(
-            release,
-            [
-                "elbv2",
-                "describe-target-groups",
-                "--load-balancer-arn",
-                load_balancer_arn(balancers),
-            ],
-        )
-        return api_nlb(nlb_name, balancers, groups)
-
-    return read_rollback_alarms(
-        names,
-        read_alarms=lambda wanted: aws_json(release, describe_alarms_arguments(wanted)),
-        read_nlb=read_nlb if nlb_name else None,
-    )
 
 
 def _validate_agent_endpoint_cidrs(

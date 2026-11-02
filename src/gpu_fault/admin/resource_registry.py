@@ -26,6 +26,7 @@ from gpu_fault.admin.resource_records import record as _record
 from gpu_fault.admin.resource_records import (
     release_repository_resources as _release_repository_resources,
 )
+from gpu_fault.admin.resource_registry_cpu_rolling import cpu_rolling_rows
 from gpu_fault.admin.resource_registry_dns import vpc_association_resources
 from gpu_fault.admin.resource_registry_network import network_resources
 from gpu_fault.admin.resource_registry_scripts import (
@@ -895,6 +896,7 @@ def build_installation_snapshot(
             state=state,
         )
     )
+    resources = cpu_rolling_rows(resources, site, region=region, account_id=account_id)
     if existing is not None:
         resources = _keep_recorded_arns(resources, existing)
     snapshot = InstallationResourceSnapshot(site_id=site_id, resources=resources)

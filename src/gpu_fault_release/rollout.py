@@ -28,7 +28,7 @@ from gpu_fault.admin.execution import (
 )
 from gpu_fault.admin.python_environment import python_environment
 from gpu_fault_release import regional_deployment_inventory as inventory
-from gpu_fault_release import repository_root
+from gpu_fault_release import regional_cpu_rolling_update as cpu_roll, repository_root
 from gpu_fault_release.regional_admin_checks import (
     build_health_report,
     build_preflight_report,
@@ -1413,6 +1413,8 @@ def _dispatch_mode(
     elif arguments.mode == "release-summary":
         report = build_release_summary(release)
         print(json.dumps(report, indent=2, sort_keys=True))
+    elif arguments.mode == "cpu-rolling-update":
+        print(json.dumps(cpu_roll.run_step(release), indent=2, sort_keys=True))
     elif arguments.mode == "release-diff":
         report = build_release_diff(release)
         print(json.dumps(report, indent=2, sort_keys=True))

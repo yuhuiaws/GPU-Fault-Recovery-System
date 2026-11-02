@@ -1120,7 +1120,7 @@ def test_release_admin_config_template_matches_defaults() -> None:
     assert config == default_admin_config()
 
 
-def test_release_template_contains_exactly_nineteen_admin_fields() -> None:
+def test_release_template_contains_exactly_twenty_three_admin_fields() -> None:
     document = yaml.safe_load(
         (ROOT / "config/admin-config.example.yaml").read_text(encoding="utf-8")
     )
@@ -1130,7 +1130,14 @@ def test_release_template_contains_exactly_nineteen_admin_fields() -> None:
             return 1
         return sum(leaves(item) for item in value.values())
 
-    assert leaves(document["spec"]) == 19
+    assert leaves(document["spec"]) == 23
+    assert document["spec"]["cpuControlPlane"] == {
+        "rollingUpdate": {"mode": "rolling", "waitIntervalSeconds": 1800},
+        "rollbackAlarms": {
+            "capacity": "gpu-fault-cpu-roll-api-capacity",
+            "notRestored": "gpu-fault-cpu-roll-api-not-restored",
+        },
+    }, "batch 240: the deploy's CPU rolling update, at its defaults"
     assert document["spec"]["aurora"] == {"minAcu": 8, "maxAcu": 32}
     assert document["spec"]["capacity"]["largestClusterNodeCount"] == 512
     assert document["spec"]["capacity"]["managedNodeCount"] == 512

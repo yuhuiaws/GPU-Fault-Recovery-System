@@ -83,6 +83,14 @@ def integer_field(value: object, path: str, *, default: int) -> int:
     return value
 
 
+def text_field(value: object, path: str, *, default: str) -> str:
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise AdminConfigError(f"{path} must be a string")
+    return value
+
+
 def number_field(value: object, path: str, *, default: float) -> float:
     if value is None:
         return default
@@ -229,6 +237,8 @@ def read_section(
             )
         elif isinstance(current, float):
             values[name] = number_field(raw, field_path, default=current)
+        elif isinstance(current, str):
+            values[name] = text_field(raw, field_path, default=current)
         else:
             values[name] = integer_field(raw, field_path, default=current)
     return cast(_SectionT, replace(section, **values))

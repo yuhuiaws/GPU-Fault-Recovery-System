@@ -54,6 +54,7 @@ def parser() -> argparse.ArgumentParser:
             "preflight",
             "release-summary",
             "release-diff",
+            "cpu-rolling-update",
             "status",
             "bootstrap",
             "deploy",

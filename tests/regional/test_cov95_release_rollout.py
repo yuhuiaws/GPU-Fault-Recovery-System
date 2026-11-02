@@ -133,6 +133,11 @@ def driver(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Driver, lis
         "drain_registry_clusters",
         lambda release, cluster_ids: release.record("drain-cluster", list(cluster_ids)),
     )
+    monkeypatch.setattr(
+        rollout.cpu_roll,
+        "run_step",
+        lambda release: release.record("cpu-rolling-update") or {"status": "DONE"},
+    )
     for symbol, name in (
         ("build_release_summary", "release-summary"),
         ("build_release_diff", "release-diff"),
@@ -161,6 +166,7 @@ def driver(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Driver, lis
         "preflight",
         "release-summary",
         "release-diff",
+        "cpu-rolling-update",
         "status",
         "bootstrap",
         "deploy",
@@ -219,6 +225,7 @@ def test_rollout_public_entrypoint_dispatches_exactly_one_selected_mode(
         "preflight",
         "release-summary",
         "release-diff",
+        "cpu-rolling-update",
         "status",
         "verify",
         "stability",

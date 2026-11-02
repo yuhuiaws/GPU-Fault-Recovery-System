@@ -54,6 +54,7 @@ SUPPORTED_RESOURCE_TYPES = frozenset(
         "amp_workspace",
         "aurora_cluster",
         "aurora_instance",
+        "cloudwatch_alarm",
         "cpu_eks",
         "cpu_hyperpod",
         "ec2_route_table",
@@ -92,6 +93,7 @@ SUPPORTED_RESOURCE_TYPES = frozenset(
 )
 
 DELETE_PRIORITY = {
+    "cloudwatch_alarm": 10,
     "route53_record": 10,
     "sns_subscription": 10,
     "sqs_policy_binding": 10,
@@ -372,6 +374,12 @@ class ResourceProbe:
             ):
                 raise BootstrapError("Grafana service account identity is unavailable")
             return any(str(item["id"]) == identifier for item in accounts)
+        if resource_type == "cloudwatch_alarm":
+            # DescribeAlarms answers a missing name with an empty list, not an error.
+            alarms = _json(
+                self._aws("cloudwatch", "describe-alarms", "--alarm-names", identifier)
+            )
+            return bool((alarms or {}).get("MetricAlarms"))
         if resource_type == "sns_topic":
             return self._exists_command(
                 self._aws(
@@ -1110,6 +1118,11 @@ class ResourceDeletion(ResourceProbe):
             _checked(
                 self._aws("sns", "delete-topic", "--topic-arn", arn),
                 not_found=("NotFound", "NotFoundException"),
+            )
+        elif resource_type == "cloudwatch_alarm":
+            _checked(
+                self._aws("cloudwatch", "delete-alarms", "--alarm-names", identifier),
+                not_found=("ResourceNotFound",),
             )
         elif resource_type == "sqs_queue":
             _checked(

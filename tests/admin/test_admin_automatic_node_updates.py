@@ -824,7 +824,12 @@ CPU_COMMAND = (
 )
 CPU_HELPER = CPU_COMMAND + " prints the update-cluster command that removes it"
 CPU_ROLLING = (
-    CPU_COMMAND + " --rolling --rollback-alarm <alarm> prints the update-cluster "
+    "with spec.cpuControlPlane.rollingUpdate mode rolling (the default) the "
+    "deploy's last step makes it roll one instance at a time, rolled back on the "
+    "product's two alarms, and gpu-fault-admin cpu-rolling-update --state-dir "
+    "<state dir> runs that step now; by hand, "
+    + CPU_COMMAND
+    + " --rolling --rollback-alarm <alarm> prints the update-cluster "
     "commands (delete the schedule, then create it again) that make it roll one "
     "instance at a time, rolled back on that alarm (without --rolling, the one "
     "that removes it: then update the group by hand in a maintenance window, one "

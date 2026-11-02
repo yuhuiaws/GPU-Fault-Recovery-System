@@ -395,8 +395,11 @@ def test_execute_release_uses_verified_noop_fast_path(
     assert calls[2][1][1] == "stage-noop"
     assert calls[3][1][3] == "verify"
     assert calls[4][1][1] == "commit"
-    assert calls[5][1][1] == "release-summary"
-    assert len(calls) == 6
+    assert (
+        calls[5] == ("run", calls[5][1]) and calls[5][1][1] == "cpu-rolling-update"
+    ), "the release ends with the CPU rolling update step, the NOOP fast path too"
+    assert calls[6][1][1] == "release-summary"
+    assert len(calls) == 7
     assert all("deploy" not in command for _kind, command in calls), (
         "verified NOOP release still invoked the deploy command"
     )
@@ -463,7 +466,8 @@ def test_execute_release_falls_back_to_deploy_for_non_noop_change(
     ) == ["stability", "verify"]
     assert calls[4][0] == "run"
     assert calls[4][1][1] == "commit"
-    assert calls[5][1][1] == "release-summary"
+    assert calls[5][1][1] == "cpu-rolling-update"
+    assert calls[6][1][1] == "release-summary"
     state = json.loads((prepared.state_dir / "state.json").read_text())
     assert state["deployment"]["status"] == "APPLIED"
     assert state["deployment"]["fast_path"] is False

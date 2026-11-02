@@ -11,6 +11,7 @@ import hashlib
 import json
 import subprocess
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,7 @@ from gpu_fault.admin.config_file import (
     load_admin_config_file,
 )
 from gpu_fault.admin.config_patch import preset_admin_config
+from gpu_fault.admin.cpu_rolling_update import record_last_run
 from gpu_fault.admin.operation_lock import SiteOperationBusy, site_operation_lock
 from gpu_fault.admin.site import SiteConfigError
 from tests.admin._first_deploy_discovery import stub_first_deploy_discovery
@@ -261,6 +263,47 @@ def test_config_applies_with_a_default_reference_and_records_the_approver(
     assert not admin_config_pending_path(tmp_path).exists(), (
         "successful apply left pending.json behind"
     )
+
+
+def test_a_cpu_rolling_update_change_rolls_no_role_and_reports_the_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``spec.cpuControlPlane`` goes through the same release as any other
+    change; the release's last step applies it (batch 240) from desired.json,
+    which is written first, and the output says what the step did."""
+
+    site_file(tmp_path)
+    mock_live_release(monkeypatch)
+    initialize_desired_admin_config(tmp_path)
+    config = _yaml(
+        tmp_path / "cpu.yaml",
+        {"cpuControlPlane": {"rollingUpdate": {"mode": "unchanged"}}},
+    )
+    stubs = Stubs(monkeypatch)
+
+    def release(**kwargs):
+        stubs.events.append("release")
+        stubs.calls["release"].append(kwargs)
+        mode = load_desired_admin_config(tmp_path).cpu_control_plane.rolling_update.mode
+        assert mode == "unchanged", "the step reads the desired config"
+        record_last_run(
+            tmp_path,
+            {"status": "DONE", "at": datetime.now(UTC).isoformat(), "warnings": []},
+        )
+        return 0
+
+    monkeypatch.setattr(admin_cli, "_run_automatic_release", release)
+
+    assert admin_cli.run(_arguments(tmp_path, "--file", str(config))) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "APPLIED"
+    assert output["affected_roles"] == [], "no Pod of any role rolls"
+    assert output["affected_resources"] == ["cpu_control_plane"]
+    assert output["cpu_rolling_update"]["status"] == "DONE"
+    assert stubs.events == ["verify", "release"]
+    canonical = load_admin_config_file(admin_config_file_path(tmp_path))
+    assert canonical.cpu_control_plane.rolling_update.mode == "unchanged"
 
 
 def test_config_rolls_back_aurora_and_desired_when_the_release_fails(

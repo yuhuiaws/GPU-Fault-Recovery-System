@@ -18,6 +18,7 @@ from gpu_fault.admin.bootstrap_common import (
     compute_agent_config_digest,
 )
 from gpu_fault.admin.command_log import admin_phase, child_failure, report_failure
+from gpu_fault.admin.cpu_rolling_update import load_last_run
 from gpu_fault.admin.operation_lock import inherited_lock_pass_fds
 from gpu_fault.admin.profile_approval import (
     ProfileApprovalError,
@@ -507,6 +508,11 @@ def _complete_release(
     registry_sync: bool,
 ) -> None:
     completion_warnings: list[str] = []
+    # Last of the release: the CPU rollback alarms and the rolling schedule,
+    # before the registry sync that records them; never fails the release.
+    cpu_rolling_update = _finish_cpu_rolling_update(
+        prepared, root=root, environment=environment, warnings=completion_warnings
+    )
     installation_registry = _record_installation_registry(
         prepared,
         root=root,
@@ -549,8 +555,48 @@ def _complete_release(
         stability=stability,
         release_summary=release_summary,
         installation_registry=installation_registry,
+        cpu_rolling_update=cpu_rolling_update,
         completion_warnings=completion_warnings,
     )
+
+
+def _finish_cpu_rolling_update(
+    prepared: PreparedRelease,
+    *,
+    root: Path,
+    environment: Mapping[str, str],
+    warnings: list[str],
+) -> dict[str, Any]:
+    """The engine's ``cpu-rolling-update`` mode (the CPU rollback alarms, then
+    the rolling schedule); a failure is a completion warning -- the
+    ``cpu_rolling_update`` status check names it -- never a failed release."""
+
+    started = utc_now()
+    try:
+        site = load_site(prepared.site_file, repository_root=root)
+        rollout = root / "deploy/control-plane/regional/rollout-regional-release.sh"
+        with materialized_release_config(site) as config:
+            _run(
+                [str(rollout), "cpu-rolling-update", "--config", str(config)],
+                cwd=root,
+                environment={
+                    **effective_environment(site),
+                    **environment,
+                    **site.environment,
+                    "GPU_FAULT_REPO_ROOT": str(root),
+                },
+            )
+        result = load_last_run(prepared.site_file.parent, since=started)
+    except Exception as exc:  # noqa: BLE001 - recorded, the release stands
+        result = {"status": "FAILED", "warnings": [f"{type(exc).__name__}: {exc}"]}
+    for warning in result.get("warnings") or ():
+        warnings.append(f"CPU rolling update: {warning}")
+        print(
+            f"release-deploy: warning: CPU rolling update: {warning}", file=sys.stderr
+        )
+    if result.get("summary"):
+        print(f"release-deploy: {result['summary']}", file=sys.stderr)
+    return result
 
 
 def _record_installation_registry(

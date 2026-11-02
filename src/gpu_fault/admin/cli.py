@@ -17,7 +17,9 @@ from typing import Any, cast
 
 from gpu_fault.admin import aurora_failback, eks_nodegroup_prepare, operator_identity
 from gpu_fault.admin import capacity_fleet
-from gpu_fault.admin import hyperpod_scheduled_update, remediation_storm
+from gpu_fault.admin import cpu_rolling_update_command, hyperpod_scheduled_update
+from gpu_fault.admin.cpu_rolling_update import load_last_run
+from gpu_fault.admin import remediation_storm
 from gpu_fault.admin.deploy_host_binding import (
     DEPLOY_HOST_STATE_BINDING as DEPLOY_HOST_STATE_BINDING,
     enforce_deploy_host_state_dir,
@@ -510,6 +512,7 @@ def parser() -> argparse.ArgumentParser:
     add_rotate_token_command(commands, _add_managed_site_arguments)
     add_submit_remediation_command(commands, _add_managed_site_arguments)
     add_collector_outbox_command(commands, _add_managed_site_arguments)
+    cpu_rolling_update_command.add_command(commands, _add_managed_site_arguments)
     add_store_maintenance_command(commands, _add_managed_site_arguments)
     remediation_storm.add_command(commands, _add_managed_site_arguments)
     aurora_failback.add_command(commands, _add_managed_site_arguments)
@@ -1206,6 +1209,7 @@ def _apply_admin_config(
     if apply.no_op:
         print(json.dumps({"status": "NOOP", **audit}, indent=2, sort_keys=True))
         return 0
+    started_at = datetime.now(UTC).isoformat()
     returncode, aurora = _roll_admin_config(
         arguments,
         site,
@@ -1235,10 +1239,23 @@ def _apply_admin_config(
                 "status": "APPLIED",
                 "release_id": release_id,
                 "affected_roles": apply.affected_roles,
-                "affected_resources": ["aurora"] if apply.aurora_changed else [],
+                "affected_resources": [
+                    name
+                    for name, changed in (
+                        ("aurora", apply.aurora_changed),
+                        ("cpu_control_plane", apply.cpu_control_plane_changed),
+                    )
+                    if changed
+                ],
                 "history": apply.history,
                 "audit": str(result),
                 **audit,
+                # The release's last step applied spec.cpuControlPlane (batch 240).
+                **(
+                    {"cpu_rolling_update": load_last_run(state_dir, since=started_at)}
+                    if apply.cpu_control_plane_changed
+                    else {}
+                ),
             },
             indent=2,
             sort_keys=True,
@@ -1330,6 +1347,7 @@ def run(arguments: argparse.Namespace) -> int:
         "rotate-token": run_rotate_token_command,
         "submit-remediation": run_submit_remediation_command,
         "collector-outbox": run_collector_outbox_command,
+        cpu_rolling_update_command.VERB: cpu_rolling_update_command.run_command,
         "store-maintenance": run_store_maintenance_command,
         "replace-resource": run_replace_resource_command,
         remediation_storm.VERB: remediation_storm.run_command,

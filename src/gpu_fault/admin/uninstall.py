@@ -51,6 +51,7 @@ from gpu_fault.admin.uninstall_ownership import (
     ownership_summary as _ownership_summary,
     release_site_ownership,
 )
+from gpu_fault.admin.uninstall_cpu_rolling import restore_cpu_rolling_update
 from gpu_fault.admin.uninstall_spares import release_declared_spares
 from gpu_fault.admin.uninstall_override import (
     cleanup_shell_environment,
@@ -1436,6 +1437,9 @@ def _uninstall_locked(
     bind_retained_database(request, active_runner, state_path, state)
     _bind_cpu_deletion(request, cleaner, snapshot, state_path, state)
     _bind_dns_deletion(request, cleaner, snapshot, state_path, state)
+    restore_cpu_rolling_update(
+        request, active_runner, snapshot, state_path, state, _transition
+    )
     settled = removal_settled_keys(request.site, snapshot)
     allow_empty = not request.site.release_config["clusters"]
     _verify_gpu_clusters(cleaner, snapshot, allow_empty=allow_empty, settled=settled)

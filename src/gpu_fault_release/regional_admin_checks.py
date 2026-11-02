@@ -27,7 +27,7 @@ from gpu_fault_release import regional_admin_checks_readiness as readiness
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import regional_monitoring_safety as monitoring_safety
 from gpu_fault_release import regional_release_token_rotation_safety as rotation_safety
-from gpu_fault_release import repository_root
+from gpu_fault_release import regional_cpu_rolling_update as cpu_roll, repository_root
 from gpu_fault_release.regional_adot_self_metrics import adot_self_metrics_report
 from gpu_fault_release.regional_aurora_credentials import (
     REFRESH_STATUS_KEY as AURORA_REFRESH_STATUS_KEY,
@@ -1550,10 +1550,7 @@ def build_health_report(release: Any, *, mode: str) -> dict[str, Any]:
                 reused_checks=reusable_checks,
             ),
         ),
-        (
-            "runtime_component_identity",
-            runtime_component_identity,
-        ),
+        ("runtime_component_identity", runtime_component_identity),
         ("control_api", lambda: _check_control_api(release, verify=mode == "verify")),
     ]
     specifications.extend(
@@ -1568,6 +1565,7 @@ def build_health_report(release: Any, *, mode: str) -> dict[str, Any]:
             ("nlb_runtime", lambda: _check_nlb_runtime(release)),
             ("aurora", lambda: _check_aurora(release)),
             ("monitoring", lambda: _check_monitoring(release)),
+            *cpu_roll.health_checks(release, mode),
         ]
     )
     with _read_snapshot(release):

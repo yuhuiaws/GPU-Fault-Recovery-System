@@ -487,6 +487,72 @@ class EvidenceConfig(_Section):
             )
 
 
+#: ``spec.cpuControlPlane.rollingUpdate.mode``.
+CPU_ROLLING_MODES = ("rolling", "unchanged")
+#: A CloudWatch alarm name the installation ledger can key on.
+CPU_ALARM_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$")
+#: The rollback alarm names; ``hyperpod_rollback.SUGGESTED_ALARM_NAMES``.
+CPU_ROLLBACK_ALARMS = (
+    "gpu-fault-cpu-roll-api-capacity",
+    "gpu-fault-cpu-roll-api-not-restored",
+)
+
+
+@dataclass(frozen=True)
+class CpuRollingUpdateConfig(_Section):
+    """How the deploy keeps the CPU control plane's scheduled update: ``rolling``
+    makes the group's own schedule roll one instance at a time, rolled back on
+    the rollback alarms; ``unchanged`` leaves the group as found (batch 240)."""
+
+    mode: str = CPU_ROLLING_MODES[0]
+    wait_interval_seconds: int = 1800
+
+    def validate(self) -> None:
+        if self.mode not in CPU_ROLLING_MODES:
+            raise AdminConfigError(
+                "spec.cpuControlPlane.rollingUpdate.mode must be rolling or unchanged"
+            )
+        # UpdateCluster takes 0..3600; the not-restored rollback alarm needs
+        # 10 minutes inside the wait plus a 5-minute margin.
+        if not 900 <= self.wait_interval_seconds <= 3600:
+            raise AdminConfigError(
+                "spec.cpuControlPlane.rollingUpdate.waitIntervalSeconds must be "
+                "within 900..3600 (the not-restored rollback alarm needs 10 minutes "
+                "inside the wait, 5 minutes before the next batch)"
+            )
+
+
+@dataclass(frozen=True)
+class CpuRollbackAlarmsConfig(_Section):
+    """The names of the two CloudWatch alarms the deploy keeps; two sites in
+    one account and Region need different names."""
+
+    capacity: str = CPU_ROLLBACK_ALARMS[0]
+    not_restored: str = CPU_ROLLBACK_ALARMS[1]
+
+    def validate(self) -> None:
+        names = (self.capacity, self.not_restored)
+        if not all(CPU_ALARM_NAME_PATTERN.fullmatch(name) for name in names):
+            raise AdminConfigError(
+                "spec.cpuControlPlane.rollbackAlarms names must be 1..255 letters, "
+                "digits, '.', '_' or '-'"
+            )
+        if self.capacity == self.not_restored:
+            raise AdminConfigError(
+                "spec.cpuControlPlane.rollbackAlarms needs two different names"
+            )
+
+
+@dataclass(frozen=True)
+class CpuControlPlaneConfig(_Section):
+    rolling_update: CpuRollingUpdateConfig = CpuRollingUpdateConfig()
+    rollback_alarms: CpuRollbackAlarmsConfig = CpuRollbackAlarmsConfig()
+
+    def validate(self) -> None:
+        self.rolling_update.validate()
+        self.rollback_alarms.validate()
+
+
 @dataclass(frozen=True)
 class AdminConfig(_Section):
     capacity: CapacityConfig = CapacityConfig()
@@ -495,6 +561,10 @@ class AdminConfig(_Section):
     workflow: WorkflowConfig = WorkflowConfig()
     notification_delivery: NotificationDeliveryConfig = NotificationDeliveryConfig()
     evidence: EvidenceConfig = EvidenceConfig()
+    #: Deploy-host only (never in a role payload), and left out of the record
+    #: at its default: every existing ``desired.json`` keeps its digest.
+    cpu_control_plane: CpuControlPlaneConfig = CpuControlPlaneConfig()
+    OMIT_WHEN_DEFAULT = frozenset({"cpu_control_plane"})
 
     def validate(self, *, enforce_capacity_evidence: bool = True) -> None:
         """Check every field and the cross-object capacity rules.
@@ -513,6 +583,7 @@ class AdminConfig(_Section):
         self.workflow.validate()
         self.notification_delivery.validate()
         self.evidence.validate()
+        self.cpu_control_plane.validate()
         capacity = self.capacity
         processor = self.processor
         # Structural in every mode: the runtime refuses a per-cluster reserve
@@ -1021,6 +1092,10 @@ class AdminConfigApply:
     @property
     def aurora_changed(self) -> bool:
         return bool(self.record["aurora_changed"])
+
+    @property
+    def cpu_control_plane_changed(self) -> bool:
+        return self.before.cpu_control_plane != self.desired.cpu_control_plane
 
     @property
     def history(self) -> str:

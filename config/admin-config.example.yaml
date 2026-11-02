@@ -38,3 +38,17 @@ spec:
   evidence:
     retentionHours: 24
     maxRecordsPerNode: 10000
+  # The CPU control-plane HyperPod group's scheduled update, applied by the
+  # deploy's last step: rolling makes the group's own schedule re-image one
+  # instance at a time, rolled back on the two CloudWatch alarms below (which
+  # the deploy creates on the API NLB); unchanged leaves the group as found.
+  # The deploy never adds a schedule and never changes when it runs. Left out
+  # of the generated file while at these defaults.
+  cpuControlPlane:
+    rollingUpdate:
+      mode: rolling
+      waitIntervalSeconds: 1800
+    # Two sites in one account and Region need names of their own.
+    rollbackAlarms:
+      capacity: gpu-fault-cpu-roll-api-capacity
+      notRestored: gpu-fault-cpu-roll-api-not-restored

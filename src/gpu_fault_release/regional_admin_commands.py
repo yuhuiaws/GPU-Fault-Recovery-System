@@ -28,6 +28,10 @@ from gpu_fault_release.regional_admin_checks import (
     build_preflight_report,
     build_quick_health_report,
 )
+from gpu_fault_release.regional_cpu_rolling_update import (
+    WINDOW_CHECK,
+    cpu_update_window,
+)
 from gpu_fault_release.regional_admin_checks_coverage import (
     dcgm_hostengine_lines,
     departed_node_lines,
@@ -832,6 +836,20 @@ def complete_deploy_workflow_preflight(
 
 
 def build_deploy_preflight_report(release: Any) -> dict[str, Any]:
+    """The deploy's preflight, plus ``cpu_update_window``: no deploy starts while
+    the CPU control plane is being re-imaged (batch 240)."""
+
+    report = _deploy_preflight_report(release)
+    if not isinstance(report.get("checks"), list):
+        return report
+    return _report(
+        "preflight",
+        release,
+        [*report["checks"], _check(WINDOW_CHECK, lambda: cpu_update_window(release))],
+    )
+
+
+def _deploy_preflight_report(release: Any) -> dict[str, Any]:
     """Only the deploy driver may defer resources its actual plan will repair."""
     state_exists = probe_resource(
         release.runner,

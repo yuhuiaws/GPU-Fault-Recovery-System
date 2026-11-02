@@ -361,6 +361,14 @@ class CleanupOwnership:
         elif kind == "sns_topic":
             command = self.aws("sns", "list-tags-for-resource", "--resource-arn", arn)
             absent = ("NotFound", "NotFoundException")
+        elif kind == "cloudwatch_alarm":
+            command = self.aws(
+                "cloudwatch",
+                "list-tags-for-resource",
+                "--resource-arn",
+                self._arn(resource, "cloudwatch", f"alarm:{identifier}"),
+            )
+            absent = ("ResourceNotFoundException",)
         elif kind == "sqs_queue":
             command = self.aws("sqs", "list-queue-tags", "--queue-url", identifier)
             absent = ("AWS.SimpleQueueService.NonExistentQueue", "QueueDoesNotExist")

@@ -980,78 +980,16 @@ def test_the_live_rolling_group_is_the_safe_form_with_its_rollback() -> None:
     ) in line, "discovery reads no alarm: the names, no state"
 
 
-def _read(alarms: dict[str, dict[str, Any]], *, nlb: bool = True) -> dict[str, Any]:
-    def read_nlb() -> dict[str, Any]:
-        return {"name": NLB_NAME, "load_balancer": LB, "target_groups": [TG]}
+def test_the_advisory_names_the_alarms_and_leaves_judging_them_to_the_check() -> None:
+    """The header line names the rollback batch and alarms; whether the alarms
+    can trip is the ``cpu_rolling_update`` check's (batch 240), so a block
+    carrying an alarm read adds no line of its own."""
 
-    return rollback.read_rollback_alarms(
-        [CAPACITY, NOT_RESTORED],
-        read_alarms=lambda names: {
-            "MetricAlarms": [alarms[n] for n in names if n in alarms]
-        },
-        read_nlb=read_nlb if nlb else None,
-    )
-
-
-def test_status_announces_each_rollback_alarm_that_cannot_trip() -> None:
-    stale = _live_alarms(state="INSUFFICIENT_DATA", lb=OLD_LB, tg=OLD_TG)
-    del stale[NOT_RESTORED]
-    block = {**_block(), "rollback_alarms": _read(stale)}
-
-    _schedule, capacity, restored = updates.control_plane_lines(block)
-
-    remedy = (
-        f"gpu-fault-admin hyperpod-scheduled-update --state-dir <state dir> "
-        f"--gpu-cluster-arn {CPU_EKS_ARN} --instance-group {CPU_GROUP} --rolling "
-        f"--wait-interval-seconds {WAIT} --rollback-alarm {CAPACITY} "
-        f"--rollback-alarm {NOT_RESTORED} prints the aws cloudwatch put-metric-alarm "
-        "commands that point the same alarm names at the current API NLB (the "
-        f"schedule then needs no change) {SECTION}"
-    )
-    owner = f"of HyperPod instance group {CPU_GROUP} of {CPU_WHERE}"
-    assert capacity.startswith(
-        f"advisory: rollback alarm {CAPACITY} {owner} is INSUFFICIENT_DATA: "
-    ), capacity
-    assert (
-        f"; and it watches AWS/NetworkELB HealthyHostCount (TargetGroup={OLD_TG}"
-        in (capacity)
-    )
-    assert capacity.endswith(remedy), capacity
-    assert restored == (
-        f"advisory: rollback alarm {NOT_RESTORED} {owner} does not exist "
-        "(describe-alarms returns no metric or composite alarm of that name): the "
-        f"update has nothing to roll back on; {remedy}"
-    )
-    healthy = {**_block(), "rollback_alarms": _read(_live_alarms())}
-    assert len(updates.control_plane_lines(healthy)) == 1, "alarms that can trip: quiet"
-
-
-def test_status_announces_an_alarm_read_it_could_not_make() -> None:
-    owner = f"of HyperPod instance group {CPU_GROUP} of {CPU_WHERE}"
-    denied = {
+    with_read = {
         **_block(),
-        "rollback_alarms": {"state": "unknown", "error": "AccessDenied"},
+        "rollback_alarms": {"state": "read", "alarms": [{"name": CAPACITY}]},
     }
 
-    (_line, unknown) = updates.control_plane_lines(denied)
-
-    assert unknown == (
-        f"advisory: could not read rollback alarm(s) {CAPACITY}, {NOT_RESTORED} "
-        f"{owner} (AccessDenied): whether they can roll a scheduled update back is "
-        f"unknown; the operator identity needs cloudwatch:DescribeAlarms {SECTION}"
-    )
-
-    def broken_nlb() -> dict[str, Any]:
-        raise BootstrapError("LoadBalancerNotFound")
-
-    read = rollback.read_rollback_alarms(
-        [CAPACITY, NOT_RESTORED],
-        read_alarms=lambda names: {"MetricAlarms": list(_live_alarms().values())},
-        read_nlb=broken_nlb,
-    )
-    (_line, nlb) = updates.control_plane_lines({**_block(), "rollback_alarms": read})
-    assert nlb == (
-        "advisory: could not read the API NLB (LoadBalancerNotFound): the dimensions "
-        f"of rollback alarm(s) {CAPACITY}, {NOT_RESTORED} {owner} were not checked "
-        f"{SECTION}"
-    )
+    assert updates.control_plane_lines(with_read) == updates.control_plane_lines(
+        _block()
+    ), "no alarm judgement in the advisory"

@@ -53,14 +53,18 @@ __all__ = [
     "SERVICE_REFUSALS",
     "SUGGESTED_ALARM_NAMES",
     "alarm_name_refusal",
+    "alarm_definitions",
     "alarm_problems",
     "alarm_records",
     "alarm_summary",
     "api_nlb",
+    "definition_matches",
     "deployment_config",
     "describe_alarms_arguments",
     "load_balancer_arn",
+    "put_metric_alarm_arguments",
     "read_rollback_alarms",
+    "restore_minutes",
     "rollback_alarm_names",
     "same_schedule",
     "suggested_alarms",
@@ -563,111 +567,213 @@ NORMAL_BATCH_MINUTES = 5
 #: The not-restored alarm trips this many minutes before the next batch.
 RESTORE_MARGIN_MINUTES = 5
 CAPACITY_MINUTES = 5
+#: The not-restored alarm's window unless the group's wait is shorter: 25 min
+#: inside the approved 1800 s wait (2026-11-02).
+DEFAULT_RESTORE_MINUTES = 25
+#: What every alarm of the pair has in common (``AWS/NetworkELB``, one-minute
+#: periods, a missing minute is neither breaching nor OK).
+_PAIR_FIELDS: dict[str, Any] = {
+    "Namespace": "AWS/NetworkELB",
+    "MetricName": "HealthyHostCount",
+    "Statistic": RECOMMENDED_STATISTIC,
+    "Period": 60,
+    "ComparisonOperator": "LessThanThreshold",
+    "TreatMissingData": "missing",
+}
+_DESCRIPTION = (
+    "GPU fault product, CPU control-plane HyperPod rolling update "
+    "(ScheduledUpdateConfig AutoRollbackConfiguration): "
+)
 
 
-def _put_metric_alarm(
-    region: str,
-    name: str,
+def restore_minutes(wait_seconds: int | None) -> int | None:
+    """The not-restored alarm's window: ``DEFAULT_RESTORE_MINUTES``, kept
+    ``RESTORE_MARGIN_MINUTES`` inside a shorter wait; ``None`` when that leaves
+    less than twice the ``NORMAL_BATCH_MINUTES`` a healthy batch is short --
+    such an alarm would roll back a normal update. A group without a rolling
+    schedule (``wait_seconds`` None) gets the default."""
+
+    if wait_seconds is None:
+        return DEFAULT_RESTORE_MINUTES
+    minutes = min(DEFAULT_RESTORE_MINUTES, wait_seconds // 60 - RESTORE_MARGIN_MINUTES)
+    return minutes if minutes >= 2 * NORMAL_BATCH_MINUTES else None
+
+
+def alarm_definitions(
     *,
-    description: str,
     nlb: Mapping[str, Any],
-    minutes: int,
-    threshold: int,
+    replicas: int,
+    wait_seconds: int | None,
+    names: Sequence[str] = SUGGESTED_ALARM_NAMES,
+    what: str = "alarm",
 ) -> dict[str, Any]:
-    arguments = [
-        "aws",
-        "cloudwatch",
-        "put-metric-alarm",
-        "--region",
-        region,
-        "--alarm-name",
-        name,
-        "--alarm-description",
-        description,
-        "--namespace",
-        "AWS/NetworkELB",
-        "--metric-name",
-        "HealthyHostCount",
-        "--dimensions",
-        f"Name=TargetGroup,Value={nlb['target_groups'][0]}",
-        f"Name=LoadBalancer,Value={nlb['load_balancer']}",
-        "--statistic",
-        RECOMMENDED_STATISTIC,
-        "--period",
-        "60",
-        "--evaluation-periods",
-        str(minutes),
-        "--datapoints-to-alarm",
-        str(minutes),
-        "--threshold",
-        str(threshold),
-        "--comparison-operator",
-        "LessThanThreshold",
-        "--treat-missing-data",
-        "missing",
+    """``{"definitions", "note"}``: the PutMetricAlarm requests of the pair on
+    ``nlb`` (``api_nlb``), statistic ``RECOMMENDED_STATISTIC`` per minute --
+    ``names[0]`` below ``replicas - 1`` for ``CAPACITY_MINUTES`` whole minutes
+    (more capacity lost than the one-instance batch), ``names[1]`` below
+    ``replicas`` for ``restore_minutes`` (the patched node's replica is not
+    back before the next batch) -- with no alarm actions. ``note`` says what
+    could not be defined -- no single target group, fewer than 2 replicas, or
+    a wait too short for the second alarm -- naming each a ``what``."""
+
+    groups = list(nlb.get("target_groups") or ())
+    if not nlb.get("load_balancer") or len(groups) != 1 or replicas < 2:
+        return {
+            "definitions": [],
+            "note": (
+                f"no {what}: the API NLB {nlb.get('name')} has {len(groups)} target "
+                f"group(s) (one expected) or api-ha runs {replicas} replica(s) (at "
+                "least 2 expected)"
+            ),
+        }
+    dimensions = [
+        {"Name": "TargetGroup", "Value": groups[0]},
+        {"Name": "LoadBalancer", "Value": str(nlb["load_balancer"])},
     ]
-    return {"name": name, "command": shlex.join(arguments)}
+
+    def define(name: str, minutes: int, threshold: int, meaning: str) -> dict[str, Any]:
+        return {
+            "AlarmName": name,
+            "AlarmDescription": _DESCRIPTION
+            + f"fewer than {threshold} of {replicas} API replicas healthy for "
+            f"{minutes} min = {meaning}; SageMaker rolls the update back. No alarm "
+            "actions.",
+            **_PAIR_FIELDS,
+            "Dimensions": [dict(item) for item in dimensions],
+            "EvaluationPeriods": minutes,
+            "DatapointsToAlarm": minutes,
+            "Threshold": float(threshold),
+        }
+
+    definitions = [
+        define(
+            names[0],
+            CAPACITY_MINUTES,
+            replicas - 1,
+            "more capacity lost than the one-instance batch",
+        )
+    ]
+    restore = restore_minutes(wait_seconds)
+    note = ""
+    if restore is not None:
+        wait = f"{wait_seconds} s" if wait_seconds is not None else "the wait"
+        definitions.append(
+            define(
+                names[1],
+                restore,
+                replicas,
+                f"the patched node's replica did not return before the next batch "
+                f"({wait})",
+            )
+        )
+    else:
+        note = (
+            f"no {names[1]} {what}: a wait of {wait_seconds} s leaves less than "
+            f"{2 * NORMAL_BATCH_MINUTES} min for it, and a normal batch is one "
+            f"replica short for about {NORMAL_BATCH_MINUTES} min"
+        )
+    return {"definitions": definitions, "note": note}
+
+
+def put_metric_alarm_arguments(definition: Mapping[str, Any]) -> list[str]:
+    """``aws cloudwatch put-metric-alarm`` options for one ``alarm_definitions``
+    request (the region and any ``--tags`` are the caller's)."""
+
+    threshold = float(definition["Threshold"])
+    return [
+        "--alarm-name",
+        str(definition["AlarmName"]),
+        "--alarm-description",
+        str(definition["AlarmDescription"]),
+        "--namespace",
+        str(definition["Namespace"]),
+        "--metric-name",
+        str(definition["MetricName"]),
+        "--dimensions",
+        *(
+            f"Name={item['Name']},Value={item['Value']}"
+            for item in definition["Dimensions"]
+        ),
+        "--statistic",
+        str(definition["Statistic"]),
+        "--period",
+        str(definition["Period"]),
+        "--evaluation-periods",
+        str(definition["EvaluationPeriods"]),
+        "--datapoints-to-alarm",
+        str(definition["DatapointsToAlarm"]),
+        "--threshold",
+        str(int(threshold)) if threshold.is_integer() else str(threshold),
+        "--comparison-operator",
+        str(definition["ComparisonOperator"]),
+        "--treat-missing-data",
+        str(definition["TreatMissingData"]),
+    ]
+
+
+def definition_matches(alarm: Mapping[str, Any], definition: Mapping[str, Any]) -> bool:
+    """Whether a ``describe-alarms`` ``MetricAlarms`` entry already is
+    ``definition``, actions included (none): then a put would change nothing."""
+
+    def dimensions(value: object) -> list[tuple[str, str]]:
+        return sorted(
+            (str(item.get("Name")), str(item.get("Value")))
+            for item in (value if isinstance(value, list) else ())
+            if isinstance(item, Mapping)
+        )
+
+    for key in (
+        "AlarmDescription",
+        "Namespace",
+        "MetricName",
+        "Statistic",
+        "Period",
+        "EvaluationPeriods",
+        "DatapointsToAlarm",
+        "ComparisonOperator",
+        "TreatMissingData",
+    ):
+        if alarm.get(key) != definition.get(key):
+            return False
+    if dimensions(alarm.get("Dimensions")) != dimensions(definition["Dimensions"]):
+        return False
+    if not isinstance(alarm.get("Threshold"), (int, float)) or float(
+        alarm["Threshold"]
+    ) != float(definition["Threshold"]):
+        return False
+    return not any(
+        alarm.get(key)
+        for key in ("AlarmActions", "OKActions", "InsufficientDataActions")
+    )
 
 
 def suggested_alarms(
     *, region: str, nlb: Mapping[str, Any], replicas: int, wait_seconds: int
 ) -> dict[str, Any]:
-    """The ``aws cloudwatch put-metric-alarm`` commands of the recommended pair
-    on the current API NLB, never run, both on the ``RECOMMENDED_STATISTIC`` of
-    ``HealthyHostCount`` per minute: ``capacity`` -- fewer than ``replicas - 1``
-    healthy targets for 5 whole minutes, more than the one-instance batch lost
-    -- and ``not-restored`` -- fewer than ``replicas`` for the wait minus
-    ``RESTORE_MARGIN_MINUTES``: the patched node's replica is not back before
-    the next batch. Re-running them after a fresh install re-points the
-    same names at the new NLB, so the schedule itself needs no change."""
+    """The ``aws cloudwatch put-metric-alarm`` commands of ``alarm_definitions``
+    on the current API NLB, never run. Re-running them after a fresh install
+    re-points the same names at the new NLB, so the schedule itself needs no
+    change."""
 
-    groups = list(nlb.get("target_groups") or ())
-    if not nlb.get("load_balancer") or len(groups) != 1 or replicas < 2:
-        return {
-            "commands": [],
-            "note": (
-                f"no suggestion: the API NLB {nlb.get('name')} has "
-                f"{len(groups)} target group(s) (one expected) or api-ha runs "
-                f"{replicas} replica(s) (at least 2 expected)"
-            ),
-        }
-    head = (
-        "GPU fault product, CPU control-plane HyperPod rolling update "
-        "(ScheduledUpdateConfig AutoRollbackConfiguration): "
+    pair = alarm_definitions(
+        nlb=nlb, replicas=replicas, wait_seconds=wait_seconds, what="suggestion"
     )
-    commands = [
-        _put_metric_alarm(
-            region,
-            SUGGESTED_ALARM_NAMES[0],
-            description=head
-            + f"fewer than {replicas - 1} of {replicas} API replicas healthy for "
-            f"{CAPACITY_MINUTES} min = more capacity lost than the one-instance "
-            "batch; SageMaker rolls the update back. No alarm actions.",
-            nlb=nlb,
-            minutes=CAPACITY_MINUTES,
-            threshold=replicas - 1,
-        )
-    ]
-    restore = wait_seconds // 60 - RESTORE_MARGIN_MINUTES
-    note = ""
-    if restore >= 2 * NORMAL_BATCH_MINUTES:
-        commands.append(
-            _put_metric_alarm(
-                region,
-                SUGGESTED_ALARM_NAMES[1],
-                description=head + f"fewer than {replicas} of {replicas} API replicas "
-                f"healthy for {restore} min = the patched node's replica did not "
-                f"return before the next batch ({wait_seconds} s); SageMaker rolls "
-                "the update back. No alarm actions.",
-                nlb=nlb,
-                minutes=restore,
-                threshold=replicas,
-            )
-        )
-    else:
-        note = (
-            f"no {SUGGESTED_ALARM_NAMES[1]} suggestion: a wait of {wait_seconds} s "
-            f"leaves less than {2 * NORMAL_BATCH_MINUTES} min for it, and a normal "
-            f"batch is one replica short for about {NORMAL_BATCH_MINUTES} min"
-        )
-    return {"commands": commands, "note": note}
+    return {
+        "commands": [
+            {
+                "name": definition["AlarmName"],
+                "command": shlex.join(
+                    [
+                        "aws",
+                        "cloudwatch",
+                        "put-metric-alarm",
+                        "--region",
+                        region,
+                        *put_metric_alarm_arguments(definition),
+                    ]
+                ),
+            }
+            for definition in pair["definitions"]
+        ],
+        "note": pair["note"],
+    }
