@@ -5829,8 +5829,9 @@ chart does. Karpenter NodePools on the CPU cluster are not read. The retry hint'
 backoff (5 ms doubling to 1000 s) and immediate sync on any ReplicaSet update are
 read from the Kubernetes v1.33.13 source, and the live annotation that ended the
 2026-11-01 wait agrees; no other Kubernetes version was checked.
-`describe-cluster-versions --include-all` for a version past its extended support
-and the exact moment AWS upgrades a cluster after its date were not exercised.
+The exact moment AWS upgrades a cluster after its date was not exercised. The
+support-dates request this batch shipped was refused live and never ran; see
+the batch 242 section.
 
 ## Rolling schedules and their rollback alarms (batch 239)
 
@@ -6180,3 +6181,69 @@ Not verified live:
   reset. That the sampler was the holder is inferred, not read.
 - The moved-B path has not run live yet; on the 2-node plain-EKS topology the
   restarted attempt always occupies A's node.
+
+## The EKS support-dates request (batch 242)
+
+Batch 231's end-of-support check never ran on any site. Its one
+`describe-cluster-versions` per region sent `--cluster-versions <versions>`
+together with `--include-all`, and the service refused the pair
+(InvalidParameterException: "Only one of the defaultOnly, clusterVersions,
+includeAll or status request parameters is accepted at a time.") from its
+first live run, the R16 deploy preflight of 2026-11-01. The status header then
+blamed a missing `eks:DescribeClusterVersions`. The tests' fake had cut the
+version list at `--include-all` instead of refusing the request.
+
+Read live and read-only on 2026-11-02 (aws-cli 2.35.21, us-west-2, the deploy
+host's identity, `describe-cluster-versions` only):
+
+- `--cluster-versions 1.31 1.32 1.33` alone: accepted, each version
+  `EXTENDED_SUPPORT` with both dates (1.31: standard 2025-11-26, extended
+  2026-11-26). `--cluster-versions 1.29 1.23` alone: both listed,
+  `UNSUPPORTED`, with both dates.
+- Refused with that text: `--cluster-versions 1.31` beside `--include-all`
+  (14:21:23Z), beside `--default-only`, beside `--status extended-support` and
+  beside `--version-status EXTENDED_SUPPORT`; `--include-all` beside
+  `--status extended-support`.
+- The CLI prints the dates in the host's zone: `2026-11-26T00:00:00+00:00` on
+  the UTC deploy host, `2026-11-25T16:00:00-08:00` under
+  `TZ=America/Los_Angeles` (the tests' fixtures use the Pacific form).
+
+The API reference (DescribeClusterVersions, URI Request Parameters, fetched
+2026-11-02) and the service model aws-cli 2.35.21 installs give each selector
+one line and state no exclusivity, so client-side validation passes. The
+service's refusal is the evidence (`VERSIONS_SERVICE_REFUSAL`, both manuals).
+
+The other AWS requests batch 231 added were checked for the same class of
+defect, and none combines exclusive parameters: `eks describe-cluster`
+(`--name`), `sagemaker describe-cluster` (`--cluster-name`, the widened
+`--query`), `eks list-nodegroups` and `describe-nodegroup` of the CPU EKS
+cluster, and `autoscaling describe-auto-scaling-groups` (group names only, sent
+only with at least one name; the API's default limit of 50 names is not
+reached on this site). The `update-cluster` plans of
+`hyperpod-scheduled-update --rolling` were refused live on other grounds; batch
+239 fixed them.
+
+Proven with fakes:
+
+- `tests/regional/test_regional_release_eks_support.py`: the request names the
+  versions in use and no other selector; the fake refuses every pair of
+  selectors with the service's text; batch 231's request reproduces the live
+  line, now with a remedy that claims no permission; an authorization failure
+  names `eks:DescribeClusterVersions`, and any other error does not.
+- The `ContextsRunner` fake of
+  `tests/regional/test_regional_release_automatic_updates.py` now refuses two
+  selectors as the service does. With `--include-all` put back, the new request
+  test and four existing header tests fail against it.
+
+Not verified:
+
+- The fixed request has not run through the product on the site. It ships with
+  the next release; the request itself was accepted live.
+- Whether `versionStatus` combines with `defaultOnly`, `includeAll` or
+  `status`: only its pair with `clusterVersions` was tried. The fake refuses
+  every pair.
+- The authorization branch against a real denial of
+  `eks:DescribeClusterVersions`: the deploy host's identity holds the
+  permission (its requests were accepted), so no denial was observed. The
+  markers are the AWS CLI's usual `AccessDeniedException`,
+  `UnauthorizedOperation` and "not authorized".

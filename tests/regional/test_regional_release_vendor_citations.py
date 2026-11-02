@@ -25,7 +25,13 @@ apostrophes are the vendors' own.
   (``cpu_rolling_update.EVIDENCE``): PutMetricAlarm (a new alarm starts
   INSUFFICIENT_DATA, an update keeps the state and ignores tags), the
   instance group's update statuses, the HyperPod cron rules, DescribeAlarms'
-  permission scope and DeleteAlarms' read-back.
+  permission scope and DeleteAlarms' read-back;
+- batch 242, the EKS support-dates request
+  (``regional_release_eks_support.DESCRIBE_CLUSTER_VERSIONS_EVIDENCE``): the
+  EKS API reference's texts of ``clusterVersions`` and ``includeAll`` -- the
+  page states no rule against sending both -- and the service's refusal of
+  both in one request (``VERSIONS_SERVICE_REFUSAL``), fetched and probed
+  2026-11-02.
 """
 
 from __future__ import annotations
@@ -50,7 +56,11 @@ from gpu_fault.admin.hyperpod_rollback import (
     SERVICE_REFUSALS,
 )
 from gpu_fault.admin.hyperpod_schedule_window import SCHEDULE_EVIDENCE
-from gpu_fault_release.regional_release_eks_support import EKS_SUPPORT_EVIDENCE
+from gpu_fault_release.regional_release_eks_support import (
+    DESCRIBE_CLUSTER_VERSIONS_EVIDENCE,
+    EKS_SUPPORT_EVIDENCE,
+    VERSIONS_SERVICE_REFUSAL,
+)
 from gpu_fault_release.regional_release_replica_failure import (
     KUEUE_POD_WEBHOOK_EVIDENCE,
     REPLICASET_BACKOFF_EVIDENCE,
@@ -108,6 +118,7 @@ def test_the_hyperpod_update_evidence_is_the_aws_page_verbatim() -> None:
         KUEUE_POD_WEBHOOK_EVIDENCE,
         REPLICASET_BACKOFF_EVIDENCE,
         EKS_SUPPORT_EVIDENCE,
+        DESCRIBE_CLUSTER_VERSIONS_EVIDENCE,
         *ROLLBACK_EVIDENCE,
         *cpu_rolling_update.EVIDENCE,
     ],
@@ -116,6 +127,7 @@ def test_the_hyperpod_update_evidence_is_the_aws_page_verbatim() -> None:
         "kueue-pod-webhook",
         "replicaset-backoff",
         "eks-support",
+        "eks-cluster-versions",
         "rolling-policy",
         "deployment-configuration",
         "alarm-details",
@@ -148,6 +160,8 @@ def test_each_manual_names_the_remedies_the_product_prints(manual: str) -> None:
         "hyperpod-scheduled-update --state-dir",
         "--rolling",
         "eks:DescribeClusterVersions",
+        "it is not an authorization failure: read the dates with aws eks "
+        "describe-cluster-versions --region <region> --cluster-versions",
         "additionalProperties: false",
         "--rollback-alarm gpu-fault-cpu-roll-api-capacity",
         "RollbackMaximumBatchSize",
@@ -228,6 +242,17 @@ def test_each_manual_records_the_live_refusals_with_their_times(manual: str) -> 
         assert f'{refusal["at"]} "{_flat(refusal["text"])}"' in text, (
             f"{manual} lacks the {refusal['at']} refusal verbatim"
         )
+
+
+@pytest.mark.parametrize("manual", MANUALS)
+def test_each_manual_records_the_versions_refusal_and_the_request(manual: str) -> None:
+    text = _flat((ROOT / manual).read_text(encoding="utf-8"))
+    refusal = VERSIONS_SERVICE_REFUSAL
+
+    assert f'{refusal["at"]} "{_flat(refusal["text"])}"' in text, (
+        f"{manual} lacks the {refusal['at']} refusal verbatim"
+    )
+    assert f"`{refusal['request']}`" in text, f"{manual} lacks the refused request"
 
 
 def test_the_deploy_step_evidence_is_the_aws_pages_verbatim() -> None:

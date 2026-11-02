@@ -3544,22 +3544,44 @@ at the end of extended support cannot be rolled back." Live (2026-11-01): the pl
 
 The product announces only: the `regional_contexts` check of `status --full` and deploy preflight reads `eks
 describe-cluster` once per site EKS cluster (`version`, `upgradePolicy.supportType`) and `eks describe-cluster-versions
---cluster-versions <versions...> --include-all` once per region, and records `details.eks_support` (per cluster `version`,
-`support_type`, `end_of_support` = the UTC date, `days_left`); a cluster within 90 days of its date, or past it, adds one line
+--cluster-versions <versions...>` once per region (that one selector only, evidence below), and records
+`details.eks_support` (per cluster `version`, `support_type`, `end_of_support` = the UTC date, `days_left`); a cluster within
+90 days of its date, or past it, adds one line
 to the `status --full` header, for example `advisory: EKS cluster gpu-eks-cluster (GPU cluster <id>) runs Kubernetes 1.31 under
 the EXTENDED upgrade policy, whose support ends 2026-11-26 (in 24 day(s)): after that date AWS upgrades its control plane to
 the next version by itself, at any time and without notice -- only the control plane: its nodes stay on 1.31 -- and a cluster
 upgraded that way cannot be rolled back; upgrade it yourself before then, in a maintenance window (control plane first, then
-its nodes and add-ons) (administrator-operations §5.0.5)`. A denied `eks:DescribeClusterVersions` turns into one line
-`advisory: could not read the EKS support dates in <region> (...): the end-of-support check of <n> EKS cluster(s) did not run;
-the operator identity needs eks:DescribeClusterVersions ...`; a cluster whose version or dates cannot be read has a line as
-well. The check verdict is unchanged; deploy discovery does not read the dates. Remedy: before the date, in a maintenance
+its nodes and add-ons) (administrator-operations §5.0.5)`. A failed dates read turns into one line `advisory: could not read
+the EKS support dates in <region> (<error>): the end-of-support check of <n> EKS cluster(s) did not run; ...` whose end depends
+on the error: an authorization failure (`AccessDenied`, `UnauthorizedOperation` or "not authorized" in the error) ends `the
+operator identity needs eks:DescribeClusterVersions ...`; any other error ends `it is not an authorization failure: read the
+dates with aws eks describe-cluster-versions --region <region> --cluster-versions <versions...> and run status --full again
+...` -- read the dates by hand with that request and run `status --full` once more; no permission is blamed. A cluster whose
+version or dates cannot be read has a line as well. The check verdict is unchanged; deploy discovery does not read the dates.
+Remedy: before the date, in a maintenance
 window, upgrade yourself -- the control plane first (`aws eks update-cluster-version`), then nodes and add-ons; the nodes of a
 HyperPod cluster do not follow the EKS version, update them with `update-cluster-software` afterwards (AWS: "The Kubernetes
 version of SageMaker HyperPod cluster nodes does not automatically update when you update your Amazon EKS cluster version.
 After updating the Kubernetes version for your Amazon EKS cluster, you must use the `UpdateClusterSoftware` API to update your
 SageMaker HyperPod cluster nodes to the same Kubernetes version.", Updating the SageMaker HyperPod platform software, as
 above).
+
+The dates read carries one selector, `--cluster-versions`. Evidence: AWS documentation, Amazon EKS API Reference,
+DescribeClusterVersions (https://docs.aws.amazon.com/eks/latest/APIReference/API_DescribeClusterVersions.html, API version
+2017-11-01; the page prints no date, Last-Modified 2026-11-02, fetched 2026-11-02), URI Request Parameters: `clusterVersions`
+"List of specific cluster versions to describe."; `includeAll` "Include all available versions in the response.". The page
+does not say that these parameters cannot be sent together (neither does the service model aws-cli 2.35.21 installs); the
+service itself refuses the combination. Earlier releases sent `--cluster-versions <versions...> --include-all`; the service
+refused that request (InvalidParameterException) from its first live run, the deploy preflight of 2026-11-01, so the
+end-of-support check never ran and the line blamed a missing `eks:DescribeClusterVersions`. Re-checked (aws-cli 2.35.21,
+us-west-2, `--cluster-versions 1.31 --include-all`):
+
+- 2026-11-02T14:21:23Z "Only one of the defaultOnly, clusterVersions, includeAll or status request parameters is accepted at a
+  time."
+
+`--cluster-versions` beside `--default-only`, `--status` or `--version-status` is refused the same way (the text does not name
+`versionStatus`). `--cluster-versions` alone lists a named version even past its support (2026-11-02: 1.29 and 1.23,
+`UNSUPPORTED`, with both dates).
 
 **Permissions.** The reads use the identity of the operator running the command: `sagemaker:DescribeCluster` (plus
 `sagemaker:ListClusters` for the helper given an EKS ARN the site does not record), `eks:DescribeNodegroup`,
