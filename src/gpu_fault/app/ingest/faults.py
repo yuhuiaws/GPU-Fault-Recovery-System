@@ -93,9 +93,9 @@ def complete_node_gpu_inventory(
     A full GPU + NVSwitch reset acts on every GPU of the node: the Node Agent
     resets them all and refuses a list that is not exactly its own inventory,
     and the plan's client check and validations cover only the GPUs it names.
-    The set is complete when it is exactly the node's expected GPU count -- the
-    collector's ``GPU_FAULT_EXPECTED_GPU_COUNT`` or instance-type count, which
-    its inventory snapshots declare:
+    The set is complete when it is exactly the node's expected GPU count, which
+    its inventory snapshots declare (``expected_gpu_count``: the count the
+    installer configures, else the instance type's):
 
     * the fresh snapshot (``snapshot``) is one nvidia-smi enumeration and
       stands for the node unless it lists fewer GPUs than it declares;
