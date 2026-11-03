@@ -6038,3 +6038,45 @@ Not verified live:
   (the legacy XIDs that list no product, and the B100/GB200-only ones such as
   159), and for every XID of a record without a GPU product and without a fresh
   inventory to stand in; which of them a live H200 node emits was not observed.
+
+## GF-REGIONAL-COLLECT-016: a failed reset, the restart custody and B's target
+
+Round 15 on R16 failed COLLECT-016 on both clusters, neither time in the
+restart custody nor in an R16 product change.
+
+- **Plain EKS, segment D (2026-11-03).** The XID 109 reset of the node running
+  the managed job ended FAILED at RESET_GPU; the product's reset rung opened
+  `workflow-reboot-after-<id>` and rebooted the node (EC2 RebootInstances), as
+  it does for every reset that fails with a known outcome. The case then asked
+  the restart custody about the FAILED workflow and reported its refusal
+  ("successful workflow or incident identity differs"); the R15-era custody
+  refuses the same input identically. A reset case now writes the terminal
+  store reading -- workflow, step executions, remote commands with the Node
+  Agent's result details, notifications -- as `workflow-terminal.json` the
+  moment the wait returns, and observes a post-restart workload only behind a
+  SUCCEEDED reset: a failed reset fails the case with its failed steps and
+  errors (`reset_terminal_record.settle_reset_terminal`).
+- **HyperPod, segment B (2026-11-03).** The native 3-node job ran on 4 GPU
+  nodes; the scheduler placed the restarted attempt on the three nodes other
+  than A's, B's XID landed on an IDLE node, the product recorded it
+  MONITOR_ONLY (`NO_ACTIVE_MANAGED_ATTEMPT`) and B waited 600 s for a workflow
+  that could not exist. B now writes its XID on a GPU the restarted attempt's
+  own RUNNING observation holds: A's node and GPU while the attempt still holds
+  that GPU there, otherwise the node of its first Pod through a collector probe
+  of its own (`budget_injection_target`).
+
+Not verified live:
+
+- Why that RESET_GPU failed. The run kept no terminal record (fixed above); the
+  step's error, `physical_calls` and `gpu_client_holders` are in the product
+  store only. The node's serial console shows no display-stack release
+  (`[drm] [nvidia-drm] ... Unloading driver`) during the whole step, while the
+  peer node's console shows the release and its reload for each of its resets
+  in the same window. A busy
+  reset whose release is declined stays busy until its three attempts are spent,
+  and the release is declined whenever a device holder other than the kept
+  persistence daemon or Fabric Manager is seen; the case's own reset sampler runs
+  `nvidia-smi --query-gpu=uuid` on the target node every 0.25 s for the whole
+  reset. That the sampler was the holder is inferred, not read.
+- The moved-B path has not run live yet; on the 2-node plain-EKS topology the
+  restarted attempt always occupies A's node.
