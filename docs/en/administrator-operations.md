@@ -3779,8 +3779,9 @@ gpu-fault-admin rotate-token \
    head, so both tokens are accepted meanwhile) -> publish the revision dropping the retiring
    digest. CPU Pods read that Secret into their environment at start (settings validation, the first bootstrap seed);
    the roll puts that start-up copy on the accepted token. `regional_registry.secret_drift` compares the copy the Pods
-   also mount (`/etc/gpu-fault/regional-clusters/clusters.json`, which kubelet refreshes with the Secret), so it does not
-   wait for the roll; on a release that does not mount the Secret yet, only the roll clears `secret_drift=true`.
+   also mount (`/etc/gpu-fault/regional-clusters/clusters.json`, which kubelet refreshes with the Secret), so it clears
+   with the final publish (the Secret and the head then both hold only the new digest), not with the roll; on a release
+   that does not mount the Secret yet, only the roll clears `secret_drift=true`.
    `--window-minutes` (default 120, set in minutes or hours, not days), `--keep-window`,
    `--rollback` and the state machine and resume rules are in REG-9.
 5. **Success criteria**: output `status=COMPLETED`; in `GET /v1/regional/clusters` that cluster has

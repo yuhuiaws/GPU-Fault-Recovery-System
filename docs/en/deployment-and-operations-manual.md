@@ -5662,7 +5662,8 @@ gpu-fault-admin rotate-token \
    the rerun. CPU Pods read that Secret into their environment at start (settings validation and the first bootstrap
    seed), and this step puts that start-up copy on the accepted token; `regional_registry.secret_drift` compares the copy
    the Pods also mount (`/etc/gpu-fault/regional-clusters/clusters.json`, refreshed by kubelet within roughly 1-2
-   minutes of the Secret write), which does not depend on this roll. On a release that does not mount the Secret yet,
+   minutes of the Secret write) and clears with the final publish, independently of this roll. On a release that does
+   not mount the Secret yet,
    without this step every replica keeps reporting `regional_registry.secret_drift=true` and the acceptance
    registry-alignment preflight refuses to run. The final
    publish of `RETIRING_TOKEN_DROPPED` goes through the control plane that was just rolled, so before publishing the
