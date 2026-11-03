@@ -329,10 +329,11 @@ class RegionalRegistryRuntime:
         """Whether the registry Secret and the durable head disagree.
 
         The Secret is the mounted copy, which kubelet keeps in step with the
-        Secret: a join, remove or rotation rewrites the Secret and publishes
-        the head, so a replica that started before it converges within the
-        kubelet sync period and needs no restart. Without a mount it is the
-        start-up copy, which only a restart refreshes. The durable head wins
+        Secret: a join or remove rewrites the Secret and publishes the head,
+        so a replica that started before it converges within the kubelet sync
+        period and needs no restart (a rotation's overlap window is a real,
+        temporary disagreement until its final publish). Without a mount it is
+        the start-up copy, which only a restart refreshes. The durable head wins
         (join/remove publish there); a drift that persists means the Secret
         and the head really disagree -- a release that only rewrote the Secret
         never reached the running registry (review H3), or the Secret was
