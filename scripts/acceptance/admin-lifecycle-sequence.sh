@@ -33,6 +33,11 @@
 #      stage 1, so one run covers both first-deploy providers and both join
 #      directions.
 #
+# --last-stage N ends the run after stage N (all PASS: exit 0 with a resume
+# line) so an operator can use the site a middle stage leaves standing (stage
+# 3: the first site with every GPU cluster joined again) before the uninstall
+# of stage 4; `--stage N+1` resumes from the same record, as after a failure.
+#
 # Mixed sites. A first deploy's GPU clusters must share one provider: the
 # deploy writes one site Runtime Profile and refuses a HyperPod + eks-managed
 # list before creating anything (bootstrap_common.require_single_provider,
@@ -99,14 +104,14 @@ usage() {
 usage: admin-lifecycle-sequence.sh --state-dir DIR --cpu-cluster-arn ARN
          --gpu-cluster-arn ARN [--gpu-cluster-arn ARN ...]
          --admin-email EMAIL --repo CHECKOUT
-         [--stage N] [--second-state-dir DIR] [--email-wait-minutes M  (stage 1 only)]
+         [--stage N] [--last-stage N] [--second-state-dir DIR] [--email-wait-minutes M  (stage 1 only)]
          [--previous-site-id ID] [--aurora-final-snapshot retain|skip]
          --confirm-isolated-build-host
 USAGE
   exit 2
 }
 
-STATE_DIR="" CPU_ARN="" ADMIN_EMAIL="" REPO="" START_STAGE=1
+STATE_DIR="" CPU_ARN="" ADMIN_EMAIL="" REPO="" START_STAGE=1 LAST_STAGE=5
 GPU_ARNS=()
 SECOND_STATE_DIR="" EMAIL_WAIT=0 PREVIOUS_SITE_ID="" ISOLATED_BUILD_HOST=false
 AURORA_FINAL_SNAPSHOT=retain
@@ -121,6 +126,7 @@ while [[ $# -gt 0 ]]; do
     --admin-email) ADMIN_EMAIL="$2"; shift 2 ;;
     --repo) REPO="$2"; shift 2 ;;
     --stage) START_STAGE="$2"; shift 2 ;;
+    --last-stage) [[ $# -ge 2 ]] || usage; LAST_STAGE="$2"; shift 2 ;;
     --second-state-dir) SECOND_STATE_DIR="$2"; shift 2 ;;
     --email-wait-minutes) EMAIL_WAIT="$2"; shift 2 ;;
     --previous-site-id) PREVIOUS_SITE_ID="$2"; shift 2 ;;
@@ -145,6 +151,7 @@ GPU_PROVIDERS=() FIRST_PROVIDER="" FIRST_DEPLOY_STATE="" REMOVAL_ARNS=()
 DEPLOY_GPU_ARNS=() DEPLOY_GPU_ARN_ARGS=() DEPLOY_RECEIPT_ARGS=()
 JOINED_PROVIDERS=() JOINED_GPU_ARNS=() JOINED_GPU_PROVIDERS=() JOINED_RECEIPT_ARGS=()
 [[ "$START_STAGE" =~ ^[1-5]$ ]] || usage
+[[ "$LAST_STAGE" =~ ^[1-5]$ && "$LAST_STAGE" -ge "$START_STAGE" ]] || usage
 [[ "$EMAIL_WAIT" =~ ^[0-9]+$ ]] || usage
 [[ "$AURORA_FINAL_SNAPSHOT" =~ ^(retain|skip)$ ]] || usage
 [[ "$ISOLATED_BUILD_HOST" == true ]] || usage
@@ -591,9 +598,13 @@ install -d -m 0700 "$ACCEPT_DIR"
 exec {SEQUENCE_LOCK_FD}>"$ACCEPT_DIR/sequence.lock"
 flock -n "$SEQUENCE_LOCK_FD" || { echo "another BOOT-029 sequence is running" >&2; exit 1; }
 init_record
-for stage in $(seq "$START_STAGE" 5); do
+for stage in $(seq "$START_STAGE" "$LAST_STAGE"); do
   run_stage "$stage"
 done
+if [[ "$LAST_STAGE" -lt 5 ]]; then
+  log "${CASE_ID}: stopped after stage ${LAST_STAGE} as asked (--last-stage ${LAST_STAGE}); resume with --stage $((LAST_STAGE + 1)); record ${RECORD}"
+  exit 0
+fi
 log "${CASE_ID}: all five driver stages PASS; record ${RECORD}"
 if [[ "$AURORA_FINAL_SNAPSHOT" == skip ]]; then
   log "GF-REGIONAL-BOOT-027: NOT_RUN (Aurora final snapshot explicitly skipped)"
