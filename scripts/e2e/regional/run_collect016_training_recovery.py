@@ -446,7 +446,8 @@ def run_restart_budget_sections(
     )
     fixtures.append(collector)
     collector.create()
-    bdf = str(collector.snapshot()["gpu_inventory"][0]["pci_bdf"])
+    gpu_a = collector.snapshot()["gpu_inventory"][0]
+    bdf = str(gpu_a["pci_bdf"])
     marker_a = f"c016-a-{int(time.time())}"
     injected_a = datetime.now(timezone.utc)
     cleanup.register_seed(collector, marker_a)
@@ -487,22 +488,33 @@ def run_restart_budget_sections(
         expected_gpu_count=topology.world_size,
     )
     target_attempt_id = target["observation"]["attempt_id"]
+    node_b, collector_b, bdf_b = budget_injection_target(
+        settings,
+        regional,
+        case_dir,
+        suffix,
+        target=target,
+        node=target_node,
+        gpu=gpu_a,
+        collector=collector,
+        fixtures=fixtures,
+    )
     marker_b = f"c016-b-{int(time.time())}"
     injected_b = datetime.now(timezone.utc)
-    cleanup.register_seed(collector, marker_b)
-    collector.execute(
+    cleanup.register_seed(collector_b, marker_b)
+    collector_b.execute(
         "write-xid",
         "--xid",
         "31",
         "--marker",
         marker_b,
         "--pci-bdf",
-        bdf,
+        bdf_b,
         "--message",
         "MMU Fault RESTART_APP budget exhausted",
     )
     state_b = regional.wait_for_workflow(
-        node=target_node,
+        node=node_b,
         marker=marker_b,
         observed_after=injected_b,
         case_dir=case_dir / "b-budget",
@@ -526,10 +538,87 @@ def run_restart_budget_sections(
         },
         "b": {
             "marker": marker_b,
+            "node": node_b,
             "workflow": workflow_b,
             "restart_budget": state_b.get("restart_budget"),
         },
     }
+
+
+def restarted_gpus(observation: dict[str, Any]) -> dict[str, set[str]]:
+    """The GPUs each node's live containers of an attempt observation hold."""
+
+    held: dict[str, set[str]] = {}
+    for container in observation.get("containers") or []:
+        if not isinstance(container, dict) or container.get("terminated"):
+            continue
+        node, uuids = container.get("node_id"), container.get("gpu_uuids")
+        if isinstance(node, str) and node and isinstance(uuids, list):
+            held.setdefault(node, set()).update(
+                uuid for uuid in uuids if isinstance(uuid, str) and uuid
+            )
+    return held
+
+
+def budget_injection_target(
+    settings: Settings,
+    regional: RegionalLiveFixture,
+    case_dir: Path,
+    suffix: str,
+    *,
+    target: dict[str, Any],
+    node: str,
+    gpu: dict[str, Any],
+    collector: CollectorAcceptanceFixture,
+    fixtures: list[CollectorAcceptanceFixture | HostProbeFixture],
+) -> tuple[str, CollectorAcceptanceFixture, str]:
+    """Where B writes its XID: ``(node, collector, PCI BDF)`` of a GPU the
+    restarted attempt holds.
+
+    RESTART_WORKLOAD resumes the job and the scheduler places its new Pods
+    anew. Live 2026-11-03 (HyperPod, the native 3-node job on 4 GPU nodes) the
+    new attempt left A's node, B's XID landed on an IDLE node, the product
+    recorded it MONITOR_ONLY (NO_ACTIVE_MANAGED_ATTEMPT) and B waited 600 s for
+    a workflow that could not exist. B keeps A's node and GPU while the
+    restarted attempt still holds that GPU; otherwise it moves to the node of
+    the attempt's first Pod, through a collector of its own, and to a GPU the
+    attempt's observation holds there.
+    """
+
+    held = restarted_gpus(target.get("observation") or {})
+    if gpu.get("uuid") in held.get(node, set()):
+        return node, collector, str(gpu["pci_bdf"])
+    pods = target.get("pods") or []
+    moved = str(pods[0].get("node") or "") if pods else ""
+    if not held.get(moved):
+        raise RegionalFixtureError(
+            "B: the restarted attempt holds no GPU on its first Pod's node "
+            f"{moved!r}; observed {sorted(held)}"
+        )
+    require_action_time(180)
+    collector_b = CollectorAcceptanceFixture(
+        regional,
+        node=moved,
+        image=settings.host_probe_image,
+        case_id=CASE_ID,
+        run_id=f"c016-b-{suffix}",
+        case_dir=case_dir,
+    )
+    fixtures.append(collector_b)
+    collector_b.create()
+    chosen = next(
+        (
+            item
+            for item in collector_b.snapshot()["gpu_inventory"]
+            if item.get("uuid") in held[moved]
+        ),
+        None,
+    )
+    if chosen is None:
+        raise RegionalFixtureError(
+            f"B: no GPU of {moved}'s inventory is one the restarted attempt holds"
+        )
+    return moved, collector_b, str(chosen["pci_bdf"])
 
 
 def capture_post_restart_workload(

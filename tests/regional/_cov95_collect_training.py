@@ -578,6 +578,22 @@ def running_observation(harness: Any) -> Any:
                 attempt_id=settings.attempt_id,
                 phase=WorkloadPhase.RUNNING,
             )["containers"]
+        elif harness.module is c016:
+            # The attempt holds the collector's first GPU on its first Pod's
+            # node: B writes there (``budget_injection_target``).
+            workload = next(
+                item
+                for item in harness.workloads
+                if item.settings.job_id == settings.job_id
+            )
+            observation["containers"] = [
+                {
+                    "node_id": row["node"],
+                    "terminated": False,
+                    "gpu_uuids": ["GPU-a"] if index == 0 else [f"GPU-{index}"],
+                }
+                for index, row in enumerate(workload.source["pods"])
+            ]
         return observation
 
     return running

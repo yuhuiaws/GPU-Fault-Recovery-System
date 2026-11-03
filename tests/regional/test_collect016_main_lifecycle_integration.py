@@ -313,7 +313,9 @@ def test_a_observes_the_replacement_before_b_and_returns_both_attempt_identities
     )
     collector = SimpleNamespace(
         create=Mock(),
-        snapshot=lambda: {"gpu_inventory": [{"pci_bdf": "0000:59:00.0"}]},
+        snapshot=lambda: {
+            "gpu_inventory": [{"uuid": "GPU-a", "pci_bdf": "0000:59:00.0"}]
+        },
         execute=Mock(),
     )
     state_a = {
@@ -343,7 +345,12 @@ def test_a_observes_the_replacement_before_b_and_returns_both_attempt_identities
     replacement = Mock(
         return_value={
             "pods": target_pods,
-            "observation": {"attempt_id": "verified-replacement"},
+            "observation": {
+                "attempt_id": "verified-replacement",
+                "containers": [
+                    {"node_id": "node-0", "terminated": False, "gpu_uuids": ["GPU-a"]}
+                ],
+            },
         },
         side_effect=(
             runner.RegionalFixtureError("replacement observation is missing")
@@ -386,8 +393,139 @@ def test_a_observes_the_replacement_before_b_and_returns_both_attempt_identities
             == "verified-replacement"
         )
         assert collector.execute.call_count == 2
+        assert regional.wait_for_workflow.call_args.kwargs["node"] == "node-0"
+        assert result["b"]["node"] == "node-0", "B stays where the attempt still is"
     replacement.assert_called_once()
     assert replacement.call_args.kwargs["source_uids"] == {
         pod["uid"] for pod in source_pods
     }
     assert workloads == [workload] and fixtures == [collector]
+
+
+@pytest.mark.parametrize("held", ["moved", "nothing-held", "inventory-mismatch"])
+def test_b_follows_the_restarted_attempt_to_a_gpu_it_holds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, held: str
+) -> None:
+    """Live 2026-11-03 (HyperPod, 3-node job on 4 GPU nodes): the restarted
+    attempt left A's node, B's XID landed on an IDLE node, the product recorded
+    it MONITOR_ONLY and B waited 600 s for a workflow that could not exist."""
+
+    job_id = "c016-a-unit"
+    settings = runner.Settings(
+        regional=SimpleNamespace(cluster_id="cluster-a"),
+        site_file=tmp_path / "site.yaml",
+        host_probe_image="unit-image",
+        predecessor_path=tmp_path / "pred.json",
+    )
+    source_pods = [{"uid": f"old-{rank}", "node": f"node-{rank}"} for rank in range(3)]
+    target_pods = [
+        {"uid": f"new-{rank}", "node": f"node-{rank + 1}"} for rank in range(3)
+    ]
+    collectors: dict[str, SimpleNamespace] = {}
+
+    def collector_for(*_: Any, node: str, **__: Any) -> SimpleNamespace:
+        inventory = {
+            "node-0": [{"uuid": "GPU-a", "pci_bdf": "0000:59:00.0"}],
+            "node-1": [
+                {"uuid": "GPU-other", "pci_bdf": "0000:5a:00.0"},
+                {
+                    "uuid": "GPU-elsewhere"
+                    if held == "inventory-mismatch"
+                    else "GPU-x",
+                    "pci_bdf": "0000:72:00.0",
+                },
+            ],
+        }[node]
+        collectors[node] = SimpleNamespace(
+            node=node,
+            create=Mock(),
+            snapshot=lambda: {"gpu_inventory": inventory},
+            execute=Mock(),
+        )
+        return collectors[node]
+
+    containers = [
+        {
+            "node_id": pod["node"],
+            "terminated": held == "nothing-held" and pod["node"] == "node-1",
+            "gpu_uuids": ["GPU-x"]
+            if pod["node"] == "node-1"
+            else [f"GPU-{pod['uid']}"],
+        }
+        for pod in target_pods
+    ]
+    state_a = {
+        "incident": {"workload_identity_source": "SOLE_ACTIVE_ATTEMPT_ON_NODE"},
+        "workflow": {
+            "official_steps": [
+                {"operation": "RESTART_WORKLOAD", "parameters": {"job_id": job_id}}
+            ]
+        },
+    }
+    state_b = {
+        "workflow": {
+            "status": "FAILED",
+            "completed_operations": ["FREEZE_EVIDENCE", "STOP_WORKLOADS"],
+            "step_executions": [
+                {
+                    "operation": "RESTART_WORKLOAD",
+                    "status": "FAILED",
+                    "details": {"reason": "RESTART_BUDGET_EXHAUSTED"},
+                }
+            ],
+        },
+        "commands": [{"step": {"operation": "STOP_WORKLOADS"}}],
+        "restart_budget": {"restart_count": 1},
+    }
+    regional = SimpleNamespace(wait_for_workflow=Mock(side_effect=[state_a, state_b]))
+    workload = SimpleNamespace(
+        submit=Mock(), wait_running=Mock(return_value={"pods": source_pods})
+    )
+    replacement = Mock(
+        return_value={
+            "pods": target_pods,
+            "observation": {"attempt_id": "replacement", "containers": containers},
+        }
+    )
+    monkeypatch.setattr(runner, "managed_fixture", lambda *a, **k: workload)
+    monkeypatch.setattr(
+        runner.base, "render_named_training_manifest", lambda path, **k: path
+    )
+    monkeypatch.setattr(runner, "CollectorAcceptanceFixture", collector_for)
+    monkeypatch.setattr(runner, "require_action_time", lambda *_: None)
+    monkeypatch.setattr(runner.workload_case, "wait_observation", Mock())
+    monkeypatch.setattr(runner.workload_case, "workflow_errors", Mock(return_value=[]))
+    monkeypatch.setattr(runner, "capture_post_restart_workload", replacement)
+    fixtures: list[Any] = []
+    cleanup = SimpleNamespace(register_seed=Mock())
+    arguments = {"workloads": [], "fixtures": fixtures, "cleanup": cleanup}
+
+    if held != "moved":
+        reason = "holds no GPU on" if held == "nothing-held" else "no GPU of node-1"
+        with pytest.raises(runner.RegionalFixtureError, match=reason):
+            runner.run_restart_budget_sections(
+                settings, regional, tmp_path, "unit", **arguments
+            )
+        assert collectors["node-0"].execute.call_count == 1, "A's XID only"
+        assert regional.wait_for_workflow.call_count == 1, "B never waited"
+        if held == "inventory-mismatch":
+            collectors["node-1"].execute.assert_not_called()
+        else:
+            assert "node-1" not in collectors, "no probe for a node it cannot use"
+        return
+    result = runner.run_restart_budget_sections(
+        settings, regional, tmp_path, "unit", **arguments
+    )
+    assert result["errors"] == [], result
+    assert result["b"]["node"] == "node-1"
+    assert fixtures == [collectors["node-0"], collectors["node-1"]], (
+        "the B probe is owned from the moment it exists"
+    )
+    collectors["node-1"].create.assert_called_once()
+    assert collectors["node-0"].execute.call_count == 1, "A's XID only"
+    written = collectors["node-1"].execute.call_args.args
+    assert written[0] == "write-xid" and "0000:72:00.0" in written, written
+    assert regional.wait_for_workflow.call_args.kwargs["node"] == "node-1"
+    assert regional.wait_for_workflow.call_args.kwargs["attempt_id"] == "replacement"
+    seeded = [call.args[0] for call in cleanup.register_seed.call_args_list]
+    assert seeded == [collectors["node-0"], collectors["node-1"]]
