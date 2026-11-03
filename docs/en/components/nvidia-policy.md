@@ -380,6 +380,15 @@ SXID recovery follows the Fabric Manager User Guide:
 - fatal trunk and 10003/19084: require fabric_partition and the complete node GPU inventory; when both are present
   `RESET_ALL_GPUS_AND_NVSWITCHES` is executed (Node Agent `fabricReset` capability, multi-node barrier);
   if either is missing the result is `BLOCKED_MISSING_EVIDENCE`, and it never degrades to a single-GPU reset.
+  Complete means exactly the node's declared expected GPU count (the collector's `GPU_FAULT_EXPECTED_GPU_COUNT` or
+  instance-type count, the `expected_gpu_count` of its inventory snapshots): a fresh inventory snapshot (one
+  nvidia-smi enumeration) that lists fewer GPUs than it declares is not; without a fresh snapshot, the latest per-GPU
+  metric rows around the event count only when they cover exactly the count the node's latest snapshot declares --
+  they are no single delivery, and for an event older than the newest deliveries the window keeps exactly the rows
+  that stopped refreshing (R16's verdict row `pcie_link_downtrain` stays at its last delivery on an idle GPU after a
+  collector restart); the GPU a trusted port topology names for the SXID's port is not either. An incomplete inventory
+  leaves the event without participating GPUs and takes the existing evidence, cordon, quarantine and operator-review
+  path (batch 244).
 - always-fatal (the 20 codes pinned by Table 23): executes `REBOOT_NODE`, cordoning and stopping the job beforehand;
   an event that declares Always-Fatal but is not in the table blocks.
 - B200/B300: the traditional fatal/non-fatal SXIDs do not apply; DCGM/NVSDM telemetry is required.

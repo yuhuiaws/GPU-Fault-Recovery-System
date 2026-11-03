@@ -4,11 +4,12 @@ import logging
 import re
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
+from typing import Protocol
 
 from gpu_fault.app.ingest.gpu_findings import gpu_node_health_findings
 from gpu_fault.app.ingest.node_health import NodeHealthIngestionService
 from gpu_fault.gpu_composites import GPU_COMPOSITE_TRANSACTION, is_pcie_kernel_xid
-from gpu_fault.gpu_metrics import GpuInventorySnapshot
+from gpu_fault.gpu_metrics import GpuInventorySnapshot, GpuMetricLatest
 from gpu_fault.host_health import (
     NodeHealthCategory,
     NodeHealthFinding,
@@ -66,6 +67,83 @@ UNRESOLVED_SIGNAL_KINDS = (
     UNCLASSIFIED_SXID_REASON,
     UNSCHEDULABLE_WITHOUT_CODE_REASON,
 )
+
+
+class GpuInventoryReads(Protocol):
+    """The store reads a node-wide SXID's GPU inventory needs."""
+
+    def get_gpu_inventory_snapshot(
+        self, cluster_id: str, node_id: str
+    ) -> GpuInventorySnapshot | None: ...
+
+    def list_gpu_metrics_latest(
+        self, cluster_id: str, node_id: str
+    ) -> list[GpuMetricLatest]: ...
+
+
+def complete_node_gpu_inventory(
+    store: GpuInventoryReads,
+    event: SxidEvent,
+    snapshot: GpuInventorySnapshot | None,
+    *,
+    legacy_max_age: timedelta,
+) -> list[str]:
+    """The node's whole GPU set a node-wide SXID acts on, or ``[]``.
+
+    A full GPU + NVSwitch reset acts on every GPU of the node: the Node Agent
+    resets them all and refuses a list that is not exactly its own inventory,
+    and the plan's client check and validations cover only the GPUs it names.
+    The set is complete when it is exactly the node's expected GPU count -- the
+    collector's ``GPU_FAULT_EXPECTED_GPU_COUNT`` or instance-type count, which
+    its inventory snapshots declare:
+
+    * the fresh snapshot (``snapshot``) is one nvidia-smi enumeration and
+      stands for the node unless it lists fewer GPUs than it declares;
+    * without one, the GPUs of the node's latest per-GPU rows around the event
+      stand for it only when they are exactly the count the node's latest
+      snapshot declares. Those rows are no delivery: each is the last value of
+      one metric of one GPU, so for an event older than the newest deliveries
+      the window keeps exactly the rows that stopped refreshing. A verdict the
+      collector publishes only under load (``pcie_link_downtrain``) stays at
+      its last delivery after a collector restart, and that one row of GPU 0
+      made a back-dated fatal SXID an executable one-GPU full reset on an
+      8-GPU node (batch 244).
+
+    Anything else is ``[]``, and the policy blocks the reset for "complete node
+    GPU inventory": evidence, cordon, quarantine and an operator.
+    """
+
+    if snapshot is not None:
+        gpus = {device.gpu_uuid for device in snapshot.devices}
+        expected = snapshot.expected_gpu_count
+        source = f"GPU inventory {snapshot.snapshot_id}"
+        if expected is None or len(gpus) == expected:
+            return sorted(gpus)
+    else:
+        declared = store.get_gpu_inventory_snapshot(event.cluster_id, event.node_id)
+        expected = declared.expected_gpu_count if declared is not None else None
+        gpus = set()
+        for latest in store.list_gpu_metrics_latest(event.cluster_id, event.node_id):
+            age = event.observed_at - latest.observed_at
+            if latest.sample.gpu_uuid and -timedelta(seconds=30) <= age <= (
+                legacy_max_age
+            ):
+                gpus.add(latest.sample.gpu_uuid)
+        source = "the latest per-GPU telemetry around the event"
+        if expected is not None and len(gpus) == expected:
+            return sorted(gpus)
+    LOGGER.warning(
+        "SXID %s on %s/%s: %s names %d GPU(s) and the node declares %s; that is "
+        "not its complete GPU inventory, so the event names no participating "
+        "GPUs (a full GPU/NVSwitch reset blocks for operator review)",
+        event.sxid,
+        event.cluster_id,
+        event.node_id,
+        source,
+        len(gpus),
+        expected if expected is not None else "no GPU count",
+    )
+    return []
 
 
 class FaultIngestionService:
@@ -464,28 +542,25 @@ class FaultIngestionService:
                 and event.link_scope.value != "ACCESS"
             )
         ):
-            inventory = (
-                {device.gpu_uuid for device in inventory_snapshot.devices}
-                if inventory_snapshot is not None
-                else {
-                    latest.sample.gpu_uuid
-                    for latest in self.context.store.list_gpu_metrics_latest(
-                        event.cluster_id, event.node_id
-                    )
-                    if (
-                        latest.sample.gpu_uuid
-                        and -timedelta(seconds=30)
-                        <= event.observed_at - latest.observed_at
-                        <= self.context.legacy_gpu_metrics_inventory_max_age
-                    )
-                }
+            inventory = complete_node_gpu_inventory(
+                self.context.store,
+                event,
+                inventory_snapshot,
+                legacy_max_age=self.context.legacy_gpu_metrics_inventory_max_age,
             )
             if inventory:
-                updates["participating_gpu_uuids"] = sorted(inventory)
+                updates["participating_gpu_uuids"] = inventory
                 updates["fabric_partition"] = (
                     event.fabric_partition
                     or f"{event.cluster_id}/{event.node_id}/local-nvswitch"
                 )
+            elif (
+                event.participating_gpu_uuids
+                and event.classification.value != "ALWAYS_FATAL"
+            ):
+                # The trusted port topology names the GPU on the SXID's port;
+                # a node-wide reset needs every GPU of the node.
+                updates["participating_gpu_uuids"] = []
         return event.model_copy(update=updates) if updates else event
 
     def _resolve_kernel_xid_gpu_uuid(self, event: XidEvent) -> XidEvent:

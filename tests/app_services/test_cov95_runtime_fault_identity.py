@@ -164,6 +164,9 @@ def test_sxid_scope_uses_current_inventory_without_borrowing_unproved_gpu_target
             legacy_metric(
                 context, uuid="GPU-b", pci="0000:c1:00.0", observed_at=observed_at
             )
+            # The count the rows must cover, from a snapshot too old to stand
+            # for the event itself (``test_full_reset_inventory_basis``).
+            inventory(context, observed_at=NOW - timedelta(hours=1))
     else:
         inventory(
             context,

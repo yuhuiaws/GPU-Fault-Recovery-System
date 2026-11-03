@@ -364,7 +364,14 @@ SXID 恢复依据 Fabric Manager User Guide：
   然后停止任务并 reset 整组 GPU。
 - fatal trunk 与 10003/19084：要求 fabric_partition 和完整节点 GPU inventory，齐备时
   执行 `RESET_ALL_GPUS_AND_NVSWITCHES`（Node Agent `fabricReset` 能力，多节点 barrier），
-  缺一即 `BLOCKED_MISSING_EVIDENCE`，不会退化成单 GPU reset。
+  缺一即 `BLOCKED_MISSING_EVIDENCE`，不会退化成单 GPU reset。完整指恰为节点声明的预期
+  GPU 数（collector 的 `GPU_FAULT_EXPECTED_GPU_COUNT` 或机型数量，即 inventory snapshot 的
+  `expected_gpu_count`）：新鲜的 inventory snapshot（一次 nvidia-smi 枚举）列出的 GPU
+  少于其声明数时不算；没有新鲜 snapshot 时，事件前后窗口内的最新逐 GPU 指标行只有恰好覆盖
+  节点最新 snapshot 声明的数量才算——这些行不是同一次投递，事件早于最新投递时窗口里留下的
+  正是停止刷新的行（R16 的判定行 `pcie_link_downtrain` 在 collector 重启后的空闲 GPU 上
+  停在最后一次投递）；可信端口拓扑为 SXID 端口给出的 GPU 也不算。不完整时事件不带
+  participating GPU，走既有的证据冻结、cordon、quarantine 与运维审核路径（batch 244）。
 - always-fatal（Table 23 钉死的 20 码）：执行 `REBOOT_NODE`，事前 cordon 并停止任务；
   事件声明 Always-Fatal 但不在表内时阻塞。
 - B200/B300：传统 fatal/non-fatal SXID 不适用，要求 DCGM/NVSDM telemetry。

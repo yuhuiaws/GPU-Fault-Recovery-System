@@ -18,6 +18,31 @@ from tests._builders import asgi_client, build_context, gpu_metric_batch
 NOW = datetime(2026, 7, 20, 10, 0, tzinfo=timezone.utc)
 
 
+def declare_gpu_count(context, count: int = 8) -> None:
+    """The node's expected GPU count, from an inventory snapshot an hour older
+    than the events (not fresh for them): the latest per-GPU rows answer for a
+    node-wide SXID's inventory only when they cover the count it declares."""
+
+    context.store.save_gpu_inventory_snapshot(
+        GpuInventorySnapshot(
+            cluster_id="hp-cluster",
+            node_id="worker-1",
+            observed_at=NOW - timedelta(hours=1),
+            source=GpuMetricSource.NVIDIA_SMI,
+            source_boot_id="boot-a",
+            devices=[
+                GpuInventoryDevice(
+                    gpu_index=index,
+                    gpu_uuid=f"GPU-H200-{index}",
+                    pci_bdf=f"0000:{0x59 + index:02x}:00.0",
+                )
+                for index in range(count)
+            ],
+            expected_gpu_count=count,
+        )
+    )
+
+
 def test_kernel_ingestion_wakes_dispatcher() -> None:
     context = build_context()
     wake_calls = []
@@ -179,6 +204,7 @@ def test_sxid_accepts_official_summary_and_rejects_continuation() -> None:
 def test_kernel_always_fatal_sxid_uses_local_gpu_inventory() -> None:
     async def scenario() -> None:
         context = build_context()
+        declare_gpu_count(context)
         context.gpu_metrics.ingest(
             gpu_metric_batch(
                 "h200-inventory",
@@ -318,6 +344,7 @@ def test_fabric_manager_log_endpoint_creates_sxid_workflow() -> None:
 def test_fabric_manager_sxid10003_resolves_local_fabric_reset() -> None:
     async def scenario() -> None:
         context = build_context()
+        declare_gpu_count(context)
         context.gpu_metrics.ingest(
             gpu_metric_batch(
                 "fm-h200-sxid10003-inventory",
@@ -426,6 +453,7 @@ def test_fabric_manager_rejects_sxid_severity_conflict() -> None:
 def test_fabric_manager_sxid_19084_requires_full_reset() -> None:
     async def scenario() -> None:
         context = build_context()
+        declare_gpu_count(context)
         context.gpu_metrics.ingest(
             gpu_metric_batch(
                 "fm-19084-inventory",
