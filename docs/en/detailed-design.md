@@ -2222,7 +2222,17 @@ all excuses nothing. Once per-GPU reset windows kept Fabric Manager, it counted 
 and escalated to RESTART_NODE with no module unloaded. VERIFY_NO_GPU_CLIENTS and the final ownership recheck scan only
 the targets' `/dev/nvidiaN` and never saw it; one holding a target still fails them closed. The bystander rule excuses
 Fabric Manager itself only: the NVLSM the same unit runs on NVL5 (`comm` `nvlsm`) is a client if it holds an NVIDIA device
-node, and the display stack stays loaded (fail closed; not observed live). The quiesce never signals Fabric Manager or
+node, and the display stack stays loaded (fail closed; not observed live). A read-only NVML query does not stop the
+unload either (`holders.display_release_query_client`): a process named `nvidia-smi` whose `/proc/<pid>/fd` reads in
+full without `nvidia-uvm` (`query_clients.query_only_device_client`, the query the final ownership recheck lets pass)
+and that holds nothing but `/dev/nvidiaN` (the target's included) and `/dev/nvidiactl` reads the driver through
+`nvidia.ko` alone and is no client of `nvidia_drm`/`nvidia_modeset`, whose unload the module reference counts gate on
+their own; it is recorded in `display_release_bystanders` too. One holding `nvidia-modeset`, a capability, fabric or
+deleted node, one whose descriptor table cannot be read in full (a process that has exited included), or any other
+process name still keeps every module loaded. It used to count as a holder: a busy reset whose release is declined
+stays busy until its three attempts are spent and the ladder reboots the node; in GF-REGIONAL-COLLECT-016 D (plain EKS
+p5en, XID 109) the node's serial console shows no display-stack release for the whole RESET_GPU step while the
+acceptance reset sampler ran `nvidia-smi` on the target node every 0.25 s. The quiesce never signals Fabric Manager or
 NVLSM: the device sweep recognises either by process name (`nv-fabricmanage`; `nvlsm` wherever it runs) or by the
 `nvidia-fabricmanager.service` cgroup (any process of the unit) and skips it whichever route matched it -- the process
 list, the workload cgroup or a Kubernetes container (`unswept_device_holders[].reason=fabric_manager_never_swept`) -- and

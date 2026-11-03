@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from gpu_fault.cluster_scope import FABRIC_MANAGER_UNIT
+from gpu_fault.node_agent.query_clients import query_only_device_client
 from gpu_fault.node_agent.common import (
     FABRIC_MANAGER_PROCESS,
     FABRIC_PROCESSES,
@@ -337,6 +338,43 @@ def display_release_bystander(
     return persistence_daemon_bystander(
         holder, target_device_paths
     ) or fabric_manager_bystander(holder, kept_services)
+
+
+def display_release_query_client(
+    proc_root: Path | None, holder: Mapping[str, Any]
+) -> bool:
+    """A read-only NVML query the display-stack release goes ahead beside.
+
+    ``nvidia-smi --query-gpu`` holds the GPUs' ``/dev/nvidiaN`` nodes of
+    ``nvidia.ko`` and ``/dev/nvidiactl`` while it runs, the target's node
+    included; it is no client of ``nvidia_drm`` or ``nvidia_modeset``, whose
+    unload the ``/proc/modules`` refcounts gate on their own
+    (``idle_display_modules``), so nothing is pulled from under it. The final
+    ownership boundary already lets such a query pass (``query_clients``); read
+    as a holder here it kept the idle stack loaded, and a busy reset whose
+    release is declined stays busy until its three attempts are spent. Live
+    (GF-REGIONAL-COLLECT-016 D, gpu-eks-cluster p5en, XID 109): no display-stack
+    release on the node's console for the whole RESET_GPU step, the reset
+    failed and the reset rung rebooted the node, while the acceptance reset
+    sampler ran ``nvidia-smi`` on the target node every 0.25 s. Positive
+    evidence only: ``query_only_device_client`` (named ``nvidia-smi``, its
+    descriptor table read in full, no ``/dev/nvidia-uvm``) holding nothing but
+    GPU nodes and ``/dev/nvidiactl`` -- no modeset, capability, fabric or
+    deleted node.
+    """
+
+    devices = [item for item in str(holder.get("devices") or "").split(",") if item]
+    if (
+        not devices
+        or holder.get("deleted_device_node")
+        or not all(
+            device == "/dev/nvidiactl"
+            or NVIDIA_GPU_DEVICE_PATTERN.fullmatch(device) is not None
+            for device in devices
+        )
+    ):
+        return False
+    return query_only_device_client(proc_root, holder)
 
 
 def display_module_state(proc_root: Path) -> list[dict[str, Any]]:

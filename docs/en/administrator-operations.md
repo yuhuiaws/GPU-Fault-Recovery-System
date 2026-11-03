@@ -1735,8 +1735,9 @@ Semantics and boundaries of `eks-managed`:
   Fabric Manager the window kept (`nv-fabricmanage` in `nvidia-fabricmanager.service`, holding only `/dev/nvidia-caps/*`,
   `/dev/nvidia-nvswitch*` and `/dev/nvidia-nvlink`; judged by that window's own `kept_services`, so a window that meant to
   stop it, one that does not manage it, or no window excuses nothing; it excuses Fabric Manager itself only -- on NVL5 an
-  `nvlsm` of the same unit holding an NVIDIA device node is still a client and fails closed, not observed live): they do
-  not stop the unload and are both recorded
+  `nvlsm` of the same unit holding an NVIDIA device node is still a client and fails closed, not observed live) and a
+  read-only `nvidia-smi` query (no `nvidia-uvm`, holding nothing but `/dev/nvidiaN` and `/dev/nvidiactl`, such as the
+  acceptance reset sampler): they do not stop the unload and are all recorded
   in `display_release_bystanders` (detailed design, quiesce). **`/proc/modules` and `/sys/class/drm` decide whether the
   stack is back**: before the unload the Agent notes which GPUs have an NVIDIA DRM device, and after the load every module
   the reset unloaded must be `Live` again and every one of those GPUs must have its DRM device back. A missing module

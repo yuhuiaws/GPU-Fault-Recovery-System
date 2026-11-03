@@ -132,7 +132,8 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
   `[display stack not restored]` 并给出补救 `modprobe nvidia_drm` 或重启节点）；窗口保留的 `nvidia-persistenced`（只持有其余 GPU）与窗口保留的
   Fabric Manager（窗口的 `kept_services` 记着它，只持有 `/dev/nvidia-caps/*`/`/dev/nvidia-nvswitch*`/`/dev/nvidia-nvlink`）
   不阻止卸载，记在 `display_release_bystanders`（只豁免 Fabric Manager 本身：NVL5 上同一单元里的 `nvlsm` 若持有 NVIDIA
-  设备节点仍算客户端，quiesce 也从不 signal 它）；QUIESCE details 带 `stopped_services`/`inactive_services`/`protected_services`。
+  设备节点仍算客户端，quiesce 也从不 signal 它），只读的 `nvidia-smi` 查询（无 `nvidia-uvm`、只持有 `/dev/nvidiaN` 与
+  `/dev/nvidiactl`）同样不阻止卸载、记在该处；QUIESCE details 带 `stopped_services`/`inactive_services`/`protected_services`。
 - 不容忍该污点的 DaemonSet Pod 在窗口内被驱逐、窗口后回来；带无 key 通配容忍（`operator: Exists`）的第三方 GPU 客户端会留在
   窗口里，reset 仍会 `In use by another client`——见 §3 第 6 条。
 

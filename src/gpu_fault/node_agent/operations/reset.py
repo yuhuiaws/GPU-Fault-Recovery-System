@@ -30,6 +30,7 @@ from gpu_fault.node_agent.operations.display_stack import (
 from gpu_fault.node_agent.operations.holders import (
     IDLE_DISPLAY_MODULES,
     display_release_bystander,
+    display_release_query_client,
     gpu_client_holder_evidence,
     gpu_client_holder_summary,
     idle_display_modules,
@@ -182,7 +183,9 @@ class ResetOperationsMixin:
         GPUs and ``/dev/nvidiactl``, and the Fabric Manager the window kept
         (``kept_services``, the window's own record), holding nothing but the
         fabric's nodes, are no such clients (``display_release_bystander``);
-        they go to ``bystanders``. The modules are loaded again after the reset
+        nor is a read-only ``nvidia-smi`` query, which holds no display-stack
+        node (``display_release_query_client``). They go to ``bystanders``.
+        The modules are loaded again after the reset
         (``_reload_display_modules``).
         """
 
@@ -193,6 +196,7 @@ class ResetOperationsMixin:
         targets = evidence.get("target_device_paths") or []
         if evidence.get("device_holder_count", len(holders)) != len(holders) or any(
             not display_release_bystander(holder, targets, kept_services)
+            and not display_release_query_client(self.proc_root, holder)
             for holder in holders
         ):
             # A listed holder that is a client, or more holders than the

@@ -175,8 +175,9 @@ closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace`
   window kept (on the other GPUs only) and the Fabric Manager the window kept (named in its `kept_services`, on
   `/dev/nvidia-caps/*`/`/dev/nvidia-nvswitch*`/`/dev/nvidia-nvlink` only) do not stop the unload and are recorded in
   `display_release_bystanders` (Fabric Manager itself only: on NVL5 an `nvlsm` of the same unit holding an NVIDIA device
-  node is still a client, and the quiesce never signals it either); QUIESCE details carry
-  `stopped_services`/`inactive_services`/`protected_services`.
+  node is still a client, and the quiesce never signals it either), and a read-only `nvidia-smi` query (no `nvidia-uvm`,
+  holding nothing but `/dev/nvidiaN` and `/dev/nvidiactl`) does not stop the unload either and is recorded there; QUIESCE
+  details carry `stopped_services`/`inactive_services`/`protected_services`.
 - DaemonSet Pods that do not tolerate the taint are evicted for the window and return after it; third-party GPU
   clients with a key-less wildcard toleration (`operator: Exists`) stay inside the window and the reset still answers
   `In use by another client` -- see §3 item 6.

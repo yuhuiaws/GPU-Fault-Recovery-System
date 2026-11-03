@@ -19,7 +19,10 @@ from subprocess import CalledProcessError, CompletedProcess
 
 import pytest
 
-from gpu_fault.node_agent.operations.holders import idle_display_modules
+from gpu_fault.node_agent.operations.holders import (
+    display_release_query_client,
+    idle_display_modules,
+)
 from gpu_fault.node_agent.protocol import NodeActionStatus
 from tests.node_agent._support import (
     WorkflowOperation,
@@ -265,6 +268,9 @@ def _holder(proc: Path, pid: str, comm: str, devices: list[str], cgroup: str) ->
 KEPT_DAEMON_DEVICES = [f"/dev/nvidia{minor}" for minor in range(1, 8)] + [
     "/dev/nvidiactl"
 ]
+#: What one ``nvidia-smi --query-gpu`` holds while it runs: every GPU node,
+#: the target's included, and ``/dev/nvidiactl``; never ``/dev/nvidia-uvm``.
+QUERY_DEVICES = [f"/dev/nvidia{minor}" for minor in range(8)] + ["/dev/nvidiactl"]
 
 
 def test_the_kept_persistence_daemon_does_not_keep_the_display_stack_loaded(
@@ -330,6 +336,24 @@ def test_the_kept_persistence_daemon_does_not_keep_the_display_stack_loaded(
             "/system.slice/dcgm-exporter.service",
             "only the persistence daemon is a bystander",
         ),
+        (
+            "nvidia-smi",
+            ["/dev/nvidia0", "/dev/nvidia-uvm", "/dev/nvidiactl"],
+            "/system.slice/sampler.service",
+            "a uvm handle is a CUDA context, whatever the process is called",
+        ),
+        (
+            "nvidia-smi",
+            ["/dev/nvidia0", "/dev/nvidia-modeset", "/dev/nvidiactl"],
+            "/system.slice/sampler.service",
+            "a modeset handle is a client of the display stack itself",
+        ),
+        (
+            "python",
+            QUERY_DEVICES,
+            "/system.slice/sampler.service",
+            "only a process named nvidia-smi is read as a query",
+        ),
     ],
 )
 def test_any_other_holder_still_keeps_every_module_loaded(
@@ -348,3 +372,60 @@ def test_any_other_holder_still_keeps_every_module_loaded(
     )
     assert "released_kernel_modules" not in result.details
     assert "display_release_bystanders" not in result.details
+
+
+def test_a_read_only_nvidia_smi_query_does_not_keep_the_display_stack_loaded(
+    tmp_path: Path,
+) -> None:
+    """Live (GF-REGIONAL-COLLECT-016 D, gpu-eks-cluster p5en, XID 109): the
+    node's console shows no display-stack release for the whole RESET_GPU
+    step, the reset failed and the reset rung rebooted the node, while the
+    acceptance sampler ran ``nvidia-smi`` on the target node every 0.25 s. A
+    query holding the GPU nodes and ``/dev/nvidiactl`` -- the target's too --
+    and no ``/dev/nvidia-uvm`` is no client of ``nvidia_drm``/``nvidia_modeset``:
+    the release goes ahead beside it and names it, as the final ownership
+    boundary already lets it pass."""
+
+    proc = _proc(tmp_path)
+    _holder(
+        proc,
+        "51234",
+        "nvidia-smi",
+        QUERY_DEVICES,
+        "/system.slice/gpu-fault-reset-sampler-0123456789abcdef.service",
+    )
+    runner = DisplayStackRunner(modules=proc / "modules")
+    agent = _agent(tmp_path, runner, proc)
+
+    result = agent.execute(envelope(command(WorkflowOperation.RESET_GPU)))
+
+    assert result.status is NodeActionStatus.SUCCEEDED, result.error
+    assert result.details["released_kernel_modules"] == ["nvidia_drm", "nvidia_modeset"]
+    assert result.details["reloaded_kernel_modules"] == ["nvidia_modeset", "nvidia_drm"]
+    assert result.details["reset_attempts"] == 2, "busy once, released, reset"
+    assert result.details["reset_busy_refusals"] == 1
+    assert result.details["display_release_bystanders"] == [
+        {
+            "pid": "51234",
+            "process_name": "nvidia-smi",
+            "devices": ",".join(sorted(QUERY_DEVICES)),
+        }
+    ], "the record names the query the release went ahead beside"
+
+
+def test_a_query_that_vanished_before_its_descriptors_were_read_still_declines(
+    tmp_path: Path,
+) -> None:
+    """Positive evidence only: a holder whose descriptor table cannot be read
+    is not judged a query, and the release is declined as before."""
+
+    proc = _proc(tmp_path)
+    holder = {"pid": "60000", "process_name": "nvidia-smi", "devices": "/dev/nvidia0"}
+    assert display_release_query_client(proc, holder) is False
+    _holder(proc, "60000", "nvidia-smi", QUERY_DEVICES, "/system.slice/x.service")
+    assert display_release_query_client(proc, holder) is True
+    assert display_release_query_client(None, holder) is False
+    assert (
+        display_release_query_client(proc, {**holder, "deleted_device_node": True})
+        is False
+    ), "a replaced device node under a query is no plain query"

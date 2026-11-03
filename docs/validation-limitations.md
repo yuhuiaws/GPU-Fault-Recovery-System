@@ -6247,3 +6247,27 @@ Not verified:
   permission (its requests were accepted), so no denial was observed. The
   markers are the AWS CLI's usual `AccessDeniedException`,
   `UnauthorizedOperation` and "not authorized".
+
+## Display-stack release beside a read-only NVML query (batch 243)
+
+A busy single-GPU reset unloads the idle `nvidia_drm`/`nvidia_modeset` only when
+every device holder is a bystander. A read-only `nvidia-smi` query -- named
+`nvidia-smi`, its descriptor table read in full without `nvidia-uvm`, holding
+nothing but `/dev/nvidiaN` and `/dev/nvidiactl` -- is one now
+(`holders.display_release_query_client`), as it already was for the final
+ownership recheck (`query_clients`). Before, a query seen at the release check
+kept the stack loaded and the reset stayed busy until its three attempts were
+spent, and the reset rung rebooted the node.
+
+Not verified live:
+
+- The R16 failure this answers (GF-REGIONAL-COLLECT-016 D, plain EKS p5en, XID
+  109, 2026-11-03): the node's serial console shows no display-stack release
+  for the whole RESET_GPU step and the reset rung rebooted the node, while the
+  case's reset sampler ran `nvidia-smi --query-gpu=uuid` on the target node
+  every 0.25 s. The step's `gpu_client_holders`, which would name the holder,
+  were not kept by the case and sit in the product store only; that the query
+  was the holder is inferred.
+- The rule is unit-tested (`tests/node_agent/test_reset_releases_idle_display_modules.py`)
+  and has not run on a node: a live proof needs a busy reset whose release
+  check sees such a query, released and reset on the next attempt.
