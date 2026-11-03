@@ -620,6 +620,44 @@ def test_restart_authorization_failure_stops_before_replacement_and_stops_sample
     assert active_reset.calls[-1] == "stop-reset-sampler"
 
 
+def test_failed_reset_fails_d_with_its_steps_and_never_asks_the_custody(
+    active_reset: SimpleNamespace,
+) -> None:
+    """Live 2026-11-03 (gpu-eks-cluster, R16): RESET_GPU failed, the product's
+    reset rung rebooted the node, and D reported the custody's refusal of the
+    FAILED workflow ("successful workflow or incident identity differs")."""
+
+    workflow = active_reset.state["workflow"]
+    workflow["status"] = "FAILED"
+    workflow["completed_operations"] = list(collect016.WORKLOAD_RESET_STEPS[:5])
+    reset_index = collect016.WORKLOAD_RESET_STEPS.index("RESET_GPU")
+    workflow["step_executions"] = [
+        *workflow["step_executions"][:reset_index],
+        {
+            "operation": "RESET_GPU",
+            "status": "FAILED",
+            "step_index": reset_index,
+            "error": "nvidia-smi --gpu-reset: In use by another client",
+        },
+    ]
+    with pytest.raises(collect016.RegionalFixtureError) as raised:
+        run_active_reset(active_reset)
+    message = str(raised.value)
+    assert "ended 'FAILED': RESET_GPU (step 5): nvidia-smi --gpu-reset" in message
+    assert "custody" in message and "identity differs" not in message
+    assert "authorize-restart" not in active_reset.calls
+    assert "replacement-pods" not in active_reset.calls
+    assert "host-after" not in active_reset.calls
+    assert active_reset.calls[-1] == "stop-reset-sampler"
+    record = json.loads((active_reset.output / "workflow-terminal.json").read_text())
+    assert record["workflow"]["status"] == "FAILED"
+    assert record["workflow"]["step_executions"][-1]["operation"] == "RESET_GPU"
+    assert "workflow-terminal.json" in active_reset.persisted_at_stop
+    assert not (active_reset.output / "post-restart-workload.json").exists(), (
+        "a failed reset writes no post-restart proof"
+    )
+
+
 def test_shared_reset_without_workload_proof_keeps_idle_client_rule(
     active_reset: SimpleNamespace,
 ) -> None:

@@ -86,6 +86,7 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     run_case_main,
     settings_from_arguments,
 )
+from scripts.e2e.regional.reset_terminal_record import settle_reset_terminal  # noqa: E402
 from scripts.e2e.regional.warm_spare_fixture import (  # noqa: E402
     WarmSpareLiveFixture,
 )
@@ -566,14 +567,9 @@ def run_single_reset(
             case_dir=case_dir,
             node=node,
         )
-        if observe_post_restart_workload is not None:
-            post_restart_workload = observe_post_restart_workload(state)
-            if not isinstance(post_restart_workload, dict) or not post_restart_workload:
-                raise RegionalFixtureError("post-restart workload proof is missing")
-            state["post_restart_workload"] = post_restart_workload
-            write_json_atomic(
-                case_dir / "post-restart-workload.json", post_restart_workload
-            )
+        post_restart_workload = settle_reset_terminal(
+            case_dir, state, observe_post_restart_workload
+        )
         after = host.execute(
             "snapshot",
             "--since-epoch",

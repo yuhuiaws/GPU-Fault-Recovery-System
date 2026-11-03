@@ -251,8 +251,11 @@ def test_single_reset_requires_a_populated_post_restart_workload_proof(
         execute=lambda action, *a, **k: host_calls.append(action) or dict(baseline),
     )
     collector = SimpleNamespace(node="node-a", execute=lambda *a, **k: {"records": []})
+    # A SUCCEEDED reset: only then is the post-restart workload observed at all.
     monkeypatch.setattr(
-        destructive, "wait_xid_workflow", lambda *a, **k: {"workflow": {"status": "X"}}
+        destructive,
+        "wait_xid_workflow",
+        lambda *a, **k: {"workflow": {"status": "SUCCEEDED"}},
     )
     settings = destructive.Settings(
         regional=SimpleNamespace(namespace="gpu-fault-system"),  # type: ignore[arg-type]
@@ -282,4 +285,7 @@ def test_single_reset_requires_a_populated_post_restart_workload_proof(
     assert "write-xid" in host_calls, "the proof is judged after the injection"
     assert not (tmp_path / "post-restart-workload.json").exists(), (
         "a refused proof is never written as evidence"
+    )
+    assert (tmp_path / "workflow-terminal.json").exists(), (
+        "the terminal record is kept before the proof is judged"
     )
