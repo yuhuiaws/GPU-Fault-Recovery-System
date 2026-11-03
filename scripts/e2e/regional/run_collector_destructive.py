@@ -57,7 +57,10 @@ from scripts.e2e.regional.collector_inventory_reboot import (  # noqa: E402
 from scripts.e2e.regional import collect015_provider as collect015  # noqa: E402
 from scripts.e2e.regional.collect014_premise import (  # noqa: E402
     FAIL_CLOSED_SAFETY_MARGIN as FAIL_CLOSED_SAFETY_MARGIN,
+    GPU_INVENTORY_SNAPSHOT as GPU_INVENTORY_SNAPSHOT,
     INGEST_FUTURE_TOLERANCE as INGEST_FUTURE_TOLERANCE,
+    PremiseClock,
+    establish_fail_closed_premise,
     fail_closed_timing_errors as fail_closed_timing_errors,
 )
 from scripts.e2e.regional.collector_reboot_evidence import (  # noqa: E402
@@ -115,9 +118,9 @@ CONFIRMATIONS = {
 # with the same verdict.
 COLLECT013_XIDS = (109, 62)
 DEFAULT_COLLECT013_XID = 109
-# COLLECT-014 fail-closed direction: how far back the API SXID is dated so no
-# stored inventory sample can count as evidence for it (see run_collect014).
-# Must stay below GPU_FAULT_FAULT_ACTION_MAX_AGE_SECONDS (900s).
+# COLLECT-014 fail-closed direction: how far back the API SXID is dated
+# (collect014_premise). Inside the 600 s coverage-heartbeat window an idle
+# cluster's IDLE needs, so under GPU_FAULT_FAULT_ACTION_MAX_AGE_SECONDS (900s).
 FAIL_CLOSED_EVENT_AGE = timedelta(minutes=8)
 FAIL_CLOSED_REASON = "requires fabric_partition and complete node GPU inventory"
 FULL_FABRIC_RESET_ACTIONS = frozenset({"RESET_ALL_GPUS_AND_NVSWITCHES"})
@@ -176,34 +179,6 @@ for workflow in store.list_workflows(limit=500, newest_first=True):
         "workflow": workflow.model_dump(mode="json"),
     })
 print(json.dumps({"matches": matches}, sort_keys=True, default=str))
-"""
-
-
-GPU_INVENTORY_SNAPSHOT = r"""
-import json
-import sys
-
-from gpu_fault.app import ApplicationContext
-
-cluster_id, node_id = sys.argv[1:]
-context = ApplicationContext.from_environment()
-store = context.store
-snapshot = store.get_gpu_inventory_snapshot(cluster_id, node_id)
-print(json.dumps({
-    "snapshot_max_age_seconds": context.gpu_inventory_max_age.total_seconds(),
-    "legacy_max_age_seconds": (
-        context.legacy_gpu_metrics_inventory_max_age.total_seconds()
-    ),
-    "present": snapshot is not None,
-    "observed_at": snapshot.observed_at.isoformat() if snapshot else None,
-    "source_boot_id": snapshot.source_boot_id if snapshot else None,
-    "device_count": len(snapshot.devices) if snapshot else 0,
-    "legacy_observed_at": [
-        item.observed_at.isoformat()
-        for item in store.list_gpu_metrics_latest(cluster_id, node_id)
-        if item.sample.gpu_uuid
-    ],
-}, sort_keys=True, default=str))
 """
 
 
@@ -931,6 +906,7 @@ def run_collect014(
     profile_version: str,
     *,
     cleanup: CaseCleanup | None = None,
+    clock: PremiseClock | None = None,
 ) -> dict[str, Any]:
     cleanup = cleanup or CaseCleanup()
     baseline = reset_host.execute("snapshot")
@@ -940,28 +916,27 @@ def run_collect014(
     gpu = baseline["gpu_inventory"][0]
     bdf = str(gpu["pci_bdf"])
     fail_marker = f"c014-fail-{int(time.time())}-a{attempt}"
-    # The fail-closed direction is "SXID 10003 with no inventory evidence".
-    # Ingest accepts an inventory sample as evidence only while -30s <=
-    # event.observed_at - sample.observed_at <= 180s (snapshot) or 600s (legacy
-    # metrics), so the event is back-dated far enough that the newest stored
-    # sample is still *newer* than event + 30s; eight minutes tolerates a 7.5
-    # min delivery lag and stays under the 900s STALE_FAULT_GENERATION fence.
-    # The premise bets on inventory freshness, so the store is read first.
-    posted_at = datetime.now(timezone.utc)
-    old_time = posted_at - FAIL_CLOSED_EVENT_AGE
-    inventory = regional.cpu_python(
-        GPU_INVENTORY_SNAPSHOT,
-        settings.regional.cluster_id,
-        settings.node,
+    # The fail-closed direction is "SXID 10003 with no inventory evidence":
+    # dated FAIL_CLOSED_EVENT_AGE back, posted only on a read where no stored
+    # sample could vouch for it. The store is re-read, the event dated afresh,
+    # until that holds; a bound from the product's max age ends the wait
+    # INCONCLUSIVE, never with a post (collect014_premise).
+    premise = establish_fail_closed_premise(
+        lambda: regional.cpu_python(
+            GPU_INVENTORY_SNAPSHOT, settings.regional.cluster_id, settings.node
+        ),
+        event_age=FAIL_CLOSED_EVENT_AGE,
+        clock=clock,
     )
-    errors = fail_closed_timing_errors(inventory, event_time=old_time)
-    if errors:
+    errors: list[str] = []
+    if premise.refusal is not None:
         return {
-            "verdict": "FAIL",
+            "verdict": "INCONCLUSIVE",
+            "inconclusive_reason": premise.refusal,
             "errors": errors,
             "fail_closed_marker": None,
             "positive_marker": None,
-            "inventory_snapshot": inventory,
+            **premise.evidence(),
             "fail_closed": None,
             "positive": None,
             "restore_workflows": [],
@@ -970,7 +945,7 @@ def run_collect014(
         "cluster_id": settings.regional.cluster_id,
         "node_id": settings.node,
         "record_id": fail_marker,
-        "observed_at": old_time.isoformat(),
+        "observed_at": premise.event_time.isoformat(),
         "message": (
             f"nvidia-nvswitch0: SXid (PCI:{bdf}): 10003, Fatal, "
             f"Link 3 NVSWITCH_NON_CORRECTABLE marker={fail_marker}"
@@ -987,7 +962,7 @@ def run_collect014(
         case_dir=case_dir / "fail-closed",
         timeout_seconds=300,
         terminal_workflow=True,
-        observed_after=posted_at,
+        observed_after=premise.posted_at,
     )
     cleanup.register_state(collector, fail_state)
     after_fail = reset_host.execute("snapshot")
@@ -1033,7 +1008,7 @@ def run_collect014(
             "errors": errors,
             "fail_closed_marker": fail_marker,
             "positive_marker": None,
-            "inventory_snapshot": inventory,
+            **premise.evidence(),
             "fail_closed": fail_state,
             "positive": None,
             "restore_workflows": restores,
@@ -1071,7 +1046,7 @@ def run_collect014(
         "errors": errors,
         "fail_closed_marker": fail_marker,
         "positive_marker": positives[0]["marker"],
-        "inventory_snapshot": inventory,
+        **premise.evidence(),
         "fail_closed": fail_state,
         "positive": positives[0]["state"],
         "positive_variants": positives,

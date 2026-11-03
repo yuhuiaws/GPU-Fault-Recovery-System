@@ -30,7 +30,7 @@
     "scripts/e2e/regional/audit_regional_command_protocol_live.py": 2192,
     "scripts/e2e/regional/probes/collector_node_probe.py": 4113,
     "scripts/e2e/regional/run_collector_acceptance.py": 1822,
-    "scripts/e2e/regional/run_collector_destructive.py": 1561,
+    "scripts/e2e/regional/run_collector_destructive.py": 1536,
     "scripts/e2e/regional/run_ha001_control_plane_failover.py": 1554,
     "scripts/e2e/regional/run_notification_acceptance.py": 1620,
     "scripts/e2e/regional/run_workload_acceptance.py": 2119,

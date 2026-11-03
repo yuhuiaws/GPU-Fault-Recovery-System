@@ -1337,9 +1337,11 @@ def test_collect014_refuses_to_post_when_the_stored_inventory_is_too_fresh(
         1,
         "v1",  # type: ignore[arg-type]
     )
-    assert result["verdict"] == "FAIL"
+    # No product max age in the read, so no wait bound: INCONCLUSIVE at once.
+    assert result["verdict"] == "INCONCLUSIVE", result
     assert "fabric-post" not in calls and "append-sxid" not in calls, calls
-    assert any("not posted" in item for item in result["errors"]), result["errors"]
+    assert "not posted" in result["inconclusive_reason"], result
+    assert calls == ["inventory"] and result["errors"] == [], (calls, result)
 
 
 def test_collect014_posts_once_and_scopes_both_waits_by_time(

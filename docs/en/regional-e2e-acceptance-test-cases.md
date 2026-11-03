@@ -15699,9 +15699,16 @@ the action class that runs `nvidia-smi --gpu-reset` over every GPU and NVSwitch 
    Both sources require
    `event.observed_at - inventory.observed_at >= -30s`;
    use a currently ACTIVE node whose lease has not expired and set the event time to `now - 8min`;
-   do not mix in identity errors by using a retired/REVOKED node. Before sending, read both the dedicated and legacy inventories;
-   every existing sample must be at least 90 seconds newer than the event (30 s ingestion tolerance plus a 60 s safety margin);
+   do not mix in identity errors by using a retired/REVOKED node. Before sending, read both the dedicated and legacy inventories
+   together with the product's own max ages;
+   every existing sample must be at least 90 seconds newer than the event (30 s ingestion tolerance plus a 60 s safety margin)
+   or older than its max age plus 60 s (a latest-metric row the node no longer refreshes);
    unknown presence/time or an unmet margin means do not send. Merely backdating the time does not by itself prove the premise.
+   The runner establishes it instead of betting on it: on a refusal it re-reads every 30 s, dating the event afresh from each read,
+   and posts on the first read where the premise holds. The event age stays 8 minutes, because an older event would leave the
+   600-second coverage-heartbeat window an idle cluster's IDLE rests on. The wait is bounded by 90 s + max age + 60 s
+   (750 s at the default 600 s legacy max age); every read is logged with the metric@GPU row a refusal quotes, and when the
+   bound ends the verdict is INCONCLUSIVE with the last refusal -- never FAIL, never a post.
    The event still stays within the 900-second generation cap, so it is not blocked by another stale-generation reason.
    The runner now also asserts a ledger delta of 0 and an unchanged `boot_id` during the fail-closed phase;
    if either is violated it FAILs immediately and injects no positive variant at all.

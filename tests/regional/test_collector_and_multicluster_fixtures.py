@@ -782,7 +782,9 @@ def test_collect014_refuses_the_fail_closed_post_when_inventory_is_stale(
     vouch for the back-dated event. On 2026-09-06 the sample lagged 2-3 min,
     the bet lost, and the "no-op" SXID ran two real full-fabric resets. The
     runner must read the store first and post nothing when the margin is
-    thinner than the ingest tolerance plus the safety margin."""
+    thinner than the ingest tolerance plus the safety margin. A premise that
+    cannot be established is INCONCLUSIVE, not a product FAIL (this read has
+    no product max age, so there is no wait bound either)."""
 
     from datetime import timedelta
 
@@ -793,8 +795,8 @@ def test_collect014_refuses_the_fail_closed_post_when_inventory_is_stale(
         settings, regional, host, collector, tmp_path, 1, "hyperpod-v1"
     )
 
-    assert result["verdict"] == "FAIL", result
-    assert any("not posted" in error for error in result["errors"]), result["errors"]
+    assert result["verdict"] == "INCONCLUSIVE", result
+    assert "not posted" in result["inconclusive_reason"], result
     assert calls == ["inventory-read"], calls
     assert result["fail_closed"] is None and result["positive"] is None, result
     assert result["restore_workflows"] == [], result
