@@ -6271,3 +6271,54 @@ Not verified live:
 - The rule is unit-tested (`tests/node_agent/test_reset_releases_idle_display_modules.py`)
   and has not run on a node: a live proof needs a busy reset whose release
   check sees such a query, released and reset on the next attempt.
+
+## Registry Secret drift after join and remove (batch 245)
+
+`join-cluster` and `remove-cluster` rewrite the `gpu-fault-regional-clusters`
+Secret and publish the durable registry head, and by design they never restart
+the CPU Deployments (registry membership is hot). `secret_drift` compared the
+head with the digest of the Secret each process had STARTED with, so every
+replica that predated a join or remove reported drift although the Secret and
+the head agreed (live 2026-11-03, BOOT-029 stage 1 site: three api-ha replicas,
+Secret and head both at one digest, generation 13; `status --full` does not
+read the flag and listed no failing check; the perf registry-alignment
+preflight refused). Nothing
+else at runtime used that start-up copy after bootstrap: cluster-token
+authentication, admission, endpoint CIDRs and provider identity follow the
+head snapshot (1 s poll), and the copy only seeds a store that has no head.
+
+The three CPU role Deployments now also mount the Secret's `clusters.json`
+(read-only, no `subPath`, only that key) at
+`/etc/gpu-fault/regional-clusters`; the registry runtime re-reads it after
+every refresh and compares that copy. `/healthz` names the compared copy
+(`secret_source`), the start-up digest and the head's digest. A Secret-only
+rewrite (review H3) drifts in every running replica, not only in Pods started
+after it.
+
+Proven locally:
+
+- `tests/regional/test_registry_secret_mount.py`: a replica started before a
+  join or remove reports no drift once Secret and head agree (with the
+  truthful transient in between); a Secret-only rewrite drifts without a
+  restart; without a mount the start-up copy decides as before; an unreadable
+  or invalid file drifts with a fixed-text `secret_error` and never puts the
+  document (plaintext tokens) into the status or a log line; unchanged bytes
+  are not re-parsed. A temp file stands in for the kubelet projection.
+- `tests/deploy/test_registry_secret_file_wiring.py`: the regional patch and
+  the three rendered role manifests carry the mount, and the application
+  factory hands the file to the runtime.
+
+Not verified:
+
+- Nothing ran on a cluster. The kubelet propagation delay for this Secret
+  volume (the Aurora Secret mount's is about 1-2 minutes) was not measured.
+- No live join or remove has run against a release carrying the mount. It
+  ships with the next release, which rolls the three CPU Deployments for its
+  new Pod template; until then a replica that predates a join or remove keeps
+  reporting drift, and restarting the reporting Deployment remains the remedy
+  once the Secret and the head are seen to agree.
+- `rotate-token` keeps its `CONTROL_PLANE_ROLLED` step unchanged. During its
+  overlap window, and under `--keep-window` until the retiring digest is
+  dropped, the Secret holds one token (the old one until
+  `CONTROL_PLANE_ROLLED`, the new one after) while the head holds both
+  digests, so `secret_drift` is true for that time, as before.

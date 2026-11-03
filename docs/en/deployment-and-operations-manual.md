@@ -5659,8 +5659,12 @@ gpu-fault-admin rotate-token \
    `gpu-fault-regional-clusters` Secret, then `rollout restart`s the three CPU Deployments one by one and waits for each
    rollout to complete; it precedes the final revision because the retiring digest is still in the durable head at that
    point, so both tokens are accepted and a stalled rollout only makes the command fail closed and resume at that step on
-   the rerun. CPU Pods read that Secret only at start; without this step every replica keeps reporting
-   `regional_registry.secret_drift=true` and the acceptance registry-alignment preflight refuses to run. The final
+   the rerun. CPU Pods read that Secret into their environment at start (settings validation and the first bootstrap
+   seed), and this step puts that start-up copy on the accepted token; `regional_registry.secret_drift` compares the copy
+   the Pods also mount (`/etc/gpu-fault/regional-clusters/clusters.json`, refreshed by kubelet within roughly 1-2
+   minutes of the Secret write), which does not depend on this roll. On a release that does not mount the Secret yet,
+   without this step every replica keeps reporting `regional_registry.secret_drift=true` and the acceptance
+   registry-alignment preflight refuses to run. The final
    publish of `RETIRING_TOKEN_DROPPED` goes through the control plane that was just rolled, so before publishing the
    command waits, bounded (up to 120 s, polling every 2 s), until every Pod of the three CPU Deployments' *current*
    ReplicaSets (the `pod-template-hash` of the Deployment's current revision) is Ready with none Terminating, and

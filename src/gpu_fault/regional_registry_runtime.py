@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -16,7 +18,10 @@ from gpu_fault.regional import (
     RegionalRegistryMember,
     RegionalRegistryRevision,
 )
-from gpu_fault.regional_registry import regional_registry_config_sha256
+from gpu_fault.regional_registry import (
+    regional_registry_config_sha256,
+    regional_registry_document_sha256,
+)
 from gpu_fault.store import NotFoundError
 
 LOGGER = logging.getLogger(__name__)
@@ -26,6 +31,10 @@ LOGGER = logging.getLogger(__name__)
 # only needs Aurora again when it comes back.
 STARTUP_RETRY_INITIAL_SECONDS = 0.5
 STARTUP_RETRY_MAX_INTERVAL_SECONDS = 10.0
+
+# Which copy of the registry Secret ``secret_drift`` compares with the head.
+SECRET_SOURCE_MOUNTED = "mounted-file"
+SECRET_SOURCE_STARTUP = "startup-environment"
 
 
 def _read_registry_head(store: Any) -> RegionalRegistryHead:
@@ -87,7 +96,14 @@ class RegionalRegistryRuntime:
         # Digest of the GPU_FAULT_REGIONAL_CLUSTERS_JSON Secret this process was
         # started with; None when the caller did not supply one.
         self.secret_config_sha256: str | None = None
-        self._secret_drift_logged: bool | None = None
+        # The mounted copy of the same Secret (kubelet keeps it current), read
+        # again on every refresh; None where nothing is mounted, and then the
+        # start-up digest above is what ``secret_drift`` compares (batch 245).
+        self.secret_file: str | None = None
+        self._secret_file_raw_sha256: str | None = None
+        self._secret_file_config_sha256: str | None = None
+        self._secret_file_error: str | None = None
+        self._secret_drift_logged: tuple[bool, str | None] | None = None
         # The member row as last written and when: the heartbeat is re-written
         # only when its content changes or a third of the stale window has
         # passed, not on every 1 s poll (control-plane review 2026-09-08, F-5).
@@ -108,14 +124,18 @@ class RegionalRegistryRuntime:
         retry_budget_seconds: float = 0.0,
         sleep: Callable[[float], None] = time.sleep,
         secret_config_sha256: str | None = None,
+        secret_file: str | None = None,
     ) -> RegionalRegistryRuntime:
         """Load the durable head, retrying store failures within a budget.
 
         ``retry_budget_seconds`` bounds how long start-up waits for the store
         (Aurora) to answer before the failure propagates and the process exits;
         zero keeps the old fail-immediately behaviour for tests and tools.
-        ``secret_config_sha256`` is the configured Secret's digest; a mismatch
-        with the durable head is logged and reported as ``secret_drift``.
+        ``secret_config_sha256`` is the configured Secret's digest at start-up;
+        ``secret_file`` the mounted copy of the same Secret, used when it
+        exists at start-up. A mismatch between the Secret (the mounted copy,
+        else the start-up digest) and the durable head is logged and reported
+        as ``secret_drift``.
         """
 
         observed = now or (lambda: datetime.now(timezone.utc))
@@ -135,6 +155,11 @@ class RegionalRegistryRuntime:
                     now=observed,
                 )
                 runtime.secret_config_sha256 = secret_config_sha256
+                # A Pod of a release that does not mount the Secret yet (and
+                # every test or tool) keeps comparing the start-up digest.
+                if secret_file and os.path.isfile(secret_file):
+                    runtime.secret_file = secret_file
+                    runtime.read_secret_file()
                 runtime._log_secret_drift()
                 return runtime
             except ValueError:
@@ -243,34 +268,109 @@ class RegionalRegistryRuntime:
             return None
         return regional_registry_config_sha256(snapshot.registrations.values())
 
-    def secret_drift(self) -> bool:
-        """Whether the start-up Secret and the durable head disagree.
+    def read_secret_file(self) -> None:
+        """Re-read the mounted registry Secret (a no-op where none is mounted).
 
-        The durable head wins (join/remove publish there); drift means the
-        Secret is stale and a release that only rewrote the Secret would not
-        reach the running registry (review H3).
+        The digest is recomputed only when the file's bytes change, so an
+        unchanged Secret costs one small read per refresh. A file that cannot
+        be read or does not validate leaves no digest and a fixed-text
+        ``secret_error``: the Secret no longer describes the head, and the next
+        Pod start would refuse it. Nothing here fails the registry refresh.
         """
 
-        if self.secret_config_sha256 is None:
+        path = self.secret_file
+        if path is None:
+            return
+        raw_sha256: str | None = None
+        digest: str | None = None
+        try:
+            with open(path, "rb") as handle:
+                raw = handle.read()
+            raw_sha256 = hashlib.sha256(raw).hexdigest()
+            with self._lock:
+                if raw_sha256 == self._secret_file_raw_sha256:
+                    return
+            digest, error = regional_registry_document_sha256(raw), None
+        except OSError as exc:
+            raw_sha256 = None
+            error = f"registry Secret file is unreadable ({type(exc).__name__})"
+        except ValueError as exc:
+            # The helper's messages are fixed text, never the document's.
+            error = str(exc)
+        except Exception as exc:
+            error = f"registry Secret file was not loaded ({type(exc).__name__})"
+        with self._lock:
+            self._secret_file_raw_sha256 = raw_sha256
+            self._secret_file_config_sha256 = digest
+            self._secret_file_error = error
+
+    def secret_source(self) -> str | None:
+        """Which Secret copy ``secret_drift`` compares; None when there is none."""
+
+        if self.secret_file is not None:
+            return SECRET_SOURCE_MOUNTED
+        if self.secret_config_sha256 is not None:
+            return SECRET_SOURCE_STARTUP
+        return None
+
+    def compared_secret_config_sha256(self) -> str | None:
+        """The Secret digest ``secret_drift`` compares with the durable head.
+
+        The mounted Secret as last read (None while it cannot be read or does
+        not validate), or the start-up digest where no Secret is mounted.
+        """
+
+        if self.secret_file is None:
+            return self.secret_config_sha256
+        with self._lock:
+            return self._secret_file_config_sha256
+
+    def secret_drift(self) -> bool:
+        """Whether the registry Secret and the durable head disagree.
+
+        The Secret is the mounted copy, which kubelet keeps in step with the
+        Secret: a join, remove or rotation rewrites the Secret and publishes
+        the head, so a replica that started before it converges within the
+        kubelet sync period and needs no restart. Without a mount it is the
+        start-up copy, which only a restart refreshes. The durable head wins
+        (join/remove publish there); a drift that persists means the Secret
+        and the head really disagree -- a release that only rewrote the Secret
+        never reached the running registry (review H3), or the Secret was
+        rewritten by hand or cannot be read.
+        """
+
+        if self.secret_source() is None:
             return False
         durable = self.durable_config_sha256()
-        return durable is not None and durable != self.secret_config_sha256
+        return durable is not None and durable != self.compared_secret_config_sha256()
 
     def _log_secret_drift(self) -> None:
         drift = self.secret_drift()
-        if drift and self._secret_drift_logged is not True:
+        with self._lock:
+            error = self._secret_file_error if self.secret_file is not None else None
+        state = (drift, error)
+        if drift and self._secret_drift_logged != state:
             LOGGER.warning(
                 "regional registry Secret drifts from the durable head: "
-                "secret_config_sha256=%s durable_config_sha256=%s; the durable "
-                "head is authoritative, republish the registry from the release "
-                "config to reconcile",
-                self.secret_config_sha256,
+                "secret_config_sha256=%s (%s)%s durable_config_sha256=%s; the "
+                "durable head is authoritative: %s",
+                self.compared_secret_config_sha256(),
+                self.secret_source(),
+                f" error={error}" if error else "",
                 self.durable_config_sha256(),
+                "a membership change converges within the kubelet sync period; "
+                "a drift that persists is a Secret the head disagrees with"
+                if self.secret_file is not None
+                else "this process compares the Secret it started from; restart "
+                "it if the Secret already matches the head, else republish the "
+                "registry from the release config",
             )
-        self._secret_drift_logged = drift
+        self._secret_drift_logged = state
 
     def status(self) -> dict[str, Any]:
         secret_drift = self.secret_drift()
+        secret_sha256 = self.compared_secret_config_sha256()
+        durable_sha256 = self.durable_config_sha256()
         with self._lock:
             snapshot = self._snapshot
             return {
@@ -286,7 +386,15 @@ class RegionalRegistryRuntime:
                 "ready": self.is_ready(),
                 "last_successful_refresh": self._last_successful_refresh,
                 "error": self._last_error,
-                "secret_config_sha256": self.secret_config_sha256,
+                # The digest ``secret_drift`` compares, the copy it came from,
+                # the start-up copy, and the head's view of the same fields.
+                "secret_config_sha256": secret_sha256,
+                "secret_source": self.secret_source(),
+                "secret_startup_config_sha256": self.secret_config_sha256,
+                "secret_error": (
+                    self._secret_file_error if self.secret_file is not None else None
+                ),
+                "durable_config_sha256": durable_sha256,
                 "secret_drift": secret_drift,
             }
 
@@ -349,6 +457,7 @@ class RegionalRegistryRuntime:
                 self._member(snapshot, ready=True, observed_at=observed),
                 refresh_sequence=refresh_sequence,
             )
+            self.read_secret_file()
             self._log_secret_drift()
             return True
         except Exception as exc:

@@ -166,6 +166,11 @@ spec:
               value: "2592000"
             - name: GPU_FAULT_GPU_FINDING_HISTORY_RETENTION_SECONDS
               value: "2592000"
+            # The start-up copy of the registry Secret: settings validation and
+            # the first bootstrap seed read it, and kubelet never refreshes an
+            # env. The regional-clusters volume below is the copy it does keep
+            # current; the registry runtime compares that one with the durable
+            # head (secret_drift), so join/remove need no CPU restart.
             - name: GPU_FAULT_REGIONAL_CLUSTERS_JSON
               valueFrom:
                 secretKeyRef:
@@ -234,3 +239,18 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 10
             failureThreshold: 3
+          # Read-only and never subPath: kubelet re-projects a Secret volume on
+          # its periodic Pod sync, a subPath mount would freeze the file.
+          volumeMounts:
+            - name: regional-clusters
+              mountPath: /etc/gpu-fault/regional-clusters
+              readOnly: true
+      volumes:
+        # Only clusters.json, the key the env reads: the release's transient
+        # previous-clusters.json backup is never projected into a Pod.
+        - name: regional-clusters
+          secret:
+            secretName: gpu-fault-regional-clusters
+            items:
+              - key: clusters.json
+                path: clusters.json

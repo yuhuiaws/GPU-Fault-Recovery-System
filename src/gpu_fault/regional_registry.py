@@ -15,6 +15,15 @@ from gpu_fault.store import NotFoundError
 
 LOGGER = logging.getLogger(__name__)
 
+# Where the regional CPU Deployments project the registry Secret's
+# ``clusters.json`` as a read-only Secret volume. The env copy
+# (``GPU_FAULT_REGIONAL_CLUSTERS_JSON``) is frozen at container start; kubelet
+# keeps this file in step with the Secret (a ``subPath`` mount would not), so
+# the registry runtime can compare the Secret as it is now with the durable
+# head instead of the copy it started from (batch 245).
+REGIONAL_CLUSTERS_SECRET_DIR = "/etc/gpu-fault/regional-clusters"
+REGIONAL_CLUSTERS_SECRET_FILE = f"{REGIONAL_CLUSTERS_SECRET_DIR}/clusters.json"
+
 # The fields an operator configures. Lifecycle state and the two timestamps
 # are runtime facts the durable registry owns, so they are excluded: a Secret
 # re-read at start-up carries fresh timestamps and no lifecycle, and comparing
@@ -65,6 +74,31 @@ def regional_registry_config_sha256(
     ]
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def regional_registry_document_sha256(raw: bytes | str) -> str:
+    """The configured-view digest of one ``clusters.json`` document.
+
+    The same normalisation the start-up digest gets (plaintext tokens become
+    digests, expired synthetic entries are skipped). A document that is not a
+    JSON list of objects, or an entry that does not validate, raises
+    ``ValueError`` with a fixed message: the document carries plaintext tokens,
+    so neither it nor a validation error quoting it may reach a log line.
+    """
+
+    try:
+        values = json.loads(raw)
+    except ValueError:
+        raise ValueError("regional registry Secret is not valid JSON") from None
+    if not isinstance(values, list) or not all(
+        isinstance(item, dict) for item in values
+    ):
+        raise ValueError("regional registry Secret is not a list of objects")
+    try:
+        registrations = configured_regional_registrations(values)
+    except (TypeError, ValueError):
+        raise ValueError("regional registry Secret entry is invalid") from None
+    return regional_registry_config_sha256(registrations)
 
 
 def configured_regional_registrations(

@@ -3579,6 +3579,16 @@ remote-command idle check, turns the explicitly selected clusters to DRAINING wi
 ACK; the lifecycle of unselected members is not re-activated. This entry point is not a shortcut around the deploy-host binding, credentials, approval or journal
 cleanup.
 
+Neither join nor remove restarts the CPU control plane; they rewrite the `gpu-fault-regional-clusters` Secret and publish
+the head. The Secret `secret_drift` compares is the copy the Pod mounts (`/etc/gpu-fault/regional-clusters/clusters.json`,
+only `clusters.json` projected, read-only, no `subPath`, refreshed by kubelet with the Secret): it is re-read after every
+successful refresh and re-parsed only when its bytes change; a copy that cannot be read or does not validate leaves no
+digest, reports drift and names the problem in `secret_error` in fixed text (never the document). The env
+`GPU_FAULT_REGIONAL_CLUSTERS_JSON` is the start-up copy, used only for settings validation, the first bootstrap seed and
+the comparison where nothing is mounted (older releases, tests and tools); `secret_source`,
+`secret_startup_config_sha256` and `durable_config_sha256` on `/healthz` say which copy was compared. Runtime
+authentication, admission, endpoint CIDRs and provider identity follow the head snapshot only and never read the Secret.
+
 ### 2.16 Remote Command Protocol `regional.py`
 
 The regional control plane does not connect to GPU clusters on its own initiative and does not hold in-cluster credentials. Every action that lands on a node is written as

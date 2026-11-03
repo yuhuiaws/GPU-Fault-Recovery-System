@@ -1394,15 +1394,19 @@ groups:
           summary: The regional registry Secret drifts from the durable registry head
           runbook_url: docs/en/administrator-operations.md#gpufaultregionalregistrysecretdrift
           description: >-
-            Role {{ $labels.service_role }} started from a registry Secret whose
-            digest differs from the durable registry head for 15 minutes. The
+            Role {{ $labels.service_role }} reads a registry Secret whose digest
+            has differed from the durable registry head for 15 minutes. Pods
+            compare the Secret as mounted (kubelet keeps it current), so a
+            join or remove has converged long before this fires. The
             head is authoritative, so the running registry is correct; the
             release config is what is stale. Compare secret_config_sha256 with
             durable_config_sha256 in /healthz regional_registry, then bring the
             release config back in line with the head (join/remove the cluster
             it disagrees on, or a release whose REGISTRY component stages and
-            publishes the Secret durably) so the next Pod restart does not come
-            up on the old cluster list. Do not edit the Secret by hand.
+            publishes the Secret durably). With secret_source
+            startup-environment (a release without the mount) a replica that
+            predates the last join or remove reports this until it restarts.
+            Do not edit the Secret by hand.
   # Every group above alerts on a component: a collector went quiet, a queue
   # filled up, an executor crashed. None of them fires when every component is
   # healthy and recovery still is not finishing — a fail-closed workflow parked

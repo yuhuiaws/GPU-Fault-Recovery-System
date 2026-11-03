@@ -193,20 +193,23 @@ def spare_reservation_metric_lines(runtime: AppRuntime) -> list[str]:
 
 
 def regional_registry_metric_lines(runtime: AppRuntime) -> list[str]:
-    """Whether the regional registry Secret this process started from
-    disagrees with the durable registry head (ARCH-H2/H3).
+    """Whether the regional registry Secret disagrees with the durable
+    registry head (ARCH-H2/H3).
 
-    The durable head wins -- join and remove publish there -- so drift means a
-    release that only rewrote the Secret never reached the running registry.
-    Only roles that run the registry runtime publish the flag; the runtime is
-    bound to the context by the application factory."""
+    The Secret is the Pod's mounted copy, which kubelet keeps current, so a
+    join or remove (they rewrite the Secret and publish the head) clears within
+    the kubelet sync period without a restart; a Pod without the mount compares
+    the copy it started from. The durable head wins, so a drift that persists
+    means a release that only rewrote the Secret never reached the running
+    registry. Only roles that run the registry runtime publish the flag; the
+    runtime is bound to the context by the application factory."""
 
     registry_runtime = getattr(runtime.context, "regional_registry_runtime", None)
     if registry_runtime is None:
         return []
     role = _escape_label(str(getattr(registry_runtime, "service_role", "")))
     lines = [
-        "# HELP gpu_fault_regional_registry_secret_drift 1 when the regional registry Secret this process started from differs from the durable registry head, which is authoritative; republish the registry from the release config to reconcile (ARCH-H2).",
+        "# HELP gpu_fault_regional_registry_secret_drift 1 when the regional registry Secret (the mounted copy kubelet keeps current; the start-up copy where none is mounted) differs from the durable registry head, which is authoritative; a membership change converges within the kubelet sync period, a persistent drift needs the Secret and the head reconciled (ARCH-H2).",
         "# TYPE gpu_fault_regional_registry_secret_drift gauge",
         "gpu_fault_regional_registry_secret_drift"
         f'{{service_role="{role}"}} {int(bool(registry_runtime.secret_drift()))}',

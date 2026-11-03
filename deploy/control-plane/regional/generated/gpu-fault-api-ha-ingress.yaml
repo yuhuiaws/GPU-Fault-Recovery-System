@@ -249,6 +249,9 @@ spec:
             port: 8080
           timeoutSeconds: 5
         volumeMounts:
+        - mountPath: /etc/gpu-fault/regional-clusters
+          name: regional-clusters
+          readOnly: true
         - mountPath: /artifact
           name: artifact
           readOnly: true
@@ -302,6 +305,12 @@ spec:
         topologyKey: kubernetes.io/hostname
         whenUnsatisfiable: DoNotSchedule
       volumes:
+      - name: regional-clusters
+        secret:
+          items:
+          - key: clusters.json
+            path: clusters.json
+          secretName: gpu-fault-regional-clusters
       - configMap:
           name: gpu-fault-control-plane-wheel-0100
         name: artifact

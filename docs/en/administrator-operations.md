@@ -2767,6 +2767,17 @@ daemonsets) for the findings; `ssm:SendCommand`/`ssm:GetCommandInvocation` for t
 - After `join-cluster` writes the new cluster's context into `gpu.kubeconfig`, it switches the current-context back
   to the site's first managed cluster (the registration/primary cluster); a join does not change which cluster the
   operator's plain `kubectl` points at.
+- Neither `join-cluster` nor `remove-cluster` restarts the CPU control plane: they rewrite the
+  `gpu-fault-regional-clusters` Secret and publish the durable head, and running replicas follow the head every
+  second. `regional_registry.secret_drift` on `/healthz` compares the Secret copy the Pod mounts
+  (`secret_source=mounted-file`, kubelet sync roughly 1-2 minutes), so a replica that predates the join or removal
+  returns to `false` by itself after that window, with no `kubectl rollout restart`; a value that stays `true` is a
+  Secret the head really disagrees with (see
+  [GpuFaultRegionalRegistrySecretDrift](#gpufaultregionalregistrysecretdrift)). A release that does not mount the
+  Secret yet (`secret_source=startup-environment`) compares the copy the process started with, so a replica started
+  before the join or removal keeps reporting `true`: confirm the Secret and the head agree (the perf registry-alignment
+  check makes exactly that comparison), then roll the Deployments that report it (usually api-ha and
+  telemetry-spool-worker; control-worker does not when the failure-domain map change already rolled it).
 - An upgrade `deploy` checks, before it changes any object, that every cluster's set of ACTIVE Agents with a live
   lease equals that cluster's GPU node set. Agents heartbeat every 30 s with a 90 s lease, so one late heartbeat can
   drop a healthy node for a few seconds; on a mismatch the sets are re-read once after 35 s. Only a persistent
@@ -3766,8 +3777,11 @@ gpu-fault-admin rotate-token \
    `secure/<cluster-id>.token` (the old file kept as `.retired-<time>`) -> write the new token into the
    `gpu-fault-regional-clusters` Secret and roll the three CPU Deployments (the retiring digest is still in the durable
    head, so both tokens are accepted meanwhile) -> publish the revision dropping the retiring
-   digest. CPU Pods read that Secret only at start; without the roll every replica keeps reporting
-   `regional_registry.secret_drift=true`. `--window-minutes` (default 120, set in minutes or hours, not days), `--keep-window`,
+   digest. CPU Pods read that Secret into their environment at start (settings validation, the first bootstrap seed);
+   the roll puts that start-up copy on the accepted token. `regional_registry.secret_drift` compares the copy the Pods
+   also mount (`/etc/gpu-fault/regional-clusters/clusters.json`, which kubelet refreshes with the Secret), so it does not
+   wait for the roll; on a release that does not mount the Secret yet, only the roll clears `secret_drift=true`.
+   `--window-minutes` (default 120, set in minutes or hours, not days), `--keep-window`,
    `--rollback` and the state machine and resume rules are in REG-9.
 5. **Success criteria**: output `status=COMPLETED`; in `GET /v1/regional/clusters` that cluster has
    `retiring_token_sha256_present=false` (the two digests themselves are always redacted); the token file digest equals the output's
@@ -5312,15 +5326,24 @@ modifying Store JSON or repeating `send`; an isolated notifier result in accepta
 
 ### GpuFaultRegionalRegistrySecretDrift
 
-- **Meaning**: the regional registry Secret digest a role's process read at startup has disagreed with the durable head
-  in Aurora for 15 consecutive minutes. The head is authoritative (join/remove publish there), and the running registry is right;
-  what is stale is the release configuration -- a release that only rewrites the Secret changed nothing, while a Pod restarted from this Secret
-  runs on the old cluster list until its first refresh.
-- **First check**: compare `secret_config_sha256` with `durable_config_sha256` in the `regional_registry` payload of
-  `/healthz`; `gpu_fault_regional_registry_secret_drift{service_role}` says which
-  role. The startup logs of api-ha and control-worker give both digests in the line `regional registry Secret drifts`.
+- **Meaning**: the regional registry Secret digest a role's process reads has disagreed with the durable head in Aurora
+  for 15 consecutive minutes. The process compares the Secret copy its Pod mounts
+  (`/etc/gpu-fault/regional-clusters/clusters.json`, which kubelet refreshes with the Secret within roughly 1-2 minutes),
+  so a join or remove (they rewrite the Secret and the head one after the other) has converged long before the alert,
+  with no restart; a release that does not mount it yet compares the copy the process started with. The head is
+  authoritative (join/remove publish there), and the running registry is right; what is stale is the release
+  configuration -- a release that only rewrites the Secret changed nothing.
+- **First check**: compare `secret_config_sha256` (the compared copy) with `durable_config_sha256` in the
+  `regional_registry` payload of `/healthz`; `secret_source` says whether that is the mounted copy (`mounted-file`) or
+  the start-up copy (`startup-environment`), `secret_startup_config_sha256` is the start-up copy, and a non-empty
+  `secret_error` means the mounted Secret cannot be read or does not validate (the next Pod start would fail on it too).
+  `gpu_fault_regional_registry_secret_drift{service_role}` says which role; the process log line
+  `regional registry Secret drifts` gives both digests and the source.
 - **Boundary**: warning. Do not hand-edit the Secret or write the head directly; let the release configuration catch up with the head -- go through
   join/remove (§5) for the diverging clusters, or run a release with the REGISTRY component that lands the Secret on the head.
+  With `secret_source=startup-environment` and a Secret that actually matches the head, the replica predates a join or
+  removal: roll the Deployment that reports it (§5.0.2). During `rotate-token --keep-window` the head keeps the retiring
+  digest, so this alert stays until the next registry publish after the window closes.
 
 ### GpuFaultControlPlaneReplicaScrapeFailing
 

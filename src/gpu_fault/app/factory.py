@@ -195,6 +195,7 @@ from gpu_fault.processor_diagnostics import (
     unregister_thread_dump_signal,
 )
 from gpu_fault.regional import TOKEN_SLOT_RETIRING
+from gpu_fault.regional_registry import REGIONAL_CLUSTERS_SECRET_FILE
 from gpu_fault.regional_registry_runtime import RegionalRegistryRuntime
 from gpu_fault.store import (
     EfaTrafficAdminConflict,
@@ -286,6 +287,9 @@ def _bootstrap_regional_registry(
             poll_seconds=float(os.getenv("GPU_FAULT_REGISTRY_POLL_SECONDS", "1")),
             stale_seconds=float(os.getenv("GPU_FAULT_REGISTRY_STALE_SECONDS", "10")),
             secret_config_sha256=ctx.regional_registry_secret_sha256,
+            # The mounted Secret, so join/remove need no CPU restart for
+            # ``secret_drift`` to clear (batch 245).
+            secret_file=REGIONAL_CLUSTERS_SECRET_FILE,
         ),
     )
 

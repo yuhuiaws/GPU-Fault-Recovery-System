@@ -30,18 +30,18 @@ while the window still accepts both.
 ``CONTROL_PLANE_ROLLED`` is the control plane restart the manual procedure had
 and the verb at first dropped: the CPU Deployments (api-ha, control-worker,
 telemetry-spool-worker) read the registry Secret into their environment once,
-at Pod start, so rewriting ``gpu-fault-regional-clusters`` reaches no running
-Pod and every replica reports ``regional_registry.secret_drift`` until it
-restarts (observed 2026-09-30). The step sits between the token file write and
-the final publish on purpose: the Secret is rewritten first so the restarted
-Pods load the accepted token, and the retiring digest is still in the durable
-head while they roll, so both tokens stay accepted and a stalled rollout leaves
-a working fleet that a rerun resumes at the same step. Rollback never needs
-the step (it is refused once ``TOKEN_FILE_WRITTEN`` has started, and the
-Secret is untouched before that). ``RETIRING_TOKEN_DROPPED`` publishes through
-the control plane it has just rolled (``regional_release_control_plane_ready``)
-and is idempotent: a head that already holds only the new digest -- a deploy
-republished the registry mid-finish -- is recorded, not republished.
+at Pod start; before they also mounted it (batch 245) every replica reported
+``regional_registry.secret_drift`` until it restarted (2026-09-30). The roll
+sits between the token file write and the final publish on purpose: the Secret
+is rewritten first so the restarted Pods' start-up copy holds the accepted
+token, and the retiring digest is still in the durable head while they roll,
+so both tokens stay accepted and a stalled rollout leaves a working fleet that
+a rerun resumes at the same step. Rollback never needs the step (it is refused
+once ``TOKEN_FILE_WRITTEN`` has started, and the Secret is untouched before
+that). ``RETIRING_TOKEN_DROPPED`` publishes through the control plane it has
+just rolled (``regional_release_control_plane_ready``) and is idempotent: a
+head that already holds only the new digest -- a deploy republished the
+registry mid-finish -- is recorded, not republished.
 
 The journal binds the site through ``rotate_token_binding`` (the raw
 ``site_sha256`` for audit plus a projection of the facts the rotation reads),
