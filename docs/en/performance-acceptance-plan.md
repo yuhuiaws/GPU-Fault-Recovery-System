@@ -199,7 +199,14 @@ configuration digest must equal the durable head's configuration digest, and eve
 `gpu-fault-api-ha` replica's `/healthz?verbose=1` must report
 `regional_registry.secret_drift=false`. Misalignment before registration refuses the run (the
 drift is not attributed to this round); misalignment after teardown fails this round's cleanup
-and lists the differences and drifted replicas field by field.
+and lists the differences and drifted replicas field by field. When the Secret and the head
+agree but a replica that compares the mounted Secret copy (`secret_source=mounted-file`)
+reports drift, kubelet has not yet projected the Secret the teardown just restored (or a
+join/remove just rewrote) into the Pod: the check re-reads every 10 s for at most 180 s
+(report field `mounted_convergence_seconds`), passes once it converges and restarts nothing;
+only a drift past that bound fails. A replica of a release that compares its start-up copy (no
+`secret_source`, or `startup-environment`) is not waited for and keeps the old rule (a rolling
+restart only for replicas started after the preflight check).
 
 ### 3.3 Store-State Prerequisite: Steady State Defined by Store Metrics, Optimistic Bound and Layout Record
 

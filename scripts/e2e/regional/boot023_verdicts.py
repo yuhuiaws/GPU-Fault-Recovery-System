@@ -8,8 +8,9 @@ append exactly well-formed entries to the append-only
 id, phase, digests, operator identity, redacted command -- without rewriting
 what was there; the previous-snapshot ConfigMaps stay within the retention
 bound and are untouched by a NOOP; every CPU Pod's durable registry head
-digest equals the digest of the Secret it started from (``secret_drift`` is
-false on ``/healthz``); and a manifest that still claims
+digest equals the digest of the registry Secret its runtime compares -- the
+mounted copy, or the one it started from where none is mounted
+(``secret_drift`` is false on ``/healthz``); and a manifest that still claims
 ``database.rollback_compatible: true`` is refused at plan time with the
 explanatory error rather than being deployed.
 

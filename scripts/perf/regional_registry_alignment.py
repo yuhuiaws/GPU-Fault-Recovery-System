@@ -10,12 +10,17 @@ and prove the control plane agrees.
   ``regional_registry.secret_drift`` (``/healthz?verbose=1``). Run before a
   perf run touches the registry (a pre-existing drift is never attributed to
   the run) and after its teardown (a drift it caused fails its cleanup).
+  A replica that reads the mounted Secret (``secret_source=mounted-file``)
+  sees a Secret rewrite only after kubelet re-projects the volume, so while
+  Secret and head agree such a replica gets a bounded wait to converge; a
+  replica that compares its start-up copy never converges by itself.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import time
 from datetime import datetime, timezone
 from collections.abc import Callable
 from pathlib import Path
@@ -45,13 +50,22 @@ print(json.dumps({"http_status": status, "payload": payload}))
 # them, never the bytes themselves (they carry plaintext tokens). Teardown
 # rebuilds the bytes from the restored entries and this shape.
 SECRET_BASELINE_FILE = "registry-secret-baseline.json"
-# An api-ha replica compares the Secret it STARTED on with the durable head
-# (``secret_drift``); a replica that started inside a run's window (HA-005
-# rolls the control plane mid-run) holds the run's transient Secret digest and
-# reports drift after the restore although Secret and head agree. Teardown
-# reconciles exactly those replicas with a rolling restart of the Deployment.
+# An api-ha replica of a release without the mounted Secret compares the
+# Secret it STARTED on with the durable head (``secret_drift``); a replica that
+# started inside a run's window (HA-005 rolls the control plane mid-run) holds
+# the run's transient Secret digest and reports drift after the restore
+# although Secret and head agree. Teardown reconciles exactly those replicas
+# with a rolling restart of the Deployment.
 API_DEPLOYMENT = "deployment/gpu-fault-api-ha"
 ROLLOUT_TIMEOUT = "600s"
+# A replica of a release that mounts the registry Secret compares the Secret
+# as kubelet last projected it, not the copy it started from: kubelet
+# re-projects a Secret volume on its periodic Pod sync (about a minute) plus
+# its cache delay, so a restore or a join just before this check is still in
+# flight there. Such replicas get this long to converge before they count.
+MOUNTED_SECRET_SOURCE = "mounted-file"
+MOUNTED_CONVERGENCE_SECONDS = 180.0
+MOUNTED_CONVERGENCE_POLL_SECONDS = 10.0
 SECRET_RESTORE_FILE = "registry-secret-restore.json"
 SERIALIZATIONS: tuple[dict[str, Any], ...] = tuple(
     {
@@ -167,9 +181,54 @@ def api_replica_registry_health(
                 "ready": registry_state.get("ready"),
                 "secret_drift": registry_state.get("secret_drift"),
                 "secret_config_sha256": registry_state.get("secret_config_sha256"),
+                # Absent on a release older than the mounted Secret.
+                "secret_source": registry_state.get("secret_source"),
             }
         )
     return replicas, skipped
+
+
+def _replica_errors(replicas: list[dict[str, Any]], *, suffix: str = "") -> list[str]:
+    return [
+        f"{replica['pod']} reports secret_drift={replica.get('secret_drift')!r}"
+        f" ready={replica.get('ready')!r}"
+        f" (secret_config_sha256={replica.get('secret_config_sha256')}){suffix}"
+        for replica in replicas
+        if replica.get("secret_drift") is not False or replica.get("ready") is not True
+    ]
+
+
+def _converging(replicas: list[dict[str, Any]]) -> bool:
+    """Whether a drifting replica reads the mounted Secret, so waiting can help."""
+
+    return any(
+        item.get("secret_drift") is not False
+        and item.get("secret_source") == MOUNTED_SECRET_SOURCE
+        for item in replicas
+    )
+
+
+def await_mounted_convergence(
+    control: Callable[..., str],
+    replicas: list[dict[str, Any]],
+    skipped: list[dict[str, Any]],
+    *,
+    timeout_seconds: float = MOUNTED_CONVERGENCE_SECONDS,
+    poll_seconds: float = MOUNTED_CONVERGENCE_POLL_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], float]:
+    """Re-read the replicas while a mounted one still drifts, bounded.
+
+    Called only when Secret and head agree: the mounted Secret then converges
+    on the head by itself. Returns the last reading and the seconds waited.
+    """
+
+    started = monotonic()
+    while _converging(replicas) and monotonic() - started < timeout_seconds:
+        sleep(poll_seconds)
+        replicas, skipped = api_replica_registry_health(control)
+    return replicas, skipped, round(monotonic() - started, 3)
 
 
 def _config_field_differences(
@@ -208,13 +267,17 @@ def verify_alignment(
     artifacts: Path | None,
     phase: str,
     restart_window_start: str | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
     """Prove the Secret, the durable head and every api-ha replica agree.
 
     The Secret's config digest must equal the head's, and no Running replica
     may report ``regional_registry.secret_drift``. The report is written to
     ``registry-alignment-<phase>.json``; a disagreement raises with the
-    differing fields and replicas named.
+    differing fields and replicas named. While Secret and head agree, a
+    replica reading the mounted Secret is given ``MOUNTED_CONVERGENCE_SECONDS``
+    to converge first (``await_mounted_convergence``).
 
     ``restart_window_start`` (the preflight's ``checked_at``) enables the one
     tolerated remedy: when Secret and head agree and every drifting replica
@@ -252,13 +315,12 @@ def verify_alignment(
                 for cluster, fields in differences.items()
             )
         )
-    for replica in replicas:
-        if replica.get("secret_drift") is not False or replica.get("ready") is not True:
-            errors.append(
-                f"{replica['pod']} reports secret_drift={replica.get('secret_drift')!r}"
-                f" ready={replica.get('ready')!r}"
-                f" (secret_config_sha256={replica.get('secret_config_sha256')})"
-            )
+    waited = 0.0
+    if not differences and _converging(replicas):
+        replicas, skipped, waited = await_mounted_convergence(
+            control, replicas, skipped, sleep=sleep, monotonic=monotonic
+        )
+    errors.extend(_replica_errors(replicas))
     restarted: list[str] = []
     if errors and not differences and restart_window_start is not None:
         drifting = [item for item in replicas if item.get("secret_drift") is not False]
@@ -270,13 +332,7 @@ def verify_alignment(
             control("rollout", "restart", API_DEPLOYMENT)
             control("rollout", "status", API_DEPLOYMENT, f"--timeout={ROLLOUT_TIMEOUT}")
             replicas, skipped = api_replica_registry_health(control)
-            errors = [
-                f"{replica['pod']} reports secret_drift={replica.get('secret_drift')!r}"
-                f" ready={replica.get('ready')!r} after the rolling restart"
-                for replica in replicas
-                if replica.get("secret_drift") is not False
-                or replica.get("ready") is not True
-            ]
+            errors = _replica_errors(replicas, suffix=" after the rolling restart")
     report = {
         "phase": phase,
         "checked_at": datetime.now(timezone.utc).isoformat(),
@@ -288,6 +344,7 @@ def verify_alignment(
         "replicas": replicas,
         "skipped_replicas": skipped,
         "restarted_replicas": restarted,
+        "mounted_convergence_seconds": waited,
         "errors": errors,
     }
     if artifacts is not None:

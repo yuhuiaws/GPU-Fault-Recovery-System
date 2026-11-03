@@ -6293,7 +6293,8 @@ The three CPU role Deployments now also mount the Secret's `clusters.json`
 every refresh and compares that copy. `/healthz` names the compared copy
 (`secret_source`), the start-up digest and the head's digest. A Secret-only
 rewrite (review H3) drifts in every running replica, not only in Pods started
-after it.
+after it. The perf alignment gate waits up to 180 s for replicas that compare
+the mounted copy; the BOOT-023 probe reads the same file.
 
 Proven locally:
 
@@ -6307,11 +6308,16 @@ Proven locally:
 - `tests/deploy/test_registry_secret_file_wiring.py`: the regional patch and
   the three rendered role manifests carry the mount, and the application
   factory hands the file to the runtime.
+- `tests/regional/test_registry_secret_mount_harness.py`: the BOOT-023 probe
+  and verdict pass a Pod that predates a join and keep the old verdict without
+  a mount; the perf gate waits for mounted replicas within its bound, fails
+  past it without restarting, and does not wait for start-up replicas.
 
 Not verified:
 
 - Nothing ran on a cluster. The kubelet propagation delay for this Secret
-  volume (the Aurora Secret mount's is about 1-2 minutes) was not measured.
+  volume (the Aurora Secret mount's is about 1-2 minutes) was not measured;
+  the 180 s bound assumes it.
 - No live join or remove has run against a release carrying the mount. It
   ships with the next release, which rolls the three CPU Deployments for its
   new Pod template; until then a replica that predates a join or remove keeps

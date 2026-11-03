@@ -86,9 +86,12 @@ def test_transport_failure_is_an_unknown_status_not_a_health_proof(monkeypatch, 
 
 
 def test_main_reads_the_selected_generation_and_real_registry_digest(
-    monkeypatch, capsys
+    monkeypatch, capsys, tmp_path
 ):
     from gpu_fault.app import ApplicationContext
+
+    # No mounted Secret here: the probe falls back to the start-up digest.
+    monkeypatch.setattr(probe, "MOUNTED_SECRET_FILE", str(tmp_path / "absent"))
     from gpu_fault.regional_registry import regional_registry_config_sha256
 
     generations = []
@@ -118,6 +121,7 @@ def test_main_reads_the_selected_generation_and_real_registry_digest(
     assert generations == [7]
     assert report["head_generation"] == 7
     assert report["secret_config_sha256"] == report["durable_config_sha256"] == digest
+    assert report["secret_source"] == "startup-environment"
     assert report["hostname"] == "private-cpu-pod"
     assert (
         report["healthz"] == report["livez"] == {"status": 200, "payload": {"ok": True}}

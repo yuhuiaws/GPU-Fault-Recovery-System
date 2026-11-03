@@ -3522,7 +3522,10 @@ state is not a successful cleanup either.
      `NOOP` (any other classification is rejected immediately -- this case only lets the release engine do "what live already is").
   3. Inside every CPU Pod (three Deployments) the Secret config digest computed by the probe `probes/boot023_registry_probe.py`
      equals the durable head config digest, `/healthz` is 200 with
-     `regional_registry.secret_drift=false` and `ready=true`.
+     `regional_registry.secret_drift=false` and `ready=true`. The probe reads the Secret copy the registry runtime
+     compares: the Pod's mounted `/etc/gpu-fault/regional-clusters/clusters.json` (refreshed by kubelet with the
+     Secret, so a join/remove needs no restart to agree); on a release without the mount, the env copy the process
+     started with. The evidence records `secret_source` and the start-up copy's digest `secret_startup_config_sha256`.
   4. The existing history is parseable and ≤ 200 entries; previous snapshot groups ≤ 3.
   5. Offline: a copy of the noop manifest with `database.rollback_compatible: true` written in, handed to
      `parse_delivery_identity`, must raise `ReleaseError` (done at plan time; refuse on failure).

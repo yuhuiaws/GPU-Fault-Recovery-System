@@ -3,11 +3,14 @@
 
 Fed on stdin to ``python3 - <http-port>`` inside one CPU control-plane Pod.
 It computes the two digests ARCH-H3 compares -- the operator-configured view
-of the ``GPU_FAULT_REGIONAL_CLUSTERS_JSON`` Secret this process started from,
-and the same view of the durable registry head in Aurora -- with the deployed
-``regional_registry_config_sha256``, and reads the Pod's own ``/healthz`` and
-``/livez`` on loopback so the reported ``secret_drift`` can be checked against
-what the digests say. It prints one JSON object and never writes anything.
+of the registry Secret, and the same view of the durable registry head in
+Aurora -- with the deployed ``regional_registry_config_sha256``, and reads the
+Pod's own ``/healthz`` and ``/livez`` on loopback so the reported
+``secret_drift`` can be checked against what the digests say. The Secret is the
+copy the registry runtime compares: the mounted ``clusters.json`` where the
+Pod mounts it (kubelet keeps it current, so a join or remove since the Pod
+started is no drift), else the ``GPU_FAULT_REGIONAL_CLUSTERS_JSON`` env the
+process started from. It prints one JSON object and never writes anything.
 """
 
 from __future__ import annotations
@@ -18,6 +21,10 @@ import sys
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
+
+# ``gpu_fault.regional_registry.REGIONAL_CLUSTERS_SECRET_FILE``; spelled out so
+# the probe also runs on a release whose wheel predates the constant.
+MOUNTED_SECRET_FILE = "/etc/gpu-fault/regional-clusters/clusters.json"
 
 
 def fetch(url: str) -> dict[str, Any]:
@@ -39,6 +46,35 @@ def fetch(url: str) -> dict[str, Any]:
         return {"status": None, "error": f"{type(exc).__name__}: {exc}"}
 
 
+def mounted_secret_sha256(path: str | None = None) -> dict[str, Any] | None:
+    """The mounted Secret's configured-view digest, or None where none is mounted.
+
+    Uses only helpers every deployed wheel has. A document that does not load
+    yields no digest and a fixed error: it carries plaintext tokens.
+    """
+
+    from gpu_fault.regional_registry import (
+        configured_regional_registrations,
+        regional_registry_config_sha256,
+    )
+
+    try:
+        with open(path or MOUNTED_SECRET_FILE, "rb") as handle:
+            raw = handle.read()
+    except FileNotFoundError:
+        return None
+    try:
+        values = json.loads(raw)
+        if not isinstance(values, list):
+            raise ValueError("not a list")
+        digest = regional_registry_config_sha256(
+            configured_regional_registrations(values)
+        )
+    except (TypeError, ValueError):
+        return {"sha256": None, "error": "mounted registry Secret does not load"}
+    return {"sha256": digest, "error": None}
+
+
 def main() -> int:
     port = int(sys.argv[1])
     from gpu_fault.app import ApplicationContext
@@ -48,9 +84,19 @@ def main() -> int:
     store = context.store
     head = store.get_regional_registry_head()
     revision = store.get_regional_registry_revision(head.generation)
+    mounted = mounted_secret_sha256()
     report = {
         "hostname": socket.gethostname(),
-        "secret_config_sha256": context.regional_registry_secret_sha256,
+        "secret_config_sha256": (
+            mounted["sha256"]
+            if mounted is not None
+            else context.regional_registry_secret_sha256
+        ),
+        "secret_source": (
+            "mounted-file" if mounted is not None else "startup-environment"
+        ),
+        "secret_error": mounted["error"] if mounted is not None else None,
+        "secret_startup_config_sha256": context.regional_registry_secret_sha256,
         "durable_config_sha256": regional_registry_config_sha256(
             revision.registrations
         ),
