@@ -92,7 +92,7 @@ requirements:
     cases: [GF-GENERAL-FIX-016]
     checks:
       - nodeid: tests/execution/test_general_health_policy_e2e.py::test_fatal_host_log_stops_the_owned_attempt_before_quarantine
-        expected: 4
+        expected: 6
       - nodeid: tests/execution/test_general_health_policy_e2e.py::test_untrusted_fatal_text_cannot_stop_training
         expected: 2
     critical: true
