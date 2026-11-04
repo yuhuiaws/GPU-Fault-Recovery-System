@@ -237,7 +237,14 @@ deployment history:
   the two; a round without `store_bloat.before` (`recorded=false`) cannot be the record for either label.
 - Every round's `store_layout.after` gives the page counts of the queue, the payloads table, the replay partitions and
   the metric latest partitions after teardown; a formal result requires the queue's heap pages back at the order of the
-  in-flight set and the synthetic clusters' metric latest partitions `DROP`ped.
+  in-flight set and the synthetic clusters' metric latest rows deleted. The synthetic clusters are published through the
+  durable registry and have no partition of their own: their rows live in `gpu_fault_gpu_metric_latest_clusters_default`
+  and the teardown deletes them row by row (`capacity-data-cleanup.json`: `dropped_partitions` empty,
+  `deleted_table_rows` counts the rows; detailed design v2 §4.4.2). Every burst therefore starts on that partition's
+  statistics as autovacuum left them after the previous teardown, without the perf cluster; the GPU metric batches' two
+  hot reads do not depend on them. A storm of reads of the table in `pg_activity` (`SELECT key, payload FROM
+  gpu_fault_gpu_metric_latest_clusters ...` five or more times in one sample) that ends with an autovacuum worker means
+  that dependency is back: file it as a store defect.
 - The proxy does not see leaf fill or dead-entry density (the live store has no `pgstattuple`; installing it is a
   write), so what **judges** a round is only the `steady_state` round's own throughput, p99 and reserved-503 share
   (§6); `index_pages_per_live_row` only separates "an optimistic bound on compact indexes" from "steady state on indexes

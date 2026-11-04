@@ -3170,6 +3170,27 @@ heap versions per request, not more frequent tidying.
    time-expired replay table is RANGE-partitioned. **Gain**: a round's 260k rows, or every latest row of a real cluster
    leaving the fleet, return their pages with the partition (previously 51,545 heap pages and 188 MB of indexes carried
    1,216 rows); `list_gpu_metrics_latest` and the upsert prune to one partition by `cluster_id`.
+   **Where rows actually live, and the two hot reads.** Only the bootstrap sync (`save_regional_cluster` while no
+   durable registry head exists) and the `--set-hot-layout detached` switch create partitions: a cluster published
+   through the durable registry (every registration after the first bootstrap, the perf suites' synthetic clusters
+   included) has no partition of its own, its rows go to `..._default`, neither publication nor removal creates or drops
+   a partition, and the perf teardown deletes those rows one by one (`dropped_partitions` is empty in
+   `capacity-data-cleanup.json`); "return their pages with the partition" above holds only for clusters that have one.
+   The statistics of `..._default` can therefore predate the cluster that is writing, and every burst-1c run starts
+   that way: autovacuum analysed the partition after the previous run's teardown deleted the perf rows, the MCV list
+   holds only production clusters and the planner estimates the perf cluster at one row. The read-back of
+   `observe_gpu_metrics` and `list_gpu_metrics_latest` then walked the primary key's `cluster_id` range and filtered on
+   the heap -- every row the cluster had written so far, per batch -- until the next autovacuum pass analysed the
+   partition (PostgreSQL 16 reproduction, 32,000 rows: the read-back 20-25 ms and 33,002 shared buffers, 0.8 ms and 128
+   after ANALYZE; the listing is a cost tie between that range and the node index, decided by index geometry, and took
+   21 ms and 33,002 buffers when the range won; in the live samplers every slow run's read storm ends with an
+   autovacuum worker). `store/postgres/metric_latest_reads.py` shapes both reads so they do not depend on those
+   statistics: the read-back is one `(cluster_id, key)` primary-key probe per key (LATERAL + `LIMIT 1`; custom and
+   generic plans alike are unique-key probes, still pruned at planning by the literal `cluster_id`); the listing passes
+   the cluster as an uncorrelated sub-select, so the planner prices the range at an average cluster (`1/n_distinct`)
+   and the node index wins, with partitions pruned at run time instead. A partition that has never been analysed has
+   no column statistics, and the listing there may still combine both indexes in a BitmapAnd (index pages of the
+   cluster's range only, no heap) until its first ANALYZE.
 5. **`store-compaction` stays as the safety net** (§10.3): lanes / queue counts / priority shards are still rewritten
    in place and keep their rules; a partitioned parent is measured by aggregating its partitions and reindexed per
    partition with `REINDEX INDEX CONCURRENTLY`; replay partitions are measured, never rebuilt.

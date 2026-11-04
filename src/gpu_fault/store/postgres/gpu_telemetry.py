@@ -5,6 +5,10 @@ from typing import Any, Callable
 
 from gpu_fault.gpu_metric_models import gpu_finding_transition
 from gpu_fault.store.postgres.hot_layout import metric_latest_table
+from gpu_fault.store.postgres.metric_latest_reads import (
+    node_rows_query,
+    previous_rows_query,
+)
 from gpu_fault.store.shared.finding_history import records_finding_history
 from gpu_fault.store.shared.time import (
     utc_text as _utc_text,
@@ -160,16 +164,9 @@ class PostgresGpuTelemetryMixin:
                 table = self._metric_latest_table(cursor, write=True)
                 partitioned = table != "gpu_fault_gpu_metric_latest"
                 # The batch is one cluster's, so the partitioned twin prunes to
-                # that cluster's partition on both the read and the upsert.
-                cursor.execute(
-                    f"""
-                    SELECT key, payload
-                    FROM {table}
-                    WHERE key=ANY(%s)
-                      AND (%s OR cluster_id=%s)
-                    """,
-                    (storage_keys, not partitioned, cluster_id),
-                )
+                # that cluster's partition on both the read and the upsert; the
+                # read is one key probe each (metric_latest_reads.py).
+                cursor.execute(*previous_rows_query(table, storage_keys, cluster_id))
                 previous_by_key = {
                     key: self._decode("gpu_metric_latest", payload)
                     for key, payload in cursor.fetchall()
@@ -387,14 +384,7 @@ class PostgresGpuTelemetryMixin:
             return super().list_gpu_metrics_latest(cluster_id, node_id)
         with self._db.cursor() as cursor:
             cursor.execute(
-                f"""
-                SELECT key, payload
-                FROM {self._metric_latest_table(cursor)}
-                WHERE cluster_id=%s
-                  AND node_id=%s
-                ORDER BY key
-                """,
-                (cluster_id, node_id),
+                *node_rows_query(self._metric_latest_table(cursor), cluster_id, node_id)
             )
             rows = cursor.fetchall()
         by_key = {

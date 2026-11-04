@@ -1118,7 +1118,7 @@ roll**:
 ```bash
 # After the control-plane roll has completed (gpu-fault-admin status healthy, release committed), once, inside a Running api-ha Pod
 kubectl -n gpu-fault-system exec deploy/gpu-fault-api-ha -- gpu-fault-store-migrate --set-hot-layout detached
-# Check: mode detached, one metric-latest partition per registered cluster (+ default), replay buckets covering the next 15 minutes
+# Check: mode detached, one metric-latest partition per cluster registered or with rows at the switch (+ default), replay buckets covering the next 15 minutes
 kubectl -n gpu-fault-system exec deploy/gpu-fault-api-ha -- gpu-fault-store-migrate --hot-layout-status
 ```
 
@@ -1128,9 +1128,12 @@ the existing rows of `gpu_fault_gpu_metric_latest` into the partitioned table, c
 mode; one-way and idempotent (an already detached database only reports its status). From then on request bodies go to
 the payloads table, completed requests leave the queue for a replay bucket (`processor-cleanup` creates the next 15
 minutes of buckets every pass and `DROP`s whole buckets past `GPU_FAULT_PROCESSOR_COMPLETED_RETENTION_SECONDS`), and
-metric latest rows go to their cluster's partition (created at registration, `DROP`ped by `remove-cluster` and by the
-perf teardown). A fresh database is recorded `detached` by ensure and needs no step. A site that never switches keeps
-running, but its queue still carries bodies and completed rows and metric latest still writes the flat table -- only the
+metric latest rows go to their cluster's partition. Registrations and removals published through the durable
+registry afterwards (`join-cluster`, `remove-cluster`, the perf suites' synthetic clusters) create and drop no
+partition: those clusters' rows live in the default partition and the perf teardown deletes them row by row; the GPU
+metric batches' two hot reads of the table do not depend on that partition's statistics (detailed design v2 §4.4.2).
+A fresh database is recorded `detached` by ensure and needs no step. A site that never switches keeps running, but its
+queue still carries bodies and completed rows and metric latest still writes the flat table -- only the
 index set's HOT gain applies; a formal perf round requires `store_layout.mode` `detached` in `summary.json` (performance
 acceptance plan §3.3). `store-compaction` and `store-maintenance` measure a partitioned parent as the sum of its
 partitions and rebuild indexes per partition (§10.3).

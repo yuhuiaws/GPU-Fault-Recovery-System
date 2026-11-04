@@ -198,6 +198,7 @@ POSTGRES_TESTS = \
 	tests/store/test_postgres_lane_claim_guard.py \
 	tests/store/test_postgres_lane_footprint.py \
 	tests/store/test_postgres_merge_vs_executor.py \
+	tests/store/test_postgres_metric_latest_plans.py \
 	tests/store/test_postgres_notification_delivery_lock.py \
 	tests/store/test_postgres_notify_edges.py \
 	tests/store/test_postgres_notify_probe_cost.py \
