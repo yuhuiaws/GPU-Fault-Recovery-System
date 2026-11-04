@@ -416,3 +416,25 @@ def test_errors_already_in_the_baseline_pass_without_findings(
 
     assert record["status"] == "PASS", record
     assert report["cluster_scope"]["not_gating_findings"] == [], report
+
+
+def test_a_cluster_the_site_does_not_name_still_gates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only another cluster of the site is set aside: a command or an error
+    attributed to a cluster the site does not name (a removed cluster's
+    leftovers) is not provably another data plane's."""
+
+    report, record = control_api(
+        monkeypatch, release_for(), unclaimed(**{"gpu-gone": 1200.0, EKS: 4.0})
+    )
+    assert report["healthy"] is False
+    assert record["summary"] == (
+        f"gpu-gone: oldest unclaimed remote command is 1200.0s; limit is {LIMIT}s"
+    )
+
+    report, record = control_api(
+        monkeypatch, release_for(), errors_since(**{"gpu-gone": 60, EKS: 30})
+    )
+    assert report["healthy"] is False
+    assert record["summary"].startswith("gpu-gone: executor internal"), record

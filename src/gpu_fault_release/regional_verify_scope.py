@@ -43,22 +43,54 @@ reads. A ``remove-cluster`` targets the cluster it removed, which the
 remaining site no longer names, so there every remaining cluster's own checks
 are findings and the shared control plane is what gates. An unscoped verify
 (``deploy``, ``config``) judges every cluster, as before.
+
+The same scope covers the verb's other engine calls, so another cluster's
+node loss (or any finding of its own) neither refuses nor rolls the verb back
+at an earlier step either:
+
+* the join's candidate ``preflight`` (``--joining-cluster-id``): another
+  cluster's part of ``regional_contexts`` and its blockers in
+  ``workflow_safety`` are findings (``WARN``, ``cluster_scope``);
+* the ``join-cluster`` mode, always scoped to its ``--cluster-id``: another
+  cluster's context, its open remote commands (the mode's idle check) and its
+  open commands and destructive workflows in every fleet wave gate are
+  findings, narrated as ``not-gating`` lines -- the waves restart Agents of
+  the joining cluster only;
+* ``sync-state`` (``--joining-cluster-id`` / ``--removed-cluster-id``):
+  another cluster's Agent set is a finding, not a refusal to commit;
+* ``drain-cluster`` scopes its idle check to the clusters it drains.
+
+Counts the Store or a probe attributes to clusters gate unless they are
+another cluster of the site (``other_cluster``): the target's, those of a
+cluster the site does not name and those nothing could attribute
+(``UNATTRIBUTED``) still gate, and so does every count whose per-cluster
+breakdown is missing or does not add up to the fleet's. A ``deploy``,
+``config``, ``status`` and every other mode bind no scope.
 """
 
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+import json
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from typing import Any
 
 from gpu_fault_release.regional_check_value import CheckValue
 from gpu_fault_release.regional_release_config import CheckFailure, ReleaseError
+from gpu_fault_release.regional_release_narration import narrate_step
 
 JOIN_VERB = "join-cluster"
 REMOVE_VERB = "remove-cluster"
+#: The idle check of ``drain-cluster``: the drained clusters' commands gate.
+DRAIN_VERB = "drain-cluster"
 JOINING_FLAG = "--joining-cluster-id"
 REMOVED_FLAG = "--removed-cluster-id"
+#: The engine modes the two flags scope (``join-cluster`` scopes itself).
+SCOPED_MODES = ("verify", "preflight", "sync-state")
+#: A probe's cluster key for a record it could not place: gates every scope.
+UNATTRIBUTED = ""
 #: Per check details: cluster id -> the findings that did not gate this verify.
 NOT_GATING_KEY = "not_gating"
 #: Report key: the verb, its targets and every finding that did not gate.
@@ -73,6 +105,10 @@ class VerifyScope:
 
     verb: str
     targets: tuple[str, ...]
+    #: The ``not-gating`` lines already printed (a wave gate polls).
+    narrated: set[tuple[str, str, str]] = field(
+        default_factory=set, compare=False, hash=False, repr=False
+    )
 
     def gates(self, cluster_id: str) -> bool:
         return cluster_id in self.targets
@@ -95,14 +131,19 @@ def add_scope_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def validate_scope_arguments(arguments: argparse.Namespace) -> None:
-    """Refuse a scope outside ``verify``, two scopes, or an empty cluster id."""
+    """Refuse a scope outside ``SCOPED_MODES`` or of a deploy's preflight, two
+    scopes, or an empty cluster id."""
 
     joining = getattr(arguments, "joining_cluster_ids", None) or []
     removed = getattr(arguments, "removed_cluster_id", None)
     if not joining and removed is None:
         return
-    if arguments.mode != "verify":
-        raise ReleaseError(f"{JOINING_FLAG}/{REMOVED_FLAG} only scope a verify")
+    if arguments.mode not in SCOPED_MODES:
+        raise ReleaseError(
+            f"{JOINING_FLAG}/{REMOVED_FLAG} only scope {', '.join(SCOPED_MODES)}"
+        )
+    if getattr(arguments, "for_deploy", False):
+        raise ReleaseError(f"{JOINING_FLAG}/{REMOVED_FLAG} never scope a deploy")
     if joining and removed is not None:
         raise ReleaseError(f"{JOINING_FLAG} and {REMOVED_FLAG} exclude each other")
     named = [*joining, *([] if removed is None else [removed])]
@@ -121,6 +162,9 @@ def scope_of(arguments: argparse.Namespace, release: Any) -> VerifyScope | None:
     validate_scope_arguments(arguments)
     joining = sorted(set(getattr(arguments, "joining_cluster_ids", None) or []))
     removed = getattr(arguments, "removed_cluster_id", None)
+    if arguments.mode == JOIN_VERB:
+        # The mode joins its --cluster-id (``join_target`` validates it).
+        return VerifyScope(JOIN_VERB, (str(arguments.cluster_id),))
     if not joining and removed is None:
         return None
     configured = {str(target.cluster_id) for target in release.config.clusters}
@@ -140,9 +184,21 @@ def scope_of(arguments: argparse.Namespace, release: Any) -> VerifyScope | None:
 
 
 def bind_scope(release: Any, arguments: argparse.Namespace) -> None:
-    """Give ``release`` the scope its ``verify`` was asked for (or none)."""
+    """Give ``release`` the scope its mode was asked for (or none)."""
 
     release.verify_scope = scope_of(arguments, release)
+
+
+@contextmanager
+def scoped_to(release: Any, scope: VerifyScope) -> Iterator[None]:
+    """``release`` scoped to ``scope`` for the block, then as it was."""
+
+    previous = getattr(release, "verify_scope", None)
+    release.verify_scope = scope
+    try:
+        yield
+    finally:
+        release.verify_scope = previous
 
 
 def verify_scope(release: Any) -> VerifyScope | None:
@@ -157,6 +213,18 @@ def gates(release: Any, cluster_id: object) -> bool:
     return scope is None or scope.gates(str(cluster_id))
 
 
+def other_cluster(release: Any, cluster_id: object) -> bool:
+    """Whether a count attributed to ``cluster_id`` is another site cluster's,
+    reported instead of gated on: never unscoped, never the target's, never
+    a cluster the site does not name, never ``UNATTRIBUTED``."""
+
+    scope = verify_scope(release)
+    cluster = str(cluster_id)
+    if scope is None or scope.gates(cluster) or cluster == UNATTRIBUTED:
+        return False
+    return cluster in {str(target.cluster_id) for target in release.config.clusters}
+
+
 def not_gating_ids(release: Any, cluster_ids: Iterable[object]) -> frozenset[str]:
     return frozenset(str(item) for item in cluster_ids if not gates(release, item))
 
@@ -166,6 +234,140 @@ def record_not_gating(container: dict[str, Any], cluster_id: str, finding: str) 
 
     findings = container.setdefault(NOT_GATING_KEY, {})
     findings.setdefault(str(cluster_id), []).append(str(finding))
+
+
+def narrate_not_gating(release: Any, check: str, cluster_id: str, finding: str) -> None:
+    """One ``not-gating`` log line per finding: a mode without a report (the
+    ``join-cluster`` mode, ``sync-state``) records them in its log."""
+
+    scope = verify_scope(release)
+    key = (check, str(cluster_id), str(finding))
+    if scope is None or key in scope.narrated:
+        return
+    scope.narrated.add(key)
+    narrate_step(
+        "not-gating",
+        verb=scope.verb,
+        targets=",".join(scope.targets),
+        cluster=cluster_id,
+        check=check,
+        finding=json.dumps(str(finding)),
+    )
+
+
+def file_not_gating(
+    release: Any, container: dict[str, Any], check: str, cluster_id: str, finding: str
+) -> None:
+    """``record_not_gating`` under ``container`` and ``narrate_not_gating``."""
+
+    record_not_gating(container, cluster_id, finding)
+    narrate_not_gating(release, check, cluster_id, finding)
+
+
+def _counts(value: object) -> dict[str, int] | None:
+    """A ``cluster -> count`` mapping of non-negative integers, else None."""
+
+    if not isinstance(value, Mapping):
+        return None
+    try:
+        counts = {str(key): int(count) for key, count in value.items()}
+    except (TypeError, ValueError):
+        return None
+    return None if any(count < 0 for count in counts.values()) else counts
+
+
+def gating_count(
+    release: Any,
+    container: dict[str, Any],
+    *,
+    check: str,
+    total: int,
+    by_cluster: object,
+    finding: Callable[[str, int], str],
+) -> int:
+    """How much of ``total`` (a fleet-wide count of blockers) gates this call.
+
+    All of it unscoped, or when ``by_cluster`` (cluster -> count) is not a
+    breakdown that adds up to ``total``. Otherwise every count but another
+    site cluster's (``other_cluster``); each of those is filed under
+    ``container`` and narrated, worded by ``finding``.
+    """
+
+    counts = _counts(by_cluster) if total > 0 else None
+    if verify_scope(release) is None or counts is None:
+        return total
+    if sum(counts.values()) != total:
+        return total
+    gating = 0
+    for cluster_id, count in sorted(counts.items()):
+        if not other_cluster(release, cluster_id):
+            gating += count
+        elif count:
+            file_not_gating(
+                release, container, check, cluster_id, finding(cluster_id, count)
+            )
+    return gating
+
+
+def gating_open_commands(
+    release: Any,
+    container: dict[str, Any],
+    *,
+    check: str,
+    open_by_status: Mapping[str, int],
+    by_cluster_status: object,
+) -> dict[str, int]:
+    """The open remote commands (status -> count) that gate this call.
+
+    All of them unscoped, or when ``by_cluster_status`` (cluster -> status ->
+    count, the Store's breakdown) does not add up to ``open_by_status`` for
+    every status. Otherwise every cluster's but another site cluster's, which
+    is filed and narrated as ``open remote commands: <status>=<n>``.
+    """
+
+    statuses = {str(key): int(count or 0) for key, count in open_by_status.items()}
+    if verify_scope(release) is None or not any(statuses.values()):
+        return statuses
+    if not isinstance(by_cluster_status, Mapping):
+        return statuses
+    per_cluster: dict[str, dict[str, int]] = {}
+    for cluster_id, cells in by_cluster_status.items():
+        counts = _counts(
+            {key: value for key, value in cells.items() if key in statuses}
+            if isinstance(cells, Mapping)
+            else None
+        )
+        if counts is None:
+            return statuses
+        per_cluster[str(cluster_id)] = counts
+    if any(
+        sum(cells.get(status, 0) for cells in per_cluster.values()) != count
+        for status, count in statuses.items()
+    ):
+        return statuses
+    gating = {status: 0 for status in statuses}
+    for cluster_id, cells in sorted(per_cluster.items()):
+        opened = {status: count for status, count in sorted(cells.items()) if count}
+        if not opened:
+            continue
+        if not other_cluster(release, cluster_id):
+            for status, count in opened.items():
+                gating[status] += count
+            continue
+        text = "open remote commands: " + ", ".join(
+            f"{status}={count}" for status, count in opened.items()
+        )
+        file_not_gating(release, container, check, cluster_id, text)
+    return gating
+
+
+def listed(ids: object, cluster_id: str, limit: int = 5) -> str:
+    """The first ``limit`` record ids a probe listed for ``cluster_id``."""
+
+    values = ids.get(cluster_id) if isinstance(ids, Mapping) else None
+    names = [str(item) for item in values or ()] if isinstance(values, list) else []
+    more = f" +{len(names) - limit} more" if len(names) > limit else ""
+    return ", ".join(names[:limit]) + more
 
 
 def scoped_cluster_check(
@@ -274,3 +476,72 @@ def not_gating_findings(report: Mapping[str, Any] | None) -> list[dict[str, str]
         for item in (findings if isinstance(findings, list) else [])
         if isinstance(item, dict)
     ]
+
+
+#: The fleet wave probe's per-cluster breakdowns (``rollout_wave_safety.py``).
+OPEN_REMOTE_BY_CLUSTER = "open_remote_by_cluster"
+DESTRUCTIVE_BY_CLUSTER = "destructive_workflow_count_by_cluster"
+DESTRUCTIVE_IDS_BY_CLUSTER = "destructive_workflows_by_cluster"
+#: Its never-dispatched lists (``regional_release_departed_nodes`` and
+#: ``regional_release_departure_absorption`` read them under these names).
+NEVER_DISPATCHED_KEYS = (
+    "never_dispatched_destructive_workflows",
+    "never_dispatched_young_destructive_workflows",
+)
+WAVE_CHECK = "fleet_wave_safety"
+
+
+def scoped_wave_safety(release: Any, snapshot: dict[str, Any]) -> dict[str, Any]:
+    """The fleet wave gate's evidence as a membership verb's waves judge it.
+
+    A ``join-cluster`` restarts Agents of the joining cluster only, so another
+    site cluster's open remote commands and destructive workflows -- the
+    record the product opens for a node a spot reclaim took, a remediation in
+    progress there -- cannot be dropped mid-way by its waves: they are
+    findings, and ``open_remote``, ``destructive_workflow_count``, its ids and
+    the never-dispatched lists keep the gating clusters' only. Unscoped (an
+    upgrade's or a rollback's waves) and without a breakdown that adds up,
+    the evidence is returned as it is.
+    """
+
+    if verify_scope(release) is None:
+        return snapshot
+    result = dict(snapshot)
+    result["open_remote"] = gating_open_commands(
+        release,
+        result,
+        check=WAVE_CHECK,
+        open_by_status=dict(snapshot.get("open_remote") or {}),
+        by_cluster_status=snapshot.get(OPEN_REMOTE_BY_CLUSTER),
+    )
+    total = int(snapshot.get("destructive_workflow_count") or 0)
+    ids = snapshot.get(DESTRUCTIVE_IDS_BY_CLUSTER)
+    gating = gating_count(
+        release,
+        result,
+        check=WAVE_CHECK,
+        total=total,
+        by_cluster=snapshot.get(DESTRUCTIVE_BY_CLUSTER),
+        finding=lambda cluster, count: (
+            f"{count} active destructive workflow(s): {listed(ids, cluster)}"
+        ),
+    )
+    if gating == total:
+        return result
+    keep = {
+        str(cluster)
+        for cluster in (ids if isinstance(ids, Mapping) else {})
+        if not other_cluster(release, cluster)
+    }
+    result["destructive_workflow_count"] = gating
+    result["destructive_workflows"] = [
+        str(item) for cluster in sorted(keep) for item in (ids or {}).get(cluster) or []
+    ][:20]
+    for key in NEVER_DISPATCHED_KEYS:
+        result[key] = [
+            entry
+            for entry in snapshot.get(key) or []
+            if isinstance(entry, dict)
+            and not other_cluster(release, entry.get("cluster_id") or "")
+        ]
+    return result

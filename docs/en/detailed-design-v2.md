@@ -3332,7 +3332,15 @@ cluster's findings are `WARN`s listed under `cluster_scope.not_gating_findings`,
 cluster that fails the verify (the target, every cluster of a `deploy`) an Agent without a Ready Node is re-read by
 `regional_release_verify_churn` under the forward path's `DepartureWatch` rule within the 10-minute departure guard: excused
 with its evidence once Kubernetes no longer lists it and the proof holds, otherwise the refusal ends with
-`departure not proven: <node>: <reason>`.
+`departure not proven: <node>: <reason>`. The same scope covers the verb's other engine calls: the join's candidate
+`preflight` (`--joining-cluster-id`: another cluster's `regional_contexts` part and its `workflow_safety` blockers are
+`WARN`s), the `join-cluster` mode (scoped to its `--cluster-id`: `join_target`'s idle check, the context validation and
+every fleet wave gate -- `scoped_wave_safety` over the wave probe's per-cluster breakdowns -- judge the joining cluster,
+another cluster's open commands, context and destructive workflows are `not-gating` log lines), `sync-state`
+(`regional_release_agent_set`: another cluster's Agent set is logged) and `drain-cluster` (the drained clusters' open
+commands). Counts gate unless `other_cluster` attributes them to another cluster of the site; a missing or inconsistent
+breakdown, an unreadable incident (`""`) and a cluster the site does not name gate. Deploy, `config` and every other mode
+bind no scope.
 
 The same entry point has three more mutually exclusive incident-level switches (`admin/incident_close.py`, all accepting
 `--reason`/`--reference`/`--dry-run`): `--close-incident INCIDENT_ID ...` closes the named

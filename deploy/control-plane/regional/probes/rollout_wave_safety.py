@@ -40,6 +40,15 @@ listed under ``never_dispatched_young_destructive_workflows``: the forward path
 waits for one that names only nodes it proved departed to age past the guard
 (``regional_release_departure_absorption``) instead of refusing the wave at once.
 
+The open remote commands and the destructive workflows are also broken down by
+GPU cluster: ``open_remote_by_cluster`` (cluster -> status -> count, from the
+Store's ``by_cluster_status``; absent from a Store without it) and
+``destructive_workflow_count_by_cluster`` / ``destructive_workflows_by_cluster``
+(by the incident's cluster; "" when it cannot be read). The waves of a
+``join-cluster`` restart the joining cluster's Agents only, so the engine gates
+them on that cluster's counts (``gpu_fault_release.regional_verify_scope``);
+every other phase still gates on the totals.
+
 The report also carries ``minimum_lease_remaining_seconds``: the smallest lease
 remaining across those outside nodes, in the same units as the request's
 threshold of the same name. It is what lets the engine re-decide the same
@@ -132,6 +141,30 @@ def operator_confirmed_parked(store: Any, workflow: Any, now: datetime) -> bool:
     )
 
 
+def incident_cluster(store: Any, workflow: Any) -> str:
+    # The record's GPU cluster; "" when its incident cannot be read (gates).
+    try:
+        return str(store.get_incident(workflow.incident_id).cluster_id or "")
+    except Exception:
+        return ""
+
+
+def open_by_cluster(remote: Any) -> Any:
+    # The Store's (cluster, status) cells of the open statuses; None without them.
+    cells = remote.get("by_cluster_status")
+    if not isinstance(cells, dict):
+        return None
+    return {
+        str(cluster): {
+            status: int(counts.get(status, 0))
+            for status in ("PENDING", "LEASED", "WAITING")
+            if int(counts.get(status, 0))
+        }
+        for cluster, counts in cells.items()
+        if isinstance(counts, dict)
+    }
+
+
 def never_dispatched_record(
     store: Any, workflow: Any, now: datetime, *, young: bool = False
 ) -> Any:
@@ -189,6 +222,7 @@ def main() -> None:
     }
     now = datetime.now(timezone.utc)
     destructive: list[str] = []
+    destructive_by_cluster: dict[str, list[str]] = {}
     resolved_destructive: list[str] = []
     confirmed_destructive: list[str] = []
     never_dispatched: list[dict[str, Any]] = []
@@ -204,6 +238,9 @@ def main() -> None:
             confirmed_destructive.append(item.request_id)
         else:
             destructive.append(item.request_id)
+            destructive_by_cluster.setdefault(
+                incident_cluster(context.store, item), []
+            ).append(item.request_id)
             record = never_dispatched_record(context.store, item, now)
             if record is not None:
                 never_dispatched.append(record)
@@ -258,10 +295,18 @@ def main() -> None:
                     "lease_remaining_seconds": lease_remaining,
                 }
             )
+    by_cluster = open_by_cluster(remote)
     result = {
         "open_remote": open_remote,
+        **({} if by_cluster is None else {"open_remote_by_cluster": by_cluster}),
         "destructive_workflow_count": len(destructive),
         "destructive_workflows": destructive[:20],
+        "destructive_workflow_count_by_cluster": {
+            cluster: len(ids) for cluster, ids in destructive_by_cluster.items()
+        },
+        "destructive_workflows_by_cluster": {
+            cluster: ids[:20] for cluster, ids in destructive_by_cluster.items()
+        },
         "resolved_destructive_workflow_count": len(resolved_destructive),
         "resolved_destructive_workflows": resolved_destructive[:20],
         "operator_confirmed_destructive_workflow_count": len(confirmed_destructive),

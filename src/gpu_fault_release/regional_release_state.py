@@ -53,7 +53,6 @@ from gpu_fault_release.regional_release_diff import (
     ReleaseExecutionPlan,
 )
 from gpu_fault_release.regional_release_history import record_release_history
-from gpu_fault_release.regional_release_legacy import AGENT_IDENTITY_FIELDS
 from gpu_fault_release.regional_release_narration import narrate_phase
 from gpu_fault_release.regional_release_node_scope import (
     RECORDED_SCOPES_DIGEST_STATE_KEY,
@@ -715,26 +714,8 @@ def capture_agent_identities(release: Any) -> dict[str, dict[str, Any]]:
         script=probe_source("active_agent_identities"),
         failure="previous Agent identity capture",
     )
-    records = json.loads(raw)
-    result: dict[str, dict[str, Any]] = {}
-    for target in release.config.clusters:
-        selected = [
-            item for item in records if item.get("cluster_id") == target.cluster_id
-        ]
-        if not selected:
-            raise ReleaseError(
-                f"{target.cluster_id} has no active Agent identity to capture"
-            )
-        identities = {
-            tuple(item.get(field) for field in AGENT_IDENTITY_FIELDS)
-            for item in selected
-        }
-        if len(identities) != 1:
-            raise ReleaseError(f"{target.cluster_id} active Agent identities differ")
-        identity = dict(zip(AGENT_IDENTITY_FIELDS, identities.pop(), strict=True))
-        identity["node_ids"] = sorted(str(item["node_id"]) for item in selected)
-        result[target.cluster_id] = identity
-    return result
+    # One identity per cluster (``regional_release_agent_set.agent_identities``).
+    return agent_set.agent_identities(release, json.loads(raw))
 
 
 def capture_gpu_cluster_snapshot(

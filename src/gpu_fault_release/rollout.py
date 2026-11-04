@@ -1381,6 +1381,7 @@ def _dispatch_mode(
     budget: observation.ObservationBudget | None = None,
 ) -> int:
     validate_cluster_arguments(arguments)
+    bind_verify_scope(release, arguments)
     exit_code = 0
     if arguments.mode == "plan":
         print(
@@ -1448,7 +1449,6 @@ def _dispatch_mode(
     elif arguments.mode == "sync-state":
         sync_release_state(release, cluster_id=arguments.cluster_id)
     elif arguments.mode == "verify":
-        bind_verify_scope(release, arguments)
         report, exit_code = observation.observed_health_report(
             release, budget, build_health_report, report_exit_code
         )

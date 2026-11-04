@@ -990,7 +990,13 @@ def build_preflight_report(
                 if include_workflow or name != "workflow_safety"
             ]
             checks = [future.result() for future in futures]
-    return _report("preflight", release, checks)
+    # A join's candidate preflight files other clusters' own findings (their
+    # contexts, their workflow blockers) as WARNs (regional_verify_scope).
+    report = _report(
+        "preflight", release, verify_scope.mark_not_gating(release, checks)
+    )
+    verify_scope.annotate_scope(release, report)
+    return report
 
 
 def _check_cpu_workloads(release: Any) -> CheckValue:

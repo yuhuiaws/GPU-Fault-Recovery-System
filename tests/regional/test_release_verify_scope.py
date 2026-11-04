@@ -450,11 +450,18 @@ def test_a_wrong_scope_is_refused_not_verified_leniently(
         SCOPE.scope_of(arguments(*words), two_cluster_release())
 
 
-def test_the_scope_flags_scope_a_verify_only() -> None:
+@pytest.mark.parametrize(
+    "words",
+    [("status",), ("join-cluster", "--cluster-id", HP), ("deploy",)],
+    ids=["status", "join-cluster-mode", "deploy"],
+)
+def test_the_scope_flags_scope_verify_preflight_and_sync_state_only(
+    words: tuple[str, ...],
+) -> None:
     parsed = ROLLOUT.parse_arguments(
-        ["status", "--config", "site.json", "--joining-cluster-id", HP]
+        [words[0], "--config", "site.json", *words[1:], "--joining-cluster-id", HP]
     )
-    with pytest.raises(ReleaseError, match="only scope a verify"):
+    with pytest.raises(ReleaseError, match="only scope verify, preflight, sync-state"):
         ROLLOUT.validate_cluster_arguments(parsed)
 
 

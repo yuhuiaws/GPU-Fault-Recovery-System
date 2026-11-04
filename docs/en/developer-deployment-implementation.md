@@ -2532,7 +2532,12 @@ dispatcher sweep. `settled_incident_blocked` requires the incident to be `RECOVE
 command, a still-occupied node or an unconfirmed node/provider action cannot release the occupation on the incident's terminal state alone.
 The probe and runtime predicates must stay consistent,
 verified by `tests/regional/test_release_workflow_safety.py`. Source snapshots and deploy-host
-delivery do not change these runtime safety conditions.
+delivery do not change these runtime safety conditions. Every blocker is also attributed to its incident's cluster
+(`blocker_count_by_cluster`, `blockers_by_cluster`; `""` when the incident cannot be read), and the fleet wave probe
+`probes/rollout_wave_safety.py` breaks its open remote commands and destructive workflows down the same way
+(`open_remote_by_cluster` from the Store's `by_cluster_status`, `destructive_workflow_count_by_cluster`,
+`destructive_workflows_by_cluster`): a `join-cluster`'s preflight and waves gate on the joining cluster's counts
+(`gpu_fault_release.regional_verify_scope`), every other release on the totals.
 
 `coverage.sources` in `config/ci-unit-gate.json` (schema 4) lists five source roots under test:
 the production scope is `src/gpu_fault`, `src/gpu_fault_release`, `deploy/control-plane/tools`, and the

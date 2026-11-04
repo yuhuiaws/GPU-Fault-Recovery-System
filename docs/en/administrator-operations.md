@@ -2001,6 +2001,17 @@ healthy release:
 
 The join's commit path pays only for the new cluster, and the `evidence` in `state.json` shows the scope of every step:
 
+- `CANDIDATE_READY`: the candidate `preflight` is **scoped to the joining cluster(s)** (`preflight --joining-cluster-id <id>`,
+  one per cluster of a batch; the report is read back and printed into the command log): the CPU checks, the joining
+  cluster's part of `regional_contexts` and the joining cluster's blockers in `workflow_safety` fail it; another cluster's
+  context (its EKS node group `DEGRADED` because Spot capacity could not replace a lost node, no Kubernetes node left, its API
+  server down) and another cluster's destructive workflows (the record the product opens for a node that left included) are
+  `WARN`s named under `details.not_gating` and `cluster_scope.not_gating_findings`.
+- `JOINED`: the engine's `join-cluster` mode is scoped to its `--cluster-id` by itself. Its idle check (`join_target`), its
+  context validation and every fleet wave gate of the joining cluster's node runtime (the pre-mutation barrier and each wave)
+  wait for and fail on the joining cluster only; another cluster's open remote commands (the Agent of a node a spot reclaim
+  took never claims its commands, which the Store expires after 900 s), its context and its destructive workflows are logged,
+  one line each: `not-gating <time> verb=join-cluster targets=<id> cluster=<other> check=<remote_commands_idle|regional_contexts|fleet_wave_safety> finding="..."`.
 - `COLLECTORS_READY`: waits only for the "fast" collectors (configured unconditional reporting period <= 60 s, currently
   `GPU_INVENTORY`, `HOST_TELEMETRY`) to report once on every node, and requires the Agent row to be alive
   (`/v1/fleet/readiness`: lease not expired, identity is the current release); kinds with a longer period
@@ -2046,13 +2057,47 @@ The join's commit path pays only for the new cluster, and the `evidence` in `sta
   start of the last release transaction (`previous`; that value is the newest of every cluster, so no per-cluster baseline
   is needed); without that record (after a `sync-state`, which every join and removal ends with, a no-op `deploy` or a
   bootstrap) every error the Store still keeps counts, each against its own cluster.
-- `RELEASE_STATE_UPDATED`: `sync-state` re-captures only the new cluster's snapshot (`capture_scope:
-  cluster:<id>`), merges it with the committed release state and still validates the site-level invariants -- each cluster's live
-  Agent set equals its HyperPod node set, and the CPU/new cluster/recorded runtime images agree.
+- `RELEASE_STATE_UPDATED`: `sync-state` of the committed site, scoped to the joining cluster (`sync-state
+  --joining-cluster-id <id>`; `capture_scope: site`): it re-captures the site snapshot and validates that the joining
+  cluster's live Agent set equals its node set and that the CPU, executor and recorded runtime images agree (it reads every
+  cluster's executor and Reconciler, so every API server must answer); another cluster's Agent set not matching its nodes
+  (a node it just lost, its replacement not installed yet) is a `not-gating ... check=agent_set` log line, not a refusal --
+  before this step had a scope, it rolled the join back.
 - `REGISTRY_UPDATED`: writes only the resource rows added by this join (`delta_keys`, i.e. EKS, HyperPod,
   Executor role/OIDC, ADOT writer role, VPC association) into Aurora, with a consistency check against
   the snapshot taken at `DISCOVERED`; `FINAL_VERIFIED` still reads the online registry to confirm these keys are
   ACTIVE.
+
+**Another GPU cluster during a join or a removal.** GPU data-plane clusters are independent: what is another cluster's own --
+a node it loses (a spot reclaim, its replacement still installing), its context, its open remote commands, its destructive
+workflows, its Agent set, its executor's errors -- never refuses, fails or rolls back a join or a removal of a different
+cluster. Every engine call of the verb is scoped to its target; the target's own state and the shared control plane still
+gate, and so does every count that cannot be attributed to another cluster of the site (an older control plane without the
+per-cluster values, a breakdown that does not add up, a record whose incident cannot be read, a cluster the site does not
+name).
+
+| Step | Gates | Another cluster's own state |
+|---|---|---|
+| candidate `preflight` (join, `--joining-cluster-id`) | every CPU check; the target's context; the target's and unattributable workflow blockers | `WARN` in `regional_contexts` / `workflow_safety`, `cluster_scope` of the report (command log) |
+| engine `join-cluster` (its `--cluster-id`) | the target's open commands, its context, its open commands and destructive workflows at every wave gate | `not-gating` log lines (`remote_commands_idle`, `regional_contexts`, `fleet_wave_safety`) |
+| final `verify` (`--joining-cluster-id` / `--removed-cluster-id`) | the shared control plane (the first kind above); the target's own checks (the second kind) | `WARN`, `evidence.VERIFIED.not_gating_findings`, the result's `not_gating_findings`, `status` |
+| `sync-state` (both verbs) | the target's Agent set (join); the site snapshot's image and identity checks | `not-gating ... check=agent_set` log line |
+| `drain-cluster` (removal) | open commands of the drained cluster, of a cluster the site does not name, unattributable ones | `not-gating ... check=remote_commands_idle` log line |
+| `status` | not a gate: judges every cluster live | shows the last verb's verify findings (`membership_verify_findings`, §4) |
+
+Reads that need another cluster's API server by design stay fail-closed, and a node loss does not trip them, only an
+unreachable API server does: the node-name uniqueness check before the join (every cluster's Nodes), the failure-domain
+map (`apply_failure_domain_map`, every cluster's Nodes, after activation for a single join, before it for a batch, at
+`RELEASE_STATE_UPDATED` for a removal) and the snapshot `sync-state` validates. A `deploy` and a `config` keep every gate
+fleet-wide: they roll every cluster's executors and Agents.
+
+Another cluster's destructive workflow does not block a join because nothing the join changes can drop that cluster's work in
+flight: its registry revisions change the joining cluster's registration only and are acknowledged by CPU processes alone (GPU
+executors and Agents are not registry members), its waves restart the joining cluster's Agents only, the AMP rules it
+re-puts are alerting only, and the control-worker roll that publishes the new failure-domain map is the lease handover every
+control-worker restart is (the `workflow-dispatch` lease moves to another worker within its 15 s, the unfinished steps' leases
+are taken over once they expire, the node action itself runs in that cluster's Agent). That roll already happened at the end
+of every join -- minutes after its preflight -- and of every removal, which never had a workflow gate.
 
 Without registered Node key custody, when the first deploy is given several GPU ARNs at once, the first cluster forms a stable baseline first
 and the remaining clusters automatically use batch
@@ -2163,7 +2208,10 @@ and HyperPod clusters preserved, and runs one verify of the remaining site scope
 kind of check under §5 `VERIFIED`) fails it, and each remaining cluster's own findings are `WARN`s that go into
 `evidence.VERIFIED.not_gating_findings`, the command result's `not_gating_findings` and `status`'s
 `membership_verify_findings`; when the shared control plane fails, the removal stops at `RELEASE_STATE_UPDATED` and a rerun with
-the same arguments resumes it once fixed.
+the same arguments resumes it once fixed. The removal's earlier engine steps are scoped the same way (the table under §5
+`REGISTRY_UPDATED`): its `drain-cluster` waits for the removed cluster's open remote commands only -- another cluster's (the
+command for the Agent of a node it lost stays `PENDING` until the 900 s claim deadline) is a `not-gating` log line -- and its
+`sync-state` (`--removed-cluster-id <id>`) logs another cluster's Agent set instead of refusing.
 join/remove use the same site transaction lock. Disassociating an exclusive Route53 VPC association saves the ChangeInfo, waits for
 `INSYNC` and confirms the association has really disappeared from the hosted zone; when other remaining GPU clusters still use the same VPC the association is kept.
 Disassociation also requires a `CREATED/DETACH` resource registration with full zone/Region/VPC identity; CPU-native associations and

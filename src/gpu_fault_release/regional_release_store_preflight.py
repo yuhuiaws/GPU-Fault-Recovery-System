@@ -78,6 +78,10 @@ from gpu_fault_release.regional_release_runtime_identity import (
     cpu_ingress_pod_if_running,
     exec_cpu_ingress_probe,
 )
+from gpu_fault_release.regional_verify_scope import (
+    gating_open_commands,
+    verify_scope,
+)
 
 from gpu_fault.execution.config import NODE_INSTALL_OPERATIONS
 
@@ -125,15 +129,57 @@ _CHECK = "the in-flight install check"
 Unreadable = Literal["refuse", "proceed"]
 
 
+#: The statuses of a remote command still in flight.
+OPEN_REMOTE_STATUSES = ("PENDING", "LEASED", "WAITING")
+
+
+def _scoped_idle(release: Any, output: str) -> bool:
+    """Idle unless a gating cluster has an open command; another site cluster's
+    open commands are its findings (``regional_verify_scope``), unreadable
+    evidence is not idle. ``output`` is the ``remote_command_stats`` probe's."""
+
+    try:
+        value = json.loads(output)
+        open_by_status = {
+            status: int(value["by_status"].get(status, 0))
+            for status in OPEN_REMOTE_STATUSES
+        }
+    except (AttributeError, TypeError, KeyError, ValueError):
+        return False
+    gating = gating_open_commands(
+        release,
+        {},
+        check="remote_commands_idle",
+        open_by_status=open_by_status,
+        by_cluster_status=value.get("by_cluster_status"),
+    )
+    return not any(gating.values())
+
+
 def remote_commands_are_idle(release: Any) -> bool:
+    """No remote command is PENDING, LEASED or WAITING.
+
+    Fleet-wide, except for an engine call scoped to a membership verb's
+    target (``regional_verify_scope``): the ``join-cluster`` mode's
+    ``join_target`` and ``drain-cluster`` (scoped to the clusters it drains)
+    wait for the target's commands only -- a command for another cluster's
+    Agent (one a spot reclaim took stays PENDING until the 900 s claim
+    deadline) is that cluster's, and nothing the verb does can drop it.
+    """
+
+    scoped = verify_scope(release) is not None
     script = (
-        "from gpu_fault.app import ApplicationContext;"
-        "stats=ApplicationContext.from_environment()"
-        ".store.remote_command_stats();"
-        "bad={name:int(stats['by_status'].get(name,0)) "
-        "for name in ('PENDING','LEASED','WAITING') "
-        "if int(stats['by_status'].get(name,0))};"
-        "print(bad if bad else '')"
+        probe_source("remote_command_stats")
+        if scoped
+        else (
+            "from gpu_fault.app import ApplicationContext;"
+            "stats=ApplicationContext.from_environment()"
+            ".store.remote_command_stats();"
+            "bad={name:int(stats['by_status'].get(name,0)) "
+            "for name in ('PENDING','LEASED','WAITING') "
+            "if int(stats['by_status'].get(name,0))};"
+            "print(bad if bad else '')"
+        )
     )
     # Asked once, outside the retry loop: a control plane with no Running
     # ingress Pod has nothing dispatching, so the absence answers the
@@ -156,7 +202,7 @@ def remote_commands_are_idle(release: Any) -> bool:
                 raise
             time.sleep(2)
             continue
-        return not output.strip()
+        return _scoped_idle(release, output) if scoped else not output.strip()
     raise ReleaseError("remote command idle check exhausted retries")
 
 

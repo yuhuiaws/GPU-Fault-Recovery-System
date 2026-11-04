@@ -8,7 +8,10 @@ are reported and never fail or roll back the verb. The deploy host:
 
 * runs the verify with the target (``--joining-cluster-id`` per joining
   cluster, ``--removed-cluster-id`` for a removal), captures the report and
-  prints it again, so the command log keeps the whole document;
+  prints it again, so the command log keeps the whole document; a join's
+  candidate ``preflight`` is scoped and echoed the same way, and so is the
+  ``sync-state`` of both verbs (the engine's ``join-cluster`` mode scopes
+  itself to its ``--cluster-id``);
 * keeps the findings that did not gate in the verb's ``VERIFIED`` evidence and
   in its result (``not_gating_findings``), each redacted and capped;
 * once the verb completed, writes them to one record,
@@ -52,6 +55,7 @@ __all__ = [
     "run_verify",
     "scoped_evidence",
     "status_view",
+    "sync_arguments",
     "verified_findings",
     "verify_arguments",
 ]
@@ -66,6 +70,8 @@ SCHEMA_VERSION = 1
 FINDING_LIMIT = 1200
 #: Findings one ``status`` run prints as lines; the field keeps every one.
 STATUS_LINE_LIMIT = 5
+#: The engine modes whose scoped report the deploy host reads (and echoes).
+REPORT_MODES = ("verify", "preflight")
 
 
 def verify_arguments(verb: str, cluster_ids: Sequence[str]) -> list[str]:
@@ -80,15 +86,22 @@ def verify_arguments(verb: str, cluster_ids: Sequence[str]) -> list[str]:
     raise BootstrapError(f"no cluster-scoped verify for {verb} {list(cluster_ids)}")
 
 
+def sync_arguments(verb: str, cluster_id: str | None) -> list[str]:
+    """The scope flags of a verb's ``sync-state``; none without a target."""
+
+    return [] if cluster_id is None else verify_arguments(verb, [cluster_id])
+
+
 def rollout_arguments(
     rollout: Path, mode: str, config: Path, cluster_id: str | Sequence[str] | None
 ) -> list[str]:
-    """A join's engine command: ``verify`` names its joining cluster(s) as scope."""
+    """A join's engine command: ``verify`` and the candidate ``preflight`` name
+    its joining cluster(s) as scope."""
 
     arguments = [str(rollout), mode, "--config", str(config)]
     if cluster_id is None:
         return arguments
-    if mode == "verify":
+    if mode in REPORT_MODES:
         ids = [cluster_id] if isinstance(cluster_id, str) else sorted(cluster_id)
         return [*arguments, *verify_arguments(JOIN_VERB, ids)]
     if not isinstance(cluster_id, str):
@@ -97,9 +110,18 @@ def rollout_arguments(
 
 
 def driver_capture(mode: str) -> dict[str, Any]:
-    """``run_driver`` options: a verify's report is read, then printed again."""
+    """``run_driver`` options: a verify's (preflight's) report is read, then
+    printed again."""
 
-    return {"stdout": subprocess.PIPE} if mode == "verify" else {}
+    return {"stdout": subprocess.PIPE} if mode in REPORT_MODES else {}
+
+
+def captured_report(
+    mode: str, result: subprocess.CompletedProcess[str]
+) -> dict[str, Any] | None:
+    """The report of a ``REPORT_MODES`` run, echoed; None for any other mode."""
+
+    return echoed_report(result) if mode in REPORT_MODES else None
 
 
 def echoed_report(result: subprocess.CompletedProcess[str]) -> dict[str, Any] | None:

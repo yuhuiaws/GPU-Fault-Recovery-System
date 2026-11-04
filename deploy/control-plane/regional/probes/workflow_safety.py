@@ -49,6 +49,13 @@ so does this copy now.
 
 The ``except Exception: return False`` arms fail closed: a Store read that
 cannot prove a workflow harmless leaves it counted as a blocker.
+
+Every blocker is also attributed to its incident's GPU cluster:
+``blocker_count_by_cluster`` (cluster -> count, adding up to
+``blocker_count``) and ``blockers_by_cluster`` (cluster -> the first 100 ids).
+The preflight of a ``join-cluster`` gates on the joining cluster's blockers
+only (``gpu_fault_release.regional_verify_scope``); a blocker whose incident
+cannot be read is filed under the empty cluster id, which gates every scope.
 """
 
 import json
@@ -179,6 +186,14 @@ def no_open_commands(store: Any, workflow: Any) -> bool:
         )
         for command in commands
     )
+
+
+def incident_cluster(store: Any, workflow: Any) -> str:
+    # The blocker's GPU cluster; "" when its incident cannot be read (gates).
+    try:
+        return str(store.get_incident(workflow.incident_id).cluster_id or "")
+    except Exception:
+        return ""
 
 
 def operator_confirmed_parked(store: Any, workflow: Any, now: datetime) -> bool:
@@ -351,14 +366,21 @@ def main() -> None:
         return no_open_commands(store, workflow)
 
     blockers: list[str] = []
+    by_cluster: dict[str, list[str]] = {}
     resolved: list[str] = []
     abandoned: list[str] = []
     compile_time: list[str] = []
     settled: list[str] = []
     confirmed: list[str] = []
+
+    def block(workflow: Any) -> None:
+        blockers.append(workflow.request_id)
+        cluster = incident_cluster(store, workflow)
+        by_cluster.setdefault(cluster, []).append(workflow.request_id)
+
     for workflow in store.list_workflows(statuses=STATUSES, limit=1001):
         if has_unresolved_node_action(workflow):
-            blockers.append(workflow.request_id)
+            block(workflow)
             continue
         if not any(
             step.operation in DESTRUCTIVE_OPERATIONS for step in workflow.official_steps
@@ -375,12 +397,18 @@ def main() -> None:
         elif operator_confirmed_parked(store, workflow, now):
             confirmed.append(workflow.request_id)
         else:
-            blockers.append(workflow.request_id)
+            block(workflow)
     print(
         json.dumps(
             {
                 "blockers": blockers[:100],
                 "blocker_count": len(blockers),
+                "blocker_count_by_cluster": {
+                    cluster: len(ids) for cluster, ids in by_cluster.items()
+                },
+                "blockers_by_cluster": {
+                    cluster: ids[:100] for cluster, ids in by_cluster.items()
+                },
                 "resolved_blocked": resolved[:100],
                 "resolved_blocked_count": len(resolved),
                 "abandoned_generation": abandoned[:100],

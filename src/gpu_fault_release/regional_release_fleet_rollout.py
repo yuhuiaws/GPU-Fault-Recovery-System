@@ -86,6 +86,7 @@ from gpu_fault_release.regional_release_runtime_identity import (
     exec_cpu_ingress_probe,
 )
 from gpu_fault_release.regional_release_timing import record_rollback_wave_event
+from gpu_fault_release.regional_verify_scope import scoped_wave_safety
 
 if TYPE_CHECKING:
     from gpu_fault_release.rollout import RegionalRelease
@@ -737,12 +738,16 @@ def ensure_rollout_wave_safe(
 
     deadline = time.monotonic() + max(0.0, timeout_seconds)
     while True:
-        snapshot = rollout_wave_safety_snapshot(
+        # A join's waves gate on the joining cluster's counts only.
+        snapshot = scoped_wave_safety(
             release,
-            target,
-            wave=wave,
-            node_names=node_names,
-            minimum_lease_remaining_seconds=(minimum_lease_remaining_seconds),
+            rollout_wave_safety_snapshot(
+                release,
+                target,
+                wave=wave,
+                node_names=node_names,
+                minimum_lease_remaining_seconds=(minimum_lease_remaining_seconds),
+            ),
         )
         open_remote = {
             str(status): int(count)

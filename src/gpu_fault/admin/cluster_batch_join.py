@@ -533,7 +533,12 @@ def _preflight_candidate(
             [_execution(item) for item in attempts],
             state_dir=context.candidate_dir,
         )
-        join._run_rollout(candidate, "preflight")
+        # Scoped to the batch's clusters, like its verify (membership_verify).
+        join._run_rollout(
+            candidate,
+            "preflight",
+            cluster_id=[_execution(item).cluster_id for item in attempts],
+        )
     except (Exception, KeyboardInterrupt) as exc:
         for attempt in attempts:
             _record_failure(context, attempt, attempt.execution, exc)

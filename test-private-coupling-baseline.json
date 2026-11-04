@@ -245,6 +245,7 @@
   "tests/regional/test_loopfs_visibility.py:storage._dm_mount": 1,
   "tests/regional/test_loopfs_visibility.py:storage._fs_mount": 1,
   "tests/regional/test_loopfs_visibility.py:utilization._fs_mount": 1,
+  "tests/regional/test_membership_scope_engine_gates.py:ROLLOUT._dispatch_mode": 2,
   "tests/regional/test_promoted_acceptance_helpers.py:fixture._kubectl": 1,
   "tests/regional/test_regional_admin_checks.py:CHECKS._check": 1,
   "tests/regional/test_regional_admin_checks.py:CHECKS._report": 2,

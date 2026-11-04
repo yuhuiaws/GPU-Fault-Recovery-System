@@ -9,7 +9,7 @@ from contextvars import copy_context
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, cast
+from typing import Any, Callable, Sequence, cast
 
 from gpu_fault.admin import cluster_removal_kubernetes as kubernetes_cleanup
 from gpu_fault.admin.atomic_json import write_json_atomic
@@ -1062,14 +1062,16 @@ def _verify_removal_parallel(
     return scoped.scoped_evidence(reports.get("remaining site"))
 
 
-def _sync_release_state(site: RenderedSite) -> None:
+def _sync_release_state(site: RenderedSite, scope: Sequence[str] = ()) -> None:
+    """The engine's ``sync-state`` of ``site``; ``scope`` names a membership
+    verb's target, so another cluster's Agent set is a finding there."""
     rollout = (
         site.repository_root
         / "deploy/control-plane/regional/rollout-regional-release.sh"
     )
     with materialized_release_config(site) as config:
         result = run_driver(
-            [str(rollout), "sync-state", "--config", str(config)],
+            [str(rollout), "sync-state", "--config", str(config), *scope],
             cwd=site.repository_root,
             env=effective_environment(site),
             check=False,
@@ -1457,7 +1459,9 @@ def _execute_removal(
         # Membership is final: drop the removed cluster from the failure-domain
         # map the control-worker mounts before the release state moves on.
         refresh_failure_domain_map(updated_site)
-        _sync_release_state(updated_site)
+        _sync_release_state(
+            updated_site, scoped.sync_arguments(scoped.REMOVE_VERB, request.cluster_id)
+        )
         _complete(
             state_path,
             state,

@@ -14,7 +14,7 @@ cluster's executor failed the target's verify, and a join was rolled back.
   ``executor_internal_error_total_by_cluster`` and
   ``executor_internal_error_last_seen_timestamp_seconds_by_cluster``): a
   target cluster's value fails the check, another cluster's is its finding
-  (``details.not_gating``).
+  (``details.not_gating``); a cluster the site does not name gates too.
 * Fail-closed: a control plane older than the per-cluster values, or values
   that do not account for the fleet's (the newest/oldest is not one of them,
   the counts do not add up), are judged fleet-wide, which gates.
@@ -38,7 +38,7 @@ from typing import Any
 
 from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_verify_scope import (
-    gates,
+    other_cluster,
     record_not_gating,
     verify_scope,
 )
@@ -180,11 +180,14 @@ def _judge(
     cluster: Callable[[float], str],
 ) -> None:
     """Fail on ``fleet`` unless a scoped verify can attribute ``over`` (the
-    clusters past the limit); then a target's fails, another's is a finding."""
+    clusters past the limit); then another site cluster's is a finding and
+    any other -- the target's, an unmanaged cluster's -- fails."""
 
     if verify_scope(release) is None or not over:
         raise ReleaseError(fleet)
-    gating = {key: value for key, value in over.items() if gates(release, key)}
+    gating = {
+        key: value for key, value in over.items() if not other_cluster(release, key)
+    }
     if gating:
         raise ReleaseError(
             "; ".join(

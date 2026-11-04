@@ -330,8 +330,9 @@ def test_join_cluster_is_atomic_resumable_and_registers_resources(
     monkeypatch.setattr(
         admin_cluster_join,
         "_sync_release_state",
-        lambda current: release_state_syncs.append(
+        lambda current, scope=(): release_state_syncs.append(
             [item["cluster_id"] for item in current.release_config["clusters"]]
+            + list(scope)
         ),
     )
     failure_domain_renders: list[list[str]] = []
@@ -419,15 +420,18 @@ def test_join_cluster_is_atomic_resumable_and_registers_resources(
     assert len(synced) == 1, "a resumed COMPLETED join re-sent the registry delta"
     _assert_adot_writer_committed(synced[-1], updated)
     assert rollout_calls == [
-        ("preflight", None),
+        # Scoped to the joining cluster, the candidate preflight and the verify
+        # alike: other clusters' own findings are reported, not gated on
+        # (membership_verify).
+        ("preflight", "hp-gpu-b"),
         ("join-cluster", "hp-gpu-b"),
-        # Scoped to the joining cluster: other clusters' own findings are
-        # reported, not gated on (membership_verify).
         ("verify", "hp-gpu-b"),
         ("activate-cluster", "hp-gpu-b"),
     ], "the join ran a baseline verify the candidate verify already answers"
     assert readiness_waits == ["hp-gpu-b"]
-    assert release_state_syncs == [["gpu-a", "hp-gpu-b"]]
+    assert release_state_syncs == [
+        ["gpu-a", "hp-gpu-b", "--joining-cluster-id", "hp-gpu-b"]
+    ], "the join's sync-state is scoped to the joining cluster"
     assert failure_domain_renders == [["gpu-a", "hp-gpu-b"]], (
         "the failure-domain map is re-rendered once, from the committed site"
     )
@@ -777,7 +781,7 @@ def test_completed_join_repairs_missing_release_state(
     monkeypatch.setattr(
         admin_cluster_join,
         "_sync_release_state",
-        lambda current: synced.append(
+        lambda current, *_scope: synced.append(
             [item["cluster_id"] for item in current.release_config["clusters"]]
         ),
     )
@@ -1328,7 +1332,7 @@ def test_join_resumes_after_a_crash_between_commit_steps(
     monkeypatch.setattr(
         admin_cluster_join,
         "_sync_release_state",
-        lambda _current: release_state_syncs.append("site"),
+        lambda _current, *_scope: release_state_syncs.append("site"),
     )
     monkeypatch.setattr(
         admin_cluster_join, "refresh_failure_domain_map", lambda _current: None

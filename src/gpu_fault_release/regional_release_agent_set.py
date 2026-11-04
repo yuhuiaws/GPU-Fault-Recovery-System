@@ -3,6 +3,15 @@
 Every cluster's ACTIVE, lease-valid Agents must be exactly its GPU nodes; the
 rollback snapshot then has one identity per cluster to restore to. The check
 is read-only, re-read once across a heartbeat gap, and names what differs.
+
+The ``sync-state`` of a ``join-cluster`` / ``remove-cluster`` is scoped to the
+verb's target (``regional_verify_scope``): it commits the release state for
+the site the verb left, which records no Agent set (``previous`` is cleared),
+so another cluster's Agents not matching its nodes -- a node a spot reclaim
+just took, its replacement not installed yet -- is that cluster's finding,
+logged as a ``not-gating`` line, never a refusal (which, before activation,
+rolled a join back). The joining cluster's set still gates, and every deploy
+(whose rollback snapshot the identities are) judges every cluster as before.
 """
 
 from __future__ import annotations
@@ -15,10 +24,18 @@ from typing import Any
 from gpu_fault.cluster_scope import is_eks_managed
 from gpu_fault_release import regional_release_state as state
 from gpu_fault_release.regional_release_config import ReleaseError
+from gpu_fault_release.regional_release_legacy import AGENT_IDENTITY_FIELDS
 from gpu_fault_release.regional_release_probes import probe_source
 from gpu_fault_release.regional_release_runtime_identity import exec_cpu_ingress_probe
+from gpu_fault_release.regional_verify_scope import gates, narrate_not_gating
 
-__all__ = ["AGENT_SET_RECHECK_SECONDS", "capture_agent_identities_matching_nodes"]
+__all__ = [
+    "AGENT_SET_RECHECK_SECONDS",
+    "agent_identities",
+    "capture_agent_identities_matching_nodes",
+]
+#: The check name of another cluster's Agent-set finding (``not-gating`` lines).
+CHECK = "agent_set"
 
 #: One Agent heartbeat period plus slack: the probe keeps an Agent only while
 #: its lease (``observed_at + max_heartbeat_age``) is ahead of the Pod's clock,
@@ -88,6 +105,69 @@ def _lease_facts(release: Any, cluster_id: str) -> dict[str, dict[str, Any]]:
         return {}
 
 
+def agent_identities(
+    release: Any, records: list[dict[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    """Each cluster's one Agent identity (``AGENT_IDENTITY_FIELDS``) and its
+    node ids, from the ``active_agent_identities`` probe's ``records``.
+
+    A cluster without an ACTIVE, lease-valid Agent, or whose Agents differ,
+    refuses -- unless it is another cluster of a scoped ``sync-state``: then
+    the problem is logged and the cluster left out.
+    """
+
+    result: dict[str, dict[str, Any]] = {}
+    for target in release.config.clusters:
+        selected = [
+            item for item in records if item.get("cluster_id") == target.cluster_id
+        ]
+        identities = {
+            tuple(item.get(field) for field in AGENT_IDENTITY_FIELDS)
+            for item in selected
+        }
+        if len(identities) != 1:
+            problem = (
+                "active Agent identities differ"
+                if selected
+                else "has no active Agent identity to capture"
+            )
+            if gates(release, target.cluster_id):
+                raise ReleaseError(f"{target.cluster_id} {problem}")
+            narrate_not_gating(release, CHECK, target.cluster_id, problem)
+            continue
+        identity = dict(zip(AGENT_IDENTITY_FIELDS, identities.pop(), strict=True))
+        identity["node_ids"] = sorted(str(item["node_id"]) for item in selected)
+        result[target.cluster_id] = identity
+    return result
+
+
+def _other_clusters(
+    release: Any, identities: dict[str, dict[str, Any]], targets: list[Any]
+) -> None:
+    """Log another cluster's Agent set that does not match its nodes (scoped
+    ``sync-state`` only); an unreadable node list is logged the same way."""
+
+    for target in targets:
+        identity = identities.get(target.cluster_id)
+        if identity is None:
+            continue  # already logged by ``agent_identities``
+        try:
+            expected = set(release._target_node_names(target))
+        except Exception as error:  # noqa: BLE001 - another cluster's, logged
+            narrate_not_gating(
+                release, CHECK, target.cluster_id, f"node list unreadable: {error}"
+            )
+            continue
+        if expected != set(identity["node_ids"]):
+            kind = "GPU" if is_eks_managed(target) else "HyperPod"
+            narrate_not_gating(
+                release,
+                CHECK,
+                target.cluster_id,
+                _agent_set_mismatch(target.cluster_id, expected, identity, kind, {}),
+            )
+
+
 def capture_agent_identities_matching_nodes(release: Any) -> dict[str, dict[str, Any]]:
     """Every cluster's ACTIVE Agents must be exactly its GPU nodes.
 
@@ -100,9 +180,14 @@ def capture_agent_identities_matching_nodes(release: Any) -> dict[str, dict[str,
     """
 
     capture_identities = getattr(release, "_capture_agent_identities", None)
+    # A scoped sync-state judges the target's set; another's is only logged.
+    gating = [
+        item for item in release.config.clusters if gates(release, item.cluster_id)
+    ]
+    others = [item for item in release.config.clusters if item not in gating]
     problem = ""
     for attempt in range(2):
-        agent_identities = (
+        identities = (
             capture_identities()
             if capture_identities is not None
             else state.capture_agent_identities(release)
@@ -111,23 +196,24 @@ def capture_agent_identities_matching_nodes(release: Any) -> dict[str, dict[str,
         for target, expected_nodes in state._map_clusters(
             release,
             lambda target: set(release._target_node_names(target)),
-            targets=release.config.clusters,
+            targets=gating,
             failure="active Agent set capture",
         ):
-            captured_nodes = set(agent_identities[target.cluster_id]["node_ids"])
+            captured_nodes = set(identities[target.cluster_id]["node_ids"])
             if expected_nodes != captured_nodes:
                 kind = "GPU" if is_eks_managed(target) else "HyperPod"
                 facts = _lease_facts(release, target.cluster_id)
                 problem = _agent_set_mismatch(
                     target.cluster_id,
                     expected_nodes,
-                    agent_identities[target.cluster_id],
+                    identities[target.cluster_id],
                     kind,
                     facts,
                 )
                 break
         if not problem:
-            return agent_identities
+            _other_clusters(release, identities, others)
+            return identities
         if attempt == 0:
             print(
                 f"active Agent set re-read in {AGENT_SET_RECHECK_SECONDS:.0f}s: {problem}",

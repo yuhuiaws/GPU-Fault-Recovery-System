@@ -502,7 +502,9 @@ cluster registry records must not be reused to bypass these gates.
   remote commands are 0 and there is no active destructive workflow; a failure on any node must not open the next wave.
 - upgrade, join and rollback must additionally run a dynamic read-only barrier before the first node mutation: re-verify the
   target Node UID/Ready/cordon/isolation taint and failure domain, and verify the Executor, remote commands,
-  destructive workflows and Agent leases. The deterministic candidate and host facts for upgrade must already be proven before the CPU rollout;
+  destructive workflows and Agent leases (a join's barrier and waves restart the joining cluster's Agents only and judge
+  its own remote commands and destructive workflows; another cluster's are logged as `not-gating`, Administrator
+  Operations §5). The deterministic candidate and host facts for upgrade must already be proven before the CPU rollout;
   when join and rollback have no reusable current candidate proof they still run the same read-only host
   preflight first within the local flow. The read-only host preflight Job may create and clean up its own Pods/Jobs, but the host root must be read-only, and writing node
   files, annotations or systemd is forbidden.

@@ -176,14 +176,14 @@ def _sync_join_release_state(
         item["cluster_id"] == cluster_id for item in site.release_config["clusters"]
     ):
         raise BootstrapError("release-state sync target is not a managed cluster")
-    _sync_release_state(site)
+    _sync_release_state(site, scoped.sync_arguments(scoped.JOIN_VERB, cluster_id))
     return {"capture_scope": "site"}
 
 
 def _run_rollout(
     site: RenderedSite, mode: str, *, cluster_id: str | Sequence[str] | None = None
 ) -> dict[str, Any] | None:
-    """``verify`` with the joining cluster(s) is scoped, returns the report."""
+    """``verify``/``preflight`` with the joining cluster(s): scoped, the report."""
     rollout = (
         site.repository_root
         / "deploy/control-plane/regional/rollout-regional-release.sh"
@@ -196,7 +196,7 @@ def _run_rollout(
             check=False,
             **scoped.driver_capture(mode),
         )
-    report = scoped.echoed_report(result) if mode == "verify" else None
+    report = scoped.captured_report(mode, result)
     if result.returncode:
         raise BootstrapError(f"regional {mode} failed")
     return report
@@ -1040,7 +1040,7 @@ def _prepare_execution(
             repository_root=request.site.repository_root,
         )
         if candidate_preflight:
-            _run_rollout(candidate, "preflight")
+            _run_rollout(candidate, "preflight", cluster_id=cluster_id)
         _complete(
             state_path,
             state,

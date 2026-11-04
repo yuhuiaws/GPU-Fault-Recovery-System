@@ -21,6 +21,7 @@ from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_release_probes import probe_source
 from gpu_fault_release.regional_release_registry import registry
 from gpu_fault_release.regional_release_runtime_identity import exec_cpu_ingress_command
+from gpu_fault_release.regional_verify_scope import DRAIN_VERB, VerifyScope, scoped_to
 
 
 def _request(
@@ -447,7 +448,11 @@ def drain_registry_clusters(release: Any, cluster_ids: Sequence[str]) -> None:
     ACTIVE, so draining several clusters one revision at a time would flip each
     earlier one back to ACTIVE and only the last would stay DRAINING; an
     uninstall drains all of a site's GPU clusters through this one publish.
-    Fail-closed like remove-cluster: refused while any remote command is open.
+    Fail-closed like remove-cluster: refused while a remote command of a
+    drained cluster -- or of a cluster the site does not name, or one the
+    Store cannot attribute -- is open. Another site cluster's open commands
+    do not hold a remove-cluster's drain: the revision changes the drained
+    clusters' lifecycle only (``regional_verify_scope``).
     """
 
     if isinstance(cluster_ids, (str, bytes)) or any(
@@ -459,7 +464,9 @@ def drain_registry_clusters(release: Any, cluster_ids: Sequence[str]) -> None:
         raise ReleaseError("--cluster-id is required")
     for cluster_id in ordered:
         release._target(cluster_id)
-    if not release._remote_commands_are_idle():
+    with scoped_to(release, VerifyScope(DRAIN_VERB, tuple(ordered))):
+        idle = release._remote_commands_are_idle()
+    if not idle:
         raise ReleaseError("remote commands are PENDING/LEASED/WAITING")
     publish_current_registry(
         release,

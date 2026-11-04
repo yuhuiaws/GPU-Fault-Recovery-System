@@ -48,7 +48,7 @@ from gpu_fault_release.regional_release_eks_support import (
     read_eks_support,
 )
 from gpu_fault_release.regional_release_state import aws_json
-from gpu_fault_release.regional_verify_scope import gates, record_not_gating
+from gpu_fault_release.regional_verify_scope import file_not_gating, gates
 
 
 def require_cpu_namespace_anchor(
@@ -696,11 +696,14 @@ def ensure_region_contexts(release: RegionalRelease) -> dict[str, Any]:
         try:
             future.result()
         except Exception as error:
-            # Another cluster's own context is a finding of a verify scoped to
-            # a membership verb's target (regional_verify_scope).
+            # Another cluster's own context is a finding of an engine call
+            # scoped to a membership verb's target (regional_verify_scope): its
+            # verify and preflight report it, the join-cluster mode logs it.
             if gates(release, target.cluster_id):
                 raise
-            record_not_gating(not_gating, target.cluster_id, str(error))
+            file_not_gating(
+                release, not_gating, "regional_contexts", target.cluster_id, str(error)
+            )
     for advisory in advisories:
         advisory.result()
     return {**facts, "providers": providers, **not_gating}
