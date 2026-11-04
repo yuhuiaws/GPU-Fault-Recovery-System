@@ -93,6 +93,7 @@ from gpu_fault_release.regional_observability_rollback import (
 )
 from gpu_fault_release.regional_release_arguments import parser as parser
 from gpu_fault_release.regional_release_arguments import validate_cluster_arguments
+from gpu_fault_release.regional_verify_scope import bind_scope as bind_verify_scope
 from gpu_fault_release.regional_release_artifacts import (
     config_map_artifact_sha,
     require_cpu_secrets,
@@ -1447,6 +1448,7 @@ def _dispatch_mode(
     elif arguments.mode == "sync-state":
         sync_release_state(release, cluster_id=arguments.cluster_id)
     elif arguments.mode == "verify":
+        bind_verify_scope(release, arguments)
         report, exit_code = observation.observed_health_report(
             release, budget, build_health_report, report_exit_code
         )

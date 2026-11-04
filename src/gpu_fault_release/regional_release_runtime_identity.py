@@ -11,6 +11,7 @@ from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_release_observation import ApiUnavailable
 from gpu_fault_release.regional_resource_probe import ResourceRef, probe_resource
+from gpu_fault_release.regional_verify_scope import gates, record_not_gating
 
 BASE_RUNTIME_PATH = (
     "/opt/app-root/bin:/opt/app-root/src/.local/bin:"
@@ -600,12 +601,26 @@ def validate_runtime_component_identity(release: Any) -> dict[str, Any]:
                 )
             except Exception as exc:
                 errors[f"{scope}/{deployment}/{pod}"] = f"{type(exc).__name__}: {exc}"
-    if errors:
+    # Another GPU cluster's Pods are its own finding in a verify scoped to a
+    # membership verb's target (regional_verify_scope); the CPU Pods always gate.
+    owner = {key: key.split("/", 1)[0] for key in errors}
+    others = {
+        key: error
+        for key, error in errors.items()
+        if owner[key] != "control-plane" and not gates(release, owner[key])
+    }
+    if len(errors) > len(others):
         details = "; ".join(
-            f"{scope}: {error}" for scope, error in sorted(errors.items())
+            f"{scope}: {error}"
+            for scope, error in sorted(errors.items())
+            if scope not in others
         )
         raise ReleaseError(f"runtime component identity validation failed: {details}")
+    findings: dict[str, Any] = {}
+    for key, error in sorted(others.items()):
+        record_not_gating(findings, owner[key], f"{key}: {error}")
     return {
+        **findings,
         "control_plane": {
             "expected": control_digest,
             "deployments": {

@@ -54,7 +54,10 @@ from gpu_fault.dcgm_versions import (
     dcgm_version_relation,
     hostengine_version,
 )
-from gpu_fault_release.regional_release_verify_churn import churn_excused
+from gpu_fault_release.regional_release_verify_churn import (
+    churn_excused,
+    departure_unproven,
+)
 from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_release_dcgm import (
     check_dcgm_hostengine_agreement,
@@ -62,6 +65,7 @@ from gpu_fault_release.regional_release_dcgm import (
     node_dcgm_details,
 )
 from gpu_fault_release.regional_release_node_scope import check_node_scope_agreement
+from gpu_fault_release.regional_release_profile_model import runtime_profile_version_for
 
 RETIRE_DEPARTED_AGENTS_HINT = (
     "these Agents have no Kubernetes Node; if HyperPod no longer lists their "
@@ -453,7 +457,9 @@ def check_agent_coverage(
     Returns the counted Agents for the checks that follow (Runtime Profile,
     readiness), so a retired record is judged by none of them. A verify's
     report also names what the release's own node churn excuses
-    (``regional_release_verify_churn``): those nodes' Agents are not counted.
+    (``regional_release_verify_churn``): those nodes' Agents are not counted,
+    and the refusal names each Agent without a Ready Node whose departure the
+    verify could not prove, with the reason.
     """
 
     excused = churn_excused(cluster)
@@ -488,7 +494,26 @@ def check_agent_coverage(
                     for node in sorted(extra)
                 )
             )
+        unproven = departure_unproven(cluster)
+        if unproven:
+            message += "; departure not proven: " + "; ".join(
+                f"{node}: {reason}" for node, reason in sorted(unproven.items())
+            )
         raise ReleaseError(message)
     if any(item.get("lifecycle_state") != "ACTIVE" for item in agents):
         raise ReleaseError(f"{cluster_id} has a non-ACTIVE Node Agent")
     return agents
+
+
+def judge_cluster_fleet(release: Any, cluster_id: str, cluster: dict[str, Any]) -> None:
+    """One cluster's section of ``control_api``: its Agent coverage, the Runtime
+    Profile its counted Agents run and its fleet readiness; raises on the first
+    that fails (a cluster-scoped verify files it as another cluster's finding,
+    ``regional_verify_scope.judge_clusters``)."""
+
+    agents = check_agent_coverage(cluster_id, cluster)
+    expected_profile = runtime_profile_version_for(release.config, cluster_id)
+    if any(item.get("runtime_profile_version") != expected_profile for item in agents):
+        raise ReleaseError(f"{cluster_id} Agent Runtime Profile drift")
+    if not (cluster.get("fleet_readiness") or {}).get("ready"):
+        raise ReleaseError(f"{cluster_id} fleet readiness failed")

@@ -18,6 +18,7 @@ from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.cluster_scope import cluster_provider, is_eks_managed
 from gpu_fault.admin.bootstrap_common import BootstrapError, safe_name
 from gpu_fault import installation_lifecycle
+from gpu_fault.admin.membership_verify import verified_findings
 from gpu_fault.admin.process_supervisor import ProcessSupervisionLost
 from gpu_fault.admin.resource_registry_outcome import FIELD, deletion_gate
 from gpu_fault.admin.site import IDENTIFIER_PATTERN, RenderedSite
@@ -504,4 +505,6 @@ def removal_result(
             if state.get(REGISTRATION_REANCHOR)
             else {}
         ),
+        # The remaining clusters' own findings the final verify did not gate on.
+        **verified_findings(state),
     }

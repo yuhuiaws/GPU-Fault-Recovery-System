@@ -22,6 +22,7 @@ import pytest
 
 from gpu_fault_release import regional_admin_checks as CHECKS
 from gpu_fault_release import regional_admin_commands as COMMANDS
+from gpu_fault_release import regional_release_departure_absorption as ABSORPTION
 from gpu_fault_release import regional_release_validation as VALIDATION
 from gpu_fault_release import regional_release_verify_churn as CHURN
 from gpu_fault_release.regional_release_departed_nodes import DepartureProof
@@ -327,13 +328,34 @@ def proof_of(monkeypatch: pytest.MonkeyPatch, *, departed: bool) -> list[list[st
         return DepartureProof((), (f"{GONE}: HyperPod cluster hp-a still lists it",))
 
     monkeypatch.setattr(CHURN, "departure_proof", proof)
+    monkeypatch.setattr(ABSORPTION, "departure_proof", proof)
     return asked
+
+
+def settle_instantly(
+    monkeypatch: pytest.MonkeyPatch, *, items: list[dict]
+) -> SimpleNamespace:
+    """The verify's departure wait on a fake clock, over a fixed Node list."""
+
+    clock = SimpleNamespace(now=0.0)
+
+    def sleep(seconds: float) -> None:
+        clock.now += seconds
+
+    monkeypatch.setattr(CHURN, "_monotonic", lambda: clock.now)
+    monkeypatch.setattr(CHURN, "_sleep", sleep)
+    monkeypatch.setattr(CHURN, "_fresh_nodes", lambda _release, _target: items)
+    return clock
 
 
 def test_a_departed_agent_no_proof_covers_still_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Re-judged for the product's ten-minute departure guard (b250), then
+    counted: the coverage refusal names the node and the proof's reason."""
+
     asked = proof_of(monkeypatch, departed=False)
+    clock = settle_instantly(monkeypatch, items=[node(PLANNED)])
     plane = ControlPlane(agents=[PLANNED, GONE])
     release = control_release([PLANNED, GONE])
     release.state["departed_nodes"] = {}
@@ -342,9 +364,15 @@ def test_a_departed_agent_no_proof_covers_still_fails(
         monkeypatch, release, plane, mode="verify", items=[node(PLANNED)]
     )
 
-    assert asked == [[GONE]], "the Agent without a Node is put to the proof"
+    assert asked[0] == [GONE], "the Agent without a Node is put to the proof"
+    assert len(asked) > 1 and all(nodes == [GONE] for nodes in asked), asked
+    assert clock.now >= CHURN.DEPARTURE_DECISION_SECONDS, "refused before the guard"
     assert record["status"] == "FAIL"
     assert "Agent coverage drift" in record["summary"], record
+    assert (
+        f"departure not proven: {GONE}: HyperPod cluster hp-a still lists it"
+        in record["summary"]
+    ), record
 
 
 def test_a_departure_the_verify_proves_itself_is_not_counted(

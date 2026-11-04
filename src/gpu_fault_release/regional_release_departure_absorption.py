@@ -193,6 +193,9 @@ class DepartureWatch:
     phase: str
     #: The clock the windows are measured on; ``time.monotonic`` when None.
     monotonic: Callable[[], float] | None = None
+    #: A fresh read of the cluster's Nodes; ``gpu_node_items(fresh=True)`` when
+    #: None (a verify, inside its report snapshot, reads past the cache).
+    read_nodes: Callable[[], list[dict[str, Any]]] | None = None
     first_seen: dict[str, float] = field(default_factory=dict)
     last_gone: dict[str, float] = field(default_factory=dict)
     checked_at: dict[str, float] = field(default_factory=dict)
@@ -209,9 +212,13 @@ class DepartureWatch:
         now = self.monotonic() if self.monotonic is not None else time.monotonic()
         asked = sorted({str(node) for node in node_ids if str(node)})
         open_nodes = [node for node in asked if node not in self.departed]
+        listed = (
+            self.read_nodes()
+            if self.read_nodes is not None
+            else gpu_node_items(self.release, self.target, fresh=True)
+        )
         items = {
-            str((item.get("metadata") or {}).get("name") or ""): item
-            for item in gpu_node_items(self.release, self.target, fresh=True)
+            str((item.get("metadata") or {}).get("name") or ""): item for item in listed
         }
         alive: list[str] = []
         lingering: dict[str, str] = {}

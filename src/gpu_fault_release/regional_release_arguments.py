@@ -11,6 +11,10 @@ import argparse
 from pathlib import Path
 
 from gpu_fault_release.regional_release_config import ReleaseError
+from gpu_fault_release.regional_verify_scope import (
+    add_scope_arguments,
+    validate_scope_arguments,
+)
 
 
 def validate_cluster_arguments(arguments: argparse.Namespace) -> None:
@@ -41,6 +45,8 @@ def validate_cluster_arguments(arguments: argparse.Namespace) -> None:
         raise ReleaseError("--cluster-id is required")
     arguments.cluster_ids = cluster_ids
     arguments.cluster_id = cluster_ids[0] if len(cluster_ids) == 1 else None
+    # `verify` scoped to a membership verb's target (regional_verify_scope).
+    validate_scope_arguments(arguments)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -104,4 +110,7 @@ def parser() -> argparse.ArgumentParser:
     # passing checks' details instead of their names. GPU_FAULT_FULL_REPORT=1
     # does the same for a wrapper that cannot add the flag.
     value.add_argument("--full", action="store_true")
+    # `verify` only, engine-internal: join-cluster / remove-cluster pass their
+    # target so other GPU clusters' own findings are reported, not gated on.
+    add_scope_arguments(value)
     return value

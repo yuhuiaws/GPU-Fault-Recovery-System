@@ -51,6 +51,7 @@ from gpu_fault.admin.cluster_join_state import (
     reset_completed_state,
     step_done,
 )
+from gpu_fault.admin.membership_verify import scoped_evidence
 from gpu_fault.admin.membership_lock import (
     membership_operation_lock,
     reload_site_for_mutation,
@@ -604,7 +605,13 @@ def _verify_deployed(
             state_dir=context.candidate_dir,
         )
         before = membership_runtime_snapshot(candidate)
-        join._run_rollout(candidate, "verify")
+        # Scoped to the batch's clusters: another cluster's own findings are
+        # reported, not gated on (membership_verify).
+        report = join._run_rollout(
+            candidate,
+            "verify",
+            cluster_id=[_execution(item).cluster_id for item in attempts],
+        )
         after = membership_runtime_snapshot(candidate)
         verified_at = datetime.now(timezone.utc)
         candidate_cluster_ids = [
@@ -635,7 +642,11 @@ def _verify_deployed(
                 attempt.state_path,
                 attempt.state,
                 "VERIFIED",
-                {**record, "candidate_site_file": str(candidate.source)},
+                {
+                    **record,
+                    "candidate_site_file": str(candidate.source),
+                    **scoped_evidence(report),
+                },
             )
         try:
             publish_batch_failure_domains(attempts)

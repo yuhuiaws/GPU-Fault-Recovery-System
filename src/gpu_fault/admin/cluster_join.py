@@ -10,7 +10,7 @@ from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
-from typing import Any, Mapping, Callable, cast
+from typing import Any, Mapping, Callable, Sequence, cast
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
@@ -103,6 +103,7 @@ from gpu_fault.admin.membership_lock import (
     membership_operation_lock,
     reload_site_for_mutation,
 )
+from gpu_fault.admin import membership_verify as scoped
 from gpu_fault.admin.resource_registry import (
     LegacyInstallationRegistryMissing,
     fetch_installation_resource_registry,
@@ -180,27 +181,25 @@ def _sync_join_release_state(
 
 
 def _run_rollout(
-    site: RenderedSite,
-    mode: str,
-    *,
-    cluster_id: str | None = None,
-) -> None:
+    site: RenderedSite, mode: str, *, cluster_id: str | Sequence[str] | None = None
+) -> dict[str, Any] | None:
+    """``verify`` with the joining cluster(s) is scoped, returns the report."""
     rollout = (
         site.repository_root
         / "deploy/control-plane/regional/rollout-regional-release.sh"
     )
     with materialized_release_config(site) as config:
-        arguments = [str(rollout), mode, "--config", str(config)]
-        if cluster_id is not None:
-            arguments[2:2] = ["--cluster-id", cluster_id]
         result = run_driver(
-            arguments,
+            scoped.rollout_arguments(rollout, mode, config, cluster_id),
             cwd=site.repository_root,
             env=effective_environment(site),
             check=False,
+            **scoped.driver_capture(mode),
         )
+    report = scoped.echoed_report(result) if mode == "verify" else None
     if result.returncode:
         raise BootstrapError(f"regional {mode} failed")
+    return report
 
 
 def _identity(value: dict[str, Any]) -> ClusterIdentity:
@@ -899,9 +898,8 @@ def _prepare_execution(
     node_claims: NodeClaims | None = None,
 ) -> JoinInputs | JoinExecution | dict[str, Any]:
     if not _done(state, PRECHECKED_STEP):
-        # The candidate verify after the rollout covers every cluster in the
-        # site, the existing ones included; a baseline verify of the site first
-        # was a second full verify that could only repeat that answer.
+        # The candidate verify after the rollout judges every cluster of the site
+        # (the joining one gates it); a baseline verify first would only repeat it.
         _complete(state_path, state, PRECHECKED_STEP)
     if _done(state, DISCOVERED_STEP):
         validate_saved_join_target(request, state["evidence"]["DISCOVERED"], runner)
@@ -1169,7 +1167,9 @@ def _verify_join_candidate(
         clear_verified_step(state_path, state)
     if not _done(state, "VERIFIED"):
         before = membership_runtime_snapshot(execution.candidate)
-        _run_rollout(execution.candidate, "verify")
+        report = _run_rollout(
+            execution.candidate, "verify", cluster_id=execution.cluster_id
+        )
         after = membership_runtime_snapshot(execution.candidate)
         _complete(
             state_path,
@@ -1191,6 +1191,7 @@ def _verify_join_candidate(
                     cluster_id=execution.cluster_id,
                 ),
                 "candidate_site_file": str(execution.candidate.source),
+                **scoped.scoped_evidence(report),
             },
         )
 
@@ -1282,10 +1283,9 @@ def _deploy_and_commit(
                 state=state,
             )
         except JoinVerificationExpired:
-            # The window closed between verify and commit. Nothing about the
-            # rolled-out data plane is wrong, so re-verify instead of rolling it
-            # back; one retry, so a clock that keeps producing stale evidence
-            # cannot loop.
+            # The window closed between verify and commit: the data plane is fine,
+            # so re-verify rather than roll it back -- once, so a clock that keeps
+            # producing stale evidence cannot loop.
             clear_verified_step(state_path, state)
             continue
         return
@@ -1387,6 +1387,7 @@ def _complete_join(
         "site_file": str(attempt.request.site.source),
         "cpu_control_plane": "PRESERVED",
         "gpu_cluster": "PRESERVED",
+        **scoped.finish_join(attempt.request.site, execution.cluster_id, attempt.state),
     }
 
 

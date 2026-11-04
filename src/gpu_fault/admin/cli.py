@@ -179,6 +179,7 @@ from gpu_fault.admin.uninstall import UninstallRequest, uninstall
 from gpu_fault.admin import workflow_reconcile_departed_agents
 from gpu_fault.admin import warm_spare_departed
 from gpu_fault.admin.workflow_reconcile import run_workflow_reconcile
+from gpu_fault.admin.membership_verify import clear_record as clear_membership_findings
 from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_validation_evidence import (
     QUICK_VALIDATION_EVIDENCE_ENV,
@@ -893,6 +894,9 @@ def _run_readonly_managed_command(
             )
         if is_status:
             print_status_report(completed.stdout, site=site, site_file=site_file)
+        elif arguments.command == "verify" and completed.returncode == 0:
+            # Every cluster judged again: a join/remove's findings are history.
+            clear_membership_findings(site_file.parent)
         return completed.returncode
 
 

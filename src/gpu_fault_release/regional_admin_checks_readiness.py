@@ -41,6 +41,7 @@ from gpu_fault_release.regional_release_runtime_identity import (
     CONTROL_PLANE_PYTHON,
     exec_cpu_ingress,
 )
+from gpu_fault_release.regional_verify_scope import not_gating_ids, record_not_gating
 
 # One missed posting cycle of the slowest unconditional cadence (the ~300 s
 # health summaries) plus the time a collector needs to post again once its
@@ -119,13 +120,16 @@ def judge_collector_readiness(
         for cluster_id, cluster in clusters.items()
         if isinstance(cluster, dict) and churn_departed(cluster)
     }
+    # A cluster-scoped verify (join-cluster / remove-cluster) neither waits for
+    # nor fails on another cluster's collectors: they are its findings.
+    others = not_gating_ids(release, snapshots)
     thresholds = _thresholds(report)
     budget = _capped_grace(grace_seconds)
     started = monotonic()
     remaining = budget
     polls = 0
     probe_errors: list[str] = []
-    pending = _not_ready(snapshots, excused)
+    pending = _not_ready(snapshots, excused, others)
     while pending and remaining > 0:
         pause = min(poll_seconds, remaining)
         sleep(pause)
@@ -146,7 +150,7 @@ def judge_collector_readiness(
                 if cluster_id in fresh["clusters"]:
                     snapshots[cluster_id] = fresh["clusters"][cluster_id]
             thresholds = _thresholds(fresh) or thresholds
-            pending = _not_ready(snapshots, excused)
+            pending = _not_ready(snapshots, excused, others)
         # The probe's own duration counts against the grace as well.
         remaining = min(remaining, budget - (monotonic() - started))
     evidence = {
@@ -171,6 +175,13 @@ def judge_collector_readiness(
         evidence["departed_not_awaited"] = {
             cluster_id: sorted(nodes) for cluster_id, nodes in excused.items()
         }
+    not_gating: dict[str, list[str]] = {}
+    for cluster_id in _not_ready({key: snapshots[key] for key in others}, excused):
+        not_gating[cluster_id] = _stale(cluster_id, snapshots[cluster_id], thresholds)
+        for line in not_gating[cluster_id]:
+            record_not_gating(report, cluster_id, f"collector readiness: {line}")
+    if not_gating:
+        evidence["not_gating"] = not_gating
     if pending:
         raise CheckFailure(_failure_message(pending, evidence), evidence)
     return evidence
@@ -188,12 +199,15 @@ def _capped_grace(grace: float) -> float:
 
 
 def _not_ready(
-    snapshots: dict[str, Any], excused: dict[str, frozenset[str]] | None = None
+    snapshots: dict[str, Any],
+    excused: dict[str, frozenset[str]] | None = None,
+    others: frozenset[str] = frozenset(),
 ) -> list[str]:
     return [
         cluster_id
         for cluster_id, snapshot in snapshots.items()
-        if not _ready(snapshot, (excused or {}).get(cluster_id, frozenset()))
+        if cluster_id not in others
+        and not _ready(snapshot, (excused or {}).get(cluster_id, frozenset()))
     ]
 
 

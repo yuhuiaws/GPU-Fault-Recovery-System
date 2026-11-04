@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 
 from gpu_fault_release import regional_release_verify_churn as release_churn
 from gpu_fault_release import regional_admin_checks_coverage as agent_coverage
+from gpu_fault_release import regional_verify_scope as verify_scope
 from gpu_fault_release.regional_release_nlb_rules import (
     nlb_https_rule_violation as nlb_https_rule_violation,
     permission_reaches_https as permission_reaches_https,
@@ -48,7 +49,6 @@ from gpu_fault_release.regional_release_diff import (
 )
 from gpu_fault_release.regional_release_preflight import monitoring_repair_preflight
 from gpu_fault_release.regional_release_probes import probe_source
-from gpu_fault_release.regional_release_profile_model import runtime_profile_version_for
 from gpu_fault_release.regional_release_replica_failure import (
     deployment_readiness,
     require_ready,
@@ -1245,16 +1245,9 @@ def _check_control_api(release: Any, *, verify: bool = False) -> CheckValue:
             f"regional registry drift: configured={sorted(configured)}, "
             f"registered={sorted(registered)}"
         )
-    for cluster_id, cluster in report.get("clusters", {}).items():
-        # Retired (REVOKED) records are not coverage; see the sibling module.
-        agents = agent_coverage.check_agent_coverage(cluster_id, cluster)
-        expected_profile = runtime_profile_version_for(release.config, cluster_id)
-        if any(
-            item.get("runtime_profile_version") != expected_profile for item in agents
-        ):
-            raise ReleaseError(f"{cluster_id} Agent Runtime Profile drift")
-        if not (cluster.get("fleet_readiness") or {}).get("ready"):
-            raise ReleaseError(f"{cluster_id} fleet readiness failed")
+    # Each cluster's section (coverage, Runtime Profile, fleet readiness) gates
+    # only where this verify's scope says so (regional_verify_scope).
+    verify_scope.judge_clusters(release, report, agent_coverage.judge_cluster_fleet)
     remote = report.get("remote_commands") or {}
     oldest = float(remote.get("oldest_unclaimed_age_seconds", 0) or 0)
     if oldest > release.config.health.remote_command_max_unclaimed_seconds:
@@ -1556,7 +1549,11 @@ def build_health_report(release: Any, *, mode: str) -> dict[str, Any]:
     specifications.extend(
         (
             f"gpu_cluster:{target.cluster_id}",
-            partial(_check_gpu_cluster, release, target, mode=mode),
+            verify_scope.scoped_cluster_check(
+                release,
+                target.cluster_id,
+                partial(_check_gpu_cluster, release, target, mode=mode),
+            ),
         )
         for target in release.config.clusters
     )
@@ -1576,7 +1573,8 @@ def build_health_report(release: Any, *, mode: str) -> dict[str, Any]:
                 for name, function in specifications
             ]
             checks = [future.result() for future in futures]
-    report = _report(mode, release, checks)
+    report = _report(mode, release, verify_scope.mark_not_gating(release, checks))
+    verify_scope.annotate_scope(release, report)
     report["reused_validation_checks"] = sorted(reusable_checks)
     if evidence_fallback is not None:
         report["validation_evidence_fallback"] = evidence_fallback

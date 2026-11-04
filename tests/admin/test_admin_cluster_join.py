@@ -421,7 +421,9 @@ def test_join_cluster_is_atomic_resumable_and_registers_resources(
     assert rollout_calls == [
         ("preflight", None),
         ("join-cluster", "hp-gpu-b"),
-        ("verify", None),
+        # Scoped to the joining cluster: other clusters' own findings are
+        # reported, not gated on (membership_verify).
+        ("verify", "hp-gpu-b"),
         ("activate-cluster", "hp-gpu-b"),
     ], "the join ran a baseline verify the candidate verify already answers"
     assert readiness_waits == ["hp-gpu-b"]

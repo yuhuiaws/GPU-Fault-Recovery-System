@@ -505,6 +505,18 @@ growing must never fail a deploy, and the preflight has no control-plane fleet r
 The complete lines, fields and remedies are in [Administrator Capacity Configuration](administrator-capacity-configuration.md)
 §5.1 and the §8 cards `GpuFaultClusterNodesExceedDeclaredTopology` / `GpuFaultManagedNodesExceedDeclaredTopology`.
 
+The final verify of `join-cluster` / `remove-cluster` fails only on its target cluster(s) and the shared control plane (§5,
+`VERIFIED`); another GPU cluster's own findings (a node it just lost to a spot reclaim, say) neither fail nor roll the verb back
+and are recorded instead: once the verb completed, the deploy host writes `<state-dir>/membership-verify/findings.json`, from
+which `status` prints one line
+`finding: <verb> <cluster> completed at <time> past <n> finding(s) on GPU clusters it does not target (not gating; status judges them live)`,
+then one `finding: <verb> <cluster>: not gating: <other cluster> <check>: <finding>` each (at most 5, the rest counted), and the
+JSON document gains the deploy-host field `membership_verify_findings` (`verb`, `cluster_id`, `recorded_at`,
+`not_gating_findings`). The lines are a record, not a verdict: `healthy`, the checks and the exit code are unchanged, and those
+clusters' own state is judged live by the checks of `status`. The next `join-cluster` / `remove-cluster` that completes replaces
+the record (one without findings removes it), and the next passing verify of the whole site (every `deploy` and `config` runs
+one) removes it.
+
 Synchronisation of the installation resource registry is also no longer on the critical path of `deploy`'s return code:
 it is performed by the release driver after the release commit, and a failure is recorded only as
 `installation_registry.status=UNAVAILABLE` in `state.json` and one `completion_warnings` entry; the release itself is still
@@ -1974,6 +1986,15 @@ healthy release:
   `joined_node_pods` without judging them. An installed newcomer is judged like every node -- installed with any artifact
   but the release's it is `artifact drift` -- and `status` exempts nothing: a newcomer still reads `installer is not
   Succeeded` until it is installed.
+- A departure the verify cannot prove at its first look -- the Node still listed NotReady or being deleted, EC2 still
+  `shutting-down`, HyperPod still listing the instance, the Agent lease not lapsed yet (live 2026-11-04: five minutes after a
+  spot interruption the Node was still listed) -- is waited out by the forward path's rule in every cluster whose findings fail
+  the verify (the target of a join, every cluster of a `deploy` / `config`): re-read every 30 s for at most the product's
+  10-minute departure guard (log `departure-undecided`); excused once Kubernetes no longer lists the node and the proof holds,
+  with the evidence in `release_churn.departure_evidence` (log `departed-node-excluded phase=verify`), and counted otherwise --
+  `Agent coverage drift` then ends with `departure not proven: <node>: <reason>`. A Node that is Ready again ends the wait with
+  the failure (verify again), and a Kubernetes Node without an Agent is never excused; a cluster a scoped verify does not fail
+  on is not waited for.
 - Where to look: `live_release.departed_nodes` and `live_release.joined_nodes` (each newcomer's `outcome`, `installer_state`,
   `joined_at`) in `gpu-fault-admin status --state-dir <dir>`. A paused release resumed after a node joined is still refused
   with `resume node set drifted`; the waves of a rollback, a join and a bootstrap do none of the above.
@@ -1990,14 +2011,29 @@ The join's commit path pays only for the new cluster, and the `evidence` in `sta
   `GPU_FAULT_HOST_INTERVAL_SECONDS`), not a hard-coded list. Evidence fields: `waited_kinds`,
   `deferred_kinds` (each kind's period, scheduled/reported node counts), `fleet_ready`. A fast kind
   not reporting within 600 s is still a hard failure.
-- `VERIFIED`: the candidate verify runs only the checks that read the new cluster (`regional_contexts`, `cpu_secrets`,
-  `cpu_workloads`, `runtime_profile`, `read_only_verifiers`, `runtime_component_identity`,
-  `control_api` and each cluster's `gpu_cluster:*`), skipping six site-level checks unrelated to the new cluster
-  (`monitoring`, `adot_self_metrics`, `aurora`, `aurora_credential_refresh`,
-  `email_notifications`, `nlb_runtime` -- they read only control-plane/AWS state, and join does not modify those objects;
-  they are still covered by `gpu-fault-admin status --full`). `control_api` judges collector readiness for the new cluster by the fast/slow rule above;
-  `evidence.VERIFIED.verify` records the checks run, the checks skipped and the relaxed
-  kinds (`relaxed_collector_readiness`).
+- `VERIFIED`: the candidate verify is the full `verify` report of the candidate site, **scoped to the joining cluster(s)**
+  (the engine's `verify --joining-cluster-id <id>`, one per cluster of a batch). GPU data-plane clusters are independent, so
+  the checks are of two kinds:
+  - **shared control plane -- fails the verify as in every verify**: the CPU part of `regional_contexts` (CPU kube context,
+    CPU HyperPod cluster, CPU API `/readyz`), `cpu_secrets`, `cpu_workloads`, `email_notifications`,
+    `aurora_credential_refresh`, `adot_self_metrics`, `runtime_profile`, the CPU role split of `read_only_verifiers`, the CPU
+    Pods of `runtime_component_identity`, the shared half of `control_api` (`/healthz`, regional mode, every required and
+    compatible artifact, config, profile, key and executor pin and window, the regional registry against the site, the oldest
+    unclaimed remote command, the executor's internal errors), `nlb_runtime`, `aurora`, `monitoring`;
+  - **per GPU cluster -- fails the verify for the joining cluster(s) only**: `gpu_cluster:<id>` (Deployments, node scope,
+    Ready nodes, installer state and artifact, executor readiness, the executor's TLS path to the control plane), the
+    cluster's section of `control_api` (Agent coverage, Agent Runtime Profile, fleet readiness, collector readiness), its
+    executor verifier in `read_only_verifiers`, its Pods in `runtime_component_identity`, and its part of
+    `regional_contexts` (GPU context, provider facts, API `/readyz`, Agent endpoint CIDRs, executor IAM, retired
+    collectors).
+
+  Another cluster's own finding (a node it lost to a spot reclaim, a Deployment of its own not Ready) never fails or rolls the
+  join back: its check reads `WARN` with the summary
+  `not gating this join-cluster <id> (other clusters' own findings): <cluster>: <finding>` and names it under
+  `details.not_gating`; the report lists every one under `cluster_scope.not_gating_findings`; the join keeps them in
+  `evidence.VERIFIED.not_gating_findings` and in its result's `not_gating_findings` (redacted, each capped), and `status`
+  shows them (§4, `membership_verify_findings`). Another cluster's collectors are not waited for. `control_api` judges the
+  joining cluster's collector readiness by the fast/slow rule above.
 - `RELEASE_STATE_UPDATED`: `sync-state` re-captures only the new cluster's snapshot (`capture_scope:
   cluster:<id>`), merges it with the committed release state and still validates the site-level invariants -- each cluster's live
   Agent set equals its HyperPod node set, and the CPU/new cluster/recorded runtime images agree.
@@ -2109,6 +2145,13 @@ journal binds the site digest and the remedial `deploy` rewrites the site; a res
 verdict it started on, and removing a re-joined cluster is a new attempt, judged again.
 
 The command completes the stop of the target GPU cluster's data sources, the queue drain and the node systemd uninstall via the state machine.
+The final verification (`VERIFIED`) confirms the target namespace and the control-plane registration are gone and the GPU EKS
+and HyperPod clusters preserved, and runs one verify of the remaining site scoped to this removal
+(`verify --removed-cluster-id <id>`): the removed cluster is no longer in the site, so only the shared control plane (the first
+kind of check under §5 `VERIFIED`) fails it, and each remaining cluster's own findings are `WARN`s that go into
+`evidence.VERIFIED.not_gating_findings`, the command result's `not_gating_findings` and `status`'s
+`membership_verify_findings`; when the shared control plane fails, the removal stops at `RELEASE_STATE_UPDATED` and a rerun with
+the same arguments resumes it once fixed.
 join/remove use the same site transaction lock. Disassociating an exclusive Route53 VPC association saves the ChangeInfo, waits for
 `INSYNC` and confirms the association has really disappeared from the hosted zone; when other remaining GPU clusters still use the same VPC the association is kept.
 Disassociation also requires a `CREATED/DETACH` resource registration with full zone/Region/VPC identity; CPU-native associations and

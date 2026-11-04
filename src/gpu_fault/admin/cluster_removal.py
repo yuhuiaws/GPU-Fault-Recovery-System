@@ -80,6 +80,7 @@ from gpu_fault.admin.membership_lock import (
     membership_operation_lock,
     reload_site_for_mutation,
 )
+from gpu_fault.admin import membership_verify as scoped
 from gpu_fault.admin.node_key_proof import read_node_key_proof
 from gpu_fault.admin.process_supervisor import (
     ensure_supervision_safe,
@@ -1005,28 +1006,31 @@ def _verify_target_absent(
     verify_preserved_hyperpod(request, target)
 
 
-def _verify_remaining_site(site: RenderedSite) -> None:
-    rollout = (
-        site.repository_root
-        / "deploy/control-plane/regional/rollout-regional-release.sh"
+def _verify_remaining_site(
+    site: RenderedSite, removed: str | None = None
+) -> dict[str, Any] | None:
+    """The remaining site's verify, scoped to the removal: the shared control
+    plane gates, each remaining cluster's own findings are reported."""
+    return scoped.run_verify(
+        site,
+        scoped.verify_arguments(scoped.REMOVE_VERB, [removed]) if removed else [],
+        failure="remaining CPU control plane verification failed",
+        drive=(run_driver, materialized_release_config, effective_environment),
     )
-    with materialized_release_config(site) as config:
-        result = run_driver(
-            [str(rollout), "verify", "--config", str(config)],
-            cwd=site.repository_root,
-            env=effective_environment(site),
-            check=False,
-        )
-    if result.returncode:
-        raise BootstrapError("remaining CPU control plane verification failed")
+
+
+#: What the final verification proved, with the remaining site's findings.
+PRESERVED = {"cpu_control_plane_preserved": True, "gpu_cluster_preserved": True}
 
 
 def _verify_removal_parallel(
     request: RemoveClusterRequest,
     target: dict[str, Any],
     updated_site: RenderedSite,
-) -> None:
-    checks: list[tuple[str, Callable[[], None]]] = [
+) -> dict[str, Any]:
+    """Every final check at once; the remaining site's findings that did not
+    gate, as ``VERIFIED`` evidence."""
+    checks: list[tuple[str, Callable[[], Any]]] = [
         (
             "target namespace",
             lambda: _verify_target_namespace_absent(request, target),
@@ -1034,8 +1038,12 @@ def _verify_removal_parallel(
         ("control registry", lambda: _verify_control_registry_absent(request)),
         ("GPU EKS", lambda: verify_preserved_gpu_eks(request, target)),
         ("HyperPod", lambda: verify_preserved_hyperpod(request, target)),
-        ("remaining site", lambda: _verify_remaining_site(updated_site)),
+        (
+            "remaining site",
+            lambda: _verify_remaining_site(updated_site, request.cluster_id),
+        ),
     ]
+    reports: dict[str, Any] = {}
     with ThreadPoolExecutor(max_workers=len(checks)) as executor:
         futures: dict[Any, str] = {
             executor.submit(copy_context().run, function): description
@@ -1044,13 +1052,14 @@ def _verify_removal_parallel(
         failures: list[str] = []
         for future in as_completed(futures):
             try:
-                future.result()
+                reports[futures[future]] = future.result()
             except Exception as exc:
                 failures.append(f"{futures[future]}: {diagnostic_text(str(exc))}")
     if failures:
         raise BootstrapError(
             "remove-cluster final verification failed: " + "; ".join(sorted(failures))
         )
+    return scoped.scoped_evidence(reports.get("remaining site"))
 
 
 def _sync_release_state(site: RenderedSite) -> None:
@@ -1456,16 +1465,8 @@ def _execute_removal(
             {"cluster_ids": [item["cluster_id"] for item in remaining]},
         )
     if not _done(state, "VERIFIED"):
-        _verify_removal_parallel(request, target, updated_site)
-        _complete(
-            state_path,
-            state,
-            "VERIFIED",
-            {
-                "cpu_control_plane_preserved": True,
-                "gpu_cluster_preserved": True,
-            },
-        )
+        warnings = _verify_removal_parallel(request, target, updated_site)
+        _complete(state_path, state, "VERIFIED", {**PRESERVED, **(warnings or {})})
     if not _done(state, OWNERSHIP_RELEASE_STEP):
         # Last: everything before selected nodes by the live label; a refused
         # write leaves the phase at VERIFIED and the rerun lands here again.
@@ -1476,6 +1477,7 @@ def _execute_removal(
     state["updated_at"] = datetime.now(timezone.utc).isoformat()
     write_json_atomic(state_path, state)
     ensure_supervision_safe()
+    scoped.finish_removal(request.site, request.cluster_id, state)
     return _removal_result(
         request.site, request.cluster_id, state_path, state, remaining
     ) | prune_result(request.site, target, remaining, state_path, state)

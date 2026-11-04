@@ -22,6 +22,7 @@ from gpu_fault.admin.dcgm_declaration import (
     unreadable_findings,
 )
 from gpu_fault.admin.eks_nodegroup_update_strategy import update_strategy_findings
+from gpu_fault.admin import membership_verify
 from gpu_fault.admin.ownership_release import status_findings
 from gpu_fault.admin.rds_ca_bundle_drift import rds_ca_bundle_findings
 from gpu_fault.admin.resource_registry_outcome import FIELD, status_view
@@ -137,6 +138,10 @@ def print_status_report(
     (``dcgm_declaration_fields``): a label flipped since the last deploy is
     the next deploy's change, ``next deploy: DATA_PLANE_COMPATIBLE
     (dcgm_hostengine: ...)``, where the engine read the recorded entry only.
+    The last ``join-cluster`` / ``remove-cluster`` that completed past findings
+    on GPU clusters it did not target adds them (``membership_verify``), as
+    findings and the ``membership_verify_findings`` field, until the next such
+    verb or a passing verify of the whole site.
     """
     if site is not None:
         state_dir = site_file.parent if site_file is not None else None
@@ -157,13 +162,17 @@ def print_status_report(
     if site_file is not None:
         fields, declaration_findings = dcgm_declaration_fields(report, site_file)
         view = status_view(site_file.parent, release_id=_running_release_id(report))
+        # The last join/remove-cluster's findings on clusters it did not target.
+        membership, membership_lines = membership_verify.status_view(site_file.parent)
         findings = [
             *findings,
             *declaration_findings,
             *([view["finding"]] if view["finding"] else []),
+            *membership_lines,
         ]
         stdout = _with_deploy_host_fields(
-            stdout, {**fields, FIELD: view, **capacity_topology_field(report)}
+            stdout,
+            {**fields, FIELD: view, **capacity_topology_field(report), **membership},
         )
     log_path = os.environ.get(ADMIN_LOG_ENVIRONMENT, "").strip()
     destination = "stdout" + (f" (also in {log_path})" if log_path else "")

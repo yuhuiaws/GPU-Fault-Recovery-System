@@ -10,6 +10,7 @@ from typing import Any
 from gpu_fault_release import repository_root
 from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_release_runtime_identity import live_release_images
+from gpu_fault_release.regional_verify_scope import gates, record_not_gating
 
 ROOT = repository_root()
 QUICK_VALIDATION_EVIDENCE_ENV = "GPU_FAULT_QUICK_VALIDATION_EVIDENCE"
@@ -123,12 +124,14 @@ def read_only_verifier_details(
             # say which release the Pods were measured against.
             error.args = (f"{error}; {yardstick['measured_against']}",)
             raise
-    gpu_outputs = {}
+    gpu_outputs: dict[str, object] = {}
+    details: dict[str, object] = {"cpu": control_output, "clusters": gpu_outputs}
     for target in release.config.clusters:
         check = f"data_plane_executor:{target.cluster_id}"
         if check in reused:
             gpu_outputs[target.cluster_id] = {"reused": True}
-        else:
+            continue
+        try:
             gpu_outputs[target.cluster_id] = release.runner.run(
                 [
                     "python3",
@@ -147,7 +150,12 @@ def read_only_verifier_details(
                 },
                 capture=True,
             )
-    details: dict[str, object] = {"cpu": control_output, "clusters": gpu_outputs}
+        except ReleaseError as error:
+            # Another cluster's executor is its own finding in a verify scoped
+            # to a membership verb's target (regional_verify_scope).
+            if gates(release, target.cluster_id):
+                raise
+            record_not_gating(details, target.cluster_id, f"executor verifier: {error}")
     if yardstick["release_id"] is not None:
         details["measured_against"] = yardstick["measured_against"]
     return details
