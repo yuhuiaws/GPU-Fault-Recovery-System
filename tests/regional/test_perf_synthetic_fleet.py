@@ -224,21 +224,29 @@ def test_the_model_refresh_and_telemetry_skip_the_fleet() -> None:
 
 
 class RecordingStore:
-    """The seed's writes, in order, over a memory store."""
+    """The seed's writes, in order, over a memory store: each workflow with the
+    Agents its cluster had, and the stamps it carried beside the wall clock."""
 
     def __init__(self) -> None:
         self.inner = build_store()
         self.writes: list[tuple[str, int]] = []
+        self.agents_saved_at: list[datetime] = []
+        # (workflow.created_at, incident.created_at, when it was saved)
+        self.stamps: list[tuple[datetime, datetime, datetime]] = []
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.inner, name)
 
     def save_agent(self, agent: Any) -> None:
         self.inner.save_agent(agent)
+        self.agents_saved_at.append(datetime.now(timezone.utc))
 
     def save_incident_and_workflow(self, incident: Any, workflow: Any) -> None:
         self.writes.append(
             (workflow.request_id, len(self.inner.list_agents(incident.cluster_id)))
+        )
+        self.stamps.append(
+            (workflow.created_at, incident.created_at, datetime.now(timezone.utc))
         )
         self.inner.save_incident_and_workflow(incident, workflow)
 
@@ -299,6 +307,42 @@ def test_the_seed_saves_every_agent_before_any_workflow(
     ] == storm_breaker_pod.step_workflow_ids(RUN, 3), (
         "the breaker step reads the seeded workflows by these ids"
     )
+
+
+def test_each_seeded_workflow_is_stamped_when_it_is_saved(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The suite's first action and workflow duration run from a workflow's
+    created_at. Stamped with the seed's start they also held the Agent template
+    read over the registered fleet and every Agent save before the first
+    workflow -- harness time (batch 246). Each workflow and its incident carry
+    their own save time now, in save order, and the summary names the basis."""
+
+    store = RecordingStore()
+
+    summary = run_seed_main(
+        monkeypatch,
+        capsys,
+        store,
+        {
+            "ACTION_SEED_MODE": "workflows",
+            "ACTION_WORKFLOWS_PER_CLUSTER": "3",
+            "ACTION_NODES_PER_WORKFLOW": "4",
+        },
+    )
+
+    last_agent = max(store.agents_saved_at)
+    assert len(store.stamps) == 3
+    for created, incident_created, saved in store.stamps:
+        assert last_agent <= created <= saved, (
+            "a workflow carries its own save time, not the seed's start"
+        )
+        assert incident_created == created, "the incident is stamped with it"
+    created = [created for created, _, _ in store.stamps]
+    assert created == sorted(created), (
+        "the dispatch order (created_at, key) stays the save order"
+    )
+    assert summary["first_action_basis"] == seed.FIRST_ACTION_BASIS == "workflow-saved"
 
 
 def test_the_fleet_mode_registers_per_cluster_agents(

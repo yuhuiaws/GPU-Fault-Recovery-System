@@ -124,6 +124,14 @@ TERMINAL_WORKFLOW_STATUSES = frozenset(
 #: much overlap for a save whose transaction committed after the poll started.
 WATCH_FEED_OVERLAP = timedelta(seconds=2)
 WATCH_FEED_LIMIT = 2000
+#: What a seeded workflow's ``created_at`` -- the start of the summary's first
+#: action and workflow duration -- is: the moment that workflow was saved. Runs
+#: without this key in ``summary.json`` stamped every workflow with the seed's
+#: start, so both figures also held the seed's own work before that workflow:
+#: by the live seed durations about 1-1.5 s at p50 while Agents and workflows
+#: were saved interleaved, about 3.5-5 s once every Agent was saved first and
+#: the Agent template read listed a registered fleet (batch 246).
+FIRST_ACTION_BASIS = "workflow-saved"
 
 
 def utc_now() -> datetime:
@@ -1309,6 +1317,12 @@ def main() -> None:
                     now=now,
                 )
                 agents_created += 1
+        # Each workflow and its incident are stamped when they are saved, not
+        # with the seed's start: the suite's first action and workflow
+        # duration run from created_at (``database_details``), and the seed's
+        # start also held the Agent template read over the registered fleet
+        # and every Agent save before the first workflow -- harness time, not
+        # the dispatcher's (batch 246; ``FIRST_ACTION_BASIS``).
         for cluster_id, scope in scopes:
             save_action_workflow(
                 context,
@@ -1317,7 +1331,7 @@ def main() -> None:
                 nodes=action_nodes(scope, nodes_per_workflow),
                 run_id=run_id,
                 runtime_profile_version=runtime_profile_version,
-                now=now,
+                now=utc_now(),
             )
             created += 1
     finally:
@@ -1333,6 +1347,7 @@ def main() -> None:
                 "workflows_per_cluster": workflows_per_cluster,
                 "nodes_per_workflow": nodes_per_workflow,
                 "steps_per_workflow": 10,
+                "first_action_basis": FIRST_ACTION_BASIS,
                 "workflows_created": created,
                 "agents_created": agents_created,
                 "agent_identity_source": identity_source,

@@ -821,6 +821,14 @@ model's 16 nodes and 240 fleet Agents, threshold 52), and the seeding script sav
 workflow. `run.json.synthetic_fleet` and `fleet.json` record it, and after the teardown `fleet-cleanup.json` proves
 nothing is left.
 
+The summary's first action (a workflow's `created_at` to its first remote command) and workflow duration run from the
+moment each workflow was saved: the seeding script stamps every workflow and its incident when it saves them, and
+`summary.json.first_action_basis` is `workflow-saved`. A summary without that key comes from a seed that stamped every
+workflow with its own start, so both figures also hold the seed's work before that workflow -- interleaved Agent and
+workflow saves before the fleet, and the Agent template read over the registered fleet plus every Agent save once the
+seed saved all Agents first; by the runs' seed durations about 1-1.5 s and about 3.5-5 s at p50. Compare such a run's
+first action only with runs of the same basis.
+
 ### 8.3 Live correlated-action
 
 Putting correlated ingestion and directly seeded Action workflows in the same report alone
