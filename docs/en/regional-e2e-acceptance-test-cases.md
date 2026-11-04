@@ -4168,7 +4168,8 @@ the errors of every stage, `departed_nodes`, `replacement_nodes`, `node_renames`
 5. Verify the CPU control plane: the registry Secret's `clusters.json` is an explicit `[]`; every CPU Pod
    `/healthz` 200 with `regional_registry.secret_drift=false`; when the failure-domain map changes only
    `control-worker` may complete the audited template update, with the Deployment UID unchanged, and it reads the new empty member/Node
-   map; the Pod UIDs and `restartCount` of ingress/spool are the same as the baseline;
+   map; the Pod UIDs and `restartCount` of ingress/spool are the same as the baseline (the `BOOT-029` driver checks
+   `secret_drift`, the Pod UIDs and `restartCount` automatically after every S2 removal, see its precondition 9);
    `site.yaml` `spec.clusters: []`; release
    state `cluster_ids: []`; `status --full` all PASS and `control_api` does not report
    `regional registry drift`.
@@ -4318,7 +4319,9 @@ node names appear only as sha256 digests; per-step durations are not recorded.
    a failure-domain map change allows only the audited roll of `control-worker`, the Deployment UID stays unchanged,
    and the new map matches the complete Node set; the Pod UIDs and `restartCount` of ingress/spool stay at baseline.
    Every CPU Pod `/healthz`
-   `regional_registry.secret_drift=false`; the cluster ID sets in `site.yaml`, the registry and the release state
+   `regional_registry.secret_drift=false` (the `BOOT-029` driver checks this and the Pod UIDs/`restartCount`
+   automatically after its S3 join, see its precondition 9); the cluster ID sets in `site.yaml`, the registry and the
+   release state
    agree; `status --full` all PASS; the Agent heartbeats of all nodes in the cluster
    converge and the executor claim no longer gets 423.
 
@@ -4711,7 +4714,8 @@ and does not count towards its sequence.
   `hyperpod-v1` and `eks-v1`) and both join directions (each with the other provider's cluster override). A
   single-provider site runs byte for byte as before.
   The driver script `scripts/acceptance/admin-lifecycle-sequence.sh` is responsible for the order, cache cleanup,
-  waiting for every command to exit, the cold-build assertions and private evidence recording; the provider of every
+  waiting for every command to exit, the cold-build assertions, the registry convergence and no-CPU-restart verdict
+  after every `join-cluster`/`remove-cluster` (precondition 9) and private evidence recording; the provider of every
   GPU ARN is decided by `scripts/e2e/regional/boot029_providers.py` through the product's own discovery (the
   orchestrator ARN of `sagemaker list-clusters`/`describe-cluster`, read-only); S5's README parsing,
   pristine source copy, allowlisted environment and `readme` receipt are handled by
@@ -4737,10 +4741,16 @@ and does not count towards its sequence.
   `scripts/e2e/regional/boot029_receipts.py` (`pending`/`profile-plan`/`verify --joined-gpu-arn`),
   `scripts/e2e/regional/boot029_readme.py` (README parsing, `prepare_source_checkout`
   pristine copy, `clean_environment` allowlist, `mixed_site_join_documented`),
-  `scripts/e2e/regional/registry_sync_preflight.py` (the installation registry sync judgment before S2/S4). Offline contracts:
+  `scripts/e2e/regional/registry_sync_preflight.py` (the installation registry sync judgment before S2/S4),
+  `scripts/e2e/regional/boot029_registry_drift.py` (the registry convergence and no-CPU-restart verdict around every
+  join/remove), `scripts/perf/regional_registry_alignment.py` (the `/healthz` reader and the bounded wait for the
+  mounted copy). Offline contracts:
   `tests/regional/test_admin_lifecycle_sequence_script.py`,
   `tests/regional/test_admin_lifecycle_sequence_mixed_site.py` (mixed site, resume shapes),
   `tests/regional/test_admin_lifecycle_sequence_registry_sync.py` (the S2/S4 sync gate and resumes),
+  `tests/regional/test_admin_lifecycle_sequence_registry_drift.py` (registry convergence after every join/remove:
+  converging, past the window, a replaced Pod, an older product, a mixed site), `tests/regional/test_boot029_registry_drift.py`
+  (the verdict's rules one by one),
   `tests/regional/test_boot029_providers.py`, `tests/regional/test_boot029_receipts_mixed_site.py`,
   `tests/regional/test_boot029_readme.py` (the latter parses the repository's real README).
 
@@ -4804,6 +4814,30 @@ and does not count towards its sequence.
    of the site -- a NOOP deploy retries the sync too -- or a `config` re-roll), after which the same stage resumes; an
    attempt whose journal already exists is left to the verb, which resumes it on the verdict it started with. The driver
    never passes `--accept-unsynchronized-registry`.
+9. Registry convergence without a CPU restart: `join-cluster`/`remove-cluster` rewrite the registry Secret and publish the
+   durable head, and by design never restart the CPU Deployments; a CPU Pod compares the Secret as mounted (`/healthz`
+   `regional_registry.secret_source=mounted-file`, a copy kubelet keeps current), so the "`secret_drift=false`, Pod UIDs
+   unchanged" that `BOOT-019`/`024`/`025` require must hold after every such verb without a restart. Around every S2
+   `remove-cluster`, the S3 `join-cluster` and, on a mixed site, every in-stage `join-cluster` of S1/S5, the driver reads
+   the CPU cluster read-only with the CPU kubeconfig and namespace the site's `site.yaml` records
+   (`scripts/e2e/regional/boot029_registry_drift.py`, `kubectl get` and `kubectl exec` only): before the verb, the CPU
+   runtime Deployments (`regional_deployment_inventory.CPU_RUNTIME_DEPLOYMENTS`: `gpu-fault-api-ha`,
+   `gpu-fault-control-worker`, `gpu-fault-telemetry-spool-worker` -- every role that serves the registry `/healthz`) and
+   their Pods' UIDs, container `restartCount` and Pod template digest; after it, the `/healthz?verbose=1` of every Running,
+   non-terminating CPU Pod with the perf registry gate's reader and bound (`scripts/perf/regional_registry_alignment.py`:
+   while a mounted copy still drifts, a re-read every 10 s for at most 180 s while kubelet re-projects the Secret) --
+   each must report `secret_source=mounted-file`, `secret_drift=false` and `ready=true` -- and then the Pods: the
+   baseline's Pod UIDs and `restartCount` unchanged, no Pod added, no Pod template changed, the one exception being the
+   audited roll the `BOOT-019` role boundary allows: a membership change re-publishes the failure-domain map and stamps
+   its digest on the control-worker's Pod template (`failure_domain_map.apply_failure_domain_map`), so the
+   control-worker may roll when that is the only change to its template. Anything else fails the stage naming the Pod;
+   a CPU cluster that cannot be read before the verb fails the stage without running it. A product whose `/healthz`
+   reports no `secret_source` (a release before the mounted Secret: its replicas compare the Secret they started with
+   and, by that release's design, drift after a join/remove until restarted) is recorded `NOT_APPLICABLE` with what was
+   seen and not failed; Pods of both generations at once fail. Every verdict goes to the stage receipt as
+   `registry_convergence` (one entry per verb, in order; configuration digests cut to 12 hex digits, next to Pod names
+   and UIDs) and, Pod by Pod, to the stage log. The operator identity therefore also needs get/list on `deployments`/`pods`
+   and `pods/exec` on the CPU cluster.
 
 #### Steps
 
@@ -4912,7 +4946,9 @@ stages or after everything has finished, following the references below.
    ```
 
    A join that exits non-zero without a pending `CLUSTER_PROFILE_NEW` plan fails the stage; the driver approves nothing
-   else. The driver asserts that `initial_deploy_target.gpu_clusters` in `bootstrap-state.json` lists exactly the
+   else. Every in-stage `join-cluster` gets the verdict of precondition 9: the baseline is taken before the first attempt
+   (the one that stops for approval), the verdict after the approved rerun has finished (receipt
+   `registry_convergence`). The driver asserts that `initial_deploy_target.gpu_clusters` in `bootstrap-state.json` lists exactly the
    clusters the first `deploy` was given (receipt `first_deploy_gpu_cluster_count`; `gpu_cluster_count` is the number of
    clusters the run manages) and, for every joined cluster, that `<STATE_DIR>/join-cluster/<arn_sha256_12>/state.json`
    ends in `phase=COMPLETED` (receipt `joins`, one entry per ARN; `profile_plan_approved` records the approved plan's
@@ -4943,7 +4979,8 @@ stages or after everything has finished, following the references below.
    `phase=COMPLETED` (the receipt's `journals` records one proof per ARN, in order, with the journal's own outcome counts
    under `journals[].ownership_release`) and, through `describe-nodegroup`/`describe-cluster`, that its node groups no
    longer carry `gpu-fault.io/control-plane=<site id>` (receipt `ownership_label_released`; a group still carrying it
-   fails the stage); after the last removal the site is in the
+   fails the stage), then gives the verdict of precondition 9 (receipt `registry_convergence`, one entry per removal in
+   order); after the last removal the site is in the
    zero-GPU-cluster CPU-only steady state (`BOOT-024` step 6). An `eks-managed` member goes through the same command (see the
    provider note of `BOOT-024`). The checklist is `BOOT-024` step 2 (all `completed_steps`:
    `DISCOVERED` → `CONTROL_REGISTRY_DRAINING` → `KUBERNETES_QUIESCED` →
@@ -4962,7 +4999,8 @@ stages or after everything has finished, following the references below.
    ```
 
    For every ARN the driver asserts that `<STATE_DIR>/join-cluster/<arn_sha256_12>/state.json` ends in
-   `phase=COMPLETED` (the receipt's `journals` records one proof per ARN); the command takes ARNs only. Before S3 acts
+   `phase=COMPLETED` (the receipt's `journals` records one proof per ARN), then gives the verdict of precondition 9
+   (receipt `registry_convergence`); the command takes ARNs only. Before S3 acts
    the driver puts the label S2 released back (`boot029_ownership.py reapply` reads the `OWNERSHIP_RELEASED` evidence of
    every `remove-cluster/<cluster_id>/state.json` and labels exactly the groups recorded `released` with the commands
    `site-id` prints -- EKS `addOrUpdateLabels`, HyperPod `update-cluster` with the full definition plus the key -- waiting
@@ -5036,7 +5074,7 @@ stages or after everything has finished, following the references below.
      cluster, and the site starts from `eks-v1`; the
      other provider's clusters are attached by the driver after the README command exits, the way the README states it
      -- the site-bound `<state-dir>/deployer-venv/bin/gpu-fault-admin join-cluster`, as in S1 (plan stop, approval,
-     rerun) -- and only when the README's deployment section states the sentence "a first `deploy`'s GPU clusters must
+     rerun, the verdict of precondition 9 around it) -- and only when the README's deployment section states the sentence "a first `deploy`'s GPU clusters must
      share one provider; the other provider joins afterwards with `join-cluster`" (receipt
      `mixed_site_join_documented`, `joined_gpu_cluster_count`, `ownership_label_documented`); without it the stage refuses and
      names the missing sentence. When the README deploy names plain EKS clusters, the README's deployment section must
@@ -5105,6 +5143,12 @@ stages or after everything has finished, following the references below.
   the outcome of `journals[].ownership_release`/`ownership_release` is `released`); before S3 and S5 the driver puts the
   label back on the groups the previous stage's journal released, with the `site-id` commands, and waits until the
   provider applies it (receipt `ownership_label_reapplied`); a cluster without release evidence is refused, not guessed;
+- After every S2 removal, the S3 join and, on a mixed site, every in-stage join of S1/S5, every Running CPU Pod reports
+  `secret_source=mounted-file`, `secret_drift=false` and `ready=true` within 180 s, the Pod UIDs and `restartCount`
+  recorded before the verb are unchanged, no Pod was added and no Pod template changed (the control-worker only by the
+  audited roll whose template changed in the failure-domain map digest alone, receipt `rolled_by_failure_domain_map`):
+  every `registry_convergence` entry is `PASS`; a product before the mounted Secret is `NOT_APPLICABLE` (recorded, not
+  judged);
 - Every administrator command's non-zero exit must propagate as a stage failure, and an old `COMPLETED` journal may not
   override the exit code; the schema-2 stage receipts bind this run's target, attempt and original journal baseline,
   and success is not guessed from the latest mtime. One run's private sequence lock may not be reused concurrently;
@@ -5132,7 +5176,11 @@ proof, original journal binding, snapshot policy, unexecuted companions and each
 carry `first_deploy_provider`/`joined_providers`, `first_deploy_gpu_cluster_count`, the per-ARN `joins` and
 `profile_plan_approved` (mixed site) and `first_deploy_already_complete` (a resume whose first deploy had finished);
 S2/S4 additionally carry `ownership_label_released` and the journals' `ownership_release`, S3/S5
-`ownership_label_reapplied` (node group names and journal paths appear only as sha256);
+`ownership_label_reapplied` (node group names and journal paths appear only as sha256); S2/S3 (and S1/S5 on a mixed
+site) additionally carry `registry_convergence` (one entry per verb: `sequence`, `operation`, the ARNs' 12-digit
+digests, `verdict`, `product_generation`, `window_seconds`/`poll_seconds`/`waited_seconds`, per Pod its name, UID,
+`secret_source`, `secret_drift`, `ready` and the two 12-digit configuration digests, `unchanged_roles`,
+`rolled_by_failure_domain_map`, `findings`);
 ARNs, e-mail address and directory paths appear in it only as sha256;
 S5 additionally has the `readme` receipt: the sha256 of the README and its two code blocks, `executed_lines` and
 `skipped_verification_lines` -- in which ARNs, e-mail address and directories are replaced by `sha256:<digest>` --
@@ -5162,6 +5210,10 @@ durations are kept only in the driver's private JSON and do not enter this docum
 - Every S5 attempt re-runs `make deploy-host-setup-online` (rebuilding the venv in a new pristine copy and fetching
   dependencies online); its duration counts towards that attempt; the README does not describe an offline bundle route,
   and S5 does not take one.
+- The verdict of precondition 9 reads only the CPU Pods' `/healthz` and the Pod/Deployment inventory: that the Secret
+  itself agrees with the durable head is still checked by the `BOOT-023` probe and the perf registry gate, and that the
+  rolled control-worker's failure-domain map matches the complete Node set is still checked by `BOOT-019`
+  (`membership_observation`).
 
 ##### Cleanup
 

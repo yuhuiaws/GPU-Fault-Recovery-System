@@ -196,7 +196,7 @@ shape (`registry-secret-restore.json` records `byte_identical`).
 An alignment check runs once before registration and once after teardown, writing
 `registry-alignment-preflight.json` / `registry-alignment-postflight.json`: the Secret's
 configuration digest must equal the durable head's configuration digest, and every Running
-`gpu-fault-api-ha` replica's `/healthz?verbose=1` must report
+`gpu-fault-api-ha` replica that is not terminating must report on `/healthz?verbose=1`
 `regional_registry.secret_drift=false`. Misalignment before registration refuses the run (the
 drift is not attributed to this round); misalignment after teardown fails this round's cleanup
 and lists the differences and drifted replicas field by field. When the Secret and the head
@@ -206,7 +206,9 @@ join/remove just rewrote) into the Pod: the check re-reads every 10 s for at mos
 (report field `mounted_convergence_seconds`), passes once it converges and restarts nothing;
 only a drift past that bound fails. A replica of a release that compares its start-up copy (no
 `secret_source`, or `startup-environment`) is not waited for and keeps the old rule (a rolling
-restart only for replicas started after the preflight check).
+restart only for replicas started after the preflight check). The BOOT-029 lifecycle driver reuses
+this reader and bound for every CPU runtime role after each `join-cluster`/`remove-cluster`
+(precondition 9 of that case).
 
 ### 3.3 Store-State Prerequisite: Steady State Defined by Store Metrics, Optimistic Bound and Layout Record
 

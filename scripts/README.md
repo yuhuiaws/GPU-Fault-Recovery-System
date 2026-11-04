@@ -55,13 +55,17 @@ generic fault-case runner.
   architecture, contracts, safety, deployment/config, docs, YAML and Shell.
   The same runner backs local `make check` and the production fallback.
 - `scripts/acceptance/`: administrator-run acceptance drivers that call only
-  the public `gpu-fault-admin` verbs plus `docker`/`aws`
+  the public `gpu-fault-admin` verbs plus `docker`/`aws` and read-only
+  `kubectl` on the CPU cluster
   (`admin-lifecycle-sequence.sh` runs GF-REGIONAL-BOOT-029: cold first deploy,
   remove-cluster, join-cluster, uninstall keep + reset-database, cold first
   deploy again, stopping at the first failing stage; on a mixed HyperPod +
   plain-EKS site each first deploy names one provider's clusters and joins the
   other provider inside the stage, approving its Runtime Profile plan -- stage
-  1 leads with the first ARN's provider, stage 5 with the other one).
+  1 leads with the first ARN's provider, stage 5 with the other one; after
+  every join-cluster and remove-cluster every CPU Pod must compare the mounted
+  registry Secret without drift and no CPU Pod may have restarted,
+  `scripts/e2e/regional/boot029_registry_drift.py`).
 - `scripts/e2e/regional/`: regional acceptance drivers, probes, boot guards,
   recovery helpers and test-only Kubernetes inputs.
 - `scripts/e2e/hyperpod/`: focused HyperPod scenario runners.

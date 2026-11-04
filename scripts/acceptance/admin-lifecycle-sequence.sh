@@ -91,6 +91,23 @@
 # which resumes it on the verdict it started with. The driver never passes
 # --accept-unsynchronized-registry.
 #
+# Registry convergence. join-cluster and remove-cluster rewrite the registry
+# Secret and publish the durable head without restarting the CPU control
+# plane. Around every join-cluster (stage 3, and the in-stage joins of stages 1
+# and 5 on a mixed site) and every stage-2 remove-cluster the driver reads the
+# CPU cluster, read-only, with the site's own kubeconfig
+# (scripts/e2e/regional/boot029_registry_drift.py): right before the verb the
+# CPU runtime Deployments and their Pods (UIDs, restart counts, Pod
+# templates); right after it every Running CPU Pod's /healthz -- within the
+# perf registry gate's 180 s window for kubelet to re-project the mounted
+# Secret, each must report secret_source=mounted-file, secret_drift=false and
+# ready=true -- and the Pods again: none replaced or restarted, no template
+# changed, except the control-worker's audited roll for a new failure-domain
+# map digest. A product without secret_source in /healthz (it predates the
+# mounted Secret) is recorded NOT_APPLICABLE, not failed. Each verdict goes to
+# the stage receipt (registry_convergence) and the stage log, with digests cut
+# to 12 hex digits, Pod names and UIDs only.
+#
 # Every admin command runs in the foreground and the next stage starts only
 # after it has exited. The first failing stage stops the run and prints its
 # number so `--stage N` can resume. Wall time and the sha256 of each stage's log
@@ -331,6 +348,24 @@ assert_registry_synchronized() {  # VERB [GPU_ARN]: before a deletion verb, the 
   printf '%s\n' "$verdict" >>"$STAGE_LOG"
 }
 
+registry_baseline() {  # STATE_DIR VERB: right before a join/remove, the CPU runtime Deployments and Pods as they stand (read-only kubectl)
+  local reason
+  reason="$(python3 -m scripts.e2e.regional.boot029_registry_drift baseline --state "$1" \
+    --operation "$2" --out "${STAGE_LOG}.registry-baseline.json" 2>>"$STAGE_LOG")" ||
+    fail "${reason:-the CPU Pods could not be read before $2; see the stage log}"
+}
+
+assert_registry_converged() {  # STATE_DIR VERB GPU_ARN...: right after it, every CPU Pod compares the mounted Secret without drift (bounded wait) and none restarted
+  local state="$1" verb="$2" verdict arns=() arn
+  shift 2
+  for arn in "$@"; do arns+=(--gpu-arn "$arn"); done
+  verdict="$(python3 -m scripts.e2e.regional.boot029_registry_drift check --state "$state" \
+    --operation "$verb" --baseline "${STAGE_LOG}.registry-baseline.json" \
+    --receipt "${STAGE_LOG}.extra.json" ${arns[@]+"${arns[@]}"} 2>>"$STAGE_LOG")" ||
+    fail "registry convergence ${verdict:-check after ${verb} failed; see the stage log}"
+  log "registry convergence ${verdict}"
+}
+
 reapply_ownership_labels() {  # STATE_DIR: before a re-join/re-deploy, the label goes back on the groups the previous stage's journal released (operator credentials, site-id commands)
   local report
   report="$(python3 -m scripts.e2e.regional.boot029_ownership reapply --cpu-arn "$CPU_ARN" "${GPU_RECEIPT_ARGS[@]}" \
@@ -449,7 +484,9 @@ join_remaining_providers() {  # STATE_DIR: one join-cluster per further provider
         group+=("${JOINED_GPU_ARNS[$index]}")
       fi
     done
+    registry_baseline "$1" join-cluster
     run_join_with_profile_approval "$1" "$provider" "${group[@]}"
+    assert_registry_converged "$1" join-cluster "${group[@]}"
   done
 }
 
@@ -519,25 +556,29 @@ removal_order() {  # REMOVAL_ARNS: every other provider's clusters first, the re
   done
 }
 
-stage_2() {  # one ARN at a time in removal_order; every removed cluster's journal is asserted and its label gone
+stage_2() {  # one ARN at a time in removal_order; every removed cluster's journal is asserted, its label gone and the CPU Pods converged
   local removed=()
   discover_gpu_providers
   removal_order
   for arn in "${REMOVAL_ARNS[@]}"; do
     assert_registry_synchronized remove-cluster "$arn"
+    registry_baseline "$STATE_DIR" remove-cluster
     run_admin remove-cluster --state-dir "$STATE_DIR" --gpu-cluster-arn "$arn" \
       --confirm REMOVE_GPU_CLUSTER
     removed+=("$arn")
     assert_current_journal "$STATE_DIR" "${removed[@]}"
     assert_ownership_released "$arn"
+    assert_registry_converged "$STATE_DIR" remove-cluster "$arn"
   done
 }
 
-stage_3() {  # one join-cluster for every GPU cluster; one journal per ARN
+stage_3() {  # one join-cluster for every GPU cluster; one journal per ARN; the CPU Pods converged
   reapply_ownership_labels "$STATE_DIR"
   assert_ownership_labels
+  registry_baseline "$STATE_DIR" join-cluster
   run_admin join-cluster --state-dir "$STATE_DIR" "${GPU_ARN_ARGS[@]}"
   assert_current_journal "$STATE_DIR"
+  assert_registry_converged "$STATE_DIR" join-cluster "${GPU_ARNS[@]}"
 }
 
 stage_4() {

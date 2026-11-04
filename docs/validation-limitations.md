@@ -6328,3 +6328,27 @@ Not verified:
   dropped, the Secret holds one token (the old one until
   `CONTROL_PLANE_ROLLED`, the new one after) while the head holds both
   digests, so `secret_drift` is true for that time, as before.
+
+The BOOT-029 lifecycle driver never asserted the "no drift, Pod UIDs
+unchanged" the BOOT-019/024/025 checklists require after a join or remove,
+which is why the drift above surfaced only in a manual check after its
+stage 5. Around every join-cluster and remove-cluster it now reads the CPU
+cluster read-only (`scripts/e2e/regional/boot029_registry_drift.py`, case
+precondition 9): every Running CPU Pod of the three roles must report
+`secret_source=mounted-file`, `secret_drift=false` and `ready=true` within
+the perf gate's 180 s bound, and no CPU Pod may be replaced or restarted
+except the control-worker's roll for a new failure-domain map digest. A
+product without `secret_source` is recorded `NOT_APPLICABLE`, not failed.
+
+- Proven locally: `tests/regional/test_admin_lifecycle_sequence_registry_drift.py`
+  (the driver against a fake CPU plane: drift that clears inside the window
+  passes, drift past it fails naming the Pod, a replaced Pod fails, a worker
+  roll without a new map digest fails, an older product is recorded not
+  judged, an unreadable plane stops the stage before the verb, the in-stage
+  joins of a mixed site are judged) and `tests/regional/test_boot029_registry_drift.py`
+  (each rule, the receipt and the fail-closed paths).
+- Not verified: no BOOT-029 sequence has run with the check. The control-worker
+  rolling for every membership change (its map document gains or loses a
+  cluster key) is read from `failure_domain_map.py`, not observed live; the
+  operator identity's `pods/exec` on the CPU cluster is assumed (the perf gate
+  and BOOT-023 exec into the same Pods).

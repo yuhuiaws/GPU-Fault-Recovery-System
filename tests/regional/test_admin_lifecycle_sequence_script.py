@@ -28,6 +28,7 @@ from pathlib import Path
 import pytest
 
 from scripts.e2e.regional import boot029_readme
+from tests.regional._admin_lifecycle_cpu_plane import FAKE_KUBECTL
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "acceptance" / "admin-lifecycle-sequence.sh"
@@ -130,6 +131,9 @@ elif mode in {"synced", "failed"}:
             "error": "fixture registry sync failed"}
     write_outcome(state, release_id="fixture-release", outcome=outcome)
 PY
+    # The site records its CPU control plane (the registry drift check reads it).
+    printf '{"spec": {"namespace": "gpu-fault-system", "cpu": {"kubeconfig": "%s/cpu.kubeconfig"}}}' \\
+      "$state_dir" > "$state_dir/site.yaml"
     ;;
   remove-cluster)
     python3 - "$state_dir" <<'PY'
@@ -266,6 +270,11 @@ if not keep:
 PY
     ;;
 esac
+# A completed membership change is one epoch of the fake CPU plane.
+if [[ "$verb" == join-cluster || "$verb" == remove-cluster ]]; then
+  epoch="${FAKE_TOOL_LOG%/*}/registry-epoch"
+  echo "$(( $(cat "$epoch" 2>/dev/null || echo 0) + 1 ))" > "$epoch"
+fi
 if [[ "$verb" == "${FAKE_ADMIN_FAIL_AFTER_WRITE:-}" ]]; then exit 17; fi
 """
 
@@ -470,6 +479,7 @@ def _install_fakes(tmp_path: Path) -> dict[str, str]:
         ("gpu-fault-admin", FAKE_ADMIN),
         ("docker", FAKE_DOCKER),
         ("aws", FAKE_AWS),
+        ("kubectl", FAKE_KUBECTL),
     ):
         path = fake_bin / name
         path.write_text(body, encoding="utf-8")

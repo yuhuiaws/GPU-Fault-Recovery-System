@@ -14,6 +14,10 @@ and prove the control plane agrees.
   sees a Secret rewrite only after kubelet re-projects the volume, so while
   Secret and head agree such a replica gets a bounded wait to converge; a
   replica that compares its start-up copy never converges by itself.
+
+The BOOT-029 lifecycle driver reuses the reader and the bounded wait for every
+CPU runtime role after each join-cluster/remove-cluster
+(``scripts/e2e/regional/boot029_registry_drift.py``).
 """
 
 from __future__ import annotations
@@ -22,7 +26,7 @@ import hashlib
 import json
 import time
 from datetime import datetime, timezone
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +61,7 @@ SECRET_BASELINE_FILE = "registry-secret-baseline.json"
 # although Secret and head agree. Teardown reconciles exactly those replicas
 # with a rolling restart of the Deployment.
 API_DEPLOYMENT = "deployment/gpu-fault-api-ha"
+API_APP = "gpu-fault-api-ha"
 ROLLOUT_TIMEOUT = "600s"
 # A replica of a release that mounts the registry Secret compares the Secret
 # as kubelet last projected it, not the copy it started from: kubelet
@@ -145,20 +150,29 @@ def baseline_serialization(
 
 def api_replica_registry_health(
     control: Callable[..., str],
+    *,
+    apps: Sequence[str] = (API_APP,),
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """``(replicas, skipped)``: ``regional_registry`` from ``/healthz?verbose=1``
-    of every Running api-ha replica, and the Pods not Running (not asked)."""
+    of every Running replica of ``apps`` (the ``app`` label; api-ha unless the
+    caller names more roles), and the Pods not asked: not Running, or
+    terminating (a replaced replica on its way out answers for nobody)."""
 
-    inventory = json.loads(
-        control("get", "pod", "-l", "app=gpu-fault-api-ha", "-o", "json")
-    )
+    if not apps:
+        raise ValueError("no CPU role to read")
+    selector = f"app={apps[0]}" if len(apps) == 1 else f"app in ({','.join(apps)})"
+    inventory = json.loads(control("get", "pod", "-l", selector, "-o", "json"))
     replicas: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     for item in inventory.get("items", []):
-        name = str(item["metadata"]["name"])
+        metadata = item["metadata"]
+        name = str(metadata["name"])
         phase = (item.get("status") or {}).get("phase")
-        if phase != "Running":
-            skipped.append({"pod": name, "phase": phase})
+        if phase != "Running" or metadata.get("deletionTimestamp"):
+            entry = {"pod": name, "phase": phase}
+            if metadata.get("deletionTimestamp"):
+                entry["terminating"] = True
+            skipped.append(entry)
             continue
         containers = (item.get("spec") or {}).get("containers") or [{}]
         ports = containers[0].get("ports") or [{}]
@@ -175,14 +189,20 @@ def api_replica_registry_health(
         replicas.append(
             {
                 "pod": name,
+                "app": (metadata.get("labels") or {}).get("app"),
+                "uid": metadata.get("uid"),
                 "phase": phase,
-                "created_at": item["metadata"].get("creationTimestamp"),
+                "created_at": metadata.get("creationTimestamp"),
                 "http_status": answer.get("http_status"),
                 "ready": registry_state.get("ready"),
                 "secret_drift": registry_state.get("secret_drift"),
                 "secret_config_sha256": registry_state.get("secret_config_sha256"),
-                # Absent on a release older than the mounted Secret.
+                # Absent on a release older than the mounted Secret: the key
+                # itself, not its value, tells the product generation.
                 "secret_source": registry_state.get("secret_source"),
+                "secret_source_reported": "secret_source" in registry_state,
+                "secret_error": registry_state.get("secret_error"),
+                "durable_config_sha256": registry_state.get("durable_config_sha256"),
             }
         )
     return replicas, skipped
@@ -213,6 +233,7 @@ def await_mounted_convergence(
     replicas: list[dict[str, Any]],
     skipped: list[dict[str, Any]],
     *,
+    apps: Sequence[str] = (API_APP,),
     timeout_seconds: float = MOUNTED_CONVERGENCE_SECONDS,
     poll_seconds: float = MOUNTED_CONVERGENCE_POLL_SECONDS,
     sleep: Callable[[float], None] = time.sleep,
@@ -220,14 +241,17 @@ def await_mounted_convergence(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], float]:
     """Re-read the replicas while a mounted one still drifts, bounded.
 
-    Called only when Secret and head agree: the mounted Secret then converges
-    on the head by itself. Returns the last reading and the seconds waited.
+    Called when Secret and head agree -- the perf gate checks that first; after
+    a BOOT-029 join or remove the verb has just published both, and a
+    disagreement only costs the whole bound before the drift fails: the
+    mounted Secret then converges on the head by itself. Returns the last
+    reading and the seconds waited.
     """
 
     started = monotonic()
     while _converging(replicas) and monotonic() - started < timeout_seconds:
         sleep(poll_seconds)
-        replicas, skipped = api_replica_registry_health(control)
+        replicas, skipped = api_replica_registry_health(control, apps=apps)
     return replicas, skipped, round(monotonic() - started, 3)
 
 
