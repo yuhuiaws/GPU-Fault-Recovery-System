@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 from collections.abc import Iterator
+from datetime import timedelta
 from threading import Event
 from types import SimpleNamespace
 from typing import Any
@@ -30,6 +31,7 @@ from gpu_fault.departed_nodes import (
 )
 from gpu_fault.fleet import AgentLifecycleState
 from gpu_fault.models import IncidentState, WorkflowStatus
+from gpu_fault.regional import RegionalClusterLifecycle
 from gpu_fault.store import PostgresStore
 from gpu_fault.store.shared import departed_nodes as shared_departed_nodes
 from gpu_fault_release import regional_release_probes as PROBES
@@ -40,12 +42,15 @@ from tests.departed_nodes._support import (
     HP_CLUSTER,
     HP_NODE,
     HP_PRESENT,
+    CleanupClock,
+    agent,
     ago,
     blocked_never_changed,
     eks_departure,
     hyperpod_departure,
     inventory_report,
     pending_never_dispatched,
+    publish_registry,
     registration,
     world,
 )
@@ -321,3 +326,58 @@ def test_an_accepted_alias_is_cleaned_on_postgres(store: PostgresStore) -> None:
             WorkflowStatus.SUPERSEDED
         ), suffix
     assert world_.provider.calls == [], "nothing is ever put to the provider"
+
+
+def test_a_removal_and_a_rejoin_mail_nobody_on_postgres(store: PostgresStore) -> None:
+    """remove-cluster's registry revisions, then a re-join's, published through
+    the store production runs (batch 249): no ledger line and no notification
+    at any step. The purge keeps the Agent rows -- what a re-join finds -- and
+    the PENDING join does not judge them."""
+
+    world_ = world(store)
+    nodes = [f"hyperpod-i-0b00000{index}" for index in (1, 2, 3)]
+    drained_at = ago(minutes=40)
+    clock = CleanupClock(drained_at)
+    world_.cleanup.now = clock
+    publish_registry(store, registration(HP_CLUSTER), reason="deploy")
+    for minute in range(15, -1, -1):
+        world_.report(HP_CLUSTER, nodes, at=drained_at - timedelta(minutes=minute))
+    for index, node in enumerate(nodes, start=1):
+        store.save_agent(
+            agent(
+                HP_CLUSTER,
+                node,
+                instance_id=f"node-uid-{index}",
+                last_seen=drained_at + timedelta(minutes=4),
+                lease_seconds=90,
+            )
+        )
+    seen = []
+    for lifecycle, minutes in (
+        (RegionalClusterLifecycle.DRAINING, 6),
+        (RegionalClusterLifecycle.DRAINING, 15),
+        (RegionalClusterLifecycle.REVOKED, 16),
+        (None, 17),
+        (RegionalClusterLifecycle.PENDING, 30),
+    ):
+        publish_registry(
+            store,
+            *(
+                []
+                if lifecycle is None
+                else [registration(HP_CLUSTER, lifecycle=lifecycle)]
+            ),
+            reason=f"{HP_CLUSTER} {lifecycle or 'purged'}",
+        )
+        clock.at = drained_at + timedelta(minutes=minutes)
+        seen.extend(world_.cleanup.run_once())
+        if lifecycle is None:
+            assert [item.node_id for item in store.list_agents(HP_CLUSTER)] == nodes
+
+    assert world_.notifications.sent == [], "a removal and a join are no departure"
+    assert seen == [], [(item.node_id, item.blocker_classes) for item in seen]
+    assert store.list_departed_node_cleanups() == []
+    assert dict(world_.cleanup.refusals_total) == {}
+    assert [item.lifecycle_state for item in store.list_regional_clusters()] == [
+        RegionalClusterLifecycle.PENDING
+    ]

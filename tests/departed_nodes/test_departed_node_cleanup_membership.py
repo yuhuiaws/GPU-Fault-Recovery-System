@@ -23,7 +23,7 @@ exactly as before.
 from __future__ import annotations
 
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Any
 
 import pytest
@@ -37,13 +37,8 @@ from gpu_fault.departed_nodes import DepartedNodeCleanupStatus
 from gpu_fault.fleet import AgentLifecycleState
 from gpu_fault.kubernetes_node_inventory import NODE_INVENTORY_PATH
 from gpu_fault.models import IncidentState, WorkflowStatus, WorkflowStepStatus
-from gpu_fault.regional import (
-    RegionalClusterLifecycle,
-    RegionalClusterRegistration,
-    RegionalRegistryRevision,
-)
+from gpu_fault.regional import RegionalClusterLifecycle
 from gpu_fault.regional_registry_runtime import regional_cluster_request_allowed
-from gpu_fault.store import NotFoundError
 from gpu_fault_release.regional_admin_checks_coverage import departed_node_lines
 from tests._builders import build_store, workflow_step_execution
 from tests.departed_nodes._support import (
@@ -53,12 +48,14 @@ from tests.departed_nodes._support import (
     HP_NAME,
     HP_NODE,
     PLUGIN,
+    CleanupClock,
     World,
     agent,
     ago,
     eks_departure,
     hyperpod_departure,
     now,
+    publish_registry,
     registration,
     world,
 )
@@ -83,37 +80,6 @@ def _members(provider: str) -> tuple[str, list[tuple[str, str]]]:
         (f"ip-10-0-50-{index}.us-west-2.compute.internal", f"i-0e0000b{index}")
         for index in (1, 2, 3)
     ]
-
-
-def _publish(
-    store: Any, *registrations: RegionalClusterRegistration, reason: str
-) -> None:
-    """One registry revision, as the release publishes it: it replaces the set."""
-
-    try:
-        generation = store.get_regional_registry_head().generation
-    except NotFoundError:
-        generation = 0
-    store.publish_regional_registry_revision(
-        RegionalRegistryRevision.build(
-            generation=generation + 1,
-            registrations=list(registrations),
-            previous_generation=generation or None,
-            required_member_ids=[],
-            reason=reason,
-        ),
-        expected_generation=generation,
-    )
-
-
-class Clock:
-    """The cleanup's clock; the store keeps the times its records were written."""
-
-    def __init__(self, at: datetime) -> None:
-        self.at = at
-
-    def __call__(self) -> datetime:
-        return self.at
 
 
 def _status_lines(store: Any) -> list[str]:
@@ -182,9 +148,11 @@ def test_remove_cluster_mails_nobody_and_leaves_no_ledger_line(provider: str) ->
     cluster_id, members = _members(provider)
     nodes = [node for node, _ in members]
     drained_at = ago(minutes=40)
-    clock = Clock(drained_at)
+    clock = CleanupClock(drained_at)
     world_.cleanup.now = clock
-    _publish(store, registration(cluster_id, provider=provider), reason="deploy")
+    publish_registry(
+        store, registration(cluster_id, provider=provider), reason="deploy"
+    )
     # The executor's reports up to the drain; the next one is refused (423).
     for minute in range(15, -1, -1):
         world_.report(cluster_id, nodes, at=drained_at - timedelta(minutes=minute))
@@ -203,7 +171,7 @@ def test_remove_cluster_mails_nobody_and_leaves_no_ledger_line(provider: str) ->
         )
     assert world_.cleanup.run_once() == [], "live Agents in a fresh report"
 
-    _publish(
+    publish_registry(
         store,
         registration(cluster_id, provider=provider, lifecycle=DRAINING),
         reason=f"remove {cluster_id} draining",
@@ -216,14 +184,14 @@ def test_remove_cluster_mails_nobody_and_leaves_no_ledger_line(provider: str) ->
         clock.at = drained_at + timedelta(minutes=minutes)
         seen.extend(world_.cleanup.run_once())
         status_during_removal.extend(_status_lines(store))
-    _publish(
+    publish_registry(
         store,
         registration(cluster_id, provider=provider, lifecycle=REVOKED),
         reason=f"remove {cluster_id} revoked",
     )
     clock.at = drained_at + timedelta(minutes=16)
     seen.extend(world_.cleanup.run_once())
-    _publish(store, reason=f"remove {cluster_id} purged")
+    publish_registry(store, reason=f"remove {cluster_id} purged")
     clock.at = drained_at + timedelta(minutes=17)
     seen.extend(world_.cleanup.run_once())
 
@@ -262,7 +230,7 @@ def test_a_rejoin_over_the_old_records_mails_nobody_until_a_real_departure() -> 
             )
         )
     world_.provider.hyperpod[HP_NAME] = {"i-0b000001", "i-0b000002"}
-    _publish(
+    publish_registry(
         store,
         registration(HP_CLUSTER, lifecycle=PENDING),
         reason=f"join {HP_CLUSTER} pending",
@@ -286,7 +254,7 @@ def test_a_rejoin_over_the_old_records_mails_nobody_until_a_real_departure() -> 
     assert store.list_departed_node_cleanups() == []
     assert world_.cleanup.refusals_total == Counter()
 
-    _publish(
+    publish_registry(
         store,
         registration(HP_CLUSTER, lifecycle=ACTIVE),
         reason=f"join {HP_CLUSTER} active",
@@ -414,13 +382,13 @@ def test_a_line_from_before_the_drain_stays_as_it_was_until_the_cluster_leaves()
     status_before = _status_lines(store)
     gauges_before = _open_nodes(store)
 
-    _publish(
+    publish_registry(
         store,
         registration(HP_CLUSTER, lifecycle=DRAINING),
         reason=f"remove {HP_CLUSTER} draining",
     )
     assert world_.cleanup.run_once() == []
-    _publish(
+    publish_registry(
         store,
         registration(HP_CLUSTER, lifecycle=REVOKED),
         reason=f"remove {HP_CLUSTER} revoked",
@@ -439,7 +407,7 @@ def test_a_line_from_before_the_drain_stays_as_it_was_until_the_cluster_leaves()
     ]
     assert world_.cleanup.refusals_total == Counter({"workflow_changed_node": 1})
 
-    _publish(store, reason=f"remove {HP_CLUSTER} purged")
+    publish_registry(store, reason=f"remove {HP_CLUSTER} purged")
     assert world_.cleanup.run_once() == []
     assert store.list_departed_node_cleanups() == [], "gone with the registration"
     assert len(world_.notifications.sent) == 1

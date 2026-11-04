@@ -28,7 +28,12 @@ from gpu_fault.models import (
     WorkflowStatus,
 )
 from gpu_fault.orchestration.incident_closure import IncidentClosureService
-from gpu_fault.regional import RegionalClusterLifecycle, RegionalClusterRegistration
+from gpu_fault.regional import (
+    RegionalClusterLifecycle,
+    RegionalClusterRegistration,
+    RegionalRegistryRevision,
+)
+from gpu_fault.store import NotFoundError
 from tests._builders import fault_incident, workflow_request, workflow_step
 
 HP_CLUSTER = "gpu-hyperpod"
@@ -69,6 +74,39 @@ def registration(
         lifecycle_state=lifecycle,
         agent_endpoint_allowed_cidrs=["10.0.0.0/16"],
     )
+
+
+def publish_registry(
+    store: Any, *registrations: RegionalClusterRegistration, reason: str
+) -> None:
+    """One registry revision, as the release publishes it: it replaces the set
+    (a cluster left out is purged; its Agent records stay)."""
+
+    try:
+        generation = store.get_regional_registry_head().generation
+    except NotFoundError:
+        generation = 0
+    store.publish_regional_registry_revision(
+        RegionalRegistryRevision.build(
+            generation=generation + 1,
+            registrations=list(registrations),
+            previous_generation=generation or None,
+            required_member_ids=[],
+            reason=reason,
+        ),
+        expected_generation=generation,
+    )
+
+
+class CleanupClock:
+    """The cleanup's clock (``DepartedNodeCleanup.now``), moved by the test;
+    the store keeps the times its records were written."""
+
+    def __init__(self, at: datetime) -> None:
+        self.at = at
+
+    def __call__(self) -> datetime:
+        return self.at
 
 
 def agent(
