@@ -901,6 +901,9 @@ rules:
       - tests/policy
       - tests/nvidia_logs
       - tests/test_efa_kernel_log.py
+      # The EFA vocabulary end to end: the node collector ships a renamed
+      # device's line and the control plane quarantines on it (batch 251).
+      - tests/execution/test_general_health_policy_e2e.py
       # host_health.py's own rules: the sustained host-resource windows, the
       # managed-attempt gate and its per-attempt scope (batch 140).
       - tests/host_health

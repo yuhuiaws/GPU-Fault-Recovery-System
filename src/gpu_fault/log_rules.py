@@ -120,13 +120,15 @@ NODE_LOG_RULES = (
         ALL_LOG_SOURCES,
     ),
     # EFA prints no "link down" / "fatal error" line; what means a dead device
-    # is its admin queue -- "Admin queue is closed", "Wait for completion
-    # (polling) timeout", "The device didn't send any completion ...", a failed
-    # reset handshake. The reviewed vocabulary, quoted from Linux
-    # v6.1.188/v6.12.103 and amzn-drivers r3.4.0, lives in
-    # ``gpu_fault.efa_kernel_log``; the kernel's spelling is fixed, so that part
-    # is case-sensitive. Other fabrics keep the keyword form: a line naming
-    # RDMA/InfiniBand with a fatal/error/timeout/link-down word.
+    # is its admin queue -- "Admin queue is closed", "The device didn't send any
+    # completion ...", "Failed to process command ... err -62" (-ETIME), a
+    # failed reset handshake -- under whatever name the ib device has now
+    # (``efa_N``, or ``rdmap<bus>s<slot>`` after rdma-core's udev rename). The
+    # reviewed vocabulary, quoted from Linux v6.1.189/v6.12.103 and amzn-drivers
+    # efa_linux_3.3.1/3.4.0, lives in ``gpu_fault.efa_kernel_log``; the kernel's
+    # spelling is fixed, so that part is case-sensitive. Other fabrics keep the
+    # keyword form: a line naming RDMA/InfiniBand with a
+    # fatal/error/timeout/link-down word.
     NodeLogRule(
         re.compile(
             rf"(?-i:{EFA_FATAL_REGEX})|"

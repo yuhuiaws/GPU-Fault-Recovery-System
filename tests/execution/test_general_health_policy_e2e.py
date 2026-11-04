@@ -52,9 +52,16 @@ def rig(tmp_path, monkeypatch):
         # ``efa_com_submit_admin_cmd()``: every admin command fails once the
         # queue is closed (gpu_fault.efa_kernel_log).
         "efa 0000:00:1d.0 efa_0: Admin queue is closed",
+        # The same line on a live node: rdma-core's udev rule renamed the ib
+        # device after its PCI location (``rdmap<bus>s<slot>``).
+        "efa 0000:55:00.0 rdmap85s0: Admin queue is closed",
+        # amzn-drivers 3.3.1g ``efa_com_cmd_exec()`` after an admin command
+        # timed out: -ETIME is -62.
+        "efa 0000:6e:00.0 rdmap110s0: Failed to process command GET_STATS "
+        "(opcode 13) err -62",
         "kernel panic",
     ],
-    ids=["mce", "storage", "rdma", "lockup"],
+    ids=["mce", "storage", "rdma", "rdma-renamed", "rdma-timeout", "lockup"],
 )
 def test_fatal_host_log_stops_the_owned_attempt_before_quarantine(rig, message):
     result = rig.log(message)
@@ -69,12 +76,18 @@ def test_fatal_host_log_stops_the_owned_attempt_before_quarantine(rig, message):
     )
 
 
-def test_degraded_efa_log_runs_read_only_fabric_diagnostics(rig):
+@pytest.mark.parametrize(
+    "device",
+    ["efa 0000:00:1d.0 efa_0", "efa 0000:55:00.0 rdmap85s0"],
+    ids=["registered", "renamed"],
+)
+def test_degraded_efa_log_runs_read_only_fabric_diagnostics(rig, device):
     # ``efa_com_handle_single_admin_completion()``: the device answered with a
     # command id the driver never issued. The driver keeps running, so the
-    # product looks at the fabric and hands the evidence over, nothing more.
+    # product looks at the fabric and hands the evidence over, nothing more --
+    # under the registered name and the one rdma-core's udev rule gave it.
     result = rig.log(
-        "efa 0000:00:1d.0 efa_0: Received completion with unexpected command "
+        f"{device}: Received completion with unexpected command "
         "id[7], sq producer: 12, sq consumer: 11, cq consumer: 11"
     )
     [finding] = result["findings"]

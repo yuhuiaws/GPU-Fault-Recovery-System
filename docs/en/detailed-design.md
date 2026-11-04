@@ -1724,14 +1724,23 @@ then picks the stronger action by the global RecoveryAction rank; on a complete 
 critical quarantine, not the memory warning that matched first.
 
 The RDMA log rules grade what the EFA driver really prints; the vocabulary and its quotes live in `efa_kernel_log.py`
-(Linux v6.1.188 / v6.12.103 `drivers/infiniband/hw/efa/` `efa_com.c`, `efa_main.c`, `efa_com_cmd.c`, `efa_verbs.c`;
-amzn-drivers r3.4.0 `kernel/linux/efa/src`; the line prefix is `__ibdev_printk()` in `drivers/infiniband/core/device.c`,
-`"%s %s %s: %pV"`, i.e. `efa <PCI BDF> efa_N: `, a device not yet registered at probe time prints `(null): `,
-`dev_err(&pdev->dev)` prints `efa <PCI BDF>: `). The fatal vocabulary -- the admin queue no longer answers / is closed /
-the reset handshake failed: `Wait for completion (polling) timeout`, `The device didn't send any completion for admin cmd`,
-`The device sent a completion but the driver didn't receive any MSI-X interrupt`, `Admin queue is closed`, `Failed to submit
-command`, `Failed to process command` only with `err -110`, `Reading register timed out`, `Device isn't ready, abort com init` /
-`can't reset device`, `Reset indication didn't turn on|off` -- keeps CRITICAL/`QUARANTINE` (`SITE_KERNEL_LOG`); the degraded
+(Linux v6.1.189 / v6.12.103 `drivers/infiniband/hw/efa/` `efa_com.c`, `efa_main.c`, `efa_com_cmd.c`, `efa_verbs.c`;
+amzn-drivers `kernel/linux/efa/src` at tags `efa_linux_3.3.1` / `efa_linux_3.4.0` -- the plain-EKS nodes load the out-of-tree
+`extra/efa.ko` 3.3.1g, and 3.4.0 keeps every print text; the line prefix is `__ibdev_printk()` in
+`drivers/infiniband/core/device.c`, `"%s %s %s: %pV"`, i.e. `efa <PCI BDF> <ib device>: `, a device not yet registered at probe
+time prints `(null): `, `dev_err(&pdev->dev)` prints `efa <PCI BDF>: `). The ib device is registered as `efa_N`, and rdma-core's
+udev rule `rdma_rename %k NAME_FALLBACK` (`rdma-persistent-naming.rules`) renames it at once after its PCI location,
+`rdmap<bus>s<slot>` (`rdma_rename.c` `by_pci()`; `0000:55:00.0` → `rdmap85s0`); `ib_device_rename()` renames the very name
+`__ibdev_printk()` prints, so every runtime line of a live node on both clusters carries `rdmap…`, and the prefix accepts any
+device name without whitespace or a colon. The fatal vocabulary -- the admin queue no longer answers / is closed / the reset
+handshake failed: `The device didn't send any completion for admin cmd`, `The device sent a completion but the driver didn't
+receive any MSI-X interrupt`, `Wait for completion (polling) timeout` (no source runs an admin command in polling mode, so no
+node prints it at runtime), `Admin queue is closed`, `Failed to submit command`, `Failed to process command` only with
+`err -62` (-ETIME, `include/uapi/asm-generic/errno.h` `#define ETIME 62`; -110 is ETIMEDOUT, which no EFA admin path returns),
+the out-of-tree `Completion context[…] is used[…]` (`efa_com_cmd_exec()` then closes the admin queue and prints nothing more;
+the in-tree `… is occupied` stays degraded because the same call prints the fatal `Failed to submit command … err -22` right
+after it), `Reading register timed out`, `Device isn't ready, abort com init` / `can't reset device`, `Reset indication didn't
+turn on|off` -- keeps CRITICAL/`QUARANTINE` (`SITE_KERNEL_LOG`); the degraded
 vocabulary -- unexpected or checksum-failed completions, EQ/CQ anomalies, unknown events, version / DMA width / MSI-X / BAR / irq
 probe failures, probe-time attribute queries -- is graded WARNING/`RUN_DIAGNOSTICS` by a second RDMA rule (`SITE_APPLICATION_LOG`:
 FREEZE_EVIDENCE → VALIDATE_FABRIC → ESCALATE_SUPPORT, no isolation); the register / unregister / irq information lines and a
@@ -1740,7 +1749,12 @@ single command the device answered with an error (`Failed to create qp [-12]`, `
 `IB_PORT_ACTIVE`); the port state belongs to the `rdma_link_down` metric rule; `efa` is no longer a keyword trigger, and
 `rdma|infiniband|ib_*` + `fatal|error|timeout|link/port down` serves other fabrics only. Both RDMA rules are `KERNEL_LOG_SOURCES`;
 the node-side `matching_log_rules` decides from the same vocabulary which lines are shipped, so a vocabulary change ships with
-the control plane, the executor and the node runtime together. The quotes are pinned by `tests/test_efa_kernel_log.py`.
+the control plane, the executor and the node runtime together. The sources are pinned to tags:
+<https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/infiniband/hw/efa?h=v6.1.189>, <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/infiniband/hw/efa?h=v6.12.103>,
+<https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/infiniband/core/device.c?h=v6.1.189>, <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/include/uapi/asm-generic/errno.h?h=v6.1.189>,
+<https://github.com/amzn/amzn-drivers/tree/efa_linux_3.3.1/kernel/linux/efa/src> (commit `f7ba3059`), <https://github.com/amzn/amzn-drivers/tree/efa_linux_3.4.0/kernel/linux/efa/src> (commit `9d5ca402`),
+<https://github.com/linux-rdma/rdma-core/blob/v65.0/kernel-boot/rdma-persistent-naming.rules> and <https://github.com/linux-rdma/rdma-core/blob/v65.0/kernel-boot/rdma_rename.c> (the rule and the rename read the same in v28.0 and v65.0). The quotes
+are pinned by `tests/test_efa_kernel_log.py`.
 
 #### 2.4.4 Training Health `training_health.py`
 
