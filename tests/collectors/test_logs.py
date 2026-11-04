@@ -237,6 +237,12 @@ def test_kernel_live_stream_survives_health_summary_failure(
         def readline(self) -> str:
             return next(self.lines)
 
+    # The fake stream models /dev/kmsg, a character device; fd 42 may be a real
+    # open regular file in this test process (an xdist worker's), which would send
+    # _collect_live_stream down the tail -f path for a regular GPU_FAULT_KMSG_PATH.
+    monkeypatch.setattr(
+        "gpu_fault.collectors.logs.kernel._is_regular_file", lambda _descriptor: False
+    )
     ready = iter([([], [], []), ([42], [], []), ([42], [], [])])
     monkeypatch.setattr(
         "gpu_fault.collectors.logs.kernel.select.select", lambda *_args: next(ready)

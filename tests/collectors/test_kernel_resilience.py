@@ -161,6 +161,12 @@ def test_kmsg_overflow_continues_on_the_same_stream_and_is_counted(
                 return SECOND
             return ""
 
+    # The fake stream models /dev/kmsg, a character device; fd 42 may be a real
+    # open regular file in this test process (an xdist worker's), which would send
+    # _collect_live_stream down the tail -f path for a regular GPU_FAULT_KMSG_PATH.
+    monkeypatch.setattr(
+        "gpu_fault.collectors.logs.kernel._is_regular_file", lambda _descriptor: False
+    )
     ready = iter([([42], [], [])] * 4)
     monkeypatch.setattr(
         "gpu_fault.collectors.logs.kernel.select.select", lambda *_args: next(ready)
@@ -192,6 +198,12 @@ def test_other_read_errors_still_leave_the_live_stream(monkeypatch) -> None:
         def readline(self) -> str:
             raise OSError(errno.EIO, "I/O error")
 
+    # The fake stream models /dev/kmsg, a character device; fd 42 may be a real
+    # open regular file in this test process (an xdist worker's), which would send
+    # _collect_live_stream down the tail -f path for a regular GPU_FAULT_KMSG_PATH.
+    monkeypatch.setattr(
+        "gpu_fault.collectors.logs.kernel._is_regular_file", lambda _descriptor: False
+    )
     monkeypatch.setattr(
         "gpu_fault.collectors.logs.kernel.select.select", lambda *_args: ([42], [], [])
     )
