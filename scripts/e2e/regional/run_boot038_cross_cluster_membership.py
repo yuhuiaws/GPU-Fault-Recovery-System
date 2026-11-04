@@ -52,6 +52,8 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from scripts.e2e.regional import boot029_node_scope as node_scope  # noqa: E402
+from scripts.e2e.regional import boot029_ownership as ownership  # noqa: E402
 from scripts.e2e.regional import boot029_registry_drift as registry  # noqa: E402
 from scripts.e2e.regional import boot038_membership as membership  # noqa: E402
 from scripts.e2e.regional import eks_nodegroup_case as case  # noqa: E402
@@ -269,7 +271,7 @@ TIMINGS = {
 }
 
 
-def _verb_command(settings: Settings, verb: str) -> list[str]:
+def verb_command(settings: Settings, verb: str) -> list[str]:
     command = [
         *admin_command(settings.state_dir),
         verb,
@@ -309,7 +311,9 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         "product_generation": preflight.get("product_generation"),
         "mutation": (
             "gpu-fault-admin remove-cluster then join-cluster of the target GPU "
-            "cluster; each ends in a scoped verify. "
+            "cluster (the join re-applies the ownership label the removal "
+            "released, from the remove tombstone, as S69 does); each ends in a "
+            "scoped verify. "
             + (
                 "One GPU node of the other cluster is held NotReady by a bounded, "
                 "self-restoring kubelet.service stop (DESTR-008 service window) "
@@ -322,7 +326,7 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             )
         ),
         "verb_commands": {
-            verb: " ".join(_verb_command(settings, verb)) for verb in membership.VERBS
+            verb: " ".join(verb_command(settings, verb)) for verb in membership.VERBS
         },
         "timings": TIMINGS,
         "stop_conditions": [
@@ -593,6 +597,8 @@ class LiveMembershipDriver:
     # -- one verb ----------------------------------------------------------
     def run_verb(self, verb: str) -> membership.VerbEvidence:
         self._snapshot_notifications(verb)
+        if verb == membership.JOIN_VERB:
+            self._reapply_ownership_label()
         baseline = self.case_dir / f"{verb}.registry-baseline.json"
         self._registry_baseline(verb, baseline)
         window = (
@@ -636,7 +642,7 @@ class LiveMembershipDriver:
         finally:
             if poller is not None:
                 poller.stop()
-        result_json = self._result_json(follower.lines)
+        result_json = membership.verb_result_from_output(follower.lines)
         if verb == membership.JOIN_VERB and process.returncode != 0:
             result_json, process_rc = self._answer_profile_plan(verb, result_json)
         else:
@@ -776,6 +782,43 @@ class LiveMembershipDriver:
     def _resume(self, window: Any) -> None:
         window.resume_cleanup()
 
+    # -- membership prerequisites ------------------------------------------
+    def _reapply_ownership_label(self) -> None:
+        """Put the ownership label back on the target's node groups before the
+        join, from its COMPLETED remove-cluster tombstone (stage 3, as the S69
+        driver did). remove-cluster released the label; join-cluster's own
+        node-scope precondition refuses without it. Fail closed."""
+
+        try:
+            record, _lines = ownership.reapply_report(
+                self.settings.cpu_cluster_arn,
+                [self.settings.target_cluster_arn],
+                state=self.settings.state_dir,
+                stage=3,
+            )
+            scope, _scope_lines = node_scope.precondition_report(
+                self.settings.cpu_cluster_arn, [self.settings.target_cluster_arn]
+            )
+        except Exception as exc:  # noqa: BLE001 - recorded, fails closed
+            raise RegionalFixtureError(
+                "re-applying the ownership label before the join failed: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        write_json_atomic(
+            self.case_dir / "join-ownership-reapply.json",
+            {"reapply": record, "node_scope_precondition": scope},
+        )
+        refused = [
+            item
+            for item in scope.get("clusters", [])
+            if item.get("status") == "refused"
+        ]
+        if refused:
+            raise RegionalFixtureError(
+                "the target's node groups do not carry the ownership label after "
+                "re-apply; join-cluster would be refused"
+            )
+
     def _observe_node(self) -> str:
         try:
             node = self.warm.node_snapshot(self.settings.other_node)
@@ -785,23 +828,7 @@ class LiveMembershipDriver:
 
     # -- verb plumbing -----------------------------------------------------
     def _verb_command(self, verb: str) -> list[str]:
-        return _verb_command(self.settings, verb)
-
-    def _result_json(self, lines: list[str]) -> dict[str, Any] | None:
-        text = "".join(lines)
-        starts = [index for index, line in enumerate(lines) if line.strip() == "{"]
-        for start in starts:
-            try:
-                value, _end = json.JSONDecoder().raw_decode("".join(lines[start:]))
-            except ValueError:
-                continue
-            if isinstance(value, dict):
-                return value
-        try:
-            value = json.loads(text)
-        except ValueError:
-            return None
-        return value if isinstance(value, dict) else None
+        return verb_command(self.settings, verb)
 
     def _answer_profile_plan(
         self, verb: str, result_json: dict[str, Any] | None
@@ -826,9 +853,9 @@ class LiveMembershipDriver:
             timeout=VERB_TIMEOUT_SECONDS,
             check=False,
         )
-        return self._result_json(completed.stdout.splitlines(keepends=True)), int(
-            completed.returncode
-        )
+        return membership.verb_result_from_output(
+            completed.stdout.splitlines(keepends=True)
+        ), int(completed.returncode)
 
     def _read_surfaces(self, verb: str) -> dict[str, Any]:
         record = membership.load_json(
@@ -963,7 +990,7 @@ for cluster in (other_cluster, target_cluster):
         incidents.append({"cluster": cluster, "id": i.incident_id})
 ledger = [
     {"node_id": r.node_id, "status": str(getattr(r.status, "value", r.status))}
-    for r in store.list_departed_node_cleanups()
+    for r in store.list_departed_node_cleanups(other_cluster)
 ]
 notifications = [
     {"subject": n.subject, "incident_id": n.incident_id, "cluster_name": n.cluster_name}

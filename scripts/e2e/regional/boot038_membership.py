@@ -104,6 +104,54 @@ VERDICT_BLOCKED = "BLOCKED"
 FINDING_SURFACES = ("result", "verified_evidence", "findings_record", "status_lines")
 
 
+#: Keys a membership verb's own result carries (``removal_result`` /
+#: ``_complete_join``), telling it apart from the many other top-level JSON
+#: objects the same stream also carries: the gpu-fault-admin wrapper tees the
+#: verb's stdout -- every ``+ aws`` command's JSON output, each check's details,
+#: the echoed verify report -- and the release narration (stderr) into one log,
+#: so a real removal/join stream holds dozens of ``{`` objects and the verb
+#: result is only the last one with this signature.
+VERB_RESULT_SIGNATURE = ("cpu_control_plane", "gpu_cluster")
+
+
+def _top_level_objects(lines: Sequence[str]) -> list[dict[str, Any]]:
+    """Every top-level JSON object in the merged verb output, in order.
+
+    An object printed by ``json.dumps(..., indent=2)`` (the verb result, the
+    verify report, an AWS CLI output) starts with ``{`` on its own line; a line
+    that is exactly ``{`` begins a candidate and the decoder reads to its end.
+    """
+
+    found: list[dict[str, Any]] = []
+    for index, line in enumerate(lines):
+        if line.strip() != "{":
+            continue
+        try:
+            value, _end = json.JSONDecoder().raw_decode("".join(lines[index:]))
+        except ValueError:
+            continue
+        if isinstance(value, dict):
+            found.append(value)
+    return found
+
+
+def verb_result_from_output(lines: Sequence[str]) -> dict[str, Any] | None:
+    """The membership verb's own result object from its merged output.
+
+    The last top-level object carrying the verb-result signature
+    (``cpu_control_plane`` + ``gpu_cluster``); the last decodable object as a
+    fallback; ``None`` when the stream carries no JSON object. Reading the first
+    ``{`` is wrong -- that is an AWS output or the echoed verify report, not the
+    verb's ``not_gating_findings``-bearing result.
+    """
+
+    objects = _top_level_objects(lines)
+    for value in reversed(objects):
+        if all(key in value for key in VERB_RESULT_SIGNATURE):
+            return value
+    return objects[-1] if objects else None
+
+
 def verify_trigger(verb: str) -> re.Pattern[str]:
     """The line after which the window opens for ``verb``.
 

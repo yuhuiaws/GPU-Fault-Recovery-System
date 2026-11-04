@@ -4108,7 +4108,9 @@ verb completes, the other cluster's finding is recorded as not gating, and no de
    270 s and the node-side restore unit as the backstop), and confirm the Node shows NotReady before `release-begin ...
    mode=verify`; otherwise the verb is INCONCLUSIVE (window missed) and the rest is still judged. Restore at `release-end
    ... mode=verify` or at a cap, whichever comes first, then wait for Ready and clean up the window.
-3. If the removal completed (exit 0, no rollback), `join-cluster` the same way (a HyperPod `CLUSTER_PROFILE_NEW` stop is
+3. If the removal completed (exit 0, no rollback), first re-apply the ownership label to the target's node groups from the
+   remove tombstone (S69's `reapply_ownership_labels` / `assert_ownership_labels`; the removal released it and join-cluster's
+   node-scope precondition refuses without it), then `join-cluster` the same way (a HyperPod `CLUSTER_PROFILE_NEW` stop is
    answered as in S69, approving the same plan and rerunning); the open trigger is the last `fleet-wave-done ... ready=N/N`.
    If the removal did not complete, the re-join is not attempted.
 4. After both verbs: read the result, the `VERIFIED` evidence, `membership-verify/findings.json` and the `status` finding

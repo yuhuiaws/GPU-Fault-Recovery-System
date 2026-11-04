@@ -290,6 +290,113 @@ def test_narration_records_fail_and_rollback() -> None:
     )
 
 
+# --- real-log contract (line shapes copied from the S69 logs, no secrets) ----
+
+# The gpu-fault-admin wrapper tees the verb's stdout (the echoed verify report,
+# every `+ aws` JSON output, per-check details, the verb result) and the
+# release narration (stderr) into one stream; these fixtures reproduce that
+# shape, including the verify report whose closing `}` is glued to the stderr
+# `release-end mode=verify` line with no newline between them.
+_REMOVE_STREAM = [
+    "+ aws sagemaker describe-cluster --cluster-name hp --region us-west-2\n",
+    "release-begin 2026-11-04T11:53:44Z mode=drain-cluster dry_run=false\n",
+    "release-end 2026-11-04T11:53:59Z mode=drain-cluster exit_code=0 total=15.0s\n",
+    "release-begin 2026-11-04T12:03:52Z mode=remove-cluster dry_run=false\n",
+    "release-end 2026-11-04T12:05:32Z mode=remove-cluster exit_code=0 total=99.4s\n",
+    "release-begin 2026-11-04T12:06:28Z mode=sync-state dry_run=false\n",
+    "release-end 2026-11-04T12:07:17Z mode=sync-state exit_code=0 total=48.5s\n",
+    "release-begin 2026-11-04T12:07:18Z mode=verify dry_run=false\n",
+    "{\n",
+    '  "checks": [],\n',
+    '  "healthy": true,\n',
+    '  "mode": "verify"\n',
+    "}release-end 2026-11-04T12:07:49Z mode=verify exit_code=0 total=31.2s\n",
+    "+ aws sagemaker list-clusters --region us-west-2 --output json\n",
+    "{\n",
+    '  "cluster_id": "hp-cluster",\n',
+    '  "cpu_control_plane": "PRESERVED",\n',
+    '  "gpu_cluster": "PRESERVED",\n',
+    '  "phase": "COMPLETED",\n',
+    '  "remaining_cluster_ids": ["gpu-eks-cluster"]\n',
+    "}\n",
+]
+_JOIN_WAVES = [
+    "fleet-wave-done 2026-11-04T12:16:08Z cluster=hp wave=1/2 ready=1/4 "
+    "nodes=hyperpod-x total=314.0s\n",
+    "fleet-wave-done 2026-11-04T12:17:08Z cluster=hp wave=2/2 ready=4/4 "
+    "nodes=hyperpod-y total=374.6s\n",
+    "release-end 2026-11-04T12:19:38Z mode=join-cluster exit_code=0 total=524.2s\n",
+    "release-begin 2026-11-04T12:19:48Z mode=verify dry_run=false\n",
+    "}release-end 2026-11-04T12:20:40Z mode=verify exit_code=0 total=50.2s\n",
+]
+_ROLLBACK_TAIL = [
+    "release-begin 2026-11-04T12:20:50Z mode=fail-cluster dry_run=false\n",
+    "release-end 2026-11-04T12:20:57Z mode=fail-cluster exit_code=0 total=7.6s\n",
+    "release-begin 2026-11-04T12:32:04Z mode=rollback-cluster dry_run=false\n",
+    "release-end 2026-11-04T12:32:16Z mode=rollback-cluster exit_code=0 total=11.6s\n",
+]
+
+
+def _follow(verb: str, lines: list[str]) -> tuple[m.VerbNarration, list[str]]:
+    narration = m.VerbNarration()
+    tokens = [token for line in lines if (token := narration.observe(verb, line))]
+    return narration, tokens
+
+
+def test_removal_stream_opens_once_then_verify_begin_and_end_in_order() -> None:
+    narration, tokens = _follow(m.REMOVE_VERB, _REMOVE_STREAM)
+    assert tokens == ["open", "verify-begin", "verify-end"], tokens
+    assert not narration.saw_fail_cluster, "a clean removal"
+    assert not narration.saw_rollback_cluster, "a clean removal"
+
+
+def test_join_stream_opens_only_on_the_full_wave_and_detects_glued_verify_end() -> None:
+    narration, tokens = _follow(m.JOIN_VERB, _JOIN_WAVES)
+    # ready=1/4 is not an open; ready=4/4 is; the glued "}release-end mode=verify"
+    # is a verify-end.
+    assert tokens == ["open", "verify-begin", "verify-end"], tokens
+    assert narration.last_full_fleet_wave is not None, "the full wave was recorded"
+
+
+def test_rolled_back_join_stream_sets_fail_and_rollback() -> None:
+    narration, _ = _follow(m.JOIN_VERB, _JOIN_WAVES + _ROLLBACK_TAIL)
+    assert narration.saw_fail_cluster, "fail-cluster narrated"
+    assert narration.saw_rollback_cluster, "rollback-cluster narrated"
+
+
+def test_verb_result_is_the_last_signature_object_not_the_verify_report() -> None:
+    result = m.verb_result_from_output(_REMOVE_STREAM)
+    assert result is not None, "a result is found"
+    assert result.get("phase") == "COMPLETED", "the verb result, not the report"
+    assert result.get("remaining_cluster_ids") == ["gpu-eks-cluster"], result
+
+
+def test_verb_result_carries_not_gating_findings_when_the_window_held() -> None:
+    stream = [
+        "{\n",
+        '  "checks": [], "healthy": true, "mode": "verify"\n',
+        "}release-end 2026-11-04T12:20:40Z mode=verify exit_code=0 total=50.2s\n",
+        "{\n",
+        '  "cpu_control_plane": "PRESERVED",\n',
+        '  "gpu_cluster": "PRESERVED",\n',
+        '  "phase": "COMPLETED",\n',
+        '  "not_gating_findings": [{"check": "control_api", '
+        '"cluster_id": "gpu-eks-cluster", "finding": "coverage drift"}]\n',
+        "}\n",
+    ]
+    result = m.verb_result_from_output(stream)
+    assert m.result_findings(result)[0]["cluster_id"] == "gpu-eks-cluster", result
+
+
+def test_verb_result_falls_back_when_the_verb_printed_no_result() -> None:
+    # A rolled-back verb prints no result object; the fallback is the last
+    # decodable object (the verify report), and its result surface is empty.
+    stream = ["{\n", '  "checks": [], "healthy": false, "mode": "verify"\n', "}\n"]
+    result = m.verb_result_from_output(stream)
+    assert result is not None and result.get("mode") == "verify", result
+    assert m.result_findings(result) == [], "a report carries no top-level findings"
+
+
 # --- record readers ----------------------------------------------------------
 
 
@@ -449,6 +556,110 @@ def test_the_window_is_ended_even_when_a_verb_raises() -> None:
     with pytest.raises(RegionalFixtureError):
         m.run_membership(driver, window=m.WINDOW_KUBELET)
     assert driver.end_windows_calls == 1
+
+
+# --- admin verb argv against the real CLI parser (point 2) -------------------
+
+
+def _settings(tmp_path: Path, window: str = m.WINDOW_KUBELET) -> Any:
+    return runner.Settings(
+        state_dir=tmp_path,
+        target_cluster_arn="arn:aws:eks:us-west-2:000000000000:cluster/tgt",
+        target_cluster_id="hp",
+        other_cluster_id="eks",
+        other_node="ip-10-0-44-18",
+        window=window,
+        dry_run=False,
+        regional=_fake_regional(tmp_path),
+        host_probe_image="image@sha256:abc",
+        cpu_cluster_arn="arn:aws:eks:us-west-2:000000000000:cluster/cpu",
+        predecessor_id="GF-REGIONAL-BOOT-029",
+        predecessor_path=None,
+        run_token="deadbeef",
+    )
+
+
+def _verb_argv(settings: Any, verb: str) -> list[str]:
+    """The runner's argv from the verb token on (dropping the binary prefix)."""
+
+    command = runner.verb_command(settings, verb)
+    return command[command.index(verb) :]
+
+
+def test_remove_cluster_argv_is_accepted_by_the_real_cli_parser(tmp_path: Path) -> None:
+    from gpu_fault.admin.cli import parser as cli_parser
+
+    argv = _verb_argv(_settings(tmp_path), m.REMOVE_VERB)
+    parsed = cli_parser().parse_args(argv)
+    assert parsed.command == "remove-cluster", argv
+    assert parsed.confirm == "REMOVE_GPU_CLUSTER", "the removal confirmation"
+    assert parsed.gpu_cluster_arn.endswith("/tgt"), parsed.gpu_cluster_arn
+
+
+def test_join_cluster_argv_and_profile_plan_rerun_parse(tmp_path: Path) -> None:
+    from gpu_fault.admin.cli import parser as cli_parser
+
+    argv = _verb_argv(_settings(tmp_path), m.JOIN_VERB)
+    parsed = cli_parser().parse_args(argv)
+    assert parsed.command == "join-cluster", argv
+    assert parsed.gpu_cluster_arn == [
+        "arn:aws:eks:us-west-2:000000000000:cluster/tgt"
+    ], "join takes an appendable --gpu-cluster-arn"
+    # The CLUSTER_PROFILE_NEW rerun flags S69 uses.
+    rerun = cli_parser().parse_args(
+        [*argv, "--approve-profile-plan", "a" * 64, "--reference", "BOOT038/x"]
+    )
+    assert rerun.approve_profile_plan == "a" * 64, "approve-profile-plan flag"
+    assert rerun.reference == "BOOT038/x", "reference flag"
+
+
+def test_the_verb_commands_target_the_deployer_venv_binary_when_present(
+    tmp_path: Path,
+) -> None:
+    # admin_command prefers <state-dir>/deployer-venv/bin/gpu-fault-admin, the
+    # site-bound CLI the S69 driver ran.
+    from scripts.e2e.regional.admin_cli import admin_command
+
+    binary = tmp_path / "deployer-venv" / "bin" / "gpu-fault-admin"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    assert admin_command(tmp_path) == [str(binary)], "the site-bound CLI"
+
+
+# --- service window call signatures (point 3) --------------------------------
+
+
+def test_service_window_fixture_accepts_the_driver_keyword_arguments() -> None:
+    import inspect
+
+    from scripts.e2e.regional.warm_spare_fixture import WarmSpareServiceFixture
+
+    signature = inspect.signature(WarmSpareServiceFixture.__init__)
+    expected = {
+        "node",
+        "image",
+        "case_id",
+        "run_id",
+        "state_directory",
+        "node_uid",
+        "plan_sha256",
+        "release_id",
+        "maintenance_expires_at",
+    }
+    assert expected <= set(signature.parameters), (
+        f"the runner passes {expected - set(signature.parameters)} the fixture lacks"
+    )
+    stop = inspect.signature(WarmSpareServiceFixture.stop)
+    assert {"restore_seconds", "delay_seconds"} <= set(stop.parameters), stop
+    for name in ("create", "restore", "cleanup", "resume_cleanup"):
+        assert hasattr(WarmSpareServiceFixture, name), name
+    # The restore-window bound stays inside the on-node probe's 60..600 s.
+    assert 60 <= m.RESTORE_SECONDS <= 600, m.RESTORE_SECONDS
+    assert m.STOP_DELAY_SECONDS + m.RESTORE_SECONDS <= m.RESTORE_CAP_SECONDS, "cap"
+    assert m.SERVICE_WINDOW_FIXTURE_CASE_ID == "GF-REGIONAL-DESTR-008", (
+        "the on-node probe trusts only the DESTR-008 window identity"
+    )
 
 
 # --- the runner's site lookup and configure ---------------------------------
