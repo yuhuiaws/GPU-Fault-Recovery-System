@@ -393,3 +393,63 @@ def test_terminal_command_retention_uses_update_time_and_stable_limits(compat_st
     assert (
         compat_store.cleanup_terminal_remote_commands(older_than=cutoff, limit=20) == 0
     ), "an exhausted retention sweep must report no additional work"
+
+
+def test_internal_errors_break_down_per_cluster(compat_store):
+    """The executor's internal errors per GPU cluster (count and last seen) add
+    up to the fleet totals on every backend, so a membership verb's verify can
+    judge the cluster it changes (``regional_verify_scope``)."""
+
+    newest = datetime.now(UTC) - timedelta(minutes=5)
+    errors = {
+        "a-first": ("gpu-a", newest - timedelta(minutes=20)),
+        "a-newest": ("gpu-a", newest),
+        "b-only": ("gpu-b", newest - timedelta(minutes=10)),
+    }
+    for name, (cluster_id, at) in errors.items():
+        save_command(
+            compat_store,
+            name,
+            cluster_id=cluster_id,
+            at=at,
+            status=RemoteCommandStatus.FAILED,
+            status_source="executor-internal-error",
+            error="AttributeError: executor defect",
+        )
+    save_command(
+        compat_store,
+        "b-legacy-refusal",
+        cluster_id="gpu-b",
+        at=newest + timedelta(minutes=1),
+        status=RemoteCommandStatus.FAILED,
+        status_source="executor-internal-error",
+        error="ValueError: node is already isolated by another incident/token",
+    )
+    save_command(
+        compat_store,
+        "c-refused",
+        cluster_id="gpu-c",
+        at=newest + timedelta(minutes=2),
+        status=RemoteCommandStatus.FAILED,
+        error="RESET_GPU refused by the node",
+    )
+
+    stats = compat_store.remote_command_stats()
+
+    assert stats["executor_internal_error_total"] == 3, stats
+    assert stats["executor_internal_error_total_by_cluster"] == {
+        "gpu-a": 2,
+        "gpu-b": 1,
+    }, "only real executor defects count, attributed to their cluster"
+    by_cluster = stats["executor_internal_error_last_seen_timestamp_seconds_by_cluster"]
+    assert sorted(by_cluster) == ["gpu-a", "gpu-b"], by_cluster
+    assert by_cluster["gpu-a"] == pytest.approx(newest.timestamp(), abs=1e-3)
+    assert by_cluster["gpu-b"] == pytest.approx(
+        (newest - timedelta(minutes=10)).timestamp(), abs=1e-3
+    )
+    assert max(by_cluster.values()) == pytest.approx(
+        stats["executor_internal_error_last_seen_timestamp_seconds"], abs=1e-6
+    ), "the fleet's last seen is the newest cluster's"
+    assert compat_store.remote_command_stats()[
+        "executor_internal_error_total_by_cluster"
+    ] == {"gpu-a": 2, "gpu-b": 1}, "a re-read reports the same breakdown"

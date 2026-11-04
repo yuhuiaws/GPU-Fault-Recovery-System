@@ -220,6 +220,8 @@ class PostgresRemoteCommandMixin:
             rows = cursor.fetchall()
         internal_errors = 0
         internal_error_last_seen = 0.0
+        errors_by_cluster: dict[str, int] = {}
+        error_last_seen_by_cluster: dict[str, float] = {}
         unclaimed_expired = 0
         total = 0
         open_by_cluster: dict[str, int] = {}
@@ -246,9 +248,17 @@ class PostgresRemoteCommandMixin:
             cluster_counts[status_value] = cluster_counts.get(status_value, 0) + count
             total += count
             internal_errors += error_count
+            if error_count:
+                errors_by_cluster[cluster_id] = (
+                    errors_by_cluster.get(cluster_id, 0) + error_count
+                )
             if latest_internal_error is not None:
                 internal_error_last_seen = max(
                     internal_error_last_seen,
+                    latest_internal_error.timestamp(),
+                )
+                error_last_seen_by_cluster[cluster_id] = max(
+                    error_last_seen_by_cluster.get(cluster_id, 0.0),
                     latest_internal_error.timestamp(),
                 )
             unclaimed_expired += expired_count
@@ -278,6 +288,10 @@ class PostgresRemoteCommandMixin:
             "executor_internal_error_total": internal_errors,
             "executor_internal_error_last_seen_timestamp_seconds": (
                 internal_error_last_seen
+            ),
+            "executor_internal_error_total_by_cluster": errors_by_cluster,
+            "executor_internal_error_last_seen_timestamp_seconds_by_cluster": (
+                error_last_seen_by_cluster
             ),
             "unclaimed_expired_total": unclaimed_expired,
         }

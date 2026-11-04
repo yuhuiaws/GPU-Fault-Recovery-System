@@ -60,6 +60,7 @@ def store(monkeypatch):
         commands.test_unclaimed_expiry_is_bounded_and_counts_only_pending_work,
         commands.test_stale_fence_sweep_preserves_live_and_current_generation_leases,
         commands.test_terminal_command_retention_uses_update_time_and_stable_limits,
+        commands.test_internal_errors_break_down_per_cluster,
     ],
     ids=lambda contract: contract.__name__.removeprefix("test_"),
 )

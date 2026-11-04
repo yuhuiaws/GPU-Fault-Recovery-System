@@ -104,6 +104,8 @@ def remote_command_stats(commands, *, now: datetime | None = None) -> dict:
     open_by_cluster: dict[str, int] = {}
     internal_errors = 0
     internal_error_last_seen = 0.0
+    errors_by_cluster: dict[str, int] = {}
+    error_last_seen_by_cluster: dict[str, float] = {}
     unclaimed_expired = 0
     for command in commands:
         by_status[command.status.value] = by_status.get(command.status.value, 0) + 1
@@ -120,6 +122,11 @@ def remote_command_stats(commands, *, now: datetime | None = None) -> dict:
             internal_error_last_seen = max(
                 internal_error_last_seen,
                 error_at.timestamp(),
+            )
+            cluster = command.cluster_id
+            errors_by_cluster[cluster] = errors_by_cluster.get(cluster, 0) + 1
+            error_last_seen_by_cluster[cluster] = max(
+                error_last_seen_by_cluster.get(cluster, 0.0), error_at.timestamp()
             )
         if command.status_source == UNCLAIMED_DEADLINE_STATUS_SOURCE:
             unclaimed_expired += 1
@@ -155,6 +162,14 @@ def remote_command_stats(commands, *, now: datetime | None = None) -> dict:
         "executor_internal_error_total": internal_errors,
         "executor_internal_error_last_seen_timestamp_seconds": (
             internal_error_last_seen
+        ),
+        # The executor's internal errors per GPU cluster: a membership verb's
+        # verify judges the cluster it changes (gpu_fault_release.
+        # regional_admin_checks_remote). Literal keys: the override-shape
+        # contract (tests/store/test_store_override_contracts.py) compares them.
+        "executor_internal_error_total_by_cluster": errors_by_cluster,
+        "executor_internal_error_last_seen_timestamp_seconds_by_cluster": (
+            error_last_seen_by_cluster
         ),
         "unclaimed_expired_total": unclaimed_expired,
     }

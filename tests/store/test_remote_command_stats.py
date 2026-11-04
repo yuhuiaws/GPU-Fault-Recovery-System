@@ -192,3 +192,63 @@ def test_stats_break_status_counts_down_by_cluster_in_both_implementations() -> 
 
 def test_a_fleet_without_commands_has_an_empty_cluster_breakdown() -> None:
     assert remote_command_stats([], now=NOW)["by_cluster_status"] == {}
+
+
+def test_internal_errors_are_attributed_to_their_cluster_in_both_implementations() -> (
+    None
+):
+    """A membership verb's verify judges the cluster it changes: the internal
+    error count and its last seen per cluster add up to the fleet totals, the
+    same shape from SQL and from the shared helper."""
+
+    later = NOW + timedelta(seconds=90)
+    failed = RemoteCommandStatus.FAILED.value
+
+    class Cursor:
+        def __enter__(self) -> "Cursor":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def execute(self, query: str, parameters: tuple[object, ...]) -> None:
+            assert "GROUP BY" in query, "the stats query must aggregate in SQL"
+
+        def fetchall(self) -> list[tuple[object, ...]]:
+            return [
+                ("gpu-a", failed, 3, 2, later, None, 0),
+                ("gpu-b", failed, 1, 1, NOW, None, 0),
+                ("gpu-c", failed, 4, 0, None, None, 1),
+            ]
+
+    postgres = PostgresRemoteCommandMixin()
+    setattr(postgres, "_db", SimpleNamespace(cursor=lambda: Cursor()))
+    from_sql = postgres.remote_command_stats(now=NOW)
+    commands = [
+        _failed_command("AttributeError: a"),
+        _failed_command("AttributeError: b", updated_at=later),
+        _failed_command("AttributeError: c"),
+    ]
+    commands[2].cluster_id = "gpu-b"
+    shared = remote_command_stats(commands, now=NOW)
+
+    for stats in (from_sql, shared):
+        assert stats["executor_internal_error_total_by_cluster"] == {
+            "gpu-a": 2,
+            "gpu-b": 1,
+        }, stats
+        assert stats[
+            "executor_internal_error_last_seen_timestamp_seconds_by_cluster"
+        ] == {"gpu-a": later.timestamp(), "gpu-b": NOW.timestamp()}, stats
+        assert stats["executor_internal_error_total"] == 3
+        assert (
+            stats["executor_internal_error_last_seen_timestamp_seconds"]
+            == later.timestamp()
+        )
+
+
+def test_a_fleet_without_internal_errors_has_an_empty_error_breakdown() -> None:
+    stats = remote_command_stats([], now=NOW)
+
+    assert stats["executor_internal_error_total_by_cluster"] == {}
+    assert stats["executor_internal_error_last_seen_timestamp_seconds_by_cluster"] == {}
