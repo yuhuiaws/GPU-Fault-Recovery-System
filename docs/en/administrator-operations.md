@@ -2018,14 +2018,16 @@ The join's commit path pays only for the new cluster, and the `evidence` in `sta
     CPU HyperPod cluster, CPU API `/readyz`), `cpu_secrets`, `cpu_workloads`, `email_notifications`,
     `aurora_credential_refresh`, `adot_self_metrics`, `runtime_profile`, the CPU role split of `read_only_verifiers`, the CPU
     Pods of `runtime_component_identity`, the shared half of `control_api` (`/healthz`, regional mode, every required and
-    compatible artifact, config, profile, key and executor pin and window, the regional registry against the site, the oldest
-    unclaimed remote command, the executor's internal errors), `nlb_runtime`, `aurora`, `monitoring`;
+    compatible artifact, config, profile, key and executor pin and window, the regional registry against the site, the
+    remote commands and executor internal errors the Store cannot attribute to a cluster), `nlb_runtime`, `aurora`,
+    `monitoring`;
   - **per GPU cluster -- fails the verify for the joining cluster(s) only**: `gpu_cluster:<id>` (Deployments, node scope,
     Ready nodes, installer state and artifact, executor readiness, the executor's TLS path to the control plane), the
-    cluster's section of `control_api` (Agent coverage, Agent Runtime Profile, fleet readiness, collector readiness), its
-    executor verifier in `read_only_verifiers`, its Pods in `runtime_component_identity`, and its part of
-    `regional_contexts` (GPU context, provider facts, API `/readyz`, Agent endpoint CIDRs, executor IAM, retired
-    collectors).
+    cluster's section of `control_api` (Agent coverage, Agent Runtime Profile, fleet readiness, collector readiness, its
+    oldest unclaimed remote command against `remoteCommandMaxUnclaimedSeconds`, its executor's internal remote-command
+    errors since the release baseline), its executor verifier in `read_only_verifiers`, its Pods in
+    `runtime_component_identity`, and its part of `regional_contexts` (GPU context, provider facts, API `/readyz`, Agent
+    endpoint CIDRs, executor IAM, retired collectors).
 
   Another cluster's own finding (a node it lost to a spot reclaim, a Deployment of its own not Ready) never fails or rolls the
   join back: its check reads `WARN` with the summary
@@ -2034,6 +2036,16 @@ The join's commit path pays only for the new cluster, and the `evidence` in `sta
   `evidence.VERIFIED.not_gating_findings` and in its result's `not_gating_findings` (redacted, each capped), and `status`
   shows them (§4, `membership_verify_findings`). Another cluster's collectors are not waited for. `control_api` judges the
   joining cluster's collector readiness by the fast/slow rule above.
+
+  The remote-command values are the Store's per-cluster ones (`oldest_unclaimed_age_seconds_by_cluster`,
+  `executor_internal_error_total_by_cluster`, `executor_internal_error_last_seen_timestamp_seconds_by_cluster`): a command
+  nobody claimed on another cluster (the Agent of a node it lost, its executor rescheduled off that node) or an error of
+  another cluster's executor is that cluster's finding. A control plane older than these values, or values that do not
+  account for the fleet's (the oldest/newest is not among them, the counts do not add up), are judged on the fleet's value
+  and fail the verify. An internal error counts when it is newer than the newest error the release state recorded at the
+  start of the last release transaction (`previous`; that value is the newest of every cluster, so no per-cluster baseline
+  is needed); without that record (after a `sync-state`, which every join and removal ends with, a no-op `deploy` or a
+  bootstrap) every error the Store still keeps counts, each against its own cluster.
 - `RELEASE_STATE_UPDATED`: `sync-state` re-captures only the new cluster's snapshot (`capture_scope:
   cluster:<id>`), merges it with the committed release state and still validates the site-level invariants -- each cluster's live
   Agent set equals its HyperPod node set, and the CPU/new cluster/recorded runtime images agree.

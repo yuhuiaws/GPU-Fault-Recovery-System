@@ -272,6 +272,7 @@
   "tests/regional/test_release_verify_departure_wait.py:ROLLOUT._dispatch_mode": 1,
   "tests/regional/test_release_verify_departure_wait.py:release._apply_health_baseline": 1,
   "tests/regional/test_release_verify_departure_wait.py:release._gpu": 1,
+  "tests/regional/test_release_verify_scope_remote_commands.py:release._load_state": 1,
   "tests/store/_postgres_processor_claim_cases_1.py:store._db": 3,
   "tests/store/_postgres_processor_claim_cases_2.py:store._db": 10,
   "tests/store/_postgres_processor_claim_cases_2.py:store._processor_queue_row": 3,

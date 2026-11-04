@@ -21,15 +21,17 @@ CPU part of ``regional_contexts``, ``cpu_secrets``, ``cpu_workloads``,
 ``runtime_profile``, the CPU role split of ``read_only_verifiers``, the CPU
 Pods of ``runtime_component_identity``, the shared half of ``control_api``
 (``/healthz``, regional mode, every required and compatible pin and window,
-the regional registry against the site, the unclaimed remote commands, the
-executor's internal errors), ``nlb_runtime``, ``aurora`` and ``monitoring``.
+the regional registry against the site, the remote commands and executor
+errors the Store cannot attribute to a cluster), ``nlb_runtime``, ``aurora``
+and ``monitoring``.
 
 What gates for the target cluster(s) only -- each cluster's own data plane:
 its ``gpu_cluster:<id>`` check (Deployments, node scope, Ready nodes,
 installers, executor readiness and its TLS path to the control plane), its
 section of ``control_api`` (Agent coverage, Agent Runtime Profile, fleet
-readiness, collector readiness), its executor verifier in
-``read_only_verifiers``, its Pods in ``runtime_component_identity`` and its
+readiness, collector readiness, its unclaimed remote commands and its
+executor's internal errors -- ``regional_admin_checks_remote``), its executor
+verifier in ``read_only_verifiers``, its Pods in ``runtime_component_identity`` and its
 part of ``regional_contexts`` (context, provider facts, API ``/readyz``, Agent
 endpoint CIDRs, executor IAM, retired collectors).
 

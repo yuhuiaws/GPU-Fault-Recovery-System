@@ -364,6 +364,12 @@ checkpoint write. `COMPLETED` is merged to disk by the next phase or cluster che
 Before upgrade begins, `executor_internal_error_total` is also written into the previous snapshot. Post-release verify
 rejects only increases of that counter relative to the baseline, which both preserves the audit and 24-hour retention of terminal commands and does not let
 already-audited historical errors permanently block later releases; when the baseline is missing it is still treated as 0 and fails closed.
+The verify of a `join-cluster` / `remove-cluster` judges the errors per GPU cluster (`regional_admin_checks_remote`, from the
+Store's `executor_internal_error_total_by_cluster` and `executor_internal_error_last_seen_timestamp_seconds_by_cluster`): the
+target's errors since the baseline fail it, another cluster's are that cluster's findings, and a control plane without the
+per-cluster values is judged on the fleet's. The recorded last-seen baseline is the newest error of every cluster, so a
+cluster's own last seen past it is an error since; only a zero count baseline is attributed per cluster, a non-zero one
+recorded without the timestamp is judged on the fleet's.
 
 The release manifest carries its own `schema_version` (1–4, `load_release_artifacts()` in
 `src/gpu_fault_release/regional_release_config.py`): from v2 on, each component's `module_digest` must be a lowercase SHA-256;

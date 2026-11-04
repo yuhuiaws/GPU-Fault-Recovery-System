@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 
 from gpu_fault_release import regional_release_verify_churn as release_churn
 from gpu_fault_release import regional_admin_checks_coverage as agent_coverage
+from gpu_fault_release import regional_admin_checks_remote as remote_commands
 from gpu_fault_release import regional_verify_scope as verify_scope
 from gpu_fault_release.regional_release_nlb_rules import (
     nlb_https_rule_violation as nlb_https_rule_violation,
@@ -1248,55 +1249,9 @@ def _check_control_api(release: Any, *, verify: bool = False) -> CheckValue:
     # Each cluster's section (coverage, Runtime Profile, fleet readiness) gates
     # only where this verify's scope says so (regional_verify_scope).
     verify_scope.judge_clusters(release, report, agent_coverage.judge_cluster_fleet)
-    remote = report.get("remote_commands") or {}
-    oldest = float(remote.get("oldest_unclaimed_age_seconds", 0) or 0)
-    if oldest > release.config.health.remote_command_max_unclaimed_seconds:
-        raise ReleaseError(
-            f"oldest unclaimed remote command is {oldest:.1f}s; "
-            f"limit is {release.config.health.remote_command_max_unclaimed_seconds}s"
-        )
-    current_internal_errors = int(remote.get("executor_internal_error_total", 0) or 0)
-    state = release._load_state()
-    previous = state.get("previous")
-    timestamp_field = "executor_internal_error_last_seen_timestamp_seconds"
-    raw_baseline_timestamp = (
-        previous.get(timestamp_field) if isinstance(previous, dict) else None
-    )
-    current_raw_timestamp = remote.get(timestamp_field)
-    if raw_baseline_timestamp is not None and current_raw_timestamp is not None:
-        try:
-            baseline_timestamp = float(raw_baseline_timestamp)
-            current_timestamp = float(current_raw_timestamp)
-        except (TypeError, ValueError) as exc:
-            raise ReleaseError(
-                "executor internal remote-command error timestamp is invalid"
-            ) from exc
-        if min(baseline_timestamp, current_timestamp) < 0:
-            raise ReleaseError(
-                "executor internal remote-command error timestamp is invalid"
-            )
-        if current_timestamp > baseline_timestamp:
-            raise ReleaseError(
-                "executor internal remote-command error observed during release: "
-                f"{baseline_timestamp:.6f}->{current_timestamp:.6f}"
-            )
-        return _control_api_pass(release, report, verify)
-    raw_baseline = (
-        previous.get("executor_internal_error_total", 0)
-        if isinstance(previous, dict)
-        else 0
-    )
-    try:
-        baseline_internal_errors = int(raw_baseline or 0)
-    except (TypeError, ValueError) as exc:
-        raise ReleaseError(
-            "executor internal remote-command error baseline is invalid"
-        ) from exc
-    if current_internal_errors > baseline_internal_errors:
-        raise ReleaseError(
-            "executor internal remote-command errors increased during release: "
-            f"{baseline_internal_errors}->{current_internal_errors}"
-        )
+    # Unclaimed commands and executor internal errors: per cluster where this
+    # verify's scope and the Store allow, fleet-wide otherwise.
+    remote_commands.judge_remote_commands(release, report)
     return _control_api_pass(release, report, verify)
 
 

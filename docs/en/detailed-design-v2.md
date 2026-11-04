@@ -3324,8 +3324,10 @@ leaves `REVOKED` records out of the coverage comparison (and of the Runtime Prof
 but when every extra Agent is absent from the Kubernetes Node list (`kubernetes_node_ids`, NotReady included) the refusal
 names the switch; the Agent of a NotReady node gets no retire hint. The final verify of `join-cluster` / `remove-cluster` is
 scoped to its target (`regional_verify_scope`: `--joining-cluster-id`, `--removed-cluster-id`): the shared control-plane checks
-fail it as before, the per-cluster checks (`gpu_cluster:<id>`, the cluster's section of `control_api`, the executor verifier,
-the runtime identity of the cluster's Pods, the cluster's part of `regional_contexts`) fail it for the target only, and another
+fail it as before, the per-cluster checks (`gpu_cluster:<id>`, the cluster's section of `control_api` -- with its unclaimed
+remote commands and its executor's internal errors, from the Store's per-cluster values in `regional_admin_checks_remote`,
+fleet-wide when the control plane predates them --, the executor verifier, the runtime identity of the cluster's Pods, the
+cluster's part of `regional_contexts`) fail it for the target only, and another
 cluster's findings are `WARN`s listed under `cluster_scope.not_gating_findings`, its collectors not waited for. In every
 cluster that fails the verify (the target, every cluster of a `deploy`) an Agent without a Ready Node is re-read by
 `regional_release_verify_churn` under the forward path's `DepartureWatch` rule within the 10-minute departure guard: excused
