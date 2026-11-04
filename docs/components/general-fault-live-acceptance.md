@@ -732,8 +732,16 @@ corrected MCE不因上下文丢失而升错级，uncorrectable不被邻近correc
 IA32_MCi_STATUS.UC 清零），产品按状态位降级为 WARNING/RUN_DIAGNOSTICS，因此该变体要求部署含
 `mce_grading` 的发布——旧发布把同一头行当作 uncorrected 并隔离节点；`kernel_lockup` 回放
 `watchdog: BUG: soft lockup - CPU#7 stuck for 23s! [python3:41234]`（`kernel/watchdog.c`）；`rdma_fatal`
-回放 `efa 0000:00:1d.0 efa_0: Wait for completion (polling) timeout`（`drivers/infiniband/hw/efa/efa_com.c`，
-经 `__ibdev_printk` 的 `"%s %s %s: %pV"` 前缀）。journal 回放的合成 cursor 带 run id
+与 `unknown_attempt` 先经内核回放探针只读的 `rdma-devices` 取节点自身 `/sys/class/infiniband` 中首个绑定 `efa`
+的设备名与 PCI BDF，再回放 amzn-drivers 3.3.1g（plain EKS 节点加载的树外 `extra/efa.ko`）管理命令超时时运行期真实
+打印的 `efa <BDF> <ib 设备名>: Failed to process command GET_STATS (opcode 13) err -62`（`efa_com.c`
+`efa_com_cmd_exec()`，`err = -ETIME` 即 -62；经 `__ibdev_printk` 的 `"%s %s %s: %pV"` 前缀），例如
+`efa 0000:55:00.0 rdmap85s0: …`——rdma-core 的 udev 规则按 PCI 位置把每个 EFA 设备改名为 `rdmap<bus>s<slot>`，
+真实节点上没有 `efa_0`。早先回放的 `efa 0000:00:1d.0 efa_0: Wait for completion (polling) timeout` 设备名不是
+任何运行中节点的名字，轮询形式运行期也不会打印（没有管理命令在轮询模式下执行）。b251 之前的产品对真实行不命中任何
+规则（前缀只认 `efa_N`、超时 errno 写成 -110），节点根本不上送：变体注入前先在 API Pod 里只读询问已部署规则表
+（`product-generation` 证据），这种 FAIL 记为预期 FAIL 并写明 `product_gap`，而不是夹具错误；含 b251 的发布之后
+应为 PASS。journal 回放的合成 cursor 带 run id
 （`gfrs-replay-<run>-<index>-<boot>`）：cursor 即采集器的 entry id，控制面由 (cluster, node, entry id) 派生
 incident 的 event id；同一节点同一 boot 上复用 cursor 时，后一次运行的 finding 被归入前一次运行的旧 incident
 （创建于本次开始之前，判定读不到），表现为“no severe kernel-log finding reached a NODE_HEALTH incident”

@@ -31,6 +31,11 @@ boot through the product's own readers, two ways, and nothing else:
   at its end on every EOF skips everything appended in between and the
   reviewed records never reach the control plane (``consumed`` false).
 
+``rdma-devices`` only reads: the node's ``/sys/class/infiniband`` devices with
+the PCI function and driver each sits on, so a reviewed EFA line can carry the
+node's own BDF and ib device name (``efa <PCI BDF> <ib device>: ``, the
+kernel's ``__ibdev_printk()`` prefix).
+
 Everything is bounded and reversible two ways -- the runner's cleanup and a
 ``systemd-run --on-active`` deadman that restores the baseline from a copy of
 this file even if the runner, the probe Pod and the control plane all vanish.
@@ -85,6 +90,12 @@ MAX_EMISSIONS = 16
 #: A record message is carried in every batch until the node recovers, so it is
 #: bounded here the way the collector bounds one entry.
 MAX_MESSAGE_BYTES = 16 * 1024
+#: The host's RDMA class directory, the one thing ``rdma-devices`` lists.
+INFINIBAND_ROOT = Path("/sys/class/infiniband")
+#: An ib device name (``IB_DEVICE_NAME_MAX`` 64) and a PCI function name.
+RDMA_DEVICE_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,63}$")
+PCI_BDF = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$")
+MAX_RDMA_DEVICES = 64
 
 
 class ProbeError(RuntimeError):
@@ -925,6 +936,56 @@ def snapshot(arguments: argparse.Namespace) -> None:
     emit({"run_id": run_id, "window_open": bool(state), "residue": residue})
 
 
+def _link_name(path: Path) -> str | None:
+    try:
+        return path.resolve(strict=True).name
+    except OSError:
+        return None
+
+
+def rdma_devices(arguments: argparse.Namespace) -> None:
+    """The node's RDMA devices as the kernel names them (read-only).
+
+    ``/sys/class/infiniband/<name>`` carries the ib device's current name --
+    ``efa_N`` as the driver registered it, ``rdmap<bus>s<slot>`` once rdma-core's
+    udev rule renamed it -- its ``device`` link the PCI function and
+    ``device/driver`` the bound driver: what ``__ibdev_printk()`` prints as
+    ``<driver> <PCI name> <ib name>: ``. A driver read from the ``uevent``
+    stands in when the link cannot be resolved.
+    """
+
+    devices: list[dict[str, Any]] = []
+    root = INFINIBAND_ROOT
+    for entry in sorted(root.iterdir()) if root.is_dir() else []:
+        if len(devices) >= MAX_RDMA_DEVICES:
+            break
+        if RDMA_DEVICE_NAME.fullmatch(entry.name) is None:
+            continue
+        pci = _link_name(entry / "device")
+        driver = _link_name(entry / "device" / "driver")
+        if driver is None:
+            try:
+                uevent = (entry / "device" / "uevent").read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except OSError:
+                uevent = ""
+            drivers = [
+                line[len("DRIVER=") :]
+                for line in uevent.splitlines()
+                if line.startswith("DRIVER=")
+            ]
+            driver = drivers[0] if len(drivers) == 1 else None
+        devices.append(
+            {
+                "name": entry.name,
+                "pci_bdf": pci if pci and PCI_BDF.fullmatch(pci) else None,
+                "driver": driver,
+            }
+        )
+    emit({"captured_at": utc_now(), "root": str(root), "devices": devices})
+
+
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser()
     commands = value.add_subparsers(dest="command", required=True)
@@ -961,6 +1022,8 @@ def parser() -> argparse.ArgumentParser:
     item = commands.add_parser("snapshot")
     item.add_argument("--run-id", required=True)
     item.set_defaults(handler=snapshot)
+
+    commands.add_parser("rdma-devices").set_defaults(handler=rdma_devices)
     return value
 
 

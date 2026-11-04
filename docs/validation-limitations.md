@@ -2713,10 +2713,54 @@ the earlier run's incident -- created before the run began, hence unreadable by
 the grade -- and 016 `kernel_lockup` / `rdma_fatal` and 017 `cgroup_oom` ended
 "no severe kernel-log finding reached a NODE_HEALTH incident" on 2026-10-26
 without a product defect. Their reviewed lines now follow the kernel's real
-print formats (Linux v6.12): the `kernel/watchdog.c` soft-lockup line, the EFA
-`efa_com.c` completion timeout through the `__ibdev_printk` prefix and the
+print formats (Linux v6.12): the `kernel/watchdog.c` soft-lockup line and the
 `mm/oom_kill.c` "Memory cgroup out of memory: Killed process" line without a
-`kernel:` tag, so the rules are exercised on what a node really logs.
+`kernel:` tag, so those rules are exercised on what a node really logs. The EFA
+line was not, until batch 251 (next paragraph).
+
+016 `rdma_fatal` and `unknown_attempt` replayed `efa 0000:00:1d.0 efa_0: Wait for
+completion (polling) timeout` until batch 251 (desk review 2026-11-04) -- a line
+no live node prints, on two counts. No live node calls an EFA device `efa_N`: the
+driver registers `efa_%d` (amzn-drivers `efa_linux_3.3.1` `efa_main.c` L705,
+https://github.com/amzn/amzn-drivers/tree/efa_linux_3.3.1/kernel/linux/efa/src),
+and rdma-core's udev rule (`kernel-boot/rdma-persistent-naming.rules` L37
+`ACTION=="add", SUBSYSTEM=="infiniband", PROGRAM="rdma_rename %k NAME_FALLBACK"`,
+https://github.com/linux-rdma/rdma-core/blob/v65.0/kernel-boot/rdma-persistent-naming.rules)
+renames it at once after its PCI location: `rdma_rename.c` takes the prefix
+`rdma` when the kernel reports no link protocol, as for EFA (`get_nldata_cb()`
+L657), and appends `by_pci()`'s `p<bus>s<slot>` (L518). `ib_device_rename()`
+(Linux v6.1.189 `drivers/infiniband/core/device.c` L403, `device_rename(&ibdev->dev,
+name)` L420) renames the very name `__ibdev_printk()` prints (`"%s %s %s: %pV"`,
+L195-211). The HyperPod GL-013 driver survey (2026-11-02) lists `rdmap85s0` at
+`0000:55:00.0` and fifteen more; the plain-EKS nodes after the EKS 1.32 roll name
+theirs `rdmap110s0` and so on (read-only SSM, 2026-11-04, 16 IB devices, kernel
+6.1.189-236.400, out-of-tree `extra/efa.ko` 3.3.1g). And no node prints the
+polling form at runtime: none of the four driver sources (Linux v6.1.189 and
+v6.12.103, amzn-drivers 3.3.1 and 3.4.0) runs an admin command in polling mode.
+The product shared the first blind spot: `src/gpu_fault/efa_kernel_log.py`
+took only `efa_\d+` as the device, so `efa 0000:55:00.0 rdmap85s0: Admin queue is
+closed` matched no rule, ranked -1 on the node and was never shipped -- only the
+probe-time `(null):` lines and the `dev_err` `efa <bdf>:` lines matched -- and its
+timeout errno was -110 (`ETIMEDOUT`), while a timed-out admin command returns
+`-ETIME`, -62 (`include/uapi/asm-generic/errno.h` v6.1.189 L45 `#define ETIME 62`,
+https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/include/uapi/asm-generic/errno.h?h=v6.1.189;
+`err = -ETIME` in v6.1.189 `efa_com.c` L522/L573 and 3.3.1 L619/L671). Batch 251
+takes `efa <BDF> <ib device>:` with any device name, grades `err -62`, and makes
+the out-of-tree `Completion context[%u] is used[%u]` fatal: 3.3.1's
+`efa_com_cmd_exec()` closes the admin queue after it and prints nothing more
+(L731-736); the in-tree `... is occupied` stays degraded because the same call
+prints the fatal `Failed to submit command ... err -22`. The replay now reads the
+node's own EFA device and BDF from `/sys/class/infiniband` (the kernel probe's
+read-only `rdma-devices`) and installs what 3.3.1g prints when an admin command
+times out, `efa <BDF> <ib device>: Failed to process command GET_STATS (opcode 13)
+err -62` (`efa_com.c` L756). Before the release that carries batch 251 the
+variant asks the deployed rule table first (read-only, in an API Pod) and
+records its FAIL as the expected one, naming the gap (`product_gap`). Not
+verified: which EFA module HyperPod loads (in-tree v6.12.103 or out-of-tree; both
+spellings are graded); the rdma-core version on the nodes (the rule and the name
+read the same in v28.0 and v65.0); whether the installer builds the kernel-verbs
+variant; and the site evidence holds no real EFA fatal line, so the grading is
+pinned on the drivers' own format strings, not on an observed fault.
 
 016 `cursor_pagination` read FAIL on every live run -- HyperPod and plain EKS
 on 2026-10-26 (R13g) and plain EKS on 2026-10-27 (R13h, after b190 changed the

@@ -757,6 +757,9 @@ rules:
       - tests/regional/test_general_live_env_replay.py
       - tests/regional/test_general_live_kernel_xid.py
       - tests/regional/test_general_live_kernel_replay.py
+      # 016's reviewed lines against the product's own rules, the rdma_fatal
+      # replay on the node's own EFA device (batch 251).
+      - tests/regional/test_general_live_kernel.py
       - tests/regional/test_general_live_gpu_fields.py
       - tests/regional/test_general_live_gpu_identity.py
       - tests/regional/test_general_live_gpu_probe.py

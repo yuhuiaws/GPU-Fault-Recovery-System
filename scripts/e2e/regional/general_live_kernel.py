@@ -30,12 +30,24 @@ format and not a paraphrase (Linux v6.12 unless noted):
 * ``kernel_lockup``: ``kernel/watchdog.c`` ``watchdog_timer_fn()``
   ``pr_emerg("BUG: soft lockup - CPU#%d stuck for %us! [%s:%d]\n", ...)`` under
   ``pr_fmt "watchdog: "``.
-* ``rdma_fatal``: ``drivers/infiniband/hw/efa/efa_com.c``
-  ``efa_com_wait_and_process_admin_cq_polling()`` ``ibdev_err_ratelimited(...,
-  "Wait for completion (polling) timeout\n")`` -- the device stopped answering
-  its admin queue and the driver closes it -- printed through
-  ``drivers/infiniband/core/device.c`` ``__ibdev_printk()`` as ``"%s %s %s:
-  %pV"`` = ``efa <pci address> efa_0: ...``.
+* ``rdma_fatal`` and ``unknown_attempt``: what amzn-drivers ``efa_linux_3.3.1``
+  (the ``extra/efa.ko`` 3.3.1g the nodes load) prints when an admin command
+  times out -- ``efa_com.c`` ``efa_com_wait_and_process_admin_cq_interrupts()``
+  closes the queue with ``err = -ETIME`` and ``efa_com_cmd_exec()`` reports
+  ``"Failed to process command %s (opcode %u) err %d\n"``, ``-ETIME`` being
+  -62 -- through ``drivers/infiniband/core/device.c`` ``__ibdev_printk()``'s
+  ``"%s %s %s: %pV"`` prefix with the node's own PCI function and ib device
+  (the probe's read-only ``rdma-devices``: the first ``/sys/class/infiniband``
+  device bound to ``efa``), e.g. ``efa 0000:55:00.0 rdmap85s0: Failed to
+  process command GET_STATS (opcode 13) err -62``. rdma-core's udev rule
+  renames every EFA device after its PCI location, so no running node has an
+  ``efa_0``; the earlier replay's ``efa 0000:00:1d.0 efa_0: Wait for
+  completion (polling) timeout`` also used a form no node prints at runtime
+  (no admin command runs in polling mode). A product before batch 251 matches
+  no rule on the real line (its prefix takes only ``efa_N``, its timeout
+  errno is -110), so its node never ships it: the variant first asks the
+  deployed rule table (``EFA_LINE_GENERATION_PROBE``, read-only) and records
+  such a FAIL as the expected one, with the gap named (``product_gap``).
 * ``uncorrectable_mce`` and ``readonly_storage`` keep their earlier reviewed
   wording: the rule names the very words they carry (``uncorrected``,
   ``Remounting filesystem read-only``), and the kernel's own forms of them
@@ -54,16 +66,20 @@ follows each record through its own finding's marker.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import re
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from scripts.e2e.regional.general_live_common import activity
 from scripts.e2e.regional.general_live_fixture import (
     VariantContext,
     VariantInconclusive,
+    VariantNotRun,
     utc_now,
 )
 from scripts.e2e.regional.general_live_kernel_replay import (
+    KernelLogReplay,
     kernel_replay,
     replay_entry_prefix,
     reviewed_record,
@@ -83,6 +99,7 @@ from scripts.e2e.regional.general_live_verdicts import (
     verdict,
     workflows_of,
 )
+from scripts.e2e.regional.regional_commands import RegionalFixtureError
 
 CASE = "GF-GENERAL-LIVE-016"
 ENABLE = "ENABLE_NODE_LOG_COLLECTOR"
@@ -151,7 +168,6 @@ def _severe(
 SEVERE_MESSAGES = {
     "uncorrectable_mce": "mce: [Hardware Error]: Machine check events logged: uncorrected error CPU 3",
     "readonly_storage": "EXT4-fs (nvme1n1): Remounting filesystem read-only after I/O error",
-    "rdma_fatal": "efa 0000:00:1d.0 efa_0: Wait for completion (polling) timeout",
     "kernel_lockup": "watchdog: BUG: soft lockup - CPU#7 stuck for 23s! [python3:41234]",
 }
 #: ``__print_mce()`` header of a corrected, polled record: "Machine Check:"
@@ -163,14 +179,169 @@ CORRECTED_MCE_MESSAGE = (
 
 
 # --------------------------------------------------------------------------- #
+# rdma_fatal / unknown_attempt: the node's own EFA device, a line 3.3.1g prints
+# --------------------------------------------------------------------------- #
+#: amzn-drivers ``efa_linux_3.3.1`` ``efa_com.c``: the interrupt-mode wait sets
+#: ``err = -ETIME`` (L671) and ``efa_com_cmd_exec()`` prints ``"Failed to process
+#: command %s (opcode %u) err %d\n"`` (L756); ``-ETIME`` is -62 (Linux
+#: ``include/uapi/asm-generic/errno.h`` ``#define ETIME 62``). GET_STATS (13) is
+#: the admin command a read of the port's ``hw_counters`` issues (``efa_verbs.c``
+#: ``efa_fill_port_stats()`` -> ``efa_com_get_stats()``).
+RDMA_FATAL_TEXT = "Failed to process command GET_STATS (opcode 13) err -62"
+#: An ib device name and the PCI function name its ``device`` link carries.
+EFA_DEVICE_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,63}$")
+EFA_PCI_BDF = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$")
+NO_EFA_DEVICE = (
+    "no EFA RDMA device (an ib device bound to driver efa on a PCI function) in "
+    "the node's /sys/class/infiniband"
+)
+#: What the product's rule table must make of the reviewed line: the RDMA
+#: CRITICAL QUARANTINE rule (``log_rules``), category / severity / action values.
+RDMA_FATAL_RULE = ["RDMA", "critical", "QUARANTINE"]
+GENERATION_EVIDENCE = "product-generation"
+#: The named reason of the expected FAIL on a product before batch 251.
+PRE_B251_GENERATION = "expected on this product generation"
+EFA_RENAMED_DEVICE_GAP = (
+    "the deployed EFA kernel-log vocabulary predates batch 251 "
+    "(src/gpu_fault/efa_kernel_log.py): its device prefix takes only an ib device "
+    "named efa_N and its timeout errno is -110, while rdma-core's udev rule renames "
+    "every live node's EFA device rdmap<bus>s<slot> and a timed-out admin command "
+    "returns -ETIME (-62); the node's log collector matches no rule on the line and "
+    "never ships it, so nothing isolates the node"
+)
+
+#: Read-only, in an API Pod: what the deployed product's own rule table makes
+#: of the reviewed line. The node collector ships an entry only when a rule
+#: matches it (``collectors/logs/node.py``, ``matching_log_rules`` without an
+#: origin) and the control plane grades it from the trusted ``dmesg`` origin;
+#: both run the table of one release. ``argv``: the reviewed line.
+EFA_LINE_GENERATION_PROBE = r"""
+import json
+import sys
+
+message = sys.argv[1]
+result = {"present": False}
+try:
+    from gpu_fault.log_rules import matching_log_rules
+
+    def view(rules):
+        return [
+            [rule.category.value, rule.severity.value, rule.action.value]
+            for rule in rules
+        ]
+
+    result.update(
+        present=True,
+        shipped=view(matching_log_rules(message)),
+        trusted=view(matching_log_rules(message, "dmesg")),
+    )
+except Exception as exc:
+    result["error"] = f"{type(exc).__name__}: {exc}"[:300]
+print(json.dumps(result, sort_keys=True))
+"""
+
+
+@dataclass(frozen=True)
+class EfaDevice:
+    """One EFA RDMA device under the name the node gives it now."""
+
+    #: ``rdmap<bus>s<slot>`` once rdma-core's udev rule renamed it (every live
+    #: node), ``efa_N`` as the driver registered it.
+    name: str
+    #: The PCI function its ``device`` link names.
+    pci_bdf: str
+
+    @property
+    def prefix(self) -> str:
+        """``__ibdev_printk()``'s ``"%s %s %s: "``: driver, PCI name, ib name."""
+
+        return f"efa {self.pci_bdf} {self.name}: "
+
+    def describe(self) -> dict[str, str]:
+        return {"name": self.name, "pci_bdf": self.pci_bdf, "prefix": self.prefix}
+
+
+def efa_device(inventory: Mapping[str, Any]) -> EfaDevice:
+    """The first EFA device (by name) of the probe's ``rdma-devices`` answer."""
+
+    entries = [
+        item for item in inventory.get("devices") or [] if isinstance(item, Mapping)
+    ]
+    for item in sorted(entries, key=lambda entry: str(entry.get("name") or "")):
+        name, bdf = str(item.get("name") or ""), str(item.get("pci_bdf") or "")
+        if (
+            item.get("driver") == "efa"
+            and EFA_DEVICE_NAME.fullmatch(name)
+            and EFA_PCI_BDF.fullmatch(bdf)
+        ):
+            return EfaDevice(name, bdf)
+    raise VariantNotRun("CAPABILITY_ABSENT", NO_EFA_DEVICE)
+
+
+def rdma_fatal_message(device: EfaDevice) -> str:
+    """The reviewed ``rdma_fatal`` line as ``device``'s node prints it."""
+
+    return device.prefix + RDMA_FATAL_TEXT
+
+
+@dataclass(frozen=True)
+class EfaLineGeneration:
+    """The deployed product's answer to ``EFA_LINE_GENERATION_PROBE``."""
+
+    message: str
+    control_plane: dict[str, Any]
+
+    @property
+    def graded(self) -> bool:
+        """The node ships the line and the control plane quarantines on it."""
+
+        answer = self.control_plane
+        return (
+            answer.get("present") is True
+            and bool(answer.get("shipped"))
+            and RDMA_FATAL_RULE in (answer.get("trusted") or [])
+        )
+
+    def describe(self) -> str:
+        answer = self.control_plane
+        if answer.get("present") is not True:
+            return f"the probe could not read the rule table: {answer.get('error')}"
+        return (
+            f"node-side rules {answer.get('shipped') or 'none'}, trusted-origin "
+            f"rules {answer.get('trusted') or 'none'}"
+        )
+
+    def record(self) -> dict[str, Any]:
+        return {
+            "message": self.message,
+            "graded": self.graded,
+            "description": self.describe(),
+            "control_plane": dict(self.control_plane),
+        }
+
+
+def efa_line_generation(ctx: VariantContext, message: str) -> EfaLineGeneration:
+    """Ask the deployed product; the answer is the evidence ``product-generation``."""
+
+    answer = ctx.regional.cpu_python(EFA_LINE_GENERATION_PROBE, message, timeout=120)
+    value = EfaLineGeneration(message, dict(answer) if isinstance(answer, dict) else {})
+    ctx.evidence.write(GENERATION_EVIDENCE, value.record())
+    return value
+
+
+# --------------------------------------------------------------------------- #
 # driver
 # --------------------------------------------------------------------------- #
 def _drive(
-    ctx: VariantContext, records: list[dict[str, Any]], *, restore_seconds: int
+    ctx: VariantContext,
+    records: list[dict[str, Any]],
+    *,
+    restore_seconds: int,
+    replay: KernelLogReplay | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Install, open (approved), arm; return (started_at, injection oracle)."""
 
-    replay = kernel_replay(ctx, mode="journal")
+    replay = replay if replay is not None else kernel_replay(ctx, mode="journal")
     replay.create()
     replay.install(records)
     opened = replay.open(approved=True, restore_seconds=restore_seconds)
@@ -240,9 +411,18 @@ def _wait_log_incident(
     return value if value is not None else last
 
 
-def _quarantine_variant(ctx: VariantContext, variant: str) -> dict[str, Any]:
-    records = _severe(SEVERE_MESSAGES[variant])
-    started, oracle = _drive(ctx, records, restore_seconds=ctx.spec.max_minutes * 60)
+def _quarantine_variant(
+    ctx: VariantContext,
+    variant: str,
+    *,
+    records: list[dict[str, Any]] | None = None,
+    replay: KernelLogReplay | None = None,
+) -> dict[str, Any]:
+    if records is None:
+        records = _severe(SEVERE_MESSAGES[variant])
+    started, oracle = _drive(
+        ctx, records, restore_seconds=ctx.spec.max_minutes * 60, replay=replay
+    )
     observed = _wait_log_incident(
         ctx,
         started,
@@ -305,8 +485,76 @@ def readonly_storage(ctx: VariantContext) -> dict[str, Any]:
     return _quarantine_variant(ctx, "readonly_storage")
 
 
+def _rdma_records(
+    ctx: VariantContext,
+) -> tuple[KernelLogReplay, list[dict[str, Any]], EfaLineGeneration]:
+    """The reviewed line on the node's own EFA device, and the product's view."""
+
+    replay = kernel_replay(ctx, mode="journal")
+    inventory = replay.rdma_devices()
+    device = efa_device(inventory)
+    message = rdma_fatal_message(device)
+    ctx.evidence.write(
+        "efa-device",
+        {
+            "device": device.describe(),
+            "message": message,
+            "devices": list(inventory.get("devices") or [])[:32],
+        },
+    )
+    return replay, _severe(message), efa_line_generation(ctx, message)
+
+
+def _rdma_variant(
+    ctx: VariantContext,
+    grade: Callable[
+        [VariantContext, list[dict[str, Any]], KernelLogReplay], dict[str, Any]
+    ],
+) -> dict[str, Any]:
+    """Grade the reviewed EFA line; an older product's FAIL is the named gap.
+
+    A FAIL also records whether the control plane ever received the record
+    (``received_entries``): none means the node did not ship it, some means
+    the control plane did not act on it. That read is evidence only; a failed
+    read never turns the grade into a harness error.
+    """
+
+    replay, records, generation = _rdma_records(ctx)
+    since = utc_now()
+    result = grade(ctx, records, replay)
+    result["product_generation"] = generation.record()
+    if result.get("verdict") != "FAIL":
+        return result
+    try:
+        received = received_entries(ctx, since, replay_entry_prefix(ctx.run_id, 0))
+    except RegionalFixtureError as error:
+        result["received_error"] = f"{type(error).__name__}: {error}"[:300]
+        copies = "an unreadable number of"
+    else:
+        result["received"] = received[:4]
+        copies = str(len(received))
+    if not generation.graded:
+        # The runner never flips a verdict; the record says which FAIL it is.
+        result.update(
+            expected_outcome="FAIL",
+            product_gap=EFA_RENAMED_DEVICE_GAP,
+            expected_gap=EFA_RENAMED_DEVICE_GAP,
+        )
+        result["notes"] = [
+            *result.get("notes", []),
+            f"{PRE_B251_GENERATION}: {generation.describe()}; the control plane "
+            f"stored {copies} cop(ies) of the reviewed record",
+        ]
+    return result
+
+
 def rdma_fatal(ctx: VariantContext) -> dict[str, Any]:
-    return _quarantine_variant(ctx, "rdma_fatal")
+    return _rdma_variant(
+        ctx,
+        lambda context, records, replay: _quarantine_variant(
+            context, "rdma_fatal", records=records, replay=replay
+        ),
+    )
 
 
 def kernel_lockup(ctx: VariantContext) -> dict[str, Any]:
@@ -512,8 +760,15 @@ def old_boot(ctx: VariantContext) -> dict[str, Any]:
 def unknown_attempt(ctx: VariantContext) -> dict[str, Any]:
     """A severe kernel line with no resolvable attempt: isolate, but no STOP."""
 
-    records = _severe(SEVERE_MESSAGES["rdma_fatal"])
-    started, _ = _drive(ctx, records, restore_seconds=ctx.spec.max_minutes * 60)
+    return _rdma_variant(ctx, _unknown_attempt)
+
+
+def _unknown_attempt(
+    ctx: VariantContext, records: list[dict[str, Any]], replay: KernelLogReplay
+) -> dict[str, Any]:
+    started, _ = _drive(
+        ctx, records, restore_seconds=ctx.spec.max_minutes * 60, replay=replay
+    )
     observed = _wait_log_incident(
         ctx, started, policy_source="SITE_KERNEL_LOG", minimum=1, name="unknown-attempt"
     )
@@ -743,8 +998,11 @@ VARIANTS = [
     ),
     _spec(
         "rdma_fatal",
-        "reviewed kernel-transport EFA admin-queue 'Wait for completion (polling) timeout' line",
-        "RDMA CRITICAL -> cordon + quarantine + notification; no unauthorized reboot",
+        "reviewed kernel-transport EFA admin-command timeout line 'efa <BDF> <ib device>: "
+        "Failed to process command GET_STATS (opcode 13) err -62' (amzn-drivers 3.3.1g, "
+        "-ETIME) on the node's own /sys/class/infiniband EFA device",
+        "RDMA CRITICAL -> cordon + quarantine + notification; no unauthorized reboot "
+        "(before batch 251 the expected FAIL: the node never ships the line)",
         rdma_fatal,
         risk="H",
     ),
@@ -780,7 +1038,8 @@ VARIANTS = [
     ),
     _spec(
         "unknown_attempt",
-        "a reviewed severe kernel line with no managed attempt to attribute it to",
+        "a reviewed severe kernel line (the rdma_fatal EFA timeout on the node's own "
+        "device) with no managed attempt to attribute it to",
         "the node is isolated and quarantined, but no workload is stopped (no guessed job)",
         unknown_attempt,
         risk="H",

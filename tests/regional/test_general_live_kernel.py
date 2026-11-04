@@ -11,14 +11,18 @@ from __future__ import annotations
 
 import base64
 import json
+import sys
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from gpu_fault.host_health import NodeHealthPolicy, NodeLogBatch, NodeLogEntry
 from gpu_fault.models import RecoveryAction, Severity
 from scripts.e2e.regional import general_live_kernel as mod
+from scripts.e2e.regional.general_live_fixture import VariantNotRun
 from scripts.e2e.regional.general_live_kernel_replay import replay_entry_prefix
 from scripts.e2e.regional.general_live_registry import coverage_rows
 from tests._builders import build_store
@@ -32,6 +36,20 @@ from tests.regional._general_live_fakes import (
 
 NODE = "ip-10-0-43-5.us-west-2.compute.internal"
 NOW = datetime(2026, 10, 1, 12, tzinfo=timezone.utc)
+#: ``rdma-devices`` on a live node: rdma-core's udev rule named every EFA
+#: device after its PCI location (HyperPod GL-013 survey, plain EKS 11-04).
+RDMA_DEVICES = {
+    "devices": [
+        {"name": "rdmap86s0", "pci_bdf": "0000:56:00.0", "driver": "efa"},
+        {"name": "rdmap85s0", "pci_bdf": "0000:55:00.0", "driver": "efa"},
+        {"name": "mlx5_0", "pci_bdf": "0000:3b:00.0", "driver": "mlx5_core"},
+    ]
+}
+#: The reviewed ``rdma_fatal`` line those devices make (first EFA by name).
+LIVE_RDMA_FATAL = (
+    "efa 0000:55:00.0 rdmap85s0: Failed to process command GET_STATS (opcode 13) "
+    "err -62"
+)
 
 
 def _spec(variant: str) -> object:
@@ -48,7 +66,54 @@ def _host_script() -> dict[str, object]:
         "arm": {"armed": True},
         "status": {"injected": {"emission_counts": {"0": 2}}},
         "close-window": {"clean": True},
+        "rdma-devices": RDMA_DEVICES,
     }
+
+
+def _generation_answer(message: str) -> dict[str, Any]:
+    """``EFA_LINE_GENERATION_PROBE`` run in-process over this product."""
+
+    import contextlib
+    import io
+
+    out = io.StringIO()
+    argv = sys.argv
+    sys.argv = ["efa-line-generation-probe", message]
+    try:
+        with contextlib.redirect_stdout(out):
+            exec(  # noqa: S102 - the reviewed probe text, as the API Pod runs it
+                compile(mod.EFA_LINE_GENERATION_PROBE, "<efa-generation>", "exec"),
+                {"__name__": "__main__"},
+            )
+    finally:
+        sys.argv = argv
+    return json.loads(out.getvalue().strip().splitlines()[-1])
+
+
+def _efa_store(
+    activity: dict[str, object],
+    *,
+    generation: dict[str, Any] | None = None,
+    received: list[dict[str, Any]] | Exception | None = None,
+) -> Callable[..., dict[str, Any]]:
+    """``store_script`` plus the two reads an EFA variant adds: the product's
+    rule table (the real probe over this product unless ``generation``) and
+    the control plane's copies of the reviewed record."""
+
+    base = store_script({"activity": activity})
+
+    def dispatch(script: str, *arguments: str) -> dict[str, Any]:
+        if script == mod.EFA_LINE_GENERATION_PROBE:
+            if generation is not None:
+                return dict(generation)
+            return _generation_answer(arguments[0])
+        if script == mod.NODE_LOG_ENTRY_PROBE:
+            if isinstance(received, Exception):
+                raise received
+            return {"entries": list(received or [])}
+        return base(script, *arguments)
+
+    return dispatch
 
 
 def _log_incident(
@@ -152,13 +217,169 @@ def test_rdma_fatal_quarantines_and_notifies(tmp_path: Path) -> None:
         notifications=[_notification()],
     )
     regional = FakeRegional(
-        cpu_python=store_script({"activity": activity}),
-        node_snapshot=_isolated_node(True),
+        cpu_python=_efa_store(activity), node_snapshot=_isolated_node(True)
     )
-    ctx, _ = _ctx("rdma_fatal", regional=regional, tmp_path=tmp_path)
+    ctx, fake = _ctx("rdma_fatal", regional=regional, tmp_path=tmp_path)
     result = mod.rdma_fatal(ctx)
     assert result["verdict"] == "PASS", result["errors"]
     assert result["proof_scope"] == "live-replay", result
+    assert result["product_generation"]["graded"] is True, result["product_generation"]
+    assert "product_gap" not in result, "this product grades the line: no gap"
+    install = next(call for call in fake.calls if call[0] == "install-records")
+    [record] = json.loads(base64.b64decode(install[install.index("--b64") + 1]))
+    assert record["message"] == LIVE_RDMA_FATAL, record
+    assert record["transport"] == "kernel", record
+    order = [call[0] for call in fake.calls]
+    assert order.index("rdma-devices") < order.index("install-records"), (
+        "the device is read before anything is installed"
+    )
+
+
+def test_rdma_fatal_before_b251_is_the_expected_fail_with_the_gap_named(
+    tmp_path: Path,
+) -> None:
+    # A product whose prefix takes only efa_N and whose timeout errno is -110
+    # matches no rule on the node's real line: the node never ships it, nothing
+    # is minted and the node stays schedulable. That FAIL is the gap, named.
+    regional = FakeRegional(
+        cpu_python=_efa_store(
+            _activity(incidents=[], workflows=[]),
+            generation={"present": True, "shipped": [], "trusted": []},
+        ),
+        node_snapshot=_isolated_node(False),
+    )
+    ctx, _ = _ctx("rdma_fatal", regional=regional, tmp_path=tmp_path)
+    result = mod.rdma_fatal(ctx)
+    assert result["verdict"] == "FAIL", "the runner never flips a verdict"
+    assert result["expected_outcome"] == "FAIL", result
+    assert result["product_gap"] == mod.EFA_RENAMED_DEVICE_GAP, result
+    assert result["expected_gap"] == mod.EFA_RENAMED_DEVICE_GAP, result
+    assert result["product_generation"]["graded"] is False, result
+    assert any(note.startswith(mod.PRE_B251_GENERATION) for note in result["notes"]), (
+        result["notes"]
+    )
+    assert result["received"] == [], "the node never shipped the line"
+    assert "batch 251" in mod.EFA_RENAMED_DEVICE_GAP, "the gap names its fix"
+
+
+def test_a_failed_read_of_the_received_copies_leaves_the_fail_graded(
+    tmp_path: Path,
+) -> None:
+    from scripts.e2e.regional.regional_commands import RegionalFixtureError
+
+    regional = FakeRegional(
+        cpu_python=_efa_store(
+            _activity(incidents=[], workflows=[]),
+            generation={"present": True, "shipped": [], "trusted": []},
+            received=RegionalFixtureError("the API Pod was replaced"),
+        ),
+        node_snapshot=_isolated_node(False),
+    )
+    ctx, _ = _ctx("rdma_fatal", regional=regional, tmp_path=tmp_path)
+    result = mod.rdma_fatal(ctx)
+    assert result["verdict"] == "FAIL", result
+    assert result["product_gap"] == mod.EFA_RENAMED_DEVICE_GAP, result
+    assert "the API Pod was replaced" in result["received_error"], result
+
+
+def test_a_graded_line_that_still_fails_is_a_plain_fail(tmp_path: Path) -> None:
+    # The deployed product grades the line, yet nothing came of it: a product
+    # (or delivery) failure of its own, never relabelled as the b251 gap.
+    regional = FakeRegional(
+        cpu_python=_efa_store(_activity(incidents=[], workflows=[])),
+        node_snapshot=_isolated_node(False),
+    )
+    ctx, _ = _ctx("rdma_fatal", regional=regional, tmp_path=tmp_path)
+    result = mod.rdma_fatal(ctx)
+    assert result["verdict"] == "FAIL", result
+    assert result["product_generation"]["graded"] is True, result
+    assert "product_gap" not in result and "expected_gap" not in result, result
+    assert result.get("expected_outcome", "PASS") == "PASS", result
+
+
+def test_rdma_fatal_without_an_efa_device_is_not_run(tmp_path: Path) -> None:
+    regional = FakeRegional(
+        cpu_python=_efa_store(_activity(incidents=[], workflows=[])),
+        node_snapshot=_isolated_node(False),
+    )
+    spec = _spec("rdma_fatal")
+    fake = FakeProbe(
+        {
+            **_host_script(),
+            "rdma-devices": {
+                "devices": [
+                    {"name": "mlx5_0", "pci_bdf": "0000:3b:00.0", "driver": "mlx5_core"}
+                ]
+            },
+        }
+    )
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=regional,
+        probes={f"kernel-replay-journal@{NODE}": fake},
+        settings=make_settings(spec, node=NODE),
+        window_minutes=60,
+    )
+    with pytest.raises(VariantNotRun) as raised:
+        mod.rdma_fatal(ctx)
+    assert raised.value.reason == "CAPABILITY_ABSENT", raised.value
+    assert [call[0] for call in fake.calls] == ["rdma-devices"], (
+        "nothing is installed on a node without an EFA device"
+    )
+
+
+@pytest.mark.parametrize(
+    "devices, expected",
+    [
+        (RDMA_DEVICES["devices"], ("rdmap85s0", "0000:55:00.0")),
+        # The registered name, before rdma-core renamed it.
+        (
+            [{"name": "efa_0", "pci_bdf": "0000:00:1d.0", "driver": "efa"}],
+            ("efa_0", "0000:00:1d.0"),
+        ),
+        # A device whose PCI function or driver did not read is skipped.
+        (
+            [
+                {"name": "rdmap100s0", "pci_bdf": None, "driver": "efa"},
+                {"name": "rdmap101s0", "pci_bdf": "0000:65:00.0", "driver": None},
+                {"name": "rdmap110s0", "pci_bdf": "0000:6e:00.0", "driver": "efa"},
+            ],
+            ("rdmap110s0", "0000:6e:00.0"),
+        ),
+    ],
+)
+def test_efa_device_takes_the_first_efa_function_by_name(
+    devices: list[dict[str, Any]], expected: tuple[str, str]
+) -> None:
+    device = mod.efa_device({"devices": devices})
+    assert (device.name, device.pci_bdf) == expected, device
+    assert device.prefix == f"efa {expected[1]} {expected[0]}: ", device
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        mod.EfaDevice("rdmap85s0", "0000:55:00.0"),
+        mod.EfaDevice("rdmap110s0", "0000:6e:00.0"),
+        mod.EfaDevice("efa_0", "0000:00:1d.0"),
+    ],
+)
+def test_the_reviewed_efa_line_is_graded_critical_quarantine_by_the_product(
+    device: mod.EfaDevice,
+) -> None:
+    message = mod.rdma_fatal_message(device)
+    assert message == (
+        f"efa {device.pci_bdf} {device.name}: "
+        "Failed to process command GET_STATS (opcode 13) err -62"
+    ), "__ibdev_printk()'s driver, PCI name and ib name before the 3.3.1g text"
+    assert _product_decision(message) == (
+        Severity.CRITICAL,
+        RecoveryAction.QUARANTINE,
+        "SITE_KERNEL_LOG",
+    ), message
+    answer = _generation_answer(message)
+    assert mod.EfaLineGeneration(message, answer).graded is True, answer
 
 
 def test_quarantine_fails_when_workflow_plans_hardware(tmp_path: Path) -> None:
@@ -231,7 +452,7 @@ def _product_decision(message: str) -> tuple[Severity, RecoveryAction, str]:
 
 
 @pytest.mark.parametrize(
-    "variant", ["uncorrectable_mce", "readonly_storage", "rdma_fatal", "kernel_lockup"]
+    "variant", ["uncorrectable_mce", "readonly_storage", "kernel_lockup"]
 )
 def test_severe_reviewed_lines_are_graded_critical_quarantine_by_the_product(
     variant: str,
@@ -465,12 +686,14 @@ def test_unknown_attempt_isolates_without_stop(tmp_path: Path) -> None:
         ],
     )
     regional = FakeRegional(
-        cpu_python=store_script({"activity": activity}),
-        node_snapshot=_isolated_node(True),
+        cpu_python=_efa_store(activity), node_snapshot=_isolated_node(True)
     )
-    ctx, _ = _ctx("unknown_attempt", regional=regional, tmp_path=tmp_path)
+    ctx, fake = _ctx("unknown_attempt", regional=regional, tmp_path=tmp_path)
     result = mod.unknown_attempt(ctx)
     assert result["verdict"] == "PASS", result["errors"]
+    install = next(call for call in fake.calls if call[0] == "install-records")
+    [record] = json.loads(base64.b64decode(install[install.index("--b64") + 1]))
+    assert record["message"] == LIVE_RDMA_FATAL, "the node's own EFA device"
 
 
 def test_unknown_attempt_fails_if_it_stops_a_workload(tmp_path: Path) -> None:

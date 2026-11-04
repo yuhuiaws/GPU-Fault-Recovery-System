@@ -751,3 +751,73 @@ def test_controller_arms_one_kmsg_record_and_refuses_it_in_journal_mode(
     journal, _ = _controller(tmp_path, {"arm": {"armed": True}})
     with pytest.raises(ValueError, match="kmsg"):
         journal.arm(index=0)
+
+
+# --------------------------------------------------------------------------- #
+# rdma-devices: the node's own EFA device names and PCI functions (read-only)
+# --------------------------------------------------------------------------- #
+def _rdma_tree(tmp_path: Path) -> Path:
+    """A ``/sys/class/infiniband`` the way sysfs lays it out: each ib device a
+    link-resolved ``device`` (the PCI function) with a ``driver`` link."""
+
+    pci = tmp_path / "devices" / "pci0000:00"
+    drivers = tmp_path / "bus" / "pci" / "drivers"
+    (drivers / "efa").mkdir(parents=True)
+    (drivers / "mlx5_core").mkdir()
+    root = tmp_path / "class" / "infiniband"
+    root.mkdir(parents=True)
+    for name, bdf, driver in (
+        ("rdmap85s0", "0000:55:00.0", "efa"),
+        ("rdmap86s0", "0000:56:00.0", None),
+        ("mlx5_0", "0000:3b:00.0", "mlx5_core"),
+    ):
+        function = pci / bdf
+        function.mkdir(parents=True)
+        if driver is not None:
+            (function / "driver").symlink_to(drivers / driver)
+        else:
+            # No driver link: the uevent's DRIVER= stands in.
+            (function / "uevent").write_text("DRIVER=efa\nPCI_ID=1D0F:EFA3\n")
+        device = root / name
+        device.mkdir()
+        (device / "device").symlink_to(function)
+    # A name the probe refuses to report, and a device whose link dangles.
+    (root / "bad name").mkdir()
+    (root / "rdmap99s0").mkdir()
+    (root / "rdmap99s0" / "device").symlink_to(tmp_path / "gone")
+    return root
+
+
+def test_rdma_devices_reports_each_ib_device_with_its_pci_function_and_driver(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    monkeypatch.setattr(probe, "INFINIBAND_ROOT", _rdma_tree(tmp_path))
+    probe.rdma_devices(argparse.Namespace())
+    answer = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert answer["devices"] == [
+        {"name": "mlx5_0", "pci_bdf": "0000:3b:00.0", "driver": "mlx5_core"},
+        {"name": "rdmap85s0", "pci_bdf": "0000:55:00.0", "driver": "efa"},
+        {"name": "rdmap86s0", "pci_bdf": "0000:56:00.0", "driver": "efa"},
+        {"name": "rdmap99s0", "pci_bdf": None, "driver": None},
+    ], answer
+    assert probe.parser().parse_args(["rdma-devices"]).handler is probe.rdma_devices, (
+        "the parser routes the read-only listing"
+    )
+
+
+def test_rdma_devices_without_an_rdma_class_reports_none(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    monkeypatch.setattr(probe, "INFINIBAND_ROOT", tmp_path / "absent")
+    probe.rdma_devices(argparse.Namespace())
+    answer = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert answer["devices"] == [], answer
+
+
+def test_controller_reads_the_rdma_devices_without_a_window(tmp_path: Path) -> None:
+    devices = {"devices": [{"name": "rdmap85s0", "pci_bdf": "0000:55:00.0"}]}
+    controller, fake = _controller(tmp_path, {"rdma-devices": devices})
+    assert controller.rdma_devices() == devices, "the probe's answer as it is"
+    assert fake.calls == [("rdma-devices",)], (
+        "a read-only listing: no run state, no window, no approval"
+    )

@@ -28,6 +28,7 @@ API (all through the one host-probe Pod, ``probes/general_live_kernel_source_pro
     replay.arm()                 # start emitting the reviewed records
     replay.arm(index=1)          # kmsg mode: emit reviewed record 1 alone, now
     ingested = replay.read_back()  # the runner's oracle of what was injected
+    replay.rdma_devices()        # read-only: the node's RDMA devices and BDFs
     ...                          # the caller reads the product's own records
     replay.cleanup()             # remove the wrapper/drop-in, restore, verify
 
@@ -188,6 +189,13 @@ class KernelLogReplay:
 
     def preflight(self) -> dict[str, Any]:
         return self.host.execute("preflight", timeout=120)
+
+    def rdma_devices(self) -> dict[str, Any]:
+        """The node's ``/sys/class/infiniband`` devices with the PCI function
+        and driver each sits on (read-only; no window, no approval)."""
+
+        self.create()
+        return self.host.execute("rdma-devices", timeout=60)
 
     def install(self, records: list[dict[str, Any]]) -> dict[str, Any]:
         """Install the reviewed record set; sha256 is checked on the node."""
