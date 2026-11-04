@@ -52,6 +52,7 @@ DEADLINE = datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc)
 STANDARD_RUNNERS = (
     "run_boot036_eks_nodegroup_plan",
     "run_boot037_eks_nodegroup_roll",
+    "run_boot038_cross_cluster_membership",
     "run_collect016_training_recovery",
     "run_collect021_late_xid_after_pod_death",
     "run_collect017_efa_plugin",

@@ -45,6 +45,8 @@ phases:
         predecessor: GF-REGIONAL-BOOT-027
       - case: GF-REGIONAL-BOOT-029
         predecessor: GF-REGIONAL-BOOT-028
+      - case: GF-REGIONAL-BOOT-038
+        predecessor: GF-REGIONAL-BOOT-029
     notes:
       - BOOT-016 先创建持续验收站点，再运行依赖其资源的 BOOT-011..015；BOOT-017 显式复用 BOOT-016。
       - BOOT-018 正式执行必须保留持续验收站点。BOOT-019 使用 CPU/GPU 均与受保护站点隔离的另一套可卸载站点。
@@ -64,6 +66,10 @@ phases:
       - BOOT-029 把冷构建首次 deploy → remove-cluster → join-cluster → uninstall keep +
         reset-database → 再次冷构建首次 deploy 作为一条序列由驱动一次跑完；它以 BOOT-028 PASS
         为证据前置，并要求先把 BOOT-028 装出的站点卸载成一对空集群。
+      - BOOT-038 以 BOOT-029 PASS 为证据前置，只在同时纳管两个及以上 GPU 集群的站点执行（如持续验收站点的
+        HyperPod + 普通 EKS）：remove-cluster 再 join-cluster 目标集群，其间把另一集群的一台 GPU 节点经 DESTR-008
+        服务窗口有界 kubelet 停止为 NotReady（Agent 仍 ACTIVE），证明 b249/b250/b250b。只纳管一个 GPU 集群的站点记
+        BLOCKED_PREREQUISITE；目标集群自身的离场豁免不在真机验证范围。
   - sequence: 1
     name: 启动配置守卫
     maintenance_window: 否

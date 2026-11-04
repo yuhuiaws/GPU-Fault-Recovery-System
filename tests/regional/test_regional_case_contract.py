@@ -158,6 +158,9 @@ def test_explicit_predecessors_are_the_documented_anchor_cases() -> None:
         # follows the last case on the site's GPU nodes, the roll follows it.
         "GF-REGIONAL-BOOT-036": "GF-REGIONAL-COLLECT-015",
         "GF-REGIONAL-BOOT-037": "GF-REGIONAL-BOOT-036",
+        # Cross-cluster membership: remove/re-join one GPU cluster while
+        # another holds a NotReady node; it reads BOOT-029's lifecycle PASS.
+        "GF-REGIONAL-BOOT-038": "GF-REGIONAL-BOOT-029",
     }
     ordered = contract.ordered_case_ids()
     for case_id, predecessor in contract.explicit_predecessors().items():

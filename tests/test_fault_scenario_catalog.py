@@ -450,6 +450,7 @@ def test_promoted_live_drivers_remain_manual_until_revalidated() -> None:
         "GF-REGIONAL-BOOT-023": "run_boot023_release_history.py",
         "GF-REGIONAL-BOOT-036": "run_boot036_eks_nodegroup_plan.py",
         "GF-REGIONAL-BOOT-037": "run_boot037_eks_nodegroup_roll.py",
+        "GF-REGIONAL-BOOT-038": "run_boot038_cross_cluster_membership.py",
         "GF-REGIONAL-CMD-017": "run_cmd017_barrier_hold.py",
         "GF-REGIONAL-CMD-018": "run_cmd018_open_sibling_hold.py",
         "GF-REGIONAL-NET-006": "run_net006_lease_loss_withheld_result.py",
@@ -891,7 +892,7 @@ def test_regional_cases_have_machine_readable_verdicts() -> None:
         case for case in load_catalog(CATALOG) if case["id"].startswith("GF-REGIONAL-")
     ]
 
-    assert len(regional) == 207
+    assert len(regional) == 208
     assert all((case.get("evidence") or {}).get("verdict") for case in regional), (
         "every regional case must record a verdict"
     )

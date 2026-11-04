@@ -8970,6 +8970,31 @@ test_cases:
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-037
   related_pytest: tests/regional/test_boot037_eks_nodegroup_roll.py::test_a_drifted_group_rolls_and_every_replacement_is_adopted
+- id: GF-REGIONAL-BOOT-038
+  title: 一个 GPU 集群的 remove-cluster/join-cluster 期间另一集群有一台 NotReady 且 Agent 仍 ACTIVE 的节点：目标动词完成，他集群发现不 gating，被移除集群的节点不发离场邮件
+  category: regional-deployability
+  level: live
+  risk: destructive
+  problem: >-
+    GPU 数据面集群相互独立，但一个集群在另一集群接入时丢节点曾让接入回滚（2026-11-04 12:20Z：一台 EKS 节点被 Spot 回收、
+    其 Node 仍以 NotReady 列出、Agent 在 10 分钟守卫内仍 ACTIVE，HyperPod 接入的最终 verify 报 gpu-eks-cluster Agent 覆盖
+    drift 并 fail-cluster/rollback-cluster）。没有正式用例证明 R19 的 b249/b250/b250b 修复在真机上成立。
+  injection: >-
+    像 S69 一样 remove-cluster 再 join-cluster HyperPod（目标）集群；对另一 GPU 集群的一台 GPU 节点开一个有界、自恢复的
+    kubelet.service 停止窗口（复用 DESTR-008 服务窗口，Agent 不动），使其在每个动词的最终 verify 读取站点时 NotReady 而 Agent
+    仍 ACTIVE，复现 12:20Z 状态且不丢实例；不损失节点地重现非计划丢失。plan B（--window none）在真实离场（节点组滚动）期间机会执行同一 remove/re-join，记录每个 verify 所见。
+  expected:
+  - 前提：服务窗口对产品不可见（claim 是节点本地文件与 harness 侧控制器 journal，verify 与离场清理只读 Kubernetes、fleet 与 provider），故普通认领停止即可重现非计划丢失，不需要非认领变体，节点侧恢复安全保留
+  - 每个动词退出码 0，没有 fail-cluster/rollback-cluster；目标自身检查通过，S69 registry 收敛成立
+  - 他集群的覆盖 drift 作为不 gating 的 finding 记录在四处：动词结果、VERIFIED 证据、membership-verify/findings.json、status 的 finding 行
+  - 窗口未命中（verify 开始前节点未 NotReady）时该动词判 INCONCLUSIVE，其余照常判定
+  - 运行后：他集群节点重新 Ready，其 Agent 从未被退役，离场账本对它没有 CLEANED/REFUSED 邮件；移除期间目标节点没有“GPU node departed”邮件（b249）；目标 Agent 全部 ACTIVE；无非终态 incident；无服务窗口残留
+  - 产品若早于 b250（无 membership-verify findings）记 NOT_APPLICABLE 且不做任何变更；目标集群自身的离场豁免不在真机验证范围（需实例真正终止）
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-038
+  related_pytest: tests/regional/test_boot038_membership.py::test_a_clean_verb_with_the_finding_on_all_four_surfaces_passes
 - id: GF-REGIONAL-HA-011
   title: 隔离部署运行时的繁忙processor与spool进程接管
   category: regional-high-availability

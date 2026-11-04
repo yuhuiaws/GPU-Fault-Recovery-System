@@ -671,6 +671,25 @@ rules:
       - GF-REGIONAL-BOOT-036..037
     counts_as_domain: false
 
+  - id: cross-cluster-membership-acceptance
+    description: >-
+      GF-REGIONAL-BOOT-038 removes and re-joins one GPU cluster while one GPU
+      node of another cluster is held NotReady with its Agent still ACTIVE
+      (reusing the DESTR-008 kubelet service window), proving the scoped
+      membership verify and findings record (the final verify, and the join's
+      preflight / mode / shared control_api) and that no departed mail goes out
+      for the removed cluster's nodes. Its runner, the pure verdict/parse/
+      orchestration helper, and their fakes-based tests; harness only.
+    paths:
+      - scripts/e2e/regional/run_boot038_cross_cluster_membership.py
+      - scripts/e2e/regional/boot038_membership.py
+      - tests/regional/test_boot038_membership.py
+    pytest:
+      - tests/regional/test_boot038_membership.py
+    regional_cases:
+      - GF-REGIONAL-BOOT-038
+    counts_as_domain: false
+
   - id: general-fault-live-acceptance
     description: >-
       The GF-GENERAL-LIVE live acceptance runner, its per-category injector and

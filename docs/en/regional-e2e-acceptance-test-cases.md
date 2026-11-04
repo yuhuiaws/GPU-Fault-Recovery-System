@@ -573,6 +573,7 @@ These reads are not a cross-table atomic snapshot, and they do not fabricate evi
 | Capacity | `CAP-001..004` | `run_capacity_acceptance.py --case <case>` |
 | Network | `NET-001` | `run_net001_collector_replay.py` |
 | Plain EKS node-group preparation | `BOOT-036..037` | `run_boot036_eks_nodegroup_plan.py`, `run_boot037_eks_nodegroup_roll.py` |
+| Cross-cluster membership | `BOOT-038` | `run_boot038_cross_cluster_membership.py` |
 
 The common plan/execute shape is:
 
@@ -4053,6 +4054,95 @@ the errors of every stage, `departed_nodes`, `replacement_nodes`, `node_renames`
   nodes the same way is outside this case.
 - On a single-node group the roll leaves the group without a GPU node from the termination until the replacement joins
   (on Spot, until one can launch); the result records it in `limitations`.
+
+### GF-REGIONAL-BOOT-038
+
+**A membership verb on one GPU cluster while another cluster has a NotReady node whose Agent is still ACTIVE: the target
+verb completes, the other cluster's finding is recorded as not gating, and no departed mail goes out for the removed cluster**
+
+- Level: `destructive`. Like `BOOT-024`/`BOOT-025`, `remove-cluster` then `join-cluster` one GPU cluster (the target), and
+  throughout hold one GPU node of **another** GPU cluster NotReady with its Agent still ACTIVE. GPU data-plane clusters are
+  independent: a node lost on one cluster while another is joined/removed used to make the target verb's final `verify` fail
+  on the other cluster's `control_api` Agent coverage drift and roll the verb back (`fail-cluster`/`rollback-cluster`). The
+  case proves the three fixes -- the final `verify` is scoped to the target (the other cluster's finding is only a WARN, not
+  gating), the join's preflight, its `join-cluster` mode, `workflow_safety` and the shared `control_api` half are scoped the
+  same way, and the removed cluster's own nodes get no "GPU node departed" mail during the removal.
+- Premise (answered first): the DESTR-008 service window the harness opens is invisible to the product -- its claim is a
+  node-local file (`/var/lib/gpu-fault-acceptance/service-window/`) plus a harness-side controller journal, and the product's
+  coverage check and departed-node cleanup read only the Kubernetes Node list, the fleet Agent records and the provider,
+  never the claim. Stopping `kubelet.service` (the node Agent runs under its own systemd unit, not kubelet, so its heartbeat
+  and lease stay live) makes the node's Kubernetes Node NotReady while its Agent stays ACTIVE -- exactly the unplanned loss
+  to reproduce; the cleanup never makes it a candidate (its lease is live), so no departed mail goes out. An ordinary
+  **claimed** stop therefore reproduces it, no unclaimed variant is needed, and the node-side self-recovery is kept.
+- runner: `scripts/e2e/regional/run_boot038_cross_cluster_membership.py`. Parameters: `--state-dir`,
+  `--target-cluster-arn` (the target GPU cluster EKS ARN, removed then joined again), `--other-cluster-id` (the cluster
+  holding the NotReady node), `--other-node` (one of its GPU nodes), `--window kubelet` (plan A) or `--window none`
+  (plan B: an external real departure such as a node-group roll; records what each verify saw), `--dry-run` (alias of
+  `--plan`: the preconditions, the plan and the expected timings, no mutation), and the confirmation
+  `BOOT038_CROSS_CLUSTER_MEMBERSHIP_WINDOW`. The site identity (kubeconfigs, Region, the other cluster's context, the
+  host-probe image) comes from `--site-profile`.
+
+#### Preconditions and isolation
+
+1. The formal predecessor is `BOOT-029` PASS (same release and cluster identity).
+2. Only on a site that manages two or more GPU clusters (such as the continuous-acceptance HyperPod + plain EKS); a site
+   with one GPU cluster records `BLOCKED_PREREQUISITE`.
+3. Product-generation guard: on a product that predates the cluster-scoped membership verify and findings record, a
+   read-only probe through the site's deploy-host interpreter records `NOT_APPLICABLE` and mutates nothing. The probe
+   imports `gpu_fault.admin.membership_verify` and `gpu_fault_release.regional_verify_scope`; a product that cannot import
+   them is older.
+4. The site is healthy, no non-terminal incident; the other cluster's node is Ready, its Agent ACTIVE, with no unfinished
+   PyTorchJob, no active workflow and no service-window claim; the other cluster keeps at least one other Ready GPU node
+   (one is not enough: the held node must leave a Ready peer so the cluster is not fully down and the drift is the single
+   held node).
+5. The target cluster has its `BOOT-024`/`BOOT-025` (S69) remove/re-join prerequisites: the ownership label, the removal
+   tombstone, the `CLUSTER_PROFILE_NEW` approval.
+
+#### Steps
+
+1. Record the pre-removal departed-mail baseline for the target's nodes, the other cluster's nodes and Agents, and the
+   registry baseline.
+2. Start `remove-cluster --state-dir <STATE_DIR> --gpu-cluster-arn <target ARN> --confirm REMOVE_GPU_CLUSTER` and follow its
+   output. Plan A: open the window on the `release-end ... mode=remove-cluster` line (a bounded, self-restoring
+   `kubelet.service` stop through the DESTR-008 window, with the delay/restore keeping stop to restore at or below about
+   270 s and the node-side restore unit as the backstop), and confirm the Node shows NotReady before `release-begin ...
+   mode=verify`; otherwise the verb is INCONCLUSIVE (window missed) and the rest is still judged. Restore at `release-end
+   ... mode=verify` or at a cap, whichever comes first, then wait for Ready and clean up the window.
+3. If the removal completed (exit 0, no rollback), `join-cluster` the same way (a HyperPod `CLUSTER_PROFILE_NEW` stop is
+   answered as in S69, approving the same plan and rerunning); the open trigger is the last `fleet-wave-done ... ready=N/N`.
+   If the removal did not complete, the re-join is not attempted.
+4. After both verbs: read the result, the `VERIFIED` evidence, `membership-verify/findings.json` and the `status` finding
+   lines; read the departed ledger, the notifications and both clusters' Agents and incidents.
+
+##### Verdicts
+
+- Per verb: exits 0; no `fail-cluster`/`rollback-cluster`; when the window held, the other cluster's coverage drift is a
+  not-gating finding recorded on all four surfaces (result, `VERIFIED` evidence, `membership-verify/findings.json`, the
+  `status` finding lines); the target's own checks pass and S69 registry convergence holds (reusing
+  `boot029_registry_drift`). Any one failing is FAIL.
+- A missed window (the Node was not NotReady before `release-begin mode=verify`) or a plan B with no real departure is
+  INCONCLUSIVE, the rest still judged. A rollback, a non-zero exit, a missing finding, a lost registry convergence or a
+  failed restore (with `resume_cleanup` then invoked) is FAIL.
+- After the run: the other node is Ready again, its Agent was never retired, the departed ledger shows no CLEANED/REFUSED
+  mail for it; no "GPU node departed" mail for the target's nodes during the removal; the target's Agents are all ACTIVE;
+  no non-terminal incident; no service-window claim or probe residue. Any one failing is FAIL.
+- Every exit path ends the window first (restore / `resume_cleanup`), then reports.
+- Local regression: `tests/regional/test_boot038_membership.py`.
+
+##### Evidence
+
+`cases/GF-REGIONAL-BOOT-038/`: `GF-REGIONAL-BOOT-038.json` (release and cluster identity, product generation, window, each
+verb's verdict and the four finding surfaces, the after-run outcome, the window residue), `preflight.json`, each verb's
+`*.registry-baseline.json`/`*.registry-check.json`, and the service window's controller journal under
+`cases/GF-REGIONAL-BOOT-038/service-window/`. The evidence holds names, IDs and 12-hex digests only, no secrets.
+
+##### Known limitations
+
+- The target cluster's own departing-node excuse is not live-verified: the shared departure proof
+  (`gpu_fault_release/regional_release_departed_nodes.py`) needs the EC2 instance terminated or the HyperPod instance gone,
+  while this case only holds another cluster's node NotReady without losing the instance.
+- Plan B depends on a real external departure (a node-group roll) happening to cover a verb's verify, so it only holds in
+  that opportunistic window.
 
 ### GF-REGIONAL-BOOT-024
 

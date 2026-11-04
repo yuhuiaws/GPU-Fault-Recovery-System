@@ -6352,3 +6352,35 @@ product without `secret_source` is recorded `NOT_APPLICABLE`, not failed.
   cluster key) is read from `failure_domain_map.py`, not observed live; the
   operator identity's `pods/exec` on the CPU cluster is assumed (the perf gate
   and BOOT-023 exec into the same Pods).
+## Cross-cluster membership while another cluster is NotReady
+
+GF-REGIONAL-BOOT-038 (`scripts/e2e/regional/run_boot038_cross_cluster_membership.py`,
+`scripts/e2e/regional/boot038_membership.py`) removes and re-joins one GPU
+cluster while one GPU node of another cluster is held NotReady with its Agent
+still ACTIVE, reproducing the cross-cluster loss that rolled a join back. It
+reuses the DESTR-008 kubelet service window (the node Agent is never touched,
+so its lease stays live and the node is never a departed-node cleanup
+candidate), and the window is invisible to the product: its claim is a
+node-local file plus a harness-side controller journal, and the coverage check
+and the departed-node cleanup read only Kubernetes, the fleet and the provider.
+So an ordinary claimed stop reproduces the unplanned loss and keeps the
+node-side recovery safety. The case judges each verb (the scoped verify's
+finding recorded, not gating, on the result, the `VERIFIED` evidence,
+`membership-verify/findings.json` and the `status` lines; no fail/rollback;
+S69 registry convergence) and the after-run (the other node Ready again, its
+Agent never retired and no departed mail for it, no departed mail for the
+target's nodes during the removal).
+
+- Proven locally: `tests/regional/test_boot038_membership.py` (every verdict
+  path with a fake driver and no cluster access: a clean verb, a missed window
+  INCONCLUSIVE, a rollback FAIL, a missing finding surface FAIL, a departed
+  mail for a target node FAIL, a retired other Agent FAIL, a failed restore
+  FAIL with `resume_cleanup` invoked, an old product NOT_APPLICABLE without
+  mutation, the `--window none` recording).
+- Not live-verified: the **target** cluster's own departing-node excuse. The
+  shared departure proof (`gpu_fault_release/regional_release_departed_nodes.py`)
+  needs the EC2 instance terminated or the HyperPod instance gone, which this
+  case never does -- it only holds another cluster's node NotReady without
+  losing the instance. Plan B (`--window none`) depends on a real external
+  departure (a node-group roll) happening to cover a verb's verify, so it only
+  holds in that opportunistic window.
