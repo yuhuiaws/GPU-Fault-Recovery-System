@@ -123,9 +123,9 @@ def _changed(change: Callable[[dict[str, dict[str, Any]]], None]) -> list[str]:
             f"{SPOOL}: the Deployment was replaced (uid d-s -> d-s2)",
         ),
         (
-            lambda roles: roles[SPOOL].update(template_sha256="9" * 64),
+            lambda roles: roles[SPOOL].update(template_sha256="e" * 64),
             f"{SPOOL}: its Pod template changed (template tttttttttttt -> "
-            "999999999999): remove-cluster started a roll of the role",
+            "eeeeeeeeeeee): remove-cluster started a roll of the role",
         ),
         (
             lambda roles: roles[API].update(failure_domain_map_sha256="3" * 64),
@@ -141,10 +141,10 @@ def _changed(change: Callable[[dict[str, dict[str, Any]]], None]) -> list[str]:
         ),
         (
             lambda roles: roles[WORKER].update(
-                failure_domain_map_sha256="2" * 64, template_sha256="9" * 64
+                failure_domain_map_sha256="2" * 64, template_sha256="e" * 64
             ),
             f"{WORKER}: its Pod template changed (template tttttttttttt -> "
-            "999999999999, besides the failure-domain map): remove-cluster started "
+            "eeeeeeeeeeee, besides the failure-domain map): remove-cluster started "
             "a roll of the role",
         ),
         (lambda roles: roles.pop(SPOOL), f"{SPOOL} is missing from the reading"),
