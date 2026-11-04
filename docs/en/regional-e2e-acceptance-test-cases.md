@@ -4103,16 +4103,22 @@ verb completes, the other cluster's finding is recorded as not gating, and no de
 1. Record the pre-removal departed-mail baseline for the target's nodes, the other cluster's nodes and Agents, and the
    registry baseline.
 2. Start `remove-cluster --state-dir <STATE_DIR> --gpu-cluster-arn <target ARN> --confirm REMOVE_GPU_CLUSTER` and follow its
-   output. Plan A: open the window on the `release-end ... mode=remove-cluster` line (a bounded, self-restoring
-   `kubelet.service` stop through the DESTR-008 window, with the delay/restore keeping stop to restore at or below about
-   270 s and the node-side restore unit as the backstop), and confirm the Node shows NotReady before `release-begin ...
-   mode=verify`; otherwise the verb is INCONCLUSIVE (window missed) and the rest is still judged. Restore at `release-end
-   ... mode=verify` or at a cap, whichever comes first, then wait for Ready and clean up the window.
+   output. Plan A: open the window on the `release-begin ... mode=remove-cluster` line (a bounded, self-restoring
+   `kubelet.service` stop through the DESTR-008 window; the delay/restore keep stop to restore at or below about 300 s --
+   this site shows NotReady slower than 60-80 s after the stop and evicts non-tolerating Pods only 300 s after the taint,
+   so a 280 s stop still reads the drift yet stays clear of evictions -- with the node-side restore unit as the backstop)
+   and poll the Node from the open. At `release-begin ... mode=verify` read the poller's state **at once, with no wait**:
+   the window was hit only if NotReady was already seen and the node is still not Ready; otherwise the verb is INCONCLUSIVE
+   (window missed) and the rest is still judged. The evidence records the stop / first-NotReady / verify-begin / restore
+   timestamps. Restore at `release-end ... mode=verify` or at the cap, whichever comes first, then wait for Ready and clean
+   up the window.
 3. If the removal completed (exit 0, no rollback), first re-apply the ownership label to the target's node groups from the
    remove tombstone (S69's `reapply_ownership_labels` / `assert_ownership_labels`; the removal released it and join-cluster's
    node-scope precondition refuses without it), then `join-cluster` the same way (a HyperPod `CLUSTER_PROFILE_NEW` stop is
-   answered as in S69, approving the same plan and rerunning); the open trigger is the last `fleet-wave-done ... ready=N/N`.
-   If the removal did not complete, the re-join is not attempted.
+   answered as in S69, approving the same plan and rerunning); the open trigger is the last fleet wave's START line
+   (`fleet-wave ... phase=join wave=M/M`; a single-wave join is `wave=1/1` and opens on its own start line), earlier than
+   its `fleet-wave-done` because this site's NotReady latency outran the later trigger. If the removal did not complete, the
+   re-join is not attempted.
 4. After both verbs: read the result, the `VERIFIED` evidence, `membership-verify/findings.json` and the `status` finding
    lines; read the departed ledger, the notifications and both clusters' Agents and incidents.
 

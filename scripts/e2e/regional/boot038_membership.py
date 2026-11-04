@@ -61,31 +61,50 @@ KUBELET_SERVICE = "kubelet.service"
 #: window exactly as GF-GENERAL-LIVE-030 does, under its own run id.
 SERVICE_WINDOW_FIXTURE_CASE_ID = "GF-REGIONAL-DESTR-008"
 
-#: kubelet down time, stop to restore, kept at or below the brief's ~270 s so
-#: the node returns well before Kubernetes evicts non-tolerating Pods (300 s
-#: after NotReady) and inside the on-node recovery authority.
-RESTORE_SECONDS = 240
+#: kubelet down time, stop to restore. On this site a node shows NotReady
+#: later than 60-80 s after the stop (live 2026-11-04: an Agent coverage read
+#: about 80 s after the stop still saw it Ready), and the node lifecycle
+#: controller taints it at about stop + 50-90 s with eviction of non-tolerating
+#: Pods 300 s after the taint -- so a stop -> restore of 280 s stays clear of
+#: evictions while a slower verb still reads the drift before the node-side
+#: restore unit fires. The explicit restore at the verify's ``release-end``
+#: ends it sooner when the verify finishes first.
+RESTORE_SECONDS = 280
 STOP_DELAY_SECONDS = 15
 #: Hard cap on stop -> restore; the explicit restore is issued at the verify's
 #: ``release-end`` and never later than this. The on-node restore unit is the
-#: backstop past it.
-RESTORE_CAP_SECONDS = 270
-#: How long after the open trigger the node is given to show NotReady before
-#: the verb's verify begins; past it the window is judged missed.
-NOT_READY_CONFIRM_SECONDS = 90.0
+#: backstop past it, and eviction is 300 s after the taint.
+RESTORE_CAP_SECONDS = 300
+#: The poller runs from the window open; at verify-begin its state is read at
+#: once with no wait -- "NotReady before the verify" must mean already NotReady
+#: when the verify started, not NotReady within a grace after it (live
+#: 2026-11-04 the removal's verify read the fleet while the node was still
+#: Ready, so no finding appeared; a 90 s grace then saw NotReady and mis-graded
+#: a missed window as a judged verb).
 NOT_READY_POLL_SECONDS = 5.0
 
 # --- the admin verb's narration grammar (regional_release_narration) ---------
-# release-begin/-end <stamp> mode=<mode> ... and fleet-wave-done ... ready=N/N.
+# release-begin/-end <stamp> mode=<mode> ...; a fleet wave's START line is
+# ``fleet-wave <ts> cluster=<id> phase=join wave=N/M ...`` and its done line is
+# ``fleet-wave-done ... wave=N/M ... ready=R/T``.
 _RELEASE_BEGIN = r"release-begin\s+\S+\s+mode={mode}\b"
 _RELEASE_END = r"release-end\s+\S+\s+mode={mode}\b"
-REMOVE_CLUSTER_END = re.compile(_RELEASE_END.format(mode="remove-cluster"))
+REMOVE_CLUSTER_BEGIN = re.compile(_RELEASE_BEGIN.format(mode="remove-cluster"))
 VERIFY_BEGIN = re.compile(_RELEASE_BEGIN.format(mode="verify"))
 VERIFY_END = re.compile(_RELEASE_END.format(mode="verify"))
 FAIL_CLUSTER = re.compile(r"release-(?:begin|end)\s+\S+\s+mode=fail-cluster\b")
 ROLLBACK_CLUSTER = re.compile(r"release-(?:begin|end)\s+\S+\s+mode=rollback-cluster\b")
-#: ``fleet-wave-done ... ready=N/N`` -- the last one the join's rollout prints.
-FLEET_WAVE_DONE = re.compile(r"fleet-wave-done\b.*\bready=(\d+)/(\d+)\b")
+#: A fleet wave's START line (``wave=N/M``). The join opens the window on the
+#: last wave's start (``wave=M/M``) -- earlier than its ``fleet-wave-done``,
+#: because this site's NotReady latency outran the later trigger.
+FLEET_WAVE_START = re.compile(
+    r"fleet-wave\s+\S+\s+cluster=\S+\s+phase=join\s+wave=(\d+)/(\d+)\b"
+)
+#: ``fleet-wave-done ... wave=N/M ... ready=R/T`` -- read to tell the last wave
+#: from an earlier one when checking the window-open stream after the fact.
+FLEET_WAVE_DONE = re.compile(
+    r"fleet-wave-done\b.*\bwave=(\d+)/(\d+)\b.*\bready=(\d+)/(\d+)\b"
+)
 
 #: The subject prefixes the departed-node cleanup mails (departed_node_cleanup).
 DEPARTED_SUBJECTS = (
@@ -155,25 +174,41 @@ def verb_result_from_output(lines: Sequence[str]) -> dict[str, Any] | None:
 def verify_trigger(verb: str) -> re.Pattern[str]:
     """The line after which the window opens for ``verb``.
 
-    Removal: ``release-end mode=remove-cluster`` (sync-state and the verify
-    follow). Join: the last ``fleet-wave-done ... ready=N/N`` (the verify
-    follows the waves). ``last_full_fleet_wave`` picks the join's line.
+    Removal: ``release-begin mode=remove-cluster`` -- the window opens before
+    the ~113 s remove, the ~57 s gap and the ~50 s sync-state so the node is
+    NotReady by the time the verify reads the fleet (its later ``release-end``
+    left too little time on this site). Join: the last wave's START line
+    (``is_last_wave_start``), earlier than its ``fleet-wave-done``.
     """
 
     if verb == REMOVE_VERB:
-        return REMOVE_CLUSTER_END
+        return REMOVE_CLUSTER_BEGIN
     if verb == JOIN_VERB:
-        return FLEET_WAVE_DONE
+        return FLEET_WAVE_START
     raise ValueError(f"unknown membership verb {verb!r}")
 
 
+def is_last_wave_start(line: str) -> bool:
+    """A fleet-wave START line for the last wave (``wave=M/M``).
+
+    A join of N nodes runs one or more waves; the last is ``wave=M/M`` (N == M),
+    and a single-wave join is ``wave=1/1`` -- both open the window on their own
+    start line. An earlier ``wave=k/M`` (k < M) does not.
+    """
+
+    match = FLEET_WAVE_START.search(line)
+    if match is None:
+        return False
+    return match.group(1) == match.group(2) and match.group(2) != "0"
+
+
 def is_full_fleet_wave(line: str) -> bool:
-    """A ``fleet-wave-done`` line whose ``ready=N/N`` is complete (N == N)."""
+    """A ``fleet-wave-done`` line whose ``ready=T/T`` is complete (R == T)."""
 
     match = FLEET_WAVE_DONE.search(line)
     if match is None:
         return False
-    return match.group(1) == match.group(2) and match.group(2) != "0"
+    return match.group(3) == match.group(4) and match.group(4) != "0"
 
 
 # --- parsing the followed output ---------------------------------------------
@@ -188,15 +223,15 @@ class VerbNarration:
     verify_ended: bool = False
     saw_fail_cluster: bool = False
     saw_rollback_cluster: bool = False
-    last_full_fleet_wave: str | None = None
+    last_wave_start: str | None = None
 
     def observe(self, verb: str, line: str) -> str | None:
         """Fold one output line in; return a transition token the caller acts on.
 
-        Tokens: ``open`` (open the window), ``verify-begin`` (confirm NotReady),
-        ``verify-end`` (restore). Removal opens on ``remove-cluster`` end; join
-        opens on the last complete ``fleet-wave-done`` -- reported as ``open``
-        each time a later complete wave appears, the caller opens only once.
+        Tokens: ``open`` (open the window), ``verify-begin`` (read the poller's
+        state), ``verify-end`` (restore). Removal opens on ``release-begin
+        mode=remove-cluster``; join opens on the last wave's START line
+        (``wave=M/M``), the caller opening the window only on the first ``open``.
         """
 
         if FAIL_CLUSTER.search(line):
@@ -209,11 +244,11 @@ class VerbNarration:
         if VERIFY_BEGIN.search(line):
             self.verify_began = True
             return "verify-begin"
-        if verb == REMOVE_VERB and REMOVE_CLUSTER_END.search(line):
+        if verb == REMOVE_VERB and REMOVE_CLUSTER_BEGIN.search(line):
             self.open_trigger_seen = True
             return "open"
-        if verb == JOIN_VERB and is_full_fleet_wave(line):
-            self.last_full_fleet_wave = line.strip()
+        if verb == JOIN_VERB and is_last_wave_start(line):
+            self.last_wave_start = line.strip()
             self.open_trigger_seen = True
             return "open"
         return None
@@ -323,8 +358,16 @@ class VerbEvidence:
     restore_ok: bool = True
     #: ``resume_cleanup`` was invoked after a failed restore (set by the run).
     resume_cleanup_called: bool = False
+    #: Why the ``status`` read did not succeed, else ``None``; a status rc != 0
+    #: is an evidence error, never read silently as "no finding".
+    status_error: str | None = None
     #: Recorded for plan B: what each verify saw of the other node.
     window_observation: str = ""
+    #: ISO timestamps of the window: ``stop`` (open), ``not_ready_seen`` (first
+    #: NotReady the poller saw), ``verify_begin``, ``restore`` -- so a missed
+    #: window is diagnosable (live 2026-11-04 the removal's verify began before
+    #: the node went NotReady).
+    window_timeline: dict[str, str] = field(default_factory=dict)
 
 
 def proof_expected(evidence: VerbEvidence) -> bool:
@@ -340,9 +383,10 @@ def proof_expected(evidence: VerbEvidence) -> bool:
 def judge_verb(evidence: VerbEvidence) -> tuple[str, list[str]]:
     """The verb's verdict and its reasons (PASS / FAIL / INCONCLUSIVE).
 
-    FAIL dominates: a rollback, a non-zero exit, a lost registry convergence or
-    a failed restore fails the verb whatever the window did. Only when nothing
-    failed does a missed window downgrade PASS to INCONCLUSIVE.
+    FAIL dominates: a rollback, a non-zero exit, a lost registry convergence, a
+    failed restore or a status read that did not succeed fails the verb whatever
+    the window did. Only when nothing failed does a missed window downgrade PASS
+    to INCONCLUSIVE.
     """
 
     fail: list[str] = []
@@ -361,6 +405,10 @@ def judge_verb(evidence: VerbEvidence) -> tuple[str, list[str]]:
         fail.append("the verb printed mode=rollback-cluster")
     if not evidence.registry_convergence_pass:
         fail.append("S69 registry convergence did not hold after the verb")
+    if evidence.status_error:
+        # A status read that did not succeed is an error, not an empty finding
+        # set: the status surface is then indeterminate, so the verb cannot pass.
+        fail.append(f"the status read did not succeed: {evidence.status_error}")
     expected = proof_expected(evidence)
     if expected:
         missing = [
@@ -699,10 +747,12 @@ def run_membership(driver: MembershipDriver, *, window: str) -> dict[str, Any]:
                         evidence.other_node_not_ready_before_verify
                     ),
                     "finding_surfaces": dict(evidence.finding_surfaces),
+                    "status_error": evidence.status_error,
                     "registry_convergence_pass": evidence.registry_convergence_pass,
                     "restore_ok": evidence.restore_ok,
                     "resume_cleanup_called": evidence.resume_cleanup_called,
                     "window_observation": evidence.window_observation,
+                    "window_timeline": dict(evidence.window_timeline),
                 }
             )
             if verb == REMOVE_VERB:

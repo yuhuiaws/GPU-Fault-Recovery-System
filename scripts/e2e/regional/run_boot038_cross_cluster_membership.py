@@ -245,27 +245,27 @@ def _host_probe_image() -> str:
 # --- timings and command lines (the plan) ------------------------------------
 
 TIMINGS = {
-    "node_not_ready_after_kubelet_stop_seconds": "40-50",
+    "node_not_ready_after_kubelet_stop_seconds": ">60-80 on this site; taint ~50-90",
     "removal": {
-        "drain_cluster_seconds": 15,
-        "wait_after_drain_minutes": "~10",
-        "remove_cluster_mode_seconds": "~100",
+        "remove_cluster_mode_seconds": "~113",
+        "gap_before_sync_state_seconds": "~57",
         "sync_state_seconds": "~50",
-        "verify_starts_after_remove_end_seconds": 106,
-        "verify_seconds": "~31-56",
-        "window_opens_on": "release-end mode=remove-cluster",
+        "verify_starts_after_remove_begin_seconds": "~220",
+        "verify_seconds": "~33",
+        "window_opens_on": "release-begin mode=remove-cluster",
     },
     "join": {
         "preflight_seconds": 20,
-        "join_cluster_mode_minutes": "7.7-8.7",
-        "verify_starts_after_last_fleet_wave_done_seconds": "94-160",
-        "verify_seconds": "~56",
-        "window_opens_on": "the last fleet-wave-done ... ready=N/N",
+        "join_cluster_mode_minutes": "7.7-9",
+        "verify_starts_after_last_wave_start_seconds": "160-234",
+        "verify_seconds": "~50",
+        "window_opens_on": "the last fleet wave's start line (fleet-wave ... wave=M/M)",
     },
     "window": {
         "stop_delay_seconds": membership.STOP_DELAY_SECONDS,
         "restore_seconds": membership.RESTORE_SECONDS,
         "stop_to_restore_cap_seconds": membership.RESTORE_CAP_SECONDS,
+        "eviction_after_taint_seconds": 300,
         "node_side_restore_is_the_backstop": True,
     },
 }
@@ -283,6 +283,40 @@ def verb_command(settings: Settings, verb: str) -> list[str]:
     if verb == membership.REMOVE_VERB:
         command += ["--confirm", "REMOVE_GPU_CLUSTER"]
     return command
+
+
+def status_command(state_dir: Path) -> list[str]:
+    """``gpu-fault-admin status --full --state-dir <S>``.
+
+    ``--state-dir`` is required: the installed deploy-host CLI refuses (rc 2,
+    "status requires that managed state") without it, so a status without it
+    read as "no finding" (live 2026-11-04).
+    """
+
+    return [
+        *admin_command(state_dir),
+        "status",
+        "--full",
+        "--state-dir",
+        str(state_dir),
+    ]
+
+
+def status_findings(returncode: int, stderr: str) -> tuple[list[str], str | None]:
+    """The ``not gating`` finding lines ``status`` printed, and an error.
+
+    A non-zero rc is returned as an evidence error, never swallowed as an empty
+    finding set -- the status surface is then indeterminate, not "no finding".
+    """
+
+    if returncode != 0:
+        return [], f"status --full exited {returncode}"
+    lines = [
+        line
+        for line in stderr.splitlines()
+        if "gpu-fault-admin status:" in line and "not gating:" in line
+    ]
+    return lines, None
 
 
 def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any]:
@@ -607,6 +641,7 @@ class LiveMembershipDriver:
             else None
         )
         not_ready_before = None if window is None else False
+        timeline: dict[str, str] = {}
         process = subprocess.Popen(  # noqa: S603 - the site's own deploy-host CLI
             self._verb_command(verb),
             cwd=self.settings.state_dir,
@@ -617,7 +652,7 @@ class LiveMembershipDriver:
         follower = _Follower(process)
         follower.start()
         narration = membership.VerbNarration()
-        poller: _NotReadyPoller | None = None
+        poller: NotReadyPoller | None = None
         restore_ok = True
         resume_called = False
         try:
@@ -625,12 +660,18 @@ class LiveMembershipDriver:
                 token = narration.observe(verb, line)
                 if token == "open" and window is not None and poller is None:
                     self._open_window(window)
-                    poller = _NotReadyPoller(self.warm, self.settings.other_node)
+                    timeline["stop"] = CLOCK_NOW().isoformat()
+                    # Poll from the window open so the verify-begin read is of a
+                    # state already reached, not a grace that waits for it.
+                    poller = NotReadyPoller(self.warm, self.settings.other_node)
                     poller.start()
-                elif token == "verify-begin" and poller is not None:
-                    not_ready_before = poller.confirm(
-                        membership.NOT_READY_CONFIRM_SECONDS
-                    )
+                elif token == "verify-begin":
+                    timeline["verify_begin"] = CLOCK_NOW().isoformat()
+                    if poller is not None:
+                        # Read at once, no wait: already NotReady and still so.
+                        not_ready_before = poller.not_ready_now()
+                        if poller.not_ready_seen_at is not None:
+                            timeline["not_ready_seen"] = poller.not_ready_seen_at
                 elif token == "verify-end" and window is not None:
                     try:
                         self._restore_window(window)
@@ -638,10 +679,13 @@ class LiveMembershipDriver:
                         restore_ok = False
                         resume_called = True
                         self._resume(window)
+                    timeline["restore"] = CLOCK_NOW().isoformat()
             process.wait(timeout=VERB_TIMEOUT_SECONDS)
         finally:
             if poller is not None:
                 poller.stop()
+                if poller.not_ready_seen_at is not None:
+                    timeline.setdefault("not_ready_seen", poller.not_ready_seen_at)
         result_json = membership.verb_result_from_output(follower.lines)
         if verb == membership.JOIN_VERB and process.returncode != 0:
             result_json, process_rc = self._answer_profile_plan(verb, result_json)
@@ -664,10 +708,12 @@ class LiveMembershipDriver:
                 record=records["record"],
                 status_lines=records["status_lines"],
             ),
+            status_error=records["status_error"],
             registry_convergence_pass=convergence,
             restore_ok=restore_ok,
             resume_cleanup_called=resume_called,
             window_observation=("" if window is not None else self._observe_node()),
+            window_timeline=timeline,
         )
 
     # -- after the run -----------------------------------------------------
@@ -864,28 +910,31 @@ class LiveMembershipDriver:
         verified_state = membership.verified_state_for(
             self.settings.state_dir, verb, self.settings.target_cluster_id
         )
-        status_lines = self._status_finding_lines()
+        status_lines, status_error = self._status_finding_lines()
         return {
             "record": record,
             "verified_state": verified_state,
             "status_lines": status_lines,
+            "status_error": status_error,
         }
 
-    def _status_finding_lines(self) -> list[str]:
-        command = [*admin_command(self.settings.state_dir), "status", "--full"]
-        completed = subprocess.run(  # noqa: S603 - the site's own CLI
-            command,
-            cwd=self.settings.state_dir,
-            capture_output=True,
-            text=True,
-            timeout=900,
-            check=False,
-        )
-        return [
-            line
-            for line in completed.stderr.splitlines()
-            if "gpu-fault-admin status:" in line and "not gating:" in line
-        ]
+    def _status_finding_lines(self) -> tuple[list[str], str | None]:
+        """The ``not gating`` finding lines ``status --full`` prints, and an
+        error when the call did not succeed."""
+
+        command = status_command(self.settings.state_dir)
+        try:
+            completed = subprocess.run(  # noqa: S603 - the site's own CLI
+                command,
+                cwd=self.settings.state_dir,
+                capture_output=True,
+                text=True,
+                timeout=900,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return [], f"status --full could not run: {type(exc).__name__}"
+        return status_findings(completed.returncode, completed.stderr)
 
     def _registry_baseline(self, verb: str, out: Path) -> None:
         try:
@@ -927,32 +976,55 @@ class LiveMembershipDriver:
             self._baseline_notifications = []
 
 
-class _NotReadyPoller:
-    """Polls the other node's Ready condition until it leaves ``True``."""
+class NotReadyPoller:
+    """Polls the other node's Ready condition from the window open.
+
+    It runs from the window open (not from verify-begin), recording the first
+    time the node left Ready (``not_ready_seen_at``) and the most recent
+    reading. ``not_ready_now`` is read at verify-begin with no wait: the window
+    was hit only when the node was already NotReady and still is -- a 90 s grace
+    after verify-begin would call a missed window a hit (live 2026-11-04).
+    """
 
     def __init__(self, warm: Any, node: str) -> None:
         self.warm = warm
         self.node = node
-        self._observed = threading.Event()
+        self.not_ready_seen_at: str | None = None
+        self._last_ready: str | None = None
+        self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._poll, daemon=True)
 
     def start(self) -> None:
         self._thread.start()
 
+    def _read(self) -> str | None:
+        try:
+            return str(self.warm.node_snapshot(self.node).get("ready"))
+        except Exception:  # noqa: BLE001 - a failed read is retried
+            return None
+
+    def _record(self, ready: str | None) -> None:
+        with self._lock:
+            self._last_ready = ready
+            if ready is not None and ready != "True" and self.not_ready_seen_at is None:
+                self.not_ready_seen_at = CLOCK_NOW().isoformat()
+
     def _poll(self) -> None:
         while not self._stop.is_set():
-            try:
-                ready = self.warm.node_snapshot(self.node).get("ready")
-            except Exception:  # noqa: BLE001 - a failed read is retried
-                ready = None
-            if ready is not None and ready != "True":
-                self._observed.set()
-                return
+            self._record(self._read())
             self._stop.wait(membership.NOT_READY_POLL_SECONDS)
 
-    def confirm(self, deadline_seconds: float) -> bool:
-        return self._observed.wait(timeout=deadline_seconds)
+    def not_ready_now(self) -> bool:
+        """At verify-begin, with no wait: NotReady was seen and the node is
+        still not Ready. One fresh read decides "still", falling back to the
+        last poll when the fresh read fails."""
+
+        fresh = self._read()
+        self._record(fresh)
+        with self._lock:
+            current = fresh if fresh is not None else self._last_ready
+            return self.not_ready_seen_at is not None and current not in (None, "True")
 
     def stop(self) -> None:
         self._stop.set()

@@ -106,6 +106,34 @@ def test_a_failed_restore_fails_the_verb_and_names_resume_cleanup() -> None:
     assert any("resume_cleanup invoked" in reason for reason in reasons), reasons
 
 
+def test_a_status_read_error_fails_the_verb_rather_than_reading_no_finding() -> None:
+    # A status rc != 0 is an evidence error; the verb cannot pass even with the
+    # window held and the other three surfaces recorded.
+    evidence = _pass_evidence(status_error="status --full exited 2")
+    verdict, reasons = m.judge_verb(evidence)
+    assert verdict == m.VERDICT_FAIL
+    assert any("status read did not succeed" in reason for reason in reasons), reasons
+
+
+def test_notready_before_verify_begin_gives_a_judged_verb_the_finding_gates() -> None:
+    # The poller saw NotReady before the verify began and the finding appeared
+    # on all four surfaces: a judged verb (PASS), not INCONCLUSIVE.
+    evidence = _pass_evidence(other_node_not_ready_before_verify=True)
+    verdict, _ = m.judge_verb(evidence)
+    assert verdict == m.VERDICT_PASS, "NotReady before verify -> judged"
+
+
+def test_notready_only_after_verify_begin_gives_inconclusive() -> None:
+    # The node was still Ready when the verify began (NotReady came later), so
+    # no finding could appear: INCONCLUSIVE (window missed), never FAIL.
+    evidence = _pass_evidence(
+        other_node_not_ready_before_verify=False, finding_surfaces=_all_surfaces(False)
+    )
+    verdict, reasons = m.judge_verb(evidence)
+    assert verdict == m.VERDICT_INCONCLUSIVE
+    assert any("window missed" in reason for reason in reasons), reasons
+
+
 def test_window_none_with_a_real_departure_passes_when_the_finding_is_recorded() -> (
     None
 ):
@@ -239,16 +267,23 @@ def test_finding_surfaces_ignores_a_finding_for_a_third_cluster() -> None:
 # --- narration grammar -------------------------------------------------------
 
 
-def test_removal_opens_on_remove_cluster_end_then_verify_begin_and_end() -> None:
+def test_removal_opens_on_remove_cluster_begin_then_verify_begin_and_end() -> None:
     narration = m.VerbNarration()
-    stamp = "2026-11-04T12:05:32Z"
+    stamp = "2026-11-04T18:47:47Z"
     assert (
         narration.observe(
-            m.REMOVE_VERB,
-            f"release-end {stamp} mode=remove-cluster exit_code=0 total=99.4s",
+            m.REMOVE_VERB, f"release-begin {stamp} mode=remove-cluster dry_run=false"
         )
         == "open"
     )
+    # Its later release-end must not re-open (open already seen); it is ignored.
+    assert (
+        narration.observe(
+            m.REMOVE_VERB,
+            f"release-end {stamp} mode=remove-cluster exit_code=0 total=113.2s",
+        )
+        is None
+    ), "the removal opens on begin, not end"
     assert (
         narration.observe(
             m.REMOVE_VERB, f"release-begin {stamp} mode=verify dry_run=false"
@@ -266,13 +301,28 @@ def test_removal_opens_on_remove_cluster_end_then_verify_begin_and_end() -> None
     )
 
 
-def test_join_opens_only_on_a_complete_fleet_wave_done() -> None:
+def test_join_opens_on_the_last_wave_start_not_an_earlier_one() -> None:
     narration = m.VerbNarration()
-    partial = "fleet-wave-done 2026-11-04T12:16:08Z wave=1/2 ready=1/4 ... total=314.0s"
-    full = "fleet-wave-done 2026-11-04T12:17:08Z wave=2/2 ready=4/4 ... total=374.6s"
-    assert narration.observe(m.JOIN_VERB, partial) is None
-    assert narration.observe(m.JOIN_VERB, full) == "open"
-    assert narration.last_full_fleet_wave is not None, "the full wave was recorded"
+    wave1 = (
+        "fleet-wave 2026-11-04T19:01:43Z cluster=hp phase=join wave=1/2 "
+        "ready=0/4 nodes=n total=246.1s"
+    )
+    wave2 = (
+        "fleet-wave 2026-11-04T19:02:54Z cluster=hp phase=join wave=2/2 "
+        "ready=1/4 nodes=n total=316.5s"
+    )
+    assert narration.observe(m.JOIN_VERB, wave1) is None, "wave 1/2 is not the last"
+    assert narration.observe(m.JOIN_VERB, wave2) == "open", "wave 2/2 opens"
+    assert narration.last_wave_start is not None, "the last wave start was recorded"
+
+
+def test_join_opens_on_a_single_wave_start() -> None:
+    narration = m.VerbNarration()
+    wave = (
+        "fleet-wave 2026-11-04T19:01:43Z cluster=hp phase=join wave=1/1 "
+        "ready=0/8 nodes=n total=200.0s"
+    )
+    assert narration.observe(m.JOIN_VERB, wave) == "open", "a single wave=1/1 opens"
 
 
 def test_narration_records_fail_and_rollback() -> None:
@@ -299,18 +349,18 @@ def test_narration_records_fail_and_rollback() -> None:
 # `release-end mode=verify` line with no newline between them.
 _REMOVE_STREAM = [
     "+ aws sagemaker describe-cluster --cluster-name hp --region us-west-2\n",
-    "release-begin 2026-11-04T11:53:44Z mode=drain-cluster dry_run=false\n",
-    "release-end 2026-11-04T11:53:59Z mode=drain-cluster exit_code=0 total=15.0s\n",
-    "release-begin 2026-11-04T12:03:52Z mode=remove-cluster dry_run=false\n",
-    "release-end 2026-11-04T12:05:32Z mode=remove-cluster exit_code=0 total=99.4s\n",
-    "release-begin 2026-11-04T12:06:28Z mode=sync-state dry_run=false\n",
-    "release-end 2026-11-04T12:07:17Z mode=sync-state exit_code=0 total=48.5s\n",
-    "release-begin 2026-11-04T12:07:18Z mode=verify dry_run=false\n",
+    "release-begin 2026-11-04T18:37:33Z mode=drain-cluster dry_run=false\n",
+    "release-end 2026-11-04T18:37:47Z mode=drain-cluster exit_code=0 total=14.9s\n",
+    "release-begin 2026-11-04T18:47:47Z mode=remove-cluster dry_run=false\n",
+    "release-end 2026-11-04T18:49:40Z mode=remove-cluster exit_code=0 total=113.2s\n",
+    "release-begin 2026-11-04T18:50:37Z mode=sync-state dry_run=false\n",
+    "release-end 2026-11-04T18:51:27Z mode=sync-state exit_code=0 total=49.9s\n",
+    "release-begin 2026-11-04T18:51:27Z mode=verify dry_run=false\n",
     "{\n",
     '  "checks": [],\n',
     '  "healthy": true,\n',
     '  "mode": "verify"\n',
-    "}release-end 2026-11-04T12:07:49Z mode=verify exit_code=0 total=31.2s\n",
+    "}release-end 2026-11-04T18:52:00Z mode=verify exit_code=0 total=32.9s\n",
     "+ aws sagemaker list-clusters --region us-west-2 --output json\n",
     "{\n",
     '  "cluster_id": "hp-cluster",\n',
@@ -320,14 +370,20 @@ _REMOVE_STREAM = [
     '  "remaining_cluster_ids": ["gpu-eks-cluster"]\n',
     "}\n",
 ]
+# wave 1/2 start and done, then wave 2/2 START (the open), then its done, the
+# join end and the glued verify report / release-end.
 _JOIN_WAVES = [
-    "fleet-wave-done 2026-11-04T12:16:08Z cluster=hp wave=1/2 ready=1/4 "
-    "nodes=hyperpod-x total=314.0s\n",
-    "fleet-wave-done 2026-11-04T12:17:08Z cluster=hp wave=2/2 ready=4/4 "
-    "nodes=hyperpod-y total=374.6s\n",
-    "release-end 2026-11-04T12:19:38Z mode=join-cluster exit_code=0 total=524.2s\n",
-    "release-begin 2026-11-04T12:19:48Z mode=verify dry_run=false\n",
-    "}release-end 2026-11-04T12:20:40Z mode=verify exit_code=0 total=50.2s\n",
+    "fleet-wave 2026-11-04T19:01:43Z cluster=hp phase=join wave=1/2 ready=0/4 "
+    "nodes=n total=246.1s\n",
+    "fleet-wave-done 2026-11-04T19:02:54Z cluster=hp wave=1/2 ready=1/4 "
+    "nodes=n total=314.0s\n",
+    "fleet-wave 2026-11-04T19:02:54Z cluster=hp phase=join wave=2/2 ready=1/4 "
+    "nodes=n total=316.5s\n",
+    "fleet-wave-done 2026-11-04T19:04:07Z cluster=hp wave=2/2 ready=4/4 "
+    "nodes=n total=374.6s\n",
+    "release-end 2026-11-04T19:06:38Z mode=join-cluster exit_code=0 total=540.9s\n",
+    "release-begin 2026-11-04T19:06:48Z mode=verify dry_run=false\n",
+    "}release-end 2026-11-04T19:07:38Z mode=verify exit_code=0 total=49.1s\n",
 ]
 _ROLLBACK_TAIL = [
     "release-begin 2026-11-04T12:20:50Z mode=fail-cluster dry_run=false\n",
@@ -350,12 +406,14 @@ def test_removal_stream_opens_once_then_verify_begin_and_end_in_order() -> None:
     assert not narration.saw_rollback_cluster, "a clean removal"
 
 
-def test_join_stream_opens_only_on_the_full_wave_and_detects_glued_verify_end() -> None:
+def test_join_stream_opens_on_the_last_wave_start_and_detects_glued_verify_end() -> (
+    None
+):
     narration, tokens = _follow(m.JOIN_VERB, _JOIN_WAVES)
-    # ready=1/4 is not an open; ready=4/4 is; the glued "}release-end mode=verify"
-    # is a verify-end.
+    # Only wave 2/2's START opens (wave 1/2 start and both done lines do not);
+    # the glued "}release-end mode=verify" is a verify-end.
     assert tokens == ["open", "verify-begin", "verify-end"], tokens
-    assert narration.last_full_fleet_wave is not None, "the full wave was recorded"
+    assert narration.last_wave_start is not None, "the last wave start was recorded"
 
 
 def test_rolled_back_join_stream_sets_fail_and_rollback() -> None:
@@ -660,6 +718,80 @@ def test_service_window_fixture_accepts_the_driver_keyword_arguments() -> None:
     assert m.SERVICE_WINDOW_FIXTURE_CASE_ID == "GF-REGIONAL-DESTR-008", (
         "the on-node probe trusts only the DESTR-008 window identity"
     )
+
+
+def test_timing_constants_keep_the_stop_clear_of_evictions() -> None:
+    assert m.RESTORE_SECONDS == 280, m.RESTORE_SECONDS
+    assert m.STOP_DELAY_SECONDS == 15, m.STOP_DELAY_SECONDS
+    assert m.RESTORE_CAP_SECONDS == 300, m.RESTORE_CAP_SECONDS
+    # stop -> restore stays at/under the cap, and the cap is the 300 s eviction
+    # grace after the taint, so the node restores before non-tolerating Pods go.
+    assert m.STOP_DELAY_SECONDS + m.RESTORE_SECONDS <= m.RESTORE_CAP_SECONDS, "cap"
+
+
+# --- status argv and rc handling (point 1) ----------------------------------
+
+
+def test_status_command_includes_state_dir(tmp_path: Path) -> None:
+    command = runner.status_command(tmp_path)
+    assert "--state-dir" in command, command
+    assert command[command.index("--state-dir") + 1] == str(tmp_path), command
+    assert command[-4:] == ["status", "--full", "--state-dir", str(tmp_path)], command
+
+
+def test_status_findings_nonzero_rc_is_an_evidence_error() -> None:
+    lines, error = runner.status_findings(
+        2, "gpu-fault-admin: ... bound to --state-dir"
+    )
+    assert lines == [], lines
+    assert error is not None and "exited 2" in error, error
+
+
+def test_status_findings_zero_rc_parses_the_not_gating_lines() -> None:
+    stderr = (
+        "gpu-fault-admin status: healthy: yes\n"
+        "gpu-fault-admin status: finding: join-cluster hp: not gating: "
+        "gpu-eks-cluster control_api: coverage drift\n"
+        "gpu-fault-admin status: full JSON report: stdout\n"
+    )
+    lines, error = runner.status_findings(0, stderr)
+    assert error is None, error
+    assert len(lines) == 1 and "not gating: gpu-eks-cluster" in lines[0], lines
+
+
+# --- the NotReady poller reads at verify-begin without waiting (point 2) -----
+
+
+class _FakeWarm:
+    def __init__(self, ready: str) -> None:
+        self.ready = ready
+
+    def node_snapshot(self, node: str) -> dict[str, str]:
+        return {"ready": self.ready}
+
+
+def test_poller_true_when_notready_was_seen_and_is_still_notready() -> None:
+    warm = _FakeWarm("Unknown")
+    poller = runner.NotReadyPoller(warm, "ip-10-0-44-18")
+    # not_ready_now reads at once (no wait): the node is NotReady now, so it is
+    # both seen and still NotReady -> a judged verb.
+    assert poller.not_ready_now() is True, "seen and still NotReady -> judged"
+    assert poller.not_ready_seen_at is not None, "the first NotReady is recorded"
+
+
+def test_poller_false_when_node_was_ready_through_verify_begin() -> None:
+    warm = _FakeWarm("True")
+    poller = runner.NotReadyPoller(warm, "ip-10-0-44-18")
+    assert poller.not_ready_now() is False, "Ready at verify -> window missed"
+    assert poller.not_ready_seen_at is None, "never NotReady"
+
+
+def test_poller_false_when_node_came_back_ready_by_verify_begin() -> None:
+    warm = _FakeWarm("Unknown")
+    poller = runner.NotReadyPoller(warm, "ip-10-0-44-18")
+    assert poller.not_ready_now() is True, "seen NotReady earlier"
+    warm.ready = "True"  # Ready again by the time the verify begins
+    assert poller.not_ready_now() is False, "'still NotReady' is required"
 
 
 # --- the runner's site lookup and configure ---------------------------------
