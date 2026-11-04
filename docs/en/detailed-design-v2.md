@@ -4383,8 +4383,16 @@ twice (`test_a_restart_between_drain_and_revoke_resumes_on_postgres`). An incide
 only when those nodes are proven departed in the **same** cycle. Every case not ended has a bounded `kind` (also the
 `reason` label of `gpu_fault_departed_node_cleanup_refusals_total`) and a manual command, in two groups -- "waiting"
 (`PENDING`, resolving by itself) and "left to the operator" (`REFUSED`) -- tabled in §10.1.1 of administrator operations; a
-workflow that changed a node or has a remote command and anything on a cluster that is not `ACTIVE` are only ever
-reported. A spare's records end as usual and its declaration on the deploy host is only reported (`DECLARED_SPARE`,
+workflow that changed a node or has a remote command is only ever reported. Only a cluster the registry holds `ACTIVE`
+is judged (`run_once` skips a registration whose `is_active` is false, as it skips a synthetic one): any other
+lifecycle is a `join-cluster` (`PENDING`/`FAILED`/`ROLLED_BACK`), a `remove-cluster` or an `uninstall`
+(`DRAINING`/`REVOKED`) under way, which owns the records -- from the drain on the Executor's node report is refused
+with 423 (`regional_cluster_request_allowed`) and, once the removal stops the node runtime, every lease lapses while
+the node is still there, so judging it reported every node departed (live 2026-11-04: an "operator action needed"
+mail for every node of a removed cluster). Such a cluster gets no new ledger line, no notification, no refusal count and no
+provider read; its existing lines stay as they are, are judged again once it is `ACTIVE` and are deleted by `_prune`
+with the registration (`tests/departed_nodes/test_departed_node_cleanup_membership.py`). The former
+`CLUSTER_NOT_ACTIVE` reason is gone with it. A spare's records end as usual and its declaration on the deploy host is only reported (`DECLARED_SPARE`,
 which once seen stays with the departure by its instance): `config spare --release` releases only the record of a
 provably departed node (`admin/warm_spare_departed.py`, skipping the unlabel and uncordon that need the Node and saying
 why) and writes a `DepartedNodeSpareRelease` in the Pod (a generic `gpu_fault_objects` kind written by the administrator
@@ -4408,8 +4416,7 @@ and no Agent left (no record, or `REVOKED`) as departed: the provider is not ask
 change reference (the never-dispatched close, `close_never_dispatched_workflow`, reads the acceptance back from the
 store for a node that rests on it, never taking the evidence's word); a `QUARANTINED` incident is not closed (an isolation is cleared only on the provider's proof). Without
 an acceptance the ledger carries the command only when the exit would be taken (the reports open, no `AGENT_ALIVE`) and
-otherwise says what it waits for; the `--retire-departed-agents` command of `CLUSTER_NOT_ACTIVE` is likewise given only
-for a known identity -- the ledger never gives a command that would refuse. A line whose proof does not hold while the
+otherwise says what it waits for -- the ledger never gives a command that would refuse. A line whose proof does not hold while the
 node has no unretired Agent and no open incident is deleted; when the node name is back in Kubernetes the acceptance goes
 with its ledger line (`tests/departed_nodes/test_unknown_provider_identity.py`,
 `tests/admin/test_admin_workflow_reconcile_unknown_identity.py`).

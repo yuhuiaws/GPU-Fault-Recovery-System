@@ -2184,6 +2184,13 @@ When every attempt was overtaken it reads `node annotation cleanup of <node> did
 | Aurora/site/release commit | Synchronises state incrementally, removes the local member and token, refreshes the failure-domain mapping | Serial commit, recording `SITE_COMMIT_STARTED` before writing the site |
 | Final re-verification | Proves the removal target is absent and the clusters to be kept are still healthy | Read-only checks may run in parallel; any failure writes no `COMPLETED` |
 
+**What the departed-node cleanup shows during a removal: nothing new.** From the `DRAINING` step until the
+registration is purged the cleanup does not judge the cluster (§10.1.1): no `departed node` line in `status`, no
+`[GPU node departed: operator action needed]` notification and no refusal counted for its nodes, although every Agent
+lease lapses once the node runtime stops; a ledger line the cluster already had is kept as it was and leaves with the
+registration. Its nodes are not departed nodes: do not run `workflow-reconcile --retire-departed-agents` for them. The
+same holds for `join-cluster` until it activates the cluster, and for every cluster of an `uninstall`.
+
 The last GPU cluster may be removed; the CPU control plane keeps running with an explicit empty registry `[]`, for
 re-joining later. After the last cluster is removed, the release state sync (`sync-state`) has no GPU cluster from which to read the Node Installer image,
 and uses the image recorded in the release state (otherwise the configured value), no longer judging the empty set as "inconsistent". The Runtime Profile registration anchor is a stable identifier and is not rewritten because the current GPU set is empty.
@@ -5971,7 +5978,6 @@ there is a manual path, the ledger line and the notification give the exact comm
 | `remote_command` | the workflow has a remote command | same |
 | `declared_spare` | the node was a declared or reserved warm spare when Kubernetes last listed it: its other records end as usual, the declaration on the deploy host is the administrator's (once seen, the finding stays with the departure even after the inventory forgets the label at 24 hours) | `gpu-fault-admin config spare --state-dir <state-dir> --node <node> --cluster-id <cluster> --release --reference <change> --confirm RELEASE_WARM_SPARE_UNCORDON`: for a provably departed node it releases only the record and acknowledges it to the control plane; the next cycle turns the ledger line `CLEANED` (§2) |
 | `incident_names_other_nodes` | the incident also names a node not proven departed | `--close-incident <id>` |
-| `cluster_not_active` | the cluster is not `ACTIVE` (or is disabled) in the registry | `--retire-departed-agents --node <node> --dry-run` (given only where the node's provider identity is known; for an unknown one see the next row) |
 | `provider_identity_unknown` | the HyperPod node name carries no instance id, or the eks-managed Agent record has no EC2-shaped `node_instance_id`: the provider can never be asked, and the cleanup neither retires such an Agent nor accepts its departure by itself | the administrator's exit `--retire-departed-agents --node <node> --accept-unknown-provider-identity --reason <why>` (`--dry-run` first, then without it and with `--reference`, §10.2). The ledger gives that command only when it would be taken: the latest Kubernetes node report fresh and not listing the node, the report chain never having listed it or leaving it out for 24 hours, and the Agent without a record, `REVOKED`, or with an expired lease and a heartbeat older than 10 minutes; otherwise the reason says what the exit still waits for (`... is not open yet: ...`) and no command is given |
 | `incident_not_closable`, `other` | the closure service refused, or another reason | per the refusal text |
 
@@ -6000,6 +6006,23 @@ at most 7 days without one.
 and no open incident (the administrator ended it by hand with `--close-incident`, say), the ledger line is deleted and
 the node no longer counts in `departed nodes:`.
 
+**A cluster that is not `ACTIVE` is not judged (a planned de-registration is no departure).** Only a cluster the
+registry holds `ACTIVE` is judged; any other lifecycle is a membership operation under way, and it owns the cluster's
+records: `join-cluster` (`PENDING`; `FAILED`/`ROLLED_BACK` when it fails), `remove-cluster` (`DRAINING` from its first
+step, `REVOKED` just before the registration is purged) and `uninstall` (every cluster `DRAINING`). From the drain on,
+the control plane refuses the cluster's Executor node report (HTTP 423) and the removal stops the node runtime, so each
+Agent's lease lapses about 90 s after its last heartbeat while its node is still in Kubernetes: judged, every node of
+the cluster would look departed. For such a cluster the cleanup therefore writes no new ledger line, sends no
+`[GPU node departed: operator action needed]` notification, counts no refusal and reads no provider. A line the cluster
+already had (a departure judged while it was `ACTIVE`) stays exactly as it was -- not rewritten, not notified again --
+and is deleted with the registration when `remove-cluster` purges it, or judged again once a join makes the cluster
+`ACTIVE` (a node the provider replaced in between is then a departure like any other: ended, with the informational
+notice). Do not run `--retire-departed-agents` for the nodes of a cluster being removed or joined: the membership
+operation owns their Agent records, and the command refuses a node still in Kubernetes anyway. Releases before batch
+249 reported every node of such a cluster `REFUSED` with the reason `cluster_not_active` (which no longer exists) and
+mailed it once per refusal set -- on a removal once with `agent_alive` while the last heartbeat was younger than
+10 minutes, and once more after that.
+
 **How to see what it did:**
 
 - `gpu-fault-admin status` prints, after `failing checks`, the header line `departed nodes: <n> cleaned, <n> pending, <n>
@@ -6012,7 +6035,8 @@ the node no longer counts in `departed nodes:`.
 - Notifications: one informational notice per departure ended, `[NOTICE][GPU node departed: records ended] <cluster>:
   <node>` (`ACTION_COMPLETED`, no action needed; the body lists the evidence and the records ended); one
   `[GPU node departed: operator action needed] <cluster>: <node>` (`OPERATOR_REVIEW`; the body lists what was ended
-  automatically, what is left for the operator and the exact commands) whenever a new set of refusal reasons appears.
+  automatically, what is left for the operator and the exact commands) whenever a new set of refusal reasons appears --
+  never for a node of a cluster that is not `ACTIVE` (above).
   Both go through the site's notification channel (SNS/SES), de-duplicated per departure; neither is an AMP alert and
   neither pages.
 - Metrics (only the control-worker process holding the lease has non-zero samples): `gpu_fault_departed_node_cleanup_enabled`,
@@ -6185,7 +6209,9 @@ nodes *it* replaces -- so the record stays `ACTIVE` with a long-expired lease. T
 check then reads one Agent more than there are Ready nodes, reports
 `<cluster> Agent coverage drift: expected=[...], agents=[...]` and rolls every deploy back; when every extra Agent has no
 Kubernetes Node the refusal ends with a hint naming this switch. The same `workflow-reconcile` with
-`--retire-departed-agents` retires such records:
+`--retire-departed-agents` retires such records. It is not for the nodes of a cluster a `remove-cluster`,
+`join-cluster` or `uninstall` holds outside `ACTIVE`: they did not depart, the membership operation owns their records
+(§10.1.1), and the command refuses a node still in Kubernetes:
 
 - **Discovery rule** (command-line side; a read-only `list-agents` in the Pod lists every Agent record of the site's
   clusters): the record is `ACTIVE` or `DRAINING` (`REVOKED` is no longer a candidate and is only counted under

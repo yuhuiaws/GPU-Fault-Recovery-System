@@ -82,7 +82,6 @@ PROVIDER_UNKNOWN = "provider_unknown"
 RECORD_MOVED = "record_moved"
 WORKFLOW_LIVE = "workflow_live"
 INCIDENT_NODES_PENDING = "incident_nodes_pending"
-CLUSTER_NOT_ACTIVE = "cluster_not_active"
 DECLARED_SPARE = "declared_spare"
 #: The node name carries no HyperPod instance, or the fleet recorded no EC2
 #: instance id for it: the provider can never be asked, so it never resolves.
@@ -104,7 +103,6 @@ WAITING_KINDS = frozenset(
     }
 )
 BLOCKER_KINDS = WAITING_KINDS | {
-    CLUSTER_NOT_ACTIVE,
     DECLARED_SPARE,
     PROVIDER_IDENTITY_UNKNOWN,
     WORKFLOW_CHANGED_NODE,

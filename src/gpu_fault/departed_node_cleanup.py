@@ -27,17 +27,27 @@ All three, judged by the rule ``workflow-reconcile`` judges with
 (``departed_nodes``), make a node proven departed; only then are its records
 ended, each through the CLI's own path (``departed_node_cleanup_actions``).
 What is not the cleanup's to end -- a workflow that changed a node or has a
-remote command, an incident naming a node that is still present, anything on
-a cluster the registry does not hold ``ACTIVE``, a departed spare's
-declaration (the deploy host's record, released by ``config spare --release``,
-which answers the finding with a ``DepartedNodeSpareRelease``), and a node
-whose provider identity is unknown (answered only by the administrator's
-``--accept-unknown-provider-identity``, a ``DepartedNodeIdentityAcceptance``;
-the cleanup never retires such an Agent itself) -- is reported instead: one
-ledger line per node
+remote command, an incident naming a node that is still present, a departed
+spare's declaration (the deploy host's record, released by ``config spare
+--release``, which answers the finding with a ``DepartedNodeSpareRelease``),
+and a node whose provider identity is unknown (answered only by the
+administrator's ``--accept-unknown-provider-identity``, a
+``DepartedNodeIdentityAcceptance``; the cleanup never retires such an Agent
+itself) -- is reported instead: one ledger line per node
 (``DepartedNodeCleanupRecord``, read by ``gpu-fault-admin status``), one
 notification naming the node and the exact administrator command, and the
 refusal counter. A cleaned node gets one informational notification.
+
+Only a cluster the registry holds ``ACTIVE`` is judged. Every other lifecycle
+is a membership operation under way -- a join (``PENDING``, ``FAILED``,
+``ROLLED_BACK``), a ``remove-cluster`` or an uninstall (``DRAINING``,
+``REVOKED``) -- and it owns the cluster's records: from the drain on the
+executor's node report is refused and the removal stops the node runtime, so
+every Agent would look departed while its node is still there (live
+2026-11-04: one "operator action needed" notification per node of a removed
+cluster). Such a cluster gets no new ledger line, no notification and no
+refusal count; the lines it already had stay as they were until it is
+``ACTIVE`` again or leaves the registry (``_prune``).
 
 ``GPU_FAULT_DEPARTED_NODE_CLEANUP_ENABLED`` (admin config
 ``spec.workflow.departedNodeCleanup``, default on) switches the writes off;
@@ -61,7 +71,6 @@ from gpu_fault.departed_node_cleanup_actions import (
     ACTION_KINDS,
     AGENT_ALIVE,
     BLOCKER_KINDS,
-    CLUSTER_NOT_ACTIVE,
     DECLARED_SPARE,
     KUBERNETES_UNPROVEN,
     OPEN_INCIDENT_STATES,
@@ -73,7 +82,6 @@ from gpu_fault.departed_node_cleanup_actions import (
     CleanupOutcome,
     DepartureWrites,
     accept_identity_command,
-    retire_command,
     spare_command,
 )
 from gpu_fault.departed_node_provider import ProviderLookupError, ProviderMembership
@@ -286,7 +294,7 @@ class DepartedNodeCleanup:
         return self.config.interval_seconds
 
     def run_once(self) -> list[DepartedNodeCleanupRecord]:
-        """Judge every registered cluster's departed nodes and end what is proven."""
+        """Judge every ACTIVE cluster's departed nodes and end what is proven."""
 
         now = self.now()
         records: list[DepartedNodeCleanupRecord] = []
@@ -294,7 +302,10 @@ class DepartedNodeCleanup:
             registered: set[str] = set()
             for registration in self.store.list_regional_clusters():
                 registered.add(registration.cluster_id)
-                if registration.synthetic:
+                if registration.synthetic or not registration.is_active(now):
+                    # A join, a removal or an uninstall owns the records of a
+                    # cluster that is not ACTIVE (module docstring): its lines
+                    # are kept as they are, and judged again once it is.
                     continue
                 records.extend(self._cluster(registration, now))
             self._prune(registered, now)
@@ -478,7 +489,6 @@ class DepartedNodeCleanup:
         now: datetime,
     ) -> dict[str, DepartureProof]:
         provider = cluster_provider_of({"provider": registration.provider})
-        active = registration.is_active(now)
         guard = self.config.guard
         proofs: dict[str, DepartureProof] = {}
         for node_id in sorted(candidates):
@@ -498,18 +508,6 @@ class DepartedNodeCleanup:
             else:
                 proof.instance_id = hyperpod_instance_id(node_id)
                 unknown = NO_HYPERPOD_INSTANCE_BLOCKER
-            if not active:
-                proof.block(
-                    CLUSTER_NOT_ACTIVE,
-                    f"cluster {registration.cluster_id} is "
-                    f"{registration.lifecycle_state.value}"
-                    + ("" if registration.enabled else " and disabled")
-                    + " in the registry; departed-node cleanup acts on ACTIVE "
-                    "clusters only",
-                    # The administrator's retire proves the departure through
-                    # the provider: named only where the provider can be asked.
-                    retire_command(node_id) if proof.instance_id is not None else None,
-                )
             if proof.kubernetes.blocker is not None:
                 proof.block(KUBERNETES_UNPROVEN, proof.kubernetes.blocker)
             if agent is not None and agent.lifecycle_state.value in (

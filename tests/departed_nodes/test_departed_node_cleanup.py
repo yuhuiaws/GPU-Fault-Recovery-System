@@ -401,25 +401,46 @@ def test_an_open_remote_command_keeps_the_workflow(
     ), "the other incident's never-dispatched record is still closed"
 
 
-@pytest.mark.parametrize(
-    "lifecycle", [RegionalClusterLifecycle.DRAINING, RegionalClusterLifecycle.PENDING]
-)
-def test_a_cluster_that_is_not_active_is_reported_not_acted_on(
-    lifecycle: RegionalClusterLifecycle,
+NOT_ACTIVE = [
+    *(
+        pytest.param({"lifecycle_state": state}, id=state.value)
+        for state in RegionalClusterLifecycle
+        if state is not RegionalClusterLifecycle.ACTIVE
+    ),
+    pytest.param({"enabled": False}, id="ACTIVE-disabled"),
+]
+
+
+@pytest.mark.parametrize("update", NOT_ACTIVE)
+def test_a_cluster_that_is_not_active_is_not_judged_until_it_is(
+    update: dict[str, Any],
 ) -> None:
+    """A join, a remove-cluster or an uninstall owns a cluster the registry
+    does not hold ACTIVE: no ledger line, no notification, no refusal, nothing
+    read or written (live 2026-11-04: a removal mailed "operator action
+    needed" for every node). ACTIVE again, its departure is judged as any."""
+
     store = build_store()
     world_ = hyperpod_departure(store)
-    store.save_regional_cluster(registration(HP_CLUSTER, lifecycle=lifecycle))
+    store.save_regional_cluster(registration(HP_CLUSTER).model_copy(update=update))
 
-    [record] = world_.cleanup.run_once()
-
-    assert record.status is DepartedNodeCleanupStatus.REFUSED
-    assert "cluster_not_active" in record.blocker_classes
-    assert f"is {lifecycle.value}" in record.blockers[0]
+    assert world_.cleanup.run_once() == []
+    assert store.list_departed_node_cleanups() == []
+    assert world_.notifications.sent == []
+    assert dict(world_.cleanup.refusals_total) == {}
+    assert world_.provider.calls == []
     assert store.get_agent(HP_CLUSTER, HP_NODE).lifecycle_state is (
         AgentLifecycleState.ACTIVE
     )
-    assert world_.provider.calls == []
+    assert store.get_workflow("workflow-hp-efa").status is WorkflowStatus.BLOCKED
+
+    store.save_regional_cluster(registration(HP_CLUSTER))
+    [record] = world_.cleanup.run_once()
+
+    assert record.status is DepartedNodeCleanupStatus.CLEANED, record.blockers
+    assert world_.notification_subjects() == [
+        f"[NOTICE][GPU node departed: records ended] {HP_CLUSTER}: {HP_NODE}"
+    ]
 
 
 def _quarantine(store: Any, incident_id: str, workflow_id: str) -> None:
