@@ -106,6 +106,21 @@ class SlottedFleetStore:
         return [agent] * self.nodes
 
 
+class CountingFleetStore(FleetStore):
+    """A ``FleetStore`` that also counts in place (``count_agents``), as the
+    PostgreSQL store does; ``counts`` records each count it was asked for."""
+
+    def __init__(self, nodes: int) -> None:
+        super().__init__(nodes)
+        self.counts: list[tuple[str, frozenset[str]]] = []
+
+    def count_agents(self, cluster_id: str, lifecycle_states) -> int:
+        self.counts.append((cluster_id, frozenset(lifecycle_states)))
+        if self.error is not None:
+            raise self.error
+        return self.nodes
+
+
 def count(store: object, now: float) -> int | None:
     return storm_admission.cluster_gpu_nodes(store, CLUSTER, now=now)
 
@@ -117,6 +132,29 @@ def failed_reads_since(before: dict[str, int]) -> dict[str, int]:
 
 def unavailable() -> RuntimeError:
     return RuntimeError("agent table unavailable")
+
+
+def test_a_store_that_counts_in_place_is_asked_for_the_number_not_listed() -> None:
+    """Listing a cluster decodes every Agent record of it -- about 60 ms for a
+    256-node cluster -- on the first-action path of a burst (batch 246); a
+    store with ``count_agents`` answers the ACTIVE/DRAINING count instead, and
+    a failed count falls back exactly as a failed list read does."""
+
+    store = CountingFleetStore(256)
+
+    assert count(store, 0.0) == 256
+    assert store.counts == [
+        (CLUSTER, frozenset({AgentLifecycleState.ACTIVE, AgentLifecycleState.DRAINING}))
+    ]
+    assert store.reads == 0, "the cluster's Agents were listed"
+    assert count(store, TTL - 1) == 256
+    assert len(store.counts) == 1, "a good count is kept for the TTL"
+
+    store.error = unavailable()
+    before = storm_admission.node_count_read_failures()
+    assert count(store, TTL + 1) == 256, "the last good count judges a failed count"
+    assert failed_reads_since(before) == {LAST_GOOD_FALLBACK: 1, FLOOR_FALLBACK: 0}
+    assert store.reads == 0, "a failed count never falls back to a list read"
 
 
 def test_a_failed_read_after_a_good_one_judges_with_the_last_good_count() -> None:

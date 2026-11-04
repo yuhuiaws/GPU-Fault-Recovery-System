@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -160,6 +161,36 @@ class PostgresFleetMixin:
             )
             rows = cursor.fetchall()
         return [self._decode("agent", row[0]) for row in rows]
+
+    def count_agents(self, cluster_id: str, lifecycle_states: Iterable[str]) -> int:
+        """How many of ``cluster_id``'s Agents are in ``lifecycle_states``.
+
+        One count over the ``gpu_fault_agent_cluster`` index: no Agent payload
+        leaves the database and none is decoded. The remediation storm
+        breaker's GPU-node count asks this instead of listing the cluster
+        (``storm_admission.cluster_gpu_nodes``); a payload without a
+        ``lifecycle_state`` counts as ``ACTIVE``, the field's default, exactly
+        as the decoded record would.
+        """
+
+        states = sorted(
+            {str(getattr(state, "value", state)) for state in lifecycle_states}
+        )
+        if not states:
+            return 0
+        with self._db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT count(*)
+                FROM gpu_fault_objects
+                WHERE kind='agent'
+                  AND payload->>'cluster_id'=%s
+                  AND COALESCE(payload->>'lifecycle_state', 'ACTIVE') = ANY(%s)
+                """,
+                (cluster_id, states),
+            )
+            row = cursor.fetchone()
+        return int(row[0]) if row else 0
 
     def list_fleet_deployments(self):
         with self._db.cursor() as cursor:

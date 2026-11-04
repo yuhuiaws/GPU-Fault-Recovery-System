@@ -4920,7 +4920,11 @@ at least two workload domains (the nodes of one job, or of one incident without 
 many nodes is one fault and never trips it; many unrelated nodes failing together look like a bad driver, image or policy. The node count is the
 cluster's `ACTIVE`/`DRAINING` fleet Agents (one per GPU node; a departed node counts until the departed-node cleanup retires its
 Agent, so the threshold errs high, not low), read at most once a minute per process and cluster
-(`execution/storm_admission.py`). A failed read is never kept: the last good count judges for up to 300 s (a count changes
+(`execution/storm_admission.py`). PostgreSQL counts them in place (`count_agents`: one count over the agent cluster index,
+no Agent record leaves the database); a store without that count is listed and counted. Listing decodes every Agent of the
+cluster, and the first admissions of one cluster in a burst read before any of them has kept its count: on the 32 x 4 x 4
+action model with 256-node clusters (local A/B) that decoding made the first dispatch tick about 4 s longer, and every
+workflow's first command waited for it (batch 246). A failed read is never kept: the last good count judges for up to 300 s (a count changes
 only through joins, departures and retirements, and a departed node is retired no sooner than the 10-minute departure guard,
 so a count five minutes old misses at most five minutes of retirements), with no count that young the floor of 3 applies, the
 store is not read again for 5 s (one dispatcher tick), and every failed read is logged and counted in

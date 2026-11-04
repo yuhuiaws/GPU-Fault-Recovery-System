@@ -21,7 +21,9 @@ from threading import Barrier
 
 import pytest
 
+from gpu_fault.execution import storm_admission
 from gpu_fault.execution.remediation_budget import RemediationBudgetPolicy
+from gpu_fault.fleet import AgentLifecycleState, AgentRecord
 from gpu_fault.models import WorkflowEventCode, WorkflowOperation, WorkflowStatus
 from gpu_fault.remediation_storm import StormBreakerState, released_breaker, storm_scope
 from gpu_fault.store import PostgresStore
@@ -303,3 +305,64 @@ def test_a_claim_waits_for_the_breaker_lock_holding_its_node_lock(store, databas
     breaker = store.get_remediation_storm_breaker(CLUSTER)
     assert breaker is not None and breaker.state is StormBreakerState.CLOSED
     assert [entry.node_id for entry in breaker.window] == ["node-idle-0"]
+
+
+def _agent(
+    node_id: str, state: AgentLifecycleState, *, cluster_id: str = CLUSTER
+) -> AgentRecord:
+    now = _now()
+    return AgentRecord(
+        cluster_id=cluster_id,
+        node_id=node_id,
+        endpoint="https://10.0.0.7:9099",
+        agent_version="1.0.0",
+        artifact_sha256="a" * 64,
+        policy_version="610",
+        runtime_profile_version="active-v1",
+        config_digest="b" * 64,
+        allowed_operations=[],
+        first_seen_at=now,
+        last_seen_at=now,
+        lifecycle_state=state,
+    )
+
+
+def test_the_breaker_counts_the_clusters_gpu_nodes_in_the_database(
+    store, database, monkeypatch
+):
+    """``count_agents`` answers what listing the cluster and counting would
+    (batch 246): its ACTIVE and DRAINING Agents, never a REVOKED one or another
+    cluster's, and a payload without ``lifecycle_state`` as the ACTIVE it
+    decodes to. The breaker's GPU-node count asks it and never lists (and so
+    never decodes) the cluster's Agents."""
+
+    active, draining, revoked = (
+        AgentLifecycleState.ACTIVE,
+        AgentLifecycleState.DRAINING,
+        AgentLifecycleState.REVOKED,
+    )
+    for index, state in enumerate([active] * 3 + [draining] * 2 + [revoked] * 2):
+        store.save_agent(_agent(f"node-{index}", state))
+    store.save_agent(_agent("node-0", active, cluster_id="cluster-b"))
+    database.execute(
+        "UPDATE gpu_fault_objects SET payload = payload - 'lifecycle_state' "
+        "WHERE kind='agent' AND key=%s",
+        (f"{CLUSTER}/node-0",),
+    )
+    counted = {active, draining}
+    listed = [
+        agent
+        for agent in store.list_agents(CLUSTER)
+        if agent.lifecycle_state in counted
+    ]
+
+    assert store.count_agents(CLUSTER, counted) == len(listed) == 5
+    assert store.count_agents(CLUSTER, [revoked]) == 2
+    assert store.count_agents(CLUSTER, []) == 0
+    assert store.count_agents("cluster-none", counted) == 0
+
+    def listing(*_args, **_kwargs):
+        raise AssertionError("the breaker's count listed the cluster's Agents")
+
+    monkeypatch.setattr(store, "list_agents", listing)
+    assert storm_admission.cluster_gpu_nodes(store, CLUSTER, now=time.monotonic()) == 5

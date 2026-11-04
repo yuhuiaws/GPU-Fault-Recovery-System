@@ -1075,6 +1075,8 @@ POSTGRES_ONLY_PUBLIC_METHODS: dict[str, str | None] = {
     "backfill_processor_queue_state_columns": None,  # legacy backfill; no Postgres test
     "claim_active_processor_query": "tests/store/test_postgres_claim_window.py",
     "compact_hot_tables": "tests/store/test_postgres_hot_table_compaction.py",
+    # The storm breaker's GPU-node count (batch 246); other stores are listed.
+    "count_agents": "tests/store/test_postgres_remediation_storm.py",
     "finalize_processor_counter_shards": "tests/store/test_postgres_processor_counters.py",
     "hot_layout_mode": "tests/store/test_postgres_hot_layout.py",
     "hot_table_bloat": "tests/store/test_postgres_hot_table_compaction.py",

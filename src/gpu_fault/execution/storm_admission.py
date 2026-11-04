@@ -14,7 +14,14 @@ The cluster's GPU nodes are its fleet agents that are ACTIVE or DRAINING (one
 per GPU node; a departed node's agent stays ACTIVE until the departed-node
 cleanup retires it, so the count errs high and the threshold with it), read at
 most once a minute per store and cluster -- a full agent list is not something
-to read on every admission.
+to read on every admission. A store that counts in place answers with the
+number (``count_agents``: PostgreSQL, one count query, no Agent record
+decoded); only any other store is listed and counted here. Listing a 256-node
+cluster decodes 256 records, and a burst's first admissions of one cluster
+start before any of them has kept its count, so on the 32 x 4 x 4 action model
+with 256-node clusters (a local A/B on PostgreSQL) that decoding made the
+first dispatch tick about 4 s longer, and every workflow's first command
+waited for it (batch 246).
 
 A failed read is never kept as the count (b227; it was kept as unknown for
 the minute, so one transient store error made a 256-node cluster's breaker
@@ -122,16 +129,34 @@ def cluster_gpu_nodes(
         if started < kept.retry_at:
             return kept.younger_than(NODE_COUNT_LAST_GOOD_SECONDS, started)
     try:
-        nodes = sum(
-            1
-            for agent in store.list_agents(cluster_id)
-            if agent.lifecycle_state in _COUNTED
-        )
+        nodes = _count_gpu_nodes(store, cluster_id)
     except Exception as exc:  # noqa: BLE001 - a failed count read has a fallback
         failed_at = time.monotonic() if now is None else now
         return _failed_read(store, cluster_id, exc, failed_at)
     _keep_good_read(store, cluster_id, nodes, started)
     return nodes
+
+
+def _count_gpu_nodes(store: Any, cluster_id: str) -> int:
+    """The cluster's ACTIVE and DRAINING fleet Agents, read from ``store``.
+
+    A store that counts in place (``count_agents``: PostgreSQL, one count over
+    the agent cluster index) is asked for the number. Any other is listed and
+    counted here, which decodes every Agent record of the cluster: about 60 ms
+    for 256 live-size records, paid by the dispatch threads of a burst's first
+    admissions -- concurrently for one cluster, before any of them has kept a
+    count -- and on the first-action path of every workflow of the burst
+    (batch 246).
+    """
+
+    count_agents = getattr(store, "count_agents", None)
+    if count_agents is not None:
+        return int(count_agents(cluster_id, _COUNTED))
+    return sum(
+        1
+        for agent in store.list_agents(cluster_id)
+        if agent.lifecycle_state in _COUNTED
+    )
 
 
 def node_count_read_failures() -> dict[str, int]:
