@@ -7,6 +7,7 @@ from typing import Any
 
 from gpu_fault.admin import cluster_join_nodes
 from gpu_fault.admin.bootstrap_common import BootstrapError, CommandRunner
+from gpu_fault.admin.cluster_node_key_digests import node_key_digests
 from gpu_fault.admin.node_key_proof import read_node_key_proof
 from gpu_fault.admin.site import RenderedSite
 
@@ -17,18 +18,11 @@ def validate_key_binding(binding: object, nodes: Sequence[str]) -> dict[str, Any
         for key in ("cpu_secret_uid", "gpu_secret_uid")
     ):
         raise BootstrapError("removal has no saved node-key Secret UID proof")
-    digests = binding.get("expected_key_sha256")
-    if (
-        not isinstance(digests, dict)
-        or set(digests) != set(nodes)
-        or any(
-            not isinstance(value, str)
-            or len(value) != 64
-            or any(character not in "0123456789abcdef" for character in value)
-            for value in digests.values()
-        )
-    ):
-        raise BootstrapError("removal has no complete node-key digest proof")
+    node_key_digests(
+        binding.get("expected_key_sha256"),
+        nodes,
+        refusal="removal has no complete node-key digest proof",
+    )
     return binding
 
 

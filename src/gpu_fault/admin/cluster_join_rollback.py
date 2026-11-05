@@ -13,6 +13,7 @@ from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.aws_commands import CommandResult, matches_not_found, wait_until
 from gpu_fault.admin.bootstrap_common import BootstrapError, CommandRunner
 from gpu_fault.admin.cluster_join_evidence import join_activation_is_irreversible
+from gpu_fault.admin.cluster_node_key_digests import node_key_digests
 from gpu_fault.admin.cluster_join_context import (
     ensure_kube_context,
     restore_current_context,
@@ -284,21 +285,19 @@ def _node_ownership(
     proof = evidence.get("NODE_NAMES_VERIFIED") or {}
     nodes = local.get("nodes") or []
     uids = local.get("node_uids")
-    digests = proof.get("expected_key_sha256")
+    refusal = "join rollback has no complete node/key ownership proof"
     if (
         not isinstance(uids, dict)
         or set(uids) != set(nodes)
-        or not isinstance(digests, dict)
-        or set(digests) != set(nodes)
         or proof.get("cluster_id")
         != (evidence.get("DISCOVERED") or {}).get("cluster_id")
         or proof.get("eks_arn") != target.get("eks_arn")
         or proof.get("node_uids") != uids
-        or any(
-            not isinstance(value, str) or len(value) != 64 for value in digests.values()
-        )
     ):
-        raise BootstrapError("join rollback has no complete node/key ownership proof")
+        raise BootstrapError(refusal)
+    # The digests the CPU key delete will demand, checked by the same rule
+    # before the rollback undoes anything.
+    digests = node_key_digests(proof.get("expected_key_sha256"), nodes, refusal=refusal)
     kubernetes_cleanup.clear_installer_annotations(
         partial(join.run_command, environment=effective_environment(request.site)),
         kubectl,
@@ -306,7 +305,7 @@ def _node_ownership(
         node_uids=uids,
         annotations=(),
     )
-    return dict(digests)
+    return digests
 
 
 def _delete_namespace(

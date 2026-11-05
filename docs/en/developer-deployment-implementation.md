@@ -1662,6 +1662,12 @@ uses the actual raw byte digest of the GPU's existing legitimate key, and only m
 can therefore be kept and correctly compensated. A resume may not overwrite the original proof with newly observed values. Only when a key write may have begun and
 the Node/key ownership proof is complete does compensation withdraw the CPU entries; the Node UID is re-verified first, then the CPU's current actual
 digest is compared item by item and resourceVersion CAS is used. A digest change or unknown ownership stops; foreign keys may not be deleted by NodeName.
+The join retry, the compensation, remove-cluster and the CPU key delete both end in read a saved digest map back through one
+validator (`src/gpu_fault/admin/cluster_node_key_digests.py`): a digest is exactly 64 lowercase hex characters, the form
+`hashlib`'s `hexdigest` writes, never folded to lowercase, and the map names exactly the proved nodes. A malformed digest is
+refused where it is first read, naming the nodes (never the value), so compensation runs no undo step first. Compensation used
+to check only for 64 characters: an uppercase or non-hex digest passed its ownership proof and the undo steps after it until the
+final CPU key delete refused it.
 Compensation of a join that already committed the site must complete the release state repair even if it finds the local site already recovered; cleaned-up
 resources must send explicit terminal updates such as `DELETED/DETACHED` under their original immutable identity, and the Aurora record cannot be assumed withdrawn just because it was
 omitted from the upsert list.

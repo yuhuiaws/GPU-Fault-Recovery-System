@@ -21,6 +21,7 @@ from gpu_fault.admin.cluster_kubeconfig import (
     kubeconfig_released,
     prune_result,
 )
+from gpu_fault.admin.cluster_node_key_digests import node_key_digests
 from gpu_fault.admin.cluster_removal_keys import (
     validate_key_binding,
     verify_node_key_ownership,
@@ -709,6 +710,15 @@ def _remove_node_action_keys(
 ) -> int:
     if not nodes:
         return 0
+    expected = (
+        None
+        if expected_key_sha256 is None
+        else node_key_digests(
+            expected_key_sha256,
+            nodes,
+            refusal="node-key deletion has an incomplete digest proof",
+        )
+    )
     runner = CommandRunner()
     proof = read_node_key_proof(
         runner, _cpu_kubectl(site), str(site.release_config["namespace"])
@@ -719,16 +729,10 @@ def _remove_node_action_keys(
         raise BootstrapError("CPU node-key Secret incarnation changed before deletion")
     present = set(proof.digests)
     removable = sorted(set(nodes) & present)
-    if expected_key_sha256 is not None:
-        if set(expected_key_sha256) != set(nodes) or any(
-            not isinstance(value, str)
-            or len(value) != 64
-            or any(character not in "0123456789abcdef" for character in value)
-            for value in expected_key_sha256.values()
-        ):
-            raise BootstrapError("node-key rollback has an incomplete digest proof")
-        if any(proof.digests[node] != expected_key_sha256[node] for node in removable):
-            raise BootstrapError("CPU node-key ownership changed before deletion")
+    if expected is not None and any(
+        proof.digests[node] != expected[node] for node in removable
+    ):
+        raise BootstrapError("CPU node-key ownership changed before deletion")
     if not removable:
         return 0
     patch = [

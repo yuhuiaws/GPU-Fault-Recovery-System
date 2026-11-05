@@ -19,6 +19,7 @@ from gpu_fault.admin.cluster_join_state import (
     reclaimed_cluster_token,
     step_done,
 )
+from gpu_fault.admin.cluster_node_key_digests import node_key_digests
 from gpu_fault.admin.deploy_limits import DEPLOY_CONCURRENCY
 from gpu_fault.admin.node_key_proof import read_node_key_proof
 from gpu_fault.admin.site import RenderedSite, effective_environment
@@ -351,19 +352,11 @@ def verify_join_node_names(
     }
     gpu_keys = read_node_key_proof(runner, gpu_kubectl, namespace)
     if already_claimed:
-        expected = previous.get("expected_key_sha256")
-        if (
-            not isinstance(expected, dict)
-            or set(expected) != nodes
-            or any(
-                not isinstance(value, str)
-                or len(value) != 64
-                or any(character not in "0123456789abcdef" for character in value)
-                for value in expected.values()
-            )
-        ):
-            raise BootstrapError("join retry has no complete node-key digest proof")
-        digests = dict(expected)
+        digests = node_key_digests(
+            previous.get("expected_key_sha256"),
+            nodes,
+            refusal="join retry has no complete node-key digest proof",
+        )
         if gpu_keys is not None and any(
             node in gpu_keys.digests and gpu_keys.digests[node] != digests[node]
             for node in nodes
