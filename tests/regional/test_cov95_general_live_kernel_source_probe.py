@@ -35,8 +35,8 @@ from tests.regional._cov95_general_live_kernel import (
     SYSTEM_PATH,
     install_host,
     records_flags,
-    unit_properties,
 )
+from tests.regional._cov95_general_live_systemd import unit_properties
 
 BOOT_ID = Path("/proc/sys/kernel/random/boot_id")
 RECORD = {"message": "NVRM: Xid (PCI:0000:53:00): 79, fell off the bus"}
