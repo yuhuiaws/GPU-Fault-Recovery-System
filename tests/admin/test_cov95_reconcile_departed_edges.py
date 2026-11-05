@@ -22,8 +22,8 @@ from gpu_fault.admin.bootstrap_common import BootstrapError
 
 CLUSTER = "gpu-eks"
 REGION = "us-west-2"
-GONE = "i-0a0000000000000a1"
-LIVE = "i-0a0000000000000b2"
+GONE = "i-00000000000000001"
+LIVE = "i-00000000000000002"
 MISSING = {
     "node_id": "ip-10-0-1-1.us-west-2.compute.internal",
     "exists": False,
@@ -175,7 +175,7 @@ def test_a_failed_describe_names_the_region_but_redacts_the_output() -> None:
         (json.dumps({"Reservations": []}), "is invalid$"),
         (json.dumps([[GONE]]), "is invalid$"),
         (json.dumps([[GONE, 7]]), "is invalid$"),
-        (json.dumps(["i-0a0000000000000a1 running"]), "is invalid$"),
+        (json.dumps([f"{GONE} running"]), "is invalid$"),
     ],
     ids=["not-json", "not-a-list", "short-row", "state-not-text", "row-not-list"],
 )
@@ -339,7 +339,7 @@ def test_recorded_ids_are_read_once_per_eks_cluster_for_the_planned_nodes() -> N
         [
             {"cluster_id": CLUSTER, "node_ids": ["node-b"]},
             {"cluster_id": CLUSTER, "node_ids": ["node-a"]},
-            {"cluster_id": "gpu-hp", "node_ids": ["hyperpod-i-0a0000000000000c3"]},
+            {"cluster_id": "gpu-hp", "node_ids": ["hyperpod-i-0000000000000000"]},
             {"cluster_id": CLUSTER},
         ],
         cluster_target=_targets,
@@ -349,7 +349,7 @@ def test_recorded_ids_are_read_once_per_eks_cluster_for_the_planned_nodes() -> N
     assert recorded.get(CLUSTER, "node-a") == GONE
     assert recorded.get(CLUSTER, "node-b") is None
     assert recorded.get(CLUSTER, "node-z") is None
-    assert recorded.get("gpu-hp", "hyperpod-i-0a0000000000000c3") is None
+    assert recorded.get("gpu-hp", "hyperpod-i-0000000000000000") is None
     assert [item["node_ids"] for item in payloads] == [["node-a", "node-b"]], (
         "the Pod was asked more than once, or asked about a HyperPod cluster"
     )
