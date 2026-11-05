@@ -15,8 +15,8 @@ import pytest
 
 from scripts.e2e.regional.regional_live_fixture import RegionalFixtureError
 from tests.regional._cov95_destr026_harness import (
-    FakeWorkload,
     Destr026Harness,
+    FakeWorkload,
     isolate,
 )
 from tests.regional.test_destr026_same_node_two_gpu_reset import INCIDENT, NODE
