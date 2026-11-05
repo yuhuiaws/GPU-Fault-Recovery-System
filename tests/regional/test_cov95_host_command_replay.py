@@ -33,8 +33,17 @@ HEALTH = ["-H", "-j", "/dev/nvme0"]
 SCAN = ["--scan-open"]
 STATS = ["-S", "rdmap79s0"]
 REAL = "/usr/sbin/smartctl"
+NVIDIA_SMI = "/usr/bin/nvidia-smi"
 HEALTHY = json.dumps({"smartctl": {"exit_status": 0}, "smart_status": {"passed": True}})
 NIC_STATS = "NIC statistics:\n     rx_drops: 7\n     tx_drops: 1\n"
+#: Rewrites UUID_A's utilization column to idle.
+SET_IDLE = {
+    "query": "utilization",
+    "action": "set_column",
+    "uuid": UUID_A,
+    "column": "utilization.gpu",
+    "value": "0",
+}
 
 
 def plan_of(tool: str, *rules: dict[str, Any], not_after: float = NOW + 600) -> dict:
@@ -184,6 +193,22 @@ def test_apply_rule_names_an_action_it_does_not_know() -> None:
         "",
         "unknown action rewrite_all",
     ), "an unknown action changes nothing and says why"
+
+
+def test_apply_rule_never_claims_a_column_the_row_does_not_carry() -> None:
+    rows = f"{UUID_A}\n{UUID_B}, 97\n"
+    assert wrapper.apply_rule(SET_IDLE, rows, 0, "") == (
+        rows,
+        0,
+        "",
+        f"the row for {UUID_A} has no utilization.gpu column",
+    ), "a row too short for the column is served as it came, with the reason"
+    assert wrapper.apply_rule(SET_IDLE, f"{UUID_A}, 55\n", 0, "") == (
+        f"{UUID_A}, 0\n",
+        0,
+        "",
+        None,
+    ), "the same rule rewrites a row that carries the column"
 
 
 def test_real_binary_skips_empty_entries_and_links_into_the_replay_root(
@@ -337,6 +362,7 @@ def test_serve_without_a_plan_passes_the_real_answer_through_and_journals_it(
             "argv": HEALTH,
             "real": REAL,
             "real_returncode": 0,
+            "real_sha256": digest(HEALTHY + "\n"),
             "served_returncode": 0,
             "served_sha256": digest(HEALTHY + "\n"),
             "applied_rules": [],
@@ -403,6 +429,9 @@ def test_serve_answers_a_whole_output_rule_without_running_the_real_binary(
         "the first whole-output rule answers alone"
     )
     assert entry["unchanged_reason"] == [], entry
+    assert (entry["real_sha256"], entry["served_sha256"]) == (None, digest("")), (
+        "no real reading, so no real digest; the served one is the empty stdout"
+    )
 
 
 def test_serve_never_fabricates_an_edit_without_a_real_binary(
@@ -455,6 +484,10 @@ def test_serve_runs_the_real_binary_once_for_several_edits(
     assert len(real.calls) == 1, "both edits act on one real reading"
     entry = journaled(run_dir, "ethtool")[-1]
     assert (entry["applied_rules"], entry["real_returncode"]) == ([0, 1], 0), entry
+    assert (entry["real_sha256"], entry["served_sha256"]) == (
+        digest(NIC_STATS),
+        digest("NIC statistics:\n     rx_drops: 5000\n"),
+    ), "the journal tells the real reading from the edited one the product saw"
 
 
 def test_serve_passes_a_failed_real_query_through_unedited(
@@ -544,6 +577,28 @@ def test_serve_journals_an_edit_the_real_output_cannot_take(
     entry = journaled(run_dir, "smartctl")[-1]
     assert entry["unchanged_reason"] == ["rule 0: the real output is not JSON"], entry
     assert entry["applied_rules"] == [], entry
+
+
+def test_serve_journals_a_column_rewrite_the_row_cannot_take_as_not_applied(
+    tmp_path: Path, real: RealBinary
+) -> None:
+    rows = f"{UUID_A}\n{UUID_B}, 97\n"
+    real.answers(rows)
+    run_dir = tmp_path / "run"
+    install_plan(run_dir, "nvidia-smi", SET_IDLE)
+    argv = list(wrapper.TOOLS["nvidia-smi"]["queries"]["utilization"]["argv"])
+    served = wrapper.serve("nvidia-smi", argv, NVIDIA_SMI, str(run_dir), now=NOW)
+    assert served == (0, rows, ""), "the product is served the real reading"
+    entry = journaled(run_dir, "nvidia-smi")[-1]
+    assert (entry["query"], entry["applied_rules"]) == ("utilization", []), (
+        "a rewrite that did not happen is never journaled as applied"
+    )
+    assert entry["unchanged_reason"] == [
+        f"rule 0: the row for {UUID_A} has no utilization.gpu column"
+    ], entry
+    assert entry["real_sha256"] == entry["served_sha256"] == digest(rows), (
+        "the journal shows the served output is the real one"
+    )
 
 
 @pytest.mark.parametrize(

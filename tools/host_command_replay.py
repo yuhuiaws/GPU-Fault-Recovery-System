@@ -25,8 +25,11 @@ line, one GPU row or utilization column, or -- for the whole-field variants
 (scan failed, malformed JSON, no BMC, no statistics) -- the reviewed stdout and
 exit status. A failing real query is passed through as it failed; a rule may be
 bounded to N calls; the plan carries a deadline after which everything passes
-through. Each catalogued call is journaled with the sha256 of the real and the
-served output so the runner can read back what the product actually saw.
+through. Each catalogued call is journaled with the sha256 of the real
+(``None`` when no real binary ran) and the served output, the rules applied and
+why each other matching rule was not -- an edit the real output cannot take (no
+row for the UUID, a row without the column, output that is not JSON) is not
+applied -- so the runner can read back what the product actually saw.
 
 Standard library only, Python 3.9+, runs as ``python -I`` from the unit's
 private PATH; the same file is imported by the probe and the runner to validate
@@ -521,7 +524,7 @@ def apply_rule(
     if action in {"drop_row", "set_column"}:
         rows = stdout.splitlines()
         kept = []
-        seen = False
+        seen = edited = False
         for row in rows:
             fields = [item.strip() for item in row.split(",")]
             if fields and fields[0] == rule["uuid"]:
@@ -534,10 +537,20 @@ def apply_rule(
                 if index < len(fields):
                     fields[index] = rule["value"]
                     kept.append(", ".join(fields))
+                    edited = True
                     continue
             kept.append(row)
         if not seen:
             return stdout, returncode, stderr, f"no row for {rule['uuid']}"
+        if action == "set_column" and not edited:
+            # The row is too short to carry the column: the product is served
+            # the real reading, so the rule must not be journaled as applied.
+            return (
+                stdout,
+                returncode,
+                stderr,
+                f"the row for {rule['uuid']} has no {rule['column']} column",
+            )
         return "\n".join(kept) + ("\n" if kept else ""), returncode, stderr, None
     return stdout, returncode, stderr, f"unknown action {action}"
 
@@ -671,6 +684,7 @@ def serve(
     # that fires first does not need it; an edit or passthrough rule does, and a
     # call no rule fires on is a plain pass-through of the real answer.
     real_returncode: int | None = None
+    real_stdout: str | None = None
     stdout, stderr, returncode = "", "", 0
     ran_real = served_whole = False
     applied: list[int] = []
@@ -686,7 +700,7 @@ def serve(
                 continue
             if not ran_real:
                 stdout, stderr, returncode = run_real()
-                ran_real, real_returncode = True, returncode
+                ran_real, real_returncode, real_stdout = True, returncode, stdout
             if action in EDIT_ACTIONS and returncode != 0:
                 reasons.append(
                     f"rule {index}: the real query failed; passed through as it failed"
@@ -714,7 +728,7 @@ def serve(
             stdout, stderr, returncode = "", f"{tool}: command not found\n", 127
         else:
             stdout, stderr, returncode = run_real()
-            ran_real, real_returncode = True, returncode
+            ran_real, real_returncode, real_stdout = True, returncode, stdout
     if problem:
         reasons.append(problem)
     journal(
@@ -727,6 +741,7 @@ def serve(
             "argv": argv,
             "real": real,
             "real_returncode": real_returncode,
+            "real_sha256": None if real_stdout is None else _sha256(real_stdout),
             "served_returncode": returncode,
             "served_sha256": _sha256(stdout),
             "applied_rules": applied,
