@@ -297,6 +297,31 @@ def test_execute_004_without_branch_tokens_refuses(tmp_path: Path) -> None:
         runner.execute_case(settings, tmp_path, 1, _window())
 
 
+@pytest.mark.parametrize(
+    ("isolate_confirm", "stop_confirm"),
+    [
+        ("ENVLIVE004_ISOLATE", ""),
+        ("", "ENVLIVE004_STOP"),
+        ("ENVLIVE004_STOP", "ENVLIVE004_ISOLATE"),
+    ],
+    ids=["no-stop-token", "no-isolate-token", "swapped-tokens"],
+)
+def test_execute_004_needs_both_branch_tokens_before_any_probe(
+    tmp_path: Path, isolate_confirm: str, stop_confirm: str
+) -> None:
+    # The one branch-token check of the runner: execute_case's own, on the
+    # settings; each token is checked on its own and named in the refusal.
+    settings = _settings(
+        "GF-ENV-LIVE-004", isolate_confirm=isolate_confirm, stop_confirm=stop_confirm
+    )
+    with pytest.raises(
+        RegionalFixtureError,
+        match="--confirm-isolate ENVLIVE004_ISOLATE and --confirm-stop ENVLIVE004_STOP",
+    ):
+        runner.execute_case(settings, tmp_path, 1, _window())
+    assert RecordingController.instances == [], "refused before any probe exists"
+
+
 def test_execute_preflight_errors_refuse(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

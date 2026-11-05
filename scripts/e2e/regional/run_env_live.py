@@ -181,13 +181,6 @@ def read_only_preflight(
 # --------------------------------------------------------------------------- #
 
 
-def _target_plan(preflight: dict[str, Any]) -> dict[str, Any] | None:
-    target = preflight.get("target_gpu") or {}
-    uuid = target.get("gpu_uuid")
-    reports = preflight.get("device_plans") or {}
-    return reports.get(uuid) if uuid else None
-
-
 def scope_not_run_reason(
     settings: fixture.EnvLiveSettings, preflight: dict[str, Any]
 ) -> str | None:
@@ -530,21 +523,6 @@ def observation_plan(
 # --------------------------------------------------------------------------- #
 # Execute
 # --------------------------------------------------------------------------- #
-def _require_branch_tokens(arguments: argparse.Namespace, case_id: str) -> None:
-    if case_id not in ISOLATING_CASES:
-        return
-    if arguments.confirm_isolate != isolate_token(case_id):
-        raise RegionalFixtureError(
-            f"this case isolates the node; --confirm-isolate must be "
-            f"{isolate_token(case_id)}"
-        )
-    if arguments.confirm_stop != stop_token(case_id):
-        raise RegionalFixtureError(
-            f"this case stops the owned workload; --confirm-stop must be "
-            f"{stop_token(case_id)}"
-        )
-
-
 def execute_case(
     settings: fixture.EnvLiveSettings,
     run_dir: Path,
