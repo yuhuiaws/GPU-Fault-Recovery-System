@@ -531,3 +531,77 @@ def test_attachment_failure_never_mints_an_armed_witness(tmp_path, monkeypatch, 
             "post-release failure must retain proof that tracer startup was released"
         )
         assert child.waits == [10]
+
+
+@pytest.mark.parametrize(
+    ("reads", "arms"),
+    [
+        pytest.param(["notice", "attached"], True, id="notice-then-attach"),
+        pytest.param(["notice+attached"], True, id="one-write"),
+        pytest.param(["plain", "attached"], True, id="without-xx"),
+        pytest.param(["single-quoted", "attached"], True, id="older-quoting"),
+        pytest.param(["attached"], True, id="no-notice"),
+        pytest.param(["foreign-notice", "attached"], False, id="other-path"),
+        pytest.param(["notice", "eof"], False, id="notice-only"),
+        pytest.param(["notice", "notice"], False, id="repeated-notice"),
+    ],
+)
+def test_attachment_reads_through_the_symlink_resolution_notice(
+    tmp_path, monkeypatch, reads, arms
+):
+    """A pinned executable that is a symlink (``/usr/bin/true`` on Ubuntu 26.04)
+    makes ``strace -P`` print one resolution line before it attaches; only that
+    exact line may precede the attach line, and it may arrive on its own read."""
+    directory = tmp_path / "private"
+    directory.mkdir(mode=0o700)
+    link = tmp_path / "bin" / "true"
+    link.parent.mkdir()
+    link.symlink_to(SAFE_EXECUTABLE.resolve())
+    witness = trace.AttachedExecWitness(
+        directory, process(), deadline=time.monotonic() + 20, executable=link
+    )
+    child = FakeTracer()
+    child.stderr = FakeDiagnostic()
+    monkeypatch.setattr(trace.subprocess, "Popen", lambda *args, **kwargs: child)
+    monkeypatch.setattr(trace.signal, "pidfd_send_signal", lambda *args: None)
+    monkeypatch.setattr(
+        trace.os, "pidfd_open", lambda pid: os.open("/dev/null", os.O_RDONLY)
+    )
+    monkeypatch.setattr(trace, "process_identity", lambda pid: process(pid))
+    checks = iter([{0}, {child.pid}])
+    monkeypatch.setattr(trace, "tracer_pids", lambda tracee: next(checks))
+    resolved = os.path.realpath(link)
+
+    def hex_quoted(path):
+        return '"' + "".join(f"\\x{byte:02x}" for byte in os.fsencode(path)) + '"'
+
+    chunks = {
+        # The witness runs strace with -xx, which hex-escapes these paths too.
+        "notice": (
+            f"strace: Requested path {hex_quoted(str(link))} resolved into "
+            f"{hex_quoted(resolved)}\n"
+        ),
+        "plain": f'strace: Requested path "{link}" resolved into "{resolved}"\n',
+        "single-quoted": f"strace: Requested path '{link}' resolved into '{resolved}'\n",
+        "foreign-notice": (
+            f"strace: Requested path {hex_quoted('/x')} resolved into "
+            f"{hex_quoted(resolved)}\n"
+        ),
+        "attached": "strace: Process 200 attached\n",
+        "eof": "",
+    }
+    chunks["notice+attached"] = chunks["notice"] + chunks["attached"]
+    pending = [chunks[name].encode() for name in reads]
+    monkeypatch.setattr(
+        trace.os, "read", lambda *args: pending.pop(0) if pending else b""
+    )
+    monkeypatch.setattr(trace.select, "select", lambda *args: ([child.stderr], [], []))
+    if arms:
+        witness.start()
+        assert witness.armed, "the resolution notice must not void a real attachment"
+        witness.close()
+    else:
+        with pytest.raises(BoundaryDenied, match="could not prove complete attachment"):
+            witness.start()
+        assert not witness.armed, "an unexpected diagnostic must not arm the witness"
+        assert witness.closed, "failed attachment must close the witness"

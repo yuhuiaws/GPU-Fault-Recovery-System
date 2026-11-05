@@ -379,19 +379,70 @@ class AttachedExecWitness:
             if gate_write >= 0:
                 os.close(gate_write)
 
+    def _resolution_notices(self) -> tuple[bytes, ...]:
+        """The line strace prints before attaching when ``-P`` names a symlink.
+
+        strace keeps the requested path, adds its realpath and announces that on
+        stderr first (``Requested path %s resolved into %s``, src/pathtrace.c
+        ``pathtrace_select_set``), so a pinned executable that is a symlink --
+        ``/usr/bin/true`` on Ubuntu 26.04's coreutils -- leads the diagnostic
+        with it. The paths are quoted like every string under ``-xx`` (all
+        bytes as ``\\xNN``); the plain and single-quoted spellings of older
+        strace builds are accepted too. Nothing else may precede the attach line.
+        """
+
+        if self.executable is None:
+            return ()
+        requested = os.fspath(self.executable)
+        try:
+            resolved = os.path.realpath(requested, strict=True)
+        except OSError:
+            return ()
+        if resolved == requested:
+            return ()
+
+        def hex_quoted(path: str) -> str:
+            return '"' + "".join(f"\\x{byte:02x}" for byte in os.fsencode(path)) + '"'
+
+        spellings = (
+            (hex_quoted(requested), hex_quoted(resolved)),
+            (f'"{requested}"', f'"{resolved}"'),
+            (f"'{requested}'", f"'{resolved}'"),
+        )
+        return tuple(
+            f"strace: Requested path {path} resolved into {real}\n".encode()
+            for path, real in spellings
+        )
+
     def _await_attachment(self) -> None:
         child = self.child
         if child is None or child.stderr is None:
             raise BoundaryDenied("exec witness did not start")
-        remaining = self.deadline - time.monotonic()
-        if remaining <= 0 or not select.select([child.stderr], [], [], remaining)[0]:
-            raise BoundaryDenied("exec witness attachment timed out")
-        diagnostic = os.read(child.stderr.fileno(), 4096)
+        notices = self._resolution_notices()
+        diagnostic = b""
+        report = b""
+        # The notice and the attach line are separate writes: read until the
+        # line after any notice is complete.
+        while b"\n" not in report and len(diagnostic) < 4096:
+            remaining = self.deadline - time.monotonic()
+            if (
+                remaining <= 0
+                or not select.select([child.stderr], [], [], remaining)[0]
+            ):
+                raise BoundaryDenied("exec witness attachment timed out")
+            chunk = os.read(child.stderr.fileno(), 4096 - len(diagnostic))
+            if not chunk:
+                break
+            diagnostic += chunk
+            report = next(
+                (diagnostic[len(n) :] for n in notices if diagnostic.startswith(n)),
+                diagnostic,
+            )
         if (
             child.poll() is not None
-            or len(diagnostic) == 4096
-            or not diagnostic.startswith(b"strace: Process ")
-            or b" attached" not in diagnostic
+            or len(diagnostic) >= 4096
+            or not report.startswith(b"strace: Process ")
+            or b" attached" not in report
             or tracer_pids(self.tracee) != {child.pid}
         ):
             raise BoundaryDenied("exec witness could not prove complete attachment")

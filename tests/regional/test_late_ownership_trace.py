@@ -430,6 +430,31 @@ def test_real_owned_child_exec_witness_cannot_be_replaced_with_model_counters(
     assert worker.is_alive(), "witness cleanup must not signal the observed process"
 
 
+def test_real_witness_arms_when_the_pinned_executable_is_a_symlink(
+    tmp_path, owned_tracee
+):
+    """``strace -P`` on a symlink announces the resolution before it attaches
+    (``/usr/bin/true`` is one on Ubuntu 26.04); the witness must still arm."""
+    worker, _peer = owned_tracee
+    link = tmp_path / "true"
+    link.symlink_to(SAFE_EXECUTABLE.resolve())
+    directory = tmp_path / "witness"
+    directory.mkdir(mode=0o700)
+    witness = trace.AttachedExecWitness(
+        directory,
+        process_identity(worker.pid),
+        deadline=time.monotonic() + 20,
+        executable=link,
+    )
+    try:
+        witness.start()
+        assert witness.armed, "a symlinked pinned executable voided the attachment"
+        witness.check()
+    finally:
+        witness.close()
+    assert worker.is_alive(), "witness cleanup must not signal the observed process"
+
+
 def test_real_killed_child_keeps_its_terminal_record_in_the_trace(
     tmp_path, owned_tracee
 ):
