@@ -52,7 +52,7 @@ from tests._builders import (
 from tests.regional._regional_support import enqueue_remote_command
 
 NOW = datetime(2026, 11, 1, 9, 0, tzinfo=timezone.utc)
-NODE = "hyperpod-i-00000000000000007"
+NODE = "hyperpod-i-00000000000000001"
 RESTART = WorkflowOperation.RESTART_WORKLOAD
 REFERENCE = "CHG-2026-1101-01"
 ACTOR = "arn:aws:sts::123456789012:assumed-role/Admin/ops"
