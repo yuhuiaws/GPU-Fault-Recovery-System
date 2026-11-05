@@ -381,8 +381,19 @@ def test_the_summary_keeps_arriving_while_one_mount_hangs_for_two_intervals(
             assert sample["value"] == 1, payload["batch_id"]
 
         hung.release()
-        clock.seconds += TICK_SECONDS
-        recovered, _ = _tick(collector, hung, TICK_BOUND_SECONDS)
+        # The parked worker answers only once the scheduler runs it after the
+        # release; until then the collector rightly still reports the earlier
+        # probe as running. A slow host can tick first, so tick until it has.
+        deadline = time.monotonic() + TICK_BOUND_SECONDS
+        while True:
+            clock.seconds += TICK_SECONDS
+            recovered, _ = _tick(collector, hung, TICK_BOUND_SECONDS)
+            if (
+                _gauges(recovered)[str(hung_mount)][0] == 0
+                or time.monotonic() >= deadline
+            ):
+                break
+            time.sleep(0.05)
         assert _gauges(recovered)[str(hung_mount)][0] == 0, _gauges(recovered)
         assert "recovered" in recovered.edge_filter_reasons, (
             recovered.edge_filter_reasons
