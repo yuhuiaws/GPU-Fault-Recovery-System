@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -424,6 +425,32 @@ def test_response_read_and_context_exit_failures_never_reach_not_started_fallbac
     assert calls == (["GET"] if phase == "lookup" else ["GET", "POST"])
 
 
+def polled(
+    target: Target,
+    done: Callable[[WorkflowStepOutcome], bool],
+    *,
+    budget_seconds: float = 30.0,
+) -> WorkflowStepOutcome | None:
+    """Re-run the step at intervals, bounded by wall clock -- ``None`` when spent.
+
+    Every WAITING outcome is remembered before the next poll, as the executor
+    records each attempt. The real Agent reaches its permission boundary and
+    its terminal ledger result on its pool thread: a healthy run is there after
+    ~20 polls (~30 ms), but a fixed spin of 200 immediate polls is only ~0.25 s
+    of wall clock and ran out on a loaded runner while that thread waited for
+    the CPU -- the same failure ``settled`` in the Agent boundary tests fixes.
+    """
+    deadline = time.monotonic() + budget_seconds
+    while True:
+        outcome = target.execute()
+        if done(outcome):
+            return outcome
+        if time.monotonic() >= deadline:
+            return None
+        target.remember(outcome)
+        time.sleep(0.01)
+
+
 def test_actual_agent_completion_can_be_polled_after_a_corrupted_permit_ack(
     target: Target, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -463,23 +490,17 @@ def test_actual_agent_completion_can_be_polled_after_a_corrupted_permit_ack(
             return reply
 
         monkeypatch.setattr(transport, "urlopen", exchange)
-        for _ in range(200):
-            outcome = target.execute()
-            if corrupted:
-                break
-            target.remember(outcome)
-        else:
+        boundary = polled(target, lambda _outcome: corrupted)
+        if boundary is None:
             pytest.fail(
                 "the owned Agent did not reach its physical permission boundary"
             )
-        assert_unknown(target, outcome, accepted=True, permit=True)
-        target.remember(outcome)
-        for _ in range(200):
-            outcome = target.execute()
-            if outcome.status is not WorkflowStepStatus.WAITING:
-                break
-            target.remember(outcome)
-        else:
+        assert_unknown(target, boundary, accepted=True, permit=True)
+        target.remember(boundary)
+        outcome = polled(
+            target, lambda value: value.status is not WorkflowStepStatus.WAITING
+        )
+        if outcome is None:
             pytest.fail("the accepted command did not return a terminal ledger result")
 
     assert outcome.status is WorkflowStepStatus.SUCCEEDED
