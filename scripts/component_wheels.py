@@ -612,7 +612,7 @@ def component_source_digest(
 def validated_build_python(python: str) -> str:
     script = (
         "import importlib.metadata as m;"
-        "expected={'build':'1.6.0','setuptools':'84.0.0'};"
+        "expected={'build':'1.6.0','setuptools':'84.1.0'};"
         "actual={name:m.version(name) for name in expected};"
         "assert actual == expected, (actual, expected)"
     )

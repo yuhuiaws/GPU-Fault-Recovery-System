@@ -678,7 +678,7 @@ fills the list items into a thread-safe cache; subsequent reads of a Deployment 
 calls. The cache must not be reused across snapshots between different reports, different release phases or after any mutation.
 
 The release build must be independent of the caller's shell `umask`. Component builds always use
-`setuptools==84.0.0`, `SOURCE_DATE_EPOCH` and `umask 022`; the Python, packaged data
+`setuptools==84.1.0`, `SOURCE_DATE_EPOCH` and `umask 022`; the Python, packaged data
 and LICENSE copied into the temporary project are uniformly `0644`; Node bundle directories are uniformly `0755`, regular files
 `0644` and scripts `0755`. `artifact-check` must yield the same release ID under `umask 077` and `umask 002`,
 and must not fabricate a spurious upgrade because ZIP external attributes changed.
@@ -2477,6 +2477,18 @@ without any `--no-emit-package` (see the node installation section of the Deploy
 passes `pip-audit --require-hashes` with zero findings, delete the ids from `pip-audit-ignore.txt`. A change to `deploy-host.lock` or
 `build.lock` changes `dependency_identity_sha256`, so the signed deploy-host bundle must be rebuilt
 and re-signed before the next live deployment; a `runtime.lock` change goes through the normal Runtime Image release.
+
+The wheel builder is not in `uv.lock`: `requirements/build.in` pins `build` and `setuptools`, and `requirements/build.lock`
+is compiled from it with its file header command. The same setuptools version is pinned in two more places: the `[build-system]`
+of `pyproject.toml`, which `scripts/component_wheels.py` copies into every component project, and `validated_build_python` in
+`scripts/component_wheels.py`, which refuses to build a component wheel with any other `build`/`setuptools`. The deployer venv
+has no pin of its own: `scripts/setup_deploy_host.py` installs its setuptools from `build.lock` (bundle and online installs alike).
+A builder bump therefore moves `build.in`, `build.lock`, `pyproject.toml` and `scripts/component_wheels.py` in one commit, and every
+Python that builds wheels then reinstalls `build.lock` (`pip install --require-hashes --requirement requirements/build.lock` or a
+new deploy-host setup; every CI job that sets up Python installs it); otherwise the component build stops at that version check. Each wheel's
+`WHEEL` file records `Generator: setuptools (<version>)`, so the bump changes every component wheel, the node installer bundle and
+the control-plane and executor runtime images while the module digests stay equal. On its own the bump makes the next deploy
+`DATA_PLANE_COMPATIBLE`: it rolls the control plane, the executor/watcher/collector and the node Agent waves although no source file changed.
 
 ### 9.4 The Regional Release Orchestrator Is a Package; Coverage Floors for Deployment-side Source
 
