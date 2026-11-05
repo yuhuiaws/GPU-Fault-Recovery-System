@@ -16,7 +16,12 @@ buffer overflows the same way.
 The ladder below shrinks the heaviest, most redundant evidence first and stops
 as soon as the document fits. Every rank keeps its identity, status, progress
 watermarks and raw-dump reference at every step; what was removed is named in
-``evidence_trimmed`` so the record says why a field is short.
+``evidence_trimmed`` so the record says why a field is short. That note weighs
+itself: its ``bytes_after`` is the size of the document as sent, the note
+included, and only a document that fits with its note stops the ladder. It
+used to record the size measured while the note still held the size before
+it, one byte short whenever the number gained a digit, so a document a byte
+or two over the budget could read ``within_budget: true``.
 
 The ladder has a floor. A document still over the budget after every sample
 list was cut used to go back as it was, and the worker replaced the whole of it
@@ -51,6 +56,8 @@ TRIAGE_RESULT_BUDGET_BYTES = OBSERVATION_RESULT_BUDGET_BYTES - 64 * 1024
 #: the control plane's semantics matcher compares across ranks.
 SEMANTIC_ENTRY_STEPS = (32, 16, 8)
 TRIMMED_MARKER = "trimmed"
+#: The result field that names what the ladder cut and what the result weighs.
+TRIMMED_NOTE_KEY = "evidence_trimmed"
 #: The floor of the ladder; the name ``evidence_trimmed.steps`` records for it.
 SKELETON_STEP = "skeleton"
 #: Row fields the skeleton keeps: identity, role and status. ``process_identity``
@@ -437,18 +444,44 @@ LADDER: tuple[tuple[str, Callable[[list[dict[str, Any]]], int]], ...] = (
 )
 
 
+def _settle(
+    result: dict[str, Any], note: dict[str, Any], start: int, budget: int
+) -> int:
+    """Put ``note`` into ``result`` naming the size of the document carrying it.
+
+    ``start`` is the size without the note. Writing a size into the note can
+    lengthen the document it describes: the number may gain a digit, and
+    ``false`` is a byte longer than ``true``. The document is measured again
+    until the size written is the size measured; from the smaller start each
+    pass can only lengthen it by those few bytes, so it ends after a pass or
+    two. Returns that size.
+    """
+
+    note["bytes_after"] = start
+    note["within_budget"] = start <= budget
+    result[TRIMMED_NOTE_KEY] = note
+    while True:
+        size = encoded_size(result)
+        if size == note["bytes_after"] and note["within_budget"] is (size <= budget):
+            return size
+        note["bytes_after"] = size
+        note["within_budget"] = size <= budget
+
+
 def bounded_triage_result(
     result: dict[str, Any], budget: int = TRIAGE_RESULT_BUDGET_BYTES
 ) -> dict[str, Any]:
     """``result`` within ``budget`` where the ladder can get it, annotated.
 
-    The ladder is walked in place and stops at the first step that brings the
-    document under the budget; its last step is the skeleton floor, which keeps
-    every rank's identity and verdict and nothing else. ``evidence_trimmed``
-    names the budget, the size before and after, every step that changed a rank
-    and whether the document fits; a document still over the budget at the
-    floor is returned as it is, for the worker's stand-in to name its size and
-    its ranks.
+    The ladder is walked in place and stops at the first step after which the
+    document fits with its ``evidence_trimmed`` note -- a step after which it
+    fits only without the note does not stop it. Its last step is the skeleton
+    floor, which keeps every rank's identity and verdict and nothing else. The
+    note names the budget, the size before, every step that changed a rank
+    with the size after it (without the note), and the size of the document
+    returned (``bytes_after``, the note included) with whether that size fits
+    (``within_budget``). A document still over the budget at the floor is
+    returned as it is, for the worker's stand-in to name its size and ranks.
     """
 
     before = encoded_size(result)
@@ -456,6 +489,15 @@ def bounded_triage_result(
         return result
     ranks = [row for row in result.get("ranks") or [] if isinstance(row, dict)]
     steps: list[dict[str, Any]] = []
+    note: dict[str, Any] = {
+        "budget_bytes": budget,
+        "bytes_before": before,
+        "bytes_after": before,
+        "within_budget": False,
+        "steps": steps,
+    }
+    # A note an earlier pass wrote is replaced, never weighed with the steps.
+    result.pop(TRIMMED_NOTE_KEY, None)
     size = before
     for name, step in LADDER:
         changed = step(ranks)
@@ -463,18 +505,11 @@ def bounded_triage_result(
             continue
         size = encoded_size(result)
         steps.append({"step": name, "ranks": changed, "bytes": size})
+        # The note only adds bytes: a document over without it is over with it.
         if size <= budget:
-            break
-    note: dict[str, Any] = {
-        "budget_bytes": budget,
-        "bytes_before": before,
-        "bytes_after": size,
-        "within_budget": size <= budget,
-        "steps": steps,
-    }
-    result["evidence_trimmed"] = note
-    # Measured with the note in place: that is the document the worker sends.
-    after = encoded_size(result)
-    note["bytes_after"] = after
-    note["within_budget"] = after <= budget
+            if _settle(result, note, size, budget) <= budget:
+                return result
+            # Over by its own note: the next step cuts further.
+            del result[TRIMMED_NOTE_KEY]
+    _settle(result, note, size, budget)
     return result

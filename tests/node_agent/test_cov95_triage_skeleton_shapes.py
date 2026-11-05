@@ -285,6 +285,9 @@ def test_an_over_budget_document_with_sparse_ranks_reaches_the_floor_intact() ->
     assert note["steps"][-1]["ranks"] == 3, "every dict row reaches the floor"
     assert note["within_budget"] is True, note
     assert encoded_size(bounded) <= budget, "the document as sent fits"
+    assert note["bytes_after"] == encoded_size(bounded), (
+        "the note names the size of the document that carries it"
+    )
     vanished, unconfigured, floor, other = bounded["ranks"]
     assert vanished == {**vanished_rank(), "skeleton": True}, vanished
     assert unconfigured["flight_recorder"] == {

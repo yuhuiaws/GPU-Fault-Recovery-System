@@ -431,7 +431,9 @@ rank 发现、容器 scope 与 dump 位置都没有问题，任何开 FR 的 8 G
 `raw_evidence` 引用（不含内容）、各组的组身份、最新操作位置与 `progress` 水位及 `semantic_entries_total`、series 的 `status`
 （PAIRED/…）、时间戳与计数、栈/进程/GPU 序列的计数和 `python_stack`/`proc` 的状态，行盖 `skeleton: true`，节点级字段原样；
 每个 rank 的身份、FR 状态、`progress`、`raw_evidence` 每一级都保留，结果的 `evidence_trimmed` 记预算、裁前/裁后字节数与各级名称
-（用到地板时含 `skeleton` 及其字节数）。读取器的 `last_entry` 不再重复该组的 `semantic_entries`。只有骨架本身就超线的文档才换成占位，
+（用到地板时含 `skeleton` 及其字节数）；
+裁后字节数 `bytes_after` 是交出文档连同这份说明本身的确切大小，`within_budget` 按它判断，只在去掉说明时才达标的一级不停。
+读取器的 `last_entry` 不再重复该组的 `semantic_entries`。只有骨架本身就超线的文档才换成占位，
 占位带 `error`（字节数、预算、最重字段）、`failed_component=observation_worker`、`failure_stage=WORKER_OUTPUT`、`result_bytes`，
 并以 `ranks_summary`（pid、rank、状态，按结果顺序装满 16 KiB 为止）、`ranks_total`、`ranks_summary_truncated` 点名被替换的 rank。
 本地复现：真机 8 rank 形状 1,006 KB → 781 KB（只用无损一级），16 rank 2,003 KB → 875 KB，两者的控制面判定与全量结果相同；

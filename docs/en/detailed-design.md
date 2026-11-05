@@ -4505,10 +4505,15 @@ groups cut to the group identity (`pg_name`, `pg_members`, `pg_membership_sha256
 snapshots' status, `raw_evidence` and groups in the same compact form, the stack/process/GPU series down to their counts
 (`samples_trimmed`, `windows_trimmed`) and `python_stack`/`proc` down to `status`/`error`/`returncode`; the row is stamped
 `skeleton: true` and the node-level fields (`status`, `process_coverage`, `workload_scope`, `efa`, `errors`) stay whole. The
-ladder stops at the first step that fits. Every rank keeps pid/rank/identity, FR status, `progress` and `raw_evidence` at every
-step, and `evidence_trimmed` records the budget, the size before and after, each step with the ranks it touched and whether the
-document fits (`steps` carries `skeleton` with its bytes when the floor was applied). The reader's `last_entry` no longer repeats
-its group's `semantic_entries`. A rank of the live shape weighs 5.7 KB at the floor (64 ranks with two 64-operation dumps each:
+ladder stops at the first step after which the document fits together with its `evidence_trimmed` note (a step after which it
+fits only without the note does not stop it). Every rank keeps pid/rank/identity, FR status, `progress` and `raw_evidence` at
+every step, and `evidence_trimmed` records the budget, the size before, each step with the ranks it touched and the size after it
+without the note (`steps` carries `skeleton` with its bytes when the floor was applied), `bytes_after` -- the exact size of the
+document returned, the note included -- and `within_budget`, judged on that size. Writing the size can lengthen the document (the
+number gains a digit, `false` is a byte longer than `true`), so it is measured again until the size written is the size
+measured (at most two passes more). It used to be the size measured while the note still held the earlier number: a byte short
+whenever that gained a digit, so a document a byte or two over the budget could read `within_budget: true`.
+The reader's `last_entry` no longer repeats its group's `semantic_entries`. A rank of the live shape weighs 5.7 KB at the floor (64 ranks with two 64-operation dumps each:
 8.85 MB -> 369 KB; eight and sixteen ranks never reach it), so only a document whose skeleton alone is over the line goes out as
 the stand-in `{"status":"RESULT_SIZE_LIMIT","ranks":[],"evidence_complete":false,
 "error":"observation result exceeds budget: <bytes> > 1048576 bytes; largest fields: ...","failed_component":"observation_worker",
