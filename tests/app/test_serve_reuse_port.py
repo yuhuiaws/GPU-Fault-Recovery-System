@@ -15,6 +15,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -236,12 +237,14 @@ def test_a_worker_still_building_its_application_takes_no_connection(
         "--workers",
         "2",
         "--timeout-worker-healthcheck",
-        "1",
+        "3",
         "--factory",
         app="tests.app._reuseport_app:waiting",
     )
     _wait_for(lambda: len(list(entered.iterdir())) == 2, 30, "both workers waiting")
-    waited_until = time.monotonic() + 3
+    # Longer than the health-check timeout: a worker that stopped answering
+    # would be replaced inside this window.
+    waited_until = time.monotonic() + 4
     while time.monotonic() < waited_until:
         assert process.poll() is None, "a waiting worker must not stop the parent"
         assert not _listening_inodes(port), "no socket may listen while starting"
@@ -254,7 +257,12 @@ def test_a_worker_still_building_its_application_takes_no_connection(
     served = {_get(port, "/pid")[1]["pid"] for _ in range(40)}
     assert served == waiting_pids, "the workers that waited are the ones serving"
     output = _stop(process)
-    assert "died" not in output and "failed to start" not in output, output
+    # The supervisor may replace a worker whose interpreter is still starting
+    # (no health thread yet) past the timeout on a slow host; that worker never
+    # reached the factory. One that waited there must never die.
+    died = {int(pid) for pid in re.findall(r"Child process \[(\d+)\] died", output)}
+    assert not died & waiting_pids, output
+    assert "failed to start" not in output, output
 
 
 def test_a_worker_that_spends_its_start_up_store_budget_stops_the_parent(
