@@ -163,6 +163,8 @@ def test_a_command_preempts_the_passive_sample_and_runs(tmp_path, monkeypatch):
     use_imported_package(monkeypatch)
     monkeypatch.setenv("PATH", str(tmp_path / "slow"))
     supervisor = ObservationSupervisor()
+    slot = WatchedSlot(supervisor.slot)
+    supervisor.slot = slot
     released = threading.Event()
     passive, box = run_in_thread(
         supervisor,
@@ -187,7 +189,7 @@ def test_a_command_preempts_the_passive_sample_and_runs(tmp_path, monkeypatch):
 
     assert result.get("status") not in {"WORKER_STILL_RUNNING", None}, result
     assert result.get("worker_started", True) is not False, result
-    assert 0 < result["slot_wait_seconds"] < 8, result
+    slot.wait_for_the_holder(result, below=8)
     passive.join(timeout=REAL_WORKER_BUDGET_SECONDS)
     assert box["result"]["status"] == "PREEMPTED", box["result"]
     assert box["result"]["preempted_by"] == "sample", box["result"]
@@ -380,6 +382,8 @@ def test_a_triage_arriving_during_the_passive_sample_pairs_every_rank(
     monkeypatch.setenv("PATH", str(tools))
     use_imported_package(monkeypatch)
     runtime = _runtime(tmp_path, monkeypatch)
+    slot = WatchedSlot(runtime.supervisor.slot)
+    runtime.supervisor.slot = slot
     passive, box = run_in_thread(
         runtime.supervisor,
         {**sample_request(tmp_path / "proc", tmp_path), "settings": runtime.settings},
@@ -403,7 +407,9 @@ def test_a_triage_arriving_during_the_passive_sample_pairs_every_rank(
         "PAIRED"
     }, [row["flight_recorder_series"].get("status") for row in result["ranks"]]
     assert sorted(node.writes) == sorted([*range(8), *range(8)]), node.writes
-    assert 0 < result["slot_wait_seconds"] < 4, result["slot_wait_seconds"]
+    # A real wait, by wall clock: the triage found the sample holding the
+    # slot and had it only once the preempted sample let go of it.
+    waited = slot.wait_for_the_holder(result, below=4)
     assert result["triage_budget_seconds"] == 20, result["triage_budget_seconds"]
     assert result["elapsed_seconds"] < 15, result["elapsed_seconds"]
     assert elapsed < 20, elapsed
@@ -412,10 +418,10 @@ def test_a_triage_arriving_during_the_passive_sample_pairs_every_rank(
     assert box["result"]["preempted_by"] == "triage", box["result"]
     # What the report quotes: the measured fit of the live shape.
     print(
-        "LIVE-SHAPE 8 ranks: slot_wait=%.2fs triage elapsed=%.2fs fr_wait=%.2fs"
+        "LIVE-SHAPE 8 ranks: slot_wait=%.3fs triage elapsed=%.2fs fr_wait=%.2fs"
         " wall=%.2fs"
         % (
-            result["slot_wait_seconds"],
+            waited,
             result["elapsed_seconds"],
             result["flight_recorder_wait_seconds"],
             elapsed,

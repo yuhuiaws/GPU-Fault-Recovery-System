@@ -28,7 +28,7 @@ from gpu_fault.node_agent.observation_supervisor import (
     ObservationSupervisor,
 )
 from tests.node_agent._cov95_runtime_hung import process
-from tests.node_agent._observation_deadline import DeadlineClock
+from tests.node_agent._observation_deadline import DeadlineClock, WatchedSlot
 from tests.node_agent._support import command
 from tests.node_agent.test_communication_monitor import (
     REAL_WORKER_BUDGET_SECONDS,
@@ -107,6 +107,8 @@ def test_a_bundle_preempts_the_passive_sample_holding_the_shared_slot(
     use_imported_package(monkeypatch)
     monkeypatch.setenv("PATH", str(tmp_path / "slow"))
     runtime = _runtime(tmp_path, monkeypatch)
+    slot = WatchedSlot(runtime.supervisor.slot)
+    runtime.supervisor.slot = slot
     passive, box = run_in_thread(
         runtime.supervisor,
         {**sample_request(root, tmp_path), "settings": runtime.settings},
@@ -122,10 +124,8 @@ def test_a_bundle_preempts_the_passive_sample_holding_the_shared_slot(
     monkeypatch.setenv("PATH", str(fast))
     result = runtime.run_command("bundle", bundle_command())
     assert result["manifest_summary"]["capture_count"] >= 0, result
-    assert 0 < result["slot_wait_seconds"] < SLOT_WAIT_MAX_SECONDS, (
-        "the bundle ran once the preempted sample left the slot",
-        result,
-    )
+    # The bundle ran once the preempted sample left the slot.
+    slot.wait_for_the_holder(result, below=SLOT_WAIT_MAX_SECONDS)
     passive.join(timeout=REAL_WORKER_BUDGET_SECONDS)
     assert box["result"]["status"] == "PREEMPTED", box["result"]
     assert box["result"]["preempted_by"] == "bundle", box["result"]
