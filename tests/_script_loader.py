@@ -117,10 +117,21 @@ class LazyScriptModule:
     script itself reads. Without that forwarding a patch would land on the proxy
     and silently do nothing, which is what pushed earlier tests into patching
     ``MODULE.some_function.__globals__`` by hand.
+
+    ``__dict__`` is the loaded module's namespace for the same reason. Since
+    pytest 9.2, ``monkeypatch.setattr`` takes the value ``undo()`` restores
+    from ``target.__dict__`` rather than from ``getattr`` (pytest #10644). With
+    the proxy's own ``__dict__`` (which holds only ``path``) every script global
+    looked newly added, so ``undo()`` deleted the real one from the module for
+    the rest of the session.
     """
 
     def __init__(self, path: Path) -> None:
         object.__setattr__(self, "path", path)
+
+    @property
+    def __dict__(self) -> dict[str, Any]:  # type: ignore[override]
+        return self.load().__dict__
 
     @property
     def name(self) -> str:

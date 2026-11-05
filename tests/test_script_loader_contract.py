@@ -75,6 +75,7 @@ def test_lazy_proxy_forwards_attribute_writes_to_the_module(
     """
     proxy = lazy_script_module(RELEASE_IDENTITY)
     module = load_script_module(RELEASE_IDENTITY)
+    original = module.canonical_sha256
     sentinel = object()
 
     monkeypatch.setattr(proxy, "canonical_sha256", sentinel)
@@ -86,9 +87,35 @@ def test_lazy_proxy_forwards_attribute_writes_to_the_module(
     )
 
     monkeypatch.undo()
-    assert module.canonical_sha256 is not sentinel, (
-        "undo left the patched collaborator in place for later tests"
+    assert module.__dict__.get("canonical_sha256") is original, (
+        "undo did not put the original collaborator back for later tests"
     )
+
+
+def test_proxy_namespace_is_the_module_namespace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``vars(PROXY)`` must be the script's own namespace.
+
+    pytest 9.2 ``monkeypatch.setattr`` reads the value ``undo()`` restores from
+    ``target.__dict__`` (pytest #10644). If that were the proxy's own dict,
+    every script global would look newly added, and ``undo()`` would delete it
+    from the module, failing every later test that touches it. This holds
+    whichever pytest version is installed.
+    """
+    proxy = lazy_script_module(RELEASE_IDENTITY)
+    module = load_script_module(RELEASE_IDENTITY)
+    assert vars(proxy) is module.__dict__, (
+        "the proxy's __dict__ is not the module namespace undo() restores into"
+    )
+
+    original = module.canonical_sha256
+    for _ in range(2):
+        with monkeypatch.context() as patch:
+            patch.setattr(proxy, "canonical_sha256", object())
+        assert module.__dict__.get("canonical_sha256") is original, (
+            "a patch-and-undo cycle through the proxy lost the module global"
+        )
 
 
 def test_two_files_cannot_claim_one_module_name(tmp_path: Path) -> None:
