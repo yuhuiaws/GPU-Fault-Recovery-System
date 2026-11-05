@@ -37,10 +37,13 @@ from gpu_fault.watcher import AttemptObservation, ContainerObservation, Workload
 from scripts.e2e.regional import audit_control_record_archive as archive_audit
 from scripts.e2e.regional import audit_node_health_atomicity_postgres as atomicity
 from scripts.e2e.regional import q118_fallback_marker as q118
+from scripts.e2e.regional import run_cap005_postgres_suite as cap005
 
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts" / "e2e" / "regional"
 DEFAULT_DSN_FILE = Path("/etc/gpu-fault/aurora/postgres-url")
-DSN_READERS = (q118, archive_audit, atomicity)
+STORE_SCRIPTS = (q118, archive_audit, atomicity)
+#: Every script that reads the Aurora DSN the same way (CAP-005's suite too).
+DSN_READERS = (*STORE_SCRIPTS, cap005)
 
 
 class StoreHandle:
@@ -180,7 +183,7 @@ class ControlRecordArchiver:
 @pytest.fixture
 def world(monkeypatch: pytest.MonkeyPatch) -> StoreWorld:
     world = StoreWorld()
-    for module in DSN_READERS:
+    for module in STORE_SCRIPTS:
         monkeypatch.setattr(module, "PostgresStore", world.open)
     # A ``__main__`` run re-imports the name from the package.
     monkeypatch.setattr(store_package, "PostgresStore", world.open)
