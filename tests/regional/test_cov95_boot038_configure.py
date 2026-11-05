@@ -158,6 +158,28 @@ def test_a_site_without_its_region_or_the_other_context_is_refused(
         runner.configure(arguments(tmp_path))
 
 
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"gpuKubeconfig": ""},
+        {"gpuKubeconfig": "  "},
+        {"gpuKubeconfig": None},
+        {"cpu": {"eksArn": CPU_ARN}},
+        {"cpu": {"kubeconfig": "", "eksArn": CPU_ARN}},
+    ],
+    ids=["gpu-empty", "gpu-blank", "gpu-null", "cpu-absent", "cpu-empty"],
+)
+def test_a_site_without_a_kubeconfig_is_refused_by_name(
+    change: dict[str, Any], tmp_path: Path, profile: Path
+) -> None:
+    # An empty path must not become Path("."), the working directory, and
+    # surface later as RegionalLiveSettings' "kubeconfig does not exist".
+    write_site(tmp_path / "state", **change)
+
+    with pytest.raises(RegionalFixtureError, match="missing the GPU/CPU kubeconfig"):
+        runner.configure(arguments(tmp_path))
+
+
 def test_a_profile_without_a_host_probe_image_is_refused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -192,10 +192,9 @@ def configure(arguments: argparse.Namespace) -> Settings:
             "--other-cluster-id must differ from the target cluster"
         )
     other = _cluster_entry(document, other_id)
-    gpu_kubeconfig = Path(
-        case._text(spec.get("gpuKubeconfig"))  # noqa: SLF001 - shared text reader
-    ).expanduser()
-    cpu_kubeconfig = Path(case._text(cpu.get("kubeconfig"))).expanduser()  # noqa: SLF001
+    # The texts are checked, not Paths: Path("") is Path("."), which is truthy.
+    gpu_kubeconfig = case._text(spec.get("gpuKubeconfig"))  # noqa: SLF001 - shared text reader
+    cpu_kubeconfig = case._text(cpu.get("kubeconfig"))  # noqa: SLF001
     region = case._text(spec.get("awsRegion"))  # noqa: SLF001
     namespace = case._text(spec.get("namespace")) or "gpu-fault-system"  # noqa: SLF001
     other_context = case._text(other.get("context"))  # noqa: SLF001
@@ -205,8 +204,8 @@ def configure(arguments: argparse.Namespace) -> Settings:
             "cluster's context"
         )
     regional = RegionalLiveSettings(
-        cpu_kubeconfig=cpu_kubeconfig.resolve(),
-        gpu_kubeconfig=gpu_kubeconfig.resolve(),
+        cpu_kubeconfig=Path(cpu_kubeconfig).expanduser().resolve(),
+        gpu_kubeconfig=Path(gpu_kubeconfig).expanduser().resolve(),
         gpu_context=other_context,
         namespace=namespace,
         cluster_id=other_id,
