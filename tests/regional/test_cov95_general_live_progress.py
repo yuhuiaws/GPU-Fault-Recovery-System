@@ -16,14 +16,8 @@ import yaml
 from scripts.e2e.regional import general_live_progress as progress
 from scripts.e2e.regional.regional_commands import RegionalFixtureError
 from scripts.e2e.regional.workload_restart_custody import WorkloadOwnershipError
-from tests.regional.test_general_live_progress_job import (
-    NODE,
-    progress_job,
-    status,
-)
-from tests.regional.test_general_live_progress_job import (
-    private_umask as private_umask,
-)
+from tests.regional.test_general_live_progress_job import NODE, progress_job, status
+from tests.regional.test_general_live_progress_job import private_umask as private_umask
 
 pytestmark = pytest.mark.usefixtures("private_umask")
 MANIFESTS = Path(progress.__file__).with_name("manifests") / "training"

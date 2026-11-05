@@ -108,7 +108,7 @@ def test_cpu_site_id_is_the_same_for_the_sagemaker_and_the_eks_arn() -> None:
     ("arn", "fragment"),
     [
         (
-            f"arn:aws:ec2:{REGION}:{ACCOUNT}:instance/i-0123456789abcdef0",
+            f"arn:aws:cloudformation:{REGION}:{ACCOUNT}:stack/gpu-fault/unit",
             "a cluster is identified by its EKS or SageMaker ARN",
         ),
         (EKS_ARN, f"no HyperPod cluster orchestrates {EKS_ARN}"),
