@@ -10,6 +10,7 @@ its clean-up are observable without a database.
 
 from __future__ import annotations
 
+import importlib
 import io
 import runpy
 import sys
@@ -19,7 +20,6 @@ from types import SimpleNamespace
 from typing import Any
 
 import boto3
-import psycopg
 import pytest
 
 import gpu_fault.store as store_package
@@ -34,16 +34,22 @@ from gpu_fault.models import (
 )
 from gpu_fault.store import InMemoryStore
 from gpu_fault.watcher import AttemptObservation, ContainerObservation, WorkloadPhase
-from scripts.e2e.regional import audit_control_record_archive as archive_audit
-from scripts.e2e.regional import audit_node_health_atomicity_postgres as atomicity
-from scripts.e2e.regional import q118_fallback_marker as q118
-from scripts.e2e.regional import run_cap005_postgres_suite as cap005
 
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts" / "e2e" / "regional"
 DEFAULT_DSN_FILE = Path("/etc/gpu-fault/aurora/postgres-url")
-STORE_SCRIPTS = (q118, archive_audit, atomicity)
+Q118 = "q118_fallback_marker"
+ARCHIVE = "audit_control_record_archive"
+ATOMICITY = "audit_node_health_atomicity_postgres"
+STORE_SCRIPTS = (Q118, ARCHIVE, ATOMICITY)
 #: Every script that reads the Aurora DSN the same way (CAP-005's suite too).
-DSN_READERS = (*STORE_SCRIPTS, cap005)
+DSN_READERS = (*STORE_SCRIPTS, "run_cap005_postgres_suite")
+
+
+def script(name: str) -> Any:
+    """The script module, imported when a test runs: the audits import psycopg,
+    which the whole-tree collection without the optional drivers must not need."""
+
+    return importlib.import_module(f"scripts.e2e.regional.{name}")
 
 
 class StoreHandle:
@@ -183,8 +189,8 @@ class ControlRecordArchiver:
 @pytest.fixture
 def world(monkeypatch: pytest.MonkeyPatch) -> StoreWorld:
     world = StoreWorld()
-    for module in STORE_SCRIPTS:
-        monkeypatch.setattr(module, "PostgresStore", world.open)
+    for name in STORE_SCRIPTS:
+        monkeypatch.setattr(script(name), "PostgresStore", world.open)
     # A ``__main__`` run re-imports the name from the package.
     monkeypatch.setattr(store_package, "PostgresStore", world.open)
     return world
@@ -193,7 +199,7 @@ def world(monkeypatch: pytest.MonkeyPatch) -> StoreWorld:
 @pytest.fixture
 def database(monkeypatch: pytest.MonkeyPatch) -> FakeDatabase:
     database = FakeDatabase()
-    monkeypatch.setattr(psycopg, "connect", database.connect)
+    monkeypatch.setattr(importlib.import_module("psycopg"), "connect", database.connect)
     return database
 
 
@@ -206,10 +212,11 @@ def dsn_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     return path
 
 
-@pytest.mark.parametrize("module", DSN_READERS, ids=lambda module: module.__name__)
+@pytest.mark.parametrize("name", DSN_READERS)
 def test_store_dsn_reads_the_configured_file_and_refuses_empty_inputs(
-    module: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    module = script(name)
     path = tmp_path / "postgres-url"
     path.write_text("  postgresql://audit.invalid/db \n", encoding="utf-8")
     monkeypatch.setenv("GPU_FAULT_STORE_URL", "postgresql://environment.invalid/db")
@@ -230,10 +237,11 @@ def test_store_dsn_reads_the_configured_file_and_refuses_empty_inputs(
         module.store_dsn()
 
 
-@pytest.mark.parametrize("module", DSN_READERS, ids=lambda module: module.__name__)
+@pytest.mark.parametrize("name", DSN_READERS)
 def test_store_dsn_falls_back_to_the_environment_without_the_mounted_file(
-    module: Any, monkeypatch: pytest.MonkeyPatch
+    name: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    module = script(name)
     if DEFAULT_DSN_FILE.exists():
         pytest.skip("this host mounts the real Aurora DSN file")
     monkeypatch.delenv("GPU_FAULT_STORE_URL_FILE", raising=False)
@@ -295,7 +303,7 @@ def test_q118_disable_turns_the_named_marker_inactive_and_closes_the_store(
         sys, "argv", ["q118", "disable", "cluster-a", "attempt-1", "marker-1"]
     )
 
-    q118.main()
+    script(Q118).main()
 
     states = {item.marker_id: item.active for item in world.store.list_markers()}
     assert states == {"marker-other": True, "marker-1": False}
@@ -325,7 +333,7 @@ def test_q118_create_marks_every_distinct_attempt_node_for_a_workload_restart(
     )
 
     before = datetime.now(timezone.utc)
-    q118.main()
+    script(Q118).main()
 
     [created] = world.store.list_markers()
     assert created.marker_id == "marker-2"
@@ -373,7 +381,7 @@ def test_q118_closes_the_store_when_the_named_marker_is_absent(
     )
 
     with pytest.raises(StopIteration):
-        q118.main()
+        script(Q118).main()
 
     assert [handle.closed for handle in world.handles] == [True]
 
@@ -410,9 +418,9 @@ def test_archive_audit_archives_only_the_recovered_incident_and_cleans_up(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     bucket, module = archive_world(monkeypatch, world, tmp_path)
-    monkeypatch.setattr(archive_audit, "uuid4", lambda: SimpleNamespace(hex="c0ffee"))
+    monkeypatch.setattr(script(ARCHIVE), "uuid4", lambda: SimpleNamespace(hex="c0ffee"))
 
-    archive_audit.main(str(module), "s3://audit-bucket/archive")
+    script(ARCHIVE).main(str(module), "s3://audit-bucket/archive")
 
     incident_id = "audit-archive-c0ffee"
     active_id = "audit-archive-active-c0ffee"
@@ -447,7 +455,7 @@ def test_archive_audit_fails_when_the_active_incident_is_archived(
     bucket, module = archive_world(monkeypatch, world, tmp_path, archive_active=True)
 
     with pytest.raises(AssertionError, match="active incident was archived"):
-        archive_audit.main(str(module), "s3://audit-bucket/archive")
+        script(ARCHIVE).main(str(module), "s3://audit-bucket/archive")
 
     # Clean-up still runs; nothing was taken from the bucket by the audit.
     assert len(bucket.archive_calls) == 1
@@ -489,10 +497,10 @@ def test_node_health_audit_serializes_the_two_creators_into_root_and_successor(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     pauses: list[float] = []
-    monkeypatch.setattr(atomicity, "time", SimpleNamespace(sleep=pauses.append))
-    monkeypatch.setattr(atomicity, "uuid4", lambda: SimpleNamespace(hex="beef"))
+    monkeypatch.setattr(script(ATOMICITY), "time", SimpleNamespace(sleep=pauses.append))
+    monkeypatch.setattr(script(ATOMICITY), "uuid4", lambda: SimpleNamespace(hex="beef"))
 
-    atomicity.main()
+    script(ATOMICITY).main()
 
     event_ids = [f"audit-p12-node-health-beef-{side}" for side in "ab"]
     workflows = [world.store.get_workflow(f"workflow-{event}") for event in event_ids]
@@ -540,7 +548,7 @@ def test_load_module_executes_the_archiver_file_without_registering_it(
     module = tmp_path / "control_record_archive.py"
     module.write_text(ARCHIVER_MODULE, encoding="utf-8")
 
-    loaded = archive_audit.load_module(str(module))
+    loaded = script(ARCHIVE).load_module(str(module))
 
     assert loaded.__name__ == "gpu_fault.control_record_archive_probe"
     assert issubclass(loaded.ArchiveSafetyError, RuntimeError), (
