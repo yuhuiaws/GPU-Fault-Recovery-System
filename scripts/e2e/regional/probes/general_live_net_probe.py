@@ -9,9 +9,11 @@ It only ever creates and drives *test* interfaces named ``gfrs<digest><slot>``
 (``gfrs`` + 6 hex of the run id digest + one letter), declared required to the
 host collector by a ``collector_window_probe.py`` window the runner opens
 separately. It only ever operates on ``gfrs*`` test names, and even then refuses
-any that carries a routable (non-link-local) address or has a ``device`` link in
-sysfs -- the management ENI (``enp71s0``), the VPC-CNI ENI (``enp72s0``) and the
-EFA netdevs can never be taken down. The IPv6 link-local (``fe80::``) the kernel
+to create, take down, delete or put a qdisc on any that carries a routable
+(non-link-local) address or has a ``device`` link in sysfs (``cleanup`` leaves
+such a name in place and reports it under ``refused``) -- the management ENI
+(``enp71s0``), the VPC-CNI ENI (``enp72s0``) and the EFA netdevs can never be
+taken down. The IPv6 link-local (``fe80::``) the kernel
 auto-assigns every interface as it comes up -- the probe's own test ``veth`` ends
 and host-side pod veths included -- is not a real-device address. A ``veth`` pair
 carries a drop generator (a
@@ -524,6 +526,7 @@ def set_link(arguments: argparse.Namespace) -> None:
 def delete_interface(arguments: argparse.Namespace) -> None:
     run_id = checked_run_id(arguments.run_id)
     name = checked_test_interface(run_id, interface_name(run_id, arguments.slot))
+    forbid_real(run_id, name)
     run(["ip", "link", "del", name], check=False)
     state = load_state(run_id)
     if name in state["interfaces"]:
@@ -1122,9 +1125,12 @@ def cleanup(arguments: argparse.Namespace) -> None:
     """Undo this run's test objects; ``tcp`` is the TCP fixture's deadman kind.
 
     ``tcp`` stops the flow units, drops the netem qdisc, deletes the test
-    netns and every ``gfrs<digest>`` interface. Its deadman is only disarmed
-    once that left nothing behind, so a cleanup that could not finish is
-    retried when the deadman fires.
+    netns and every ``gfrs<digest>`` interface. A ``gfrs<digest>`` name that
+    carries a routable address or a ``device`` link (``forbid_real``) is never
+    deleted: it is listed under ``refused`` and stays in the residue, so the
+    cleanup is not clean. Its deadman is only disarmed once that left nothing
+    behind, so a cleanup that could not finish is retried when the deadman
+    fires.
     """
 
     run_id = checked_run_id(arguments.run_id)
@@ -1142,10 +1148,17 @@ def cleanup(arguments: argparse.Namespace) -> None:
         restore_tcp(run_id)
     if kind in {"all", "netns", "tcp"}:
         delete_netns(run_id)
+    refused: list[str] = []
     if kind in {"all", "interfaces", "tcp"}:
-        for entry in list(NET_CLASS.iterdir()):
-            if entry.name.startswith(f"{TEST_PREFIX}{digest}"):
-                run(["ip", "link", "del", entry.name], check=False)
+        for entry in sorted(NET_CLASS.iterdir()):
+            if not entry.name.startswith(f"{TEST_PREFIX}{digest}"):
+                continue
+            try:
+                forbid_real(run_id, entry.name)
+            except ProbeError:
+                refused.append(entry.name)
+                continue
+            run(["ip", "link", "del", entry.name], check=False)
         save_state(run_id, {"run_id": run_id, **json.loads(json.dumps(EMPTY_STATE))})
     disarm_deadman(run_id, "interfaces")
     remaining = residue(run_id)
@@ -1156,6 +1169,7 @@ def cleanup(arguments: argparse.Namespace) -> None:
         {
             "run_id": run_id,
             "kind": kind,
+            "refused": refused,
             "residue": remaining,
             "clean": clean,
         }

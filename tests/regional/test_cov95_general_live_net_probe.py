@@ -132,6 +132,27 @@ def test_delete_interface_removes_the_link_and_its_record(
     assert inner(host).count(["ip", "link", "del", DUMMY]) == 2, host.calls
 
 
+@pytest.mark.parametrize(
+    "link",
+    [{"device": True}, {"addresses": [("global", "10.0.44.9")]}],
+    ids=["device-link", "routable-address"],
+)
+def test_delete_interface_refuses_a_test_name_that_is_a_real_device(
+    node: tuple[FakeHost, NetBoundary], cli: Cli, link: dict[str, Any]
+) -> None:
+    host, _ = node
+    host.add_link(DUMMY, **link)
+    state = netp.load_state(RUN_ID)
+    state["interfaces"].append(DUMMY)
+    netp.save_state(RUN_ID, state)
+    code, answer, err = cli(*call("delete-interface", "--slot", "d"))
+    assert code == 1 and refused(answer, "delete-interface"), answer
+    assert "test interface name collides with a real device" in err, err
+    assert not any(c[:3] == ["ip", "link", "del"] for c in inner(host)), host.calls
+    assert (host.net_class / DUMMY).is_dir(), "the interface is left in place"
+    assert netp.load_state(RUN_ID)["interfaces"] == [DUMMY], "and so is its record"
+
+
 def test_set_link_refuses_a_state_that_is_not_up_or_down(
     node: tuple[FakeHost, NetBoundary], cli: Cli
 ) -> None:
@@ -403,11 +424,37 @@ def test_each_cleanup_kind_undoes_only_its_own_objects(
 
     code, answer, _ = cli(*call("cleanup", "--kind", "interfaces"))
     assert code == 0 and answer["clean"] is True, answer
+    assert answer["refused"] == [], "the probe's own dummy is no real device"
     assert ["ip", "link", "del", DUMMY] in inner(host), "the dummy is deleted"
     assert netp.load_state(RUN_ID)["interfaces"] == [], "the state is reset"
 
     code, answer, err = cli(*call("cleanup", "--kind", "everything"))
     assert code == 1 and "unsafe cleanup kind" in err, err
+
+
+def test_a_cleanup_never_deletes_a_test_name_that_is_a_real_device(
+    node: tuple[FakeHost, NetBoundary], cli: Cli
+) -> None:
+    host, _ = node
+    assert cli(*call("create-dummy", "--deadman-seconds", "600"))[0] == 0, "created"
+    host.add_link(A, device=True)
+    host.add_link(B, addresses=[("global", "10.0.44.9")])
+    own = netp.interface_name(RUN_ID, "c")
+    host.add_link(own, addresses=[("link", "fe80::1")])
+    host.calls.clear()
+    code, answer, _ = cli(*call("cleanup", "--kind", "interfaces"))
+    assert code == 0, answer
+    assert answer["refused"] == [A, B], "a device link or a routable address"
+    deleted = [c[3] for c in inner(host) if c[:3] == ["ip", "link", "del"]]
+    assert deleted == [own, DUMMY], (
+        "only the test interfaces are deleted; a kernel link-local is no real address"
+    )
+    assert (host.net_class / A).is_dir() and (host.net_class / B).is_dir(), (
+        "the refused names are left in place"
+    )
+    assert answer["residue"]["interfaces"] == [A, B], answer["residue"]
+    assert answer["clean"] is False, "a cleanup that refused something is not clean"
+    assert (host.net_class / "enp71s0").is_dir(), "the management ENI is untouched"
 
 
 def test_a_tcp_cleanup_without_a_fixture_still_disarms_both_deadmen(
@@ -432,6 +479,12 @@ def test_a_tcp_cleanup_never_drops_a_qdisc_on_a_real_device(
     assert code == 0, answer
     assert not any(c[0] == "tc" for c in inner(host)), (
         "a name that looks like a real NIC gets no qdisc change"
+    )
+    assert ["ip", "link", "del", A] not in inner(host), "and is never deleted"
+    assert (answer["refused"], answer["clean"]) == ([A], False), answer
+    stopped = [c[2] for c in inner(host) if c[:2] == ["systemctl", "stop"]]
+    assert f"{DEADMAN}-tcp.timer" not in stopped, (
+        "the tcp deadman stays armed while the residue is left"
     )
 
 
