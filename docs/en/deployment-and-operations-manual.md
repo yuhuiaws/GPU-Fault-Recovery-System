@@ -5185,9 +5185,10 @@ rm -f /tmp/gpu-fault-cluster-action-executor.yaml
 #### REG-8. Regional Deployment Acceptance Checklist
 
 This checklist applies only to the regionally separated deployment and is not interchangeable with the Appendix A.6 single-cluster checklist: the single-cluster checklist uses
-`http://<control-plane>` directly on 8080, whereas the regional control plane is exposed only through the TLS NLB on 443, and
-`/v1/fleet/agents` must carry the cluster scope in regional mode (a call without `cluster_id` is blocked with 403 by the
-default-deny middleware, or returns only the caller's own cluster data).
+`http://<control-plane>` directly on 8080, whereas the regional control plane is exposed only through the TLS NLB on 443.
+`/v1/fleet/agents` needs a credential (the execution token or a cluster token; an unauthenticated call is blocked with 403 by the
+default-deny middleware): a cluster token can read only its own cluster (naming another `cluster_id` answers 403), and the execution
+token without `cluster_id` returns every cluster, so acceptance always queries scoped by `cluster_id`.
 
 First prepare the acceptance variables. All operator-side calls need the execution token:
 
@@ -5207,10 +5208,10 @@ export EXECUTION_TOKEN="$(
 | 4 | Registry entries are complete and do not leak tokens | The code block below | One entry per registered cluster, `token_sha256_present=true`, `token_sha256_length=64`, and the response contains no `token_sha256` or `retiring_token_sha256` field; outside a rotation `retiring_token_sha256_present=false` |
 | 5 | All three replicas Ready | `kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" get deployment/gpu-fault-api-ha` | `3/3`, with no restart in the last 10 minutes |
 | 6 | Per-cluster Agent readiness (scoped) | The code block below | All nodes of the target cluster `ready=true` |
-| 7 | Executor **functionally** ready | The code block below | `claimed_total` increases monotonically or `last_successful_claim_at` is within 2 poll periods; Pod Ready by itself does not count |
-| 8 | No command stuck unclaimed | The code block below | `oldest_unclaimed_age_seconds` is `null` or < 600 |
+| 7 | Executor **functionally** ready | The code block below | `claimed_total` increases monotonically or `last_successful_claim_at` is within 2 poll periods (on the data-plane `/metrics` port 9111: `gpu_fault_cluster_executor_claims_total` / `gpu_fault_cluster_executor_last_claim_timestamp`); Pod Ready by itself does not count |
+| 8 | No command stuck unclaimed | The code block below | `gpu_fault_remote_command_oldest_unclaimed_seconds` (`oldest_unclaimed_age_seconds` in the statistics JSON) is empty or < 600 |
 | 9 | No new executor internal errors | `gpu_fault_remote_command_executor_internal_errors_total`, `gpu_fault_remote_command_executor_internal_error_last_seen_timestamp_seconds` | The former is the number of currently retained records and decreases with cleanup; the latter must not advance after this release, and a new value within the last 900 seconds triggers a critical alert |
-| 10 | The AMP/SNS alerting chain is loaded | The code block below | Live AMP contains the five required groups, Alertmanager has a valid SNS receiver, and `UNREACHABLE_ALERT_DEFECTS= 0` |
+| 10 | The AMP/SNS alerting chain is loaded | The code block below | Live AMP contains the seven groups `verify-regional-alerting.py` requires (`EXPECTED_GROUPS`), Alertmanager has a valid SNS receiver, and `UNREACHABLE_ALERT_DEFECTS= 0` |
 | 11 | The executor's HyperPod second confirmation comes from its own configuration | The code block below | With the HyperPod adapter enabled, `GPU_FAULT_HYPERPOD_CLUSTER` is non-empty and equals the `hyperpod_cluster_name` of the same `cluster_id` in the registry; when disabled, the variable being empty suffices |
 
 Items 1-3 must be run from a source allowed by the NLB Security Group. If the front-end SG only allows the GPU cluster's
@@ -5288,9 +5289,10 @@ kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
   'import json,os,urllib.request; r=urllib.request.Request("http://127.0.0.1:8080/v1/regional/clusters", headers={"X-GPU-Fault-Execution-Token": os.environ["TOKEN"]}); print(json.dumps(json.load(urllib.request.urlopen(r, timeout=10)), indent=2))'
 
 # 6. cluster-scoped readiness
+# When the site records a node selector (eks-managed, ownership-label clusters), set GPU_NODE_SELECTOR to it.
 NODE_IDS_JSON="$(
   kubectl --context "${GPU_EKS_CONTEXT}" get nodes \
-    -l "sagemaker.amazonaws.com/cluster-name=${HYPERPOD_CLUSTER_NAME}" -o json |
+    -l "${GPU_NODE_SELECTOR:-sagemaker.amazonaws.com/cluster-name=${HYPERPOD_CLUSTER_NAME}}" -o json |
   jq -c '[.items[].metadata.name] | sort'
 )"
 kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
@@ -5361,10 +5363,12 @@ kubectl --context "${GPU_EKS_CONTEXT}" -n "${NAMESPACE}" \
   grep -E 'ENABLE_(NODE_ACTION|HYPERPOD)_ADAPTER'
 ```
 
-`gpu-fault-hyperpod-adapter` is advertised only when `GPU_FAULT_ENABLE_HYPERPOD_ADAPTER=true`; the default manifest has `false`;
-before using
-`config/runtime-profile.regional-hyperpod-safe.example.yaml` (where `nodeReboot` and
-`nodeReplace` are OWN), the adapter must first be enabled per chapter 10 "Phase D". `nodeReplace`
+`gpu-fault-hyperpod-adapter` (`gpu-fault-eks-adapter` on an eks-managed cluster) is advertised only when
+`GPU_FAULT_ENABLE_HYPERPOD_ADAPTER=true`. The regional data-plane manifest `deploy/dataplane/cluster-action-executor.yaml` enables it by
+default and sets `GPU_FAULT_ALLOW_HYPERPOD_REBOOT=true`, `GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER=true` and
+`GPU_FAULT_ALLOW_HYPERPOD_REPLACE=false`; `verify_dataplane_executor.py` checks that all three `ENABLE_*` are `true`.
+`config/runtime-profile.regional-hyperpod-safe.example.yaml` (where `nodeReboot` and `nodeReplace` are OWN) therefore has executable
+owners; enabling destructive capabilities in phases is chapter 10 "Phase D". `nodeReplace`
 in that profile performs a `HEALTHY_WARM_SPARE_ONLY` local switch and must still keep
 `GPU_FAULT_ALLOW_HYPERPOD_REPLACE=false`; it must not call the provider replace API.
 
@@ -5400,7 +5404,12 @@ CPU HyperPod name, current release, regionally shared Runtime Profile and the cu
 `registration_cluster_id`; that anchor does not change as GPU clusters join or other clusters are decommissioned. Only when
 `remove-cluster` removes its own cluster while the site has other members does it move to a remaining member of the same
 provider (REG-8.1.6). Every GPU entry must explicitly contain the same Region, EKS ARN and
-HyperPod name; there is no `us-west-2` or other Region default.
+HyperPod name (an empty string for an eks-managed entry, which also carries `provider: eks-managed` and `node_selector`); there is no
+`us-west-2` or other Region default. Every entry must also carry a non-empty `agent_endpoint_allowed_cidrs` (the GPU node subnet
+CIDRs; the example template does not list the key): without it the engine fails with `<cluster_id> requires Agent endpoint CIDRs`
+before writing the registry, and the preflight checks that the actual node IPs fall inside these CIDRs. `gpu-fault-admin` does not
+require writing this JSON by hand: every command materializes the same configuration from `site.yaml` (a temporary 0600
+`regional-release.json`) and hands it to the engine.
 That `version` is the single version input for the CPU fleet pin, the Kubernetes Resource Collector,
 the node Installer Jobs generated by the Reconciler and the training workload annotation;
 you must not modify only one of these objects.
@@ -5464,25 +5473,34 @@ deploy/control-plane/regional/rollout-regional-release.sh \
 The execution order of `bootstrap` is fixed:
 
 1. Validate the actual EKS ARN, Region and HyperPod Orchestrator of the CPU/GPU kube contexts,
-   and confirm every GPU HyperPod is `NodeRecovery=None`;
-2. Apply the CPU prerequisites and write a non-empty regional registry containing only the first baseline GPU cluster;
-3. Upload the content-addressed wheels/bundle and run the schema ensure Job;
-4. Deploy the CPU ingress/worker, and register or check the declared regional Runtime Profile;
-5. Deploy and verify the NLB/TLS endpoint;
-6. Once the endpoint is ready, create the connection Secret for the first baseline GPU cluster and deploy
-   the Executor, Watcher, Resource Collector and Reconciler;
-7. Wait for the baseline cluster's node annotations to converge to the target artifact and write a checkpoint; a process interruption can be resumed,
-   and a controlled failure still runs the first-deployment cleanup below; the remaining GPU ARNs enter a separate batch join only after the baseline verify;
-8. Run the CPU role-split and GPU executor verifiers.
+   and confirm every GPU HyperPod is `NodeRecovery=None` (an eks-managed cluster instead validates the node groups its selector
+   selects), checking the Agent endpoint CIDRs and the executor IAM role boundary as well;
+2. Apply the CPU prerequisites (including the release-metadata read RBAC) and the RDS CA bundle, and write a non-empty regional
+   registry containing only the first baseline GPU cluster;
+3. Create the NLB Service early (AWS provisions the NLB during the following steps; the CNAME is published only after the gate of
+   step 6 passes);
+4. Upload the content-addressed wheels/bundle, install and run the Aurora credential refresher, prove the store state, and run the
+   schema ensure Job;
+5. Deploy the three CPU roles ingress/worker/spool, register or check the declared regional Runtime Profile, and write
+   `bootstrap-cpu-ready`;
+6. Wait for the NLB/TLS/DNS gate (the automated steps of CPU-5 to CPU-8) and write `bootstrap-endpoint-ready`;
+7. With the control-plane collector in place, create the connection Secret for the first baseline GPU cluster, run the endpoint check
+   Pod, deploy the Executor, Watcher, Resource Collector and Reconciler, install the Agents in node waves, wait for the node annotations
+   to converge to the target artifact and write a checkpoint; a process interruption can be resumed, and a controlled failure still runs
+   the first-deployment cleanup below; the remaining GPU ARNs enter a separate batch join only after the baseline verify;
+8. Write the per-cluster data-plane alert rules, run the full release validation (the CPU role-split, GPU executor and other
+   verifiers), and write `complete`.
 
 All GPU-specific mutations in steps 2 to 7 target only the first baseline cluster, including the kubeconfig context,
 namespace, token, Executor IAM, Node Action key, NLB NAT EIP and Private Hosted Zone
 VPC association. Clusters waiting to join must not receive network permissions in advance. VPC associations are deduplicated by `Region + VPC ID`;
 when several GPU clusters share a VPC it is associated only once.
 
-A first deployment has no "previous stable version". On failure it automatically fails closed: this solution's CPU/GPU Deployments
-are scaled to 0, while EKS/VPC/Aurora, Secrets and the content-addressed artefacts are kept for inspection or `resume`; shared
-infrastructure is never deleted by mistake.
+A first deployment has no "previous stable version". On failure (state `bootstrap-failed`) `auto_rollback=true` fails closed
+automatically: the Reconciler is scaled to 0 and running installer Jobs are cancelled first, then this solution's GPU-side Deployments
+(including the data-plane collector) and the three CPU roles are scaled to 0 (`bootstrap-cleanup-*` -> `bootstrap-cleaned`), while
+EKS/VPC/Aurora, Secrets and the content-addressed artefacts are kept for inspection or `resume`; shared infrastructure is never deleted
+by mistake.
 
 ##### REG-8.1.4 Upgrade, Resume and Rollback
 
@@ -5556,7 +5574,7 @@ the future, with no executor, i.e. never claimed by the dispatcher) and REPLACE_
 pinned in both directions by `tests/orchestration/test_replacement_merge_reopens_only_undispatched.py`); within them every unfinished, non-superseded reinstall step is recorded as `PENDING` when it has no execution record yet and `WAITING` when its latest execution is WAITING
 (a latest SUCCEEDED/FAILED does not count). Therefore reinstall steps not yet started at **any depth** of the plan, as well as plans still in SAFETY_PENDING,
 block every deploy / rollback in the Region for the whole lifetime of that step (until it completes, fails or is superseded). The scan is bounded at 1000 rows;
-with more than 1000 executable workflows it refuses with `could not bound the scan` rather than treating 0 as clean. The rationale is that R4's stable command id
+with more than 1000 executable workflows it refuses with `could not bound the scan` rather than treating 0 as clean. The rationale is that a reinstall step's stable command id
 is one-way: a control plane of another shape (the previous version a rollback lands on, or the old version replaced mid-upgrade) would submit the installation still running on the node a second time.
 
 The gate is open on both `upgrade` (new transaction, resume and supersede all enter here) and `rollback`, positioned **after** the Aurora credential refresh
@@ -5679,7 +5697,9 @@ immutable chunked ConfigMaps `gpu-fault-release-previous-<digest>-<part>`; the m
 the digest and chunk references; the non-sensitive role ConfigMap data actually referenced by the CPU three roles lives in that snapshot. Read,
 resume, rollback, status and management-plane alignment all transparently hydrate and verify chunk by chunk, stopping immediately on a missing chunk or digest mismatch.
 Rollback restores these configurations first and then starts the old wheel; tokens still exist only in Secrets and never enter ordinary ConfigMaps, logs
-or release state. A successful release deletes the temporary Secret backups and cleans up old snapshot chunks no longer referenced by the current state.
+or release state. When a successful release commits, it keeps only the Secret backups the new `previous` references (for
+`deploy --rollback`) and deletes the other labelled backups; previous-snapshot chunks keep the group the current state references and
+the newest other groups, at most 3 groups in total (`PREVIOUS_SNAPSHOTS_RETAINED`).
 A completed rollback prunes the snapshot chunks by the same rule and keeps the snapshot of the release it restored.
 When the control plane synchronises the registry at startup it first reads the raw list of cluster IDs, deletes old IDs no longer declared, then checks and overwrites the old payload of the same ID by the Region
 field, and only then reads with the new model. Therefore, when adding required fields, old
@@ -5832,8 +5852,8 @@ kube context), because a member rolled back alone would revoke the NAT EIP ingre
 created while the other member of that VPC still uses it; join the next cluster of that VPC in a separate `join-cluster` after the first
 returned `COMPLETED` (`administrator-operations.md` §5.0.4, known limit 4).
 When several join CLIs start concurrently on the same site, only one obtains the site operation lock; the rest fail immediately reporting the pid and command of the
-lock holder (deploy, join, remove, uninstall, config and workflow-reconcile share this one
-lock and this one policy), never waiting silently. Parallelism only happens inside a single batch.
+lock holder (deploy, join-cluster, remove-cluster, uninstall, config, rotate-token, workflow-reconcile and every other
+`gpu-fault-admin` command that changes the site share this one lock and this one policy), never waiting silently. Parallelism only happens inside a single batch.
 The Secret disaster-recovery copy uses `resourceVersion` CAS, re-reading and merging after a conflict. The site, release state and
 Aurora are committed first, then `ACTIVATION_STARTED` is written before activation; after that point it is fail-forward only. Each cluster's
 transaction state is fixed at `join-cluster/<arn-hash>/state.json` and does not occupy the site root `state.json`.
@@ -5852,10 +5872,15 @@ gpu-fault-admin remove-cluster \
   --confirm REMOVE_GPU_CLUSTER
 ```
 
-The high-level command first cleans up the target data plane and node services. After the Agent/Executor stop, it asynchronously requests namespace deletion,
-deregisters the CPU registry/keys in parallel and cleans up IAM/network in waves by installation-resource dependency; finally it waits for the
-namespace to disappear and verifies in parallel the target's absence, the registry, EKS/HyperPod preservation and the health of the remaining site. CPU
-join and remove share the same site transaction lock. When disassociating Route53 it first waits for ChangeInfo to reach `INSYNC`, then
+The high-level command first marks the cluster draining in the registry, then cleans up the target data plane and node services. After
+the Agent/Executor stop, it asynchronously requests namespace deletion, deregisters the CPU registry/keys in parallel and cleans up
+IAM/network in waves by installation-resource dependency; it then updates the Aurora resource registry, `site.yaml` and the release
+state, verifies in parallel the target's absence, the registry, EKS/HyperPod preservation and the health of the remaining site, and as
+the last step releases the ownership label `gpu-fault.io/control-plane=<site-id>` from the cluster's node groups (with
+`--keep-ownership-label` the label stays and is recorded as retained, for a re-join soon; it may also be added on a resume stuck at
+that step). CPU join and remove share the same site transaction lock. When the last installation registry sync failed, is not recorded
+or is unreadable, the command refuses to start unless `--accept-unsynchronized-registry` is given (only what the registry records is
+deleted; the flag and the recorded outcome go into the journal). When disassociating Route53 it first waits for ChangeInfo to reach `INSYNC`, then
 confirms the VPC association has disappeared from the hosted zone; it must not disassociate while remaining clusters still reference the same VPC.
 The control plane, the other GPU clusters and the target GPU EKS/HyperPod are all kept.
 The GPU-side Kubernetes cleanup runs with `--scope gpu --cluster-id <cluster_id>`: in its evidence
@@ -5870,17 +5895,20 @@ current GPU set. The site's registration cluster (`spec.runtimeProfile.registrat
 the anchor new versions register under: when the removed cluster is that cluster and the site has other members, the
 command makes a remaining member of the same provider the registration cluster (`registration_reanchor` in the journal
 and the command result); without such a member it refuses before changing anything -- join a cluster of the same
-provider first, then remove it. Removing the last cluster keeps the registration cluster. Details: Administrator
-Operations §5.0.4.
+provider first, then remove it. Removing the last cluster keeps the registration cluster. When the registration cluster has left the
+site (its completed remove-cluster journal proves it) without the anchor moving with it,
+`gpu-fault-admin deploy --state-dir ... --registration-cluster <remaining same-provider cluster> --reference <change>` moves the anchor
+to that cluster (journaled) and continues the deploy. Details: Administrator Operations §5.0.4.
 Removal acceptance includes at least:
 
 ```bash
 # After gpu-fault-admin remove-cluster returns, use the old token from a temporary probe on the removed data plane:
 # expect HTTP 403 with detail regional cluster is not registered.
 
-# Execution-token query on the CPU side:
-cp_get /v1/regional/clusters
-# The output must no longer contain the removed cluster_id.
+# Execution-token query on the CPU side (the same endpoint as REG-8 item 4); the output must no longer contain the removed cluster_id.
+kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
+  exec "${CPU_API_POD}" -- env TOKEN="${EXECUTION_TOKEN}" python -c \
+  'import json,os,urllib.request; r=urllib.request.Request("http://127.0.0.1:8080/v1/regional/clusters", headers={"X-GPU-Fault-Execution-Token": os.environ["TOKEN"]}); print(json.dumps(sorted(item["cluster_id"] for item in json.load(urllib.request.urlopen(r, timeout=10)))))'
 ```
 #### REG-8.2 Manual Release Object Inventory and Three-Tier Rollback
 
