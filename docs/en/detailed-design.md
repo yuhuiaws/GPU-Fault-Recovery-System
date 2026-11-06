@@ -4120,7 +4120,7 @@ The load-test bottleneck of the accepted rate is in this layer, not in database 
   the host's mount table `/proc/1/mountinfo` (PID 1 lives in the host mount namespace and the root unit can read it):
   `READ_ONLY` only when that mount's per-mount options or its superblock options say `ro`, never from the collector's
   own `statvfs` `ST_RDONLY` -- the unit's `ProtectSystem=strict` binds every mount read-only inside its sandbox, so
-  batch 163, which read that flag, reported every node's healthy `/` and `/var` read-only. An unreadable host table
+  reading that flag would report every node's healthy `/` and `/var` read-only. An unreadable host table
   reports no `READ_ONLY` (a view that cannot be read is no evidence of a read-only filesystem) and is warned about
   once. A path the sandbox hides (`/home`, `/root` and `/run/user` under `ProtectHome=`, or a mount the host has but
   the sandbox never received) is neither probed nor reported, and ENOENT inside a `PrivateTmp=` private directory is
@@ -4140,9 +4140,9 @@ The load-test bottleneck of the accepted rate is in this layer, not in database 
   raised; `errno` named), `IO_ERROR` (`statvfs` answered but the directory read raised; `errno` named, e.g.
   EACCES/EIO/ESTALE), `IO_TIMEOUT` (the directory read did not answer: no verdict, reported unavailable as missing
   evidence rather than healthy, and kept `IO_TIMEOUT` on later ticks while the parked read still holds the mount,
-  never relabelled `PROBE_TIMEOUT`) and `MOUNT_MISSING` (below). The rule is unchanged: ≥1 is CRITICAL
-  `RUN_DIAGNOSTICS`, VALIDATE_HOST re-reads the value and holds the node while it is 1; the labels are new and
-  optional, and unlabelled samples from older collectors grade as before.
+  never relabelled `PROBE_TIMEOUT`) and `MOUNT_MISSING` (below). The rule: ≥1 is CRITICAL
+  `RUN_DIAGNOSTICS`, VALIDATE_HOST re-reads the value and holds the node while it is 1; the labels are optional, and
+  unlabelled samples from older collectors grade the same way.
 - Shared mount memory (`collectors/host/shared_mounts.py`): only node-scoped mounts are remembered -- not the
   workload mounts under `/var/lib/kubelet/pods`, `/var/lib/kubelet/plugins` and the container runtime directories
   (they come and go with the job, and the control plane follows the Pod lifecycle), and not automounter children
@@ -4165,17 +4165,16 @@ The control plane uses `HealthSignalState` in the Aurora/SQLite/in-memory Store 
 `active_since/notified`. A finding is created only when the abnormality persists for the configured duration; a persistent abnormality notifies only once,
 and after returning to normal the active state is cleared and the signal is re-armed. Aurora uses an advisory transaction lock to prevent
 the three API replicas from sending duplicate emails. A batch claim (and the remediation-budget scopes of a workflow claim) takes
-the locks of all its keys in one statement ordered `COLLATE "C"` (byte order: the order of Python `sorted()` and of older
-pods' per-key loops), so two batches with overlapping keys cannot deadlock and no key costs its own database round trip
+the locks of all its keys in one statement ordered `COLLATE "C"` (byte order: the order of Python `sorted()`), so two batches with overlapping keys cannot deadlock and no key costs its own database round trip
 (`tests/store/test_postgres_advisory_lock_batches.py`).
 
-Device-scoped signals and a device that disappears (batch 160, GF-GENERAL-LIVE-006 live on plain EKS): a signal keyed
+Device-scoped signals and a device that disappears (GF-GENERAL-LIVE-006 covers it): a signal keyed
 `cluster/node/metric/<device>` (`disk_io_*` per block device, `network_*` per interface, the filesystem rules per mount
 point, SMART per drive) only receives samples while the device is on the node -- the host collector emits `disk_io_*`
-only for block devices present in `/proc/diskstats` with completed I/O -- so when a test dm-delay device had driven
-`disk_io_await_ms/dm-0` to active+notified and was then torn down, no below-threshold sample ever cleared it, the latch
-stayed for two hours, and a new same-named dm-0 that crossed the threshold again minted nothing because
-`_next_health_signal_state` saw `previously_notified` (a silent miss). Two layers now close this; both only ever *clear*
+only for block devices present in `/proc/diskstats` with completed I/O -- so once a device is torn down no below-threshold
+sample ever clears it: a `disk_io_await_ms/dm-0` already driven to active+notified would keep its latch, and a new same-named
+dm-0 that crosses the threshold again would mint nothing because `_next_health_signal_state` sees `previously_notified` (a
+silent miss). Two layers therefore close this; both only ever *clear*
 a signal and never invent a fault, a cleared signal must run its full sustain window again before it notifies, and a
 device that keeps breaching is carried by every delivered batch so neither layer touches it. (1) The collector reports a
 block device that was in `/proc/diskstats` on its previous read and is not now -- or whose counters restarted, which the
@@ -4209,7 +4208,7 @@ resolving to multiple attempts, is treated as an idle sample and resets the pers
 The finding carries the resolved `job_id`/`attempt_id`. The window is timed per that attempt: the claimed `HealthSignalState`
 key is `cluster/node/metric/device/rule/job_id/attempt_id`, so when another attempt (or job) takes over the node the window
 starts from zero with a notification latch of its own -- the previous attempt's low time is not counted against its
-successor (a job about one minute old was once flagged as idle and stopped/restarted that way), and a delivered finding of
+successor (otherwise a job about one minute old could be flagged as idle and stopped/restarted that way), and a delivered finding of
 the previous attempt does not silence the next one. The unscoped key `cluster/node/metric/device/rule` is claimed in the same
 call as the continuity gate: a sample without exactly one managed attempt lands only on it and resets it; it is never
 latched, and a finding needs both windows to have run for the configured duration
@@ -4234,10 +4233,10 @@ one WARNING per attempt and node once the attempt has run for a whole window (`l
 GPU of attempt ...`) (`tests/host_health/test_low_utilization_owned_gpus.py`). Several managed attempts on one node still
 count as "no single attempt" and are not graded.
 
-`LOW_CPU_UTILIZATION` no longer reads the host-wide `cpu_usage_percent` (every CPU in `/proc/stat`). The live HyperPod
-`ml.p5en.48xlarge` nodes expose 96 vCPUs and plain EKS `p5en.48xlarge` nodes 192: eight ranks each spinning about one core
+`LOW_CPU_UTILIZATION` does not read the host-wide `cpu_usage_percent` (every CPU in `/proc/stat`): HyperPod
+`ml.p5en.48xlarge` nodes expose 96 vCPUs and plain EKS `p5en.48xlarge` nodes 192, and eight ranks each spinning about one core
 while they wait on their GPU make the same healthy job read 8.3 % on the first and 4.2 % on the second, which is below 5 %
-and read as idle. The rule now reads `training_rank_cpu_percent`: the same threshold and window
+and would read as idle. The rule reads `training_rank_cpu_percent`: the same threshold and window
 (`GPU_FAULT_LOW_UTILIZATION_THRESHOLD_PERCENT`/`_DURATION_SECONDS`), only the denominator is one core instead of the whole
 host, and it too is graded only on the GPUs the attempt holds, whatever the host's size. The query is the
 `--query-compute-apps=pid,gpu_uuid` the Node Agent already runs, and utime+stime cover the whole thread group; a process on
@@ -4248,7 +4247,7 @@ waiting on its GPU spins a core and reads near 100 %; a blocked attempt whose ra
 deadlock, I/O that never returns) reads near 0 and still trips the rule; NOTIFY-005's CPU-only burners create no CUDA
 context and leave nothing to grade; an idle node has neither a managed attempt nor a compute process. Known limitation: a
 healthy job that explicitly selects `cudaDeviceScheduleBlockingSync` (same page: "Instruct CUDA to block the CPU thread on a synchronization primitive when waiting for the device to finish work.") can read near 0 during
-long GPU steps and trips `LOW_CPU_UTILIZATION` as it did under the old rule (the action is FREEZE_EVIDENCE + VALIDATE_HOST
+long GPU steps and trips `LOW_CPU_UTILIZATION` too (the action is FREEZE_EVIDENCE + VALIDATE_HOST
 only; the job is not stopped). Rejected alternatives: scaling the 5 % by the vCPU count or a busy-core threshold -- still a
 host-wide reading that co-tenant jobs and daemons decide, and a one-GPU job's single rank still reads as idle; the Pod
 cgroup's CPU against its request -- a new cgroup v1/v2 and cgroup-driver dependent reader, for a request that says nothing
@@ -4258,11 +4257,11 @@ blocking-sync mode. The host-wide `cpu_usage_percent` still feeds the 98 % satur
 
 The delivery edges of low utilisation are per GPU (`collectors/host/collector.py`): `host_gpu_utilization_percent` or
 `training_rank_cpu_percent` at or below the threshold gives every GPU its own edge reason `sustained:<metric>:<device>`.
-The two reasons used to be computed only for a collector statically configured `GPU_FAULT_WORKLOAD_STATE=ACTIVE`, which no
-deploy path sets (the live HyperPod and plain EKS collectors report UNKNOWN and the control plane fills it from the
-topology), so low utilisation was never an edge and the windows could only be judged on health summaries 270-330 seconds
-apart; and a reason per metric name stays present while any unallocated GPU idles, so the held GPU's recovery could not be
-delivered either. Now every GPU's crossing is delivered unless the collector explicitly declares `IDLE`; a collector's
+Every GPU's crossing is delivered unless the collector explicitly declares `IDLE`: no deploy path sets
+`GPU_FAULT_WORKLOAD_STATE` (the HyperPod and plain EKS collectors report UNKNOWN and the control plane fills it from the
+topology), so computed only for `ACTIVE` the two reasons would never make low utilisation an edge, the windows could only be
+judged on health summaries 270-330 seconds apart, and a reason per metric name would stay present while any unallocated GPU
+idles, so the held GPU's recovery could not be delivered either; a collector's
 first (baseline) delivery leaves these reasons out: idle GPUs read low from the first cycle, which is a state and not an
 edge, and with them every collector start would post evidence-class traffic instead of a routine baseline the spool can
 take (`tests/collectors/test_rank_cpu_and_low_utilization_edges.py`). The default rules are as follows:
@@ -4288,15 +4287,14 @@ it is counted in `gpu_fault_workflow_merge_record_only_total{reason="unsettled_h
 Different metrics and different nodes still each open their own; once the incident is `RECOVERED` (administrator has closed it) or
 `QUARANTINED`, the next finding opens a new one as usual.
 
-A finding the product routes into **an incident another fault opened** is mailed the same way (b215): while a managed
+A finding the product routes into **an incident another fault opened** is mailed the same way: while a managed
 attempt's recovery is in flight (an XID 13 stop-and-restart, an XID 48 GPU reset, an XID 79 reboot) the attempt grouping
 folds the finding into that recovery's `GPU_FAULT_GROUP` record (under the XID's event id and policy source), and the
 recovery's plan takes on the finding's own `FREEZE_EVIDENCE` + `VALIDATE_HOST` -- one more gate on the recovery; on a node
-the product is rebooting the reboot's record absorbs the finding (`orchestration/reboot_window.py`). The mail used to go
-out only when the finding minted its own incident (`app/ingest/node_health.py` took only
-`incident.event_id == finding.event_id`), so neither case mailed anything, while the XID's own mail went out before the
-fold and speaks of the XID alone: the administrator could find the signal only in the incident's reasons. The rule now:
-one mail per incident, node and signal -- a finding that mints (or re-posts) its incident is mailed as before, and one that
+the product is rebooting the reboot's record absorbs the finding (`orchestration/reboot_window.py`). Mailing only a finding
+that mints its own incident (`incident.event_id == finding.event_id`) would mail neither case, while the XID's own mail goes
+out before the fold and speaks of the XID alone: the administrator could find the signal only in the incident's reasons. The
+rule is one mail per incident, node and signal -- a finding that mints (or re-posts) its incident is mailed, and one that
 lands on another incident is mailed too, its Incident/Workflow fields naming the record it joined and that record's steps
 (a recovery's with the finding's `VALIDATE_HOST`, a reboot's unchanged). The administrator counts as told, and nothing is
 mailed, when an earlier finding of the same node and signal (not of this batch) already reached that incident (a re-arm
@@ -4306,7 +4304,7 @@ judgement reads the finding markers ingestion re-pointed at the incident (`marke
 node, source and signal whatever the record's label, identity or policy source became) and the node's unsettled
 incidents; the incident the signal minted on this node is judged without a read, any other (folded or absorbed findings
 only) with two indexed reads. The GPUs of one node in one batch still share one mail, the deduplication key and cooldown
-are unchanged (cluster/node/metric/workloads/signal/cooldown bucket), and GF-REGIONAL-NOTIFY-005 still counts per node
+are per cluster/node/metric/workloads/signal/cooldown bucket, consistent with GF-REGIONAL-NOTIFY-005's per-node count
 (`tests/host_health/test_folded_host_resource_mail.py`).
 
 ### 2.20 EFA/RDMA Traffic Anomaly and Training Hang Detection
@@ -4343,7 +4341,7 @@ row is enough; the state still belongs to one attempt only:
 - a newer sample of another attempt starts again at WARMUP and inherits none of the previous attempt's baseline,
   zero-traffic clock, first-observed time or spike acknowledgement.
 
-Before batch 145 there was one row per `cluster/node/job/attempt`, never deleted. When the node row is not the attempt's,
+Early versions kept one row per `cluster/node/job/attempt`, never deleted. When the node row is not the attempt's,
 or is more than `LEGACY_EFA_RECHECK_GAP` (2 minutes; the node's edge filter reports a steady node every few minutes, a
 shorter gap is an ordinary one) behind the sample, the attempt's old per-attempt row is consulted: read under that row's
 own advisory lock (a writer of the older release still holds it during a rolling upgrade), the row with the later sample
@@ -4359,7 +4357,11 @@ retention sweep deletes such superseded rows after the grace period (§3.2.1).
 
 The Aurora implementation uses a PostgreSQL advisory transaction lock to guarantee that multiple API replicas do not
 advance the same state twice. Non-anomalous samples update the baseline by EWMA; spike, drop, zero warning and
-hung generate findings only on state transitions.
+hung generate findings only on state transitions. Defaults (`host_health.py`, each overridable through
+`GPU_FAULT_EFA_TRAFFIC_*`): a baseline EWMA factor of 0.2 (`_BASELINE_ALPHA`); throughput at 4x the baseline or more is a spike
+(`_SPIKE_RATIO`) and at 0.25x or less a drop (`_DROP_RATIO`); at most 1 B/s counts as zero traffic (`_ZERO_BPS`), entering
+`ZERO_WARNING` after 60 s and `HUNG_SUSPECTED` after 600 s (`_ZERO_WARNING_SECONDS`/`_ZERO_HUNG_SECONDS`); the minimum valid
+traffic of precondition 3 is 1 MiB/s (`_MIN_ACTIVE_BPS`); the attempt start-up grace is 120 s (`_STARTUP_GRACE_SECONDS`).
 
 ```mermaid
 stateDiagram-v2
@@ -4420,9 +4422,8 @@ was routed to must belong to the requested cluster, carry one of the node-health
 grouping opens for it) or a record the finding's marker (`marker-<event id>`, re-pointed at it by ingestion) names with
 `event_source=SITE_EFA_TRAFFIC` and that node alone. The latter is a SPIKE raised while a managed attempt's recovery is in
 flight: the attempt grouping folds it into that recovery record (under the XID's event id and `NVIDIA_CATALOG`), or a
-later finding folds into the SPIKE's own record and takes over its policy source. The route used to take `NODE_HEALTH`
-only and answered `409` for both (b213); another node's, another cluster's or a non-EFA-traffic Event ID still returns
-`409`.
+later finding folds into the SPIKE's own record and takes over its policy source. Taking `NODE_HEALTH` only, the route would answer `409` for both; another node's, another cluster's or a non-EFA-traffic
+Event ID returns `409`.
 
 #### 2.20.3 Read-only forensics chain for HUNG_SUSPECTED
 
@@ -4454,12 +4455,12 @@ container ids the kubelet reports (the 64-hex part of `containerStatuses[].conta
 and the Node Agent finds in its own `/proc/<pid>/cgroup` the container cgroup named after that id
 (`cri-containerd-<id>.scope`, `crio-<id>.scope`, `docker-<id>.scope` or the cgroupfs `<id>`; `crio-conmon-<id>.scope` is not
 part of it). Summary and triage results carry `workload_scope` (`basis`, resolved/unresolved container counts); no container
-found is still `SCOPE_UNKNOWN`, some containers found is `scan_complete=false`, never zero processes. Before this every live
-managed job planned `{node: []}`: every HyperPod GF-GENERAL-LIVE-011 variant's summary was `SCOPE_UNKNOWN` and the triage
-sampled no node (`NO_VALID_SURVEY`).
+found is still `SCOPE_UNKNOWN`, some containers found is `scan_complete=false`, never zero processes. With the annotation alone every
+managed job would plan `{node: []}`: the summary would be `SCOPE_UNKNOWN` and the triage would sample no node
+(`NO_VALID_SURVEY`; GF-GENERAL-LIVE-011 covers it).
 The same container ids scope the continuous passive communication monitor: `CommunicationTarget.container_ids` goes only to an
 Agent whose heartbeat advertises `communication_monitor_version=communication-monitor/v2` (a v1 Agent validates with
-`extra="forbid"` and would refuse the whole lease, so it keeps receiving byte for byte the v1 plan it accepts, with no target on
+`extra="forbid"` and would refuse the whole lease, so it receives the v1 plan without container ids, with no target on
 a managed Pod); a v2 Agent resolves them with the same resolver, its samples carry `workload_scope`, a partial resolution is
 `scan_complete=false`, none found is `SCOPE_UNKNOWN` and writes no history. An older control plane does not know v2 and gives an
 upgraded Agent no lease.
@@ -4468,7 +4469,7 @@ legacy zero remains 32. A resumable sliding window allows at most 32 nodes in fl
 For 1024 GPUs on 128 nodes, an explicit budget of 128 permits full-node expansion, not guaranteed diagnosis.
 The budget does not limit survey targets.
 `COLLECT_HUNG_TRIAGE` is an independently permitted read-only
-Node Agent operation; it does not stop services, modify drivers, or reboot nodes. New plans use a 20-second per-node sampling budget,
+Node Agent operation; it does not stop services, modify drivers, or reboot nodes. It uses a 20-second per-node sampling budget,
 not a strict wall-clock bound on thread shutdown or kernel/file I/O:
 
 - filters compute processes by GPU UUID, then verifies workload cgroup and process starttime before attachment;
@@ -4485,19 +4486,18 @@ Failures count as missing coverage. `VALIDATE_FABRIC` depends only on step 1, so
 when the deep-forensics node is unreachable.
 
 On a node, summary/triage/bundle share one isolated read-only worker slot (`ObservationSupervisor`), and the continuous passive
-communication monitor samples on it every 30 s. Live, a two-node `fr_temporal_completion` run (HyperPod, 2026-10-26 04:21:31Z) had
-COLLECT_HUNG_TRIAGE reach both nodes 1.45 s into a 30-second sampling epoch -- the passive sample held the slot on both -- and each
-answered `WORKER_STILL_RUNNING` within 1.2 s: no worker ran, the FR responders show 0 requests on all 16 ranks, the step recorded
-`node_failures` for both nodes, the control plane did not ask again and the decision saw no process. A control-plane command
-(summary/triage/bundle) now **waits** for the slot instead of being refused on arrival: it waits a share of its own timeout
+communication monitor samples on it every 30 s. Refused on arrival, a
+COLLECT_HUNG_TRIAGE that reaches a node just after a passive sampling epoch began would answer `WORKER_STILL_RUNNING` at once on
+every node: no worker runs, the step records `node_failures`, the control plane does not ask again and the decision sees no process
+(GF-GENERAL-LIVE-011 `fr_temporal_completion` covers it). A control-plane command (summary/triage/bundle) therefore **waits** for the slot instead of being refused on arrival: it waits a share of its own timeout
 (`SLOT_WAIT_FRACTION` 0.3) up to `SLOT_WAIT_MAX_SECONDS` (10 s) and inside that timeout (triage 28 s → at most 8.4 s, bundle 120 s →
 at most 10 s, so the control plane's 30-second per-node wait is never exceeded); if the holder is the passive sample (the only
 `preemptible` activity) the command preempts it (`os.killpg` stops the whole subtree; the epoch is sampled again 30 s later), and a
 command never preempts another command. Only a slot that stays held for the whole wait is refused `WORKER_STILL_RUNNING`, and that
 refusal is a **retryable** failure (`worker_started=false`, naming the holder and the seconds waited): the executor marks it retryable,
 the survey adapter keeps the node pending and re-sends within the node's 30-second wait (`REFUSED_RESEND_SECONDS`, the path a node that
-accepted but has not answered already takes) rather than recording it at once. An Agent older than this fix returns a non-retryable
-`ObservationIncomplete: WORKER_STILL_RUNNING`, recorded in `node_failures` as before.
+accepted but has not answered already takes) rather than recording it at once. An older Agent returns a non-retryable
+`ObservationIncomplete: WORKER_STILL_RUNNING`, recorded in `node_failures`.
 
 Once a worker has the slot, the supervisor hands the worker the deadline itself through `OBSERVATION_DEADLINE_VARIABLE` (the
 environment variable `OBSERVATION_DEADLINE_MONOTONIC`): the `time.monotonic()` reading, counted from the command's arrival, on
@@ -4505,31 +4505,26 @@ environment variable `OBSERVATION_DEADLINE_MONOTONIC`): the `time.monotonic()` r
 is about to run the triage, and the triage plans its own sampling budget (20 s by default, at least 2 s) within that remaining time
 less `WORKER_BUDGET_MARGIN_SECONDS` (2.5 s, the time to trim along the ladder and write a result of the live size), so a command that
 waited for the slot finishes what fits and says so instead of being cut mid second-dump interval. The slot wait and the start of the
-guard and of the worker (two fresh interpreters, the worker importing the package) all run on that clock: measured on the
-release-gate host, from spawn to the worker's first line takes about 0.3 s idle and about 3.3 s with eight busy loops on its CPU. An
-Agent older than this fix handed over the seconds left at the spawn (`OBSERVATION_BUDGET_SECONDS`) and the worker never subtracted its
-start: after a triage slot wait of more than 5.5 s only the 2.5 s margin was left for it, and on a node whose CPU a training job
-saturates the triage ran past the deadline and came back `PARTIAL_TIMEOUT` with its last checkpoint. The guard also starts the
+guard and of the worker (two fresh interpreters, the worker importing the package) all run on that clock: from spawn to the
+worker's first line takes about 0.3 s on an idle host and about 3.3 s with eight busy loops on its CPU. An older Agent hands over
+the seconds left at the spawn (`OBSERVATION_BUDGET_SECONDS`) and its worker does not subtract its start, so on a node whose CPU a
+training job saturates the triage can run past the deadline and come back `PARTIAL_TIMEOUT` with its last checkpoint. The guard starts the
 worker by name only (`observation_guard.WORKER_ENTRY_POINT`, in the `module:callable` form the component wheel closure follows, so
 the node-runtime wheel still carries the worker) instead of importing the worker's whole closure (pydantic, the models, every
-operation mixin) to read its module name: about 0.25 s of CPU less per observation, and from spawn to the first line 5.3 s → 3.3 s
-with eight busy loops. The two-dump pairing of eight ranks
-measured ~4.5 s inside the 20 s budget (`slot_wait` 0.05 s, `fr_wait` 0.28 s), matching the same release's `different_process_groups`
-(5.0 s a node); the two active-diagnostic passes keep their default budget of 8 nodes. The triage and bundle publish partial documents
+operation mixin) to read its module name. The two-dump pairing of eight ranks takes about 4.5 s inside the 20 s budget; the two
+active-diagnostic passes keep their default budget of 8 nodes. The triage and bundle publish partial documents
 at checkpoints (`publish(..., final=False)`): the triage at `RANKS_DISCOVERED` → `PROCESS_SERIES_SAMPLED` → `FIRST_FLIGHT_DUMPS_READ`
 (a checkpoint that carries dumps goes through the same `bounded_triage_result` ladder as the result, on a copy of the rows so trimming
 a checkpoint never shortens the evidence the triage is assembling), the bundle after each capture as `BUNDLE_CAPTURING`
 (`captures_done`, `captures_pending`, `elapsed_seconds`). When the supervisor's deadline (or a preemption) falls before the final
 result, it hands back the last checkpoint (`PARTIAL_TIMEOUT`/`PREEMPTED`, `evidence_complete=false`, `supervisor_timeout_seconds`), so a
-slow triage or bundle comes back with the ranks/dumps it had read and what is missing, not empty. Live, the `fr_second_missing` run
-(HyperPod, 2026-10-26 04:46Z) had the bundle fail whole as `WORKER_STILL_RUNNING` on the shared node `hyperpod-i-08d8…` alone -- the
-node also hosting the other lane's prewarm/training Pods, with more passive-sample targets holding the slot -- while the other node
-finished; this fix makes it wait and preempt first, and a genuine timeout returns the captured manifest. Once the final result has
+slow triage or bundle comes back with the ranks/dumps it had read and what is missing, not empty; a bundle on a shared node whose slot is held more often (it also hosts other prewarm/training Pods, with more
+passive-sample targets) likewise waits and preempts first, and a genuine timeout returns the captured manifest (GF-GENERAL-LIVE-011
+`fr_second_missing` covers it). Once the final result has
 arrived and the worker's output has ended (the worker tree is on its way out; the guard closes the pipe as it exits), the supervisor
-waits for the tree to exit up to the deadline instead of 0.1 s: on a CPU-starved host the exiting process stayed off the CPU for
-longer than that between closing its stdout and being reaped (measured with 48 busy loops on its CPU), and a complete result came
-back `PARTIAL_TIMEOUT` with `evidence_complete=false`; a tree still not gone at the deadline is handed back as read and marked
-incomplete, as before.
+waits for the tree to exit up to the deadline instead of 0.1 s: on a CPU-starved host the exiting process can stay off the CPU for
+longer than that between closing its stdout and being reaped, and a complete result would come back `PARTIAL_TIMEOUT` with
+`evidence_complete=false`; a tree still not gone at the deadline is handed back as read and marked incomplete.
 
 The executor compares groups by name and membership, requiring at least three valid samples and a strict majority.
 A single snapshot yields at most `PLAUSIBLE` progress outliers, never confirmed root cause.
@@ -4565,9 +4560,8 @@ keys and the bundle collects as usual; only a request still over budget is refus
 `error` (exception class and message, e.g. `ValueError: observation input exceeds budget: <bytes> > 262144 bytes; largest
 parameters: ...`), `failed_component=observation_supervisor`, `failure_stage` (`WORKER_NOT_STARTED`/`WORKER_OUTPUT`) and
 `worker_started`, and `ObservationIncomplete`'s message is `<status>: <error>`, so the step's `node_failures` and the
-hand-off mail state the cause. Live, a two-node `tid_namespace` run's 259 KB full decision pushed the request to 264 KB and
-the bundle failed as a whole within 5 ms with `{"status":"UNAVAILABLE","ranks":[],"error":"ValueError"}` -- neither thread
-namespaces nor thread discovery were involved; the worker never started.
+hand-off mail state the cause. Without this trimming a full decision of about 259 KB alone would push the request over the
+budget and the bundle would fail as a whole before the worker started (GF-GENERAL-LIVE-011 `tid_namespace` covers it).
 The result line the worker hands back is bounded too: 1 MiB (`observation_limits.OBSERVATION_RESULT_BUDGET_BYTES`, newline
 included; the supervisor drops a longer line). Before it returns, COLLECT_HUNG_TRIAGE brings its document under
 `TRIAGE_RESULT_BUDGET_BYTES` (1 MiB less 64 KiB for the wire wrapper, the command id the executor stamps on it and the
@@ -4594,9 +4588,8 @@ every step, and `evidence_trimmed` records the budget, the size before, each ste
 without the note (`steps` carries `skeleton` with its bytes when the floor was applied), `bytes_after` -- the exact size of the
 document returned, the note included -- and `within_budget`, judged on that size. Writing the size can lengthen the document (the
 number gains a digit, `false` is a byte longer than `true`), so it is measured again until the size written is the size
-measured (at most two passes more). It used to be the size measured while the note still held the earlier number: a byte short
-whenever that gained a digit, so a document a byte or two over the budget could read `within_budget: true`.
-The reader's `last_entry` no longer repeats its group's `semantic_entries`. A rank of the live shape weighs 5.7 KB at the floor (64 ranks with two 64-operation dumps each:
+measured (at most two passes more).
+The reader's `last_entry` does not repeat its group's `semantic_entries`. A rank of a typical shape weighs about 5.7 KB at the floor (64 ranks with two 64-operation dumps each:
 8.85 MB -> 369 KB; eight and sixteen ranks never reach it), so only a document whose skeleton alone is over the line goes out as
 the stand-in `{"status":"RESULT_SIZE_LIMIT","ranks":[],"evidence_complete":false,
 "error":"observation result exceeds budget: <bytes> > 1048576 bytes; largest fields: ...","failed_component":"observation_worker",
@@ -4606,13 +4599,12 @@ the stand-in `{"status":"RESULT_SIZE_LIMIT","ranks":[],"evidence_complete":false
 (`RESULT_STAND_IN_RANKS_BUDGET_BYTES`), in the result's own order -- so even the last resort names the ranks and the step's
 `node_failures` states the cause. COLLECT_HUNG_SUMMARY and COLLECT_DIAGNOSTIC_BUNDLE share the worker's result line but need no
 floor: a bundle result is a reference (`evidence_ref`, SHA-256, size, capture counts; under 1 KB, its partial carries at most the
-256 KiB request context), and a summary is bounded by construction (at most 256 scoped processes a node, scalar/delta rows of 365
-bytes -- 95 KB for 256; the passive sampler strips `semantic_entries` before caching, `cached_fr` holds at most 256 pairs), so its
+256 KiB request context), and a summary is bounded by construction (at most 256 scoped processes a node, scalar/delta rows of about 365
+bytes -- about 95 KB for 256; the passive sampler strips `semantic_entries` before caching, `cached_fr` holds at most 256 pairs), so its
 own 1 MiB self-check is out of reach of any realistic node shape.
-Live, the two-node HyperPod `fr_enabled` run (2026-10-25 23:05Z) had the triage find all sixteen ranks and both dumps of every
-rank written inside the triage window; 8 ranks x 2 dumps x 64 operation summaries serialized four times made the result ~1.2 MB,
-both nodes were left with `ObservationIncomplete: RESULT_SIZE_LIMIT` and `node_results={}`, and the decision saw no process.
-Any eight-GPU node with the recorder on does the same; the node type and its cgroup layout play no part.
+Without this ladder any eight-GPU node with the recorder on would serialize 8 ranks x 2 dumps x 64 operation summaries four
+times into a result of ~1.2 MB and be left with `ObservationIncomplete: RESULT_SIZE_LIMIT`, `node_results={}` and a decision that
+sees no process (GF-GENERAL-LIVE-011 `fr_enabled` covers it).
 Hung bundles omit DCGM diag, bug-report and strace.
 EFA/log suspicion goes to operator review; healthy fabric is not application recovery.
 The NCCL pipeline never uses training step/phase, including detection, target selection and completion.
@@ -4634,10 +4626,10 @@ the fixed SHA-256 of `/opt/gpu-fault/tools/py-spy-<version>-<sha>/venv/bin/py-sp
 a version or binary mismatch fails the node installation. The dependency closure of the node runtime venv likewise comes only from
 `requirements/node-runtime.lock` (`pip install --require-hashes --no-deps`); that lock
 is the complete export of the `collectors` extra and must cover every third-party import at any depth in the node-runtime wheel closure:
-`prometheus-client` is imported only inside the DCGM collector function, and on 2026-09-09 a lock that
-dropped it was installed on a canary node, after which every collector hit ModuleNotFoundError, the node had zero metrics, and the installation verification
-failed; `test_node_runtime_lock_pins_every_third_party_import_of_the_node_closure`
-checks the lock by importing the closure one module at a time to prevent a recurrence.
+`prometheus-client` is imported only inside the DCGM collector function, and a lock that drops it leaves every collector with
+ModuleNotFoundError, the node with zero metrics and the installation verification failing;
+`test_node_runtime_lock_pins_every_third_party_import_of_the_node_closure` (`tests/deploy/test_node_installer_security.py`)
+checks the lock by importing the closure one module at a time.
 Missing tools, ptrace refusal or timeouts are all written into the manifest. The default 10 seconds only limits a single command from hanging
 abnormally; it is not the sampling observation window. The manifest's `python_stack_sampling.mode` is fixed to
 `round_parallel`, and records the sample count, inter-round interval, command timeout and number of associated processes.
@@ -4737,9 +4729,10 @@ A mismatch therefore carries an explicit `failure_mode`:
 | `INVENTORY_UNAVAILABLE` | PCI listing not trusted (`INCONSISTENT`/`UNAVAILABLE`) and driver bound `< expected`: the shortfall cannot be classified, diagnostics only, no reboot |
 
 The expected values come from the node-local `GPU_FAULT_EXPECTED_GPU_COUNT` and
-`GPU_FAULT_EXPECTED_EFA_DEVICE_COUNT`, not from a global control-plane configuration. The HyperPod
-installer resolves the table below from each Kubernetes Node's `node.kubernetes.io/instance-type`;
-names with and without the `ml.` prefix are supported:
+`GPU_FAULT_EXPECTED_EFA_DEVICE_COUNT`, not from a global control-plane configuration. The node installer reconciler
+sizes every install Job's expected values from each Kubernetes Node's `node.kubernetes.io/instance-type` with the table below
+(`GPU_INSTANCE_INVENTORY` in `src/gpu_fault/gpu_instance_inventory.py`, shared by HyperPod and plain EKS); names with and
+without the `ml.` prefix are supported:
 
 | Instance type | GPU count | Maximum EFA interfaces |
 | --- | ---: | ---: |
@@ -4750,7 +4743,7 @@ names with and without the `ml.` prefix are supported:
 | `p6-b200.48xlarge` | 8 | 8 |
 | `p6-b300.48xlarge` | 8 | 16 |
 
-The values come from AWS EC2 `DescribeInstanceTypes`, verified on 2026-07-27. P6-B300 has
+The values come from AWS EC2 `DescribeInstanceTypes`. P6-B300 has
 `NetworkCards` of 17 but `EfaInfo.MaximumEfaInterfaces` of 16; this state machine checks the latter.
 Unknown types require the deployer to provide both expected values explicitly. Every sample's labels carry
 `node_instance_type`, so inventory state is not shared when one control plane handles heterogeneous nodes.
@@ -4775,14 +4768,14 @@ a directory that is missing or unreadable is not 0 but no reading at all. An NVM
 while that directory cannot be read either is two failed reads, not zero GPUs (GF-GENERAL-LIVE-012): that round
 emits only `gpu_inventory_expected_count` with `failure_mode=INVENTORY_UNAVAILABLE`, no discovered, active, missing or
 mismatch sample, the consecutive mismatch counter stays untouched as well, and the collection error names both failed
-reads. An unreadable directory used to count as 0, and the second such cycle minted `REBOOT_NODE`. When some GPUs
+reads. Counting an unreadable directory as 0 would mint `REBOOT_NODE` on the second such cycle. When some GPUs
 fail to answer and the directory cannot be read, the inventory samples are produced as usual but without
 `gpu_inventory_discovered_count` and the `discovered_count` label, instead of reporting 0.
 
 A configuration error is not a lost GPU (GF-GENERAL-LIVE-012 `expectation_wrong`). The expected count is a
-node-level setting; typed wrong by hand (live: `expected=9` on an 8-GPU p5en) the collector compared only the
-configured value with the listed UUIDs, and the second cycle graded a healthy node as a lost GPU and went to
-`REBOOT_NODE`. The collector now writes the driver-bound count (`discovered_count`, label only when the query
+node-level setting; typed wrong by hand (e.g. `expected=9` on an 8-GPU p5en), comparing only the configured value with the listed UUIDs
+would grade a healthy node as a lost GPU on the second cycle and go to `REBOOT_NODE`. The collector therefore writes the
+driver-bound count (`discovered_count`, label only when the query
 answered -- no extra sample, the sample set is unchanged) and the instance type's GPU count
 (`instance_type_gpu_count`) into the labels of every GPU inventory sample; the node-side verdict itself is
 unchanged, still configured against listed. On the control plane, `gpu_inventory_verdicts` in
@@ -4793,17 +4786,17 @@ table (`gpu_instance_inventory`) before grading, whatever the collector version 
 | Configured E vs type count T | Listed O vs T | Bound D vs O | Verdict |
 | --- | --- | --- | --- |
 | E = T | O = T | — | healthy |
-| E = T | O ≠ T | — | `gpu_inventory_mismatch` CRITICAL → `REBOOT_NODE` (unchanged) |
+| E = T | O ≠ T | — | `gpu_inventory_mismatch` CRITICAL → `REBOOT_NODE` |
 | E ≠ T | O = T | D = O or not reported | mismatch re-read as 0; `gpu_expected_count_contradicted=1` → WARNING `COLLECT_EVIDENCE` (FREEZE_EVIDENCE only + operator-review advisory whose reason names E, T, O and D) |
 | E ≠ T | O = T | D ≠ O or unparsable | mismatch stays CRITICAL → `REBOOT_NODE`; the contradicted WARNING is raised as well |
-| E ≠ T | O ≠ T | — | mismatch graded against E as before (a real loss still reboots); the contradicted WARNING is raised as well |
+| E ≠ T | O ≠ T | — | mismatch graded against E (a real loss still reboots); the contradicted WARNING is raised as well |
 | T unknown (type not in the table) or labels missing/unparsable | — | — | the explicit expectation keeps its meaning; nothing is re-read |
 
 `gpu_expected_count_contradicted` clears with a 0 on every batch where E = T, so correcting the setting and
 restarting the collector closes the episode; one contradiction is told once. When `VALIDATE_GPU` has no
 plan-frozen requirement it validates against the node's latest `gpu_inventory_expected_count`; that row's own
 `node_instance_type` label lets the instance type's physical count cap it too (`inventory_requirement_clamped`
-in the step details), so a configuration error no longer fails every reboot's validation and escalates to
+in the step details), so a configuration error does not fail every reboot's validation and escalate to
 `REPLACE_NODE`.
 
 #### 2.21.2 Debounce and metrics
@@ -4918,20 +4911,19 @@ ESCALATE_SUPPORT only, without isolation, and the incident reasons name the miss
 request was withheld by which bound (`requested escalation REBOOT_NODE withheld: ...`). A validation that had
 observed the node failing before the cap (`node_failures_observed` non-empty), or whose verdict is the adapter's
 own (`failed_nodes`), escalates as designed; so does a plugin/driver recovery chain whose action itself failed.
-Before this the request applied to any FAILED validation, and with the collectors dark the cap's failure rebooted
-a node nothing had been learned about (GF-GENERAL-LIVE-013 `link_inactive`, live). The samples that raised the
+Were the request applied to any FAILED validation, the cap's failure with the collectors dark would reboot a node
+nothing had been learned about (GF-GENERAL-LIVE-013 `link_inactive` covers it). The samples that raised the
 finding predate that moment and are not diagnostic evidence. A count the host collector reported since the action is
 a verdict even when a collector the step waits for is stale or erroring: the gate fails the node on the fresh row and
 keeps the batch's collection errors beside it (`host_collector_errors`), but passes nothing on such a batch and reads
-no verdict from one whose inventory contributor itself failed (live 2026-10-27, GF-GENERAL-LIVE-013
-`post_repair_failure` on both clusters: the re-unbound function's 15/16 count arrived seconds after
-TRIGGER_HEALTH_SNAPSHOT, and the same batches' `_rdma` coverage error -- an inventory shortfall the traffic
-contributor no longer reports as a collection error -- kept the collector check from reading it until the cap
-withheld the reboot).
+no verdict from one whose inventory contributor itself failed (GF-GENERAL-LIVE-013 `post_repair_failure` covers
+it: a 15/16 count arriving seconds after the action is the verdict and is not held off until the per-step cap by
+another contributor's collection error in the same batch; the traffic contributor does not report such an inventory
+shortfall as a collection error either).
 Both modes record the reading each verdict rests on in the step record's `inventory_evidence` (node → metric →
-`value`/`expected`/`observed_at`). Before this, the validation waited for an action completion no step in the plan
-would produce, failed at the 600 s per-step cap, and the cap's failure escalated a node whose port had long been
-ACTIVE again to `RESTART_NODE` (GF-GENERAL-LIVE-013 `link_inactive`, live).
+`value`/`expected`/`observed_at`). Waiting for an action completion no step in the plan would produce would fail the
+validation at the 600 s per-step cap and escalate a node whose port had long been ACTIVE again to `RESTART_NODE`
+(GF-GENERAL-LIVE-013 `link_inactive` covers it).
 
 The Dispatcher's failure escalator then creates a `REPLACE_NODE` workflow whose predecessor has ended:
 
@@ -4990,7 +4982,7 @@ The regional APIs all belong to the `execution-token` bucket:
 
 An identity conflict is a deterministic refusal, hence a 409 and not a 500: the processor completes a 4xx at once as the
 request's final answer, while a 500 is replayed as retryable for its retry horizon (300 s) -- and with row-by-row saving every
-replay rewrote the rows ahead of the conflict (it happened live). The admin side
+replay would rewrite the rows ahead of the conflict. The admin side
 (`resource_registry.sync_installation_resource_snapshot`) turns the 409 into `InstallationRegistryConflict`, naming key and
 fields (a `BootstrapError`, so the deploy/config completion step, join, the join rollback, remove-cluster and uninstall all fail
 closed on it), and neither retries nor falls back to the direct Aurora path; the in-Pod script passes on only the validated
@@ -5040,9 +5032,11 @@ single transaction in `tests/app_services/test_installation_registry_conflicts.p
 
 ### 2.23 Administrator CLI and deployment assets `src/gpu_fault/admin/`
 
-`gpu-fault-admin` is the site's only change entry point (public verbs `status`, `deploy`, `config`, `workflow-reconcile`,
-`failure-domain-map`, `rotate-token`, `submit-remediation`, `collector-outbox`, `store-maintenance`, `replace-resource`,
-`remediation-storm`, `join-cluster`, `remove-cluster`, `uninstall`; `preflight`/`verify` are only internal pass-throughs of the release driver and do not appear in `--help`).
+`gpu-fault-admin` is the site's only change entry point (public verbs `status`, `deploy`, `site-id`, `prepare-eks-nodegroup`,
+`node-scope`, `hyperpod-scheduled-update`, `config`, `workflow-reconcile`, `failure-domain-map`, `rotate-token`,
+`submit-remediation`, `collector-outbox`, `cpu-rolling-update`, `store-maintenance`, `remediation-storm`, `aurora-failback`,
+`replace-resource`, `join-cluster`, `node-key-custody`, `remove-cluster`, `uninstall` (`src/gpu_fault/admin/cli.py`);
+`preflight`/`verify` are only internal pass-throughs of the release driver and do not appear in `--help`).
 It drives the site lifecycle and takes no part in fault decisions, but shares the Store model, the authentication boundary
 (the execution-token routes of §4) and the installation resource registry of §2.22 with the control plane. The administrator
 implementation belongs to a separate deploy-host distribution and does not enter the
@@ -5060,7 +5054,7 @@ signature-verifies the deploy-host bundle, then installs the bundle into
 --state-dir` and `... deploy --prepared-source-release --repo-root <snapshot>`:
 `run_prepared_deploy` performs the bootstrap inside `administrator_operation_lock`, then releases automatically, and finally joins
 the GPU clusters waiting in `pending_gpu_cluster_arns`. The outer layer holds `site_operation_lock` throughout, and the site is
-no longer re-read between classification
+not re-read between classification
 (`UNCHANGED`/`DEPLOY_HOST_ONLY`/`APPLICATION_RELEASE`) and application. An installed
 deploy-host is constrained by `admin/deploy_host_binding.py` to its bound state-dir: the CLI entry point calls
 `enforce_deploy_host_state_dir` before executing any command and rejects any other `--state-dir` outright, while running from a
@@ -5086,18 +5080,21 @@ a merely same-named `removed_clusters` row cannot prove which provider cluster w
 `COMPLETE`, and from then on
 the site document rather than the checkpoint states which clusters the site manages; it no longer sits in `PENDING` waiting for an
 upgrade that happens to request the original set, so a CPU-only upgrade after a remove and a `deploy --gpu-cluster-arn NEW`
-immediately after the first deployment are no longer rejected.
+immediately after the first deployment are not rejected.
 
 **join/remove/uninstall each have their own state machine, and progress is written only to external files.** `join-cluster`
 (`src/gpu_fault/admin/cluster_join_state.py`) records `completed_steps` in `<state-dir>/join-cluster/<first 12 chars of the ARN digest>/state.json`
 (`PRECHECKED → DISCOVERED → LOCAL_INPUTS_READY → PREREQUISITES_READY →
-CANDIDATE_READY → RELEASE_STARTED → JOINED → COLLECTORS_READY → VERIFIED`, phase `COMPLETED`;
-`ALREADY_MANAGED` directly when already under management) together with per-step evidence; on failure it writes a redacted `failure{error, after_step, recorded_at}`
+CANDIDATE_READY → JOIN_STARTED → JOINED → COLLECTORS_READY → VERIFIED`, then the activation and site commit
+(`cluster_join_commit.activate_and_commit`) and the failure-domain map render (`FAILURE_DOMAINS_STARTED → FAILURE_DOMAINS_READY`),
+phase `COMPLETED`; `_STARTED` markers such as `LOCAL_INPUTS_STARTED`, `NODE_KEYS_STARTED` and `ACTIVATION_STARTED` mark a step whose
+mutation has begun; `ALREADY_MANAGED` directly when already under management) together with per-step evidence; on failure it writes a redacted `failure{error, after_step, recorded_at}`
 and the phase enters `ROLLED_BACK`/`ROLLBACK_FAILED`; an in-progress attempt refuses to resume if it finds that non-membership fields of the site have drifted.
 `remove-cluster` (`src/gpu_fault/admin/cluster_removal.py`) advances in
 `<state-dir>/remove-cluster/<cluster_id>/state.json` through `DISCOVERED → CONTROL_REGISTRY_DRAINING →
 KUBERNETES_QUIESCED → KUBERNETES_REMOVED → CONTROL_REGISTRY_REMOVED → AWS_DETACHED →
-AURORA_UPDATED → SITE_UPDATED → RELEASE_STATE_UPDATED → VERIFIED → OWNERSHIP_RELEASED → COMPLETED` (the last step releases the
+AURORA_UPDATED → SITE_COMMIT_STARTED → SITE_UPDATED → RELEASE_STATE_UPDATED → VERIFIED → OWNERSHIP_RELEASED → COMPLETED`
+(dependencies in `cluster_removal_state.STEP_DEPENDENCIES`; the last step releases the
 ownership label `gpu-fault.io/control-plane` from the node groups the site selected for the cluster, `admin/ownership_release.py`;
 `--keep-ownership-label` records `retained`), with the registry side corresponding to
 `DRAINING → REVOKED` of §2.15.1. When the removed cluster is the site's registration cluster
@@ -5125,7 +5122,8 @@ immutable snapshot of `scripts/release_deploy_profile.py` keeps the anchor it re
 `--reset-database` (an ordinary reinstall keeps Aurora, so there is nothing to snapshot), and `--reset-database` combines only with `keep`.
 These three compete with deploy/bootstrap, Profile approval and AdminConfig for the same state-dir change lock.
 
-**Site configuration and installation resources.** The site configuration uses a strict model. AdminConfig has **22** recursively editable leaf fields, not the number of top-level
+**Site configuration and installation resources.** The site configuration uses a strict model. AdminConfig has **23** recursively editable leaf fields (`admin_config_spec`; the 4 of
+`cpuControlPlane` are written into the spec only when they differ from their defaults), not the number of top-level
 nested containers; updates go through the administrator plan/apply and role digest, and environment variables cannot be changed online. Notification configuration, credentials, Profile and
 destructive capabilities each have their own source of truth and must not be mixed into capacity fields. The complete contract is in the Developer Deployment Implementation. Installation resources continue to be registered by
 `InstallationResource` with a stable identity and ownership. Private Hosted Zone associations are deduplicated by
