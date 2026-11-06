@@ -14,7 +14,7 @@ from gpu_fault.collectors.host import system_metrics
 from gpu_fault.execution import ProductionExecutorConfig
 from gpu_fault.gpu_metrics import GpuMetricsService
 from gpu_fault.host_health import HostMetricSample
-from gpu_fault.models import WorkflowExecutionRequest, WorkflowStatus
+from gpu_fault.models import IncidentState, WorkflowExecutionRequest, WorkflowStatus
 from gpu_fault.models import WorkflowOperation as Op
 from tests._builders import asgi_client, build_store
 
@@ -109,6 +109,116 @@ def test_swap_fault_from_collector_to_api_and_real_validation(
             assert (
                 workflow.official_steps[1].parameters["host_diagnostic_probe"]["metric"]
                 == "swap_used_percent"
+            )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("cleared", [False, True], ids=["still-unusable", "remounted"])
+def test_an_unusable_mount_is_a_diagnostic_that_never_cordons_the_node(
+    tmp_path, monkeypatch, cleared
+):
+    """``filesystem_unavailable`` is a diagnostic, not a hold: FREEZE_EVIDENCE
+    then VALIDATE_HOST, which fails while the mount still reads unusable and
+    passes once it reads usable again. Neither path cordons, resets, reboots or
+    quarantines the node; a failed validation closes the incident RECOVERED
+    ("diagnostic inconclusive")."""
+
+    memory = tmp_path / "meminfo"
+    memory.write_text(
+        "MemTotal: 1000 kB\nMemAvailable: 800 kB\nMemFree: 700 kB\n"
+        "Cached: 100 kB\nSwapTotal: 1000 kB\nSwapFree: 900 kB\n"
+    )
+    monkeypatch.setattr(
+        system_metrics,
+        "Path",
+        lambda value: memory if value == "/proc/meminfo" else Path(value),
+    )
+    monkeypatch.setattr(HostTelemetryCollector, "CONTRIBUTORS", ("_memory",))
+
+    class Sink:
+        def post(self, *_):
+            return {}
+
+    collector = HostTelemetryCollector(
+        Sink(),
+        CollectorContext(
+            cluster_id="cluster-a", runtime_profile_version="simulated-v1"
+        ),
+        node_id="node-a",
+        edge_filter_enabled=False,
+        now=lambda: datetime.now(timezone.utc),
+    )
+    store = build_store()
+    owner = "simulated-runtime"
+    ctx = ApplicationContext(
+        store=store,
+        production_executor_config=ProductionExecutorConfig(
+            enabled=True,
+            executor_id="host-e2e",
+            allowed_operations=frozenset({Op.FREEZE_EVIDENCE, Op.VALIDATE_HOST}),
+        ),
+        production_adapters=[
+            ControlPlaneEvidenceAdapter(owner=owner),
+            GpuValidationAdapter(
+                GpuMetricsService(store=store), store=store, owner=owner
+            ),
+        ],
+        execution_token="local-host-test-" + "x" * 32,
+    )
+    store.save_profile(default_simulated_profile())
+
+    async def scenario():
+        async with asgi_client(ctx) as client:
+
+            async def publish(unusable: bool):
+                batch = collector.collect_once()
+                batch.samples.extend(
+                    [
+                        HostMetricSample(name="load1_per_cpu", value=0.1),
+                        HostMetricSample(name="filesystem_used_percent", value=20),
+                        HostMetricSample(
+                            name="filesystem_unavailable",
+                            value=1.0 if unusable else 0.0,
+                            device="/mnt/data",
+                            labels={"failure_mode": "READ_ONLY"} if unusable else {},
+                        ),
+                    ]
+                )
+                response = await client.post(
+                    "/v1/collector-events/host-telemetry",
+                    json=batch.model_dump(mode="json"),
+                )
+                assert response.status_code == 200, response.text
+                return response.json()
+
+            decision = await publish(unusable=True)
+            assert len(decision["workflow_request_ids"]) == 1, decision
+            if cleared:
+                await publish(unusable=False)
+            request_id = decision["workflow_request_ids"][0]
+            result = ctx.workflow_executor.execute(
+                request_id, WorkflowExecutionRequest(expected_fencing_token=1)
+            )
+            assert result.status is (
+                WorkflowStatus.SUCCEEDED if cleared else WorkflowStatus.FAILED
+            ), result
+            workflow = store.get_workflow(request_id)
+            assert [step.operation for step in workflow.official_steps] == [
+                Op.FREEZE_EVIDENCE,
+                Op.VALIDATE_HOST,
+            ], "a diagnostic only: nothing cordons, resets, reboots or quarantines"
+            assert (
+                workflow.official_steps[1].parameters["host_diagnostic_probe"]["metric"]
+                == "filesystem_unavailable"
+            ), "VALIDATE_HOST re-reads the availability gauge itself"
+            incident = store.get_incident(workflow.incident_id)
+            assert incident.state is IncidentState.RECOVERED, incident.state
+            inconclusive = any(
+                "diagnostic inconclusive" in reason for reason in incident.reasons
+            )
+            assert inconclusive is not cleared, (
+                "only a validation that still read the mount unusable is inconclusive"
             )
 
     asyncio.run(scenario())

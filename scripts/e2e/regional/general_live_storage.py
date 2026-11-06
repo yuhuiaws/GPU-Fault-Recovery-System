@@ -12,8 +12,9 @@ validated restore. ``filesystem_inodes_used_percent`` (``f_files/f_ffree``) is
 graded the same way, so ``inode_full`` runs that chain on the inode signal. A
 configured mount that is read-only, gone, or whose ``statvfs`` raises is
 ``filesystem_unavailable`` (READ_ONLY / MOUNT_MISSING / PROBE_FAILED): a
-VALIDATE_HOST diagnostic with no capacity finding and no reset, reboot or
-quarantine (batch 163), the node held while it stays unusable and readmitted
+VALIDATE_HOST diagnostic with no capacity finding and no cordon, reset, reboot
+or quarantine (batch 163): VALIDATE_HOST fails while the mount stays unusable,
+the incident closes RECOVERED (diagnostic inconclusive), and the signal clears
 once the mount is restored. ``probe_error``'s faulting mount is the storage
 probe's loop + device-mapper device carrying FAT16 (``dm-create --fstype
 vfat``): ``dm-retarget --target error`` creates a second mapping over the same
@@ -360,9 +361,10 @@ def _unusable_filesystem_variant(
 
     Read-only, vanished, or an unreadable ``statvfs``: the product reads each as
     ``filesystem_unavailable`` and runs the VALIDATE_HOST diagnostic -- never a
-    capacity finding (the free bytes are untouched), never a reset, reboot or
-    quarantine. The node is held while the mount stays unusable, and readmitted
-    once the injection is undone and the signal clears to 0 (batch 163 closed
+    capacity finding (the free bytes are untouched), never a cordon, reset,
+    reboot or quarantine. VALIDATE_HOST fails while the mount stays unusable and
+    the incident closes RECOVERED (diagnostic inconclusive); the variant waits
+    for the signal to clear to 0 once the injection is undone (batch 163 closed
     the capacity-only gap these variants used to record as expected FAILs).
     ``probe_error`` uses the FAT16 dm device and its ``error`` table swap; the
     others the loop ext4 file system.

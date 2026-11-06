@@ -1223,10 +1223,11 @@ inode signal and readmits the node through the validated restore, exactly as
 `capacity_full` does. Nor is the capacity-only reading of a read-only, vanished
 or unreadable configured mount: the product reports each as
 `filesystem_unavailable` (READ_ONLY / MOUNT_MISSING / PROBE_FAILED), a
-VALIDATE_HOST diagnostic that holds the node while the mount stays unusable and
-never resets, reboots or quarantines, so 004 `read_only` and
-`required_mount_missing` expect that chain and readmit the node once the
-mount is restored and the signal clears.
+FREEZE_EVIDENCE + VALIDATE_HOST diagnostic that never cordons, resets, reboots
+or quarantines the node: VALIDATE_HOST fails while the mount stays unusable and
+the incident closes RECOVERED ("diagnostic inconclusive"), so 004 `read_only`
+and `required_mount_missing` expect that chain and wait for the signal to clear
+once the mount is restored.
 The read-only verdict comes from the host's `/proc/1/mountinfo` -- per-mount or
 superblock `ro` on the mount holding the path
 (`src/gpu_fault/collectors/host/mount_table.py`) -- never from the collector's

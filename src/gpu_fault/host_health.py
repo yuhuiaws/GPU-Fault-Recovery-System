@@ -770,10 +770,10 @@ class NodeHealthPolicy:
         # A configured mount that is read-only, gone, or whose ``statvfs``
         # cannot be read is unusable regardless of its free bytes
         # (GF-GENERAL-LIVE-004 ``read_only``/``required_mount_missing``/
-        # ``probe_error``). Diagnostic, not quarantine: VALIDATE_HOST re-reads
-        # the gauge and holds the node while it stays 1, closing the incident
-        # ``diagnostic inconclusive`` once it clears -- an unreadable status
-        # must never widen to a reset, reboot or quarantine.
+        # ``probe_error``). A diagnostic, never a hold: VALIDATE_HOST re-reads
+        # the gauge, fails while it reads 1 (incident RECOVERED, ``diagnostic
+        # inconclusive``) and passes once it reads 0; nothing cordons, resets,
+        # reboots or quarantines the node for an unreadable status.
         "filesystem_unavailable": (
             1.0,
             NodeHealthCategory.STORAGE,

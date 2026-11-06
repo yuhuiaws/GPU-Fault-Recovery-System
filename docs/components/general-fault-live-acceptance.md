@@ -212,9 +212,9 @@ finding 读不到。现在在 `low_finding_window`（300 秒 + 2×摘要 + 采�
 inode耗尽、只读、必需挂载消失、EIO/EACCES分别验，不能用剩余字节判断健康。
 只读、消失或statvfs失败的配置挂载按 `filesystem_unavailable`
 （READ_ONLY/MOUNT_MISSING/PROBE_FAILED）报为不可用并走 VALIDATE_HOST 诊断：不产生
-容量 finding，不 reset/reboot/隔离，不可读状态记为不可用（UNKNOWN）而非健康，挂载
-不可用期间 hold 节点、还原后随信号清零受控接纳（批次163修复，此前按 capacity-only
-缺口记 FAIL）。`probe_error` 的故障挂载夹具：存储探针的 loop + device-mapper 测试设备改载
+容量 finding，不 cordon/reset/reboot/隔离，不可读状态记为不可用（UNKNOWN）而非健康；
+挂载不可用期间 VALIDATE_HOST 失败、incident 以 RECOVERED（diagnostic inconclusive）结束，
+还原后等信号清零（此前按 capacity-only 缺口记 FAIL，现已修复）。`probe_error` 的故障挂载夹具：存储探针的 loop + device-mapper 测试设备改载
 FAT16（`dm-create --fstype vfat`；FAT 区段按引导扇区 BPB 计算、向内对齐到页边界并记入
 `fat_sectors`），`dm-retarget --target error` 在**同一个 loop 设备上再建一个映射**
 `<dm>-fault`，其三段表仅 FAT 区段为 `dm_mod` 内建 `error` 目标、引导扇区/根目录/数据区仍为
