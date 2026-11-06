@@ -3278,7 +3278,7 @@ The product announces, it changes no check verdict, and it grades what one windo
 - No rolling `DeploymentConfig`, or a batch that covers every instance of the group (`INSTANCE_COUNT` at least the instance
   count, `CAPACITY_PERCENTAGE` 100): the whole control plane goes down. For example `deploy`'s discovery of the CPU cluster
   prints `gpu-fault-admin: advisory: HyperPod instance group <group> of the CPU control-plane cluster <name> has
-  ScheduledUpdateConfig cron(0 8 ? * SUN *) with no rolling DeploymentConfig: observed to re-image all 3
+  ScheduledUpdateConfig cron(0 8 ? * SUN *) with no rolling DeploymentConfig: observed (2026-11-01) to re-image all 3
   instances of the group at once -- every node the control plane runs on, so the whole control plane (api-ha,
   control-worker) is down for minutes each time; with spec.cpuControlPlane.rollingUpdate mode rolling (the default) the
   deploy's last step makes it roll one instance at a time, rolled back on the product's two alarms, and gpu-fault-admin
