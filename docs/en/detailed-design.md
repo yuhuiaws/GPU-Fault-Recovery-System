@@ -2528,7 +2528,15 @@ registry's node-hardware-mutating operations that carry a recovery rank (`valida
 set after which the validation adapter re-reads telemetry (`gpu_validation.TELEMETRY_READINESS_OPERATIONS`); the GPU-service
 window around a reset and the planning-only RESTART_VM carry no rank. A test pins that every one of them has a rung, so a
 recovery action added to the registry fails until it is given one. The rung after a runtime restart is taken by the whole
-record (`workflow-reboot-after-<workflow>`), not in place on a node branch.
+record (`workflow-reboot-after-<workflow>`), not in place on a node branch. A validation with no recovery step before it
+is no recovery's verdict and climbs nothing. When the record's own cordon or quarantine still holds a node -- a
+validate-then-readmit (FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → [QUARANTINE] → VALIDATE_* → RESTORE_SCHEDULING) whose
+validation fails -- the held nodes, and only those, go to `workflow-support-after-<workflow>` (stage `held_chain_step`, the
+four steps of item 7), which sends the support mail and ends `ESCALATED`, one ticket per failed record; item 7's endings
+that open no ticket stay (a validation the executor refused before dispatch, a hand-off of the record that already ran or
+failed). Before, such a record ended FAILED + QUARANTINED with no hand-off and no notice. A record that holds nothing -- a
+read-only chain, the operator's validated restore, a node a RESTORE_SCHEDULING already released -- still opens nothing,
+and a DRAIN chain keeps its own stage `drain_validation` (item 6).
 
 ```mermaid
 flowchart LR

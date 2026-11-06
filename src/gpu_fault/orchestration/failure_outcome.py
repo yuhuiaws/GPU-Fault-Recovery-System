@@ -87,18 +87,21 @@ def held_chain_hand_off(
     ``None``.
 
     The classifier calls this where the ladder has no rung for a failure:
-    its last branch, and the diagnostic contract's short-circuit. A record
-    whose own cordon or quarantine still holds a node then needs an operator,
-    whatever the step: the chains that hand the node over themselves (DRAIN,
-    the ENVIRONMENT_REVIEW chain, an operator escalation) whose diagnostic
+    its last branch, a validation with no recovery step before it, and the
+    diagnostic contract's short-circuit. A record whose own cordon or
+    quarantine still holds a node then needs an operator, whatever the step:
+    the chains that hand the node over themselves (DRAIN, the
+    ENVIRONMENT_REVIEW chain, an operator escalation) whose diagnostic
     bundle, health snapshot, job stop or checkpoint failed before their
     ESCALATE_SUPPORT; the plans whose end *is* the hold (the node-health
     QUARANTINE plan, a terminal quarantine folded into another chain, a
-    containment prefix) whose job stop failed after the cordon; and the
-    release chains -- a reset, a reboot, the older cooldown plan -- whose job
-    stop, GPU-client check, answered checkpoint or cooldown validation,
-    snapshot or bundle failed after the cordon. Each used to end FAILED +
-    QUARANTINED with no support record and no mail. The answer is
+    containment prefix) whose job stop failed after the cordon; the release
+    chains -- a reset, a reboot, the older cooldown plan -- whose job stop,
+    GPU-client check, answered checkpoint or cooldown validation, snapshot or
+    bundle failed after the cordon; and a validate-then-readmit whose
+    validation failed after the cordon with no recovery step before it (no
+    recovery's verdict, so no rung). Each used to end FAILED + QUARANTINED
+    with no support record and no mail. The answer is
     ``(HELD_CHAIN_STEP_STAGE, ESCALATE_OPERATOR, ESCALATE_SUPPORT, failed)``:
     a support-after successor that keeps the hold and sends the mail.
 

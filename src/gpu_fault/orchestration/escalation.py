@@ -885,7 +885,12 @@ class HardwareEscalationService:
                 next_action = RecoveryAction.ESCALATE_OPERATOR
                 next_operation = WorkflowOperation.ESCALATE_SUPPORT
             else:
-                return None
+                # Validate-then-readmit: no recovery step ran before the
+                # validation, so no rung answers it, but a node the record's
+                # own cordon still holds goes to support; a record that holds
+                # nothing (a read-only chain, the operator's validated restore)
+                # opens nothing.
+                return held_chain_hand_off(workflow, failed_executions)
         elif failed_operation_set.intersection(_CONTAINMENT_RELEASE_OPERATIONS):
             failed_stage = (
                 CONTAINMENT_REFUSED_STAGE

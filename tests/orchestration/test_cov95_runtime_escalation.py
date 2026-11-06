@@ -17,6 +17,7 @@ from gpu_fault.operation_registry import (
 )
 from gpu_fault.orchestration import validation_rungs
 from gpu_fault.orchestration.escalation import HardwareEscalationService
+from gpu_fault.orchestration.failure_outcome import EXECUTOR_REJECTED_STATUS_SOURCE
 from tests._builders import workflow_step
 from tests.orchestration._cov95_runtime_escalation import (
     RESTART_CONTEXT,
@@ -165,26 +166,152 @@ def test_a_failed_validation_of_a_drain_hands_the_held_node_to_support(
     )
 
 
+VALIDATIONS = (
+    VALIDATE,
+    WorkflowOperation.VALIDATE_HOST,
+    WorkflowOperation.VALIDATE_FABRIC,
+)
+READMIT = WorkflowOperation.RESTORE_SCHEDULING
+
+
+def _first_validation(operations) -> int:
+    return next(
+        index for index, operation in enumerate(operations) if operation in VALIDATIONS
+    )
+
+
 @pytest.mark.parametrize(
-    ("operations", "why"),
+    ("operations", "details", "why"),
     [
         (
             [FREEZE, WorkflowOperation.VALIDATE_HOST, SUPPORT],
+            None,
             "a read-only chain held nothing: its failure is inconclusive",
         ),
         (
-            [FREEZE, CORDON, VALIDATE, WorkflowOperation.RESTORE_SCHEDULING],
-            "no hand-off was planned behind the validation",
+            [FREEZE, VALIDATE, READMIT],
+            None,
+            "a validate-then-readmit that cordoned nothing holds nothing",
+        ),
+        (
+            [VALIDATE, WorkflowOperation.VALIDATE_HOST, VALIDATE, READMIT],
+            None,
+            "the operator's validated restore holds nothing of its own",
+        ),
+        (
+            [FREEZE, CORDON, READMIT, VALIDATE],
+            None,
+            "the RESTORE_SCHEDULING released the node before the validation",
+        ),
+        (
+            [FREEZE, CORDON, VALIDATE, READMIT],
+            {"remote_status_source": EXECUTOR_REJECTED_STATUS_SOURCE},
+            "refused before dispatch: a stale generation, a newer one owns it",
         ),
     ],
-    ids=["read-only", "no-planned-hand-off"],
+    ids=[
+        "read-only",
+        "unheld-validate-then-readmit",
+        "validated-restore",
+        "released-before-the-validation",
+        "executor-rejected",
+    ],
 )
-def test_a_failed_validation_without_a_held_hand_off_climbs_nothing(
-    operations, why
+def test_a_failed_validation_that_holds_nothing_opens_nothing(
+    operations, details, why
 ) -> None:
-    h = EscalationHarness(operations, failed_index=1 if len(operations) == 3 else 2)
+    h = EscalationHarness(
+        operations, failed_index=_first_validation(operations), details=details
+    )
 
     assert HardwareEscalationService.classify(h.workflow) is None, why
+    assert h.escalate() is None, why
+    assert len(h.store.list_workflows()) == 1, "no successor was opened"
+
+
+@pytest.mark.parametrize(
+    "operations",
+    [
+        [FREEZE, CORDON, VALIDATE, READMIT],
+        [FREEZE, CORDON, WorkflowOperation.VALIDATE_HOST, READMIT],
+        [FREEZE, CORDON, WorkflowOperation.VALIDATE_FABRIC, READMIT],
+        [FREEZE, CORDON, QUARANTINE, VALIDATE, READMIT],
+    ],
+    ids=["validate-gpu", "validate-host", "validate-fabric", "quarantined"],
+)
+def test_a_held_validate_then_readmit_hands_the_held_node_to_support(
+    operations,
+) -> None:
+    """Validate-then-readmit: the chain cordons the node, validates it and
+    would release it. A validation failing with no recovery step before it is
+    no recovery's verdict, so no rung answers it -- but the cordon still
+    holds the node. The record used to end FAILED + QUARANTINED with no
+    hand-off and no notice; the held node now goes to support, once."""
+
+    validation = operations[_first_validation(operations)]
+    h = EscalationHarness(
+        operations,
+        failed_index=_first_validation(operations),
+        details={"failed_nodes": ["node-a"], "node_failures": {"node-a": ["x"]}},
+    )
+
+    classification = HardwareEscalationService.classify(h.workflow)
+    assert classification is not None, (
+        f"{validation.value} failed on a held node and nobody was told"
+    )
+    assert classification[:3] == (
+        "held_chain_step",
+        RecoveryAction.ESCALATE_OPERATOR,
+        SUPPORT,
+    )
+    result = h.escalate()
+    assert result is not None, "the held node needs a durable hand-off"
+    incident, successor = result
+    assert incident.reasons[0].startswith(
+        "held_chain_step remediation failed; failed operation or validation: "
+        f"{validation.value}"
+    ), incident.reasons
+    assert incident.node_ids == ["node-a"], incident.node_ids
+    assert [(step.operation, step.node_ids) for step in successor.official_steps] == [
+        (FREEZE, ["node-a"]),
+        (CORDON, ["node-a"]),
+        (QUARANTINE, ["node-a"]),
+        (SUPPORT, ["node-a"]),
+    ], "the hold is kept and handed over: no rung, no release"
+    assert successor.lifetime_deadline_at is None, (
+        "an operator hand-off starts its own clock"
+    )
+    assert h.escalate() == result, "one support successor per failed chain"
+    assert len(h.store.list_workflows()) == 2
+
+
+def test_a_held_validate_then_readmit_hands_over_only_the_held_nodes() -> None:
+    """The validation names a node the chain never cordoned (a sibling it
+    merely checks): the hand-off keeps the chain's hold and does not extend
+    it to that node."""
+
+    operations = [FREEZE, CORDON, VALIDATE, READMIT]
+    h = EscalationHarness(
+        operations,
+        failed_index=operations.index(VALIDATE),
+        details={"failed_nodes": ["node-a", "node-b"]},
+    )
+    h.amend(
+        official_steps=[
+            step.model_copy(update={"node_ids": ["node-a", "node-b"]})
+            if step.operation in {VALIDATE, READMIT}
+            else step
+            for step in h.workflow.official_steps
+        ]
+    )
+
+    result = h.escalate()
+
+    assert result is not None, "the held node still needs its hand-off"
+    incident, successor = result
+    assert incident.node_ids == ["node-a"], incident.node_ids
+    assert {step.node_ids[0] for step in successor.official_steps} == {"node-a"}
+    assert "node-b" not in incident.reasons[0], incident.reasons
 
 
 def test_a_drain_whose_own_hand_off_failed_opens_no_second_one() -> None:

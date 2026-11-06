@@ -12,12 +12,13 @@ replacement plan lost the per-node GPU mapping the agents insist on.
 from __future__ import annotations
 
 from gpu_fault.adapters import NodeActionWorkflowAdapter
-from gpu_fault.app import default_simulated_profile
+from gpu_fault.app import ApplicationContext, default_simulated_profile
 from gpu_fault.models import (
     IncidentState,
     RecoveryAction,
     WorkflowOperation,
     WorkflowStatus,
+    WorkflowStepSpec,
     WorkflowStepStatus,
 )
 from gpu_fault.node_agent import NodeActionResult, NodeActionStatus
@@ -716,3 +717,130 @@ def test_the_scope_of_one_exhausted_branch_carries_only_that_nodes_gpus():
     assert scope["ordered_failed_nodes"] == ["node-a"]
     assert scope["gpu_uuids"] == ["GPU-a"], scope["gpu_uuids"]
     assert scope["gpu_uuids_by_node"] == {"node-a": ["GPU-a"]}
+
+
+def test_a_held_validate_then_readmit_whose_validation_fails_sends_one_hand_off_mail(
+    context: ApplicationContext,
+) -> None:
+    """Validate-then-readmit: FREEZE_EVIDENCE -> MARK_UNSCHEDULABLE ->
+    VALIDATE_GPU -> RESTORE_SCHEDULING. Its validation fails with no recovery
+    step before it, so no rung answers -- but the cordon still holds the node.
+    The record used to end FAILED + QUARANTINED with no hand-off and no
+    notice. The dispatcher's failure handler now opens one support hand-off on
+    the held node, which sends one mail and ends ESCALATED."""
+    from gpu_fault.adapters.support_escalation import SupportEscalationAdapter
+    from gpu_fault.execution import WorkflowStepOutcome
+    from gpu_fault.models import WorkflowExecutionRequest
+    from tests._builders import active_workflow_executor
+
+    planned = [
+        WorkflowOperation.FREEZE_EVIDENCE,
+        WorkflowOperation.MARK_UNSCHEDULABLE,
+        WorkflowOperation.VALIDATE_GPU,
+        WorkflowOperation.RESTORE_SCHEDULING,
+    ]
+    held = "workflow-validate-then-readmit"
+    incident = fault_incident(
+        "inc-validate-then-readmit",
+        "event-validate-then-readmit",
+        state=IncidentState.ACTION_PENDING,
+        workflow_request_id=held,
+        gpu_uuids=["GPU-a"],
+        fencing_token=1,
+    )
+    context.store.save_incident_and_workflow(
+        incident,
+        workflow_request(
+            held,
+            incident.incident_id,
+            WorkflowStatus.PENDING,
+            fencing_token=1,
+            runtime_profile_version="simulated-v1",
+            official_steps=[
+                workflow_step(
+                    operation,
+                    "simulated-runtime",
+                    node_ids=["node-a"],
+                    gpu_uuids=["GPU-a"],
+                )
+                for operation in planned
+            ],
+        ),
+    )
+
+    class _SimulatedRuntime:
+        def __init__(self) -> None:
+            self.support = SupportEscalationAdapter(context.store)
+            self.executed: list[tuple[str, WorkflowOperation]] = []
+
+        def supports(self, step: WorkflowStepSpec) -> bool:
+            return step.execution_owner == "simulated-runtime"
+
+        def execute(self, step_context) -> WorkflowStepOutcome:
+            operation = step_context.step.operation
+            self.executed.append((step_context.workflow.request_id, operation))
+            if operation is WorkflowOperation.ESCALATE_SUPPORT:
+                return self.support.execute(step_context)
+            if (
+                operation is WorkflowOperation.VALIDATE_GPU
+                and step_context.workflow.request_id == held
+            ):
+                return WorkflowStepOutcome.failed(
+                    "VALIDATE_GPU failed",
+                    details={
+                        "failed_nodes": ["node-a"],
+                        "node_failures": {"node-a": ["gpu_temperature_c=97"]},
+                    },
+                )
+            return WorkflowStepOutcome.succeeded(
+                operation_id=step_context.idempotency_key
+            )
+
+    adapter = _SimulatedRuntime()
+    result = active_workflow_executor(context.store, [adapter], planned).execute(
+        held, WorkflowExecutionRequest(expected_fencing_token=1)
+    )
+
+    assert result.status is WorkflowStatus.FAILED
+    assert (held, WorkflowOperation.RESTORE_SCHEDULING) not in adapter.executed
+    failed = context.store.get_workflow(held)
+    assert context.store.get_incident(incident.incident_id).state is (
+        IncidentState.QUARANTINED
+    ), "the cordon holds the node"
+    assert context.store.list_notifications() == []
+
+    escalation = context.orchestrator.escalate_failed_hardware_remediation(failed)
+
+    assert escalation is not None, "the held node must still reach an operator"
+    support_incident, support = escalation
+    assert support.request_id == f"workflow-support-after-{held}"
+    assert support_incident.reasons[0].startswith(
+        "held_chain_step remediation failed; failed operation or validation: "
+        "VALIDATE_GPU; nodes: node-a: gpu_temperature_c=97"
+    ), support_incident.reasons
+    assert [step.operation for step in support.official_steps] == [
+        WorkflowOperation.FREEZE_EVIDENCE,
+        WorkflowOperation.MARK_UNSCHEDULABLE,
+        WorkflowOperation.QUARANTINE,
+        WorkflowOperation.ESCALATE_SUPPORT,
+    ], "the hand-off keeps the hold: no rung, no release"
+    assert context.orchestrator.escalate_failed_hardware_remediation(failed) == (
+        escalation
+    ), "one support successor per failed chain"
+
+    handoff = active_workflow_executor(
+        context.store, [adapter], [step.operation for step in support.official_steps]
+    ).execute(
+        support.request_id,
+        WorkflowExecutionRequest(expected_fencing_token=support.fencing_token),
+    )
+
+    assert handoff.status is WorkflowStatus.SUCCEEDED
+    assert context.store.get_incident(support_incident.incident_id).state is (
+        IncidentState.ESCALATED
+    )
+    [mail] = context.store.list_notifications()
+    assert mail.incident_id == support_incident.incident_id
+    assert mail.subject.startswith("[GPU FAULT][hardware out of service] "), (
+        mail.subject
+    )

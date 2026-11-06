@@ -58,7 +58,9 @@ EFA_RECOVERY_STAGE = "efa_recovery"
 #: device-plugin restarts, whose plans ask for that reboot themselves
 #: (``failure_escalation_action``, ``families/health._resource_escalation``)
 #: and which climb to it as well when a plan carries no request. A validation
-#: with none of these before it is no recovery's verdict and has no rung.
+#: with none of these before it is no recovery's verdict and has no rung: the
+#: record's held nodes go to support (``failure_outcome.held_chain_hand_off``),
+#: a record that holds nothing opens nothing.
 VALIDATION_RUNGS: tuple[
     tuple[str, frozenset[WorkflowOperation], RecoveryAction, WorkflowOperation | None],
     ...,

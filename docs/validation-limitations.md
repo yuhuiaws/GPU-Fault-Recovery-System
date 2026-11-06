@@ -1693,7 +1693,13 @@ request: software-tested only
 (`tests/orchestration/test_cov95_runtime_escalation.py`,
 `tests/orchestration/test_fabric_manager_plan.py`), since no catalog plan runs
 a validation after a Fabric Manager restart and every EFA or device-plugin
-plan carries the request. 015
+plan carries the request. So is the support hand-off of a validate-then-readmit
+record whose validation fails with no recovery step before it while its cordon
+still holds the node (stage `held_chain_step`;
+`tests/orchestration/test_cov95_runtime_escalation.py`,
+`tests/orchestration/test_escalation_classifier.py`): outside the DRAIN and
+diagnostic-contract chains, which have their own stages, no catalog plan
+validates a cordoned node with no recovery step before the validation. 015
 `command_failure` serves two exits in turn: a BMC that does not answer (`Get
 Device ID command failed`) must be a `_bmc` collection error with no sample, a
 host without an IPMI device node (`Could not open device at /dev/ipmi0 ...: No
