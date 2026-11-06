@@ -2,8 +2,8 @@
 
 ## 依据与边界
 
-复核日期：2026-10-23。GFRS 基于当前未提交 worktree；没有改 NVIDIA Xid catalog，
-没有部署、改功率上限或执行 GPU 压测。以下区分接口定义、NVSentinel 实现与本站策略。
+本复核没有改 NVIDIA Xid catalog，没有部署、改功率上限或执行 GPU 压测。
+以下区分接口定义、NVSentinel 实现与本站策略。
 
 1. [NVIDIA nvidia-smi 文档](https://docs.nvidia.com/deploy/nvidia-smi/index.html)：
    `SW Power Cap` 是功率管理降频；`HW Power Brake` 是外部供电系统触发；
@@ -44,7 +44,12 @@ STORE_ONLY，二者默认三次确认。开启执行后才进入其隔离流程�
 | 停训后冷却 300 秒就自动接纳 | 新严重环境工作流改为 ENVIRONMENT_REVIEW，保留隔离、交人工检查，没有自动恢复训练 |
 | 将站点阈值描述为 NVIDIA 官方动作 | duration/功率相关明确标为本站性能策略，不伪称官方统一恢复动作 |
 
-仍采用设备报告的绝对或 T.Limit 阈值，缺失时保留可配置绝对 fallback。GFRS 在 HW
+仍采用设备报告的绝对或 T.Limit 阈值，缺失时保留可配置绝对 fallback。
+只报 T.Limit 的 GPU（其 XML 不打印绝对阈值）唯一保留的绝对限值是关机温度：DCGM collector
+读取设备经 DCGM 字段 159（`DCGM_FI_DEV_SHUTDOWN_TEMP`）报告的值，仅当 XML 没有绝对关机阈值
+且该值与此 GPU 的 T.Limit 算式相差不超过 1 °C 时发布为 `gpu_shutdown_temperature_c`
+（`src/gpu_fault/collectors/gpu/shutdown_limit.py`），只服务于关机温度的单样本保护，
+不换算成绝对读数的严重阈值。GFRS 在 HW
 slowdown 边界使用 `>=`（绝对）/`<=`（余量）；NVSentinel 当前余量 watch 使用严格 `<`。
 这是有意保留的本站保守边界，不宣称两者完全相同。
 显存绝对温度仍独立保留安全阈值，不凭共享 T.Limit 反推 GPU 核心温度或证明即将关机。
