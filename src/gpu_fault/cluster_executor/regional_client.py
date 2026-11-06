@@ -823,8 +823,14 @@ class RegionalFleetRegistry:
 class RegionalHyperPodSubmissionStore:
     """Control-plane-backed idempotency store for provider submissions.
 
-    HyperPodLifecycleAdapter only needs three methods to make reboot and
-    replace idempotent across restarts. In the default regional
+    The submission ledger (``provider_submissions.ProviderSubmissionLedger``)
+    needs only these three methods to make a node reboot idempotent across
+    restarts. A reboot is the only provider submission it records: HyperPod
+    ``BatchRebootClusterNodes`` (``HyperPodLifecycleAdapter``) or, on an
+    ``eks-managed`` cluster, EC2 ``RebootInstances``
+    (``EksManagedNodeProvider``). Provider replacement is refused before any
+    record is written, and ``REPLACE_NODE`` is the healthy warm-spare
+    failover, which submits nothing to the provider. In the default regional
     deployment the executor has no database (REMOTE_STATE=true), and the
     Pod that submits a reboot is routinely the Pod that reboot restarts,
     so the record has to live on the CPU control plane.
