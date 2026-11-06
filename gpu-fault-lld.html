@@ -8365,7 +8365,12 @@ VALIDATE_GPU/RESTORE_SCHEDULING 扩到从未隔离过的对端节点、把 incid
 幂等调用：</p>
 <ol type="1">
 <li><code>RESET_GPU/RESET_ALL_GPUS_NVSWITCHES</code> 失败：创建
-<code>RESTART_NODE</code> workflow。</li>
+<code>RESTART_NODE</code> workflow。<code>RESTART_FABRIC_MANAGER</code>
+失败时同样如此 （阶段 <code>fabric_manager_restart</code>）：solo XID 45
+计划没有 cordon，所以它经整条记录升级——后继先 cordon 并隔离节点再重启——
+而不在记录内原地升级。Agent 的 GPU 客户端检查拒绝的 Fabric Manager
+重启并未执行，且其 GPU 正在使用：不重启，只做取证并开工单
+（<code>node_action_refused</code>）。</li>
 <li><code>RESTART_NODE</code> 失败：创建带
 <code>replacement_strategy=HEALTHY_WARM_SPARE_ONLY</code> 的
 <code>REPLACE_NODE</code> workflow。</li>
@@ -8405,19 +8410,34 @@ snapshot、停作业、 有结果的 checkpoint；ENVIRONMENT_REVIEW
 有意不开工单的结局保持不变：每个失败都被执行器在派发前拒绝（过期世代，较新的一代负责该
 incident），或某一步是 结果未知而被放弃的
 ESCALATE_SUPPORT、FREEZE_EVIDENCE、CHECKPOINT_WORKLOADS（<code>NO_SECOND_TICKET_OPERATIONS</code>：第二张
-工单，或可能仍在作业里运行的取证/checkpoint）；只读诊断链、冷却计划与已执行或失败的交接也不开。
+工单，或可能仍在作业里运行的取证/checkpoint）；只读诊断链（没有隔离）与已执行或失败的交接也不开。
 交接只保持链自己的隔离、从不扩大：每个失败的 <code>failed_nodes</code>
 收窄到该记录仍隔离的节点
 （<code>failure_outcome.held_scope</code>、<code>handoff_hold.record_held_nodes</code>），所以按整个作业分配编译的
 STOP_WORKLOADS / CHECKPOINT_WORKLOADS 失败时，后继只
-cordon、隔离并点名故障节点，不碰作业里健康的节点。
+cordon、隔离并点名故障节点，不碰作业里健康的节点。交接的原因逐节点写它自己的
+finding，或写它为何被隔离：<code>held after &lt;OPERATION&gt; failed</code>；该步骤并未在其上失败的被隔离节点（先验证再放回中验证已通过的节点）写<code>held; &lt;OPERATION&gt; failed on another node</code>；其他没有逐节点
+finding 的步骤失败写
+<code>&lt;OPERATION&gt; failed</code>，绝不写成验证失败。唯一有意的例外是人工确认交接：
+结果无人知道（<code>manual_confirmation_required</code>）的整作业
+STOP_WORKLOADS / CHECKPOINT_WORKLOADS 交出作业整个分配的每个节点——
+cordon、隔离并点名——直到运维确认作业状态，因为作业状态未知时隔离整个分配是安全的做法；所有链都如此，诊断契约链
+（ENVIRONMENT_REVIEW、旧版冷却计划）也让位给它（<code>escalation._contract_ends_classification</code>），只读链没有隔离、不受影响。
+确认作业状态、修复或替换故障节点之后，运维在该交接 incident 下用
+validated restore
+（<code>submit-remediation --disposition restore</code>）放回这些节点；只有它仍隔离的每个节点都验证通过才会放回。
 以隔离本身收尾的计划——节点健康的 QUARANTINE 计划（FREEZE_EVIDENCE →
 MARK_UNSCHEDULABLE → [STOP_WORKLOADS] →
 QUARANTINE）、并入其他链的终态隔离分支、含容前缀——不规划
 ESCALATE_SUPPORT（它完成时的终点是 QUARANTINED 与终态 通知）；cordon
-之后的步骤（如停作业）失败时得到同样的交接（<code>failure_outcome.owes_hand_off</code>：存在没有
-RESTORE_SCHEDULING 放回的 QUARANTINE，即终态隔离）。为了放回而 cordon
-的计划（reset、reboot、冷却）不在本规则内。</li>
+之后的步骤（如停作业）失败时得到同样的交接。为了放回而 cordon
+的计划——reset、reboot 链与旧版冷却计划——同样适用： cordon
+之后停作业、GPU 客户端检查（VERIFY_NO_GPU_CLIENTS）或有结果的 checkpoint
+失败（还没有 reset/reboot 执行，梯级无从接手），
+以及冷却计划的验证、snapshot
+或诊断包失败时，同样把仍被隔离的节点交给支持（<code>failure_outcome.owes_hand_off</code>：只要该记录的
+ESCALATE_SUPPORT 没有执行过）；已被 RESTORE_SCHEDULING
+放回的节点不再算被隔离。</li>
 <li>诊断契约（ENVIRONMENT_REVIEW
 与旧版冷却契约）不让任何硬件梯级接手，但不挡隔离交接：它的
 MARK_UNSCHEDULABLE、 QUARANTINE 或 RESTORE_SCHEDULING
@@ -8432,6 +8452,33 @@ ESCALATE_SUPPORT。ENVIRONMENT_REVIEW 链的 cordon 失败时什么都没隔离�
 service）。执行器在派发前拒绝的 cordon 不开工单，结果未知的 cordon
 走人工确认工单。</li>
 </ol>
+<p>验证失败时，按记录在它之前执行过的最强恢复步骤升到该步骤的下一级（<code>validation_rungs.VALIDATION_RUNGS</code>）：替换之后升到
+support；reboot
+之后升到替换；reset（RESET_GPU、RESET_ALL_GPUS_NVSWITCHES、RECOVER_DRAIN_P2P）之后升到
+reboot；驱动或固件 安装、NVIDIA field diagnostic 或 NVLink 流程之后升到
+support；DCGM 诊断之后升到 drain；Fabric Manager 重启（阶段
+<code>fabric_manager_validation</code>）、EFA 驱动修复或 device plugin
+重启（阶段 <code>efa_recovery</code>，计划没有带 reboot
+请求时也如此）之后升到
+reboot，且只升级该步骤作用过的节点。恢复步骤即注册表中带恢复等级的节点硬件变更操作
+（<code>validation_rungs.NODE_RECOVERY_OPERATIONS</code>），与验证适配器在其后重新读取遥测的集合相同
+（<code>gpu_validation.TELEMETRY_READINESS_OPERATIONS</code>）；reset
+前后的 GPU 服务窗口与仅用于规划的 RESTART_VM 没有恢复等级。
+有测试固定每个恢复步骤都有对应的一级，注册表新增恢复动作而未给出升级级别时测试失败。运行时重启之后的这一级由整条记录
+升级（<code>workflow-reboot-after-&lt;workflow&gt;</code>），不在节点分支内原地升级。验证之前没有任何恢复步骤时，验证失败不是任何恢复的结论，
+不升任何一级。记录自己的 cordon
+或隔离仍然隔离着节点时——先验证再放回（FREEZE_EVIDENCE →
+MARK_UNSCHEDULABLE → [QUARANTINE] → VALIDATE_* →
+RESTORE_SCHEDULING）的验证失败——被隔离的节点（且只有这些节点）交给
+<code>workflow-support-after-&lt;workflow&gt;</code>（阶段
+<code>held_chain_step</code>，即第 7
+项的四步），由它发出支持交接邮件并以 <code>ESCALATED</code>
+结束，每条失败记录一张工单；第 7 项中有意不开工单的
+结局保持不变（执行器在派发前拒绝的验证、该记录已执行或已失败的交接）。此前这类记录以
+FAILED + QUARANTINED 结束，既无交接也无通知。
+没有隔离任何节点的记录——只读链、运维的 validated restore、已被
+RESTORE_SCHEDULING 放回的节点——仍然不开任何东西，DRAIN 链保持
+它自己的阶段 <code>drain_validation</code>（第 6 项）。</p>
 <pre class="mermaid">flowchart LR
     R1[&quot;RESET_GPU /&lt;br/&gt;RESET_ALL_GPUS_NVSWITCHES&quot;] --&gt;|SUCCEEDED| OK1[&quot;RESTORE_SCHEDULING&lt;br/&gt;+ RESTART_WORKLOAD&quot;]
     R1 --&gt;|&quot;FAILED 或&lt;br/&gt;validation 失败&quot;| R2[&quot;RESTART_NODE&quot;]
