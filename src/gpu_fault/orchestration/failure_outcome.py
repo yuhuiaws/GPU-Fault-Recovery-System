@@ -67,6 +67,23 @@ def executor_rejected_failure(details: Mapping[str, Any] | None) -> bool:
     )
 
 
+#: The step-detail key the Node Agent's GPU-client check writes when it
+#: refuses (``node_agent/operations/clients.GpuClientsActive``: ``agent``,
+#: ``compute`` or ``device`` holders), carried into the step record by the
+#: node-action fold (``adapters/node_action/verification_continuation
+#: .VERIFY_EVIDENCE_KEYS``).
+GPU_CLIENT_KIND_DETAIL = "gpu_client_kind"
+
+
+def gpu_clients_refused(details: Mapping[str, Any] | None) -> bool:
+    """Whether a FAILED node action was refused by the agent's GPU-client
+    check: it found GPU clients on its targets. The Fabric Manager restart
+    runs that check before it touches the unit, so such a restart never ran
+    -- and the GPUs are in use on a node nothing stopped."""
+
+    return details is not None and bool(details.get(GPU_CLIENT_KIND_DETAIL))
+
+
 def unknown_outcome_failure(details: Mapping[str, Any] | None) -> bool:
     """Whether a FAILED step's details say its outcome is not actually known.
 

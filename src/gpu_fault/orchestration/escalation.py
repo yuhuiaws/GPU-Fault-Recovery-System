@@ -30,6 +30,7 @@ from gpu_fault.orchestration.failure_outcome import (
     NO_SECOND_TICKET_OPERATIONS as _NO_SECOND_TICKET_OPERATIONS,
     UNKNOWN_OUTCOME_FLAGS as _UNKNOWN_OUTCOME_FLAGS,
     executor_rejected_failure as executor_rejected_failure,
+    gpu_clients_refused,
     held_chain_hand_off,
     unknown_outcome_failure as unknown_outcome_failure,
 )
@@ -85,6 +86,7 @@ _CONTAINMENT_RELEASE_OPERATIONS = frozenset(
 )
 _CLASSIFIABLE_OPERATIONS = (
     HARDWARE_ESCALATION_RELEVANT_OPERATIONS
+    | _RECOVERY_ACTION_OPERATIONS
     | _CONTAINMENT_RELEASE_OPERATIONS
     | _VALIDATION_OPERATIONS
 )
@@ -461,6 +463,31 @@ def _no_verdict_classification(
     )
 
 
+def _fabric_manager_restart_rung(
+    failed_executions: list[WorkflowStepExecution],
+) -> tuple[str, RecoveryAction, WorkflowOperation]:
+    """A failed RESTART_FABRIC_MANAGER climbs like a failed reset, through the
+    whole record (the solo XID 45 plan holds no cordon; the reboot successor
+    cordons first). One its GPU-client check refused never ran, on GPUs in use
+    nothing stopped: no reboot, the evidence and the ticket only."""
+
+    if all(
+        gpu_clients_refused(execution.details)
+        for execution in failed_executions
+        if execution.operation is WorkflowOperation.RESTART_FABRIC_MANAGER
+    ):
+        return (
+            NODE_ACTION_REFUSED_STAGE,
+            RecoveryAction.ESCALATE_OPERATOR,
+            WorkflowOperation.ESCALATE_SUPPORT,
+        )
+    return (
+        "fabric_manager_restart",
+        RecoveryAction.REBOOT_NODE,
+        WorkflowOperation.RESTART_NODE,
+    )
+
+
 def _refused_containment(
     executions: list[WorkflowStepExecution],
 ) -> bool:
@@ -489,8 +516,9 @@ def next_rung(
     replacement. ``None`` means the branch takes no rung in place and the
     outcome goes to the whole-workflow path once the workflow fails: an
     operator (support escalation / drain), or the reboot the whole record
-    climbs to after a runtime restart or a plan's own request
-    (``validation_rungs.VALIDATION_RUNGS``, ``EFA_RECOVERY_STAGE``).
+    climbs to after a runtime restart -- a failed Fabric Manager restart or a
+    validation behind one, whose successor cordons first -- or a plan's own
+    request (``validation_rungs.VALIDATION_RUNGS``, ``EFA_RECOVERY_STAGE``).
     ``recovery_context`` is the set of recovery operations that already ran
     on the branch; it decides what a failed *validation* escalates from.
     """
@@ -876,6 +904,10 @@ class HardwareEscalationService:
             failed_stage = "reset"
             next_action = RecoveryAction.REBOOT_NODE
             next_operation = WorkflowOperation.RESTART_NODE
+        elif WorkflowOperation.RESTART_FABRIC_MANAGER in failed_operation_set:
+            failed_stage, next_action, next_operation = _fabric_manager_restart_rung(
+                failed_executions
+            )
         elif failed_operation_set.intersection(_VALIDATION_OPERATIONS):
             rung = validation_rung(recovery_context_operations)
             if rung is not None:

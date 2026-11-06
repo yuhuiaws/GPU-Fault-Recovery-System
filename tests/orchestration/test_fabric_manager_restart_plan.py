@@ -214,3 +214,172 @@ def test_the_graded_inventory_is_the_gpus_that_report_a_fabric_state() -> None:
     assert graded_fabric_gpus([sample("GPU-a", 0.0)]) == [], "not supported"
     assert graded_fabric_gpus([sample("GPU-a", 3.0, "NVIDIA L40S")]) == []
     assert graded_fabric_gpus([sample(None, 3.0)]) == [], "no UUID to reset by"
+
+
+#: The successor every reboot rung plans (``escalation._escalation_operations``):
+#: it cordons and quarantines before it reboots, then validates and readmits.
+REBOOT_SUCCESSOR = [
+    Op.FREEZE_EVIDENCE,
+    Op.MARK_UNSCHEDULABLE,
+    Op.QUARANTINE,
+    Op.RESTART_NODE,
+    Op.VALIDATE_GPU,
+    Op.VALIDATE_HOST,
+    Op.VALIDATE_FABRIC,
+    Op.RESTORE_SCHEDULING,
+]
+
+
+def test_a_failed_solo_fabric_manager_restart_climbs_to_the_reboot(
+    context: ApplicationContext,
+) -> None:
+    """The solo XID 45 plan is FREEZE_EVIDENCE -> RESTART_FABRIC_MANAGER: no
+    cordon, no validation. Its Fabric Manager restart failing used to end the
+    record FAILED and the incident ESCALATED with no successor and no mail.
+    It now climbs to the reboot the way a failed reset does; the reboot
+    successor cordons and quarantines the node before it reboots it."""
+    from gpu_fault.execution import WorkflowStepOutcome
+    from gpu_fault.models import WorkflowExecutionRequest
+    from tests._builders import active_workflow_executor
+
+    incident, workflow = _solo_xid45(context)
+    planned = [step.operation for step in workflow.official_steps]
+    assert planned == [Op.FREEZE_EVIDENCE, Op.RESTART_FABRIC_MANAGER]
+
+    class _SimulatedRuntime:
+        def supports(self, step) -> bool:
+            return step.execution_owner == "simulated-runtime"
+
+        def execute(self, step_context) -> WorkflowStepOutcome:
+            if step_context.step.operation is Op.RESTART_FABRIC_MANAGER:
+                return WorkflowStepOutcome.failed(
+                    "node agent node-a: CalledProcessError: systemctl restart "
+                    "nvidia-fabricmanager returned 1"
+                )
+            return WorkflowStepOutcome.succeeded(
+                operation_id=step_context.idempotency_key
+            )
+
+    result = active_workflow_executor(
+        context.store, [_SimulatedRuntime()], planned
+    ).execute(
+        workflow.request_id,
+        WorkflowExecutionRequest(expected_fencing_token=workflow.fencing_token),
+    )
+
+    assert result.status is WorkflowStatus.FAILED
+    failed = context.store.get_workflow(workflow.request_id)
+    assert context.store.get_incident(incident.incident_id).state is (
+        IncidentState.ESCALATED
+    )
+
+    escalation = context.orchestrator.escalate_failed_hardware_remediation(failed)
+
+    assert escalation is not None, "a failed Fabric Manager restart climbs nothing"
+    successor_incident, successor = escalation
+    assert successor.request_id == f"workflow-reboot-after-{workflow.request_id}"
+    assert successor_incident.reasons[0].startswith(
+        "fabric_manager_restart remediation failed; failed operation or "
+        "validation: RESTART_FABRIC_MANAGER; nodes: node-a"
+    ), successor_incident.reasons
+    assert [step.operation for step in successor.official_steps] == (
+        REBOOT_SUCCESSOR
+    ), "the reboot rung isolates the node before it reboots it"
+    assert {node for step in successor.official_steps for node in step.node_ids} == {
+        "node-a"
+    }
+    assert context.orchestrator.escalate_failed_hardware_remediation(failed) == (
+        escalation
+    ), "one reboot successor per failed restart"
+
+
+def _failed_fabric_manager_restart(operations, details=None):
+    from tests.orchestration._cov95_runtime_escalation import EscalationHarness
+
+    return EscalationHarness(
+        operations,
+        failed_index=operations.index(Op.RESTART_FABRIC_MANAGER),
+        details=details,
+    )
+
+
+def test_a_failed_fabric_manager_restart_in_a_held_chain_climbs_to_the_reboot() -> None:
+    """Like a failed reset in a chain that cordoned first: the reboot rung,
+    no longer the support hand-off of a step no rung answered."""
+    from gpu_fault.models import RecoveryAction
+    from gpu_fault.orchestration.escalation import HardwareEscalationService
+
+    h = _failed_fabric_manager_restart(
+        [
+            Op.FREEZE_EVIDENCE,
+            Op.MARK_UNSCHEDULABLE,
+            Op.RESTART_FABRIC_MANAGER,
+            Op.VALIDATE_GPU,
+            Op.RESTORE_SCHEDULING,
+        ]
+    )
+
+    classification = HardwareEscalationService.classify(h.workflow)
+
+    assert classification is not None
+    assert classification[:3] == (
+        "fabric_manager_restart",
+        RecoveryAction.REBOOT_NODE,
+        Op.RESTART_NODE,
+    )
+
+
+@pytest.mark.parametrize(
+    ("details", "stage", "why"),
+    [
+        (
+            {"remote_status_source": "executor-rejected"},
+            None,
+            "refused before dispatch: a stale generation, a newer one owns it",
+        ),
+        (
+            {
+                "safety_rejection": True,
+                "manual_confirmation_required": True,
+                "node_action_not_started": True,
+            },
+            "node_action_refused",
+            "the agent attests it refused before acting: nothing to reboot from",
+        ),
+        (
+            {
+                "gpu_client_kind": "compute",
+                "gpu_client_holders": [{"gpu_uuid": "GPU-a", "pid": "4242"}],
+            },
+            "node_action_refused",
+            "GPU clients are live on a node nothing stopped: never a reboot",
+        ),
+        (
+            {"outcome_unknown": True, "manual_confirmation_required": True},
+            "manual_confirmation_required",
+            "the restart may still be running: an operator confirms it",
+        ),
+    ],
+    ids=["executor-rejected", "agent-refused", "gpu-clients", "unknown-outcome"],
+)
+def test_a_failed_fabric_manager_restart_keeps_the_endings_that_never_reboot(
+    details, stage, why
+) -> None:
+    from gpu_fault.orchestration.escalation import HardwareEscalationService
+
+    h = _failed_fabric_manager_restart(
+        [Op.FREEZE_EVIDENCE, Op.RESTART_FABRIC_MANAGER], details
+    )
+
+    classification = HardwareEscalationService.classify(h.workflow)
+    result = h.escalate()
+
+    assert (classification and classification[0]) == stage, why
+    if stage is None:
+        assert result is None, why
+        return
+    assert result is not None, why
+    _incident, successor = result
+    operations = [step.operation for step in successor.official_steps]
+    assert Op.RESTART_NODE not in operations, why
+    assert Op.ESCALATE_SUPPORT in operations, "the operator gets one hand-off"

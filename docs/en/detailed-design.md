@@ -2459,7 +2459,11 @@ isolated and the incident to both nodes.
 
 Whole-record hardware recovery escalation is invoked idempotently by the Dispatcher on `FAILED` workflows:
 
-1. `RESET_GPU/RESET_ALL_GPUS_NVSWITCHES` fails: create a `RESTART_NODE` workflow.
+1. `RESET_GPU/RESET_ALL_GPUS_NVSWITCHES` fails: create a `RESTART_NODE` workflow. So does a failed
+   `RESTART_FABRIC_MANAGER` (stage `fabric_manager_restart`): the solo XID 45 plan holds no cordon, so it climbs
+   through the whole record, whose successor cordons and quarantines the node before the reboot, not in place. A
+   Fabric Manager restart the agent's GPU-client check refused never ran and its GPUs are in use: no reboot, the
+   evidence and the ticket only (`node_action_refused`).
 2. `RESTART_NODE` fails: create a `REPLACE_NODE` workflow with
    `replacement_strategy=HEALTHY_WARM_SPARE_ONLY`.
 3. Replacement only allows a warm spare that has passed the independent health state machine's validation and has been atomically reserved; the managed/provider

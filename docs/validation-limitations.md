@@ -1693,7 +1693,11 @@ request: software-tested only
 (`tests/orchestration/test_cov95_runtime_escalation.py`,
 `tests/orchestration/test_fabric_manager_plan.py`), since no catalog plan runs
 a validation after a Fabric Manager restart and every EFA or device-plugin
-plan carries the request. So is the support hand-off of a validate-then-readmit
+plan carries the request. A failed Fabric Manager restart climbs to the
+reboot too (stage `fabric_manager_restart`), and one its GPU-client check
+refused goes to support without a reboot: software-tested only
+(`tests/orchestration/test_fabric_manager_restart_plan.py`), no live variant
+fails a Fabric Manager restart. So is the support hand-off of a validate-then-readmit
 record whose validation fails with no recovery step before it while its cordon
 still holds the node (stage `held_chain_step`;
 `tests/orchestration/test_cov95_runtime_escalation.py`,
