@@ -1,7 +1,8 @@
 # NCCL hung 端到端覆盖审计
 
 本轮清单、时序、Fabric 和错误分流修改另增
-`test_nccl_review_e2e.py` 的 8 个连续链实例，以及
+`test_nccl_review_e2e.py` 的 9 个连续链实例（其中 QP 所属线程绑定任务端口的一例为后续补充，
+第011类注入运行器选用其余实例），以及
 `test_nccl_review_boundaries.py`、`test_nccl_collection_budget.py` 的边界测试。
 下面“历史测量”的覆盖百分比只对应修改前快照，不能作为当前代码覆盖率。
 当前行为、RAS 版本边界及未完成的真机验收以
@@ -12,21 +13,22 @@
 | 测试文件 | 验证内容 | 边界 |
 |---|---|---|
 | `test_hung_episode_e2e.py` | API、SQLite、第一次取证、噪声不重采、稳定恢复、第二波新轮次 | 软件链，非真实训练 |
-| `test_efa_stall_episodes.py` | 冻结基线、fallback、缺样本/尖峰/跨 attempt、旧状态迁移 | 状态机 |
+| `tests/host_health/test_efa_stall_episodes.py` | 冻结基线、fallback、缺样本/尖峰/跨 attempt、旧状态迁移 | 状态机 |
 | `test_communication_monitor.py` | 真 loopback RAS 协议、128节点投影、QP绑定、进程阻塞与回收 | RAS服务和GPU响应为测试边界 |
 | `test_communication_history_pipeline.py` | 固定epoch历史、PID复用、无RANK关联、三个真实worker入口 | 不执行真实GPU命令 |
 | `test_communication_scope.py` | 已认证heartbeat签名兼容、作用域、boot/generation/租约拒绝 | 本地API |
 | `test_partial_hung_evidence.py` | 超时部分证据留存，不计完整覆盖率 | 实际工作流适配器 |
 
 第011类自动注入运行器已加入这些关键连续链和边界选择器。
-另在独立 PyTorch 2.10.0+cpu 环境运行 `tools.verify_fr_analyzer`，
-114 个原生匹配规则对照与 10 个官方 builder 用例通过。没有 CUDA/NCCL 运行；
+`tools.verify_fr_analyzer` 是独立的 CPU 验收：只在安装了真实 PyTorch 2.10 FR 引擎的环境中运行，
+把本项目的集合通信匹配逐条对照 PyTorch 原生匹配规则，并核对官方 builder 用例的分析结论；
+它不在常规测试中执行，结果不进入仓库，也不运行 CUDA/NCCL；
 真机初始化、长 checkpoint、局部组停滞、实际采集开销、框架协同恢复仍需相应环境验收。
 本轮未重新计算行覆盖百分比，不能把用例通过数当成代码覆盖率。
 
 ## 口径
 
-不能把此前5141项相关回归通过、端到端场景覆盖和真机验收覆盖混为一谈。
+不能把相关回归测试的通过数、端到端场景覆盖和真机验收覆盖混为一谈。
 本次区分三层：
 
 1. 组件测试：分别验证解析器、分类器、状态机、适配器。
@@ -41,7 +43,9 @@
 
 ## 新增连续链
 
-`tests/execution/test_nccl_continuous_e2e.py`包含36个参数化测试实例。
+`tests/execution/test_nccl_continuous_e2e.py`包含38个参数化测试实例：下表14类义务的36个实例，
+以及按 kubelet 报告的运行时容器 ID 解析受管任务 cgroup 范围的2个实例（FR 开/关）。
+第011类注入运行器选用前36个。
 辅助夹具为 `_nccl_chain_node.py`、`_nccl_chain_support.py`。
 
 ```text
@@ -77,7 +81,7 @@ Host Collector仅启用RDMA贡献器，其他健康遥测用于真实Fabric验�
 | 进程与角色 | 无RANK的I/O线索、py-spy非零退出、同角色/不同PP角色、不同采样时长CPU归一化、NSpid映射 | 连续软件链 |
 | 扩采与预算 | 首轮4+次轮4、遗漏分母、压缩证据解码；字节预算耗尽不得宣称全采 | 连续软件链 |
 | 缺失与损坏 | summary不可达、triage不可达、checksum损坏、旧snapshot epoch | 连续软件链 |
-| 身份与范围 | 其他任务PID不attach；无cgroup范围不attach；bundle前PID复用跳过 | 连续软件链 |
+| 身份与范围 | 其他任务PID不attach；无cgroup范围不attach；bundle前PID复用跳过；无cgroup注解的Pod按运行时容器ID定位范围 | 连续软件链 |
 | 证据落盘 | 实际归档、manifest中最终判定、SHA-256与执行回执一致 | 连续软件链 |
 | Fabric证据不足 | 缺GPU遥测保持等待；补齐后才结束取证，不用进程数据替代 | 连续软件链 |
 | 安全收尾 | 健康Fabric不等于训练恢复；bundle部分失败仍为ESCALATED且保留其他节点证据 | 连续软件链 |
@@ -107,7 +111,7 @@ RESTART_WORKLOAD、REPLACE_NODE、隔离/禁调度，并让training-progress读�
 
 ## 历史测量
 
-2026-10-23本轮 review 修改前本地运行：36个实例全部通过，无跳过。仅运行这36个实例，
+本轮 review 修改前的快照上本地运行：36个实例全部通过，无跳过。仅运行这36个实例，
 对下列18个NCCL专用模块启用pytest-cov分支统计，结果为：
 
 | 指标 | 已覆盖/总数 | 覆盖率 |
@@ -145,8 +149,7 @@ adapters.node_action.hung_survey
 
 共享API、通用执行器及HostHealth其他故障类别不计入这个代码统计分母，
 但链路用例实际执行了相应路径。
-本机原始报告为 `/tmp/gfrs-nccl-coverage-h9itb3/coverage.json` 与同目录 `junit.xml`。
-重新统计时对以上模块分别传 `--cov=gpu_fault.<模块>`，加 `--cov-branch`，
+该次原始报告（coverage.json、junit.xml）不在仓库中。重新统计时对以上模块分别传 `--cov=gpu_fault.<模块>`，加 `--cov-branch`，
 并将 `COVERAGE_FILE` 和报告路径指向新的独立目录，避免覆盖其他测试证据。
 
 ## 复跑
