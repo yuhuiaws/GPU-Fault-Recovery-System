@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from gpu_fault.admin import notification_precheck as PRECHECK
 from gpu_fault.admin.bootstrap_common import (
     BootstrapError,
@@ -302,3 +304,118 @@ def _result(*, ses: bool, sns: str) -> PRECHECK.EmailConfirmation:
         sns_subscription_arn=None,
         channel="ses",
     )
+
+
+class PerIdentityRunner(Runner):
+    """SES answers per address: the administrator's identity is verified, any
+    other address has none until the check creates it."""
+
+    def __init__(self) -> None:
+        super().__init__(ses_verified=True, sns_confirmed=True)
+        self.identities: dict[str, bool] = {EMAIL: True}
+
+    def aws_json(self, _region, *arguments, **_kwargs):
+        if arguments[0:2] == ("sesv2", "get-email-identity"):
+            self.commands.append(arguments)
+            address = arguments[arguments.index("--email-identity") + 1]
+            if address not in self.identities:
+                raise BootstrapError("NotFoundException")
+            verified = self.identities[address]
+            return {
+                "VerifiedForSendingStatus": verified,
+                "VerificationStatus": "SUCCESS" if verified else "PENDING",
+            }
+        return super().aws_json(_region, *arguments, **_kwargs)
+
+    def run(self, arguments, **_kwargs):
+        self.commands.append(tuple(arguments))
+        if "create-email-identity" in arguments:
+            self.identities[arguments[arguments.index("--email-identity") + 1]] = False
+        return ""
+
+
+def test_an_ses_site_is_checked_for_the_sender_it_declares_not_the_admin_address(
+    tmp_path: Path,
+) -> None:
+    """SES sends from ``emailSender`` (``SesEmailNotifier``: FromEmailAddress is
+    GPU_FAULT_EMAIL_SENDER, the Secret's email-sender). A verified
+    administrator identity says nothing about that sender, so the check must
+    read -- and on first sight create -- the sender's identity, while the SNS
+    subscription stays the administrator's."""
+
+    runner = PerIdentityRunner()
+    state = BootstrapState(tmp_path / "bootstrap-state.json", site_id="site-a")
+    declared = {
+        "channel": "ses",
+        "allowEmail": True,
+        "acknowledgeExternalAlertChannel": False,
+        "adminEmail": EMAIL,
+        "emailSender": "alerts@example.com",
+        "emailRecipients": ["oncall@example.com"],
+        "emailSubjectPrefix": "",
+    }
+
+    result = PRECHECK.check_email_confirmations(
+        runner,
+        cpu=_cpu(),
+        site_id="site-a",
+        admin_email=EMAIL,
+        state=state,
+        channel="ses",
+        notifications=declared,
+    )
+
+    identities = [
+        command[command.index("--email-identity") + 1]
+        for command in runner.commands
+        if "--email-identity" in command
+    ]
+    assert identities and set(identities) == {"alerts@example.com"}, (
+        f"the check read or created the wrong SES identity: {identities}"
+    )
+    assert [c for c in runner.commands if "create-email-identity" in c], (
+        "a sender without an identity gets its verification mail once"
+    )
+    assert result.sender == "alerts@example.com"
+    assert result.ses_verified is False and result.confirmed is False, (
+        "a verified administrator identity must not stand in for the sender"
+    )
+    assert result.admin_email == EMAIL and result.sns_confirmed is True
+    message = PRECHECK.email_confirmation_refusal(result, rerun_command="rerun")
+    assert "SES sender identity alerts@example.com: verification mail sent" in message
+
+
+def test_without_a_declared_sender_the_administrator_address_is_the_sender(
+    tmp_path: Path,
+) -> None:
+    """A site that only switched ``channel: ses`` sends from the administrator
+    address (bootstrap writes it as ``emailSender``), so that identity is the
+    one the check reads."""
+
+    runner = PerIdentityRunner()
+
+    result = PRECHECK.check_email_confirmations(
+        runner,
+        cpu=_cpu(),
+        site_id="site-a",
+        admin_email=EMAIL,
+        state=None,
+        channel="ses",
+        notifications={"channel": "ses", "adminEmail": EMAIL},
+    )
+
+    assert result.sender == EMAIL and result.confirmed is True
+    assert not [c for c in runner.commands if "create-email-identity" in c]
+
+
+def test_an_invalid_declared_block_fails_the_check_by_name(tmp_path: Path) -> None:
+    with pytest.raises(BootstrapError, match="emailSender must be a valid email"):
+        PRECHECK.check_email_confirmations(
+            PerIdentityRunner(),
+            cpu=_cpu(),
+            site_id="site-a",
+            admin_email=EMAIL,
+            state=None,
+            channel="ses",
+            notifications={"channel": "ses", "emailSender": "not-an-address"},
+        )

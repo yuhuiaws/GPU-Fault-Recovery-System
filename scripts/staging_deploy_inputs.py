@@ -56,7 +56,9 @@ def managed_site_inputs(state_dir: Path) -> dict[str, object] | None:
     ``deploy --state-dir X`` is the whole upgrade command: the CPU ARN, the GPU
     ARNs and the administrator email are read from ``site.yaml`` when the
     command does not give them. Read as YAML rather than through ``load_site``
-    so a site whose recorded repository snapshot was pruned still answers.
+    so a site whose recorded repository snapshot was pruned still answers. The
+    raw ``spec.notifications`` block goes to the first-minute check, which
+    resolves the SES sender from it the way bootstrap will.
     """
 
     site_file = state_dir / "site.yaml"
@@ -91,6 +93,7 @@ def managed_site_inputs(state_dir: Path) -> dict[str, object] | None:
         # The channel the existing site notifies over decides which
         # confirmation(s) the first-minute check asks for.
         "notification_channel": site_notification_channel(document),
+        "notifications": notifications,
     }
 
 
@@ -168,13 +171,15 @@ def precheck_email_confirmations(
     rerun_command: str,
     runner: CommandRunner | None = None,
     channel: str = "sns",
+    notifications: object = None,
 ) -> EmailConfirmation:
     """The first-minute notification check; raises naming the address when unconfirmed.
 
     Discovers the CPU cluster (the site id and Region come from it), sends the
-    confirmation mail once (two for a ``ses`` site: the SES verification as
-    well), and stops -- exit status 2 -- with one message naming the address(es)
-    and the rerun line. ``wait_minutes`` polls instead.
+    confirmation mail once (two for a ``ses`` site: the verification of the SES
+    sender the site declares -- ``notifications`` is its ``spec.notifications``
+    -- as well), and stops -- exit status 2 -- with one message naming the
+    address(es) and the rerun line. ``wait_minutes`` polls instead.
     """
 
     active_runner = runner or CommandRunner()
@@ -197,6 +202,7 @@ def precheck_email_confirmations(
                 admin_email=admin_email,
                 state=state,
                 channel=channel,
+                notifications=notifications,
             )
 
         result = await_email_confirmations(check, wait_minutes=wait_minutes)

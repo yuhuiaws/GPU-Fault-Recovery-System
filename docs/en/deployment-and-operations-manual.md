@@ -230,7 +230,7 @@ signed release and generates `site.yaml`. The ARN entry point is the only creato
 `join-cluster`/`remove-cluster`, `cpu-rolling-update`, `aurora-failback` and `uninstall` only change or delete registered resources within their own scope.
 
 Within its first minute the first ARN deploy creates the site SNS topic, the email subscription and the publish permission according to
-`--admin-email` (a `channel: ses` site also gets an SES identity and send permission) and writes them into the internal site; until the subscription
+`--admin-email` (a `channel: ses` site also gets an SES identity and send permission for its sender `emailSender`) and writes them into the internal site; until the subscription
 is confirmed it stops with exit status 2 (`nothing was deployed`) and prints the rerun command, or with `--wait-for-email-confirmation <minutes>` it
 polls every 30 seconds instead. An existing site needs only the same state-dir; the hidden site mode does not accept online notification overrides.
 
@@ -9248,7 +9248,8 @@ the bound `gpu-fault-admin deploy`. The site validates the address format: `allo
 `channel: ses` additionally requires `emailSender` and at least one recipient (`emailRecipients` defaults to `adminEmail`);
 `allowEmail: false` requires `acknowledgeExternalAlertChannel: true` (rendered as `GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL`).
 Before any gate or build, deploy's first-minute precheck confirms the SNS subscription of `adminEmail` on the site topic, and on a `channel: ses`
-site also the SES identity of `adminEmail` (created when absent, which sends one verification email); while unconfirmed it stops, naming the
+site also the SES identity of the `emailSender` the mail is sent from (resolved from the notification block as described below, so `adminEmail` when the
+site declares no sender; created when absent, which sends one verification email); while unconfirmed it stops, naming the
 address(es) and the exact rerun command. The release engine's preflight and verification then check: on an SES site, the sender's
 `VerifiedForSendingStatus` via SES v2, the account sending permission, the declared configuration set and the addresses actually in the Secret;
 on an SNS site, that `spec.health.snsTopicArn` is set and the site context in the Secret.
@@ -9265,7 +9266,8 @@ declared or implied `channel`, `allowEmail: true`, `acknowledgeExternalAlertChan
 site's value; when the address changes, an `emailSender` or `emailRecipients` still equal to the old address (that default) follows it to the new
 one, and any other declared sender and recipients stay. The SES sending identity, the control-plane role's `ses:SendEmail` and the
 `gpu-fault-email` Secret all converge on this block. A declared field that is invalid (address format, an unknown key, a non-boolean
-`allowEmail` and so on) stops bootstrap before its first task, naming the field.
+`allowEmail` and so on) stops the deploy at its first-minute email check, naming the field (bootstrap refuses it before its first task
+as well).
 
 `sesConfigurationSet` accepts 1 to 64 ASCII letters, digits, hyphens or underscores. Once declared it must already exist,
 with a matching name and `SendingOptions.SendingEnabled=true`; unknown or sending-disabled are both refused. deploy does not create that resource on your behalf,

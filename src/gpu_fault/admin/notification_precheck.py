@@ -34,6 +34,7 @@ from gpu_fault.admin.notifications import (
     ensure_ses_identity,
     resolve_notification_routing,
     ses_identity_verified,
+    site_notification_routing,
 )
 from gpu_fault.admin.site import NOTIFICATION_CHANNEL_SES, NOTIFICATION_CHANNEL_SNS
 
@@ -87,6 +88,7 @@ def check_email_confirmations(
     admin_email: str,
     state: BootstrapState | None,
     channel: str = NOTIFICATION_CHANNEL_SNS,
+    notifications: object = None,
 ) -> EmailConfirmation:
     """Send (once) and read the confirmation(s) the channel needs.
 
@@ -96,9 +98,22 @@ def check_email_confirmations(
     the subscription request recorded here is the one it recognises and it
     never subscribes a second time. With ``channel="sns"`` no SES API is
     called: there is no identity to create or verify.
+
+    The SNS subscription is the administrator's. The SES identity is the one
+    the mail is sent from: ``SesEmailNotifier`` uses the Secret's
+    ``email-sender`` -- the site's ``emailSender`` -- as ``FromEmailAddress``.
+    ``notifications`` is the existing site's ``spec.notifications``; the
+    channel and sender are then the ones the deploy goes on to use
+    (``site_notification_routing``, as bootstrap resolves them), which is the
+    administrator address only where the site declares no sender. Without a
+    site (a first deploy) it is the administrator address on ``channel``.
     """
 
-    routing = resolve_notification_routing(admin_email=admin_email, channel=channel)
+    routing = (
+        site_notification_routing(notifications, admin_email=admin_email)
+        if notifications is not None
+        else resolve_notification_routing(admin_email=admin_email, channel=channel)
+    )
     ses_verified, created = True, False
     if routing.uses_ses:
         identity, created = ensure_ses_identity(

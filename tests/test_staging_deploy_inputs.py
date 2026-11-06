@@ -375,6 +375,9 @@ def test_email_precheck_forwards_the_wait_and_the_rerun_line(
     assert seen["admin_email"] == EMAIL
     assert seen["cpu_cluster_arn"] == CPU_ARN
     assert seen["channel"] == "sns", "a site with only adminEmail notifies over SNS"
+    assert seen["notifications"] == {"adminEmail": EMAIL}, (
+        "the check needs the site's block to know the sender it must verify"
+    )
     assert seen["rerun_command"] == f"gpu-fault-admin deploy --state-dir {state}"
 
 
@@ -395,6 +398,64 @@ def test_managed_site_reports_the_channel_the_precheck_must_confirm(
     document["spec"]["notifications"]["channel"] = "sns"
     (state / "site.yaml").write_text(yaml.safe_dump(document), encoding="utf-8")
     assert staging_deploy.managed_site_inputs(state)["notification_channel"] == "sns"
+    assert staging_deploy.managed_site_inputs(state)["notifications"] == {
+        "adminEmail": EMAIL,
+        "emailSender": EMAIL,
+        "channel": "sns",
+    }, "the site's own block, read as written"
+
+
+def test_the_first_minute_check_receives_the_sites_notification_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The SES identity the check verifies is the site's sender, so the block
+    it is resolved from has to reach ``check_email_confirmations``; the CPU
+    discovery is the only AWS collaborator replaced."""
+
+    from gpu_fault.admin.bootstrap_common import ClusterIdentity
+    from scripts import staging_deploy_inputs
+
+    state = tmp_path / "state"
+    _write_site(state)
+    declared = {"channel": "ses", "adminEmail": EMAIL, "emailSender": "a@example.com"}
+    cpu = ClusterIdentity(
+        input_arn=CPU_ARN,
+        role="cpu",
+        region="us-east-1",
+        account_id="123456789012",
+        hyperpod_arn="arn:aws:sagemaker:us-east-1:123456789012:cluster/control",
+        hyperpod_name="control",
+        eks_arn=CPU_ARN,
+        eks_name="control",
+        vpc_id="vpc-1",
+        subnet_ids=("subnet-1",),
+        node_recovery="None",
+        context="gpu-fault-admin-precheck",
+    )
+    seen: dict[str, object] = {}
+
+    def check(_runner: object, **kwargs: object) -> EmailConfirmation:
+        seen.update(kwargs)
+        return _email(ses=True, sns="CONFIRMED")
+
+    monkeypatch.setattr(
+        staging_deploy_inputs, "discover_cluster", lambda *_a, **_k: cpu
+    )
+    monkeypatch.setattr(staging_deploy_inputs, "check_email_confirmations", check)
+
+    staging_deploy_inputs.precheck_email_confirmations(
+        state_dir=state,
+        cpu_cluster_arn=CPU_ARN,
+        admin_email=EMAIL,
+        wait_minutes=0,
+        rerun_command="rerun",
+        runner=staging_deploy_inputs.CommandRunner(),
+        channel="ses",
+        notifications=declared,
+    )
+
+    assert seen["notifications"] == declared
+    assert seen["admin_email"] == EMAIL and seen["channel"] == "ses"
 
 
 def test_early_supersede_refusal_happens_before_gates_and_build(
