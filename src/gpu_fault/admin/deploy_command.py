@@ -116,8 +116,13 @@ def add_deploy_command(commands: Any) -> None:
         dest="alert_email",
         metavar="EMAIL",
         help=(
-            "administrator email for SES fault notifications and SNS alerts; "
-            "required on the first deploy, read from the site afterwards"
+            "administrator email: subscribed to the site's SNS alert topic "
+            "(which also carries the control plane's notifications on the "
+            "default channel: sns), written as spec.notifications.adminEmail and "
+            "used to find the IAM Identity Center user granted Grafana ADMIN; a "
+            "channel: ses site sends from and to it only where site.yaml names "
+            "no emailSender/emailRecipients; required on the first deploy, read "
+            "from the site afterwards"
         ),
     )
     add_deploy_action_arguments(deploy)

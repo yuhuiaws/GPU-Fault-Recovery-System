@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from gpu_fault.admin import cli as admin_cli
 from gpu_fault.admin import notification_bootstrap as admin_notification_bootstrap
 from gpu_fault.admin.bootstrap_common import (
     BootstrapError,
@@ -489,3 +490,31 @@ def test_an_invalid_declared_notification_field_stops_before_any_task(
     assert "notification_channel" not in state.value["resources"], (
         "a refused contract must not leave a routing behind"
     )
+
+
+# --- what the command's administrator address is for ---------------------------
+
+
+def test_admin_email_help_says_what_the_address_is_used_for(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The address is the SNS subscription (AMP alerts, and the control plane's
+    own notifications on the default channel), ``spec.notifications.adminEmail``
+    and the Grafana ADMIN lookup. SES sends from ``emailSender``: the address is
+    the SES sender and recipient only where the site declares none."""
+
+    with pytest.raises(SystemExit, match="0"):
+        admin_cli.parser().parse_args(["deploy", "--help"])
+    help_text = " ".join(capsys.readouterr().out.split())
+    start = help_text.index("--admin-email EMAIL", help_text.index("options:"))
+    entry = help_text[start : help_text.index("--rollback", start)]
+
+    assert "SES fault notifications" not in entry, entry
+    for phrase in (
+        "SNS",
+        "spec.notifications.adminEmail",
+        "Grafana ADMIN",
+        "emailSender",
+        "required on the first deploy",
+    ):
+        assert phrase in entry, f"--admin-email help does not mention {phrase}: {entry}"
