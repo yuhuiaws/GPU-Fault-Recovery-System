@@ -29,6 +29,7 @@
       "src/gpu_fault/admin/capacity_evidence.py",
       "src/gpu_fault/admin/config.py",
       "src/gpu_fault/admin/config_parser.py",
+      "src/gpu_fault/admin/config_roles.py",
       "src/gpu_fault/admin/python_environment.py",
       "src/gpu_fault/admin/operation_lock.py",
       "src/gpu_fault/admin/site.py",

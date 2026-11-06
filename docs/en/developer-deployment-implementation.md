@@ -211,7 +211,9 @@ spool switch/replica consistency and the PostgreSQL fleet connection budget, and
 The publisher reuses the current signed images and wheels and invokes the same role-split renderer in a temporary directory, without modifying the checked-in
 default generated artifacts. The global digest goes into release state and Deployment metadata, the per-role digests go into the Pod
 template; a CPU configuration-only change is classified as `CONTROL_PLANE_ONLY`, executes no schema, GPU, Node Runtime,
-Profile or cluster registry revision, and rolls only the affected CPU roles by digest. Release delivery additionally
+Profile or cluster registry revision, and rolls only the affected CPU roles by digest (each role digest holds exactly the
+entries that role reads; the reader table is `gpu_fault.admin.config_roles`, and
+`tests/admin/test_admin_config_role_readers.py` checks it field by field against the role-split renderer). Release delivery additionally
 maintains separate ingress, worker and spool Manifest digests; when a role Manifest changes alone, only that role is rendered/applied and
 waited for, while changes to shared CPU inputs, the Control Plane wheel or pins still conservatively roll all CPU roles.
 The baseline also reads the `GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION` actually loaded by one Running api-ha Pod

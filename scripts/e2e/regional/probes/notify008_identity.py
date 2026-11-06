@@ -25,6 +25,7 @@ SHARED_ADMIN_FILES = frozenset(
         "capacity_evidence.py",
         "config.py",
         "config_parser.py",
+        "config_roles.py",
         "operation_lock.py",
         "python_environment.py",
         "site.py",

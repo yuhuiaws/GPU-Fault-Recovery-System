@@ -46,6 +46,12 @@ from gpu_fault.admin.config_parser import (
     read_section,
     snake_section,
 )
+from gpu_fault.admin.config_roles import (
+    ADMIN_CONFIG_ROLES,
+    earlier_role_inputs,
+    role_entries,
+    role_inputs,
+)
 from gpu_fault.admin.operation_lock import SiteOperationBusy, site_operation_lock
 from gpu_fault.digests import SHA256_PATTERN
 from gpu_fault.postgres_capacity import PostgresPoolCapacity, flush_slots_per_process
@@ -60,7 +66,6 @@ ADMIN_CONFIG_PENDING = ADMIN_CONFIG_ROOT / "pending.json"
 ADMIN_CONFIG_HISTORY = ADMIN_CONFIG_ROOT / "history"
 APPROVAL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{2,127}$")
 HISTORY_ID_PATTERN = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{64}$")
-ADMIN_CONFIG_ROLES = ("ingress", "worker", "spool")
 # The ingress tier as the regional manifests ship it: three api-ha replicas,
 # each running ``uvicorn --workers 4``. The site-wide admission flush caps of
 # ``ProcessorConfig`` are shared by these processes (each takes
@@ -643,35 +648,9 @@ class AdminConfig(_Section):
         return canonical_sha256(self.as_dict())
 
     def role_payload(self, role: str, *, node_counts: bool = True) -> dict[str, object]:
-        common: dict[str, object] = {
-            "processor": self.processor.as_dict(),
-            "workflow": self.workflow.as_dict(),
-            "notification_delivery": self.notification_delivery.as_dict(),
-            "evidence": self.evidence.as_dict(),
-        }
-        # The fault reserve derived from the node counts is rendered into
-        # every role, so a node count change has to move every role digest.
-        # ``node_counts=False`` reproduces the digests a release before the
-        # node counts recorded, for verifying such a persisted state.
-        if node_counts:
-            common.update(self.capacity.node_counts())
-        if role == "ingress":
-            return {
-                **common,
-                "telemetry_spool_enabled": (self.capacity.telemetry_spool.enabled),
-            }
-        if role == "worker":
-            return {
-                **common,
-                "control_worker_replicas": (self.capacity.control_worker_replicas),
-                "remediation": self.capacity.remediation.as_dict(),
-            }
-        if role == "spool":
-            return {
-                **common,
-                "telemetry_spool": self.capacity.telemetry_spool.as_dict(),
-            }
-        raise AdminConfigError(f"unknown control-plane role: {role}")
+        """What ``role`` reads of this config (``config_roles``): its digest."""
+
+        return role_inputs(role_entries(self, node_counts=node_counts), role)
 
     def role_sha256(self, *, node_counts: bool = True) -> dict[str, str]:
         return {
@@ -814,7 +793,10 @@ def _stored_config_sha256(
 def _stored_role_sha256(
     raw_config: Mapping[str, object],
     config: AdminConfig,
-) -> dict[str, str]:
+) -> list[dict[str, str]]:
+    """The role digests a record of ``config`` may carry: today's, or those
+    of the releases that digested the spool depth for the spool worker."""
+
     # The first release digested capacity-only role payloads with no common
     # section at all.
     if set(raw_config) == {"schema_version", "capacity"}:
@@ -827,8 +809,12 @@ def _stored_role_sha256(
             },
             "spool": capacity.telemetry_spool.as_dict(),
         }
-        return {role: canonical_sha256(payload) for role, payload in payloads.items()}
-    return config.role_sha256(node_counts=not _missing_node_counts(raw_config))
+        return [{role: canonical_sha256(item) for role, item in payloads.items()}]
+    entries = role_entries(config, node_counts=not _missing_node_counts(raw_config))
+    return [
+        {role: canonical_sha256(build(entries, role)) for role in ADMIN_CONFIG_ROLES}
+        for build in (role_inputs, earlier_role_inputs)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -946,9 +932,13 @@ def load_desired_admin_config(
     config = AdminConfig.from_mapping(raw_config)
     if record.get("config_sha256") != _stored_config_sha256(raw_config, config):
         raise AdminConfigError("desired admin config digest does not match its content")
-    if record.get("role_sha256") != _stored_role_sha256(raw_config, config):
+    if record.get("role_sha256") not in _stored_role_sha256(raw_config, config):
         raise AdminConfigError("desired admin config role digests do not match")
-    legacy = "aurora" not in raw_config or _missing_node_counts(raw_config)
+    legacy = (
+        "aurora" not in raw_config
+        or _missing_node_counts(raw_config)
+        or record.get("role_sha256") != config.role_sha256()
+    )
     if migrate_legacy and legacy:
         source = record.get("source")
         migration_source = (

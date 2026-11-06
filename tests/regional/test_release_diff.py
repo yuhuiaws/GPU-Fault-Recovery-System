@@ -5,6 +5,7 @@ import pytest
 import yaml
 
 from gpu_fault.admin.config import default_admin_config
+from gpu_fault.admin.config_patch import apply_patch
 from gpu_fault_release import regional_release_config as CONFIG
 from gpu_fault_release import regional_release_diff as DIFF
 from gpu_fault_release import regional_release_node_scope as SCOPE
@@ -463,6 +464,30 @@ def test_admin_config_change_is_control_plane_only_and_skips_registry() -> None:
         DIFF.ReleaseComponent.VERIFY,
     )
     assert DIFF.control_plane_role_targets(diff) == ("worker",)
+
+
+def test_a_spool_depth_change_targets_the_ingress_that_reads_it() -> None:
+    """The renderer writes telemetrySpool.maxClusterDepth into the api-ha
+    ConfigMap only: a release that changes nothing else must re-apply and roll
+    the ingress, or its spool admission keeps the old depth."""
+
+    recorded = default_admin_config()
+    desired = apply_patch(
+        recorded, {"capacity": {"telemetrySpool": {"maxClusterDepth": 4096}}}
+    )
+    release = _release()
+    release.admin_config_role_digests = desired.role_sha256()
+    state = _state()
+    state["admin_config_role_sha256"] = recorded.role_sha256()
+
+    diff = DIFF.classify_release(release, state)
+
+    assert diff.kind is DIFF.ReleaseChangeKind.CONTROL_PLANE_ONLY, (
+        "a depth change is a control-plane-only config release"
+    )
+    assert DIFF.control_plane_role_targets(diff) == ("ingress",), (
+        f"the depth's reader must be selected, the release selected {diff.changed}"
+    )
 
 
 def test_component_dependency_closures_are_runtime_specific() -> None:

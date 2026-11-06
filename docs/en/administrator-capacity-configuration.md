@@ -300,7 +300,9 @@ the Aurora fields they are kept at the historical `0.5/8`, so a software upgrade
 lacks node counts, the topology is inferred from its own declared single-cluster queue depth (`min(512, depth / 4)`; the historical
 `1024` means 256 nodes, and the managed node count takes the same value), so a cluster that depth cannot hold is not read in at the new default 512. An old
 record with unknown structure, modified content or any digest mismatch still fails closed. `--dry-run` only reads and does not
-complete.
+complete. When the per-cluster spool depth is off its default, earlier releases digested it into the spool-worker role digest
+(not into the digest of the ingress that reads it); such a record verifies against those earlier role digests and is
+re-digested with the current readers inside the same site operation lock, its content unchanged.
 
 Reading persisted or online-captured state performs only structural validation without applying the empirical floors of §5: an old site below the floors is
 a fact, and refusing to read would only prevent the administrator from loading the state to plan a fix. Every entry point that generates a new desired (file,
@@ -762,16 +764,17 @@ The configuration digest is independent of the code release ID, image digest and
   instances' actual ACU landed;
 - Runs no schema, GPU data-plane, Node Runtime or Runtime Profile phase;
 - Publishes no cluster registry revision;
-- The three role digests decide which roles roll (`AdminConfig.role_payload`): a worker replica change rolls only the
-  control-worker (the remediation section has no field left to change); a node count change changes the fault reserved
-  depth shared by the three roles, and therefore rolls all three CPU roles; the `processor`, `workflow`
-  (`departedNodeCleanup` included), `notificationDelivery` and `evidence` sections are in every role's digest, so changing
-  them rolls all three CPU roles as well; the spool switch is in the ingress and spool-worker digests, the spool-worker
-  replica count in the spool-worker digest alone; an Aurora-only or `cpuControlPlane`-only change rolls no role.
-  `telemetrySpool.maxClusterDepth` is in the spool-worker digest only, while the ingress's spool admission is what reads
-  it (the renderer writes `GPU_FAULT_TELEMETRY_SPOOL_MAX_CLUSTER_DEPTH` into the api-ha ConfigMap only): changed alone,
-  the release selects only the spool-worker, the api-ha ConfigMap is not re-applied and its Pods do not roll, and the new
-  depth takes effect only with a later release that selects the ingress;
+- The three role digests decide which roles roll (`AdminConfig.role_payload`): each role's digest holds exactly the
+  entries that role reads, and the readers are declared in one place, `gpu_fault.admin.config_roles` (a role reads a field
+  when the renderer writes it into that role's environment), so a change rolls every role that reads it and no other. A
+  worker replica change rolls only the control-worker (the remediation section has no field left to change); a node count
+  change changes the fault reserved depth shared by the three roles, and therefore rolls all three CPU roles; the
+  `processor`, `workflow` (`departedNodeCleanup` included), `notificationDelivery` and `evidence` sections are in every
+  role's digest, so changing them rolls all three CPU roles as well; the spool switch is in the ingress and spool-worker
+  digests, the spool-worker replica count in the spool-worker digest alone; `telemetrySpool.maxClusterDepth` is read only
+  by the ingress's spool admission (the renderer writes `GPU_FAULT_TELEMETRY_SPOOL_MAX_CLUSTER_DEPTH` into the api-ha
+  ConfigMap only), so it is in the ingress digest alone, and a release that changes only the depth re-applies the api-ha
+  ConfigMap and rolls only the ingress; an Aurora-only or `cpuControlPlane`-only change rolls no role;
 - The roles roll one at a time, each waiting for its own rollout, in the order ingress -> control-worker ->
   spool-worker (ingress's surge Pod needs a free slot on some node, which the consumer tier's added replicas would
   take; the preflight decides the deletion order of ingress's old Pods and writes it as `pod-deletion-cost`, and an
