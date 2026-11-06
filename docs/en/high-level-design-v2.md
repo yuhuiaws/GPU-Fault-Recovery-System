@@ -619,7 +619,7 @@ The proposal requires "checking active processes and device occupancy before ope
 not a single condition inside an action:
 
 - `VERIFY_NO_GPU_CLIENTS`: re-checks compute clients and device file holders.
-  This is the **only** operation allowed on the node side **by default**.
+  This is the **only** operation the node side's bare application default allows (the installer writes a base list on top, see §1.4).
 - `QUIESCE_GPU_SERVICES` / `RESTORE_GPU_SERVICES`: stop/start the local GPU services as a pair before and after a reset; a per-GPU reset's window keeps Fabric Manager running (stopping it loses the NVLink fabric state).
 - GPU reset is **off by default**, and occupancy is checked once more before execution (check at submission + re-check before execution).
 - The warm spare side checks the same way: "active gpu resource pods exist" / "active gpu clients"
