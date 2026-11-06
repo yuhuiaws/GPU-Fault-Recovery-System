@@ -17,11 +17,11 @@ from gpu_fault.admin.bootstrap_services import (
 )
 from gpu_fault.admin.notifications import (
     NotificationRouting,
+    declared_site_notifications,
     ensure_email_notifications,
     resolve_admin_email,
-    resolve_notification_routing,
+    site_notification_routing,
 )
-from gpu_fault.admin.site import site_notification_channel
 
 
 def notification_routing(
@@ -31,13 +31,16 @@ def notification_routing(
     state: BootstrapState,
     existing_site: Mapping[str, Any] | None = None,
 ) -> tuple[str, NotificationRouting]:
-    """The administrator address and the channel it is reached over.
+    """The administrator address and the routing the existing site declares.
 
     The channel is the existing site's (``spec.notifications.channel``, or
     ``ses`` for a site written before the field existed and still carrying an
     ``emailSender``); a new site gets ``sns``. Flipping a live site is an edit
     of that one field followed by a ``deploy`` rerun, never a side effect of
-    the rerun itself.
+    the rerun itself. The sender, recipients and subject prefix are the site's
+    too (``site_notification_routing``): the role, the SES identity and the
+    Secret these tasks converge must match the block the regenerated site
+    keeps (``preserve_existing_site_contract``).
     """
 
     admin_email, source = resolve_admin_email(
@@ -45,9 +48,8 @@ def notification_routing(
         account_id=cpu.account_id,
         configured=request.alert_email,
     )
-    routing = resolve_notification_routing(
-        admin_email=admin_email,
-        channel=site_notification_channel(existing_site),
+    routing = site_notification_routing(
+        declared_site_notifications(existing_site), admin_email=admin_email
     )
     state.record("admin_email_source", source)
     state.record("notification_channel", routing.channel)

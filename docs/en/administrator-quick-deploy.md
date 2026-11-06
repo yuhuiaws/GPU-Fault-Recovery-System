@@ -86,7 +86,7 @@ Administrators do not create or pass in that file by hand and change only the fi
 | `spec.runtimeProfile` | Editable template, immutable source snapshot, automatic version and stable registration anchor |
 | `spec.nlb` | NLB name, public subnets, Security Group, ACM certificate ARN |
 | `spec.health` | Aurora, AMP, SNS and health thresholds |
-| `spec.notifications` | Notification channel (`channel: sns` default / `ses`), administrator email, Subject prefix and external alert acknowledgement; `ses` additionally has sender, recipient list and the optional `sesConfigurationSet` (a deploy regenerating the site keeps only `channel`; sender/recipient are the administrator email) |
+| `spec.notifications` | Notification channel (`channel: sns` default / `ses`), administrator email, Subject prefix and external alert acknowledgement; `ses` additionally has sender, recipient list and the optional `sesConfigurationSet` (a deploy regenerating the site keeps every declared field; an undeclared sender/recipient is the administrator email) |
 | `spec.clusters[]` | Per-cluster unique ID, context, EKS ARN, HyperPod name, IRSA, namespace allowlist, GPU node subnets `agentEndpointAllowedCidrs` |
 | Administrator configuration | The normalised non-sensitive configuration, `config_sha256` and the three role digests in `state-dir/admin-config/desired.json` |
 | Credential references | Per-cluster token files, CA file and the controlled fleet master file |

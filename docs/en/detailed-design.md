@@ -3062,6 +3062,9 @@ when no channel is available, the notification is persisted and recorded as unde
 
 SES routing separates the site contact, sender and recipient lists: `adminEmail` is still used for SNS operations alerts,
 `emailSender` must correspond to a verified identity, and `emailRecipients[]` allows multiple SES recipients.
+Every deploy that regenerates the site keeps the fields `spec.notifications` declares and defaults only the undeclared ones
+(`admin/notifications.py::site_notification_contract`); the control-plane role's SES grant, the SES identity and the
+`gpu-fault-email` Secret converge on the sender and recipients resolved from that block (`site_notification_routing`).
 The optional `spec.notifications.sesConfigurationSet` flows through the low-level `ses_configuration_set` and
 the shared `render_notification_config_maps` into each CPU role's
 `GPU_FAULT_SES_CONFIGURATION_SET`, and SES requests then carry `ConfigurationSetName`.

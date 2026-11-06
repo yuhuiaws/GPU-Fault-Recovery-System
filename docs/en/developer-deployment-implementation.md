@@ -634,8 +634,8 @@ Mail routing is declared by the site: `adminEmail`, `emailSender`, `emailRecipie
 `sesConfigurationSet` is the SES v2 configuration set name, rendered with the release config into the three roles'
 `…-config-notification` ConfigMap (`GPU_FAULT_SES_CONFIGURATION_SET`); when not declared it stays empty
 and does not change the notification digest of existing sites. The ARN-only
-entry point allows passing the sender and multiple recipients independently; only when an old site declares no recipient list does it fall back for compatibility to
-`adminEmail`.
+entry point takes only `--admin-email` on the command; the sender and recipient list the site declares are kept whenever deploy regenerates the site,
+and only when the site declares none does it fall back to `adminEmail`.
 
 The SES adapter uniformly adds site, Region, AWS account and cluster to the outgoing Subject and body, and does not require
 every fault template to maintain these fields again. Each Builder accepts only the current event, Incident, Workflow and node

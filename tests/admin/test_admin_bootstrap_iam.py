@@ -23,6 +23,7 @@ from gpu_fault.admin.bootstrap_common import (
     BootstrapError,
     ClusterIdentity,
 )
+from gpu_fault.admin.bootstrap_iam_policies import SES_SEND_EMAIL_RESOURCES_EVIDENCE
 from gpu_fault.admin.bootstrap_services import (
     amp_remote_write_policy_document,
     control_plane_policy_document,
@@ -920,3 +921,46 @@ def test_a_long_hyperpod_name_keeps_the_adot_writer_role_within_iam_limits(
     role_name = _role_name(create)
     assert len(role_name) <= 64, f"IAM role names are capped at 64: {role_name!r}"
     assert role_name.startswith("gpu-fault-site-a-hp-"), role_name
+
+
+OPERATIONS_MANUALS = (
+    "docs/部署和运维手册.md",
+    "docs/en/deployment-and-operations-manual.md",
+)
+
+
+def test_the_ses_grant_is_the_sender_identity_and_the_manuals_cite_the_set_resource() -> (
+    None
+):
+    """Security reference 5.1: a declared SES configuration set does not widen
+    the role. The AWS Service Authorization Reference gives SendEmail the
+    resource type ``configuration-set`` beside the required ``identity*``, so
+    both operations manuals carry that evidence verbatim with the grant the
+    operator adds for a declared set."""
+
+    document = control_plane_policy_document(
+        region=REGION, account_id=ACCOUNT, email_sender="alerts@example.com"
+    )
+    (grant,) = [
+        item
+        for item in document["Statement"]
+        if item.get("Sid") == "AdministratorEmail"
+    ]
+    assert grant["Resource"] == (
+        f"arn:aws:ses:{REGION}:{ACCOUNT}:identity/alerts@example.com"
+    ), "bootstrap grants no configuration-set resource; the operator does"
+    evidence = SES_SEND_EMAIL_RESOURCES_EVIDENCE
+    needles = [
+        evidence["url"],
+        evidence["page"],
+        *evidence["sections"],
+        evidence["docs_date"],
+        evidence["fetched"],
+        *evidence["quotes"],
+    ]
+    root = Path(__file__).resolve().parents[2]
+    for manual in OPERATIONS_MANUALS:
+        text = " ".join((root / manual).read_text(encoding="utf-8").split())
+        for needle in needles:
+            assert needle in text, f"{manual} lacks {needle!r}"
+        assert ":configuration-set/<" in text, f"{manual} names no grant to add"

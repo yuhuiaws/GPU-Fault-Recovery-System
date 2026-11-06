@@ -198,8 +198,11 @@ def bind_bootstrap_inputs(
     control_plane_wheel_sha256 = (
         _manifest_wheel_sha256(root, manifest) if manifest is not None else None
     )
-    # Sender and recipient are the administrator address (see
-    # ``resolve_notification_routing``), so the address is the whole identity.
+    # Only the administrator address is bound here. The sender, recipients and
+    # prefix come from site.yaml (``site_notification_routing``); the two tasks
+    # that converge them, ``control_plane_role`` and ``email_notifications``,
+    # are never trusted from the checkpoint alone: on every run their read-only
+    # probes compare the role policy, the SES identity and the Secret with it.
     notification_identity = {"admin_email": request.alert_email}
     payload = {
         "schema_version": 1,

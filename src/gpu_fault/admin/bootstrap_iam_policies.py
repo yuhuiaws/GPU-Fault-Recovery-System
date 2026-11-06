@@ -15,7 +15,43 @@ from gpu_fault.admin.bootstrap_common import Arn, BootstrapError
 from gpu_fault.admin.site_s3 import archive_s3_prefix_arn
 from gpu_fault.cluster_scope import ClusterProvider
 
-__all__ = ["control_plane_policy_document", "executor_policy_document"]
+__all__ = [
+    "SES_SEND_EMAIL_RESOURCES_EVIDENCE",
+    "control_plane_policy_document",
+    "executor_policy_document",
+]
+
+#: Why the control plane's SES grant names the sender identity only, and what
+#: an operator who declares ``spec.notifications.sesConfigurationSet`` grants
+#: beside it. The SES v2 actions table gives SendEmail the resource types
+#: ``configuration-set`` and the required ``identity*``, and the resource-type
+#: table gives both ARN formats: a send through a configuration set names that
+#: ARN too. A declared configuration set does not widen this role (security
+#: reference 5.1), so the operations manual tells the operator to grant
+#: ``ses:SendEmail`` on it. The page prints no date; ``docs_date`` is its HTTP
+#: Last-Modified on the day it was fetched. Not live-verified: no site here
+#: sends through a configuration set.
+SES_SEND_EMAIL_RESOURCES_EVIDENCE: dict[str, Any] = {
+    "vendor": "AWS",
+    "url": (
+        "https://docs.aws.amazon.com/service-authorization/latest/reference/"
+        "list_sesv2.html"
+    ),
+    "page": "Actions, resources, and condition keys for Amazon Simple Email Service v2",
+    "sections": (
+        "Actions defined by Amazon Simple Email Service v2",
+        "Resource types defined by Amazon Simple Email Service v2",
+    ),
+    "docs_date": "Last-Modified 2026-11-06",
+    "fetched": "2026-11-06",
+    "quotes": (
+        "Grants permission to send an email message",
+        "Resource types (*required)",
+        "arn:${Partition}:ses:${Region}:${Account}:identity/${IdentityName}",
+        "arn:${Partition}:ses:${Region}:${Account}:configuration-set/"
+        "${ConfigurationSetName}",
+    ),
+}
 
 
 def control_plane_policy_document(
@@ -61,6 +97,8 @@ def control_plane_policy_document(
         },
     ]
     if email_sender:
+        # The sender identity only: a declared configuration set is granted by
+        # the operator, not here (``SES_SEND_EMAIL_RESOURCES_EVIDENCE``).
         statements.append(
             {
                 "Sid": "AdministratorEmail",

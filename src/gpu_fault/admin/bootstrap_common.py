@@ -273,9 +273,10 @@ class BootstrapRequest:
     gpu_cluster_arns: tuple[str, ...]
     repository_root: Path
     state_dir: Path
-    # SES sends from this address to this address; there is no separate sender,
-    # recipient list or subject prefix (the site.yaml fields the release engine
-    # reads are filled from it).
+    # The administrator address. There is no separate sender, recipient list or
+    # subject prefix on the command: an SES site sends from and to this address
+    # only where its site.yaml declares no emailSender/emailRecipients, and a
+    # declared field is kept (``notifications.site_notification_contract``).
     alert_email: str | None = None
     staging_only_release: bool = False
     impact_base: str = "origin/main"

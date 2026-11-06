@@ -22,6 +22,7 @@ from gpu_fault.admin.bootstrap_common import (
     CommandRunner,
     safe_name,
 )
+from gpu_fault.admin.notifications import site_notification_contract
 
 INITIAL_DEPLOY_TARGET = "initial_deploy_target"
 _TARGET_PROVIDER_FIELDS = ("eks_arn", "hyperpod_arn", "hyperpod_name")
@@ -590,6 +591,22 @@ def preserve_existing_site_contract(
         raise BootstrapError("existing site spec.diagnosticS3Uri must be a string")
     if declared_destination:
         generated_spec["diagnosticS3Uri"] = declared_destination
+    # ``notifications`` is the operator's contract: the administrator address,
+    # the SES sender and the recipient list are independent, and the subject
+    # prefix and SES configuration set are site settings. Rebuilt from the
+    # administrator address alone, the block would keep only ``channel`` and
+    # drop every custom field on each deploy. The generated block carries this
+    # run's administrator address (``--admin-email``, else the site's); the
+    # routing the notification tasks ran with came from the same contract.
+    generated_notifications = generated_spec.get("notifications")
+    if (
+        isinstance(generated_notifications, Mapping)
+        and existing_spec.get("notifications") is not None
+    ):
+        generated_spec["notifications"] = site_notification_contract(
+            existing_spec["notifications"],
+            admin_email=str(generated_notifications.get("adminEmail") or ""),
+        )
     existing_clusters = {
         item.get("clusterId"): item
         for item in existing_spec.get("clusters", [])

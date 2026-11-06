@@ -9258,13 +9258,14 @@ the channel, topic and configuration set are rendered by the same renderer into 
 `…-config-notification.yaml` ConfigMaps of the three CPU roles, and the sending switch `GPU_FAULT_ALLOW_EMAIL` into `…-config-core.yaml`.
 These values must not depend on environment variables inherited in the deployment shell.
 
-Before every release it actually applies, `gpu-fault-admin deploy` has bootstrap regenerate the whole `spec.notifications`: only the declared `channel`
-and the administrator address (`adminEmail`, or `--admin-email` on the command) carry over; it writes back `allowEmail: true`,
-`acknowledgeExternalAlertChannel: false` and an empty `emailSubjectPrefix`; with `channel: ses` both `emailSender` and the single
-`emailRecipients` entry are `adminEmail`, and `sesConfigurationSet` is not kept; the control-plane role's `ses:SendEmail` is granted on the
-`adminEmail` identity only. A hand-written custom sender, several recipients, a subject prefix or a configuration set therefore does not take
-effect through deploy; the release engine renders and checks these fields from the site it actually reads (the configuration-set rules below
-apply at that layer).
+Before every release it actually applies, `gpu-fault-admin deploy` has bootstrap regenerate the site, and every field that `spec.notifications`
+declares is kept as it is (`src/gpu_fault/admin/notifications.py::site_notification_contract`); only an undeclared field gets its default: the
+declared or implied `channel`, `allowEmail: true`, `acknowledgeExternalAlertChannel: false`, an empty `emailSubjectPrefix` and, with
+`channel: ses`, `adminEmail` as `emailSender` and as the single `emailRecipients` entry. `adminEmail` is `--admin-email` on the command, else the
+site's value; when the address changes, an `emailSender` or `emailRecipients` still equal to the old address (that default) follows it to the new
+one, and any other declared sender and recipients stay. The SES sending identity, the control-plane role's `ses:SendEmail` and the
+`gpu-fault-email` Secret all converge on this block. A declared field that is invalid (address format, an unknown key, a non-boolean
+`allowEmail` and so on) stops bootstrap before its first task, naming the field.
 
 `sesConfigurationSet` accepts 1 to 64 ASCII letters, digits, hyphens or underscores. Once declared it must already exist,
 with a matching name and `SendingOptions.SendingEnabled=true`; unknown or sending-disabled are both refused. deploy does not create that resource on your behalf,
@@ -9273,24 +9274,38 @@ notification digest is kept; rollback restores the actually captured old ConfigM
 The validation entry point is `src/gpu_fault_release/regional_notifications.py::check_notification_channel`.
 
 bootstrap grants the CPU Pod Identity role the least privilege of the selected channel: for SES an
-`ses:SendEmail` on the `adminEmail` identity restricted by `ses:FromAddress`, for SNS `sns:Publish` on the site topic. The SES preflight additionally needs
+`ses:SendEmail` on the `emailSender` identity restricted by `ses:FromAddress`, for SNS `sns:Publish` on the site topic. Declaring
+`sesConfigurationSet` does not widen that grant ([security and parameters reference §5.1](security-and-parameters-reference.md#51-mail-notification-boundaries)).
+The AWS Service Authorization Reference page "Actions, resources, and condition keys for Amazon Simple Email Service v2"
+(https://docs.aws.amazon.com/service-authorization/latest/reference/list_sesv2.html; the page prints no date, fetched 2026-11-06 with
+Last-Modified 2026-11-06) gives SendEmail ("Grants permission to send an email message") in its "Actions defined by Amazon Simple Email
+Service v2" table the "Resource types (*required)" `configuration-set` and the required `identity*`, and its "Resource types defined by
+Amazon Simple Email Service v2" table gives `arn:${Partition}:ses:${Region}:${Account}:identity/${IdentityName}` and
+`arn:${Partition}:ses:${Region}:${Account}:configuration-set/${ConfigurationSetName}`: a send through a configuration set names the
+latter as well. So before declaring one, grant the control-plane role `ses:SendEmail` on that configuration set
+(`arn:aws:ses:<region>:<account>:configuration-set/<name>`) yourself; bootstrap rewrites only its own inline policy
+`GPUFaultRegionalObserve` (the evidence is `SES_SEND_EMAIL_RESOURCES_EVIDENCE` in `src/gpu_fault/admin/bootstrap_iam_policies.py`).
+The SES preflight additionally needs
 `ses:GetEmailIdentity`, `ses:GetAccount` (and the right to create the identity when it does not exist); SNS sites need no SES identity.
 
-When SES is needed, change only `spec.notifications.channel` of the generated site to `ses`, not the identity, credentials, allowlist or release pins;
-deploy then regenerates the notification block as below (an SES site still has to confirm the SNS subscription the AMP alerts use):
+When SES is needed, change `spec.notifications.channel` of the generated site to `ses`, not the identity, credentials, allowlist or release pins;
+a custom sender, recipient list, subject prefix or configuration set goes into the same block, and an undeclared sender and recipients are
+written as `adminEmail` by deploy (an SES site still has to confirm the SNS subscription the AMP alerts use):
 
 ```yaml
 # <state-dir>/site.yaml
 spec:
   notifications:
-    channel: ses                      # the only field to edit by hand (was sns)
+    channel: ses                      # was sns
     allowEmail: true
     acknowledgeExternalAlertChannel: false
     adminEmail: admin@example.com
-    emailSender: admin@example.com    # deploy writes adminEmail
-    emailRecipients:
-      - admin@example.com             # deploy writes adminEmail
-    emailSubjectPrefix: ""
+    emailSender: gpu-alerts@example.com   # optional; deploy writes adminEmail when undeclared
+    emailRecipients:                      # optional; deploy writes [adminEmail] when undeclared
+      - admin1@example.com
+      - admin2@example.com
+    emailSubjectPrefix: "[PROD]"          # optional
+    # sesConfigurationSet: gpu-fault-alerts   # optional: SES v2 configuration set name, IAM prerequisite above
 ```
 
 First check the notification content with the preview API, then apply in the approved release window (while the SES identity is still awaiting email confirmation

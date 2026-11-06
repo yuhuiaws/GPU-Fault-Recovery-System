@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -17,6 +18,9 @@ from gpu_fault.admin.site import (
     NOTIFICATION_CHANNEL_SES,
     NOTIFICATION_CHANNEL_SNS,
     NOTIFICATION_CHANNELS,
+    NotificationSiteConfig,
+    SiteConfigError,
+    default_notification_channel,
 )
 
 EMAIL_PATTERN = re.compile(r"^[^\s@,]+@[^\s@,]+\.[^\s@,]+$")
@@ -30,8 +34,10 @@ class NotificationRouting:
     ``sns`` (the default for every site the CLI writes): the administrator
     address is the one confirmed subscription on the site topic; ``sender`` and
     ``recipients`` are carried for the record but no SES identity exists.
-    ``ses``: mail goes from the administrator address to the administrator
-    address through a verified SES identity, as before.
+    ``ses``: mail goes from ``sender`` to ``recipients`` through a verified SES
+    identity -- the site's ``emailSender``/``emailRecipients``, the
+    administrator address where the site declares none
+    (``site_notification_routing``).
     """
 
     sender: str
@@ -47,7 +53,9 @@ class NotificationRouting:
         """The ``spec.notifications`` block the generated site.yaml declares.
 
         Only the SES channel has a sender identity and a recipient list; the
-        SNS channel is the administrator's subscription on the site topic.
+        SNS channel is the administrator's subscription on the site topic. On
+        an existing site the fields it declares are merged over this block
+        (``preserve_existing_site_contract``).
         """
 
         addresses: dict[str, Any] = (
@@ -77,12 +85,12 @@ def resolve_notification_routing(
     admin_email: str,
     channel: str = NOTIFICATION_CHANNEL_SNS,
 ) -> NotificationRouting:
-    """One administrator address is the whole routing, on either channel.
+    """The routing of a site that declares nothing but its channel.
 
     There is no separate sender, recipient list or subject prefix on the
-    command; the ``site.yaml`` fields the release engine reads are filled from
-    this routing. The channel comes from the existing site (``sns`` for a new
-    one) so a routine upgrade never moves a live site's notifications.
+    command: the administrator address is sender and only recipient, with no
+    prefix. A site that declares those fields keeps them
+    (``site_notification_routing``).
     """
 
     if channel not in NOTIFICATION_CHANNELS:
@@ -96,6 +104,119 @@ def resolve_notification_routing(
         subject_prefix="",
         channel=channel,
     )
+
+
+def _declared_address(value: object) -> str | None:
+    return value.strip() if isinstance(value, str) else None
+
+
+def _declared_addresses(value: object) -> tuple[str, ...] | None:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return None
+    return tuple(dict.fromkeys(str(item).strip() for item in value))
+
+
+def _contract(
+    declared: object, *, admin_email: str
+) -> tuple[dict[str, Any], NotificationSiteConfig]:
+    admin = validate_admin_email(admin_email)
+    if declared is None:
+        block: dict[str, Any] = {}
+    elif isinstance(declared, Mapping):
+        block = dict(declared)
+    else:
+        raise BootstrapError("existing site spec.notifications must be a mapping")
+    channel = block.get("channel")
+    if channel is None:
+        channel = default_notification_channel(block)
+    elif isinstance(channel, str) and channel.strip() in NOTIFICATION_CHANNELS:
+        channel = channel.strip()
+    else:
+        # Falling back to the default here would write it and silently move a
+        # mistyped site to the other channel.
+        raise BootstrapError(
+            "existing site spec.notifications.channel must be one of "
+            + ", ".join(NOTIFICATION_CHANNELS)
+        )
+    contract: dict[str, Any] = {
+        "channel": channel,
+        "allowEmail": True,
+        "acknowledgeExternalAlertChannel": False,
+        "adminEmail": admin,
+        **(
+            {"emailSender": admin, "emailRecipients": [admin]}
+            if channel == NOTIFICATION_CHANNEL_SES
+            else {}
+        ),
+        "emailSubjectPrefix": "",
+    }
+    contract.update(
+        (key, deepcopy(value))
+        for key, value in block.items()
+        if key not in {"channel", "adminEmail"} and value is not None
+    )
+    previous = _declared_address(block.get("adminEmail"))
+    if previous and previous != admin:
+        if _declared_address(contract.get("emailSender")) == previous:
+            contract["emailSender"] = admin
+        if _declared_addresses(contract.get("emailRecipients")) == (previous,):
+            contract["emailRecipients"] = [admin]
+    try:
+        config = NotificationSiteConfig.from_value(contract)
+    except SiteConfigError as exc:
+        raise BootstrapError(f"existing site {exc}") from exc
+    return contract, config
+
+
+def site_notification_contract(declared: object, *, admin_email: str) -> dict[str, Any]:
+    """The ``spec.notifications`` block a deploy writes for a site.
+
+    ``declared`` is the existing site's block (``None`` for a site without
+    one). Every field it declares is the operator's and is kept; what it
+    leaves out is what bootstrap writes for a site that declares nothing: the
+    channel the block names or implies (``default_notification_channel``),
+    email allowed, no external alert channel acknowledged, no subject prefix
+    and, on ``ses``, the administrator address as sender and only recipient.
+    ``admin_email`` -- the command's ``--admin-email``, else the site's own
+    ``adminEmail`` -- replaces ``adminEmail``; a sender or recipient list that
+    is still the address it replaces is that derived default and follows it,
+    any other declared address stays: the three are independent (security
+    reference 5.1).
+
+    The block is checked as the site loader reads it, so a value the release
+    would refuse stops the bootstrap, naming the field, before its first task
+    rather than after it.
+    """
+
+    return _contract(declared, admin_email=admin_email)[0]
+
+
+def site_notification_routing(
+    declared: object, *, admin_email: str
+) -> NotificationRouting:
+    """The routing ``site_notification_contract`` declares.
+
+    The control-plane role's ``ses:SendEmail`` grant, the SES identity, the
+    ``gpu-fault-email`` Secret and the first-minute check act on it, so they
+    name the same sender and recipients the site file does -- normalised the
+    way the release engine reads them, which rewrites the same Secret.
+    """
+
+    _block, config = _contract(declared, admin_email=admin_email)
+    admin = str(config.admin_email)
+    return NotificationRouting(
+        sender=config.email_sender or admin,
+        recipients=config.email_recipients or (admin,),
+        subject_prefix=config.email_subject_prefix,
+        channel=config.channel,
+    )
+
+
+def declared_site_notifications(site: Mapping[str, Any] | None) -> object:
+    """``spec.notifications`` of a raw site document, ``None`` when it has none."""
+
+    spec = site.get("spec") if isinstance(site, Mapping) else None
+    return spec.get("notifications") if isinstance(spec, Mapping) else None
 
 
 def _optional_aws_json(

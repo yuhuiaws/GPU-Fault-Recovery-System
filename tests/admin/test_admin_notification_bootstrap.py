@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -14,11 +15,13 @@ from gpu_fault.admin.bootstrap_common import (
     BootstrapState,
     ClusterIdentity,
 )
+from gpu_fault.admin.bootstrap_site import finalize_bootstrap_site
 from gpu_fault.admin.notification_bootstrap import (
     notification_bootstrap_tasks,
     notification_routing,
 )
 from gpu_fault.admin.notifications import NotificationRouting
+from gpu_fault.admin.site import NotificationSiteConfig
 
 
 class Runner:
@@ -269,3 +272,220 @@ def test_sns_tasks_grant_publish_on_the_site_topic_and_no_ses(
     )
     assert calls["ensure_email_notifications"]["routing"].channel == "sns"
     assert calls["ensure_monitoring_resources"]["alert_email"] == "ops@example.com"
+
+
+# --- a deploy that regenerates site.yaml keeps the notification contract -------
+
+# What bootstrap writes for an SES site that declares nothing beyond the channel.
+SES_BLOCK: dict[str, Any] = {
+    "channel": "ses",
+    "allowEmail": True,
+    "acknowledgeExternalAlertChannel": False,
+    "adminEmail": "ops@example.com",
+    "emailSender": "ops@example.com",
+    "emailRecipients": ["ops@example.com"],
+    "emailSubjectPrefix": "",
+}
+
+
+def _regenerate(
+    tmp_path: Path, declared: dict[str, Any], *, alert_email: str = "ops@example.com"
+) -> tuple[NotificationRouting, dict[str, Any]]:
+    """One deploy's notification path over a site that declares ``declared``.
+
+    The routing is what the role, SES identity and Secret tasks run with; the
+    block is what the regenerated site.yaml says. ``_site_document`` writes
+    ``routing.site_notifications(admin_email)`` and ``finalize_bootstrap_site``
+    merges the existing site over it, exactly as here.
+    """
+
+    existing = {"spec": {"notifications": deepcopy(declared), "clusters": []}}
+    state = _state(tmp_path)
+    admin_email, routing = notification_routing(
+        Runner(), _cpu(), _request(tmp_path, alert_email=alert_email), state, existing
+    )
+    generated = {
+        "spec": {
+            "notifications": routing.site_notifications(admin_email),
+            "clusters": [],
+        }
+    }
+    written: list[dict[str, Any]] = []
+    finalize_bootstrap_site(
+        tmp_path / "site.yaml",
+        generated,
+        existing,
+        [],
+        state,
+        lambda _path, document: written.append(document),
+    )
+    return routing, written[0]["spec"]["notifications"]
+
+
+@pytest.mark.parametrize(
+    "custom",
+    [
+        {"emailSender": "alerts@example.com"},
+        {"emailRecipients": ["oncall@example.com", "ops@example.com"]},
+        {"emailSubjectPrefix": "[PROD]"},
+        {"sesConfigurationSet": "gpu-fault-alerts"},
+        {"acknowledgeExternalAlertChannel": True},
+        {"allowEmail": False, "acknowledgeExternalAlertChannel": True},
+    ],
+    ids=[
+        "sender",
+        "recipients",
+        "subject-prefix",
+        "configuration-set",
+        "external-channel",
+        "email-off",
+    ],
+)
+def test_a_regenerated_site_keeps_each_declared_notification_field(
+    tmp_path: Path, custom: dict[str, Any]
+) -> None:
+    """Security reference 5.1: sender, recipients and administrator address are
+    independent, and the subject prefix and configuration set are site
+    settings. A deploy used to rebuild the block from the administrator address
+    and keep only ``channel``, so none of these could take effect."""
+
+    declared = {**SES_BLOCK, **custom}
+
+    routing, written = _regenerate(tmp_path, declared)
+
+    assert written == declared, "the regenerated site.yaml lost a declared field"
+    config = NotificationSiteConfig.from_value(written)
+    assert routing == NotificationRouting(
+        sender=str(config.email_sender),
+        recipients=config.email_recipients,
+        subject_prefix=config.email_subject_prefix,
+        channel="ses",
+    ), "the notification tasks must act on the same contract the site declares"
+
+
+def test_a_generated_sns_site_regenerates_unchanged(tmp_path: Path) -> None:
+    """The default site's block -- what every first deploy writes -- comes back
+    field for field, so a deploy of such a site moves no notification setting."""
+
+    generated = NotificationRouting(
+        sender="ops@example.com", recipients=("ops@example.com",), subject_prefix=""
+    ).site_notifications("ops@example.com")
+
+    routing, written = _regenerate(tmp_path, generated)
+
+    assert list(written.items()) == list(generated.items()), (
+        "same fields, same values, same order"
+    )
+    assert routing == NotificationRouting(
+        sender="ops@example.com", recipients=("ops@example.com",), subject_prefix=""
+    )
+
+
+def test_an_sns_site_keeps_its_prefix_and_the_ses_fields_it_carries(
+    tmp_path: Path,
+) -> None:
+    """A site flipped back to ``channel: sns`` carries its SES sender and
+    recipients unused, so flipping it to ``ses`` again is one edit."""
+
+    declared = {
+        "channel": "sns",
+        "allowEmail": True,
+        "acknowledgeExternalAlertChannel": False,
+        "adminEmail": "ops@example.com",
+        "emailSender": "alerts@example.com",
+        "emailRecipients": ["oncall@example.com"],
+        "emailSubjectPrefix": "[PROD]",
+        "sesConfigurationSet": "gpu-fault-alerts",
+    }
+
+    routing, written = _regenerate(tmp_path, declared)
+
+    assert written == declared
+    assert routing.channel == "sns" and routing.uses_ses is False
+    assert routing.subject_prefix == "[PROD]", "the Secret carries the declared prefix"
+
+
+def test_the_command_admin_email_wins_and_moves_only_the_addresses_derived_from_it(
+    tmp_path: Path,
+) -> None:
+    """``--admin-email`` replaces ``adminEmail``. A sender or recipient list that
+    is still the address it replaces is what bootstrap derived from it and
+    follows it; an address the operator chose stays."""
+
+    derived = {**SES_BLOCK, "emailSubjectPrefix": "[PROD]"}
+    routing, written = _regenerate(tmp_path, derived, alert_email="new@example.com")
+
+    assert written == {
+        **derived,
+        "adminEmail": "new@example.com",
+        "emailSender": "new@example.com",
+        "emailRecipients": ["new@example.com"],
+    }
+    assert routing.sender == "new@example.com"
+    assert routing.recipients == ("new@example.com",)
+
+    chosen = {
+        **SES_BLOCK,
+        "emailSender": "alerts@example.com",
+        "emailRecipients": ["ops@example.com", "oncall@example.com"],
+    }
+    routing, written = _regenerate(tmp_path, chosen, alert_email="new@example.com")
+
+    assert written == {**chosen, "adminEmail": "new@example.com"}, (
+        "an operator-chosen sender or recipient list must survive a new admin email"
+    )
+    assert routing.sender == "alerts@example.com"
+    assert routing.recipients == ("ops@example.com", "oncall@example.com")
+
+
+def test_the_regenerated_ses_block_fills_only_what_the_site_leaves_out(
+    tmp_path: Path,
+) -> None:
+    """The documented switch is one edit -- ``channel: ses`` -- on the block an
+    SNS site was generated with; the sender and recipient it lacks are the
+    administrator address."""
+
+    sns_generated = {
+        "channel": "ses",
+        "allowEmail": True,
+        "acknowledgeExternalAlertChannel": False,
+        "adminEmail": "ops@example.com",
+        "emailSubjectPrefix": "[PROD]",
+    }
+
+    routing, written = _regenerate(tmp_path, sns_generated)
+
+    assert written == {
+        **sns_generated,
+        "emailSender": "ops@example.com",
+        "emailRecipients": ["ops@example.com"],
+    }
+    assert routing.sender == "ops@example.com" and routing.uses_ses
+
+
+@pytest.mark.parametrize(
+    ("custom", "message"),
+    [
+        ({"emailSender": "not-an-address"}, "emailSender must be a valid email"),
+        ({"emailSenders": ["a@example.com"]}, "unknown fields: emailSenders"),
+        ({"channel": "email"}, "channel must be one of"),
+        ({"allowEmail": "yes"}, "allowEmail must be a boolean"),
+        ({"emailSubjectPrefix": "x" * 65}, "emailSubjectPrefix must be a single line"),
+    ],
+)
+def test_an_invalid_declared_notification_field_stops_before_any_task(
+    tmp_path: Path, custom: dict[str, Any], message: str
+) -> None:
+    """Kept verbatim, a bad value would only be refused by the release after
+    the whole bootstrap ran; it stops the run before the first task instead,
+    where the generator used to drop it silently."""
+
+    state = _state(tmp_path)
+    existing = {"spec": {"notifications": {**SES_BLOCK, **custom}}}
+
+    with pytest.raises(BootstrapError, match=message):
+        notification_routing(Runner(), _cpu(), _request(tmp_path), state, existing)
+
+    assert "notification_channel" not in state.value["resources"], (
+        "a refused contract must not leave a routing behind"
+    )
