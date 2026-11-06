@@ -10984,7 +10984,8 @@ export GPU_FAULT_LOCAL_FILESYSTEM_DURATION_SECONDS=60
 | `GPU_FAULT_LOCAL_FILESYSTEM_DURATION_SECONDS` | 60 | Continuous high disk usage duration |
 
 Percentages allow `0..100`, durations at least 15 seconds. Regional sites write these values into the source Manifests,
-render them via the renderer into the role ConfigMaps (`regional/generated/gpu-fault-*-config-core.yaml`) and release them with the checked
+render them via the renderer into the role ConfigMaps (the memory thresholds and the notification cooldown in
+`regional/generated/gpu-fault-*-config-telemetry.yaml`, the rest in `-config-core.yaml`) and release them with the checked
 release; the values are validated during rendering and by the startup guard; do not override production values with the deployment shell environment:
 
 ```bash
@@ -10999,9 +11000,9 @@ Low CPU/GPU triggers only when the node is associated with an ACTIVE training jo
 the control plane resolves, so a job that takes over the node never inherits its predecessor's low time. Both rules grade
 only the GPUs that attempt's live containers on the node hold: for a job that holds part of a node, the unallocated GPUs and
 those of other workloads are never reported as idle. Which GPUs it holds comes from the GPU UUIDs the completion watcher
-reads for each container (the `gpu-fault.io/gpu-uuids` annotation, or, with `GPU_FAULT_DISCOVER_POD_GPU_UUIDS=true`,
-`nvidia-smi --query-gpu=uuid` run inside the running container, which needs `nvidia-smi` in the image and `pods/exec` for
-the watcher); without UUIDs, the attempt holds every GPU only when its declared `nvidia.com/gpu` covers the whole node,
+reads for each container (the `gpu-fault.io/gpu-uuids` annotation, or `nvidia-smi --query-gpu=uuid` the watcher runs
+inside the running container: `GPU_FAULT_DISCOVER_POD_GPU_UUIDS` is on by default, needs `nvidia-smi` in the image, and the
+watcher's `pods/exec` is granted only inside each allowed workload namespace); without UUIDs, the attempt holds every GPU only when its declared `nvidia.com/gpu` covers the whole node,
 otherwise those GPUs are not graded and, once the attempt has run for a whole window, the control-plane log shows one
 WARNING `low CPU/GPU utilisation cannot grade every GPU of attempt ...`; restore the UUID source it names.
 `LOW_CPU_UTILIZATION` reads the per-GPU `training_rank_cpu_percent`: the CPU used by the processes holding a compute context
@@ -11218,8 +11219,7 @@ operation lists along the result's `evidence_trimmed` ladder, whose floor (`skel
 `progress` and `raw_evidence` and drops everything else, and only a result whose skeleton alone is over the line becomes a
 `RESULT_SIZE_LIMIT` stand-in carrying `error` (size, budget, heaviest fields) and `ranks_summary` (pid, rank and status of the
 ranks it replaced); a step whose `node_failures` reads `ObservationIncomplete: RESULT_SIZE_LIMIT` while the node result is a bare
-`{"status":"RESULT_SIZE_LIMIT","ranks":[]}` comes from an Agent older than this fix (live HyperPod `fr_enabled`, eight ranks with
-the recorder on).
+`{"status":"RESULT_SIZE_LIMIT","ranks":[]}` comes from an Agent older than this fix.
 A triage or bundle step whose `node_failures` reads `ObservationIncomplete: WORKER_STILL_RUNNING` for a node with empty
 `node_results` means that node's single observation worker slot was held by the 30-second passive communication sample when the
 command arrived. An upgraded Agent waits for the slot (a share of its timeout, at most 10 s, inside the control plane's 30-second
@@ -11228,8 +11228,7 @@ per-node wait) and preempts the passive sample; a refusal after the whole wait i
 could not finish by its deadline now hands back a partial: `status=PARTIAL_TIMEOUT`/`PREEMPTED`, `collection_stage`, the ranks and
 dumps the triage read, or the bundle's `captures_done`/`captures_pending` and `elapsed_seconds`, with `evidence_complete=false` --
 read it as the evidence that was gathered, not an empty answer. A bare `WORKER_STILL_RUNNING` with no `slot_holder`/`slot_wait_seconds`
-is an Agent older than this fix (live HyperPod `fr_temporal_completion` 04:21Z refused both nodes; `fr_second_missing` 04:46Z failed
-the bundle on the shared node alone).
+is an Agent older than this fix.
 A triage the worker planned is sized to finish by the supervisor's deadline: the worker reads what is left of the deadline when it
 plans (the supervisor hands it the deadline, not the seconds left when it spawned the worker), so the start of the guard and the
 worker -- seconds on a node whose CPU a training job saturates -- shortens `triage_budget_seconds` instead of pushing the triage past
@@ -11335,15 +11334,13 @@ Rename-Item `
 tar -xf .\gpu-diagnostic-<bundle-key>.tar -C .\gpu-diagnostic
 ```
 
-When investigating an incomplete Windows download, first check the S3 object size and SHA-256. The verified
-`gpu-diagnostic-6912996569bf09eb8a735545.tar.gz` example should be `11594199` bytes,
-with SHA-256
-`0a213550331e315658e1f489603f6daea0391a72a7eced2a9a5bdfa1a311c399`:
+When investigating an incomplete Windows download, first compare the local file's size and SHA-256 with the S3 object
+size and with `size_bytes` and `sha256` in the `COLLECT_DIAGNOSTIC_BUNDLE` node result:
 
 ```powershell
-(Get-Item .\gpu-diagnostic-6912996569bf09eb8a735545.tar.gz).Length
+(Get-Item .\gpu-diagnostic-<bundle-key>.tar.gz).Length
 Get-FileHash `
-  .\gpu-diagnostic-6912996569bf09eb8a735545.tar.gz `
+  .\gpu-diagnostic-<bundle-key>.tar.gz `
   -Algorithm SHA256
 ```
 
@@ -11352,8 +11349,7 @@ extracted again as needed. Do not judge that a bundle is a hung bundle from the 
 `diagnostics/manifest.json`. A real hung-process diagnostic must contain
 `fault_context.diagnostic_reason=EFA_TRAFFIC_HUNG_SUSPECTED`, plus
 `python-stack-*-sample-NN.txt`, `proc-*-stack-sample-NN.txt` and
-`strace-*-sample-NN*`. The `691299...` example above is a base archive format validation bundle and contains no
-`py-spy/strace` process samples.
+`strace-*-sample-NN*`; a bundle with only the base archive content contains no `py-spy/strace` process samples.
 
 On each node, process state and command line are collected once only for the compute processes corresponding to the GPU UUIDs allocated to that attempt,
 and the repeated sampling above is run for `/proc/<pid>/stack`, `wchan` and time-limited `strace`. Check
