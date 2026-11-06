@@ -44,6 +44,7 @@ from gpu_fault.policy.nvlink74 import resolve_nvlink74
 from gpu_fault.policy.product_families import (
     ProductFamilyPolicyMixin,
     ProductFamilyResolver,
+    unplaced_sxid_product_reason,
 )
 from gpu_fault.policy.xid_cross_source import follow_report_twin, same_gpu
 
@@ -848,7 +849,7 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
                 ],
                 requires_operator=True,
             )
-        if event.product and family is None:
+        if family is None:  # missing, empty or unknown: never the Hopper path
             return _Resolution(
                 source=ActionSource.NVIDIA_FABRIC_MANAGER,
                 disposition=ActionDisposition.BLOCKED_MISSING_EVIDENCE,
@@ -857,7 +858,7 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
                 action=None,
                 containment=Containment.UNKNOWN,
                 reasons=[
-                    f"SXID applicability requires a recognized GPU generation; product {event.product} is unknown"
+                    unplaced_sxid_product_reason(event.product),
                 ],
                 requires_operator=True,
             )

@@ -449,9 +449,15 @@ has no trunk link; an ordinary `FATAL` with an explicit port may be completed to
 
 Fabric Manager SXID messages apply only to Hopper and earlier GPUs. The runtime uses the same product-family
 normalization: B100/B200/B300 fold into B100, GB200/GB300 fold into GB200; both
-Blackwell families return `NOT_APPLICABLE` and do not enter the SXID Catalog action. A product that is explicitly provided but
-whose generation cannot be recognized returns `BLOCKED_MISSING_EVIDENCE` and must not be guessed as Hopper. A missing product field
-is still handled along the compatibility path, but production collectors must report the real product.
+Blackwell families return `NOT_APPLICABLE` and do not enter the SXID Catalog action. A product the families place nowhere -- one
+explicitly provided whose generation cannot be recognized, and equally a missing, empty or blank product -- returns
+`BLOCKED_MISSING_EVIDENCE` (investigatory `VERIFY_GPU_PRODUCT_GENERATION`, safety quarantine) and is never guessed as Hopper. Before
+the gate, a missing, empty or blank product is filled from the node's fresh single-product GPU inventory of the event's boot
+(`_enrich_gpu_identity`, the same stand-in the XID gate gets), so only an SXID nothing can place is blocked. Evidence: Fabric
+Manager User Guide, "NVSwitch Errors On DGX B200/B300 and NVIDIA HGX B200/B300 Systems" (page "Last updated on Oct 07, 2026"),
+<https://docs.nvidia.com/datacenter/tesla/fabric-manager-user-guide/index.html#nvswitch-errors-on-dgx-b200-b300-and-nvidia-hgx-b200-b300-systems>:
+"NVSwitch SXID errors are no longer applicable to DGX B200/B300 and NVIDIA HGX B200/B300 systems." (`policy/product_families.py`,
+pinned by `tests/policy/test_policy_security.py`; unit-tested from the guide, not live-verified on B-series hardware).
 
 The SXID Catalog action mapping is as follows:
 

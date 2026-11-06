@@ -22,7 +22,8 @@ from gpu_fault.gpu_metrics import (
     GpuInventorySnapshot,
     GpuMetricSource,
 )
-from gpu_fault.policy import ActionDisposition
+from gpu_fault.models import RecoveryAction
+from gpu_fault.policy import ActionDisposition, SxidClassification, SxidEvent
 from gpu_fault.store import InMemoryStore
 from tests._builders import build_context
 from tests.orchestration.test_provider_correlation_arbitration import NOW, xid
@@ -117,3 +118,56 @@ def test_anything_less_than_a_fresh_same_boot_single_product_fails_closed(
     stored = service.context.store.get_xid_event("xid-unresolved")
     assert stored.product is None, why
     assert stored.gpu_identity_source == "NO_FRESH_GPU_INVENTORY", why
+
+
+def _productless_sxid(event_id: str, product: str | None) -> SxidEvent:
+    """A non-fatal SXID (IGNORE, monitor-only on a Hopper product)."""
+
+    return SxidEvent(
+        event_id=event_id,
+        cluster_id="cluster-a",
+        node_id="node-a",
+        observed_at=NOW + timedelta(seconds=1),
+        source_boot_id=BOOT,
+        sxid=22013,
+        classification=SxidClassification.NON_FATAL,
+        classification_source="NVIDIA_FABRIC_MANAGER_CATALOG",
+        product=product,
+        runtime_profile_version="simulated-v1",
+    )
+
+
+@pytest.mark.parametrize("missing", [None, "", "   "], ids=["none", "empty", "blank"])
+def test_an_empty_product_is_no_product_and_the_inventory_stands_in(
+    missing: str | None,
+) -> None:
+    """An empty or blank product names no hardware: the node's inventory stands
+    in for it as for ``None``, for an XID and an SXID alike."""
+
+    service = _service(_inventory())
+    decision = service.ingest_xid(
+        _productless_xid("xid-blank-product").model_copy(update={"product": missing})
+    )
+
+    assert decision.disposition is not ActionDisposition.NOT_APPLICABLE, decision
+    stored = service.context.store.get_xid_event("xid-blank-product")
+    assert (stored.product, stored.gpu_identity_source) == (
+        "H200",
+        "GPU_INVENTORY:gpu-inventory-node-a-1",
+    ), stored
+    sxid_decision = service.ingest_sxid(_productless_sxid("sxid-blank", missing))
+    assert sxid_decision.disposition is ActionDisposition.MONITOR_ONLY, sxid_decision
+
+
+@pytest.mark.parametrize("missing", [None, "", "   "], ids=["none", "empty", "blank"])
+def test_an_sxid_no_inventory_can_place_fails_closed(missing: str | None) -> None:
+    """Without a fresh single-product inventory the SXID family gate blocks:
+    a missing product never takes the Hopper path (the SXID twin of the XID
+    gate's "not applicable to product UNKNOWN")."""
+
+    service = _service(None)
+    decision = service.ingest_sxid(_productless_sxid("sxid-unplaced", missing))
+
+    assert decision.disposition is ActionDisposition.BLOCKED_MISSING_EVIDENCE
+    assert decision.investigatory_action == "VERIFY_GPU_PRODUCT_GENERATION"
+    assert decision.safety_action is RecoveryAction.QUARANTINE, decision

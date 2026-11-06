@@ -276,6 +276,7 @@ def test_fatal_access_sxid_requires_participating_gpu_reset() -> None:
             link_scope=SxidLinkScope.ACCESS,
             link_scope_source="TRUSTED_NVSWITCH_TOPOLOGY",
             participating_gpu_uuids=["GPU-a", "GPU-b"],
+            product="H200",
         )
     )
 
@@ -296,6 +297,7 @@ def test_fatal_trunk_sxid_is_not_mapped_to_single_gpu_reset() -> None:
             link_scope_source="TRUSTED_NVSWITCH_TOPOLOGY",
             fabric_partition="fabric-a",
             participating_gpu_uuids=["GPU-a", "GPU-b"],
+            product="A100",
         )
     )
 
@@ -319,6 +321,7 @@ def test_fatal_trunk_sxid_requires_complete_fabric_scope() -> None:
             link_scope=SxidLinkScope.TRUNK,
             link_scope_source="TRUSTED_NVSWITCH_TOPOLOGY",
             fabric_partition="fabric-a",
+            product="A100",
         )
     )
 
@@ -410,6 +413,7 @@ def test_sxid_20001_fatal_conflict_fails_closed() -> None:
             link_scope_source="TRUSTED_NVSWITCH_TOPOLOGY",
             fabric_partition="fabric-a",
             participating_gpu_uuids=["GPU-a", "GPU-b"],
+            product="A100",
         )
     )
 
@@ -468,6 +472,7 @@ def test_code_specific_sxid_requires_full_fabric_reset(code: int) -> None:
             "NVIDIA_FABRIC_MANAGER_CATALOG",
             fabric_partition="fabric-a",
             participating_gpu_uuids=["GPU-a", "GPU-b"],
+            product="H200",
         )
     )
 
@@ -505,6 +510,7 @@ def test_sxid_raw_link_scope_cannot_authorize_reset() -> None:
             link_scope_source="RAW_MESSAGE",
             fabric_partition="fabric-a",
             participating_gpu_uuids=["GPU-a", "GPU-b"],
+            product="H200",
         )
     )
 
@@ -530,6 +536,7 @@ def test_code_specific_investigatory_actions(
             code,
             SxidClassification.NON_FATAL,
             "NVIDIA_FABRIC_MANAGER_CATALOG",
+            product="H200",
         )
     )
 

@@ -438,7 +438,12 @@ the artifact `src/gpu_fault/data/nvidia-fabric-manager-sxid-2025-11-14.yaml` pin
   no cordon, no stop).
 - The Blackwell families (B100/GB200 product families: B200/B300, GB200/GB300): the traditional SXIDs do not apply,
   `NOT_APPLICABLE` (investigatory `USE_DCGM_NVSDM_TELEMETRY`) + `safety_action=QUARANTINE` (this system's fail-closed choice);
-  a product in no known family is `BLOCKED_MISSING_EVIDENCE` (`VERIFY_GPU_PRODUCT_GENERATION`).
+  a product in no known family -- unknown, or missing, empty or blank once the node's fresh GPU inventory could not stand
+  in -- is `BLOCKED_MISSING_EVIDENCE` (`VERIFY_GPU_PRODUCT_GENERATION`), never the Hopper path. Evidence: Fabric Manager
+  User Guide, "NVSwitch Errors On DGX B200/B300 and NVIDIA HGX B200/B300 Systems" (page "Last updated on Oct 07, 2026"),
+  `https://docs.nvidia.com/datacenter/tesla/fabric-manager-user-guide/index.html#nvswitch-errors-on-dgx-b200-b300-and-nvidia-hgx-b200-b300-systems`:
+  "NVSwitch SXID errors are no longer applicable to DGX B200/B300 and NVIDIA HGX B200/B300 systems." (unit-tested from
+  the guide, not live-verified: no B-series hardware).
 
 The SXID `classification_source` must be `NVIDIA_FABRIC_MANAGER` (or `NVIDIA_FABRIC_MANAGER_CATALOG`,
 `NVIDIA_FABRIC_MANAGER_RUNTIME`); otherwise it blocks because the evidence source is untrusted, and so does a

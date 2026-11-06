@@ -9,6 +9,30 @@ from gpu_fault.policy.models import CatalogProductFamily
 
 LOGGER = logging.getLogger(__name__)
 
+#: NVIDIA Fabric Manager User Guide, "Runtime NVSwitch and GPU Errors" >
+#: "NVSwitch Errors On DGX B200/B300 and NVIDIA HGX B200/B300 Systems" (page
+#: "Last updated on Oct 07, 2026"), verbatim: Blackwell reports no SXIDs, so the
+#: SXID gate (``GpuFaultPolicyEngine._resolve_sxid_product``) answers the
+#: B100/GB200 families NOT_APPLICABLE -- and a product it can place in no family,
+#: missing, empty or unknown, BLOCKED: never the Hopper path by default.
+NVIDIA_FM_BLACKWELL_SXID_REFERENCE = (
+    "https://docs.nvidia.com/datacenter/tesla/fabric-manager-user-guide/"
+    "index.html#nvswitch-errors-on-dgx-b200-b300-and-nvidia-hgx-b200-b300-systems"
+)
+NVIDIA_FM_BLACKWELL_SXID_QUOTE = (
+    "NVSwitch SXID errors are no longer applicable to DGX B200/B300 and NVIDIA "
+    "HGX B200/B300 systems."
+)
+
+
+def unplaced_sxid_product_reason(product: str | None) -> str:
+    """Why an SXID whose product is in no catalog family is blocked."""
+
+    named = (product or "").strip()
+    return "SXID applicability requires a recognized GPU generation; " + (
+        f"product {product} is unknown" if named else "the event names no GPU product"
+    )
+
 
 def catalog_product_family(
     product: str | None,

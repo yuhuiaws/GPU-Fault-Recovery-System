@@ -1190,6 +1190,18 @@ need NVSDM and the exporter's ConnectX entities. BER (1215-1218) and the FEC
 history (1404-1419) are not graded (DCGM 4.7.0 removed its BER thresholds). B-series
 nodes should run the DCGM host engine 4.7.0 or later (deployment manual).
 
+The SXID family gate is unit-tested from the same guide, not live-verified (no
+B-series hardware): an SXID on a B100/GB200-family product (B200/B300 and
+GB200/GB300, in the driver's spelling such as `NVIDIA B300 SXM6 AC`) is
+NOT_APPLICABLE (`USE_DCGM_NVSDM_TELEMETRY`) with the safety quarantine
+("NVSwitch SXID errors are no longer applicable to DGX B200/B300 and NVIDIA HGX
+B200/B300 systems.", section "NVSwitch Errors On DGX B200/B300 and NVIDIA HGX
+B200/B300 Systems"), and one whose product no family places -- unknown, or
+missing, empty or blank once the node's fresh GPU inventory could not stand in
+-- is BLOCKED_MISSING_EVIDENCE (`VERIFY_GPU_PRODUCT_GENERATION`), never the
+Hopper path (`tests/policy/test_policy_security.py`,
+`tests/app_services/test_xid_product_from_inventory.py`).
+
 ## GF-GENERAL-LIVE live acceptance runner (phase 1)
 
 The generic `scripts/e2e/regional/run_general_live.py` runner and its

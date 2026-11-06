@@ -399,7 +399,12 @@ SXID 恢复依据 Fabric Manager User Guide（`https://docs.nvidia.com/datacente
   `safety_action=QUARANTINE`（隔离是本系统的 fail-closed 选择）；`CHECK_MECHANICALS`（20012）：`ESCALATE_OPERATOR`，编译为 FREEZE_EVIDENCE → CHECK_MECHANICALS（通知并等待人工确认，不 cordon、不停任务）。
 - Blackwell 系列（B100/GB200 产品系列，含 B200/B300、GB200/GB300）：传统 SXID 不适用，判 `NOT_APPLICABLE`（investigatory
   `USE_DCGM_NVSDM_TELEMETRY`）+ `safety_action=QUARANTINE`（本系统的 fail-closed 选择）；产品不属于任何已知系列时
-  `BLOCKED_MISSING_EVIDENCE`（`VERIFY_GPU_PRODUCT_GENERATION`）。
+  `BLOCKED_MISSING_EVIDENCE`（`VERIFY_GPU_PRODUCT_GENERATION`）——缺失、空或空白且节点新鲜 GPU inventory 无法补全的
+  产品同样如此，绝不走 Hopper 路径。依据：Fabric Manager User Guide，"NVSwitch Errors On DGX B200/B300 and NVIDIA HGX
+  B200/B300 Systems"（页面 "Last updated on Oct 07, 2026"），
+  `https://docs.nvidia.com/datacenter/tesla/fabric-manager-user-guide/index.html#nvswitch-errors-on-dgx-b200-b300-and-nvidia-hgx-b200-b300-systems`：
+  "NVSwitch SXID errors are no longer applicable to DGX B200/B300 and NVIDIA HGX B200/B300 systems."（依 NVIDIA 文档做单元
+  测试，未真机验证：没有 B 系列硬件）。
 
 SXID 的 `classification_source` 必须是 `NVIDIA_FABRIC_MANAGER`（或 `NVIDIA_FABRIC_MANAGER_CATALOG`、
 `NVIDIA_FABRIC_MANAGER_RUNTIME`），否则因证据来源不可信而阻塞；事件观察到的 fatal/non-fatal 与钉死表冲突时同样阻塞。

@@ -16,6 +16,10 @@ from gpu_fault.policy import (
     SxidClassification,
     SxidLinkScope,
 )
+from gpu_fault.policy.product_families import (
+    NVIDIA_FM_BLACKWELL_SXID_QUOTE,
+    NVIDIA_FM_BLACKWELL_SXID_REFERENCE,
+)
 from tests._builders import build_sxid_event
 from tests.policy._support import NOW
 
@@ -35,6 +39,7 @@ def _fatal_trunk_sxid(code: int, classification_source: str):
         link_scope_source="TRUSTED_NVSWITCH_TOPOLOGY",
         fabric_partition="fabric-a",
         participating_gpu_uuids=["GPU-a", "GPU-b"],
+        product="H200",
     )
 
 
@@ -84,6 +89,7 @@ def test_unknown_fatal_sxid_with_unknown_scope_still_fails_on_the_catalog() -> N
             UNKNOWN_SXID,
             SxidClassification.FATAL,
             "NVIDIA_FABRIC_MANAGER_RUNTIME",
+            product="H200",
         )
     )
 
@@ -103,6 +109,7 @@ def test_unknown_non_fatal_sxid_remains_monitor_only() -> None:
             UNKNOWN_SXID,
             SxidClassification.NON_FATAL,
             "NVIDIA_FABRIC_MANAGER_RUNTIME",
+            product="H200",
         )
     )
 
@@ -118,3 +125,110 @@ def test_catalogued_fatal_trunk_sxid_is_still_executable() -> None:
 
     assert decision.disposition is ActionDisposition.EXECUTABLE
     assert decision.official_action == "RESET_ALL_GPUS_AND_NVSWITCHES"
+
+
+#: Products the SXID family gate (``catalog_product_family``) places in no
+#: family because there is none to place: the collector stamped no product, or
+#: an empty or blank one, and the node's inventory could not stand in.
+UNPLACED_PRODUCTS = [None, "", "   "]
+#: An SXID of each shape the gate stands in front of; on a Hopper product each
+#: executes or monitors, so a missing product used to take the Hopper path.
+SXID_SHAPES = {
+    "always-fatal": {"code": 23001, "classification": SxidClassification.ALWAYS_FATAL},
+    "fatal-trunk": {
+        "code": 11001,
+        "classification": SxidClassification.FATAL,
+        "link_scope": SxidLinkScope.TRUNK,
+        "link_scope_source": "TRUSTED_NVSWITCH_TOPOLOGY",
+        "fabric_partition": "fabric-a",
+        "participating_gpu_uuids": ["GPU-a", "GPU-b"],
+    },
+    "fatal-access": {
+        "code": 11001,
+        "classification": SxidClassification.FATAL,
+        "link_scope": SxidLinkScope.ACCESS,
+        "link_scope_source": "TRUSTED_NVSWITCH_TOPOLOGY",
+        "participating_gpu_uuids": ["GPU-a"],
+    },
+    "full-reset-10003": {
+        "code": 10003,
+        "classification": SxidClassification.FATAL,
+        "fabric_partition": "fabric-a",
+        "participating_gpu_uuids": ["GPU-a", "GPU-b"],
+    },
+    "non-fatal": {"code": 22013, "classification": SxidClassification.NON_FATAL},
+}
+
+
+def _shaped_sxid(shape: str, product: str | None):
+    values = dict(SXID_SHAPES[shape])
+    code, classification = values.pop("code"), values.pop("classification")
+    return build_sxid_event(
+        f"sxid-{shape}-{product!r}",
+        NOW,
+        code,
+        classification,
+        "NVIDIA_FABRIC_MANAGER_CATALOG",
+        product=product,
+        **values,
+    )
+
+
+@pytest.mark.parametrize("product", UNPLACED_PRODUCTS, ids=["none", "empty", "blank"])
+@pytest.mark.parametrize("shape", sorted(SXID_SHAPES))
+def test_an_sxid_without_a_gpu_product_fails_closed_like_an_unknown_product(
+    shape: str, product: str | None
+) -> None:
+    """The family gate ran only for a product the event named: an SXID without
+    one skipped the Blackwell gate and took the Hopper path -- a reboot, a full
+    GPU/NVSwitch reset or a GPU reset on a node whose generation was never
+    established. It now fails closed the way an unknown product does."""
+
+    engine = GpuFaultPolicyEngine()
+    hopper = engine.evaluate_sxid(_shaped_sxid(shape, "H200"))
+    assert hopper.investigatory_action != "VERIFY_GPU_PRODUCT_GENERATION", hopper
+
+    decision = engine.evaluate_sxid(_shaped_sxid(shape, product))
+
+    assert decision.disposition is ActionDisposition.BLOCKED_MISSING_EVIDENCE
+    assert decision.action is None, decision
+    assert decision.official_action is None, decision
+    assert decision.pre_actions == [], decision
+    assert decision.safety_action is RecoveryAction.QUARANTINE, decision
+    assert decision.investigatory_action == "VERIFY_GPU_PRODUCT_GENERATION"
+    assert decision.containment is Containment.UNKNOWN, decision
+    assert decision.requires_operator, decision
+    assert decision.reasons == [
+        "SXID applicability requires a recognized GPU generation; the event "
+        "names no GPU product"
+    ], decision.reasons
+
+
+@pytest.mark.parametrize(
+    "product",
+    # The names the driver reports (``nvidia-smi --query-gpu=name``) and the
+    # collectors' normalized form.
+    ["NVIDIA B200", "NVIDIA B300 SXM6 AC", "NVIDIA GB200", "NVIDIA GB300", "B300"],
+)
+def test_the_blackwell_sxid_gate_rests_on_the_fabric_manager_guide(
+    product: str,
+) -> None:
+    """NVIDIA reports no SXIDs on HGX B200/B300 (unit-tested from the guide,
+    not live-verified: no B-series hardware)."""
+
+    assert NVIDIA_FM_BLACKWELL_SXID_REFERENCE == (
+        "https://docs.nvidia.com/datacenter/tesla/fabric-manager-user-guide/"
+        "index.html#nvswitch-errors-on-dgx-b200-b300-and-nvidia-hgx-b200-b300-systems"
+    )
+    assert NVIDIA_FM_BLACKWELL_SXID_QUOTE == (
+        "NVSwitch SXID errors are no longer applicable to DGX B200/B300 and NVIDIA "
+        "HGX B200/B300 systems."
+    )
+    decision = GpuFaultPolicyEngine().evaluate_sxid(
+        _shaped_sxid("always-fatal", product)
+    )
+
+    assert decision.disposition is ActionDisposition.NOT_APPLICABLE, decision
+    assert decision.action is None, decision
+    assert decision.safety_action is RecoveryAction.QUARANTINE, decision
+    assert decision.investigatory_action == "USE_DCGM_NVSDM_TELEMETRY", decision

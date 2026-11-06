@@ -400,11 +400,13 @@ class FaultIngestionService:
         inventory is the same hardware's identity, read by nvidia-smi on the
         node, so it stands in -- only when it is fresh (``gpu_inventory_max_age``),
         from the event's boot and names exactly one product. Anything less
-        leaves the event as it came and the gate fails closed as before; either
-        way ``gpu_identity_source`` records what happened.
+        leaves the event as it came and the gate fails closed as before (the
+        XID gate as "not applicable", the SXID family gate as BLOCKED); either
+        way ``gpu_identity_source`` records what happened. An empty or blank
+        product names no hardware either and is filled the same way.
         """
 
-        if event.product is not None:
+        if (event.product or "").strip():
             return event
         snapshot = self._fresh_gpu_inventory(
             cluster_id=event.cluster_id,
