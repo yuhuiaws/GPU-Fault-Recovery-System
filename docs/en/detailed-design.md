@@ -1777,8 +1777,10 @@ FREEZE_EVIDENCE → VALIDATE_FABRIC → ESCALATE_SUPPORT, no isolation); the reg
 single command the device answered with an error (`Failed to create qp [-12]`, `Failed to process command … err -12|-22`,
 `efa_com_comp_status_to_errno()`) match no rule. EFA has no link-down wording (`efa_query_port()` always reports
 `IB_PORT_ACTIVE`); the port state belongs to the `rdma_link_down` metric rule; `efa` is not a keyword trigger, and
-`rdma|infiniband|ib_*` + `fatal|error|timeout|link/port down` serves other fabrics only. Both RDMA rules are `KERNEL_LOG_SOURCES`;
-the node-side `matching_log_rules` decides from the same vocabulary which lines are shipped, so a vocabulary change ships with
+`rdma|infiniband|ib_*` + `fatal|error|timeout|link/port down` serves other fabrics only. Both RDMA rules are `KERNEL_LOG_SOURCES`,
+and both pass the kernel-origin trust gate (`log_recovery_context.log_rule_decision`: dmesg, or a `_TRANSPORT=kernel`
+journal line of the current boot timed between 900 s before and 30 s after the collection; the degraded wording too, though
+it is a WARNING); the node-side `matching_log_rules` decides from the same vocabulary which lines are shipped, so a vocabulary change ships with
 the control plane, the executor and the node runtime together. The sources are pinned to tags:
 <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/infiniband/hw/efa?h=v6.1.189>, <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/infiniband/hw/efa?h=v6.12.103>,
 <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/infiniband/core/device.c?h=v6.1.189>, <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/include/uapi/asm-generic/errno.h?h=v6.1.189>,

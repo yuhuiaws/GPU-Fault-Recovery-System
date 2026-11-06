@@ -112,6 +112,26 @@ def test_untrusted_fatal_text_cannot_stop_training(rig, source):
     assert rig.boundary.calls == [], "no mutation is dispatched"
 
 
+@pytest.mark.parametrize(
+    ("source", "fields"),
+    [("journal", None), ("dmesg", {"_BOOT_ID": "boot-before"})],
+    ids=["stdout-transport", "previous-boot"],
+)
+def test_untrusted_degraded_efa_text_opens_no_fabric_diagnostic(rig, source, fields):
+    # The EFA driver's degraded wording is a kernel-only rule like its fatal
+    # wording: a journal line another transport wrote, or a line of an earlier
+    # boot, never reaches VALIDATE_FABRIC on the node and its job.
+    result = rig.log(
+        "efa 0000:55:00.0 rdmap85s0: Received completion with unexpected command "
+        "id[7], sq producer: 12, sq consumer: 11, cq consumer: 11",
+        source=source,
+        fields=fields,
+    )
+    assert result["findings"] == [], result
+    assert result["workflow_request_ids"] == [], result
+    assert rig.boundary.calls == [], "no mutation is dispatched"
+
+
 def test_application_log_preserves_attribution_and_watcher_ownership(rig):
     rig.gpu(
         {

@@ -6,6 +6,7 @@ import hashlib
 import json
 from typing import Any, Callable
 
+from gpu_fault.log_rules import KERNEL_LOG_SOURCES
 from gpu_fault.mce_grading import MceGrade, grade_mce_line
 from gpu_fault.models import RecoveryAction, Severity, WorkloadState
 from gpu_fault.nccl_events import event_kind
@@ -15,7 +16,11 @@ from gpu_fault.store.shared.errors import NotFoundError
 def log_rule_decision(
     store: Any, batch: Any, entry: Any, rule: Any
 ) -> tuple[Severity, RecoveryAction] | None:
-    if rule.action is RecoveryAction.QUARANTINE:
+    # The trusted kernel line: every rule only a kernel origin may satisfy --
+    # each QUARANTINE rule and the EFA driver's degraded wording, a WARNING --
+    # takes a journal line only from the kernel transport (the kmsg record,
+    # not ``logger`` or a unit's stdout) and only of the current boot.
+    if rule.action is RecoveryAction.QUARANTINE or rule.sources <= KERNEL_LOG_SOURCES:
         if entry.source == "journal" and entry.fields.get("_TRANSPORT") != "kernel":
             return None
         if not current_kernel_evidence(store, batch, entry):

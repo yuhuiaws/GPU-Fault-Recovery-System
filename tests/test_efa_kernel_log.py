@@ -17,7 +17,7 @@ kernel quote, not a new opinion.
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -202,8 +202,16 @@ PREFIXES = [
 ]
 
 
-def _evaluate(message: str, *, source: str = "dmesg", kernel: bool = True) -> list:
-    fields = {"_TRANSPORT": "kernel"} if kernel else {"_TRANSPORT": "syslog"}
+def _evaluate(
+    message: str,
+    *,
+    source: str = "dmesg",
+    kernel: bool = True,
+    fields: dict[str, str] | None = None,
+    observed_at: datetime = NOW,
+) -> list:
+    if fields is None:
+        fields = {"_TRANSPORT": "kernel"} if kernel else {"_TRANSPORT": "syslog"}
     return NodeHealthPolicy(build_store()).evaluate_logs(
         NodeLogBatch(
             cluster_id="cluster-a",
@@ -213,7 +221,7 @@ def _evaluate(message: str, *, source: str = "dmesg", kernel: bool = True) -> li
                 NodeLogEntry(
                     entry_id="efa-line",
                     source=source,
-                    observed_at=NOW,
+                    observed_at=observed_at,
                     message=message,
                     fields=fields,
                 )
@@ -298,6 +306,68 @@ def test_degraded_efa_text_from_a_workload_log_is_ignored() -> None:
     message = DEGRADED_LINES[0]
     assert matching_log_rules(message, "training-log") == [], message
     assert _evaluate(message, source="training-log", kernel=False) == [], message
+
+
+#: Lines the kernel trust gate (``log_recovery_context.log_rule_decision``)
+#: refuses for every rule only a kernel origin may satisfy: a journal line
+#: another transport wrote (a host process's ``logger``, a unit's stdout), a
+#: line of another boot, one older than the collection window or from its
+#: future (``current_kernel_evidence``: 900 s before to 30 s after).
+UNTRUSTED_KERNEL_ORIGINS = {
+    "syslog-transport": {"source": "journal", "fields": {"_TRANSPORT": "syslog"}},
+    "stdout-transport": {"source": "journal", "fields": {"_TRANSPORT": "stdout"}},
+    "previous-boot": {
+        "fields": {
+            "_TRANSPORT": "kernel",
+            "_BOOT_ID": "boot-before",
+            "_COLLECTOR_BOOT_ID": "boot-now",
+        }
+    },
+    "stale": {"observed_at": NOW - timedelta(seconds=901)},
+    "future": {"observed_at": NOW + timedelta(seconds=31)},
+}
+#: ``efa_com_handle_single_admin_completion()``, amzn-drivers' spelling.
+UNEXPECTED_COMPLETION = (
+    "Received completion with unexpected command id[2f], status[0] "
+    "sq producer[12], sq consumer[11], cq consumer[11]"
+)
+
+
+@pytest.mark.parametrize("prefix", [DEV, LIVE_DEV], ids=["registered", "renamed"])
+@pytest.mark.parametrize("origin", sorted(UNTRUSTED_KERNEL_ORIGINS))
+def test_degraded_efa_text_passes_the_fatal_lines_kernel_trust_gate(
+    prefix: str, origin: str
+) -> None:
+    # The degraded rule is KERNEL_LOG_SOURCES like the fatal one, but the gate
+    # behind the source tag used to run only for QUARANTINE rules: a
+    # ``logger`` line in the journal or a previous boot's line opened a fabric
+    # diagnostic on the node and its job.
+    untrusted = UNTRUSTED_KERNEL_ORIGINS[origin]
+    message = prefix + UNEXPECTED_COMPLETION
+    assert grade_efa_line(message) is EfaLineGrade.DEGRADED, message
+    assert _evaluate(message, **untrusted) == [], (origin, message)
+    fatal = prefix + "Admin queue is closed"
+    assert _evaluate(fatal, **untrusted) == [], (origin, "the fatal twin is refused")
+
+
+@pytest.mark.parametrize("prefix", [DEV, LIVE_DEV], ids=["registered", "renamed"])
+@pytest.mark.parametrize("age_seconds", [-30, 0, 900])
+def test_a_current_boot_kernel_degraded_line_still_requests_diagnostics(
+    prefix: str, age_seconds: int
+) -> None:
+    [finding] = _evaluate(
+        prefix + UNEXPECTED_COMPLETION,
+        fields={
+            "_TRANSPORT": "kernel",
+            "_BOOT_ID": "boot-now",
+            "_COLLECTOR_BOOT_ID": "boot-now",
+        },
+        observed_at=NOW - timedelta(seconds=age_seconds),
+    )
+    assert (finding.severity, finding.recommended_action) == (
+        Severity.WARNING,
+        RecoveryAction.RUN_DIAGNOSTICS,
+    ), finding
 
 
 def test_node_side_priority_ranks_fatal_above_degraded_above_noise() -> None:

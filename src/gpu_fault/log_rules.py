@@ -23,7 +23,10 @@ class LogHealthCategory(StrEnum):
 #: the systemd journal (see ``collectors/logs/node.py`` ``_parse_journal``); a
 #: training job cannot write into either. A hardware-fatal rule (MCE, ECC,
 #: a dead RDMA/EFA device, kernel panic) may only fire from one of these,
-#: because a match drives isolation/quarantine.
+#: because a match drives isolation/quarantine. Every rule limited to them
+#: also passes the gate behind the tag (``log_recovery_context.
+#: log_rule_decision``): a journal line only from the kernel transport, and
+#: only of the current boot.
 KERNEL_LOG_SOURCES: frozenset[str] = frozenset({"dmesg", "journal"})
 
 #: Origins that a workload can influence -- the training log is a file the job
@@ -147,7 +150,8 @@ NODE_LOG_RULES = (
     # version/BAR/MSI-X failures): the device is still answering, so this is
     # read-only fabric diagnostics (FREEZE_EVIDENCE -> VALIDATE_FABRIC), not
     # isolation. Per-command failures the device answered ("Failed to create
-    # qp [-12]") are a job's resource problem and match nothing here.
+    # qp [-12]") are a job's resource problem and match nothing here. A
+    # trusted kernel line all the same: the fatal rule's gate applies.
     NodeLogRule(
         re.compile(EFA_DEGRADED_REGEX),
         LogHealthCategory.RDMA,
