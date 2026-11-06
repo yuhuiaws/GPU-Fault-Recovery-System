@@ -132,6 +132,39 @@ def withheld_escalation(
     return str(action)
 
 
+def held_for_unsent_hand_off(workflow: WorkflowRequest) -> bool:
+    """Whether ``workflow`` holds its node for an operator hand-off that never ran.
+
+    The DRAIN chain -- the node-health one and the ladder's ``drain-after-``
+    successor -- cordons and quarantines its node, leaves it held (RMA class,
+    no RESTORE_SCHEDULING) and hands it over with the ESCALATE_SUPPORT behind
+    its VALIDATE_GPU, which an RMA-class GPU often still fails. No recovery
+    action ran before that validation, so neither ladder has a rung for it; the
+    hand-off is still owed, or the drain parks QUARANTINED with no support
+    record and no mail. True when an isolation of the record completed and its
+    planned ESCALATE_SUPPORT has no execution record at all: a hand-off that ran
+    or failed keeps its own ending, and a settled containment prefix (no
+    ESCALATE_SUPPORT among its safety steps) keeps its own notice.
+    """
+
+    steps = (
+        workflow.safety_steps
+        if workflow.executes_safety_steps
+        else workflow.official_steps
+    )
+    return (
+        bool(
+            {WorkflowOperation.MARK_UNSCHEDULABLE, WorkflowOperation.QUARANTINE}
+            & set(workflow.completed_operations)
+        )
+        and any(step.operation is WorkflowOperation.ESCALATE_SUPPORT for step in steps)
+        and not any(
+            execution.operation is WorkflowOperation.ESCALATE_SUPPORT
+            for execution in workflow.step_executions
+        )
+    )
+
+
 def requested_escalations(workflow: WorkflowRequest) -> set[str]:
     """The ``failure_escalation_action`` values the record's FAILED steps ask
     for and are owed: a failed node action's as designed, a failed

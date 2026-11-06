@@ -31,6 +31,7 @@ from gpu_fault.orchestration.gpu_placement import (
 )
 from gpu_fault.orchestration.validation_evidence import (
     VALIDATION_OPERATIONS,
+    held_for_unsent_hand_off,
     missing_evidence_reason,
     requested_escalations,
     validation_unobserved_failure,
@@ -919,6 +920,10 @@ class HardwareEscalationService:
                 failed_stage = "temperature_validation"
                 next_action = RecoveryAction.DRAIN
                 next_operation = None
+            elif held_for_unsent_hand_off(workflow):
+                failed_stage = "drain_validation"
+                next_action = RecoveryAction.ESCALATE_OPERATOR
+                next_operation = WorkflowOperation.ESCALATE_SUPPORT
             else:
                 return None
         elif failed_operation_set.intersection(_CONTAINMENT_RELEASE_OPERATIONS):

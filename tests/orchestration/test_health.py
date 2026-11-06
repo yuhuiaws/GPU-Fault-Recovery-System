@@ -965,3 +965,97 @@ def test_a_completed_drain_chain_leaves_the_incident_escalated(
     assert context.store.get_incident(incident.incident_id).state is (
         IncidentState.ESCALATED
     )
+
+
+def test_a_drain_whose_validation_fails_still_hands_the_node_to_support(
+    context: ApplicationContext,
+) -> None:
+    """The DRAIN chain's hand-off is the ESCALATE_SUPPORT behind its VALIDATE_GPU,
+    and an RMA-class GPU often still fails that validation. The failure must
+    not park the node QUARANTINED with nobody told: there is no hardware rung
+    after a drain, so it goes to support -- the hand-off the chain itself would
+    have made -- and the support successor ends ESCALATED with the mail sent."""
+    from gpu_fault.execution import WorkflowStepOutcome
+    from gpu_fault.models import IncidentState, WorkflowExecutionRequest
+    from tests._builders import active_workflow_executor
+
+    incident, workflow = context.orchestrator.ingest_node_health(
+        _rma_drain_finding(WorkloadState.IDLE, official_action=None)
+    )
+    drain = workflow.request_id
+
+    class _SimulatedRuntime:
+        def __init__(self) -> None:
+            self.executed: list[tuple[str, WorkflowOperation]] = []
+
+        def supports(self, step: WorkflowStepSpec) -> bool:
+            return step.execution_owner == "simulated-runtime"
+
+        def execute(self, step_context) -> WorkflowStepOutcome:
+            operation = step_context.step.operation
+            self.executed.append((step_context.workflow.request_id, operation))
+            if (
+                operation is WorkflowOperation.VALIDATE_GPU
+                and step_context.workflow.request_id == drain
+            ):
+                return WorkflowStepOutcome.failed(
+                    "active_gpu_health_findings",
+                    details={
+                        "failed_nodes": ["node-a"],
+                        "node_failures": {"node-a": ["active_gpu_health_findings"]},
+                    },
+                )
+            return WorkflowStepOutcome.succeeded(
+                operation_id=step_context.idempotency_key
+            )
+
+    adapter = _SimulatedRuntime()
+    executor = active_workflow_executor(
+        context.store, [adapter], [step.operation for step in workflow.official_steps]
+    )
+
+    result = executor.execute(
+        drain, WorkflowExecutionRequest(expected_fencing_token=workflow.fencing_token)
+    )
+
+    assert result.status is WorkflowStatus.FAILED
+    failed = context.store.get_workflow(drain)
+    assert WorkflowOperation.ESCALATE_SUPPORT not in failed.completed_operations
+    assert context.store.get_incident(incident.incident_id).state is (
+        IncidentState.QUARANTINED
+    ), "the node stays held by the drain"
+
+    escalation = context.orchestrator.escalate_failed_hardware_remediation(failed)
+
+    assert escalation is not None, (
+        "a drain whose VALIDATE_GPU failed must still reach an operator: no "
+        "support record and no mail otherwise"
+    )
+    support_incident, support = escalation
+    assert support.request_id == f"workflow-support-after-{drain}"
+    assert support_incident.effective_action is RecoveryAction.ESCALATE_OPERATOR
+    assert [step.operation for step in support.official_steps] == [
+        WorkflowOperation.FREEZE_EVIDENCE,
+        WorkflowOperation.MARK_UNSCHEDULABLE,
+        WorkflowOperation.QUARANTINE,
+        WorkflowOperation.ESCALATE_SUPPORT,
+    ], "the hand-off keeps the hold: no stop, no hardware rung, no release"
+    assert "VALIDATE_GPU" in support_incident.reasons[0], support_incident.reasons
+    assert context.orchestrator.escalate_failed_hardware_remediation(failed) == (
+        escalation
+    ), "one support successor per failed drain"
+
+    handoff = active_workflow_executor(
+        context.store, [adapter], [step.operation for step in support.official_steps]
+    ).execute(
+        support.request_id,
+        WorkflowExecutionRequest(expected_fencing_token=support.fencing_token),
+    )
+
+    assert handoff.status is WorkflowStatus.SUCCEEDED
+    assert (support.request_id, WorkflowOperation.ESCALATE_SUPPORT) in (
+        adapter.executed
+    )
+    assert context.store.get_incident(support_incident.incident_id).state is (
+        IncidentState.ESCALATED
+    ), "the hand-off ends ESCALATED, the state an operator closes after the RMA"

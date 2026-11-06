@@ -2467,6 +2467,13 @@ Whole-record hardware recovery escalation is invoked idempotently by the Dispatc
    even if it once had a FAILED record (for example `RESET_GPU` failed, escalated in place to reboot and already
    `RESTORE_SCHEDULING`), is not isolated again by the support successor incident
    (`HardwareEscalationService._exhausted_branch_executions`).
+6. A DRAIN chain (the node-health RMA chain and the ladder's `drain-after-<workflow>` successor) fails its VALIDATE_GPU:
+   no recovery action ran before it and there is no hardware rung to climb, but the hand-off at the end of the chain is
+   still owed -- an RMA-class GPU often still fails that validation. The drain's incident is `QUARANTINED`, and a
+   `workflow-support-after-<workflow>` is created (stage `drain_validation`: FREEZE_EVIDENCE → MARK_UNSCHEDULABLE →
+   QUARANTINE → ESCALATE_SUPPORT, taking over the same isolation, no job stop, no reset, no readmission) that sends the
+   fixed-template mail and ends `ESCALATED` (`validation_evidence.held_for_unsent_hand_off`); a chain whose own
+   ESCALATE_SUPPORT ran or failed opens no second one.
 
 ```mermaid
 flowchart LR

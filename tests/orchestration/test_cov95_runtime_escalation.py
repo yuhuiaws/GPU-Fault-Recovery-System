@@ -101,6 +101,87 @@ def test_failed_recovery_emits_the_reviewed_rung_with_real_profile_compilation(
     )
 
 
+FREEZE = WorkflowOperation.FREEZE_EVIDENCE
+CORDON = WorkflowOperation.MARK_UNSCHEDULABLE
+STOP = WorkflowOperation.STOP_WORKLOADS
+QUARANTINE = WorkflowOperation.QUARANTINE
+BUNDLE = WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE
+DRAIN_CHAIN = [FREEZE, CORDON, QUARANTINE, BUNDLE, VALIDATE, SUPPORT]
+
+
+@pytest.mark.parametrize(
+    "operations",
+    [DRAIN_CHAIN, [FREEZE, CORDON, STOP, QUARANTINE, BUNDLE, VALIDATE, SUPPORT]],
+    ids=["drain", "drain-with-stop"],
+)
+def test_a_failed_validation_of_a_drain_hands_the_held_node_to_support(
+    operations,
+) -> None:
+    """A drain (the node-health DRAIN chain, the ladder's drain-after successor)
+    holds its node and hands it over with the ESCALATE_SUPPORT behind its
+    VALIDATE_GPU. With no recovery action before the validation the ladder has
+    no rung, but the hand-off is still owed: support, not a silent QUARANTINED."""
+
+    h = EscalationHarness(operations, failed_index=operations.index(VALIDATE))
+
+    classification = HardwareEscalationService.classify(h.workflow)
+    assert classification is not None, (
+        "a failed drain validation left the held node with nobody told"
+    )
+    assert classification[:3] == (
+        "drain_validation",
+        RecoveryAction.ESCALATE_OPERATOR,
+        SUPPORT,
+    )
+    result = h.escalate()
+    assert result is not None, "the failed drain needs a durable hand-off"
+    incident, successor = result
+    assert incident.reasons[0].startswith(
+        "drain_validation remediation failed; failed operation or validation: "
+        "VALIDATE_GPU"
+    ), incident.reasons
+    assert [step.operation for step in successor.official_steps] == [
+        FREEZE,
+        CORDON,
+        QUARANTINE,
+        SUPPORT,
+    ], "the hold is kept and handed over; nothing stops, resets or releases"
+    assert successor.lifetime_deadline_at is None, (
+        "an operator hand-off starts its own clock"
+    )
+
+
+@pytest.mark.parametrize(
+    ("operations", "why"),
+    [
+        (
+            [FREEZE, WorkflowOperation.VALIDATE_HOST, SUPPORT],
+            "a read-only chain held nothing: its failure is inconclusive",
+        ),
+        (
+            [FREEZE, CORDON, VALIDATE, WorkflowOperation.RESTORE_SCHEDULING],
+            "no hand-off was planned behind the validation",
+        ),
+    ],
+    ids=["read-only", "no-planned-hand-off"],
+)
+def test_a_failed_validation_without_a_held_hand_off_climbs_nothing(
+    operations, why
+) -> None:
+    h = EscalationHarness(operations, failed_index=1 if len(operations) == 3 else 2)
+
+    assert HardwareEscalationService.classify(h.workflow) is None, why
+
+
+def test_a_drain_whose_own_hand_off_failed_opens_no_second_one() -> None:
+    """The rule is for a hand-off that never ran. A drain whose ESCALATE_SUPPORT
+    itself failed keeps today's ending: no second ticket from this rule."""
+
+    h = EscalationHarness(DRAIN_CHAIN)
+
+    assert HardwareEscalationService.classify(h.workflow) is None
+
+
 @pytest.mark.parametrize("profile", [None, "missing-profile"])
 def test_escalation_with_unknown_runtime_profile_is_blocked_for_an_operator(
     profile,

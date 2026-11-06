@@ -5756,7 +5756,9 @@ one node no longer waits on the other node's 8. A successor built now names only
 
 **The escalation ladder and node ownership (reset -> reboot -> replace)**: when the predecessor workflow fails after
 its cordon (RESET_GPU, or the VALIDATE_GPU after it) the incident reads QUARANTINED and the Dispatcher opens the successor
-`workflow-reboot-after-<id>` (then `workflow-replace-after-<id>`). The successor's MARK_UNSCHEDULABLE/QUARANTINE now
+`workflow-reboot-after-<id>` (then `workflow-replace-after-<id>`); a DRAIN chain whose VALIDATE_GPU fails has no hardware
+rung and opens the hand-off successor `workflow-support-after-<id>` (FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → QUARANTINE →
+ESCALATE_SUPPORT, which keeps and takes over that terminal quarantine). The successor's MARK_UNSCHEDULABLE/QUARANTINE now
 **takes over** the isolation the predecessor left on the node (the `gpu-fault.io/incident-id`/`fencing-token`
 annotations are rewritten to the successor incident, the `previous-unschedulable` baseline is kept) when: the incident on
 the node's annotations is the one whose workflow this successor escalates (event id `reboot-after-<workflow>`), that
