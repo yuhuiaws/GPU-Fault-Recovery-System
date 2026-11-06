@@ -191,9 +191,21 @@ data:
                 # other per-cluster ownership counts match
                 # gpu_fault_ambiguous_attempt_ownership_.+ and
                 # gpu_fault_attempt_observation_scan_.+ (label cluster_id only).
+                # gpu_fault_gc_.+, gpu_fault_listen_.+,
+                # gpu_fault_event_loop_lag_seconds.* and
+                # gpu_fault_process_resident_memory_bytes are each process's
+                # health (gpu_fault.app.process_health): GC collections and
+                # pauses, the listening sockets' accept queues, somaxconn and
+                # connections, the event-loop lag histogram and resident
+                # memory. An ingress liveness or NLB incident is diagnosed from
+                # them, and the probe restarts the processes that held them, so
+                # without them in AMP the evidence died with the processes.
+                # Labels are bounded: generation is 0..2, port the service or
+                # liveness port, le the lag histogram's fixed buckets, process
+                # the slot.
                 - action: keep
                   source_labels: [__name__]
-                  regex: up|gpu_fault_processor_.+|gpu_fault_telemetry_spool_.+|gpu_fault_store_io_.+|gpu_fault_store_hot_table_.+|gpu_fault_store_compaction_.+|gpu_fault_store_bloat_scan_timestamp_seconds|gpu_fault_remote_command_.+|gpu_fault_collector_.+|gpu_fault_policy_.+|gpu_fault_ambiguous_attempt_ownership_.+|gpu_fault_stale_attempt_observations|gpu_fault_stale_attempt_observation_nodes|gpu_fault_attempt_observation_scan_.+|gpu_fault_workflow_.+|gpu_fault_closed_loop_.+|gpu_fault_notification_.+|gpu_fault_remediation_budget_.+|gpu_fault_fleet_rollout_.+|gpu_fault_fleet_pin_drift_.+|gpu_fault_stale_agents|gpu_fault_spare_reservations_.+|gpu_fault_regional_registry_.+|gpu_fault_postgres_.+|gpu_fault_periodic_.+|gpu_fault_health_signal_.+|gpu_fault_ingest_.+|gpu_fault_control_record_.+|gpu_fault_orphan_.+|gpu_fault_incident_.+|gpu_fault_incidents_.+|gpu_fault_completion_.+|gpu_fault_gpu_findings_.+|gpu_fault_capacity_.+|gpu_fault_metrics_.+|gpu_fault_aurora_.+|gpu_fault_ingress_.+|gpu_fault_departed_node_cleanup_.+
+                  regex: up|gpu_fault_processor_.+|gpu_fault_telemetry_spool_.+|gpu_fault_store_io_.+|gpu_fault_store_hot_table_.+|gpu_fault_store_compaction_.+|gpu_fault_store_bloat_scan_timestamp_seconds|gpu_fault_remote_command_.+|gpu_fault_collector_.+|gpu_fault_policy_.+|gpu_fault_ambiguous_attempt_ownership_.+|gpu_fault_stale_attempt_observations|gpu_fault_stale_attempt_observation_nodes|gpu_fault_attempt_observation_scan_.+|gpu_fault_workflow_.+|gpu_fault_closed_loop_.+|gpu_fault_notification_.+|gpu_fault_remediation_budget_.+|gpu_fault_fleet_rollout_.+|gpu_fault_fleet_pin_drift_.+|gpu_fault_stale_agents|gpu_fault_spare_reservations_.+|gpu_fault_regional_registry_.+|gpu_fault_postgres_.+|gpu_fault_periodic_.+|gpu_fault_health_signal_.+|gpu_fault_ingest_.+|gpu_fault_control_record_.+|gpu_fault_orphan_.+|gpu_fault_incident_.+|gpu_fault_incidents_.+|gpu_fault_completion_.+|gpu_fault_gpu_findings_.+|gpu_fault_capacity_.+|gpu_fault_metrics_.+|gpu_fault_aurora_.+|gpu_fault_ingress_.+|gpu_fault_departed_node_cleanup_.+|gpu_fault_gc_.+|gpu_fault_listen_.+|gpu_fault_event_loop_lag_seconds.*|gpu_fault_process_resident_memory_bytes
                 # Dropped because they describe the collector, not the fleet.
                 # The receiver stamps every metric with the instrumentation
                 # scope it arrived under, and those labels then take part in

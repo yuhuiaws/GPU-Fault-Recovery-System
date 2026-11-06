@@ -11798,7 +11798,9 @@ queue depth of this process's listening socket; one `SO_REUSEPORT` socket per wo
 (the Pod network namespace's accept-queue cap: a Pod's own namespace gets the kernel default 4096, the 65535 the node
 DaemonSet writes does not reach the Pod, `--backlog 8192` is clamped to 4096, and once the queue is full new SYNs are
 dropped and clients retransmit after 1 s), the `gpu_fault_event_loop_lag_seconds` histogram,
-`gpu_fault_gc_collection_seconds_max{generation}` and `gpu_fault_process_resident_memory_bytes`.
+`gpu_fault_gc_collection_seconds_max{generation}` and `gpu_fault_process_resident_memory_bytes`. These families, with
+the `gpu_fault_listen_*` families of the next paragraph, are in the control-plane ADOT keep list and reach AMP too: a
+Pod's `/metrics` covers only its live processes, so the series from before a probe restart are only in AMP.
 
 The service port itself is no longer one shared accept queue either: the three roles' container command launches
 `python -m gpu_fault.app.serve` (`gpu_fault.app.serve` reuses uvicorn's `Server` and every flag, but each worker process

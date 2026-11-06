@@ -2041,8 +2041,8 @@ small and cannot explain second-level latency.
     port (probe median 10 ms, max 0.61 s under the same burst), 10 s x 3 probe parameters, `gc.freeze()` (-26% GC
     time, +7% throughput). During acceptance read `gpu_fault_listen_accept_queue_connections`, the
     `gpu_fault_event_loop_lag_seconds` histogram and `gpu_fault_gc_collection_seconds_max` (the runners' metric
-    snapshot keeps only the event loop lag, and none of the three is in the control-plane ADOT keep list: read the Pods'
-    `/metrics` directly). Setting the flush stub to
+    snapshot keeps only the event loop lag; all three are in the control-plane ADOT keep list and can be queried in
+    AMP). Setting the flush stub to
     8 ms of CPU per item (i.e. assuming the 81 ms flush is all CPU) gives 583 req/s and 43% 503s, inconsistent with the
     live 1,175 req/s and 0 non-2xx -- the live flush's 81 ms is mostly Aurora round-trip wait.
     Follow-up (the same reproduction plus `--launcher uvicorn|serve`, `--keep-alive`, per-socket accept queues and

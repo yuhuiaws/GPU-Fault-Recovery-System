@@ -2605,7 +2605,8 @@ start-up; `GPU_FAULT_GC_GEN2_THRESHOLD` defaults to 10. `/metrics`: `gpu_fault_e
 `gpu_fault_gc_collections_total{generation}`, `gpu_fault_gc_collection_seconds_total{generation}`,
 `gpu_fault_gc_collection_seconds_max{generation}` (maximum over a Pod's processes), `gpu_fault_gc_frozen_objects`,
 `gpu_fault_listen_accept_queue_connections{port}` (each worker's own socket; exported per process, summed over the Pod) and
-`gpu_fault_listen_somaxconn`.
+`gpu_fault_listen_somaxconn`. These families and the `gpu_fault_listen_*` families of the next paragraph are in the
+control-plane ADOT keep list and reach AMP.
 
 Per-worker `SO_REUSEPORT` service sockets (`app/serve.py`, `app/listener.py`): `python -m gpu_fault.app.serve` replaces
 `python -m uvicorn` as the launcher of the three roles -- the same uvicorn flags and `uvicorn.Server`, but the parent binds

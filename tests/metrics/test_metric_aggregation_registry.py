@@ -35,6 +35,15 @@ ADOT_CONTROL_PLANE = (
 #: ``gpu_fault_store_`` families the control plane renders that the ADOT keep
 #: list deliberately does not ship to AMP, each with the reason.
 DROPPED_STORE_FAMILIES: dict[str, str] = {}
+#: The process-health families: resident memory, GC collections and pauses,
+#: the listening sockets (``gpu_fault.app.process_health``) and the event-loop
+#: lag histogram (``gpu_fault.app.metrics``).
+PROCESS_HEALTH_PREFIXES = (
+    "gpu_fault_process_",
+    "gpu_fault_gc_",
+    "gpu_fault_listen_",
+    "gpu_fault_event_loop_lag_",
+)
 
 
 def _scrape(monkeypatch, role: str) -> str:
@@ -243,3 +252,62 @@ def test_every_store_family_reaches_amp_or_is_dropped_with_a_reason(
         family for family, reason in DROPPED_STORE_FAMILIES.items() if not reason
     )
     assert reasonless == [], f"dropped store families need a reason: {reasonless}"
+
+
+def test_every_process_health_family_reaches_amp(rendered_scrapes) -> None:
+    """The deployment manual diagnoses an ingress liveness or NLB incident from
+    the process-health families -- resident memory, GC collections and pauses,
+    the listening sockets' accept queues and connections, the event-loop lag
+    histogram -- and the keep list had no alternative for any of them, so every
+    control-plane Pod rendered them and ADOT dropped them before AMP: the
+    evidence died with the processes the probe restarted. Every such family the
+    registry knows, and every sample name a real scrape renders (the
+    histogram's ``_bucket``/``_sum``/``_count``/``_max`` included), must pass
+    the keep filter."""
+
+    keep = _adot_keep_filter()
+    series: dict[str, set[str]] = {
+        family: {family}
+        for family in STRATEGIES
+        if family.startswith(PROCESS_HEALTH_PREFIXES)
+    }
+    for parsed in rendered_scrapes.values():
+        for family, samples in parsed.samples.items():
+            if family.startswith(PROCESS_HEALTH_PREFIXES):
+                series.setdefault(family, {family}).update(
+                    sample.name for sample in samples
+                )
+    dropped = sorted(
+        name
+        for names in series.values()
+        for name in names
+        if not re.fullmatch(keep, name)
+    )
+
+    assert dropped == [], (
+        "the ADOT keep list drops process-health series the control plane "
+        "renders; keep them in deploy/observability/adot-control-plane.yaml: "
+        f"{dropped}"
+    )
+    assert {
+        "gpu_fault_process_resident_memory_bytes",
+        "gpu_fault_gc_collections_total",
+        "gpu_fault_gc_collection_seconds_total",
+        "gpu_fault_gc_collection_seconds_max",
+        "gpu_fault_gc_frozen_objects",
+        "gpu_fault_listen_accept_queue_connections",
+        "gpu_fault_listen_somaxconn",
+        "gpu_fault_listen_reuse_port",
+        "gpu_fault_listen_accepted_connections_total",
+        "gpu_fault_listen_open_connections",
+        "gpu_fault_event_loop_lag_seconds",
+    } <= set(series), f"the process-health families are no longer known: {series}"
+    assert {
+        "gpu_fault_event_loop_lag_seconds_bucket",
+        "gpu_fault_event_loop_lag_seconds_sum",
+        "gpu_fault_event_loop_lag_seconds_count",
+        "gpu_fault_event_loop_lag_seconds_max",
+    } <= series["gpu_fault_event_loop_lag_seconds"], (
+        "the scrape no longer renders the lag histogram's samples: "
+        f"{series['gpu_fault_event_loop_lag_seconds']}"
+    )
