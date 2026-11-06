@@ -345,6 +345,12 @@ mutation. Every workflow contains at least:
 - remote command claim/result;
 - DAG dependency, lease and fencing.
 
+The §8.2 action model is a fixed 10-step DAG (`dag_enabled`): `MARK_UNSCHEDULABLE` -> `CHECKPOINT_WORKLOADS` ->
+`STOP_WORKLOADS`, then `COLLECT_DIAGNOSTIC_BUNDLE` (branch `diagnostics`) and `QUIESCE_GPU_SERVICES` (branch `mutation`)
+in parallel, `VERIFY_NO_GPU_CLIENTS` waiting on both, then `RESET_GPU` -> `RESTORE_GPU_SERVICES` -> `RESTART_NODE` ->
+`RESTORE_SCHEDULING`. It carries no workload restart; the §8.4 integrated runner covers that (compiled by the live
+policy, its SXID branch carries diagnostics, stop, fabric validation and the workload restart).
+
 **After the fixed limits' retirement (the remediation storm breaker, detailed design v2 §9.5).** This section, the
 "production-budget / raw-capacity tiers" of §8.2 and the budget matrix of §13.5 apply only to a release that still has the
 Region, per-cluster and per-resource-class limits. On a later release:
@@ -980,8 +986,9 @@ export AURORA_CLUSTER_ID='<aurora-cluster-id>'
 ```
 
 `gpu-fault-perf-system` may hold only the connection Secret, the load-generator
-ServiceAccount/RBAC and the simulated Executor Job; no real Cluster Executor, Watcher, Collector
-or Node Runtime may be deployed there. Before the formal start run:
+ServiceAccount/RBAC, the load Job and the simulated Executor Job, plus what the runner itself creates there: the
+script, template, start-gate and executor ConfigMaps, the start gate's Role/RoleBinding and the token Secret
+`gpu-fault-perf-clusters`; no real Cluster Executor, Watcher, Collector or Node Runtime may be deployed there. Before the formal start run:
 
 ```bash
 gpu-fault-admin status --full --state-dir "${STATE_DIR}"
@@ -1078,7 +1085,12 @@ data:
 - **Event-driven publish**: for the whole workflow phase one watch session runs in an api-ha Pod (the
   seeding script's `integrated-validation-watch` mode over `kubectl exec -i`; the program arrives
   length-prefixed on stdin and the rest of stdin is the stop signal, closed by the runner's wrap-up and by
-  a runner process that exits). Every second the session reads the workflows saved since its previous
+  a runner process that exits; during the session the runner writes a newline to stdin every 15 seconds
+  (`StdinKeepalive`, as the samplers and the fleet heartbeat session do): kubectl's WebSocket transport gives every
+  stdin data write a 60-second write deadline, but the close frame carrying EOF inherits the deadline of the previous
+  write, so a close more than 60 seconds after the last write times out at once and breaks the connection -- the
+  program never sees EOF, kubectl exits on a read timeout 61 seconds later and the session loses its last output).
+  Every second the session reads the workflows saved since its previous
   poll and, as soon as a node's reset/reboot step is recorded, publishes that node's healthy GPU/NVLink
   metrics, host metrics and all collector successes stamped with the actual publish time, once per
   barrier. An executor result without the step record publishes nothing, and a stamp that is not later
@@ -1086,7 +1098,8 @@ data:
   strictly later. The session ends when every workflow of the round is terminal, when stdin closes or at its
   deadline, and is restarted at most 3 times after an unexpected loss; `summary.json.validation_telemetry`
   records the sessions, restarts, publishes and the p50/p95/p99/max barrier-to-publish delay.
-- **Periodic refresh (fallback)**: before the start gate and every 30 seconds during execution it
+- **Periodic refresh (fallback)**: once before the start gate and every 30 seconds while the runner waits for the
+  workflows (none while it waits for the load Job, when only the event-driven session publishes) it
   refreshes the synthetic Agent heartbeat, healthy GPU/NVLink/RDMA metrics, `load1_per_cpu`,
   `memory_used_percent`, `filesystem_used_percent` and all collector success statuses that Agent actually
   requires. Every node carries its own write time: the whole refresh used to share the refresh script's
@@ -1131,7 +1144,8 @@ a result still undelivered after its attempts -- and only those, with the comple
 renewal checks, fail an executor Pod, whose document names them in `fatal`. The executor Jobs keep
 `backoffLimit: 0`: once a Pod fails on a fatal condition the round is invalid anyway, so the action and
 integrated runners stop waiting for workflows as soon as the executor Job has failed
-(`executor_job_failure` in the last history sample) instead of waiting out `--timeout-seconds`.
+(`executor_job_failure`, in the last history sample for the action runner and in `summary.json.workflow` for the
+integrated runner) instead of waiting out `--timeout-seconds`.
 The correlated scenario's attempt and XID/SXID posts may be repeated as they are, too: the control plane
 deduplicates by `event_id` (one incident, workflow, marker and notification of each kind), and repeating an
 observation or a training-progress post is harmless; with `Idempotency-Key` the repeat must resend a
@@ -1147,13 +1161,13 @@ SET_AURORA_MIN_124_MAX_128` only acknowledges that the round requires the formal
 The runner
 then hard-verifies that both `db.serverless` instances are `available` and that the actual
 CloudWatch capacity of each is not below 124 ACU; at the same time it reads
-`GPU_FAULT_REMEDIATION_MAX_ACTIVE_*` from every control-worker Pod one by one and requires them
-to match the 32/50-cluster budgets of the table below exactly (a release after the fixed limits' retirement: Region,
-per cluster and per resource class absent, per node and per failure domain at 1). The results are written to
+`GPU_FAULT_REMEDIATION_MAX_ACTIVE_*` from every Running control-worker Pod one by one and requires Region, per cluster
+and per resource class absent and per node and per failure domain at 1, whatever the cluster count, so a release that
+still carries the fixed limits fails closed before registration. The results are written to
 `aurora-preflight.json` and `remediation-budget-preflight.json` respectively.
 Before registration the runner also mirrors the connection Secret from the data-plane identity
-namespace (`GPU_FAULT_PERF_IDENTITY_NAMESPACE`) into the perf namespace (the perf namespace is
-recreated across sites and would otherwise retain the previous site's CA and token); it fails
+namespace (`GPU_FAULT_PERF_IDENTITY_NAMESPACE`) into the perf namespace (the perf namespace outlives a site rebuild
+and would otherwise keep the previous site's CA and token); it fails
 closed when the identity namespace lacks that Secret, and the mirror result is written to
 `connection-secret-preflight.json`.
 
@@ -1161,7 +1175,8 @@ The spool mode must come from a formal config-only release. The runner checks th
 environment of every ingress Pod, the spool-worker replica count and the five remediation budget
 tiers of every control-worker one by one; online `kubectl set env` is not allowed. The report
 records the code release ID, the global configuration SHA and the three role configuration
-SHAs. The runner must also check that the live ingress start command contains no
+SHAs (the runner records only the release ID and the wheel and module digests; whoever runs the round adds the
+configuration digests from the `gpu-fault-admin config` output to the formal record). The runner must also check that the live ingress start command contains no
 `--limit-max-requests` or the corresponding jitter parameter; when an old release still recycles
 by request count, it fails closed before registering synthetic clusters, and "restart the
 workers first every round" to zero the accumulated request count cannot be used to claim
@@ -1171,23 +1186,27 @@ steady-state capacity passed. The check result is written to
 The integrated runner's final verdict must verify:
 
 ```text
-fixed P0/P50/P100 request counts match exactly
+request total and the XID (NVIDIA_KERNEL) and SXID (FABRIC_MANAGER_LOG) counts match the fixed matrix exactly
 mixed ingress Indexed Job = Complete
+the load generators' DNS process cache active: one resolution, at least one address, cache hits covering every request
 P0 (NVIDIA_KERNEL, FABRIC_MANAGER_LOG) and evidence paths: HTTP 429/503 and client errors are all 0
-routine telemetry paths (GPU_INVENTORY, GPU_METRICS, HOST_TELEMETRY) may show the reserved 503 of §6.1 at a share ≤ 2% (recorded in ingress.reserved_rejections / reserved_rejection_share); 429 and other non-2xx are 0
+routine telemetry paths (GPU_INVENTORY, GPU_METRICS, HOST_TELEMETRY) may show the reserved 503 of §6.1 at a share ≤ 2% (recorded in ingress.reserved_rejections / reserved_rejection_share); 429 and other non-2xx are 0. The ingress normal-tier concurrency derives from the preset's managed node count (the 50-cluster preset: 2560 per process); at a fixed 1000 the share reached 0.58-3.85%
 first transport retry = 0 on every path
-incident/workflow count = clusters × 4
+incident/workflow count = clusters × 4, and every incident carries attempt context
 every action workflow = SUCCEEDED
 remote command count = clusters × 30
 every command terminal with result_details.simulated = true
 workflow step count within 8..12
-reset, fabric reset, reboot, containment and restore operations all covered
+reset, fabric reset, reboot, containment, diagnostic and restore operations all covered
 duplicate claim/idempotency/workflow step = 0
 fencing mismatch, claim/result error, permanent budget waiter = 0
 control-plane Pod set unchanged, container restart delta = 0, no readiness flap and all Ready at the end
 at least one lease renewal on a long action
-processor queue and spool back to the depth from before the round started
 ```
+
+Whether the processor queue and the spool return to their depth from before the round is not part of the verdict:
+`summary.json.queue_drain` records up to 900 seconds of draining after the load stops (the target is the pre-run depth
+plus 4, or 1 when the pre-run depth is at most 1), and whoever runs the round checks it.
 
 To additionally verify automatic escalation to reboot after a `RESET_GPU` or fabric reset
 failure, same-rank aggregation and preemption, the `regional_correlated_action_suite.py` of §8.3
@@ -1208,14 +1227,15 @@ status.json = ok
 summary.json.status = PASS
 Job/Pod in cleanup-workloads.json are all empty
 incident/workflow/command in cleanup-residuals.json are all 0
-registry-postflight.json contains no synthetic registration from this round
+registry-postflight.json removed equals this round's registered count (its synthetic_entries are the pre-cleanup snapshot), and registry-alignment-postflight.json passes
 every workflow and command is terminal
 ```
 
-Once the runner enters `finally` it must temporarily mask `SIGINT`, `SIGTERM` and `SIGHUP` and
-explicitly wait until both Jobs and all their Pods are deleted. The first termination signal only
-changes the round's result to aborted and cannot interrupt the bounded teardown; any remaining
-resource or database/registry residue still fails the round.
+Once the runner enters the teardown in `finally` it ignores `SIGINT`, `SIGTERM` and `SIGHUP` (a signal arriving then is
+dropped and changes no result) and explicitly waits until both Jobs and all their Pods are deleted; any remaining
+resource or database/registry residue still fails the round. Before the teardown, `SIGINT` interrupts the round as a
+KeyboardInterrupt, which still goes through the teardown and is recorded aborted; `SIGTERM` and `SIGHUP` have no handler
+and end the process without a teardown, which the §8.1 recovery command then completes.
 
 After the measurement window ends, the runner reads load/executor Pod logs with at most 16-way
 concurrency and sorts them by Indexed Job completion index before writing artifacts and
@@ -1224,14 +1244,16 @@ window, request model, latency samples or verdict; any read exception still fail
 closed.
 
 On any verdict failure, critical alert, undrained queue, cleanup residual, unconverged registry
-or unavailable Aurora, stop the remaining rounds immediately. Failed artifacts go into
-`aborted/` and cannot serve as formal PASS evidence.
+or unavailable Aurora, stop the remaining rounds immediately. A run that ends in an exception has its directory moved
+under `<artifact-root>/_aborted/`; a verdict FAIL stays where it is with `status.json` `aborted` (reason `integrated
+verdict failed`). Neither can serve as formal PASS evidence.
 
 The runner records each round's starting Min/Max in `aurora-preflight.json.initial_scaling`
 (`scaling_modified` is always false, `administrator_managed: true`) and never modifies Aurora. After all
 rounds end, run `gpu-fault-admin config` once with the AdminConfig saved before the load test: the site
 configuration is restored together with its `aurora` window through the reviewed path (`config` waits for the
-cluster and both `db.serverless` instances to be available on the original window), then run `verify` again. If a
+cluster and both `db.serverless` instances to be available on the original window and has run verify/stability), then
+check with `gpu-fault-admin status --full`. If a
 `config` refuses with `AuroraCapacityDriftError` (the live window is neither the reviewed current nor the target;
 the refusal happens before any modify, no Aurora compensation is made and `desired.json` is restored to the
 pre-change configuration), follow its hint: first `gpu-fault-admin deploy --state-dir <dir>` to converge Aurora
@@ -1245,7 +1267,9 @@ A release after the fixed limits' retirement bounds a correlated fault with each
 remediation (a workflow's first admission of budgeted work) reach `max(3, ceil(20% x the cluster's GPU nodes))` and span
 at least two workload domains (the job, else the incident), the cluster's new destructive work is held (the whole
 workflow stays `PENDING`, its last refusal naming `storm:<cluster>`), work in flight goes on, the critical
-`GpuFaultRemediationStormBreakerOpen` fires, and nothing resumes until an operator releases or aborts it. The cluster's
+`GpuFaultRemediationStormBreakerOpen` fires. Only an operator's release resumes new destructive work; an abort keeps
+the breaker open (state `ABORTED`) and hands the held workflows to the operator as `SUPERSEDED`, their incidents
+`ESCALATED`. The cluster's
 GPU nodes are its fleet Agents that are `ACTIVE` or `DRAINING`, whatever their lease, counted at the cluster's first
 admissions and at most once a minute per control-plane process (`storm_admission.cluster_gpu_nodes`); a failed read keeps
 the last good count for up to 300 s, and only without one is it the floor of 3. 20%, 600 s and 3 are product constants,
@@ -1261,7 +1285,11 @@ let the model reach the threshold. The fleet
   `fleet-agents` mode), with the identity the model's own Agents carry; the action seed in turn saves all of its Agents
   before its first workflow, so no first admission is judged against a partial cluster;
 - belongs to the run: node ids `fleet-node-<run>-c<NNN>-n<NNNN>` in the run's own registered `perf-cap-*` clusters, which
-  the teardown's record walk takes whole;
+  the teardown's record walk takes whole (the walk's bound widens with the cluster count and the (cluster, node) pairs
+  the run's records touch: 4000 records per cluster, 48 per node -- a synthetic node now leaves 27 rows of latest host
+  telemetry (it was 5), about 260-270k records for a 32-cluster x 256-node round; the reference lookup carries no Agent,
+  latest-telemetry, collector-state or inventory-snapshot key, since nothing references them, which took the walk from
+  158 s to 16 s, inside the cleanup transaction's 120-s statement timeout);
 - heartbeats for the whole run: one `kubectl exec -i` session in an api-ha Pod (`scripts/perf/synthetic_fleet_pod.py`,
   the arrangement of the §8.4 validation-telemetry session: the program length-prefixed on stdin, the rest of stdin its
   stop channel) renews every fleet Agent's `last_seen_at` and lease by compare-and-set, one pass every 300 s against a
@@ -1333,8 +1361,9 @@ bounded:
    operator exit acts on) has the 4, each `PENDING` on `storm:perf-cap-000` with no remote command and never `RUNNING`
    while the breaker is open; the 12 admitted workflows run to `SUCCEEDED` while it stays open; the breaker records the
    operator notice (`notified_trip_id` equals `trip_id`; a `perf-cap-*` notice is a drill and is not delivered); the
-   `gpu_fault_remediation_budget_storm_breaker_{open,threshold_nodes,window_nodes,held_workflows}` gauges of an api-ha
-   Pod's `/metrics` read 1/52/52/4; and AMP's `/api/v1/alerts` reports `GpuFaultRemediationStormBreakerOpen` `firing`
+   `gpu_fault_remediation_budget_storm_breaker_{open,threshold_nodes,window_nodes,held_workflows}` gauges of a
+   control-worker Pod's `/metrics` read 1/52/52/4 (cluster-level gauges only the worker tier that runs the background
+   services renders; api-ha's ingress tier does not); and AMP's `/api/v1/alerts` reports `GpuFaultRemediationStormBreakerOpen` `firing`
    with `cluster_id="perf-cap-000"`;
 3. release: the operator exit releases the breaker (below) and the step records when;
 4. `drain` (`--drain-timeout-seconds`, 900): every held workflow runs to `SUCCEEDED` and the breaker stays `CLOSED` with an
@@ -1348,14 +1377,16 @@ durations one workflow takes about 140 s (the 120-s reboot dominates), so the re
 dispatcher's pickup of the held rows.
 
 A phase that times out fails the step; the release still runs after a `hold` timeout, so a missing alert never strands
-the held work. Whatever ends the step -- `PASS`, `FAIL`, an exception or a signal -- its cleanup reads the breaker and,
+the held work. Whatever ends the step -- `PASS`, `FAIL`, an exception or `SIGINT` (`SIGTERM`/`SIGHUP` end the process
+before the cleanup, see §8.4) -- its cleanup reads the breaker and,
 when it is still open, hands the held work over (`abort`) and releases it, then reads it `CLOSED`
 (`storm-breaker-exit.json`); the fleet's exit checks once more; the teardown then purges and deregisters the cluster and
 `fleet-cleanup.json` proves no Agent and no breaker record is left. `summary.json.checks` lists each criterion
 (`fleet_counted`, `tripped_at_planned_admission`, `held_while_open`, `in_flight_completed_while_open`, `operator_notice`,
 `gauges_read_the_trip`, `alert_firing`, `released`, `held_completed_after_release`, `no_recount_after_release`,
-`alert_resolved`, `executor_clean`), every one read from the product's own state -- the breaker record, the workflow and
-command rows, the gauges and AMP's alert state -- never from log text.
+`alert_resolved`, `executor_clean`). Except `executor_clean`, which reads the simulated executors' JSON documents
+through `kubectl logs`, every one is read from the product's own state -- the breaker record, the workflow and command
+rows, the gauges and AMP's alert state -- never from log text.
 
 Constraints:
 
@@ -1389,7 +1420,9 @@ spool enabled/disabled must use:
 
 The configuration switch must go through the formal rollout process and must not merely modify
 the environment variables of some Pods. Before each round, confirm that the service role, spool
-setting and module digest of all non-zero replicas are exactly the same.
+setting and module digest of all non-zero replicas are exactly the same (the integrated runner only checks
+`GPU_FAULT_TELEMETRY_SPOOL` on every Running api-ha and spool-worker Pod and reads the module digest from the first api-ha
+Pod; the burst runner checks no spool mode; the rest is checked by whoever runs the round).
 
 ## 10. Verdicts
 
@@ -1399,6 +1432,12 @@ Formal results are one of:
 - `FAIL`: any threshold failed;
 - `INVALID`: version drift, load generator saturation, missing metrics, failed cleanup or an inconsistent test model;
 - `PASS_WITH_LIMITATIONS`: allowed only for explicit limitations that do not affect the core thresholds.
+
+The runners produce only part of this: the `summary.json.status` of the integrated runner, the correlated runner and the
+storm breaker step, and the `verdict` of `fleet.json`, are only `PASS`/`FAIL`, the Aurora measurement adds
+`PASS`/`FAIL`/`UNVERIFIED`; the burst and action runners give no verdict; `status.json` says
+`running`/`ok`/`aborted`/`measurement-failed`. `INVALID` and `PASS_WITH_LIMITATIONS` are the reviewer's call under this
+section.
 
 The report must also record the direction of failure and cannot offer only averages or
 throughput. Capacity may never be declared passed in the following situations:
@@ -1410,8 +1449,10 @@ throughput. Capacity may never be declared passed in the following situations:
 - several logical clusters used in place of a single-cluster hot-spot test;
 - only ingress observed with spool enabled, not the spool-worker;
 - results of a historical release used in place of the current release.
-- a release that supports the remediation budget ran only the production-budget tier or only the raw-capacity tier;
-- the five budget tiers not recorded, or budget active/wait metrics missing;
+- a release that carries the fixed remediation budget limits (before their retirement) ran only the production-budget
+  tier or only the raw-capacity tier;
+- the five budget tiers not recorded, or budget active/wait evidence missing (the runners' metric snapshots do not keep
+  `gpu_fault_remediation_budget_*`; the store readings of `remediation-budget.json` are the evidence);
 - a claim to have verified the failure-domain budget while the synthetic workflows have no domain field;
 - on a release after the fixed limits' retirement, an action, correlated or integrated step without `fleet.json` or with
   its `verdict` `FAIL` (§8.5), or a remediation storm breaker step with any `summary.json.checks` entry false.
@@ -1442,14 +1483,26 @@ pods/
 executors/
 ```
 
+That list is the union of the runners' artifacts; each runner writes part of it: the burst runner
+(`regional_capacity_suite.py`) writes run/status/summary, the metrics/cgroup/postgres before/after, `queue-drain.json`,
+`processor-timeseries.json`, `pg-activity.json`, `processor-priority-latency.json`, `aurora.json` and `pods/`; the
+integrated runner writes run/status/summary, the metrics/cgroup/postgres and `control-pods-*` before/after, its
+preflights (`ingress-process-model-preflight.json` among them), `workflow-history.json`, `load-pods/` and
+`executor-pods/`, with the drain, the priority latency and the Aurora series inside `summary.json` only; the action
+runner writes run/status/summary, the metrics/cgroup/postgres before/after, `history.json`, `remediation-budget.json`
+and `executors/`; the correlated runner writes run/status/summary, `job.json`, `terminal-drain.json` and `pods/`. The
+action, correlated and integrated runners also write `fleet.json` and `fleet-cleanup.json`; the storm breaker step's
+artifacts are listed below.
+
 Every ingress path in `summary.json` must include classified `transport_retries` counts; the
 executor must include `claim_error_counts` and bounded, redacted `claim_error_samples`, the retried
 `claim_retry_counts`/`result_retry_counts` beside the fatal `result_error_counts`, and `fatal` for every
 executor Pod that failed (§8.2). The burst,
-integrated and action runners' `run.json` and `summary.json` must also include `placement` (the Aurora
-writer instance, its Availability Zone and the control-plane node Availability Zones, §8.1; `recorded=false`
-for an action round that names no Aurora cluster), and the integrated and correlated runners' `summary.json`
-must also include `validation_telemetry` (§8.4, §8.3). All three
+integrated, action and correlated runners' `run.json` and `summary.json` must also include `placement` (the Aurora
+writer instance, its Availability Zone and the control-plane node Availability Zones, §8.1; for an action or
+correlated round that names no Aurora cluster `run.json` has no such key and `summary.json.placement` is
+`recorded=false`), and the integrated and correlated runners' `summary.json`
+must also include `validation_telemetry` (§8.4, §8.3). The burst, integrated and action
 runners' `summary.json` must also carry `store_bloat`: `before`/`after` derive, from the `hot_tables`
 section of `postgres-before.json`/`postgres-after.json`, each hot table's live rows, heap pages, index
 pages, `heap_pages_per_live_row`, `index_pages_per_live_row`, `index_min_entries_per_page`, `index_max_pages` (the
@@ -1463,7 +1516,7 @@ fresh or just-compacted store reads far below 1 on both ratios; a store left unc
 previous round's teardown reads in the tens (§3.2). From schema v23 `summary.json` must also carry
 `store_layout` (§3.3): the `mode` (`inline`/`detached`) and, in the `before`/`after` snapshots, the partition
 counts, pages and live rows of `gpu_fault_gpu_metric_latest_clusters` and `gpu_fault_processor_replays`;
-`recorded=false` means a control plane older than v23. A formal record must also state the round's label
+`recorded=false` means a control plane older than v23 or a failed in-Pod snapshot. A formal record must also state the round's label
 (`optimistic_bound`/`steady_state`, §3.3) with the two values it is derived from --
 `store_bloat.before.gpu_fault_processor_queue.index_pages_per_live_row` and `store_layout.mode` -- and the
 `pg_stat_activity` sampler summary of the first two storm minutes (active statement samples, `LWLock:BufferContent`
@@ -1480,7 +1533,7 @@ non-zero it cannot count as a formal PASS.
 
 `processor-priority-latency.json` (also `summary.json.processor_priority_latency`) is the per-tier
 completion latency of the round's requests: per tier `completion_latency` (count and p50/p95/p99/max in
-ms), `cluster_fairness` (the spread of the per-cluster p99) and `status_counts`, scoped to the synthetic
+ms), `cluster_fairness` (the minimum, maximum and mean of the per-cluster p99) and `status_counts`, scoped to the synthetic
 clusters and to requests created since the load Job was created (`since_epoch`). It reads where
 `layout_mode` keeps completed requests: in `inline` the queue's COMPLETED rows with their stored
 priority, in `detached` the `gpu_fault_processor_replays` rows (`completed_source`); both tables are read,
@@ -1559,6 +1612,11 @@ Unless a table says otherwise, the reference experiments use:
 - processor cluster depth 1024, fault reserved cluster depth 128;
 - spool cluster depth 1024 except in the single-cluster depth4096 experiment;
 - PostgreSQL deadlock 0 in all listed experiments.
+
+That was the configuration of the time, not what the current release renders: by default the processor cluster depth is
+now 4096 and the fault reserved cluster depth 512 (`max(4096 / 8, largestClusterNodeCount 512)`), and the enabled presets
+run 5 control-workers -- 6 control-workers plus 3 spool-workers and the ingress pool of 48 need 1302 connections, above
+the 1240 budget, and the configuration validation refuses them (Administrator Capacity Configuration §4.7).
 
 The two single-cluster samples are:
 
@@ -1649,7 +1707,7 @@ about the depth change is: single-cluster spool 429s fell from 243 to 0.
 
 ### 13.5 Latest 32/50-Cluster spool A/B
 
-This group used the currently signed release, Aurora `Min=124, Max=128`, and the Pod, process,
+This group used the release signed at the time, Aurora `Min=124, Max=128`, and the Pod, process,
 connection pool and dedicated spool-worker configuration of §13.1. The load generator used 256
 workers, 60 seconds, cold connections; the request matrix used the fixed 32/50-cluster model of
 §4.1.
@@ -1782,7 +1840,7 @@ experiments.
 
 ### 13.6 Latest Four Formal Integrated Workflow Rounds
 
-This group used the same signed release and the formal runner of §4.2, and on top of the fixed
+This group used the same signed release and the formal runner of §8.4, and on top of the fixed
 ingress matrix of §13.5 created 4 workflows per cluster with full attempt/workload causal
 identity at the same time. 32 clusters executed 128 workflows and 960 simulated remote commands
 in total; 50 clusters executed 200 workflows and 1500 simulated remote commands. Resets and
@@ -1839,7 +1897,7 @@ Reading:
 - the single DNS pre-resolution and process cache eliminated the DNS query storm the cold-connect
   load Pods used to produce; this group had no recovered or final transport retries at all.
 
-These four rounds are the current release's formal integrated ingress, workflow and remote-command
+These four rounds are that release's formal integrated ingress, workflow and remote-command
 evidence, but each mode still has only one sample. The trend can be used for regression and
 capacity judgement and cannot replace multi-round variance, cost and target SLO review.
 
@@ -1885,23 +1943,27 @@ small and cannot explain second-level latency.
 3. **A spool cluster depth of at least 4096 is recommended for a 1000-node single cluster.**
    3000 synchronous P100 items trip the expected 429 at depth1024. 4096 should only be a capacity
    value in the very-large-cluster profile and must not be turned into the global default for all
-   sites without verification; the per-cluster cap must also be kept.
+   sites without verification; the per-cluster cap must also be kept. The depth is the AdminConfig field
+   `spec.capacity.telemetrySpool.maxClusterDepth` (default 1024); no rule derives it from `largestClusterNodeCount`, so
+   set it explicitly for the cluster size; what a change of it alone rolls is in Administrator Capacity Configuration §7.
 4. **Shorten the node/attempt lane holder first.** Move parallelizable parsing, evidence writes
    and policy precomputation outside the lane, and commit incident/workflow only in a short
    transaction; pure telemetry/evidence should be separated from node-control by conflict domain.
 5. **Add complete performance evidence for the lane holder.** Artifacts must collect the path
    label of `gpu_fault_processor_lane_holder_seconds` and write the before/after delta into the
-   summary, not only the cumulative lane wait.
+   summary, not only the cumulative lane wait (today the runners' metric snapshot filters that family out and the
+   summary has no such delta).
 6. **Continue A/A and A/B on batch delay as a candidate configuration.** The current values
    improve completion p99 but increase rollbacks; repeat at least 3 rounds and check rollback
    causes, pool checkout and admission batch expired before it becomes the production default.
-   The delay is now the AdminConfig field `spec.processor.admissionBatchDelaySeconds` (default
+   The routine admission delay is now the AdminConfig field `spec.processor.admissionBatchDelaySeconds` (default
    0.002, unchanged by the presets), so A/B rounds change the value per site without a code
-   change; the candidate range is 20-50 ms: with the ingress's routine admission batch cap of 64,
+   change (the fault and evidence tiers' 0.002 and the spool's 0.01 are renderer constants, so the §13.3 tuned
+   group's evidence 0.01 and spool 0.05 cannot be reproduced through AdminConfig alone); the candidate range is 20-50 ms: with the ingress's routine admission batch cap of 64,
    at about 1,000 req/s the average flush grows from 9.7 items to about 29-48, cutting admission
    transactions 3-5x at the cost of at most the delay in added acceptance latency. The window is
-   adaptive now: once the flush-duration EWMA passes 100 ms it rises to
-   `spec.processor.admissionBatchDelayMaxSeconds` (default 0.05) and falls back as the store
+   adaptive now: once the flush-duration EWMA passes 100 ms it rises linearly, reaching
+   `spec.processor.admissionBatchDelayMaxSeconds` (default 0.05) at 200 ms, and falls back as the store
    recovers, so an A/B only compares the base delay. The site-wide range of concurrent admission
    flushes (ceilings `admissionFlushConcurrency` and friends, defaults 96/48/24; floors
    `admissionFlushConcurrencyFloor` and friends, defaults 96/48/12 -- the routine and fault floors equal their
@@ -1923,8 +1985,10 @@ small and cannot explain second-level latency.
    alone, and items per flush are not a lever the coalescing window can pull either (see the closed-loop
    simulation in Administrator Capacity Configuration §4.6). The acceptance target for the default configuration
    is therefore 1,000+ req/s with zero reserved 503s and zero P0 503s; when reviewing a run read
-   `gpu_fault_processor_admission_batch_in_flight_limit` (constant at 8/4 on the routine/fault tiers with
-   `..._in_flight_limit_raised_total` / `..._lowered_total` at 0; the evidence tier may move within 1..2),
+   `gpu_fault_processor_{,fault_,evidence_}admission_batch_in_flight_limit` (per process constant at 8/4 on the
+   routine/fault tiers and within 1..2 on the evidence tier; an api-ha Pod's `/metrics` sums its 4 processes, so it
+   reads 32/16 and 4..8, the site 96/48 and 12..24; the per-process `..._in_flight_limit_raised_total` /
+   `..._lowered_total` at 0),
    `..._expired_total` (must be 0), the average flush duration (`gpu_fault_processor_admission_batch_flush_seconds_sum / _count`, close to
    81 ms), plus the peak active statement count (~113) and the `BufferContent` share (~1%) in the
    `pg_stat_activity` samples; where an administrator opens a range, the controller's only legitimate reason to
@@ -1934,7 +1998,8 @@ small and cannot explain second-level latency.
    the public/NLB first-request threshold.
 8. **The load tool must verify the processor final response.** An ingress 202 only means
    enqueued; a dry run once found background 422s. The formal tool should judge any non-2xx
-   receipt/final response as FAIL directly.
+   receipt/final response as FAIL directly (no runner checks it today: the load generators record ingress status codes
+   only and the priority-latency probe counts queue states, never the processor's final response).
 9. **Isolate periodic cloud queries for the synthetic registry.** An audit cluster carries a
    placeholder HyperPod name, so refreshing it only produces `ResourceNotFound` logs. The background
    identity refresh skips these entries by the registration's `synthetic` marker (it reads the
@@ -1944,7 +2009,9 @@ small and cannot explain second-level latency.
 10. **Before raising ACU further, check whether the bottleneck is still the database.** When
     Aurora CPU is already below about 70%–80% while lane wait is still at the second level, adding
     ACU has limited benefit; turn to transaction, lane and completion parallelism optimization.
-11. **Do not raise the production remediation budget just to pass the raw-capacity tier.** The
+11. **Do not raise the production remediation budget just to pass the raw-capacity tier.** (Only for releases
+    before the fixed limits' retirement; today no concurrency limit is tunable and the remediation storm breaker bounds
+    a correlated fault.) The
     production-budget tier first proves that the defaults limit fault storms without starvation;
     the raw-capacity tier raises the quota only in the isolated environment to expose the next
     layer of dispatcher, Store and Executor bottlenecks. If the business genuinely requires
@@ -1964,7 +2031,9 @@ small and cannot explain second-level latency.
     503s), GC (gen-2 pauses of 0.15-0.6 s are the longest single stall, far from 5 s). The fix: the dedicated `livez`
     port (probe median 10 ms, max 0.61 s under the same burst), 10 s x 3 probe parameters, `gc.freeze()` (-26% GC
     time, +7% throughput). During acceptance read `gpu_fault_listen_accept_queue_connections`, the
-    `gpu_fault_event_loop_lag_seconds` histogram and `gpu_fault_gc_collection_seconds_max`. Setting the flush stub to
+    `gpu_fault_event_loop_lag_seconds` histogram and `gpu_fault_gc_collection_seconds_max` (the runners' metric
+    snapshot keeps only the event loop lag, and none of the three is in the control-plane ADOT keep list: read the Pods'
+    `/metrics` directly). Setting the flush stub to
     8 ms of CPU per item (i.e. assuming the 81 ms flush is all CPU) gives 583 req/s and 43% 503s, inconsistent with the
     live 1,175 req/s and 0 non-2xx -- the live flush's 81 ms is mostly Aurora round-trip wait.
     Follow-up (the same reproduction plus `--launcher uvicorn|serve`, `--keep-alive`, per-socket accept queues and
