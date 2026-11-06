@@ -18,6 +18,7 @@ from gpu_fault.admin.aurora_capacity import (  # noqa: E402
 )
 
 if __package__:
+    from . import regional_integrated_evidence as evidence
     from .regional_action_capacity_suite import (
         aggregate_executor_documents,
         collect_executor_logs,
@@ -91,6 +92,7 @@ if __package__:
     )
     from .regional_validation_telemetry import start_validation_telemetry
 else:
+    import regional_integrated_evidence as evidence
     from regional_action_capacity_suite import (
         aggregate_executor_documents,
         collect_executor_logs,
@@ -965,6 +967,8 @@ def verdict(
         errors.append("executor did not complete every remote command")
     if int(executor.get("long_commands", 0)) and not int(executor.get("renewals", 0)):
         errors.append("long simulated actions produced no lease renewals")
+    errors.extend(evidence.drain_errors(summary.get("queue_drain")))
+    errors.extend(evidence.config_errors(summary.get("config_identity")))
     return ("PASS" if not errors else "FAIL", errors)
 
 
@@ -1028,6 +1032,7 @@ def execute_integrated_jobs(
     expected_workflows: int,
     aurora_preflight: dict,
     heartbeat_refresh: Callable[[], None],
+    config: dict,
 ) -> int:
     resources = RunResources(artifacts, run_id, NAMESPACE, dataplane)
     placement = start_placement(args.aurora_cluster_id, artifacts)
@@ -1123,6 +1128,7 @@ def execute_integrated_jobs(
         "run_id": run_id,
         "registry_scope": registry_scope,
         "spool_mode": spool,
+        "config_identity": config,
         "clusters": args.clusters,
         "fixed_matrix": fixed_matrix(args.clusters),
         "expected_workflows": expected_workflows,
@@ -1186,6 +1192,7 @@ def write_run_record(
     spool: dict,
     fleet: dict,
     resume: dict[str, str],
+    config: dict,
 ) -> None:
     """``run.json``: the formal model, how it is measured, and the resume fields
     that let the logged recovery command finish this run's teardown."""
@@ -1195,6 +1202,8 @@ def write_run_record(
             {
                 "run_id": run_id,
                 "spool_mode": spool,
+                # The site configuration the round ran on (perf plan §9).
+                "config_identity": config,
                 "clusters": args.clusters,
                 "nodes_per_cluster": FORMAL_NODES_PER_CLUSTER,
                 "workflows_per_cluster": args.workflows_per_cluster,
@@ -1247,6 +1256,7 @@ def run(args: argparse.Namespace) -> int:
         nodes_per_cluster=args.fleet_nodes_per_cluster,
     )
     spool = control_spool_mode(args.spool_mode)
+    config = evidence.config_identity(control)
     run_id = args.suite_id or datetime.now(timezone.utc).strftime(
         "integrated%Y%m%dT%H%M%S"
     )
@@ -1265,6 +1275,7 @@ def run(args: argparse.Namespace) -> int:
         resume=resume_identity(
             suite_id=run_id, scope=registry_scope, identity=identity
         ),
+        config=config,
     )
     write_status(artifacts, status="running")
     expected_workflows = args.clusters * args.workflows_per_cluster
@@ -1346,6 +1357,7 @@ def run(args: argparse.Namespace) -> int:
                 expected_workflows=expected_workflows,
                 aurora_preflight=aurora_preflight,
                 heartbeat_refresh=heartbeat_refresh,
+                config=config,
             )
     except BaseException as exc:
         failure = exc

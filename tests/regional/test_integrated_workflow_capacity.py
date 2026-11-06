@@ -17,6 +17,7 @@ from scripts.perf import benchmark_regional_action_executor as executor
 from scripts.perf import benchmark_synchronized_burst as burst
 from scripts.perf import regional_action_capacity_suite as action_suite
 from scripts.perf import regional_capacity_suite as capacity_suite
+from scripts.perf import regional_integrated_evidence as evidence
 from scripts.perf import regional_integrated_workflow_capacity_suite as suite
 from scripts.perf import seed_regional_action_workflows as seed
 from tests._builders import build_context
@@ -573,6 +574,31 @@ def test_executor_log_collection_accepts_integrated_job_name(
     assert f"batch.kubernetes.io/job-name={suite.EXECUTOR_JOB}" in calls[0]
 
 
+# A round that drained and ran on one configuration (test_perf_integrated_evidence).
+ROUND_EVIDENCE = {
+    "queue_drain": {
+        "target_queue_depth": 1.0,
+        "target_spool_depth": 1.0,
+        "samples": [
+            {"elapsed_seconds": 2.0, "queue_depth": 0.0, "telemetry_spool_depth": 0.0}
+        ],
+    },
+    "config_identity": {
+        "admin_config_sha256": "a" * 64,
+        "roles": {
+            role: {
+                "deployment": name,
+                "admin_config_sha256": "a" * 64,
+                "role_config_sha256": "b" * 64,
+                "running_pods": 1,
+                "pods_on_another_role_config": {},
+            }
+            for role, name in evidence.ROLE_DEPLOYMENTS.items()
+        },
+    },
+}
+
+
 def test_integrated_verdict_requires_causal_terminal_simulated_workflows() -> None:
     expected = 128
     summary = {
@@ -631,6 +657,7 @@ def test_integrated_verdict_requires_causal_terminal_simulated_workflows() -> No
             "long_commands": 32,
             "renewals": 32,
         },
+        **ROUND_EVIDENCE,
     }
 
     status, errors = suite.verdict(summary, expected_workflows=expected)
@@ -746,6 +773,7 @@ def test_integrated_verdict_rejects_ingress_http_errors(
             "long_commands": 32,
             "renewals": 32,
         },
+        **ROUND_EVIDENCE,
     }
 
     path = summary["ingress"]["paths"][kind]

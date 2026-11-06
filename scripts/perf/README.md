@@ -295,6 +295,10 @@ is split by responsibility:
   load stop.
 - `regional_capacity_placement.py`: the run's Aurora writer, its Availability
   Zone and the control-plane node zones.
+- `regional_integrated_evidence.py`: the integrated verdict's drain check and
+  the configuration it records and judges (`config_identity`: the global
+  AdminConfig digest and the three role configuration digests of the live role
+  Deployments and their Running Pods).
 - `regional_capacity_pods.py`: the control-plane Pod runtime snapshot and the
   lifecycle comparison the integrated verdict reads (replaced, added,
   restarted, not Ready, readiness flaps).

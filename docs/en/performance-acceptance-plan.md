@@ -1177,8 +1177,12 @@ The spool mode must come from a formal config-only release. The runner checks th
 environment of every ingress Pod, the spool-worker replica count and the five remediation budget
 tiers of every control-worker one by one; online `kubectl set env` is not allowed. The report
 records the code release ID, the global configuration SHA and the three role configuration
-SHAs (the runner records only the release ID and the wheel and module digests; whoever runs the round adds the
-configuration digests from the `gpu-fault-admin config` output to the formal record). The runner must also check that the live ingress start command contains no
+SHAs: before registration the integrated runner reads, from the three role Deployments, the global AdminConfig digest
+each Deployment carries (`gpu-fault.io/admin-config-sha256`) and each role's configuration digest on its Pod template
+(`gpu-fault.io/role-config-sha256`), checks that every Running Pod carries its Deployment's role digest, and writes it
+as `config_identity` into `run.json` and `summary.json` (`regional_integrated_evidence.config_identity`); a missing
+digest, Deployments carrying different global digests, or a Pod still on another role configuration (a roll in flight)
+fails the verdict. The runner must also check that the live ingress start command contains no
 `--limit-max-requests` or the corresponding jitter parameter; when an old release still recycles
 by request count, it fails closed before registering synthetic clusters, and "restart the
 workers first every round" to zero the accumulated request count cannot be used to claim
@@ -1204,11 +1208,14 @@ duplicate claim/idempotency/workflow step = 0
 fencing mismatch, claim/result error, permanent budget waiter = 0
 control-plane Pod set unchanged, container restart delta = 0, no readiness flap and all Ready at the end
 at least one lease renewal on a long action
+processor queue and spool back to the depth from before the round started
+the round ran on one configuration (config_identity: digests present, one global digest, no Pod on another role configuration)
 ```
 
-Whether the processor queue and the spool return to their depth from before the round is not part of the verdict:
-`summary.json.queue_drain` records up to 900 seconds of draining after the load stops (the target is the pre-run depth
-plus 4, or 1 when the pre-run depth is at most 1), and whoever runs the round checks it.
+The drain check reads `summary.json.queue_drain`: up to 900 seconds of draining after the load stops, against the
+pre-run depth plus 4 (or 1 when the pre-run depth is at most 1); a last sample whose queue depth is unreadable or above
+its target, or whose spool depth is above its target, fails the verdict with the depth and the time waited
+(`regional_integrated_evidence.drain_errors`).
 
 To additionally verify automatic escalation to reboot after a `RESET_GPU` or fabric reset
 failure, same-rank aggregation and preemption, the `regional_correlated_action_suite.py` of §8.3

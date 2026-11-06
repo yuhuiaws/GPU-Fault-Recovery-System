@@ -372,6 +372,11 @@ def caller(
         monkeypatch.setattr(module, "shell_run", forbidden)
         monkeypatch.setattr(module, "control_spool_mode", lambda _mode: {})
         monkeypatch.setattr(
+            module.evidence,
+            "config_identity",
+            lambda _control: {"admin_config_sha256": "test-admin-config"},
+        )
+        monkeypatch.setattr(
             module, "ingress_process_model_preflight", lambda: {"valid": True}
         )
         monkeypatch.setattr(
@@ -819,6 +824,9 @@ def test_integrated_run_records_how_its_workflow_latencies_were_measured(
     run = caller.report("run.json")
     assert run["simulated_command_completion"] == "per-command"
     assert run["validation_telemetry"] == "event-driven+periodic-30s"
+    configuration = {"admin_config_sha256": "test-admin-config"}
+    assert run["config_identity"] == configuration, "run.json names the config"
+    assert summary["config_identity"] == configuration, "and so does the summary"
 
 
 @pytest.mark.parametrize("caller", [correlated], indirect=True, ids=["correlated"])
