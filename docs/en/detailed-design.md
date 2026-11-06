@@ -2498,6 +2498,14 @@ Whole-record hardware recovery escalation is invoked idempotently by the Dispatc
    ESCALATE_SUPPORT (its completed end is QUARANTINED with the terminal notice); when a step after its cordon fails (the
    job stop), it gets the same hand-off (`failure_outcome.owes_hand_off`: a QUARANTINE no RESTORE_SCHEDULING readmits,
    the terminal hold). A plan that cordons in order to release (a reset, a reboot, a cooldown) is not this rule's.
+8. A diagnostic contract (ENVIRONMENT_REVIEW and the older cooldown contracts) keeps every hardware rung away, not the
+   containment hand-off: when its MARK_UNSCHEDULABLE, QUARANTINE or RESTORE_SCHEDULING fails, the record takes the
+   containment stages every other chain takes (`escalation._contract_ends_classification`) -- `containment_or_release`:
+   FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → QUARANTINE → ESCALATE_SUPPORT; `containment_refused` when the adapter refused
+   the isolation: FREEZE_EVIDENCE → ESCALATE_SUPPORT. An ENVIRONMENT_REVIEW chain whose cordon failed held nothing and
+   ended `ESCALATED` with no mail; that `ESCALATED` now names a real escalation, the support-after successor that sends
+   one hardware escalation mail ("no node was taken out of service" when nothing is held). A cordon the executor
+   refused before dispatch opens no ticket; one with an unknown outcome gets the manual-confirmation ticket.
 
 ```mermaid
 flowchart LR

@@ -62,7 +62,12 @@ sink retry, within the bounded observed journal window. Omitted, incomplete or
 exhausted receipts refuse proof. Observed truncation advances cursor generation;
 a polling reader cannot recover an undetectable truncate/rewrite between reads.
 DCGM thermal tests exercise persistent warning-to-critical delivery with actual
-collector/ingestion logic, not physical overheating.
+collector/ingestion logic, not physical overheating. The ENVIRONMENT_REVIEW
+chain's failure endings are software-tested only: a cordon that fails (nothing
+held) takes the containment hand-off -- `containment_or_release`, or
+`containment_refused` for a refused cordon -- whose support successor sends the
+one hardware escalation mail (`tests/orchestration/test_cov95_runtime_escalation.py`,
+`tests/orchestration/test_health.py`); no live variant makes the cordon fail.
 
 The GF-ENV-LIVE acceptance runner (`scripts/e2e/regional/run_env_live.py`) drives
 the audited loopback replay proxy and repoints only the single metrics collector

@@ -1225,3 +1225,115 @@ def test_a_quarantine_plan_whose_stop_fails_still_hands_the_node_to_support(
     assert context.store.get_incident(support_incident.incident_id).state is (
         IncidentState.ESCALATED
     )
+
+
+@pytest.mark.parametrize(
+    ("details", "stage", "steps", "subject"),
+    [
+        pytest.param(
+            {"node_failures": {"node-a": ["cordon patch failed"]}},
+            "containment_or_release",
+            [
+                WorkflowOperation.FREEZE_EVIDENCE,
+                WorkflowOperation.MARK_UNSCHEDULABLE,
+                WorkflowOperation.QUARANTINE,
+                WorkflowOperation.ESCALATE_SUPPORT,
+            ],
+            "[GPU FAULT][hardware out of service] ",
+            id="cordon-failed",
+        ),
+        pytest.param(
+            {"safety_rejection": True},
+            "containment_refused",
+            [WorkflowOperation.FREEZE_EVIDENCE, WorkflowOperation.ESCALATE_SUPPORT],
+            "[GPU FAULT][support escalation] ",
+            id="cordon-refused",
+        ),
+    ],
+)
+def test_an_environment_review_whose_cordon_fails_sends_exactly_one_hand_off_mail(
+    context: ApplicationContext,
+    details: dict,
+    stage: str,
+    steps: list[WorkflowOperation],
+    subject: str,
+) -> None:
+    """The ENVIRONMENT_REVIEW chain's cordon fails: nothing is held, and the
+    record used to end ESCALATED with no mail -- the contract's short-circuit
+    kept the containment hand-off away. It now gets the containment hand-off
+    every chain gets, so the ESCALATED is a real escalation: one support
+    successor, one hardware escalation mail saying what is held."""
+    from gpu_fault.adapters.support_escalation import SupportEscalationAdapter
+    from gpu_fault.execution import WorkflowStepOutcome
+    from gpu_fault.models import IncidentState, WorkflowExecutionRequest
+    from tests._builders import active_workflow_executor
+
+    incident, workflow = context.orchestrator.ingest_node_health(
+        _thermal_review_finding(WorkloadState.IDLE)
+    )
+    source = workflow.request_id
+    planned = [step.operation for step in workflow.official_steps]
+    assert planned[:2] == [
+        WorkflowOperation.FREEZE_EVIDENCE,
+        WorkflowOperation.MARK_UNSCHEDULABLE,
+    ], planned
+
+    class _SimulatedRuntime:
+        def __init__(self) -> None:
+            self.support = SupportEscalationAdapter(context.store)
+
+        def supports(self, step: WorkflowStepSpec) -> bool:
+            return step.execution_owner == "simulated-runtime"
+
+        def execute(self, step_context) -> WorkflowStepOutcome:
+            operation = step_context.step.operation
+            if operation is WorkflowOperation.ESCALATE_SUPPORT:
+                return self.support.execute(step_context)
+            if (
+                operation is WorkflowOperation.MARK_UNSCHEDULABLE
+                and step_context.workflow.request_id == source
+            ):
+                return WorkflowStepOutcome.failed(
+                    "the cordon did not land", details=details
+                )
+            return WorkflowStepOutcome.succeeded(
+                operation_id=step_context.idempotency_key
+            )
+
+    adapter = _SimulatedRuntime()
+    result = active_workflow_executor(context.store, [adapter], planned).execute(
+        source, WorkflowExecutionRequest(expected_fencing_token=workflow.fencing_token)
+    )
+
+    assert result.status is WorkflowStatus.FAILED
+    failed = context.store.get_workflow(source)
+    assert context.store.get_incident(incident.incident_id).state is (
+        IncidentState.ESCALATED
+    ), "nothing is held: the chain escalates"
+    assert context.store.list_notifications() == []
+
+    escalation = context.orchestrator.escalate_failed_hardware_remediation(failed)
+
+    assert escalation is not None, "the escalation must reach an operator"
+    support_incident, support = escalation
+    assert support.request_id == f"workflow-support-after-{source}"
+    assert support_incident.reasons[0].startswith(f"{stage} remediation failed"), (
+        support_incident.reasons
+    )
+    assert [step.operation for step in support.official_steps] == steps
+    assert context.orchestrator.escalate_failed_hardware_remediation(failed) == (
+        escalation
+    ), "one hand-off per failed chain"
+
+    handoff = active_workflow_executor(context.store, [adapter], steps).execute(
+        support.request_id,
+        WorkflowExecutionRequest(expected_fencing_token=support.fencing_token),
+    )
+
+    assert handoff.status is WorkflowStatus.SUCCEEDED
+    assert context.store.get_incident(support_incident.incident_id).state is (
+        IncidentState.ESCALATED
+    )
+    [mail] = context.store.list_notifications()
+    assert mail.incident_id == support_incident.incident_id
+    assert mail.subject.startswith(subject), mail.subject

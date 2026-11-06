@@ -221,7 +221,6 @@ def held_chain(
         (DRAIN_STOP_CHAIN, STOP, None),
         (DRAIN_CHAIN, BUNDLE, None),
         (ENV_REVIEW_CHAIN, STOP, ENV_REVIEW),
-        (ENV_REVIEW_CHAIN, QUARANTINE, ENV_REVIEW),
         (ENV_REVIEW_CHAIN, BUNDLE, ENV_REVIEW),
         (ENV_REVIEW_CHAIN, SNAPSHOT, ENV_REVIEW),
         (OPERATOR_CHAIN, CHECKPOINT, None),
@@ -231,7 +230,6 @@ def held_chain(
         "drain-stop",
         "drain-bundle",
         "environment-review-stop",
-        "environment-review-quarantine",
         "environment-review-bundle",
         "environment-review-snapshot",
         "operator-checkpoint-answered",
@@ -561,6 +559,121 @@ def test_a_quarantine_plan_keeps_its_deliberate_stop_endings(
 ) -> None:
     h = held_chain(QUARANTINE_PLAN, QUARANTINE_PLAN.index(STOP), details=details)
     terminal_hold(h)
+
+    classification = HardwareEscalationService.classify(h.workflow)
+
+    assert (classification and classification[0]) == expected, why
+    h.escalate()
+    assert len(h.store.list_workflows()) == (1 if expected is None else 2), why
+
+
+COOLDOWN = {"health_recovery_contract": {"mode": "THERMAL_COOLDOWN"}}
+REFUSED = {"safety_rejection": True}
+RESTORE = WorkflowOperation.RESTORE_SCHEDULING
+COOLDOWN_CHAIN = [FREEZE, CORDON, BUNDLE, SNAPSHOT, VALIDATE, RESTORE]
+
+
+@pytest.mark.parametrize(
+    ("operations", "failed", "details", "contract", "stage", "successor"),
+    [
+        (
+            ENV_REVIEW_CHAIN,
+            CORDON,
+            None,
+            ENV_REVIEW,
+            "containment_or_release",
+            [FREEZE, CORDON, QUARANTINE, SUPPORT],
+        ),
+        (
+            ENV_REVIEW_CHAIN,
+            CORDON,
+            REFUSED,
+            ENV_REVIEW,
+            "containment_refused",
+            [FREEZE, SUPPORT],
+        ),
+        (
+            ENV_REVIEW_CHAIN,
+            QUARANTINE,
+            None,
+            ENV_REVIEW,
+            "containment_or_release",
+            [FREEZE, CORDON, QUARANTINE, SUPPORT],
+        ),
+        (
+            COOLDOWN_CHAIN,
+            RESTORE,
+            None,
+            COOLDOWN,
+            "containment_or_release",
+            [FREEZE, CORDON, QUARANTINE, SUPPORT],
+        ),
+    ],
+    ids=[
+        "environment-review-cordon",
+        "environment-review-cordon-refused",
+        "environment-review-quarantine",
+        "cooldown-restore",
+    ],
+)
+def test_a_contract_chain_whose_isolation_fails_gets_the_containment_hand_off(
+    operations, failed, details, contract, stage, successor
+) -> None:
+    """A diagnostic contract keeps the hardware rungs away, never the operator:
+    its cordon, quarantine or restore that fails is handed over like in every
+    other chain (F-H1). The ENVIRONMENT_REVIEW chain whose cordon failed held
+    nothing and ended ESCALATED with no mail; it now opens the containment
+    hand-off, and ESCALATED names a real escalation."""
+
+    h = held_chain(
+        operations, operations.index(failed), details=details, contract=contract
+    )
+
+    classification = HardwareEscalationService.classify(h.workflow)
+    assert classification is not None, f"{failed.value} failed and nobody was told"
+    assert classification[:3] == (stage, RecoveryAction.ESCALATE_OPERATOR, SUPPORT)
+    result = h.escalate()
+    assert result is not None, "the failed isolation needs a durable hand-off"
+    incident, successor_workflow = result
+    assert incident.reasons[0].startswith(f"{stage} remediation failed"), (
+        incident.reasons
+    )
+    assert [step.operation for step in successor_workflow.official_steps] == (
+        successor
+    ), "a refused isolation is not planned again; no hardware rung either way"
+    assert h.escalate() == result, "one hand-off per failed chain"
+    assert len(h.store.list_workflows()) == 2
+
+
+@pytest.mark.parametrize(
+    ("details", "expected", "why"),
+    [
+        (
+            REJECTED,
+            None,
+            "refused before dispatch: a stale generation, a newer one owns it",
+        ),
+        (
+            UNKNOWN_OUTCOME,
+            "manual_confirmation_required",
+            "an operator confirms the cordon first: one ticket, not a second one",
+        ),
+    ],
+    ids=["executor-rejected", "unknown-outcome"],
+)
+def test_a_contract_chains_cordon_endings_match_every_other_chain(
+    details, expected, why
+) -> None:
+    """A cordon refused before dispatch opens nothing (no second ticket); one
+    whose outcome nobody knows gets the manual-confirmation ticket, the only
+    one -- the endings a cordon of any other chain has."""
+
+    h = held_chain(
+        ENV_REVIEW_CHAIN,
+        ENV_REVIEW_CHAIN.index(CORDON),
+        details=details,
+        contract=ENV_REVIEW,
+    )
 
     classification = HardwareEscalationService.classify(h.workflow)
 

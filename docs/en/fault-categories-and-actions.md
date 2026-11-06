@@ -130,8 +130,10 @@ on the read-only contract's list, training progress and observation recovery fol
 (`DIAGNOSTIC_ONLY`, no DCGM diagnostic, no hardware escalation); a confirmed temperature
 or thermal-throttle CRITICAL takes `ENVIRONMENT_REVIEW` (a terminal hold handed to an
 operator, no automatic cooldown readmission; a step of that chain that fails before its ESCALATE_SUPPORT is handed
-over by `workflow-support-after-<id>`, stage `held_chain_step`; an older persisted cooldown plan still
-finishes by its own rules); none of them enters the legacy DCGM failure escalation below
+over by `workflow-support-after-<id>`, stage `held_chain_step`; its cordon or QUARANTINE that fails takes the
+containment hand-off every chain gets, stage `containment_or_release` (`containment_refused` when the isolation was
+refused), so a failed cordon that held nothing no longer ends ESCALATED with no mail; an older persisted cooldown plan
+still finishes by its own rules, its failed cordon or RESTORE_SCHEDULING taking the same containment hand-off); none of them enters the legacy DCGM failure escalation below
 merely because the action enum is the same. The WARNING diagnostics of the newer DCGM
 fields (1423, 1424's unconfirmed duty cycle, the PCIe downtrain and 1501, 1211/1213, a
 degraded fabric health) are on that list too and diagnose read-only like the metric family

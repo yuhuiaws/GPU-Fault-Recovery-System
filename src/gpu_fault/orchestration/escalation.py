@@ -221,6 +221,21 @@ def node_action_refused_before_acting(details: Mapping[str, Any] | None) -> bool
     return attested and verdict in (None, "not-attempted", "not-applied")
 
 
+def _contract_ends_classification(
+    workflow: WorkflowRequest, failed_executions: list[WorkflowStepExecution]
+) -> bool:
+    """Whether a diagnostic contract ends the classification at the held-chain
+    rule: every failure is a contract step's and none is a containment or
+    release step. A cordon, quarantine or restore that failed goes on to the
+    hand-off every other chain gets (F-H1, the containment stages below): the
+    contract keeps the hardware rungs away, and that hand-off plans none."""
+
+    return diagnostic_workflow_failures(workflow, failed_executions) and not any(
+        execution.operation in _CONTAINMENT_RELEASE_OPERATIONS
+        for execution in failed_executions
+    )
+
+
 def _pre_action_classification(
     failed_executions: list[WorkflowStepExecution],
 ) -> tuple[bool, Any]:
@@ -742,7 +757,7 @@ class HardwareEscalationService:
             for execution in workflow.step_executions
             if execution.status is WorkflowStepStatus.FAILED
         ]
-        if diagnostic_workflow_failures(workflow, failed_executions):
+        if _contract_ends_classification(workflow, failed_executions):
             return held_chain_hand_off(workflow, failed_executions)
         handled, verdict = _pre_action_classification(failed_executions)
         if handled:
