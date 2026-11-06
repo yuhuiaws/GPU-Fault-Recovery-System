@@ -74,6 +74,35 @@ def held_nodes(
     return [node for node in dict.fromkeys(node_ids) if node in held]
 
 
+def record_held_nodes(workflow: WorkflowRequest) -> list[str]:
+    """The nodes ``workflow``'s own records leave held, in plan order.
+
+    Read from its step executions (:func:`held_nodes`); a row whose completed
+    steps have no execution records (written before completions were
+    recorded) falls back to its completed isolation and release steps.
+    """
+
+    steps = (
+        workflow.safety_steps
+        if workflow.executes_safety_steps
+        else workflow.official_steps
+    )
+    nodes = [node for step in steps for node in step.node_ids]
+    recorded = held_nodes([workflow], nodes)
+    if recorded:
+        return recorded
+    held: set[str] = set()
+    completed = set(workflow.completed_step_indexes)
+    for index, step in enumerate(steps):
+        if index not in completed:
+            continue
+        if step.operation in _ISOLATION:
+            held |= set(step.node_ids)
+        elif step.operation is WorkflowOperation.RESTORE_SCHEDULING:
+            held -= set(step.node_ids)
+    return [node for node in dict.fromkeys(nodes) if node in held]
+
+
 def hold_disposition(node_ids: Sequence[str], held: Sequence[str]) -> str:
     """The ``hardware_disposition`` of a hand-off naming ``node_ids``."""
 

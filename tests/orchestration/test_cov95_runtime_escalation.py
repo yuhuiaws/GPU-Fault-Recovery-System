@@ -348,6 +348,80 @@ def test_the_no_second_ticket_endings_still_open_nothing(
     assert len(h.store.list_workflows()) == 1, "no successor was opened"
 
 
+#: The steps a job family compiles for the job's whole allocation
+#: (``families/grouped_health.py``, ``grouped_faults.py``): a STOP or a
+#: CHECKPOINT names every node of the job, the cordon only the faulty one.
+JOB_WIDE = {STOP, CHECKPOINT}
+
+
+@pytest.mark.parametrize(
+    ("operations", "failed", "contract"),
+    [
+        (DRAIN_STOP_CHAIN, STOP, None),
+        (ENV_REVIEW_CHAIN, STOP, ENV_REVIEW),
+        (OPERATOR_CHAIN, STOP, None),
+        (OPERATOR_CHAIN, CHECKPOINT, None),
+    ],
+    ids=[
+        "drain-stop",
+        "environment-review-stop",
+        "operator-stop",
+        "operator-checkpoint",
+    ],
+)
+def test_the_hand_off_holds_only_the_nodes_the_chain_held(
+    operations, failed, contract
+) -> None:
+    """A job-wide step that fails names the whole allocation; the hand-off
+    keeps the chain's hold and must not cordon the job's healthy nodes."""
+
+    h = held_chain(operations, operations.index(failed), contract=contract)
+    h.amend(
+        official_steps=[
+            step.model_copy(update={"node_ids": ["node-a", "node-b"]})
+            if step.operation in JOB_WIDE
+            else step
+            for step in h.workflow.official_steps
+        ]
+    )
+
+    result = h.escalate()
+
+    assert result is not None, "the held node still needs its hand-off"
+    incident, successor = result
+    assert incident.node_ids == ["node-a"], incident.node_ids
+    assert {step.operation: step.node_ids for step in successor.official_steps} == {
+        FREEZE: ["node-a"],
+        CORDON: ["node-a"],
+        QUARANTINE: ["node-a"],
+        SUPPORT: ["node-a"],
+    }, "node-b was never held by the chain: the hand-off does not cordon it"
+    assert "node-b" not in incident.reasons[0], incident.reasons
+
+
+def test_a_row_without_its_completed_executions_hands_over_its_completed_hold() -> None:
+    """A record written before completions were recorded keeps only its FAILED
+    execution; its completed isolation steps still name the held node."""
+
+    h = held_chain(DRAIN_STOP_CHAIN, DRAIN_STOP_CHAIN.index(STOP))
+    h.amend(
+        step_executions=[
+            item for item in h.workflow.step_executions if item.operation is STOP
+        ],
+        official_steps=[
+            step.model_copy(update={"node_ids": ["node-a", "node-b"]})
+            if step.operation in JOB_WIDE
+            else step
+            for step in h.workflow.official_steps
+        ],
+    )
+
+    incident, successor = h.escalate()
+
+    assert incident.node_ids == ["node-a"], incident.node_ids
+    assert {step.node_ids[0] for step in successor.official_steps} == {"node-a"}
+
+
 def test_a_failed_support_hand_off_is_terminated_not_handed_off_again() -> None:
     """A support-after successor that holds its node and failed before its own
     ESCALATE_SUPPORT is the chain terminator's: no support-after-support."""

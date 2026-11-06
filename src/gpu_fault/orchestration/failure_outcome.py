@@ -13,6 +13,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from gpu_fault.handoff_hold import record_held_nodes
 from gpu_fault.models import (
     RecoveryAction,
     WorkflowOperation,
@@ -103,6 +104,12 @@ def held_chain_hand_off(
     generation's record: a newer one owns the incident); an abandoned step of
     :data:`NO_SECOND_TICKET_OPERATIONS` (the support escalation, the evidence
     freeze, the checkpoint that may still be running inside the job).
+
+    The hand-off keeps the chain's hold and never extends it: each failure's
+    ``failed_nodes`` is narrowed to the nodes the record holds
+    (:func:`held_scope`), so a job-wide STOP or CHECKPOINT -- compiled for
+    the whole allocation -- hands over the faulty node, not the job's healthy
+    ones.
     """
 
     if (
@@ -116,9 +123,41 @@ def held_chain_hand_off(
         )
     ):
         return None
+    scoped = held_scope(workflow, failed)
+    if not scoped:
+        return None
     return (
         HELD_CHAIN_STEP_STAGE,
         RecoveryAction.ESCALATE_OPERATOR,
         WorkflowOperation.ESCALATE_SUPPORT,
-        list(failed),
+        scoped,
     )
+
+
+def held_scope(
+    workflow: WorkflowRequest, failed: Sequence[WorkflowStepExecution]
+) -> list[WorkflowStepExecution]:
+    """``failed`` with each failure's ``failed_nodes`` set to the nodes of its
+    step the record still holds (``handoff_hold.record_held_nodes``); a
+    failure on none of them is dropped.
+
+    The escalation's scope reads ``failed_nodes`` within the step's nodes
+    (``escalation._failed_step_nodes``), so the support successor cordons,
+    quarantines and names exactly the held nodes.
+    """
+
+    held = set(record_held_nodes(workflow))
+    steps = workflow.official_steps
+    scoped = []
+    for item in failed:
+        step_nodes = (
+            steps[item.step_index].node_ids if 0 <= item.step_index < len(steps) else []
+        )
+        nodes = [node for node in step_nodes if node in held]
+        if nodes:
+            scoped.append(
+                item.model_copy(
+                    update={"details": {**item.details, "failed_nodes": nodes}}
+                )
+            )
+    return scoped

@@ -2489,7 +2489,10 @@ Whole-record hardware recovery escalation is invoked idempotently by the Dispatc
    executor before dispatch (a stale generation; a newer one owns the incident), or an abandoned ESCALATE_SUPPORT,
    FREEZE_EVIDENCE or CHECKPOINT_WORKLOADS with an unknown outcome (`NO_SECOND_TICKET_OPERATIONS`: a second ticket, or
    an evidence freeze or checkpoint that may still be running inside the job); neither do a read-only chain, a cooldown
-   plan or a hand-off that ran or failed.
+   plan or a hand-off that ran or failed. The hand-off keeps the chain's hold and never extends it: each failure's
+   `failed_nodes` is narrowed to the nodes the record still holds (`failure_outcome.held_scope`,
+   `handoff_hold.record_held_nodes`), so when a STOP_WORKLOADS or CHECKPOINT_WORKLOADS compiled for the job's whole
+   allocation fails, the successor cordons, quarantines and names the faulty node only, never the job's healthy ones.
 
 ```mermaid
 flowchart LR

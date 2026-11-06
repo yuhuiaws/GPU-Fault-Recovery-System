@@ -5763,7 +5763,7 @@ its cordon (RESET_GPU, or the VALIDATE_GPU after it) the incident reads QUARANTI
 `workflow-reboot-after-<id>` (then `workflow-replace-after-<id>`); a DRAIN chain whose VALIDATE_GPU fails has no hardware
 rung and opens the hand-off successor `workflow-support-after-<id>` (FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → QUARANTINE →
 ESCALATE_SUPPORT, which keeps and takes over that terminal quarantine), and so does a DRAIN, ENVIRONMENT_REVIEW or
-ESCALATE_OPERATOR chain whose job stop, diagnostic bundle, health snapshot or similar step fails before its hand-off. The successor's MARK_UNSCHEDULABLE/QUARANTINE now
+ESCALATE_OPERATOR chain whose job stop, diagnostic bundle, health snapshot or similar step fails before its hand-off; that hand-off holds only the nodes the chain held (a job-wide stop's other nodes are not cordoned). The successor's MARK_UNSCHEDULABLE/QUARANTINE now
 **takes over** the isolation the predecessor left on the node (the `gpu-fault.io/incident-id`/`fencing-token`
 annotations are rewritten to the successor incident, the `previous-unschedulable` baseline is kept) when: the incident on
 the node's annotations is the one whose workflow this successor escalates (event id `reboot-after-<workflow>`), that
