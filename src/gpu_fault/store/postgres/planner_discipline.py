@@ -13,10 +13,12 @@ about a minute.
 The claim transactions (``claim_active_processor_requests`` and the legacy
 ``claim_processor_requests``) therefore start with ``SET LOCAL enable_seqscan
 = off``, scoped to that transaction. The window's ``ORDER BY (priority,
-created_at, request_id) LIMIT window`` is exactly what ``gpu_fault_processor_
-queue_priority_claim`` / ``_path_priority_claim`` store, so once the heap scan
+created_at, request_id) LIMIT window`` is exactly what the schema v23 queue
+indexes store -- ``gpu_fault_processor_queue_claim_window``, and
+``gpu_fault_processor_queue_path_claim_window`` under a leading ``path`` for a
+path-filtered sub-window (``ddl_processor_layout``) -- so once the heap scan
 is priced out the planner walks the index in claim order and stops at the
-window, and the lane probes walk ``gpu_fault_processor_queue_lane``. Measured
+window, and the lane probes walk ``gpu_fault_processor_queue_lane_rows``. Measured
 on 5,000 PENDING rows with the planner's statistics fixed by the test
 (``tests/store/test_postgres_claim_planner_discipline.py``, numbers recorded as
 test properties): with the burst's statistics -- 138 rows analysed, then 4,862

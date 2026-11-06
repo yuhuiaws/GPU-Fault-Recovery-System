@@ -147,7 +147,7 @@ _CLAIM_ELIGIBLE_SQL = """\
 # backlog and a top-N sort instead, so the claim's cost grew with the path's
 # depth - the shape F-D2 removed for the unfiltered window (B-3 / G-3). The
 # fault stream excludes the dedicated paths; that stays a residual filter on
-# the priority_claim walk, which is still an ordered index walk.
+# the claim_window walk, which is still an ordered index walk.
 _PATH_EQUALS_SQL = """\
       AND candidate.path={path_literal}
 """
@@ -784,7 +784,7 @@ class PostgresProcessorClaimsMixin:
         """The exact statement ``claim_active_processor_requests`` runs.
 
         Exposed so a test can EXPLAIN it against the real schema (F-J3):
-        the window must walk ``gpu_fault_processor_queue_priority_claim``
+        the window must walk ``gpu_fault_processor_queue_claim_window``
         rather than sort the eligible backlog. The internal result also carries
         a continuation boundary; an empty claim has one NULL-payload metadata row.
         """
