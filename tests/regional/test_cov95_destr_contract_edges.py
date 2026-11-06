@@ -148,7 +148,7 @@ def test_fabric_preflight_requires_healthy_idle_owned_capability(
         (("commands", 0, "status"), "FAILED", "not uniquely SUCCEEDED"),
         (("evidence",), [], "kernel evidence"),
         (("notifications",), [], "notification is not unique"),
-        (("notifications", 0, "status"), "PENDING", "notification is not terminal"),
+        (("notifications", 0, "status"), "PENDING", "is PENDING, not SENT"),
     ],
 )
 def test_fabric_workflow_rejects_missing_or_wrong_proof(

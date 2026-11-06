@@ -23,6 +23,9 @@ from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     processor_queue_backlog,
     write_json_atomic,
 )
+from scripts.e2e.regional.fabric_restart_shape import (  # noqa: E402
+    normalize_notifications,
+)
 from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
     HostProbeFixture,
     HostProbeSettings,
@@ -41,6 +44,10 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     required,
     run_case_main,
     settings_from_arguments,
+)
+from scripts.e2e.regional.reset_notification_evidence import (  # noqa: E402
+    DELIVERY_WAIT_SECONDS,
+    wait_for_delivery,
 )
 
 PROBE_SCRIPT = Path(__file__).with_name("probes") / "node_host_probe.py"
@@ -188,37 +195,6 @@ def capability(profile: dict[str, Any] | None, name: str) -> dict[str, Any] | No
         if isinstance(item, dict) and item.get("capability") == name:
             return cast(dict[str, Any], item)
     return None
-
-
-def normalize_notifications(items: list[Any]) -> list[dict[str, Any]]:
-    """One notification shape for the verdict, whichever probe produced it.
-
-    The shared STORE_PROBE returns ``{"notification": {...}, "result": {...}}``
-    pairs; the flat ``{"notification_id", "category", "subject", "status"}``
-    shape is what this case recorded before it moved onto the shared fixture.
-    """
-
-    result = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        if "notification" in item:
-            notification = item.get("notification") or {}
-            delivery = item.get("result") or {}
-            result.append(
-                {
-                    "notification_id": notification.get("notification_id"),
-                    "category": notification.get("category"),
-                    "subject": notification.get("subject"),
-                    "status": delivery.get("status") if delivery else None,
-                    "provider_message_id_present": bool(
-                        delivery and delivery.get("provider_message_id")
-                    ),
-                }
-            )
-        else:
-            result.append(dict(item))
-    return result
 
 
 def focused_tests(case_dir: Path, *, reuse: bool = False) -> dict[str, Any]:
@@ -393,6 +369,8 @@ def workflow_errors(
     state: dict[str, Any],
     shape: str = shapes.FABRIC_MANAGER_RESTART,
     expected_gpus: Sequence[str] = (),
+    *,
+    drill_id: str | None = None,
 ) -> list[str]:
     errors = []
     event = state.get("event") or {}
@@ -400,9 +378,6 @@ def workflow_errors(
     workflow = state.get("workflow") or {}
     commands = state.get("commands") or []
     evidence = state.get("evidence") or []
-    notifications = shapes.shape_notifications(
-        normalize_notifications(state.get("notifications") or []), shape
-    )
     if event.get("xid") != 45:
         errors.append("matched event is not XID 45")
     if not str(event.get("evidence_ref") or "").startswith("kmsg://"):
@@ -419,16 +394,67 @@ def workflow_errors(
         errors.extend(_restart_workflow_errors(workflow, commands))
     if not evidence:
         errors.append("raw NVIDIA kernel evidence was not retained")
+    errors.extend(
+        shape_notification_errors(
+            state.get("notifications") or [], shape, drill_id=drill_id
+        )
+    )
+    return errors
+
+
+def shape_notification_errors(
+    notifications: list[Any], shape: str, *, drill_id: str | None
+) -> list[str]:
+    """The node action's one completion notification and its delivery result:
+    SENT, or kept back by the drill policy as this run's drill
+    (``fabric_restart_shape.notification_delivery_errors``)."""
+
     label = (
         "Fabric Manager action"
         if shape == shapes.FABRIC_MANAGER_RESTART
         else "GPU/NVSwitch reset"
     )
-    if len(notifications) != 1:
-        errors.append(f"{label} notification is not unique")
-    elif notifications[0].get("status") not in {"SENT", "SKIPPED"}:
-        errors.append(f"{label} notification is not terminal")
-    return errors
+    owed = shapes.shape_notifications(normalize_notifications(notifications), shape)
+    if len(owed) != 1:
+        return [f"{label} notification is not unique ({len(owed)} found)"]
+    return shapes.notification_delivery_errors(owed[0], drill_id=drill_id, label=label)
+
+
+def wait_for_shape_notification(
+    regional: RegionalLiveFixture,
+    state: dict[str, Any],
+    shape: str,
+    *,
+    node: str,
+    marker: str,
+    observed_after: datetime,
+    drill_id: str,
+) -> list[dict[str, Any]]:
+    """The incident's notifications once the shape's delivery result settled.
+
+    The completion notice is saved with the step that owes it, before the
+    workflow turns terminal; its result follows -- at once when the drill
+    policy keeps it back, from the asynchronous dispatcher when the site mails
+    it. A result still in flight is re-read for at most ``DELIVERY_WAIT_SECONDS``;
+    any other result is judged as it was read. ``time.sleep`` and
+    ``time.monotonic`` are looked up per call, so a test replaces the module's
+    ``time`` with a fake clock.
+    """
+
+    notifications, _errors = wait_for_delivery(
+        normalize_notifications(state.get("notifications") or []),
+        judge=lambda items: shape_notification_errors(items, shape, drill_id=drill_id),
+        pending=lambda items: shapes.notification_delivery_pending(
+            shapes.shape_notifications(normalize_notifications(items), shape)
+        ),
+        snapshot=lambda: regional.store_snapshot(
+            node=node, marker=marker, observed_after=observed_after, queue_attempts=1
+        ),
+        timeout_seconds=DELIVERY_WAIT_SECONDS,
+        sleep=time.sleep,
+        monotonic=time.monotonic,
+    )
+    return normalize_notifications(notifications)
 
 
 def _restart_workflow_errors(
@@ -462,10 +488,12 @@ def terminal_errors(
     terminal_fabric: dict[str, Any],
     shape: str,
     expected_gpus: Sequence[str],
+    *,
+    drill_id: str | None = None,
 ) -> list[str]:
     """The workflow verdict, and after a full reset every GPU's fabric state."""
 
-    errors = workflow_errors(state, shape, expected_gpus)
+    errors = workflow_errors(state, shape, expected_gpus, drill_id=drill_id)
     if shape == shapes.FABRIC_RESET:
         errors.extend(
             shapes.fabric_state_errors(
@@ -807,10 +835,18 @@ def _chain_phase(
     state = {
         **state,
         "evidence": terminal_fabric.get("evidence") or [],
-        "notifications": normalize_notifications(state.get("notifications") or []),
+        "notifications": wait_for_shape_notification(
+            regional,
+            state,
+            shape,
+            node=settings.node,
+            marker=marker,
+            observed_after=injected_at,
+            drill_id=run_id,
+        ),
     }
     write_json_atomic(case_dir / "workflow-state.json", state)
-    errors = terminal_errors(state, terminal_fabric, shape, graded)
+    errors = terminal_errors(state, terminal_fabric, shape, graded, drill_id=run_id)
     workflow_request_id = str((state.get("workflow") or {}).get("request_id") or "")
     command = replay_target(state, shape)
     generation = int((state.get("agent") or {}).get("generation") or 0)
@@ -885,6 +921,7 @@ def _chain_phase(
         errors.append("provider mutation appeared during DESTR-010")
     return errors, {
         "marker": marker,
+        "drill_id": run_id,
         "workflow": {
             "request_id": workflow_request_id or None,
             "status": (state.get("workflow") or {}).get("status"),

@@ -6,10 +6,11 @@ window (``xid45_opt_in``) and proves batch 128's full GPU + NVSwitch reset
 chain, it injects one solo XID 45 under the default and proves the default:
 the decision is MONITOR_ONLY / NO_ACTION with RESTART_FM still the official
 action; the incident is RECOVERED with no workflow, cites NVIDIA's GPU debug
-guidelines and says how to opt in; exactly the XID investigatory notification
-is sent; and nothing reached the node -- Fabric Manager's MainPID and
-InvocationID, the Agent ledger, the gpu-fault timers and the node's scheduling
-state are exactly the baseline's.
+guidelines and says how to opt in; its one notification is the XID
+investigatory notification, SENT or kept back by the drill policy as this
+phase's drill (``<run_id>-observe``); and nothing reached the node -- Fabric
+Manager's MainPID and InvocationID, the Agent ledger, the gpu-fault timers and
+the node's scheduling state are exactly the baseline's.
 """
 
 from __future__ import annotations
@@ -22,6 +23,10 @@ from typing import Any, Callable
 from scripts.e2e.regional import fabric_restart_shape as shapes
 from scripts.e2e.regional.acceptance_runner_common import write_json_atomic
 from scripts.e2e.regional.regional_live_fixture import RegionalFixtureError
+from scripts.e2e.regional.reset_notification_evidence import (
+    DELIVERY_WAIT_SECONDS,
+    wait_for_delivery,
+)
 
 #: After the decision lands, how long the phase keeps watching for a workflow
 #: or a node action that must not come.
@@ -61,28 +66,29 @@ def wait_finalized(
     raise RegionalFixtureError(f"the solo XID 45 was never finalized: {state}")
 
 
-def notification_errors(state: dict[str, Any]) -> list[str]:
-    """Exactly the XID investigatory notice, terminal; no completion notice."""
+def notification_errors(
+    state: dict[str, Any], *, drill_id: str | None = None
+) -> list[str]:
+    """Exactly the XID investigatory notice, no completion notice; the notice
+    SENT or kept back by the drill policy as ``drill_id``
+    (``fabric_restart_shape.notification_delivery_errors``)."""
 
-    items = [
-        {
-            **(item.get("notification") or {}),
-            "status": (item.get("result") or {}).get("status"),
-        }
-        if "notification" in item
-        else dict(item)
-        for item in state.get("notifications") or []
-        if isinstance(item, dict)
-    ]
+    items = shapes.normalize_notifications(state.get("notifications") or [])
     investigatory = shapes.shape_notifications(items, shapes.OBSERVE_ONLY)
-    errors = []
     if len(investigatory) != 1 or len(items) != 1:
-        errors.append(
-            f"expected only the XID investigatory notification, got {len(items)}"
-        )
-    elif investigatory[0].get("status") not in {"SENT", "SKIPPED"}:
-        errors.append("the XID investigatory notification is not terminal")
-    return errors
+        return [f"expected only the XID investigatory notification, got {len(items)}"]
+    return shapes.notification_delivery_errors(
+        investigatory[0], drill_id=drill_id, label="XID investigatory"
+    )
+
+
+def investigatory_delivery_pending(notifications: list[Any]) -> bool:
+    """Whether a later read could still settle the investigatory notice's result."""
+
+    items = shapes.normalize_notifications(notifications)
+    return len(items) == 1 and shapes.notification_delivery_pending(
+        shapes.shape_notifications(items, shapes.OBSERVE_ONLY)
+    )
 
 
 def run_phase(
@@ -99,6 +105,7 @@ def run_phase(
     companion_window_seconds: int,
     node_state_errors: Callable[..., list[str]],
     sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
     """Inject one solo XID 45 under the default and judge it; never raises
     for a verdict, only for a case that cannot continue."""
@@ -106,13 +113,14 @@ def run_phase(
     phase_dir = case_dir / "observe-only"
     phase_dir.mkdir(parents=True, exist_ok=True)
     marker = f"destr010-observe-{int(time.time())}-a{attempt}"
+    drill_id = f"{run_id}-observe"
     injected_at = datetime.now(timezone.utc)
     injection = fixture.execute(
         "write-xid45",
         "--marker",
         marker,
         "--drill-id",
-        f"{run_id}-observe",
+        drill_id,
         "--pci-bdf",
         baseline_host["gpu_pci_bdf"],
     )
@@ -127,14 +135,32 @@ def run_phase(
     )
     # Give a workflow or a node action that must not come the time to come.
     sleep(SETTLE_SECONDS)
-    state = regional.store_snapshot(
-        node=node, marker=marker, observed_after=injected_at, queue_attempts=1
+
+    def snapshot() -> dict[str, Any]:
+        value: dict[str, Any] = regional.store_snapshot(
+            node=node, marker=marker, observed_after=injected_at, queue_attempts=1
+        )
+        return value
+
+    state = snapshot()
+    # The notice's result follows the decision: at once when the drill policy
+    # keeps it back, from the dispatcher when the site mails it.
+    state["notifications"], _errors = wait_for_delivery(
+        list(state.get("notifications") or []),
+        judge=lambda items: notification_errors(
+            {"notifications": items}, drill_id=drill_id
+        ),
+        pending=investigatory_delivery_pending,
+        snapshot=snapshot,
+        timeout_seconds=DELIVERY_WAIT_SECONDS,
+        sleep=sleep,
+        monotonic=monotonic,
     )
     write_json_atomic(phase_dir / "store.json", state)
     host = fixture.execute("snapshot", "--since-epoch", str(injected_at.timestamp()))
     write_json_atomic(phase_dir / "host.json", host)
     errors = shapes.observe_only_errors(state, graded_gpus)
-    errors.extend(notification_errors(state))
+    errors.extend(notification_errors(state, drill_id=drill_id))
     if (state.get("event") or {}).get("xid") != 45:
         errors.append("matched event is not XID 45")
     if not str((state.get("event") or {}).get("evidence_ref") or "").startswith(
@@ -151,6 +177,7 @@ def run_phase(
     )
     report = {
         "marker": marker,
+        "drill_id": drill_id,
         "injected_at": injected_at.isoformat(),
         "incident_id": (state.get("incident") or {}).get("incident_id"),
         "decision": {

@@ -31,6 +31,11 @@ from __future__ import annotations
 
 from typing import Any
 
+from scripts.e2e.regional.reset_notification_evidence import (
+    DRILL_POLICY_MARKER,
+    PENDING_RESULT_STATUSES,
+)
+
 FABRIC_MANAGER_RESTART = "fabric-manager-restart"
 FABRIC_RESET = "fabric-reset"
 OBSERVE_ONLY = "observe-only"
@@ -324,6 +329,99 @@ def fabric_state_errors(grading: Any, expected_gpus: list[str]) -> list[str]:
             + ", ".join(sorted(pending))
         ]
     return []
+
+
+def normalize_notifications(items: list[Any]) -> list[dict[str, Any]]:
+    """One notification record for the verdict, whichever probe produced it.
+
+    The shared STORE_PROBE returns ``{"notification": {...}, "result": {...}}``
+    pairs; the flat ``{"notification_id", "category", "subject", "status"}``
+    shape is what DESTR-010 recorded before it moved onto the shared fixture.
+    A pair keeps what the delivery verdict reads (``notification_delivery_errors``):
+    the notification's drill label and its result's status, reason and provider
+    message id. A flat record passes through unchanged.
+    """
+
+    result = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if "notification" in item:
+            notification = item.get("notification") or {}
+            delivery = item.get("result") or {}
+            result.append(
+                {
+                    "notification_id": notification.get("notification_id"),
+                    "category": notification.get("category"),
+                    "subject": notification.get("subject"),
+                    "drill_id": notification.get("drill_id"),
+                    "status": delivery.get("status"),
+                    "reason": delivery.get("reason"),
+                    "provider_message_id": delivery.get("provider_message_id"),
+                    "provider_message_id_present": bool(
+                        delivery.get("provider_message_id")
+                    ),
+                }
+            )
+        else:
+            result.append(dict(item))
+    return result
+
+
+def notification_delivery_errors(
+    record: dict[str, Any], *, drill_id: str | None, label: str
+) -> list[str]:
+    """Why one of the case's notifications was neither delivered nor kept back
+    as this run's drill.
+
+    The case writes its XID 45 lines with a drill id, and whether drills are
+    mailed is the site's choice (``GPU_FAULT_NOTIFICATION_DELIVER_DRILLS``, off
+    by default), so both outcomes of the delivery decision pass: SENT with a
+    provider message id, or SKIPPED by the drill policy -- the reason names
+    ``DRILL_POLICY_MARKER`` -- on a notification labelled with ``drill_id``. A
+    SKIPPED for any other reason (an expired advisory, a disabled channel,
+    pre-watermark backlog) or on a notification without the run's drill, a SENT
+    without its provider message id and every other status are named with
+    their status and reason. ``record`` is a ``normalize_notifications`` entry.
+    """
+
+    status = record.get("status")
+    reason = str(record.get("reason") or "")
+    if status == "SENT":
+        if record.get("provider_message_id"):
+            return []
+        return [f"{label} notification is SENT without a provider message id"]
+    described = f"{status or 'unsent'}" + (f": {reason}" if reason else "")
+    if status != "SKIPPED":
+        return [f"{label} notification is {described}, not SENT"]
+    errors = []
+    labelled = record.get("drill_id")
+    if not drill_id or labelled != drill_id:
+        carried = f"drill {labelled}" if labelled else "no drill id"
+        errors.append(
+            f"{label} notification is SKIPPED but carries {carried}, "
+            f"not this run's drill {drill_id}"
+        )
+    if DRILL_POLICY_MARKER not in reason:
+        errors.append(
+            f"{label} notification is {described}, not SKIPPED by the drill "
+            f"policy ({DRILL_POLICY_MARKER})"
+        )
+    return errors
+
+
+def notification_delivery_pending(records: list[dict[str, Any]]) -> bool:
+    """Whether another store read could still settle the one notification judged.
+
+    Exactly one record whose result is absent or still in flight
+    (``PENDING_RESULT_STATUSES``). Each notification the case judges exists
+    before the read that judges it -- the completion notice is saved with the
+    step that owes it, the investigatory notice before the XID's decision is
+    finalized -- so a missing record, a second one or a result that is already
+    final does not change by waiting.
+    """
+
+    return len(records) == 1 and records[0].get("status") in PENDING_RESULT_STATUSES
 
 
 def shape_notifications(

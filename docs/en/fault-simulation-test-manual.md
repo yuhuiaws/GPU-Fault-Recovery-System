@@ -456,9 +456,15 @@ unchanged node scheduling state. The success criteria of the full chain and of t
 workload appears (the preflight requires only system Pods on the node); on a graded
 node `RESET_ALL_GPUS_NVSWITCHES` runs once, Fabric Manager is stopped once and started once, every graded GPU's fabric
 state is back to Success after the reset, and the node is schedulable again after `RESTORE_SCHEDULING`. The injected
-lines carry `drill_id`, so the shape's fixed-template notification is suppressed as `SKIPPED` by default and is `SENT`
-only with `GPU_FAULT_NOTIFICATION_DELIVER_DRILLS=true` (the runner accepts either; check it by hand), and an idempotent
-replay must not deliver twice.
+lines carry `drill_id` (`<run_id>` for the chain and the Fabric Manager restart, `<run_id>-observe` for the observe-only
+phase), so under the default policy the shape's fixed-template notification and the observe-only phase's investigatory
+notification are recorded `SKIPPED` by the drill policy, and on a site with `GPU_FAULT_NOTIFICATION_DELIVER_DRILLS=true`
+they are `SENT`. The runner judges the delivery result: `SENT` must carry a non-empty `provider_message_id`; `SKIPPED`
+passes only on a notification that carries the run's own `drill_id` and whose reason is the drill policy (containing
+`GPU_FAULT_NOTIFICATION_DELIVER_DRILLS`), and a `SKIPPED` for any other reason (expired, a disabled channel, ...) or on
+a notification without that `drill_id` is FAIL; a result not yet recorded or still being delivered (no result, `QUEUED`,
+a retrying `FAILED`) is re-read from the Store for at most 120 s and is FAIL if it is still not `SENT`; any other status
+is FAIL at once. An idempotent replay must not deliver twice.
 
 ### 7.5.1 XID 45 Cross-Replica and Companion Correlation on Real Hardware
 

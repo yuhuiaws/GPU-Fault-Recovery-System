@@ -166,6 +166,7 @@ class ActionHarness:
                         "category": "ACTION_COMPLETED",
                         "subject": "Fabric Manager restarted",
                         "status": "SENT",
+                        "provider_message_id": "message-fabric",
                     }
                 ],
             }

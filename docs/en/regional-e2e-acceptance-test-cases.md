@@ -10832,7 +10832,8 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
      its reasons carry exactly one `observe-only: ...` reason (stating `<n> GPUs report`, n being the graded GPU count)
      and one that says how to opt in (naming `GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM`); the incident has exactly one
      notification, the XID investigatory notification (subject containing `[XID 45 investigatory action]`,
-     `FAULT_DETECTED`, `SENT`, or `SKIPPED` for a drill), and no completion notification; no remote command was created
+     `FAULT_DETECTED`), and no completion notification; its delivery result is judged by the rule of step 9, against
+     this phase's own `drill_id`, `<run_id>-observe`; no remote command was created
      for it and the cluster has none open; on the host Fabric Manager is active, its `MainPID` and `InvocationID` are
      unchanged and the journal shows no stop or start, and the Node Agent ledger and the gpu-fault timers are unchanged;
      the node's scheduling fields equal the baseline. If any of this does not hold, no window is opened, no chain is run,
@@ -10867,8 +10868,16 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
      again.
   9. The same incident has exactly one completion notification (on a node that is not graded the `ACTION_COMPLETED`
      Fabric Manager notification, on a graded node the GPU/NVSwitch reset notification), and after the Node Agent replay
-     the notification ID count does not increase; a drill notification may be recorded as `SKIPPED` per site policy, while a real event with mail enabled
-     must be `SENT`.
+     the notification ID count does not increase. The injected line carries `drill_id` (`<run_id>` for the chain and the
+     Fabric Manager restart), so under the default policy the notification is recorded `SKIPPED` by the drill policy,
+     and on a site with `GPU_FAULT_NOTIFICATION_DELIVER_DRILLS=true` it is `SENT`. Only those two delivery results pass:
+     `SENT` with a non-empty `provider_message_id`, or `SKIPPED` on a notification that carries the run's own
+     `drill_id`, with the drill policy as its reason (containing `GPU_FAULT_NOTIFICATION_DELIVER_DRILLS`). A `SKIPPED`
+     for any other reason (expired, a disabled channel, ...) or on a notification without that `drill_id`, a `SENT`
+     without a `provider_message_id` and any other status are FAIL; a result not yet recorded or still being delivered
+     (no result, `QUEUED`, a retrying `FAILED`) is re-read from the Store for at most 120 s and is FAIL if it is still
+     not `SENT`. In the evidence every notification records its `drill_id`, `status`, `reason` and
+     `provider_message_id`, and the case result and `observe-only/verdict.json` record the `drill_id` compared against.
   10. Close the window (when one was opened, in `finally`, before the probe cleanup): restore exactly what the baseline
       record holds (a second control-worker roll); the record's state is `CLOSED` and every ready replica reads its
       pre-window value again; a window that cannot be closed, or a window record carrying anything but the switch,

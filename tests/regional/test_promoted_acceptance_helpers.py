@@ -32,6 +32,7 @@ from scripts.e2e.regional.host_probe_fixture import (
     HostProbeFixture,
     HostProbeSettings,
 )
+from tests.regional._reset_notification_support import drill_policy_reason
 
 ROOT = Path(__file__).resolve().parents[2]
 REGIONAL = ROOT / "scripts/e2e/regional"
@@ -416,14 +417,18 @@ def test_destr010_exact_workflow_contract() -> None:
                 "notification_id": "notification-a",
                 "category": "ACTION_COMPLETED",
                 "subject": "[DRILL:test] [GPU Fabric Manager 已自动重启]",
+                "drill_id": "test",
                 "status": "SKIPPED",
+                "reason": drill_policy_reason("test"),
             }
         ],
     }
 
-    assert destr010.workflow_errors(state) == []
+    assert destr010.workflow_errors(state, drill_id="test") == []
     state["workflow"]["completed_operations"].append("MARK_UNSCHEDULABLE")
-    assert "forbidden isolation/quiesce" in " ".join(destr010.workflow_errors(state))
+    assert "forbidden isolation/quiesce" in " ".join(
+        destr010.workflow_errors(state, drill_id="test")
+    )
 
 
 def test_destr010_parser_is_plan_only_by_default(tmp_path: Path) -> None:

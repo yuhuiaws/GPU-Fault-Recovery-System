@@ -27,6 +27,7 @@ from scripts.e2e.regional.regional_live_fixture import (
     RegionalLiveFixture,
     RegionalLiveSettings,
 )
+from tests.regional._reset_notification_support import drill_policy_reason
 
 NODE = "node-a"
 GENERATION = 3
@@ -497,6 +498,9 @@ def test_execute_case_judges_the_graded_node_by_the_chain(
 
 OBSERVE_GRADED = {**GRADED, "observe_only_default": True}
 SWITCH = xid45_opt_in.SWITCH
+# The observe-only phase's drill: ``<run_id>-observe``, the run id derived from
+# the ``run-DESTR010`` run directory and attempt 1.
+OBSERVE_DRILL = "destr010-destr010-a1-observe"
 
 
 def _observe_preflight(opted_in: bool | None = False) -> dict[str, Any]:
@@ -539,8 +543,12 @@ def _observe_state() -> dict[str, Any]:
                     "category": "FAULT_DETECTED",
                     "subject": "[GPU FAULT][XID 45 investigatory action] "
                     "cluster-a node-a",
+                    "drill_id": OBSERVE_DRILL,
                 },
-                "result": {"status": "SKIPPED"},
+                "result": {
+                    "status": "SKIPPED",
+                    "reason": drill_policy_reason(OBSERVE_DRILL),
+                },
             }
         ],
     }
@@ -617,7 +625,7 @@ def test_the_observe_only_default_passes_its_contract() -> None:
     state = _observe_state()
 
     assert shapes.observe_only_errors(state, GPUS) == []
-    assert observe.notification_errors(state) == []
+    assert observe.notification_errors(state, drill_id=OBSERVE_DRILL) == []
     assert shapes.observe_only_host_errors(BASELINE, BASELINE) == []
 
 

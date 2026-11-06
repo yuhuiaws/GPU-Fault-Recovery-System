@@ -38,6 +38,10 @@ DRILL_POLICY_MARKER = "GPU_FAULT_NOTIFICATION_DELIVER_DRILLS"
 # for a mail that never comes -- that is a FAIL, reached at the deadline.
 DELIVERY_WAIT_SECONDS = 120
 DELIVERY_POLL_SECONDS = 5
+# The result statuses another store read can still turn into SENT: no result
+# yet, QUEUED, or a FAILED attempt the outbox retries. Every other status is
+# the record's verdict; waiting does not change it.
+PENDING_RESULT_STATUSES = frozenset({None, "QUEUED", "FAILED"})
 
 
 def reset_step_idempotency_key(commands: list[dict[str, Any]]) -> str | None:
@@ -187,7 +191,36 @@ def delivery_pending(
     if len(mails) != 1:
         return False
     status = (mails[0].get("result") or {}).get("status")
-    return status in {None, "QUEUED", "FAILED"}
+    return status in PENDING_RESULT_STATUSES
+
+
+def wait_for_delivery(
+    notifications: list[dict[str, Any]],
+    *,
+    judge: Callable[[list[dict[str, Any]]], list[str]],
+    pending: Callable[[list[dict[str, Any]]], bool],
+    snapshot: Callable[[], dict[str, Any]],
+    timeout_seconds: float,
+    sleep: Callable[[float], None],
+    monotonic: Callable[[], float],
+    poll_seconds: float = DELIVERY_POLL_SECONDS,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """``judge``'s verdict on the records once it is settled, or at the deadline.
+
+    The records in hand are judged first, so a result that already landed
+    costs no store read. While the verdict fails and ``pending`` says a later
+    read could still change it, every read is a fresh ``snapshot()``; a defect
+    no later read can cure ends the loop at once, and the deadline ends it with
+    the last reading's errors.
+    """
+
+    errors = judge(notifications)
+    deadline = monotonic() + timeout_seconds
+    while errors and pending(notifications) and monotonic() < deadline:
+        sleep(poll_seconds)
+        notifications = list(snapshot().get("notifications") or [])
+        errors = judge(notifications)
+    return notifications, errors
 
 
 def wait_for_reset_notification(
@@ -211,24 +244,28 @@ def wait_for_reset_notification(
     it is judged once.
     """
 
-    notifications = list(state.get("notifications") or [])
-    errors = reset_notification_errors(
-        notifications, operation_id=operation_id, drill_id=drill_id
-    )
-    deadline = monotonic() + timeout_seconds
-    while (
-        errors
-        and operation_id
-        and not drill_id
-        and delivery_pending(notifications, operation_id=operation_id)
-        and monotonic() < deadline
-    ):
-        sleep(poll_seconds)
-        notifications = list(snapshot().get("notifications") or [])
-        errors = reset_notification_errors(
+    def judge(notifications: list[dict[str, Any]]) -> list[str]:
+        return reset_notification_errors(
             notifications, operation_id=operation_id, drill_id=drill_id
         )
-    return notifications, errors
+
+    def pending(notifications: list[dict[str, Any]]) -> bool:
+        return bool(
+            operation_id
+            and not drill_id
+            and delivery_pending(notifications, operation_id=operation_id)
+        )
+
+    return wait_for_delivery(
+        list(state.get("notifications") or []),
+        judge=judge,
+        pending=pending,
+        snapshot=snapshot,
+        timeout_seconds=timeout_seconds,
+        sleep=sleep,
+        monotonic=monotonic,
+        poll_seconds=poll_seconds,
+    )
 
 
 def reset_notification_evidence(
