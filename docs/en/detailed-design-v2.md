@@ -2440,9 +2440,9 @@ the pre-burst rows (autoanalyze is asynchronous); on that estimate the planner c
 the window" for the claim window and sequential scans for the correlated `EXISTS` probes (retry barrier, STRICT
 predecessor, fault/observation interlock) and the completion's row locking, and the heap is scanned hundreds of times a
 second (`LWLock:BufferContent` takes over the INSERT's active time). The window's `ORDER BY (priority, created_at,
-request_id) LIMIT window` is exactly the stored order of `priority_claim`/`path_priority_claim`, so once the heap
-scan is priced out the planner walks the index in claim order and stops at the window; the lane probes walk
-`gpu_fault_processor_queue_lane`. Measured on 5,000 PENDING rows with
+request_id) LIMIT window` is exactly the stored order of `gpu_fault_processor_queue_claim_window`/`..._path_claim_window`
+(v23, §4.4.2), so once the heap scan is priced out the planner walks the index in claim order and stops at the window; the lane
+probes walk `gpu_fault_processor_queue_lane_rows`. Measured on 5,000 PENDING rows with
 the planner's statistics fixed by the test (`tests/store/test_postgres_claim_planner_discipline.py`, numbers recorded
 as test properties): with the burst's statistics -- 138 rows analysed, then 4,862 more the planner knows nothing
 about -- the path-filtered sub-window (the shape 7 of the 8 sub-claims per cycle use) read 2,316 shared blocks,
@@ -2790,8 +2790,9 @@ a real instance of `src/gpu_fault/policy/models.py::XidEvent` (a `StrictModel`,
   "job_id": "llm-pretrain-7b",
   "attempt_id": "llm-pretrain-7b-attempt-14",
   "workload_identity_source": "pod-annotation",
+  "gpu_identity_source": null,
   "fabric_partition": "fp-0",
-  "runtime_profile_version": "regional/2026-08-15/7d3c1f",
+  "runtime_profile_version": "regional-hyperpod-7d3c1f2a9b04",
   "workload_state": "ACTIVE",
   "affected_workload_ids": ["llm-pretrain-7b"],
   "checkpoint_manifest_ref": "s3://.../manifests/attempt-14.json",
@@ -2804,14 +2805,17 @@ a real instance of `src/gpu_fault/policy/models.py::XidEvent` (a `StrictModel`,
   "xid_154_action": null,
   "uvm_in_use": false,
   "raw_message": "NVRM: Xid (PCI:0000:53:00): 79, pid=..., GPU has fallen off the bus.",
-  "evidence_ref": "raw_evidence/ip-10-0-12-34/2026-08-24T03-14-07Z",
+  "evidence_ref": "kmsg://ip-10-0-12-34.us-west-2.compute.internal/<source-boot-id>/48213",
   "drill_id": null,
   "synthetic": false
 }
 ```
 
 Only 4 fields are required: `cluster_id`, `node_id`, `observed_at`, `xid`. `event_id`
-has a default generator and may be omitted by the client. Everything else is nullable. **This is deliberate**: the collector
+has a default generator and may be omitted by the client. `evidence_ref` is the collector's evidence locator (the kernel collector
+writes `kmsg://<node>/<boot_id>/<sequence>`); `gpu_identity_source` records which GPU inventory the control plane took a `product`
+from when the collector did not stamp one (`GPU_INVENTORY:<snapshot>`), or why none could be found (`NO_FRESH_GPU_INVENTORY`), and is
+null when the collector stamped it. Everything else is nullable. **This is deliberate**: the collector
 reports as much as it can obtain; a missing field makes the policy fall back to a more conservative branch rather than rejecting the event.
 
 Field-by-field mapping from the proposed fields to the implemented fields:
@@ -2869,7 +2873,7 @@ The counterparts in the implementation of the 5 proposed models:
 
 | Proposed model | Implemented counterpart | Location |
 |---|---|---|
-| `GPUDevice` | Four kinds of objects: `gpu_inventory_snapshot` + `gpu_finding_state` + `gpu_finding_history` + `gpu_metric_latest`; device identity is `(node_id, gpu_uuid)` | `gpu_fault_objects` |
+| `GPUDevice` | Four kinds of objects: `gpu_inventory_snapshot` + `gpu_finding_state` + `gpu_finding_history` + `gpu_metric_latest`; device identity is `(cluster_id, node_id, gpu_uuid)` (§3.4 ⑧) | `gpu_fault_objects` and the GPU hot-state tables (§4.4) |
 | `FaultRule` | `CatalogRule` (XID), SXID rules, `NvlinkDecodeRule`. **Rules are not in the database**; they are YAML inside the wheel, compiled at assembly time | `src/gpu_fault/data/`, `src/gpu_fault/policy/models.py` |
 | `RemediationPolicy` | `XidPolicy` / `Nvlink5Policy` + `RuntimeProfile` / `EffectiveRuntimeProfile` (24 `CapabilityName` × 5 `CapabilityMode`) | `src/gpu_fault/models.py`, `src/gpu_fault/capabilities.py` |
 | `RemediationRun` | `WorkflowRequest` + list of `WorkflowStepExecution` + `RecoveryPlan`; a failed plan can record `resolved_by_restore_workflow_id`, `reconciliation_reference` and `reconciled_at` | `src/gpu_fault/models.py` |
@@ -2892,60 +2896,64 @@ otherwise one would follow the proposal and look for non-existent tables such as
 
 | Table | Primary key | Content |
 |---|---|---|
-| `gpu_fault_objects` | `(kind, key)` | Generic JSONB document table; the Store codec currently registers 47 logical kinds (`record_models()` in `store/shared/record_models.py`), covering the fault closed loop, notifications, fleet/regional, installation resources, telemetry, Processor and policy state |
+| `gpu_fault_objects` | `(kind, key)` | Generic JSONB document table; the Store codec currently registers 52 logical kinds (`record_models()` in `store/shared/record_models.py`), covering the fault closed loop, notifications, fleet/regional, installation resources, departed-node cleanup, telemetry, Processor and policy state |
 | `gpu_fault_links` | `(kind, key)` | 5 link kinds; **the unique constraint is the primary key**: `incident_by_event` (`event_id` → `incident_id`, the landing point of at-least-once delivery dedup), `notification_dedup`, `attempt_event`, `sxid_fault_group`, `replacement_fault_group` |
 | `gpu_fault_control_state_modes` | `kind` | Migration mode, version and backfill/retirement checkpoints for workflow and remote_command respectively; the database is the single source of truth |
 | `gpu_fault_remote_commands` | `command_id` | Status, lease and query-dimension columns; large snapshots stored separately; introduced in v15 |
 | `gpu_fault_workflows` | `request_id` | Workflow status, version guards, lease and pagination-dimension columns; introduced in v16 |
-| `gpu_fault_gpu_metric_latest` | `key` | Latest GPU metric sample (the physical landing point of latest-wins) |
+| `gpu_fault_gpu_metric_latest` | `key` | Latest GPU metric sample (the physical landing point of latest-wins, `inline` hot layout) |
+| `gpu_fault_gpu_metric_latest_clusters` | `(cluster_id, key)` | The same data under the `detached` hot layout, LIST-partitioned by `cluster_id` (`_default` as fallback); introduced in v23 (§4.4.2) |
 | `gpu_fault_gpu_metrics_batches` | `key` | Metric batches |
 | `gpu_fault_attempt_observations` | `key` | Job attempt observations |
 | `gpu_fault_training_progress` | `key` | Training progress |
-| `gpu_fault_processor_queue` | `request_id` | Request queue + lease + replay response; `not_before`, `retry_count` and `lane_policy` control delayed retry and strict/reorderable lanes |
+| `gpu_fault_processor_queue` | `request_id` | Request queue + lease; `not_before`, `retry_count` and `lane_policy` control delayed retry and strict/reorderable lanes; under the `inline` layout completed rows and replay responses live here too, under `detached` only in-flight rows |
+| `gpu_fault_processor_payloads` | `request_id` | Request/response bodies of the `detached` layout (`body BYTEA`); introduced in v23 |
+| `gpu_fault_processor_replays` | RANGE-partitioned by `completed_at` (300 s each, `_default` as fallback) | Replay envelopes, request and response bodies of completed requests under the `detached` layout, dropped a partition at a time once expired; introduced in v23 |
 | `gpu_fault_processor_lanes` | lane key | Lane leases (owner / epoch / token / expiry) |
 | `gpu_fault_processor_queue_counts` | `cluster_id` | Queue counts (maintained by trigger) |
 | `gpu_fault_processor_counter_mode` | `singleton` (BOOLEAN, single-row table with `CHECK (singleton)`) | Counting mode `dual` → `partitioned` |
 | `gpu_fault_processor_priority_count_shards` | `(cluster_id, priority_bucket, shard_id)` | Count ledger, `priority_bucket ∈ {0,50,100}`, `shard_id ∈ [0,128)` (writer backend pid mod 128) |
 | `gpu_fault_telemetry_spool` | `spool_key` | Telemetry spool, merged with `INSERT ... ON CONFLICT (spool_key)` |
+| `gpu_fault_hot_layout_mode` | `singleton` | Hot-table write layout `inline` (v22) / `detached` (v23), switched one way |
 | `gpu_fault_schema_version` | `singleton` | Single-row version |
 | `gpu_fault_schema_migrations` | `version` | Migration history; `name` is unique, `checksum` must be 64 characters |
 
-The 47 codec kinds break down as: control/workflow, 9 kinds (event, decision, marker, plan,
-profile, incident, workflow, restart_budget, remote_command); notifications, 4 kinds (notification and its
-delivery / result / watermark); fleet/regional/installation lifecycle, 10 kinds (agent, fleet_deployment, barrier,
+The 52 codec kinds break down as: control/workflow, 10 kinds (event, decision, marker, plan,
+profile, incident, workflow, restart_budget, remote_command, remediation_storm_breaker); notifications, 4 kinds (notification and its
+delivery / result / watermark); fleet/regional/installation/departure lifecycle, 14 kinds (agent, fleet_deployment, barrier,
 hyperpod_node_identity, hyperpod_submission, regional_cluster, three regional_registry_*,
-`installation_resource`); telemetry and health, 13 kinds (attempt_observation, training_progress,
+`installation_resource`, kubernetes_node_inventory, departed_node_cleanup, departed_node_spare_release,
+departed_node_identity_acceptance); telemetry and health, 13 kinds (attempt_observation, training_progress,
 workload_coverage_heartbeat, collector_status, collector_metrics_snapshot, raw_evidence,
 gpu_inventory_snapshot, gpu_finding_state / gpu_finding_history, gpu_metric_latest,
 gpu_metrics_batch, telemetry_metric_latest, health_signal_state); Processor/lease, 4 kinds
 (processor_request, processor_lane, processor_leadership, periodic_task_lease); policy, XID and
 EFA correlation state, 7 kinds (xid_correlation, xid_correlation_event, xid_policy_decision,
 xid_metric_baseline, xid74_occurrence_state, efa_traffic_state, efa_traffic_admin_decision).
-This number is the set of logical types the Store can decode; it does not mean all 47 have rows in
+This number is the set of logical types the Store can decode; it does not mean all 52 have rows in
 `gpu_fault_objects` under production `dedicated` mode: GPU hot state, Processor queue/lane, and
-workflow/remote_command that have completed the switch land in dedicated tables, while the generic table keeps compatibility or low-frequency objects. There are currently 17 base tables in total,
-not counting the three logical read views.
+workflow/remote_command that have completed the switch land in dedicated tables, while the generic table keeps compatibility or low-frequency objects. The table above lists 21 base tables (4 of them new in v23),
+not counting partition children and the three logical read views.
 
-`index_builder.declared_index_statements()` currently declares **81 non-primary-key indexes**, including historical
-compatibility indexes and 13 indexes on the two new dedicated tables. The actually required set is filtered by the database retirement state; legacy indexes explicitly
+`index_builder.declared_index_statements()` currently declares **77 non-primary-key indexes**: 49 on `gpu_fault_objects` (15 of them
+historical compatibility indexes of workflow/remote_command), 13 on the two dedicated tables and 5 on the queue (v23). The actually required set is filtered by the database retirement state; legacy indexes explicitly
 cleaned up after the dedicated-table switch are no longer required to exist and are not re-created by ensure. Index definitions are spread across
-`store/postgres/ddl*.py` (`ddl.py`, `ddl_processor_retry.py`, `ddl_spool.py`,
+`store/postgres/ddl*.py` (`ddl.py`, `ddl_processor_layout.py`, `ddl_spool.py`,
 `ddl_control_plane_review.py`, `ddl_remote_command_state.py`, `ddl_workflow_state.py`);
-do not count `ddl.py` alone. Triggers include statement-level queue counting, row-level notify (processor_queue,
-telemetry_spool, objects, `ddl_wakeups.py`), and the dedicated-table migration's legacy write barrier, dual-write mirror and
-native-table barrier; plpgsql functions are likewise spread across these files.
+do not count `ddl.py` alone. Triggers include statement-level queue counting (the per-writer ledger, `ddl_counter_ledger.py`),
+statement-level edge notify (processor_queue, telemetry_spool, v21), row-level wakeup notify (objects, `ddl_wakeups.py`; the two
+dedicated tables have their own), and the dedicated-table migration's legacy write barrier, dual-write mirror and native-table barrier; plpgsql functions are likewise spread across these files.
 The indexes on `gpu_fault_objects` are **partial expression indexes**, for example
 `gpu_fault_marker_incident ON (payload->>'incident_id', payload->>'observed_at', key) WHERE kind='marker'`.
 When adding a new query pattern, the corresponding partial index must be added at the same time, otherwise the JSONB will be scanned with a full table scan.
 
-The partial indexes on the queue table (`..._priority_claim`, `..._path_priority_claim`, `..._cluster`,
-`..._incomplete_cluster`, `..._lane`, `..._correlation_scopes`, `..._completed`, and
-`gpu_fault_processor_queue_available` from `ddl_processor_retry.py`,
-`(status, not_before, priority, created_at, request_id)`, on which claims after a delayed retry comes due depend) are
-everything claim performance depends on; the claim statement uses `FOR UPDATE SKIP LOCKED`.
-`gpu_fault_processor_queue` has a **row-level** trigger
-`gpu_fault_processor_queue_notify_pending_trigger` that emits
-`pg_notify('gpu_fault_processor_queue', {priority, path, request_id})`;
+Besides its primary key the queue table (v23) has only 5 indexes, none keyed on `status`/the lease columns/`updated_at`:
+`..._claim_window`, `..._path_claim_window`, `..._lane_rows`, `..._cluster_rows` and `..._scope_keys` (GIN,
+`WHERE cardinality(scope_keys) > 0`) (§4.4.2); they are everything claim performance depends on, and the claim statement uses
+`FOR UPDATE SKIP LOCKED`. The notification on `gpu_fault_processor_queue` is two **statement-level** triggers
+(`..._notify_pending_trigger` for INSERT, `..._notify_pending_update_trigger` for UPDATE, v21) that read the transition tables
+`added`/`removed` and emit `pg_notify('gpu_fault_processor_queue', {priority, path})` only when a `(path, priority)` goes from no
+PENDING row to some (an edge, deduplicated by a transaction-scoped advisory try-lock); lease renewals and completions never emit;
 `gpu_fault_telemetry_spool` has the same. Since schema v14, `gpu_fault_objects` also has a row-level trigger
 `gpu_fault_objects_notify_wakeup_trigger` (`ddl_wakeups.py`, `AFTER INSERT OR UPDATE OF payload`):
 when `kind='workflow'` and the new status is in `EXECUTABLE_WORKFLOW_STATUSES`, and the row is new or one of
@@ -2954,13 +2962,13 @@ when `kind='workflow'` and the new status is in `EXECUTABLE_WORKFLOW_STATUSES`, 
 (`cluster_id` is currently null; WorkflowRequest does not carry that field); for `kind='remote_command'` every status transition emits
 `pg_notify('gpu_fault_remote_command', {command_id, cluster_id, workflow_request_id, status})`;
 other kinds pay only one plpgsql call and two text comparisons. Lease renewals, WAITING write-backs and cancel requests do not emit,
-so that consumers are not woken by their own bookkeeping (same as E-8). The listener is the Store's
+so that consumers are not woken by their own bookkeeping. The listener is the Store's
 `run_wakeup_listener` (dedicated LISTEN connection, write-side probing, reconnection, no shard lock: every replica needs every wakeup).
 The v15/v16 dedicated tables each have notify triggers with the same semantics, which emit only in `dedicated` mode for the corresponding kind;
 in `dual` the legacy table still emits once, and the mirror write does not wake up twice. Lease renewal updates only unindexed columns and does not touch notify fields.
 Row-level triggers still have an invocation cost; capacity estimates must include it.
 
-Retryable replay responses (408/425/429/5xx) no longer return immediately to the claim hot loop; instead they back off exponentially per
+Retryable replay responses (408/425/429/5xx) do not return immediately to the claim hot loop; instead they back off exponentially per
 `GPU_FAULT_PROCESSOR_RETRY_BACKOFF_SECONDS`, bounded by
 `GPU_FAULT_PROCESSOR_RETRY_BACKOFF_MAX_SECONDS`. A `STRICT` request continues to act as a lane barrier until its
 `not_before` comes due; only latest-wins P100 requests explicitly marked `REORDERABLE`
@@ -2974,10 +2982,12 @@ so that takeover does not have to wait for the full request lease.
 
 ### 4.4.1 Dedicated Table Split for workflow / remote_command
 
-v15/v16 have implemented the remote_command and workflow dedicated tables respectively. The preserved original F2 design, the current implementation differences,
+v15/v16 have implemented the remote_command and workflow dedicated tables respectively. The original design, the current implementation differences,
 the audited CLI and the release order are in [Dedicated table migration implementation](components/postgres-state-tables.md);
 the full DDL has `ddl_remote_command_state.py` and `ddl_workflow_state.py` as its source of truth respectively,
-and a second copy of the table-creation SQL is not maintained here. Deployment only creates empty tables; the default remains `legacy`, with no automatic backfill or switch.
+and a second copy of the table-creation SQL is not maintained here. A database with migration history only gets the empty tables at deployment
+and stays `legacy`, with no automatic backfill or switch; a fresh database starts directly in `dedicated` through the schema Job's
+`--fresh-control-state-mode dedicated` (the CLI's bare default is `legacy`; §3.7).
 
 **Why it saves writes.** Some expression indexes on the legacy table depend on the whole `payload` column, so a lease renewal changing one field
 cannot be a HOT update either. The new tables promote status, identity, version guards and time fields to columns; the remote command's
@@ -2993,7 +3003,7 @@ conditioned on the raw JSON just read back, which is compatible with old rows la
 and cannot overwrite concurrent changes made between the two reads. The dedicated-table path keeps its own status columns and full expected guard,
 and must not degrade to an unconditional write because of the generic-table compatibility logic.
 
-The original F1 half-lease write avoidance, the `merge_revision` / `execution_epoch` /
+The half-lease write avoidance, the `merge_revision` / `execution_epoch` /
 `fencing_token` guards of `save_workflow`, and the full expected-CAS are all preserved. Workflow lease renewal does not change `updated_at`,
 so it neither disturbs the dispatcher cursor nor maintains an index on that time. The lease-expiry condition first narrows candidates by the status/identity index
 and then filters; status transitions or step-progress writes may still maintain indexes or large payloads.
@@ -3036,70 +3046,22 @@ SQL cleanup first materialises the qualified target set, then calls the routing 
 
 ### 4.4.2 Hot-Table Physical Layout v23: Slim Queue Rows, Replay Partitions and metric latest Partitioned by Cluster
 
-**The shape of the problem.** The formal perf suite produced three points on one release with identical admission
-defaults: a fresh store 1,572 req/s PASS; after one 32-cluster round and its teardown 538 req/s FAIL (normal-telemetry
-reserved-503 share 29.4 %, 49 % of the active statements waiting on `LWLock:BufferContent` -- the queue INSERT in 84 %
-of its samples, the completion CTE 78 %, the claim CTE 48 %); indexes rebuilt and the three small tables `VACUUM FULL`ed
-with heaps and TOAST left bloated 1,141 req/s PASS. The `store-compaction` job of §10.3 is after-the-fact compaction;
-this section changes the write path and the data model so that ingress capacity under a start-burst from many GPU
-clusters no longer depends on a freshly tidied store. The design rests on read-only catalog readings of the live store
-(about nine hours after a cold deploy, covering a full perf day) cross-referenced with the hot statements' source:
+**The shape of the problem.** Under the v22 layout the store's ingress capacity depends on a freshly tidied store: after
+a large perf round and its teardown, the same release with the same admission defaults loses much of its throughput, most
+active statements wait on `LWLock:BufferContent` (the queue INSERT, the completion CTE and the claim CTE among them), and
+rebuilding the indexes alone restores it. The `store-compaction` job of §2.3.1 is after-the-fact compaction; this section
+changes the write path and the data model so that ingress capacity under a start-burst from many GPU clusters does not depend
+on a freshly tidied store. The variable that separates fast from slow is not heap or TOAST size, dead-tuple counts, autovacuum
+overlap or index file size but the internal state of the queue's index entries and pages (dead entries, sparse pages, splits
+at the rightmost leaf): the v22 layout leaves 3 heap versions and about 18 index entries per request, with `status`, the lease
+columns and `updated_at` in the indexes, so every claim and completion manufactures dead entries and splits at the rightmost
+leaf and the concurrent admission statements queue on exactly those pages (the leaf-level micro-mechanism cannot be proven
+directly without `pgstattuple`; what can be pinned down is this lever). **What v23 prevents is index-entry churn under
+concurrency, not heap size**: one heap version and 5-6 index entries per request, HOT claims / completions / coalescing
+rewrites, completed rows and bodies out of the queue indexes. The acceptance method changes accordingly: steady state is
+defined by store metrics, and the per-round readings are in the performance acceptance plan §3.3.
 
-| Fact (live, read-only) | Value |
-|---|---|
-| `gpu_fault_processor_queue`: inserts / updates / deletes / HOT updates | 123,895 / 248,350 / 165,789 / **0** |
-| Bytes of the queue's 9 indexes vs live rows | 40.8 MiB vs 30 rows; every index has scans (fewest: `_completed` 229, the GIN 10,650) |
-| Queue payload (JSONB) | live average 1,046 B (request body 359 B); perf rounds average 2.3 KiB compressed, 65 % toasted; 13 column values duplicated in the payload |
-| `gpu_fault_gpu_metric_latest`: live rows / heap pages / indexes | 1,216 / 51,545 pages (422 MB) / 188 MB; 1.79M inserts, 2.20M deletes, 237k updates (73 % HOT) |
-| `gpu_fault_objects`: live rows / heap pages / indexes / HOT | 812 / 10,658 pages / 51 MB / 2.3 % of 285k updates HOT; all 48 non-primary indexes reference `payload` |
-| Zero-scan indexes on objects | all of them workflow / remote_command kinds (both live in the v15/v16 state tables on this site and those indexes are already retired per mode); nothing can be dropped site-independently |
-| The two most bloated objects indexes | `gpu_fault_telemetry_metric_scope` 15.3 MB for 270 rows; `gpu_fault_collector_status_scope` 6.9 MB for 31 rows |
-
-**A fourth data point on the same release, and what it refutes.** Same runtime release, v22 layout, after the 10:51
-index rebuild and another full 16-step formal suite (its rounds still deleting their working sets row by row), the
-store was **more** bloated than at the 10:30 failure (`gpu_fault_gpu_metric_latest` 582 MB for 1,292 live rows,
-`gpu_fault_processor_queue` 194 MB for 146 rows, `gpu_fault_objects` 133 MB for 864 rows, lanes 19 MB for 58 rows) --
-and the "aged r1" **passed at 1,601 req/s**, the best r1 of the day (fault p50 3.4 s / p99 8.7 s, wall 17 s, 128/128, 0
-rejections), with `LWLock:BufferContent` 0.2 % of the active samples, peak 18 concurrent admission INSERTs and
-autovacuum in 4 % of the samples. The sampler readings of the first two minutes of the three storms side by side:
-
-| First two storm minutes (0.5 s samples) | 10:34 FAIL 538 | 10:57 PASS 1,141 (6 min after the 10:51 rebuild) | 14:21 PASS 1,601 (aged) |
-|---|---|---|---|
-| Active statement samples / peak concurrency | 10,989 / 288 | 1,762 / 91 | 1,862 / 71 |
-| `LWLock:BufferContent` share | **52.6 %** (69 % in the first minute) | 0 | 0.3 % |
-| Admission INSERT samples (of which on BufferContent) | 4,587 (**84 %**) | 81 (0) | 61 (5 %) |
-| Peak concurrent admission INSERTs | **148** | 9 | 9 |
-| `IO:XactSync` / `Lock:advisory` / `Lock:extend` | 20 % / 1.6 % / 2.1 % | **47 %** / 11 % (27 % in the next two minutes) / 0 | 37 % / 9 % / 0 |
-| Peak queue dead tuples in the storm / autovacuum samples (on the queue) | 5,043 / 117 (49) | 3,388 / 46 (TOAST 19) | **7,262** / 37 (9) |
-| Queue indexes / metric latest heap+indexes before the run | ~36 MB / 242+113 MB | ~0.1 MB (just rebuilt) / 243+0.3 MB | ~41 MB / **403+179 MB** |
-| Small-table extension during the storm | lanes 5 -> 1,021 pages, queue 34 -> 3,582 | lanes 3 -> 1,409, counts 5 -> 226, queue 40 -> 6,697 | lanes none (1,969 pages kept), queue 40 -> 7,004 |
-
-Refuted: **"residual heap/TOAST bloat costs about a quarter of the throughput (1,572 against 1,141)"**. 14:21 ran the
-fastest r1 of the day on 582 MB of metric latest heap+indexes, 194 MB of queue (72 MB of it TOAST) and 133 MB of
-objects; heap size is not the variable. The 1,141 vs 1,572/1,601 spread has another source: in the 10:57 storm 47 % of
-the active samples sat in `IO:XactSync` (commit I/O) and 11 % -> 27 % in `Lock:advisory` over the following three
-minutes, and six minutes earlier `store-maintenance` had `VACUUM FULL`ed lanes / queue counts / priority shards down
-to 3-5 pages, so the storm had to re-extend them (lanes 3 -> 1,409 pages, counts 5 -> 226); the 14:21 run kept its
-1,969 lane pages and extended nothing. That is an I/O-and-lock profile, not the 10:34 BufferContent convoy and not
-heap size.
-
-Also ruled out: dead-tuple counts (the 14:21 storm peaked at 7,262 dead queue tuples, above the failing run's 5,043),
-autovacuum overlapping the storm (all three had it; 10:57 and 14:21 had the same amount) and index **file** size (the
-41 MB of queue indexes before 14:21 are not smaller than the 36 MB before 10:34). The **one** variable the three storms
-do not share is the internal state of the queue's index entries and pages: the 10:34 indexes had grown since the 03:59
-cold deploy through 6.5 hours of mixed writes (one round, the replay after a 4-hour HyperPod outage, two spool on/off
-rolls) and had never been rebuilt; the 10:57 and 14:21 indexes were the 10:51 rebuild regrown only by identical formal
-rounds, each round's VACUUM recycling the previous round's pages for the next. pg_stat exposes neither leaf fill nor
-LP_DEAD density nor deleted-but-unrecycled pages -- the live store has no `pgstattuple`, and installing it is a write --
-so the leaf-level micro-mechanism remains **unproven**; what the facts pin down is the lever: the v22 layout leaves 3
-heap versions and about 18 index entries per request, with `status`, the lease columns and `updated_at` in the indexes
-so every claim and completion manufactures dead entries and splits at the rightmost leaf, and 150 concurrent admission
-statements queue on exactly those pages. **What v23 prevents is index-entry churn under concurrency (dead entries,
-sparse pages, splits at the right edge), not heap size**: one heap version and 5-6 index entries per request, HOT
-claims / completions / coalescing rewrites, completed rows and bodies out of the queue indexes. The acceptance method
-changes accordingly: steady state is defined by store metrics (performance acceptance plan §3.3).
-
-**Why no queue update is HOT.** PostgreSQL makes an update HOT only when no updated column appears in any index's
+**Why no v22 queue update is HOT.** PostgreSQL makes an update HOT only when no updated column appears in any index's
 keys, expressions **or partial-index predicate**. All eight partial queue indexes carry `status IN ('PENDING','LEASED')`
 in their predicate, `gpu_fault_processor_queue_lane` keys `lease_expires_at`, `gpu_fault_processor_queue_completed`
 keys `updated_at`, `gpu_fault_processor_queue_available` leads with `status` -- a claim changes `status`, the lease
@@ -3109,19 +3071,14 @@ three tuple versions in the heap and about 18 index entries (8 at INSERT: the pr
 and `_completed` after completion), all deleted row by row by the retention sweep 600 s later. Two thirds of the index
 entries are born dead; that is where the B-trees' high-water mark after a teardown comes from, and why the next
 round's INSERTs queue on sparse leaf pages. TOAST comes from the request body and the response body written back on
-completion (65 % of a perf round's rows cross the 2 KiB threshold); its index grows monotonically by chunk_id, so every
+completion (rows crossing the 2 KiB threshold are toasted); its index grows monotonically by chunk_id, so every
 concurrent writer lands on the same rightmost leaf.
 
-**Two facts added by the local reproduction (vanilla PostgreSQL 16, real schema and statements).** One round of 27k
-queue rows (two thirds completed) and 260k metric latest rows was admitted through the real admission/claim/completion
-paths and then torn down like the perf suite does (everything deleted, about 1,200 rows kept, two VACUUMs): the queue
-shows `n_tup_upd` 496,752 and `n_tup_hot_upd` **0** (the coalescing whole-row rewrites included); after the teardown the
-queue's indexes hold 24.8 MiB and 0.7 MiB after `REINDEX`; metric latest's indexes go 92.9 MB -> 0.27 MB while its 22,338
-heap pages stay. Yet under a single-session `EXPLAIN (ANALYZE, BUFFERS)` the pages each hot statement touches barely move
-across the compact / bloated / rebuilt states (10-row INSERT 346/266/275 blocks, metrics-path claim 2,205/1,328/2,005,
-8-row completion 307/32/32, 32-key metric upsert 341/362/264): bloat does not make one statement read more pages, it
-makes 190 concurrent writers queue on sparse leaf pages full of dead entries -- so the remedy is fewer index entries and
-heap versions per request, not more frequent tidying.
+**The pages one statement touches do not change.** One round of queue and metric latest rows admitted through the real
+admission/claim/completion paths on vanilla PostgreSQL 16 and then torn down shows, under `EXPLAIN (ANALYZE, BUFFERS)`, nearly
+the same pages per hot statement across the compact / bloated / rebuilt states: bloat does not make one statement read more pages,
+it makes many concurrent writers queue on sparse leaf pages full of dead entries -- so the remedy is fewer index entries and heap
+versions per request, not more frequent tidying.
 
 **The five changes of v23 and their expected gain** (aimed at the lever pinned down above -- index-entry churn under concurrency -- not at heap size).
 
@@ -3142,8 +3099,8 @@ heap versions per request, not more frequent tidying.
    default` catches gaps and is swept by row). The completion CTE DELETEs the queue row and writes the envelope JSON,
    the request body and the response body into the replay partition; `get_processor_request` and the admission's
    idempotent replay look in the queue first and then in the replays, so the same `request_id` still gets the same
-   response within retention. **Gain**: the queue heap holds only in-flight requests (a few thousand rows at a perf
-   peak) and has no "high-water mark of the previous round"; replay rows are never deleted row by row, never vacuumed,
+   response within retention. **Gain**: the queue heap holds only in-flight requests and has no "high-water mark of
+   the previous round"; replay rows are never deleted row by row, never vacuumed,
    and return their pages with the partition.
 3. **Make the claim a HOT update.** Once only in-flight rows live in the queue, `status` no longer needs to be a
    partial-index predicate. v23 replaces the eight B-tree/GIN indexes with five whose keys contain neither `status`, the
@@ -3172,41 +3129,38 @@ heap versions per request, not more frequent tidying.
    rows across partitions on update (DELETE+INSERT, which destroys HOT) -- rejected; the in-flight queue stays
    unpartitioned -- the claim takes its window in region-wide priority order and a per-cluster partitioning turns every
    claim into a Merge Append over N partition indexes whose cost grows with the cluster count, so only the append-only,
-   time-expired replay table is RANGE-partitioned. **Gain**: a round's 260k rows, or every latest row of a real cluster
-   leaving the fleet, return their pages with the partition (previously 51,545 heap pages and 188 MB of indexes carried
-   1,216 rows); `list_gpu_metrics_latest` and the upsert prune to one partition by `cluster_id`.
+   time-expired replay table is RANGE-partitioned. **Gain**: when a cluster that owns a partition leaves the fleet, every
+   latest row of it returns its pages with the partition; `list_gpu_metrics_latest` and the upsert prune to one partition
+   by `cluster_id`.
    **Where rows actually live, and the two hot reads.** Only the bootstrap sync (`save_regional_cluster` while no
    durable registry head exists) and the `--set-hot-layout detached` switch create partitions: a cluster published
    through the durable registry (every registration after the first bootstrap, the perf suites' synthetic clusters
    included) has no partition of its own, its rows go to `..._default`, neither publication nor removal creates or drops
-   a partition, and the perf teardown deletes those rows one by one (`dropped_partitions` is empty in
-   `capacity-data-cleanup.json`); "return their pages with the partition" above holds only for clusters that have one.
-   The statistics of `..._default` can therefore predate the cluster that is writing, and every burst-1c run starts
-   that way: autovacuum analysed the partition after the previous run's teardown deleted the perf rows, the MCV list
-   holds only production clusters and the planner estimates the perf cluster at one row. The read-back of
-   `observe_gpu_metrics` and `list_gpu_metrics_latest` then walked the primary key's `cluster_id` range and filtered on
-   the heap -- every row the cluster had written so far, per batch -- until the next autovacuum pass analysed the
-   partition (PostgreSQL 16 reproduction, 32,000 rows: the read-back 20-25 ms and 33,002 shared buffers, 0.8 ms and 128
-   after ANALYZE; the listing is a cost tie between that range and the node index, decided by index geometry, and took
-   21 ms and 33,002 buffers when the range won; in the live samplers every slow run's read storm ends with an
-   autovacuum worker). `store/postgres/metric_latest_reads.py` shapes both reads so they do not depend on those
+   a partition, and a teardown deletes those rows one by one; "return their pages with the partition" above holds only
+   for clusters that have one. The statistics of `..._default` can therefore lag the cluster that is writing (autovacuum
+   analysed the partition after a teardown deleted another cluster's rows, so the MCV list holds only the remaining
+   clusters and the planner estimates a newly writing cluster at one row); planned on those statistics, the read-back of
+   `observe_gpu_metrics` and `list_gpu_metrics_latest` would walk the primary key's `cluster_id` range and filter on the
+   heap -- every row the cluster had written so far, per batch -- until the next autovacuum pass analysed the partition.
+   `store/postgres/metric_latest_reads.py` shapes both reads so they do not depend on those
    statistics: the read-back is one `(cluster_id, key)` primary-key probe per key (LATERAL + `LIMIT 1`; custom and
    generic plans alike are unique-key probes, still pruned at planning by the literal `cluster_id`); the listing passes
    the cluster as an uncorrelated sub-select, so the planner prices the range at an average cluster (`1/n_distinct`)
    and the node index wins, with partitions pruned at run time instead. A partition that has never been analysed has
    no column statistics, and the listing there may still combine both indexes in a BitmapAnd (index pages of the
    cluster's range only, no heap) until its first ANALYZE.
-5. **`store-compaction` stays as the safety net** (§10.3): lanes / queue counts / priority shards are still rewritten
+5. **`store-compaction` stays as the safety net** (§2.3.1): lanes / queue counts / priority shards are still rewritten
    in place and keep their rules; a partitioned parent is measured by aggregating its partitions and reindexed per
    partition with `REINDEX INDEX CONCURRENTLY`; replay partitions are measured, never rebuilt.
 
-**What about objects.** All 48 indexes of `gpu_fault_objects` reference `payload`, so no update of any kind can ever be
-HOT -- a structural fact of the JSONB document table, not a redundant index: the zero-scan indexes are already retired
-by the v15/v16 state-table modes and every index with scans has a reading statement. The 87k objects rows a perf round
-leaves behind are the three per-node hot-updated kinds `telemetry_metric_latest`, `collector_status` and
-`gpu_inventory_snapshot`; like workflow/remote_command in §4.4.1 and the GPU hot state they belong in dedicated tables
-(columnised index keys, `fillfactor=70`, partitioned by cluster). v23 leaves the objects index set alone and records
-that step here as the committed scope of v24, with the two index sizes above as its evidence.
+**What about objects.** All 49 declared non-primary indexes of `gpu_fault_objects` reference `payload`, so no update of any
+kind can ever be HOT -- a structural fact of the JSONB document table, not a redundant index: the workflow/remote_command
+indexes retire with the v15/v16 state-table modes in `dedicated`, and every other index has a reading statement. The
+per-node hot-updated kinds with the most rows in objects are `telemetry_metric_latest`, `collector_status` and
+`gpu_inventory_snapshot` (their `gpu_fault_telemetry_metric_scope` and `gpu_fault_collector_status_scope` indexes bloat the
+most); like workflow/remote_command in §4.4.1 and the GPU hot state they belong in dedicated tables (columnised index keys,
+`fillfactor=70`, partitioned by cluster). v23 leaves the objects index set alone; that step is not implemented yet (the schema
+is at v23).
 
 **Compatibility and cutover (expand/contract).** The release order is unchanged: index-build Job -> ensure (v23) ->
 preflight -> staged control-plane roll -> data-plane executors. The v23 ensure creates the empty new tables and indexes
@@ -3235,10 +3189,14 @@ same scale and was not compacted by hand.
 | Data | Retention | Mechanism |
 |---|---|---|
 | `raw_evidence` | 24h, and at most 10,000 records per node | `GPU_FAULT_EVIDENCE_RETENTION_HOURS` / `_MAX_RECORDS_PER_NODE`, cleaned by `processor-cleanup` |
-| Completed `processor_request` | 600s | `GPU_FAULT_PROCESSOR_COMPLETED_RETENTION_SECONDS`; a redelivery within this window gets the same response |
+| Completed `processor_request` | 600s | `GPU_FAULT_PROCESSOR_COMPLETED_RETENTION_SECONDS`; a redelivery within this window gets the same response; under the `detached` layout they live in `gpu_fault_processor_replays`, dropped a partition at a time (§4.4.2) |
+| processor lane rows | 3,600s after the lease ended | `GPU_FAULT_PROCESSOR_LANE_RETENTION_SECONDS` (§3.12 lane lifecycle) |
 | Terminal-state `remote_command` | 86,400s | `processor-cleanup` |
 | `gpu_metrics_batch` | 86,400s | `GPU_FAULT_GPU_METRICS_BATCH_RETENTION_SECONDS` |
 | GPU finding history | 2,592,000s (30 days) | `GPU_FAULT_GPU_FINDING_HISTORY_RETENTION_SECONDS` |
+| Hot-state terminal / latest rows | 2,592,000s (30 days) each | `GPU_FAULT_HOT_STATE_TERMINAL_RETENTION_SECONDS` / `GPU_FAULT_HOT_STATE_LATEST_RETENTION_SECONDS`; attempt observations also have a maximum age of 604,800s (`GPU_FAULT_ATTEMPT_OBSERVATION_MAX_AGE_SECONDS`, 0 disables) |
+| Terminal `fleet_deployment` | 604,800s (7 days) | `GPU_FAULT_FLEET_DEPLOYMENT_RETENTION_SECONDS` |
+| Health-signal state rows | 2,592,000s, 86,400s grace | the `health_signal_states` job (§2.3.1) |
 | `incident` / `workflow` | **No bare TTL** | Archived by `control-record-archive`, see below; the site default enables 30-day archive-first (omitting `spec.retention` means `controlRecordRetentionDays: 30`; only an explicit 0 disables it), reclaimed per `GPU_FAULT_CONTROL_RECORD_RETENTION_DAYS`; the full terminal-state/reference conditions must still be satisfied |
 | Inactive `marker` / terminal-state `notification` / decided completion decisions | 2,592,000s (30 days); retained while still referenced by an incident | The `inactive_markers` / `notifications` / `completion_records` jobs of `processor-cleanup` (§2.3.1) |
 | Expired regional registry member rows | 86,400s | The `registry_members` job of `processor-cleanup` |
@@ -3271,9 +3229,9 @@ an edge-filter reason other than `health-summary`; steady-state health summaries
 `GPU_METRICS` evidence records is by design; the delivery cadence is answered by `collector_status`, which every accepted batch updates
 (the `HOST_TELEMETRY` row is updated only by batches with `producer=node`: the control-plane Kubernetes reader posts
 `k8s-efa-*` allocatable batches on the same channel tagged `producer=control-plane`, and does not write the node's collector status; otherwise its newer, cleaner
-row would mask node-side collection errors and silence, and drop the node's late tick as a replay) (regional acceptance case COLLECT-001 once used the evidence count to prove steady-state suppression, which is exactly the question evidence cannot answer).
+row would mask node-side collection errors and silence, and drop the node's late tick as a replay); the evidence count therefore cannot prove steady-state suppression, which is exactly the question evidence cannot answer.
 The journald `__CURSOR` (typically 150-190 characters) is kept at full length in `entry_id` and `evidence_ref`;
-`event_id` uses its digest rather than a truncated value (F-B7 / F-M3).
+`event_id` uses its digest rather than a truncated value.
 
 A historical `BLOCKED` predecessor cannot be "unblocked" by deleting it with SQL. The administrator entry point
 `gpu-fault-admin workflow-reconcile` (`--dry-run` only prints the plan; without it, plan and apply are
@@ -3282,15 +3240,24 @@ incident is already `RECOVERED`, the successor is `SUCCEEDED` and has completed 
 node**: the record has never completed any operation in `NODE_MUTATING_OPERATIONS` (containment such as cordon/quarantine alone
 does not count), and the incident is `ESCALATED` or `RECOVERED`, so no successor is needed. Both
 shapes additionally verify fencing and execution epoch, lease, open remote commands, WAITING provider
-actions, a source plan that exists and is FAILED (event-driven records without a source plan are never eligible by design),
-and that the GPU node has no residual cordon/quarantine. apply recomputes the plan digest, and on drift names the changed fields and
+actions, the source plan (a record with a `source_plan_id` needs that plan to exist, link back to the record and be FAILED; a record
+without one -- a job DAG node branch, a record whose plan a merge replaced in place -- is judged by a verified restore successor or the
+"never mutated the node" shape, and refused only when neither holds), and that the GPU node has no residual cordon/quarantine. For a node
+no longer in Kubernetes the provider is asked, for the never-mutated shape only: on HyperPod the administrator side matches
+`hyperpod-<instance-id>` against `aws sagemaker list-cluster-nodes`, on eks-managed it reads the fleet's recorded EC2 instance id with
+`aws ec2 describe-instances` (`admin/workflow_reconcile_departed_nodes.py`, `departed_nodes.ec2_state_blocker`); a node whose instance
+is gone is recorded `absent_from_provider=true`, `restored=true` (a node that does not exist carries no isolation), while an instance
+still present, an unknown provider identity (no comparable instance id) or a failed lookup keeps the blocker, fail-closed; that evidence
+enters the administrator plan digest. apply recomputes the plan digest, and on drift names the changed fields and
 before/after values; the verified-recovery shape, in a Store transaction, simultaneously turns the predecessor into `SUPERSEDED`, keeps the incident
 pointing to the successor, and adds recovery associations to the incident and source plan; the never-mutated-node shape writes only the workflow
-(`amend_workflow`) and the source plan, and does not blindly write the incident. Each record is written individually, and the result lists
-successes, failures and reasons separately. Discovery mode batches by incident / `blocked_kind`, with a batch size and a scan cap; exceeding the cap
-is reported rather than refused; records remain in the live store and can only afterwards be archived by the archive-first process above.
+(`amend_workflow`) and the source plan (if any), and does not blindly write the incident; a record `workflow-reconcile` turned `SUPERSEDED`
+does not keep the incident counting an open workflow because of a node action of unknown outcome (`incident_closure._open_workflow`).
+Each record is written individually, and the result lists successes, failures and reasons separately. Discovery mode batches by
+incident / `blocked_kind`, with a batch size and a scan cap; exceeding the cap is reported rather than refused; records remain in the live
+store and can only afterwards be archived by the archive-first process above.
 
-The third shape, **never dispatched, node gone** (`never-dispatched`): HyperPod reclaimed a spot node while its last telemetry
+The third shape, **never dispatched, node gone** (`never-dispatched`): the provider reclaimed a spot node (a HyperPod replacement or an EC2 spot reclaim) while its last telemetry
 was being ingested, the workflows created for its incidents had no Agent to be dispatched to and stay `PENDING` for good (zero
 step executions, zero remote commands, no events); the dispatcher sweep leaves `PENDING` alone and the release preflight
 `workflow_safety` counts them as live blockers. The Pod side judges them in
@@ -3300,8 +3267,10 @@ completed operation, no owner or unexpired lease, no budget claim, **no** remote
 `node departure is unproven ...`: the Pod cannot read the node, so the deployed apply refuses it for ever. The admin side
 (`admin/workflow_reconcile_never_dispatched.py`) discovers it beside the `BLOCKED` backlog (`never_dispatched_plan_items`;
 `--incident-id`/`--max-items`/`--workflow-id` apply alike), takes the node being absent from the Kubernetes Node list **and**
-its instance absent from `aws sagemaker list-cluster-nodes` as the only admitting evidence (a node still in Kubernetes is a
-blocker and the provider is not asked; still listed, not HyperPod-managed or a failed lookup all fail closed), records each
+the provider proving its instance gone (HyperPod: absent from `aws sagemaker list-cluster-nodes`; eks-managed: `aws ec2
+describe-instances` reports it terminated or unknown) as the only admitting evidence (a node still in Kubernetes is a
+blocker and the provider is not asked; an instance still present, an unknown provider identity, a cluster not in the site or a
+failed lookup all fail closed), records each
 source's verdict on the item (`sources`, in the digest) and read time (`evidence_read_at`, outside it), and re-plans field
 by field before the apply; the write goes through the `apply-never-dispatched` bridge -- existing store primitives only,
 re-checking fencing token, execution epoch, `created_at`, every condition and that the evidence's node set equals the
@@ -3316,9 +3285,9 @@ record (the Agent's lifecycle ends with its last heartbeat; the HyperPod adapter
 record stays `ACTIVE` with an expired lease and the release verification's `control_api` reads one Agent more than there are
 Ready nodes and rolls back. The command-line side takes every record through a read-only `list-agents` in the Pod; a candidate
 is `ACTIVE`/`DRAINING`, has `last_seen_at` at least 10 minutes before the Pod's clock (`DEPARTED_AGENT_GUARD_AGE`) and its node
-absent from Kubernetes and from the `list-cluster-nodes` inventory at once (the `never-dispatched` evidence and `sources` shape
-are reused; a node still present, an instance still listed, a non-HyperPod cluster, a failed lookup or a cluster not in the site
-all fail closed); the item carries the record's keys (`generation`/`lifecycle_state`/`last_seen_at`, ...) and the verdicts in
+absent from Kubernetes and from its provider at once (HyperPod `list-cluster-nodes` / eks-managed EC2 `describe-instances`; the
+`never-dispatched` evidence and `sources` shape are reused; a node still present, an instance still present, an unknown provider
+identity, a failed lookup or a cluster not in the site all fail closed); the item carries the record's keys (`generation`/`lifecycle_state`/`last_seen_at`, ...) and the verdicts in
 the digest, the read times outside it, and the re-plan before apply is compared field by field. The write goes through
 `FleetRegistry.drain_agent` then `revoke_agent` in the Pod with an `AgentTransitionRequest` whose `transition_id` is
 `workflow-reconcile/<reference>/<first 16 of the digest>` and whose `reason` is the audit line with the evidence sources, read
@@ -3347,6 +3316,17 @@ commands). Counts gate unless `other_cluster` attributes them to another cluster
 breakdown, an unreadable incident (`""`) and a cluster the site does not name gate. Deploy, `config` and every other mode
 bind no scope.
 
+Collector readiness on the release-verification side (`regional_admin_checks_readiness.judge_collector_readiness`) carries a
+bounded post-roll grace: the control plane's `/v1/collector-readiness/{cluster_id}` judges a collector ready when the age of its last
+successful report is within its kind's silence threshold (`collector_silent_thresholds`: inventory 180 s, metrics/host 420 s,
+log/kernel/fabric 900 s) and its systemd unit runs; an api-ha roll that drops one report of a roughly 300 s cadence brings the first
+reading's age close to 600 s and would judge the cluster not ready. For a cluster that is not ready, verify re-reads only that cluster's
+readiness every 10 s (the probe `collector_readiness_inspect`, which also reports the thresholds the control plane actually applies),
+for at most 600 s and never beyond the release's remaining budget (`remaining_timeout`), and fails with a `CheckFailure` carrying the
+snapshot only once that is spent; `status` does not wait. The check record's `details.collector_readiness` keeps the final snapshot
+(per node and collector kind `ready`, `age_seconds`, `threshold_seconds`) with `waited_seconds`, `polls` and `stale`; a failed record's
+`details` are that snapshot, and its summary line names the stale nodes/collectors and their ages.
+
 The same entry point has three more mutually exclusive incident-level switches (`admin/incident_close.py`, all accepting
 `--reason`/`--reference`/`--dry-run`): `--close-incident INCIDENT_ID ...` closes the named
 `ESCALATED` incident; `--close-escalated [--max-items N]` discovers and closes all `ESCALATED` incidents
@@ -3356,21 +3336,20 @@ The same entry point has three more mutually exclusive incident-level switches (
 **Retired generation** is another shape, handled automatically by the periodic sweep of `WorkflowDispatcher`,
 with no administrator mode. When an incident has already advanced to a higher fencing generation and points to another workflow,
 while the old workflow has neither had `predecessor_workflow_id` written nor released its owner, lease and
-`remediation_budget_claims`, no path closes it: `_validate_fencing` originally rejected stale tokens only while the incident
-still pointed to **this** workflow; once the incident points to someone else, the inconsistency is treated as "a preemption
-whose resolution is the successor link's responsibility". The old record is thus dispatched repeatedly forever, and because `WorkflowDispatcher` admits only
-one workflow per incident, it simultaneously starves the successor the incident is really waiting for. On 2026-09-04 a generation 1
-`STOP_WORKLOADS` survived this way for four and a half hours. None of the three handling layers depends on who wrote this shape:
+`remediation_budget_claims`, a token comparison alone cannot close it: a token is stale only while the incident still points to
+**this** workflow; once the incident points to someone else, the inconsistency reads as "a preemption whose resolution is the
+successor link's responsibility". The old record would thus be dispatched repeatedly forever, and because `WorkflowDispatcher` admits only
+one workflow per incident, it would starve the successor the incident is really waiting for. None of the three handling layers depends on who wrote this shape:
 
 - `gpu_fault/retired_generation.py` holds the decision; `WorkflowDispatcher` sweeps once per round, **cancelling the remote
   command first and then terminalising**. Any case that cannot be proven keeps its blocking semantics: completed node-mutating operations
   (`NODE_MUTATING_OPERATIONS`; cordon/quarantine alone does not count and is reclaimed by the successor generation),
   `LEASED` commands and local `WAITING` steps are all handed to the administrator and not cleaned up automatically. Refusal reasons are given as structured
   `blocker_codes`, and `cancellable` is decided by code rather than by wording.
-- `workflow_resolution.retirement_fences_out_dispatch` is the safety belt, preventing the tick that beats the sweep from
+- `workflow_resolution.retirement_fences_out_dispatch` is the safety belt (`_validate_fencing` reads it besides the token comparison), preventing the tick that beats the sweep from
   delivering a destructive step to the adapter again. It reads the Store, because only the successor lookup can distinguish a retired generation from "a preemption
   someone else is handling": wrongly killing the latter loses work, wrongly holding the latter deadlocks the two workflows against each other.
-- The same sweep (`WorkflowDispatcher.sweep_stuck_records`) also absorbed the two other modes formerly in
+- The same sweep (`WorkflowDispatcher.sweep_stuck_records`) also carries the two other modes formerly in
   `workflow-reconcile`: compile-time `BLOCKED` no-op records
   (`gpu_fault.compile_blocked`; the same module also closes a second shape: `BLOCKED` records whose incident has already been collected as `RECOVERED` by an operator or by verified recovery,
   which themselves have no owner/unexpired lease/source plan/open remote command,
@@ -3381,7 +3360,7 @@ one workflow per incident, it simultaneously starves the successor the incident 
   (`gpu_fault.orphaned_commands`), written with actor `dispatcher` onto
   `OPERATOR_RECONCILED` events. Every actual use of these modes was to unblock a release preflight, and the decisions
   are all Store predicates, so the runtime does them itself; the administrator command keeps only the one shape that needs GPU node evidence.
-  Since 2026-10-26 the compile-time shape is only a record whose first step is unowned or that has another refusal as well: a plan
+  The compile-time shape is only a record whose first step is unowned or that has another refusal as well: a plan
   refused **only** for a missing executable owner, with an isolation compiled before the first unowned step, first runs that
   containment prefix as `SAFETY_PENDING` and then settles `BLOCKED/SAFETY_SETTLED` (incident `QUARANTINED`,
   `WorkflowBuilder.containment_before_block`); it ran steps and changed a node, `never_dispatched_reasons` refuses the sweep on
@@ -3399,15 +3378,15 @@ release probes must use the same exclusion conditions and must not pass that gat
 The administrator plan digest **excludes** `workflow_updated_at` (the `DIGEST_EXCLUDED_ITEM_FIELDS` rule, used by both
 the runtime and administrator digest layers). A retired generation being dispatched in a loop renews its lease and rewrites that timestamp every tick;
 a BLOCKED record has it rewritten by every merge; including it in the digest would inevitably invalidate the plan the administrator has just reviewed.
-On 2026-09-04 the apply of `workflow-45c6b6b7` was refused because the two evaluations differed only by 19:25:59→19:26:54.
+An apply whose two evaluations differ by a minute would be refused.
 The digest still covers all decision inputs (status, both fencing tokens, execution epoch, incident status,
 successor identity and generation, completed/pending destructive operations, unsettled local steps, budget claims, open
 commands), while the write itself is guarded by the fencing token comparison inside the transaction; `workflow-reconcile` rebuilds the
 plan before applying and compares it field by field with the reviewed plan (`_plan_drift`). The timestamp is still printed as usual, because "touched a few seconds ago" is exactly what
 the administrator uses to judge that this is a live wedge rather than a historical leftover.
 
-The Aurora credential refresh (`src/gpu_fault/aurora_credential_refresh.py`) by default **no longer rolls**
-Deployments (CP-3 / H1): the three-role Pods mount the whole `gpu-fault-aurora` Secret at
+The Aurora credential refresh (`src/gpu_fault/aurora_credential_refresh.py`) by default **does not roll**
+Deployments: the three-role Pods mount the whole `gpu-fault-aurora` Secret at
 `/etc/gpu-fault/aurora`, the connection pool re-reads the DSN via `GPU_FAULT_STORE_URL_FILE=/etc/gpu-fault/aurora/postgres-url`
 when opening new connections, and recovery follows as soon as kubelet syncs after the Secret update; `--restart-deployments` (or
 `GPU_FAULT_AURORA_REFRESH_RESTART_DEPLOYMENTS=true`) is retained as a compatibility switch. Each run writes
@@ -3421,15 +3400,15 @@ A refresh failure also creates a Kubernetes Warning Event, which is the earliest
   `SchemaMigration(version, name, ddl_checksum, apply, legacy_checksum)`, currently
   **23 versions**; v7 is `processor-retry-schedule-and-lane-policy`, v12 is
   `store-review-hot-query-indexes` (6 hot-query/metrics indexes, drops `gpu_fault_remote_command_workflow`),
-  v13 is `control-plane-review-indexes-and-autovacuum` (the indexes and autovacuum parameters from the
-  control-plane review of 2026-09-08), v14 is `objects-wakeup-notify-trigger` (adds only the `gpu_fault_objects_notify_wakeup()`
+  v13 is `control-plane-review-indexes-and-autovacuum` (control-plane hot-query indexes and
+  autovacuum parameters), v14 is `objects-wakeup-notify-trigger` (adds only the `gpu_fault_objects_notify_wakeup()`
   function and the row-level notify trigger on `gpu_fault_objects`, leaving tables and indexes untouched, §3.7 ④), v15/v16 are the
   two-phase dedicated tables described above (`remote-command-state-table-and-cutover-fences`,
   `workflow-state-table-and-independent-cutover`), v17/v18 correct the dedicated-table migrations' dual-projection conditional delete
   and legacy-copy reset (`control-state-dual-projection-conditional-delete`,
   `control-state-legacy-copy-reset-without-truncate`), v19 is `hot-table-storage-parameters-and-hot-update-indexes` (hot-table storage parameters, two retention-only timestamp indexes retired), v20 is `processor-counters-per-writer-backend-rows` (counter rows per writer backend), v21/v22 are the statement-level edge-triggered wakeups and the per-key planner-pinned probes (`edge-triggered-statement-level-wakeups`, `per-key-planner-pinned-wakeup-probes`), v23 is `processor-queue-detached-payloads-replays-and-cluster-partitions` (§4.4.2: the payloads/replays tables, metric latest partitioned by cluster, the queue index set without `status`/lease columns, the `gpu_fault_hot_layout_mode` fact source).
 - Large indexes are built online with `gpu-fault-store-migrate --build-indexes-concurrently` (`CREATE INDEX
-  CONCURRENTLY`, which does not lock hot tables). The read-only check at replica startup now compares more than the version number: **missing, INVALID
+  CONCURRENTLY`, which does not lock hot tables). The read-only check at replica startup compares more than the version number: **missing, INVALID
   (left behind by an interrupted concurrent index build), or definition-drifted indexes all make the replica refuse to start**; preflight reports
   `indexes.missing` / `indexes.invalid` / `indexes.drifted` and prints the rebuild command; a drifted index must be
   dropped first and then rebuilt concurrently.
