@@ -10,9 +10,9 @@ English edition of `docs/概要设计.md`; the Chinese file remains the source o
 |---|---|
 | System name | GPU Fault Control Plane |
 | Code version | 0.10.0 |
-| Fact-check date | Source code, generated manifests and test contract baseline: 2026-09-15 (partial check: notifications, persistent registry, deployment identity, monitoring and retention); enabled deployment snapshot: 2026-09-20 (§4.1.2); all other facts follow the release source code, generated manifests and test contracts |
+| Fact-check basis | The release source code, generated manifests and test contracts; the enabled deployment snapshot in §4.1.2 is a dated field observation and does not follow code changes |
 | Language and framework | Python 3.12, FastAPI, Pydantic |
-| Applicable environments | Kubernetes, EKS, SageMaker HyperPod EKS; the core model can be extended to EC2 and Slurm |
+| Applicable environments | The regional control plane runs on a SageMaker HyperPod EKS CPU cluster; a GPU cluster is SageMaker HyperPod EKS (`provider: hyperpod`) or a plain Amazon EKS cluster with managed node groups and no HyperPod orchestrator (`provider: eks-managed`); the core domain model does not depend on Kubernetes, but bare EC2 and HyperPod Slurm have no execution path |
 | Document basis | `src/gpu_fault`, `src/gpu_fault_release`, `deploy`, `config`, `pyproject.toml` |
 
 ### 1.2 Readers and Reading Paths
@@ -44,7 +44,10 @@ Three conventions when reading:
 
 **First, only one production deployment form is currently delivered**: regional multi-cluster split deployment
 (`GPU_FAULT_DEPLOYMENT_MODE=regional`), that is, one independent CPU control plane per AWS Region,
-managing one or more HyperPod EKS GPU clusters in that Region. Positioning of the other forms:
+managing one or more GPU clusters in that Region. A GPU cluster has one of two providers:
+SageMaker HyperPod EKS (`provider: hyperpod`, the default and fully accepted form) or a plain EKS cluster with
+managed node groups and no HyperPod orchestrator (`provider: eks-managed`, new and less validated); one site may
+manage both (§2.4). Positioning of the other forms:
 
 | Form | Positioning | See |
 |---|---|---|
@@ -58,7 +61,9 @@ systemd is the **installation method** for the Collector/Agent on regional GPU d
 
 **Second, the actions that can actually be executed are a finite set, and "implemented" does not mean "unconditionally enabled"**. What can currently be
 executed for real: Kubernetes node isolation, Job/PyTorchJob/JobSet stop and restore, signed GPU reset,
-full GPU/NVSwitch reset, Fabric Manager restart, controlled HyperPod reboot, and fixed-template
+drain-P2P recovery, full GPU/NVSwitch reset, Fabric Manager restart, EFA driver remediation, GPU/EFA device plugin
+restart, controlled node reboot (HyperPod `BatchRebootClusterNodes`; on eks-managed, EC2 `RebootInstances` of the bound
+instance), warm-spare replacement that only hands over to a declared healthy spare, and fixed-template
 support escalation. Mechanical inspection is implemented as a `WAITING` step confirmed by notification + incident/fencing annotation,
 and does not automatically cordon or stop healthy workloads. Driver and firmware repair also have real executors,
 but they are only added to the workflow after the site explicitly configures the applicable SXIDs, target version, absolute-path command and SHA-256;
@@ -118,20 +123,25 @@ These are **solution-level hard constraints**, not configurable options:
 
 1. **`NodeRecovery` of a managed GPU cluster must be `None`** (that is, HyperPod
    automatic node recovery is disabled). Clusters with `NodeRecovery=Automatic` are **outside the scope supported by this solution**.
+   A plain EKS cluster (`eks-managed`) has no such field; the counterpart constraint is that the managed node groups hosting
+   GPU nodes must have EKS node auto repair off (`nodeRepairConfig.enabled` not `true`, §2.4).
 2. **This solution never calls HyperPod's replace-node related APIs under any circumstances**
    (`BatchReplaceClusterNodes`). There is no exception path of "may be called after approval".
    Node replacement can only go through warm spare: migrate to a customer-provided hot standby GPU node,
-   while the faulty instance stays isolated and is not destroyed.
+   while the faulty instance stays isolated and is not destroyed. A plain EKS cluster likewise never has an EC2 instance
+   replaced or terminated.
 3. **HyperPod's job auto-resume must be disabled; job auto-recovery is taken over entirely by this solution.**
    Managed training jobs **must not** set
    `sagemaker.amazonaws.com/enable-job-auto-resume=true`;
    on the Slurm side `srun --auto-resume=1` **must not** be used.
    That is, in the semantics table in §2.3 only the row "this solution is the executor" is the compliant form.
-4. **Only HyperPod EKS orchestration is supported; HyperPod Slurm orchestration is not supported yet.**
-   `DescribeCluster.Orchestrator` of a managed cluster must be EKS;
-   Slurm-orchestrated HyperPod clusters are **outside the current supported scope**, and the management-admission precheck should refuse them.
+4. **HyperPod is supported only with EKS orchestration; HyperPod Slurm orchestration is not supported yet.**
+   `DescribeCluster.Orchestrator` of a managed HyperPod cluster must be EKS;
+   Slurm-orchestrated HyperPod clusters are **outside the current supported scope**: discovery refuses a HyperPod cluster that
+   exposes no EKS orchestrator outright (`src/gpu_fault/admin/bootstrap.py::discover_cluster`).
    This is a **current implementation boundary**, not a permanent design decision — different in nature from constraints 1~3,
-   it can be relaxed once the Slurm-side execution path is completed.
+   it can be relaxed once the Slurm-side execution path is completed. A plain EKS cluster without a HyperPod orchestrator
+   is the other supported kind of GPU cluster (`eks-managed`, §2.4) and is not HyperPod orchestration in the sense of this item.
 
 #### 2.1.1 Why These Are Hard Constraints
 
@@ -152,16 +162,19 @@ the only effective gate; otherwise the managed side might bring the job up while
 This constraint is enforced at two layers, the **deploy-time management-admission precheck** and the **runtime fail-closed guard**;
 the enforcement details are in §2.3.
 
-**Constraint 4 (HyperPod EKS only)** is justified by the implementation status: the Slurm-side execution path is not implemented.
-Across `src/` there are only four files that reference Slurm, and none of them is an execution path —
-`Environment.HYPERPOD_SLURM` in `models.py:99` (the bare `slurm` value has been removed and is refused at parse time),
-`from_slurm_auto_resume()` in `hyperpod.py:102-118` (ownership decision, and not wired to the runtime)
-and the environment decision at `:398`, the environment branch in `orchestration/coordinator.py:1522`,
-and one comment in `watcher.py:181` saying "common to Kubernetes/Slurm".
+**Constraint 4 (HyperPod with EKS orchestration only)** is justified by the implementation status: the Slurm-side execution path is not implemented.
+Across `src/` there are only five files that reference Slurm, and none of them is an execution path —
+`HYPERPOD_SLURM` of `src/gpu_fault/models.py::Environment` (bare `slurm`/`ec2` values do not exist and are refused at parse time),
+`src/gpu_fault/hyperpod.py::HyperPodWorkloadRecoveryEvidence.from_slurm_auto_resume` (ownership decision, with no caller)
+and the environment decision in `src/gpu_fault/hyperpod.py::HyperPodLifecycleAdapter.resolve_recovery_ownership`,
+`src/gpu_fault/node_provider.py::restart_vm_effective_action`, which maps `HYPERPOD_SLURM` to a reboot just like `HYPERPOD_EKS`,
+one docstring of `src/gpu_fault/watcher.py::CompletionWatcher` saying "common to Kubernetes/Slurm", and
+`src/gpu_fault/admin/ownership_release.py`, which lists `SlurmConfig` as a field of a HyperPod instance group definition to copy verbatim.
 There is **no** Slurm scheduler adapter, no `scontrol` isolation evidence read-back,
 no Slurm workload stop/restart executor, and no Slurm-side Node Agent deployment path.
-Therefore every action that needs "isolation evidence" or "job stop/restore" fails closed on a Slurm cluster
-and stays at `PENDING`/`BLOCKED` — this is safe, but it does not constitute a usable recovery capability.
+A Slurm-orchestrated cluster is refused at discovery and never gets under management; even bypassing discovery, every action
+that needs "isolation evidence" or "job stop/restore" fails closed and stays at `PENDING`/`BLOCKED` — this is safe, but it does
+not constitute a usable recovery capability.
 The existence of an enum value **does not** mean that orchestration is supported; this is the easiest point to misjudge.
 
 #### 2.1.2 Invariants Derived from the Constraints
@@ -171,14 +184,14 @@ come back to this table and verify first:
 
 | Invariant | Value / requirement |
 |---|---|
-| `GPU_FAULT_ALLOW_HYPERPOD_REPLACE` | **Always `false`**. It is no longer a "default off, enable on demand" switch but an invariant; there is no legitimate scenario of temporarily enabling it within a maintenance window |
-| `GPU_FAULT_ALLOW_HYPERPOD_REBOOT` | May still be `true` — reboot does not destroy the instance and is not affected by this constraint |
-| `GPU_FAULT_ALLOW_WITH_AUTOMATIC_NODE_RECOVERY` | **Always `false`**. Its purpose is "still allow submitting batch mutations under `NodeRecovery=Automatic`", and this constraint has already excluded that premise |
-| Runtime Profile `nodeReplace` owner | Always `gpu-fault-hyperpod-adapter` (`OWN`); **must not** `DELEGATE` to `hyperpod-managed-node-recovery` |
-| Runtime Profile `workloadStop` / `workloadRestart` owner | Always this solution's own adapter (`OWN`); **must not** `DELEGATE` to `hyperpod-managed-job-recovery` |
-| Management-admission precheck (cluster) | `DescribeCluster.NodeRecovery == "None"`, and `DescribeCluster.Orchestrator` is EKS; otherwise refuse to bring the cluster under management |
-| Management-admission precheck (job) | Training jobs in managed namespaces do not carry `sagemaker.amazonaws.com/enable-job-auto-resume=true` (Slurm submission scripts do not carry `--auto-resume=1`); otherwise refuse to bring that job under management |
-| CloudTrail assertion | Any occurrence of `BatchReplaceClusterNodes` **is always treated as an anomaly**, regardless of the caller |
+| `GPU_FAULT_ALLOW_HYPERPOD_REPLACE` | **Always `false`**. It is no longer a "default off, enable on demand" switch but an invariant; there is no legitimate scenario of temporarily enabling it within a maintenance window. Set to `true`, the executor fails to construct the provider adapter (`src/gpu_fault/hyperpod.py::HyperPodAdapterConfig.from_environment`, `src/gpu_fault/eks_provider.py::EksProviderConfig.from_environment`) |
+| `GPU_FAULT_ALLOW_HYPERPOD_REBOOT` | May still be `true` — reboot does not destroy the instance and is not affected by this constraint; the same switch also governs the EC2 `RebootInstances` of eks-managed, and the regional executor production manifest sets it to `true` |
+| `GPU_FAULT_ALLOW_WITH_AUTOMATIC_NODE_RECOVERY` | **Always `false`**. Its purpose is "still allow submitting batch mutations under `NodeRecovery=Automatic`", and this constraint has already excluded that premise; set to `true`, adapter construction fails as well |
+| Runtime Profile `nodeReplace` owner | Always this solution's provider adapter (`OWN`, observed `warm-spare-v1`, meaning a warm-spare handover): `gpu-fault-hyperpod-adapter` on hyperpod, `gpu-fault-eks-adapter` on eks-managed; **must not** `DELEGATE` to `hyperpod-managed-node-recovery` |
+| Runtime Profile `workloadStop` / `workloadRestart` owner | Always this solution's own adapter `gpu-fault-kubernetes-adapter` (`OWN`); **must not** `DELEGATE` to `hyperpod-managed-job-recovery` |
+| Management-admission precheck (cluster) | hyperpod: `DescribeCluster.NodeRecovery == "None"`, and `DescribeCluster.Orchestrator` is EKS; eks-managed: the EKS cluster and its managed node groups are `ACTIVE` and no node group hosting GPU nodes has node auto repair on. Otherwise discovery and the release preflight refuse (`src/gpu_fault/admin/bootstrap.py::discover_cluster`, `src/gpu_fault_release/regional_release_preflight.py::validate_eks_managed_cluster`) |
+| Management-admission precheck (job) | Training jobs in managed namespaces do not carry `sagemaker.amazonaws.com/enable-job-auto-resume=true` (Slurm submission scripts do not carry `--auto-resume=1`); otherwise refuse to bring that job under management; this row is a manual check, the code has no admission-time scan for it |
+| CloudTrail assertion | Any occurrence of `BatchReplaceClusterNodes` **is always treated as an anomaly**, regardless of the caller; the executor IAM does not grant the action |
 
 The last row is an extra benefit brought by this constraint: the audit assertion is simplified from "must distinguish the caller" to "must be empty".
 
@@ -213,11 +226,13 @@ Orchestration level: constraint 4 converges HyperPod's two orchestrations into o
 | Orchestration | Status |
 |---|---|
 | HyperPod EKS | **The only supported form** |
-| HyperPod Slurm | **Not supported yet** (implementation boundary, not a design decision); the management-admission precheck should refuse it |
+| HyperPod Slurm | **Not supported yet** (implementation boundary, not a design decision); discovery refuses it |
 
-Therefore the operating form supported by this solution is **a single one**:
+Therefore the operating form this solution supports for a HyperPod cluster is **a single one**:
 HyperPod EKS orchestration + `NodeRecovery=None` + job recovery taken over by this solution,
-with node replacement going through mode B or degrading to mode C depending on whether a warm spare exists.
+with node replacement going through mode B or degrading to mode C depending on whether a warm spare exists. The counterpart
+form of a plain EKS cluster is: GPU node groups with node auto repair off + job recovery taken over by this solution + node
+replacement likewise only through warm spare (§2.4).
 
 The code paths corresponding to the removed mode A and job-level delegation
 (`ManagedRecoveryObserverAdapter`, `HyperPodManagedRecoveryObserver`,
@@ -225,26 +240,40 @@ The code paths corresponding to the removed mode A and job-level delegation
 a **fail-closed fallback** rather than an operating form:
 
 - `ManagedRecoveryObserverAdapter` is hit only when a managed owner appears in the profile.
-  In a compliant deployment all four owners in the profile are the solution's own adapters, so it **should not be triggered**.
+  In a compliant deployment all four owners in the profile (`nodeReboot`, `nodeReplace`, `workloadStop`,
+  `workloadRestart`) are the solution's own adapters, so it **should not be triggered**.
   The value of keeping it: if someone mistakenly changes the profile to `DELEGATE`,
   the result is "observe only, do not touch Kubernetes" (failing on the safe side) rather than "nobody handles it".
-- The identity ledger of `HyperPodIdentityRegistry` is also used on the warm spare path
-  (`hyperpod_spares.py:339-352`); it is unrelated to this constraint and must be kept.
+  The regional control plane decides per registration: it constructs a `HyperPodManagedRecoveryObserver` only for
+  hyperpod clusters, and an eks-managed cluster has no HyperPod managed recovery to delegate to.
+- The identity ledger `HyperPodIdentityRegistry` writes is also used on the warm spare path
+  (`src/gpu_fault/hyperpod_spares.py::HyperPodSpareCoordinator._resolve_targets` resolves fault nodes through
+  `retired_aliases`); it is unrelated to this constraint and must be kept.
 
 Removing mode A also incidentally eliminated a known gap, recorded here so that it is not forgotten if the mode is reintroduced some day:
 when HyperPod replaces a node **spontaneously** (this solution has no corresponding workflow),
 the background identity refresh thread correctly updates `instance_id` / `generation` / `retired_aliases`
-(`managed_recovery.py:44-107`, one round every 20 seconds by default),
+(`src/gpu_fault/managed_recovery.py::HyperPodIdentityRegistry.refresh`, one round every 20 seconds by default,
+`GPU_FAULT_HYPERPOD_IDENTITY_REFRESH_SECONDS`),
 but `_retire_old_agent()` and `_isolate_replacement()`
-**are only called inside `observe()`** (`managed_recovery.py:300` and `:308` are the only call sites),
-so without a workflow step neither happens. The consequence is that the old agent stays `ACTIVE` without being fenced,
-and the new node enters the scheduling pool directly without being checked by this solution; more concretely, if the agent on the new instance registers with the same
-`node_id`, `same_instance_reboot` in `fleet.py:535-556` is false because
+**are only called inside `observe()`** (`src/gpu_fault/managed_recovery.py::HyperPodManagedRecoveryObserver.observe`
+is the only call site), so without a workflow step neither happens, and the new node is not checked by the isolation of
+`observe()`. If the agent on the new instance registers with the same
+`node_id`, `same_instance_reboot` in `src/gpu_fault/fleet.py::FleetRegistry._next_agent_record` is false because
 `node_instance_id` has changed, and as long as the old record's lease has not expired and is still `ACTIVE`
 it raises `another agent incarnation holds the node lease`,
 **and the new agent's registration is refused until the old lease expires naturally**.
 This check itself is correct (split-brain prevention), but it assumes that replacement goes through `observe()` so that the old agent has already been
 revoked — spontaneous replacement bypasses exactly that premise.
+
+What the old node leaves behind is now ended by the departed-node cleanup (common to both providers; it covers Spot
+reclaims, scale-in and provider replacement): the one control-worker process holding the `departed-node-cleanup` periodic
+lease judges every 60 seconds, and only when the Kubernetes node reports, the provider (HyperPod `ListClusterNodes` or the
+EC2 instance state) and the Agent record all prove that the node has left (the Agent has no record, is `REVOKED`, or has an
+expired lease with a last heartbeat older than the 10-minute guard) does it retire the Agent and end the workflows and
+incidents nobody can run any more, through the same paths as `workflow-reconcile`; what is not its to end is recorded in a
+ledger and notified to the administrator (`src/gpu_fault/departed_node_cleanup.py`,
+`GPU_FAULT_DEPARTED_NODE_CLEANUP_ENABLED`, on by default).
 
 ### 2.3 Job Recovery Ownership: Exclusive to This Solution
 
@@ -256,23 +285,28 @@ After constraint 3, job recovery ownership is no longer a dimension "decided by 
 | `true` | HyperPod | **Non-compliant**; the management-admission precheck should refuse it; if it slips through, the runtime fails closed |
 
 Corresponding profile: `workloadStop` / `workloadRestart` are always `OWN`,
-with the owner being this solution's own adapter. This matches the static hard-coded value currently in the deployment script
-(`deploy/hyperpod/deploy.sh:2330-2337`),
+with the owner being this solution's own adapter `gpu-fault-kubernetes-adapter`. The two profile templates the regional
+release uses (`config/runtime-profile.regional-hyperpod-safe.example.yaml`,
+`config/runtime-profile.regional-eks-safe.example.yaml`) and the historical single-cluster script
+`deploy/hyperpod/deploy.sh` all hard-code this value,
 that is, **constraint 3 turned a former implementation gap into a constraint-compliant implementation** —
-the deployment script unconditionally fills in `OWN`, and the only compliant form is exactly `OWN`.
+deployment unconditionally fills in `OWN`, and the only compliant form is exactly `OWN`.
 
 **First layer of enforcement: management-admission precheck.** At deploy/admission time, walk the managed namespaces and reject violating jobs.
 It is a manual process and will miss things, so a second layer is required.
 
 **Second layer of enforcement: runtime fail-closed guard.** The decision capability of `from_eks_annotations()`
-is wired into the execution path: `KubernetesWorkflowAdapter._set_workloads()`, after reading each workload
+is wired into the execution path: `KubernetesWorkflowAdapter._set_workloads()`, through
+`_prepare_workload_mutation()` (`src/gpu_fault/adapters/kubernetes/workload_operations.py`), after reading each workload
 object and before issuing any patch or marking Pods for termination, calls
 `_managed_job_recovery_conflict()` to re-evaluate the annotation with `from_eks_annotations()`;
-as soon as one workload is decided `ENABLED`, the step goes straight to `FAILED`, with details carrying
+`RESTART_WORKLOAD` evaluates it once more after re-reading the source workloads.
+As soon as one workload is decided `ENABLED`, the step goes straight to `FAILED`, with details carrying
 `managed_job_recovery_workloads`, `required_annotation`,
 `required_annotation_value` and directly executable `remediation_commands`
 (`kubectl annotate … enable-job-auto-resume-`).
-`STOP_WORKLOADS` and `RESTART_WORKLOAD` go through the same entry point, so both are covered.
+`STOP_WORKLOADS` and `RESTART_WORKLOAD` go through the same entry point, so both are covered; the guard does not depend
+on the provider and applies on eks-managed clusters as well.
 
 Three questions commonly asked about this guard:
 
@@ -289,8 +323,9 @@ Three questions commonly asked about this guard:
   `UNKNOWN` → `OBSERVE`" in `docs/区域模式端到端验收测试用例.md` (Regional-Mode End-to-End Acceptance Test Cases) §2.0.1 is function-level behaviour of `hyperpod.py`; an unreadable workload
   here manifests as `_read_workload()` raising an exception, before the guard has run.
 
-The manual CLI `hyperpod_cli.py:67-83` is still a caller of `resolve_recovery_ownership()`
-(`--workload-recovery` is a human-supplied parameter), used for a one-time check before bringing under management; the runtime guard does not depend on it.
+The manual CLI `gpu-fault-hyperpod ownership` (`src/gpu_fault/hyperpod_cli.py::main`) is still a caller of
+`resolve_recovery_ownership()` (`--workload-recovery` is a human-supplied parameter), used for a one-time check before
+bringing under management; the runtime guard does not depend on it.
 The corresponding negative acceptance cases are in
 `docs/区域模式端到端验收测试用例.md` (Regional-Mode End-to-End Acceptance Test Cases) §2.0.1 and `GF-REGIONAL-DESTR-012`.
 
@@ -311,16 +346,42 @@ and cannot read the intermediate state, retry count or scheduling order of manag
 Therefore the decision "when HyperPod restarts the job" happens on the managed side; this solution can neither observe its intermediate state
 nor negotiate ordering with it — this is exactly the basis on which constraint 3 chooses to disable at the source rather than compete at runtime.
 Conversely, this solution **does not write** any of the above `sagemaker.amazonaws.com/*` labels or taints
-(the whole codebase uses the instance-group / cluster-name / node-health-status selectors read-only:
-`hyperpod_spares.py`, `node_installer_reconciler.py`,
-`failure_domains.py`, the management-admission, warm-spare and failure-domain modules under `admin/`, and
-the preflight in `src/gpu_fault_release`; there are no writes at all), and when restoring scheduling it only deletes its own
+(the whole codebase uses the instance-group / cluster-name / node-health-status selectors and the job auto-resume
+annotation read-only: `cluster_scope.py` (the one source of a cluster's node selector), `hyperpod_spares.py`,
+`failure_domains.py`, `node_provider.py`, the workload guard of the Kubernetes adapter, the management-admission,
+warm-spare and failure-domain modules under `admin/`, and the preflight and GPU rollout in `src/gpu_fault_release`;
+there are no writes at all), and when restoring scheduling it only deletes its own
 `gpu-fault.io/*` taints. So this solution will not accidentally trigger managed recovery.
+
+### 2.4 The Two GPU Cluster Providers: `hyperpod` and `eks-managed`
+
+A GPU cluster's provider is decided from its ARN at discovery and written to the cluster entry of `site.yaml` and to the
+regional registry (`src/gpu_fault/cluster_scope.py::ClusterProvider`: empty means `hyperpod`, any other spelling fails
+closed): a HyperPod ARN, or an EKS ARN that exactly one HyperPod cluster orchestrates, is `hyperpod`; an EKS ARN no HyperPod
+cluster orchestrates is `eks-managed` (`src/gpu_fault/admin/bootstrap.py::discover_cluster`). The CPU control plane must be
+a HyperPod EKS cluster. The GPU clusters of a first `deploy` must share one provider; the other provider joins later with
+`join-cluster`, which makes the site a mixed-provider site; each cluster runs a Runtime Profile version that matches its
+provider. Constraints 2 and 3 and the other invariants of this chapter hold for both providers alike.
+
+| Aspect | `hyperpod` | `eks-managed` |
+|---|---|---|
+| Admission gate | `NodeRecovery=None`, EKS orchestrator | The EKS cluster and its managed node groups `ACTIVE`, node auto repair off on the node groups hosting GPU nodes; an `updateStrategy` other than `MINIMAL` is only advised |
+| GPU node scope | Instance groups labelled `gpu-fault.io/control-plane=<site id>`, cross-checked with the cluster-name label | Managed node groups carrying the same ownership label |
+| `nodeReboot` | `gpu-fault-hyperpod-adapter`: `BatchRebootClusterNodes` | `gpu-fault-eks-adapter`: EC2 `RebootInstances` of the instances preflight bound, confirmed by the instance `running` plus a new Agent incarnation/boot_id; refused while the node group has node auto repair on |
+| `nodeReplace` | Only hands the workload over to a declared healthy spare; no provider replacement is called | Same; the adapter never accepts a provider `REPLACE` |
+| Runtime Profile template | `config/runtime-profile.regional-hyperpod-safe.example.yaml` | `config/runtime-profile.regional-eks-safe.example.yaml`; when the site profile's `nodeReboot` owner cannot serve the provider, join generates the cluster its own profile version and asks for approval |
+| HyperPod managed capabilities | Declares `gpuDetection` (AUGMENT) and `providerHealthIsolation` (OBSERVE) of `hyperpod-hma`; identity refresh thread and managed-recovery observer | No HMA, managed-recovery observer or identity refresh |
+| GPU service quiesce | Stops the GPU host services of the node | Also taints the node `gpu-fault.io/quiesce` NoExecute before dispatching the quiesce so the GPU clients of DaemonSets leave the reset window, and removes it before the restore |
+| DCGM hostengine | The node's host service | Embedded in the exporter container by default; the host hostengine when every selected node group declares `gpu-fault.io/dcgm-hostengine=host` |
+| Executor IAM | SageMaker Describe/List and `BatchRebootClusterNodes` | `ec2:DescribeInstances`, `ec2:RebootInstances` limited by the `eks:cluster-name` tag, EKS Describe of that cluster; no `sagemaker:*`, no stop/terminate/launch |
+
+`eks-managed` is a new form whose live acceptance is narrower than that of `hyperpod`; the design details, operator
+prerequisites and validation status are in [Plain EKS GPU Clusters and Mixed-Provider Sites](components/plain-eks-gpu-cluster.md).
 
 ## 3. System Context
 
 Externally the system interacts with only three kinds of objects: the data sources that produce signals (kernel/DCGM/Fabric Manager/host/training),
-the objects being operated on (Kubernetes API, GPU devices, SageMaker API), and the external
+the objects being operated on (Kubernetes API, GPU devices, SageMaker / EC2 API), and the external
 systems that receive conclusions (state store, SNS/SES administrator notifications, S3 and AMP).
 
 ```mermaid
@@ -341,7 +402,7 @@ flowchart LR
         D --> RA["Regional Remote Adapter"]
         D --> KA["Kubernetes Adapter"]
         D --> NA["Signed Node Agent"]
-        D --> HP["HyperPod Adapter / Observer"]
+        D --> HP["Provider Adapter (HyperPod / EKS)"]
     end
 
     C -- "outbound TLS" --> API
@@ -350,16 +411,18 @@ flowchart LR
     RA -.- EX
     KA --> K8S["Kubernetes API"]
     NA --> GPU["GPU / node"]
-    HP --> AWS["SageMaker API"]
+    HP --> AWS["SageMaker / EC2 API"]
 ```
 
 The division of labour in the Adapter column of the diagram differs between the two forms; this is the easiest place to misread:
 
 - **Regional form (production)**: the `Regional Remote Adapter` only writes actions as commands, which the target cluster's
   Cluster Action Executor pulls and executes with local permissions. On the control plane side the
-  `Kubernetes Adapter` and the HyperPod mutation adapter **must be disabled**; if enabled, startup fails;
-  the check entry point is `ControlPlaneSettings.from_mapping` (`settings.py`: in regional mode, if either of these two
-  switches is true, `RuntimeError`).
+  `Kubernetes Adapter` and the provider (HyperPod / EKS) mutation adapter **must be disabled**; if enabled, startup fails;
+  the check entry point is `ControlPlaneSettings.from_mapping` (`settings.py`: in regional mode, if
+  `GPU_FAULT_ENABLE_KUBERNETES_ADAPTER` or `GPU_FAULT_ENABLE_HYPERPOD_ADAPTER` is true, `RuntimeError`). The executors of
+  both providers construct their provider adapter with `GPU_FAULT_ENABLE_HYPERPOD_ADAPTER=true`, and
+  `GPU_FAULT_CLUSTER_PROVIDER` decides whether SageMaker or EC2 backs it.
 - **Single-cluster all-in-one form (historical)**: these two Adapters connect directly to the local API, with no Executor.
 
 ## 4. Overall Architecture
@@ -374,7 +437,7 @@ The system is divided into two sides. There is only one channel between the two 
 
 | | Regional control-plane side | Per-GPU-cluster data-plane side |
 |---|---|---|
-| Deployment location | Independent CPU HyperPod/EKS, in a different VPC from any GPU cluster | Inside each GPU HyperPod/EKS |
+| Deployment location | Independent CPU HyperPod EKS cluster, in a different VPC from any GPU cluster | Inside each GPU cluster (HyperPod EKS or plain EKS) |
 | Responsibilities | Event persistence, correlation, policy, workflow, fencing, notification, audit | Local collection, Kubernetes watch, action execution |
 | Credentials held | SHA-256 digest of each cluster's token (plus a retiring digest during rotation), Aurora credentials, permission for the site notification channel: `sns:Publish` on the site SNS topic (default) or `ses:SendEmail` (`channel: ses` sites) | Its own cluster's token, local ServiceAccount, Node Action signing key |
 | Not held | The kubeconfig of any GPU cluster | Any credential of other clusters |
@@ -408,7 +471,7 @@ and the control plane has no arrow pointing at a GPU cluster.
 
 ```mermaid
 flowchart LR
-    subgraph GA["GPU cluster A (HyperPod EKS)"]
+    subgraph GA["GPU cluster A (HyperPod EKS or plain EKS)"]
         AN["per node systemd: collectors + node-agent"]
         AD["in-cluster Deployments: watcher / collector / executor"]
         AG["NAT Gateway fixed EIP"]
@@ -466,7 +529,7 @@ flowchart LR
     JOB["node-installer Job"]
     NATGW["NAT Gateway → control-plane NLB"]
     S3[("S3 training logs / diagnostic scene, optional")]
-    HPAPI["SageMaker HyperPod API"]
+    HPAPI["SageMaker HyperPod API / EC2 API"]
     AMPW[("AMP, same workspace as the control plane")]
 
     MC --> NATGW
@@ -486,7 +549,7 @@ flowchart LR
     NIR --> JOB
     CAE -- "cordon / drain / delete Pod" --> KAPI
     CAE -- "HMAC-signed actions" --> NA
-    CAE -- "BatchRebootClusterNodes" --> HPAPI
+    CAE -- "BatchRebootClusterNodes / EC2 RebootInstances" --> HPAPI
     CAE -.-> S3
     CW -.-> S3
     NA -.-> S3
@@ -524,20 +587,20 @@ Connection direction, listening surface and identity of each component:
 | Component | Deployment form | Outbound connections | Inbound listeners | Identity used |
 |---|---|---|---|---|
 | kernel / metrics / host / fabric-manager collector | systemd on each GPU node | Control-plane `/v1/...` events and heartbeats (via NAT) | None | That cluster's collector token |
-| dcgm-exporter | GPU cluster DaemonSet; the node installer reuses it with `--dcgm-exporter existing` and does not start a second systemd service with the same function | None | `:9400`, scraped by the metrics-collector on the same node | None |
+| dcgm-exporter | GPU cluster DaemonSet (hostNetwork); on hyperpod it dials the node's host hostengine, on eks-managed it embeds a hostengine in the container by default; the node installer reuses it with `--dcgm-exporter existing` and does not start a second systemd service with the same function | None | `127.0.0.1:9400`, scraped by the metrics-collector on the same node | None |
 | node-agent | systemd on each GPU node | Control-plane registration and heartbeat (via NAT); when `--diagnostic-s3-uri` (managed site: `spec.diagnosticS3Uri` of `site.yaml`) is configured, additionally uploads diagnostic bundles to S3 | Node private IP `:9099` | Outbound uses the collector token; inbound verifies the HMAC signature, command TTL, target node, Agent generation and incident fencing token |
 | certificate-check.timer | systemd on each GPU node | TLS handshake with the control plane, checking the certificate's remaining validity | None | None (handshake only) |
 | gpu-persistence | systemd on each GPU node | No network | None | None (only changes the local GPU persistence state) |
 | completion-watcher | GPU cluster Deployment, 1 replica | This cluster's Kubernetes API + control plane (via NAT); uploads terminal-state logs when a training-log S3 URI is configured | `:9109` metrics/health | Local ServiceAccount + that cluster's token |
 | kubernetes-node-resource-collector | GPU cluster Deployment, 1 replica | This cluster's Kubernetes API + control plane (via NAT) | None | Same as above |
-| cluster-action-executor | GPU cluster Deployment, 2 replicas | Control-plane claim/receipt, this cluster's Kubernetes API, node-agent `:9099`, SageMaker, S3 | `:9111` metrics/health | That cluster's token + local ServiceAccount + IRSA role (this cluster's OIDC trust) + Node Action signing key |
+| cluster-action-executor | GPU cluster Deployment, 2 replicas | Control-plane claim/receipt, this cluster's Kubernetes API, node-agent `:9099`, the provider API (hyperpod: SageMaker; eks-managed: EC2 and EKS Describe), S3 | `:9111` metrics/health | That cluster's token + local ServiceAccount + IRSA role (this cluster's OIDC trust) + Node Action signing key |
 | node-installer-reconciler | GPU cluster Deployment, 1 replica | **Connects only to this cluster's Kubernetes API**, not to the control plane | `:9110` metrics/health | Local ServiceAccount |
 | adot-dataplane | Deployment, 1 replica, in configured GPU clusters | Scrapes the declared metrics ports in this namespace (completion-watcher `:9109`, reconciler `:9110`, executor `:9111`), remote_write to the site AMP (same workspace as the control plane) | `:8090` health probe | This cluster's IRSA role, granted `aps:RemoteWrite` only on the site workspace |
 | NAT Gateway | GPU VPC | TCP 443 to the public NLB | None | Fixed EIP, registered in the NLB Security Group allowlist |
 | NLB | Control-plane VPC | To ingress Pod IP `:8080` | TCP 443 TLS, health check `/healthz` | Server certificate (ACM or private CA) |
-| ingress | Control-plane Deployment, 3 replicas × 4 processes | Aurora writer endpoint | `:8080`, the only NLB target | Pod Identity role + Aurora credentials |
-| control-worker | Control-plane Deployment, 6 replicas × 4 processes | Aurora, SNS or SES, SageMaker read-only | `:8081`, not an NLB target, accessed only by probes and ADOT | Same as above + the site channel's `sns:Publish` (`ses:SendEmail` when `channel: ses`) |
-| spool-worker | Control-plane Deployment, 0 replicas (scaled on demand) | Aurora | `:8082`, same as above | Same as above |
+| ingress | Control-plane Deployment, 3 replicas × 4 processes | Aurora writer endpoint | `:8080`, the only NLB target; liveness/readiness probes use the dedicated liveness port `:8090` | Pod Identity role + Aurora credentials |
+| control-worker | Control-plane Deployment, 6 replicas × 4 processes | Aurora, SNS or SES, SageMaker read-only | `:8081`, not an NLB target, scraped only by ADOT; probes use `:8091` | Same as above + the site channel's `sns:Publish` (`ses:SendEmail` when `channel: ses`) |
+| spool-worker | Control-plane Deployment, 0 replicas (scaled on demand) | Aurora | `:8082`, same as above; probes use `:8092` | Same as above |
 | ADOT Collector (control plane) | Control-plane EKS | Scrapes the three roles' Pod IP `/metrics`, remote_write to AMP | None | execution token (CPU scrape only) + Pod Identity role for writing AMP |
 | aurora-credential-refresh | Control-plane CronJob | Secrets Manager | None | Pod Identity role |
 | Amazon Managed Grafana | Regional managed service, created or reused by deploy | The workspace IAM role queries AMP via SigV4 | Managed workspace entry | IAM Identity Center user (the user matching the administrator email is granted ADMIN automatically by deploy) |
@@ -658,13 +721,14 @@ Remaining node data-plane components:
 
 | Component | Role | Deployment side | Modifies the node |
 |---|---|---|---|
-| Node Action Agent | Executes signed client checks and GPU reset | GPU cluster | Yes, reset off by default |
-| Cluster Action Executor | Claims and executes this cluster's Kubernetes/Node Agent/HyperPod actions | GPU cluster, regional form only | Yes |
+| Node Action Agent | Executes signed node actions: client checks, evidence and diagnostic capture, GPU service quiesce and restore, GPU reset / drain-P2P / full GPU+NVSwitch reset, Fabric Manager restart, EFA driver remediation, collector outbox maintenance | GPU cluster | Yes; the installer's bare default disables reset, the regional production install enables it explicitly |
+| Cluster Action Executor | Claims and executes this cluster's Kubernetes/Node Agent/provider (HyperPod or EC2) actions | GPU cluster, regional form only | Yes |
 
 The Node Agent prevents forgery and duplicate operations through HMAC, command TTL, target node, Agent generation, incident fencing
 token and a local SQLite ledger.
 
-The data plane has fixed configuration `AWS_REGION`, `GPU_FAULT_CLUSTER_ID`, the control-plane URL and that cluster's independent credentials.
+The data plane has fixed configuration `AWS_REGION`, `GPU_FAULT_CLUSTER_ID`, `GPU_FAULT_CLUSTER_PROVIDER`,
+`GPU_FAULT_NODE_SELECTOR` (the label selector of the cluster's GPU nodes), the control-plane URL and that cluster's independent credentials.
 The Completion Watcher watches only this cluster and writes this cluster's ID into every observation and terminal
 event. The Cluster Action Executor can only claim actions that match its own authenticated identity and `cluster_id`.
 
@@ -688,11 +752,17 @@ A notification is generated when there is no success record or the time since th
 
 The control plane writes an `AdvisoryNotification`, delivered by the Notification Dispatcher through the site SNS/SES channel,
 deduplicated by cluster, node and channel in a default 3600-second time bucket (at most one per hour for the same node, collector and channel).
-This scan does not send probe requests to nodes, does not write a unified `UNKNOWN` node state, and does not
-create a recovery workflow because of it. Nodes whose Agent heartbeat lease has expired do not participate in this scan or the corresponding metric statistics;
-look at Fleet readiness and the stale-agent metrics instead; "no collector silence alert" must not be equated with "node healthy".
+The scan also records the observation validity of every required channel as `collector_observation_valid`
+(`HEALTHY`/`UNKNOWN`, per node and channel, not a unified node state); for a channel that is really silent it submits at
+most one bounded refresh request per node per hour, the non-destructive observability diagnostic workflow
+`TRIGGER_HEALTH_SNAPSHOT → VALIDATE_HOST` (it makes the node collect a fresh snapshot; it does not isolate, does not stop
+training and is not a recovery workflow; a channel that still reports, only with collection errors, triggers no refresh, see
+`src/gpu_fault/app/collector_silence.py::notify_silent_collectors`). Nodes whose Agent heartbeat lease has expired do not
+participate in this scan or the corresponding metric statistics; look at Fleet readiness and the stale-agent metrics
+instead; "no collector silence alert" must not be equated with "node healthy".
 
-In compatible deployments without AMP enabled (`GPU_FAULT_ENABLE_AMP=false`, the install script skips the AMP/ADOT resources),
+In compatible deployments without AMP enabled (`GPU_FAULT_ENABLE_AMP=false`, the install script skips the AMP/ADOT resources;
+`gpu-fault-admin` deployments always write `true`, only the compatibility path that calls the install script directly can set `false`),
 the built-in notification path still works; `GPU_FAULT_ENABLE_AMP` does not control this notification chain.
 With AMP, ADOT also remote-writes the same metrics into AMP and uses rules as a second layer of alerting.
 
@@ -707,8 +777,11 @@ role processes:
 | `worker` | `gpu-fault-control-worker` | 6 | 4 | 8081 | Consume the queue, policy, orchestration, dispatch, notification |
 | `spool-worker` | `gpu-fault-telemetry-spool-worker` | 0 | 1 | 8082 | Replay relief valve during telemetry floods, not enabled by default |
 
+Every process is started by `gpu_fault.app.serve` (uvicorn; each worker process binds the service port itself with
+`SO_REUSEPORT`), and the liveness/readiness probes use a dedicated liveness port at "service port + 10" (8090/8091/8092).
 The only allowed role values are `all`/`ingress`/`worker`/`spool-worker`; other values fail startup; production does not use
-`all`. ingress replicas also construct the Processor object (needed for enqueue and admission) but do not start any
+`all`; `spool-worker` also requires the queued Processor mode and `GPU_FAULT_TELEMETRY_SPOOL=true`.
+ingress replicas also construct the Processor object (needed for enqueue and admission) but do not start any
 consumer thread — **"ingress Pod Ready" does not mean someone is consuming the queue**; look at the worker role to judge.
 
 The worker role process carries the API, policy services and background threads, classified by the five phases of §2 as follows:
@@ -729,9 +802,12 @@ The worker role process carries the API, policy services and background threads,
 | All phases | Regional Cluster Registry | Persists per-cluster registration and token digests, verifies data-plane identity |
 
 In the regional form the Processor is `active-active` and does not elect a global service leader: every worker
-process runs the workflow dispatcher and the correlation finalizer (6 replicas × 4 processes = 24 copies),
-arbitrated respectively by the workflow execution lease/fencing and the correlation lease, so there is
-no leadership thread and no single-point leader. Neither ingress nor spool-worker dispatches workflows. The control plane
+process runs the workflow dispatcher and the correlation finalizer (6 replicas × 4 processes = 24 copies).
+Queue consumption is arbitrated by lane leases and correlation by the correlation lease; each dispatcher tick first takes
+the fleet-wide `workflow-dispatch` lease (15 seconds by default, renewed during the tick), so at any moment only its holder
+scans and dispatches while the other processes skip the round, and when the holder goes away any process takes the
+lease over once it expires; the execution of one workflow is then arbitrated by the workflow execution lease/fencing.
+So there is no elected leader and no fixed single point. Neither ingress nor spool-worker dispatches workflows. The control plane
 does not deploy GPU collectors, the DCGM exporter or the GPU Node Agent.
 
 The Processor's retries also do not rely on in-process sleep: when replay gets 408/425/429/5xx and the
@@ -757,21 +833,32 @@ Module-level details of threads and channel tiers are in Detailed Design §2.18.
 | SQLite WAL | Single-replica canary | Shared writes from multiple replicas not allowed |
 | InMemoryStore | Unit tests, default simulation | Lost on process exit |
 
-Aurora has 17 base tables in seven families: schema metadata 2, generic objects and relations 2, hot-state
-dedicated tables 4, Processor queue and lanes 2, Processor counters 3, telemetry spool 1, control-state dedicated tables and
-mode metadata 3. The four hot-state dedicated tables
+The DDL declares 21 base tables on Aurora (not counting the partitions created at run time per cluster or time bucket), in
+seven families: schema metadata 2, generic objects and relations 2, hot-state dedicated tables 5 (including the v23 GPU
+metric latest table LIST-partitioned by cluster), Processor queue and lanes plus the v23 detached payload/replay tables 4,
+Processor counters 3, telemetry spool 1, control-state dedicated tables and mode metadata 4 (including the v23 hot-table
+layout mode table). The four original hot-state dedicated tables
 participate in reads and writes only when `GPU_FAULT_POSTGRES_HOT_STATE_MODE` is `dual`/`dedicated`; production is
-`dedicated`, and startup verifies that the tables exist and the backfill has completed, otherwise it refuses to start.
+`dedicated` (so is the application default), and startup verifies that the tables exist and the backfill has completed,
+otherwise it refuses to start. Writers choose the v23 detached hot-table layout (Processor payload/replay tables and the
+cluster-partitioned metric latest table) by the layout mode recorded in the database: `inline` by default, switched one way
+by the operator with `gpu-fault-store-migrate --set-hot-layout detached` once the control-plane roll is complete; the read
+paths read both layouts.
 
-The workflow/remote_command dedicated tables were introduced in v16/v15 respectively, default legacy, with the database as the single
-source of truth for the mode. The checked CLI performs staged dual-write, backfill verification and the dedicated cutover; the new tables separate leases from large JSON,
+The workflow/remote_command dedicated tables were introduced in v16/v15 respectively; an existing database defaults to
+legacy, with the database as the single source of truth for the mode, while a brand-new database starts in dedicated
+straight from the schema Job (`--fresh-control-state-mode dedicated`). The checked CLI performs staged dual-write, backfill
+verification and the dedicated cutover; the new tables separate leases from large JSON,
 and lease renewal writes only unindexed columns. An ordinary deploy does not automatically migrate or clean old rows; see
 [Dedicated table migration implementation](components/postgres-state-tables.md).
 
-The schema is maintained by a **versioned migration framework** (currently 18 versions; v7 added Processor delayed retry and
+The schema is maintained by a **versioned migration framework** (currently 23 versions; v7 added Processor delayed retry and
 lane policy, v13 added the control-plane review indexes and autovacuum parameters, v14 added the wakeup NOTIFY trigger on `gpu_fault_objects`,
 v15/v16 introduced the remote_command/workflow dedicated tables and their cutover fence,
-v17/v18 tightened the conditional delete of the control-state dual projection and the legacy copy reset; registry continuity and
+v17/v18 tightened the conditional delete of the control-state dual projection and the legacy copy reset, v19 set the hot-table
+storage parameters and HOT-update-friendly indexes, v20 moved the Processor counters to one row per writer backend, v21
+switched to edge-triggered statement-level wakeups, v22 added per-key planner-pinned wakeup probes, and v23 detached the
+Processor queue payloads and replays and partitioned by cluster; registry continuity and
 DDL source checksums are verified at import time); production deployments run it separately with
 `gpu-fault-store-migrate --ensure-schema`, and the business processes'
 `GPU_FAULT_POSTGRES_AUTO_SCHEMA_INIT` is `false` in all production manifests — business processes
@@ -803,11 +890,13 @@ Capability modes are independent of the deployment form, but **who executes** de
 to the target cluster's executor; enabling either of the following on the control-plane side causes startup failure:
 
 - the in-cluster `KubernetesWorkflowAdapter`;
-- the HyperPod mutation adapter.
+- the provider (HyperPod / EKS) mutation adapter.
 
 The owners delegated to remote execution by default are `gpu-fault-kubernetes-adapter`,
-`gpu-fault-node-agent`, `gpu-fault-hyperpod-adapter`, overridable with
-`GPU_FAULT_REMOTE_EXECUTION_OWNERS`. Module-level details are in Detailed Design §2.11 and §2.15–2.17.
+`gpu-fault-node-agent`, `gpu-fault-hyperpod-adapter`, `gpu-fault-eks-adapter`, overridable with
+`GPU_FAULT_REMOTE_EXECUTION_OWNERS`. Every OWN/DELEGATE owner must be advertised by an adapter the target cluster's
+executor actually constructs; when the site profile's `nodeReboot` owner cannot serve the cluster's provider, join
+generates a matching profile version for that cluster and asks for approval (§2.4). Module-level details are in Detailed Design §2.11 and §2.15–2.17.
 
 ## 5. Core Business Flows
 
@@ -937,8 +1026,9 @@ does not prove the hardware is healthy; there is currently no in-cluster quick d
 ### 5.3 Workflow Execution Gates
 
 Workflow states are `PENDING`/`SAFETY_PENDING`/`BLOCKED`/`RUNNING`/`SUCCEEDED`/`FAILED`/
-`SUPERSEDED`; the last three and `BLOCKED` are never executed by the dispatcher again, and `SUPERSEDED` is written by
-`workflow-reconcile` to indicate that the record's target has been recovered by a later workflow.
+`SUPERSEDED`; the last three and `BLOCKED` are never executed by the dispatcher again. `SUPERSEDED` means a successor
+workflow has taken the record over and records `preempted_by_workflow_id`: the dispatcher writes it when it revokes a
+preempted or retired generation, and `workflow-reconcile` writes it when it closes a record whose target a successor already restored.
 Every execution must satisfy all of the following conditions at the same time; if any one is not met, it does not advance (fail-closed, not skipped):
 
 - the operation is in the control-plane allowlist;
@@ -981,19 +1071,28 @@ interfaces; the inventory does not count the dedicated ENA card as EFA. Both Hyp
 the standard EC2 names are supported; unknown instance types must have GPU/EFA expected values configured explicitly, otherwise node installation fails.
 
 **Decision and remediation.** After consecutive anomalies reach the threshold, the Collector reports `gpu_inventory_mismatch` or
-`efa_inventory_mismatch`. The control plane creates a CRITICAL finding, sends the fixed
-`hardware-inventory-mismatch-zh-v1` notification, and executes:
+`efa_inventory_mismatch`. The control plane creates a CRITICAL finding and sends the fixed
+`hardware-inventory-mismatch-zh-v1` notification. A missing GPU and a missing EFA PCI device
+(`failure_mode=PCI_DEVICE_MISSING`) execute the node reboot chain:
 
 ```text
 FREEZE_EVIDENCE -> MARK_UNSCHEDULABLE -> QUARANTINE
--> [STOP_WORKLOADS] -> RESTART_NODE -> VALIDATE_GPU
+-> [STOP_WORKLOADS] -> RESTART_NODE -> VALIDATE_GPU -> VALIDATE_HOST
 -> VALIDATE_FABRIC -> RESTORE_SCHEDULING -> [RESTART_WORKLOAD]
 ```
+
+The other EFA failure modes are layered by `src/gpu_fault/host_health.py::efa_inventory_rule`: `DRIVER_UNBOUND` (PCI device
+present, driver not bound) first runs `REMEDIATE_EFA_DRIVER → RESTART_EFA_DEVICE_PLUGIN → TRIGGER_HEALTH_SNAPSHOT →
+VALIDATE_FABRIC`; `LINK_INACTIVE` (port not ACTIVE/LinkUp), `EXCESS_DEVICE` and an unknown mode first run diagnostics; only
+when the validation still fails after the driver remediation or the `LINK_INACTIVE` diagnostic does the workflow escalate
+to the node reboot. A configured expected GPU count that contradicts the instance type is a configuration error: it is
+only notified for review, and no reboot or isolation is derived from it.
 
 Validation must use **new** HostTelemetry produced after the node reboot completes, and must again compare GPU
 ACTIVE and EFA ACTIVE against their respective expected counts; samples cached before the reboot cannot pass. If either is still missing devices, the
 workflow fails and escalates to `REPLACE_NODE`; the replacement may only choose a healthy warm spare of the same specification,
-and validation runs again after the replacement. When spares are insufficient, it stays blocked.
+and validation runs again after the replacement. Without enough healthy spares `REPLACE_NODE` fails closed (`FAILED`) and
+escalates to manual handling, while the faulty node stays isolated.
 
 ### 5.5 Cross-Boundary Action Dispatch
 
@@ -1031,8 +1130,12 @@ Step by step:
 6. The Executor reports `WAITING`/`SUCCEEDED`/`FAILED` with the same idempotency key. When the lease has expired,
    the fencing token has changed, or the command is already in a terminal state, the old executor's write is rejected.
 
-A duplicate result does not produce a second side effect, including no second notification delivery. For the module-level design of the protocol see Detailed Design
-§2.16 and §2.17; for boundaries and invariants see §4.1.
+A duplicate result does not produce a second side effect, including no second notification delivery. Adjacent node-side
+steps of a single-node GPU reset chain (`QUIESCE_GPU_SERVICES`, `VERIFY_NO_GPU_CLIENTS`, `RESET_GPU`,
+`RESTORE_GPU_SERVICES`, `TRIGGER_HEALTH_SNAPSHOT`) may be minted as one compound command that the executor replays with the
+original per-step contexts; the Node Agent protocol is unchanged (`src/gpu_fault/remote_step_batching.py`,
+`GPU_FAULT_REMOTE_STEP_BATCHING` on by default, and the executor protocol version must support it).
+For the module-level design of the protocol see Detailed Design §2.16 and §2.17; for boundaries and invariants see §4.1.
 
 **Implementation maturity: the code is implemented; the real-environment go-live gates have not all passed (see §10).**
 
@@ -1051,7 +1154,7 @@ A duplicate result does not produce a second side effect, including no second no
 | RawEvidenceRecord | `record_id` | Short-term raw evidence |
 | RegionalClusterRegistration | `cluster_id` | Cluster registration, token digest (during rotation also the retiring digest and expiry time), and namespace allowlist |
 | RemoteActionCommand | `command_id` | Cross-boundary action command, lease, and result |
-| HyperPodSubmissionRecord | idempotency key | provider submission intent and result, survives process restarts |
+| HyperPodSubmissionRecord | idempotency key | provider (HyperPod reboot or the EC2 reboot of eks-managed) submission intent and result, survives process restarts |
 | InstallationResource | `site_id + resource_key` | AWS resource ownership, deletion policy, dependencies, and uninstall status; identity is immutable, status can advance |
 
 ### 6.2 Isolation Key Requirements
@@ -1078,7 +1181,8 @@ middleware on top of them. Grouped by function:
   host telemetry, node logs, and collector self-check, 7 collection channels in total.
 - `/v1/attempts/*`, `/v1/workload-observations`, `/v1/training-progress`:
   training observation, terminal state, and failure reporting.
-- `/v1/incidents/*`, `/v1/workflows/*`, `/v1/recovery-plans/*`: faults, execution, and plans.
+- `/v1/incidents/*`, `/v1/workflows/*`, `/v1/recovery-plans/*`: faults, execution, and plans;
+  `/v1/markers`, `/v1/restart-budgets/*`: trusted health marker writes and restart budget queries.
 - `/v1/fleet/*`: Agent, readiness, rolling release, and barrier.
 - `/v1/regional/registry/*`: immutable revision publishing, convergence status, and monotonic rollback. Convergence is judged against the set of control-plane members
   active at publish time: every currently active process, including joiners after publishing, must ACK the same generation/digest with a valid persisted heartbeat;
@@ -1086,13 +1190,19 @@ middleware on top of them. Grouped by function:
   `GPU_FAULT_REGISTRY_STALE_SECONDS` (90 s in production) is treated as having left the fleet and does not block convergence.
 - `/v1/evidence/*`, `/v1/collector-status/*`, `/v1/collector-readiness/*`,
   `/v1/gpu-health-findings/*`, `/v1/gpu-metrics/*`: evidence, collection health, and hot-state queries.
-- `/v1/advisory-notifications/*`: notification preview, dispatch, and re-send.
+- `/v1/advisory-notifications/*`: notification lookup, re-send, requeue and immediate dispatch (preview is
+  `/v1/incidents/{incident_id}/advisory-notifications`).
+- `/v1/efa-traffic/admin-actions`, `/v1/training-health/*`, `/v1/runtime-profiles`: EFA traffic false-positive
+  acknowledgement / new-baseline acceptance, training health scans, and Runtime Profile registration.
 - `/v1/installation-resources*`: bulk sync, per-site query, status update and the replacement transition (`replace-resource`) of the AWS installation resource registry.
-- `/v1/processor/*`, `/v1/internal/*`, `/v1/capabilities/*`, `/v1/admin/*`:
-  queue status, enqueue receipts, internal telemetry batch submission, and operations injection.
-- `/v1/regional/*`: cluster registration query, remote command claim/renew/progress/result, HyperPod submission idempotency,
-  incident ownership and fleet rollout fence query, spare health, Agent drain/revoke, evidence and
-  notification write-back, node-key top-up for replacement nodes, **17 endpoints** in total (another 4 are under `/v1/regional/registry/*`). The routes are also mounted in the local
+- `/v1/processor/*`, `/v1/internal/*`, `/v1/capabilities/*`, `/v1/admin/*`, `/v1/version`:
+  queue status, enqueue receipts, internal telemetry batch submission and silence metrics, the operation capability list,
+  operations injection, and the version.
+- `/v1/regional/*` (registry excluded), **19 endpoints**: 17 under `executors` (remote command claim/renew/progress/result,
+  HyperPod submission idempotency, incident ownership and fleet rollout fence query, spare health,
+  Agent drain/revoke/reactivate, evidence and notification write-back, node inventory and executor readiness reports), plus the
+  cluster registration query `/v1/regional/clusters` and the node-key top-up for replacement nodes
+  `/v1/regional/node-action-keys`; another 4 are under `/v1/regional/registry/*`. The routes are also mounted in the local
   `all` mode, but only regional is the supported production semantics and the complete authentication path; see them one by one in
   Detailed Design §4.4.
 
@@ -1101,8 +1211,8 @@ The OpenAPI page is at `/docs` by default.
 ### 6.4 Authorization Model
 
 Authorization is a default-deny model in which **every route explicitly declares a bucket**; the five buckets are `public`, `metrics`,
-`cluster-token`, `dual-credential`, and `execution-token`, with the current distribution
-2/1/34/7/45 (`public` is `/healthz` and `/livez`). If a new route does not declare a bucket, the application fails to start at assembly time;
+`cluster-token`, `dual-credential`, and `execution-token`; in that order they are
+currently distributed 2 / 1 / 37 / 7 / 46 (`public` is `/healthz` and `/livez`). If a new route does not declare a bucket, the application fails to start at assembly time;
 at runtime a route that exists but has not declared a bucket always returns 403 (fail-closed), and an unknown
 path served by no route returns 404, so a retired entry point is not disguised as a credential error.
 For model details see Detailed Design §4.5.
@@ -1113,16 +1223,17 @@ For model details see Detailed Design §4.5.
 
 ### 7.1 Regionally Separated Multi-Cluster (Target Form)
 
-One control plane per AWS Region, managing multiple GPU HyperPod clusters within that Region.
+One control plane per AWS Region, managing multiple GPU clusters (HyperPod EKS or plain EKS, §2.4) within that Region.
 
 Control-plane side:
 
 - an independent CPU HyperPod instance group hosting three role Deployments: ingress
   `replicas: 3`, control-worker `replicas: 6`, telemetry spool worker
   `replicas: 0` (see §4.3);
-- required node affinity bound to the stable node label of the CPU instance group;
-- Pod anti-affinity and topology spread use `whenUnsatisfiable: DoNotSchedule`;
-  when nodes are insufficient, multiple replicas are not allowed to land on the same node;
+- the manifests set no node affinity or nodeSelector, so replicas may be scheduled on any schedulable node of the CPU cluster;
+- replicas of one role are spread by `kubernetes.io/hostname` (`maxSkew: 1`, `whenUnsatisfiable: DoNotSchedule`,
+  counted per `pod-template-hash`), with a preferred Pod anti-affinity aiming at one replica per node; with more replicas
+  than nodes (for example 6 control-workers on 3 nodes) every node carries several replicas evenly;
 - ingress PDB `minAvailable: 2`, control-worker and spool worker PDB
   `maxUnavailable: 1`;
 - shared Aurora PostgreSQL; SQLite or local files as the production state store are forbidden;
@@ -1133,9 +1244,12 @@ Ingress boundary:
 
 - the endpoint uses an internal NLB/PrivateLink, or a public NLB with a source IP allowlist, and TLS is mandatory;
 - when GPU VPC CIDRs conflict, each GPU cluster may reach the public NLB through a NAT Gateway;
-- without an owned domain name, the NLB's default AWS domain name may be used, with a private CA issuing a server certificate whose SAN matches that full domain name;
-  every data plane must install that CA, and disabling hostname or certificate verification is forbidden;
-- when an NLB rebuild changes the AWS domain name, the certificate must be re-issued and all data-plane endpoints updated;
+- `gpu-fault-admin deploy` creates the site's private Hosted Zone `<site id>.gpu-fault.internal` (associated with the
+  control-plane and every GPU VPC, its `api.` record pointing at the NLB), and the site's private CA issues a server
+  certificate whose SAN matches that hostname, imported into ACM; every data plane must install that CA, and disabling
+  hostname or certificate verification is forbidden;
+- switching to another hostname (for example the NLB's default AWS domain name) requires re-issuing a certificate with a
+  matching SAN and updating all data-plane endpoints;
 - an unauthenticated collector API must not be exposed to the public internet;
 - in NLB IP target mode, the API Pod's `preStop` drain wait must be longer than the target deregistration propagation time, and
   `terminationGracePeriodSeconds` must cover both `preStop` and the application's graceful exit time.
@@ -1163,9 +1277,13 @@ adding a cluster, single-step rollback, and profile plan approval; there are als
 release is a recoverable transaction that resumes from persisted checkpoints
 (`PREPARING → CPU_STAGED → ROLLING_CLUSTERS → FINALIZING → COMMITTED`, with failure as
 `FAILED`/`PAUSED → ROLLING_BACK → ROLLED_BACK`), keeping signed artifacts, per-wave safety checks, and rollback
-gates: the control plane rolls one replica at a time, GPU clusters roll one by one according to `upgradeMaxParallelClusters`, and when validation or the
+gates: the control plane rolls one replica at a time, GPU clusters roll with the parallelism of
+`spec.release.upgradeMaxParallelClusters` (default 1, at most 8) and the nodes of a cluster roll in waves whose first wave
+is a one-node canary, and when validation or the
 stability window fails it automatically rolls back to the previous release according to `spec.autoRollback`; for releases across schema versions see §11
-item 4. Release artifacts (wheel, node bundle) are carried in ConfigMaps, and the wheel is stored `.xz`-compressed.
+item 4. Release artifacts (wheel, node bundle) are carried in ConfigMaps; the wheel is stored `.xz`-compressed and split
+into a chunked set with a digest per part once it exceeds one ConfigMap; the running processes use the wheel inside the
+Runtime image, and the ConfigMaps only keep the artifact recoverable and digest-checkable.
 All state lives under `--state-dir` (site.yaml, checkpoints, and the state.json of join/rotate). The installed
 deploy-host is bound to the managed state-dir, and assets are located by `gpu_fault_release.repository_root()` to the
 trusted source snapshot; the wheel/bundle relative paths inside the Manifest are additionally resolved by `load_release_artifacts` against the snapshot that
@@ -1235,9 +1353,12 @@ This is an accepted interim security risk and does not block the current deploym
 2. switch the NLB to TCP passthrough and terminate mTLS in Envoy/a service mesh or the control-plane process.
 
 Upgrading to mTLS requires filling in per-cluster/node certificate issuance, SAN identity mapping, rotation, revocation, and a dual-certificate transition.
-Until then, when a Token leak is discovered, rotate immediately with `gpu-fault-admin rotate-token --gpu-cluster-arn …
---window-minutes 10`: the registry enters an overlap window in which the old and new digests coexist, the data plane and node Agents
-switch over in waves, and the old digest becomes invalid after the window closes; then audit all events of that cluster_id.
+Until then, when a Token leak is discovered, rotate immediately with `gpu-fault-admin rotate-token --state-dir <dir>
+--gpu-cluster-arn <ARN> --window-minutes 10` (the overlap window defaults to 120 minutes and may be 10–10080): the registry
+enters an overlap window in which the old and new digests coexist, the GPU Secret, the data-plane Deployments and the node
+Agents switch over in waves, then the site's token file and the registry Secret are updated and the control plane restarts;
+by default the old digest is dropped as soon as the rotation ends (`--keep-window` keeps it until the window expires), and a
+rerun resumes an interrupted rotation; then audit all events of that cluster_id.
 
 ### 8.2 Authorization Model
 
@@ -1259,17 +1380,24 @@ switch over in waves, and the old digest becomes invalid after the window closes
 - Kubernetes RBAC grants only the verbs an action truly needs: `nodes` gets
   `get,list,watch,patch` (**no Node delete permission is granted**), training objects
   (`jobs`, `pytorchjobs`, `jobsets`) get `get,list,watch,patch,create` (likewise no delete).
-  `delete` on `pods` is the only delete permission granted, and it is used in only two places: restarting the GPU/EFA device
+  On the fault-handling path (the executor and the Completion Watcher), `delete` on `pods` is the only delete permission
+  granted, and it is used in only two places: restarting the GPU/EFA device
   plugin's DaemonSet Pods, and marking the Pods of a managed training job for termination when stopping it. This solution does not call the
-  Kubernetes Eviction API, nor does it delete nodes or the training objects themselves.
-  These write verbs are not in the ClusterRole: the ClusterRole grants only `nodes` patch and the read verbs of each kind;
+  Kubernetes Eviction API, nor does it delete nodes or the training objects themselves; the node-installer-reconciler may
+  additionally delete, only inside `gpu-fault-system`, the installer Jobs it created itself.
+  These write verbs are not in the ClusterRole: the ClusterRole grants only `nodes` patch and the read verbs of each kind
+  (the Completion Watcher's ClusterRole additionally grants get/update/patch, by `resourceNames`, only on its own two outbox
+  ConfigMaps);
   the write verbs are rendered by the release engine as a Role/RoleBinding per allowed workload namespace (executor:
   `pods` patch/delete, training object create/patch; Completion Watcher: `pods` patch,
   `pods/exec` get/create, `pods/log` get, training object patch), and the device plugin's
   `pods delete` is only in `kube-system`. Commands outside the namespace are rejected by both the executor and the API server,
   a double rejection.
-- GPU reset is off by default, and compute clients and device-file holders are re-checked before execution.
-- HyperPod mutation is off by default; with `NodeRecovery=Automatic`, self-built mutation is rejected by default.
+- GPU reset is off in the installer's bare default and enabled explicitly by the regional production install, and compute
+  clients and device-file holders are re-checked before execution.
+- The provider node reboot (HyperPod and eks-managed share `GPU_FAULT_ALLOW_HYPERPOD_REBOOT`) is off in the application's
+  bare default and enabled explicitly by the regional executor manifest; with `NodeRecovery=Automatic`, self-built mutation
+  is always rejected, and an eks-managed node group with node auto repair on likewise has its reboot refused.
 - **`GPU_FAULT_ALLOW_HYPERPOD_REPLACE` and
   `GPU_FAULT_ALLOW_WITH_AUTOMATIC_NODE_RECOVERY` are always `false` (§2.1 hard constraint);
   the managed cluster's `NodeRecovery` must be `None`; managed training jobs must not enable
@@ -1290,7 +1418,10 @@ switch over in waves, and the old digest becomes invalid after the window closes
   control-worker and spool-worker both `maxUnavailable=1`.
 - PostgreSQL is the shared consistency point; the control plane cannot use a per-Pod independent SQLite.
 - The default workflow lease is 180 seconds, minimum 30 seconds.
-- The default dispatcher scans every 5 seconds, 100 workflows per batch.
+- The default dispatcher runs a round every 5 seconds (store wakeups may trigger one earlier), and only the process holding
+  the 15-second `workflow-dispatch` lease scans; the batch size is derived from the dispatch threads and the lease (346 rows
+  with the default 8 threads and 15-second lease, bounded to 100–400), and `WAITING` rows hold only a 30-second short lease
+  so that a lease handover is quick.
 - The default Agent heartbeat is 30 seconds; 90 seconds is treated as expired.
 - Raw evidence is retained by default for 24 hours, 10000 records per node.
 - The site's closed incidents and their workflows and other core control records are retained by default for 30 days
@@ -1330,9 +1461,11 @@ switch over in waves, and the old digest becomes invalid after the window closes
   the checked Deployment rollout, Pod replacement, and liveness, avoiding multiple retire-first
   worker replacements overlapping during a burst.
 - Capacity protection limits both the regional total outstanding queue and the single-cluster outstanding queue; requests over the limit are not persisted and return
-  `429 Retry-After`; the global and single-cluster caps each reserve 40% for the priority=0 XID/SXID,
-  incident, and workflow fault paths, and ordinary telemetry/observation cannot occupy that reserved capacity.
-  A Store I/O admission timeout returns `503 Retry-After`.
+  `429 Retry-After`; both caps keep part of their depth for the fault tiers (priority ≤ 10: incident/workflow control-plane
+  actions are 0, XID/SXID device events are 10), which ordinary telemetry/observation cannot occupy. The production render
+  reserves an eighth of the global depth and an eighth of the per-cluster depth but no less than the node count of the
+  largest cluster (`src/gpu_fault/admin/capacity_evidence.py`; the current generated manifests carry 65536/8192 and
+  4096/512); the application's bare default without configuration is 40%. A Store I/O admission timeout returns `503 Retry-After`.
 
 ## 10. Go-Live Gates
 
@@ -1361,18 +1494,22 @@ mapping table in that document must be updated in sync.**
 
 ## 11. Current Boundaries and Risks
 
-1. The Completion Watcher's GPU UUID depends on Pod annotations or an upstream mapping; it is not yet directly connected to kubelet PodResources.
-2. Generic Kubernetes deployment is currently not implemented as a deliverable capability; the legacy manifests contain `REPLACE_WITH_*`,
-   serve only as a development reference, and cannot go live as-is.
+1. The Completion Watcher's GPU UUIDs come from the Pod annotation `gpu-fault.io/gpu-uuids`, or are discovered by exec'ing
+   `nvidia-smi --query-gpu=uuid` in the training container (`GPU_FAULT_DISCOVER_POD_GPU_UUIDS`, on in production, relying
+   on the `pods/exec` granted per workload namespace); it is not yet directly connected to kubelet PodResources.
+2. Generic Kubernetes deployment is currently not implemented as a deliverable capability, and its historical manifests have
+   been removed from the public tree. The `deploy/` templates and `config/` example profiles in the repository that still
+   carry `REPLACE_WITH_*` placeholders are rendered only by the release engine and cannot be applied with `kubectl apply` as-is.
 3. If some HyperPod example manifests are used directly, the test cluster name, node names, Service name, and
    wheel ConfigMap name in them must be replaced. Normal production releases use `gpu-fault-admin deploy` and the release engine renderer of the trusted source
    snapshot; `deploy/hyperpod/deploy.sh` is only the compatibility entry point of the §7.2 historical single-cluster form
    and cannot replace the regional release transaction.
-4. The PostgreSQL schema already has a versioned migration framework (currently 18 versions, see
+4. The PostgreSQL schema already has a versioned migration framework (currently 23 versions, see
    `schema_migrations.POSTGRES_SCHEMA_MIGRATIONS` for details: v7 adds Processor `not_before`,
    `retry_count`, `lane_policy`, and availability indexes, v13 adds control-plane review indexes and autovacuum
    parameters, v14 adds the wakeup NOTIFY trigger on `gpu_fault_objects`, v15–v18 introduce and tighten the
-   dedicated remote_command/workflow tables; at import time it checks version continuity, name uniqueness, and the DDL source checksum; production runs
+   dedicated remote_command/workflow tables, v19–v23 tune the hot-table storage parameters, the counter shards, the wakeup
+   mechanism and the Processor hot-table layout (§4.4); at import time it checks version continuity, name uniqueness, and the DDL source checksum; production runs
    `gpu-fault-store-migrate --ensure-schema` separately with the Job in `deploy/migrations/`, and
    business processes do not create tables themselves). The remaining limitation is **forward-only**: there is no down migration, business processes accept only the exact schema version that
    matches themselves, and cross-version releases cannot be rolled back. The `dual` mode of hot state and the dedicated workflow/remote-command
@@ -1380,7 +1517,8 @@ mapping table in that document must be updated in sync.**
    `gpu-fault-admin deploy --accept-schema-change`: the release engine first creates an Aurora manual
    snapshot, then marks this transaction as fail-forward (no automatic rollback on validation failure, `SKIPPED_POLICY`),
    and `spec.autoRollback` is not rewritten; the only way back is to restore the snapshot and then roll back; old processes cannot be
-   switched back directly onto the new database.
+   switched back directly onto the new database. A database nobody would restore (staging) may skip the snapshot with
+   `--accept-schema-change-without-snapshot`.
 5. The collector's local outbox is a capacity-limited event re-submission mechanism; a prolonged offline period exceeding its capacity still requires
    external alerts and operations intervention, and it must not be treated as an indefinite message queue or long-term log storage.
 6. GPU count changes already have an annotation approval gate, but there is no independent approval UI yet.
@@ -1397,10 +1535,12 @@ mapping table in that document must be updated in sync.**
 9. The single-cluster all-in-one code serves only as a historical transition. When maintaining an old environment, the executor of the same capability differs from the regional form
    (direct control-plane access vs. cluster executor), and the Runtime Profile's owner must match the actual environment;
    new production environments must no longer choose this path.
-10. **Only HyperPod EKS orchestration is supported; HyperPod Slurm orchestration is not supported for now** (§2.1 constraint 4).
+10. **HyperPod is supported only with EKS orchestration; HyperPod Slurm orchestration is not supported for now** (§2.1 constraint 4).
     The Slurm side lacks a scheduler adapter, `scontrol` isolation evidence read-back, and workload
     stop/restart executors; `hyperpod-slurm` in the `Environment` enum
     is only a data-model value. Any Slurm protocol details appearing in the documents are reference and future-extension notes.
+    The other supported kind of GPU cluster is plain EKS (`eks-managed`, §2.4), a new form whose live acceptance is narrower
+    than that of `hyperpod`.
 11. **Job auto-recovery is owned exclusively by this solution** (§2.1 constraint 3); HyperPod Job Auto Restart
     must be disabled. This constraint is enforced at two layers: the pre-management check (deployment time, manual, may miss)
     and the Kubernetes adapter's fail-closed guard before writing the workload
@@ -1414,4 +1554,5 @@ mapping table in that document must be updated in sync.**
 - [Deployment and Operations Manual](deployment-and-operations-manual.md) -- deployment, migration, and troubleshooting steps
 - [Regional-Mode End-to-End Acceptance Test Cases](regional-e2e-acceptance-test-cases.md) -- step-by-step verification of the §10 gates
 - [Fault Simulation Test Manual](fault-simulation-test-manual.md) -- fault scenario catalog and verification tiers
+- [Plain EKS GPU Clusters and Mixed-Provider Sites](components/plain-eks-gpu-cluster.md) -- design, prerequisites and validation status of `eks-managed`
 - `COLLECTORS.md`
