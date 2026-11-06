@@ -126,7 +126,12 @@ persistence 随服务恢复为 Enabled。任何提前启动训练、重复 reset
 
 ## 真机验收条件
 
-这些条件是未执行的验收规格，不提供自动破坏性 runner。
+这些条件是未执行的验收规格；整条 Drain P2P 恢复链没有专用的自动破坏性 runner。
+GF-GENERAL-LIVE-024 的 `xid_twin_drain_p2p` 变体（`scripts/e2e/regional/general_live_xid_twins.py`，
+需单独的 `GPU_DRAIN_P2P` 审批）在空闲节点上先让 DCGM 字段 230 变为 154，再写入一行经审阅的
+XID 154 Drain P2P 内核日志，期望恰好执行一次 RECOVER_DRAIN_P2P、事件 RECOVERED 且不计划 QUARANTINE。
+它验证双源配对和这条链在真实节点上的执行；真实 `GPU Recovery Action` 仍由驱动决定，
+因此不覆盖下列 Reset/Reboot 分支，也不覆盖训练恢复。
 
 - 使用隔离 GPU 节点、可丢弃训练任务及明确维护窗口；先记录 workload/attempt、
   GPU UUID/PCI、driver/CUDA、boot ID、persistence、服务状态和初始调度状态。

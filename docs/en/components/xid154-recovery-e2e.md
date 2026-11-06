@@ -61,8 +61,15 @@ the existing policy tests.
 
 ## Live Acceptance Prerequisites
 
-Live acceptance is specified but not run or provided as an automatic destructive
-runner. Use isolated nodes, a disposable training job and an approved maintenance
+Live acceptance of the full chain is specified but not run, and no dedicated
+automatic destructive runner exists for it. GF-GENERAL-LIVE-024's
+`xid_twin_drain_p2p` variant (`scripts/e2e/regional/general_live_xid_twins.py`,
+separately approved as `GPU_DRAIN_P2P`) moves DCGM field 230 to 154 on an idle
+node and then writes one reviewed XID 154 Drain P2P kernel line, expecting
+exactly one executed RECOVER_DRAIN_P2P, a RECOVERED incident and no planned
+QUARANTINE. It exercises the cross-source pairing and the chain on a real node
+while the driver still decides the actual GPU Recovery Action, so it covers
+neither the Reset/Reboot branches below nor training recovery. Use isolated nodes, a disposable training job and an approved maintenance
 window. Record workload/attempt identity, GPU UUID/PCI, driver/CUDA, boot ID,
 persistence, service state and scheduling state first. Prove independent bounded
 recovery and operator takeover before authorizing stop/reset/reboot.
