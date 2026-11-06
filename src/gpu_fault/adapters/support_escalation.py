@@ -8,6 +8,7 @@ from gpu_fault.execution import (
 )
 from gpu_fault.execution.hung_handoff import hung_handoff_workflow
 from gpu_fault.execution.hung_handoff_evidence import handoff_evidence
+from gpu_fault.handoff_hold import held_nodes, hold_disposition
 from gpu_fault.models import (
     WorkflowRequest,
     WorkflowStepSpec,
@@ -65,7 +66,12 @@ class SupportEscalationAdapter:
 
     The read-only hung DAG's hand-off (``execution/hung_handoff``) sends the
     hung notice instead of the hardware escalation: that diagnostic isolated
-    nothing, so neither its mail nor its step details may say otherwise.
+    nothing, so neither its mail nor its step details may say otherwise. Every
+    other hand-off says what its chain left on each node it names
+    (``handoff_hold.held_nodes`` over the escalation lineage): the hardware
+    escalation mail's headline, node lines, subject and case draft and the
+    step's ``hardware_disposition`` / ``held_nodes`` -- a node-health
+    ESCALATE_OPERATOR WARNING plan cordons nothing.
     """
 
     OPERATIONS = operations_for_adapter(OperationAdapter.SUPPORT)
@@ -91,6 +97,8 @@ class SupportEscalationAdapter:
         if hung_handoff_workflow(context.workflow):
             return self._hung_handoff(context)
         ticket_id = f"vendor-ticket-{context.incident.incident_id}"
+        lineage = escalation_lineage(self.store, context)
+        held = held_nodes(lineage, context.step.node_ids)
         builder = (
             self.nvlink74_builder
             if context.incident.official_action == "WORKFLOW_NVLINK_ERR"
@@ -121,10 +129,9 @@ class SupportEscalationAdapter:
                     # restore does not restart them (G7, batch 139).
                     "suspended_workloads": [
                         suspended_workload_line(item)
-                        for item in suspended_workloads(
-                            escalation_lineage(self.store, context)
-                        )
+                        for item in suspended_workloads(lineage)
                     ],
+                    "held_node_ids": held,
                 }
                 if builder is self.builder
                 else {}
@@ -138,7 +145,8 @@ class SupportEscalationAdapter:
             details={
                 "ticket_id": ticket_id,
                 "notification_id": notification.notification_id,
-                "hardware_disposition": "OFFLINE_QUARANTINED",
+                "hardware_disposition": hold_disposition(context.step.node_ids, held),
+                "held_nodes": held,
             },
         )
 

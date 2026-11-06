@@ -3734,7 +3734,7 @@ workflow ends FAILED with that failure and the incident `ESCALATED`; a VALIDATE_
 explicit `fabric_status=UNKNOWN` instead of waiting (`components/nccl-hung-hardening.md`).
 
 That DAG's `ESCALATE_SUPPORT` sends the `HUNG_SUPPORT_HANDOFF` notice (`hung-support-handoff-zh-v1`, category `OPERATOR_REVIEW`,
-deduplication key `<cluster>/<incident>/hung-support-handoff/<workflow>`) rather than the hardware-escalation mail, which says "hardware
+deduplication key `<cluster>/<incident>/hung-support-handoff/<workflow>`) rather than the hardware-escalation mail, which for held nodes says "hardware
 taken out of service" and that the nodes stay unschedulable and quarantined -- untrue for a hung diagnostic. The body states that the
 diagnostic is read-only (it did not cordon, drain, quarantine, reset or reboot any node, and did not stop, suspend or restart any workload),
 the job/attempt and nodes, each evidence step's result as its own record has it (the step record key `<workflow>/<index>/<operation>`, the
@@ -3746,7 +3746,12 @@ VALIDATE_FABRIC that SUCCEEDED without a `fabric_status` of its own reads PASSED
 recovery). The step details are `support_disposition=READ_ONLY_HUNG_DIAGNOSTIC`, `nodes_isolated=false`, `workloads_stopped=false` and
 `fabric_verdict` (`PASSED`/`UNKNOWN`/`FAILED`/`NOT RUN`/`NOT PLANNED`); `hardware_disposition=OFFLINE_QUARANTINED` is no longer written.
 The selection is exactly `hung_handoff.hung_handoff_workflow`; every other `ESCALATE_SUPPORT` (hardware escalation, XID 74, a plan that
-touched a node, the operator hand-off after a spent lifetime) is unchanged.
+touched a node, the operator hand-off after a spent lifetime) is unchanged. The hardware escalation mail's (`hardware-escalation-zh-v4`)
+first line, node-state lines, subject and case-draft Disposition state whether each named node is still held, read from the step records
+of the hand-off and its escalation lineage (`handoff_hold.held_nodes`: a completed MARK_UNSCHEDULABLE/QUARANTINE holds, a failed
+isolation's `isolated_nodes` still hold, a completed RESTORE_SCHEDULING releases), and the step details carry `hardware_disposition`
+(`OFFLINE_QUARANTINED`/`NOT_ISOLATED`/`PARTIALLY_QUARANTINED`) and `held_nodes`; the chain terminator's copy of the mail reads the same
+records.
 
 **Shared-storage failure domain (a record-only incident).** `shared_filesystem_unavailable` is graded per node, so
 while an NFS server is down or a Lustre MDS is in recovery every node that loses the export opens its own CRITICAL

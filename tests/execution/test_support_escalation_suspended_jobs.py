@@ -19,6 +19,7 @@ from gpu_fault.models import (
     WorkflowStatus,
     WorkflowStepStatus,
 )
+from gpu_fault.notifications.common import HARDWARE_ESCALATION_TEMPLATE_VERSION
 from gpu_fault.restart_containment import STOP_OWNERSHIP_RECEIPT_KEY
 from tests._builders import (
     build_store,
@@ -146,7 +147,10 @@ def test_the_hand_off_email_names_the_job_the_failed_chain_left_suspended() -> N
 
     assert LINE in notification.body_text
     assert LINE in notification.support_case_draft
-    assert "Template: hardware-escalation-zh-v3" in notification.body_text
+    assert f"Template: {HARDWARE_ESCALATION_TEMPLATE_VERSION}" in notification.body_text
+    assert "The faulty nodes stay unschedulable and quarantined" in (
+        notification.body_text
+    ), "the failed chain's cordon still holds node-a"
 
 
 def test_the_hand_off_email_says_none_when_the_chain_restarted_the_job() -> None:

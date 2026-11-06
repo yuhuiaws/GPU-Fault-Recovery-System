@@ -36,7 +36,7 @@ FABRIC_RESET_TEMPLATE_VERSION = "fabric-reset-zh-v2"
 NOT_APPLICABLE_TEMPLATE_VERSION = "xid-not-applicable-zh-v2"
 XID_INVESTIGATORY_TEMPLATE_VERSION = "xid-investigatory-zh-v1"
 SXID_EVENT_TEMPLATE_VERSION = "sxid-event-zh-v1"
-HARDWARE_ESCALATION_TEMPLATE_VERSION = "hardware-escalation-zh-v3"
+HARDWARE_ESCALATION_TEMPLATE_VERSION = "hardware-escalation-zh-v4"
 NVLINK74_SUPPORT_TEMPLATE_VERSION = "xid74-support-zh-v3"
 NVLINK74_MECHANICAL_TEMPLATE_VERSION = "xid74-mechanical-zh-v1"
 GPU_MECHANICAL_TEMPLATE_VERSION = "gpu-mechanical-zh-v1"
@@ -303,8 +303,32 @@ GPU mechanical check required
 Template: {template_version}
 """
 
+#: The hardware escalation mail's first line and node-state lines follow what
+#: the hand-off's records left on each node it names (``handoff_hold``): held
+#: (cordoned and quarantined, scheduling not restored) or not.
+HARDWARE_ESCALATION_HELD_HEADLINE = (
+    "GPU node automatic recovery failed: hardware taken out of service"
+)
+HARDWARE_ESCALATION_NOT_HELD_HEADLINE = (
+    "GPU fault escalated to support: no node was taken out of service"
+)
+HARDWARE_ESCALATION_ALL_HELD_LINE = (
+    "- The faulty nodes stay unschedulable and quarantined; scheduling is not\n"
+    "  restored."
+)
+HARDWARE_ESCALATION_NONE_HELD_LINE = (
+    "- The nodes were not cordoned or quarantined by this remediation; their\n"
+    "  scheduling is unchanged."
+)
+HARDWARE_ESCALATION_HELD_NODES_LINE = (
+    "- Unschedulable and quarantined, scheduling not restored: {nodes}"
+)
+HARDWARE_ESCALATION_NOT_HELD_NODES_LINE = (
+    "- Not cordoned or quarantined by this remediation: {nodes}"
+)
+
 HARDWARE_ESCALATION_EMAIL_TEMPLATE = """\
-GPU node automatic recovery failed: hardware taken out of service
+{headline}
 
 1. Event
 - Cluster: {cluster_id}
@@ -319,8 +343,7 @@ GPU node automatic recovery failed: hardware taken out of service
 
 2. System handling
 - Automatic recovery steps that failed: {failed_operations}
-- The faulty nodes stay unschedulable and quarantined; scheduling is not
-  restored.
+{node_state}
 - Workloads the remediation suspended and did not restart (a validated
   restore does not restart them either; their owner must):
 {suspended_workloads}

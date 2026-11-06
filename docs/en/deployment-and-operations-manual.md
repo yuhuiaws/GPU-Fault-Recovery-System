@@ -9417,7 +9417,14 @@ NCCL/EFA hung diagnostic DAG uses `hung-support-handoff-zh-v1`, category `OPERAT
 `<cluster>/<incident>/hung-support-handoff/<workflow>`: the body states that the diagnostic is read-only (nothing cordoned, quarantined,
 stopped, reset or rebooted), lists each evidence step's result with its record key, the diagnostic bundle archive references with their
 sha256, the task-port fabric verdict (each node's reason for an UNKNOWN or partial scope) and the operator's next steps; every other support
-escalation still uses `hardware-escalation-zh-v3`, and XID 74 `xid74-support-zh-v3`. When a plan refused only for a
+escalation uses `hardware-escalation-zh-v4`, and XID 74 `xid74-support-zh-v3`. The hardware escalation mail's first line, node-state
+lines, subject and case-draft Disposition follow the step records of the hand-off and its escalation lineage: whether each named node
+is still cordoned and quarantined by this remediation (MARK_UNSCHEDULABLE and QUARANTINE are one Kubernetes patch; a completed
+RESTORE_SCHEDULING releases it). With every node held it reads "hardware taken out of service" and "stay unschedulable and
+quarantined", subject `[GPU FAULT][hardware out of service]`; with none held (for example the node-health `ESCALATE_OPERATOR` WARNING
+plan FREEZE_EVIDENCE → ESCALATE_SUPPORT) it reads "no node was taken out of service" and "not cordoned or quarantined by this
+remediation", subject `[GPU FAULT][support escalation]`; a partial hold lists both groups of nodes. The step details'
+`hardware_disposition` (`OFFLINE_QUARANTINED`/`NOT_ISOLATED`/`PARTIALLY_QUARANTINED`) and `held_nodes` come from the same records. When a plan refused only for a
 missing executable owner (a Runtime Profile capability declared OBSERVE, such as `memoryDiagnostics`) has run its
 containment prefix and the record stops `BLOCKED/SAFETY_SETTLED` (incident `QUARANTINED`), the executor sends
 `contained-operator-handoff-zh-v1`, category `OPERATOR_REVIEW`, subject `[GPU FAULT][contained, operator action

@@ -59,7 +59,9 @@ def test_support_escalation_creates_fixed_ticket_notification() -> None:
     )
 
     assert outcome.status is WorkflowStepStatus.SUCCEEDED
-    assert outcome.details["hardware_disposition"] == ("OFFLINE_QUARANTINED")
+    assert outcome.details["hardware_disposition"] == "NOT_ISOLATED", (
+        "no step of this record cordoned or quarantined node-a"
+    )
     notification = store.list_notifications()[0]
     assert outcome.details["ticket_id"] in notification.body_text
     assert "Automatic recovery steps that failed" in notification.body_text

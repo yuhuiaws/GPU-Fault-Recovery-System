@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Mapping
+from contextlib import suppress
 from datetime import datetime, timezone
 from typing import Any
 
@@ -17,6 +18,7 @@ from gpu_fault.models import (
     WorkflowStepStatus,
     bounded_reasons,
 )
+from gpu_fault.handoff_hold import held_nodes
 from gpu_fault.notifications import HardwareEscalationEmailBuilder
 from gpu_fault.health_recovery_contract import diagnostic_workflow_failures
 from gpu_fault.operation_registry import (
@@ -1406,6 +1408,9 @@ class HardwareEscalationService:
                 for workload_id in step.workload_ids
             )
         )
+        lineage = [workflow]
+        with suppress(NotFoundError, KeyError, TypeError):
+            lineage.append(self.store.get_workflow(origin[1]))
         notification = HardwareEscalationEmailBuilder().build(
             cluster_id=source.cluster_id,
             incident_id=source.incident_id,
@@ -1419,6 +1424,7 @@ class HardwareEscalationService:
             policy_source=source.policy_source,
             official_action=source.official_action,
             ticket_id=f"vendor-ticket-{source.incident_id}",
+            held_node_ids=held_nodes(lineage, source.node_ids),
         )
         self.store.save_notification_if_absent(notification)
         if first_termination:

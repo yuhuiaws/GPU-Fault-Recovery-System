@@ -36,6 +36,7 @@ from gpu_fault.models import (
     WorkflowStatus,
     WorkflowStepStatus,
 )
+from gpu_fault.notifications.common import HARDWARE_ESCALATION_TEMPLATE_VERSION
 from gpu_fault.notifications.hardware_escalation import HardwareEscalationEmailBuilder
 from gpu_fault.notifications.hung_support import (
     HUNG_SUPPORT_HANDOFF_TEMPLATE_VERSION,
@@ -76,6 +77,7 @@ ISOLATION_CLAIMS = (
     "unschedulable and quarantined",
     "HARDWARE_OFFLINE",
     "hardware-escalation-zh-v3",
+    HARDWARE_ESCALATION_TEMPLATE_VERSION,
 )
 BOUND = {"basis": "TASK_DEVICE_BINDING", "network_interfaces": [], "rdma_ports": []}
 
@@ -807,16 +809,20 @@ def ordinary(workflow):
     ids=["plan-touches-a-node", "training-contract", "ordinary-support-ticket"],
 )
 def test_every_other_support_escalation_keeps_the_hardware_notice(shape):
+    """The hardware notice, whose node lines follow the records: no step of
+    these records cordoned or quarantined a node (``handoff_hold``)."""
+
     outcome, notification = hand_off(shape(hung_record()))
-    assert outcome.details["hardware_disposition"] == "OFFLINE_QUARANTINED", outcome
+    assert outcome.details["hardware_disposition"] == "NOT_ISOLATED", outcome
     body = notification.body_text
-    assert "Template: hardware-escalation-zh-v3" in body, body
-    assert "unschedulable and quarantined" in body, body
-    assert notification.subject.startswith("[GPU FAULT][hardware out of service]"), (
+    assert f"Template: {HARDWARE_ESCALATION_TEMPLATE_VERSION}" in body, body
+    assert "not cordoned or quarantined by this remediation" in body, body
+    assert "unschedulable and quarantined" not in body, body
+    assert notification.subject.startswith("[GPU FAULT][support escalation]"), (
         notification.subject
     )
     assert notification.deduplication_key == (
-        f"{INCIDENT}/hardware-escalation/hardware-escalation-zh-v3"
+        f"{INCIDENT}/hardware-escalation/{HARDWARE_ESCALATION_TEMPLATE_VERSION}"
     ), notification
 
 
@@ -825,7 +831,9 @@ def test_the_xid74_support_notice_is_unchanged():
         ordinary(hung_record()), case=incident(official_action="WORKFLOW_NVLINK_ERR")
     )
     assert "XID 74 NVLink" in notification.subject, notification.subject
-    assert outcome.details["hardware_disposition"] == "OFFLINE_QUARANTINED", outcome
+    assert outcome.details["hardware_disposition"] == "NOT_ISOLATED", (
+        "the step records what the chain left on the node, not a fixed claim"
+    )
 
 
 def test_the_registry_names_the_hung_notice():
