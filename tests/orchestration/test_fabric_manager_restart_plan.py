@@ -278,9 +278,10 @@ def test_a_failed_solo_fabric_manager_restart_climbs_to_the_reboot(
     assert escalation is not None, "a failed Fabric Manager restart climbs nothing"
     successor_incident, successor = escalation
     assert successor.request_id == f"workflow-reboot-after-{workflow.request_id}"
-    assert successor_incident.reasons[0].startswith(
+    assert successor_incident.reasons[0] == (
         "fabric_manager_restart remediation failed; failed operation or "
-        "validation: RESTART_FABRIC_MANAGER; nodes: node-a"
+        "validation: RESTART_FABRIC_MANAGER; nodes: node-a: "
+        "RESTART_FABRIC_MANAGER failed"
     ), successor_incident.reasons
     assert [step.operation for step in successor.official_steps] == (
         REBOOT_SUCCESSOR

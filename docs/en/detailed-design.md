@@ -2497,6 +2497,10 @@ Whole-record hardware recovery escalation is invoked idempotently by the Dispatc
    `failed_nodes` is narrowed to the nodes the record still holds (`failure_outcome.held_scope`,
    `handoff_hold.record_held_nodes`), so when a STOP_WORKLOADS or CHECKPOINT_WORKLOADS compiled for the job's whole
    allocation fails, the successor cordons, quarantines and names the faulty node only, never the job's healthy ones.
+   The hand-off's reason names each node by its own finding or by why it is held: `held after <OPERATION> failed`, or
+   `held; <OPERATION> failed on another node` for a held node the step did not fail on (one that passed the validation
+   of a validate-then-readmit); any other step failure without a per-node finding reads `<OPERATION> failed`, never a
+   failed validation.
    The one deliberate exception is the manual-confirmation hand-off: a job-wide STOP_WORKLOADS or CHECKPOINT_WORKLOADS
    whose outcome nobody knows (`manual_confirmation_required`) hands over every node of the job's allocation --
    cordoned, quarantined and named -- until an operator confirms the job's state, because while that state is unknown,

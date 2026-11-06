@@ -118,7 +118,7 @@ def test_incomplete_step_scope_preserves_incident_nodes_without_guessing_gpu_map
     assert scope["gpu_uuids"] == ["GPU-a", "GPU-b"], scope
     assert scope["gpu_uuids_by_node"] == {}, scope
     assert scope["node_reason"] == (
-        "node-a: validation failed; node-b: validation failed"
+        "node-a: RESTART_NODE failed; node-b: RESTART_NODE failed"
     ), scope
 
 

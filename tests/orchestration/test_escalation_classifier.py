@@ -844,3 +844,83 @@ def test_a_held_validate_then_readmit_whose_validation_fails_sends_one_hand_off_
     assert mail.subject.startswith("[GPU FAULT][hardware out of service] "), (
         mail.subject
     )
+
+
+def _hand_off_reason(operations, failed_index, details, *, two_nodes=()):
+    from tests.orchestration._cov95_runtime_escalation import EscalationHarness
+
+    h = EscalationHarness(operations, failed_index=failed_index, details=details)
+    if two_nodes:
+        h.amend(
+            official_steps=[
+                step.model_copy(update={"node_ids": ["node-a", "node-b"]})
+                if step.operation in two_nodes
+                else step
+                for step in h.workflow.official_steps
+            ]
+        )
+    result = h.escalate()
+    assert result is not None, "the failure must be handed over"
+    return result[0].reasons[0]
+
+
+def test_a_held_node_that_passed_its_validation_is_not_reported_as_failing() -> None:
+    """A validate-then-readmit cordoned both nodes and its validation failed
+    on node-a only: node-b passed but is still held, so the hand-off keeps it
+    -- and says why it is held instead of the old "validation failed"."""
+
+    operations = [
+        WorkflowOperation.FREEZE_EVIDENCE,
+        WorkflowOperation.MARK_UNSCHEDULABLE,
+        WorkflowOperation.VALIDATE_GPU,
+        RESTORE,
+    ]
+    reason = _hand_off_reason(
+        operations,
+        2,
+        {
+            "failed_nodes": ["node-a"],
+            "node_failures": {"node-a": ["gpu_temperature_c=97"]},
+        },
+        two_nodes=set(operations),
+    )
+
+    assert reason == (
+        "held_chain_step remediation failed; failed operation or validation: "
+        "VALIDATE_GPU; nodes: node-a: gpu_temperature_c=97; "
+        "node-b: held; VALIDATE_GPU failed on another node"
+    ), reason
+
+
+def test_a_held_node_whose_step_failed_names_the_step_not_a_validation() -> None:
+    """A reset chain's job stop failed after the cordon (no reset ran): the
+    held node is handed over because of the stop, which the reason names."""
+
+    operations = [
+        WorkflowOperation.FREEZE_EVIDENCE,
+        WorkflowOperation.MARK_UNSCHEDULABLE,
+        WorkflowOperation.STOP_WORKLOADS,
+        RESET,
+        WorkflowOperation.VALIDATE_GPU,
+        RESTORE,
+    ]
+    reason = _hand_off_reason(operations, 2, {"error": "stop timed out"})
+
+    assert reason == (
+        "held_chain_step remediation failed; failed operation or validation: "
+        "STOP_WORKLOADS; nodes: node-a: held after STOP_WORKLOADS failed"
+    ), reason
+
+
+def test_a_failed_step_without_findings_is_named_by_its_operation() -> None:
+    """Off the held hand-off too: a reset that failed with no per-node
+    finding no longer reads as a failed validation."""
+
+    reason = _hand_off_reason(
+        [WorkflowOperation.MARK_UNSCHEDULABLE, RESET, RESTORE], 1, {"error": "x"}
+    )
+
+    assert reason == (
+        "reset remediation failed; failed operation or validation: RESET_GPU; "
+        "nodes: node-a: RESET_GPU failed"
+    ), reason

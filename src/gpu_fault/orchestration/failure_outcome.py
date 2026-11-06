@@ -20,6 +20,7 @@ from gpu_fault.models import (
     WorkflowRequest,
     WorkflowStepExecution,
 )
+from gpu_fault.orchestration.validation_evidence import missing_evidence_reason
 
 #: ``remote_status_source`` of a command the cluster executor refused before any
 #: adapter ran it (``cluster_executor.dispatch._validate``: cluster mismatch, a
@@ -46,6 +47,11 @@ NO_SECOND_TICKET_OPERATIONS = frozenset(
 #: The classification stage of a held chain's step failure (see
 #: :func:`held_chain_hand_off`).
 HELD_CHAIN_STEP_STAGE = "held_chain_step"
+#: The step detail :func:`held_scope` writes on each failure it hands over:
+#: why each of its nodes is held, which the hand-off's reason gives for a node
+#: with no finding of its own (``escalation.HardwareEscalationService
+#: .collect_scope``).
+HELD_NODE_REASONS_DETAIL = "held_node_reasons"
 
 
 def executor_rejected_failure(details: Mapping[str, Any] | None) -> bool:
@@ -172,6 +178,51 @@ def owes_hand_off(workflow: WorkflowRequest) -> bool:
     )
 
 
+def reported_failed_nodes(
+    details: Mapping[str, Any], step_nodes: Sequence[str]
+) -> list[str]:
+    """The nodes of ``step_nodes`` a FAILED step says it failed on: its
+    ``failed_nodes``, else the ``pending_nodes`` of a step a bound failed while
+    it waited, else -- none of them on the step -- every node of the step."""
+
+    reported = details.get("failed_nodes")
+    if not isinstance(reported, list):
+        reported = details.get("pending_nodes")
+    if not isinstance(reported, list):
+        return list(step_nodes)
+    return [node for node in reported if node in step_nodes] or list(step_nodes)
+
+
+def node_failure_reasons(execution: WorkflowStepExecution, node_id: str) -> list[str]:
+    """What a hand-off's reason says for ``node_id`` of FAILED ``execution``.
+
+    Its findings (``node_failures``); else, for a validation still waiting on
+    the node, what kept it from looking (``node_pending``: the adapter's
+    reason and the operator's exit when it wrote one, else the missing
+    evidence itself, ``validation_evidence.missing_evidence_reason``); else
+    why the record holds the node (:data:`HELD_NODE_REASONS_DETAIL`); else the
+    failed step's own ``<OPERATION> failed`` -- never a validation the node may
+    have passed.
+    """
+
+    details = execution.details
+    reported = details.get("node_failures")
+    reasons = reported.get(node_id, []) if isinstance(reported, Mapping) else []
+    if not isinstance(reasons, list):
+        reasons = [str(reasons)]
+    pending = details.get("node_pending")
+    record = pending.get(node_id) if isinstance(pending, Mapping) else None
+    if not reasons and isinstance(record, Mapping):
+        reason = missing_evidence_reason(record)
+        if reason:
+            reasons = [reason]
+    if not reasons:
+        held = details.get(HELD_NODE_REASONS_DETAIL)
+        held = held if isinstance(held, Mapping) else {}
+        reasons = [held.get(node_id) or f"{execution.operation.value} failed"]
+    return [str(reason) for reason in reasons]
+
+
 def held_scope(
     workflow: WorkflowRequest, failed: Sequence[WorkflowStepExecution]
 ) -> list[WorkflowStepExecution]:
@@ -181,7 +232,12 @@ def held_scope(
 
     The escalation's scope reads ``failed_nodes`` within the step's nodes
     (``escalation._failed_step_nodes``), so the support successor cordons,
-    quarantines and names exactly the held nodes.
+    quarantines and names exactly the held nodes. Each failure also says why
+    each of those nodes is held (:data:`HELD_NODE_REASONS_DETAIL`): ``held
+    after <OPERATION> failed`` for a node the step failed on, ``held;
+    <OPERATION> failed on another node`` for one it did not fail on -- a held
+    node that passed the validation of a validate-then-readmit -- so the
+    hand-off never reports a node that passed as failing.
     """
 
     held = set(record_held_nodes(workflow))
@@ -193,9 +249,25 @@ def held_scope(
         )
         nodes = [node for node in step_nodes if node in held]
         if nodes:
+            failed_on = set(reported_failed_nodes(item.details, step_nodes))
+            operation = item.operation.value
+            reasons = {
+                node: (
+                    f"held after {operation} failed"
+                    if node in failed_on
+                    else f"held; {operation} failed on another node"
+                )
+                for node in nodes
+            }
             scoped.append(
                 item.model_copy(
-                    update={"details": {**item.details, "failed_nodes": nodes}}
+                    update={
+                        "details": {
+                            **item.details,
+                            "failed_nodes": nodes,
+                            HELD_NODE_REASONS_DETAIL: reasons,
+                        }
+                    }
                 )
             )
     return scoped

@@ -32,6 +32,8 @@ from gpu_fault.orchestration.failure_outcome import (
     executor_rejected_failure as executor_rejected_failure,
     gpu_clients_refused,
     held_chain_hand_off,
+    node_failure_reasons,
+    reported_failed_nodes,
     unknown_outcome_failure as unknown_outcome_failure,
 )
 from gpu_fault.orchestration.families.identity import note_stale_event_link
@@ -43,7 +45,6 @@ from gpu_fault.orchestration.gpu_placement import (
 from gpu_fault.orchestration.validation_evidence import (
     VALIDATION_OPERATIONS,
     held_for_unsent_hand_off,
-    missing_evidence_reason,
     requested_escalations,
     validation_unobserved_failure,
     withheld_escalation,
@@ -360,14 +361,7 @@ def _failed_step_nodes(
     RESET_GPU on one node escalated to a reboot that cordoned two).
     """
 
-    reported = execution.details.get("failed_nodes")
-    if not isinstance(reported, list):
-        reported = execution.details.get("pending_nodes")
-    selected = (
-        [node_id for node_id in reported if node_id in step_nodes]
-        if isinstance(reported, list)
-        else list(step_nodes)
-    ) or list(step_nodes)
+    selected = reported_failed_nodes(execution.details, step_nodes)
     if execution.operation in _VALIDATION_OPERATIONS:
         acted = _acted_nodes(workflow, execution.step_index) & set(step_nodes)
         if acted:
@@ -1008,24 +1002,9 @@ class HardwareEscalationService:
             )
             selected = _failed_step_nodes(workflow, execution, list(step_nodes))
             failed_nodes.update(selected)
-            reported_failures = execution.details.get("node_failures", {})
-            # A validation that never observed the node has no failure to
-            # report; its pending record names what kept it from looking --
-            # the adapter's reason (and the operator's exit) when it wrote
-            # one, else the missing evidence itself -- which is what the
-            # hand-off should carry (``missing_evidence_reason``).
-            pending = execution.details.get("node_pending")
-            pending = pending if isinstance(pending, dict) else {}
             for node_id in selected:
-                reasons = reported_failures.get(node_id, [])
-                if not isinstance(reasons, list):
-                    reasons = [str(reasons)]
-                if not reasons and isinstance(pending.get(node_id), dict):
-                    reason = missing_evidence_reason(pending[node_id])
-                    if reason:
-                        reasons = [reason]
                 node_failures.setdefault(node_id, []).extend(
-                    str(reason) for reason in reasons
+                    node_failure_reasons(execution, node_id)
                 )
         if not failed_nodes:
             failed_nodes.update(source.node_ids)
@@ -1050,7 +1029,7 @@ class HardwareEscalationService:
                 + (
                     ",".join(sorted(set(node_failures[node_id])))
                     if node_failures.get(node_id)
-                    else "validation failed"
+                    else f"{failed or 'remediation'} failed"
                 )
             )
             for node_id in ordered_failed_nodes
