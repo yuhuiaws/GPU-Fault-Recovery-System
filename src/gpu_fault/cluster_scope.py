@@ -248,9 +248,12 @@ class DcgmHostEngine(StrEnum):
     """Which nv-hostengine serves a GPU cluster's nodes.
 
     * ``host``: the node image runs DCGM as a host service; the exporter dials
-      it, ``dcgmi diag`` grades the GPUs, and an absent dcgmi or an unreachable
-      engine is a failure. Every HyperPod cluster; an ``eks-managed`` cluster
-      whose selected node groups all carry ``DCGM_HOSTENGINE_LABEL=host``.
+      it, ``dcgmi diag`` grades the GPUs, and an engine that does not answer
+      (after one start, ``hostengine_recovery``) is a failure. Every HyperPod
+      cluster; an ``eks-managed`` cluster whose selected node groups all carry
+      ``DCGM_HOSTENGINE_LABEL=host``, where an absent dcgmi is a failure too
+      (the node group promised DCGM). HyperPod keeps grading an absent dcgmi
+      as the configuration-only WARN it always has.
     * ``embedded``: the exporter runs its own hostengine inside the container
       and the node has none to dial, so the quick diagnostic reports the
       missing tool or engine as a configuration-only WARN. The plain EKS
