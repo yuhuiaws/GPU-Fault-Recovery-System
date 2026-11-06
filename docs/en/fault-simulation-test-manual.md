@@ -398,7 +398,7 @@ grades the target node's NVLink fabric (a graded NVSwitch node: a H100/H200/H800
 a PCIe/NVL variant, whose DCGM exporter field 170 reports a fabric state 1-4; HGX B200/B300 not live-verified), and on the
 control plane's site switch `GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM`:
 
-- a node that is not graded (A100, PCIe/NVL, GH200, GB200/GB300, unknown parts, a node that reports no field 170):
+- a node that is not graded (A100, PCIe/NVL, GH200, GB200/GB300, B100 and the other catalog parts the fabric grading leaves out, a node that reports no field 170; a part in no catalog product family is NOT_APPLICABLE at the product gate and isolated first):
   whatever the switch says, the workflow is `FREEZE_EVIDENCE` → `RESTART_FABRIC_MANAGER`, a Fabric Manager restart
   only, with no isolation, no quiesce and no reset;
 - a graded node with the switch unset (the default): observe-only (our deviation from the catalog's "Solo: RESTART_FM"). The decision is `MONITOR_ONLY`/`NO_ACTION` with
