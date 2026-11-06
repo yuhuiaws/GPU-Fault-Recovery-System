@@ -137,7 +137,8 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
   上限都按节点 GPU 数放大（8 GPU 为 55 s 与 52 s）；装回以 `/proc/modules` 与 `/sys/class/drm` 核对——每张 GPU 的 DRM
   设备都须回来——缺失时暂停 5 s 重试一次，部分装载重试为 `rmmod nvidia_drm && modprobe nvidia_drm`，仍未装回
   则 `display_stack_restored=false`，缺 DRM 设备的 GPU 记在 `display_drm_devices_missing`：reset 照样成功、不当 GPU 故障处理，GPU reset 与 GPU/NVSwitch reset 完成通知的主题带
-  `[display stack not restored]`，正文给出 Agent 记录的补救：模块未装回时 `modprobe` 最外层被卸载的模块（通常 `nvidia_drm`），已装回但缺
+  `[display stack not restored]`，正文写出已装回与仍未装回的模块、仍缺 DRM 设备的 GPU（`/proc/modules` 读不出时为模块状态
+  未知），并给出 Agent 记录的补救：模块未装回时 `modprobe` 最外层被卸载的模块（通常 `nvidia_drm`），已装回但缺
   DRM 设备时 `rmmod nvidia_drm && modprobe nvidia_drm`，或重启节点）；窗口保留的 `nvidia-persistenced`（只持有其余 GPU）与窗口保留的
   Fabric Manager（窗口的 `kept_services` 记着它，只持有 `/dev/nvidia-caps/*`/`/dev/nvidia-nvswitch*`/`/dev/nvidia-nvlink`）
   不阻止卸载，记在 `display_release_bystanders`（只豁免 Fabric Manager 本身：NVL5 上同一单元里的 `nvlsm` 若持有 NVIDIA

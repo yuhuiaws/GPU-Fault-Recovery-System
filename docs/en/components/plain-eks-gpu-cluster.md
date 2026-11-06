@@ -188,8 +188,10 @@ closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace`
   a missing module earns one retry after a 5 s pause, a partial load one `rmmod nvidia_drm && modprobe nvidia_drm`, and a
   stack still not back is `display_stack_restored=false`, the GPUs without a DRM device in
   `display_drm_devices_missing`: the reset stays successful, it is not handled as a GPU fault, and the subject of the GPU
-  reset and the GPU/NVSwitch reset completion mails carries `[display stack not restored]` while the body gives the
-  remedy the Agent recorded: `modprobe` of the outermost unloaded module (usually `nvidia_drm`) when a module did not
+  reset and the GPU/NVSwitch reset completion mails carries `[display stack not restored]` while the body names the
+  modules loaded back and still not loaded and the GPUs still without a DRM device (an unknown module state when
+  `/proc/modules` cannot be read) and gives the remedy the Agent recorded: `modprobe` of the outermost unloaded module
+  (usually `nvidia_drm`) when a module did not
   come back, `rmmod nvidia_drm && modprobe nvidia_drm` when the modules are back but a DRM device is missing, or a node
   reboot); the
   `nvidia-persistenced` the

@@ -2352,9 +2352,15 @@ display stack back before an exception that is no reset verdict (a probe between
 on. A display stack that is not back neither fails a successful reset nor counts as a GPU fault: CUDA does not use the
 DRM device, and draining, quarantining or resetting for it would be disproportionate. It reaches the operator through
 the reset's own completion mail (`notifications/display_stack.py`: GPU_RESET_COMPLETED/FABRIC_RESET_COMPLETED already
-receive every node's result; the subject gains `[display stack not restored]` and "3. Follow-up" names, per node, the
-missing modules, the last error and the remedy; for a partial load the line lists the modules the reset unloaded, the
-last error names the GPUs without a DRM device and the remedy unloads before it loads). The channels not taken: a node-health finding opens an incident and a workflow, a GPU finding fails the
+receive every node's result; the subject gains `[display stack not restored]` and "3. Follow-up" writes, per node and
+from the Agent's receipt fields alone, the modules loaded back (`reloaded_kernel_modules`), the modules still not loaded
+(`display_modules_missing`) and the number of GPUs still without a DRM device (`display_drm_devices_missing`, "k of N"
+with N from `display_drm_devices_before`), then the last error, the impact -- the whole node without `/dev/dri` while a
+module is missing, only the named GPUs once every module is back and only DRM devices are missing -- and the remedy
+(for a partial load it unloads before it loads). When `/proc/modules` could not be read (`display_module_state_error`)
+nothing was verified: the modules read as in an unknown state, never as not loaded, the impact as a `/dev/dri` that may
+be missing, and the last error is the last `modprobe`'s own error or the fact that it exited 0, not the Agent's "left
+... unloaded" inferred from the table it could not read). The channels not taken: a node-health finding opens an incident and a workflow, a GPU finding fails the
 chain's own VALIDATE_GPU, VALIDATE_HOST is not in a reset chain and has no non-blocking finding, and a heartbeat report
 would change the signed heartbeat protocol.
 

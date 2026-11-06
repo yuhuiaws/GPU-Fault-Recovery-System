@@ -1823,11 +1823,14 @@ Semantics and boundaries of `eks-managed`:
   node`); a failed fabric reset's step details carry the same fields.
   That is neither a failed reset nor a GPU fault: the reset stays SUCCEEDED, nothing is drained, quarantined or escalated
   to a reset or reboot (CUDA does not use the display stack), but until the stack is loaded or the node reboots it has no
-  `/dev/dri` and graphics/EGL/Vulkan workloads get no DRM device. The operator reads it in that reset's completion mail:
-  `GPU_RESET_COMPLETED`/`FABRIC_RESET_COMPLETED` (templates `gpu-reset-zh-v2`/`fabric-reset-zh-v2`, category still
-  `ACTION_COMPLETED`) carries `[display stack not restored]` in the subject and, per node, the missing modules, the last
-  error and the remedy under "3. Follow-up"; the same fields are in the reset step's `node_results.<node>` of
-  `GET /v1/workflows/{workflow_id}`. Remedy: on that node run `modprobe nvidia_drm` as root (`modprobe nvidia_modeset` when
+  `/dev/dri` (after a partial load only the GPUs without a DRM device lack theirs) and graphics/EGL/Vulkan workloads get
+  no DRM device. The operator reads it in that reset's completion mail: `GPU_RESET_COMPLETED`/`FABRIC_RESET_COMPLETED`
+  (templates `gpu-reset-zh-v2`/`fabric-reset-zh-v2`, category still `ACTION_COMPLETED`) carries
+  `[display stack not restored]` in the subject and, per node under "3. Follow-up", the modules loaded back, the modules
+  still not loaded and the number of GPUs still without a DRM device (with `/proc/modules` unreadable the modules' state
+  reads as unknown, not as not loaded), the last error, the impact (the whole node while a module is missing, only the
+  GPUs without a DRM device once every module is back) and the remedy; the same fields are in the reset step's
+  `node_results.<node>` of `GET /v1/workflows/{workflow_id}`. Remedy: on that node run `modprobe nvidia_drm` as root (`modprobe nvidia_modeset` when
   only `nvidia_modeset` was unloaded; after a partial load `rmmod nvidia_drm` first, and `ls /dev/dri` should then show one
   `renderD*` per GPU), or reboot the node -- before a fabric reset on such a node: its GPUs without a DRM device are
   cold, and a busy reset may run out of the command's two minutes; later reset records and mails no longer carry it. An

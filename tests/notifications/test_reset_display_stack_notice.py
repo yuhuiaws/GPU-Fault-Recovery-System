@@ -1,32 +1,47 @@
 """A reset that left a node's display stack unloaded says so in its completion mail.
 
 The Agent reloads the ``nvidia_drm`` / ``nvidia_modeset`` a busy reset
-unloaded, retries once and reports ``display_stack_restored`` per node
+unloaded, retries once, checks ``/proc/modules`` and ``/sys/class/drm`` and
+reports ``display_stack_restored`` per node
 (``node_agent/operations/display_stack.py``). The reset is SUCCEEDED either
 way and nothing is drained, quarantined or reset for a display stack, so the
 operator reads it in the mail every successful reset already sends
 (GPU_RESET_COMPLETED, FABRIC_RESET_COMPLETED): a subject marker and, per node,
-what is missing, the last error and the exact remedy. A stack that is back, or
-a reset that released nothing, leaves the mail as it was.
+what came back, what is still missing -- modules, or GPUs without their DRM
+device -- or unverified, the last error and the exact remedy. A stack that is
+back, or a reset that released nothing, leaves the mail as it was.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
+import pytest
+
 from gpu_fault.models import NotificationStatus
+from gpu_fault.node_agent.operations.display_stack import reload_display_stack
 from gpu_fault.notifications.common import (
     FABRIC_RESET_TEMPLATE_VERSION,
     GPU_RESET_TEMPLATE_VERSION,
 )
 from gpu_fault.notifications.display_stack import (
     DISPLAY_STACK_SUBJECT_MARKER,
+    ERROR_TEXT_LIMIT,
     display_stack_follow_up,
     unrestored_display_stacks,
 )
 from gpu_fault.notifications.restart_guard import RestartGuardEmailBuilder
 from gpu_fault.regional import RemoteCommandStatus
 from tests._builders import build_store
+from tests.node_agent._cold_node import GPU_BUS_IDS, ColdNode, cold_agent, fabric_reset
+from tests.node_agent.test_reset_display_stack_reload import (
+    DRM_FAILED,
+    NO_DEVICE,
+    ReloadNode,
+    _agent,
+    _reset,
+)
 from tests.notifications.test_batched_remote_completion import (
     QUIESCE_NODE_RESULTS,
     _compound_command,
@@ -58,6 +73,10 @@ RESTORED = {
     "reloaded_kernel_modules": ["nvidia_modeset", "nvidia_drm"],
     "display_stack_restored": True,
 }
+RELEASED = ["nvidia_drm", "nvidia_modeset"]
+#: The two GPUs whose DRM probe fails on every load, in the receipt's order.
+SHORT = ", ".join(sorted(GPU_BUS_IDS[-2:]))
+IMPACT_TAIL = "CUDA is unaffected; nothing is drained, quarantined or reset for it\n"
 
 
 def _gpu_mail(node_results: dict[str, Any]):
@@ -212,3 +231,140 @@ def test_the_regional_completion_of_a_batched_reset_mails_the_remedy() -> None:
     )
     assert notification.category == "ACTION_COMPLETED"
     assert len(notifier.notifications) == 1
+
+
+def test_a_partial_load_names_what_came_back_and_the_gpus_still_short(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Agent's own receipt of a load that stays short: both modules Live
+    again, two GPUs without their DRM device after both loads. The mail used
+    to call the reloaded modules "not loaded" next to an error saying
+    ``nvidia_drm`` is loaded; it names them loaded back, counts the GPUs still
+    without a DRM device and scopes the impact to those GPUs."""
+
+    node = ColdNode(tmp_path)
+    node.failing_probes = [set(GPU_BUS_IDS[-2:]), set(GPU_BUS_IDS[-2:])]
+    details = cold_agent(tmp_path, node, monkeypatch).execute(fabric_reset()).details
+    assert "display_modules_missing" not in details, "both modules are Live again"
+
+    notification = _fabric_mail({"node-a": details})
+
+    block = display_stack_follow_up({"node-a": details})
+    assert block == (
+        "- Display stack: NOT restored on node-a: nvidia_modeset, nvidia_drm "
+        "loaded back; 2 of 8 GPUs without a DRM device after 2 modprobe "
+        "attempt(s); last error: nvidia_drm is loaded without a DRM device for "
+        f"2 of 8 GPUs: {SHORT}\n"
+        f"  Impact: no /dev/dri device for {SHORT} on node-a for graphics, EGL or "
+        f"Vulkan workloads; {IMPACT_TAIL}"
+        "  Remedy on node-a: rmmod nvidia_drm && modprobe nvidia_drm, or reboot "
+        "the node\n"
+    ), "what came back, the GPUs still short and the Agent's remedy:\n" + block
+    assert block in notification.body_text, notification.body_text
+    assert "not loaded" not in block, "no module the reset released is missing"
+    assert DISPLAY_STACK_SUBJECT_MARKER in notification.subject, notification.subject
+
+
+def test_a_mixed_load_names_the_module_back_and_the_one_still_missing(
+    tmp_path: Path,
+) -> None:
+    """``modprobe nvidia_drm`` brought ``nvidia_modeset`` back and failed on
+    ``nvidia_drm`` twice (the Agent's receipt): the mail says which is which,
+    and without ``nvidia_drm`` no GPU of the node has its DRM device."""
+
+    node = ReloadNode(tmp_path, ["modeset-only", "modeset-only"])
+    details = _reset(_agent(tmp_path, node)).details
+    error = details["kernel_module_reload_error"]
+    assert DRM_FAILED in error, error
+
+    block = display_stack_follow_up({"node-a": details})
+
+    assert block == (
+        "- Display stack: NOT restored on node-a: nvidia_modeset loaded back; "
+        "nvidia_drm not loaded after 2 modprobe attempt(s); last error: "
+        f"{error[:ERROR_TEXT_LIMIT]}\n"
+        "  Impact: no /dev/dri on node-a for graphics, EGL or Vulkan workloads; "
+        f"{IMPACT_TAIL}"
+        "  Remedy on node-a: modprobe nvidia_drm, or reboot the node\n"
+    ), "the module back, the module missing, the node-wide impact:\n" + block
+    assert block in _gpu_mail({"node-a": details}).body_text, "the mail carries it"
+
+
+def test_a_stack_that_did_not_load_keeps_the_node_wide_impact(tmp_path: Path) -> None:
+    """Every load failed on a node whose eight GPUs had their DRM devices
+    before the release: both modules are reported not loaded, the GPUs
+    without a DRM device are counted, and the impact stays the whole node's."""
+
+    node = ColdNode(tmp_path)
+    node.loaded, node.drm = set(), []  # right after the busy reset's release
+    node.write()
+    cause = f"modprobe exited with status 1: {NO_DEVICE}"
+
+    def refused(command: list[str], **_: Any) -> None:
+        raise RuntimeError(cause)
+
+    details = reload_display_stack(
+        RELEASED,
+        run_checked=refused,
+        sleep=node.sleep,
+        proc_root=node.proc,
+        drm_class_root=node.drm_class,
+        drm_devices_before=GPU_BUS_IDS,
+        gpu_count=len(GPU_BUS_IDS),
+    )
+
+    assert display_stack_follow_up({"node-a": details}) == (
+        "- Display stack: NOT restored on node-a: nvidia_drm, nvidia_modeset not "
+        "loaded; 8 of 8 GPUs without a DRM device after 2 modprobe attempt(s); "
+        f"last error: RuntimeError: {cause}\n"
+        "  Impact: no /dev/dri on node-a for graphics, EGL or Vulkan workloads; "
+        f"{IMPACT_TAIL}"
+        "  Remedy on node-a: modprobe nvidia_drm, or reboot the node\n"
+    ), details
+
+
+def test_an_unreadable_module_table_reads_as_unknown_never_as_not_loaded(
+    tmp_path: Path,
+) -> None:
+    """``/proc/modules`` could not be read after either load: the Agent lists
+    every released module as missing (not verified is not restored) and, for
+    a ``modprobe`` that exited 0, writes "left ... unloaded". Nothing was
+    verified, so the mail says the state is unknown and quotes ``modprobe``'s
+    own outcome."""
+
+    calls: list[list[str]] = []
+    details = reload_display_stack(
+        RELEASED,
+        run_checked=lambda command, **_: calls.append(command),
+        sleep=lambda _seconds: None,
+        proc_root=tmp_path,
+    )
+    assert details["display_module_state_error"] == "/proc/modules is unreadable"
+    assert len(calls) == 2, calls
+
+    notification = _gpu_mail({"node-a": details})
+
+    block = display_stack_follow_up({"node-a": details})
+    assert block == (
+        "- Display stack: NOT restored on node-a: state of nvidia_drm, "
+        "nvidia_modeset unknown (/proc/modules is unreadable) after 2 modprobe "
+        "attempt(s); last error: none, the last modprobe exited 0\n"
+        "  Impact: /dev/dri on node-a may be missing for graphics, EGL or Vulkan "
+        f"workloads; {IMPACT_TAIL}"
+        "  Remedy on node-a: modprobe nvidia_drm, or reboot the node\n"
+    ), "an unverified stack reads as unknown:\n" + block
+    assert "not loaded" not in block, block
+    assert "unloaded" not in block, "the Agent's inference from an unread table"
+    assert block in notification.body_text, notification.body_text
+    assert DISPLAY_STACK_SUBJECT_MARKER in notification.subject, notification.subject
+
+    def failing(command: list[str], **_: Any) -> None:
+        raise RuntimeError(f"modprobe exited with status 1: {NO_DEVICE}")
+
+    failed = reload_display_stack(
+        RELEASED, run_checked=failing, sleep=lambda _seconds: None, proc_root=tmp_path
+    )
+    assert (
+        "unknown (/proc/modules is unreadable) after 2 modprobe attempt(s); last "
+        f"error: RuntimeError: modprobe exited with status 1: {NO_DEVICE}\n"
+    ) in display_stack_follow_up({"node-a": failed}), "modprobe's own error stays"
