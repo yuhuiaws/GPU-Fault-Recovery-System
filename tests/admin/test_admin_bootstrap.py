@@ -401,7 +401,7 @@ def test_legacy_foundation_rejects_source_only_release(tmp_path) -> None:
         encoding="utf-8",
     )
 
-    with pytest.raises(BootstrapError, match="deployable schema v3"):
+    with pytest.raises(BootstrapError, match="deployable schema v3 or v4 release"):
         admin_release_artifacts.load_prebuilt_release(
             type("Runner", (), {"dry_run": False})(),
             repository_root=tmp_path,

@@ -629,7 +629,7 @@ def exporter_client_version(release: Any) -> str | None:
     """The DCGM client library version of ``release``'s exporter, or None.
 
     The DCGM half of its image tag (``<dcgm>-<exporter>-<variant>``); a
-    digest-pinned image (every schema v3 release) is read through the image
+    digest-pinned image (every schema v3 or v4 release) is read through the image
     lock's ``source`` tag when the digest is the locked one. An image whose tag
     does not follow NVIDIA's scheme (a private mirror by digest alone, the bare
     ``4.8.4``) names no version.

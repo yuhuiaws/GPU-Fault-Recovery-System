@@ -776,7 +776,9 @@ def load_prebuilt_release(
         int(release.get("schema_version", 0)) < 3
         or release.get("deployable") is not True
     ):
-        raise BootstrapError("ARN bootstrap requires a deployable schema v3 release")
+        raise BootstrapError(
+            "ARN bootstrap requires a deployable schema v3 or v4 release"
+        )
     tier = release.get("staging_only", False)
     if not isinstance(tier, bool):
         raise BootstrapError("release manifest staging_only must be a boolean")

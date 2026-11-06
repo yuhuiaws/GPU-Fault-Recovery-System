@@ -1048,7 +1048,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--prebuilt-attestation",
         type=Path,
         help=(
-            "verified CI attestation for a prebuilt schema v3 release; "
+            "verified CI attestation for a prebuilt schema v3 or v4 release; "
             "when set, the deployment host does not rerun make check"
         ),
     )

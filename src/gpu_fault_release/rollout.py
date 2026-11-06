@@ -1342,7 +1342,7 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 # Registry-only modes: served by RegistryDrainContext, which never resolves an
-# image, so the schema v3 image lock cannot refuse them (an uninstall run from a
+# image, so the schema v3/v4 image lock cannot refuse them (an uninstall run from a
 # checkout ahead of the deployed release drains under a conflicting pin). Every
 # other mode builds RegionalRelease, whose constructor enforces the lock first.
 IMAGE_LOCK_EXEMPT_MODES = frozenset({"drain-cluster"})

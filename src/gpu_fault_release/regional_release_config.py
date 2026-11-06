@@ -763,7 +763,7 @@ def _parse_delivery_identity(
         or delivery.get("runtime_prebuilt") is not True
     ):
         raise ReleaseError(
-            "schema v3 release requires a prebuilt deployable runtime image"
+            "a schema v3 or v4 release requires a prebuilt deployable runtime image"
         )
     raw_components = dict(delivery.get("components") or {})
     legacy_components = {

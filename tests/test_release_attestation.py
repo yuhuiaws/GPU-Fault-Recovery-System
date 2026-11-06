@@ -36,6 +36,27 @@ def test_attestation_rejects_non_deployable_manifest(tmp_path: Path) -> None:
         release_attestation.load_manifest(path)
 
 
+def test_attestation_names_the_manifest_schemas_it_takes(tmp_path: Path) -> None:
+    """A prebuilt release is schema v3 (shared image) or v4 (split images)."""
+
+    path = manifest(tmp_path)
+    value = json.loads(path.read_text(encoding="utf-8"))
+    value["schema_version"] = 2
+    path.write_text(json.dumps(value), encoding="utf-8")
+
+    with pytest.raises(
+        release_attestation.ReleaseAttestationError,
+        match="requires a schema v3 or v4 release manifest",
+    ):
+        release_attestation.load_manifest(path)
+
+    value["schema_version"] = 4
+    path.write_text(json.dumps(value), encoding="utf-8")
+    assert release_attestation.load_manifest(path)["schema_version"] == 4, (
+        "a split-image schema v4 manifest is a prebuilt release too"
+    )
+
+
 def test_staging_manifest_requires_explicit_authorization(tmp_path: Path) -> None:
     path = manifest(tmp_path, staging_only=True)
 

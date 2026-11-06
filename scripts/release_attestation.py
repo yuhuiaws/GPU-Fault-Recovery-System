@@ -69,7 +69,7 @@ def load_manifest(
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict) or int(value.get("schema_version", 0)) < 3:
         raise ReleaseAttestationError(
-            "prebuilt deployment requires a schema v3 release manifest"
+            "prebuilt deployment requires a schema v3 or v4 release manifest"
         )
     if value.get("deployable") is not True:
         raise ReleaseAttestationError(

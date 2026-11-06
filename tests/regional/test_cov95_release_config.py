@@ -75,8 +75,8 @@ def reseal(manifest: dict[str, Any]) -> None:
     "fault,problem",
     [
         ("digest", "identity digest is invalid"),
-        ("deployable", "prebuilt deployable"),
-        ("prebuilt", "prebuilt deployable"),
+        ("deployable", "a schema v3 or v4 release requires a prebuilt deployable"),
+        ("prebuilt", "a schema v3 or v4 release requires a prebuilt deployable"),
         ("components", "components are incomplete"),
         ("component-digest", "component digests are invalid"),
         ("layout", "split-v1"),
