@@ -10604,15 +10604,30 @@ Do not delete `${MIGRATION_STATE}` when the migration or verification fails; aft
 <a id="12-分阶段启用破坏性能力"></a>
 ## 10. Enabling Destructive Capabilities in Phases
 
+A regional production release already enables every phase below by default: the generated control-plane ConfigMaps
+set `GPU_FAULT_EXECUTOR_MODE=active` and a `GPU_FAULT_ALLOWED_OPERATIONS` holding every operation except the
+planning-only `RESTART_VM`; the regional Installer turns on the node reset/quiesce/fabric switches (Phase C item 1) and
+the Executor manifest turns on reboot and warm-spare (Phase D); the shipped Runtime Profile declares `nvlinkDiagnostics`,
+`memoryDiagnostics`, `driverRemediation` and `softwareFirmwareUpdate` as `OBSERVE` and `gpuReset`, `fabricReset`,
+`fabricManagerRestart`, `nodeReboot`, `nodeReplace` and the rest as `OWN`. The phases are the acceptance order for a new
+site; to hold one back, release a new Runtime Profile version that sets the capabilities concerned to `OBSERVE`
+(`spec.runtimeProfile` plus `gpu-fault-admin deploy --approve-profile-plan`): as long as `schedulerDrain` stays `OWN`, a
+plan refused for a missing executable owner still isolates the node and keeps the evidence first (evidence freeze,
+cordon, `QUARANTINE`), the remaining steps are BLOCKED for an operator. Do not hand-edit the
+generated allowlist, the Installer parameters or the Executor environment: the release renders all of them and a later
+release overwrites manual changes.
+
 ### Phase A: Observation
 
-- The executor stays in simulation, or active with only forensics enabled.
+- Destructive capabilities stay `OBSERVE`, only forensics run (the regional control plane is fixed at `active` and
+  offers no simulation switch).
 - Deploy collectors, the Watcher and the profile.
 - Verify XIDs, metrics, allocation, Agent heartbeats and evidence.
 
 ### Phase B: Isolation and Training Control
 
-- Enable `MARK_UNSCHEDULABLE/QUARANTINE/STOP_WORKLOADS/RESTART_WORKLOAD`.
+- Set `schedulerDrain`, `workloadStop` and `workloadRestart` to `OWN`, enabling
+  `MARK_UNSCHEDULABLE/QUARANTINE/STOP_WORKLOADS/RESTART_WORKLOAD`.
 - Use a GPU-free E2E to verify that old and new attempts do not overlap.
 - Verify that provider taints are not removed.
 
@@ -10626,29 +10641,39 @@ Do not delete `${MIGRATION_STATE}` when the migration or verification fails; aft
 2. Check Fleet readiness, artifact SHA and config digest.
 3. Test on a single drained node without workloads inside a maintenance window.
 4. Check that the node allowlist contains
-   `QUIESCE_GPU_SERVICES/RESET_GPU/RESTORE_GPU_SERVICES`.
+   `QUIESCE_GPU_SERVICES/VERIFY_NO_GPU_CLIENTS/RESET_GPU/RESTORE_GPU_SERVICES` (the installer's default allowlist does).
 5. Confirm that `gpu-fault-quiesce-*.timer` can restore services independently when both the control plane and kubelet are unavailable.
    The control plane sets `GPU_FAULT_AGENT_MAINTENANCE_WINDOW_SECONDS=420` and the node sets
-   `GPU_FAULT_QUIESCE_FAILSAFE_SECONDS=420`; the former must not exceed the latter.
-6. Check that the control-plane allowlist also contains the three operations above; do not enable only the node-side switch.
+   `GPU_FAULT_QUIESCE_FAILSAFE_SECONDS=420`; the former must not exceed the latter -- configured larger, the control
+   plane still takes the smaller of it and each node's `failsafe_seconds` from the QUIESCE receipt as the maintenance window.
+6. Check that the control-plane allowlist also contains the operations above (the regionally generated ConfigMaps do by
+   default); do not enable only the node-side switch.
 7. Verify the complete order:
-   `STOP_WORKLOADS -> QUIESCE_GPU_SERVICES -> VERIFY_NO_GPU_CLIENTS ->
-   RESET_GPU -> RESTORE_GPU_SERVICES -> VALIDATE_GPU ->
-   RESTORE_SCHEDULING -> RESTART_WORKLOAD`.
+   `FREEZE_EVIDENCE -> MARK_UNSCHEDULABLE -> STOP_WORKLOADS -> QUIESCE_GPU_SERVICES ->
+   VERIFY_NO_GPU_CLIENTS -> RESET_GPU -> RESTORE_GPU_SERVICES -> VALIDATE_GPU ->
+   RESTORE_SCHEDULING -> RESTART_WORKLOAD` (`STOP_WORKLOADS` only with active training, `RESTART_WORKLOAD` only with an
+   affected workload).
 8. Make the reset and the explicit restore fail separately, confirming the fail-safe timer is kept and retries; after a successful recovery
    the timer is cancelled and the state file deleted.
-9. Verify the three gates -- GPU, host and fabric -- after the reset.
-10. Fabric Manager in the window: on an NVSwitch node a per-GPU reset window keeps `nvidia-fabricmanager` running -- the
+9. Verify the gates after the reset: the per-GPU reset chain of item 7 has `VALIDATE_GPU` only (on a graded NVSwitch node
+   it also checks the NVLink fabric state and the Fabric Manager unit); the XID 74 (Phase C.0), `DRAIN_P2P` and full
+   GPU + NVSwitch reset chains add `VALIDATE_FABRIC`; no reset chain has `VALIDATE_HOST`.
+10. Fabric Manager in the window: on an NVSwitch node a window whose only GPU-state change is a per-GPU reset (`RESET_GPU`
+    or `RECOVER_DRAIN_P2P`) keeps `nvidia-fabricmanager` running -- the
     QUIESCE step's details list it under `kept_services`, not `stopped_services`; `systemctl show -p
     MainPID,ExecMainStartTimestamp nvidia-fabricmanager` is unchanged across the window and the RESTORE does not start it.
-    A full-fabric window (`RESET_ALL_GPUS_NVSWITCHES`, also XID 45's `RESTART_FM` on a graded NVSwitch node once the site
-    turned on `GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM` -- by default it is observe-only, §6.1) still stops it before
-    `nvidia-smi -r` and starts it after. The Agent waits up to 780 s for a start or restart of `nvidia-fabricmanager`
+    Every other window -- a full-fabric window (`RESET_ALL_GPUS_NVSWITCHES`, also XID 45's `RESTART_FM` on a graded NVSwitch
+    node once the site turned on `GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM` -- by default it is observe-only, §6.1) and a
+    window holding a driver/firmware remediation or the NVLink Field Diagnostic -- still has the QUIESCE stop it (in a
+    full-fabric window that is before `nvidia-smi -r`) and the RESTORE start it again. The Agent waits up to 780 s for a
+    start or restart of `nvidia-fabricmanager`
     (NVIDIA's R580 unit allows `TimeoutStartSec=720`, plus a minute, which also covers a restart's stop; the restore loop
     -- RESTORE, the fail-safe timer's restore and the boot reconcile --, the start after a full reset and the
     RESTART_FABRIC_MANAGER restart all use it, every other unit still 120 s), so the control-plane waiting cap of
-    RESTORE_GPU_SERVICES and RESTART_FABRIC_MANAGER is 1200 s (780 + 420, never below the default 600 s and never above the
-    node lifetime) while QUIESCE, VERIFY, RESET_* and VALIDATE_* keep 600 s; a B200 Fabric Manager start near NVIDIA's full
+    RESTORE_GPU_SERVICES and RESTART_FABRIC_MANAGER is 1200 s (780 + 420, never below the default 600 s
+    `GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS` and never above the node lifetime
+    `GPU_FAULT_NODE_WORKFLOW_MAX_LIFETIME_SECONDS`, default 3600 s) while QUIESCE, VERIFY, RESET_* and VALIDATE_* keep
+    600 s; a B200 Fabric Manager start near NVIDIA's full
     720 s brings the whole chain close to the 1800 s workflow execution budget (`GPU_FAULT_WORKFLOW_EXECUTION_TIMEOUT_SECONDS`,
     unchanged). After a per-GPU reset, an 8-GPU NCCL job with `NCCL_NVLS_ENABLE=1` must
     initialise NVLS, and the node's Fabric Manager log must carry no `multicast team setup request` or `All GPUs in the
@@ -10685,7 +10710,8 @@ Do not delete `${MIGRATION_STATE}` when the migration or verification fails; aft
     longer applicable to DGX B200/B300 and NVIDIA HGX B200/B300 systems.", so the SXID path of Phase C.1 does not apply on
     these nodes. HGX B200/B300 are graded by the same rules as Hopper SXM but have not been observed live.
 
-Upgrade note (Fabric Manager in the quiesce window): the release is `DATA_PLANE_COMPATIBLE` -- the control-plane, executor and
+Upgrade note (Fabric Manager in the quiesce window; applies only when upgrading from an earlier release): the release
+that introduced it is `DATA_PLANE_COMPATIBLE` -- the control-plane, executor and
 node_runtime wheels change (the control-plane roles roll; executor, completion-watcher and kubernetes-node-resource-collector on
 every GPU cluster; Node Agent waves on every GPU node); every release-identity file set and the Agent config digest are unchanged.
 During the roll: a new executor with an Agent not yet upgraded sends `fabric_manager=keep`, the old Agent ignores it and stops
@@ -10695,10 +10721,10 @@ first sent by an older executor and re-sent by a newer one after a retryable Age
 409 `COMMAND_ID_REUSED` (manual confirmation; a narrow window, so let open quiesce windows finish before the executor roll
 where practical); an XID 45 workflow compiled before the control-plane roll keeps its two steps.
 
-Upgrade note (the observe-only solo XID 45 default, NVL5 timing and the HGX B200/B300 grading): the release is
-`DATA_PLANE_COMPATIBLE` (the deploy host's source classification is `APPLICATION_RELEASE`) -- the control-plane,
-executor and node_runtime wheels, the node bundle and the node template inputs change: the control plane (cpu: api-ha,
-control-worker, spool-worker), the executor, completion-watcher and kubernetes-node-resource-collector of every GPU
+Upgrade note (the observe-only solo XID 45 default, NVL5 timing and the HGX B200/B300 grading; applies only when upgrading
+from an earlier release): the release that introduced them is `DATA_PLANE_COMPATIBLE` (the deploy host's source
+classification is `APPLICATION_RELEASE`) -- the control-plane, executor and node_runtime wheels, the node bundle and the node template inputs change: the control plane (cpu: api-ha,
+control-worker, telemetry-spool-worker), the executor, completion-watcher and kubernetes-node-resource-collector of every GPU
 cluster and the Node Agent waves on every GPU node (the metrics collector's systemd unit is a node template input) roll,
 the DCGM exporter does not -- `src/gpu_fault/gpu_fabric_manager.py` and `src/gpu_fault/execution/config.py` sit in all
 three closures, and `env-inventory.json` changes too; there is no schema, protocol-version or Runtime Profile change,
@@ -10709,7 +10735,7 @@ control-worker has rolled the new default holds. An old Agent keeps its old Fabr
 loop and the restart, 180 s for the start after a full reset), which a new control plane's 1200 s step cap does not
 hurt; a new Agent under an old control plane can wait up to 780 s inside an old 600 s step cap -- so finish the Node
 Agent waves after the control plane. The collector's `After=nvidia-fabricmanager.service` takes effect at each node's
-next boot. Visible on the live H200 sites: the observe-only XID 45 default, the collector ordering (from the next boot),
+next boot. Visible on H200 sites: the observe-only XID 45 default, the collector ordering (from the next boot),
 the 780 s Fabric Manager start/restart bound and the 1200 s step cap; the B200/B300 grading is dormant there.
 
 #### Phase C.0: XID 74 NVLink Workflow
@@ -10717,9 +10743,16 @@ the 780 s Fabric Manager start/restart bound and the 1200 s step cap; the B200/B
 1. Confirm the Runtime Profile has `diagnosticBundleCapture`,
    `nvlinkDiagnostics`, `gpuReset` and `supportEscalation` enabled. The owner of
    `nvlinkDiagnostics` and `gpuReset` must be `gpu-fault-node-agent`.
+   The shipped regional profiles declare `nvlinkDiagnostics` as `OBSERVE`: the reset chain of a first event holds no
+   `RUN_NVLINK74_WORKFLOW` and is unaffected; for an event that needs the Field Diagnostic (a same-Link/bit repeat at its threshold, ECC/parity included) the
+   planned `RUN_NVLINK74_WORKFLOW` has no executable owner, so the
+   workflow runs only its safety plan (`FREEZE_EVIDENCE -> MARK_UNSCHEDULABLE -> QUARANTINE`), the incident is
+   QUARANTINED and the rest of the plan (the reset included) is BLOCKED for an operator. To run the Field Diagnostic,
+   release a new Runtime Profile version that OWNs `nvlinkDiagnostics` for `gpu-fault-node-agent` (adapter
+   `node-action`, declared available under `observed`).
 2. The control-plane allowlist must contain `COLLECT_DIAGNOSTIC_BUNDLE`,
    `RUN_NVLINK74_WORKFLOW`, `RESET_GPU`, `QUIESCE_GPU_SERVICES`,
-   `VERIFY_NO_GPU_CLIENTS`, `RESTORE_GPU_SERVICES` and `ESCALATE_SUPPORT`.
+   `VERIFY_NO_GPU_CLIENTS`, `RESTORE_GPU_SERVICES` and `ESCALATE_SUPPORT` (the regionally generated ConfigMaps do by default).
    Pre-install on every GPU node the NVIDIA-provided Field Diagnostic compatible with the current GPU/driver,
    then compute the executable's hash:
 
@@ -10731,9 +10764,9 @@ sudo sha256sum /opt/nvidia/fielddiag/fielddiag
    Field Diagnostic CLI the customer actually installed, and this solution assumes no fixed argument format of the vendor tool:
 
 ```bash
-# Managed regional sites have the reviewed Installer Job template (deploy/node/run-hyperpod-installer-job.sh) generate the parameters from
+# On managed regional sites the reviewed Installer Job template (deploy/node/run-hyperpod-installer-job.sh) generates the parameters from
 # GPU_FAULT_ENABLE_NODE_FIELD_DIAGNOSTIC, GPU_FAULT_FIELD_DIAGNOSTIC_COMMAND/_SHA256,
-# GPU_FAULT_MEMORY_FIELD_DIAGNOSTIC_COMMAND/_SHA256, GPU_FAULT_FIELD_DIAGNOSTIC_TIMEOUT_SECONDS;
+# GPU_FAULT_MEMORY_FIELD_DIAGNOSTIC_COMMAND/_SHA256, GPU_FAULT_FIELD_DIAGNOSTIC_TIMEOUT_SECONDS (current limitation below);
 # nothing is run on the node bypassing the release. Row-remap failure uses a separate whole-card memory diagnostic command
 # and does not require or fabricate a Link ID. The manual compatibility path has the following parameter shape; the other required release/node parameters are omitted:
 install-gpu-fault-collector.sh <other checked parameters> \
@@ -10748,14 +10781,25 @@ install-gpu-fault-collector.sh <other checked parameters> \
    The regional Job template `deploy/node/run-hyperpod-installer-job.sh` generates these parameters from
    `GPU_FAULT_ENABLE_NODE_FIELD_DIAGNOSTIC` and the command/SHA/timeout inputs.
    `GPU_FAULT_ENABLE_FIELD_DIAGNOSTIC` is only a variable of the old single-cluster `deploy/hyperpod/deploy.sh` (Appendix A);
-   neither the control-plane nor the Node Agent process recognises it. The installer adds `RUN_NVLINK74_WORKFLOW` and the configured
-   `RUN_FIELD_DIAGNOSTIC` to the Node Agent allowlist, registers the
-   `nvlinkDiagnostics` and `memoryDiagnostics` capabilities respectively, and includes both commands and their digests in
-   the Agent heartbeat gate. Installation fails when a command is missing, the path is not absolute, the SHA-256 does not match, or the timeout
-   is outside 60-7200 seconds. When no memory command is configured, the row-remap failure workflow
-   stays BLOCKED for lack of a `memoryDiagnostics` owner and never replaces the node directly.
+   neither the control-plane nor the Node Agent process recognises it. The installer adds `RUN_NVLINK74_WORKFLOW` and (with a
+   memory command configured) `RUN_FIELD_DIAGNOSTIC` to the Node Agent allowlist; they belong to the
+   `nvlinkDiagnostics` and `memoryDiagnostics` capabilities respectively, and both commands, their SHA-256 and the timeout
+   enter the Agent config digest that heartbeats report and the fleet readiness gate compares. Installation fails when a
+   command is missing, the path is not absolute, the SHA-256 does not match (the Agent checks the executable when it starts),
+   or the timeout is outside 60-7200 seconds. Current limitation: `gpu-fault-admin deploy` has no site field that sets
+   these inputs, and it computes the Agent config digest the control plane requires from the default node install (the
+   allowlist of `src/gpu_fault/admin/node_allowed_operations.py`, without these two operations); a node with the Field
+   Diagnostic enabled reports another digest, the fleet readiness gate holds it not ready and no node action is
+   dispatched to it, so managed regional sites keep the Field Diagnostic off. The row-remap failure's RMA chain (cordon,
+   `QUARANTINE`, diagnostic bundle, `RUN_FIELD_DIAGNOSTIC`, `VALIDATE_GPU`, `ESCALATE_SUPPORT`) never restores scheduling
+   and never replaces the node directly: without an executable `memoryDiagnostics` owner (the shipped profiles say
+   `OBSERVE`) only the isolation and evidence steps before it run, the incident is QUARANTINED and the remaining steps are
+   BLOCKED for an operator; on a node without a memory command the Agent refuses the step with `OPERATION_NOT_ALLOWED`
+   and it goes to support.
 3. Kernel log lines that need count-based decisions must contain both an explicit Link ID and the seven
-   hexadecimal fields after XID 74. For example, the following is only a user-space software chain replay and does not create a real NVLink fault:
+   hexadecimal fields after XID 74. The register decode applies to Hopper only (the Catalog's H100 family, H200 included);
+   an XID 74 on any other product escalates to support without a reset. For example, the following is only a user-space
+   software chain replay and does not create a real NVLink fault:
 
 ```bash
 printf '%s\n' \
@@ -10765,12 +10809,15 @@ printf '%s\n' \
 
 4. `0x100` means bit 8 of the first register. The XID Catalog requires a GPU reset or node reboot
    to clear this error, so the first event directly executes
-   `MARK_UNSCHEDULABLE -> STOP_WORKLOADS (if training is active) ->
+   `FREEZE_EVIDENCE -> MARK_UNSCHEDULABLE -> STOP_WORKLOADS (if training is active) ->
    QUIESCE_GPU_SERVICES -> VERIFY_NO_GPU_CLIENTS -> RESET_GPU ->
-   RESTORE_GPU_SERVICES -> VALIDATE_GPU/FABRIC -> RESTORE_SCHEDULING`.
+   RESTORE_GPU_SERVICES -> VALIDATE_GPU/FABRIC -> RESTORE_SCHEDULING ->
+   RESTART_WORKLOAD (with an affected workload)`.
    `CHECK_MECHANICALS` must not block the first reset. When the reset fails, the failure escalation chain enters
-   `REBOOT_NODE`; only when neither reset nor reboot can clear it, or it keeps recurring, does it enter manual hardware inspection/support.
-   Repeats on the same Link/bit may add a diagnostic bundle and Field Diagnostic; the diagnostic parameters must contain the Link ID,
+   `REBOOT_NODE` (workflow step `RESTART_NODE`), and a failed reboot moves on to a warm-spare `REPLACE_NODE`; only when
+   neither reset nor reboot can clear it, or it keeps recurring, does it enter manual hardware inspection/support.
+   Repeats on the same Link/bit may add a diagnostic bundle and Field Diagnostic (this needs `nvlinkDiagnostics` OWNed,
+   item 1); the diagnostic parameters must contain the Link ID,
    bit count and seven registers, but the diagnostic cannot replace the reset.
 5. Replay an unknown bit, all zeros, secondary-only and bit 18 of the fourth register separately, confirming the node stays
    fail closed, generates the `xid74-support-zh-v3` fixed-template notification and executes no single-GPU reset.
@@ -10790,18 +10837,20 @@ printf '%s\n' \
 2. The Node Agent sets simultaneously
    `GPU_FAULT_NODE_ALLOW_GPU_RESET=true`,
    `GPU_FAULT_NODE_ALLOW_SERVICE_QUIESCE=true` and
-   `GPU_FAULT_NODE_ALLOW_FABRIC_RESET=true`.
-3. The Node Agent allowlist and the control-plane allowlist add
-   `COLLECT_DIAGNOSTIC_BUNDLE`, `RESET_ALL_GPUS_NVSWITCHES`, and the Runtime Profile configures the owner of
+   `GPU_FAULT_NODE_ALLOW_FABRIC_RESET=true` (the regional Installer sets them by default, Phase C item 1).
+3. The Node Agent allowlist and the control-plane allowlist must contain
+   `COLLECT_DIAGNOSTIC_BUNDLE`, `RESET_ALL_GPUS_NVSWITCHES` (the installer's default node allowlist and the regionally
+   generated ConfigMaps both do), and the Runtime Profile configures the owner of
    `diagnosticBundleCapture` and `fabricReset` as
-   `gpu-fault-node-agent`.
+   `gpu-fault-node-agent` (the shipped profiles do).
 4. The execution order must be:
-   `COLLECT_DIAGNOSTIC_BUNDLE -> STOP_WORKLOADS -> QUIESCE_GPU_SERVICES ->
-   VERIFY_NO_GPU_CLIENTS ->
+   `FREEZE_EVIDENCE -> COLLECT_DIAGNOSTIC_BUNDLE -> MARK_UNSCHEDULABLE -> STOP_WORKLOADS ->
+   QUIESCE_GPU_SERVICES -> VERIFY_NO_GPU_CLIENTS ->
    RESET_ALL_GPUS_NVSWITCHES -> RESTORE_GPU_SERVICES -> VALIDATE_GPU ->
    VALIDATE_FABRIC -> RESTORE_SCHEDULING -> RESTART_WORKLOAD`.
    After a successful quiesce, each node's Agent generation is pinned into the persisted workflow evidence.
-   When stopping kubelet makes the heartbeat/lease expire, only that workflow may continue within the maintenance window;
+   When stopping kubelet makes the heartbeat/lease expire on HyperPod (an eks-managed quiesce never stops kubelet or
+   containerd and taints the node for the window instead), only that workflow may continue within the maintenance window;
    a generation change, an Agent being drained/revoked, or exceeding the window aborts the whole multi-node barrier.
    The reset email may fail to send the first time while network services are quiesced; after `RESTORE_GPU_SERVICES`
    succeeds the same notification ID is retried automatically. Acceptance must confirm the final state is `SENT`; checking only that
@@ -10848,18 +10897,26 @@ export GPU_FAULT_DIAGNOSTIC_S3_URI='s3://REPLACE_BUCKET/gpu-fault'
 The control-plane side recognises only `GPU_FAULT_SXID_DRIVER_REMEDIATION_CODES` / `GPU_FAULT_TARGET_DRIVER_BRANCH` and
 `GPU_FAULT_SXID_FIRMWARE_UPDATE_CODES` / `GPU_FAULT_TARGET_FIRMWARE_VERSION`: regional sites write them into
 the source Manifests, render them into the generated ConfigMaps via `make deployment-contracts-update` and release them with the checked release.
+The shipped Runtime Profiles declare `driverRemediation` and `softwareFirmwareUpdate` as `OBSERVE`, so a new profile
+version that OWNs them for `gpu-fault-node-agent` must be released too, or those steps have no executable owner.
 The node-side switches are installer parameters: the Installer Job template (`deploy/node/run-hyperpod-installer-job.sh`) reads
 `GPU_FAULT_ENABLE_NODE_DRIVER_REMEDIATION` / `GPU_FAULT_ENABLE_NODE_FIRMWARE_UPDATE` and the
-command/SHA inputs above, generating `--allow-driver-remediation`, `--driver-*`, `--allow-firmware-update`,
-`--firmware-*`; when installing a node by hand pass these parameters directly to `install-gpu-fault-collector.sh`.
+command/SHA/target inputs above, generating `--allow-driver-remediation`, `--driver-*`, `--target-driver-branch`,
+`--allow-firmware-update`, `--firmware-*`, `--target-firmware-version`; when installing a node by hand pass these
+parameters directly to `install-gpu-fault-collector.sh`. The current limitation is the one of the Phase C.0 Field
+Diagnostic: `gpu-fault-admin deploy` has no site field for these inputs and pins the Agent config digest of the default
+node install (without `REMEDIATE_DRIVER`/`UPDATE_SOFTWARE_FIRMWARE`), so on a managed regional site a node with them
+enabled is held not ready by the fleet readiness gate. A managed site's `GPU_FAULT_DIAGNOSTIC_S3_URI` comes from
+`spec.diagnosticS3Uri` in `site.yaml`.
 These node parameters do not replace the Profile, allowlist, signing and pre-action gates. The old single-cluster deployment entry point
 (`deploy/hyperpod/deploy.sh deploy` distributing both sides at once) is kept only in Appendix A. After deployment check `/v1/fleet/agents`: the allowlist,
 artifact SHA and config digest of every target node must agree. The order after the policy matches is:
 
-`COLLECT_DIAGNOSTIC_BUNDLE -> STOP_WORKLOADS -> QUIESCE_GPU_SERVICES ->
-VERIFY_NO_GPU_CLIENTS -> [REMEDIATE_DRIVER] -> [UPDATE_SOFTWARE_FIRMWARE] ->
-RESET -> RESTORE_GPU_SERVICES -> VALIDATE_GPU -> VALIDATE_FABRIC ->
-RESTORE_SCHEDULING -> RESTART_WORKLOAD`.
+`FREEZE_EVIDENCE -> COLLECT_DIAGNOSTIC_BUNDLE -> MARK_UNSCHEDULABLE -> STOP_WORKLOADS ->
+QUIESCE_GPU_SERVICES -> VERIFY_NO_GPU_CLIENTS -> [REMEDIATE_DRIVER] -> [UPDATE_SOFTWARE_FIRMWARE] ->
+RESET_ALL_GPUS_NVSWITCHES/RESET_GPU -> RESTORE_GPU_SERVICES -> VALIDATE_GPU -> [VALIDATE_FABRIC] ->
+RESTORE_SCHEDULING -> RESTART_WORKLOAD` (an ordinary Fatal Trunk and `10003/19084` get the full reset with
+`VALIDATE_FABRIC`; an access-port Fatal resets only the affected and participating workload GPUs, with `VALIDATE_GPU` only).
 
 Any target version mismatch, SHA mismatch, GPU client not exited, upload failure or version verification failure must
 fail closed. A failed driver/firmware remediation keeps the isolation and directly creates a support workflow, no longer automatically
@@ -10891,7 +10948,8 @@ replay uses SXID `10003`, for which the Catalog specifies full-reset, and may on
 ### Phase D: Node Lifecycle (Provider Replace Always Disabled)
 
 The current `config/runtime-profile.regional-hyperpod-safe.example.yaml` gives both `nodeReboot`
-and `nodeReplace` to `gpu-fault-hyperpod-adapter` as OWN. D.1/D.2 below are acceptance sub-phases that must
+and `nodeReplace` to `gpu-fault-hyperpod-adapter` as OWN (`config/runtime-profile.regional-eks-safe.example.yaml` of a
+plain EKS cluster gives them to `gpu-fault-eks-adapter`). D.1/D.2 below are acceptance sub-phases that must
 each leave evidence, not two independent environment switches. When only D.1 is approved, a new Runtime
 Profile version must be released keeping `nodeReplace` as `OBSERVE`; do not manufacture an apparent "reboot-only" configuration by turning off the spare coordinator,
 because that also removes the safety lock refusing fallback to the provider replace API.
@@ -10903,28 +10961,24 @@ because that also removes the safety lock refusing fallback to the provider repl
 - Set only
   `GPU_FAULT_ENABLE_HYPERPOD_ADAPTER=true`,
   `GPU_FAULT_ALLOW_HYPERPOD_REBOOT=true` and
-  `GPU_FAULT_ALLOW_HYPERPOD_REPLACE=false`.
+  `GPU_FAULT_ALLOW_HYPERPOD_REPLACE=false`; the regional Executor manifest
+  `deploy/dataplane/cluster-action-executor.yaml` (rendered by `gpu-fault-admin deploy`) already fixes these three values
+  and carries no old master switch.
 - You must run `unset GPU_FAULT_ALLOW_HYPERPOD_MUTATION`; never set this old master switch in a regional
   production deployment under any circumstances. Otherwise, when the separate reboot switch is absent, it falls back per
   `src/gpu_fault/hyperpod.py::HyperPodAdapterConfig.from_environment` -- only turning reboot on
   (reboot inherits the old switch when absent); replace is always false in every configuration, setting
   `GPU_FAULT_ALLOW_HYPERPOD_REPLACE=true` makes the process refuse to start, and the old switch cannot enable provider replace either.
 - Every submission must provide the cluster second confirmation, isolated nodes, workflow/incident fencing token and idempotency key.
-- Start from one test node; the batch maximum of 25 is not a recommended concurrency.
+- Start from one test node; the batch maximum of 25 (`GPU_FAULT_HYPERPOD_MAX_BATCH_SIZE`) is not a recommended concurrency.
+- A plain EKS (`eks-managed`) cluster uses the same switches (the variable names are unchanged): the `nodeReboot` owner is
+  `gpu-fault-eks-adapter` and a reboot calls EC2 `RebootInstances` on the instances the preflight bound; the preflight
+  requires the EKS cluster and the targets' managed node groups `ACTIVE` and EKS node auto repair not enabled on those
+  node groups (the counterpart of HyperPod's `NodeRecovery=None`).
 
-The actual change command for the regional Executor is as follows; the trailing `-` means deleting the old master switch, not setting it to
-an empty string:
+The regional Executor needs no manual change; check it with this read-only command:
 
 ```bash
-kubectl --context "${GPU_EKS_CONTEXT}" -n "${NAMESPACE}" \
-  set env deployment/gpu-fault-cluster-executor \
-  GPU_FAULT_ALLOW_HYPERPOD_MUTATION- \
-  GPU_FAULT_ENABLE_HYPERPOD_ADAPTER=true \
-  GPU_FAULT_ALLOW_HYPERPOD_REBOOT=true \
-  GPU_FAULT_ALLOW_HYPERPOD_REPLACE=false
-kubectl --context "${GPU_EKS_CONTEXT}" -n "${NAMESPACE}" \
-  rollout status deployment/gpu-fault-cluster-executor \
-  --timeout=600s
 kubectl --context "${GPU_EKS_CONTEXT}" -n "${NAMESPACE}" \
   get deployment/gpu-fault-cluster-executor \
   -o jsonpath='{range .spec.template.spec.containers[0].env[*]}{.name}={.value}{"\n"}{end}' |
@@ -10932,8 +10986,9 @@ kubectl --context "${GPU_EKS_CONTEXT}" -n "${NAMESPACE}" \
 ```
 
 `GPU_FAULT_ALLOW_HYPERPOD_MUTATION` must not appear in the output, and the three separate values must be
-`true`, `true`, `false` respectively. The same values must be written back into the manifests or configuration used by the next release, otherwise
-a later `kubectl apply` overwrites this activation.
+`true`, `true`, `false` respectively. Do not change these values with `kubectl set env`: the next `gpu-fault-admin deploy`
+renders the manifest again and overwrites the manual change; while reboot is not approved, release a new Runtime Profile
+version with `nodeReboot` as `OBSERVE`.
 
 #### Phase D.2: warm-spare nodeReplace
 
@@ -10945,22 +11000,23 @@ is not destroyed, and `BatchReplaceClusterNodes` must not be called at any stage
 Before go-live all of the following must be proven:
 
 1. HyperPod `NodeRecovery=None`, the Runtime Profile's `nodeReplace` owner is
-   `gpu-fault-hyperpod-adapter`, and the observed version is `warm-spare-v1`.
+   `gpu-fault-hyperpod-adapter`, and the observed version is `warm-spare-v1` (plain EKS: the owner is
+   `gpu-fault-eks-adapter` and the targets' node groups do not have EKS node auto repair enabled).
 2. The Executor keeps
    `GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER=true`,
    `GPU_FAULT_CLUSTER_EXECUTOR_REMOTE_STATE=true` and
    `GPU_FAULT_ALLOW_HYPERPOD_REPLACE=false`. The spare failover switch is a safety lock forcing the local path and
    refusing provider fallback, not an independent action authorisation.
 3. Every candidate spare carries `gpu-fault.io/spare=true`, belongs to the same instance
-   group/type as the faulty node, and simultaneously satisfies HyperPod `Running`, provider
-   `Schedulable`, Kubernetes `Ready`, Agent fleet-ready, no active faults and not reserved by another
-   incident.
+   group/type as the faulty node, and simultaneously satisfies provider status `Running`, the HyperPod node health label
+   `Schedulable` (HyperPod only), Kubernetes `Ready`, Agent fleet-ready, no active faults and not reserved by another
+   incident; an unreserved spare must stay cordoned and run no Pod that holds a GPU.
 4. The number of healthy spares can cover all faulty nodes of this round. Allocation and activation must complete atomically; when insufficient the whole
    `REPLACE_NODE` fails, with no partial replacement.
 5. The request contains the cluster second confirmation, verified node isolation, workflow/incident fencing token
    and idempotency key.
 6. The complete order passes acceptance:
-   `MARK_UNSCHEDULABLE/QUARANTINE -> STOP_WORKLOADS -> REPLACE_NODE ->
+   `FREEZE_EVIDENCE -> MARK_UNSCHEDULABLE/QUARANTINE -> STOP_WORKLOADS -> REPLACE_NODE ->
    VALIDATE_GPU -> VALIDATE_FABRIC -> RESTORE_SCHEDULING -> RESTART_WORKLOAD`.
 
 Check the regional Executor:
@@ -11019,13 +11075,16 @@ sudo apt-get update
 sudo apt-get install -y strace iproute2 procps coreutils rdma-core ethtool
 ```
 
-The Node Installer only allows installing the binary wheel `py-spy==0.4.1` into a separate tool slot, then verifies
-the pinned SHA-256 of `/opt/gpu-fault/tools/py-spy-0.4.1-<sha>/venv/bin/py-spy`. The installation Job
-must be able to reach the configured Python
-package index; a version drift, a source package or a binary hash mismatch all fail the installation. Verify after deployment:
+The Node Installer only allows installing the binary wheel `py-spy==0.4.1` from its hash lock
+(`requirements/node-tools.lock`) into a separate tool slot, then verifies the pinned SHA-256 of
+`/opt/gpu-fault/tools/py-spy-0.4.1-<sha>/venv/bin/py-spy` (`<sha>` is the first 12 hex digits of that SHA-256). A managed
+regional install takes it offline from the wheelhouse of the release's node dependency image (`--wheelhouse`); only a
+manual install without a wheelhouse must be able to reach the configured Python package index. A version drift, a source
+package or a binary hash mismatch all fail the installation. Verify after deployment (`node-agent.env` is root-only 0600,
+so reading it needs sudo too):
 
 ```bash
-sudo "$(sed -n 's/^GPU_FAULT_PYTHON_STACK_TOOL=\"\\(.*\\)\"$/\\1/p' \
+sudo "$(sudo sed -n 's/^GPU_FAULT_PYTHON_STACK_TOOL="\(.*\)"$/\1/p' \
   /etc/gpu-fault/node-agent.env)" --version
 sudo systemctl show gpu-fault-node-agent.service -p User -p Group
 cat /proc/sys/kernel/yama/ptrace_scope
@@ -11034,7 +11093,9 @@ cat /proc/sys/kernel/yama/ptrace_scope
 The Agent should run as root. `ptrace_scope` or SELinux may still refuse to attach; in that case the
 manifest must show an explicit error, and an empty Python stack file must not be treated as success.
 
-Configure the control-plane thresholds before deployment:
+The control-plane thresholds and their defaults (a regional site gets them from the generated
+`gpu-fault-<role>-config-telemetry` ConfigMaps and changes them the way Phase C.2 describes; an export on the deploy
+host only affects the old `deploy/hyperpod/deploy.sh` of Appendix A):
 
 ```bash
 export GPU_FAULT_EFA_TRAFFIC_MIN_ACTIVE_BPS=1048576
@@ -11052,9 +11113,9 @@ export GPU_FAULT_EFA_TRAFFIC_STARTUP_GRACE_SECONDS=120
 
 | Parameter | Default | Meaning |
 | --- | ---: | --- |
-| `GPU_FAULT_EFA_TRAFFIC_MIN_ACTIVE_BPS` | 1048576 | Only above this value does the attempt prove it once had effective EFA traffic |
+| `GPU_FAULT_EFA_TRAFFIC_MIN_ACTIVE_BPS` | 1048576 | Only reaching this value proves the attempt once had effective EFA traffic |
 | `GPU_FAULT_EFA_TRAFFIC_SPIKE_RATIO` | 4 | Reports a spike when the current throughput reaches this multiple of the EWMA baseline |
-| `GPU_FAULT_EFA_TRAFFIC_DROP_RATIO` | 0.25 | Reports a drop when the current throughput falls below this fraction of the baseline |
+| `GPU_FAULT_EFA_TRAFFIC_DROP_RATIO` | 0.25 | Reports a drop when the current throughput falls to this fraction of the baseline or below |
 | `GPU_FAULT_EFA_TRAFFIC_ZERO_BPS` | 1 | At or below this value counts as zero traffic |
 | `GPU_FAULT_EFA_TRAFFIC_ZERO_WARNING_SECONDS` | 60 | Continuous zero-traffic warning time |
 | `GPU_FAULT_EFA_TRAFFIC_ZERO_HUNG_SECONDS` | 600 | Continuous zero-traffic suspected-hung time |
@@ -11064,7 +11125,10 @@ export GPU_FAULT_EFA_TRAFFIC_STARTUP_GRACE_SECONDS=120
 | `GPU_FAULT_EFA_TRAFFIC_BASELINE_ALPHA` | 0.2 | EWMA new-sample weight, range `(0,1]` |
 | `GPU_FAULT_EFA_TRAFFIC_STARTUP_GRACE_SECONDS` | 120 | No zero-traffic judgement in the attempt's initial phase |
 
-`ZERO_HUNG_SECONDS` must be greater than or equal to `ZERO_WARNING_SECONDS`. For communication-sparse models,
+`ZERO_HUNG_SECONDS` must be greater than or equal to `ZERO_WARNING_SECONDS`, `DROP_RATIO` must lie in `(0,1)` and
+`SPIKE_RATIO` must exceed 1, or the process refuses to start. The node Host Collector reads `MIN_ACTIVE_BPS`,
+`SPIKE_RATIO` and `DROP_RATIO` too (at their defaults), only to decide when a traffic edge is reported at once; the
+decision stays on the control plane. For communication-sparse models,
 raise both durations according to the longest communication-free period of a normal step; do not lower them to a few seconds
 in pursuit of faster recovery.
 
@@ -11113,7 +11177,7 @@ The control plane retains host activity timestamps without resetting the zero-tr
 | `stalled` | No host activity met the probe threshold; not proof of NCCL hung |
 | `advancing` | Host activity met the threshold; not proof of collective progress and does not suppress suspicion |
 | `unavailable` | The node reported nothing (no GPU process / no nvidia-smi / no baseline in the first collection period); **escalates as usual**, never silenced by a missing probe |
-| `disabled` | Turned off with `RANK_LIVENESS_ENABLED=false` |
+| `disabled` | Turned off on the control plane with `GPU_FAULT_EFA_TRAFFIC_RANK_LIVENESS_ENABLED=false` (with the node-side `GPU_FAULT_RANK_LIVENESS_ENABLED=false` the node reports nothing and the status is `unavailable`) |
 
 The new detector has no progress-suppression budget: same-attempt prior activity and valid sustained low RDMA
 trigger evidence collection, regardless of step/phase, writes or CPU activity. A long checkpoint may still
