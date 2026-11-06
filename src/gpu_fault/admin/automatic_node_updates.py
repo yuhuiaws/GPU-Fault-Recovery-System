@@ -593,7 +593,7 @@ def _control_plane_window(group: Mapping[str, Any], *, whole: bool) -> tuple[str
             True,
         )
     covered = (
-        "with no rolling DeploymentConfig: observed (2026-11-01) to re-image "
+        "with no rolling DeploymentConfig: observed to re-image "
         f"{instances} of the group at once"
         if not batch
         else f"with a rolling batch of {batch.get('value')}"

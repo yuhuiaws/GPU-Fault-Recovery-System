@@ -253,7 +253,7 @@ def test_status_full_header_names_the_control_plane_schedule_first() -> None:
     assert advisories[0] == (
         f"advisory: HyperPod instance group {CPU_GROUP} of the CPU control-plane "
         f"cluster hp-cpu has ScheduledUpdateConfig {CPU_SCHEDULE} with no rolling "
-        "DeploymentConfig: observed (2026-11-01) to re-image all 3 instances of the "
+        "DeploymentConfig: observed to re-image all 3 instances of the "
         "group at once -- every node the control plane runs on, so the whole "
         "control plane (api-ha, control-worker) is down for minutes each time; "
         "with spec.cpuControlPlane.rollingUpdate mode rolling (the default) the "

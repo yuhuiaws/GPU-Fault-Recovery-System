@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -989,12 +990,34 @@ def test_the_live_schedule_says_the_whole_control_plane_goes_down() -> None:
     assert updates.control_plane_lines(_cpu_block()) == [
         f"advisory: HyperPod instance group {CPU_GROUP} of {CPU_WHERE} has "
         f"ScheduledUpdateConfig {CPU_SCHEDULE} with no rolling DeploymentConfig: "
-        "observed (2026-11-01) to re-image all 3 instances of the group at once -- "
+        "observed to re-image all 3 instances of the group at once -- "
         "every node the control plane runs on, so the whole control plane "
         "(api-ha, control-worker) is down for minutes each time; "
         + CPU_ROLLING.format(group=CPU_GROUP)
         + f" {CPU_SECTION}"
     ], "observed, not documented: no AWS sentence states the default"
+
+
+@pytest.mark.parametrize(
+    "groups",
+    [
+        (_cpu_group(),),
+        (_cpu_group(), _cpu_group("cpu-b", count=2, schedule=None)),
+        (_cpu_group(count=None),),
+        (_cpu_group(batch={"Type": "INSTANCE_COUNT", "Value": 3}),),
+    ],
+)
+def test_the_advisory_names_no_site_observation_date(groups) -> None:
+    """Product text goes to every site: it says the default was observed, never
+    when or where one site observed it."""
+
+    lines = updates.control_plane_lines(_cpu_block(*groups))
+
+    assert lines, "the scheduled group is announced"
+    for line in lines:
+        assert re.search(r"\b\d{4}-\d{2}-\d{2}\b", line) is None, (
+            f"an advisory line carries a date: {line}"
+        )
 
 
 def test_a_group_beside_other_cpu_nodes_names_the_pods_on_it_only() -> None:
@@ -1004,7 +1027,7 @@ def test_a_group_beside_other_cpu_nodes_names_the_pods_on_it_only() -> None:
 
     (line,) = lines
     assert (
-        "observed (2026-11-01) to re-image all 3 instances of the group at once, "
+        "observed to re-image all 3 instances of the group at once, "
         "so the control-plane Pods on them (api-ha, control-worker) are down for "
         "minutes each time"
     ) in line, "another group holds CPU nodes too: not the whole control plane"
@@ -1080,7 +1103,7 @@ def test_an_unknown_count_and_auto_patching_are_announced_too() -> None:
 
     scheduled, auto_patch = updates.control_plane_lines(_cpu_block(patched))
 
-    assert "observed (2026-11-01) to re-image every instance of the group" in scheduled
+    assert "observed to re-image every instance of the group" in scheduled
     assert auto_patch == (
         f"advisory: HyperPod instance group {CPU_GROUP} of {CPU_WHERE} has "
         "AutoPatchConfig (PatchingStrategy WhenIdle): the service cordons and "
