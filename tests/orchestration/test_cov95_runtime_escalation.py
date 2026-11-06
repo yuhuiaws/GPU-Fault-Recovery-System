@@ -4,12 +4,18 @@ from copy import deepcopy
 
 import pytest
 
+from gpu_fault.adapters.gpu_validation import TELEMETRY_READINESS_OPERATIONS
 from gpu_fault.models import (
     BlockedKind,
     RecoveryAction,
     WorkflowOperation,
     WorkflowStatus,
 )
+from gpu_fault.operation_registry import (
+    NODE_HARDWARE_MUTATING_OPERATIONS,
+    RECOVERY_OPERATION_RANK,
+)
+from gpu_fault.orchestration import validation_rungs
 from gpu_fault.orchestration.escalation import HardwareEscalationService
 from tests._builders import workflow_step
 from tests.orchestration._cov95_runtime_escalation import (
@@ -24,6 +30,10 @@ VALIDATE = WorkflowOperation.VALIDATE_GPU
 RESTART = WorkflowOperation.RESTART_WORKLOAD
 DCGM = WorkflowOperation.RUN_DCGM_DIAGNOSTIC
 SUPPORT = WorkflowOperation.ESCALATE_SUPPORT
+FM_RESTART = WorkflowOperation.RESTART_FABRIC_MANAGER
+EFA_DRIVER = WorkflowOperation.REMEDIATE_EFA_DRIVER
+EFA_PLUGIN = WorkflowOperation.RESTART_EFA_DEVICE_PLUGIN
+GPU_PLUGIN = WorkflowOperation.RESTART_GPU_DEVICE_PLUGIN
 
 
 @pytest.mark.parametrize(
@@ -66,6 +76,10 @@ SUPPORT = WorkflowOperation.ESCALATE_SUPPORT
         ),
         ([DCGM, VALIDATE], RecoveryAction.DRAIN, SUPPORT),
         ([RESET, VALIDATE], RecoveryAction.REBOOT_NODE, REBOOT),
+        ([FM_RESTART, VALIDATE], RecoveryAction.REBOOT_NODE, REBOOT),
+        ([EFA_DRIVER, VALIDATE], RecoveryAction.REBOOT_NODE, REBOOT),
+        ([EFA_PLUGIN, VALIDATE], RecoveryAction.REBOOT_NODE, REBOOT),
+        ([GPU_PLUGIN, VALIDATE], RecoveryAction.REBOOT_NODE, REBOOT),
     ],
 )
 def test_failed_recovery_emits_the_reviewed_rung_with_real_profile_compilation(
@@ -180,6 +194,150 @@ def test_a_drain_whose_own_hand_off_failed_opens_no_second_one() -> None:
     h = EscalationHarness(DRAIN_CHAIN)
 
     assert HardwareEscalationService.classify(h.workflow) is None
+
+
+#: The node recovery actions: the operations the registry calls
+#: node-hardware-mutating and ranks as a recovery. Pinned: a recovery action
+#: added to the registry (or one that loses its rank) fails here until the
+#: escalation ladder says which rung a validation failing after it climbs to.
+NODE_RECOVERY_ACTIONS = frozenset(
+    {
+        RESET,
+        WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES,
+        WorkflowOperation.RECOVER_DRAIN_P2P,
+        FM_RESTART,
+        EFA_DRIVER,
+        EFA_PLUGIN,
+        GPU_PLUGIN,
+        WorkflowOperation.REMEDIATE_DRIVER,
+        WorkflowOperation.UPDATE_SOFTWARE_FIRMWARE,
+        REBOOT,
+        REPLACE,
+    }
+)
+_REBOOT_RUNG = (RecoveryAction.REBOOT_NODE, REBOOT)
+_SUPPORT_RUNG = (RecoveryAction.ESCALATE_OPERATOR, SUPPORT)
+#: The rung a validation failing after each node recovery action climbs to:
+#: reset -> reboot -> warm-spare replacement -> support; the installs go to
+#: support (their software may be half updated), and the runtime restarts --
+#: Fabric Manager, the EFA driver, the device plugins -- climb like a reset.
+VALIDATION_RUNG_AFTER = {
+    RESET: ("reset_validation", *_REBOOT_RUNG),
+    WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES: ("reset_validation", *_REBOOT_RUNG),
+    WorkflowOperation.RECOVER_DRAIN_P2P: ("reset_validation", *_REBOOT_RUNG),
+    FM_RESTART: ("fabric_manager_validation", *_REBOOT_RUNG),
+    EFA_DRIVER: ("efa_recovery", *_REBOOT_RUNG),
+    EFA_PLUGIN: ("efa_recovery", *_REBOOT_RUNG),
+    GPU_PLUGIN: ("efa_recovery", *_REBOOT_RUNG),
+    WorkflowOperation.REMEDIATE_DRIVER: ("remediation_validation", *_SUPPORT_RUNG),
+    WorkflowOperation.UPDATE_SOFTWARE_FIRMWARE: (
+        "remediation_validation",
+        *_SUPPORT_RUNG,
+    ),
+    REBOOT: ("reboot_validation", RecoveryAction.REPLACE_NODE, REPLACE),
+    REPLACE: ("replacement_validation", *_SUPPORT_RUNG),
+}
+
+
+def _node_recovery_actions() -> frozenset[WorkflowOperation]:
+    return NODE_HARDWARE_MUTATING_OPERATIONS & frozenset(RECOVERY_OPERATION_RANK)
+
+
+def test_every_node_recovery_action_is_a_recovery_step_before_a_validation() -> None:
+    """The guard. The node recovery actions come from the registry -- the
+    node-hardware-mutating operations that carry a recovery rank; the
+    GPU-service window around a reset (QUIESCE / RESTORE_GPU_SERVICES) and the
+    planning-only RESTART_VM carry none -- and the validation adapter re-reads
+    telemetry after exactly the same set. Every one of them must be a recovery
+    step the ladder judges a failed validation against: RESTART_FABRIC_MANAGER
+    was not, so a validation failing after a Fabric Manager restart had no
+    rung and the record ended silently."""
+
+    derived = _node_recovery_actions()
+    assert derived == NODE_RECOVERY_ACTIONS, (
+        "the registry's recovery actions changed: classify the new one in "
+        "validation_rungs.VALIDATION_RUNGS, then update this pin"
+    )
+    assert derived == TELEMETRY_READINESS_OPERATIONS, (
+        "the validation adapter re-reads telemetry after exactly the recovery actions"
+    )
+    assert validation_rungs.NODE_RECOVERY_OPERATIONS == derived
+    unjudged = derived - validation_rungs.VALIDATION_JUDGED_OPERATIONS
+    assert not unjudged, "no rung for a validation failing after " + ", ".join(
+        sorted(operation.value for operation in unjudged)
+    )
+    assert set(VALIDATION_RUNG_AFTER) == derived
+
+
+@pytest.mark.parametrize("held", [True, False], ids=["held", "unheld"])
+@pytest.mark.parametrize(
+    "operation", sorted(_node_recovery_actions()), ids=lambda operation: operation.value
+)
+def test_a_validation_failing_after_a_recovery_action_climbs_its_rung(
+    operation, held
+) -> None:
+    """A validation that fails after a node recovery action is a failed
+    recovery, whether or not the plan cordoned first: it climbs the rung of
+    that action. Before, a validation after a Fabric Manager restart -- or
+    after the EFA driver or a device-plugin restart whose plan carried no
+    reboot request -- climbed nothing."""
+
+    operations = (
+        [FREEZE, CORDON, operation, VALIDATE, WorkflowOperation.RESTORE_SCHEDULING]
+        if held
+        else [FREEZE, operation, VALIDATE]
+    )
+    h = EscalationHarness(
+        operations,
+        failed_index=operations.index(VALIDATE),
+        details={"failed_nodes": ["node-a"], "node_failures": {"node-a": ["x"]}},
+    )
+
+    classification = HardwareEscalationService.classify(h.workflow)
+
+    assert classification is not None, (
+        f"a validation failed after {operation.value} and climbed nothing"
+    )
+    assert classification[:3] == VALIDATION_RUNG_AFTER[operation]
+
+
+def test_a_validation_after_a_fabric_manager_restart_escalates_the_restarted_node() -> (
+    None
+):
+    """Counted as the recovery step, the Fabric Manager restart also scopes
+    the failed validation: the reboot rung acts on the node it restarted, not
+    on a sibling the validation merely checked."""
+
+    operations = [FREEZE, CORDON, FM_RESTART, VALIDATE]
+    h = EscalationHarness(
+        operations,
+        failed_index=operations.index(VALIDATE),
+        details={"failed_nodes": ["node-a", "node-b"]},
+    )
+    h.amend(
+        official_steps=[
+            step
+            if step.operation is FM_RESTART
+            else step.model_copy(update={"node_ids": ["node-a", "node-b"]})
+            for step in h.workflow.official_steps
+        ]
+    )
+
+    result = h.escalate()
+
+    assert result is not None, "the failed validation needs its rung"
+    incident, successor = result
+    assert incident.effective_action is RecoveryAction.REBOOT_NODE
+    assert incident.reasons[0].startswith(
+        "fabric_manager_validation remediation failed; failed operation or "
+        "validation: VALIDATE_GPU"
+    ), incident.reasons
+    assert incident.node_ids == ["node-a"], incident.node_ids
+    assert {
+        step.operation: step.node_ids
+        for step in successor.official_steps
+        if step.operation in {CORDON, REBOOT}
+    } == {CORDON: ["node-a"], REBOOT: ["node-a"]}
 
 
 SNAPSHOT = WorkflowOperation.TRIGGER_HEALTH_SNAPSHOT

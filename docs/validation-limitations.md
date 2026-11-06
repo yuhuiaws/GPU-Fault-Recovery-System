@@ -1685,7 +1685,15 @@ no DESTR or GF-GENERAL-LIVE variant fails those steps. So is the
 manual-confirmation hand-off of a job-wide stop or checkpoint whose outcome is
 unknown, which by design holds the job's whole allocation until an operator
 confirms (`tests/orchestration/test_cov95_runtime_escalation.py`): no live
-variant abandons a stop. 015
+variant abandons a stop. A validation that fails after a Fabric Manager
+restart climbs to the reboot like one after a reset (stage
+`fabric_manager_validation`), and one after the EFA driver remediation or a
+device-plugin restart climbs to it also when the plan carries no reboot
+request: software-tested only
+(`tests/orchestration/test_cov95_runtime_escalation.py`,
+`tests/orchestration/test_fabric_manager_plan.py`), since no catalog plan runs
+a validation after a Fabric Manager restart and every EFA or device-plugin
+plan carries the request. 015
 `command_failure` serves two exits in turn: a BMC that does not answer (`Get
 Device ID command failed`) must be a `_bmc` collection error with no sample, a
 host without an IPMI device node (`Could not open device at /dev/ipmi0 ...: No

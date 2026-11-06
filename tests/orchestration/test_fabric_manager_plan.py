@@ -282,6 +282,13 @@ def _failed_validation(after: WorkflowOperation):
             "reboot_validation",
             RecoveryAction.REPLACE_NODE,
         ),
+        # A Fabric Manager restart is a recovery step like the reset: the
+        # fabric it did not bring back climbs to the reboot.
+        (
+            WorkflowOperation.RESTART_FABRIC_MANAGER,
+            "fabric_manager_validation",
+            RecoveryAction.REBOOT_NODE,
+        ),
     ],
 )
 def test_a_fabric_that_does_not_train_climbs_the_existing_ladder(

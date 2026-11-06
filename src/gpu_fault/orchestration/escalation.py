@@ -48,6 +48,12 @@ from gpu_fault.orchestration.validation_evidence import (
     withheld_escalation,
     withheld_escalation_reasons,
 )
+from gpu_fault.orchestration.validation_rungs import (
+    EFA_RECOVERY_STAGE,
+    RESET_OPERATIONS as _RESET_OPERATIONS,
+    VALIDATION_JUDGED_OPERATIONS,
+    validation_rung,
+)
 from gpu_fault.store.shared.errors import NotFoundError
 
 RESTART_SAFETY_PARAMETERS = (
@@ -59,20 +65,12 @@ RESTART_SAFETY_PARAMETERS = (
 )
 
 
-_RESET_OPERATIONS = frozenset(
-    {
-        WorkflowOperation.RESET_GPU,
-        WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES,
-        WorkflowOperation.RECOVER_DRAIN_P2P,
-    }
-)
 _VALIDATION_OPERATIONS = VALIDATION_OPERATIONS
 # The node actions a validation judges: the reset, reboot, replacement,
-# remediation or diagnostic that ran before it. A failed validation escalates
-# the nodes one of these acted on, never a sibling the step merely checked.
-_RECOVERY_ACTION_OPERATIONS = (
-    HARDWARE_ESCALATION_RELEVANT_OPERATIONS - _VALIDATION_OPERATIONS
-)
+# runtime restart, remediation or diagnostic that ran before it
+# (``validation_rungs.VALIDATION_RUNGS``). A failed validation escalates the
+# nodes one of these acted on, never a sibling the step merely checked.
+_RECOVERY_ACTION_OPERATIONS = VALIDATION_JUDGED_OPERATIONS
 # Containment and release steps. Their failure is not a hardware rung but it
 # is not nothing either: a node whose RESTORE_SCHEDULING failed stays
 # cordoned until someone acts, so the failure goes to an operator (F-H1).
@@ -488,9 +486,11 @@ def next_rung(
 
     Mirrors the ladder ``HardwareEscalationService._classify`` applies to a
     whole workflow, for one node branch (F-N1): reset -> reboot -> warm-spare
-    replacement. ``None`` means the ladder is exhausted for this branch and
-    the outcome belongs to an operator (support escalation / drain), which
-    the whole-workflow path produces once the workflow fails.
+    replacement. ``None`` means the branch takes no rung in place and the
+    outcome goes to the whole-workflow path once the workflow fails: an
+    operator (support escalation / drain), or the reboot the whole record
+    climbs to after a runtime restart or a plan's own request
+    (``validation_rungs.VALIDATION_RUNGS``, ``EFA_RECOVERY_STAGE``).
     ``recovery_context`` is the set of recovery operations that already ran
     on the branch; it decides what a failed *validation* escalates from.
     """
@@ -815,7 +815,7 @@ class HardwareEscalationService:
             RecoveryAction.REBOOT_NODE.value in requested
             and WorkflowOperation.RESTART_NODE not in recovery_context_operations
         ):
-            failed_stage = "efa_recovery"
+            failed_stage = EFA_RECOVERY_STAGE
             next_action = RecoveryAction.REBOOT_NODE
             next_operation = WorkflowOperation.RESTART_NODE
         elif WorkflowOperation.RECOVER_DRAIN_P2P in failed_operation_set:
@@ -877,33 +877,9 @@ class HardwareEscalationService:
             next_action = RecoveryAction.REBOOT_NODE
             next_operation = WorkflowOperation.RESTART_NODE
         elif failed_operation_set.intersection(_VALIDATION_OPERATIONS):
-            if WorkflowOperation.REPLACE_NODE in recovery_context_operations:
-                failed_stage = "replacement_validation"
-                next_action = RecoveryAction.ESCALATE_OPERATOR
-                next_operation = WorkflowOperation.ESCALATE_SUPPORT
-            elif WorkflowOperation.RESTART_NODE in recovery_context_operations:
-                failed_stage = "reboot_validation"
-                next_action = RecoveryAction.REPLACE_NODE
-                next_operation = WorkflowOperation.REPLACE_NODE
-            elif recovery_context_operations.intersection(_RESET_OPERATIONS):
-                failed_stage = "reset_validation"
-                next_action = RecoveryAction.REBOOT_NODE
-                next_operation = WorkflowOperation.RESTART_NODE
-            elif recovery_context_operations.intersection(
-                {
-                    WorkflowOperation.REMEDIATE_DRIVER,
-                    WorkflowOperation.UPDATE_SOFTWARE_FIRMWARE,
-                    WorkflowOperation.RUN_FIELD_DIAGNOSTIC,
-                    WorkflowOperation.RUN_NVLINK74_WORKFLOW,
-                }
-            ):
-                failed_stage = "remediation_validation"
-                next_action = RecoveryAction.ESCALATE_OPERATOR
-                next_operation = WorkflowOperation.ESCALATE_SUPPORT
-            elif WorkflowOperation.RUN_DCGM_DIAGNOSTIC in recovery_context_operations:
-                failed_stage = "temperature_validation"
-                next_action = RecoveryAction.DRAIN
-                next_operation = None
+            rung = validation_rung(recovery_context_operations)
+            if rung is not None:
+                failed_stage, next_action, next_operation = rung
             elif held_for_unsent_hand_off(workflow):
                 failed_stage = "drain_validation"
                 next_action = RecoveryAction.ESCALATE_OPERATOR

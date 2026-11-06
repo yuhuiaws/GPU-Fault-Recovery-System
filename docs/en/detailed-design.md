@@ -2518,6 +2518,18 @@ Whole-record hardware recovery escalation is invoked idempotently by the Dispatc
    one hardware escalation mail ("no node was taken out of service" when nothing is held). A cordon the executor
    refused before dispatch opens no ticket; one with an unknown outcome gets the manual-confirmation ticket.
 
+A failed validation climbs the rung of the strongest recovery step the record ran before it
+(`validation_rungs.VALIDATION_RUNGS`): after a replacement, support; after a reboot, the replacement; after a reset
+(RESET_GPU, RESET_ALL_GPUS_NVSWITCHES, RECOVER_DRAIN_P2P), the reboot; after a driver or firmware install, the NVIDIA
+field diagnostic or the NVLink workflow, support; after a DCGM diagnostic, the drain; after a Fabric Manager restart
+(stage `fabric_manager_validation`), the EFA driver remediation or a device-plugin restart (stage `efa_recovery`, also when
+the plan carries no reboot request), the reboot, and only the nodes that step acted on. The recovery steps are the
+registry's node-hardware-mutating operations that carry a recovery rank (`validation_rungs.NODE_RECOVERY_OPERATIONS`), the same
+set after which the validation adapter re-reads telemetry (`gpu_validation.TELEMETRY_READINESS_OPERATIONS`); the GPU-service
+window around a reset and the planning-only RESTART_VM carry no rank. A test pins that every one of them has a rung, so a
+recovery action added to the registry fails until it is given one. The rung after a runtime restart is taken by the whole
+record (`workflow-reboot-after-<workflow>`), not in place on a node branch.
+
 ```mermaid
 flowchart LR
     R1["RESET_GPU /<br/>RESET_ALL_GPUS_NVSWITCHES"] -->|SUCCEEDED| OK1["RESTORE_SCHEDULING<br/>+ RESTART_WORKLOAD"]
