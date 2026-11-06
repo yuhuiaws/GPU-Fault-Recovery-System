@@ -38,8 +38,8 @@ training, thermal, spare-health or RMA policies from that review.
   instead of a bare "2". BMC the node cannot provide -- no `ipmitool`, or an
   `ipmitool` that finds no IPMI device node and none exists (EC2) -- is
   `bmc_status_unsupported` (TOOL_MISSING / NO_DEVICE) with no collection
-  error, like SMART's; it used to be a `_bmc` error on every tick that held
-  host validation forever. Like every capability marker it is a state, and
+  error, like SMART's, so it never holds host validation. Like every
+  capability marker it is a state, and
   its appearance, a `reason` change and its clearing are edges while every
   accepted batch keeps it in the node's latest records (see the EFA bullet).
 - SMART query failures are `smart_query_failed` plus a collection error and
@@ -65,22 +65,19 @@ training, thermal, spare-health or RMA policies from that review.
   marker with its `reason` and device in `telemetry_metric_latest`
   (`NodeHealthPolicy.LATEST_METRICS_REQUIRED`), so the records say when a
   netdev stopped exposing a counter and what a node's capability state is at
-  any moment. The first live `missing_counter` run found the changed EFA
-  marker never delivered, the health summary that carried it not kept as
-  evidence; the first live 015 `command_failure` and `unsupported_bmc` runs
-  found the BMC marker in no record at all -- it had no edge and no latest
-  record.
+  any moment. The health summary itself is not kept as raw evidence, so the
+  edge and the latest record are what make a marker observable.
 - The sysfs RDMA port counters (`rdma_errors_delta`, `rdma_<counter>_delta`)
   and the netdev `statistics` counters (`network_errors_delta`,
   `network_drops_delta`) follow the same reset rule: a counter below its
   baseline is unknown for that tick (a collection error naming the reader, the
   device/port and the counter, in the `ethtool` wording), the baseline is
   re-armed from the new value and no delta is shipped for it; counters that did
-  not reset still report. The clamped 0 used to clear the active signal and
-  let the continuing increase mint a second incident.
+  not reset still report. A clamped 0 would clear the active signal and let
+  the continuing increase open a second incident.
 - An NVML failure while `/proc/driver/nvidia/gpus` is missing or unreadable is
   `INVENTORY_UNAVAILABLE`: no GPU count, no mismatch, no streak advance -- two
-  failed reads are not zero GPUs. An unreadable directory used to count as 0.
+  failed reads are not zero GPUs.
 - Inode exhaustion is `filesystem_inodes_used_percent`, graded like capacity
   (98 %, CRITICAL, QUARANTINE) and checked by VALIDATE_HOST.
 - Host metrics needed by verification are persisted. New diagnostic plans carry
