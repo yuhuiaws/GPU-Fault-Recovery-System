@@ -335,10 +335,9 @@ def test_run_with_deadline_defaults_the_cleanup_budget_for_a_single_case(
     assert summary["verdict"] == "PASS"
     assert seen["cases"] == ("GF-REGIONAL-CMD-001",)
     assert seen["kwargs"]["credential_envelope"] is None
-    assert (
-        seen["kwargs"]["deadline"].hard_until - seen["kwargs"]["deadline"].work_until
-        == 30
-    )
+    deadline = seen["kwargs"]["deadline"]
+    # Both ends are monotonic-clock floats: their difference is 30 only to float precision.
+    assert deadline.hard_until - deadline.work_until == pytest.approx(30)
     assert seen["audit"].closed is True
 
 
