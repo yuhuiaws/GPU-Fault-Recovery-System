@@ -3496,7 +3496,7 @@ rule file can express them all at once:
 | `decision.severity` / `scope` | `FaultPolicyDecision.severity` / `containment` computed at decision time | Not hard-coded in the rule |
 | `decision.action` | `immediateAction` / `investigatoryAction` (vendor wording) → mapped to `RecoveryAction`(17) | Original text kept for reconciliation against vendor docs |
 | `workflow.steps` | `src/gpu_fault/orchestration/workflow_builder.py` generates the `WorkflowOperation`(35) sequence from action and capabilities | **Not a hand-written step list in the rule** |
-| `approval` | **Does not exist**. The gate for destructive actions is the fleet consistency preflight (§3.7 ⑪), not approval | §8.6, §11 |
+| `approval` | **Does not exist**. The gate for destructive actions is the fleet consistency preflight (§3.7 ⑪), not approval | §8.7, §11 |
 | `cooldown` | `defaults.markerTtlSeconds: 3600` + notification cooldown 3600s | Implemented via markers, not a rule field |
 | `maxAttempts` | Restart budget (`src/gpu_fault/execution/restart_budget_preflight.py`) + ladder escalation | Not a rule field |
 
@@ -3549,8 +3549,8 @@ and a trusted kernel XID 32/79 within the window, supporting either arrival orde
 Kernel evidence does not masquerade as a DCGM sample, and the independent XID policy continues to execute; XID history is not read when there is no real PCIe out-of-bounds sample,
 and multiple anomalous GPUs share one bounded node/time query.
 DCGM's `xid_last_error` is a "last XID" state that every scrape re-reads, so its latest sample is always as fresh as
-the batch and bounding its `observed_at` by the window bounded nothing: a gauge that went to 32/79 long before used to
-re-join a CRITICAL `DRAIN` composite on every later PCIe breach (GF-GENERAL-LIVE-022 `expired_xid`). The gauge is
+the batch and bounding its `observed_at` by the window would bound nothing: a gauge that went to 32/79 long before would
+re-join a CRITICAL `DRAIN` composite on every later PCIe breach (acceptance case GF-GENERAL-LIVE-022 `expired_xid`). The gauge is
 dated by the `XidEvent` its change produced (`GpuMetricsService._xid_event`, claimed once across replicas;
 `gpu_composites.link_xid_events` fetches the persisted changes with the same bounded query, and the batch's own changes
 come in through `ingest`) and judged by the kernel path's rules: same node and GPU, no further than
@@ -3570,8 +3570,8 @@ exec'd by the completion-watcher). When an event carries `cgroup_path`, a contai
 such annotation, and is the process's container when a segment of the event's path names its kubelet runtime id the way the
 runtime names a container's cgroup (`cri-containerd-<id>.scope`, `crio-<id>.scope`, `docker-<id>.scope`, the cgroupfs `<id>`)
 (`workload_container_scope.cgroup_in_container`, shared by `WorkloadTopologyService.resolve` and `attempt_observation`); a path
-naming another container, `crio-conmon-<id>.scope`, the Pod-level cgroup or a host unit does not match. Before this a managed
-container never matched: the event found no attempt (`workload_identity_source=NO_ACTIVE_MANAGED_ATTEMPT`), its workload state
+naming another container, `crio-conmon-<id>.scope`, the Pod-level cgroup or a host unit does not match. Were a managed
+container never to match, the event would find no attempt (`workload_identity_source=NO_ACTIVE_MANAGED_ATTEMPT`), its workload state
 stayed `UNKNOWN`, and the plan went `SAFETY_PENDING` (`node workload state is UNKNOWN`) with only FREEZE_EVIDENCE,
 MARK_UNSCHEDULABLE and QUARANTINE waiting for an operator, instead of the attributed stop, reset and restart -- conservative and
 harmless to the job, but no automatic recovery; the product's own collectors do not fill the field, only an external producer
@@ -3588,9 +3588,9 @@ The attribution result decides at which level the action stops:
 - `workload_state` is `UNKNOWN` → handled on the conservative side, **never assuming nobody is using it**. The boundary between `UNKNOWN` and `IDLE`
   is decided by the 600s observation/coverage heartbeat window of §3.4 ⑦: a stopped watcher means `UNKNOWN`.
 
-The boundary between `UNKNOWN` and `IDLE` is decided by the **coverage heartbeat**. With no managed job at all, the control plane could originally only
+The boundary between `UNKNOWN` and `IDLE` is decided by the **coverage heartbeat**. With no managed job at all, the control plane could otherwise only
 say `UNKNOWN` (no observation within 10 minutes; an idle cluster and a dead watcher look the same to it), so every
-XID plan was BLOCKED. The completion watcher now sends a heartbeat to
+XID plan would be BLOCKED. The completion watcher sends a heartbeat to
 `POST /v1/attempts/coverage` after every **idle** pass, declaring "I have just fully listed this cluster: zero running
 managed Pods, zero active attempts, no new reconcile failures this round"; the control plane reads `UNKNOWN` as `IDLE` only when the heartbeat satisfies
 `watched_pods == 0 && watched_attempts == 0` and is no older than
@@ -3603,8 +3603,8 @@ also consumes that interval, so when the control plane keeps rejecting, the clus
 Two premises: (1) the solution stipulates that **every submitted training job must carry the `gpu-fault.io/managed=true` label**;
 the definition of a "job" is a Pod carrying that label; the heartbeat is built on this contract, unlabelled workloads are outside the solution's protection
 scope, and no coverage needs to be designed for them; the watcher's list/watch selector is therefore fixed to
-`gpu-fault.io/managed=true`, with no switch to relax it (the former `GPU_FAULT_COMPLETION_OBSERVE_UNMANAGED`
-observe-only mode would count every Pod in the cluster and make the heartbeat never fire; it has been removed as dead surface outside the contract);
+`gpu-fault.io/managed=true`, with no switch to relax it and no mode that observes unlabelled Pods (it would count every Pod in
+the cluster and make the heartbeat never fire);
 (2) the heartbeat hands `IDLE` to the checkpoint-less REBOOT/RESET path, so it would rather under-send than over-send.
 
 `DistributedXidBatch` is for the scenario where multiple ranks report errors at the same time; its eight checks (unique event IDs,
@@ -3636,7 +3636,7 @@ A rule change = swapping the wheel, and swapping the wheel has six places that m
    `kubectl create configmap --from-file=<wheel>.whl.xz=<file>` when the object does not exist, and when the xz stream is over 1 MiB
    creates the `<name>-part-<k>` parts first and the named ConfigMap holding only `artifact.json` last; an existing object of either
    layout is only read back, re-hashed part by part and compared, with no `apply`: the ConfigMap ceiling is 1 MiB, the control-plane
-   wheel's xz stream has outgrown it, and `apply` would also write the whole object into the last-applied annotation and exceed the
+   wheel's xz stream can outgrow it, and `apply` would also write the whole object into the last-applied annotation and exceed the
    limit again. The preflight check `artifact_config_maps` derives every artifact's layout from the local files before any object is
    created; the bundle cannot be split -- the installer Job reads it from its mount -- so over the limit is FAIL and near it is WARN);
 2. the bundle ConfigMap;
@@ -3718,15 +3718,14 @@ Figure 6-1 The six `IncidentState` states
 (evidence collection, diagnostics, validation, as decided by the operation registry; containment/destructive/node-level operations do not count), a failure has reached
 no conclusion about the node, so the incident moves to `RECOVERED`, `reasons` gets `diagnostic inconclusive[: <error>]` appended,
 the TERMINAL event carries `details.diagnostic_inconclusive=true`, the incident's marker is retired, and a
-`DIAGNOSTIC_INCONCLUSIVE` notification is sent (§3.11). This solves "a WARNING diagnostic marker from two minutes of CPU at 98%
-keeps the job from restarting for an hour": the diagnostic workflow never repaired anything, yet it parked the incident in ESCALATED holding
-job recovery hostage. A `VALIDATE_HOST` acting as a gate (followed by a restart) does not count as diagnostics; its failure still escalates.
+`DIAGNOSTIC_INCONCLUSIVE` notification is sent (§3.11). Otherwise a diagnostic-only workflow (one a WARNING diagnostic marker from two
+minutes of CPU at 98% started, say) that never repaired anything would park the incident in ESCALATED holding job recovery hostage and keep
+the job from restarting for a long time. A `VALIDATE_HOST` acting as a gate (followed by a restart) does not count as diagnostics; its failure still escalates.
 The conclusion has to come from the data: for a WARNING-level growth GPU finding (such as `thermal_violation_total_us`), `VALIDATE_GPU`
-no longer fails at the end of the fixed grace on whatever the node's health-summary phase happened to deliver; past the grace it keeps
+does not fail at the end of the fixed grace on whatever the node's health-summary phase happened to deliver; past the grace it keeps
 `WAITING` for a GPU metrics batch newer than the finding's current state to re-judge it (`node_pending.<node>.awaiting_newer_gpu_metrics`
 and its reason text, bounded by the 600 s per-step cap), fails only if that re-judgement leaves the finding active, and succeeds once it
-is cleared (the DCGM diagnostics section of `detailed-design.md`, which also records the 2026-10-26/27 case where the same sequence passed
-on one cluster and failed on the other).
+is cleared (the DCGM diagnostics section of `detailed-design.md`).
 
 The exception does not apply to the read-only NCCL/EFA hung diagnostic DAG (steps carry the `HUNG_DIAGNOSTIC` contract and it ends with
 `ESCALATE_SUPPORT`): the training may still be hung and the verdict belongs to a human. When one of its evidence/validation steps fails only the
@@ -3735,7 +3734,7 @@ workflow ends FAILED with that failure and the incident `ESCALATED`; a VALIDATE_
 explicit `fabric_status=UNKNOWN` instead of waiting (`components/nccl-hung-hardening.md`).
 
 That DAG's `ESCALATE_SUPPORT` sends the `HUNG_SUPPORT_HANDOFF` notice (`hung-support-handoff-zh-v1`, category `OPERATOR_REVIEW`,
-deduplication key `<cluster>/<incident>/hung-support-handoff/<workflow>`) and no longer the hardware-escalation mail, which says "hardware
+deduplication key `<cluster>/<incident>/hung-support-handoff/<workflow>`) rather than the hardware-escalation mail, which says "hardware
 taken out of service" and that the nodes stay unschedulable and quarantined -- untrue for a hung diagnostic. The body states that the
 diagnostic is read-only (it did not cordon, drain, quarantine, reset or reboot any node, and did not stop, suspend or restart any workload),
 the job/attempt and nodes, each evidence step's result as its own record has it (the step record key `<workflow>/<index>/<operation>`, the
@@ -3763,43 +3762,39 @@ nothing is isolated, no job is stopped. The back-reference says what stays uncha
 on: a node's own shared-storage chain reads `the diagnostic-only handling of this node is unchanged`, a record of another
 fault the finding was folded into or absorbed by names its effective action (`this incident's REBOOT_NODE handling of
 this node is unchanged`); the record's member line and the notification name that action for such a member too,
-`reasons[0]` no longer claims a diagnostic-only chain for every node, and the notification says `unchanged and
-diagnostic-only` only when every member is on one (b215). The back-reference used to say diagnostic-only everywhere,
-on an XID recovery's or a reboot's record as well. A member's per-node incident is the record holding its activation, under any
+`reasons[0]` does not claim a diagnostic-only chain for every node, and the notification says `unchanged and
+diagnostic-only` only when every member is on one. A member's per-node incident is the record holding its activation, under any
 node-health label the product gives it (`NODE_HEALTH`, or the group labels `NODE_HEALTH_GROUP`/`NODE_RESOURCE_GROUP`/
 `GPU_FAULT_GROUP`, `src/gpu_fault/orchestration/families/incident_labels.py`): while a managed attempt's recovery is in
 flight (an XID 13 stop-and-restart, an XID 48 GPU reset) the attempt grouping folds the node's finding into that
 recovery record -- `GPU_FAULT_GROUP` under the event id, policy source and node scope of the fault that minted it, and
 a record-only fold does not even add the node to `node_ids` -- so only the finding's marker (`marker-<event id>`,
 re-pointed by ingestion at the record it routed the finding to) ties the node to the record; the peer look, the safety
-net and the member-incident lookup all follow it. Before, only `event_type=NODE_HEALTH` records whose event id names
-the metric counted: when the node that activated first had been folded into a recovery, the peer activating after it
-never saw it, and a two-node outage of one export formed no record (or the safety net named the node `none open`)
-(b213, `tests/host_health/test_grouped_node_health_incidents.py`). A node the product is rebooting (RESTART_NODE
+net and the member-incident lookup all follow it. Were only `event_type=NODE_HEALTH` records whose event id names
+the metric to count, a node that activated first and was folded into a recovery would never be seen by the peer activating
+after it, and a two-node outage of one export would form no record (or the safety net would name the node `none open`)
+(`tests/host_health/test_grouped_node_health_incidents.py`). A node the product is rebooting (RESTART_NODE
 dispatched, the RESTORE_SCHEDULING behind it not done) has every finding absorbed into the reboot's record
 (`orchestration/reboot_window.py`: the event is linked and the marker re-pointed, the label is kept) -- a lost GPU's
-reboot is a `NODE_HEALTH` record, a fault family's own record may be `XID`. The peer look took only records the
-activation minted and grouped records, so such a node counted in its own look only: when it reported first and its peer
-after it, a two-node outage of one export formed no record, and the safety net named it `none open`. Every record with a
-workflow is now judged on the markers re-pointed at it (an activation's own `NODE_HEALTH` chain and a record without a
+reboot is a `NODE_HEALTH` record, a fault family's own record may be `XID`. Were the peer look to take only records the
+activation minted and grouped records, such a node would count in its own look only: when it reported first and its peer
+after it, a two-node outage of one export would form no record and the safety net would name it `none open`. So every record
+with a workflow is judged on the markers re-pointed at it (an activation's own `NODE_HEALTH` chain and a record without a
 workflow cost no read, every other open record one indexed read), so the same record forms whichever node reports first;
 the node counts once, the reboot keeps its plan, progress and state, and the node gets no chain of its own beside it
-(b215, `tests/host_health/test_rebooting_member_failure_domain.py`). A member's per-node record may also have
+(`tests/host_health/test_rebooting_member_failure_domain.py`). A member's per-node record may also have
 closed already: a shared-storage activation's own chain does not wait for the export -- VALIDATE_HOST reads the gauge,
 finds the export still unavailable and fails, and a failed chain that never touched the node closes its record
-`RECOVERED` "diagnostic inconclusive" (`execution/terminal_state.py`), live 1-2 s after the record was created. Each
-node finds the outage on its own collector tick, so the peer's activation lands up to one tick (15 s) later, mostly
-after the first node's record has closed: plain EKS on 2026-10-28, records 2.5 s apart on the node clocks, the first
-closed 0.8 s before the second was created, no domain record; HyperPod on 2026-10-27, 3.4 s apart, closed 1.8 s
-before, no record either (the HyperPod pass that evening had its two activations 0.7 s apart, inside the first chain's
-run). The peer look took only open records, so the node that reported first was never a peer although its latest
-reading still said "unavailable" -- and its latest reading, not its record's state, is the evidence. The peer look,
-the safety net and the member-incident lookup now also take a `RECOVERED` record an activation minted that closed
+`RECOVERED` "diagnostic inconclusive" (`execution/terminal_state.py`), typically a second or two after the record was created.
+Each node finds the outage on its own collector tick, so the peer's activation lands up to one tick (15 s) later, mostly
+after the first node's record has closed. Were the peer look to take only open records, the node that reported first would
+never be a peer although its latest reading still said "unavailable" -- and its latest reading, not its record's state, is the
+evidence. So the peer look, the safety net and the member-incident lookup also take a `RECOVERED` record an activation minted that closed
 inside the window (one read of the cluster's newest 200 `RECOVERED` records, `updated_at` against the control-plane
 clock that stamped it; no marker is read for a record that is not an activation's), and the node's latest reading
 decides as for an open record; the look after the commit counts the record this very activation was linked to
 whatever its state; the back-reference is written on the closed record as on an open one (its state, action and
-chain stay as they are) (b216, `tests/host_health/test_closed_member_failure_domain.py`). The whole domain mails once
+chain stay as they are) (`tests/host_health/test_closed_member_failure_domain.py`). The whole domain mails once
 (`SHARED_STORAGE_FAILURE_DOMAIN`, deduplicated
 per cluster/export/record id); a node that joins later is added to `node_ids` and `reasons` without another mail. The
 export identity comes from the collector's sample label `source` (the mountinfo mount source, e.g. `10.0.0.5:/export`,
@@ -3811,9 +3806,7 @@ window, or no reading at all) → `ESCALATED` (silence is not recovery; the oper
 from the silent node later still closes it `RECOVERED`). Concurrent activations for one export do not see each other:
 the batches of one outage land seconds apart on separate replicas and each is ingested in its own transaction (one
 advisory lock per cluster/node/batch, READ COMMITTED), so the look inside the transaction (`observe_finding`) finds
-only peers that had already committed. (The HyperPod miss this was first written for -- per-node incidents 3.4 s
-apart, no record -- was a closed member, see above: the first record had closed before the second activation was
-ingested, the transactions never overlapped.) The correlation therefore looks twice: once inside the transaction and once more after the batch's own commit (`observe_committed`, called from the
+only peers that had already committed. The correlation therefore looks twice: once inside the transaction and once more after the batch's own commit (`observe_committed`, called from the
 finish half of host ingestion), so whichever of two concurrent activations commits last sees the other; identical
 member sets derive identical record ids and the notification is deduplicated per record, so two late looks converge on
 one record and one mail. The per-batch safety net (every later "still unavailable" sample inside the window re-checks
@@ -3835,10 +3828,10 @@ workflow), `BLOCKED_MISSING_EVIDENCE` (missing evidence), `NOT_APPLICABLE` (not 
 | → `DETECTED` | Event passes admission, decision completes, marker written | Create incident, `incident_by_event` link, send investigation-class notification | Incident persisted | Link conflict → decision `duplicate=true`, no new incident |
 | `DETECTED` → `DETECTED` | Correlation window not yet finalized (`companionWindowSeconds: 30`) | Companion events merge into the same incident, `reasons` accumulate | `xid_correlation.status=FINALIZED` | When the window `deadline` is reached the `gpu-fault-xid-correlation` thread force-finalizes; the lease guarantees a single finalize |
 | `DETECTED` → `ACTION_PENDING` | `disposition=EXECUTABLE` | Build `RecoveryPlan` + `WorkflowRequest`, issue fencing token | Workflow persisted with `status=PENDING` | Cannot be built (missing capability) → `BLOCKED` when the first step is unowned or any other refusal stands (UNKNOWN workload, missing profile); refused **only** for a missing executable owner with a compiled containment prefix → `SAFETY_PENDING` (next row) |
-| `DETECTED` → `SAFETY_PENDING` | `disposition=SITE_SAFETY` or `blocked_reasons` non-empty (the fault family's fixed safety steps; since 2026-10-26 the node-health and node-lifecycle families too: when a plan is refused **only** for `no executable owner for <capability>` and an isolation compiled before the first unowned step, `safety_steps` = that prefix's FREEZE_EVIDENCE / MARK_UNSCHEDULABLE / QUARANTINE / COLLECT_DIAGNOSTIC_BUNDLE / TRIGGER_HEALTH_SNAPSHOT, `WorkflowBuilder.containment_before_block`; STOP_WORKLOADS is never in the prefix) | Execute only `safety_steps` | Safety steps complete → workflow `BLOCKED/SAFETY_SETTLED`, incident `QUARANTINED`; the missing-owner shape also writes "contained + which capability waits for an operator" into the incident `reasons` and sends `contained-operator-handoff-zh-v1` | Failure → `ESCALATED` |
+| `DETECTED` → `SAFETY_PENDING` | `disposition=SITE_SAFETY` or `blocked_reasons` non-empty (the fault family's fixed safety steps; the node-health and node-lifecycle families too: when a plan is refused **only** for `no executable owner for <capability>` and an isolation compiled before the first unowned step, `safety_steps` = that prefix's FREEZE_EVIDENCE / MARK_UNSCHEDULABLE / QUARANTINE / COLLECT_DIAGNOSTIC_BUNDLE / TRIGGER_HEALTH_SNAPSHOT, `WorkflowBuilder.containment_before_block`; STOP_WORKLOADS is never in the prefix) | Execute only `safety_steps` | Safety steps complete → workflow `BLOCKED/SAFETY_SETTLED`, incident `QUARANTINED`; the missing-owner shape also writes "contained + which capability waits for an operator" into the incident `reasons` and sends `contained-operator-handoff-zh-v1` | Failure → `ESCALATED` |
 | `DETECTED` → `RECOVERED` | `MONITOR_ONLY` / `NOT_APPLICABLE` | Only write marker and notification, leave the node untouched | Marker persisted | — |
 | `ACTION_PENDING` → `QUARANTINED` | Plan contains `MARK_UNSCHEDULABLE` / `QUARANTINE` | One patch writes: `unschedulable=true`, the `gpu-fault.io/quarantined=incident-<sha256[:24]>` taint, and the three ownership annotations (see §9.4); then `STOP_WORKLOADS` | Node `unschedulable=true` and taint present | `resourceVersion` conflict retried; RBAC 403 → step `FAILED` |
-| `ACTION_PENDING` / `QUARANTINED` → `RECOVERED` | All steps `SUCCEEDED`, and the `VALIDATE_*` conclusion is PASS (the inventory requirement of `VALIDATE_GPU`/`VALIDATE_FABRIC` is frozen from the finding's configured value; at check time it is capped at the physical count from the instance-type list and `inventory_requirement_clamped` is recorded: a configured value above the physical ceiling is a configuration error and must not turn into a replace/support escalation chain) | `RESTORE_SCHEDULING`: after verifying ownership, one patch clears the taint + restores `unschedulable` to the value recorded before isolation + clears the three annotations; marker set to `active=false`. A workflow containing only evidence/diagnostics/validation (no isolation) likewise leaves the incident RECOVERED on success, and the executor's terminal hook `IncidentClosureService.on_terminal` immediately retires its marker (`retired_at/retired_reason/retired_by`, ARCH-I4) instead of leaving it to the TTL | Node has no `gpu-fault.io/quarantined` taint and scheduling state is back to pre-isolation | Validation conclusion `INCONCLUSIVE`/`BLOCKED`/`QUARANTINED` → **not released**, stays in `QUARANTINED` |
+| `ACTION_PENDING` / `QUARANTINED` → `RECOVERED` | All steps `SUCCEEDED`, and the `VALIDATE_*` conclusion is PASS (the inventory requirement of `VALIDATE_GPU`/`VALIDATE_FABRIC` is frozen from the finding's configured value; at check time it is capped at the physical count from the instance-type list and `inventory_requirement_clamped` is recorded: a configured value above the physical ceiling is a configuration error and must not turn into a replace/support escalation chain) | `RESTORE_SCHEDULING`: after verifying ownership, one patch clears the taint + restores `unschedulable` to the value recorded before isolation + clears the three annotations; marker set to `active=false`. A workflow containing only evidence/diagnostics/validation (no isolation) likewise leaves the incident RECOVERED on success, and the executor's terminal hook `IncidentClosureService.on_terminal` immediately retires its marker (`retired_at/retired_reason/retired_by`) instead of leaving it to the TTL | Node has no `gpu-fault.io/quarantined` taint and scheduling state is back to pre-isolation | Validation conclusion `INCONCLUSIVE`/`BLOCKED`/`QUARANTINED` → **not released**, stays in `QUARANTINED` |
 | `ACTION_PENDING` → `RECOVERED` | `CHECK_MECHANICALS` receives the exact incident/fencing annotation | Complete the manual inspection step; this workflow itself neither cordons nor stops workloads | Annotation exactly matches the current incident/fencing | Stays `WAITING` until confirmed |
 | Any → `ESCALATED` | `ESCALATE_SUPPORT`, or the escalation ladder reaches the top after repair/validation failure | Send hardware escalation notification (with synthetic ticket number); existing isolation stays unchanged | Notification persisted | Notification failure retried; isolation **not lifted** |
 | workflow `PENDING` → `RUNNING` | Execution lease acquired (`execution_owner_id` + `execution_epoch`), `not_before` has passed, fleet consistency gate passed | Execute steps in order | Lease renewal succeeds | Lease not renewed for 180s → taken over, epoch+1 |
@@ -3880,7 +3873,7 @@ periodic-task lease), so "two replicas each send a mail" and "each finalizes the
 | Action validity | 900s | Expired actions are not executed; when the event boot_id matches the Agent's, only an annotation is recorded, no blocking |
 | after_incident restart wait | Lifetime of the repair workflow (fallback 240s) | Keeps waiting while the repair is still open; on expiry `NODE_REMEDIATION_TIMEOUT` |
 | Per-step wait for reinstall steps | 1900s | `GPU_FAULT_WORKFLOW_INSTALL_STEP_TIMEOUT_SECONDS`, only for `REMEDIATE_DRIVER` / `UPDATE_SOFTWARE_FIRMWARE` / `REMEDIATE_EFA_DRIVER`; on expiry that step fails |
-| Per-step wait for steps that may start Fabric Manager | 1200s (the Agent's 780s start/restart bound for `nvidia-fabricmanager` + 420s for the rest of a restore) | Only for `RESTORE_GPU_SERVICES` / `RESTART_FABRIC_MANAGER`; never below the default step cap, never above the node workflow lifetime (it follows DESTR-018's compressed window); on expiry that step fails |
+| Per-step wait for steps that may start Fabric Manager | 1200s (the Agent's 780s start/restart bound for `nvidia-fabricmanager` + 420s for the rest of a restore) | Only for `RESTORE_GPU_SERVICES` / `RESTART_FABRIC_MANAGER`; never below the default step cap, never above the node workflow lifetime (it shrinks with a compressed lifetime); on expiry that step fails |
 | Execution deadline floor for workflows containing reinstall steps | 1900s + 600s (`GPU_FAULT_WORKFLOW_INSTALL_CONTAINMENT_SECONDS`, 0 allowed), not exceeding the lifetime | Raises the execution deadline only on the stamped claim (DAG re-stamps on every claim), leaving the lifetime untouched; the startup check rejects "reinstall ceiling ≤ lifetime < floor", and the error string names the three variables; sites whose active nodes run `STOP_WORKLOADS` first should raise the margin |
 | Agent install subprocess | 1800s | Result unknown, handed to the operator (§3.1 ⑦) |
 | Correlation window | 30s | Forced finalize |
@@ -3891,7 +3884,8 @@ periodic-task lease), so "two replicas each send a mail" and "each finalizes the
 ## 7. Key Sequences
 
 The first eight diagrams correspond to the eight scenarios in the recommendation column; §7.9 adds the role interaction for the passive training terminal state.
-Every arrow in the diagrams is a real call or a real state write, not a conceptual sketch.
+Every arrow in the diagrams is a real call or a real state write, not a conceptual sketch; the one omission is node actions (D→A): in the regional
+deployment the cluster executor claims the remote command and forwards it to the Node Agent as a signed command (§3.9), a hop the diagrams leave out.
 
 ### 7.1 General Alert: No Isolation
 
@@ -3984,27 +3978,31 @@ across boots are replayed when the Agent starts (§3.1 ⑪)
 sequenceDiagram
     autonumber
     participant D as workflow dispatcher
+    participant Ex as cluster executor
+    participant P as provider (HyperPod / EC2)
     participant A as node agent
     participant Nd as node OS
 
-    D->>A: RESTART_NODE(command_id, fencing_token)
-    A->>A: ledger writes PENDING
-    A->>Nd: reboot
-    Note over D,A: connection lost. The Agent returns no result; the control plane sees a timeout
-    D->>D: step stays WAITING, lease renewal continues
-    Nd->>A: boot, systemd starts node-agent (agent_generation+1)
-    A->>A: command_id in the ledger is still PENDING → mark INTERRUPTED
-    D->>A: re-submit the same command_id (idempotent replay)
-    A-->>D: NodeActionResult INTERRUPTED + new agent_generation
-    D->>D: rule "restart has happened", wait 60s stabilisation period
+    D->>Ex: remote command RESTART_NODE(fencing_token)
+    Ex->>Ex: record baselines: the Agent's boot_id and agent_incarnation_id, the provider node
+    Ex->>P: BatchRebootClusterNodes / RebootInstances<br/>(the submission record lives on the control plane, one submission per step)
+    P->>Nd: reboot
+    Note over Ex,A: node unreachable; the command answers WAITING, the step stays WAITING, the lease keeps renewing
+    Nd->>A: boot, systemd starts node-agent, its heartbeat carries a new boot_id / incarnation (agent_generation+1)
+    Ex->>Ex: every poll confirms: Agent ACTIVE with boot_id and incarnation both different from the baseline, provider reports Running
+    Ex->>Ex: 60s post-reboot stabilisation
+    Ex->>A: TRIGGER_HEALTH_SNAPSHOT (post-reboot)
+    Ex-->>D: SUCCEEDED (externally_confirmed, confirmation_source)
     D->>A: VALIDATE_HOST / VALIDATE_GPU
     A-->>D: PASS → incident RECOVERED
 ```
 
-Figure 7-4 The outcome of a restart is answered by the ledger, not by whether the connection was kept
+Figure 7-4 A reboot does not go through the Node Agent: its outcome is answered by the pre-submit baselines against the Agent heartbeat and
+provider state after the reboot, not by whether the connection was kept (`adapters/hyperpod/confirmation.py`; submission idempotency lives on the
+control plane in `RegionalHyperPodSubmissionStore`, because the executor Pod that submits a reboot is often the one it restarts)
 
 The diagram above holds only for a reboot that `RESTART_NODE` **itself initiated**: the reboot is the expected result of that step,
-the control plane re-submits with the same `command_id` and rules "already rebooted" from the ledger. A node that is **rebooted from outside the system
+and the executor rules "already rebooted" from the baselines it recorded before submitting. A node that is **rebooted from outside the system
 within the maintenance window** (an operator's manual reboot, a kernel panic, DESTR-017's out-of-band `systemctl reboot`) takes
 a different path and the diagram above must not be applied to it:
 
@@ -4022,11 +4020,12 @@ a different path and the diagram above must not be applied to it:
   fixes their `command_id` to `<key>/<node>` (without the `agent-N` suffix); the request body still carries the live generation;
   after an Agent restart the re-submission hits the INTERRUPTED row in the ledger → FAILED with `manual_confirmation_required`,
   and if it had already SUCCEEDED before the restart the result is read back directly and never executed a second time. Diagnostic operations, QUIESCE and RESTART_FABRIC_MANAGER
-  keep the generation suffix. Compatibility during the upgrade transition: the Agent ledger may still hold old-format rows written by the previous control-plane version,
+  keep the generation suffix. Compatibility with old-format ledger rows: the Agent ledger may still hold old-format rows written by the previous control-plane version,
   `<key>/<node>/agent-N`; when the new control plane gets a 404 looking up the stable id it first reads back the old id pointer in the step record (exact),
   then reads back `<key>/<node>/agent-<current generation>`; if in flight it waits, if a result exists it folds it in, and only when both are 404 does it actually submit;
   the read-back also scans the old id pointers in every record of that step and carries them to the next
-  record via `node_action_legacy_command_ids`, so a single transient transport error overwriting the pointer does not lose it. This read-back code is annotated "delete after one release cycle" (2026-09-09).
+  record via `node_action_legacy_command_ids`, so a single transient transport error overwriting the pointer does not lose it. This read-back is kept for one release or the ledger retention
+  window, whichever is longer (`adapters/node_action/transport.py`).
   The per-step wait ceiling for these three steps is `GPU_FAULT_WORKFLOW_INSTALL_STEP_TIMEOUT_SECONDS` (default 1900 s),
   not the general 600 s; for a workflow containing these three steps the execution deadline is raised, on the claim that stamps it, to a floor of
   "1900 + `GPU_FAULT_WORKFLOW_INSTALL_CONTAINMENT_SECONDS` (default 600, 0 allowed)" (default 2500 s),
@@ -4035,7 +4034,7 @@ a different path and the diagram above must not be applied to it:
   (`INSTALL_TIMEOUT_SECONDS` in `gpu_fault.node_agent.operations.remediation`): killed on timeout, or the post-install
   verification probe cannot run → FAILED, `retryable=false`, `outcome_unknown` + `manual_confirmation_required`;
   when folding, the control plane writes the flags together with `failed_nodes`/`node_failures` into the step record and hands off to the operator under the unknown-outcome rule in `orchestration/escalation.py`
-  (the step-level REBOOT request of `REMEDIATE_EFA_DRIVER` also no longer takes effect); a failure before the installer starts
+  (the step-level REBOOT request of `REMEDIATE_EFA_DRIVER` does not take effect either); a failure before the installer starts
   is still retryable, and a clean non-zero exit is a definite failure. The read-back of the stable id is **one-way**: after a rollback to the old control plane the old code
   still derives suffixed ids and does not read back, so as long as a single reinstall step is in flight in the region, **the release tool refuses** to open a transaction:
   `upgrade_release` (new transactions, resume and supersede all enter here) and `rollback_release` each read the control-plane store once after the Aurora credential refresh and
@@ -4071,7 +4070,7 @@ a different path and the diagram above must not be applied to it:
 - When a rollback restores the GPU plane, the executor pin preflight compares against **the previous version's own pin window** (the
   `metadata` in the previous snapshot), not the live `gpu-fault-release-metadata`: cpu-finalize has already promoted the live window to the candidate, and if a transaction that fails after that
   checked the old executor artifact against the live window, the rollback would be refused at its first step with "regional executor artifact mismatch" and
-  the transaction would stop in `rollback-failed`. When the snapshot has no window, the check still uses the live window (fail-closed, as before).
+  the transaction would stop in `rollback-failed`. When the snapshot has no window, the check still uses the live window (fail-closed).
   Control-plane Pods judge the executor by the window injected at start-up (`gpu-fault-release-metadata` → env), so rolling back
   the executor, like rolling back the Agent, must first do controller staging (`needs_controller`: the rollback components of any cluster include
   AGENT or EXECUTOR), re-rolling the control plane under the previous version's window before restoring the data plane; otherwise the old executor Pods are
@@ -4085,7 +4084,7 @@ a different path and the diagram above must not be applied to it:
 
 For live acceptance see `GF-REGIONAL-DESTR-017`.
 
-The dual behaviour on the loss-of-contact side: once the heartbeat exceeds 90s, **no destructive step is issued any more**; events on the collector side
+The dual behaviour on the loss-of-contact side: once the heartbeat exceeds 90s, **no destructive step is issued**; events on the collector side
 queue in the outbox and are submitted late in on-disk order once the node recovers.
 
 ### 7.5 Proactive Diagnostic Failure
@@ -4136,7 +4135,7 @@ Figure 7-6 Resumption relies on `completed_step_indexes` + `command_id` idempote
 
 ### 7.7 Manual Intervention: The Real Shape of Pause, "Approve" and Cancel
 
-**The implementation has no approve / cancel / pause endpoints** (§8.6, §11). The real means of manual intervention are three,
+**The implementation has no approve / cancel / pause endpoints** (§8.7, §11). The real means of manual intervention are three,
 and the diagram below shows how they actually happen:
 
 ```mermaid
@@ -4390,11 +4389,11 @@ is judged (`run_once` skips a registration whose `is_active` is false, as it ski
 lifecycle is a `join-cluster` (`PENDING`/`FAILED`/`ROLLED_BACK`), a `remove-cluster` or an `uninstall`
 (`DRAINING`/`REVOKED`) under way, which owns the records -- from the drain on the Executor's node report is refused
 with 423 (`regional_cluster_request_allowed`) and, once the removal stops the node runtime, every lease lapses while
-the node is still there, so judging it reported every node departed (live 2026-11-04: an "operator action needed"
-mail for every node of a removed cluster). Such a cluster gets no new ledger line, no notification, no refusal count and no
+the node is still there, so judging it would report every node departed and send an "operator action needed"
+mail for every node of a removed cluster. Such a cluster gets no new ledger line, no notification, no refusal count and no
 provider read; its existing lines stay as they are, are judged again once it is `ACTIVE` and are deleted by `_prune`
-with the registration (`tests/departed_nodes/test_departed_node_cleanup_membership.py`). The former
-`CLUSTER_NOT_ACTIVE` reason is gone with it. A spare's records end as usual and its declaration on the deploy host is only reported (`DECLARED_SPARE`,
+with the registration (`tests/departed_nodes/test_departed_node_cleanup_membership.py`), so there is no "cluster not
+active" refusal reason either. A spare's records end as usual and its declaration on the deploy host is only reported (`DECLARED_SPARE`,
 which once seen stays with the departure by its instance): `config spare --release` releases only the record of a
 provably departed node (`admin/warm_spare_departed.py`, skipping the unlabel and uncordon that need the Node and saying
 why) and writes a `DepartedNodeSpareRelease` in the Pod (a generic `gpu_fault_objects` kind written by the administrator
