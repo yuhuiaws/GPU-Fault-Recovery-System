@@ -43,7 +43,7 @@ Agent endpoint CIDR 取 GPU 节点组子网；`NodeRecovery` 门禁的对应项�
 `release-deploy/profile-plan.json`（`change_kind: CLUSTER_PROFILE_NEW`）审批：`join-cluster --approve-profile-plan
 <sha> --reference <CHG>`；审批消费后写入不可变快照 `profiles/<version>.yaml`，同 provider 的后续集群复用。
 批量 join（多个 `--gpu-cluster-arn`、`deploy --gpu-cluster-arn`）与单集群 join 同样审核；同一版本只出一份计划，列出需要它的全部集群，release 比较已注册版本时不比较注册锚点（`cluster_id`），见 [Runtime Profile 变更审批](../管理员Profile变更审批.md) §1.2。
-release 注册每个在用版本，按集群渲染 Executor/Watcher/Reconciler/安装器的版本 pin 与 Agent 配置摘要；
+release 注册每个在用版本，按集群渲染 node-resource collector（`GPU_FAULT_RUNTIME_PROFILE_VERSION`）与 Reconciler/安装器（`GPU_FAULT_RUNTIME_PROFILE`）的版本 pin 和 Agent 配置摘要（Executor/Watcher 不带 profile pin）；
 注册表条目携带 `runtime_profile_version`/`agent_config_digest`（等于站点缺省时不进入摘要）；控制面
 `FleetRegistry.cluster_policy` 按集群核对 Agent，`GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION` 仍是站点缺省；
 首次 `deploy` 的 GPU 集群仍须同一 provider。
@@ -74,22 +74,24 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
   注解 `gpu-fault.io/dcgm-hostengine: host`，显式容忍与其余 eks 渲染不变，plan 对应 `dcgm_eks_managed_host`；embedded 变体同样带注解（值 `embedded`），HyperPod 清单不带。
   模式变化是 release diff 输入 `dcgm_hostengines`：规划 DCGM + reconciler + Agent（`DATA_PLANE_COMPATIBLE`），exporter 重新应用、
   该集群的 Agent 分波重装（reconciler 节点注解 `gpu-fault.io/installer-dcgm-hostengine=host`），变更前的节点预检先核对主机 hostengine。
-  `status --full` 的 `node_scope.dcgm_hostengine`/`dcgm_hostengine_source`/`dcgm_hostengine_pending_nodes` 与 `node-scope` 的
-  `dcgm_hostengine` 显示模式、来源与待重装的节点。源码不变的 deploy 也在 NOOP 捷径之前用同一套发现读取重读标签，声明与
-  记录不同就改走应用发布，混合声明在任何变更之前拒绝；`status`（快速与 `--full`）与 `node-scope` 把尚未发布的声明显示为
-  `next deploy: DATA_PLANE_COMPATIBLE (dcgm_hostengine: <集群> declared host, recorded embedded)`。exporter 或 reconciler 实际运行的
+  `status --full` 的 `node_scope.dcgm_hostengine`/`dcgm_hostengine_source`/`dcgm_hostengine_pending_nodes` 显示模式、来源与待重装的
+  节点，`node-scope` 的 `dcgm_hostengine` 显示模式与来源。源码不变的 deploy 也在 NOOP 捷径之前用同一套发现读取重读标签，声明与
+  记录不同就改走应用发布，混合声明在任何变更之前拒绝；`status`（快速与 `--full`）把尚未发布的声明显示为
+  `next deploy: DATA_PLANE_COMPATIBLE (dcgm_hostengine: <集群> declared host, recorded embedded)`，`node-scope` 的 `dcgm_hostengine`
+  记 `state: pending deploy` 与 `next_deploy`（`status --full` 另有按 Agent 心跳的 `dcgm_hostengine_live`）。exporter 或 reconciler 实际运行的
   模式（DaemonSet 注解/环境，reconciler 的 `GPU_FAULT_DCGM_HOSTENGINE`）与记录不同为 release diff 输入 `dcgm_hostengine_drift`，同样
   规划 DCGM + reconciler + Agent，`status --full`/verify 的 `gpu_cluster:<id>` 检查对这种不一致判失败（`node_scope.dcgm_hostengine_served`）；
   被拒绝并回滚的发布由回滚对齐把记录恢复为实际运行的模式，`sync-state` 按 exporter 实际运行的模式记录摘要，节点预检的拒绝
-  逐节点列出完整原因并记下每个节点的 DCGM 状态。
+  逐节点列出原因（每节点一行至多 600 字符、至多 50 个节点）并记下每个节点的 DCGM 状态。
 - 节点 collector 从 exporter HTTP 取 DCGM 指标，不依赖 dcgmi；节点 agent 的快速 DCGM 诊断（`dcgmi diag -r 1 -j`）在 embedded 模式下
   对无 dcgmi 或连不上 hostengine 记配置性 `WARN`（`DCGM_TOOL_UNAVAILABLE`/`DCGM_HOSTENGINE_UNAVAILABLE`，不排空）；host 模式下
   （Agent 环境 `GPU_FAULT_DCGM_HOSTENGINE=host`，只写入 eks-managed 节点、不进 config digest）给出真实判定，缺 dcgmi 或连不上主机
-  hostengine 按 HyperPod 判 FAIL/`DCGM_EXECUTION_REVIEW`（`DRAIN_AND_QUARANTINE`）；判定前若 enabled 的 `nvidia-dcgm` 停着
-  （inactive/failed）或正在启动，Agent 先做一次有界恢复（`systemctl reset-failed` + `start`，等 `dcgmi discovery -l` 应答至多 30 s；
-  quiesce 窗口内不做，从不安装软件包）再诊断一次（`node_agent/operations/hostengine_recovery.py`，HyperPod 节点同样）。
-- 数据面 Deployment（executor、watcher、reconciler、node-resource collector、ADOT）不钉节点、不容忍 GPU 污点，
-  落在 CPU 节点。
+  hostengine 都判 FAIL/`DCGM_EXECUTION_REVIEW`（`DRAIN_AND_QUARANTINE`）——连不上 hostengine 与 HyperPod 相同，HyperPod 上缺 dcgmi
+  仍只记配置性 `WARN`；判定前若 `nvidia-dcgm` 停着或正在启动，Agent 先做一次有界恢复（`inactive`/`failed` 且已启用时
+  `systemctl start`，`failed` 先 `reset-failed`；`activating` 只等待；30 s 内 `dcgmi discovery -l` 应答才再诊断一次；quiesce 窗口内
+  不做，从不安装软件包；`node_agent/operations/hostengine_recovery.py`，HyperPod 节点同样）。
+- 数据面 Deployment（executor、watcher、reconciler、node-resource collector、ADOT）不钉节点、不容忍 GPU 污点：GPU 节点组带
+  `nvidia.com/gpu` 等 NoSchedule 污点时落在 CPU 节点；GPU 节点组不带污点时它们可能被调度到 GPU 节点（产品不强制）。
 - 节点预检 Job 在 `chroot /host` 核对主机前置并一次列全缺失项（`ERROR: host prerequisites unavailable: ...`
   + JSON 判定）；AL2023 需 launch template 安装 `python3.12 strace`（管理员日常运维 §5.0.1）；host 模式另需 `dcgmi`、
   `nv-hostengine`、active 的 `nvidia-dcgm` 与成功的 `timeout 30 dcgmi discovery -l`，同一条判定里列出。预检把每个节点的 DCGM 状态
@@ -97,17 +99,19 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
   只接受 `host-active`，embedded 模式拒绝与内嵌 hostengine 并存（运行中、active/activating 或 enabled）的主机 hostengine
   （`ERROR: DCGM host engine conflict: ...`）；HyperPod 节点始终按 host 模式核对（`dcgmi`、`nv-hostengine`、active 的 `nvidia-dcgm`、
   `dcgmi discovery -l` 缺一即拒绝，CUDA 不符与外来 nv-hostengine 只记 `WARN`）；最近一次预检的逐节点状态记入 release state `node_dcgm_hostengine`，`status --full` 显示为
-  `node_scope.dcgm_hostengine_nodes`/`dcgm_hostengine_conflict_nodes`。Agent 始终按集群声明的模式判定。
-- Node Action key：所有节点清单读取都用集群选择器（含 CPU 镜像守卫）。
+  `node_scope.dcgm_hostengine_nodes`/`dcgm_hostengine_conflict_nodes`。Agent 始终按安装时写入的模式判定（`GPU_FAULT_DCGM_HOSTENGINE`，
+  即最近一次发布记录的模式）。
+- Node Action key：所有节点清单读取都用集群选择器（含同步 CPU 侧副本 Secret 时的节点清单复核）。
 
 ### 2.6 join 的可恢复性与诊断
-- `allowedNamespaces` 缺省为站点现有集群共用的列表、不再强加 `training`；join 在首次读取 GPU 集群时核对每个
-  工作负载命名空间存在。
+- `allowedNamespaces` 缺省为站点现有集群共用的列表（站点尚无集群或各集群列表不一致时为 `gpu-fault-system`/`training`，可用
+  `--allowed-namespace` 指定）；join 在首次读取 GPU 集群时核对每个工作负载命名空间存在。
 - 敏感命令失败保留脚本自己的 `ERROR:` 行（否则最后一行 stderr，打码）；admin 与 release 两个 runner 一致。
 - Runtime Profile 注册探针自述失败（HTTP 状态/30 s 无应答）并重试一次。
-- 回滚：从未装过节点运行时的集群其节点清理是"空的已证明目标集"（SKIPPED）；停在 PREFLIGHT 的清理日志在站点升级后
-  被留档并按当前 release 重新规划；`ROLLBACK_FAILED` 用同样参数重跑即可恢复并接着开始新 attempt。
-- 部署机门禁：测试影响选择与角色拆分渲染测试在部署的 deadline/API-budget 作用域内运行而不继承它。
+- 回滚：从未装过节点运行时的集群其节点清理是"空的已证明目标集"（SKIPPED）；停在 PREFLIGHT 的清理日志在每次回滚重跑时
+  被留档（改名为 `<name>.superseded-NNN.json`）并按当前 release 重新规划；`ROLLBACK_FAILED` 用同样参数重跑即可恢复并接着开始新 attempt。
+- 部署机门禁：测试影响选择所选的 pytest 与 PostgreSQL 压测不继承部署的 deadline/API-budget（`isolated_gate_environment`）；角色拆分
+  渲染测试在作用域内运行时保留该作用域（渲染的 `kubectl kustomize` 走预算 shim）。
 
 ### 2.7 quiesce 污点（仅 eks-managed）
 - 普通 EKS 节点的 quiesce 不停 kubelet，Agent 停掉的 GPU 客户端容器（产品自己的 exporter、device plugin、GFD）几秒内
@@ -121,7 +125,9 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
 - 污点的生命周期全部有出口：QUIESCE 的每个结果都记 `quiesce_taint_nodes`，FAILED 的 quiesce 当场摘掉；打了污点未完成的 QUIESCE 同样欠
   RESTORE_GPU_SERVICES 补偿；后继的 MARK_UNSCHEDULABLE 摘掉孤儿污点；RESTART_GPU_DEVICE_PLUGIN 在别人仍持有的污点下 WAITING 并点名、
   孤儿污点先摘；VALIDATE_GPU 的 pending 里写 `quiesce_taint_present`/`quiesce_taint_holders`；`--disposition restore` 对只剩本事件
-  quiesce 污点的节点只跑 RESTORE_SCHEDULING（`quiesce_taint_only`）。详见管理员日常运维 §5.0 与 §9.2。
+  quiesce 污点的节点只跑 RESTORE_SCHEDULING（`quiesce_taint_only`）；确认的 RESTART_NODE 摘掉节点全部 quiesce 污点
+  （`quiesce_taint_removed_nodes`，摘不掉只记 `quiesce_taint_error`，reboot 照样成功）；待定节点都带 `quiesce_taint_present` 且未观察到
+  失败的验证两条梯子都不升级（`validation_unobserved`）。详见管理员日常运维 §5.0 与 §9.2。
 - 排队后继的 plan 就地替换不再抬 fencing token（与 RUNNING 前驱共享世代），RUNNING 的 reset 链吸收自己的污点引起的 EFA/GPU
   allocatable 下降，被 executor 在派发前拒绝的步骤两条梯子都不升级；接管前驱隔离的判定走整条升级谱系
   （`escalation_descends_from`，`/executors/incident-ownership?successor_workflow_id=` 的 `escalation_lineage`），
@@ -130,8 +136,9 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
   （`released_kernel_modules`/`reloaded_kernel_modules`；卸载后 GPU 是冷的，只读 `nvidia-smi` 查询与装回的 modprobe 的
   上限都按节点 GPU 数放大（8 GPU 为 55 s 与 52 s）；装回以 `/proc/modules` 与 `/sys/class/drm` 核对——每张 GPU 的 DRM
   设备都须回来——缺失时暂停 5 s 重试一次，部分装载重试为 `rmmod nvidia_drm && modprobe nvidia_drm`，仍未装回
-  则 `display_stack_restored=false`，缺 DRM 设备的 GPU 记在 `display_drm_devices_missing`：reset 照样成功、不当 GPU 故障处理，GPU reset 完成通知的主题带
-  `[display stack not restored]` 并给出补救 `modprobe nvidia_drm` 或重启节点）；窗口保留的 `nvidia-persistenced`（只持有其余 GPU）与窗口保留的
+  则 `display_stack_restored=false`，缺 DRM 设备的 GPU 记在 `display_drm_devices_missing`：reset 照样成功、不当 GPU 故障处理，GPU reset 与 GPU/NVSwitch reset 完成通知的主题带
+  `[display stack not restored]`，正文给出 Agent 记录的补救：模块未装回时 `modprobe` 最外层被卸载的模块（通常 `nvidia_drm`），已装回但缺
+  DRM 设备时 `rmmod nvidia_drm && modprobe nvidia_drm`，或重启节点）；窗口保留的 `nvidia-persistenced`（只持有其余 GPU）与窗口保留的
   Fabric Manager（窗口的 `kept_services` 记着它，只持有 `/dev/nvidia-caps/*`/`/dev/nvidia-nvswitch*`/`/dev/nvidia-nvlink`）
   不阻止卸载，记在 `display_release_bystanders`（只豁免 Fabric Manager 本身：NVL5 上同一单元里的 `nvlsm` 若持有 NVIDIA
   设备节点仍算客户端，quiesce 也从不 signal 它），只读的 `nvidia-smi` 查询（无 `nvidia-uvm`、只持有 `/dev/nvidiaN` 与
@@ -146,7 +153,8 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
    管理员日常运维 §5.0.1）；节点组的 `updateConfig.updateStrategy` 为 `MINIMAL`（`DEFAULT` 滚动先多启动一台 GPU 实例、
    再终止一台；管理员日常运维 §5.0.1）；NVIDIA device plugin 与 EFA device plugin 运行；GPU 污点可有。
    `AL2023_x86_64_NVIDIA` 节点组可用 `gpu-fault-admin prepare-eks-nodegroup` 自动完成本条的 user data、node auto repair
-   与更新策略以及第 5 条的归属标签（默认只读计划，`--apply --confirm PREPARE_EKS_NODEGROUP --reference <CHG>` 执行并滚动节点组，
+   与更新策略以及第 5 条的归属标签（默认只读计划，`--apply --confirm PREPARE_EKS_NODEGROUP --reference <CHG>`（另需 `--state-dir`
+   或 `--work-dir`）执行，托管 user data 变化时滚动节点组，
    `--dcgm-hostengine host` 另装第 7 条的主机 DCGM；管理员日常运维 §5.0.1a）。
 2. 命名空间：`allowedNamespaces` 里的工作负载命名空间（缺省站点列表，如 `training`）必须已存在，或用
    `--allowed-namespace` 指定存在的列表。
@@ -156,7 +164,7 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
    `eks-v1` 快照已登记另一份策略时为 `regional-eks-<digest12>`）。
 5. 归属标签：`gpu-fault-admin site-id --cpu-cluster-arn <CPU ARN>` 打印站点 ID，
    `aws eks update-nodegroup-config --cluster-name <eks> --nodegroup-name <ng> --labels addOrUpdateLabels={gpu-fault.io/control-plane=<站点ID>}`
-   给 GPU 节点组加标签（HyperPod：`update-cluster` 的 `KubernetesConfig.Labels`；Karpenter：NodePool 模板标签）；
+   给 GPU 节点组加标签（HyperPod：`update-cluster` 的 `KubernetesConfig.Labels`；Karpenter：NodePool 模板标签；普通 EKS 集群至少要有一个带标签的托管节点组，发现只读托管节点组）；
    命令：`gpu-fault-admin join-cluster --state-dir <dir> --gpu-cluster-arn <eks arn>`（只需要 ARN）。
    注销即释放：`remove-cluster`/`uninstall` 的最后一步 `OWNERSHIP_RELEASED` 用
    `aws eks update-nodegroup-config --cluster-name <eks> --nodegroup-name <ng> --labels removeLabels=gpu-fault.io/control-plane`
@@ -166,7 +174,7 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
    报 finding（重新接入的同一集群是成员，不报）；重新接入前按 `site-id` 打印的命令重新加标签（管理员日常运维 §5.0.0 "释放"行）。
 6. 第三方 GPU 客户端 DaemonSet（客户自己的 dcgm-exporter、GPU feature discovery、监控 agent 等）**不得容忍**
    `gpu-fault.io/quiesce`（不要用无 key 的 `operator: Exists` 通配容忍；按 key 列出 `nvidia.com/gpu` 等即可），并须容忍在
-   quiesce 窗口内被停止/驱逐；NVIDIA device plugin 与 GFD 的默认清单只容忍 `nvidia.com/gpu`，无需改动。
+   quiesce 窗口内被停止/驱逐；NVIDIA device plugin 与 GFD 的默认清单不带无 key 通配容忍、不容忍 `gpu-fault.io/quiesce`，无需改动。
 7. 主机 DCGM（可选，真实的 `dcgmi diag` 判定）：launch template 固定版本安装 `datacenter-gpu-manager-4-core-<ver>` 与
    `datacenter-gpu-manager-4-cuda<CUDA 主版本>-<ver>`（主版本与 `nvidia-smi` 的 "CUDA Version" 一致），写入 `Restart=on-failure` 的 drop-in
    `nvidia-dcgm.service.d/90-gpu-fault-restart.conf`（软件包单元的 `Restart=on-abort` 让一次非零退出或一轮崩溃循环永久停着）并
@@ -174,17 +182,21 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
    在节点上用 `dcgmi discovery -l`、`dcgmi diag -r 1` 确认，给该集群的**每个** GPU 节点组加 `gpu-fault.io/dcgm-hostengine=host`
    （`prepare-eks-nodegroup --dcgm-hostengine host [--dcgm-version <版本>-<build>]` 一并写入 user data、启用单元并加标签，
    缺省版本为 exporter 配对的 `4.6.1-1`），随即
-   deploy/join（源码不变也照样 deploy，它会重读标签；之前 `status` 显示待生效的 `next deploy`；启用而不加标签的 deploy 会被
-   embedded 冲突检查拒绝）；退出时摘标签、把 `nvidia-dcgm` 从 launch template 拿掉并在节点上
+   deploy/join（源码不变也照样 deploy，它会重读标签；之前 `status` 显示待生效的 `next deploy`；启用而不加标签时 `status` 按 Agent 心跳报
+   `DCGM host engine next to the embedded one on <集群>`，下一次规划 reconciler/Agent 的发布（含 join）在变更前的节点预检被 embedded
+   冲突检查拒绝，源码与标签都不变的 deploy 不做节点预检）；退出时摘标签、把 `nvidia-dcgm` 从 launch template 拿掉并在节点上
    `systemctl disable --now nvidia-dcgm`，再立即 deploy（次序与命令见管理员日常运维 §5.0.1「主机 DCGM」）。
 8. 自动节点更新：托管节点组没有计划更新，但 Karpenter NodePool 的 `expireAfter`（默认 720h）、drift 与 consolidation、
    EKS Auto Mode 节点池、ASG `MaxInstanceLifetime` 和按计划调用 `UpdateNodegroupVersion` 的自动化都会替换 GPU 节点：
    NodePool 设 `expireAfter: Never` 并加 `nodes: "0"` 预算，`MaxInstanceLifetime` 保持未设置，自动化移到维护窗口；Spot 节点组的
-   Capacity Rebalance 由 EKS 开启，按替换节点的接入窗口处理。`status --full`/`node-scope` 记录并提示（不拒绝），操作者身份需
+   Capacity Rebalance 由 EKS 开启，按替换节点的接入窗口处理。`status --full`/`node-scope` 记录并提示（不拒绝）带本站点标签的 Karpenter NodePool 与设了
+   `MaxInstanceLifetime` 的 ASG，Capacity Rebalance 只记录，EKS Auto Mode 与外部 `UpdateNodegroupVersion` 自动化不检测；操作者身份需
    `autoscaling:DescribeAutoScalingGroups`（管理员日常运维 §5.0.5）。CPU 控制面集群仍是 HyperPod 集群：没有滚动策略时其实例组的
    `ScheduledUpdateConfig` 一个窗口同时重镜像全部 CPU 节点，deploy 的最后一步因此保留原 cron 把它改为逐台滚动（每批 1 台，
-   两个 API NLB `HealthyHostCount` 回滚告警，`spec.cpuControlPlane.rollingUpdate` 缺省 `rolling`）；
-   `gpu-fault-admin hyperpod-scheduled-update --rolling` 打印同样的命令，同见 §5.0.5。
+   两个 API NLB `HealthyHostCount` 回滚告警，`admin-config.yaml` 的 `spec.cpuControlPlane.rollingUpdate.mode` 缺省 `rolling`，等待间隔
+   缺省 1800 s）；`gpu-fault-admin cpu-rolling-update --state-dir <dir>` 立即重跑这一步，
+   `gpu-fault-admin hyperpod-scheduled-update --gpu-cluster-arn <CPU ARN> --rolling --rollback-alarm <告警>... --wait-interval-seconds 1800`
+   只打印同样的步骤（其缺省等待 600 s 时 not-restored 告警来不及触发），同见 §5.0.5。
 
 ## 4. 限制
 
@@ -204,7 +216,7 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
   `--cluster-id` 不在下一次 `deploy` 中保留）；集群多时发布只有一个 canary、回滚逐集群串行，且共用固定的 6 小时期限与
   2 小时恢复预留。
 - 注册集群（`spec.runtimeProfile.registrationClusterId`）被 `remove-cluster` 移除且站点还有其他成员时，改为剩余的同
-  provider 成员；没有同 provider 成员时拒绝移除，基线家族不会随移除改变。
+  provider 成员；没有同 provider 成员时拒绝移除，基线家族不会随移除改变；移除最后一个集群时注册集群不变，清空后首次接入必须带该 provider 的集群。
 
 ## 5. 验证状态（诚实版）
 

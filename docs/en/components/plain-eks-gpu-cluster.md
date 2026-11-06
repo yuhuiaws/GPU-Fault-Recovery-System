@@ -58,7 +58,9 @@ reviewed through `release-deploy/profile-plan.json` (`change_kind: CLUSTER_PROFI
 `deploy --gpu-cluster-arn`) is reviewed like a single join; a version is one plan naming every cluster that needs it,
 and the release compares a registered version without its registration anchor (`cluster_id`), see
 [Runtime Profile Change Approval](../administrator-profile-change-approval.md) §1.2. The release registers every version in use and
-renders each cluster's Executor/Watcher/Reconciler/installer pins and Agent config digest from its own version; the
+renders each cluster's version pins -- the node-resource collector's `GPU_FAULT_RUNTIME_PROFILE_VERSION` and the
+Reconciler/installer's `GPU_FAULT_RUNTIME_PROFILE` -- and its Agent config digest from its own version (the Executor and
+Watcher carry no profile pin); the
 registry entry carries `runtime_profile_version`/`agent_config_digest` (digest-excluded while equal to the site
 default); `FleetRegistry.cluster_policy` checks Agents per cluster while `GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION`
 keeps meaning the site default; a first `deploy` still requires one provider.
@@ -96,29 +98,33 @@ closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace`
   change is the release-diff input `dcgm_hostengines`: it plans DCGM + reconciler + Agent (`DATA_PLANE_COMPATIBLE`), the
   exporter is re-applied and the cluster's Agents are re-installed in waves (reconciler node annotation
   `gpu-fault.io/installer-dcgm-hostengine=host`), and the node preflight checks the host hostengine before any change.
-  `node_scope.dcgm_hostengine`/`dcgm_hostengine_source`/`dcgm_hostengine_pending_nodes` of `status --full` and the
-  `dcgm_hostengine` of `node-scope` show the mode, its source and the nodes still to re-install. A deploy of an unchanged
-  source re-reads the label with the same discovery reads before its NOOP shortcut and takes the application release when
-  the declaration differs from the record (a mixed one is refused before any change); `status` (quick and `--full`) and
-  `node-scope` show a declaration not yet released as
-  `next deploy: DATA_PLANE_COMPATIBLE (dcgm_hostengine: <cluster> declared host, recorded embedded)`. An exporter or
+  `node_scope.dcgm_hostengine`/`dcgm_hostengine_source`/`dcgm_hostengine_pending_nodes` of `status --full` show the mode,
+  its source and the nodes still to re-install, the `dcgm_hostengine` of `node-scope` the mode and its source. A deploy of
+  an unchanged source re-reads the label with the same discovery reads before its NOOP shortcut and takes the application
+  release when the declaration differs from the record (a mixed one is refused before any change); `status` (quick and
+  `--full`) shows a declaration not yet released as
+  `next deploy: DATA_PLANE_COMPATIBLE (dcgm_hostengine: <cluster> declared host, recorded embedded)`, and the
+  `dcgm_hostengine` of `node-scope` records `state: pending deploy` with its `next_deploy` (`status --full` also carries
+  `dcgm_hostengine_live`, from the Agent heartbeats). An exporter or
   reconciler whose live mode (the DaemonSet annotation/environment, the reconciler's `GPU_FAULT_DCGM_HOSTENGINE`) differs
   from the record is the release-diff input `dcgm_hostengine_drift`, planned like a flip (DCGM + reconciler + Agent), and
   the `gpu_cluster:<id>` check of `status --full`/verify fails on it (`node_scope.dcgm_hostengine_served`); after a
   refused and rolled-back release the rollback alignment restores the record to the mode that runs and `sync-state`
-  records the digest of the mode the exporters run, and a node preflight refusal names every node with its whole
-  reasons and records every node's DCGM state.
+  records the digest of the mode the exporters run, and a node preflight refusal names every failed node with its
+  reasons (one line of at most 600 characters per node, at most 50 nodes) and records every node's DCGM state.
 - The node collector scrapes DCGM metrics from the exporter over HTTP, never dcgmi; in embedded mode the node agent's
   quick DCGM diagnostic (`dcgmi diag -r 1 -j`) reports a missing dcgmi or an unreachable hostengine as a configuration
   `WARN` (`DCGM_TOOL_UNAVAILABLE`/`DCGM_HOSTENGINE_UNAVAILABLE`, never drained); in host mode (Agent environment
   `GPU_FAULT_DCGM_HOSTENGINE=host`, written on eks-managed nodes only and not part of the config digest) it returns
-  real verdicts, and a missing dcgmi or an unreachable host hostengine fails as on HyperPod with `DCGM_EXECUTION_REVIEW`
-  (`DRAIN_AND_QUARANTINE`); before such a verdict, when the enabled `nvidia-dcgm` is down (inactive/failed) or still
-  starting, the Agent makes one bounded recovery (`systemctl reset-failed` + `start`, then waits at most 30 s for
-  `dcgmi discovery -l`; never inside a quiesce window, never installs a package) and runs the diagnostic once more
-  (`node_agent/operations/hostengine_recovery.py`, the same on HyperPod nodes).
+  real verdicts, and a missing dcgmi and an unreachable host hostengine both fail with `DCGM_EXECUTION_REVIEW`
+  (`DRAIN_AND_QUARANTINE`) -- an unreachable hostengine as on HyperPod, while a missing dcgmi on HyperPod stays a
+  configuration `WARN`; before such a verdict, when `nvidia-dcgm` is down or still starting, the Agent makes one bounded
+  recovery (`inactive`/`failed` and enabled: `systemctl start`, after `reset-failed` for `failed`; `activating`: wait
+  only; the diagnostic runs once more only when `dcgmi discovery -l` answers within 30 s; never inside a quiesce window,
+  never installs a package; `node_agent/operations/hostengine_recovery.py`, the same on HyperPod nodes).
 - Data-plane Deployments (executor, watcher, reconciler, node-resource collector, ADOT) carry no node pin and tolerate
-  no GPU taint; they land on CPU nodes.
+  no GPU taint: they land on CPU nodes when the GPU node groups carry a NoSchedule taint such as `nvidia.com/gpu`; with
+  untainted GPU node groups they may be scheduled onto GPU nodes (the product does not enforce it).
 - The node preflight Job checks the host prerequisites inside `chroot /host` and reports every missing one at once
   (`ERROR: host prerequisites unavailable: ...` plus a JSON verdict); AL2023 needs `python3.12 strace` from the launch
   template (administrator-operations §5.0.1); host mode additionally needs `dcgmi`, `nv-hostengine`, an active
@@ -129,21 +135,25 @@ closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace`
   always checked as host mode (`dcgmi`, `nv-hostengine`, an active `nvidia-dcgm` and `dcgmi discovery -l` refuse, a CUDA
   flavor mismatch or a foreign nv-hostengine only warns); the per-node
   states of the last preflight are recorded in the release state `node_dcgm_hostengine` and shown by `status --full` as
-  `node_scope.dcgm_hostengine_nodes`/`dcgm_hostengine_conflict_nodes`. The Agent always grades by the cluster's declared
-  mode.
-- Node Action keys: every node inventory read, including the CPU mirror guard, uses the cluster selector.
+  `node_scope.dcgm_hostengine_nodes`/`dcgm_hostengine_conflict_nodes`. The Agent always grades by the mode its installation
+  wrote (`GPU_FAULT_DCGM_HOSTENGINE`, the mode the last release recorded).
+- Node Action keys: every node inventory read uses the cluster selector, including the node inventory re-check while the
+  CPU-side copy of the key Secret is synchronised.
 
 ### 2.6 Join recoverability and diagnostics
-- `allowedNamespaces` defaults to the list the site's clusters share and no longer forces `training`; the join checks
-  every workload namespace exists on its first read of the GPU cluster.
+- `allowedNamespaces` defaults to the list the site's clusters share (`gpu-fault-system`/`training` when the site has no
+  cluster yet or its clusters disagree; `--allowed-namespace` names the list); the join checks every workload namespace
+  exists on its first read of the GPU cluster.
 - A failed sensitive command keeps the script's own `ERROR:` lines (else the last stderr line, redacted) in both the
   admin and the release runner.
 - The Runtime Profile registration probe names its failure (HTTP status / 30 s no answer) and is retried once.
 - Rollback: a cluster that never received a node runtime is an empty, proven cleanup target set (SKIPPED); a cleanup
-  journal that never left PREFLIGHT is archived and re-planned after a site upgrade; `ROLLBACK_FAILED` recovers by
-  rerunning the same `join-cluster`, which then starts a fresh attempt.
-- Deploy-host gates: the test-impact selection and the role-split render test run inside the deploy's
-  deadline/API-budget scope without inheriting it.
+  journal that never left PREFLIGHT is archived on every rerun of the rollback (renamed `<name>.superseded-NNN.json`) and
+  re-planned under the current release; `ROLLBACK_FAILED` recovers by rerunning the same `join-cluster`, which then
+  starts a fresh attempt.
+- Deploy-host gates: the pytest and PostgreSQL stress gates the test-impact selection picks do not inherit the deploy's
+  deadline/API-budget (`isolated_gate_environment`); the role-split render test keeps the scope when it runs inside one
+  (its `kubectl kustomize` goes through the budget shim).
 
 ### 2.7 The quiesce taint (eks-managed only)
 - A plain EKS quiesce leaves kubelet running, so the GPU client containers the Agent stops (the product's own exporter,
@@ -162,7 +172,10 @@ closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace`
   successor's MARK_UNSCHEDULABLE strips an orphaned taint; RESTART_GPU_DEVICE_PLUGIN WAITs under a taint somebody still
   holds and names it, stripping an orphaned one first; a starved VALIDATE_GPU writes `quiesce_taint_present`/
   `quiesce_taint_holders` into its pending details; `--disposition restore` runs RESTORE_SCHEDULING alone for a node whose
-  only isolation of the incident is its quiesce taint (`quiesce_taint_only`). See administrator operations §5.0 and §9.2.
+  only isolation of the incident is its quiesce taint (`quiesce_taint_only`); a confirmed RESTART_NODE strips every
+  quiesce taint of its nodes (`quiesce_taint_removed_nodes`; a removal that fails is only named in `quiesce_taint_error`
+  and the reboot still succeeds); a validation whose pending nodes all carry `quiesce_taint_present` and that observed no
+  failure climbs neither ladder (`validation_unobserved`). See administrator operations §5.0 and §9.2.
 - An in-place plan replacement of a queued successor no longer bumps the fencing token (it shares its RUNNING
   predecessor's generation), a RUNNING reset chain absorbs the EFA/GPU allocatable dips its own taint causes, a step the
   executor refused before dispatch climbs neither ladder, and the takeover of a predecessor's isolation follows the whole
@@ -174,8 +187,11 @@ closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace`
   52 s on eight GPUs; `/proc/modules` and `/sys/class/drm` check the reload -- every GPU's DRM device must come back --,
   a missing module earns one retry after a 5 s pause, a partial load one `rmmod nvidia_drm && modprobe nvidia_drm`, and a
   stack still not back is `display_stack_restored=false`, the GPUs without a DRM device in
-  `display_drm_devices_missing`: the reset stays successful, it is not handled as a GPU fault, and the GPU reset
-  completion mail carries `[display stack not restored]` and the remedy `modprobe nvidia_drm` or a node reboot); the
+  `display_drm_devices_missing`: the reset stays successful, it is not handled as a GPU fault, and the subject of the GPU
+  reset and the GPU/NVSwitch reset completion mails carries `[display stack not restored]` while the body gives the
+  remedy the Agent recorded: `modprobe` of the outermost unloaded module (usually `nvidia_drm`) when a module did not
+  come back, `rmmod nvidia_drm && modprobe nvidia_drm` when the modules are back but a DRM device is missing, or a node
+  reboot); the
   `nvidia-persistenced` the
   window kept (on the other GPUs only) and the Fabric Manager the window kept (named in its `kept_services`, on
   `/dev/nvidia-caps/*`/`/dev/nvidia-nvswitch*`/`/dev/nvidia-nvlink` only) do not stop the unload and are recorded in
@@ -196,8 +212,9 @@ closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace`
    plugins running; a GPU taint is fine.
    For `AL2023_x86_64_NVIDIA` node groups `gpu-fault-admin prepare-eks-nodegroup` automates this item's user data, node
    auto repair and update strategy and item 5's ownership label (a read-only plan by default;
-   `--apply --confirm PREPARE_EKS_NODEGROUP --reference <CHG>` runs it and rolls the node group, `--dcgm-hostengine host`
-   also installs item 7's host DCGM; administrator-operations §5.0.1a).
+   `--apply --confirm PREPARE_EKS_NODEGROUP --reference <CHG>` (plus `--state-dir` or `--work-dir`) runs it and rolls
+   the node group when the managed user data changes, `--dcgm-hostengine host` also installs item 7's host DCGM;
+   administrator-operations §5.0.1a).
 2. Namespaces: every workload namespace in `allowedNamespaces` (the site's default list, e.g. `training`) must exist,
    or pass `--allowed-namespace` with namespaces that do.
 3. Network: the GPU VPC's NAT EIP is whitelisted on the NLB, the private Route53 zone associated, Agent CIDRs taken
@@ -207,7 +224,8 @@ closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace`
 5. Ownership label: `gpu-fault-admin site-id --cpu-cluster-arn <CPU ARN>` prints the site id;
    `aws eks update-nodegroup-config --cluster-name <eks> --nodegroup-name <ng> --labels addOrUpdateLabels={gpu-fault.io/control-plane=<site id>}`
    labels the GPU node group (HyperPod: `update-cluster` with `KubernetesConfig.Labels`; Karpenter: NodePool template
-   labels). Command: `gpu-fault-admin join-cluster --state-dir <dir> --gpu-cluster-arn <eks arn>` (ARNs only).
+   labels; a plain EKS cluster needs at least one labelled managed node group, since discovery reads managed node
+   groups only). Command: `gpu-fault-admin join-cluster --state-dir <dir> --gpu-cluster-arn <eks arn>` (ARNs only).
    De-registration releases it: the last step of `remove-cluster`/`uninstall`, `OWNERSHIP_RELEASED`, removes the key
    from the node groups the site selected with
    `aws eks update-nodegroup-config --cluster-name <eks> --nodegroup-name <ng> --labels removeLabels=gpu-fault.io/control-plane`
@@ -222,7 +240,8 @@ closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace`
 6. Third-party GPU client DaemonSets (the customer's own dcgm-exporter, GPU feature discovery, monitoring agents)
    **must not tolerate** `gpu-fault.io/quiesce` (no key-less `operator: Exists` wildcard toleration; list the keys such
    as `nvidia.com/gpu` instead) and must tolerate being stopped/evicted inside a quiesce window; the default NVIDIA
-   device plugin and GFD manifests tolerate only `nvidia.com/gpu` and need no change.
+   device plugin and GFD manifests carry no key-less wildcard toleration and do not tolerate `gpu-fault.io/quiesce`, so
+   they need no change.
 7. Host DCGM (optional, real `dcgmi diag` verdicts): the launch template installs a pinned
    `datacenter-gpu-manager-4-core-<ver>` and `datacenter-gpu-manager-4-cuda<CUDA major>-<ver>` (the major of the
    "CUDA Version" `nvidia-smi` prints), writes the `Restart=on-failure` drop-in
@@ -232,21 +251,28 @@ closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace`
    `gpu-fault.io/dcgm-hostengine=host` (`prepare-eks-nodegroup --dcgm-hostengine host [--dcgm-version <version>-<build>]`
    writes the user data, enables the unit and labels the group in one go; the default version is `4.6.1-1`, the
    exporter's pair) and deploy/join right away (also over an unchanged source: the deploy re-reads the
-   label, and `status` shows the pending `next deploy` before it; a deploy with the service enabled but no label is
-   refused by the embedded conflict check); to leave, remove the label, take `nvidia-dcgm` out of the launch template and
-   run `systemctl disable --now nvidia-dcgm` on the nodes, then deploy at once (order and commands in
-   administrator-operations §5.0.1, "Host DCGM").
+   label, and `status` shows the pending `next deploy` before it; with the service enabled but no label `status` reports
+   `DCGM host engine next to the embedded one on <cluster>` from the Agent heartbeats, the next release that plans the
+   reconciler/Agents (a join included) is refused by the embedded conflict check of its node preflight before any change,
+   and a deploy with neither source nor label changed runs no node preflight); to leave, remove the label, take
+   `nvidia-dcgm` out of the launch template and run `systemctl disable --now nvidia-dcgm` on the nodes, then deploy at
+   once (order and commands in administrator-operations §5.0.1, "Host DCGM").
 8. Automatic node updates: managed node groups have no scheduled update, but a Karpenter NodePool's `expireAfter`
    (default 720h), drift and consolidation, EKS Auto Mode node pools, an ASG `MaxInstanceLifetime` and automation
    calling `UpdateNodegroupVersion` on a schedule all replace GPU nodes: give the NodePools `expireAfter: Never` and a
    `nodes: "0"` budget, keep `MaxInstanceLifetime` unset and move the automation into the maintenance window; the
    Capacity Rebalance EKS enables on Spot node groups is handled by the replacement-node join window. `status
-   --full`/`node-scope` record and announce them (never refuse); the operator identity needs
+   --full`/`node-scope` record and announce (never refuse) the Karpenter NodePools carrying the site's label and the ASGs
+   with a `MaxInstanceLifetime`, record Capacity Rebalance only, and do not detect EKS Auto Mode or outside
+   `UpdateNodegroupVersion` automation; the operator identity needs
    `autoscaling:DescribeAutoScalingGroups` (administrator-operations §5.0.5). The CPU control-plane cluster is still a
    HyperPod cluster: without a rolling policy one window of its instance groups' `ScheduledUpdateConfig` re-images every
    CPU node at once, so the deploy's last step keeps the cron expression and makes the schedule roll one instance at a
-   time (batch size 1, two API NLB `HealthyHostCount` rollback alarms, `spec.cpuControlPlane.rollingUpdate` default
-   `rolling`); `gpu-fault-admin hyperpod-scheduled-update --rolling` prints the same commands, also §5.0.5.
+   time (batch size 1, two API NLB `HealthyHostCount` rollback alarms, `admin-config.yaml`'s
+   `spec.cpuControlPlane.rollingUpdate.mode` default `rolling`, a wait interval of 1800 s by default);
+   `gpu-fault-admin cpu-rolling-update --state-dir <dir>` reruns that step at once, and
+   `gpu-fault-admin hyperpod-scheduled-update --gpu-cluster-arn <CPU ARN> --rolling --rollback-alarm <alarm>... --wait-interval-seconds 1800`
+   only prints the same steps (with its default wait of 600 s the not-restored alarm cannot fire in time), also §5.0.5.
 
 ## 4. Limitations
 
@@ -272,7 +298,8 @@ closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace`
   rollback is serial per cluster, and both share the fixed 6-hour deadline and 2-hour recovery reserve.
 - When `remove-cluster` removes the registration cluster (`spec.runtimeProfile.registrationClusterId`) while other
   members remain, a remaining member of the same provider becomes the registration cluster; without one the removal is
-  refused, so a removal never changes the base family.
+  refused, so a removal never changes the base family; removing the last cluster keeps the registration cluster, and the
+  first join after the site is empty must bring a cluster of that provider.
 
 ## 5. Validation status (honest)
 
