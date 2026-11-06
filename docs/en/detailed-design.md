@@ -1683,8 +1683,8 @@ count, traffic or error baselines. The BMC status `nc` means non-critical and is
 the labels `sensors` (the alerting sensors' names, in table order) and `sensor_alerts` (each sensor's reading, units,
 status and the threshold columns `ipmitool sensor` printed, e.g. `CPU1 Temp=96.000 degrees C [cr; unc 90.000, ucr
 95.000, unr 100.000]`); `bmc_critical_sensor_rule` in `host_health.py` turns them into the finding reason
-`BMC reports 2 critical sensors: ...`, so the incident `reasons`, the marker `raw_reason` and the QUARANTINE step's
-hardware escalation mail name the sensors and their thresholds; a bare count without labels (an older collector)
+`BMC reports 2 critical sensors: ...`, so the incident `reasons` and the marker `raw_reason` name the sensors and
+their thresholds (the QUARANTINE plan sends no mail itself; a support hand-off that follows lists those reasons); a bare count without labels (an older collector)
 keeps the fixed text `BMC reports a critical sensor`. A non-zero `ipmitool` exit, a timeout, no valid four-column
 row, or a table whose every status is `na` is UNKNOWN (a `_bmc` collection error, no sample); no `ipmitool`
 (TOOL_MISSING) or an `ipmitool` that reports no IPMI device node while none of `/dev/ipmi0`, `/dev/ipmi/0`,

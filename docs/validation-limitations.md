@@ -1659,8 +1659,8 @@ error and no sample -- and stays software-tested). 015 `critical` and
 `bmc_critical_sensor` sample's `sensors` / `sensor_alerts` labels (name,
 reading, units, status and the threshold columns ipmitool printed), the
 incident `reasons` (`BMC reports 2 critical sensors: CPU1 Temp=96.000 degrees C
-[cr; unc 90.000, ucr 95.000, unr 100.000]; Fan1=...`, the text the QUARANTINE
-step's hardware escalation mail lists) and the marker `raw_reason`; a bare
+[cr; unc 90.000, ucr 95.000, unr 100.000]; Fan1=...`, the text a later support
+hand-off's mail lists; the QUARANTINE plan sends no mail) and the marker `raw_reason`; a bare
 count would name nothing. 015
 `command_failure` serves two exits in turn: a BMC that does not answer (`Get
 Device ID command failed`) must be a `_bmc` collection error with no sample, a

@@ -473,9 +473,9 @@ def bmc_critical_sensor_rule(
 ]:
     """The BMC rule, with the alerting sensors named in its reason.
 
-    The reason is the one text the incident keeps (``reasons``), the marker
-    carries (``raw_reason``) and the QUARANTINE step's hardware escalation
-    mail lists, so this is where the names, readings, statuses and thresholds
+    The reason is the one text the incident keeps (``reasons``) and the
+    marker carries (``raw_reason``) -- the QUARANTINE plan sends no mail; a
+    support hand-off that may follow lists the reasons -- so this is where the names, readings, statuses and thresholds
     the collector put in the sample's labels (``sensor_alerts``, or the bare
     ``sensors`` names) reach the operator: a multi-sensor alert names its
     sensors instead of reading "2". The labels themselves travel as the
