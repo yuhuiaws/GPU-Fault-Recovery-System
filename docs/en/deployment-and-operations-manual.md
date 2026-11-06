@@ -2188,7 +2188,8 @@ when the Aurora password has already rotated and running replicas show authentic
 "running replicas fail authentication" only happens in the window between rotation and refresh, and the recovery action is reduced to **running the refresh Job once**
 -- Pods do not need a restart; once the mounted file syncs, new connections recover.
 
-The symptom is all three replicas in `CrashLoopBackOff` at the same time, with `kubectl logs --previous` showing
+The symptom is new or restarted control-plane Pods in `CrashLoopBackOff` (running replicas fail their reconnects and
+`GpuFaultPostgresPoolConnectionErrors` fires), with `kubectl logs --previous` showing
 `PostgresStore.__init__` -> `psycopg_pool.PoolTimeout: couldn't get a
 connection after 2.00 sec`. Note that `PoolTimeout` is the **surface symptom**: the connection pool swallows the authentication failure
 and only reports a timeout. To see the real cause, connect once directly with the DSN from the Secret and you will get
@@ -2196,7 +2197,7 @@ and only reports a timeout. To see the real cause, connect once directly with th
 
 The same root cause has a second presentation: a `gpu-fault-admin deploy` or `rollback` stops at
 `failed`/`rollback-failed`, the newly rolled control-plane Pods are in `CrashLoopBackOff`, yet the release itself
-has nothing wrong. Since 2026-09-07, both deploy and rollback first synchronously run the refresh CronJob once and
+has nothing wrong. Both deploy and rollback first synchronously run the refresh CronJob once and
 fail closed (see the end of §2b), so this situation should only appear when the refresh step was skipped (the CronJob does not exist)
 or the rotation happened in the tiny window right after the refresh and during the rollout. Do not touch the release in that case: after
 diagnosing per this section, run the refresh Job once by hand (`kubectl create job --from=cronjob/...`, about 5 seconds, Pods
@@ -2245,9 +2246,14 @@ print("AWSPREVIOUS =", digest(stage("AWSPREVIOUS")))
 PY
 ```
 
-`k8s secret == AWSPREVIOUS` confirms the diagnosis. Recovery steps: first back up the existing Secret for rollback,
-then rebuild the DSN from `AWSCURRENT`, `patch` it into the Secret, and `rollout restart`. The password travels
-only through files and stdin throughout, **never in command-line arguments**:
+`k8s secret == AWSPREVIOUS` confirms the diagnosis. The preferred recovery is to run the refresh Job once by hand (the
+verification commands of §2b): it builds the candidate DSN from `AWSCURRENT` (only the password changes, the original DSN's
+query is kept) and connects to the database with it before writing the Secret. Use the manual procedure below only when the
+refresher itself cannot run (CronJob missing, Pod Identity or KMS permissions broken): first back up the existing Secret for
+rollback, then rebuild the DSN from `AWSCURRENT` (in the same `sslmode=verify-full` form as CPU-2) and `patch` it into the
+Secret. Running replicas recover through the mounted file; `restart-regional-control-plane.sh` only makes Pods waiting in a
+`CrashLoopBackOff` back-off restart at once. The password travels only through files and stdin throughout, **never in
+command-line arguments**:
 
 <!-- boot017-out-of-band: after-the-fact recovery procedure operating on a running deployment; not part of the first-deployment order -->
 
@@ -2260,6 +2266,7 @@ umask 077
 AWS_REGION="${AWS_REGION}" \
 AURORA_MASTER_SECRET_ARN="${AURORA_MASTER_SECRET_ARN}" \
 AURORA_CLUSTER_ID="${AURORA_CLUSTER_ID}" \
+GPU_FAULT_RDS_CA_BUNDLE="${GPU_FAULT_RDS_CA_BUNDLE}" \
 python3.12 - <<'PY' > /tmp/aurora-patch.json
 import base64, json, os, subprocess
 from urllib.parse import quote
@@ -2289,7 +2296,8 @@ url = (
     + quote(secret["username"], safe="")
     + ":" + quote(secret["password"], safe="")
     + "@" + endpoint
-    + ":5432/gpu_fault?sslmode=require"
+    + ":5432/gpu_fault?sslmode=verify-full&sslrootcert="
+    + quote(os.environ["GPU_FAULT_RDS_CA_BUNDLE"], safe="/")
 )
 print(json.dumps(
     {"data": {"postgres-url": base64.b64encode(url.encode()).decode()}}
@@ -2336,6 +2344,13 @@ standalone Helm/IAM installation. Two LBCs watching all namespaces at the same t
 create/modify the same SG, TargetGroupBinding, listener and NLB. Platform-managed CRDs must not be
 force-upgraded with another chart version either.
 
+The bootstrap of `gpu-fault-admin deploy` decides the same way automatically (`bootstrap_load_balancer.py`): a Deployment whose
+image matches `load-balancer|operator-alb` with all replicas Ready, while `kube-system` has no Helm release named
+`aws-load-balancer-controller`, counts as a platform-managed Controller and is reused without any IAM or Helm work; with that
+Helm release present it is reused only when the chart is `1.17.1`, `clusterName`/`region`/`vpcId` match the CPU EKS,
+`replicaCount=2`, the ServiceAccount is not created by the chart (`serviceAccount.create=false`) and the Controller is Ready;
+otherwise it runs `helm upgrade --install` again with the parameters below.
+
 Only when the check above finds no usable Controller do you run the following standalone installation procedure.
 
 First confirm the EKS Pod Identity Agent is available; create the managed add-on when it is not:
@@ -2359,7 +2374,9 @@ kubectl --kubeconfig "${CPU_KUBECONFIG}" -n kube-system \
   get daemonset eks-pod-identity-agent
 ```
 
-Download the official IAM policy matching the installed version and create the Pod Identity role:
+Download the official IAM policy matching the installed version, check it against the SHA-256 bootstrap pins before creating
+it, then create the Pod Identity role. A git tag can be moved: when the digest differs, do not create the policy (bootstrap
+fails closed in that case):
 
 ```bash
 export AWS_ACCOUNT_ID="$(
@@ -2370,6 +2387,11 @@ export LBC_POLICY_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${LBC_POLICY_NAME}"
 
 curl -fsSLo /tmp/aws-load-balancer-controller-iam-policy.json \
   "https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/${LBC_VERSION}/docs/install/iam_policy.json"
+# The same pin as gpu_fault.admin.bootstrap_load_balancer.LBC_IAM_POLICY_SHA256.
+printf '%s  %s\n' \
+  16f232c9d9f79366fe949c4550ad517a202380058a9e48d45a4e215044a20a6a \
+  /tmp/aws-load-balancer-controller-iam-policy.json |
+sha256sum -c -
 
 if ! aws iam get-policy --policy-arn "${LBC_POLICY_ARN}" >/dev/null 2>&1; then
   aws iam create-policy \
@@ -2427,6 +2449,13 @@ else
     --role-arn "${LBC_ROLE_ARN}"
 fi
 
+# As bootstrap does: kubectl creates the ServiceAccount and the chart does not (serviceAccount.create=false),
+# so a later bootstrap check of the same release does not reinstall it with different values and delete the account.
+kubectl --kubeconfig "${CPU_KUBECONFIG}" -n kube-system \
+  create serviceaccount aws-load-balancer-controller \
+  --dry-run=client -o yaml |
+kubectl --kubeconfig "${CPU_KUBECONFIG}" apply -f -
+
 helm repo add eks https://aws.github.io/eks-charts
 helm repo update eks
 helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
@@ -2437,7 +2466,7 @@ helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-contro
   --set region="${AWS_REGION}" \
   --set vpcId="${CPU_VPC_ID}" \
   --set replicaCount=2 \
-  --set serviceAccount.create=true \
+  --set serviceAccount.create=false \
   --set serviceAccount.name=aws-load-balancer-controller
 
 kubectl --kubeconfig "${CPU_KUBECONFIG}" -n kube-system \
@@ -2530,7 +2559,8 @@ cat > /tmp/gpu-fault-control-plane-ses-send.json <<EOF
     "Sid": "SendFromVerifiedGpuFaultIdentity",
     "Effect": "Allow",
     "Action": "ses:SendEmail",
-    "Resource": "arn:aws:ses:${AWS_REGION}:${AWS_ACCOUNT_ID}:identity/${GPU_FAULT_EMAIL_SENDER}"
+    "Resource": "arn:aws:ses:${AWS_REGION}:${AWS_ACCOUNT_ID}:identity/${GPU_FAULT_EMAIL_SENDER}",
+    "Condition": {"StringEquals": {"ses:FromAddress": "${GPU_FAULT_EMAIL_SENDER}"}}
   }]
 }
 EOF
@@ -2576,19 +2606,29 @@ else
 fi
 ```
 
-The regional control plane and the old single-cluster `deploy/hyperpod/deploy.sh` use different IAM roles. The release engine (bootstrap) grants only the permissions of the
-channel selected by `spec.notifications.channel`: for SNS, `sns:Publish` on the site topic; for
-`channel: ses`, a sender-restricted `ses:SendEmail`. Setting only `GPU_FAULT_ALLOW_EMAIL=true` does not fill in
+The regional control plane and the old single-cluster `deploy/hyperpod/deploy.sh` use different IAM roles. The bootstrap of
+`gpu-fault-admin deploy` writes every permission into one inline policy `GPUFaultRegionalObserve` on the role
+`gpu-fault-<site-id>-control` (`bootstrap_iam_policies.control_plane_policy_document`): the SageMaker reads and
+`DepartedNodeInstanceReads` above, then only the permissions of the channel selected by `spec.notifications.channel` -- for SNS,
+`sns:Publish` on the site topic (`AdministratorNotificationTopic`); for `channel: ses`, `ses:SendEmail` restricted to the sender
+(`ses:FromAddress`, `AdministratorEmail`); and, when `site.yaml` `spec.retention` names an archive bucket, `s3:PutObject` on that
+prefix (`ControlRecordArchive`). In the manual procedure a `channel: sns` site (the default) must grant `sns:Publish` on the
+site topic on the same role itself. Setting only `GPU_FAULT_ALLOW_EMAIL=true` does not fill in
 the permissions; when the CPU EKS Pod Identity role lacks `ses:SendEmail`, notifications are still saved, but the delivery result is
 `FAILED/AccessDeniedException`.
 
-Create the email Secret (the sender/recipients fields below are needed only on `channel: ses` sites):
+Create the email Secret. The keys bootstrap writes: `email-subject-prefix` (`spec.notifications.emailSubjectPrefix`, empty by
+default), `site-id` and `aws-account-id` on every channel; `email-sender`/`email-recipients` only on `channel: ses` sites (the SNS
+channel carries no addresses; the topic comes from the `GPU_FAULT_SNS_TOPIC_ARN` environment variable):
 
 ```bash
 kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
   create secret generic gpu-fault-email \
   --from-literal=email-sender="${GPU_FAULT_EMAIL_SENDER}" \
   --from-literal=email-recipients="${GPU_FAULT_EMAIL_RECIPIENTS}" \
+  --from-literal=email-subject-prefix='' \
+  --from-literal=site-id='<site-name>' \
+  --from-literal=aws-account-id="${AWS_ACCOUNT_ID}" \
   --dry-run=client -o yaml |
 kubectl --kubeconfig "${CPU_KUBECONFIG}" apply -f -
 ```
@@ -2684,11 +2724,22 @@ for target in cpu gpu; do
 done
 ```
 
+The script lists the nodes through the cluster's GPU node selector and derives one key per node. The form above is for a
+HyperPod cluster that records no selector (an empty `GPU_FAULT_NODE_SELECTOR` defaults to the
+`sagemaker.amazonaws.com/cluster-name=<HyperPod name>` label). When the site records a selector, pass it verbatim: a plain EKS
+(eks-managed) cluster has no HyperPod name, so `GPU_FAULT_HYPERPOD_CLUSTER` is the cluster id and
+`GPU_FAULT_NODE_SELECTOR=gpu-fault.io/control-plane=<site-id>`; a HyperPod cluster managed under the ownership label uses
+`gpu-fault.io/control-plane=<site-id>,sagemaker.amazonaws.com/cluster-name=<HyperPod name>` (`gpu-fault-admin node-scope`
+shows each cluster's recorded selector). Bootstrap passes the script exactly the recorded selector
+(`bootstrap_common.node_key_scope_environment`).
+
 **On the first deployment `gpu-fault-regional-clusters` must contain the first GPU cluster.** This guarantees an acceptable data plane exists
 immediately after bootstrap; it is not a runtime restriction on an empty registry. After the last GPU cluster is deregistered via
 `gpu-fault-admin remove-cluster`, an explicit empty array `[]` is a legitimate
 unloaded control-plane state; a missing Secret/key, invalid JSON or a non-array still makes the API Pods fail to start. Therefore
-the unified releaser first writes all clusters from `site.yaml` into the registry and then starts the CPU control plane; without release
+the unified releaser first writes all clusters from `site.yaml` into the registry and then starts the CPU control plane (the
+`site.yaml` of a first deployment holds only the first GPU cluster; the other ARNs are joined by the batch join after the
+release); without release
 state, or in a `bootstrap-*` recovery phase, an empty cluster set is refused before the first Kubernetes apply.
 The manual check below is only for the break-glass procedure:
 
@@ -2726,9 +2777,9 @@ Deployment that both receives requests and consumes the queue. The actual runtim
 
 | File | Content | Fields to modify per site |
 |---|---|---|
-| `deploy/control-plane/regional/regional-control-plane-prerequisites.yaml` | `gpu-fault-system` Namespace, `gpu-fault-control-plane` ServiceAccount, ClusterIP Service `gpu-fault-api` (8080 -> `http`) | None (the NLB is created separately in step 5 of this chapter and points at the same set of Pods) |
+| `deploy/control-plane/regional/regional-control-plane-prerequisites.yaml` | `gpu-fault-system` Namespace (with the LBC Pod readiness gate injection label `elbv2.k8s.aws/pod-readiness-gate-inject: enabled`), `gpu-fault-control-plane` ServiceAccount, ClusterIP Service `gpu-fault-api` (8080 -> `http`) | None (the NLB is created separately in step 5 of this chapter and points at the same set of Pods) |
 | `deploy/control-plane/base/control-plane-deployment.yaml` | Deployment baseline shared by single-cluster and regional mode, wheel ConfigMap reference, artifact SHA annotation | None (the apply script replaces automatically; direct apply is forbidden) |
-| `deploy/control-plane/regional/regional-control-plane-patch.yaml` | Regional-mode environment variables and `nodeSelector` | The Region stays `REPLACE_WITH_AWS_REGION` and is replaced at apply time by the checked configuration; do not hand-edit the generated output |
+| `deploy/control-plane/regional/regional-control-plane-patch.yaml` | Regional-mode environment variables, hostname topology spread, resources and probe ports, Secret mounts | The Region stays `REPLACE_WITH_AWS_REGION` and is replaced at apply time by the checked configuration; do not hand-edit the generated output |
 | `deploy/control-plane/regional/generated/*.yaml` | ingress, control-worker, spool-worker with 0 replicas by default, PDBs and per-role ConfigMaps | Do not hand-edit; the directory content must exactly match `manifest-list.txt` |
 
 The ServiceAccount in prerequisites is the same object created by `create serviceaccount` earlier in this section;
@@ -2770,9 +2821,17 @@ export NODE_COMPATIBILITY_DIGEST="$(
 )"
 export WHEEL_CONFIG_MAP="gpu-fault-control-plane-wheel-0100-${ARTIFACT_SHA256:0:12}"
 
-deploy/control-plane/tools/render-control-plane-role-split.sh
-PYTHONPATH=src python3.12 -m gpu_fault.config_cli validate \
-  deploy/control-plane/regional/generated
+# As the release engine does: render into a temporary directory (the checked-in generated/ is not rewritten),
+# with the site's notification channel set at render time. All three roles check for an external alert channel
+# at startup: without the channel variables and without SES addresses they refuse to start with
+# "active executor has no external alert channel". channel: sns (the default) takes the site SNS topic;
+# a channel: ses site sets GPU_FAULT_NOTIFICATION_CHANNEL=ses and drops the topic.
+export ROLE_SPLIT_DIR="$(mktemp -d)"
+GPU_FAULT_ROLE_SPLIT_OUT_DIR="${ROLE_SPLIT_DIR}" \
+GPU_FAULT_NOTIFICATION_CHANNEL=sns \
+GPU_FAULT_SNS_TOPIC_ARN="${SNS_TOPIC_ARN:?site SNS topic ARN}" \
+  deploy/control-plane/tools/render-control-plane-role-split.sh
+PYTHONPATH=src python3.12 -m gpu_fault.config_cli validate "${ROLE_SPLIT_DIR}"
 
 kubectl --kubeconfig "${CPU_KUBECONFIG}" apply \
   -f deploy/control-plane/regional/regional-control-plane-prerequisites.yaml
@@ -2789,11 +2848,18 @@ export CONFIG_MAP_SHA256="$(
 test "${CONFIG_MAP_SHA256}" = "${ARTIFACT_SHA256}"
 ```
 
+`SNS_TOPIC_ARN` is the site SNS topic: `gpu-fault-<site-id>-alerts` on a site built by `gpu-fault-admin deploy`
+(`spec.health.snsTopicArn` in `site.yaml`), and `gpu-fault-control-plane-alerts-<Region>` created by
+`deploy/observability/install-amp-monitoring.sh` in the manual procedure.
+
 The release metadata values come from the Executor/Node Runtime artefacts, bundle/template, image digests and the final Node Agent configuration
-of the same signed schema v3 release. The environment below matches the step 6 production installation command:
-key version 2,
+of the same signed release (manifest schema v3/v4). The environment below matches the step 6 production installation command
+(and `bootstrap_common.compute_agent_config_digest` of `gpu-fault-admin deploy`): key version 2,
 GPU reset, fabric reset, service quiesce and Fabric Manager restart enabled by default, and
-the EFA remediation capability retained. Pins must not be reverse-selected from `/v1/fleet/agents`; that endpoint is only
+the EFA remediation capability retained; the allowed node operations are the list in `gpu_fault.admin.node_allowed_operations`,
+identical to the installer default; the two values the installer prints with `--print-config-digest-environment` (the py-spy
+path `GPU_FAULT_PYTHON_STACK_TOOL` and `GPU_FAULT_QUIESCE_RESTORE_COMMAND`) enter the digest too, and so does
+`GPU_FAULT_DIAGNOSTIC_S3_URI` when the site declares `spec.diagnosticS3Uri`. Pins must not be reverse-selected from `/v1/fleet/agents`; that endpoint is only
 used for cross-checking after node installation.
 
 ```bash
@@ -2809,9 +2875,17 @@ export REQUIRED_REGIONAL_EXECUTOR_PROTOCOL_VERSION="$(
   PYTHONPATH=src python3.12 -c \
     'from gpu_fault.regional_compatibility import CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION; print(CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION)'
 )"
-export NODE_ALLOWED_OPERATIONS='COLLECT_HUNG_TRIAGE,COLLECT_DIAGNOSTIC_BUNDLE,RUN_DCGM_DIAGNOSTIC,QUIESCE_GPU_SERVICES,VERIFY_NO_GPU_CLIENTS,TRIGGER_HEALTH_SNAPSHOT,RESET_GPU,RESET_ALL_GPUS_NVSWITCHES,RESTORE_GPU_SERVICES,RESTART_FABRIC_MANAGER,REMEDIATE_EFA_DRIVER,COLLECTOR_OUTBOX_MAINTENANCE'
+export NODE_ALLOWED_OPERATIONS="$(
+  PYTHONPATH=src python3.12 -c \
+    'from gpu_fault.admin.node_allowed_operations import NODE_ALLOWED_OPERATIONS; print(NODE_ALLOWED_OPERATIONS)'
+)"
 : "${RUNTIME_PROFILE_VERSION:?load the approved content-addressed Profile from site/release}"
+INSTALLER_DIGEST_EXPORTS="$(
+  bash deploy/node/install-gpu-fault-collector.sh --print-config-digest-environment |
+  jq -r 'to_entries[] | "export \(.key)=\(.value | @sh)"'
+)"
 export REQUIRED_AGENT_CONFIG_DIGEST="$(
+  eval "${INSTALLER_DIGEST_EXPORTS}"
   GPU_FAULT_NODE_RUNTIME_PROFILE_VERSION="${RUNTIME_PROFILE_VERSION}" \
   GPU_FAULT_NODE_ACTION_KEY_VERSION=2 \
   GPU_FAULT_NODE_ALLOWED_OPERATIONS="${NODE_ALLOWED_OPERATIONS}" \
@@ -2905,6 +2979,7 @@ fails fails the release and rolls ingress back with it.
 
 ```bash
 KUBECONFIG="${CPU_KUBECONFIG}" \
+GPU_FAULT_ROLE_SPLIT_GENERATED_DIR="${ROLE_SPLIT_DIR}" \
 GPU_FAULT_AWS_REGION="${AWS_REGION}" \
 GPU_FAULT_NAMESPACE="${NAMESPACE}" \
 GPU_FAULT_WHEEL_CONFIGMAP="${WHEEL_CONFIG_MAP}" \
@@ -2938,12 +3013,14 @@ When the verifier resolves the container environment it follows kubelet's `optio
 `gpu-fault-failure-domain-map` does not exist, `GPU_FAULT_REMEDIATION_FAILURE_DOMAIN_MAP`
 is treated as unset rather than as a verification failure; control-worker runs as usual, and no runtime code reads the mapping anyway
 (remediation is organized by workload and workflows are kept apart per node, see detailed design v2 §9.5).
-That ConfigMap is rendered automatically by the apply step: the release engine generates the mapping from the node labels of every managed GPU cluster
-(`spec.failureDomainLabels` in `site.yaml`, default instance group -> zone),
+That ConfigMap is rendered by the release engine before it calls the apply script: it generates the mapping from the node labels of every managed GPU cluster
+(`spec.failureDomainLabels` in `site.yaml`; by default the HyperPod instance group first, followed by the EKS node group when the
+site has an eks-managed cluster, then the zone),
 validates it with the mapping's loader before applying, and writes the content digest into the control-worker Pod template annotation
 `gpu-fault.io/failure-domain-map-sha256` (`GPU_FAULT_FAILURE_DOMAIN_MAP_SHA256`
 passed to the apply script); the worker rolls only when the mapping changes; `join-cluster`/`remove-cluster` likewise
-re-render it. Administrators need no manual action; see Administrator Operations §5.1 for details.
+re-render it. Running the apply script directly by hand as above does not create it, and control-worker runs as usual.
+Administrators need no manual action; see Administrator Operations §5.1 for details.
 
 The release metadata must exist before any Deployment. Once it runs ahead of the nodes' current heartbeats,
 NodeAction fails closed with `PIN_AHEAD_OF_FLEET`; this is the intended protection and must not be bypassed by lowering the gate.
@@ -2967,8 +3044,11 @@ kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
 
 Runtime Profiles are stored globally by `profile_version` in the regional control plane; the same version is shared by all
 GPU clusters that reference it. The payload's `cluster_id` is the registration authorisation anchor and must be a stable
-`CLUSTER_ID` in the registry, not a HyperPod provider name; it does not create a private copy for that cluster. When the same version
-already exists with different content it must not be overwritten; a new version must be created.
+`CLUSTER_ID` in the registry, not a HyperPod provider name (the API answers 403 when it is not in the registry); it does not create a
+private copy for that cluster. When the same version already exists with different content it must not be overwritten; a new version
+must be created: `POST /v1/runtime-profiles` itself writes by `profile_version` without comparing the existing content
+(`register_profile` in `routes/configuration.py`), so a manual registration may only be used for a version not registered yet.
+The template for a plain EKS (eks-managed) cluster is `config/runtime-profile.regional-eks-safe.example.yaml`.
 
 First registration:
 
@@ -3036,9 +3116,9 @@ stays idempotent when it exists and matches, and stops and requires a new versio
 This section is run only after all of CPU-4c has passed; it is not part of the first-start dependency order.
 
 **Reclaim the accumulated wheel ConfigMaps.** The content-addressed naming above
-(`gpu-fault-control-plane-wheel-<tag>-<sha12>`) creates a new object of about
-440 KiB on every code change, and **originally there was no reclamation mechanism at all** -- measured on 2026-08-01, the CPU control plane
-had 31 piled up and the GPU cluster 98. Run a reclamation once after the rollout completes:
+(`gpu-fault-control-plane-wheel-<tag>-<sha12>`) creates a new set of objects on every code change; at commit the release engine
+reclaims only the previous-snapshot ConfigMaps, **not the wheel ConfigMaps**, so those keep accumulating on the CPU control plane and
+the GPU clusters. Run a reclamation once after the rollout completes:
 
 ```bash
 # Dry run by default: only prints the plan.
@@ -3066,8 +3146,7 @@ The script's retention rules -- **deleting one wrong object breaks rollback, so 
 - **The most recent `GPU_FAULT_PRUNE_KEEP_RECENT` (default 3) are kept unconditionally**,
   guaranteeing a rollback target at any time.
 - **Only the auto-generated naming `<tag>-<12 hex chars>` is processed.** Hand-pinned experimental wheels
-  (such as `gpu-fault-control-plane-wheel-reboot-email-reason-0723`,
-  of which the GPU side has 62) are **never in the candidate set**.
+  (such as `gpu-fault-control-plane-wheel-reboot-email-reason-0723`) are **never in the candidate set**.
 - `GPU_FAULT_PRUNE_PROTECT=<name>[,<name>]` can explicitly protect a freshly built wheel
   not yet referenced by any workload; that is how `deploy.sh` protects the artefact of the current build.
 
@@ -3079,25 +3158,33 @@ kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
 kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
   get pods -l app=gpu-fault-api-ha -o wide
 kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
-  get pdb gpu-fault-api-ha
+  get pdb gpu-fault-api-ha-pdb
 
 kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
   get deployment gpu-fault-api-ha -o json |
 jq '{
   replicas: .spec.replicas,
-  nodeSelector: .spec.template.spec.nodeSelector,
   terminationGracePeriodSeconds: .spec.template.spec.terminationGracePeriodSeconds,
-  env: [.spec.template.spec.containers[0].env[] |
-    select(.name == "GPU_FAULT_DEPLOYMENT_MODE"
-      or .name == "GPU_FAULT_PROCESSOR_MODE"
-      or .name == "GPU_FAULT_ENABLE_KUBERNETES_ADAPTER"
-      or .name == "GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER"
-      or .name == "GPU_FAULT_ENABLE_HYPERPOD_ADAPTER"
-      or .name == "GPU_FAULT_ENABLE_TRAINING_HEALTH_MONITOR")]
+  envFrom: [.spec.template.spec.containers[0].envFrom[].configMapRef.name]
 }'
 
+# The role environment is not in the Deployment's env but in the per-role ConfigMaps (envFrom).
+for role in gpu-fault-api-ha gpu-fault-control-worker; do
+  kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
+    get configmap "${role}-config-core" "${role}-config-processor" -o json |
+  jq --arg role "${role}" '{role: $role} + ([.items[].data | to_entries[] |
+    select(.key == "GPU_FAULT_SERVICE_ROLE"
+      or .key == "GPU_FAULT_DEPLOYMENT_MODE"
+      or .key == "GPU_FAULT_PROCESSOR_MODE"
+      or .key == "GPU_FAULT_PROCESSOR_WORKERS"
+      or .key == "GPU_FAULT_ENABLE_KUBERNETES_ADAPTER"
+      or .key == "GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER"
+      or .key == "GPU_FAULT_ENABLE_HYPERPOD_ADAPTER"
+      or .key == "GPU_FAULT_ENABLE_TRAINING_HEALTH_MONITOR")] | from_entries)'
+done
+
 kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
-  get pdb gpu-fault-api-ha -o jsonpath='{.spec.minAvailable}{"\n"}'
+  get pdb gpu-fault-api-ha-pdb -o jsonpath='{.spec.minAvailable}{"\n"}'
 kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
   get deployment gpu-fault-control-worker \
   -o jsonpath='{.status.readyReplicas}{"/"}{.spec.replicas}{"\n"}'
@@ -3110,8 +3197,8 @@ Expected values:
 
 - ingress Deployment `3` replicas, Pods spread across the CPU nodes; control-worker
   Deployment `6` replicas and all Ready; spool-worker `0` by default.
-- ingress PDB `minAvailable=2`; control-worker PDB `maxUnavailable=1`.
-- `GPU_FAULT_DEPLOYMENT_MODE=regional`.
+- ingress PDB (`gpu-fault-api-ha-pdb`) `minAvailable=2`; control-worker PDB `maxUnavailable=1`.
+- `GPU_FAULT_DEPLOYMENT_MODE=regional`; `GPU_FAULT_SERVICE_ROLE` is `ingress` and `worker` respectively (`spool` for spool-worker).
 - ingress only receives requests and does not start a processor; control-worker uses
   `GPU_FAULT_PROCESSOR_MODE=active-active` to consume the shared Aurora queue, competing dynamically for work via database lane
   leases, with no need to pre-assign clusters or partitions.
