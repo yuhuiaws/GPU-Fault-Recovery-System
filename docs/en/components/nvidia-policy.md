@@ -193,7 +193,7 @@ GB300 belongs to the GB200 column.
   `DRAIN_AND_RESET`.
 - XID 94/95: application/all-applications containment are stored separately; XID 95 requires the affected workload to be stopped before
   the reset.
-- XID 154: the driver-reported action takes precedence and is mapped as-is. The catalog's `Xid 154 linkage` describes the
+- XID 154: the driver-reported action takes precedence. The catalog's `Xid 154 linkage` describes the
   version from which XID 154 is reported alongside, not the original XID's minimum supported version; an old driver or
   missing version information does not block the original rules of XID 48/63/79/94/95 and the others. The NVLink5 R575
   bit-format boundary and its required decode evidence remain. DCGM field 1523 holds the same value as a
