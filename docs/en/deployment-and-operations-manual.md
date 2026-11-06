@@ -10039,6 +10039,9 @@ The repository provides the following transactional scripts:
   commands and successor references.
 - `scripts/postgres/incident-audit-export.sql`: exports the deletion scope as NDJSON.
 - `scripts/postgres/incident-audit-purge.sql`: transactional deletion with terminal-state guards and double incident ID confirmation.
+- `scripts/postgres/incident-audit-predicates.sql`: the one purge predicate that preview and purge both read with `\ir`
+  (session-temporary functions, no schema change), so the preview lists exactly the records the purge's guard refuses; it must sit
+  in the same directory as the other two.
 
 This procedure is only for incidents that have ended and exceeded the organisation's audit retention period. After deletion, the same event ID
 is no longer protected by the original `incident_by_event` dedup record, and a replay from the event source may create a new incident, so you must also
@@ -10065,7 +10068,8 @@ kubectl --kubeconfig "${CONTROL_KUBECONFIG}" -n "${NS}" \
   create configmap "${SQL_CONFIGMAP}" \
   --from-file=scripts/postgres/incident-audit-preview.sql \
   --from-file=scripts/postgres/incident-audit-export.sql \
-  --from-file=scripts/postgres/incident-audit-purge.sql
+  --from-file=scripts/postgres/incident-audit-purge.sql \
+  --from-file=scripts/postgres/incident-audit-predicates.sql
 
 cat <<YAML | kubectl --kubeconfig "${CONTROL_KUBECONFIG}" \
   -n "${NS}" apply -f -
@@ -10111,10 +10115,11 @@ kubectl --kubeconfig "${CONTROL_KUBECONFIG}" -n "${NS}" \
   wait --for=condition=Ready "pod/${ADMIN_POD}" --timeout=5m
 ```
 
-Preview first. In the following output the open remote commands and external successor workflows must be empty,
-and all workflows must be `SUCCEEDED`, `SUPERSEDED`, or `FAILED` with their failure handling done (`failure_handled_at`
-set); close a `BLOCKED` record with `gpu-fault-admin workflow-reconcile` first. The preview lists only the status;
-`failure_handled_at` is checked by the purge script's terminal guard:
+Preview first. In the following output the unsettled or unhandled workflows, the open remote commands and the external
+successor workflows must all be empty: every workflow must be `SUCCEEDED`, `SUPERSEDED`, or `FAILED` with its failure handling
+done (`failure_handled_at` set); close a `BLOCKED` record with `gpu-fault-admin workflow-reconcile` first. The first two of those
+sections read the same predicate as the purge script's terminal guard (`incident-audit-predicates.sql`), and the first also shows
+`failure_handled_at`, so the preview lists exactly the workflows and remote commands the purge would refuse:
 
 ```bash
 kubectl --kubeconfig "${CONTROL_KUBECONFIG}" -n "${NS}" \

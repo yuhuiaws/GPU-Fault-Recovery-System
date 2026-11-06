@@ -31,7 +31,8 @@ PREVIEW_SECTIONS = (
     "Incident",
     "Related object counts",
     "Workflow states",
-    "Open or unknown remote commands; this result must be empty before purge",
+    audit.UNSETTLED_WORKFLOWS,
+    audit.OPEN_REMOTE_COMMANDS,
     "External successor workflows; purge these incidents first",
 )
 
@@ -158,9 +159,10 @@ def assert_typed_state_filters(plans: dict, mode: str) -> None:
         return
     for title, index in (
         ("Workflow states", "gpu_fault_workflows_incident"),
+        (audit.UNSETTLED_WORKFLOWS, "gpu_fault_workflows_incident"),
         ("Purge workflow capture", "gpu_fault_workflows_incident"),
         ("Purge remote_command capture", "gpu_fault_remote_commands_incident"),
-        (PREVIEW_SECTIONS[3], "gpu_fault_remote_commands_incident"),
+        (audit.OPEN_REMOTE_COMMANDS, "gpu_fault_remote_commands_incident"),
     ):
         assert any(
             node.get("Index Name") == index and node.get("Actual Loops", 0)
@@ -206,6 +208,8 @@ def test_incident_audit_native_statement_plans(
         )
     statements["Purge successor guard"] = audit.successor_guard_query(flow.incident_id)
     plans = {}
+    # The preview's sections call the predicate functions its ``\ir`` defines.
+    audit.run_includes(connection, "preview")
     with connection.transaction(force_rollback=True):
         audit.capture_victims(connection, flow.incident_id)
         for title, statement in statements.items():
@@ -241,7 +245,7 @@ def test_incident_audit_native_statement_plans(
             name: hashlib.sha256(
                 audit.PURGE_SQL.with_name(f"incident-audit-{name}.sql").read_bytes()
             ).hexdigest()
-            for name in ("preview", "export", "purge")
+            for name in ("preview", "export", "purge", "predicates")
         },
         "summary": {title: plan_summary(plan) for title, plan in plans.items()},
         "plans": plans,

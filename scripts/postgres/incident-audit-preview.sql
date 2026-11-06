@@ -9,6 +9,10 @@
   $audit_incident_argument_guard$;
 \endif
 
+-- The purge's own predicates: the two safety sections below list exactly
+-- what its terminal guard refuses.
+\ir incident-audit-predicates.sql
+
 \echo 'Incident'
 SELECT
     key AS incident_id,
@@ -134,11 +138,18 @@ FROM gpu_fault_workflow_records
 WHERE incident_id=:'incident_id'
 ORDER BY created_at, key;
 
+\echo 'Unsettled or unhandled workflows; this result must be empty before purge'
+SELECT key AS workflow_id, status, failure_handled_at
+FROM gpu_fault_workflow_records
+WHERE incident_id=:'incident_id'
+  AND pg_temp.gpu_fault_audit_workflow_blocks_purge(status, failure_handled_at)
+ORDER BY created_at, key;
+
 \echo 'Open or unknown remote commands; this result must be empty before purge'
 SELECT key AS command_id, status, workflow_request_id AS workflow_id
 FROM gpu_fault_remote_command_records
 WHERE incident_id=:'incident_id'
-  AND (status IN ('SUCCEEDED', 'FAILED')) IS NOT TRUE
+  AND pg_temp.gpu_fault_audit_remote_command_blocks_purge(status)
 ORDER BY key;
 
 \echo 'External successor workflows; purge these incidents first'

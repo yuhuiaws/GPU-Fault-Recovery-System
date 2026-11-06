@@ -153,6 +153,9 @@ An external successor's unknown status keeps its predecessor record, and an empt
 The three incident-audit SQL scripts refuse requests with missing parameters,
 mismatched confirmation or unmet cleanup conditions through `ON_ERROR_STOP` and explicit SQL exceptions, without relying on the exit-code `\quit` that older `psql` does not support.
 preview also lists remote commands with unknown status, and a failure of any conditional delete in purge rolls back the whole transaction.
+preview and purge read one predicate file with `\ir`, `incident-audit-predicates.sql` (session `pg_temp` functions, no schema
+change): preview's unsettled-or-unhandled workflow section and its open-or-unknown remote command section list exactly the
+records purge's terminal guard refuses.
 The three incident-audit scripts first filter by the typed incident and predecessor
 columns of the workflow/remote-command views, then rebuild the payload for the selected rows. The OR branch for non-state objects explicitly excludes these two kinds, so that the outer OR does not again
 project all the large snapshots early; the count query does not rebuild the state JSON. The legacy fallback is kept, so it cannot be

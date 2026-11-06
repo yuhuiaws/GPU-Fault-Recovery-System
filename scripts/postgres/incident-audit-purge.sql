@@ -29,6 +29,10 @@ SELECT :'incident_id' = :'confirm_incident_id' AS confirmed
   $audit_confirmation_guard$;
 \endif
 
+-- The terminal guard below refuses through the predicates the preview lists
+-- with, defined before the transaction starts.
+\ir incident-audit-predicates.sql
+
 BEGIN ISOLATION LEVEL SERIALIZABLE;
 SET LOCAL lock_timeout='5s';
 SET LOCAL statement_timeout='2min';
@@ -97,19 +101,15 @@ DO $purge_terminal_guard$
 BEGIN
     IF EXISTS (
         SELECT 1 FROM purge_workflow_ids
-        WHERE (
-            payload->>'status' IN ('SUCCEEDED', 'SUPERSEDED')
-            OR (
-                payload->>'status'='FAILED'
-                AND NULLIF(payload->>'failure_handled_at', '') IS NOT NULL
-            )
-        ) IS NOT TRUE
+        WHERE pg_temp.gpu_fault_audit_workflow_blocks_purge(
+            payload->>'status', payload->>'failure_handled_at'
+        )
     ) THEN
         RAISE EXCEPTION 'refusing purge: incident has a non-terminal or unhandled workflow';
     END IF;
     IF EXISTS (
         SELECT 1 FROM purge_remote_command_ids
-        WHERE (payload->>'status' IN ('SUCCEEDED', 'FAILED')) IS NOT TRUE
+        WHERE pg_temp.gpu_fault_audit_remote_command_blocks_purge(payload->>'status')
     ) THEN
         RAISE EXCEPTION 'refusing purge: incident has an open or unknown remote command';
     END IF;

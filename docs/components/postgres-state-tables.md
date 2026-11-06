@@ -151,6 +151,9 @@ predecessor、reconcile 和归档继续使用原有业务规则。
 三份 incident-audit SQL 脚本通过 `ON_ERROR_STOP` 与显式 SQL 异常拒绝缺失参数、
 不匹配确认或不满足清理条件的请求，不依赖旧版 `psql` 不支持的带退出码 `\quit`。
 preview 也会列出未知状态的远程命令，purge 的任一条件删除失败都会回滚整个事务。
+preview 与 purge 用 `\ir` 读入同一份判定文件 `incident-audit-predicates.sql`（会话级
+`pg_temp` 函数，不改 schema）：preview 的未终结或失败未处理 workflow 段与开放或未知
+远程命令段，列出的正是 purge 终态守卫会拒绝的记录。
 三份incident-audit脚本先用workflow/remote-command视图的类型化incident及predecessor
 列筛选，再为选中行重建payload。非状态对象的OR分支明确排除这两类，避免外层OR再次
 让全部大快照提前投影；计数查询不重建状态JSON。legacy fallback仍保留，不能据此

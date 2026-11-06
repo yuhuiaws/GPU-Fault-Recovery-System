@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -24,6 +25,28 @@ pytestmark = pytest.mark.skipif(
 PURGE_SQL = (
     Path(__file__).resolve().parents[2] / "scripts/postgres/incident-audit-purge.sql"
 )
+PREDICATES_SQL = PURGE_SQL.with_name("incident-audit-predicates.sql")
+UNSETTLED_WORKFLOWS = (
+    "Unsettled or unhandled workflows; this result must be empty before purge"
+)
+OPEN_REMOTE_COMMANDS = (
+    "Open or unknown remote commands; this result must be empty before purge"
+)
+
+
+def run_includes(connection, operation: str) -> None:
+    """Run what an audit script ``\\ir``-includes, as psql does in its session.
+
+    The preview and the purge include the shared purge predicates: session
+    functions their statements call, so a statement lifted out of either
+    script needs them defined on the same connection first.
+    """
+
+    source = PURGE_SQL.with_name(f"incident-audit-{operation}.sql").read_text()
+    for line in source.splitlines():
+        if line.startswith("\\ir "):
+            included = PURGE_SQL.with_name(line.removeprefix("\\ir ").strip())
+            connection.execute(included.read_text())
 
 
 def sql_block(tag: str, operation: str = "purge") -> str:
@@ -54,6 +77,7 @@ def purge_capture_query(kind: str, incident_id: str, *, select_only: bool = Fals
 
 
 def capture_victims(connection, incident_id: str = "audit-incident") -> None:
+    run_includes(connection, "purge")
     for kind in ("workflow", "remote_command"):
         connection.execute(purge_capture_query(kind, incident_id))
 
@@ -176,12 +200,24 @@ def test_dual_legacy_json_difference_is_deleted_atomically(
 
 
 def audit_query(connection, name: str, incident_id: str):
+    run_includes(connection, name)
     source = (PURGE_SQL.parent / f"incident-audit-{name}.sql").read_text()
     start = source.index("\nWITH\n" if name == "export" else "\nSELECT\n")
     statement = "\n".join(
         line for line in source[start:].splitlines() if not line.startswith("\\")
     )
     return bind_incident_query(statement, incident_id)
+
+
+def preview_section(connection, incident_id: str, title: str) -> list[tuple]:
+    """The rows the preview prints under ``title``, its result sets in order."""
+
+    source = PURGE_SQL.with_name("incident-audit-preview.sql").read_text()
+    titles = re.findall(r"^\\echo '(.*)'$", source, flags=re.MULTILINE)
+    cursor = connection.execute(audit_query(connection, "preview", incident_id))
+    for _ in range(titles.index(title)):
+        assert cursor.nextset(), f"the preview ended before {title!r}"
+    return cursor.fetchall()
 
 
 @pytest.mark.parametrize("workflow_mode", ["legacy", "dual", "dedicated"])
@@ -223,6 +259,8 @@ def test_incident_preview_counts_migrated_workflow_and_command(
     assert counts["object:workflow"] == counts["object:remote_command"] == 1
     assert cursor.nextset(), "the preview omitted workflow states"
     assert cursor.fetchone()[:2] == (flow.request_id, "SUCCEEDED")
+    assert cursor.nextset(), "the preview omitted the unsettled-workflow safety check"
+    assert cursor.fetchall() == []
     assert cursor.nextset(), "the preview omitted the open-command safety check"
     assert cursor.fetchall() == []
     assert cursor.nextset(), "the preview omitted the external-successor safety check"
@@ -292,10 +330,170 @@ def test_preview_includes_unknown_command_status_as_a_purge_blocker(
         "WHERE kind='remote_command' AND key=%s",
         (json.dumps({"status": status}), remote.command_id),
     )
-    cursor = connection.execute(audit_query(connection, "preview", flow.incident_id))
-    for _ in range(3):
-        assert cursor.nextset(), "preview omitted a required result set"
-    assert cursor.fetchall() == [(remote.command_id, status, flow.request_id)]
+    assert preview_section(connection, flow.incident_id, OPEN_REMOTE_COMMANDS) == [
+        (remote.command_id, status, flow.request_id)
+    ]
+
+
+# A workflow shape: (status, failure_handled_at, blocks the purge, legacy JSON
+# only). The empty and unknown values cannot reach the typed dedicated table
+# (or its dual-mode mirror), so they exist only as legacy rows.
+WORKFLOW_PURGE_SHAPES = {
+    "succeeded": ("SUCCEEDED", None, False, False),
+    "superseded": ("SUPERSEDED", None, False, False),
+    "failed-handled": ("FAILED", "2026-09-01T00:00:00+00:00", False, False),
+    "failed-unhandled": ("FAILED", None, True, False),
+    "failed-empty-handled-at": ("FAILED", "", True, True),
+    "pending": ("PENDING", None, True, False),
+    "blocked": ("BLOCKED", None, True, False),
+    "unknown-status": ("UNKNOWN", None, True, True),
+}
+
+
+def seed_workflow_shape(connection, mode: str, shape: str):
+    """One incident with one workflow of ``shape``, written for ``mode``."""
+
+    status, handled_at, _blocks, legacy_only = WORKFLOW_PURGE_SHAPES[shape]
+    select_mode(connection, "workflow", mode)
+    incident = fault_incident("shape-incident", "shape-event")
+    flow = workflow_request(
+        "shape-workflow",
+        incident.incident_id,
+        status=WorkflowStatus.SUCCEEDED if legacy_only else WorkflowStatus(status),
+        failure_handled_at=(
+            datetime.fromisoformat(handled_at)
+            if handled_at and not legacy_only
+            else None
+        ),
+    )
+    assert POSTGRES_URL is not None, "the audit fixture requires local PostgreSQL"
+    store = PostgresStore(POSTGRES_URL, initialize_schema=False)
+    try:
+        store.save_incident(incident)
+        if not legacy_only:
+            store.save_workflow(flow)
+    finally:
+        store.close()
+    if legacy_only:
+        payload = flow.model_dump(mode="json")
+        payload.update(status=status, failure_handled_at=handled_at)
+        connection.execute(
+            "INSERT INTO gpu_fault_objects(kind,key,payload) VALUES "
+            "('workflow',%s,%s::jsonb)",
+            (flow.request_id, json.dumps(payload)),
+        )
+    return flow
+
+
+def purge_guard_refusal(connection, incident_id: str) -> str | None:
+    """The terminal guard's refusal over the purge's own capture, or ``None``."""
+
+    import psycopg
+
+    try:
+        with connection.transaction(force_rollback=True):
+            capture_victims(connection, incident_id)
+            connection.execute(sql_block("purge_terminal_guard"))
+    except psycopg.errors.RaiseException as exc:
+        return str(exc)
+    return None
+
+
+@pytest.mark.parametrize(
+    ("mode", "shape"),
+    [
+        (mode, shape)
+        for mode in ("legacy", "dual", "dedicated")
+        for shape, (_status, _handled, _blocks, legacy_only) in (
+            WORKFLOW_PURGE_SHAPES.items()
+        )
+        if mode == "legacy" or not legacy_only
+    ],
+)
+def test_preview_lists_exactly_the_workflows_the_purge_guard_refuses(
+    migration_database, mode: str, shape: str
+) -> None:
+    """One predicate: what the preview lists is what the purge refuses, by
+    status and by ``failure_handled_at``, in every workflow state mode."""
+
+    connection = migration_database
+    status, handled_at, blocks, _legacy_only = WORKFLOW_PURGE_SHAPES[shape]
+    flow = seed_workflow_shape(connection, mode, shape)
+
+    listed = preview_section(connection, flow.incident_id, UNSETTLED_WORKFLOWS)
+    refusal = purge_guard_refusal(connection, flow.incident_id)
+
+    assert listed == ([(flow.request_id, status, handled_at)] if blocks else []), (
+        f"the preview listed {listed} for a {shape} workflow in {mode} mode"
+    )
+    assert (refusal is not None) is blocks, (
+        f"the purge guard {'refused' if refusal else 'accepted'} a {shape} "
+        f"workflow in {mode} mode: {refusal}"
+    )
+    assert refusal is None or "non-terminal or unhandled workflow" in refusal, refusal
+
+
+@pytest.mark.parametrize(
+    ("status", "blocks"),
+    [
+        ("SUCCEEDED", False),
+        ("FAILED", False),
+        ("PENDING", True),
+        ("WAITING", True),
+        ("LEASED", True),
+        (None, True),
+        ("UNKNOWN", True),
+    ],
+)
+def test_preview_lists_exactly_the_remote_commands_the_purge_guard_refuses(
+    migration_database, status: str | None, blocks: bool
+) -> None:
+    connection = migration_database
+    flow, remote = seed_terminal_pair(connection, "legacy", "legacy")
+    connection.execute(
+        "UPDATE gpu_fault_objects SET payload=payload || %s::jsonb "
+        "WHERE kind='remote_command' AND key=%s",
+        (json.dumps({"status": status}), remote.command_id),
+    )
+
+    listed = preview_section(connection, flow.incident_id, OPEN_REMOTE_COMMANDS)
+    refusal = purge_guard_refusal(connection, flow.incident_id)
+
+    assert listed == (
+        [(remote.command_id, status, flow.request_id)] if blocks else []
+    ), f"the preview listed {listed} for a {status!r} remote command"
+    assert (refusal is not None) is blocks, (
+        f"the purge guard {'refused' if refusal else 'accepted'} a {status!r} "
+        f"remote command: {refusal}"
+    )
+    assert refusal is None or "open or unknown remote command" in refusal, refusal
+
+
+@pytest.mark.parametrize("operation", ["preview", "purge"])
+def test_preview_and_purge_read_the_one_predicate_definition(operation: str) -> None:
+    """Neither script spells the status vocabulary itself: both include the
+    predicate file before their first statement that calls it (the purge also
+    before its transaction), and that file is plain SQL psql and the tests run
+    alike."""
+
+    source = PURGE_SQL.with_name(f"incident-audit-{operation}.sql").read_text()
+    include = f"\\ir {PREDICATES_SQL.name}"
+    assert source.splitlines().count(include) == 1, f"{operation} must include once"
+    for function in (
+        "pg_temp.gpu_fault_audit_workflow_blocks_purge(",
+        "pg_temp.gpu_fault_audit_remote_command_blocks_purge(",
+    ):
+        assert source.index(include) < source.index(function), (operation, function)
+    if operation == "purge":
+        assert source.index(include) < source.index("BEGIN ISOLATION LEVEL"), (
+            "the purge defines its predicates before its transaction starts"
+        )
+    for literal in ("'SUCCEEDED'", "'SUPERSEDED'", "'FAILED'"):
+        assert literal not in source, f"{operation} spells {literal} itself"
+    predicates = PREDICATES_SQL.read_text()
+    assert [line for line in predicates.splitlines() if line.startswith("\\")] == [], (
+        "the predicate file is plain SQL"
+    )
 
 
 @pytest.mark.parametrize("owner", ["missing", "null"])
@@ -317,12 +515,11 @@ def test_successor_with_unknown_incident_owner_blocks_purge(
         "('workflow',%s,%s::jsonb)",
         (successor.request_id, json.dumps(payload)),
     )
-    preview = connection.execute(audit_query(connection, "preview", flow.incident_id))
-    for _ in range(4):
-        assert preview.nextset(), "preview omitted its successor result"
-    assert preview.fetchall() == [
-        (successor.request_id, None, "SUCCEEDED", flow.request_id)
-    ]
+    assert preview_section(
+        connection,
+        flow.incident_id,
+        "External successor workflows; purge these incidents first",
+    ) == [(successor.request_id, None, "SUCCEEDED", flow.request_id)]
     with connection.transaction(force_rollback=True):
         capture_victims(connection, flow.incident_id)
         connection.execute(sql_block("purge_terminal_guard"))
@@ -345,6 +542,7 @@ def test_successor_with_unknown_incident_owner_blocks_purge(
 
 
 def complete_purge(connection, incident_id: str) -> None:
+    run_includes(connection, "purge")
     with connection.transaction():
         connection.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
         for kind in (
