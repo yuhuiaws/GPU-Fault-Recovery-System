@@ -1666,7 +1666,13 @@ and the marker `raw_reason`; a bare count would name nothing. That notice
 <cluster>: <node>", one per incident; the same for 004's full filesystem and
 016's severe kernel lines) is software-tested only
 (`tests/execution/test_quarantined_node_notice.py`): no live run has carried
-it yet, and the 015/004/016 harness does not judge it. 015
+it yet, and the 015/004/016 harness does not judge it. When a step after the
+cordon of such a plan fails -- the job stop of 016's severe kernel lines --
+the record ends FAILED and the failure handler opens the support hand-off
+`workflow-support-after-<id>` (stage `held_chain_step`) for the held node
+only; that path is software-tested only too
+(`tests/orchestration/test_cov95_runtime_escalation.py`,
+`tests/orchestration/test_health.py`): no live variant fails the stop. 015
 `command_failure` serves two exits in turn: a BMC that does not answer (`Get
 Device ID command failed`) must be a `_bmc` collection error with no sample, a
 host without an IPMI device node (`Could not open device at /dev/ipmi0 ...: No

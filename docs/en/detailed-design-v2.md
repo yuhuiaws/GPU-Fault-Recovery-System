@@ -2341,7 +2341,7 @@ as `HUNG_SUPPORT_HANDOFF`; and `QUARANTINED_NODE_NOTICE`: template `quarantined-
 deduplication key `<cluster>/<incident>/quarantined-node-notice` (one per incident), sent by the executor after the terminal write
 when a record that ends with its own quarantine SUCCEEDS and writes the incident `QUARANTINED`
 (`execution/terminal_quarantine_notice.py`: the QUARANTINE plan of a node-health finding graded `QUARANTINE`, or a critical
-quarantine folded into another chain; a hold the predecessor left, ESCALATED, BLOCKED and FAILED records send none): the body names
+quarantine folded into another chain; a hold the predecessor left, ESCALATED, BLOCKED and FAILED records send none -- a FAILED record still holding its node is handed to support instead, stage `held_chain_step`): the body names
 the held nodes, the finding, the steps run, the jobs left suspended and the two exits (§9.2 restore, the QUARANTINED branch of
 §9.1); its template and version live in `notifications/quarantined_node_notice.py` for the same reason);
 `channel.py` selects the channel, `sns.py` / `ses.py` perform delivery, and `common.py` handles convergence and deduplication.

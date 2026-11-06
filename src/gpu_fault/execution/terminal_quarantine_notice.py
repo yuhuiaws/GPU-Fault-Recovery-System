@@ -16,8 +16,10 @@ Not this end: a hold the incident's *predecessor* left (the record itself
 holds nothing; ``terminal_state.predecessor_holds_isolation``), a support
 hand-off (ESCALATED, its own mail), a settled safety plan (BLOCKED; the
 contained hand-off speaks for the missing-owner shape) and every FAILED record
-(the escalation ladder's). This module reads the record as written; the
-executor only calls it (``workflow_notifications.after_terminal_write``).
+(the escalation ladder's: a failed step after the cordon of such a plan hands
+the held node to support, ``failure_outcome.held_chain_hand_off``). This
+module reads the record as written; the executor only calls it
+(``workflow_notifications.after_terminal_write``).
 """
 
 from __future__ import annotations

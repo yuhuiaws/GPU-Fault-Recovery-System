@@ -9443,7 +9443,9 @@ incident still `QUARANTINED`, the executor sends `quarantined-node-notice-zh-v1`
 nodes, the finding (the incident reasons; for the BMC, the alerting sensors with their readings, statuses and thresholds), the steps
 run, the cordon + taint, the jobs the remediation suspended and did not restart, and the two exits (`submit-remediation --disposition
 restore` after the repair; a close on the departure proof once the node is replaced); the incident state and the operator's exits do
-not change, and no support case is opened. When a GPU
+not change, and no support case is opened. When a step after the cordon fails (the job stop), the record ends FAILED and sends
+no such notice: the Dispatcher opens `workflow-support-after-<id>` (stage `held_chain_step`), whose support hand-off mail tells the
+operator. When a GPU
 cluster's remediation storm breaker trips, the dispatcher sends one `remediation-storm-tripped-zh-v1` per trip, category
 `OPERATOR_REVIEW`, priority 0 (ahead of the per-node mail a storm queues), subject `[GPU FAULT][remediation storm, operator action
 required] <cluster>: <N> nodes in 600s`, deduplication key `<cluster>/remediation-storm-tripped/<trip>`: the body names the numbers it

@@ -2493,6 +2493,11 @@ Whole-record hardware recovery escalation is invoked idempotently by the Dispatc
    `failed_nodes` is narrowed to the nodes the record still holds (`failure_outcome.held_scope`,
    `handoff_hold.record_held_nodes`), so when a STOP_WORKLOADS or CHECKPOINT_WORKLOADS compiled for the job's whole
    allocation fails, the successor cordons, quarantines and names the faulty node only, never the job's healthy ones.
+   A plan whose end is the hold itself -- the node-health QUARANTINE plan (FREEZE_EVIDENCE → MARK_UNSCHEDULABLE →
+   [STOP_WORKLOADS] → QUARANTINE), a terminal quarantine folded into another chain, a containment prefix -- plans no
+   ESCALATE_SUPPORT (its completed end is QUARANTINED with the terminal notice); when a step after its cordon fails (the
+   job stop), it gets the same hand-off (`failure_outcome.owes_hand_off`: a QUARANTINE no RESTORE_SCHEDULING readmits,
+   the terminal hold). A plan that cordons in order to release (a reset, a reboot, a cooldown) is not this rule's.
 
 ```mermaid
 flowchart LR

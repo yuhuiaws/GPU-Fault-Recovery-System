@@ -437,9 +437,142 @@ def test_a_failed_support_hand_off_is_terminated_not_handed_off_again() -> None:
     assert len(h.store.list_workflows()) == 1, "the terminator opens no successor"
 
 
+#: The node-health QUARANTINE plan of a BMC sensor, a host signal or a severe
+#: kernel line (``families/health._operations``): it plans no hand-off and
+#: ends with the node held -- its QUARANTINE carries the terminal hold.
+QUARANTINE_PLAN = [FREEZE, CORDON, STOP, QUARANTINE]
+TERMINAL = {"terminal_quarantine_node_ids": ["node-a"]}
+
+
+def terminal_hold(h: EscalationHarness, *, job_wide: bool = False) -> None:
+    """Give ``h``'s QUARANTINE its terminal hold (and its STOP the job's
+    whole allocation)."""
+
+    h.amend(
+        official_steps=[
+            step.model_copy(update={"parameters": {**step.parameters, **TERMINAL}})
+            if step.operation is QUARANTINE
+            else step.model_copy(update={"node_ids": ["node-a", "node-b"]})
+            if job_wide and step.operation in JOB_WIDE
+            else step
+            for step in h.workflow.official_steps
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    ("explicit", "job_wide"),
+    [(True, False), (False, False), (True, True)],
+    ids=["terminal-quarantine", "legacy-no-readmission", "job-wide-stop"],
+)
+def test_a_quarantine_plan_whose_stop_fails_hands_the_held_node_to_support(
+    explicit, job_wide
+) -> None:
+    """The QUARANTINE plan plans no ESCALATE_SUPPORT: its hand-off is the end
+    state itself (QUARANTINED, the terminal notice). A STOP_WORKLOADS that
+    fails after the cordon ended the record FAILED + QUARANTINED with no
+    ticket and no notice; the held node is now handed to support."""
+
+    h = held_chain(QUARANTINE_PLAN, QUARANTINE_PLAN.index(STOP))
+    if explicit:
+        terminal_hold(h, job_wide=job_wide)
+
+    classification = HardwareEscalationService.classify(h.workflow)
+    assert classification is not None, "the held node was left with nobody told"
+    assert classification[:3] == (
+        "held_chain_step",
+        RecoveryAction.ESCALATE_OPERATOR,
+        SUPPORT,
+    )
+    result = h.escalate()
+    assert result is not None, "the held node needs a durable hand-off"
+    incident, successor = result
+    assert incident.reasons[0].startswith(
+        "held_chain_step remediation failed; failed operation or validation: "
+        "STOP_WORKLOADS"
+    ), incident.reasons
+    assert incident.node_ids == ["node-a"], incident.node_ids
+    assert [(step.operation, step.node_ids) for step in successor.official_steps] == [
+        (FREEZE, ["node-a"]),
+        (CORDON, ["node-a"]),
+        (QUARANTINE, ["node-a"]),
+        (SUPPORT, ["node-a"]),
+    ], "the hold is kept and handed over: no stop again, no release, no node-b"
+    assert h.escalate() == result, "one support successor per failed plan"
+    assert len(h.store.list_workflows()) == 2
+
+
+def test_a_failed_containment_prefix_hands_its_held_node_to_support() -> None:
+    """A plan refused only for a missing owner runs its containment prefix as
+    safety steps; a prefix step failing after the hold (the diagnostic
+    bundle) leaves a FAILED record holding the node with neither the
+    contained hand-off notice (that is a settled record's) nor a ticket."""
+
+    prefix = [FREEZE, CORDON, QUARANTINE, BUNDLE]
+    h = held_chain(prefix, prefix.index(BUNDLE))
+    terminal_hold(h)
+    h.amend(
+        safety_steps=h.workflow.official_steps,
+        safety_only=True,
+        official_steps=[
+            *h.workflow.official_steps,
+            workflow_step(VALIDATE, node_ids=["node-a"]),
+            workflow_step(SUPPORT, node_ids=["node-a"]),
+        ],
+        step_executions=[
+            item.model_copy(update={"phase": "safety"})
+            for item in h.workflow.step_executions
+        ],
+    )
+
+    result = h.escalate()
+
+    assert result is not None, "the held node needs a durable hand-off"
+    incident, successor = result
+    assert incident.reasons[0].startswith("held_chain_step remediation failed"), (
+        incident.reasons
+    )
+    assert [step.operation for step in successor.official_steps] == [
+        FREEZE,
+        CORDON,
+        QUARANTINE,
+        SUPPORT,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("details", "expected", "why"),
+    [
+        (
+            REJECTED,
+            None,
+            "refused before dispatch: a stale generation, a newer one owns it",
+        ),
+        (
+            UNKNOWN_OUTCOME,
+            "manual_confirmation_required",
+            "an operator confirms the stop first: one ticket, not a second one",
+        ),
+    ],
+    ids=["executor-rejected", "unknown-outcome"],
+)
+def test_a_quarantine_plan_keeps_its_deliberate_stop_endings(
+    details, expected, why
+) -> None:
+    h = held_chain(QUARANTINE_PLAN, QUARANTINE_PLAN.index(STOP), details=details)
+    terminal_hold(h)
+
+    classification = HardwareEscalationService.classify(h.workflow)
+
+    assert (classification and classification[0]) == expected, why
+    h.escalate()
+    assert len(h.store.list_workflows()) == (1 if expected is None else 2), why
+
+
 def test_a_cooldown_plan_without_a_hand_off_still_opens_nothing() -> None:
-    """A legacy THERMAL_COOLDOWN plan cordons but plans no ESCALATE_SUPPORT:
-    nothing is owed by this rule, whatever step failed."""
+    """A legacy THERMAL_COOLDOWN plan cordons for a cooldown -- no terminal
+    hold -- and plans no ESCALATE_SUPPORT: nothing is owed by this rule,
+    whatever non-containment step failed."""
 
     cooldown = {"health_recovery_contract": {"mode": "THERMAL_COOLDOWN"}}
     operations = [FREEZE, CORDON, BUNDLE, SNAPSHOT, VALIDATE]

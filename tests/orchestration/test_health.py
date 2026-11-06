@@ -1113,3 +1113,115 @@ def test_a_held_chain_whose_step_fails_still_hands_the_node_to_support(
     assert context.store.get_incident(support_incident.incident_id).state is (
         IncidentState.ESCALATED
     ), "the hand-off ends ESCALATED, the state an operator closes after the RMA"
+
+
+def _severe_kernel_finding() -> NodeHealthFinding:
+    """A severe kernel line on a node running the job: the QUARANTINE plan
+    with its STOP (``log_recovery_context``: ``stop_on_isolation``)."""
+
+    return node_health_finding(
+        "finding-kernel-mce",
+        "kernel-mce",
+        observed_at=NOW,
+        category=NodeHealthCategory.MCE,
+        severity="critical",
+        reason="CPU or memory hardware error",
+        recommended_action=RecoveryAction.QUARANTINE,
+        runtime_profile_version="simulated-v1",
+        workload_state=WorkloadState.ACTIVE,
+        affected_workload_ids=["training/job/job-a"],
+        diagnostic_parameters={"stop_on_isolation": True},
+        policy_source="SITE_KERNEL_LOG",
+    )
+
+
+def test_a_quarantine_plan_whose_stop_fails_still_hands_the_node_to_support(
+    context: ApplicationContext,
+) -> None:
+    """The node-health QUARANTINE plan ends with the node held and plans no
+    ESCALATE_SUPPORT. Its STOP_WORKLOADS failing after the cordon used to end
+    the record FAILED + QUARANTINED with no ticket and no notice; the
+    dispatcher's failure handler now opens the support hand-off for the held
+    node, which ends ESCALATED."""
+    from gpu_fault.execution import WorkflowStepOutcome
+    from gpu_fault.models import IncidentState, WorkflowExecutionRequest
+    from tests._builders import active_workflow_executor
+
+    incident, workflow = context.orchestrator.ingest_node_health(
+        _severe_kernel_finding()
+    )
+    held = workflow.request_id
+    planned = [step.operation for step in workflow.official_steps]
+    assert planned == [
+        WorkflowOperation.FREEZE_EVIDENCE,
+        WorkflowOperation.MARK_UNSCHEDULABLE,
+        WorkflowOperation.STOP_WORKLOADS,
+        WorkflowOperation.QUARANTINE,
+    ], planned
+
+    class _SimulatedRuntime:
+        def __init__(self) -> None:
+            self.executed: list[tuple[str, WorkflowOperation]] = []
+
+        def supports(self, step: WorkflowStepSpec) -> bool:
+            return step.execution_owner == "simulated-runtime"
+
+        def execute(self, step_context) -> WorkflowStepOutcome:
+            operation = step_context.step.operation
+            self.executed.append((step_context.workflow.request_id, operation))
+            if (
+                operation is WorkflowOperation.STOP_WORKLOADS
+                and step_context.workflow.request_id == held
+            ):
+                return WorkflowStepOutcome.failed("the job did not suspend")
+            return WorkflowStepOutcome.succeeded(
+                operation_id=step_context.idempotency_key
+            )
+
+    adapter = _SimulatedRuntime()
+    result = active_workflow_executor(context.store, [adapter], planned).execute(
+        held, WorkflowExecutionRequest(expected_fencing_token=workflow.fencing_token)
+    )
+
+    assert result.status is WorkflowStatus.FAILED
+    failed = context.store.get_workflow(held)
+    assert context.store.get_incident(incident.incident_id).state is (
+        IncidentState.QUARANTINED
+    ), "the cordon holds the node"
+    assert context.store.list_notifications() == [], (
+        "the terminal notice is a completed hold's; a FAILED record's is the hand-off"
+    )
+
+    escalation = context.orchestrator.escalate_failed_hardware_remediation(failed)
+
+    assert escalation is not None, "the held node must still reach an operator"
+    support_incident, support = escalation
+    assert support.request_id == f"workflow-support-after-{held}"
+    assert support_incident.reasons[0].startswith(
+        "held_chain_step remediation failed; failed operation or validation: "
+        "STOP_WORKLOADS"
+    ), support_incident.reasons
+    assert [step.operation for step in support.official_steps] == [
+        WorkflowOperation.FREEZE_EVIDENCE,
+        WorkflowOperation.MARK_UNSCHEDULABLE,
+        WorkflowOperation.QUARANTINE,
+        WorkflowOperation.ESCALATE_SUPPORT,
+    ], "the hand-off keeps the hold: no stop again, no hardware rung, no release"
+    assert context.orchestrator.escalate_failed_hardware_remediation(failed) == (
+        escalation
+    ), "one support successor per failed plan"
+
+    handoff = active_workflow_executor(
+        context.store, [adapter], [step.operation for step in support.official_steps]
+    ).execute(
+        support.request_id,
+        WorkflowExecutionRequest(expected_fencing_token=support.fencing_token),
+    )
+
+    assert handoff.status is WorkflowStatus.SUCCEEDED
+    assert (support.request_id, WorkflowOperation.ESCALATE_SUPPORT) in (
+        adapter.executed
+    )
+    assert context.store.get_incident(support_incident.incident_id).state is (
+        IncidentState.ESCALATED
+    )
