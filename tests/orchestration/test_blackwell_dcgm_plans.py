@@ -14,7 +14,7 @@ raises are that window's to judge. The WARNING diagnostics -- a link recovery
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -65,6 +65,9 @@ Op = WorkflowOperation
 CLUSTER = "cluster-a"
 NODE = "node-0"
 NOW = datetime.now(timezone.utc).replace(microsecond=0)
+# The first batch is always older than the second: a module imported in a
+# minute's first second must not give both batches the same timestamp.
+EARLIER = NOW - timedelta(seconds=30)
 GPUS = [f"GPU-b300-{index}" for index in range(8)]
 B300 = "NVIDIA B300 SXM6 AC"
 
@@ -78,7 +81,7 @@ def node_findings(samples_by_batch, *, profile="simulated-v1", store=None):
         result = metrics.ingest(
             gpu_metric_batch(
                 f"bw-{index}",
-                NOW.replace(second=0) if index == 0 else NOW,
+                EARLIER if index == 0 else NOW,
                 GpuMetricSource.DCGM_EXPORTER,
                 samples,
                 cluster_id=CLUSTER,
