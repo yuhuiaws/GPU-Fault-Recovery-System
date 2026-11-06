@@ -419,3 +419,21 @@ def test_an_invalid_declared_block_fails_the_check_by_name(tmp_path: Path) -> No
             channel="ses",
             notifications={"channel": "ses", "emailSender": "not-an-address"},
         )
+
+
+def test_a_rerun_line_that_already_waits_is_told_to_wait_longer() -> None:
+    """The rerun line repeats the operator's own ``--wait-for-email-confirmation``;
+    the hint then asks for more minutes instead of adding the flag again."""
+
+    waiting = f"gpu-fault-admin deploy --state-dir /secure/x {PRECHECK.WAIT_FLAG} 5"
+    result = _result(ses=True, sns="PENDING")
+
+    message = PRECHECK.email_confirmation_refusal(result, rerun_command=waiting)
+    plain = PRECHECK.email_confirmation_refusal(
+        result, rerun_command="gpu-fault-admin deploy --state-dir /secure/x"
+    )
+
+    assert f"rerun: {waiting}" in message
+    assert f"or add {PRECHECK.WAIT_FLAG}" not in message
+    assert f"raise MINUTES of {PRECHECK.WAIT_FLAG} to wait longer" in message
+    assert f"or add {PRECHECK.WAIT_FLAG} MINUTES to the command" in plain

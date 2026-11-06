@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import sys
 from dataclasses import dataclass
 from functools import partial
@@ -463,6 +464,85 @@ def join_gpu_clusters(
         print(json.dumps(result, indent=2, sort_keys=True))
 
 
+# The public ``deploy`` options a printed rerun line repeats, as (attribute,
+# flag), in the order the line names them. Every public option is here or in
+# ``RERUN_OMITTED_OPTIONS`` -- a test reads both against the public help -- so
+# a new option is decided for the rerun line instead of silently dropped.
+_RERUN_VALUE_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("cpu_cluster_arn", "--cpu-cluster-arn"),
+    ("gpu_cluster_arn", "--gpu-cluster-arn"),
+    ("state_dir", "--state-dir"),
+    ("admin_config_file", "--config"),
+    ("alert_email", "--admin-email"),
+    ("approve_profile_plan", "--approve-profile-plan"),
+    ("reference", "--reference"),
+    ("grafana_workspace_id", "--grafana-workspace-id"),
+    ("grafana_viewer", "--grafana-viewer"),
+)
+_RERUN_SWITCHES: tuple[tuple[str, str], ...] = (
+    ("accept_schema_change", "--accept-schema-change"),
+    (
+        "accept_schema_change_without_snapshot",
+        "--accept-schema-change-without-snapshot",
+    ),
+    ("supersede_failed_transaction", "--supersede-failed-transaction"),
+    ("allow_inflight_installs", "--allow-inflight-installs"),
+)
+RERUN_REPEATED_OPTIONS = frozenset(
+    {
+        *(flag for _attribute, flag in (*_RERUN_VALUE_OPTIONS, *_RERUN_SWITCHES)),
+        WAIT_FLAG,
+    }
+)
+# ``--rollback`` never reaches a stop that prints the line. ``--registration-
+# cluster`` moved -- and journaled -- the anchor before the email check, and a
+# second move is refused (``reanchor_registration``).
+RERUN_OMITTED_OPTIONS = frozenset({"--rollback", "--registration-cluster"})
+
+
+def deploy_rerun_command(arguments: argparse.Namespace, state_dir: Path) -> str:
+    """The operator's ``gpu-fault-admin deploy`` command, for a stop to print.
+
+    The email-confirmation stop in the first minute
+    (``scripts/staging_deploy.py``) prints the line to rerun once the link is
+    clicked. Every public option the command was given is repeated with its
+    value -- the clusters (a joining one included), ``--config``, the
+    administrator address, the profile approval, the Grafana options, the
+    consents and the email wait -- so the rerun does what the stopped command
+    was asked to do; what is left out is ``RERUN_OMITTED_OPTIONS``. Paths are
+    absolute and every value is shell-quoted. Nothing is read from the
+    environment, and no deploy option carries a secret (credentials come from
+    the state directory and the caller's AWS identity), so the line holds only
+    what was typed.
+    """
+
+    words = ["gpu-fault-admin", "deploy"]
+    approves = bool(getattr(arguments, "approve_profile_plan", None))
+    for attribute, flag in _RERUN_VALUE_OPTIONS:
+        if attribute == "reference" and not approves:
+            # Typed for --registration-cluster, which is not repeated; a lone
+            # --reference is refused.
+            continue
+        value = getattr(arguments, attribute, None)
+        if attribute == "state_dir":
+            value = state_dir
+        elif attribute == "admin_config_file" and value:
+            value = Path(value).expanduser().resolve()
+        values = value if isinstance(value, list) else [value]
+        words.extend(
+            word for item in values if item for word in (flag, shlex.quote(str(item)))
+        )
+    words.extend(
+        flag
+        for attribute, flag in _RERUN_SWITCHES
+        if getattr(arguments, attribute, False)
+    )
+    wait = int(getattr(arguments, "wait_for_email_confirmation", 0) or 0)
+    if wait > 0:
+        words.extend((WAIT_FLAG, str(wait)))
+    return " ".join(words)
+
+
 def run_public_deploy(
     arguments: argparse.Namespace,
     state_dir: Path,
@@ -495,6 +575,7 @@ def run_public_deploy(
             wait_for_email_confirmation=int(
                 getattr(arguments, "wait_for_email_confirmation", 0) or 0
             ),
+            rerun_command=deploy_rerun_command(arguments, state_dir),
         )
     )
     if status or not delta or source_deploy_applied_release(state_dir):

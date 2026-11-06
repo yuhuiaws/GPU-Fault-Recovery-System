@@ -200,5 +200,11 @@ def email_confirmation_refusal(result: EmailConfirmation, *, rerun_command: str)
         )
     )
     lines.append(f"  rerun: {rerun_command}")
-    lines.append(f"  (or add {WAIT_FLAG} MINUTES to the command to wait for {links})")
+    if WAIT_FLAG in rerun_command.split():
+        # The line repeats the operator's own wait; more of it is the remedy.
+        lines.append(f"  (or raise MINUTES of {WAIT_FLAG} to wait longer for {links})")
+    else:
+        lines.append(
+            f"  (or add {WAIT_FLAG} MINUTES to the command to wait for {links})"
+        )
     return "\n".join(lines)

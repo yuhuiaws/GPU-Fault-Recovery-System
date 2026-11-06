@@ -351,6 +351,56 @@ def test_email_precheck_stops_before_the_source_scan(
     assert "--wait-for-email-confirmation" in err
 
 
+def test_the_email_stop_prints_the_command_the_operator_gave(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``gpu-fault-admin deploy`` hands its own command line down
+    (``--rerun-command``); the stop prints it rather than ``--state-dir`` alone,
+    which dropped a joining cluster and the consents. Hidden from the help: it is
+    the public command's, not an operator option of this script."""
+
+    state = tmp_path / "state"
+    _write_site(state)
+    events: list[str] = []
+    _stub_until_first_minute(
+        monkeypatch, state=state, events=events, report=None, manifest=None
+    )
+    pending = _email(ses=False, sns="PENDING")
+
+    def precheck(**kwargs: object) -> EmailConfirmation:
+        raise staging_deploy.StagingDeployError(
+            email_confirmation_refusal(
+                pending, rerun_command=str(kwargs["rerun_command"])
+            )
+        )
+
+    monkeypatch.setattr(staging_deploy, "precheck_email_confirmations", precheck)
+    joining = "arn:aws:eks:us-east-1:123456789012:cluster/gpu-b"
+    line = (
+        f"gpu-fault-admin deploy --gpu-cluster-arn {GPU_ARN} --gpu-cluster-arn "
+        f"{joining} --state-dir {state} --accept-schema-change"
+    )
+
+    status = staging_deploy.main(
+        [
+            "--state-dir",
+            str(state),
+            "--repo-root",
+            str(tmp_path / "repo"),
+            "--quiet",
+            "--rerun-command",
+            line,
+        ]
+    )
+
+    assert status == 2
+    assert f"rerun: {line}" in capsys.readouterr().err
+    assert (
+        staging_deploy.parser().parse_args(["--state-dir", "x"]).rerun_command is None
+    )
+    assert "--rerun-command" not in staging_deploy.parser().format_help()
+
+
 def test_email_precheck_forwards_the_wait_and_the_rerun_line(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

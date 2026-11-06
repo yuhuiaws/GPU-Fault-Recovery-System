@@ -1134,7 +1134,10 @@ def deploy(arguments: argparse.Namespace) -> dict[str, object]:
         channel=str(site_inputs.get("notification_channel") or "sns"),
         notifications=site_inputs.get("notifications"),
         wait_minutes=int(getattr(arguments, "wait_for_email_confirmation", 0) or 0),
-        rerun_command=deploy_rerun_command(
+        # The public command's own line when it handed one down; run directly,
+        # this script names the public command from its resolved inputs.
+        rerun_command=getattr(arguments, "rerun_command", None)
+        or deploy_rerun_command(
             state_dir=state_dir,
             first_deploy=first_deploy,
             cpu_cluster_arn=cpu_cluster_arn,
@@ -1326,6 +1329,9 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--base", default="origin/main")
     value.add_argument("--repo-root", type=Path, default=ROOT)
     value.add_argument("--quiet", action="store_true")
+    # ``gpu-fault-admin deploy`` passes the operator's command line
+    # (``deploy_command.deploy_rerun_command``) for the email stop to print.
+    value.add_argument("--rerun-command", help=argparse.SUPPRESS)
     return value
 
 

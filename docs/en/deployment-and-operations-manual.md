@@ -231,7 +231,8 @@ signed release and generates `site.yaml`. The ARN entry point is the only creato
 
 Within its first minute the first ARN deploy creates the site SNS topic, the email subscription and the publish permission according to
 `--admin-email` (a `channel: ses` site also gets an SES identity and send permission for its sender `emailSender`) and writes them into the internal site; until the subscription
-is confirmed it stops with exit status 2 (`nothing was deployed`) and prints the rerun command, or with `--wait-for-email-confirmation <minutes>` it
+is confirmed it stops with exit status 2 (`nothing was deployed`) and prints the rerun command (every option of this command again,
+minus `--registration-cluster`, whose anchor move happened before the stop), or with `--wait-for-email-confirmation <minutes>` it
 polls every 30 seconds instead. An existing site needs only the same state-dir; the hidden site mode does not accept online notification overrides.
 
 The first go-live must still complete the training smoke, REG-8 and the

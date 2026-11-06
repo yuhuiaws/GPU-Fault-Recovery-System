@@ -5073,7 +5073,10 @@ signature-verifies the deploy-host bundle, then installs the bundle into
 (`{"schema_version": 1, "state_dir": ...}`) at that venv root. It then re-enters the inner layer as `<deployer-venv>/bin/gpu-fault-admin preflight
 --state-dir` and `... deploy --prepared-source-release --repo-root <snapshot>`:
 `run_prepared_deploy` performs the bootstrap inside `administrator_operation_lock`, then releases automatically, and finally joins
-the GPU clusters waiting in `pending_gpu_cluster_arns`. The outer layer holds `site_operation_lock` throughout, and the site is
+the GPU clusters waiting in `pending_gpu_cluster_arns`. The outer hop also hands the operator's whole command line
+(`deploy_rerun_command`) to `scripts/staging_deploy.py` as the hidden `--rerun-command`: that line is the rerun command printed when
+the first-minute email confirmation stops the deploy, minus `--registration-cluster`, which took effect before the stop and is refused
+a second time. The outer layer holds `site_operation_lock` throughout, and the site is
 not re-read between classification
 (`UNCHANGED`/`DEPLOY_HOST_ONLY`/`APPLICATION_RELEASE`) and application. An installed
 deploy-host is constrained by `admin/deploy_host_binding.py` to its bound state-dir: the CLI entry point calls

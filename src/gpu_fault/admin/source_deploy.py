@@ -116,7 +116,15 @@ def run_source_deploy(
     current_directory: Path,
     extra_environment: Mapping[str, str] | None = None,
     wait_for_email_confirmation: int = 0,
+    rerun_command: str | None = None,
 ) -> int:
+    """Run the source preparer (``scripts/staging_deploy.py``) for this deploy.
+
+    It receives the resolved inputs; ``rerun_command`` is the operator's own
+    command line (``deploy_command.deploy_rerun_command``), which a stop in its
+    first minute prints to be rerun.
+    """
+
     repository_root = resolve_source_repository(
         state_dir,
         current_directory=current_directory,
@@ -147,6 +155,8 @@ def run_source_deploy(
         command.extend(
             ("--wait-for-email-confirmation", str(wait_for_email_confirmation))
         )
+    if rerun_command:
+        command.extend(("--rerun-command", rerun_command))
     completed = run_driver(
         command,
         cwd=repository_root,
