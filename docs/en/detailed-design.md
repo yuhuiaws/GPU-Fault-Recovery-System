@@ -56,7 +56,7 @@ flowchart TB
         RES["Installed-resource registry §2.22<br/>AWS resource lifecycle"]
     end
     subgraph ST["Persistence §3"]
-        DB[("Aurora PostgreSQL<br/>seven families, 17 tables §3.1")]
+        DB[("Aurora PostgreSQL<br/>eight groups, 21 tables §3.1")]
     end
 
     COL -->|HTTP report| API
@@ -1232,8 +1232,8 @@ one cordons first (FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → ESCALATE_SUPPORT).
   `tests/regional/test_dataplane_dcgm_counters.py`, and the evidence pins in `tests/test_dcgm_gap_field_evidence.py`.
 
 **HGX B200/B300 DCGM fields (`src/gpu_fault/gpu_nvlink5_policy.py`, `src/gpu_fault/gpu_fabric_health.py`,
-`src/gpu_fault/gpu_memory_repair_policy.py`).** A Blackwell field audit that re-judged every DCGM field for HGX
-B200/B300 (`p6-b200.48xlarge`, `p6-b300.48xlarge`; driver R580, DCGM 4.7.0) found a blocker: NVML does not report the
+`src/gpu_fault/gpu_memory_repair_policy.py`).** Judging every DCGM field for HGX
+B200/B300 (`p6-b200.48xlarge`, `p6-b300.48xlarge`; driver R580, DCGM 4.7.0) meets one blocker: NVML does not report the
 NVLink data-link counters on Blackwell, so on those counters alone a B-series node could never satisfy the required NVLink fields -- a permanent
 `dcgm_field_completeness` finding, `RUN_DIAGNOSTICS` after 180 s, every VALIDATE_GPU refused on `active_gpu_health_findings`,
 VALIDATE_FABRIC waiting for `missing_fabric_metric_groups` until its cap, and the legacy deploy's endpoint probe calling the
@@ -4217,8 +4217,8 @@ it records, and starts again at WARMUP when another attempt takes the node (§2.
 health-signal retention sweep reclaims the window rows it left (§3.2.1).
 
 Both rules are graded per GPU, and only on the GPUs that attempt holds (`host_low_utilization.py`). Graded per node, a
-job holding one GPU of eight (DESTR-012 group D, or any partial-node job in production) left seven unallocated GPUs that
-read 0 % by definition, and after 300 s each was reported as "GPU idle while a training workload is active". The GPUs an
+job holding one GPU of eight (DESTR-012 group D, or any partial-node job in production) would leave seven unallocated GPUs that
+read 0 % by definition, and after 300 s each would be reported as "GPU idle while a training workload is active". The GPUs an
 attempt holds are the union of the `gpu_uuids` of its live containers on the node: the completion watcher reads the Pod's
 `gpu-fault.io/gpu-uuids` annotation or, without it, runs `nvidia-smi --query-gpu=uuid` inside the running container
 (`GPU_FAULT_DISCOVER_POD_GPU_UUIDS`, on by default). HyperPod and plain EKS go through the same Pod parsing, which yields
@@ -5149,8 +5149,10 @@ the private proxy methods of `IncidentOrchestrator`.
 
 Production Aurora uses PostgreSQL. The physical schema is created in one pass by
 `create_postgres_schema()` in `src/gpu_fault/store/postgres/ddl.py`;
-the application creates **17 base tables** in total, divided into seven groups by responsibility. PostgreSQL system tables,
-TOAST tables, logical views and indexes are not counted toward the table count here.
+the application creates **21 base tables** in total, divided into eight groups by responsibility;
+`gpu_fault_processor_replays` and `gpu_fault_gpu_metric_latest_clusters` are partitioned parents, each with a DEFAULT partition,
+and child partitions are created at run time per five-minute range and per cluster (`store/postgres/hot_layout.py`).
+PostgreSQL system tables, TOAST tables, logical views, indexes and partitions are not counted toward the table count here.
 
 The grouping is based on access pattern, not business concept: the generic object tables are "low-frequency writes, point lookups by kind/key", the hot-state
 dedicated tables are "high-frequency overwrite, targeted queries by dimension", and the queue and counter tables are "very high-frequency writes + row-level contention". Putting them in
@@ -5189,15 +5191,22 @@ flowchart TB
         T16["remote_commands<br/>status/lease separated from snapshot"]
         T17["workflows<br/>status/lease separated from progress"]
     end
+    subgraph G8["v23 detached hot layout (4)"]
+        T18["processor_payloads<br/>request bodies, BYTEA"]
+        T19["processor_replays<br/>completed replays, five-minute RANGE partitions"]
+        T20["gpu_metric_latest_clusters<br/>LIST partitions by cluster"]
+        T21["hot_layout_mode<br/>inline / detached"]
+    end
 
     G1 -.->|startup check| G2
     G4 -->|admission quota| G5
     G6 -->|re-injected after coalescing| G4
     G2 -->|incident/workflow/evidence| G3
     G2 -->|phased migration| G7
+    G4 -->|request bodies and completed replays| G8
 ```
 
-Figure 3-1 Seven families, 17 tables, grouped by access pattern
+Figure 3-1 Eight groups, 21 tables, grouped by access pattern
 
 | Group | Table | Primary key / core columns | Purpose |
 |---|---|---|---|
@@ -5218,6 +5227,10 @@ Figure 3-1 Seven families, 17 tables, grouped by access pattern
 | control-state dedicated tables | `gpu_fault_control_state_modes` | `kind PRIMARY KEY`; `mode`, `revision`, backfill checkpoints and `legacy_purged` | Per-kind migration source of truth for the two kinds; defaults to legacy and is not switched via process environment variables. |
 | control-state dedicated tables | `gpu_fault_remote_commands` | `command_id PRIMARY KEY`; identity, status, lease columns and `snapshot` | v15: in dedicated-table mode, lease renewal does not rewrite the workflow/incident snapshot; the lease columns and updated_at are not indexed. |
 | control-state dedicated tables | `gpu_fault_workflows` | `request_id PRIMARY KEY`; status, version guard, lease, time columns and `payload` | v16: keeps the pagination, reconcile and CAS/fencing semantics; lease renewal touches only unindexed lease columns. |
+| v23 detached hot layout | `gpu_fault_processor_payloads` | `request_id PRIMARY KEY`; `body BYTEA` | request bodies under the detached layout; the queue row keeps only the routing and scheduling columns. |
+| v23 detached hot layout | `gpu_fault_processor_replays` | `PRIMARY KEY(request_id, completed_at)`; `cluster_id`, `envelope JSONB`, `body`, `response_status`/`response_content_type`/`response_body`; `PARTITION BY RANGE (completed_at)` | completed requests and their response replay, one partition per five minutes plus DEFAULT; retention drops whole partitions. |
+| v23 detached hot layout | `gpu_fault_gpu_metric_latest_clusters` | `PRIMARY KEY(cluster_id, key)`; `node_id`, `observed_at`, `payload`; `PARTITION BY LIST (cluster_id)` | the per-cluster partitioned twin of `gpu_fault_gpu_metric_latest`; a cluster's partition is created at registration and dropped at removal. |
+| v23 detached hot layout | `gpu_fault_hot_layout_mode` | single row; `mode CHECK(mode IN ('inline','detached'))` | which layout writers use: `inline` on an upgraded database, `detached` on a fresh one. |
 
 The four hot-state dedicated tables take part in the read/write path only when `GPU_FAULT_POSTGRES_HOT_STATE_MODE`
 is `dual`/`dedicated`;
@@ -5230,6 +5243,14 @@ dedicated. dual mirrors inside the old-table write transaction; dedicated has th
 Backfill, verification, cutover, retirement of old rows/indexes and failure recovery are described in
 [Control-state dedicated table implementation](components/postgres-state-tables.md). The three logical read views uniformly cover both compatibility rows and dedicated-table rows,
 add no new logical kind, and do not change the archive file format.
+
+The v23 detached hot layout (`store/postgres/ddl_processor_layout.py`) is independent of those modes as well:
+`gpu_fault_hot_layout_mode` decides the writers' layout, seeded `inline` (the v22 layout) on an upgraded database and `detached`
+on a fresh one, and switched by `gpu-fault-store-migrate --set-hot-layout detached` after the control-plane roll; readers always
+read both layouts. Under `detached` request bodies go to `gpu_fault_processor_payloads` and completed requests move into
+`gpu_fault_processor_replays`, so the queue heap carries only in-flight rows and retention drops whole partitions; the queue gains
+the two columns the hot statements read (`path`, `scope_keys`), filled from the payload by a BEFORE INSERT trigger when a writer
+of the previous release leaves them NULL, so old and new Pods write the same table.
 
 The Processor performs a path-level freshness decision on PENDING requests. XID, SXID, Kernel/Fabric Manager
 faults, failure/terminal and administrator actions are safety and audit events and are never discarded because of queue age.
@@ -5263,22 +5284,14 @@ currently a mismatch: the first observation is `baseline:<resource>`, entering a
 `recovered:<resource>`, and a batch that is **healthy and identical to the previous one, delivered only because the summary period expired** is
 `health-summary`. This directly determines capacity: `app/ingest/telemetry.py` writes raw evidence only when there is a finding, a
 collection error, or a delivery reason other than just `health-summary`, so labelling an unchanged healthy delivery
-as `recovered:` would make every healthy node write one evidence record per summary period forever (measured:
-an idle node produced 17 records in 40 minutes, efa/gpu alternating roughly every 150 seconds).
+as `recovered:` would make every healthy node write one evidence record per summary period forever.
 `TRIGGER_HEALTH_SNAPSHOT` writes GPU and Host request files under `/var/lib/gpu-fault/health-snapshot/`
 and then restarts the Collector; when the Collector detects a request file it skips the startup phase and deletes the
 file after a successful sample.
 
-The live snapshot is only a capacity baseline; the numbers change with operation; `pg_total_relation_size` includes the main table, indexes and
-TOAST. The table below is the measurement taken on 2026-08-11 of the only four tables that existed at the time; the hot-state dedicated tables,
-counter tables and spool table added since have no corresponding snapshot, and capacity assessment must be re-measured:
-
-| Table | Row count measured 2026-08-11 | Total size |
-|---|---:|---:|
-| `gpu_fault_objects` | 34,300 | 435,077,120 bytes, about 415 MiB |
-| `gpu_fault_links` | 1,432 | 876,544 bytes, about 856 KiB |
-| `gpu_fault_processor_queue` | 19 | 13,099,008 bytes, about 12.5 MiB |
-| `gpu_fault_processor_lanes` | 24 | 98,304 bytes, about 96 KiB |
+Capacity must be measured per site (`pg_total_relation_size` includes the main table, indexes and TOAST): the numbers change
+with operation, and the hot-state dedicated tables, counter tables, spool and v23 detached-layout tables shift the distribution
+across tables, so this document gives no fixed snapshot.
 
 #### 3.1.1 `gpu_fault_objects`
 
@@ -5315,9 +5328,9 @@ are grouped as:
 - XID correlation: `xid_correlation_event`, `xid_policy_decision`,
   `xid_correlation`, `xid_metric_baseline`.
 
-`processor_request` is written to both `gpu_fault_processor_queue` and
-`gpu_fault_objects`. The former is the authoritative path for current high-frequency claims; the latter serves replicas that still
-read the old generic object format during a rolling upgrade. Completed cleanup deletes both records at the same time.
+`processor_request` is written only to `gpu_fault_processor_queue` (under the detached layout the body is in
+`gpu_fault_processor_payloads` and the completed record in `gpu_fault_processor_replays`); `processor_request` rows an early
+release left in `gpu_fault_objects` are deleted by the completed cleanup alongside.
 
 Partial/expression indexes are built for hot queries:
 
@@ -5378,17 +5391,22 @@ This table splits the processor hot path out of JSONB full-table scans. Core col
   `STRICT/REORDERABLE`, default `STRICT`.
 - Lease/fencing: `lease_owner`, `leader_epoch`, `lease_token`,
   `lease_expires_at`.
-- Replay: the three normalized columns `response_status`, `response_content_type`, `response_body_base64`
-  hold the completion response, and `payload JSONB` holds the full request. The three columns are appended by
-  `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, supporting rolling upgrades.
+- Hot-path columns (v23): `path` and `scope_keys`, so that no index references `payload` any more.
+- Replay: under the inline layout the three normalized columns `response_status`, `response_content_type`,
+  `response_body_base64` hold the completion response and `payload JSONB` holds the full request (the three columns are
+  appended by `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, supporting rolling upgrades); under the detached layout the body is
+  in `gpu_fault_processor_payloads` and a completed request moves, with its response, into `gpu_fault_processor_replays`.
 
-Partial indexes on `status IN ('PENDING','LEASED')` respectively cover the global priority claim
-(`..._priority_claim`), per-endpoint pooled claim (`..._path_priority_claim`, indexing the
-`payload->>'path'` expression), cluster backlog (`..._cluster`,
-`..._incomplete_cluster`), lane busy check (`..._lane`) and correlation promotion
-(`..._correlation_scopes`); `..._completed` indexes only `COMPLETED` rows for cleanup.
-`gpu_fault_processor_queue_available(status, not_before, priority, created_at,
-request_id)` provides the availability scan entry point for delayed retry.
+The v23 index set has no `status` predicate and no lease column (`ddl_processor_layout.create_processor_queue_indexes`), so claims,
+completions and coalescing rewrites are HOT updates: the global claim window
+`..._claim_window (priority, created_at, request_id)`, the per-endpoint pools'
+`..._path_claim_window (path, priority, created_at, request_id)`, the lane probe
+`..._lane_rows (ordering_key)`, the cluster backlog `..._cluster_rows (cluster_id, created_at)` and a GIN `..._scope_keys` over
+the rows that carry scope keys (`WHERE cardinality(scope_keys) > 0`). The eight status-predicated v22 indexes (`..._priority_claim`,
+`..._path_priority_claim`, `..._lane`, `..._cluster`, `..._incomplete_cluster`, `..._available`, `..._completed`,
+`..._correlation_scopes`; `RETIRED_QUEUE_INDEXES`) are dropped by the v23 migration callback. A claim transaction starts with
+`SET LOCAL enable_seqscan = off` and `enable_material = off` (`planner_discipline.HOT_PATH_PLANNER_SETTINGS`, for claims only,
+never for the admission, completion or lease transactions), so the planner walks the claim-window index in claim order.
 Claim uses `FOR UPDATE SKIP LOCKED`; a completion write must verify both the request lease and the lane
 epoch/token. The periodic cleanup task deletes by
 `GPU_FAULT_PROCESSOR_COMPLETED_RETENTION_SECONDS`, whose production value is 600 seconds.
@@ -5400,23 +5418,20 @@ function itself keeps only the rows that became PENDING) issue at most one
 `pg_notify('gpu_fault_processor_queue', {priority, path})` per distinct `(path, priority)` in a statement, and only when
 no PENDING row for that key existed outside the statement: since schema v22 one parameterised `EXISTS` probe per distinct
 key (function-level `SET enable_seqscan / enable_bitmapscan / enable_hashjoin / enable_mergejoin = off`, so whatever the
-statistics say it walks `gpu_fault_processor_queue_path_priority_claim` in index order and stops at the first PENDING row
+statistics say it walks the `(path, priority, ...)` index -- `gpu_fault_processor_queue_path_claim_window` from v23 -- in index order and stops at the first PENDING row
 that is not the statement's own); a writer of an idle key takes the try-only advisory xact lock and probes once more
 under it (the previous holder's commit is visible to new snapshots before the lock is released), so exactly one of the
-concurrent first writers notifies, and writers of a busy key neither touch the lock nor wait. v21 wrote the probe as one
-`NOT EXISTS` anti-join over the transition table: plpgsql caches that statement's plan per backend, a pooled ingress
-backend first ran it while the queue was empty, the planner hashed the queue side (estimated at one row) and probed it
-with the transition rows, and kept that plan until autoanalyze invalidated it -- on the grown backlog a 10-row admission
-INSERT read 49k shared buffers in 250-320 ms (the whole PENDING backlog hashed once per inserted row), and 190 such
-statements at once were the perf suite's 30-65 s `LWLock:BufferContent` convoy at load start, bimodal from run to run
-because it depended on when autoanalyze happened to land (`tests/store/test_postgres_notify_probe_cost.py` lays the same
-trap -- plan while the table is empty, grow it by 5,000 rows without ANALYZE -- and proves the pages a 10-row INSERT
-reads do not grow with the backlog). The reason: every transaction that issued NOTIFY takes
+concurrent first writers notifies, and writers of a busy key neither touch the lock nor wait. The probe is not an
+`NOT EXISTS` anti-join over the transition table: plpgsql caches a statement's plan per backend, a pooled ingress backend first
+runs it while the queue is empty, and the planner would hash the queue side (estimated at one row) and keep that plan until
+autoanalyze invalidates it, so on a grown backlog every admission INSERT would hash the whole PENDING backlog, and many such
+statements at once are the load-start `LWLock:BufferContent` convoy (`tests/store/test_postgres_notify_probe_cost.py` lays the
+same trap -- plan while the table is empty, grow it by 5,000 rows without ANALYZE -- and proves the pages a 10-row INSERT
+reads do not grow with the backlog). At most one notification, because every transaction that issued NOTIFY takes
 `PreCommit_Notify`'s `AccessExclusiveLock on object 0 of class 1262` (the database object) at COMMIT and holds it across its
-WAL flush so queue entries appear in commit order -- with one `pg_notify` per row every admission flush notified (~570k per
-r1 run, 548k of them filtered as irrelevant by the listeners), and once v20 had removed the counter-row convoy the flushes
-reached COMMIT together and queued on that lock (2389 waits of 1 s or more in a 15-minute window, 70% of active statements
-COMMIT, Aurora CommitLatency 21-29 ms); the expired admission batches were the reserved 503s. Listeners treat
+WAL flush so queue entries appear in commit order -- with one `pg_notify` per row every admission flush would notify (most
+of them filtered as irrelevant by the listeners), the flushes would reach COMMIT together and queue on that lock, and the
+expired admission batches are reserved 503s. Listeners treat
 notifications as hints: the trigger assumes a woken claim loop polls until its streams are empty, so a key that already has
 PENDING work gets no second wakeup. The empty-round backoff does not keep that assumption: a priority-0 row admitted while
 another row of its path is PENDING (lane leased, `not_before` deferred, held by the observation interlock) raises no
@@ -5429,26 +5444,22 @@ finishing fault worker claims the fault stream at once, so such a row waits at m
 0.6 s). A finishing worker of any pool wakes the claim loop at once (`SlotWake`; any number of finishes coalesce into
 one wake): a standing backlog raises no edge, and otherwise the loop sleeps to its nearest stream deadline -- the
 fallback once the fault stream has backed off with no fault-tier row -- so in a burst whose fault rows came last the
-freed gpu and host slots waited for that deadline (761 instead of 1,152 rows in flight). While fault-tier work may be
+freed gpu and host slots would wait for that deadline. While fault-tier work may be
 due -- the fault stream polls below its idle ceiling because it takes rows, because busy pools hold it after a fault
 claim, or because the lane probe holds it behind a leased lane -- such a wake claims the fault stream first: the rounds
 its cadence would run anyway, only sooner. Fault pressure asks for more: it holds the evidence pools back while the
 process runs a fault worker, and while the lane probe of its latest fault round found fault-tier rows behind leased
 lanes (the backlog probe's yes still held), so in every process that sees such rows, not only in one that runs a fault
-worker. The busy rounds after a fault claim ask the store nothing and press nothing: while they counted, a burst whose
-faults were done kept its telemetry pools at one worker until the fault stream settled (82-85% occupancy in the burst
-below instead of 91-92%). A backlog that is only deferred or held by the observation interlock triggers neither. On
-local Postgres (six coordinators with the production pool split, 4,704 burst rows, 1 s per replay) the wake raises the
-drain from 186-214 to 307-318 rows/s and the occupancy of the telemetry slots from 63-68% to 90-93%, while the idle
-rounds stay at one fault round per 5 s per coordinator and the first fault row is still claimed within 10 ms of its edge
-(`tests/processor/test_fault_stream_wake.py` pins the refill: at least 90% occupancy, 33% before). The fault stream's
-0.5 s cadence is only needed while a row can be silent, and on an idle queue it made 97% of a perf run's fault claim
-rounds empty (23-26k per integrated run instead of 5-6k). The trigger's "is the key busy" probe reads PENDING rows only,
+worker. The busy rounds after a fault claim ask the store nothing and press nothing: were they counted, a burst whose
+faults were done would keep its telemetry pools at one worker until the fault stream settled. A backlog that is only deferred or held by the observation interlock triggers neither. The wake keeps the telemetry slots
+of a burst full, while the idle rounds stay at one fault round per 5 s per coordinator and the first fault row is still claimed
+right after its edge (`tests/processor/test_fault_stream_wake.py` pins the refill: at least 90% occupancy). The fault stream's
+0.5 s cadence is only needed while a row can be silent; on an idle queue it would only produce empty rounds. The trigger's "is the key busy" probe reads PENDING rows only,
 so a silent row needs another PENDING row of its path and priority, hence of the fault tier; a LEASED row never silences
 an edge and becomes claimable without a statement only when its lease lapses. `has_unleased_fault_backlog(now=...)`
 therefore asks for a fault-tier row that is PENDING (deferred, lane-blocked or held by the interlock alike) or LEASED
-with a lapsed lease -- not for one a worker still holds, which kept every process on the 0.5 s cadence for as long as a
-fault handler ran (`processor_fault_backlog_depth()`, PENDING or LEASED, still drives the spool's fault pressure and the
+with a lapsed lease -- not for one a worker still holds, which would keep every process on the 0.5 s cadence for as long as a
+fault handler runs (`processor_fault_backlog_depth()`, PENDING or LEASED, still drives the spool's fault pressure and the
 acceptance probes). With notifications on, an empty fault round that neither busy pools nor the lane probe hold asks it
 as soon as the fallback would give a longer interval than 0.5 s, settled or not -- after an edge the stream doubles 0.2,
 0.4, 0.8, 1.6, 3.2 s out to the fallback instead of first polling eight rounds at 0.5 s -- and with none the stream
@@ -5459,7 +5470,7 @@ process while a backlog exists; a store that cannot answer, or a failed query, k
 after the empty claim, so what it cannot see is a row that commits later without an edge -- one whose edge went to a
 concurrent first writer that rolled back, or one admitted behind a PENDING row that completed before it committed -- and
 a lease that lapses after the read; each waits for the stream's next poll, at most the fallback -- a fault row whose
-holder died is claimed again within 5 s of its lease lapsing instead of about 0.5 s (the lease-reclaim sweep also hands
+holder died is claimed again within one fallback interval (5 s) of its lease lapsing (the lease-reclaim sweep also hands
 a lapsed row back to PENDING, which the trigger announces). The lane probe is asked first, as on every stream: a
 lane-blocked backlog keeps the stream polling, because no edge announces a freed lane and only a fault worker finishing
 in this process claims the fault stream at once -- the fault stream's routine-tier rows (collector health, admin and
@@ -5468,10 +5479,10 @@ fault-tier row waits and at the routine busy ceiling (0.4 s), the one those rows
 does. The same test file proves the idle side: with no backlog the two coordinators poll the fault stream about once per
 5 s instead of ten times and 5-6 times in the 5 s after an edge instead of 9-10, a row admitted to the empty queue is
 claimed on its NOTIFY within 1 s, rows queued behind a deferred fault row are claimed within 0.6 s again, a fault row
-held by a worker of a third process leaves the idle streams at about one poll per 5 s (ten before) while the next row of
+held by a worker of a third process leaves the idle streams at about one poll per 5 s while the next row of
 its path is claimed on its own edge and the held row is claimed again within the fallback once its lease lapses, and a
-routine row queued behind a lane held elsewhere is claimed within 0.5 s of the lane freeing (about 3 s before) while the
-streams poll it at most once per 0.4 s. The payload carries no `request_id` any more: one edge wakes every shard-owning
+routine row queued behind a lane held elsewhere is claimed within 0.5 s of the lane freeing while the
+streams poll it at most once per 0.4 s. The payload carries no `request_id`: one edge wakes every shard-owning
 listener (`notify_work_available` applies no shard filter to a payload without `request_id`; per-row payloads with one
 are still routed). A suppressed or lost edge on a routine stream costs at most one fallback poll:
 `processor_notification_fallback_seconds` for a shard owner (default 5 s,
@@ -5489,36 +5500,31 @@ One row per `ordering_key`. `owner_id + epoch + lease_token` identify the curren
 owner, and `lease_expires_at` allows another Pod to take over after the owner fails. On request completion or release, the
 fencing fields of both the lane and the request must be verified.
 
-Expired-lease takeover goes through the claim CTE's primary-key path (`ON CONFLICT (ordering_key) ... WHERE
-lease_expires_at <= now`) and needs no index on `lease_expires_at`. expiry is an ownership lease, not a data TTL; lane
-rows are reused and updated in place by subsequent requests -- since v19 `lease_expires_at` is no longer indexed and the
+Expired-lease takeover goes through the claim CTE's primary-key path
+(`ON CONFLICT (ordering_key) ... WHERE lease_expires_at <= now`) and needs no index on `lease_expires_at`. Expiry is an
+ownership lease, not a data TTL; lane
+rows are reused and updated in place by subsequent requests -- since v19 `lease_expires_at` is not indexed and the
 table's `fillfactor` is 50, so these updates are HOT. Lane rows are deleted by the periodic `cleanup_processor_lanes`:
 lanes whose lease expired with no PENDING/LEASED request on the same ordering key are removed in LIMIT batches, by
 default one hour after expiry, by a sequential scan of the very table that retention keeps small.
 
 A claim takes a transaction-scoped try-lock on each lane it is about to lease (`pg_try_advisory_xact_lock`, the two-key
 form in a key space of its own) and skips a lane that another claim is leasing at that moment instead of waiting for it.
-The lane upsert used to queue on the other claim's uncommitted lane row -- for a new lane, on its speculative insert --
-until that claim committed, and then found the lane leased: 1.6 s for nothing behind a claim held open 2 s, between the
-gpu and host evidence of one node lane and for a P10 claim behind its lane's evidence
-(`tests/store/test_postgres_lane_claim_guard.py`). The upsert's `WHERE lease_expires_at <= now` stays the fence against
+Otherwise the lane upsert would queue on the other claim's uncommitted lane row -- for a new lane, on its speculative
+insert -- until that claim commits, and only then find the lane leased, a wait for nothing between the gpu and host evidence
+of one node lane and for a P10 claim behind its lane's evidence (`tests/store/test_postgres_lane_claim_guard.py`). The upsert's `WHERE lease_expires_at <= now` stays the fence against
 a double lease; the try-lock only spares the wait and is taken once per row the claim selected, never inside the window
 scans (`tests/store/test_postgres_claim_planner_discipline.py`). SQLite runs one claim at a time, so a claim there never
 meets another claim's uncommitted lane.
 
 #### 3.1.5 admission Counters: A Per-Writer-Backend Ledger
 
-The admission quota needs the "current number of incomplete requests". Originally there was only
-`gpu_fault_processor_queue_counts` with one row per cluster, so the counter transaction of routine telemetry contended for the same row lock with
-priority=0 fault requests; the next step sharded by priority bucket and a hash of the request id into 16 shards. Hash shards still put every
-concurrent flush and completion of one cluster on the same set of rows: of five perf r1 rounds on one release and one database, two passed
-(1449/1542 req/s) and two failed (663/490 req/s, reserved 503 share 2.75%/21.6%) with neither node nor Aurora CPU saturated; the RDS
-`log_lock_waits` showed 4665/6984 lock waits of a second or more per 14-minute failing window (603/523 in passing ones), the "while inserting
-index tuple" waits landing on `gpu_fault_processor_priority_count_shards` 6990/8907 times (1080/988) and on `gpu_fault_processor_queue_counts`
-196/551 times (0) -- ShareLock on transaction and AccessExclusiveLock on tuple inside the statement-level counter triggers. Every concurrent
-transaction upserted the same (cluster, bucket, shard) rows and the same per-cluster count row, so they queued behind each other for their whole
-duration; the total lock order added earlier to remove 103 deadlocks had turned them into a convoy, and a commit-latency rise from 0.3 to 1.4 ms
-was enough to make a system already 62% waiting on Lock:transactionid expire its admission batches (the 503s).
+The admission quota needs the "current number of incomplete requests". One count row per cluster would make the counter
+transaction of routine telemetry contend for the same row lock with priority=0 fault requests; sharding by priority bucket and a hash
+of the request id still puts every concurrent flush and completion of one cluster on the same set of rows: every concurrent
+transaction upserts the same (cluster, bucket, shard) rows and the same per-cluster count row (ShareLock on transaction and
+AccessExclusiveLock on tuple inside the statement-level counter triggers), they queue behind each other for their whole duration,
+a total lock order added to remove deadlocks turns that into a convoy, and under load it expires admission batches (reserved 503s).
 
 Since v20 both counter tables are a ledger with one row set per writer backend (`ddl_counter_ledger.py`):
 
@@ -5533,7 +5539,7 @@ gpu_fault_processor_queue_counts
 ```
 
 A backend only rewrites its own rows, and the rows hold signed partial sums -- when backend B completes a request backend A admitted, B's row goes
-negative while the aggregate stays exact, which is why the `incomplete_count >= 0` checks and the `greatest(0, ...)` clamps are gone (with
+negative while the aggregate stays exact, which is why there is no `incomplete_count >= 0` check and no `greatest(0, ...)` clamp (with
 per-writer rows a clamp would make the aggregate drift upward). Every reader (`_processor_counter_depths`, `processor_queue_stats`,
 `processor_queue_count_status`, the global-boundary read) already sums per cluster or per (cluster, bucket). Two live backends share rows only
 when their pids are equal modulo 128; even then both apply their deltas in the same total (scope, bucket, shard) order, so a collision costs a wait,
@@ -5592,7 +5598,7 @@ The indexes are `..._available (available_at, spool_key)`,
 the processor queue (schema v21): at most one `pg_notify('gpu_fault_telemetry_spool', {path})` per distinct `path` per
 statement, and only when no claimable row of that path (`available_at <= clock_timestamp()`, the consumer's own predicate)
 existed outside the statement -- since schema v22 probed per path with a parameterised `EXISTS`, once more under the
-try-only advisory xact lock, under the same function-level planner pins, along the `..._path_available` index; the E-8
+try-only advisory xact lock, under the same function-level planner pins, along the `..._path_available` index; the
 row rule stays -- every insert, and every update that makes a row available no
 later than before (coalesce, abandon), is an edge, while a claim or release that pushes the lease into the future stays
 quiet, and the new row's own stamp is never compared with a clock. A lost edge costs at most
@@ -5600,8 +5606,8 @@ quiet, and the new row's own stamp is never compared with a clock. A lost edge c
 
 #### 3.1.7 Index and Trigger Totals
 
-`index_builder.declared_index_statements()` currently aggregates the 81 non-primary-key index declarations of `ddl*.py`
-(`ddl.py`, `ddl_control_plane_review.py`, `ddl_processor_retry.py`, `ddl_spool.py` and the dedicated-table DDL).
+`index_builder.declared_index_statements()` currently aggregates the 77 non-primary-key index declarations of `ddl*.py`
+(`ddl.py`, `ddl_control_plane_review.py`, `ddl_processor_retry.py`, `ddl_processor_layout.py`, `ddl_spool.py` and the dedicated-table DDL).
 Of these, 13 belong to the workflow/remote_command dedicated tables; legacy indexes whose retirement is complete are excluded from the runtime
 required set, and ensure does not rebuild them. v12 added 6:
 `gpu_fault_workflow_status_count`, `gpu_fault_incident_state_count`,
@@ -5609,7 +5615,7 @@ required set, and ensure does not rebuild them. v12 added 6:
 because PostgreSQL does not do Index Only Scans on expression indexes), `gpu_fault_remote_command_workflow_all`
 (all-status `workflow_request_id` lookup, replacing `gpu_fault_remote_command_workflow`, which contained only non-terminal rows),
 `gpu_fault_workflow_incident` (reverse lookup of workflows by `incident_id`),
-`gpu_fault_executable_workflow_dispatch_order` (expression index for the dispatch pagination cursor, previously created only ad hoc in tests).
+`gpu_fault_executable_workflow_dispatch_order` (expression index for the dispatch pagination cursor).
 v13 added 9 (`ddl_control_plane_review.py`: `gpu_fault_workflow_updated_all`,
 `gpu_fault_workflow_predecessor`, `gpu_fault_incident_workflow_pointer`,
 `gpu_fault_incident_archive_candidate`, `gpu_fault_incident_event`, `gpu_fault_event_ended`,
@@ -5625,7 +5631,9 @@ retires `gpu_fault_gpu_metric_latest_observed` and `gpu_fault_processor_lanes_ex
 only readers are the retention sweeps' batched DELETEs, and they kept every metric upsert and lane update from being
 HOT. Existing bloat is reclaimed by `gpu-fault-admin store-maintenance` (`admin/store_maintenance_script.py`).
 v14 added the function `gpu_fault_objects_notify_wakeup()` and the trigger
-`gpu_fault_objects_notify_wakeup_trigger` (`ddl_wakeups.py`).
+`gpu_fault_objects_notify_wakeup_trigger` (`ddl_wakeups.py`). v23 (`ddl_processor_layout.py`) replaces the eight v22 queue indexes with
+five that carry no status predicate and no lease column (§3.1.3) and declares `..._node (node_id, key)` on
+`gpu_fault_gpu_metric_latest_clusters`.
 Every declaration first checks `to_regclass` via `_declare_index()` and issues no create-index statement when it already exists, so an unchanged
 `--ensure-schema` holds only AccessShareLock and never takes an index-build lock. Functions, triggers and views have their own definition verification:
 
@@ -5634,6 +5642,7 @@ Every declaration first checks `to_regclass` via `_declare_index()` and issues n
 | `gpu_fault_processor_queue_count_insert/update/delete` | `FOR EACH STATEMENT` + transition table | Maintains the legacy counts in `gpu_fault_processor_queue_counts` |
 | `gpu_fault_processor_priority_count_insert/update/delete` | `FOR EACH STATEMENT` + transition table | Maintains the priority shard counts |
 | `gpu_fault_processor_queue_notify_pending_trigger` / `..._update_trigger` | `FOR EACH STATEMENT` + transition table | Edge wakeup: at most one `pg_notify` per `(path, priority)` per statement, only when the key had no PENDING row outside the statement (§3.1.3) |
+| `gpu_fault_processor_queue_fill_columns_trigger` | `BEFORE INSERT FOR EACH ROW` (`WHEN path IS NULL OR scope_keys IS NULL`) | v23: fills `path`/`scope_keys` from the payload when a writer of the previous release leaves them NULL, so old and new Pods write the same table during the roll |
 | `gpu_fault_telemetry_spool_notify_available_trigger` / `..._update_trigger` | `FOR EACH STATEMENT` + transition table | Edge wakeup: at most one `pg_notify` per `path` per statement, only when the path had no claimable row outside the statement (§3.1.6) |
 | `gpu_fault_objects_notify_wakeup_trigger` | `FOR EACH ROW` (`AFTER INSERT OR UPDATE OF payload`) | In legacy/dual mode, when a workflow enters the dispatchable set (a new row, or a change in an ordering/filter field) or a remote_command changes status, `pg_notify` wakes the dispatcher and executor claim; same-status UPDATEs such as lease renewal and cancel requests stay silent, otherwise the dispatcher would be woken by its own bookkeeping and re-dispatch repeatedly |
 | `gpu_fault_objects_control_state_fence_trigger` / `gpu_fault_objects_control_state_mirror_trigger` | `FOR EACH ROW` | Old-write barrier and AFTER in-transaction mirroring |
@@ -5641,9 +5650,9 @@ Every declaration first checks `to_regclass` via `_declare_index()` and issues n
 | `gpu_fault_workflows_wakeup_trigger` / `gpu_fault_remote_commands_wakeup_trigger` | `FOR EACH ROW` | Wakeup in dedicated mode with the same semantics as the old table; lease renewal sends no notification |
 
 The counter triggers must be statement-level: a bulk enqueue/completion runs the aggregation once, whereas a row-level implementation would turn every row into a
-counter row update. The historical `gpu_fault_processor_queue_claim`, `..._partition_claim` and
-`..._path_claim` keep only `DROP INDEX IF EXISTS`: they have been replaced by narrower claim indexes, and
-duplicate indexes would leave nothing but write amplification.
+counter row update. The early `gpu_fault_processor_queue_claim`, `..._partition_claim` and
+`..._path_claim`, and the eight status-predicated v22 queue indexes, keep only `DROP INDEX IF EXISTS` (or the v23 migration
+callback's drop): they have been replaced by narrower claim indexes, and duplicate indexes would leave nothing but write amplification.
 
 ### 3.2 Retention and Deletion
 
@@ -5702,20 +5711,21 @@ Control-plane process-level counters keep a bounded `process` label; queries com
 periodic tasks use `periodic_job` and do not mix with the Prometheus-scraped `job` label. Counter drift uses only the latest
 valid scan, and the notification-failure alert uses the actual terminal event time rather than the difference in retained record counts.
 Missing, expired, malformed and future-dated shared process samples or Aurora refresh state are each reported as unknown and must not be filled in as a healthy zero.
-The metric family counts of the same in-memory three-role test fixture are ingress 225, worker 264, spool-worker 224,
-excluding the conditional PostgreSQL/regional/refresh-file families; see the multi-process aggregation contract in Detailed Design v2 for details.
+The same in-memory three-role test fixture (`tests/metrics/test_metric_aggregation_registry.py`) currently renders ingress 267,
+worker 316 and spool-worker 266 metric families (the counts move with every metric added or removed), excluding the conditional
+PostgreSQL/regional/refresh-file families; see the multi-process aggregation contract in Detailed Design v2 for details.
 
 Aurora backup retention and row-level retention are two different concepts: deleting from a live table does not immediately delete historical data
 in automated backups or manual snapshots.
 
 #### 3.2.1 Retention of health-signal state rows
 
-`health_signal_state` (sustained windows, notification latches) and `efa_traffic_state` used to be never deleted. The rows
+`health_signal_state` (sustained windows, notification latches) and `efa_traffic_state` do not go away by themselves. The rows
 that accumulate:
 
 | Rows | Key | Growth |
 |---|---|---|
-| Low CPU/GPU attempt windows (batch 140/142) | `cluster/node/metric/gpu/rule/job_id/attempt_id` | up to 16 per node for every attempt that ever read low (8 GPUs × 2 rules) |
+| Low CPU/GPU attempt windows | `cluster/node/metric/gpu/rule/job_id/attempt_id` | up to 16 per node for every attempt that ever read low (8 GPUs × 2 rules) |
 | Training-health signals | `cluster/attempt/rank-N/training-<kind>` | up to 4 per rank per attempt (only with the training-health monitor on) |
 | EFA traffic state of the older release | `cluster/node/job/attempt` | 1 per attempt per node; now 1 per node (§2.20.1) |
 | Node- and device-level signals (including the low-utilisation continuity gate) | `cluster/node/metric/device[/rule]` | bounded per node, but nodes that left the cluster (spot replacements, re-images, node-group rolls) and replaced GPU UUIDs stay forever |
@@ -5724,7 +5734,7 @@ that accumulate:
 `training_progress` and attempt observations belong to the hot-state cleanup.
 
 The control plane's `processor-cleanup` round (protected by its periodic task lease: one writer across the site at a time)
-gains one job, `health_signal_states` (`store/shared/signal_retention.py`, one set of rules shared by the three stores).
+includes the job `health_signal_states` (`store/shared/signal_retention.py`, one set of rules shared by the three stores).
 A row is deleted only when all of the following hold:
 
 1. **Nothing wrote it within the grace period**: the row's clock (`clock_at`, the control-plane receive time, else
@@ -5779,10 +5789,10 @@ must be between 600 seconds and the retention period, or start-up refuses
 
 The schema has an independent versioned migration registry, `src/gpu_fault/schema_migrations.py`. Each entry is a
 `SchemaMigration(version, name, ddl_checksum, apply, legacy_checksum)`;
-`POSTGRES_SCHEMA_MIGRATIONS` currently has **19 versions** (v12 `store-review-hot-query-indexes`,
+`POSTGRES_SCHEMA_MIGRATIONS` currently has **23 versions** (contiguous from v1; among them v12 `store-review-hot-query-indexes`,
 v13 `control-plane-review-indexes-and-autovacuum`, v14 `objects-wakeup-notify-trigger`,
 v15 `remote-command-state-table-and-cutover-fences`, v16 `workflow-state-table-and-independent-cutover`,
-v17 `control-state-dual-projection-conditional-delete`, v18 `control-state-legacy-copy-reset-without-truncate`, v19 `hot-table-storage-parameters-and-hot-update-indexes`, v20 `processor-counters-per-writer-backend-rows`, v21 `edge-triggered-statement-level-wakeups`, v22 `per-key-planner-pinned-wakeup-probes`), and `LATEST_POSTGRES_SCHEMA_VERSION`
+v17 `control-state-dual-projection-conditional-delete`, v18 `control-state-legacy-copy-reset-without-truncate`, v19 `hot-table-storage-parameters-and-hot-update-indexes`, v20 `processor-counters-per-writer-backend-rows`, v21 `edge-triggered-statement-level-wakeups`, v22 `per-key-planner-pinned-wakeup-probes`, v23 `processor-queue-detached-payloads-replays-and-cluster-partitions`), and `LATEST_POSTGRES_SCHEMA_VERSION`
 takes the last version number. Three guards are executed by `validate_migration_registry()` **at module import time**,
 not as an optional runtime check:
 
@@ -5795,9 +5805,9 @@ not as an optional runtime check:
    `PostgreSQL DDL changed without a new schema migration`, so schema drift is stopped
    at the import stage.
 
-The current v7 `processor-retry-schedule-and-lane-policy` idempotently adds, via
+v7 `processor-retry-schedule-and-lane-policy` idempotently adds, via
 `ddl_processor_retry.py`, `not_before`, a non-negative `retry_count`,
-a `STRICT/REORDERABLE lane_policy` and the `gpu_fault_processor_queue_available` index.
+a `STRICT/REORDERABLE lane_policy` and the `gpu_fault_processor_queue_available` index (retired by v23, see §3.1.3).
 `retry_count` and `lane_policy` use non-null defaults, guaranteeing that inserts from older versions that do not supply the new columns still
 succeed; the compatibility requirement for new columns is "old code can write and read", which is not equivalent to every column having to be nullable.
 
@@ -5806,7 +5816,7 @@ Migration application and verification take two paths (`src/gpu_fault/store/post
 | Path | Trigger condition | Behavior |
 |---|---|---|
 | `_bootstrap_schema()` | `initialize_schema=True` (`gpu-fault-store-migrate --ensure-schema`, the Job `deploy/migrations/postgres-schema-ensure-job.yaml`, and development environments that have not set `GPU_FAULT_POSTGRES_AUTO_SCHEMA_INIT=false`; the application's bare default is `true`) | Sets `statement_timeout`/`lock_timeout` (defaults 540s/60s), takes `pg_advisory_xact_lock(hashtextextended('gpu_fault_schema_bootstrap', 0))`, executes the idempotent DDL, writes `gpu_fault_schema_migrations` in order (calling an entry's `apply` callback only when the historical entry is missing), and finally upserts `gpu_fault_schema_version` |
-| `_validate_existing_schema()` and `validate_state_table_schema()` | `GPU_FAULT_POSTGRES_AUTO_SCHEMA_INIT=false`, i.e. all production processes of the three-tier control plane | Read-only verification: the 10 key relations, 4 plpgsql functions (including `gpu_fault_objects_notify_wakeup()`), 3 notify triggers (including `gpu_fault_objects_notify_wakeup_trigger`) and 3 priority count triggers all exist; `_validate_declared_indexes()` requires every index declared by the DDL to exist, be valid and have an undrifted definition (INVALID indexes left by a failed `CREATE INDEX CONCURRENTLY` and hand-built indexes of the same name are both caught); `_validate_triggers_enabled()` rejects any disabled `gpu_fault_*` trigger; `_validate_counter_trigger_definitions()` compares the table/function/`tgtype`/transition table and function body of the six count triggers verbatim against the DDL declarations (F-D10); the migration history equals the in-code registry row by row; `gpu_fault_schema_version.version` equals `LATEST_POSTGRES_SCHEMA_VERSION`; the workflow/remote_command dedicated tables are verified by `validate_state_table_schema()` for mode, column types and function/trigger/view definitions, rejecting anything missing or drifted; in `dedicated` hot-state mode, `hot_state_backfill_gaps()` (one `EXISTS` per kind, no `count(*)`) additionally confirms the backfill has no gaps. Any mismatch raises `RuntimeError` advising to run `--ensure-schema` first; business processes do not repair persistent structures |
+| `_validate_existing_schema()` and `validate_state_table_schema()` | `GPU_FAULT_POSTGRES_AUTO_SCHEMA_INIT=false`, i.e. all production processes of the three-tier control plane | Read-only verification: the 10 key relations, 4 plpgsql functions (including `gpu_fault_objects_notify_wakeup()`), 3 notify triggers (including `gpu_fault_objects_notify_wakeup_trigger`) and 3 priority count triggers all exist; `_validate_declared_indexes()` requires every index declared by the DDL to exist, be valid and have an undrifted definition (INVALID indexes left by a failed `CREATE INDEX CONCURRENTLY` and hand-built indexes of the same name are both caught); `_validate_triggers_enabled()` rejects any disabled `gpu_fault_*` trigger; `_validate_counter_trigger_definitions()` compares the table/function/`tgtype`/transition table and function body of the six count triggers verbatim against the DDL declarations; the migration history equals the in-code registry row by row; `gpu_fault_schema_version.version` equals `LATEST_POSTGRES_SCHEMA_VERSION`; the workflow/remote_command dedicated tables are verified by `validate_state_table_schema()` for mode, column types and function/trigger/view definitions, rejecting anything missing or drifted; in `dedicated` hot-state mode, `hot_state_backfill_gaps()` (one `EXISTS` per kind, no `count(*)`) additionally confirms the backfill has no gaps. Any mismatch raises `RuntimeError` advising to run `--ensure-schema` first; business processes do not repair persistent structures |
 
 The generated three-tier manifests set `GPU_FAULT_POSTGRES_AUTO_SCHEMA_INIT` to `false` everywhere, so
 **production business processes do not create tables themselves**: the schema is built by a one-off Job, ingress/worker only perform
@@ -5837,8 +5847,9 @@ A SQLite-to-PostgreSQL or PostgreSQL-to-PostgreSQL migration must stop all write
 
 ## 4. API Design
 
-`create_app()` currently always mounts **93 application routes**; regional mode
-(`GPU_FAULT_DEPLOYMENT_MODE=regional`) additionally installs the five-bucket default-deny authorization middleware. Routes are distributed by
+`create_app()` currently always mounts **93 application routes**; the five-bucket default-deny authorization middleware takes
+effect in regional mode (`GPU_FAULT_DEPLOYMENT_MODE=regional`) (it is always mounted and passes every request through
+outside regional mode, see §4.5). Routes are distributed by
 implementation module:
 
 | Module | Route count |
@@ -5892,10 +5903,10 @@ and the documentation routes do not live under the `routes/` directory.
 The `internal` in `/v1/internal/*` only means "not facing the cluster side"; authentication is still the operator execution
 token; it is not an unauthenticated path and must not be exposed directly to the collector side.
 
-### 4.2 Cluster-Side Event Entry Points (`cluster-token`, 34 in total)
+### 4.2 Cluster-Side Event Entry Points (`cluster-token`, 37 in total)
 
 The following 19 are collector-side and node-side entry points; all require `X-GPU-Fault-Cluster-ID` and the matching per-cluster
-token; the other 15 are the executor interfaces of §4.4 (the `GET /v1/regional/clusters` of §4.4 belongs to
+token; the other 18 are the executor interfaces of §4.4 (the `GET /v1/regional/clusters` of §4.4 belongs to
 `execution-token`).
 
 | Method | Path | Channel/purpose |
@@ -5977,7 +5988,7 @@ they cannot be placed in a single bucket.
 
 ### 4.4 Regional executor Interface
 
-**17 endpoints** in total, all in `src/gpu_fault/app/routes/regional.py`. The router is also mounted in non-
+**19 endpoints** in total, all in `src/gpu_fault/app/routes/regional.py`. The router is also mounted in non-
 regional local/test modes, but only regional mode is the supported
 production semantics, fully protected by the cluster-token/execution-token middleware:
 
@@ -5992,6 +6003,7 @@ production semantics, fully protected by the cluster-token/execution-token middl
 | GET | `/v1/regional/executors/incident-ownership` | cluster-token | `get_remote_incident_ownership` |
 | GET | `/v1/regional/executors/fleet-rollout-fence` | cluster-token | `get_remote_fleet_rollout_fence` |
 | POST | `/v1/regional/node-action-keys` | cluster-token | `regional_node_action_keys` |
+| POST | `/v1/regional/executors/node-inventory` | cluster-token | `regional_node_inventory` |
 | POST | `/v1/regional/executors/hyperpod-submissions/reserve` | cluster-token | `reserve_remote_hyperpod_submission` |
 | GET | `/v1/regional/executors/hyperpod-submissions` | cluster-token | `get_remote_hyperpod_submission` |
 | POST | `/v1/regional/executors/hyperpod-submissions/outcome` | cluster-token | `record_remote_hyperpod_submission` |
@@ -6012,7 +6024,9 @@ node-action, read the set of deployments of this cluster currently in fleet roll
 evaluated before dispatch and cannot recall a command already written to the Store, while the executor itself has no Store to query; the cluster is taken from the authentication header and cannot be
 read across clusters. `regional_capture_evidence` and `regional_save_advisory_notification` let
 the cluster-side executor write evidence and notifications back to the control plane: the cluster side has no database (see §2.17).
-`node-action-keys` feeds the executor's node-key sync (`cluster_executor/node_key_sync.py`): body
+`executors/node-inventory` takes the names of all the cluster's Kubernetes Nodes the executor posts every 60 s
+(`KubernetesNodeInventoryReport`, `cluster_executor/node_inventory.py`), the departed-node cleanup's first proof that a node has left
+the cluster. `node-action-keys` feeds the executor's node-key sync (`cluster_executor/node_key_sync.py`): body
 `{cluster_id, node_ids, nodes?}` (at most 64, validated like every node id), `cluster_id` enters the
 cluster binding check, and the control plane derives the version-2 key from the fleet master for
 nodes this cluster's own data-plane evidence has already reported (an Agent record, a GPU inventory
@@ -6040,7 +6054,7 @@ AUTHORIZATION_BUCKETS = frozenset({
 ```
 
 Decorating an endpoint with `@authorization_bucket("...")` writes the bucket onto the function attribute;
-`ExplicitAuthorizationRegistry.load()` iterates over all `/v1/*`, `/healthz` and
+`ExplicitAuthorizationRegistry.load()` iterates over all `/v1/*`, `/healthz`, `/livez` and
 `/metrics` routes at assembly time, and raises
 `RuntimeError: route {path} has no explicit authorization bucket` if any one has no declaration: **forgetting to classify a new route
 is a startup failure, not a silent pass-through**. Prefix matching cannot achieve this: a new prefix silently falls into
@@ -6050,13 +6064,15 @@ is a startup failure, not a silent pass-through**. Prefix matching cannot achiev
 |---|---|
 | `public` | Exempt from authentication. Only `/healthz` and `/livez`, plus `/openapi.json`, `/docs`, `/docs/oauth2-redirect`, `/redoc` passed through by the `declared()` fallback |
 | `metrics` | Treated as `public` when the client is `127.0.0.1`/`::1`/`localhost`, otherwise requires the execution token (additionally accepts `Authorization: Bearer`, because most Prometheus scrapers only send this header) |
-| `cluster-token` | `X-GPU-Fault-Cluster-ID` + the token registered for that cluster, compared with `secrets.compare_digest` |
+| `cluster-token` | `X-GPU-Fault-Cluster-ID` + `Authorization: Bearer <the token registered for that cluster>`. The token's SHA-256 is compared with the digests of both the current and the retiring slot, each with `secrets.compare_digest`, without short-circuiting on the first hit; a missing header is 401, an unregistered cluster or a mismatch 403, and a registry snapshot that is not current 503 (with `Retry-After`) |
 | `dual-credential` | Decided by the credentials the request carries: with the execution token header, as `execution-token`; with only `Authorization: Bearer` + the cluster header, as `cluster-token`; with neither, fail closed as `execution-token`. The cluster header is only a routing hint, not a credential; sending it alone cannot select a bucket |
 | `execution-token` | Operator `X-GPU-Fault-Execution-Token` |
 
 When the middleware `regional_default_deny_authorization` cannot obtain a bucket (`effective()` returns
-`None`) it responds 403 `regional route has no declared authorization bucket` directly, so it also fails closed at
-runtime. The regional control plane sits behind an internet-facing NLB; this fallback cannot be omitted.
+`None`) it responds 403 `regional route has no declared authorization bucket` whenever a route serves the path, so it also
+fails closed at runtime; a path no route serves at all gets the 404 the router itself would answer (`route_exists()`): the
+collector outbox dead-letters a 404 but reads a 403 as a token rotation in progress and replays it forever. The regional
+control plane sits behind an internet-facing NLB; this fallback cannot be omitted.
 
 The loopback decision depends on the **directly connected socket peer**, so
 `validate_direct_client_identity_environment()` forbids `FORWARDED_ALLOW_IPS` and
@@ -6065,10 +6081,13 @@ loopback and thereby read `/metrics` without authentication, and the peer check 
 
 After passing authentication, `cluster-token` endpoints additionally check that the `cluster_id` in the payload matches the authenticated identity,
 returning 403 on mismatch: otherwise a legitimate token of cluster A could write events for cluster B. Request body decoding has an
-upper bound; exceeding the limit/timeout yields 413/503 respectively, and a decode failure yields 400.
+upper bound: an oversized body yields 413, an exhausted decode pool or a passed request deadline 503 (with `Retry-After`), a
+decode failure 400 and a NUL character 422; a request the cluster's lifecycle state does not allow yields 423.
 
-Non-regional mode (`all` single-process local run) does not install this middleware and only keeps each route's own
-execution token dependency; it is not a production form, and its authentication behavior cannot be used to infer production behavior.
+In non-regional mode (`GPU_FAULT_DEPLOYMENT_MODE=single-cluster` or a disabled executor; a local `all` single-process run is
+one) both middlewares pass every request through, and only each route's own execution token dependency remains (the routes'
+bucket declarations are still checked at assembly time); it is not a production form, and its authentication behavior cannot
+be used to infer production behavior.
 
 ## 5. Configuration Precedence
 
@@ -6080,13 +6099,22 @@ The Runtime Profile controls "who may execute", `GPU_FAULT_ALLOWED_OPERATIONS` c
 
 ## 6. Exceptions and Retries
 
-- Collector: bounded retries for network, 429 and 5xx; bad requests are not retried indefinitely.
-- API: model errors return 422; conflicts and fencing errors mostly return 409; token errors return 403.
-- Processor replay: 408/425/429/5xx within a 300-second age write back a persisted delay,
-  `retry_count` increments by one each time, and the backoff is `min(30s, 1s × 2^min(previous_retry_count,16))`;
+- Collector: network failures, 5xx and 408/425/429 get at most 4 bounded attempts per delivery (a `Retry-After` is honored
+  up to 30 s), after which the record goes to the local outbox and is replayed later; a 401/403 during a token rotation
+  window is likewise "not now"; every other 4xx is a verdict on the event itself, and the record is dead-lettered at replay
+  rather than replayed forever.
+- API: model errors return 422; conflicts and fencing errors mostly return 409; token errors return 403 (a missing
+  cluster-token header is 401, see §4.5).
+- Processor replay: 408/425/429/5xx within a 300-second age (for a workload observation, its stale limit
+  `observation_stale_seconds`, 120 s by default) write back a persisted delay,
+  `retry_count` increments by one each time, and the backoff is `min(30s, 1s × 2^min(previous_retry_count,16))`; a retryable
+  response past that horizon is committed as the row's final answer and counted in
+  `gpu_fault_processor_retry_horizon_failures_total`;
   `STRICT` requests keep lane order, `REORDERABLE` is used only for latest-wins P100 snapshots.
-- Dispatcher: catches the exception of a single workflow and continues scanning.
-- Kubernetes: a resourceVersion conflict is not treated as success.
+- Dispatcher: a single workflow's failure is that row's alone (counted, and the scan continues); a transient Store error
+  fails the whole tick, which the next tick retries, rather than hiding an outage behind per-row counters.
+- Kubernetes: a resourceVersion conflict (409) is retried a bounded number of times against the re-read current object;
+  a persisting conflict raises `NodePatchConflict` and the caller decides WAITING or FAILED; it is never treated as success.
 - Provider: a submission return only enters WAITING; the observer is responsible for confirmation.
 - Node Agent: receipts are persisted; replaying the same command ID returns the existing result.
 - Unknown/incomplete evidence: `INCONCLUSIVE/BLOCKED/QUARANTINED`, never downgraded to PASS.
@@ -6096,7 +6124,9 @@ product. The implementation verifies the UUID and normalized model of all visibl
 Mixed models or an explicit configuration conflict are configuration/hardware evidence errors and prevent the Collector from starting; when the command is unavailable,
 `GPU_FAULT_GPU_PRODUCT_DISCOVERY` controls the behavior: `required` refuses to start, `auto` falls back to the explicit configuration,
 and without explicit configuration it starts without a product (the product is identity metadata on the batch, not a prerequisite for reading the host; a driver that
-cannot answer at startup must not restart-loop the whole host collector into a "silent" node).
+cannot answer at startup must not restart-loop the whole host collector into a "silent" node); the collectors that stamp the
+product then retry the discovery at most every 60 s while it is unknown (`src/gpu_fault/collectors/identity_refresh.py`).
+`disabled` never calls `nvidia-smi` during the collector's whole life.
 
 ## 7. Logging, Metrics and Audit
 
@@ -6115,63 +6145,75 @@ using the fixed `xid-not-applicable-zh-v2` template. Template fields come from `
 The notification is delivered immediately through the unified notifier and deduplicated by the composite key of incident, XID and policy version.
 A recorded incident without a workflow -- for example a line from a boot the node has left (`reboot_window.cover_fault`) --
 gets the same notice: Workflow, Workflow status and Safety action read `NONE`, and the incident's own reason follows the
-decision reasons (batch 238). Before, the notice refused such an incident and the kernel-event route answered 409: the
-decision was never finalized and no notice was sent.
+decision reasons. The notice cannot refuse such an incident: a refusal makes the kernel-event route answer 409, the
+decision is never finalized and no notice is sent at all.
 
 `GET /metrics` outputs Prometheus text. The family count is not hard-coded in this document: `/metrics` is gated in segments by role and Store type
 (`src/gpu_fault/app/metrics.py`); to verify, render once with `create_app()` and then count by prefix. Main prefixes:
 
 | Prefix | Coverage |
 |---|---|
-| `gpu_fault_processor_*` | Queue depth, claim, lane wait/hold, delayed retries, claimed but not started, graceful-shutdown release, admission and batching, leases, cleanup and counting mode (the largest group) |
-| `gpu_fault_telemetry_*` | spool depth, merge/supersede, lease bytes, replay duration, channel freshness and notification fallback |
-| `gpu_fault_workflow_*` | Dispatch cycles/filters/deferrals, internal errors, failure handling, preemption, budget refusals, un-reconciled BLOCKED |
+| `gpu_fault_processor_*` | Queue depth, claim, lane wait/hold, delayed retries and the retry horizon, claimed but not started, graceful-shutdown release, admission and batching, fault pressure and the observation interlock, LISTEN/NOTIFY notifications, leases, cleanup and counting mode (the largest group) |
+| `gpu_fault_telemetry_*` | spool depth and bytes, admission and claim, merge/supersede/stale completion, leases and in-flight bytes, replay duration, fault pressure and notification fallback |
+| `gpu_fault_workflow_*` | Dispatch cycles/filters/deferrals, dispatch lease and wakeups, internal errors, failure handling, node-busy timeouts, preemption, branch-escalation budget refusals, placement holds, step waits and lifetime expiry, un-reconciled BLOCKED |
 | `gpu_fault_notification_*` | Delivery totals/errors, outbox depth, oldest pending, expiry and dead-letter, drill suppression |
-| `gpu_fault_remediation_budget_*` | Budget ceilings, active claims, waiting workflows (global/per cluster/per scope) |
+| `gpu_fault_remediation_budget_*` | Active claims by scope type, waiting workflows (total/by scope type) and the longest wait, over-limit scopes, released parked holds; `*_storm_breaker_*` gives per cluster the breaker's open state, the nodes in its 600-s window, the trip threshold, the trip time and the held workflows, plus a count of failed GPU-node-count reads |
 | `gpu_fault_periodic_*` | Run timestamps, errors, row counts and budget exhaustion of periodic tasks and cleanup |
 | `gpu_fault_ingress_*` | Per-lane in-flight count, wait duration, worker count, backpressure and decode rejections |
 | `gpu_fault_remote_command_*` | Command state and per-cluster counts, oldest/expired unclaimed, executor internal errors, compound command and batch step counts, sibling hold |
 | `gpu_fault_request_decode_*` / `gpu_fault_store_io_*` | Concurrency, waits and rejections of decoding / Store I/O |
 | `gpu_fault_metrics_aggregation_*` | The multi-process merge itself: number of processes merged and the degraded flag |
-| Other singletons | event-loop lag, PostgreSQL pool checkout, unknown product, attempt ownership ambiguity, stale Agent, closed-loop milestones, incident count by state, control record archival |
+| Others | event-loop lag, GC and resident memory, the listening socket (accept queue, `SO_REUSEPORT`, somaxconn), the PostgreSQL pool (checkout wait, demand/headroom/oversubscription), Aurora credential refresh, regional registry refresh and secret drift, capacity (managed/registered node counts), silent/erroring collector nodes, departed-node cleanup, fleet pin drift and rollout fences, completion decisions, unresolved ingest signals, unknown product, attempt ownership ambiguity and the observation scan, stale Agent, closed-loop milestones, incident count by state and dangling workflow pointers, the hardware escalation chain, spare reservations, Store bloat scans and compaction, control record archival |
 
 `/metrics` merging for multi-process Pods (`src/gpu_fault/app/process_metrics.py`): ingress and control-worker
 run with `--workers 4`, each uvicorn process has its own in-process counters, one scrape hits only one of those processes,
 and consecutive scrapes of the same Pod jump between different process fingerprints and read counts as 0. Therefore every process writes its complete rendering to
-`/dev/shm/gpu-fault-process-metrics/<pid>.json` (on every response, and every 5 seconds by the
+`/dev/shm/gpu-fault-process-metrics/<POD_UID>/<pid>.json` (on every response, and every 5 seconds by the
 `gpu-fault-process-metrics` thread); the responding process merges its own fresh rendering with the files of the other live processes, and each family is aggregated by
-the policy registered in `metric_aggregation` (SUM/MAX/MIN/ANY/PER_PROCESS; PER_PROCESS families carry a
-`process="<slot>"` label, the slot is held by `flock` and released as soon as the process dies); files whose PID has vanished are deleted on the spot, and
-Prometheus reads the resulting decrease in the sum as one counter reset. The directory is derived from `POD_UID` by default;
-`GPU_FAULT_PROCESS_METRICS_DIR` can override it or turn it off with `off`; single-process and unit tests merge only their own copy, and the bytes equal
-the plain rendering plus two merger gauges.
+the policy registered in `metric_aggregation` (SUM/MAX/MIN/ANY/PER_PROCESS). Counters and cumulative summaries/histograms are
+PER_PROCESS and carry a bounded `process="<slot>"` label (the slot is held by a `flock` on `slot-<n>.lock` and released as
+soon as the process dies, so a restarted worker takes the freed slot); queries apply rate/increase per process before
+summing, so one child's restart cannot reset its siblings' history. Files whose PID has vanished are deleted on the spot,
+and a stale, malformed or missing publication of a live process sets `gpu_fault_metrics_aggregation_degraded` to 1. The
+directory is derived from the `POD_UID` the Deployment injects; `GPU_FAULT_PROCESS_METRICS_DIR` can override it or turn it
+off with `off`; when it is off (single-process runs and unit tests) a process renders only its own copy: gauges unchanged,
+PER_PROCESS families with `process="0"`, plus the two merger gauges.
 
 The main closed-loop metrics still not exported are the unified signal→finding latency, the false-isolation rate and the event-loss-rate denominator.
 API end-to-end latency is still mainly measured from response headers and on the load-test side.
 
 ## 8. Test Design
 
-`tests/` is organized by domain; `tests/regional/` is the largest group, and the rest are divided by execution, store,
-orchestration, admin, processor, node_agent, collectors, hyperpod, metrics, completion
-and host_health, with the top-level `tests/` holding cross-domain contract and gate tests. File counts are not hard-coded in this document:
+`tests/` is organized by domain; `tests/regional/` is the largest group, and the rest are divided by admin, execution, store,
+orchestration, processor, node_agent, collectors, host_health, metrics, completion, hyperpod, eks_provider, policy,
+notifications, nvidia_logs, fleet, departed_nodes, deploy, app and app_services, with the top-level `tests/` holding
+cross-domain contract and gate tests. File counts are not hard-coded in this document:
 `scripts/check-doc-facts.py` forbids literal counts and only guards the structural assertion "regional is the largest".
 Policy, XID/SXID, distributed reset, API, Watcher, Completion, Executor,
 PostgreSQL, Fleet, Agent, NVIDIA logs, metrics, evidence and notifications are all covered there.
 
-`make check` is the commit gate; it chains formatting and static checks, `compileall`,
+`make check` is the commit gate (`scripts/run_release_gates.py --mode check`): it first runs `make check-static`
+(`scripts/run_static_gates.py` runs formatting and static checks, the mypy baseline, `compileall`,
 the `scripts/check-*.py` structural guards (including `scripts/check-lazy-exports.py`, which parses every
-`_EXPORTS` lazy export table and Lambda `Handler`), `make docs-check` (including
-`scripts/check-doc-facts.py`), manifest and YAML/Shell checks,
-`make artifact-check` (rebuilds the wheel and proves it is the current source), and finally runs the full `pytest`.
-`artifact-check` accepts an interpreter command name or an explicit path; a command name is resolved through the current `PATH`. Therefore when running `make check` directly after activating `.venv` per the root
-README, the default `python3` must resolve to that virtual environment;
-a non-existent interpreter fails explicitly before the artifact is built.
+`_EXPORTS` lazy export table and Lambda `Handler`), `make docs-static-check` (including
+`scripts/check-doc-facts.py`), the XID catalog/deployment contract/manifest checks and the YAML/Shell checks in parallel), then
+runs `make artifact-check` (rebuilds the wheel and proves it is the current source) and the full `pytest`
+(`make test-parallel-release`, the documentation contract tests included) in parallel.
+`artifact-check` accepts an interpreter command name or an explicit path; a command name is resolved through the current
+`PATH`. `PYTHON` defaults to the repository's `.venv/bin/python` and falls back to `python3` on `PATH` only when that does
+not exist; a non-existent interpreter fails explicitly before the artifact is built.
 Documentation-only changes must also run `make docs-check`. `make coverage` requires a real
-`GPU_FAULT_TEST_POSTGRES_URL`: it first collects non-PostgreSQL coverage with 4 workers, then serially appends
-PostgreSQL backend coverage and enforces a unified 78% floor. The lock-contention stress tier uses
+`GPU_FAULT_TEST_POSTGRES_URL`: it first collects non-PostgreSQL coverage with `PYTEST_XDIST_WORKERS` xdist workers (4-16 by
+CPU count by default), then serially appends PostgreSQL backend coverage; the combined coverage of the production sources
+(`src/gpu_fault`, `src/gpu_fault_release`, `deploy/control-plane/tools`) must not fall below 78%, and
+`scripts/ci_coverage_gate.py floors` additionally requires at least 95% statements and 95% branches in each of the production
+and runner (`scripts/e2e/regional`, `tools`) scopes and checks the module floors of `config/ci-unit-gate.json`. The
+lock-contention stress tier uses
 `make test-postgres-stress`, fixed at 8 workers × 40 rounds; the formal entry point of CAP-005,
 `scripts/e2e/regional/run_cap005_postgres_suite.py`, creates an isolated
-database from `GPU_FAULT_STORE_URL`, requires zero skips after generating JUnit, and deletes the database at the end.
+database from the store DSN file (`GPU_FAULT_STORE_URL_FILE`, default `/etc/gpu-fault/aurora/postgres-url`; only when the
+default file is absent does it fall back to `GPU_FAULT_STORE_URL`), requires zero skips after generating JUnit, and deletes
+the database at the end.
 
 `make docs-check` itself is ten generated-artifact/reference consistency checks (`docs-static-check`: doc-impact, impact,
 env-doc, case-index, manual-command-order, doc-reference, doc-anchor, fault-evidence, doc-facts,
@@ -6179,7 +6221,8 @@ grafana-dashboards) plus the 12 documentation contract test files listed in `DOC
 `tests/test_doc_impact.py` and `tests/test_change_impact.py`). `doc-anchor` parses the `](path#anchor)` links of every public
 Markdown file and verifies the target file and anchor by the rendered site's slug rules: a broken anchor
 does not render as an error, the reader is just silently left at the top of the document, so only the gate can catch it. Generated documents
-(`docs/环境变量参考.md` (Environment Variables Reference), `docs/区域用例索引.md` (Regional Case Index)) and
+(`docs/环境变量参考.md` (Environment Variables Reference), `docs/管理员环境变量参考.md` (Administrator Environment
+Variables Reference), `docs/区域用例索引.md` (Regional Case Index)) and
 `deploy/control-plane/regional/generated/` are produced by renderers; manual edits are caught by these checks.
 
 Verification tiers:
