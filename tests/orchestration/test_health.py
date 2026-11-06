@@ -967,22 +967,78 @@ def test_a_completed_drain_chain_leaves_the_incident_escalated(
     )
 
 
-def test_a_drain_whose_validation_fails_still_hands_the_node_to_support(
+def _thermal_review_finding(workload_state: WorkloadState) -> NodeHealthFinding:
+    """A confirmed GPU temperature CRITICAL: the ENVIRONMENT_REVIEW chain."""
+
+    return node_health_finding(
+        "finding-thermal-review",
+        "thermal-review",
+        observed_at=NOW,
+        category=NodeHealthCategory.GPU,
+        severity="critical",
+        reason="GPU temperature 96 C over the device limit, confirmed 3/3",
+        recommended_action=RecoveryAction.DRAIN,
+        metric_name="gpu_temperature_c",
+        gpu_uuids=["GPU-a"],
+        runtime_profile_version="simulated-v1",
+        workload_state=workload_state,
+        affected_workload_ids=(
+            ["training/job/job-a"] if workload_state is WorkloadState.ACTIVE else []
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("finding", "failing", "stage"),
+    [
+        pytest.param(
+            _rma_drain_finding(WorkloadState.IDLE, official_action=None),
+            WorkflowOperation.VALIDATE_GPU,
+            "drain_validation",
+            id="drain-validation",
+        ),
+        pytest.param(
+            _rma_drain_finding(WorkloadState.IDLE, official_action=None),
+            WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE,
+            "held_chain_step",
+            id="drain-bundle",
+        ),
+        pytest.param(
+            _thermal_review_finding(WorkloadState.IDLE),
+            WorkflowOperation.TRIGGER_HEALTH_SNAPSHOT,
+            "held_chain_step",
+            id="environment-review-snapshot",
+        ),
+        pytest.param(
+            _thermal_review_finding(WorkloadState.ACTIVE),
+            WorkflowOperation.STOP_WORKLOADS,
+            "held_chain_step",
+            id="environment-review-stop",
+        ),
+    ],
+)
+def test_a_held_chain_whose_step_fails_still_hands_the_node_to_support(
     context: ApplicationContext,
+    finding: NodeHealthFinding,
+    failing: WorkflowOperation,
+    stage: str,
 ) -> None:
-    """The DRAIN chain's hand-off is the ESCALATE_SUPPORT behind its VALIDATE_GPU,
-    and an RMA-class GPU often still fails that validation. The failure must
-    not park the node QUARANTINED with nobody told: there is no hardware rung
-    after a drain, so it goes to support -- the hand-off the chain itself would
-    have made -- and the support successor ends ESCALATED with the mail sent."""
+    """The DRAIN and ENVIRONMENT_REVIEW chains hold their node and hand it over
+    with their last step, ESCALATE_SUPPORT. A step before it that fails -- the
+    VALIDATE_GPU an RMA-class GPU often still fails, the diagnostic bundle, the
+    health snapshot, the job stop -- must not park the node QUARANTINED with
+    nobody told: there is no hardware rung after a drain, so the failure goes
+    to support -- the hand-off the chain itself would have made -- and the
+    support successor ends ESCALATED with the mail sent."""
     from gpu_fault.execution import WorkflowStepOutcome
     from gpu_fault.models import IncidentState, WorkflowExecutionRequest
     from tests._builders import active_workflow_executor
 
-    incident, workflow = context.orchestrator.ingest_node_health(
-        _rma_drain_finding(WorkloadState.IDLE, official_action=None)
-    )
-    drain = workflow.request_id
+    incident, workflow = context.orchestrator.ingest_node_health(finding)
+    held = workflow.request_id
+    planned = [step.operation for step in workflow.official_steps]
+    assert failing in planned, planned
+    assert planned[-1] is WorkflowOperation.ESCALATE_SUPPORT, planned
 
     class _SimulatedRuntime:
         def __init__(self) -> None:
@@ -994,15 +1050,12 @@ def test_a_drain_whose_validation_fails_still_hands_the_node_to_support(
         def execute(self, step_context) -> WorkflowStepOutcome:
             operation = step_context.step.operation
             self.executed.append((step_context.workflow.request_id, operation))
-            if (
-                operation is WorkflowOperation.VALIDATE_GPU
-                and step_context.workflow.request_id == drain
-            ):
+            if operation is failing and step_context.workflow.request_id == held:
                 return WorkflowStepOutcome.failed(
-                    "active_gpu_health_findings",
+                    f"{operation.value} failed on node-a",
                     details={
                         "failed_nodes": ["node-a"],
-                        "node_failures": {"node-a": ["active_gpu_health_findings"]},
+                        "node_failures": {"node-a": [f"{operation.value} failed"]},
                     },
                 )
             return WorkflowStepOutcome.succeeded(
@@ -1010,29 +1063,27 @@ def test_a_drain_whose_validation_fails_still_hands_the_node_to_support(
             )
 
     adapter = _SimulatedRuntime()
-    executor = active_workflow_executor(
-        context.store, [adapter], [step.operation for step in workflow.official_steps]
-    )
+    executor = active_workflow_executor(context.store, [adapter], planned)
 
     result = executor.execute(
-        drain, WorkflowExecutionRequest(expected_fencing_token=workflow.fencing_token)
+        held, WorkflowExecutionRequest(expected_fencing_token=workflow.fencing_token)
     )
 
     assert result.status is WorkflowStatus.FAILED
-    failed = context.store.get_workflow(drain)
+    failed = context.store.get_workflow(held)
     assert WorkflowOperation.ESCALATE_SUPPORT not in failed.completed_operations
     assert context.store.get_incident(incident.incident_id).state is (
         IncidentState.QUARANTINED
-    ), "the node stays held by the drain"
+    ), "the node stays held by the chain"
 
     escalation = context.orchestrator.escalate_failed_hardware_remediation(failed)
 
     assert escalation is not None, (
-        "a drain whose VALIDATE_GPU failed must still reach an operator: no "
-        "support record and no mail otherwise"
+        f"a held chain whose {failing.value} failed must still reach an "
+        "operator: no support record and no mail otherwise"
     )
     support_incident, support = escalation
-    assert support.request_id == f"workflow-support-after-{drain}"
+    assert support.request_id == f"workflow-support-after-{held}"
     assert support_incident.effective_action is RecoveryAction.ESCALATE_OPERATOR
     assert [step.operation for step in support.official_steps] == [
         WorkflowOperation.FREEZE_EVIDENCE,
@@ -1040,10 +1091,13 @@ def test_a_drain_whose_validation_fails_still_hands_the_node_to_support(
         WorkflowOperation.QUARANTINE,
         WorkflowOperation.ESCALATE_SUPPORT,
     ], "the hand-off keeps the hold: no stop, no hardware rung, no release"
-    assert "VALIDATE_GPU" in support_incident.reasons[0], support_incident.reasons
+    assert support_incident.reasons[0].startswith(f"{stage} remediation failed"), (
+        support_incident.reasons
+    )
+    assert failing.value in support_incident.reasons[0], support_incident.reasons
     assert context.orchestrator.escalate_failed_hardware_remediation(failed) == (
         escalation
-    ), "one support successor per failed drain"
+    ), "one support successor per failed chain"
 
     handoff = active_workflow_executor(
         context.store, [adapter], [step.operation for step in support.official_steps]

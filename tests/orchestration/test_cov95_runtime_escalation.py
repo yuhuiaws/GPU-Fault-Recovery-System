@@ -182,6 +182,198 @@ def test_a_drain_whose_own_hand_off_failed_opens_no_second_one() -> None:
     assert HardwareEscalationService.classify(h.workflow) is None
 
 
+SNAPSHOT = WorkflowOperation.TRIGGER_HEALTH_SNAPSHOT
+CHECKPOINT = WorkflowOperation.CHECKPOINT_WORKLOADS
+DRAIN_STOP_CHAIN = [FREEZE, CORDON, STOP, QUARANTINE, BUNDLE, VALIDATE, SUPPORT]
+#: The confirmed thermal DRAIN's chain; every step carries the contract.
+ENV_REVIEW_CHAIN = [FREEZE, CORDON, STOP, QUARANTINE, BUNDLE, SNAPSHOT, SUPPORT]
+#: The XID/SXID ESCALATE_OPERATOR chain of an active job with a checkpoint.
+OPERATOR_CHAIN = [FREEZE, CORDON, CHECKPOINT, STOP, QUARANTINE, SUPPORT]
+ENV_REVIEW = {
+    "health_recovery_contract": {
+        "mode": "ENVIRONMENT_REVIEW",
+        "metric": "gpu_temperature_c",
+        "detected_at": "2026-01-01T00:00:00+00:00",
+        "node_id": "node-a",
+    }
+}
+UNKNOWN_OUTCOME = {"outcome_unknown": True, "manual_confirmation_required": True}
+REJECTED = {"remote_status_source": "executor-rejected"}
+
+
+def held_chain(
+    operations, failed_index: int, details=None, contract=None
+) -> EscalationHarness:
+    h = EscalationHarness(operations, failed_index=failed_index, details=details)
+    if contract is not None:
+        h.amend(
+            official_steps=[
+                step.model_copy(update={"parameters": {**step.parameters, **contract}})
+                for step in h.workflow.official_steps
+            ]
+        )
+    return h
+
+
+@pytest.mark.parametrize(
+    ("operations", "failed", "contract"),
+    [
+        (DRAIN_STOP_CHAIN, STOP, None),
+        (DRAIN_CHAIN, BUNDLE, None),
+        (ENV_REVIEW_CHAIN, STOP, ENV_REVIEW),
+        (ENV_REVIEW_CHAIN, QUARANTINE, ENV_REVIEW),
+        (ENV_REVIEW_CHAIN, BUNDLE, ENV_REVIEW),
+        (ENV_REVIEW_CHAIN, SNAPSHOT, ENV_REVIEW),
+        (OPERATOR_CHAIN, CHECKPOINT, None),
+        (OPERATOR_CHAIN, STOP, None),
+    ],
+    ids=[
+        "drain-stop",
+        "drain-bundle",
+        "environment-review-stop",
+        "environment-review-quarantine",
+        "environment-review-bundle",
+        "environment-review-snapshot",
+        "operator-checkpoint-answered",
+        "operator-stop",
+    ],
+)
+def test_a_held_chain_step_failure_hands_the_node_to_support(
+    operations, failed, contract
+) -> None:
+    """A chain that holds its node plans its ESCALATE_SUPPORT last; a step
+    before it that fails where the ladder has no rung -- the bundle, the
+    snapshot, the stop, a checkpoint that answered -- still owes that hand-off
+    (the ENVIRONMENT_REVIEW contract keeps hardware rungs away, not the
+    operator). Before, every one ended QUARANTINED with nobody told."""
+
+    h = held_chain(operations, operations.index(failed), contract=contract)
+
+    classification = HardwareEscalationService.classify(h.workflow)
+    assert classification is not None, (
+        f"{failed.value} failed in a held chain and nobody was told"
+    )
+    assert classification[:3] == (
+        "held_chain_step",
+        RecoveryAction.ESCALATE_OPERATOR,
+        SUPPORT,
+    )
+    result = h.escalate()
+    assert result is not None, "the held node needs a durable hand-off"
+    incident, successor = result
+    assert incident.reasons[0].startswith(
+        "held_chain_step remediation failed; failed operation or validation: "
+        f"{failed.value}"
+    ), incident.reasons
+    assert [step.operation for step in successor.official_steps] == [
+        FREEZE,
+        CORDON,
+        QUARANTINE,
+        SUPPORT,
+    ], "the hold is kept and handed over; nothing stops, resets or releases"
+    assert h.escalate() == result, "one support successor per failed chain"
+    assert len(h.store.list_workflows()) == 2
+
+
+@pytest.mark.parametrize(
+    ("operations", "failed_index", "details", "contract", "why"),
+    [
+        (
+            DRAIN_CHAIN,
+            DRAIN_CHAIN.index(SUPPORT),
+            UNKNOWN_OUTCOME,
+            None,
+            "an abandoned support escalation: a second vendor ticket",
+        ),
+        (
+            ENV_REVIEW_CHAIN,
+            ENV_REVIEW_CHAIN.index(SUPPORT),
+            UNKNOWN_OUTCOME,
+            ENV_REVIEW,
+            "an abandoned support escalation: a second vendor ticket",
+        ),
+        (
+            OPERATOR_CHAIN,
+            OPERATOR_CHAIN.index(CHECKPOINT),
+            UNKNOWN_OUTCOME,
+            None,
+            "an abandoned checkpoint may still be running inside the job",
+        ),
+        (
+            [FREEZE, CORDON, QUARANTINE, FREEZE, BUNDLE, VALIDATE, SUPPORT],
+            3,
+            UNKNOWN_OUTCOME,
+            None,
+            "an abandoned evidence freeze may still be running",
+        ),
+        (
+            [FREEZE, CORDON, QUARANTINE, FREEZE, BUNDLE, SNAPSHOT, SUPPORT],
+            3,
+            UNKNOWN_OUTCOME,
+            ENV_REVIEW,
+            "an abandoned evidence freeze may still be running",
+        ),
+        (
+            DRAIN_CHAIN,
+            DRAIN_CHAIN.index(BUNDLE),
+            REJECTED,
+            None,
+            "refused before dispatch: a stale generation, a newer one owns it",
+        ),
+        (
+            ENV_REVIEW_CHAIN,
+            ENV_REVIEW_CHAIN.index(SNAPSHOT),
+            REJECTED,
+            ENV_REVIEW,
+            "refused before dispatch: a stale generation, a newer one owns it",
+        ),
+    ],
+    ids=[
+        "drain-abandoned-support",
+        "environment-review-abandoned-support",
+        "abandoned-checkpoint",
+        "abandoned-freeze",
+        "environment-review-abandoned-freeze",
+        "drain-executor-rejected",
+        "environment-review-executor-rejected",
+    ],
+)
+def test_the_no_second_ticket_endings_still_open_nothing(
+    operations, failed_index, details, contract, why
+) -> None:
+    h = held_chain(operations, failed_index, details=details, contract=contract)
+
+    assert HardwareEscalationService.classify(h.workflow) is None, why
+    assert h.escalate() is None, why
+    assert len(h.store.list_workflows()) == 1, "no successor was opened"
+
+
+def test_a_failed_support_hand_off_is_terminated_not_handed_off_again() -> None:
+    """A support-after successor that holds its node and failed before its own
+    ESCALATE_SUPPORT is the chain terminator's: no support-after-support."""
+
+    h = held_chain(
+        [FREEZE, CORDON, QUARANTINE, SUPPORT], failed_index=2, details={"error": "x"}
+    )
+    h.store.save_incident(
+        h.source.model_copy(update={"event_id": "support-after-earlier-workflow"})
+    )
+
+    assert h.escalate() is None
+    assert len(h.store.list_workflows()) == 1, "the terminator opens no successor"
+
+
+def test_a_cooldown_plan_without_a_hand_off_still_opens_nothing() -> None:
+    """A legacy THERMAL_COOLDOWN plan cordons but plans no ESCALATE_SUPPORT:
+    nothing is owed by this rule, whatever step failed."""
+
+    cooldown = {"health_recovery_contract": {"mode": "THERMAL_COOLDOWN"}}
+    operations = [FREEZE, CORDON, BUNDLE, SNAPSHOT, VALIDATE]
+    h = held_chain(operations, operations.index(SNAPSHOT), contract=cooldown)
+
+    assert HardwareEscalationService.classify(h.workflow) is None
+
+
 @pytest.mark.parametrize("profile", [None, "missing-profile"])
 def test_escalation_with_unknown_runtime_profile_is_blocked_for_an_operator(
     profile,

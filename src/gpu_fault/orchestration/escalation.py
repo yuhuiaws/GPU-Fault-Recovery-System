@@ -25,6 +25,14 @@ from gpu_fault.operation_registry import (
     HARDWARE_ESCALATION_RELEVANT_OPERATIONS,
     NODE_ACTION_SCOPE_OPERATIONS,
 )
+from gpu_fault.orchestration.failure_outcome import (
+    EXECUTOR_REJECTED_STATUS_SOURCE as EXECUTOR_REJECTED_STATUS_SOURCE,
+    NO_SECOND_TICKET_OPERATIONS as _NO_SECOND_TICKET_OPERATIONS,
+    UNKNOWN_OUTCOME_FLAGS as _UNKNOWN_OUTCOME_FLAGS,
+    executor_rejected_failure as executor_rejected_failure,
+    held_chain_hand_off,
+    unknown_outcome_failure as unknown_outcome_failure,
+)
 from gpu_fault.orchestration.families.identity import note_stale_event_link
 from gpu_fault.orchestration.gpu_placement import (
     EscalationGpuScope,
@@ -130,21 +138,6 @@ VALIDATION_EVIDENCE_MISSING_STAGE = "validation_evidence_missing"
 # Both ladders read this: ``_classify`` here and the DAG branch escalator
 # (``execution/branch_escalation.py``), which exhausts such a branch at once.
 MANUAL_CONFIRMATION_STAGE = "manual_confirmation_required"
-_UNKNOWN_OUTCOME_FLAGS = (
-    "manual_confirmation_required",
-    "node_action_interrupted",
-    "outcome_unknown",
-)
-# Unknown-outcome failures that must not open a successor: a second support
-# case for a support escalation the executor abandoned, or a support case for
-# an evidence freeze / checkpoint that may still be running inside the job.
-_NO_SECOND_TICKET_OPERATIONS = frozenset(
-    {
-        WorkflowOperation.ESCALATE_SUPPORT,
-        WorkflowOperation.FREEZE_EVIDENCE,
-        WorkflowOperation.CHECKPOINT_WORKLOADS,
-    }
-)
 # Written by the Kubernetes node adapter on a step it refused rather than
 # failed: ``safety_rejection`` on every refusal, ``absent`` when the node
 # could not be read at all.
@@ -181,32 +174,6 @@ def escalation_origin(event_id: str) -> tuple[str, str] | None:
     if name not in ESCALATION_NAMES.values():
         return None
     return name, source_request_id
-
-
-#: ``remote_status_source`` of a command the cluster executor refused before any
-#: adapter ran it (``cluster_executor.dispatch._validate``: cluster mismatch, a
-#: stale fencing token, no or an ambiguous adapter, a namespace outside the
-#: executor's scope). Deterministic per command and never a node failure.
-EXECUTOR_REJECTED_STATUS_SOURCE = "executor-rejected"
-
-
-def executor_rejected_failure(details: Mapping[str, Any] | None) -> bool:
-    """Whether a FAILED step never reached its node: the executor refused the
-    command before dispatch.
-
-    Neither ladder climbs on it. Live (gpu-eks-cluster, XID 46 reset): the
-    reset chain's generation was fenced by a successor's plan rewrite, the
-    RESTART_NODE rung was refused "command fencing token does not match
-    workflow/incident", the branch ladder appended REPLACE_NODE, that was
-    refused the same way, and the compensation restore too -- three rungs
-    spent on a record whose incident had already moved on. The refusal names
-    the stale generation; nothing about the hardware was learned.
-    """
-
-    return (
-        details is not None
-        and details.get("remote_status_source") == EXECUTOR_REJECTED_STATUS_SOURCE
-    )
 
 
 def node_action_refused_before_acting(details: Mapping[str, Any] | None) -> bool:
@@ -336,19 +303,6 @@ def escalation_descends_from(
     return False
 
 
-def unknown_outcome_failure(details: Mapping[str, Any] | None) -> bool:
-    """Whether a FAILED step's details say its outcome is not actually known.
-
-    Shared by both ladders: ``_classify`` (whole workflow) and the DAG branch
-    escalator's guard, which must stop where this stops -- a rung appended in
-    place is the same reboot over a possibly-reset GPU.
-    """
-
-    return details is not None and any(
-        details.get(flag) is True for flag in _UNKNOWN_OUTCOME_FLAGS
-    )
-
-
 def _acted_nodes(workflow: WorkflowRequest, before_index: int) -> set[str]:
     """Nodes a recovery action ran on before step ``before_index``."""
 
@@ -403,7 +357,7 @@ def _unknown_outcome_failures(
     Every operation qualifies -- a STOP_WORKLOADS or RESTART_VM the executor
     abandoned mid-flight is not a hardware rung, but classifying it as None
     made it a silent FAILED the dispatcher only stamps ``failure_handled_at``
-    on -- except the three in ``_NO_SECOND_TICKET_OPERATIONS``: an abandoned
+    on -- except the three in ``failure_outcome.NO_SECOND_TICKET_OPERATIONS``: an abandoned
     ESCALATE_SUPPORT, FREEZE_EVIDENCE or CHECKPOINT_WORKLOADS carries the same
     flags, but a ``support-after-<wf>`` successor for a support escalation that
     timed out is a second vendor ticket. Those keep the previous behaviour -- no
@@ -789,7 +743,7 @@ class HardwareEscalationService:
             if execution.status is WorkflowStepStatus.FAILED
         ]
         if diagnostic_workflow_failures(workflow, failed_executions):
-            return None
+            return held_chain_hand_off(workflow, failed_executions)
         handled, verdict = _pre_action_classification(failed_executions)
         if handled:
             return verdict
@@ -937,7 +891,7 @@ class HardwareEscalationService:
             next_action = RecoveryAction.ESCALATE_OPERATOR
             next_operation = WorkflowOperation.ESCALATE_SUPPORT
         else:
-            return None
+            return held_chain_hand_off(workflow, failed_executions)
 
         failed_executions = [
             execution

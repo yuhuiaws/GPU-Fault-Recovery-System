@@ -2480,6 +2480,16 @@ Whole-record hardware recovery escalation is invoked idempotently by the Dispatc
    QUARANTINE → ESCALATE_SUPPORT, taking over the same isolation, no job stop, no reset, no readmission) that sends the
    fixed-template mail and ends `ESCALATED` (`validation_evidence.held_for_unsent_hand_off`); a chain whose own
    ESCALATE_SUPPORT ran or failed opens no second one.
+7. A chain that cordoned its node and plans its hand-off as ESCALATE_SUPPORT (DRAIN, the ENVIRONMENT_REVIEW chain of a
+   confirmed thermal DRAIN, the XID/SXID ESCALATE_OPERATOR chain) fails a step before the hand-off where the ladder has
+   no rung -- the diagnostic bundle, the health snapshot, the job stop, a checkpoint that answered; the
+   ENVIRONMENT_REVIEW contract keeps every hardware rung away and used to end the record at any of its steps -- and
+   gets the same `workflow-support-after-<workflow>` (stage `held_chain_step`, the same four steps,
+   `failure_outcome.held_chain_hand_off`). The endings that open no ticket on purpose stay: every failure refused by the
+   executor before dispatch (a stale generation; a newer one owns the incident), or an abandoned ESCALATE_SUPPORT,
+   FREEZE_EVIDENCE or CHECKPOINT_WORKLOADS with an unknown outcome (`NO_SECOND_TICKET_OPERATIONS`: a second ticket, or
+   an evidence freeze or checkpoint that may still be running inside the job); neither do a read-only chain, a cooldown
+   plan or a hand-off that ran or failed.
 
 ```mermaid
 flowchart LR
