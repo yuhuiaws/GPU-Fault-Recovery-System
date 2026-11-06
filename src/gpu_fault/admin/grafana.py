@@ -17,7 +17,8 @@ means the deploy creates one for the site (IAM Identity Center authentication,
 removes it). And dashboards are not the alerting path: unless the operator's own
 input was wrong (``--grafana-workspace-id`` pointing at nothing, ``--grafana-viewer``
 refused), a failed step -- a refused import or a creation the region cannot
-serve -- is recorded as ``FAILED`` with a loud warning that names the manual
+serve -- is recorded as ``DEGRADED`` (``reason_code``
+``PRESENTATION_UNAVAILABLE``) with a loud warning that names the manual
 fallback, and the deploy continues.
 
 The Grafana HTTP API is reached with a service-account token minted through the

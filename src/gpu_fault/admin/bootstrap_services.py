@@ -1061,7 +1061,7 @@ def install_monitoring(
     )
     # Dashboards ride on this task so they are checkpointed with the AMP install
     # they visualise and re-imported when the dashboard assets change; the step
-    # itself decides between a soft FAILED record and an operator-input error.
+    # itself decides between a soft DEGRADED record and an operator-input error.
     # The alert email is the site administrator's: the step derives the Identity
     # Center user to grant Grafana ADMIN from it.
     dashboards = ensure_grafana_dashboards(
