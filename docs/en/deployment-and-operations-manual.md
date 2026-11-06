@@ -11834,20 +11834,26 @@ The complete environment variable reference table used by the code is generated 
 python3 scripts/generate-env-reference.py
 ```
 
-The generated result is in `docs/环境变量参考.md` (Environment Variables Reference). CI runs `--check` and fails outright when the code adds a
+The generated result is in `docs/环境变量参考.md` (Environment Variables Reference); the same command also generates the
+role-oriented `docs/管理员环境变量参考.md` (Administrator Environment Variables, from `scripts/admin-env-reference.yaml`).
+CI runs `--check` and fails outright when the code adds a
 `GPU_FAULT_*` configuration without updating the reference table.
 
 The same generator also maintains the in-package `gpu_fault/data/env-inventory.json`. At startup the API, Node Agent,
 Cluster Executor, Collector and Completion Watcher enumerate the `GPU_FAULT_*` in the actual environment;
 unknown names fail closed by default, preventing misspellings from silently falling back to defaults.
 `GPU_FAULT_UNKNOWN_ENV_POLICY=warn|ignore` is allowed only for a controlled migration window and must be removed in steady state.
+Retired variables (default column `<retired: ignored>` in the reference) stay in the inventory: the process starts as usual and
+only logs one warning naming what replaced the variable; no code reads it any more.
 
 Besides names, `value_kinds` in the inventory also records each variable's value type. The types are not maintained by hand:
 the generator infers them from the conversion the code actually applies to the variable (`int(...)` -> integer, `float(...)` -> number,
 comparison with `0/1/true/false/yes/no/on/off` -> boolean); variables with more than one reading or caught by `except ValueError`
 stay untyped and unvalidated, so the inference can only miss, never misjudge a type as unusable in production.
 The five processes above validate these values at startup, **unaffected by `GPU_FAULT_UNKNOWN_ENV_POLICY`**:
-integers/numbers must parse; switches must be one of the eight words above, and must be an enabling word that switch itself recognises --
+integers/numbers must parse, be finite and lie inside the range the inventory's `value_bounds` records (inferred by the
+generator from the reading code's own guards as well; where read sites disagree the widest range wins, so a refused value is
+one no read site can use); switches must be one of the eight words above, and must be an enabling word that switch itself recognises --
 a switch that only recognises `true` written as `yes` fails startup instead of silently staying off (this kind of misspelling used to
 be discovered only when a recovery action was due and did not execute). `no`/`0`/`off` are always accepted, because for every reading
 they mean off. An empty value equals unconfigured, and every reading falls back to its own default.
@@ -11864,11 +11870,21 @@ The validator checks:
 
 - Sensitive configuration must use `valueFrom`
 - `value` and `valueFrom` must not coexist
+- Unknown `GPU_FAULT_*` names, values of the wrong type or out of range, and blank booleans (the same inventory the processes
+  enforce at startup, so the render fails instead of the rollout crash-looping)
 - preStop, Uvicorn, lifespan and Pod termination budgets
 - processor valid request and exit budgets
 - ingress/worker/spool role configuration boundaries
+- uvicorn must carry `--no-proxy-headers`; no client identity may be derived from proxy headers
 - agent artifact/config pin declarations
-- The fleet-wide PostgreSQL connection budget `pool max × workers × replicas`
+- Operation allowlists contain only known operations (with `--node-operations`, the node allowlist must also match the
+  control plane's NodeAction operations)
+- The fleet-wide PostgreSQL connection budget `pool max × workers × replicas` (plus one LISTEN connection per worker/spool-worker
+  process), capped by `GPU_FAULT_POSTGRES_FLEET_CONNECTION_BUDGET` (default 1200)
+
+On rollback the renderer copies the previous release's container env/envFrom verbatim; the validator then runs with
+`--container-env-snapshot <file>`, checks only that the render equals that snapshot and skips the current release's contract
+validators.
 
 ### Production Manifest Modification and Auto-Generation
 
@@ -11917,9 +11933,9 @@ gpu-fault-admin deploy \
 
 The first deployment uses that command; later upgrades need only `gpu-fault-admin deploy --state-dir /secure/gpu-fault`,
 which automatically chooses bootstrap or upgrade from the internal site and the regional release state. Resume is rerunning as is, rollback is
-the same command plus `--rollback`, joining a cluster is the same command with a new `--gpu-cluster-arn` (or the alias
-`join-cluster`), and removal uses `remove-cluster --gpu-cluster-arn`; no path requires the administrator to touch
-the low-level release JSON or the regional rollout scripts.
+the same command plus `--rollback`, joining a cluster is the same command with a new `--gpu-cluster-arn` (or the separate
+`join-cluster` verb), and removal uses `remove-cluster --gpu-cluster-arn <arn> --confirm REMOVE_GPU_CLUSTER`; no path requires
+the administrator to touch the low-level release JSON or the regional rollout scripts.
 
 If that command generates a Profile plan and stops, the administrator reruns the same deploy once with
 `--approve-profile-plan <plan_sha256> --reference <change ticket>`; the internal
@@ -11935,7 +11951,7 @@ Online kubectl edit of this solution's Deployments/DaemonSets/RBAC
 ```
 
 These operations bypass the release pin, role split, runtime resource registration and rollback records. When a new solution component is needed,
-a developer should submit the source change and publish a new release, and the administrator then deploys it through `upgrade`.
+a developer should submit the source change and publish a new release, and the administrator then upgrades with `gpu-fault-admin deploy`.
 
 The customer's own training job YAML is an explicit exception. Customers may maintain their own PyTorchJob/Job/JobSet,
 and then onboard it to this solution via `gpu-training-submit` or `gpu-fault-workload-annotate`; that YAML
@@ -12104,8 +12120,9 @@ The command automatically performs in order:
 1. Re-renders `regional/generated/`;
 2. Scans the lifecycle annotations of the production Manifests;
 3. Rewrites the build-time candidate inventory `cleanup-inventory.json`;
-4. Validates the three-role configuration, the generated allowlist and the deploy directory boundary;
-5. Runs the renderer and cleanup inventory contract tests.
+4. Re-checks the cleanup inventory with `--check`, validates the generated three-role configuration (allowlists included)
+   with `gpu_fault.config_cli validate`, and checks the deploy directory boundary;
+5. Runs the renderer, cleanup inventory and installed-resource registry contract tests.
 
 Before committing you can run the read-only mode to confirm no generated file was forgotten:
 
@@ -12122,16 +12139,17 @@ CI runs the same `--check` entry point automatically. It fails when a source Man
 registry; upgrades scan live objects and merge-refresh, without requiring administrators to maintain resource names.
 ## Hard Constraints on Client Identity and Migration Switches
 
-- All uvicorn processes must explicitly use `--no-proxy-headers`;
+- All uvicorn processes (the `gpu_fault.app.serve` launcher included) must explicitly use `--no-proxy-headers`;
   `--proxy-headers`, `--forwarded-allow-ips` and
-  `FORWARDED_ALLOW_IPS` are forbidden. Processor replay and the in-Pod metrics bypass trust only
-  the direct peer address of the TCP socket.
-- `GPU_FAULT_NODE_ACTION_RESULT_SIGNATURE_REQUIRED=false` is allowed only for a short
+  `FORWARDED_ALLOW_IPS` are forbidden, and a process refuses to start with `FORWARDED_ALLOW_IPS` set or
+  `GPU_FAULT_PROXY_HEADERS_ENABLED=true`. Processor replay and the in-Pod metrics bypass trust only
+  the direct peer address of the TCP socket: `/metrics` is public to a loopback peer and needs the execution token from anywhere else.
+- The Node Agent's `GPU_FAULT_NODE_ACTION_RESULT_SIGNATURE_REQUIRED=false` (unsigned result queries) is allowed only for a short
   migration, and at the same time
   `GPU_FAULT_NODE_ACTION_RESULT_SIGNATURE_MIGRATION_RELEASE_ID` matching the current `GPU_FAULT_RELEASE_ID` must be set, as well as
-  a `GPU_FAULT_NODE_ACTION_RESULT_SIGNATURE_MIGRATION_EXPIRES_AT`
-  no more than 14 days out.
-- By default `/metrics` exposes only the collector aggregates, the fixed Top-N and
+  a `GPU_FAULT_NODE_ACTION_RESULT_SIGNATURE_MIGRATION_EXPIRES_AT` that is an ISO-8601 time with a time zone, not yet passed and
+  no more than 14 days out; otherwise the Agent refuses to start.
+- By default `/metrics` exposes only the collector aggregates, the fixed Top-N (`GPU_FAULT_METRICS_COLLECTOR_TOP_N`, default 20) and
   `gpu_fault_collector_metrics_snapshot_age_seconds`. That metric family is exported only by
   `GPU_FAULT_SERVICE_ROLE=all/ingress`; a custom scrape configuration must include ingress,
   and worker replicas do not export the collector gauges.
