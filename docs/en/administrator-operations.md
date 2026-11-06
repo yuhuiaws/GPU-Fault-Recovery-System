@@ -461,6 +461,10 @@ kubeconfig and logs are untouched; the reinstall does not need these inputs prep
 
 **Read-only checks**
 
+`gpu-fault-admin status --state-dir /secure/gpu-fault --full`: the stderr summary reads `healthy: yes`, `live release: <id>
+phase=<phase> committed=yes` (no transaction in flight), `next deploy: <kind>` is the kind this deploy will run (see the
+table below), and `failing checks: none`.
+
 **Command**
 
 ```bash
@@ -503,6 +507,23 @@ with the reason given in `validation_evidence_fallback`. `status` without `--ful
 these probes at all. The verify gate inside the release driver likewise reuses the just-written evidence after a successful finalize (the driver passes the file path to verify via
 `GPU_FAULT_QUICK_VALIDATION_EVIDENCE`, with the same hard conditions as `status --full`);
 a manual verify/probe without that environment variable always reruns.
+
+The verify's `control_api` gives each cluster's collector readiness a bounded **post-roll grace**. While the api-ha Pods are
+being replaced, a collector that posts about every 300 s may lose one post (the NLB still hands connections to a target that
+is going away, and the collector outbox replays only on its next successful live post), so at the first reading seconds after
+the roll its `age_seconds` can approach 600 s, above the 420 s silence threshold, and one node flips its whole cluster to not
+ready. When a cluster is not ready, `control_api` re-reads only that cluster's `/v1/collector-readiness/{cluster_id}` every
+10 s (probe `collector_readiness_inspect`, without repeating the whole control-plane report or the GPU cluster's `kubectl get
+nodes`), for at most 600 s -- the budget `join-cluster` gives a new cluster's first post -- and never beyond the release's
+remaining time budget; only a cluster still not ready when the grace runs out is a hard failure (still fail closed); fleet
+readiness and the other verdicts are unchanged, and the wait starts only after they all passed. `status` (with or without
+`--full`) does not wait and judges the snapshot it reads. Pass or fail, the verify record carries the final readiness
+snapshot: `details.collector_readiness` of the `control_api` check (on a failure `details` is that snapshot) gives per
+cluster, node and collector kind `ready`, `age_seconds`, `threshold_seconds` (the threshold the control plane applied) and
+`unit_state`, plus `waited_seconds`, `polls`, `grace_seconds` and a `stale` list naming the stale collectors; the summary
+line names them too, e.g. `gpu-a collector readiness failed after 600s of post-roll grace (60 polls):
+gpu-a/node-a/HOST_TELEMETRY: age 512s exceeds threshold 420s`. `details.clusters.<id>.collector_readiness` is still the
+first snapshot after the roll, so the ages before and after the wait can be compared.
 
 `status` first prints five human-readable summary lines on stderr (healthy or not, online release id and phase,
 the next deployment classification, failed check names, where the JSON went), then outputs the complete JSON unchanged to stdout; scripts parse
@@ -612,16 +633,20 @@ repeated approval, and after success the active record is consumed and cannot be
 | Classification | Actual action |
 |---|---|
 | `NOOP` | No upload, no migration, no rollout; only the CPU/GPU verifiers run |
-| `CONTROL_PLANE_ONLY` | Uploads only the Control Plane wheel and rolls the three CPU tiers |
+| `CONTROL_PLANE_ONLY` | Uploads only the Control Plane wheel and rolls the three CPU tiers; a change of only the CPU-side ADOT/alert rules, the Aurora refresher, notifications or the administrator configuration is this kind too |
 | `DATA_PLANE_COMPATIBLE` | Uploads only the changed Executor/Node artefacts and proceeds in GPU cluster order |
 | `FULL` | Performs the complete two-phase release when schema, protocol, Agent configuration, Profile or cluster set changes |
 
 The physical SHA-256 confirms the actual files installed on Pods/nodes, and the component `module_digest` judges the behavioural content.
 Both Agent and Executor carry the artifact SHA, compatibility digest and protocol; the required/compatible window opens only when these
-values actually change. A shared release advances one GPU cluster at a time by default;
-within a single cluster the Executor converges first, Watcher/Collector run in parallel in the same wave, then the Reconciler and Node Runtime follow.
-The first upgrade wave is fixed at 1, then adapts by node scale and failure domains to 4, 8, 16 or an explicit 32; the first rollback wave
-is fixed at 1, with later waves conservatively adapting to 1, 2 or 4.
+values actually change. A shared release advances one GPU cluster at a time by default
+(`spec.release.upgradeMaxParallelClusters`, default 1, at most 8); within a single cluster the DNS/TLS gate, the connection
+Secret, the DCGM exporter and the data-plane ADOT collector come first, then the Executor, Watcher and Collector Deployments
+are applied as one wave and their rollouts awaited together, then the Reconciler and Node Runtime follow.
+The first upgrade wave is fixed at 1, then adapts by node scale to at most 4 (fewer than 64 nodes), 8 (fewer than 256),
+16 (fewer than 512) or 32; `spec.release.upgradeMaxUnavailable` (default 0 = auto, at most 32) can only tighten that, and
+failure domains and the site installer budget cap it too. The first rollback wave is fixed at 1, with later waves
+conservatively adapting to 1, 2 or 4, also capped by `spec.release.rollbackMaxUnavailable` (default 2).
 
 An upgrade touching the GPU or Node Runtime submits the candidate preflight as a background phase after `uploaded`, running in parallel with the schema Jobs and
 the CPU stage, and joins before entering the data plane, writing `candidate-preflight-ready` (the join is the gate, not the
@@ -633,7 +658,7 @@ A resume that has not reached `data-converged` re-runs the read-only candidate/h
 
 When a GPU cluster hits local capacity, an Agent safety gate or convergence timeout, or an Installer failure, the site release enters `PAUSED`: clusters already
 `CONVERGED` stay on the candidate version, the currently failed cluster keeps its checkpoint, and later clusters stay `PENDING`.
-After fixing the cause, rerun the same four-parameter deploy; the system re-validates the release, execution plan, previous digest,
+After fixing the cause, rerun the same `deploy --state-dir`; the system re-validates the release, execution plan, previous digest,
 CPU compatibility window, cluster identities and node sets, then resumes from the failed cluster. Unknown scope or a global fault still fails closed.
 
 **Success criteria**
@@ -648,7 +673,7 @@ CPU compatibility window, cluster identities and node sets, then resumes from th
 **Rollback**
 
 ```bash
-gpu-fault-admin deploy --state-dir /secure/gpu-fault-bootstrap --rollback
+gpu-fault-admin deploy --state-dir /secure/gpu-fault --rollback
 ```
 
 `--rollback` goes back only one step: the target is always `previous` in the release state, i.e. the release running online before the current release
@@ -685,7 +710,7 @@ If the rollback target is an old single-wheel release without separate component
 compatibility digest back to the old artifact SHA and removes the 6 component-pin environment variables that only the new version recognises before applying the old Deployment;
 these variables must not be left for the old process by hand.
 
-After an upgrade failure or automatic rollback, simply rerun the same four-parameter `gpu-fault-admin deploy`. A
+After an upgrade failure or automatic rollback, simply rerun the same `gpu-fault-admin deploy --state-dir`. A
 `failed` transaction not yet rolled back allows only the same release to resume with the original `release_diff`; once rollback has been verified and the
 `rolled-back` terminal state entered, the next candidate reuses the conservative diff set but opens a new transaction from the current online baseline, not treating the old
 release checkpoint as resume state. A new transaction clears the previous release's rollback phase and cluster
@@ -702,15 +727,10 @@ stability failure keeps the candidate intermediate state and marks `SKIPPED_POLI
 **deploy says "a failed fail-forward transaction only resumes the release that failed".**
 This is the refusal you see when a fail-forward transaction stopped at `failed`/`partial-convergence` and you fixed the defect and deploy again:
 the fix produced a new release id, and the failed transaction allows only the same release to resume. The error states the failed
-release id, the current candidate id and the way out -- add `--supersede-failed-transaction` on the same four-parameter deploy:
+release id, the current candidate id and the way out -- add `--supersede-failed-transaction` to the same deploy:
 
 ```bash
-gpu-fault-admin deploy \
-  --cpu-cluster-arn <cpu-arn> \
-  --gpu-cluster-arn <gpu-arn> \
-  --state-dir /secure/gpu-fault \
-  --admin-email <operations-email> \
-  --supersede-failed-transaction
+gpu-fault-admin deploy --state-dir /secure/gpu-fault --supersede-failed-transaction
 ```
 
 It opens a **new transaction** for the new candidate: the rollback baseline inherits the failed transaction's `previous` (the previous committed release and its Secret
@@ -725,14 +745,14 @@ release state ConfigMap or hand-write scripts calling the orchestrator to bypass
 
 **Aurora password rotation and `password authentication failed`.** RDS rotates the Aurora
 master password every 7 days, and the `gpu-fault-aurora` Secret is synchronised only by the `gpu-fault-aurora-credential-refresh`
-CronJob (now hourly at `17 * * * *`). Running Pods re-read the DSN through the `/etc/gpu-fault/aurora/postgres-url`
+CronJob (hourly at `17 * * * *`). Running Pods re-read the DSN through the `/etc/gpu-fault/aurora/postgres-url`
 mount: after the Secret refresh, kubelet sync (about 1-2 minutes) restores them, and connections rebuilt after `max_idle` reclamation before the refresh
-fail authentication and are retried by the pool with backoff, no longer losing slots (control-plane review 2026-09-08, CP-3); the refresher by default
-no longer rolls the Deployments, and the three create/wait/delete lines in the release output are unchanged. Between the rotation and the refresh, every **newly created**
+fail authentication and are retried by the pool with backoff without losing slots; the refresher by default
+does not roll the Deployments, and the three create/wait/delete lines in the release output are unchanged. Between the rotation and the refresh, every **newly created**
 control-plane Pod still exits with `FATAL: password authentication failed` --
-and a release is exactly a batch of new Pods. On 2026-09-07 12:13Z a production transaction ran into this window: the re-apply
-failed, the automatic rollback restarted control-worker, the new Pods likewise could not authenticate, the transaction stopped at `rollback-failed`,
-and from the release output it was indistinguishable from a genuinely broken release. Therefore deploy (including resume) and rollback now
+and a release is exactly a batch of new Pods. A transaction that runs into this window fails its re-apply,
+the automatic rollback restarts control-worker, the new Pods likewise cannot authenticate, the transaction stops at `rollback-failed`,
+and from the release output it is indistinguishable from a genuinely broken release. Therefore deploy (including resume) and rollback
 both synchronously run this CronJob once before rolling any component and fail closed:
 
 - Normally the release output gains three lines `+ kubectl ... create job --from=cronjob/...`, `wait`,
@@ -780,19 +800,19 @@ handled as above. When the old previous lacks the container environment snapshot
 
 `UpdateClusterSoftware` reinstalls the GPU node's system disk in place: the Node object and UID are unchanged and all annotations preserved,
 but `/opt/gpu-fault`, `/var/lib/gpu-fault`, `/etc/gpu-fault` and all `gpu-fault-*` systemd
-units disappear, and the Agent lease expires accordingly. The node-installer-reconciler used to compare only annotations and Node UID,
-so it judged such a node `current` and did not reinstall; the release then failed at "previous Agent identity capture" with
+units disappear, and the Agent lease expires accordingly. Comparing only annotations and Node UID judges such a node `current`
+and does not reinstall it; the release then fails at "previous Agent identity capture" with
 `<cluster> has no active Agent identity to capture`. An instance group with a `ScheduledUpdateConfig` (or `AutoPatchConfig`)
 gets this re-image automatically on its schedule: switch it off and update by hand in a maintenance window, see §5.0.5.
 
-The reconciler now binds the installation record to `status.nodeInfo.bootID` (annotation
+The node-installer-reconciler therefore binds the installation record to `status.nodeInfo.bootID` (annotation
 `gpu-fault.io/installer-boot-id`): after a boot id change it first probes the Agent port
 (`GPU_FAULT_NODE_AGENT_PORT`, default 9099) -- a response means an ordinary reboot, and the boot id is re-stamped;
 no response with the node Ready for more than `GPU_FAULT_INSTALLER_REBOOT_GRACE_SECONDS` (default 600) marks
 `Retrying` and reinstalls in the regular waves (the two counters `rebooted`/`recovering` appear in the reconcile log).
 Nodes installed by an old version lack the annotation; the first reconcile only adds the annotation without reinstalling.
 
-If a re-image already happened before the release carrying this fix was deployed, trigger the reinstall through the reconciler's own retry channel:
+If a node was re-imaged before it carried the annotation (the first reconcile only adds it and does not reinstall), trigger the reinstall through the reconciler's own retry channel:
 
 ```bash
 kubectl --context "${GPU_CONTEXT}" annotate node <node> \
@@ -802,7 +822,7 @@ kubectl --context "${GPU_CONTEXT}" annotate node <node> \
 The reconciler creates an installer Job for that node (bound by `max-unavailable`, proceeding node by node), and after completion
 the Agent lease recovers. This changes only the installation bookkeeping annotation; the isolation/incident annotations or taints must not be changed the same way.
 
-The reconciler and cluster executor now each have their own `/metrics` (9110 / 9111, scraped into AMP by each GPU cluster's
+The reconciler and cluster executor each have their own `/metrics` (9110 / 9111, scraped into AMP by each GPU cluster's
 `gpu-fault-adot-dataplane`, series carrying `gpu_cluster`), so checking "is the loop still turning" no longer needs
 `kubectl exec` to read the heartbeat file: `gpu_fault_node_installer_reconcile_passes_total` flat across several periods, or
 `time() - gpu_fault_node_installer_last_pass_completed_timestamp` growing continuously = the reconciler loop is not doing work;
@@ -984,9 +1004,9 @@ Which counter table the per-cluster depth of processor admission reads is decide
 the source of truth. Since schema v20 both counter tables hold one row set per writer backend (`shard_id = mod(pg_backend_pid(), 128)`, signed
 partial sums summed on read), so concurrent enqueues and completions no longer queue on a shared counter row; the mode only decides which
 table is read (Detailed Design §3.1.5).
-When the production database was inspected on 2026-09-07 it had stayed at `dual` all along, and no metric had exposed that before.
+The mode can stay at `dual` for good without anyone noticing, which is why the metric matters.
 
-`/metrics` now exports the two series `gpu_fault_processor_counter_mode{mode="dual"}` and
+`/metrics` exports the two series `gpu_fault_processor_counter_mode{mode="dual"}` and
 `{mode="partitioned"}`, with the active one at 1 (SQLite/in-memory stores do not export). The routine check after an upgrade:
 
 ```bash
@@ -1070,12 +1090,7 @@ to exactly equal the code, and a Pod rolled back to the old wheel refuses to sta
 **Only one parameter needs adding to the same deploy command:**
 
 ```bash
-gpu-fault-admin deploy \
-  --cpu-cluster-arn <cpu-arn> \
-  --gpu-cluster-arn <gpu-arn> \
-  --state-dir /secure/gpu-fault \
-  --admin-email <operations-email> \
-  --accept-schema-change
+gpu-fault-admin deploy --state-dir /secure/gpu-fault --accept-schema-change
 ```
 
 This parameter expresses one thing only: I know this crosses a schema version and cannot be rolled back. The rest is done by the release engine within **this one transaction**:
@@ -1174,15 +1189,15 @@ index set's HOT gain applies; a formal perf round requires `store_layout.mode` `
 acceptance plan §3.3). `store-compaction` and `store-maintenance` measure a partitioned parent as the sum of its
 partitions and rebuild indexes per partition (§10.3).
 
-### 4.8 Two Automatic Checks Around a Release: the Archive Bucket and the ADOT Self-Monitoring Metric Names
+### 4.8 Automatic Checks Around a Release: the Archive Bucket, the Diagnostic Evidence Bucket and the ADOT Self-Monitoring Metric Names
 
-These two used to live only in release records and human memory; both are now check items in the `gpu-fault-admin deploy` report, and either failing stops:
+All three are check items in the `gpu-fault-admin deploy` report, and any one failing stops the deploy (`diagnostic_evidence_destination` only WARNs when it is undeclared or the bucket is in another Region):
 
 | Check | Phase | Pass condition | What to do when it fails |
 | --- | --- | --- | --- |
 | `control_record_archive_bucket` | Preflight | `GPU_FAULT_CONTROL_RECORD_ARCHIVE_S3_URI` is `s3://bucket/prefix`, and the bucket exists in the site Region (read-only `s3api get-bucket-location`) | Normally the bootstrap task `control_record_archive_bucket` has created and hardened the bucket before the preflight; a failure here means the bucket was deleted, is in another Region, or the bootstrap task failed on permissions -- look at that task's error in the deploy output. The control-plane pod identity's `s3:PutObject` on that prefix is granted by bootstrap per `spec.retention`. With the bucket missing the archiver only counts `gpu_fault_control_record_archive_errors_total` and deletes no live rows, but retention has silently stopped |
 | `diagnostic_evidence_destination` | Preflight | `spec.diagnosticS3Uri` of `site.yaml` (where the node Agents upload diagnostic archives) is declared and the bucket exists (read-only `s3api get-bucket-location`) in the site Region | Undeclared is a WARN, not a failure: the archives stay on the faulting node and the evidence references in the mails are `file://` paths readable only there -- declare `spec.diagnosticS3Uri` as the operations manual describes and rerun deploy (one node Agent wave). A missing bucket fails: create it or correct the URI; a bucket in another Region is a WARN (node uploads follow the S3 redirect, but the evidence leaves the site Region). The check reads no node IAM role: the GPU node role's `s3:PutObject` on that prefix is granted by the administrator, and without it the node's upload fails, the result keeps the `file://` reference and records `evidence_upload_error` |
-| `adot_self_metrics` | Post-deployment verify | Reads AMP with a SigV4 instant query: `up{job="gpu-fault-adot-self"}` is 1, and every `otelcol_*` series referenced by the alert rules and the keep list exists under that job (no longer reads the Pod's `:8889` through the API server proxy -- that reader is deliberately bound to 127.0.0.1, and proxying to the Pod IP inevitably gets connection refused, which is exactly how the verify of deploy #25 on 2026-09-09 failed; reading AMP also proves the whole chain of self-scrape, keep list and remote_write) | Means the collector image changed the metric naming (most likely added a suffix like `_bytes`): change the keep regex of `deploy/observability/adot-control-plane.yaml` and the `GpuFaultAdotMemoryHigh` / remote_write alerts in `amp-rules.yaml` in step, then rerun verify. Until then ADOT's own alerts are mute |
+| `adot_self_metrics` | Post-deployment verify | Reads AMP with a SigV4 instant query: `up{job="gpu-fault-adot-self"}` is 1, and every `otelcol_*` series referenced by the alert rules and the keep list exists under that job (it does not read the Pod's `:8889` through the API server proxy -- that reader is deliberately bound to 127.0.0.1, and proxying to the Pod IP inevitably gets connection refused; reading AMP also proves the whole chain of self-scrape, keep list and remote_write) | Means the collector image changed the metric naming (most likely added a suffix like `_bytes`): change the keep regex of `deploy/observability/adot-control-plane.yaml` and the `GpuFaultAdotMemoryHigh` / remote_write alerts in `amp-rules.yaml` in step, then rerun verify. Until then ADOT's own alerts are mute |
 
 `adot_self_metrics` is rerun separately with `gpu-fault-admin status --full`; `control_record_archive_bucket`
 runs only in the preflight of `deploy`, so to rerun it rerun `deploy`. `preflight` / `verify` are internal pass-throughs of the release driver,
@@ -1260,15 +1275,14 @@ gpu-fault-admin aurora-failback --state-dir "$STATE_DIR" --reference CHG-... --c
 
 ### 4.10 When verify/stability Cannot Reach an API: Credential Plugin Retries, the Observation Budget and Exit Status 4
 
-**Why this section exists.** On 2026-10-15 a `gpu-fault-admin config` rolled a `CONTROL_PLANE_ONLY` change cleanly; then the `verify`
-and `stability` engine processes that the release driver (`scripts/release_deploy.py`) starts in parallel both exited about 2 seconds in
-with `ERROR: exec credential plugin exited 253`. Before any check the engine runs the kubeconfig's `aws eks get-token` for a token (the
-token-cache paragraph of the [Deployment and Operations Manual](deployment-and-operations-manual.md)), and at that moment the deploy host
-got no EC2 instance-role credentials: AWS CLI v2 exit status 253 means that configuration or credentials are unavailable, and
-instance-role credentials come over IMDS, which the AWS CLI asks once with a 1-second timeout by default. The driver treats any
-verify/stability failure as a failed validation, the site has `spec.autoRollback: true`, and
-`rollout-regional-release.sh rollback --automatic` rolled a healthy change back. An observation that could not be made no longer counts
-as unhealthy; there are three layers:
+**Why this section exists.** After a change has rolled, the release driver (`scripts/release_deploy.py`) starts the `verify` and
+`stability` engine processes in parallel. Before any check the engine runs the kubeconfig's `aws eks get-token` for a token (the
+token-cache paragraph of the [Deployment and Operations Manual](deployment-and-operations-manual.md)); if at that moment the deploy
+host gets no EC2 instance-role credentials (AWS CLI v2 exit status 253 means that configuration or credentials are unavailable, and
+instance-role credentials come over IMDS, which the AWS CLI asks once with a 1-second timeout by default), both processes exit about
+2 seconds in with `ERROR: exec credential plugin exited 253`. A driver that took this for a failed validation would have
+`rollout-regional-release.sh rollback --automatic` roll a healthy change back on a site with `spec.autoRollback: true`. An
+observation that could not be made therefore does not count as unhealthy; there are three layers:
 
 1. **IMDS defaults**: every child process of a deployment scope gets `AWS_METADATA_SERVICE_NUM_ATTEMPTS=3` and
    `AWS_METADATA_SERVICE_TIMEOUT=2` unless the administrator set them (see "IMDS defaults and overrides" in this section).
@@ -1362,7 +1376,7 @@ this rollback, and do not raise `GPU_FAULT_RELEASE_STABILITY_SECONDS` to "buy" b
   `~/.aws/config`), means that one is not added; a config file that cannot be read means neither is added: unread, it cannot say what
   the administrator chose.
 - No effect when credentials come from the environment, a profile or SSO: the chain reaches IMDS last. The cost: when IMDS really is
-  down, a credential lookup takes about 12 seconds to fail instead of about 2.
+  down, a credential lookup takes about 12 seconds to fail (about 2 with the AWS CLI's own defaults).
 - For other values, export the two variables in the environment `gpu-fault-admin` runs in, or write them into the AWS config:
 
 ```ini
