@@ -2,8 +2,11 @@
 
 This is the acceptance-only composition used by
 `run_destr008_warm_spare_shortage.py`. It does not authorize a live drill.
-The existing maintenance approval, predecessor, EKS-only HyperPod,
-`NodeRecovery=None`, disabled auto-resume and no-provider-replacement rules remain.
+The existing maintenance approval, predecessor, provider recovery off (HyperPod
+`NodeRecovery=None`; on a plain EKS `eks-managed` cluster, node auto repair
+disabled on the GPU node groups), disabled auto-resume and no-provider-replacement
+rules remain; the spare health, topology and `nodeReplace` owner checks follow the
+cluster's provider (`warm_spare_provider`, `destr008_contract.profile_errors`).
 
 ## Independent Authorities
 
@@ -118,5 +121,9 @@ Focused tests compose the real watchdog, Memory Store, resource lifecycle,
 control protocol and main runner with controlled Kubernetes/host/workload I/O.
 Native PostgreSQL tests cover scoped history and protocol-filtered claims.
 These are local implementation tests, not Aurora, EKS admission, GPU occupancy
-or real service-recovery acceptance. The catalog remains `NOT_RUN` until a
-separately authorized live execution produces complete evidence.
+or real service-recovery acceptance. Only a separately authorized live execution
+with complete evidence sets the catalog verdict (`testcases/fault-scenarios.yaml`);
+a `PASS` there is bound to the case digest and the control-plane, Executor and
+Node Runtime component digests it was verified on, and
+`scripts/build-fault-evidence-index.py` reports it `STALE` (to be re-verified in a
+live window) once those components change.
