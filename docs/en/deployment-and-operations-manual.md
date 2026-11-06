@@ -4313,6 +4313,9 @@ Production-grade multi-cluster E2E must not be declared complete until all gates
 
 This section registers one GPU HyperPod EKS to a standalone CPU control plane in the same Region. There is currently no self-service
 registration API; the administrator must update the control-plane registry and distribute the same set of credentials to the GPU cluster.
+A plain EKS GPU cluster (`eks-managed`, no HyperPod orchestrator) follows the same procedure, with the differences noted where they
+apply: no HyperPod name and no `NodeRecovery` check, a registry entry with `provider: eks-managed`, and nodes selected by the selector
+the site records (`gpu-fault.io/control-plane=<site-id>`).
 
 #### REG-1. Pin the Control-Plane and Target GPU Cluster Contexts
 
@@ -4381,15 +4384,21 @@ rolling Pods does **not** change the runtime membership. Later joins, removals a
 `remove-cluster` and `rotate-token`, which publish a revision via `/v1/regional/registry` and verify the fleet ACK;
 the manual write-up below is only for the first cluster seed before the control plane is deployed, or for a DR rebuild after identity and database state have been verified.
 
-**The execution order for the first cluster differs from later clusters.** The regional-mode startup guard refuses an empty registry, so this step for the first
-cluster must be completed before the control plane is deployed; at that point `deployment/gpu-fault-api-ha` does not exist yet,
+**The execution order for the first cluster differs from later clusters.** The regional-mode startup guard refuses to start without the
+registry Secret (`regional mode requires GPU_FAULT_REGIONAL_CLUSTERS_JSON`) and the unified releaser refuses a first deployment with an
+empty cluster set, so this step for the first cluster must be completed before the control plane is deployed; at that point `deployment/gpu-fault-api-ha` does not exist yet,
 the restart script finds no Deployment and returns safely, and the registry is loaded from the Secret seed when the control plane first starts.
 The 2nd and later clusters are onboarded by `join-cluster` via the registry API; rolling the CPU to import the Secret cannot
 replace a persistent revision and ACK; writing the Secret at that point only keeps the disaster-recovery copy consistent with the registry, and rolling the running
 roles does not import it.
 
-The token must be independent per cluster and must not contain a newline. On repeated runs reuse the token already generated, to avoid updating only the control-plane
-side and leaving the GPU data plane temporarily unauthenticated:
+The token must be independent per cluster, must not contain a newline and must be at least 32 characters long. On repeated runs reuse
+the token already generated, to avoid updating only the control-plane side and leaving the GPU data plane temporarily unauthenticated.
+The entry must also carry `agent_endpoint_allowed_cidrs` (the CIDRs of the subnets the GPU nodes run in; bootstrap takes the EKS subnets
+plus the HyperPod node subnets, or the GPU node group subnets of an eks-managed cluster): with the Agent registry enabled (the regional
+manifests' default) an entry without it makes the control plane refuse to start with
+`regional cluster registrations require agent_endpoint_allowed_cidrs`. An eks-managed entry also carries `provider: "eks-managed"` and an
+empty `hyperpod_cluster_name`:
 
 ```bash
 umask 077
@@ -4413,12 +4422,14 @@ else
 fi
 
 # Remove the old entry with the same cluster_id, then append this entry; other clusters stay unchanged.
+: "${AGENT_ENDPOINT_ALLOWED_CIDRS:?comma-separated GPU node subnet CIDRs}"
 jq \
   --arg cluster_id "${CLUSTER_ID}" \
   --arg region "${AWS_REGION}" \
   --arg hyperpod "${HYPERPOD_CLUSTER_NAME}" \
   --arg eks_arn "${GPU_EKS_ARN}" \
   --arg namespaces "${ALLOWED_NAMESPACES}" \
+  --arg cidrs "${AGENT_ENDPOINT_ALLOWED_CIDRS}" \
   --rawfile token "${SECURE_DIR}/cluster-token" \
   'map(select(.cluster_id != $cluster_id)) + [{
     cluster_id: $cluster_id,
@@ -4426,7 +4437,8 @@ jq \
     hyperpod_cluster_name: $hyperpod,
     eks_cluster_arn: $eks_arn,
     token: $token,
-    allowed_namespaces: ($namespaces | split(","))
+    allowed_namespaces: ($namespaces | split(",")),
+    agent_endpoint_allowed_cidrs: ($cidrs | split(","))
   }]' \
   "${SECURE_DIR}/clusters.current.json" \
   > "${SECURE_DIR}/clusters.json"
@@ -4465,7 +4477,9 @@ further.
 
 The CPU control plane keeps the fleet master; the GPU Node Agent and Cluster Executor receive only
 node-specific keys derived by `(cluster_id, node_id)`. First stage the master on a trusted deployment host;
-it **must not** be written into a GPU Kubernetes Secret:
+it **must not** be written into a GPU Kubernetes Secret. On a site built by `gpu-fault-admin deploy` `CONTROL_PLANE_URL` is the stable
+hostname `https://api.<site-id>.gpu-fault.internal` (`spec.clusters[].controlPlaneUrl` in `site.yaml`); the fallback below to the raw
+NLB hostname only applies to legacy environments whose certificate is bound to the NLB DNS:
 
 ```bash
 if [[ -z "${CONTROL_PLANE_URL:-}" ||
@@ -4491,7 +4505,8 @@ Save the public certificate of the CA that issued the NLB certificate as:
 ${SECURE_DIR}/control-plane-ca.crt
 ```
 
-If the CA has been stored in Secrets Manager per this solution, you can export only the public certificate:
+If the CA has been stored in Secrets Manager per this solution, you can export only the public certificate (on a site built by deploy
+the secret is `gpu-fault/<site-id>/regional-pki`, and the CA is already written to `<state-dir>/control-plane-ca.crt`):
 
 ```bash
 export NLB_PKI_SECRET_ID=gpu-fault/regional-control-plane/nlb-private-pki
@@ -4512,7 +4527,8 @@ curl --fail --cacert "${SECURE_DIR}/control-plane-ca.crt" \
   "${CONTROL_PLANE_URL}/healthz"
 ```
 
-If the NLB Security Group only allows the GPU NAT EIPs, the `curl` above should be run from inside the GPU VPC.
+If the NLB Security Group only allows the GPU NAT EIPs, the `curl` above should be run from inside the GPU VPC; the private hostname
+also resolves only inside VPCs associated with the private hosted zone.
 
 #### REG-4. Create the Connection Secret in the GPU EKS
 
@@ -4540,6 +4556,10 @@ kubectl --context "${GPU_EKS_CONTEXT}" -n "${NAMESPACE}" \
   --from-file=ca.crt="${SECURE_DIR}/control-plane-ca.crt" \
   --dry-run=client -o yaml |
 kubectl --context "${GPU_EKS_CONTEXT}" apply -f -
+# The same Secret written by the release engine also has cluster-provider (hyperpod/eks-managed), node-selector,
+# node-selector-source and eks-cluster-name (the EKS cluster name for eks-managed); the manifests read them as
+# optional keys. An eks-managed cluster must add the first three and eks-cluster-name, and then both
+# hyperpod-cluster-name and hyperpod-confirm-cluster-name hold the cluster id.
 
 FLEET_MASTER_FILE="$(mktemp)"
 kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
@@ -4563,7 +4583,7 @@ shred -u "${FLEET_MASTER_FILE}"
 
 #### REG-5. Sync the Executor Wheel and Deploy the Cluster Action Executor
 
-**The Executor is deployed only on the GPU cluster side (current design, confirmed 2026-08-01).** It needs to operate directly on
+**The Executor is deployed only on the GPU cluster side.** It needs to operate directly on
 data-plane nodes and training workloads, so it belongs to the GPU EKS and connects back to the CPU control plane through the NLB
 to claim commands; there should be no running executor on the CPU control-plane side.
 
@@ -4608,7 +4628,7 @@ EXISTING_WHEEL_SHA="$(
 )"
 test "${EXISTING_WHEEL_SHA}" = "${ARTIFACT_SHA256}"
 
-# The GPU side also accumulates wheel ConfigMaps (98 measured on 2026-08-01); reclaim after the rollout completes;
+# The GPU side also accumulates wheel ConfigMaps; reclaim after the rollout completes;
 # protect the one just built -- it is not yet referenced by any workload.
 KUBE_CONTEXT="${GPU_EKS_CONTEXT}" NAMESPACE="${NAMESPACE}" \
   GPU_FAULT_PRUNE_PROTECT="${WHEEL_CONFIG_MAP}" \
@@ -4618,7 +4638,7 @@ KUBE_CONTEXT="${GPU_EKS_CONTEXT}" NAMESPACE="${NAMESPACE}" \
 # REPLACE_WITH_EXECUTOR_IRSA_ROLE_ARN, which **must** be replaced: without this annotation the Pod has
 # no AWS credentials at all, and an executor with GPU_FAULT_ENABLE_HYPERPOD_ADAPTER=true
 # fails and exits at startup with missing_aws_credentials (this is deliberate --
-# before 2026-08 it started up perfectly fine, until hours later a card really broke and
+# otherwise it would start up fine and only fail when a card really broke and
 # REPLACE_NODE died on NoCredentialsError).
 # Regional mode must use a data-plane-specific role and must not reuse the single-cluster
 # gpu-fault-control-plane role. The latter usually contains ses:SendEmail; reusing it would hand notification permission
@@ -4630,9 +4650,10 @@ KUBE_CONTEXT="${GPU_EKS_CONTEXT}" NAMESPACE="${NAMESPACE}" \
 # BatchDeleteClusterNodes and sagemaker:* are forbidden; workload log S3 PutObject/
 # AbortMultipartUpload may be granted separately per target prefix.
 # The executor role of a plain EKS cluster (provider: eks-managed) holds no sagemaker:*
-# at all: only ec2:DescribeInstances (EC2 grants it on Resource "*" only),
+# at all: bootstrap grants only ec2:DescribeInstances (EC2 grants it on Resource "*" only),
 # ec2:RebootInstances conditioned on aws:ResourceTag/eks:cluster-name=<EKS cluster name>,
 # and eks:DescribeCluster / eks:DescribeNodegroup scoped to this cluster's and node groups' ARNs;
+# the validator additionally tolerates ec2:DescribeInstanceStatus and eks:ListNodegroups, and
 # every other ec2:*/eks:* is refused (regional_release_iam.EXECUTOR_EKS_MANAGED_ACTIONS).
 export EXECUTOR_IRSA_ROLE_ARN="arn:aws:iam::<account-id>:role/<executor-role>"
 
@@ -4709,8 +4730,8 @@ kubectl --context "${GPU_EKS_CONTEXT}" -n "${NAMESPACE}" exec \
   deploy/gpu-fault-cluster-executor -- gpu-fault-cluster-executor-readiness
 ```
 
-Note that this entry point ships with the wheel: **on a cluster whose wheel ConfigMap has not been re-rolled the command does not exist**,
-and the probe fails continuously.
+Note that this entry point ships with the wheel installed in the executor image (`/opt/gpu-fault/executor/bin`): **a Pod still running an
+older image without it has no such command**, and the probe fails continuously.
 
 #### REG-6. Install the Collector and Node Agent on Every GPU Node
 
@@ -4763,6 +4784,11 @@ sudo ./deploy/node/install-gpu-fault-collector.sh \
   --node-instance-id "$(cat /secure/node-uid)"
 ```
 
+A plain EKS (eks-managed) node adds `--cluster-provider eks-managed` (that provider never quiesces kubelet/containerd) and, as its node
+group declares, `--dcgm-hostengine host|embedded`; when the site declares `spec.diagnosticS3Uri`, add `--diagnostic-s3-uri <s3://...>`.
+All of these inputs enter the Agent config digest, which must equal `required-agent-config-digest` in the control plane's release
+metadata, otherwise NodeAction fails closed on pin drift.
+
 Security constraints: do not put the cluster token directly on the command line with `--token` (argv is visible to every process on the same machine);
 use `--token-file` instead, pointing at a 0600 absolute-path file (`--token` and `--token-file`
 are mutually exclusive). `--wheel-sha256` is now **mandatory**: pass the 64-hex-digit
@@ -4772,11 +4798,11 @@ the release manifest match that value, aborting fail-closed on a mismatch; the d
 (`requirements/node-runtime.lock`) is the complete closure of the `collectors` extra, generated by
 `uv export --frozen --no-dev --no-emit-project --extra collectors`; **do not** use
 `--no-emit-package` to strip any package: `prometheus-client` is imported only inside a function of the DCGM collector,
-invisible to a top-level scan; on 2026-09-09 a lock that stripped it was installed on the first canary node,
-`gpu-fault-metrics-collector` hit ModuleNotFoundError on every scrape, the node sent not a single metric,
-the installation validation's "metrics delivered" step kept failing, and the release stalled in the data-plane pause. The test
+invisible to a top-level scan; a lock that strips it makes `gpu-fault-metrics-collector` hit ModuleNotFoundError on every scrape,
+the node sends not a single metric, the installation validation's "metrics delivered" step keeps failing, and the release stalls in
+the data-plane pause. The test
 `test_node_runtime_lock_pins_every_third_party_import_of_the_node_closure`
-now checks the lock import by import against the node-runtime wheel closure.
+checks the lock import by import against the node-runtime wheel closure.
 
 Do not pass `--enable-node-log-collector` or
 `--enable-nvidia-smi-metrics-collector`. After installation run:
@@ -4818,28 +4844,37 @@ per-cluster Deployments, not installed once per GPU node either. The Nvidia SMI 
 an optional runtime mode of `gpu-fault-metrics-collector`, not a separate systemd service, and is currently
 disabled by default.
 
-Persistent deployments must enable `gpu-fault-node-installer-reconciler`. Every 5 seconds (`GPU_FAULT_RECONCILE_SECONDS`, manifest value 5) it queries only Ready
-Nodes carrying the `sagemaker.amazonaws.com/cluster-name=${HYPERPOD_CLUSTER_NAME}` label; the stable `CLUSTER_ID` is used only for events, the registry and per-node key derivation and cannot replace
-the provider cluster name. When a Node
+Persistent deployments must enable `gpu-fault-node-installer-reconciler`. Every 5 seconds (`GPU_FAULT_RECONCILE_SECONDS`, manifest value 5) it queries only
+the Ready Nodes the cluster's GPU node selector selects: the connection Secret's `node-selector` (`GPU_FAULT_NODE_SELECTOR`, required
+on eks-managed; `gpu-fault.io/control-plane=<site-id>[,sagemaker.amazonaws.com/cluster-name=<name>]` for a cluster managed under the
+ownership label), falling back to the `sagemaker.amazonaws.com/cluster-name=${HYPERPOD_CLUSTER_NAME}` label when unset; the stable
+`CLUSTER_ID` is used only for events, the registry and per-node key derivation and cannot replace the provider cluster name. When a Node
 lacks the current installer version/config digest/artifact SHA, it creates an
 Installer Job bound to that Node.
 Inside the Job the same `install-gpu-fault-collector.sh` and `/opt/gpu-fault/verify` still run.
 On success the Reconciler records the version, config digest, artifact SHA,
 Node UID and `Succeeded` in Node annotations; the same node is not installed twice. An artifact change must trigger a reinstall even when the config digest
-is unchanged. A failed Job is kept for 5 minutes, then deleted and recreated; a node replacement also reinstalls because the Node UID changes.
+is unchanged. A failed Job is kept for `GPU_FAULT_INSTALL_RETRY_SECONDS` (default 300 seconds), then deleted and recreated, with the
+attempt count and reason recorded in the Node annotations `gpu-fault.io/installer-attempts` / `gpu-fault.io/installer-reason`; a node
+replacement (changed Node UID) and an in-place HyperPod re-image (changed boot id, `gpu-fault.io/installer-boot-id`) also reinstall.
 The Reconciler serves `/metrics` (family `gpu_fault_node_installer_*`) and `/healthz` on `GPU_FAULT_NODE_INSTALLER_METRICS_PORT` (default 9110),
 scraped by each GPU cluster's `gpu-fault-adot-dataplane`;
 for variables, how to read them and prerequisites see "The scrape path for the data plane's own metrics" in the path B section.
 
-When using `deploy/hyperpod/deploy.sh deploy`, the Reconciler is deployed automatically after the first per-node installation succeeds.
-In regional control-plane mode, use the existing production installer bundle and separately upload the wheel containing
-the Reconciler:
+The release engine of `gpu-fault-admin deploy` deploys the Reconciler on every GPU cluster and installs the Agents through it in node
+waves: the first wave is a one-node canary; after that each wave moves at most `spec.release.upgradeMaxUnavailable` nodes (the default
+0 means automatic from the node count: min(nodes, 4) below 64 nodes, 8 below 256, 16 below 512, 32 beyond; also bounded by the
+site-wide budget of 64 concurrent installs shared across the clusters rolling in parallel), split evenly across failure domains when
+there are several, and one node per wave while any node lacks a failure-domain label. With the legacy `deploy/hyperpod/deploy.sh deploy`,
+the Reconciler is deployed automatically after the first per-node installation succeeds. Below is the break-glass manual deployment:
+use the production installer bundle the same release already uploaded and separately upload the wheel containing the Reconciler.
+`deploy-node-installer-reconciler.sh` requires every identity below (a missing one exits with `ERROR: <name> is required`);
+`GPU_FAULT_INSTALLER_CONFIG_DIGEST` is the Agent config digest, not a bundle digest:
 
 ```bash
 export GPU_EKS_CONTEXT='arn:aws:eks:us-west-2:123456789012:cluster/<gpu-eks-cluster>'
 export CLUSTER_ID='<stable-regional-cluster-id>'
 export NAMESPACE=gpu-fault-system
-export INSTALLER_CONFIG_MAP=gpu-fault-node-installer-0100
 
 EXECUTOR_WHEEL="${EXECUTOR_WHEEL:-$(
   python3.12 scripts/release-artifact-path.py executor-wheel
@@ -4847,24 +4882,34 @@ EXECUTOR_WHEEL="${EXECUTOR_WHEEL:-$(
 test -s "${EXECUTOR_WHEEL}"
 WHEEL_SHA="$(sha256sum "${EXECUTOR_WHEEL}" | cut -d' ' -f1)"
 RECONCILER_WHEEL_CONFIG_MAP="gpu-fault-executor-wheel-0100-${WHEEL_SHA:0:12}"
+# The same writer as the release engine (xz-compressed, chunkable); an existing object is only read back and re-hashed.
+test "$(
+  PYTHONPATH=src python3.12 -m gpu_fault.admin.artifact_configmaps \
+    --context "${GPU_EKS_CONTEXT}" --namespace "${NAMESPACE}" \
+    upload --name "${RECONCILER_WHEEL_CONFIG_MAP}" --artifact "${EXECUTOR_WHEEL}" \
+    --compress --splittable |
+  jq -er '.sha256'
+)" = "${WHEEL_SHA}"
 
-if ! kubectl --context "${GPU_EKS_CONTEXT}" -n "${NAMESPACE}" \
-  get configmap "${RECONCILER_WHEEL_CONFIG_MAP}" >/dev/null 2>&1; then
-  kubectl --context "${GPU_EKS_CONTEXT}" -n "${NAMESPACE}" \
-    create configmap "${RECONCILER_WHEEL_CONFIG_MAP}" \
-    --from-file="${EXECUTOR_WHEEL}"
-fi
-
-INSTALLER_DIGEST="$(
-  kubectl --context "${GPU_EKS_CONTEXT}" -n "${NAMESPACE}" \
-    get configmap "${INSTALLER_CONFIG_MAP}" -o json |
-  jq -r '.binaryData | to_entries[0].value' |
-  base64 -d | sha256sum | cut -d' ' -f1
+# The release engine uploaded the same release's installer bundle as a content-addressed ConfigMap.
+NODE_BUNDLE="$(python3.12 scripts/release-artifact-path.py bundle)"
+NODE_BUNDLE_SHA="$(sha256sum "${NODE_BUNDLE}" | cut -d' ' -f1)"
+export INSTALLER_CONFIG_MAP="gpu-fault-node-installer-0100-${NODE_BUNDLE_SHA:0:12}"
+INSTALLER_TEMPLATE_SHA="$(
+  jq -er '.components.node_bundle.template_sha256' dist/current-release.json
+)"
+NODE_COMPATIBILITY_DIGEST="$(
+  jq -er '.components.node_runtime.module_digest' dist/current-release.json
 )"
 INSTALLER_ARTIFACT_SHA="$(
   kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
     get configmap gpu-fault-release-metadata \
     -o jsonpath='{.data.required-agent-artifact-sha256}'
+)"
+INSTALLER_CONFIG_DIGEST="$(
+  kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
+    get configmap gpu-fault-release-metadata \
+    -o jsonpath='{.data.required-agent-config-digest}'
 )"
 
 FLEET_MASTER_FILE="$(mktemp)"
@@ -4882,13 +4927,21 @@ GPU_FAULT_RUNTIME_PROFILE="${RUNTIME_PROFILE_VERSION}" \
 GPU_FAULT_FLEET_MASTER_FILE="${FLEET_MASTER_FILE}" \
 GPU_FAULT_CONTROL_PLANE_KUBECONFIG="${CPU_KUBECONFIG}" \
 GPU_FAULT_INSTALLER_CONFIG_MAP="${INSTALLER_CONFIG_MAP}" \
-GPU_FAULT_INSTALLER_CONFIG_DIGEST="${INSTALLER_DIGEST}" \
+GPU_FAULT_INSTALLER_CONFIG_DIGEST="${INSTALLER_CONFIG_DIGEST}" \
 GPU_FAULT_INSTALLER_ARTIFACT_SHA256="${INSTALLER_ARTIFACT_SHA}" \
+GPU_FAULT_INSTALLER_BUNDLE_SHA256="${NODE_BUNDLE_SHA}" \
+GPU_FAULT_INSTALLER_TEMPLATE_SHA256="${INSTALLER_TEMPLATE_SHA}" \
+GPU_FAULT_NODE_COMPATIBILITY_DIGEST="${NODE_COMPATIBILITY_DIGEST}" \
+GPU_FAULT_NODE_INSTALLER_IMAGE="${GPU_FAULT_NODE_INSTALLER_IMAGE}" \
 GPU_FAULT_WHEEL_CONFIG_MAP="${RECONCILER_WHEEL_CONFIG_MAP}" \
 GPU_FAULT_EXECUTOR_WHEEL_FILENAME="$(basename "${EXECUTOR_WHEEL}")" \
   deploy/node/deploy-node-installer-reconciler.sh
 shred -u "${FLEET_MASTER_FILE}"
 ```
+
+An eks-managed cluster also passes `GPU_FAULT_CLUSTER_PROVIDER=eks-managed`, `GPU_FAULT_NODE_SELECTOR=<the selector the site records>`
+and `GPU_FAULT_DCGM_HOSTENGINE=host|embedded`, with `GPU_FAULT_HYPERPOD_CLUSTER` set to the cluster id; when the site declares
+`spec.diagnosticS3Uri`, also pass `GPU_FAULT_DIAGNOSTIC_S3_URI`.
 
 The Reconciler wheel and the production installer bundle must be kept separate: the former only runs the Kubernetes
 controller, the latter determines the Agent/collector artifact SHA installed on the host. Do not replace the production installer bundle in order to upgrade
@@ -4915,10 +4968,18 @@ NODE_BUNDLE="$(
 )"
 NODE_BUNDLE_SHA="$(sha256sum "${NODE_BUNDLE}" | cut -d' ' -f1)"
 NODE_BUNDLE_CONFIG_MAP="gpu-fault-node-installer-0100-${NODE_BUNDLE_SHA:0:12}"
+INSTALLER_TEMPLATE_SHA="$(
+  jq -er '.components.node_bundle.template_sha256' dist/current-release.json
+)"
 
-kubectl --context "${GPU_EKS_CONTEXT}" -n "${NAMESPACE}" \
-  create configmap "${NODE_BUNDLE_CONFIG_MAP}" \
-  --from-file=gpu-fault-node-installer-0.10.0.tar.gz="${NODE_BUNDLE}"
+# The installer Job reads the bundle from its mount, so it is stored as one uncompressed object (no chunking, no
+# compression); an existing object is only re-hashed.
+test "$(
+  PYTHONPATH=src python3.12 -m gpu_fault.admin.artifact_configmaps \
+    --context "${GPU_EKS_CONTEXT}" --namespace "${NAMESPACE}" \
+    upload --name "${NODE_BUNDLE_CONFIG_MAP}" --artifact "${NODE_BUNDLE}" |
+  jq -er '.sha256'
+)" = "${NODE_BUNDLE_SHA}"
 
 FLEET_MASTER_FILE="$(mktemp)"
 kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
@@ -4935,18 +4996,22 @@ GPU_FAULT_RUNTIME_PROFILE="${RUNTIME_PROFILE_VERSION}" \
 GPU_FAULT_FLEET_MASTER_FILE="${FLEET_MASTER_FILE}" \
 GPU_FAULT_CONTROL_PLANE_KUBECONFIG="${CPU_KUBECONFIG}" \
 GPU_FAULT_INSTALLER_CONFIG_MAP="${NODE_BUNDLE_CONFIG_MAP}" \
-GPU_FAULT_INSTALLER_CONFIG_DIGEST="${NODE_BUNDLE_SHA}" \
+GPU_FAULT_INSTALLER_CONFIG_DIGEST="${REQUIRED_AGENT_CONFIG_DIGEST}" \
 GPU_FAULT_INSTALLER_ARTIFACT_SHA256="${NODE_WHEEL_SHA}" \
+GPU_FAULT_INSTALLER_BUNDLE_SHA256="${NODE_BUNDLE_SHA}" \
+GPU_FAULT_INSTALLER_TEMPLATE_SHA256="${INSTALLER_TEMPLATE_SHA}" \
 GPU_FAULT_NODE_COMPATIBILITY_DIGEST="${NODE_COMPATIBILITY_DIGEST}" \
+GPU_FAULT_NODE_INSTALLER_IMAGE="${GPU_FAULT_NODE_INSTALLER_IMAGE}" \
 GPU_FAULT_WHEEL_CONFIG_MAP="${RECONCILER_WHEEL_CONFIG_MAP}" \
 GPU_FAULT_EXECUTOR_WHEEL_FILENAME="$(basename "${EXECUTOR_WHEEL}")" \
   deploy/node/deploy-node-installer-reconciler.sh
 shred -u "${FLEET_MASTER_FILE}"
 ```
 
-Use `kubectl create` for the large bundle ConfigMap; do not create it via
+`artifact_configmaps` creates the large bundle ConfigMap with `kubectl create`; do not create it via
 `kubectl create --dry-run -o yaml | kubectl apply -f -`; the
-`last-applied-configuration` annotation the latter adds may exceed the Kubernetes 256 KiB limit.
+`last-applied-configuration` annotation the latter adds may exceed the Kubernetes 256 KiB limit. A bundle over the 1 MiB ConfigMap
+ceiling is refused by the release engine before any object is created (a wheel may be chunked, a bundle may not).
 
 Regional authentication uses the token digest (`token_sha256`) and membership state of the Aurora persistent registry as the source of truth; the CPU
 `gpu-fault-regional-clusters` Secret keeps the bootstrap seed and the raw credentials needed for disaster recovery. The following is only
@@ -4972,7 +5037,9 @@ unset TOKEN_B64
 ```
 
 The Agent pin cannot switch atomically from the old value straight to the new one: the control plane and all nodes cannot possibly finish
-rolling at the same instant. The standard `deploy/hyperpod/deploy.sh` first pauses the processor worker, writes the old
+rolling at the same instant. The regional release engine first applies the control plane with a compatibility window (the old
+artifact/config/protocol in `compatible-*`), then installs the Agents in node waves, and only after every node's heartbeat has converged
+finalizes by clearing the compatibility fields. The legacy `deploy/hyperpod/deploy.sh` first pauses the processor worker, writes the old
 artifact/config/protocol into the three `compatible-*` fields, then starts the new control plane and installs the
 Agents; only after the heartbeats of all current nodes have converged exactly to the new
 `artifact_sha256`, `config_digest` and protocol does the script clear the compatibility fields, roll
@@ -5060,7 +5127,7 @@ kubectl --context "${GPU_EKS_CONTEXT}" -n "${NAMESPACE}" \
 kubectl --context "${GPU_EKS_CONTEXT}" -n "${NAMESPACE}" \
   logs deployment/gpu-fault-node-installer-reconciler --tail=100
 kubectl --context "${GPU_EKS_CONTEXT}" get nodes \
-  -l sagemaker.amazonaws.com/cluster-name="${HYPERPOD_CLUSTER_NAME}" \
+  -l "${GPU_NODE_SELECTOR:-sagemaker.amazonaws.com/cluster-name=${HYPERPOD_CLUSTER_NAME}}" \
   -o custom-columns='NAME:.metadata.name,VERSION:.metadata.annotations.gpu-fault\.io/installer-version,STATE:.metadata.annotations.gpu-fault\.io/installer-state,DIGEST:.metadata.annotations.gpu-fault\.io/installer-config-digest'
 ```
 #### REG-7. Verify from the GPU Data Plane
