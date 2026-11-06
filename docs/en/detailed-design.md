@@ -1878,7 +1878,7 @@ GPU index, UUID, PCI BDF and product model; Aurora keeps only the latest value p
 When an XID log carries only a PCI address, the control plane uses this snapshot to fill in the GPU UUID; when an SXID needs to participate in a GPU set it uses
 the same snapshot. The snapshot is valid for 180 seconds by default and the event boot ID must match the snapshot; if it is missing, expired
 or the boot does not match, the path fails closed. The old `gpu_metric_latest` identity mapping serves only as a compatibility
-fallback during rolling upgrades and is no longer the normal path. Before executing a reset, the Node Agent still re-reads the live local inventory and checks the
+fallback during rolling upgrades and is not the normal path. Before executing a reset, the Node Agent still re-reads the live local inventory and checks the
 target set, so the control plane's identity snapshot cannot bypass the data plane's final safety gate.
 
 A DCGM edge candidate is delivered only once it reaches the confirmation count consecutively; a one-off candidate and its recovery are both suppressed,
@@ -1934,7 +1934,8 @@ recovery and eviction of persisted attempts, `publish_coverage_heartbeat`) and `
 restart counts and not sharing capacity with critical events); `completion_outbox.py` (`KubernetesCompletionOutbox`: provides
 write-ahead records for failure-detected/terminal deliveries) and `completion_outbox_records.py` (the pure functions for its
 ConfigMap document merging and capacity); `completion_metrics_server.py` (the Watcher's own `/metrics` +
-`/healthz`). The logger name uniformly borrows `gpu_fault.completion_controller`, so log lines are byte-identical before and after the split.
+`/healthz`). `completion_delivery`, `completion_liveness`, `completion_reconcile_loop`, `completion_pod_parsing` and
+`completion_workload_stopper` borrow the logger name `gpu_fault.completion_controller`; the other modules log under their own module names.
 
 Semantics of the write-ahead outbox: the two critical deliveries `/v1/attempts/failure-detected` and `/v1/attempts/terminal`
 are first written to `events.json` in ConfigMap `<outbox-name>` and then delivery is attempted; delivery failures are replayed by `replay`. Permanent rejections
@@ -2046,7 +2047,7 @@ Terminal handling logic:
    the decision is checked again and the event, the plan with its incident/workflow, and the decision are saved, avoiding duplicate delivery
    or a second recovery produced by multi-replica races. The legacy "event exists but no decision" state from older versions can get its decision filled in on redelivery.
 3. The recovery workflow points to the containment workflow via `predecessor_workflow_id`, and the scheduler guarantees stop-before-start;
-   terminal reporting no longer returns 409 because containment is still open, nor does it wait for containment execution to complete.
+   terminal reporting does not return 409 because containment is still open, nor does it wait for containment execution to complete.
 4. A termination initiated by another incident (`termination_initiator_incident_id` points to something other than this attempt's
    passive containment incident), or an explicit initiator that cannot be found → `NO_ACTION`, no recursive recovery.
 5. Without passive containment, `STOPPED` or a non-failure terminal state → `NO_ACTION` and withdraw the related restart
@@ -2196,10 +2197,10 @@ Every record is bounded in count and length.
 
 **The sweep's workload scope.** The device sweep TERM/KILLs only three kinds of holders of the target GPU: the process
 whitelist, the affected attempt's workload cgroup and (on `eks-managed` only) a Kubernetes container; any other is listed in
-`unswept_device_holders` and left to VERIFY_NO_GPU_CLIENTS to refuse. The workload cgroup used to come from the
-`gpu-fault.io/cgroup-path` annotation alone (`workload_cgroup_paths_by_node`), which a managed Pod never has, so a training
-process still holding the GPU after the stop could only make VERIFY fail closed. The control plane now also freezes into the
-QUIESCE the runtime ids of the attempt's running containers per node (`workload_container_ids_by_node`, the hung DAG's
+`unswept_device_holders` and left to VERIFY_NO_GPU_CLIENTS to refuse. The workload cgroup comes from the
+`gpu-fault.io/cgroup-path` annotation (`workload_cgroup_paths_by_node`) -- which a managed Pod usually lacks, so with the
+annotation alone a training process still holding the GPU after the stop could only make VERIFY fail closed -- and from the
+runtime ids the control plane freezes into the QUIESCE of the attempt's running containers per node (`workload_container_ids_by_node`, the hung DAG's
 parameter), and only when the same plan has the attempt's STOP_WORKLOADS before that QUIESCE (`evidence.stops_attempt_before`):
 the sweep meets a stopped attempt's survivors, never a job the plan left running. The Agent resolves its node's ids to
 container cgroups with the hung chain's resolver (`/proc/<pid>/cgroup`) at the start of the quiesce, before anything stops,
@@ -2207,19 +2208,19 @@ and adds them to the sweep scope (`node_agent/operations/workload_scope.quiesce_
 read (not 64-hex, more than 64 per node) refuses the quiesce before the fail-safe is armed. A container with no process adds
 nothing, a scan cut short adds only what it saw, and the receipt carries `workload_scope`; another job's container,
 `crio-conmon-<id>.scope` and host processes never enter the scope. An older control plane sends no ids and an older Agent ignores
-them: the behavior is the previous one.
+them: the scope then holds only the annotated cgroup.
 
 **Fabric Manager across the window (`src/gpu_fault/gpu_fabric_window.py`).** Stopping `nvidia-fabricmanager` loses the
 fabric state, and once it runs again every GPU in the NVLink fabric needs a reset (NVIDIA Fabric Manager User Guide,
-"Stopping Fabric Manager"). The quiesce used to stop it in every window, so a window that reset one GPU left the restored
-Fabric Manager knowing that GPU alone. Live (plain EKS p5en, 8 x H200 SXM on 4 NVSwitches, driver 580.178.04, NVLink Inband
-and ALI) its log then said `failed to find the member GPU handle <n> in partition -1 in the multicast team setup request`
-and "All GPUs in the partition need to be reset to recover": every NVLink multicast team with one of the other seven GPUs
-failed and the node lost NVLS, while unicast P2P and DCGM field 170 still read healthy (NCCL up to 2.26 and from 2.29 fails
+"Stopping Fabric Manager"). Stopped in every window, it would come back after a window that reset one GPU knowing that GPU alone
+(observed on a p5en with 8 x H200 SXM on 4 NVSwitches, driver 580.178.04, NVLink Inband and ALI): its log then says
+`failed to find the member GPU handle <n> in partition -1 in the multicast team setup request`
+and "All GPUs in the partition need to be reset to recover", every NVLink multicast team with one of the other GPUs
+fails and the node loses NVLS, while unicast P2P and DCGM field 170 still read healthy (NCCL up to 2.26 and from 2.29 fails
 at init with `NCCL_NVLS_ENABLE` at its default; 2.27/2.28 fall back silently and can hang a multi-node job). From Hopper on,
 an NVSwitch system resets one GPU while Fabric Manager runs (the guide: "a GPU can be individually reset"; the `nvidia-smi`
 man page: "the dependency on Fabric Manager to facilitate reset is removed"), and with NVLink Inband Fabric Manager does
-not open the GPUs at all (live: it holds only `/dev/nvidia-nvswitch*`, `/dev/nvidia-nvlink` and `nvidia-cap0`, never
+not open the GPUs at all (measured: it holds only `/dev/nvidia-nvswitch*`, `/dev/nvidia-nvlink` and `nvidia-cap0`, never
 `/dev/nvidia[0-7]`). Hence:
 
 - **The window's policy**: the node-action adapter reads the QUIESCE's window off the persisted plan -- the steps after it
@@ -2257,8 +2258,8 @@ loads it back after the reset whatever its outcome. The `nvidia-persistenced` th
 and `/dev/nvidiactl`: it is a client of neither the target GPU nor the display stack (whose clients the module reference
 counts decide), so it does not stop the unload, and the receipt records it in `display_release_bystanders`. Any other
 holder -- another process, a target device node, `nvidia-uvm`, a deleted device node, a containerised process, or an
-unknown target set -- still keeps every module loaded. The daemon used to count as a holder, the display stack was never
-unloaded, and every single-GPU reset on a plain EKS p5en node failed busy three times and escalated to RESTART_NODE.
+unknown target set -- still keeps every module loaded. Counted as a holder, the daemon would keep the display stack from ever
+unloading, and every single-GPU reset would fail busy three times and escalate to RESTART_NODE.
 The Fabric Manager the window kept is the second bystander (`holders.fabric_manager_bystander`, combined with the
 daemon's rule in `display_release_bystander`): with NVLink Inband it holds only the fabric's own nodes --
 `/dev/nvidia-caps/*` (the fabric-management capability), `/dev/nvidia-nvswitch*` and `/dev/nvidia-nvlink`, never a GPU
@@ -2269,22 +2270,21 @@ cgroup is the `nvidia-fabricmanager.service` unit and no other unit or scope, it
 device node and nothing outside those three kinds; one holding `/dev/nvidiactl`, `nvidia-uvm` or any `/dev/nvidiaN`
 (target or not) is not -- that is a Fabric Manager operating the GPUs through the driver, a client like any other. A
 window that meant to stop it (the process outlived its unit's stop), a window that does not manage it, or no window at
-all excuses nothing. Once per-GPU reset windows kept Fabric Manager, it counted as a holder on
-`/dev/nvidia-caps/nvidia-cap0`, and every busy single-GPU reset on a plain EKS p5en node again failed busy three times
-and escalated to RESTART_NODE with no module unloaded. VERIFY_NO_GPU_CLIENTS and the final ownership recheck scan only
+all excuses nothing. Without this rule the Fabric Manager a per-GPU reset window keeps would count as a holder on
+`/dev/nvidia-caps/nvidia-cap0`, and every busy single-GPU reset would again fail busy three times
+and escalate to RESTART_NODE with no module unloaded. VERIFY_NO_GPU_CLIENTS and the final ownership recheck scan only
 the targets' `/dev/nvidiaN` and never saw it; one holding a target still fails them closed. The bystander rule excuses
 Fabric Manager itself only: the NVLSM the same unit runs on NVL5 (`comm` `nvlsm`) is a client if it holds an NVIDIA device
-node, and the display stack stays loaded (fail closed; not observed live). A read-only NVML query does not stop the
+node, and the display stack stays loaded (fail closed; not observed on hardware). A read-only NVML query does not stop the
 unload either (`holders.display_release_query_client`): a process named `nvidia-smi` whose `/proc/<pid>/fd` reads in
 full without `nvidia-uvm` (`query_clients.query_only_device_client`, the query the final ownership recheck lets pass)
 and that holds nothing but `/dev/nvidiaN` (the target's included) and `/dev/nvidiactl` reads the driver through
 `nvidia.ko` alone and is no client of `nvidia_drm`/`nvidia_modeset`, whose unload the module reference counts gate on
 their own; it is recorded in `display_release_bystanders` too. One holding `nvidia-modeset`, a capability, fabric or
 deleted node, one whose descriptor table cannot be read in full (a process that has exited included), or any other
-process name still keeps every module loaded. It used to count as a holder: a busy reset whose release is declined
-stays busy until its three attempts are spent and the ladder reboots the node; in GF-REGIONAL-COLLECT-016 D (plain EKS
-p5en, XID 109) the node's serial console shows no display-stack release for the whole RESET_GPU step while the
-acceptance reset sampler ran `nvidia-smi` on the target node every 0.25 s. The quiesce never signals Fabric Manager or
+process name still keeps every module loaded. Counted as a holder, such a query would decline the release, keep a busy reset busy until its three attempts are spent
+and have the ladder reboot the node -- the acceptance reset sampler (GF-REGIONAL-COLLECT-016), for example, runs
+`nvidia-smi` on the target node every 0.25 s. The quiesce never signals Fabric Manager or
 NVLSM: the device sweep recognises either by process name (`nv-fabricmanage`; `nvlsm` wherever it runs) or by the
 `nvidia-fabricmanager.service` cgroup (any process of the unit) and skips it whichever route matched it -- the process
 list, the workload cgroup or a Kubernetes container (`unswept_device_holders[].reason=fabric_manager_never_swept`) -- and
@@ -2294,15 +2294,15 @@ Manager or NVLSM").
 
 After the display-stack release the GPUs are cold: the quiesce window has persistence mode off, a GPU no client holds
 does not stay initialised, and from then on every `nvidia-smi` initialises every GPU of the node one after another and
-tears it down again on exit, as `modprobe nvidia_drm` does (about 2.2 s per H200 on a plain EKS p5en). The Agent's
+tears it down again on exit, as `modprobe nvidia_drm` does (about 2.2 s per H200). The Agent's
 read-only `nvidia-smi` queries -- compute apps, `-q -x`, the index map, the inventory -- are therefore bounded by the
 node's GPU count: 15 s plus 5 s per GPU (`nvidia_smi_query_timeout` in `node_agent/operations/clients.py`; the count is
-the driver's own `/proc/driver/nvidia/gpus`, eight when it cannot be read), 55 s on an eight-GPU node. The flat 15 s it
-replaces killed the first compute-apps query after `nvidia_drm` was unloaded on GF-REGIONAL-DESTR-010 (p5en, fabric
-reset) -- the pre-permit recheck of the checkpoint before `rmmod nvidia_modeset` -- and the final ownership boundary
-turned that `TimeoutExpired` into `OWNERSHIP_FINAL_SAFETY_CHANGED`: a recoverable busy reset ended FAILED. A query that
+the driver's own `/proc/driver/nvidia/gpus`, eight when it cannot be read), 55 s on an eight-GPU node. A flat 15 s would kill
+the first compute-apps query after `nvidia_drm` is unloaded -- the pre-permit recheck of the checkpoint before
+`rmmod nvidia_modeset` -- and the final ownership boundary would turn that `TimeoutExpired` into
+`OWNERSHIP_FINAL_SAFETY_CHANGED`, ending a recoverable busy fabric reset FAILED (GF-REGIONAL-DESTR-010 covers this path). A query that
 outlives the larger bound still refuses (`refusal_cause=TimeoutExpired`), and a client that appears still refuses. After
-the release the busy loop no longer runs a sampled verification of its own: with a final ownership gate the boundary
+the release the busy loop runs no sampled verification of its own: with a final ownership gate the boundary
 re-reads the compute apps, resolves the targets' device nodes and samples their holders right before the retry's spawn
 anyway, and the loop keeps only the check of the Agent's own GPU work the boundary does not make; on cold GPUs that
 repeated read would push the retry's checkpoint past the command's two-minute lifetime (`OWNERSHIP_COMMAND_EXPIRED`).
@@ -2325,8 +2325,8 @@ it), and none while `nvidia_drm` has a user -- that is reported. Each `modprobe`
 every GPU of the node: 12 s plus 5 s per GPU (`display_reload_timeout`, 52 s on eight GPUs). A `modprobe` killed by its
 timeout does not leave the kernel to finish the load: the pending SIGKILL fails the killable wait behind every GPU probe
 not yet started (`request_irq() failed (-4)`, "Failed to allocate NvKmsKapiDevice") and `nvidia_drm` goes `Live` anyway
--- on GF-REGIONAL-DESTR-010 the former 12 s bound met eight cold H200, six render nodes came back, `0000:a5:00.0` and
-`0000:59:00.0` had no DRM device, and `/proc/modules` alone called the stack restored. Each attempt is recorded in
+-- a flat 12 s bound meeting eight cold H200 brings back only six render nodes with two GPUs lacking a DRM device, and
+`/proc/modules` alone would call the stack restored. Each attempt is recorded in
 `display_module_reload_attempts` (a partial one with `drm_devices_missing`) and the verdict is `display_stack_restored`,
 beside `display_drm_devices_before`/`_after`; a stack still not back also carries `display_modules_missing` or
 `display_drm_devices_missing` (PCI addresses), the last `kernel_module_reload_error` and the remedy in
@@ -2427,14 +2427,14 @@ log XID/SXID events on that node are signals that this reboot itself explains (X
 comes back, an empty host inventory); `orchestration/reboot_window.py` absorbs them into the incident that owns the node
 as evidence (the event is linked to that incident, and no new incident/workflow is opened); a kernel log event that carries
 a boot id the node has already left (the Agent has already heartbeated with the new boot, and the event's kernel time is earlier than that heartbeat) is only recorded as a `RECOVERED`
-incident and no action is planned. That incident is the event's own (`inc-<event_id>`): when the provider-event correlation has just associated the event with a live marker, the association becomes a reason and the marker's incident is never overwritten (before batch 236 it was: the live incident turned `RECOVERED`, its event link moved to the previous boot's line and its workflow pointer was lost). When ownership cannot be decided, the original behavior is kept.
+incident and no action is planned. That incident is the event's own (`inc-<event_id>`): when the provider-event correlation has just associated the event with a live marker, the association becomes a reason and the marker's incident is never overwritten (overwriting it would turn the live incident `RECOVERED`, move its event link to the previous boot's line and lose its workflow pointer). When ownership cannot be decided, the original behavior is kept.
 
 A record-only absorption (`ABSORB_RECORD_ONLY`: after the aggregation window closed, a read-only finding falls inside a
 RUNNING workflow's mutating scope -- a node-mutating step or a pending `RESTART_WORKLOAD` naming the node) only links
 the event to the incident and appends the reason: neither the incident's node/GPU scope nor the workflow's pending steps
-grow (`families/grouped_health.py`). A two-node training job's RESET_GPU once absorbed the peer rank's hung read-only
-findings after the STOP, report after report, widening VALIDATE_GPU/RESTORE_SCHEDULING onto a peer it never isolated
-and the incident to both nodes.
+grow (`families/grouped_health.py`). Otherwise a two-node training job's RESET_GPU would absorb the peer rank's hung
+read-only findings after the STOP, report after report, widening VALIDATE_GPU/RESTORE_SCHEDULING onto a peer it never
+isolated and the incident to both nodes.
 
 Whole-record hardware recovery escalation is invoked idempotently by the Dispatcher on `FAILED` workflows:
 
@@ -2483,12 +2483,12 @@ restore) does not prove a sibling's GPU is here; last, a single-node source inci
 nodes include the source incident's escalation lineage (`escalation.escalation_lineage_nodes`), so a successor an earlier release
 built, every single-node step of it naming the inherited list, is scoped by the nodes' reports when it fails in turn. A GPU placed
 only on nodes that did not fail never enters the successor. A GPU nothing places is an explicit fail-closed decision: when every
-node of the scope failed it stays (it can only be on the successor's nodes, as before); otherwise no successor step names it (it
+node of the scope failed it stays (it can only be on the successor's nodes); otherwise no successor step names it (it
 stays on the source incident) and each failed node's VALIDATE_GPU/VALIDATE_HOST/VALIDATE_FABRIC names the node's full known GPU
 inventory instead (`scope_validation_steps`) -- every GPU the node reports must report fresh, and a node nothing is known about is
 validated node-wide (fresh node telemetry, every finding on the node). Such a GPU was never reported by any node of the scope, so
 the failed node gives up no evidence it could have produced. Node-action steps carry `gpu_uuids_by_node` only when every failed
-node holds a share and every source GPU is placed; when the store cannot be read, the workflow's own lists decide, as before.
+node holds a share and every source GPU is placed; when the store cannot be read, the workflow's own lists decide.
 The operator's validated restore (`orchestration/validated_restore.py`) takes an incident GPU off a restored node's validation
 only on positive evidence that it sits elsewhere: the inventory of a release-only node (one held only by this incident's
 quiesce taint, released and not validated) or, for an escalation successor, of a node on its lineage lists it and no restored
@@ -2508,15 +2508,14 @@ When `GPU_FAULT_KMSG_PATH` names a **regular file** (the kernel source replay's 
 with `/dev/kmsg`), keeps the file open at EOF and reads on from the same offset after the reopen delay (1 s); a line still being
 written (no newline yet) is held until the rest arrives; only a file truncated below the read offset or replaced at its path ends
 the stream and is reopened (again at the new file's end). `/dev/kmsg` blocks in `select` until the kernel writes the next record
-and never reports EOF, whereas a regular file reports EOF at once; the collector used to take that EOF for an ended stream,
-closing, reopening and seeking to the end every second, so every record appended between two reopens was skipped -- a replayed
-XID/SXID was read only if appended in the microseconds between the seek and the first read, i.e. it never reached the control
-plane (`tests/collectors/test_kernel_regular_file_follow.py`).
+and never reports EOF, whereas a regular file reports EOF at once; taking that EOF for an ended stream would close, reopen and seek to the end
+every second, skipping every record appended between two reopens, so a replayed XID/SXID would practically never reach the
+control plane (the follow behaviour is pinned by `tests/collectors/test_kernel_regular_file_follow.py`).
 
 kmsg **reading and delivery are two stages**: the reader thread pushes records into an in-process bounded queue (2048 entries), and a
 delivery thread drains it. The reader thread never waits for delivery -- `HttpEventSink` spends up to about 47 seconds retrying each record
 before handing it to the outbox, and the kernel ring keeps overwriting old records during that time -- so backpressure can only land on the queue:
-when the queue is full the **oldest** record is dropped and the newest is kept. On SIGTERM the queue no longer drops; instead it is written synchronously into the outbox within the shutdown budget,
+when the queue is full the **oldest** record is dropped and the newest is kept. On SIGTERM the queue stops dropping; instead it is written synchronously into the outbox within the shutdown budget,
 and only what cannot be written counts as lost. A delivery thread that dies on its own is counted and replaced; after more than 3 replacements
 it is no longer replaced, and the reader thread delivers inline instead.
 
@@ -2583,9 +2582,9 @@ each solving a different problem.
 `active` and `trusted`, `recommended_action` must be non-empty, the TTL must not have expired,
 `|observed_at - ended_at|` must not exceed `marker_window` (default 10 minutes),
 and at least one of node / GPU / fabric partition must intersect that attempt's allocation.
-The criterion is scope, not "close in time". A matched diagnostic-class marker (see §Terminal Handling step 4 above) does not make
-its incident the owner of job recovery: a WARNING `RUN_DIAGNOSTICS` marker once hung the job's restart gate
-on a diagnostic incident that never repaired anything, until the marker TTL expired an hour later.
+The criterion is scope, not "close in time". A matched diagnostic-class marker (see §Terminal Handling step 6 above) does not make
+its incident the owner of job recovery: otherwise a WARNING `RUN_DIAGNOSTICS` marker would hang the job's restart gate
+on a diagnostic incident that never repaired anything, until the marker TTL (one hour) expired.
 
 The marker must be persisted before the incident -- before ingest decides ownership, no observer may
 see a faulty node without a marker, so `marker()` can only guess `inc-<event_id>` first.
@@ -2606,15 +2605,20 @@ What decides "can the new event act now" is `status`, `predecessor_workflow_id`,
 The Dispatcher's gate is: the workflow is allowed to execute only when `predecessor_workflow_id` is empty, or the predecessor has entered
 `BLOCKED/SUCCEEDED/FAILED`.
 
-The serialization key is **node exclusivity**, not `job_id`. A workflow containing the following operations
-acquires exclusive possession of the host and therefore blocks later workflows pointing at the same node:
+The serialization key is **node exclusivity**, not `job_id`. A workflow containing the following operations (those
+`operation_registry` declares `node_exclusive`, `NODE_EXCLUSIVE_OPERATIONS`) acquires exclusive possession of the host and
+therefore blocks later workflows pointing at the same node whose resource claims conflict (see "node exclusivity is
+implemented as resource claims" below):
 
 ```text
-QUIESCE_GPU_SERVICES  RESET_GPU  RESET_ALL_GPUS_NVSWITCHES
-RESTORE_GPU_SERVICES  RESTART_FABRIC_MANAGER  RESTART_NODE
-REPLACE_NODE  REMEDIATE_DRIVER  UPDATE_SOFTWARE_FIRMWARE
-RESTORE_SCHEDULING
+MARK_UNSCHEDULABLE  QUIESCE_GPU_SERVICES  RESET_GPU  RECOVER_DRAIN_P2P
+RESET_ALL_GPUS_NVSWITCHES  RESTORE_GPU_SERVICES  RESTART_FABRIC_MANAGER
+REMEDIATE_EFA_DRIVER  RESTART_EFA_DEVICE_PLUGIN  RESTART_GPU_DEVICE_PLUGIN
+RESTART_NODE  REPLACE_NODE  REMEDIATE_DRIVER  UPDATE_SOFTWARE_FIRMWARE
+RESTORE_SCHEDULING  QUARANTINE
 ```
+
+A BLOCKED (needs-operator) record that never ran a step holds nothing on the node (`never_executed_operator_block`).
 
 Serializing by `job_id` alone is not enough: an idle node has no job, and a host telemetry sample carries whatever workload state the collector **happened
 to sample**. As soon as two probes disagree about "whose job this is" for the same machine,
@@ -2627,20 +2631,23 @@ resetting. All four entry points (the non-grouped path of `ingest_node_health`,
 workflows in `PENDING/SAFETY_PENDING/RUNNING` that belong to the same `cluster_id` and whose node sets intersect.
 
 **The reverse must also hold: pure forensic and verification workflows do not block.**
-Combinations such as `FREEZE_EVIDENCE + VALIDATE_FABRIC` and
-`FREEZE_EVIDENCE + MARK_UNSCHEDULABLE + QUARANTINE`
-neither possess the host nor care who possesses it; queuing them only ages the evidence
-and leaves the node idle for longer. So the criterion is "does it contain an operation from the table above", not "is any workflow running".
+Combinations such as `FREEZE_EVIDENCE + VALIDATE_FABRIC` contain no operation of the table above and hold no resource claim;
+they neither possess the host nor care who possesses it; queuing them only ages the evidence
+and leaves the node idle for longer. So the criterion is "does it contain an operation from the table above and do the claims
+conflict", not "is any workflow running". An isolation such as `MARK_UNSCHEDULABLE + QUARANTINE` holds `SCHEDULER_MUTATION` and
+serializes with any other workflow that changes the node's scheduling state.
 
-Measured behavior when collector events are injected one by one during reset execution (`QUIESCE` completed, `RESET` not completed):
+Collector events that arrive for the same node while a reset is executing (`QUIESCE` completed, `RESET` not completed):
 
-| Collector report | Decided action | predecessor | Occupies node |
-| --- | --- | --- | --- |
-| `gpu_inventory_mismatch` | `REBOOT_NODE` | the running reset | yes |
-| `efa_inventory_mismatch` | `REBOOT_NODE` | the previous reboot (chained transitively)| yes |
-| `bmc_critical_sensor` | `QUARANTINE` | empty | no |
-| `rdma_link_down` | `RUN_DIAGNOSTICS` | empty | no |
-| `filesystem_used_percent` | `QUARANTINE` | empty | no |
+| Collector report | Decided action | Handling |
+| --- | --- | --- |
+| `gpu_inventory_mismatch` | `REBOOT_NODE` | its own workflow, predecessor the running reset, occupies the node; only a running workflow with `RESTART_NODE`/`REPLACE_NODE` absorbs it as an inventory change of its own (`TRANSIENT_INVENTORY_FINDINGS`) |
+| `efa_inventory_mismatch` | `REBOOT_NODE` | likewise, predecessor the previous reboot (chained transitively) |
+| `bmc_critical_sensor`, `filesystem_used_percent` and other CRITICAL host findings | `QUARANTINE` | joins the running reset's incident and workflow: QUARANTINE is added and its not-yet-run RESTORE_SCHEDULING and RESTART_WORKLOAD are superseded (job and idle nodes alike) |
+| an RDMA finding of the same attempt (`rdma_link_down`, `rdma_errors_delta`) | `RUN_DIAGNOSTICS` | joins the same workflow (VALIDATE_FABRIC added); the job restart is kept |
+
+(`test_critical_host_quarantine_joins_running_attempt_recovery`, `test_idle_host_quarantine_joins_active_node_reset` and
+`test_running_gpu_recovery_accepts_same_node_rdma_diagnostics` in `tests/orchestration/_misc_cases_1.py`.)
 
 **Configurable preemption by a higher-level workflow.**
 `GPU_FAULT_ENABLE_WORKFLOW_PREEMPTION` defaults to `true`. Only for the same attempt,
@@ -2669,7 +2676,7 @@ Evidence, checkpoint, verify, hardware actions, restore and validation are never
 
 If the incident already points to the successor while the predecessor is executing, the predecessor's terminal-state transaction only updates
 its own workflow row and must not write `workflow_request_id` or the incident state back from a stale incident
-snapshot. This also fixes the existing pointer race for non-preempting successors.
+snapshot; this also keeps non-preempting successors clear of the same pointer race.
 
 **Attempt DAG and resource-domain arbitration.**
 The same `cluster/job/attempt` has only one set of shared workload steps:
@@ -2691,7 +2698,7 @@ recovery phase. A reset window is committed from the moment its QUIESCE is dispa
 the QUIESCE completed or has an execution record of any status, the QUIESCE and every later step of that node on the same branch keep the node
 and GPU scope they were dispatched with -- the four widening passes (`disposition.widen_in_place`, `DagBrancher.widen_parallel_job_branch`,
 `IncidentOrchestrator._widen_node_action_scope`, `merge_sxid_step_scope` in `ingest/sxid.py`) share `fixed_scope_step_indexes` to leave them
-alone; when a fault names a GPU the dispatched QUIESCE did not cover (`widens_dispatched_window`), the merge no longer answers
+alone; when a fault names a GPU the dispatched QUIESCE did not cover (`widens_dispatched_window`), the merge does not answer
 `WIDEN_IN_PLACE`/`WIDEN_BRANCH`: a job record whose join has not started gets a node successor branch (`QUEUE_BRANCH_SUCCESSOR`,
 `branch:<node>:successor:<n>`, which cordons, quiesces, verifies, resets, restores, validates and restores scheduling again after the first
 branch restored scheduling; there is still one join), a record with no join or a started join gets a successor workflow, and in both the added
@@ -2700,21 +2707,21 @@ The Node Agent's QUIESCE ran `nvidia-smi -i <bus id> -pm 0` and swept clients fo
 window kept still holds every other GPU's device node: a widened VERIFY_NO_GPU_CLIENTS met it on the new GPU and failed closed, and the ladder
 climbed to reboot; the Agent also refuses a QUIESCE with another target set for the same incident ("quiesce target GPU scope changed after
 quiesce"). With remote step batching the QUIESCE is the head of a compound command whose VERIFY, RESET and RESTORE passengers carry the scope
-they had when it was minted and run on the data plane under one lease, their results read back by step index: a widened RESET_GPU was recorded
+they had when it was minted and run on the data plane under one lease, their results read back by step index: a widened RESET_GPU would be recorded
 SUCCEEDED for two GPUs while the node reset one. When a multi-node step widens (the barrier hands each node its
 `gpu_uuids_by_node` entry), the widened node's entry takes only its own GPUs (the new event's, and those of the candidate's
-single-node step on that node), as `DagBrancher.widen_parallel_job_branch` does; `disposition.widen_in_place` used to add the
-step's whole GPU list to that entry, so the barrier sent a sibling's GPU to this node's Agent and the reset failed on a UUID it
-does not have. The orchestrator's merge widening holds a node-action step without its own `gpu_uuids_by_node` to the same
+single-node step on that node), as `DagBrancher.widen_parallel_job_branch` does; were `disposition.widen_in_place` to add the
+step's whole GPU list to that entry, the barrier would send a sibling's GPU to this node's Agent and the reset would fail on a
+UUID it does not have. The orchestrator's merge widening holds a node-action step without its own `gpu_uuids_by_node` to the same
 rule: `RecoveryArbiter.merged_gpu_scope` places such a multi-node step's GPUs with the workflow's own per-node lists
 (`arbitration.step_gpu_shares` over `gpu_placement.workflow_gpu_placement`: explicit mappings, single-node steps) and gives each
-node only the GPUs placed there -- it used to give every node of the step the whole list, which the widened mapping would have
-handed to each node's Agent. When those lists cannot place every GPU of the step, none of them is attributed, and
+node only the GPUs placed there -- giving every node of the step the whole list would let the widened mapping hand it to
+each node's Agent. When those lists cannot place every GPU of the step, none of them is attributed, and
 `IncidentOrchestrator._widen_node_action_scope` (through `arbitration.widened_gpu_mapping`) widens the step's nodes and flat GPU
 list but writes no mapping on it. A multi-node reset without a mapping is refused before any command is sent (`multi-node GPU
 reset requires parameters.gpu_uuids_by_node`) and the ladder takes over; other node actions hand each node the step's list, as for
 a step no merge touched, and an Agent refuses a GPU it does not have. The step stays unmapped through later merges -- the other
-widening passes only edit an existing mapping, and `merge_sxid_step_scope` (`ingest/sxid.py`) no longer starts one on such a step --
+widening passes only edit an existing mapping, and `merge_sxid_step_scope` (`ingest/sxid.py`) never starts one on such a step --
 so no later merge completes a partial mapping that would drop the unplaced GPU from the reset unseen. The merged scope still names
 the faulted nodes only; a workload participant never enters isolation. Arbitration compares not only rank but also uses explicit
 operation dominance: `RESTART_NODE` covers reset/reset-all/fabric-manager restart,
@@ -2723,11 +2730,16 @@ are not treated as having repaired other fault domains.
 
 The so-called "node exclusivity" is implemented as resource claims rather than a whole-machine global lock:
 
-- `GPU_RUNTIME_MUTATION`: quiesce/reset/driver/firmware/fabric-manager;
+- `GPU_RUNTIME_MUTATION`: quiesce/reset/drain-P2P recovery/driver/firmware/fabric-manager, plus `RUN_DCGM_DIAGNOSTIC` and
+  `VERIFY_NO_GPU_CLIENTS`, which open GPU clients (they hold the claim without being node-exclusive);
 - `NODE_LIFECYCLE_MUTATION`: reboot/replace, conflicts with all mutations on the same node;
 - `SCHEDULER_MUTATION`: cordon/quarantine/readmission;
+- `EFA_RUNTIME_MUTATION` (EFA driver remediation), `EFA_DEVICE_PLUGIN_MUTATION`, `GPU_DEVICE_PLUGIN_MUTATION` (device-plugin restarts);
 - read-only evidence/validation for CPU, memory, disk, EFA/RDMA and NCCL holds no mutation claim
   and may run in parallel with GPU runtime recovery.
+
+Two workflows conflict only when their claims on an intersecting node overlap or either holds `NODE_LIFECYCLE_MUTATION`
+(`RecoveryArbiter.resource_claims_conflict`).
 
 The raw evidence continuously collected by the collectors is already persisted before the event arrives. `FREEZE_EVIDENCE` only pins references
 and does not re-collect. The shared STOP waits only for evidence freezing, scheduling isolation, and the short in-flight scene capture with explicit
@@ -2789,14 +2801,14 @@ explicit criteria are also needed, otherwise a new fault would be silently swall
 Because the merge keys never expire and a key's link is rewritten only when a merge returns, the link outlives
 the incident it names. The node key is written only by the two drain routes (a critical QUARANTINE joining the
 node's incumbent isolation, a device-resource finding joining the incumbent, `orchestration/families/drain.py`);
-an isolation the health path opens normally never writes it. After the node's first merged isolation had ended
-the link still named that pair, and the next critical QUARANTINE that met a new isolation in flight was compared
-against the ended pair and opened an isolation of its own beside the incumbent, with no predecessor -- two
-concurrent MARK_UNSCHEDULABLE + QUARANTINE workflows on one node, the later one taking it over (live 2026-10-25,
-plain EKS, GF-GENERAL-LIVE-008 `interface_missing`: both ends of a veth pair went missing in one tick and the
-second end's finding opened its own isolation). The two routes now treat a linked pair whose workflow no longer
+an isolation the health path opens normally never writes it. After the node's first merged isolation has ended
+the link still names that pair; were the next critical QUARANTINE that meets a new isolation in flight compared
+against the ended pair, it would open an isolation of its own beside the incumbent, with no predecessor -- two
+concurrent MARK_UNSCHEDULABLE + QUARANTINE workflows on one node, the later one taking it over (GF-GENERAL-LIVE-008
+`interface_missing` covers it: both ends of a veth pair go missing in one tick and the second end's finding would open
+its own isolation). The two routes therefore treat a linked pair whose workflow no longer
 executes (no longer PENDING/RUNNING/SAFETY_PENDING) as no link and merge into the incumbent the node exclusivity
-lookup found; a linked pair that still executes is preferred as before. The node-scope fault family already drops
+lookup found; a linked pair that still executes is preferred. The node-scope fault family already drops
 an ended link that way, through `reopen_if_terminal`.
 
 **Layer three: ownership annotations on the node object -- cross-process ownership decisions.**
@@ -2871,6 +2883,37 @@ Before executing `RESTART_WORKLOAD`, the Kubernetes Adapter:
 Retrying the same workflow operation ID does not consume the budget twice. Multiple attempts of the same job share the count;
 modifying the annotation cannot raise a budget that is already established.
 
+**Remediation budget and storm breaker (`execution/remediation_budget.py`, `execution/storm_admission.py`,
+`src/gpu_fault/remediation_storm.py`).** When the Dispatcher claims a workflow it asks, in the same Store transaction, for the
+scopes of its budgeted steps (operations that mutate a node or a workload): every node they touch `node:<cluster>:<node>`, the
+job a STOP/RESTART touches `job:<cluster>:<job>`, and the NVSwitch fabric partition an SXID step carries
+`domain:<cluster>:<partition>`, each with a limit of 1 (`GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE`,
+`GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN`); there is no fixed region, cluster or resource-class concurrency cap (an
+older release's variables of that kind are ignored, and such a scope left on an old record neither admits nor refuses). A refused
+claim leaves the workflow `PENDING` in the queue with its wait count and the last refused scope and reason
+(`remediation_budget_wait_count`, `remediation_budget_last_blocked_scope`/`_reason`); it never fails it. Once its budgeted work has
+begun (a budgeted step completed or has an execution record, or a parked failure owes compensation) later claims only add and are
+never refused, so a reset, reboot or compensation in flight is never stranded, and the hold ends with the workflow; a rung an
+in-record escalation appends first claims the scopes it newly touches (`escalation_budget_claims`), and a rung that cannot be
+admitted exhausts its branch (§2.9).
+
+How many nodes one correlated fault may take into destructive remediation at once is the call of each cluster's **storm breaker**:
+over a sliding 600 s window (`STORM_WINDOW_SECONDS`) it counts the nodes that **newly enter** destructive node remediation (a
+workflow's first admission of budgeted work whose steps mutate the node's hardware or quarantine it; a job's healthy peers that only
+a STOP/RESTART touches are not counted, `storm_counted_node_ids`) and trips when they reach max(3, ceil(0.2 x the cluster's GPU
+nodes)) (`STORM_MIN_NODES`, `STORM_NODE_FRACTION`; the node count is the ACTIVE/DRAINING fleet Agents, read at most once a minute
+per cluster, the last good count up to five minutes old after a failed read, else the floor) across at least 2 workload domains
+(`STORM_MIN_DOMAINS`; a job, or an incident without one, is one domain, so one big job failing on many nodes never trips it).
+Tripped, the cluster's new first admissions are refused with the scope `storm:<cluster>` and wait `PENDING` like any budget waiter;
+work already admitted (holds, escalation rungs, preempting successors) goes on. The three thresholds are product constants, not
+configuration. The breaker is the Store's `remediation_storm_breaker` kind, read and written inside the claim transaction under the
+`remediation_storm/<cluster>` lock, so replicas and restarts see one breaker; it never closes by itself:
+`gpu-fault-admin remediation-storm release` closes and re-arms it (the window starts empty and a held record is admitted without
+counting again), `abort` keeps it open and hands the held workflows to people (`SUPERSEDED` with a `REMEDIATION_STORM_ABORTED`
+operator event, the incident `ESCALATED`); both require `--reason` and `--reference`, and `--dry-run` only reads. `/metrics` exports
+`gpu_fault_remediation_budget_*`: the active claims, the longest wait and the breaker state (`..._storm_breaker_open`,
+`_threshold_nodes`, `_window_nodes`, `_held_workflows`).
+
 For multiple `REPLACE_NODE` findings with the same `cluster_id/job_id/attempt_id`, the Store uses
 SQLite `BEGIN IMMEDIATE` or a PostgreSQL advisory transaction lock to merge the faulty nodes atomically.
 The workflow's `not_before` prevents the dispatcher from executing until the aggregation window ends. Hardware steps act only on
@@ -2921,12 +2964,12 @@ normalized GPU UUID, PCI BDF, fabric partition, NVLink link, switch/port or devi
 compare as devices, see 2.3) and the event falls within a 5-minute window; whether they share an execution is decided by
 workflow arbitration, and association alone never merges two executions.
 The one exception is the kernel line and the DCGM field 230 change of one XID (2.3, `policy/xid_cross_source`): they are one occurrence, so the second
-is linked to the first one's incident as a duplicate observation and plans nothing (batch 237).
+is linked to the first one's incident as a duplicate observation and plans nothing.
 Same-source kernel events can still use the monotonic timestamp within the same boot, unaffected by wall-clock skew.
 Different fault domains such as EFA and NVSwitch/SXID are never merged even when the PCI or node is the same.
 
 Correlation candidates are queried by the Store by target node, active state and a recent time window, at most 1000 by default; the same boot ID
-serves as an additional query condition for monotonic correlation. PostgreSQL no longer loads the full marker history into Python.
+serves as an additional query condition for monotonic correlation. PostgreSQL does not load the full marker history into Python.
 
 The warm-spare health controller isolates anomalies per node. A failure in any step of reading the Node, parsing the health state, parsing the failure count,
 querying incident/workflow or writing back the annotation only records that node's result for this round as
@@ -2956,10 +2999,13 @@ has it; `completion_observation.keep_known_gpu_uuids`), so the GPUs of a rank th
 event, the attempt-failure incident and the terminal allocation; a container never read with UUIDs keeps none, and a
 replacement Pod (new UID) is read from its own Pod. The same record keeps whether the Pod's deletion had been requested
 (`deleting`, written only while true), so a rank that exited non-zero after a graceful delete or an eviction is still a stop
-after a watcher restart, not a training failure (before, the restored attempt ended TIMED_OUT and the control plane opened a
-containment that stopped the running job).
+after a watcher restart, not a training failure (otherwise the restored attempt would end TIMED_OUT and the control plane would
+open a containment that stops the running job).
 
-The Dispatcher scans at most 100 entries every 5 seconds by default. A single failure is isolated and does not block the other workflows in the same batch.
+The Dispatcher scans every 5 seconds by default (`GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS`); only the process holding the fleet-wide
+dispatch lease (`GPU_FAULT_WORKFLOW_DISPATCH_LEASE_SECONDS`, default max(15 s, 3 x the poll interval)) scans at a time, taking at most
+`dispatch_batch_size` rows per tick (derived from the worker count and the lease: 346 for 8 workers and a 15 s lease, bounded to
+100-400; `GPU_FAULT_WORKFLOW_BATCH_SIZE` overrides it). A single failure is isolated and does not block the other workflows in the same batch.
 
 ### 2.11 Runtime Adapters
 
@@ -2970,7 +3016,7 @@ The Dispatcher scans at most 100 entries every 5 seconds by default. A single fa
 | GpuValidationAdapter | `gpu-fault-validation-adapter` | GPU/host/fabric freshness and health gates | Executed on the control-plane side |
 | NodeActionWorkflowAdapter | `gpu-fault-node-agent` | Client check, GPU reset | **Disabled on the control plane**, delegated to the cluster executor |
 | ManagedRecoveryObserverAdapter | `hyperpod-managed-*` | Observe managed recovery | Observed on the control-plane side |
-| HyperPodLifecycleStepAdapter | `gpu-fault-hyperpod-adapter` | HyperPod reboot/replace | **Disabled on the control plane**, delegated to the cluster executor |
+| HyperPodLifecycleStepAdapter | `gpu-fault-hyperpod-adapter` (`gpu-fault-eks-adapter` on an eks-managed cluster) | node reboot/replace: the SageMaker API on HyperPod; on an eks-managed cluster the same step adapter runs on the EKS provider (`src/gpu_fault/eks_provider.py`), reboot is EC2 `RebootInstances` and replace is a warm-spare handover only | **Disabled on the control plane**, delegated to the cluster executor |
 | SupportEscalationAdapter | `gpu-fault-support-escalation` | `ESCALATE_SUPPORT`: generates a stable synthetic ticket ID, writes it into the workflow result and the persisted notification, and sends it through the site SNS/SES channel; does not integrate with an external ticketing system | Executed on the control-plane side |
 | RegionalRemoteWorkflowAdapter | See `GPU_FAULT_REMOTE_EXECUTION_OWNERS` | Converts steps into remote commands | **Enabled only in regional mode** |
 
@@ -2985,9 +3031,10 @@ with no separate literals written inside the Adapters:
 |---|---:|
 | `control-plane` | 1 (`FREEZE_EVIDENCE`) |
 | `kubernetes` | 9 |
-| `node-action` | 16 |
+| `node-action` | 18 |
 | `gpu-validation` | 3 |
 | `hyperpod` | 2 (`RESTART_NODE`, `REPLACE_NODE`) |
+| `eks` | 2 (`RESTART_NODE`, `REPLACE_NODE`) |
 | `managed-recovery` | 4 |
 | `support` | 1 (`ESCALATE_SUPPORT`) |
 
@@ -3028,7 +3075,7 @@ In regional mode (`GPU_FAULT_DEPLOYMENT_MODE=regional`), enabling either of the 
 - the HyperPod mutation adapter.
 
 The owner set of `RegionalRemoteWorkflowAdapter` defaults to
-`gpu-fault-kubernetes-adapter,gpu-fault-node-agent,gpu-fault-hyperpod-adapter`,
+`gpu-fault-kubernetes-adapter,gpu-fault-node-agent,gpu-fault-hyperpod-adapter,gpu-fault-eks-adapter`,
 overridden by `GPU_FAULT_REMOTE_EXECUTION_OWNERS`; startup fails when the owner set is empty.
 
 ### 2.12 Node Agent `src/gpu_fault/node_agent/`
@@ -3068,17 +3115,17 @@ The restore loop runs one `systemctl start` per unit: 780 s for `nvidia-fabricma
 covers a restart's stop; on NVL5 its start script polls up to 60 s for the InfiniBand device, starts NVLSM, then Fabric
 Manager; the R535 unit had 240), 120 s for every other unit (`unit_start_timeout_seconds` in `node_agent/common.py`); the
 RESTORE step, the fail-safe timer's restore and the boot reconcile run the same loop. `RESTART_FABRIC_MANAGER`
-(`_restart_fabric_manager` in `operations/reset.py`, `systemctl restart`) waits 780 s as well (120 s before). The control
-plane raises the waiting cap of the steps that may start the unit to 1200 s (§2.10).
+(`_restart_fabric_manager` in `operations/reset.py`, `systemctl restart`) waits 780 s as well. The control
+plane raises the waiting cap of the steps that may start the unit to 1200 s (the tiered caps of §2.14.1).
 
 The full GPU + NVSwitch reset (`RESET_ALL_GPUS_NVSWITCHES`) notes the scope `ALL_LOCAL_GPUS_AND_NVSWITCHES` on the quiesce
 window's reset claim (`record_reset_scope` in `node_agent/quiesce.py`, best effort: a failed write never costs the window its
 one reset). The quiesce stops only what is running and the restore starts only what the quiesce stopped, so a Fabric Manager
-that had already FAILED used to be neither stopped nor started, and the reset left every GPU waiting for a Fabric Manager that
-was not there. The RESTORE of such a window now looks at `nvidia-fabricmanager` after it has restored the other services, that
+that has already FAILED is neither stopped nor started, and the reset would leave every GPU waiting for a Fabric Manager that
+is not there. The RESTORE of such a window therefore looks at `nvidia-fabricmanager` after it has restored the other services, that
 is after the reset (NVIDIA's order: Fabric Manager is started after the reset): when the unit is not active and
-`systemctl is-enabled` answers enabled/enabled-runtime/static it runs `systemctl reset-failed` and `systemctl start` (780 s,
-180 s before; `start_fabric_manager_after_reset` in `node_agent/fabric_manager_restart.py`). Nothing happens when the
+`systemctl is-enabled` answers enabled/enabled-runtime/static it runs `systemctl reset-failed` and `systemctl start` (780 s;
+`start_fabric_manager_after_reset` in `node_agent/fabric_manager_restart.py`). Nothing happens when the
 restore already started the unit (the quiesce had stopped it) or it is running; a unit an operator disabled or masked
 stays down (`attempted: false`). The outcome is the RESTORE step details' `fabric_manager_start` (`unit`, `state_before`, `enabled`, `attempted`, `returncode`,
 `state_after`, `active`, and `output_tail` or `error`) and never a restore failure: VALIDATE_GPU judges whether the fabric
@@ -3093,7 +3140,7 @@ of the command body, so the ledger's parameter digest binds it to the `command_i
 above). `_execute_reset_all` and the driver/firmware remediation fence refuse to run in a window that kept Fabric Manager
 (`refuse_kept_fabric_manager`), before the reset claim, so the refusal never spends the window's one reset.
 
-`COLLECTOR_OUTBOX_MAINTENANCE` is the 16th node-action operation and performs metadata-only maintenance:
+`COLLECTOR_OUTBOX_MAINTENANCE` is one of the node-action operations and performs metadata-only maintenance:
 the administrator command `gpu-fault-admin collector-outbox` dispatches inspection/requeue of the node-local `gpu-fault-collector outbox`
 to the node as a NODE_ACTION step, returning only metadata and never moving payloads; `requeue-dead` requires `--yes`, and the remote side does not offer
 `--force`.
@@ -3137,10 +3184,10 @@ Fleet Deployment forms waves by `max_unavailable`. Multi-node reset uses the `PR
 
 The AgentRecord and the installation resource registry in Aurora serve only as the runtime source of facts; they cannot serve as progress storage
 for Aurora's own destruction procedure. All progress of `uninstall` (`src/gpu_fault/admin/uninstall.py`) is written to external
-files in the state-dir: `uninstall/state.json` records the phase
-`STARTED → REGISTRY_EXPORTED → KUBERNETES_VERIFIED → NON_AURORA_DELETE_IN_PROGRESS →
-READY_TO_DELETE_AURORA → OWNERSHIP_RELEASED → COMPLETED` (the last phase releases the ownership label from every GPU cluster's node
-groups, evidence `ownership_release`); before stopping the writer, the registry snapshot is exported as `installation-resources-before.json` with a `.sha256` sidecar,
+files in the state-dir: `uninstall/state.json` records the phase (`UNINSTALL_PHASES` in `admin/uninstall_types.py`)
+`STARTED → REGISTRY_EXPORTED → KUBERNETES_VERIFIED → NON_AURORA_DELETE_IN_PROGRESS → NON_AURORA_VERIFIED →
+CPU_DELETE_IN_PROGRESS → CPU_VERIFIED → READY_TO_DELETE_AURORA → AURORA_DELETE_IN_PROGRESS → OWNERSHIP_RELEASED → COMPLETED`
+(`OWNERSHIP_RELEASED` releases the ownership label from every GPU cluster's node groups, evidence `ownership_release`); before stopping the writer, the registry snapshot is exported as `installation-resources-before.json` with a `.sha256` sidecar,
 followed in order by `installation-resources-delete-plan.json`,
 `installation-resources-pre-aurora-delete.json` and `installation-resources-final.json`;
 Kubernetes-side cleanup writes a separate `kubernetes-cleanup.json`, whose phase must reach `CLEANUP_COMPLETED`
@@ -3151,9 +3198,12 @@ The node metadata cleanup's patches (the uninstall's, and the installer annotati
 between the read and the patch, the cleanup re-reads it, re-evaluates every precondition on the fresh object and retries a bounded number of
 times (a changed UID or an unchanged resourceVersion still fails); a failed cleanup command names its reason class and kubectl's redacted
 last stderr line in the error and in the journal's `FAILED` entry.
-The Aurora deletion thread (`AuroraDeletion`) is issued immediately after `KUBERNETES_VERIFIED` (disable deletion protection, reader,
-writer, cluster) and runs in parallel with the prioritized deletion of non-Aurora resources; `READY_TO_DELETE_AURORA` records the end of the non-Aurora
-phase, after which it waits for the Aurora deletion to complete and verifies the retained final snapshot. The final state is closed out by the
+After `KUBERNETES_VERIFIED` the non-Aurora resources are deleted in batches by dependency and delete priority (up to 4 in parallel per
+batch, `last_completed_priority` recorded after each), Helm and the other CPU-side resources are proved gone while the CPU cluster's API
+is still up (`NON_AURORA_VERIFIED`), and the CPU cluster is deleted or verified (`CPU_DELETE_IN_PROGRESS` → `CPU_VERIFIED`);
+`READY_TO_DELETE_AURORA` writes the registry snapshot before Aurora, and `AURORA_DELETE_IN_PROGRESS` then deletes Aurora last
+(`_delete_aurora_last`: disable deletion protection, reader, writer, cluster, under the final-snapshot policy) and verifies the
+retained final snapshot. The final state is closed out by the
 `DELETED/DETACHED/PRESERVED` status of every resource in `installation-resources-final.json`; any resource not in a terminal state
 makes the uninstall fail.
 
@@ -3238,10 +3288,10 @@ Node replacement can only go through a warm spare (customer-provided hot standby
 
 A spare parked in the pool **must stay cordoned**: `HyperPodSpareCoordinator` refuses an unreserved yet schedulable candidate with
 "unreserved spare is schedulable" -- a node that ordinary Pods can land on cannot be handed over whole to a single failover.
-This invariant once collided directly with the release engine's
-pre-node-mutation barrier: the barrier read any cordon as "someone is draining or
-repairing this machine", so as soon as a site declared a spare pool every upgrade failed at the barrier and rolled back,
-and the customer could only choose between "keep the spares" and "accept fixes". The barrier therefore exempts the cordon and the derived
+This invariant collides with the release engine's
+pre-node-mutation barrier: the barrier reads any cordon as "someone is draining or
+repairing this machine", so without an exemption every upgrade of a site that declared a spare pool would fail at the
+barrier and roll back, and the customer could only choose between "keep the spares" and "accept fixes". The barrier therefore exempts the cordon and the derived
 `node.kubernetes.io/unschedulable` taint for nodes that are unreserved and carry
 `gpu-fault.io/spare-pool-state=AVAILABLE` (`regional_release_node_preflight.py`):
 a parked spare carries no workload, and it can only be assigned if its node agent stays fleet-ready,
@@ -3279,33 +3329,29 @@ Three rules guarantee that downstream stages cannot erase this distinction:
    restarts, and a record a preemption freezes mid-poll no longer says the step was parked on live GPU clients
    (the barrier contract of DESTR-016).
 
-The sentence "can only wait until `execution_deadline` expires" in rule 3 above was once wrong: **that fallback was
-not executable at all at the time**. The only enforcer of `execution_deadline` is the dispatcher's
-`_expire_stuck_workflows`, and it must `claim_workflow` first before it can touch the record; the store refuses claims by other owners
+The `execution_deadline` fallback of rule 3 above cannot be left to the watchdog alone: the dispatcher's
+`_expire_stuck_workflows` must `claim_workflow` first before it can touch the record, the store refuses claims by other owners
 while the lease is valid (`WorkflowLeaseError`), and a workflow that keeps being re-dispatched
-renews its lease to 180 seconds ahead on every 5-second poll, so the watchdog loses every time and `except
-WorkflowLeaseError: continue` skips silently. The watchdog can only collect records the executor no longer touches
-(process dead, lease expired); **the workflow that is actually spinning -- the very reason this deadline exists --
-is immune to its own deadline**. Measured on 2026-09-05: a workflow 10 minutes past its deadline was still
-RUNNING, `execution_owner_id` was a live executor, and the lease pointed constantly 3 minutes ahead.
-This is the same predicament already recorded for `_revoke_retired_generations`: the lease holder is this dispatch
-loop itself.
+renews its lease to 180 seconds ahead on every 5-second poll, so the watchdog would lose every time. The watchdog can only collect
+records the executor no longer touches (process dead, lease expired); **the workflow that is actually spinning -- the very reason
+this deadline exists -- would be immune to its own deadline** (the same predicament as `_revoke_retired_generations`: the lease
+holder is this dispatch loop itself).
 
-The fix has two layers that do not replace each other:
+The deadline is therefore enforced in two layers that do not replace each other:
 
 - **workflow layer**: the deadline is enforced by the lease holder itself (`execution/step_bounds.py`
   `workflow_deadline_failure`), and it is returned in the form of **the current step FAILED**, rather than setting a terminal state directly in the
   watchdog -- only via the existing failure path does an unrecovered quiesce get its compensation,
   the incident land in the correct state, and the dispatcher hand the record to the failure handler. Before returning it first calls
   `cancel_remote_commands_for_workflow`: a remote command outlives the workflow record, and
-  setting the terminal state first would leave a command behind that the next fence evaluation lets through. The watchdog is kept, responsible for abandoned
-  records, and "could not get the lease" changes from a silent `continue` into an alertable warning.
+  setting the terminal state first would leave a command behind that the next fence evaluation lets through. The watchdog is responsible for abandoned
+  records, and "could not get the lease" is an alertable warning, not a silent `continue`.
 - **step layer**: every step has an independent waiting ceiling `GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS`
   (default 600) and an alert threshold `GPU_FAULT_WORKFLOW_STEP_WARNING_SECONDS` (default 300).
   It measures **time, not counts**: all per-operation counters (`verify_max_attempts`,
   `gpu_reset_commit_attempt`) are read back from the step execution record, and a record whose key does not advance
-  takes the counter ceiling away with it -- rule 3 above is exactly this shape. For this, `started_at` is now preserved across retries
-  (previously it was reset on every retry, making it a copy of `updated_at` that nobody in the repository read); for records
+  takes the counter ceiling away with it -- rule 3 above is exactly this shape. For this, `started_at` is preserved across retries
+  (reset on every retry it would only be a copy of `updated_at`); for records
   inherited through merge/branch, the start of the current execution window is the lower bound, and inherited time can only push the ceiling later, never trigger earlier.
   The window start must be derived backwards from a deadline that is **stamped only once**: a single-node workflow uses `execution_deadline`
   minus the workflow budget; a job DAG's `execution_deadline` is re-stamped by `claim_deadlines` on **every**
@@ -3336,8 +3382,8 @@ The fix has two layers that do not replace each other:
   persistence read-back), never below the default ceiling and never above the node workflow lifetime (DESTR-018's
   compressed window, lifetime = step = 180 seconds, stays a bootable set); QUIESCE, VERIFY, RESET_* and VALIDATE_* keep
   600 seconds. The executor's per-command limit (`DEFAULT_MAX_EXECUTION_SECONDS`, 1800 seconds) and the 3600-second node
-  lifetime hold it; the workflow execution budget (`GPU_FAULT_WORKFLOW_EXECUTION_TIMEOUT_SECONDS`, 1800 seconds) was not
-  changed, so a Fabric Manager start near NVIDIA's 720 seconds brings the full chain close to that budget.
+  lifetime hold it; the workflow execution budget (`GPU_FAULT_WORKFLOW_EXECUTION_TIMEOUT_SECONDS`, 1800 seconds) is not
+  raised with them, so a Fabric Manager start near NVIDIA's 720 seconds brings the full chain close to that budget.
 - **who reports the abandonment**: the managed recovery window and the workflow budget are configured separately; at default values they are equal in length, and
   the workflow has already spent time before this step, so what actually arrives first is the workflow deadline. Left unhandled,
   the step would terminate via the generic failure path and the escalation notification above still would not be sent. For this the observer clamps its own deadline to
@@ -3407,19 +3453,18 @@ field order on one's own is forbidden. Any duplicate replay must first read, by 
 `SUBMITTED` record carrying a result; if the record is missing it stops immediately and must not call the provider adapter.
 
 
-**No-op workflows BLOCKED at compile time and open commands left behind by terminal workflows no longer need an administrator command.**
+**No-op workflows BLOCKED at compile time and open commands left behind by terminal workflows close on their own, with no administrator command.**
 There is one more kind of record that neither of the two layers above touches: when the Runtime Profile lacks an execution owner for some capability, `compile_steps`
 marks the workflow `BLOCKED` before any step executes (`blocked_reasons` of the form `no executable owner for
 efaDriverRemediation`). It has no lease, no step execution, no remote command, no source
 plan, and the containment pre-actions did not run, so there is no isolation of its own on the node; but it contains destructive operations, and both the `workflow_safety`
 preflight and the Profile switch finalize gate count it as active, which blocks exactly the release that would add that owner. The adjacent
 other shape is the open remote command left behind by a terminal workflow (`FAILED`/`SUCCEEDED`/`BLOCKED`/`SUPERSEDED`):
-the old executor, when a step hit its waiting ceiling, only ruled the step failed without cancelling that step's remote command
-(`execution/step_bounds.py` now cancels first and then fails), so a `FAILED` `CHECK_MECHANICALS` could leave the
+an older executor, when a step hit its waiting ceiling, only ruled the step failed without cancelling that step's remote command
+(the current `execution/step_bounds.py` cancels first and then fails), so a `FAILED` `CHECK_MECHANICALS` left that way can keep the
 command in `WAITING` forever, while the upgrade gate requires zero open commands.
 
-These two shapes each used to have a `workflow-reconcile --mode compile-blocked/orphaned-commands`; every actual use
-was to unblock a release preflight, and every condition they check is a Store predicate, so they are now closed automatically by the dispatcher's periodic sweep
+Every condition these two shapes check is a Store predicate, so they are closed automatically by the dispatcher's periodic sweep
 `WorkflowDispatcher.sweep_stuck_records` (`src/gpu_fault/execution/dispatcher.py`), deciding
 **by reconciling each record against the full Store predicates, not by record age or terminal-state name**, re-deriving from freshly read records on every tick:
 `gpu_fault.compile_blocked` writes compile-time BLOCKED records as
@@ -3450,9 +3495,9 @@ the latter requiring that the node isolation has disappeared and stripping the a
 SUPERSEDED; the administrator command is not the only writer of that state; see Detailed Design v2 §4.5 for the exact predicates, and do not abandon workflows with raw SQL.
 For the procedure see Administrator Daily Operations §10.1 (automatic closure) and §10.2 (`workflow-reconcile`).
 
-**Node re-imaging and the installer boot id.** `node_installer_reconciler` originally decided whether a node was `current` by annotation + Node UID;
-when HyperPod `UpdateClusterSoftware` reinstalls the system disk in place neither changes, yet the Agent
-is gone (one fleet-wide update in 2026 made four Agent leases expire simultaneously with nobody reinstalling). The install record now carries
+**Node re-imaging and the installer boot id.** Deciding whether a node is `current` by annotation + Node UID alone is not enough for
+`node_installer_reconciler`: when HyperPod `UpdateClusterSoftware` reinstalls the system disk in place neither changes, yet the Agent
+is gone, and a fleet-wide update would let every Agent lease expire with nobody reinstalling. The install record therefore also carries
 `gpu-fault.io/installer-boot-id`: boot id changed → TCP-probe the Agent port (HTTPS+mTLS, so only the
 listener is probed) → on answer, re-stamp the boot id; no answer and Ready longer than the grace → `Retrying` reinstall. See Administrator Daily
 Operations §4.0.
@@ -3490,9 +3535,9 @@ rather than "nobody handles it". The identity ledger of `HyperPodIdentityRegistr
 and must continue to be used on the warm spare path (`hyperpod_spares.py`'s
 `HyperPodSpareCoordinator._resolve_targets()` resolves the faulty node's identity by alias/retired alias).
 
-The owner in the production profile is static: a regional site's profile comes from the template
-`config/runtime-profile.regional-hyperpod-safe.example.yaml` (`workloadRestart` is
-`mode: OWN`, owner `gpu-fault-kubernetes-adapter`), rendered and registered by
+The owner in the production profile is static: a regional site's profile comes, by cluster provider, from the template
+`config/runtime-profile.regional-hyperpod-safe.example.yaml` or `config/runtime-profile.regional-eks-safe.example.yaml`
+(`cluster_scope.py`; in both `workloadRestart` is `mode: OWN`, owner `gpu-fault-kubernetes-adapter`), rendered and registered by
 `render_runtime_profile_payload()` in `src/gpu_fault_release/regional_runtime_profile.py` through the site release configuration's
 `runtime_profile.source`; the old single-cluster script `deploy/hyperpod/deploy.sh` likewise fixes
 `workloadRestart` to that owner with an unconditional `"mode": "OWN"`, but it is no longer a runtime path of the regional architecture;
@@ -3603,7 +3648,7 @@ Every role (ingress/worker/spool-worker) runs one `gpu-fault-regional-registry` 
 the in-process snapshot as a whole; then it writes its own member heartbeat row -- immediately when the content (generation/digest/ready/error) changes,
 otherwise rewritten every `stale/3` seconds (production manifest `GPU_FAULT_REGISTRY_STALE_SECONDS=90`, application default 10; under the 90-second
 window about 1.2 writes/second site-wide). `is_ready()` requires at the same time that the snapshot is aligned with the head and that the most recent successful refresh and the most recent successful
-persistent heartbeat are both within the stale window; future timestamps are invalid; a single transient connection closure no longer counts as not ready, and continued successful database reads
+persistent heartbeat are both within the stale window; future timestamps are invalid; a single transient connection closure does not count as not ready, and continued successful database reads
 cannot extend an expired write proof. Concurrent refreshes use a sequence number and a heartbeat lock to stop old results from overwriting a newer snapshot. While not ready, cluster-token
 requests get 503 + `Retry-After`. At startup the whole Store path (pool and schema check, registry sync and registered-cluster reads, registry
 bootstrap) waits for the Store within one `GPU_FAULT_STARTUP_STORE_RETRY_SECONDS` (default 120) budget, for transient failures only,
@@ -3737,7 +3782,7 @@ wakes the dispatcher immediately on receipt so the next covered step advances; t
 
 When the lease has expired, the fencing token has changed or the command is already terminal, the result is rejected by the control plane; a rejected result does not affect
 the submission of results for other commands in the same batch. A repeated result with the same idempotency key produces no second side effect, including no second
-SNS/SES delivery. Queue and lane arbitration on the control-plane side is in §2.3.1.
+SNS/SES delivery. Queue and lane arbitration on the control-plane side is in §2.18.
 
 **HyperPod submission idempotency is not restated in this section.** §2.14 already gives the complete semantics: `confirm_cluster_name`
 taken from the executing side's own `GPU_FAULT_HYPERPOD_CLUSTER`, the two-phase
@@ -3751,8 +3796,8 @@ Spare health queries use `RemoteSpareHealthRequest` (`cluster_id`,
 
 ### 2.17 Cluster Action Executor (package `gpu_fault.cluster_executor`)
 
-The original single file `cluster_executor.py` has been split into a package by layer (`__init__` re-exports the same 36 names unchanged, and the
-two console scripts `gpu_fault.cluster_executor:main` / `:readiness_probe` are unchanged); currently seven modules:
+The package has nine modules by layer (`__init__` re-exports 39 names; the console scripts are
+`gpu_fault.cluster_executor:main` / `:readiness_probe`):
 `regional_client.py` (`RegionalExecutorClient`, `RegionalFleetRegistry`,
 `RegionalHyperPodSubmissionStore`, `RegionalIncidentOwnershipProvider`, `ClusterExecutorError`),
 `lease.py` (`CommandLeaseWatch`, `CommandLifecycle`: lease renewal thread, result reporting retries, abandoning a held lease),
@@ -3764,8 +3809,11 @@ querying the lease guard between steps, stopping and reporting the completed par
 `STOPPED_BETWEEN_STEPS_STATUS_SOURCE`) and `metrics.py` (`ClusterExecutorMetrics`/
 `cluster_executor_metrics`: the `gpu_fault_cluster_executor_*` series, the same set of counters the readiness breadcrumb reads;
 `start_executor_metrics` exposes `/metrics` and `/healthz` on `GPU_FAULT_CLUSTER_EXECUTOR_METRICS_PORT` (default 9111),
-and the container liveness probe reads the latter).
-The logger name of every layer is still `gpu_fault.cluster_executor`; the only visible change is that the qualified name of the exception class becomes
+and the container liveness probe reads the latter), `node_inventory.py` (every 60 s it posts the names of all the cluster's
+Kubernetes Nodes to `/v1/regional/executors/node-inventory`, the departed-node cleanup's proof that a node has left the cluster) and
+`node_key_sync.py` (every 60 s it asks the control plane's `/v1/regional/node-action-keys` for the node-scoped Node Action keys newly
+joined nodes lack and patches only those keys into the `gpu-fault-node-action-keys` Secret).
+The logger name of every layer is `gpu_fault.cluster_executor`; the exception class's qualified name is
 `gpu_fault.cluster_executor.regional_client.ClusterExecutorError`.
 
 The process entry point is `gpu-fault-cluster-executor`; it is assembled by `executor_from_environment()` and then
@@ -3880,8 +3928,10 @@ and the generated manifests explicitly give `GPU_FAULT_PROCESSOR_FAULT_WORKERS=4
 worker process: `gpu-fault-processor-inbox`, `gpu-fault-periodic-services`,
 `gpu-fault-workflow-dispatcher`, `gpu-fault-xid-correlation`, plus two conditional threads --
 `gpu-fault-processor-notifications` is added when the Store has `listen_processor_queue_notifications`,
-and `gpu-fault-telemetry-spool` (plus `-notifications`) is added when `telemetry_spool_enabled`.
-`gpu-fault-processor-leadership` is inserted at the very front only when `active_consumers` is false;
+and `gpu-fault-telemetry-spool` (plus `-notifications`) is added when `telemetry_spool_enabled`; with the dispatcher enabled
+and a Store that can LISTEN, two dispatcher wake-up listeners are added as well, `gpu-fault-workflow-dispatch-wakeups-workflow`
+and `gpu-fault-workflow-dispatch-wakeups-remote-command` (they turn the Store's `WakeupChannel` NOTIFYs into this process's
+`dispatcher.wake()`). `gpu-fault-processor-leadership` is inserted at the very front only when `active_consumers` is false;
 production is `active-active`, so there is **no** leadership thread and no single-point leader.
 
 `start_spool_threads()` starts only the two threads `gpu-fault-telemetry-spool-notifications` and
@@ -3958,8 +4008,8 @@ The two-level throttling before enqueue lives in `src/gpu_fault/app/admission_ru
 
 The meaning of the fault reservation is: routine telemetry starts being rejected once it fills the queue to `depth - reservation`, while the fault channels still have
 8192 slots. Exceeding the depth returns 429 with `Retry-After: GPU_FAULT_PROCESSOR_RETRY_AFTER_SECONDS`
-(2 seconds in the generated manifests). A full in-process store I/O queue is `StoreIoCapacityExceeded` → 503,
-which is the real reason accepted stalled at 11k-13k in the load test; it has nothing to do with database ACU.
+(2 seconds in the generated manifests). A full in-process store I/O queue is `StoreIoCapacityExceeded` → 503;
+the accepted rate of a load test tops out at this layer first, which has nothing to do with database ACU.
 
 The ingress side has one more layer of asyncio semaphores: `GPU_FAULT_INGRESS_FAULT_CONCURRENCY` (256,
 waits 30 seconds) and `GPU_FAULT_INGRESS_NORMAL_CONCURRENCY` (runtime default 1000, waits 2 seconds; the renderer derives it
@@ -3993,10 +4043,10 @@ expires; only requests whose channel registry entry has
 safe snapshots in the same lane to pass them. Fault, evidence and control requests always stay `STRICT`.
 
 The lane's priority order also holds across paths. A dedicated pool's claim (GPU or host evidence, training progress)
-names its own path only, so a lane whose head was a row of another path looked free to it: in spool-enabled bursts P50
-GPU/host evidence and P10 device events share the node lane, and the evidence claims re-leased it after each of their
-own rows while the fault waited (P10 completion p50 6.1-6.9 s instead of 1.15 s; evidence took the lane ahead of the P10
-row 90-94% of the time). Such a claim therefore never leases a lane while a `STRICT`, due row of a higher priority waits
+names its own path only, so a lane whose head is a row of another path looks free to it: in spool-enabled bursts P50
+GPU/host evidence and P10 device events share the node lane, and the evidence claims would re-lease it after each of their
+own rows while the fault waits (in local load tests P10 completion slowed several-fold and evidence mostly took the lane
+ahead of the P10 row). Such a claim therefore never leases a lane while a `STRICT`, due row of a higher priority waits
 on it, `PENDING` or with a lapsed lease, whatever its path (one probe of `gpu_fault_processor_queue_lane_rows` per
 candidate, comparing `head.priority + 0` so that the planner cannot AND it with a `claim_window` range over every
 higher-priority row; `tests/store/test_postgres_claim_planner_discipline.py` pins it as an index read under the generic
@@ -4006,11 +4056,9 @@ ahead of the correlated faults they share attempt lanes with, and the guard woul
 
 A claim cycle runs the fault stream's sub-claim first and then those of the observation and evidence pools -- up to
 seven more claim statements. The fault rows go to their workers the moment their sub-claim returns, not when the cycle
-ends: a P10 worker used to wait for all of them, so a claim slowed by load or by a held lock delayed every fault row of
-its cycle (local Postgres, claim transactions held 0.3 s, 24 coordinators: P10 claim-to-start p50/p95
-0.63-1.29/1.24-1.66 s before, 1-5/3-39 ms after; `tests/processor/test_fault_stream_wake.py`: with one 1 s evidence
-claim in the cycle the P10 worker starts within 50 ms of its claim, 1.0 s before). The other rows start when the cycle
-ends, as before, and the cycle's wait and backoff decisions still see every claim of the cycle.
+ends: were a P10 worker to wait for all of them, a claim slowed by load or by a held lock would delay every fault row of
+its cycle (`tests/processor/test_fault_stream_wake.py`: with one 1 s evidence claim in the cycle the P10 worker still starts
+within 50 ms of its claim). The other rows start when the cycle ends, and the cycle's wait and backoff decisions still see every claim of the cycle.
 
 The same completion batch is first grouped by cluster, and each group is still committed in an independent PostgreSQL transaction.
 `GPU_FAULT_PROCESSOR_COMPLETION_CLUSTER_CONCURRENCY` controls whether different cluster groups run in parallel;
@@ -4029,9 +4077,12 @@ correlation lease. Training health, spare health, HyperPod identity refresh
 and processor cleanup use periodic task leases with different `task_key` values; an owner failure or slow execution of any one task
 does not block the other periodic tasks.
 
-XID/SXID, workflows and management changes are serialized by `cluster_id`; the continuously reported `gpu-metrics` and
-`host-telemetry` are split into lanes by `cluster_id + node_id + endpoint` and run in parallel, with a claim priority
-lower than fault control events (the channel-to-lane mapping is in §2.18.3). Different lanes are claimed dynamically in parallel by multiple processes;
+A lane is the `ordering_key` (`_ordering_key_for` in `processor/models.py`): ATTEMPT channels carrying an `attempt_id`,
+`/v1/gpu-events/xid|sxid` and `/v1/attempts/*` use `<cluster>:attempt:<attempt_id>`; incident, workflow and recovery-plan routes
+use `<cluster>:<resource>:<id>`; collector and GPU events carrying a `node_id` (including the XID/SXID of the kernel and Fabric
+Manager logs) use `<cluster>:node:<node_id>`, gpu-inventory adds `:gpu-inventory` and a pure health summary is split further by
+its `summary_lane_suffix`; every other request is serialized by `cluster_id`. Continuously reported telemetry is claimed at a lower
+priority than fault control events (the channel-to-lane mapping is in §2.18.3). Different lanes are claimed dynamically in parallel by multiple processes;
 cross-node finding/workflow merging is still made atomic by the Aurora attempt transaction lock.
 `/metrics` provides queue depth, oldest wait time, per-cluster backlog, processing duration and rejection counts, and the accompanying
 PrometheusRule alerts on backlog, latency, rejections and p95 latency.
@@ -4041,7 +4092,7 @@ loop; they are carried by a per-process independent `AsyncStoreExecutor`. This e
 thread count and an in-flight semaphore, preserving the complete transaction boundary within one endpoint; an admission timeout
 returns `503 Retry-After` and does not occupy the event loop. `/metrics` additionally exposes Store I/O
 in-flight, configured capacity and rejections, and the PrometheusRule alerts on 90% saturation and on any rejection.
-The bottleneck where accepted stalled at 11k-13k in the load test is in this layer, not in database ACU (see §2.18.4).
+The load-test bottleneck of the accepted rate is in this layer, not in database ACU (see §2.18.4).
 
 ### 2.19 Host Resource Persistent Hazard State Machine
 
