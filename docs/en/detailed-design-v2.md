@@ -11,7 +11,7 @@ English edition of `docs/详细设计-v2.md`; the Chinese file remains the sourc
 | [High-Level Design v2 (closed-loop view)](high-level-design-v2.md) | Detect → decide → isolate → stop workload → repair → validate → return to management / manual handling: who does each link and where the boundaries are | This document is its implementation-level expansion. Wherever a "capability boundary" or "hard constraint" conclusion exists there, this document does not restate it, it only references it |
 | [Detailed Design](detailed-design.md) (v1) | Which modules, protocols and state machines the current code has | The factual baseline of this document. v1 is "enumerated by module"; this document is "sunk down by runtime behaviour" |
 | [Deployment and Operations Manual](deployment-and-operations-manual.md) | How to install, upgrade, roll back and inspect | This document only writes down what "must be so by design"; concrete command sequences are not copied |
-| [Regional-Mode End-to-End Acceptance Test Cases](regional-e2e-acceptance-test-cases.md) | How each behaviour is proven on real machines | The traceability matrix in §10.5 of this document points directly at its case ids |
+| [Regional-Mode End-to-End Acceptance Test Cases](regional-e2e-acceptance-test-cases.md) | How each behaviour is proven on real machines | The traceability matrix in §10.3 of this document points directly at its case ids |
 
 The section numbers of the v1 Detailed Design are referenced by other documents and by tests (§2.11, §2.14, §2.15–2.17, §2.18, §3.1, §3.3, §4.4, §4.5) and
 **will not** change because this document exists. This document is a parallel second detailed design, not a replacement.
@@ -37,12 +37,12 @@ Every assertion in this document corresponds to source code or a generated manif
 - Anything that exists in the proposal but not in the implementation is never written as "implemented"; it is collected in §11.
 - Performance numbers do not live in this document. Capacity and load-test definitions are in the
   [Performance Load-Test Acceptance Plan](performance-acceptance-plan.md) and [Detailed Design](detailed-design.md) §2.18.5.
-- The date of the most recent item-by-item verification against the real app, the Store codec, the generated manifests and the test directory on the current `main`
-  is **2026-09-15**; on the same day this branch additionally spot-verified notifications, the persistent registry, deployment identity, monitoring and retention.
-  Count-type assertions (route and auth buckets, metric families, codec kinds, notification templates, DDL objects, operation counts) are generated under
+- Count-type assertions (route and auth buckets, metric families, codec kinds, notification templates, DDL objects, operation counts) are generated under
   the conditions of the real app assembled by `create_app(build_context())`, the in-memory Store fixture and the regional worker role;
-  metric families are counted once each with `regional_mode` off and on, and Postgres-only families and conditional families are not counted. All other facts follow the released source code,
-  the generated manifests and the existing fact checks; the numbers in this document are recounted against the current code of this repository and are not replaced by counts from another branch.
+  metric families are counted once each with `regional_mode` off and on, and Postgres-only families and conditional families are not counted. The route and
+  auth-bucket counts, the `WorkflowOperation` count and the Node Agent contract fields and routes are re-checked against the real code by the documentation
+  contract tests (`tests/test_documentation_contracts.py`); all other facts follow the released source code, the generated manifests and the existing fact
+  checks (`scripts/check-doc-facts.py`). The numbers in this document are recounted against the current code of this repository and are not replaced by counts from another branch.
 
 ---
 
@@ -53,7 +53,12 @@ Every assertion in this document corresponds to source code or a generated manif
 This document covers the only production form of `gpu-fault-control-plane` **0.10.0**:
 
 - one **CPU control plane** per AWS Region (three Deployments on EKS + Aurora PostgreSQL);
-- N **HyperPod EKS GPU clusters** in that Region as the data plane, each cluster with one set of executor and collectors;
+- N **GPU clusters** in that Region as the data plane, each cluster with one set of executor and collectors. A cluster runs on one of two providers
+  (`ClusterProvider` in `src/gpu_fault/cluster_scope.py`): `hyperpod` (SageMaker HyperPod orchestrated by EKS) or `eks-managed` (plain EKS with managed
+  node groups and no HyperPod orchestrator). The GPU clusters of a first deploy must share one provider; a cluster of the other provider joins afterwards
+  with `join-cluster` and gets its own Runtime Profile version (`admin/bootstrap_common.require_single_provider`). The managed nodes are declared by the
+  `gpu-fault.io/control-plane=<site id>` label on their node groups (`OWNERSHIP_LABEL`). Most sequences in this document use HyperPod as the example; provider
+  differences are called out in the sections concerned;
 - one **systemd collector + signed node-action Agent** per GPU node.
 
 The single-cluster all-in-one form (`GPU_FAULT_DEPLOYMENT_MODE` not `regional`) is only for local development and testing;
@@ -66,15 +71,15 @@ its authentication, admission and consumption behaviour differ from production, 
 |---|---|---|
 | GPU vendor | NVIDIA only | No AMD/Intel/ROCm/XGMI implementation anywhere in the repository (§11) |
 | GPU product families | `A100`, `H100` (including `GH`), `B100`, `GB200`, matched by model-name prefix `A/H/GH/B/GB` | `productFamilies` in `src/gpu_fault/data/nvidia-xid-catalog-610.generated.yaml` |
-| Instance types (expected GPU/EFA counts) | `p5.4xlarge` (1/1), `p5.48xlarge` (8/32), `p5e.48xlarge` (8/32), `p5en.48xlarge` (8/16), `p6-b200.48xlarge` (8/8), `p6-b300.48xlarge` (8/16) | `src/gpu_fault/gpu_instance_inventory.py` (`GPU_INSTANCE_INVENTORY`; `node_installer_reconciler.py` and the release renderer only import it, `src/gpu_fault/collectors/gpu/discovery.py` is the node-side copy with the same values) |
+| Instance types (expected GPU/EFA counts) | `p5.4xlarge` (1/1), `p5.48xlarge` (8/32), `p5e.48xlarge` (8/32), `p5en.48xlarge` (8/16), `p6-b200.48xlarge` (8/8), `p6-b300.48xlarge` (8/16) | `src/gpu_fault/gpu_instance_inventory.py` (`GPU_INSTANCE_INVENTORY`; node-installer rendering, host health, GPU validation, the fabric window, the administrator CLI and the release renderer only import it, `src/gpu_fault/collectors/gpu/discovery.py` is the node-side copy with the same values) |
 | Basis for XID decisions | NVIDIA Xid Catalog **610**, `coverage: FULL_OFFICIAL_ARTIFACT` | `spec.catalog.version` of the same YAML |
 | Basis for SXID decisions | Snapshot of Fabric Manager User Guide tables 21–24 (`2025-11-14`), `coverage: NVIDIA_FM_TABLES_21_24` | `src/gpu_fault/data/nvidia-fabric-manager-sxid-2025-11-14.yaml` |
 | Driver version | No version compatibility matrix. The only decision that forks by driver branch is NVLink5 sub-code decoding: `driverBoundary: 575` decides whether the v1 or v2 bit pattern is used | `nvlink5Policy` of the same XID catalog |
-| Python | `>=3.12`; the production Runtime Image is based on `registry.access.redhat.com/ubi9/python-312-minimal` (the `RUNTIME_BASE_IMAGE` build-arg of `deploy/image/Dockerfile`, which must be a sha256 digest reference; `scripts/release_image.py` rejects the tag form); `python:3.12-slim` appears only in the manifests of the e2e/perf probe Jobs | `pyproject.toml`, `deploy/image/Dockerfile` |
+| Python | `>=3.12`; the production Runtime Image is based on `registry.access.redhat.com/ubi9/python-312-minimal` (the `RUNTIME_BASE_IMAGE` build-arg of `deploy/image/Dockerfile`, which must be a sha256 digest reference; `scripts/release_image.py` rejects the tag form); `public.ecr.aws/docker/library/python:3.12-slim` is the placeholder image (`DEFAULT_RUNTIME_IMAGE`) of the checked-in manifest templates and generated manifests, replaced at release rendering by the digest reference of the signed Runtime Image; only the e2e/perf probe Jobs actually run it | `pyproject.toml`, `deploy/image/Dockerfile` |
 | Kubernetes client | `kubernetes>=31,<36`; uses `batch/v1` Job, `kubeflow.org` PyTorchJob, `jobset.x-k8s.io` JobSet | `pyproject.toml`, `deploy/dataplane/cluster-action-executor.yaml` |
 | Node OS | Requires systemd, `journald`, `/dev/kmsg`, `nvidia-smi`; the node runtime is installed under `/opt/gpu-fault/releases/<artifact-sha>/venv` and selected atomically by `current` | `deploy/systemd/`, `deploy/node/install-gpu-fault-collector.sh` |
 | DCGM | `nvcr.io/nvidia/k8s/dcgm-exporter:4.6.1-4.8.4-distroless` (NVIDIA's pair of the DCGM 4.6.1 client and exporter 4.8.4, pinned in the image lock by its manifest-list digest); on HyperPod and in eks host mode connected to the host hostengine via `DCGM_REMOTE_HOSTENGINE_INFO=127.0.0.1:5555` (NVIDIA requires the client to be at least the hostengine's version; eks host mode installs the paired DCGM `4.6.1-1`, the version relation is advisory), in eks embedded mode the container's embedded engine | `src/gpu_fault/admin/dcgm_exporter_release.py`, `deploy/dataplane/hyperpod-dcgm-exporter.yaml`, `config/release-images.lock.json` |
-| Orchestrator | EKS only. HyperPod Slurm orchestration is not supported | The four hard constraints in High-Level Design v1 §2.1 |
+| Orchestrator | EKS only: HyperPod EKS clusters (`hyperpod`) or plain EKS clusters with managed node groups (`eks-managed`). HyperPod Slurm orchestration is not supported | The four hard constraints in High-Level Design v1 §2.1, `src/gpu_fault/cluster_scope.py` |
 | Database | Aurora PostgreSQL; `psycopg[binary,pool]>=3.2,<4` | `pyproject.toml`, generated manifests |
 
 ### 1.3 Explicitly unsupported scenarios
@@ -84,15 +89,15 @@ The following are not "not yet tested"; they are **deliberately not done by desi
 | Scenario | Current state | Basis |
 |---|---|---|
 | Calling `BatchReplaceClusterNodes` to replace a node | Unreachable at the code level. The provider client protocol does not declare the method, and `HyperPodAction.REPLACE` fails immediately on entering provider submit; environment variables, IAM and CloudTrail provide outer-layer disproof on top | `src/gpu_fault/hyperpod.py` and `tests/hyperpod/test_hyperpod.py` |
-| HyperPod `NodeRecovery` automatic recovery | Must be `None`; the control plane verifies this at startup | High-Level Design v2 §1.2 |
-| Job auto-resume taken over by the platform | The contract requires jobs **without** the `sagemaker.amazonaws.com/enable-job-auto-resume` annotation: when the annotation is missing or false the `workloadStop`/`workloadRestart` capability is `OWN`; when it is true the code yields `DELEGATE` (`src/gpu_fault/hyperpod.py`), and there is **no** startup refusal guard like the one for NodeRecovery | High-Level Design v2 §1.2, `src/gpu_fault/hyperpod.py` |
+| HyperPod `NodeRecovery` automatic recovery | Must be `None`. Checked when deploy and join-cluster discover the cluster (`admin/bootstrap.discover_cluster`; a first deploy runs the same discovery read-only before recording its request, `admin/first_deploy_precheck.py`); before every provider mutation (reboot) the HyperPod adapter's `preflight` re-reads `DescribeCluster` and refuses unless `NodeRecovery` is explicitly `None`; the adapter configuration refuses `GPU_FAULT_ALLOW_WITH_AUTOMATIC_NODE_RECOVERY`. The eks-managed counterpart: the GPU node groups' `nodeRepairConfig.enabled` must not be true (`src/gpu_fault/eks_node_repair.py`) | High-Level Design v2 §1.2, `src/gpu_fault/hyperpod.py` |
+| Job auto-resume taken over by the platform | The contract requires jobs **without** the `sagemaker.amazonaws.com/enable-job-auto-resume` annotation: when the annotation is missing or false the `workloadStop`/`workloadRestart` capability is `OWN`; when it is true the code yields `DELEGATE` (`src/gpu_fault/hyperpod.py`). There is no deploy-time refusal like the one for NodeRecovery; at execution time a workload stop/restart step that reads the annotation as true fails without touching the job, its details carrying the command that removes the annotation (`_managed_job_recovery_conflict` in `adapters/kubernetes/workload_operations.py`) | High-Level Design v2 §1.2, `src/gpu_fault/hyperpod.py` |
 | Single-GPU-granularity removal (device-plugin stops only one card) | Not implemented. Only the whole GPU/EFA device-plugin DaemonSet Pod can be restarted, so **the isolation granularity is the whole node** | §3.8, §11 |
 | MIG-instance-level fault modelling | The MIG UUID prefix is only treated as part of the device identity; there is no MIG-granularity fault model or blast radius | §11 |
 | Kubernetes Eviction API eviction | Not used. Node isolation uses cordon + the `gpu-fault.io/quarantined:NoSchedule` taint; stopping the workload is executed by the independent `STOP_WORKLOADS` step | §3.8 |
-| Writing Kubernetes Events / custom CRDs | Not written. NodeCondition is read-only | §3.8, §11 |
-| A real dry-run | `/simulate` writes to the database and drives the workflow and incident to a terminal state; it is not a read-only rehearsal | §8.5, §11 |
-| External ticketing systems (Jira/PagerDuty/Slack/webhook) | None. The "ticket number" is a locally synthesised `vendor-ticket-<incident_id>` string that appears in the SNS/SES notification body | §3.10, §11 |
-| PCIe AER decoding | None. On the PCIe side there are `pcie_replay_total` / `DCGM_FI_DEV_PCIE_REPLAY_COUNTER`, from batch 233 the link generation/width (235-238) and the correctable-error count (1501), and `pci_bdfs`; AER is not decoded | §11 |
+| Writing Kubernetes Events / custom CRDs | The fault-handling path writes no Event and there is no custom CRD; NodeCondition is read-only. The only Event writer is the Aurora credential rotation CronJob: when its retries are exhausted it records an `AuroraCredentialRefreshFailed` Warning on its Secret (`src/gpu_fault/aurora_credential_refresh.py`) | §3.8, §11 |
+| A real dry-run | `/simulate` writes to the database and drives the workflow and incident to a terminal state; it is not a read-only rehearsal | §8.7, §11 |
+| External ticketing systems (Jira/PagerDuty/Slack/webhook) | None. The "ticket number" is a locally synthesised `vendor-ticket-<incident_id>` string that appears in the SNS/SES notification body | §3.11, §11 |
+| PCIe AER decoding | None. On the PCIe side there are `pcie_replay_total` / `DCGM_FI_DEV_PCIE_REPLAY_COUNTER` (field 202), the link generation/width (235-238) and the correctable-error count (1501, `src/gpu_fault/gpu_pcie_link_policy.py`), and `pci_bdfs`; AER is not decoded | §11 |
 
 ---
 ## 2. Deployment and Process Design
@@ -111,29 +116,28 @@ The schema-v4 business wheels and locked dependencies are pre-installed into the
 `/opt/gpu-fault/executor` respectively; the container directly execs the uvicorn/entry point of that venv), and business Pods
 do not run `pip install` at startup. The `/artifact` ConfigMap volume stores only xz-compressed wheels
 (`<wheel>.whl.xz`, `src/gpu_fault/admin/artifact_configmaps.py`) for digest verification and recovery; once the xz
-stream itself exceeds the 1 MiB ConfigMap ceiling (the control-plane wheel's xz stream has reached 1,051,472 bytes) it
+stream itself exceeds the 1 MiB ConfigMap ceiling it
 becomes a chunked set: the named ConfigMap holds only `artifact.json` (file name, sha256, encoding and the part list), the
 parts live in `<name>-part-<k>`, the parts are created before the manifest and every reader re-hashes them part by part. It is
 part of signed-artifact delivery and audit, not an online dependency installation source, and nothing reads it at runtime; the Node bundle
 is additionally paired with an offline dependency image at a fixed digest. The regional
-orchestrator judges the blast radius by component `module_digest`, so control-plane changes no longer require rolling GPUs or nodes.
+orchestrator judges the blast radius by component `module_digest`, so control-plane changes do not require rolling GPUs or nodes.
 
 | Layer | Workload | Kind | Replicas | Entry point | Port | ServiceAccount |
 |---|---|---|---|---|---|---|
-| Control plane | `gpu-fault-api-ha` | Deployment | 3 | `python -m gpu_fault.app.serve gpu_fault.app:create_app --factory --workers 4` | 8080 | `gpu-fault-control-plane` |
-| Control plane | `gpu-fault-control-worker` | Deployment | 6 | Same as above, `--workers 4` | 8081 | `gpu-fault-control-plane` |
-| Control plane | `gpu-fault-telemetry-spool-worker` | Deployment | **0** | Same as above, `--workers 1` | 8082 | `gpu-fault-control-plane` |
+| Control plane | `gpu-fault-api-ha` | Deployment | 3 | `python -m gpu_fault.app.serve gpu_fault.app:create_app --factory --workers 4` | 8080; probe port 8090 (`livez`: liveness `/livez`, readiness `/healthz`; `GPU_FAULT_LIVENESS_PORT` = service port + 10, §3.12) | `gpu-fault-control-plane` |
+| Control plane | `gpu-fault-control-worker` | Deployment | 6 | Same as above, `--workers 4` | 8081; probe port 8091 | `gpu-fault-control-plane` |
+| Control plane | `gpu-fault-telemetry-spool-worker` | Deployment | **0** | Same as above, `--workers 1` | 8082; probe port 8092 | `gpu-fault-control-plane` |
 | Data plane | `gpu-fault-cluster-executor` | Deployment | 2 | `gpu-fault-cluster-executor` | **9111**; `/metrics` and `/healthz` (family `gpu_fault_cluster_executor_*`; the port is given by `GPU_FAULT_CLUSTER_EXECUTOR_METRICS_PORT`, must equal the manifest's `metrics` containerPort, 0 disables; `/healthz` and the exec liveness read the same loop-alive file) | `gpu-fault-cluster-executor` |
 | Data plane | `gpu-fault-completion-watcher` | Deployment | 1 | `gpu-fault-completion-watcher` | **9109**; `/metrics` and `/healthz`, all three probes read it | `gpu-fault-completion-watcher` |
 | Data plane | `gpu-fault-node-installer-reconciler` | Deployment | 1 | `gpu-fault-node-installer-reconciler` | **9110**; `/metrics` and `/healthz` (family `gpu_fault_node_installer_*`; `GPU_FAULT_NODE_INSTALLER_METRICS_PORT`, 0 disables; the liveness probe still reads the heartbeat file, `/healthz` answers the same 300 s freshness question) | `gpu-fault-node-installer-reconciler` |
 | Data plane | `gpu-fault-kubernetes-node-resource-collector` | Deployment | 1 | `gpu-fault-collector kubernetes-node-resources` | No listening port | `gpu-fault-kubernetes-node-resource-collector` |
-| Data plane | `gpu-fault-dcgm-exporter` | DaemonSet | One per GPU node | dcgm-exporter | 9400 | default |
+| Data plane | `gpu-fault-dcgm-exporter` | DaemonSet | One per GPU node | dcgm-exporter | 9400 (`hostNetwork`, bound to `127.0.0.1` only, read by the node's metrics collector) | default |
 | Data plane | `gpu-fault-adot-dataplane` | Deployment | 1 per GPU cluster | aws-otel-collector (`deploy/dataplane/adot-dataplane.yaml`) | 8090 (`/health` of the health_check extension, for probes only) | `gpu-fault-adot-dataplane` (IRSA) |
 | Node | 5 installable collector systemd units (4 enabled by default in production, NodeLog disabled by default) | systemd | 1 of each per node | `/opt/gpu-fault/current/venv/bin/gpu-fault-collector <mode>` | No listening port | root (see §2.4) |
 | Node | `gpu-fault-node-agent` | systemd | 1 per node | `/opt/gpu-fault/current/venv/bin/gpu-fault-node-agent` | **9099**; TLS by default | root |
 
-Before the data-plane review of 2026-09-08 the data-plane components' own metrics had no scrape path at all (the watcher's 9109 could only be
-read manually via `kubectl exec`). Now each GPU cluster runs one `gpu-fault-adot-dataplane` collector (1 replica,
+The data-plane components' own metrics are scraped by one `gpu-fault-adot-dataplane` collector per GPU cluster (1 replica,
 `Recreate`, only a get/list/watch Role on `pods` in its own namespace, no ClusterRole):
 
 - **Discovery is declarative**: job `gpu-fault-dataplane` uses `kubernetes_sd_configs role: pod` to look only at
@@ -159,8 +163,7 @@ read manually via `kubectl exec`). Now each GPU cluster runs one `gpu-fault-adot
   execution tokens do not leave the control plane.
 - **Post-deploy verification of the collector's own metrics reads AMP, not the Pod port**: the `service.telemetry`
   Prometheus reader of both collectors is deliberately bound to `127.0.0.1:8889` (the unauthenticated internal counters of the collector are not exposed to the
-  namespace), so any read proxied through the API server to the Pod IP necessarily gets connection refused —
-  that is exactly how the `adot_self_metrics` verify of deploy #25 on 2026-09-09 failed after COMMITTED.
+  namespace), so any read proxied through the API server to the Pod IP necessarily gets connection refused, and the verify cannot read that way.
   `regional_adot_self_metrics.adot_self_metrics_report` (the implementation of `regional_admin_checks.check_adot_self_metrics`) uses `amp_instant_query` (SigV4-signed
   `/api/v1/query`) to check against the site AMP workspace: `up{job="gpu-fault-adot-self"}` is 1, and every `otelcol_*` series referenced by the alert rules and
   the keep list exists under that job; this simultaneously proves the whole chain of self-scrape, keep filter and
@@ -208,29 +211,27 @@ read manually via `kubectl exec`). Now each GPU cluster runs one `gpu-fault-adot
   has no absent rule at all until the digest happens to move); `sync_release_state` (the plan-less `_capture_previous()`) likewise reads
   the collector objects of every GPU cluster in parallel. `previous-image`
   is reachable only when the state lacks `dataplane_adot` (transactions older than this version) and is recorded truthfully. The four helpers of `regional_manifest_snapshot` therefore accept
-  an optional `kubectl` prefix; the narrative of `REPLAYED_MANIFEST_CHANGES` was changed to hold for both planes. Known limitation (F5): a release that touches only observability
+  an optional `kubectl` prefix; the narrative of `REPLAYED_MANIFEST_CHANGES` holds for both planes. Known limitation: a release that touches only observability
   also records every cluster as CONVERGED and refreshes `converged_at_epoch`. The `observability_adot` digest =
   `sha256({control_plane_manifest, dataplane_manifest, amp_workspace_id, adot_irsa_role_arns: {cluster: arn|null},
   dataplane_expected_rules})` (the last item is the rendered per-cluster rule text):
   adding a role, adding a workspace or changing the collector manifest all become a `CONTROL_PLANE_ONLY` release with an OBSERVABILITY node; `registry_config_digest`
-  / `dcgm_digest` / `observability_rules_digest` are not affected by the role. On the first deployment of a release containing this change, `observability_adot`
-  moves once because of the formula change. The missing alert `GpuFaultDataplaneCollectorMissing` is split in two halves: the static rule only has "some `gpu_cluster` has
+  / `dcgm_digest` / `observability_rules_digest` are not affected by the role. The missing alert `GpuFaultDataplaneCollectorMissing` is split in two halves: the static rule only has "some `gpu_cluster` has
   `max(up) == 0` for 15 minutes"; "not a single series" is rendered by `render_dataplane_expected_rules` during `_apply_observability`
   for the clusters that have a role configured as `absent(up{job="gpu-fault-dataplane", gpu_cluster="<id>"} == 1)` (same alert name, same
   runbook card, description naming the cluster), handed via `run_amp_monitoring_installer` with `--dataplane-expected-rules <tmp>` /
   `--no-dataplane-expected-rules` to `install-amp-monitoring.sh`, which writes it into the independent namespace `gpu-fault-dataplane-expected`
-  (idempotently deleted when no cluster has a role configured; a bare run of the script does not touch it). The global `absent(...)` half has been deleted: it would alert permanently on a
-  site with "workspace but no role". Per-cluster rendering also closed the previous blind spot (with multiple clusters, one dead and one alive, the dead one had no series at all). The two Completion Watcher rules are grouped by
+  (idempotently deleted when no cluster has a role configured; a bare run of the script does not touch it). There is no global `absent(...)` rule: it would alert permanently on a
+  site with "workspace but no role", and with several clusters, one dead and one alive, it could not name the dead one (which has no series at all); per-cluster rendering avoids both. The two Completion Watcher rules are grouped by
   `gpu_cluster`.
 
-The production entry point is `uvicorn ... --factory`, **not** the console script `gpu-fault-api`. Reading a process's identity
+The production entry point is `python -m gpu_fault.app.serve gpu_fault.app:create_app --factory` (the per-worker `SO_REUSEPORT` launcher, §3.12), **not**
+`python -m uvicorn`, and not the console script `gpu-fault-api` (the image's default `CMD`, which the manifests always override). Reading a process's identity
 cannot rely on the Pod name or annotations, only on `module_digest` (`GET /v1/version`):
 the `gpu-fault.io/artifact-sha256` annotation and `GPU_FAULT_RELEASE_ID` are pure labels; changing them does not affect the running code.
 
-The historical in-cluster GPU metrics DaemonSet manifest (`gpu-metrics-collector.yaml`) has been deleted from
-`deploy/dataplane/` and from the cleanup inventory. Current regional production collects GPU metrics via the node
-systemd `gpu-fault-metrics-collector.service`; a DaemonSet of this kind must not be redeployed,
-otherwise the same node would have two producers.
+GPU metrics are collected only by the node systemd unit `gpu-fault-metrics-collector.service`; `deploy/dataplane/` has no
+in-cluster GPU metrics DaemonSet and none may be deployed, otherwise the same node would have two producers.
 
 ### 2.2 The three control-plane roles
 
@@ -264,7 +265,7 @@ The same `create_app()` splits by `GPU_FAULT_SERVICE_ROLE`. Only the values
   so the reading is independent of which process the scrape lands on.
 
 The 18 ConfigMaps of the three roles (core/notification/postgres/processor/recovery/telemetry per role)
-are generated by the renderer; hand edits are caught by the manifest check of `make docs-check`. Before changing an environment variable you must first confirm it
+are generated by the renderer; hand edits are caught by `make deployment-contracts-check` (re-render and compare byte for byte) and `make config-check`. Before changing an environment variable you must first confirm it
 is not a `valueFrom` — each of the three Deployments has 26 explicit `env` items that come from
 Secret/ConfigMap references, and changing `value` directly has no effect; the remaining configuration is injected through 6 `envFrom`
 ConfigMaps.
@@ -305,8 +306,8 @@ does not block the other tasks (`src/gpu_fault/app/periodic_services.py`).
 | `training-health` | 15s | `GPU_FAULT_TRAINING_HEALTH_SCAN_SECONDS` | Runs only with `GPU_FAULT_ENABLE_TRAINING_HEALTH_MONITOR=true` |
 | `spare-health` | 30s | `GPU_FAULT_SPARE_HEALTH_SCAN_SECONDS` | Warm spare patrol |
 | `identity-refresh` | 20s | `GPU_FAULT_HYPERPOD_IDENTITY_REFRESH_SECONDS` | HyperPod node identity refresh. In regional mode every pass (and every tick's "anything to refresh?" check) reads this process's registry runtime snapshot as it is now, not a start-up copy: a HyperPod cluster joined online enters the refresh on the next pass (its observer is built on first sight and shared with the workflow path; every observer records the provider identity it was built from -- provider, region, HyperPod cluster name, EKS ARN -- and every lookup compares it with the registry's current registration, so a cluster id removed and re-joined as another cluster has the old observer dropped and exactly one new one built on its next lookup on either path, while the same cluster re-joined keeps its observer), a cluster removed online is no longer refreshed from the next pass, and neither needs a CPU Pod restart; `synthetic` registrations (perf/acceptance placeholders whose HyperPod name does not exist) and plain EKS registrations are not refreshed; an unavailable snapshot refreshes no cluster that pass (fail closed); an observer that cannot be built fails only that cluster's pass and is retried on the next (`ApplicationContext.background_identity_registries`). The identity thread of a process without a processor behaves the same |
-| `processor-cleanup` | 60s | `GPU_FAULT_PROCESSOR_CLEANUP_INTERVAL_SECONDS` | Queue tombstones, evidence TTL, remote command retention; since the control-plane review of 2026-09-08 the same round also runs the four kinds that originally had no retention, `inactive_markers` / `notifications` / `completion_records` / `registry_members` (see below) |
-| `control-record-archive` | 600s | `GPU_FAULT_CONTROL_RECORD_ARCHIVE_INTERVAL_SECONDS` | Incident archive-first archiving, at most `GPU_FAULT_CONTROL_RECORD_ARCHIVE_BATCH_SIZE=200` records per round (the original 3600s / 25 records could never catch up with the backlog, F-8) |
+| `processor-cleanup` | 60s | `GPU_FAULT_PROCESSOR_CLEANUP_INTERVAL_SECONDS` | The jobs of one round: completed queue rows (`GPU_FAULT_PROCESSOR_COMPLETED_RETENTION_SECONDS`, 600s), raw evidence TTL, hot state, processor lanes (`GPU_FAULT_PROCESSOR_LANE_RETENTION_SECONDS`, 3600s), `inactive_markers` / `notifications` / `completion_records` / `health_signal_states`; regional mode adds remote command retention, expiry of unclaimed remote commands (`GPU_FAULT_REMOTE_COMMAND_CLAIM_DEADLINE_SECONDS`, 900s), fleet deployments, `registry_members` and expiry of stale-fence remote commands (`GPU_FAULT_REMOTE_COMMAND_STALE_FENCE_GRACE_SECONDS`, 600s) (see below) |
+| `control-record-archive` | 600s | `GPU_FAULT_CONTROL_RECORD_ARCHIVE_INTERVAL_SECONDS` | Incident archive-first archiving, at most `GPU_FAULT_CONTROL_RECORD_ARCHIVE_BATCH_SIZE=200` records per round (a rate that drains a backlog) |
 | `collector-silence` | 60s | `GPU_FAULT_COLLECTOR_SILENCE_SCAN_SECONDS` | Collector silence check; scope and criteria below; notifications deduplicated by default in 3600s time buckets |
 | `processor-lease-reclaim` | 30s | `GPU_FAULT_PROCESSOR_LEASE_RECLAIM_SECONDS` | Reclaims queue rows whose lease has expired but are still LEASED, at most `LEASE_RECLAIM_BATCH=256` rows per round |
 | `processor-counter-drift` | 60s | `GPU_FAULT_PROCESSOR_COUNTER_DRIFT_SCAN_SECONDS` | Drift scan between the queue count table/shards and the real row count (`processor_counter_drift_abs`) |
@@ -322,12 +323,13 @@ Processor, an available Store and the periodic-task lease.
 The scan covers only Agents in active clusters that `agent_is_current` judges to be online, i.e. ACTIVE with a valid heartbeat lease;
 then `required_collectors_for_agent` selects the required channels, excluding services explicitly disabled/masked.
 A notification is generated when `last_success_at` is missing or the time since it exceeds the threshold of that channel; when the success record is missing,
-this scan does not first wait a full threshold window. The thresholds come from `src/gpu_fault/collector_registry.py`:
-GPU inventory defaults to 180s, GPU metrics/host telemetry 420s, log channels 900s.
+this scan does not first wait a full threshold window. The thresholds come from `COLLECTOR_KINDS` in `src/gpu_fault/collector_kinds.py`
+(re-exported by `collector_registry`, each with a `GPU_FAULT_*_SILENT_AFTER_SECONDS`): GPU inventory defaults to 180s, GPU metrics/host telemetry 420s,
+node-log, kernel and Fabric Manager 900s.
 `synthetic` registrations (perf/acceptance placeholders whose nodes report nothing by construction) are not scanned, by the
 same `is_placeholder_registration` test the background identity refresh uses. Right before each notification is written the scan
 re-reads the cluster and the Agent: a cluster no longer registered ACTIVE, or an Agent whose record is gone or no longer current,
-gets none, so a purge that commits after the scan read the Agents (remove-cluster, a perf suite's teardown) is no longer followed
+gets none, so a purge that commits after the scan read the Agents (remove-cluster, a perf suite's teardown) is not followed
 by notifications with their delivery/result records and dedup links.
 Notifications are deduplicated by cluster, node, channel and the `GPU_FAULT_COLLECTOR_SILENT_ALERT_SECONDS` time bucket,
 with a default bucket width of 3600s. Every round also writes the unified observation state `collector_observation_valid` for each
@@ -343,22 +345,23 @@ interrupts the healthy metrics collector beside it (GF-REGIONAL-COLLECT-019). Ag
 Executor and Watcher are not part of this collector silence scan.
 
 The cleanup task has a double upper bound: `GPU_FAULT_PROCESSOR_CLEANUP_BATCH_SIZE=1000` and
-`GPU_FAULT_PROCESSOR_CLEANUP_BUDGET_SECONDS=20`. The design is "clean one batch per round, never fill the whole period",
-so **the cleanup rate is bounded**: when the production rate exceeds `limit ÷ interval` the queue only grows. Capacity calculations must
-account for both ratios at once.
+`GPU_FAULT_PROCESSOR_CLEANUP_BUDGET_SECONDS=20`. Every job cleans at least one batch per round and continues while its batches are full,
+until the round's budget is spent; the remaining budget is split evenly among the jobs still to run (a job that finishes early hands its slack on),
+and the starting job rotates every round so no table always works from leftovers (`PeriodicServiceRunner._cleanup_round`).
+So **the cleanup rate is bounded**: when the production rate exceeds it the backlog only grows. Capacity calculations must account for both the batch size and the budget.
 
-The four kinds that originally had no retention at all are now reclaimed by the same cleanup round (F-8 / G-9); each switch set to 0 disables it:
+The following kinds are reclaimed by the same cleanup round; each switch set to 0 disables it:
 inactive markers (`GPU_FAULT_MARKER_RETENTION_SECONDS`), notifications whose delivery reached SENT/DEAD
 (`GPU_FAULT_NOTIFICATION_RETENTION_SECONDS`; PENDING/RETRY/LEASED are never cleaned), decided
 completion decisions and their events (`GPU_FAULT_COMPLETION_RECORD_RETENTION_SECONDS`),
 the three defaulting to 2,592,000s (30 days); and expired member rows of the regional registry
 (`GPU_FAULT_REGISTRY_MEMBER_RETENTION_SECONDS`, default 86,400s). The common rule is: **as long as an
-incident still references the record it is kept** — it is packaged by the archiver together with the incident (F-I1); each job's row count,
+incident still references the record it is kept** — it is packaged by the archiver together with the incident; each job's row count,
 errors and budget exhaustion are counted respectively in `gpu_fault_periodic_cleanup_rows_total{periodic_job}`,
 `gpu_fault_periodic_cleanup_job_errors_total{periodic_job}` and
-`gpu_fault_periodic_cleanup_budget_exhausted_total{periodic_job}` (F-F2); an exception thrown by the periodic task body itself is counted in
-`periodic_job_errors_total` and triggers `GpuFaultPeriodicServiceErrors`, and `job_last_run` is no longer
-refreshed by a failed round (F-1).
+`gpu_fault_periodic_cleanup_budget_exhausted_total{periodic_job}`; an exception thrown by the periodic task body itself is counted in
+`periodic_job_errors_total` and triggers `GpuFaultPeriodicServiceErrors`, and a failed round does not refresh `job_last_run`
+(the gauge the stall alert reads); one failing job does not stop the other jobs of the same tick.
 
 Health-signal state rows (`health_signal_state` sustained windows and notification latches, `efa_traffic_state`) are
 reclaimed by the same round's `health_signal_states` job: a row written within the grace period
@@ -368,16 +371,16 @@ its node departed, or once nothing has written it within the retention period (`
 default 2,592,000s, 0 disables it). The scan is keyset paging over the primary key, and a PostgreSQL deletion only tries
 the advisory lock a claim holds and never waits (`detailed-design.md` §3.2.1).
 
-The regional registry's member heartbeat no longer writes on every 1s poll: it upserts only when the member row content changes or when more than
-`GPU_FAULT_REGISTRY_STALE_SECONDS / 3` (production 90s → 30s) has elapsed since the last write (F-5);
+The regional registry refreshes every `GPU_FAULT_REGISTRY_POLL_SECONDS` (default 1s), but the member heartbeat upserts only when the member row content changes or when more than
+`GPU_FAULT_REGISTRY_STALE_SECONDS / 3` (production 90s → 30s) has elapsed since the last write;
 `active_registry_member_ids` still judges liveness by the stale window, allowing two consecutive missed heartbeats.
 `RegionalRegistryRuntime.is_ready` requires both the most recent successful refresh and the persistent heartbeat to be within that window,
 and the timestamps must not be in the future; a successful database read cannot mask a long-running heartbeat write failure.
 `registry_revision_missing_member_ids` is shared by the API status and `registry_revision_converged`:
 all currently active processes, including joiners after the release, must be ready and ACK the same generation and content digest.
-Once the old heartbeat of a known required member has expired, it need no longer block the remaining ACKed active fleet (2026-09-15 live incident:
-an old control-worker that was terminating during the remove-cluster rollout was captured into required by the release of the subsequent join;
-convergence stalled for the full 300s and rolled back; after the fix an expired heartbeat no longer counts in `missing_member_ids`); a missing required record
+Once the old heartbeat of a known required member has expired, it no longer blocks the remaining ACKed active fleet: an old control-worker that is
+terminating during a remove-cluster rollout and gets recorded into required by the following release stops counting in `missing_member_ids` as soon as
+its heartbeat expires, so convergence does not stall for the full 300s and roll back; a missing required record
 cannot prove departure, and all heartbeats expiring cannot become success. Only when both required and member records are empty is it an empty bootstrap.
 `required_member_ids` keeps the original release snapshot; the ACK and missing lists may include processes that joined later.
 This proof is based on runtime heartbeat leases of the same release and the same stale window; it is not live proof of Pod termination or of old versions running mixed.
@@ -400,7 +403,7 @@ premise is that these processes must never compete with training jobs for resour
 | `gpu-fault-metrics-collector` | `gpu-fault-collector ${GPU_FAULT_METRICS_MODE}` | `ReadWritePaths=/var/lib/gpu-fault` | 100% | 1G | mode is `dcgm` or `nvidia-smi`; `After=nvidia-persistenced.service nvidia-fabricmanager.service` (ordering only, no Requires/Wants: the fabric state window counts from the collector's first observation, so at boot it starts once Fabric Manager's start job has finished) |
 | `gpu-fault-host-collector` | `gpu-fault-collector host` | `ReadWritePaths=/var/lib/gpu-fault` | 100% | 512M | 15s sampling |
 | `gpu-fault-log-collector` | `gpu-fault-collector logs` | `StateDirectory=gpu-fault` | 100% | 768M | `SupplementaryGroups=systemd-journal` |
-| `gpu-fault-fabric-manager-collector` | `gpu-fault-collector fabric-manager` | `StateDirectory=gpu-fault` | 50% | 256M | `After=nvidia-fabricmanager.service` |
+| `gpu-fault-fabric-manager-collector` | `gpu-fault-collector fabric-manager` | `StateDirectory=gpu-fault` | 50% | 256M | `After=nvidia-fabricmanager.service`, `SupplementaryGroups=systemd-journal` |
 | `gpu-fault-node-agent` | `gpu-fault-node-agent` | `ReadWritePaths=/var/lib/gpu-fault` | 200% | 1G | Listens on **9099**, requires TLS by default |
 | `gpu-fault-certificate-check.timer` | `/opt/gpu-fault/check-control-plane-certificate` | — | — | 256M | `OnBootSec=5m`, `OnUnitActiveSec=12h`, `RandomizedDelaySec=10m` |
 | `gpu-fault-gpu-persistence` | `nvidia-smi -pm 1` | — | — | 512M | `Type=oneshot`, `RemainAfterExit=yes` |
@@ -446,7 +449,7 @@ so an authorisation such as `pods/exec` that cannot be restricted with resourceN
 
 | ServiceAccount | Resource → verbs | Why these |
 |---|---|---|
-| `gpu-fault-cluster-executor` | ClusterRole: `nodes`: get/list/watch/**patch**; `pods`, `batch/jobs`, `kubeflow.org/pytorchjobs`, `jobset.x-k8s.io/jobsets`: get/list/watch. Roles rendered per allowed namespace: `pods`: patch/**delete**; `jobs`/`pytorchjobs`/`jobsets`: **create**/patch; plus a `pods delete` Role in `kube-system` (restarting the device-plugin Pod) | Isolation relies on patch (cordon + taint); `pods delete` is used only to restart the device-plugin DaemonSet Pod and to mark terminating Pods. There is **no** `nodes delete` and the Eviction API is not used; out-of-scope writes are refused twice, by the application and by the API server |
+| `gpu-fault-cluster-executor` | ClusterRole: `nodes`: get/list/watch/**patch**; `pods`, `batch/jobs`, `kubeflow.org/pytorchjobs`, `jobset.x-k8s.io/jobsets`: get/list/watch. Roles rendered per allowed namespace: `pods`: patch/**delete**; `jobs`/`pytorchjobs`/`jobsets`: **create**/patch; plus a `pods delete` Role in `kube-system` (restarting the device-plugin Pod), and in its own namespace a get/patch Role on the single Secret `gpu-fault-node-action-keys` (the node-key sync `cluster_executor/node_key_sync.py` only adds missing node keys, fenced by `resourceVersion`; no create/delete/list) | Isolation relies on patch (cordon + taint); `pods delete` is used only to restart the device-plugin DaemonSet Pod and to mark terminating Pods. There is **no** `nodes delete` and the Eviction API is not used; out-of-scope writes are refused twice, by the application and by the API server |
 | `gpu-fault-completion-watcher` | ClusterRole: `pods`: get/list/watch; `jobs`/`pytorchjobs`/`jobsets`: get; `configmaps` (only the two resourceNames `gpu-fault-completion-watcher-outbox` / `-outbox-active`): get/update/patch, no create. Roles rendered per allowed namespace: `pods`: patch; `pods/exec`: get/create; `pods/log`: get; `jobs`/`pytorchjobs`/`jobsets`: patch | Needs exec to read GPU UUIDs and training progress inside the Pod; patch only, never delete; `pods/exec` cannot be restricted by resourceNames, so it is granted only in the namespaced Role and does not become a shell permission on any Pod in the whole cluster |
 | `gpu-fault-node-installer-reconciler` | ClusterRole only `nodes`: get/list/watch/patch; Role in the same namespace: `jobs`: get/list/watch/create/**delete**; `configmaps` (`gpu-fault-node-installer-template` / `-wave`): get; `pods`: get/list | Re-runs the installation by deleting the Job; the delete scope is Jobs only; Pods are read to decide the state of the install Job's Pod |
 | `gpu-fault-kubernetes-node-resource-collector` | `nodes`: get/list; `pods`: get/list | Read-only allocatable summary and Pod occupancy |
@@ -454,10 +457,12 @@ so an authorisation such as `pods/exec` that cannot be restricted with resourceN
 
 The SA annotation `eks.amazonaws.com/role-arn` of `gpu-fault-cluster-executor` must be replaced with the real
 IRSA role, using the OIDC trust of this GPU cluster. Only two data-plane workloads hold AWS credentials: the executor
-(HyperPod mutations) and `gpu-fault-adot-dataplane` (independent IRSA, granted only `aps:RemoteWrite` on the site AMP,
-§2.1) — the Executor can no longer be described as the data plane's only AWS identity.
-The control plane performs no HyperPod mutation.
-The executor refuses to start when `GPU_FAULT_ENABLE_HYPERPOD_ADAPTER=true` and the credentials cannot be resolved,
+(provider mutations: the SageMaker API on a HyperPod cluster, EC2 `RebootInstances` on an eks-managed cluster, whose instances must carry the
+matching `eks:cluster-name` tag, `src/gpu_fault/eks_provider.py`) and `gpu-fault-adot-dataplane` (independent IRSA, granted only `aps:RemoteWrite`
+on the site AMP, §2.1) — the Executor is not the data plane's only AWS identity.
+The control plane performs no provider mutation.
+The executor refuses to start when `GPU_FAULT_ENABLE_HYPERPOD_ADAPTER=true` and the credentials cannot be resolved (the switch applies to both
+providers; `GPU_FAULT_CLUSTER_PROVIDER` decides which provider backs it),
 so an unreplaced placeholder blows up at deploy time rather than waiting for the next real fault.
 
 The three `ENABLE_*` switches on the executor container must be `true`:
@@ -472,7 +477,7 @@ The three `ENABLE_*` switches on the executor container must be `true`:
 
 ### 2.6 Replicas, anti-affinity, PDB and "no leader election"
 
-The scheduling constraints of the three control-plane Deployments are identical:
+The scheduling constraints of the three control-plane Deployments are identical (except the rolling parameters):
 
 - `podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution` (weight 100,
   `topologyKey: kubernetes.io/hostname`);
@@ -480,7 +485,8 @@ The scheduling constraints of the three control-plane Deployments are identical:
   `matchLabelKeys: [pod-template-hash]` — grouped by hash, so the old and new generations do not crowd each other out during a rolling upgrade;
 - tolerates `gpu-fault.io/quarantined:NoSchedule` (otherwise the control plane would be driven out by its own taint) and
   `not-ready`/`unreachable:NoExecute`, `tolerationSeconds: 60`;
-- `RollingUpdate`, `maxSurge: 1`, `maxUnavailable: 1`;
+- `RollingUpdate`: ingress uses `maxSurge: 1`, `maxUnavailable: 0` (a new Pod starts and becomes Ready before an old one stops, so a roll
+  never has fewer than 3 Ready api-ha Pods); worker and spool-worker use `maxSurge: 1`, `maxUnavailable: 1`;
 - PDB: `minAvailable: 2` for ingress, `maxUnavailable: 1` each for worker and spool-worker.
 
 High availability does not rely on a leader but on three layers of leases (§9.3):
@@ -504,7 +510,7 @@ sequenceDiagram
     Note over Job: production business processes have AUTO_SCHEMA_INIT=false,<br/>they do not create tables themselves
     Ing->>Ing: validate_direct_client_identity_environment()<br/>proxy headers forbidden
     Ing->>Ing: ExplicitAuthorizationRegistry.load()<br/>any route without a bucket fails startup
-    Ing->>Ing: _validate_existing_schema() read-only check<br/>9 tables + 1 index + 4 functions + 6 triggers<br/>+ 68 declared indexes (with definition comparison) + triggers enabled + version + migration history
+    Ing->>Ing: _validate_existing_schema() read-only check<br/>9 tables + 1 index + 4 functions + 6 triggers<br/>+ declared indexes (with definition comparison) + triggers enabled + version + migration history
     Ing-->>Ing: startupProbe tcpSocket:8080 (up to 600s)
     Wk->>Wk: same three steps as above + compile Runtime Profile
     Wk->>Wk: start all threads of §2.3
@@ -551,7 +557,7 @@ A few points that must be remembered:
   product-driven restart would fire `GpuFaultExclusiveNodeOwnershipInvariantViolation`, and fault events on that node would be
   attributed to no job. A suspend without the product's annotation (user/Kueue), a successor whose `operation-id` the restart
   rewrote (the restart copies the initiator annotation into the successor), and a partially unreadable or partially deleted object
-  set all keep the grace period; Pods recreated by a later un-suspend still withdraw the tombstone (F2). An owner read failure that is
+  set all keep the grace period; Pods recreated by a later un-suspend still withdraw the tombstone. An owner read failure that is
   not 404/410 (RBAC, timeout, no client) is still handled by the grace period, fail-closed. The tombstone does not forge a
   container exit code; the terminal event continues to use the allocation the Watcher has accumulated.
   Once the product's own stop is recorded in the first round as a tombstone without containers, the stopped attempt has no
@@ -566,58 +572,53 @@ A few points that must be remembered:
   a branch (PREEMPT-018), and a late XID 79 on the node under reset supersedes the reset as before. An event whose own
   job/attempt or workload differs, a tombstone older than that workflow (an earlier stop's), a STOP that does not cover the node
   or never ran, a workflow that left PENDING/RUNNING, a join that already started, or more than one stopped attempt matching all
-  attribute nothing, and the event opens its own workflow as before. Earlier, node-b's XID 46 in the eks-managed
-  GF-REGIONAL-DESTR-014 arrived 2.6 s after the tombstone, opened a RESET_GPU workflow of its own and stayed PENDING behind the
-  failure-domain budget the job workflow held; no gate before the restart looked at it, so the job's join could have restarted the
-  job onto the faulted node, with only the placement hold after the restart to catch it. The 300 s grace used to let such events
-  join only by accident; the bound is now "until the stopping workflow's join starts". The judgement is per node: the tombstone no
+  attribute nothing, and the event opens its own workflow. A late event that is not attributed (another member node's XID
+  arriving seconds after the tombstone, say) opens a workflow of its own (a RESET_GPU, for example) queued behind the
+  failure-domain budget the job workflow holds; no gate before the restart looks at it, so the job's join could restart the
+  job onto the faulted node, with only the placement hold after the restart to catch it. That is why the bound is "until the
+  stopping workflow's join starts" rather than the watcher's 300 s grace. The judgement is per node: the tombstone no
   longer knows which GPUs the job used, and the restart lands on these nodes, so a fault on any GPU of them is repaired first.
   Node ownership (`ownership_metric_snapshot`) and topology attribution (`WorkloadTopologyService.resolve`) still count
   PENDING/RUNNING containers only, and health findings do not take this fallback, so the stopped source attempt and its restarted
   successor never both count as owners again. When the grouped-fault family scopes the job DAG from such an observation the
   allocation is empty, so the workload steps still to run (the join's `node_ids` and `source_gpu_count`) keep their compiled
-  values instead of being rewritten to an empty set and 0 -- the same-node inheritance path (`active_recovery_attempt_observation`
-  returning an observation left with terminated containers only) used to break the join that way too. Cost: taken only when both
+  values instead of being rewritten to an empty set and 0 (likewise on the same-node inheritance path, where
+  `active_recovery_attempt_observation` returns an observation left with terminated containers only). Cost: taken only when both
   lookups above find nothing, one incident read and one workflow read per retained STOPPED tombstone that names an initiator.
   A non-zero exit while the Pod carries `metadata.deletionTimestamp` is likewise read as STOPPED (`deletion_requested`):
   a user/operator `kubectl delete` of the job first makes torchrun receive SIGTERM and exit with 1 and then makes the Pod disappear;
   this is not a training failure, no failure-detected is sent, no restart budget is consumed, no escalation.
   The persisted active record keeps the request (`deleting`, written only while true), so the verdict survives a watcher
   restart -- also for a single Pod that is deleted or evicted (Eviction API: a drain, a consolidation) while the job goes on with
-  the controller's replacement Pod. Before, the record kept the exit and dropped the request: a watcher restarted after such a
-  reading restored the rank as an unexcused non-zero exit, the watcher core held a failure no failure-detected ever reported,
-  and the attempt -- still running on its other ranks and on the replacement -- ended TIMED_OUT at the cleanup deadline, which
-  the control plane answers with the attempt's containment (FREEZE_EVIDENCE, STOP_WORKLOADS of the healthy job) and a
-  RESTART_WORKLOAD plan; a job the user had deleted, restored past the cleanup deadline (30 s in the shipped manifest), got a
-  containment and a restart instead of the user stop. A Pod nobody asked to remove carries no such key, so its record is byte for
-  byte the earlier release's and the upgrade rewrites nothing; an earlier watcher (a rollback) keeps only the keys it knows and
-  reads the record as it always did. A record without the key -- every record an earlier watcher wrote -- restores no deletion: a
-  deletion is read, never inferred, so a watcher upgraded inside that narrow window (the deleted rank's exit read, its Pod not
-  yet removed) still restores that exit as a failure once.
+  the controller's replacement Pod. A record that dropped the request would make a restarted watcher restore the rank as an
+  unexcused non-zero exit: the attempt -- still running on its other ranks and on the replacement -- would end TIMED_OUT at the
+  cleanup deadline (30 s in the shipped manifest), which the control plane answers with the attempt's containment
+  (FREEZE_EVIDENCE, STOP_WORKLOADS of the healthy job) and a RESTART_WORKLOAD plan instead of the user stop. A Pod nobody asked to
+  remove carries no such key; a record without the key restores no deletion -- a deletion is read, never inferred -- and a watcher
+  version that does not know the key reads the record as before.
   Once an attempt's failure is detected, the passive containment's STOP_WORKLOADS annotates its Pods and then deletes them with
   zero grace, one after another; a pass that lands between two of those deletes lists only the surviving Pods. That pass keeps the
   exits of the ranks the previous pass saw terminated (`completion_observation.carry_vanished_failed_ranks`): the observation stays
   FAILED and the TIMED_OUT terminal observation still lists that rank, consistent with the terminal event's `rank_exit_status`; it
   is the same rule as republishing the previous observation unchanged when no Pod is left. A Pod listed again (the controller's
-  replacement) is read from that Pod, and a running rank whose Pod is gone is not carried. Before, such a pass put the attempt back
-  to RUNNING without the dead rank, the surviving node counted as an active attempt's node until the terminal, and the terminal
-  observation was `containers: []` (GF-REGIONAL-COLLECT-021 on plain EKS).
+  replacement) is read from that Pod, and a running rank whose Pod is gone is not carried. Otherwise such a pass would put the
+  attempt back to RUNNING without the dead rank, the surviving node would count as an active attempt's node until the terminal,
+  and the terminal observation would be `containers: []`.
   A container's GPUs come from the `gpu-fault.io/gpu-uuids` annotation or from an `nvidia-smi` exec into the running container,
-  and an exited container cannot be exec'd, so the reading of a rank that died used to carry no GPU UUID at all: the
-  failure-detected event and the attempt-failure incident (`inc-attempt-failure-*` and its FREEZE_EVIDENCE/STOP_WORKLOADS steps)
-  named only the surviving ranks' GPUs, the terminal allocation listed the dead rank with `gpu_uuids` empty (`gpu_count` still the
-  declared 8), and the recovery incident compiled from the terminal lacked the same GPUs (GF-REGIONAL-COLLECT-021: 8 of 16 on
-  plain EKS, 16 of 24 on HyperPod). Those lists do not decide the main path's plan (FREEZE_EVIDENCE records incident references,
-  STOP/RESTART act on workloads and nodes, `source_gpu_count` prefers the declared `nvidia.com/gpu`, and the live COLLECT-021 took
-  one restart without hardware evidence), but three narrow paths read them: the attempt attribution of a late fault
+  and an exited container cannot be exec'd. Were a dead rank's GPU UUIDs lost, the failure-detected event and the attempt-failure
+  incident (`inc-attempt-failure-*` and its FREEZE_EVIDENCE/STOP_WORKLOADS steps) would name only the surviving ranks' GPUs, the
+  terminal allocation would list the dead rank with `gpu_uuids` empty (`gpu_count` still the declared count), and the recovery
+  incident compiled from the terminal would lack the same GPUs. Those lists do not decide the main path's plan (FREEZE_EVIDENCE
+  records incident references, STOP/RESTART act on workloads and nodes, `source_gpu_count` prefers the declared `nvidia.com/gpu`),
+  but three narrow paths read them: the attempt attribution of a late fault
   (`orchestration/families/evidence.active_recovery_attempt_observation`: when the active node-exclusive workflow on the node
   belongs to an incident of that attempt -- a recovery incident compiled from a marker plan, the escalation successor of a failed
   passive workflow -- and its GPU list does not intersect the fault's GPUs, the fault is not attributed to the attempt and opens a
   workflow queued behind it); VALIDATE_GPU/VALIDATE_FABRIC scoped by the incident's GPUs (the validated restore and the escalation
-  successor look only at findings on the GPUs the step names, so findings on the dead rank's GPUs were ignored); and a Pod that
-  declares no `nvidia.com/gpu` (MIG resources only, for example), whose `source_gpu_count` falls back to counting UUIDs, came out
-  short and made the restart guard wait for a GPU-count-change approval.
-  Now a container a pass reads without UUIDs keeps the ones the previous reading held for the same
+  successor look only at findings on the GPUs the step names, so findings on the dead rank's GPUs would be ignored); and a Pod that
+  declares no `nvidia.com/gpu` (MIG resources only, for example), whose `source_gpu_count` falls back to counting UUIDs, would come
+  out short and make the restart guard wait for a GPU-count-change approval.
+  So a container a pass reads without UUIDs keeps the ones the previous reading held for the same
   Pod UID, container and rank (`completion_observation.keep_known_gpu_uuids`, called before `carry_vanished_failed_ranks`): the
   kubelet assigns a container its devices once for the life of its Pod, and a restart in place reuses them, so that set is still
   this container's. The failure event is thereby the union of every critical rank's known GPUs, each terminal allocation entry
@@ -626,35 +627,31 @@ A few points that must be remembered:
   and so does a running container whose exec fails after the restart. A container never read with UUIDs (exited the first time it
   was seen, or its exec failed for as long as it ran) keeps none and its allocation stays INCOMPLETE -- nothing is guessed -- and a
   replacement Pod has a new UID and is read from its own Pod. A FAILED reading is not an active one, but
-  publishing it no longer deletes the persisted record: the record of the last active reading is kept until the attempt's terminal
+  publishing it does not delete the persisted record: the record of the last active reading is kept until the attempt's terminal
   reading is published (`terminal` of `completion_attempt_state.publish_attempt_observation`; the outbox replay of a non-active
-  observation no longer deletes it either, since only the watcher knows which reading is the terminal one). Before, the record went
-  with the first FAILED reading: a watcher that restarted after that and before the terminal re-read the exited rank from its Pod
-  without its GPUs (INCOMPLETE), the terminal allocation and the recovery incident compiled from it lacked them, and so did the
-  VALIDATE_GPU the recovery path scopes by the incident's GPUs; when STOP_WORKLOADS had deleted the Pods while the watcher was
-  down, the new process knew nothing of the attempt and its terminal was never sent. Now the restarted process restores the
-  attempt from the kept record: with the Pods still listed the dead rank keeps the record's UUIDs, and the failure event it sends
+  observation does not delete it either, since only the watcher knows which reading is the terminal one). Were the record to go
+  with the first FAILED reading, a watcher restarted before the terminal would re-read the exited rank from its Pod without its
+  GPUs (INCOMPLETE), and when STOP_WORKLOADS had deleted the Pods while the watcher was down, the new process would know nothing
+  of the attempt and never send its terminal. With the record kept, the restarted process restores the attempt from it: with the Pods still listed the dead rank keeps the record's UUIDs, and the failure event it sends
   again (same key; the containment incident still follows the first process's event), the TIMED_OUT/FAILED terminal allocation
   and the recovery incident name every GPU; with the Pods gone it takes the existing path of a restored attempt whose Pods are
-  missing (F7): when our own stop suspended and annotated the workload object, the `STOPPED` terminal naming that containment
+  missing: when our own stop suspended and annotated the workload object, the `STOPPED` terminal naming that containment
   incident is sent at once, its allocation comes from the record with every GPU, and the control plane decides the recovery as
   for its passive containment's stop (the record predates the death, so this terminal carries no rank exit; the plan is the
   same). When that first read proves neither our stop nor the object's absence (the read fails, or something else removed
   the Pods), the restored attempt waits out the missing grace like any restored attempt, republishing its last RUNNING
   reading with a fresh instant -- for that time the control plane reads the attempt as RUNNING again, the fail-closed cost of
-  not knowing -- and the read at the end of the grace decides the terminal (our stop's initiator, or the object's verdict);
-  before, no terminal was ever sent. A container never read with UUIDs stays empty and INCOMPLETE across the restart, and a
+  not knowing -- and the read at the end of the grace decides the terminal (our stop's initiator, or the object's verdict).
+  A container never read with UUIDs stays empty and INCOMPLETE across the restart, and a
   replacement Pod is still read from its own Pod. Not covered: UUIDs first read in a non-active reading (a container whose exec
   answered only after another rank had failed) are not in the record.
-  The complete list also exposed a gap in the scope by the incident's GPUs: the escalation successor narrows the nodes to the
-  failed ones, and when the source workflow had not recorded which GPU sits on which node it inherited every GPU of the source --
-  on one node of a two-node attempt a single-node VALIDATE_GPU named the other node's 8 GPUs, which a healthy node can never
-  report, so it waited out the per-step cap and was escalated to REPLACE_NODE; the operator restore of that successor copied the
-  same list. Now each failed node's validation names the GPUs placed on that node (the dead rank's GPUs are validated on the dead
-  rank's node, a surviving rank's GPUs no longer appear on its steps); the placement rules and the decision for a GPU nothing
+  Scoped by the incident's GPUs, each failed node's validation names only the GPUs placed on that node (the dead rank's GPUs are
+  validated on the dead rank's node, a surviving rank's GPUs do not appear on its steps): an escalation successor inheriting every
+  GPU of the source would make a single-node VALIDATE_GPU name the other node's GPUs, which a healthy node can never report, so it
+  would wait out the per-step cap and escalate to REPLACE_NODE. The placement rules and the decision for a GPU nothing
   places are in the hardware recovery escalation of the detailed design §2.9 (`orchestration/gpu_placement.py`).
   ownership only accepts Observations whose `ingested_at` is not more than 120 seconds relative to the event; older
-  `PENDING/RUNNING` records go into the stale gauge and no longer participate in node-mutation attribution.
+  `PENDING/RUNNING` records go into the stale gauge and do not participate in node-mutation attribution.
   `/v1/workload-observations` is sent directly under normal conditions; after a send failure it is written per attempt, latest-wins, into the
   Completion Watcher ConfigMap outbox and replayed with priority in the next round. failure/terminal still remains strictly
   write-ahead. `active-attempts.json` lives in the separate `-active` ConfigMap (the WAL and steady state are
@@ -663,7 +660,7 @@ A few points that must be remembered:
   `host_pid`, about 833 B/Pod) plus its exit fields and, only while true, its deletion request (`deleting`), so the normal
   3-second refresh does not write the ConfigMap; after a Watcher restart it restores
   spec/allocation and rebuilds the remaining fields from live Pods; when Pods are missing beyond the cleanup timeout it sends `STOPPED` and clears
-  the persisted state; the record lives until the attempt's terminal reading is published, a FAILED reading does not delete it. The WAL depth is tracked in-process; when known to be empty, replay no longer GETs, and ConfigMap reads on a healthy cluster
+  the persisted state; the record lives until the attempt's terminal reading is published, a FAILED reading does not delete it. The WAL depth is tracked in-process; when known to be empty, replay does not GET, and ConfigMap reads on a healthy cluster
   are close to zero. A release rollout preserves the two existing state ConfigMaps and does not replay default empty data. After a terminal event is produced, both the Watcher and the Store map the Observation monotonically to the terminal state; the Store
   rejects a later-arriving active Observation in the same attempt transaction, and cleanup repairs historical contradictions. Persistent delivery
   failure may still produce a stale warning; a database TTL cannot replace the terminal Observation.
@@ -677,7 +674,7 @@ A few points that must be remembered:
   and turns 503. Cold start is covered by `startupProbe` (30s×20), so `/healthz` keeps only this one criterion.
   `gpu_fault_completion_watcher_last_cycle_completed_timestamp` is for alerting only and is **not**
   a `/healthz` criterion — a full pass may legitimately lag by more than one watch timeout.
-  Correspondingly, `GPU_FAULT_COMPLETION_WATCHER_METRICS_PORT=0` (or a port that cannot bind) is no longer "just no
+  Hence `GPU_FAULT_COMPLETION_WATCHER_METRICS_PORT=0` (or a port that cannot bind) is not "just no
   metrics" but makes the kubelet repeatedly kill the Pod: the probes read exactly this port; the process itself keeps running,
   and the failure shows up in the restart count. Besides the existing controller counters, the watcher also exports two gauges
   `gpu_fault_completion_outbox_depth` and `gpu_fault_completion_outbox_quarantined_depth`
@@ -705,7 +702,7 @@ A few points that must be remembered:
   fire-and-forget: a send failure is only counted, does not enter the outbox, and the next idle pass naturally overwrites it. The control plane reads only a fresh heartbeat with
   `watched_pods == 0 && watched_attempts == 0` as coverage (`IDLE`); a heartbeat with running workloads
   is still `UNKNOWN` (fail closed). An idle cluster has no managed attempts and therefore no
-  `AttemptObservation` at all; previously the control plane could not distinguish "no jobs" from "watcher is dead" and could only fail closed to
+  `AttemptObservation` at all; without the heartbeat the control plane could not distinguish "no jobs" from "watcher is dead" and could only fail closed to
   `UNKNOWN`; the heartbeat hands "the cluster has been fully looked at and nothing is running" to the control plane as a fact in its own right (§3.4 ⑦).
 - **Diagnostic markers do not own job recovery**: markers that only observe the node, such as `COLLECT_EVIDENCE` / `RUN_DIAGNOSTICS` /
   `VALIDATE_NODE` (`gpu_fault.markers.marker_is_diagnostic`), even when their
@@ -722,20 +719,23 @@ A few points that must be remembered:
 
 ### 2.8 Graceful shutdown
 
-The shutdown order is in `src/gpu_fault/app/lifespan.py`, with an overall budget held by `ShutdownCoordinator`:
+The shutdown order is in `src/gpu_fault/app/lifespan.py`, with an overall budget held by `ShutdownCoordinator`
+(`GPU_FAULT_LIFESPAN_SHUTDOWN_MAX_SECONDS`; generated manifests: ingress 20s, worker 130s, spool-worker 30s):
 
-1. `preStop: sleep 20` — first let the Service endpoints remove this Pod, avoiding still receiving traffic halfway through shutdown;
-2. cancel the event-loop lag monitoring task;
+1. `preStop: sleep` (ingress 35s, worker and spool-worker 20s) — first let the Service endpoints remove this Pod, avoiding still
+   receiving traffic halfway through shutdown; uvicorn then finishes in-flight requests within `--timeout-graceful-shutdown 60`;
+2. close the dedicated liveness/readiness probe listener (§3.12) and cancel the event-loop lag monitoring task;
 3. set the `stop` event → `processor.stop()` → stop further claims; after the Processor worker pool
    converges, actively release `claimed-but-not-started` requests, then `join` each thread one by one. Over budget,
-   record `processor shutdown deadline exceeded` and log the names of the failed threads;
+   `abandon_in_flight()` releases every request lease the process still holds, and `processor shutdown deadline exceeded` is logged
+   (the failed thread names and the in-flight/released/failed counts);
 4. `join` the training / spare / identity / notification-dispatcher / collector-metrics-snapshot /
    process-metrics publishing thread / regional-registry watch thread / diagnostics / the two dispatch
    wakeup listener threads / xid-correlation;
 5. `close()` the four admission batchers and the six store/decode I/O executors;
 6. `raise_if_failed()` — if a thread did not stop cleanly, make the shutdown **fail explicitly**, not silently.
 
-`terminationGracePeriodSeconds` differs by role: ingress 120s, worker **240s**,
+`terminationGracePeriodSeconds` differs by role: ingress 140s, worker **240s**,
 spool-worker 130s. The worker is longer because it may be executing a multi-step workflow;
 when force-killed, another replica takes over through lane/execution lease expiry (§7.6).
 
@@ -746,7 +746,7 @@ A partition is not one behaviour; it splits into three by direction:
 | Direction | Symptom | Designed behaviour |
 |---|---|---|
 | Node → control plane unreachable | Collector POST fails | Events are written to `/var/lib/gpu-fault/outbox/*.ndjson` and retried with backoff; after recovery they are submitted in on-disk order. `Retry-After` is honoured. The Node Agent does nothing on its own — **it only executes signed commands and has no local autonomous action** |
-| Control plane → node unreachable | Node action step times out | Once the heartbeat exceeds `GPU_FAULT_AGENT_MAX_HEARTBEAT_AGE_SECONDS` (the data-plane executor sets 90s) it is treated as stale and destructive steps are not dispatched; already-dispatched commands rely on idempotent replay by `command_id` to look up the receipt (§3.1) |
+| Control plane → node unreachable | Node action step times out | Once the heartbeat exceeds `GPU_FAULT_AGENT_MAX_HEARTBEAT_AGE_SECONDS` (both the control plane and the data-plane executor set 90s) it is treated as stale and destructive steps are not dispatched; already-dispatched commands rely on idempotent replay by `command_id` to look up the receipt (§3.1) |
 | Data-plane executor → control plane unreachable | Cannot claim/renew/report | Already-leased remote commands are re-dispatched after the lease expires (`GPU_FAULT_CLUSTER_EXECUTOR_LEASE_SECONDS=120`); executor readiness turns fail and the Pod is removed. On the control-plane side, if `GPU_FAULT_REMOTE_COMMAND_CLAIM_DEADLINE_SECONDS=900` passes with no one claiming, the step fails |
 | Control plane → Aurora unreachable | Both enqueue and consumption fail | On the ingress side admission returns 503 (`StoreIoCapacityExceeded`) or 429; no state is accumulated in memory. **There is no local degraded mode**, deliberately: the control plane is stateless, state lives only in Aurora |
 
@@ -764,11 +764,11 @@ At startup the new wheel requires `gpu_fault_schema_version.version` to be exact
 fail-closed guard of §2.7), so a release that changes the schema cannot roll back: the rolled-back old wheel would refuse to start on the new database.
 The release engine (`src/gpu_fault_release/regional_release_orchestration.py`) therefore refuses, before rolling, a transaction with
 a `database_schema` change and `auto_rollback=true`, and the `rollback` gate likewise refuses an explicit rollback across
-schemas. The past workaround was to change `spec.autoRollback` in `site.yaml` and change it back afterwards; forgetting to change it back
-made all subsequent releases lose automatic rollback.
+schemas. Do not work around it by changing `spec.autoRollback` in `site.yaml` and back: forgetting to change it back
+makes all subsequent releases lose automatic rollback.
 
-Now `gpu-fault-admin deploy --accept-schema-change` completes it within **a single transaction**
-(`src/gpu_fault_release/regional_schema_change.py`):
+`gpu-fault-admin deploy --accept-schema-change` (or `--accept-schema-change-without-snapshot`, which takes no snapshot) completes it
+within **a single transaction** (`src/gpu_fault_release/regional_schema_change.py`):
 
 - **Propagation**: the CLI writes the acceptance as the environment variable `GPU_FAULT_RELEASE_ACCEPT_SCHEMA_CHANGE` (value `snapshot` or
   `no-snapshot`), the same mechanism as `GPU_FAULT_EXPECTED_RELEASE_STATE_SHA256` and the fast-verify evidence path —
@@ -788,10 +788,9 @@ Now `gpu-fault-admin deploy --accept-schema-change` completes it within **a sing
   writes the reason of `SKIPPED_POLICY` as schema acceptance
   rather than `spec.autoRollback is false`. When `_rollback_context` refuses it attaches the snapshot id to restore from.
 - **Does not change the site**: `site.yaml` is untouched; after the transaction commits, the next deploy reads `autoRollback` as usual.
-- **Superseding a stopped fail-forward transaction** (`--supersede-failed-transaction`, exposed by production deploy #7 on
-  2026-09-07): `failed`/`partial-convergence` only resumes the same release; a different candidate is refused in `run_deploy`/`run_resume`
-  by `_refuse_foreign_candidate_resume` with both ids and the parameter name, replacing the engine-internal
-  `resume release_id does not match the candidate`. The parameter is propagated via `GPU_FAULT_RELEASE_SUPERSEDE_FAILED_TRANSACTION`
+- **Superseding a stopped fail-forward transaction** (`--supersede-failed-transaction`): `failed`/`partial-convergence` only resumes
+  the same release; a different candidate is refused in `run_deploy`/`run_resume` by `_refuse_foreign_candidate_resume` with both ids
+  and the parameter name, instead of reaching the engine-internal `resume release_id does not match the candidate`. The parameter is propagated via `GPU_FAULT_RELEASE_SUPERSEDE_FAILED_TRANSACTION`
   (the two literals in the CLI and `regional_admin_commands` are pinned by tests); `run_deploy` first uses
   `_require_supersede_target` to refuse in any state other than the above, or when the candidate equals the failed id, then calls
   `upgrade_release(resume=False, diff=supersede_release_diff(...), supersede=<failed state>)`.
@@ -802,10 +801,9 @@ Now `gpu-fault-admin deploy --accept-schema-change` completes it within **a sing
   the initial state records `superseded_transaction`; `resolve_acceptance(inherited=...)` reuses the record when the schema version accepted by the failed transaction
   equals the candidate's version, otherwise refuses by the normal rules; `approved_manifest_sha256` is produced by this transaction,
   and `autoRollback` is read from the site.
-- **A new candidate takes over a live transaction that is `complete` but not committed** (exposed by production deploy #29 on 2026-09-09): when
-  verify/stability fails after deployment and no rollback occurs, the transaction stops at `complete`, `transaction_committed=false`; originally only the same candidate
-  could resume into commit, but when verify itself is defective (`adot_self_metrics` of deploy #25) it can never pass,
-  and a new candidate is refused by the engine with `resume release_id does not match the candidate`, so the site can never be deployed again. Now,
+- **A new candidate takes over a live transaction that is `complete` but not committed**: when verify/stability fails after deployment
+  and no rollback occurs, the transaction stops at `complete`, `transaction_committed=false`; if only the same candidate could resume into
+  commit, a defective verify could never pass while a new candidate was refused, and the site could never be deployed again. So,
   when `_commit_pending(state) and _foreign_candidate(...)`, `run_deploy` first calls
   `regional_release_transaction.commit_live_release`: it uses `save_recorded_state` to write `transaction_committed=true` under the live release's **own identity**
   (`save_state` cannot be used; it would stamp the candidate's release_id/digest onto the state describing the live
@@ -813,9 +811,9 @@ Now `gpu-fault-admin deploy --accept-schema-change` completes it within **a sing
   `classify_release` new transaction, with the live release becoming that transaction's `previous`; `next_deploy` reports
   `commits_live_release_id`. The same candidate still resumes into commit as before. Tests:
   `tests/regional/test_release_transaction.py`, `tests/regional/test_regional_admin_commands.py`.
-- **A rollback prunes the previous snapshots as a commit does** (BOOT-023 after BOOT-020 found 4 groups, above the bound of 3):
-  every forward transaction captures a new snapshot of the live release and only the commit pruned, so rollbacks with no commit
-  in between piled them up. `finalize_rollback` now runs `cleanup_previous_snapshots` after deleting the Secret backups `previous`
+- **A rollback prunes the previous snapshots as a commit does**: every forward transaction captures a new snapshot of the live
+  release; were only the commit to prune, rollbacks with no commit in between would pile the groups up beyond
+  `PREVIOUS_SNAPSHOTS_RETAINED` (3). So `finalize_rollback` runs `cleanup_previous_snapshots` after deleting the Secret backups `previous`
   references and before writing `rollback_cleanup_completed=true`. It keeps the group the state references, which after a
   rollback is the snapshot of the restored release (`previous`), plus the newest others up to `PREVIOUS_SNAPSHOTS_RETAINED`. A
   state that does not reference the snapshot of that `previous` keeps every group and narrates
@@ -830,10 +828,11 @@ timeout/permission error, cluster id derivation, no rollback on failure, rollbac
 
 Regional bootstrap itself creates the Aurora cluster and two `db.serverless` instances (`src/gpu_fault/admin/bootstrap.py`
 `_ensure_aurora`, `src/gpu_fault/admin/bootstrap_aurora.py` `ensure_serverless_instances`/`await_aurora_ready`), so the database's
-observability configuration is also its responsibility rather than a manual operations step (store review 2026-09-07, item K):
+observability configuration is also its responsibility rather than a manual operations step:
 
 - `ensure_cluster_parameter_group`: one parameter group `<cluster name>-pg` per cluster (the default group cannot be modified, and sharing across sites would let
-  one site's change spill into another); when missing it is created by looking up the family for the engine version; for the four diagnostic parameters it reads and compares each before writing, changes only the deviating ones,
+  one site's change spill into another); when missing it is created by looking up the family for the engine version; for the four diagnostic parameters (`DIAGNOSTIC_PARAMETERS`: `log_lock_waits=1`, `log_min_duration_statement=1000`,
+  `pg_stat_statements.track=all`, `shared_preload_libraries=pg_stat_statements`) it reads and compares each before writing, changes only the deviating ones,
   does not touch other parameters set by operations, and sends not a single modification when already aligned.
 - `reconcile_cluster_diagnostics`: when the cluster is not attached to that group or `postgresql` log export is not enabled, one
   `modify-db-cluster --apply-immediately` fills the gap, then reuses the settle wait of the capacity reconciliation; no instance is restarted.
@@ -860,21 +859,33 @@ nodes, tiers 0/1); `tests/admin/test_rds_ca_bundle_drift.py` (certificate parsin
 classification, finding text, read-only) and `tests/deploy/test_rds_ca_bundle_wiring.py` (the vendored copy installed by default, a modified
 copy fails closed, the download never takes part in trust).
 
+### 2.11 Interpreter binding of release-engine subprocesses
+
+Before `gpu_fault_release.rollout.Runner._execute` hands a command to `run_command`, it uses
+`gpu_fault.admin.python_environment.python_environment(..., executable=sys.executable)` to put the directory of the engine's own interpreter
+at the head of the child's `PATH` and to drop an inherited `PYTHONHOME`. Deploy tools such as `deploy/control-plane/tools/apply-control-plane-role-split.sh`
+call scripts of the same repository (`apply_control_plane_deployment.py`, `wait_control_plane_pins.py` and others) with a bare `python3` and
+`import gpu_fault`; the administrator CLI guarantees that through `effective_environment(site)`, but the acceptance drivers that construct `Runner`
+directly (BOOT-020, release-history, the lifecycle runner) have no such layer: were the child to inherit only the operator shell's `python3`
+and that interpreter lack `gpu_fault`, the candidate upgrade and the automatic rollback would both fail with `ModuleNotFoundError` and the
+transaction would stop at `rollback-failed`, so the binding sits in `Runner` itself. It happens before `api_environment`, so the API quota shim
+still comes first on PATH. Test: `tests/test_release_runner_interpreter_path.py`.
+
 ### 2.12 Unobservable is not unhealthy: credential plugin retries, IMDS defaults and the observation budget
 
-**The traced path** (2026-10-15). After `gpu-fault-admin config` had rolled a `CONTROL_PLANE_ONLY` change cleanly, the release driver's
-`_run_verification_and_stability` (`scripts/release_deploy.py`) started two read-only processes in parallel:
+**The failure mode.** After a change has rolled cleanly (a `CONTROL_PLANE_ONLY` release of `gpu-fault-admin config`, say), the release
+driver's `_run_verification_and_stability` (`scripts/release_deploy.py`) starts two read-only processes in parallel:
 `python -m gpu_fault.admin.cli verify` (which runs `deploy/control-plane/regional/rollout-regional-release.sh verify`) and
 `rollout-regional-release.sh stability`. Both engine processes construct `ReleaseKubeconfigCache` in `_run_mode`
-(`src/gpu_fault_release/rollout.py`) before any check, running `aws eks get-token` for the kubeconfig; at that moment the deploy host got
-no EC2 instance-role credentials over IMDS (AWS CLI v2 exit status 253: configuration or credentials unavailable; the AWS CLI's IMDS
-defaults are 1 attempt with a 1-second timeout), the single attempt of `_fetch_exec_credential` raised
-`ReleaseError("exec credential plugin exited 253")`, `main` ended through `report_failure` with exit status 2, and both processes were gone
-about 2 seconds in. The driver's `_run_json` recorded the non-zero exit as `command failed (2): ...`, and `recover_release_failure`
-(`scripts/release_failure_recovery.py`), with `deployment_succeeded` and `automatic_rollback`, called `rollback_after_failure`, which ran
-`rollout-regional-release.sh rollback --automatic`: an observation that never happened bought about seven minutes of forced restarts and
-took a healthy change back. Both rules were right -- the engine must not carry on with a credential-less kubeconfig, and the driver must
-not commit a release nobody verified; the mistake was reading "could not see" as "saw it unhealthy".
+(`src/gpu_fault_release/rollout.py`) before any check, running `aws eks get-token` for the kubeconfig. Should the deploy host get no EC2
+instance-role credentials over IMDS at that moment (AWS CLI v2 exit status 253: configuration or credentials unavailable; the AWS CLI's IMDS
+defaults are 1 attempt with a 1-second timeout) and the credential fetch try only once, it raises
+`ReleaseError("exec credential plugin exited 253")`, `main` ends through `report_failure` with exit status 2 and both processes are gone
+about 2 seconds in; the driver's `_run_json` records the non-zero exit as `command failed (2): ...`, and `recover_release_failure`
+(`scripts/release_failure_recovery.py`), with `deployment_succeeded` and `automatic_rollback`, calls `rollback_after_failure`, which runs
+`rollout-regional-release.sh rollback --automatic`: an observation that never happened buys about seven minutes of forced restarts and
+takes a healthy change back. Both rules are right -- the engine must not carry on with a credential-less kubeconfig, and the driver must
+not commit a release nobody verified; the mistake is reading "could not see" as "saw it unhealthy". The three layers below keep the two apart.
 
 **Three layers**
 
@@ -886,7 +897,7 @@ not commit a release nobody verified; the mistake was reading "could not see" as
    `metadata_service_timeout` in any section of `AWS_CONFIG_FILE` (by default `~/.aws/config`), means that one is not added; a config
    file that cannot be read (`OSError`, an encoding error, `configparser.Error`) means nothing is added. The chain reaches IMDS last, so
    environment, profile and SSO credentials are unaffected; when IMDS really is down one lookup takes about 12 seconds at worst (about 2
-   before).
+   with the AWS CLI defaults).
 2. **Credential fetch retries** (`src/gpu_fault_release/regional_kubeconfig_cache.py`). `_plugin_invocation` builds the command and its
    environment and `_plugin_attempt` runs it once: a non-zero exit, a timeout or output that is not JSON comes back as a `_PluginFailure`
    (the failure plus its reason word); a plugin that cannot be started (`OSError`) and output above 8 MiB are a `ReleaseError` at once;
@@ -899,7 +910,7 @@ not commit a release nobody verified; the mistake was reading "could not see" as
    API budget shim, admitted like any other `aws` call. Every retry narrates one `exec-credential-retry` line (`narrate_step`); a final
    failure raises `ApiUnavailable` with a message such as `exec credential plugin exited 253 (no-credentials) after 3 attempts in 9s` --
    the failure and the reason word, never the plugin's output or the token.
-3. **The observation budget** (the new module `src/gpu_fault_release/regional_release_observation.py`). Only for `OBSERVATION_MODES`
+3. **The observation budget** (`src/gpu_fault_release/regional_release_observation.py`). Only for `OBSERVATION_MODES`
    (`verify`, `stability`); `ObservationBudget.for_mode` returns `None` for every other mode and for `--dry-run`. While `observe` raises
    `ApiUnavailable`, `attempt(observe, what=...)` charges the failed attempt's time to `unobserved`, pauses by
    `OBSERVATION_RETRY_DELAYS = (5.0, 10.0, 20.0, 30.0)` (the last repeating), charges the pause too, and observes again; a pause that
@@ -920,9 +931,9 @@ not commit a release nobody verified; the mistake was reading "could not see" as
      of samples; `_ControlPlaneOnlyWindow.missed` turns the `CONTROL_PLANE_ONLY` early close off once anything before or inside the window
      was taken again, and a convergence read in `may_close` that raises `ApiUnavailable` only keeps the full window; the report carries
      `observation`;
-   - `exec_cpu_ingress` (`src/gpu_fault_release/regional_release_runtime_identity.py`): `ApiUnavailable` no longer triggers the "was the
+   - `exec_cpu_ingress` (`src/gpu_fault_release/regional_release_runtime_identity.py`): `ApiUnavailable` does not trigger the "was the
      Pod replaced" lookup and its extra attempt (an API the engine could not reach cannot say whether the Pod went away either, and the
-     lookup only rewrote the failure into the finding `cannot read pod`); the failure goes up to the budget as it is, and a read-only
+     lookup would only rewrite the failure into the finding `cannot read pod`); the failure goes up to the budget as it is, and a read-only
      probe's own retries still run.
 
 **Classification: where `ApiUnavailable` comes from.** `ApiUnavailable` is a `CheckFailure` whose `details` are always
@@ -983,10 +994,10 @@ for the next deploy to resume; with `spec.autoRollback: false` the failure is `S
   live;
 - A separate `GPU_FAULT_*` budget variable: an env-inventory change rolls the node Agents.
 
-**Release impact.** Deploy host only: `src/gpu_fault_release/*`, `src/gpu_fault/admin/api_budget.py`, `scripts/release_deploy.py` and
-`deploy/control-plane/regional/probes/*.py` are deploy-host orchestration inputs; the control_plane/executor/node_runtime component
-wheels, the manifests, the images and the node bundle do not change, so the next deploy is NOOP for the clusters (no CPU/GPU roll, no
-node Agent waves); no new `GPU_FAULT_*` variable and no env-inventory change.
+**Where it lives.** All three layers are on the deploy host: `src/gpu_fault_release/*`, `src/gpu_fault/admin/api_budget.py`,
+`scripts/release_deploy.py` and `deploy/control-plane/regional/probes/*.py` are deploy-host orchestration inputs and enter none of the
+control_plane/executor/node_runtime component wheels, the manifests, the images or the node bundle; they have no `GPU_FAULT_*` variable
+either, so changing them changes no env-inventory and starts no node Agent wave.
 
 Tests: `tests/regional/test_kubeconfig_cache.py` (a plugin failing once is retried and its token cached, a persistent failure fails
 closed with the classified reason, non-JSON output is retried and never echoed, a contract violation is not retried, a hung attempt is
@@ -997,7 +1008,7 @@ stability window extended and never closing early, a credential plugin that reco
 `tests/admin/test_api_budget_metadata_defaults.py` (the defaults set and restored, environment and config-file values winning, an
 unreadable config), `tests/regional/test_release_stability_window.py` (the window itself),
 `tests/admin/test_release_deploy_unobservable.py` (the driver's record and the rollback that stays) and
-`tests/regional/test_runtime_component_identity.py` (an unreachable API is no longer asked whether the Pod went away).
+`tests/regional/test_runtime_component_identity.py` (an unreachable API is not asked whether the Pod went away).
 
 ## 3. Detailed Module Design
 
