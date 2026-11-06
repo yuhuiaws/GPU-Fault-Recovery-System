@@ -38,6 +38,7 @@ if __package__:
         STORE_DSN_SNIPPET,
         control,
         dataplane,
+        dataplane_context_problem,
         register,
         sync_dataplane_connection_secret,
         validate_alertmanager_drill_route,
@@ -110,6 +111,7 @@ else:
         STORE_DSN_SNIPPET,
         control,
         dataplane,
+        dataplane_context_problem,
         register,
         sync_dataplane_connection_secret,
         validate_alertmanager_drill_route,
@@ -425,6 +427,19 @@ def log(message: str) -> None:
     print(f"[{stamp}] {message}", flush=True)
 
 
+def first_api_pod() -> str:
+    """The api-ha Pod the seeding and audit programs run in."""
+
+    return control(
+        "get",
+        "pod",
+        "-l",
+        "app=gpu-fault-api-ha",
+        "-o",
+        "jsonpath={.items[0].metadata.name}",
+    ).strip()
+
+
 def seed_integrated_agents(
     *,
     run_id: str,
@@ -433,14 +448,7 @@ def seed_integrated_agents(
     lease_seconds: int,
     agent_identity: dict[str, object] | None,
 ) -> dict:
-    pod = control(
-        "get",
-        "pod",
-        "-l",
-        "app=gpu-fault-api-ha",
-        "-o",
-        "jsonpath={.items[0].metadata.name}",
-    ).strip()
+    pod = first_api_pod()
     environment = [
         f"ACTION_RUN_ID={run_id}",
         f"ACTION_CLUSTERS={clusters}",
@@ -475,14 +483,7 @@ def refresh_integrated_agents(
     workflows_per_cluster: int,
     lease_seconds: int,
 ) -> dict:
-    pod = control(
-        "get",
-        "pod",
-        "-l",
-        "app=gpu-fault-api-ha",
-        "-o",
-        "jsonpath={.items[0].metadata.name}",
-    ).strip()
+    pod = first_api_pod()
     output = control(
         "exec",
         "-i",
@@ -626,35 +627,29 @@ def wait_for_executor_pods(clusters: int, timeout_seconds: int = 600) -> None:
     raise RuntimeError("integrated executor pods did not become Running")
 
 
+SPOOL_SWITCH = "import os; print(os.environ.get('GPU_FAULT_TELEMETRY_SPOOL','false'))"
+
+
+def running_pods(app: str) -> list[str]:
+    selector = ("-l", f"app={app}", "--field-selector=status.phase=Running")
+    names = "jsonpath={.items[*].metadata.name}"
+    return control("get", "pod", *selector, "-o", names).split()
+
+
+def spool_switches(pods: list[str]) -> dict[str, str]:
+    """``GPU_FAULT_TELEMETRY_SPOOL`` as each Pod's own process reads it."""
+
+    return {
+        pod: control("exec", pod, "--", "python3", "-c", SPOOL_SWITCH).strip().lower()
+        for pod in pods
+    }
+
+
 def control_spool_mode(expected: str) -> dict:
-    pods = control(
-        "get",
-        "pod",
-        "-l",
-        "app=gpu-fault-api-ha",
-        "--field-selector=status.phase=Running",
-        "-o",
-        "jsonpath={.items[*].metadata.name}",
-    ).split()
+    pods = running_pods("gpu-fault-api-ha")
     if not pods:
         raise RuntimeError("no Running ingress Pods for spool-mode check")
-    values = {}
-    for pod in pods:
-        values[pod] = (
-            control(
-                "exec",
-                pod,
-                "--",
-                "python3",
-                "-c",
-                (
-                    "import os; print("
-                    "os.environ.get('GPU_FAULT_TELEMETRY_SPOOL','false'))"
-                ),
-            )
-            .strip()
-            .lower()
-        )
+    values = spool_switches(pods)
     replicas = int(
         control(
             "get",
@@ -665,32 +660,8 @@ def control_spool_mode(expected: str) -> dict:
         ).strip()
         or 0
     )
-    spool_pods = control(
-        "get",
-        "pod",
-        "-l",
-        "app=gpu-fault-telemetry-spool-worker",
-        "--field-selector=status.phase=Running",
-        "-o",
-        "jsonpath={.items[*].metadata.name}",
-    ).split()
-    spool_values = {}
-    for pod in spool_pods:
-        spool_values[pod] = (
-            control(
-                "exec",
-                pod,
-                "--",
-                "python3",
-                "-c",
-                (
-                    "import os; print("
-                    "os.environ.get('GPU_FAULT_TELEMETRY_SPOOL','false'))"
-                ),
-            )
-            .strip()
-            .lower()
-        )
+    spool_pods = running_pods("gpu-fault-telemetry-spool-worker")
+    spool_values = spool_switches(spool_pods)
     enabled = all(value in {"1", "true", "yes", "on"} for value in values.values())
     disabled = all(
         value in {"", "0", "false", "no", "off"} for value in values.values()
@@ -713,14 +684,7 @@ def control_spool_mode(expected: str) -> dict:
 
 
 def workflow_audit(run_id: str) -> dict:
-    pod = control(
-        "get",
-        "pod",
-        "-l",
-        "app=gpu-fault-api-ha",
-        "-o",
-        "jsonpath={.items[0].metadata.name}",
-    ).strip()
+    pod = first_api_pod()
     script = f"""
 import json, os, psycopg, statistics
 {STORE_DSN_SNIPPET}
@@ -1487,6 +1451,8 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = parser().parse_args()
+    if problem := dataplane_context_problem():
+        parser().error(problem)
     if args.confirm_live_registry != "ALLOW_PERF_CAPACITY_LIVE_REGISTRY":
         parser().error("exact live-registry confirmation is required")
     if args.synthetic_ttl_seconds < args.timeout_seconds + 600:

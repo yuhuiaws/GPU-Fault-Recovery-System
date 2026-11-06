@@ -64,6 +64,7 @@ if TYPE_CHECKING or __package__:
     )
     from .regional_capacity_registry import (
         NAMESPACE,
+        dataplane_context_problem,
         dataplane,
         log,
         register,
@@ -112,6 +113,7 @@ else:
     )
     from regional_capacity_registry import (
         NAMESPACE,
+        dataplane_context_problem,
         dataplane,
         log,
         register,
@@ -620,6 +622,8 @@ def write_run_record(
 def main(argv: list[str] | None = None) -> int:
     options = parser()
     args = options.parse_args(argv)
+    if problem := dataplane_context_problem():
+        options.error(problem)
     try:
         registry_scope = validate_registry_target(
             allow_live_registry=args.allow_live_registry,

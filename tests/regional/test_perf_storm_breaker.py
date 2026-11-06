@@ -38,6 +38,7 @@ from gpu_fault.remediation_storm import storm_admission as admit
 from gpu_fault.store import InMemoryStore
 from gpu_fault.workflow_reconcile import remediation_storm_action
 from scripts.e2e.regional.regional_live_fixture import component_python
+from scripts.perf import regional_capacity_registry as capacity_registry
 from scripts.perf import regional_storm_breaker as storm
 from scripts.perf import regional_storm_breaker_suite as suite
 from scripts.perf import seed_regional_action_workflows as seed
@@ -805,6 +806,7 @@ def test_the_step_refuses_a_plan_it_cannot_run_safely(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr(suite, "validate_registry_target", lambda **_kwargs: "live")
+    monkeypatch.setattr(capacity_registry, "DATAPLANE_CONTEXT", "fake-context")
 
     with pytest.raises(SystemExit):
         suite.main(arguments)
@@ -882,6 +884,7 @@ def orchestration(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleName
             events.append("fleet-exit")
 
     monkeypatch.setattr(suite, "validate_registry_target", lambda **_kwargs: "live")
+    monkeypatch.setattr(capacity_registry, "DATAPLANE_CONTEXT", "fake-context")
     monkeypatch.setattr(suite, "release_identity", lambda: {"release_id": "rel-a"})
     monkeypatch.setattr(suite, "artifact_dir", lambda *_args: tmp_path)
     monkeypatch.setattr(

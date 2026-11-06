@@ -1308,8 +1308,8 @@ def resume_capacity_command(args: argparse.Namespace, scope: str) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = capacity_parser()
     args = parser.parse_args(argv)
-    if not DATAPLANE_CONTEXT:
-        parser.error("GPU_FAULT_DATAPLANE_CONTEXT is required")
+    if problem := capacity_registry.dataplane_context_problem():
+        parser.error(problem)
     if args.command in {"all", "run"} and not AURORA_CLUSTER_ID:
         parser.error(
             "GPU_FAULT_AURORA_CLUSTER_ID is required: the run resolves its Aurora "

@@ -28,6 +28,7 @@ if __package__:
         STORE_DSN_SNIPPET,
         TOKEN_SECRET,
         control,
+        dataplane_context_problem,
         dataplane,
         register,
         validate_registry_target,
@@ -85,6 +86,7 @@ else:
         STORE_DSN_SNIPPET,
         TOKEN_SECRET,
         control,
+        dataplane_context_problem,
         dataplane,
         register,
         validate_registry_target,
@@ -1028,6 +1030,8 @@ def main() -> int:
     parser.add_argument("--synthetic-ttl-seconds", type=int, default=3600)
     add_fleet_argument(parser)
     args = parser.parse_args()
+    if problem := dataplane_context_problem():
+        parser.error(problem)
     if args.synthetic_ttl_seconds < 300:
         parser.error("--synthetic-ttl-seconds must be at least 300")
     if args.scenario_max_seconds < 60:

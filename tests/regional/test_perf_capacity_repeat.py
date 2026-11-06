@@ -204,7 +204,8 @@ class Suite:
     def __init__(self, monkeypatch: pytest.MonkeyPatch, codes: list[int]) -> None:
         self.codes = codes
         self.calls: list[dict[str, Any]] = []
-        monkeypatch.setattr(capacity, "DATAPLANE_CONTEXT", "fake-context")
+        for module in (capacity, capacity.capacity_registry):
+            monkeypatch.setattr(module, "DATAPLANE_CONTEXT", "fake-context")
         monkeypatch.setattr(capacity, "AURORA_CLUSTER_ID", "aurora-a")
         monkeypatch.setattr(
             capacity, "validate_registry_target", lambda **_kwargs: "isolated"

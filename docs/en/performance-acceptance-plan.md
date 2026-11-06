@@ -863,9 +863,11 @@ occupancy sample fails as well -- on the current release none of the three limit
 ≤ 2 per cluster (every workflow of the model claims all three resource classes); the raw-capacity and integrated
 workflow thresholds are unchanged.
 
-Every entry point must name the target kubeconfig/context explicitly: only `regional_capacity_suite.py` refuses an
-empty `GPU_FAULT_DATAPLANE_CONTEXT`, `GPU_FAULT_CONTROL_KUBECONFIG` defaults to `/tmp/gpu-fault-control-plane.kubeconfig`,
-and the other runners use kubectl's current context when the context is empty. Production registry tokens and Secrets
+Every entry point must name the target kubeconfig/context explicitly: every runner (burst, action, correlated, integrated
+and the storm breaker step) refuses an empty `GPU_FAULT_DATAPLANE_CONTEXT` with a usage error (exit 2) before any kubectl
+or AWS call (`regional_capacity_registry.dataplane_context_problem`), and the data-plane kubectl client itself refuses an
+empty context, so it never falls back to kubectl's current context. `GPU_FAULT_CONTROL_KUBECONFIG` defaults to
+`/tmp/gpu-fault-control-plane.kubeconfig`. Production registry tokens and Secrets
 must not be written into artifacts: `registry-baseline.json` keeps every field of the production registrations except
 the plaintext token, recorded only as `token_sha256`, and `registry-secret-baseline.json` holds only the digest and the
 serialized shape.

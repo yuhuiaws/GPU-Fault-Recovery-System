@@ -25,6 +25,7 @@ if TYPE_CHECKING or __package__:
     )
     from .regional_capacity_registry import (
         STORE_DSN_SNIPPET,
+        dataplane_context_problem,
         dataplane_identity,
         validate_registry_target,
     )
@@ -88,6 +89,7 @@ else:
     )
     from regional_capacity_registry import (
         STORE_DSN_SNIPPET,
+        dataplane_context_problem,
         dataplane_identity,
         validate_registry_target,
     )
@@ -1237,6 +1239,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--synthetic-ttl-seconds", type=int, default=3600)
     add_fleet_argument(parser)
     args = parser.parse_args(argv)
+    if problem := dataplane_context_problem():
+        parser.error(problem)
     if args.synthetic_ttl_seconds < 300:
         parser.error("--synthetic-ttl-seconds must be at least 300")
     if args.synthetic_ttl_seconds < args.timeout_seconds + 600:

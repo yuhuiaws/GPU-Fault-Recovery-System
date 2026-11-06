@@ -162,7 +162,8 @@ class CapacityWire:
         for module in (capacity, action, registry):
             monkeypatch.setattr(module, "dataplane", self.dataplane)
             monkeypatch.setattr(module, "control", self.control)
-        monkeypatch.setattr(capacity, "DATAPLANE_CONTEXT", "fake-context")
+        for module in (capacity, registry):
+            monkeypatch.setattr(module, "DATAPLANE_CONTEXT", "fake-context")
         monkeypatch.setattr(registry, "validate_notification_safety", lambda: None)
         monkeypatch.setattr(
             registry,

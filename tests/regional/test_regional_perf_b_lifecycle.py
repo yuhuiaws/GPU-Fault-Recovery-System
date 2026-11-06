@@ -303,6 +303,8 @@ def caller(
         pytest.fail("unmocked external command")
 
     monkeypatch.setattr(registry, "run", forbidden)
+    # Every runner refuses to start without a named data-plane context.
+    monkeypatch.setattr(registry, "DATAPLANE_CONTEXT", "fake-context")
     # A round naming no Aurora cluster records no placement or Aurora reading.
     monkeypatch.delenv("GPU_FAULT_AURORA_CLUSTER_ID", raising=False)
     monkeypatch.setattr(base, "dataplane", harness.api)

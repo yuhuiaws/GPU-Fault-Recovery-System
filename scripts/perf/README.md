@@ -190,6 +190,11 @@ scripts/perf/regional_integrated_workflow_capacity_suite.py \
   --confirm-live-registry ALLOW_PERF_CAPACITY_LIVE_REGISTRY
 ```
 
+Every runner refuses to start without `GPU_FAULT_DATAPLANE_CONTEXT` (exit 2,
+before any kubectl or AWS call): an empty `--context` would make kubectl use
+its current context, so the load, executors and token Secret could land in
+any cluster.
+
 It targets the live CPU ingress/worker/Aurora path. Synthetic cluster identity,
 Agent records and the executor isolate GPU mutations; reset and reboot commands
 sleep for configured representative durations and return simulated results.

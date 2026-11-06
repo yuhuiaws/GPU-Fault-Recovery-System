@@ -60,6 +60,13 @@ CONTROL_KUBECONFIG = os.getenv(
     "/tmp/gpu-fault-control-plane.kubeconfig",
 )
 DATAPLANE_CONTEXT = os.getenv("GPU_FAULT_DATAPLANE_CONTEXT", "")
+# Every runner creates its load, executors and token Secret in the data-plane
+# context it names; with an empty one kubectl would use its current context,
+# whichever cluster that is.
+DATAPLANE_CONTEXT_REQUIRED = (
+    "GPU_FAULT_DATAPLANE_CONTEXT is required: with an empty context kubectl "
+    "uses its current context, which may be any cluster"
+)
 AWS_REGION = os.getenv("GPU_FAULT_PERF_AWS_REGION", "us-west-2")
 
 # Scripts exec'd inside a control-plane Pod that open psycopg themselves must
@@ -184,12 +191,20 @@ def control(
     return result.stdout.decode()
 
 
+def dataplane_context_problem() -> str | None:
+    """Why no runner may start (``parser.error``), or None."""
+
+    return None if DATAPLANE_CONTEXT else DATAPLANE_CONTEXT_REQUIRED
+
+
 def dataplane(
     *args: str,
     stdin: bytes | None = None,
     check: bool = True,
     timeout: int = 300,
 ) -> str:
+    if not DATAPLANE_CONTEXT:
+        raise RuntimeError(DATAPLANE_CONTEXT_REQUIRED)
     result = run(
         [
             "kubectl",
@@ -241,6 +256,8 @@ def dataplane_identity(
     check: bool = True,
     timeout: int = 300,
 ) -> str:
+    if not DATAPLANE_CONTEXT:
+        raise RuntimeError(DATAPLANE_CONTEXT_REQUIRED)
     result = run(
         [
             "kubectl",
