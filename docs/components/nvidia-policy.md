@@ -8,8 +8,7 @@
 - XLSX SHA-256：
   `7f70ce9684be0c9d98a367770341ccc1d8bca4465cebe42dab7e23d57df5d5a5`
 - 生成物 canonical SHA-256：
-  `ffb82509abb574577db3c5d759cec94df40ea25edaf4691e7bd4ba0a12ba0462`
-- 获取和生成日期：2026-07-20
+  `ffb82509abb574577db3c5d759cec94df40ea25edaf4691e7bd4ba0a12ba0462`（即生成物 `metadata.generatedSha256`）
 
 生成物
 `src/gpu_fault/data/nvidia-xid-catalog-610.generated.yaml`
@@ -18,7 +17,7 @@
 重新生成：
 
 ```bash
-python tools/generate_nvidia_xid_policy.py \
+PYTHONPATH=src python tools/generate_nvidia_xid_policy.py \
   Xid-Catalog.xlsx \
   src/gpu_fault/data/nvidia-xid-catalog-610.generated.yaml \
   --catalog-version 610 \
@@ -27,7 +26,7 @@ python tools/generate_nvidia_xid_policy.py \
 ```
 
 摘要不匹配时生成过程直接失败，禁止静默接受上游变化。
-`--expected-sha256` 即使省略也默认使用上述固定 XLSX 摘要。
+`--expected-sha256` 即使省略也默认使用上述固定 XLSX 摘要；输出路径省略时写到上面的生成物。
 整数单元格拒绝布尔值，不能把 `TRUE`/`FALSE` 当成 XID 编号；整数、整值浮点和整数文本
 保留原规范化行为。只读工作簿在成功及解析失败后都会关闭，避免重复生成时累积文件句柄。
 
@@ -38,8 +37,8 @@ PYTHONPATH=src python tools/generate_nvidia_xid_policy.py --check
 ```
 
 该门禁检查 canonical 格式、上游摘要、172/95/32 条数和
-`metadata.generatedSha256`。运行时 loader 会重新计算生成物摘要；
-`mapping_version` 使用生成物摘要前 16 位，因此手改规则会直接加载失败，
+`metadata.generatedSha256`（`--generated-policy` 可指定别的生成物）。运行时 loader 会重新计算生成物摘要；
+`mapping_version` 为 `nvidia-xid-catalog-610/sha256:<生成物摘要前 16 位>`，因此手改规则会直接加载失败，
 或在显式更新摘要后触发部署 pin 不匹配。
 
 上游 XLSX 不进入源码树。重新生成前应把已校验文件存入
@@ -80,7 +79,7 @@ NVIDIA 的规则（原文）：
 配对的 exporter（go-dcgm 的 `v1.4701.*` 绑定存在，没有 exporter release 使用它）。与 DCGM 4.6.0 配对的
 `4.6.0-4.8.3-distroless` 不带 `/etc/ld.so.cache`，启动时对 `libdcgm.so.4` 的检查随即以 "exit status 1" 退出，除非容器运行时的
 NVIDIA hook 写入一个（github.com/NVIDIA/dcgm-exporter issue #612，由 4.8.4 的 PR #724 修复）。自 4.8.2 起 NVIDIA 只发布
-distroless 变体。各集群的配对（普通 EKS host 模式为受支持的配对；HyperPod 的引擎由 AMI 决定，现网 Agent 心跳报告 4.7.0，比 4.6.1
+distroless 变体。各集群的配对（普通 EKS host 模式为受支持的配对；HyperPod 的引擎由 AMI 决定，Agent 心跳报告的 HyperPod AMI 引擎 4.7.0 比 4.6.1
 客户端新，违反连接要求，产品没有补救手段，在 NVIDIA 发布基于 DCGM 4.7.0 或更新版本的 exporter 之前只提示）、只提示不拒绝的理由与升级
 步骤见[部署和运维手册](../部署和运维手册.md) §6.5「DCGM exporter 版本与主机 hostengine 配对」。
 
@@ -124,7 +123,9 @@ curl -sL -H "Authorization: Bearer ${token}" "${registry}/blobs/${config}" \
   fail-closed 动作，当前仅允许 `QUARANTINE`。
 - `source`：`NVIDIA_CATALOG`、`NVIDIA_XID_154`、
   `NVIDIA_FABRIC_MANAGER` 或 `SITE_SAFETY`。
-- `disposition`：可执行、只监控、缺证据阻塞、缺 workflow 阻塞或不适用。
+- `disposition`：等待关联（`PENDING_CORRELATION`）、可执行（`EXECUTABLE`）、只监控（`MONITOR_ONLY`）、缺 workflow 阻塞
+  （`BLOCKED_WORKFLOW`）、缺证据阻塞（`BLOCKED_MISSING_EVIDENCE`）、不适用（`NOT_APPLICABLE`）或站点安全（`SITE_SAFETY`）；
+  后四种且没有执行动作时 `safety_action=QUARANTINE`。
 
 只有下列直接映射自动进入恢复计划：
 
@@ -138,7 +139,10 @@ curl -sL -H "Authorization: Bearer ${token}" "${registry}/blobs/${config}" \
 在 `hyperpod-eks` 和 `hyperpod-slurm` runtime profile 中，
 `RESTART_VM` 表示 reboot 当前 HyperPod 节点，runtime compiler 保留
 `official_action=RESTART_VM`，设置 `effective_action=REBOOT_NODE`，并由
-`BatchRebootClusterNodes` 执行。该映射不表示 EC2 stop/start；stop/start 和
+`BatchRebootClusterNodes` 执行；`eks`（普通 EKS，`eks-managed`）profile 同样设为 `REBOOT_NODE`，
+由 EC2 `RebootInstances` 重启 Node providerID 绑定的实例（`node_provider.restart_vm_effective_action`）；
+`kubernetes` profile 不映射，保持引擎的 BLOCKED 判定。该映射只用于 XID（XID 151），SXID 11004/12028 的
+`RESTART_VM` 不改写。该映射不表示 EC2 stop/start；stop/start 和
 节点 replacement 的宿主机放置、本地存储及身份语义仍是独立动作。
 
 `CONTACT_SUPPORT`、`CHECK_MECHANICALS`、`UPDATE_SWFW` 不会被粗略替换成另一个
@@ -180,7 +184,7 @@ GB300 属于 GB200 列。
   `DRAIN_AND_RESET`。
 - XID 94/95：分别保存 application/all-applications containment；XID 95 在 reset
   前要求停止受影响工作负载。
-- XID 154：驱动报告动作优先。Catalog 的 `Xid 154 linkage` 描述联动上报版本，不是原始 Xid 的最低支持版本；旧驱动或缺少版本信息不因此阻止 Xid 48/63/79/94/95 等原始规则。NVLink5 的 R575 位格式边界和必需解码证据仍保留。DCGM 字段 1523 以状态的形式持有同一个值（batch 233）：取值 1-4 按同标签的 XID 154 判定，XID 154 负责该 GPU 的恢复时只作证据（见下文「依据（Evidence）：DCGM 字段审计补入的规则」）。
+- XID 154：驱动报告动作优先。Catalog 的 `Xid 154 linkage` 描述联动上报版本，不是原始 Xid 的最低支持版本；旧驱动或缺少版本信息不因此阻止 Xid 48/63/79/94/95 等原始规则。NVLink5 的 R575 位格式边界和必需解码证据仍保留。DCGM 字段 1523 以状态的形式持有同一个值：取值 1-4 按同标签的 XID 154 判定，XID 154 负责该 GPU 的恢复时只作证据（见下文「依据（Evidence）：DCGM 字段审计补入的规则」）。
 - `DRAIN_P2P`：禁止调度、停止关联任务、quiesce、确认无 GPU 客户端后，由独立 `RECOVER_DRAIN_P2P` operation 检查目标 GPU 的 persistence 已关闭并重读 GPU Recovery Action。`None` 不 reset；`Reset`、`Drain and Reset`、仍为 `Drain P2P` 时复用既有受保护的 GPU reset；任一目标要求 `Reboot` 时不先 reset 其他目标，转节点重启。未知动作、缺失/重复 GPU、persistence 未释放等不授权 reset/reboot，交人工处理。独立 operation 让旧 Agent 拒绝不认识的请求，不能静默退化为 `STOP_WORKLOADS` 或无条件 reset。
 - XID 159 `CHECK_UVM`：显式确认使用 UVM/vGPU 时 reset，否则 ignore；缺少证据阻塞。
 - XID 144-150：按驱动 R575 边界选择 V1/V2 `IntrInfo` pattern，同时匹配
@@ -249,12 +253,12 @@ incident 的 `policy_reference` 就是上面排障指南的 URL；站点需要 c
 等比复位更新的 GPU 指标批次重判；清除即成功，仍置位即按既有路径失败；上限为执行器单步上限。
 `RECOVER_DRAIN_P2P`（可能 `reset_skipped`）、`REMEDIATE_DRIVER`、`UPDATE_SOFTWARE_FIRMWARE`、
 `REPLACE_NODE` 不计为应用修复。实现 `src/gpu_fault/adapters/pending_repair_rejudge.py`，引文由
-`tests/execution/test_validation_pending_repair_after_reset.py` 钉住；该缺口为读代码发现的潜在缺口，
-未在真机出现（详见 [详细设计](../详细设计.md) DCGM 诊断一节）。
+`tests/execution/test_validation_pending_repair_after_reset.py` 钉住；该情形未在真机出现，行为由单元测试覆盖
+（详见 [详细设计](../详细设计.md) DCGM 诊断一节）。
 
-### 依据（Evidence）：DCGM 字段审计补入的规则（batch 233）
+### 依据（Evidence）：DCGM 字段审计补入的规则
 
-下列页面均于 2026-11-01 重新抓取核对；NVML 与 NVIDIA GPU Memory Error Management 为 docs version 615（页面 "Last updated on Sep
+下列页面均已重新抓取核对；NVML 与 NVIDIA GPU Memory Error Management 为 docs version 615（页面 "Last updated on Sep
 09, 2026"），DCGM 页面为 "Version: 4.6 (Latest)"，DCGM 源码为 v4.7.0 标签。完整引文与决定见详细设计 §2.4.1「DCGM 字段审计补入的
 字段」；每条引文由 `tests/test_dcgm_gap_field_evidence.py` 钉住。
 
@@ -308,9 +312,9 @@ closed（NVIDIA 对 6 和 7 只记载一行枚举含义，且产品的 GPU 复�
 的公式（只有没有链路读数时为 8/min）；correctable 错误上限取该公式与 DCGM PCIe 诊断上限中较低者。Blackwell（B200/B300）的行为依据
 NVIDIA 文档做了单元测试，未经现网验证（没有 B 系列硬件）。
 
-### 依据（Evidence）：HGX B200/B300 的 DCGM 规则（batch 235）
+### 依据（Evidence）：HGX B200/B300 的 DCGM 规则
 
-下列页面均为 batch 235 重新抓取核对：NVML API Reference 与 NVIDIA GPU Memory Error Management 为 docs version 615，DCGM
+下列页面均已重新抓取核对：NVML API Reference 与 NVIDIA GPU Memory Error Management 为 docs version 615，DCGM
 页面为 "Version: 4.6 (Latest)"，DCGM 源码为 v4.7.0 标签，Fabric Manager User Guide 为 "Last updated on Oct 07, 2026"，
 nvidia-smi 文档为 v610 时期页面，fabric-health 的位值取自 NVIDIA 的 `nvidia-ml-py` 13.615.71。完整引文与决定见详细设计
 §2.4.1「HGX B200/B300 DCGM 字段」；每条引文由 `tests/test_blackwell_dcgm_evidence.py` 钉住。
@@ -369,12 +373,15 @@ SXID 恢复依据 Fabric Manager User Guide：
   `expected_gpu_count`）：新鲜的 inventory snapshot（一次 nvidia-smi 枚举）列出的 GPU
   少于其声明数时不算；没有新鲜 snapshot 时，事件前后窗口内的最新逐 GPU 指标行只有恰好覆盖
   节点最新 snapshot 声明的数量才算——这些行不是同一次投递，事件早于最新投递时窗口里留下的
-  正是停止刷新的行（R16 的判定行 `pcie_link_downtrain` 在 collector 重启后的空闲 GPU 上
-  停在最后一次投递）；可信端口拓扑为 SXID 端口给出的 GPU 也不算。不完整时事件不带
-  participating GPU，走既有的证据冻结、cordon、quarantine 与运维审核路径（batch 244）。
-- always-fatal（Table 23 钉死的 20 码）：执行 `REBOOT_NODE`，事前 cordon 并停止任务；
-  事件声明 Always-Fatal 但不在表内时阻塞。
+  正是停止刷新的行（例如 collector 重启后空闲 GPU 上的 `pcie_link_downtrain` 判定行停在
+  最后一次投递）；可信端口拓扑为 SXID 端口给出的 GPU 也不算。不完整时事件不带
+  participating GPU，走既有的证据冻结、cordon、quarantine 与运维审核路径。
+- always-fatal（Table 23 钉死的 20 码）：执行 `REBOOT_NODE`，事前 cordon 并停止任务，不需要 fabric_partition
+  或 GPU inventory；不在钉死表内的码声明 Always-Fatal 或 Fatal 时一律阻塞（`BLOCKED_MISSING_EVIDENCE`），不凭
+  客户端给出的分级授权任何破坏性恢复。
+- `RESTART_VM`（11004、12028，Shared NVSwitch/vGPU 场景）：裸金属没有 guest VM 生命周期，`BLOCKED_WORKFLOW`
+  + `safety_action=QUARANTINE`；`CHECK_MECHANICALS`（20012）：`ESCALATE_OPERATOR`，通知并等待人工确认。
 - B200/B300：传统 fatal/non-fatal SXID 不适用，要求 DCGM/NVSDM telemetry。
 
-SXID 的 `classification_source` 必须是 `NVIDIA_FABRIC_MANAGER`，否则因证据来源
-不可信而阻塞。
+SXID 的 `classification_source` 必须是 `NVIDIA_FABRIC_MANAGER`（或 `NVIDIA_FABRIC_MANAGER_CATALOG`、
+`NVIDIA_FABRIC_MANAGER_RUNTIME`），否则因证据来源不可信而阻塞；事件观察到的 fatal/non-fatal 与钉死表冲突时同样阻塞。

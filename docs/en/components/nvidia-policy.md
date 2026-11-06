@@ -10,8 +10,7 @@ English edition of `docs/components/nvidia-policy.md`; the Chinese file remains 
 - XLSX SHA-256:
   `7f70ce9684be0c9d98a367770341ccc1d8bca4465cebe42dab7e23d57df5d5a5`
 - Generated artifact canonical SHA-256:
-  `ffb82509abb574577db3c5d759cec94df40ea25edaf4691e7bd4ba0a12ba0462`
-- Fetch and generation date: 2026-07-20
+  `ffb82509abb574577db3c5d759cec94df40ea25edaf4691e7bd4ba0a12ba0462` (the artifact's `metadata.generatedSha256`)
 
 The generated artifact
 `src/gpu_fault/data/nvidia-xid-catalog-610.generated.yaml`
@@ -20,7 +19,7 @@ contains 172 XID entries, 95 XID 144-150 decode entries and 32 Resolution Bucket
 Regenerate:
 
 ```bash
-python tools/generate_nvidia_xid_policy.py \
+PYTHONPATH=src python tools/generate_nvidia_xid_policy.py \
   Xid-Catalog.xlsx \
   src/gpu_fault/data/nvidia-xid-catalog-610.generated.yaml \
   --catalog-version 610 \
@@ -29,7 +28,8 @@ python tools/generate_nvidia_xid_policy.py \
 ```
 
 When the digest does not match, generation fails outright; silently accepting an upstream change is forbidden.
-Even when `--expected-sha256` is omitted, it defaults to the pinned XLSX digest above.
+Even when `--expected-sha256` is omitted, it defaults to the pinned XLSX digest above; an omitted output path writes the
+generated artifact above.
 Integer cells reject boolean values, so `TRUE`/`FALSE` cannot be taken as an XID number; integers, integral floats and integer text
 keep the original normalisation behaviour. The read-only workbook is closed both after success and after a parse failure, so repeated generation does not accumulate file handles.
 
@@ -40,8 +40,8 @@ PYTHONPATH=src python tools/generate_nvidia_xid_policy.py --check
 ```
 
 This gate checks the canonical format, the upstream digest, the 172/95/32 counts and
-`metadata.generatedSha256`. The runtime loader recomputes the digest of the generated artifact;
-`mapping_version` uses the first 16 characters of the generated artifact's digest, so a hand-edited rule fails to load outright,
+`metadata.generatedSha256` (`--generated-policy` points it at another artifact). The runtime loader recomputes the digest of the generated artifact;
+`mapping_version` is `nvidia-xid-catalog-610/sha256:<first 16 characters of the generated artifact's digest>`, so a hand-edited rule fails to load outright,
 or, after the digest is explicitly updated, triggers a deployment pin mismatch.
 
 The upstream XLSX does not enter the source tree. Before regenerating, store the verified file under
@@ -84,7 +84,7 @@ Why this release: it is the newest exporter release; DCGM 4.7.0 packages are pub
 start-up check for `libdcgm.so.4` then exits with "exit status 1" unless the container runtime's NVIDIA hook writes one
 (github.com/NVIDIA/dcgm-exporter issue #612, fixed by PR #724 in 4.8.4). Since 4.8.2 NVIDIA publishes the distroless variant
 only. The pairing per cluster (plain EKS host mode is a supported pair; the HyperPod engine is the AMI's, whose version the AMI
-decides, 4.7.0 as the live Agent heartbeats report, newer than the 4.6.1 client, the connection requirement broken with no product
+decides, 4.7.0 as the Agent heartbeats report for the HyperPod AMI's engine, newer than the 4.6.1 client, the connection requirement broken with no product
 remedy, advised about until NVIDIA publishes an exporter on DCGM 4.7.0 or later), why the product advises rather than refuses,
 and the upgrade steps are in the [Deployment and Operations Manual](../deployment-and-operations-manual.md) §6.5, "DCGM
 exporter version and the host hostengine pairing".
@@ -130,7 +130,10 @@ The policy results are stored separately:
   incomplete; currently only `QUARANTINE` is allowed.
 - `source`: `NVIDIA_CATALOG`, `NVIDIA_XID_154`,
   `NVIDIA_FABRIC_MANAGER` or `SITE_SAFETY`.
-- `disposition`: executable, monitor only, blocked on missing evidence, blocked on missing workflow, or not applicable.
+- `disposition`: pending correlation (`PENDING_CORRELATION`), executable (`EXECUTABLE`), monitor only (`MONITOR_ONLY`),
+  blocked on missing workflow (`BLOCKED_WORKFLOW`), blocked on missing evidence (`BLOCKED_MISSING_EVIDENCE`), not applicable
+  (`NOT_APPLICABLE`) or site safety (`SITE_SAFETY`); the last four without an executable action carry
+  `safety_action=QUARANTINE`.
 
 Only the following direct mappings enter a recovery plan automatically:
 
@@ -144,7 +147,10 @@ Only the following direct mappings enter a recovery plan automatically:
 In the `hyperpod-eks` and `hyperpod-slurm` runtime profiles,
 `RESTART_VM` means rebooting the current HyperPod node; the runtime compiler keeps
 `official_action=RESTART_VM`, sets `effective_action=REBOOT_NODE`, and
-`BatchRebootClusterNodes` executes it. This mapping does not mean an EC2 stop/start; the host placement, local storage and identity semantics of stop/start and
+`BatchRebootClusterNodes` executes it; the `eks` (plain EKS, `eks-managed`) profile maps it to `REBOOT_NODE` as well, executed
+by EC2 `RebootInstances` on the instance the Node providerID binds (`node_provider.restart_vm_effective_action`); a
+`kubernetes` profile maps nothing and keeps the engine's BLOCKED verdict. The mapping applies to an XID (XID 151) only; the
+`RESTART_VM` of SXID 11004/12028 is not rewritten. This mapping does not mean an EC2 stop/start; the host placement, local storage and identity semantics of stop/start and
 node replacement remain independent actions.
 
 `CONTACT_SUPPORT`, `CHECK_MECHANICALS` and `UPDATE_SWFW` are not crudely replaced with another
@@ -187,9 +193,19 @@ GB300 belongs to the GB200 column.
   `DRAIN_AND_RESET`.
 - XID 94/95: application/all-applications containment are stored separately; XID 95 requires the affected workload to be stopped before
   the reset.
-- XID 154: the driver-reported action takes precedence and is mapped as-is. DCGM field 1523 holds the same value as a
-  state (batch 233): values 1-4 take the XID 154 decision of the same label, and the value is evidence only while an XID
+- XID 154: the driver-reported action takes precedence and is mapped as-is. The catalog's `Xid 154 linkage` describes the
+  version from which XID 154 is reported alongside, not the original XID's minimum supported version; an old driver or
+  missing version information does not block the original rules of XID 48/63/79/94/95 and the others. The NVLink5 R575
+  bit-format boundary and its required decode evidence remain. DCGM field 1523 holds the same value as a
+  state: values 1-4 take the XID 154 decision of the same label, and the value is evidence only while an XID
   154 owns the GPU's recovery (see "Evidence: the DCGM field audit rules" below).
+- `DRAIN_P2P`: after cordoning, stopping the associated jobs, quiescing and confirming that no GPU client is left, a
+  dedicated `RECOVER_DRAIN_P2P` operation checks that the target GPUs' persistence is off and re-reads the GPU Recovery
+  Action. `None` resets nothing; `Reset`, `Drain and Reset` and a still-`Drain P2P` reuse the existing guarded GPU reset;
+  when any target asks for `Reboot`, no other target is reset first and the node is rebooted. An unknown action, a missing
+  or duplicate GPU, or persistence not released authorises no reset or reboot and goes to an operator. The dedicated
+  operation lets an old Agent refuse a request it does not know, so it can never silently degrade to `STOP_WORKLOADS` or an
+  unconditional reset.
 - XID 159 `CHECK_UVM`: reset when UVM/vGPU use is explicitly confirmed, otherwise ignore; blocked when evidence is missing.
 - XID 144-150: selects the V1/V2 `IntrInfo` pattern by the driver R575 boundary, matching
   Error Status and Action 2 at the same time. The primary action and Action 2 may use different bit patterns and are matched separately;
@@ -258,12 +274,12 @@ newer than that completion is no verdict on the reset GPU: `VALIDATE_GPU` keeps 
 than the reset re-judges it; cleared succeeds, still set fails on the existing path; the bound is the executor's per-step
 cap. `RECOVER_DRAIN_P2P` (it can succeed with `reset_skipped`), `REMEDIATE_DRIVER`, `UPDATE_SOFTWARE_FIRMWARE` and
 `REPLACE_NODE` do not count as applying the repair. Implementation `src/gpu_fault/adapters/pending_repair_rejudge.py`; the
-quotes are pinned by `tests/execution/test_validation_pending_repair_after_reset.py`. The gap was latent, found by code
-reading and never seen live (see the DCGM diagnostics section of [Detailed Design](../detailed-design.md)).
+quotes are pinned by `tests/execution/test_validation_pending_repair_after_reset.py`. The case has not occurred on real
+hardware; unit tests cover the behaviour (see the DCGM diagnostics section of [Detailed Design](../detailed-design.md)).
 
-### Evidence: the DCGM field audit rules (batch 233)
+### Evidence: the DCGM field audit rules
 
-Every page below was re-fetched on 2026-11-01; NVML and NVIDIA GPU Memory Error Management are docs version 615 (pages
+Every page below was re-fetched and checked; NVML and NVIDIA GPU Memory Error Management are docs version 615 (pages
 "Last updated on Sep 09, 2026"), the DCGM pages "Version: 4.6 (Latest)", the DCGM source tag v4.7.0. The full quotes and the
 decisions are in the detailed design §2.4.1, "The DCGM field audit's fields"; each quote is pinned by
 `tests/test_dcgm_gap_field_evidence.py`.
@@ -321,9 +337,9 @@ link (8/min only without a link reading); the correctable-error limit is the low
 diagnostic limit. Blackwell (B200/B300) behaviour is unit-tested from NVIDIA documentation, not live-verified (no B-series
 hardware).
 
-### Evidence: the HGX B200/B300 DCGM rules (batch 235)
+### Evidence: the HGX B200/B300 DCGM rules
 
-The pages below were re-fetched for batch 235: NVML API Reference and NVIDIA GPU Memory Error Management docs version 615,
+The pages below were re-fetched and checked: NVML API Reference and NVIDIA GPU Memory Error Management docs version 615,
 the DCGM pages "Version: 4.6 (Latest)", the DCGM source tag v4.7.0, the Fabric Manager User Guide "Last updated on Oct 07,
 2026", the nvidia-smi documentation of the v610 era, and NVIDIA's `nvidia-ml-py` 13.615.71 for the fabric-health bit
 values. The full quotes and the decisions are in the detailed design §2.4.1, "HGX B200/B300 DCGM fields"; each quote is
@@ -385,13 +401,18 @@ SXID recovery follows the Fabric Manager User Guide:
   nvidia-smi enumeration) that lists fewer GPUs than it declares is not; without a fresh snapshot, the latest per-GPU
   metric rows around the event count only when they cover exactly the count the node's latest snapshot declares --
   they are no single delivery, and for an event older than the newest deliveries the window keeps exactly the rows
-  that stopped refreshing (R16's verdict row `pcie_link_downtrain` stays at its last delivery on an idle GPU after a
-  collector restart); the GPU a trusted port topology names for the SXID's port is not either. An incomplete inventory
+  that stopped refreshing (for example the `pcie_link_downtrain` verdict row of an idle GPU stays at its last delivery
+  after a collector restart); the GPU a trusted port topology names for the SXID's port is not either. An incomplete inventory
   leaves the event without participating GPUs and takes the existing evidence, cordon, quarantine and operator-review
-  path (batch 244).
-- always-fatal (the 20 codes pinned by Table 23): executes `REBOOT_NODE`, cordoning and stopping the job beforehand;
-  an event that declares Always-Fatal but is not in the table blocks.
+  path.
+- always-fatal (the 20 codes pinned by Table 23): executes `REBOOT_NODE`, cordoning and stopping the job beforehand, and
+  needs neither fabric_partition nor a GPU inventory; a code outside the pinned tables that declares Always-Fatal or Fatal
+  always blocks (`BLOCKED_MISSING_EVIDENCE`): a client-supplied severity never authorises a destructive recovery.
+- `RESTART_VM` (11004, 12028, the Shared NVSwitch/vGPU case): bare metal has no guest VM lifecycle, so `BLOCKED_WORKFLOW`
+  + `safety_action=QUARANTINE`; `CHECK_MECHANICALS` (20012): `ESCALATE_OPERATOR`, notify and wait for an operator's
+  acknowledgement.
 - B200/B300: the traditional fatal/non-fatal SXIDs do not apply; DCGM/NVSDM telemetry is required.
 
-The SXID `classification_source` must be `NVIDIA_FABRIC_MANAGER`; otherwise it blocks because the evidence source
-is untrusted.
+The SXID `classification_source` must be `NVIDIA_FABRIC_MANAGER` (or `NVIDIA_FABRIC_MANAGER_CATALOG`,
+`NVIDIA_FABRIC_MANAGER_RUNTIME`); otherwise it blocks because the evidence source is untrusted, and so does a
+fatal/non-fatal observed on the event that conflicts with the pinned table.
