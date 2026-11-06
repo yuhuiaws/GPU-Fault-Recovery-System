@@ -2,8 +2,7 @@
 
 ## 结论与范围
 
-核对基线：`59ab780472a0b0aa032c897e415301cad94eb6d4` 加当前 worktree
-未提交修改。范围是[总表](../故障类别与处置动作总表.md)第一部分的 **32 行**，
+核对对象是当前代码。范围是[总表](../故障类别与处置动作总表.md)第一部分的 **32 行**，
 不是 32 个底层错误码，也不是所有组合故障的穷举。
 
 **并非全部 32 类建议均已完成。** 第一批修复 Host/EFA 观测有效性、主机诊断绑定与
@@ -14,7 +13,7 @@
 本文件给每行一份独立端到端验收规格，统一注册为 `GF-GENERAL-E2E-001..032`。
 它们是 **manual / NOT_RUN**，不是 32 个已经运行通过的自动化测试。
 需要整改才能满足的目标另列“整改验收缺口”；验证现有行为通过，不能关闭该缺口。
-案例和需求矩阵均保留这些缺口。历史区域案例的 PASS 不代表当前 worktree 通过。
+案例和需求矩阵均保留这些缺口。历史区域案例的 PASS 不代表当前代码通过。
 
 新增[32 类自动化软件注入入口](general-fault-injection-runner.md)。运行器区分连续
 主场景和分段检查，不能把自动化 PASS 替代本文件仍未执行的完整真机验收。
@@ -35,10 +34,10 @@
 | 001 | CPU 过载 | 部分 | GF-HOST-003 只到计划；新增 GF-GENERAL-SW-001 执行真实验证；应用阶段关联仍缺 |
 | 002 | 内存/交换耗尽 | 部分 | GF-HOST-OBS-001 验证 swap；GF-GENERAL-SW-001 扩展 memory；cgroup/任务归因仍缺 |
 | 003 | 低利用率/资源持续异常 (`SITE_HOST_RESOURCE_HEALTH`) | 部分 | 持续窗口、attempt 归属与诊断绑定有本地测试；应用阶段与 MIG 归因仍缺 |
-| 004 | 本地磁盘满 | 部分 | GF-HOST-001 只测策略；新增 GF-GENERAL-SW-002 执行隔离；inode 耗尽已按同一 98% 规则判定（`filesystem_inodes_used_percent`，SW-002 `inode` 变体执行真实隔离）；只读、挂载消失、EIO 与任务盘区分仍缺 |
+| 004 | 本地磁盘满 | 部分 | GF-HOST-001 只测策略；新增 GF-GENERAL-SW-002 执行隔离；inode 耗尽已按同一 98% 规则判定（`filesystem_inodes_used_percent`，SW-002 `inode` 变体执行真实隔离）；只读、挂载消失与 statvfs 其他错误（含 EIO）报 `filesystem_unavailable`（READ_ONLY / MOUNT_MISSING / PROBE_FAILED，只做 VALIDATE_HOST 诊断，不隔离、不 reset/reboot）；系统盘与任务盘区分仍缺 |
 | 005 | 共享存储不可用/满 | 部分 | 有 statvfs 超时与策略测试；新诊断绑定；跨节点故障域记录已有控制面实现与软件测试（`SHARED_STORAGE_FAILURE_DOMAIN`）；真实读写与故障域真机验收仍缺 |
 | 006 | 磁盘 IO 饱和 | 部分 | 有持续窗口与限时采集测试；新诊断绑定；与 checkpoint 关联仍缺 |
-| 007 | SMART 失败 | 部分 | GF-HOST-004 原为 API 到计划；新增 SW-002/003 分别执行隔离与拒绝误隔离；scan 失败、盘无法打开、单盘超时为 UNKNOWN（`smart_query_failed` + collection error，SW-003 `smart-scan`），工具缺失/无盘/无结论为 NOT_SUPPORTED（`smart_status_unsupported`）；真机回放夹具仍缺 |
+| 007 | SMART 失败 | 部分 | GF-HOST-004 原为 API 到计划；新增 SW-002/003 分别执行隔离与拒绝误隔离；scan 失败、盘无法打开、单盘超时为 UNKNOWN（`smart_query_failed` + collection error，SW-003 `smart-scan`），工具缺失/无盘/无结论为 NOT_SUPPORTED（`smart_status_unsupported`）；真机回放由 GF-GENERAL-LIVE-007 的宿主来源回放规定（`scripts/e2e/regional/general_live_source_replay.py`），仍为 NOT_RUN |
 | 008 | 网卡链路 down | 部分 | 新增 SW-002/003 覆盖接口消失/down/unknown；接口角色、bond 等场景仍缺 |
 | 009 | 网卡错误/丢包 | 部分 | 错误/丢包持续窗口有本地测试；新诊断绑定；`statistics` 计数器回退为 UNKNOWN（本轮不发该指标，不再夹成 0 清掉信号）；错误率与业务关联仍缺 |
 | 010 | EFA/RDMA 计数错误 | 部分 | GF-HOST-002 只测策略；新诊断绑定；`ethtool -S` 差值只来自真实读数（失败/重置为 UNKNOWN，缺失计数器为 `efa_ethtool_counters_unsupported`，不再报 0）；sysfs 端口计数器回退同样为 UNKNOWN（本轮不发 `rdma_errors_delta`，collection error 点名端口与计数器，基线重建）；按驱动/计数器语义分级仍缺 |
@@ -128,20 +127,25 @@ GPU/rank CPU ≤5% 持续 300 秒、可用内存 ≤5% 持续 60 秒、page cach
 本地盘满。对测试专用挂载的 statvfs 回放 99% 使用率，经采集到实际 Kubernetes
 隔离 patch，检查 cordon、NoSchedule taint、incident QUARANTINED；当前契约不停止
 现有任务。97% 不触发该临界规则；重复投递不能重复建链，provider taint 必须保留。
-测试 inode 耗尽另记缺口，不把字节剩余当作 inode 健康。清理测试盘并验证后解隔离。
-整改缺口：节点系统盘与任务 scratch 区分、inode/只读检测。软件实现见 SW-002。
+inode 耗尽按同一 98% 规则作为该挂载的独立信号判定，字节剩余不能掩盖 inode 耗尽
+（SW-002 `inode` 变体）。只读、挂载消失或 statvfs 其他错误报 `filesystem_unavailable`
+（READ_ONLY / MOUNT_MISSING / PROBE_FAILED），只执行 VALIDATE_HOST 诊断，挂载恢复且信号清除后
+验证通过，不隔离、不 reset/reboot。清理测试盘并验证后解隔离。
+整改缺口：节点系统盘与任务 scratch 区分。软件实现见 SW-002。
 
 ### GF-GENERAL-E2E-005
 
 共享存储。用独立 NFS/Lustre 测试挂载分别制造 statvfs 超时、98% 容量和正常响应，
 验证采集有界且其他指标仍送达，随后实际执行目标挂载的 VALIDATE_HOST。
 另一正常挂载不能覆盖故障挂载；缺失新样本应等待，不得确认恢复。
-增加“statvfs 正常但读写/fsync 失败”与“挂载消失”变体作为整改验收：产品自批次176起对每个共享挂载在
+增加“statvfs 正常但读写/fsync 失败”与“挂载消失”变体作为整改验收：产品对每个共享挂载在
 statvfs 之外做一次有界只读目录项读取（`IO_ERROR` 带 errno、超时 `IO_TIMEOUT` 按缺证据记不可用），并记住
-节点级共享挂载、消失后报 `MOUNT_MISSING`（记忆跨 collector 重启）；真机证明仍待独立测试 export。
+节点级共享挂载、消失后报 `MOUNT_MISSING`（记忆跨 collector 重启）；该读取只读、不在客户文件系统上
+创建、写入或 fsync 文件，因此读路径仍正常、只有写/fsync 失败的 export 不在其检测范围内；
+真机证明仍待独立测试 export。
 恢复服务器/挂载，读写探针和相关任务进度均通过后结束。
-整改缺口：均已由产品关闭——真实有界 I/O 探针与消失挂载记忆由采集器实现（批次176：statvfs 之外的有界只读目录项读取、
-节点级共享挂载消失的跨重启记忆，样本带 `source`/`fstype` 标签供聚合）；共享存储故障域聚合已由控制面实现（批次177：≥2 节点在 600 s 内报同一
+整改缺口：读路径与挂载消失已由产品关闭——有界只读 I/O 探针与消失挂载记忆由采集器实现（statvfs 之外的有界只读目录项读取、
+节点级共享挂载消失的跨重启记忆，样本带 `source`/`fstype` 标签供聚合），只写/fsync 失败的检测仍缺；共享存储故障域聚合已由控制面实现（≥2 节点在 600 s 内报同一
 export 不可用时另记一条集群级 `SHARED_STORAGE_FAILURE_DOMAIN` incident 并只发一封通知，节点链不变；
 依赖采集器样本标签 `source`/`server`+`export` 给出 export 标识，见
 [真机验收 GF-GENERAL-LIVE-005](general-fault-live-acceptance.md#gf-general-live-005)），真机执行仍待证明。
@@ -159,9 +163,12 @@ export 不可用时另记一条集群级 `SHARED_STORAGE_FAILURE_DOMAIN` inciden
 SMART。经真实 JSON parser 回放 `smart_status.passed=false`，执行隔离并保留证据；
 再分别回放查询非零退出、损坏 JSON、`--scan-open` 失败、健康磁盘。
 查询失败不能生成 `smart_health_failed`；应可重试并表明 UNKNOWN，而不是健康零。
-现有 scan 失败处理仍有缺口，必须单独记录，不让 per-device 测试替它背书。
+`--scan-open` 失败（非零退出、超时或 smartctl 退出 0 前打印的 `# scan_smart_devices:` 行）
+为 `SCAN_FAILED`，扫描无法打开的盘为 `OPEN_FAILED`，单盘 `-H` 挂起或非布尔结论为 `QUERY_FAILED`，
+均为 `smart_query_failed` 加 collection error（SW-003 `smart-scan`）；scan 失败须单独运行，
+不让 per-device 测试替它背书。
 清理命令 fixture，不实际损坏介质。真实设备坏盘/RMA 结果不在软件证明范围。
-软件实现见 SW-002/003，整改缺口包括 scan 失败及分设备影响级别。
+软件实现见 SW-002/003，整改缺口为分设备影响级别。
 
 ### GF-GENERAL-E2E-008
 
@@ -206,7 +213,10 @@ GPU 掉卡。固定节点真实期望 GPU 数，从完整 UUID 查询 8 卡基�
 新 boot ID、完整 GPU/Host/Fabric 验证与恢复任务。超时、查询失败、错配期望数、
 瞬时恢复必须分别跑，不能把“命令没有返回”当真实丢卡证明。
 可复用 COLLECT-003/004 的部分夹具，不能用清单只读检查代表 reboot 执行。
-整改缺口：查询失败分类和更充分的失卡交叉证据。清理期望数与测试任务。
+查询失败已分类：NVML 失败且 `/proc/driver/nvidia/gpus` 缺失或不可读为 `INVENTORY_UNAVAILABLE`，
+不计数、不推进连续确认；配置的期望数与机型自身 GPU 数及驱动绑定数矛盾时只记配置 finding
+（`gpu_expected_count_contradicted`，取证并人工复核，不 reboot）。
+整改缺口：其余场景更充分的失卡交叉证据。清理期望数与测试任务。
 
 ### GF-GENERAL-E2E-013
 
