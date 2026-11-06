@@ -19,8 +19,8 @@ A simulated event is not the same as a real hardware fault. Reports must disting
 | `component` | Deterministic tests of a real policy, Collector, Store or adapter |
 | `integration` | Multi-module tests of API, workflow, adapter or the durable Store |
 | `end-to-end` | A closed loop from event input to decision, workflow, notification or Agent barrier |
-| `staging` | Controlled acceptance in an isolated HyperPod test cluster |
-| `live` | Manual or explicit command acceptance in a real HyperPod environment |
+| `staging` | Controlled acceptance in an isolated HyperPod or plain EKS (`eks-managed`) test cluster |
+| `live` | Manual or explicit command acceptance in a real HyperPod or plain EKS environment |
 
 Full acceptance of the split deployment of the regional CPU control plane and the GPU data plane is in
 [Regional E2E Acceptance Test Cases](regional-e2e-acceptance-test-cases.md). `GF-REGIONAL-*`
@@ -64,7 +64,7 @@ The node lifecycle supports only the following production paths:
 | Risk | Action | Constraints |
 |---|---|---|
 | `destructive` | The Node Agent performs a GPU/fabric reset | Must quiesce, have no GPU clients, be signed, fenced and validated after the action |
-| `destructive-provider-reboot` | HyperPod reboot of the original node | `NodeRecovery=None`, secondary cluster confirmation and provider idempotency |
+| `destructive-provider-reboot` | Reboot of the original node: HyperPod `BatchRebootClusterNodes`, plain EKS EC2 `RebootInstances` on the bound instance | HyperPod `NodeRecovery=None` (plain EKS: the node group's EKS node auto repair off), secondary cluster confirmation and provider idempotency |
 | `destructive-warm-spare` | `HEALTHY_WARM_SPARE_ONLY` local switch | Uses only managed healthy spares; the faulty instance stays in existence and isolated |
 
 `destructive-provider-replace` is neither a legal risk nor an executable test path.
@@ -74,7 +74,7 @@ warm spares are insufficient it must fail and alert, never fall back to provider
 Every real-hardware test must:
 
 - state the target Region, context, cluster ID, nodes and maintenance window explicitly;
-- confirm HyperPod `NodeRecovery=None`;
+- confirm HyperPod `NodeRecovery=None`, and that plain EKS node groups have EKS node auto repair off;
 - record the current release, Runtime Profile, required/compatible pins and node Agent generation;
 - use isolated nodes or a controlled training job, with stop conditions and rollback defined in advance;
 - write the raw report to `artifacts/fault/`, a CI artifact or the private evidence store;
@@ -124,7 +124,10 @@ Non-destructive pytest uses the `local-test: shared` lock by default and clears
 `GPU_FAULT_STORE_URL` and `GPU_FAULT_TEST_POSTGRES_URL` in the child process so that environment variables on the
 admin machine cannot make a local case connect to the live database by mistake. command and manual cases use the global
 exclusive lock by default; only a command that explicitly declares `execution.parallel_safe=true` in the catalog and lists
-its resource locks may run in parallel.
+its resource locks may run in parallel. `execution` may also declare `depends_on` (the cases it depends on; when a selected
+dependency fails the case is recorded `BLOCKED`) and `failure_scope` (`case`, `branch` or `global`, default `branch`; a
+command/manual case without `execution` counts as `global`: once it FAILs every case not yet started is recorded
+`BLOCKED`).
 
 CAP-005 uses a random temporary database but still shares the CPU, I/O, connections, WAL and lock manager of the same
 PostgreSQL/Aurora server, so it declares:
@@ -133,6 +136,7 @@ PostgreSQL/Aurora server, so it declares:
 execution:
   parallel_safe: true
   environment: inherit
+  failure_scope: branch
   locks:
   - {resource: postgres-server, mode: exclusive}
   - {resource: cap005-workdir, mode: exclusive}
@@ -168,11 +172,13 @@ python3.12 tools/run_fault_test_cases.py \
 
 ## 4. Reports and Evidence
 
-The runner starts a separate process for every pytest or command case, and any failure makes the final process return
-non-zero. Every result contains:
+The runner starts a separate process for every pytest or command case (`--batch-pytest` runs a compatible pytest
+selection in one pytest process and still reports per case; `--pytest-results` reuses the per-node results
+`tools/pytest_case_reporter.py` wrote, which is what CI's `make fault-test-cases-ci` does), and any `FAIL` or `BLOCKED` case
+makes the final process return non-zero. Every result contains:
 
 - case ID, level, risk, problem, injection method and expectation;
-- `PASS`, `FAIL` or `NOT_RUN`;
+- `PASS`, `FAIL`, `BLOCKED` (not run after a failed dependency or a global failure) or `NOT_RUN`;
 - the pytest node ID or command, duration and raw output;
 - the `processing_trace` produced by cases that require a trace.
 - the queued/start/completed times, lock wait, worker, resource locks and environment mode in `scheduling`.
@@ -186,8 +192,8 @@ The report-level verdicts are:
 |---|---|
 | `PASS` | All selected cases executed and passed |
 | `PASS_WITH_LIMITATIONS` | The executed cases passed, but the report contains `NOT_RUN` |
-| `FAIL` | At least one executed case failed |
-| `NOT_RUN` | No case actually executed |
+| `FAIL` | At least one case is `FAIL` or `BLOCKED` |
+| `NOT_RUN` | No case passed (and none is `FAIL`/`BLOCKED`) |
 
 A case that requires a processing trace is judged `FAIL` when it outputs no valid structure, even if the pytest exit code
 is 0.
@@ -273,7 +279,12 @@ The current public catalog covers:
 - SXID, DCGM, GPU inventory, host, EFA/RDMA, training progress and log Collectors;
 - training terminal, allocation, restart budget, idempotency and the attempt generation fence;
 - regional boot guards, authentication, remote command, HA, capacity, notifications and least privilege;
-- manual destructive acceptance such as reset, reboot and warm spare.
+- manual destructive acceptance such as reset, reboot and warm spare;
+- the end-to-end specifications of the 32 general fault categories (`GF-GENERAL-E2E-*`), their software tests
+  (`GF-GENERAL-SW-*`, `GF-GENERAL-FIX-*`) and live acceptance (`GF-GENERAL-LIVE-*`), and the live acceptance of GPU
+  temperature, power and throttling (`GF-ENV-LIVE-*`); the software tests are pytest cases, the rest are manual, and
+  the live ones are run by their own runners and approvals (`scripts/e2e/regional/run_general_live.py`,
+  `scripts/e2e/regional/run_env_live.py`).
 
 The order of authority is:
 
@@ -296,8 +307,8 @@ STATE_DIR="${GPU_FAULT_STATE_DIR:?set GPU_FAULT_STATE_DIR}"
 gpu-fault-admin status --full --state-dir "${STATE_DIR}"
 ```
 
-`verify` must confirm that the Profile is registered, has no warnings, and agrees with the CPU side, Collector, Watcher,
-Installer and node Agent. Real-hardware reports are written to `artifacts/fault/` or the private evidence store and do
+The `status --full` checks must confirm that the Profile is registered, has no warnings, and agrees with the CPU side,
+Collector, Watcher, Installer and node Agent. Real-hardware reports are written to `artifacts/fault/` or the private evidence store and do
 not modify source files outside the public catalog.
 
 ### 7.1 kmsg Format Replay
@@ -561,10 +572,15 @@ python3.12 scripts/e2e/hyperpod/run_hyperpod_xid74_case.py \
   --job-id <gpu-fault.io/job-id> \
   --node <kubernetes-node-name> \
   --pci-bdf <0000:bb:dd> \
+  --context <kube context of the target cluster> \
+  --confirm-context <the same context> \
+  --live-run \
   --report "artifacts/fault/<case>-$(date -u +%Y%m%dT%H%M%SZ).json"
 ```
 
-Support-flow cases must pass `--allow-support` explicitly and `--require-email-sent` when delivery is required; cases that
+`--context` pins every kubectl call to the target cluster (`--kubeconfig` names a kubeconfig), `--confirm-context` must
+repeat it exactly and `--live-run` acknowledges that the case changes a live cluster; without any of them the case
+refuses to run. Support-flow cases must pass `--allow-support` explicitly and `--require-email-sent` when delivery is required; cases that
 may execute a real GPU reset must pass `--allow-reset`.
 
 Monitoring cases must not create a workflow or change Pod UIDs, the attempt, taints or GPU annotations. Reset cases must
@@ -578,7 +594,7 @@ This chapter lists, by the layer at which a signal enters the system, every inje
 today. It answers "how does this case manufacture the fault"; it neither replaces the per-case procedures of Chapter 7 nor
 changes the safety boundaries of Chapter 2. Code references cite only files and symbols, never line numbers.
 
-### 8.1 Six Kinds of Injection
+### 8.1 Seven Kinds of Injection
 
 | Kind | Method | Signals covered |
 |---|---|---|
@@ -588,15 +604,19 @@ changes the safety boundaries of Chapter 2. Code references cite only files and 
 | Break infrastructure and network | iptables blocking 443, deleting or rolling Pods, cordon eviction, Aurora failover, secret rotation, changing Deployment environment variables | Control-plane high availability, executor protocol, timeout and recovery paths |
 | Seed state in the database | Register `synthetic` clusters and write remote commands, stuck workflows and expired evidence rows directly | dispatcher, command protocol, cleanup and reconciliation logic, with no real node |
 | Notification drills and in-process simulation | Mail with `drill_id`; fake DCGM endpoint, fake EFA counter directory and in-memory kmsg lines inside an isolated process | Notification delivery path, collector parsing logic, zero side effects |
+| Replay raw readings on a real node (live-replay) | Replace only one raw reading a product collector reads: DCGM exporter fields, procfs/sysfs files or trees, `smartctl`/`ipmitool`/`ethtool`/`nvidia-smi` output, kernel or journal records, a CRI Pod log, a flight recorder dump; bounded, reversible, restored by a deadman | The live-replay variants of GF-GENERAL-LIVE and GF-ENV-LIVE: collection, grading, orchestration and recovery are all the product's own; they prove the processing chain, never a physical fault |
 
 The conclusion of Section 7.8 stands: none of the above can make GPU hardware or the driver genuinely produce a specified
-XID.
+XID. The approvals, windows and verdicts of every GF-GENERAL-LIVE and GF-ENV-LIVE fixture are in
+[general fault live acceptance](../components/general-fault-live-acceptance.md) and
+[GPU environment live acceptance](../components/gpu-environment-live-acceptance.md).
 
 ### 8.2 Common Preconditions
 
 All node-level injections enter the host through the privileged Pod (privileged, hostPID, hostNetwork, hostPath root)
-created by `scripts/e2e/regional/host_probe_fixture.py::HostProbeFixture`, chroot into the venv of the node's current
-signed slot and run the probe subcommand. Every injection that changes node state first schedules a recovery timer with
+created by `scripts/e2e/regional/host_probe_fixture.py::HostProbeFixture`, chroot and run the probe subcommand with the
+venv of the node Agent's current signed slot (`/opt/gpu-fault/current/venv/bin/python`; a node without the Agent falls
+back to the system `python3`, the probe scripts being stdlib-only). Every injection that changes node state first schedules a recovery timer with
 `systemd-run` and only then applies the change; Manifest-style injections must first label the target node with
 `gpu-fault.io/e2e-target-a=true` or `-b=true`, see
 `scripts/e2e/regional/manifests/fault-injection/README.md`.
@@ -653,6 +673,8 @@ event is created."
 | Write user-space annotated lines | A monitor-only XID 63, or a deliberately malformed Xid line missing its code | As above, kind limited to `xid63` and `unparsed-xid` | NET-001, COLLECT-018, NET-008 | `scripts/e2e/regional/probes/net001_node_probe.py::write_kmsg`, `scripts/e2e/regional/probes/collector_window_probe.py::write_kmsg` |
 | Manifest privileged Pod writes kmsg or the FM log | Single- or two-node XID combinations, cross faults inside and outside the time window, SXID 10003 | busybox `printf > /host-dev-kmsg`; hostPath CharDevice or File | Manual COLLECT, GF-CROSS-FAULT, dual-node, the GF-LIVE-XID74 series | The `scripts/e2e/regional/manifests/fault-injection/` directory, `scripts/e2e/hyperpod/run_hyperpod_xid74_case.py` |
 | Append an SXID line to the Fabric Manager log | A `nvidia-nvswitchN: SXid (PCI:..): <sxid>, Fatal/Non-fatal` record | Append write plus fsync; SXID allowlist | COLLECT-005/011/013/014/015 | `scripts/e2e/regional/probes/collector_node_probe.py::append_sxid` |
+| Replay kernel-source records through the product's readers | A trusted `_TRANSPORT=kernel` record read by the node log collector (a non-kernel transport stays untrusted), or an XID/SXID record in `/dev/kmsg` syntax read by the kernel collector | Journal mode: a `/run` drop-in puts a pass-through `journalctl` wrapper first on the PATH of `gpu-fault-log-collector.service` only, which after `arm` appends the reviewed JSON lines after the real output; kmsg mode: a drop-in points the kernel collector's `GPU_FAULT_KMSG_PATH` at a reviewed file under `/run` and `arm` appends the records; the real `/dev/kmsg` is never written, a `systemd-run` deadman restores | GF-GENERAL-LIVE-016, 032 | `scripts/e2e/regional/probes/general_live_kernel_source_probe.py` |
+| Give the node log collector one reviewed CRI Pod log | OOM, NCCL and torch.distributed error text of a managed attempt, with the real Pod UID and container name | A `/run` drop-in makes `GPU_FAULT_TRAINING_LOG_PATHS` of `gpu-fault-log-collector.service` match only this run's fixture file and runtime-enables the unit; the fixture file lives in the real log directory kubelet made for the runner's own Pod | GF-GENERAL-LIVE-017 | `scripts/e2e/regional/probes/general_live_applog_probe.py` |
 
 ### 8.4 Node Hardware and Configuration Layer
 
@@ -660,7 +682,7 @@ event is created."
 |---|---|---|---|---|
 | Lower the GPU power cap and run at full load | Real power violation combined with high utilization | `nvidia-smi -pl` plus `dcgmproftester`, restored on a timer | COLLECT-002 | `scripts/e2e/regional/probes/collector_node_probe.py::throttle_gpu` |
 | Unbind the EFA driver | `efa_inventory_mismatch` with failure_mode `DRIVER_UNBOUND` | Write `/sys/bus/pci/drivers/efa/unbind`, rebind on a timer | COLLECT-017, DESTR-021 | `scripts/e2e/regional/probes/collector_node_probe.py::unbind_efa` |
-| Tamper with the collector's expected GPU count | On a type in the instance table the control plane grades it as a configuration contradiction: WARNING `gpu_expected_count_contradicted`, evidence only, no reboot (GF-GENERAL-LIVE-012 `expectation_wrong`); only a type outside the table still goes `gpu_inventory_mismatch` → reboot | Change `/etc/gpu-fault/collector.env` to the current value plus one, restored on a timer (COLLECT-004 no longer uses this path; old override journals are still cleaned up by their protocol) | GF-GENERAL-LIVE-012 `expectation_wrong` | `scripts/e2e/regional/probes/collector_node_probe.py::override_expected_gpu_count` |
+| Tamper with the collector's expected GPU count | On a type in the instance table the control plane grades it as a configuration contradiction: WARNING `gpu_expected_count_contradicted`, evidence only, no reboot; only a type outside the table still goes `gpu_inventory_mismatch` → reboot | Change `/etc/gpu-fault/collector.env` to the current value plus one, restored on a timer (no runner takes this path any more: COLLECT-004 uses the next row, GF-GENERAL-LIVE-012 `expectation_wrong` the env mode of the host-collector source replay; old override journals are still cleaned up by their protocol) | (none) | `scripts/e2e/regional/probes/collector_node_probe.py::override_expected_gpu_count` |
 | One real UUID fewer in the isolated collector instance's `nvidia-smi` listing | `gpu_inventory_mismatch` (expected = configured, observed = expected-1), genuinely reaching REBOOT_NODE on a type in the table; the production collector, its configuration and the node's listing are untouched | The probe's `DroppedUuidListing` as the isolated `HostTelemetryCollector`'s runner drops the same real UUID row on both ticks (the GF-GENERAL-LIVE-012 `drop_row` idiom); refused when the real listing lacks the configured number of UUIDs | COLLECT-004 | `scripts/e2e/regional/probes/collector_node_probe.py::sample_gpu_inventory` |
 | Shadow `nvidia-smi` | Collection timeout, or one GPU missing from the first inventory | A systemd drop-in puts the shadow script first on PATH | COLLECT-019, COLLECT-020 | `scripts/e2e/regional/probes/collector_window_probe.py::open_window` |
 | Collector environment window | 403 from a wrong cluster token, or a missing expected GPU count | EnvironmentFile or UnsetEnvironment in a systemd drop-in, deadman timer closes the window | COLLECT-018/019/020, NET-008 | As above |
@@ -670,6 +692,16 @@ event is created."
 | Disable the Node Agent or kubelet | The Agent stops registering, the node goes NotReady, the hot spare becomes unavailable | Arm the recovery timer first, then `systemctl disable` or `stop` | DESTR-008, DESTR-014, DESTR-019 | `scripts/e2e/regional/probes/warm_spare_node_probe.py::stop_with_failsafe`, `scripts/e2e/regional/probes/destr014_node_probe.py::disable_agent_restart`, `scripts/e2e/regional/probes/destr019_node_probe.py::restart_agent` |
 | Real quiesce and restore cycle | Stop fabricmanager, dcgm, persistenced and kubelet, then restore | Call the Node Agent's quiesce manager; or run `systemctl stop` in a chroot from a Manifest and restore on a timer | PREEMPT-012, the dual-node quiesce Manifest | `scripts/e2e/regional/probes/preempt012_node_probe.py`, `DEFAULT_QUIESCE_SERVICES` in `src/gpu_fault/node_agent/common.py` |
 | Real low-utilization training load | The `LOW_GPU_UTILIZATION` sustained rule (`LOW_CPU_UTILIZATION` stays silent) | Submit a CPU-only burn PyTorchJob that holds all 8 GPUs of each node and creates no CUDA context | NOTIFY-005 | `scripts/e2e/regional/notify005_checks.py::low_utilization_manifest` |
+| Replay the host collector's raw readings | Variants of the CPU, memory, NIC and EFA counter, PCI/InfiniBand tree, `/proc/driver/nvidia`, SMART, BMC, `ethtool` and `nvidia-smi` readings | Only inside the mount namespace of `gpu-fault-host-collector.service`: `BindReadOnlyPaths=` over an allow-listed file (bind) or a whole directory (tree, the real tree copied with reviewed mutations), a pass-through command wrapper that rewrites only allow-listed fields (command, `tools/host_command_replay.py`), a file or tool made unopenable (inaccessible), and for that unit only an expected-GPU-count override (env, 012 `expectation_wrong`) or a fixture PCI tree (pci-root, 013); a `/run` drop-in plus a deadman restores | GF-GENERAL-LIVE-001/002/007/008/009/010/011/012/013/015/032 | `scripts/e2e/regional/probes/general_live_source_probe.py`, `scripts/e2e/regional/probes/general_live_source_builders.py` |
+| Replay DCGM exporter fields and the GPU inventory reading | Memory ECC/remap, NVLink counters, fabric state, PCIe, composites, field-structure gaps and GPU identity changes | A loopback replay tool on the node (`tools/gpu_dcgm_field_replay.py` with its per-category profiles; `tools/gpu_environment_replay.py` for the thermal/power parts) and a `/run` drop-in pointing the single metrics collector at it; the inventory variants add a pass-through `nvidia-smi` wrapper (`tools/nvidia_smi_inventory_replay.py`); a deadman restores | GF-GENERAL-LIVE-019/020/021/022/024/025/026 | `scripts/e2e/regional/probes/general_live_dcgm_probe.py`, `scripts/e2e/regional/general_live_gpu_replay.py` |
+| Replay temperature, power and throttle readings | GPU and memory temperature, power limit, thermal violation time, Power Brake and other DCGM readings | The loopback proxy `tools/gpu_environment_replay.py` passes the real exporter through (`127.0.0.1:9400` → `127.0.0.1:9411`) and injects only after `arm`; the deadman is armed first, then a `/run` drop-in points `gpu-fault-metrics-collector.service` at the proxy | GF-ENV-LIVE-001..012 | `scripts/e2e/regional/probes/env_replay_proxy.py`, `scripts/e2e/regional/run_env_live.py` |
+| Bounded host load and producer pauses | CPU saturation, memory pressure, page cache, low utilisation; collector silence; a DCGM collection gap | Only transient systemd units named after the run digest and bounded by `RuntimeMaxSec` (CPU burners, a reader of a sparse file filling the page cache, a capped memory allocator); a SIGSTOP of every process of one allow-listed collector unit (a `/run` drop-in stops a restarted main process too) or of the node's DCGM exporter process, resumed by a deadman; a runtime enable of the node log collector behind an approval | GF-GENERAL-LIVE-001/002/003/025/031 | `scripts/e2e/regional/probes/general_live_node_probe.py`, `scripts/e2e/regional/probes/general_live_node_pause.py` |
+| Test file systems and block devices | Capacity and inode exhaustion, read-only, a vanished mount, statvfs errors, IO saturation and latency | A loop file system or a loop + device-mapper device mounted under `/mnt/gfrs-live/<digest>/`, a bounded O_DIRECT writer unit, the `probe_error` fault mapping; recorded before created, undone by a deadman | GF-GENERAL-LIVE-004, 006 | `scripts/e2e/regional/probes/general_live_storage_probe.py` |
+| Test NFS exports | Shared-storage timeouts, full, vanished mounts, a cross-node failure domain | A userspace NFSv4 server Pod (memory-backed emptyDir) serves the export; the node mounts it `soft` under `/mnt/gfrs-live/<digest>/` in PID 1's mount namespace, a deadman unmounts | GF-GENERAL-LIVE-005 | `scripts/e2e/regional/shared_export_fixture.py`, `scripts/e2e/regional/probes/general_live_shared_probe.py` |
+| Test network interfaces | A required interface down or missing, an unknown state, error and drop deltas, TCP-only loss, counter resets | Only `gfrs<digest><slot>` test interfaces (a drop generator on a veth pair, a `dummy` interface, a netns peer with `tc netem` loss), declared required to the collector by a collector window; an interface with a routable address or a real device is always refused | GF-GENERAL-LIVE-008, 009 | `scripts/e2e/regional/probes/general_live_net_probe.py` |
+| EFA driver rebind failure | The bind failure and the post-repair validation failure of `REMEDIATE_EFA_DRIVER` | Before one allow-listed EFA function is unbound its `driver_override` is set to a driver name no module provides, so the kernel refuses to bind it to `efa` again; a deadman restores | GF-GENERAL-LIVE-013 | `scripts/e2e/regional/probes/general_live_efa_probe.py` |
+| Freeze a device plugin | `gpu_device_plugin_unresponsive`/`efa_device_plugin_unresponsive` (invisible to kubelet itself) | A SIGSTOP of the plugin container's own process: the socket stays open, the Pod stays Running, allocatable unchanged; a deadman sends SIGCONT | GF-GENERAL-LIVE-014 | `scripts/e2e/regional/probes/general_live_device_plugin_probe.py` |
+| Temporary test packages | None (only makes a variant's tool or kernel module usable: `tc`/`sch_netem`, `smartmontools`, `dosfstools`) | Only the reviewed packages and their closures, previewed with `--assumeno` first; what this run installed is removed afterwards | GF-GENERAL-LIVE-004, 007, 009 | `scripts/e2e/regional/probes/general_live_deps_probe.py` |
 
 ### 8.5 Control-Plane API Layer
 
@@ -680,6 +712,7 @@ event is created."
 | Distributed XID batch | A multi-node XID batch with `synthetic=true` | Direct POST to `/v1/gpu-events/xid/distributed` | The case of Section 7.7.2 | `src/gpu_fault/app/routes/gpu_events.py::evaluate_distributed_xids` |
 | Synthetic node-replacement finding | A CRITICAL `REPLACE_NODE` that drives a hot-spare switch | POST `/v1/admin/test/node-replacement`, requires the switch and the execution token | DESTR-003, DESTR-008 | `src/gpu_fault/app/routes/collector_events.py::inject_test_node_replacement`, `scripts/e2e/regional/warm_spare_fixture.py::WarmSpareLiveFixture.post_synthetic_replacement`, `scripts/e2e/regional/synthetic_replacement_route.py` |
 | Submit an event with an illegal field | Enqueued successfully but rejected by the processor, producing a rejected event | Deliver a payload with an unknown field through the real sink inside the node venv | COLLECT-018 | `scripts/e2e/regional/probes/collector_window_probe.py::post_rejected_event` |
+| Redeliver the product's own recorded terminal | The same TerminalEvent arriving a second time | In an API Pod, under the product's interpreter, the stored TerminalEvent of a test attempt is handed to `CompletionService.handle_terminal` (the entry of the `/v1/attempts/terminal` route) | GF-GENERAL-LIVE-028 (`old_terminal`), 029 (`duplicate_event`) | `scripts/e2e/regional/general_live_terminal_replay.py` |
 
 ### 8.6 Kubernetes and Network Layer
 
@@ -692,6 +725,8 @@ event is created."
 | Delete or roll control-plane and executor Pods | Process-level failover and takeover | `kubectl delete pod`, `rollout restart`, `scale` | HA-001/004/005/006/010 | `scripts/e2e/regional/run_ha001_control_plane_failover.py` and sibling runners |
 | cordon plus PDB eviction | Topology and availability constraint verification | Cordon a CPU node, then call the Eviction API | HA-002 | `scripts/e2e/regional/run_ha002_pdb_topology.py` |
 | Deployment environment variable window | Compress workflow lifetimes, lower validation counts, turn off the dispatcher, single-variable mutation | `kubectl set env`, with a compiled-in variable allowlist and a required confirmation string | DESTR-014/018, PREEMPT-037, BOOT-001..010 | `ALLOWED_VARIABLES` in `scripts/e2e/regional/executor_env_window.py`, `scripts/e2e/regional/control_plane_env_window.py`, `scripts/e2e/regional/boot_guard/mutate.py` |
+| Host-level network isolation | The completion watcher's POSTs to the control plane fail at once; the executor cannot push to the Node Agent | Tagged `REJECT --reject-with tcp-reset` rules: FORWARD from the watcher Pod's IP to the control-plane endpoint, or INPUT to the Agent's listening port on a GPU node; the intent is recorded and the deadman armed before the rules go in | GF-GENERAL-LIVE-028 (`api_unreachable`), 011 (`unreachable_node`) | `scripts/e2e/regional/probes/general_live_isolation_probe.py` |
+| Managed test jobs | A critical container's non-zero exit, stop or hang; training progress NaN, stall or a silent reporter; a two-node NCCL stall | Disposable jobs submitted through `ManagedWorkloadFixture`: every replica of the failing job runs the variant's exit/stop/hang command; the progress job runs a `gpu-fault-collector training-progress` sidecar in the training Pod over the progress file the test application writes; the NCCL job's rank 0 stops on the runner's pause file, so every rank blocks in the next all-reduce | GF-GENERAL-LIVE-011, 027, 028, 029 | `scripts/e2e/regional/general_live_fail_job.py`, `scripts/e2e/regional/general_live_progress.py`, `scripts/e2e/regional/general_live_nccl_job.py` |
 
 ### 8.7 Cloud Service and Data Layer
 
@@ -708,6 +743,7 @@ event is created."
 |---|---|---|---|---|
 | drill notification | A real mail with the `[DRILL:..]` marker that triggers no action | Built with the email builder and sent through real SES | NOTIFY-001/002/007 | `scripts/e2e/regional/probes/notification_drill.py::build_notification`, `scripts/e2e/regional/probes/notify007_delivery_drill.py` |
 | In-process synthetic signals | Fake DCGM metrics endpoint, fake EFA counter directory, in-memory kmsg lines | A local HTTP server and temporary directories fed to the deployed collector, then delivered to an isolated control plane | Section 7.1 and the hyperpod E2E | `scripts/e2e/hyperpod/run_hyperpod_dcgm_metrics_e2e.py`, `scripts/e2e/hyperpod/run_hyperpod_efa_traffic_e2e.py`, `scripts/e2e/hyperpod/run_hyperpod_three_source_fault_e2e.py` |
+| Flight recorder responder inside the managed job | Flight recorder dumps shaped by the variant: progress that advances, an operation left pending, enqueue without completion, a rank one collective behind, a withheld second dump | The two-node NCCL stall job runs with `TORCH_NCCL_TRACE_BUFFER_SIZE=0`; the responder owns every rank's FIFO and writes a dump on each `COLLECT_HUNG_TRIAGE` request; the FIFO protocol, namespace mapping and parsing are the product's | GF-GENERAL-LIVE-011 | `scripts/e2e/regional/probes/general_live_fr_responder.py`, `scripts/e2e/regional/general_live_fr_replay.py` |
 
 ### 8.9 Maintenance Rules
 
