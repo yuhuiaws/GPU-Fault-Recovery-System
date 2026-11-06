@@ -215,3 +215,68 @@ def test_the_action_run_writes_the_budget_evidence_beside_its_summary(
     assert summary["remediation_budget_waits"] == waits, (
         "summary.json carries the same wait side"
     )
+
+
+def test_the_budget_is_read_from_every_control_worker_and_must_agree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``kubectl set env`` on one Pod went unnoticed: the runner read the
+    first Running control-worker only."""
+
+    environments = {
+        "worker-a": {"GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE": "1"},
+        "worker-b": {"GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE": "1"},
+    }
+    reads: list[str] = []
+
+    def control(*args: str, **_kwargs: Any) -> str:
+        if args[:2] == ("get", "pod"):
+            return " ".join(environments)
+        assert args[0] == "exec", args
+        reads.append(args[1])
+        return json.dumps(environments[args[1]])
+
+    monkeypatch.setattr(action, "control", control)
+
+    budget = action.live_remediation_budget()
+
+    assert reads == ["worker-a", "worker-b"], "every Running control-worker is read"
+    assert budget["GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE"] == 1, budget
+    assert budget["GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION"] is None, budget
+
+    environments["worker-b"]["GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION"] = "20"
+    with pytest.raises(RuntimeError, match="carry different remediation budgets"):
+        action.live_remediation_budget()
+
+
+def test_run_json_says_whether_the_model_carries_a_failure_domain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Perf plan §8.2/§10: a round may only claim to verify the failure-domain
+    budget when its workflows carry a domain; the seeded action model does not
+    (its steps set no fabric_partition), and run.json now says so."""
+
+    CapacityWire(tmp_path, monkeypatch)
+
+    assert action.main(action_args(tmp_path)) == 0
+
+    record = json.loads((tmp_path / "run.json").read_text())["remediation_budget"]
+    assert record["failure_domain"] == {
+        "assigned": False,
+        "parameter": "fabric_partition",
+        "domains": [],
+    }, record
+
+
+def test_a_failure_domain_is_read_where_the_budget_reads_it() -> None:
+    steps = [
+        SimpleNamespace(parameters={"fabric_partition": "c/n/nvswitch"}),
+        SimpleNamespace(parameters={"fabric_partition": ["c/n/a", "c/n/b"]}),
+        SimpleNamespace(parameters={"failure_domain": "ignored", "run_id": "r"}),
+    ]
+
+    assert budget.failure_domain_record(steps) == {
+        "assigned": True,
+        "parameter": "fabric_partition",
+        "domains": ["c/n/a", "c/n/b", "c/n/nvswitch"],
+    }

@@ -836,9 +836,12 @@ These values are allowed only for the isolated raw-capacity tier and are not pro
 recommendations. The configuration switch must go into the formal release/site configuration and
 complete a rollout; it must not be applied to some Pods temporarily with `kubectl set env`.
 `run.json` must save the five budget tiers, the tested tier and whether workflows were given a
-failure domain (today `run.json` has no field for the latter, and the seed sets no `fabric_partition`). The runner reads
-the five budget tiers from the environment of one Running control-worker Pod (that Pod only: a `kubectl set env` on some
-Pods goes unnoticed) and classifies the run on the Region, per-cluster and per-resource-class rows of the table above:
+failure domain: `run.json.remediation_budget.failure_domain` is read off the steps the seed builds (`assigned`, the
+parameter read, `fabric_partition`, and the `domains`; the current seed sets no `fabric_partition`, so it records
+`assigned: false`, and such a round cannot claim to have verified the failure-domain budget). The runner reads the five
+budget tiers from the environment of every Running control-worker Pod, refuses to run before registration when they
+differ (a `kubectl set env` on some Pods, a roll in flight) and classifies the run on the Region, per-cluster and
+per-resource-class rows of the table above:
 all three unset is `unbounded`, an unset row counts as satisfied, all satisfied is `raw-capacity`, anything else
 `production-budget`; the per-node and per-failure-domain rows take no part. It writes the result to
 `run.json.remediation_budget`; in both tiers the executor concurrency lower bound only requires

@@ -70,6 +70,7 @@ if TYPE_CHECKING or __package__:
         BUDGET_LIMIT_EXCEEDED,
         budget_occupancy_check,
         budget_tier,
+        failure_domain_record,
         write_remediation_budget,
     )
     from .regional_synthetic_fleet import (
@@ -135,6 +136,7 @@ else:
         BUDGET_LIMIT_EXCEEDED,
         budget_occupancy_check,
         budget_tier,
+        failure_domain_record,
         write_remediation_budget,
     )
     from regional_synthetic_fleet import (
@@ -201,10 +203,12 @@ REMEDIATION_BUDGET_ENV = (
 def live_remediation_budget() -> dict[str, int | None]:
     """The five remediation budget limits of the live control workers.
 
-    Read from one Running control-worker Pod's environment; ``None`` for a
-    limit that is unset. The same request model runs under the production
-    budget tier and the raw capacity tier (性能压测验收方案 §8.2), so the run
-    records which tier it measured instead of assuming one.
+    Read from every Running control-worker Pod's environment and refused when
+    they differ (a ``kubectl set env`` on some Pods, a roll in flight: the run
+    would measure a budget the next claim may not see); ``None`` for a limit
+    that is unset. The same request model runs under the production budget
+    tier and the raw capacity tier (性能压测验收方案 §8.2), so the run records
+    which tier it measured instead of assuming one.
     """
 
     pods = control(
@@ -218,25 +222,43 @@ def live_remediation_budget() -> dict[str, int | None]:
     ).split()
     if not pods:
         raise RuntimeError("no Running control-worker Pods for the budget read")
-    raw = control(
-        "exec",
-        pods[0],
-        "--",
-        "python3",
-        "-c",
-        (
-            "import json,os; print(json.dumps({"
-            + ",".join(
-                f"{name!r}:os.environ.get({name!r})" for name in REMEDIATION_BUDGET_ENV
-            )
-            + "},sort_keys=True))"
-        ),
+    program = (
+        "import json,os; print(json.dumps({"
+        + ",".join(
+            f"{name!r}:os.environ.get({name!r})" for name in REMEDIATION_BUDGET_ENV
+        )
+        + "},sort_keys=True))"
     )
-    values = json.loads(raw.splitlines()[-1])
-    return {
-        name: (int(values[name]) if values.get(name) not in (None, "") else None)
-        for name in REMEDIATION_BUDGET_ENV
-    }
+    budgets = {}
+    for pod in pods:
+        values = json.loads(
+            control("exec", pod, "--", "python3", "-c", program).splitlines()[-1]
+        )
+        budgets[pod] = {
+            name: (int(values[name]) if values.get(name) not in (None, "") else None)
+            for name in REMEDIATION_BUDGET_ENV
+        }
+    if len({json.dumps(budget, sort_keys=True) for budget in budgets.values()}) > 1:
+        raise RuntimeError(
+            "the Running control-worker Pods carry different remediation budgets "
+            "(a partial `kubectl set env` or a roll in flight): "
+            + json.dumps(budgets, sort_keys=True)
+        )
+    return budgets[pods[0]]
+
+
+def model_failure_domain(nodes_per_workflow: int) -> dict:
+    """Whether the model's workflows carry a failure domain (perf plan §8.2):
+    read off the steps the seed builds (product models, imported here only)."""
+
+    from scripts.perf.seed_regional_action_workflows import workflow_steps
+
+    steps = workflow_steps(
+        nodes=[f"model-node-{index}" for index in range(max(nodes_per_workflow, 1))],
+        workload_id="model-workload",
+        run_id="model",
+    )
+    return failure_domain_record(steps)
 
 
 def executor_job(
@@ -1221,6 +1243,50 @@ def execute_capacity_run(
     return measured_exit(0 if occupancy["passed"] else BUDGET_LIMIT_EXCEEDED, summary)
 
 
+def write_run_record(
+    artifacts: Path,
+    args: argparse.Namespace,
+    *,
+    run_id: str,
+    tier: dict,
+    fleet: dict,
+    registry_scope: str,
+    identity: dict[str, str],
+) -> None:
+    """``run.json``: the request model, the budget tier it ran under (with
+    whether the model's workflows carry a failure domain) and the targets."""
+
+    (artifacts / "run.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "remediation_budget": tier,
+                "clusters": args.clusters,
+                "workflows_per_cluster": (args.workflows_per_cluster),
+                "nodes_per_workflow": args.nodes_per_workflow,
+                "executor_workers": args.executor_workers,
+                "delay_scale": args.delay_scale,
+                "lease_seconds": args.lease_seconds,
+                "inject_renew_failure_once": args.inject_renew_failure_once,
+                "synthetic_fleet": fleet,
+                "suite_id": run_id,
+                "registry_scope": registry_scope,
+                "control_namespace": CONTROL_NAMESPACE,
+                "dataplane_namespace": NAMESPACE,
+                "registry_secret": REGISTRY_SECRET,
+                "connection_secret": CONNECTION_SECRET,
+                "agent_identity_source": (
+                    "release-state" if registry_scope == "isolated" else "live-agent"
+                ),
+                **identity,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+
+
 @abort_on_signals
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
@@ -1289,34 +1355,15 @@ def main(argv: list[str] | None = None) -> int:
         f"remediation budget tier {tier['tier']}: executor concurrency floor "
         f"{tier['min_concurrent_commands']} of {args.executor_workers}"
     )
-    (artifacts / "run.json").write_text(
-        json.dumps(
-            {
-                "run_id": run_id,
-                "remediation_budget": tier,
-                "clusters": args.clusters,
-                "workflows_per_cluster": (args.workflows_per_cluster),
-                "nodes_per_workflow": args.nodes_per_workflow,
-                "executor_workers": args.executor_workers,
-                "delay_scale": args.delay_scale,
-                "lease_seconds": args.lease_seconds,
-                "inject_renew_failure_once": args.inject_renew_failure_once,
-                "synthetic_fleet": fleet,
-                "suite_id": run_id,
-                "registry_scope": registry_scope,
-                "control_namespace": CONTROL_NAMESPACE,
-                "dataplane_namespace": NAMESPACE,
-                "registry_secret": REGISTRY_SECRET,
-                "connection_secret": CONNECTION_SECRET,
-                "agent_identity_source": (
-                    "release-state" if registry_scope == "isolated" else "live-agent"
-                ),
-                **identity,
-                "started_at": datetime.now(timezone.utc).isoformat(),
-            },
-            indent=2,
-        )
-        + "\n"
+    tier["failure_domain"] = model_failure_domain(args.nodes_per_workflow)
+    write_run_record(
+        artifacts,
+        args,
+        run_id=run_id,
+        tier=tier,
+        fleet=fleet,
+        registry_scope=registry_scope,
+        identity=identity,
     )
     write_status(artifacts, status="running")
     started = time.time()

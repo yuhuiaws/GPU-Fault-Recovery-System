@@ -8,7 +8,9 @@ every one of them, so it writes the document instead of leaving each reader to
 recombine ``run.json`` and ``summary.json``:
 
 * the five tiers and the tier the run measured: ``run.json.remediation_budget``
-  (read from a control-worker Pod before the run);
+  (read from every Running control-worker Pod before the run, refused when
+  they differ), with ``failure_domain``: whether the model's workflows carry
+  the one step parameter the failure-domain budget reads;
 * the peak active claims: the occupancy verdict over ``history.json``
   (``budget_occupancy_check``) -- per scope kind, the most RUNNING workflows
   holding one scope of that kind in any sample, the count the store admits
@@ -108,6 +110,31 @@ def write_remediation_budget(
         json.dumps(document, indent=2, sort_keys=True) + "\n"
     )
     return document
+
+
+#: The one step parameter the failure-domain budget claims a domain from
+#: (``execution.remediation_budget``: ``domain:<cluster>:<partition>``, written
+#: by the SXID planner); ``failure_domain`` and ``availability_zone`` are no
+#: longer read.
+FAILURE_DOMAIN_PARAMETER = "fabric_partition"
+
+
+def failure_domain_record(steps: list[Any]) -> dict[str, Any]:
+    """Whether a workflow model's steps carry a failure domain (perf plan
+    §8.2): a run that claims to verify the failure-domain budget needs
+    ``assigned`` true; the action model's seeded steps carry none."""
+
+    domains: set[str] = set()
+    for step in steps:
+        raw = (getattr(step, "parameters", None) or {}).get(FAILURE_DOMAIN_PARAMETER)
+        domains.update(
+            str(value) for value in (raw if isinstance(raw, list) else [raw]) if value
+        )
+    return {
+        "assigned": bool(domains),
+        "parameter": FAILURE_DOMAIN_PARAMETER,
+        "domains": sorted(domains),
+    }
 
 
 def budget_tier(
