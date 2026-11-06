@@ -29,7 +29,10 @@ from gpu_fault.store.shared.primitives import (
     StateTransaction,
     state_key,
 )
-from gpu_fault.store.shared.record_guards import record_matches_expected
+from gpu_fault.store.shared.record_guards import (
+    record_matches_expected,
+    stored_runtime_profile,
+)
 
 
 class SharedControlRecordMixin:
@@ -166,6 +169,22 @@ class SharedControlRecordMixin:
     def save_profile(self, profile: EffectiveRuntimeProfile) -> None:
         with self._statement_guard():
             self._put("profile", profile.profile_version, profile)
+
+    def register_profile(
+        self, profile: EffectiveRuntimeProfile
+    ) -> EffectiveRuntimeProfile:
+        """See ``CompletionStore.register_profile``: the read, the compare and
+        the insert run in one write transaction under ``profile/<version>``."""
+
+        version = profile.profile_version
+        with self._state_transaction(f"profile/{version}"):
+            stored = stored_runtime_profile(
+                self._get_optional("profile", version), profile
+            )
+            if stored is not None:
+                return stored
+            self._put("profile", version, profile)
+            return profile
 
     def get_profile(self, version: str) -> EffectiveRuntimeProfile:
         return self._get("profile", version)

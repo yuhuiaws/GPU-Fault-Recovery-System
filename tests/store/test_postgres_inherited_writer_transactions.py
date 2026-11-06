@@ -95,6 +95,9 @@ REVIEWED_INHERITED_WRITERS = frozenset(
         # Two round-trips (_get_optional + _put), both under _state_transaction.
         "record_remote_command_progress",
         "record_xid74_occurrences",
+        # Two round-trips (_get_optional + _put) under _state_transaction on
+        # profile/<version>: a registered version is never overwritten.
+        "register_profile",
         "release_job_restart",
         "renew_remote_command_lease",
         "reserve_hyperpod_submission",

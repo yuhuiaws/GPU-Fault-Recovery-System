@@ -240,6 +240,7 @@ POSTGRES_TESTS = \
 	tests/store/test_recent_markers_trusted_predicate.py \
 	tests/store/test_reconcile_epoch_cas.py \
 	tests/store/test_reconcile_narrow_reads.py \
+	tests/store/test_register_profile_guard.py \
 	tests/store/test_remote_command_stale_fence.py \
 	tests/store/test_save_incident_guard.py \
 	tests/store/test_save_plan_guard.py \

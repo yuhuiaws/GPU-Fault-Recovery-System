@@ -3051,10 +3051,11 @@ kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
 Runtime Profiles are stored globally by `profile_version` in the regional control plane; the same version is shared by all
 GPU clusters that reference it. The payload's `cluster_id` is the registration authorisation anchor and must be a stable
 `CLUSTER_ID` in the registry, not a HyperPod provider name (the API answers 403 when it is not in the registry); it does not create a
-private copy for that cluster. When the same version already exists with different content it must not be overwritten; a new version
-must be created: `POST /v1/runtime-profiles` itself writes by `profile_version` without comparing the existing content
-(`register_profile` in `routes/configuration.py`), so a manual registration may only be used for a version not registered yet.
-The template for a plain EKS (eks-managed) cluster is `config/runtime-profile.regional-eks-safe.example.yaml`.
+private copy for that cluster. A registered version cannot be rewritten; a changed policy needs a new version:
+`POST /v1/runtime-profiles` only creates -- registering the same version again with the same policy (the registration anchor
+`cluster_id` is not compared) is idempotent and answers the stored profile (its `cluster_id` stays the anchor of the first
+registration), and different content is answered 409 and nothing is written (the Store's `register_profile` compares and writes
+under one lock). The template for a plain EKS (eks-managed) cluster is `config/runtime-profile.regional-eks-safe.example.yaml`.
 
 First registration:
 
@@ -12857,9 +12858,15 @@ curl -fsS -X POST \
 unset PROFILE_JSON
 ```
 
-The returned `cluster_id` must equal the registration anchor, `profile_version` and the capability owners must match
+On a first registration the returned `cluster_id` equals the registration anchor; `profile_version` and the capability owners must match
 the regional deployment policy, and `warnings` must be empty. The Profile is saved in Aurora and shared immediately by the three API Pods and
-all GPU clusters referencing that version, with no rollout needed. A content change within the same version must use a new version instead.
+all GPU clusters referencing that version, with no rollout needed. A content change within the same version must use a new version instead:
+the API answers a registration of a stored version with the same policy idempotently with the stored profile (its `cluster_id` is the
+anchor of the first registration) and a registration with different content with 409, writing nothing. The old single-cluster
+`deploy/hyperpod/deploy.sh` registers, on every deploy and under `GPU_FAULT_RUNTIME_PROFILE`, the profile generated from
+`GPU_FAULT_ENABLE_FIELD_DIAGNOSTIC`, `GPU_FAULT_MEMORY_FIELD_DIAGNOSTIC_COMMAND` and the discovered HyperPod `NodeRecovery`: after one of
+these inputs changes, deploy with a new `GPU_FAULT_RUNTIME_PROFILE`, or the "Register executable HyperPod runtime capability owners"
+step stops with HTTP 409.
 
 <a id="13-过渡单集群验收清单非生产"></a>
 ### A.6 Transitional Single-Cluster Acceptance Checklist (Non-Production)

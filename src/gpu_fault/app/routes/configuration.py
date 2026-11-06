@@ -21,6 +21,7 @@ from gpu_fault.models import (
     NodeMarker,
     RuntimeProfile,
 )
+from gpu_fault.store.shared.errors import RuntimeProfileConflict
 
 
 @dataclass(frozen=True)
@@ -78,9 +79,16 @@ async def register_profile(
                         "registered regional cluster"
                     ),
                 ) from exc
-        effective = compile_runtime_profile(profile)
-        ctx.store.save_profile(effective)
-        return effective
+        # Create-only: a registered version is immutable. The same policy
+        # again answers the stored profile; other content is a 409 and
+        # nothing is written (``register_profile``).
+        try:
+            return cast(
+                EffectiveRuntimeProfile,
+                ctx.store.register_profile(compile_runtime_profile(profile)),
+            )
+        except RuntimeProfileConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     return await _store_call(dependencies, register)
 

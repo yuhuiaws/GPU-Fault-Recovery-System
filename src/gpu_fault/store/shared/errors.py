@@ -69,6 +69,16 @@ class StaleWriteError(ValueError):
     """A conditional write found the row changed (or gone) since it was read."""
 
 
+class RuntimeProfileConflict(ValueError):
+    """A Runtime Profile registration whose version is stored with other content.
+
+    A version is immutable once written (``register_profile``): every Agent,
+    collector and event naming it keeps reading the policy it was registered
+    with. Deterministic, so ``POST /v1/runtime-profiles`` answers 409, which
+    the processor completes at once instead of retrying it.
+    """
+
+
 class EfaTrafficAdminConflict(ValueError):
     pass
 

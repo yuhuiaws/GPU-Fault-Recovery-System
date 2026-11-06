@@ -6,7 +6,14 @@ import pytest
 
 from gpu_fault.async_store import StoreIoCapacityExceeded
 from gpu_fault.installation_resources import InstallationResource
-from gpu_fault.models import Environment, RuntimeProfile
+from gpu_fault.models import (
+    CapabilityClaim,
+    CapabilityMode,
+    CapabilityName,
+    Environment,
+    ObservedCapability,
+    RuntimeProfile,
+)
 from gpu_fault.processor import ProcessorRequestStatus
 from gpu_fault.telemetry import EvidenceKind
 from tests._builders import processor_request
@@ -57,6 +64,77 @@ def test_runtime_profile_registration_requires_the_regional_cluster_to_exist(
         saved = api.context.store.get_profile(profile.profile_version)
         assert saved.cluster_id == "cluster-a"
         assert saved.capabilities == []
+
+
+def test_runtime_profile_registration_is_create_only(api: Api) -> None:
+    """A registered version is immutable: the same policy again answers the
+    stored profile, other content is a 409 and nothing is written."""
+
+    api.context.regional_mode = True
+    api.context.store.save_regional_cluster(CLUSTER_A)
+    api.context.store.save_regional_cluster(
+        CLUSTER_A.model_copy(
+            update={
+                "cluster_id": "cluster-b",
+                "hyperpod_cluster_name": "hp-b",
+                "eks_cluster_arn": "arn:aws:eks:us-west-2:1:cluster/b",
+                "token_sha256": "b" * 64,
+            }
+        )
+    )
+    claim = CapabilityClaim(
+        capability=CapabilityName.SCHEDULER_DRAIN,
+        mode=CapabilityMode.OWN,
+        owner="gpu-fault-kubernetes-adapter",
+        adapter="kubernetes",
+    )
+    profile = RuntimeProfile(
+        cluster_id="cluster-a",
+        environment=Environment.KUBERNETES,
+        claims=[claim],
+        observed=[
+            ObservedCapability(
+                capability=CapabilityName.SCHEDULER_DRAIN,
+                owner="gpu-fault-kubernetes-adapter",
+                available=True,
+                version="v1",
+            )
+        ],
+        profile_version="unit-immutable-profile",
+    )
+
+    def register(candidate: RuntimeProfile):
+        return api.client.post(
+            "/v1/runtime-profiles", json=candidate.model_dump(mode="json")
+        )
+
+    first = register(profile)
+    assert first.status_code == 200, first.text
+    again = register(profile)
+    assert (again.status_code, again.json()) == (200, first.json()), (
+        "an identical registration is idempotent"
+    )
+    anchored = register(profile.model_copy(update={"cluster_id": "cluster-b"}))
+    assert (anchored.status_code, anchored.json()) == (200, first.json()), (
+        "the same policy under another member answers the stored version, "
+        "registered under its first anchor"
+    )
+    refused = register(
+        profile.model_copy(
+            update={
+                "claims": [claim.model_copy(update={"mode": CapabilityMode.OBSERVE})]
+            }
+        )
+    )
+    assert refused.status_code == 409, refused.text
+    detail = refused.json()["detail"]
+    assert "unit-immutable-profile" in detail and "new profile_version" in detail, (
+        detail
+    )
+    stored = api.context.store.get_profile("unit-immutable-profile")
+    assert stored.model_dump(mode="json") == first.json(), (
+        "a refused registration writes nothing"
+    )
 
 
 @pytest.mark.parametrize("mismatch", ["site", "key", "none"])

@@ -1061,7 +1061,25 @@ class CompletionStore(Protocol):
 
     def get_profile(self, version: str) -> EffectiveRuntimeProfile: ...
 
-    def save_profile(self, profile: EffectiveRuntimeProfile) -> None: ...
+    def save_profile(self, profile: EffectiveRuntimeProfile) -> None:
+        """Upsert ``profile`` under its version: fixtures and the built-in
+        simulation profile. A registration goes through ``register_profile``."""
+        ...
+
+    def register_profile(
+        self, profile: EffectiveRuntimeProfile
+    ) -> EffectiveRuntimeProfile:
+        """Store ``profile`` unless its version is stored; answer the stored row.
+
+        A version is immutable once written. The same policy again -- the
+        registration anchor ``cluster_id`` aside -- answers the row as stored,
+        under the member it was first registered under; other content raises
+        ``RuntimeProfileConflict`` and writes nothing (``POST
+        /v1/runtime-profiles``). The compare and the write are one critical
+        section: PostgreSQL takes the ``profile/<version>`` advisory lock in
+        one transaction, the in-memory and SQLite stores their process lock.
+        """
+        ...
 
     def list_attempt_observation_states(
         self,

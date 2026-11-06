@@ -312,6 +312,9 @@ TerminalEvent also carries `restart_budget`. `RestartBudgetState` uses
 6. Degrade to `OBSERVE` when unavailable, and execute no action.
 
 A Profile must first be registered via `POST /v1/runtime-profiles`; the `runtime_profile_version` in an event must be found in the Store.
+A registered version cannot be rewritten: registering the same version again with the same policy (the registration anchor
+`cluster_id` is not compared) is idempotent and answers the stored profile, and different content is answered 409 without a
+write; the Store's `register_profile` compares and writes under one lock (the `profile/<version>` advisory lock on PostgreSQL).
 
 Release classification uses a normalized Profile policy digest: it ignores `cluster_id/profile_version` and sorts
 `claims/observed`. Switching a template to an immutable snapshot or reordering YAML fields does not change that digest, and therefore
@@ -5880,7 +5883,7 @@ and the documentation routes do not live under the `routes/` directory.
 | GET | `/livez` | public | Process-local liveness: the event loop answers and the consumer threads indispensable to this role are alive; deliberately does not look at Aurora: a writer failover should only make the Pod NotReady, not restart a process that will need Aurora again once it is up |
 | GET | `/metrics` | metrics | Prometheus text; loopback is exempt from authentication, non-loopback requires the execution token |
 | GET | `/v1/version` | execution-token | Version, `module_digest`, Agent/Profile/regional Executor protocol pin |
-| POST | `/v1/runtime-profiles` | execution-token | Compile and register a profile |
+| POST | `/v1/runtime-profiles` | execution-token | Compile and register a profile; create-only: the same version with the same policy answers the stored profile, different content is a 409 |
 | POST | `/v1/advisory-notifications/{notification_id}/requeue` | execution-token | Explicitly requeue a DEAD/RETRY notification and reset its retry budget; SENT stays idempotent and is not implicitly revived by `send` |
 | POST | `/v1/markers` | execution-token | Write an externally trusted marker |
 | GET | `/v1/incidents` | execution-token | List incident digests by `state` (required, repeatable) and optional `cluster_id`/`node_id`, `limit`, in descending `updated_at` order, `truncated` marks truncation; without `cluster_id` it iterates over all clusters in the registry |

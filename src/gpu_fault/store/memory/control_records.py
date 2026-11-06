@@ -36,7 +36,10 @@ from gpu_fault.store.shared.evidence_pins import (
     EVIDENCE_PINNING_INCIDENT_STATES,
     evidence_pinned,
 )
-from gpu_fault.store.shared.record_guards import record_matches_expected
+from gpu_fault.store.shared.record_guards import (
+    record_matches_expected,
+    stored_runtime_profile,
+)
 
 
 class MemoryControlRecordMixin(AttemptObservationTerminalSupport):
@@ -506,6 +509,20 @@ class MemoryControlRecordMixin(AttemptObservationTerminalSupport):
     def save_profile(self, profile: EffectiveRuntimeProfile) -> None:
         with self._lock:
             self._profiles[profile.profile_version] = profile
+
+    def register_profile(
+        self, profile: EffectiveRuntimeProfile
+    ) -> EffectiveRuntimeProfile:
+        """See ``CompletionStore.register_profile``."""
+
+        with self._lock:
+            stored = stored_runtime_profile(
+                self._profiles.get(profile.profile_version), profile
+            )
+            if stored is not None:
+                return stored
+            self._profiles[profile.profile_version] = profile
+            return profile
 
     def get_profile(self, version: str) -> EffectiveRuntimeProfile:
         with self._lock:
