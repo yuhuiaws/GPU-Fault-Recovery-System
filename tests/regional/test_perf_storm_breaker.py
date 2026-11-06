@@ -49,7 +49,10 @@ from tests.execution._budget_hold_support import (
     ScriptedAdapter,
     budget_dispatcher,
 )
-from tests.regional._perf_caller_support import deliver_signal
+from tests.regional._perf_caller_support import (
+    default_signal_dispositions,
+    deliver_signal,
+)
 from tests.regional.test_regional_action_capacity import release_agent_identity
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -983,7 +986,9 @@ def test_a_step_that_raises_still_closes_the_breaker_and_tears_down(
 
 
 def test_a_signal_during_the_step_closes_the_breaker_and_tears_down(
-    orchestration: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+    orchestration: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
     """A SIGTERM used to end the step with the breaker open, its held work
     parked and the synthetic cluster registered; now it ends through the
@@ -1002,6 +1007,7 @@ def test_a_signal_during_the_step_closes_the_breaker_and_tears_down(
 
     monkeypatch.setattr(FakeStep, "run", signalled)
     monkeypatch.setattr(FakeStep, "close_breaker", close_breaker)
+    default_signal_dispositions(request)
 
     assert suite.main(ARGS) == 128 + signal.SIGTERM, "the exit status names SIGTERM"
 

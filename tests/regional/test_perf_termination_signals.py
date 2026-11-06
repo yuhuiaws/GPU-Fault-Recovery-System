@@ -25,20 +25,23 @@ from pathlib import Path
 import pytest
 
 from scripts.perf import regional_capacity_recovery as recovery
-from tests.regional._perf_caller_support import deliver_signal
+from tests.regional._perf_caller_support import (
+    default_signal_dispositions,
+    deliver_signal,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture(autouse=True)
-def default_dispositions() -> Iterator[None]:
-    """Every test starts from, and must leave, the process's own handlers."""
+def default_dispositions(request: pytest.FixtureRequest) -> Iterator[None]:
+    """Every test starts from a terminal's dispositions (also under ``nohup``,
+    which ignores SIGHUP) and the guard must leave them as it found them."""
 
+    default_signal_dispositions(request)
     before = {value: signal.getsignal(value) for value in recovery.TERMINATION_SIGNALS}
     yield
     after = {value: signal.getsignal(value) for value in recovery.TERMINATION_SIGNALS}
-    for value, handler in before.items():
-        signal.signal(value, handler)
     assert after == before, "the guard must restore the handlers it replaced"
 
 
@@ -179,6 +182,7 @@ def test_a_real_sigterm_from_outside_reaches_the_teardown(tmp_path: Path) -> Non
             from scripts.perf import regional_capacity_recovery as recovery
 
             events = []
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)  # whatever the parent had
 
             @recovery.abort_on_signals
             def run():

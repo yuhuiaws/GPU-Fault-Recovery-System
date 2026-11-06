@@ -30,6 +30,28 @@ TEARDOWN_TAIL = [
 PLACEMENT = {"aurora": {"cluster_id": "test-aurora", "writer_instance_id": "test-w"}}
 
 
+def default_signal_dispositions(request: pytest.FixtureRequest) -> None:
+    """Start the test from the dispositions of a runner an operator starts in a
+    terminal -- SIGINT raises KeyboardInterrupt, SIGTERM and SIGHUP terminate --
+    and put the inherited ones back after it. A test process started under
+    ``nohup`` (a release-chain driver) has SIGHUP ignored, and the runners
+    keep an inherited ignore on purpose."""
+
+    previous = {
+        value: signal.getsignal(value)
+        for value in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    }
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    signal.signal(signal.SIGHUP, signal.SIG_DFL)
+
+    def restore() -> None:
+        for value, handler in previous.items():
+            signal.signal(value, handler)
+
+    request.addfinalizer(restore)
+
+
 def deliver_signal(signum: int) -> None:
     """Send this process ``signum`` as ``kill`` would, once the code under test
     holds a handler for it: without one SIGTERM and SIGHUP end the process on

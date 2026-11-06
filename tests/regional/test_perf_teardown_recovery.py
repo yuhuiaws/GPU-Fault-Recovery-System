@@ -27,6 +27,7 @@ from tests.regional._perf_caller_support import (
     CapacityWire,
     action_args,
     capacity_args,
+    default_signal_dispositions,
     deliver_signal,
 )
 
@@ -221,11 +222,16 @@ SIGNALLED_STEP = {
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGHUP])
 @pytest.mark.parametrize("suite", sorted(SUITES))
 def test_a_signal_during_the_run_tears_it_down_and_aborts_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suite: str, signum: int
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    suite: str,
+    signum: int,
 ) -> None:
     """``kill`` or a closed terminal used to end the runner with its load and
     synthetic registry left on the site; now it ends through the teardown."""
 
+    default_signal_dispositions(request)
     wire = CapacityWire(tmp_path, monkeypatch)
     module, step = SIGNALLED_STEP[suite]
     monkeypatch.setattr(module, step, lambda *_args, **_kwargs: deliver_signal(signum))
@@ -245,8 +251,12 @@ def test_a_signal_during_the_run_tears_it_down_and_aborts_it(
 
 @pytest.mark.parametrize("suite", sorted(SUITES))
 def test_a_signal_during_the_teardown_does_not_interrupt_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suite: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    suite: str,
 ) -> None:
+    default_signal_dispositions(request)
     wire = CapacityWire(tmp_path, monkeypatch)
     finish = wire.teardown
 

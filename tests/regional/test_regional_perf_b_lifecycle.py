@@ -22,7 +22,12 @@ from scripts.perf import regional_correlated_action_suite as correlated
 from scripts.perf import regional_integrated_workflow_capacity_suite as integrated
 from scripts.perf import regional_validation_telemetry as telemetry
 from scripts.perf.regional_capacity_resources import RunResources
-from tests.regional._perf_caller_support import PLACEMENT, AmpWire, deliver_signal
+from tests.regional._perf_caller_support import (
+    PLACEMENT,
+    AmpWire,
+    default_signal_dispositions,
+    deliver_signal,
+)
 
 
 class FakeDataplane:
@@ -894,11 +899,15 @@ def test_callers_register_the_fleet_before_the_load_and_prove_it_gone_after(
 
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGHUP])
 def test_a_signal_during_the_run_tears_it_down_and_aborts_it(
-    caller: CallerHarness, monkeypatch: pytest.MonkeyPatch, signum: int
+    caller: CallerHarness,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    signum: int,
 ) -> None:
     """Perf plan §8.4: the first signal marks the round aborted and runs the
     teardown, so no load Job, executor or synthetic cluster is left behind."""
 
+    default_signal_dispositions(request)
     step = (
         "execute_integrated_jobs"
         if caller.module is integrated
