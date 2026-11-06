@@ -1677,7 +1677,11 @@ the record ends FAILED and the failure handler opens the support hand-off
 `workflow-support-after-<id>` (stage `held_chain_step`) for the held node
 only; that path is software-tested only too
 (`tests/orchestration/test_cov95_runtime_escalation.py`,
-`tests/orchestration/test_health.py`): no live variant fails the stop. 015
+`tests/orchestration/test_health.py`): no live variant fails the stop. The
+same hand-off for a reset or reboot chain whose job stop, GPU-client check
+or answered checkpoint fails after the cordon, and for an older cooldown plan
+whose validation, snapshot or bundle fails, is software-tested only as well:
+no DESTR or GF-GENERAL-LIVE variant fails those steps. 015
 `command_failure` serves two exits in turn: a BMC that does not answer (`Get
 Device ID command failed`) must be a `_bmc` collection error with no sample, a
 host without an IPMI device node (`Could not open device at /dev/ipmi0 ...: No

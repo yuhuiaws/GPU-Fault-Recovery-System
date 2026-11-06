@@ -20,8 +20,6 @@ from gpu_fault.models import (
     WorkflowRequest,
     WorkflowStepExecution,
 )
-from gpu_fault.orchestration.validation_evidence import held_for_unsent_hand_off
-from gpu_fault.workflow_quarantine import terminal_quarantine_nodes
 
 #: ``remote_status_source`` of a command the cluster executor refused before any
 #: adapter ran it (``cluster_executor.dispatch._validate``: cluster mismatch, a
@@ -85,29 +83,30 @@ def unknown_outcome_failure(details: Mapping[str, Any] | None) -> bool:
 def held_chain_hand_off(
     workflow: WorkflowRequest, failed: Sequence[WorkflowStepExecution]
 ) -> tuple[str, RecoveryAction, WorkflowOperation, list[WorkflowStepExecution]] | None:
-    """The support hand-off a FAILED held chain is owed, or ``None``.
+    """The support hand-off a FAILED record that holds its node is owed, or
+    ``None``.
 
-    A chain that holds its node for an operator -- the DRAIN chain, the
-    ENVIRONMENT_REVIEW chain of a confirmed thermal drain, an operator
-    escalation -- plans its ESCALATE_SUPPORT last. A step before it that fails
-    where the ladder has no rung -- the diagnostic bundle, the health snapshot,
-    the job stop, a checkpoint that answered -- used to end the record
-    QUARANTINED with no support record and no mail; the ENVIRONMENT_REVIEW
-    contract keeps every hardware rung away and so ended it there for any
-    step. The hand-off is the chain's own, so it is owed whatever the step:
-    ``(HELD_CHAIN_STEP_STAGE, ESCALATE_OPERATOR, ESCALATE_SUPPORT, failed)``,
-    a support-after successor that keeps the hold and sends the mail. A plan
-    whose end *is* the hold -- the node-health QUARANTINE plan, a terminal
-    quarantine folded into another chain, a containment prefix -- plans no
-    ESCALATE_SUPPORT (its completed end is QUARANTINED with the terminal
-    notice), and is owed the same hand-off when a step after its cordon fails
-    (:func:`owes_hand_off`).
+    The classifier calls this where the ladder has no rung for a failure:
+    its last branch, and the diagnostic contract's short-circuit. A record
+    whose own cordon or quarantine still holds a node then needs an operator,
+    whatever the step: the chains that hand the node over themselves (DRAIN,
+    the ENVIRONMENT_REVIEW chain, an operator escalation) whose diagnostic
+    bundle, health snapshot, job stop or checkpoint failed before their
+    ESCALATE_SUPPORT; the plans whose end *is* the hold (the node-health
+    QUARANTINE plan, a terminal quarantine folded into another chain, a
+    containment prefix) whose job stop failed after the cordon; and the
+    release chains -- a reset, a reboot, the older cooldown plan -- whose job
+    stop, GPU-client check, answered checkpoint or cooldown validation,
+    snapshot or bundle failed after the cordon. Each used to end FAILED +
+    QUARANTINED with no support record and no mail. The answer is
+    ``(HELD_CHAIN_STEP_STAGE, ESCALATE_OPERATOR, ESCALATE_SUPPORT, failed)``:
+    a support-after successor that keeps the hold and sends the mail.
 
-    Not owed -- the endings that open no ticket on purpose: no hold, or a
-    hold the plan meant to release with no planned hand-off (a read-only
-    chain, a cooldown plan; :func:`owes_hand_off`), a hand-off that already
-    ran or failed; every failure refused by the executor before dispatch (a stale
-    generation's record: a newer one owns the incident); an abandoned step of
+    Not owed -- the endings that open no ticket on purpose: no hold left (a
+    read-only chain, a node a RESTORE_SCHEDULING released); a hand-off of the
+    record that already ran or failed (:func:`owes_hand_off`); every failure
+    refused by the executor before dispatch (a stale generation's record: a
+    newer one owns the incident); an abandoned step of
     :data:`NO_SECOND_TICKET_OPERATIONS` (the support escalation, the evidence
     freeze, the checkpoint that may still be running inside the job).
 
@@ -141,39 +140,16 @@ def held_chain_hand_off(
 
 
 def owes_hand_off(workflow: WorkflowRequest) -> bool:
-    """Whether a FAILED record's hold is owed a support hand-off.
-
-    True when no ESCALATE_SUPPORT of the record ran and its plan either hands
-    the node over (a planned ESCALATE_SUPPORT behind a completed isolation:
-    ``validation_evidence.held_for_unsent_hand_off``) or ends with it held: a
-    QUARANTINE no RESTORE_SCHEDULING readmits, the terminal hold
-    (``workflow_quarantine.terminal_quarantine_nodes`` over the executed
-    phase's steps; a malformed hold scope counts as a hold). A plan that
-    cordons in order to release -- a reset, a reboot, a cooldown -- is not
-    this rule's. Whether a node is still held is :func:`held_scope`'s.
+    """Whether a FAILED record's hold is owed a support hand-off: no
+    ESCALATE_SUPPORT of the record ran. A hand-off that ran or failed keeps
+    its own ending -- a second ticket answers nothing. Whether the record
+    still holds a node is :func:`held_scope`'s.
     """
 
-    if held_for_unsent_hand_off(workflow):
-        return True
-    if any(
+    return not any(
         execution.operation is WorkflowOperation.ESCALATE_SUPPORT
         for execution in workflow.step_executions
-    ):
-        return False
-    phase = (
-        workflow.model_copy(
-            update={
-                "official_steps": workflow.safety_steps,
-                "superseded_step_indexes": [],
-            }
-        )
-        if workflow.executes_safety_steps
-        else workflow
     )
-    try:
-        return bool(terminal_quarantine_nodes(phase))
-    except ValueError:
-        return True
 
 
 def held_scope(

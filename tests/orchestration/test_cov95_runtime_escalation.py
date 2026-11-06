@@ -682,16 +682,160 @@ def test_a_contract_chains_cordon_endings_match_every_other_chain(
     assert len(h.store.list_workflows()) == (1 if expected is None else 2), why
 
 
-def test_a_cooldown_plan_without_a_hand_off_still_opens_nothing() -> None:
-    """A legacy THERMAL_COOLDOWN plan cordons for a cooldown -- no terminal
-    hold -- and plans no ESCALATE_SUPPORT: nothing is owed by this rule,
-    whatever non-containment step failed."""
+QUIESCE = WorkflowOperation.QUIESCE_GPU_SERVICES
+VERIFY = WorkflowOperation.VERIFY_NO_GPU_CLIENTS
+RESTORE_SERVICES = WorkflowOperation.RESTORE_GPU_SERVICES
+#: The release chains: they cordon in order to readmit the node.
+RESET_CHAIN = [
+    FREEZE,
+    CORDON,
+    CHECKPOINT,
+    STOP,
+    QUIESCE,
+    VERIFY,
+    RESET,
+    RESTORE_SERVICES,
+    VALIDATE,
+    RESTORE,
+    RESTART,
+]
+REBOOT_CHAIN = [
+    FREEZE,
+    CORDON,
+    QUARANTINE,
+    CHECKPOINT,
+    STOP,
+    REBOOT,
+    VALIDATE,
+    WorkflowOperation.VALIDATE_HOST,
+    WorkflowOperation.VALIDATE_FABRIC,
+    RESTORE,
+    RESTART,
+]
+#: The older persisted THERMAL_COOLDOWN plan (``families/health._operations``).
+COOLDOWN_PLAN = [FREEZE, CORDON, STOP, BUNDLE, SNAPSHOT, VALIDATE, RESTORE, RESTART]
 
-    cooldown = {"health_recovery_contract": {"mode": "THERMAL_COOLDOWN"}}
-    operations = [FREEZE, CORDON, BUNDLE, SNAPSHOT, VALIDATE]
-    h = held_chain(operations, operations.index(SNAPSHOT), contract=cooldown)
 
-    assert HardwareEscalationService.classify(h.workflow) is None
+@pytest.mark.parametrize(
+    ("operations", "failed", "contract", "job_wide"),
+    [
+        (RESET_CHAIN, STOP, None, False),
+        (RESET_CHAIN, STOP, None, True),
+        (RESET_CHAIN, VERIFY, None, False),
+        (RESET_CHAIN, CHECKPOINT, None, True),
+        (REBOOT_CHAIN, STOP, None, True),
+        (COOLDOWN_PLAN, VALIDATE, COOLDOWN, False),
+        (COOLDOWN_PLAN, SNAPSHOT, COOLDOWN, False),
+        (COOLDOWN_PLAN, BUNDLE, COOLDOWN, False),
+        (COOLDOWN_PLAN, STOP, COOLDOWN, True),
+    ],
+    ids=[
+        "reset-stop",
+        "reset-job-wide-stop",
+        "reset-verify",
+        "reset-checkpoint-answered",
+        "reboot-job-wide-stop",
+        "cooldown-validate",
+        "cooldown-snapshot",
+        "cooldown-bundle",
+        "cooldown-job-wide-stop",
+    ],
+)
+def test_a_release_chain_whose_step_fails_after_the_cordon_hands_the_node_over(
+    operations, failed, contract, job_wide
+) -> None:
+    """A reset, a reboot and the older cooldown plan cordon in order to
+    readmit the node. A step after the cordon that fails where no rung
+    answers -- the job stop, the GPU-client check, a checkpoint that
+    answered; the cooldown's validation, snapshot or bundle -- left the record
+    FAILED + QUARANTINED with no ticket and no notice. The held node is now
+    handed to support, and only the held node."""
+
+    h = held_chain(operations, operations.index(failed), contract=contract)
+    if job_wide:
+        h.amend(
+            official_steps=[
+                step.model_copy(update={"node_ids": ["node-a", "node-b"]})
+                if step.operation in JOB_WIDE
+                else step
+                for step in h.workflow.official_steps
+            ]
+        )
+
+    classification = HardwareEscalationService.classify(h.workflow)
+    assert classification is not None, (
+        f"{failed.value} failed after the cordon and nobody was told"
+    )
+    assert classification[:3] == (
+        "held_chain_step",
+        RecoveryAction.ESCALATE_OPERATOR,
+        SUPPORT,
+    )
+    result = h.escalate()
+    assert result is not None, "the held node needs a durable hand-off"
+    incident, successor = result
+    assert incident.reasons[0].startswith(
+        "held_chain_step remediation failed; failed operation or validation: "
+        f"{failed.value}"
+    ), incident.reasons
+    assert incident.node_ids == ["node-a"], incident.node_ids
+    assert [(step.operation, step.node_ids) for step in successor.official_steps] == [
+        (FREEZE, ["node-a"]),
+        (CORDON, ["node-a"]),
+        (QUARANTINE, ["node-a"]),
+        (SUPPORT, ["node-a"]),
+    ], "the hold is kept and handed over: no hardware rung, no release, no node-b"
+    assert h.escalate() == result, "one support successor per failed chain"
+    assert len(h.store.list_workflows()) == 2
+
+
+@pytest.mark.parametrize(
+    ("operations", "failed_index", "details", "contract", "why"),
+    [
+        (
+            RESET_CHAIN,
+            RESET_CHAIN.index(STOP),
+            REJECTED,
+            None,
+            "refused before dispatch: a stale generation, a newer one owns it",
+        ),
+        (
+            RESET_CHAIN,
+            RESET_CHAIN.index(CHECKPOINT),
+            UNKNOWN_OUTCOME,
+            None,
+            "an abandoned checkpoint may still be running inside the job",
+        ),
+        (
+            COOLDOWN_PLAN,
+            COOLDOWN_PLAN.index(SNAPSHOT),
+            REJECTED,
+            COOLDOWN,
+            "refused before dispatch: a stale generation, a newer one owns it",
+        ),
+        (
+            RESET_CHAIN,
+            RESET_CHAIN.index(RESTART),
+            {"error": "the job did not come back"},
+            None,
+            "the node was released before the restart: nothing is held",
+        ),
+    ],
+    ids=[
+        "reset-stop-executor-rejected",
+        "reset-abandoned-checkpoint",
+        "cooldown-snapshot-executor-rejected",
+        "reset-restart-after-release",
+    ],
+)
+def test_a_release_chain_keeps_its_deliberate_no_ticket_endings(
+    operations, failed_index, details, contract, why
+) -> None:
+    h = held_chain(operations, failed_index, details=details, contract=contract)
+
+    assert HardwareEscalationService.classify(h.workflow) is None, why
+    assert h.escalate() is None, why
+    assert len(h.store.list_workflows()) == 1, "no successor was opened"
 
 
 @pytest.mark.parametrize("profile", [None, "missing-profile"])

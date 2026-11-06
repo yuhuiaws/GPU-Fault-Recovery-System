@@ -2488,16 +2488,19 @@ Whole-record hardware recovery escalation is invoked idempotently by the Dispatc
    `failure_outcome.held_chain_hand_off`). The endings that open no ticket on purpose stay: every failure refused by the
    executor before dispatch (a stale generation; a newer one owns the incident), or an abandoned ESCALATE_SUPPORT,
    FREEZE_EVIDENCE or CHECKPOINT_WORKLOADS with an unknown outcome (`NO_SECOND_TICKET_OPERATIONS`: a second ticket, or
-   an evidence freeze or checkpoint that may still be running inside the job); neither do a read-only chain, a cooldown
-   plan or a hand-off that ran or failed. The hand-off keeps the chain's hold and never extends it: each failure's
+   an evidence freeze or checkpoint that may still be running inside the job); neither do a read-only chain (nothing
+   held) or a hand-off that ran or failed. The hand-off keeps the chain's hold and never extends it: each failure's
    `failed_nodes` is narrowed to the nodes the record still holds (`failure_outcome.held_scope`,
    `handoff_hold.record_held_nodes`), so when a STOP_WORKLOADS or CHECKPOINT_WORKLOADS compiled for the job's whole
    allocation fails, the successor cordons, quarantines and names the faulty node only, never the job's healthy ones.
    A plan whose end is the hold itself -- the node-health QUARANTINE plan (FREEZE_EVIDENCE → MARK_UNSCHEDULABLE →
    [STOP_WORKLOADS] → QUARANTINE), a terminal quarantine folded into another chain, a containment prefix -- plans no
    ESCALATE_SUPPORT (its completed end is QUARANTINED with the terminal notice); when a step after its cordon fails (the
-   job stop), it gets the same hand-off (`failure_outcome.owes_hand_off`: a QUARANTINE no RESTORE_SCHEDULING readmits,
-   the terminal hold). A plan that cordons in order to release (a reset, a reboot, a cooldown) is not this rule's.
+   job stop), it gets the same hand-off. The plans that cordon in order to readmit -- the reset and reboot chains and the older cooldown
+   plan -- get it too: their job stop, GPU-client check (VERIFY_NO_GPU_CLIENTS) or answered checkpoint failing after the
+   cordon (no reset or reboot ran, so no rung can answer), and the cooldown's validation, snapshot or bundle failing, hand
+   the still-held node to support (`failure_outcome.owes_hand_off`: no ESCALATE_SUPPORT of the record ran); a node a
+   RESTORE_SCHEDULING released is not held.
 8. A diagnostic contract (ENVIRONMENT_REVIEW and the older cooldown contracts) keeps every hardware rung away, not the
    containment hand-off: when its MARK_UNSCHEDULABLE, QUARANTINE or RESTORE_SCHEDULING fails, the record takes the
    containment stages every other chain takes (`escalation._contract_ends_classification`) -- `containment_or_release`:
