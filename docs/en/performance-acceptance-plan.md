@@ -59,13 +59,15 @@ Every formal load-test round must record:
 ### 3.1 Load-Test Notifications Must Never Leave the Site
 
 - Every synthetic performance cluster must use the reserved prefix `perf-cap-`; the Store must
-  tag every notification produced by that prefix with `drill_id=perf-capacity`, including
-  Collector, Agent, capacity and silence alert notifications that have no persisted Incident.
+  mark every notification produced by that prefix as a drill, including Collector, Agent, capacity
+  and silence alert notifications that have no persisted Incident: a `drill_id` the notification or
+  its incident already carries is kept, otherwise it becomes `drill_id=perf-capacity`
+  (`with_incident_drill_label`).
 - AMP alerts do not pass through the Store: Alertmanager delivers straight to the site SNS topic.
   The Alertmanager definition must therefore route alerts with `cluster_id=~"perf-cap-.*"` to the
   `gpu-fault-drill-sink` receiver, which has no delivery configuration (the alerts remain
-  queryable in AMP); the runner reads the live definition before registration to check that
-  route, fails closed when it is missing, and writes the result to
+  queryable in AMP); every runner reads the live definition before registration to check that
+  route and fails closed when it is missing; the §8.4 integrated runner also writes the result to
   `notification-safety-preflight.json`.
 - `GPU_FAULT_NOTIFICATION_DELIVER_DRILLS` must be unset or `false`. Before modifying the registry
   or creating load, the performance runner must check that value on every non-zero CPU Pod one by
@@ -100,6 +102,12 @@ export GPU_FAULT_PERF_REGISTRY_SECRET=gpu-fault-regional-clusters
 export GPU_FAULT_PERF_CONNECTION_SECRET=gpu-fault-regional-connection
 ```
 
+Every suite's registration mirrors the connection Secret of the identity namespace (`GPU_FAULT_PERF_IDENTITY_NAMESPACE`,
+default `gpu-fault-system`) into the perf namespace (`connection-secret-preflight.json`; a missing Secret there fails
+closed), and the load generators and simulated executors connect to the control plane that Secret names: an isolated run
+must point the identity namespace at one that holds the isolated control plane's connection Secret, or the load reaches
+the control plane the default namespace's Secret names.
+
 The isolated control plane must also use a separate, disposable PostgreSQL database; changing
 only the namespace and registry Secret while continuing to write to the production database
 does not constitute isolation. That database is still created by the separate schema ensure
@@ -109,8 +117,10 @@ that all synthetic rows, Jobs and connections have terminated, then delete the d
 Formal rounds assume a maintained store: one campaign day of writes leaves the hot tables (processor lanes/queue
 counts/priority shards/queue, `gpu_fault_gpu_metric_latest`) with heap and index pages a hundred times their live
 rows, halving ingress throughput, raising `gpu_fault_processor_admission_batch_expired_total` and failing the reserved
-503 share verdict; schema v19's storage parameters stop the growth, and existing bloat is reclaimed before a formal
-round with `gpu-fault-admin store-maintenance --confirm STORE_MAINTENANCE` (Administrator Operations §10.3). The bloat
+503 share verdict; schema v19's storage parameters stop the growth, and existing index and small-table bloat is
+reclaimed before a formal round with
+`gpu-fault-admin store-maintenance --state-dir <state-dir> --reference <CHG> --confirm STORE_MAINTENANCE`
+(Administrator Operations §10.3). The bloat
 is what one formal 32-cluster round itself leaves behind: a round inserts about 264k synthetic
 `gpu_fault_gpu_metric_latest` rows, 87k objects and 27k queue rows, the teardown deletes them, and the heap and index
 files stay at their high-water mark (metric latest: 1,233 live rows in 31,023 pages plus 118 MiB of indexes; the queue:
@@ -119,12 +129,17 @@ next round runs on. Three points on one release with identical admission default
 bloated indexes and heaps 538 req/s FAIL (normal-telemetry reserved 503 share 29.4 %, 49 % of the active statements
 waiting on `LWLock:BufferContent` -- the queue INSERT in 84 % of its samples, the completion CTE 78 %, the claim CTE
 48 %); indexes rebuilt and the three small tables `VACUUM FULL`ed with the large heaps and the TOAST left as they were
-1,141 req/s PASS with zero BufferContent samples. Heap bloat is **not** a throughput variable (on the same release the aged r1 ran 1,601 req/s on 582 MB of metric latest; see §3.3 and detailed design v2 §4.4.2). The control-worker periodic job `store-compaction` (`GPU_FAULT_STORE_COMPACTION_INTERVAL_SECONDS`, default
-300 s) acts on catalog facts -- heap pages per live row, index pages per live row, the least dense index's entries per
-page -- and rebuilds an index past the threshold with `REINDEX INDEX CONCURRENTLY` and a thinned small table with
-`VACUUM (FULL, ANALYZE)`, so no manual `store-maintenance` is needed between a formal round and the next; large heaps
-and the TOAST relation are still reclaimed only by that verb. The r1
-collapses were not bloat alone: across five rounds on one release and one database, the failing rounds' RDS
+1,141 req/s PASS with zero BufferContent samples. The sequential scans of the queue and the objects (91k / 64k) are
+the read statements of stale statistics, 4 % of the active samples: victims, not drivers. Heap bloat is **not** a
+throughput variable (on the same release the aged burst round ran 1,601 req/s on 582 MB of metric latest; see §3.3
+and detailed design v2 §4.4.2). The control-worker periodic job `store-compaction`
+(`GPU_FAULT_STORE_COMPACTION_INTERVAL_SECONDS`, default 300 s) acts on catalog facts: it rebuilds an index of at least
+64 pages holding fewer than 8 live entries per page with `REINDEX INDEX CONCURRENTLY` and a small table of at least 16
+pages holding fewer than 4 live rows per page with `VACUUM (FULL, ANALYZE)` (heap and index pages per live row are
+reported, never triggers), so no manual `store-maintenance` is needed between a formal round and the next. No product
+path rewrites the large heaps or the TOAST relation: the verb only rebuilds every index of the large tables and runs a
+plain `VACUUM (ANALYZE)` on them; reclaiming a large heap takes a `VACUUM FULL` an operator decides on in a maintenance
+window. The burst round's collapses were not bloat alone: across five rounds on one release and one database, the failing rounds' RDS
 `log_lock_waits` showed thousands of lock waits of a second or more per window concentrated in the statement-level
 counter triggers of the processor queue -- hash sharding put every concurrent flush and completion of a cluster on the
 same rows and formed a convoy; schema v20 rekeys both counter tables per writer backend (Detailed Design §3.1.5), and
@@ -175,7 +190,8 @@ command supply both:
 ```
 
 If either confirmation is missing it must fail before modifying the registry. Merely changing
-the Secret name in the formal namespace cannot be claimed as isolation.
+the Secret name in the formal namespace cannot be claimed as isolation. The §8.4 integrated runner
+is the live acceptance entry point and requires both flags whatever the target namespace.
 
 Every logical cluster registry record must contain:
 
@@ -185,8 +201,10 @@ Every logical cluster registry record must contain:
 - a placeholder identity that does not point at a real EKS/HyperPod.
 
 Expired synthetic records must not keep authenticating and must not enter the runtime durable
-registry. Legacy or expired `perf-cap-*` residue is cleaned automatically before the load test;
-when another not-yet-expired run is found, stop rather than preempt it. After the load test this
+registry. Registration refuses to start while the registry still holds any synthetic or `perf-cap-*`
+entry -- legacy, expired or another run's (`preflight cannot purge any run`); it neither preempts nor
+cleans up on another run's behalf: remove it first with the owning run's `teardown` (its original
+`--suite-id` and `--run-dir`). After the load test this
 round's records must be deleted, the registry re-read to confirm that no synthetic residue
 remains, and `registry-preflight.json` and `registry-postflight.json` saved.
 Before registration the runner records the digest and serialized shape of `clusters.json` in
@@ -218,9 +236,9 @@ data-plane clusters", not a freshly tidied store. Four points on one release wit
 active statements on `LWLock:BufferContent`, 148 concurrent admission INSERTs); indexes rebuilt 1,141 req/s PASS (no
 BufferContent; commit I/O, advisory-lock waits and the small tables `VACUUM FULL` had just shrunk re-extending in the
 storm); after another full 16-step suite, with heaps larger than at the failure (metric latest 582 MB, queue 194 MB),
-the "aged" r1 1,601 req/s PASS. Conclusion: **heap/TOAST size, time since the cold deploy and "after the previous
+the "aged" burst round 1,601 req/s PASS. Conclusion: **heap/TOAST size, time since the cold deploy and "after the previous
 round" do not decide whether a round counts as a formal record** -- the state of the index entries does, and the catalog
-proxy for it is the `store_bloat.before` batch 58 writes into every `summary.json` (per hot table
+proxy for it is the `store_bloat.before` the runner writes into every `summary.json` (per hot table
 `index_pages_per_live_row`, `index_min_entries_per_page`, `heap_pages_per_live_row`) together with schema v23's
 `store_layout`. A round's label is therefore decided by **the store metrics at its start**, not by the clock or the
 deployment history:
@@ -230,16 +248,20 @@ deployment history:
   `store-maintenance` / compaction, or indexes that never carried a round's working set). Such a round gives the upper
   bound only and is never the formal record, however long the site has been up.
 - **`steady_state`**: `store_bloat.before.gpu_fault_processor_queue.index_pages_per_live_row >= 8` (the queue indexes
-  still at the high-water mark of at least one round's working set: about 19 in the 10:30 failing state, about 25 in
-  the aged passing state), `store_layout.mode == detached`, and **no** manual `store-maintenance` before the round (the
-  `store-compaction` job runs as usual). The runner derives the label from these two fields and writes it into
-  `summary.json`; nobody fills it in by hand. A round in `inline` mode may only be labelled a comparison inside the
-  upgrade window, never a formal result of the v23 layout.
+  still at the high-water mark of at least one round's working set: about 19 in the failing state, about 25 in the
+  aged passing state), `store_layout.mode == detached`, and **no** manual `store-maintenance` before the round (the
+  `store-compaction` job runs as usual). The runner writes only these two fields into `summary.json`, not the label:
+  the label is derived from them by this rule and the previous one and written into the formal record, never filled in
+  by judgement. A round in `inline` mode may only be labelled a comparison inside the upgrade window, never a formal
+  result of the v23 layout.
 - At least one round per label; the verdict is the `steady_state` round's; nothing may be compacted by hand between
   the two; a round without `store_bloat.before` (`recorded=false`) cannot be the record for either label.
-- Every round's `store_layout.after` gives the page counts of the queue, the payloads table, the replay partitions and
-  the metric latest partitions after teardown; a formal result requires the queue's heap pages back at the order of the
-  in-flight set and the synthetic clusters' metric latest rows deleted. The synthetic clusters are published through the
+- Every round's `store_layout.before` / `after` give the write-layout mode and the partition count, pages and live rows
+  of `gpu_fault_gpu_metric_latest_clusters` and `gpu_fault_processor_replays` before the load and when the load ends
+  (before the teardown); the queue's and the payloads' pages are in `store_bloat.before` / `after`. The teardown's
+  result is in `capacity-data-cleanup.json`, and the queue's heap pages after the teardown are what the next round's
+  `store_bloat.before` reads: a formal result requires them back at the order of the in-flight set and the synthetic
+  clusters' metric latest rows deleted. The synthetic clusters are published through the
   durable registry and have no partition of their own: their rows live in `gpu_fault_gpu_metric_latest_clusters_default`
   and the teardown deletes them row by row (`capacity-data-cleanup.json`: `dropped_partitions` empty,
   `deleted_table_rows` counts the rows; detailed design v2 §4.4.2). Every burst therefore starts on that partition's
@@ -254,10 +276,12 @@ deployment history:
 
 Verdict rule: the `steady_state` round is judged by §6; a `steady_state` round more than 10 % below the
 `optimistic_bound` round in throughput, or crossing the reserved-503 threshold, is a FAIL filed as a write-path defect
-and may not be replaced by a rerun after manual compaction. The local PostgreSQL reproduction (the bloat harness under
-`scripts/perf`: the same burst against a fresh store, a store after one round plus teardown, and a store after
-compaction, comparing each hot statement's shared buffers, `LWLock:BufferContent` share and the queue updates' HOT
-share) is the developer gate before a commit; it does not replace the live steady-state round.
+and may not be replaced by a rerun after manual compaction. The local PostgreSQL reproduction
+(`scripts/perf/store_layout_bloat_harness.py`: the same admission / claim / completion workload against a compact store,
+the store after one simulated round and its teardown, and the same store after `REINDEX`, recording per phase the
+admitted rows and admission latency percentiles, the `pg_stat_activity` wait mix with the statements waiting on
+`LWLock:BufferContent`, the relation sizes before and after and the queue's HOT update share) is the developer gate
+before a commit; it does not replace the live steady-state round.
 
 ## 4. Traffic Model
 
@@ -273,7 +297,7 @@ The fixed formal request matrix is as follows. Do not guess the P50 count from C
 
 | Scale | P0: XID + SXID | P50: GPU + Host evidence | P100: three node telemetry kinds | Total requests | Ratio P0/P50/P100 |
 |---|---:|---:|---:|---:|---:|
-| 32 clusters × 256 nodes | 500 + 500 | 500 + 500 | 8192 × 3 = 24576 | 26576 | 3.76% / 3.76% / 92.48% |
+| 32 clusters × 256 nodes | 500 + 500 | 500 + 500 | 8192 × 3 = 24576 | 26576 | 3.76% / 3.76% / 92.47% |
 | 50 clusters × 256 nodes | 781 + 781 | 781 + 781 | 12800 × 3 = 38400 | 41524 | 3.76% / 3.76% / 92.48% |
 
 32/50 clusters must each be tested with:
@@ -342,7 +366,9 @@ Region, per-cluster and per-resource-class limits. On a later release:
   constants; and one separate step (`regional_storm_breaker_suite.py`) crosses the threshold on one cluster on purpose
   and judges the trip, the held work, the work in flight, the critical alert, the release and the drain after it.
 
-A release that includes the durable remediation budget must split the Action load test into
+The two tiers, the defaults table and the dispatch selection below apply only to releases before the fixed limits'
+retirement, which still carry the Region / per-cluster / per-resource-class limits; on the current release the action
+runner reads the tier `unbounded`. Those releases must split the Action load test into
 two tiers:
 
 1. **Production-budget tier**: use the production defaults about to be released and verify
@@ -352,7 +378,7 @@ two tiers:
    formal release configuration until it is no longer a bottleneck, and measure the raw
    throughput of dispatcher, Store and Executor.
 
-The current production defaults are:
+The production defaults of those releases are:
 
 | scope | Default |
 |---|---:|
@@ -362,7 +388,7 @@ The current production defaults are:
 | Per failure domain | 1 |
 | Per resource class | 2 |
 
-Every workflow in the current Action model requests `WORKLOAD_MUTATION`,
+On those releases every workflow of the Action model requests `WORKLOAD_MUTATION`,
 `GPU_RUNTIME_MUTATION` and `NODE_LIFECYCLE_MUTATION` at the same time. Therefore
 `--workflows-per-cluster 4` in the production-budget tier actually has at most 2 same-cluster
 workflows active simultaneously, and 32/50 clusters × 4 workflows are also executed in waves
@@ -380,19 +406,20 @@ gives 390/644 s, 307 s and about 12 minutes, and RUNNING climbed to the dispatch
 production-budget figures are the throttle's result: the verdict stays §6.3 (correct throttling,
 no starvation, final convergence), not a regression threshold.
 
-The dispatcher selects the oldest max(100, Region budget + 50) open workflows a tick, at most 400
-(detailed design §9.5; after the fixed limits' retirement, the rows the execution threads work in half the dispatch
-lease, 346 as shipped). The production-budget tier (Region 20) keeps 100; the integrated runner's
+The dispatcher now selects a tick the rows its execution threads work in half the dispatch lease (100..400; 346 for
+the shipped 8 threads and 15 s lease, `dispatch_batch_size`). Before the fixed limits' retirement it selected the oldest
+max(100, Region budget + 50) open workflows a tick, at most 400 (detailed design §9.5). The production-budget tier (Region 20) keeps 100; the integrated runner's
 Region budgets of 128 and 200 give 178 and 250, so every workflow of a 32- or 50-cluster round is
 inside one tick's selection, where the fixed 100 rows made the second 100 workflows of the
 50-cluster round wait for the first (the scheduling model, with per-command completion and
 event-driven telemetry, puts the integrated-50 workflow p99 at about 155 s instead of about 207 s).
 Rounds measured with the fixed 100-row selection are not comparable with later ones.
 
-The current seeded synthetic steps set no `failure_domain`, `fabric_partition` or
-`availability_zone`, so they cannot prove that the failure-domain budget takes effect. Formal
-budget acceptance must give synthetic workflows deterministic domains covering both directions:
-same-domain mutual exclusion and different-domain parallelism.
+The only domain the failure-domain budget reads is the step parameter `fabric_partition` (written by the SXID planner,
+claimed as `domain:<cluster>:<partition>`; `failure_domain` and `availability_zone` are no longer read), besides the job
+token of the steps that stop or restart a job. The current seeded synthetic steps carry no `fabric_partition`, so they
+cannot prove that the fabric-partition budget takes effect. Formal budget acceptance must give synthetic workflows a
+deterministic `fabric_partition` covering both directions: same-domain mutual exclusion and different-domain parallelism.
 
 ### 4.4 Whole-Cluster Correlated Fault on N x 500+ Node Single-AZ Clusters (planned, not yet executed)
 
@@ -407,10 +434,10 @@ power event) produces ≥500 fault-priority requests simultaneously on ≥500 di
 of the same cluster, whereas the 1000-node model of §13.4 sends load in matrix batches, not as a
 whole-cluster wave in the same second.
 
-The baseline topology matches the release defaults: 4 clusters x 512 nodes = 2048 managed
-nodes, one AZ per cluster, AdminConfig `largestClusterNodeCount=512`, `managedNodeCount=2048`,
-`maxClusterQueueDepth=4096`, `aurora.minAcu>=20.5` (derivation rules in Administrator Capacity
-Configuration §6). Before execution the values above must be converged through the formal
+The baseline topology's cluster size matches the release default (512): 4 clusters x 512 nodes = 2048 managed
+nodes, one AZ per cluster, AdminConfig `largestClusterNodeCount=512`, `managedNodeCount=2048` (default 512),
+`maxClusterQueueDepth=4096`, `aurora.minAcu>=20.5` (default 8; derivation rules in Administrator Capacity
+Configuration §5). Before execution the values above must be converged through the formal
 configuration entry point, and `GPU_FAULT_PROCESSOR_FAULT_RESERVED_CLUSTER_DEPTH >= 512` must be
 confirmed in the ConfigMaps of the three CPU roles.
 
@@ -421,7 +448,7 @@ stop/restart and remote command per §4.3. The other 3 clusters keep normal tele
 prove that a single-cluster storm does not spill over.
 
 Acceptance criteria (each corresponds to one derivation rule or runtime self-check in
-Administrator Capacity Configuration §6):
+Administrator Capacity Configuration §5):
 
 1. **The fault reserve holds the whole wave**: all 512 fault requests of the injected cluster
    get 202, and
@@ -430,7 +457,10 @@ Administrator Capacity Configuration §6):
    (this is the reserve taking effect, not a failure).
 2. **Single-cluster depth does not spill over**: for the other 3 clusters
    `gpu_fault_telemetry_spool_rejected_total{scope="cluster"}` and processor 429 are both 0,
-   and `gpu_fault_processor_admission_rejections_total{scope="global"}` is 0.
+   and `gpu_fault_processor_admission_rejections_total{scope="global"}` is 0 (the spool rejection counter carries
+   only a `scope` label, no `cluster_id`, so the per-cluster verdict comes from the load generators' per-cluster status
+   counts; the processor's per-cluster refusals are
+   `gpu_fault_processor_admission_rejections_by_cluster_total`).
 3. **The Aurora floor holds**: HTTP 503 is 0 during the whole wave, and the actual Aurora ACU
    does not exceed 100% of the capacity pre-provisioned by Min 20.5 (if it does, the
    `managedNodeCount/100` ratio needs correction and must be recorded).
@@ -464,6 +494,10 @@ remains the scenario definition.
 - Average CPU usage on the load generator stays below 50%; results are invalid if any resource exceeds 70%.
 - Test at least the 16 and 32 concurrency levels for the same model.
 - Timeouts, connection exhaustion or scheduling jitter on the load generator itself must not be attributed to the control plane.
+- The current runners start one load-generating Pod per synthetic cluster (an Indexed Job with
+  `completions = parallelism = clusters`, so the single-cluster 1000-node model has one), set no anti-affinity, run no
+  no-op calibration and judge no load-generator CPU, recording only `client_cpu_cores`: the Pod count, spread and CPU
+  gates of this section are checked by whoever runs the round and written into the formal record.
 - Before the start gate, the synchronous burst performs at most 5 bounded resolutions of the control-plane hostname and caches and rotates the results within each load-generating process. Every request still opens a new TCP/TLS connection and completes HTTP Host, TLS SNI and certificate verification with the original hostname; a request matrix on the order of 40,000 must not create 40,000 CoreDNS queries at once. Formal results must record the number of DNS resolution attempts, addresses and cache hits; if pre-resolution needs retries, any request bypasses the cache, or a transport retry occurs, the round fails.
 
 ## 6. Acceptance Thresholds
@@ -546,7 +580,8 @@ gpu_fault_processor_lane_wait_seconds
 gpu_fault_processor_admission_rejections_by_path_total
 gpu_fault_store_io_admission_wait_seconds
 gpu_fault_postgres_pool_checkout_wait_seconds
-gpu_fault_processor_claim_seconds
+gpu_fault_processor_claim_seconds_sum
+gpu_fault_processor_claim_seconds_max
 gpu_fault_telemetry_spool_depth
 gpu_fault_telemetry_spool_in_flight_bytes
 gpu_fault_event_loop_lag_seconds
