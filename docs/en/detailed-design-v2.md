@@ -1015,7 +1015,7 @@ unreadable config), `tests/regional/test_release_stability_window.py` (the windo
 ### 3.0 Module Inventory and Template
 
 The suggested outline listed 10 modules, of which "AMD / Intel Adapter" is not implemented (§11), while the implementation has three additional
-load-bearing modules that must be spelled out: **Cluster Action Executor** (the only data-plane process that holds HyperPod change credentials and the only one that executes
+load-bearing modules that must be spelled out: **Cluster Action Executor** (the only data-plane process that holds provider change credentials and the only one that executes
 isolation/shutdown-class Kubernetes changes), **Processor** (the single entry point and lease layer for all writes), and
 **Installation Resource Registry** (the source of truth for AWS resources during deployment and uninstallation). This chapter covers
 13 modules, each with a fixed set of 12 sections:
@@ -1034,7 +1034,7 @@ isolation/shutdown-class Kubernetes changes), **Processor** (the single entry po
 | 3.6 | Fault orchestration and state machine | control-plane worker | `src/gpu_fault/orchestration/` |
 | 3.7 | Remediation Worker | control-plane worker | `src/gpu_fault/execution/` |
 | 3.8 | Kubernetes operation adapter | data-plane executor | `src/gpu_fault/adapters/kubernetes/` |
-| 3.9 | Cluster Action Executor | data-plane Deployment | package `src/gpu_fault/cluster_executor/` (`regional_client.py` outbound HTTP and fleet/HyperPod proxy, `lease.py` lease renewal and reporting, `dispatch.py` verification and dispatch, `executor.py` claim loop, `bootstrap.py` assembly and entry point) |
+| 3.9 | Cluster Action Executor | data-plane Deployment | package `src/gpu_fault/cluster_executor/` (`regional_client.py` outbound HTTP and fleet/HyperPod proxy, `lease.py` lease renewal and reporting, `dispatch.py` verification and dispatch, `batching.py` step-by-step execution of compound commands, `executor.py` claim loop, `node_key_sync.py` filling in missing node keys, `node_inventory.py` node inventory, `metrics.py` its own metrics, `bootstrap.py` assembly and entry point) |
 | 3.10 | Proactive diagnostics service | control-plane worker + node Agent | `src/gpu_fault/processor_diagnostics.py`, `src/gpu_fault/node_agent/operations/diagnostics.py` |
 | 3.11 | Notification service | control-plane worker | `src/gpu_fault/notifications/` |
 | 3.12 | Processor | all control-plane roles | `src/gpu_fault/processor/` |
@@ -1044,9 +1044,9 @@ isolation/shutdown-class Kubernetes changes), **Processor** (the single entry po
 
 **① Module responsibilities**: executes **signed node actions** on GPU nodes, and executes only signed actions.
 It is the landing point for node-owned operations such as diagnostics collection, `QUIESCE_GPU_SERVICES` / `VERIFY_NO_GPU_CLIENTS`, GPU/fabric reset,
-`RESTORE_GPU_SERVICES`, `RESTART_FABRIC_MANAGER`, and driver/firmware repair. `RESTART_NODE` / `REPLACE_NODE` do not go through the Node Agent;
-they are handled by the HyperPod
-lifecycle adapter or the managed recovery observer. The Agent has **no** autonomous decision-making:
+`RESTORE_GPU_SERVICES`, `RESTART_FABRIC_MANAGER`, and driver/firmware repair (plus drain-P2P recovery `RECOVER_DRAIN_P2P`, hung-process
+evidence collection and collector outbox maintenance). `RESTART_NODE` / `REPLACE_NODE` do not go through the Node Agent;
+they are handled by the provider lifecycle adapter (HyperPod or EKS) or the managed recovery observer. The Agent has **no** autonomous decision-making:
 it does not read policy, does not look at thresholds, and does not act on its own when disconnected; every "whether to do it" is decided by the control plane.
 
 The regional production Installer enables GPU reset, fabric reset, service quiesce, and Fabric
@@ -1088,15 +1088,24 @@ this is not a configuration entry point for turning off the production final che
 `executor.py` (operation dispatch and command whitelist), `ledger.py` (SQLite receipt ledger),
 `quiesce.py` (service/process/container quiesce and restore), `protocol.py` (command and result models),
 `late_ownership.py` (post-dequeue single-use permit and physical check), `late_ownership_http.py` (challenge/permit handling on the original HTTP
-endpoints), `heartbeat.py` (signed heartbeat and generation write-back), `operations/` (9
-operation mixins; `operations/registry.py` maps 16 operations to handlers),
+endpoints), `heartbeat.py` (signed heartbeat and generation write-back), `gpu_activity.py` (mutual exclusion between a quiesce window and
+the Agent's own GPU work, see ④), `quiesce_persistence.py` (target-scoped persistence release and restore), `fabric_manager_restart.py`,
+`query_clients.py` (device holders that only read the GPU), passive communication observation (`passive_communication.py`,
+`communication_*.py`, `observation_*.py`: bounded subprocesses and budgets), `operations/` (9 operation mixins; `OPERATION_HANDLERS` in
+`operations/registry.py` maps 18 operations to handlers and is checked at import against the NODE_ACTION set of `operation_registry`),
 `config.py` (configuration digest, see ⑧).
 
 **④ Thread/coroutine model**: single-process uvicorn, single worker. HTTP handling is asyncio; the actual actions run
 blocking subprocesses (`nvidia-smi`, `systemctl`, diagnostics/repair scripts) in a thread pool. Execution for the same `command_id` is
 serialized by the ledger; different `command_id`s run concurrently on `GPU_FAULT_NODE_ACTION_WORKERS` (default 4) threads,
-with **no operation-level conflict detection**: the only cross-command barrier is the quiesce window's single-reset declaration
-(`quiesce.py`: a second `RESET_GPU` within the same incident returns a FAILED result, not an HTTP rejection);
+with **no general operation-level conflict detection**. There are exactly two cross-command barriers: the quiesce window's single-reset
+declaration (`quiesce.py`: a second `RESET_GPU` within the same incident returns a FAILED result, not an HTTP rejection), and the quiesce
+window's exclusion of the Agent's own GPU work (`gpu_activity.py`): while a window is open (a quiesce state file of this boot, or a QUIESCE
+still running), another incident's `GPU_ACTIVITY_OPERATIONS` (DCGM/field/NVLink74 diagnostics, diagnostic bundles, hung collection,
+`TRIGGER_HEALTH_SNAPSHOT`) are refused at admission with `GPU_MAINTENANCE_WINDOW_OPEN` (409, retryable, nothing reaches the ledger) and the
+control plane resubmits them once the window closes; a QUIESCE marks the window first, flags foreign activities in flight as overlapped and
+waits up to 30s for them (`DEFAULT_WINDOW_DRAIN_SECONDS`); an overlapped activity stops at its next subprocess spawn and ends as a retryable
+failure, never with a verdict; `VERIFY_NO_GPU_CLIENTS` and the reset's own re-checks fail closed while a registered activity is in flight.
 `ACTION_CONFLICT` is merely the fallback code for a ValueError that matched no other rejection message and cannot be treated as complete operation
 conflict detection. Protected actions must still pass quiesce, fencing, device occupancy, and the final ownership permit; a physical-action mutual-exclusion guarantee cannot be derived from thread-pool
 concurrency.
@@ -1156,8 +1165,8 @@ any AWS management permission from this, nor touches the AWS API.
    `GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST`, and on mismatch the whole fleet consistency gate fails and
    all node-side steps are refused dispatch. This pin **must** be derived from
    `src/gpu_fault/node_agent/config.py::agent_config_payload`; a field list must not be hand-copied in the deployment
-   script. It was hand-copied once: the quiesce service list in the script and the Agent's real list differed in length,
-   causing every node action to fail permanently.
+   script: a hand-copied list that differs from the Agent's real values in a single place (the length of the quiesce service
+   list, say) makes every node action fail permanently.
 5. **Post-dequeue final ownership permit**: bound to the original command, nonce, Agent generation, and fencing;
    the safety conditions, cancellation state, and original deadline are reconfirmed before and after the local client check, and the deadline cannot be extended by receiving a permit again.
    A refusal must be handed to the operator and cannot be escalated to reboot/replace as a reset failure. When the final device-holder recheck
@@ -1202,7 +1211,7 @@ The Agent **exposes no Prometheus endpoint**; its health can only be observed fr
 the control plane's stale-agent decision, not the Agent alerting on its own.
 
 **⑪ Exception handling**: all rejections go through `src/gpu_fault/node_agent/app.py::_node_action_rejection`,
-with a fixed response body `{code, message, retryable, requires_new_command}`:
+with a fixed response body `{code, message, retryable, requires_new_command}` (`OWNERSHIP_REFUSED` additionally merges the refused action's details):
 
 | `code` | HTTP | retryable | requires_new_command |
 |---|---:|---|---|
@@ -1215,7 +1224,9 @@ with a fixed response body `{code, message, retryable, requires_new_command}`:
 | `COMMAND_EXPIRED` | 410 | yes | yes |
 | `INVALID_TTL` | 422 | no | yes |
 | `STALE_FENCING_TOKEN` | 409 | yes | yes |
+| `GPU_MAINTENANCE_WINDOW_OPEN` | 409 | yes | no |
 | `COMMAND_ID_REUSED` | 409 | no | no |
+| `OWNERSHIP_REFUSED` | 409 | no | no |
 | `ACTION_CONFLICT` | 409 | no | no |
 
 Exceptions during execution are always **converted into results** rather than HTTP 5xx: subprocess non-zero exit → `FAILED`, with the
@@ -1229,7 +1240,7 @@ are restored as-is and deleted. An out-of-band reboot takes the transient timer 
 incident could never quiesce again, while `assert_quiesced` would release
 RESET_GPU on a boot that was never quiesced. Files for the current boot whose timer still exists are in-flight maintenance windows, and an Agent restart must not touch them.
 
-**⑫ Unit test scope**: positive/negative cases for signature verification (including `node_action_key_version` rotation); each of the eleven rejection codes
+**⑫ Unit test scope**: positive/negative cases for signature verification (including `node_action_key_version` rotation); each of the thirteen rejection codes
 asserted individually for HTTP and the three boolean bits; resubmitting the same `command_id` returns the same result without a second execution;
 `fencing_token` regression is rejected; old-generation commands are rejected after an Agent restart; ledger retention and cap trimming;
 the full quiesce → restore round trip (including the failsafe trigger path); `config_digest` changes for
@@ -1267,7 +1278,7 @@ production api-ha (the real ingress) 32 / 1024 / 30, control-worker and spool-wo
 
 **⑤ Start/stop procedure**: see §2.4. The FM collector has `After=nvidia-fabricmanager.service` and restores its read offset from
 `fabric-manager-collector-state.json` to avoid replaying the whole log after a restart. The offset decides
-"same file" by inode (`st_dev` changes across reboots; one reboot once treated the device-number change as a file switch, reset the offset to zero, and replayed the entire log);
+"same file" by inode (`st_dev` changes across reboots; judging by device number would treat a reboot as a file switch, reset the offset to zero, and replay the entire log);
 lines whose own timestamp is older than the read time by `GPU_FAULT_FABRIC_MANAGER_MAX_LINE_AGE_SECONDS` (default 900 seconds)
 only advance the offset and are not reported; the control plane then, using `collected_at - observed_at` exceeding
 `GPU_FAULT_FABRIC_LOG_MAX_AGE_SECONDS` (default 900 seconds) as the criterion, records such entries as `rejected-event:`
@@ -1288,14 +1299,14 @@ edge-detection premise "exporter refresh period ≤ 8 × collection interval"; o
 (`DCGM_COLLECTOR_INTERVAL_SECONDS = 15` × 1000); the contract test reads the two
 15 s defaults from the install script and the collector source and pins the seconds to agree, milliseconds = seconds × 1000, the ≤ 8× upper bound, and the literal 15000 (changing it means re-reviewing
 the duty-cycle carry-over window); the unit default and the DaemonSet's `-c` are likewise pinned to this constant. Two caveats:
-the legacy all-in-one path `deploy/hyperpod/deploy.sh` only applies a same-value sed to the DaemonSet, and the install Job it creates passes an empty
+the all-in-one path `deploy/hyperpod/deploy.sh` only applies a same-value sed to the DaemonSet, and the install Job it creates passes an empty
 `DCGM_EXPORTER_INTERVAL_MS`, so `existing`-mode nodes installed through that path do not know the period; the reconciler passes
-`--dcgm-exporter-interval-ms` to every install Job, and a `GPU_FAULT_INSTALLER_BUNDLE_SHA256` hand-pinned to a version before this one
-makes the old installer exit with "unknown argument" (the install bundle shipped with the same release is unaffected). After splitting the instance-type inventory into
-`gpu_fault.gpu_instance_inventory` and counting only it and the cadence constant into the dcgm digest, other reconciler changes no longer
-add a dcgm entry to every GPU cluster's release plan, re-apply, and wait for rollout status (this never restarted the exporter Pod before,
-it was just one pointless extra apply). Hence 9400 is visible only to the
-metrics collector on the same node; Prometheus scraping from outside the cluster or across nodes is no longer available; to see these
+`--dcgm-exporter-interval-ms` to every install Job, so hand-pinning an older install bundle that does not know the argument
+(`GPU_FAULT_INSTALLER_BUNDLE_SHA256`) makes the installer exit with "unknown argument" (the install bundle shipped with the same release is unaffected).
+The digest inputs of the dcgm component (`component_inputs.dcgm` in `config/release-identity.yaml`) are only the counter list, the DaemonSet template,
+`gpu_fault.dcgm_exporter_cadence`, `gpu_fault.gpu_instance_inventory` and two rendering modules, not the node installer reconciler, so other reconciler
+changes do not add a dcgm entry to every GPU cluster's release plan, re-apply, and wait for rollout status. The exporter binds loopback only, so 9400 is visible only to the
+metrics collector on the same node; Prometheus scraping from outside the cluster or across nodes is not available; to see these
 counters on the control plane, the only path is the `/v1/collector-events/gpu-metrics` channel. The DaemonSet uses
 `nodeAffinity` rather than nodeSelector, listing the supported GPU instance types exactly by `node.kubernetes.io/instance-type`;
 this list is rendered by `regional_release_rendering.render_dcgm_exporter_manifest`
@@ -1312,10 +1323,9 @@ priority 50** (`is_routine_payload` returns False when `collection_errors` is pr
 "the collection itself is broken" is not queued at the tail as a routine heartbeat. The control plane records a batch carrying `collection_errors` as
 a node-level WARNING finding `dcgm_field_completeness` (`SITE_DCGM_FIELD_COMPLETENESS`),
 **and the next clean scrape clears it**: `GpuMetricsService.ingest` reads the existing state of that key together with the sample, and
-when the batch has no errors and the existing finding is non-empty it writes `(key, None, observed_at)`. Before 2026-09-09 this step did not exist;
-the WARNING left by the one or two failed scrapes when the collector came up before dcgm-exporter after a node reboot stayed active forever, and
-every validation recovery by `VALIDATE_GPU` for that node was refused with `active_gpu_health_findings`
-(the cleanup in DESTR-014 attempt 10 failed because of this).
+when the batch has no errors and the existing finding is non-empty it writes `(key, None, observed_at)`. Without this step
+the WARNING left by the one or two failed scrapes when the collector comes up before dcgm-exporter after a node reboot would stay active forever, and
+every validation recovery by `VALIDATE_GPU` for that node would be refused with `active_gpu_health_findings`.
 **Booked is not actionable**: the finding is booked with `automatic_action=NO_ACTION` -- status, metrics and readers
 still see the telemetry gap, and `VALIDATE_GPU` still refuses while it is active -- but it opens no incident and no
 workflow. Only once the node's GPU-metrics collector has sent error batches back to back (no clean batch in between)
@@ -1323,24 +1333,23 @@ for `GPU_FAULT_DCGM_COLLECTION_ERROR_SUSTAIN_SECONDS` (`GpuMetricsThresholds.col
 default 180, 15-900; measured on batch `observed_at` from the streak's first error batch) does it escalate to
 `RUN_DIAGNOSTICS` and open exactly one NODE_HEALTH incident through the existing path (an action change is an
 activation, the thermal consecutive-breach model). The streak start lives in the finding itself: its `observed_at` and
-`finding_id` are the first error batch's, the state's `observed_at` follows the latest batch, so memory, SQLite and
-PostgreSQL need no schema change and older code still decodes it; one streak has one event id
+`finding_id` are the first error batch's, the state's `observed_at` follows the latest batch, so the stores need no
+extra column; one streak has one event id
 (`gpu-<first batch id>-dcgm-fields`), replays are idempotent, late batches are still dropped by the state's time
-fence, and a finding an older release booked with `RUN_DIAGNOSTICS` stays escalated without activating again
+fence, and a finding already booked with `RUN_DIAGNOSTICS` stays escalated without activating again
 (`gpu_collection_errors.collection_error_finding`). 180 s is the 6th consecutive failure of the 15 s collector (its
-backoff reports at 0/15/30/60/120/180 s) and six times the longest live exporter-roll outage (< 30 s); an exporter
-that comes up after the collector at boot is covered by the 300 s startup grace above. Live lesson: a release
-re-rendered the dcgm-exporter DaemonSet, exactly one scrape inside the Pod restart failed and the next batch 15 s
-later was clean, yet the old logic opened the diagnostic incident at once; its `VALIDATE_GPU` ran 3 s before the clean
-batch cleared the finding and refused, the DRAIN successor quarantined a healthy node, and its WAITING
-diagnostic-bundle command failed the release's `rollout_wave_safety` probe and forced a rollback whose own exporter
-re-render repeated the sequence.
+backoff reports at 0/15/30/60/120/180 s) and six times an exporter-roll outage (typically < 30 s); an exporter
+that comes up after the collector at boot is covered by the 300 s startup grace above. The cost of having no sustain
+window: when a release re-renders the dcgm-exporter DaemonSet, one scrape failing inside the Pod restart (the next batch
+15 s later already clean) would open the diagnostic incident; its `VALIDATE_GPU` could run before the clean batch cleared
+the finding and refuse, the DRAIN successor would quarantine a healthy node, and its WAITING diagnostic-bundle command would
+fail the release's `rollout_wave_safety` probe and force a rollback whose own exporter re-render repeats the sequence.
 **Completeness is judged GPU by GPU**: the collector's required-field check runs per GPU
 (`collectors/gpu/completeness.completeness_errors`, `dcgm_fields.missing_dcgm_metric_groups_by_gpu`) over what the
 exporter actually served and the parser kept -- a blank or non-finite slot is already gone, so it counts as
 missing, never as a healthy reading -- and a field another GPU still reports never stands in for the GPU that
-lacks it (GF-GENERAL-LIVE-025 `one_gpu_missing`; the check used to run over the union of the whole batch's
-fields, which hid the gap). A group no GPU reports keeps the old message
+lacks it (a check over the union of the whole batch's fields would hide the gap; acceptance case GF-GENERAL-LIVE-025
+`one_gpu_missing`). A group no GPU reports keeps the old message
 `DCGM exporter is missing required fields: <groups>`; a group only some GPUs lack is reported per GPU as
 `DCGM exporter is missing required fields on <GPU UUID>: <groups>`, so the finding's reason names the GPU and the
 field group. The nvidia-smi temperature limits, cached for the process's life, are not judged, so a replaced
@@ -1352,9 +1361,9 @@ scrape after erroring batches (failed-scrape error batches included) is delivere
 `GPU_FAULT_DCGM_COLLECTION_ERROR_SUSTAIN_SECONDS` since its first delivery (the collecting node's own environment,
 default 180 like the control plane's) unless another delivery already covered the window
 (`fields-incomplete-sustained`), so a persisting gap opens its one diagnostic at the window at the cost of one or
-two extra deliveries, not one per tick. Before, a batch with missing fields reached the control plane only with the
-next health summary: the finding opened late, the clean batch after the recovery was filtered as an unchanged
-healthy batch so the finding cleared only at the following summary, and a persisting gap escalated only when two
+two extra deliveries, not one per tick. Were a batch with missing fields to reach the control plane only with the
+next health summary, the finding would open late, the clean batch after the recovery would be filtered as an unchanged
+healthy batch so the finding cleared only at the following summary, and a persisting gap would escalate only when two
 summaries both happened to be incomplete.
 Raised while a RUNNING node-exclusive chain quiesces, resets or reboots the node (the eks-managed quiesce taint evicted
 the exporter and the collector's scrape failed before the quiesce stopped it), the finding is that chain's own side
@@ -1398,7 +1407,8 @@ legitimate maintenance is reported once and becomes the baseline.
 `GPU_FAULT_DCGM_POWER_LIMIT_RATIO=0.95` with
 `GPU_FAULT_DCGM_POWER_CORRELATION_MIN_UTILIZATION_PERCENT=80` (power pegged at the cap under low utilization
 does not count as an anomaly), `GPU_FAULT_DCGM_RETIRED_PAGES_DBE_DELTA_CRITICAL=1`. The metric policy version
-`site-dcgm-metric-policy/v4` is defined in `src/gpu_fault/gpu_metric_models.py`, increments with decision-semantics
+`site-dcgm-metric-policy/v5` (`SITE_METRIC_POLICY_VERSION`) is defined in `src/gpu_fault/gpu_metric_models.py`, with
+`site-dcgm-correlation/v3` (`gpu_composites.SITE_CORRELATION_POLICY_VERSION`) for the composite correlation; it increments with decision-semantics
 changes, and is carried in events; **interpreting historical events must start with this version number**.
 
 **⑩ Logs/metrics/alerts**: every sample logs `node_id`, `channel`, `sample_count`,
@@ -1408,7 +1418,9 @@ The control plane exports the GPU/EFA/NVLink metric families (§10.2). Collectio
 
 **⑪ Exception handling**: `nvidia-smi` unavailable → the inventory channel reports `collection_errors`,
 the control plane sets that node's GPU product to unknown, and thereafter **the policy cannot branch by model** and falls back to the most conservative branch;
-DCGM port unreachable → automatically degrades to `nvidia-smi` mode per configuration; FM log missing → the SXID channel goes silent,
+DCGM port unreachable → no mode switch at runtime, failed scrapes are reported as `collection_errors` (⑦); `nvidia-smi` mode is chosen only
+at install time (`--metrics-mode auto`: `dcgm` when the exporter is ready, otherwise `nvidia-smi` only if the nvidia-smi metrics collector is
+explicitly enabled, otherwise the install fails); FM log missing → the SXID channel goes silent,
 and the silence scan alerts instead of pretending health.
 
 The same `nvidia-smi` failure is **not a decision** on the host-side GPU inventory: when not a single UUID is listed
@@ -1456,7 +1468,7 @@ batcher; synchronous transactions are not on the event loop. Decode pools are sp
 `GPU_FAULT_INGRESS_DECODE_WORKERS` (bare default 8 threads, in-flight 128, 5s timeout; production api-ha
 32 / 1024 / 30, control-worker 4 / 32 / 5), while the fault path
 (FAULT prefixes such as `/v1/gpu-events/*`, `/v1/provider-events/*`, `/v1/attempts/*`) goes through the separate
-`GPU_FAULT_FAULT_DECODE_WORKERS` pool (default 8 threads, in-flight 256), so a telemetry flood no longer crowds out the decoding of fault events; the per-item
+`GPU_FAULT_FAULT_DECODE_WORKERS` pool (default 8 threads, in-flight 256), so a telemetry flood cannot crowd out the decoding of fault events; the per-item
 `cluster_id` verification traversal is also done in the decode pool and does not occupy the event loop.
 
 **⑤ Start/stop procedure** — follows the process; the four admission batchers `close()` on shutdown (§2.8).
@@ -1488,8 +1500,9 @@ node-log/host-telemetry take turns claiming with priority within the original li
 and an empty channel hands its turn to the other channel in the same pool. The mechanism covers the queued path; it does not count
 inventory already diverted by the spool as processor backlog, nor does it widen fault-period concurrency or change the priority within the Store.
 
-**⑩ Logs/metrics/alerts** — enqueue log fields `path`, `cluster_id`, `priority`,
-`processor_request_id`, `ordering_key`, `admission_decision`. The order for diagnosing a production problem is
+**⑩ Logs/metrics/alerts** — ingress logs no line per enqueued request (uvicorn `--no-access-log`; only refusals and failures are logged at
+WARNING/ERROR); diagnosis reads the queue row and the receipt: `path`, `cluster_id`, `priority`,
+`processor_request_id`, `ordering_key`. The order for diagnosing a production problem is
 **first look at `processor_request.response_status` and the policy disposition, then at the step sequence** —
 HTTP 202 only means the enqueue succeeded, not that the payload is valid.
 
@@ -1523,8 +1536,10 @@ periodic-task lease.
 
 **⑤ Start/stop procedure** — starts and stops with the worker role; no local cache needs warming, all state is in Aurora.
 
-**⑥ Dependent services** — Aurora; HyperPod DescribeCluster/ListClusterNodes (proxied by the data-plane executor,
-the control plane does not connect directly); the Kubernetes node resources collector.
+**⑥ Dependent services** — Aurora; HyperPod `DescribeCluster`/`ListClusterNodes`/`DescribeClusterNode` (read directly by the
+control-plane worker with its own role, which holds SageMaker read-only plus the Region's `ec2:DescribeInstances` and nothing else,
+`admin/bootstrap_iam_policies.py`; mutating APIs exist only on the executor, and an eks-managed cluster has no HyperPod identity refresh);
+the Kubernetes node resources collector.
 
 **⑦ Timeouts/retries/circuit breakers** — `GPU_FAULT_PROCESSOR_GPU_INVENTORY_STALE_SECONDS=180`,
 `GPU_FAULT_GPU_INVENTORY_SILENT_AFTER_SECONDS=180`,
@@ -1537,14 +1552,14 @@ The IDLE/UNKNOWN decision of `workload_state` (`WorkloadTopologyService.resolve`
 `UNKNOWN`, `IDLE` is backfilled only if the cluster has
 **any attempt observation or one coverage heartbeat** within `GPU_FAULT_WORKLOAD_CONTEXT_FRESHNESS_SECONDS` (600s) (§2.7, `get_workload_coverage_heartbeat`) and no observation hits
 that node; otherwise it stays `UNKNOWN`, and destructive node-health plans compile to
-`BLOCKED NEEDS_OPERATOR`. Before the heartbeat joined the decision, on an idle cluster with no managed jobs every XID
-plan would be BLOCKED(UNKNOWN) after 10 minutes — that misjudged "no jobs" as "monitoring lost"; now only a stopped watcher yields
+`BLOCKED NEEDS_OPERATOR`. Without the coverage heartbeat, on an idle cluster with no managed jobs every XID
+plan would be BLOCKED(UNKNOWN) after 10 minutes — misjudging "no jobs" as "monitoring lost"; with it, only a stopped watcher yields
 `UNKNOWN`, which is exactly the desired fail-closed. Heartbeats arrive at most once every 120 s (`coverage_heartbeat_interval_seconds`
 default 120); by the rule "heartbeat interval ≤ 1/5 of the freshness period", 600 s is already the lower bound of freshness, and tightening it requires
 shrinking the heartbeat interval in step. `resolve` reads a **bounded newest-first window**
 (`OBSERVATION_SCAN_LIMIT=512` attempt observation states, early-stopped by `observed_at`): the newest one decides
-coverage, and matching stops beyond 120s; before 2026-09-08 every event pulled the cluster's entire set of observations and then filtered in Python,
-which was O(events × attempts).
+coverage, and matching stops beyond 120s, instead of pulling the cluster's entire set of observations for every event and filtering in Python
+(which is O(events × attempts)).
 
 **⑧ Idempotency and concurrency control** — device identity is `(cluster_id, node_id, gpu_uuid)`; MIG appears as
 a UUID prefix.
@@ -1601,7 +1616,7 @@ the YAML packaged into the wheel, verifies the sha256 and structure, compiles it
 `GPU_FAULT_FAULT_ACTION_MAX_AGE_SECONDS=900` (expired action requests are no longer executed; but when the event's
 `source_boot_id` matches the Agent's current `boot_id`, the Agent is ACTIVE and the lease is fresh, the age is only recorded as a
 `FAULT_AGE_OVER_LIMIT` annotation and does not block — boot identity is the stronger proof of "same generation", and age is the fallback when
-`boot_id` is missing; a processor backlog over 15 minutes no longer turns every fault into isolation).
+`boot_id` is missing; a processor backlog over 15 minutes does not turn every fault into isolation either).
 The circuit breaker is embodied in the ladder: repeated failures on the same target escalate along `recovery_rank`, ending at
 `ESCALATE_SUPPORT`/`CHECK_MECHANICALS` instead of retrying the same action indefinitely.
 
@@ -1614,9 +1629,9 @@ and if any one fails the whole batch is rejected — **better not to decide than
 **⑨ Configuration parameters** — for thresholds see §3.2 ⑨; `recovery_rank` is the **globally unique** operation ladder
 (`operation_registry.py`, by rank value): 10 RUN_DCGM_DIAGNOSTIC / RESTART_FABRIC_MANAGER /
 RUN_FIELD_DIAGNOSTIC < 15 RESTART_EFA_DEVICE_PLUGIN / RESTART_GPU_DEVICE_PLUGIN <
-20 RESTART_WORKLOAD < 30 RESET_GPU < 35 REMEDIATE_EFA_DRIVER < 40 RESET_ALL_GPUS_NVSWITCHES <
+20 RESTART_WORKLOAD < 30 RESET_GPU / RECOVER_DRAIN_P2P < 35 REMEDIATE_EFA_DRIVER < 40 RESET_ALL_GPUS_NVSWITCHES <
 50 RESTART_NODE < 60 QUARANTINE < 70 REMEDIATE_DRIVER / UPDATE_SOFTWARE_FIRMWARE <
-75 REPLACE_NODE < 80 CHECK_MECHANICALS / ESCALATE_SUPPORT; the remaining 17 observe/isolate/restore-class
+75 REPLACE_NODE < 80 CHECK_MECHANICALS / ESCALATE_SUPPORT (`RECOVERY_OPERATION_RANK`); the remaining 18 observe/isolate/restore-class
 operations have rank 0. `RUN_DIAGNOSTICS` and `DRAIN` are `RecoveryAction` values rather than operations,
 and are not on this ladder. There is no second per-cluster override ladder.
 
@@ -1654,8 +1669,9 @@ long actions are not awaited here but are materialized as steps and handed to §
 
 **⑥ Dependent services** — Aurora; notification service; policy engine.
 
-**⑦ Timeouts/retries/circuit breakers** — a single queue request executes for at most `REQUEST_MAX_EXECUTION_SECONDS=120`,
-response timeout 115s, lease 150s, renewed every 10s. Beyond that the request fails and can be re-claimed.
+**⑦ Timeouts/retries/circuit breakers** — a single queue request executes for at most `GPU_FAULT_PROCESSOR_REQUEST_MAX_EXECUTION_SECONDS=120`
+(bare default 30), response timeout 115s (`GPU_FAULT_PROCESSOR_RESPONSE_TIMEOUT_SECONDS`), lease 150s (`GPU_FAULT_PROCESSOR_REQUEST_LEASE_SECONDS`,
+bare default 120), renewed every 10s (`..._REQUEST_RENEW_SECONDS`, bare default 5). Beyond that the request fails and can be re-claimed.
 Incident-level circuit breaker: repeated failures escalate along the ladder to `ESCALATED`.
 
 **⑧ Idempotency and concurrency control** — threefold: `event_id` deduplication, `correlation_key` folding,
@@ -1664,8 +1680,8 @@ generation and execution state: an unexecuted plan can be replaced, a started pl
 preemption hands over only at safe boundaries and cannot forcibly terminate committed hardware actions. The in-process mutex is
 **a reentrant lock keyed by `(cluster_id, node_id)`** (`orchestration/node_locks.py`): ingestion on the same node
 is serialized, across nodes it is parallel; multi-node calls (distributed XID batches, placement retention, `simulate`) lock in a uniform
-order by sorted keys to prevent deadlocks. Before 2026-09-08 it was a single process-level `RLock` with multiple DB round trips inside the lock, serializing the ingestion of all
-nodes and all clusters into one line. Marker correlation uses the marker's own `cluster_id` as the cluster boundary; only
+order by sorted keys to prevent deadlocks; there is no single process-level lock (with multiple DB round trips inside it, it would serialize the ingestion of all
+nodes and all clusters into one line). Marker correlation uses the marker's own `cluster_id` as the cluster boundary; only
 legacy records lacking that field fall back to looking up the incident.
 
 `QUARANTINE` is not a read-only event. `workflow_quarantine` keeps the original node's terminal isolation constraint with
@@ -1676,36 +1692,36 @@ shared restore steps can still serve non-isolated nodes. After a healthy warm sp
 while the isolation branch still targets the fault node. The Kubernetes restore entry point, before any patch or no-op on a nonexistent node,
 refuses to release an original node that is still in the terminal isolation set; a merely planned REPLACE cannot be taken as already switched to the warm spare.
 
-Two additions after the control-plane review of 2026-09-08:
+Three more concurrency and blocking rules:
 
 - **Adoption lock order** (`TransactionalWorkflowMixin`): when one event group merges another group's incident/workflow
   rows into itself, the adopted rows are locked **after** the group's own rows (incident first, then workflow, with a real
   `FOR UPDATE`), and are stamped with the stored `merge_revision + 1`, going through the same generation
   guard as `save_incident`. Two groups concurrently adopting each other can still deadlock on PostgreSQL; 40P01 is classified as retryable, and ingest re-reads
-  and then retries (C-01).
-- **A never-executed `BLOCKED(NEEDS_OPERATOR)` no longer serves as a predecessor** (C-03): such a record is open to the dispatcher,
-  the successors queued behind it can never be dispatched, and during idle periods every fault on the same node lengthens the chain. `workflow_merge`
-  now targets a NEEDS_OPERATOR record that "has run no steps" with `REPLACE_IN_PLACE` — the next event on the same node
+  and then retries.
+- **A never-executed `BLOCKED(NEEDS_OPERATOR)` does not serve as a predecessor**: such a record is open to the dispatcher; as a predecessor,
+  the successors queued behind it could never be dispatched, and during idle periods every fault on the same node would lengthen the chain. `workflow_merge`
+  targets a NEEDS_OPERATOR record that "has run no steps" with `REPLACE_IN_PLACE` — the next event on the same node
   recompiles in place under the original id (history preserved, generation +1), and once the workload becomes ACTIVE `compile_steps` passes
   naturally. As a result, the operations `compile-blocked` mode only has to handle NEEDS_OPERATOR /
   INTERNAL_ERROR records **that have run steps**.
-- **A plan refused only for a missing executable owner contains first, then blocks** (live 2026-10-26: on plain EKS a CRITICAL
-  `row_remap_failure` RMA drain blocked whole at compile time for `memoryDiagnostics: OBSERVE`, the node stayed schedulable
-  with no evidence frozen, and the sweep closed the record as one that "never changed a node"): the node-health and
-  node-lifecycle families now write the containment/evidence prefix compiled before the first unowned step
+- **A plan refused only for a missing executable owner contains first, then blocks** (for example a CRITICAL `row_remap_failure`
+  RMA drain on plain EKS under `memoryDiagnostics: OBSERVE` has no executable owner; blocked whole at compile time, the node would
+  stay schedulable with no evidence frozen, and the sweep would close the record as one that "never changed a node"): the node-health and
+  node-lifecycle families write the containment/evidence prefix compiled before the first unowned step
   (FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → QUARANTINE [terminal-quarantine parameters kept] → COLLECT_DIAGNOSTIC_BUNDLE)
   as `safety_steps` of a `SAFETY_PENDING` record (`WorkflowBuilder.containment_before_block`); the executor runs the prefix
   and settles it `BLOCKED/SAFETY_SETTLED` with the incident `QUARANTINED` -- the fault family's safety-plan shape. The
   record ran steps, so the compile-time sweep leaves it alone; the exit is the validated restore of §9.2 or the QUARANTINED
-  branch of §9.1. A plan whose first step is unowned, one with any other refusal as well (UNKNOWN workload, ARCH-B2), a
-  containment-only plan and a hung-triage DAG keep their previous behaviour.
+  branch of §9.1. A plan whose first step is unowned, one with any other refusal as well (UNKNOWN workload), a
+  containment-only plan and a hung-triage DAG take no such prefix and keep their own compile result.
 
 **⑨ Configuration parameters** — `GPU_FAULT_FAULT_ACTION_MAX_AGE_SECONDS=900`,
 `GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS=1800`,
 `GPU_FAULT_HYPERPOD_POST_REBOOT_STABILIZATION_SECONDS=60`,
 `GPU_FAULT_AGENT_MAINTENANCE_WINDOW_SECONDS=420`.
 
-Aggregation window: `GPU_FAULT_MULTI_NODE_AGGREGATION_WINDOW_SECONDS=5` (multiplied by ⌈log₂ node count⌉, capped at `GPU_FAULT_MULTI_NODE_AGGREGATION_WINDOW_MAX_SECONDS=30`) is the `not_before` of a new workflow, and `aggregation_max_deadline` = cap + `GPU_FAULT_PROCESSOR_DRAIN_MAX_WAIT_SECONDS`. **The window is set only by families that create rows by group key** (node-scope, attempt, SXID, replacement); the independent incident path never calls `_aggregation_deadlines`: CHECK_MECHANICALS, RESTART_FM, CONTACT_SUPPORT on an idle node and pure diagnostic chains have `not_before=None` and are dispatchable as soon as the row is created. On 2026-09-09 (performance 5) skipping the window by step shape was evaluated — "no window if the official steps contain no `merge_intent`/`multi_node_barrier` operation" — and **rejected**: mergeability is determined by group-key reachability plus `disposition()`, independent of operation semantics. Sibling events of the same attempt within the window ABSORB/WIDEN into any PENDING row that has not been claimed, and this holds alike for the FREEZE_EVIDENCE→CHECK_MECHANICALS, →RESTART_FABRIC_MANAGER and RUN_DCGM_DIAGNOSTIC chains (`_widen_node_action_scope` widens all pending steps to both nodes); `merge_intent` is only an input to the generation fence `_generation_fence`, not a merge gate; squeezing `aggregation_max_deadline` down to `now` would also make `_read_only_branch_window_closed` reclassify read-only candidates as QUEUE_SUCCESSOR. Hence none of the windowed family rows is "never mergeable"; the predicate is "rows created by a group-key family get a window, independent rows do not", and `tests/orchestration/test_aggregation_window_predicate.py` pins both sides.
+Aggregation window: `GPU_FAULT_MULTI_NODE_AGGREGATION_WINDOW_SECONDS=5` (multiplied by ⌈log₂ node count⌉, capped at `GPU_FAULT_MULTI_NODE_AGGREGATION_WINDOW_MAX_SECONDS=30`) is the `not_before` of a new workflow, and `aggregation_max_deadline` = cap + `GPU_FAULT_PROCESSOR_DRAIN_MAX_WAIT_SECONDS`. **The window is set only by families that create rows by group key** (node-scope, attempt, SXID, replacement); the independent incident path never calls `_aggregation_deadlines`: CHECK_MECHANICALS, RESTART_FM, CONTACT_SUPPORT on an idle node and pure diagnostic chains have `not_before=None` and are dispatchable as soon as the row is created. Skipping the window by step shape ("no window if the official steps contain no `merge_intent`/`multi_node_barrier` operation") is a **rejected** alternative: mergeability is determined by group-key reachability plus `disposition()`, independent of operation semantics. Sibling events of the same attempt within the window ABSORB/WIDEN into any PENDING row that has not been claimed, and this holds alike for the FREEZE_EVIDENCE→CHECK_MECHANICALS, →RESTART_FABRIC_MANAGER and RUN_DCGM_DIAGNOSTIC chains (`_widen_node_action_scope` widens all pending steps to both nodes); `merge_intent` is only an input to the generation fence `_generation_fence`, not a merge gate; squeezing `aggregation_max_deadline` down to `now` would also make `_read_only_branch_window_closed` reclassify read-only candidates as QUEUE_SUCCESSOR. Hence none of the windowed family rows is "never mergeable"; the predicate is "rows created by a group-key family get a window, independent rows do not", and `tests/orchestration/test_aggregation_window_predicate.py` pins both sides.
 
 **⑩ Logs/metrics/alerts** — `incident_id`, `workflow_id`, `node_id`, `cluster_id`,
 `state`, `operation`, `execution_epoch`, `disposition`. Note: **the terminal-state, step and milestone metrics in the workflow result
@@ -1715,14 +1731,14 @@ actual training recovery success rate; the latter still needs an explicit busine
 **⑪ Exception handling** — see the per-transition table in §6.4. Key constraint: `INCONCLUSIVE`, `BLOCKED`,
 `QUARANTINED` **never downgrade to PASS** — a failed validation is a failed validation; better to remain in the isolated state.
 
-**⑫ Unit test scope** — 6 states × every legal/illegal transition; step construction for the 33 operations;
+**⑫ Unit test scope** — 6 states × every legal/illegal transition; step construction for the 35 operations;
 a more severe event supersedes a running workflow and the old one turns `SUPERSEDED`; `execution_epoch` increments and
 writes from an old epoch are rejected; an audit record exists for every action.
 
 Distributed XID batches also reuse `DagBrancher`: all participants of the allocation share one
 `STOP_WORKLOADS`, each actually affected node has its own recovery branch with an explicit GPU scope, and the final
 `RESTART_WORKLOAD` waits for all valid branches while preserving the original attempt, GPU count and restart budget authorization.
-Multi-node reset steps that require the regional Executor to hold a BarrierCoordinator are no longer generated;
+Multi-node reset steps that require the regional Executor to hold a BarrierCoordinator are not generated;
 the production Executor still does not connect directly to the control-plane database.
 Before expansion, the total step count is computed with `execution.config.MAX_DAG_STEPS=256`, the limit shared with the executor.
 For example, an ordinary 32-node reset needs 258 steps and cannot be saved as a PENDING automatic recovery plan; when the limit is exceeded, the
@@ -1758,7 +1774,7 @@ keeps the same-action aggregation optimization, and does not let a new event's a
 **④ Thread/coroutine model**: 1 scan thread + 2 wakeup listener threads +
 `GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS=8` execution threads, each scan taking a batch of
 `GPU_FAULT_WORKFLOW_BATCH_SIZE` rows: unset, the rows the execution threads work in half the dispatch lease -- a tick takes about
-1 s + 0.15 s per workflow over the workers (8.5 s at 400 on 8, batch 88's measured model), so (lease x 0.5 - 1 s) x workers /
+1 s + 0.15 s per workflow over the workers (8.5 s at 400 on 8 in the tick model, `execution.config.dispatch_batch_size`), so (lease x 0.5 - 1 s) x workers /
 0.15 s, within 100..400 (346 for the shipped 8 workers and 15-s lease); the other half of the lease is margin for a slow Store
 and the model's error. No remediation limit enters the batch: no fixed number caps how many remediations run at once, each GPU
 cluster's remediation storm breaker bounds a correlated fault (§9.5). An explicit batch is kept, and startup warns when a tick
@@ -1767,13 +1783,13 @@ but only one process dispatches at a time: each `run_once` first takes the fleet
 (`GPU_FAULT_WORKFLOW_DISPATCH_LEASE_SECONDS`, default `max(15, 3 × poll interval)` = 15 seconds, renewed by its holder at the start
 of every tick and, inside a tick, at its checkpoints -- every row the sweeps and the scan walk, the end of the scan, every row of the
 batch that finishes -- once a third of the lease has passed since the last renewal;
-the lease owner is the per-process executor id) and returns `lease_held_by_other` without scanning when another process holds it (F-A1). The
+the lease owner is the per-process executor id) and returns `lease_held_by_other` without scanning when another process holds it. The
 threads that execute workflows are the 8 of the lease holder, not 6 × 4 × 8 = 192; the other processes' pools stay idle, and when the
 holder stops renewing, the next process to take the expired lease (≤15 seconds) carries on, with `claim_workflow`'s execution lease
 keeping a single executor per workflow while two holders overlap at the handover. Only progress renews: a holder stuck in one Store
-call, or waiting on rows that never finish, stops renewing and the lease lapses and hands over as before, while a long tick that keeps
-moving no longer loses it. The lease used to be taken once at the start of a tick, so a tick longer than the lease (a holder starved
-of CPU or of the GIL while working a full batch) let the next process's ordinary poll take the lapsed lease and scan again while the
+call, or waiting on rows that never finish, stops renewing and the lease lapses and hands over, while a long tick that keeps
+moving does not lose it. Were the lease taken only once at the start of a tick, a tick longer than the lease (a holder starved
+of CPU or of the GIL while working a full batch) would let the next process's ordinary poll take the lapsed lease and scan again while the
 first was still working its batch. A holder that finds the lease taken at a checkpoint stops: it starts no further sweep row, scan row
 or batch row, the rows it queued but had not started stay PENDING for the new holder, the rows already running finish, and the tick's
 report says `lease_held_by_other` (`gpu_fault_workflow_dispatch_lease_losses_total`, §10.2). The cadence of scanning is the wakeup; the `GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS=5` second poll is only
@@ -1789,7 +1805,7 @@ every one wakes (rows whose `not_before` is in the future are still held back by
 SUCCEEDED/FAILED (so a WAITING step advances immediately); PENDING/LEASED/WAITING belong to the executor side,
 are counted in `wakeups_ignored_total` and not scanned; WAITING write-backs and lease renewals do not send wakeups, otherwise the dispatcher would
 spin on the row it just wrote. `wake()` is an Event; any number of wakeups between two scan rounds coalesce into one scan,
-and a wakeup that lands during a scan causes exactly one extra scan (F-A8's clear-then-scan order). The `wake()` calls in the routes land in the ingress
+and a wakeup that lands during a scan causes exactly one extra scan (the Event is cleared before the scan). The `wake()` calls in the routes land in the ingress
 process and never reach the scan process; crossing processes relies on these two listener threads. A wakeup is only a hint to "scan now"; losing one merely
 falls back to polling. Postgres uses the v14 `gpu_fault_objects` row-level trigger in legacy/dual,
 and the equivalent trigger on the v15/v16 dedicated tables in dedicated; memory/sqlite use the in-process `WakeupHub`.
@@ -1808,37 +1824,37 @@ table); Node Agent (through signed commands).
 | Item | Value |
 |---|---|
 | workflow execution lease | `GPU_FAULT_WORKFLOW_LEASE_DURATION_SECONDS=180` |
-| Lease of a WAITING row | `max(3 × GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS, 30s)` (30s in production, D-7). While a step waits for a remote result the row does not need to be held by the same process for the full 180s; the short lease lets another replica take it over quickly after a dispatcher handover; seeing `execution_lease_expires_at` very close is **not** an anomaly |
-| Start of the rule-A wait window | The **first** `HOLD(node under remediation)` event the dispatcher recorded for that row, not `created_at` (D-11): time spent blocked by the `not_before` aggregation window or by non-terminal predecessors does not count as waiting, otherwise the window would already be exceeded at unblocking and the job would fail at first sight. Each step of the sequential loop re-checks whether the job has already been withdrawn (F-N1 §7) |
-| Stale-fence commands | Remote commands that are still LEASED after a workflow generation change (fencing token mismatch), whose lease has expired and whose result nobody collects, are set to FAILED by the periodic sweep, `status_source="stale-fence"`; a result the executor reports later is kept in `result_details.post_stale_fence_status/_error`, `stale_fence_swept=true` (D-9). This is an audit signal, not a retry entry point |
+| Lease of a WAITING row | `max(3 × GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS, 30s)` (30s in production). While a step waits for a remote result the row does not need to be held by the same process for the full 180s; the short lease lets another replica take it over quickly after a dispatcher handover; seeing `execution_lease_expires_at` very close is **not** an anomaly |
+| Start of the rule-A wait window | The **first** `HOLD(node under remediation)` event the dispatcher recorded for that row, not `created_at`: time spent blocked by the `not_before` aggregation window or by non-terminal predecessors does not count as waiting, otherwise the window would already be exceeded at unblocking and the job would fail at first sight. Each step of the sequential loop re-checks whether the job has already been withdrawn |
+| Stale-fence commands | Remote commands that are still LEASED after a workflow generation change (fencing token mismatch), whose lease has expired and whose result nobody collects, are set to FAILED by the periodic sweep, `status_source="stale-fence"`; a result the executor reports later is kept in `result_details.post_stale_fence_status/_error`, `stale_fence_swept=true`. This is an audit signal, not a retry entry point |
 | remote command claim deadline | `GPU_FAULT_REMOTE_COMMAND_CLAIM_DEADLINE_SECONDS=900`; if nobody claims, the step fails |
-| Compound remote command (performance C) | `GPU_FAULT_REMOTE_STEP_BATCHING=true`: when dispatching a step, if it is the first of a **contiguous** run of node-side steps, mint only one command that carries the whole run. Eligibility predicate: not a DAG (`dag_enabled=false`); contiguous by index starting from that step, truncated at the first ineligible step; every step is within {QUIESCE_GPU_SERVICES, VERIFY_NO_GPU_CLIENTS, RESET_GPU, RESTORE_GPU_SERVICES, TRIGGER_HEALTH_SNAPSHOT} (excluding RESET_ALL_GPUS_NVSWITCHES, RUN_NVLINK74_WORKFLOW, RUN_FIELD_DIAGNOSTIC, REMEDIATE_*, UPDATE_SOFTWARE_FIRMWARE, and also excluding steps owned by other adapters), `node_ids` identical to the first step and exactly one node, same `execution_owner`, no `branch_id`, no `depends_on_step_indexes`, not resolved; the first step's idempotency key must equal `request_id/index/operation` (otherwise no merge); a single step does not count as a batch. Takes effect only once the compatibility policy no longer admits Executors with protocol <3 (see §8.5 item 5) |
+| Compound remote command | `GPU_FAULT_REMOTE_STEP_BATCHING=true` (`src/gpu_fault/remote_step_batching.py`): when dispatching a step, if it is the first of a **contiguous** run of node-side steps, mint only one command that carries the whole run. Eligibility predicate: not a DAG (`dag_enabled=false`); contiguous by index starting from that step, truncated at the first ineligible step; every step is within {QUIESCE_GPU_SERVICES, VERIFY_NO_GPU_CLIENTS, RESET_GPU, RESTORE_GPU_SERVICES, TRIGGER_HEALTH_SNAPSHOT} (excluding RESET_ALL_GPUS_NVSWITCHES, RUN_NVLINK74_WORKFLOW, RUN_FIELD_DIAGNOSTIC, REMEDIATE_*, UPDATE_SOFTWARE_FIRMWARE, and also excluding steps owned by other adapters), `node_ids` identical to the first step and exactly one node, same `execution_owner`, no `branch_id`, no `depends_on_step_indexes`, not resolved; the first step's idempotency key must equal `request_id/index/operation` (otherwise no merge); a single step does not count as a batch. Takes effect only once the compatibility policy no longer admits Executors with protocol <3 (see §8.5 item 5) |
 | Agent heartbeat freshness | `GPU_FAULT_AGENT_MAX_HEARTBEAT_AGE_SECONDS=90`; when exceeded, destructive steps are not dispatched |
 | Quiesce maintenance window | `GPU_FAULT_AGENT_MAINTENANCE_WINDOW_SECONDS=420` (valid range 30–3600). This is the validity period opened **after** `QUIESCE_GPU_SERVICES` succeeds; the effective value is the **smaller** of it and the `failsafe_seconds` reported by each node; once expired, every step except `RESTORE_GPU_SERVICES` fails (`quiesce maintenance window expired at …`) |
 | HyperPod managed recovery wait | 1800s (`GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS`, bare default same as production); 60s stabilization period after restart |
-| Circuit breaker | A `FAILED` workflow **must obtain a new fencing token** to run again; an exhausted restart budget only **withholds `RESTART_WORKLOAD`**: the claim preflight pre-writes that step as FAILED (`RESTART_BUDGET_EXHAUSTED`) and sends a BUDGET_EXHAUSTED notification; cordon / stop / reset / validate / restore run as usual, the workflow ends FAILED, and the incident follows "isolated and not released → QUARANTINED, otherwise → ESCALATED" (before 2026-09-08 the preflight abandoned the whole chain: the node was not repaired and the job was not stopped) |
+| Circuit breaker | A `FAILED` workflow **must obtain a new fencing token** to run again; an exhausted restart budget only **withholds `RESTART_WORKLOAD`**: the claim preflight pre-writes that step as FAILED (`RESTART_BUDGET_EXHAUSTED`) and sends a BUDGET_EXHAUSTED notification; cordon / stop / reset / validate / restore run as usual, the workflow ends FAILED, and the incident follows "isolated and not released → QUARANTINED, otherwise → ESCALATED" (the preflight does not abandon the whole chain: the node is still repaired and the job still stopped) |
 | after_incident restart wait | While the repair workflow it depends on is still open, the passive path's `RESTART_WORKLOAD` wait ceiling follows that workflow's `lifetime_deadline_at` (if not stamped, the step ceiling of `RESTART_WORKLOAD`); when the repair is terminal, has no id or is unreadable, it falls back to `node_busy_wait_seconds=240`. The dispatcher's 240 s for **not-yet-started** job workflows is unchanged |
 
 **⑧ Idempotency and concurrency control**: `execution_epoch` + fencing token are the core: the taker-over increments the epoch,
 and any write by the old holder is rejected (409). Node-side idempotency relies on the `command_id` ledger of §3.1.
-Idempotency of compound commands (performance C): the `command_id` digest covers the first step and all accompanying steps (a single-step command's digest
-is **byte-identical** to before the merge; in-flight commands during an upgrade are not renamed); the command's own `step`/`step_index`/
-`idempotency_key` are still the first step, so old readers keep working. When a step covered by some compound command is dispatched again, **no new command is minted**:
+Idempotency of compound commands: the `command_id` digest covers the first step and all accompanying steps (a single-step command's digest
+is **byte-identical** to the unbatched one, so in-flight commands are not renamed by the switch); the command's own `step`/`step_index`/
+`idempotency_key` are still the first step, so readers that know only single steps keep working. When a step covered by some compound command is dispatched again, **no new command is minted**:
 first look up `find_remote_command_covering_step` by (workflow, fencing_token, step space, index membership),
 and map that step's share in `result_details.batched_results["<step_index>"]` to a result:
 SUCCEEDED → step succeeded (details verbatim), FAILED → step failed (with `remote_status_source`),
 command not terminal → WAITING (`remote_status`, `batched_step_index`). When the compound command is terminal but **never reached** that step
 (it failed or was cancelled at an earlier step), it is treated as not covered and a new command is minted normally: the step never started on the node,
-so the RESTORE compensation the chain dispatches after a RESET failure still really runs on the node as it does today; answering "earlier
+so the RESTORE compensation the chain dispatches after a RESET failure really runs on the node; answering "earlier
 batched step failed" would turn the compensation into a failure record and leave the node quiesced until the agent's fail-safe timer.
 Cancellation: the `remote_command_id` in every covered step's WAITING record is the compound command's id, so the existing
 `preemption_boundary` → `cancel_remote_command` path hits the compound command as-is; cancelling a PENDING
 compound command fails the whole command, a LEASED one gets `cancellation_requested_at`, and the executor checks the
 lease guard between steps and stops before the next step (see §3.9 ⑧).
 Multi-node actions have a barrier; fleet-level actions advance by wave.
-Nodes, job tokens and NVSwitch fabric partitions all now have persistent remediation budget claims, and every GPU cluster has
-a remediation storm breaker; claim, breaker judgement and workflow lease share one transaction (the fixed Region, cluster and
-resource class limits are retired, §9.5). Per executor
+Nodes, job tokens and NVSwitch fabric partitions all have persistent remediation budget claims, and every GPU cluster has
+a remediation storm breaker; claim, breaker judgement and workflow lease share one transaction (there is no fixed Region, cluster or
+resource class concurrency limit, §9.5). Per executor
 `GPU_FAULT_CLUSTER_EXECUTOR_MAX_CONCURRENT_COMMANDS=5`,
 multi-node barrier, fleet wave and restart budget (§9.5, §11).
 
@@ -1850,7 +1866,7 @@ Compound command counts live on the regional adapter: `gpu_fault_remote_command_
 (number of compound commands minted) and `gpu_fault_remote_command_batched_steps_total` (number of accompanying steps, i.e. round trips saved),
 in the same family as `..._open_sibling_holds_total`, keeping the bounded process slot; queries compute per-process deltas first and then sum.
 The Dispatcher backlog metric is **not exported** (§10.2). In the event audit, consecutive waits of the same step are **folded** into one
-STEP_ATTEMPT (RF-2): `attempt` records the "number of attempts with a change" rather than the number of redispatches; when the wait exceeds
+STEP_ATTEMPT: `attempt` records the "number of attempts with a change" rather than the number of redispatches; when the wait exceeds
 that operation's alert threshold, `details.step_waiting_slow=true` lands on the same record, and the log is
 written once at the moment the line is crossed, not repeated on every subsequent redispatch.
 
@@ -1863,7 +1879,7 @@ written once at the moment the line is crossed, not repeated on every subsequent
 2. **transient**: errors that `transient_errors.py` recognizes are retried; all others fail directly.
 3. **safety**: `SAFETY_PENDING` is in `EXECUTABLE_STATUSES`, meaning "run only
    `safety_steps`" (`is_safety = workflow.executes_safety_steps`, i.e. `safety_only or status is SAFETY_PENDING`); it is **not** a manual approval state.
-   The implementation has no approve/cancel endpoints (§8.6, §11).
+   The implementation has no approve/cancel endpoints (§8.7, §11).
 
 **⑫ Unit test scope**: lease preemption and epoch fencing (writes by the old owner get 409); the claim deadline
 being reached fails the step; a stale Agent blocks destructive steps; the held path executes no destructive step;
@@ -1894,9 +1910,8 @@ restart, read-only NodeCondition reads (`src/gpu_fault/adapters/kubernetes/`).
 re-read and retry the patch.
 
 **⑧ Idempotency and concurrency control**: isolation is idempotent: repeated cordon and taint produce the same result.
-Restoring scheduling removes the cordon and the `gpu-fault.io` taint **at the same time**: the passive path once undid only
-half, leaving a taint that made the node permanently unschedulable, so "lift isolation" must do both together, and tests must assert
-both together.
+Restoring scheduling removes the cordon and the `gpu-fault.io` taint **at the same time**: undoing only half leaves a taint
+that makes the node permanently unschedulable, so "lift isolation" must do both together, and tests must assert both together.
 
 **⑨ Configuration parameters**: taint key prefix `gpu-fault.io`; `gpu-fault.io/quarantined:NoSchedule`
 is the quarantine taint (the control plane itself tolerates it, §2.6).
@@ -1913,8 +1928,8 @@ only a 404 on `RESTORE_SCHEDULING` is treated as nothing to do; device-plugin Po
 WAITING (`waiting_for_daemonset_pod: true`) to wait for the DaemonSet to recreate it; only after `restart_timeout_seconds`
 (default 180) does it FAIL, never silently skipped. Among the Pods the label selector lists on the node, one that declares
 volumes but no hostPath at the kubelet `device-plugins` directory is not a device plugin (the upstream k8s-device-plugin
-chart's gpu-feature-discovery/mps-control-daemon carry the plugin's labels and no component label; on a plain EKS cluster
-this FAILED "expected at most one device plugin Pod, found 2"): the restart deletes only the plugin Pod, counts only the
+chart's gpu-feature-discovery/mps-control-daemon carry the plugin's labels and no component label; otherwise a plain EKS
+cluster would FAIL with "expected at most one device plugin Pod, found 2"): the restart deletes only the plugin Pod, counts only the
 plugin's new Pod as its replacement, and records the ignored companions as `companion_pods`
 (`node_operations.companion_pod`). The restart step's record says per node (`details.node_results[<node>]`) what was
 deleted and what replaced it: the delete attempt's receipt carries `deleted_pod` (namespace/name) and
@@ -1923,9 +1938,9 @@ FAILED record keep `deleted_pod_uid` (read from the node's own `gpu-fault.io/<gp
 annotation, the product's authority on which Pod went) and carry the `deleted_pod` of this step's earlier receipt,
 and the SUCCEEDED record adds `replacement_pod_uids` (the UIDs of the newly Ready plugin Pods); a record with
 `already_healthy: true`, or a restart that deleted nothing and only waited for the DaemonSet
-(`waiting_for_daemonset_pod`), records no `deleted_pod_uid` (`node_operations.deleted_plugin_pod_receipt`). Before,
-the terminal record held only `replacement_pod_uids` and the deleted Pod's UID vanished with the replaced WAITING
-record, so the product's own record could not prove which Pod had been restarted (GF-GENERAL-LIVE-014).
+(`waiting_for_daemonset_pod`), records no `deleted_pod_uid` (`node_operations.deleted_plugin_pod_receipt`). Were the
+terminal record to hold only `replacement_pod_uids`, the deleted Pod's UID would vanish with the replaced WAITING
+record and the product's own record could not prove which Pod had been restarted (acceptance case GF-GENERAL-LIVE-014).
 
 **A device plugin that is hung but still connected (`*_device_plugin_unresponsive`).** Everything above judges by
 kubelet's allocatable, and a plugin whose process is SIGSTOPped, deadlocked or frozen by the OOM path while its socket
@@ -1940,14 +1955,14 @@ passed. Meanwhile a new Pod asking for the resource is admitted through topology
 (`kubelet.go`): kubelet's whole sync loop blocks, there is no `UnexpectedAdmissionError` event (that exists only when
 `Allocate` *returns* an error, such as `no healthy devices present` / `requested number of devices unavailable`), the
 Pod stays Pending for ever, the node stays Ready (node status is reported by its own goroutine), and only after 5 min
-does kubelet's `/healthz` `syncloop` check report `sync Loop took longer than expected`. Live GF-GENERAL-LIVE-014
-`gpu_plugin` (HyperPod): the NVIDIA plugin SIGSTOPped for about four minutes, `nvidia.com/gpu` allocatable 8
-throughout, the product without any signal. The host collector therefore gained the `_device_plugins` contributor
+does kubelet's `/healthz` `syncloop` check report `sync Loop took longer than expected`. An NVIDIA plugin SIGSTOPped
+for minutes, say, keeps `nvidia.com/gpu` allocatable full throughout, and the allocatable rules see nothing (acceptance case
+GF-GENERAL-LIVE-014 `gpu_plugin`). The host collector therefore has the `_device_plugins` contributor
 (`collectors/host/device_plugin.py`): every tick, for each socket in the kubelet `device-plugins` directory
 (`GPU_FAULT_DEVICE_PLUGIN_SOCKET_DIR`) that matches a resource family (default `nvidia-*.sock` / `*efa*.sock`,
-`GPU_FAULT_DEVICE_PLUGIN_SOCKET_PATTERNS`; never `kubelet.sock`; verified by a read-only listing on 2026-10-27: a HyperPod
-node and a plain-EKS node both hold exactly `aws-efa-device-plugin.sock`, `nvidia-gpu.sock`, `kubelet.sock` and
-`kubelet_internal_checkpoint`, no MIG sockets, so each default glob resolves to one socket) it speaks one HTTP/2 + gRPC exchange with the
+`GPU_FAULT_DEVICE_PLUGIN_SOCKET_PATTERNS`; never `kubelet.sock`; a HyperPod node and a plain-EKS node both hold
+`aws-efa-device-plugin.sock`, `nvidia-gpu.sock`, `kubelet.sock` and `kubelet_internal_checkpoint`, no MIG sockets, so each
+default glob resolves to one socket; at most 8 sockets per family are probed per tick) it speaks one HTTP/2 + gRPC exchange with the
 standard library alone (`collectors/host/device_plugin_probe.py`: connection preface, SETTINGS, literal HPACK headers,
 one empty length-prefixed message) calling the side-effect-free `GetDevicePluginOptions` -- not `ListAndWatch`: the
 NVIDIA and EFA plugins serve `ListAndWatch` from one shared health channel, so a second stream would race kubelet's
@@ -1960,7 +1975,7 @@ refused connection is a plugin that exited (kubelet sees the stream end) and bel
 `probe_states`, `probe_detail`, `transport_answered`, `latency_ms`, `timeout_seconds`, `expected_count`);
 `host_health` grades it CRITICAL `RESTART_*_DEVICE_PLUGIN` (the rule sits beside the allocatable rules in
 `device_plugin_liveness.py`), and the planner builds the same plugin-restart chain with `plugin_unresponsive=true`
-stamped on the restart step: for such a finding `_restart_device_plugin_node` no longer reads the full allocatable as
+stamped on the restart step: for such a finding `_restart_device_plugin_node` does not read the full allocatable as
 `already_healthy`, deletes the plugin Pod on its first pass (receipt `restart_reason=DEVICE_PLUGIN_UNRESPONSIVE`) and
 then succeeds only on a Ready Pod of another UID with allocatable restored. A kubelet already blocked in that plugin's
 `Allocate` (a Pod happened to be scheduled to the node during the hang) neither kills the frozen container nor starts
@@ -1969,25 +1984,22 @@ the replacement, so the restart step FAILS at `restart_timeout_seconds` and esca
 unblock kubelet and make it restart the container) is a follow-up that needs a new node action and approval. The host
 collector runs as root under `ProtectSystem=strict`, and the read-only binds do not forbid connecting to a unix socket
 (`net/unix/af_unix.c` `unix_find_bsd` asks only `path_permission(MAY_WRITE)` of the socket inode; the EROFS in
-`fs/namei.c` `sb_permission` applies to regular files, directories and symlinks); verified on the deploy host with a
-transient unit under the same directives (a write under `/var/lib` fails EROFS, a unix connect there succeeds). No unit
+`fs/namei.c` `sb_permission` applies to regular files, directories and symlinks); in a transient unit under the same directives a write under
+`/var/lib` fails with EROFS while a unix connect there succeeds. No unit
 or node template change is needed.
 
-**The restart deletes the plugin Pod gracefully, never forced (b212).** `_restart_device_plugin_node` deletes the plugin
-Pod with `grace_period_seconds=PLUGIN_POD_DELETE_GRACE_SECONDS` (5 s); up to R13h it force-deleted it (grace 0). Live
-GF-GENERAL-LIVE-014 `efa_plugin` on plain EKS (R13h, p5en.48xlarge): the EFA plugin process was SIGSTOPped at 19:22:36Z,
-`efa_device_plugin_unresponsive` was minted at 19:23:03Z and RESTART_EFA_DEVICE_PLUGIN force-deleted the frozen Pod. The
-API server removed the Pod at once and the DaemonSet created the replacement at once; the replacement -- the EFA chart runs
-`hostNetwork: true` with no init container -- registered with kubelet before kubelet's SIGKILL ended the frozen container (a
+**The restart deletes the plugin Pod gracefully, never forced.** `_restart_device_plugin_node` deletes the plugin
+Pod with `grace_period_seconds=PLUGIN_POD_DELETE_GRACE_SECONDS` (5 s). A forced delete (grace 0) of a hung plugin fails:
+the API server removes the Pod at once and the DaemonSet creates the replacement at once; the replacement -- the EFA chart runs
+`hostNetwork: true` with no init container -- can register with kubelet before kubelet's SIGKILL ends the frozen container (a
 stopped process acts on no SIGTERM, and kubelet waits at least `minimumGracePeriodInSeconds` = 2 s even after a force
-delete). When the frozen plugin's `ListAndWatch` stream then ended, kubelet's device manager disconnected the client
+delete). When the frozen plugin's `ListAndWatch` stream then ends, kubelet's device manager disconnects the client
 registered *last* under `vpc.amazonaws.com/efa` -- the replacement's: `runClient` re-reads `s.getClient(name)` after
-`c.Run()` returns -- and `PluginDisconnected` marked every device unhealthy; nothing makes a disconnected plugin register
-again. The node showed a Ready replacement Pod and allocatable 0 for the restart's whole 180 s, the step FAILED (`device
-plugin did not restore vpc.amazonaws.com/efa`), the escalation (QUARANTINE + REBOOT) rebooted the node, and only the reboot
-(kubelet restarted, the plugins registered afresh) brought the 16 devices back. The same freeze of the NVIDIA plugin PASSED
-on both clusters because that replacement (pod network, NVML start-up) registered only after the frozen container had
-died: timing, not safety. With a positive grace the API server keeps the Pod, terminating, until kubelet has stopped its
+`c.Run()` returns -- and `PluginDisconnected` marks every device unhealthy, with nothing to make a disconnected plugin register
+again: the node shows a Ready replacement Pod and allocatable 0 for the restart's whole 180 s, the step FAILS (`device
+plugin did not restore vpc.amazonaws.com/efa`) and only the escalation (QUARANTINE + REBOOT) brings the devices back
+(acceptance case GF-GENERAL-LIVE-014 `efa_plugin`). An NVIDIA plugin's replacement (pod network, NVML start-up) usually
+registers only after the frozen container has died: timing, not safety. With a positive grace the API server keeps the Pod, terminating, until kubelet has stopped its
 containers and removed it, and a non-surge DaemonSet (`OnDelete`, or the charts' `RollingUpdate` without `maxSurge`)
 creates no Pod for a node whose daemon Pod is still terminating, so the replacement registers only after the hung plugin's
 stream ended and kubelet keeps it. 5 s because the restart runs only for a plugin that is hung or has lost its devices: a
@@ -2055,8 +2067,9 @@ JobSet; assertion that **the Eviction API is not used** (to prevent someone "cas
 ### 3.9 Cluster Action Executor
 
 **① Module responsibilities**: the only execution agent on the data plane. It claims the remote commands issued by the control plane,
-executes them within the local cluster (Kubernetes operations, HyperPod calls, forwarding signed commands to the Node Agent),
-and reports results. The control plane **never directly** touches any cluster or AWS API.
+executes them within the local cluster (Kubernetes operations, provider calls -- HyperPod or EC2 --, forwarding signed commands to the
+Node Agent), and reports results. The control plane **never directly** touches a GPU cluster's Kubernetes API and calls no mutating
+provider API (it holds only SageMaker read-only and the Region's `ec2:DescribeInstances`, §3.4 ⑥).
 
 **② Inputs and outputs**: in: the claim/renew/report protocol of `/v1/regional/executors/*`
 (per-cluster token). Out: command results, evidence, readiness reports.
@@ -2064,13 +2077,14 @@ and reports results. The control plane **never directly** touches any cluster or
 **③ Internal components**: claim loop, command dispatch, Kubernetes adapter (§3.8), HyperPod adapter,
 Node Agent client, readiness reporting (package `src/gpu_fault/cluster_executor/`: the claim loop in
 `executor.py`, dispatch and local checks in `dispatch.py`, lease and reporting in `lease.py`, outbound client and
-proxy in `regional_client.py`, environment assembly and `readiness_probe` in `bootstrap.py`).
+proxy in `regional_client.py`, step-by-step execution of compound commands in `batching.py`, filling in missing node keys in
+`node_key_sync.py`, the `/metrics` family in `metrics.py`, environment assembly and `readiness_probe` in `bootstrap.py`).
 
 **④ Thread/coroutine model**: 2 replicas, each with one claim loop (`ClaimLoop`) + at most
 `min(GPU_FAULT_CLUSTER_EXECUTOR_BATCH_SIZE, GPU_FAULT_CLUSTER_EXECUTOR_MAX_CONCURRENT_COMMANDS)`
 (default 5) commands in flight. Every command runs, renews and reports on its own worker, the slot it frees is claimed again
-at once, and a claim asks for the free slots only, so every claimed command starts at once and none queues locally; the loop
-used to wait for its whole claimed batch before claiming again, so a reboot of 15-45 minutes held the next steps of its short
+at once, and a claim asks for the free slots only, so every claimed command starts at once and none queues locally; were the loop
+to wait for its whole claimed batch before claiming again, a reboot of 15-45 minutes would hold the next steps of its short
 batch siblings and every new claim.
 
 **⑤ Start/stop procedure**: see §2.7: the pre-installed OCI starts directly → `touch /tmp/executor-ready`
@@ -2096,11 +2110,11 @@ LEASED command; when the executor has just re-claimed a compound command, the ad
 refused. The lease is confirmed its own and no adapter has run, so the executor posts WAITING at once
 (`status_source=executor-cancelled-before-start`, `result_details` echoed with `node_action_not_started`/`cancelled_before_start`);
 the control plane ends the command FAILED/`completed-after-cancellation` and the engine reads a known no-start rather than an unknown
-outcome. Before this the branch only counted `results_withheld_total` without reporting, the command stayed LEASED for ever, the
-compensation RESTORE was refused and the record parked NEEDS_OPERATOR without the support hand-off (DESTR-018 live, 2026-09-28).
+outcome. Were the branch only to count `results_withheld_total` without reporting, the command would stay LEASED for ever, the
+compensation RESTORE would be refused and the record would park NEEDS_OPERATOR without the support hand-off.
 
 **A NEEDS_OPERATOR record settled by receipts is resumed by the dispatcher.** `terminal_decision` parks a record
-BLOCKED/NEEDS_OPERATOR when a node action's outcome is unknown (F-A4). When later remote receipts (such as the no-start
+BLOCKED/NEEDS_OPERATOR when a node action's outcome is unknown. When later remote receipts (such as the no-start
 above) resolve every unresolved action, no operator confirmation is involved, no remote command is still open and the
 incident still points at the record, `resume_receipt_settled_workflows` in `sweep_stuck_records` puts the record back to
 PENDING with its failure parked (`pending_failure_*`, event OPERATOR_RECONCILED by the dispatcher) in one compare-and-set
@@ -2108,7 +2122,7 @@ write; the ordinary executor path then runs the RESTORE it owes and ends FAILED 
 record would have had one tick later. A batched step with no entry once its carrier ended is read as a known no-start,
 replacing the LEASED-time snapshot that marked it unknown, and the WAITING row that snapshot appended at parking time ends FAILED
 with the receipt: the refresh merge rewrites a row's status only when the row is WAITING, the snapshot is a confirmed FAILED and
-no action is unresolved -- otherwise a step that will never run refuses the incident close as an "unknown provider action" (live 2026-09-28).
+no action is unresolved -- otherwise a step that will never run refuses the incident close as an "unknown provider action".
 
 **⑥ Dependent services**: control-plane HTTP, Kubernetes API, HyperPod API (IRSA), Node Agent.
 **No database connection**: `GPU_FAULT_STORE_URL` is deliberately absent from the manifests, because
@@ -2120,7 +2134,7 @@ periodic renewal; control-plane-side claim deadline 900s. `SSL_CERT_FILE`/`REQUE
 
 claim is a **long poll**: the request body carries `wait_seconds` (`GPU_FAULT_CLUSTER_EXECUTOR_CLAIM_WAIT_SECONDS`,
 default 20; 0 disables it and falls back to pure polling); the control plane suspends an empty result for at most that long, and as soon as a PENDING
-command appears for this cluster it claims once more and returns; therefore after an empty answer the claim loop **no longer sleeps** `GPU_FAULT_CLUSTER_EXECUTOR_POLL_SECONDS`
+command appears for this cluster it claims once more and returns; therefore after an empty answer the claim loop **does not sleep** `GPU_FAULT_CLUSTER_EXECUTOR_POLL_SECONDS` (default 2)
 but claims again immediately. `POLL_SECONDS` is still used in two places: the spin protection when a command returns WAITING,
 and the starting point of the exponential backoff when the control plane is unreachable. The HTTP timeout of the claim request is `wait_seconds` + the regular 15s.
 When `wait_seconds=0` the field is **not sent at all**, so an executor with long polling disabled still works against an old control plane that does not know the field.
@@ -2140,7 +2154,7 @@ operations of the outcome-unknown row; timeouts of other operations are definite
 action was forwarded it also carries `node_action_command_id`, the only entry point through which an operator can look up the real result in the Agent ledger.
 An outcome-unknown command keeps holding its lease before reporting (`abandoned_lease_holds_total`), for at most one
 more execution window, to prevent the sibling replica from re-claiming the same destructive command and resetting the same GPU.
-The control plane's escalation classification (`orchestration/escalation.py`) **no longer climbs the hardware ladder** for failed steps carrying `manual_confirmation_required`,
+The control plane's escalation classification (`orchestration/escalation.py`) **does not climb the hardware ladder** for failed steps carrying `manual_confirmation_required`,
 `node_action_interrupted` or `outcome_unknown`; it goes directly to
 `ESCALATE_OPERATOR` (stage `manual_confirmation_required`): a RESET with unknown outcome does not automatically
 become a REBOOT, and a RESTART_NODE with unknown outcome does not automatically become a REPLACE_NODE. The carrier is these flags in details,
@@ -2150,12 +2164,12 @@ verifies against fleet/Kubernetes evidence (reboot: node Ready, Agent ACTIVE, ku
 the Agent's terminal answer in the remote command's `node_results`, or the validated restore successor of the same incident has already completed VALIDATE_GPU + RESTORE_SCHEDULING on that node),
 sets `outcome_unknown`/`manual_confirmation_required` to false via compare-and-set, records `operator_confirmed` evidence and a `NODE_ACTION_CONFIRMED` event;
 the step stays FAILED and the record stays BLOCKED. The pre-action boot baseline is taken first from the workflow's own STOP receipt, carried along its confirmed
-reboots (`execution/node_action_baseline.py`), so a re-image before the STOP no longer reads as "rebooted since the action" against the incident's fault-time
-`source_boot_id`. When the platform takes a node away (a managed node group roll, a Spot reclaim, a HyperPod replacement), the departure proof -- gone from
+reboots (`execution/node_action_baseline.py`), rather than the incident's fault-time `source_boot_id`, against which a re-image before the STOP would read as
+"rebooted since the action". When the platform takes a node away (a managed node group roll, a Spot reclaim, a HyperPod replacement), the departure proof -- gone from
 Kubernetes and from its provider, the Agent not alive -- itself answers the actions parked on it: `confirm-node-action` for a node no longer in the cluster, the
 evidence close with the departure proof and the departed-node cleanup all confirm them `settled_by: node_departed` (`execution/node_departure_settlement.py`;
 nothing is confirmed for a step that also names a node not proven departed), and the close ends the record SUPERSEDED with it. A subsequent `--disposition restore` restores only nodes still isolated by this incident; a BLOCKED record not driven by a plan can be
-closed by `workflow-reconcile` once it has a verified restore successor (a source recovery plan is no longer required), and the dispatcher's periodic sweep closes the same shape automatically.
+closed by `workflow-reconcile` once it has a verified restore successor (a source recovery plan is not required), and the dispatcher's periodic sweep closes the same shape automatically.
 Three details: (1) the only exceptions are the three operations `ESCALATE_SUPPORT` / `FREEZE_EVIDENCE` / `CHECKPOINT_WORKLOADS`
 whose own outcome is unknown: they are still handled as "workflow FAILED, no successor", to avoid opening another support ticket for the same incident; all
 other operations (including STOP_WORKLOADS, RESTART_VM, RESTART_FABRIC_MANAGER) go to the operator; when a
@@ -2166,7 +2180,7 @@ the join skips the exhausted branch, and only then does the workflow go FAILED a
 pronounced dead while a sibling node is mid-reboot. (3) The three sources write their own reasons into `node_failures` in details:
 `node action interrupted: <error>`, `command_id reused with a different body (HTTP 409)`,
 `execution timed out; outcome unknown`, so incident reasons and support mails can distinguish "Agent interrupted", "request body
-mismatch (workflow defect)" and "execution timeout", and the operator no longer has to dig through step executions.
+mismatch (workflow defect)" and "execution timeout", and the operator does not have to dig through step executions.
 
 There are also recovery and terminal-state restrictions while the node's physical outcome is unconfirmed:
 `execution/node_action_uncertainty.py` identifies outcome-unknown and still-waiting
@@ -2182,12 +2196,12 @@ This does not provide atomic mutual exclusion between Kubernetes ownership write
 
 **⑧ Idempotency and concurrency control**: command-level lease + `command_id` idempotency; the two replicas exclude each other via the lease.
 
-A compound command (performance C, `RemoteActionCommand.batched_steps` non-empty) is still **one command, one lease**;
+A compound command (`RemoteActionCommand.batched_steps` non-empty) is still **one command, one lease**;
 `max_concurrent_commands` and renewal are unchanged. The executor runs the first step and the accompanying steps in order
 (`src/gpu_fault/cluster_executor/batching.py`): each step builds a `WorkflowStepContext` with **its own** `step_index`/
 `idempotency_key`, and the workflow copy's `step_executions` is appended with the SUCCEEDED records of the steps already completed within this command
 (`completed_step_indexes`/`completed_operations` kept in sync),
-so the QUIESCE evidence read by `_maintenance_generations` is exactly the same as today; after each step,
+so the QUIESCE evidence read by `_maintenance_generations` is exactly the same as for single-step commands; after each step,
 `POST .../{command_id}/progress` writes one `batched_results["<index>"]` entry (best-effort: 404/network errors are only counted,
 and the terminal result still carries the full set). SUCCEEDED → continue; WAITING → the whole command returns WAITING (progress preserved), and the next claim resumes from that step
 (already SUCCEEDED steps are skipped; the step's own previous WAITING record is fed back as a synthetic predecessor record, and the attempt count increments as usual);
@@ -2209,7 +2223,7 @@ must be resolvable (§2.5).
 mtime of `/tmp/executor-loop-alive`, and the probe (`deploy/dataplane/cluster-action-executor.yaml`)
 restarts the Pod when it decides that file has not been updated for more than 300s. This is distinct from `/tmp/executor-ready`: ready only
 says the startup checks passed, loop-alive says the loop is still turning; a replica stuck on a claim/renew is replaced through it.
-The same set of counters is now also exported from `:9111 /metrics` (`gpu_fault.cluster_executor.metrics`, family
+The same set of counters is also exported from `:9111 /metrics` (`gpu_fault.cluster_executor.metrics`, family
 `gpu_fault_cluster_executor_*`, 28 series: 21 counters: `claims_total`, `results_succeeded_total` /
 `results_failed_total` / `results_waiting_total`, `execution_timeouts_total`,
 `abandoned_lease_holds_total`, `fleet_fence_holds_total`, `lease_lost_total`,
@@ -2280,8 +2294,10 @@ reached) and must not be treated as a failure.
 `GPU_FAULT_HUNG_STRACE_SAMPLE_COUNT=3`, `_SAMPLE_DURATION_SECONDS=3`,
 `_SAMPLE_INTERVAL_SECONDS=2`.
 
-**⑩ Logs/metrics/alerts**: `diagnostic_id`, `operation`, `verdict`, `duration_ms`,
-`archive_path`, `s3_uri`.
+**⑩ Logs/metrics/alerts**: node-side log fields as in §3.1 ⑩ (`command_id`, `operation`, `duration_ms` and so on); a diagnostic
+bundle's result details carry `evidence_ref` (the node-local `file://` path, or the uploaded `s3://` object when
+`GPU_FAULT_DIAGNOSTIC_S3_URI` is configured), `evidence_upload_error` when the upload failed (the diagnostic step does not fail and the
+evidence stays local), `sha256`, `size_bytes` and `manifest_summary`.
 
 **⑪ Exception handling**: four lessons from real hardware must be reflected in code and tests:
 
@@ -2312,11 +2328,11 @@ records and their delivery status.
 
 **③ Internal components**: `src/gpu_fault/notifications/registry.py` registers **23** notification template kinds
 (XID investigation, SXID events, DCGM diagnostics, EFA/RDMA, NVLink7.4 mechanical parts and support, hardware upgrade and inventory,
-host resources, HyperPod advisory, warm spare, reboot guard, not-applicable notes, and so on, plus `DIAGNOSTIC_INCONCLUSIVE`, added by the control-plane review of 2026-09-08:
+host resources, HyperPod advisory, warm spare, reboot guard, the remediation storm breaker (`REMEDIATION_STORM_TRIPPED`, §9.5), not-applicable notes, and so on, plus `DIAGNOSTIC_INCONCLUSIVE`:
 template `diagnostic-inconclusive-zh-v1`, category `ADVISORY`,
 emitted when a workflow containing only forensic/diagnostic/validation steps ends FAILED, see §6.3; and `HUNG_SUPPORT_HANDOFF`: template
 `hung-support-handoff-zh-v1`, category `OPERATOR_REVIEW`, emitted by the `ESCALATE_SUPPORT` of the read-only NCCL/EFA hung diagnostic DAG
-in place of the hardware-escalation mail it used to send by mistake, see §6.3; and `CONTAINED_OPERATOR_HANDOFF`: template
+rather than the hardware-escalation mail, see §6.3; and `CONTAINED_OPERATOR_HANDOFF`: template
 `contained-operator-handoff-zh-v1`, category `OPERATOR_REVIEW`, deduplication key
 `<cluster>/<incident>/contained-operator-handoff/<workflow>`, sent by the executor after the terminal write when a plan refused
 only for a missing executable owner has run its containment prefix and settled `BLOCKED/SAFETY_SETTLED`: the body names the
@@ -2381,16 +2397,16 @@ aggregate metrics cannot prove that a given administrator has read anything.
 
 **⑪ Exception handling**: SNS/SES rejection → record the failure and retry within the existing budget; no channel configured → record and let
 `ACKNOWLEDGE_NO_ALERT_CHANNEL` decide whether to suppress noise; template rendering failure → record the raw fact, never swallow the
-event. `send` (including `POST /v1/advisory-notifications/{id}/send`) **no longer resurrects DEAD** (F-2):
+event. `send` (including `POST /v1/advisory-notifications/{id}/send`) **does not resurrect DEAD**:
 delivery rows that have backed off (RETRY) or were abandoned (DEAD) stay where the dispatcher left them; `send` only enqueues notifications that have no delivery row or are still
 PENDING (asking again for a PENDING row merely refreshes its shelf life); for DEAD it returns `FAILED` with a reason containing
 `requeue it explicitly to try again`. Only the service-layer `AdvisoryNotificationService.requeue`
 (an explicit operations action) pulls RETRY/DEAD rows back to PENDING and resets the attempt budget; rows already SENT return DUPLICATE
-and are not resent. Previously the collection-silence scan repeated `send` on the same notification every 60s, which made the retry budget unbounded and
-incremented `dead_lettered_total` by 1 every minute. When the TTL is overridden per category, `ADVISORY` uses
-`GPU_FAULT_NOTIFICATION_TTL_SECONDS_ADVISORY`; otherwise the global TTL applies.
+and are not resent. Otherwise the collection-silence scan, repeating `send` on the same notification every 60s, would make the retry budget unbounded and
+increment `dead_lettered_total` by 1 every minute. The TTL can be overridden per category with `GPU_FAULT_NOTIFICATION_TTL_SECONDS_<CATEGORY>`
+(`..._ADVISORY`, for example; `notification_service.py` derives the name from the category); otherwise the global `GPU_FAULT_NOTIFICATION_TTL_SECONDS` applies.
 
-**⑫ Unit test scope**: each of the 21 template kinds renders its required fields (including the synthesised ticket number format);
+**⑫ Unit test scope**: each of the 23 template kinds renders its required fields (including the synthesised ticket number format);
 deduplication and cooldown windows; stable shard routing; persist-only behaviour when `GPU_FAULT_NOTIFICATION_DISPATCHER_ENABLED=false` in asynchronous mode;
 retirement without delivery when the TTL expires; the loop does not crash when there are no recipients.
 
@@ -2409,7 +2425,7 @@ pooled workers, notification listener, cleanup, counter sharding (`src/gpu_fault
 claimed-not-started tracking and lane hold duration; `processor_completion_runtime.py` handles bounded parallel completion
 after grouping by cluster.
 
-The claim candidate window (`store/postgres/processor_claims.py`, F-D2 / B-3): for each include path it
+The claim candidate window (`store/postgres/processor_claims.py`): for each include path it
 renders **two ordered index walks** joined by `UNION ALL`: the first `window_limit` rows by raw priority, then the oldest ROUTINE rows that have exceeded
 `GPU_FAULT_PROCESSOR_ROUTINE_STARVATION_SECONDS`; each segment stops at the window,
 so the cost of one claim is bounded by **window × number of include paths**, independent of queue depth; the paths are whitelisted
@@ -2419,11 +2435,11 @@ literals, not parameters. Window size = target batch × `GPU_FAULT_PROCESSOR_CLA
 **Planner discipline** (`store/postgres/planner_discipline.py`): the claim transactions
 (`claim_active_processor_requests` and the legacy `claim_processor_requests`) start with `SET LOCAL enable_seqscan =
 off` (and `enable_material = off`, below), scoped to that transaction -- and **only** the claim transactions. A
-burst grew `gpu_fault_processor_queue` from 45 to 5,800 pages inside a minute while `pg_class` still said 138 rows
-(autoanalyze is asynchronous); on that estimate the planner chose "scan every candidate, sort, take the window" for
-the claim window and sequential scans for the correlated `EXISTS` probes (retry barrier, STRICT predecessor,
-fault/observation interlock) and the completion's row locking, and the heap was scanned 300-600 times a second
-(`LWLock:BufferContent` took 90% of the INSERT's active time). The window's `ORDER BY (priority, created_at,
+burst can grow `gpu_fault_processor_queue` from tens to thousands of pages inside a minute while `pg_class` still counts
+the pre-burst rows (autoanalyze is asynchronous); on that estimate the planner chooses "scan every candidate, sort, take
+the window" for the claim window and sequential scans for the correlated `EXISTS` probes (retry barrier, STRICT
+predecessor, fault/observation interlock) and the completion's row locking, and the heap is scanned hundreds of times a
+second (`LWLock:BufferContent` takes over the INSERT's active time). The window's `ORDER BY (priority, created_at,
 request_id) LIMIT window` is exactly the stored order of `priority_claim`/`path_priority_claim`, so once the heap
 scan is priced out the planner walks the index in claim order and stops at the window; the lane probes walk
 `gpu_fault_processor_queue_lane`. Measured on 5,000 PENDING rows with
@@ -2432,10 +2448,8 @@ as test properties): with the burst's statistics -- 138 rows analysed, then 4,86
 about -- the path-filtered sub-window (the shape 7 of the 8 sub-claims per cycle use) read 2,316 shared blocks,
 touched all 5,000 rows and ran 24.6 ms by default, and so did it under fresh statistics; with the setting it read 765
 blocks, touched the 72-row window and ran 3.9 ms. The unfiltered and excluded-path windows already walked the index.
-In the release that carried it, the claim CTE's slow-statement maximum over a 13-minute burst window fell from
-22.5-25.6 s to 3.9 s. The setting is **not** applied to the admission, completion or lease transactions: one release
-did so and the admission flush became twice as slow (`INSERT INTO gpu_fault_processor_queue` slow statements: average
-2.95 -> 4.99 s, maximum 9.1 -> 16.8 s; the completion CTE appeared four times as often) -- a `SET LOCAL` governs every
+The setting is **not** applied to the admission, completion or lease transactions (there it would make the admission
+flush twice as slow): a `SET LOCAL` governs every
 statement the transaction runs, including the statement-level triggers the INSERT and the completion fire (the
 per-writer counter apply and the edge-triggered NOTIFY over the `added`/`removed` transition tables), and transition
 tables have no indexes, so pricing the sequential scan out only degrades their plans into per-row probes. Those
@@ -2446,46 +2460,33 @@ window's LIMIT the LIMIT promises no early stop, and the planner picks the cheap
 a bitmap scan or another index, the lane and retry probes for every row, then a sort. During a spool-enabled burst
 that is the normal case, because the statistics lag the burst: without column statistics `status='PENDING'` is priced
 at 0.5 %, and once the lanes have been analysed under live leases the former `LEFT JOIN` lane test
-(`lane.ordering_key IS NULL OR lane.lease_expires_at <= now`) was priced at one row. In the integrated 50-cluster fault
-phase with the spool on, all 20 control-worker processes spent 74 % of a 4.5 s window inside 1.1-3.4 s claim
-statements (the writer's slow-statement log; their fault claims asked for four rows, so every fault worker was free)
-while fault rows waited 5-7 s to be claimed. The window's tests are therefore spelled so that their prices keep the
+(`lane.ordering_key IS NULL OR lane.lease_expires_at <= now`) was priced at one row. The claim statements would then
+hold the control-worker processes for seconds (even with every fault worker free) while fault rows wait seconds to be
+claimed. The window's tests are therefore spelled so that their prices keep the
 estimate up whatever the statistics say (`processor_claims.py` `_CLAIM_ELIGIBLE_SQL`): `status<>'COMPLETED' AND NOT
 (status='LEASED' AND lease_expires_at > now)` -- the same set as "PENDING, or LEASED with a lapsed lease", because the
 status is one of the three and never NULL, priced at about 99 % -- and the lane test as a `NOT EXISTS` over live
 leases, whose anti-join estimate follows the leases. The lane-head probe compares `head.priority + 0`, which keeps it on
 `gpu_fault_processor_queue_lane_rows` (a bare `head.priority` let the planner AND that index with a `claim_window`
 range over every higher-priority row: 24,300 instead of 7,200 blocks a claim). The claim transactions also price out
-Materialize (`enable_material = off`): with the estimate up, the planner computed the retry-barrier anti-join once over
-a full index scan of the queue instead of probing the lane index per candidate the window walks (3,800 instead of 1,000
-blocks). Measured with the fault stream's claim (the dedicated pools' paths excluded, four rows, a 68-row window) on a
-3,200-row burst queue -- 800 node lanes, each a P10 nvidia-kernel and fabric-manager row ahead of a P50 gpu and host
-evidence row, the oldest 80 fault rows held by another process: 10,500 shared blocks before and 1,000 after on
-statistics analysed under those leases, 13,200 / 1,000 on a table never analysed, 32,300 / 1,200 with 20,000 routine
-rows queued behind (a spool-disabled site), 1,000 / 1,000 on statistics analysed before the leases were taken; a
-backlog whose every lane is leased is read whole by any plan (3,000 / 2,500). A local reproduction of the fault phase
-(20 coordinators with the production pools and cadence, 3,200 rows from 50 clusters, emulated handlers, statistics
-lagging the burst, PostgreSQL limited to six CPUs) halved both the claim time (101-105 -> 44-47 s) and the p99
-completion of the synchronous action faults (7.4-7.5 -> 3.4-3.6 s). The planner test pins the walk
-(`test_a_fault_claim_reads_its_window_while_the_lanes_are_leased`): 68 rows read on a 1,600-row burst and with 4,000
-routine rows behind it, 720 rows before. No spelling survives the statistics of a drained queue whose pages stayed
-allocated (`reltuples` 0, `relpages` > 0, what the autoanalyze after a worked-off burst leaves): the planner believes the
-queue is empty, and every claim reads the burst (29,000 blocks) until the queue's next autoanalyze. In the reproduction
-with the statistics left drained for the burst, 20 coordinators spent 83 % of its first 15 s inside claims, fault
-claims fell from 155 to 13-44 per half second, taken by 7-14 of the 20 processes, and the action faults' p99 reached
-16.1 s -- the live stall's signature. A claim whose window comes back full has proved that the queue holds at least a
+Materialize (`enable_material = off`): with the estimate up, the planner would compute the retry-barrier anti-join once over
+a full index scan of the queue instead of probing the lane index per candidate the window walks. The planner test pins the
+fault stream claim's walk (the dedicated pools' paths excluded, four rows, a 68-row window;
+`test_a_fault_claim_reads_its_window_while_the_lanes_are_leased`): 68 rows read on a 1,600-row burst whose lanes are mostly
+leased by another process and with 4,000 routine rows behind it; a backlog whose every lane is leased is read whole by any
+plan. No spelling survives the statistics of a drained queue whose pages stayed allocated (`reltuples` 0, `relpages` > 0,
+what the autoanalyze after a worked-off burst leaves): the planner believes the queue is empty, every claim reads the whole
+burst until the queue's next autoanalyze, claims fill the coordinators and the fault claim rate collapses. A claim whose
+window comes back full has proved that the queue holds at least a
 window, so when `pg_class` still counts fewer than two windows the store analyses the queue itself
 (`store/postgres/queue_statistics.py`; only the queue -- lanes analysed early in a burst, when nearly every lane row is
-one the burst has just leased, price the lane anti-join as if nothing were eligible, and the reproduction's p99 was
-4.5-6.3 s with them analysed alongside): it reads the count at most once a second per store after a full window, analyses
+one the burst has just leased, price the lane anti-join as if nothing were eligible): it reads the count at most once a second per store after a full window, analyses
 at most once per 10 s per store and one process of the site at a time (a transaction-scoped try-lock of its own key
 space), and gives the table up after a 100 ms lock timeout when autovacuum holds it; ANALYZE takes a
 ShareUpdateExclusive lock, which claims, admissions and completions never wait for, and a role that may not analyse
-the table gets PostgreSQL's warning and the next autoanalyze, as before. Same reproduction: claim time 275 -> 46-56 s,
-action-fault p99 16.1 -> 3.4-4.3 s, claim-busy share 0.83 -> 0.15-0.18, no stall
+the table gets PostgreSQL's warning and waits for the next autoanalyze
 (`test_a_full_window_refreshes_the_statistics_of_a_drained_queue`: the first claim's full window leaves `reltuples` at
-the 1,600 rows queued and the next claim reads 68 rows, 1,600 before; a window that does not fill leaves the statistics
-alone). `enable_bitmapscan = off` is still not applied: it prices the interlock's scope GIN probes out (GIN indexes are
+the 1,600 rows queued and the next claim reads 68 rows; a window that does not fill leaves the statistics alone). `enable_bitmapscan = off` is still not applied: it prices the interlock's scope GIN probes out (GIN indexes are
 bitmap-only). The pin
 statements are plain `SET LOCAL` without placeholders, executed with an explicit empty parameter tuple through the
 same cursor path as the statements they protect, so a test that stands a cursor double in for the database sees them
@@ -2529,8 +2530,7 @@ maximum age of a retryable response 300s. 408/425/429/5xx write back
 immediately; idle backoff at most 2s (FAULT pool 0.5s), busy backoff 0.4s (FAULT pool 0.1s); after
 `GPU_FAULT_PROCESSOR_BUSY_EMPTY_ROUNDS_BEFORE_IDLE` (default 8) consecutive empty claim rounds on one stream, "this
 replica's pools are busy" no longer holds that stream at the busy ceiling and it backs off to the idle one (the v21
-edge notifications wake it when a row arrives; 92% of a perf run's claim rounds were empty while the busy ceiling held
-them at 0.4s); a backlog the store reports as lane-blocked keeps the busy ceiling, because rows already PENDING raise
+edge notifications wake it when a row arrives; otherwise the busy ceiling would hold mostly empty claim rounds at 0.4s); a backlog the store reports as lane-blocked keeps the busy ceiling, because rows already PENDING raise
 no notification edge and only polling drains that tail at the rate lanes free up; with notifications on, a FAULT
 stream the lane probe does not hold keeps 0.5s only while a fault-tier row is PENDING or LEASED with a lapsed lease (a
 row can only be silent behind a PENDING one; a row under a live lease silences nothing) and otherwise waits on the 5s
@@ -2544,13 +2544,12 @@ so a freed slot is refilled without waiting for a stream deadline; overload retu
 `lease_expires_at`, combined with `FOR UPDATE SKIP LOCKED`; completed requests are kept for 600s so the same response can be
 replayed (this is the mechanism behind "a client that re-submits gets the same receipt"). The default `STRICT` lane keeps
 blocking subsequent requests during a delayed retry; only latest-wins priority 100 requests are
-`REORDERABLE`. When releasing a claimed request, the lane row and the queue row are **each CAS'd independently** (B-2): the lane is released as long as
+`REORDERABLE`. When releasing a claimed request, the lane row and the queue row are **each CAS'd independently**: the lane is released as long as
 `(ordering_key, owner_id, epoch, lease_token)` still matches, regardless of the queue row; the queue row returns to PENDING as long as
 its fence fields match and it is still LEASED, regardless of whether the lane has been taken over by someone else. Neither side is a precondition
-for the other; otherwise a queue row completed by a fenced batch would leave the owner's lane locked for nothing until the lease expires (this is the cause of
-the "stale processor lane fencing token" and the periodic `depth` of 1, B-1). When one entry in a telemetry batch
-returns 408/425/429/5xx, only that entry is rescheduled using **exactly the same** ledger as a single-entry replay (`retry_disposition`,
-B-4); the rest of the batch commits as usual; the batch path renews the lease for the whole batch while the handler runs (one renewal thread per batch).
+for the other; otherwise a queue row completed by a fenced batch would leave the owner's lane locked for nothing until the lease expires (showing as
+the "stale processor lane fencing token" and a periodic `depth` of 1). When one entry in a telemetry batch
+returns 408/425/429/5xx, only that entry is rescheduled using **exactly the same** ledger as a single-entry replay (`retry_disposition`); the rest of the batch commits as usual; the batch path renews the lease for the whole batch while the handler runs (one renewal thread per batch).
 Completion is still one transaction per cluster; different clusters can run in parallel via
 `GPU_FAULT_PROCESSOR_COMPLETION_CLUSTER_CONCURRENCY`, legal range
 `1..min(8, pool_max_size)`, 1 in production.
@@ -2574,8 +2573,7 @@ asked by the dispatcher on every pass: saturated (every slot busy, work still qu
 `..._ADMISSION_FLUSH_CONCURRENCY_OPEN_SECONDS` (default 0.15) opens one slot; an EWMA above `..._CLOSE_SECONDS`
 (default 0.30) halves the headroom above the floor; between the thresholds it holds; a limit that stops binding gives
 back one slot down to the floor. Every change waits for a generation of flushes at the current level (`max(3, limit)`),
-a raise included -- a raise used to need one completed flush, and the live limit flapped 81 raises and 51 lowers in 14
-minutes. The arrival-time deadline projection counts the slot wait in rounds of the concurrency the controller is
+a raise included -- raising after a single completed flush would make the controller flap within minutes. The arrival-time deadline projection counts the slot wait in rounds of the concurrency the controller is
 about to open (the ceiling while the EWMA is below the open threshold, the live limit otherwise), so capacity that is
 opening is not counted as missing. `/metrics`:
 `gpu_fault_processor_{,fault_,evidence_}admission_batch_in_flight_limit` (live value, summed over a Pod's processes)
@@ -2583,19 +2581,14 @@ and `..._in_flight_limit_raised_total` / `..._lowered_total` (per process). The 
 `admissionBatchDelayMaxSeconds` (`GPU_FAULT_PROCESSOR_{,FAULT_,EVIDENCE_}ADMISSION_BATCH_DELAY_MAX_SECONDS`, default
 0.05) once the flush EWMA passes 100 ms: the window widens first (0.1-0.2 s), the concurrency may still open below
 0.15 s, holds between 0.15 and 0.30 s, and closes above 0.30 s. The window is not a lever on items per flush: a flush is
-one transaction for one cluster, and it carries that cluster's requests in flight inside the process at dispatch (a
-closed-loop simulation of one process gave 1.0 / 3.0 / 12.5 items per flush for 16 / 96 / 400 requests in flight
-whatever the window did), while a wider window only idles the slot a flush just freed (a 20 ms base window cost 17% of
-the throughput, a 50 ms window held under saturation 35%). The defaults come from three calibration points of this
-site's integrated-32 suite (the same schema v22, 12 processes): a fixed 24 (2 per process) gave 517 req/s with 4,601
-requests expired in the queue (18.7% reserved 503s) at 0.59 s per flush; a fixed 96/48 gave 1,051 req/s, zero 503s,
-81 ms per flush and 1% `BufferContent`; an adaptive 48..192 (thresholds 1.0/2.0 s) let the site reach ~250 concurrent
-flushes and the page-lock convoy on `gpu_fault_processor_queue` returned (a 69 s storm, 142 active statements at the
-peak, `BufferContent` 36%, 1.08 s per flush, 35.8% reserved 503s, P0 503s) while 1.08 s stayed below the 2.0 s close
-threshold and no slot was ever given back -- the store tolerates about 100 concurrent admission flushes on this schema,
-the historical 1,400+ req/s at 192 slots predates the v20 per-writer ledger and is not reachable by concurrency alone,
-so the ceilings are the fixed caps that passed and the controller serves ranges an administrator opens and the
-evidence tier.
+one transaction for one cluster, and it carries that cluster's requests in flight inside the process at dispatch
+whatever the window does, while a wider window only idles the slot a flush just freed. The default ceilings 96/48 are
+the fixed values that passed capacity acceptance: a fixed concurrency set too low lets requests expire in the queue
+(reserved 503s), while an adaptive range that lets the site reach ~250 concurrent flushes brings back the page-lock convoy
+on `gpu_fault_processor_queue` (an `LWLock:BufferContent` storm); the store tolerates about 100 concurrent admission
+flushes on this schema, so the routine and fault floors equal their ceilings and the controller serves ranges an
+administrator opens and the evidence tier (capacity and load-test definitions:
+[Performance Load-Test Acceptance Plan](performance-acceptance-plan.md)).
 
 Process liveness and the GC policy (`app/liveness.py`, `app/process_health.py`): at the end of lifespan start-up every
 uvicorn worker binds `GPU_FAULT_LIVENESS_PORT` with `SO_REUSEPORT` (the renderer sets service port + 10; 0 turns it
@@ -2603,15 +2596,13 @@ off) and answers `GET /livez` on its own event loop with `liveness_report`, the 
 liveness probe moves to that port with `periodSeconds/timeoutSeconds/failureThreshold = 10/10/3`. Readiness
 (`/healthz`, 5/5/3) reads that port too: at assembly `serve_readiness` hands the route's own verdict
 `readiness_report` (`app/routes/admin.py`, 503 with the same document) to `LivenessListener.serve`, and the renderer
-points the readiness probe at the listener port -- on the service port the same burst made all three api-ha Pods
-NotReady at once, the AWS Load Balancer Controller deregistered every NLB target, and for ~40 s the NLB had no healthy
-target and closed new claims without a response; the startup probe and the NLB health check stay on the service port.
-The mechanism is in the deployment manual's liveness section (a cold-connect burst parks the probe connection
-in the service socket's accept queue: locally, with 4,250 connections, a queue median of 3,874, a 3.6 s probe and 0.1 s
-in-app; on the dedicated port a median of 10 ms and a maximum of 0.61 s). `GPU_FAULT_GC_FREEZE_AFTER_STARTUP` (the
-renderer sets true) runs `gc.collect(); gc.freeze()` at the end of lifespan start-up; `GPU_FAULT_GC_GEN2_THRESHOLD`
-defaults to 10. `/metrics`: `gpu_fault_event_loop_lag_seconds` changes from a summary to a histogram (buckets
-5 ms-10 s, `_max` kept); new families `gpu_fault_process_resident_memory_bytes`,
+points the readiness probe at the listener port -- probed on the service port, a cold-connect burst would park the probe
+connection in the service socket's accept queue, all three api-ha Pods could turn NotReady at once, and the AWS Load
+Balancer Controller would deregister every NLB target, leaving the NLB without a healthy target for a while; the startup
+probe and the NLB health check stay on the service port. The mechanism is in the deployment manual's liveness section.
+`GPU_FAULT_GC_FREEZE_AFTER_STARTUP` (the renderer sets true) runs `gc.collect(); gc.freeze()` at the end of lifespan
+start-up; `GPU_FAULT_GC_GEN2_THRESHOLD` defaults to 10. `/metrics`: `gpu_fault_event_loop_lag_seconds` is a histogram
+(buckets 5 ms-10 s, `_max` kept); further families `gpu_fault_process_resident_memory_bytes`,
 `gpu_fault_gc_collections_total{generation}`, `gpu_fault_gc_collection_seconds_total{generation}`,
 `gpu_fault_gc_collection_seconds_max{generation}` (maximum over a Pod's processes), `gpu_fault_gc_frozen_objects`,
 `gpu_fault_listen_accept_queue_connections{port}` (each worker's own socket; exported per process, summed over the Pod) and
@@ -2626,12 +2617,11 @@ counting subclass (`connection_made` increments `accepted_total`), and registers
 supervisor keeps uvicorn's semantics (SIGTERM/SIGINT stop every worker gracefully, SIGHUP replaces them one at a time, a
 worker that does not answer the health pipe within `--timeout-worker-healthcheck` or dies is replaced, exit code 3 =
 `STARTUP_FAILURE` -- bind, import, a raising factory, a failed lifespan -- stops the parent with 3 so the Pod restarts and
-backs off); `--workers 1` runs in-process, still on its own socket. Measured (local reproduction, 4 workers, 50 clusters):
-at 4,250 concurrent cold connections within noise of the shared socket (throughput -3%, tail +3-11%, per-worker share
-24.7-25.2%); at 5,500 (above the Pod namespace's `somaxconn` 4096) the shared socket gives 961 req/s, 73 503s and client
-p99 27.9 s, the per-worker sockets 1,117 req/s, 0 non-2xx and p99 5.35 s. New `/metrics` families
-`gpu_fault_listen_reuse_port` (ANY), `gpu_fault_listen_accepted_connections_total{port}` (PER_PROCESS),
-`gpu_fault_listen_open_connections{port}` (SUM); `gpu_fault_listen_accept_queue_connections` moves from MAX to PER_PROCESS.
+backs off); `--workers 1` runs in-process, still on its own socket. The per-worker sockets buy capacity, not throughput:
+below the Pod namespace's `somaxconn` (4096) concurrent cold connections they match the shared socket, above it the shared
+socket starts answering 503 and the per-worker sockets do not. `/metrics` families `gpu_fault_listen_reuse_port` (ANY),
+`gpu_fault_listen_accepted_connections_total{port}` (PER_PROCESS), `gpu_fault_listen_open_connections{port}` (SUM) and
+`gpu_fault_listen_accept_queue_connections` (PER_PROCESS).
 The renderer makes `-m gpu_fault.app.serve` a prefix contract (`LAUNCHER_MODULE`) and sets `--timeout-keep-alive 100`
 (`KEEP_ALIVE_TIMEOUT_SECONDS`); the verifier and `config_cli validate` both check the launcher.
 
@@ -2658,9 +2648,9 @@ cadence x 1.1 + 15 + 20 + 47 s against every default threshold.
 
 **⑩ Logs/metrics/alerts**: `processor_request_id`, `path`, `priority`, `cluster_id`,
 `lane`, `lease_owner`, `leader_epoch`, `attempt`, `response_status`,
-`retry_count`, `not_before`, `duration_ms`. New metrics cover retry reschedule/delay,
+`retry_count`, `not_before`, `duration_ms`. Metrics cover retry reschedule/delay,
 lane holder, claimed-not-started and shutdown release (§10.2). The liveness signal of the consume loop is the coordinator's
-`processor_consumer_running` flag plus the age of the most recent round (B-6): exported as
+`processor_consumer_running` flag plus the age of the most recent round: exported as
 `gpu_fault_processor_consumer_running`, and `metrics_snapshot()` gains a `consumer` key; the worker
 role's `GET /livez` lists `processor-consumer` in `dead_threads` and returns 503 when the loop has exited or the age of the most recent round exceeds
 `max(30s, 6 × GPU_FAULT_PROCESSOR_NOTIFICATION_FALLBACK_SECONDS)`
@@ -2688,10 +2678,10 @@ Region/account, ownership, delete policy, dependencies, non-sensitive attributes
 
 **③ Internal components**: the model lives in `installation_resources.py`; generating the registry from bootstrap/live AWS
 state, import/export and digest verification live in `admin/resource_registry.py`; join/remove/
-uninstall consume it in `admin/cluster_join.py` (with the split-out modules `cluster_join_state.py`,
-`cluster_join_commit.py`, `cluster_join_rollback.py`, `cluster_join_network.py`,
-`cluster_join_evidence.py`, `cluster_join_readonly.py`), `admin/cluster_removal.py` and
-`admin/uninstall.py` respectively; `admin/deploy_host_binding.py` decides which copy of `gpu-fault-admin`
+uninstall consume it in `admin/cluster_join.py` (with the split-out `cluster_join_*.py` modules: state, commit, rollback,
+network, nodes, profile, inputs, context, evidence, readonly, reclaim, failure_domains, types), `admin/cluster_removal.py`
+(`cluster_removal_*.py`) and `admin/uninstall.py` (`uninstall_*.py`) respectively; AWS discovery and reconciliation are split into
+`admin/resource_registry_{dns,network,cpu_rolling,scripts,outcome}.py`; `admin/deploy_host_binding.py` decides which copy of `gpu-fault-admin`
 may act on a managed state dir (see ⑦).
 
 **④ Thread/coroutine model**: no background threads. The administrator CLI discovers and renders synchronously; the control-plane API runs Store calls through
@@ -2713,11 +2703,11 @@ Four further rules govern "where to resume after a failure, and who resumes":
 
 - When join-cluster fails, `cluster_join_state.note_join_failure` writes
   `failure{error, after_step, recorded_at}` into `state.json` (rollback keeps the key;
-  `reset_completed_state` clears it when the next attempt starts), so operations no longer sees just a bare `ROLLED_BACK`.
+  `reset_completed_state` clears it when the next attempt starts), so operations sees more than a bare `ROLLED_BACK`.
 - The first deploy's `initial_deploy_target` checkpoint (`bootstrap_site.bind_initial_deploy_target`)
   constrains the resume target only while the site document does not yet exist or does not yet cover all target clusters; once the site document manages
   those clusters, or `remove-cluster` has released the clusters that were never reached, the checkpoint becomes `COMPLETE`, and later
-  CPU-only upgrades or `deploy --gpu-cluster-arn NEW` are no longer refused with "initial deploy target differs".
+  CPU-only upgrades or `deploy --gpu-cluster-arn NEW` are not refused with "initial deploy target differs".
 - Relative wheel/bundle paths in the release manifest resolve against **the repository root containing the manifest itself**
   (`gpu_fault_release.containing_repository_root`, `regional_release_config.py`), not the engine
   process's own checkout: join-cluster runs the engine in-process inside the operator's worktree, while the artifacts sit under the site's source snapshot at
@@ -2726,10 +2716,13 @@ Four further rules govern "where to resume after a failure, and who resumes":
   site's directory): the CLI installed by the first `deploy` into `<state-dir>/deployer-venv` carries
   `gpu-fault-managed-state-dir.json` and from then on acts only on its own state dir (`--state-dir` must
   equal the bound value); the source checkout's `.venv` is an unbound CLI and refuses every mutating verb against a site that already has a bound CLI,
-  allowing only `deploy` (which prepares the release and then re-execs into the bound CLI) and the read-only verbs
-  `status` / `preflight` / `verify`; the refusal message names the
+  allowing only a source `deploy` (no `--rollback`/`--prepared-source-release`; it prepares the release and then re-execs into the bound
+  CLI) and the read-only verbs (`READONLY_COMMANDS`: `status`, `preflight`, `verify`, `site-id`, `node-scope`, `hyperpod-scheduled-update`,
+  plus the forms without a confirm/apply argument such as `config --dry-run` and `workflow-reconcile --dry-run`,
+  `deploy_host_binding.is_readonly_command`); the refusal message names the
   `<state-dir>/deployer-venv/bin/gpu-fault-admin` that should be used instead; there is no environment-variable override: to act on a site with checkout code
-  the only route is a source `deploy` (which prepares the release first and then re-execs into the bound CLI).
+  the only route is a source `deploy`, the one exception being an uninstall whose journal is unfinished, which may resume with
+  `--accept-repository-root-override`.
 
 **⑧ Idempotency and concurrency control**: the key is `site_id + resource_key`. `immutable_identity()`
 covers provider/type/ID/ARN/region/account/ownership/delete policy/dependencies;
@@ -2751,7 +2744,8 @@ rebuild from a legacy environment, cluster removal, uninstall dependency orderin
 Deployment identity and asset location are additionally managed by `admin/deploy_host_binding.py`,
 `gpu_fault_release.repository_root` and `load_release_artifacts`: the installed deploy-host
 is bound to the managed state-dir; engine assets come from the trusted snapshot, and the Manifest's relative artifact paths are verified against the snapshot
-they belong to. AdminConfig has **22** recursively editable leaf fields, not a count of top-level nested containers;
+they belong to. AdminConfig has **36** recursive leaf fields (the sections of `AdminConfig` in `admin/config.py`, not a count of top-level nested
+containers), of which the 3 under `capacity.remediation` are retired (kept only so old records' digests verify, never rendered or read);
 capacity, notifications, Profile, credentials and destructive authorisation remain constrained by their respective contracts.
 
 Private Hosted Zone associations use `(vpc_region, vpc_id)` as the physical identity; the member set is not the resource key;
