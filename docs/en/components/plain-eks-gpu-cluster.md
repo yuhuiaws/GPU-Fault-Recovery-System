@@ -2,10 +2,12 @@
 
 English edition of `docs/components/plain-eks-gpu-cluster.md`; the Chinese file remains the source of record until both are maintained together.
 
-Status: implemented and joined once on a real cluster (2026-10-04, `gpu-eks-cluster`, 2× p5en.48xlarge,
-AL2023_x86_64_NVIDIA AMI, joining an existing `hyperpod-v1` HyperPod site). **No acceptance campaign has run on a mixed
-site yet**; section 5 lists what one join cannot prove. This is the summary of branch `feature/plain-eks-gpu-cluster`
-(base `0d151512`, 36 commits, 184 files) for the later PR description.
+Status: implemented. A plain EKS cluster (managed node groups on the AL2023_x86_64_NVIDIA AMI) can be a site's GPU
+cluster on its own or next to HyperPod clusters, sharing one control plane, release engine and set of
+[regional acceptance cases](../regional-e2e-acceptance-test-cases.md) with HyperPod. This document summarises the design,
+operator prerequisites, limitations and validation status; it records no date or result of any run. The public catalog's
+verdicts do not distinguish providers; per-cluster live results are kept in the private evidence store
+([fault simulation test manual](../fault-simulation-test-manual.md) §4).
 
 ## 1. Goal and boundary
 
@@ -19,7 +21,7 @@ site yet**; section 5 lists what one join cannot prove. This is the summary of b
   `tests/regional/test_regional_token_rotation.py`).
 - Out of scope: provider-side node replacement (the adapter refuses `REPLACE` and no EC2 instance is replaced;
   `nodeReplace` is OWNed by `gpu-fault-eks-adapter` only as the warm-spare handover of §2.4), HyperPod
-  health-monitoring-agent capabilities, installing DCGM host tools on nodes.
+  health-monitoring-agent capabilities; DCGM host tools are not installed by default (§3 item 7).
 
 ## 2. Design
 
@@ -111,7 +113,10 @@ closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace`
   `WARN` (`DCGM_TOOL_UNAVAILABLE`/`DCGM_HOSTENGINE_UNAVAILABLE`, never drained); in host mode (Agent environment
   `GPU_FAULT_DCGM_HOSTENGINE=host`, written on eks-managed nodes only and not part of the config digest) it returns
   real verdicts, and a missing dcgmi or an unreachable host hostengine fails as on HyperPod with `DCGM_EXECUTION_REVIEW`
-  (`DRAIN_AND_QUARANTINE`).
+  (`DRAIN_AND_QUARANTINE`); before such a verdict, when the enabled `nvidia-dcgm` is down (inactive/failed) or still
+  starting, the Agent makes one bounded recovery (`systemctl reset-failed` + `start`, then waits at most 30 s for
+  `dcgmi discovery -l`; never inside a quiesce window, never installs a package) and runs the diagnostic once more
+  (`node_agent/operations/hostengine_recovery.py`, the same on HyperPod nodes).
 - Data-plane Deployments (executor, watcher, reconciler, node-resource collector, ADOT) carry no node pin and tolerate
   no GPU taint; they land on CPU nodes.
 - The node preflight Job checks the host prerequisites inside `chroot /host` and reports every missing one at once
@@ -128,7 +133,7 @@ closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace`
   mode.
 - Node Action keys: every node inventory read, including the CPU mirror guard, uses the cluster selector.
 
-### 2.6 Join recoverability and diagnostics (product gaps fixed on this branch)
+### 2.6 Join recoverability and diagnostics
 - `allowedNamespaces` defaults to the list the site's clusters share and no longer forces `training`; the join checks
   every workload namespace exists on its first read of the GPU cluster.
 - A failed sensitive command keeps the script's own `ERROR:` lines (else the last stderr line, redacted) in both the
@@ -143,7 +148,7 @@ closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace`
 ### 2.7 The quiesce taint (eks-managed only)
 - A plain EKS quiesce leaves kubelet running, so the GPU client containers the Agent stops (the product's own exporter,
   the device plugin, GFD) are back within seconds, recreated by their DaemonSets, and the `VERIFY_NO_GPU_CLIENTS` before
-  the reset never sees the GPU free (live, 2026-10-05). The Executor taints the node
+  the reset never sees the GPU free. The Executor taints the node
   `gpu-fault.io/quiesce=<incident value>:NoExecute` before it dispatches QUIESCE_GPU_SERVICES
   (`adapters/node_action/quiesce_taint.py`; if the taint cannot be applied the step FAILS and no Agent command is sent)
   and removes it before it dispatches RESTORE_GPU_SERVICES (if the removal fails the host services are still restored
@@ -190,14 +195,15 @@ closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace`
    launches one more GPU instance before it terminates one; administrator-operations §5.0.1); NVIDIA and EFA device
    plugins running; a GPU taint is fine.
    For `AL2023_x86_64_NVIDIA` node groups `gpu-fault-admin prepare-eks-nodegroup` automates this item's user data, node
-   auto repair and update strategy and item 5's ownership label (a read-only plan by default, `--apply` runs it;
-   administrator-operations §5.0.1a).
+   auto repair and update strategy and item 5's ownership label (a read-only plan by default;
+   `--apply --confirm PREPARE_EKS_NODEGROUP --reference <CHG>` runs it and rolls the node group, `--dcgm-hostengine host`
+   also installs item 7's host DCGM; administrator-operations §5.0.1a).
 2. Namespaces: every workload namespace in `allowedNamespaces` (the site's default list, e.g. `training`) must exist,
    or pass `--allowed-namespace` with namespaces that do.
 3. Network: the GPU VPC's NAT EIP is whitelisted on the NLB, the private Route53 zone associated, Agent CIDRs taken
    from the node group subnets -- done by the join, which needs the corresponding AWS permissions.
 4. Approval: the first plain EKS cluster joining a HyperPod site needs `--approve-profile-plan <sha> --reference <CHG>`
-   (eks-v1).
+   (version `eks-v1`; `regional-eks-<digest12>` when the site's `eks-v1` snapshot already registers another policy).
 5. Ownership label: `gpu-fault-admin site-id --cpu-cluster-arn <CPU ARN>` prints the site id;
    `aws eks update-nodegroup-config --cluster-name <eks> --nodegroup-name <ng> --labels addOrUpdateLabels={gpu-fault.io/control-plane=<site id>}`
    labels the GPU node group (HyperPod: `update-cluster` with `KubernetesConfig.Labels`; Karpenter: NodePool template
@@ -223,7 +229,9 @@ closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace`
    `nvidia-dcgm.service.d/90-gpu-fault-restart.conf` (the package unit's `Restart=on-abort` leaves a non-zero exit or a
    crash loop down for good) and runs `systemctl enable --now nvidia-dcgm`; confirm on a node with
    `dcgmi discovery -l` and `dcgmi diag -r 1`, label **every** GPU node group of the cluster
-   `gpu-fault.io/dcgm-hostengine=host` and deploy/join right away (also over an unchanged source: the deploy re-reads the
+   `gpu-fault.io/dcgm-hostengine=host` (`prepare-eks-nodegroup --dcgm-hostengine host [--dcgm-version <version>-<build>]`
+   writes the user data, enables the unit and labels the group in one go; the default version is `4.6.1-1`, the
+   exporter's pair) and deploy/join right away (also over an unchanged source: the deploy re-reads the
    label, and `status` shows the pending `next deploy` before it; a deploy with the service enabled but no label is
    refused by the embedded conflict check); to leave, remove the label, take `nvidia-dcgm` out of the launch template and
    run `systemctl disable --now nvidia-dcgm` on the nodes, then deploy at once (order and commands in
@@ -235,8 +243,10 @@ closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace`
    Capacity Rebalance EKS enables on Spot node groups is handled by the replacement-node join window. `status
    --full`/`node-scope` record and announce them (never refuse); the operator identity needs
    `autoscaling:DescribeAutoScalingGroups` (administrator-operations §5.0.5). The CPU control-plane cluster is still a
-   HyperPod cluster, and its instance groups' `ScheduledUpdateConfig` is announced the same way (one window re-images
-   every CPU node at once and takes the whole control plane down for minutes), also §5.0.5.
+   HyperPod cluster: without a rolling policy one window of its instance groups' `ScheduledUpdateConfig` re-images every
+   CPU node at once, so the deploy's last step keeps the cron expression and makes the schedule roll one instance at a
+   time (batch size 1, two API NLB `HealthyHostCount` rollback alarms, `spec.cpuControlPlane.rollingUpdate` default
+   `rolling`); `gpu-fault-admin hyperpod-scheduled-update --rolling` prints the same commands, also §5.0.5.
 
 ## 4. Limitations
 
@@ -246,10 +256,12 @@ closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace`
   `dcgmi diag` only records a configuration WARN and the diagnostic bundle records the missing tool; real verdicts need
   host mode (§3 item 7).
 - One profile version per cluster; site profile changes stay site-level approvals; the override version is the example
-  profile's version name.
+  profile's version name (`eks-v1`), or the digest-named `regional-eks-<digest12>` when that name's snapshot already
+  registers another policy (§2.4).
 - A first `deploy` refuses mixed providers (deploy one provider, join the other).
 - The embedded hostengine relies on the AMI's default NVIDIA container runtime; a cluster without `nvidia` as the
-  default runtime would need `runtimeClassName` on the DaemonSet (not needed on this cluster).
+  default runtime would need `runtimeClassName` on the DaemonSet (the AL2023_x86_64_NVIDIA AMI's default runtime is
+  `nvidia`).
 - The quiesce taint evicts only Pods that do not tolerate it: DaemonSets with a wildcard toleration, static Pods and
   non-Kubernetes processes are untouched, and a reset may still answer `In use by another client` because of them (the
   step's `details.gpu_client_holders` names the holders).
@@ -264,25 +276,17 @@ closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace`
 
 ## 5. Validation status (honest)
 
-- Verified live, once: discovery, profile approval, IAM/network/node-key prerequisites, per-cluster profile
-  registration and rendering, DCGM embedded-hostengine rollout, DNS/TLS gate, data-plane Deployments on CPU nodes,
-  node preflight and installer Jobs (2 nodes), collector readiness, VERIFIED, registry update, site commit,
-  activation; several failed attempts rolled back and reran (including after site upgrades).
 - Unit/contract: `tests/*eks_managed*`, `tests/fleet/test_cluster_profile_pins.py`,
   `tests/eks_provider/test_mixed_site_owner_resolution.py`, `tests/deploy/test_node_preflight_host_prerequisites.py`
   and others; HyperPod neutrality is pinned by digest constants and byte-identical render assertions.
-- **Not validated**: DCGM host mode (§2.5) has unit/contract tests only and is still to be proven live; the quiesce taint (§2.7) and the restore exit for a RECOVERED incident have unit tests only; the third live DESTR-001 round is still to run; the acceptance campaign on a mixed site (fault injection, real `nodeReboot` execution and
-  confirmation, departed nodes, token rotation, the live `remove-cluster`/`uninstall` paths for eks-managed, Agent
-  upgrade/rollback, long-run stability); more than one plain EKS cluster (a batch join of several plain EKS clusters has
-  unit tests only); non-AL2023 AMIs; workload namespaces other
-  than `training`; clusters without the NVIDIA runtime as default.
+- Live: plain EKS clusters run the same regional acceptance cases as HyperPod
+  ([Regional E2E acceptance test cases](../regional-e2e-acceptance-test-cases.md); GF-REGIONAL-BOOT-036/037 are specific
+  to plain EKS node groups, GF-REGIONAL-BOOT-038 covers a join/remove across clusters). The public catalog records only
+  verdicts and component digests and does not distinguish providers; per-cluster results are kept in the private
+  evidence store, and this document records no run.
+- Shapes without live coverage: more than one plain EKS cluster in one site (a batch join of several plain EKS clusters
+  has unit tests only); non-AL2023 AMIs; workload namespaces other than `training`; clusters without the NVIDIA runtime as
+  default.
 - p6-b200/p6-b300 (HGX B200/B300) are graded by the same rules as Hopper SXM (the fabric state window, VALIDATE_GPU's
-  fabric and unit checks, the observe-only default of a solo XID 45), but no such node is on the site: not observed live.
-
-## 6. Commits (base 0d151512 -> 3dedcd07, excerpt)
-
-Contract and runtime: `a36f600f` `b84a033b` `d1244a34` `5fcf6fe6` `3b28ab2e` `2cd0135d`; admin/release/deploy:
-`d3acba29` `0b6e3823` `daab59e1` `fc3ad683`; per-cluster profile: `b9dbf3de` `df71aefe` `114ab02e` `0ced160e`
-`2beb24e0` `9c1ec98e`; live-trial fixes: `3017aba4` (node-key inventory), `8ca598db` (registration probe/rollback
-targets), `f7dfb5fa` (rollback journal re-plan), `5a06f7b9` (DCGM embedded hostengine), `457829f3` (allowed
-namespaces), `3dedcd07` (node preflight verdict); deploy-host gates: `3ce79c81` `89153747` `29cdddd1` `526c0a73`.
+  fabric and unit checks, the observe-only default of a solo XID 45): unit-tested from NVIDIA documentation, not
+  live-verified (no B-series hardware).

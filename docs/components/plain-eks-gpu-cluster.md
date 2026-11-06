@@ -1,9 +1,9 @@
 # 普通 EKS GPU 集群（`eks-managed`）与混合 provider 站点
 
-状态：已实现并在一个真实集群上完成一次 join（2026-10-04，`gpu-eks-cluster`，p5en.48xlarge ×2，
-AL2023_x86_64_NVIDIA AMI，加入一个已有 `hyperpod-v1` HyperPod 站点）。**验收 campaign 尚未在混合站点上跑过**；
-下文"未验证"一节列出凭一次 join 不能证明的内容。本文是分支 `feature/plain-eks-gpu-cluster`
-（基线 `0d151512`，36 个提交，184 个文件）的汇总，面向后续 PR 说明。
+状态：已实现。普通 EKS 集群（AL2023_x86_64_NVIDIA AMI 的托管节点组）可单独或与 HyperPod 集群一起作为站点的 GPU 集群，
+与 HyperPod 共用同一套控制面、release 引擎与[区域验收用例](../区域模式端到端验收测试用例.md)。本文汇总设计、操作员前置、
+限制与验证状态，不记录某次执行的日期或结果；公开 catalog 的 verdict 不区分 provider，逐集群的真机结论在私有证据库
+（[故障模拟测试手册](../故障模拟测试手册.md) §4）。
 
 ## 1. 目标与边界
 
@@ -13,7 +13,7 @@ AL2023_x86_64_NVIDIA AMI，加入一个已有 `hyperpod-v1` HyperPod 站点）�
 - HyperPod 集群的一切渲染（选择器、Secret 键、注册表摘要、manifest、安装器环境、CPU pin）逐字节不变；
   以测试固定（`tests/*eks_managed*`、`tests/regional/test_regional_token_rotation.py` 的摘要固定值）。
 - 不做：provider 侧节点替换（adapter 拒绝 `REPLACE`，不替换任何 EC2 实例；`nodeReplace` 只作为 warm-spare 交接由
-  `gpu-fault-eks-adapter` OWN，见 §2.4）、HyperPod health-monitoring-agent 相关能力、在节点上安装 DCGM 主机工具。
+  `gpu-fault-eks-adapter` OWN，见 §2.4）、HyperPod health-monitoring-agent 相关能力；DCGM 主机工具缺省不装（§3 第 7 条）。
 
 ## 2. 设计
 
@@ -85,7 +85,9 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
 - 节点 collector 从 exporter HTTP 取 DCGM 指标，不依赖 dcgmi；节点 agent 的快速 DCGM 诊断（`dcgmi diag -r 1 -j`）在 embedded 模式下
   对无 dcgmi 或连不上 hostengine 记配置性 `WARN`（`DCGM_TOOL_UNAVAILABLE`/`DCGM_HOSTENGINE_UNAVAILABLE`，不排空）；host 模式下
   （Agent 环境 `GPU_FAULT_DCGM_HOSTENGINE=host`，只写入 eks-managed 节点、不进 config digest）给出真实判定，缺 dcgmi 或连不上主机
-  hostengine 按 HyperPod 判 FAIL/`DCGM_EXECUTION_REVIEW`（`DRAIN_AND_QUARANTINE`）。
+  hostengine 按 HyperPod 判 FAIL/`DCGM_EXECUTION_REVIEW`（`DRAIN_AND_QUARANTINE`）；判定前若 enabled 的 `nvidia-dcgm` 停着
+  （inactive/failed）或正在启动，Agent 先做一次有界恢复（`systemctl reset-failed` + `start`，等 `dcgmi discovery -l` 应答至多 30 s；
+  quiesce 窗口内不做，从不安装软件包）再诊断一次（`node_agent/operations/hostengine_recovery.py`，HyperPod 节点同样）。
 - 数据面 Deployment（executor、watcher、reconciler、node-resource collector、ADOT）不钉节点、不容忍 GPU 污点，
   落在 CPU 节点。
 - 节点预检 Job 在 `chroot /host` 核对主机前置并一次列全缺失项（`ERROR: host prerequisites unavailable: ...`
@@ -98,7 +100,7 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
   `node_scope.dcgm_hostengine_nodes`/`dcgm_hostengine_conflict_nodes`。Agent 始终按集群声明的模式判定。
 - Node Action key：所有节点清单读取都用集群选择器（含 CPU 镜像守卫）。
 
-### 2.6 join 的可恢复性与诊断（本分支修的产品缺口）
+### 2.6 join 的可恢复性与诊断
 - `allowedNamespaces` 缺省为站点现有集群共用的列表、不再强加 `training`；join 在首次读取 GPU 集群时核对每个
   工作负载命名空间存在。
 - 敏感命令失败保留脚本自己的 `ERROR:` 行（否则最后一行 stderr，打码）；admin 与 release 两个 runner 一致。
@@ -109,7 +111,7 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
 
 ### 2.7 quiesce 污点（仅 eks-managed）
 - 普通 EKS 节点的 quiesce 不停 kubelet，Agent 停掉的 GPU 客户端容器（产品自己的 exporter、device plugin、GFD）几秒内
-  被 DaemonSet 拉回，reset 前的 `VERIFY_NO_GPU_CLIENTS` 永远看不到 GPU 空闲（2026-10-05 真机）。Executor 在派发
+  被 DaemonSet 拉回，reset 前的 `VERIFY_NO_GPU_CLIENTS` 永远看不到 GPU 空闲。Executor 在派发
   QUIESCE_GPU_SERVICES 前给节点打 `gpu-fault.io/quiesce=<incident 值>:NoExecute`（`adapters/node_action/quiesce_taint.py`；
   打不上则该步 FAILED、不发 Agent 命令），在派发 RESTORE_GPU_SERVICES 前摘掉（摘不掉则主机服务照常恢复、该步 FAILED 点名）；
   仅当 `GPU_FAULT_CLUSTER_PROVIDER=eks-managed` 时 `cluster_executor/bootstrap.py` 把 Kubernetes core 客户端接给 Node Action
@@ -144,12 +146,14 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
    管理员日常运维 §5.0.1）；节点组的 `updateConfig.updateStrategy` 为 `MINIMAL`（`DEFAULT` 滚动先多启动一台 GPU 实例、
    再终止一台；管理员日常运维 §5.0.1）；NVIDIA device plugin 与 EFA device plugin 运行；GPU 污点可有。
    `AL2023_x86_64_NVIDIA` 节点组可用 `gpu-fault-admin prepare-eks-nodegroup` 自动完成本条的 user data、node auto repair
-   与更新策略以及第 5 条的归属标签（默认只读计划，`--apply` 执行；管理员日常运维 §5.0.1a）。
+   与更新策略以及第 5 条的归属标签（默认只读计划，`--apply --confirm PREPARE_EKS_NODEGROUP --reference <CHG>` 执行并滚动节点组，
+   `--dcgm-hostengine host` 另装第 7 条的主机 DCGM；管理员日常运维 §5.0.1a）。
 2. 命名空间：`allowedNamespaces` 里的工作负载命名空间（缺省站点列表，如 `training`）必须已存在，或用
    `--allowed-namespace` 指定存在的列表。
 3. 网络：GPU VPC 的 NAT EIP 加入 NLB 白名单、Route53 私有区关联、Agent CIDR 来自节点组子网——join 自动完成，
    需要相应 AWS 权限。
-4. 审批：首个普通 EKS 集群加入 HyperPod 站点需 `--approve-profile-plan <sha> --reference <CHG>`（eks-v1）。
+4. 审批：首个普通 EKS 集群加入 HyperPod 站点需 `--approve-profile-plan <sha> --reference <CHG>`（版本 `eks-v1`；站点的
+   `eks-v1` 快照已登记另一份策略时为 `regional-eks-<digest12>`）。
 5. 归属标签：`gpu-fault-admin site-id --cpu-cluster-arn <CPU ARN>` 打印站点 ID，
    `aws eks update-nodegroup-config --cluster-name <eks> --nodegroup-name <ng> --labels addOrUpdateLabels={gpu-fault.io/control-plane=<站点ID>}`
    给 GPU 节点组加标签（HyperPod：`update-cluster` 的 `KubernetesConfig.Labels`；Karpenter：NodePool 模板标签）；
@@ -167,7 +171,9 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
    `datacenter-gpu-manager-4-cuda<CUDA 主版本>-<ver>`（主版本与 `nvidia-smi` 的 "CUDA Version" 一致），写入 `Restart=on-failure` 的 drop-in
    `nvidia-dcgm.service.d/90-gpu-fault-restart.conf`（软件包单元的 `Restart=on-abort` 让一次非零退出或一轮崩溃循环永久停着）并
    `systemctl enable --now nvidia-dcgm`，
-   在节点上用 `dcgmi discovery -l`、`dcgmi diag -r 1` 确认，给该集群的**每个** GPU 节点组加 `gpu-fault.io/dcgm-hostengine=host`，随即
+   在节点上用 `dcgmi discovery -l`、`dcgmi diag -r 1` 确认，给该集群的**每个** GPU 节点组加 `gpu-fault.io/dcgm-hostengine=host`
+   （`prepare-eks-nodegroup --dcgm-hostengine host [--dcgm-version <版本>-<build>]` 一并写入 user data、启用单元并加标签，
+   缺省版本为 exporter 配对的 `4.6.1-1`），随即
    deploy/join（源码不变也照样 deploy，它会重读标签；之前 `status` 显示待生效的 `next deploy`；启用而不加标签的 deploy 会被
    embedded 冲突检查拒绝）；退出时摘标签、把 `nvidia-dcgm` 从 launch template 拿掉并在节点上
    `systemctl disable --now nvidia-dcgm`，再立即 deploy（次序与命令见管理员日常运维 §5.0.1「主机 DCGM」）。
@@ -175,8 +181,10 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
    EKS Auto Mode 节点池、ASG `MaxInstanceLifetime` 和按计划调用 `UpdateNodegroupVersion` 的自动化都会替换 GPU 节点：
    NodePool 设 `expireAfter: Never` 并加 `nodes: "0"` 预算，`MaxInstanceLifetime` 保持未设置，自动化移到维护窗口；Spot 节点组的
    Capacity Rebalance 由 EKS 开启，按替换节点的接入窗口处理。`status --full`/`node-scope` 记录并提示（不拒绝），操作者身份需
-   `autoscaling:DescribeAutoScalingGroups`（管理员日常运维 §5.0.5）。CPU 控制面集群仍是 HyperPod 集群，其实例组的
-   `ScheduledUpdateConfig` 同样提示（一个窗口同时重镜像全部 CPU 节点、整个控制面停摆数分钟），同见 §5.0.5。
+   `autoscaling:DescribeAutoScalingGroups`（管理员日常运维 §5.0.5）。CPU 控制面集群仍是 HyperPod 集群：没有滚动策略时其实例组的
+   `ScheduledUpdateConfig` 一个窗口同时重镜像全部 CPU 节点，deploy 的最后一步因此保留原 cron 把它改为逐台滚动（每批 1 台，
+   两个 API NLB `HealthyHostCount` 回滚告警，`spec.cpuControlPlane.rollingUpdate` 缺省 `rolling`）；
+   `gpu-fault-admin hyperpod-scheduled-update --rolling` 打印同样的命令，同见 §5.0.5。
 
 ## 4. 限制
 
@@ -184,10 +192,11 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
   `gpuDetection`/`providerHealthIsolation` 不声明。
 - embedded 模式（默认，节点组未声明主机 DCGM）：节点上没有主机 hostengine，快速诊断 `dcgmi diag` 只记配置性 WARN，诊断包里
   记录工具缺失；声明 host 模式（§3 第 7 条）后才有真实判定。
-- 一个集群只能有一个 profile 版本；站点 profile 变更仍是站点级审批，集群 override 版本固定为示例 profile 的版本名。
+- 一个集群只能有一个 profile 版本；站点 profile 变更仍是站点级审批，集群 override 版本为示例 profile 的版本名（`eks-v1`），
+  该名字的快照已登记另一份策略时为摘要命名的 `regional-eks-<digest12>`（§2.4）。
 - 首次 `deploy` 不接受混合 provider（先部署一种，再 join 另一种）。
 - 嵌入式 hostengine 依赖 AMI 的默认 NVIDIA 容器运行时；若集群不是默认 `nvidia` runtime，需为 DaemonSet 加
-  `runtimeClassName`（本次集群不需要）。
+  `runtimeClassName`（AL2023_x86_64_NVIDIA AMI 的默认 runtime 即 `nvidia`）。
 - quiesce 污点只驱逐不容忍它的 Pod：带通配容忍的 DaemonSet、静态 Pod 与非 Kubernetes 进程不受影响，reset 对它们仍可能
   `In use by another client`（步骤 `details.gpu_client_holders` 点名持有者）。
 - 多集群站点（管理员日常运维 §5.0.4）：节点名必须全站唯一，普通 EKS 节点名由私有 IPv4 派生，VPC CIDR 重叠的两个普通
@@ -199,23 +208,13 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
 
 ## 5. 验证状态（诚实版）
 
-- 已验证（真机，一次）：发现、profile 审批、IAM/网络/节点 key 前置、按集群 profile 注册与渲染、DCGM 嵌入式
-  hostengine 滚动、DNS/TLS 门、数据面 Deployment 落 CPU 节点、节点预检与安装 Job（2 节点）、collector 就绪、
-  VERIFIED、注册表更新、站点提交、激活；多次失败回滚与重跑（含站点升级后）。
 - 单元/契约：`tests/*eks_managed*`、`tests/fleet/test_cluster_profile_pins.py`、
   `tests/eks_provider/test_mixed_site_owner_resolution.py`、`tests/deploy/test_node_preflight_host_prerequisites.py`
   等；HyperPod 中立性以摘要固定值与逐字节渲染断言保证。
-- **未验证**：DCGM host 模式（§2.5）只有单元/契约测试，真机待验；quiesce 污点（§2.7）与 RECOVERED 事件的 restore 出口只有单元测试，真机 DESTR-001 第三轮待跑；混合站点上的验收 campaign（故障注入、nodeReboot 实际执行与确认、离场节点、token 轮换、
-  remove-cluster/uninstall 对 eks-managed 的真机路径、Agent 升级/回滚、长期稳定性）；多于一个普通 EKS 集群（一批 join 多个
-  普通 EKS 集群只有单元测试）；
-  非 AL2023 AMI；`training` 以外的工作负载命名空间；非默认 NVIDIA runtime 的集群。
+- 真机：普通 EKS 集群跑与 HyperPod 相同的区域验收用例（[区域模式端到端验收测试用例](../区域模式端到端验收测试用例.md)；
+  只针对普通 EKS 节点组的是 GF-REGIONAL-BOOT-036/037，跨集群 join/remove 的是 GF-REGIONAL-BOOT-038）。公开 catalog 只记 verdict
+  与组件摘要、不区分 provider，逐集群的执行结论在私有证据库；本文不记录某次执行。
+- 没有真机覆盖的形态：一个站点内多于一个普通 EKS 集群（一批 join 多个普通 EKS 集群只有单元测试）；非 AL2023 AMI；
+  `training` 以外的工作负载命名空间；非默认 NVIDIA runtime 的集群。
 - p6-b200/p6-b300（HGX B200/B300）按与 Hopper SXM 相同的规则分级（fabric 状态窗口、VALIDATE_GPU 的 fabric 与单元检查、
-  solo XID 45 默认只观测），但现网没有这类节点，未观察过。
-
-## 6. 提交（基线 0d151512 → 3dedcd07，摘录）
-
-契约与 runtime：`a36f600f` `b84a033b` `d1244a34` `5fcf6fe6` `3b28ab2e` `2cd0135d`；admin/release/部署：
-`d3acba29` `0b6e3823` `daab59e1` `fc3ad683`；按集群 profile：`b9dbf3de` `df71aefe` `114ab02e` `0ced160e`
-`2beb24e0` `9c1ec98e`；真机缺陷修复：`3017aba4`（节点 key 清单）、`8ca598db`（注册探针/回滚目标）、
-`f7dfb5fa`（回滚日志重规划）、`5a06f7b9`（DCGM 嵌入式 hostengine）、`457829f3`（允许命名空间）、
-`3dedcd07`（节点预检判定）；部署机门禁：`3ce79c81` `89153747` `29cdddd1` `526c0a73`。
+  solo XID 45 默认只观测），依据 NVIDIA 文档做了单元测试，未经现网验证（没有 B 系列硬件）。
