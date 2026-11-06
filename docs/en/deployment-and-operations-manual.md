@@ -8628,18 +8628,18 @@ that local inference.
 |---|---|
 | `GPU_FAULT_CONTROL_PLANE_URL` | Required |
 | `GPU_FAULT_CLUSTER_ID` | Required |
-| `GPU_FAULT_RUNTIME_PROFILE_VERSION` | Recommended required |
-| `GPU_FAULT_CONTROL_PLANE_TOKEN` | Optional |
+| `GPU_FAULT_RUNTIME_PROFILE_VERSION` | Required by the installer (`--runtime-profile-version`); the process itself does not enforce it |
+| `GPU_FAULT_CONTROL_PLANE_TOKEN` | Required in regional mode: the cluster bearer token (the regional Installer Job takes `cluster-token` from `gpu-fault-regional-connection` and writes it through `--token-file`); the process itself does not enforce it, and the regional control plane refuses requests without it |
 | `GPU_FAULT_GPU_PRODUCT` | Optional fallback; must be filled in `disabled` mode |
 | `GPU_FAULT_GPU_PRODUCT_DISCOVERY` | `auto`; optionally `required/disabled`. Under `auto` when `nvidia-smi` is unavailable: if `GPU_FAULT_GPU_PRODUCT` is configured the configured value is used, otherwise it **starts without a product** and logs a WARNING (host telemetry keeps being delivered, and timeouts are reported as collection errors); only `required` refuses to start. A kernel / metrics (DCGM, nvidia-smi) / Fabric Manager collector that started without a product retries the same discovery at most once per 60 s before it stamps the identity (`collectors/identity_refresh.py`); on success it logs the WARNING `GPU identity discovered after start`, and the XIDs/SXIDs/metric batches after it carry the product and the driver branch/CUDA version the configuration left empty; `disabled` never retries |
-| `GPU_FAULT_DRIVER_BRANCH` | Recommended |
-| `GPU_FAULT_CUDA_VERSION` | Recommended |
-| `GPU_FAULT_METRICS_INTERVAL_SECONDS` | DCGM 15, nvidia-smi 30 |
+| `GPU_FAULT_DRIVER_BRANCH` | Optional (the regional installation leaves it unset); when unset it is discovered with `nvidia-smi --query-gpu=driver_version` (not under `disabled`); a configured value that disagrees with the discovered one, or mixed driver branches on the node, make the Collector refuse to start |
+| `GPU_FAULT_CUDA_VERSION` | Optional (the regional installation leaves it unset); when unset it is discovered from the `nvidia-smi` summary, with no consistency check |
+| `GPU_FAULT_METRICS_INTERVAL_SECONDS` | DCGM 15, nvidia-smi 30; the installer always writes 15 (`--metrics-interval`) |
 | `GPU_FAULT_HOST_INTERVAL_SECONDS` | 15 |
 | `GPU_FAULT_LOG_INTERVAL_SECONDS` | 10 |
 | `GPU_FAULT_FILESYSTEMS` | `/,/var,/tmp` |
 | `GPU_FAULT_REQUIRED_INTERFACES` | Empty |
-| `GPU_FAULT_TRAINING_LOG_PATHS` | Empty |
+| `GPU_FAULT_TRAINING_LOG_PATHS` | Empty; the regional Installer Job writes `/var/log/pods/*/*/*.log,/opt/ml/output/**/*.log`, read only when the NodeLogCollector is enabled |
 
 The node-local Collector runs by default at startup:
 
@@ -8651,16 +8651,21 @@ nvidia-smi \
 
 The system reads all visible GPUs, not just the first card, and normalises names such as `NVIDIA H200 NVL` to
 `H200`. All GPUs must have unique UUIDs and the same model. When the discovered model disagrees with
-`GPU_FAULT_GPU_PRODUCT`, mixed models are returned, or the CSV is corrupt, the Collector refuses to start.
+`GPU_FAULT_GPU_PRODUCT`, mixed models are returned, or the CSV is corrupt, the Collector refuses to start. The driver branch is
+discovered separately with `nvidia-smi --query-gpu=driver_version`; a disagreement with `GPU_FAULT_DRIVER_BRANCH` or mixed branches
+also refuse the start. A missing `nvidia-smi`, a timeout (15 s), a non-zero exit or a list with no GPU at all count as "discovery
+unavailable", and the mode below decides whether the Collector still starts:
 
-- `auto`: prefers `nvidia-smi`; the explicit configuration may be used when the CLI is unavailable.
+- `auto`: prefers `nvidia-smi`; when discovery is unavailable the explicit configuration is used, and without one the Collector starts without a product and retries later (see below).
 - `required`: refuses to start when auto-discovery fails, with no fallback.
 - `disabled`: runs no command and uses only the explicit configuration.
 
-A collector that started without a product under `auto` does not stay blind: the kernel, metrics (DCGM/nvidia-smi) and Fabric Manager collectors retry the same `nvidia-smi` discovery every 60 s before stamping the identity (the kernel collector also in the idle gaps of its stream read); on success they log the WARNING `GPU identity discovered after start (attempt N): product=… driver_branch=… cuda_version=…` and fill the driver branch/CUDA version the configuration left empty; a failed retry only logs a WARNING and never holds a record (the three collector units are also ordered `After=nvidia-persistenced.service`, so a normal boot no longer starts them before the driver). The control plane has its own fallback: an XID/SXID without a product takes it from the node's GPU inventory when that inventory is from the **same boot, younger than 180 s** (`GPU_FAULT_GPU_INVENTORY_MAX_AGE_SECONDS`) and names one product on every device; the event's `gpu_identity_source` records `GPU_INVENTORY:<snapshot_id>`. Otherwise it records `NO_FRESH_GPU_INVENTORY` and the policy fails closed as before (`NOT_APPLICABLE … product UNKNOWN`, Administrator Operations §7).
+A collector that started without a product under `auto` does not stay blind: the kernel, metrics (DCGM/nvidia-smi) and Fabric Manager collectors retry the same `nvidia-smi` discovery every 60 s before stamping the identity (the kernel collector also in the idle gaps of its stream read); on success they log the WARNING `GPU identity discovered after start (attempt N): product=… driver_branch=… cuda_version=…` and fill the driver branch/CUDA version the configuration left empty; a failed retry only logs a WARNING and never holds a record (the kernel, metrics and host collector units are ordered `After=nvidia-persistenced.service`, so a normal boot no longer starts them before the driver; the Fabric Manager collector unit is ordered after `nvidia-fabricmanager.service`). The control plane has its own fallback: an XID/SXID without a product takes it from the node's GPU inventory when that inventory is from the **same boot, younger than 180 s** (`GPU_FAULT_GPU_INVENTORY_MAX_AGE_SECONDS`) and names one product on every device; the event's `gpu_identity_source` records `GPU_INVENTORY:<snapshot_id>`. Otherwise it records `NO_FRESH_GPU_INVENTORY` and the policy fails closed as before (`NOT_APPLICABLE … product UNKNOWN`, Administrator Operations §7).
 
-The legacy generic Kubernetes Collector manifests in the repository are not implemented as a delivered capability; their images and
-`REPLACE_WITH_GPU_PRODUCT` placeholders cannot be used in production. Regional HyperPod data-plane nodes are installed via the
+Node Collectors run only as systemd units; the repository no longer ships manifests that run a node Collector as a Kubernetes Pod.
+The only Collector Deployment in a cluster is the regionally rolled-out `gpu-fault-kubernetes-node-resource-collector`
+(`gpu-fault-collector kubernetes-node-resources`, manifest `deploy/dataplane/kubernetes-node-resource-collector.yaml`), which does
+no GPU product discovery. Regional data-plane nodes (HyperPod and `eks-managed`) are installed via the
 Installer/Reconciler or systemd, and GPU product discovery uses `auto` by default.
 
 | Environment variable | Default |
@@ -8669,21 +8674,32 @@ Installer/Reconciler or systemd, and GPU product discovery uses `auto` by defaul
 | `GPU_FAULT_DCGM_METRICS_URL` | `http://127.0.0.1:9400/metrics` |
 | `GPU_FAULT_COLLECTOR_OUTBOX_PATH` | `/var/lib/gpu-fault/outbox/<subcommand>.ndjson` |
 | `GPU_FAULT_COLLECTOR_GZIP_MIN_BYTES` | `4096` |
+| `GPU_FAULT_COLLECTOR_HTTP_TIMEOUT_SECONDS` | `10`; HTTP timeout of one delivery, must be positive; raising it above 18 s means raising the kernel collector unit's `TimeoutStopSec=30` too |
+| `GPU_FAULT_COLLECTOR_OUTBOX_MAX_RECORDS` | `1000`; outbox record cap; beyond it the oldest records are evicted down to 90% with the WARNING `collector outbox is full` |
 
 Collector-to-control-plane delivery has three behaviours directly related to IOPS and bandwidth that must be confirmed at deployment:
 
 - **durable outbox**: when the control plane is unreachable, events first land in NDJSON and are replayed after recovery. The path is derived automatically by default
   from `gpu-fault-collector <subcommand>` as
-  `/var/lib/gpu-fault/outbox/<subcommand>.ndjson`, with no per-deployment setting needed. Collector containers running in
+  `/var/lib/gpu-fault/outbox/<subcommand>.ndjson`, with no per-deployment setting needed; the systemd units keep that directory
+  writable with `StateDirectory=gpu-fault` or `ReadWritePaths=/var/lib/gpu-fault`. Collector containers running in
   Kubernetes use a read-only root filesystem, so a writable volume **must** be mounted at
-  `/var/lib/gpu-fault` (the sample manifest uses an emptyDir with `sizeLimit: 256Mi`);
-  otherwise outbox writes fail and buffered events are silently dropped.
+  `/var/lib/gpu-fault` (`deploy/dataplane/kubernetes-node-resource-collector.yaml` uses an emptyDir with `sizeLimit: 256Mi`);
+  otherwise outbox writes fail (an ERROR `cannot persist collector outbox event` the first time, then WARNINGs with the running
+  count) and events that could not be delivered are lost. On the node,
+  `gpu-fault-collector outbox --collector <subcommand> {list,stats,requeue-dead}` inspects the outbox (metadata only;
+  `requeue-dead` needs `--yes`); remotely use `gpu-fault-admin collector-outbox`.
 - **gzip**: request bodies reaching `GPU_FAULT_COLLECTOR_GZIP_MIN_BYTES` are compressed. Both the control-plane
   processor and cluster-token middlewares decompress, so the default 4 KiB is safe;
   raise it only when you have confirmed some chain does not pass through these two middlewares.
 - **connection reuse**: the same thread reuses HTTP/1.1 keep-alive connections for the same `(scheme, host, port)`
-  (at most 8 per thread, LRU eviction), retrying once when a reused connection meets a silent close by the peer.
-  For verification see the `ss -tan` count in the "Node verification" section.
+  (at most 8 per thread, LRU eviction); a connection idle longer than `GPU_FAULT_HTTP_CONNECTION_IDLE_SECONDS` (90 s) or older than
+  `GPU_FAULT_HTTP_CONNECTION_MAX_AGE_SECONDS` (1800 s, ±10% jitter) is replaced before reuse, and TCP keepalive is
+  `GPU_FAULT_HTTP_TCP_KEEPALIVE_SECONDS` (60 s). A connection found closed by the peer before the write is replaced, and a request
+  whose write failed is sent again on a fresh connection; a request that broke after it was written is retried once on a fresh
+  connection only for a GET or a POST carrying `Idempotency-Key`/`X-GPU-Fault-Request-ID`/`X-GPU-Fault-Command-ID`. The pool
+  summarises its counters in the log every 300 s (`transport pool: opened=… reused=…`), and the Node Agent's `/healthz` returns the
+  same counters under `transport`.
 
 <a id="92-completion-watcher"></a>
 ### 7.2 Completion Watcher
@@ -8692,13 +8708,15 @@ Collector-to-control-plane delivery has three behaviours directly related to IOP
 |---|---|
 | `GPU_FAULT_CONTROL_PLANE_URL` | Required |
 | `GPU_FAULT_CLUSTER_ID` | Required |
-| `GPU_FAULT_WATCHER_ENVIRONMENT` | `hyperpod-eks` |
-| `GPU_FAULT_WATCH_NAMESPACE` | Empty, watches all namespaces |
-| `GPU_FAULT_WATCHER_POLL_SECONDS` | 5 |
+| `GPU_FAULT_WATCHER_ENVIRONMENT` | `hyperpod-eks`; defaults to `eks` when `GPU_FAULT_CLUSTER_PROVIDER=eks-managed` (the regional release renders `eks` for an `eks-managed` cluster); one of `eks/hyperpod-eks/hyperpod-slurm/kubernetes` |
+| `GPU_FAULT_WATCH_NAMESPACE` | Empty, watches all namespaces; when set only that namespace is listed and no idle coverage heartbeat is sent (§7.4) |
+| `GPU_FAULT_WATCHER_POLL_SECONDS` | 5 (regional manifest 3); only paces the polling fallback used when the watch client is unavailable |
 | `GPU_FAULT_WATCHER_WATCH_TIMEOUT_SECONDS` | 30 |
-| `GPU_FAULT_WATCHER_CLEANUP_TIMEOUT_SECONDS` | 120 |
-| `GPU_FAULT_PASSIVE_STOP_FALLBACK_SECONDS` | 30; an empty value disables the emergency fallback |
-| `GPU_FAULT_PUBLISH_WORKLOAD_OBSERVATIONS` | true |
+| `GPU_FAULT_WATCHER_RECONCILE_DEBOUNCE_SECONDS` | 0.5; window in which a burst of Pod events of one attempt coalesces into one reconcile. Raise it (and the CPU limit) when the Watcher lags; do not add replicas: the Deployment is fixed at 1 replica with `Recreate` |
+| `GPU_FAULT_WATCHER_CLEANUP_TIMEOUT_SECONDS` | 120 (regional manifest 30), 1-3600; deadline for the remaining critical ranks to exit after an attempt reported a failure; when it passes with ranks still running the `TIMED_OUT` terminal is published |
+| `GPU_FAULT_COMPLETION_ATTEMPT_MISSING_GRACE_SECONDS` | 300; how long all Pods of an attempt may be absent before it ends as `STOPPED` (at once when the workload object is gone) |
+| `GPU_FAULT_PASSIVE_STOP_FALLBACK_SECONDS` | 30; an empty value disables the emergency fallback, a set value must be at least 1 |
+| `GPU_FAULT_PUBLISH_WORKLOAD_OBSERVATIONS` | true; false also stops the idle coverage heartbeat |
 | `GPU_FAULT_DISCOVER_POD_GPU_UUIDS` | true |
 | `GPU_FAULT_DEFAULT_RESTART_BUDGET` | 1 |
 | `GPU_FAULT_WORKLOAD_LOG_TAIL_LINES` | 2000 |
@@ -8707,7 +8725,9 @@ Collector-to-control-plane delivery has three behaviours directly related to IOP
 | `GPU_FAULT_WORKLOAD_LOG_S3_MAX_BYTES` | 104857600; per-Pod S3 snapshot cap |
 | `GPU_FAULT_WORKLOAD_LOG_ANNOTATION_TAIL_BYTES` | 8192; Pod annotation tail surviving Watcher restarts |
 | `GPU_FAULT_COMPLETION_WATCHER_METRICS_PORT` | 9109; the same HTTP server serves `GET /metrics` (`gpu_fault_completion_controller_*` counters and outbox gauges) and `GET /healthz`. All three startup/liveness/readiness probes read `/healthz`, so setting 0 or a bind failure is no longer "just missing metrics": the process keeps running, but kubelet repeatedly kills the Pod, and the failure shows up in the restart count |
-| `LOG_LEVEL` | INFO |
+| `GPU_FAULT_PROCESSOR_RECEIPT_TIMEOUT_SECONDS` / `GPU_FAULT_PROCESSOR_RECEIPT_POLL_SECONDS` | 120 / 0.25; how long failure-detected/terminal wait for the processor's final receipt and how often they poll; part of the `/healthz` stall budget |
+| `GPU_FAULT_COMPLETION_OUTBOX_MAX_RECORDS` / `GPU_FAULT_COMPLETION_OUTBOX_MAX_BYTES` | 256 / 900000; record and byte caps of `gpu-fault-completion-watcher-outbox` (a ConfigMap is capped at 1 MiB per object) |
+| `LOG_LEVEL` | INFO; `GPU_FAULT_LOG_LEVEL` takes precedence, an unrecognised level means INFO |
 
 The `cleanup timeout` should exceed the graceful exit time of distributed jobs and be below the scheduler's hard timeout. For large jobs, stress-test starting from 120-600 seconds.
 
@@ -8728,6 +8748,10 @@ The Watcher ServiceAccount must also have:
   verbs: ["get"]
 ```
 
+The regional release keeps the Watcher's ClusterRole read-only (Pod get/list/watch, Job/PyTorchJob/JobSet get, and get/update/patch
+on the two outbox ConfigMaps); the write verbs come from a Role/RoleBinding rendered into every workload namespace listed in the
+cluster's `allowedNamespaces` in `site.yaml`: `pods` patch, `pods/log` get, `pods/exec` get/create, and Job/PyTorchJob/JobSet patch.
+
 When `GPU_FAULT_WORKLOAD_LOG_S3_URI` is configured, give the Watcher a separate IRSA that allows only
 `s3:PutObject` on the target log prefix. Do not reuse the executor role carrying HyperPod reboot/replace permissions.
 An unreachable control plane does not affect this independent S3 chain.
@@ -8741,10 +8765,14 @@ written only while true), so a graceful delete or an eviction (a non-zero exit a
 training failure, after a restart -- a record without deletions is byte for byte the previous release's, so upgrading rewrites nothing,
 and a rolled-back watcher ignores the key; a rolling upgrade does not overwrite the two existing
 ConfigMaps, and when upgrading to this version the attempt state in the old object is migrated once when the Watcher first reads it; the migration is one-way
-(the `attempt:*` keys in the old object are deleted), and after rolling back to the previous watcher there is no restart memory and it can only be rebuilt from live Pods. The Role's
+(the `attempt:*` keys in the old object are deleted), and after rolling back to the previous watcher there is no restart memory and it can only be rebuilt from live Pods. The Watcher ClusterRole's
 `resourceNames` must list both objects; when `-active` reads 403/404 the Watcher runs degraded and sets
 `gpu_fault_completion_active_state_unavailable` to 1 (one ERROR per hour); delivery is unaffected,
 but there is no attempt memory after a restart.
+The two critical events, failure-detected and terminal, are written to `gpu-fault-completion-watcher-outbox` first (write-ahead)
+and delivered after; a delivered record is removed. A record whose failures stay retryable for 24 hours expires and is removed
+(logged at ERROR); one the control plane rejects as non-retryable is quarantined and kept. After fixing the cause, run
+`gpu-fault-completion-watcher --replay-quarantined` once in the Watcher Pod (exit code 1 while anything is still quarantined or expired).
 `GpuFaultStaleAttemptObservation` means the CPU side still has an active-phase
 Observation not refreshed for more than 120 seconds; that record has been excluded from ownership. The alert fires only after persisting for 2 minutes; troubleshooting should check the corresponding training Pod,
 Watcher logs/Ready and outbox, and must not delete database rows directly.
@@ -8787,7 +8815,9 @@ When a Job, PyTorchJob or JobSet is restarted successfully, the system generates
 the workload root metadata and all new Pod templates. A retry of the same operation yields the same attempt ID and does not
 consume the budget twice.
 
-The control-plane ServiceAccount also needs `get/list/patch` on managed Pods.
+The Cluster Executor that runs `STOP_WORKLOADS`/`RESTART_WORKLOAD` (ServiceAccount `gpu-fault-cluster-executor`) also needs
+`get/list/patch` on managed Pods: its ClusterRole is read-only (get/list/watch), and Pod `patch`/`delete` as well as Job/PyTorchJob/JobSet
+`create`/`patch` again come from the namespace Roles rendered from `allowedNamespaces`.
 `STOP_WORKLOADS` writes
 `gpu-fault.io/termination-initiator-incident-id` before suspending, preventing a second recursive recovery flow
 when the training process exits non-zero because of the deliberate stop.
@@ -8850,8 +8880,8 @@ the solution's contract is that every submitted training job carries that label;
 nor counted as running Pods in the heartbeat. The early "observe-only mode" (`GPU_FAULT_COMPLETION_OBSERVE_UNMANAGED`
 together with `GPU_FAULT_COMPLETION_OBSERVATION_RUNTIME_PROFILE` and
 `GPU_FAULT_COMPLETION_OBSERVATION_RETENTION_CYCLES`) has been removed; if the site configuration still sets these three
-variables, the environment validation at process startup treats them as unknown `GPU_FAULT_*` variables and errors or warns per
-`GPU_FAULT_UNKNOWN_ENV_POLICY`; just remove them. JobSet/PyTorchJob jobs, like ordinary Jobs,
+variables, the environment validation at process startup treats them as unknown `GPU_FAULT_*` variables and handles them per
+`GPU_FAULT_UNKNOWN_ENV_POLICY` (default `error`, i.e. the process refuses to start; `warn`/`ignore` are the alternatives); just remove them. JobSet/PyTorchJob jobs, like ordinary Jobs,
 are aggregated per attempt as long as the Pods carry the managed label and attempt-id; there is no longer a side path synthesising attempts by `jobset-name`.
 
 The Completion watcher also carries the **idle coverage heartbeat**: after every pass with no running managed Pods, no active attempts
@@ -8859,8 +8889,9 @@ and no new reconcile failures, it reports "cluster idle" once to `POST /v1/attem
 from which the control plane reads `workload_state` as `IDLE` instead of `UNKNOWN`, so that XID plans on an idle cluster are no longer uniformly
 BLOCKED. The premise is the solution's existing contract: **every submitted training job carries the `gpu-fault.io/managed=true` label**;
 the heartbeat is responsible only for labelled Pods, unlabelled workloads are outside the protection scope, and the watcher has no switch to relax the selector
-(the former observe-only mode has been removed). The 120 s heartbeat interval is built into
-the watcher, and `GPU_FAULT_WORKLOAD_CONTEXT_FRESHNESS_SECONDS` (default 600) must not be lowered below 600,
+(the former observe-only mode has been removed). A watcher that watches a single namespace (`GPU_FAULT_WATCH_NAMESPACE` set) or runs
+with `GPU_FAULT_PUBLISH_WORKLOAD_OBSERVATIONS=false` sends no heartbeat. Heartbeats go out at most every 120 s (an interval built into
+the watcher), and `GPU_FAULT_WORKLOAD_CONTEXT_FRESHNESS_SECONDS` (default 600) must not be lowered below 600,
 otherwise `UNKNOWN` gaps appear.
 
 After go-live, verify the collection plane once with the following command:
@@ -8885,9 +8916,10 @@ report format error. The cluster ID is encoded as a single URL path segment.
 
 | Environment variable | Default | Description |
 |---|---|---|
-| `GPU_FAULT_FABRIC_MANAGER_JOURNAL` | true | Whether to read journald |
+| `GPU_FAULT_FABRIC_MANAGER_JOURNAL` | true | Whether to read journald; the installer's `--disable-fabric-manager-journal` turns it off, which then requires file paths |
 | `GPU_FAULT_FABRIC_MANAGER_IDENTIFIERS` | `nvidia-fabricmanager,nv-fabricmanager` | journal identity allowlist |
-| `GPU_FAULT_FABRIC_MANAGER_LOG_PATHS` | Auto-discovered | When `LOG_USE_SYSLOG=0`, reads the existing absolute paths from the NVIDIA configuration; can also be overridden explicitly |
+| `GPU_FAULT_FABRIC_MANAGER_LOG_PATHS` | Empty in the process; discovered by the installer | Comma-separated absolute globs. Without an explicit value the installer takes `LOG_FILE_NAME` from `/usr/share/nvidia/nvswitch/fabricmanager.cfg` when that file sets `LOG_USE_SYSLOG=0` (written only when the file exists); an explicit `--fabric-manager-log-paths` wins |
+| `GPU_FAULT_FABRIC_MANAGER_LOG_INTERVAL_SECONDS` | 5 | Fabric Manager collector collection period (installer `--fabric-manager-log-interval`) |
 | `GPU_FAULT_FABRIC_MANAGER_STATE_PATH` | `/var/lib/gpu-fault/fabric-manager-collector-state.json` | journal cursor and file inode/offset |
 
 #### HMA Forwarding Chain Retirement and Upgrade
@@ -8921,8 +8953,10 @@ check, `NodeRecovery=None` or the always-disabled provider replace constraint.
 
 #### XID 154 Evidence and Correlation Acceptance
 
-The Kernel Collector does not guess semantics from the action code; it accepts only the bracketed
-labels explicitly listed by the NVIDIA Catalog. The write below only verifies the software chain and does not create a hardware fault:
+The control plane derives the XID 154 recovery action from the raw kernel line (`parse_xid154_action` in
+`src/gpu_fault/policy/models.py`; an `xid_154_action` field sent by a client is always discarded): it does not guess semantics from the
+action code and accepts only the bracketed labels explicitly listed by the NVIDIA Catalog, `None`, `Drain P2P`, `Drain and Reset`,
+`GPU Reset Required` and `Node Reboot Required`. The write below only verifies the software chain and does not create a hardware fault:
 
 ```bash
 printf '%s\n' \
@@ -8936,19 +8970,23 @@ During acceptance first write an XID 144-150 sample decodable as `XID_154_EVAL`,
 `correlated_event_id` points at the primary, and the two events share exactly one incident/workflow. Removing the bracketed
 label or changing it to an unknown label must yield `BLOCKED_MISSING_EVIDENCE` and must not execute reset/reboot.
 
-The NVIDIA kernel message of XID 144-150 must carry the complete seven-register payload:
+The NVIDIA kernel message of XID 144-150 carries a parenthesised register group after the Xid number. The GSP-RM firmware that
+formats these Xids has exactly two payloads: two registers (intrInfo, errorStatus), or the same prefix followed by six registers (four
+debug words more); R590 and newer firmware add a literal `SECURE` token before the severity. The seven values the NVIDIA Catalog
+`WORKFLOW_NVLINK5_ERR` template lists are documentation only (see [detailed design](detailed-design.md) §2.3.1):
 
 ```text
-NVRM: Xid (PCI:0000:BB:DF): <144-150> <sub-component> <fatality> \
-<cross-contain> <injected> <link> \
-(<intrInfo> <errorStatus> <debug0> <debug1> <debug2> <debug3> <debug4>)
+NVRM: Xid (PCI:0000:BB:DF): <144-150>, <sub-component> <Fatal|Nonfatal> XC<n> i<n> Link <nn> \
+(<intrInfo> <errorStatus>[ <debug0> <debug1> <debug2> <debug3>])
 ```
 
-The Collector sets `intr_info` from the first value inside the brackets and `error_status` from the second, and the control plane then
-selects the V1/V2 Catalog pattern by the R575 boundary. Acceptance must check that the evidence keeps the complete original text,
+The kernel line travels verbatim; the control plane's normalizer (`src/gpu_fault/nvidia_logs.py`) reads only the parenthesised payload
+after that Xid number and before the next Xid, requires at least two 32-bit hexadecimal registers (with no upper bound), sets
+`intr_info` from the first and `error_status` from the second, and then selects the V1/V2 Catalog pattern by the R575 boundary.
+Acceptance must check that the evidence keeps the complete original text,
 that both fields in the normalized XID event are integers, and that the decision contains `decoded_subcode` and
-`matched_decode_rules`. A simplified sample with only two registers should yield
-`BLOCKED_MISSING_EVIDENCE` and cannot be used to verify real recovery actions. Samples that may decode to reset/reboot
+`matched_decode_rules`. A sample with a single register, a non-hex token or a value over 32 bits gets neither field and should yield
+`BLOCKED_MISSING_EVIDENCE`; it cannot be used to verify real recovery actions. Samples that may decode to reset/reboot
 may only be injected on already isolated B200/B300 test nodes.
 
 <a id="95-node-agent-完整参数"></a>
@@ -8958,50 +8996,70 @@ The installation script generates these variables; when deploying the Agent by h
 
 | Environment variable | Default / constraint | Description |
 |---|---|---|
-| `GPU_FAULT_NODE_ACTION_SECRET` | Required | With version 2, the node-specific HMAC key derived by `cluster_id/node_id`; the node must not keep the fleet master |
+| `GPU_FAULT_NODE_ACTION_SECRET` | Required, at least 32 characters | With version 2, the node-specific HMAC key derived by `cluster_id/node_id`; the node must not keep the fleet master |
 | `GPU_FAULT_NODE_ACTION_KEY_VERSION` | Regional installation writes 2 explicitly; the process defaults to 1 when unset | `1` is only for rolling migration of old Agents; production must ultimately be node-level `2` |
-| `GPU_FAULT_NODE_ALLOWED_OPERATIONS` | Generated by the installation script, containing `RUN_DCGM_DIAGNOSTIC` | The node's final allowlist |
+| `GPU_FAULT_NODE_ALLOWED_OPERATIONS` | Generated by the installation script; the process alone allows only `VERIFY_NO_GPU_CLIENTS` | The node's final allowlist; an operation the Agent does not support refuses the start. The installer writes 13 base operations `COLLECT_HUNG_TRIAGE`, `COLLECT_HUNG_SUMMARY`, `COLLECT_DIAGNOSTIC_BUNDLE`, `RUN_DCGM_DIAGNOSTIC`, `QUIESCE_GPU_SERVICES`, `VERIFY_NO_GPU_CLIENTS`, `TRIGGER_HEALTH_SNAPSHOT`, `RESET_GPU`, `RECOVER_DRAIN_P2P`, `RESET_ALL_GPUS_NVSWITCHES`, `RESTORE_GPU_SERVICES`, `RESTART_FABRIC_MANAGER`, `COLLECTOR_OUTBOX_MAINTENANCE`, adds `REMEDIATE_EFA_DRIVER` by default, and per switch `RUN_NVLINK74_WORKFLOW`/`RUN_FIELD_DIAGNOSTIC`, `REMEDIATE_DRIVER` and `UPDATE_SOFTWARE_FIRMWARE` |
 | `GPU_FAULT_NODE_ALLOW_GPU_RESET` | CLI false; regional production true | reset master switch |
+| `GPU_FAULT_NODE_SINGLE_GPU_RESET_SUPPORTED` | true | false refuses every single-GPU `RESET_GPU` (a topology without single-GPU reset uses `RESET_ALL_GPUS_NVSWITCHES` or a reboot); part of the Agent config digest |
 | `GPU_FAULT_NODE_ALLOW_FABRIC_RESET` | CLI false; regional production true | Separate master switch for all-GPU/NVSwitch reset |
 | `GPU_FAULT_NODE_ALLOW_FABRIC_MANAGER_RESTART` | CLI false; regional production true | Separate master switch for Fabric Manager restart |
 | `GPU_FAULT_NODE_ALLOW_SERVICE_QUIESCE` | CLI false; regional production true | quiesce/restore master switch |
 | `GPU_FAULT_DIAGNOSTIC_OUTPUT_DIR` | `/var/lib/gpu-fault/diagnostics` | root-only local diagnostic bundle directory |
 | `GPU_FAULT_DIAGNOSTIC_S3_URI` | Empty | Optional `s3://bucket[/prefix]` persistent evidence location; on a managed site from `spec.diagnosticS3Uri` of `site.yaml`, part of the Agent config digest |
+| `GPU_FAULT_DIAGNOSTIC_RETENTION_SECONDS` / `GPU_FAULT_DIAGNOSTIC_MAX_ARCHIVES` | 604800 (minimum 3600) / 20 (minimum 1) | Retention time and count cap of local diagnostic bundles |
+| `GPU_FAULT_PYTHON_STACK_TOOL` | The installer writes the path of a pinned py-spy; the process defaults to `/opt/gpu-fault/venv/bin/py-spy` | Tool that samples Python stacks for hung diagnostics; must be an absolute path |
+| `GPU_FAULT_NODE_ALLOW_FIELD_DIAGNOSTIC` | false | NVIDIA Field Diagnostic master switch (the allowlist gains `RUN_NVLINK74_WORKFLOW`, plus `RUN_FIELD_DIAGNOSTIC` when a memory diagnostic command is configured) |
+| `GPU_FAULT_FIELD_DIAGNOSTIC_COMMAND` / `GPU_FAULT_FIELD_DIAGNOSTIC_SHA256` | Empty | Absolute-path command (may contain `{link_id}`/`{gpu_uuid}`/`{pci_bdf}`) and the SHA-256 of its executable |
+| `GPU_FAULT_MEMORY_FIELD_DIAGNOSTIC_COMMAND` / `GPU_FAULT_MEMORY_FIELD_DIAGNOSTIC_SHA256` | Empty | Whole-GPU memory diagnostic command used for row-remap failures, and its SHA-256 |
+| `GPU_FAULT_FIELD_DIAGNOSTIC_TIMEOUT_SECONDS` | 1800, 60-7200 | Field Diagnostic timeout |
 | `GPU_FAULT_NODE_ALLOW_DRIVER_REMEDIATION` | false | Node master switch for driver remediation |
 | `GPU_FAULT_DRIVER_REMEDIATION_COMMAND` | Empty | Absolute-path command; arguments may contain `{target}` |
 | `GPU_FAULT_DRIVER_REMEDIATION_SHA256` | Empty | SHA-256 of the driver remediation executable |
 | `GPU_FAULT_TARGET_DRIVER_BRANCH` | Empty | Integer branch exactly matching the control plane |
+| `GPU_FAULT_NODE_ALLOW_EFA_DRIVER_REMEDIATION` | Process false; installer default true (`--disable-efa-driver-remediation` turns it off) | Node master switch for the EFA PCI driver rebind (`REMEDIATE_EFA_DRIVER`) |
 | `GPU_FAULT_NODE_ALLOW_FIRMWARE_UPDATE` | false | Node master switch for firmware updates |
 | `GPU_FAULT_FIRMWARE_UPDATE_COMMAND` | Empty | Absolute-path command; arguments may contain `{target}` |
 | `GPU_FAULT_FIRMWARE_UPDATE_SHA256` | Empty | SHA-256 of the firmware update executable |
 | `GPU_FAULT_TARGET_FIRMWARE_VERSION` | Empty | Exact version exactly matching the control plane |
 | `GPU_FAULT_FIRMWARE_VERIFY_COMMAND` | Empty | Absolute-path command whose stdout prints only the current exact version |
 | `GPU_FAULT_FIRMWARE_VERIFY_SHA256` | Empty | SHA-256 of the firmware verification executable |
-| `GPU_FAULT_QUIESCE_SERVICES` | Generated by the installation script, containing `nvidia-persistenced`, `gpu-fault-gpu-persistence`, DCGM/FM/collector/kubelet | Restore order; stop order is the reverse |
-| `GPU_FAULT_QUIESCE_PROCESSES` | The set of NVIDIA/DCGM processes | Process names for exact TERM; never `nv-fabricmanage` or `nvlsm` (refused when the Agent starts, as in `GPU_FAULT_DEVICE_SWEEP_PROCESSES`: the quiesce never signals Fabric Manager or NVLSM) |
-| `GPU_FAULT_QUIESCE_FAILSAFE_SECONDS` | 420, 30-3600 | Delay of the first automatic recovery |
+| `GPU_FAULT_QUIESCE_SERVICES` | `nvidia-fabricmanager,nvidia-dcgm,nvidia-persistenced,gpu-fault-gpu-persistence,gpu-fault-metrics-collector,gpu-fault-host-collector,kubelet` (installer and process default alike) | Restore order; stop order is the reverse; on an `eks-managed` node the quiesce never stops kubelet/containerd (the list and the config digest stay the same) |
+| `GPU_FAULT_QUIESCE_PROCESSES` | Empty (neither the process nor the installer TERMs any process by name by default) | Process names for exact TERM; never `nv-fabricmanage` or `nvlsm` (refused when the Agent starts, as in `GPU_FAULT_DEVICE_SWEEP_PROCESSES`: the quiesce never signals Fabric Manager or NVLSM) |
+| `GPU_FAULT_QUIESCE_CONTAINERS` | `aws-hyperpod/health-monitoring-agent,gpu-fault-system/exporter,kube-system/nvidia-device-plugin-ctr` | `namespace/container` selectors stopped during the quiesce; a selector that matches no running container is skipped |
+| `GPU_FAULT_CONTAINER_STOP_TIMEOUT_SECONDS` / `GPU_FAULT_CONTAINER_RESTORE_TIMEOUT_SECONDS` | 30 (5-120) / 180 (30-900) | Graceful container stop timeout / wait for the containers to return |
+| `GPU_FAULT_DEVICE_SWEEP_PROCESSES` | `nvidia-persiste,nv-hostengine` | Process names (`comm`, at most 15 characters) that may be TERMed when they still hold a target `/dev/nvidiaN` after the service and container stop; holders inside the affected workload's cgroup are swept too, any other holder is left for VERIFY to fail closed on |
+| `GPU_FAULT_DEVICE_SWEEP_TIMEOUT_SECONDS` | 20, 0-120 | Wait after the TERM before a holder is escalated to KILL |
+| `GPU_FAULT_QUIESCE_FAILSAFE_SECONDS` | 420, 30-3600; at least 2100 (`GPU_FAULT_LONG_MUTATION_MIN_FAILSAFE_SECONDS`) when the allowlist holds `REMEDIATE_DRIVER`/`UPDATE_SOFTWARE_FIRMWARE`, otherwise the Agent refuses to start | Delay of the first automatic recovery |
 | `GPU_FAULT_QUIESCE_RETRY_SECONDS` | 60, 10-600 | Automatic recovery retry period |
 | `GPU_FAULT_QUIESCE_SETTLE_SECONDS` | 2, 0-60 | Wait after stopping services |
+| `GPU_FAULT_RESTORE_SETTLE_SECONDS` | 30, 0-120 | Wait after restoring the services, before each GPU's persistence mode is read |
 | `GPU_FAULT_QUIESCE_STATE_DIR` | `/var/lib/gpu-fault/quiesce` | root-only persistent recovery state |
+| `GPU_FAULT_QUIESCE_RESTORE_COMMAND` | The installer writes `/opt/gpu-fault/current/venv/bin/gpu-fault-restore-gpu-services` | Command the automatic restore timer runs; must be an absolute path |
+| `GPU_FAULT_CLUSTER_PROVIDER` / `GPU_FAULT_DCGM_HOSTENGINE` / `GPU_FAULT_QUIESCE_SWEEP_KUBERNETES_DEVICE_HOLDERS` | Written only on `eks-managed` nodes (`eks-managed`, `host` or `embedded`, `true`) | The provider (the quiesce never stops kubelet/containerd), the DCGM host engine mode (any other spelling refuses the Agent start), and permission for the quiesce to stop a Kubernetes container still holding a target GPU; none of the three enters the config digest |
 | `GPU_FAULT_NODE_ACTION_DB` | `/var/lib/gpu-fault/node-actions.db` | Idempotency ledger |
-| `GPU_FAULT_NODE_AGENT_HOST` | Node private address | The installer writes the InternalIP; it no longer listens on all interfaces by default |
+| `GPU_FAULT_NODE_ACTION_RETENTION_SECONDS` / `GPU_FAULT_NODE_ACTION_MAX_RESULTS` | 2592000 (minimum 600) / 10000 (minimum 100) | Ledger retention and row cap |
+| `GPU_FAULT_NODE_INFLIGHT_WAIT_TIMEOUT_SECONDS` | 2100, 10-7200 | How long a duplicate command waits for the in-flight original |
+| `GPU_FAULT_NODE_AGENT_HOST` | The process defaults to the first private address the host name resolves to (`127.0.0.1` without one) | The regional Installer Job writes the InternalIP, a direct installation defaults to the node ID (`--node-agent-host`); it no longer listens on all interfaces by default |
 | `GPU_FAULT_NODE_AGENT_PORT` | 9099 | Listening port |
 | `GPU_FAULT_NODE_AGENT_ALLOW_PLAINTEXT` | false | Must be set explicitly to true without TLS; allowed only in an already isolated node network |
 | `GPU_FAULT_NODE_CONTROL_PLANE_URL` | Conditionally required | Required when heartbeat is enabled |
 | `GPU_FAULT_NODE_CLUSTER_ID` | Conditionally required | Required when heartbeat is enabled |
+| `GPU_FAULT_NODE_CONTROL_PLANE_TOKEN` | Written by the installer | Cluster bearer token of the heartbeat; falls back to `GPU_FAULT_CONTROL_PLANE_TOKEN` when unset |
 | `GPU_FAULT_NODE_ARTIFACT_SHA256` | Conditionally required | wheel SHA-256 |
+| `GPU_FAULT_NODE_COMPATIBILITY_DIGEST` / `GPU_FAULT_NODE_INSTALLER_BUNDLE_SHA256` / `GPU_FAULT_NODE_INSTALLER_TEMPLATE_SHA256` | Written by the installer (the last two only when the Installer Job provides them); the compatibility digest defaults to the wheel SHA-256 | Compatibility digest and bundle/template SHA-256 reported in the heartbeat |
 | `GPU_FAULT_NODE_RUNTIME_PROFILE_VERSION` | Conditionally required | Agent profile |
-| `GPU_FAULT_NODE_ADVERTISE_URL` | FQDN:9099 | URL reachable by the control plane |
+| `GPU_FAULT_NODE_ADVERTISE_URL` | Process default `https://<FQDN>:<port>` (`http://` without a certificate); the regional installation writes `https://<InternalIP>:9099` | URL reachable by the control plane |
 | `GPU_FAULT_NODE_HEARTBEAT_INTERVAL_SECONDS` | 30, minimum 5 | Heartbeat period |
-| `GPU_FAULT_NODE_INSTANCE_ID` | Node UID / instance ID | Fencing across node replacement |
-| `GPU_FAULT_NODE_ACTION_RESULT_SIGNATURE_REQUIRED` | true | `GET /v1/node-actions/result` must carry `issued_at`+`signature` (same HMAC secret). Set false only during a migration window where the control plane has not yet rolled |
+| `GPU_FAULT_NODE_INSTANCE_ID` | The Node UID on HyperPod, the EC2 instance ID from `spec.providerID` on `eks-managed`; a direct installation without it takes the DMI `product_uuid` or `/etc/machine-id` | Fencing across node replacement; when unset the process falls back to `NODE_UID`, then `EC2_INSTANCE_ID` |
+| `GPU_FAULT_NODE_ACTION_RESULT_SIGNATURE_REQUIRED` | true | `GET /v1/node-actions/result` must carry `issued_at`+`signature` (same HMAC secret). Set false only during a migration window where the control plane has not yet rolled, and only together with `GPU_FAULT_NODE_ACTION_RESULT_SIGNATURE_MIGRATION_RELEASE_ID` equal to the current `GPU_FAULT_RELEASE_ID` and a `GPU_FAULT_NODE_ACTION_RESULT_SIGNATURE_MIGRATION_EXPIRES_AT` with a time zone, not expired and at most 14 days ahead, otherwise the Agent refuses to start; an Agent started from the environment carries the final-ownership gate, so its result queries still accept signed requests only |
 | `GPU_FAULT_NODE_ACTION_RESULT_SIGNATURE_SKEW_SECONDS` | 300 | Replay window of the result query signature |
-| `GPU_FAULT_NODE_AGENT_TLS_CERT` | Empty | Listens on HTTPS when set; must be set together with KEY, and the advertise URL must be `https://` |
-| `GPU_FAULT_NODE_AGENT_TLS_KEY` | Empty | Certificate private key |
+| `GPU_FAULT_NODE_AGENT_TLS_CERT` | Empty in the process; without a certificate and without plaintext permission the installer generates a self-signed `/etc/gpu-fault/node-agent.crt` (397 days) | Listens on HTTPS when set; must be set together with KEY, and the advertise URL must be `https://` |
+| `GPU_FAULT_NODE_AGENT_TLS_KEY` | Empty in the process; `/etc/gpu-fault/node-agent.key` (0600) when generated | Certificate private key |
 | `GPU_FAULT_NODE_AGENT_TLS_KEY_PASSWORD` | Empty | Private key passphrase (optional) |
 | `GPU_FAULT_NODE_AGENT_TLS_CLIENT_CA` | Empty | When set, **requires** client certificates verified with this CA, further constraining which control-plane callers may connect to 9099 |
 
-If only one of the control-plane URL or cluster ID is set, the Agent refuses to start.
+If only one of the control-plane URL or cluster ID is set, the Agent refuses to start; with the heartbeat enabled, a missing artifact
+SHA-256 or runtime profile refuses the start as well.
 
 Authentication of the result query is by signature, not by port reachability: `command_id` is derived from the workflow idempotency key and
 guessable, so an unsigned query is refused with 401 (`INVALID_SIGNATURE`). The signing side and the verifying side share the same protocol contract between
@@ -9010,21 +9068,21 @@ node bundle second**: an un-rolled Agent ignores the two extra query parameters,
 emit the signature. The physical artifact SHAs need not be the same; the protocol version and the compatibility window must match.
 
 The endpoint announced by the heartbeat becomes the target URL of the control plane's POSTed signed commands, so it is restricted to
-"the node's own name, or a private address, or an EC2 private DNS name (`ip-a-b-c-d...`)", the port must
-fall within `GPU_FAULT_AGENT_ENDPOINT_ALLOWED_PORTS`, and no path, query or
-userinfo is allowed. The current regional installation requires `https://<node-private-ip>:9099`, and the signed heartbeat
-carries the node certificate for the control plane to pin.
+"the node's own name, or a private address, or an EC2 private DNS name (`ip-a-b-c-d...`), or a domain suffix listed in
+`GPU_FAULT_AGENT_ENDPOINT_ALLOWED_HOST_SUFFIXES`", the port must
+fall within `GPU_FAULT_AGENT_ENDPOINT_ALLOWED_PORTS` (default `9099`), and no path, query or
+userinfo is allowed. `GPU_FAULT_AGENT_ENDPOINT_REQUIRE_TLS` (default true) further requires an `https://` endpoint and a node
+certificate carried by the signed heartbeat; the current regional installation requires `https://<node-private-ip>:9099`, and the
+control plane pins that certificate.
 
-On 2026-08-16 this was probed item by item on real machines (hitting the production control plane's
-`/v1/fleet/agents/heartbeat` with the node's own cluster token, 10 malicious endpoints): the metadata service
-`169.254.169.254`, loopback, public addresses, an attacker domain, with userinfo, with path, with
-query, and the non-whitelisted port 8080 were all rejected with 409/422; only `172.20.0.1` (the ClusterIP of the Kubernetes API)
-**passed the endpoint validation** and was finally stopped only by the unrelated incarnation lease.
-The reason is that HyperPod's node_id does not encode an address, so the check is left with only "is it private". Therefore
-regional production now additionally reads the node subnets from the
-`RegionalClusterRegistration.agent_endpoint_allowed_cidrs` of the authenticated `cluster_id`; the same
-`172.20.0.1` is rejected with `outside GPU_FAULT_AGENT_ENDPOINT_ALLOWED_CIDRS`, and an EC2 private
-DNS name cannot bypass it either. Two clusters may declare the same CIDR, but requests are still bound to their own registration by the cluster token and node key.
+A heartbeat sent to `/v1/fleet/agents/heartbeat` with the node's own cluster token that announces the metadata service
+`169.254.169.254`, loopback, a public address, an external domain, an endpoint with userinfo/path/query or a non-whitelisted port
+is rejected with 409/422. Checking only "is it private" is not enough: HyperPod's node_id does not encode an address, and an address
+in the Service CIDR (the Kubernetes API's ClusterIP, for example) is private too. Therefore
+regional production reads the node subnets from the
+`RegionalClusterRegistration.agent_endpoint_allowed_cidrs` of the authenticated `cluster_id`; a private address outside them is
+rejected with `outside GPU_FAULT_AGENT_ENDPOINT_ALLOWED_CIDRS`, and an EC2 private
+DNS name (whose encoded address must fall inside the subnets as well) cannot bypass it either. Two clusters may declare the same CIDR, but requests are still bound to their own registration by the cluster token and node key.
 
 At go-live set this value to the actual subnet CIDRs of the GPU nodes and run a set of positive and negative checks: legitimate node endpoints
 must keep advancing heartbeats; the Service CIDR, a neighbouring VPC or addresses outside the whitelist must return 409
@@ -9032,7 +9090,7 @@ must keep advancing heartbeats; the Service CIDR, a neighbouring VPC or addresse
 `site.yaml` cluster and go through the formal release-deploy; do not widen the control-plane environment variable online.
 
 The current Node Action key version 2 derives the initial node-specific key with
-`HMAC-SHA256(fleet_master, "gpu-fault/node-action/v1" || cluster_id || node_id)`.
+`HMAC-SHA256(fleet_master, "gpu-fault/node-action/v1\0" || cluster_id || "\0" || node_id)` (hex digest).
 The fleet master is kept only in the CPU control-plane Secret and in a short-lived 0600 file on the trusted deployment host;
 the GPU cluster's `gpu-fault-node-action-keys`, the Cluster Executor and the
 installer Job hold only per-node keys. A key leaked from one node cannot produce a legitimate heartbeat, command or result-query signature for another
@@ -9107,9 +9165,12 @@ This oneshot runs after `nvidia-persistenced.service`:
 nvidia-smi -pm 1
 ```
 
-Both the installer and the verifier require `persistence_mode=Enabled` on every GPU, otherwise node installation fails.
-The service also belongs to the quiesce/restore set: stopped before reset, driver or firmware maintenance, and run again after
-`nvidia-persistenced` is restored. Check commands:
+When the oneshot fails the installer aborts and rolls back, and the verifier also requires it to be `is-active`; a GPU whose
+`persistence_mode` is not `Enabled` is only a `WARN` and does not roll the install back, and the installer then writes
+`/var/lib/gpu-fault/installer-degraded-gpu.json` (see NODE-5).
+The service also belongs to the quiesce/restore set: the quiesce before a reset, driver or firmware maintenance stops it and then
+releases persistence on the target GPUs only with `nvidia-smi -i <bus id> -pm 0` (`nvidia-smi -pm 0` for a whole-node window); the
+restore runs it again after `nvidia-persistenced`. Check commands:
 
 ```bash
 systemctl is-active gpu-fault-gpu-persistence.service
@@ -9119,13 +9180,15 @@ nvidia-smi --query-gpu=index,persistence_mode --format=csv,noheader
 <a id="96-fleet-cli-transport-变量"></a>
 ### 7.6 Fleet CLI transport Variables
 
-When `gpu-fault-fleet run-deployment` executes the transport command for each node, besides substituting the command template placeholders it also injects the `GPU_FAULT_FLEET_*` environment variables, including node, cluster, deployment, Agent version and artifact SHA. Transport scripts should read values from the environment variables, avoiding concatenating unescaped node data into shell.
+When `gpu-fault-fleet run-deployment` executes the transport command for each node, besides substituting the command template placeholders (`{node_id}`, `{cluster_id}`, `{deployment_id}`, `{agent_version}`, `{artifact_sha256}`) it also injects the matching `GPU_FAULT_FLEET_NODE_ID`, `GPU_FAULT_FLEET_CLUSTER_ID`, `GPU_FAULT_FLEET_DEPLOYMENT_ID`, `GPU_FAULT_FLEET_AGENT_VERSION` and `GPU_FAULT_FLEET_ARTIFACT_SHA256` environment variables. The template is split with shell lexing and executed directly, without a shell; transport scripts should read values from the environment variables, avoiding concatenating unescaped node data into shell.
 
 The Fleet CLI's read-only `agents`, `readiness` and `deployment` also require
 `--execution-token`; the deployment loop's status reads, next-wave requests and final readiness all carry the same credential.
 Authentication required by the current API must not be omitted just because the interface is a read operation. The credential must not enter ordinary output or evidence.
-`--wave-timeout-seconds` is timed from before the wave request and covers the local transport wait and the subsequent heartbeat wait;
-a transport timeout stops subsequent waves and reports the remote completion state as unknown, which does not mean the remote installation or its sub-tasks were cancelled.
+`--wave-timeout-seconds` (default 900) is timed from before the wave request and covers the local transport wait and the subsequent
+heartbeat wait, polled every `--poll-interval-seconds` (default 10); a node whose transport failed or timed out, or whose target
+heartbeat was not seen before the deadline, is marked `FAILED` and the command exits without requesting further waves;
+a transport timeout reports the remote completion state as unknown, which does not mean the remote installation or its sub-tasks were cancelled.
 A single HTTP request still uses a separate 30-second timeout. Check the actual remote state before continuing.
 
 <a id="10-邮件通知"></a>
