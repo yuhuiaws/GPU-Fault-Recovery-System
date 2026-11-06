@@ -2516,6 +2516,17 @@
           "legendFormat": "rejected",
           "range": true,
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "sum by (cluster_id) (increase(gpu_fault_telemetry_spool_rejected_by_cluster_total{cluster_id=~\"$cluster_id\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"}[5m]))",
+          "instant": false,
+          "legendFormat": "{{cluster_id}}",
+          "range": true,
+          "refId": "B"
         }
       ],
       "title": "Spool admissions rejected (5m)",

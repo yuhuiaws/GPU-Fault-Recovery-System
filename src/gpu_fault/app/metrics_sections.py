@@ -830,11 +830,32 @@ def render_spool_metrics_one(
             "# TYPE gpu_fault_telemetry_spool_rejected_total counter",
         ]
     )
-    for scope in sorted(telemetry_spool_rejections):
+    # One sorted copy of the keys: the process-metrics publisher renders on
+    # its own thread while admission adds a cluster's first key.
+    keys = sorted(telemetry_spool_rejections)
+    for scope in keys:
+        if "\x1f" in scope:
+            continue
         lines.append(
             "gpu_fault_telemetry_spool_rejected_total"
             f'{{scope="{scope}"}} '
             f"{telemetry_spool_rejections[scope]}"
+        )
+    lines.extend(
+        [
+            "# HELP gpu_fault_telemetry_spool_rejected_by_cluster_total "
+            "Spool admissions rejected by the per-cluster depth cap, by cluster.",
+            "# TYPE gpu_fault_telemetry_spool_rejected_by_cluster_total counter",
+        ]
+    )
+    for key in keys:
+        if "\x1f" not in key:
+            continue
+        scope, cluster_id = key.split("\x1f", 1)
+        lines.append(
+            "gpu_fault_telemetry_spool_rejected_by_cluster_total"
+            f'{{cluster_id="{_metrics_label_value(cluster_id)}",scope="{scope}"}} '
+            f"{telemetry_spool_rejections[key]}"
         )
     # ARCH-E E3: same contract as the processor claim stamp above.
     if "last_cycle_timestamp_seconds" in spool_runtime:

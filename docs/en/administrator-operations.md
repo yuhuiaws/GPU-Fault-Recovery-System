@@ -4738,7 +4738,9 @@ evidence and routine requests are refused. The two "depth" panels plot the same 
 ### GpuFaultTelemetrySpoolAdmissionRejected
 
 - **Meaning**: the spool is rejecting routine samples at the entry, one link earlier than `DataLoss`.
-- **First check**: entry batching parameters, the in-flight byte cap, whether a single cluster is flooding.
+- **First check**: entry batching parameters, the in-flight byte cap, whether a single cluster is flooding --
+  `sum by (cluster_id) (increase(gpu_fault_telemetry_spool_rejected_by_cluster_total[5m]))` names every cluster the
+  per-cluster depth cap refused; a `scope="global"` refusal belongs to no cluster.
 - **Boundary**: as above; restore capacity first, then assess the extent of the telemetry hole.
 
 ### GpuFaultTelemetrySpoolReplayError

@@ -464,11 +464,9 @@ Administrator Capacity Configuration §5):
    is 0 for that cluster; at the same moment that cluster's routine telemetry may show 429
    (this is the reserve taking effect, not a failure).
 2. **Single-cluster depth does not spill over**: for the other 3 clusters
-   `gpu_fault_telemetry_spool_rejected_total{scope="cluster"}` and processor 429 are both 0,
-   and `gpu_fault_processor_admission_rejections_total{scope="global"}` is 0 (the spool rejection counter carries
-   only a `scope` label, no `cluster_id`, so the per-cluster verdict comes from the load generators' per-cluster status
-   counts; the processor's per-cluster refusals are
-   `gpu_fault_processor_admission_rejections_by_cluster_total`).
+   `gpu_fault_telemetry_spool_rejected_by_cluster_total{scope="cluster"}` (a series appears only for a cluster that
+   was refused) and processor 429 are both 0, and `gpu_fault_processor_admission_rejections_total{scope="global"}` is
+   0 (the processor's per-cluster refusals are `gpu_fault_processor_admission_rejections_by_cluster_total`).
 3. **The Aurora floor holds**: HTTP 503 is 0 during the whole wave, and the actual Aurora ACU
    does not exceed 100% of the capacity pre-provisioned by Min 20.5 (if it does, the
    `managedNodeCount/100` ratio needs correction and must be recorded).

@@ -429,6 +429,7 @@ _PER_PROCESS = (
     "gpu_fault_telemetry_spool_fallback_polls_total",
     "gpu_fault_telemetry_spool_notification_reconnects_total",
     "gpu_fault_telemetry_spool_notifications_received_total",
+    "gpu_fault_telemetry_spool_rejected_by_cluster_total",
     "gpu_fault_telemetry_spool_rejected_total",
     "gpu_fault_telemetry_spool_released_total",
     "gpu_fault_telemetry_spool_replay_seconds",

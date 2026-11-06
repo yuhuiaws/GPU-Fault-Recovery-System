@@ -599,6 +599,14 @@ CONTROL_PLANE_CAPACITY = Dashboard(
                             + "[5m]))",
                             "rejected",
                         ),
+                        Target(
+                            "sum by (cluster_id) (increase("
+                            + cluster_series(
+                                "gpu_fault_telemetry_spool_rejected_by_cluster_total"
+                            )
+                            + "[5m]))",
+                            "{{cluster_id}}",
+                        ),
                     ),
                 ),
                 Panel(

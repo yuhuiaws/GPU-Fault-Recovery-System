@@ -867,8 +867,11 @@ groups:
           description: >-
             Rejection at the spool ingress is one link earlier than
             GpuFaultTelemetrySpoolDataLoss. Check the ingress batch parameters,
-            the in-flight byte ceiling, and whether one cluster is flooding.
-            Restore capacity first, then scope the resulting telemetry hole.
+            the in-flight byte ceiling, and whether one cluster is flooding:
+            gpu_fault_telemetry_spool_rejected_by_cluster_total names the
+            cluster of every refusal by the per-cluster depth cap (a
+            scope="global" refusal belongs to no cluster). Restore capacity
+            first, then scope the resulting telemetry hole.
       - alert: GpuFaultTelemetrySpoolReplayError
         expr: increase(gpu_fault_telemetry_spool_errors_total[5m]) > 0
         labels:

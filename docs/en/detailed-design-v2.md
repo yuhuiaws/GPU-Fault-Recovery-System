@@ -5290,17 +5290,17 @@ The only realistic means of cross-process correlation is
 
 `GET /metrics` (Prometheus text format; loopback is unauthenticated, non-loopback needs the execution token) rendered on
 the real app assembled by `create_app(build_context())` (in-memory Store fixture, worker role)
-exports **311 metric families** with `regional_mode` off and **324** with it on (the extra 13 are all emitted only in regional mode:
+exports **312 metric families** with `regional_mode` off and **325** with it on (the extra 13 are all emitted only in regional mode:
 9 `gpu_fault_remote_command_*`, 2 `gpu_fault_fleet_rollout_*`, 2 `gpu_fault_regional_registry_*`),
-all prefixed `gpu_fault_`; under the same fixture ingress is 262/264, and spool-worker (a role that only assembles with an active-active
-Processor plus the telemetry spool) is 265/267. The numbers grow with the code; the actual `GET /metrics` output is authoritative. Conditional families such as the Postgres connection pool,
+all prefixed `gpu_fault_`; under the same fixture ingress is 263/265, and spool-worker (a role that only assembles with an active-active
+Processor plus the telemetry spool) is 266/268. The numbers grow with the code; the actual `GET /metrics` output is authoritative. Conditional families such as the Postgres connection pool,
 spare health, spool consumer, collector snapshot and the departed-node cleanup (`gpu_fault_departed_node_cleanup_*`, 7, on
 the regional-mode worker only, §7.10) are not in the count; a production worker only has more, never fewer. Distribution in regional mode:
 
 | Prefix | Families | Coverage |
 |---|---:|---|
 | `gpu_fault_processor_*` | 120 | Queue depth and limits, admission batching (fault/evidence batches, adaptive in-flight limit, shed/expired), claim rounds and backoff, lane wait/hold, lease renewal and reclaim, consumption, delayed retries, claimed-not-started and graceful-shutdown release, cleanup, fault pressure, counter drift scans, `pg_notify` listening and shards, consume-loop liveness |
-| `gpu_fault_telemetry_*` | 40 | spool, batch commits, freshness of each telemetry channel |
+| `gpu_fault_telemetry_*` | 41 | spool, batch commits, freshness of each telemetry channel |
 | `gpu_fault_workflow_*` | 38 | workflow status census, step/duration, waits and overdue steps, dispatch tick/lease/wakeups and loop-liveness stamps, placement holds, branch-escalation budget refusals, scan window and truncation |
 | `gpu_fault_store_*` | 17 | store I/O concurrency/waiting/rejections (`store_io_*`, 4), hot-table layout (`store_hot_table_*`, 8), compaction rounds/actions and the bloat scan time |
 | `gpu_fault_remediation_budget_*` | 15 | Active claims (by scope type), waiting counts (total/by scope) and the longest wait, over-limit scopes, parked-hold releases, the remediation storm breaker (§9.5) |

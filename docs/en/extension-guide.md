@@ -248,7 +248,7 @@ contributor that raises is only counted in `gpu_fault_metrics_contributor_errors
 `gpu_fault.app.metric_aggregation`, otherwise `tests/metrics/test_metric_aggregation_registry.py` fails.
 Metric families are counted by actual role and by assembly conditions such as PostgreSQL/regional;
 a historical baseline must not be taken as the current total for all roles; after adding, recount and update the prefix distribution in the Detailed Design.
-The same in-memory three-role fixture (the per-role scrape of that test) currently gives 267/316/266 families for
+The same in-memory three-role fixture (the per-role scrape of that test) currently gives 268/317/267 families for
 ingress/worker/spool-worker respectively; the processor prefix is 125 families in all cases, and the notification prefix
 is 8/12/8 families respectively.
 These fixtures do not enable the conditional PostgreSQL, regional and refresh-file metrics and cannot be taken as the production inventory.

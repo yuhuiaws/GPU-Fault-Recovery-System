@@ -424,7 +424,15 @@ async def _try_spool(
     finally:
         REQUEST_DEADLINE.reset(token)
     if result in {"global", "cluster"}:
-        dependencies.telemetry_spool_rejections[result] += 1
+        rejections = dependencies.telemetry_spool_rejections
+        rejections[result] += 1
+        if result == "cluster":
+            # The processor's key scheme (``_enqueue``): the scope series
+            # stays zero-initialised for the alert, and the refused cluster
+            # -- the spool cap's own ``__unscoped__`` scope for a request
+            # without one -- gets a series of its own.
+            cluster_key = f"{result}\x1f{item.cluster_id or '__unscoped__'}"
+            rejections[cluster_key] = rejections.get(cluster_key, 0) + 1
         return JSONResponse(
             status_code=429,
             headers={"Retry-After": str(dependencies.processor_retry_after_seconds)},
