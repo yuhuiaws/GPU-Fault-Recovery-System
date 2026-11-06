@@ -1418,8 +1418,9 @@ systemd delivery all belong to the same regionally separated architecture; `Appe
 ### 5.1 Regional CPU Control-Plane Greenfield Deployment
 
 > **Do not start a normal application release by executing this section item by item.** When the shared infrastructure is already prepared, use
-> the four `gpu-fault-admin` commands in [Administrator Quick Deploy](administrator-quick-deploy.md). This section is only for creating or
-> checking missing prerequisite resources such as Aurora, LBC/IAM, NLB/PKI, and for item-by-item forensics after the unified orchestrator fails.
+> `gpu-fault-admin deploy` from [Administrator Quick Deploy](administrator-quick-deploy.md) (four arguments the first time, `--state-dir`
+> alone afterwards). This section is only for creating or checking missing prerequisite resources such as Aurora, LBC/IAM, NLB/PKI, and for
+> item-by-item forensics after the unified orchestrator fails.
 
 This section starts from an already created standalone CPU HyperPod/EKS and deploys a Region-level control plane. It is
 the standard procedure for a new environment and does not include migration of an old in-GPU-cluster control plane. The control-plane EKS does not hold any GPU EKS
@@ -1490,9 +1491,19 @@ kubectl --kubeconfig "${CPU_KUBECONFIG}" get nodes \
   -o wide
 ```
 
-There must be three Ready CPU nodes, able to satisfy the strict hostname anti-affinity of
-`regional-control-plane-patch.yaml`. The following check must print
-`3`; if it is not `3`, fix the CPU instance group first; do not lower the replica count or the anti-affinity:
+The `AURORA_CLUSTER_ID`, `NLB_NAME`, IAM role/policy names and `PKI_SECRET_ID` above are only the names of this section's manual
+procedure. The bootstrap of `gpu-fault-admin deploy` names everything after the site id: the Aurora cluster `gpu-fault-<site-id>-aurora`
+(DB subnet group and Security Group of the same name, parameter group `<cluster-name>-pg`, instances `<cluster-name>-writer`/`-reader`),
+the NLB and its Security Group `gpu-fault-<site-id>`, the LBC role/policy `gpu-fault-<site-id>-lbc`/`gpu-fault-<site-id>-lbc-policy`,
+the control-plane role `gpu-fault-<site-id>-control`, the PKI Secret `gpu-fault/<site-id>/regional-pki` and the credential refresh role
+`gpu-fault-<site-id>-aurora-refresh` (truncated with an 8-character digest when a name exceeds the AWS length limit). When checking a
+site built by deploy, set these variables to those names; `gpu-fault-admin site-id --cpu-cluster-arn <cpu-arn>` prints the site id.
+The CPU control plane must be a HyperPod-orchestrated EKS cluster: an EKS ARN without a HyperPod orchestrator is refused as the CPU
+cluster.
+
+There must be three Ready CPU nodes, able to satisfy the strict hostname topology spread of
+`regional-control-plane-patch.yaml` (`topologySpreadConstraints`: `maxSkew: 1`, `whenUnsatisfiable: DoNotSchedule`). The following check must print
+`3`; if it is not `3`, fix the CPU instance group first; do not lower the replica count or relax that constraint:
 
 ```bash
 CPU_NODE_COUNT="$(
@@ -1508,6 +1519,7 @@ test "${CPU_NODE_COUNT}" -eq 3
 
 All subsequent CPU commands always carry `--kubeconfig "${CPU_KUBECONFIG}"`. Do not change the default context, and do not
 write the GPU EKS context into this kubeconfig.
+
 #### CPU-2. Create or Take Over the Same-Site Legacy Aurora Serverless v2
 
 Obtain the VPC and private subnets in at least two different AZs from the CPU EKS. `CPU_PRIVATE_SUBNETS` can be filled in explicitly according to the actual
@@ -1667,6 +1679,34 @@ mapfile -t CPU_PRIVATE_AZS < <(
   tr '\t' '\n'
 )
 
+# create only references the parameter group, it does not create it: first create <cluster-name>-pg for the engine
+# version's family and write the four diagnostic parameters (as bootstrap's ensure_cluster_parameter_group does;
+# the modify can be skipped when they already match).
+AURORA_PG_FAMILY="$(
+  aws rds describe-db-engine-versions \
+    --region "${AWS_REGION}" \
+    --engine aurora-postgresql \
+    --engine-version "${AURORA_ENGINE_VERSION}" \
+    --query 'DBEngineVersions[0].DBParameterGroupFamily' --output text
+)"
+if ! aws rds describe-db-cluster-parameter-groups \
+  --region "${AWS_REGION}" \
+  --db-cluster-parameter-group-name "${AURORA_CLUSTER_ID}-pg" >/dev/null 2>&1; then
+  aws rds create-db-cluster-parameter-group \
+    --region "${AWS_REGION}" \
+    --db-cluster-parameter-group-name "${AURORA_CLUSTER_ID}-pg" \
+    --db-parameter-group-family "${AURORA_PG_FAMILY}" \
+    --description "gpu-fault control plane diagnostics for ${AURORA_CLUSTER_ID}"
+fi
+aws rds modify-db-cluster-parameter-group \
+  --region "${AWS_REGION}" \
+  --db-cluster-parameter-group-name "${AURORA_CLUSTER_ID}-pg" \
+  --parameters \
+    "ParameterName=log_lock_waits,ParameterValue=1,ApplyMethod=immediate" \
+    "ParameterName=log_min_duration_statement,ParameterValue=1000,ApplyMethod=immediate" \
+    "ParameterName=pg_stat_statements.track,ParameterValue=all,ApplyMethod=immediate" \
+    "ParameterName=shared_preload_libraries,ParameterValue=pg_stat_statements,ApplyMethod=pending-reboot"
+
 if ! aws rds describe-db-clusters \
   --region "${AWS_REGION}" \
   --db-cluster-identifier "${AURORA_CLUSTER_ID}" >/dev/null 2>&1; then
@@ -1751,7 +1791,12 @@ aws rds describe-db-clusters \
 ```
 
 Create the Kubernetes connection Secret. The procedure below does not show the password on standard output; the temporary URL file has mode
-`0600`:
+`0600`. The DSN has the form bootstrap writes (`gpu_fault.admin.bootstrap._aurora_dsn`): `sslmode=verify-full`, with `sslrootcert`
+set to the in-Pod mount path of the RDS CA bundle, `GPU_FAULT_RDS_CA_BUNDLE` (`/etc/gpu-fault/rds/ca-bundle.pem` in `regional-env.sh`);
+an unverified `sslmode=require` is not used. The same step therefore installs the CA bundle ConfigMap `gpu-fault-rds-ca-bundle`
+(`deploy/control-plane/tools/apply-rds-ca-bundle.sh` installs the RDS global bundle vendored in the repository, pinned by SHA-256);
+without it the three control-plane roles, the schema Jobs and the refresh CronJob all stay in `CreateContainerConfigError` on the
+missing mount:
 
 ```bash
 install -d -m 0700 /tmp/gpu-fault-regional-bootstrap
@@ -1782,13 +1827,17 @@ sys.stdout.write(
     + quote(s["username"], safe="")
     + ":" + quote(s["password"], safe="")
     + "@" + os.environ["AURORA_ENDPOINT"]
-    + ":5432/gpu_fault?sslmode=require"
+    + ":5432/gpu_fault?sslmode=verify-full&sslrootcert="
+    + quote(os.environ["GPU_FAULT_RDS_CA_BUNDLE"], safe="/")
 )
 ' > /tmp/gpu-fault-regional-bootstrap/postgres-url
 
 kubectl --kubeconfig "${CPU_KUBECONFIG}" create namespace "${NAMESPACE}" \
   --dry-run=client -o yaml |
 kubectl --kubeconfig "${CPU_KUBECONFIG}" apply -f -
+
+KUBECONFIG="${CPU_KUBECONFIG}" GPU_FAULT_NAMESPACE="${NAMESPACE}" \
+  deploy/control-plane/tools/apply-rds-ca-bundle.sh
 
 kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
   create secret generic gpu-fault-aurora \
@@ -1800,20 +1849,15 @@ kubectl --kubeconfig "${CPU_KUBECONFIG}" apply -f -
 rm -f /tmp/gpu-fault-regional-bootstrap/postgres-url
 ```
 
-> **Must read: this Secret expires after 7 days, at which point all three control-plane replicas go
-> `CrashLoopBackOff`.** The `--manage-master-user-password` passed to
-> `create-db-cluster` lets RDS manage the master password, rotating it automatically with the default
-> `AutomaticallyAfterDays=7`; the snippet above merely **snapshots** the password of that moment into a
-> static `postgres-url`. After a rotation, Secrets Manager holds the new password while the K8s Secret
-> still holds the old one (equal to `AWSPREVIOUS`), and the code has no rotation awareness at all:
-> `PostgresStore.__init__` builds the connection pool at startup, and a failed connection raises directly -> the process exits
-> -> `CrashLoopBackOff`. Because credentials are read only **at process start**, the failure does not erupt at the moment of rotation
-> but only becomes visible at the first Pod restart after the rotation (a release, an eviction, a node rotation, a probe restart),
-> so it presents as "it was fine yesterday, and today everything died on the first restart".
->
-> The real incident record is in
-> `docs/区域模式端到端验收测试用例.md`,
-> `GF-REGIONAL-BOOT-016`, incidental finding 2.
+> **Must read: when nothing follows the rotation, this Secret goes stale at RDS's first master password rotation.**
+> The `--manage-master-user-password` passed to `create-db-cluster` lets RDS manage the master password, rotating it automatically
+> with the default `AutomaticallyAfterDays=7`; the snippet above merely **snapshots** the password of that moment into
+> `postgres-url`. The control plane never reads Secrets Manager itself: the three roles read only the mounted Secret file
+> (`GPU_FAULT_STORE_URL_FILE=/etc/gpu-fault/aurora/postgres-url`, re-read by the connection pool on every connect). After a rotation,
+> Secrets Manager holds the new password while the K8s Secret still holds the old one (equal to `AWSPREVIOUS`): from then on every
+> newly created control-plane Pod fails at startup with `FATAL: password authentication failed` (`CrashLoopBackOff`), and running
+> replicas fail the same authentication on reconnect once the pool recycles a connection (`max_idle` 300 s / `max_lifetime`
+> 3600 s), so checkouts time out.
 >
 > **Remediation: keep the rotation and deploy the credential refresh CronJob of the next sub-section.**
 > Keeping the rotation means the master password keeps changing on the RDS cycle, at the cost of one more
@@ -1836,10 +1880,14 @@ Manifest: `deploy/control-plane/regional/aurora-credential-refresh.yaml`
 (SA + Role + RoleBinding + CronJob); logic:
 `src/gpu_fault/aurora_credential_refresh.py`.
 
-> If you deploy via `deploy/hyperpod/deploy.sh`, this sub-section is **already automated**
-> (`deploy_aurora_credential_refresh`, executed after the control plane is deployed:
-> create the IRSA role -> apply the manifest -> run one verification Job), with no manual action needed.
-> Below are the steps for manual deployment or retrofitting afterwards.
+> When you deploy with `gpu-fault-admin deploy`, this sub-section is **already automated**: bootstrap creates the refresher's IAM
+> role `gpu-fault-<site-id>-aurora-refresh` (policy `ReadAuroraManagedMasterSecret`, associated through Pod Identity with the
+> ServiceAccount `gpu-fault-aurora-credential-refresh`); the release engine renders this manifest as a release component
+> (`aurora-refresh`) -- substituting the namespace, the wheel ConfigMap, the runtime image and the managed master Secret ARN, and
+> pinning `GPU_FAULT_AURORA_REFRESH_RESTART_DEPLOYMENTS=false` -- applies and runs it once before the schema and the CPU roles,
+> proves that `AWSCURRENT` is in the Secret, and restores the previous refresher objects on rollback. The legacy
+> `deploy/hyperpod/deploy.sh` does the same through `deploy_aurora_credential_refresh` (IRSA role -> apply the manifest -> run one
+> verification Job). Below are the steps for manual deployment or retrofitting afterwards.
 
 On every run it reads `AWSCURRENT` from Secrets Manager and compares it with the password in the Secret:
 
@@ -1852,24 +1900,27 @@ On every run it reads `AWSCURRENT` from Secrets Manager and compares it with the
 The "verify first, then switch" step cannot be omitted: if the refresher cannot tell a good password from a bad one,
 it has the power to replace a still-working Secret with a broken one, turning a rotation into an outage of its own making.
 
-After replacing the Secret, **no** replica restart is needed (control-plane review 2026-09-08, CP-3 / H1): the three role Deployments project the
+After replacing the Secret, **no** replica restart is needed: the three role Deployments project the
 `gpu-fault-aurora` Secret as a whole into `/etc/gpu-fault/aurora` (read-only, without `subPath` -- a mount with
 `subPath` does not follow Secret updates), and when the connection pool opens a new connection it re-reads the DSN via
 `GPU_FAULT_STORE_URL_FILE=/etc/gpu-fault/aurora/postgres-url`; the `GPU_FAULT_STORE_URL`
 env still keeps a copy as a startup fallback (settings/admission read it before the pool opens). Within roughly 1-2 minutes of kubelet sync after the Secret is written,
 new connections use the new password; before that, connections rebuilt after being reclaimed by `max_idle` fail authentication, and the pool backs off
 and retries without losing slots any more (`GpuFaultPostgresPoolConnectionErrors` will show this window). If you do choose
-`--restart-deployments`, `maxUnavailable=1` plus the PDB `minAvailable=2` guarantee a majority of replicas
-keep serving during the rollout. At the end of every run (success or final failure) the refresher writes
+`--restart-deployments`, the rollout follows each role's own release strategy: ingress surges first (`maxSurge: 1`,
+`maxUnavailable: 0`, PDB `minAvailable: 2`), control-worker and spool-worker take at most one replica down at a time
+(`maxUnavailable: 1`, PDB `maxUnavailable: 1`). At the end of every run (success or final failure) the refresher writes
 `{status, finished_at, error, rotated, restarted, reason}` into the same Secret's
 `last-refresh-status.json` (patching only this one key; the DSN password in error is redacted); the control plane exports a metric from its
-age and `GpuFaultAuroraCredentialRefreshStale` / `...Failing` alert on it -- a CronJob that
-"silently does not work" is visible from now on.
+age and `GpuFaultAuroraCredentialRefreshStale` / `...Failing` / `...StatusUnknown` alert on it -- a CronJob that
+"silently does not work" is visible from now on. One run makes up to `GPU_FAULT_AURORA_REFRESH_MAX_ATTEMPTS` (3 in the manifest)
+attempts; when all fail it also records an `AuroraCredentialRefreshFailed` Warning Event on that Secret.
 
 **First create the IAM role and associate Pod Identity.** There are only two permissions, both restricted to concrete resources:
 reading that one managed master password, and the KMS key used to decrypt it.
 
 ```bash
+# The same role created by gpu-fault-admin deploy is named gpu-fault-<site-id>-aurora-refresh.
 export REFRESH_ROLE_NAME=gpu-fault-aurora-credential-refresh
 # Note that this reads MasterUserSecret.KmsKeyId on the RDS side.
 # The top level of secretsmanager describe-secret has no KmsKeyId field;
@@ -1964,7 +2015,11 @@ CONFIG_MAP_SHA256="$(
 )"
 test "${CONFIG_MAP_SHA256}" = "${WHEEL_SHA256}"
 
-sed "s/gpu-fault-control-plane-wheel-0100/${WHEEL_CM}/g" \
+sed \
+  -e "s/gpu-fault-control-plane-wheel-0100/${WHEEL_CM}/g" \
+  -e "s#public.ecr.aws/docker/library/python:3.12-slim#${GPU_FAULT_RUNTIME_IMAGE}#g" \
+  -e "s#REPLACE_WITH_AURORA_MASTER_SECRET_ARN#${AURORA_MASTER_SECRET_ARN}#g" \
+  -e "s/gpu-fault-system/${NAMESPACE}/g" \
   deploy/control-plane/regional/aurora-credential-refresh.yaml \
   > /tmp/aurora-credential-refresh.yaml
 kubectl --kubeconfig "${CPU_KUBECONFIG}" apply \
@@ -2011,15 +2066,19 @@ The manifest does not set `AWS_REGION`: both Pod Identity and IRSA inject it int
 and hard-coding a region in a manifest that is otherwise region-agnostic is exactly how a copy-pasted deployment ends up reading
 another account's keys. To override, set `GPU_FAULT_AWS_REGION`.
 
-`gpu-fault-control-plane-wheel-0100` in the manifest is only a placeholder; the `sed` above must
-replace it with the content-addressed ConfigMap of the current release. An existing ConfigMap is only compared by content SHA, not overwritten;
+`gpu-fault-control-plane-wheel-0100`, `public.ecr.aws/docker/library/python:3.12-slim`,
+`REPLACE_WITH_AURORA_MASTER_SECRET_ARN` and `gpu-fault-system` in the manifest are placeholders (the same set the release engine's
+`render_aurora_refresh` substitutes); the `sed` above must replace them with the content-addressed ConfigMap of the current release,
+the release's runtime image (the container command `gpu-fault-aurora-credential-refresh` comes from the wheel installed in that
+image), the managed master Secret ARN and the target namespace; with the ARN placeholder left in the manifest the refresher reads
+Secrets Manager with the placeholder and fails. An existing ConfigMap is only compared by content SHA, not overwritten;
 it is created from the same `${WHEEL}` only when absent. That way when CPU-4b meets it again it only re-checks the same SHA
 and does not produce a second release artifact.
 
 **Verify (do not wait until the next rotation cycle to discover it does not work).** Trigger it once manually.
-When the password has not changed and the three database consumers already carry the same refresh token, the expected path is
-the harmless "did nothing" path; if the previous rotation completed only part of the Deployment patches,
-this run only rolls the missing roles:
+When the password has not changed, the expected path is the harmless "did nothing" path (only under the `--restart-deployments`
+compatibility switch, when the previous rotation completed only part of the Deployment patches, does this run roll just the
+missing roles):
 
 ```bash
 kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
@@ -2034,14 +2093,14 @@ kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
   logs job/aurora-credential-refresh-verify
 ```
 
-When fully converged, expect `rotated=False restarted=False`. When the Secret of a first deployment has no
-refresh token yet, the reason is `secret already carries the AWSCURRENT password`;
-when a rotation has already completed, the reason is
-`secret and database consumers already carry current credentials`.
+When fully converged, expect `rotated=False restarted=False (secret already carries the AWSCURRENT password)`: default mode
+does not read the rollout annotation, so a first deployment and an already rotated Secret both print this line. Only under the
+`--restart-deployments` compatibility switch, while the Secret still carries the rollout token of the last rotation, is the reason
+`secret and database consumers already carry current credentials` (every Deployment already carries that token), or
 `rotated=False restarted=True (deployment rollout resumed for
-current credentials)` only appears under the `--restart-deployments` compatibility switch, meaning it completed a previously
-unfinished rollout, which is also a correct recovery path; in that case confirm that only the `generation` of the missing Deployment changed;
-in default mode a leftover rollout annotation is treated as nothing and does not trigger any rollout.
+current credentials)` -- it completed a previously unfinished rollout, which is also a correct recovery path; in that case confirm
+that only the `generation` of the missing Deployment changed; in default mode a leftover rollout annotation is treated as nothing
+and does not trigger any rollout.
 
 In a greenfield CPU-2b the control-plane Deployments do not exist yet, so only check the no-op log; when retrofitting an existing environment
 that was already converged, also confirm that the `generation` of ingress, control-worker and the enabled
@@ -2087,24 +2146,26 @@ kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
   get jobs -l app=gpu-fault-aurora-credential-refresh
 ```
 
-**Schedule frequency and synchronous refresh before a release (two tightenings after the 2026-09-07 production incident).** The
-`schedule` in the manifest is **hourly** `17 * * * *`, no longer twice a day. In the window between a rotation and the next
-tick the Secret still holds the old password; running replicas are unaffected, but during that time **every newly created** control-plane
-Pod exits with `FATAL: password authentication failed`. Twice a day used to mean this window could last
-up to 12 hours; on 2026-09-07 12:13Z a release transaction landed exactly inside the window: the re-apply failed, the automatic rollback
-restarted control-worker, the new Pods likewise could not authenticate, and the transaction finally stopped at `rollback-failed` -- from the release output
-it looked no different from a genuinely broken release until someone read the Pod logs. The hourly schedule compresses the window to
-1 hour, and `startingDeadlineSeconds` is shortened accordingly to 1800 so a late run does not collide with the next tick.
+**Schedule frequency and synchronous refresh before a release.** The `schedule` in the manifest is **hourly** `17 * * * *`
+(`timeZone: Etc/UTC`, `concurrencyPolicy: Forbid`). In the window between a rotation and the next tick the Secret still holds the old
+password: during that time **every newly created** control-plane Pod exits with `FATAL: password authentication failed`, and the
+reconnects of running replicas fail too. A release transaction is exactly a burst of new Pods: an upgrade landing inside the window
+fails its re-apply, the control-worker restarted by the automatic rollback cannot authenticate either, and the transaction ends in
+`rollback-failed` -- from the release output it looks no different from a genuinely broken release until someone reads the Pod logs.
+The hourly schedule compresses the window to 1 hour, and `startingDeadlineSeconds` is 1800 so a late run does not collide with the
+next tick; every Job has `activeDeadlineSeconds: 900` and `backoffLimit: 2`.
 
-The second tightening is in the orchestrator (`src/gpu_fault_release/regional_aurora_credentials.py`):
-`upgrade` (including resume), after applying the RDS CA bundle and **before** checking the remote command queue and capturing the
-previous release, as well as `rollback` **before** making any compensation plan, synchronously runs
-this CronJob once -- `kubectl create job --from=cronjob/gpu-fault-aurora-credential-refresh
-gpu-fault-aurora-credential-refresh-<8-char random suffix>`, then
-`kubectl wait --for=condition=complete --timeout=300s`, and deletes the Job on success. It is
-**fail closed**: if the Job does not reach Complete within the timeout, the transaction immediately fails with
-`Aurora credential refresh Job <namespace>/<job> did not complete within 300s`,
-writes no release state, rolls no component, and leaves the Job in place for investigation:
+The second safeguard is in the orchestrator (`src/gpu_fault_release/regional_aurora_credentials.py`):
+`upgrade` (including resume), after applying the RDS CA bundle and **before** the store gates and capturing the previous release, and
+`rollback` **before** restoring any component (when the compensation plan includes the refresher, the previous refresher objects are
+restored first and then run), synchronously run this CronJob once -- `kubectl create job --from=cronjob/gpu-fault-aurora-credential-refresh
+gpu-fault-aurora-credential-refresh-<8-char random suffix>`, then wait for it with
+`deploy/control-plane/tools/wait-for-kubernetes-job.sh` (300 s by default), and delete the Job on success. When the release itself
+changes the refresher (the `aurora-refresh` component), the engine first snapshots the previous refresher objects, applies the
+candidate manifest, and requires this run to write a successful `last-refresh-status.json` newer than the Job start before any DDL or
+consumer restart is allowed. It is **fail closed**: if the Job does not reach Complete within the timeout, the transaction immediately
+fails with `Aurora credential refresh Job <namespace>/<job> did not complete within 300s` (the message carries the troubleshooting
+steps below), rolls no component, and leaves the Job in place for investigation:
 
 ```bash
 kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
@@ -2117,9 +2178,9 @@ After fixing the cause (commonly a missing Pod Identity role, KMS permission or 
 delete this Job and rerun the same deploy/rollback command. The wait duration is overridden by
 `GPU_FAULT_RELEASE_AURORA_REFRESH_WAIT_SECONDS` (positive integer seconds, default 300); it applies to
 the deployment-host environment running `gpu-fault-admin`, not to container env. On a site without the CronJob (a legacy environment that never installed
-§2b) the step prints `aurora-credential-refresh skipped` and skips, behaving as
-before. A greenfield bootstrap does not run this step: at that point the Secret was just written from `AWSCURRENT` by the same deployment,
-and the CronJob has not been created yet.
+§2b) the step prints `aurora-credential-refresh skipped` and skips; a denied, timed-out or malformed read of the CronJob is not
+"absent" and stops the transaction. A first deployment (the engine's `bootstrap`) likewise installs the refresher and runs it once
+before the schema and the CPU roles, proving that `AWSCURRENT` is in the Secret.
 ##### CPU-2R. Aurora Credential Recovery for an Already Deployed Environment
 
 This section is an after-the-fact recovery runbook, not part of the greenfield first-deployment steps. A first deployment continues with CPU-3; run this section only
