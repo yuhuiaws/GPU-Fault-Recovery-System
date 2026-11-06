@@ -9197,37 +9197,61 @@ A single HTTP request still uses a separate 30-second timeout. Check the actual 
 A site has exactly one email channel. The default channel is the site SNS topic (`site.yaml` `spec.notifications.channel: sns`):
 it carries both the AMP Alertmanager metric alerts and the business notifications sent by the control plane itself; the administrator confirms only one SNS subscription email,
 with no SES identity to verify and no sandbox restriction. The cost is the medium: SNS emails are plain text, the sender is fixed as
-`no-reply@sns.amazonaws.com`, and the subject must be a single line of ASCII of at most 100 characters -- notifications convert Chinese subjects to ASCII by
-a deterministic rule (each run of non-ASCII replaced by one `?`, truncated to 99 characters) for the Subject, put the full subject as
+`no-reply@sns.amazonaws.com`, and the subject must be a single line of ASCII of at most 100 characters -- the notification templates' subjects
+are English ASCII already, and before sending they are still normalised by a deterministic rule (line breaks become spaces, each run of non-ASCII
+is replaced by one `?`, truncated to 99 characters) for the Subject; the full subject with its site/region/account prefix is put as
 the first line of the body, and the rest of the body is verbatim identical to the SES version. The control-plane role holds only `sns:Publish` on that topic.
-Sites that need rich-text email, a custom sender or multiple recipients declare `channel: ses` in `site.yaml`; the SES description below
+Sites that need a subject free of these limits and a verified SES identity as the sender declare `channel: ses` in `site.yaml` (the SES body is
+UTF-8 plain text as well, not rich text); the SES description below
 applies only to such sites. The release engine renders the channel and topic into the environment variables of the three control-plane roles:
 
 | Environment variable | Description |
 |---|---|
-| `GPU_FAULT_NOTIFICATION_CHANNEL` | `sns` (default) / `ses` / `disabled`; when undeclared, inferred as `sns` with a topic ARN, `ses` with an SES address pair |
+| `GPU_FAULT_NOTIFICATION_CHANNEL` | `sns` / `ses` / `disabled`; the release engine renders `sns` or `ses` from `spec.notifications.channel` (`sns` when the site declares none, `ses` for an older site still carrying an `emailSender`); a process without the variable infers `sns` from a topic ARN, `ses` from an SES address, and `disabled` from neither |
 | `GPU_FAULT_SNS_TOPIC_ARN` | The site topic ARN when `channel=sns` (from `spec.health.snsTopicArn`) |
-| `GPU_FAULT_EMAIL_SENDER` | `channel=ses`: the verified sender |
-| `GPU_FAULT_EMAIL_RECIPIENTS` | `channel=ses`: administrator addresses, several separated by ASCII commas |
-| `GPU_FAULT_ALLOW_EMAIL` | Master switch: `sns` defaults to `true` (a confirmed subscription is the authorisation), `ses` defaults to `false`, sending happens only when set to `true` |
+| `GPU_FAULT_EMAIL_SENDER` | `channel=ses`: the verified sender (`email-sender` of the `gpu-fault-email` Secret) |
+| `GPU_FAULT_EMAIL_RECIPIENTS` | `channel=ses`: administrator addresses, several separated by ASCII commas (`email-recipients` of the Secret) |
+| `GPU_FAULT_EMAIL_SUBJECT_PREFIX`, `GPU_FAULT_SITE_ID`, `GPU_FAULT_AWS_ACCOUNT_ID` | Read on both channels from the Secret's `email-subject-prefix`, `site-id` and `aws-account-id`: the subject prefix and the site context in the body |
+| `GPU_FAULT_ALLOW_EMAIL` | Master switch: `sns` defaults to `true` (a confirmed subscription is the authorisation), `ses` defaults to `false`, sending happens only when set to `true`; the release engine renders it from `spec.notifications.allowEmail` into `…-config-core` |
 | `GPU_FAULT_NOTIFICATION_ASYNC_DELIVERY` | `true`; business requests only write to the Aurora outbox |
-| `GPU_FAULT_NOTIFICATION_DISPATCHER_ENABLED` | Usually the same as `GPU_FAULT_ALLOW_EMAIL` |
-| `GPU_FAULT_NOTIFICATION_LEASE_SECONDS` | dispatcher claim lease, default 120 seconds |
-| `GPU_FAULT_NOTIFICATION_MAX_ATTEMPTS` | Maximum attempts of the exponential backoff, default 8 |
+| `GPU_FAULT_NOTIFICATION_DISPATCHER_ENABLED` | `true` on all three roles in the regional manifests (with asynchronous delivery the startup guard requires it); the outbox dispatcher thread runs only in the control-worker (`GPU_FAULT_SERVICE_ROLE=worker`) |
+| `GPU_FAULT_NOTIFICATION_LEASE_SECONDS` | dispatcher claim lease, default 120 seconds, at least 30 |
+| `GPU_FAULT_NOTIFICATION_BATCH_SIZE` | Claims per cycle, default 25, from admin-config `spec.notificationDelivery.batchSize`; admin-config accepts 1..1000 but the dispatcher accepts only 1..100, and above 100 every cycle fails and nothing is delivered |
+| `GPU_FAULT_NOTIFICATION_POLL_SECONDS` | Dispatcher poll interval, default 2 seconds |
+| `GPU_FAULT_NOTIFICATION_MAX_ATTEMPTS` | Maximum attempts of the exponential backoff, default 8 (admin-config `spec.notificationDelivery.maxAttempts`, 1..32) |
+| `GPU_FAULT_NOTIFICATION_THROTTLE_MAX_SECONDS` | Ceiling of the dispatcher's slow-down while the provider throttles, default 300 seconds |
 | `GPU_FAULT_NOTIFICATION_BACKLOG_GRACE_SECONDS` | Watermark look-back window, default 300 seconds; backlog older than it is treated as history |
-| `GPU_FAULT_NOTIFICATION_DELIVER_BACKLOG` | `false`; set `true` to send the entire historical backlog on first enablement |
+| `GPU_FAULT_NOTIFICATION_DELIVER_BACKLOG` | `false`; set `true` to send the entire historical backlog on first enablement, which also turns the shelf life off |
+| `GPU_FAULT_NOTIFICATION_TTL_SECONDS` | Notification shelf life, default 21600 seconds (6 hours); category `HEALTH_TREND` at most 3600 seconds; `GPU_FAULT_NOTIFICATION_TTL_SECONDS_<CATEGORY>` overrides one category, `0` means never expires |
+| `GPU_FAULT_NOTIFICATION_DELIVER_DRILLS` | `false`: a drill notification (with a `drill_id`) is only recorded `SKIPPED`, never mailed |
+| `GPU_FAULT_NOTIFICATION_RETENTION_SECONDS` | Retention of terminal notifications, default 2592000 seconds (30 days), after which the periodic cleanup deletes them |
 | `GPU_FAULT_HOST_NOTIFICATION_COOLDOWN_SECONDS` | Cooldown of node resource trend emails, default 3600 seconds |
-| `AWS_REGION` | SES region |
+| `AWS_REGION` | SNS/SES client Region (the site Region) |
 | `GPU_FAULT_SES_CONFIGURATION_SET` | Optional SES configuration set name, from `spec.notifications.sesConfigurationSet` (effective only with `channel: ses`; empty when undeclared) |
 
-Regional sites declare the channel and notification fields only in `spec.notifications` of `site.yaml` (`channel`, `allowEmail`, `emailSender`,
-`emailRecipients`, `emailSubjectPrefix`, `sesConfigurationSet`) and release via
-the bound `gpu-fault-admin deploy`. deploy validates the address format; SES sender and recipients must
-be given together; before any gate or build the preflight checks the sender's `VerifiedForSendingStatus` via SES v2
-(sending one verification email and giving the rerun command when unverified), the account sending permission, and the addresses actually in the Secret.
-Addresses are rendered into the `gpu-fault-system/gpu-fault-email` Secret and are not written in plaintext into ConfigMaps or Deployments;
-the channel, sending switch and configuration set are rendered by the same renderer into the
-`…-config-notification.yaml` ConfigMaps of the three CPU roles. These values must not depend on environment variables inherited in the deployment shell.
+Regional sites declare the channel and notification fields only in `spec.notifications` of `site.yaml` (`channel`, `allowEmail`, `acknowledgeExternalAlertChannel`,
+`adminEmail`, `emailSender`, `emailRecipients`, `emailSubjectPrefix`, `sesConfigurationSet`) and release via
+the bound `gpu-fault-admin deploy`. The site validates the address format: `allowEmail: true` requires `adminEmail`, and
+`channel: ses` additionally requires `emailSender` and at least one recipient (`emailRecipients` defaults to `adminEmail`);
+`allowEmail: false` requires `acknowledgeExternalAlertChannel: true` (rendered as `GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL`).
+Before any gate or build, deploy's first-minute precheck confirms the SNS subscription of `adminEmail` on the site topic, and on a `channel: ses`
+site also the SES identity of `adminEmail` (created when absent, which sends one verification email); while unconfirmed it stops, naming the
+address(es) and the exact rerun command. The release engine's preflight and verification then check: on an SES site, the sender's
+`VerifiedForSendingStatus` via SES v2, the account sending permission, the declared configuration set and the addresses actually in the Secret;
+on an SNS site, that `spec.health.snsTopicArn` is set and the site context in the Secret.
+Addresses are rendered into the `gpu-fault-system/gpu-fault-email` Secret (rewritten every time the CPU roles are applied with `allowEmail: true`; on SNS it holds only
+`email-subject-prefix`, `site-id` and `aws-account-id`, on SES also `email-sender` and `email-recipients`) and are not written in plaintext into ConfigMaps or Deployments;
+the channel, topic and configuration set are rendered by the same renderer into the
+`…-config-notification.yaml` ConfigMaps of the three CPU roles, and the sending switch `GPU_FAULT_ALLOW_EMAIL` into `…-config-core.yaml`.
+These values must not depend on environment variables inherited in the deployment shell.
+
+Before every release it actually applies, `gpu-fault-admin deploy` has bootstrap regenerate the whole `spec.notifications`: only the declared `channel`
+and the administrator address (`adminEmail`, or `--admin-email` on the command) carry over; it writes back `allowEmail: true`,
+`acknowledgeExternalAlertChannel: false` and an empty `emailSubjectPrefix`; with `channel: ses` both `emailSender` and the single
+`emailRecipients` entry are `adminEmail`, and `sesConfigurationSet` is not kept; the control-plane role's `ses:SendEmail` is granted on the
+`adminEmail` identity only. A hand-written custom sender, several recipients, a subject prefix or a configuration set therefore does not take
+effect through deploy; the release engine renders and checks these fields from the site it actually reads (the configuration-set rules below
+apply at that layer).
 
 `sesConfigurationSet` accepts 1 to 64 ASCII letters, digits, hyphens or underscores. Once declared it must already exist,
 with a matching name and `SendingOptions.SendingEnabled=true`; unknown or sending-disabled are both refused. deploy does not create that resource on your behalf,
@@ -9236,23 +9260,24 @@ notification digest is kept; rollback restores the actually captured old ConfigM
 The validation entry point is `src/gpu_fault_release/regional_notifications.py::check_notification_channel`.
 
 bootstrap grants the CPU Pod Identity role the least privilege of the selected channel: for SES an
-`ses:SendEmail` restricted by `ses:FromAddress`, for SNS `sns:Publish` on the site topic. The SES preflight additionally needs
-`ses:GetEmailIdentity`, `ses:GetAccount`; SNS sites need no SES identity.
+`ses:SendEmail` on the `adminEmail` identity restricted by `ses:FromAddress`, for SNS `sns:Publish` on the site topic. The SES preflight additionally needs
+`ses:GetEmailIdentity`, `ses:GetAccount` (and the right to create the identity when it does not exist); SNS sites need no SES identity.
 
-When SES is needed, modify only the notification block of the generated site, not the identity, credentials, allowlist or release pins:
+When SES is needed, change only `spec.notifications.channel` of the generated site to `ses`, not the identity, credentials, allowlist or release pins;
+deploy then regenerates the notification block as below (an SES site still has to confirm the SNS subscription the AMP alerts use):
 
 ```yaml
 # <state-dir>/site.yaml
 spec:
   notifications:
-    channel: ses
+    channel: ses                      # the only field to edit by hand (was sns)
     allowEmail: true
-    emailSender: gpu-alerts@example.com
+    acknowledgeExternalAlertChannel: false
+    adminEmail: admin@example.com
+    emailSender: admin@example.com    # deploy writes adminEmail
     emailRecipients:
-      - admin1@example.com
-      - admin2@example.com
-    # emailSubjectPrefix: "[PROD]"
-    # sesConfigurationSet: gpu-fault-alerts   # optional: SES v2 configuration set name
+      - admin@example.com             # deploy writes adminEmail
+    emailSubjectPrefix: ""
 ```
 
 First check the notification content with the preview API, then apply in the approved release window (while the SES identity is still awaiting email confirmation
@@ -9265,6 +9290,7 @@ gpu-fault-admin deploy --state-dir /secure/gpu-fault
 Production must keep sending and the dispatcher enabled; a drill configuration with sending disabled must not be treated as production-ready.
 Only old single-cluster environments use Appendix A's `RUN_E2E=false deploy/hyperpod/deploy.sh deploy` to distribute the same set of
 `GPU_FAULT_EMAIL_*` parameters.
+
 With `GPU_FAULT_NOTIFICATION_ASYNC_DELIVERY=true`, notifications generated while sending is off keep being written to the
 outbox. On its first run the dispatcher first establishes a watermark: undelivered backlog older than
 `GPU_FAULT_NOTIFICATION_BACKLOG_GRACE_SECONDS` (default 300 seconds) is marked
@@ -9273,31 +9299,46 @@ the first dispatcher and persisted; later replicas and restarts follow the same 
 `suppressed_backlog` in the `dispatch` response gives the number suppressed. When one really needs to be resent,
 call `POST /v1/advisory-notifications/{id}/send` to re-enqueue it -- but it only enqueues notifications with no delivery row or still
 `PENDING`; rows already backed off by the dispatcher (`RETRY`) stay where they are, and dead-lettered ones (`DEAD`) return
-`FAILED` with a reason containing `requeue it explicitly to try again` (control-plane review 2026-09-08, F-2:
-the collection-silence scan repeating `send` every 60 s once made the retry budget unbounded and `dead_lettered_total` +1 every minute). Reviving
-`RETRY`/`DEAD` only goes through the service layer `AdvisoryNotificationService.requeue`: it resets the attempt budget and reopens the
+`FAILED` with a reason containing `requeue it explicitly to try again`, so a repeated `send` cannot inflate the retry budget. Reviving
+`RETRY`/`DEAD` only goes through an explicit requeue: `POST /v1/advisory-notifications/{id}/requeue` (execution token required; the
+service layer's `AdvisoryNotificationService.requeue`) resets the attempt budget and reopens the
 shelf life, and already `SENT` ones return `DUPLICATE` without resending. To resend the entire history set
-`GPU_FAULT_NOTIFICATION_DELIVER_BACKLOG=true`, but confirm the backlog size first. The SES call itself is bounded:
+`GPU_FAULT_NOTIFICATION_DELIVER_BACKLOG=true`, but confirm the backlog size first. The SNS and SES calls themselves are bounded:
 connect timeout 5 s, read timeout 20 s, at most 2 attempts.
+
+Each cycle the dispatcher claims by priority (lower first, default 50), `available_at` and creation time; a failed send backs off from 15 s,
+doubling, up to 900 s, and at `GPU_FAULT_NOTIFICATION_MAX_ATTEMPTS` the delivery row turns `DEAD`. Provider throttling (SES
+`TooManyRequestsException`, SNS `ThrottledException` and the like) costs no attempt: the rest of the batch is handed back untouched and the
+dispatcher slows down from twice the poll interval, doubling, up to `GPU_FAULT_NOTIFICATION_THROTTLE_MAX_SECONDS`. A notification past its
+shelf life when claimed (counted from its creation, or from `not_before` or a re-enqueue (`send`/`requeue`) when later; retries do not extend
+it) is recorded `SKIPPED` with a reason starting `expired:` and is not mailed; a drill notification (with a `drill_id`) is likewise only
+recorded `SKIPPED` while `GPU_FAULT_NOTIFICATION_DELIVER_DRILLS=false`. Delivery trouble raises
+`GpuFaultNotificationDeliveryFailing`, `GpuFaultNotificationUndeliveredTooLong`, `GpuFaultNotificationOutboxNotDraining`,
+`GpuFaultNotificationExpiredUnsent` and `GpuFaultNotificationDeliveryErrors`; their handling is in
+[Administrator Operations](administrator-operations.md#gpufaultnotificationdeliveryfailing).
 
 With `channel: ses` while SES is still in the sandbox, the sender and every administrator recipient must be verified in the same region;
 production mode usually requires only the sender identity to be verified. The actual restrictions follow the target AWS account and SES region; `channel: sns`
 has none of these restrictions.
 HyperPod managed advisories, `NOT_APPLICABLE` XIDs, GPU count changes, restart budget
-exhaustion and successful `RESTART_WORKLOAD` submission notifications share this configuration. Automatic restart notifications use the fixed
+exhaustion and successful `RESTART_WORKLOAD` submission notifications share this configuration. GPU count changes and restart budget
+exhaustion use the fixed `restart-guard-zh-v2` template. Automatic restart notifications use the fixed
 `restart-workload-zh-v1` template, recording the incident, job, original/new attempt, GPU count before and after the restart
 and restart budget usage. That email means the Kubernetes restart operation was submitted successfully, not that
 the training has passed health checks. The restart budget exhaustion notification is sent by the control plane's claim preflight
-(`reserve_restart_budgets` -> `fail_restart_preflight`), no longer by the data-plane
-Kubernetes Adapter: the workflow goes straight to `FAILED`, the incident to `ESCALATED`,
-no adapter is called, and the details of the corresponding step carry `notification_id`. A
+(`prepare_claimed_workflow` -> `withhold_exhausted_restart`), no longer by the data-plane
+Kubernetes Adapter: only that `RESTART_WORKLOAD` is withheld -- it is recorded `FAILED` before any adapter runs (its details carry
+`reason=RESTART_BUDGET_EXHAUSTED` and `notification_id`) and skipped, while the cordon, stop, reset and other steps run as planned;
+the workflow then ends `FAILED` (incident `QUARANTINED` while a node this workflow isolated stays isolated, otherwise `ESCALATED`), and the
+training has to be resubmitted by hand. A
 `RESTART_RESERVATION_MISSING` at dispatch (reserved at claim but the reservation is gone at dispatch) is a broken invariant and sends no email:
-the workflow goes straight to `FAILED`, the incident to `ESCALATED`, surfacing only via the workflow ESCALATED alert
-(`GpuFaultIncidentsAwaitingOperator`). `NOT_APPLICABLE` notifications use the fixed
+the step fails without an adapter call, the workflow fails with it, and the incident follows the failure rule -- `ESCALATED` (`QUARANTINED`
+while a node stays isolated) -- surfacing only through the incident state (`ESCALATED` raises
+`GpuFaultIncidentsAwaitingOperator`). `NOT_APPLICABLE` notifications use the fixed
 `xid-not-applicable-zh-v2` template, filling only the XID event, policy decision, isolation workflow and evidence fields,
 without generating administrator advice; a recorded incident without a workflow (for example a kernel line of a boot the
 node has left) gets the same notice with Workflow, Workflow status and Safety action `NONE` and the incident's own reason. Event ingestion only writes idempotently into the Aurora notification outbox; the standalone
-dispatcher calls SNS (or SES) after claiming with owner, epoch and lease. Send failures are retried with exponential backoff
+dispatcher (running only in the control-worker) calls SNS (or SES) after claiming with owner, epoch and lease. Send failures are retried with exponential backoff
 and do not change the result of event handling, GPU reset or workload restart. A notification result of `FAILED` is a terminal
 semantic: written only when `GPU_FAULT_NOTIFICATION_MAX_ATTEMPTS` is exhausted or an inline send fails; deliveries under retry
 show only in the delivery record's `attempts`/`last_error` and do not count as `FAILED`. The same incident, XID and
@@ -9364,12 +9405,15 @@ diagnostic workflow and evidence references, without a large language model. Not
 the deduplication key is composed of the Event ID and the template version, so continuous abnormal samples and re-submission of the same event do not send twice.
 `notification_ids` in the HostTelemetry API response returns the notification IDs created or matched this time.
 
-When no notification channel is configured (`GPU_FAULT_NOTIFICATION_CHANNEL=disabled`) or the dispatcher is off, notifications stay in the Aurora outbox and can be queried via
-`/v1/advisory-notifications/{id}`. The API returning a notification ID or `QUEUED` only means
-enqueue succeeded; acceptance must wait for the result to be `SENT` with a non-empty `provider_message_id`. Historical notifications without
+When no notification channel is configured (`GPU_FAULT_NOTIFICATION_CHANNEL=disabled`), sending is off or no dispatcher runs, notifications are still written to the Aurora outbox
+(an active control plane in that state must declare with `GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL=true` that alerting goes through an external channel, or it refuses to start) and their content can be queried via
+`/v1/advisory-notifications/{id}` (that route does not return the delivery result). The API returning a notification ID or `QUEUED` only means
+enqueue succeeded; acceptance must wait for the result to be `SENT` with a non-empty `provider_message_id` (calling
+`POST /v1/advisory-notifications/{id}/send` again on a delivered notification only returns `DUPLICATE` with the original `provider_message_id` and sends nothing). Historical notifications without
 delivery records from before the upgrade are not enqueued automatically, avoiding replay of old alerts; administrators can re-enqueue a given notification ID
-individually via `/v1/advisory-notifications/{id}/send`. If sender and
-recipients are not provided on redeployment, the script deletes the `gpu-fault-email` Secret and keeps sending off.
+individually via `/v1/advisory-notifications/{id}/send`. A regional deploy never deletes the `gpu-fault-email` Secret:
+with `allowEmail: false` it leaves the Secret as it is; Appendix A's old single-cluster script reuses the addresses in the existing Secret when
+sender and recipients are not provided, and refuses to deploy with `GPU_FAULT_ALLOW_EMAIL=true` and no address at all.
 
 <a id="101-gpu-数量变化审批"></a>
 ### 8.1 GPU Count Change Approval
@@ -9377,9 +9421,10 @@ recipients are not provided on redeployment, the script deletes the `gpu-fault-e
 Before an automatic restart the system compares:
 
 - Source count: the number of unique GPU UUIDs in the failed attempt allocation.
-- Target count: the total of `nvidia.com/gpu` or MIG resources in the Job/PyTorchJob/JobSet template.
+- Target count: the total of `nvidia.com/gpu` or MIG resources (`nvidia.com/mig-*`) in the Job/PyTorchJob/JobSet template
+  (per container the larger of request and limit, multiplied by replicas/completions).
 
-The target count can also be declared explicitly on the workload metadata:
+The target count can also be declared explicitly on the workload metadata (it takes precedence over the template count):
 
 ```yaml
 metadata:
@@ -9387,7 +9432,9 @@ metadata:
     gpu-fault.io/target-gpu-count: "4"
 ```
 
-If it changes from 8 GPUs to 4 GPUs, the workflow stays `WAITING` and sends an administrator notification. The administrator needs to check
+If it changes from 8 GPUs to 4 GPUs, the `RESTART_WORKLOAD` step stays `WAITING` (details `reason=GPU_COUNT_CHANGED`), no new workload is created,
+and an administrator notification is sent (`restart-guard-zh-v2`, subject `[ACTION REQUIRED][GPU training restart paused] <job>: 8 GPU -> 4 GPU`,
+whose body gives the exact approval command with `--context`). The administrator needs to check
 world size, data-parallel/model-parallel strategy, gradient accumulation, global batch size, learning
 rate and checkpoint compatibility. After confirming, set the exact approval value on the original workload metadata:
 
@@ -9396,14 +9443,20 @@ kubectl -n <namespace> annotate job <job-name> \
   gpu-fault.io/approve-gpu-count-change='8:4' --overwrite
 ```
 
-The Dispatcher re-reads the template on its next scan; it continues only when the approval value exactly matches the current actual source/target counts.
-When the source or target count is unknown, automatic approval via annotation is not possible; a new job must be submitted manually.
+The Dispatcher re-reads the template on its next scan; it continues only when the approval value exactly matches the current actual source/target counts
+(every workload of the step carrying the same approval value); setting the template back to the original GPU count also continues once the counts match.
+When the source or target count is unknown, automatic approval via annotation is not possible; a new job must be submitted manually. The wait is not
+open-ended: it is bounded by the per-step waiting cap `GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS` (default 600 seconds, counted from the start of the step),
+after which `RESTART_WORKLOAD` fails, the workload is not restarted automatically and can only be resubmitted by hand.
 
-Query the budget:
+Query the budget. The regional control plane's operator routes require the execution token and are exposed only through the TLS NLB, so call
+them over loopback inside the CPU API Pod, with the token taken from the Pod's own environment; a job with no automatic restart reserved yet returns 404:
 
 ```bash
-curl -fsS \
-  http://<control-plane>/v1/restart-budgets/<cluster-id>/<job-id>
+kubectl --kubeconfig <cpu-kubeconfig> -n gpu-fault-system \
+  exec deploy/gpu-fault-api-ha -- python -c \
+  'import json,os,sys,urllib.request; r=urllib.request.Request("http://127.0.0.1:8080/v1/restart-budgets/" + sys.argv[1] + "/" + sys.argv[2], headers={"X-GPU-Fault-Execution-Token": os.environ["GPU_FAULT_EXECUTION_TOKEN"]}); print(json.dumps(json.load(urllib.request.urlopen(r, timeout=15)), indent=2))' \
+  <cluster-id> <job-id>
 ```
 
 <a id="102-spare-不足时管理员手动降级恢复"></a>
@@ -9422,7 +9475,11 @@ This procedure applies to the following scenario:
 The current automatic flow requires a one-to-one correspondence between faulty nodes and healthy spares and does not support automatic partial replacement. For example, when the original job uses
 3 nodes with 8 GPUs each, 2 nodes fail and only 1 healthy spare exists, the automatic flow does not replace only
 one of them. The `REPLACE_NODE` step fails, the faulty nodes stay isolated, and the subsequent
-`RESTART_WORKLOAD` does not execute.
+`RESTART_WORKLOAD` does not execute. Allocation pairs spares per (instance group/node group, instance type) and allocates nothing when any group
+is short; the step error reads `insufficient healthy HyperPod spares: <group>/<instance type>: required=N, healthy=M` (followed by the
+rejected candidates and their reasons), and the administrator notification `[GPU action required] <cluster>: insufficient HyperPod spare nodes`
+(deduplication key `<incident>/hyperpod-spare-insufficient`) is sent. When that GPU cluster has no declared spare at all, the step error is
+`warm-spare replacement is required; provider node replacement API fallback is disabled`: the provider's node replacement API is never called.
 
 This scenario must be handled as a new manual training attempt. Do not merely set
 `gpu-fault.io/approve-gpu-count-change` on the old workload; that annotation can only release the GPU count gate of a workflow that has already reached
@@ -9434,10 +9491,11 @@ The operation does not write partial `node_rebindings` into the original workflo
 From the control plane's perspective the original automatic recovery still failed; the new attempt, the manual reservation and the operations ticket together form
 the subsequent audit record.
 
-The following examples assume:
+The following examples assume (kubectl commands without `--kubeconfig` run in the current context of the GPU cluster of `CLUSTER_ID`):
 
 ```bash
-export CONTROL_PLANE=http://<control-plane>
+export CPU_KUBECONFIG='<cpu-control-plane-kubeconfig>'
+export SITE_FILE='<state-dir>/site.yaml'
 export AWS_REGION='<aws-region>'
 export CLUSTER_ID='<hyperpod-cluster-id>'
 export NAMESPACE='<training-namespace>'
@@ -9449,6 +9507,17 @@ export BAD_NODE_1='<failed-node-1>'
 export BAD_NODE_2='<failed-node-2>'
 export SPARE_NODE='<healthy-spare-node>'
 export CHANGE_ID="manual-${INCIDENT_ID}"
+
+# The regional control plane's operator routes are default-deny, require the execution token
+# and are exposed only through the TLS NLB: call them over loopback inside the CPU API Pod, with the
+# token taken from the Pod's own environment, never on a command line or in the NLB logs.
+# Usage: cp_api GET <path>; cp_api POST <path> '<json>'
+cp_api() {
+  kubectl --kubeconfig "${CPU_KUBECONFIG}" -n gpu-fault-system \
+    exec deploy/gpu-fault-api-ha -- python -c \
+    'import json,os,sys,urllib.request; body=sys.argv[3].encode() if len(sys.argv) > 3 else None; r=urllib.request.Request("http://127.0.0.1:8080" + sys.argv[2], data=body, method=sys.argv[1], headers={"Content-Type": "application/json", "X-GPU-Fault-Execution-Token": os.environ["GPU_FAULT_EXECUTION_TOKEN"]}); print(json.dumps(json.load(urllib.request.urlopen(r, timeout=15)), indent=2))' \
+    "$@"
+}
 ```
 
 <a id="1022-第一步确认自动流程已经停止"></a>
@@ -9457,11 +9526,9 @@ export CHANGE_ID="manual-${INCIDENT_ID}"
 Query the incident and the workflow:
 
 ```bash
-curl -fsS \
-  "${CONTROL_PLANE}/v1/incidents/${INCIDENT_ID}"
+cp_api GET "/v1/incidents/${INCIDENT_ID}"
 
-curl -fsS \
-  "${CONTROL_PLANE}/v1/workflows/${WORKFLOW_ID}"
+cp_api GET "/v1/workflows/${WORKFLOW_ID}"
 ```
 
 You must confirm:
@@ -9514,20 +9581,27 @@ kubectl get node "${SPARE_NODE}" \
   -o custom-columns='NAME:.metadata.name,SPARE:.metadata.labels.gpu-fault\.io/spare,HYPERPOD_HEALTH:.metadata.labels.sagemaker\.amazonaws\.com/node-health-status,READY:.status.conditions[?(@.type=="Ready")].status,UNSCHEDULABLE:.spec.unschedulable,RESERVATION:.metadata.annotations.gpu-fault\.io/spare-reservation,POOL_STATE:.metadata.annotations.gpu-fault\.io/spare-pool-state,SPARE_HEALTH:.metadata.annotations.gpu-fault\.io/spare-health'
 ```
 
-The candidate node must simultaneously satisfy (the first two are reported item by item by the read-only check of `gpu-fault-admin config spare --state-dir ... --node <spare>`; declaring and releasing also go through that command, see "Adding an independently repaired and re-accepted node to the spare pool" below):
+The candidate node must simultaneously satisfy (the read-only check of `gpu-fault-admin config spare --state-dir ... --node "${SPARE_NODE}" --fault-node "${BAD_NODE_1}"` reports, item by item, the Ready condition, the HyperPod health label, the reservation, the pool state, quarantine residue, active GPU Pods, exactly one ACTIVE Node Agent and the matching topology; it judges whether the node could be declared as a new spare, so for a spare already labeled and cordoned in the pool it always lists `node is already declared as a spare and cordoned` and exits 1, which is expected in this procedure. Add `--cluster-id` when the site manages several GPU clusters. Declaring and releasing also go through that command, see "Adding an independently repaired and re-accepted node to the spare pool" below):
 
 - `gpu-fault.io/spare=true`;
-- HyperPod state `Running`;
-- `sagemaker.amazonaws.com/node-health-status=Schedulable`;
+- HyperPod state `Running` (plain EKS cluster: the EC2 instance is `running`);
+- `sagemaker.amazonaws.com/node-health-status=Schedulable` (HyperPod only; a plain EKS node has no such label);
 - Kubernetes `Ready=True`;
 - Currently `unschedulable=true`;
 - `gpu-fault.io/spare-health=HEALTHY`, or the field not yet written but the latest spare health
-  controller scan explicitly found no health reasons;
-- No other `gpu-fault.io/spare-reservation`;
-- GPU SKU, GPUs per node, EFA count, driver, firmware and topology satisfy the reduced YAML.
+  controller scan explicitly found no health reasons (a regional deployment does not run that controller, see below);
+- No other `gpu-fault.io/spare-reservation`, and `gpu-fault.io/spare-pool-state` empty or `AVAILABLE`;
+- No running GPU Pod on the node and no active fault marker/finding;
+- GPU SKU, GPUs per node, EFA count, driver, firmware and topology satisfy the reduced YAML (automatic allocation compares only the instance group/node group and the instance type).
 
-`gpu-fault.io/spare-health=UNAVAILABLE` does not stay silent forever. The controller re-checks every 1 hour by default;
-a persistent fault alerts repeatedly every 24 hours. After a healthy re-check the state transitions as:
+The spare health controller runs only when the control plane itself turns on `GPU_FAULT_ENABLE_HYPERPOD_ADAPTER` and
+`GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER` (which only Appendix A's transitional single cluster can do); a regional control plane must not
+enable the HyperPod adapter, so it does not run it and no
+`gpu-fault.io/spare-health*` annotation ever appears on the nodes: spare health is checked only when the executor allocates, against the
+items above, and the executor also reclaims, every 300 seconds, a stale reservation carrying `gpu-fault.io/spare-reserved-at` that is older
+than 24 hours and holds no GPU Pod. Where the controller runs,
+`gpu-fault.io/spare-health=UNAVAILABLE` does not stay silent forever. The controller re-checks every 1 hour by default (`GPU_FAULT_SPARE_UNAVAILABLE_RECHECK_SECONDS`);
+a persistent fault alerts repeatedly every 24 hours (`GPU_FAULT_SPARE_UNAVAILABLE_ALERT_SECONDS`). After a healthy re-check the state transitions as:
 
 ```text
 UNAVAILABLE -> RECHECKING -> HEALTHY
@@ -9541,13 +9615,8 @@ Invalid states, counts or stale incident annotations are handled in single-node 
 Check the Node Action Agent readiness:
 
 ```bash
-curl -fsS -X POST \
-  "${CONTROL_PLANE}/v1/fleet/readiness" \
-  -H 'Content-Type: application/json' \
-  -d "{
-    \"cluster_id\": \"${CLUSTER_ID}\",
-    \"node_ids\": [\"${SPARE_NODE}\"]
-  }"
+cp_api POST /v1/fleet/readiness \
+  "{\"cluster_id\": \"${CLUSTER_ID}\", \"node_ids\": [\"${SPARE_NODE}\"]}"
 ```
 
 Continue only when the response has `ready=true`. Then write the manual reservation first and make the node schedulable afterwards:
@@ -9564,7 +9633,9 @@ kubectl uncordon "${SPARE_NODE}"
 
 The first command deliberately does not use `--overwrite`. If the node has already been reserved by another incident or administrator, the command should
 fail; the original reservation must not be overwritten. Once the reservation is written, the automatic spare allocator does not assign the node to
-other incidents, and the spare health controller does not modify it during manual use.
+other incidents, and the spare health controller does not modify it during manual use. A manual reservation carries no
+`gpu-fault.io/spare-reserved-at` and its value is not an incident ID, so neither the 24-hour TTL nor an ended owner workflow reclaims it --
+release it by hand per 8.2.8 when done.
 
 <a id="1025-第四步修改训练-yaml-和训练参数"></a>
 #### 8.2.5 Step 4: Modify the Training YAML and Training Parameters
@@ -9648,7 +9719,8 @@ The change record should keep at least the following comparison:
 #### 8.2.6 Step 5: Generate and Review the New Attempt
 
 Reuse the original `JOB_ID`, but you must use a new, never-used attempt ID. The restart budget must match the value
-already established for that job:
+already established for that job (the control plane records it per cluster/job and it is immutable; a different value makes that job's later
+automatic recovery fail its claim preflight with `restart budget is immutable`):
 
 `gpu-training-submit` is recommended for the formal resubmission. If an external training platform can generate and review the complete
 managed YAML, a direct `kubectl apply` is also possible; what is forbidden is directly submitting raw YAML lacking
@@ -9725,8 +9797,7 @@ Verify item by item:
 You can query the restart budget to confirm the manual submission itself did not unexpectedly increase the automatic restart count:
 
 ```bash
-curl -fsS \
-  "${CONTROL_PLANE}/v1/restart-budgets/${CLUSTER_ID}/${JOB_ID}"
+cp_api GET "/v1/restart-budgets/${CLUSTER_ID}/${JOB_ID}"
 ```
 
 Write `INCIDENT_ID`, `WORKFLOW_ID`, `CHANGE_ID`, the old and new attempt IDs, the node mapping, the YAML Git
@@ -9741,7 +9812,9 @@ If the new workload has not started or the submission verification failed, re-co
 kubectl cordon "${SPARE_NODE}"
 ```
 
-After confirming no new training Pods are on that node, clear the manual reservation and restore the spare pool state:
+After confirming no new training Pods are on that node, clear the manual reservation and restore the spare pool state (the same state the
+control plane writes back when it releases a reservation itself; `gpu-fault-admin config spare --release` refuses a node that still carries
+`spare-reservation` or `ALLOCATED`, so a manual reservation can only be undone this way):
 
 ```bash
 kubectl get pods -A \
