@@ -63,7 +63,7 @@ controlled object storage; `artifacts/` is only a local workspace.
   `config/release-images.lock.json` (`reference` the manifest-list digest, `source` the tag); the plain EKS host-mode host
   DCGM `4.6.1-1` (`DCGM_HOST_PACKAGE_VERSION`) is derived from it; the rule is in `src/gpu_fault/dcgm_versions.py`
 
-NVIDIA's rules, verbatim:
+NVIDIA's rules, verbatim (from the page version "Last updated on 2026-09-10", the text the product and its tests pin):
 
 - "Install DCGM Exporter", "Requirements and Version Compatibility"
   (<https://docs.nvidia.com/datacenter/dcgm/latest/installation/install-dcgm-exporter.html#requirements-and-version-compatibility>):
@@ -84,7 +84,7 @@ Why this release: it is the newest exporter release; DCGM 4.7.0 packages are pub
 start-up check for `libdcgm.so.4` then exits with "exit status 1" unless the container runtime's NVIDIA hook writes one
 (github.com/NVIDIA/dcgm-exporter issue #612, fixed by PR #724 in 4.8.4). Since 4.8.2 NVIDIA publishes the distroless variant
 only. The pairing per cluster (plain EKS host mode is a supported pair; the HyperPod engine is the AMI's, whose version the AMI
-decides, 4.7.0 as the Agent heartbeats report for the HyperPod AMI's engine, newer than the 4.6.1 client, the connection requirement broken with no product
+decides, the HyperPod AMI's own engine (currently DCGM 4.7.0) newer than the 4.6.1 client, the connection requirement broken with no product
 remedy, advised about until NVIDIA publishes an exporter on DCGM 4.7.0 or later), why the product advises rather than refuses,
 and the upgrade steps are in the [Deployment and Operations Manual](../deployment-and-operations-manual.md) §6.5, "DCGM
 exporter version and the host hostengine pairing".
@@ -123,7 +123,9 @@ again from `pkg/dcgm/const_fields.go` of the new release's go-dcgm (its `go.mod`
 
 The policy results are stored separately:
 
-- `official_action`: the original NVIDIA Immediate Action/workflow name.
+- `official_action`: the original NVIDIA Immediate Action/workflow name; for an SXID the branch this system picked from the
+  Fabric Manager table (an Always-Fatal `RESTART_HOST_OR_SBR` is recorded as `RESTART_BM`, scope-dependent codes as
+  `RESET_PARTICIPATING_GPUS`, `RESET_ALL_GPUS_AND_NVSWITCHES` or `RESOLVE_TRUSTED_LINK_SCOPE`).
 - `investigatory_action`: the original NVIDIA Investigatory Action.
 - `action`: the execution action the current control plane has approved and can express.
 - `safety_action`: the site's fail-closed action when the official workflow is blocked because evidence or the executor is
@@ -156,7 +158,8 @@ node replacement remain independent actions.
 `CONTACT_SUPPORT`, `CHECK_MECHANICALS` and `UPDATE_SWFW` are not crudely replaced with another
 "official action": the policy keeps the original action and returns EXECUTABLE, and the workflow compiler lands them respectively as
 `ESCALATE_SUPPORT` (fixed-template mail, no isolation), `CHECK_MECHANICALS` (notify and wait for manual confirmation)
-and a downtime chain containing `UPDATE_SOFTWARE_FIRMWARE`. Other workflow names with no registered resolver keep
+and a downtime chain containing `UPDATE_SOFTWARE_FIRMWARE` (it needs `GPU_FAULT_TARGET_FIRMWARE_VERSION`; without it the plan
+blocks and only the safety chain FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → QUARANTINE runs). Other workflow names with no registered resolver keep
 the original action, return `BLOCKED_WORKFLOW`, and block further scheduling through the independent `safety_action=QUARANTINE`.
 The per-XID verdicts and steps are in
 [Fault Categories and Actions](../fault-categories-and-actions.md).
@@ -172,12 +175,13 @@ GB300 belongs to the GB200 column.
 ## Implemented Official Workflows
 
 - XID 45: first persisted as `PENDING_CORRELATION`, waiting for the 30-second window to close; when accompanied by other XIDs
-  it reuses the incident/workflow of the most severe accompanying XID; when solo it keeps `RESTART_FM`. A node that is not
-  graded -- A100 (NVIDIA's own solo case), PCIe/NVL variants, GH200, GB200/GB300, unknown parts, and a Hopper/Blackwell node
-  whose exporter reports no field 170 -- compiles it to `RESTART_FABRIC_MANAGER` (`FREEZE_EVIDENCE → RESTART_FABRIC_MANAGER`)
+  it reuses the incident/workflow of the most severe accompanying XID; when solo it keeps `RESTART_FM`. A node of a catalog product family that is not
+  graded -- A100 (NVIDIA's own solo case), PCIe/NVL variants, GH200, GB200/GB300, B100 and the other parts the fabric grading
+  leaves out, and a Hopper/Blackwell node whose exporter reports no field 170 (or only NOT_SUPPORTED/UNRECOGNIZED/NVML_TOO_OLD)
+  -- compiles it to `RESTART_FABRIC_MANAGER` (`FREEZE_EVIDENCE → RESTART_FABRIC_MANAGER`)
   whatever the switch below says, executed by the Node Agent's `fabricManagerRestart` capability. On a graded NVSwitch node
   (a Hopper SXM or HGX B200/B300 part whose latest DCGM samples report field 170), a Fabric Manager restart alone
-  loses the fabric state, so `RESTART_FM` there can only be NVIDIA's H100-and-later procedure, the full GPU + NVSwitch reset;
+  loses the fabric state, so the product compiles `RESTART_FM` there as NVIDIA's H100-and-later procedure, the full GPU + NVSwitch reset;
   NVIDIA's GPU debug guidelines, on the other hand, read such a solo XID 45 as informational (see "Evidence" below). Such a
   node is therefore **observe-only** by default (`orchestration/xid45_policy.py`): the decision becomes `MONITOR_ONLY` /
   `NO_ACTION`, `official_action` stays `RESTART_FM` and `investigatory_action` is unchanged, the marker is INFO and not
@@ -189,8 +193,9 @@ GB300 belongs to the GB200 column.
   NVSwitch reset chain on the graded GPUs (`RESET_ALL_GPUS_NVSWITCHES` inside a quiesce window that stops and restarts
   Fabric Manager, then VALIDATE_GPU and VALIDATE_FABRIC), under the `fabricReset` capability. The shared
   Store lease supports HA, out-of-order arrival and Pod restarts.
-- XID 48: solo executes `RESET_GPU`; when accompanied by XID 63/64 it executes
-  `DRAIN_AND_RESET`.
+- XID 48: solo executes `RESET_GPU`; with an XID 63/64 already stored for the same GPU and boot within 30 seconds it is
+  recorded as `DRAIN_AND_RESET` (the same RESET_GPU chain, cordoned first) and merges only into an XID 64's incident, never
+  into an XID 63's; a later XID 64 links back to that XID 48, so the GPU is reset once.
 - XID 94/95: application/all-applications containment are stored separately; XID 95 requires the affected workload to be stopped before
   the reset.
 - XID 154: the driver-reported action takes precedence. The catalog's `Xid 154 linkage` describes the
@@ -206,7 +211,9 @@ GB300 belongs to the GB200 column.
   or duplicate GPU, or persistence not released authorises no reset or reboot and goes to an operator. The dedicated
   operation lets an old Agent refuse a request it does not know, so it can never silently degrade to `STOP_WORKLOADS` or an
   unconditional reset.
-- XID 159 `CHECK_UVM`: reset when UVM/vGPU use is explicitly confirmed, otherwise ignore; blocked when evidence is missing.
+- XID 159 `CHECK_UVM`: reset when the event carries `uvm_in_use=true`, ignore on `false`; without that evidence
+  `BLOCKED_MISSING_EVIDENCE` + `safety_action=QUARANTINE` (this system's fail-closed choice). The product's own collectors do
+  not provide the field, so a collected XID 159 is currently handled as missing evidence.
 - XID 144-150: selects the V1/V2 `IntrInfo` pattern by the driver R575 boundary, matching
   Error Status and Action 2 at the same time. The primary action and Action 2 may use different bit patterns and are matched separately;
   an RXPIPE secondary-pattern hit must still satisfy the Error Status of the same table entry, and cannot first require the primary pattern to hit as well.
@@ -233,7 +240,7 @@ Both pages were verified against NVIDIA's live pages:
   "Solo: RESTART_FM / Not Solo: IGNORE (follow other Xid)"; Trigger:
   "This event is logged when the user application aborts and the kernel driver tears down the GPU application running on the GPU. Control-C, GPU resets, sigkill are all examples where the application is aborted and this event is created. In many cases, this is not indicative of a bug but rather a user or system action."
 
-Conclusion: NVIDIA's own triage guide explains the catalog's "Solo: RESTART_FM" as the A100 case (an unexpected Fabric
+Conclusion (our reading and our deviation): NVIDIA's own triage guide explains the catalog's "Solo: RESTART_FM" as the A100 case (an unexpected Fabric
 Manager shutdown with Fabric Manager in the GPU's OS) and reads every other solo XID 45 as informational. The default
 departs from the catalog's investigatory action only where NVIDIA's own debug guidance reads the solo event as
 informational -- graded NVSwitch Hopper/Blackwell nodes; the catalog data itself is unchanged (the generated artifact, its
@@ -269,13 +276,14 @@ Every page below was verified against NVIDIA's live page (docs version 615):
 
 Conclusion: a pending row remap or page retirement takes effect at the next GPU reset (or node reboot), so after this
 workflow's `RESET_GPU` (on that GPU), `RESET_ALL_GPUS_NVSWITCHES` or `RESTART_NODE` a pending finding whose reading is not
-newer than that completion is no verdict on the reset GPU: `VALIDATE_GPU` keeps `WAITING` (`awaiting_newer_gpu_metrics` and
+newer than that completion is no verdict on the reset GPU: as long as every blocking finding is a pending-repair flag
+(`row_remap_pending`/`retired_pages_pending`), `VALIDATE_GPU` keeps `WAITING` (`awaiting_newer_gpu_metrics` and
 `pending_repair_reset` in `node_pending.<node>`, `policy_references` the flag's URL above) until a GPU metrics batch newer
 than the reset re-judges it; cleared succeeds, still set fails on the existing path; the bound is the executor's per-step
-cap. `RECOVER_DRAIN_P2P` (it can succeed with `reset_skipped`), `REMEDIATE_DRIVER`, `UPDATE_SOFTWARE_FIRMWARE` and
+cap; with any other finding beside it the step fails at once as before. `RECOVER_DRAIN_P2P` (it can succeed with `reset_skipped`), `REMEDIATE_DRIVER`, `UPDATE_SOFTWARE_FIRMWARE` and
 `REPLACE_NODE` do not count as applying the repair. Implementation `src/gpu_fault/adapters/pending_repair_rejudge.py`; the
 quotes are pinned by `tests/execution/test_validation_pending_repair_after_reset.py`. The case has not occurred on real
-hardware; unit tests cover the behaviour (see the DCGM diagnostics section of [Detailed Design](../detailed-design.md)).
+hardware; unit tests cover the behaviour (see the pending repair flag paragraph of [Detailed Design](../detailed-design.md) §2.4.1, "GPU Metrics `gpu_metrics.py`").
 
 ### Evidence: the DCGM field audit rules
 
@@ -333,7 +341,7 @@ decisions are in the detailed design §2.4.1, "The DCGM field audit's fields"; e
 Conclusion: values 1-4 of field 1523 take the XID 154 decision of the same label; RECOVER_IMEX_DOMAIN goes to an operator;
 BUS_RESET, SYSTEM_REBOOT and undocumented values fail closed (NVIDIA documents only one-line enum meanings for 6 and 7, and
 the product's GPU reset is an FLR, not a bus reset). The PCIe replay threshold follows DCGM's health formula for the current
-link (8/min only without a link reading); the correctable-error limit is the lower of that formula and DCGM's PCIe
+link (8/min only without a link reading; a configured `GPU_FAULT_PCIE_REPLAY_RATE_WARNING_PER_MINUTE` other than 8 wins); the correctable-error limit is the lower of that formula and DCGM's PCIe
 diagnostic limit. Blackwell (B200/B300) behaviour is unit-tested from NVIDIA documentation, not live-verified (no B-series
 hardware).
 
@@ -357,7 +365,7 @@ documentation, not live-verified (no B-series hardware).
   reported 1 or more errors. This includes datalink CRC, recovery, and replay errors (pre-Blackwell GPUs) and link recovery
   events (Blackwell+ GPUs)."; DCGM v4.7.0 `modules/health/DcgmHealthWatch.cpp`
   `https://github.com/NVIDIA/DCGM/blob/v4.7.0/modules/health/DcgmHealthWatch.cpp`: 1212 above 0 FAIL, 1211 above 0 WARN,
-  any change within a minute of the NVLink5 error counters FAIL, next step "Run a field diagnostic on the GPU."; DCGM Release
+  any change within a minute of 1204-1209, 1213, 1214, 1219 or 1220 FAIL, next step "Run a field diagnostic on the GPU."; DCGM Release
   Notes 4.7.0 `https://docs.nvidia.com/datacenter/dcgm/latest/release-notes/changelog.html` "Removed NVLink bit-error-rate
   thresholds that caused false health and diagnostic failures on healthy GB200 systems." (BER is not graded).
 - Fabric health (174/175): NVML API Reference, "Fabric Definitions"
@@ -380,19 +388,29 @@ documentation, not live-verified (no B-series hardware).
 
 Conclusion: on HGX B200/B300 the NVLink5 link-recovery counters answer for the NVLink fields NVML no longer reports; a
 failed link recovery (1212) drains, the other NVLink5 counters take the NVLink family's WARNING, an increment across a
-product window grades nothing and one an XID 144-150/155 owns is evidence; an XID 144-150 read from DCGM field 230 joins the
-kernel-sourced incident. A confirmed unhealthy fabric takes NVIDIA's full GPU + NVSwitch reset, a degraded one a diagnostic
-and an operator notice, NOT_SUPPORTED nothing. A pending memory repair is an operator's reboot unless the GPU recovery action
+product window grades nothing and one an XID 144-150/155 owns is evidence; a DCGM field 230 XID change and the kernel line
+on the same GPU within 120 s are one occurrence (see Part IV of [fault categories and actions](../fault-categories-and-actions.md)),
+and a change of XID 144-150 waits up to 120 s for its kernel line. An unhealthy fabric (summary UNHEALTHY, route unhealthy
+or an incorrect configuration) held ≥ 60 s outside any product fabric window is confirmed and takes NVIDIA's full GPU +
+NVSwitch reset; a route or access-timeout recovery in progress is evidence only and is treated the same after 300 s; a
+degraded fabric gets a diagnostic and an operator notice, NOT_SUPPORTED nothing; the rule covers every graded NVSwitch part
+(Hopper SXM included). DCGM records FAIL at once for the NVLink5 error counters and these fabric states: the product's
+WARNING grading, its confirmation wait and never resetting for a degradation are our deviation. A pending memory repair is an operator's reboot unless the GPU recovery action
 decides; unrepairable memory takes the row-remap failure's RMA drain. Per-link fields, the NVSDM switch fields and the
 ConnectX bridge fields are deferred ([validation limitations](../../validation-limitations.md)).
 
 ## SXID
 
-SXID recovery follows the Fabric Manager User Guide:
+SXID recovery follows the Fabric Manager User Guide (`https://docs.nvidia.com/datacenter/tesla/fabric-manager-user-guide/index.html`;
+the artifact `src/gpu_fault/data/nvidia-fabric-manager-sxid-2025-11-14.yaml` pins Tables 21-24 of its "2025-11-14" edition):
 
-- non-fatal: informational, keep monitoring.
-- fatal access link: the affected GPU and the workload participating GPUs must already be resolved,
-  then the job is stopped and the whole GPU group is reset.
+- non-fatal: the catalog's IGNORE codes and non-fatal codes outside the tables are informational, keep monitoring; the non-fatal
+  19084, 11004/12028 and 20012 follow their own rules below.
+- fatal access link: the access scope must come from a trusted NVSwitch port topology (`TRUSTED_NVSWITCH_TOPOLOGY`) or the
+  HGX H100/H200 product invariant (`NVIDIA_PRODUCT_INVARIANT`), otherwise `BLOCKED_MISSING_EVIDENCE` + QUARANTINE; with a
+  non-empty participating GPU set the node is cordoned, the job stopped and that group reset (`RESET_PARTICIPATING_GPUS`),
+  with an empty one it blocks. The set is the port's GPU from the trusted topology; without one, every GPU of the node's
+  active jobs (plus the GPUs in the NVSwitch's PCI slot) -- the two are never merged.
 - fatal trunk and 10003/19084: require fabric_partition and the complete node GPU inventory; when both are present
   `RESET_ALL_GPUS_AND_NVSWITCHES` is executed (Node Agent `fabricReset` capability, multi-node barrier);
   if either is missing the result is `BLOCKED_MISSING_EVIDENCE`, and it never degrades to a single-GPU reset.
@@ -409,9 +427,12 @@ SXID recovery follows the Fabric Manager User Guide:
   needs neither fabric_partition nor a GPU inventory; a code outside the pinned tables that declares Always-Fatal or Fatal
   always blocks (`BLOCKED_MISSING_EVIDENCE`): a client-supplied severity never authorises a destructive recovery.
 - `RESTART_VM` (11004, 12028, the Shared NVSwitch/vGPU case): bare metal has no guest VM lifecycle, so `BLOCKED_WORKFLOW`
-  + `safety_action=QUARANTINE`; `CHECK_MECHANICALS` (20012): `ESCALATE_OPERATOR`, notify and wait for an operator's
-  acknowledgement.
-- B200/B300: the traditional fatal/non-fatal SXIDs do not apply; DCGM/NVSDM telemetry is required.
+  + `safety_action=QUARANTINE` (the isolation is this system's fail-closed choice); `CHECK_MECHANICALS` (20012):
+  `ESCALATE_OPERATOR`, compiled to FREEZE_EVIDENCE → CHECK_MECHANICALS (notify and wait for an operator's acknowledgement,
+  no cordon, no stop).
+- The Blackwell families (B100/GB200 product families: B200/B300, GB200/GB300): the traditional SXIDs do not apply,
+  `NOT_APPLICABLE` (investigatory `USE_DCGM_NVSDM_TELEMETRY`) + `safety_action=QUARANTINE` (this system's fail-closed choice);
+  a product in no known family is `BLOCKED_MISSING_EVIDENCE` (`VERIFY_GPU_PRODUCT_GENERATION`).
 
 The SXID `classification_source` must be `NVIDIA_FABRIC_MANAGER` (or `NVIDIA_FABRIC_MANAGER_CATALOG`,
 `NVIDIA_FABRIC_MANAGER_RUNTIME`); otherwise it blocks because the evidence source is untrusted, and so does a
