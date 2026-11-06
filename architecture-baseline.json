@@ -64,7 +64,7 @@
     "src/gpu_fault/app/factory.py:create_app": 293,
     "src/gpu_fault/app/metrics.py:render_prometheus_metrics": 223,
     "src/gpu_fault/execution/executor.py:ProductionWorkflowExecutor._execute_dag": 238,
-    "src/gpu_fault/node_agent/app.py:create_node_agent_app": 320,
+    "src/gpu_fault/node_agent/app.py:create_node_agent_app": 314,
     "src/gpu_fault/orchestration/families/reset.py:ResetOperationService.ingest_distributed_xids": 210,
     "src/gpu_fault_release/regional_release_orchestration.py:run_upgrade_phases": 291,
     "tests/regional/test_cov95_workload_runner.py:test_e2e_preflight_proves_all_nodes_collectors_agents_and_executor_logs": 218

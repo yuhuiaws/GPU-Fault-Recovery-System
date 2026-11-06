@@ -174,6 +174,42 @@ def test_valid_migration_does_not_accept_an_invalid_provided_signature(
     assert action_pool.actions == []
 
 
+def test_the_migration_switch_cannot_open_an_agent_with_the_ownership_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    node_factory: Callable[..., NodeActionExecutor],
+    action_pool: ActionPool,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The production Agent runs the final-ownership gate, which answers signed
+    result queries only: the migration switch cannot open it, and the Agent says
+    the switch has no effect instead of warning that its results are open."""
+
+    agent = node_factory(allowed_operations={VERIFY}, require_final_ownership=True)
+    assert agent.ownership_gate is not None, "the production gate is on"
+    monkeypatch.setenv("GPU_FAULT_NODE_ACTION_RESULT_SIGNATURE_REQUIRED", "false")
+    monkeypatch.setenv("GPU_FAULT_RELEASE_ID", "runtime-unit-release")
+    monkeypatch.setenv(
+        "GPU_FAULT_NODE_ACTION_RESULT_SIGNATURE_MIGRATION_RELEASE_ID",
+        "runtime-unit-release",
+    )
+    monkeypatch.setenv(
+        "GPU_FAULT_NODE_ACTION_RESULT_SIGNATURE_MIGRATION_EXPIRES_AT",
+        (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+    )
+    with caplog.at_level("WARNING", logger="gpu_fault.node_agent.app"):
+        app = node_app.create_node_agent_app(agent)
+    with TestClient(app) as client:
+        unsigned = client.get(
+            "/v1/node-actions/result", params={"command_id": "unknown"}
+        )
+    assert unsigned.status_code == 401, "the gate keeps result queries signed"
+    assert "has no effect" in caplog.text, caplog.text
+    assert "unauthenticated" not in caplog.text, (
+        "the warning must not claim the results are readable by anyone"
+    )
+    assert action_pool.actions == []
+
+
 def test_pending_duplicates_execute_once_and_reused_targets_are_refused(
     node_factory: Callable[..., NodeActionExecutor], action_pool: ActionPool
 ) -> None:

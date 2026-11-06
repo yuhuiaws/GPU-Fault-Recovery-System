@@ -94,6 +94,31 @@ def _result_query_signature_required() -> bool:
     return required
 
 
+def _warn_unsigned_result_queries(*, gated: bool) -> None:
+    """Say what the unsigned result-query switch does on this Agent.
+
+    With the final-ownership gate -- every Agent started from the environment
+    (``config._executor_from_settings``) -- ``action_result`` requires a
+    signature whatever the switch says, so it has no effect and the results
+    are not open; only an Agent without the gate answers unsigned queries.
+    """
+
+    if gated:
+        LOGGER.warning(
+            "GPU_FAULT_NODE_ACTION_RESULT_SIGNATURE_REQUIRED=false has no "
+            "effect on this Agent: its final-ownership gate answers signed "
+            "result queries only; unset the variable"
+        )
+        return
+    LOGGER.warning(
+        "node action result queries are unauthenticated: anything "
+        "that can reach this port can read every recovery action's "
+        "result; unset "
+        "GPU_FAULT_NODE_ACTION_RESULT_SIGNATURE_REQUIRED once the "
+        "control plane signs its polls"
+    )
+
+
 def _node_action_rejection(
     error: ValueError,
 ) -> tuple[int, dict[str, Any]]:
@@ -297,13 +322,7 @@ def create_node_agent_app(
         )
     )
     if not require_signed_result_query:
-        LOGGER.warning(
-            "node action result queries are unauthenticated: anything "
-            "that can reach this port can read every recovery action's "
-            "result; unset "
-            "GPU_FAULT_NODE_ACTION_RESULT_SIGNATURE_REQUIRED once the "
-            "control plane signs its polls"
-        )
+        _warn_unsigned_result_queries(gated=ownership_gate is not None)
 
     def finished_result(
         command_id: str,
@@ -556,11 +575,11 @@ def create_node_agent_app(
         signature: str | None = None,
     ) -> NodeActionSubmission:
         # Set to false only to poll a fleet whose control plane has not
-        # been rolled yet: the signing side ships in the same wheel, so
-        # roll the control plane first, then the node bundle, and this
-        # never has to be touched. An unsigned query is answered either
-        # way when it is false, which is the whole point -- it is a
-        # migration escape hatch, not a mode.
+        # been rolled yet: the signing side ships in the same wheel, so roll
+        # the control plane first, then the node bundle. It is a migration
+        # escape hatch, not a mode, and only for an Agent without the
+        # final-ownership gate: with the gate (every Agent started from the
+        # environment) a signature is required regardless.
         rejection = result_query_refusal(
             verify_result_query,
             command_id,

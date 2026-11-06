@@ -12434,7 +12434,7 @@ registry; upgrades scan live objects and merge-refresh, without requiring admini
   a `GPU_FAULT_NODE_ACTION_RESULT_SIGNATURE_MIGRATION_EXPIRES_AT` that is an ISO-8601 time with a time zone, not yet passed and
   no more than 14 days out; otherwise the Agent refuses to start. An Agent with the final-ownership gate (the production Node
   Agent's default, `require_final_ownership=True`) requires signed result queries whatever this switch says, so on a
-  production Agent it does not open unsigned queries.
+  production Agent it does not open unsigned queries, and the Agent logs one start-up warning saying the switch has no effect.
 - By default `/metrics` exposes only the collector aggregates, the fixed Top-N (`GPU_FAULT_METRICS_COLLECTOR_TOP_N`, default 20) and
   `gpu_fault_collector_metrics_snapshot_age_seconds`. That metric family is exported only by
   `GPU_FAULT_SERVICE_ROLE=all/ingress`; a custom scrape configuration must include ingress,

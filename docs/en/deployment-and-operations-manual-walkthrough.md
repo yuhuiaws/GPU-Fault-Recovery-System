@@ -617,7 +617,8 @@ review of generated results, contracts and the full gate, staging release/rollba
 ## Hard Constraints on Client Identity and Migration Switches
 
 - Uvicorn must use `--no-proxy-headers`; internal replay trusts only the direct peer.
-- Unsigned NodeAction result queries may be enabled only in a short migration window carrying the release ID and expiry.
+- Unsigned NodeAction result queries may be enabled only in a short migration window carrying the release ID and expiry,
+  and only on an Agent without the final-ownership gate; the production Node Agent always requires signed queries.
 - Collector gauges are exported only from ingress; the scrape configuration must include ingress.
 - Internal detail metrics need the execution token and do not enter the AMP default scrape.
 - A non-regional active executor must explicitly confirm `GPU_FAULT_ALLOW_SINGLE_CLUSTER=true`.
