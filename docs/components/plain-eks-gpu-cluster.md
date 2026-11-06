@@ -71,7 +71,7 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
   在任何变更之前拒绝并逐组列出 `<节点组> gpu-fault.io/dcgm-hostengine=<值|absent>`；Karpenter NodePool 不读，HyperPod 始终是 host
   （来源 `provider`，不记录）。`site.yaml` 的 eks 条目记 `dcgmHostEngine`/`dcgmHostEngineSource`，每次 deploy/join 按节点组改写
   （节点镜像能力，不像 `nodeSelector` 那样沿用）。host 变体的 exporter 保留 `DCGM_REMOTE_HOSTENGINE_INFO=127.0.0.1:5555`、
-  注解 `gpu-fault.io/dcgm-hostengine: host`，显式容忍与其余 eks 渲染不变，plan 对应 `dcgm_eks_managed_host`；embedded 变体逐字节不变。
+  注解 `gpu-fault.io/dcgm-hostengine: host`，显式容忍与其余 eks 渲染不变，plan 对应 `dcgm_eks_managed_host`；embedded 变体同样带注解（值 `embedded`），HyperPod 清单不带。
   模式变化是 release diff 输入 `dcgm_hostengines`：规划 DCGM + reconciler + Agent（`DATA_PLANE_COMPATIBLE`），exporter 重新应用、
   该集群的 Agent 分波重装（reconciler 节点注解 `gpu-fault.io/installer-dcgm-hostengine=host`），变更前的节点预检先核对主机 hostengine。
   `status --full` 的 `node_scope.dcgm_hostengine`/`dcgm_hostengine_source`/`dcgm_hostengine_pending_nodes` 与 `node-scope` 的

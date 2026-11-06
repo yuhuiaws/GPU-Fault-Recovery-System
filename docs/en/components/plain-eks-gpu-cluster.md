@@ -92,7 +92,7 @@ closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace`
   `dcgmHostEngine`/`dcgmHostEngineSource`, rewritten from the node groups by every deploy/join (a node-image capability,
   not kept the way `nodeSelector` is). The host variant of the exporter keeps `DCGM_REMOTE_HOSTENGINE_INFO=127.0.0.1:5555`
   with the annotation `gpu-fault.io/dcgm-hostengine: host`, the explicit tolerations and the rest of the eks render are
-  unchanged, and the plan shows it as `dcgm_eks_managed_host`; the embedded variant is byte for byte unchanged. A mode
+  unchanged, and the plan shows it as `dcgm_eks_managed_host`; the embedded variant carries the annotation too (value `embedded`), the HyperPod manifest none. A mode
   change is the release-diff input `dcgm_hostengines`: it plans DCGM + reconciler + Agent (`DATA_PLANE_COMPATIBLE`), the
   exporter is re-applied and the cluster's Agents are re-installed in waves (reconciler node annotation
   `gpu-fault.io/installer-dcgm-hostengine=host`), and the node preflight checks the host hostengine before any change.
