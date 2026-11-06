@@ -3516,9 +3516,9 @@ What the service accepts differs from the API reference. The reference marks `Ro
 `UpdateCluster` refuses, measured, a rolling schedule without them and an in-place change of a schedule (ValidationException; the third names the
 group, `<instance group>` here):
 
-- "RollingUpdatePolicy is missing the RollbackMaximumBatchSize parameter."
-- "AutoRollbackConfiguration is required. Add a list of alarms and try again."
-- "You can't modify the existing ScheduledUpdateConfig for an instance group. To update the
+- 2026-11-02T00:16:46Z "RollingUpdatePolicy is missing the RollbackMaximumBatchSize parameter."
+- 2026-11-02T00:19:01Z "AutoRollbackConfiguration is required. Add a list of alarms and try again."
+- 2026-11-02T00:30:16Z "You can't modify the existing ScheduledUpdateConfig for an instance group. To update the
   configuration, first delete the existing configuration for the <instance group> instance group, and then create a new
   configuration."
 
@@ -3731,10 +3731,10 @@ DescribeClusterVersions (https://docs.aws.amazon.com/eks/latest/APIReference/API
 2017-11-01; the page prints no date, Last-Modified 2026-11-02, fetched 2026-11-02), URI Request Parameters: `clusterVersions`
 "List of specific cluster versions to describe."; `includeAll` "Include all available versions in the response.". The page
 does not say that these parameters cannot be sent together (neither does the service model aws-cli 2.35.21 installs); the
-service itself refuses the combination (InvalidParameterException), for example `--cluster-versions <version> --include-all`
-(aws-cli 2.35.21):
+service itself refuses the combination (InvalidParameterException), for example (re-checked with aws-cli 2.35.21,
+us-west-2) `--cluster-versions 1.31 --include-all`:
 
-- "Only one of the defaultOnly, clusterVersions, includeAll or status request parameters is accepted at a
+- 2026-11-02T14:21:23Z "Only one of the defaultOnly, clusterVersions, includeAll or status request parameters is accepted at a
   time."
 
 `--cluster-versions` beside `--default-only`, `--status` or `--version-status` is refused the same way (the text does not name
