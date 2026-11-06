@@ -67,7 +67,9 @@ This is the entry point of the whole manual, resolving "which deployment path to
 - **Key conclusion**: Aurora Serverless v2 and the public TLS NLB are both required components of the regional solution.
 - **Pitfall**: the low-level `rollout-regional-release.sh bootstrap` is responsible only for the application layer;
   only the ARN-only `gpu-fault-admin deploy` first automatically creates the Aurora, LBC/IAM,
-  NLB/PKI and monitoring resources exclusive to the current site; same-site tagged objects are taken over only as uncleaned leftovers.
+  NLB/PKI and monitoring resources exclusive to the current site; same-site tagged objects are taken over only as uncleaned leftovers. The CPU
+  control plane must be a HyperPod EKS cluster; an existing site upgrades with `gpu-fault-admin deploy --state-dir` alone, and the finish runs verify
+  and the stability window in parallel.
 
 ### 0.2 Persisting Regional Variables and Restoring a Session
 
@@ -84,12 +86,13 @@ This is the entry point of the whole manual, resolving "which deployment path to
 - **Purpose**: wipe this solution's state and reinstall, while keeping only the CPU EKS and all GPU EKS clusters.
 - **Entry point**: normally use `gpu-fault-admin uninstall --cpu-cluster keep`; the low-level
   `prepare-clean-redeploy.sh --mode reset --node-mode uninstall` is only for break-glass.
-- **What is deleted**: both sides' solution namespaces/components, node installations, the whole dedicated Aurora Serverless v2,
-  NLB/SG, ACM/PKI and LBC/IAM.
+- **What is deleted**: both sides' solution namespaces/components, node installations, NLB/SG, ACM/PKI, LBC/IAM and the other
+  solution-specific AWS resources in the registry; Aurora is kept by default and deleted only with `--reset-database` (a final snapshot is still kept by default).
 - **Safety boundary**: the script calls no CPU/GPU EKS delete API; finding a GPU node still under quarantine
-  refuses the reset. Aurora deletion requires an explicit choice on whether to keep a final snapshot.
-- **Redeployment entry point**: return to §0.1; CPU-2 rebuilds Aurora, CPU-3/5 rebuild LBC/NLB,
-  REG-3 to 8 reinstall on the original GPU EKS.
+  refuses the reset. It refuses to start while the last registry sync is not recorded as a success; the last step removes the GPU node groups'
+  ownership label (`--keep-ownership-label` keeps it).
+- **Redeployment entry point**: return to §0.1 and `deploy` again: the retained Aurora is taken over on the retained-database handoff proof,
+  LBC/NLB/PKI and the rest are created afresh, and REG-3 to 8 reinstall on the original GPU EKS.
 
 ### 0.4 Permanent Decommissioning Plan
 
@@ -98,12 +101,12 @@ This is the entry point of the whole manual, resolving "which deployment path to
 - **GPU boundary**: all GPU EKS/HyperPod clusters must be kept, with only this solution's components uninstalled.
 - **Entry point**: `gpu-fault-admin uninstall --cpu-cluster delete`; the Aurora registry is exported first,
   and the Aurora final phase is entered only after the non-Aurora resources and the CPU cluster are verified.
-- **Entry point**: REG-13; do not run the §0.3 reset first, or the final Aurora snapshot loses its audit data.
+- **break-glass**: REG-13; do not run the §0.3 reset first, or the final Aurora snapshot loses its audit data.
 
 ## 1. Scope
 
 - **Purpose**: define the only production form and the non-delivery boundary.
-- **Production form**: a regional CPU control plane separated from one or more HyperPod EKS GPU clusters.
+- **Production form**: a regional CPU control plane (HyperPod EKS) separated from one or more GPU clusters (HyperPod EKS or plain EKS).
 - **Non-production/undelivered**: single cluster only as a historical transition; generic Kubernetes not implemented;
   systemd is a regional data-plane installation method.
 - **Key conclusion**: the regional control plane must not directly apply the renderer inputs in `deploy/control-plane/base/`, nor run the single-cluster `deploy.sh`
@@ -113,34 +116,36 @@ This is the entry point of the whole manual, resolving "which deployment path to
 ## 2. Pre-Go-Live Decisions
 
 - **Purpose**: fix the globally stable identity and recovery responsibility before creating resources.
-- **Must decide**: `cluster_id`, Runtime Profile, Store, control-plane URL, DCGM endpoint,
-  lifecycle owner, the initial operation allowlist.
-- **Key principle**: HyperPod managed recovery and this system's mutations must not become dual writers.
+- **Must decide**: `cluster_id`, Runtime Profile, Store, control-plane URL (the site's private hostname), DCGM endpoint,
+  the initial operation allowlist; the lifecycle owner is fixed to this system.
+- **Key principle**: HyperPod managed recovery (`NodeRecovery=Automatic`) or EKS node auto repair and this system's mutations must not become
+  dual writers; both are refused.
 
 ### 2.1 Mandatory Pre-Go-Live Checklist
 
-- **Code gate**: `make check` and the real PostgreSQL tests pass.
+- **Code gate**: the main CI gate, or the complete gates of a local `make release-build` (real PostgreSQL stress included), pass.
 - **Release gate**: the release metadata is complete, and the compatible fields are empty in steady state.
 - **Secret gate**: execution token, processor replay secret and node action secret
   are all present and different.
-- **Runtime gate**: exit budgets, PDBs, email/ADOT, Agent key version and collector readiness
+- **Runtime gate**: exit budgets, PDBs, CPU capacity and roll schedulability, email/ADOT, Agent key version and collector readiness
   are all satisfied.
 - **Significance**: this section is a go-live veto list, not a suggestion list; any failure forbids the release.
 
 ### 2.2 Hard Constraints of the Regional Production Solution
 
-- HyperPod `NodeRecovery` must be `None`.
+- HyperPod `NodeRecovery` must be `None`; the GPU managed node groups of plain EKS must have node auto repair off.
 - This solution's code and execution roles never call `BatchReplaceClusterNodes`, and
   `GPU_FAULT_ALLOW_HYPERPOD_REPLACE` is always `false`.
 - Job automatic resume must be disabled; training recovery is the responsibility of this solution alone.
-- Only HyperPod EKS is currently supported, not HyperPod Slurm.
+- HyperPod is supported with EKS orchestration only, not HyperPod Slurm; plain EKS serves only as a GPU data cluster.
 
 ## 3. Software and Network Prerequisites
 
 ### 3.1 General
 
-Lists the minimum dependencies such as Python, PostgreSQL, the NVIDIA driver, `nvidia-smi`, `/dev/kmsg`, Node Agent
-9099 and DCGM 9400. When these fail, Kubernetes objects should not be created.
+Lists the minimum dependencies such as Python, PostgreSQL, the NVIDIA driver, `nvidia-smi`, `/dev/kmsg`, the Executor to Node Agent
+9099 and DCGM 9400, plus the Agent-set check before an upgrade and the handling of nodes that leave or join during a release.
+When these fail, Kubernetes objects should not be created.
 
 ### 3.2 Stable Private DNS, Public NLB and Private CA
 
@@ -152,24 +157,25 @@ Lists the minimum dependencies such as Python, PostgreSQL, the NVIDIA driver, `n
 
 ### 3.3 HyperPod EKS
 
-Checks AWS CLI, kubectl, Helm, IAM, EKS subnets, Load Balancer Controller permissions and
-HyperPod HMA/DCGM. The CPU/GPU contexts must be specified explicitly.
+Checks the deployment host tools (AWS CLI, kubectl, Helm; the ARN entry point also needs cosign, Docker/Buildx and make), IAM, EKS subnets,
+Load Balancer Controller permissions and HyperPod HMA/DCGM. The CPU/GPU contexts must be specified explicitly.
 
 ### 3.4 Boundary Between Solution Component Images and Customer Training Images
 
 - **Solution images**: the Python runtime, node installation Job, DCGM Exporter, ADOT.
 - **Training images**: entirely decided by the customer workload, never replaced by the control plane.
-- **Enterprise images**: unify images or pin digests through the four `GPU_FAULT_*_IMAGE` variables.
+- **Enterprise images**: a signed release locks every solution image by digest (the solution-built control-plane and executor images included);
+  the five `GPU_FAULT_*_IMAGE` variables may only point to a mirror of the same digest.
 - **Key conclusion**: the business version is determined by the content-addressed wheel, not by the Python base image tag.
 
 ## 4. Build and Test
 
-- **Purpose**: obtain from CI a signed deployable schema v3 release containing separate wheels/
-  bundle, rendered digests, dependency lock, Node template and immutable OCI image digests.
-- **Gate contents**: Ruff, the full mypy/Mixin contract ratchet, compileall,
-  the architecture ratchet, deploy layout,
-  bash/ShellCheck, environment variable reference, case index, generated config, artifact consistency,
-  the full pytest.
+- **Purpose**: obtain from CI a signed deployable schema v4 release containing separate wheels/
+  bundle, rendered digests, dependency lock, Node template and immutable OCI image digests (control-plane, executor and node dependency
+  images built separately).
+- **Gate contents**: after a promtool preflight the static gates run first (Ruff, the full mypy/Mixin contract ratchet, compileall,
+  the architecture ratchet, deploy layout, bash/ShellCheck, YAML, documentation and environment variable reference, case index,
+  generated config), then artifact consistency and the full pytest in parallel; `release-build` runs the PostgreSQL stress in parallel too.
 - **PostgreSQL**: use the CAP-005 runner to create an isolated PostgreSQL 16 database, run
   the 8×40 lock contention, completion concurrency 2/4, counter/fencing/deadlock tests and require
   zero skips in JUnit; `make check` itself does not connect to an external database.
@@ -191,15 +197,15 @@ This is the AWS infrastructure and CPU application-layer runbook of regional mod
 | `CPU-1. Pin the CPU EKS Context and Check the Three Nodes` | Pins the kubeconfig and confirms three Ready CPU nodes, permissions and anti-affinity capacity. |
 | `CPU-2. Create or Take Over the Same-Site Legacy Aurora Serverless v2` | Creates the subnet group, SG, Aurora cluster, writer, reader and the Kubernetes DSN Secret. |
 | `2b. Deploy the Aurora Credential Refresh CronJob (Required Step When Keeping Rotation)` | Synchronises AWSCURRENT from Secrets Manager into the Kubernetes Secret; running Pods re-read the DSN through the mounted file, no rollout by default (`--restart-deployments` is a compatibility switch), and every run writes its conclusion into `last-refresh-status.json`. |
-| `CPU-2R. Aurora Credential Recovery for an Already Deployed Environment` | When the password has rotated and Pods CrashLoop, compares AWSCURRENT/AWSPREVIOUS and safely repairs the DSN. |
+| `CPU-2R. Aurora Credential Recovery for an Already Deployed Environment` | When the password has rotated and Pods CrashLoop, compares AWSCURRENT/AWSPREVIOUS and safely repairs the DSN; with mounted credentials running the refresh Job once is enough, with no Pod restart. |
 | `CPU-3. Install the AWS Load Balancer Controller` | Lets a Kubernetes LoadBalancer Service create and continuously maintain the AWS NLB/IP targets. |
 | `CPU-4. Create the Control-Plane Secrets and Deploy the Three-Tier Roles` | Configures the control-plane IAM, email, Secrets, registry, release pins and schema. |
 | `CPU-4a. Create the Control-Plane Credentials and Confirm the First Registry` | Creates three different keys; the first-deployment registry must contain the first GPU, and later decommissioning of a single cluster allows an explicit empty array. |
 | `CPU-4b. Create the Release Metadata and Initialise the Schema` | Reuses the tested wheel, computes the artifact/config/protocol pins, and runs the schema Jobs first. |
-| `CPU-4c. Deploy and Verify the Three-Tier Role Split` | Deploys in the order spool-worker -> control-worker -> ingress and runs the verifier. |
+| `CPU-4c. Deploy and Verify the Three-Tier Role Split` | After the schedulability preflight (fails closed when the roll cannot fit) rolls ingress -> control-worker -> spool-worker one at a time, then runs the verifier. |
 | `CPU-4d. Register the Regionally Shared Runtime Profile` | Uses the stable cluster ID as the registration anchor; registers when missing, requires a new version when the same version's content drifts. |
 | `CPU-4P. Wheel Reclamation After the Release Completes` | Deletes only unreferenced old ConfigMaps, protecting ReplicaSets, 0-replica Deployments and recent versions. |
-| `CPU-4U. Counter Shards Upgrade for an Already Deployed Environment` | Switches the priority counters through dual/finalize/rollback while queue=0. |
+| `CPU-4U. Counter Shards Upgrade for an Already Deployed Environment` | Switches the priority counters through dual/finalize/rollback; finalize requires queue=0, and rollback re-seeds the counts from live rows. |
 | `CPU-5 to CPU-8. Automated NLB, DNS and TLS Gates` | hosted zone/certificate -> NLB Service -> active/TLS listener -> raw DNS -> healthy targets -> CNAME -> INSYNC -> GPU Pod DNS/TLS -> Executor. |
 | `Legacy Reference: CPU-5. TCP Bootstrap of the Public NLB` | Only for recognising and migrating legacy environments; a new deployment must not substitute a non-empty hostname for the complete gate. |
 | `Legacy Reference: CPU-6. Issue a Private Certificate for the NLB AWS DNS` | The old flow bound the certificate to the raw NLB DNS; it must not be mixed with the current stable private CNAME path. |
@@ -219,7 +225,7 @@ This is the AWS infrastructure and CPU application-layer runbook of regional mod
 | Section | Walkthrough |
 |---|---|
 | `REG-1. Pin the Control-Plane and Target GPU Cluster Contexts` | Operates on exactly one explicit CPU kubeconfig and one GPU context at a time. |
-| `REG-2. Generate the Per-Cluster Token and Update the Control-Plane Registry` | Tokens are independent per cluster; other registry entries are kept; all non-zero CPU roles are rolled. |
+| `REG-2. Generate the Per-Cluster Token and Update the Control-Plane Registry` | Tokens are independent per cluster; other registry entries are kept. The registry Secret is only the seed and disaster-recovery copy of the first cluster: the durable head in Aurora is the truth, later joins/removals/rotations are published as revisions by `join-cluster`/`remove-cluster`/`rotate-token` and wait for the fleet ACK, and rolling the CPU does not import the Secret. |
 | `REG-3. Prepare the Node Action Keys and the Private CA` | Derives node-specific keys from the CPU fleet master and distributes only the public CA and per-node keys to the GPU side. |
 | `REG-4. Create the Connection Secret in the GPU EKS` | Writes the URL, cluster ID/token, namespace allowlist, HyperPod double-confirmation name and CA. |
 | `REG-5. Sync the Executor Wheel and Deploy the Cluster Action Executor` | Uploads the separate Executor wheel, configures the data-plane-specific IRSA, and verifies the artifact, compatibility digest and real claim capability. |
@@ -230,9 +236,9 @@ This is the AWS infrastructure and CPU application-layer runbook of regional mod
 | `REG-8.1.1 Management Boundary` | The script creates no customer shared infrastructure such as EKS/VPC/Aurora/ACM. |
 | `REG-8.1.2 Read-Only Checks` | `plan/status` read the release and per-cluster state without modifying resources. |
 | `REG-8.1.3 First Deployment` | Uploads artefacts, schema, CPU/GPU Deployments, Reconciler, and waits for Agent convergence. |
-| `REG-8.1.4 Upgrade, Resume and Rollback` | required keeps the old stable value, the candidate goes into compatible; finalize after the whole fleet succeeds. |
-| `REG-8.1.5 Joining a Second GPU Cluster to an Existing Control Plane` | Appends to the registry without rebuilding Aurora/NLB, requiring the current global required release. |
-| `REG-8.1.6 Removing a GPU Cluster` | Stops the target data plane first, then deletes the registry entry and rolls the CPU; removing the last GPU cluster is allowed, and the CPU control plane stays runnable with the explicit empty registry `[]`. |
+| `REG-8.1.4 Upgrade, Resume and Rollback` | The entry point is `gpu-fault-admin deploy --state-dir` (rerun the same command to resume, add `--rollback` to roll back); required keeps the old stable value, the candidate goes into compatible; finalize after the whole fleet succeeds. |
+| `REG-8.1.5 Joining a Second GPU Cluster to an Existing Control Plane` | Appends to the registry without rebuilding Aurora/NLB, requiring the current global required release; a `deploy` naming a superset of the managed set joins after the release, `join-cluster` only joins; a cluster of the other provider first stops for approval of its own Profile plan. |
+| `REG-8.1.6 Removing a GPU Cluster` | Publishes a DRAINING revision and stops the target data plane first, then publishes the REVOKED and purge revisions (no CPU roll; control-worker rolls only when the failure-domain map changes); removing the Runtime Profile registration cluster moves the anchor to a remaining cluster of the same provider, or refuses when there is none; removing the last GPU cluster is allowed, and the CPU control plane stays runnable with the explicit empty registry `[]`. |
 | `REG-8.2 Manual Release Object Inventory and Three-Tier Rollback` | Centrally records CPU/GPU wheels, bundle, template and node annotations; rollback cannot undo only ingress. |
 | `REG-9. Cluster Token Rotation` | One `gpu-fault-admin rotate-token` completes the overlap revision, GPU Secret, data-plane rollout, node fleet-wave reinstall, retirement log confirmation, atomic token file replacement, registry Secret rewrite plus CPU control-plane roll, and finalisation; resumable, `--rollback`-capable, never prints the token. The journal binds the site facts the rotation reads, not the bytes of `site.yaml`, so a release-only site rewrite does not block the resume; `deploy`/`join-cluster` preflight refuses while a rotation is unfinished. |
 | `REG-10. Bulk Migration of Node Endpoints and Credentials` | A one-shot privileged DaemonSet rewrites the CA, URL and host wheel; token rotation is now done by the REG-9 command. |
@@ -376,8 +382,9 @@ Deployments and does not automatically delete AWS stacks, queues or the AWS buil
 
 #### XID 154 Evidence and Correlation Acceptance
 
-Verifies the 30-second correlation between the seven-register evidence of XID 144-150 and the XID 154 action code.
-Missing registers or an unknown label must yield `BLOCKED_MISSING_EVIDENCE`.
+Verifies the 30-second correlation between the register evidence of XID 144-150 and the XID 154 action code: the parser accepts two or more
+registers (the firmware prints 2 or 6), and the driver branch, IntrInfo and Error Status are required. Missing ones or an unknown label must yield
+`BLOCKED_MISSING_EVIDENCE`.
 
 ### 7.5 Complete Node Agent Parameters
 
@@ -392,9 +399,10 @@ avoiding concatenating unescaped values into shell.
 
 ## 8. Email Notifications
 
-- **Role**: writes notifications asynchronously into the Aurora outbox, then the dispatcher sends via SES.
-- **Key gates**: sender/recipient, SES region, dispatcher, watermark, deduplication.
-- **Reading**: a notification ID or QUEUED does not equal delivered; wait for `SENT` and the provider ID.
+- **Role**: writes notifications asynchronously into the Aurora outbox, then the dispatcher sends through the site's notification channel: the
+  default `channel: sns` publishes to the site SNS topic (the same subscription as the AMP alerts), `channel: ses` sends through SES.
+- **Key gates**: channel readiness (a confirmed SNS subscription, or the SES sender/recipient and region), dispatcher, watermark, deduplication.
+- **Reading**: a notification ID or QUEUED does not equal delivered; wait for `SENT` and the provider ID (the SNS MessageId for SNS).
 
 ### 8.1 GPU Count Change Approval
 
@@ -418,7 +426,10 @@ unknown counts cannot be approved automatically.
 
 `CHECK_MECHANICALS` only means investigation. `gpu-fault-admin submit-remediation` derives the annotation value, trusted marker and terminal trigger from the incident record:
 `inspected` only confirms, `reset-gpu`/`reboot-node`/
-`quarantine` compile a new fenced workflow without rewriting the original incident; idempotent, and any inconsistency fails closed.
+`quarantine` compile a new fenced workflow without rewriting the original incident; `restore` creates the VALIDATE_GPU -> VALIDATE_HOST ->
+VALIDATE_FABRIC -> RESTORE_SCHEDULING validated restore of a QUARANTINED (or an ESCALATED/RECOVERED one whose workflows have all ended) incident;
+`confirm-node-action --node` confirms an unknown node action outcome on the evidence of a Ready node with its Agent ACTIVE on a new boot id.
+`--plan` only prints and writes nothing; idempotent, and any inconsistency fails closed.
 
 <a id="84-手工删除无-ttl-的-incident-审计记录"></a>
 ### 8.4 Manually Deleting Incident Audit Records Ahead of Time
@@ -579,7 +590,8 @@ re-verifies the inventory after the action.
 
 Administrators use
 `gpu-fault-admin deploy/status/join-cluster/remove-cluster/uninstall`;
-only resume and rollback still use the low-level checked commands. Editing generated, the cleanup inventory or
+resuming is rerunning the same `deploy --state-dir`, rolling back is `deploy --rollback`, and the low-level checked commands are left for
+break-glass. Editing generated, the cleanup inventory or
 online Deployments/RBAC directly is forbidden. The customer's training job YAML is a business workload and the only explicit exception.
 
 #### Example: Adding a GPU PCIe Collector
@@ -613,9 +625,10 @@ review of generated results, contracts and the full gate, staging release/rollba
 ## IV. Recommended Daily Usage
 
 1. **First regional deployment**: follow §0.1 strictly; do not run only bootstrap.
-2. **Daily releases**: first `plan/status`, confirm remote open=0, then `upgrade`.
+2. **Daily releases**: first `gpu-fault-admin status`, then `gpu-fault-admin deploy --state-dir ...`; the upgrade preflight refuses by itself
+   while remote commands are not idle, workflows are unsafe or a token rotation is unfinished.
 3. **Adding a GPU cluster**: use `gpu-fault-admin join-cluster --state-dir ...
-   --gpu-cluster-arn ...`; do not rebuild the CPU control plane.
+   --gpu-cluster-arn ...` (join only), or give `deploy` a superset of the managed set (joined after the release); do not rebuild the CPU control plane.
 4. **Node addition/replacement**: installed automatically by the Reconciler according to Node UID and the artifact/config pins.
 5. **Troubleshooting**: check the wheel/module digest first, then authentication, queue, Executor, Agent.
 6. **Destructive actions**: open in phases A -> D, each phase needing a maintenance window and rollback evidence.
@@ -653,7 +666,7 @@ the `gpu-fault-api-canary` compatibility Service; the regional path uses `gpu-fa
 
 ### A.5 Runtime Profile Selection
 
-- **Role**: declares for each capability whether this system OWNs it, DELEGATEs it, OBSERVEs it or disables it.
+- **Role**: declares for each capability whether this system OWNs it, DELEGATEs it, AUGMENTs it, OBSERVEs it or disables it (DISABLED).
 - **Key requirement**: events, Collectors, Agents, Watcher and training jobs must reference the same registered
   profile version.
 - **Common fault**: referencing an unregistered profile from a sample file leaves the Watcher at 404 forever.
@@ -693,9 +706,10 @@ This is a safe terminal state or a safe wait. Complete evidence/owner/freshness 
   is forbidden for automation and administrators alike.
 - `REPLACE_NODE` means only `HEALTHY_WARM_SPARE_ONLY`. With a qualified spare continue the checked
   warm-spare workflow; when insufficient perform the manual degraded new attempt of §8.2 or support escalation.
-- The faulty node stays isolated. Only after a node disappears through independent repair or permanent decommissioning are stale
-  fleet records cleaned via drain -> revoke; before re-admitting it as a spare, hardware acceptance, Agent convergence, the spare label,
-  the `AVAILABLE` state and the cordon must be completed.
+- The faulty node stays isolated. Once a node disappears through independent repair or permanent decommissioning, the control plane's departed-node
+  cleanup drains and revokes the stale fleet records by itself when Kubernetes, the provider and the Agent lease all prove the departure (the CLI
+  fallback is `workflow-reconcile --retire-departed-agents`; an unknown provider identity or a declared spare is only reported); before re-admitting it
+  as a spare, hardware acceptance, Agent convergence, the spare label, the `AVAILABLE` state and the cordon must be completed.
 - The generic `MARK_UNSCHEDULABLE` completion notification is still a gap, but any later notification must explicitly say
   "warm-spare only, provider replace forbidden".
 
@@ -706,7 +720,7 @@ The sub-sections kept in the main manual are for executing the alternative path 
 | `When an Alternative Remediation May Start: Preconditions` | First prove that isolation and stopping training are complete |
 | `No Need to Avoid the Warm Spare Allocation Window` | The faulty node and the spare reservation are different objects |
 | `Permitted Remediation Steps` | Only warm-spare or the §8.2 manual degradation is allowed |
-| `Cleaning Up Fleet Records After a Node Disappears Through External Repair or Permanent Decommissioning` | drain -> revoke stale Agents |
+| `Cleaning Up Fleet Records After a Node Disappears Through External Repair or Permanent Decommissioning` | The control plane drains and revokes stale Agents by itself once the three-way proof holds; CLI fallback |
 | `Adding an Independently Repaired and Re-accepted Node to the Spare Pool` | Complete the health, Agent, label, AVAILABLE and cordon gates |
 | Manual cleanup of isolation residue (only when the workflow never reached `RESTORE_SCHEDULING`) | Clean only this solution's taints/annotations |
 | `Known Gap: No Notification When Isolation Completes` | Do not rely on emails to judge whether remediation may proceed |
