@@ -32,12 +32,13 @@ The staging attestation is additionally bound to the impact-test `BASE`; when th
 selection must also be re-executed. Normal production deploys and signature verification refuse the staging-only level by default.
 
 main CI splits unit evidence into four logical domains: `runtime`, `deployment`, `fault_runner` and `postgres`;
-runtime is further split by a stable pytest nodeid hash into three signed execution shards, producing six physical shards in total.
-Each shard is bound to the source, tests, dependencies and Python/Runner environment it consumes; the PostgreSQL shard is additionally
-bound to the actual PostgreSQL image. On a shard miss only that domain is rerun; the six data sets are finally merged with
+runtime, deployment and postgres are further split by a stable pytest nodeid hash into three, four and four signed execution shards
+(`protocol.partitions` in `config/ci-unit-gate.json`) and fault_runner stays one shard, producing twelve physical shards in total.
+Each shard is bound to the source, tests, dependencies and Python/Runner environment it consumes; the PostgreSQL shards are additionally
+bound to the actual PostgreSQL image. On a shard miss only that shard is rerun; the twelve data sets are finally merged with
 `coverage combine` and checked against the production 78% combined floor, the per-module
 floors declared in `coverage.module_floors`, and the 95% statement and branch gates for production and runner respectively (deployment-only modules are visible only in the merged report). Deploy-host-only administrator source changes invalidate only the
-deployment shard and do not require retesting the unchanged application Runtime; changes to runtime shared source
+four deployment shards and do not require retesting the unchanged application Runtime; changes to runtime shared source
 conservatively invalidate the multiple shards that depend on it. Documentation-only or `.github`-only changes are verified by the current static run and may reuse
 all shards. The current commit always re-executes static, documentation/CI contract and artifact checks.
 
@@ -48,7 +49,8 @@ Administrators and customers do not write solution Manifests; the customer's own
 ## 1. Support Boundary and Normal Entry Point
 
 The only production topology is a regional CPU EKS/HyperPod control plane, Aurora PostgreSQL, a TLS NLB and one or
-more HyperPod EKS GPU clusters with `NodeRecovery=None`. Generic Kubernetes, Slurm and
+more GPU clusters: HyperPod EKS clusters with `NodeRecovery=None`, or plain EKS clusters of managed node groups
+(provider `eks-managed`, the newer and less validated form). Generic Kubernetes, Slurm and
 CPU/GPU single-cluster all-in-one are not delivery targets for new production features.
 
 The normal administrator entry point is:
@@ -71,7 +73,10 @@ gpu-fault-admin uninstall --state-dir /secure/gpu-fault \
   --cpu-cluster keep --confirm UNINSTALL_GPU_FAULT
 ```
 
-First deploys, subsequent upgrades and resumes after failure all use the first four-parameter command. `release-ref`, artifact, site,
+A first deploy uses the first four-parameter command; upgrades and resumes of an existing site may give `--state-dir` alone (the CPU/GPU ARNs
+and the administrator email are read from the site). When given, the CPU must be the site's own and the GPU set must equal the managed set or a
+superset of it (the extra clusters are joined after the release; a subset is refused with a pointer to `remove-cluster`).
+`gpu-fault-admin deploy --state-dir <state-dir> --rollback` rolls the site back one step to the recorded previous release (§8.4). `release-ref`, artifact, site,
 `release-build/release-deploy`, bundle and venv paths are internal implementation and not part of the public CLI contract.
 The hidden site mode is reserved only for internal orchestration and compatibility audits.
 
@@ -145,7 +150,7 @@ Production source files are placed by owner:
 
 | Scope | Source files |
 |---|---|
-| GPU data plane | `deploy/dataplane/*.yaml`, `deploy/dataplane/optional/*.yaml` |
+| GPU data plane | `deploy/dataplane/*.yaml`, `deploy/dataplane/dcgm-counters.csv`, `deploy/dataplane/tools/` |
 | CPU control plane | `deploy/control-plane/base/`, regional patches, `render_control_plane_role_split.py` |
 | Observability | `deploy/observability/` |
 | Node installation | `deploy/node/`, `deploy/systemd/` |
@@ -184,8 +189,11 @@ New configuration must first settle on its single source of truth:
 - Runtime Profile policy goes into versioned Profile YAML; content within the same `profile_version` cannot be overwritten;
 - Non-sensitive CPU configuration goes into ConfigMaps split by domain;
 - Administrator-mutable configuration goes into `state-dir/admin-config/desired.json`, normalized by the strict `AdminConfig`
-  schema, which produces the global and per-role digests; the public template currently contains 22 fields covering control-plane capacity/topology/remediation budget,
-  Aurora Min/Max, Processor, Workflow, notification delivery and evidence retention;
+  schema, which produces the global and per-role digests; the public template (`config/admin-config.example.yaml`) currently contains 23 fields:
+  control-plane capacity/topology, Aurora Min/Max, Processor, Workflow, notification delivery, evidence retention, and the CPU control plane's
+  rolling-update mode/interval plus its two rollback-alarm switches. The remediation budget is no longer an administrator input: one remediation
+  per node and per failure domain at a time are safety constants, the old region/cluster/resource-class caps are retired (a correlated fault is bounded
+  by each cluster's remediation storm breaker), and old YAML that still spells them only gets a warning and is otherwise ignored;
 - Tokens, passwords and private keys go into Kubernetes Secrets, Secrets Manager or controlled files outside the repository;
 - Node configuration is generated by the Installer as `/etc/gpu-fault/*.env`.
 
@@ -196,7 +204,7 @@ retry backoff is `1..30s`, and completion cluster concurrency is fixed at 1 in p
 All three CPU roles forbid Uvicorn `--limit-max-requests`: overlapping recycles of ingress during a burst reduce the
 serving processes and amplify admission waits, and worker recycles interrupt claim/lease. Process replacement must go through a checked
 Deployment rollout, Pod replacement or liveness.
-When capacity acceptance changes the telemetry spool, control-worker replicas, remediation budget or Aurora
+When capacity acceptance changes the telemetry spool, control-worker replicas, the node counts or Aurora
 Min/Max, the administrator edits `<state-dir>/admin-config.yaml` and runs `gpu-fault-admin config`.
 Within the same command the CLI generates and archives the plan SHA, while validating field upper/lower bounds, the ACU step size and Min/Max relationship,
 spool switch/replica consistency and the PostgreSQL fleet connection budget, and then writes the normalized configuration into the low-level release JSON.
@@ -307,7 +315,7 @@ Modifying the Profile affects every training job and node in the whole site that
 | Field | Meaning | Modification rule |
 |---|---|---|
 | `cluster_id` | Stable anchor used at first registration | The template keeps a placeholder; the releaser injects it from the site, and it does not change as GPU clusters are added or removed |
-| `environment` | Orchestration environment the Profile applies to | Currently fixed to `hyperpod-eks` in production |
+| `environment` | Orchestration environment the Profile applies to | `hyperpod-eks` in the HyperPod template, `eks` in the plain EKS (`eks-managed`) template |
 | `profile_version` | Immutable policy version | The template value is not used as the release version; it is generated automatically from the content digest |
 | `claims[]` | Declares the expected mode, owner and adapter for each capability | The main place to edit for policy changes |
 | `observed[]` | Declares whether the owner implementation is available and its implementation version | `OWN/DELEGATE` must have a matching fact with `available=true` |
@@ -347,10 +355,15 @@ Profile that carries warnings.
 | `nvlinkDiagnostics` | `OBSERVE/gpu-fault-node-agent` | Run the NVLink Field Diagnostic with Link ID and a fixed SHA | Switch to OWN after the tool, parameters and SHA have been validated on the site; may occupy GPUs for a long time |
 | `memoryDiagnostics` | `OBSERVE/gpu-fault-node-agent` | Run whole-card GPU memory/ECC/row-remap diagnostics | Switch to OWN after the memory diagnostic tool has been validated; a failed diagnostic usually keeps the node isolated |
 | `driverRemediation` | `OBSERVE/gpu-fault-node-agent` | Run GPU driver remediation with a fixed command and target branch | Switch to OWN only when the vendor conclusion, target version and command SHA are all present; failure may leave a partially updated state |
-| `efaDriverRemediation` | `OWN/gpu-fault-node-agent` | When the EFA PCI function exists but the `efa` driver is not bound, the Node Agent rebinds the driver (`REMEDIATE_EFA_DRIVER`) | Node Agent default `ALLOW_EFA_DRIVER_REMEDIATION=true`; before 2026-09-06 the regional template did not declare this capability, so all such incidents could only fail closed |
+| `efaDriverRemediation` | `OWN/gpu-fault-node-agent` | When the EFA PCI function exists but the `efa` driver is not bound, the Node Agent rebinds the driver (`REMEDIATE_EFA_DRIVER`) | Node Agent default `ALLOW_EFA_DRIVER_REMEDIATION=true`; while a regional template does not declare this capability, all such incidents can only fail closed |
 | `softwareFirmwareUpdate` | `OBSERVE/gpu-fault-node-agent` | Update and verify GPU or related firmware | Switch to OWN only after full acceptance in an isolated maintenance environment; an irreversible high-risk action |
 | `nodeReboot` | `OWN/gpu-fault-hyperpod-adapter` | Invoke the HyperPod in-place node reboot and wait for the new incarnation | Modify when the adapter protocol changes or phase D.1 is withdrawn; reboots the physical node |
 | `nodeReplace` | `OWN/gpu-fault-hyperpod-adapter` | Perform only the `HEALTHY_WARM_SPARE_ONLY` local switch-over | Modify when the warm-spare protocol changes or phase D.2 is withdrawn; must not call `BatchReplaceClusterNodes` |
+
+The table is the HyperPod template `config/runtime-profile.regional-hyperpod-safe.example.yaml`. A plain EKS cluster uses
+`config/runtime-profile.regional-eks-safe.example.yaml` (`environment: eks`, declared version `eks-v1`): it has no HMA, so it declares no
+`gpuDetection`/`providerHealthIsolation`; the owner of `nodeReboot`/`nodeReplace` is `gpu-fault-eks-adapter` (a reboot is EC2
+`RebootInstances`, and `nodeReplace` is likewise only the local warm-spare switch-over, never a provider replacement); every other claim matches the table.
 
 If any Node Agent capability is changed from `OBSERVE` to `OWN`, you must also:
 
@@ -494,7 +507,7 @@ empty means `hyperpod`, an unknown spelling fails closed): compare two records' 
 Aurora credential refresh is cross-role configuration: `preflight/verify` must parse both the CronJob's
 `GPU_FAULT_AURORA_RESTART_DEPLOYMENTS` and the live Role's Deployment
 `resourceNames`, and fail closed when the two sets are not exactly equal. Allowing only ingress while missing worker
-creates the hidden drift of "Secret updated, some consumers still using the old password". Since the control-plane review of 2026-09-08 (CP-3 /
+creates the hidden drift of "Secret updated, some consumers still using the old password". Since the control-plane review (CP-3 /
 H1) the refresher no longer rolls Deployments by default -- the three roles mount the whole `gpu-fault-aurora` Secret at
 `/etc/gpu-fault/aurora`, and the connection pool re-reads the DSN via `GPU_FAULT_STORE_URL_FILE`;
 `GPU_FAULT_AURORA_RESTART_DEPLOYMENTS` drives rolling only under the `--restart-deployments` (or
@@ -544,7 +557,7 @@ keeping the predecessor audit link. A restore or persistence failure keeps a res
 The new candidate must re-validate the Manifest pin, credentials and Store; Manifest drift within the same release is still refused,
 and this path does not widen the supersede or commit-live permissions.
 
-An upgrade candidate can likewise abort after the repair reaches `READY` and before the apply transaction starts (live 2026-09-18: the candidate was
+An upgrade candidate can likewise abort after the repair reaches `READY` and before the apply transaction starts (for example when the candidate is
 refused at the workflow gate), and since the release id is a digest of the source tree the original candidate will never appear again; if the journal accepted only the original candidate,
 a committed site would be locked forever by that orphan journal, and even `deploy --rollback` could not get in. Therefore
 `validate_upgrade_repair_handoff` allows the **next candidate** to take over a non-bootstrap orphan journal, provided all of the following hold:
@@ -594,9 +607,16 @@ Reinstallation after a managed `uninstall --cpu-cluster keep` completes takes a 
 `regional_release_retained_database`: the completed uninstall record, the original Aurora incarnation, the site identity
 and the new installation ID form an independent handoff, and the first use also pins a new namespace UID.
 This path stores `retained_database_origin`; it cannot copy the old namespace's empty-database origin, nor does it claim the retained database
-is empty. Every continuation re-reads the current safety state. Only a reviewed retained-schema pair (`compatible_retained_schema`, today v17-to-v18, v18-to-v19, v19-to-v20, v20-to-v21 and v21-to-v22) lets the precheck validate the full
+is empty. Every continuation re-reads the current safety state. Only a reviewed retained-schema pair (`compatible_retained_schema`, today v17-to-v18, v18-to-v19, v19-to-v20, v20-to-v21, v21-to-v22 and v22-to-v23) lets the precheck validate the full
 historical prefix and the physical heap/columns without executing old stored functions, after which the normal schema Job ensures up to the candidate version,
 and only then are business Pods allowed; older, future, missing or drifted schemas get no generic compatibility.
+
+The retained-database path and the deploy preflight's database proof both check the Aurora identity through `installation_lifecycle.aurora_binding`:
+`DBClusterIdentifier`/ARN, engine, `DbClusterResourceId`, Endpoint, database name, user, port and the managed master Secret ARN must each be equal.
+The cluster status only has to be online: `available`, `backing-up` during automated backups (always seen once within about ten minutes of creation,
+then daily) and `maintenance` during the maintenance window are accepted (`AURORA_ONLINE_STATUSES`); `creating`, `modifying`, `failing-over`, `deleting`,
+`stopped` and the like still fail closed, and the error text tells "not online: status=…" apart from "binding differs". The automated backup that always
+follows creation therefore cannot make the first deploy's preflight report a binding mismatch.
 
 Rollback first restores the full objects of the old refresher according to component progress, then lets the old program synchronize `AWSCURRENT` in Secrets Manager,
 and only then may the control plane be restarted. The old database password is never restored, nor is anything quietly repaired in verify via `set image`.
@@ -990,6 +1010,34 @@ Run at least:
   tests/fleet/test_installation_inventory.py
 ```
 
+### New Node Operation for Drain P2P
+
+`RECOVER_DRAIN_P2P` uses the existing `gpuReset` capability but has its own operation
+allowlist entry. The CPU source Manifest, the node installer and the old HyperPod installation entry point must all authorize this operation;
+the regional generated files are updated by `deployment-contracts-update`. It inherits quiesce's maintenance
+generation, GPU runtime mutual exclusion and the single-reset ledger, and adds no IAM, service or Runtime Profile
+capability.
+
+An upgrade must deliver matching control plane, Executor and Node Runtime; an old Agent rejects the unknown operation,
+so there is no downgrade in the form of "the old RESET_GPU plus a new parameter". Before a rollback, drain the pending
+workflows that contain this operation, so that an old version cannot silently interpret the new enum as a stopped task. The node's read-back of the recovery action and
+the confirmation that persistence is off are both required preconditions; with incomplete data the fault stays in handling and goes to an operator,
+and the checks are never bypassed for a direct reset. Real-node UVM persistence and driver output compatibility still need maintenance-window validation;
+local tests perform no GPU reset or node reboot.
+
+### NCCL Hung Whole-Job Summary Operation
+
+`COLLECT_HUNG_SUMMARY` uses the existing `diagnosticBundleCapture` capability; it is a separate, non-destructive
+NodeAction that depends on the host proc root. The CPU source allowlist, the node Installer and the bootstrap entry point all authorize it
+explicitly, and the generated files are updated by `deployment-contracts-update`. The operation name is defined in
+`operation_names.py` and re-exported by `models.WorkflowOperation` for compatibility.
+Control plane, Executor and Node Runtime are delivered in the existing required/compatible pin order;
+an old Agent rejects the new enum, and there is no downgrade as the old triage plus a parameter. Before a rollback, first handle in-flight workflows containing the new enum.
+No IAM, service, table or route is added; the repair of missing Store progress reuses the existing labels JSON structure.
+The application may optionally set `GPU_FAULT_RANK_PROGRESS_FILE`; it is not a CPU/Agent service setting and
+is not injected into training containers automatically. The interface, overhead limits and unverified items are in
+[NCCL hung improvements and validation](../components/nccl-hung-hardening.md).
+
 ### 6.1 Node Action Key Preparation and Synchronization
 
 `deploy/node/provision-node-action-keys.sh` calls
@@ -1364,15 +1412,15 @@ the progress stream outputs only the exception type, detailed reasons are read f
 When lease reclamation (`_reap_leases`) uses `/proc/<pid>/stat` to decide whether a CLI has exited, **the zombie state (Z) by itself is not
 evidence of exit**: snap-packaged aws/kubectl are exec'd by the Go launcher (`snap run`, `snap-exec`) from a non-main thread, and
 before the exec'ing thread takes over the pid the kernel reports the already-dead main thread as Z under the same pid and the same starttime, for a window
-of one scheduling delay. Deploy #18 on 2026-09-19 was exactly this: one shim judged a sibling shim's just-started `aws` as exited,
-found it running on re-check, and then failed its own innocent command with `cannot release a running API command`.
+of one scheduling delay. In that window one shim could judge a sibling shim's just-started `aws` as exited,
+find it running on re-check, and then fail its own innocent command with `cannot release a running API command`.
 Now, when `_identity_gone` sees Z, it first checks whether `/proc/<pid>/task/` still has live threads, then re-reads according to
 `EXIT_CONFIRMATION_DELAYS` (2/5/10/20/30 ms), and only a consistently Z or vanished entry counts as exited;
 when the reclaimer (not the lease owner) finds on re-check that the command is still running it only keeps its capacity and no longer raises, while an owner releasing a still-running command in
 `_finish_slot` is still refused.
 The failure line for a shim process exit appends the class name and text of the underlying exception after the generic text
 (`…capacity/deadline: <Error>: <detail>`): a release that failed only because of a shim otherwise leaves no diagnosable information
-(on 2026-09-18, 2 of the 20 concurrent kubectl calls in the finishing identity validation left only the bare generic line). The finishing runtime component identity validation
+(the failing ones among concurrent kubectl calls would leave only the bare generic line). The finishing runtime component identity validation
 (`validate_runtime_component_identity`) retries the read-only Pod list and module digest probes once in place after the first failure,
 counting an error only if they fail again: one shim hiccup must not judge a candidate that has already fully rolled out as failed and trigger a rollback.
 The ledger here is `budget.sqlite3` inside the single command's temporary directory on the deploy host, using the Python standard library SQLite
@@ -1665,9 +1713,7 @@ digest is compared item by item and resourceVersion CAS is used. A digest change
 The join retry, the compensation, remove-cluster and the CPU key delete both end in read a saved digest map back through one
 validator (`src/gpu_fault/admin/cluster_node_key_digests.py`): a digest is exactly 64 lowercase hex characters, the form
 `hashlib`'s `hexdigest` writes, never folded to lowercase, and the map names exactly the proved nodes. A malformed digest is
-refused where it is first read, naming the nodes (never the value), so compensation runs no undo step first. Compensation used
-to check only for 64 characters: an uppercase or non-hex digest passed its ownership proof and the undo steps after it until the
-final CPU key delete refused it.
+refused where it is first read, naming the nodes (never the value), so compensation runs no undo step first.
 Compensation of a join that already committed the site must complete the release state repair even if it finds the local site already recovered; cleaned-up
 resources must send explicit terminal updates such as `DELETED/DETACHED` under their original immutable identity, and the Aurora record cannot be assumed withdrawn just because it was
 omitted from the upsert list.
@@ -1840,6 +1886,14 @@ it continues to verify the GPU clusters and the absence of the original resource
 | `remediation-storm release\|abort` | Checks that `--cluster-id` is a managed cluster, `--reason` (<=512) and `--reference`; `--dry-run` reads only; execution takes the site operation lock, re-reads the site and writes the breaker by compare-and-set through `workflow_reconcile.remediation_storm_action` in the Pod (release: CLOSED, window emptied; abort: ABORTED, and every `PENDING`/`SAFETY_PENDING` workflow held on `storm:<cluster>` becomes `SUPERSEDED` with a `REMEDIATION_STORM_ABORTED` event and its incident `ESCALATED`); evidence under `remediation-storm/<cluster>/<action>-<time>-<digest>.json` | A release of a closed breaker is a no-op; abort writes and reports each workflow on its own, any failure is `partial` with exit 1, and a rerun handles only the rows still held; on a deployed image that predates the breaker the Pod script refuses |
 | `aurora-failback` | Without `--confirm` read-only: the placement (writer, every member's zone/status/promotion tier, the zones of the nodes the Running api-ha and control-worker Pods are on) and the target member (`available` in the first zone of `writer_first_zones` counted by Pod, lowest tier); `--confirm AURORA_FAILBACK` with a valid `--reference` re-reads the site under the site operation lock, refuses an unfinished release transaction and PENDING/LEASED/WAITING remote commands by the rule of `rotate_token.ensure_rotation_allowed` and an active destructive workflow by the deploy preflight's `workflow_safety`, journals `PLANNED`, calls `ensure_writer_zone_affinity` (`failover-db-cluster --target-db-instance-identifier`, bounded wait for `available` with the target as the one writer), journals `CLUSTER_AVAILABLE`, then journals `CONTROL_PLANE_HEALTHY` after `wait_control_plane_ready` and one Store read over a fresh connection in the ingress Pod, and ends `COMPLETED` (`aurora-failback/<run-id>.json`) | A writer already in that zone is a `NOOP`; a cluster that is not `available`, has no single writer or no available member in that zone is refused, and a refusal writes no journal; rerun after an interruption or a failed wait: when the writer has moved back it finishes that journal's waits, otherwise that journal is marked `SUPERSEDED` and the run executes again; the engine primitives run inside `rotate_token.site_process_environment`; never automatic |
 | `deploy --rollback` | Under lock re-read the live state, take only the committed previous, run the rollback under supervision, then align the management site/configuration and sync-state | No independent build, no second lifecycle transaction started in parallel; neither an engine failure nor a management-plane alignment failure may report success, and the old transaction should first resume in its original direction |
+| `prepare-eks-nodegroup` | Read-only plan by default: per plain EKS managed node group what is compliant, what would change and the exact commands, plus Kubernetes findings that are reported and never changed; `--apply --confirm PREPARE_EKS_NODEGROUP --reference` re-plans and runs it (launch template user data installing `python3.12`/`strace`, node auto repair off, the ownership label, `updateStrategy` MINIMAL, the roll and an SSM check of the new nodes), with journal and log under `--state-dir`, or `--work-dir` before a site exists (`admin/eks_nodegroup_prepare.py`) | Completed steps are skipped, so a rerun after a stop converges; with `--state-dir` the site name must equal the derived site id and the apply holds the site administrator lock; the roll wait defaults to 90 minutes, at most 360; covers only `AL2023_x86_64_NVIDIA` node groups with a launch template, others follow the manual steps |
+| `cpu-rolling-update` | Run the deploy's last step now: create or re-point the two CPU rollback alarms and write the `spec.cpuControlPlane.rollingUpdate` schedule to the CPU HyperPod (delete, read back, create, read back); the `cpu_rolling_update` check of `status --full` names this verb (`admin/cpu_rolling_update_command.py`) | Holds the site operation lock; deferred while an AMI update is in flight or the next scheduled window is near; never adds a schedule to a group that has none |
+| `replace-resource` | Without `--confirm` read-only: for the named keys it rebuilds the registry from the bootstrap state as the deploy completion step does (without those rows) and shows the replacement rows with live proofs (the recorded resource is gone or detached, the replacement is this site's); `--confirm REPLACE_RESOURCE` with `--reference` re-plans under the site operation lock, journals `PLANNED`, sends the transition to the registry API -- one transaction in which each recorded row moves unchanged to `retired/<key>/<digest>` and its replacement takes the key -- and journals `COMMITTED` (`admin/resource_replacement.py`) | The only supported path after a recorded resource identity was really replaced, never run automatically; refused while an uninstall or remove-cluster is open; a rerun resends the same transition (the API accepts one it already stored); the next deploy (a NOOP one too) or config re-roll records a successful sync |
+
+`site-id`, `node-scope` (without `--converge`), `failure-domain-map` and `hyperpod-scheduled-update` are read-only: the first two see §8.1;
+`failure-domain-map` shows the node failure-domain ConfigMap that deploy/join-cluster/remove-cluster render and apply automatically, and the nodes it leaves unmapped;
+`hyperpod-scheduled-update` only prints the `aws sagemaker update-cluster` commands that remove the scheduled update of the HyperPod instance groups the site manages,
+or (`--rolling`) make that schedule roll one instance at a time with rollback alarms; the operator runs them.
 
 The token journal pins the values and types of `keep_window`, `window_minutes`, `quiet_seconds` and
 `acceptance_timeout_seconds`. An in-flight resume and a post-commit resume with only temporary file cleanup left must both
@@ -1928,6 +1982,10 @@ subsequent site commands are bound to the current CLI's interpreter directory to
 which would wrongly fall back to the system environment; the inherited `PYTHONHOME` is removed so it cannot override the verified venv's package paths.
 The verified executor then puts the API quota shim first; the operation lock and deadline continue to be passed through;
 there is no need to activate the internal content-addressed venv, and the interpreter selection on GPU nodes is unchanged.
+The release engine's `gpu_fault_release.rollout.Runner` likewise puts its own interpreter directory first, through `python_environment`, for every
+subcommand it starts: deployment tools such as `apply-control-plane-role-split.sh` call the same repository's scripts with a bare `python3`, so
+acceptance drivers that construct a `Runner` directly no longer depend on whether the operator's shell activated a venv (otherwise a system
+`python3` without `gpu_fault` fails the upgrade and the automatic rollback alike); the API quota shim still comes before it.
 The internal hand-off that starts the verified CLI also removes the old `PYTHONPATH` and explicitly binds this run's repositoryRoot,
 so an old checkout cannot shadow the installed code; later site scripts use only the source paths of the bound repository.
 Removal/rotation entry points that receive a complete environment must not layer the original environment on top again and bring back the removed `PYTHONHOME`;
@@ -1951,7 +2009,8 @@ make PYTHON=.venv/bin/python release-build \
   RUNTIME_IMAGE_REPOSITORY=<registry/repository>
 ```
 
-This target requires a clean source tree; it runs static first, then runs ordinary pytest,
+This target requires a clean source tree and a set `GPU_FAULT_TEST_POSTGRES_URL` (missing, it exits 2 before any gate; a local build driven by the
+source deploy gets that connection from the isolated PostgreSQL allocation described below); it runs static first, then runs ordinary pytest,
 PostgreSQL stress and the source-only artifact with 1 to 3 lanes according to CPU capacity. Once all pass, it uses the hashed requirements exported from `uv.lock`
 to prepare the runtime image. The first ARN deploy creates ECR and completes the login first, then builds the control-plane/executor wheels with the same
 target; an independent build provides the repository explicitly. The image identity computes a canonical image input digest from the
@@ -2219,9 +2278,9 @@ The deployment phases are:
    `transaction_committed=false`: rerunning deploy with the same candidate resumes into commit; a deploy with a **different candidate**
    first commits that live transaction under its own identity (`commit_live_release`→`save_recorded_state`, not
    `save_state`, otherwise the candidate's digests would overwrite the state describing the live release), then opens its own transaction with it as `previous`, and
-   stderr prints `commit-live-release release_id=… reason=…`. The verify of deploy #25 on 2026-09-09 failed because
-   the check itself was defective; the old candidate could never pass verify and the new candidate was refused by the engine with
-   `resume release_id does not match the candidate`; this path was added for exactly that.
+   stderr prints `commit-live-release release_id=… reason=…`. Without this path, a verify that fails because the check itself is
+   defective would leave the old candidate unable ever to pass verify while the engine refuses the new candidate with
+   `resume release_id does not match the candidate`.
 9. `release-summary.json` is generated only once, at the end; NOOP only registers the new release state and runs one full
    verify, skipping the mutating deploy, the repeated quick verifiers and the stability window.
 
@@ -2366,7 +2425,7 @@ During a release there must be no further build, and no manual editing of Deploy
 5. Run the required generators and review the generated Manifests, cleanup inventory and environment variable reference.
    A PostgreSQL DDL change also appends a consecutive schema migration; the current baseline is
    `schema_migrations.LATEST_POSTGRES_SCHEMA_VERSION` (currently v23), the new migration version number
-   must be consecutive +1 (the next version is v19), and it must pass `make test-postgres-stress` or the CAP-005 runner.
+   must be consecutive +1 (the next version is v24), and it must pass `make test-postgres-stress` or the CAP-005 runner.
 6. Run the first-step build and sign:
 
    ```bash
@@ -2461,8 +2520,8 @@ mode or reappear in the deployable Manifests. The candidate `preflight_retired_c
 that the old producer Deployment has been decommissioned; for the handling order of old queues and evidence see the Deployment and Operations
 Manual §7.4. Nothing here changes the Runtime Profile's AWS provider responsibilities or any recovery authorization.
 
-When fixing a transitive dependency reported by pip-audit, do not hand-edit the locks: `uv.lock` is the single source, and the three locks are exported by the commands recorded in their own file
-headers. Closing the 6 PYSEC entries of urllib3 2.3.0 on 2026-09-07 followed exactly this route: urllib3 is a transitive dependency of
+When fixing a transitive dependency reported by pip-audit, do not hand-edit the locks: `uv.lock` is the single source, and the runtime, deploy-host and node-runtime locks are exported by the `uv export` commands recorded in their own file
+headers (`build.lock` is compiled from `build.in`, see below; `node-tools.lock` only pins the py-spy Linux wheel by hand). Closing the 6 PYSEC entries of urllib3 2.3.0 followed exactly this route: urllib3 is a transitive dependency of
 botocore/requests/kubernetes, pinned by the `urllib3<2.4.0` of `kubernetes==34.1.0`,
 so `kubernetes>=31,<35` in `pyproject.toml` was relaxed to `<36`, and uv 0.8.12 (the same exporter as the existing locks,
 able to reproduce both exports byte for byte) ran `uv lock --upgrade-package kubernetes --upgrade-package
@@ -2492,7 +2551,7 @@ the control-plane and executor runtime images while the module digests stay equa
 
 ### 9.4 The Regional Release Orchestrator Is a Package; Coverage Floors for Deployment-side Source
 
-The regional release orchestrator (rollout / rollback / join / status and so on, 75 modules, about 31 thousand lines) is the
+The regional release orchestrator (rollout / rollback / join / status and every other module) is the
 `src/gpu_fault_release/` package, whose entry module is `src/gpu_fault_release/rollout.py`; modules import each other exclusively with
 `from gpu_fault_release.<module> import …` absolute imports. It used to be
 a pile of scripts in `deploy/control-plane/regional/*.py` importing each other by bare name, loadable only by pushing that directory into
@@ -2557,7 +2616,7 @@ delivery do not change these runtime safety conditions. Every blocker is also at
 `destructive_workflows_by_cluster`): a `join-cluster`'s preflight and waves gate on the joining cluster's counts
 (`gpu_fault_release.regional_verify_scope`), every other release on the totals.
 
-`coverage.sources` in `config/ci-unit-gate.json` (schema 4) lists five source roots under test:
+`coverage.sources` in `config/ci-unit-gate.json` (schema 5) lists five source roots under test:
 the production scope is `src/gpu_fault`, `src/gpu_fault_release`, `deploy/control-plane/tools`, and the
 runner scope is `scripts/e2e/regional`, `tools`. The two scopes are measured independently and each enforces 95% statement/branch;
 the production scope's 78% combined floor and the original per-module floors are kept. The two deployment-only roots also
@@ -2583,13 +2642,16 @@ the original implementation. JSON continues to be validated at runtime at the or
 
 Every module of the deployment-side source must belong to a `coverage.module_floors` family
 (guarded by `tests/test_ci_unit_gate.py::test_module_floors_cover_every_deployment_only_source_file`):
+`administrator-tools` (`src/gpu_fault/admin/*.py`), `release-state-snapshot` (`src/gpu_fault/release_state_snapshot.py`),
+`failure-domains` (`src/gpu_fault/failure_domains.py`),
 `regional-release-orchestrator` (`src/gpu_fault_release/regional_release_*.py`,
 `rollout.py` and `__init__.py`), `regional-deployment-support` (the remaining
 `src/gpu_fault_release/regional_*.py` listed by name), `control-plane-tools`
 (`deploy/control-plane/tools/*.py`). Floors come from the first measurement: the family floor is the measured value rounded down minus 2, and
-the file floor is the lowest file in the family rounded down; the purpose is to stop the numbers sliding, not to claim compliance. To raise a floor: run
-`make coverage-shard COVERAGE_SHARD=deployment COVERAGE_SHARD_ROOT=/tmp/x`, generate the report with
-`coverage json` (with the three roots in `source`), confirm that `python scripts/ci_coverage_gate.py module-floors
+the file floor is the lowest file in the family rounded down; the purpose is to stop the numbers sliding, not to claim compliance. To raise a floor: take a
+merged report -- the `coverage.json` in the `coverage-evidence` artifact the CI `unit` job uploads, or the `artifacts/coverage-local.json` that a local
+`make coverage` (needs `GPU_FAULT_TEST_POSTGRES_URL`) writes; a single `deployment_<i>` shard holds only its partition's tests and cannot measure on its own --
+confirm that `python scripts/ci_coverage_gate.py module-floors
 --coverage-json <report>` passes, then write the new integer into the corresponding family; it may only go up. When adding a
 `gpu_fault_release` module, add it to the `globs` of `regional-deployment-support` (or create a new family),
 otherwise that guard test fails.
