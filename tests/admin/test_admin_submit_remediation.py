@@ -144,6 +144,7 @@ def test_inspected_plan_writes_only_the_acknowledgement_derived_from_the_record(
     plan = _build("inspected", reference="CHG-1")
 
     assert plan.action is None and plan.marker is None and plan.terminal is None
+    assert plan.reference == "CHG-1", "no marker carries it, so the plan does"
     assert plan.acknowledgement_value == f"{INCIDENT}:7"
     assert plan.pending_nodes == ("node-a",)
     assert plan.next_operations == ("RESTORE_SCHEDULING", "RESTART_WORKLOAD")
@@ -384,6 +385,31 @@ def test_inspected_annotates_the_node_and_is_a_no_op_the_second_time(
     assert len(harness.evidence()) == 2
 
 
+@pytest.mark.parametrize("reference", ["CHG-41", None])
+def test_inspected_records_the_reference_on_its_plan_and_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reference: str | None
+) -> None:
+    harness = Harness(tmp_path, monkeypatch)
+
+    reviewed = harness.submit("inspected", reference=reference, plan_only=True)
+    assert reviewed.as_dict()["plan"]["reference"] == reference, (
+        "the --plan output names the change the acknowledgement is recorded under"
+    )
+    assert harness.evidence() == [], "a plan writes no evidence"
+
+    first = harness.submit("inspected", reference=reference)
+    second = harness.submit("inspected", reference=reference)
+
+    assert (first.no_op, second.no_op) == (False, True)
+    recorded = [
+        json.loads(path.read_text(encoding="utf-8")) for path in harness.evidence()
+    ]
+    assert [(item["status"], item["plan"]["reference"]) for item in recorded] == [
+        ("SUBMITTED", reference),
+        ("NO_OP", reference),
+    ], "every inspected evidence file records --reference, the rerun's included"
+
+
 def test_annotation_conflict_stops_the_operator_action(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -465,6 +491,12 @@ def test_hardware_disposition_acknowledges_then_submits_marker_and_terminal(
     assert (
         evidence["plan"]["marker"]["marker_id"]
         == f"marker-operator-{INCIDENT}-reset-gpu"
+    )
+    assert evidence["plan"]["reference"] == "CHG-9", (
+        "a hardware disposition's evidence names its change like inspected's"
+    )
+    assert evidence["plan"]["marker"]["raw_reason"].endswith("; reference CHG-9"), (
+        "the marker keeps carrying the change reference"
     )
 
 

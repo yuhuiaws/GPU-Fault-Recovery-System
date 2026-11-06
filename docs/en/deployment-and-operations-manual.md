@@ -9898,9 +9898,9 @@ needs `--node`, and `--reference` unless `--plan` is given, see item 9).
    decision does not carry this marker, the command refuses, and you should first check whether that decision/workflow already has the required remediation.
 7. **Evidence**: `<state-dir>/submit-remediation/<incident-id>/<disposition>-<time>.json`
    records the operator ARN, the complete plan, the annotation result and the decision/plan/workflow IDs. `--reference`
-   reaches the file through the plan: in the marker's `raw_reason` for a hardware remediation, in the incident reason for
-   `restore`, in the confirmation record for `confirm-node-action`; the evidence file of `inspected` does not record it
-   today, so keep the change ID elsewhere.
+   reaches the file through the plan: in the plan's `reference` for `inspected` and a hardware remediation (which also
+   writes it into the marker's `raw_reason`), in the incident reason for `restore`, in the confirmation record for
+   `confirm-node-action`; the `--plan` output carries it the same way.
 8. **`restore` (validated restore after a QUARANTINED node is repaired)**:
    `gpu-fault-admin submit-remediation --state-dir ... --incident-id <QUARANTINED incident>
    --disposition restore --reference CHG-xxxx [--plan]`. All preconditions are checked before writing, refusing if any fails:

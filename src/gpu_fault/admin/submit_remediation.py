@@ -229,12 +229,17 @@ class RemediationPlan:
     workload_source: str | None = None
     resubmission: bool = False
     warnings: tuple[str, ...] = ()
+    # ``--reference``: the change the disposition is recorded under. For
+    # ``inspected`` (no marker) the plan is the only record that carries it
+    # into the evidence file; a hardware marker repeats it in ``raw_reason``.
+    reference: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "incident_id": self.incident_id,
             "cluster_id": self.cluster_id,
             "disposition": self.disposition,
+            "reference": self.reference,
             "node_ids": list(self.node_ids),
             "gpu_uuids": list(self.gpu_uuids),
             "fencing_token": self.fencing_token,
@@ -680,6 +685,7 @@ def build_remediation_plan(
         workload_source=source,
         resubmission=resubmission,
         warnings=tuple(warnings),
+        reference=reference,
     )
 
 
@@ -1271,8 +1277,11 @@ def add_submit_remediation_command(
         "--reference",
         metavar="CHANGE_ID",
         help=(
-            "change ticket recorded on the marker and the evidence file; required "
-            "by confirm-node-action unless --plan is given"
+            "change ticket recorded on the plan and the evidence file of every "
+            "disposition (also on the marker of reset-gpu/reboot-node/quarantine, "
+            "the incident reason of restore and the confirmation record of "
+            "confirm-node-action); required by confirm-node-action unless --plan "
+            "is given"
         ),
     )
     command.add_argument(
