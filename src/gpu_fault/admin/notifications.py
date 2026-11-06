@@ -44,6 +44,9 @@ class NotificationRouting:
     recipients: tuple[str, ...]
     subject_prefix: str
     channel: str = NOTIFICATION_CHANNEL_SNS
+    #: The site's ``sesConfigurationSet``; on ``ses`` the role gets one
+    #: ``ses:SendEmail`` statement on it (``control_plane_policy_document``).
+    ses_configuration_set: str | None = None
 
     @property
     def uses_ses(self) -> bool:
@@ -209,6 +212,7 @@ def site_notification_routing(
         recipients=config.email_recipients or (admin,),
         subject_prefix=config.email_subject_prefix,
         channel=config.channel,
+        ses_configuration_set=config.ses_configuration_set,
     )
 
 

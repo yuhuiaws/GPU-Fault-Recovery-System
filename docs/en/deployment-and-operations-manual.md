@@ -2618,7 +2618,8 @@ The regional control plane and the old single-cluster `deploy/hyperpod/deploy.sh
 `gpu-fault-<site-id>-control` (`bootstrap_iam_policies.control_plane_policy_document`): the SageMaker reads and
 `DepartedNodeInstanceReads` above, then only the permissions of the channel selected by `spec.notifications.channel` -- for SNS,
 `sns:Publish` on the site topic (`AdministratorNotificationTopic`); for `channel: ses`, `ses:SendEmail` restricted to the sender
-(`ses:FromAddress`, `AdministratorEmail`); and, when `site.yaml` `spec.retention` names an archive bucket, `s3:PutObject` on that
+(`ses:FromAddress`, `AdministratorEmail`), plus the same restricted grant on a declared `sesConfigurationSet`
+(`AdministratorEmailConfigurationSet`); and, when `site.yaml` `spec.retention` names an archive bucket, `s3:PutObject` on that
 prefix (`ControlRecordArchive`). In the manual procedure a `channel: sns` site (the default) must grant `sns:Publish` on the
 site topic on the same role itself. Setting only `GPU_FAULT_ALLOW_EMAIL=true` does not fill in
 the permissions; when the CPU EKS Pod Identity role lacks `ses:SendEmail`, notifications are still saved, but the delivery result is
@@ -9277,18 +9278,20 @@ notification digest is kept; rollback restores the actually captured old ConfigM
 The validation entry point is `src/gpu_fault_release/regional_notifications.py::check_notification_channel`.
 
 bootstrap grants the CPU Pod Identity role the least privilege of the selected channel: for SES an
-`ses:SendEmail` on the `emailSender` identity restricted by `ses:FromAddress`, for SNS `sns:Publish` on the site topic. Declaring
-`sesConfigurationSet` does not widen that grant ([security and parameters reference §5.1](security-and-parameters-reference.md#51-mail-notification-boundaries)).
-The AWS Service Authorization Reference page "Actions, resources, and condition keys for Amazon Simple Email Service v2"
+`ses:SendEmail` on the `emailSender` identity restricted by `ses:FromAddress` (`AdministratorEmail`); when `sesConfigurationSet` is
+declared, one more `ses:SendEmail` on that configuration set only (`arn:aws:ses:<region>:<account>:configuration-set/<name>`),
+restricted by `ses:FromAddress` to the same `emailSender` (`AdministratorEmailConfigurationSet`), and without one the policy is
+unchanged byte for byte; for SNS `sns:Publish` on the site topic ([security and parameters reference §5.1](security-and-parameters-reference.md#51-mail-notification-boundaries)).
+The basis is the AWS Service Authorization Reference page "Actions, resources, and condition keys for Amazon Simple Email Service v2"
 (https://docs.aws.amazon.com/service-authorization/latest/reference/list_sesv2.html; the page prints no date, fetched 2026-11-06 with
-Last-Modified 2026-11-06) gives SendEmail ("Grants permission to send an email message") in its "Actions defined by Amazon Simple Email
-Service v2" table the "Resource types (*required)" `configuration-set` and the required `identity*`, and its "Resource types defined by
-Amazon Simple Email Service v2" table gives `arn:${Partition}:ses:${Region}:${Account}:identity/${IdentityName}` and
-`arn:${Partition}:ses:${Region}:${Account}:configuration-set/${ConfigurationSetName}`: a send through a configuration set names the
-latter as well. So before declaring one, grant the control-plane role `ses:SendEmail` on that configuration set
-(`arn:aws:ses:<region>:<account>:configuration-set/<name>`) yourself; bootstrap rewrites only its own inline policy
-`GPUFaultRegionalObserve` (the evidence is `SES_SEND_EMAIL_RESOURCES_EVIDENCE` in `src/gpu_fault/admin/bootstrap_iam_policies.py`).
-The SES preflight additionally needs
+Last-Modified 2026-11-06): its "Actions defined by Amazon Simple Email Service v2" table gives SendEmail ("Grants permission to send an
+email message") the "Resource types (*required)" `configuration-set` and the required `identity*`, with `ses:FromAddress` among the
+condition keys of `configuration-set` (its "Condition keys for Amazon Simple Email Service v2" table defines it as: Filters access by the
+"From" address of a message); its "Resource types defined by Amazon Simple Email Service v2" table gives
+`arn:${Partition}:ses:${Region}:${Account}:identity/${IdentityName}` and
+`arn:${Partition}:ses:${Region}:${Account}:configuration-set/${ConfigurationSetName}`, and a send through a configuration set names the
+latter as well (the evidence is `SES_SEND_EMAIL_RESOURCES_EVIDENCE` in `src/gpu_fault/admin/bootstrap_iam_policies.py`; not
+live-verified, see [validation limitations](../validation-limitations.md)). The SES preflight additionally needs
 `ses:GetEmailIdentity`, `ses:GetAccount` (and the right to create the identity when it does not exist); SNS sites need no SES identity.
 
 When SES is needed, change `spec.notifications.channel` of the generated site to `ses`, not the identity, credentials, allowlist or release pins;

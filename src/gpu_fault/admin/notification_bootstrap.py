@@ -88,6 +88,7 @@ def notification_bootstrap_tasks(
             namespace=namespace,
             site_id=site_id,
             email_sender=routing.sender if uses_ses else None,
+            ses_configuration_set=routing.ses_configuration_set if uses_ses else None,
             sns_topic_arn=None if uses_ses else site_sns_topic_arn(cpu, site_id),
             archive_s3_uri=archive_s3_uri,
         ),

@@ -228,6 +228,53 @@ def test_notification_tasks_send_as_the_routing_sender_and_alert_the_admin(
     assert calls["ensure_monitoring_resources"]["state"] is state
 
 
+@pytest.mark.parametrize(
+    ("channel", "granted"), [("ses", "gpu-fault-alerts"), ("sns", None)]
+)
+def test_the_role_task_grants_the_declared_configuration_set_on_ses_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, channel: str, granted: str | None
+) -> None:
+    """The set the site declares reaches the role's policy on the SES channel;
+    on SNS it is carried unused and the role holds no SES grant at all."""
+
+    calls: dict[str, dict[str, Any]] = {}
+
+    def spy(name: str):
+        def record(runner: Any, **kwargs: Any) -> dict[str, str]:
+            calls[name] = kwargs
+            return {"name": name}
+
+        return record
+
+    for target in (
+        "ensure_control_plane_role",
+        "ensure_email_notifications",
+        "ensure_monitoring_resources",
+    ):
+        monkeypatch.setattr(admin_notification_bootstrap, target, spy(target))
+    routing = NotificationRouting(
+        sender="alerts@example.com",
+        recipients=("oncall@example.com",),
+        subject_prefix="",
+        channel=channel,
+        ses_configuration_set="gpu-fault-alerts",
+    )
+
+    tasks = notification_bootstrap_tasks(
+        Runner(),
+        state=_state(tmp_path),
+        cpu=_cpu(),
+        cpu_kubeconfig=tmp_path / "cpu.kubeconfig",
+        namespace="gpu-fault-system",
+        site_id="site-a",
+        admin_email="ops@example.com",
+        routing=routing,
+    )
+    tasks["control_plane_role"]()
+
+    assert calls["ensure_control_plane_role"]["ses_configuration_set"] == granted
+
+
 def test_sns_tasks_grant_publish_on_the_site_topic_and_no_ses(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -361,6 +408,7 @@ def test_a_regenerated_site_keeps_each_declared_notification_field(
         recipients=config.email_recipients,
         subject_prefix=config.email_subject_prefix,
         channel="ses",
+        ses_configuration_set=config.ses_configuration_set,
     ), "the notification tasks must act on the same contract the site declares"
 
 

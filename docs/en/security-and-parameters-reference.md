@@ -711,7 +711,9 @@ Clusters not in the ACTIVE lifecycle state are refused on this path.
   letters, digits, hyphens or underscores. Its value is declared by site.yaml, rendered into the
   `GPU_FAULT_SES_CONFIGURATION_SET` of the three CPU role ConfigMaps and enters the rollback environment; when not declared the variable is cleared explicitly and must not inherit
   the value from the deploy-host shell. Once declared, preflight must confirm that the SES configuration set exists, the name matches and sending is allowed;
-  it does not create it automatically or widen IAM permissions. Rollback restores the actually captured old ConfigMaps and per-role env; the candidate configuration must not
+  it does not create it automatically. bootstrap adds one `ses:SendEmail` statement on that configuration set's ARN only
+  (`AdministratorEmailConfigurationSet`), restricted by `ses:FromAddress` to the same `emailSender`, and widens no other IAM permission;
+  without a declared set the policy is unchanged byte for byte. Rollback restores the actually captured old ConfigMaps and per-role env; the candidate configuration must not
   overwrite the old notification environment.
 - The sender of a native SNS email subscription is the AWS-managed `no-reply@sns.amazonaws.com`;
   `emailSender` only controls the SES fault/action notifications sent directly by this solution.

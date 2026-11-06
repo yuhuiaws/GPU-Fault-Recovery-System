@@ -606,9 +606,11 @@ The notification contract a deploy keeps -- every declared `spec.notifications`
 field over the bootstrap defaults, and the routing the role, SES identity and
 Secret tasks converge on -- is covered by unit tests with fake SES, SNS and IAM
 readers. No site here uses
-`channel: ses`, and the operations manual's `ses:SendEmail` grant on a declared
-configuration set rests on the AWS Service Authorization Reference listing
-`configuration-set` as a SendEmail resource type, not on a live send through one.
+`channel: ses`, and bootstrap's `ses:SendEmail` statement on a declared
+configuration set (`AdministratorEmailConfigurationSet`, conditioned on the
+sender's `ses:FromAddress`) rests on the AWS Service Authorization Reference
+listing `configuration-set` as a SendEmail resource type with that condition
+key, not on a live send through one.
 
 ## Release signing: Rekor 409 recovery
 

@@ -9316,7 +9316,9 @@ The lock name may in future be subdivided by explicit endpoint scope; for now th
      - `sns` (the admin CLI default channel): the `Resource` of `sns:Publish` is scoped exactly
        to this site's alert Topic ARN, and there is **no** `ses:SendEmail`;
      - `ses`: the `Resource` of `ses:SendEmail` is scoped to the `identity/*` ARN of the
-       verified sender identity with a `FromAddress` condition, and there is **no** `sns:Publish`;
+       verified sender identity with a `FromAddress` condition (with `sesConfigurationSet` declared,
+       one more statement scoped only to that configuration set's ARN with the same `FromAddress`
+       condition), and there is **no** `sns:Publish`;
      - `disabled`: both `sns:Publish` and `ses:SendEmail` are absent.
 - Verdict:
   - in step 2 every write verb is `no` (except the resources in its own namespace needed for notification/evidence);

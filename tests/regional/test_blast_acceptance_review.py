@@ -215,6 +215,10 @@ def test_record_case_cannot_keep_pass_when_release_identity_is_unknown(
         ("ses", "wrong-sa"),
         ("ses", "service-wildcard"),
         ("ses", "extra-channel"),
+        ("ses", "configuration-set"),
+        ("ses", "undeclared-configuration-set"),
+        ("ses", "other-configuration-set"),
+        ("ses", "configuration-set-without-condition"),
         ("sns", "none"),
         ("sns", "topic-wildcard"),
         ("sns", "missing-topic"),
@@ -288,9 +292,26 @@ def test_cpu_permission_audit_checks_actual_identity_and_sender_scope(
         statements.append(
             {"Effect": "Allow", "Action": "sage*:UpdateCluster", "Resource": "*"}
         )
+    # A declared SES configuration set gets one more SendEmail statement on
+    # that set's ARN, same FromAddress condition; any other set statement fails.
+    if "configuration-set" in defect:
+        if defect != "undeclared-configuration-set":
+            runner.config["notifications"]["ses_configuration_set"] = "alerts"
+        statements.append(
+            {
+                "Effect": "Allow",
+                "Action": "ses:SendEmail",
+                "Resource": "arn:aws:ses:us-west-2:000000000000:configuration-set/"
+                + ("other" if defect == "other-configuration-set" else "alerts"),
+                "Condition": {}
+                if defect == "configuration-set-without-condition"
+                else {"StringEquals": {"ses:FromAddress": "sender@example.com"}},
+            }
+        )
+    passes = defect in {"none", "configuration-set"}
     monkeypatch.setattr(runner, "iam_role_policies", lambda role: (statements, {}))
-    assert runner.run() == (0 if defect == "none" else 1)
-    assert evidence(runner)["verdict"] == ("PASS" if defect == "none" else "FAIL")
+    assert runner.run() == (0 if passes else 1)
+    assert evidence(runner)["verdict"] == ("PASS" if passes else "FAIL")
 
 
 @pytest.mark.parametrize(

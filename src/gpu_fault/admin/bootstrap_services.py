@@ -531,6 +531,7 @@ def ensure_control_plane_role(
     email_sender: str | None = None,
     archive_s3_uri: str | None = None,
     sns_topic_arn: str | None = None,
+    ses_configuration_set: str | None = None,
 ) -> dict[str, str]:
     _ensure_pod_identity_agent(runner, cpu, site_id)
     _ensure_service_account(
@@ -552,6 +553,7 @@ def ensure_control_plane_role(
             email_sender=email_sender,
             archive_s3_uri=archive_s3_uri,
             sns_topic_arn=sns_topic_arn,
+            ses_configuration_set=ses_configuration_set,
         ),
         site_id=site_id,
     )

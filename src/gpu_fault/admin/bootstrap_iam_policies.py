@@ -21,16 +21,16 @@ __all__ = [
     "executor_policy_document",
 ]
 
-#: Why the control plane's SES grant names the sender identity only, and what
-#: an operator who declares ``spec.notifications.sesConfigurationSet`` grants
-#: beside it. The SES v2 actions table gives SendEmail the resource types
+#: Why a declared ``spec.notifications.sesConfigurationSet`` gets a statement of
+#: its own. The SES v2 actions table gives SendEmail the resource types
 #: ``configuration-set`` and the required ``identity*``, and the resource-type
 #: table gives both ARN formats: a send through a configuration set names that
-#: ARN too. A declared configuration set does not widen this role (security
-#: reference 5.1), so the operations manual tells the operator to grant
-#: ``ses:SendEmail`` on it. The page prints no date; ``docs_date`` is its HTTP
-#: Last-Modified on the day it was fetched. Not live-verified: no site here
-#: sends through a configuration set.
+#: ARN too. The set's condition keys in the SendEmail row
+#: (``configuration_set_condition_keys``, verbatim) include ``ses:FromAddress``,
+#: so the statement on that one ARN keeps the identity's condition: the same
+#: sender, nothing else widened (security reference 5.1). The page prints no
+#: date; ``docs_date`` is its HTTP Last-Modified on the day it was fetched. Not
+#: live-verified: no site here sends through a configuration set.
 SES_SEND_EMAIL_RESOURCES_EVIDENCE: dict[str, Any] = {
     "vendor": "AWS",
     "url": (
@@ -41,6 +41,7 @@ SES_SEND_EMAIL_RESOURCES_EVIDENCE: dict[str, Any] = {
     "sections": (
         "Actions defined by Amazon Simple Email Service v2",
         "Resource types defined by Amazon Simple Email Service v2",
+        "Condition keys for Amazon Simple Email Service v2",
     ),
     "docs_date": "Last-Modified 2026-11-06",
     "fetched": "2026-11-06",
@@ -50,6 +51,17 @@ SES_SEND_EMAIL_RESOURCES_EVIDENCE: dict[str, Any] = {
         "arn:${Partition}:ses:${Region}:${Account}:identity/${IdentityName}",
         "arn:${Partition}:ses:${Region}:${Account}:configuration-set/"
         "${ConfigurationSetName}",
+        'Filters access by the "From" address of a message',
+    ),
+    "configuration_set_condition_keys": (
+        "aws:ResourceTag/${TagKey}",
+        "ses:ApiVersion",
+        "ses:FeedbackAddress",
+        "ses:FromAddress",
+        "ses:FromDisplayName",
+        "ses:MultiRegionEndpointId",
+        "ses:Recipients",
+        "ses:TenantName",
     ),
 }
 
@@ -61,6 +73,7 @@ def control_plane_policy_document(
     email_sender: str | None = None,
     archive_s3_uri: str | None = None,
     sns_topic_arn: str | None = None,
+    ses_configuration_set: str | None = None,
 ) -> dict[str, Any]:
     """Every AWS permission the regional control plane is allowed to hold.
 
@@ -70,7 +83,8 @@ def control_plane_policy_document(
     of EC2 (the departed-node cleanup asks whether an eks-managed node's
     recorded instance is gone; a read EC2 grants only on ``*``), no node
     mutation of any kind, notifications only to the site's own SNS topic
-    (``channel: sns``) or only from the verified sender (``channel: ses``),
+    (``channel: sns``) or only from the verified sender (``channel: ses``;
+    a declared SES configuration set adds that one set, same sender),
     and -- only when ``site.yaml`` ``spec.retention`` names an archive bucket
     -- ``PutObject`` under that one prefix, because the archiver writes
     bundles and never reads or deletes them. Stated as a document it can be
@@ -97,8 +111,6 @@ def control_plane_policy_document(
         },
     ]
     if email_sender:
-        # The sender identity only: a declared configuration set is granted by
-        # the operator, not here (``SES_SEND_EMAIL_RESOURCES_EVIDENCE``).
         statements.append(
             {
                 "Sid": "AdministratorEmail",
@@ -114,6 +126,22 @@ def control_plane_policy_document(
                 },
             }
         )
+        if ses_configuration_set:
+            # A send through the declared set names its ARN as well; the one
+            # set, on the same From address (SES_SEND_EMAIL_RESOURCES_EVIDENCE).
+            # Without a set the document stays byte for byte what it was.
+            statements.append(
+                {
+                    "Sid": "AdministratorEmailConfigurationSet",
+                    "Effect": "Allow",
+                    "Action": "ses:SendEmail",
+                    "Resource": (
+                        f"arn:aws:ses:{region}:{account_id}:configuration-set/"
+                        f"{ses_configuration_set}"
+                    ),
+                    "Condition": {"StringEquals": {"ses:FromAddress": email_sender}},
+                }
+            )
     if sns_topic_arn:
         # Publish only: the control plane never subscribes, lists or deletes;
         # the topic itself stays a bootstrap-owned resource.

@@ -927,28 +927,157 @@ OPERATIONS_MANUALS = (
     "docs/部署和运维手册.md",
     "docs/en/deployment-and-operations-manual.md",
 )
+SENDER = "alerts@example.com"
+CONFIGURATION_SET = "gpu-fault-alerts"
 
 
-def test_the_ses_grant_is_the_sender_identity_and_the_manuals_cite_the_set_resource() -> (
+def test_without_a_configuration_set_the_ses_policy_is_unchanged_byte_for_byte() -> (
     None
 ):
-    """Security reference 5.1: a declared SES configuration set does not widen
-    the role. The AWS Service Authorization Reference gives SendEmail the
-    resource type ``configuration-set`` beside the required ``identity*``, so
-    both operations manuals carry that evidence verbatim with the grant the
-    operator adds for a declared set."""
+    """The document ``put-role-policy`` sends for an SES site that declares no
+    configuration set, exactly as before the set got a statement of its own."""
+
+    today = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "sagemaker:DescribeCluster",
+                    "sagemaker:ListClusterNodes",
+                    "sagemaker:DescribeClusterNode",
+                ],
+                "Resource": f"arn:aws:sagemaker:{REGION}:{ACCOUNT}:cluster/*",
+            },
+            {
+                "Sid": "DepartedNodeInstanceReads",
+                "Effect": "Allow",
+                "Action": "ec2:DescribeInstances",
+                "Resource": "*",
+                "Condition": {"StringEquals": {"aws:RequestedRegion": REGION}},
+            },
+            {
+                "Sid": "AdministratorEmail",
+                "Effect": "Allow",
+                "Action": "ses:SendEmail",
+                "Resource": f"arn:aws:ses:{REGION}:{ACCOUNT}:identity/{SENDER}",
+                "Condition": {"StringEquals": {"ses:FromAddress": SENDER}},
+            },
+        ],
+    }
+
+    for document in (
+        control_plane_policy_document(
+            region=REGION, account_id=ACCOUNT, email_sender=SENDER
+        ),
+        control_plane_policy_document(
+            region=REGION,
+            account_id=ACCOUNT,
+            email_sender=SENDER,
+            ses_configuration_set=None,
+        ),
+    ):
+        assert json.dumps(document, separators=(",", ":")) == json.dumps(
+            today, separators=(",", ":")
+        ), "no configuration set must leave the inline policy byte for byte"
+
+
+def test_a_declared_configuration_set_adds_one_statement_on_its_arn_for_the_sender() -> (
+    None
+):
+    """A send through a configuration set names that set's ARN as well
+    (SendEmail lists ``configuration-set`` as a resource type), so the set the
+    site declares gets exactly one statement: ``ses:SendEmail`` on that one
+    ARN, conditioned on the same From address -- a condition key the reference
+    lists for that resource type."""
+
+    without = control_plane_policy_document(
+        region=REGION, account_id=ACCOUNT, email_sender=SENDER
+    )
+    declared = control_plane_policy_document(
+        region=REGION,
+        account_id=ACCOUNT,
+        email_sender=SENDER,
+        ses_configuration_set=CONFIGURATION_SET,
+    )
+
+    assert declared["Statement"][: len(without["Statement"])] == without["Statement"]
+    (extra,) = declared["Statement"][len(without["Statement"]) :]
+    assert extra == {
+        "Sid": "AdministratorEmailConfigurationSet",
+        "Effect": "Allow",
+        "Action": "ses:SendEmail",
+        "Resource": (
+            f"arn:aws:ses:{REGION}:{ACCOUNT}:configuration-set/{CONFIGURATION_SET}"
+        ),
+        "Condition": {"StringEquals": {"ses:FromAddress": SENDER}},
+    }
+    (key,) = extra["Condition"]["StringEquals"]
+    assert key in SES_SEND_EMAIL_RESOURCES_EVIDENCE["configuration_set_condition_keys"]
+
+
+def test_an_sns_site_gets_no_ses_grant_for_a_carried_configuration_set() -> None:
+    topic = f"arn:aws:sns:{REGION}:{ACCOUNT}:gpu-fault-{SITE}-alerts"
 
     document = control_plane_policy_document(
-        region=REGION, account_id=ACCOUNT, email_sender="alerts@example.com"
+        region=REGION,
+        account_id=ACCOUNT,
+        sns_topic_arn=topic,
+        ses_configuration_set=CONFIGURATION_SET,
     )
-    (grant,) = [
-        item
-        for item in document["Statement"]
-        if item.get("Sid") == "AdministratorEmail"
-    ]
-    assert grant["Resource"] == (
-        f"arn:aws:ses:{REGION}:{ACCOUNT}:identity/alerts@example.com"
-    ), "bootstrap grants no configuration-set resource; the operator does"
+
+    assert not [item for item in _actions(document) if item.startswith("ses:")], (
+        "a configuration set carried on channel: sns has no sender to grant"
+    )
+
+
+def test_the_next_deploy_grants_a_newly_declared_configuration_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``control_plane_role`` is re-proven by its probe on every deploy: a set
+    declared after bootstrap re-puts the one inline policy with the extra
+    statement, and nothing else about the role or its association moves."""
+
+    account = Account()
+    account.addon_installed = True
+    account.service_account_exists = True
+    account.role_exists = True
+    account.role_tags = [{"Key": SITE_TAG_KEY, "Value": SITE}]
+    account.role_trust = pod_identity_trust(_cluster())
+    account.role_policy = control_plane_policy_document(
+        region=REGION, account_id=ACCOUNT, email_sender=SENDER
+    )
+    account.associations = [{"associationId": "assoc-a"}]
+    account.association_role = f"arn:aws:iam::{ACCOUNT}:role/gpu-fault-{SITE}-control"
+    account.install(monkeypatch)
+
+    account.control_plane(
+        tmp_path, email_sender=SENDER, ses_configuration_set=CONFIGURATION_SET
+    )
+
+    [put] = account.mutations("put-role-policy")
+    assert json.loads(put[put.index("--policy-document") + 1]) == (
+        control_plane_policy_document(
+            region=REGION,
+            account_id=ACCOUNT,
+            email_sender=SENDER,
+            ses_configuration_set=CONFIGURATION_SET,
+        )
+    )
+    for fragment in (
+        "create-role",
+        "update-assume-role-policy",
+        "create-pod-identity-association",
+        "update-pod-identity-association",
+    ):
+        assert not account.mutations(fragment), fragment
+
+
+def test_both_operations_manuals_cite_the_configuration_set_statement() -> None:
+    """The statement rests on the AWS Service Authorization Reference; both
+    manuals carry that evidence verbatim and name the statement bootstrap
+    adds."""
+
     evidence = SES_SEND_EMAIL_RESOURCES_EVIDENCE
     needles = [
         evidence["url"],
@@ -957,10 +1086,10 @@ def test_the_ses_grant_is_the_sender_identity_and_the_manuals_cite_the_set_resou
         evidence["docs_date"],
         evidence["fetched"],
         *evidence["quotes"],
+        "AdministratorEmailConfigurationSet",
     ]
     root = Path(__file__).resolve().parents[2]
     for manual in OPERATIONS_MANUALS:
         text = " ".join((root / manual).read_text(encoding="utf-8").split())
         for needle in needles:
             assert needle in text, f"{manual} lacks {needle!r}"
-        assert ":configuration-set/<" in text, f"{manual} names no grant to add"

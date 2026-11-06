@@ -47,6 +47,43 @@ AUTHORIZATION_RESOURCE_GROUPS = {
 }
 
 
+def ses_send_scoped(
+    statements: Sequence[Mapping[str, Any]],
+    *,
+    region: str,
+    account_id: str,
+    notifications: Mapping[str, Any],
+) -> bool:
+    """Whether the ``ses:SendEmail`` grants are the sender's and nothing more.
+
+    ``control_plane_policy_document`` renders one on the sender identity and,
+    for a declared ``ses_configuration_set``, one more on that set's ARN, both
+    conditioned on the sender's ``ses:FromAddress``. The identity grant must be
+    there, and every grant must be one of those two with that condition.
+    """
+
+    sender = str(notifications.get("email_sender") or "")
+    configuration_set = str(notifications.get("ses_configuration_set") or "")
+    identity = {f"arn:aws:ses:{region}:{account_id}:identity/{sender}"}
+    allowed = [identity]
+    if configuration_set:
+        allowed.append(
+            {f"arn:aws:ses:{region}:{account_id}:configuration-set/{configuration_set}"}
+        )
+    return (
+        bool(sender)
+        and any(set(resources_for(item)) == identity for item in statements)
+        and all(
+            set(resources_for(item)) in allowed
+            and ((item.get("Condition") or {}).get("StringEquals") or {}).get(
+                "ses:FromAddress"
+            )
+            == sender
+            for item in statements
+        )
+    )
+
+
 def gpu_fault_jobs_in(
     cpu_json: Callable[..., dict[str, Any]],
     windows: tuple[tuple[datetime, datetime], ...],
@@ -781,7 +818,9 @@ class BlastCasesOne(BlastRunnerBase):
         # one send permission from spec.notifications.channel: sns:Publish scoped
         # to the site topic ARN (channel "sns", the admin-CLI default), or
         # ses:SendEmail scoped to the verified identity with a FromAddress
-        # condition (channel "ses"), or neither (channel "disabled"). So the
+        # condition (channel "ses"; a declared sesConfigurationSet adds one more
+        # statement on that set's ARN with the same condition), or neither
+        # (channel "disabled"). So the
         # audit reads the deployed channel and requires that one permission to be
         # present and scoped and the other absent, instead of demanding SES on a
         # topic-only site (which would fail the correct SNS posture).
@@ -797,8 +836,8 @@ class BlastCasesOne(BlastRunnerBase):
             for item in statements
             if allow_statement_matches(item, "ses:SendEmail")
         ]
-        sender = str((self.config.get("notifications") or {}).get("email_sender") or "")
-        sender_arn = f"arn:aws:ses:{self.region}:{account_id}:identity/{sender}"
+        notifications = self.config.get("notifications") or {}
+        configuration_set = str(notifications.get("ses_configuration_set") or "")
         sns_scoped = (
             sns_topic_arn.startswith(f"arn:aws:sns:{self.region}:{account_id}:")
             and not any(marker in sns_topic_arn for marker in ("*", "?"))
@@ -808,14 +847,11 @@ class BlastCasesOne(BlastRunnerBase):
                 for item in sns_send_statements
             )
         )
-        ses_scoped = bool(ses_send_statements) and all(
-            bool(sender)
-            and set(resources_for(item)) == {sender_arn}
-            and ((item.get("Condition") or {}).get("StringEquals") or {}).get(
-                "ses:FromAddress"
-            )
-            == sender
-            for item in ses_send_statements
+        ses_scoped = ses_send_scoped(
+            ses_send_statements,
+            region=self.region,
+            account_id=account_id,
+            notifications=notifications,
         )
         if channel == "sns":
             notification_send_scoped = sns_scoped and not ses_send_statements
@@ -837,6 +873,7 @@ class BlastCasesOne(BlastRunnerBase):
                 "sns_publish_statement_count": len(sns_send_statements),
                 "sns_publish_scoped_to_site_topic": sns_scoped,
                 "ses_send_statement_count": len(ses_send_statements),
+                "ses_configuration_set": configuration_set or None,
                 "ses_send_scoped_to_identity_with_condition": ses_scoped,
                 "notification_send_scoped_to_active_channel": notification_send_scoped,
             }
