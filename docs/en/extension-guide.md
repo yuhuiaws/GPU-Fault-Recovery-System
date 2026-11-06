@@ -13,8 +13,12 @@ this guide does not repeat them.
 
 1. Add an enum member to `operation_names.WorkflowOperation`; `models.WorkflowOperation` remains a compatible re-export.
 2. Add a complete semantic row to `operation_registry.OPERATION_REGISTRY`:
-   capability, scope, destructive, rank, adapter, resource locks, DAG, preempt
-   and barrier; plus the following decision fields:
+   capability, scope, adapters, destructive, `recovery_rank` and `dominates` (a dominated
+   operation must have a strictly lower rank, and dominance must be transitively closed),
+   `merge_intent`/`node_wide`/`node_exclusive`, resource claims (`resource_claims`), DAG (`shared_dag`),
+   preempt (`safe_waiting_preempt`/`safe_remote_waiting_preempt`) and barrier (`multi_node_barrier`);
+   plus the following decision fields (a destructive or NODE_ACTION operation must declare
+   `hardware_escalation_relevant` explicitly):
    - `hardware_escalation_relevant`: may serve as attempt evidence for hardware escalation.
    - `host_proc_root_dependent`: requires the host `/proc` mount; the Node Agent
      verifies the runtime path at startup (`HOST_PROC_ROOT_OPERATIONS`).
@@ -23,7 +27,8 @@ this guide does not repeat them.
      (`MAINTENANCE_GENERATION_OPERATIONS`).
    - `generation_stable_command_id`: the `command_id` of long-running, mutating reinstall-type NodeActions (driver / firmware / EFA)
      carries no `agent-N` suffix, so a re-post after an Agent restart hits the same ledger row instead of executing a second time;
-     mutually exclusive with `maintenance_generation_scoped` (`GENERATION_STABLE_COMMAND_OPERATIONS`).
+     allowed only on a node-mutating NODE_ACTION and mutually exclusive with `maintenance_generation_scoped`
+     (`GENERATION_STABLE_COMMAND_OPERATIONS`).
    - `planning_only`: does not land on any adapter; participates only in orchestration decisions.
    Beyond `destructive`, `CONTAINMENT_ONLY_OPERATIONS` is also derived
    (`resource_claims` is only `SCHEDULER_MUTATION`, i.e. cordon/quarantine/
@@ -34,16 +39,25 @@ this guide does not repeat them.
    (the remaining merge / budget / busy-node rules still treat them as node-mutating).
    The two gates, boot generation fence and workload_state UNKNOWN, look only at the latter:
    refusing isolation because evidence is stale or the workload condition is unknown amounts to leaving a suspicious node schedulable.
+   Node-mutating minus the workload kind (`WORKLOAD_MUTATION_OPERATIONS`, i.e. stopping/restarting training) gives
+   `NODE_HARDWARE_MUTATING_OPERATIONS`; the remediation storm breaker counts a node only for these (and a first `QUARANTINE`).
 3. Implement the execution logic in the target adapter. `OPERATIONS` is derived automatically from the registry;
    no independent collection may be maintained any more; derived collections with more than three members must not re-list literals at call sites,
-   and `tests/test_registry_contracts.py` scans the AST to reject duplicates.
+   and `tests/test_registry_contracts.py` scans the AST to reject duplicates. A NODE_ACTION operation must also register
+   the Node Agent executor's handler method in `OPERATION_HANDLERS` of `src/gpu_fault/node_agent/operations/registry.py`;
+   `validate_operation_handlers()` requires it to equal the registry's node-action set exactly.
 4. Add policy, workflow builder, adapter and negative tests.
 5. Run `tests/test_operation_registry.py` and
    `tests/test_registry_contracts.py`. A missing registration fails directly at import time.
-6. Before deployment run `gpu-fault-config validate` to check the generated Manifests, the control-plane allowlist and
-   the Node Agent allowlist. This command does not read the Runtime Profile; Profile claims, observed
-   capability and owner consistency are checked by `tests/regional/test_capabilities.py`, the regional release
-   verifier and `gpu-fault-admin status --full`.
+6. Before deployment run `gpu-fault-config validate` (`--node-operations` passes the node allowlist) to check the
+   generated Manifests, the control-plane allowlist and the Node Agent allowlist. The control-plane allowlist comes
+   from `GPU_FAULT_ALLOWED_OPERATIONS` in `deploy/control-plane/base/control-plane-deployment.yaml`, and
+   `deploy/control-plane/regional/generated/` is rewritten only by the renderer (`make deployment-contracts-update`);
+   to open a new NODE_ACTION on nodes by default, change both the default `NODE_ALLOWED_OPERATIONS` of
+   `deploy/node/install-gpu-fault-collector.sh` and `src/gpu_fault/admin/node_allowed_operations.py` (a test pins the two
+   to each other, and the change moves the Agent config digest and the release id). This command does not read the
+   Runtime Profile; Profile claims, observed capability and owner consistency are checked by
+   `tests/regional/test_capabilities.py`, the regional release verifier and `gpu-fault-admin status --full`.
 7. Loading a plugin does not mean automatic authorisation: the adapter must still match the operation registry, the control-plane
    allowlist and the Runtime Profile.
 
@@ -53,7 +67,14 @@ adding a core operation must go through the core registry review above.
 ## 2. Adding a Collector / Processor Channel
 
 1. Register path, priority mode, pool,
-   lane, spool, edge filter, latest-wins and routine reason vocabulary in `channel_registry.CHANNEL_REGISTRY`.
+   lane, spool, edge filter, latest-wins and routine reason vocabulary in `channel_registry.CHANNEL_REGISTRY`,
+   together with flags such as `batchable`, `receipt`, `correlated_fault`, `incident_scoped` and `spool_weight`.
+   `validate_channel_registry()` refuses contradictory combinations at import time (a spoolable channel must be
+   batchable, a correlated fault channel must be incident-scoped, a FAULT/GPU/HOST channel that can write nodes into an
+   incident must be incident-scoped, ...); a spoolable channel also needs a batch handler in
+   `src/gpu_fault/app/ingest/telemetry.py`, and a batchable channel of the GPU/HOST pools needs a batch size in
+   `TELEMETRY_BATCH_SIZE_BY_PATH` of `src/gpu_fault/processor/batching.py` (`tests/test_registry_contracts.py` checks both
+   directions).
 2. Create the FastAPI route and the Collector sink call using the path constants exported by the registry.
 3. Add route and processor tests. Application startup compares all
    `/v1/collector-events/*` routes with the registry; a missing registration fails directly.
@@ -62,12 +83,16 @@ adding a core operation must go through the core registry review above.
 5. Requests with `latest_wins=true` and an actual priority=100 automatically become
    `REORDERABLE`; all other requests are `STRICT`. A new channel must be tested for whether later requests in the same lane may overtake
    during delayed retries; fault/evidence channels must not be mislabelled as reorderable.
+6. A new collector registers its CLI subcommand (factory, produced channels, where it runs) in
+   `collector_registry.COLLECTOR_REGISTRY`, its producer name, systemd unit and silence threshold in
+   `collector_kinds.COLLECTOR_KINDS`, and adds a systemd unit under `deploy/`; `validate_collector_registry()` refuses
+   inconsistent rows at import time. Third-party collectors join through the `gpu_fault.collectors` entry point (§6).
 
 ## 3. Supporting a new GPU product family
 
-The product family mapping comes from a generator; do not edit
-`src/gpu_fault/data/nvidia-xid-catalog-610.generated.yaml` directly. Add to the generator input of
-`tools/generate_nvidia_xid_policy.py`:
+The product family mapping of the XID Catalog comes from a generator; do not edit
+`src/gpu_fault/data/nvidia-xid-catalog-610.generated.yaml` directly. Add to the `spec.catalog.productFamilies` that
+`tools/generate_nvidia_xid_policy.py` generates (`_catalog_from_workbook`):
 
 ```yaml
 spec:
@@ -77,9 +102,13 @@ spec:
         modelPrefixes: [Z]
 ```
 
-No Python regex needs changing. An unknown product produces
+The Catalog's family match is the generic "prefix + model number", so no Python regex needs changing. An unknown product produces
 `gpu_fault_policy_unknown_product_total{product=...}` and triggers
-`GpuFaultUnknownProductFamily`; automatic recovery stays fail-closed.
+`GpuFaultUnknownProductFamily`; automatic recovery stays fail-closed. The platform-graded rules outside the Catalog have
+their own product decisions in code and must be reviewed item by item against NVIDIA's documentation for a new family:
+the GPU/EFA expected-count table of instance types (`GPU_INSTANCE_INVENTORY` in `src/gpu_fault/gpu_instance_inventory.py`), the
+product regex of the NVSwitch fabric-state grading `src/gpu_fault/gpu_fabric_manager.py::nvswitch_fabric_product`, and the
+platform decisions in the NVLink5, PCIe link, memory and other `gpu_*_policy.py` modules.
 
 After regenerating with an approved NVIDIA Catalog XLSX with a pinned digest, update the pinned source/generated
 SHA tests and run:
@@ -95,24 +124,29 @@ release rather than replacing the file online.
 
 1. Extend the Protocol in `store/contracts.py` with concrete model types; `Any` is forbidden.
 2. All three implementations implement or explicitly inherit the method.
-3. When the generic object codec is used, register the SQLite/PostgreSQL `_models` at the same time; when adding a dedicated table,
+3. When the generic object codec is used, register the kind in `record_models()` of `store/shared/record_models.py` (both the
+   SQLite and the PostgreSQL `_models` are built from it); when adding a dedicated table,
    spell out the dual/dedicated migration, backfill, cleanup and old-codec compatibility paths.
 4. Add the behaviour to the shared contract fixture; when a PostgreSQL URL is configured, Memory, SQLite and
    PostgreSQL must run the same tests.
-5. Run the mypy boundary check, the override shape check and the real PostgreSQL tests, and update the inventory of the
-   current 48 logical kinds in the Detailed Design at the same time.
+5. Run the mypy boundary check (`make mypy-check`, which includes the structural assertions of `store/_conformance.py` over
+   the three implementations), the override shape check (`make mixin-check`) and the real PostgreSQL tests, and update the
+   inventory of the logical kinds of `record_models()` (currently 52) in Detailed Design v2 at the same time.
 
 ## 5. Adding a Schema migration
 
-The latest version in the current registry is v22
-`per-key-planner-pinned-wakeup-probes`. The next migration must append v23:
+The latest version in the current registry (`LATEST_POSTGRES_SCHEMA_VERSION`) is v23
+`processor-queue-detached-payloads-replays-and-cluster-partitions`. The next migration must append v24:
 
 1. Modify the latest idempotent schema in the corresponding `store/postgres/ddl*.py`; the checksum covers all
    `ddl*.py`, not just `ddl.py`. Catalog reads inside a stage (`pg_class`/`pg_index`, ...) must tolerate cursor
-   doubles: the release gate replays the whole DDL with a `RecordingCursor` that answers every read with the
-   one-column row `(True,)`, and the migration tests' `MigrationRecorder` answers `(None,)` or `None` -- a
-   multi-column query must not index its second column by position (v19's storage-parameter stage treats a missing
-   TOAST column as "no options", `tests/store/test_ddl_storage_parameters.py`).
+   doubles: `tests/processor/test_processor_partition_cleanup.py::RecordingCursor`, which replays the whole DDL, answers
+   most reads with the one-column row `(True,)` (a few known queries get fixed answers of their own), and the migration
+   tests' `tests/store/_cov95_runtime_schema.py::MigrationRecorder` answers `(None,)` to `to_regclass` and `None` otherwise
+   -- a multi-column query must not index its second column by position (v19's storage-parameter stage treats a missing
+   TOAST column as "no options", `tests/store/test_ddl_storage_parameters.py`). The partitions created at run time per
+   cluster or time bucket (v23) do not belong in `ddl*.py` but in `store/postgres/hot_layout.py`, and do not change the
+   schema version.
 2. Compute the new DDL source SHA-256.
 3. Append a consecutive version to
    `POSTGRES_SCHEMA_MIGRATIONS` in `src/gpu_fault/schema_migrations.py`; historical rows must not be modified.
@@ -120,20 +154,26 @@ The latest version in the current registry is v22
 5. New columns must remain writable by old code: use nullable columns, or provide a deterministic non-null default like
    `retry_count/lane_policy` in v7.
 6. Modifying the DDL directly without adding a migration fails at import time.
-7. Run `make test-postgres-stress` and the CAP-005 runner, covering lock contention, migration history,
+7. Run `make test-postgres-stress` and the CAP-005 runner (`make fault-test-cases-with-cap005`, which needs
+   `GPU_FAULT_STORE_URL`), covering lock contention, migration history,
    completion concurrency, counters, fencing, deadlock and zero skips.
 
 ## 6. Adding a notification Builder, Adapter or Sink
 
-The project declares the following entry-point groups:
+`gpu_fault.plugins.PluginGroup` recognises the following entry-point groups:
 
+- `gpu_fault.collectors`
 - `gpu_fault.collector_sinks`
 - `gpu_fault.workflow_adapters`
 - `gpu_fault.notification_builders`
 - `gpu_fault.metric_contributors`
 
-Plugins with the same name in the same group are failed closed by `gpu_fault.plugins.discover_plugins()`. Currently only
-`gpu_fault.metric_contributors` is discovered and assembled automatically by the runtime.
+`pyproject.toml` declares built-in entries only for the sink, adapter and notification builder groups. Except
+`gpu_fault.collectors`, every group accepts only the identifiers on the `gpu_fault.plugins` allowlist that ship with the
+distribution, and installed metadata grants no trust by itself; plugins with the same name in the same group are failed
+closed by `gpu_fault.plugins.discover_plugins()`. Currently only `gpu_fault.metric_contributors` is discovered and
+assembled automatically by the runtime, and its allowlist is empty, so every discovered entry is refused (built-in
+contributors register through `register()`, see §9).
 
 Collector sinks, Workflow adapters and Notification builders are still assembled statically by their respective factory/registry.
 An external package merely declaring an entry point does not take effect automatically; when adding these three kinds of extension you must also explicitly wire
@@ -150,7 +190,7 @@ That full validation must run in a verified candidate environment; on-demand loa
 
 ## 7. Adding an HTTP route
 
-Every FastAPI handler must explicitly add:
+Every FastAPI handler must explicitly add (the decorator comes from `gpu_fault.app.authorization`):
 
 ```python
 @router.post("/v1/example")
@@ -199,18 +239,26 @@ uninstalled". When both kinds of change are present, the gates of both documents
 
 ## 9. Adding Metrics
 
-Implement a metric lines contributor for the subsystem and register it in the metrics registry; do not keep appending
-string blocks to the core render function. Metric families are counted by actual role and by assembly conditions such as PostgreSQL/regional;
+Implement a metric lines contributor for the subsystem and register it in the metrics registry
+(`gpu_fault.app.metrics.METRIC_CONTRIBUTORS.register(name, contributor, fleet_level=...)`; the built-in contributors live in
+`gpu_fault.app.builtin_metric_contributors`); do not keep appending string blocks to the core render function. A
+`fleet_level=True` contributor reads a cluster-level fact, and the ingress and spool-worker roles do not render it; a
+contributor that raises is only counted in `gpu_fault_metrics_contributor_errors_total` and does not take the whole
+`/metrics` down. Every new metric family must also declare its multi-process Pod merge strategy in
+`gpu_fault.app.metric_aggregation`, otherwise `tests/metrics/test_metric_aggregation_registry.py` fails.
+Metric families are counted by actual role and by assembly conditions such as PostgreSQL/regional;
 a historical baseline must not be taken as the current total for all roles; after adding, recount and update the prefix distribution in the Detailed Design.
-The previous closed-loop round added four gauge families, and the same in-memory worker fixture went from 257 to 261,
-with no increase for ingress/spool-worker. This round adds two counter drift scan evidence gauges and one terminal-state notification
-event time gauge; the same three-role fixture gives 225/264/224 families for ingress/worker/spool-worker respectively,
-an increase of 3 families each. The processor prefix is 111 families in all cases; the notification prefix is 8/12/8 families respectively.
+The same in-memory three-role fixture (the per-role scrape of that test) currently gives 267/316/266 families for
+ingress/worker/spool-worker respectively; the processor prefix is 125 families in all cases, and the notification prefix
+is 8/12/8 families respectively.
 These fixtures do not enable the conditional PostgreSQL, regional and refresh-file metrics and cannot be taken as the production inventory.
 If a metric is used for AMP alerting, you must also, at the same time:
 
-1. add it to the ADOT keep regex;
-2. add a production rule in `deploy/observability/amp-rules.yaml`;
+1. add it to the ADOT keep regex of `deploy/observability/adot-control-plane.yaml` (data-plane component metrics are
+   scraped by `deploy/dataplane/adot-dataplane.yaml` from the `metrics` port a Pod declares);
+2. add a production rule in `deploy/observability/amp-rules.yaml` whose `runbook_url` points at the anchor of the
+   alert-name heading in `docs/en/administrator-operations.md` (`tests/test_alert_runbooks_point_to_english_docs.py`), and
+   re-render the dashboards that the rule thresholds feed with `make grafana-dashboards`;
 3. keep the rule equivalent on the optional
    Prometheus Operator path in `deploy/control-plane/regional/processor-alerts.yaml`;
 4. run the alert reachability tests of `tests/regional/test_production_safety_config.py`.
