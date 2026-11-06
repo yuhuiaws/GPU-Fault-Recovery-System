@@ -9686,20 +9686,22 @@ gpu-fault-admin submit-remediation \
 
 `--disposition` values: `inspected` (mechanical inspection complete, no further hardware action), `reset-gpu`,
 `reboot-node`, `quarantine`, `restore` (not an answer to CHECK_MECHANICALS but the exit of a QUARANTINED
-incident: after the node is repaired manually, creates a validated restore workflow under the same incident, see item 8),
+incident -- or of an ESCALATED/RECOVERED one whose workflows have all ended while a node still carries its isolation:
+after the node is repaired manually, creates a validated restore workflow under the same incident, see item 8),
 `confirm-node-action` (likewise not an answer to CHECK_MECHANICALS: records a manual confirmation for a node action with unknown outcome on a BLOCKED workflow;
-needs `--node`, see item 9).
+needs `--node`, and `--reference` unless `--plan` is given, see item 9).
 
 1. **Applicability**: the incident's workflow is in `WAITING` at `CHECK_MECHANICALS`; the incident
    and workflow have the same fencing token (otherwise it is a stale generation); the node set of the waiting step matches
    the incident; the workflow's `execution_deadline`/`lifetime_deadline_at` have not passed; the nodes are still in
-   the cluster and not isolated by another incident. If any condition fails, the command refuses and writes nothing. When several
-   active attempts are observed on the same node it likewise refuses, without guessing which one to terminate.
+   the cluster and not isolated by another incident. If any condition fails, the command refuses and writes nothing. When a hardware
+   remediation observes several active attempts on the incident's nodes it likewise refuses, without guessing which one to terminate.
 2. **Scope of impact**: `inspected` writes only the node annotation
    `gpu-fault.io/mechanical-inspection-complete=<incident>:<fencing token>`; the annotation value is derived from the record
    rather than typed by hand, and the original workflow then completes on its own and restores the workload. A hardware remediation first writes the same annotation, then with
    the nodes, GPU UUIDs and job/attempt/workload from the record (taken from the current AttemptObservation; an idle node
-   uses the separate job/attempt ID `operator-<incident>` with empty `workload_ids`) submits a trusted
+   uses the separate job ID `operator-<incident>` and attempt ID `operator-<incident>-<disposition>` with empty
+   `workload_ids`) submits a trusted
    marker (`marker-operator-<incident>-<disposition>`, source `operator-change`, incident
    `inc-operator-<incident>-<disposition>`) and an operator terminal trigger, and the completion
    service compiles a new fenced workflow; the original incident is neither rewritten nor reused. When the node has active training
@@ -9719,19 +9721,28 @@ needs `--node`, see item 9).
    the original decision (output `no_op=true`). Do not fabricate a new attempt ID to bypass idempotency; if the existing
    decision does not carry this marker, the command refuses, and you should first check whether that decision/workflow already has the required remediation.
 7. **Evidence**: `<state-dir>/submit-remediation/<incident-id>/<disposition>-<time>.json`
-   records the operator ARN, `--reference`, the complete plan, the annotation result and the decision/plan/workflow IDs.
+   records the operator ARN, the complete plan, the annotation result and the decision/plan/workflow IDs. `--reference`
+   reaches the file through the plan: in the marker's `raw_reason` for a hardware remediation, in the incident reason for
+   `restore`, in the confirmation record for `confirm-node-action`; the evidence file of `inspected` does not record it
+   today, so keep the change ID elsewhere.
 8. **`restore` (validated restore after a QUARANTINED node is repaired)**:
    `gpu-fault-admin submit-remediation --state-dir ... --incident-id <QUARANTINED incident>
    --disposition restore --reference CHG-xxxx [--plan]`. All preconditions are checked before writing, refusing if any fails:
-   incident `state=QUARANTINED`; the incident has no PENDING/RUNNING/SAFETY_PENDING
+   incident `state=QUARANTINED`, or `ESCALATED`/`RECOVERED` with every workflow ended
+   (FAILED/SUPERSEDED/SUCCEEDED; a BLOCKED record still on its nodes goes through item 9 and `workflow-reconcile` first);
+   the incident has no PENDING/RUNNING/SAFETY_PENDING
    workflow; every node is in the cluster, or proven to have left it (for a node not in `kubectl get nodes` the CLI reads the
    departure proof from HyperPod `list-cluster-nodes` or EC2, and the Agent in the Pod's inspection must not be alive: such a node
    is `skip` with `departed: true` in `node_decisions`, neither validated nor released); the incident and its last workflow have the same fencing token (otherwise
    a stale generation); at least one node is still isolated by this incident. Isolation ownership is judged per node and written into the
-   `node_decisions` of `--plan`: nodes carrying a `gpu-fault.io/quarantined` taint whose value equals `quarantine_taint_value(<incident>)`,
+   `node_decisions` of `--plan`: nodes carrying a `gpu-fault.io/quarantined` taint whose value equals `quarantine_taint_value(<incident>)`
+   (or the raw incident id an older release wrote),
    or carrying this incident's `gpu-fault.io/incident-id` annotation (taint/cordon removed by hand, annotation
-   still present) enter the restore; already clean nodes and nodes isolated by another incident (named -- that isolation is released by its
-   own restore) are skipped; when no node is still isolated by this incident it refuses, and you close with node evidence via the
+   still present) enter the restore; a node left with only this incident's `gpu-fault.io/quiesce` taint (its isolation
+   belongs to another incident, or it has no isolation annotation) enters as a release-only node and only that taint is
+   stripped; already clean nodes, nodes isolated by another incident (named -- that isolation is released by its
+   own restore) and contradictory nodes whose annotation names this incident while their quarantine taint is another
+   incident's are skipped; when no node is still isolated by this incident it refuses, and you close with node evidence via the
    QUARANTINED branch of Administrator Operations §9.1. Effect: through the exec channel of a CPU ingress Pod the command,
    under the product identity, constructs with `gpu_fault.orchestration.validated_restore` and writes in one transaction
    the workflow `workflow-validated-restore-<uuid>` (official_action `RESTORE_SCHEDULING`, steps
@@ -9759,8 +9770,8 @@ needs `--node`, see item 9).
    nothing, and the result names any step that still differs from the plan (`the created workflow's steps differ from the
    plan: ...`, e.g. an inventory that changed after the inspection). A missing inventory still drops no GPU, and an unrelated node's
    inventory never removes an original incident's GPU. When only
-   some nodes of the incident are restored (`restore_node_ids` is a proper subset of `node_ids`), the steps do not carry the incident's GPU scope but do full per-node
-   validation: the GPUs named by the incident may be on already restored sibling nodes. The restore does not restart a job a
+   some nodes of the incident are restored (`restore_node_ids` is a proper subset of `node_ids`), the steps do not carry the incident's GPU scope but validate
+   node-wide: the GPUs named by the incident may be on already restored sibling nodes. The restore does not restart a job a
    STOP suspended: `suspended_workloads`/`warnings` of `--plan` and the result message name each workload the incident's records
    left suspended and no RESTART_WORKLOAD brought back (`workload <namespace>/<kind>/<name> stays suspended (stopped by workflow
    <id>): the restore does not restart it; its owner must restart it`), for the job owner to resume (Administrator Operations §9.2).
@@ -9768,20 +9779,25 @@ needs `--node`, see item 9).
    `gpu-fault-admin submit-remediation --state-dir ... --incident-id <incident>
    --disposition confirm-node-action --node <node_id> --reference CHG-xxxx [--plan]`. Applies when
    a node action step on a BLOCKED / NEEDS_OPERATOR workflow FAILED with details carrying
-   `outcome_unknown: true, manual_confirmation_required: true` (the executor got no receipt within the step cap).
+   `outcome_unknown: true, manual_confirmation_required: true` (the executor got no receipt within the step cap), or with
+   another outcome-uncertainty flag (`node_action_interrupted`, `node_action_response_unknown`,
+   `ownership_permit_delivery_unknown`).
    The command-line side computes the decision from the Pod's inspect result (incident, BLOCKED workflow, fleet Agent record, the remote command's evidence keys,
-   GPU inventory) and the node object read via the GPU kubeconfig, and `--plan` prints it; at write time the in-Pod script uses only
+   GPU inventory, the same cluster's SUCCEEDED workflows that later validated the node) and the node object read via the GPU kubeconfig, and `--plan` prints it; at write time the in-Pod script uses only
    store primitives that exist in the running release: it re-reads the incident/workflow, compares the fencing token, execution epoch,
    merge revision, state and node set, compares the confirmed step's status/adapter operation/details verbatim,
    re-reads the Agent record to re-check ACTIVE, the lease, a boot id consistent with kubelet and different from the pre-action boot id, then writes with
    `save_workflow(expected=)` and appends `OPERATOR_RECONCILED` / `NODE_ACTION_CONFIRMED` events.
    Evidence rules: the record is BLOCKED, has no owner, its lease has expired, has no WAITING step and no open remote command; the node is in the incident's
-   node list and that record really has a pending node action on this node. `RESTART_NODE` requires the node Ready, the Agent ACTIVE
-   with a heartbeat after the action started, kubelet and the Agent reporting the same boot id which differs from the boot id recorded before the action
+   node list and that record really has a pending node action on this node. While the node is still in the cluster, every
+   node action requires the node Ready and the Agent ACTIVE on a live lease with a heartbeat after the action started;
+   `RESTART_NODE` additionally requires kubelet and the Agent reporting the same boot id which differs from the boot id recorded before the action
    (`agent_baselines` / `stop_reboot_authorization_v1` / the workflow's own STOP receipt carried along its confirmed reboots --
-   the baseline whenever it names the node / the single-node incident's `source_boot_id`; refused when none exists); other node actions require the Agent's terminal answer (`node_results`) on the remote command, or a later validated restore of the same incident
-   having completed `VALIDATE_GPU` and `RESTORE_SCHEDULING` on that node and made the incident
-   RECOVERED, or -- the same evidence as `RESTART_NODE` -- a reboot of the node since the action (no GPU reset survives a boot;
+   the baseline whenever it names the node / the single-node incident's `source_boot_id`; refused when none exists;
+   the confirmation's `settled_by` is `boot_transition`); other node actions require the Agent's terminal answer (`node_results`) on the remote command, or a later validated restore
+   having completed `VALIDATE_GPU` and `RESTORE_SCHEDULING` on that node (one of the same incident that made the incident
+   RECOVERED, or a SUCCEEDED workflow of any incident of the same cluster that validated the node after the action started,
+   its GPU scope covering the GPUs the action touched), or -- the same evidence as `RESTART_NODE` -- a reboot of the node since the action (no GPU reset survives a boot;
    the confirmation's `settled_by` names `terminal_node_result`/`validated_restore`/`reboot_since_action`). For a node no
    longer in the cluster the CLI reads its departure proof (HyperPod `list-cluster-nodes` / EC2); gone from Kubernetes and from
    the provider with its Agent not alive (no record, `REVOKED`, or an expired lease with its last heartbeat more than 10 minutes
@@ -9812,7 +9828,10 @@ needs `--node`, see item 9).
 
 The archive-first automatic retention of the production control plane is **enabled by default**, retaining 30 days; it is disabled only when `site.yaml` explicitly declares
 `spec.retention.controlRecordRetentionDays: 0`. Configuration ownership, site.yaml fields and IAM are in
-`docs/管理员容量配置.md` (Administrator Capacity Configuration) §10. The values the release engine renders to the control plane by default:
+`docs/en/administrator-capacity-configuration.md` §10. With the default configuration the control-worker (the only role
+that runs the archiver) sees the values below; the first two are rendered by the release engine from site.yaml (neither
+while retention is off), the last two are runtime defaults -- the archive interval is rendered only when site.yaml
+declares `archiveIntervalSeconds` (60-604800), and site.yaml never renders the batch size:
 
 ```text
 GPU_FAULT_CONTROL_RECORD_RETENTION_DAYS=30
@@ -9824,7 +9843,7 @@ GPU_FAULT_CONTROL_RECORD_ARCHIVE_BATCH_SIZE=200
 `archiveS3Uri` may be omitted; `src/gpu_fault/admin/site.py::default_control_record_archive_s3_uri`
 derives the default target from account, Region and site. bootstrap creates the bucket automatically and converges encryption, versioning and Block Public
 Access; the CPU role obtains only `s3:PutObject` on the target prefix and is granted no read or delete permission on the archived objects
-(the archiver only writes; it neither reads nor deletes objects). The running process still refuses to start with `RETENTION_DAYS>0` but no URI, but
+(the archiver only writes; it neither reads nor deletes objects). The running process still refuses to start with `RETENTION_DAYS>0` but no URI (or a store that is not PostgreSQL), but
 the release engine always renders the URI. The system first archives the complete audit package and re-checks the SHA within the transaction, then deletes the live table records. The throughput cap
 is 200 records / 10 minutes; `gpu_fault_control_record_archive_archived_total` should keep growing, and growth of
 `gpu_fault_control_record_archive_errors_total{reason}` is handled per
@@ -9832,7 +9851,7 @@ is 200 records / 10 minutes; `gpu_fault_control_record_archive_archived_total` s
 cleanup job (event dedup links, group links, etc.) are archived and deleted only together with the incident -- **as long as the incident
 exists, they are kept**; inactive markers, terminal notifications, completion decisions and expired registry
 members are reclaimed by `processor-cleanup` according to their own `*_RETENTION_SECONDS`, and those referenced by an incident are likewise kept
-(see `docs/详细设计-v2.md` §2.3.1); health-signal state rows: see §8.5.
+(see `docs/en/detailed-design-v2.md` §2.3.1); health-signal state rows: see §8.5.
 
 Do not run single-table `DELETE`s separately: the incident is also referenced by event dedup links,
 attempt/node group links, notification dedup links and predecessor workflows. Once dangling
@@ -9850,14 +9869,16 @@ is no longer protected by the original `incident_by_event` dedup record, and a r
 confirm that the collector cursor, completion watcher and external event sources will not replay that historical event.
 
 First set the variables and create a PostgreSQL admin Pod that exists only during the maintenance window. The Pod reads the DSN from the existing Secret;
-the password does not appear on the command line or in the Pod YAML:
+the password does not appear on the command line or in the Pod YAML. The DSN bootstrap writes requires `sslmode=verify-full`
+with `sslrootcert` at `/etc/gpu-fault/rds/ca-bundle.pem`, so like the control-plane Pods the admin Pod mounts the
+`gpu-fault-rds-ca-bundle` ConfigMap at `/etc/gpu-fault/rds`; without it `psql` cannot connect:
 
 ```bash
 export CONTROL_KUBECONFIG=/tmp/gpu-fault-control-plane.kubeconfig
 export NS=gpu-fault-system
 export INCIDENT_ID=inc-replace-with-terminal-incident
 export STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-export SQL_CONFIGMAP="gpu-fault-incident-purge-${STAMP}"
+export SQL_CONFIGMAP="gpu-fault-incident-purge-${STAMP,,}"
 export ADMIN_POD="gpu-fault-db-admin-${STAMP,,}"
 export BACKUP_DIR="${HOME}/gpu-fault-audit-purge/${STAMP}"
 
@@ -9898,10 +9919,16 @@ spec:
         - name: sql
           mountPath: /sql
           readOnly: true
+        - name: rds-ca-bundle
+          mountPath: /etc/gpu-fault/rds
+          readOnly: true
   volumes:
     - name: sql
       configMap:
         name: ${SQL_CONFIGMAP}
+    - name: rds-ca-bundle
+      configMap:
+        name: gpu-fault-rds-ca-bundle
 YAML
 
 kubectl --kubeconfig "${CONTROL_KUBECONFIG}" -n "${NS}" \
@@ -9909,7 +9936,9 @@ kubectl --kubeconfig "${CONTROL_KUBECONFIG}" -n "${NS}" \
 ```
 
 Preview first. In the following output the open remote commands and external successor workflows must be empty,
-and all workflows must be `SUCCEEDED`, `FAILED` or `BLOCKED`:
+and all workflows must be `SUCCEEDED`, `SUPERSEDED`, or `FAILED` with their failure handling done (`failure_handled_at`
+set); close a `BLOCKED` record with `gpu-fault-admin workflow-reconcile` first. The preview lists only the status;
+`failure_handled_at` is checked by the purge script's terminal guard:
 
 ```bash
 kubectl --kubeconfig "${CONTROL_KUBECONFIG}" -n "${NS}" \
@@ -9940,8 +9969,9 @@ wc -l "${BACKUP_FILE}"
 ```
 
 All Aurora writers must be stopped during deletion, to avoid another replica merging the same incident just as the event dedup link is deleted.
-The writers in regional mode are ingress, control-worker and a non-zero-replica
-spool-worker; the writer in transitional single-cluster mode is `gpu-fault-control-plane`. Record each one's original replica
+The writers in regional mode and in transitional single-cluster mode (`deploy/hyperpod/deploy.sh` deploys the same three
+roles) are ingress (`gpu-fault-api-ha`), control-worker and a non-zero-replica
+spool-worker; the script's `gpu-fault-control-plane` branch is only for an older single-tier deployment. Record each one's original replica
 count and set a recovery trap that runs on any failure:
 
 ```bash
@@ -10051,9 +10081,11 @@ kubectl --kubeconfig "${CONTROL_KUBECONFIG}" -n "${NS}" \
 
 The script rolls back and exits when any of the following holds:
 
+- `incident_id`/`confirm_incident_id` is missing, or the two differ;
 - The incident does not exist;
-- There are `PENDING`, `RUNNING` or `SAFETY_PENDING` workflows;
-- There are `PENDING`, `WAITING` or `LEASED` remote commands;
+- There is a workflow that is neither `SUCCEEDED`/`SUPERSEDED` nor `FAILED` with its failure handling done (`PENDING`,
+  `RUNNING`, `SAFETY_PENDING`, `BLOCKED` or an unknown status);
+- There is a remote command whose status is not `SUCCEEDED`/`FAILED` (`PENDING`, `WAITING`, `LEASED` or an unknown status);
 - A workflow of another incident still uses this incident's workflow as predecessor.
 
 Restore by the original replica counts. Regional mode restores the consumers first and ingress last; the function internally waits for every
@@ -10064,15 +10096,17 @@ restore_incident_purge_writers
 trap - EXIT
 
 kubectl --kubeconfig "${CONTROL_KUBECONFIG}" -n "${NS}" \
-  exec "${ADMIN_POD}" -- sh -ec \
+  exec -i "${ADMIN_POD}" -- sh -ec \
   'psql "$DATABASE_URL" -X -At -v ON_ERROR_STOP=1 \
-    -v incident_id="$1" \
-    -c "SELECT count(*) FROM gpu_fault_objects
-        WHERE kind='\''incident'\'' AND key=:'\''incident_id'\'';"' \
-  sh "${INCIDENT_ID}"
+    -v incident_id="$1"' \
+  sh "${INCIDENT_ID}" <<'SQL'
+SELECT count(*) FROM gpu_fault_objects
+WHERE kind='incident' AND key=:'incident_id';
+SQL
 ```
 
-The last command must print `0`. After confirming the control plane has recovered, delete the temporary Pod and ConfigMap:
+The last command must print `0`. The query reaches `psql` on stdin because `psql -c` does not interpolate variables such
+as `:'incident_id'`. After confirming the control plane has recovered, delete the temporary Pod and ConfigMap:
 
 ```bash
 kubectl --kubeconfig "${CONTROL_KUBECONFIG}" -n "${NS}" \
@@ -10124,8 +10158,9 @@ kubectl --kubeconfig "${CPU_KUBECONFIG}" -n gpu-fault-system logs \
 The cumulative removed rows are the Prometheus counter
 `gpu_fault_periodic_cleanup_rows_total{periodic_job="health_signal_states"}`.
 
-The log line reads like `health-signal retention removed 37 health_signal_state rows (attempt_ended=32, node_departed=5)`,
-followed by the shared `cleanup health_signal_state deleted 37 rows; keys[:20]=…`. Growth of
+The log line reads like `health-signal retention removed 37 health_signal_state rows (attempt_ended=32, node_departed=5)`
+(the other reasons are `not_updated`: no write within the retention period, and `superseded`: an older release's
+per-attempt EFA row), followed by the shared `cleanup health_signal_state deleted 37 rows; keys[:20]=…`. Growth of
 `gpu_fault_periodic_cleanup_job_errors_total{periodic_job="health_signal_states"}` means the sweep failed; steady growth of
 `gpu_fault_periodic_cleanup_budget_exhausted_total{periodic_job="health_signal_states"}` means a backlog (for example the
 first cleanup of historical rows after an upgrade), and every round still makes progress. Remaining rows (read-only):
@@ -10142,8 +10177,11 @@ it below a few hours.
 
 ## 9. Data Migration
 
-The migration command requires the target database to be empty and no writer during the migration window. First determine the deployment mode and record
-the original replica counts; the state file must be kept in a controlled directory for the recovery session after a disconnect:
+The migration command requires the target database to be empty (no rows in `gpu_fault_control_records` and
+`gpu_fault_links`) and no writer during the migration window. First determine the deployment mode and record
+the original replica counts: a deployment that has `gpu-fault-api-ha` -- regional mode, and the transitional single-cluster
+`deploy/hyperpod/deploy.sh`, which splits into the same ingress/control-worker/spool-worker roles -- takes the `regional`
+branch; the `generic` branch is only for an older single-tier `gpu-fault-control-plane` deployment. The state file must be kept in a controlled directory for the recovery session after a disconnect:
 
 ```bash
 : "${CONTROL_KUBECONFIG:?the control-plane kubeconfig must be given explicitly}"
@@ -10272,7 +10310,7 @@ if [[ "${DEPLOYMENT_MODE}" == regional ]]; then
     fi
   done
 else
-  # The generic single-tier deployment both receives requests and consumes the queue. First stop traffic at the external entry point and confirm
+  # The older single-tier deployment (gpu-fault-control-plane) both receives requests and consumes the queue. First stop traffic at the external entry point and confirm
   # gpu_fault_processor_queue_depth / in_flight are both 0 before scaling down.
   kubectl --kubeconfig "${CONTROL_KUBECONFIG}" -n "${NS}" \
     scale deployment/gpu-fault-control-plane --replicas=0
@@ -10297,7 +10335,10 @@ done < "${MIGRATION_STATE}"
 The status query, backfill, cleanup and logical data copy entry points only validate the existing schema and no longer implicitly initialise tables or indexes by constructing a
 `PostgresStore`. Source and target databases must already have gone through the checked schema release process;
 on a structural mismatch handle the schema first; `status` or the data migration command must not be used to repair it implicitly.
-An explicit `--ensure-schema` is still executed by the standalone schema ensure Job.
+An explicit `--ensure-schema` is still executed by the standalone schema ensure Job
+(`deploy/migrations/postgres-schema-ensure-job.yaml`: `--ensure-schema --fresh-control-state-mode dedicated`);
+`gpu-fault-store-migrate --schema-preflight` reports read-only the `registered`/`required` versions of `schema_version`,
+the migration history and the index state, and the schema is ready only when `ok` is `true`.
 When target connection initialisation fails or the close is abnormal, the copier still closes the source connection; the legacy SQLite compatibility import uses an encoded
 read-only URI and does not treat characters such as `?` in the file name as connection options. The production control plane still uses PostgreSQL.
 
@@ -10306,7 +10347,13 @@ and requires the reviewed native PostgreSQL backup/restore process instead. The 
 storage mode. Hot state in old SQLite or legacy objects is backfilled into the dedicated tables within the same target transaction,
 so that the dedicated reader can read the just-imported data after success returns.
 
-Then run one kind of stop-write migration:
+Then run one kind of stop-write migration. The target DSN is `--postgres-url`, else `GPU_FAULT_STORE_URL_FILE`, else
+`GPU_FAULT_STORE_URL`; a process with `GPU_FAULT_STORE_URL_FILE` set (inside a control-plane Pod, for example) refuses a
+PostgreSQL -> PostgreSQL copy, so run it as a dedicated process. Pass the source DSN in the environment variable named by
+`--source-postgres-url-env`, which keeps it off the process argv (`--source-postgres-url` still works but puts the DSN on
+the argv); the example manifest `deploy/migrations/postgres-to-aurora-migration.yaml` passes it that way and mounts
+`gpu-fault-rds-ca-bundle` for the `sslrootcert` of the Aurora target DSN (it carries the wheel ConfigMap placeholder and
+cannot be applied as is). Success prints `migration complete: objects=<n> links=<m>`:
 
 ```bash
 # SQLite -> PostgreSQL
@@ -10314,10 +10361,11 @@ GPU_FAULT_STORE_URL='postgresql://target/...' \
   gpu-fault-store-migrate \
   --sqlite-path /var/lib/gpu-fault/control-plane.db
 
-# or PostgreSQL -> PostgreSQL
+# or PostgreSQL -> PostgreSQL (the source DSN only through the environment)
 GPU_FAULT_STORE_URL='postgresql://target/...' \
+SOURCE_POSTGRES_URL='postgresql://source/...' \
   gpu-fault-store-migrate \
-  --source-postgres-url 'postgresql://source/...'
+  --source-postgres-url-env SOURCE_POSTGRES_URL
 ```
 
 After the migration completes, first start the minimal closed-loop verification. Regional mode must have one consumer and one ingress at the same time;
