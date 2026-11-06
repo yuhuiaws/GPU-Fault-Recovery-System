@@ -4195,16 +4195,21 @@ keeps it out of the latest metrics, so VALIDATE_HOST never reads a healthy 0 ms 
 samples come first in the tick and are repeated every tick until a batch is delivered (the tick a device vanishes is
 usually the `recovered` edge of its own, otherwise the next health summary carries them), and a vanished device's
 counter baseline is forgotten so a same-named successor is rated from its own first read
-(`collectors/host/system_metrics.py`). (2) After the claim of every host batch from the node's own collector
+(`collectors/host/system_metrics.py`). (2) Before the claim of every host batch from the node's own collector
 (`producer=node`) the control plane reads, through `stale_health_signal_states("cluster/node/")` (an exact prefix, not
 a key range: the production database's default collation is not byte order), the node's rows no claim wrote for
 `GPU_FAULT_HEALTH_SIGNAL_DEVICE_AGE_OUT_SUMMARIES` (default 3; `0` off; otherwise at least 2, because one jittered
 summary interval can run 1.5x) times `GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS` (default 300 s: about 15 minutes), and
 writes those that are active, device-scoped (device segment not `node`, metric in the host rule tables, not a
-per-attempt low-utilisation window) and absent from this batch to inactive through the ordinary claim once the window
-has passed on both the control plane's receive clock and the node's clock (the age-out); when only one clock jumped --
-a backlog delivered after an outage moves only the receive clock -- nothing is cleared. The record is the cleared state
-itself (`observed_at/clock_at` at the age-out), one INFO line naming the keys (`aged out N device-scoped health
+per-attempt low-utilisation window) to inactive through the ordinary claim once the window has passed on both the
+control plane's receive clock and the node's clock (the age-out) -- also when this batch carries the device again: when
+the node itself went silent for the window (a reboot, a dead collector, a replacement node under the same name; a
+collector start delivers every present device), the device's first sample after the silence is the first of a new
+episode, not a sample of the old latched one (the outcome used to depend on whether the device was in the node's first
+batch or a later one); a device the batch carries that reported within the window is never touched. When only one
+clock jumped -- a backlog delivered after an outage moves only the receive clock -- nothing is cleared. The record is
+the cleared state itself (`observed_at/clock_at` at the age-out, a microsecond before the batch for a device it carries
+so that the batch's own sample stays newer), one INFO line naming the keys (`aged out N device-scoped health
 signal(s) of cluster/node`) and `device_signal_age_outs_total` on the policy; no field is added to `HealthSignalState`,
 because the previous release could not decode a row with an unknown field after a rollback and the claim path reads
 these rows on every sample. Node-scoped signals (device segment `node`) and attempt windows are never aged out

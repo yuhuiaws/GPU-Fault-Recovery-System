@@ -1135,11 +1135,11 @@ class NodeHealthPolicy:
                 )
             )
         self.store.observe_telemetry_metrics(latest_metrics)
+        age_out_vanished_device_signals(self, batch, transitions)
         emitted = managed_attempt.claim(
             transitions,
             [finding_health_signal_fingerprint(item) for item in transition_findings],
         )
-        age_out_vanished_device_signals(self, batch, transitions)
         findings.extend(
             finding
             for finding, emit in zip(transition_findings, emitted, strict=True)

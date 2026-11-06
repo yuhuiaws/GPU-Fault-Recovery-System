@@ -30,12 +30,20 @@ carried by every delivered batch and is affected by neither:
   (``GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS``, default 300 s: fifteen minutes
   by default) on *both* the control plane's receive clock and the node's own
   clock, so a backlog the node delivers after an outage, where only the
-  receive clock jumped, ages nothing out. Node-scoped signals (device
-  ``node``) and attempt-scoped low-utilisation windows (the retention sweep's
-  business) are never aged out; only the node's own collector speaks for the
-  node's devices. The age-out is the cleared state itself -- ``active=False``
-  at the batch's time, written through the ordinary claim -- one INFO log line
-  naming the keys, and ``device_signal_age_outs_total`` on the policy. (No new
+  receive clock jumped, ages nothing out. It runs before the batch's own
+  claim and also re-arms a device the batch carries again after such a gap:
+  when the node itself went silent for the window -- a reboot, a dead
+  collector, a replacement node under the same name; a collector start
+  delivers every present device -- the device's first sample after it opens a
+  new episode instead of being judged against the old latch (that used to
+  depend on whether the device was in the node's first batch or a later one).
+  Node-scoped signals (device ``node``) and attempt-scoped low-utilisation
+  windows (the retention sweep's business) are never aged out; only the
+  node's own collector speaks for the node's devices. The age-out is the
+  cleared state itself -- ``active=False`` at the batch's time (a microsecond
+  before it for a device the batch carries), written through the ordinary
+  claim -- one INFO log line naming the keys, and
+  ``device_signal_age_outs_total`` on the policy. (No new
   field on ``HealthSignalState``: a row with an unknown field cannot be decoded
   by the previous release after a rollback, and the claim path reads these
   rows on every sample.)
@@ -70,6 +78,8 @@ DEVICE_AGE_OUT_SUMMARIES_ENV = "GPU_FAULT_HEALTH_SIGNAL_DEVICE_AGE_OUT_SUMMARIES
 #: Fewer summaries than this would age out a device whose one jittered summary
 #: ran long (``cadence.jittered_next_phase``: up to ``1.5 x`` the interval).
 MINIMUM_DEVICE_AGE_OUT_SUMMARIES = 2
+#: How far before a batch a key it carries again is cleared.
+_BEFORE = timedelta(microseconds=1)
 
 
 def device_gone(sample: HostMetricSample) -> bool:
@@ -125,8 +135,11 @@ def age_out_vanished_device_signals(
     """Clear the active device-scoped signals of ``batch``'s node that carried
     no sample for the age-out window on both clocks; the cleared keys.
 
-    ``transitions`` are the claims this batch made: a device in the batch is
-    reporting and is never aged out, whatever its reading.
+    Runs before ``transitions`` -- the claims this batch is about to make --
+    are written. A device the batch carries that reported within the window
+    is reporting and is never aged out, whatever its reading; one it carries
+    again after the window is cleared a microsecond before the batch, so its
+    sample is judged as the first of a new episode.
     """
 
     stale_after = policy.device_signal_age_out_seconds
@@ -139,32 +152,45 @@ def age_out_vanished_device_signals(
         return []
     window = timedelta(seconds=stale_after)
     prefix = f"{batch.cluster_id}/{batch.node_id}/"
-    claimed = {signal_key for signal_key, *_ in transitions}
+    carried = {signal_key for signal_key, *_ in transitions}
     received = _utc(signal_clock(batch.observed_at, batch.received_at))
     observed = _utc(batch.observed_at)
-    cleared: list[Transition] = []
+    absent: list[Transition] = []
+    returned: list[Transition] = []
     # Inclusive: a device last heard from exactly one window ago has been
     # missing for the window (the store's bound is exclusive, like retention's).
-    for state in stale_states(
-        prefix, stale_before=received - window + timedelta(microseconds=1)
-    ):
+    for state in stale_states(prefix, stale_before=received - window + _BEFORE):
         if (
             not state.active
-            or state.signal_key in claimed
             or not _device_scoped(policy, prefix, state.signal_key)
             or observed - _utc(state.observed_at) < window
         ):
             continue
-        cleared.append((state.signal_key, False, batch.observed_at, 0.0))
-    if not cleared:
+        if state.signal_key in carried:
+            returned.append((state.signal_key, False, batch.observed_at - _BEFORE, 0.0))
+        else:
+            absent.append((state.signal_key, False, batch.observed_at, 0.0))
+    if absent:
+        policy.store.claim_health_signal_transitions(
+            absent, received_at=batch.received_at
+        )
+    if returned:
+        # Strictly older than the batch, or the store would drop the batch's
+        # own sample of the key as a replay (``sample_disposition``).
+        policy.store.claim_health_signal_transitions(
+            returned,
+            received_at=(
+                batch.received_at - _BEFORE if batch.received_at is not None else None
+            ),
+        )
+    keys = [signal_key for signal_key, *_ in (*absent, *returned)]
+    if not keys:
         return []
-    policy.store.claim_health_signal_transitions(cleared, received_at=batch.received_at)
-    keys = [signal_key for signal_key, *_ in cleared]
     policy.device_signal_age_outs_total += len(keys)
     LOGGER.info(
         "aged out %d device-scoped health signal(s) of %s/%s: no sample for their "
-        "device in %.0f s while the node kept reporting; a new crossing opens a "
-        "new episode: %s",
+        "device in %.0f s on the node's and the receive clock; a new crossing "
+        "opens a new episode: %s",
         len(keys),
         batch.cluster_id,
         batch.node_id,

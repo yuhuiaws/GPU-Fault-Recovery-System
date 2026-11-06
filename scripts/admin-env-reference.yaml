@@ -542,7 +542,7 @@ categories:
       - name: GPU_FAULT_HEALTH_SIGNAL_GRACE_SECONDS
         description: "健康信号保留的宽限秒数（默认 1 天，取值 600 至保留期）：宽限内被写过的行从不删除；attempt 已结束、节点已证明离开或旧版本按 attempt 存的 EFA 行，须超过宽限无写入才删除。"
       - name: GPU_FAULT_HEALTH_SIGNAL_DEVICE_AGE_OUT_SUMMARIES
-        description: "设备级健康信号（键为 cluster/node/metric/<device>，如 disk_io_await_ms/dm-0）在节点仍在上报、但该设备连续多少个 host 健康摘要周期（GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS，默认 300 秒）没有任何样本后被老化清除（默认 3，即约 15 分钟；控制面接收时钟与节点时钟都须超过该窗口）：清除后同名设备再次持续越界会产生新的 finding/通知；0 关闭老化，1 不允许（一个抖动后的摘要间隔即可能超过）。节点级信号与按 attempt 计时的低利用率窗口不受影响。"
+        description: "设备级健康信号（键为 cluster/node/metric/<device>，如 disk_io_await_ms/dm-0）在该设备连续多少个 host 健康摘要周期（GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS，默认 300 秒）没有任何样本后，于节点的下一个批次被老化清除（默认 3，即约 15 分钟；控制面接收时钟与节点时钟都须超过该窗口；该批次又带上该设备时也一样，例如节点本身重启或 collector 停止超过窗口之后）：清除后同名设备再次持续越界会产生新的 finding/通知；0 关闭老化，1 不允许（一个抖动后的摘要间隔即可能超过）。节点级信号与按 attempt 计时的低利用率窗口不受影响。"
       - name: GPU_FAULT_REMOTE_COMMAND_STALE_FENCE_GRACE_SECONDS
         production: "600"
         description: "LEASED 远程命令租约过期后，栅栏不再匹配的命令被清扫为 FAILED(stale-fence) 前的宽限秒数（D-9）。"

@@ -266,3 +266,58 @@ def test_a_gone_sample_for_an_unknown_device_writes_nothing(site: Site) -> None:
     gone = dm0(0.0, **{DEVICE_STATE_LABEL: DEVICE_STATE_GONE})
     assert site.evaluate(0, [gone]) == []
     assert site.store.get_health_signal_state(DM0) is None
+
+
+def test_a_device_back_above_threshold_after_the_node_itself_was_silent_is_a_new_episode(
+    site: Site,
+) -> None:
+    """The whole node went quiet for longer than the window on both clocks -- a
+    reboot, a dead collector, a replacement node under the same name -- and the
+    first batch after it carries dm-0 above its threshold again (a collector
+    start delivers every present device in its baseline). The claim used to
+    run first and judge that sample against the old latch, and the age-out
+    skipped a key the batch carried: no finding for a new episode, for as long
+    as the device stayed slow. The same device back one batch later was aged out
+    and minted -- the verdict followed the batch's composition."""
+
+    at = site.first_episode()
+    at += 2 * 3600.0  # nothing from the node for two hours
+    assert site.evaluate(at, [dm0(250.0)]) == [], "the sustain window starts again"
+    state = site.store.get_health_signal_state(DM0)
+    assert state is not None and state.active and state.notified is False, state
+    assert state.active_since == NOW + timedelta(seconds=at), state
+    assert site.policy.device_signal_age_outs_total == 1
+    findings = site.evaluate(at + WINDOW, [dm0(250.0)])
+    assert [item.metric_name for item in findings] == ["disk_io_await_ms"], (
+        "the new episode mints its own finding"
+    )
+
+
+def test_a_device_back_after_a_silence_shorter_than_the_window_keeps_its_episode(
+    site: Site,
+) -> None:
+    at = site.first_episode()
+    at += 2 * SUMMARY  # a collector restart: under three summaries of silence
+    assert site.evaluate(at, [dm0(250.0)]) == []
+    assert site.evaluate(at + WINDOW, [dm0(250.0)]) == [], "one episode, one finding"
+    state = site.store.get_health_signal_state(DM0)
+    assert state is not None and state.active and state.notified is True, state
+    assert site.policy.device_signal_age_outs_total == 0
+
+
+def test_a_backlog_that_carries_the_device_keeps_its_episode(site: Site) -> None:
+    """Only the receive clock jumped: the node's clock says dm-0 was read
+    seconds after its last sample, so it is one episode still."""
+
+    at = site.first_episode()
+    late = NOW + timedelta(hours=2)
+    for tick in (15, 30, 45):
+        assert (
+            site.evaluate(
+                at + tick, [dm0(250.0)], received_at=late + timedelta(seconds=tick)
+            )
+            == []
+        )
+    state = site.store.get_health_signal_state(DM0)
+    assert state is not None and state.active and state.notified is True, state
+    assert site.policy.device_signal_age_outs_total == 0
