@@ -196,9 +196,10 @@ def test_bmc_critical_sensor_rule_names_the_sensors_without_mutating_the_sample(
     """The rule's reason carries the labelled sensors (GF-GENERAL-LIVE-015).
 
     The reason is the one text the incident (``reasons``), the marker
-    (``raw_reason``) and the QUARANTINE step's hardware escalation mail keep,
-    so a multi-sensor alert names its sensors there; a bare count from an
-    older collector keeps the table's fixed text.
+    (``raw_reason``) and the notice the completed QUARANTINE plan sends
+    (``quarantined-node-notice-zh-v1``) keep, so a multi-sensor alert names
+    its sensors there; a bare count from an older collector keeps the table's
+    fixed text.
     """
 
     alerts = (

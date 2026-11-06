@@ -34,8 +34,9 @@ training, thermal, spare-health or RMA policies from that review.
   count ≥1 names the alerting sensors on the sample (`sensors`,
   `sensor_alerts`: reading, units, status, the threshold columns printed), and
   `bmc_critical_sensor_rule` writes them into the finding reason, so the
-  incident reasons and the marker name them instead of a bare "2" (the
-  quarantine chain sends no mail of its own). BMC the node cannot provide -- no `ipmitool`, or an
+  incident reasons, the marker and the `quarantined-node-notice-zh-v1`
+  notice the completed quarantine chain sends name them instead of a bare
+  "2". BMC the node cannot provide -- no `ipmitool`, or an
   `ipmitool` that finds no IPMI device node and none exists (EC2) -- is
   `bmc_status_unsupported` (TOOL_MISSING / NO_DEVICE) with no collection
   error, like SMART's, so it never holds host validation. Like every

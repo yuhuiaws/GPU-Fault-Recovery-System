@@ -2357,8 +2357,8 @@ expected FAIL 变体却 PASS），这种底线之下的读数以及无样本可�
   传感器数（同名重复行只计一次）→ MARK_UNSCHEDULABLE + QUARANTINE 一条 incident，随后同一
   包装器改供健康表、产品读到 0（recovered），再关窗、受控恢复。`sensor_identity` 阶段要求每个
   告警传感器的名称出现在三处：样本标签 `sensors`（`sensor_alerts` 另带读数、单位、状态和
-  ipmitool 打印的阈值列）、该 finding 所开 incident 的 `reasons`（QUARANTINE 计划本身不发邮件，
-  之后若有支持交接，其邮件列出这段文字，形如 `BMC reports 2 critical sensors: CPU1 Temp=96.000 degrees C [cr; unc
+  ipmitool 打印的阈值列）、该 finding 所开 incident 的 `reasons`（QUARANTINE 计划完成时发出的
+  `quarantined-node-notice-zh-v1` 通知列出这段文字，形如 `BMC reports 2 critical sensors: CPU1 Temp=96.000 degrees C [cr; unc
   90.000, ucr 95.000, unr 100.000]; Fan1=...`）和该 incident marker 的 `raw_reason`；
   旧的裸计数在三处都不命名传感器，即为 FAIL。`wrong_column`（cr/nr 出现在名称/值/单位列、
   三列残行）与 `unavailable_sensor`（一行 na/na）须是 `bmc_critical_sensor=0`、无标签、无采集

@@ -1659,9 +1659,14 @@ error and no sample -- and stays software-tested). 015 `critical` and
 `bmc_critical_sensor` sample's `sensors` / `sensor_alerts` labels (name,
 reading, units, status and the threshold columns ipmitool printed), the
 incident `reasons` (`BMC reports 2 critical sensors: CPU1 Temp=96.000 degrees C
-[cr; unc 90.000, ucr 95.000, unr 100.000]; Fan1=...`, the text a later support
-hand-off's mail lists; the QUARANTINE plan sends no mail) and the marker `raw_reason`; a bare
-count would name nothing. 015
+[cr; unc 90.000, ucr 95.000, unr 100.000]; Fan1=...`, the text the
+`quarantined-node-notice-zh-v1` notice of the completed QUARANTINE plan lists)
+and the marker `raw_reason`; a bare count would name nothing. That notice
+(category OPERATOR_REVIEW, "[GPU FAULT][quarantined, operator action required]
+<cluster>: <node>", one per incident; the same for 004's full filesystem and
+016's severe kernel lines) is software-tested only
+(`tests/execution/test_quarantined_node_notice.py`): no live run has carried
+it yet, and the 015/004/016 harness does not judge it. 015
 `command_failure` serves two exits in turn: a BMC that does not answer (`Get
 Device ID command failed`) must be a `_bmc` collection error with no sample, a
 host without an IPMI device node (`Could not open device at /dev/ipmi0 ...: No

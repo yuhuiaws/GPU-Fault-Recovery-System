@@ -12,6 +12,10 @@ from gpu_fault.execution.contained_handoff import (
     notify_contained_operator_handoff,
 )
 from gpu_fault.execution.models import WorkflowStepOutcome
+from gpu_fault.execution.terminal_quarantine_notice import (
+    notify_terminal_quarantine,
+    terminal_quarantine,
+)
 from gpu_fault.execution.terminal_state import TerminalDecision, inconclusive_reason
 from gpu_fault.markers import retire_markers_for_incident
 from gpu_fault.models import (
@@ -161,11 +165,13 @@ def after_terminal_write(
 ) -> None:
     """The effects that follow a terminal write and must never undo it.
 
-    Both are read from ``decision`` -- the records as written -- and both are
+    All are read from ``decision`` -- the records as written -- and all are
     skipped when the incident was not this workflow's to write (a stronger
     successor took the pointer): the inconclusive-diagnostic close with its
-    advisory, and the hand-off notice of a settled containment prefix whose
-    plan an operator now owns (``execution/contained_handoff.py``).
+    advisory, the hand-off notice of a settled containment prefix whose plan
+    an operator now owns (``execution/contained_handoff.py``), and the notice
+    of a completed remediation that left its node quarantined
+    (``execution/terminal_quarantine_notice.py``).
     """
 
     if decision.incident is None or not incident_written:
@@ -188,6 +194,11 @@ def after_terminal_write(
             handoff,
             builder=executor.contained_handoff_email_builder,
             sender=executor.notification_sender,
+        )
+    held = terminal_quarantine(decision)
+    if held is not None:
+        notify_terminal_quarantine(
+            executor.store, decision, held, sender=executor.notification_sender
         )
 
 

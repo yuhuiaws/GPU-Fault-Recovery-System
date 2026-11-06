@@ -64,10 +64,10 @@ class HostBmcMixin:
         as labels -- ``sensors`` (names, table order, each once) and
         ``sensor_alerts`` (name, reading, units, status and the threshold
         columns ipmitool printed) -- which the grader puts into the finding's
-        reason and details, so the incident reasons and the marker name them
-        (the QUARANTINE plan sends no mail; a support hand-off that may follow
-        lists the reasons). A healthy table
-        is the plain ``0`` an older control plane already reads.
+        reason and details, so the incident reasons, the marker and the
+        notice the completed QUARANTINE plan sends
+        (``quarantined-node-notice-zh-v1``) name them. A healthy table is the
+        plain ``0`` an older control plane already reads.
 
         What the BMC could not say is UNKNOWN, never a zero: a non-zero exit,
         a hung or unrunnable ipmitool, a table without a four-column row and

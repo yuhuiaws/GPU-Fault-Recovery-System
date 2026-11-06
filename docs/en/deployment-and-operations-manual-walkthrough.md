@@ -724,4 +724,4 @@ The sub-sections kept in the main manual are for executing the alternative path 
 | `Cleaning Up Fleet Records After a Node Disappears Through External Repair or Permanent Decommissioning` | The control plane drains and revokes stale Agents by itself once the three-way proof holds; CLI fallback |
 | `Adding an Independently Repaired and Re-accepted Node to the Spare Pool` | Complete the health, Agent, label, AVAILABLE and cordon gates |
 | Manual cleanup of isolation residue (only when the workflow never reached `RESTORE_SCHEDULING`) | Clean only this solution's taints/annotations |
-| `Known Gap: No Notification When Isolation Completes` | Do not rely on emails to judge whether remediation may proceed |
+| `Known Gap: No Notification When a Repair Path Isolates the Node` | Do not rely on emails to judge whether remediation may proceed; a plan that ends with the isolation sends `quarantined-node-notice-zh-v1` when it ends |

@@ -101,6 +101,10 @@ _EXPORTS = {
         "gpu_fault.notifications.contained_operator_handoff",
         "ContainedOperatorHandoffEmailBuilder",
     ),
+    "QuarantinedNodeNoticeEmailBuilder": (
+        "gpu_fault.notifications.quarantined_node_notice",
+        "QuarantinedNodeNoticeEmailBuilder",
+    ),
     "RestartGuardEmailBuilder": (
         "gpu_fault.notifications.restart_guard",
         "RestartGuardEmailBuilder",

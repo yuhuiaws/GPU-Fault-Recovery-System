@@ -473,12 +473,13 @@ def bmc_critical_sensor_rule(
 ]:
     """The BMC rule, with the alerting sensors named in its reason.
 
-    The reason is the one text the incident keeps (``reasons``) and the
-    marker carries (``raw_reason``) -- the QUARANTINE plan sends no mail; a
-    support hand-off that may follow lists the reasons -- so this is where the names, readings, statuses and thresholds
-    the collector put in the sample's labels (``sensor_alerts``, or the bare
-    ``sensors`` names) reach the operator: a multi-sensor alert names its
-    sensors instead of reading "2". The labels themselves travel as the
+    The reason is the one text the incident keeps (``reasons``), the marker
+    carries (``raw_reason``) and the notice the completed QUARANTINE plan
+    sends lists (``quarantined-node-notice-zh-v1``), so this is where the
+    names, readings, statuses and thresholds the collector put in the
+    sample's labels (``sensor_alerts``, or the bare ``sensors`` names) reach
+    the operator: a multi-sensor alert names its sensors instead of reading
+    "2". The labels themselves travel as the
     finding's ``diagnostic_parameters``. A count without labels -- a node
     whose collector predates them -- keeps the table's fixed text. Pure: the
     sample is evidence and is not changed.

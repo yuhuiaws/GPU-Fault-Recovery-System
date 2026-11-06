@@ -9433,7 +9433,17 @@ containment prefix and the record stops `BLOCKED/SAFETY_SETTLED` (incident `QUAR
 `contained-operator-handoff-zh-v1`, category `OPERATOR_REVIEW`, subject `[GPU FAULT][contained, operator action
 required] <cluster>: <nodes>`, deduplication key `<cluster>/<incident>/contained-operator-handoff/<workflow>`: the body
 names the cordoned + quarantined nodes, the steps run and not run, the capability without an owner, the `blocked_reasons`
-and the two exits (`submit-remediation --disposition restore`; a close on the departure proof once the node is replaced). When a GPU
+and the two exits (`submit-remediation --disposition restore`; a close on the departure proof once the node is replaced). When a plan
+that ends with its QUARANTINE and has no ESCALATE_SUPPORT -- the FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → [STOP_WORKLOADS] →
+QUARANTINE of a node-health finding graded `QUARANTINE` (a BMC sensor, a disk or inode table full, a SMART failure, a required link
+down, a severe kernel log line, a GPU finding so graded), or a critical quarantine folded into another chain -- ends SUCCEEDED with the
+incident still `QUARANTINED`, the executor sends `quarantined-node-notice-zh-v1`, category `OPERATOR_REVIEW`, subject
+`[GPU FAULT][quarantined, operator action required] <cluster>: <nodes>`, deduplication key `<cluster>/<incident>/quarantined-node-notice`
+(one per incident: a re-run step or a second record of the incident ending on the same hold sends nothing new): the body names the held
+nodes, the finding (the incident reasons; for the BMC, the alerting sensors with their readings, statuses and thresholds), the steps
+run, the cordon + taint, the jobs the remediation suspended and did not restart, and the two exits (`submit-remediation --disposition
+restore` after the repair; a close on the departure proof once the node is replaced); the incident state and the operator's exits do
+not change, and no support case is opened. When a GPU
 cluster's remediation storm breaker trips, the dispatcher sends one `remediation-storm-tripped-zh-v1` per trip, category
 `OPERATOR_REVIEW`, priority 0 (ahead of the per-node mail a storm queues), subject `[GPU FAULT][remediation storm, operator action
 required] <cluster>: <N> nodes in 600s`, deduplication key `<cluster>/remediation-storm-tripped/<trip>`: the body names the numbers it
@@ -13229,7 +13239,7 @@ The target value of `unschedulable` should be taken from the `gpu-fault.io/previ
 `gpu-fault.io/node-key-activation` / `node-key-activated`; the full list is
 `gpu_fault.node_installer_reconciler.INSTALLER_NODE_ANNOTATIONS`) -- they belong to the node installer and are unrelated to isolation.
 
-##### Known Gap: No Notification When Isolation Completes
+##### Known Gap: No Notification When a Repair Path Isolates the Node
 
 The current implementation **sends no notification** at the moment isolation succeeds -- `_isolate()`
 (`src/gpu_fault/adapters/kubernetes/node_operations.py::KubernetesNodeOperationsMixin._isolate`) contains no
@@ -13237,6 +13247,12 @@ The current implementation **sends no notification** at the moment isolation suc
 The first email the administrator receives is the XID investigatory action email sent **synchronously** at ingest time
 (`src/gpu_fault/app/`, **before** `dispatcher.wake()`), when isolation has not yet executed.
 **So "the node is already isolated when the notification arrives" does not currently hold; the order is reversed.**
+
+A plan that ends with the isolation itself is no longer silent: when the FREEZE_EVIDENCE → MARK_UNSCHEDULABLE →
+[STOP_WORKLOADS] → QUARANTINE of a node-health finding graded `QUARANTINE` (a BMC sensor, a host signal, a GPU finding so
+graded) ends SUCCEEDED with the incident `QUARANTINED`, the executor sends one `quarantined-node-notice-zh-v1` after the
+terminal write (one per incident; see chapter 8, "Email Notifications"). That notice is the plan's end, not a status notice
+during a repair: this gap still applies to every path that isolates and then repairs (reset, reboot, replace).
 
 warm-spare replace itself already has two kinds of notifications:
 

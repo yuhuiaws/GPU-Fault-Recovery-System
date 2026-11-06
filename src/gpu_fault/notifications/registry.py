@@ -38,6 +38,9 @@ from gpu_fault.notifications.nvlink74_mechanical import (
 from gpu_fault.notifications.nvlink74_support import (
     Nvlink74SupportEmailBuilder,
 )
+from gpu_fault.notifications.quarantined_node_notice import (
+    QuarantinedNodeNoticeEmailBuilder,
+)
 from gpu_fault.notifications.remediation_storm import RemediationStormEmailBuilder
 from gpu_fault.notifications.restart_guard import RestartGuardEmailBuilder
 from gpu_fault.notifications.sxid_event import SxidEventEmailBuilder
@@ -67,6 +70,7 @@ class NotificationKind(StrEnum):
     DCGM_DIAGNOSTIC = "DCGM_DIAGNOSTIC"
     DIAGNOSTIC_INCONCLUSIVE = "DIAGNOSTIC_INCONCLUSIVE"
     CONTAINED_OPERATOR_HANDOFF = "CONTAINED_OPERATOR_HANDOFF"
+    QUARANTINED_NODE_NOTICE = "QUARANTINED_NODE_NOTICE"
     HARDWARE_ESCALATION = "HARDWARE_ESCALATION"
     HUNG_SUPPORT_HANDOFF = "HUNG_SUPPORT_HANDOFF"
     NVLINK74_SUPPORT = "NVLINK74_SUPPORT"
@@ -133,6 +137,9 @@ NOTIFICATION_REGISTRY = {
     ),
     NotificationKind.CONTAINED_OPERATOR_HANDOFF: NotificationDefinition(
         ContainedOperatorHandoffEmailBuilder
+    ),
+    NotificationKind.QUARANTINED_NODE_NOTICE: NotificationDefinition(
+        QuarantinedNodeNoticeEmailBuilder
     ),
     NotificationKind.HARDWARE_ESCALATION: NotificationDefinition(
         HardwareEscalationEmailBuilder
