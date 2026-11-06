@@ -18,9 +18,10 @@ Administrators can currently configure:
   (`managedNodeCount`);
 - telemetry spool enabled/disabled, the spool-worker replica count and the single-cluster spool depth
   `maxClusterDepth` (64..65536, default 1024; beyond that depth a single cluster's routine telemetry receives reserved 429.
-  Per the complete model of a 1000-node single cluster in Performance Acceptance Plan §13.4: at 1024, 1150 of 3000 routine telemetry requests got 429;
-  at 4096 all 6500 requests got 202 with P0 and evidence unchanged. 4096 is recommended when a single cluster has >= 512 nodes;
-  the default 1024 corresponds to the preset 256-node cluster model);
+  Per the 1000-node single cluster of Performance Acceptance Plan §13.4: the priority-only model at 1024 got 243 429s on its
+  3000 routine telemetry requests; the complete model at 4096 got 202 for all 6500 requests with P0 and evidence unchanged.
+  4096 is recommended when a single cluster has >= 512 nodes; the default 1024 corresponds to the preset 256-node cluster
+  model; the ingress's spool admission reads the value, and §7 says what a change of it alone rolls);
 - Aurora Serverless v2 Min/Max ACU;
 - Processor total queue, single-cluster queue, client backoff, persistent retry, completed record retention and the
   ingress's routine admission batch delay (`admissionBatchDelaySeconds`, 0..0.5 s, default 0.002; the default is
@@ -40,7 +41,7 @@ Administrators can currently configure:
   itself, and those records are left to `workflow-reconcile` (Administrator Operations §10.1.1);
 - Notification batch size and maximum attempts;
 - Raw evidence retention hours and per-node record cap;
-- The CPU control plane's scheduled update, `cpuControlPlane` (batch 240). `rollingUpdate.mode` is `rolling` (the
+- The CPU control plane's scheduled update, `cpuControlPlane`. `rollingUpdate.mode` is `rolling` (the
   default) or `unchanged`, and `rollingUpdate.waitIntervalSeconds` is 900..3600, default 1800.
   `rollbackAlarms.capacity`/`rollbackAlarms.notRestored` name the two CloudWatch alarms; the defaults are
   `gpu-fault-cpu-roll-api-capacity`/`gpu-fault-cpu-roll-api-not-restored`, and two sites in one account and Region
@@ -114,8 +115,10 @@ The CLI validates the configuration before the source build or any AWS/Kubernete
 <state-dir>/admin-config.yaml
 ```
 
-A first deployment does not need `config` to run first. Without `--config` the release defaults are used and a default
-`<state-dir>/admin-config.yaml` is generated.
+A first deployment does not need `config` to run first. Without `--config` the release defaults are used (or, when the
+state dir already holds an `admin-config.yaml`, that file is read) and a default `<state-dir>/admin-config.yaml` is
+generated. Once the site exists (`site.yaml` is present), `deploy --config` accepts only a file equal to the current
+desired values; a different one is refused with the hint to use `gpu-fault-admin config --state-dir <state-dir>`.
 
 ## 4. Modifying an Existing Site
 
@@ -125,7 +128,7 @@ A first deployment does not need `config` to run first. Without `--config` the r
 gpu-fault-admin config --state-dir STATE_DIR [--file ADMIN_CONFIG] [--dry-run] [--reference REFERENCE] [--accept-below-registered-fleet]
 ```
 
-Under the same verb there is also a sub-action `gpu-fault-admin config spare --state-dir STATE_DIR --node NODE [--declare|--release ...]` for declaring or releasing warm-spare GPU nodes; it does not involve the capacity configuration of this document, see the task table of [Administrator Operations](administrator-operations.md).
+Under the same verb there is also a sub-action `gpu-fault-admin config spare --state-dir STATE_DIR --node NODE [--fault-node NODE] [--cluster-id ID] [--reference REFERENCE] [--declare --confirm DECLARE_WARM_SPARE_CORDON | --release --confirm RELEASE_WARM_SPARE_UNCORDON]` for declaring or releasing warm-spare GPU nodes (without `--declare`/`--release` it only runs the read-only readiness check); it does not involve the capacity configuration of this document, see the task table of [Administrator Operations](administrator-operations.md).
 
 After editing `<state-dir>/admin-config.yaml` the administrator simply runs:
 
@@ -135,13 +138,16 @@ gpu-fault-admin config --state-dir /secure/gpu-fault
 
 - `--file`: temporarily use another `0600` file as input; on success the CLI writes the normalised result back to
   `<state-dir>/admin-config.yaml` so it always equals the online desired values.
-- `--dry-run`: reads only the local `desired.json` and YAML, prints the change plan (affected roles, before/after values per field,
-  whether Aurora changes) and exits. No Cosign signature verification, no cluster reads, no executor identity resolution, no state file written,
-  and no migration of a legacy `desired.json`. A missing input file is refused outright without creating the template or changing
-  directory permissions; the ordinary non-dry-run command can still initialise a missing default template. Reading no
+- `--dry-run`: reads only the local `desired.json` and YAML, prints the change plan (a `status: DRY_RUN` JSON document:
+  affected roles, before/after values per field, whether Aurora changes) and exits. No Cosign signature verification, no
+  cluster reads, no executor identity resolution, no state file written, and no migration of a legacy `desired.json`. A
+  missing input file is refused outright without creating the template or changing directory permissions; the ordinary
+  non-dry-run command, when `<state-dir>/admin-config.yaml` is missing (and no `--file` is given), writes the complete
+  editable file from the currently persisted configuration and stops, asking for the edit and a rerun. Reading no
   cluster, it cannot judge whether a lowered node count falls below the registered GPU fleet (§4.2 step 2): it prints the
   plan as before, and the real apply judges.
-- `--reference`: optional change ticket or maintenance window number, 3 to 128 letters, digits or `. _ : / -`.
+- `--reference`: optional change ticket or maintenance window number, 3 to 128 letters, digits or `. _ : / -`, the first
+  character a letter or digit.
   When absent it is recorded as `<executor identity>:<start time>`. The executor identity is always taken automatically from
   the caller ARN of `aws sts get-caller-identity` (degrading to `user@host` when unobtainable) and enters the audit record together with the
   reference; administrators need not and cannot fill in the identity by hand.
@@ -156,7 +162,9 @@ Fields absent from the file inherit the currently persisted values. The CLI refu
 `managedNodeCount` less than
 `largestClusterNodeCount`, combinations exceeding the accepted PostgreSQL fleet connection budget, and combinations violating the §5
 topology derivation rules (for example raising the managed node count to 2048 without raising `aurora.minAcu` to at least 20.5).
-The error message gives the exact next command to run.
+Each field's range is in §5. A validation error names the field and its bound (an empirical floor names both fields and the
+measurement behind it); a state error (a missing file, a damaged record, an interrupted apply that does not match the current
+state) gives the exact next command to run.
 
 ### 4.2 Apply Flow
 
@@ -164,7 +172,7 @@ Without `--dry-run`, the whole command holds the site operation lock (the same l
 and, in order:
 
 1. Reads `desired.json` (a legacy record is first verified per §4.5 and atomically completed) and the YAML, computes the target configuration and validates it
-   fully; with no change it prints `NOOP` and exits without writing any file.
+   fully.
 2. Checks the content-addressed Manifest against the Cosign attestation and reads the live release
    state in the CPU cluster: it must be the current signed release and already committed, otherwise fail closed (except the resume exception of §4.3).
    When the target lowers `spec.capacity.largestClusterNodeCount` or `managedNodeCount` below the current `desired.json`
@@ -178,7 +186,10 @@ and, in order:
    finding into one stderr line and the apply continues.
 3. Writes the audit: `history/<start time>-<target configuration digest>/before.json` (the
    `desired.json` before the change), `pending.json` (configuration before and after, site identity, signed release identity,
-   executor, reference, start time), then changes `desired.json` to the target configuration.
+   executor, reference, start time), then changes `desired.json` to the target configuration. When the target equals the
+   current configuration this step writes nothing and prints `NOOP` (with `config_sha256`, the reference and the
+   executor) and exits; the signature and live-release checks of step 2 have run before it, and a stale `pending.json`
+   of another target is still recorded `SUPERSEDED` first (§4.3).
 4. When Aurora Min/Max changed, first calls RDS `modify-db-cluster` and waits for the cluster, writer and reader
    to return to `available` on the new window (three consecutive observations); when it did not change, checks
    read-only that the live window equals the pre-change value (`verify_aurora_capacity`), so an apply is never
@@ -201,7 +212,8 @@ and, in order:
    template (the old Pod sharing the surge node last -- otherwise the controller always deletes it first and the next
    new Pod has nowhere to go), recomputed from where the new Pods actually land during the rollout wait; only when
    even the steered order cannot progress is the change refused, naming the node short of cores and by how much
-   ("free one 4-core / 4Gi slot on a second node or add a CPU node"). The roles roll one at a time, each waiting for
+   ("free one 4-core / 4Gi slot on a second node (one that will host no new Pod) or add a CPU node before applying").
+   The roles roll one at a time, each waiting for
    its own rollout: ingress -> control-worker ->
    spool-worker.
 6. When raising Min ACU, proves after the role rollout that the `ServerlessDatabaseCapacity` of both writer and reader
@@ -210,7 +222,10 @@ and, in order:
    (three polls were measured at about 38 seconds, one takes about 6); a stale sample still keeps the step waiting. The
    ramp itself already happened in step 4, so this step normally ends after one read.
 7. Writes `history/<...>/after.json` and `result.json` (`APPLIED`), deletes `pending.json`,
-   and writes the normalised complete 19 items back to `<state-dir>/admin-config.yaml`.
+   writes the normalised complete configuration back to `<state-dir>/admin-config.yaml` (19 items when everything is at
+   its default: the fields §5 lists as omitted at their default, and a `cpuControlPlane` section wholly at its defaults,
+   are left out and written once they carry another value) and prints the `APPLIED` result (affected roles,
+   `affected_resources`, the history and the audit file).
 
 The log prints `admin-phase-begin <time> command=config phase=<step>` and
 `admin-phase-end ... status=ok|failed elapsed=<seconds>s` per step: steps 1-3 are `release-identity`,
@@ -304,7 +319,8 @@ spec:
 ```
 
 The `preset` is applied first, then other explicit fields in the same file override on top; non-capacity fields inherit from the currently persisted
-AdminConfig. A preset names a topology, and the topology decides the Aurora Min ACU floor (see §5): when the current
+AdminConfig. A preset replaces the whole capacity section (`telemetrySpool.maxClusterDepth` returns to 1024 too); to keep
+a non-preset value, spell it in the same file's `spec.capacity`. A preset names a topology, and the topology decides the Aurora Min ACU floor (see §5): when the current
 Min ACU is below that preset's floor, the plan raises Min ACU to the floor and Max ACU to `max(current Max, 128)`,
 entering the audit and RDS path like any other Aurora change; an Aurora already above the floor is not lowered. The `124/128` used by the formal stress
 test is above the `82` floor of `32-*` and must still be set explicitly; it cannot be inferred from `32-enabled`;
@@ -331,7 +347,8 @@ the schedulability preflight by the same formula before the apply (§4.2 step 5)
 Pods' deletion order is steered); no free slot at all, or a new Pod with nowhere to go even steered, is refused naming
 the node and the missing cores -- add CPU nodes first, then apply.
 
-Admission batch delay: the presets leave `processor.admissionBatchDelaySeconds` at the release default 0.002 (2 ms).
+Admission batch delay: a preset replaces only the capacity section (and raises Aurora, never lowers it); it leaves
+`processor.admissionBatchDelaySeconds` at its current value (the release default is 0.002, 2 ms).
 The tuned group of Performance Acceptance Plan §13.3 improved completion p99 by about 14% at 0.05 with unchanged
 throughput, but PostgreSQL `xact_rollback` rose from 4 to 59 and §15 item 6 requires repeated rounds before it becomes
 the default, so the default is not changed silently. With the ingress's routine admission batch cap of 64, a delay of
@@ -470,7 +487,10 @@ high-water mark: on one release with identical admission defaults, ingress throu
 store to 538 req/s (49 % of the active statements waiting on `LWLock:BufferContent`) and returned to 1,141 req/s once
 only the indexes were rebuilt and the three small tables `VACUUM FULL`ed. The control worker's periodic job
 `store-compaction` (`GPU_FAULT_STORE_COMPACTION_INTERVAL_SECONDS`, default 300 s, `0` disables) does exactly that from
-catalog facts and exports `gpu_fault_store_hot_table_heap_pages_per_live_row{table}`,
+catalog facts (`REINDEX INDEX CONCURRENTLY` of each index past the thresholds on the queue, the payloads, the objects, the
+metric latest table and its per-cluster partitioned table and the GPU metrics batches, `VACUUM (FULL, ANALYZE)` of the
+three small tables; it shares the `gpu_fault_schema_bootstrap` advisory lock with the schema ensure and
+`store-maintenance` and skips a round while the lock is held instead of waiting) and exports `gpu_fault_store_hot_table_heap_pages_per_live_row{table}`,
 `gpu_fault_store_hot_table_index_pages_per_live_row{table}` and
 `gpu_fault_store_hot_table_index_min_entries_per_page{table}`, `gpu_fault_store_hot_table_index_max_pages{table}` and
 `gpu_fault_store_hot_table_due_actions{table}`; the control-plane ADOT keep list ships these families, the
@@ -488,7 +508,7 @@ of throughput. The variable is a ConfigMap environment variable, not a capacity-
 
 ## 5. Configuration File Format
 
-The current template content is:
+The current template, `config/admin-config.example.yaml`, reads (comments removed):
 
 ```yaml
 apiVersion: gpu-fault.aws/v1alpha1
@@ -501,7 +521,6 @@ spec:
     telemetrySpool:
       enabled: false
       replicas: 0
-      maxClusterDepth: 1024
   aurora:
     minAcu: 8
     maxAcu: 32
@@ -512,14 +531,6 @@ spec:
     retryBackoffSeconds: 1
     retryBackoffMaxSeconds: 30
     completedRetentionSeconds: 600
-    admissionBatchDelaySeconds: 0.002
-    admissionBatchDelayMaxSeconds: 0.05
-    admissionFlushConcurrency: 96
-    admissionFlushConcurrencyFloor: 96
-    faultAdmissionFlushConcurrency: 48
-    faultAdmissionFlushConcurrencyFloor: 48
-    evidenceAdmissionFlushConcurrency: 24
-    evidenceAdmissionFlushConcurrencyFloor: 12
   workflow:
     pollIntervalSeconds: 5
     dispatcherWorkers: 8
@@ -537,6 +548,42 @@ spec:
       capacity: gpu-fault-cpu-roll-api-capacity
       notRestored: gpu-fault-cpu-roll-api-not-restored
 ```
+
+That is 23 leaf fields. Ten more fields are not in the template: at their defaults they are left out of `desired.json`
+and of the generated `<state-dir>/admin-config.yaml` (so the digests of an existing site do not move); to change one,
+spell it in the matching section of the same file: `spec.capacity.telemetrySpool.maxClusterDepth` (1024),
+`spec.workflow.departedNodeCleanup` (`true`), `spec.processor.admissionBatchDelaySeconds` (0.002),
+`admissionBatchDelayMaxSeconds` (0.05), and `admissionFlushConcurrency` / `admissionFlushConcurrencyFloor` (96/96),
+`faultAdmissionFlushConcurrency` / `faultAdmissionFlushConcurrencyFloor` (48/48) and
+`evidenceAdmissionFlushConcurrency` / `evidenceAdmissionFlushConcurrencyFloor` (24/12). A `cpuControlPlane` section
+wholly at its defaults is likewise left out of the record and the generated YAML.
+
+The range of each field (the `validate` of each `AdminConfig` section; a value outside it is refused):
+
+| Field | Range | Default |
+|---|---|---:|
+| `capacity.controlWorkerReplicas` | 1..64 | 6 |
+| `capacity.largestClusterNodeCount` | 1..4096 | 512 |
+| `capacity.managedNodeCount` | `largestClusterNodeCount`..65536 | 512 |
+| `capacity.telemetrySpool.enabled` / `replicas` | boolean / 0..32; at least 1 when enabled, exactly 0 when disabled | `false` / 0 |
+| `capacity.telemetrySpool.maxClusterDepth` | 64..65536 | 1024 |
+| `aurora.minAcu` / `maxAcu` | each 0.5..256 in 0.5 steps, `minAcu <= maxAcu` | 8 / 32 |
+| `processor.maxQueueDepth` | 1024..1000000 | 65536 |
+| `processor.maxClusterQueueDepth` | 1..100000, at most `maxQueueDepth`, at least `largestClusterNodeCount` | 4096 |
+| `processor.retryAfterSeconds` / `retryBackoffSeconds` | each 1..60 | 2 / 1 |
+| `processor.retryBackoffMaxSeconds` | 1..600, at least `retryBackoffSeconds` | 30 |
+| `processor.completedRetentionSeconds` | 60..604800, at least `max(300, retryBackoffMaxSeconds)` | 600 |
+| `processor.admissionBatchDelaySeconds` / `admissionBatchDelayMaxSeconds` | each 0..0.5 | 0.002 / 0.05 |
+| `processor.*AdmissionFlushConcurrency` and `*Floor` (six) | each 1..1024, the floor at most the ceiling | 96/96, 48/48, 24/12 |
+| `workflow.pollIntervalSeconds` / `dispatcherWorkers` | 0.5..60 / 1..64 | 5 / 8 |
+| `workflow.departedNodeCleanup` | boolean | `true` |
+| `notificationDelivery.batchSize` / `maxAttempts` | 1..1000 / 1..32 | 25 / 8 |
+| `evidence.retentionHours` / `maxRecordsPerNode` | 1..8760 / 100..1000000 | 24 / 10000 |
+| `cpuControlPlane.rollingUpdate.mode` / `waitIntervalSeconds` | `rolling` or `unchanged` / 900..3600 | `rolling` / 1800 |
+| `cpuControlPlane.rollbackAlarms.capacity` / `notRestored` | 1..255 letters, digits, `.`, `_` or `-` (first a letter or digit), the two different | see the template |
+
+On top of these, the cross-field empirical floors of the rule table below and the connection budget of §4.7 are
+validated.
 
 The field names in the YAML are the camelCase spelling of the snake_case field names in `desired.json`; both derive from the same
 schema, declared once. Fields absent from the file inherit the currently persisted values. An ordinary code upgrade keeps the current
@@ -635,11 +682,11 @@ lines; with `spec.workflow.departedNodeCleanup: false` they stay until `workflow
 if the fleet really is that large, raise the declaration by the rules above. Never silence either alert by lowering
 anything.
 
-**Dashboards.** The overview's (`gpu-fault-overview`) "Declared topology" row keeps its stat panel "Declared GPU node
-counts" and gains two timeseries panels beside it: "Registered GPU nodes per cluster vs declared largest cluster" (the
+**Dashboards.** The overview's (`gpu-fault-overview`) "Declared topology" row has the stat panel "Declared GPU node
+counts" and two timeseries panels beside it: "Registered GPU nodes per cluster vs declared largest cluster" (the
 registered nodes per `cluster_id`, `max`, against the declared `largestClusterNodeCount`, `min`) and "Registered GPU
 nodes vs declared managed fleet" (the registered total, `max`, against the declared `managedNodeCount`, `min`); the two
-alerts land on these panels. The Control-plane capacity dashboard (`gpu-fault-control-plane-capacity`) gains the row
+alerts land on these panels. The Control-plane capacity dashboard (`gpu-fault-control-plane-capacity`) has the row
 "Fleet vs declared topology" with the same two panels.
 
 **What `gpu-fault-admin status` reports.** On the deploy host, `status` computes this comparison from the engine's
@@ -696,8 +743,9 @@ and `envFrom`, unknown fields or out-of-range combinations all fail before appli
 
 A first deployment has no historical `desired.json`, and omitted fields in the configuration file use the AdminConfig defaults. On an existing site
 omitted fields inherit the current `desired.json` values, suited to changing only a few fields with a partial `--file`. After a successful application
-`<state-dir>/admin-config.yaml` always writes out the complete 19 items; to restore defaults, fill in the template defaults explicitly,
-or write `preset: default` for the capacity as a whole.
+`<state-dir>/admin-config.yaml` always writes out the complete configuration (19 items when everything is at its default,
+§4.2 step 7); to restore defaults, fill in the template defaults explicitly, or write `preset: default` for the capacity as
+a whole.
 
 ## 7. Taking Effect and Rollback
 
@@ -710,9 +758,16 @@ The configuration digest is independent of the code release ID, image digest and
   instances' actual ACU landed;
 - Runs no schema, GPU data-plane, Node Runtime or Runtime Profile phase;
 - Publishes no cluster registry revision;
-- A worker replica change rolls only the control-worker (the remediation section has no field left to change); a node count change changes the fault reserved depth shared by the three roles,
-  and therefore rolls all three CPU roles; the `workflow` section (`departedNodeCleanup` included) is in every role's digest, so
-  changing it rolls all three CPU roles as well;
+- The three role digests decide which roles roll (`AdminConfig.role_payload`): a worker replica change rolls only the
+  control-worker (the remediation section has no field left to change); a node count change changes the fault reserved
+  depth shared by the three roles, and therefore rolls all three CPU roles; the `processor`, `workflow`
+  (`departedNodeCleanup` included), `notificationDelivery` and `evidence` sections are in every role's digest, so changing
+  them rolls all three CPU roles as well; the spool switch is in the ingress and spool-worker digests, the spool-worker
+  replica count in the spool-worker digest alone; an Aurora-only or `cpuControlPlane`-only change rolls no role.
+  `telemetrySpool.maxClusterDepth` is in the spool-worker digest only, while the ingress's spool admission is what reads
+  it (the renderer writes `GPU_FAULT_TELEMETRY_SPOOL_MAX_CLUSTER_DEPTH` into the api-ha ConfigMap only): changed alone,
+  the release selects only the spool-worker, the api-ha ConfigMap is not re-applied and its Pods do not roll, and the new
+  depth takes effect only with a later release that selects the ingress;
 - The roles roll one at a time, each waiting for its own rollout, in the order ingress -> control-worker ->
   spool-worker (ingress's surge Pod needs a free slot on some node, which the consumer tier's added replicas would
   take; the preflight decides the deletion order of ingress's old Pods and writes it as `pod-deletion-cost`, and an
@@ -748,14 +803,14 @@ bypass the field whitelist and audit of this document.
 ## 10. Control Record Retention
 
 archive-first retention of control records (incidents/workflows and their associated markers, notifications, completion records) is **enabled by default**
-(the decision of the control-plane component review of 2026-09-08); administrators need to change no file; the default `site.yaml` is equivalent to:
+(the decision of the control-plane component review); administrators need to change no file; the default `site.yaml` is equivalent to:
 
 ```yaml
 spec:
   retention:
-    controlRecordRetentionDays: 30          # default 30; only an explicit 0 disables
+    controlRecordRetentionDays: 30          # default 30 (0..3650); only an explicit 0 disables
     # archiveS3Uri: s3://<bucket>/<prefix>  # optional; derived by default from account/Region/site
-    # archiveIntervalSeconds: 600           # optional; archive scan period, default 600
+    # archiveIntervalSeconds: 600           # optional; archive scan period (60..604800), default 600
 ```
 
 When `archiveS3Uri` is not written, both site loading and bootstrap resolve the target as
