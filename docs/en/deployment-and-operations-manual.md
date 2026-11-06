@@ -11389,7 +11389,7 @@ shell before running the installation.
 | --- | --- | ---: | --- |
 | `GPU_FAULT_NODE_INSTANCE_TYPE` | `--node-instance-type` | Read automatically on HyperPod | Instance type written into metrics and emails |
 | `GPU_FAULT_EXPECTED_GPU_COUNT` | `--expected-gpu-count` | Per the table above | Expected number of visible GPU UUIDs; on a type in the table, a value that contradicts the table while the node lists exactly the table's count (bound count agreeing) only yields a WARNING `gpu_expected_count_contradicted` (configuration error) on the control plane -- no lost-GPU verdict, no reboot |
-| `GPU_FAULT_EXPECTED_EFA_DEVICE_COUNT` | `--expected-efa-device-count` | Per the table above | Expected number of ACTIVE EFA devices |
+| `GPU_FAULT_EXPECTED_EFA_DEVICE_COUNT` | `--expected-efa-device-count` | Per the table above (installer Job and installer reconciler; a direct `install-gpu-fault-collector.sh` run without it does not check EFA) | Expected number of ACTIVE EFA devices |
 | `GPU_FAULT_INVENTORY_MISMATCH_CONSECUTIVE_SAMPLES` | `--inventory-mismatch-samples` | 2 | How many consecutive abnormal rounds trigger |
 | `GPU_FAULT_HOST_INTERVAL_SECONDS` | `--host-interval` | 15 | Host Collector period (seconds) |
 
@@ -11416,8 +11416,14 @@ done
 
 `regional` mode does not look up the decommissioned `gpu-fault-api-canary`
 ClusterIP in the GPU EKS. The installation Job reads the NLB URL,
-per-cluster token, private CA, cluster ID and node action secret only through the `gpu-fault-regional-connection` Secret; Secret values are not written into the generated
+per-cluster token, private CA and cluster ID only through the `gpu-fault-regional-connection` Secret, and mounts the node's own
+node action key from the `gpu-fault-node-action-keys` Secret (keyed by node name); Secret values are not written into the generated
 Job YAML.
+
+In a persistent deployment `gpu-fault-node-installer-reconciler` renders the same Installer Job for every Ready node and takes the
+expected GPU/EFA counts from the same built-in table (`src/gpu_fault/gpu_instance_inventory.py`). The reconciler does not install
+an instance type missing from the table (the node counts into `gpu_fault_node_installer_errors_total`); such a node can only be
+installed by hand with both explicit values as shown below.
 
 Control-plane liveness uses `GET /livez`: it asserts only process-local state (the event loop is answering,
 the spool-worker's consumer thread is still alive, the worker role's `gpu-fault-processor-inbox` consumer loop is still alive --
@@ -11487,15 +11493,12 @@ a real hang. Readiness reads the same port too: the listener also answers `GET /
 (`readiness_report` in `app/routes/admin.py`: processor, spool consumer and registry freshness; 503 carries the same
 body), still at the base manifest's 5 s x 3, and the release engine's in-Pod registry check takes its port off the
 readiness probe as before. It used to read the service port on the theory that a Pod that cannot accept a request
-promptly should be NotReady, but under a fleet-wide burst every replica is that Pod at the same moment. Measured live
-in two 50-cluster rounds: the probe timed out three times in a row (`Client.Timeout exceeded while awaiting headers`)
-on all three api-ha Pods within 2.3 s while every load request was answered 2xx; the AWS Load Balancer Controller
-deregistered all three NLB targets within 2 s and revoked the NLB's ingress rule on the Pods' security group for
-3-4 s; the Pods were Ready again 4-6 s later and re-registered, yet the target group's `HealthyHostCount` stayed 0
-until the targets had passed the NLB health check again (the `target-health` readiness gate turned True ~40 s after
-re-registration), and simulated executor claims opened in that window were closed without a response
-(`RemoteDisconnected`; in one round every surviving executor within the same 1.2 s). Three earlier 50-cluster rounds show the same
-deregistrations (two or three targets, no restart) without a failed claim. Taking every replica out of the load
+promptly should be NotReady, but under a fleet-wide burst every replica is that Pod at the same moment: while every
+request is answered 2xx the probe times out repeatedly (`Client.Timeout exceeded while awaiting headers`) on all api-ha
+Pods, the AWS Load Balancer Controller deregisters every NLB target and briefly revokes the NLB's ingress rule on the Pods'
+security group; after the Pods are Ready again the target group's `HealthyHostCount` stays 0 until the targets have passed
+the NLB health check again (the `target-health` readiness gate), and executor claims opened in that window are closed
+without a response (`RemoteDisconnected`). Taking every replica out of the load
 balancer never relieves a backlog all replicas share, so readiness reports only what makes this process unfit for
 traffic. The service port keeps the startup probe (`tcpSocket`) and, for api-ha, the NLB health check (traffic port
 `/healthz`, 10 s timeout x 2 at a 10 s interval), which gates a roll through the readiness gate and, when every target
@@ -11558,9 +11561,10 @@ summary and the Agent's first heartbeat, its registration, are not delayed); the
 cadence x 1.1 + 15 + 20 + 47 s (the sink's full retry ladder): inventory 148 s <= 180 s, the 300 s channels 412 s <= 420 s
 / 900 s (`tests/collectors/test_cadence_jitter.py`). On a node read the Agent's `/healthz` `transport` section
 (opened/reused/stale/idle-expired counters) or each collector's `transport pool:` log line every 300 s.
-Because the container needs to install dependencies from the wheel at startup, a TCP `startupProbe` must also be configured (currently waiting up to
-10 minutes); before startup succeeds Kubernetes runs no readiness/liveness, avoiding repeatedly restarting a container still
-installing dependencies.
+The containers run the runtime image with its dependencies preinstalled (the command prefers
+`/opt/gpu-fault/control-plane/bin/python -m gpu_fault.app.serve`) and install no wheel at startup; the service port's TCP
+`startupProbe` (up to 600 s) covers only the start-up Store wait above, and before startup succeeds Kubernetes runs no
+readiness/liveness, so a process still waiting for Aurora is not restarted over and over.
 A normal role-split release does not passively wait the full 10 minutes: the total rollout window per role is 5 minutes, during which the candidate release Pod logs are checked every 5 seconds.
 An unknown `GPU_FAULT_*` variable, a regional registry lacking Agent CIDRs or
 a registry schema incompatible with the target wheel immediately terminates that role's rollout and enters the formal rollback; only a slow installation without a deterministic
@@ -11596,10 +11600,13 @@ The root cause of the single-worker OOM above was not the normal uvicorn baselin
 processor hot path repeatedly reading and deserialising all historical requests, including completed large GPU telemetry
 payloads. The current implementation uses a dedicated `gpu_fault_processor_queue` table with normalised state, cluster, ordering key, priority, lease and time
 columns; claims read only the actually claimed requests via indexes,
-`FOR UPDATE SKIP LOCKED` and in-database lane deduplication. During a mixed old/new rollout
-it also writes the old JSONB objects and reconciles by `updated_at`; after the upgrade completes, the Pod holding the separate
-`processor-cleanup` periodic task lease periodically cleans a bounded number of
-`COMPLETED` records older than 10 minutes, no longer scanning the history table on every completion.
+`FOR UPDATE SKIP LOCKED` and in-database lane deduplication. In the detached hot layout
+(`gpu_fault_hot_layout_mode`; a fresh database starts `detached`, an upgraded one is switched by
+`gpu-fault-store-migrate --set-hot-layout detached` after the control-plane roll) request bodies live in
+`gpu_fault_processor_payloads` and a completed request leaves the queue table for `gpu_fault_processor_replays`, partitioned
+on `completed_at` in five-minute buckets. The Pod holding the separate `processor-cleanup` periodic task lease periodically
+cleans a bounded number of completed records past retention (10 minutes by default): `COMPLETED` rows of the inline layout
+are deleted in batches and replay partitions are dropped whole, no longer scanning the history table on every completion.
 
 Collector requests return `202 Accepted` immediately after passing authentication, admission and durable enqueue, no longer polling Aurora
 every 100 ms for the processing result; control requests such as XID/SXID and workflow that need response content
@@ -11646,8 +11653,8 @@ into the ingress thread or connection budget, and `generated/gpu-fault-api-ha-in
 these five variables (`verify_control_plane_role_split.py` fails the deployment when they reappear on ingress).
 `POOL_MAX_SIZE` should not be less than
 `GPU_FAULT_STORE_IO_WORKERS`, otherwise the concurrency cap lands on checkout, presenting as
-`PoolTimeout` rather than readable backpressure; a warning is printed at startup. After the control-plane review of 2026-09-08
-(F-E5 / G-7) this estimate is computed by **the thread families that actually exist for that role**: each Store I/O pool + the processor claim loop
+`PoolTimeout` rather than readable backpressure; a warning is printed at startup. This estimate is computed by
+**the thread families that actually exist for that role**: each Store I/O pool + the processor claim loop
 and each sub-pool worker (by the number `ProcessorPoolSettings` actually starts, not the `PROCESSOR_WORKERS` budget) +
 dispatcher workers + 1 each for periodic services, XID correlation, notification dispatch, collector snapshot, regional registry refresh + spool replay
 threads, requiring `demand + 2 ≤ POOL_MAX_SIZE` (the two spare for registry refresh, `/metrics` and per-request renewal threads);
@@ -11660,9 +11667,8 @@ demand breakdown), and one WARNING is logged at startup; actual queueing is seen
 `POOL_MIN_SIZE`, and `..._MAX_LIFETIME_SECONDS` also reclaims connections still pointing at the old
 writer after an Aurora failover.
 
-After the old hot-path fix was deployed, the three real control-plane Pods ran continuously for over 36 minutes with no restarts, and the working
-set dropped from about 4.9--5.7Gi to 126--189Mi. 4Gi/8Gi is still kept as traffic peak and diagnostic
-headroom; the limit should not be shrunk immediately based on that idle baseline. The dedicated queue table, connection pool and 202 path must also pass
+Since the old hot-path fix the working set of an idle control-plane Pod stays far below its request. 4Gi/8Gi is still kept
+as traffic peak and diagnostic headroom; the limit should not be shrunk immediately based on an idle baseline. The dedicated queue table, connection pool and 202 path must also pass
 capacity tests against the target Aurora and NLB before large-scale production validation can be declared complete.
 
 The Aurora isolated-schema smoke should verify concurrent claims, same-cluster lane serialisation, cross-cluster parallelism,
@@ -11767,7 +11773,8 @@ fabricated as 0; the EFA inventory is still collected independently.
    configured count, the type's count, the listed count and the bound count); correcting the setting and
    restarting the collector clears the signal. A node really short of the type's count, a bound count that
    disagrees with the listing, or a type outside the table is handled by the original rule.
-3. SES sends the email with the fixed `hardware-inventory-mismatch-zh-v1` template. The body contains the instance
+3. The notification uses the fixed `hardware-inventory-mismatch-zh-v1` template and goes out through the site's
+   notification channel (the site SNS topic by default, mail when SES is chosen). The body contains the instance
    type, expected, ACTIVE, discovered, missing/excess, node, workload and workflow.
 4. A missing EFA PCI executes `RESTART_NODE`; an unbound driver executes
    `STOP_WORKLOADS -> REMEDIATE_EFA_DRIVER -> VALIDATE_FABRIC`; a port merely inactive first
@@ -11806,9 +11813,10 @@ go straight into the reboot/replace chain.
 The post-reboot inventory gate above applies to all `RESTART_NODE` workflows, not only incidents triggered by an
 inventory mismatch. The same check runs after a reboot triggered by XID, SXID or DCGM.
 
-Emails depend on the SES sender, recipients, region and identity of section 8. Destructive workflows
+Notifications depend on the channel configured in section 8 (the site SNS topic with a confirmed subscription, or the SES
+sender, recipients, region and identity where SES is chosen). Destructive workflows
 also require the Runtime Profile, operation allowlist, HyperPod Adapter, healthy spares and
-restart budget to all be satisfied. A successfully sent email does not mean the node replacement necessarily succeeded.
+restart budget to all be satisfied. A successfully sent notification does not mean the node replacement necessarily succeeded.
 
 Do not perform acceptance on a production active control plane by deliberately setting a wrong expected count; that really triggers isolation
 and replacement. Fault injection should first run on a simulation/canary control plane, then on dedicated nodes in a maintenance window.
