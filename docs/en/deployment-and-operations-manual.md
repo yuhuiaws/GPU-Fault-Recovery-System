@@ -8003,65 +8003,73 @@ version, policy/profile versions, heartbeat age and TLS are still read at proces
 <a id="85-gpu-阈值"></a>
 ### 6.5 GPU Thresholds
 
-| Environment variable | Default |
-|---|---:|
-| `GPU_FAULT_GPU_TEMP_WARNING_C` | 85 |
-| `GPU_FAULT_GPU_TEMP_CRITICAL_C` | 90 |
-| `GPU_FAULT_MEMORY_TEMP_WARNING_C` | 90 |
-| `GPU_FAULT_MEMORY_TEMP_CRITICAL_C` | 95 |
-| `GPU_FAULT_GPU_TEMP_WARNING_MARGIN_C` | 5 |
-| `GPU_FAULT_GPU_TEMP_SHUTDOWN_MARGIN_C` | 3 |
-| `GPU_FAULT_MEMORY_TEMP_WARNING_MARGIN_C` | 5 |
-| `GPU_FAULT_PCIE_REPLAY_RATE_WARNING_PER_MINUTE` | 8 |
-| `GPU_FAULT_NVLINK_ERROR_DELTA_CRITICAL` | 1 |
-| `GPU_FAULT_POWER_VIOLATION_DELTA_WARNING_US` | 1 |
-| `GPU_FAULT_THERMAL_VIOLATION_DELTA_WARNING_US` | 1 |
-| `GPU_FAULT_THERMAL_VIOLATION_DRAIN_CONSECUTIVE_SAMPLES` | 2 |
-| `GPU_FAULT_TEMPERATURE_WARNING_GRACE_SECONDS` | 120; minimum 15 | Cool-down observation time after a temperature warning completes the DCGM diagnostic |
+| Environment variable | Default | Description |
+|---|---|---|
+| `GPU_FAULT_GPU_TEMP_WARNING_C` | 85; ≥ 0 | Fallback GPU temperature warning when the device reports no usable limit |
+| `GPU_FAULT_GPU_TEMP_CRITICAL_C` | 90; must exceed the warning | Fallback GPU temperature critical (`DRAIN`) |
+| `GPU_FAULT_MEMORY_TEMP_WARNING_C` | 90; ≥ 0 | Fallback memory (HBM) warning when there is no absolute memory limit |
+| `GPU_FAULT_MEMORY_TEMP_CRITICAL_C` | 95; must exceed the warning | Fallback memory critical |
+| `GPU_FAULT_GPU_TEMP_WARNING_MARGIN_C` | 5; > 0 | Margin between the warning and the device critical: on the absolute scale critical − margin (never above the max-operating limit), on the T.Limit scale the higher of critical + margin and the max-operating T.Limit |
+| `GPU_FAULT_GPU_TEMP_SHUTDOWN_MARGIN_C` | 3; > 0 | Without a slowdown limit, critical is shutdown − margin (+ margin on the T.Limit scale) |
+| `GPU_FAULT_MEMORY_TEMP_WARNING_MARGIN_C` | 5; > 0 | The memory warning is the memory max-operating limit − margin |
+| `GPU_FAULT_PCIE_REPLAY_RATE_WARNING_PER_MINUTE` | 8; ≥ 0 | Left at 8, DCGM's expected rate of the current link applies; any other value wins (table below) |
+| `GPU_FAULT_NVLINK_ERROR_DELTA_CRITICAL` | 1; > 0 | Increment threshold between adjacent samples of an NVLink error counter (NVLink5 counters included); a breach is a Warning with read-only diagnostics |
+| `GPU_FAULT_POWER_VIOLATION_DELTA_WARNING_US` | 10000; > 0 | Minimum increment (µs) of the power violation time (DCGM 240) between adjacent samples; the power and utilisation conditions apply too (table below) |
+| `GPU_FAULT_THERMAL_VIOLATION_DELTA_WARNING_US` | 10000; > 0 | Minimum increment (µs) of the thermal violation (DCGM 241) and HW thermal slowdown (DCGM 1423) times |
+| `GPU_FAULT_THERMAL_VIOLATION_DRAIN_CONSECUTIVE_SAMPLES` | 2; ≥ 2 | Still parsed and validated, but no longer affects grading: thermal violation time only ever grades Warning, never `DRAIN` |
+| `GPU_FAULT_TEMPERATURE_WARNING_GRACE_SECONDS` | 120; minimum 15 | VALIDATE_GPU cool-down window for temperature/thermal Warnings, counted from the workflow's creation |
 | `GPU_FAULT_DCGM_CORRELATION_WINDOW_SECONDS` | 45; 15-300 | Event time window for correlated analysis |
-| `GPU_FAULT_DCGM_COMPOSITE_CONSECUTIVE_SAMPLES` | 2; 2-10 | Consecutive count for the thermal composite to escalate to DRAIN |
-| `GPU_FAULT_DCGM_POWER_LIMIT_RATIO` | 0.95; 0-1 | Ratio of power usage to the enforced limit |
-| `GPU_FAULT_DCGM_POWER_CORRELATION_MIN_UTILIZATION_PERCENT` | 80; 0-100 | Minimum GPU utilisation for the power correlation rule |
-| `GPU_FAULT_TRANSIENT_GPU_WARNING_GRACE_SECONDS` | 120; minimum 15 | Observation window for corrected-memory Warnings |
+| `GPU_FAULT_DCGM_COMPOSITE_CONSECUTIVE_SAMPLES` | 2; 2-10 | Still parsed and validated, but no longer affects grading: `THERMAL_STRESS` is Critical `DRAIN` only once its temperature component is a confirmed Critical |
+| `GPU_FAULT_DCGM_POWER_LIMIT_RATIO` | 0.95; (0, 1] | Ratio of power usage to the enforced limit |
+| `GPU_FAULT_DCGM_POWER_CORRELATION_MIN_UTILIZATION_PERCENT` | 80; 0-100 | Minimum GPU utilisation for the power rule |
+| `GPU_FAULT_TRANSIENT_GPU_WARNING_GRACE_SECONDS` | 120; minimum 15 | VALIDATE_GPU observation window for corrected-memory and power Warnings |
 | `GPU_FAULT_DCGM_ECC_SBE_DELTA_WARNING` | 1; positive | SBE counter delta threshold per sample |
 | `GPU_FAULT_DCGM_RETIRED_PAGES_SBE_DELTA_WARNING` | 1; positive | Threshold for newly corrected retired pages |
-| `GPU_FAULT_DCGM_RETIRED_PAGES_DBE_DELTA_CRITICAL` | 1; positive | Threshold for newly uncorrectable retired pages |
+| `GPU_FAULT_DCGM_RETIRED_PAGES_DBE_DELTA_CRITICAL` | 1; positive | Threshold for newly uncorrectable retired pages (graded Warning, run diagnostics) |
 | `GPU_FAULT_DCGM_ROW_REMAP_CORRECTABLE_DELTA_WARNING` | 1; positive | Threshold for new correctable remaps |
-| `GPU_FAULT_DCGM_CORRECTABLE_MEMORY_DRAIN_CONSECUTIVE_SAMPLES` | 3; 2-10 | Count for the corrected-memory composite to escalate to DRAIN |
+| `GPU_FAULT_DCGM_CORRECTABLE_MEMORY_DRAIN_CONSECUTIVE_SAMPLES` | 3; 2-10 | Consecutive count at which the corrected-memory composite turns Critical; its action stays run diagnostics, never `DRAIN` |
 | `GPU_FAULT_DCGM_COLLECTION_ERROR_SUSTAIN_SECONDS` | 180; 15-900 | How long a node's DCGM scrape failures must last before the RUN_DIAGNOSTICS incident opens; until then `dcgm_field_completeness` is booked with NO_ACTION |
+
+The control plane reads these variables (the thresholds through `GpuMetricsThresholds.from_environment`, the two observation windows in the GPU validation adapter): the regional manifests write the
+correlation and memory variables and `GPU_FAULT_DCGM_COLLECTION_ERROR_SUSTAIN_SECONDS` into `gpu-fault-*-config-telemetry`
+and the two observation windows into `gpu-fault-*-config-core`; the temperature, PCIe, NVLink and violation thresholds are
+not in the manifests and run at the defaults above. The node DCGM collector's edge filter picks the temperature, power and
+scrape-failure candidates with the same model, and the node install sets none of these variables, so the node side always
+runs the defaults.
 
 Rule sources and default handling are as follows:
 
 | Signal | Default behaviour | Source |
 |---|---|---|
-| PCIe replay rate above DCGM's expected rate of the GPU's current link (fields 237/238: 31/min at Gen5 x16, 62/min at Gen6 x16; `>8/min` when the exporter serves no link; a configured `GPU_FAULT_PCIE_REPLAY_RATE_WARNING_PER_MINUTE` other than 8 wins) | Warning, run GPU diagnostics | NVIDIA DCGM Health `DCGM_FR_PCI_REPLAY_RATE` (`GetExpectedPcieReplayRate`) |
+| PCIe replay rate above DCGM's expected rate of the GPU's current link (fields 237/238: 31/min at Gen5 x16, 62/min at Gen6 x16; `>8/min` when the exporter serves no link; a configured `GPU_FAULT_PCIE_REPLAY_RATE_WARNING_PER_MINUTE` other than 8 wins) | Warning, read-only diagnostics | NVIDIA DCGM Health `DCGM_FR_PCI_REPLAY_RATE` (`GetExpectedPcieReplayRate`) |
 | PCIe link downtrain (DCGM 235-238): current generation or width below the device and system maximum under load (utilization ≥ 50 %) for 3 consecutive valid samples | Warning, run diagnostics; still downtrained after a GPU reset or reboot → hand to an operator (reconnect or replace the link) | Site rule on NVIDIA's link semantics (nvidia-smi, NVML) |
 | PCIe correctable errors (DCGM 1501) above R in 2 consecutive windows, R the lower of the current link's expected rate and DCGM's PCIe diagnostic corrected-error limit (31/min at Gen5 x16, 16/min at Gen6 x16) | Warning, run diagnostics | Site rule; NVIDIA documents no health threshold; DCGM diagnostic `GetAERThresholdRate` |
 | GPU recovery action (DCGM 1523) not None | Reset / Reboot / Drain P2P / Drain and Reset follow the XID 154 action of the same label; RECOVER_IMEX_DOMAIN → cordon and hand to an operator; BUS_RESET, SYSTEM_REBOOT (NVIDIA documents only a one-line enum meaning; the product's reset is a Function Level Reset, not a bus reset) or an undocumented value → quarantine for an operator; evidence only while an XID 154 owns the GPU; after a reset or reboot VALIDATE_GPU requires the value back at 0 | NVIDIA GPU Memory Error Management "Error Recovery and Response Flags"; NVML v615 change log |
 | SRAM threshold exceeded (DCGM 346 = 1) | Critical, as a row-remap failure: stop jobs and isolate, RMA only after the NVIDIA Field Diagnostic | NVIDIA GPU Memory Error Management "GPU L2 Memory RMA Policy" |
-| Memory banks without spare rows (DCGM 389 > 0) | Warning, run diagnostics, operator notice; no automatic hardware action | Site rule on NVIDIA's bank remap histogram |
-| Uncorrectable row remaps (DCGM 393) ≥ 512 | Warning, run diagnostics (the field diagnostic is recommended) | NVIDIA DCGM Health (4.6.0) `DCGM_LIMIT_MAX_ROW_REMAP_UNCORRECTABLE` |
+| Memory banks without spare rows (DCGM 389 > 0) | Warning, read-only diagnostics, operator notice; no automatic hardware action | Site rule on NVIDIA's bank remap histogram |
+| Uncorrectable row remaps (DCGM 393) ≥ 512 | Warning, read-only diagnostics (the field diagnostic is recommended) | NVIDIA DCGM Health (4.6.0) `DCGM_LIMIT_MAX_ROW_REMAP_UNCORRECTABLE` |
 | HW power brake slowdown time (DCGM 1424) | Duty > 0: Warning, run diagnostics; ≥ 1 % in two consecutive samples or beside clock-event bit 0x80: Critical `DRAIN` (power delivery) | NVML clock event reason counters; site duty rule |
+| Clock event reason bits (DCGM 112 `DCGM_FI_DEV_CLOCK_THROTTLE_REASONS`) | 0x80 HW power brake: Critical `DRAIN` (power delivery, confirmed over 3 samples, isolated and handed to an operator); 0x20/0x40 thermal limiting: Warning, read-only diagnostics; 0x08 HW slowdown is not graded on its own, power cap and the other bits grade nothing | NVML clocks event reasons; site confirmation policy |
 | HW thermal slowdown time (DCGM 1423) | Graded as the thermal violation time | NVML clock event reason counters |
 | ECC disabled (DCGM 300 = 0) or an ECC mode change pending (301 ≠ 300) | Warning, hand to an operator (without ECC the memory rules are blind) | NVML `nvmlDeviceGetMemoryErrorCounter` / `nvmlDeviceGetEccMode` |
 | InfoROM checksum invalid (nvidia-smi `inforom.checksum_validation`, inventory cadence) | Warning, hand to an operator (flash the InfoROM); the GPU's memory-repair evidence is untrusted | NVIDIA Dynamic Page Retirement; DCGM `DCGM_FR_CORRUPT_INFOROM` |
 | NVLink5 link recovery failed (DCGM 1212, HGX B200/B300) increment `>=1` | Critical, drain: cordon, [stop jobs], isolate, collect the diagnostic bundle, hand to support (the NVIDIA field diagnostic); evidence only while an XID 144-150/155 owns the GPU; nothing across a product quiesce, reset, reboot or Fabric Manager window | NVIDIA DCGM Health `DCGM_FR_NVLINK_ERROR_CRITICAL` (DCGM 4.7.0 FAIL) |
-| Other NVLink5 counters (DCGM 1204-1209, 1211, 1213, 1214, 1219, 1220) increment `>=1` | Warning, run diagnostics (the NVLink family rule); the same window and XID exceptions; a decrease re-baselines the aggregate | NVIDIA DCGM Health `MonitorNVLink5Fields` |
-| NVLink fabric health (DCGM 174/175) | UNHEALTHY (summary, route unhealthy, incorrect configuration) held 60 s, or a route recovery held 300 s, outside product fabric windows: Critical, the full GPU + NVSwitch reset of an untrained fabric; degraded bandwidth or LIMITED_CAPACITY: Warning, run diagnostics, operator notice; NOT_SUPPORTED (the H200 reading): nothing | NVIDIA DCGM Health `MonitorFabricFields`; NVML fabric health definitions |
-| GPU memory repair pending (nvidia-smi `<channel_repair_pending>` / `<tpc_repair_pending>`, inventory cadence) | GPU recovery action (1523) None: Warning, hand to an operator (reboot in a service window: the repair takes effect at the next reboot); otherwise the recovery action decides | NVIDIA GPU Memory Error Management "RAS Repair"; nvidia-smi "ECC Errors" |
+| Other NVLink5 counters (DCGM 1204-1209, 1211, 1213, 1214, 1219, 1220) increment `>=1` | Warning (the NVLink family rule: 1211/1213 run the DCGM diagnostic, the others read-only diagnostics); the same window and XID exceptions; a decrease re-baselines the aggregate | NVIDIA DCGM Health `MonitorNVLink5Fields` |
+| NVLink fabric health (DCGM 174/175) | UNHEALTHY (summary, route unhealthy, incorrect configuration) held 60 s, or a route or access-timeout recovery held 300 s, outside product fabric windows: Critical, the full GPU + NVSwitch reset of an untrained fabric; degraded bandwidth or LIMITED_CAPACITY: Warning, run diagnostics, operator notice; NOT_SUPPORTED (the H200 reading): nothing | NVIDIA DCGM Health `MonitorFabricFields`; NVML fabric health definitions |
+| GPU memory repair pending (nvidia-smi `<channel_repair_pending>` / `<tpc_repair_pending>`, inventory cadence) | GPU recovery action (1523) None or not reported: Warning, hand to an operator (reboot in a service window: the repair takes effect at the next reboot); otherwise the recovery action decides | NVIDIA GPU Memory Error Management "RAS Repair"; nvidia-smi "ECC Errors" |
 | Unrepairable memory (nvidia-smi `<unrepairable_memory>` or DCGM 1507 = 1) | Critical, as a row-remap failure: stop jobs and isolate, RMA only after the NVIDIA Field Diagnostic | NVIDIA DCGM Health `DCGM_FR_FAULTY_MEMORY` |
-| NVLink error counter delta `>=1` | Critical, stop affected jobs, isolate and analyse the GPU | NVIDIA DCGM Health `DCGM_FR_NVLINK_ERROR_CRITICAL` |
+| NVLink error counter delta `>=1` (`GPU_FAULT_NVLINK_ERROR_DELTA_CRITICAL`) | Warning, read-only diagnostics; counters alone never `DRAIN` and never mean RMA (an independently received XID/SXID keeps its own policy) | Site rule `SITE_NVLINK_COUNTER_EVIDENCE`, after NVIDIA DCGM Health `DCGM_FR_NVLINK_ERROR_CRITICAL` |
 | Untrained NVLink fabric (`fabric_manager_status`): the Fabric Manager state of a GPU on a graded NVSwitch node (Hopper SXM, HGX B200/B300) held NotStarted/InProgress/Failure for >=300 s | Critical, cordon, [stop jobs], reset every GPU and NVSwitch inside the quiesce window (the restore starts a Fabric Manager that is not running) and validate that every GPU's fabric state is Success; failure escalates to reboot, then warm-spare replacement | NVIDIA Fabric Manager User Guide (`NVIDIA_FABRIC_MANAGER_STATE`); the 300 s window is a site constant, not configurable |
 | Volatile DBE non-zero or increased | Critical, stop affected jobs, isolate and analyse the GPU | NVIDIA DCGM Health `DCGM_FR_VOLATILE_DBE_DETECTED` |
 | Row-remap pending | Stop jobs, reset the GPU in a controlled window, then validate | NVIDIA GPU Memory Error Management |
 | Row-remap failure | Stop jobs and isolate; RMA can be judged only after running the NVIDIA Field Diagnostic | NVIDIA GPU Memory Error Management RMA Policy |
-| Aggregate DBE/uncorrectable remap counter increased | Warning, run diagnostics | Site conservative policy; the first scrape of a cumulative value only establishes a baseline |
-| GPU temperature | Prefers the device slowdown/max-operating/shutdown limits: on the T.Limit scale (H200 on driver 580) `gpu_tlimit_c` ≤ threshold, on the absolute scale `gpu_temperature_c` ≥ threshold; warning runs diagnostics, reaching the operating limit executes `DRAIN` | Site action derived from NVIDIA device limits |
-| HBM temperature | Prefers the device memory max-operating limit; warning runs diagnostics, reaching the limit executes `DRAIN` | Site action derived from NVIDIA device limits |
+| Aggregate DBE/uncorrectable remap counter increased | Warning, read-only diagnostics | Site conservative policy; the first scrape of a cumulative value only establishes a baseline |
+| GPU temperature | Prefers the device slowdown/max-operating/shutdown limits: on the T.Limit scale (H200 on driver 580) `gpu_tlimit_c` ≤ threshold, on the absolute scale `gpu_temperature_c` ≥ threshold; a warning gets read-only diagnostics (the VALIDATE_GPU cool-down window); reaching the operating limit executes `DRAIN` once confirmed by 3 comparable samples at most 60 s apart, reaching the absolute shutdown temperature on one sample; the `DRAIN` plan is `ENVIRONMENT_REVIEW`: isolate, collect evidence and hand to an operator, with no automatic return to scheduling and no job restart | Site action derived from NVIDIA device limits |
+| HBM temperature | Prefers the device memory max-operating limit; a warning gets read-only diagnostics, reaching the limit executes `DRAIN` once confirmed by 3 comparable samples (as above) | Site action derived from NVIDIA device limits |
 | GPU/HBM fallback temperature | Uses 85/90 when the device exposes no usable limit, or T.Limit thresholds without a T.Limit reading; 90/95 for HBM without an absolute limit | Site fallback |
-| Power violation increased | Warning, run diagnostics | NVIDIA DCGM Health signal; the delta allows site override |
-| Thermal violation increased | First Warning with diagnostics; continued growth escalates to `DRAIN` on the 2nd by default | NVIDIA DCGM Health signal plus site automated escalation |
-| DCGM scrape failed (`collection_errors`) | Warning `dcgm_field_completeness` booked at once (NO_ACTION, no incident); diagnostics run only once the node's error batches have lasted `GPU_FAULT_DCGM_COLLECTION_ERROR_SUSTAIN_SECONDS` (default 180 s) back to back; the next clean scrape clears it | Site policy `SITE_DCGM_FIELD_COMPLETENESS` |
+| Power violation increased (DCGM 240) | An increment ≥ `GPU_FAULT_POWER_VIOLATION_DELTA_WARNING_US` at a duty of 0.1 %-105 %, with power ≥ `GPU_FAULT_DCGM_POWER_LIMIT_RATIO` x the enforced limit and utilisation ≥ `GPU_FAULT_DCGM_POWER_CORRELATION_MIN_UTILIZATION_PERCENT` in the same scrape: Warning, read-only diagnostics; ordinary power limiting stops no job | Site performance policy `SITE_GPU_POWER_PERFORMANCE` (the power violation signal of NVIDIA DCGM Health) |
+| Thermal violation increased (DCGM 241) | An increment ≥ `GPU_FAULT_THERMAL_VIOLATION_DELTA_WARNING_US` at a duty of 0.1 %-105 %: Warning, read-only diagnostics; time alone never means `DRAIN` | Site performance policy `SITE_GPU_THERMAL_PERFORMANCE` (NVML clocks event reasons) |
+| DCGM scrape failed (`collection_errors`) | Warning `dcgm_field_completeness` booked at once (NO_ACTION, no incident); the RUN_DIAGNOSTICS incident opens only once the node's error batches have lasted `GPU_FAULT_DCGM_COLLECTION_ERROR_SUSTAIN_SECONDS` (default 180 s) back to back, with an `OBSERVABILITY` plan (`TRIGGER_HEALTH_SNAPSHOT` -> `VALIDATE_HOST`, no GPU diagnostic); the next clean scrape clears it | Site policy `SITE_DCGM_FIELD_COMPLETENESS` |
 
 NVIDIA references:
 
@@ -8069,20 +8077,23 @@ NVIDIA references:
 - [Row Remapping](https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/row-remapping.html)
 - [GPU DRAM Memory RMA Policy](https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/rma-policy-thresholds-for-row-remapping.html)
 
-When the PCIe, NVLink, power or thermal thresholds override the official defaults, the finding/incident's
-`policy_source` is recorded as `SITE_OVERRIDE_NVIDIA_DCGM_HEALTH` and no longer masquerades as a pure
-NVIDIA rule. `policy_reference`, `official_action` and the final `effective_action` are all
-kept.
+With the PCIe replay threshold configured to anything but 8, the finding/incident's `policy_source` is recorded as
+`SITE_OVERRIDE_NVIDIA_DCGM_HEALTH` (`threshold_source` `SITE_CONFIGURED_REPLAY_RATE`) and no longer masquerades as a pure
+NVIDIA rule; an NVLink counter finding always records the site source `SITE_NVLINK_COUNTER_EVIDENCE` (with
+`GPU_FAULT_NVLINK_ERROR_DELTA_CRITICAL` other than 1 its `policy_version` becomes the site's), and the power and thermal
+time rules always record the site performance policies `SITE_GPU_POWER_PERFORMANCE` / `SITE_GPU_THERMAL_PERFORMANCE`.
+`policy_reference`, `official_action` and the final `effective_action` are all kept.
 
 The old parameters `GPU_FAULT_PCIE_REPLAY_DELTA_WARNING` and
-`GPU_FAULT_NVLINK_ERROR_DELTA_WARNING` are no longer used. PCIe must be normalised to a per-minute rate by adjacent sample times,
+`GPU_FAULT_NVLINK_ERROR_DELTA_WARNING` are no longer used and are not known variables any more: setting one is an unknown
+`GPU_FAULT_*` variable, which a process refuses to start with by default (`GPU_FAULT_UNKNOWN_ENV_POLICY`). PCIe must be normalised to a per-minute rate by adjacent sample times,
 so that a change in collection period does not produce different results for the same behaviour.
 
 The node collector reads and caches each GPU's slowdown, shutdown, GPU max-operating and memory max-operating temperatures using structured `nvidia-smi -q -x`.
 NVIDIA reports them on two scales (the full quotes and sources are in Detailed Design §2.4.1): a GPU without the T.Limit
 sensor prints the absolute tags (`gpu_temp_slow_threshold` and so on, canonical `gpu_slowdown_temperature_c` and so
 on); a GPU with it prints only the T.Limit tags (`gpu_temp_slow_tlimit_threshold` and so on, canonical
-`gpu_slowdown_tlimit_c` and so on, signed). The H200 of the live plain-EKS p5en (driver 580.178.04) is the latter:
+`gpu_slowdown_tlimit_c` and so on, signed). The H200 of a p5en on driver 580.178.04 is the latter:
 shutdown −8 C, slowdown −2 C, GPU and memory max-operating 0 C. The nvidia-smi documentation
 (<https://docs.nvidia.com/deploy/nvidia-smi/index.html>, GPU ATTRIBUTES › Temperature): "The T.Limit sensor measures
 the current margin in degree Celsius to the maximum operating temperature. As such it is not an absolute temperature
@@ -8092,8 +8103,8 @@ degrees, so the T.Limit thresholds grade the current T.Limit reading `gpu_tlimit
 `DCGM_FI_DEV_GPU_TEMP_LIMIT`, `temperature.gpu.tlimit` in nvidia-smi metrics mode), and a breach is "at or below":
 critical is the slowdown T.Limit, warning is max(critical + `GPU_FAULT_GPU_TEMP_WARNING_MARGIN_C`, GPU/memory
 max-operating T.Limit), on the H200 ≤ 3 warns and ≤ −2 is `DRAIN`. On the absolute scale the warning threshold is the
-device limit minus the configured margin. On reaching the device operating limit it stops the affected training, forbids
-scheduling, isolates and validates the GPU. While a T.Limit judgement exists `gpu_temperature_c` is no longer graded on
+device limit minus the configured margin. On reaching the device operating limit (once confirmed) it stops the affected training, forbids
+scheduling, isolates the GPU, collects evidence and hands it to an operator (`ENVIRONMENT_REVIEW`, no automatic return). While a T.Limit judgement exists `gpu_temperature_c` is no longer graded on
 the 85/90 fallback; the memory reading `memory_temperature_c` is absolute only and keeps the 90/95 fallback when there
 is no absolute limit. Only when the command fails, an XML field is missing, the target GPU does not support the field,
 or there are T.Limit thresholds while the exporter does not export field 153 does it use the fixed fallback values. A
@@ -8105,15 +8116,19 @@ masquerading as an NVIDIA-mandated automatic recovery action.
 
 The collector's log: `NVIDIA temperature limits unavailable (N consecutive); using configured fallback thresholds, next
 probe ...` is one WARNING per reason (repeats are DEBUG), and the retry doubles from 60 s after three quick probes, capped
-at 3600 s; limits found later log the INFO `NVIDIA temperature limits available after N failed probe(s)`. On driver 580
-nodes that WARNING no longer appears; it used to come about every 64 s per node (28 per 30 minutes) because the parser
-did not know the T.Limit tags. If it persists, check the `<temperature>` element of `nvidia-smi -q -x` (a vGPU or MIG
+at 3600 s; limits found later log the INFO `NVIDIA temperature limits available after N failed probe(s)`. The parser knows
+the T.Limit tags of driver 580, so such nodes do not log that WARNING. If it persists, check the `<temperature>` element of `nvidia-smi -q -x` (a vGPU or MIG
 device without threshold tags is expected).
 
-A temperature warning has the Node Agent run `dcgmi diag -r 1 -j`. Before deployment confirm that
-`dcgmi` exists in the node image and that `GPU_FAULT_NODE_ALLOWED_OPERATIONS` also contains
-`RUN_DCGM_DIAGNOSTIC`. Diagnostic output is saved in
-`GPU_FAULT_DIAGNOSTIC_OUTPUT_DIR`. When a regional site extends the cooling observation period, change
+A Warning of the temperature, thermal violation, clock-reason, power violation, PCIe replay, memory counter, NVLink error
+counter and composite rules compiles a read-only plan (health contract `DIAGNOSTIC_ONLY`,
+`src/gpu_fault/health_recovery_contract.py`: `FREEZE_EVIDENCE` -> `VALIDATE_GPU`) that neither cordons nor runs a DCGM
+diagnostic. The Node Agent's `RUN_DCGM_DIAGNOSTIC` (`dcgmi diag -r 1 -j`) is planned only for the field-audit rules'
+diagnostic Warnings (PCIe downtrain and correctable errors, the DCGM 1423/1424 times, NVLink5 link recovery, degraded fabric
+health and the like: `RUN_DCGM_DIAGNOSTIC` -> `VALIDATE_GPU`). Before deployment confirm that
+`dcgmi` exists in the node image and that `GPU_FAULT_NODE_ALLOWED_OPERATIONS` contains
+`RUN_DCGM_DIAGNOSTIC` (the managed node install's default list does). Diagnostic output is saved in
+`GPU_FAULT_DIAGNOSTIC_OUTPUT_DIR` (default `/var/lib/gpu-fault/diagnostics`). When a regional site extends the observation period of temperature Warnings, change
 `GPU_FAULT_TEMPERATURE_WARNING_GRACE_SECONDS` in the source Manifest
 (`deploy/control-plane/base/control-plane-deployment.yaml` or the regional patch), render it via the renderer into
 `regional/generated/gpu-fault-*-config-core.yaml` and release it with the checked release;
@@ -8128,8 +8143,10 @@ gpu-fault-admin deploy --state-dir /secure/gpu-fault
 
 Only the old single-cluster compatibility path distributes the same-named variable via Appendix A's `deploy/hyperpod/deploy.sh deploy`.
 
-When the diagnostic returns `FAIL/INCONCLUSIVE`, or the warning persists after the observation period ends, the control plane executes
-`DRAIN` and keeps the node isolated; this path does not automatically restore scheduling or restart training jobs.
+When the DCGM diagnostic returns `FAIL/INCONCLUSIVE`, or the VALIDATE_GPU after it fails, the control plane executes
+`DRAIN` and keeps the node isolated; this path does not automatically restore scheduling or restart training jobs. A failed
+VALIDATE_GPU of a read-only (`DIAGNOSTIC_ONLY`) plan escalates to no hardware or isolation action; a temperature that reaches
+the device operating limit opens a `DRAIN` incident of its own through a new Critical finding (table above).
 
 After the diagnostic completes, an email with the fixed template `dcgm-diagnostic-zh-v2` is sent. The email contains the node, DCGM test,
 status, entity, error code, a digest of the raw message, evidence URI, control-plane action and fixed remediation guidance.
@@ -8143,11 +8160,14 @@ The email does not use a large language model. Common action codes:
 | `NVLINK_FABRIC_RECOVERY` | The GPUs have not finished registering with the NVLink fabric: keep the node out of service; it is no host configuration problem and a Fabric Manager restart alone does not help; the product runs the full GPU/NVSwitch reset of `fabric_manager_status`; when this diagnostic's DRAIN already holds the node, reboot the instance out of band and, once the fabric state is Success, run `submit-remediation --disposition restore` (administrator operations §7) |
 | `GPU_MEMORY_FIELD_DIAGNOSTIC` | Inspect ECC/row-remap and run the NVIDIA Field Diagnostic |
 | `DRIVER_DCGM_REMEDIATION` | Inspect driver/DCGM/CUDA compatibility and services |
+| `GPU_FIELD_DIAGNOSTIC` | A compute/stress test failed: keep the node out of service, collect the NVIDIA bug report and run the NVIDIA Field Diagnostic |
+| `GPU_CLIENT_DRIVER_CHECK` | Context creation or permissions failed: check active GPU clients, device permissions, the driver state and the container runtime's GPU access, then re-run the diagnostic |
+| `GPU_HOST_CONFIG_REMEDIATION` | DCGM reports a CONFIG-severity condition only (e.g. persistence mode off): the result counts as WARN and drains nothing; apply the host configuration fix the message names through node provisioning, then re-run the diagnostic |
 | `DEEP_DIAGNOSTIC_REVIEW` | Unrecognised result; review the complete evidence and run deep diagnostics |
 | `DCGM_EXECUTION_REVIEW` | Inspect dcgmi/hostengine and stderr, then re-run the diagnostic |
 
 Production should configure an S3 destination for diagnostic evidence, otherwise the `file://` URIs in the email can only be read
-locally on the faulty node (the NCCL hung-triage hand-off mail of 2026-10-25 listed nothing but `file:///var/lib/gpu-fault/...`).
+locally on the faulty node.
 A managed regional site declares it once in `site.yaml`; the release engine renders it into the node installer template and every
 GPU node's Node Agent gets `GPU_FAULT_DIAGNOSTIC_S3_URI`:
 
@@ -8185,40 +8205,43 @@ DCGM_FI_DEV_MEM_CLOCK
 ```
 
 Upgrade note: this version adds `DCGM_FI_DEV_CLOCK_THROTTLE_REASONS` and
-`DCGM_FI_DEV_POWER_MGMT_LIMIT` as required DCGM core fields. The bundled
-`deploy/dataplane/dcgm-counters.csv` already contains both; when the `existing` mode reuses a customer exporter,
-missing fields refuse the upgrade at the deployment validation phase, and the exporter counters should be updated first. Use of
-`NvidiaSmiMetricsCollector` is currently disabled by default. An explicitly enabled `nvidia-smi` fallback cannot reliably
-obtain the full throttle bitmask or PCIe/NVLink counters,
-the related correlated rules are not enabled, and missing signals must not be interpreted as healthy.
+`DCGM_FI_DEV_POWER_MGMT_LIMIT` as required DCGM core fields (`DCGM_CORE_CANONICAL_FIELDS` and `DCGM_EXPORTER_FIELD_GROUPS` of
+`src/gpu_fault/dcgm_fields.py`). The bundled
+`deploy/dataplane/dcgm-counters.csv` already contains both, and a regional release always renders and deploys the
+solution's own exporter from it; when the legacy single-cluster `deploy/hyperpod/deploy.sh` reuses a customer exporter in
+`existing` mode (`GPU_FAULT_DCGM_EXPORTER_MODE`), missing fields refuse the upgrade at the deployment validation phase, and
+the exporter counters should be updated first. The nvidia-smi fallback (`NvidiaSmiMetricsCollector`) is disabled by
+default; explicitly enabled, it reads temperatures, power and `power.limit`, utilisation, memory use, ECC, remapped rows and
+the clock event reasons (`clocks_event_reasons.active`), but no PCIe replay, no NVLink counters and no violation times, so
+the rules and correlated rules that need them never fire, and missing signals must not be interpreted as healthy.
 
 Fabric Manager fields: the bundled `deploy/dataplane/dcgm-counters.csv` also exports `DCGM_FI_DEV_FABRIC_MANAGER_STATUS` (170) and
 `DCGM_FI_DEV_FABRIC_MANAGER_ERROR_CODE` (171) for the passive detection of an untrained NVLink fabric (`fabric_manager_status` in
 the table above). Both are exported, never required: `DCGM_EXPORTER_FIELD_GROUPS` and the missing-field check are unchanged (171 has
-no sample until registration completes), and an `existing`-mode customer exporter without them simply has no such detection. Both
+no sample until registration completes), and a legacy single-cluster `existing`-mode customer exporter without them simply has no such detection. Both
 fields exist since DCGM 4.0.0 and the pinned dcgm-exporter `4.6.1-4.8.4` (go-dcgm `v1.4611.2`) knows both names (171's name is a
 deprecated alias it keeps; DCGM 4.6 calls the field `DCGM_FI_DEV_FABRIC_MANAGER_ERROR`); every engine the solution runs is 4.0 or
-later (the exporter's embedded 4.6.1; on HyperPod p5en the AMI's own engine, whose version the AMI decides, 4.7.0 as the live
-Agent heartbeats report; 4.6.1 in plain EKS host mode as pinned from the exporter, 4.7.0 on a node group prepared earlier until it
-is prepared again), so they cannot break a working exporter. When editing the CSV:
+later (the exporter's embedded 4.6.1; on HyperPod p5en the AMI's own engine, whose version the AMI decides, 4.7.0 as the
+Agent heartbeats report; 4.6.1 installed in plain EKS host mode as pinned from the exporter, 4.7.0 on a node group prepared
+under the earlier pin until it is prepared again), so they cannot break a working exporter. When editing the CSV:
 that exporter parses it at start-up with Go's `encoding/csv` (`#` starts a comment) and exits on every GPU node at a record that is
 not exactly three fields (no comma in a help text), an unknown field name (go-dcgm's `GetFieldID` reads the current field map, then
 the legacy one), a type other than counter/gauge/untyped/label, or one of the retired PCIe throughput fields 200/201, which it now
 refuses outright. `DCGM_FI_DEV_FABRIC_HEALTH_MASK` (174), `DCGM_FI_DEV_FABRIC_HEALTH_SUMMARY` (175) and
 `DCGM_FI_DEV_FABRIC_MANAGER_ERROR` are no longer unknown names to this exporter and no longer stop it at start-up; but adding any
 field first means updating the verified field table from that release's go-dcgm (`PINNED_FIELD_IDS` in
-`tests/regional/test_dataplane_dcgm_counters.py`, which fails while the CSV and the table disagree), as batch 235 did when it
-added 174/175. Those two carry values only from a host engine that serves them; the solution grades them since batch 235, and a
-reading of 0 (NOT_SUPPORTED, as on the live H200 nodes) grades nothing ("Blackwell fields" below).
+`tests/regional/test_dataplane_dcgm_counters.py`, which fails while the CSV and the table disagree). Those two carry values
+only from a host engine that serves them; the solution grades them, and a reading of 0 (NOT_SUPPORTED, as on H200) grades
+nothing ("Blackwell fields" below).
 
 T.Limit field: the CSV also exports `DCGM_FI_DEV_GPU_TEMP_LIMIT` (153, gauge), the current reading `gpu_tlimit_c` that
 the T.Limit thresholds above grade. DCGM 4.1.0 introduced it (release notes: "Add a field to track the TLIMIT"; field
 description: "Thermal margin temperature (distance to nearest slowdown threshold) for this GPU"), and DCGM 4.6.0
 renamed it `DCGM_FI_DEV_GPU_TEMP_MARGIN_CELSIUS`; the pinned exporter's go-dcgm (`v1.4611.2`) resolves the 4.1 name to 153
-as a deprecated alias and renders the field under the CSV's name, which is the name the collector maps, so the CSV keeps the
-4.1 name; never write the new one. Likewise exported, never required: an exporter without it puts the GPU core back on the
-grading of its absolute reading. In host mode the host engine must be DCGM 4.1.0 or later (live: 4.7.0 for the HyperPod
-AMI's engine and the plain EKS node group's, as the Agent heartbeats report; 4.6.1 once the node group is prepared again).
+as a deprecated alias and renders the field under the CSV's name; the collector maps both names, and the CSV keeps the 4.1
+name (the one the verified field table holds); never write the new one. Likewise exported, never required: an exporter without it puts the GPU core back on the
+grading of its absolute reading. In host mode the host engine must be DCGM 4.1.0 or later (the HyperPod p5en AMI's 4.7.0
+and plain EKS's pinned 4.6.1 both are).
 
 Shutdown temperature field: the CSV also exports `DCGM_FI_DEV_SHUTDOWN_TEMP` (159, gauge), the GPU's absolute shutdown
 temperature (field description: "Shutdown temperature for the device."). A GPU that prints T.Limit thresholds (the
@@ -8229,12 +8252,12 @@ and the value is within 1 °C of the T.Limit arithmetic of one nvidia-smi snapsh
 threshold), and only that protection reads it; otherwise the raw `dcgm_shutdown_temperature_c` sample stays in the batch
 with `shutdown_limit_state=withheld:...` and the collector warns once. DCGM 4.6.0 renamed it
 `DCGM_FI_DEV_GPU_TEMP_SHUTDOWN_CELSIUS`; the pinned exporter's go-dcgm (`v1.4611.2`) resolves the old name to 159 as a
-deprecated alias, so the CSV keeps the old name here too. Exported, never required: an exporter without it only lacks
+deprecated alias, so the CSV keeps the old name here too (the collector maps both names). Exported, never required: an exporter without it only lacks
 that protection, and the GPU stays graded on its T.Limit thresholds. The source decision and NVIDIA's text are in the
 detailed design §2.4.1. Changing the CSV changes the counters digest of the exporter pod template, so a release rolls the
 exporter node by node.
 
-Fault evidence fields (batch 233): the CSV also exports `DCGM_FI_DEV_GET_GPU_RECOVERY_ACTION` (1523), `DCGM_FI_DEV_ECC_CURRENT`
+Fault evidence fields: the CSV also exports `DCGM_FI_DEV_GET_GPU_RECOVERY_ACTION` (1523), `DCGM_FI_DEV_ECC_CURRENT`
 (300), `DCGM_FI_DEV_ECC_PENDING` (301), `DCGM_FI_DEV_THRESHOLD_SRM` (346), `DCGM_FI_DEV_BANKS_REMAP_ROWS_AVAIL_LOW` (388),
 `DCGM_FI_DEV_BANKS_REMAP_ROWS_AVAIL_NONE` (389), `DCGM_FI_DEV_PCIE_MAX_LINK_GEN` (235), `DCGM_FI_DEV_PCIE_MAX_LINK_WIDTH` (236),
 `DCGM_FI_DEV_PCIE_LINK_GEN` (237), `DCGM_FI_DEV_PCIE_LINK_WIDTH` (238) as gauges and `DCGM_FI_DEV_PCIE_COUNT_CORRECTABLE_ERRORS`
@@ -8248,7 +8271,7 @@ NVIDIA's text are in the detailed design §2.4.1 ("The DCGM field audit's fields
 above. Blackwell (B200/B300): every one of these rules is unit-tested from NVIDIA documentation, not live-verified (no B-series hardware). Changing the CSV changes the counters digest of the
 exporter pod template, so the release rolls the exporter node by node.
 
-Blackwell fields (batch 235): the CSV also exports the NVLink5 counters of HGX B200/B300 --
+Blackwell fields: the CSV also exports the NVLink5 counters of HGX B200/B300 --
 `DCGM_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_SUCCESSFUL_EVENTS` (1211), `DCGM_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_FAILED_EVENTS` (1212),
 `DCGM_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_EVENTS` (1213), `DCGM_FI_DEV_NVLINK_COUNT_RX_SYMBOL_ERRORS` (1214),
 `DCGM_FI_DEV_NVLINK_COUNT_RX_MALFORMED_PACKET_ERRORS` (1204), `DCGM_FI_DEV_NVLINK_COUNT_RX_BUFFER_OVERRUN_ERRORS` (1205),
@@ -8258,11 +8281,12 @@ Blackwell fields (batch 235): the CSV also exports the NVLink5 counters of HGX B
 `DCGM_FI_DEV_FABRIC_HEALTH_MASK` (174), `DCGM_FI_DEV_FABRIC_HEALTH_SUMMARY` (175) and `DCGM_FI_DEV_MEMORY_UNREPAIRABLE_FLAG`
 (1507) as gauges. All but 174/175 carry their DCGM 4.5.3 names (deprecated aliases in go-dcgm `v1.4611.2`'s legacy map; 175 has
 only its DCGM 4.6 name); the collector reads both names. Every one is exported and never required, except that 1211-1213 now also
-*answer* for the required NVLink fields: NVML does not report the data-link counters (497-499) on Blackwell, so
-`GPU_FAULT_DCGM_REQUIRED_METRICS`' default lists the link-recovery names as alternatives of each NVLink group, and a B-series
-exporter that serves them is complete. A Hopper node reports none of the NVLink5 fields and reads 174/175 as 0 (NOT_SUPPORTED):
+*answer* for the required NVLink fields: NVML does not report the data-link counters (497-499) on Blackwell, so the
+required NVLink field groups (`DCGM_FABRIC_CANONICAL_GROUPS` and `DCGM_EXPORTER_FIELD_GROUPS` of `src/gpu_fault/dcgm_fields.py`;
+the legacy single-cluster `GPU_FAULT_DCGM_REQUIRED_METRICS` defaults to the latter) list the link-recovery names as
+alternatives of each NVLink group, and a B-series exporter that serves them is complete. A Hopper node reports none of the NVLink5 fields and reads 174/175 as 0 (NOT_SUPPORTED):
 it grades exactly as before. The DCGM collector also reads the nvidia-smi XML (`nvidia-smi -q -x`) once per inventory interval for
-the memory-repair flags and the `<fabric><health>` sub-tags (live H200 R580: every repair flag `No`, every sub-tag `N/A`); a failed
+the memory-repair flags and the `<fabric><health>` sub-tags (H200 on driver R580: every repair flag `No`, every sub-tag `N/A`); a failed
 query backs off like the temperature-limit probe. What each field grades and NVIDIA's text are in the detailed design §2.4.1
 ("HGX B200/B300 DCGM fields"). Blackwell (B200/B300): every one of these rules is unit-tested from NVIDIA documentation, not
 live-verified (no B-series hardware).
@@ -8270,14 +8294,14 @@ live-verified (no B-series hardware).
 **B-series nodes and the DCGM host engine.** Run the DCGM host engine 4.7.0 or later on HGX B200/B300 (`p6-b200.48xlarge`,
 `p6-b300.48xlarge`) nodes: DCGM 4.7.0 removed the NVLink bit-error-rate thresholds that failed healthy GB200 systems in `dcgmi
 diag` (DCGM Release Notes 4.7.0: "Removed NVLink bit-error-rate thresholds that caused false health and diagnostic failures on
-healthy GB200 systems.") -- `RUN_DIAGNOSTICS` runs `dcgmi diag` -- and per-link NVLink5 values are live only from 4.7.0. For a
+healthy GB200 systems.") -- the product's `RUN_DCGM_DIAGNOSTIC` step runs `dcgmi diag` -- and per-link NVLink5 values are live only from 4.7.0. For a
 plain EKS node group in host mode that means `prepare-eks-nodegroup --dcgm-hostengine host` with a 4.7.x `--dcgm-version` for
 the B-series node group (the 4.6.1-1 pin stays for the H200 node groups); until an exporter release with a DCGM 4.7.0 or newer
 client exists, such a node is the `host-newer` pairing the advisories below name.
 
 The exporter reads the CSV only at process start and the DaemonSet mounts the ConfigMap with subPath, which a running Pod never sees
-refreshed, so a counters-only release used to update the ConfigMap and restart no Pod. The pod template of
-`deploy/dataplane/hyperpod-dcgm-exporter.yaml` now carries the annotation `gpu-fault.io/dcgm-counters-sha256` (the sha256 of the CSV
+refreshed, so a ConfigMap change alone never reaches the exporter. The pod template of
+`deploy/dataplane/hyperpod-dcgm-exporter.yaml` therefore carries the annotation `gpu-fault.io/dcgm-counters-sha256` (the sha256 of the CSV
 the ConfigMap is built from, rendered by `render_dcgm_exporter_manifest`, failing closed on a surviving placeholder; the legacy
 single-cluster `deploy/hyperpod/deploy.sh` substitutes it with sed): a counters change is a template change, and dcgm-exporter rolls
 on every GPU cluster one node at a time (RollingUpdate, `maxUnavailable: 1`).
@@ -8325,12 +8349,12 @@ HyperPod AMI's own engine, plain EKS's pinned 4.7.0).
 
 | Cluster | Host engine | Relation to the client |
 |---|---|---|
-| Plain EKS host mode | 4.6.1 after `prepare-eks-nodegroup --dcgm-hostengine host --dcgm-version 4.6.1-1` and its MINIMAL roll | `paired`, the pair NVIDIA supports. Until then nodes installed with 4.7.0-x run 4.7.0, newer than the client (`host-newer`, the connection requirement broken), and get the advisories below; still better than before: the previous 4.4.1 client was older than both host engines |
+| Plain EKS host mode | 4.6.1 after `prepare-eks-nodegroup --dcgm-hostengine host --dcgm-version 4.6.1-1` and its MINIMAL roll | `paired`, the pair NVIDIA supports. Nodes installed with 4.7.0-x under the earlier pin and not prepared again run 4.7.0, newer than the client (`host-newer`, the connection requirement broken), and get the advisories below |
 | Plain EKS embedded mode | no host engine: the exporter runs its own embedded 4.6.1 | nothing to compare |
-| HyperPod | the AMI's own engine, whose version the AMI decides (4.7.0 as the live Agent heartbeats report) | `host-newer`: 4.7.0 is newer than the 4.6.1 client, the connection requirement broken ("For a separate DCGM host engine, the exporter’s DCGM client library version must also be greater than or equal to the DCGM host engine version."). The engine belongs to the AMI, so the product has no remedy and only advises: the `status --full` header line and the `WARN` line of the deploy/join node preflight (the AMI remedy part) name these nodes (below). No exporter release built on DCGM 4.7.0 or later exists yet; once NVIDIA publishes one, moving the pin to it meets the connection requirement (a pair when its DCGM is the engine's version) |
+| HyperPod | the AMI's own engine, whose version the AMI decides (4.7.0 on the p5en AMI, as the Agent heartbeats report) | `host-newer`: 4.7.0 is newer than the 4.6.1 client, the connection requirement broken ("For a separate DCGM host engine, the exporter’s DCGM client library version must also be greater than or equal to the DCGM host engine version."). The engine belongs to the AMI, so the product has no remedy and only advises: the `status --full` header line and the `WARN` line of the deploy/join node preflight (the AMI remedy part) name these nodes (below). No exporter release built on DCGM 4.7.0 or later exists yet; once NVIDIA publishes one, moving the pin to it meets the connection requirement (a pair when its DCGM is the engine's version) |
 
 An exporter image per cluster (or per provider) is **not implemented**, and it would not help now: the HyperPod AMI's engine
-(4.7.0 live) is newer than the DCGM of every published exporter release (the newest, `4.6.1-4.8.4`, is on 4.6.1), so no release
+(4.7.0) is newer than the DCGM of every published exporter release (the newest, `4.6.1-4.8.4`, is on 4.6.1), so no release
 meets the connection requirement on HyperPod; a per-cluster image also needs the image lock (exactly one `dcgm_exporter` entry
 today), the release manifest's delivery images, `site.yaml` `images.dcgmExporter`, the plan payload and the rollback identity to
 carry an image per cluster (or per provider), and it doubles the vetted exporter set. When NVIDIA publishes an exporter release on
@@ -8369,8 +8393,8 @@ readings:
    is not the exporter's DCGM, a finding that names the pairing `--dcgm-version` (administrator operations §5.0.1a).
 
 All of it is advisory: no check verdict, `healthy` or exit code changes, no node and no release is refused, existing sites stay
-deployable. Why: metrics flow with mismatched versions (NVIDIA: "might function"; the previous 4.4.1 client ran live against newer
-engines, and so does the 4.6.1 client against the live 4.7.0 engines); the HyperPod engine belongs to the AMI, not the release; a
+deployable. Why: metrics flow with mismatched versions (NVIDIA: "might function"; the previous 4.4.1 client ran against newer
+engines, and so does the 4.6.1 client against the 4.7.0 engines); the HyperPod engine belongs to the AMI, not the release; a
 refusal would also refuse the very release that brings a newer exporter and block deploys of existing sites; a broken exporter is
 still caught by the DCGM collection checks (missing fields, failed scrapes).
 
@@ -8419,7 +8443,7 @@ still caught by the DCGM collection checks (missing fields, failed scrapes).
 **When an AMI ships a newer DCGM.** HyperPod: once a node runs the new AMI, the header line above appears within one heartbeat
 refresh window (about 15 minutes; the next deploy/join's node preflight prints the `WARN` too); deploy an exporter release whose
 DCGM is at least the engine's (the steps above); while NVIDIA has published none, the combination "might function": watch the DCGM
-collection health and do not downgrade the AMI's DCGM by hand. This is HyperPod's live state: the AMI's engine is 4.7.0 and NVIDIA
+collection health and do not downgrade the AMI's DCGM by hand. This is the HyperPod p5en case: the AMI's engine is 4.7.0 and NVIDIA
 has published no exporter release on DCGM 4.7.x. Plain EKS: the AL2023 NVIDIA AMI ships no DCGM and the solution's
 user data pins it -- keep it at the exporter's version (a version-only pin such as `4.6.1` accepts any build of 4.6.1, never a newer
 minor).
@@ -8430,14 +8454,16 @@ node_runtime: the three control-plane roles roll, and executor, completion-watch
 cluster); the node preflight script is a node template input, so Node Agent waves run on every GPU node; the dcgm component (the
 DaemonSet's image) changes, so every GPU cluster rolls gpu-fault-dcgm-exporter; the image lock changes the release identity. Then
 run step 5 above for the host-mode plain EKS node groups; until then their 4.7.0 engines appear in the advisories. The HyperPod
-nodes' AMI engines (4.7.0 live) stay in them until NVIDIA publishes an exporter on DCGM 4.7.0 or later and the pin moves to it (the
+nodes' AMI engines (4.7.0) stay in them until NVIDIA publishes an exporter on DCGM 4.7.0 or later and the pin moves to it (the
 pairing table above).
 
-When the thermal composite is first Warning, GPU validation puts the temperature, thermal violation,
-thermal throttle and `THERMAL_STRESS` together into the
-`GPU_FAULT_TEMPERATURE_WARNING_GRACE_SECONDS` cool-down window. Within the window it returns `WAITING`
-and does not `DRAIN` early because a throttle finding is still active. When later samples reach the configured consecutive count and
-escalate to Critical it no longer waits and executes `DRAIN` immediately.
+While every finding of the temperature, thermal violation, HW thermal slowdown, clock-reason and `THERMAL_STRESS` rules is
+a Warning, VALIDATE_GPU returns `WAITING` within the `GPU_FAULT_TEMPERATURE_WARNING_GRACE_SECONDS` cool-down window counted
+from the workflow's creation and does not fail early because a throttle finding is still active; after the window it needs a
+sample newer than the window to judge again and fails while the findings stay active (corrected-memory and power Warnings
+use `GPU_FAULT_TRANSIENT_GPU_WARNING_GRACE_SECONDS`). Once a temperature is a confirmed Critical nothing waits:
+`THERMAL_STRESS` follows its temperature component (a composite never grades above the confirmed temperature action),
+VALIDATE_GPU fails at once, and the Critical finding opens a `DRAIN` incident of its own.
 
 When tuning the correlation window and consecutive counts, the following are example configuration values for the source manifests, not an online environment override entry point.
 Regional sites must release via `make deployment-contracts-update` -> build release -> `gpu-fault-admin deploy --state-dir`;
@@ -8445,7 +8471,6 @@ for the old single-cluster path see Appendix A:
 
 ```bash
 export GPU_FAULT_DCGM_CORRELATION_WINDOW_SECONDS=60
-export GPU_FAULT_DCGM_COMPOSITE_CONSECUTIVE_SAMPLES=3
 export GPU_FAULT_DCGM_POWER_LIMIT_RATIO=0.90
 export GPU_FAULT_DCGM_POWER_CORRELATION_MIN_UTILIZATION_PERCENT=75
 export GPU_FAULT_TRANSIENT_GPU_WARNING_GRACE_SECONDS=180
@@ -8464,20 +8489,22 @@ baseline and NVIDIA support advice; the defaults must not be described as offici
 
 | Environment variable | Default | Description |
 |---|---|---|
-| `GPU_FAULT_ENABLE_HYPERPOD_ADAPTER` | false | Self-built lifecycle Adapter |
-| `GPU_FAULT_HYPERPOD_CLUSTER` | Required | HyperPod name |
+| `GPU_FAULT_ENABLE_HYPERPOD_ADAPTER` | Bare application default false; the cluster executor manifest sets true (the control-plane manifests false) | Self-built provider lifecycle step adapter (`RESTART_NODE`/`REPLACE_NODE`; the name predates plain EKS support and switches it on for `eks-managed` clusters too); enabled without `GPU_FAULT_HYPERPOD_CONFIRM_CLUSTER`, AWS credentials (the ServiceAccount's role-arn annotation) or a fleet registry, the executor fails at start-up |
+| `GPU_FAULT_HYPERPOD_CLUSTER` | Empty; required to build the HyperPod adapter | HyperPod cluster name (the provider mutation target); the cluster executor reads it from the `hyperpod-cluster-name` key of the connection Secret `gpu-fault-regional-connection` |
+| `GPU_FAULT_HYPERPOD_CONFIRM_CLUSTER` | Empty; required while the adapter is enabled | Independent second confirmation of the target cluster, read by the cluster executor from the connection Secret's `hyperpod-confirm-cluster-name`; missing, the executor fails at start-up, and a reboot/replace whose provider target differs fails at the confirmation gate |
 | `AWS_REGION/AWS_DEFAULT_REGION` | SDK default | Region |
 | `GPU_FAULT_ALLOW_HYPERPOD_MUTATION` | Unset (application default false) | Legacy compatibility switch; may only fall back to reboot when the separate reboot switch is absent; never falls back to replace. Regional production deployments must not set this variable |
-| `GPU_FAULT_ALLOW_HYPERPOD_REBOOT` | The bare application default inherits `GPU_FAULT_ALLOW_HYPERPOD_MUTATION` (false when unset); the executor manifest explicitly sets `true` | Allows calling the SageMaker HyperPod reboot API, still subject to the Profile, signing, maintenance window and pre-action gates; does not replace the node instance |
+| `GPU_FAULT_ALLOW_HYPERPOD_REBOOT` | The bare application default inherits `GPU_FAULT_ALLOW_HYPERPOD_MUTATION` (false when unset); the executor manifest explicitly sets `true` | Allows calling the SageMaker HyperPod reboot API, still subject to the Profile, signing, maintenance window and pre-action gates; does not replace the node instance. The plain EKS provider's EC2 reboot answers to the same switch |
 | `GPU_FAULT_ALLOW_HYPERPOD_REPLACE` | Always false (solution invariant of §2.2) | The process refuses to start when set to true; this solution never calls the SageMaker HyperPod replace API, and the warm-spare local switch does not depend on this switch |
-| `GPU_FAULT_ALLOW_WITH_AUTOMATIC_NODE_RECOVERY` | false | Extremely high risk; normally must not be enabled |
-| `GPU_FAULT_HYPERPOD_OWNER` | `gpu-fault-hyperpod-adapter` | profile owner |
-| `GPU_FAULT_ENABLE_HYPERPOD_MANAGED_OBSERVER` | true | Effective once the cluster is configured |
+| `GPU_FAULT_ALLOW_WITH_AUTOMATIC_NODE_RECOVERY` | Always false | Set to true, the HyperPod adapter configuration (`HyperPodAdapterConfig`) refuses to build and the process that needs it fails at start-up; under HyperPod `NodeRecovery=Automatic` the solution never mutates |
+| `GPU_FAULT_HYPERPOD_OWNER` | `gpu-fault-hyperpod-adapter` (`gpu-fault-eks-adapter` on an `eks-managed` cluster's executor) | profile owner |
+| `GPU_FAULT_ENABLE_HYPERPOD_MANAGED_OBSERVER` | true (false in the spool-worker manifest) | Managed recovery observer: the regional control plane runs it for every HyperPod registration, provided the managed owners include `hyperpod-managed-node-recovery` and the Agent registry is on; single-cluster mode needs `GPU_FAULT_HYPERPOD_CLUSTER` |
 | `GPU_FAULT_HYPERPOD_IDENTITY_REFRESH_SECONDS` | 20 | Identity refresh |
 | `GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS` | 1800 | Managed recovery timeout; also the per-step wait cap of `REPLACE_NODE`/`RESTART_NODE` |
 | `GPU_FAULT_HYPERPOD_POST_REBOOT_STABILIZATION_SECONDS` | 60 | Device plugin settle time after a node reboot |
-| `GPU_FAULT_KUBERNETES_REQUEST_TIMEOUT_SECONDS` | 30 | Cap per Kubernetes API call; HyperPod REBOOT/REPLACE now require the Kubernetes adapter to be present and able to read the target node, otherwise the step is `FAILED{safety_rejection}` |
-| `GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER` | false | Automatic spare switch |
+| `GPU_FAULT_HYPERPOD_MAX_BATCH_SIZE` | 25; 1-25 | Most nodes one provider mutation step may submit; more fails the preflight |
+| `GPU_FAULT_KUBERNETES_REQUEST_TIMEOUT_SECONDS` | 30; > 0 | Cap per Kubernetes API call; HyperPod REBOOT/REPLACE require the Kubernetes adapter to be present, to read the target node and to find it isolated right now, otherwise the step is `FAILED{safety_rejection}` |
+| `GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER` | Bare application default false; the cluster executor manifest sets true (the control-plane manifests false) | Automatic warm-spare switch: a Kubernetes-level handover on both providers that never calls a provider replacement API; on the cluster executor it requires `GPU_FAULT_CLUSTER_EXECUTOR_REMOTE_STATE=true` |
 | `GPU_FAULT_HYPERPOD_SPARE_LABEL` | `gpu-fault.io/spare` | spare label |
 | `GPU_FAULT_HYPERPOD_SPARE_LABEL_VALUE` | `true` | spare label value |
 | `GPU_FAULT_SPARE_HEALTH_SCAN_SECONDS` | 30 | spare scan |
@@ -8487,13 +8514,13 @@ baseline and NVIDIA support advice; the defaults must not be described as offici
 | `GPU_FAULT_MULTI_NODE_AGGREGATION_WINDOW_SECONDS` | 5 | Aggregation window for multi-node replacement of the same training attempt and cross-type DCGM metric/XID/SXID aggregation |
 | `GPU_FAULT_MULTI_NODE_AGGREGATION_WINDOW_MAX_SECONDS` | 30 | Cap of the aggregation window after logarithmic scaling by the attempt's node count |
 | `GPU_FAULT_PROCESSOR_DRAIN_MAX_WAIT_SECONDS` | 30 | Bounded wait during which PENDING/LEASED processor requests of the same cluster block aggregated workflow execution |
-| `GPU_FAULT_PROCESSOR_WORKERS` | deploy.sh 24; bare application default 4 | Number of concurrent lanes per active consumer process; control events are serialised within a cluster, periodic telemetry is parallel per node. Under the role split it belongs only to `gpu-fault-control-worker`; setting it on the ingress tier has no effect (see the connection and thread budget above) |
+| `GPU_FAULT_PROCESSOR_WORKERS` | 24 in the regional control-worker manifest and the legacy deploy.sh; bare application default 4 | Number of concurrent lanes per active consumer process; control events are serialised within a cluster, periodic telemetry is parallel per node. Under the role split it belongs only to `gpu-fault-control-worker`; setting it on the ingress tier has no effect (see the connection and thread budget above) |
 | `GPU_FAULT_PROCESSOR_FAULT_IDLE_BACKOFF_MAX_SECONDS` | 0.5 | Polling backoff cap for a genuinely empty fault stream, also while LISTEN/NOTIFY is healthy as long as a fault-tier row is PENDING or LEASED with a lapsed lease (the queue trigger notifies only idle->busy edges, so a fault row queued behind a PENDING row of its path is never announced); a shard owner whose fault stream finds no such row waits on the notification fallback instead, and a fault row under a live lease does not count |
 | `GPU_FAULT_PROCESSOR_FAULT_BUSY_BACKOFF_MAX_SECONDS` | 0.1 | Fault claim cap when there is local in-flight work, or a lane-blocked backlog on the fault stream while a fault-tier row waits (with notifications on and no such row, a lane-blocked backlog polls at `GPU_FAULT_PROCESSOR_BUSY_BACKOFF_MAX_SECONDS`, 0.4 s) |
 | `GPU_FAULT_PROCESSOR_NOTIFICATION_FALLBACK_SECONDS` | 5 | Fallback polling cap of the routine streams while LISTEN/NOTIFY is healthy, and of the fault stream while no fault-tier row is PENDING or LEASED with a lapsed lease (otherwise the fault stream uses the smaller of this and `GPU_FAULT_PROCESSOR_FAULT_IDLE_BACKOFF_MAX_SECONDS`); also how long the fault stream believes a fault backlog it found before asking again; an arriving notification clears the backoff immediately |
-| `GPU_FAULT_PROCESSOR_CONSUMER_PROCESSES` | 24 | Total consumer processes = control-worker replicas x uvicorn processes per Pod (6 x 4); the renderer writes it together with `NOTIFICATION_SHARDS`, and the runtime refuses a shard count below it |
-| `GPU_FAULT_PROCESSOR_NOTIFICATION_SHARDS` | 24 | Number of advisory-lock owner shards for queue notifications; the default equals 6 worker Pods x 4 processes, so each process holds at most 1 shard |
-| `GPU_FAULT_PROCESSOR_COMPLETION_CLUSTER_CONCURRENCY` | 1 | Number of cluster transactions that may be committed in parallel within one completion batch; production default 1, canary allows only 2/4 and must verify deadlock=0, consistent counters and no fencing regression |
+| `GPU_FAULT_PROCESSOR_CONSUMER_PROCESSES` | Regional control-worker manifest 24; unset by default in the application | Total consumer processes = control-worker replicas x uvicorn processes per Pod (6 x 4); the renderer writes it together with `NOTIFICATION_SHARDS`, and the runtime refuses a shard count below it |
+| `GPU_FAULT_PROCESSOR_NOTIFICATION_SHARDS` | Regional control-worker manifest 24; bare application default: `CONSUMER_PROCESSES` when that is set, else 8 | Number of advisory-lock owner shards for queue notifications; the regional value equals 6 worker Pods x 4 processes, so each process holds at most 1 shard |
+| `GPU_FAULT_PROCESSOR_COMPLETION_CLUSTER_CONCURRENCY` | 1; 1 to min(8, PostgreSQL pool max size) | Number of cluster transactions that may be committed in parallel within one completion batch; production default 1, canary allows only 2/4 and must verify deadlock=0, consistent counters and no fencing regression |
 | `GPU_FAULT_PROCESSOR_ROUTINE_STARVATION_SECONDS` | 30 | After priority 100 has waited longer than this in the GPU/Host main queue it is claimed at effective priority 49, avoiding permanent starvation by priority 50 |
 | `GPU_FAULT_PROCESSOR_FAULT_PRESSURE_EVIDENCE_WORKERS` | 1 | Cap on execution workers each GPU/Host evidence pool retains while this process runs a fault-tier request, or while its latest fault round found fault-tier rows waiting behind leased lanes (not in the busy rounds after a fault claim, nor while the backlog is only deferred); must be at least 1 |
 | `GPU_FAULT_PROCESSOR_REQUEST_LEASE_SECONDS` | ingress/spool 30; worker 150; bare application default 120 | Active lane lease cap; the worker's long value covers the 120 s handler deadline, and the actual renewal deadline never crosses the request's hard deadline |
@@ -8510,7 +8537,7 @@ baseline and NVIDIA support advice; the defaults must not be described as offici
 | `GPU_FAULT_COLLECTOR_STARTUP_SPREAD_SECONDS` | 15 | Maximum stagger window for the first collection of ordinary Collectors; `TRIGGER_HEALTH_SNAPSHOT` bypasses this phase via the request file |
 | `GPU_FAULT_COLLECTOR_STARTUP_JITTER_SECONDS` | 20 | Random start-up offset added on top of the stagger window; the first health summary and the first heartbeat are not delayed |
 | `GPU_FAULT_COLLECTOR_CADENCE_JITTER_RATIO` | 0.1 | +-ratio jitter per round of the inventory/health-summary/heartbeat cadences; the silence thresholds are checked against cadence x (1+ratio) + stagger + retry ladder |
-| `GPU_FAULT_PROCESSOR_EXIT_ON_DEADLINE` | true | Exit the process after a deadline fires and let Kubernetes recreate it |
+| `GPU_FAULT_PROCESSOR_EXIT_ON_DEADLINE` | Regional manifests true; bare application default false | Exit the process after a deadline fires and let Kubernetes recreate it |
 | `GPU_FAULT_PROCESSOR_EXIT_GRACE_SECONDS` | 5 | Wrap-up seconds before an unhealthy process hard-exits |
 | `GPU_FAULT_PROCESSOR_MAX_QUEUE_DEPTH` | Regional manifest 65536; bare application default 10000 | Regional processor queue admission cap |
 | `GPU_FAULT_PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH` | Regional manifest 4096 (configured by administrators via `processor.maxClusterQueueDepth` in `admin-config.yaml`); bare application default 1000 | Single-cluster processor queue admission cap |
@@ -8519,25 +8546,25 @@ baseline and NVIDIA support advice; the defaults must not be described as offici
 | `GPU_FAULT_PROCESSOR_RETRY_AFTER_SECONDS` | 2 | Suggested retry interval after a capacity rejection |
 | `GPU_FAULT_PROCESSOR_MAX_REQUEST_BYTES` | 16777216 | Hard cap on the processor request body |
 | `GPU_FAULT_TELEMETRY_SPOOL` | ingress false, worker false, spool-worker true (but 0 replicas by default) | The regional base manifests do not write new telemetry into the spool by default; when enabling the pressure-relief path you must make ingress write to the spool and scale up the dedicated spool-worker at the same time, not just scale replicas |
-| `GPU_FAULT_TELEMETRY_SPOOL_WORKERS` | 8 | Normal replay threads of a single spool-worker process; automatically drops to 1 with a priority 0 backlog. With spool enabled it validates `workers × REPLAY_BATCH_MAX_BYTES ≤ MAX_IN_FLIGHT_BYTES` (production 8 × 8 MiB = 64 MiB exactly), otherwise the last free slot cannot hold the head-of-queue batch and the claim repeatedly gives up and re-fetches (E-6). When unset on the worker role it is derived from the processor budget as 12, which does not error only because it does not start the spool consumer -- to enable spool on the worker it must be set explicitly to 8 |
+| `GPU_FAULT_TELEMETRY_SPOOL_WORKERS` | 8 | Normal replay threads of a single spool-worker process; automatically drops to 1 with a priority 0 backlog. With spool enabled it validates `workers × REPLAY_BATCH_MAX_BYTES ≤ MAX_IN_FLIGHT_BYTES` (production 8 × 8 MiB = 64 MiB exactly), otherwise the last free slot cannot hold the head-of-queue batch and the claim repeatedly gives up and re-fetches (E-6). Unset, it is derived as min(2 x max(1, `PROCESSOR_WORKERS` / 4), `MAX_IN_FLIGHT_BYTES` / `REPLAY_BATCH_MAX_BYTES`), at least 1: the worker role (24 lanes, default byte limits) gets 8 |
 | `GPU_FAULT_TELEMETRY_SPOOL_FAULT_PRESSURE_WORKERS` | 1 | Per-process replay cap while a priority 0 backlog exists |
 | `GPU_FAULT_TELEMETRY_SPOOL_FAULT_PRESSURE_POLL_SECONDS` | 0.5 | Sampling period for the priority 0 backlog |
 | `GPU_FAULT_TELEMETRY_SPOOL_MAX_ITEM_BYTES` | 4194304 | Cap for a single routine telemetry item to enter the spool; larger items stay in the processor main queue |
 | `GPU_FAULT_TELEMETRY_SPOOL_REPLAY_BATCH_MAX_BYTES` | 8388608 | Byte cap of a single internal replay JSON; must hold the largest item plus envelope |
 | `GPU_FAULT_TELEMETRY_SPOOL_MAX_IN_FLIGHT_BYTES` | 67108864 | Total byte cap of all replay futures of a single spool-worker process; the production value equals 8 maximum batches |
-| `GPU_FAULT_TELEMETRY_SPOOL_MAX_DEPTH` | 65536 | Global spool admission depth cap |
-| `GPU_FAULT_TELEMETRY_SPOOL_MAX_CLUSTER_DEPTH` | 1024 | Single-cluster spool admission depth cap |
+| `GPU_FAULT_TELEMETRY_SPOOL_MAX_DEPTH` | Regional ingress manifest 65536; bare application default `PROCESSOR_MAX_QUEUE_DEPTH` | Global spool admission depth cap |
+| `GPU_FAULT_TELEMETRY_SPOOL_MAX_CLUSTER_DEPTH` | Regional ingress manifest 1024; bare application default `PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH` | Single-cluster spool admission depth cap |
 | `GPU_FAULT_TELEMETRY_SPOOL_LEASE_SECONDS` | 60 | spool claim lease; after a process crash it expires and other replicas can re-claim |
 | `GPU_FAULT_TELEMETRY_SPOOL_RETRY_BACKOFF_SECONDS` | 1 | Retry backoff after a real replay failure; local scheduling re-queues do not consume retry attempts |
 | `GPU_FAULT_TELEMETRY_SPOOL_ADMISSION_PARTITIONS` | Regional manifest 8; bare application default 4 | Number of admission stripes across which consecutive full batches rotate |
 | `GPU_FAULT_TELEMETRY_SPOOL_STORE_IO_WORKERS` | Regional manifest 8; bare application default 16 | Store I/O threads dedicated on ingress to cross-cluster spool admission; at most one in-flight flush per stripe |
-| `GPU_FAULT_TELEMETRY_SPOOL_STORE_IO_MAX_IN_FLIGHT` | 256 | Cap on spool admissions waiting or executing in a single ingress process |
+| `GPU_FAULT_TELEMETRY_SPOOL_STORE_IO_MAX_IN_FLIGHT` | Regional manifest 256; bare application default 512 | Cap on spool admissions waiting or executing in a single ingress process |
 | `GPU_FAULT_PROCESSOR_CLEANUP_INTERVAL_SECONDS` | 60 | Whichever Pod obtains the separate `processor-cleanup` task lease periodically batch-cleans completed processor requests |
 | `GPU_FAULT_PROCESSOR_COMPLETED_RETENTION_SECONDS` | 600 | Retention time of completed processor responses |
 | `GPU_FAULT_PROCESSOR_CLEANUP_BATCH_SIZE` | 1000 | Per-run cleanup cap |
 | `GPU_FAULT_POSTGRES_POOL_MIN_SIZE` | Regional manifest 2; bare application default 1 | Minimum Aurora PostgreSQL connections per uvicorn process |
 | `GPU_FAULT_POSTGRES_POOL_MAX_SIZE` | Regional manifest ingress 40 / control-worker 24 / spool-worker 12; bare application default 8 | Maximum Aurora PostgreSQL connections per uvicorn process (the total must also be multiplied by `--workers` and the replica count) |
-| `GPU_FAULT_POSTGRES_POOL_TIMEOUT_SECONDS` | 2 | pool checkout timeout |
+| `GPU_FAULT_POSTGRES_POOL_TIMEOUT_SECONDS` | Regional manifest 10; bare application default 2 | pool checkout timeout |
 | `GPU_FAULT_POSTGRES_POOL_MAX_IDLE_SECONDS` | 300 | Idle connection reclamation time |
 | `GPU_FAULT_POSTGRES_POOL_MAX_LIFETIME_SECONDS` | 3600 | Maximum connection lifetime |
 | `GPU_FAULT_FLEET_DEPLOYMENT_RETENTION_SECONDS` | 604800 | Retention of terminal fleet deployments; the periodic task deletes in batches |
@@ -8551,17 +8578,18 @@ baseline and NVIDIA support advice; the defaults must not be described as offici
 | `GPU_FAULT_TARGET_DRIVER_BRANCH` | Empty | e.g. `575`; required when the driver SXID list is configured |
 | `GPU_FAULT_TARGET_FIRMWARE_VERSION` | Empty | The exact version validated by the site; required when any firmware flow is enabled |
 
-When automatic spare switching is enabled, the control plane only picks nodes from the pool carrying
+When automatic spare switching is enabled, the spare coordinator (inside the cluster executor in a regional deployment) only picks nodes from the pool carrying
 `gpu-fault.io/spare=true`. Each candidate node must simultaneously satisfy HyperPod
-`Running`, `sagemaker.amazonaws.com/node-health-status=Schedulable`, Kubernetes
-`Ready`, independent Agent fleet-ready, no active fault markers/findings, and not reserved by another incident.
+`Running`, `sagemaker.amazonaws.com/node-health-status=Schedulable` (judged on HyperPod only; a plain EKS node has no such label), Kubernetes
+`Ready`, independent Agent fleet-ready, no active fault markers/findings, no running GPU Pod, cordoned while idle (an unreserved
+spare that is schedulable is ineligible), spare pool state `AVAILABLE`, and not reserved by another incident.
 When the required number of healthy spares is insufficient the whole replacement transaction fails without partial activation; this path does not call
 HyperPod `BatchReplaceClusterNodes`.
 
 Reset-failure escalation using a warm spare must additionally satisfy:
 
 1. HyperPod `NodeRecovery=None`, avoiding double writes by managed replacement and this controller.
-2. `GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER=true`.
+2. `GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER=true` (the cluster executor manifest's default).
 3. The Runtime Profile's `nodeReplace` owner is `gpu-fault-hyperpod-adapter` and cannot be delegated to
    `hyperpod-managed-node-recovery`.
 4. The replacement step generated by escalation always carries
