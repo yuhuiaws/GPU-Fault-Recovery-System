@@ -7856,21 +7856,27 @@ sudo /opt/gpu-fault/uninstall
 | `GPU_FAULT_PROCESSOR_REPLAY_SECRET` | Empty | Required for the queued processor, at least 32 characters; must differ from the execution token, and replay accepts loopback sources only |
 | `GPU_FAULT_ALLOWED_OPERATIONS` | Empty | Required in active, comma-separated |
 | `GPU_FAULT_EXECUTOR_ID` | Automatic | Manual setting is not recommended with multiple replicas |
-| `GPU_FAULT_WORKFLOW_LEASE_DURATION_SECONDS` | 180 | Minimum 30 |
+| `GPU_FAULT_DEPLOYMENT_MODE` | `single-cluster` | Only `regional` / `single-cluster` are accepted; any other value refuses to start. Regional production is `regional`: `GPU_FAULT_REGIONAL_CLUSTERS_JSON` is required and `GPU_FAULT_HYPERPOD_CLUSTER` must be unset; `single-cluster` is Canary-only and additionally needs an explicit `GPU_FAULT_ALLOW_SINGLE_CLUSTER=true` |
+| `GPU_FAULT_WORKFLOW_LEASE_DURATION_SECONDS` | 180 | Minimum 30; must be below the execution timeout |
+| `GPU_FAULT_WORKFLOW_EXECUTION_TIMEOUT_SECONDS` | 1800 | Execution budget of a workflow from its first claim; must not exceed either lifetime. A workflow holding `CHECK_MECHANICALS` is floored at the operator acknowledgement ceiling, one holding a reinstall step at the reinstall floor below |
+| `GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS` | 600 | Generic per-step waiting cap; operations whose adapter owns the wait (managed recovery, reinstalls, Fabric Manager starts and others) have higher ceilings, and an override may only be above this value |
+| `GPU_FAULT_WORKFLOW_STEP_WARNING_SECONDS` | 300 | Alert threshold for a single step's wait, exported as `gpu_fault_workflow_step_waiting_warning_seconds` for `GpuFaultWorkflowStepStalled`; must not exceed the step cap |
+| `GPU_FAULT_JOB_WORKFLOW_MAX_LIFETIME_SECONDS` / `GPU_FAULT_NODE_WORKFLOW_MAX_LIFETIME_SECONDS` | 3600 / 3600 | Lifetime cap of job / node workflows; must be positive |
 | `GPU_FAULT_WORKFLOW_INSTALL_STEP_TIMEOUT_SECONDS` | 1900 | Per-step wait cap for the three reinstall steps `REMEDIATE_DRIVER` / `UPDATE_SOFTWARE_FIRMWARE` / `REMEDIATE_EFA_DRIVER`, replacing the generic 600 s; must not exceed the node workflow lifetime |
 | `GPU_FAULT_WORKFLOW_INSTALL_CONTAINMENT_SECONDS` | 600 | Execution deadline floor of a workflow containing a reinstall step = reinstall cap + this value (2500 s by default, capped by the lifetime); >= 0, compression drills may set 0; sites that run `STOP_WORKLOADS` first on active nodes should raise it (e.g. 1200) |
 | `GPU_FAULT_ENABLE_WORKFLOW_DISPATCHER` | true | Effective in active |
 | `GPU_FAULT_ENABLE_WORKFLOW_PREEMPTION` | true | Allows a higher-tier workflow on the same node with the same attempt, or with neither side having a job, to set the lower-tier predecessor to `SUPERSEDED` at a safe step boundary; on by default, can be explicitly disabled during emergency troubleshooting |
-| `GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS` | 5 | Fallback scan interval of persistent workflows; remote completion, GPU metrics and host telemetry actively wake this Pod's dispatcher after being stored |
+| `GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS` | 5 | Fallback scan interval of persistent workflows. When a workflow row becomes executable or a remote command reaches `SUCCEEDED`/`FAILED`, a PostgreSQL trigger sends a NOTIFY (`gpu_fault_workflow_dispatch` / `gpu_fault_remote_command`) and the control-worker's listener threads wake the dispatcher at once; this value only covers a wakeup that was never delivered |
+| `GPU_FAULT_WORKFLOW_DISPATCH_LEASE_SECONDS` | max(15, 3 x poll) | Only the dispatcher holding this lease scans, across the whole control plane; an explicit value below 3 x poll refuses to start; `0` disables the lease (every process scans; tests only) |
 | `GPU_FAULT_WORKFLOW_BATCH_SIZE` | (dispatch lease x 0.5 - 1 s) x workers / 0.15 s, within 100..400 | Oldest workflow rows selected per tick; unset, derived from the dispatcher workers and the dispatch lease (346 as shipped), and startup warns when a tick cannot finish inside the lease; no longer derived from a remediation limit |
 | `GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS` | 8 | Number of dispatcher threads executing different incidents in parallel; at most one workflow per incident per round |
 | `GPU_FAULT_XID_CORRELATION_POLL_SECONDS` | 1 | Period for scanning expired XID 45 |
 | `GPU_FAULT_XID_CORRELATION_LEASE_SECONDS` | 30 | HA final-processing lease; minimum 5 seconds |
 | `GPU_FAULT_DEFAULT_RESTART_BUDGET` | 1 | Maximum automatic restarts of the same job when the Pod has no annotation |
-| `GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL` | false | Emergency compatibility switch. Must not be set in production by default; startup fails when active and SES/dispatcher do not form an outbound channel |
+| `GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL` | false | Emergency compatibility switch. Must not be set in production by default; startup fails when active without an outbound alert channel. An outbound channel = the site SNS topic (`GPU_FAULT_SNS_TOPIC_ARN`) or SES where chosen, with `GPU_FAULT_ALLOW_EMAIL=true`, and either the notification dispatcher enabled or `GPU_FAULT_NOTIFICATION_ASYNC_DELIVERY=false`; set to true, startup only logs a warning declaring that alerting is handled outside this process (the ADOT/AMP path) |
 | `GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256` | Required | Must be a non-empty 64-character SHA-256 when the Agent Registry is enabled |
 | `GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST` | Required | Must be a non-empty 64-character SHA-256 when the Agent Registry is enabled |
-| `GPU_FAULT_REQUIRED_NODE_ACTION_KEY_VERSION` | 2 | Mandatory version after the whole fleet completes the node-specific key migration |
+| `GPU_FAULT_REQUIRED_NODE_ACTION_KEY_VERSION` | Empty (unrestricted); 2 in regional releases | Only `1` or `2` is accepted; `2` = the whole fleet uses node-specific keys. A regional deployment injects it from `required-node-action-key-version` of `gpu-fault-release-metadata`, which `apply-control-plane-role-split.sh` writes as `2` by default |
 | `GPU_FAULT_POSTGRES_BOOTSTRAP_TIMEOUT_SECONDS` | 540 | Total cap for one bootstrap of the schema Job |
 | `GPU_FAULT_POSTGRES_BOOTSTRAP_LOCK_TIMEOUT_SECONDS` | 60 | Cap on bootstrap waiting for relation/advisory locks |
 | `GPU_FAULT_REMOTE_COMMAND_CLAIM_DEADLINE_SECONDS` | 900 | Dead-letter timeout of `PENDING` remote commands nobody claims; 0 disables |
@@ -7941,17 +7947,18 @@ companion, and the 30 s `PENDING_CORRELATION` window is unchanged.
 
 | Environment variable | Default | Description |
 |---|---|---|
-| `GPU_FAULT_ENABLE_KUBERNETES_ADAPTER` | false | Kubernetes mutation |
-| `GPU_FAULT_KUBERNETES_OWNER` | `gpu-fault-kubernetes-adapter` | Must match the profile |
-| `GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER` | false | Calls the Node Agent |
+| `GPU_FAULT_ENABLE_KUBERNETES_ADAPTER` | false | In-process Kubernetes mutation of the control plane, single-cluster/Canary only; a regional control plane refuses to start with true. In regional mode Kubernetes operations run in each GPU cluster's cluster executor (which always loads the Kubernetes adapter) |
+| `GPU_FAULT_KUBERNETES_OWNER` | `gpu-fault-kubernetes-adapter` | Must match the profile; the cluster executor reads the same variable |
+| `GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER` | false | A single-cluster control plane calls the Node Agent directly; a regional control plane does not load this adapter (the regional manifests pin false), node actions are dispatched by the cluster executor (whose manifest sets `true`) |
 | `GPU_FAULT_NODE_ACTION_OWNER` | `gpu-fault-node-agent` | Must match the profile |
-| `GPU_FAULT_NODE_ACTION_SECRET` | Empty | Same as on the nodes |
-| `GPU_FAULT_NODE_AGENT_ENDPOINTS` | `{}` | Static JSON fallback; the registry takes precedence |
+| `GPU_FAULT_NODE_ACTION_SECRET` | Empty | Fleet master secret (at least 32 characters), also the default of `GPU_FAULT_AGENT_REGISTRATION_SECRET`; node-specific keys (version 2) are HMAC-derived from it per cluster/node and a node holds only its own derived key; with version 1 it equals the shared secret on the nodes |
+| `GPU_FAULT_NODE_AGENT_ENDPOINTS` | `{}` | Static JSON (node -> URL) used only without an Agent registry; with the registry, only the heartbeat-registered endpoints are used |
 | `GPU_FAULT_EVIDENCE_OWNER` | `gpu-fault-control-plane` | Evidence step owner |
 | `GPU_FAULT_VALIDATION_OWNER` | `gpu-fault-validation-adapter` | validation owner |
 | `GPU_FAULT_VALIDATION_REQUIRE_RDMA` | false | Set true on RDMA clusters |
 | `GPU_FAULT_POST_ACTION_VALIDATION_MAX_SAMPLE_AGE_SECONDS` | 420 | Validation window after actions such as RESET/REBOOT; must be no less than `GPU_FAULT_GPU_METRICS_SILENT_AFTER_SECONDS`; the default covers one 300 s edge-filter period plus transport jitter |
-| `GPU_FAULT_MANAGED_RECOVERY_OWNERS` | The two HyperPod owners | Comma-separated |
+| `GPU_FAULT_MANAGED_RECOVERY_OWNERS` | The two HyperPod owners | Comma-separated (`hyperpod-managed-node-recovery,hyperpod-managed-job-recovery`); empty by default when the process has `GPU_FAULT_CLUSTER_PROVIDER=eks-managed` (plain EKS has no HyperPod managed recovery) |
+| `GPU_FAULT_REMOTE_EXECUTION_OWNERS` | The four adapter owners: Kubernetes, Node Agent, HyperPod, EKS | In regional mode the steps of these owners become remote commands for the target cluster's cluster executor; empty refuses to start in regional mode |
 
 <a id="83-fleet-compatibility"></a>
 ### 6.3 Fleet compatibility
@@ -7960,13 +7967,24 @@ companion, and the 30 s `PENDING_CORRELATION` window is unchanged.
 |---|---|---|
 | `GPU_FAULT_ENABLE_AGENT_REGISTRY` | false | Enables the heartbeat registry |
 | `GPU_FAULT_AGENT_REGISTRATION_SECRET` | node secret | Can be set independently |
-| `GPU_FAULT_REQUIRED_AGENT_VERSION` | Unrestricted | Pinning 0.10.0 recommended |
-| `GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256` | Unrestricted | Pinning the wheel SHA recommended |
+| `GPU_FAULT_REQUIRED_AGENT_VERSION` | Unrestricted | Pinning 0.10.0 recommended (the regional manifests pin 0.10.0) |
+| `GPU_FAULT_REQUIRED_AGENT_PROTOCOL_VERSION` | The code constant `CURRENT_AGENT_PROTOCOL_VERSION` | Must be a positive integer |
+| `GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256` | Empty | Required when the registry is enabled (empty refuses to start): the SHA-256 of the Agent wheel |
+| `GPU_FAULT_REQUIRED_AGENT_COMPATIBILITY_DIGEST` | The artifact SHA-256 | Agent compatibility digest |
 | `GPU_FAULT_REQUIRED_POLICY_VERSION` | Unrestricted | Pinning the mapping version recommended |
 | `GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION` | Unrestricted | Pinning recommended |
-| `GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST` | Unrestricted | Pin after rollout |
-| `GPU_FAULT_AGENT_MAX_HEARTBEAT_AGE_SECONDS` | 90 | Should be 2-3 times the heartbeat interval |
+| `GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST` | Empty | Required when the registry is enabled (empty refuses to start): the Agent configuration digest |
+| `GPU_FAULT_COMPATIBLE_AGENT_PROTOCOL_VERSIONS` / `_ARTIFACT_SHA256S` / `_COMPATIBILITY_DIGESTS` / `_CONFIG_DIGESTS` | Empty | Values accepted in addition to the required ones during a rolling upgrade window (comma-separated; digests must be 64-character hex SHA-256) |
+| `GPU_FAULT_AGENT_MAX_HEARTBEAT_AGE_SECONDS` | 90 | 10-3600; should be 2-3 times the heartbeat interval |
+| `GPU_FAULT_AGENT_ENDPOINT_REQUIRE_TLS` | true | The endpoint a heartbeat announces must be `https://` and carry its signed TLS certificate |
 | `GPU_FAULT_AGENT_MAINTENANCE_WINDOW_SECONDS` | 420, 30-3600 | After a quiesce, allows the same generation to continue reset/restore while heartbeats are paused; must not exceed the node fail-safe |
+
+In a regional deployment every required/compatible pin (the Agent and regional executor artifacts, protocol versions,
+compatibility digests, configuration digests and the node-action key version) comes through `configMapKeyRef` from the
+ConfigMap `gpu-fault-release-metadata`. Each control-plane process also re-reads that ConfigMap every
+`GPU_FAULT_FLEET_PIN_POLL_SECONDS` (default 2 seconds) and swaps its pin snapshot atomically, so a pin-only change needs no
+Pod roll; a read or validation failure keeps serving the previous validated pins and never affects readiness. The Agent
+version, policy/profile versions, heartbeat age and TLS are still read at process start only.
 
 <a id="84-诊断训练与证据"></a>
 ### 6.4 Diagnostics, Training and Evidence
@@ -7978,7 +7996,7 @@ companion, and the 30 s `PENDING_CORRELATION` window is unchanged.
 | `GPU_FAULT_TRAINING_HEARTBEAT_TIMEOUT_SECONDS` | 120 | Minimum 15 |
 | `GPU_FAULT_TRAINING_STARTUP_GRACE_SECONDS` | 300 | Minimum 15 |
 | `GPU_FAULT_TRAINING_MAX_STEP_LAG` | 20 | Minimum 1 |
-| `GPU_FAULT_TRAINING_MIN_THROUGHPUT_RATIO` | 0.5 | 0-1 |
+| `GPU_FAULT_TRAINING_MIN_THROUGHPUT_RATIO` | 0.5 | Greater than 0 and less than 1 |
 | `GPU_FAULT_EVIDENCE_RETENTION_HOURS` | 24 | Short-term evidence TTL |
 | `GPU_FAULT_EVIDENCE_MAX_RECORDS_PER_NODE` | 10000 | Per-node cap |
 
