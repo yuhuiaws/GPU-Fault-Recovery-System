@@ -8,9 +8,18 @@ and must not serve as the basis for the current deployment or implementation.
 
 ## English editions
 
-Every document of the Chinese documentation set has an English edition in this
+The documents of the Chinese documentation set have English editions in this
 directory. The Chinese file remains the source of record until both are
-maintained together; when the two disagree, the Chinese file wins. Alert
+maintained together; when the two disagree, the Chinese file wins. The
+exceptions are focused documents that exist in one language only:
+`validation-limitations.md` and, under `components/`,
+`atomic-ownership-fence-design.md`, `destr008-cancellation.md`,
+`destr008-service-window.md`, `destr014-recovery-safeguard.md`,
+`health-policy-hardening.md`, `host-observation-hardening.md`,
+`late-ownership-acceptance.md`, `node-key-custody-evidence.md` and
+`scenario-coverage.md` are written in English only, while the seven
+`general-fault-*`, `gpu-environment-*` and `nccl-hung-*` documents under
+`components/` exist in Chinese only; this index links them where they are. Alert
 `runbook_url` annotations and Grafana panel links point at
 [Administrator Operations](administrator-operations.md), whose runbook card
 headings are the alert names.
@@ -45,6 +54,7 @@ headings are the alert names.
 | [Workflow and Remote Command State Tables](components/postgres-state-tables.md) | [components/postgres-state-tables.md](../components/postgres-state-tables.md) | Two-phase DDL, migration CLI, validation boundary and the preserved original F2 design |
 | [NVIDIA Official Policy Implementation Audit](components/nvidia-policy.md) | [components/nvidia-policy.md](../components/nvidia-policy.md) | Pinned upstream sources, decision semantics, implemented official workflows and SXID handling |
 | [Plain EKS GPU Clusters and Mixed-Provider Sites](components/plain-eks-gpu-cluster.md) | [components/plain-eks-gpu-cluster.md](../components/plain-eks-gpu-cluster.md) | Design, operator prerequisites, limitations and validation status of `eks-managed` |
+| [Regional Acceptance Runner Case-by-case Review](components/regional-acceptance-review.md) | [components/regional-acceptance-review.md](../components/regional-acceptance-review.md) | Implementation analysis and repeatability judgement of the regional acceptance runner cases |
 
 ## Administrator Entry Points
 
@@ -71,6 +81,7 @@ The normal path does not require administrators to read the full deployment manu
 | [Detailed Design](detailed-design.md) | How the current code modules, protocols and state machines are implemented |
 | [Detailed Design v2 (implementation view)](detailed-design-v2.md) | How each module runs, how data flows, how exceptions are handled, enough to code and integrate from it |
 | [NVIDIA Policy Supply Chain and Implementation](components/nvidia-policy.md) | Catalog and DCGM exporter pinned sources, generated digests, action semantics and runtime gates |
+| [Plain EKS GPU Clusters and Mixed-Provider Sites](components/plain-eks-gpu-cluster.md) | Design, operator prerequisites, limitations and validation status of `eks-managed` |
 | [Fault Categories and Actions](fault-categories-and-actions.md) | For every fault category and every XID/SXID: detection rules, NVIDIA official recommendations, policy decisions and actual execution steps |
 | [CI Release Process](ci-release-process.md) | How main CI produces signed candidates, how Release verifies signatures, promotes and delivers artifacts |
 | [EC2 Source Staging Unified Deployment Process](ec2-source-staging-reproduction.md) | First deploy, dirty iterations and subsequent upgrades all use the four-parameter `gpu-fault-admin deploy` |
@@ -85,8 +96,9 @@ The normal path does not require administrators to read the full deployment manu
 
 The only current production form is a regional CPU control plane separated from the EKS GPU data plane: a GPU cluster is a HyperPod EKS
 cluster by default (`provider: hyperpod`, the fully validated form) or a plain EKS cluster without a HyperPod orchestrator
-(`provider: eks-managed`, a new, less validated form in which provider-side node replacement is observe-only; see Administrator
-Operations §5.0). The historical
+(`provider: eks-managed`, a new, less validated form: node reboot goes through EC2 `RebootInstances`, neither provider has a
+provider-side node replacement, and `REPLACE_NODE` only hands over to a declared spare; see
+[High-Level Design §2.4](high-level-design.md) and Administrator Operations §5.0). The historical
 single-cluster all-in-one content is used only for migration and compatibility verification and does not constitute a new production deployment entry point.
 
 ## Acceptance and Testing
@@ -95,6 +107,15 @@ single-cluster all-in-one content is used only for migration and compatibility v
 |---|---|---|
 | [Regional E2E Acceptance Test Cases](regional-e2e-acceptance-test-cases.md) | Specification | Revised with the current implementation; case IDs and title anchors stay stable |
 | [Xid Recovery E2E](components/xid154-recovery-e2e.md) | Focused regression | Software, physical acceptance and UVM implementation gaps are recorded separately |
+| [General Fault Item-by-item Acceptance Overview](../components/general-fault-e2e-audit.md) (Chinese only) | Specification and gaps | Overview of the 32 classes, remediation status and items not yet executed |
+| [General Fault Live Acceptance Supplement](../components/general-fault-live-acceptance.md) (Chinese only) | Live specification | Specifications of the 30 added classes and the temperature/power reuse mapping; design coverage is not a live pass |
+| [32-Class Software Injection Runner](../components/general-fault-injection-runner.md) (Chinese only) | Software validation | Reports the continuous main scenario and the segmented checks separately |
+| [Host Observation and Diagnostic Hardening](../components/host-observation-hardening.md) | Implementation note | Unreadable data, fault classification and validation binding |
+| [NCCL Hung Improvements and Validation](../components/nccl-hung-hardening.md) (Chinese only) | Implementation and acceptance | Task summary, sampling cap, evidence boundary, concurrent merge and recovery decision |
+| [NCCL Hung End-to-End Coverage Audit](../components/nccl-hung-e2e-coverage.md) (Chinese only) | Test coverage | Continuous software chain, scenario matrix, code coverage statistics and live gaps |
+| [General Health Policy Changes](../components/health-policy-hardening.md) | Implementation note | Twelve policy classes and their software validation boundary |
+| [GPU Environment Policy Review](../components/gpu-environment-policy-review.md) (Chinese only) | Focused assessment | NVIDIA/NVSentinel basis, environment fault decisions and manual review |
+| [GPU Environment Live Acceptance](../components/gpu-environment-live-acceptance.md) (Chinese only) | Live specification | Real power experiments, telemetry replay and physical fault proof kept separate |
 | [Regional Case Index](regional-case-index.md) | Generated artifact | Shows only the execution order and specification entry points, without internal execution state |
 | [Change Impact and Test Selection](change-impact-and-test-selection.md) | Development gate | Selects pytest and affected regional cases backwards from code paths |
 | [Coverage and Scenario Requirement Matrix](../components/scenario-coverage.md) | Quality statistics | Measures statements, branches, mechanism requirements and real-machine verification separately; keeps unimplemented items |
@@ -124,7 +145,9 @@ Generated artifacts must not be edited by hand. After modifying the source of tr
 
 - `src/**/*.py`: runtime, protocols, configuration and module design;
 - `tests/**/*.py`: test behavior, acceptance catalog and limitation notes;
-- `scripts/**/*.sh`, `deploy/**/*.sh`: commands executed by administrators and deployment processes.
+- `scripts/**/*.sh`, `deploy/**/*.sh`: commands executed by administrators and deployment processes;
+- `deploy/**/*.py`, `deploy/**/*.yaml`, `deploy/**/*.yml`, `deploy/**/*.json` and
+  `scripts/generate-cleanup-inventory.py`: production manifests, renderers and cleanup registries.
 
 `scripts/check-doc-impact.py` reads the Git diff in a Pull Request. When code matching a contract
 changes, at least one corresponding document must change as well. When a purely internal refactor really does not affect the documentation, the
@@ -156,7 +179,7 @@ A source package without Git metadata still runs the contract structure and cove
   metrics; production delivery continues to go into Developer Deployment Implementation.
 - [Workflow/Remote Command Dedicated Tables Implementation](components/postgres-state-tables.md): two-phase
   DDL, migration CLI, validation boundaries, and the preserved original F2 design.
-- [Regional Acceptance Runner Case-by-case Review](../components/regional-acceptance-review.md): implementation analysis of the existing 188 cases,
+- [Regional Acceptance Runner Case-by-case Review](components/regional-acceptance-review.md): implementation analysis of the existing 188 cases,
   repeatability judgment and three subsequent additions; historical full-run results and the current coverage remediation are kept separate and are not live pass evidence.
 - [Insufficient Hot Spare Independent Cancellation and Safeguards](../components/destr008-cancellation.md): time-limited fixtures, producer
   withdrawal, command silence, resource custody and cleanup-only resume; service window details are in
@@ -183,7 +206,6 @@ For the contribution entry point see [CONTRIBUTING.md](../../CONTRIBUTING.md) at
   [evidence/fault/README.md](../evidence/fault/README.md); the non-authoritative historical narrative
   migrated out of the public specification is
   [evidence/regional-history/README.md](../evidence/regional-history/README.md).
-- `reference/`: explanatory reference material that cannot be submitted directly to the runtime API.
 
 ## Machine Guard
 

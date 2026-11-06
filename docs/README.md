@@ -6,14 +6,20 @@
 
 ## English editions
 
-本目录每篇文档都有英文版，位于 [`docs/en/`](en/README.md)（英文索引逐篇列出
-对应关系与一句话说明）。中文文件仍是事实源，直到两者同步维护。告警的
+本目录的中文文档在 [`docs/en/`](en/README.md) 有英文版（英文索引逐篇列出对应关系与
+一句话说明）；中文文件仍是事实源，直到两者同步维护。例外是只有一种语言的专项材料：
+`validation-limitations.md` 与 `components/` 下的 `atomic-ownership-fence-design.md`、
+`destr008-cancellation.md`、`destr008-service-window.md`、`destr014-recovery-safeguard.md`、
+`health-policy-hardening.md`、`host-observation-hardening.md`、`late-ownership-acceptance.md`、
+`node-key-custody-evidence.md`、`scenario-coverage.md` 只有英文原文；`components/` 下的
+`general-fault-*`、`gpu-environment-*` 与 `nccl-hung-*` 共七篇只有中文。告警的
 `runbook_url` 与 Grafana 面板链接指向英文版 `docs/en/administrator-operations.md`，
 锚点与中文版的告警名标题一致。
 
-English editions of every document in this directory live under
+English editions of the Chinese documents in this directory live under
 [`docs/en/`](en/README.md); the Chinese files remain the source of record until
-both are maintained together. Alert `runbook_url` annotations and Grafana panel
+both are maintained together. A few focused documents exist in one language
+only (listed above). Alert `runbook_url` annotations and Grafana panel
 links point at `docs/en/administrator-operations.md`.
 
 ## 管理员入口
@@ -56,7 +62,9 @@ links point at `docs/en/administrator-operations.md`.
 
 当前唯一生产形态是区域 CPU 控制面与 EKS GPU 数据面分离：GPU 集群默认是 HyperPod EKS
 （`provider: hyperpod`，完整验收形态），也可以是没有 HyperPod 编排器的普通 EKS 集群
-（`provider: eks-managed`，新增、验证较少的形态，provider 侧节点替换只观察；见管理员日常运维 §5.0）。
+（`provider: eks-managed`，新增、验证较少的形态：节点 reboot 经 EC2 `RebootInstances`，
+两种 provider 都没有 provider 侧节点替换，`REPLACE_NODE` 只交接到已声明的热备；见
+[概要设计 §2.4](概要设计.md) 与管理员日常运维 §5.0）。
 历史单集群一体化内容只用于迁移和兼容验证，不构成新的生产部署入口。
 
 ## 验收与测试
@@ -103,7 +111,9 @@ links point at `docs/en/administrator-operations.md`.
 
 - `src/**/*.py`：运行时、协议、配置与模块设计；
 - `tests/**/*.py`：测试行为、验收目录与限制说明；
-- `scripts/**/*.sh`、`deploy/**/*.sh`：管理员执行的命令和部署流程。
+- `scripts/**/*.sh`、`deploy/**/*.sh`：管理员执行的命令和部署流程；
+- `deploy/**/*.py`、`deploy/**/*.yaml`、`deploy/**/*.yml`、`deploy/**/*.json` 与
+  `scripts/generate-cleanup-inventory.py`：生产 Manifest、renderer 与清理注册表。
 
 `scripts/check-doc-impact.py` 在 Pull Request 中读取 Git diff。命中契约的代码
 发生变化时，至少一份对应文档也必须变化。纯内部重构确实不影响文档时，必须在
@@ -162,7 +172,6 @@ Documentation-Impact-Reason: 仅重构内部实现，公共行为、命令和验
   [evidence/fault/README.md](evidence/fault/README.md)；从公共规格迁出的
   非权威历史叙述见
   [evidence/regional-history/README.md](evidence/regional-history/README.md)。
-- `reference/`：不能直接提交给运行时 API 的说明性参考材料。
 
 ## 机器守卫
 
