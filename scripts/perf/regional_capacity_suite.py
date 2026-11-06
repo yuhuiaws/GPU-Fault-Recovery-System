@@ -52,6 +52,7 @@ if TYPE_CHECKING or __package__:
     from . import regional_capacity_results as capacity_results
     from . import regional_capacity_settle as capacity_settle
     from . import regional_capacity_timeseries as capacity_timeseries
+    from . import regional_load_generator as capacity_load_generator
     from .regional_capacity_cleanup import (
         AUDIT_PURGE_STATEMENTS as AUDIT_PURGE_STATEMENTS,
     )
@@ -73,6 +74,7 @@ else:
     import regional_capacity_results as capacity_results
     import regional_capacity_settle as capacity_settle
     import regional_capacity_timeseries as capacity_timeseries
+    import regional_load_generator as capacity_load_generator
     from regional_capacity_cleanup import (
         AUDIT_PURGE_STATEMENTS as AUDIT_PURGE_STATEMENTS,
     )
@@ -115,6 +117,7 @@ store_state_section = capacity_database.store_state_section
 _processor_priority_latency = capacity_database.processor_priority_latency
 MEASUREMENT_FAILED_EXIT = capacity_database.MEASUREMENT_FAILED_EXIT
 measured_exit = capacity_database.measured_exit
+measured_reason = capacity_database.measured_reason
 step_status = capacity_database.step_status
 CONTROL_POD_PREFIXES = capacity_placement.CONTROL_POD_PREFIXES
 start_placement = capacity_placement.start_placement
@@ -918,6 +921,10 @@ def execute_case(
                 "gpu_fault_processor_queue"
             ),
             "processor_priority_latency": priority_latency,
+            # Pods, nodes and client CPU against the CPU limit (perf plan §5).
+            "load_generator": capacity_load_generator.evidence(
+                dataplane, job, documents, cpu_limit=cpu_limit
+            ),
             "placement": placement_section(placement, AURORA_CLUSTER_ID),
             # aurora_capacity_max, aurora_cpu_max and aurora_measurement.
             **aurora,
@@ -1148,11 +1155,11 @@ def execute_capacity_command(
             if summary.get("job_status") != "Complete":
                 result = 1
                 aborted_reason = f"job status: {summary.get('job_status')}"
-            elif measured_exit(0, summary):
-                # The run measured some other database; its product readings
-                # stay in summary.json, but the step does not count.
-                result = MEASUREMENT_FAILED_EXIT
-                aborted_reason = summary["aurora_measurement"]["reason"]
+            elif result := measured_exit(0, summary):
+                # A saturated load generator, or a run that measured some other
+                # database: the readings stay in summary.json, the step does
+                # not count.
+                aborted_reason = measured_reason(result, summary)
     except BaseException as exc:
         failure = exc
     finally:
@@ -1407,6 +1414,11 @@ def start_capacity_run(
                 "correlate_attempt_faults": (args.correlate_attempt_faults),
                 "workers": args.workers,
                 "duration_seconds": args.duration_seconds,
+                "load_generator": capacity_load_generator.plan(
+                    pods=args.clusters,
+                    cpu_request=args.cpu_request,
+                    cpu_limit=args.cpu_limit,
+                ),
                 "fault_only": args.fault_only,
                 "prewarm_connections": (args.prewarm_connections),
                 "command": args.command,

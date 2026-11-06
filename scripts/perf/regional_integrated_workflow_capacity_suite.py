@@ -19,6 +19,7 @@ from gpu_fault.admin.aurora_capacity import (  # noqa: E402
 
 if __package__:
     from . import regional_integrated_evidence as evidence
+    from . import regional_load_generator as load_generator
     from .regional_action_capacity_suite import (
         aggregate_executor_documents,
         collect_executor_logs,
@@ -95,6 +96,7 @@ if __package__:
     from .regional_validation_telemetry import start_validation_telemetry
 else:
     import regional_integrated_evidence as evidence
+    import regional_load_generator as load_generator
     from regional_action_capacity_suite import (
         aggregate_executor_documents,
         collect_executor_logs,
@@ -173,6 +175,7 @@ else:
 
 PERF_DIR = Path(__file__).resolve().parent
 LOAD_JOB = "gpu-fault-perf-suite-burst"
+LOAD_CPU_REQUEST, LOAD_CPU_LIMIT = "2", "4"
 EXECUTOR_JOB = "gpu-fault-integrated-action-executors"
 EXECUTOR_CONFIGMAP = "gpu-fault-integrated-action-executor"
 TERMINAL_WORKFLOWS = {"SUCCEEDED", "FAILED", "BLOCKED", "SUPERSEDED"}
@@ -428,11 +431,6 @@ def remediation_budget_preflight(clusters: int) -> dict:
     return live_budget_preflight(control)
 
 
-def log(message: str) -> None:
-    stamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
-    print(f"[{stamp}] {message}", flush=True)
-
-
 def first_api_pod() -> str:
     """The api-ha Pod the seeding and audit programs run in."""
 
@@ -559,8 +557,8 @@ def build_load_manifest(
         start_epoch=time.time() + lead_seconds,
         workers=workers,
         duration_seconds=60,
-        cpu_request="2",
-        cpu_limit="4",
+        cpu_request=LOAD_CPU_REQUEST,
+        cpu_limit=LOAD_CPU_LIMIT,
         include_telemetry=True,
         prewarm_connections=False,
     )
@@ -1166,6 +1164,9 @@ def execute_integrated_jobs(
             pod_runtime_after,
         ),
         "processor_priority_latency": processor_priority_latency(load_created_at),
+        "load_generator": load_generator.evidence(
+            dataplane, LOAD_JOB, load_documents, cpu_limit=LOAD_CPU_LIMIT
+        ),
         "postgres_deltas": {
             key: (postgres_after.get(key) or 0) - (postgres_before.get(key) or 0)
             for key in ("deadlocks", "xact_commit", "xact_rollback")
@@ -1177,6 +1178,8 @@ def execute_integrated_jobs(
         summary["store_bloat"], summary["store_layout"]
     )
     status, errors = verdict(summary, expected_workflows=expected_workflows)
+    if summary["load_generator"]["valid"] is False:  # perf plan §5
+        status, errors = "INVALID", [summary["load_generator"]["reason"], *errors]
     summary["status"] = status
     summary["errors"] = errors
     for name, value in (
@@ -1228,6 +1231,11 @@ def write_run_record(
                     "XID79_RESTART_NODE",
                     "SXID11001_DIAGNOSTIC_FABRIC_RESET",
                 ],
+                "load_generator": load_generator.plan(
+                    pods=args.clusters,
+                    cpu_request=LOAD_CPU_REQUEST,
+                    cpu_limit=LOAD_CPU_LIMIT,
+                ),
                 "simulated_reset_seconds": 8,
                 "simulated_reboot_seconds": 120,
                 # How the workflow latencies are measured (性能压测验收方案 §8.4).

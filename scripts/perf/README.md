@@ -301,6 +301,10 @@ is split by responsibility:
   accounted for) and the configuration it records and judges
   (`config_identity`: the global AdminConfig digest and the three role
   configuration digests of the live role Deployments and their Running Pods).
+- `regional_load_generator.py`: the burst and integrated runners' load
+  generator evidence (Pods, distinct nodes, client CPU against the Pod's CPU
+  limit) and the INVALID verdict of a generator above 70% of its limit;
+  evidence only, the load shape is unchanged.
 - `regional_capacity_pods.py`: the control-plane Pod runtime snapshot and the
   lifecycle comparison the integrated verdict reads (replaced, added,
   restarted, not Ready, readiness flaps).

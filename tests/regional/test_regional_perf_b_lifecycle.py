@@ -20,6 +20,7 @@ from scripts.perf import regional_capacity_registry as registry
 from scripts.perf import regional_capacity_suite as base
 from scripts.perf import regional_correlated_action_suite as correlated
 from scripts.perf import regional_integrated_workflow_capacity_suite as integrated
+from scripts.perf import regional_load_generator as load_generator
 from scripts.perf import regional_validation_telemetry as telemetry
 from scripts.perf.regional_capacity_resources import RunResources
 from tests.regional._perf_caller_support import (
@@ -927,3 +928,26 @@ def test_a_signal_during_the_run_tears_it_down_and_aborts_it(
     status = caller.report("status.json")
     assert status["status"] == "aborted", status
     assert status["reason"] == f"RunTerminated: received {signal.Signals(signum).name}"
+
+
+@pytest.mark.parametrize("caller", [integrated], indirect=True, ids=["integrated"])
+def test_a_saturated_load_generator_makes_the_integrated_round_invalid(
+    caller: CallerHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Perf plan §5: a client above 70% of its CPU limit cannot prove product
+    latency, so a round that passed every check is INVALID instead of PASS."""
+
+    saturated = [{"cluster_id": "perf-cap-007", "client_cpu_cores": 3.5}]
+    monkeypatch.setattr(integrated, "collect_logs", lambda *_args: saturated)
+
+    assert caller.run() == load_generator.INVALID_EXIT, "status invalid, exit 5"
+
+    summary = caller.report("summary.json")
+    assert summary["status"] == "INVALID", summary["errors"]
+    assert summary["errors"][0] == (
+        "the load generator of perf-cap-007 used 3.50 of its 4-core CPU limit "
+        "(88% > 70%): a saturated client cannot prove product latency"
+    )
+    assert caller.report("status.json")["status"] == "invalid"
+    assert caller.report("run.json")["load_generator"]["cpu_limit"] == "4"
+    assert len(caller.teardowns) == 1, "an INVALID round is still torn down"

@@ -53,7 +53,8 @@ Every formal load-test round must record:
   fixed limits' retirement has two, node and failure domain, and records the remediation storm breaker's state, see
   §4.3); when the release lacks this capability record `unsupported` explicitly, never fabricate defaults;
 - GPU cluster count, node count, request mix, duration and concurrency;
-- load generator CPU/memory limits, actual usage and the dedicated node it runs on;
+- load generator CPU/memory limits, actual usage and the dedicated node it runs on (the burst and integrated runners
+  record the Pod count, the distinct nodes and the CPU share of the limit, §5);
 - start/end UTC times and cleanup result.
 
 ### 3.1 Load-Test Notifications Must Never Leave the Site
@@ -503,10 +504,22 @@ remains the scenario definition.
 - Average CPU usage on the load generator stays below 50%; results are invalid if any resource exceeds 70%.
 - Test at least the 16 and 32 concurrency levels for the same model.
 - Timeouts, connection exhaustion or scheduling jitter on the load generator itself must not be attributed to the control plane.
-- The current runners start one load-generating Pod per synthetic cluster (an Indexed Job with
-  `completions = parallelism = clusters`, so the single-cluster 1000-node model has one), set no anti-affinity, run no
-  no-op calibration and judge no load-generator CPU, recording only `client_cpu_cores`: the Pod count, spread and CPU
-  gates of this section are checked by whoever runs the round and written into the formal record.
+- The runners start one load-generating Pod per synthetic cluster (an Indexed Job with
+  `completions = parallelism = clusters`, so the single-cluster 1000-node model has one), set no anti-affinity and run
+  no no-op calibration. The burst and integrated runners record the load generators' evidence without changing the
+  load: `run.json.load_generator` gives the rendered Pod count, CPU request/limit, no anti-affinity and no calibration;
+  `summary.json.load_generator` gives the load Job's Pod count, the distinct nodes they ran on and the most Pods on one
+  node, the Pods' CPU limit (the rendered one, with the read error recorded, when the Pods cannot be read), the maximum
+  and mean `client_cpu_cores` of the generator processes (each process's CPU seconds per wall second of the send
+  phase) and their share of the limit, and as facts "at least 4 Pods", "one Pod per node" and "mean below 50% of the
+  limit" (`regional_load_generator`). A generator process above 70% of its Pod's CPU limit makes the round `INVALID`: a
+  saturated client cannot prove product latency -- the integrated runner's `summary.json.status` is `INVALID` (the
+  reason first in `errors`), `status.json` is `invalid` and the exit status 5; the burst runner writes `invalid` with
+  the reason and exits 5 too; without a reading or a limit the gate records `judged: false` and does not judge.
+- Still open and a decision of their own: (b) spreading the load Pods by anti-affinity, (c) at least 4 load Pods for the
+  single-cluster model and (d) a no-op calibration at twice the target peak. Each changes the load shape or its
+  scheduling, so the numbers measured that way need a fresh baseline; until then whoever runs the round checks the Pod
+  count and spread and writes them into the formal record.
 - Before the start gate, the synchronous burst performs at most 5 bounded resolutions of the control-plane hostname and caches and rotates the results within each load-generating process. Every request still opens a new TCP/TLS connection and completes HTTP Host, TLS SNI and certificate verification with the original hostname; a request matrix on the order of 40,000 must not create 40,000 CoreDNS queries at once. Formal results must record the number of DNS resolution attempts, addresses and cache hits; if pre-resolution needs retries, any request bypasses the cache, or a transport retry occurs, the round fails.
 
 ## 6. Acceptance Thresholds
@@ -1221,6 +1234,7 @@ at least one lease renewal on a long action
 processor queue and spool back to the depth from before the round started
 the round ran on one configuration (config_identity: digests present, one global digest, no Pod on another role configuration)
 every completed request's processor final response is 2xx, and the fault-tier final responses number at least the matrix's P0 count (XID + SXID)
+every load generator process within 70% of its Pod's CPU limit, else the round is INVALID (§5)
 ```
 
 The drain check reads `summary.json.queue_drain`: up to 900 seconds of draining after the load stops, against the
@@ -1459,10 +1473,11 @@ Formal results are one of:
 - `PASS_WITH_LIMITATIONS`: allowed only for explicit limitations that do not affect the core thresholds.
 
 The runners produce only part of this: the `summary.json.status` of the integrated runner, the correlated runner and the
-storm breaker step, and the `verdict` of `fleet.json`, are only `PASS`/`FAIL`, the Aurora measurement adds
-`PASS`/`FAIL`/`UNVERIFIED`; the burst and action runners give no verdict; `status.json` says
-`running`/`ok`/`aborted`/`measurement-failed`. `INVALID` and `PASS_WITH_LIMITATIONS` are the reviewer's call under this
-section.
+storm breaker step, and the `verdict` of `fleet.json`, are only `PASS`/`FAIL` (the integrated runner's is `INVALID` when
+a load generator was saturated), the Aurora measurement adds `PASS`/`FAIL`/`UNVERIFIED`; the burst and action runners
+give no verdict; `status.json` says `running`/`ok`/`aborted`/`measurement-failed`/`invalid` (`invalid`: a load generator
+process of the burst or integrated runner above 70% of its Pod's CPU limit, §5). The other `INVALID` causes and
+`PASS_WITH_LIMITATIONS` are the reviewer's call under this section.
 
 The report must also record the direction of failure and cannot offer only averages or
 throughput. Capacity may never be declared passed in the following situations:
@@ -1527,7 +1542,8 @@ integrated, action and correlated runners' `run.json` and `summary.json` must al
 writer instance, its Availability Zone and the control-plane node Availability Zones, §8.1; for an action or
 correlated round that names no Aurora cluster `run.json` has no such key and `summary.json.placement` is
 `recorded=false`), and the integrated and correlated runners' `summary.json`
-must also include `validation_telemetry` (§8.4, §8.3). The burst, integrated and action
+must also include `validation_telemetry` (§8.4, §8.3), and the burst and integrated runners' `run.json` and
+`summary.json` carry `load_generator` (§5). The burst, integrated and action
 runners' `summary.json` must also carry `store_bloat`: `before`/`after` derive, from the `hot_tables`
 section of `postgres-before.json`/`postgres-after.json`, each hot table's live rows, heap pages, index
 pages, `heap_pages_per_live_row`, `index_pages_per_live_row`, `index_min_entries_per_page`, `index_max_pages` (the

@@ -7,9 +7,11 @@ from typing import Any, Callable
 try:
     from . import regional_capacity_priority_latency as priority_latency
     from .regional_capacity_registry import STORE_DSN_SNIPPET
+    from .regional_load_generator import INVALID_EXIT, INVALID_REASON
 except ImportError:
     import regional_capacity_priority_latency as priority_latency
     from regional_capacity_registry import STORE_DSN_SNIPPET
+    from regional_load_generator import INVALID_EXIT, INVALID_REASON
 
 try:
     from gpu_fault.store.postgres.hot_table_bloat import HOT_TABLES
@@ -293,13 +295,26 @@ def aurora_step_fields(
 
 
 def measured_exit(code: int, summary: dict) -> int:
-    """A step's own failure first; else ``MEASUREMENT_FAILED_EXIT`` when its
-    Aurora measurement failed."""
+    """``INVALID_EXIT`` when a load generator was saturated (the round
+    measured its client, whatever the verdict); else a step's own failure;
+    else ``MEASUREMENT_FAILED_EXIT`` when its Aurora measurement failed."""
 
+    if (summary.get("load_generator") or {}).get("valid") is False:
+        return INVALID_EXIT
     if code:
         return code
     measurement = summary.get("aurora_measurement") or {}
     return MEASUREMENT_FAILED_EXIT if measurement.get("status") == "FAIL" else 0
+
+
+def measured_reason(code: int, summary: dict) -> str | None:
+    """status.json's reason for a ``measured_exit`` code."""
+
+    source = {
+        INVALID_EXIT: "load_generator",
+        MEASUREMENT_FAILED_EXIT: "aurora_measurement",
+    }
+    return (summary.get(source.get(code, "")) or {}).get("reason")
 
 
 def step_status(
@@ -309,6 +324,8 @@ def step_status(
 
     if code == 0:
         return {"status": "ok"}
+    if code == INVALID_EXIT:
+        return {"status": "invalid", "reason": measurement or INVALID_REASON}
     if code == MEASUREMENT_FAILED_EXIT:
         return {
             "status": "measurement-failed",
