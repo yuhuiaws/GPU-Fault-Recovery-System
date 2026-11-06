@@ -7434,8 +7434,8 @@ EDGE_FILTERED 通道<strong>升到 priority
 默认 180，取值 15–900；按批次 <code>observed_at</code>
 从这一串的第一批错误起算）， 它才升级为
 <code>RUN_DIAGNOSTICS</code>，经原有路径开出恰好一条 NODE_HEALTH
-incident（动作变化即激活， 与 thermal
-连续越限同一模型）。这一串的起点记在发现自身：发现的
+incident（动作变化即激活，
+<code>gpu_metric_models.gpu_finding_transition</code>）。这一串的起点记在发现自身：发现的
 <code>observed_at</code> 与 <code>finding_id</code> 取自第一批错误，
 状态的 <code>observed_at</code>
 跟随最新一批，存储不需要额外的列；一串只对应一个事件
@@ -7521,7 +7521,6 @@ domain、十六进制大小写）不算移动，任一侧无法解析的 BDF
 一致的快照清除该信号，所以合法维护后的新身份只报一次即成为基线。</p>
 <p><strong>⑨ 配置参数</strong>——DCGM 判定阈值全部可 env 覆盖，生产值见
 <code>gpu-fault-control-worker-config-telemetry</code> ConfigMap，例如
-<code>GPU_FAULT_DCGM_COMPOSITE_CONSECUTIVE_SAMPLES=2</code>（复合规则要连续两个样本才成立）、
 <code>GPU_FAULT_DCGM_CORRELATION_WINDOW_SECONDS=45</code>、
 <code>GPU_FAULT_DCGM_POWER_LIMIT_RATIO=0.95</code> 且
 <code>GPU_FAULT_DCGM_POWER_CORRELATION_MIN_UTILIZATION_PERCENT=80</code>（低利用率下的功耗贴顶
@@ -8920,7 +8919,7 @@ PagerDuty、Slack 或 webhook（§11）。</p>
 邮件；库里保留通知 记录与投递状态。</p>
 <p><strong>③
 内部组件</strong>——<code>src/gpu_fault/notifications/registry.py</code>
-注册 <strong>23</strong> 类通知模板 （XID 调查、SXID 事件、DCGM
+注册 <strong>24</strong> 类通知模板 （XID 调查、SXID 事件、DCGM
 诊断、EFA/RDMA、NVLink7.4 机械件与支持、硬件升级与清单、
 主机资源、HyperPod 咨询、warm
 spare、重启守卫、修复风暴熔断（<code>REMEDIATION_STORM_TRIPPED</code>，§9.5）、不适用说明等，以及
@@ -8941,9 +8940,22 @@ owner 被拒的计划跑完 含容前缀、记录停为
 的节点、已跑/未跑步骤、缺 owner 的能力与两条出口（§9.2 restore、§9.1
 QUARANTINED 分支）， 模板与版本放在
 <code>notifications/contained_operator_handoff.py</code>，理由同
-<code>HUNG_SUPPORT_HANDOFF</code>）， <code>channel.py</code>
-选择渠道，<code>sns.py</code> / <code>ses.py</code>
-负责投递，<code>common.py</code> 负责收敛与去重。
+<code>HUNG_SUPPORT_HANDOFF</code>；<code>QUARANTINED_NODE_NOTICE</code>——
+模板 <code>quarantined-node-notice-zh-v1</code>，category
+<code>OPERATOR_REVIEW</code>，去重键
+<code>&lt;cluster&gt;/&lt;incident&gt;/quarantined-node-notice</code>
+（每个 incident 一封），以自身隔离收尾的记录 SUCCEEDED、incident 写为
+<code>QUARANTINED</code> 时由执行器在终态写之后发出
+（<code>execution/terminal_quarantine_notice.py</code>；判为
+<code>QUARANTINE</code> 的节点健康 finding 的 QUARANTINE
+计划，或并入其他链的 critical 隔离；前驱留下的隔离、ESCALATED、BLOCKED
+与 FAILED 记录都不发，仍隔离着节点的 FAILED 记录改由阶段
+<code>held_chain_step</code>
+的支持交接通知运维）：正文写明被隔离的节点、finding、已执行步骤、挂起未恢复的作业与
+两条出口（§9.2 restore、§9.1 QUARANTINED 分支），模板与版本放在
+<code>notifications/quarantined_node_notice.py</code>，理由同上），
+<code>channel.py</code> 选择渠道，<code>sns.py</code> /
+<code>ses.py</code> 负责投递，<code>common.py</code> 负责收敛与去重。
 <code>HUNG_SUPPORT_HANDOFF</code> 的模板与版本放在
 <code>notifications/hung_support.py</code> 而不是
 <code>common.py</code>： <code>common.py</code> 也随集群 executor wheel
@@ -9300,7 +9312,9 @@ lifespan 启动末尾
 内取最大）、<code>gpu_fault_gc_frozen_objects</code>、
 <code>gpu_fault_listen_accept_queue_connections{port}</code>（每 worker
 自己的套接字，按进程导出、Pod 内求和）与
-<code>gpu_fault_listen_somaxconn</code>。</p>
+<code>gpu_fault_listen_somaxconn</code>。 这些族与下一段的
+<code>gpu_fault_listen_*</code> 都在控制面 ADOT 的 keep 列表里，进入
+AMP。</p>
 <p>服务端口 per-worker
 <code>SO_REUSEPORT</code>（<code>app/serve.py</code>、<code>app/listener.py</code>）：<code>python -m gpu_fault.app.serve</code>
 取代 <code>python -m uvicorn</code> 作为三个角色的启动器——同一套 uvicorn
@@ -11327,7 +11341,7 @@ VALIDATE_FABRIC 以显式 <code>fabric_status=UNKNOWN</code>
 <code>HUNG_SUPPORT_HANDOFF</code>
 通知（<code>hung-support-handoff-zh-v1</code>，category
 <code>OPERATOR_REVIEW</code>，去重键
-<code>&lt;cluster&gt;/&lt;incident&gt;/hung-support-handoff/&lt;workflow&gt;</code>），不发硬件升级邮件——后者写着
+<code>&lt;cluster&gt;/&lt;incident&gt;/hung-support-handoff/&lt;workflow&gt;</code>），不发硬件升级邮件——后者为被隔离的节点写着
 「hardware taken out of service」「节点保持不可调度并隔离」，对 hung
 诊断不成立。正文写明只读（没有 cordon、drain、 隔离、reset 或 reboot
 任何节点，没有停止、挂起或重启任何作业）、job/attempt
@@ -11348,7 +11362,15 @@ PASSED（仍只是遥测检查，不证明 NCCL 恢复）。步骤 details 为
 <code>hardware_disposition=OFFLINE_QUARANTINED</code>。 选择条件就是
 <code>hung_handoff.hung_handoff_workflow</code>；其余
 <code>ESCALATE_SUPPORT</code>（硬件升级、XID 74、改动过节点的计划、
-lifetime 用尽后的 operator 交接）不变。</p>
+lifetime 用尽后的 operator
+交接）不变。硬件升级邮件（<code>hardware-escalation-zh-v4</code>）的首行、节点状态行、主题与工单草稿的
+Disposition
+按交接及其升级谱系的步骤记录写每个点名节点是否仍被隔离（<code>handoff_hold.held_nodes</code>：完成的
+MARK_UNSCHEDULABLE/QUARANTINE 隔离、失败隔离的
+<code>isolated_nodes</code> 仍算、完成的 RESTORE_SCHEDULING 解除），步骤
+details 写
+<code>hardware_disposition</code>（<code>OFFLINE_QUARANTINED</code>/<code>NOT_ISOLATED</code>/<code>PARTIALLY_QUARANTINED</code>）与
+<code>held_nodes</code>；链终止器补发的 同一封邮件读同样的记录。</p>
 <p><strong>共享存储故障域（记录型 incident）。</strong>
 <code>shared_filesystem_unavailable</code> 按节点判定，一台 NFS 服务器或
 Lustre MDS 恢复期间，每个丢失该 export 的节点都各自开 CRITICAL
@@ -11516,7 +11538,13 @@ TRIGGER_HEALTH_SNAPSHOT，<code>WorkflowBuilder.containment_before_block</code>�
 <td>一次 patch
 写入：<code>unschedulable=true</code>、<code>gpu-fault.io/quarantined=incident-&lt;sha256[:24]&gt;</code>
 污点、以及三个归属注解（见 §9.4）；再 <code>STOP_WORKLOADS</code></td>
-<td>节点 <code>unschedulable=true</code> 且污点存在</td>
+<td>节点 <code>unschedulable=true</code> 且污点存在；以 QUARANTINE
+收尾的计划（判为 <code>QUARANTINE</code> 的节点健康 finding，无
+RESTORE_SCHEDULING、无 ESCALATE_SUPPORT）SUCCEEDED
+后停在此态，执行器每个 incident 发一封
+<code>quarantined-node-notice-zh-v1</code>（§3.11 的
+<code>QUARANTINED_NODE_NOTICE</code>），出口为 §9.2 restore 或 §9.1
+QUARANTINED 分支</td>
 <td><code>resourceVersion</code> 冲突重试；RBAC 403 → step
 <code>FAILED</code></td>
 </tr>
@@ -14468,14 +14496,14 @@ OpenTelemetry，也不解析 <code>traceparent</code>。
 <p><code>GET /metrics</code>（Prometheus 文本格式；回环免鉴权，非回环需
 execution token）在 <code>create_app(build_context())</code> 装配的真实
 app（内存 Store 夹具、worker 角色）上渲染， <code>regional_mode</code>
-关闭时导出 <strong>311 个指标族</strong>，打开时 <strong>324
+关闭时导出 <strong>312 个指标族</strong>，打开时 <strong>325
 个</strong>（多出的 13 个都只在区域模式输出： 9 个
 <code>gpu_fault_remote_command_*</code>、2 个
 <code>gpu_fault_fleet_rollout_*</code>、2 个
 <code>gpu_fault_regional_registry_*</code>）， 全部以
 <code>gpu_fault_</code> 开头；同一夹具下 ingress 为
-262/264，spool-worker（该角色只能在 active-active Processor 加 telemetry
-spool 下装配）为 265/267。数字随代码增长，以 <code>GET /metrics</code>
+263/265，spool-worker（该角色只能在 active-active Processor 加 telemetry
+spool 下装配）为 266/268。数字随代码增长，以 <code>GET /metrics</code>
 的实际输出为准。Postgres 连接池族、 spare 健康、spool
 consumer、采集器快照、离场节点清理（<code>gpu_fault_departed_node_cleanup_*</code>
 7 个，只在区域模式的 worker 上，§7.10）这类条件族不在计数内，生产 worker
@@ -14500,7 +14528,7 @@ consumer、采集器快照、离场节点清理（<code>gpu_fault_departed_node_
 </tr>
 <tr class="even">
 <td><code>gpu_fault_telemetry_*</code></td>
-<td style="text-align: right;">40</td>
+<td style="text-align: right;">41</td>
 <td>spool、批提交、各遥测通道新鲜度</td>
 </tr>
 <tr class="odd">

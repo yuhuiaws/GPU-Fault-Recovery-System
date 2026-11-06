@@ -4781,7 +4781,12 @@ src/gpu_fault/capabilities.py</h3>
 </ol>
 <p>Profile 必须先通过 <code>POST /v1/runtime-profiles</code>
 注册，事件中的 <code>runtime_profile_version</code> 必须能在 Store
-中找到。</p>
+中找到。
+已注册的版本不可改写：同一版本再次注册且策略相同（不比较注册锚点
+<code>cluster_id</code>）时幂等返回已存储的 profile，内容不同返回
+409、不写入；Store 的 <code>register_profile</code>
+在同一把锁内比较并写入（PostgreSQL 为
+<code>profile/&lt;version&gt;</code> advisory lock）。</p>
 <p>发布分类使用规范化 Profile 策略摘要：忽略
 <code>cluster_id/profile_version</code>，并对
 <code>claims/observed</code> 排序。模板切换为不可变快照或 YAML
@@ -4966,14 +4971,27 @@ closed。H100/H200/H20 第三代单 baseboard 没有 trunk link；带明确 port
 <p>Fabric Manager SXID message 只适用于 Hopper 及更早
 GPU。运行时使用同一产品族 归一化：B100/B200/B300 归入 B100，GB200/GB300
 归入 GB200；这两个 Blackwell family 均返回
-<code>NOT_APPLICABLE</code>，不进入 SXID Catalog action。显式提供但
-无法识别代际的产品返回 <code>BLOCKED_MISSING_EVIDENCE</code>，不得猜测为
-Hopper。产品字段 缺失仍按兼容路径处理，但生产 collector 必须上报真实
-product。</p>
+<code>NOT_APPLICABLE</code>，不进入 SXID Catalog
+action。产品族无法归类的
+产品——显式提供但无法识别代际的，以及缺失、空或空白的——一律返回
+<code>BLOCKED_MISSING_EVIDENCE</code> （investigatory
+<code>VERIFY_GPU_PRODUCT_GENERATION</code>，safety
+quarantine），不得猜测为 Hopper。进入门禁之前，
+缺失、空或空白的产品先由节点同一 boot 的新鲜单一产品 GPU inventory
+补全（<code>_enrich_gpu_identity</code>，与 XID
+门禁同一补全），只有无从归类的 SXID 才阻塞。依据：Fabric Manager User
+Guide，&quot;NVSwitch Errors On DGX B200/B300 and NVIDIA HGX B200/B300
+Systems&quot;（页面 &quot;Last updated on Oct 07, 2026&quot;）， <a href="https://docs.nvidia.com/datacenter/tesla/fabric-manager-user-guide/index.html#nvswitch-errors-on-dgx-b200-b300-and-nvidia-hgx-b200-b300-systems">https://docs.nvidia.com/datacenter/tesla/fabric-manager-user-guide/index.html#nvswitch-errors-on-dgx-b200-b300-and-nvidia-hgx-b200-b300-systems</a>：
+&quot;NVSwitch SXID errors are no longer applicable to DGX B200/B300 and
+NVIDIA HGX B200/B300 systems.&quot;
+（<code>policy/product_families.py</code>，由
+<code>tests/policy/test_policy_security.py</code> 钉住；依 NVIDIA
+文档做单元测试， 未在 B 系列硬件上真机验证）。</p>
 <p>SXID Catalog 动作映射如下：</p>
 <ul>
 <li>普通 <code>FATAL</code>：可信 <code>ACCESS</code> 执行参与 GPU
-reset，可信 <code>TRUNK</code> 执行本节点完整 GPU/NVSwitch reset；scope
+reset（端口 GPU 与节点上活动受管任务的全部 GPU 之并），可信
+<code>TRUNK</code> 执行本节点完整 GPU/NVSwitch reset；scope
 不可信时隔离。</li>
 <li><code>10003/19084</code>：不依赖日志 scope，要求完整
 inventory/partition 后执行本节点完整 GPU/NVSwitch reset。</li>
@@ -5724,7 +5742,7 @@ Diagnostic 验证后才能 进入 RMA/替换判断。</li>
 使用<code>DRAIN</code>，固定温度只作为设备没有可用限制、或有 T.Limit
 阈值而缺 T.Limit 读数时的<code>SITE_DCGM_METRIC</code> fallback。</li>
 <li>thermal
-violation首次增长进入diagnostics，连续增长达到配置次数后升级为<code>DRAIN</code>。</li>
+violation增长只判Warning并进入diagnostics，单凭时长从不升级为<code>DRAIN</code>（不再有可配置的连续次数）。</li>
 <li>finding从warning升级到critical或自动动作改变时会再次产生<code>new_finding</code>，使既有
 attempt workflow能够原地升级或创建successor。</li>
 <li>同严重度、同动作的替换 finding（更新批次重判后仍越界，新
@@ -5736,11 +5754,13 @@ attempt workflow能够原地升级或创建successor。</li>
 也作为 <code>GPU_METRICS</code>
 原始证据保存，每批一次；健康节点的摘要照旧不保存。</li>
 </ul>
-<p>GPU/HBM 温度 warning 的 diagnostics 不是被动读取指标。控制面生成
-<code>FREEZE_EVIDENCE -&gt; RUN_DCGM_DIAGNOSTIC -&gt; VALIDATE_GPU</code>，Node
+<p>GPU/HBM 温度 warning
+走只读诊断契约（<code>DIAGNOSTIC_ONLY</code>，<code>health_recovery_contract</code>）：控制面生成
+<code>FREEZE_EVIDENCE -&gt; VALIDATE_GPU</code>，不跑 DCGM 诊断、不
+cordon；不在该契约名单内的 GPU 类 warning 才生成
+<code>FREEZE_EVIDENCE -&gt; RUN_DCGM_DIAGNOSTIC -&gt; VALIDATE_GPU</code>（Node
 Agent 执行非破坏性的 <code>dcgmi diag -r 1 -j</code>，将原始
-JSON、stderr、SHA-256 和结果状态写入 root-only 证据目录。
-<code>PASS/WARN</code> 进入冷却观察；warning 在
+JSON、stderr、SHA-256 和结果状态写入 root-only 证据目录）。warning 在
 <code>GPU_FAULT_TEMPERATURE_WARNING_GRACE_SECONDS</code>（默认 120
 秒）内仍存在时 validation 保持
 <code>WAITING</code>，清除后成功。宽限期是最短等待，不是判定点：宽限期结束时，若
@@ -5766,11 +5786,15 @@ id）、<code>awaiting_newer_gpu_metrics_findings</code>（<code>observed_at</co
 秒投递一次健康摘要，所以只靠固定宽限期时，同一物理
 序列会因摘要相位不同而一过一败：摘要落在确认读与恢复读之间时恢复边沿
 delta 为 0 而通过；恢复边沿重铸了
-finding、而宽限期内唯一更新的摘要又带计数器复位无法重判时，宽限期末就失败。<code>FAIL/INCONCLUSIVE</code>，或宽限期
-后 warning 被更新批次重判仍存在时，原 workflow 失败并幂等升级为
-<code>DRAIN</code>：禁止调度、停止受影响任务、隔离节点、采集完整
-诊断包并验证 GPU。该升级不包含 <code>RESTORE_SCHEDULING</code> 或
-<code>RESTART_WORKLOAD</code>，必须在
+finding、而宽限期内唯一更新的摘要又带计数器复位无法重判时，宽限期末就失败。宽限期后
+warning 被 更新批次重判仍存在时 VALIDATE_GPU
+失败：只读契约的链不升级，incident 以 RECOVERED「diagnostic
+inconclusive」结束， 温度达到设备运行限制时由新的 CRITICAL finding 开
+<code>ENVIRONMENT_REVIEW</code>（终态隔离交人工）。名单外的 warning 在
+<code>FAIL/INCONCLUSIVE</code> 或其后的 VALIDATE_GPU 失败时，原 workflow
+失败并幂等升级为 <code>DRAIN</code>：禁止调度、停止受影响任务、
+隔离节点、采集完整诊断包并验证 GPU。该升级不包含
+<code>RESTORE_SCHEDULING</code> 或 <code>RESTART_WORKLOAD</code>，必须在
 故障清除并经管理员处置后才能恢复。</p>
 <p>pending
 修复标志在复位之后由更新的数据重判。<code>row_remap_pending</code>（Ampere
@@ -7105,7 +7129,8 @@ batch（<code>&lt;batch id&gt;-&lt;gpu&gt;-&lt;metric&gt;</code>）：它们是�
 <tr class="odd">
 <td><code>THERMAL_STRESS</code></td>
 <td>GPU/HBM温度finding + thermal violation或thermal throttle bit</td>
-<td>首次diagnostics；默认连续2次后<code>DRAIN</code></td>
+<td>温度组件为Warning时diagnostics；温度组件已确认为Critical时Critical
+<code>DRAIN</code>（不按连续次数升级）</td>
 </tr>
 <tr class="even">
 <td><code>POWER_LIMIT_THROTTLING</code></td>
@@ -7159,18 +7184,16 @@ software/hardware thermal slowdown 位
 power cap，不产生 thermal finding。</p>
 <p>violation
 类计数器附带<strong>量纲合理性闸门</strong>。这类字段的语义是&quot;处于违规状态的微秒数&quot;，
-因此每分钟增量不可能超过一分钟；<code>MAX_PLAUSIBLE_VIOLATION_US_PER_MINUTE</code>
-取
-<code>60_000_000 × 1.05</code>（多出的余量吸收采样偏斜）。<code>_throttle_decision</code>
-在 delta 越过阈值后先检查 rate：超过该上界时<strong>不产生
-finding</strong>，因为计数器声称的违规
-时长长于已流逝的时间，说明它在这台机器上并不是这个量纲，不可解释的量不能作为判据。
-这条闸门是必要的而不是保守的——thermal violation 连续 2 次越界即升级到
-<code>DRAIN</code>，
-在这里放过一个不可解释的速率会<strong>驱逐健康节点</strong>。功耗
-finding 路径
-（<code>POWER_LIMIT_THROTTLING</code>）不加此闸门：它本来就要求
-power/limit 比值与高 utilization 同时成立，加闸门只会丢真阳性。</p>
+因此每分钟增量不可能超过一分钟；上界取 <code>60_000_000 × 1.05</code>
+µs/min（多出的余量吸收
+采样偏斜）。<code>_throttle_decision</code>（<code>gpu_environment_policy.thermal_duration_decision</code>）在
+delta 越过阈值后先检查 rate：低于 <code>60_000</code> µs/min（占空比 0.1
+%）或超过该上界时<strong>不产生
+finding</strong>，超过上界说明计数器声称的违规时长长于已流逝的时间，它在这台机器上并不是这个
+量纲，不可解释的量不能作为判据。单凭时长的判定只是 Warning
+诊断，从不升级 <code>DRAIN</code>。功耗 finding
+路径（<code>gpu_power_policy.power_violation_decision</code>）使用同一速率区间，另需
+power/limit 比值与高 utilization 同时成立。</p>
 <p>GPU validation 将
 <code>gpu_temperature_c</code>、<code>memory_temperature_c</code>、
 <code>thermal_violation_total_us</code>、<code>clock_throttle_reasons</code>
@@ -7178,8 +7201,8 @@ power/limit 比值与高 utilization 同时成立，加闸门只会丢真阳性�
 集合。只有集合内所有 active finding 都是 Warning 时才在 grace 内返回
 <code>WAITING</code>；任一 finding 升级 Critical、 出现其他类别
 finding，或 grace 到期后仍未清除，立即返回 <code>FAILED</code>
-并触发既有 <code>DRAIN</code> 升级。这样首次 thermal throttle
-不会绕过连续采样状态机。</p>
+并触发既有 <code>DRAIN</code> 升级。这样一次 thermal throttle 在清除或
+grace 到期之前不会被判验证通过。</p>
 <p>Corrected-memory counter
 使用相邻样本正增量，不使用累计绝对值误判旧错误：</p>
 <ul>
@@ -7250,9 +7273,10 @@ collector只读取driver为<code>efa</code>的InfiniBand设备，mlx5等其他RD
 <code>CPU1 Temp=96.000 degrees C [cr; unc 90.000, ucr 95.000, unr 100.000]</code>），<code>host_health.py</code>
 的 <code>bmc_critical_sensor_rule</code> 据此生成 finding reason
 <code>BMC reports 2 critical sensors: ...</code>，incident
-<code>reasons</code>、marker <code>raw_reason</code> 和 QUARANTINE
-步骤的硬件升级邮件因此带传感器名称与阈值；无标签的裸计数（旧 collector）
-仍为固定文案
+<code>reasons</code> 与 marker <code>raw_reason</code>
+因此带传感器名称与阈值，QUARANTINE 计划完成时发出的
+<code>quarantined-node-notice-zh-v1</code> 通知也列出这些
+reason；无标签的裸计数（旧 collector） 仍为固定文案
 <code>BMC reports a critical sensor</code>。<code>ipmitool</code>
 退出非零、超时、无有效四列行或 全部行状态均为 <code>na</code> 是
 UNKNOWN（<code>_bmc</code> 采集错误、无样本）；无
@@ -7417,7 +7441,10 @@ EFA 没有 link down 文案（<code>efa_query_port()</code> 恒为
 指标规则负责；<code>efa</code> 不是关键词
 规则的触发词，<code>rdma|infiniband|ib_*</code> +
 <code>fatal|error|timeout|link/port down</code> 只服务其他 fabric。两条
-RDMA 规则同为 <code>KERNEL_LOG_SOURCES</code>； 节点端
+RDMA 规则同为 <code>KERNEL_LOG_SOURCES</code>，
+都过内核来源的可信门禁（<code>log_recovery_context.log_rule_decision</code>：dmesg，或
+<code>_TRANSPORT=kernel</code>、当前 boot、行时间在采集前 900 s 至后 30
+s 内的 journal 行；降级文案虽是 WARNING 也一样）；节点端
 <code>matching_log_rules</code> 用同一词表决定上送哪些行，所以词表改动随
 control plane、executor 与 node runtime 三个组件一起发布。
 引文出处固定到标签：<a href="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/infiniband/hw/efa?h=v6.1.189">https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/infiniband/hw/efa?h=v6.1.189</a>、
@@ -8184,10 +8211,19 @@ RESET_GPU 一致；RESET_GPU 遇到不是 reset
 不使用 DRM 设备，为它 drain、隔离或再 reset 都过度。它经该 reset
 已有的完成通知交给运维（<code>notifications/display_stack.py</code>：GPU_RESET_COMPLETED/FABRIC_RESET_COMPLETED
 本就收到每个节点的结果，主题加
-<code>[display stack not restored]</code>，「3.
-Follow-up」逐节点写出缺少的模块、最后的错误与补救；
-部分装载时该行列出本次卸载的模块，最后的错误点名没有 DRM 设备的
-GPU，补救为先 <code>rmmod</code> 再 <code>modprobe</code>）。没有选用的
+<code>[display stack not restored]</code>，「3. Follow-up」逐节点只按
+Agent 回执的字段写出已装回的
+模块（<code>reloaded_kernel_modules</code>）、仍未装回的模块（<code>display_modules_missing</code>，写作
+not loaded）与仍缺 DRM 设备的 GPU 数
+（<code>display_drm_devices_missing</code>，「k of N」的 N 取
+<code>display_drm_devices_before</code>），随后是最后的错误、影响——有模块未装回时
+整个节点没有 <code>/dev/dri</code>，模块都已装回、只缺 DRM
+设备时只点名这些 GPU——与补救（部分装载为先 <code>rmmod</code> 再
+<code>modprobe</code>）。 <code>/proc/modules</code>
+读不出（<code>display_module_state_error</code>）时什么都没有核实：模块写作状态未知、从不写
+not loaded，影响写作 <code>/dev/dri</code>
+可能缺失，最后的错误取最后一次 modprobe 自己的错误或它退出 0
+的事实，不转述 Agent 由读不出的表推断的 &quot;left … unloaded&quot;）。没有选用的
 通道：节点健康 finding 会开 incident 与 workflow，GPU finding 会让本链的
 VALIDATE_GPU 失败，VALIDATE_HOST 不在 reset
 链里、也没有不阻塞的发现，经心跳上报则要改签名的心跳协议。</p>
@@ -8348,6 +8384,53 @@ FAILED，且该原因同时写入
 并已 <code>RESTORE_SCHEDULING</code>），也不会被 support 后继 incident
 再次隔离
 （<code>HardwareEscalationService._exhausted_branch_executions</code>）。</li>
+<li>DRAIN 链（节点健康的 RMA 链与梯级的
+<code>drain-after-&lt;workflow&gt;</code> 后继）的 VALIDATE_GPU
+失败：此前没有恢复动作、 没有硬件梯级可升，但链尾的交接仍然欠着——RMA 类
+GPU 常常仍不过这次验证。drain 的 incident 记为
+<code>QUARANTINED</code>，并创建
+<code>workflow-support-after-&lt;workflow&gt;</code>（阶段
+<code>drain_validation</code>：FREEZE_EVIDENCE → MARK_UNSCHEDULABLE →
+QUARANTINE → ESCALATE_SUPPORT，接管同一隔离，不停作业、不
+reset、不放回调度）， 由它发出固定模板邮件并以 <code>ESCALATED</code>
+结束（<code>validation_evidence.held_for_unsent_hand_off</code>）；链自己的
+ESCALATE_SUPPORT 已执行或失败时不再开第二个。</li>
+<li>隔离了节点、计划以 ESCALATE_SUPPORT 交接的链（DRAIN、确认的热 DRAIN
+的 ENVIRONMENT_REVIEW 链、XID/SXID 的 ESCALATE_OPERATOR
+链）在交接之前的步骤失败、而梯级没有对应的一级时——诊断包、health
+snapshot、停作业、 有结果的 checkpoint；ENVIRONMENT_REVIEW
+契约不让任何硬件梯级接手，原先它的任何一步失败都到此为止——同样创建
+<code>workflow-support-after-&lt;workflow&gt;</code>（阶段
+<code>held_chain_step</code>，同上的四步，<code>failure_outcome.held_chain_hand_off</code>）。
+有意不开工单的结局保持不变：每个失败都被执行器在派发前拒绝（过期世代，较新的一代负责该
+incident），或某一步是 结果未知而被放弃的
+ESCALATE_SUPPORT、FREEZE_EVIDENCE、CHECKPOINT_WORKLOADS（<code>NO_SECOND_TICKET_OPERATIONS</code>：第二张
+工单，或可能仍在作业里运行的取证/checkpoint）；只读诊断链、冷却计划与已执行或失败的交接也不开。
+交接只保持链自己的隔离、从不扩大：每个失败的 <code>failed_nodes</code>
+收窄到该记录仍隔离的节点
+（<code>failure_outcome.held_scope</code>、<code>handoff_hold.record_held_nodes</code>），所以按整个作业分配编译的
+STOP_WORKLOADS / CHECKPOINT_WORKLOADS 失败时，后继只
+cordon、隔离并点名故障节点，不碰作业里健康的节点。
+以隔离本身收尾的计划——节点健康的 QUARANTINE 计划（FREEZE_EVIDENCE →
+MARK_UNSCHEDULABLE → [STOP_WORKLOADS] →
+QUARANTINE）、并入其他链的终态隔离分支、含容前缀——不规划
+ESCALATE_SUPPORT（它完成时的终点是 QUARANTINED 与终态 通知）；cordon
+之后的步骤（如停作业）失败时得到同样的交接（<code>failure_outcome.owes_hand_off</code>：存在没有
+RESTORE_SCHEDULING 放回的 QUARANTINE，即终态隔离）。为了放回而 cordon
+的计划（reset、reboot、冷却）不在本规则内。</li>
+<li>诊断契约（ENVIRONMENT_REVIEW
+与旧版冷却契约）不让任何硬件梯级接手，但不挡隔离交接：它的
+MARK_UNSCHEDULABLE、 QUARANTINE 或 RESTORE_SCHEDULING
+失败时，记录与其他链一样走隔离阶段（<code>escalation._contract_ends_classification</code>）——
+<code>containment_or_release</code>：FREEZE_EVIDENCE →
+MARK_UNSCHEDULABLE → QUARANTINE → ESCALATE_SUPPORT；适配器拒绝隔离时
+<code>containment_refused</code>：FREEZE_EVIDENCE →
+ESCALATE_SUPPORT。ENVIRONMENT_REVIEW 链的 cordon 失败时什么都没隔离，
+原先以无邮件的 <code>ESCALATED</code> 结束；现在 <code>ESCALATED</code>
+对应一个真实的升级：support-after 后继发一封硬件升级邮件
+（没有节点被隔离时写明 no node was taken out of
+service）。执行器在派发前拒绝的 cordon 不开工单，结果未知的 cordon
+走人工确认工单。</li>
 </ol>
 <pre class="mermaid">flowchart LR
     R1[&quot;RESET_GPU /&lt;br/&gt;RESET_ALL_GPUS_NVSWITCHES&quot;] --&gt;|SUCCEEDED| OK1[&quot;RESTORE_SCHEDULING&lt;br/&gt;+ RESTART_WORKLOAD&quot;]
@@ -9181,7 +9264,13 @@ workflow result 与持久通知，并经站点 SNS/SES
 没有可用渠道时持久化通知并记录未投递，不能视为成功告警。</p>
 <p>SES路由把站点联系人、sender和recipient列表分开：<code>adminEmail</code>仍用于SNS运维告警，
 <code>emailSender</code>必须对应已验证identity，<code>emailRecipients[]</code>允许多个SES接收者。
-可选 <code>spec.notifications.sesConfigurationSet</code> 经低层
+deploy每次重新生成site时保留<code>spec.notifications</code>中声明的字段，未声明的才取默认值
+（<code>admin/notifications.py::site_notification_contract</code>）；控制面role的SES授权、SES
+identity和 <code>gpu-fault-email</code>
+Secret都按由这份通知块解析出的sender与recipient收敛（<code>site_notification_routing</code>），
+deploy首分钟预检核对的也是这个sender的SES
+identity，而不是<code>adminEmail</code>的。 可选
+<code>spec.notifications.sesConfigurationSet</code> 经低层
 <code>ses_configuration_set</code>、 共享
 <code>render_notification_config_maps</code> 进入各 CPU 角色的
 <code>GPU_FAULT_SES_CONFIGURATION_SET</code>，SES 请求再带
@@ -10866,7 +10955,7 @@ ms）；样本排在该 tick 最前，每 tick 重复直到某
 个批次投递成功（设备消失的 tick 通常本身就是 <code>recovered</code>
 边沿，否则随下一次健康摘要），消失设备的计数基线被遗忘，同名后继
 从自己的首次读取起算（<code>collectors/host/system_metrics.py</code>）。（2）控制面在每个来自节点自身
-collector（<code>producer=node</code>） 的 host 批次申领之后，用
+collector（<code>producer=node</code>） 的 host 批次申领之前，用
 <code>stale_health_signal_states(&quot;cluster/node/&quot;)</code>（精确前缀而非键范围——生产库默认排序规则不是字
 节序）读取该节点在
 <code>GPU_FAULT_HEALTH_SIGNAL_DEVICE_AGE_OUT_SUMMARIES</code>（默认 3；0
@@ -10874,11 +10963,16 @@ collector（<code>producer=node</code>） 的 host 批次申领之后，用
 <code>GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS</code>（默认 300 s，即约 15
 分钟）内无申领写入的行，其中 active、设备级（设备段不是
 <code>node</code>、指标属于 host 规则表、不是按 attempt
-计时的低利用率窗口）且不在本批次中的信号，在控制面
+计时的低利用率窗口）的信号，在控制面
 接收时钟与节点时钟都超过窗口时按普通申领写成
-inactive（老化清零）；只有一个时钟跳了——例如停机后补投的积压批次只有接收时钟
-跳——不清零。记录就是清零后的状态本身（<code>observed_at/clock_at</code>
-为老化时刻）、一条点名各键的 INFO 日志
+inactive（老化清零）——本批次又带上该设备时也一样：节点本身静默超过窗口
+（重启、collector 宕掉、沿用同名的替换节点；collector
+启动时会投递所有在场设备），静默后该设备的第一个样本是新 episode
+的第一个样本，而不是沿用旧闩锁的样本（此前结果取决于设备出现在节点第一个批次还是之后的批次）；本批次带上、且在窗口内
+上报过的设备从不受影响。只有一个时钟跳了——例如停机后补投的积压批次只有接收时钟跳——不清零。记录就是清零后的状态本身
+（<code>observed_at/clock_at</code>
+为老化时刻；对本批次带上的设备取批次前一微秒，使批次自身的样本保持更新）、一条点名各键的
+INFO 日志
 （<code>aged out N device-scoped health signal(s) of cluster/node</code>）以及策略上的
 <code>device_signal_age_outs_total</code>；不给
 <code>HealthSignalState</code>
@@ -12164,7 +12258,13 @@ CPU/Executor/Node Runtime 业务 wheel。构建、签名 bundle、Profile
 重入内层： <code>run_prepared_deploy</code> 在
 <code>administrator_operation_lock</code> 内做
 bootstrap，接着自动发布，最后 join <code>pending_gpu_cluster_arns</code>
-里待加入的 GPU 集群。外层全程持有 <code>site_operation_lock</code>，分类
+里待加入的 GPU
+集群。外层还把操作者的完整命令行（<code>deploy_rerun_command</code>）以隐藏
+参数 <code>--rerun-command</code> 交给
+<code>scripts/staging_deploy.py</code>：首分钟邮件确认未通过时打印的续跑命令就是这一行，只去掉
+已在停止前生效、重复会被拒绝的
+<code>--registration-cluster</code>。外层全程持有
+<code>site_operation_lock</code>，分类
 （<code>UNCHANGED</code>/<code>DEPLOY_HOST_ONLY</code>/<code>APPLICATION_RELEASE</code>）与应用之间不重读站点。已安装的
 deploy-host 由 <code>admin/deploy_host_binding.py</code> 约束到绑定的
 state-dir：CLI 入口在执行任何命令前调用
@@ -13504,7 +13604,8 @@ protocol pin</td>
 <td>POST</td>
 <td><code>/v1/runtime-profiles</code></td>
 <td>execution-token</td>
-<td>编译并注册 profile</td>
+<td>编译并注册 profile；只创建：同版本同策略幂等返回已存储的
+profile，内容不同 409</td>
 </tr>
 <tr class="even">
 <td>POST</td>
