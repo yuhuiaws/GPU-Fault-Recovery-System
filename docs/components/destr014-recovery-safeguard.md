@@ -2,8 +2,11 @@
 
 This is an acceptance-only safeguard, not a production recovery operation or
 permission to run DESTR-014. The case still requires the approved physical plan,
-target identity, maintenance window, EKS HyperPod `NodeRecovery=None`, no warm
-spares, and provider replacement disabled. Local tests are not LIVE evidence.
+target identity, maintenance window, the provider's own recovery off (a HyperPod
+cluster InService with `NodeRecovery=None`; a plain EKS `eks-managed` cluster
+ACTIVE with node auto repair disabled on every GPU node group), no warm spares,
+and provider replacement disabled (`destr014_preflight`,
+`warm_spare_provider.cluster_recovery_errors`). Local tests are not LIVE evidence.
 
 ## Protocol
 
