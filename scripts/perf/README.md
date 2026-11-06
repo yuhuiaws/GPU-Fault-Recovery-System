@@ -283,8 +283,9 @@ is split by responsibility:
 
 - `regional_capacity_job.py`: Indexed Job and start-gate manifest construction.
 - `regional_capacity_database.py`: Aurora and PostgreSQL observations.
-- `regional_capacity_priority_latency.py`: per-tier completion latency, read in
-  an api-ha Pod from where the active store layout keeps completed requests
+- `regional_capacity_priority_latency.py`: per-tier completion latency and the
+  processor's final response statuses (`response_status_counts`), read in an
+  api-ha Pod from where the active store layout keeps completed requests
   (queue rows inline, replay partitions detached).
 - `regional_capacity_pg_activity.py`: one session in an api-ha Pod that reads
   `pg_stat_activity` twice a second through the load and the drain, and the
@@ -295,10 +296,11 @@ is split by responsibility:
   load stop.
 - `regional_capacity_placement.py`: the run's Aurora writer, its Availability
   Zone and the control-plane node zones.
-- `regional_integrated_evidence.py`: the integrated verdict's drain check and
-  the configuration it records and judges (`config_identity`: the global
-  AdminConfig digest and the three role configuration digests of the live role
-  Deployments and their Running Pods).
+- `regional_integrated_evidence.py`: the integrated verdict's drain check, its
+  final-response check (every request answered 2xx, every fault-tier request
+  accounted for) and the configuration it records and judges
+  (`config_identity`: the global AdminConfig digest and the three role
+  configuration digests of the live role Deployments and their Running Pods).
 - `regional_capacity_pods.py`: the control-plane Pod runtime snapshot and the
   lifecycle comparison the integrated verdict reads (replaced, added,
   restarted, not Ready, readiness flaps).

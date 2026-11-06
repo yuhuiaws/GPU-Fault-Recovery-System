@@ -1210,6 +1210,7 @@ control-plane Pod set unchanged, container restart delta = 0, no readiness flap 
 at least one lease renewal on a long action
 processor queue and spool back to the depth from before the round started
 the round ran on one configuration (config_identity: digests present, one global digest, no Pod on another role configuration)
+every completed request's processor final response is 2xx, and the fault-tier final responses number at least the matrix's P0 count (XID + SXID)
 ```
 
 The drain check reads `summary.json.queue_drain`: up to 900 seconds of draining after the load stops, against the
@@ -1547,7 +1548,9 @@ non-zero it cannot count as a formal PASS.
 
 `processor-priority-latency.json` (also `summary.json.processor_priority_latency`) is the per-tier
 completion latency of the round's requests: per tier `completion_latency` (count and p50/p95/p99/max in
-ms), `cluster_fairness` (the minimum, maximum and mean of the per-cluster p99) and `status_counts`, scoped to the synthetic
+ms), `cluster_fairness` (the minimum, maximum and mean of the per-cluster p99), `status_counts` and
+`response_status_counts` (per tier, the completed requests by the processor's final response status, which both tables
+keep in `response_status`; a row without one counts as `none`), scoped to the synthetic
 clusters and to requests created since the load Job was created (`since_epoch`). It reads where
 `layout_mode` keeps completed requests: in `inline` the queue's COMPLETED rows with their stored
 priority, in `detached` the `gpu_fault_processor_replays` rows (`completed_source`); both tables are read,
@@ -2012,8 +2015,11 @@ small and cannot explain second-level latency.
    the public/NLB first-request threshold.
 8. **The load tool must verify the processor final response.** An ingress 202 only means
    enqueued; a dry run once found background 422s. The formal tool should judge any non-2xx
-   receipt/final response as FAIL directly (no runner checks it today: the load generators record ingress status codes
-   only and the priority-latency probe counts queue states, never the processor's final response).
+   receipt/final response as FAIL directly: the load generators record the ingress status codes, the priority-latency
+   probe records each tier's final response statuses (`response_status_counts`), and the integrated runner's verdict
+   fails when any tier shows a non-2xx (or missing) final response or when fewer fault-tier final responses were read
+   than the matrix's P0 count (XID + SXID) (`regional_integrated_evidence.final_response_errors`); the burst runner
+   records them without a verdict.
 9. **Isolate periodic cloud queries for the synthetic registry.** An audit cluster carries a
    placeholder HyperPod name, so refreshing it only produces `ResourceNotFound` logs. The background
    identity refresh skips these entries by the registration's `synthetic` marker (it reads the

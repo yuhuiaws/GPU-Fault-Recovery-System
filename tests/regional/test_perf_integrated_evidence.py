@@ -175,6 +175,67 @@ def test_missing_or_mixed_admin_digests_fail() -> None:
     ]
 
 
+def answered(**tiers: dict[str, int]) -> dict[str, Any]:
+    """The probe's final responses: the 32-cluster matrix answered 2xx."""
+
+    counts = {"10": {"200": 1000}, "50": {"200": 1128}, "100": {"202": 128}}
+    counts.update({tier.removeprefix("t"): value for tier, value in tiers.items()})
+    return {"layout_mode": "detached", "response_status_counts": counts}
+
+
+def test_every_request_answered_2xx_passes() -> None:
+    assert evidence.final_response_errors(answered(), fault_requests=1000) == []
+
+
+@pytest.mark.parametrize(
+    ("latency", "expected"),
+    [
+        (
+            answered(t50={"200": 1100, "422": 28}),
+            ["processor final response 422 on 28 tier-50 requests"],
+        ),
+        (
+            answered(t10={"200": 999, "500": 1}),
+            ["processor final response 500 on 1 tier-10 requests"],
+        ),
+        (
+            answered(t100={"none": 3}),
+            ["processor final response none on 3 tier-100 requests"],
+        ),
+        (
+            answered(t10={"200": 400}),
+            [
+                "only 400 of the 1000 fault-tier requests have a processor final "
+                "response"
+            ],
+        ),
+        (
+            {"error": "command failed (1): exec"},
+            ["processor final responses were not read: command failed (1): exec"],
+        ),
+        ({"layout_mode": "inline"}, ["processor final responses were not recorded"]),
+        (None, ["processor final responses were not read: None"]),
+    ],
+)
+def test_a_non_2xx_or_unread_final_response_fails(
+    latency: dict[str, Any] | None, expected: list[str]
+) -> None:
+    """An ingress 202 only means enqueued; a dry run once found background
+    422s behind 202 receipts (perf plan §13, item 8)."""
+
+    assert evidence.final_response_errors(latency, fault_requests=1000) == expected
+
+
+def test_the_integrated_verdict_fails_a_background_422() -> None:
+    summary = passing_summary()
+    summary["processor_priority_latency"] = answered(t50={"200": 1127, "422": 1})
+
+    status, errors = suite.verdict(summary, expected_workflows=128)
+
+    assert status == "FAIL", errors
+    assert errors == ["processor final response 422 on 1 tier-50 requests"]
+
+
 def passing_summary() -> dict[str, Any]:
     expected = 128
     return {
@@ -219,6 +280,7 @@ def passing_summary() -> dict[str, Any]:
         "executor": {"expected_commands": 960, "completed_commands": 960},
         "queue_drain": drain(0.0, 0.0),
         "config_identity": evidence.config_identity(site()),
+        "processor_priority_latency": answered(),
     }
 
 

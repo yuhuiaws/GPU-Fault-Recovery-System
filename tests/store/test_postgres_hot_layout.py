@@ -111,7 +111,7 @@ def _hot_counters(connection, table: str) -> tuple[int, int]:
     ).fetchone()
 
 
-def _complete(store, claimed):
+def _complete(store, claimed, *, statuses=None):
     return store.complete_active_processor_requests_batch(
         [
             {
@@ -119,7 +119,7 @@ def _complete(store, claimed):
                 "owner_id": "owner",
                 "lane_epoch": item.leader_epoch,
                 "lease_token": item.lease_token,
-                "response_status": 202,
+                "response_status": (statuses or {}).get(item.request_id, 202),
                 "response_content_type": "application/json",
                 "response_body_base64": RESPONSE,
             }
@@ -504,6 +504,7 @@ def test_the_perf_latency_probe_reads_completions_where_the_layout_keeps_them(
     store.try_enqueue_processor_requests_batch(
         [*requests, outside, early], max_depth=100, max_cluster_depth=100
     )
+    refused = requests[2].request_id  # the processor answers it 422
     for _round in range(10):
         claimed = store.claim_active_processor_requests(
             "owner",
@@ -513,7 +514,7 @@ def test_the_perf_latency_probe_reads_completions_where_the_layout_keeps_them(
         )
         if not claimed:
             break
-        _complete(store, claimed)
+        _complete(store, claimed, statuses={refused: 422})
     pending = processor_request(
         HOST_PATH, body=b'{"node_id": "p"}', cluster_id="perf-cap-001"
     )
@@ -552,3 +553,11 @@ def test_the_perf_latency_probe_reads_completions_where_the_layout_keeps_them(
     )
     assert document["status_counts"]["100"] == {"COMPLETED": 2, "PENDING": 1}
     assert set(document["cluster_fairness"]) == set(expected)
+    answers: dict[str, dict[str, int]] = {}
+    for item in requests:
+        status = "422" if item.request_id == refused else "202"
+        tier = answers.setdefault(str(item.queue_priority()), {})
+        tier[status] = tier.get(status, 0) + 1
+    assert document["response_status_counts"] == {
+        tier: dict(sorted(answers[tier].items())) for tier in sorted(answers, key=int)
+    }, "every completed request's final response, on its tier, from either table"

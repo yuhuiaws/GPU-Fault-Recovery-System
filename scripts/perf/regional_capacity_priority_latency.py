@@ -27,6 +27,11 @@ run's synthetic clusters and to requests created since ``since_epoch``. The
 product keeps completed requests for ``completedRetentionSeconds`` (600 s by
 default), so the document states the completion interval each source covered.
 
+An ingress 202 only means a request was enqueued; its outcome is the
+processor's final response, which both tables keep (``response_status``).
+``response_status_counts`` gives, per tier, the completed requests by that
+status, the evidence the integrated verdict reads (perf plan §13, item 8).
+
 Shipped to a control-plane Pod as source and run with the product's
 interpreter (``python -``), like ``regional_capacity_data``.
 """
@@ -58,14 +63,14 @@ WHERE cluster_id LIKE %(prefix)s
 GROUP BY priority, status
 """
 QUEUE_COMPLETED_SQL = """
-SELECT priority, cluster_id,
+SELECT priority, cluster_id, response_status,
        array_agg(extract(epoch FROM updated_at - created_at) * 1000),
        min(extract(epoch FROM updated_at)), max(extract(epoch FROM updated_at))
 FROM gpu_fault_processor_queue
 WHERE cluster_id LIKE %(prefix)s
   AND status = 'COMPLETED'
   AND created_at >= to_timestamp(%(since)s)
-GROUP BY priority, cluster_id
+GROUP BY priority, cluster_id, response_status
 """
 #: ``parsed`` is an optimisation fence (``OFFSET 0``) so a body is decoded
 #: and parsed once per row; LATIN1 maps every byte but NUL to a character, so
@@ -74,6 +79,7 @@ GROUP BY priority, cluster_id
 REPLAYS_SQL = r"""
 SELECT r.cluster_id, r.envelope->>'path', edge.fields,
        CASE WHEN edge.unreadable THEN coalesce(r.body, '\x'::bytea) END,
+       r.response_status,
        array_agg(
            extract(epoch FROM r.completed_at
                    - (r.envelope->>'created_at')::timestamptz) * 1000
@@ -105,7 +111,7 @@ CROSS JOIN LATERAL (
 WHERE r.cluster_id LIKE %(prefix)s
   AND r.completed_at >= to_timestamp(%(since)s)
   AND (r.envelope->>'created_at')::timestamptz >= to_timestamp(%(since)s)
-GROUP BY 1, 2, 3, 4
+GROUP BY 1, 2, 3, 4, 5
 """
 
 
@@ -147,15 +153,18 @@ class Tiers:
         return self._known[key]
 
 
+Group = tuple[int, str, list[float], Any]
+
+
 def replay_groups(
     rows: Iterable[tuple[Any, ...]], tier: Callable[[str, bytes], int]
-) -> tuple[list[tuple[int, str, list[float]]], int]:
-    """(tier, cluster, latencies) per replay group, and how many rows were
-    classified on their full body."""
+) -> tuple[list[Group], int]:
+    """(tier, cluster, latencies, final response status) per replay group, and
+    how many rows were classified on their full body."""
 
     groups = []
     unreadable = 0
-    for cluster, path, fields, raw, values, _first, _last in rows:
+    for cluster, path, fields, raw, status, values, _first, _last in rows:
         if raw is not None:
             body = bytes(raw)
             unreadable += len(values)
@@ -163,8 +172,21 @@ def replay_groups(
             body = json.dumps(fields, sort_keys=True).encode()
         else:
             body = b""
-        groups.append((tier(path or "", body), cluster, [float(v) for v in values]))
+        latencies = [float(v) for v in values]
+        groups.append((tier(path or "", body), cluster, latencies, status))
     return groups, unreadable
+
+
+def response_sections(groups: Iterable[Group]) -> dict[str, dict[str, int]]:
+    """Per tier, the completed requests by the processor's final response
+    status (``"none"`` for a row that carries none)."""
+
+    counts: dict[int, dict[str, int]] = {}
+    for tier, _cluster, values, status in groups:
+        key = "none" if status is None else str(status)
+        by_status = counts.setdefault(tier, {})
+        by_status[key] = by_status.get(key, 0) + len(values)
+    return {str(tier): dict(sorted(counts[tier].items())) for tier in sorted(counts)}
 
 
 def latency_sections(
@@ -231,16 +253,16 @@ def measure(connection: Any, *, prefix: str, since_epoch: float) -> dict[str, An
         statuses.setdefault(str(priority), {})[str(status)] = int(count)
     cursor.execute(QUEUE_COMPLETED_SQL, parameters)
     queue_rows = cursor.fetchall()
-    groups = [
-        (int(priority), cluster, [float(value) for value in values])
-        for priority, cluster, values, _first, _last in queue_rows
+    groups: list[Group] = [
+        (int(priority), cluster, [float(value) for value in values], status)
+        for priority, cluster, status, values, _first, _last in queue_rows
     ]
     sources: dict[str, Any] = {"queue": _covered(queue_rows)}
     if has_replays:
         cursor.execute(REPLAYS_SQL, {**parameters, "edge_paths": edge_filtered_paths()})
         replay_rows = cursor.fetchall()
         replayed, unreadable = replay_groups(replay_rows, Tiers())
-        for tier, _cluster, values in replayed:
+        for tier, _cluster, values, _status in replayed:
             counts = statuses.setdefault(str(tier), {})
             counts[COMPLETED] = counts.get(COMPLETED, 0) + len(values)
         groups.extend(replayed)
@@ -248,7 +270,7 @@ def measure(connection: Any, *, prefix: str, since_epoch: float) -> dict[str, An
             **_covered(replay_rows),
             "classified_on_full_body": unreadable,
         }
-    latency, fairness = latency_sections(groups)
+    latency, fairness = latency_sections(group[:3] for group in groups)
     return {
         "layout_mode": mode,
         "completed_source": "replays" if mode == "detached" else "queue",
@@ -258,6 +280,7 @@ def measure(connection: Any, *, prefix: str, since_epoch: float) -> dict[str, An
         "status_counts": {key: statuses[key] for key in sorted(statuses, key=int)},
         "completion_latency": latency,
         "cluster_fairness": fairness,
+        "response_status_counts": response_sections(groups),
     }
 
 

@@ -66,19 +66,29 @@ def test_a_replay_group_is_classified_on_what_the_statement_returned() -> None:
         return 7
 
     fields = {"collection_errors": None, "edge_filter_reasons": ["threshold:temp"]}
+    metrics = "/v1/collector-events/gpu-metrics"
     rows = [
-        ("perf-cap-000", "/v1/gpu-events/xid", None, None, [1, 2], 1.0, 2.0),
-        ("perf-cap-000", "/v1/collector-events/gpu-metrics", fields, None, [3], 1, 1),
-        ("perf-cap-001", "/v1/collector-events/node-logs", None, b"{NaN", [4], 1, 1),
+        ("perf-cap-000", "/v1/gpu-events/xid", None, None, 202, [1, 2], 1.0, 2.0),
+        ("perf-cap-000", metrics, fields, None, 422, [3], 1, 1),
+        (
+            "perf-cap-001",
+            "/v1/collector-events/node-logs",
+            None,
+            b"{NaN",
+            202,
+            [4],
+            1,
+            1,
+        ),
     ]
 
     groups, unreadable = latency.replay_groups(rows, tier)
 
     assert groups == [
-        (7, "perf-cap-000", [1.0, 2.0]),
-        (7, "perf-cap-000", [3.0]),
-        (7, "perf-cap-001", [4.0]),
-    ]
+        (7, "perf-cap-000", [1.0, 2.0], 202),
+        (7, "perf-cap-000", [3.0], 422),
+        (7, "perf-cap-001", [4.0], 202),
+    ], "every group keeps the final response status it was grouped by"
     assert seen == [
         ("/v1/gpu-events/xid", b""),
         (
@@ -88,6 +98,24 @@ def test_a_replay_group_is_classified_on_what_the_statement_returned() -> None:
         ("/v1/collector-events/node-logs", b"{NaN"),
     ], "path only, the two extracted fields, or the whole unreadable body"
     assert unreadable == 1
+
+
+def test_final_responses_are_counted_per_tier_and_status() -> None:
+    """An ingress 202 only means enqueued (perf plan §13, item 8): the probe
+    reports the processor's own answer, which the integrated verdict judges."""
+
+    groups = [
+        (10, "perf-cap-000", [1.0, 2.0], 202),  # queue rows
+        (10, "perf-cap-001", [3.0], 202),  # replay rows of the same tier
+        (50, "perf-cap-000", [4.0], 422),
+        (100, "perf-cap-000", [5.0, 6.0], None),
+    ]
+
+    assert latency.response_sections(groups) == {
+        "10": {"202": 3},
+        "50": {"422": 1},
+        "100": {"none": 2},
+    }
 
 
 class Reading(dict[str, Any]):

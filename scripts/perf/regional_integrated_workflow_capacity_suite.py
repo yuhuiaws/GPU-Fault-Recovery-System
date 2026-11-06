@@ -969,6 +969,11 @@ def verdict(
         errors.append("long simulated actions produced no lease renewals")
     errors.extend(evidence.drain_errors(summary.get("queue_drain")))
     errors.extend(evidence.config_errors(summary.get("config_identity")))
+    errors.extend(
+        evidence.final_response_errors(
+            summary.get("processor_priority_latency"), fault_requests=model["p0"]
+        )
+    )
     return ("PASS" if not errors else "FAIL", errors)
 
 

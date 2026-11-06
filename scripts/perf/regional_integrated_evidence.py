@@ -10,7 +10,11 @@ Perf plan §8.4 and §9: a formal integrated round passes only when
   AdminConfig digest every role Deployment carries and the configuration digest
   of each of the three roles (``config_identity``, in ``run.json`` and
   ``summary.json``). A Running Pod whose role digest is not its Deployment's
-  comes from an older ReplicaSet: a configuration roll was still in flight.
+  comes from an older ReplicaSet: a configuration roll was still in flight;
+* every request's final response is 2xx (§13, item 8): an ingress 202 only
+  means the request was enqueued, and the processor's own answer is what the
+  priority latency probe reads per tier (``response_status_counts``), with
+  every fault-tier request of the matrix accounted for.
 """
 
 from __future__ import annotations
@@ -18,6 +22,8 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from typing import Any
+
+from gpu_fault.processor.models import is_reserved_tier
 
 #: The role Deployments of the control plane and their Pods' ``app`` label.
 ROLE_DEPLOYMENTS = {
@@ -149,5 +155,39 @@ def config_errors(identity: dict[str, Any] | None) -> list[str]:
         errors.append(
             "control-plane Pods run another role configuration than their "
             "Deployment (a roll in flight): " + ", ".join(stale)
+        )
+    return errors
+
+
+def final_response_errors(
+    latency: dict[str, Any] | None, *, fault_requests: int
+) -> list[str]:
+    """Why the processor's final responses do not show every request answered
+    2xx: a non-2xx (or missing) status on any tier, or fewer fault-tier final
+    responses than the matrix's ``fault_requests`` (P0: XID plus SXID) -- a
+    probe that read too little proves nothing."""
+
+    if not isinstance(latency, dict) or latency.get("error"):
+        detail = (latency or {}).get("error") if isinstance(latency, dict) else None
+        return [f"processor final responses were not read: {detail}"]
+    counts = latency.get("response_status_counts")
+    if not isinstance(counts, dict):
+        return ["processor final responses were not recorded"]
+    errors = [
+        f"processor final response {status} on {count} tier-{tier} requests"
+        for tier, statuses in sorted(counts.items(), key=lambda item: int(item[0]))
+        for status, count in sorted(statuses.items())
+        if not (status.isdigit() and 200 <= int(status) < 300)
+    ]
+    answered = sum(
+        int(count)
+        for tier, statuses in counts.items()
+        if is_reserved_tier(int(tier))
+        for count in statuses.values()
+    )
+    if answered < fault_requests:
+        errors.append(
+            f"only {answered} of the {fault_requests} fault-tier requests have a "
+            "processor final response"
         )
     return errors

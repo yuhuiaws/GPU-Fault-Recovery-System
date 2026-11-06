@@ -574,8 +574,12 @@ def test_executor_log_collection_accepts_integrated_job_name(
     assert f"batch.kubernetes.io/job-name={suite.EXECUTOR_JOB}" in calls[0]
 
 
-# A round that drained and ran on one configuration (test_perf_integrated_evidence).
+# A round that drained, ran on one configuration and whose every request the
+# processor answered 2xx (test_perf_integrated_evidence).
 ROUND_EVIDENCE = {
+    "processor_priority_latency": {
+        "response_status_counts": {"10": {"200": 1000}, "50": {"200": 1000}}
+    },
     "queue_drain": {
         "target_queue_depth": 1.0,
         "target_spool_depth": 1.0,
