@@ -198,6 +198,26 @@ nor does it change `NodeRecovery=None` or the provider replace prohibition.
   (with its failure) are written into `installation_registry_sync` of `uninstall/state.json` and the field of the same name in
   the command output. A refusal leaves no journal, so `deploy` is not blocked by "uninstall in progress"; a resume of an
   uninstall already started keeps the verdict it started on and is not judged again.
+- Every ACTIVE Agent in the fleet still has its node in the GPU EKS, or the node left HyperPod with a spot replacement (the
+  control plane's departed-node cleanup has usually set such a record `REVOKED` already, see §10.1.1;
+  `workflow-reconcile --retire-departed-agents` does it by hand, see §10.2; `REVOKED` records take no part in the gate).
+  PREFLIGHT lets a missing ACTIVE node pass in one case only: the node name `hyperpod-<instance-id>` is absent both from
+  Kubernetes and from the `aws sagemaker list-cluster-nodes` result (captured once per cluster and recorded with its SHA-256
+  under `provider_nodes` in `kubernetes-cleanup.json`). Such a node is recorded in `departed_fleet_nodes` and is no longer
+  a node-cleanup target; when HyperPod still lists the instance, the cluster is not HyperPod-managed, the AWS call fails or
+  the node name carries no instance id, PREFLIGHT still refuses with `an active fleet node is missing` and the reason. A
+  departed ACTIVE record of an eks-managed cluster does not qualify (its node name carries no instance id): the
+  departed-node cleanup or `--retire-departed-agents` must retire it first. A replacement node that carries only
+  `gpu-fault.io/installer-*` annotations, with `installer-state` `Failed`/`Installing`/`Retrying`/`WaitingForKey` and
+  no Agent record in the fleet, does not block either: it is recorded in `orphaned_installer_nodes`, and the reset removes
+  just those installer annotations with a patch preconditioned on the Node UID/resourceVersion; any other `gpu-fault.io/*`
+  label, taint or ownership annotation, or `installer-state=Succeeded`, still fails closed as `unregistered node runtime`.
+  The node-group ownership label `gpu-fault.io/control-plane` (§5.0.0) is such a label itself: on a cluster selected by the
+  label convention a GPU node without an Agent record (a replacement still installing, or one whose install failed) is
+  currently refused as `unregistered node runtime` as well, and becomes an ordinary cleanup target once its Agent
+  registers. Do not scale the reconciler to 0 for this: a PREFLIGHT resume then refuses with `original resource state
+  changed during capture: deployment gpu-fault-system/gpu-fault-node-installer-reconciler replicas 1 -> 0`; restore the
+  original replica count and rerun.
 
 **Scope of impact**
 
@@ -307,8 +327,8 @@ The fixed phases and reasons for waiting are:
 | Phase | Proof that must be completed | Performance and parallelism boundary |
 |---|---|---|
 | Registry export | site/account/Region, complete CPU/GPU/Aurora identity, dependencies and the effective policy of this run agree; records to delete are `DELETE_PENDING` | Pins the original inventory first; resume reuses the bound snapshot and does not rebuild authorisation ad hoc |
-| Stop producers and drain | Active workflows/commands and queues at zero; an unknown state cannot be treated as an empty queue | Stops producers, closes ingress and drains; nodes and Executors may still finish in-flight work during this time; records are not emptied via bulk orphan SQL |
-| Stop consumers and GPU Executors | First `CONTROL_CONSUMERS_STOPPED`, then `GPU_EXECUTORS_STOPPED` | Prevents further dispatch; both must precede node component uninstall |
+| Stop producers and drain | Active workflows/commands and queues at zero; an unknown state cannot be treated as an empty queue | Stops producers, then drains with the ingress and the consumers still running; nodes and Executors may still finish in-flight work during this time; records are not emptied via bulk orphan SQL |
+| Stop consumers and GPU Executors | First `CONTROL_CONSUMERS_STOPPED`, then `INGRESS_STOPPED`, then `GPU_EXECUTORS_STOPPED` | Prevents further dispatch; all three must precede node component uninstall |
 | Node and Kubernetes uninstall | `NODE_RUNTIMES_STOPPED` uses the original journal's fleet/UID inventory; then auxiliary, registered objects and both sides' solution namespaces are cleaned up (within each dependency wave all objects are issued for deletion first, then their disappearance is awaited once), and both sides' installed-resource ConfigMaps, registered objects and namespaces are confirmed absent | No database reads after the consumers stop; bulk re-verification by context/kind/namespace; a successful delete request does not equal object disappearance |
 | Non-Aurora resource deletion | NLB/listener/target group, DNS, PKI (ACM certificate), LBC Helm release, monitoring, SES identity, ECR repository, IAM, EKS addons and solution-specific network resources are cleaned by dependency, and external users must not be affected | Resources of the same priority without dependencies at most 4-way per batch; the CPU Helm/LBC must be verified while the CPU API is still available |
 | CPU keep or delete | `keep` confirms the CPU is still present; `delete` deletes the CPU HyperPod first, then EKS; all GPU clusters are still present | nodegroups may be requested for deletion in the same wave; Fargate profiles are deleted one by one with waits, not blindly in parallel |
@@ -411,10 +431,10 @@ a managed site, and the command refuses outright.
 `deploy --state-dir` refuses outright (`an uninstall of this site is in progress (phase <phase>)`);
 first finish the uninstall with the same `uninstall` command; do not use `deploy` to refresh the deployment host while the uninstall is unfinished. The first `deploy` after the uninstall
 reaches `COMPLETED` first turns this directory back into a new site: with a retirement journal carrying persisted intent and checkpoints it moves
-`site.yaml`, `bootstrap-state.json`, `source-deploy.json`, `source-deploy-success.json`,
+`initial-deploy-request.json`, `site.yaml`, `bootstrap-state.json`, `source-deploy.json`, `source-deploy-success.json`,
 `source-deploy-success.sigstore.json`, `installation-resources.json(.sha256)`,
-`quick-validation.json`, `public-release-verdict.json`, the old `release-deploy/`, `join-cluster/`,
-`remove-cluster/` transaction directories and the whole `uninstall/` into
+`quick-validation.json`, `public-release-verdict.json`, `installation-lifecycle.json`, the old `release-deploy/`,
+`join-cluster/`, `remove-cluster/` and `registration-anchor/` directories and the whole `uninstall/` into
 `<state-dir>/retired-<UTC time>-<random id>/` (kept for audit, not deleted, and not just renaming the main state file), writes a new
 installation ID (`keep` mode also records `retained_uninstall` for taking over the retained Aurora), prints
 `completed installation retired into retired-...; bootstrap will revalidate retained resources` on stderr,
