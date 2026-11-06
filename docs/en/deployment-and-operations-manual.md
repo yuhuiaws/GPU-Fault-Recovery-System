@@ -3248,19 +3248,25 @@ a two-phase switch; old Pods must not be run mixed with the `partitioned` counte
    module digest matches.
 3. Confirm the processor queue's `PENDING/LEASED` are both 0.
 4. Substitute the current wheel ConfigMap into
-   `postgres-counter-shards-finalize-job.yaml` and run it. Under the advisory lock and the
-   queue table lock the Job re-seeds the shards and then atomically switches to `partitioned`.
+   `postgres-counter-shards-finalize-job.yaml` and run it (`gpu-fault-store-migrate
+   --finalize-processor-counter-shards`). Under the advisory lock and the
+   queue table lock the Job re-seeds the shards and then atomically switches to `partitioned`; while the queue still holds
+   `PENDING/LEASED` rows it refuses with `processor counter mode switch requires an empty queue`.
 5. Confirm `mode=partitioned`, `ready=true` with
    `gpu-fault-store-migrate --processor-counter-shard-status`.
 
-Rollback is in the reverse order: you must first run
-`postgres-counter-shards-rollback-job.yaml` while queue=0, restoring and re-seeding the legacy counter,
+Rollback is in the reverse order: first run
+`postgres-counter-shards-rollback-job.yaml` while queue=0 (`--restore-legacy-processor-counters`; the Job itself does not check that
+the queue is empty and re-seeds the legacy counter from the `PENDING/LEASED` rows present under the same lock),
 and only after confirming `mode=dual` may you roll back to an old wheel that does not understand priority shards. Both Jobs have
-a hard cap of 720 seconds; on failure the rollout must not continue.
+a hard cap of 720 seconds (`activeDeadlineSeconds`); on failure the rollout must not continue. Since schema v20 both counter tables
+hold one row per writer backend (`shard_id = mod(pg_backend_pid(), 128)`); the mode only decides which table is the source of truth.
 
-The execution side is not infinitely strict about priority either: once this process has claimed or is executing priority 0, the GPU/Host
-evidence pools each shrink to 1 worker, and evidence already running is not interrupted. Priority 50
-keeps progressing; within the same GPU/Host pool, priority 100 that has waited more than 30 seconds is claimed at effective priority 49,
+The execution side is not infinitely strict about priority either: once this process has claimed or is executing a fault-tier request
+(priority 0 control-plane actions and priority 10 device events), the GPU/Host evidence pools each shrink to
+`GPU_FAULT_PROCESSOR_FAULT_PRESSURE_EVIDENCE_WORKERS` (default 1) workers, and evidence already running is not interrupted. Priority 50
+keeps progressing; within the same GPU/Host pool, priority 100 that has waited more than
+`GPU_FAULT_PROCESSOR_ROUTINE_STARVATION_SECONDS` (default 30 seconds) is claimed at effective priority 49,
 avoiding permanent starvation by continuous evidence. This aging only changes the claim order, not the persisted
 priority, and does not preempt already leased requests.
 
@@ -3328,7 +3334,7 @@ sending according to `spec.notifications.channel`: new sites default to SNS
 The standalone ADOT Collector (`gpu-fault-system/gpu-fault-adot`) implements **path B** only:
 scrape `/metrics` of `gpu-fault-api-ha` -> remote-write to AMP -> AMP evaluates rules
 -> Alertmanager -> SNS. It takes no part in fault remediation transactions, but belongs to the production observability baseline:
-  the first sub-route of the Alertmanager definition sends `cluster_id=~"perf-cap-.*"` (the synthetic clusters of capacity stress tests) to the `gpu-fault-drill-sink` receiver, which has no delivery configuration: these alerts remain queryable in AMP but do not send email via SNS; the capacity runner checks that the online definition contains this route before registering synthetic clusters and fails closed if it is missing.
+the first sub-route of the Alertmanager definition sends `cluster_id=~"perf-cap-.*"` (the synthetic clusters of capacity stress tests) to the `gpu-fault-drill-sink` receiver, which has no delivery configuration: these alerts remain queryable in AMP but do not send email via SNS; the capacity runner checks that the online definition contains this route before registering synthetic clusters and fails closed if it is missing.
 
 - The metrics interaction is one-way pull. ADOT connects directly to Pod IPs via Pod discovery and does not depend on the `gpu-fault-api` Service.
   The control plane does not push metrics to ADOT and there is no push logic in the code; the topic environment variable used for SNS notifications belongs to
@@ -3362,23 +3368,25 @@ clusters whose apply output is entirely `unchanged` are not restarted (other clu
 (including those newly added in the candidate) have the objects installed by the candidate deleted, recorded as `removed`; only clusters added to site.yaml after the transaction opened take the `scaled-to-zero` path,
 and clusters removed from site.yaml after the transaction opened make the phase refuse before touching any object. An unreachable cluster or a `rollout status` timeout **does not abort** the other clusters:
 it records `failed: <reason>` and continues, and at the end of the phase raises a single error "data-plane observability rollback failed on N of M steps: … -- the rest was
-restored; resume the rollback to retry the failed ones"; the rollback is truthfully recorded as failed, and after the fix `--resume` reruns the phase. Afterwards the per-cluster
+restored; resume the rollback to retry the failed ones"; the rollback is truthfully recorded as failed, and after the fix resuming the rollback (rerunning the same deploy command) reruns this idempotent phase. Afterwards the per-cluster
 alert rule namespace `gpu-fault-dataplane-expected` is restored or deleted (waiting for it to stabilise first; after a restore it waits for ACTIVE, after a delete for ResourceNotFound, before recording `restored` / `deleted`).
 The rollback of the control-plane AMP definitions (static rule namespace, Alertmanager definition) uses the same waits: each definition waits to stabilise before the put, and after the put waits until AMP
 reports ACTIVE before the next step (300 s budget each); when AMP rejects a definition, the rollback fails before touching the collectors with an error like
 `AMP rejected the AMP Alertmanager definition after put-alert-manager-definition: status UPDATE_FAILED: <statusReason>`,
-and after the fix `--resume`.
+and after the fix the rollback is resumed.
 In the rollback record, `path` under `rollback_timing.phases.dataplane_observability_restore.details` for this phase reads `snapshot`
 (plus `clusters.<id>`, `expected_rules`, and `error` on failure; `observability_restore.details` keeps only the control-plane collector's
 `restored|restored-unchanged` and one line `dataplane_adot: deferred to dataplane_observability_restore`); only when the transaction state predates this version and has no such snapshot does it fall back to
 `previous-image` (re-rendering the candidate manifests with the previous ADOT image, and truthfully recording that path). `bootstrap`, `join-cluster` and
-`remove-cluster` each rerun the AMP installation at the end to re-render the per-cluster rules: a newly onboarded cluster with a role immediately has its own absent rule, and the rules of a deregistered cluster
-disappear accordingly; before `remove-cluster`, first remove it from site.yaml and `deploy` (the OBSERVABILITY node scales the collector to 0), otherwise
-there is a 15-minute gap between its collector and its rules during which the alert fires. Prerequisites,
+`remove-cluster` each rerun the AMP installation at the end to re-render the per-cluster rules: a newly onboarded cluster with a role
+immediately has its own absent rule; `remove-cluster` first scales that cluster's collector to 0 in the same step and then reruns the
+AMP installation with a rule set that excludes the cluster, so the deregistered cluster's absent rule disappears and does not fire on
+the stopped collector. Prerequisites,
 **one set per GPU cluster**:
 
-1. An IAM role, **created automatically** by the bootstrap of the first `gpu-fault-admin deploy` and by `join-cluster` (task `adot_writer_role:<hyperpod>`,
-   running after `executor_role:<hyperpod>` and `monitoring_resources`), named `gpu-fault-<site>-<hyperpod>-adot-writer`
+1. An IAM role, **created automatically** by the bootstrap of the first `gpu-fault-admin deploy` and by `join-cluster` (task `adot_writer_role:<cluster>`,
+   running after `executor_role:<cluster>` and `monitoring_resources`), named `gpu-fault-<site>-<provider-name>-adot-writer`
+   (`<provider-name>` is the HyperPod name, or the EKS cluster name of an eks-managed cluster)
    (truncated with an 8-character digest by the same rule as the executor role when over 64 characters); the inline policy `GPUFaultDataplaneAmpWriter` allows only
    `aps:RemoteWrite` to `arn:aws:aps:<region>:<account>:workspace/<AMP_WORKSPACE_ID>`; the trust policy hangs on that GPU EKS's
    OIDC provider (sharing the same provider as the executor role; `sts:AssumeRoleWithWebIdentity`,
@@ -3393,12 +3401,11 @@ there is a 15-minute gap between its collector and its rules during which the al
    then sits idle and is cleaned up at uninstall). Still **do not** write a placeholder -- a leftover `REPLACE_WITH_…` value makes the render fail closed.
    `config/site.example.yaml` has an example and explanation; in the low-level regional-release JSON the counterpart is
    `clusters[].adot_irsa_role_arn` (`deploy/control-plane/regional/regional-release.example.json`). This field does not enter
-   `registry_config_digest` (a `clusters` difference does not flip it), but **does enter the `observability_adot` digest**: the digest is now computed jointly from
-   `adot-control-plane.yaml`, `adot-dataplane.yaml`, `health.amp_workspace_id`, each cluster's role ARN and the rendered
-   per-cluster alert rule text (`dataplane_expected_rules`),
+   `registry_config_digest` (a `clusters` difference does not flip it), but **does enter the `observability_adot` digest**: the digest is computed jointly from
+   `adot-control-plane.yaml`, `adot-dataplane.yaml`, `health.amp_workspace_id`, the control-plane AMP writer role name, each cluster's
+   role ARN and the rendered per-cluster alert rule text (`dataplane_expected_rules`),
    so adding the role, adding the workspace or changing the collector manifest is not a NOOP but a `CONTROL_PLANE_ONLY` release: it reruns the AMP installation,
-   then visits every GPU cluster with the `OBSERVABILITY` node, applying the collector or printing a skip. The first time a release containing this change is deployed, every site whose state
-   already has `observability_adot_sha256` sees `observability_adot` change once (the formula changed), with the consequence being the round trip described above.
+   then visits every GPU cluster with the `OBSERVABILITY` node, applying the collector or printing a skip.
 
 When any of these is missing, the release does **not** deploy that cluster's collector: it prints one line on stderr
 `<cluster>: data-plane ADOT collector not applied (<reason>); the Completion Watcher alerts stay inert for this cluster`,
@@ -3415,8 +3422,8 @@ When any of these is missing, the release does **not** deploy that cluster's col
   a role is quiet (no permanent "deployed but no role configured" warning), and with multiple clusters, one dead and one alive, the dead one can still be reported; removing a cluster's role
   is a release, the OBSERVABILITY node scales that cluster's collector to 0, and at the next render its rule disappears. The two Completion Watcher rules are also
   changed to group by `gpu_cluster`;
-- The first release carrying this manifest moves the cleanup inventory digests of `rendered_manifests` and the node component, so the node component reruns once
-  -- the same behaviour as every previous manifest addition.
+- Adding or changing a data-plane manifest moves the cleanup inventory digests of `rendered_manifests` and the node component, so the node
+  component reruns once.
 
 Process-side variables for the two new endpoints (both are env of the data-plane containers and must match the manifest's `metrics` containerPort / `prometheus.io/port`;
 set 0 to disable; a port bind failure only logs one ERROR line, the main loop runs as usual, and the collector reads `up == 0`):
@@ -3439,9 +3446,10 @@ queue depth, Store I/O, processing duration p95, and
 **has no "nobody claimed the command" alert**. Secondary detection of stuck training was originally planned to be produced by
 `TrainingHealthMonitor` (`GPU_FAULT_ENABLE_TRAINING_HEALTH_MONITOR`) as
 `training_hang` CRITICAL findings going through the incident flow.
-**That feature is not yet fully implemented and tested as a deliverable capability and currently cannot serve as the production alerting fallback.**
+**The monitor code exists, but it is off by default and the regional manifests pin it to `false`; it has not been accepted as a
+deliverable capability and currently cannot serve as the production alerting fallback.**
 Therefore path B cannot be scaled to 0 replicas; it remains responsible for attributing "training stuck" directly to "command not claimed"
-(see `GF-REGIONAL-BOOT-015` incidental finding 2).
+(see `GF-REGIONAL-BOOT-015`).
 Only when another monitored Prometheus/AMP scrape chain has already taken over these rules may you explicitly set
 `GPU_FAULT_ENABLE_ADOT=false`; the script never silently scales down a running collector.
 
@@ -3550,14 +3558,15 @@ so deploy **auto-discovers** the home Region: it queries the CPU cluster Region 
 one by one (Regions that refuse the call are skipped); the first Region with an instance is the home Region, `identitystore
 get-user-id` queries there, while the Grafana-related calls stay in the CPU cluster Region; the discovery result is written to `admin_grant.identity_center_region`
 and persisted as `spec.health.identityCenterRegion` in site.yaml, so the next deploy asks that Region directly without scanning
-(production 2026-09-09: the workspace was in us-west-2, Identity Center in us-east-1, and before the scan nobody had been granted anything).
+(when the workspace and Identity Center live in different Regions, no user can be derived without the scan).
 The operator can also pre-set `spec.health.identityCenterRegion` (for example `eu-west-1`): then only that Region is asked and no scan occurs,
 and the reason for not finding an instance states that it is the Region pointed to by that setting; an invalid Region string fails site validation. When no Region
 finds anything, the reason is `no IAM Identity Center instance is visible from <region> or the N other enabled
 regions scanned; enable IAM Identity Center for the account, or set spec.health.identityCenterRegion …`.
 
-If the script above was run without `GPU_FAULT_ENABLE_ADOT=true`,
-and you now decide to enable path B, scale up explicitly here (the Deployment has been created by the script at this point):
+The script defaults to `GPU_FAULT_ENABLE_ADOT=true`; run with `false` it keeps the collector's current replica count (neither scaling
+up nor down). When the collector was scaled to 0 and you now decide to enable path B, scale up explicitly here (the Deployment has been
+created by the script at this point):
 
 ```bash
 kubectl --kubeconfig "${CPU_KUBECONFIG}" -n gpu-fault-system \
@@ -3609,9 +3618,9 @@ does not use Prometheus Operator; `deploy/control-plane/regional/processor-alert
 And even with a correct rule, the metric must still reach AMP: the ADOT collector's
 `metric_relabel_configs` keep whitelist is the **only entry point**; metric families not on the whitelist
 are dropped on the scrape side, and the rule stays `absent` forever.
-The real-machine re-check of `GF-REGIONAL-BOOT-015` on 2026-08-01 hit both layers at once:
-the `gpu_fault_remote_command_*` alerts were only in the `PrometheusRule`, and the metric was blocked by the keep
-whitelist, so it could not fire in the real environment. Run this gate after every alert addition:
+Both layers have occurred together: the `gpu_fault_remote_command_*` alerts were only in the `PrometheusRule`, and the metric was
+blocked by the keep whitelist, so it could not fire in the real environment (the alert reachability gate of `GF-REGIONAL-BOOT-015`).
+Run this gate after every alert addition:
 
 ```bash
 python3.12 scripts/verify-regional-alerting.py
@@ -3646,9 +3655,9 @@ rm -rf "${ALERT_VERIFY_DIR}"
 ```
 
 Passing requires all of: `UNREACHABLE_ALERT_DEFECTS= 0`, `AMP_RULE_GROUPS` contains at least
-`gpu-fault-collector-health`, `gpu-fault-control-plane-capacity`,
-`gpu-fault-remote-command`, `gpu-fault-policy-coverage` and
-`gpu-fault-orchestration-invariants`, and `ALERTMANAGER_SNS_RECEIVERS` is non-empty.
+`gpu-fault-collector-health`, `gpu-fault-telemetry-pipeline`, `gpu-fault-control-plane-capacity`,
+`gpu-fault-remote-command`, `gpu-fault-policy-coverage`, `gpu-fault-orchestration-invariants` and
+`gpu-fault-recovery-outcome` (the script's `EXPECTED_GROUPS`), and `ALERTMANAGER_SNS_RECEIVERS` is non-empty.
 
 When you need to confirm that an alert really fires, evaluate directly against AMP with SigV4. Beware of two pitfalls:
 the control-plane Pod Identity role has no `aps:QueryMetrics` (least privilege, correct),
@@ -3704,19 +3713,29 @@ In the current production deployment this phase is executed by `gpu-fault-admin 
 Service hostname must no longer be treated as NLB readiness, and the CNAME must not be published before the targets are healthy. The strict order
 is as follows; failure of any step stops the subsequent steps:
 
-1. Confirm the private Route53 hosted zone exists and the control-plane hostname is inside that zone.
+1. Confirm the Route53 hosted zone exists and is a **private** zone, and the control-plane hostname is inside that zone.
 2. Confirm the ACM certificate is `ISSUED`, not yet expired, with a SAN covering the control-plane hostname.
 3. Create or update `Service/gpu-fault-api-nlb`.
-4. Wait for the AWS NLB `state=active`, and confirm the single TLS 443 listener uses the target certificate.
+4. Wait for the AWS NLB `state=active` (up to 900 s), and confirm the single TLS 443 listener uses the target certificate.
 5. Resolve the raw `*.elb.<region>.amazonaws.com` NLB DNS from the deployment execution environment.
 6. Wait until every NLB target group has at least as many targets as
    `Deployment/gpu-fault-api-ha.spec.replicas`, all of them
-   `healthy`.
-7. `UPSERT` the private Route53 CNAME so the stable control-plane hostname points at the raw NLB DNS.
+   `healthy` (up to 600 s; waited for in parallel with step 5).
+7. `UPSERT` the private Route53 CNAME (TTL 60) so the stable control-plane hostname points at the raw NLB DNS; no change is submitted
+   when the record already points there.
 8. Wait for the Route53 change waiter to finish, then read the change again; the status must explicitly be `INSYNC`.
-9. Create a one-shot check Pod in every GPU EKS; that Pod must be able to resolve the stable CNAME, complete TLS hostname/certificate-chain verification
-   with the private CA inside the connection Secret, and obtain `/healthz` HTTP 200.
+9. Create a one-shot check Pod (`gpu-fault-control-plane-endpoint-check`) in every GPU EKS; that Pod must be able to resolve the stable
+   CNAME (waiting up to 240 s right after the VPC was associated with the private zone), complete TLS hostname/certificate-chain verification
+   with the private CA inside the connection Secret, obtain `/healthz` HTTP 200, and call the read-only
+   `/v1/regional/executors/incident-ownership` with the cluster token from the same Secret to prove the registry accepts that token.
 10. Only after the check Pod succeeds may the Cluster Executor be started for the first time or re-joined.
+
+The resources these gates check are prepared by the bootstrap of `gpu-fault-admin deploy` (and later by `join-cluster`): the private
+hosted zone `<site-id>.gpu-fault.internal` (associated with the CPU VPC and every GPU cluster's VPC, deduplicated by `Region + VPC ID`),
+the control-plane hostname `api.<site-id>.gpu-fault.internal`; a private-CA certificate issued for that hostname is imported into ACM,
+the PKI is kept in Secrets Manager as `gpu-fault/<site-id>/regional-pki` and the CA file is written to `<state-dir>/control-plane-ca.crt`;
+when the CPU VPC has no public subnets, two `/28` subnets are created from free CIDR space, and the NLB Security Group allows only TCP
+443 from each GPU cluster's NAT EIP `/32`.
 
 The implementation entry points are
 `src/gpu_fault_release/regional_dns.py` and
@@ -4065,9 +4084,16 @@ rm -rf "${PKI_DIR}"
 
 #### CPU-9. Verify Pod IP Targets, TLS and Processor Active-Active Consumption
 
-Confirm the NLB target type is `ip` and all three targets are healthy:
+Confirm the NLB target type is `ip` and all three targets are healthy. Without the legacy CPU-8 above, take `NLB_ARN` from the NLB name
+(on a site built by deploy, `spec.nlb.name` in `site.yaml`, i.e. `gpu-fault-<site-id>`):
 
 ```bash
+export NLB_ARN="${NLB_ARN:-$(
+  aws elbv2 describe-load-balancers \
+    --region "${AWS_REGION}" \
+    --names "${NLB_NAME}" \
+    --query 'LoadBalancers[0].LoadBalancerArn' --output text
+)}"
 export TARGET_GROUP_ARN="$(
   aws elbv2 describe-target-groups \
     --region "${AWS_REGION}" \
@@ -4247,8 +4273,8 @@ The order cannot be swapped: every step provides a revertible observation window
    do not continue if it fails.
 4. **Open capabilities step by step.** Follow the phase A -> B -> C -> D order of §10 enabling destructive capabilities in phases,
    without skipping levels; those criteria are not repeated in this section.
-5. **Verify reset/reboot/replace in a maintenance window.** Only afterwards onboard the second GPU cluster,
-   repeating steps 2-4 for the second cluster.
+5. **Verify reset/reboot and the warm-spare handover in a maintenance window** (provider replace is permanently disabled, see §10
+   phase D). Only afterwards onboard the second GPU cluster, repeating steps 2-4 for the second cluster.
 6. **Stop and delete the control plane in the original GPU cluster.** Delete only the old control-plane resources,
    **not the data-plane components** -- the Collector, Watcher, Node Agent and Executor stay in the
    GPU cluster, now serving the regional control plane. Scaling to 0 alone is not enough: a 0-replica template can still be scaled up by mistake,
