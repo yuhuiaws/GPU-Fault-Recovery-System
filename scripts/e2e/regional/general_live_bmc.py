@@ -8,8 +8,9 @@ skipped): ``bmc_critical_sensor`` is the number of distinct sensors reading
 ``host_health.py``), and a count ``>= 1`` carries the alerting sensors on its
 labels -- ``sensors`` (names) and ``sensor_alerts`` (name, reading, units,
 status, the threshold columns ipmitool printed) -- which the grader writes
-into the finding's reason, so the incident reasons and the marker name them
-(the QUARANTINE plan sends no mail of its own). A non-zero exit, a hung
+into the finding's reason, so the incident reasons, the marker and the
+``quarantined-node-notice-zh-v1`` notice the completed QUARANTINE plan sends
+name them. A non-zero exit, a hung
 tool, a table without a valid row and a table whose every status is ``na`` are
 UNKNOWN (a ``_bmc`` collection error, no sample). BMC the node cannot provide
 is NOT_SUPPORTED: ``bmc_status_unsupported`` ``TOOL_MISSING`` without
@@ -482,8 +483,8 @@ def sensor_identity(observed: Mapping[str, Any], sensors: Iterable[str]) -> list
 
     Three places, each checked: the ``sensors`` label of the critical
     ``bmc_critical_sensor`` sample (the collector's record), the reasons of
-    the incident the finding minted (the text a support hand-off's mail would
-    list; the QUARANTINE plan mails nothing), and the ``raw_reason`` of that
+    the incident the finding minted (the text the quarantined-node notice of
+    the completed QUARANTINE plan lists), and the ``raw_reason`` of that
     incident's marker.
     A bare count names nothing anywhere, and that was the registered gap.
     """
