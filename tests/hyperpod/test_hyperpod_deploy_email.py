@@ -1,6 +1,9 @@
 import os
+import re
 import subprocess
 from pathlib import Path
+
+from gpu_fault.gpu_metrics import GpuMetricsThresholds
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "deploy" / "hyperpod" / "deploy.sh"
@@ -186,6 +189,62 @@ def test_hyperpod_deploy_supports_external_dcgm_exporter() -> None:
     assert "--enable-nvidia-smi-metrics-collector" in installer
     assert '--dcgm-exporter "\\${DCGM_EXPORTER_MODE}"' in installer
     assert '--dcgm-metrics-url "\\${dcgm_metrics_url}"' in installer
+
+
+#: Every GpuMetricsThresholds variable the legacy script wires, and its field.
+LEGACY_THRESHOLD_FIELDS = {
+    "GPU_FAULT_GPU_TEMP_WARNING_C": "gpu_temperature_warning_c",
+    "GPU_FAULT_GPU_TEMP_CRITICAL_C": "gpu_temperature_critical_c",
+    "GPU_FAULT_MEMORY_TEMP_WARNING_C": "memory_temperature_warning_c",
+    "GPU_FAULT_MEMORY_TEMP_CRITICAL_C": "memory_temperature_critical_c",
+    "GPU_FAULT_GPU_TEMP_WARNING_MARGIN_C": "gpu_temperature_warning_margin_c",
+    "GPU_FAULT_GPU_TEMP_SHUTDOWN_MARGIN_C": "gpu_temperature_shutdown_margin_c",
+    "GPU_FAULT_MEMORY_TEMP_WARNING_MARGIN_C": "memory_temperature_warning_margin_c",
+    "GPU_FAULT_PCIE_REPLAY_RATE_WARNING_PER_MINUTE": (
+        "pcie_replay_rate_warning_per_minute"
+    ),
+    "GPU_FAULT_NVLINK_ERROR_DELTA_CRITICAL": "nvlink_error_delta_critical",
+    "GPU_FAULT_POWER_VIOLATION_DELTA_WARNING_US": "power_violation_delta_warning_us",
+    "GPU_FAULT_THERMAL_VIOLATION_DELTA_WARNING_US": (
+        "thermal_violation_delta_warning_us"
+    ),
+    "GPU_FAULT_DCGM_CORRELATION_WINDOW_SECONDS": "correlation_window_seconds",
+    "GPU_FAULT_DCGM_POWER_LIMIT_RATIO": "power_limit_ratio",
+    "GPU_FAULT_DCGM_POWER_CORRELATION_MIN_UTILIZATION_PERCENT": (
+        "power_correlation_min_utilization_percent"
+    ),
+    "GPU_FAULT_DCGM_ECC_SBE_DELTA_WARNING": "ecc_sbe_delta_warning",
+    "GPU_FAULT_DCGM_RETIRED_PAGES_SBE_DELTA_WARNING": (
+        "retired_pages_sbe_delta_warning"
+    ),
+    "GPU_FAULT_DCGM_RETIRED_PAGES_DBE_DELTA_CRITICAL": (
+        "retired_pages_dbe_delta_critical"
+    ),
+    "GPU_FAULT_DCGM_ROW_REMAP_CORRECTABLE_DELTA_WARNING": (
+        "row_remap_correctable_delta_warning"
+    ),
+    "GPU_FAULT_DCGM_CORRECTABLE_MEMORY_DRAIN_CONSECUTIVE_SAMPLES": (
+        "correctable_memory_drain_consecutive_samples"
+    ),
+}
+
+
+def test_hyperpod_deploy_threshold_defaults_are_the_application_defaults() -> None:
+    """The legacy script sets every threshold it wires explicitly, so a default
+    it carries replaces the application's. The violation deltas once read 1 us,
+    a leftover of the old application default the hardening raised to the
+    10000 us site noise bound; nothing chose 1 for the legacy path."""
+
+    script = SCRIPT.read_text()
+    defaults = GpuMetricsThresholds()
+
+    for name, field_name in LEGACY_THRESHOLD_FIELDS.items():
+        match = re.search(r"\$\{" + name + r":-([0-9.]+)\}", script)
+        assert match is not None, f"{name} has no default in the legacy script"
+        assert float(match.group(1)) == getattr(defaults, field_name), (
+            f"{name} defaults to {match.group(1)} in the legacy script, "
+            f"the application to {getattr(defaults, field_name)}"
+        )
 
 
 def test_hyperpod_deploy_wires_gpu_metric_thresholds() -> None:
