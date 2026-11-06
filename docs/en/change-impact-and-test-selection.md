@@ -61,6 +61,14 @@ PostgreSQL stress test is needed and the environment does not set `GPU_FAULT_TES
 The unified staging entry point first reads the `postgres` flag in the plan and creates the isolated
 PostgreSQL 16 only when that flag is true.
 
+The selected pytest runs take explicit file lists. The locked pytest 9.1 builds a second `Package` node for a
+test directory when the argument list leaves it for a file of its parent and comes back, and a directory
+`conftest.py`'s autouse fixtures sit only on the first node (pytest-dev/pytest#14635, fixed in 9.2.0), so the
+tests under the second node lose them. Autouse fixtures that keep tests off AWS and the clusters therefore live
+in `tests/conftest.py` only, and one meant for a subdirectory checks the test's path (for example the fixed
+operator identity and the `status` reader stubs of `tests/admin`); `tests/test_test_suite_contracts.py` refuses
+autouse fixtures in a subdirectory conftest.
+
 ## Main CI content-identity reuse
 
 The `unit` gate of main CI does not use the Git commit directly as the sole reuse key; instead it generates four logical content domains:

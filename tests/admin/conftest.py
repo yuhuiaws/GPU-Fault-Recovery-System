@@ -1,74 +1,14 @@
-"""Keep administrator tests off the AWS CLI when they resolve the operator.
+"""The administrator tests' shared operator identity.
 
-Every mutating admin path now stamps the operator's STS identity into what it
-writes. The shared guard already refuses to run ``aws`` from a test, so the
-resolver is replaced here with a fixed ARN; the resolver's own tests inject
-their runner directly and never go through this seam.
+``tests/conftest.py`` applies the stubs every test under ``tests/admin`` needs
+by path: the operator's STS identity fixed to ``TEST_OPERATOR_ARN``, and
+``status`` reading no Aurora writer placement and no RDS CA bundle. They are not
+autouse fixtures of this directory conftest: pytest 9.1 binds those to the first
+``Package`` node it builds for ``tests/admin``, and a command line that comes
+back here after a file of ``tests`` gets a second node whose tests ran without
+the stubs (pytest-dev/pytest#14635, fixed in 9.2.0).
 """
 
 from __future__ import annotations
 
-import pytest
-
 TEST_OPERATOR_ARN = "arn:aws:sts::123456789012:assumed-role/Admin/test-operator"
-
-
-@pytest.fixture(autouse=True)
-def _fixed_operator_identity(
-    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    if request.module.__name__.rsplit(".", 1)[-1] == "test_operator_identity":
-        # The resolver's own tests exercise the real function with an injected
-        # runner; stubbing it here would make them test the stub.
-        return
-    try:
-        from gpu_fault.admin import operator_identity
-    except ImportError:  # the module is what the red run is missing
-        return
-    monkeypatch.setattr(
-        operator_identity, "caller_identity_arn", lambda **_kwargs: TEST_OPERATOR_ARN
-    )
-
-
-@pytest.fixture(autouse=True)
-def _aurora_placement_is_not_read(
-    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """``status`` reads where the Aurora writer runs through kubectl and aws.
-
-    The shared guard refuses both binaries in a test, so every ``status`` test
-    reports no placement finding instead; the placement's own module injects a
-    recorded world and drives the real reader through ``status``.
-    """
-
-    if request.module.__name__.rsplit(".", 1)[-1] == "test_admin_aurora_placement":
-        return
-    try:
-        from gpu_fault.admin import status_report
-    except ImportError:  # the module is what the red run is missing
-        return
-    monkeypatch.setattr(
-        status_report, "placement_findings", lambda *_args, **_kwargs: []
-    )
-
-
-@pytest.fixture(autouse=True)
-def _rds_ca_bundle_is_not_read(
-    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """``status`` reads the installed RDS CA bundle (kubectl), the published one
-    (curl, which the shared guard does not block) and the Aurora CAs (aws).
-
-    Every ``status`` test therefore reports no RDS CA bundle finding; the
-    module's own tests inject a recorded world and drive the real reader.
-    """
-
-    if request.module.__name__.rsplit(".", 1)[-1] == "test_rds_ca_bundle_drift":
-        return
-    try:
-        from gpu_fault.admin import status_report
-    except ImportError:  # the module is what the red run is missing
-        return
-    monkeypatch.setattr(
-        status_report, "rds_ca_bundle_findings", lambda *_args, **_kwargs: []
-    )

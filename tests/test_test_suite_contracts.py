@@ -584,3 +584,45 @@ def test_test_suite_does_not_lose_assertion_coverage() -> None:
     )
 
     assert assert_count >= 6_263
+
+
+def _autouse_fixture(decorator: ast.expr) -> bool:
+    if not isinstance(decorator, ast.Call):
+        return False
+    target = decorator.func
+    name = (
+        target.attr if isinstance(target, ast.Attribute) else getattr(target, "id", "")
+    )
+    return name == "fixture" and any(
+        keyword.arg == "autouse"
+        and isinstance(keyword.value, ast.Constant)
+        and keyword.value.value is True
+        for keyword in decorator.keywords
+    )
+
+
+def test_only_the_root_conftest_defines_autouse_fixtures() -> None:
+    """pytest 9.1 -- the version uv.lock and the deploy-host lock pin -- binds a
+    directory conftest's fixtures to the first ``Package`` node built for that
+    directory. A command line that comes back to the directory after a file of
+    its parent makes pytest build a second node, and the tests under it run
+    without those fixtures (pytest-dev/pytest#14635, fixed in 9.2.0). The
+    ``tests/admin`` stubs (fixed operator identity, no Aurora placement or RDS
+    CA bundle read) went missing that way and a ``status`` test reached the
+    blocked kubectl. Fixtures that keep tests off AWS and the clusters belong
+    in ``tests/conftest.py``, which applies the directory's own by path."""
+
+    offenders = []
+    for path in sorted(TESTS.rglob("conftest.py")):
+        if path == TESTS / "conftest.py":
+            continue
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(
+                _autouse_fixture(decorator) for decorator in node.decorator_list
+            ):
+                offenders.append(f"{path.relative_to(ROOT)}::{node.name}")
+
+    assert not offenders, (
+        "directory conftest autouse fixtures are lost under a duplicate Package "
+        f"node on pytest 9.1: {offenders}"
+    )

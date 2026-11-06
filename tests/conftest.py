@@ -4,6 +4,7 @@ import os
 import random
 from collections.abc import Iterator
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -32,6 +33,7 @@ SHUFFLE_SHARD_WORKERINPUT = "gpu_fault_shuffle_shard"
 
 
 OUTBOX_RETRY_MARKER = "collector_outbox_retry"
+ADMIN_TESTS = Path(__file__).resolve().parent / "admin"
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -309,6 +311,101 @@ def processor_replay_secret(monkeypatch) -> None:
     monkeypatch.setenv("GPU_FAULT_COLLECTOR_STARTUP_JITTER_SECONDS", "0")
     monkeypatch.setenv(
         "GPU_FAULT_PROCESSOR_REPLAY_SECRET", "test-processor-replay-secret-" + "r" * 32
+    )
+
+
+def _administrator_stub_applies(
+    request: pytest.FixtureRequest, *, own_module: str
+) -> bool:
+    """Whether a ``tests/admin`` stub applies to this test.
+
+    These stubs were autouse fixtures of ``tests/admin/conftest.py``. pytest 9.1
+    binds a directory conftest's fixtures to the first ``Package`` node built
+    for the directory; a command line that comes back to ``tests/admin`` after a
+    file of ``tests`` makes it build a second one, whose tests ran without the
+    stubs and reached the blocked kubectl (pytest-dev/pytest#14635, fixed in
+    9.2.0). This conftest's fixtures sit on the ``tests`` node, so the stubs are
+    applied here by path; ``own_module`` is the reader's own test module, which
+    drives the real code with an injected runner.
+    """
+
+    path = Path(request.path).resolve()
+    return path.is_relative_to(ADMIN_TESTS) and path.stem != own_module
+
+
+@pytest.fixture(autouse=True)
+def _fixed_operator_identity(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keep administrator tests off the AWS CLI when they resolve the operator.
+
+    Every mutating admin path stamps the operator's STS identity into what it
+    writes. The shared guard refuses to run ``aws`` from a test, so the resolver
+    is replaced with a fixed ARN; the resolver's own tests inject their runner
+    directly and never go through this seam.
+    """
+
+    if not _administrator_stub_applies(request, own_module="test_operator_identity"):
+        return
+    try:
+        from gpu_fault.admin import operator_identity
+    except ImportError:  # the module is what the red run is missing
+        return
+    # Imported here: ``tests.admin.conftest`` must not import this conftest,
+    # whose Postgres URL read would mark every importer of the ARN as a
+    # Postgres-gated module (``ci_coverage_config.postgres_gated_test``).
+    from tests.admin.conftest import TEST_OPERATOR_ARN
+
+    monkeypatch.setattr(
+        operator_identity, "caller_identity_arn", lambda **_kwargs: TEST_OPERATOR_ARN
+    )
+
+
+@pytest.fixture(autouse=True)
+def _aurora_placement_is_not_read(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``status`` reads where the Aurora writer runs through kubectl and aws.
+
+    The shared guard refuses both binaries in a test, so every administrator
+    ``status`` test reports no placement finding instead; the placement's own
+    module injects a recorded world and drives the real reader through
+    ``status``.
+    """
+
+    if not _administrator_stub_applies(
+        request, own_module="test_admin_aurora_placement"
+    ):
+        return
+    try:
+        from gpu_fault.admin import status_report
+    except ImportError:  # the module is what the red run is missing
+        return
+    monkeypatch.setattr(
+        status_report, "placement_findings", lambda *_args, **_kwargs: []
+    )
+
+
+@pytest.fixture(autouse=True)
+def _rds_ca_bundle_is_not_read(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``status`` reads the installed RDS CA bundle (kubectl), the published one
+    (curl, which the shared guard does not block) and the Aurora CAs (aws).
+
+    Every administrator ``status`` test therefore reports no RDS CA bundle
+    finding; the module's own tests inject a recorded world and drive the real
+    reader.
+    """
+
+    if not _administrator_stub_applies(request, own_module="test_rds_ca_bundle_drift"):
+        return
+    try:
+        from gpu_fault.admin import status_report
+    except ImportError:  # the module is what the red run is missing
+        return
+    monkeypatch.setattr(
+        status_report, "rds_ca_bundle_findings", lambda *_args, **_kwargs: []
     )
 
 
