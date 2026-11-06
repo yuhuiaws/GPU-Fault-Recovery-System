@@ -33,7 +33,7 @@ rationale and special recovery steps are kept in the [Deployment and Operations 
 | Explicitly register Node key custody | `gpu-fault-admin node-key-custody configure --state-dir ... --file ... --trust-sha256 ...`; after registration the original `deploy` / `join-cluster` still perform the authorised preparation and resume; Secrets are not rotated directly | [§6.2](#62-node-key-custody) |
 | Submit an explicit remediation after CHECK_MECHANICALS; trigger a validated restore after a QUARANTINED node (or the still-isolated node of an ESCALATED incident whose ladder is exhausted and every workflow ended) is repaired; manually confirm a node action with unknown outcome | `gpu-fault-admin submit-remediation --state-dir ... --incident-id ... --disposition {inspected,reset-gpu,reboot-node,quarantine,restore,confirm-node-action} [--node <node>] [--plan]` (`restore` see §9.2, `confirm-node-action --node` see §9.4) | §9, §9.2, §9.4, Deployment and Operations Manual §8.3 |
 | Remotely view/requeue a node collector's dead-letter outbox | `gpu-fault-admin collector-outbox --state-dir ... --cluster-id C --node N --collector kernel --action stats\|list\|requeue-dead [--path /v1/...] [--yes] --reference CHG-...` (no login to the GPU node; only metadata is returned; `requeue-dead` must carry `--yes`; there is no remote `--force`) | §9.3, §8 `GpuFaultCollectorSilent` |
-| Reclaim PostgreSQL hot-table bloat (after a campaign day, before a formal perf or acceptance round) | `gpu-fault-admin store-maintenance --state-dir ... --reference CHG-... [--confirm STORE_MAINTENANCE]` (without `--confirm` it only prints each hot table's live rows, pages, index bytes and proposed action; with the token it executes under the site operation lock; evidence under `$STATE_DIR/store-maintenance/`) | [§10.3](#103-hot-table-storage-parameters-and-store-maintenance-reclaiming-bloat) |
+| Reclaim PostgreSQL hot-table bloat (when the periodic `store-compaction` job is off or its actions keep failing) | `gpu-fault-admin store-maintenance --state-dir ... --reference CHG-... [--confirm STORE_MAINTENANCE]` (without `--confirm` it only prints each hot table's live rows, pages, index bytes and proposed action; with the token it executes under the site operation lock; evidence under `$STATE_DIR/store-maintenance/`) | [§10.3](#103-hot-table-storage-parameters-and-store-maintenance-reclaiming-bloat) |
 | A failover left the Aurora writer outside the zone with the most control-plane Pods (`status` reports `finding: Aurora writer ... runs in ...`) | `gpu-fault-admin aurora-failback --state-dir ... --reference CHG-... [--confirm AURORA_FAILBACK]` (without `--confirm` it only prints the placement and the target member; with the token it executes under the site operation lock, refuses while work is in flight, waits for the cluster to be `available` and the control plane ready, journal under `$STATE_DIR/aurora-failback/`; never run automatically) | [§4.9](#49-aurora-writer-beside-the-control-plane-the-status-finding-and-aurora-failback) |
 | AWS published a new RDS global CA bundle (`status` reports `finding: RDS CA bundle drift: ...`), or `deploy`/`config` of an older release fails with `RDS CA bundle digest does not match the pinned SHA-256; refusing` | A current release only reports, it never blocks: roll the vendored copy and its pin in the source with the steps the finding gives, then `deploy`; on an older release, rerun the same command with `GPU_FAULT_RDS_CA_BUNDLE_SOURCE` set to a bundle byte-identical to the old pin | [§6.3](#63-rds-ca-bundle-vendored-in-the-release-aws-rotations-reported-by-status) |
 | The installation registry sync fails because it "would change recorded identities" and that key's physical resource really was replaced (a recreated subnet, a re-subscribed SNS e-mail) | `gpu-fault-admin replace-resource --state-dir ... --resource-key <key> --reference ...` for the read-only plan; add `--confirm REPLACE_RESOURCE` to execute | §4 |
@@ -3099,7 +3099,7 @@ judgement). The batch additionally refuses two members that share a VPC (known l
 **Known limits:**
 
 1. **Node names must be unique across the site.** A plain EKS node name derives from the private IPv4 address
-   (`ip-10-0-33-205.<region>.compute.internal`), so two plain EKS GPU clusters in overlapping VPC CIDRs can produce the
+   (`ip-<private IPv4 with dashes>.<region>.compute.internal`), so two plain EKS GPU clusters in overlapping VPC CIDRs can produce the
    same node name; HyperPod node names (`hyperpod-i-<instance id>`) cannot collide. A join that meets a node name already
    in use is refused (`join NodeNames conflict with existing cluster, Agent, or CPU key ownership`); a node that appears
    with a used name after the join (scale-out, Spot replacement) gets no Node Action key -- the CPU-side
@@ -5703,7 +5703,7 @@ curl -sS -X POST "$CONTROL_PLANE_URL/v1/incidents/inc-xxx/close" \
 
 ### 9.2 Triggering a Validated Restore After a QUARANTINED (or Ladder-Exhausted ESCALATED) Node Is Repaired
 
-**When to use**: `state=QUARANTINED`, the node still carries the incident's `gpu-fault.io/quarantined` taint (value `incident-<sha256(incident_id)[:24]>`) and the `gpu-fault.io/incident-id=<incident_id>` annotation, the hardware has been repaired by the vendor/manually, and the node needs product verification before returning to scheduling; **or** `state=ESCALATED` with every workflow of the incident ended (FAILED/SUPERSEDED/SUCCEEDED) while a node still carries its isolation -- the shape of an exhausted escalation ladder whose last rung FAILED (example: the `workflow-reboot-after-<wf>` successor of a RESET_GPU drill isolated the node and then FAILED; the node is Ready on its installer boot id yet keeps the cordon, the `gpu-fault.io/quarantined` taint and the `gpu-fault.io/incident-id`/`fencing-token` annotations; `restore` used to refuse it as "not QUARANTINED", `confirm-node-action` has no BLOCKED record to answer, the hardware dispositions are not waiting on CHECK_MECHANICALS, and `--close-incident` would only change the record, orphaning the isolation); **or** `state=RECOVERED` with every workflow of the incident ended while a node still carries its isolation -- a FAILED reset workflow left its MARK_UNSCHEDULABLE in place and another workflow of the same incident later SUCCEEDED and wrote the incident RECOVERED (2026-10-05, gpu-eks-cluster ip-10-0-41-164: the reset's VERIFY window expired and FAILED, the planner queued a RESTART_GPU_DEVICE_PLUGIN successor for the `gpu_kubernetes_allocatable_mismatch` the quiesce itself caused and moved the incident pointer to it, the successor SUCCEEDED -> RECOVERED, and the node kept its cordon + `gpu-fault.io/quarantined` + `gpu-fault.io/incident-id`/`fencing-token` from 15:07Z on while `restore` refused with "is RECOVERED, not QUARANTINED or ESCALATED"; now a successor's terminal verdict inherits the isolation its predecessor left unreleased and reads QUARANTINED, a RUNNING reset chain absorbs the allocatable dip it causes instead of queueing a successor, and `restore` accepts such a RECOVERED incident). There is only one exit path: create under the **same** incident and the same fencing token a validated restore workflow `VALIDATE_GPU -> VALIDATE_HOST -> VALIDATE_FABRIC -> RESTORE_SCHEDULING` (the first three steps the validation adapter, the last the kubernetes adapter, which lifts cordon/taint/annotations after checking the node's isolation ownership by incident id + fencing token). Do not hand-edit the incident state and do not uncordon by hand -- that leaves the incident in QUARANTINED forever with the node ownership annotation still present. **The quiesce-taint-only shape** (eks-managed: the node carries a `gpu-fault.io/quiesce` taint whose value is this incident's `quarantine_taint_value` while the cordon and `gpu-fault.io/incident-id` already belong to a successor or any other incident): run the restore for **the incident that tainted it**; the plan's `node_decisions` say `quiesce_taint_only: true` with the reason "strips only that taint and leaves the owner's isolation in place", the workflow is the single step RESTORE_SCHEDULING, which strips that one taint and leaves the other incident's cordon/annotations/`gpu-fault.io/quarantined` alone, and nothing is validated first (`--plan` lists such nodes in `release_only_node_ids`; when the same restore also readmits other nodes of the incident, these only join its RESTORE_SCHEDULING and only the readmitted nodes are validated). The CLI hands that list to the builder in the Pod, so the workflow written is the one `--plan` printed: the written restore used to validate these nodes as well, and its VALIDATE_GPU waited on the exporter the very taint evicts until the step cap failed it, before the RESTORE_SCHEDULING that would strip the taint. A deployed image whose builder predates this refuses such a restore and writes nothing (`... cannot release <node> unvalidated, as the plan does ...`): deploy the current release, then run the restore again. A waiting successor VALIDATE_GPU names the incident to restore in `node_pending.<node>.quiesce_taint_holders`. Do not `kubectl taint ... -` by hand.
+**When to use**: `state=QUARANTINED`, the node still carries the incident's `gpu-fault.io/quarantined` taint (value `incident-<sha256(incident_id)[:24]>`) and the `gpu-fault.io/incident-id=<incident_id>` annotation, the hardware has been repaired by the vendor/manually, and the node needs product verification before returning to scheduling; **or** `state=ESCALATED` with every workflow of the incident ended (FAILED/SUPERSEDED/SUCCEEDED) while a node still carries its isolation -- the shape of an exhausted escalation ladder whose last rung FAILED (example: the `workflow-reboot-after-<wf>` successor of a RESET_GPU drill isolated the node and then FAILED; the node is Ready on its installer boot id yet keeps the cordon, the `gpu-fault.io/quarantined` taint and the `gpu-fault.io/incident-id`/`fencing-token` annotations; `confirm-node-action` has no BLOCKED record to answer, the hardware dispositions are not waiting on CHECK_MECHANICALS, and `--close-incident` would only change the record, orphaning the isolation); **or** `state=RECOVERED` with every workflow of the incident ended while a node still carries its isolation -- a FAILED reset workflow left its MARK_UNSCHEDULABLE in place and another workflow of the same incident later SUCCEEDED and wrote the incident RECOVERED (for example the reset's VERIFY window expired and FAILED, while the RESTART_GPU_DEVICE_PLUGIN successor queued for the `gpu_kubernetes_allocatable_mismatch` the quiesce itself caused SUCCEEDED and wrote the incident RECOVERED, and the node kept its cordon + `gpu-fault.io/quarantined` + `gpu-fault.io/incident-id`/`fencing-token`. A successor's terminal verdict inherits the isolation its predecessor left unreleased and reads QUARANTINED, a RUNNING reset chain absorbs the allocatable dip it causes instead of queueing a successor, and `restore` accepts such a RECOVERED incident). There is only one exit path: create under the **same** incident and the same fencing token a validated restore workflow `VALIDATE_GPU -> VALIDATE_HOST -> VALIDATE_FABRIC -> RESTORE_SCHEDULING` (the first three steps the validation adapter, the last the kubernetes adapter, which lifts cordon/taint/annotations after checking the node's isolation ownership by incident id + fencing token). Do not hand-edit the incident state and do not uncordon by hand -- that leaves the incident in QUARANTINED forever with the node ownership annotation still present. **The quiesce-taint-only shape** (eks-managed: the node carries a `gpu-fault.io/quiesce` taint whose value is this incident's `quarantine_taint_value` while the cordon and `gpu-fault.io/incident-id` already belong to a successor or any other incident): run the restore for **the incident that tainted it**; the plan's `node_decisions` say `quiesce_taint_only: true` with the reason "strips only that taint and leaves the owner's isolation in place", the workflow is the single step RESTORE_SCHEDULING, which strips that one taint and leaves the other incident's cordon/annotations/`gpu-fault.io/quarantined` alone, and nothing is validated first (`--plan` lists such nodes in `release_only_node_ids`; when the same restore also readmits other nodes of the incident, these only join its RESTORE_SCHEDULING and only the readmitted nodes are validated). The CLI hands that list to the builder in the Pod, so the workflow written is the one `--plan` printed: the written restore used to validate these nodes as well, and its VALIDATE_GPU waited on the exporter the very taint evicts until the step cap failed it, before the RESTORE_SCHEDULING that would strip the taint. A deployed image whose builder predates this refuses such a restore and writes nothing (`... cannot release <node> unvalidated, as the plan does ...`): deploy the current release, then run the restore again. A waiting successor VALIDATE_GPU names the incident to restore in `node_pending.<node>.quiesce_taint_holders`. Do not `kubectl taint ... -` by hand.
 
 ```bash
 # Read-only: prints the workflow that would be created (steps, owner, nodes, GPU scope, fencing token), writing nothing
@@ -5858,14 +5858,12 @@ REMEDIATE_DRIVER, UPDATE_SOFTWARE_FIRMWARE, ...): the boundary attests `node_act
 `OwnershipRefused` it raises itself -- the refusal lands before the guarded physical call is spawned, and a handler reaches
 its next checkpoint only after the previous call returned, so nothing is in flight; `RESET_ALL_GPUS_NVSWITCHES` carries
 RESET_GPU's `reset_verdict` (`not-attempted` before the first spawn, `not-applied` before the retry of a busy reset),
-`reset_scope` and the four reset lists, and the step's `node_failures` read `node action refused before acting: ...`. Live
-(gpu-eks-cluster, COLLECT-013, SXID 10003): the fabric reset was refused `OWNERSHIP_PERMIT_EXPIRED` before the retry of a
-busy reset, the previous Agent attested nothing, the record parked BLOCKED/NEEDS_OPERATOR on `outcome_unknown`, the
-product's own validated restore then put the node back while the parked record kept the node's exclusive occupancy -- the
-next incident's REBOOT_NODE workflow sat PENDING for half an hour and the `config`/`deploy` preflight was blocked; a record
-of that shape written by the previous release is still closed per §9.4 with `confirm-node-action` → `workflow-reconcile` →
-close incident. Live
-(gpu-eks-cluster) the successor of such a refusal quarantined and cordoned a node nothing had been done to. The refusal's
+`reset_scope` and the four reset lists, and the step's `node_failures` read `node action refused before acting: ...`. An older
+Agent that does not attest leaves a different shape: for example a whole-node reset refused `OWNERSHIP_PERMIT_EXPIRED`
+before the retry of a busy reset parks the record BLOCKED/NEEDS_OPERATOR on `outcome_unknown`; the product's own
+validated restore then puts the node back while the parked record keeps the node's exclusive occupancy -- the next
+incident's REBOOT_NODE workflow stays PENDING and the `config`/`deploy` preflight is blocked; such a record is closed
+per §9.4 with `confirm-node-action` → `workflow-reconcile` → close incident. The refusal's
 cause is on the step: a persistent device holder is named in `persistent_device_clients`; an expired ownership permit
 (`OWNERSHIP_PERMIT_EXPIRED`) carries `ownership_permit_timing` -- `pre_permit_seconds` (the compute-apps query and the
 sampled holder classification, run before the permit is asked for), `permit_wait_seconds`, `post_permit_seconds` (the
@@ -5915,9 +5913,10 @@ the remote command carries the Agent's own terminal answer (`node_results`, SUCC
 RECOVERED and pointing at it), **or any incident's** on the same node (the product validates nodes, not incidents: a SUCCEEDED
 workflow of the cluster whose `VALIDATE_GPU` step names the node, whose GPU scope, if any, covers the GPUs the action touched,
 and whose validation completed after the action started; the Pod's inspection lists such workflows as `node_validations` and the
-confirmation records the one it rests on as `validated_by_workflow` with its `incident_id` and `cross_incident=true`). Live
-(gpu-eks-cluster, XID 46): the heal of the product's own DCGM incident validated and uncordoned the node seconds after a refused
-reset, and the confirmation still sent the operator to reboot a node the product had just declared healthy. A BLOCKED
+confirmation records the one it rests on as `validated_by_workflow` with its `incident_id` and `cross_incident=true`). For
+example, the heal of the product's own DCGM incident can validate and uncordon the node seconds after a refused reset; a
+confirmation that ignored such a cross-incident validation would send the operator to reboot a node the product had
+just declared healthy. A BLOCKED
 record's deadline being long past is no grounds for refusal -- that is exactly why it was stopped.
 When the terminal answer of a `RESET_GPU` is `OWNERSHIP_FINAL_CLIENTS_CHANGED`, its details carry `persistent_device_clients`
 (`gpu_uuid`/`pid`/`device`/`process_name`, at most 8 entries): read there whether the holder is a lingering workload or a platform daemon
@@ -5999,7 +5998,7 @@ row is deleted.
 | Shape | Decision (all must hold) | Action | Audit location |
 | --- | --- | --- | --- |
 | Retired generation | The incident has advanced to a higher fencing generation and points at another workflow; the old workflow is still `PENDING`/`RUNNING`/`SAFETY_PENDING`/`BLOCKED` and has **not** completed any node-changing operation | First cancels its remote commands, then in the next round turns it `SUPERSEDED` (`preempted_by_workflow_id` pointing at the successor), releasing unused restart reservations | `preemption_reason` and the incident's `reasons`; control-worker log `retired generation revoked` |
-| Compile-time BLOCKED | `BLOCKED` with non-empty `blocked_reasons`, never claimed (`execution_epoch` is 0), zero step executions, no completed operation, no owner, no source plan, no budget claim, no open remote command, and the incident is `ESCALATED`/`RECOVERED`. Since 2026-10-26 only a plan whose first step is unowned, or that has another refusal as well (UNKNOWN workload, missing profile), is this shape: a plan refused **only** for a missing executable owner with an isolation compiled before the first unowned step first runs its containment prefix as `SAFETY_PENDING` and then stops `BLOCKED/SAFETY_SETTLED` (incident `QUARANTINED`); it ran steps, is not this shape, and is handled per the "contained, operator action required" card of §8 | Turns it `SUPERSEDED`, `preemption_reason` carrying the original `blocked_reasons`; **does not write the incident** | An `OPERATOR_RECONCILED` event on the workflow with `actor` `dispatcher`; log `compile-time BLOCKED workflow closed by the dispatcher` |
+| Compile-time BLOCKED | `BLOCKED` with non-empty `blocked_reasons`, never claimed (`execution_epoch` is 0), zero step executions, no completed operation, no owner, no source plan, no budget claim, no open remote command, and the incident is `ESCALATED`/`RECOVERED`. Only a plan whose first step is unowned, or that has another refusal as well (UNKNOWN workload, missing profile), is this shape: a plan refused **only** for a missing executable owner with an isolation compiled before the first unowned step first runs its containment prefix as `SAFETY_PENDING` and then stops `BLOCKED/SAFETY_SETTLED` (incident `QUARANTINED`); it ran steps, is not this shape, and is handled per the "contained, operator action required" card of §8 | Turns it `SUPERSEDED`, `preemption_reason` carrying the original `blocked_reasons`; **does not write the incident** | An `OPERATOR_RECONCILED` event on the workflow with `actor` `dispatcher`; log `compile-time BLOCKED workflow closed by the dispatcher` |
 | BLOCKED of a settled incident | `BLOCKED`, its incident already `RECOVERED` (`ESCALATED` does not count), no owner, unexpired lease, source plan or open remote command, and node occupancy, unconfirmed node actions and `WAITING` provider actions excluded; may have run steps, but must pass the complete safety predicate. Only then are residual budget claims released with the closure, with `released_budget_claims` recorded in the event details | Sets `SUPERSEDED`, `preemption_reason` carrying `closed BLOCKED workflow of a RECOVERED incident` and the original `blocked_reasons` | An `OPERATOR_RECONCILED` event, actor `dispatcher`; when an operator closes an incident with `--close-quarantined`/`--close-escalated`/`--close-incident` the same predicates apply |
 | Remote commands left by a terminal workflow | The workflow is already `FAILED`/`SUCCEEDED`/`BLOCKED`/`SUPERSEDED` while its commands are still `PENDING`/`LEASED`/`WAITING` | Calls the Store's `cancel_remote_commands_for_workflow`: `PENDING`/`WAITING` become `FAILED` immediately (`status_source=workflow-timeout`), `LEASED` gets one cancellation request settled on the Agent side; workflow and incident untouched | An `OPERATOR_RECONCILED` event on the workflow (`actor=dispatcher`, `details.action=cancelled orphaned remote commands`, `details.command_ids`); log `orphaned remote commands cancelled by the dispatcher` |
 
@@ -6057,7 +6056,7 @@ the one process holding its task lease writes; it judges with the very rule `wor
   10 minutes. An Agent that still holds its lease is never a candidate, whatever a report says.
 
 So a spot reclaim is ended about 10–12 minutes after the node left Kubernetes (the 10-minute guard plus at most one 60 s
-period each of the report and the cleanup). Once a release carrying this change is live, residue left by nodes that
+period each of the report and the cleanup). Residue left by nodes that
 departed earlier is ended too: after 10 minutes of an unbroken report chain, a node the chain never listed counts as
 absent from the chain's start.
 
@@ -6070,7 +6069,8 @@ inventory's 24-hour memory.
 1. **Retire the Agent**: `FleetRegistry.drain_agent`, then `revoke_agent`, under the transition
    `departed-node-cleanup/<reference>`, with the audit line `--retire-departed-agents` writes as its reason
    (`operator reconciliation <reference>: retired Agent <node> after its node left Kubernetes and HyperPod|EC2 (instance
-   ..., kubernetes read ..., hyperpod|ec2 read ...; actor departed-node-cleanup; admin plan <evidence digest>)`). The write
+   ..., record node_instance_id ..., HyperPod|EC2 cluster ... in ...; kubernetes read ..., hyperpod|ec2 read ...; actor
+   departed-node-cleanup; admin plan <evidence digest>)`). The write
    re-checks `generation`, `lifecycle_state` and `last_seen_at` and re-judges the guard at that moment; a record left
    `DRAINING` by a cycle interrupted between the drain and the revoke is revoked under the transition that drained it,
    never drained twice.
@@ -6151,10 +6151,7 @@ already had (a departure judged while it was `ACTIVE`) stays exactly as it was -
 and is deleted with the registration when `remove-cluster` purges it, or judged again once a join makes the cluster
 `ACTIVE` (a node the provider replaced in between is then a departure like any other: ended, with the informational
 notice). Do not run `--retire-departed-agents` for the nodes of a cluster being removed or joined: the membership
-operation owns their Agent records, and the command refuses a node still in Kubernetes anyway. Releases before batch
-249 reported every node of such a cluster `REFUSED` with the reason `cluster_not_active` (which no longer exists) and
-mailed it once per refusal set -- on a removal once with `agent_alive` while the last heartbeat was younger than
-10 minutes, and once more after that.
+operation owns their Agent records, and the command refuses a node still in Kubernetes anyway.
 
 **How to see what it did:**
 
@@ -6185,8 +6182,8 @@ mailed it once per refusal set -- on a removal once with `agent_alive` while the
 - Logs (control-worker; cluster names, node names and counts only, never tokens): one line per verdict change
   `departed-node cleanup: <cluster>/<node> <state> actions=... blockers=...`; a failed provider read logs the WARNING
   `departed-node cleanup: <provider> lookup for cluster <cluster> failed; <n> node(s) stay unproven: <error code>`. A failed
-  Executor report logs the WARNING `Kubernetes node report failed`; a control plane older than this change is said once
-  at INFO while the Executor waits for its upgrade.
+  Executor report logs the WARNING `Kubernetes node report failed`; a control plane that does not accept node reports yet (an
+  older release) is said once at INFO while the Executor waits for its upgrade.
 
 **Switch**: `spec.workflow.departedNodeCleanup` (default `true`; left out of `desired.json` and `admin-config.yaml` while at
 its default, so an existing site's configuration digests do not move). To switch it off, write
@@ -6199,16 +6196,16 @@ records are handled by hand with the §10.2 commands as before. The 10-minute gu
 configurable.
 
 **IAM**: the control-plane role already holds HyperPod's `ListClusterNodes`; the eks-managed proof needs
-`ec2:DescribeInstances`. The bootstrap's control-plane inline policy `GPUFaultRegionalObserve` gains the statement
+`ec2:DescribeInstances`. The bootstrap's control-plane inline policy `GPUFaultRegionalObserve` carries the statement
 `DepartedNodeInstanceReads`: that one read permission, `Resource: "*"` (EC2 grants this read only on `*`), limited to the
-site's Region by `aws:RequestedRegion`. The next `deploy` carrying this change finds the policy difference when the
+site's Region by `aws:RequestedRegion`. A `deploy` finds any policy difference when the
 bootstrap re-checks the control-plane role and writes it with `put-role-policy`; nothing else is needed. A site whose
 roles were created by hand adds the statement per CPU-4 of the deployment and operations manual. Until the permission is
 in effect, eks-managed nodes stay `PENDING` (`provider_unknown`, error code `UnauthorizedOperation`) and are never taken
 for departed.
 
 **Manual fallback**: the `workflow-reconcile` shapes of §10.2 are unchanged and judge with the same rule as the
-automatic cleanup. Use them when the switch is off, when the control plane predates this change, or for a ledger line in
+automatic cleanup. Use them when the switch is off, when the control plane has no departed-node cleanup (an older release), or for a ledger line in
 `REFUSED`. The two never act twice on one record: every write is a compare-and-set, the first writer wins and the other
 reads the record as ended (`REVOKED`, `SUPERSEDED`, `RECOVERED`) and skips it.
 
@@ -6267,13 +6264,23 @@ gpu-fault-admin workflow-reconcile \
 Non-plan-driven records (`source_plan_id` empty: node branches of job DAGs, workflows submitted directly with `--disposition`)
 can also be closed out -- as long as they have a verified restore successor (`terminalization` is `verified-restore`).
 The successor proves the recovery, the audit lands on the workflow's `OPERATOR_RECONCILED` event and the incident's reasons, and having no
-source plan to write is no reason to refuse; `resolved_plan_ids` is empty for such records. The `never-changed` shape still requires a
-source plan: there, no successor can prove anything. When the running release still carries the old rule (the record in the plan has `eligible=false`,
-`reasons` contains only `workflow has no source recovery plan`, `terminalization=verified-restore`), the command-line side
-promotes it to `verified-restore-non-plan` and writes through an in-Pod `apply-verified-restore` that uses only existing store primitives (the parser decision minus that one
-reason, `amend_workflow` with an audit event, compare-and-set `save_incident`)
--- so this lever is usable on the very release whose preflight such records block; after the release the dispatcher's sweep also automatically closes out
-the same shape (except node actions with a still-unknown outcome; confirm first per §9.4). Do not change Store rows to make the count fall.
+source plan to write is no reason to refuse; `resolved_plan_ids` is empty for such records. The `never-changed` shape does not require a
+source plan either: its typical source is a record whose plan a merge replaced **in place** (event `PLAN_REWRITE` "plan replaced in
+place: ...", merge adopted), leaving `source_plan_id` empty -- it completed no node-mutating operation, its incident is
+`ESCALATED`/`RECOVERED`, and the command-line side checks the node evidence (scheduling restored, or gone from HyperPod as above); the Pod
+writes only the workflow (`amend_workflow` with an `OPERATOR_RECONCILED` event, `preemption_reason` carrying the audit), neither the plan
+nor the incident, and `resolved_plan_ids` is empty too. When the running release still carries the old rule (the record in the plan has
+`eligible=false`, `reasons` contains only `workflow has no source recovery plan`), the command-line side promotes by shape:
+`terminalization=verified-restore` with a successor becomes `verified-restore-non-plan`, written through an in-Pod
+`apply-verified-restore` that uses only existing store primitives (the parser decision minus that one reason, `amend_workflow` with an
+audit event, compare-and-set `save_incident`); `terminalization=never-changed` with no successor and no source plan becomes
+`never-changed-non-plan`, written through `apply-never-changed` with the same existing primitives (fencing token / execution epoch
+comparison, `amend_workflow` with an audit event, no incident write) -- so both levers are usable on the very release whose preflight or
+`uninstall` such records block; after the release the dispatcher's sweep also automatically closes out the verified-restore shape
+(except node actions with a still-unknown outcome; confirm first per §9.4). Records closed this way then have their `ESCALATED`
+incident closed with `--close-incident`: a record `workflow-reconcile` set `SUPERSEDED` no longer counts as "a workflow still open"
+even if it keeps a node action of unknown outcome -- with the node gone `confirm-node-action` cannot confirm it, and that reconcile is
+the administrator's answer to it. Do not change Store rows to make the count fall.
 
 **The third shape: a never-dispatched `PENDING` record whose node is gone (`never-dispatched`).** The control plane's
 departed-node cleanup (§10.1.1) now closes such records by itself; this is the manual path for when it is off, refuses
@@ -6351,26 +6358,31 @@ Kubernetes Node the refusal ends with a hint naming this switch. The same `workf
   `discovery.revoked`); `last_seen_at` is **at least 10 minutes** before the Pod's clock (`DEPARTED_AGENT_GUARD_AGE` -- an
   Agent that spoke within ten minutes is restarting, not gone) and its lease has expired (otherwise `agent lease has not
   expired`; the rule is the one the control plane's departed-node cleanup applies, `gpu_fault/departed_nodes.py`); and the node is absent from the cluster's Kubernetes Node
-  list **and** the instance behind `hyperpod-<instance-id>` absent from the `aws sagemaker list-cluster-nodes` inventory.
-  A node still in Kubernetes (NotReady or cordoned included) is `node is still in Kubernetes; an Agent is retired only for
-  a node that left Kubernetes and HyperPod` and the provider is not consulted; an instance HyperPod still lists, a cluster
-  the site does not describe as HyperPod-managed, a failed AWS call, or a record of a cluster not in the site keep failing
-  closed with the reason. `--node <id>` narrows the plan to the named nodes; a named node without a record (or already
+  list **and** its instance from the provider -- on HyperPod the instance behind `hyperpod-<instance-id>` absent from the
+  `aws sagemaker list-cluster-nodes` inventory, on eks-managed `aws ec2 describe-instances` reporting the record's
+  `node_instance_id` `terminated` or unknown. A node still in Kubernetes (NotReady or cordoned included) is `node is still in
+  Kubernetes; an Agent is retired only for a node that left Kubernetes and its provider` and the provider is not consulted;
+  an instance the provider still has, a cluster whose provider identity the site lacks (no HyperPod name, or no EC2 instance
+  id on the Agent record), a failed AWS call, or a record of a cluster not in the site keep failing closed with the reason. `--node <id>` narrows the plan to the named nodes; a named node without a record (or already
   `REVOKED`) is reported as `no Agent record in the fleet`, and a named record that is not eligible refuses the whole
   apply before any write.
 - **Plan output**: each item carries the record's keys (`generation`, `lifecycle_state`, `last_seen_at`,
   `node_instance_id`, `agent_incarnation_id`, `transition_id`), `node_evidence.sources` (`kubernetes.present`,
-  `hyperpod.cluster_name`/`region`/`listed`) and `evidence_read_at`. The keys and verdicts are in `plan_sha256`, the read
+  plus `hyperpod.cluster_name`/`region`/`listed` or the eks-managed `ec2`) and `evidence_read_at`. The keys and verdicts are in `plan_sha256`, the read
   times are not -- if the re-plan before apply finds the instance listed again, the node back in Kubernetes, or the
   record heartbeating again (`generation`/`last_seen_at` moved), the command refuses by field
   (`gpu-a/hyperpod-...: eligible True -> False`, `...: generation 4 -> 5`) and writes nothing.
 - **Write**: through the registry's own lifecycle path in the Pod -- `FleetRegistry.drain_agent` then `revoke_agent`
   with one `AgentTransitionRequest`: `transition_id` is `workflow-reconcile/<reference>/<first 16 of plan_sha256>`, and
   `reason` is the audit line `operator reconciliation <reference>: retired Agent <node> after its node left Kubernetes
-  and HyperPod (instance ..., HyperPod cluster ... in ...; kubernetes read ..., hyperpod read ...; actor <ARN>; admin
-  plan <sha256>)`, which the record keeps for good in `transition_id`/`transition_reason`. Before the write the Pod
-  compare-and-sets `generation`, `lifecycle_state` and `last_seen_at` and re-checks the 10-minute guard and the evidence
-  on its own clock; a `DRAINING` record (a drain whose revoke never followed) is revoked under its original transition.
+  and HyperPod|EC2 (instance ..., record node_instance_id <id|unset>, HyperPod|EC2 cluster ... in ...; kubernetes read ...,
+  hyperpod|ec2 read ...; actor <ARN>; admin plan <sha256>)`, which the record keeps for good in
+  `transition_id`/`transition_reason`. Before the write the Pod compare-and-sets `generation`, `lifecycle_state` and
+  `last_seen_at` (`last_seen_at` as an instant, not a spelling: the inventory JSON ends in `Z`, the record in `+00:00`) and
+  re-checks the 10-minute guard and the evidence on its own clock; the record's `node_instance_id` is what the node reported
+  at registration (the Kubernetes Node UID on HyperPod, the providerID's EC2 instance id on eks-managed), only an EC2-shaped
+  value is compared with the departure evidence and a UID is written into the audit line as it is; any mismatch refuses the
+  write, and `failed_agents`/`failures` in the result name each one; a `DRAINING` record (a drain whose revoke never followed) is revoked under its original transition.
   There is no raw UPDATE. Plan and result are archived under `--state-dir` at
   `workflow-reconcile/departed-agents/<plan_sha256>/`.
 - **The verification afterwards**: `control_api` no longer counts `REVOKED` records as coverage and no longer checks
@@ -6422,7 +6434,7 @@ gpu-fault-admin workflow-reconcile --state-dir /secure/gpu-fault --retire-depart
   under `workflow-reconcile/departed-agents/<plan_sha256>/` as well.
 - **Afterwards**: the departed-node cleanup's next cycle (60 s) takes the node as departed, ends the rest of what it left
   and turns its ledger line `CLEANED` (§10.1.1, "After the administrator's acceptance", including the two cases it still
-  leaves). On a control plane older than this change the plan refuses the exit with `the control plane predates the
+  leaves). On a control-plane image that does not carry this exit yet (an older release) the plan refuses the exit with `the control plane predates the
   unknown-provider-identity exit`; the other shapes are unaffected.
 
 **The fifth shape: a parked record whose node action the operator confirmed (`operator-confirmed`).** A node
@@ -6529,7 +6541,7 @@ gate and the wave convergence wait) absorbs a node that leaves mid-release on th
 joins while a release runs". The operator's exit, with no hand edit:
 
 ```bash
-# 1. Rerun the same deploy unchanged with a build carrying this fix: the engine resumes the rollback, the verification
+# 1. Rerun the same deploy unchanged: the engine resumes the rollback, the verification
 #    counts only the nodes that exist and records departed_nodes, and the run ends with
 #    "rollback recovery completed; rerun deploy to start a new transaction" (exit code 2 is expected)
 # 2. If the node's Agent record is still ACTIVE (lease expired), retire it: the rollback verification does not require
@@ -6549,7 +6561,7 @@ Ready.
 
 ### 10.3 Hot-Table Storage Parameters and store-maintenance (Reclaiming Bloat)
 
-**Symptom.** One campaign day of writes leaves the Store's hot tables with heap and index pages a hundred times
+**Symptom.** Without the schema v19 storage parameters, one day of heavy writes and mass deletes leaves the Store's hot tables with heap and index pages a hundred times
 their live rows: `gpu_fault_gpu_metric_latest` with 1,216 live rows in 23,435 heap pages (192 MB) plus 124 MB of
 indexes, `gpu_fault_processor_lanes` with 40 rows in 1,188 pages, `gpu_fault_processor_queue_counts` with 3-5 rows in
 62 pages read 212k times. Every admission read scans tens to hundreds of pages for a handful of rows, every metric
@@ -6578,21 +6590,28 @@ gpu-fault-admin store-maintenance --state-dir "$STATE_DIR" --reference CHG-...
 
 # Execute: takes the site operation lock (refused while a release/config mutation is in progress), re-plans in the
 # Pod and checks the plan digest, then runs through the control plane's own Store connection;
-# evidence: $STATE_DIR/store-maintenance/<timestamp>-<plan digest>.json
+# evidence: $STATE_DIR/store-maintenance/<UTC timestamp>-<first 16 hex digits of the plan digest>.json
 gpu-fault-admin store-maintenance --state-dir "$STATE_DIR" --reference CHG-... --confirm STORE_MAINTENANCE
 ```
 
 The action per table follows what its readers tolerate: the small in-place tables (`gpu_fault_processor_lanes`,
 `gpu_fault_processor_queue_counts`, `gpu_fault_processor_priority_count_shards`) get `VACUUM (FULL, ANALYZE)`, an
 exclusive lock of well under a second at their live size; the large or continuously read tables
-(`gpu_fault_gpu_metric_latest`, `gpu_fault_objects`, `gpu_fault_processor_queue` with its TOAST,
-`gpu_fault_gpu_metrics_batches`) get `REINDEX INDEX CONCURRENTLY` per index and then `VACUUM (ANALYZE)`, with no long
-exclusive lock. The script is exec'd into a Running `gpu-fault-api-ha` Pod and connects with the mounted Store
-credentials (like every other administrator verb; the deploy host needs no network path to Aurora), holds the
-`gpu_fault_schema_bootstrap` advisory lock so it cannot overlap a schema ensure or index build, requires PostgreSQL 12
-or newer for `REINDEX ... CONCURRENTLY` (checked through `server_version_num`), never touches Aurora capacity, and is
-harmless to repeat. Before/after sizes of every table go into the evidence file; a table that fails is recorded, the
-run ends `FAILED` with exit code 1, and a later rerun finishes the work.
+(`gpu_fault_gpu_metric_latest`, `gpu_fault_gpu_metric_latest_clusters`, `gpu_fault_objects`,
+`gpu_fault_processor_queue`, `gpu_fault_processor_payloads`, `gpu_fault_gpu_metrics_batches`) get
+`REINDEX INDEX CONCURRENTLY` per index and then `VACUUM (ANALYZE)`, with no long exclusive lock -- a plain VACUUM does
+not return heap pages scattered across the file, so the verb does not shrink the large tables' heaps or TOAST. Tables
+outside the two lists are never touched; a table that does not exist yet is listed as absent in the plan and skipped.
+The script is exec'd into a Running `gpu-fault-api-ha` Pod and connects with the mounted Store credentials (like every
+other administrator verb; the deploy host needs no network path to Aurora) with a session `lock_timeout` of 10 s and
+`statement_timeout` of 840 s; it holds the `gpu_fault_schema_bootstrap` advisory lock so it cannot overlap a schema
+ensure or index build (a held lock is a refusal, not a wait), requires PostgreSQL 12 or newer for
+`REINDEX ... CONCURRENTLY` (checked through `server_version_num`), and never touches Aurora capacity. On execute the
+command first plans in the Pod, then the execute script plans again and compares the digests -- the digest covers the
+tables, their actions and their index names, not sizes, so one index more or less is a refusal (`the store changed
+since the plan was reviewed; plan again`). It is harmless to repeat. Before/after sizes of every table go into the
+evidence file; a table that fails is recorded, the run ends `FAILED` with exit code 1, and a later rerun finishes the
+work.
 
 **The product compacts indexes and small tables itself (the `store-compaction` periodic job).** The bloat comes from
 mass deletes: one formal 32-cluster round writes about 264k synthetic metric-latest rows, 87k objects and 27k queue
@@ -6646,18 +6665,21 @@ ran". The job needs no `GPU_FAULT_STORE_COMPACTION_INTERVAL_SECONDS` in a Config
 manifests carry none -- the code default of 300 s applies.
 
 **When `store-maintenance` is still needed.** The large tables' heaps and TOAST (`gpu_fault_gpu_metric_latest`,
-`gpu_fault_objects`, the TOAST of `gpu_fault_processor_queue`) are measured by the job but never rewritten -- returning
-their pages takes `VACUUM FULL`'s exclusive lock, an operator decision for a maintenance window rather than a
-background job -- and they are a storage cost, not a throughput variable: on the same release the aged r1 ran 1,601 req/s on 582 MB of metric
-latest and 194 MB of queue (72 MB of it TOAST) (the fourth data point of detailed design v2 §4.4.2 refutes the earlier "about a quarter" claim;
-the 1,141 run's gap came from commit I/O, advisory-lock waits and the small tables `VACUUM FULL` had just shrunk to 3-5 pages re-extending
-during the storm). Run the verb
-through the plan/execute flow above when `gpu_fault_store_hot_table_heap_pages_per_live_row` stays above ten on a large
-table, when the job is switched off with `GPU_FAULT_STORE_COMPACTION_INTERVAL_SECONDS=0`, or when
-`gpu_fault_store_compaction_actions_total{status="FAILED"}` keeps growing (for example `REINDEX ... CONCURRENTLY`
-repeatedly hitting its `lock_timeout`); before a formal perf or acceptance round read `store_bloat` in `summary.json`
-(Performance Acceptance Plan §11).
-**v23 removes three sources of the bloat.** The queue's claims, completions and coalescing rewrites are HOT updates (the index set carries neither `status`, the lease columns nor `updated_at`); once switched to the `detached` layout, completed rows and request bodies no longer live in the queue heap and TOAST (§4.7, v23 note), replays return their pages per partition, and the metric latest rows of synthetic clusters and of real clusters leaving the fleet go with their partition's `DROP`. The periodic job and this verb measure `gpu_fault_gpu_metric_latest_clusters` and `gpu_fault_processor_payloads` as the sum of their partitions and `REINDEX INDEX CONCURRENTLY` per partition; `gpu_fault_processor_replays` is measured, never rebuilt. The rules for lanes / queue counts / priority shards are unchanged.
+`gpu_fault_objects`, the TOAST of `gpu_fault_processor_queue`) are measured by the job but never rewritten, and the
+verb only rebuilds their indexes and runs a plain `VACUUM (ANALYZE)` -- returning scattered heap pages takes a
+`VACUUM FULL` with a long exclusive lock on a large table, which neither the job nor the verb runs: an operator
+decision for a maintenance window. They are a storage cost, not a throughput variable: on the same release an aged
+store with 582 MB of metric-latest heap plus indexes and 194 MB of queue (72 MB of it TOAST) ran 1,601 req/s, on a par
+with a fresh store (detailed design v2 §4.4.2); the gap of the 1,141 req/s measured after compacting only the indexes
+and small tables came from commit I/O, advisory-lock waits and the small tables `VACUUM FULL` had just shrunk to 3-5
+pages re-extending during the storm, not from heap size. A `gpu_fault_store_hot_table_heap_pages_per_live_row` that
+stays above ten on a large table therefore only reports storage cost; the verb does not bring it down. Run the verb
+through the plan/execute flow above when the job is switched off with `GPU_FAULT_STORE_COMPACTION_INTERVAL_SECONDS=0`
+or when `gpu_fault_store_compaction_actions_total{status="FAILED"}` keeps growing (for example
+`REINDEX ... CONCURRENTLY` repeatedly hitting the job's 5 s `lock_timeout`; the verb's session waits 10 s); before a
+formal perf or acceptance round read `store_bloat` in `summary.json` (Performance Acceptance Plan §11).
+
+**v23 removes three sources of the bloat.** The queue's claims, completions and coalescing rewrites are HOT updates (the index set carries neither `status`, the lease columns nor `updated_at`); once switched to the `detached` layout, completed rows and request bodies no longer live in the queue heap and TOAST (§4.7, v23 note), replays return their pages per partition, and the metric latest rows of synthetic clusters and of real clusters leaving the fleet go with their partition's `DROP`. The periodic job and this verb sum the facts of `gpu_fault_gpu_metric_latest_clusters` (partitioned by `cluster_id`) over its partitions, and `REINDEX INDEX CONCURRENTLY` of one of its partitioned index names rebuilds every partition in turn; `gpu_fault_processor_payloads` is a plain table (`fillfactor` 80, `toast_tuple_target=8160`, so a compressed body stays inline) measured and reindexed like the queue; `gpu_fault_processor_replays` is on neither list -- neither measured nor rebuilt -- because retention drops its expired partitions whole (the DEFAULT partition is swept row by row). The rules for lanes / queue counts / priority shards are unchanged.
 
 ## 11. Centralised Container Logs (CloudWatch Container Insights)
 
