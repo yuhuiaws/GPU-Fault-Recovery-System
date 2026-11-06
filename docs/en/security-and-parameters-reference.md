@@ -62,7 +62,7 @@ incarnation/boot_id. Only the provider call differs:
 | provider | RESTART_NODE | preflight | nodeReplace | managed-recovery observer |
 |---|---|---|---|---|
 | `hyperpod` | `BatchRebootClusterNodes` | ClusterStatus InService, `NodeRecovery=None` | local warm-spare switch (D.2) | `HyperPodIdentityRegistry` + observer |
-| `eks-managed` | `ec2:RebootInstances` on exactly the instance ids preflight resolved and the Node providerID re-read at submission confirms; a changed providerID refuses | `eks describe-cluster` ACTIVE and every target's `eks.amazonaws.com/nodegroup` node group ACTIVE; target instances must agree on `eks:cluster-name` (pin with `GPU_FAULT_EKS_CLUSTER_NAME`); EC2 state must be running | warm-spare handover only: the Executor builds the spare coordinator on both providers (`GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER=true`) and `REPLACE_NODE` (`HEALTHY_WARM_SPARE_ONLY`) moves the workload to a declared spare at the Kubernetes level; `REPLACE` is not in the allowlist and `submit` refuses it; the `regional-eks-safe` profile OWNs `nodeReplace` through `gpu-fault-eks-adapter` (`warm-spare-v1`); without a declared spare the step fails closed | not built; no `hyperpod-managed-*` owners |
+| `eks-managed` | `ec2:RebootInstances` on exactly the instance ids preflight resolved and the Node providerID re-read at submission confirms; a changed providerID refuses | `eks describe-cluster` ACTIVE and every target's `eks.amazonaws.com/nodegroup` node group ACTIVE; target instances must agree on `eks:cluster-name` (pin with `GPU_FAULT_EKS_CLUSTER_NAME`); EC2 state must be running; a target node group with EKS node auto repair on (`nodeRepairConfig.enabled=true`) is refused, the counterpart of HyperPod's `NodeRecovery=None` (join/deploy discovery and the release preflight refuse it too) | warm-spare handover only: the Executor builds the spare coordinator on both providers (`GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER=true`) and `REPLACE_NODE` (`HEALTHY_WARM_SPARE_ONLY`) moves the workload to a declared spare at the Kubernetes level; `REPLACE` is not in the allowlist and `submit` refuses it; the `regional-eks-safe` profile OWNs `nodeReplace` through `gpu-fault-eks-adapter` (`warm-spare-v1`); without a declared spare the step fails closed | not built; no `hyperpod-managed-*` owners |
 
 The eks-managed executor IAM needs only `ec2:DescribeInstances`, `ec2:RebootInstances`
 (conditioned on `aws:ResourceTag/eks:cluster-name`), `eks:DescribeCluster` and `eks:DescribeNodegroup`,
@@ -86,7 +86,10 @@ The rollback alarms of a rolling CPU control-plane schedule (same section):
 - Reading them takes `cloudwatch:DescribeAlarms`, scoped to `*` because the read asks for composite alarms too.
   Reading the API NLB they should watch takes `elasticloadbalancing:DescribeLoadBalancers` and
   `elasticloadbalancing:DescribeTargetGroups`. These reads serve the `cpu_rolling_update` check of `status --full` and
-  `hyperpod-scheduled-update --rolling`. Denied, the check fails with the AWS message and the helper refuses its plan.
+  `hyperpod-scheduled-update --rolling`, and the same reads by the deploy's last step, `config` and `cpu-rolling-update`
+  when they keep the alarms. Denied, the check fails with the AWS message; the helper refuses a plan that writes when it
+  cannot read the alarms (or one is missing), and only warns that the alarms' dimensions were not checked when it cannot
+  read the API NLB.
 - The deploy's last step, `gpu-fault-admin config` and `gpu-fault-admin cpu-rolling-update` keep the alarms and the CPU
   group's schedule with these permissions:
   - `cloudwatch:PutMetricAlarm` and `cloudwatch:TagResource`: PutMetricAlarm tags an alarm on create only with both;
@@ -94,8 +97,9 @@ The rollback alarms of a rolling CPU control-plane schedule (same section):
   - `cloudwatch:GetMetricStatistics` and `elasticloadbalancing:DescribeTargetHealth`, the full-capacity wait;
   - `sagemaker:DescribeCluster` and `sagemaker:UpdateCluster` on the CPU HyperPod cluster ARN
     (`arn:aws:sagemaker:<region>:<account>:cluster/<cluster id>`).
-- The ownership-label release (above) needs `sagemaker:UpdateCluster` on the GPU HyperPod clusters. This step needs it
-  on the CPU HyperPod cluster as well; a policy scoped to the GPU clusters must add the CPU cluster's ARN.
+- The ownership-label release (above) changes only GPU clusters and needs `sagemaker:UpdateCluster` on the GPU
+  HyperPod clusters; the CPU rolling step (and uninstall's restore) needs the same permission on the CPU HyperPod
+  cluster, so a policy scoped to the GPU clusters must add the CPU cluster's ARN.
 - Uninstall's restore of the pre-install schedule uses the same SageMaker pair, and `cloudwatch:DeleteAlarms` deletes
   the alarms.
 - All of these are the operator identity's alone, never an Executor or control-plane role's. Denied, the step records
@@ -150,8 +154,9 @@ COLLECT-022 uses only this run's private FM log, checkpoint and a non-forwarding
 delete the real collector cursor, modify its service, or describe a private software log as a real hardware fault.
 The dedicated-table acceptance of BOOT-030/031 only connects to the writer read-only and does not automatically advance migrations or clean up old data.
 
-The live publish of COLLECT-004 still triggers a real reboot; it is not a read-only case. The new path uses `baseline+1` only in an isolated Collector
-instance, and the private sink has no network access; only after sampling completes may the two saved batches, bound to the original Node,
+The live publish of COLLECT-004 still triggers a real reboot; it is not a read-only case. The new path drops one real GPU UUID (the baseline's
+highest-indexed GPU, the same row on both ticks) from an isolated Collector instance's own nvidia-smi listing, keeping the
+expected GPU count at its configured value, and the private sink has no network access; only after sampling completes may the two saved batches, bound to the original Node,
 boot, production configuration digest and collection process, be delivered to the real entry point. The production `collector.env` and Host
 Collector service must not be modified for this, and a second continuously forwarding producer must not be started.
 The publish must be explicitly confirmed and match the sampling digest, keeping the original batch IDs; on a lost response only the persistent evidence may be queried, without blindly
@@ -354,10 +359,11 @@ cluster registry records must not be reused to bypass these gates.
   live registry mutation requires double confirmation, and every execution path must complete a retryable,
   verifiable teardown in `finally`. Residue must not be hidden by making status ignore `perf-cap-*`.
 - The production deploy host must install its Python environment from a Cosign-signed offline deploy-host bundle. The bundle contains only
-  hash-locked wheels, the project wheel, the tool manifest and optional audited binaries, and must not contain credentials. Online initialization is
+  hash-locked wheels, the project wheel, the tool manifest and optional audited binaries (plus the administrator config
+  template, the dependency locks and the bundle manifest), and must not contain credentials. Online initialization is
   only for development checkouts; `gpu-fault-admin deploy` must not install or upgrade host software.
 - The administrator CLI must come from the independent `gpu-fault-deploy-host` distribution; the production Control Plane
-  Runtime wheel/image must not contain the `gpu-fault-admin` entry point, `admin_cli.py` or
+  Runtime wheel/image must not contain the `gpu-fault-admin` entry point, `gpu_fault.admin.cli` or
   `deploy-host-tools.json`. Deploy-host code changes must not masquerade as application Runtime changes.
 - The locally built temporary PostgreSQL listens only on loopback; the password must not enter Docker arguments, URLs or ordinary artifacts;
   a private authorization directory outside the repository is used. Even after the exact CID, image and ownership are confirmed, cleanup must still prove the resource no longer exists;
@@ -382,7 +388,9 @@ cluster registry records must not be reused to bypass these gates.
   [Runtime Profile Change Approval](administrator-profile-change-approval.md).
 - The PostgreSQL schema is currently v23 (as defined by `schema_migrations.LATEST_POSTGRES_SCHEMA_VERSION`); production business Pods run with
   `GPU_FAULT_POSTGRES_AUTO_SCHEMA_INIT=false`, and DDL may only be executed by the ensure Job.
-- The workflow/remote_command dedicated tables stay legacy by default. Data migration is executed explicitly by the audited Store CLI and
+- A brand-new database gets the workflow/remote_command dedicated tables in dedicated mode straight from the schema ensure
+  Job (`--fresh-control-state-mode dedicated`); an existing database keeps its recorded mode (the DDL default is legacy).
+  Data migration is executed explicitly by the audited Store CLI (`gpu-fault-store-migrate`) and
   is not switched automatically by deploy; before dedicated, the canonical JSON/missing/difference checks must complete and active commands and
   workflow leases must be drained. After the switch, old-table writers are refused by the database barrier and old writes cannot be restored through a rollback mode;
   old rows and indexes may only be decommissioned explicitly after the stability period.
@@ -526,8 +534,10 @@ cluster registry records must not be reused to bypass these gates.
   and does not relax the interpreter version or system site-packages isolation requirements.
 - The terminal event is the monotonic terminal barrier of the attempt Observation. Saving the terminal event must move the corresponding Observation to a terminal state in the same
   Store transaction; a late-arriving `PENDING/RUNNING` must not restore active ownership.
-- Only `ACTIVE` members of the cluster registry may dispatch operations; `PENDING/FAILED/ROLLED_BACK` retain only
-  join, verification and audit capabilities. Concurrent joins must use a single-cluster CAS transition; fully overwriting the registry revision from an expired candidate site
+- Only `ACTIVE` members of the cluster registry may dispatch operations (claims); `PENDING` accepts only reads,
+  heartbeat/readiness and telemetry channel POSTs (a join verifies collector readiness with them), `FAILED` only reads and
+  heartbeat/readiness, `DRAINING` also the executor's renew/result and HyperPod submission outcome, and the tokens of
+  `ROLLED_BACK` and `REVOKED` members are refused outright. Concurrent joins must use a single-cluster CAS transition; fully overwriting the registry revision from an expired candidate site
   is forbidden. Join CLIs of the same site are serialized across the whole transaction; discovery and prerequisite work within a single batch is at most 4-way,
   the rolling parallelism takes the site's `upgradeMaxParallelClusters`, and batch and upgrade share that knob (default 1, ceiling 8).
   The site-wide Installer budget is fixed at 64 nodes, and each cluster's wave is further bounded by `floor(64 / cluster parallelism)`; cluster and node parallelism cannot be
@@ -626,7 +636,7 @@ cluster registry records must not be reused to bypass these gates.
   cleanup idempotently and must not re-mark a release that has passed the point of no return as rollbackable.
 - Deleting incident/workflow/plan database rows directly or hand-editing workflow JSON is forbidden. Historical `BLOCKED` records already converged by a recovery
   successor may only be handled through
-  `gpu-fault-admin workflow-reconcile` (`--dry-run` shows the plan only; drop it to execute); fencing,
+  `gpu-fault-admin workflow-reconcile` (`--dry-run` shows the plan only; to execute drop `--dry-run` and pass `--reference <change>`); fencing,
   lease, remote commands, provider actions, the source plan and GPU node isolation state must be re-verified, and on success they transition only to
   `SUPERSEDED` with the complete audit preserved; final deletion still goes through S3 archive-first.
 - When any of the Agent artifact/compatibility digest, config digest, protocol or Runtime Profile
@@ -638,10 +648,10 @@ cluster registry records must not be reused to bypass these gates.
 | Credential | Allowed locations | Forbidden locations |
 |---|---|---|
 | execution token | CPU Secret, CPU Pod | GPU EKS, documentation, logs |
-| cluster token | CPU registry, the corresponding GPU Secret, target node env | other GPU clusters |
-| fleet master | CPU Secret, short-lived file on the trusted deploy host | GPU Secret, nodes |
+| cluster token | CPU registry, the corresponding GPU Secret, target node env, the private token file in the deploy host's state dir (`<state-dir>/secure/<cluster-id>.token`; a rotation also keeps a `.retired-<time>` copy) | other GPU clusters |
+| fleet master | CPU Secret, a private file in the deploy host's state dir (`<state-dir>/secure/fleet-master`, 0600, reused across runs) | GPU Secret, nodes |
 | per-node action key | CPU/GPU key map, the corresponding node | other nodes |
-| CA private key | PKI storage such as Secrets Manager | ConfigMap, nodes |
+| CA private key | PKI storage such as Secrets Manager, the deploy host's private state directory (`<state-dir>/pki/ca.key`, 0600) | ConfigMap, nodes |
 | CA public key | GPU Secret, node trust bundle | none |
 | Aurora password | Secrets Manager, Kubernetes DSN Secret | shell arguments, ordinary artifacts |
 
@@ -706,13 +716,14 @@ Clusters not in the ACTIVE lifecycle state are refused on this path.
 - The sender of a native SNS email subscription is the AWS-managed `no-reply@sns.amazonaws.com`;
   `emailSender` only controls the SES fault/action notifications sent directly by this solution.
 - The SNS confirmation request binds the Topic generation, endpoint, real Subscription ARN and a 48-hour window;
-  `Subscribe` must not be repeated while pending. When the same Topic/mailbox shows multiple confirmed or
+  `Subscribe` must not be repeated while pending. When the same Topic/mailbox shows multiple confirmed, multiple pending or
   confirmed+pending entries it must fail closed and not guess automatically which one to delete. Ordinary deploy/rollback
   must not delete the site alert Topic; only a formal uninstall handles it according to the installation registry.
 - Node, workload, Incident and Workflow identifiers must come from the current event or persisted state; production templates must not
   write example node names, fixed HyperPod instance IDs or test fixture identifiers.
-- kubectl approval commands in mail must explicitly carry the context; when the context is unknown, use the
-  `GPU_FAULT_KUBE_CONTEXT` required-value protection; falling back to the current kubectl context is forbidden.
+- kubectl approval commands in mail are always written `kubectl --context "${GPU_FAULT_KUBE_CONTEXT:?...}"`: whoever
+  runs them sets `GPU_FAULT_KUBE_CONTEXT` (a required-value guard that fails when it is unset); falling back to the
+  current kubectl context is forbidden.
 - `vendor-ticket-*` is this solution's internal support escalation record and does not mean an AWS Support Case has been created.
   Templates may only list the Workflow operations that actually FAILED and must not sweepingly claim that reset, reboot and replace
   have all been executed and failed.
@@ -735,8 +746,11 @@ If any of the following fails, active must not be entered:
 - a destructive step lacks the adapter owner, signature, fencing or post-action verification;
 - the Agent endpoint CIDR is empty, HTTP is used, or the signed heartbeat does not carry a TLS certificate;
 - the capacity test shows sustained 429/503, queue growth or database connection exhaustion.
-- the 120 to 300 second stability window after release shows new Pod restarts, sustained queue growth, non-terminal remote commands or critical
-  firing alerts. Before the formal stability window, only a bounded convergence wait of at most 420 seconds for `GpuFaultStoreIoRejected` is allowed,
+- the 120 to 300 second stability window after release (a CONTROL_PLANE_ONLY release with at least two clean samples
+  and converged Deployments may close it at 60 seconds) shows new Pod restarts, sustained queue growth, non-terminal
+  remote commands or critical firing alerts (except `GpuFaultCollectorSilent` and
+  `GpuFaultCollectorMetricsSnapshotStale` within 600 seconds of the release's own recorded data-plane convergence, a list
+  `GPU_FAULT_RELEASE_STABILITY_GRACE_ALERTS` can override; no recorded convergence, no grace). Before the formal stability window, only a bounded convergence wait of at most 420 seconds for `GpuFaultStoreIoRejected` is allowed,
   and it must first prove a complete fresh zero view of all running CPU Pods: aggregator degraded=0,
   the bounded slot count matches process-count, and every slot fully publishes finite non-negative zero values for the three reasons.
   Missing, old merged-format, duplicate, malformed or non-zero data cannot authorize the wait, and process_id cannot replace the slot; other
