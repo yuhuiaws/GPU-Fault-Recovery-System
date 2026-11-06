@@ -118,9 +118,11 @@ Formal rounds assume a maintained store: one campaign day of writes leaves the h
 counts/priority shards/queue, `gpu_fault_gpu_metric_latest`) with heap and index pages a hundred times their live
 rows, halving ingress throughput, raising `gpu_fault_processor_admission_batch_expired_total` and failing the reserved
 503 share verdict; schema v19's storage parameters stop the growth, and existing index and small-table bloat is
-reclaimed before a formal round with
-`gpu-fault-admin store-maintenance --state-dir <state-dir> --reference <CHG> --confirm STORE_MAINTENANCE`
-(Administrator Operations §10.3). The bloat
+reclaimed before a formal round: plan and review it with
+`gpu-fault-admin store-maintenance --state-dir <state-dir> --reference <CHG>` (no `--confirm`), then execute the
+reviewed plan with
+`gpu-fault-admin store-maintenance --state-dir <state-dir> --reference <CHG> --confirm STORE_MAINTENANCE --approve-plan <plan_sha256>`
+(`<plan_sha256>` from the plan output; Administrator Operations §10.3). The bloat
 is what one formal 32-cluster round itself leaves behind: a round inserts about 264k synthetic
 `gpu_fault_gpu_metric_latest` rows, 87k objects and 27k queue rows, the teardown deletes them, and the heap and index
 files stay at their high-water mark (metric latest: 1,233 live rows in 31,023 pages plus 118 MiB of indexes; the queue:

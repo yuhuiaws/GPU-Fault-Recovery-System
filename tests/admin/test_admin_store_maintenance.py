@@ -1,6 +1,7 @@
 """``gpu-fault-admin store-maintenance``: plan is read-only, execute needs the
-exact token and an approved reference, takes the site operation lock,
-re-plans in the Pod and records before/after sizes as evidence."""
+exact token, the digest of the reviewed plan and an approved reference, takes
+the site operation lock, re-plans in the Pod, refuses any plan but the
+reviewed one and records before/after sizes as evidence."""
 
 from __future__ import annotations
 
@@ -64,6 +65,8 @@ PLAN = {
     "missing_tables": [],
     "plan_sha256": "a" * 64,
 }
+#: What the operator passes back from the plan step's output.
+REVIEWED = PLAN["plan_sha256"]
 EXECUTED = {
     "mode": "execute",
     "status": "SUCCEEDED",
@@ -109,6 +112,21 @@ def _argv(tmp_path: Path, *extra: str) -> list[str]:
     return ["store-maintenance", "--state-dir", str(tmp_path), *extra]
 
 
+def _execute_argv(tmp_path: Path, *extra: str) -> list[str]:
+    """An execute of the plan the operator reviewed (``REVIEWED``)."""
+
+    return _argv(
+        tmp_path,
+        "--reference",
+        "CHG-7",
+        "--confirm",
+        module.CONFIRMATION,
+        "--approve-plan",
+        REVIEWED,
+        *extra,
+    )
+
+
 class _Pod:
     """The exec channel, recorded: plan then execute, each with its payload."""
 
@@ -140,6 +158,9 @@ def test_plan_mode_prints_the_review_and_takes_no_lock(
 
     printed = json.loads(capsys.readouterr().out)
     assert printed["mode"] == "plan" and printed["reference"] == "CHG-7"
+    assert printed["plan_sha256"] == REVIEWED, (
+        "the plan step prints the digest an execute of this plan passes back"
+    )
     assert [item["table"] for item in printed["tables"]] == [
         "gpu_fault_processor_lanes",
         "gpu_fault_gpu_metric_latest",
@@ -170,6 +191,80 @@ def test_execute_requires_the_exact_token_and_an_approved_reference(
     assert pod.calls == [], "refusals precede every Pod exec"
 
 
+def test_execute_requires_the_digest_of_the_reviewed_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pod = _Pod(monkeypatch)
+    monkeypatch.setattr(
+        module,
+        "administrator_operation_lock",
+        lambda _path: pytest.fail("a refused execute must not take the site lock"),
+    )
+    site = _site(tmp_path)
+    unbound = cli.parser().parse_args(
+        _argv(tmp_path, "--reference", "CHG-7", "--confirm", module.CONFIRMATION)
+    )
+
+    with pytest.raises(BootstrapError) as refused:
+        module.run_store_maintenance_command(unbound, site=site)
+
+    message = str(refused.value)
+    assert "--confirm STORE_MAINTENANCE requires --approve-plan PLAN_SHA256" in message
+    assert "the plan_sha256 the plan step printed" in message, (
+        "the refusal says which value to pass"
+    )
+    assert (
+        "gpu-fault-admin store-maintenance --state-dir <state-dir> --reference "
+        "<reference>` without --confirm" in message
+    ), "the refusal names the plan step to run and review first"
+    for malformed in ("a" * 63, "a" * 65, "A" * 64, "g" * 64, "   "):
+        arguments = cli.parser().parse_args(_execute_argv(tmp_path)[:-1] + [malformed])
+        with pytest.raises(BootstrapError, match="--approve-plan"):
+            module.run_store_maintenance_command(arguments, site=site)
+    assert pod.calls == [], "every refusal precedes the first Pod exec"
+
+
+def test_a_plan_digest_without_confirm_is_refused_not_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pod = _Pod(monkeypatch)
+    arguments = cli.parser().parse_args(
+        _argv(tmp_path, "--reference", "CHG-7", "--approve-plan", REVIEWED)
+    )
+
+    with pytest.raises(
+        BootstrapError,
+        match="--approve-plan applies only with --confirm STORE_MAINTENANCE",
+    ):
+        module.run_store_maintenance_command(arguments, site=_site(tmp_path))
+    assert pod.calls == [], "the plan step is not run with a flag it would ignore"
+
+
+def test_execute_refuses_a_plan_other_than_the_reviewed_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    pod = _Pod(monkeypatch)
+    monkeypatch.setattr(module, "reload_site_for_mutation", lambda site: site)
+    monkeypatch.setattr(module, "administrator_operation_lock", _no_lock)
+    # The operator reviewed an earlier plan; a table or an index has appeared
+    # or gone since, so the store's plan is no longer that one.
+    reviewed = "b" * 64
+    arguments = cli.parser().parse_args(_execute_argv(tmp_path)[:-1] + [reviewed])
+
+    with pytest.raises(BootstrapError) as refused:
+        module.run_store_maintenance_command(arguments, site=_site(tmp_path))
+
+    message = str(refused.value)
+    assert f"reviewed plan_sha256 {reviewed}" in message, message
+    assert f"current {PLAN['plan_sha256']}" in message, message
+    assert "review the new plan and pass its plan_sha256" in message, message
+    assert [payload for payload, _ in pod.calls] == [{"mode": "plan"}], (
+        "a plan other than the reviewed one is refused before the execute exec"
+    )
+    assert not (tmp_path / module.STATE_ROOT).exists(), "a refusal records no evidence"
+    assert capsys.readouterr().out == ""
+
+
 def test_execute_takes_the_lock_replans_and_records_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:
@@ -193,17 +288,15 @@ def test_execute_takes_the_lock_replans_and_records_evidence(
 
     monkeypatch.setattr(module, "administrator_operation_lock", lock)
     monkeypatch.setattr(module, "reload_site_for_mutation", reload)
-    arguments = cli.parser().parse_args(
-        _argv(tmp_path, "--reference", "CHG-7", "--confirm", module.CONFIRMATION)
-    )
+    arguments = cli.parser().parse_args(_execute_argv(tmp_path))
 
     assert module.run_store_maintenance_command(arguments, site=original) == 0
 
     assert events == ["lock", "reload", "unlock"]
     assert [payload for payload, _ in pod.calls] == [
         {"mode": "plan"},
-        {"mode": "execute", "plan_sha256": "a" * 64},
-    ]
+        {"mode": "execute", "plan_sha256": REVIEWED},
+    ], "the Pod executes the reviewed digest, after the re-plan matched it"
     printed = json.loads(capsys.readouterr().out)
     assert printed["status"] == "SUCCEEDED" and printed["reference"] == "CHG-7"
     assert printed["operator"].endswith("test-operator"), (
@@ -235,9 +328,7 @@ def test_a_failed_table_is_recorded_and_exits_non_zero(
     _Pod(monkeypatch, executed=failed)
     monkeypatch.setattr(module, "reload_site_for_mutation", lambda site: site)
     monkeypatch.setattr(module, "administrator_operation_lock", _no_lock)
-    arguments = cli.parser().parse_args(
-        _argv(tmp_path, "--reference", "CHG-7", "--confirm", module.CONFIRMATION)
-    )
+    arguments = cli.parser().parse_args(_execute_argv(tmp_path))
 
     assert module.run_store_maintenance_command(arguments, site=_site(tmp_path)) == 1
 
@@ -268,9 +359,7 @@ def test_execute_refuses_while_another_mutation_holds_the_site_lock(
     holder = threading.Thread(target=hold, daemon=True)
     holder.start()
     assert held.wait(timeout=10), "the holder must take the site lock first"
-    arguments = cli.parser().parse_args(
-        _argv(tmp_path, "--reference", "CHG-7", "--confirm", module.CONFIRMATION)
-    )
+    arguments = cli.parser().parse_args(_execute_argv(tmp_path))
     try:
         with pytest.raises(BootstrapError, match="another administrator mutation"):
             module.run_store_maintenance_command(arguments, site=_site(tmp_path))
@@ -293,7 +382,9 @@ def test_unexpected_pod_results_are_refused(
     weird["status"] = "DONE"
     _Pod(monkeypatch, executed=weird)
     with pytest.raises(BootstrapError, match="unexpected result"):
-        module.run_store_maintenance(site, reference="CHG-7", identity=lambda: "op")
+        module.run_store_maintenance(
+            site, reference="CHG-7", plan_sha256=REVIEWED, identity=lambda: "op"
+        )
 
 
 def test_plan_lines_render_pages_mebibytes_and_actions() -> None:

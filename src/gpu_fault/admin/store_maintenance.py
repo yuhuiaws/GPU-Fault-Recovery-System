@@ -9,14 +9,18 @@ handful of rows. Schema v19 stops the growth (fillfactor, threshold-only
 autovacuum, HOT-eligible updates); this verb returns the pages already lost.
 
 Plan (no ``--confirm``) is read-only: it prints every hot table's live rows,
-pages, index bytes and the proposed action. Execute (``--confirm
-STORE_MAINTENANCE`` plus an approved ``--reference``) takes the site
-operation lock -- so it refuses while a release or configuration mutation is
-in progress -- re-plans in the Pod, refuses a plan whose identity drifted,
-runs ``VACUUM (FULL, ANALYZE)`` on the small in-place tables and ``REINDEX
-INDEX CONCURRENTLY`` + ``VACUUM (ANALYZE)`` on the large ones through the
-product's store connection, and records before/after sizes under
-``<state-dir>/store-maintenance/``. Running it twice is harmless.
+pages, index bytes, the proposed action and the plan's ``plan_sha256``.
+Execute (``--confirm STORE_MAINTENANCE``, ``--approve-plan`` with the digest of
+the plan the operator reviewed, and an approved ``--reference``) takes the
+site operation lock -- so it refuses while a release or configuration
+mutation is in progress -- re-plans in the Pod and refuses unless that plan is
+still the reviewed one: the verb compares before it sends the execute, and
+the in-Pod execute compares again, against the same reviewed digest, before
+its first maintenance statement. It then runs ``VACUUM (FULL, ANALYZE)`` on
+the small in-place tables and ``REINDEX INDEX CONCURRENTLY`` + ``VACUUM
+(ANALYZE)`` on the large ones through the product's store connection, and
+records before/after sizes under ``<state-dir>/store-maintenance/``. Running
+it twice is harmless.
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -44,6 +49,8 @@ from gpu_fault.admin.workflow_reconcile import (
 
 CONFIRMATION = "STORE_MAINTENANCE"
 STATE_ROOT = "store-maintenance"
+#: ``plan_sha256`` as the plan step prints it (``hashlib`` hex digest).
+PLAN_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 SIZE_KEYS = (
     "live_rows",
     "dead_rows",
@@ -70,6 +77,26 @@ def approved_reference(reference: str | None) -> str:
         )
     if not REFERENCE_PATTERN.fullmatch(normalized):
         raise BootstrapError("store maintenance reference is invalid")
+    return normalized
+
+
+def reviewed_plan_sha256(value: str | None) -> str:
+    """The digest of the plan the operator reviewed, or a refusal naming it."""
+
+    normalized = (value or "").strip()
+    if not normalized:
+        raise BootstrapError(
+            f"store-maintenance --confirm {CONFIRMATION} requires --approve-plan "
+            "PLAN_SHA256: the plan_sha256 the plan step printed (run "
+            "`gpu-fault-admin store-maintenance --state-dir <state-dir> --reference "
+            "<reference>` without --confirm, review the plan, then pass its "
+            "plan_sha256)"
+        )
+    if not PLAN_SHA256_PATTERN.fullmatch(normalized):
+        raise BootstrapError(
+            "--approve-plan must be the 64 lowercase hexadecimal characters of the "
+            "plan_sha256 the plan step printed"
+        )
     return normalized
 
 
@@ -138,16 +165,30 @@ def run_store_maintenance(
     site: RenderedSite,
     *,
     reference: str,
+    plan_sha256: str,
     now: datetime | None = None,
     identity: Callable[[], str] | None = None,
 ) -> dict[str, Any]:
-    """Execute the reviewed plan and record the evidence (caller holds the lock)."""
+    """Execute the reviewed plan and record the evidence (caller holds the lock).
+
+    ``plan_sha256`` is the digest of the plan the operator reviewed. The plan
+    made here is the evidence's before-state; a plan other than the reviewed
+    one is refused before the execute is sent, and the in-Pod execute, handed
+    the reviewed digest, refuses one that changed in between.
+    """
 
     recorded_at = now or datetime.now(timezone.utc)
     plan = plan_store_maintenance(site)
+    if plan["plan_sha256"] != plan_sha256:
+        raise BootstrapError(
+            "the store maintenance plan changed since it was reviewed: reviewed "
+            f"plan_sha256 {plan_sha256}, current {plan['plan_sha256']}; run the "
+            "plan step again (without --confirm), review the new plan and pass "
+            "its plan_sha256"
+        )
     executed = run_control_plane_script(
         site,
-        {"mode": "execute", "plan_sha256": plan["plan_sha256"]},
+        {"mode": "execute", "plan_sha256": plan_sha256},
         script=maintenance_source(),
     )
     if executed.get("status") not in {"SUCCEEDED", "FAILED"} or not isinstance(
@@ -165,7 +206,7 @@ def run_store_maintenance(
         "recorded_at": recorded_at.isoformat(),
         "reference": reference,
         "operator": resolve(),
-        "plan_sha256": plan["plan_sha256"],
+        "plan_sha256": plan_sha256,
         "server": executed.get("server", plan["server"]),
         "plan": plan["tables"],
         "actions": executed["actions"],
@@ -184,14 +225,17 @@ def add_store_maintenance_command(
         "store-maintenance",
         usage=(
             "gpu-fault-admin store-maintenance --state-dir STATE_DIR "
-            f"--reference CHANGE_ID [--confirm {CONFIRMATION}]"
+            f"--reference CHANGE_ID [--confirm {CONFIRMATION} "
+            "--approve-plan PLAN_SHA256]"
         ),
         help=(
             "reclaim hot-table bloat in the PostgreSQL store through the "
             "control plane's own connection: without --confirm prints the "
-            "per-table plan (live rows, pages, index bytes, action) and changes "
-            f"nothing; --confirm {CONFIRMATION} executes it under the site "
-            "operation lock and records before/after sizes as evidence"
+            "per-table plan (live rows, pages, index bytes, action) and its "
+            f"plan_sha256 and changes nothing; --confirm {CONFIRMATION} "
+            "--approve-plan <that plan_sha256> executes the reviewed plan under "
+            "the site operation lock, refuses a plan that changed since, and "
+            "records before/after sizes as evidence"
         ),
     )
     add_managed_site_arguments(command)
@@ -210,6 +254,16 @@ def add_store_maintenance_command(
             "prints the plan and changes nothing"
         ),
     )
+    command.add_argument(
+        "--approve-plan",
+        dest="approve_plan",
+        default=None,
+        metavar="PLAN_SHA256",
+        help=(
+            "with --confirm: approve the plan you reviewed by the plan_sha256 the "
+            "plan step printed for it; the execute refuses any other plan"
+        ),
+    )
 
 
 def run_store_maintenance_command(
@@ -217,7 +271,14 @@ def run_store_maintenance_command(
 ) -> int:
     reference = approved_reference(arguments.reference)
     confirmation = getattr(arguments, "confirm", None)
+    reviewed = getattr(arguments, "approve_plan", None)
     if confirmation is None:
+        if reviewed is not None:
+            raise BootstrapError(
+                f"--approve-plan applies only with --confirm {CONFIRMATION}: it "
+                "binds an execute to the reviewed plan; without --confirm the "
+                "command only prints the plan"
+            )
         plan = plan_store_maintenance(site)
         print(
             json.dumps(
@@ -229,8 +290,11 @@ def run_store_maintenance_command(
         return 0
     if confirmation != CONFIRMATION:
         raise BootstrapError(f"store-maintenance requires --confirm {CONFIRMATION}")
+    plan_sha256 = reviewed_plan_sha256(reviewed)
     with administrator_operation_lock(site.source.parent):
         site = reload_site_for_mutation(site)
-        result = run_store_maintenance(site, reference=reference)
+        result = run_store_maintenance(
+            site, reference=reference, plan_sha256=plan_sha256
+        )
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if result["status"] == "SUCCEEDED" else 1

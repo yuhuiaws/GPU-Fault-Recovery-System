@@ -24,8 +24,10 @@ actions do, chosen per table by what its readers tolerate:
 The script never changes Aurora capacity, never touches a table outside the
 two lists, runs under the ``gpu_fault_schema_bootstrap`` advisory lock so it
 cannot overlap a schema ensure or an index build, refuses to execute a plan
-whose identity differs from the one the operator reviewed, and reports the
-before/after size of every table so the verb can record it as evidence.
+whose identity differs from the one the operator reviewed (the execute
+request's ``plan_sha256``: the verb's ``--approve-plan``, the digest the plan
+step printed), and reports the before/after size of every table so the verb
+can record it as evidence.
 """
 
 from __future__ import annotations

@@ -33,7 +33,7 @@ rationale and special recovery steps are kept in the [Deployment and Operations 
 | Explicitly register Node key custody | `gpu-fault-admin node-key-custody configure --state-dir ... --file ... --trust-sha256 ...`; after registration the original `deploy` / `join-cluster` still perform the authorised preparation and resume; Secrets are not rotated directly | [§6.2](#62-node-key-custody) |
 | Submit an explicit remediation after CHECK_MECHANICALS; trigger a validated restore after a QUARANTINED node (or the still-isolated node of an ESCALATED incident whose ladder is exhausted and every workflow ended) is repaired; manually confirm a node action with unknown outcome | `gpu-fault-admin submit-remediation --state-dir ... --incident-id ... --disposition {inspected,reset-gpu,reboot-node,quarantine,restore,confirm-node-action} [--node <node>] [--plan]` (`restore` see §9.2, `confirm-node-action --node` see §9.4) | §9, §9.2, §9.4, Deployment and Operations Manual §8.3 |
 | Remotely view/requeue a node collector's dead-letter outbox | `gpu-fault-admin collector-outbox --state-dir ... --cluster-id C --node N --collector kernel --action stats\|list\|requeue-dead [--path /v1/...] [--yes] --reference CHG-...` (no login to the GPU node; only metadata is returned; `requeue-dead` must carry `--yes`; there is no remote `--force`) | §9.3, §8 `GpuFaultCollectorSilent` |
-| Reclaim PostgreSQL hot-table bloat (when the periodic `store-compaction` job is off or its actions keep failing) | `gpu-fault-admin store-maintenance --state-dir ... --reference CHG-... [--confirm STORE_MAINTENANCE]` (without `--confirm` it only prints each hot table's live rows, pages, index bytes and proposed action; with the token it executes under the site operation lock; evidence under `$STATE_DIR/store-maintenance/`) | [§10.3](#103-hot-table-storage-parameters-and-store-maintenance-reclaiming-bloat) |
+| Reclaim PostgreSQL hot-table bloat (when the periodic `store-compaction` job is off or its actions keep failing) | `gpu-fault-admin store-maintenance --state-dir ... --reference CHG-... [--confirm STORE_MAINTENANCE --approve-plan <plan_sha256>]` (without `--confirm` it only prints each hot table's live rows, pages, index bytes, proposed action and the plan digest `plan_sha256`; with the token and the `plan_sha256` of the plan you reviewed it executes under the site operation lock, refusing a plan that changed since the review; evidence under `$STATE_DIR/store-maintenance/`) | [§10.3](#103-hot-table-storage-parameters-and-store-maintenance-reclaiming-bloat) |
 | A failover left the Aurora writer outside the zone with the most control-plane Pods (`status` reports `finding: Aurora writer ... runs in ...`) | `gpu-fault-admin aurora-failback --state-dir ... --reference CHG-... [--confirm AURORA_FAILBACK]` (without `--confirm` it only prints the placement and the target member; with the token it executes under the site operation lock, refuses while work is in flight, waits for the cluster to be `available` and the control plane ready, journal under `$STATE_DIR/aurora-failback/`; never run automatically) | [§4.9](#49-aurora-writer-beside-the-control-plane-the-status-finding-and-aurora-failback) |
 | AWS published a new RDS global CA bundle (`status` reports `finding: RDS CA bundle drift: ...`), or `deploy`/`config` of an older release fails with `RDS CA bundle digest does not match the pinned SHA-256; refusing` | A current release only reports, it never blocks: roll the vendored copy and its pin in the source with the steps the finding gives, then `deploy`; on an older release, rerun the same command with `GPU_FAULT_RDS_CA_BUNDLE_SOURCE` set to a bundle byte-identical to the old pin | [§6.3](#63-rds-ca-bundle-vendored-in-the-release-aws-rotations-reported-by-status) |
 | The installation registry sync fails because it "would change recorded identities" and that key's physical resource really was replaced (a recreated subnet, a re-subscribed SNS e-mail) | `gpu-fault-admin replace-resource --state-dir ... --resource-key <key> --reference ...` for the read-only plan; add `--confirm REPLACE_RESOURCE` to execute | §4 |
@@ -6601,13 +6601,16 @@ is enough), which makes the metric upsert and the lane updates HOT.
 **Existing bloat is reclaimed by `store-maintenance`** -- storage parameters do not return pages already consumed:
 
 ```bash
-# Plan (read-only): every hot table's live/dead rows, heap pages, index/TOAST bytes, reloptions and proposed action
+# Plan (read-only): every hot table's live/dead rows, heap pages, index/TOAST bytes, reloptions, proposed action
+# and the plan digest plan_sha256
 gpu-fault-admin store-maintenance --state-dir "$STATE_DIR" --reference CHG-...
 
-# Execute: takes the site operation lock (refused while a release/config mutation is in progress), re-plans in the
-# Pod and checks the plan digest, then runs through the control plane's own Store connection;
+# Execute the reviewed plan: --approve-plan passes back the plan_sha256 the plan step printed; takes the site
+# operation lock (refused while a release/config mutation is in progress), re-plans in the Pod, refuses unless the
+# digest is the reviewed one, then runs through the control plane's own Store connection;
 # evidence: $STATE_DIR/store-maintenance/<UTC timestamp>-<first 16 hex digits of the plan digest>.json
-gpu-fault-admin store-maintenance --state-dir "$STATE_DIR" --reference CHG-... --confirm STORE_MAINTENANCE
+gpu-fault-admin store-maintenance --state-dir "$STATE_DIR" --reference CHG-... \
+  --confirm STORE_MAINTENANCE --approve-plan <plan_sha256>
 ```
 
 The action per table follows what its readers tolerate: the small in-place tables (`gpu_fault_processor_lanes`,
@@ -6622,12 +6625,17 @@ The script is exec'd into a Running `gpu-fault-api-ha` Pod and connects with the
 other administrator verb; the deploy host needs no network path to Aurora) with a session `lock_timeout` of 10 s and
 `statement_timeout` of 840 s; it holds the `gpu_fault_schema_bootstrap` advisory lock so it cannot overlap a schema
 ensure or index build (a held lock is a refusal, not a wait), requires PostgreSQL 12 or newer for
-`REINDEX ... CONCURRENTLY` (checked through `server_version_num`), and never touches Aurora capacity. On execute the
-command first plans in the Pod, then the execute script plans again and compares the digests -- the digest covers the
-tables, their actions and their index names, not sizes, so one index more or less is a refusal (`the store changed
-since the plan was reviewed; plan again`). It is harmless to repeat. Before/after sizes of every table go into the
-evidence file; a table that fails is recorded, the run ends `FAILED` with exit code 1, and a later rerun finishes the
-work.
+`REINDEX ... CONCURRENTLY` (checked through `server_version_num`), and never touches Aurora capacity. Execute binds
+the plan the operator reviewed: `--confirm STORE_MAINTENANCE` needs `--approve-plan` with the `plan_sha256` the plan
+step printed (missing or malformed, the command refuses before any Pod exec and before the site lock, saying what to
+pass). The command first plans in the Pod (the evidence's before-state) and refuses when that digest is not the
+reviewed one (`the store maintenance plan changed since it was reviewed: reviewed plan_sha256 ..., current ...`),
+sending no execute and writing no evidence; the execute script is handed the same reviewed digest and plans once
+more before its first maintenance statement, refusing a change in between (`the store changed since the plan was
+reviewed; plan again`). The digest covers the tables, their actions and their index names, not sizes, so one index
+more or less (a schema release in between, say) means planning and reviewing again. It is harmless to repeat.
+Before/after sizes of every table go into the evidence file; a table that fails is recorded, the run ends `FAILED`
+with exit code 1, and a later rerun finishes the work.
 
 **The product compacts indexes and small tables itself (the `store-compaction` periodic job).** The bloat comes from
 mass deletes: one formal 32-cluster round writes about 264k synthetic metric-latest rows, 87k objects and 27k queue
@@ -6838,7 +6846,8 @@ rotate-token         one command completes the cluster token overlap-window rota
 node-key-custody     configure explicitly registers forward-looking custody; authorised delivery is still performed by deploy/join (§6.2)
 submit-remediation   explicit remediation after CHECK_MECHANICALS
 collector-outbox     remotely view/requeue a node collector's dead-letter outbox (§9.3)
-store-maintenance    reclaim PostgreSQL hot-table bloat: without --confirm prints the plan, --confirm STORE_MAINTENANCE executes (§10.3)
+store-maintenance    reclaim PostgreSQL hot-table bloat: without --confirm prints the plan, --confirm STORE_MAINTENANCE
+                     --approve-plan <the plan's plan_sha256> executes the reviewed plan (§10.3)
 aurora-failback      fail the Aurora writer back to the control plane's zone: without --confirm prints the plan, --confirm AURORA_FAILBACK executes (§4.9)
 replace-resource     move an installation registry key whose physical resource really was replaced: without --confirm prints the plan and proofs, --confirm REPLACE_RESOURCE executes (§4 installation registry sync)
 failure-domain-map   read-only debug: prints the failure-domain mapping the product would render

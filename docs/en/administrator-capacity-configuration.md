@@ -509,7 +509,7 @@ at least 64 pages below 8 live entries per page; a small table of at least 16 pa
 capacity parameters and do not vary with the preset. The large tables' heaps and the queue's TOAST are only measured
 and exported; no product path rewrites them: reclaiming them needs `VACUUM FULL`'s exclusive lock for the whole copy, an
 operator decision for a maintenance window. `gpu-fault-admin store-maintenance` (`--reference`, executes only with
-`--confirm STORE_MAINTENANCE`; Administrator Operations §10.3) runs `REINDEX INDEX CONCURRENTLY` over every index of those
+`--confirm STORE_MAINTENANCE` and `--approve-plan <the reviewed plan's plan_sha256>`; Administrator Operations §10.3) runs `REINDEX INDEX CONCURRENTLY` over every index of those
 large tables followed by a plain `VACUUM (ANALYZE)`, and `VACUUM (FULL, ANALYZE)` on the three small tables, so it does
 not rewrite the large heaps either. The large heaps cost roughly a quarter of the lost throughput. The variable is a
 ConfigMap environment variable, not a capacity-preset field of `admin-config.yaml`.
