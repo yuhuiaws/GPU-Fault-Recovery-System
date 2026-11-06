@@ -838,6 +838,82 @@ def test_a_release_chain_keeps_its_deliberate_no_ticket_endings(
     assert len(h.store.list_workflows()) == 1, "no successor was opened"
 
 
+@pytest.mark.parametrize(
+    ("operations", "contract"),
+    [
+        (RESET_CHAIN, None),
+        (DRAIN_STOP_CHAIN, None),
+        (QUARANTINE_PLAN, None),
+        (ENV_REVIEW_CHAIN, ENV_REVIEW),
+        (COOLDOWN_PLAN, COOLDOWN),
+    ],
+    ids=["reset", "drain", "quarantine-plan", "environment-review", "cooldown"],
+)
+def test_an_unknown_outcome_job_wide_stop_holds_the_whole_allocation(
+    operations, contract
+) -> None:
+    """The one hand-off that is not narrowed to the held nodes: a job-wide
+    STOP whose outcome nobody knows. Until an operator confirms the job's
+    state, isolating its whole allocation is the safe choice, so the
+    manual-confirmation hand-off cordons, quarantines and names every node of
+    the stop -- in every chain, the diagnostic-contract chains included."""
+
+    h = held_chain(
+        operations, operations.index(STOP), details=UNKNOWN_OUTCOME, contract=contract
+    )
+    h.amend(
+        official_steps=[
+            step.model_copy(update={"node_ids": ["node-a", "node-b"]})
+            if step.operation in JOB_WIDE
+            else step
+            for step in h.workflow.official_steps
+        ]
+    )
+
+    classification = HardwareEscalationService.classify(h.workflow)
+    assert classification is not None, "an operator must confirm the stop"
+    assert classification[:3] == (
+        "manual_confirmation_required",
+        RecoveryAction.ESCALATE_OPERATOR,
+        SUPPORT,
+    )
+    incident, successor = h.escalate()
+    assert incident.node_ids == ["node-a", "node-b"], incident.node_ids
+    assert {
+        step.operation: step.node_ids
+        for step in successor.official_steps
+        if step.operation in {CORDON, QUARANTINE}
+    } == {CORDON: ["node-a", "node-b"], QUARANTINE: ["node-a", "node-b"]}, (
+        "the job's state is unknown on every node of the stop"
+    )
+
+
+def test_an_unknown_outcome_in_a_read_only_chain_cordons_nothing() -> None:
+    """A read-only hung diagnostic holds nothing: its evidence step that the
+    executor abandoned (outcome unknown) opens no manual-confirmation
+    hand-off, so the diagnostic never cordons or quarantines a node."""
+
+    hung = {"health_recovery_contract": {"mode": "HUNG_DIAGNOSTIC"}}
+    operations = [
+        FREEZE,
+        WorkflowOperation.COLLECT_HUNG_SUMMARY,
+        WorkflowOperation.COLLECT_HUNG_TRIAGE,
+        BUNDLE,
+        WorkflowOperation.VALIDATE_FABRIC,
+        SUPPORT,
+    ]
+    h = held_chain(
+        operations,
+        operations.index(WorkflowOperation.COLLECT_HUNG_TRIAGE),
+        details=UNKNOWN_OUTCOME,
+        contract=hung,
+    )
+
+    assert HardwareEscalationService.classify(h.workflow) is None
+    assert h.escalate() is None
+    assert len(h.store.list_workflows()) == 1, "no successor was opened"
+
+
 @pytest.mark.parametrize("profile", [None, "missing-profile"])
 def test_escalation_with_unknown_runtime_profile_is_blocked_for_an_operator(
     profile,

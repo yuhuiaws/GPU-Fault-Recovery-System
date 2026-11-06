@@ -1681,7 +1681,11 @@ only; that path is software-tested only too
 same hand-off for a reset or reboot chain whose job stop, GPU-client check
 or answered checkpoint fails after the cordon, and for an older cooldown plan
 whose validation, snapshot or bundle fails, is software-tested only as well:
-no DESTR or GF-GENERAL-LIVE variant fails those steps. 015
+no DESTR or GF-GENERAL-LIVE variant fails those steps. So is the
+manual-confirmation hand-off of a job-wide stop or checkpoint whose outcome is
+unknown, which by design holds the job's whole allocation until an operator
+confirms (`tests/orchestration/test_cov95_runtime_escalation.py`): no live
+variant abandons a stop. 015
 `command_failure` serves two exits in turn: a BMC that does not answer (`Get
 Device ID command failed`) must be a `_bmc` collection error with no sample, a
 host without an IPMI device node (`Could not open device at /dev/ipmi0 ...: No

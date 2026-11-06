@@ -18,7 +18,7 @@ from gpu_fault.models import (
     WorkflowStepStatus,
     bounded_reasons,
 )
-from gpu_fault.handoff_hold import held_nodes
+from gpu_fault.handoff_hold import held_nodes, record_held_nodes
 from gpu_fault.notifications import HardwareEscalationEmailBuilder
 from gpu_fault.health_recovery_contract import diagnostic_workflow_failures
 from gpu_fault.operation_registry import (
@@ -225,14 +225,27 @@ def _contract_ends_classification(
     workflow: WorkflowRequest, failed_executions: list[WorkflowStepExecution]
 ) -> bool:
     """Whether a diagnostic contract ends the classification at the held-chain
-    rule: every failure is a contract step's and none is a containment or
-    release step. A cordon, quarantine or restore that failed goes on to the
-    hand-off every other chain gets (F-H1, the containment stages below): the
-    contract keeps the hardware rungs away, and that hand-off plans none."""
+    rule: every failure is a contract step's, none is a containment or release
+    step, and none of a chain that holds its node has an outcome nobody knows.
+    A cordon, quarantine or restore that failed goes on to the hand-off every
+    other chain gets (F-H1, the containment stages below), and an unknown
+    outcome in a chain that cordoned its node (ENVIRONMENT_REVIEW, the older
+    cooldown plan) to the manual-confirmation hand-off
+    (``_no_verdict_classification``), which holds every node of the step -- a
+    job-wide stop's whole allocation -- until an operator confirms. The
+    contract keeps the hardware rungs away, and neither hand-off plans one; a
+    read-only chain (a hung or diagnostic-only plan) holds nothing and keeps
+    ending here, so its unknown evidence step never cordons a node."""
 
-    return diagnostic_workflow_failures(workflow, failed_executions) and not any(
-        execution.operation in _CONTAINMENT_RELEASE_OPERATIONS
-        for execution in failed_executions
+    return (
+        diagnostic_workflow_failures(workflow, failed_executions)
+        and not any(
+            execution.operation in _CONTAINMENT_RELEASE_OPERATIONS
+            for execution in failed_executions
+        )
+        and not (
+            _unknown_outcome_failures(failed_executions) and record_held_nodes(workflow)
+        )
     )
 
 
